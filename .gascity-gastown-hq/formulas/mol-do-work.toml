@@ -197,6 +197,10 @@ if [ "$ISOLATED" != "1" ]; then
   git checkout -B "$BRANCH" origin/main
 fi
 bd update {{issue}} --set-metadata branch="$BRANCH"
+# Real lease refresh (ga-z93p0) — distinct from `gc bd heartbeat`'s dashboard
+# stamp; this is the one `bd reclaim` actually reads. Non-fatal: a heartbeat
+# failure must never block real work.
+bd heartbeat {{issue}} 2>/dev/null || true
 echo "Branch: $BRANCH"
 ```
 
@@ -221,6 +225,7 @@ Do not commit unrelated runtime metadata, caches, or bead database churn.
 
 **4. Push your branch:**
 ```bash
+bd heartbeat {{issue}} 2>/dev/null || true   # ga-z93p0 — refresh the real lease before handoff
 git push origin "$BRANCH"
 ```
 
