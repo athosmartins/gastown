@@ -51,7 +51,9 @@ DETECTION DIMENSIONS:
      story:approved beads). Suppressed when the queue is empty (idle ≠ stalled) or
      the dispatcher log is stale (a dead engine is the engine-stall monitors' job).
   3. STUCK-EXECUTION — a bead in_progress whose updated_at is older than
-     STUCK_EXEC_SEC (assigned but not progressing).
+     STUCK_EXEC_SEC (assigned but not progressing). Skips beads labeled
+     story:awaiting-external-merge or pilot:no-auto-dispatch — they already
+     declare they're not dispatchable/actionable here (ga-e5tn8).
 
 Recovers silently; silence = healthy. Never crashes the loop.
 """
@@ -299,11 +301,22 @@ def merge_stall(now=None):
             % (MERGE_STALL_SEC // 60, age_txt, queued, approved))
 
 
+# ga-e5tn8: labels that mean "in_progress but not actually stuck" — the bead
+# itself declares it's waiting on something outside this rig's control (an
+# external upstream PR review, days by construction) or has explicitly opted
+# out of the auto-dispatch remedy this dimension's REMEDY text recommends
+# (kill+redispatch). Flagging either as STUCK-EXECUTION contradicts what the
+# bead already says about its own state — see ga-5ksp5, flagged after 15h
+# while carrying both labels.
+STUCK_EXEC_EXCLUDE_LABELS = {"story:awaiting-external-merge", "pilot:no-auto-dispatch"}
+
+
 # ── DIMENSION 3: stuck-execution ──────────────────────────────────────────────
 def stuck_execution(now=None):
     """Return a reason string if any in_progress bead has updated_at older than
     STUCK_EXEC_SEC (assigned but not progressing); else None. FAIL-OPEN: a failed
-    `bd list` or an unparseable timestamp yields no finding."""
+    `bd list` or an unparseable timestamp yields no finding. Beads carrying a
+    STUCK_EXEC_EXCLUDE_LABELS label are skipped regardless of age — see ga-e5tn8."""
     now = now if now is not None else time.time()
     r = sh([BD, "list", "--status", "in_progress", "--json", "--limit", "0"], timeout=25)
     if not r or r.returncode != 0:
@@ -315,6 +328,8 @@ def stuck_execution(now=None):
     for b in beads:
         if not isinstance(b, dict):
             continue
+        if STUCK_EXEC_EXCLUDE_LABELS.intersection(b.get("labels") or []):
+            continue  # ga-e5tn8: legitimately waiting/parked, not an execution stall
         e = parse_iso_epoch(b.get("updated_at") or b.get("updated") or b.get("updatedAt"))
         if e is None:
             continue  # can't age it → don't flag (fail-safe)
