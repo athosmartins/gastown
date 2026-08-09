@@ -96,22 +96,28 @@ classify_pr_transition() {
   esac
 }
 
+# Both _alert_* functions return 0 only if EVERY notification channel
+# succeeded, 1 if any failed. The caller (run_sweep) uses this to decide
+# whether the transition is truly "handled" — see the state-advance comment
+# below for why that distinction matters.
 _alert_merge() {
-  local pr_num="$1" url="$2" bead_id="$3" bead_city="$4" msg
+  local pr_num="$1" url="$2" bead_id="$3" bead_city="$4" msg ok=0
   msg="beads-upstream-pr-watchdog (ga-574zr): upstream PR $url (gastownhall/beads #$pr_num, author $GH_AUTHOR) is now MERGED. Next step (engine rebuild+swap) needs Mayor coordination — this bead does not close itself."
   printf '%s' "$msg" | "$BD_BIN" -C "$bead_city" comment "$bead_id" --stdin >>"$LOG" 2>&1 \
-    || log "WARN: bd comment failed for $bead_id (PR #$pr_num)"
+    || { ok=1; log "WARN: bd comment failed for $bead_id (PR #$pr_num)"; }
   "$GC_BIN" mail send mayor -s "Upstream PR merged: gastownhall/beads #$pr_num" -m "$msg" >>"$LOG" 2>&1 \
-    || log "WARN: gc mail send failed for PR #$pr_num"
+    || { ok=1; log "WARN: gc mail send failed for PR #$pr_num"; }
+  return "$ok"
 }
 
 _alert_closed_no_merge() {
-  local pr_num="$1" url="$2" bead_id="$3" bead_city="$4" msg
+  local pr_num="$1" url="$2" bead_id="$3" bead_city="$4" msg ok=0
   msg="beads-upstream-pr-watchdog (ga-574zr): upstream PR $url (gastownhall/beads #$pr_num, author $GH_AUTHOR) was CLOSED WITHOUT merging. A human should decide whether to resubmit or abandon."
   printf '%s' "$msg" | "$BD_BIN" -C "$bead_city" comment "$bead_id" --stdin >>"$LOG" 2>&1 \
-    || log "WARN: bd comment failed for $bead_id (PR #$pr_num)"
+    || { ok=1; log "WARN: bd comment failed for $bead_id (PR #$pr_num)"; }
   "$GC_BIN" mail send mayor -s "Upstream PR closed without merge: gastownhall/beads #$pr_num" -m "$msg" >>"$LOG" 2>&1 \
-    || log "WARN: gc mail send failed for PR #$pr_num"
+    || { ok=1; log "WARN: gc mail send failed for PR #$pr_num"; }
+  return "$ok"
 }
 
 run_sweep() {
@@ -138,7 +144,7 @@ run_sweep() {
   while IFS=$'\t' read -r pr_num bead_id bead_city; do
     [ -z "$pr_num" ] && continue
 
-    local cur cur_state cur_url prev_pr_state action
+    local cur cur_state cur_url prev_pr_state action handled
     cur=$(printf '%s' "$all_prs" | jq -c --argjson n "$pr_num" '[.[] | select(.number == $n)][0] // empty')
     if [ -z "$cur" ]; then
       log "PR #$pr_num (author=$GH_AUTHOR) not found in this sweep's result — safe-skip (may be outside --limit=$GH_LIMIT; widen BUPW_GH_LIMIT if this persists)"
@@ -150,16 +156,33 @@ run_sweep() {
 
     tracked_count=$((tracked_count + 1))
     action=$(classify_pr_transition "$prev_pr_state" "$cur_state")
+    # "handled" gates whether new_state advances below. A transition whose
+    # alert only partially succeeded (e.g. bd comment landed but the Mayor
+    # mail failed on a transient Dolt/network blip) must NOT be recorded as
+    # done — advancing the state here would permanently silence the retry,
+    # since transition-only alerting means classify_pr_transition() would see
+    # MERGED->MERGED ("no-change") on every future sweep and never speak
+    # again. Leaving prev_pr_state untouched costs one duplicate alert
+    # (visible, cheap) in exchange for never silently losing one.
+    handled=1
     case "$action" in
       merged)
         log "TRANSITION: PR #$pr_num $prev_pr_state -> $cur_state (merged) — alerting bead=$bead_id"
-        _alert_merge "$pr_num" "$cur_url" "$bead_id" "$bead_city"
-        event_count=$((event_count + 1))
+        if _alert_merge "$pr_num" "$cur_url" "$bead_id" "$bead_city"; then
+          event_count=$((event_count + 1))
+        else
+          handled=0
+          log "WARN: PR #$pr_num merge alert incomplete — state NOT advanced, will retry next sweep"
+        fi
         ;;
       closed-no-merge)
         log "TRANSITION: PR #$pr_num $prev_pr_state -> $cur_state (closed, no merge) — alerting bead=$bead_id"
-        _alert_closed_no_merge "$pr_num" "$cur_url" "$bead_id" "$bead_city"
-        event_count=$((event_count + 1))
+        if _alert_closed_no_merge "$pr_num" "$cur_url" "$bead_id" "$bead_city"; then
+          event_count=$((event_count + 1))
+        else
+          handled=0
+          log "WARN: PR #$pr_num closed-no-merge alert incomplete — state NOT advanced, will retry next sweep"
+        fi
         ;;
       reopened)
         log "TRANSITION: PR #$pr_num $prev_pr_state -> $cur_state (reopened) — tracking resumes, no alert"
@@ -175,8 +198,10 @@ run_sweep() {
         ;;
     esac
 
-    new_state=$(printf '%s' "$new_state" | jq --arg k "$pr_num" --arg s "$cur_state" --arg t "$(ts)" \
-      '.[$k] = {state: $s, checked_at: $t}')
+    if [ "$handled" = "1" ]; then
+      new_state=$(printf '%s' "$new_state" | jq --arg k "$pr_num" --arg s "$cur_state" --arg t "$(ts)" \
+        '.[$k] = {state: $s, checked_at: $t}')
+    fi
   done < <(printf '%s' "$PR_BEAD_MAP" | jq -r '.[] | [.pr, .bead, .city] | @tsv')
 
   # Unconditional per-sweep line, even when nothing changed: on a log that

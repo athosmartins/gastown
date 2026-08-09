@@ -125,6 +125,56 @@ run_sweep
 eq "sweep3: no repeat bd comment on unchanged MERGED state" "$(wc -l < "$BD_CALLS_LOG" | tr -d ' ')" "0"
 eq "sweep3: no repeat gc mail on unchanged MERGED state"    "$(wc -l < "$GC_CALLS_LOG" | tr -d ' ')" "0"
 
+# ── Part 2.5: a partially-failed alert must NOT advance state ──────────────
+# Proves the gate-done self-audit fix: if bd succeeds but gc mail fails (a
+# transient Dolt/network blip at the exact moment a transition is detected),
+# the state must stay at the OLD value so the SAME transition is retried next
+# sweep — advancing state on a failed notification would silence it forever
+# under transition-only alerting.
+echo ""
+echo "== partial alert failure must not silently advance state =="
+
+export GC_FAIL_FLAG="$TMP/gc-should-fail"
+cat > "$TMP/gc" <<'STUB'
+#!/usr/bin/env bash
+{ printf 'CALL:'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; } >> "$GC_CALLS_LOG"
+[ -f "$GC_FAIL_FLAG" ] && exit 1
+exit 0
+STUB
+chmod +x "$TMP/gc"
+
+# 5439 stays MERGED (its already-advanced state, so it's a no-op this sweep);
+# 5479 stays OPEN (untouched); only 5470 transitions OPEN -> CLOSED, isolating
+# the bd/gc call-count assertions below to the one PR under test.
+cat > "$TMP/gh" <<'STUB'
+#!/usr/bin/env bash
+{ printf 'CALL:'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; } >> "$GH_CALLS_LOG"
+cat <<JSON
+[
+  {"number": 5439, "state": "MERGED", "mergedAt": "2026-08-09T20:00:00Z", "url": "https://github.com/gastownhall/beads/pull/5439", "title": "x"},
+  {"number": 5479, "state": "OPEN", "mergedAt": null, "url": "https://github.com/gastownhall/beads/pull/5479", "title": "x"},
+  {"number": 5470, "state": "CLOSED", "mergedAt": null, "url": "https://github.com/gastownhall/beads/pull/5470", "title": "x"}
+]
+JSON
+STUB
+chmod +x "$TMP/gh"
+
+touch "$GC_FAIL_FLAG"
+: > "$BD_CALLS_LOG"; : > "$GC_CALLS_LOG"
+run_sweep
+eq "partial-fail sweep: state NOT advanced for 5470 (alert incomplete)" \
+  "$(jq -r '.["5470"].state' "$BUPW_STATE" 2>&1)" "OPEN"
+
+# Recover: gc works again. The SAME OPEN->CLOSED transition must retry, not
+# be skipped — proving state was genuinely left unhandled above, not just
+# coincidentally still OPEN.
+rm -f "$GC_FAIL_FLAG"
+: > "$BD_CALLS_LOG"; : > "$GC_CALLS_LOG"
+run_sweep
+eq "retry sweep: exactly one bd comment once gc recovers" "$(wc -l < "$BD_CALLS_LOG" | tr -d ' ')" "1"
+eq "retry sweep: exactly one gc mail once gc recovers"    "$(wc -l < "$GC_CALLS_LOG" | tr -d ' ')" "1"
+eq "retry sweep: state now advances to CLOSED for 5470" "$(jq -r '.["5470"].state' "$BUPW_STATE" 2>&1)" "CLOSED"
+
 # ── Part 3: single-instance lock (ga-y0g5x pattern) ─────────────────────────
 echo ""
 echo "== single-instance lock =="
