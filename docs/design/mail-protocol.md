@@ -472,6 +472,39 @@ A "seen" state distinct from "read" (separating "surfaced in a prompt" from
 "actually processed") would be the structurally clean fix here, but it's real
 design surface -- deferred unless this norm proves insufficient in practice.
 
+## Mail Provenance: Filing a Bead From a Mail
+
+Archiving a mail (`gc mail archive`) soft-closes the underlying bead -- it
+does not delete it. But mail beads are ephemeral wisps with no `wisp_type:`
+label, so they used to fall into the untyped 24h default bucket of the
+hourly `wisp-compact` order and get hard-deleted once closed and past that
+TTL (fixed in ga-3rqwa: both `wisp-compact.sh` and the reaper's purge step
+now explicitly exempt `issue_type == "message"`). Confirmed live before the
+fix: an archived mail wisp came back "no issue found," permanently erasing
+the only record of who sent it and when.
+
+Even with that fix, don't depend on the source mail's continued existence
+to answer "who wrote this?" -- **when filing a new bead that cites a mail as
+its source, copy the mail's authorship onto the new bead at creation time**,
+instead of (or in addition to) citing it in prose. Prose ("ACHADO DE X,
+verificado por Y") has no disputable-proof value on its own: it can misattribute
+a subagent's finding to its parent session, and it's worthless once the
+source mail is gone.
+
+```bash
+# Instead of: bd create "Title" --description "ACHADO DE X (mail ga-wisp-...)"
+scripts/file-bead-from-mail.sh --mail-id ga-wisp-xxxxx \
+    "Title" --description "..." --type bug
+```
+
+This reads the mail's native `sender`/`assignee`/`created_at` fields and sets
+`mail.source_id` / `mail.author` / `mail.recipient` / `mail.sent_at` on the
+new bead's metadata -- so "who wrote this?" is answerable from the new bead
+alone, via `bd show <id> --json | jq .metadata`, independent of whether the
+source mail still exists. Omitting `--mail-id` is a plain passthrough to
+`bd create`: no `mail.*` key is ever added and no author is ever invented --
+an absent field is an honest answer, a guessed author is worse than none.
+
 ## Implementation
 
 ### Sending Mail

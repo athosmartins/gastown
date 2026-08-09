@@ -1,0 +1,16 @@
+# town-deltas override (ga-3rqwa): the embedded wisp-compact.sh hard-deletes
+# any closed ephemeral wisp past its TTL bucket with no exception for mail
+# (issue_type=="message"). Mail carries no wisp_type: label, so it falls into
+# the untyped 24h default bucket — meaning any read-or-archived mail message
+# (soft-closed via `gc mail archive/read`, never actually deleted by that
+# command itself) left alone for >24h was hard-deleted here, permanently
+# destroying the only durable record of who wrote it and when. Confirmed live:
+# an archived mail wisp came back "no issue found" from `bd show`, absent from
+# `hq.wisps` entirely. Script vendored into town-deltas/assets so $PACK_DIR
+# resolves here (the embedded maintenance copy is gitignored/ephemeral) — same
+# recipe as orphan-sweep's override.
+[order]
+description = "TTL-based cleanup of expired ephemeral beads (wisps) — mail exempt (ga-3rqwa)"
+trigger = "cooldown"
+interval = "1h"
+exec = "$PACK_DIR/assets/scripts/wisp-compact.sh"

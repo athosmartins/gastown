@@ -169,9 +169,12 @@ AND (
 -- Repeat the count/update pair until this returns zero so multi-level stale
 -- child chains converge in one reaper run.
 
--- Closed wisps past purge_age (purge candidates)
+-- Closed wisps past purge_age (purge candidates). issue_type filter
+-- (ga-3rqwa) matches the "purge" step's DELETE below so this estimate
+-- doesn't overcount vs. what actually gets deleted.
 SELECT COUNT(*) FROM wisps
 WHERE status = 'closed'
+AND issue_type NOT IN ('message')
 AND closed_at < DATE_SUB(NOW(), INTERVAL <purge_age_hours> HOUR)
 AND id NOT IN (
   SELECT DISTINCT d.depends_on_id FROM wisp_dependencies d
@@ -268,6 +271,7 @@ Delete closed wisps past purge_age.
 ```sql
 DELETE FROM wisps
 WHERE status = 'closed'
+AND issue_type NOT IN ('message')
 AND closed_at < DATE_SUB(NOW(), INTERVAL <purge_age_hours> HOUR)
 AND id NOT IN (
   SELECT DISTINCT d.depends_on_id FROM wisp_dependencies d
@@ -285,7 +289,13 @@ AND id NOT IN (
 retention window, and never deletes a closed parent wisp while any
 non-closed child wisp still depends on it. Active wisps are never touched.
 Mail messages live as beads (Type=message), not in a SQL table — use `bd`
-for any mail cleanup, never DELETE FROM mail.
+for any mail cleanup, never DELETE FROM mail. ga-3rqwa: this was previously
+prose-only (this sentence existed, but the DELETE above had no WHERE-clause
+enforcement of it) — a live audit found an archived mail wisp hard-deleted
+by the sibling `wisp-compact.sh` order, which had the identical gap. The
+`issue_type NOT IN ('message')` clause above makes the SQL itself match what
+this paragraph always claimed, instead of depending on whoever runs this
+step to remember and hand-append the exclusion.
 
 **Exit criteria:** Old closed wisps purged."""
 
