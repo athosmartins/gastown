@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key><string>/Users/athos</string>
+		<key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+	</dict>
+	<key>Label</key><string>com.gascity.beads-upstream-pr-watchdog</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/athos/gt/.gascity-gastown-hq/scripts/beads-upstream-pr-watchdog.sh</string>
+	</array>
+	<!-- Daily, not StartInterval=86400: a long StartInterval resets its
+	     countdown on every sleep/reboot of the mini and may in practice never
+	     fire (same lesson already learned in this repo — see
+	     upstream-drift-sentinel.plist). StartCalendarInterval fires at the
+	     next real wall-clock occurrence and launchd runs it shortly after
+	     wake if the mini was asleep at the scheduled time. Third-party PR
+	     review takes days, not minutes, so once/day is plenty (ga-574zr). -->
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key><integer>10</integer>
+		<key>Minute</key><integer>30</integer>
+	</dict>
+	<!-- Deliberately false: this job's own schedule already self-catches-up
+	     after a missed wake (see above) — RunAtLoad=true would ALSO fire an
+	     extra immediate run on every relog/restart of this plist, which is
+	     not wanted for a once-a-day sweep. -->
+	<key>RunAtLoad</key><false/>
+	<key>LowPriorityIO</key><true/>
+	<key>Nice</key><integer>10</integer>
+	<key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/beads-upstream-pr-watchdog-launchd.err</string>
+	<key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/beads-upstream-pr-watchdog-launchd.out</string>
+	<key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+</dict>
+</plist>
