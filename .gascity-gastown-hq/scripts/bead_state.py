@@ -63,7 +63,34 @@ GATE_ACTIVE = frozenset({"gate:queued", "gate:reviewing", "gate:needs-rebase"})
 GATE_FAILED = frozenset({"gate:failed", "gate:needs-fix"})
 ATHOS_TURN = frozenset({
     "story:needs-approval", "next-action:athos", "blocked-reason:decision",
+    "refino:policy-gap",       # lacuna de POLÍTICA = decisão de produto, só ele decide
 })
+# Só a variante de DECISÃO DE PRODUTO do gate é dele. Técnica/roteamento/
+# mayor-fixing/on-device são do Mayor/crew (ga-aprov, Athos: "rodar o máximo sem mim").
+ATHOS_GATE_HUMAN_SUFFIXES = frozenset({"product"})
+# ⚠️ story:refino-escalado / auto-refino:escalated NÃO estão aqui, DE PROPÓSITO.
+# "O refino escalou" diz que o refinador desistiu — não diz que existe decisão do
+# Athos. Sem uma classificação de lacuna (policy-gap = ele; info-gap = o criador),
+# a escalação é NÃO-CLASSIFICADA: é triagem do Mayor. Medido 09/08: ga-n77jl, uma
+# feature migrada do ClickUp com descrição completa e zero perguntas, ficou na
+# coluna do Athos sem NENHUM botão possível — exatamente o sintoma que ele reportou
+# ("estão na etapa 'sua vez' mas nenhuma tem um botão que as destrave"). A ação real
+# ali era refinar/priorizar, que é trabalho do Mayor.
+
+
+def is_athos_page(labels) -> bool:
+    """True sse existe uma ação que SÓ o Athos pode tomar.
+
+    Vocabulário absorvido de painel_visibilidade._has_athos_page_label, que já era
+    mais preciso que a 1ª versão deste módulo. Convergir para o MELHOR dos dois é o
+    ponto do modelo único — migrar cru teria REGREDIDO o painel.
+    """
+    lset = labels if isinstance(labels, (set, frozenset)) else set(labels or [])
+    if lset & ATHOS_TURN:
+        return True
+    pfx = "gate:needs-human:"
+    return any(str(l).startswith(pfx) and str(l)[len(pfx):] in ATHOS_GATE_HUMAN_SUFFIXES
+               for l in lset)
 
 EPHEMERAL_MARKERS = ("-adhoc-", "claude-headless", "wa-worker-", "ps-worker-", "dog-")
 
@@ -132,17 +159,22 @@ def derive(bead: dict, live_sessions: frozenset = frozenset(),
                 "turn": "crew:" + crew_of(assignee, known_crews) if crew_of(assignee, known_crews) else "mayor",
                 "actions": actions, "reasons": reasons}
 
-    # 3. PARK EXPLÍCITO — decisão deliberada de não andar.
+    # 3. VEZ DO ATHOS — só quando há ação que SÓ ele toma.
+    # ⚠️ Vem ANTES do park DE PROPÓSITO. O contrato das colunas (Athos, 17/07) diz:
+    # "um bead que precisa do Athos NUNCA pode estar em Travadas — é mis-filing". Um
+    # bead com blocked:* E story:needs-approval é destravado pela decisão DELE, então
+    # a decisão ganha do bloqueio. Com o park antes, ele sumia da coluna dele e ia
+    # parar em Travadas, onde ninguém espera achar uma decisão pendente.
+    if is_athos_page(L):
+        offer("aprovar", True); offer("rejeitar", True)
+        return {"state": "awaiting_athos", "turn": "athos", "actions": actions, "reasons": reasons}
+
+    # 4. PARK EXPLÍCITO — decisão deliberada de não andar.
     park = _has_prefix(L, PARK_PREFIXES) or next((l for l in L if l in PARK_EXACT), None)
     if park or status == "deferred":
         ext = "story:awaiting-external-merge" in L or park == "blocked:external-quota-motherduck"
         return {"state": "parked", "turn": "external" if ext else "mayor",
                 "actions": ["despausar"], "reasons": {"despausar": f"parkeado por {park or 'status=deferred'}"}}
-
-    # 4. VEZ DO ATHOS — só quando há ação que SÓ ele toma.
-    if L & ATHOS_TURN:
-        offer("aprovar", True); offer("rejeitar", True)
-        return {"state": "awaiting_athos", "turn": "athos", "actions": actions, "reasons": reasons}
 
     # 5. GATE REPROVOU — vez de quem constrói, não do Athos.
     if L & GATE_FAILED:
