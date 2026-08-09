@@ -182,11 +182,21 @@ def main(argv: list[str] | None = None) -> int:
         p.error("message cannot be empty")
 
     try:
-        escalate_emergency(args.emergency_class, args.title, message, mail_mayor=not args.no_mail)
+        ok = escalate_emergency(args.emergency_class, args.title, message, mail_mayor=not args.no_mail)
     except InvalidEmergencyClass as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    return 0
+    # ga-wxwao gate-feedback: previously `return 0` unconditionally here,
+    # discarding escalate_emergency()'s own carefully-computed notify_ok
+    # result. Both of this fix's new CLI call sites (compactor-dog/run.sh,
+    # dolt-hang-watchdog.sh) rely on THIS process's exit code as their only
+    # signal that the page failed to send — with the old unconditional 0,
+    # that signal could never fire for the two highest-stakes classes this
+    # mechanism exists for (Dolt data-integrity loss, total Dolt outage),
+    # since neither site passes an invalid --class (the only other nonzero
+    # path). "notify subprocess genuinely failed" and "notify subprocess
+    # genuinely succeeded" must not collapse into the same exit code.
+    return 0 if ok else 1
 
 
 # ── standalone / selftest entry point ─────────────────────────────────────────
@@ -299,8 +309,17 @@ def _selftest() -> int:
             bad(f"T7: main() exited with code {exc.code}, expected nonzero")
 
     # T8: CLI happy path — joins positional message args, exits 0, notifies once.
+    # ga-wxwao gate-feedback: the mock below must set a real returncode=0 —
+    # an unconfigured MagicMock's .returncode is itself a MagicMock, and
+    # `MagicMock() == 0` is False (verified), so escalate_emergency() would
+    # actually compute notify_ok=False here. Pre-fix, main()'s unconditional
+    # `return 0` masked that entirely, so this "happy path" test was passing
+    # for the wrong reason — it never actually exercised a genuine notify
+    # success. T8c below is the new, explicit test for the failure side this
+    # gap in T8 was quietly leaving uncovered.
     with mock.patch.object(subprocess, "run") as m_run, \
          mock.patch.object(this_module, "_ledger_append"):
+        m_run.return_value = subprocess.CompletedProcess([], returncode=0)
         rc = main(["--class", "quorum-diverged", "--title", "T8", "--no-mail", "hello", "world"])
         if rc == 0 and m_run.call_count == 1:
             ok("T8a: CLI happy path exits 0 and invokes notify once")
@@ -311,6 +330,24 @@ def _selftest() -> int:
             ok("T8b: CLI joins positional message args with spaces")
         else:
             bad(f"T8b: expected joined message 'hello world', got {sent_msg!r}")
+
+    # T8c (ga-wxwao gate-feedback, the reviewer's actual blocking issue): the
+    # CLI's own exit code must propagate a REAL notify failure — this is the
+    # exact signal compactor-dog/run.sh's `if ! ... ; then` and dolt-hang-
+    # watchdog.sh's `... || log "WARN: ..."` depend on to know an escalation
+    # didn't reach anyone. Pre-fix, main() returned 0 unconditionally here
+    # too (the only nonzero path was InvalidEmergencyClass, unreachable from
+    # either real call site since both pass hardcoded valid --class values).
+    with mock.patch.object(subprocess, "run") as m_run, \
+         mock.patch.object(this_module, "_ledger_append"):
+        m_run.return_value = subprocess.CompletedProcess([], returncode=1, stderr="boom")
+        rc = main(["--class", "town-halted", "--title", "T8c", "--no-mail", "hello"])
+        if rc != 0:
+            ok(f"T8c: CLI exit code propagates a real notify failure (rc={rc}, nonzero)")
+        else:
+            bad("T8c REGRESSION: main() returned 0 even though the underlying notify call "
+                "failed (returncode=1) — a caller's `|| log ...` / `if ! ...` fallback can "
+                "never fire for this failure mode")
 
     # T9: return value reflects the ACTUAL notify exit code — not a blanket
     # True regardless of outcome (the third-state bug: "couldn't confirm" and
