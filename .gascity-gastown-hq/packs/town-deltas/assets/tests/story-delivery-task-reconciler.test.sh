@@ -22,12 +22,25 @@
 #                               unchanged (fail-safe control — this must NOT
 #                               regress, or the fix becomes "trust the label
 #                               pair alone" in different clothes).
+#   T9 SHA_SCOPED_OVERRIDES   — ga-as3p1: the bead-scoped commit-subject scan
+#                               (T7's mechanism) finds a real commit for this
+#                               bead id — but a gate-sha-failed stamp names a
+#                               DIFFERENT, unresolved sha (the multi-slice
+#                               shape: one slice merged, a later slice failed
+#                               and never merged, wa-7l2u3). The sha-scoped
+#                               check must OVERRIDE the bead-scoped hit and
+#                               keep the labels — T7's proof that "verified
+#                               resolves" must not regress into "any commit
+#                               for this bead id resolves any contradiction."
 #
 # This is the ga-tjqe acceptance test: "a regression test simulates a gate:passed
 # task/bug bead and asserts delivery closes it in the same sweep". T7/T8 are the
 # ga-tuk26 acceptance test: "a fixture reproducing wa-iochp's exact label set
 # resolves iff independently verifiable; the same fixture without a verifiable
-# commit stays stuck, unchanged."
+# commit stays stuck, unchanged." T9 is the ga-as3p1 acceptance test: "a bead
+# carrying gate-sha-failed:<shaB>, with <shaA> (a DIFFERENT commit for the same
+# bead) in origin/main and <shaB> outside it, keeps gate:failed/gate:needs-fix —
+# today they are erased."
 
 set -uo pipefail
 
@@ -126,6 +139,14 @@ CONTRADICTED_VERIFIED_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS r
 # repo has no commit for — the fail-safe control. Same contradictory labels,
 # but nothing anywhere proves the fail-cycle residue is stale.
 CONTRADICTED_UNVERIFIED_JSON='[{"id":"ga-test-task-nocommit","title":"unrelated task, never merged","status":"in_progress","issue_type":"task","labels":["gate:passed","gate:failed","gate:needs-fix","lane:small"]}]'
+# ga-as3p1: SAME id as TASK_BEAD_JSON/CONTRADICTED_VERIFIED_JSON ("ga-test-task")
+# — the bead-scoped scan finds run_block's synthetic commit for it, exactly
+# like T7. The difference is the extra gate-sha-failed stamp naming a sha that
+# does not exist anywhere in the synthetic repo (standing in for wa-7l2u3's
+# df90c973 — a real, different, never-merged slice). A bead-scoped-only check
+# would wrongly treat T7's proof as covering this bead too; the sha-scoped
+# check must catch that the NAMED rejected sha specifically never resolved.
+CONTRADICTED_SHA_SCOPED_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","status":"in_progress","issue_type":"task","labels":["gate:passed","gate:failed","gate:needs-fix","gate-sha-failed:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef:code","lane:small"]}]'
 
 # ── T1: Task bead with gate:passed → close called ─────────────────────────────
 run_block "$TASK_BEAD_JSON" 0 ""
@@ -190,6 +211,24 @@ run_block "$CONTRADICTED_UNVERIFIED_JSON" 0 ""
 # "kept, not closed" from "closed" is what the two assertions above already
 # do (no close call, no label remove) — TASK_COUNT is not that signal.
 [ "${RUN_TASK_COUNT:-0}" = "1" ] && ok "T8 TASK_COUNT=1 (candidate found, but kept — not the same as acted)" || nok "T8 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
+
+# ── T9: bead-scoped hit EXISTS, but the NAMED rejected sha is unresolved ────
+# ga-as3p1 acceptance test: the bead-scoped commit-subject scan (T7's own
+# mechanism) finds a real commit for "ga-test-task" — same as T7 — but the
+# gate-sha-failed stamp names a sha that isn't that commit and doesn't
+# resolve anywhere. Before this fix, the bead-scoped hit alone was enough to
+# clear gate:failed/gate:needs-fix and close the bead — exactly the false
+# positive measured live on wa-7l2u3 (slice 8b2c5ffe merged papering over
+# slice df90c973's live, correct rejection). The sha-scoped check must win:
+# labels survive, bd close is never called.
+run_block "$CONTRADICTED_SHA_SCOPED_JSON" 0 ""
+! echo "$LAST_BD" | grep -q 'label remove ga-test-task "\?gate:failed"\?' \
+  && ok "T9 SHA_SCOPED_OVERRIDES → gate:failed NOT cleared (named sha unresolved)" || nok "T9 gate:failed wrongly cleared" "$LAST_BD"
+! echo "$LAST_BD" | grep -q 'label remove ga-test-task "\?gate:needs-fix"\?' \
+  && ok "T9 SHA_SCOPED_OVERRIDES → gate:needs-fix NOT cleared" || nok "T9 gate:needs-fix wrongly cleared" "$LAST_BD"
+! echo "$LAST_BD" | grep -q "close ga-test-task" \
+  && ok "T9 SHA_SCOPED_OVERRIDES → bd close NOT called (bead-scoped hit overridden)" || nok "T9 spurious-close" "$LAST_BD"
+[ "${RUN_TASK_COUNT:-0}" = "1" ] && ok "T9 TASK_COUNT=1 (candidate found, but kept)" || nok "T9 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
 
 echo ""
 echo "story-delivery task-reconciler tests: $PASS passed, $FAIL failed"

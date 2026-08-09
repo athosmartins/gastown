@@ -156,6 +156,48 @@ task_reconciler_verdict() {
   echo "keep:merge-not-verified"
 }
 
+# task_reconciler_failed_sha_resolved <gdir> <container> <ref> <labels> —
+# ga-as3p1. Three-state answer about the SPECIFIC sha(s) the gate rejected
+# (gate-sha-failed:<sha>[:<class>], quality-gate-dispatcher.sh's
+# gate_sha_fail_label — stamped in the SAME write as gate:failed/
+# gate:needs-fix; see quality-gate-dispatcher.sh:4305-4314/4373):
+#   "yes"    — at least one gate-sha-failed sha was found, and EVERY one is
+#              now an ancestor of <ref> (reuses story_merge_verdict, defined
+#              below in the STORY helpers section — one sha+ref ancestry
+#              check, not a second copy that could drift).
+#   "no"     — at least one gate-sha-failed sha was found, and at least one
+#              is NOT an ancestor of <ref> — the rejection is still live.
+#   "absent" — no gate-sha-failed stamp on this bead at all. Distinct from
+#              "no": there is nothing here to disprove staleness with, so
+#              the caller must fall back to its own (bead-scoped) evidence
+#              rather than guess in either direction ("could not verify" and
+#              "verified negative" must not collapse to the same value).
+#
+# Why this exists (not scan_commit_subject_for_bead, above): that proves
+# "SOME commit for this bead id is in <ref>" — true for ANY slice that ever
+# passed, not necessarily the slice that is CURRENTLY failing. Measured live
+# (wa-7l2u3): slice 8b2c5ffe passed and merged; slice df90c973 failed the
+# gate (ga-7ppa7) and never merged (`git merge-base --is-ancestor df90c973
+# origin/main` → no; the bead's real label set carried
+# gate-sha-failed:df90c9737596394969e78ee66382759e355a0ca6). The bead-scoped
+# scan found 8b2c5ffe, called the coexisting gate:failed stale, and erased a
+# live, correct rejection (an off-by-one timezone bug) — the bead was left
+# looking approved with the bug still in it. Multiple stamps (e.g. an
+# ancient superseded rejection alongside a live one) resolve to "no" as a
+# set — one still-unmerged sha is enough to keep the labels: same
+# asymmetric-cost reasoning as elsewhere in this file (keeping a stale FAIL
+# costs a re-verification; erasing a live one ships a bug marked approved).
+task_reconciler_failed_sha_resolved() {
+  local gdir="$1" container="$2" ref="$3" labels="$4"
+  local sha found=0
+  for sha in $(printf '%s\n' "$labels" | tr ' ' '\n' \
+      | sed -n 's/^gate-sha-failed:\([0-9a-f]\{4,40\}\)\(:[a-z]*\)\{0,1\}$/\1/p' | sort -u); do
+    found=1
+    story_merge_verdict "$gdir" "$container" "$ref" "$sha" >/dev/null 2>&1 || { echo "no"; return 0; }
+  done
+  if [ "$found" = "1" ]; then echo "yes"; else echo "absent"; fi
+}
+
 # ═════════════════════════════════════════════════════════════════════════════
 # ga-mmdm2: pre-deploy merge-verification helpers for the STORY delivery loop
 # below (Step 3.6). gate:passed is a LABEL, not proof the story's commit ever
@@ -586,23 +628,48 @@ if [ -z "$FORCE_STORY_ID" ]; then
         TASK_MERGE_VERIFIED=1
       fi
 
+      # ga-as3p1: the bead-scoped scan above proves "some commit for this
+      # bead id landed" — true for ANY slice that ever passed, not
+      # necessarily the slice that is CURRENTLY failing (multi-slice
+      # false-positive, measured live on wa-7l2u3 — see
+      # task_reconciler_failed_sha_resolved's header for the full incident).
+      # When a gate-sha-failed stamp names the SPECIFIC rejected sha, that is
+      # strictly better evidence and must override the bead-scoped guess in
+      # BOTH directions (a still-unmerged failed sha must NOT be waved
+      # through just because a sibling slice merged; an ancestor failed sha
+      # DOES resolve, even absent a bead-scoped hit — the hold-class case).
+      # No stamp recorded at all ("absent") leaves TASK_MERGE_VERIFIED at the
+      # bead-scoped value above — there is nothing sha-specific to disprove
+      # staleness with, so this falls back to the pre-ga-as3p1 behavior
+      # rather than guessing in either direction.
+      if [ "$TASK_CONTRADICTED" = "1" ]; then
+        TASK_LABELS_SPACE=$(echo "$TASK_BEAD" | jq -r '(.labels // []) | join(" ")' 2>/dev/null || echo "")
+        case "$(task_reconciler_failed_sha_resolved "$TASK_GDIR" "$TASK_CONTAINER" "origin/$TASK_DEFAULT_BRANCH" "$TASK_LABELS_SPACE")" in
+          yes) TASK_MERGE_VERIFIED=1 ;;
+          no)  TASK_MERGE_VERIFIED=0 ;;
+          *)   : ;;  # absent — keep the bead-scoped TASK_MERGE_VERIFIED as-is
+        esac
+      fi
+
       # ga-tuk26: if the contradiction is now independently PROVEN stale
       # (contradicted AND the commit really did land), clear the residual
       # gate:failed/gate:needs-fix labels regardless of the eventual verdict
       # below (close, or kept for an unrelated reason like partial-scope) —
       # a bead should never sit there LOOKING contradicted once we have
       # positive proof it is not. Never runs in the unverified case (stays
-      # maximally conservative — see task_reconciler_verdict).
+      # maximally conservative — see task_reconciler_verdict). ga-as3p1:
+      # TASK_MERGE_VERIFIED is now sha-scoped whenever a gate-sha-failed
+      # stamp exists (see above); this block is otherwise unchanged.
       TASK_CONTRADICTION_RESOLVED=0
       if [ "$TASK_CONTRADICTED" = "1" ] && [ "$TASK_MERGE_VERIFIED" = "1" ]; then
         TASK_CONTRADICTION_RESOLVED=1
-        log "Task reconciler: $TASK_BEAD_ID contradiction (gate:failed/gate:needs-fix) proven STALE — a commit for this bead is verified in origin/$TASK_DEFAULT_BRANCH (ga-tuk26). Clearing residual labels."
+        log "Task reconciler: $TASK_BEAD_ID contradiction (gate:failed/gate:needs-fix) proven STALE — the rejected sha (or, absent a gate-sha-failed stamp, a commit for this bead) is verified in origin/$TASK_DEFAULT_BRANCH (ga-as3p1/ga-tuk26). Clearing residual labels."
         if [ "$DRY_RUN" = "1" ]; then
           log "DRY_RUN=1 — WOULD: bd -C $TASK_STORE label remove $TASK_BEAD_ID gate:failed / gate:needs-fix (ga-tuk26 stale-contradiction clear)"
         else
           bd -C "$TASK_STORE" label remove "$TASK_BEAD_ID" "gate:failed" -q 2>/dev/null || true
           bd -C "$TASK_STORE" label remove "$TASK_BEAD_ID" "gate:needs-fix" -q 2>/dev/null || true
-          bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-tuk26): gate:failed/gate:needs-fix cleared — independently verified a commit for this bead IS in origin/$TASK_DEFAULT_BRANCH (content check, ga-266z8 discipline), proving the coexisting gate:passed reflects the latest cycle and the earlier FAIL-cycle residue was stale." 2>/dev/null || true
+          bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-as3p1/ga-tuk26): gate:failed/gate:needs-fix cleared — independently verified (sha-scoped where a gate-sha-failed stamp exists, ga-as3p1; bead-scoped content check otherwise, ga-266z8) that origin/$TASK_DEFAULT_BRANCH now contains the resolving commit, proving the coexisting gate:passed reflects the latest cycle and the earlier FAIL-cycle residue was stale." 2>/dev/null || true
         fi
       fi
 

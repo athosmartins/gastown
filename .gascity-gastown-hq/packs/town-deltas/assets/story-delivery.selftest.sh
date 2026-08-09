@@ -43,6 +43,7 @@ STORY_DELIVERY_LIB_ONLY=1 source "$SCRIPT" \
   || { echo "FATAL: could not source story-delivery.sh in lib-only mode"; exit 1; }
 for fn in rig_gitdir git_in token_bounded subject_impl_scopes_bead \
           scan_commit_subject_for_bead task_reconciler_verdict \
+          task_reconciler_failed_sha_resolved \
           extract_gate_merge_info story_merge_verdict; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by story-delivery.sh"; exit 1; }
 done
@@ -276,6 +277,41 @@ rc1 story_merge_verdict "$BARE_GDIR" "$BARE_CONTAINER" "main" "deadbeefdeadbeefd
 eq "verdict: branch_ref does not resolve → unresolvable" \
    "$(story_merge_verdict "$BARE_GDIR" "$BARE_CONTAINER" "no-such-ref" "$FOUND_SHA")" "unresolvable"
 rc1 story_merge_verdict "$BARE_GDIR" "$BARE_CONTAINER" "no-such-ref" "$FOUND_SHA"
+
+# ── 7. task_reconciler_failed_sha_resolved — ga-as3p1 (sha-scoped, not bead) ─
+# Reuses this section's own fixtures: $FOUND_SHA is on main (the "slice that
+# passed and merged" role); $SIDE_SHA is a real commit that exists but was
+# never merged to main (the "slice that failed and never merged" role) — the
+# exact wa-7l2u3 shape (8b2c5ffe merged / df90c973 rejected, never merged).
+echo "── 7. task_reconciler_failed_sha_resolved (ga-as3p1: sha-scoped, not bead-scoped) ──"
+
+eq "no gate-sha-failed label at all → absent (nothing to disprove staleness with)" \
+   "$(task_reconciler_failed_sha_resolved "$BARE_GDIR" "$BARE_CONTAINER" "main" "gate:failed gate:needs-fix lane:small")" \
+   "absent"
+
+eq "gate-sha-failed on the MERGED sha (hold-class resolution) → yes" \
+   "$(task_reconciler_failed_sha_resolved "$BARE_GDIR" "$BARE_CONTAINER" "main" "gate:needs-fix gate-sha-failed:${FOUND_SHA}:hold")" \
+   "yes"
+
+eq "gate-sha-failed on the NEVER-MERGED sha (wa-7l2u3 shape) → no, keep the labels" \
+   "$(task_reconciler_failed_sha_resolved "$BARE_GDIR" "$BARE_CONTAINER" "main" "gate:failed gate-sha-failed:${SIDE_SHA}:code")" \
+   "no"
+
+eq "legacy unclassed gate-sha-failed:<sha> (wa-7l2u3's REAL label, no :class) → no" \
+   "$(task_reconciler_failed_sha_resolved "$BARE_GDIR" "$BARE_CONTAINER" "main" "gate:failed gate-sha-failed:${SIDE_SHA}")" \
+   "no"
+
+# THE ga-as3p1 REGRESSION CASE: a multi-slice bead where one stamp resolved
+# and another did not must NOT clear — one still-live rejection blocks the
+# whole set, exactly the "bead-scoped scan found the OTHER slice" false
+# positive this function replaces.
+eq "ga-as3p1: mixed stamps (one merged + one never-merged) → no (one live rejection blocks all)" \
+   "$(task_reconciler_failed_sha_resolved "$BARE_GDIR" "$BARE_CONTAINER" "main" "gate:failed gate-sha-failed:${FOUND_SHA}:code gate-sha-failed:${SIDE_SHA}:code")" \
+   "no"
+
+eq "gate-sha-failed on a sha that never existed at all → no (fail-closed, not false-yes)" \
+   "$(task_reconciler_failed_sha_resolved "$BARE_GDIR" "$BARE_CONTAINER" "main" "gate-sha-failed:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef:code")" \
+   "no"
 
 echo ""
 echo "═══════════════════════════════════════"
