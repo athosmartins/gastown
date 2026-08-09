@@ -424,6 +424,25 @@ for entry in "${CANDIDATES[@]}"; do
     ERROR_DETAILS="${ERROR_DETAILS}${DB}: integrity check failed (DB left in compacted state)\n"
     gt escalate "compactor-dog: integrity failure in $DB" -s HIGH \
       --reason "Row count mismatch after flatten compaction on $DB. DATABASE LEFT IN COMPACTED STATE — MANUAL INSPECTION REQUIRED." 2>/dev/null || true
+    # ga-wxwao (case 1): gt escalate's underlying mechanism never actually
+    # reaches a human — ~/gt/settings/escalation.json's contacts are empty,
+    # so email:human/sms:human are no-ops (ga-aw2ga). ADD the canonical
+    # escalate_emergency() path alongside (not replacing) gt escalate above,
+    # whose bead-tracking side effect is still worth keeping. Message
+    # deliberately does NOT cite $TABLE/$PRE/$POST_COUNT: by this point they
+    # hold whatever the LAST iteration of the two table-scan loops above
+    # evaluated, not necessarily the table that actually failed integrity
+    # (no per-failure accumulator exists) — a specific-but-possibly-wrong
+    # table/count pairing in a human-facing 🚨 alert is worse than pointing
+    # at the log, which already has the exact per-table "INTEGRITY FAILURE"
+    # lines this loop logged as it found them.
+    if ! _ESC_ERR=$(python3 /Users/athos/gt/.gascity-gastown-hq/scripts/escalate_emergency.py \
+        --class data-security \
+        --title "compactor-dog: integrity failure in $DB" \
+        "Row count mismatch or missing table detected after flatten compaction on $DB — DATABASE LEFT IN COMPACTED STATE, MANUAL INSPECTION REQUIRED. See the compactor-dog log for the specific table(s) and counts." \
+        2>&1 >/dev/null); then
+      log "  [handled] escalate_emergency.py call failed (non-fatal — gt escalate above still fired): $_ESC_ERR"
+    fi
     continue
   fi
 

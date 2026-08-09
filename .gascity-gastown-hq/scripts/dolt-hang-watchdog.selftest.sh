@@ -271,6 +271,52 @@ if [ -f "$SRC" ]; then
                             || bad "ga-153cq regressao: esperava 4 call-sites de 'if is_dry_run', achei ${_gate_count} — algum ramo de mutacao ficou sem gate"
 fi
 
+# ── ga-wxwao (case 2): the post-restart "still unhealthy" branch must call the
+# canonical escalate_emergency() path (--class town-halted), not the raw ad-hoc
+# `notify -p 5` it used to (which only ever reached push because its message
+# happened to contain "NEEDS HUMAN", matching notify's own content classifier —
+# a silent, wording-dependent fragility). Static check, not dynamic: reaching
+# this branch by actually running the script means surviving the SAME
+# kill -QUIT + restart machinery the gate-FAIL 2/3 blocks above work so hard to
+# avoid — and here `pgrep -f 'dolt sql-server'` would find THIS HOST'S REAL
+# PRODUCTION Dolt process, not a scratch fixture (no STRIKES/veto-file-style
+# override exists for "which PID looks like Dolt" at the kill site). There is
+# no safe way to dynamically exercise this specific branch. The function being
+# called (escalate_emergency.py) has its own independent --selftest (17/0 as of
+# this fix) — this file's job is only to prove the RIGHT call, with the RIGHT
+# class, replaced the old raw notify, not to re-verify escalate_emergency()'s
+# own internals. ──
+echo "ga-wxwao: post-restart still-unhealthy branch calls escalate_emergency (--class town-halted), not raw notify"
+if [ -f "$SRC" ]; then
+  _still_unhealthy_block=$(sed -n '/WARN: Dolt STILL unhealthy after restart/,/^fi$/p' "$SRC")
+  if [ -n "$_still_unhealthy_block" ]; then
+    if printf '%s' "$_still_unhealthy_block" | grep -q 'escalate_emergency\.py'; then
+      ok "still-unhealthy branch calls escalate_emergency.py"
+    else
+      bad "ga-wxwao regressao: still-unhealthy branch nao chama mais escalate_emergency.py"
+    fi
+    if printf '%s' "$_still_unhealthy_block" | grep -q -- '--class town-halted'; then
+      ok "escalate_emergency call uses --class town-halted (correct sanctioned class)"
+    else
+      bad "ga-wxwao regressao: escalate_emergency call nao usa --class town-halted"
+    fi
+    if printf '%s' "$_still_unhealthy_block" | grep -qE "notify[[:space:]]+-p[[:space:]]+5[[:space:]]+-t[[:space:]]+'Dolt hang-watchdog'"; then
+      bad "ga-wxwao regressao: ramo still-unhealthy AINDA chama notify -p 5 direto — dupla notificacao (escalate_emergency ja chama notify internamente)"
+    else
+      ok "raw ad-hoc 'notify -p 5' call removed from still-unhealthy branch (no double-notify)"
+    fi
+    if printf '%s' "$_still_unhealthy_block" | grep -q "NEEDS HUMAN"; then
+      ok "message still says NEEDS HUMAN (human-readable urgency preserved, even though it's no longer load-bearing for notify's own classifier)"
+    else
+      bad "ga-wxwao: NEEDS HUMAN text lost from the escalation message"
+    fi
+  else
+    bad "nao achei o bloco still-unhealthy no fonte — drift-guard nao rodou"
+  fi
+else
+  bad "nao achei o script ao lado — asserts do ga-wxwao nao rodaram"
+fi
+
 echo
 echo "dolt-hang-watchdog selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -294,7 +294,22 @@ if probe_ok; then
   command -v notify >/dev/null 2>&1 && notify -p 4 -t 'Dolt hang-watchdog' "Restarted HUNG Dolt after ${n} strikes — now healthy" >/dev/null 2>&1 || true
 else
   log "WARN: Dolt STILL unhealthy after restart — escalating."
-  command -v notify >/dev/null 2>&1 && notify -p 5 -t 'Dolt hang-watchdog' "Restart attempted but Dolt STILL unhealthy after ${n} strikes — NEEDS HUMAN" >/dev/null 2>&1 || true
+  # ga-wxwao (case 2): migrated from an ad-hoc `notify -p 5` call to the
+  # canonical escalate_emergency() path — same eventual notify (it calls
+  # notify -p 5 internally with NOTIFY_FORCE_PUSH=1), PLUS mayor mail and a
+  # ledger audit trail this site never had. Also removes a "by luck of
+  # wording" fragility: this call only ever reached push because its message
+  # happened to contain "NEEDS HUMAN", matching notify's own content
+  # classifier — a future reword would have silently stopped pushing with no
+  # test catching it. DRY_RUN cannot reach this line at all (is_dry_run()
+  # exits unconditionally at line 257, well before here — see ga-153cq's
+  # note above), so no separate dry-run threading is needed: by the time
+  # we're here, this is a real, confirmed-still-unhealthy event.
+  python3 /Users/athos/gt/.gascity-gastown-hq/scripts/escalate_emergency.py \
+    --class town-halted \
+    --title "Dolt hang-watchdog: restart did not recover" \
+    "Restart attempted but Dolt STILL unhealthy after ${n} strikes — NEEDS HUMAN." \
+    >> "$LOG" 2>&1 || log "WARN: escalate_emergency.py call failed (non-fatal)"
 fi
 rm -f "$STRIKES"
 exit 0

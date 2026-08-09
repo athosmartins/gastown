@@ -21,8 +21,18 @@ validate_hash() {
 }
 
 # Verify our copy matches run.sh (guard against drift).
-RUN_SH_REGEX=$(sed -n '/^validate_hash/,/^}/p' "$SCRIPT_DIR/run.sh" | grep -oP '\^\[.*\]\+\$')
-TEST_REGEX=$(sed -n '/^validate_hash/,/^}/p' "$0" | grep -oP '\^\[.*\]\+\$')
+# ga-wxwao: -oP (PCRE) -> -oE (POSIX ERE). Found while adding this file's own
+# new checks below: this line crashes ("grep: invalid option -- P") the instant
+# the script runs as a plain subprocess (`bash run_test.sh`) on stock macOS
+# grep, which has no -P support — it only ever appeared to work inside an
+# interactive Claude Code shell, whose `grep` is itself a function wrapping
+# ugrep (PCRE-capable). Every new assertion appended after this line was
+# unreachable without fixing it first. No behavior change: the pattern
+# (`\^\[.*\]\+\$` — literal ^, [, ], +, $ with a .* wildcard between) uses no
+# PCRE-only construct, so -E produces byte-identical output (verified against
+# the real validate_hash source line before switching).
+RUN_SH_REGEX=$(sed -n '/^validate_hash/,/^}/p' "$SCRIPT_DIR/run.sh" | grep -oE '\^\[.*\]\+\$')
+TEST_REGEX=$(sed -n '/^validate_hash/,/^}/p' "$0" | grep -oE '\^\[.*\]\+\$')
 if [[ "$RUN_SH_REGEX" != "$TEST_REGEX" ]]; then
   echo "FAIL: validate_hash regex in test ($TEST_REGEX) doesn't match run.sh ($RUN_SH_REGEX)"
   echo "      Update the test to match run.sh"
@@ -68,6 +78,44 @@ assert_invalid "hash with spaces"
 assert_invalid ""
 assert_invalid "../../../etc/passwd"
 assert_invalid "'; DROP TABLE issues; --"
+
+echo ""
+echo "=== ga-wxwao: integrity-failure escalation drift-guards ==="
+
+# ga-wxwao: static checks, not dynamic — the integrity-failure branch lives
+# deep inside a real-Dolt compaction loop (dolt_query/dolt_exec against a live
+# server) that this file's existing tests don't exercise at all (they only
+# cover the validate_hash helper in isolation). Building a full mock-Dolt
+# harness for the compaction loop is out of scope for this bead; the CLI
+# invocation itself was smoke-tested directly with ESCALATE_DRY_RUN=1 during
+# development. What matters here is that the wiring didn't silently drift.
+assert_contains_once() {
+  local pattern="$1" desc="$2"
+  local count
+  # `if ! count=$(cmd); then count=0; fi`, not a bare assignment: under this
+  # file's `set -euo pipefail`, `grep -c` returning rc=1 on a genuine
+  # zero-match regression would otherwise abort the WHOLE script right here,
+  # silently, before ever reaching the check below that's supposed to report
+  # "FAIL: ...". A test that can only pass, never actually fail-and-report,
+  # isn't a test — verified live (this exact assignment shape, this exact
+  # flag set, killed a throwaway script with no output at all).
+  if ! count=$(grep -c -- "$pattern" "$SCRIPT_DIR/run.sh"); then
+    count=0
+  fi
+  if [[ "$count" -ge 1 ]]; then
+    echo "  ok: $desc"
+  else
+    echo "FAIL: $desc — pattern not found: $pattern"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
+assert_contains_once "escalate_emergency\.py" \
+  "integrity-failure branch calls escalate_emergency.py (ga-wxwao case 1 — gt escalate alone never reaches a human, empty contacts in escalation.json)"
+assert_contains_once "--class data-security" \
+  "escalate_emergency call uses --class data-security (correct sanctioned class for a Dolt integrity failure)"
+assert_contains_once 'gt escalate "compactor-dog: integrity failure' \
+  "original gt escalate call is PRESERVED alongside the new one (its bead-tracking side effect is still worth keeping — this was an ADD, not a replace)"
 
 echo ""
 if [[ $FAILURES -gt 0 ]]; then
