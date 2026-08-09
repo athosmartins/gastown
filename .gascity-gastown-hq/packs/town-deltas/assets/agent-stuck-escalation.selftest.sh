@@ -1035,6 +1035,35 @@ assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test35" "T51: escalati
 assert_contains "$WORK/last_mail_body.txt" "SÓ DEPOIS de confirmar" "T51: mail body requires peek confirmation before any destructive action"
 assert_contains "$WORK/last_mail_body.txt" "raciocínio longo, subagente ativo" "T51: mail body flags the false-positive possibility up front"
 
+# ── T52: BLOQUEADO-EM-PROMPT body must timestamp its evidence and make the
+# nudge-ban conditional, not absolute (ga-swmbf). Measured live 2026-08-09:
+# by the time a human acted on this exact mail, the pane snapshot was 57min
+# stale and the session had already moved on — the body's old wording
+# presented "o pane confirma um diálogo interativo aberto" as a PRESENT
+# fact and unconditionally said "Não tente nudge aqui", so a reader who
+# trusted the mail literally would send a blind keystroke into a live,
+# unrelated turn. Same fixture as T34 (fresh dialog, confirmed at scan
+# time) — the detection behavior (T34) must be unchanged; only the body's
+# wording changes to require re-confirmation and to allow nudge once the
+# dialog is gone.
+echo "T52: BLOQUEADO-EM-PROMPT body requires reconfirmation before acting and does not unconditionally ban nudge (ga-swmbf)"
+echo '{"sessions":[{"name":"dog-test6","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-test6 3600 '[{"type":"assistant","message":{"stop_reason":"tool_use"},"blocks":[{"type":"tool_use","name":"Bash","input":{"command":"rm -rf scripts/__pycache__"}}]}]'
+{
+    echo "Permission rule Bash(rm -rf:*) requires confirmation for this command."
+    echo "Do you want to proceed?  1. Yes  2. Yes, and don't ask again  3. No"
+} > "$PEEK_FIXTURE_DIR/dog-test6.txt"
+printf '[%s]' "$(make_bead ga-test36 dog-test6 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test36"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente BLOQUEADO EM PROMPT (1 tecla resolve): ga-test36" "T52: differentiated escalation subject still fires (detection unchanged)"
+assert_contains "$WORK/last_mail_body.txt" "RECONFIRME" "T52: body demands re-confirmation, not trust in the snapshot"
+assert_contains "$WORK/last_mail_body.txt" "coletada às" "T52: body timestamps when the pane evidence was collected"
+assert_absent "$WORK/last_mail_body.txt" "nudge aqui." "T52: nudge is no longer banned unconditionally"
+assert_contains "$WORK/last_mail_body.txt" "nudge é a ferramenta certa" "T52: body allows nudge once the dialog is confirmed gone"
+rm -f "$LOGS_FIXTURE_DIR/dog-test6.json" "$PEEK_FIXTURE_DIR/dog-test6.txt"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

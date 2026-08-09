@@ -577,37 +577,44 @@ for b in d:
 # two places now.
 build_permission_prompt_body() {
     local bead_id="$1" title="$2" assignee_display="$3" live_session_name="$4" \
-          blocked_cmd="$5" age_min="$6" failure_markers="$7"
+          blocked_cmd="$5" age_min="$6" failure_markers="$7" observed_at="$8"
     cat <<BODY
-CAMADA 2 — ESCALAÇÃO AUTOMÁTICA: agente BLOQUEADO EM PROMPT DE PERMISSÃO
-(NÃO é um stall genérico — o pane confirma um diálogo interativo aberto).
+CAMADA 2 — ESCALAÇÃO AUTOMÁTICA: possível agente BLOQUEADO EM PROMPT DE PERMISSÃO
+(evidência coletada às ${observed_at} — NESSE INSTANTE o pane mostrava um
+diálogo interativo aberto. Isto é um retrato, não o estado agora: pode já
+ter mudado no tempo até você ler este e-mail. RECONFIRME no passo 1 antes
+de agir — não assuma que o diálogo ainda está lá).
 
 Bead:      $bead_id — $title
 Assignee:  ${assignee_display:-'(não atribuído)'}
 Sessão:    $live_session_name
-Comando bloqueado: $blocked_cmd
+Comando bloqueado (na leitura de ${observed_at}): $blocked_cmd
 Sem update há: ${age_min} minutos (limiar: $(( STUCK_AGENT_SEC / 60 )) min)
 Marcadores de falha: $failure_markers
 
-O QUE ACONTECEU: mesmo com bypass de permissões ativo, uma regra "ask"
-explícita ainda exigiu confirmação e a sessão está parada num diálogo como:
+O QUE PODE TER ACONTECIDO: mesmo com bypass de permissões ativo, uma regra
+"ask" explícita pode ter exigido confirmação, parando a sessão num diálogo
+como:
   "Do you want to proceed?  1. Yes  2. Yes, and don't ask again  3. No"
-\`gc session nudge\` NÃO resolve isso — a mensagem fica em fila e só é
-processada DEPOIS do diálogo (verificado: 105s+ sem efeito). Não tente
-nudge aqui.
 
-AÇÃO SUGERIDA (confirmação antes de agir, resolve em segundos, não é kill):
-1. gc session peek $live_session_name --lines 40 — confirme o texto exato do prompt
-2. Responda a tecla certa DIRETAMENTE no pane (exceção documentada da
-   doutrina de pool — nudge não serve pra isto): tmux send-keys -t <pane>
-   '1' Enter (ou a tecla da opção CORRETA — leia o prompt antes, não assuma
-   sempre '1')
-3. Depois de destravar: se esta regra de permissão alcança sessões de pool
-   não-supervisionadas, considere virar "deny"/"allow" — nunca "ask"
-   (ga-q640n/AC3).
+AÇÃO SUGERIDA (o passo 1 decide o resto — não pule pro passo 2 sem reler o pane):
+1. gc session peek $live_session_name --lines 40 — releia o pane AGORA, não
+   confie só no snapshot acima.
+2. SE o diálogo AINDA estiver lá: responda a tecla certa DIRETAMENTE no
+   pane (exceção documentada da doutrina de pool — \`gc session nudge\`
+   fica em fila atrás do diálogo e só é processado DEPOIS dele, verificado:
+   105s+ sem efeito): tmux send-keys -t <pane> '<tecla>' Enter (leia a
+   opção CORRETA no prompt relido no passo 1 — não assuma sempre '1').
+   SE o diálogo JÁ NÃO estiver lá (a sessão pode ter avançado sozinha, ou
+   já foi destravada por outra via): NÃO envie tecla às cegas — sem diálogo
+   pendente, nudge é a ferramenta certa e não-destrutiva; use gc session
+   nudge normalmente.
+3. Depois de destravar via tecla (ramo 2 acima): se esta regra de permissão
+   alcança sessões de pool não-supervisionadas, considere virar
+   "deny"/"allow" — nunca "ask" (ga-q640n/AC3).
 
 Limiar configurável via STUCK_AGENT_SEC (atual: ${STUCK_AGENT_SEC}s).
-(Daemon: agent-stuck-escalation · ga-qw3p.2 · permission-prompt: ga-iog1v/ga-q640n)
+(Daemon: agent-stuck-escalation · ga-qw3p.2 · permission-prompt: ga-iog1v/ga-q640n · reconfirmação: ga-swmbf)
 BODY
 }
 
@@ -1009,6 +1016,7 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
         # signal, never reintroducing the noise ga-n937 killed.
         gate_reviewer_sess="$(gate_reviewer_permission_prompt_session "$bead_id" 2>/dev/null || true)"
         if [ -n "$gate_reviewer_sess" ]; then
+            gate_observed_at="$(date '+%Y-%m-%d %H:%M:%S')"
             gate_blocked_cmd="$(permission_prompt_blocked_command "$gate_reviewer_sess" 2>/dev/null || true)"
             [ -z "$gate_blocked_cmd" ] && gate_blocked_cmd="(comando não determinado — veja gc session peek $gate_reviewer_sess --lines 40)"
             log "$bead_id: EM GATE mas reviewer $gate_reviewer_sess BLOQUEADO-EM-PROMPT ${age_min}min — NÃO suprimindo (ga-lxk26): comando=[$gate_blocked_cmd]"
@@ -1020,7 +1028,7 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
                 gate_failure_markers="${gate_failure_markers}story:blocked "
             fi
             [ -z "$gate_failure_markers" ] && gate_failure_markers="nenhum"
-            gate_body="$(build_permission_prompt_body "$bead_id" "$title" "(bead sem assignee — EM GATE; reviewer=$gate_reviewer_sess)" "$gate_reviewer_sess" "$gate_blocked_cmd" "$age_min" "$gate_failure_markers")"
+            gate_body="$(build_permission_prompt_body "$bead_id" "$title" "(bead sem assignee — EM GATE; reviewer=$gate_reviewer_sess)" "$gate_reviewer_sess" "$gate_blocked_cmd" "$age_min" "$gate_failure_markers" "$gate_observed_at")"
             send_escalation "$bead_id" "$title" "$labels" "$age_min" "$gate_reviewer_sess" "1" "Agente BLOQUEADO EM PROMPT (1 tecla resolve)" "$gate_body" "$sf"
             continue
         fi
@@ -1202,8 +1210,10 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
     # exato + pane — porque aqui basta 1 tecla, não um kill/reclaim.
     permission_prompt_detected=0
     blocked_cmd=""
+    observed_at=""
     if [ "$transcript_state" = "frozen" ] && [ -n "$live_session_name" ] && pane_shows_permission_prompt "$live_session_name"; then
         permission_prompt_detected=1
+        observed_at="$(date '+%Y-%m-%d %H:%M:%S')"
         blocked_cmd="$(permission_prompt_blocked_command "$live_session_name" 2>/dev/null || true)"
         [ -z "$blocked_cmd" ] && blocked_cmd="(comando não determinado — veja gc session peek $live_session_name --lines 40)"
     fi
@@ -1234,7 +1244,7 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
     mail_subject_prefix="Agente travado"
     if [ "$permission_prompt_detected" = "1" ]; then
         mail_subject_prefix="Agente BLOQUEADO EM PROMPT (1 tecla resolve)"
-        body="$(build_permission_prompt_body "$bead_id" "$title" "$assignee" "$live_session_name" "$blocked_cmd" "$age_min" "$failure_markers")"
+        body="$(build_permission_prompt_body "$bead_id" "$title" "$assignee" "$live_session_name" "$blocked_cmd" "$age_min" "$failure_markers" "$observed_at")"
     else
         body="$(cat <<BODY
 CAMADA 2 — ESCALAÇÃO AUTOMÁTICA: bead in_progress sem ESCRITA detectada há
