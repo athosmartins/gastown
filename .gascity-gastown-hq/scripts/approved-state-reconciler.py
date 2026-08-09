@@ -992,7 +992,7 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
         "%s\n\n"
         "This bead matched NONE of this reconciler's known non-buildable signals\n"
         "(blocked-on:*, waiting-on:*, depends-on:*, next-action:*, pool:refused:*,\n"
-        "gate:{needs-fix,failed,queued,reviewing,needs-human}, exec:manual,\n"
+        "gate:{needs-fix,failed,queued,reviewing,needs-human}, exec:manual, ctx:thin,\n"
         "pilot:held(-until:*), pilot:reclaim-count:N). It should have been\n"
         "dispatched within %dmin.\n\n"
         "INVESTIGAR:\n"
@@ -1893,6 +1893,27 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
         # Exact-match only (not a prefix check) — exec:auto must keep alarming if it starves.
         if park_labels.EXEC_MANUAL_LABEL in labels:
             _log("  %s: no signal, daemon-age=%.0fmin, exec:manual (awaiting human execution, "
+                 "not a dispatch failure) — no alarm" % (bead_id, starve_age_min))
+            continue
+
+        # ga-it3e8: ctx:thin — bead has too little context to build; it needs
+        # refino, not a builder, and the Pilot is correctly declining to
+        # dispatch it. This reconciler had NO concept of ctx:thin at all
+        # (grep -c 'ctx:thin' on this file was 0) despite it already being a
+        # NAMED member of park_labels.NOT_READY_LABELS — the other two
+        # park_labels consumers (imparavel-check.py, throughput-stall-
+        # watchdog.py) already recognize it; this reconciler's bespoke
+        # starve-alarm check is the one that had fallen out of sync (same
+        # class of gap ga-hzt8s/ga-m0ksy already fixed here for other
+        # labels). wa-b3eae (story:approved + ctx:thin + refino:creator-
+        # swept, no ctx:ready/exec:auto) alarmed "dispatch path failing"
+        # every cycle indefinitely, blaming the Pilot for a bead it was
+        # correctly leaving alone. Same shape as exec:manual above: suppress
+        # the alarm, do NOT reclassify — refino (not this reconciler) owns
+        # what happens to a ctx:thin bead next. Exact-match only — ctx:ready
+        # must keep alarming if it starves.
+        if park_labels.CTX_THIN_LABEL in labels:
+            _log("  %s: no signal, daemon-age=%.0fmin, ctx:thin (awaiting refino, "
                  "not a dispatch failure) — no alarm" % (bead_id, starve_age_min))
             continue
 
@@ -2949,6 +2970,50 @@ def _selftest():
             "exec:manual fix)")
     else:
         _bad("(v): exec:auto bead FAILED to alarm — exec:manual fix regressed exec:auto "
+             "dispatch-failure detection", "mail_calls=%s" % mail_calls)
+
+    print("\nScenario (ga-it3e8-a): ctx:thin bead → no starve alarm (awaiting refino, ga-it3e8)")
+    # Reproduces wa-b3eae's exact real-world label shape: story:approved + ctx:thin +
+    # refino:creator-swept, NO ctx:ready/exec:auto. ctx:thin means "too little context to
+    # build" — the bead needs refino, not a builder, and the Pilot is correctly declining to
+    # dispatch it. Before this fix the reconciler had NO concept of ctx:thin at all (grep -c
+    # 'ctx:thin' on this file was 0) despite it already being a named member of
+    # park_labels.NOT_READY_LABELS — the alarm fired "dispatch path failing" every cycle,
+    # blaming the Pilot for a bead it was correctly leaving alone.
+    _bd_approved = lambda root: [_make_bead(
+        "wa-it3e8a", labels=["story:approved", "ctx:thin", "refino:creator-swept"], age_min=0.1)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_it3e8a = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_it3e8a["first_seen_approved"]["wa-it3e8a"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_it3e8a)
+    alarmed_it3e8a = any("wa-it3e8a" in subj for subj, _ in mail_calls)
+    if not alarmed_it3e8a:
+        _ok("(ga-it3e8-a): ctx:thin bead — no starve alarm (awaiting refino, ga-it3e8)")
+    else:
+        _bad("(ga-it3e8-a): ctx:thin bead FALSELY alarmed as starving (false dispatch-failure mail)",
+             "mail_calls=%s" % mail_calls)
+
+    print("\nScenario (ga-it3e8-b): ctx:ready bead (not ctx:thin) → STILL alarms (regression guard)")
+    # Guard against a future refactor loosening the ctx:thin check to a prefix/substring match
+    # (or otherwise widening it) — ctx:ready means the bead HAS enough context and the Pilot
+    # should dispatch it, so a starving ctx:ready bead is a real dispatch failure and must keep
+    # alarming. Mirrors scenario (v)'s role for exec:manual/exec:auto — the test has to fail on
+    # the PRIOR HEAD's fix-less code too, but that code never suppressed ctx:ready either, so
+    # this scenario's real job is catching a FUTURE overcorrection, not this bead's own bug.
+    _bd_approved = lambda root: [_make_bead(
+        "wa-it3e8b", labels=["story:approved", "ctx:ready"], age_min=0.1)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_it3e8b = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_it3e8b["first_seen_approved"]["wa-it3e8b"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_it3e8b)
+    alarmed_it3e8b = any("wa-it3e8b" in subj for subj, _ in mail_calls)
+    if alarmed_it3e8b:
+        _ok("(ga-it3e8-b): ctx:ready bead — still alarms (exact-match guard, not swallowed by "
+            "the ctx:thin fix)")
+    else:
+        _bad("(ga-it3e8-b): ctx:ready bead FAILED to alarm — ctx:thin fix regressed ctx:ready "
              "dispatch-failure detection", "mail_calls=%s" % mail_calls)
 
     print("\nScenario (w): BUILT bead (marker lives in HQ), NOT flowing → no starve alarm "

@@ -66,6 +66,15 @@ BLOCKED_LABELS = ("blocked", "story:blocked")
 GATE_NEEDS_FIX_LABEL = "gate:needs-fix"
 GATE_FAILED_LABEL = "gate:failed"
 EXEC_MANUAL_LABEL = "exec:manual"
+# ga-it3e8: named individually (already a member of NOT_READY_LABELS below,
+# same as NEEDS_HUMAN_BARE_LABEL's relationship to NEEDS_HUMAN_LABELS above)
+# so approved-state-reconciler.py's starve-alarm suppress-check — a bespoke
+# single-label check, same shape as its EXEC_MANUAL_LABEL check right below
+# this constant's own consumer — has a canonical name to reference instead of
+# a bare "ctx:thin" string. A ctx:thin bead (too little context to build,
+# awaiting refino) alarmed "dispatch path failing" every cycle forever before
+# this fix — the Pilot was correctly declining to dispatch it.
+CTX_THIN_LABEL = "ctx:thin"
 PILOT_HELD_LABEL = "pilot:held"
 
 # ── grouped sets for consumers that just need "is this bead parked?" ────────
@@ -90,7 +99,7 @@ BLOCKED_FAMILY_LABELS = frozenset({
 # cancelled, parked pending an engine window or an external merge, or a pool
 # worker already declined it.
 NOT_READY_LABELS = frozenset({
-    "story:refinement-in-progress", "ctx:thin", "story:cancelled",
+    "story:refinement-in-progress", CTX_THIN_LABEL, "story:cancelled",
     "framework:engine", "story:awaiting-external-merge", "pool:refused",
 })
 
