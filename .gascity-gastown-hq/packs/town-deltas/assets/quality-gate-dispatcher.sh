@@ -2209,7 +2209,7 @@ gate_branch_already_merged() {
   printf '0'
 }
 
-# gate_release_stale_assignee <bead_id> [<city>]
+# gate_release_stale_assignee <bead_id> <merge_verified> [<city>]
 # ga-v5acl: shared clear-assignee primitive for every source-bead terminal
 # path (PASS handoff/close, Step 0a-4 reaper, Step 4b already-merged). A
 # plain `bd assign "" ` succeeds immediately in the common case (no live
@@ -2218,84 +2218,108 @@ gate_branch_already_merged() {
 # `bd reclaim --older-than 0s` FIRST — per its own contract (`bd reclaim
 # --help`) it reclaims ONLY a lease that has ALREADY expired, never a live
 # one, using bd's own TTL/heartbeat bookkeeping as the discriminator, not a
-# git-state heuristic — then retry the plain assign once more. NEVER uses
-# --force: force overwrites unconditionally regardless of whether the claim
-# is actually abandoned (its own --help text: "use only for abandoned
-# claims... prefer bd reclaim"); reclaim only touches what bd itself has
-# independently determined is stale. Replaces 3 of this file's 4 previously
-# inconsistent clear-assignee failure modes (warn-only / silent-no-warn) with
-# one shared, safer escalation. Deliberately defined BEFORE the
-# GATE_DISPATCHER_LIB_ONLY early-return (same reasoning as
+# git-state heuristic — then retry the plain assign once more. Deliberately
+# defined BEFORE the GATE_DISPATCHER_LIB_ONLY early-return (same reasoning as
 # gate_branch_already_merged above) so lib-only selftests can call it
 # directly; also wrapped in its own SELFTEST-EXTRACT markers so call sites
 # still covered by verbatim-block extraction (e.g. gate-verdict-status-
 # unreadable.selftest.sh's already-merged-source-bead-cleanup-fn splice) can
 # pull this function in alongside the block that calls it.
-# Returns 0 iff the bead ends up with no assignee; 1 otherwise (a live,
-# non-stale claim — callers must NOT then force a close either; see
-# gate_close_source_terminal below, which applies the identical discipline).
 #
-# ⚠️ CAVEAT confirmed while investigating THIS bead's own AC5 (filed as
-# ga-z93p0, P1, citywide): "lease expired" here is weaker than it sounds.
-# bd's real lease is refreshed ONLY by `bd heartbeat`, and nothing in this
-# city currently calls that — every formula that says "heartbeat" (e.g.
-# mol-do-work.toml) calls `gc bd heartbeat`, an unrelated dashboard-only
-# stamp. So in practice ANY claim looks lease-expired to `bd reclaim` ~5min
-# after being claimed (DefaultLeaseTTL), regardless of whether the claiming
-# worker is dead, throttled, or actively productive — confirmed live on
-# THIS bead's own claim during the AC5 investigation. `bd reclaim` is
-# therefore NOT a real liveness check as deployed today.
-# This function is still safe to call at ITS 3 sites (A/C/D) specifically
-# because each one independently verifies, via git, that the branch is
-# ALREADY MERGED to main before ever reaching this call — the reclaim isn't
-# being trusted to PROVE the claim is abandoned, it's only the mechanism to
-# get past bd's live-claim refusal on a claim already known (by an
-# independent, stronger signal) to be done. Do NOT call this function (or
-# gate_close_source_terminal) anywhere that lacks that independent
-# merge-verified precondition — there, "lease expired" would tell you
-# nothing about whether the claim is actually abandoned. See ga-z93p0 for
-# the full investigation and the citywide fix this bead does not attempt.
+# <merge_verified> is a REQUIRED literal "1", not optional sugar — it is the
+# caller's attestation that it has ALREADY confirmed, via git (merge-base/
+# patch-id — NOT this function, NOT `bd reclaim`), that the branch behind
+# this claim is merged. Anything else (missing, blank, "0") refuses outright
+# and returns 1 WITHOUT calling bd at all — a future call site that forgets
+# this precondition fails loudly instead of silently getting the weaker,
+# pre-ga-2emo8 behavior. Every one of this function's call sites must
+# establish that BEFORE calling (see each call site's own comment).
+#
+# ga-2emo8 (supersedes the pre-ga-z93p0 caveat this comment used to carry —
+# see git history for the original text): `bd reclaim --older-than 0s`
+# reclaims a lease ONLY if it has ALREADY EXPIRED. Before ga-z93p0, heartbeat
+# was fake (every formula's "heartbeat" step called `gc bd heartbeat`, an
+# unrelated dashboard-only stamp bd's own lease code never reads), so nearly
+# any claim looked stale within ~5min regardless of the worker's actual
+# state — reclaim-then-retry alone was enough. ga-z93p0 wired the REAL `bd
+# heartbeat` into mol-do-work.toml, called immediately before `git push` —
+# so a claim is now routinely still FRESH the moment this function runs,
+# seconds after its own branch merged. "Lease fresh" and "no work remains
+# behind this claim" are now two DIFFERENT questions, and reclaim only ever
+# answers the first (live-reproduced on ga-7mbry: both WARNs below fired
+# verbatim against a confirmed-merged, gate-PASSED source bead). This
+# function's authority to override a still-live claim comes from
+# <merge_verified> — the caller's independent, stronger signal — never from
+# reclaim succeeding. When the plain assign AND the reclaim-then-retry both
+# still fail, escalate ONE more step: a bead-scoped `--force` (never blind —
+# gated on merge_verified="1" — and never ad hoc: this is the only place in
+# the file that does it, same centralization ga-v5acl already established
+# for the weaker escalation). This satisfies, rather than contradicts,
+# ga-v5acl's original concern about unconditional --force: the old site B
+# forced with NO independent proof of anything; this forces only after the
+# caller has independently proven the work is done.
+#
+# Returns 0 iff the bead ends up with no assignee; 1 otherwise (merge not
+# verified, or bd erroring on every attempt including the forced one).
 # SELFTEST-EXTRACT gate-release-stale-assignee-fn: BEGIN
 gate_release_stale_assignee() {
-  local _bead_id="$1" _city="${2:-$BEAD_CITY}"
+  local _bead_id="$1" _merge_verified="$2" _city="${3:-$BEAD_CITY}"
   [ -z "$_bead_id" ] && return 1
+  if [ "$_merge_verified" != "1" ]; then
+    warn "gate_release_stale_assignee: refusing $_bead_id — called without merge_verified=1 (ga-2emo8 contract)."
+    return 1
+  fi
   if bd -C "$_city" assign "$_bead_id" "" -q 2>/dev/null; then
     return 0
   fi
   bd -C "$_city" reclaim --id "$_bead_id" --older-than 0s -q 2>/dev/null || true
-  bd -C "$_city" assign "$_bead_id" "" -q 2>/dev/null
+  if bd -C "$_city" assign "$_bead_id" "" -q 2>/dev/null; then
+    return 0
+  fi
+  warn "  Assignee clear on $_bead_id still refused after lease-aware reclaim — forcing (ga-2emo8: merge independently verified by caller)."
+  bd -C "$_city" assign "$_bead_id" "" --force -q 2>/dev/null
 }
 # SELFTEST-EXTRACT gate-release-stale-assignee-fn: END
 
-# gate_close_source_terminal <bead_id> <close_reason> [<city>]
+# gate_close_source_terminal <bead_id> <close_reason> <merge_verified> [<city>]
 # ga-v5acl: shared close-with-lease-aware-retry primitive, sibling to
-# gate_release_stale_assignee above (same escalation mechanism — bd reclaim
-# --older-than 0s, never --force — applied to the CLOSE call instead of
-# assign). Replaces the one site (the old PASS-path bug/task close, ga-esbg/
-# wa-j824s) that used to escalate to `bd assign ... --force` + `bd close
-# ... --force` UNCONDITIONALLY, without checking the claim was actually
-# abandoned — exactly what bd's own --force --help text warns against.
-# Prints the bd close error once (via warn) on the first failed attempt, so
-# the log names what happened before the silent reclaim-and-retry. Returns 0
-# iff the bead ends up closed; 1 otherwise (a live, non-stale claim — the
-# bead correctly stays open+assigned; the caller's post-merge verification
-# will surface the residual re-pick vector instead of this function pretending
-# it succeeded). Same LIB_ONLY-early / SELFTEST-EXTRACT placement rationale
-# as gate_release_stale_assignee — including its ⚠️ CAVEAT (ga-z93p0):
-# "lease expired" is not a real liveness signal in this city today. Only
-# call this from a site that has independently verified the branch is
-# already merged, same as this function's own 3 call sites (B/C/D).
+# gate_release_stale_assignee above (same escalation mechanism, applied to
+# the CLOSE call instead of assign). Replaces the one site (the old
+# PASS-path bug/task close, ga-esbg/wa-j824s) that used to escalate to
+# `bd assign ... --force` + `bd close ... --force` UNCONDITIONALLY, without
+# checking the claim was actually abandoned. Prints the bd close error once
+# (via warn) on the first failed attempt, so the log names what happened
+# before the reclaim-and-retry. Same LIB_ONLY-early / SELFTEST-EXTRACT
+# placement rationale, same required <merge_verified> contract, and the same
+# ga-2emo8 force-escalation as gate_release_stale_assignee above — see its
+# header comment for the full reasoning (why reclaim alone stopped being
+# enough post-ga-z93p0, and why a merge-verified-gated --force here doesn't
+# reopen ga-v5acl's original concern). Only call this from a site that has
+# independently verified the branch is already merged, same as this
+# function's own 3 call sites (B/C/D).
+#
+# Returns 0 iff the bead ends up closed; 1 otherwise (merge not verified, or
+# bd erroring on every attempt including the forced one — the caller's
+# post-merge verification surfaces the residual re-pick vector).
 # SELFTEST-EXTRACT gate-close-source-terminal-fn: BEGIN
 gate_close_source_terminal() {
-  local _bead_id="$1" _reason="$2" _city="${3:-$BEAD_CITY}"
+  local _bead_id="$1" _reason="$2" _merge_verified="$3" _city="${4:-$BEAD_CITY}"
   local _out _rc=0
+  if [ "$_merge_verified" != "1" ]; then
+    warn "gate_close_source_terminal: refusing $_bead_id — called without merge_verified=1 (ga-2emo8 contract)."
+    return 1
+  fi
   _out=$(bd -C "$_city" close "$_bead_id" -r "$_reason" 2>&1) || _rc=$?
   if [ "$_rc" -eq 0 ]; then
     return 0
   fi
   warn "  Close of $_bead_id failed: $(printf '%s' "$_out" | head -1) — retrying after lease-aware reclaim (ga-v5acl)."
   bd -C "$_city" reclaim --id "$_bead_id" --older-than 0s -q 2>/dev/null || true
-  bd -C "$_city" close "$_bead_id" -r "$_reason" 2>/dev/null
+  if bd -C "$_city" close "$_bead_id" -r "$_reason" 2>/dev/null; then
+    return 0
+  fi
+  warn "  Close of $_bead_id still refused after lease-aware reclaim — forcing (ga-2emo8: merge independently verified by caller)."
+  bd -C "$_city" close "$_bead_id" -r "$_reason" --force 2>/dev/null
 }
 # SELFTEST-EXTRACT gate-close-source-terminal-fn: END
 
@@ -4030,10 +4054,13 @@ fi
       #     removes it from the pool in_progress crash-recovery selector
       #     (--assignee <builder>) and from the Pilot's assigned-bead exclusion,
       #     breaking the re-spawn loop even if the close/handoff below fails.
-      # ga-v5acl: escalates via lease-aware `bd reclaim` (never blind --force)
-      # when the plain assign is refused — see gate_release_stale_assignee.
+      # ga-v5acl: escalates via lease-aware `bd reclaim`, then (ga-2emo8) a
+      # merge-verified --force, when the plain assign is refused — see
+      # gate_release_stale_assignee. merge_verified=1: this PASS path only
+      # reaches here after a confirmed successful merge (MERGE_SHA set above
+      # by the merge step itself).
       if [ -n "$BUILDER_ASSIGNEE" ]; then
-        gate_release_stale_assignee "$BEAD_ID" \
+        gate_release_stale_assignee "$BEAD_ID" 1 \
           || warn "Could not clear builder assignee on source bead $BEAD_ID even after lease-aware reclaim (ga-v5acl)"
       fi
 
@@ -4098,14 +4125,15 @@ $PARTIAL_EVIDENCE" 2>/dev/null || true
         bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
         _CLOSE_REASON="Quality gate PASSED — branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA, gate_run=$GATE_RUN_ID). Closed by autonomous dispatcher (ga-esbg)."
         # ga-v5acl: gate_close_source_terminal now owns the retry-on-refusal
-        # path (lease-aware `bd reclaim --older-than 0s`, never blind
-        # --force). Was: unconditional `bd assign --force` + `bd close
-        # --force` on ANY close failure, regardless of whether the claim was
-        # actually abandoned — exactly what bd's own --force --help text
-        # warns against ("use only for abandoned claims... prefer bd
-        # reclaim"). See ga-esbg/wa-j824s for the original incident this
-        # replaces the ad hoc escalation for.
-        if gate_close_source_terminal "$BEAD_ID" "$_CLOSE_REASON"; then
+        # path (lease-aware `bd reclaim --older-than 0s`, then (ga-2emo8) a
+        # merge-verified --force). Was: unconditional `bd assign --force` +
+        # `bd close --force` on ANY close failure, regardless of whether the
+        # claim was actually abandoned — exactly what bd's own --force
+        # --help text warns against ("use only for abandoned claims...
+        # prefer bd reclaim"). See ga-esbg/wa-j824s for the original
+        # incident this replaces the ad hoc escalation for. merge_verified=1:
+        # same confirmed-merge precondition as the assignee-clear above.
+        if gate_close_source_terminal "$BEAD_ID" "$_CLOSE_REASON" 1; then
           log "  Source bead $BEAD_ID closed (gate PASS + merged)."
         else
           warn "Could not close source bead $BEAD_ID even after lease-aware reclaim — re-pick vector remains, see post-merge verification below (ga-v5acl)"
@@ -5968,10 +5996,12 @@ if [ "$NEEDS_REBASE_COUNT" -gt 0 ]; then
           bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
           # ga-v5acl: was a silent `|| true` — the weakest of this file's 4
           # release sites (not even a warn on failure). Now shares the same
-          # lease-aware escalation (bd reclaim --older-than 0s, never
-          # --force) as the other 3 sites, and actually surfaces a failure
-          # instead of eating it.
-          gate_release_stale_assignee "$BEAD_ID" \
+          # lease-aware escalation (bd reclaim --older-than 0s, then
+          # ga-2emo8's merge-verified --force) as the other sites, and
+          # actually surfaces a failure instead of eating it. merge_verified=1:
+          # this branch only runs after gate_branch_already_merged confirmed
+          # the merge via git a few lines above.
+          gate_release_stale_assignee "$BEAD_ID" 1 \
             || warn "  Step 0a-4: could not release assignee on $BEAD_ID even after lease-aware reclaim (ga-v5acl)."
           if printf '%s' "$NR_SRC_LABELS" | grep -q "story:approved"; then
             # STORY → hand off to story-delivery, same as Step 4b's already-merged
@@ -5985,7 +6015,7 @@ if [ "$NEEDS_REBASE_COUNT" -gt 0 ]; then
           else
             bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:superseded" -q 2>/dev/null || true
             bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $NR_BRANCH already in $DEFAULT_BRANCH — gate superseded (marker $NR_MARKER_ID, reaped from stranded needs-rebase). story:in-flight stripped; work already merged. (ga-88sl7)" 2>/dev/null || true
-            gate_close_source_terminal "$BEAD_ID" "Branch $NR_BRANCH already merged to $DEFAULT_BRANCH — delivered via prior merge; gate superseded (marker $NR_MARKER_ID, reaped from stranded needs-rebase, ga-88sl7)." \
+            gate_close_source_terminal "$BEAD_ID" "Branch $NR_BRANCH already merged to $DEFAULT_BRANCH — delivered via prior merge; gate superseded (marker $NR_MARKER_ID, reaped from stranded needs-rebase, ga-88sl7)." 1 \
               || warn "Could not close already-merged non-story source bead $BEAD_ID even after lease-aware reclaim (non-fatal, ga-v5acl)."
           fi
           ;;
@@ -6822,9 +6852,13 @@ if [ "$ALREADY_MERGED" = "1" ]; then
         # supersede path did not — phantom in-flight slots wedged the Pilot at capacity.
         bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
         # ga-v5acl: was a silent `|| true`; now the shared lease-aware
-        # escalation (bd reclaim --older-than 0s, never --force) — see
-        # gate_release_stale_assignee's header comment above.
-        gate_release_stale_assignee "$BEAD_ID" \
+        # escalation (bd reclaim --older-than 0s, then ga-2emo8's
+        # merge-verified --force) — see gate_release_stale_assignee's header
+        # comment above. merge_verified=1: this whole block is the
+        # already-merged short-circuit (BRANCH confirmed already in
+        # DEFAULT_BRANCH via git before this point — see vb_status_action
+        # dispatch above).
+        gate_release_stale_assignee "$BEAD_ID" 1 \
           || warn "Could not release assignee on $BEAD_ID even after lease-aware reclaim (ga-v5acl)."
 
         if [ "$SUPERSEDE_IS_STORY" = "1" ]; then
@@ -6847,7 +6881,7 @@ if [ "$ALREADY_MERGED" = "1" ]; then
           # do NOT route through story-delivery; they close terminal here.
           bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:superseded" -q 2>/dev/null || true
           bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $BRANCH already in $DEFAULT_BRANCH — gate superseded (marker $MARKER_ID). story:in-flight stripped (Pilot lane slot freed — ga-67hae pilot-cascade fix); work already merged." 2>/dev/null || true
-          gate_close_source_terminal "$BEAD_ID" "Branch $BRANCH already merged to $RIG/$DEFAULT_BRANCH — delivered via prior merge; gate superseded (marker $MARKER_ID). Closed by dispatcher (ga-i53ua: non-story already-merged terminal)." \
+          gate_close_source_terminal "$BEAD_ID" "Branch $BRANCH already merged to $RIG/$DEFAULT_BRANCH — delivered via prior merge; gate superseded (marker $MARKER_ID). Closed by dispatcher (ga-i53ua: non-story already-merged terminal)." 1 \
             || warn "Could not close already-merged non-story source bead $BEAD_ID even after lease-aware reclaim (non-fatal, ga-v5acl)."
         fi
         ;;
