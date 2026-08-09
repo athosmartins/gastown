@@ -64,6 +64,8 @@ CHUNK_OVERLAP = 20
 BD_SHOW_BATCH = 40
 BD_TIMEOUT_LIST = 90
 BD_TIMEOUT_SHOW = 120
+MODEL_FETCH_TIMEOUT_S = 180                # one-time weight download (~87MB),
+                                            # generous for a slow link (wa-h9dc1)
 
 MAX_AGE_DAYS = 90                          # corpus retention window
 STALE_AFTER_SECONDS = 24 * 3600            # rebuild trigger: index age
@@ -218,10 +220,21 @@ def load_model():
     Bootstrap/self-heal (wa-h9dc1): a fresh machine, a wiped cache, or a
     new user has no cached weights yet, and forced-offline turned that into
     a permanent failure with no recovery path (nothing else in the repo
-    downloads the weights). So on a cache-miss under offline, retry once
-    with offline disabled to fetch them — after that one-time fetch the
-    cache is warm and every later call in this and future processes is
-    offline again. If the online retry also fails (no network), raise
+    downloads the weights). On a cache-miss under offline, fetch the
+    weights once via a SUBPROCESS started with offline disabled, then
+    retry in THIS process (still offline) now that the cache is warm.
+
+    Why a subprocess and not just flipping os.environ and retrying inline
+    (what this function did on the first attempt at this fix, rejected by
+    the quality gate — ga-444oq): huggingface_hub reads HF_HUB_OFFLINE into
+    a module-level constant AT IMPORT TIME (constants.py) and never
+    re-reads os.environ afterward. By the time the offline attempt below
+    fails, huggingface_hub is already imported with that constant frozen
+    True, so flipping os.environ and calling SentenceTransformer() again
+    IN THIS PROCESS is a no-op — it still runs offline internally and
+    fails identically. Only a fresh interpreter, started with the env var
+    already correct before its own import happens, actually goes online.
+    If the fetch subprocess also fails (no network), raise
     RecallModelUnavailableError rather than letting the raw
     huggingface_hub traceback surface."""
     global _MODEL
@@ -234,25 +247,53 @@ def load_model():
 
     try:
         _MODEL = SentenceTransformer(MODEL_NAME)
-    except Exception as offline_err:
-        try:
-            os.environ["HF_HUB_OFFLINE"] = "0"
-            os.environ["TRANSFORMERS_OFFLINE"] = "0"
-            _MODEL = SentenceTransformer(MODEL_NAME)
-        except Exception as online_err:
-            raise RecallModelUnavailableError(
-                f"embedding model '{MODEL_NAME}' is not in the local HF cache "
-                f"and the one-time online fetch failed (no network?). Populate "
-                f"the cache manually with:\n"
-                f"  HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 "
-                f"{GC_CITY_PATH}/.gc/recall-venv/bin/python3 -c "
-                f"\"from sentence_transformers import SentenceTransformer; "
-                f"SentenceTransformer('{MODEL_NAME}')\"\n"
-                f"offline error: {offline_err}\nonline error: {online_err}"
-            ) from online_err
-        finally:
-            os.environ["HF_HUB_OFFLINE"] = "1"
-            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        return _MODEL
+    except Exception as exc:
+        # `except ... as name` auto-deletes `name` when the block exits
+        # (Python 3 scoping) — stash it in a plain variable so it's still
+        # readable/raisable below, past the end of this except clause.
+        offline_err = exc
+
+    bootstrap_env = dict(os.environ, HF_HUB_OFFLINE="0", TRANSFORMERS_OFFLINE="0")
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c",
+             "from sentence_transformers import SentenceTransformer; "
+             f"SentenceTransformer({MODEL_NAME!r})"],
+            env=bootstrap_env, capture_output=True, text=True,
+            timeout=MODEL_FETCH_TIMEOUT_S,
+        )
+        fetch_ok = proc.returncode == 0
+        fetch_detail = proc.stderr[-2000:] if not fetch_ok else ""
+    except subprocess.TimeoutExpired:
+        fetch_ok = False
+        fetch_detail = f"timed out after {MODEL_FETCH_TIMEOUT_S}s"
+    except Exception as bootstrap_err:  # e.g. interpreter not spawnable
+        fetch_ok = False
+        fetch_detail = str(bootstrap_err)
+
+    if not fetch_ok:
+        raise RecallModelUnavailableError(
+            f"embedding model '{MODEL_NAME}' is not in the local HF cache "
+            f"and the one-time online fetch failed (no network?). Populate "
+            f"the cache manually with:\n"
+            f"  HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 "
+            f"{GC_CITY_PATH}/.gc/recall-venv/bin/python3 -c "
+            f"\"from sentence_transformers import SentenceTransformer; "
+            f"SentenceTransformer('{MODEL_NAME}')\"\n"
+            f"offline error: {offline_err}\nfetch error: {fetch_detail}"
+        ) from offline_err
+
+    # Cache is now warm on disk — this process stays offline and just
+    # reads it from local cache, no network involved.
+    try:
+        _MODEL = SentenceTransformer(MODEL_NAME)
+    except Exception as post_bootstrap_err:
+        raise RecallModelUnavailableError(
+            f"embedding model '{MODEL_NAME}' fetch subprocess reported "
+            f"success but the model still failed to load locally: "
+            f"{post_bootstrap_err}"
+        ) from post_bootstrap_err
     return _MODEL
 
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -122,8 +123,10 @@ class TestKeywordsAndChunking(unittest.TestCase):
 
 # ---------------------------------------------------------------------------
 # load_model() bootstrap/self-heal contract (wa-h9dc1) — mocked
-# SentenceTransformer, no real network or model weights needed. Real-model
-# loading is already exercised by TestHybridRetrievalQuality.setUpClass;
+# SentenceTransformer and subprocess.run, no real network or model weights
+# needed (see TestHFHubOfflineFlagIsFrozenAtImportTime below for the one
+# unmocked test that pins the underlying huggingface_hub behavior). Real-
+# model loading is already exercised by TestHybridRetrievalQuality.setUpClass;
 # these tests isolate rl._MODEL and the HF env vars per-test so they run
 # safely regardless of test execution order relative to that class.
 # ---------------------------------------------------------------------------
@@ -144,35 +147,102 @@ class TestLoadModelBootstrap(unittest.TestCase):
                 os.environ[k] = v
 
     def test_offline_success_never_goes_online(self):
-        with mock.patch("sentence_transformers.SentenceTransformer", return_value="fake-model") as st:
+        with mock.patch("sentence_transformers.SentenceTransformer", return_value="fake-model") as st, \
+             mock.patch("recall_lib.subprocess.run") as run:
             model = rl.load_model()
         self.assertEqual(model, "fake-model")
         st.assert_called_once_with(rl.MODEL_NAME)
         self.assertEqual(os.environ.get("HF_HUB_OFFLINE"), "1")
+        run.assert_not_called()  # cache hit — no bootstrap subprocess needed
 
-    def test_cache_miss_self_heals_via_one_time_online_fetch(self):
-        seen_offline_flag = []
+    def test_cache_miss_self_heals_via_subprocess_bootstrap(self):
+        """Regression for ga-444oq (the gate-rejected first attempt at this
+        fix): that version retried SentenceTransformer() a SECOND TIME IN
+        THIS PROCESS after flipping os.environ. That retry is a no-op —
+        huggingface_hub freezes HF_HUB_OFFLINE into a module-level constant
+        at import time and never re-reads os.environ afterward (pinned
+        directly, without mocks, by
+        TestHFHubOfflineFlagIsFrozenAtImportTime below) — so it fails
+        identically both times and never touches subprocess.run at all.
+        Against that version this test fails outright on
+        `run.assert_called_once()` (0 calls) before the other assertions
+        are even reached."""
+        calls = []
 
         def fake_ctor(name):
-            seen_offline_flag.append(os.environ.get("HF_HUB_OFFLINE"))
-            if len(seen_offline_flag) == 1:
+            calls.append(os.environ.get("HF_HUB_OFFLINE"))
+            if len(calls) == 1:
                 raise OSError("cache miss under offline")
-            return "fake-model-fetched-online"
+            return "fake-model-after-bootstrap"
 
-        with mock.patch("sentence_transformers.SentenceTransformer", side_effect=fake_ctor):
+        fake_proc = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch("sentence_transformers.SentenceTransformer", side_effect=fake_ctor), \
+             mock.patch("recall_lib.subprocess.run", return_value=fake_proc) as run:
             model = rl.load_model()
-        self.assertEqual(model, "fake-model-fetched-online")
-        self.assertEqual(seen_offline_flag, ["1", "0"])  # offline attempt first, then online
-        self.assertEqual(os.environ.get("HF_HUB_OFFLINE"), "1")  # restored after self-heal
+
+        self.assertEqual(model, "fake-model-after-bootstrap")
+        # BOTH in-process SentenceTransformer calls see the same, original
+        # offline flag — the fix never mutates this process's env, so there
+        # is nothing here for an in-process retry to exploit even in theory.
+        self.assertEqual(calls, ["1", "1"])
+        run.assert_called_once()
+        bootstrap_env = run.call_args.kwargs["env"]
+        self.assertEqual(bootstrap_env["HF_HUB_OFFLINE"], "0")
+        self.assertEqual(bootstrap_env["TRANSFORMERS_OFFLINE"], "0")
+        self.assertEqual(os.environ.get("HF_HUB_OFFLINE"), "1")
         self.assertEqual(os.environ.get("TRANSFORMERS_OFFLINE"), "1")
 
     def test_no_network_raises_clear_error_not_raw_traceback(self):
-        with mock.patch("sentence_transformers.SentenceTransformer", side_effect=OSError("cache miss under offline")):
+        fake_proc = mock.Mock(returncode=1, stdout="", stderr="ConnectionError: no route to host")
+        with mock.patch("sentence_transformers.SentenceTransformer",
+                         side_effect=OSError("cache miss under offline")), \
+             mock.patch("recall_lib.subprocess.run", return_value=fake_proc):
             with self.assertRaises(rl.RecallModelUnavailableError) as ctx:
                 rl.load_model()
         self.assertIn(rl.MODEL_NAME, str(ctx.exception))
+        self.assertIn("no route to host", str(ctx.exception))  # real cause surfaces, not swallowed
         self.assertIsNone(rl._MODEL)  # failed load must not poison the cache
-        self.assertEqual(os.environ.get("HF_HUB_OFFLINE"), "1")  # restored even on failure
+        self.assertEqual(os.environ.get("HF_HUB_OFFLINE"), "1")
+
+    def test_bootstrap_subprocess_timeout_raises_clear_error(self):
+        with mock.patch("sentence_transformers.SentenceTransformer",
+                         side_effect=OSError("cache miss under offline")), \
+             mock.patch("recall_lib.subprocess.run",
+                         side_effect=subprocess.TimeoutExpired(cmd="python3", timeout=rl.MODEL_FETCH_TIMEOUT_S)):
+            with self.assertRaises(rl.RecallModelUnavailableError) as ctx:
+                rl.load_model()
+        self.assertIn("timed out", str(ctx.exception))
+        self.assertIsNone(rl._MODEL)
+
+
+class TestHFHubOfflineFlagIsFrozenAtImportTime(unittest.TestCase):
+    """Pins the actual huggingface_hub behavior that load_model()'s
+    subprocess-based bootstrap depends on (wa-h9dc1 / ga-444oq): the
+    library reads HF_HUB_OFFLINE into a module-level constant ONCE, at
+    import time, and never re-reads os.environ afterward — so flipping
+    the env var and retrying in the SAME process (the first, gate-rejected
+    version of this fix) cannot work; it silently stays offline and fails
+    identically every time. Runs in an isolated subprocess so the result
+    doesn't depend on whether some earlier test in this file already
+    imported huggingface_hub with a different starting value. If a future
+    huggingface_hub release makes the flag dynamic, this is the test that
+    catches it — at which point the subprocess bootstrap in load_model()
+    may be simplifiable back to an in-process retry."""
+
+    def test_flipping_env_after_import_does_not_change_offline_mode(self):
+        probe = (
+            "import os; os.environ['HF_HUB_OFFLINE'] = '1'\n"
+            "import huggingface_hub.constants as c\n"
+            "assert c.HF_HUB_OFFLINE is True, 'expected frozen True right after import'\n"
+            "os.environ['HF_HUB_OFFLINE'] = '0'\n"
+            "assert c.HF_HUB_OFFLINE is True, ("
+            "'huggingface_hub now re-reads os.environ live -- the subprocess '"
+            "'bootstrap in load_model() may no longer be necessary')\n"
+            "print('OK')\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("OK", proc.stdout)
 
 
 # ---------------------------------------------------------------------------
