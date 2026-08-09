@@ -93,7 +93,41 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # neither alone would have caught both live instances. The regex is anchored
 # to the start with a :/whitespace delimiter so a title merely containing
 # "epic" mid-sentence is never over-matched.
-bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --json --sort oldest --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:held"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not)] | .[:1]'
+# ga-znlvl: also excludes the REFINO-STAGE + MANUAL-EXECUTION label families —
+# a bead still mid-refino (or requiring a human/device to execute) was surfacing
+# as candidate #1 and burning a claim-detect-drain cycle every time, exactly
+# the same "probe never learned this label" shape as every fix above. Two
+# distinct sources, cited exactly, not invented:
+#   • refino-stage: the canonical allowlist lives in lifecycle-coherence-janitor.sh's
+#     R7 check (reasoned in ga-rccry) — enumerated here because --exclude-label is
+#     exact-match only (the janitor's own ^story:refino- PREFIX cannot be expressed
+#     as a flag). Deliberately an ALLOWLIST of what blocks, not a denylist of what
+#     doesn't: ga-rccry measured that a broad ^refino:/^auto-refino: prefix also
+#     catches refino:creator-swept (36 of ~50 refino-labeled beads at measurement
+#     time) and refino:done (refino FINISHED — implementable by definition), and
+#     excluding either would silently block legitimate work.
+#   • manual-execution: park_labels.py's MANUAL_EXEC_LABELS (the canonical "the
+#     headless pool cannot build this by design" set) — found by the Mayor
+#     (ga-znlvl investigation) already honored by FOUR other consumers
+#     (throughput-stall-watchdog.py, approved-state-reconciler.py, park_labels
+#     itself, inflight-reclaim-guard.py) but not this probe, the one that
+#     actually starts work. Live near-miss: wa-ielq6.1/.2 (exec:manual, child of
+#     an epic touching central_sender.py, the sibling wa-worker rig's
+#     highest-blast-radius file) claimed and only stopped by a worker manually
+#     reading the label.
+# NOTE (residual, not fixed here — flagging rather than silently expanding
+# scope or silently dropping it): park_labels.py also defines
+# BLOCKED_FAMILY_LABELS, GATE_PARK_LABELS, and FLOWING_OR_DONE_LABELS as
+# further "don't offer this bead fresh" signals. Not included in this pass —
+# no LIVE incident confirmed them reaching this probe specifically (unlike the
+# two families above), and bd ready's own status/assignee filtering already
+# excludes most of that territory in the normal reclaim/gate flow (a reclaim
+# clears story:in-flight together with status/assignee; a gate:queued bead
+# stays assigned, not open+unassigned, in the flow this session observed).
+# If one of those labels is ever caught live on an offered candidate, that is
+# real evidence this note's reasoning was wrong for that label — add it then,
+# don't pre-emptively enumerate the whole canonical set against zero incidents.
+bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --json --sort oldest --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:held"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not)] | .[:1]'
 # If it returns a bead (output is NOT []), THAT BEAD IS YOURS. Claim it FIRST:
 #     gc bd update <id> --claim
 # verify the claim set assignee to your session, then go to the Build Protocol and build it.
