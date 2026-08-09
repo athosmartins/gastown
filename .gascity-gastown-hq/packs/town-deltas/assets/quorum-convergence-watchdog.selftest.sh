@@ -288,6 +288,59 @@ check_absent "Path C: no traceback"                           "$trigger_test" "T
 
 echo ""
 
+# ── 7. DIVERGED path routes through escalate_emergency (ga-aw2ga) ────────────
+# Before ga-aw2ga, _escalate_diverged called `notify -p 5 "🚨 ..."` directly —
+# which does NOT guarantee a phone push (notify's own content-based allowlist
+# decides that, and a 3-way vote split or a zero-vote timeout matches none of
+# its rules). This exercises the REAL _escalate_diverged with QUORUM_DRY_RUN=0
+# (so it runs past the early-return dry-run guard) and a stubbed
+# escalate_emergency + _run, proving the diverged path calls the canonical
+# gate with class="quorum-diverged" — not a reimplementation of that check.
+echo "7. DIVERGED path routes through escalate_emergency (ga-aw2ga)"
+
+diverged_test=$(QUORUM_DRY_RUN=0 QUORUM_WATCHDOG_ENABLED=0 GC_CITY_PATH=/tmp \
+    python3 -c "
+import sys, os, types, json
+sys.path.insert(0, '$(dirname "$WATCHDOG")')
+mod = types.ModuleType('gc_ledger')
+mod.gc_ledger_append = lambda *a, **kw: None
+sys.modules['gc_ledger'] = mod
+
+calls = []
+esc_mod = types.ModuleType('escalate_emergency')
+def fake_escalate(emergency_class, title, message, **kw):
+    calls.append({'class': emergency_class, 'title': title, 'message': message})
+    return True
+esc_mod.escalate_emergency = fake_escalate
+sys.modules['escalate_emergency'] = esc_mod
+
+import importlib.util
+spec = importlib.util.spec_from_file_location('qcw7', '$(realpath "$WATCHDOG")')
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+# Stub the bd-command runner so no real 'bd'/'gc' subprocess is invoked —
+# _escalate_diverged's label/comment side effects are quorum bookkeeping,
+# orthogonal to what this test verifies.
+m._run = lambda *a, **kw: None
+
+m._escalate_diverged('ga-test123', 'Test Bead', {'crew-a': 'reclaim', 'crew-b': 'needs-human'})
+
+assert len(calls) == 1, f'expected exactly 1 escalate_emergency call, got {len(calls)}'
+c = calls[0]
+assert c['class'] == 'quorum-diverged', f\"expected class='quorum-diverged', got {c['class']!r}\"
+assert 'ga-test123' in c['title'], f\"expected bead id in title, got {c['title']!r}\"
+assert 'ga-test123' in c['message'], f\"expected bead id in message, got {c['message']!r}\"
+print('DIVERGED_ROUTES_THROUGH_ESCALATE_EMERGENCY')
+" 2>&1)
+
+check "DIVERGED calls escalate_emergency exactly once with class=quorum-diverged" \
+    "$diverged_test" "DIVERGED_ROUTES_THROUGH_ESCALATE_EMERGENCY"
+check_absent "DIVERGED integration: no traceback" "$diverged_test" "Traceback"
+check_absent "DIVERGED integration: no AssertionError" "$diverged_test" "AssertionError"
+
+echo ""
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 TOTAL=$((PASS + FAIL))
 echo "=== Results: $PASS/$TOTAL passed ==="

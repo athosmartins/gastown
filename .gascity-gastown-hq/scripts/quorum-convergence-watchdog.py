@@ -89,6 +89,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gc_ledger import gc_ledger_append as _qcw_log
+from escalate_emergency import escalate_emergency
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 CITY = os.environ.get("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
@@ -531,7 +532,9 @@ def _execute_action(bead_id: str, action: str) -> bool:
 
 
 def _escalate_diverged(bead_id: str, title: str, votes: dict[str, str]) -> None:
-    """Mark quorum:diverged + notify 🚨 (ga-qw3p.4 / ga-aw2ga path)."""
+    """Mark quorum:diverged + page the human via escalate_emergency (ga-aw2ga:
+    Layer 4 of the ga-qw3p ladder — see that module for why this can't just be
+    a raw `notify -p 5` call)."""
     vote_summary = "; ".join(f"{k}:{v}" for k, v in votes.items()) if votes else "sem respostas"
     msg = (
         f"🚨 QUÓRUM DIVERGIU — blocker {bead_id} (\"{title}\") não convergiu. "
@@ -551,18 +554,7 @@ def _escalate_diverged(bead_id: str, title: str, votes: dict[str, str]) -> None:
           f"quorum-convergence-watchdog (ga-qw3p.3): DIVERGED. {msg}"],
          timeout=BD_TIMEOUT)
 
-    # 🚨 notify
-    try:
-        subprocess.run(
-            [NOTIFY, "-t", "🚨 Quórum divergiu", "-p", "5", msg],
-            capture_output=True, text=True, timeout=10)
-    except Exception:
-        pass
-
-    # Mail Mayor as well (durable escalation).
-    _run([GC, "mail", "send", "mayor",
-          "-s", f"🚨 Quórum divergiu: {bead_id}",
-          "-m", msg], timeout=GC_TIMEOUT)
+    escalate_emergency("quorum-diverged", f"Quórum divergiu: {bead_id}", msg)
 
 
 # ── main cycle ────────────────────────────────────────────────────────────────
