@@ -247,3 +247,54 @@ def test_outros_labels_park_absorvidos_de_pilot_dispatcher():
                    ["prod-experiment"], ["ban-risk"], ["engine-window:pending"],
                    ["waiting-on:ga-xyz"], ["depends-on:ga-xyz"]):
         assert derive(b(labels=labels), None, CREWS)["state"] == "parked", labels
+# ── pilot:held-until expira (ga-fup3m, absorvido de pilot-missing-route-watchdog.sh) ──
+# scripts/pilot-missing-route-watchdog.sh (81 refs) já mede isto — seus próprios
+# Scenario 7/8 de selftest provam o comportamento certo: pilot:held bare SEM
+# held-until pareka indefinidamente; COM held-until EXPIRADO, não pareka mais.
+# bead_state.py tratava QUALQUER held-until como park permanente — nunca checava
+# se o timestamp já tinha passado. pilot:held / pilot:held-until:<epoch> são
+# escritos JUNTOS por _mayor_deferred_hold_db (achado por ga-7qsxr, comentário do
+# seu commit a2ac5c8c5).
+
+def test_pilot_held_sem_held_until_pareka_indefinidamente():
+    """Regressão-guarda: sem held-until, pilot:held bare continua parkeando
+    (mirrors pilot-missing-route-watchdog.sh Scenario 7)."""
+    st = derive(b(labels=["pilot:held"]), None, CREWS)
+    assert st["state"] == "parked"
+
+
+def test_pilot_held_until_expirado_nao_pareka_mais():
+    """O achado real: held-until no PASSADO destrava (mirrors
+    pilot-missing-route-watchdog.sh Scenario 8 exatamente)."""
+    st = derive(b(labels=["pilot:held", "pilot:held-until:1000000000"]), None, CREWS, now=2000000000)
+    assert st["state"] != "parked"
+
+
+def test_pilot_held_until_futuro_continua_parkeando():
+    st = derive(b(labels=["pilot:held", "pilot:held-until:2000000000"]), None, CREWS, now=1000000000)
+    assert st["state"] == "parked"
+
+
+def test_pilot_held_until_sem_now_preserva_comportamento_antigo():
+    """now=None (não consultado) NUNCA expira um hold — mesma direção segura de
+    todo outro None neste módulo. Todo chamador EXISTENTE (que não passa now)
+    continua vendo o comportamento de HOJE, sem quebra."""
+    st = derive(b(labels=["pilot:held", "pilot:held-until:1000000000"]), None, CREWS)
+    assert st["state"] == "parked"
+
+
+def test_pilot_held_expirado_mas_outro_motivo_de_park_independente_ainda_pareka():
+    """Um hold expirado não pode mascarar outro motivo de park genuinamente
+    independente na mesma bead."""
+    st = derive(b(labels=["pilot:held", "pilot:held-until:1000000000", "blocked:outra-coisa"]),
+                None, CREWS, now=2000000000)
+    assert st["state"] == "parked"
+    assert st["reasons"]["despausar"] == "parkeado por blocked:outra-coisa"
+
+
+def test_pilot_held_multiplos_held_until_usa_o_maximo():
+    """Mirrors a lógica 'max(held-until) < now' do arquivo-fonte: com dois
+    held-until, só expira quando o MAIOR também já passou."""
+    st = derive(b(labels=["pilot:held", "pilot:held-until:1000000000", "pilot:held-until:3000000000"]),
+                None, CREWS, now=2000000000)
+    assert st["state"] == "parked"   # o maior (3000000000) ainda não passou

@@ -153,6 +153,35 @@ def _has_prefix(labels, prefixes) -> str | None:
     return None
 
 
+def _labels_after_expired_hold(labels, now):
+    """labels, minus an EXPIRED pilot:held hold — ga-fup3m, absorvido de
+    pilot-missing-route-watchdog.sh (81 refs, seus próprios Scenario 7/8).
+
+    pilot:held (bare) e pilot:held-until:<epoch> são escritos JUNTOS por
+    _mayor_deferred_hold_db (achado por ga-7qsxr). Sem held-until, o hold pareka
+    indefinidamente (comportamento preservado). Com held-until, o hold só continua
+    valendo enquanto o MAIOR timestamp presente ainda não passou — mirrors a lógica
+    'max(held-until) < now' do arquivo-fonte exatamente. now=None (não consultado)
+    NUNCA expira um hold, mesma direção segura que todo outro None neste módulo:
+    todo chamador que não passa now preserva o comportamento de hoje (park
+    indefinido), sem quebra.
+
+    Qualquer OUTRO motivo de park que a bead carregue independentemente do hold
+    continua no conjunto devolvido — só o par pilot:held/pilot:held-until é
+    removido, nunca o resto."""
+    if now is None:
+        return labels
+    until_values = []
+    for l in labels:
+        if l.startswith("pilot:held-until:"):
+            suffix = l[len("pilot:held-until:"):]
+            if suffix.isdigit():
+                until_values.append(int(suffix))
+    if not until_values or max(until_values) >= now:
+        return labels
+    return frozenset(l for l in labels if l != "pilot:held" and not l.startswith("pilot:held-until:"))
+
+
 def is_ephemeral(actor: str) -> bool:
     """Worker efêmero NÃO é crew. Confundir os dois foi a causa do 'claude-wa'
     inexistente que quebrou o botão Cutucar (medido 09/08)."""
@@ -249,13 +278,17 @@ def holder_is_alive(assignee: str, live_sessions) -> bool | None:
 
 def derive(bead: dict, live_sessions=None,
            known_crews: frozenset = frozenset(),
-           merged: bool | None = None) -> dict:
+           merged: bool | None = None,
+           now: int | None = None) -> dict:
     """Estado canônico. PURA — todo fato de runtime entra por parâmetro.
 
     live_sessions: conjunto de sessões vivas, ou None = NÃO CONSULTEI. None nunca
             vira "ninguém vivo" — ver holder_is_alive().
     merged: True/False se o chamador verificou o merge; None = não verificou.
             None NUNCA é tratado como False (erro ≠ vazio).
+    now: epoch atual, ou None = não consultado. Usado só para expirar
+            pilot:held-until:<epoch> (ga-fup3m) — ver _labels_after_expired_hold().
+            None preserva o comportamento antigo (park indefinido), nunca expira.
     """
     L = _labels(bead)
     status = bead.get("status") or ""
@@ -296,7 +329,8 @@ def derive(bead: dict, live_sessions=None,
         return {"state": "awaiting_athos", "turn": "athos", "actions": actions, "reasons": reasons}
 
     # 4. PARK EXPLÍCITO — decisão deliberada de não andar.
-    park = _has_prefix(L, PARK_PREFIXES) or next((l for l in L if l in PARK_EXACT), None)
+    park_labels = _labels_after_expired_hold(L, now)
+    park = _has_prefix(park_labels, PARK_PREFIXES) or next((l for l in park_labels if l in PARK_EXACT), None)
     if park or status == "deferred":
         ext = "story:awaiting-external-merge" in L or park == "blocked:external-quota-motherduck"
         return {"state": "parked", "turn": "external" if ext else "mayor",
