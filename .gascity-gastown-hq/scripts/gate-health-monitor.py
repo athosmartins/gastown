@@ -8,7 +8,7 @@ Emits a line ONLY for actionable problems (silence = healthy):
   [DELIVERY-FAIL]       a delivery failed or HALTed
   [ASYNC-START-REGRESS] the stale_async_start race fix is MISSING from the live gc binary
   [ASYNC-START-RACE]    stale_async_start race rate spiked above threshold
-  [VERDICT-ASSIGNEE-GAP] a pending verdict bead has had no assignee for too long (ga-mo7q)
+  [VERDICT-ASSIGNEE-GAP] a pending verdict bead has had no assignee for too long (ga-mo7q, now ga-qqtoo)
 
 Deliberately does NOT emit routine GATE PASS / PILOT dispatch / DELIVERY PASS —
 those are normal operation and were the source of the old monitor's noise.
@@ -28,13 +28,17 @@ creating, identified by 'async-start (fresh creating)' in the binary. If the
 binary is rebuilt without the fix, reviewer-spawn flakiness resurges silently.
 Env: GATE_REVIEWER_RACE_CHECK=1 (default on), GATE_REVIEWER_RACE_MAX (default 8/h).
 
-[VERDICT-ASSIGNEE-GAP] (ga-mo7q) closes the blind spot measured at 30% of
-verdict beads: quality-gate-dispatcher.sh creates the verdict bead, then
+[VERDICT-ASSIGNEE-GAP] (ga-mo7q, now ga-qqtoo — ga-mo7q itself is no longer
+bd-show-able, its "30%" figure is no longer independently auditable, and
+ga-qqtoo's own 2026-08-10 remeasurement found a materially different number;
+treat this docstring's history as provenance, not a live statistic) closes
+the blind spot: quality-gate-dispatcher.sh creates the verdict bead, then
 SEPARATELY assigns it to the reviewer's session name (assign_verdict_bead_verified,
-ga-vdurb) — that second write can fail silently, leaving a bead the reviewer's
-`--assignee` poll can never find. The reviewer now also falls back to
-`metadata.gc.session_name` (ga-mo7q fix b) so most cases self-heal, but this
-check gives an independent, bead-content-level signal for the residual cases —
+ga-vdurb, hardened further by ga-qqtoo) — that second write can fail silently,
+leaving a bead the reviewer's `--assignee` poll can never find. The reviewer
+now also falls back to `metadata.gc.session_name` (ga-mo7q fix b) so most
+cases self-heal, but this check gives an independent, bead-content-level
+signal for the residual cases —
 any open verdict:pending bead with no assignee past ASSIGNEE_GAP_STUCK_SEC
 (1min) is a defect worth surfacing, not routine churn (a fresh bead's assignee
 write is near-instant, so first-seen tracking exists only to skip the write's
@@ -153,7 +157,7 @@ def pending_verdicts_by_run():
 
 def verdict_beads_missing_assignee():
     """Return open verdict beads (type:quality-gate-verdict, verdict:pending)
-    that have no assignee set (ga-mo7q). Returns a list of bead ids on success
+    that have no assignee set (ga-mo7q, now ga-qqtoo). Returns a list of bead ids on success
     (possibly empty — genuinely no gap), or None if the query itself failed
     (non-zero exit, timeout, unparseable output). Callers MUST treat None as
     "unknown" and skip both alerting and prune-tracking that cycle — conflating
@@ -452,8 +456,9 @@ if __name__ == "__main__":
             error_first_seen.pop(mid, None)
             error_alerted.pop(mid, None)
 
-        # --- VERDICT-ASSIGNEE-GAP: pending verdict bead created with no assignee (ga-mo7q) ---
-        # Measured 30% of verdict beads: the durable-pull assign write
+        # --- VERDICT-ASSIGNEE-GAP: pending verdict bead created with no assignee (ga-mo7q, now ga-qqtoo) ---
+        # Measured 30% of verdict beads at the time (see ga-qqtoo for the 2026-08-10
+        # remeasurement — a materially different number): the durable-pull assign write
         # (assign_verdict_bead_verified, ga-vdurb) can fail silently after the bead
         # itself was created fine, leaving the reviewer's --assignee poll blind to
         # it. The reviewer now also falls back to metadata.gc.session_name (ga-mo7q
@@ -479,7 +484,7 @@ if __name__ == "__main__":
                     last_alert = assignee_gap_alerted.get(vid, 0)
                     if now - last_alert > REALERT_SEC:
                         emit("[VERDICT-ASSIGNEE-GAP] verdict bead %s has no assignee %dmin after "
-                             "first seen (ga-mo7q) — reviewer's --assignee poll is blind to it; "
+                             "first seen (ga-mo7q, now ga-qqtoo) — reviewer's --assignee poll is blind to it; "
                              "the metadata.gc.session_name fallback should rescue it, but "
                              "verify verdicts are still landing: gc bd show %s" % (
                                  vid, int(stuck_for / 60), vid))

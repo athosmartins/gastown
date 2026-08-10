@@ -540,14 +540,22 @@ TASK
 # A genuinely independent Claude session on the refino-gate-reviewer template
 # (model = Sonnet; provider = claude-headless so it never grabs Remote Control).
 #
-# ga-mo7q: sibling of quality-gate-dispatcher.sh's assign_verdict_bead_verified
-# (ga-vdurb) — this dispatcher had the SAME durable-pull assignment as a single
-# unverified `bd_ update --assignee ... || true` with no read-back and no retry
-# at all (strictly more fragile than the code-gate's already-hardened version).
-# Verify + retry + label-on-final-failure so a lost write is never silent.
+# ga-mo7q (now ga-qqtoo): sibling of quality-gate-dispatcher.sh's
+# assign_verdict_bead_verified (ga-vdurb) — this dispatcher had the SAME
+# durable-pull assignment as a single unverified `bd_ update --assignee ...
+# || true` with no read-back and no retry at all (strictly more fragile than
+# the code-gate's already-hardened version). Verify + retry +
+# label-on-final-failure so a lost write is never silent.
+#
+# ga-qqtoo: mirrors the code-gate sibling's own extension — the --assignee
+# write can partially land (metadata.gc.session_name set, assignee column
+# not, from the SAME bd update call), so check for that before burning a
+# retry, and make one final explicit --set-metadata attempt if all 4 tries
+# leave both fields unset. See quality-gate-dispatcher.sh's
+# assign_verdict_bead_verified for the full measurement this mirrors.
 # Args: <verdict_bead_id> <session_name> <context-label-for-logs>
 refino_assign_verdict_bead_verified() {
-  local _vb="$1" _sname="$2" _ctx="${3:-}" _seen _try
+  local _vb="$1" _sname="$2" _ctx="${3:-}" _seen _seen_meta _try
   [ -z "$_vb" ] && return 1
   [ -z "$_sname" ] && { warn "  Verdict-assign (${_ctx}): empty session name for bead ${_vb} — durable channel NOT wired."; return 1; }
   for _try in 1 2 3 4; do
@@ -557,9 +565,20 @@ refino_assign_verdict_bead_verified() {
       [ "$_try" -gt 1 ] && log "  Verdict-assign (${_ctx}): bead ${_vb} → ${_sname} verified on retry ${_try}."
       return 0
     fi
+    _seen_meta=$(bd_ show "$_vb" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .metadata["gc.session_name"] // empty' 2>/dev/null || echo "")
+    if [ "$_seen_meta" = "$_sname" ]; then
+      log "  Verdict-assign (${_ctx}): bead ${_vb} assignee write didn't land but metadata.gc.session_name did (retry ${_try}) — durable link present via the fallback channel (ga-qqtoo)."
+      return 0
+    fi
     [ "$_try" -lt 4 ] && sleep 1
   done
-  warn "  Verdict-assign (${_ctx}): bead ${_vb} assignee read back as [${_seen:-None}], expected [${_sname}] after ${_try} attempts — durable pull channel DEGRADED (ga-mo7q). Labeling bead verdict:assignee-degraded (session_name-fallback + detector backstop)."
+  bd_ update "$_vb" --set-metadata "gc.session_name=$_sname" -q 2>/dev/null || true
+  _seen_meta=$(bd_ show "$_vb" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .metadata["gc.session_name"] // empty' 2>/dev/null || echo "")
+  if [ "$_seen_meta" = "$_sname" ]; then
+    log "  Verdict-assign (${_ctx}): bead ${_vb} assignee never verified, but an explicit metadata.gc.session_name write succeeded — durable link established (ga-qqtoo)."
+    return 0
+  fi
+  warn "  Verdict-assign (${_ctx}): bead ${_vb} — BOTH assignee (read back as [${_seen:-None}], expected [${_sname}]) AND an explicit metadata.gc.session_name write failed after ${_try} attempts — durable pull channel DEGRADED, no known-working fallback (ga-qqtoo). Labeling bead verdict:assignee-degraded (detector backstop)."
   bd_ label add "$_vb" "verdict:assignee-degraded" -q 2>/dev/null || true
   return 1
 }
