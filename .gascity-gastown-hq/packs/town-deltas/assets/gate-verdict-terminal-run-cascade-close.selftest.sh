@@ -234,12 +234,24 @@ for fn in reconcile_dead_reviewer_verdict_action reconcile_orphaned_verdict_acti
 done
 
 echo "── 9. NON-VACUOUSNESS: the wiring assertions actually distinguish pre-fix HEAD from the fix ──"
-PRE_FIX_COUNT=$(git -C "$SELF_DIR" show main:.gascity-gastown-hq/packs/town-deltas/assets/quality-gate-guard.sh 2>/dev/null \
-  | grep -c 'close_pending_verdicts_for_run' || true)
-if [ "$PRE_FIX_COUNT" = "0" ]; then
-  ok "pre-fix HEAD (main) has ZERO occurrences of close_pending_verdicts_for_run — proves assertion #5 (count=3) would have FAILED there, not vacuous"
+# ga-hgsqg self-audit: `git show ... || true` on a FAILED read (bad ref, not a
+# git repo, detached this file from history) leaves grep reading EMPTY stdin,
+# which prints "0" and exits 1 — caught by the same `|| true` and therefore
+# indistinguishable from "read real content, genuinely found zero matches".
+# Both collapse to PRE_FIX_COUNT=0, and a false "0" would report this
+# non-vacuousness proof as PASSING when it never actually read anything —
+# exactly the error-vs-empty defect class this whole self-audit step exists
+# to catch. Capture git's own exit code before anything can discard it.
+if PRE_FIX_CONTENT=$(git -C "$SELF_DIR" show main:.gascity-gastown-hq/packs/town-deltas/assets/quality-gate-guard.sh 2>/dev/null) \
+    && [ -n "$PRE_FIX_CONTENT" ]; then
+  PRE_FIX_COUNT=$(printf '%s\n' "$PRE_FIX_CONTENT" | grep -c 'close_pending_verdicts_for_run' || true)
+  if [ "$PRE_FIX_COUNT" = "0" ]; then
+    ok "pre-fix HEAD (main) has ZERO occurrences of close_pending_verdicts_for_run — proves assertion #5 (count=3) would have FAILED there, not vacuous"
+  else
+    bad "pre-fix HEAD already contains close_pending_verdicts_for_run ($PRE_FIX_COUNT×) — wiring test would not discriminate, INVESTIGATE (branch may be stale vs main)"
+  fi
 else
-  bad "pre-fix HEAD already contains close_pending_verdicts_for_run ($PRE_FIX_COUNT×) — wiring test would not discriminate, INVESTIGATE (branch may be stale vs main)"
+  bad "could not read main:.../quality-gate-guard.sh via git show — cannot verify non-vacuousness (this is a query failure, NOT confirmed-zero; treat as FAIL rather than silently passing)"
 fi
 
 echo ""
