@@ -16,7 +16,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bead_state import (  # noqa: E402
     derive, holder_is_alive, is_athos_page, is_ephemeral, is_needs_human,
     claimant_provably_dead, session_owner_is_healthy, session_activity_age,
-    parse_iso_epoch, is_coordinator, EPHEMERAL_POOL_TEMPLATES, STALE_ACTIVITY_TTL,
+    parse_iso_epoch, is_coordinator, is_active_owner, EPHEMERAL_POOL_TEMPLATES,
+    STALE_ACTIVITY_TTL,
 )
 
 BEAD_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bead_state.py")
@@ -121,6 +122,107 @@ def test_gate_failed_nao_devolve_pro_pool_sem_prova_de_morte():
     assert "devolver_pro_pool" not in st["actions"]
     st2 = derive(b(status="open", labels=["gate:needs-fix"], assignee="mila-wa"), frozenset(), CREWS)
     assert "devolver_pro_pool" in st2["actions"]
+
+
+# ── is_active_owner: idle-aware session records (ga-rwgp8, derive() swap fatia
+# 2/6 — decisões 1+2 de docs/pilot-dispatcher-derive-swap-decisions.md). Porta
+# 1:1 a regra jq verificada na fonte (pilot-dispatcher.sh's _ACTIVE_OWNER_IDS,
+# linhas ~3383-3388): select(.state != "asleep") | select((.idle_minutes ==
+# null) or (.idle_minutes < $thresh)). Thin wrapper sobre holder_is_alive —
+# cada caso abaixo espelha um ramo real dessa regra, ou o bug ga-46wq5 que ela
+# existe pra prevenir (dono idle/asleep sendo tratado como ativo, silenciando
+# o dispatch queue).
+
+def test_active_owner_nao_consultei_e_none():
+    assert is_active_owner("mila-wa", None) is None
+
+
+def test_active_owner_sem_match_e_false():
+    assert is_active_owner("mila-wa", {}) is False
+    assert is_active_owner(
+        "mila-wa", {"oracle-wa-x1": {"state": "active", "idle_minutes": 5}}
+    ) is False
+
+
+def test_active_owner_coordenador_e_none_nao_false():
+    """Herdado de holder_is_alive por composição, não reinventado: mayor/deacon
+    nunca tem vivacidade CONFIRMADA, mesmo com registro de sessão presente."""
+    assert is_active_owner(
+        "mayor", {"gastown.mayor": {"state": "active", "idle_minutes": 0}}
+    ) is None
+
+
+def test_active_owner_idle_desconhecido_em_sessao_nao_asleep_e_ativo():
+    """A regressão ga-46wq5, metade 1: idle_minutes=None numa sessão viva e
+    NÃO-asleep (o caso comum: worker -adhoc- recém-criado que nunca populou
+    last_active) resolve pra ATIVO — mass-reclamar esse trabalho nunca foi o
+    que ga-46wq5 pediu (mirrors o comentário da fonte bash, linha ~3396: 'most
+    unknowns are fresh -adhoc- pool workers... mass-reclaiming their beads was
+    never what ga-46wq5 asked for')."""
+    live = {"ps-mrfb-adhoc-x1": {"state": "active", "idle_minutes": None}}
+    assert is_active_owner("ps-mrfb-adhoc-x1", live) is True
+
+
+def test_active_owner_sentinela_zero_do_go_sessao_asleep_nao_e_ativo():
+    """A regressão ga-46wq5, metade 2 (o fixture original do bug: 'sessão está
+    asleep... é despachado'). Uma sessão asleep tem last_active == sentinela
+    zero do Go ('0001-01-01T00:00:00Z'), que o CHAMADOR (bash,
+    _SESSIONS_IDLE_JSON) já traduz pra idle_minutes=None antes de chegar
+    aqui — idêntico em idle_minutes ao caso acima, mas com state='asleep'. Um
+    check só de idle_minutes NUNCA distinguiria os dois (ambos None); é o
+    check de state que protege, rodando ANTES do de idle_minutes, de
+    propósito. Sem ele, o dono asleep pareceria ativo pra sempre e o bead
+    nunca seria readmitido à fila de dispatch."""
+    asleep = {"ps-mrfb-adhoc-x1": {"state": "asleep", "idle_minutes": None}}
+    assert is_active_owner("ps-mrfb-adhoc-x1", asleep) is False
+
+
+def test_active_owner_idle_abaixo_do_threshold_e_ativo():
+    live = {"mila-wa-x1": {"state": "active", "idle_minutes": 10}}
+    assert is_active_owner("mila-wa", live, idle_threshold_min=180) is True
+
+
+def test_active_owner_idle_igual_ou_acima_do_threshold_nao_e_ativo():
+    """>= threshold, não só >: mirrors a comparação estrita `idle_minutes <
+    $thresh` da fonte — no limiar exato, já NÃO é ativo."""
+    at_thresh = {"mila-wa-x1": {"state": "active", "idle_minutes": 180}}
+    over_thresh = {"mila-wa-x1": {"state": "active", "idle_minutes": 999}}
+    assert is_active_owner("mila-wa", at_thresh, idle_threshold_min=180) is False
+    assert is_active_owner("mila-wa", over_thresh, idle_threshold_min=180) is False
+
+
+def test_active_owner_threshold_customizado_nao_hardcoded():
+    """O caller continua dono do valor real (PILOT_ASSIGNEE_IDLE_MINUTES) —
+    bead_state.py não hardcoda 180 uma segunda vez, só espelha o default pra
+    paridade (docs/pilot-dispatcher-derive-swap-decisions.md, Decisão 2)."""
+    live = {"mila-wa-x1": {"state": "active", "idle_minutes": 50}}
+    assert is_active_owner("mila-wa", live, idle_threshold_min=30) is False
+    assert is_active_owner("mila-wa", live, idle_threshold_min=60) is True
+
+
+def test_active_owner_casa_por_sufixo_como_holder_is_alive():
+    """Mesma primitiva de casamento de holder_is_alive (Decisão 1) — o achado
+    original de sufixo (crew 'mila-wa' vs sessão 'mila-wa-awispm94omdp') vale
+    igual aqui, não é uma segunda reimplementação com um bug diferente."""
+    live = {"mila-wa-awispm94omdp": {"state": "active", "idle_minutes": 5}}
+    assert is_active_owner("mila-wa", live) is True
+
+
+def test_active_owner_aceita_forma_antiga_set_sem_registro_rico():
+    """Backward-compat explícito (Decisão 1): um chamador que só tem a forma
+    antiga (set de identificadores, sem state/idle_minutes) ainda funciona —
+    degrada pra 'sem dado extra, então não restringe' (mesma direção segura de
+    idle_minutes=None), nunca lança exceção nem quebra."""
+    assert is_active_owner("mila-wa", frozenset({"mila-wa-x1"})) is True
+    assert is_active_owner("mila-wa", frozenset()) is False
+
+
+def test_active_owner_registro_ausente_ou_none_para_match_nao_quebra():
+    """Defensivo: um dict rico onde o registro de UM match é vazio/None (dado
+    malformado de um chamador) não lança AttributeError — trata como 'sem
+    dado extra', mesma direção segura de idle_minutes=None acima."""
+    assert is_active_owner("mila-wa", {"mila-wa-x1": {}}) is True
+    assert is_active_owner("mila-wa", {"mila-wa-x1": None}) is True
 
 
 # ── de quem é a vez ──────────────────────────────────────────────────────────
@@ -774,3 +876,64 @@ def test_story_blocked_prefixado_continua_sem_vocabulario():
     mesmo erro de forma oposta (over-match em vez de under-match)."""
     st = derive(b(labels=["story:approved", "story:blocked:algumacoisa"]), None, CREWS)
     assert st["state"] != "parked"
+
+
+# ── parâmetro omitido == None explícito (Decisão 4, item 3 — ga-rwgp8) ───────
+# "toda vez que um swap acidentalmente troca None por False silenciosamente,
+# uma sessão viva vira reciclada" — este é o teste que pegaria isso ANTES de
+# um call site real, não depois. Não testa a LÓGICA de cada regra (os testes
+# acima já fazem isso); testa a OMISSÃO em si: para cada parâmetro opcional de
+# derive(), chamar sem ele precisa devolver EXATAMENTE o mesmo dict que chamar
+# com ele passado como None explícito — nenhum default silenciosamente
+# diferente de None pode se infiltrar num parâmetro cujo contrato é tri-state.
+# Cobre os 4 parâmetros opcionais de derive() hoje: live_sessions, known_crews
+# (frozenset() é o default, não None — mas mesmo princípio: omitido ==
+# default explícito), merged, now, gate_active.
+
+_OMITTED_PARAM_FIXTURES = (
+    ("backlog_simples", b()),
+    ("in_progress_com_assignee", b(status="in_progress", assignee="mila-wa")),
+    ("gate_failed", b(status="open", labels=["gate:needs-fix"], assignee="mila-wa")),
+    ("gate_queued", b(labels=["gate:queued"])),
+    ("gate_passed_merged_none", b(labels=["gate:passed"])),
+    ("armed_roteado", b(status="open", labels=["ctx:ready", "exec:auto"],
+                         metadata={"gc.routed_to": "gastown.dog"})),
+    ("pilot_held_com_until", b(labels=["pilot:held", "pilot:held-until:1000000000"])),
+    ("exec_manual_sem_crew", b(labels=["exec:manual"])),
+)
+
+
+def test_derive_todos_parametros_omitidos_e_identico_a_todos_none_explicito():
+    for nome, bead in _OMITTED_PARAM_FIXTURES:
+        omitido = derive(bead)
+        explicito = derive(bead, live_sessions=None, known_crews=frozenset(),
+                            merged=None, now=None, gate_active=None)
+        assert omitido == explicito, (nome, omitido, explicito)
+
+
+def test_derive_live_sessions_omitido_e_identico_a_none_explicito():
+    """Isolado do teste acima (que já cobre via kwargs completos) — este varia
+    SÓ live_sessions, provando que especificamente ele não é o parâmetro que
+    poderia divergir se um dia ganhasse um default diferente de None."""
+    for nome, bead in _OMITTED_PARAM_FIXTURES:
+        assert derive(bead) == derive(bead, None), nome
+
+
+def test_derive_merged_omitido_e_identico_a_none_explicito():
+    st_omitido = derive(b(labels=["gate:passed"]), None, CREWS)
+    st_explicito = derive(b(labels=["gate:passed"]), None, CREWS, merged=None)
+    assert st_omitido == st_explicito
+
+
+def test_derive_now_omitido_e_identico_a_none_explicito():
+    bead = b(labels=["pilot:held", "pilot:held-until:1000000000"])
+    st_omitido = derive(bead, None, CREWS)
+    st_explicito = derive(bead, None, CREWS, now=None)
+    assert st_omitido == st_explicito
+
+
+def test_derive_gate_active_omitido_e_identico_a_none_explicito():
+    bead = b(labels=["gate:queued"])
+    st_omitido = derive(bead, None, CREWS)
+    st_explicito = derive(bead, None, CREWS, gate_active=None)
+    assert st_omitido == st_explicito

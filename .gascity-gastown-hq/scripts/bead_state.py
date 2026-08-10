@@ -538,6 +538,35 @@ def crew_of(actor: str, known_crews: frozenset) -> str | None:
     return base if base in known_crews else None
 
 
+def _match_live_session(assignee: str, live_sessions):
+    """Casamento exato/prefixo (nos dois sentidos) entre `assignee` e um
+    identificador em `live_sessions` — a MESMA lógica de holder_is_alive,
+    extraída para ser reusada por is_active_owner (Decisão 1, ga-rwgp8: uma
+    primitiva canônica, composers layering em cima dela, nunca uma segunda
+    cópia do laço de casamento — é exatamente o tipo de duplicação que este
+    módulo existe pra acabar).
+
+    live_sessions aceita as DUAS formas que holder_is_alive já aceita: a
+    antiga (set/frozenset de identificadores) OU a rica (dict[identificador,
+    {state, idle_minutes}]) — iterar um dict em Python já devolve as CHAVES,
+    então o mesmo laço serve pras duas sem branch explícito de forma; só a
+    extração do registro por chamador precisa saber qual forma recebeu.
+
+    Devolve (matched, record). record é o dict associado quando live_sessions
+    é a forma rica e houve match; {} em qualquer outro caso (forma antiga, ou
+    sem match) — nunca None, pra chamador (is_active_owner) não precisar de
+    guarda extra antes de um .get().
+    """
+    is_rich = isinstance(live_sessions, dict)
+    for s in live_sessions:
+        if s == assignee or s.startswith(assignee + "-") or assignee.startswith(s + "-"):
+            # `or {}` cobre um registro presente mas None/vazio (dict malformado
+            # de um chamador) — sem isto, o .get() de is_active_owner quebraria
+            # com AttributeError em vez de degradar pra "sem dado extra".
+            return True, ((live_sessions[s] or {}) if is_rich else {})
+    return False, {}
+
+
 def holder_is_alive(assignee: str, live_sessions) -> bool | None:
     """O detentor do bead está vivo? True / False / None = NÃO DÁ PRA SABER.
 
@@ -581,6 +610,13 @@ def holder_is_alive(assignee: str, live_sessions) -> bool | None:
        state=active produzindo zero saída (zumbi com quota estourada). VIVO ≠
        TRABALHANDO; para decisão de reclaim, vivacidade é condição necessária, não
        suficiente.
+
+    ⭐ FORMA RICA (Decisão 1, ga-rwgp8 — derive() swap fatia 2/6): live_sessions
+       também aceita dict[identificador, {state, idle_minutes}], o mesmo registro
+       que is_active_owner() consome. Sem mudança de comportamento aqui: iterar
+       um dict em Python já devolve as chaves, então o casamento é idêntico ao da
+       forma antiga; só quem precisa do REGISTRO associado a um match
+       (is_active_owner) usa _match_live_session diretamente em vez de só o bool.
     """
     if live_sessions is None:
         return None
@@ -593,10 +629,62 @@ def holder_is_alive(assignee: str, live_sessions) -> bool | None:
         # (regra 7 só vira "stranded" com alive IS False; None e True são idênticos
         # ali) — sem fingir uma certeza que não temos.
         return None
-    for s in live_sessions:
-        if s == assignee or s.startswith(assignee + "-") or assignee.startswith(s + "-"):
-            return True
-    return False
+    matched, _ = _match_live_session(assignee, live_sessions)
+    return matched
+
+
+def is_active_owner(assignee: str, session_meta, idle_threshold_min: int = 180) -> bool | None:
+    """True sse `assignee` é um dono CONFIRMADO ATIVO: vivo (holder_is_alive),
+    E não-asleep, E (idle_minutes desconhecido OU abaixo de idle_threshold_min).
+
+    Decisões 1+2 (ga-rwgp8) — substitui pilot-dispatcher.sh's
+    _session_is_active_owner (linhas ~3383-3402), thin wrapper por composição
+    sobre holder_is_alive, não uma segunda reimplementação: porta 1:1 a regra
+    jq verificada na fonte —
+        select(.state != "asleep")
+        | select((.idle_minutes == null) or (.idle_minutes < $thresh))
+    — mesmo roster (`_ACTIVE_OWNER_IDS`), mesmo threshold-source
+    (PILOT_ASSIGNEE_IDLE_MINUTES, default 180, caller continua dono do valor
+    real — não hardcoda de novo aqui, só espelha o default pra paridade).
+
+    session_meta: dict[identificador, {"state": str, "idle_minutes": int|None}]
+    — o registro rico que holder_is_alive's live_sessions agora aceita — ou
+    None = NÃO CONSULTEI (mesma semântica, herdada via holder_is_alive).
+
+    Tri-state por COMPOSIÇÃO com holder_is_alive (não reimplementação do
+    None-safety nem da imunidade de coordenador):
+      - session_meta is None                  → None (não consultei)
+      - assignee vazio, ou nenhum match vivo   → False (mesmo veredito de
+        holder_is_alive — sem sessão viva casando, não pode ser dono ativo)
+      - coordenador (mayor/deacon)             → None (holder_is_alive nunca
+        confirma vivacidade de um papel sempre-ligado; herdado, não reinventado)
+      - match vivo, state == "asleep"          → False. ⚠️ É o achado ga-46wq5:
+        uma sessão asleep tem last_active == sentinela zero do Go
+        ("0001-01-01T00:00:00Z"), que o CHAMADOR (bash, _SESSIONS_IDLE_JSON)
+        já traduz pra idle_minutes=None antes de chegar aqui — um check só de
+        idle_minutes NUNCA pegaria isso (None cai no braço "ativo" abaixo,
+        pelo desenho). O check de state É a proteção real contra esse caso;
+        não é redundante com o de idle_minutes — roda ANTES dele, de
+        propósito, mirroring exatamente a ordem `select(state != asleep) |
+        select(idle...)` da fonte.
+      - match vivo, não-asleep, idle_minutes None    → True. Idle desconhecido
+        resolve pra ATIVO, não pra incerto: a maioria dos None reais são
+        workers -adhoc- recém-criados que nunca populam last_active, e
+        mass-reclamar o trabalho deles nunca foi o que ga-46wq5 pediu (mesma
+        direção documentada na fonte bash, comentário da linha ~3396).
+      - match vivo, não-asleep, idle_minutes < threshold  → True
+      - match vivo, não-asleep, idle_minutes >= threshold → False
+    """
+    alive = holder_is_alive(assignee, session_meta)
+    if alive is not True:
+        return alive
+    _, record = _match_live_session(assignee, session_meta)
+    if (record.get("state") or "") == "asleep":
+        return False
+    idle = record.get("idle_minutes")
+    if idle is None:
+        return True
+    return idle < idle_threshold_min
 
 
 def derive(bead: dict, live_sessions=None,
