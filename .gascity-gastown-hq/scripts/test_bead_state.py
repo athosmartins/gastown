@@ -11,7 +11,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bead_state import derive, holder_is_alive, is_athos_page, is_ephemeral  # noqa: E402
+from bead_state import derive, holder_is_alive, is_athos_page, is_ephemeral, is_coordinator  # noqa: E402
 
 CREWS = frozenset({"mila-wa", "oracle-wa", "batista-wa", "batista-ps", "mayor"})
 
@@ -55,6 +55,55 @@ def test_in_progress_com_prova_de_morte_e_stranded():
     st = derive(b(status="in_progress", assignee="mila-wa"), frozenset(), CREWS)
     assert st["state"] == "stranded"
     assert st["actions"] == ["liberar_para_pool"]
+
+
+# ── coordenador (mayor/deacon) nunca é stranded (ga-8lrud) ─────────────────────
+# Absorvido de inflight-reclaim-guard.py's COORDINATOR_MARKERS/is_coordinator
+# (scripts/inflight-reclaim-guard.py:289-294,1144-1152), que lifecycle-coherence-
+# janitor.sh's R4/R7 já refletiam com uma exclusão hardcoded de "mayor" (prova de
+# que consumidores de produção já tinham aprendido a lição; o modelo canônico não).
+# A sessão viva se chama "gastown.mayor"/"gastown.deacon" — um PREFIXO diferente
+# do assignee bare "mayor"/"deacon" que o casamento por sufixo de holder_is_alive
+# não cobre — então SEM esta guarda um bead in_progress do mayor/deacon resolvia
+# alive=False -> "stranded". Nenhum bead in_progress de mayor/deacon existia no
+# momento da medição (09/08) — gap latente, não incidente vivo.
+
+def test_is_coordinator_casa_por_substring_mesmo_vocabulario_do_guard():
+    assert is_coordinator("mayor") is True
+    assert is_coordinator("deacon") is True
+    assert is_coordinator("gastown.mayor") is True
+    assert is_coordinator("gastown.deacon") is True
+    assert is_coordinator("mila-wa") is False
+    assert is_coordinator("") is False
+
+
+def test_holder_alive_coordenador_e_none_nao_false_mesmo_sem_sessao_correspondente():
+    """A sessão real é 'gastown.mayor', não 'mayor' — o casamento por sufixo
+    (s==assignee / s.startswith(assignee+'-') / assignee.startswith(s+'-')) não
+    bate nenhum dos dois. Sem a guarda de is_coordinator, isto cairia no loop e
+    devolveria False (ninguém bate)."""
+    live = frozenset({"gastown.mayor", "gastown.deacon", "mila-wa-x1"})
+    assert holder_is_alive("mayor", live) is None
+    assert holder_is_alive("deacon", live) is None
+
+
+def test_holder_alive_coordenador_protegido_mesmo_com_lista_de_sessoes_vazia():
+    """Mesma semântica de claimant_provably_dead: coordenador nunca é 'comprovadamente
+    morto', mesmo quando a consulta de sessões devolve vazio (CONSULTEI E NÃO HÁ
+    NINGUÉM para qualquer outro assignee — mas coordenador é exceção antes do loop)."""
+    assert holder_is_alive("mayor", frozenset()) is None
+
+
+def test_in_progress_do_coordenador_nunca_e_stranded():
+    """O teste que teria pegado o gap antes de virar incidente: R4/R7 do janitor já
+    protegiam 'mayor' na prática — este é o mesmo invariante no modelo canônico."""
+    live = frozenset({"gastown.mayor", "mila-wa-x1"})
+    st = derive(b(status="in_progress", assignee="mayor"), live, CREWS)
+    assert st["state"] == "executing"
+    assert "liberar_para_pool" not in st["actions"]
+    st2 = derive(b(status="in_progress", assignee="deacon"), live, CREWS)
+    assert st2["state"] == "executing"
+    assert "liberar_para_pool" not in st2["actions"]
 
 
 def test_gate_failed_nao_devolve_pro_pool_sem_prova_de_morte():

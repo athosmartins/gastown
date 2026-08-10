@@ -172,12 +172,27 @@ def crew_of(actor: str, known_crews: frozenset) -> str | None:
     return base if base in known_crews else None
 
 
+# ga-8lrud: absorvido de inflight-reclaim-guard.py's COORDINATOR_MARKERS/is_coordinator
+# (scripts/inflight-reclaim-guard.py:289-294,1144-1152) — MESMO vocabulário, substring
+# match, não prefixo/exato, de propósito (a guarda original já usa substring e vários
+# consumidores já dependem dessa amplitude via reclaim_liveness.claimant_provably_dead).
+# Papel sempre-ligado: nunca é candidato a "morto comprovado".
+COORDINATOR_MARKERS = ("mayor", "deacon")
+
+
+def is_coordinator(identity: str) -> bool:
+    if not identity:
+        return False
+    return any(marker in identity for marker in COORDINATOR_MARKERS)
+
+
 def holder_is_alive(assignee: str, live_sessions) -> bool | None:
     """O detentor do bead está vivo? True / False / None = NÃO DÁ PRA SABER.
 
-    ⚠️ DOIS ERROS MEDIDOS EM 09/08, os dois produzindo "abandonado" com confiança
-    sobre trabalho VIVO — que é o pior falso-positivo que este módulo pode ter,
-    porque a ação que ele autoriza é RECLAMAR o bead de quem está trabalhando nele.
+    ⚠️ TRÊS ERROS MEDIDOS, todos produzindo "abandonado" com confiança sobre
+    trabalho VIVO (ou, no 3º caso, sobre um papel que nunca "morre") — que é o
+    pior falso-positivo que este módulo pode ter, porque a ação que ele autoriza
+    é RECLAMAR o bead de quem está trabalhando nele.
 
     1. NOME COM SUFIXO. O assignee é o nome do crew (`mila-wa`); a sessão viva
        chama-se `mila-wa-awispm94omdp`. A comparação era `assignee in live_sessions`,
@@ -189,6 +204,20 @@ def holder_is_alive(assignee: str, live_sessions) -> bool | None:
        ERRADO. Por isso `live_sessions=None` agora significa NÃO CONSULTEI, é distinto
        de `frozenset()` = CONSULTEI E NÃO HÁ NINGUÉM, e só o segundo pode concluir
        "abandonado".
+    3. COORDENADOR SEM PROTEÇÃO (ga-8lrud, absorvido de inflight-reclaim-guard.py's
+       is_coordinator()/COORDINATOR_MARKERS). assignee="mayor"/"deacon" é um papel
+       sempre-ligado, mas a sessão viva se chama "gastown.mayor"/"gastown.deacon" —
+       um PREFIXO diferente do assignee bare, que o casamento por sufixo acima não
+       cobre (nem `s==assignee`, nem `s.startswith(assignee+"-")`, nem o inverso).
+       Sem esta guarda, um bead in_progress do mayor/deacon resolvia alive=False →
+       "stranded", oferecendo liberar_para_pool sobre um papel que nunca deveria ser
+       reclamado. R4 e R7 do lifecycle-coherence-janitor.sh já protegiam "mayor" à
+       mão (exclusão hardcoded antes mesmo de qualquer checagem de liveness) — prova
+       de que consumidores de produção já tinham aprendido essa lição; o modelo
+       canônico não. Nenhum bead in_progress de mayor/deacon existia no momento da
+       medição (09/08) — gap latente, não incidente vivo, mas real: qualquer
+       consumidor futuro que confie cegamente em holder_is_alive()/derive() herdaria
+       o mesmo buraco que a versão *hardcoded* já tinha fechado.
 
     ⭐ FONTE CANÔNICA DE VIVACIDADE — use esta, não invente a sua:
            gc session list --json      → 72 sessões (medido 09/08)
@@ -205,6 +234,13 @@ def holder_is_alive(assignee: str, live_sessions) -> bool | None:
         return None
     if not assignee:
         return False
+    if is_coordinator(assignee):
+        # None, não True: nunca verificamos vivacidade de fato para um coordenador —
+        # só recusamos concluir morte. Mesma semântica de live_sessions=None ("não
+        # consultei"), e produz o mesmo resultado em todo call site de derive() hoje
+        # (regra 7 só vira "stranded" com alive IS False; None e True são idênticos
+        # ali) — sem fingir uma certeza que não temos.
+        return None
     for s in live_sessions:
         if s == assignee or s.startswith(assignee + "-") or assignee.startswith(s + "-"):
             return True
