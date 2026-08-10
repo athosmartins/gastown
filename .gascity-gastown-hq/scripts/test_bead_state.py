@@ -11,7 +11,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bead_state import derive, holder_is_alive, is_athos_page  # noqa: E402
+from bead_state import derive, holder_is_alive, is_athos_page, is_ephemeral  # noqa: E402
 
 CREWS = frozenset({"mila-wa", "oracle-wa", "batista-wa", "batista-ps", "mayor"})
 
@@ -111,3 +111,90 @@ def test_nenhum_estado_resolve_pro_athos_sem_label_de_pagina():
 
 def test_closed_e_terminal():
     assert derive(b(status="closed"), None, CREWS)["turn"] == "nobody"
+
+
+# ── absorvido de pilot-dispatcher.sh (ga-7qsxr, 09/08) ─────────────────────────
+# Catalogados lendo o arquivo inteiro (300 refs, 3 leituras independentes por trecho)
+# antes de qualquer troca de lógica local por derive() — ordem exigida pelo bead.
+
+def test_gate_needs_human_qualquer_sufixo_e_park_exceto_product():
+    """pilot-dispatcher.sh veta gate:needs-human* (10+ call sites) independente do
+    sufixo; só :product é vez do Athos (is_athos_page, regra 3, roda antes do park).
+    Sem isto derive() dizia 'ready'/'backlog' pra uma bead que o Pilot nunca
+    despacharia — custo medido: ga-3lsy1 dispatched 4x apesar do label desde a
+    criação."""
+    st_technical = derive(b(labels=["ctx:ready", "exec:auto", "gate:needs-human:technical"]),
+                           None, CREWS)
+    assert st_technical["state"] == "parked"
+    assert st_technical["turn"] == "mayor"
+
+    st_bare = derive(b(status="in_progress", labels=["gate:needs-human"], assignee="mila-wa"),
+                      frozenset({"mila-wa"}), CREWS)
+    assert st_bare["state"] == "parked"
+
+    st_product = derive(b(labels=["gate:needs-human:product"]), None, CREWS)
+    assert st_product["turn"] == "athos"
+    assert st_product["state"] != "parked"
+
+
+def test_needs_human_bare_prefix_bugs_tech_debt_e_park():
+    """Vocabulário separado de gate:needs-human — usado por bugs/tech-debt sem o
+    prefixo gate: (ga-3lsy1)."""
+    st = derive(b(labels=["needs-human-followup"]), None, CREWS)
+    assert st["state"] == "parked"
+
+
+def test_pilot_held_count_bookkeeping_nao_colide_com_park():
+    """ACHADO MAIS URGENTE da sessão: pilot:held-count:<slug>:<n> (contador de
+    escalação de _pilot_hold_or_escalate, NUNCA limpo) colidia com o antigo prefixo
+    bare 'pilot:held' em PARK_PREFIXES — uma bead segurada UMA VEZ ficava 'parked'
+    pra SEMPRE, mesmo muito depois de despachada/mergeada, porque park (regra 4) é
+    checado antes de executing/at_gate/gate_failed (regras 5-7). Já afeta o painel
+    em produção (1º consumidor migrado)."""
+    st = derive(b(status="in_progress", labels=["pilot:held-count:ga-lfvs6:1"],
+                  assignee="mila-wa"),
+                frozenset({"mila-wa"}), CREWS)
+    assert st["state"] != "parked"
+    assert st["state"] == "executing"
+
+
+def test_pilot_held_e_held_until_continuam_parkeando():
+    """Regressão-guarda para o fix acima: o par LEGÍTIMO (pilot:held bare +
+    pilot:held-until:<epoch>, escritos juntos por _mayor_deferred_hold_db) precisa
+    continuar parkeando — só o contador de bookkeeping deixa de colidir."""
+    assert derive(b(labels=["pilot:held"]), None, CREWS)["state"] == "parked"
+    assert derive(b(labels=["pilot:held-until:1786400000"]), None, CREWS)["state"] == "parked"
+
+
+def test_story_triage_e_unrefined():
+    """Agrupada com story:unrefined/story:refinement-in-progress em
+    pilot-dispatcher.sh's _FILTER_PREAPPROVAL_LABELS — mesma guarda-chuva
+    pré-aprovação."""
+    assert derive(b(labels=["story:triage"]), None, CREWS)["state"] == "unrefined"
+
+
+def test_ephemeral_formas_nuas_do_pool_template():
+    """'wa-worker'/'ps-worker'/'gastown.dog' SEM sufixo não batiam nenhum marker
+    substring existente (falta o traço final) — pilot-dispatcher.sh já as tratava
+    como efêmeras explicitamente (padrão bash case, 2 call sites). Sem isto,
+    crew_of() resolveria a forma nua como se fosse um crew real."""
+    assert is_ephemeral("gastown.dog") is True
+    assert is_ephemeral("wa-worker") is True
+    assert is_ephemeral("ps-worker") is True
+    # formas sufixadas já cobertas pelos markers substring existentes — regressão-guarda
+    assert is_ephemeral("wa-worker-adhoc-xyz") is True
+    assert is_ephemeral("gastown.dog-3") is True
+    # não deve super-generalizar para nomes de crew reais
+    assert is_ephemeral("mila-wa") is False
+
+
+def test_outros_labels_park_absorvidos_de_pilot_dispatcher():
+    """story:blocked, type:future, cost-decision, prod-experiment, ban-risk,
+    engine-window:pending, waiting-on:/depends-on: — cada um com pelo menos um
+    call site real em pilot-dispatcher.sh, ausentes do vocabulário canônico até
+    ga-7qsxr. Direção aditiva/segura: pior caso é 'não despachou', nunca
+    double-dispatch."""
+    for labels in (["story:blocked"], ["type:future"], ["cost-decision"],
+                   ["prod-experiment"], ["ban-risk"], ["engine-window:pending"],
+                   ["waiting-on:ga-xyz"], ["depends-on:ga-xyz"]):
+        assert derive(b(labels=labels), None, CREWS)["state"] == "parked", labels

@@ -47,16 +47,53 @@ from __future__ import annotations
 
 PARK_PREFIXES = (
     "blocked:", "blocked-on:", "blocked-by:", "pool:refused", "pilot:refused",
-    "needs:engine-window", "pilot:held",
+    "needs:engine-window", "pilot:held-until:",
+    # gate:needs-human* (QUALQUER sufixo, incl. sem sufixo) — achado 09/08 catalogando
+    # pilot-dispatcher.sh p/ ga-7qsxr (300 refs, o maior interpretador privado): é o
+    # veto de park mais usado do arquivo (10+ call sites), confirmado por TRÊS leituras
+    # independentes do mesmo arquivo. Só o sufixo :product já tinha lar aqui (via
+    # is_athos_page/regra 3, que roda ANTES desta — logo :product continua indo pro
+    # Athos; só as OUTRAS variantes — :technical, :mayor-fixing, :on-device, ou a forma
+    # bare "gate:needs-human" — caem aqui). Sem isto, derive() dizia "ready"/"backlog"
+    # pra uma bead que o Pilot nunca despacharia. Custo medido no arquivo-fonte:
+    # ga-3lsy1 (dispatched 4x apesar do label desde a criação) e o TOCTOU re-check de
+    # dispatch_one, cujo combined-regex não conhecia a forma bare e despachou 253s
+    # depois de um hold explícito do Mayor.
+    "gate:needs-human",
+    "needs-human",   # bare, sem prefixo gate:/story: — usado p/ bugs/tech-debt (ga-3lsy1)
+    "waiting-on:", "depends-on:",
 )
 PARK_EXACT = frozenset({
     "framework:engine", "no-auto-dispatch", "pilot:no-auto-dispatch",
     "story:awaiting-external-merge", "on-device", "story:needs-device", "phone-proxy",
+    # Achados 09/08 catalogando pilot-dispatcher.sh p/ ga-7qsxr — cada um tem pelo menos
+    # um call site real no arquivo-fonte:
+    "pilot:held",            # bare — movido de PARK_PREFIXES (era prefixo, e por ser
+                              # prefixo colidia com o contador de bookkeeping
+                              # pilot:held-count:<slug>:<n> de _pilot_hold_or_escalate,
+                              # que NUNCA é limpo/decrementado. Sob o match antigo, uma
+                              # bead segurada UMA VEZ ficava "parked" pra SEMPRE, mesmo
+                              # muito depois de despachada/no-gate/mergeada — porque
+                              # "parked" é checado (regra 4) antes de gate_failed/
+                              # at_gate/executing (regras 5-7). Este é o achado mais
+                              # urgente da sessão: já afeta o painel EM PRODUÇÃO (1º
+                              # consumidor migrado, mergeado 884e8a670). O par legítimo
+                              # pilot:held / pilot:held-until:<epoch> continua coberto
+                              # (exact + prefixo, respectivamente); só o contador deixa
+                              # de colidir.
+    "story:blocked", "story:needs-human", "story:cancelled",
+    "type:future", "cost-decision", "prod-experiment", "ban-risk",
+    "engine-window:pending",  # distinto de needs:engine-window (Fase 2 batched
+                               # deliberadamente, não bloqueada — nomes quase iguais,
+                               # significados opostos)
 })
 # Estágios de refino: o bead ainda não é construível.
 UNREFINED = frozenset({
     "ctx:thin", "story:unrefined", "story:epic",
     "story:refinement-in-progress", "refino:policy-gap", "refino:info-gap",
+    "story:triage",  # agrupada com as 2 acima em pilot-dispatcher.sh's
+                      # _FILTER_PREAPPROVAL_LABELS — mesma "guarda-chuva pré-aprovação"
+                      # (achado 09/08, ga-7qsxr)
 })
 ARMED = frozenset({"ctx:ready", "exec:auto"})
 GATE_ACTIVE = frozenset({"gate:queued", "gate:reviewing", "gate:needs-rebase"})
@@ -93,6 +130,15 @@ def is_athos_page(labels) -> bool:
                for l in lset)
 
 EPHEMERAL_MARKERS = ("-adhoc-", "claude-headless", "wa-worker-", "ps-worker-", "dog-")
+# Formas NUAS (sem sufixo à direita) dos mesmos templates de pool. "wa-worker" sozinho
+# não bate "wa-worker-" (falta o traço final) e "gastown.dog" não bate "dog-" (idem) —
+# então is_ephemeral() dizia False pras duas, enquanto pilot-dispatcher.sh já as tratava
+# como efêmeras explicitamente (padrão bash `case`:
+# gastown.dog|gastown.dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*, 2 call sites).
+# Achado 09/08 catalogando aquele arquivo p/ ga-7qsxr, confirmado por 2 leituras
+# independentes. Sem isto, um crew_of() chamado com a forma nua resolveria como se
+# fosse um crew real.
+EPHEMERAL_EXACT = frozenset({"gastown.dog", "wa-worker", "ps-worker"})
 
 
 def _labels(bead) -> frozenset:
@@ -110,7 +156,9 @@ def _has_prefix(labels, prefixes) -> str | None:
 def is_ephemeral(actor: str) -> bool:
     """Worker efêmero NÃO é crew. Confundir os dois foi a causa do 'claude-wa'
     inexistente que quebrou o botão Cutucar (medido 09/08)."""
-    return bool(actor) and any(m in actor for m in EPHEMERAL_MARKERS)
+    if not actor:
+        return False
+    return actor in EPHEMERAL_EXACT or any(m in actor for m in EPHEMERAL_MARKERS)
 
 
 def crew_of(actor: str, known_crews: frozenset) -> str | None:
