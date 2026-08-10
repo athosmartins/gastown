@@ -2254,7 +2254,16 @@ if [ "$ORPHAN_VERDICT_COUNT" -gt 0 ]; then
     OV_AGE=$(age_minutes_of "$OV_UPDATED" "$NOW_EPOCH")
     case "$OV_AGE" in ''|*[!0-9]*) OV_AGE=0 ;; esac
 
-    OV_GR_ID=$(printf '%s\n' "$OV_LABELS" | grep -oE 'gate-run:[A-Za-z0-9._-]+' | head -1 | sed 's/^gate-run://')
+    # ga-qtc16 gate-fix (attempt 3): same failure class as the OV_GR_RAW fix
+    # below, one sibling over. When a verdict carries no gate-run: substring
+    # at all — Step 0b.2's OWN anticipated "no label" case, with a dedicated
+    # skip branch further down — `grep -oE` finds no match and exits 1; under
+    # `pipefail` that nonzero status survives through `head -1`/`sed` (both
+    # succeed trivially on empty input) to become the whole pipeline's exit
+    # status, so the bare assignment aborted the ENTIRE script on exactly the
+    # input this step exists to handle. `|| true` is the same established
+    # idiom as the sibling fix immediately below.
+    OV_GR_ID=$(printf '%s\n' "$OV_LABELS" | grep -oE 'gate-run:[A-Za-z0-9._-]+' | head -1 | sed 's/^gate-run://') || true
     OV_HAS_GR_LABEL=1
     [ -z "$OV_GR_ID" ] && OV_HAS_GR_LABEL=0
 
