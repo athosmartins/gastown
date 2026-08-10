@@ -3401,15 +3401,75 @@ _ACTIVE_OWNER_IDS_JSON=$(printf '%s' "$_ACTIVE_OWNER_IDS" \
   | jq -R -s 'split("\n") | map(select(length>0))' 2>/dev/null || echo "[]")
 _ROSTER_OK_FOR_FILTER=$_DEADWORKER_OK
 
+# ga-9e8ks (derive() swap slice 4/6, docs/pilot-dispatcher-derive-swap-
+# decisions.md): dict[identifier, {state, idle_minutes}] — the session_meta
+# shape bead_state.is_active_owner() expects. Mechanical port of the SAME
+# roster $_ACTIVE_OWNER_IDS reads (closed!=true is the only pre-filter here,
+# matching $_LIVE_SESSION_IDS's own gate above — NOT asleep/idle, which
+# is_active_owner applies itself; pre-filtering those here would just be the
+# ga-46wq5 rule reimplemented a third time, the exact duplication this swap
+# exists to end). Every identifier field $_ACTIVE_OWNER_IDS already treats as
+# a synonym maps to the SAME record, so is_active_owner's prefix-aware
+# _match_live_session finds a match under any of them, same as the jq roster.
+_SESSION_META_JSON=$(echo "$_SESSIONS_IDLE_JSON" \
+  | jq -c '[.sessions[]? | select(.closed != true) |
+      {state: (.state // ""), idle_minutes: .idle_minutes} as $rec |
+      (.session_name, .name, .alias, .id, .agent_name) |
+      select(. != null and . != "") |
+      {(.): $rec}]
+    | add // {}' 2>/dev/null || echo '{}')
+[ -n "$_SESSION_META_JSON" ] && [ "$_SESSION_META_JSON" != "null" ] || _SESSION_META_JSON='{}'
+
 # _session_is_active_owner <identifier> — exit 0 iff <identifier> is a
 # confirmed active owner: not closed, not asleep, and (idle-time unknown OR
 # under PILOT_ASSIGNEE_IDLE_MINUTES). Unknown idle-time deliberately resolves
 # to "still active" (fail toward NO behavior change vs pre-fix) — most
 # unknowns are fresh -adhoc- pool workers that never populated last_active at
 # all, and mass-reclaiming THEIR beads was never what ga-46wq5 asked for.
+#
+# ga-9e8ks: bridges to bead_state.is_active_owner(assignee, session_meta,
+# idle_threshold_min) instead of reimplementing the rule a third time in jq —
+# same resolution/fail-open discipline as ga-10co2's _filter_exec_manual
+# bridge (slice 1): bead_state.py is located relative to THIS script's own
+# location (BASH_SOURCE), never a static HQ default (the ga-8mzgn trap), and
+# ANY bridge failure — python3/bead_state.py missing, or output other than
+# the exact literal True/False/None — falls back to the pre-existing
+# $_ACTIVE_OWNER_IDS grep unchanged, never a half-trusted result.
 _session_is_active_owner() {
   [ -n "${1:-}" ] || return 1
-  printf '%s\n' "$_ACTIVE_OWNER_IDS" | grep -Fxq -- "$1"
+  local _sao_asg="$1"
+
+  local _sao_bsp _sao_sd
+  _sao_bsp="${PILOT_BEAD_STATE_PY_OVERRIDE:-}"
+  if [ -z "$_sao_bsp" ]; then
+    _sao_sd="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    _sao_bsp="${_sao_sd:+$_sao_sd/../../../scripts}/bead_state.py"
+  fi
+
+  if command -v python3 >/dev/null 2>&1 && [ -f "$_sao_bsp" ]; then
+    local _sao_pydir _sao_meta _sao_payload _sao_out
+    _sao_pydir="$(dirname "$_sao_bsp")"
+    _sao_meta="${_SESSION_META_JSON:-}"
+    [ -n "$_sao_meta" ] || _sao_meta='{}'
+    _sao_payload=$(jq -n --arg asg "$_sao_asg" --argjson meta "$_sao_meta" \
+      --argjson thresh "${PILOT_ASSIGNEE_IDLE_MINUTES:-180}" \
+      '{assignee: $asg, session_meta: $meta, idle_threshold_min: $thresh}' 2>/dev/null)
+    if [ -n "$_sao_payload" ]; then
+      _sao_out=$(printf '%s' "$_sao_payload" | PYTHONPATH="$_sao_pydir" python3 -c '
+import sys, json
+from bead_state import is_active_owner
+p = json.load(sys.stdin)
+print(is_active_owner(p["assignee"], p["session_meta"], p["idle_threshold_min"]))
+' 2>/dev/null)
+      case "$_sao_out" in
+        True)       return 0 ;;
+        False|None) return 1 ;;
+      esac
+    fi
+  fi
+
+  # Bridge unavailable or produced unexpected output — original jq/grep check.
+  printf '%s\n' "$_ACTIVE_OWNER_IDS" | grep -Fxq -- "$_sao_asg"
 }
 
 # ── Stale-sling liveness (dead-builder HOL-block fix) ─────────────────────────
