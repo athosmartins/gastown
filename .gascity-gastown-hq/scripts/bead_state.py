@@ -691,7 +691,8 @@ def derive(bead: dict, live_sessions=None,
            known_crews: frozenset = frozenset(),
            merged: bool | None = None,
            now: int | None = None,
-           gate_active: bool | None = None) -> dict:
+           gate_active: bool | None = None,
+           has_active_branch: bool | None = None) -> dict:
     """Estado canônico. PURA — todo fato de runtime entra por parâmetro.
 
     live_sessions: conjunto de sessões vivas, ou None = NÃO CONSULTEI. None nunca
@@ -712,6 +713,19 @@ def derive(bead: dict, live_sessions=None,
             documentou — a mesma doença que painel_visibilidade.py parou de
             confiar em gate:queued sozinho, ga-opzlf), e um marker aberto conta
             como at_gate mesmo se o label ainda não sincronizou.
+    has_active_branch: True/False se o chamador resolveu evidência de branch git
+            ativo (via _target_has_real_branch/_beadid_has_branch/equivalente em
+            bash — I/O que fica FORA deste núcleo puro, mesmo padrão de `merged`/
+            `gate_active`); None = não resolvido (default, comportamento
+            preservado para todo chamador que não passa este parâmetro).
+            ⚠️ Direção OPOSTA a `merged`/`gate_active`: aqui é só um sinal de
+            proteção ADICIONAL sobre a regra 7, nunca a causa direta de uma
+            ação destrutiva — então o default seguro sob incerteza é assumir
+            AUSENTE (False-like), não None-como-verdade. Só `is True` explícito
+            ativa a proteção (Decisão 4, item 2: nunca truthiness) — porta 1:1
+            o atalho que _sling_is_live já usa em bash (branch existente é
+            prova de vida suficiente por si só, linha ~3386), não uma proteção
+            nova (Decisão 3, docs/pilot-dispatcher-derive-swap-decisions.md).
     """
     L = _labels(bead)
     status = bead.get("status") or ""
@@ -811,6 +825,16 @@ def derive(bead: dict, live_sessions=None,
                     "actions": ["cutucar"],
                     "reasons": {} if alive else {
                         "_incerteza": "vivacidade não consultada — 'executando' é o default seguro"}}
+        # Decisão 3 (ga-yy9td, fatia 3/6): detentor PROVADO morto, mas o
+        # chamador resolveu branch git ativo — porta o atalho que
+        # _sling_is_live já usa em bash (branch existente = prova de vida
+        # suficiente por si só). `is True` explícito, nunca truthiness
+        # (Decisão 4, item 2) — has_active_branch=False/None não protege.
+        if has_active_branch is True:
+            return {"state": "executing", "turn": "crew:" + (crew_of(assignee, known_crews) or assignee or "?"),
+                    "actions": ["cutucar"],
+                    "reasons": {"_incerteza": "detentor provado morto, mas branch ativo prova "
+                                               "trabalho em andamento — protege contra stranded"}}
         return {"state": "stranded", "turn": "mayor",
                 "actions": ["liberar_para_pool"],
                 "reasons": {}}

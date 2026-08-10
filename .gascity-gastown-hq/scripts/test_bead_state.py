@@ -66,6 +66,33 @@ def test_in_progress_com_prova_de_morte_e_stranded():
     assert st["actions"] == ["liberar_para_pool"]
 
 
+# ── has_active_branch: branch git ativo protege contra stranded (Decisão 3,
+# ga-yy9td, fatia 3/6) ────────────────────────────────────────────────────────
+# Porta o atalho que _sling_is_live já usa em bash (branch existente = prova de
+# vida suficiente por si só, linha ~3386 de pilot-dispatcher.sh) — não é
+# proteção nova. Decisão 4, item 2: testado como `is True`, nunca truthiness.
+
+def test_in_progress_morto_mas_com_branch_ativo_nao_e_stranded():
+    """O caso que este slice porta: detentor provadamente morto (alive is
+    False), mas o chamador resolveu has_active_branch=True (via
+    _target_has_real_branch/equivalente) — o branch prova trabalho em
+    andamento mesmo sem sessão viva."""
+    st = derive(b(status="in_progress", assignee="mila-wa"), frozenset(), CREWS,
+                has_active_branch=True)
+    assert st["state"] == "executing"
+    assert "liberar_para_pool" not in st["actions"]
+
+
+def test_in_progress_morto_com_branch_false_continua_stranded():
+    """Regressão: has_active_branch=False (resolvido, sem branch) NÃO pode
+    proteger — só True explícito ativa o atalho. Confirma que o novo
+    parâmetro não afrouxou o caso já coberto por
+    test_in_progress_com_prova_de_morte_e_stranded."""
+    st = derive(b(status="in_progress", assignee="mila-wa"), frozenset(), CREWS,
+                has_active_branch=False)
+    assert st["state"] == "stranded"
+
+
 # ── coordenador (mayor/deacon) nunca é stranded (ga-8lrud) ─────────────────────
 # Absorvido de inflight-reclaim-guard.py's COORDINATOR_MARKERS/is_coordinator
 # (scripts/inflight-reclaim-guard.py:289-294,1144-1152), que lifecycle-coherence-
@@ -886,9 +913,9 @@ def test_story_blocked_prefixado_continua_sem_vocabulario():
 # derive(), chamar sem ele precisa devolver EXATAMENTE o mesmo dict que chamar
 # com ele passado como None explícito — nenhum default silenciosamente
 # diferente de None pode se infiltrar num parâmetro cujo contrato é tri-state.
-# Cobre os 4 parâmetros opcionais de derive() hoje: live_sessions, known_crews
+# Cobre os 5 parâmetros opcionais de derive() hoje: live_sessions, known_crews
 # (frozenset() é o default, não None — mas mesmo princípio: omitido ==
-# default explícito), merged, now, gate_active.
+# default explícito), merged, now, gate_active, has_active_branch.
 
 _OMITTED_PARAM_FIXTURES = (
     ("backlog_simples", b()),
@@ -907,7 +934,8 @@ def test_derive_todos_parametros_omitidos_e_identico_a_todos_none_explicito():
     for nome, bead in _OMITTED_PARAM_FIXTURES:
         omitido = derive(bead)
         explicito = derive(bead, live_sessions=None, known_crews=frozenset(),
-                            merged=None, now=None, gate_active=None)
+                            merged=None, now=None, gate_active=None,
+                            has_active_branch=None)
         assert omitido == explicito, (nome, omitido, explicito)
 
 
@@ -936,4 +964,11 @@ def test_derive_gate_active_omitido_e_identico_a_none_explicito():
     bead = b(labels=["gate:queued"])
     st_omitido = derive(bead, None, CREWS)
     st_explicito = derive(bead, None, CREWS, gate_active=None)
+    assert st_omitido == st_explicito
+
+
+def test_derive_has_active_branch_omitido_e_identico_a_none_explicito():
+    bead = b(status="in_progress", assignee="mila-wa")
+    st_omitido = derive(bead, frozenset(), CREWS)
+    st_explicito = derive(bead, frozenset(), CREWS, has_active_branch=None)
     assert st_omitido == st_explicito
