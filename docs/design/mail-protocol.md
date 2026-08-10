@@ -455,11 +455,17 @@ handled:**
 
 - `gc mail read <id>` -- view a message and mark it read (stays in the store,
   re-readable later)
-- `gc mail archive <id>` -- remove a message once handled; it no longer
-  appears in `gc mail check` or `gc mail inbox` results
+- `gc mail archive <id>` -- **permanently deletes** the message bead despite
+  the name: it no longer appears in `gc mail check`/`gc mail inbox`, AND
+  `bd show <id>` afterward returns "no issue found" -- forever, not merely
+  hidden from view. `gc mail delete` does the identical thing (its own
+  `--help` text says it works "by closing the beads," which is wrong -- see
+  "Mail Provenance" below for the verified mechanism). There is no undo.
 
 Don't leave a backlog of read-but-unarchived mail either -- once you've acted
 on a message (or it's a routine ack you don't need to revisit), archive it.
+Just don't expect to consult it again afterward for anything you didn't
+capture first (see below).
 
 ### Why not auto-mark-read on `--inject`?
 
@@ -472,38 +478,91 @@ A "seen" state distinct from "read" (separating "surfaced in a prompt" from
 "actually processed") would be the structurally clean fix here, but it's real
 design surface -- deferred unless this norm proves insufficient in practice.
 
-## Mail Provenance: Filing a Bead From a Mail
+## Mail Provenance: Filing a Bead From a Mail, and Verifying Delivery
 
-Archiving a mail (`gc mail archive`) soft-closes the underlying bead -- it
-does not delete it. But mail beads are ephemeral wisps with no `wisp_type:`
-label, so they used to fall into the untyped 24h default bucket of the
-hourly `wisp-compact` order and get hard-deleted once closed and past that
-TTL (fixed in ga-3rqwa: both `wisp-compact.sh` and the reaper's purge step
-now explicitly exempt `issue_type == "message"`). Confirmed live before the
-fix: an archived mail wisp came back "no issue found," permanently erasing
-the only record of who sent it and when.
+**`gc mail archive`/`gc mail delete` are an immediate, unconditional hard
+delete of the message bead -- not a soft-close.** This section used to say
+archiving soft-closed the bead and that only a *later* TTL-based janitor
+sweep (`wisp-compact.sh`'s hourly pass, once past the untyped-mail 24h
+bucket) actually destroyed it -- fixed in ga-3rqwa by exempting
+`issue_type == "message"` from that janitor's delete branch (and from the
+reaper's purge SQL). **That fix is real and still correct for the janitor
+path, but it never touched the actual deletion path**, which sits one layer
+up. Verified directly against the running engine's source
+(`internal/mail/beadmail/beadmail.go`): `Archive()` calls the store's
+`Delete()` unconditionally -- including when the message is already
+closed, where it still deletes rather than no-op'ing -- and `Delete()` is
+*literally* `return p.Archive(id)`, so the two commands are one code path
+wearing two names, and the help text for `gc mail delete` ("closing the
+beads") does not match what it does. Confirmed live (2026-08-10,
+self-contained test against a throwaway self-sent message): archive it, and
+within about a second `bd show <id>` returns "no issue found," the row is
+gone from `hq.wisps`, and no "closed"/"deleted" event was ever recorded in
+`wisp_events` -- there's no `bd show --all` or `--include-infra` to reach
+for either; neither flag exists on `show` (they belong to `list`/`count`/
+`export`). Dolt's own version history doesn't help: the `wisps` table is
+`dolt_ignore`d, so deletes there are never committed and there's no history
+to check out. **The window between "mail exists" and "mail is
+unrecoverably gone" is effectively zero, not a day** -- it depends entirely
+on how soon the recipient (or any automated processor) archives it.
 
-Even with that fix, don't depend on the source mail's continued existence
-to answer "who wrote this?" -- **when filing a new bead that cites a mail as
-its source, copy the mail's authorship onto the new bead at creation time**,
-instead of (or in addition to) citing it in prose. Prose ("ACHADO DE X,
-verificado por Y") has no disputable-proof value on its own: it can misattribute
-a subagent's finding to its parent session, and it's worthless once the
-source mail is gone.
+**The one place the data survives:** `gc events` (`.gc/events.jsonl`)
+records a `mail.sent` event (full body, sender, recipient, timestamp) and a
+separate `mail.archived` event (actor, id, timestamp) for every message,
+independent of `bd`/Dolt and unaffected by archive/delete. Neither `gc
+mail` nor `bd show` consults it, but it's the only durable record once a
+mail bead is gone -- see `gc events --help` for the `--type`/filter options.
 
-```bash
-# Instead of: bd create "Title" --description "ACHADO DE X (mail ga-wisp-...)"
-scripts/file-bead-from-mail.sh --mail-id ga-wisp-xxxxx \
-    "Title" --description "..." --type bug
-```
+This mechanism produces two symmetric rules, for the two things people have
+actually tried to reconstruct from a mail bead after the fact:
 
-This reads the mail's native `sender`/`assignee`/`created_at` fields and sets
-`mail.source_id` / `mail.author` / `mail.recipient` / `mail.sent_at` on the
-new bead's metadata -- so "who wrote this?" is answerable from the new bead
-alone, via `bd show <id> --json | jq .metadata`, independent of whether the
-source mail still exists. Omitting `--mail-id` is a plain passthrough to
-`bd create`: no `mail.*` key is ever added and no author is ever invented --
-an absent field is an honest answer, a guessed author is worse than none.
+1. **Authorship** (the original case, ga-3rqwa): don't depend on the source
+   mail's continued existence to answer "who wrote this?" -- **when filing
+   a new bead that cites a mail as its source, copy the mail's authorship
+   onto the new bead at creation time**, instead of (or in addition to)
+   citing it in prose. Prose ("ACHADO DE X, verificado por Y") has no
+   disputable-proof value on its own: it can misattribute a subagent's
+   finding to its parent session, and it's worthless once the source mail
+   is gone.
+
+   ```bash
+   # Instead of: bd create "Title" --description "ACHADO DE X (mail ga-wisp-...)"
+   scripts/file-bead-from-mail.sh --mail-id ga-wisp-xxxxx \
+       "Title" --description "..." --type bug
+   ```
+
+   This reads the mail's native `sender`/`assignee`/`created_at` fields and
+   sets `mail.source_id` / `mail.author` / `mail.recipient` /
+   `mail.sent_at` on the new bead's metadata -- so "who wrote this?" is
+   answerable from the new bead alone, via `bd show <id> --json | jq
+   .metadata`, independent of whether the source mail still exists.
+   Omitting `--mail-id` is a plain passthrough to `bd create`: no `mail.*`
+   key is ever added and no author is ever invented -- an absent field is
+   an honest answer, a guessed author is worse than none.
+
+2. **Delivery** (ga-8h185, 2026-08-10): don't depend on the destination
+   mail's continued existence to answer "did this send?" either --
+   **the only valid proof of a send is what `gc mail send` itself returned
+   at call time** (its JSON `ok`/`id` fields), captured then, in that
+   step's own close_reason or bead comment. Never re-verify a past send by
+   querying the mail bead afterward -- the recipient may have long since
+   archived it (routine mail hygiene, not a problem on their end), and
+   "not found" is then indistinguishable from "never sent." Getting this
+   wrong isn't just a wrong belief: in the incident that named this rule, a
+   dog re-checked an already-successful digest send this way, read the
+   false "not found" as proof of failure, and sent a real duplicate to the
+   mayor. If a later session genuinely needs to know whether a past
+   send happened, check `gc events --type mail.sent` (or the sending
+   step's own recorded close_reason) -- never `bd show` on the mail id.
+
+The underlying fix -- making `gc mail archive`/`gc mail delete` a real
+soft-close instead of an unconditional delete -- is Go-engine-level
+(`internal/mail/beadmail`, `internal/beads` in the gascity engine) and was
+deliberately not pursued for either incident above: both times the cheaper,
+engine-rebuild-free fix (capture the fact durably at the moment it's true,
+on the bead that needs it) fully closed the actual harm. Revisit only if
+this class of incident recurs after this doc update, or during a
+Mayor-coordinated engine window already touching this code.
 
 ## Implementation
 
