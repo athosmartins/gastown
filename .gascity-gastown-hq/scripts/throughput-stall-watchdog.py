@@ -71,6 +71,18 @@ import datetime as _tsw_datetime
 import park_labels
 import reclaim_liveness
 
+# ga-98inr: scripts/bead_state.py is the city's single canonical state model
+# (10 consumers used to each keep their own park-label copy — this file's own
+# park_labels.py, ga-hzt8s 2026-07-20, was itself a 2nd canonical attempt that
+# bead_state.py's ga-c1yqp effort didn't know about when it was built). Import
+# is DEFENSIVE and FAIL-OPEN to the park_labels-based _bead_is_braked() below —
+# same pattern already used by production-stall-watchdog.py's ga-qhca1 migration.
+_CANONICAL_STATE_FN = None
+try:
+    from bead_state import derive as _CANONICAL_STATE_FN  # type: ignore
+except Exception:
+    _CANONICAL_STATE_FN = None
+
 # ── paths ────────────────────────────────────────────────────────────────────
 CITY = os.environ.get("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
 PILOT_LOG = os.path.join(CITY, ".gc/logs/pilot-dispatcher.log")
@@ -241,6 +253,35 @@ def _bead_is_braked(labels):
     if park_labels.any_labeled(labels, EXCLUDE_LABELS_BACKLOG):
         return True
     return park_labels.is_reclaim_exhausted(labels)
+
+
+# ga-98inr: bead_state.derive() states that mean "not currently pool-
+# dispatchable right now" — this file's braked-equivalent. Deliberately
+# EXCLUDES "pinned": the old park_labels-based _bead_is_braked() above never
+# modeled it (a pinned+story:approved bead was counted as backlog pre-
+# migration, since bd queries only ever fetch status=open beads and no park_
+# labels group covers "pinned" label) — leaving it out here preserves that
+# exact fail-open behavior instead of silently changing it as a side effect.
+_TSW_BRAKED_STATES = frozenset({
+    "parked", "unrefined", "gate_failed", "at_gate",
+    "manual_assigned", "manual_unrouted", "awaiting_athos", "flowing",
+})
+
+
+def _canonical_is_braked(bead: dict):
+    """True/False via bead_state.py's canonical park/state vocabulary, or None
+    if the model is unavailable/erroring — the caller falls back to
+    _bead_is_braked() (this file's park_labels-based check) on None. No
+    live_sessions/known_crews/merged passed: only the STATE NAME is read, and
+    none of _TSW_BRAKED_STATES's branches change name based on those inputs
+    (verified against bead_state.py's derive() — they only affect 'turn' and
+    'actions', which this check never reads)."""
+    if _CANONICAL_STATE_FN is None:
+        return None
+    try:
+        return _CANONICAL_STATE_FN(bead).get("state") in _TSW_BRAKED_STATES
+    except Exception:
+        return None
 
 # ── test seams (monkeypatched in --selftest) ──────────────────────────────────
 # These are module-level callables so tests can substitute them without patching subprocess.
@@ -763,10 +804,16 @@ def backlog_signal():
                 labels = {str(l).strip() for l in raw_labels}
             elif isinstance(raw_labels, str):
                 labels = {x.strip() for x in raw_labels.split(",") if x.strip()}
-            # Exclude braked beads (variant-aware: catches gate:needs-human:product,
-            # story:blocked, etc. — not just exact base labels)
-            if _bead_is_braked(labels):
-                continue
+            # ga-98inr: bead_state.py's canonical model first; only fall back
+            # to the local park_labels-based check when the model errors or
+            # is unavailable (variant-aware either way: catches
+            # gate:needs-human:product, story:blocked, etc. — not just exact
+            # base labels).
+            braked = _canonical_is_braked(b)
+            if braked is True:
+                continue  # bead_state.py: not currently pool-dispatchable
+            if braked is None and _bead_is_braked(labels):
+                continue  # canonical model unavailable — fall back to the old local check
             all_beads.append(b)
             rig_unbraked += 1
         per_rig_raw[rig] = per_rig_raw.get(rig, 0) + rig_unbraked
@@ -3192,6 +3239,62 @@ def _selftest():
     else:
         _bad("ga-hzt8s-2", "pilot:reclaim-count:2 should NOT be braked yet, got %s"
              % _ghz_under_cap)
+
+    print("\nScenario ga-98inr-1: _canonical_is_braked — bead_state.py's model is now checked "
+          "FIRST (park_labels.py-based _bead_is_braked above is the fallback for when it's "
+          "unavailable). Covers vocabulary bead_state.py itself was missing (gate:needs-human "
+          "bare/:technical, next-action:<non-athos>, story:needs-human — none of which "
+          "park_labels.py's own EXCLUDE_LABELS_BACKLOG needed, since bead_state.py's is a "
+          "DIFFERENT canonical vocabulary this file didn't know about until this fix)")
+    _g98_cases = [
+        ({"status": "open", "labels": ["ctx:ready", "gate:needs-human"]}, True,
+         "gate:needs-human bare (bead_state.py PARK_PREFIXES gap, not in park_labels.py either)"),
+        ({"status": "open", "labels": ["ctx:ready", "gate:needs-human:technical"]}, True,
+         "gate:needs-human:technical (real case: wa-zy1ah)"),
+        ({"status": "open", "labels": ["ctx:ready", "next-action:batista-constroi"]}, True,
+         "next-action:<crew> (real case: wa-7dl62/wa-ielq6)"),
+        ({"status": "open", "labels": ["ctx:ready", "story:needs-human"]}, True,
+         "story:needs-human (bead_state.py-only gap)"),
+        ({"status": "open", "labels": ["story:approved", "ctx:ready"]}, False,
+         "no park label — genuinely backlog (canonical model agrees with the old check)"),
+    ]
+    for _g98_bead, _g98_expect, _g98_desc in _g98_cases:
+        _g98_got = _canonical_is_braked(_g98_bead)
+        if _g98_got == _g98_expect:
+            _ok("ga-98inr-1: %s → braked=%s (via bead_state.py)" % (_g98_desc, _g98_expect))
+        else:
+            _bad("ga-98inr-1", "%s: expected braked=%s got %s" % (_g98_desc, _g98_expect, _g98_got))
+
+    print("\nScenario ga-98inr-2: REAL LIVE CASE (09/08) — ga-98inr itself (the bug this fix "
+          "closes) carries ctx:ready+exec:auto+story:approved+story:in-flight+pilot:dispatched. "
+          "Without bead_state.py's new FLOWING_LABELS vocabulary, ARMED would win and this bead "
+          "would come back as 'ready'/unbraked — a bead ALREADY dispatched re-offered to the pool "
+          "as idle backlog. Same shape as ga-fup3m/ga-x3e7p, its two sibling slices.")
+    _g98_flowing = {
+        "status": "open", "assignee": "",
+        "labels": ["ctx:ready", "exec:auto", "story:approved", "story:in-flight", "pilot:dispatched"],
+        "metadata": {"gc.routed_to": "gastown.dog"},
+    }
+    _g98_flowing_got = _canonical_is_braked(_g98_flowing)
+    if _g98_flowing_got is True:
+        _ok("ga-98inr-2: armed-but-already-flowing bead → braked=True (not re-offered as backlog)")
+    else:
+        _bad("ga-98inr-2", "armed+story:in-flight+pilot:dispatched should be braked, got %s"
+             % _g98_flowing_got)
+
+    print("\nScenario ga-98inr-3: _canonical_is_braked falls back to None (never crashes) when "
+          "the canonical model raises — caller then uses the old park_labels-based check, "
+          "matching production-stall-watchdog.py's ga-qhca1 fail-open pattern")
+    _g98_saved_fn = _CANONICAL_STATE_FN
+    globals()["_CANONICAL_STATE_FN"] = lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("boom"))
+    try:
+        _g98_err_got = _canonical_is_braked({"status": "open", "labels": ["needs-label-review"]})
+    finally:
+        globals()["_CANONICAL_STATE_FN"] = _g98_saved_fn
+    if _g98_err_got is None:
+        _ok("ga-98inr-3: canonical model raising → _canonical_is_braked returns None (fail-open)")
+    else:
+        _bad("ga-98inr-3", "expected None on canonical error, got %s" % _g98_err_got)
 
     # ── cleanup ───────────────────────────────────────────────────────────────────
     _read_pilot_log_lines = None

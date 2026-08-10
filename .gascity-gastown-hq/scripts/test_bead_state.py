@@ -247,6 +247,8 @@ def test_outros_labels_park_absorvidos_de_pilot_dispatcher():
                    ["prod-experiment"], ["ban-risk"], ["engine-window:pending"],
                    ["waiting-on:ga-xyz"], ["depends-on:ga-xyz"]):
         assert derive(b(labels=labels), None, CREWS)["state"] == "parked", labels
+
+
 # ── pilot:held-until expira (ga-fup3m, absorvido de pilot-missing-route-watchdog.sh) ──
 # scripts/pilot-missing-route-watchdog.sh (81 refs) já mede isto — seus próprios
 # Scenario 7/8 de selftest provam o comportamento certo: pilot:held bare SEM
@@ -330,3 +332,103 @@ def test_gate_active_true_conta_mesmo_sem_o_label_sincronizado():
     chamador GANHA nesta direção também."""
     st = derive(b(labels=[]), None, CREWS, gate_active=True)
     assert st["state"] == "at_gate"
+
+
+# ── ga-98inr: vocabulário absorvido de park_labels.py (2026-07-20, ga-hzt8s) ──
+# throughput-stall-watchdog.py já delegava a park_labels.py — um SEGUNDO módulo
+# "canônico" que bead_state.py não conhecia. Cada caso abaixo corresponde a um
+# label medido na população viva (candidatos story:approved/ctx:ready, 09/08)
+# que ficava sem classificação de park neste módulo.
+
+def test_needs_label_review_e_parked():
+    """10 ocorrências na população viva (ex.: wa-5b6yw, sem outro label de freio)."""
+    assert derive(b(labels=["ctx:ready", "needs-label-review"]), None, CREWS)["state"] == "parked"
+
+
+def test_story_needs_human_e_parked():
+    assert derive(b(labels=["story:approved", "story:needs-human"]), None, CREWS)["state"] == "parked"
+
+
+def test_gate_needs_human_bare_e_variantes_nao_product_sao_parked():
+    """gate:needs-human (bare, 3 ocorrências) e :technical (2 ocorrências, ex.
+    wa-zy1ah) não batem em PARK_PREFIXES/PARK_EXACT nem em is_athos_page (só
+    ':product' é vez do Athos) — caíam sem classificação nenhuma."""
+    assert derive(b(labels=["ctx:ready", "gate:needs-human"]), None, CREWS)["state"] == "parked"
+    assert derive(b(labels=["ctx:ready", "gate:needs-human:technical"]), None, CREWS)["state"] == "parked"
+    assert derive(b(labels=["ctx:ready", "gate:needs-human:branch-content-mismatch"]),
+                   None, CREWS)["state"] == "parked"
+
+
+def test_gate_needs_human_product_continua_vez_do_athos():
+    """Regressão: a nova entrada em PARK_PREFIXES não pode roubar a vez do Athos
+    da variante ':product' — is_athos_page (branch 3) precisa continuar ganhando."""
+    st = derive(b(labels=["ctx:ready", "gate:needs-human:product"]), None, CREWS)
+    assert st["turn"] == "athos"
+    assert st["state"] == "awaiting_athos"
+
+
+def test_next_action_nao_athos_e_parked():
+    """next-action:mayor (3), next-action:batista-constroi (2),
+    next-action:oracle-constroi (1) — só next-action:athos tinha vocabulário."""
+    for who in ("mayor", "batista-constroi", "oracle-constroi"):
+        st = derive(b(labels=["ctx:ready", f"next-action:{who}"]), None, CREWS)
+        assert st["state"] == "parked", (who, st)
+
+
+def test_next_action_athos_continua_vez_do_athos():
+    """Regressão: next-action:athos não pode virar 'parked' pela prefix nova."""
+    st = derive(b(labels=["ctx:ready", "next-action:athos"]), None, CREWS)
+    assert st["turn"] == "athos"
+
+
+def test_waiting_on_e_parked():
+    """3 ocorrências (waiting-on:external, :vespasiano-response, :wa-4e2m8)."""
+    assert derive(b(labels=["story:approved", "waiting-on:external"]), None, CREWS)["state"] == "parked"
+
+
+def test_reclaim_count_esgotado_e_parked():
+    """CASO REAL: ga-6n9mq, ga-qpfza, ga-r7uec, ga-yd0k2 — pilot:reclaim-count:3
+    SOZINHO (sem nenhum outro label de freio), cap=3 (mirrors park_labels.py's
+    DEFAULT_RECLAIM_CAP). É um limiar NUMÉRICO — 'pilot:reclaim-count:3' como
+    string exata pararia de bater no dia em que o cap mudasse (a mesma lição que
+    ga-hzt8s já aprendeu para este exato padrão de label, só que em park_labels.py;
+    bead_state.py não a herdou automaticamente)."""
+    assert derive(b(labels=["story:approved", "pilot:reclaim-count:3"]), None, CREWS)["state"] == "parked"
+    assert derive(b(labels=["story:approved", "pilot:reclaim-count:5"]), None, CREWS)["state"] == "parked"
+
+
+def test_reclaim_count_abaixo_do_cap_nao_e_parked_por_isso():
+    """19 ocorrências de pilot:reclaim-count:1 na população viva — não pode virar
+    supressor geral. Regressão: abaixo do cap, isolado, backlog normal."""
+    st = derive(b(status="open", labels=["ctx:ready", "exec:auto", "pilot:reclaim-count:1"]),
+                None, CREWS)
+    assert st["state"] != "parked"
+
+
+def test_flowing_labels_batem_antes_de_armed():
+    """CASO REAL AO VIVO (09/08): a própria ga-98inr — o bug que absorve este gap —
+    carrega ctx:ready+exec:auto+story:approved+story:in-flight+pilot:dispatched.
+    Sem este branch, ARMED (branch 10) venceria e devolveria 'ready': um bead JÁ
+    despachado sendo reoferecido ao pool como backlog ocioso. Mesmo padrão medido
+    em ga-fup3m e ga-x3e7p (as duas irmãs da mesma fatia)."""
+    st = derive(b(status="open",
+                  labels=["ctx:ready", "exec:auto", "story:approved",
+                          "story:in-flight", "pilot:dispatched"]),
+                None, CREWS)
+    assert st["state"] == "flowing"
+    assert st["state"] != "ready"
+
+
+def test_flowing_cobre_os_4_labels_do_grupo():
+    for label in ("story:in-flight", "pilot:dispatched", "pilot:dispatching", "story:done"):
+        st = derive(b(status="open", labels=[label]), None, CREWS)
+        assert st["state"] == "flowing", (label, st)
+
+
+def test_armed_sem_flowing_continua_ready():
+    """Regressão: o branch novo não pode engolir o caso comum (armado, roteado,
+    sem nenhum label de 'já em movimento')."""
+    st = derive(b(status="open", labels=["ctx:ready", "exec:auto"],
+                  metadata={"gc.routed_to": "gastown.dog"}),
+                None, CREWS)
+    assert st["state"] == "ready"
