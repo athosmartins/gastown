@@ -55,6 +55,21 @@ esac
 NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 OVER_ISO="$(date -u -v-200M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$NOW_ISO")"
 
+# ga-9e8ks gate-fix (attempt 2): _session_is_active_owner locates bead_state.py
+# via a BASH_SOURCE[0]-relative "../../../scripts" walk from wherever it is
+# DEFINED. eval'd here, BASH_SOURCE[0] resolves to THIS script's own path
+# (prod-tests/gascity/story-ga-9e8ks.sh — one directory level deeper than
+# pilot-dispatcher.sh), so the walk lands one level short and the bridge
+# silently falls through to the pre-existing $_ACTIVE_OWNER_IDS grep fallback
+# — the exact "test passes without exercising the path it claims to test"
+# the gate FAIL caught (proved live: identical PASS output even with
+# bead_state.py deleted entirely from a scratch tree). Set the bridge's own
+# documented escape hatch so it never needs BASH_SOURCE-based resolution
+# inside this eval — same variable the shipped code already checks first.
+export PILOT_BEAD_STATE_PY_OVERRIDE="$CITY/scripts/bead_state.py"
+[[ -f "$PILOT_BEAD_STATE_PY_OVERRIDE" ]] \
+  || fail "PILOT_BEAD_STATE_PY_OVERRIDE target missing: $PILOT_BEAD_STATE_PY_OVERRIDE — cannot verify the real bridge"
+
 export _SESSIONS_JSON='{"sessions":[
   {"session_name":"prodtest-active","state":"active","closed":false,"last_active":"'"$NOW_ISO"'"},
   {"session_name":"prodtest-idle","state":"active","closed":false,"last_active":"'"$OVER_ISO"'"},
