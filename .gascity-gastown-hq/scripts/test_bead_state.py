@@ -9,9 +9,13 @@ definido só pelo primeiro que o leu.
 """
 import sys
 import os
+import json
+import subprocess
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bead_state import derive, holder_is_alive, is_athos_page, is_ephemeral  # noqa: E402
+
+BEAD_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bead_state.py")
 
 CREWS = frozenset({"mila-wa", "oracle-wa", "batista-wa", "batista-ps", "mayor"})
 
@@ -198,3 +202,49 @@ def test_outros_labels_park_absorvidos_de_pilot_dispatcher():
                    ["prod-experiment"], ["ban-risk"], ["engine-window:pending"],
                    ["waiting-on:ga-xyz"], ["depends-on:ga-xyz"]):
         assert derive(b(labels=labels), None, CREWS)["state"] == "parked", labels
+
+
+# ── CLI export de vocabulário (ga-8mzgn) ────────────────────────────────────
+# Consumidores shell (pilot-missing-route-watchdog.sh e outros) hardcodam uma
+# CÓPIA das listas de park deste módulo em jq — a mesma doença que motivou
+# bead_state.py inteiro, um nível abaixo. `--export-vocab` deixa um consumidor
+# shell VERIFICAR (não substituir) a própria cópia contra a fonte canônica, sem
+# precisar rodar derive() em bash — não existe ponte bash->python nesta cidade
+# (achado por ga-7qsxr/ga-4oc2k para pilot-dispatcher.sh, reconfirmado por
+# ga-fup3m/ga-8mzgn para pilot-missing-route-watchdog.sh).
+
+def _run_export_vocab():
+    r = subprocess.run([sys.executable, BEAD_STATE_PATH, "--export-vocab"],
+                        capture_output=True, text=True, timeout=10)
+    return r
+
+
+def test_export_vocab_saida_e_json_com_as_duas_listas():
+    r = _run_export_vocab()
+    assert r.returncode == 0, r.stderr
+    data = json.loads(r.stdout)
+    assert "PARK_PREFIXES" in data
+    assert "PARK_EXACT" in data
+    assert isinstance(data["PARK_PREFIXES"], list)
+    assert isinstance(data["PARK_EXACT"], list)
+
+
+def test_export_vocab_contem_os_prefixos_que_pilot_missing_route_watchdog_hardcoda():
+    """As entradas específicas que pilot-missing-route-watchdog.sh's próprio jq
+    filter hardcoda hoje (needs:engine-window, no-auto-dispatch,
+    pilot:no-auto-dispatch, blocked:/blocked-on:/blocked-by:) devem seguir
+    presentes na fonte canônica — se sumirem daqui sem o consumidor ser
+    atualizado, o selftest do consumidor (Scenario de drift-check, ga-8mzgn)
+    precisa pegar isso, não descobrir em produção."""
+    r = _run_export_vocab()
+    data = json.loads(r.stdout)
+    all_vocab = set(data["PARK_PREFIXES"]) | set(data["PARK_EXACT"])
+    for expected in ("needs:engine-window", "no-auto-dispatch", "pilot:no-auto-dispatch",
+                      "blocked:", "blocked-on:", "blocked-by:", "framework:engine"):
+        assert expected in all_vocab, f"'{expected}' desapareceu do vocabulário canônico"
+
+
+def test_export_vocab_flag_desconhecida_falha_alto_e_claro():
+    r = subprocess.run([sys.executable, BEAD_STATE_PATH, "--not-a-real-flag"],
+                        capture_output=True, text=True, timeout=10)
+    assert r.returncode != 0

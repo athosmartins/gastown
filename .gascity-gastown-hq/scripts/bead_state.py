@@ -340,3 +340,24 @@ def derive(bead: dict, live_sessions=None,
     # 15. DESCONHECIDO — default é o Mayor, jamais o Athos.
     return {"state": "unknown", "turn": "mayor", "actions": ["triar"],
             "reasons": {"_diagnostico": "estado não classificável pelo modelo canônico"}}
+
+
+def _export_vocab() -> dict:
+    """As listas de vocabulário deste módulo, em forma serializável — ga-8mzgn.
+    Não é uma ponte pra rodar derive() em bash (essa decisão maior segue aberta,
+    ver ga-4oc2k); é o degrau mínimo que deixa um consumidor shell VERIFICAR a
+    própria cópia hardcoded contra a fonte canônica, sem rodar Python em
+    produção. PARK_PREFIXES preserva ordem (é usado como prefixo, ordem pode
+    importar pra qual label "vence" num log); PARK_EXACT é ordenado por ser um
+    set sem ordem própria."""
+    return {"PARK_PREFIXES": list(PARK_PREFIXES), "PARK_EXACT": sorted(PARK_EXACT)}
+
+
+if __name__ == "__main__":
+    import json as _json
+    import sys as _sys
+    if len(_sys.argv) == 2 and _sys.argv[1] == "--export-vocab":
+        _sys.stdout.write(_json.dumps(_export_vocab()))
+    else:
+        _sys.stderr.write("usage: bead_state.py --export-vocab\n")
+        _sys.exit(1)

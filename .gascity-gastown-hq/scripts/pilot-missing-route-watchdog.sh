@@ -1746,6 +1746,57 @@ BDSTUB
   PMRW_DRY_RUN=0
   [ ! -s "$U43" ] && ok "scenario 43: dry-run attempted zero repair writes" || bad "scenario 43 (dry-run violated): a repair write was attempted"
 
+  # ── Scenario 44 (ga-8mzgn): vocabulary drift-check — every label this
+  # file's own jq filter hardcodes (gate:needs-human, pilot:held,
+  # pilot:held-until:, needs:engine-window, framework:engine,
+  # no-auto-dispatch, pilot:no-auto-dispatch, blocked:/blocked-on:/
+  # blocked-by:) must still be present in scripts/bead_state.py's canonical
+  # vocabulary (`--export-vocab`). This is NOT a live bridge — running
+  # derive() from bash is a bigger decision, deliberately deferred (see
+  # ga-4oc2k, still open as of this writing). This is the cheap half: catch
+  # DRIFT at test time if bead_state.py ever renames/removes one of these,
+  # instead of this watchdog silently disagreeing with the canonical model
+  # in production. Skips (never fails) if python3/bead_state.py are
+  # unavailable — this checks CONSISTENCY between two files, it is not a
+  # runtime dependency of the watchdog itself, which must keep working with
+  # no Python present at all.
+  echo "Scenario 44 (ga-8mzgn): hardcoded park vocabulary still matches bead_state.py's canonical export"
+  # NOT "$HQ" — the selftest setup above reassigns HQ to a throwaway $TMP/hq
+  # fixture dir for test isolation (see "HQ=\"\$TMP/hq\"" near the top of this
+  # block); bead_state.py lives in the REAL repo, so re-derive the same
+  # default this script's own top-level HQ= line uses (PMRW_HQ, same env var).
+  BEAD_STATE_PY="${PMRW_HQ:-/Users/athos/gt/.gascity-gastown-hq}/scripts/bead_state.py"
+  VOCAB_JSON=""
+  if command -v python3 >/dev/null 2>&1 && [ -f "$BEAD_STATE_PY" ]; then
+    VOCAB_JSON=$(python3 "$BEAD_STATE_PY" --export-vocab 2>/dev/null)
+  fi
+  if [ -z "${VOCAB_JSON:-}" ]; then
+    echo "  skip scenario 44: python3 or bead_state.py unavailable — consistency check needs both, the watchdog itself does not"
+  elif ! printf '%s' "$VOCAB_JSON" | jq empty >/dev/null 2>&1; then
+    # Distinct from "confirmed missing" below: this is "couldn't verify at
+    # all" (malformed output from --export-vocab), not "checked and it's
+    # gone" — collapsing the two would report all 10 labels as individually
+    # MISSING for what is actually a parse failure, misleading whoever reads
+    # the log about what's actually wrong.
+    bad "scenario 44 (COULD NOT VERIFY): --export-vocab produced unparseable output — bead_state.py may be broken, not just drifted"
+  else
+    _MISSING=""
+    for _LBL in "gate:needs-human" "pilot:held" "pilot:held-until:" "needs:engine-window" \
+                "framework:engine" "no-auto-dispatch" "pilot:no-auto-dispatch" \
+                "blocked:" "blocked-on:" "blocked-by:"; do
+      _FOUND=$(printf '%s' "$VOCAB_JSON" | jq --arg l "$_LBL" \
+        '(.PARK_PREFIXES // []) + (.PARK_EXACT // []) | index($l) != null' 2>/dev/null)
+      if [ "$_FOUND" != "true" ]; then
+        _MISSING="${_MISSING}${_LBL} "
+      fi
+    done
+    if [ -z "$_MISSING" ]; then
+      ok "scenario 44: all hardcoded park labels still present in bead_state.py's canonical vocabulary"
+    else
+      bad "scenario 44 (DRIFT DETECTED): bead_state.py no longer carries: $_MISSING — this file's jq filter is now a private, diverging interpreter for these"
+    fi
+  fi
+
   echo ""
   echo "pilot-missing-route-watchdog selftest: PASS=$PASS FAIL=$FAIL"
   [ "$FAIL" -eq 0 ] && exit 0 || exit 1
