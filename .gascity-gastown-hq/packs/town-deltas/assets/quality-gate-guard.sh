@@ -877,29 +877,43 @@ gap2_arm_needs_remerge() {
 # ones — a caller must never be able to mistake "I called this with the
 # wrong verdict" for "it acted".
 gap2_apply_pass_verdict() {
-  local bead_id="$1" sling_id="$2" is_story="$3" verdict="$4" reason=""
+  local bead_id="$1" sling_id="$2" is_story="$3" verdict="$4"
+
   case "$verdict" in
-    close:merge-verified)
-      reason="parent's own fix verified merged into origin/main (ga-6ync4)"
-      ;;
-    close:untracked-delivery)
-      reason="parent carries delivery:untracked (ga-x2x63) — no git artifact is expected by design, so merge verification was skipped and the sling-passed signal is trusted"
-      ;;
-    *)
-      return 1
-      ;;
+    close:merge-verified|close:untracked-delivery) : ;;
+    *) return 1 ;;
   esac
 
   bd -C "$GC_CITY" label remove "$bead_id" "story:in-flight"  -q 2>/dev/null || true
   bd -C "$GC_CITY" label remove "$bead_id" "pilot:dispatched" -q 2>/dev/null || true
 
   if [ "$is_story" = "1" ]; then
+    local story_reason=""
+    case "$verdict" in
+      close:merge-verified)
+        story_reason="parent's own fix verified merged into origin/main (ga-6ync4)"
+        ;;
+      close:untracked-delivery)
+        story_reason="parent carries delivery:untracked (ga-x2x63) — no git artifact is expected by design, so merge verification was skipped and the sling-passed signal is trusted"
+        ;;
+    esac
     bd -C "$GC_CITY" label add "$bead_id" "gate:passed" -q 2>/dev/null || true
-    bd -C "$GC_CITY" comment "$bead_id" "ga-pa36 GAP-2 reconciler (ga-1un0n): sling bead $sling_id gate-passed and closed, and $reason. story:in-flight + pilot:dispatched cleared; gate:passed set — story-delivery will deploy and mark story:done." 2>/dev/null || true
+    bd -C "$GC_CITY" comment "$bead_id" "ga-pa36 GAP-2 reconciler (ga-1un0n): sling bead $sling_id gate-passed and closed, and $story_reason. story:in-flight + pilot:dispatched cleared; gate:passed set — story-delivery will deploy and mark story:done." 2>/dev/null || true
   else
-    bd -C "$GC_CITY" close "$bead_id" \
-      -r "ga-pa36 GAP-2 reconciler: sling bead $sling_id gate-passed and closed, and $reason — work is done; closing parent." \
-      2>/dev/null || warn "Could not close parent $bead_id after pass-stranded detection"
+    # ga-1un0n: bug/task messages preserved VERBATIM from the pre-fix code —
+    # this path's behavior is unchanged, only its verification gate moved.
+    case "$verdict" in
+      close:merge-verified)
+        bd -C "$GC_CITY" close "$bead_id" \
+          -r "ga-pa36 GAP-2 reconciler: sling bead $sling_id gate-passed and closed, and parent's own fix verified merged into origin/main (ga-6ync4) — work is done; closing parent." \
+          2>/dev/null || warn "Could not close parent $bead_id after pass-stranded detection"
+        ;;
+      close:untracked-delivery)
+        bd -C "$GC_CITY" close "$bead_id" \
+          -r "ga-pa36 GAP-2 reconciler: sling bead $sling_id gate-passed and closed; parent carries delivery:untracked (ga-x2x63) — no git artifact is expected by design, so merge verification was skipped and the sling-passed signal is trusted; closing parent." \
+          2>/dev/null || warn "Could not close parent $bead_id after pass-stranded detection (untracked delivery)"
+        ;;
+    esac
   fi
 }
 
