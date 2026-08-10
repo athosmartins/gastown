@@ -168,6 +168,23 @@ r=$(reconcile_dead_reviewer_verdict_action 999 15 1 1); [ "$r" = "skip" ] && ok 
 r=$(reconcile_dead_reviewer_verdict_action 16 15 0 0); [ "$r" = "release" ] && ok "just past grace (16>15), run active → release" || bad "just-past-grace-active got '$r'"
 r=$(reconcile_dead_reviewer_verdict_action 15 15 0 0); [ "$r" = "skip" ] && ok "exactly at grace boundary (15<=15) → skip (inclusive, mirrors reconcile_zero_verdict_run_action's own <= convention)" || bad "boundary got '$r'"
 
+# ── reconcile_orphaned_verdict_action <age> <grace> <has_gate_run_label> <parent_lookup_state> ─
+# ga-qtc16: Step 0b.2's sibling of reconcile_dead_reviewer_verdict_action above,
+# for verdicts whose PARENT gate-run bead is gone entirely (not just a dead
+# reviewer on an otherwise-live run). parent_lookup_state is a 3-state string
+# ("found"/"not_found"/"unknown") — "unknown" must behave identically to
+# "found" here (both skip), since only a CONFIRMED absence is ever safe to act
+# on (root-class:error-vs-empty).
+echo "reconcile_orphaned_verdict_action: close only on confirmed-absent parent, past grace, with a gate-run label"
+r=$(reconcile_orphaned_verdict_action 100 15 1 not_found); [ "$r" = "close" ] && ok "old, has label, parent confirmed not_found → close" || bad "old+notfound got '$r'"
+r=$(reconcile_orphaned_verdict_action 5 15 1 not_found); [ "$r" = "skip" ] && ok "young (5<=15 grace), otherwise closeable → skip (replication-lag guard wins)" || bad "young+notfound got '$r'"
+r=$(reconcile_orphaned_verdict_action 15 15 1 not_found); [ "$r" = "skip" ] && ok "exactly at grace boundary (15<=15) → skip (inclusive, same convention as the sibling function)" || bad "boundary got '$r'"
+r=$(reconcile_orphaned_verdict_action 16 15 1 not_found); [ "$r" = "close" ] && ok "just past grace (16>15), confirmed not_found → close" || bad "just-past-grace got '$r'"
+r=$(reconcile_orphaned_verdict_action 100 15 1 found); [ "$r" = "skip" ] && ok "old, has label, parent FOUND → skip (genuinely pending, not orphaned — must never touch this case)" || bad "old+found got '$r'"
+r=$(reconcile_orphaned_verdict_action 100 15 1 unknown); [ "$r" = "skip" ] && ok "old, has label, parent lookup UNKNOWN (query failed) → skip (unknown is never confirmed-absent, the whole point of this function)" || bad "old+unknown got '$r'"
+r=$(reconcile_orphaned_verdict_action 100 15 0 not_found); [ "$r" = "skip" ] && ok "old, NO gate-run label at all → skip (nothing to check parent liveness against, never guess)" || bad "no-label got '$r'"
+r=$(reconcile_orphaned_verdict_action 999999 15 1 unknown); [ "$r" = "skip" ] && ok "even a VERY old verdict with unknown parent state stays skip — age alone never overrides an unconfirmed lookup" || bad "very-old+unknown got '$r'"
+
 # ── session_alive_for_assignee <assignee> <sess_snap_json> — single-assignee liveness ─
 echo "session_alive_for_assignee: matches id/session_name/session_id, excludes closed"
 SNAP='[{"id":"gate-reviewer-adhoc-abc123","closed":false},{"session_name":"gate-reviewer-adhoc-dead999","closed":true},{"session_id":"gate-reviewer-adhoc-xyz","closed":false}]'

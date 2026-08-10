@@ -324,6 +324,34 @@ reconcile_dead_reviewer_verdict_action() {
   echo "release"
 }
 
+# reconcile_orphaned_verdict_action <age_min> <grace_min> <has_gate_run_label> <parent_lookup_state>
+#   parent_lookup_state: "found" | "not_found" | "unknown" — "unknown" means
+#   the parent lookup itself couldn't even be parsed as JSON (Dolt timeout/bad
+#   path/etc.), distinct from "not_found" (bd show succeeded in telling us the
+#   id genuinely doesn't exist). Step 0b.2's sibling of
+#   reconcile_dead_reviewer_verdict_action above, for verdicts whose PARENT
+#   gate-run bead is gone entirely (ga-qtc16), not just carrying a dead
+#   reviewer on an otherwise-live run (that's this function's own sibling's
+#   job). Only a CONFIRMED "not_found" ever triggers close — "unknown" must
+#   never collapse into "confirmed gone" (root-class:error-vs-empty; a query
+#   failure is not evidence of absence).
+#
+# Priority (most-specific / safest first, mirrors the sibling's ordering):
+#   1. age_min <= grace_min                 → skip (same-cycle replication-lag
+#      artifact guard, not a real race in normal operation — see call site)
+#   2. has_gate_run_label != 1              → skip (can't determine parent at
+#      all, never guess)
+#   3. parent_lookup_state != "not_found"   → skip (found = genuinely pending,
+#      not orphaned; unknown = query failed, not confirmed absent)
+#   4. else (not_found, past grace, labeled) → close
+reconcile_orphaned_verdict_action() {
+  local age_min="$1" grace_min="$2" has_gate_run_label="$3" parent_lookup_state="$4"
+  [ "$age_min" -le "$grace_min" ] && { echo "skip"; return; }
+  [ "$has_gate_run_label" != "1" ] && { echo "skip"; return; }
+  [ "$parent_lookup_state" != "not_found" ] && { echo "skip"; return; }
+  echo "close"
+}
+
 # session_alive_for_assignee <assignee> <sess_snap_json> — pure given the
 # snapshot as data (ga-u07fn). Single-assignee liveness check: is <assignee> a
 # still-open (non-closed) session in <sess_snap_json>? Same snapshot shape and
@@ -2154,6 +2182,131 @@ if [ "$DEAD_VERDICT_COUNT" -gt 0 ]; then
         ;;
       skip)
         : # reviewer_alive/grace already filtered above via early `continue`s; reconcile fn's own skip branch is defense-in-depth, nothing further to do
+        ;;
+    esac
+  done
+fi
+
+# ── Step 0b.2 (ga-qtc16): orphaned verdict reap — parent gate-run REAPED, not just dead-reviewer ──
+# Sibling of Step 0b.1 above, for the population that step's own comment
+# explicitly carved OUT of scope: EMPTY-assignee verdict beads whose
+# gate-run:<id> doesn't resolve via `bd show` at all (ga-u07fn investigation,
+# 45 of 46 open verdicts that day). That population is NOT "dead reviewer on
+# a still-active run" (Step 0b.1's case) — it's the run's PARENT gate-run bead
+# itself no longer existing, most likely reaped as an old ga-wisp-* ephemeral
+# by the wisp reaper, which has no knowledge of (and doesn't cascade to) the
+# verdict-bead children a gate-run spawned (distinct from ga-g4m18, which only
+# cascades on THIS guard's own supersede:dead-reviewers path — see that
+# function's own comment above).
+#
+# Measured 2026-08-10 (ga-qtc16): of 41 sampled open verdicts, 34 (83%) carry
+# a gate-run:<id> pointing nowhere — permanently unkillable via the normal
+# dispatch path (no future sweep will ever revisit a bead whose parent is
+# gone), and gate-health-monitor.py's VERDICT-ASSIGNEE-GAP/IDLE-REVIEWER
+# checks fire on them every cycle as pure, unactionable noise.
+#
+# root-class:error-vs-empty (deliberately careful): `bd show <id>` exits 1 for
+# BOTH "confirmed not found" AND a genuine query failure (Dolt timeout/bad
+# path) — same exit code, verified empirically while writing this fix, so
+# exit code alone cannot distinguish them. The two cases differ in whether
+# stdout is valid, bd-shaped JSON at all: "not found" returns a parseable
+# JSON object ({"error": "no issues found matching the provided IDs", ...},
+# no .id field); a genuine failure returns a bare, non-JSON error line. So:
+# JSON-parses AND .id absent → CONFIRMED gone, safe to close. Doesn't-parse-
+# as-JSON → unknown failure, skip (never treat "couldn't read" as "confirmed
+# absent" — the exact collapse this codebase's doctrine warns against).
+#
+# Grace: reuses GATE_DEAD_VERDICT_GRACE_MINUTES (Step 0b.1's sibling constant,
+# same "fewer magic numbers" reasoning as that constant's own comment) against
+# the VERDICT bead's own age — no plausible legitimate path creates a verdict
+# referencing a gate-run that doesn't exist yet (the dispatcher creates the
+# gate-run before spawning reviewers), so this only guards against a same-
+# cycle Dolt replication-lag artifact, not a real race in normal operation.
+log "Step 0b.2 (ga-qtc16): orphaned verdict reap — parent gate-run gone, grace=${GATE_DEAD_VERDICT_GRACE_MINUTES}m..."
+
+if ORPHAN_VERDICT_JSON=$(bd -C "$GC_CITY" list --json --limit 0 \
+    -l type:quality-gate-verdict -l verdict:pending \
+    --no-assignee \
+    2>/dev/null); then
+  ORPHAN_VERDICT_COUNT=$(printf '%s\n' "$ORPHAN_VERDICT_JSON" | jq 'length' 2>/dev/null || echo "0")
+  case "$ORPHAN_VERDICT_COUNT" in
+    ''|*[!0-9]*)
+      warn "ga-qtc16: orphan-verdict-reap query returned unparseable output — skipping this sweep rather than guessing a count."
+      ORPHAN_VERDICT_COUNT=0
+      ;;
+  esac
+else
+  warn "ga-qtc16: orphan-verdict-reap query FAILED (Dolt timeout/contention?) — skipping this sweep; next sweep in ~2min will retry. Not a confirmed-empty result."
+  ORPHAN_VERDICT_JSON="[]"
+  ORPHAN_VERDICT_COUNT=0
+fi
+
+if [ "$ORPHAN_VERDICT_COUNT" -gt 0 ]; then
+  NOW_EPOCH="${NOW_EPOCH:-$(date +%s)}"
+
+  for _ovi in $(seq 0 $((ORPHAN_VERDICT_COUNT - 1))); do
+    OV=$(printf '%s\n' "$ORPHAN_VERDICT_JSON" | jq ".[$_ovi]")
+    OV_ID=$(printf '%s\n' "$OV" | jq -r '.id // ""')
+    OV_UPDATED=$(printf '%s\n' "$OV" | jq -r '.updated_at // ""')
+    OV_LABELS=$(printf '%s\n' "$OV" | jq -r '(.labels // []) | join(" ")')
+    [ -z "$OV_ID" ] && continue
+
+    OV_AGE=$(age_minutes_of "$OV_UPDATED" "$NOW_EPOCH")
+    case "$OV_AGE" in ''|*[!0-9]*) OV_AGE=0 ;; esac
+
+    # ga-qtc16 gate-fix (attempt 3): same failure class as the OV_GR_RAW fix
+    # below, one sibling over. When a verdict carries no gate-run: substring
+    # at all — Step 0b.2's OWN anticipated "no label" case, with a dedicated
+    # skip branch further down — `grep -oE` finds no match and exits 1; under
+    # `pipefail` that nonzero status survives through `head -1`/`sed` (both
+    # succeed trivially on empty input) to become the whole pipeline's exit
+    # status, so the bare assignment aborted the ENTIRE script on exactly the
+    # input this step exists to handle. `|| true` is the same established
+    # idiom as the sibling fix immediately below.
+    OV_GR_ID=$(printf '%s\n' "$OV_LABELS" | grep -oE 'gate-run:[A-Za-z0-9._-]+' | head -1 | sed 's/^gate-run://') || true
+    OV_HAS_GR_LABEL=1
+    [ -z "$OV_GR_ID" ] && OV_HAS_GR_LABEL=0
+
+    OV_PARENT_STATE="unknown"
+    if [ "$OV_HAS_GR_LABEL" = "1" ]; then
+      # ga-qtc16 gate-fix (attempt 2): bare `VAR=$(bd show ...)` aborted the
+      # WHOLE script under `set -euo pipefail` the moment the parent gate-run
+      # was genuinely not found (bd show exit 1) — the exact case Step 0b.2
+      # exists to detect, so it recurred every sweep with any orphan queued.
+      # `|| true` is this file's own established idiom for this shape (see
+      # line ~3042's near-identical `bd show <id> --json ... || true`): the
+      # assignment still captures whatever stdout bd produced on either exit
+      # code (the not-found error envelope `{"error": ...}` parses as a JSON
+      # object same as before), only the abort-on-nonzero-exit is removed.
+      OV_GR_RAW=$(bd -C "$GC_CITY" show "$OV_GR_ID" --json 2>/dev/null) || true
+      if printf '%s' "$OV_GR_RAW" | jq -e 'type == "object" or type == "array"' >/dev/null 2>&1; then
+        OV_GR_FOUND_ID=$(printf '%s' "$OV_GR_RAW" | jq -r 'if type=="array" then (.[0].id // empty) else (.id // empty) end' 2>/dev/null)
+        if [ -n "$OV_GR_FOUND_ID" ]; then
+          OV_PARENT_STATE="found"
+        else
+          OV_PARENT_STATE="not_found"
+        fi
+      fi
+      # else stays "unknown" — bd show's own response didn't even parse as
+      # JSON, a genuine query failure (Dolt timeout/bad path/etc.), not
+      # confirmed absence.
+    fi
+
+    OV_ACTION=$(reconcile_orphaned_verdict_action "$OV_AGE" "$GATE_DEAD_VERDICT_GRACE_MINUTES" "$OV_HAS_GR_LABEL" "$OV_PARENT_STATE")
+    case "$OV_ACTION" in
+      close)
+        warn "ga-qtc16: closing orphaned verdict $OV_ID (age=${OV_AGE}m, no assignee, parent gate-run $OV_GR_ID confirmed gone via bd show) — permanently unkillable via the normal dispatch path otherwise."
+        bd -C "$GC_CITY" comment "$OV_ID" "ga-qtc16: verdict closed — parent gate-run $OV_GR_ID no longer exists (bd show: not found), most likely reaped as an old ephemeral by the wisp reaper. This verdict was leftover debris, not a stuck review. Self-healed by guard." 2>/dev/null || true
+        bd -C "$GC_CITY" close "$OV_ID" -r "parent gate-run $OV_GR_ID does not exist (reaped) — orphaned verdict debris. Closed by guard (ga-qtc16)." 2>/dev/null || \
+          warn "ga-qtc16: close of $OV_ID FAILED — the comment above claims it closed but the bead is still open. Next sweep will retry."
+        ;;
+      skip)
+        if [ "$OV_HAS_GR_LABEL" = "1" ] && [ "$OV_PARENT_STATE" = "unknown" ] && [ "$OV_AGE" -gt "$GATE_DEAD_VERDICT_GRACE_MINUTES" ]; then
+          warn "ga-qtc16: parent gate-run $OV_GR_ID lookup for verdict $OV_ID returned unparseable output — genuine query failure, not confirmed absent. Skipping."
+        elif [ "$OV_HAS_GR_LABEL" != "1" ] && [ "$OV_AGE" -gt "$GATE_DEAD_VERDICT_GRACE_MINUTES" ]; then
+          warn "ga-qtc16: verdict $OV_ID (age=${OV_AGE}m, no assignee) carries no gate-run:<id> label — cannot determine parent, skipping rather than guessing."
+        fi
+        # age<=grace or parent genuinely found: routine, no warn needed.
         ;;
     esac
   done
