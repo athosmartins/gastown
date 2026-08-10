@@ -213,13 +213,26 @@ def holder_is_alive(assignee: str, live_sessions) -> bool | None:
 
 def derive(bead: dict, live_sessions=None,
            known_crews: frozenset = frozenset(),
-           merged: bool | None = None) -> dict:
+           merged: bool | None = None,
+           gate_active: bool | None = None) -> dict:
     """Estado canônico. PURA — todo fato de runtime entra por parâmetro.
 
     live_sessions: conjunto de sessões vivas, ou None = NÃO CONSULTEI. None nunca
             vira "ninguém vivo" — ver holder_is_alive().
     merged: True/False se o chamador verificou o merge; None = não verificou.
             None NUNCA é tratado como False (erro ≠ vazio).
+    gate_active: True/False se o chamador verificou via marker (ex.: reusando
+            inflight-reclaim-guard.py's list_gate_active_source_beads(), do jeito
+            que lifecycle-coherence-janitor.sh's _gate_active_beads() já faz);
+            None = não verificou, cai no heurístico de label (GATE_ACTIVE). Existe
+            porque gate:queued especificamente sobrevive ao marker fechar (ga-zltsr:
+            só 2 call sites de 'label remove ... gate:queued' no pipeline inteiro,
+            contra 12 de gate:reviewing) — confirmado em produção (wa-nh37r,
+            ga-tje7u: label gate:queued com ZERO marker referenciando). Quando o
+            chamador VERIFICOU, o resultado marker-aware vence o label bruto nas
+            duas direções — cobre tanto o label sobrevivendo ao marker fechar
+            (gate_active=False apesar do label) quanto o label ainda não ter sido
+            aplicado a um marker já ativo (gate_active=True sem o label).
     """
     L = _labels(bead)
     status = bead.get("status") or ""
@@ -280,8 +293,10 @@ def derive(bead: dict, live_sessions=None,
         return {"state": "gate_failed", "turn": ("crew:" + crew) if crew else "mayor",
                 "actions": actions, "reasons": reasons}
 
-    # 6. NO GATE
-    if L & GATE_ACTIVE:
+    # 6. NO GATE — label bruto é o default; chamador que verificou via marker vence,
+    # nas duas direções (ver docstring de gate_active).
+    at_gate = bool(L & GATE_ACTIVE) if gate_active is None else gate_active
+    if at_gate:
         return {"state": "at_gate", "turn": "nobody", "actions": [], "reasons": {}}
 
     # 7. EM EXECUÇÃO — 'stranded' exige PROVA de que o detentor morreu.

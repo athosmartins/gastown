@@ -66,6 +66,44 @@ def test_gate_failed_nao_devolve_pro_pool_sem_prova_de_morte():
     assert "devolver_pro_pool" in st2["actions"]
 
 
+# ── gate ativo: label vs marker (ga-zltsr, 10/08) ───────────────────────────────
+# gate:queued sobrevive ao marker fechar — só 2 call sites de 'label remove ...
+# gate:queued' no pipeline inteiro, contra 12 de gate:reviewing. Confirmado em
+# produção: wa-nh37r carregava gate:queued com ZERO marker referenciando.
+
+def test_gate_active_label_sozinho_quando_chamador_nao_verificou():
+    """Comportamento pré-existente preservado: sem gate_active (None), a decisão
+    cai no heurístico de label bruto — igual a antes desta bead."""
+    st = derive(b(labels=["gate:queued"]), None, CREWS)
+    assert st["state"] == "at_gate"
+
+
+def test_gate_active_false_verificado_vence_label_obsoleto():
+    """O caso wa-nh37r: label gate:queued sobrevivendo ao marker já fechado. Um
+    chamador que VERIFICOU via marker e não achou nada precisa poder dizer que
+    NÃO está no gate, mesmo com o label ainda presente."""
+    st = derive(b(status="in_progress", labels=["gate:queued"], assignee="mila-wa"),
+                frozenset({"mila-wa"}), CREWS, gate_active=False)
+    assert st["state"] != "at_gate"
+    assert st["state"] == "executing"
+
+
+def test_gate_active_true_verificado_mesmo_sem_label():
+    """Direção oposta: marker já ativo, label ainda não aplicado — o mesmo lag que
+    faz pilot-dispatcher.sh's _filter_built() usar OR entre marker e label."""
+    st = derive(b(labels=[]), None, CREWS, gate_active=True)
+    assert st["state"] == "at_gate"
+
+
+def test_gate_active_none_nunca_colapsa_pra_false():
+    """Convenção do módulo inteiro: None (não verifiquei) nunca vira o mesmo
+    resultado que False (verifiquei e não está ativo). Com label presente, None
+    preserva o heurístico (at_gate); só um False EXPLÍCITO derruba."""
+    with_label = b(labels=["gate:reviewing"])
+    assert derive(with_label, None, CREWS, gate_active=None)["state"] == "at_gate"
+    assert derive(with_label, None, CREWS, gate_active=False)["state"] != "at_gate"
+
+
 # ── de quem é a vez ──────────────────────────────────────────────────────────
 
 def test_policy_gap_e_do_athos():
