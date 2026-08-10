@@ -219,8 +219,30 @@ EPHEMERAL_POOL_TEMPLATES = frozenset({"wa-worker", "gastown.dog"})
 
 # Sessões always-on que NUNCA são um builder dono de trabalho (ga-7m191) —
 # mayor/deacon nunca morrem, então sem esta exclusão um bead parqueado sob
-# o Mayor pareceria 'dono de sessão viva' para sempre.
+# o Mayor pareceria 'dono de sessão viva' para sempre. Absorvido de
+# inflight-reclaim-guard.py's COORDINATOR_MARKERS/is_coordinator
+# (scripts/inflight-reclaim-guard.py:289-294,1144-1152) — MESMO vocabulário,
+# substring match, não prefixo/exato, de propósito (a guarda original já usa
+# substring). Papel sempre-ligado: nunca é candidato a "morto comprovado".
+#
+# ⚠️ TEM QUE FICAR AQUI, antes de claimant_provably_dead() — não é só estilo.
+# Achado num merge com main (ga-8lrud definiu o MESMO símbolo de novo, perto
+# de crew_of()/holder_is_alive(), sem conflito textual do git porque são
+# pontos diferentes do arquivo — a segunda definição shadowava esta
+# silenciosamente): claimant_provably_dead() usa COORDINATOR_MARKERS como
+# DEFAULT de parâmetro (`coordinator_markers=COORDINATOR_MARKERS`), avaliado
+# em tempo de DEFINIÇÃO do módulo, não de chamada — ao contrário de
+# is_coordinator(), que holder_is_alive() só referencia dentro do corpo (essa
+# sim resolve em tempo de chamada, e funcionaria de qualquer posição). Mover
+# este bloco pra depois de claimant_provably_dead() reintroduziria o
+# NameError que este comentário documenta ter existido.
 COORDINATOR_MARKERS = ("mayor", "deacon")
+
+
+def is_coordinator(identity: str) -> bool:
+    if not identity:
+        return False
+    return any(marker in identity for marker in COORDINATOR_MARKERS)
 
 LIVE_SESSION_STATES = frozenset({"active", "awake"})
 # Estados terminais que PROVAM que uma sessão não pode estar trabalhando.
@@ -235,13 +257,6 @@ DEAD_SESSION_STATES = frozenset({
 # que isto, E cujo bead não teve bd-update no mesmo intervalo, é um zumbi
 # congelado/sem-quota — não um dono ativo. VIVO ≠ TRABALHANDO.
 STALE_ACTIVITY_TTL = 1800
-
-
-def is_coordinator(identity) -> bool:
-    """True se identity nomeia um coordenador always-on (mayor/deacon), não
-    um builder. Substring, case-insensitive. Ver COORDINATOR_MARKERS."""
-    ident = (identity or "").lower()
-    return any(marker in ident for marker in COORDINATOR_MARKERS)
 
 
 def parse_iso_epoch(ts):
@@ -353,6 +368,35 @@ def _has_prefix(labels, prefixes) -> str | None:
     return None
 
 
+def _labels_after_expired_hold(labels, now):
+    """labels, minus an EXPIRED pilot:held hold — ga-fup3m, absorvido de
+    pilot-missing-route-watchdog.sh (81 refs, seus próprios Scenario 7/8).
+
+    pilot:held (bare) e pilot:held-until:<epoch> são escritos JUNTOS por
+    _mayor_deferred_hold_db (achado por ga-7qsxr). Sem held-until, o hold pareka
+    indefinidamente (comportamento preservado). Com held-until, o hold só continua
+    valendo enquanto o MAIOR timestamp presente ainda não passou — mirrors a lógica
+    'max(held-until) < now' do arquivo-fonte exatamente. now=None (não consultado)
+    NUNCA expira um hold, mesma direção segura que todo outro None neste módulo:
+    todo chamador que não passa now preserva o comportamento de hoje (park
+    indefinido), sem quebra.
+
+    Qualquer OUTRO motivo de park que a bead carregue independentemente do hold
+    continua no conjunto devolvido — só o par pilot:held/pilot:held-until é
+    removido, nunca o resto."""
+    if now is None:
+        return labels
+    until_values = []
+    for l in labels:
+        if l.startswith("pilot:held-until:"):
+            suffix = l[len("pilot:held-until:"):]
+            if suffix.isdigit():
+                until_values.append(int(suffix))
+    if not until_values or max(until_values) >= now:
+        return labels
+    return frozenset(l for l in labels if l != "pilot:held" and not l.startswith("pilot:held-until:"))
+
+
 def is_ephemeral(actor: str) -> bool:
     """Worker efêmero NÃO é crew. Confundir os dois foi a causa do 'claude-wa'
     inexistente que quebrou o botão Cutucar (medido 09/08)."""
@@ -375,9 +419,10 @@ def crew_of(actor: str, known_crews: frozenset) -> str | None:
 def holder_is_alive(assignee: str, live_sessions) -> bool | None:
     """O detentor do bead está vivo? True / False / None = NÃO DÁ PRA SABER.
 
-    ⚠️ DOIS ERROS MEDIDOS EM 09/08, os dois produzindo "abandonado" com confiança
-    sobre trabalho VIVO — que é o pior falso-positivo que este módulo pode ter,
-    porque a ação que ele autoriza é RECLAMAR o bead de quem está trabalhando nele.
+    ⚠️ TRÊS ERROS MEDIDOS, todos produzindo "abandonado" com confiança sobre
+    trabalho VIVO (ou, no 3º caso, sobre um papel que nunca "morre") — que é o
+    pior falso-positivo que este módulo pode ter, porque a ação que ele autoriza
+    é RECLAMAR o bead de quem está trabalhando nele.
 
     1. NOME COM SUFIXO. O assignee é o nome do crew (`mila-wa`); a sessão viva
        chama-se `mila-wa-awispm94omdp`. A comparação era `assignee in live_sessions`,
@@ -389,6 +434,20 @@ def holder_is_alive(assignee: str, live_sessions) -> bool | None:
        ERRADO. Por isso `live_sessions=None` agora significa NÃO CONSULTEI, é distinto
        de `frozenset()` = CONSULTEI E NÃO HÁ NINGUÉM, e só o segundo pode concluir
        "abandonado".
+    3. COORDENADOR SEM PROTEÇÃO (ga-8lrud, absorvido de inflight-reclaim-guard.py's
+       is_coordinator()/COORDINATOR_MARKERS). assignee="mayor"/"deacon" é um papel
+       sempre-ligado, mas a sessão viva se chama "gastown.mayor"/"gastown.deacon" —
+       um PREFIXO diferente do assignee bare, que o casamento por sufixo acima não
+       cobre (nem `s==assignee`, nem `s.startswith(assignee+"-")`, nem o inverso).
+       Sem esta guarda, um bead in_progress do mayor/deacon resolvia alive=False →
+       "stranded", oferecendo liberar_para_pool sobre um papel que nunca deveria ser
+       reclamado. R4 e R7 do lifecycle-coherence-janitor.sh já protegiam "mayor" à
+       mão (exclusão hardcoded antes mesmo de qualquer checagem de liveness) — prova
+       de que consumidores de produção já tinham aprendido essa lição; o modelo
+       canônico não. Nenhum bead in_progress de mayor/deacon existia no momento da
+       medição (09/08) — gap latente, não incidente vivo, mas real: qualquer
+       consumidor futuro que confie cegamente em holder_is_alive()/derive() herdaria
+       o mesmo buraco que a versão *hardcoded* já tinha fechado.
 
     ⭐ FONTE CANÔNICA DE VIVACIDADE — use esta, não invente a sua:
            gc session list --json      → 72 sessões (medido 09/08)
@@ -405,6 +464,13 @@ def holder_is_alive(assignee: str, live_sessions) -> bool | None:
         return None
     if not assignee:
         return False
+    if is_coordinator(assignee):
+        # None, não True: nunca verificamos vivacidade de fato para um coordenador —
+        # só recusamos concluir morte. Mesma semântica de live_sessions=None ("não
+        # consultei"), e produz o mesmo resultado em todo call site de derive() hoje
+        # (regra 7 só vira "stranded" com alive IS False; None e True são idênticos
+        # ali) — sem fingir uma certeza que não temos.
+        return None
     for s in live_sessions:
         if s == assignee or s.startswith(assignee + "-") or assignee.startswith(s + "-"):
             return True
@@ -413,13 +479,17 @@ def holder_is_alive(assignee: str, live_sessions) -> bool | None:
 
 def derive(bead: dict, live_sessions=None,
            known_crews: frozenset = frozenset(),
-           merged: bool | None = None) -> dict:
+           merged: bool | None = None,
+           now: int | None = None) -> dict:
     """Estado canônico. PURA — todo fato de runtime entra por parâmetro.
 
     live_sessions: conjunto de sessões vivas, ou None = NÃO CONSULTEI. None nunca
             vira "ninguém vivo" — ver holder_is_alive().
     merged: True/False se o chamador verificou o merge; None = não verificou.
             None NUNCA é tratado como False (erro ≠ vazio).
+    now: epoch atual, ou None = não consultado. Usado só para expirar
+            pilot:held-until:<epoch> (ga-fup3m) — ver _labels_after_expired_hold().
+            None preserva o comportamento antigo (park indefinido), nunca expira.
     """
     L = _labels(bead)
     status = bead.get("status") or ""
@@ -470,7 +540,12 @@ def derive(bead: dict, live_sessions=None,
     # mas fica ligado de propósito como rede de segurança contra regressão
     # futura de PARK_PREFIXES, provada load-bearing por
     # test_needs_human_wiring_e_load_bearing_independente_de_park_prefixes.
-    park = _has_prefix(L, PARK_PREFIXES) or next((l for l in L if l in PARK_EXACT), None)
+    # park_labels (ga-fup3m): pilot:held/-until expirado sai do conjunto ANTES
+    # do teste de PARK_PREFIXES/PARK_EXACT — needs_human continua sobre L bruto
+    # (hold-expiry não remove nenhum label de needs-human, então não faz
+    # diferença ali; manter L evita acoplar dois conceitos independentes).
+    park_labels = _labels_after_expired_hold(L, now)
+    park = _has_prefix(park_labels, PARK_PREFIXES) or next((l for l in park_labels if l in PARK_EXACT), None)
     needs_human = is_needs_human(L)
     if park or needs_human or status == "deferred":
         ext = "story:awaiting-external-merge" in L or park == "blocked:external-quota-motherduck"

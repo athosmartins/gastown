@@ -260,6 +260,59 @@ sys.exit(0 if rl.claimant_provably_dead(assignee, sessions) else 1)
 ' "$assignee" 2>/dev/null
 }
 
+# ── Canonical PARK vocabulary for R4/R8 (ga-8lrud) ───────────────────────────
+# scripts/bead_state.py's PARK_PREFIXES/PARK_EXACT is the city's single park
+# vocabulary (same disease/cure as _provably_dead above and production-stall-
+# watchdog.py's _canonical_is_parked, ga-qhca1/cbbc13660): R8's own park check
+# was a private 3-signal copy (needs-human exact, story:blocked, pool:refused:*
+# prefix) — measured 2026-08-10 against the live population, 14+ HQ beads and
+# 3+ whatsapp_automation beads carry ctx:ready/exec:auto together with a
+# canonical park label the old 3-signal check missed entirely (gate:needs-human*,
+# blocked-on:*, framework:engine, pilot:refused-reason:* — the last one is the
+# ACTUAL label pool workers write on self-refusal per this repo's own
+# "pool:refused:engine-rebuild-required" doctrine; R8's old pool:refused:*
+# prefix never matched the pilot:refused-reason: form).
+#
+# Fetched ONCE per sweep (mirrors _gate_active_beads/_sessions_json above) as a
+# JSON snapshot of the two vocabulary sets — never re-derived per bead, and
+# never hand-copied: this prints bead_state.py's OWN constants, so it cannot
+# silently drift from them the way the old hardcoded 3-signal list did.
+# FAIL-OPEN: any import/parse error yields {} (empty vocab), which — because
+# callers below UNION it with their pre-existing hardcoded checks rather than
+# replacing them — is exactly equivalent to "canonical unavailable, behave
+# exactly as before" with zero extra branching (same defensive contract as
+# _CANONICAL_STATE_FN in production-stall-watchdog.py, just expressed as data
+# instead of a function reference since bash can't pass a callable across the
+# python3 boundary).
+#
+# Deliberately does NOT use bead_state.derive()/GATE_ACTIVE or the "parked"
+# state as a whole — only the raw PARK_PREFIXES/PARK_EXACT membership. R8's own
+# invariant is explicitly UNCONDITIONAL across status (see R8 below, "No status
+# filter"); derive()'s rule ordering would make a CLOSED bead's park labels
+# invisible (closed short-circuits before the park rule), silently narrowing
+# R8's own documented scope. Using the flat vocabulary instead of full derive()
+# keeps R8/R4's status-agnostic intent intact while still sourcing the label
+# SET from the single canonical place.
+LCJ_BEAD_STATE_LIB="${LCJ_BEAD_STATE_LIB:-/Users/athos/gt/.gascity-gastown-hq/scripts}"
+_PARK_VOCAB_JSON=""
+_park_vocab_json() {
+  [ -n "$_PARK_VOCAB_JSON" ] && { printf '%s' "$_PARK_VOCAB_JSON"; return 0; }
+  _PARK_VOCAB_JSON=$(python3 -c '
+import sys, json
+sys.path.insert(0, "'"$LCJ_BEAD_STATE_LIB"'")
+try:
+    from bead_state import PARK_PREFIXES, PARK_EXACT
+    print(json.dumps({"prefixes": list(PARK_PREFIXES), "exact": list(PARK_EXACT)}))
+except Exception:
+    print("{}")
+' 2>/dev/null)
+  case "$_PARK_VOCAB_JSON" in
+    '{'*'}') : ;;  # looks like a JSON object, keep it
+    *) _PARK_VOCAB_JSON="{}" ;;  # empty output / crash / anything unexpected → fail open
+  esac
+  printf '%s' "$_PARK_VOCAB_JSON"
+}
+
 # ── AC3 (ga-to242): bead-id → branch(es) resolution + real git-ancestry merge
 # verification for R5. R4/R5 were re-enabled 2026-07-17 (ga-6plfv) with R5 only
 # partially fixed: it skipped beads still carrying gate:failed/needs-fix at sweep
@@ -431,6 +484,10 @@ run_sweep() {
   case "$_gate_active" in
     *"$_GATE_UNKNOWN_SENTINEL"*) notify_fail "lifecycle-coherence-janitor: consulta de gate-markers FALHOU nesta sweep — protecoes R3/R7 degradadas (fail-safe ativo, bd/Dolt pode estar instavel)" ;;
   esac
+  # ga-8lrud: canonical park vocabulary, computed once per sweep (same reasoning
+  # as _gate_active above — R4/R8 below consult the SAME snapshot regardless of
+  # which store they're currently walking).
+  local _park_vocab; _park_vocab=$(_park_vocab_json)
   for store in $LCJ_STORES; do
     [ -d "$store" ] || continue
 
@@ -510,12 +567,27 @@ run_sweep() {
     # test("^gate:needs-human:") — that traded the original exact-match gap for a new one, still
     # missing the bare label actively written by production code. Matched by PREFIX with an
     # optional colon-suffix instead, so both forms are covered.
+    # ga-8lrud: the gate:needs-human*/story:blocked checks below are now UNIONED
+    # with the canonical park vocabulary ($_park_vocab, see definition above) —
+    # story:in-flight/exec:manual stay as their own hardcoded exclusions since
+    # they are NOT "parked" concepts (in-flight = actively building; exec:manual
+    # = explicitly handed to a human), they're a different reason to leave the
+    # assignee alone. Measured live 2026-08-10: wa-5b6yw carries
+    # pilot:refused-reason:device-coupled-batista-directive, which the OLD
+    # 2-signal check missed entirely (would have cleared batista-wa's assignee
+    # the moment liveness ever lapses, undoing an explicit device-coupled hold).
     _r4_seen=" "
     for _rlbl in story:approved ctx:ready; do
       for _pair in $("$BD" -C "$store" list -l "$_rlbl" --status open --json -n 0 2>/dev/null \
-                  | jq -r '.[] | select((.assignee // "") != "" and (.assignee // "") != "mayor")
+                  | jq -r --argjson pv "$_park_vocab" '.[] | select((.assignee // "") != "" and (.assignee // "") != "mayor")
                           | ([.labels[]?]) as $l
-                          | select(($l|index("story:in-flight"))==null and ($l|index("exec:manual"))==null and (($l|any(test("^gate:needs-human(:.*)?$")))|not) and ($l|index("story:blocked"))==null)
+                          | select(($l|index("story:in-flight"))==null and ($l|index("exec:manual"))==null
+                                   and (($l | any(
+                                         . as $lbl
+                                         | ($lbl | test("^gate:needs-human(:.*)?$")) or ($lbl == "story:blocked")
+                                           or ((($pv.exact // []) | index($lbl)) != null)
+                                           or (($pv.prefixes // []) | any(. as $p | $lbl | startswith($p)))
+                                       )) | not))
                           | .id + "|" + .assignee' 2>/dev/null); do
         [ -n "$_pair" ] || continue
         id="${_pair%%|*}"; _r4_assignee="${_pair#*|}"
@@ -647,9 +719,23 @@ run_sweep() {
     # symptom). Fixed by enumerating the labels that actually indicate a blocked refino state
     # instead of excluding the ones that don't: a denylist silently misclassifies any future
     # accounting label as blocking; an allowlist defaults new labels to non-blocking.
+    # ga-8lrud: ^ctx:thin$|^story:triage$ added — both are canonical UNREFINED
+    # (scripts/bead_state.py) but were absent from this enumeration. Measured
+    # live 2026-08-10: 19 HQ + 3 whatsapp_automation beads carry ctx:thin with
+    # gc.routed_to still set (all closed or open-unassigned, none in_progress —
+    # low-risk: this only clears stale routing metadata / closes orphaned
+    # slings, never touches a live worker). Kept as a hardcoded mirror rather
+    # than a live python3 fetch (unlike R4/R8's _park_vocab_json): this
+    # enumeration already combines FOUR different canonical buckets (UNREFINED,
+    # ATHOS_TURN's story:needs-approval, the janitor-specific auto-refino:
+    # escalated, and gate:needs-human*) that don't correspond to any single
+    # bead_state.py set, and --all can return hundreds of rows per store where
+    # R4/R8's candidate sets are a handful — a per-row python3 dispatch here
+    # would be materially more expensive for no correctness gain over a
+    # hand-verified literal mirror.
     local non_imp_beads
     non_imp_beads=$("$BD" -C "$store" list --all --json 2>/dev/null \
-                    | jq -r '.[] | select([.labels[]?] | any(test("^story:epic$|^story:unrefined$|^story:needs-approval$|^story:refino-|^story:refinement-in-progress$|^refino:policy-gap$|^refino:info-gap$|^auto-refino:escalated$|^gate:needs-human(:.*)?$")) ) | .id' 2>/dev/null)
+                    | jq -r '.[] | select([.labels[]?] | any(test("^story:epic$|^story:unrefined$|^story:needs-approval$|^story:refino-|^story:refinement-in-progress$|^refino:policy-gap$|^refino:info-gap$|^auto-refino:escalated$|^gate:needs-human(:.*)?$|^ctx:thin$|^story:triage$")) ) | .id' 2>/dev/null)
     for id in $non_imp_beads; do
       [ -n "$id" ] || continue
       case "$_gate_active" in
@@ -766,11 +852,24 @@ run_sweep() {
     # like R1/R2/R5/R6 — this does NOT consult _gate_active_beads (that check is
     # reserved for R3/R7's status-flip/close mutations); it DOES honor the advisory
     # lock, matching R4-R7.
+    # ga-8lrud: the 3-signal check below is now UNIONED with the canonical park
+    # vocabulary ($_park_vocab, see definition above) — needs-human/story:blocked/
+    # pool:refused:* stay as an explicit OR-clause (redundant with canonical but
+    # harmless, and keeps the fail-open fallback behavior IDENTICAL to before
+    # this change when $_park_vocab degrades to {}). Measured live 2026-08-10:
+    # 14+ HQ beads + 3+ whatsapp_automation beads carry ctx:ready/exec:auto
+    # together with a canonical park label this 3-signal check missed (see the
+    # full rationale on _park_vocab_json above).
     _r8_seen=" "
     for _armlbl in exec:auto ctx:ready; do
       for id in $("$BD" -C "$store" list -l "$_armlbl" --json -n 0 2>/dev/null \
-                  | jq -r '.[] | ([.labels[]?]) as $l
-                          | select($l | any(. == "needs-human" or . == "story:blocked" or test("^pool:refused:")))
+                  | jq -r --argjson pv "$_park_vocab" '.[] | ([.labels[]?]) as $l
+                          | select($l | any(
+                              . as $lbl
+                              | ($lbl == "needs-human") or ($lbl == "story:blocked") or ($lbl | test("^pool:refused:"))
+                                or ((($pv.exact // []) | index($lbl)) != null)
+                                or (($pv.prefixes // []) | any(. as $p | $lbl | startswith($p)))
+                            ))
                           | .id' 2>/dev/null); do
         [ -n "$id" ] || continue
         case "$_r8_seen" in *" $id "*) continue ;; esac
@@ -878,7 +977,7 @@ case "\$a" in
   *"list -l story:approved --status closed"*)   echo '[{"id":"ca-1"},{"id":"ca-cancel","labels":["story:cancelled","story:approved"]},{"id":"ca-byreason","close_reason":"CANCELLED — requirements changed, replaced by ga-xyz"}]' ;;
   *"list -l story:in-flight --status blocked"*) echo '[{"id":"bl-1"}]' ;;
   *"list --status in_progress"*)                echo '[{"id":"ip-noasg","assignee":"","updated_at":"2020-01-01T00:00:00Z"},{"id":"ip-fresh","assignee":"","updated_at":"'"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"'"},{"id":"ip-asg","assignee":"mila-wa"},{"id":"ip-gate-active","assignee":"","updated_at":"2020-01-01T00:00:00Z"}]' ;;
-  *"list -l story:approved --status open"*)     echo '[{"id":"r4-asg","assignee":"mila-wa","labels":["story:approved"]},{"id":"r4-human","assignee":"mila-wa","labels":["story:approved","gate:needs-human:foo"]},{"id":"r4-human-bare","assignee":"mila-wa","labels":["story:approved","gate:needs-human"]},{"id":"r4-live","assignee":"crew-live","labels":["story:approved"]},{"id":"r4-ambiguous","assignee":"crew-ambiguous","labels":["story:approved"]},{"id":"r4-deacon","assignee":"deacon","labels":["story:approved"]}]' ;;
+  *"list -l story:approved --status open"*)     echo '[{"id":"r4-asg","assignee":"mila-wa","labels":["story:approved"]},{"id":"r4-human","assignee":"mila-wa","labels":["story:approved","gate:needs-human:foo"]},{"id":"r4-human-bare","assignee":"mila-wa","labels":["story:approved","gate:needs-human"]},{"id":"r4-live","assignee":"crew-live","labels":["story:approved"]},{"id":"r4-ambiguous","assignee":"crew-ambiguous","labels":["story:approved"]},{"id":"r4-deacon","assignee":"deacon","labels":["story:approved"]},{"id":"r4-canon-blocked","assignee":"mila-wa","labels":["story:approved","blocked:needs-oracle-approval"]}]' ;;
   *"list -l ctx:ready --status open"*)          echo '[]' ;;
   *"list -l ctx:ready --status closed"*)        echo '[{"id":"r5","labels":["ctx:ready"]},{"id":"r5-locked","labels":["ctx:ready"]},{"id":"r5-cancel","labels":["ctx:ready","story:cancelled"]},{"id":"r5-byreason","labels":["ctx:ready"],"close_reason":"discontinued: replaced by wa-xyz redesign"},{"id":"r5-gate-failed","labels":["ctx:ready","gate:failed","gate:needs-fix"]},{"id":"r5m","labels":["ctx:ready"]},{"id":"r5s","labels":["ctx:ready"]},{"id":"r5u","labels":["ctx:ready"]},{"id":"r9dot.1","labels":["ctx:ready"]},{"id":"r5mb","labels":["ctx:ready"]},{"id":"r5mm","labels":["ctx:ready"]}]' ;;
   *"show r5 "*|*"show r5-locked "*)             echo '[{"id":"r5","labels":["ctx:ready"]}]' ;;
@@ -900,12 +999,14 @@ case "\$a" in
   # the third enumerated blocker (refino:info-gap, alongside t-refino's refino:policy-gap).
   # ga-6dpoa: t-scope-review carries the scope guard's OWN label (scope:needs-review,
   # never gate:needs-human) — proves the two systems no longer share a label.
-  *"list --all"*)                               echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}},{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-8yw4i.1","status":"in_progress","assignee":"mila-wa","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-unrefined","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refinement","status":"open","labels":["story:refinement-in-progress"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino","status":"open","labels":["refino:policy-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-infogap","status":"open","labels":["refino:info-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-swept","status":"open","labels":["refino:creator-swept"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-done","status":"open","labels":["refino:done"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-combo","status":"open","labels":["refino:creator-swept","auto-refino:escalated"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto","status":"open","labels":["auto-refino:escalated"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto-generic","status":"open","labels":["auto-refino:foo"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human","status":"open","labels":["gate:needs-human:bar"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human-bare","status":"open","labels":["gate:needs-human"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-scope-review","status":"open","labels":["delivery:partial","gate:passed","scope:needs-review"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-valid","status":"in_progress","labels":["story:in-flight"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-mayor-assigned","status":"in_progress","assignee":"mayor","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-gate-protect","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"r7-original-target","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"list --all"*)                               echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}},{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-8yw4i.1","status":"in_progress","assignee":"mila-wa","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-unrefined","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refinement","status":"open","labels":["story:refinement-in-progress"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino","status":"open","labels":["refino:policy-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-infogap","status":"open","labels":["refino:info-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-swept","status":"open","labels":["refino:creator-swept"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-done","status":"open","labels":["refino:done"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-combo","status":"open","labels":["refino:creator-swept","auto-refino:escalated"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto","status":"open","labels":["auto-refino:escalated"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto-generic","status":"open","labels":["auto-refino:foo"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human","status":"open","labels":["gate:needs-human:bar"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human-bare","status":"open","labels":["gate:needs-human"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-scope-review","status":"open","labels":["delivery:partial","gate:passed","scope:needs-review"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-valid","status":"in_progress","labels":["story:in-flight"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-mayor-assigned","status":"in_progress","assignee":"mayor","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-gate-protect","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"r7-original-target","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-ctxthin","status":"open","labels":["ctx:thin"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-triage","status":"open","labels":["story:triage"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show wa-o4kuh"*)                             echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}}]' ;;
   *"show wa-06yog"*)                             echo '[{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show wa-8yw4i.1"*)                           echo '[{"id":"wa-8yw4i.1","status":"in_progress","assignee":"mila-wa","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-mayor-assigned"*)                     echo '[{"id":"t-mayor-assigned","status":"in_progress","assignee":"mayor","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-unrefined"*)                          echo '[{"id":"t-unrefined","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"show t-ctxthin"*)                            echo '[{"id":"t-ctxthin","status":"open","labels":["ctx:thin"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"show t-triage"*)                             echo '[{"id":"t-triage","status":"open","labels":["story:triage"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-refinement"*)                         echo '[{"id":"t-refinement","status":"open","labels":["story:refinement-in-progress"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-refino "*)                            echo '[{"id":"t-refino","status":"open","labels":["refino:policy-gap"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-refino-infogap"*)                     echo '[{"id":"t-refino-infogap","status":"open","labels":["refino:info-gap"],"metadata":{"gc.routed_to":"pool"}}]' ;;
@@ -956,9 +1057,9 @@ case "\$a" in
   # dedup guard), r8-locked (ctx:ready + needs-human, advisory-locked — must be skipped),
   # r8-clean-auto/r8-clean-ready (arm label, no park label — must be left alone).
   *"list -l exec:auto --json"*)
-    echo '[{"id":"r8-parked-auto","labels":["exec:auto","pool:refused:engine-rebuild-required"]},{"id":"r8-parked-auto2","labels":["exec:auto","pool:refused:some-other-reason"]},{"id":"r8-parked-both","labels":["exec:auto","ctx:ready","story:blocked"]},{"id":"r8-clean-auto","labels":["exec:auto","lane:small"]}]' ;;
+    echo '[{"id":"r8-parked-auto","labels":["exec:auto","pool:refused:engine-rebuild-required"]},{"id":"r8-parked-auto2","labels":["exec:auto","pool:refused:some-other-reason"]},{"id":"r8-parked-both","labels":["exec:auto","ctx:ready","story:blocked"]},{"id":"r8-clean-auto","labels":["exec:auto","lane:small"]},{"id":"r8-parked-canon-exact","labels":["exec:auto","framework:engine"]},{"id":"r8-parked-canon-prefix","labels":["exec:auto","pilot:refused-reason:engine-rebuild-required"]}]' ;;
   *"list -l ctx:ready --json"*)
-    echo '[{"id":"r8-parked-ready","labels":["ctx:ready","needs-human"]},{"id":"r8-parked-both","labels":["exec:auto","ctx:ready","story:blocked"]},{"id":"r8-locked","labels":["ctx:ready","needs-human"]},{"id":"r8-clean-ready","labels":["ctx:ready","lane:small"]}]' ;;
+    echo '[{"id":"r8-parked-ready","labels":["ctx:ready","needs-human"]},{"id":"r8-parked-both","labels":["exec:auto","ctx:ready","story:blocked"]},{"id":"r8-locked","labels":["ctx:ready","needs-human"]},{"id":"r8-clean-ready","labels":["ctx:ready","lane:small"]},{"id":"r8-parked-canon-blockedon","labels":["ctx:ready","blocked-on:wa-d9a0j"]}]' ;;
   *"label remove"*|*"label add"*|*"update"*|*"dolt commit"*) echo "\$a" >> "$ACT" ;;
   *) echo '[]' ;;
 esac
@@ -1069,6 +1170,13 @@ GITSHIM
   grep -q 'update r4-ambiguous --assignee'    "$ACT" && bad "R4 (ga-6plfv): cleared the assignee of a session in an UNRECOGNIZED state — unknown must fail safe as NOT provably dead" || ok "R4 (ga-6plfv): left an ambiguous-state session's assignee alone (fail-safe on unknown state)"
   grep -q 'update r4-deacon --assignee'       "$ACT" && bad "R4 (ga-6plfv): cleared assignee=deacon — coordinator exclusion gap the liveness check was supposed to close" || ok "R4 (ga-6plfv): left assignee=deacon alone (is_coordinator() protects it, same convention as assignee=mayor)"
   grep -q 'update r4-asg --assignee'          "$ACT" && ok "R4 (ga-6plfv): mila-wa is absent from the session roster → still provably dead → still cleared (pre-fix behavior preserved for genuine phantoms)" || bad "R4 (ga-6plfv): regressed the genuinely-phantom case — mila-wa should still be cleared"
+  # R4 canonical-park widening (ga-8lrud): r4-canon-blocked's assignee (mila-wa) is
+  # the SAME dead/absent-from-roster identity as r4-asg above (which DOES get
+  # cleared) — so this fixture isolates the park-exclusion itself: if it were
+  # cleared, this test would fail even though liveness alone would have allowed
+  # it, proving the canonical park check fires (and wins) before liveness is
+  # even consulted.
+  grep -q 'update r4-canon-blocked --assignee' "$ACT" && bad "R4 (ga-8lrud): cleared assignee on a bead carrying blocked:* (canonical PARK_PREFIXES, not in the old gate:needs-human*/story:blocked exclusion) — canonical park widening broken" || ok "R4 (ga-8lrud): left blocked:* bead's assignee alone (canonical PARK_PREFIXES widening works)"
   grep -q 'label remove r6-exp pilot:held'     "$ACT" && ok "R6 (imp19): expired pilot:held-until → stripped pilot:held" || bad "R6 did not strip expired pilot:held"
   grep -q 'label remove r6-exp pilot:held-until:1000000' "$ACT" && ok "R6 (imp19): stripped the expiry label" || bad "R6 did not strip expiry label"
   grep -q 'label add r6-noexp pilot:held-until:' "$ACT" && ok "R6 (imp19): pilot:held with no expiry → stamped default 24h expiry" || bad "R6 did not stamp default expiry"
@@ -1136,6 +1244,12 @@ GITSHIM
   # (the old shared label this replaces), scope:needs-review carries no gate:needs-human
   # prefix at all, so no R7 pattern change was needed — this test locks that in.
   grep -q 't-scope-review' "$ACT" && bad "R7 (ga-6dpoa): touched scope:needs-review bead — scope guard's review signal must not be read as non-implementable" || ok "R7 (ga-6dpoa): left t-scope-review alone (scope:needs-review is a review signal, not a blocking state)"
+  # R7 canonical UNREFINED widening (ga-8lrud): ctx:thin/story:triage are in
+  # bead_state.py's UNREFINED set but were absent from this file's own
+  # enumeration. Measured live 2026-08-10: 22 real beads (19 HQ, 3 WA) carry
+  # ctx:thin with gc.routed_to still set.
+  grep -q 'update t-ctxthin --unset-metadata gc.routed_to' "$ACT" && ok "R7 (ga-8lrud): unset gc.routed_to on ctx:thin (canonical UNREFINED, previously missing from R7's enumeration)" || bad "R7 (ga-8lrud) did not unset gc.routed_to on t-ctxthin"
+  grep -q 'update t-triage --unset-metadata gc.routed_to' "$ACT" && ok "R7 (ga-8lrud): unset gc.routed_to on story:triage (canonical UNREFINED, previously missing from R7's enumeration)" || bad "R7 (ga-8lrud) did not unset gc.routed_to on t-triage"
 
   # R8 (ga-ipm4): park+arm invariant — a parked bead (needs-human/pool:refused:*/
   # story:blocked) must never keep exec:auto/ctx:ready. Reproduced live on ga-66wc.
@@ -1148,6 +1262,16 @@ GITSHIM
   grep -q 'r8-locked' "$ACT" && bad "R8: touched an advisory-locked parked+armed bead (must be skipped, matches R4-R7 convention)" || ok "R8: skipped the advisory-locked bead (r8-locked)"
   grep -q 'r8-clean-auto' "$ACT" && bad "R8: touched an exec:auto bead with NO park label (false positive)" || ok "R8: left a clean exec:auto bead alone (no park label)"
   grep -q 'r8-clean-ready' "$ACT" && bad "R8: touched a ctx:ready bead with NO park label (false positive)" || ok "R8: left a clean ctx:ready bead alone (no park label)"
+
+  # R8 canonical-park widening (ga-8lrud): labels the OLD 3-signal check could
+  # never catch (framework:engine is PARK_EXACT; pilot:refused-reason:*/
+  # blocked-on:* match PARK_PREFIXES entries pilot:refused/blocked-on:). Exercises
+  # the REAL scripts/bead_state.py (not shimmed — _park_vocab_json has no I/O to
+  # fake, it only introspects static module constants), so this is genuine
+  # integration coverage, not a re-mocked copy of the vocabulary.
+  grep -q 'label remove r8-parked-canon-exact exec:auto' "$ACT" && ok "R8 (ga-8lrud): exec:auto + framework:engine (canonical PARK_EXACT, not in the old 3-signal list) → stripped exec:auto" || bad "R8 (ga-8lrud): did not strip exec:auto on r8-parked-canon-exact — canonical PARK_EXACT widening broken"
+  grep -q 'label remove r8-parked-canon-prefix exec:auto' "$ACT" && ok "R8 (ga-8lrud): exec:auto + pilot:refused-reason:* (canonical 'pilot:refused' PREFIX — the ACTUAL label pool workers write, distinct from the old check's pool:refused:* only) → stripped exec:auto" || bad "R8 (ga-8lrud): did not strip exec:auto on r8-parked-canon-prefix — canonical PARK_PREFIXES widening broken"
+  grep -q 'label remove r8-parked-canon-blockedon ctx:ready' "$ACT" && ok "R8 (ga-8lrud): ctx:ready + blocked-on:<id> (canonical PARK_PREFIXES, not in the old 3-signal list) → stripped ctx:ready" || bad "R8 (ga-8lrud): did not strip ctx:ready on r8-parked-canon-blockedon — canonical PARK_PREFIXES widening broken"
 
   # Gate-active protection (ga-ibz0/wa-bkjy7, 2026-07-11): quality-gate-guard.sh silently
   # detaches a bead's assignee for the FULL gate duration (no bd comment); R3/R7 must never

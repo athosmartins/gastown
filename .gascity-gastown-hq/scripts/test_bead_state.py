@@ -61,6 +61,55 @@ def test_in_progress_com_prova_de_morte_e_stranded():
     assert st["actions"] == ["liberar_para_pool"]
 
 
+# ── coordenador (mayor/deacon) nunca é stranded (ga-8lrud) ─────────────────────
+# Absorvido de inflight-reclaim-guard.py's COORDINATOR_MARKERS/is_coordinator
+# (scripts/inflight-reclaim-guard.py:289-294,1144-1152), que lifecycle-coherence-
+# janitor.sh's R4/R7 já refletiam com uma exclusão hardcoded de "mayor" (prova de
+# que consumidores de produção já tinham aprendido a lição; o modelo canônico não).
+# A sessão viva se chama "gastown.mayor"/"gastown.deacon" — um PREFIXO diferente
+# do assignee bare "mayor"/"deacon" que o casamento por sufixo de holder_is_alive
+# não cobre — então SEM esta guarda um bead in_progress do mayor/deacon resolvia
+# alive=False -> "stranded". Nenhum bead in_progress de mayor/deacon existia no
+# momento da medição (09/08) — gap latente, não incidente vivo.
+
+def test_is_coordinator_casa_por_substring_mesmo_vocabulario_do_guard():
+    assert is_coordinator("mayor") is True
+    assert is_coordinator("deacon") is True
+    assert is_coordinator("gastown.mayor") is True
+    assert is_coordinator("gastown.deacon") is True
+    assert is_coordinator("mila-wa") is False
+    assert is_coordinator("") is False
+
+
+def test_holder_alive_coordenador_e_none_nao_false_mesmo_sem_sessao_correspondente():
+    """A sessão real é 'gastown.mayor', não 'mayor' — o casamento por sufixo
+    (s==assignee / s.startswith(assignee+'-') / assignee.startswith(s+'-')) não
+    bate nenhum dos dois. Sem a guarda de is_coordinator, isto cairia no loop e
+    devolveria False (ninguém bate)."""
+    live = frozenset({"gastown.mayor", "gastown.deacon", "mila-wa-x1"})
+    assert holder_is_alive("mayor", live) is None
+    assert holder_is_alive("deacon", live) is None
+
+
+def test_holder_alive_coordenador_protegido_mesmo_com_lista_de_sessoes_vazia():
+    """Mesma semântica de claimant_provably_dead: coordenador nunca é 'comprovadamente
+    morto', mesmo quando a consulta de sessões devolve vazio (CONSULTEI E NÃO HÁ
+    NINGUÉM para qualquer outro assignee — mas coordenador é exceção antes do loop)."""
+    assert holder_is_alive("mayor", frozenset()) is None
+
+
+def test_in_progress_do_coordenador_nunca_e_stranded():
+    """O teste que teria pegado o gap antes de virar incidente: R4/R7 do janitor já
+    protegiam 'mayor' na prática — este é o mesmo invariante no modelo canônico."""
+    live = frozenset({"gastown.mayor", "mila-wa-x1"})
+    st = derive(b(status="in_progress", assignee="mayor"), live, CREWS)
+    assert st["state"] == "executing"
+    assert "liberar_para_pool" not in st["actions"]
+    st2 = derive(b(status="in_progress", assignee="deacon"), live, CREWS)
+    assert st2["state"] == "executing"
+    assert "liberar_para_pool" not in st2["actions"]
+
+
 def test_gate_failed_nao_devolve_pro_pool_sem_prova_de_morte():
     """A ação irreversível deste módulo é tirar o bead de quem o segura. Ela exige
     PROVA de óbito, nunca ausência de informação."""
@@ -415,3 +464,56 @@ def test_is_coordinator_pega_mayor_e_deacon():
     assert is_coordinator("hq-deacon") is True
     assert is_coordinator("mila-wa") is False
     assert is_coordinator("") is False
+
+
+# ── pilot:held-until expira (ga-fup3m, absorvido de pilot-missing-route-watchdog.sh) ──
+# scripts/pilot-missing-route-watchdog.sh (81 refs) já mede isto — seus próprios
+# Scenario 7/8 de selftest provam o comportamento certo: pilot:held bare SEM
+# held-until pareka indefinidamente; COM held-until EXPIRADO, não pareka mais.
+# bead_state.py tratava QUALQUER held-until como park permanente — nunca checava
+# se o timestamp já tinha passado. pilot:held / pilot:held-until:<epoch> são
+# escritos JUNTOS por _mayor_deferred_hold_db (achado por ga-7qsxr, comentário do
+# seu commit a2ac5c8c5).
+
+def test_pilot_held_sem_held_until_pareka_indefinidamente():
+    """Regressão-guarda: sem held-until, pilot:held bare continua parkeando
+    (mirrors pilot-missing-route-watchdog.sh Scenario 7)."""
+    st = derive(b(labels=["pilot:held"]), None, CREWS)
+    assert st["state"] == "parked"
+
+
+def test_pilot_held_until_expirado_nao_pareka_mais():
+    """O achado real: held-until no PASSADO destrava (mirrors
+    pilot-missing-route-watchdog.sh Scenario 8 exatamente)."""
+    st = derive(b(labels=["pilot:held", "pilot:held-until:1000000000"]), None, CREWS, now=2000000000)
+    assert st["state"] != "parked"
+
+
+def test_pilot_held_until_futuro_continua_parkeando():
+    st = derive(b(labels=["pilot:held", "pilot:held-until:2000000000"]), None, CREWS, now=1000000000)
+    assert st["state"] == "parked"
+
+
+def test_pilot_held_until_sem_now_preserva_comportamento_antigo():
+    """now=None (não consultado) NUNCA expira um hold — mesma direção segura de
+    todo outro None neste módulo. Todo chamador EXISTENTE (que não passa now)
+    continua vendo o comportamento de HOJE, sem quebra."""
+    st = derive(b(labels=["pilot:held", "pilot:held-until:1000000000"]), None, CREWS)
+    assert st["state"] == "parked"
+
+
+def test_pilot_held_expirado_mas_outro_motivo_de_park_independente_ainda_pareka():
+    """Um hold expirado não pode mascarar outro motivo de park genuinamente
+    independente na mesma bead."""
+    st = derive(b(labels=["pilot:held", "pilot:held-until:1000000000", "blocked:outra-coisa"]),
+                None, CREWS, now=2000000000)
+    assert st["state"] == "parked"
+    assert st["reasons"]["despausar"] == "parkeado por blocked:outra-coisa"
+
+
+def test_pilot_held_multiplos_held_until_usa_o_maximo():
+    """Mirrors a lógica 'max(held-until) < now' do arquivo-fonte: com dois
+    held-until, só expira quando o MAIOR também já passou."""
+    st = derive(b(labels=["pilot:held", "pilot:held-until:1000000000", "pilot:held-until:3000000000"]),
+                None, CREWS, now=2000000000)
+    assert st["state"] == "parked"   # o maior (3000000000) ainda não passou
