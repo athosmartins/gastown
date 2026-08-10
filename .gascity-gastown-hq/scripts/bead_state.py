@@ -251,8 +251,30 @@ def is_needs_human(labels) -> bool:
     simula exatamente esse cenário e prova a wiring load-bearing, não morta.
 
     Mecânica de casamento reusada de park_labels.label_matches (ga-hzt8s) —
-    vocabulário (quais bases) é próprio desta função, igual ao que
-    inflight-reclaim-guard.py's _has_needs_human_label já testava.
+    vocabulário (quais bases) é próprio desta função.
+
+    ⚠️ CORREÇÃO 2 (ga-x3e7p GATE-FAIL attempt 3/3): a frase acima ("igual ao
+    que _has_needs_human_label já testava") era FALSA — verificado
+    empiricamente, não só por inspeção. label_matches casa exato, ":"-sufixo,
+    OU "-"-sufixo; a versão ORIGINAL de _has_needs_human_label (pré-migração)
+    só casava exato ou ":"-sufixo — nunca "-"-sufixo. Concretamente:
+    is_needs_human(["needs-human-followup"]) is True (via o sufixo "-"), mas
+    a função original retornava False pro mesmo input (confirmado rodando o
+    blob do merge-base). "needs-human-followup" não é hipotético — é label
+    real (ga-3lsy1, bugs/tech-debt).
+
+    Isto É uma correção intencional, não uma regressão: PARK_PREFIXES/
+    derive() já tratava "needs-human-followup" como parked ANTES desta
+    função existir (via _has_prefix's startswith cru sobre a base bare
+    "needs-human" — ver test_needs_human_bare_prefix_bugs_tech_debt_e_park,
+    que já passava por ESSE caminho). O guarda que chama is_needs_human()
+    diretamente (bypassando derive()) estava, até agora, DESALINHADO do
+    resto do sistema — via de proteção mais estreita que a que derive() já
+    reconhecia. Alargar o guarda pra bater com o resto do sistema é fechar
+    um gap real, na mesma direção segura de todo outro achado desta
+    migração: nunca reduz proteção contra reclaim indevido, só adiciona.
+    Ver test_is_needs_human_reconhece_sufixo_hifen (o teste que faltava,
+    exatamente no ponto onde o comportamento diverge do guarda original).
     """
     lset = labels if isinstance(labels, (set, frozenset)) else set(labels or [])
     return any(
@@ -393,7 +415,6 @@ def session_owner_is_healthy(matched_live, activity_age, bead_update_age,
 
 
 def claimant_provably_dead(assignee, sessions,
-                            coordinator_markers=COORDINATOR_MARKERS,
                             dead_states=DEAD_SESSION_STATES) -> bool:
     """True sse o detentor do bead está PROVADAMENTE morto (gt-fppb0):
     TODO match — por template bare (session.template == assignee, ex.
@@ -407,6 +428,15 @@ def claimant_provably_dead(assignee, sessions,
     provavelmente morta — o builder pode ainda estar vivo, então mantêm a
     janela de histerese normal. Só um claimant CERTAMENTE ausente ganha o
     caminho rápido (reclaim imediato, sem esperar TTL).
+
+    ga-x3e7p GATE-FAIL (attempt 3/3): esta função já teve um parâmetro
+    coordinator_markers=COORDINATOR_MARKERS que a própria implementação nunca
+    lia — as duas chamadas internas a is_coordinator() usam a função livre,
+    que fecha sobre o global do módulo, então qualquer override do chamador
+    era silenciosamente ignorado (falsa afordância de configurabilidade).
+    Removido; is_coordinator() em si não aceita override — se um dia precisar,
+    refatore is_coordinator() primeiro. dead_states continua parâmetro real
+    (usado abaixo), não sofreu o mesmo problema.
 
     Conservador / fail-safe por construção:
       - lista de sessões vazia/None       → False (não dá pra provar morte)

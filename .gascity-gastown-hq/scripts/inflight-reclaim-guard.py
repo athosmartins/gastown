@@ -374,8 +374,9 @@ def account_is_rate_limited():
 
 
 def _has_needs_human_label(labels):
-    """True if labels contain gate:needs-human (exact), any gate:needs-human:*
-    variant, or the bare "needs-human" label.
+    """True if labels contain "gate:needs-human" or "needs-human" — exact, any
+    ":"-suffixed variant (gate:needs-human:technical), or (ga-x3e7p, see the
+    correction below) any "-"-suffixed variant (needs-human-followup).
 
     ga-hkpwv / bead-spec: the Mayor's circuit-breaker uses sub-labels like
     gate:needs-human:on-device, :routing, :technical. An exact-match check misses
@@ -390,10 +391,8 @@ def _has_needs_human_label(labels):
     incorrectly auto-reclaimed as a result. Same bug class already fixed
     in production-stall-watchdog.py under ga-m0ksy.
 
-    ga-x3e7p: delegates to bead_state.is_needs_human — same vocabulary this
-    function has always used (bare "needs-human", bare "gate:needs-human",
-    every "gate:needs-human:*" suffix), now shared with derive()'s PARK step
-    instead of living only here.
+    ga-x3e7p: delegates to bead_state.is_needs_human, now shared with
+    derive()'s PARK step instead of living only here.
 
     ⚠️ CORREÇÃO (gate_run=ga-b5y6y, code review): an earlier version of this
     note claimed bead_state.py had NO classification at all for these labels
@@ -406,9 +405,28 @@ def _has_needs_human_label(labels):
     actually missing: a STANDALONE predicate this consumer could call
     directly (without invoking the full derive() state machine) — this
     function had its own private copy of that exact check, which is the real
-    gap ga-x3e7p closed (see bead_state.py's is_needs_human() docstring for
-    the full correction and the load-bearing test that proves the wiring
-    isn't just decorative).
+    gap ga-x3e7p closed.
+
+    ⚠️ CORREÇÃO 2 (ga-x3e7p GATE-FAIL attempt 3/3): this note (and this
+    function's own docstring, before this fix) claimed the delegation was
+    "same vocabulary this function has always used" / "zero behavior
+    change" — FALSE, verified empirically: the ORIGINAL body of this
+    function (before delegating) matched exact or ":"-suffix only;
+    is_needs_human() (via park_labels.label_matches) also matches
+    "-"-suffix. Concretely: this function returned False for
+    ["needs-human-followup"] before the delegation, True after — a real,
+    already-used label (ga-3lsy1, bugs/tech-debt), not a hypothetical. This
+    reaches reclaim_decision()'s FIRST safety guard directly (line ~571 as
+    of this writing) — a stranded bead carrying that label now correctly
+    blocks auto-reclaim, where before it didn't. Intentional widening, not
+    a regression: derive() already treated this label as parked via
+    PARK_PREFIXES's own (broader) raw-startswith match, so this only
+    brings the guard's direct call in line with what the rest of the
+    system already did — never narrows protection, only closes a gap. See
+    bead_state.py's is_needs_human() docstring for the full correction, and
+    test_is_needs_human_reconhece_sufixo_hifen /
+    test_reclaim_decision_needs_human_hifen_sufixado_e_noop (this file's
+    own selftest) for the regression coverage that was missing.
     """
     return is_needs_human(labels)
 
@@ -5891,6 +5909,23 @@ def _selftest():
           _has_needs_human_label(["gate:needs-human:on-device"]))
     check("NH-4: unrelated labels → False",
           not _has_needs_human_label(["ctx:ready", "exec:manual"]))
+    # --- NH-5/6 (ga-x3e7p GATE-FAIL attempt 3/3): the ORIGINAL body of this
+    # function (pre-migration) matched exact/":"-suffix only — "-"-suffixed
+    # forms like "needs-human-followup" (real label, ga-3lsy1) returned False.
+    # The delegation to bead_state.is_needs_human widened this to also match
+    # "-"-suffix, which the diff's own comments falsely claimed was "zero
+    # behavior change". NH-5 locks in the new (intentional) behavior at the
+    # label level; NH-6 proves it all the way through reclaim_decision()'s
+    # actual safety guard — the real consumer, not a reimplementation of it.
+    check("NH-5: recognizes '-'-suffixed variant (needs-human-followup) — was False pre-ga-x3e7p, now True by design",
+          _has_needs_human_label(["needs-human-followup"]))
+    check("NH-6: reclaim_decision noops on a would-otherwise-reclaim bead once has_needs_human is computed from the '-'-suffixed label",
+          reclaim_decision(
+              has_live_session=False, has_recent_branch=False,
+              seconds_stranded=RECLAIM_TTL + 1, reclaim_count=0,
+              has_needs_human=_has_needs_human_label(["needs-human-followup"]),
+              has_dispatching_marker=False,
+          ) == "noop")
 
     # --- CTRL-1: explicit pointer to ga-u8fly's own acceptance control (2) —
     # a FRESH claim (assignee changed since last cycle) must get a full TTL

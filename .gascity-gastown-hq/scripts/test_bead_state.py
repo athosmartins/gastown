@@ -281,6 +281,20 @@ def test_is_needs_human_pega_todas_as_variantes():
     assert is_needs_human([]) is False
 
 
+def test_is_needs_human_reconhece_sufixo_hifen():
+    """Regressão (ga-x3e7p GATE-FAIL attempt 3/3): a versão ORIGINAL de
+    inflight-reclaim-guard.py's _has_needs_human_label (pré-migração) só
+    reconhecia exato ou sufixo ":" — nunca "-". is_needs_human() (via
+    park_labels.label_matches) reconhece os três. Verificado empiricamente
+    contra o merge-base: _has_needs_human_label(["needs-human-followup"]) ==
+    False lá, is_needs_human(["needs-human-followup"]) == True aqui. Label
+    real, não hipotética (ga-3lsy1, bugs/tech-debt) — este é o teste que
+    faltava exatamente no ponto onde o guarda diverge do comportamento
+    antigo, achado pelo reviewer, não descoberto sozinho."""
+    assert is_needs_human(["needs-human-followup"]) is True
+    assert is_needs_human(["gate:needs-human-mayor-fixing"]) is True
+
+
 def test_needs_human_nao_product_e_parked_nao_executing():
     """Hoje esta cobertura vem de PARK_PREFIXES (bare 'gate:needs-human',
     qualquer sufixo — cfc0da088/ga-7qsxr), não da wiring de needs_human em
