@@ -4421,7 +4421,11 @@ has "$DISPATCHER" 'PILOT_CTX_MIN_SPEC_CHARS' "spec-floor knob (gate b) is wired 
 # ── rig-scope allowlist (ga-mfeip WA-only default — honors the bead's scope, cuts
 # wasted ctx:ready queries against empty rigs → lighter Dolt footprint per sweep).
 has "$DISPATCHER" 'PILOT_CTX_READY_RIGS' "rig-scan scope allowlist defined (default whatsapp_automation)"
-has "$DISPATCHER" 'whatsapp_automation}"' "rig-scan scope defaults to whatsapp_automation (ga-mfeip scope)"
+# ga-3oxo5: default widened to include property_scrapers (measured real backlog,
+# see that bug's own comment on PILOT_CTX_READY_RIGS) — whatsapp_automation is
+# still the first entry, just no longer the sole one, so the exact old closing-
+# brace pattern no longer matches; check the current default string instead.
+has "$DISPATCHER" 'whatsapp_automation property_scrapers}"' "rig-scan scope defaults to whatsapp_automation + property_scrapers (ga-mfeip scope, widened by ga-3oxo5)"
 
 # ── Scenario 22g: HOL-block fix — built/gate-failed beads excluded from ctx:ready pool
 # A bead that is already built (has a crew branch) or gate-failed must NOT be a ctx:ready
@@ -5284,10 +5288,88 @@ has "$DISPATCHER" 'PILOT_WA_RIG_TIER2_OVERRIDE'    "PILOT_WA_RIG_TIER2_OVERRIDE 
 has "$DISPATCHER" 'Step 2b-rig-tier2'              "Step 2b-rig-tier2 block comment present (not in fallback 2c)"
 # The merge line must include WA_RIG_TIER2_JSON alongside the other pools.
 # Use fixed-string grep to avoid ERE interpretation of the $ variable sigil.
-if grep -qF '"$TIER1_JSON $TIER2_JSON $CTXREADY_JSON $CTXREADY_RIG_JSON $WA_RIG_TIER2_JSON"' "$DISPATCHER"; then
+# ga-3oxo5: the merge line grew a new pool (RIG_TIER1_JSON) — this assertion
+# now checks the CURRENT full merge line, not the pre-ga-3oxo5 shorter one.
+if grep -qF '"$TIER1_JSON $TIER2_JSON $CTXREADY_JSON $CTXREADY_RIG_JSON $WA_RIG_TIER2_JSON $RIG_TIER1_JSON"' "$DISPATCHER"; then
   ok "WA_RIG_TIER2_JSON merged into primary candidate pool (Bug A fix)"
 else
   bad "WA_RIG_TIER2_JSON NOT in primary merge echo — pool merge incomplete (Bug A fix regression)"
+fi
+
+# ── Scenario 23d (ga-3oxo5): RIG_TIER1_JSON — unconditional rig bug/tech-debt ──
+# Sibling of Scenario 23c above, same structural-check shape, for the new
+# Tier-1 (bug/tech-debt) rig pool that closes the gap Scenario 23a/23b/23c
+# never covered: those all test Tier-2 (story:approved feature) rig
+# candidates specifically.
+echo "Scenario 23d: structural — ga-3oxo5 rig Tier-1 wiring verified in dispatcher source"
+has "$DISPATCHER" 'RIG_TIER1_JSON'                 "RIG_TIER1_JSON variable wired (ga-3oxo5)"
+has "$DISPATCHER" 'PILOT_RIG_TIER1_QUERIES'        "PILOT_RIG_TIER1_QUERIES env gate defined"
+has "$DISPATCHER" 'PILOT_RIG_TIER1_OVERRIDE'       "PILOT_RIG_TIER1_OVERRIDE test seam defined"
+has "$DISPATCHER" 'Step 2b-rig-tier1'              "Step 2b-rig-tier1 block comment present (unconditional, not fallback 2c)"
+has "$DISPATCHER" 'skipped for Tier-1 bug/tech-debt scan' \
+    "non-allowlisted rig skip is logged explicitly, not silent (ga-3oxo5 AC)"
+if grep -qF 'PILOT_CTX_READY_RIGS:-whatsapp_automation property_scrapers' "$DISPATCHER"; then
+  ok "PILOT_CTX_READY_RIGS default widened to include property_scrapers (ga-3oxo5, measured real backlog)"
+else
+  bad "PILOT_CTX_READY_RIGS default NOT widened — property_scrapers still silently excluded (ga-3oxo5 regression)"
+fi
+
+# ── Scenario 23e (ga-3oxo5): BEHAVIORAL — rig Tier-1 bug IS dispatched even when
+# HQ also has candidates — the exact acceptance-criteria claim, not just wiring.
+# Mirrors run_wa_rig_tier2/Scenario 23a's harness exactly, swapped to the new
+# override seam, proving this bead's own AC1: "Um bug/tech-debt buildable
+# vivendo num DB de rig não-HQ é ENCONTRADO numa sweep em que a HQ TEM
+# candidatos (hoje não é)."
+run_rig_tier1() {
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=1 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
+    PILOT_DOLT_CPU_OVERRIDE=10 \
+    DISPATCH_TO_CAPACITY=1 \
+    FAKE_BUGS_JSON="${2:-}" \
+    FAKE_BLOCKED_IDS="" \
+    PILOT_RIG_TIER1_OVERRIDE="${1:-[]}" \
+    PILOT_RIG_TIER1_QUERIES="${3:-1}" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+echo "Scenario 23e: rig Tier-1 bug IS dispatched when HQ also has bugs (ga-3oxo5 AC1)"
+RIG_TIER1_BUG_FX='[{"id":"ps-3oxo5fx","title":"property_scrapers rig bug fixture, 80+ chars to clear the spec floor for dispatch eligibility","priority":0,"issue_type":"bug","description":"fixture body — rig-native Tier-1 bug, long enough to clear the spec floor gate","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]'
+HQ_BUG_FX_23E='[{"id":"tt-hq-bug-23e","title":"HQ bug fixture","priority":1,"issue_type":"bug","description":"fixture body","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}}]'
+LOG23E="$(run_rig_tier1 "$RIG_TIER1_BUG_FX" "$HQ_BUG_FX_23E")"
+if echo "$LOG23E" | grep -q "Lane picks.*ps-3oxo5fx\|WOULD DISPATCH.*ps-3oxo5fx\|Dispatch:.*ps-3oxo5fx\|small: ps-3oxo5fx\|big: ps-3oxo5fx"; then
+  ok "rig Tier-1 bug (ps-3oxo5fx) dispatched even though HQ bug also present — this is the fix, not just wiring"
+else
+  bad "rig Tier-1 bug NOT dispatched when HQ has bugs — ga-3oxo5 regression (the exact starvation this bug reports)"
+fi
+if echo "$LOG23E" | grep -q "ga-3oxo5, unconditional\|Tier-1 rig bug/tech-debt total"; then
+  ok "rig Tier-1 pool was scanned and logged in the PRIMARY merge (not fallback-only, ga-3oxo5)"
+else
+  bad "rig Tier-1 pool scan not logged in primary merge — ga-3oxo5 fix not actually wired into the live sweep"
+fi
+
+echo "Scenario 23f (control, ga-3oxo5 AC3 regression): PILOT_RIG_TIER1_QUERIES=0 disables the new scan cleanly"
+LOG23F="$(run_rig_tier1 "$RIG_TIER1_BUG_FX" "$HQ_BUG_FX_23E" "0")"
+if echo "$LOG23F" | grep -q "ps-3oxo5fx"; then
+  bad "rig Tier-1 bug appeared even with PILOT_RIG_TIER1_QUERIES=0 — the off-switch does not actually disable the scan"
+else
+  ok "PILOT_RIG_TIER1_QUERIES=0 cleanly disables the new scan (deliberate-exclusion capability preserved, ga-3oxo5 AC3)"
+fi
+# HQ's own bug must still dispatch when the rig scan is off — proves the toggle
+# scopes to the NEW pool only, not a wholesale sweep failure.
+if echo "$LOG23F" | grep -q "tt-hq-bug-23e"; then
+  ok "HQ bug still dispatches with the rig Tier-1 scan disabled (toggle is scoped, not a sweep-wide break)"
+else
+  bad "HQ bug did not dispatch with PILOT_RIG_TIER1_QUERIES=0 — the toggle broke more than the rig scan"
 fi
 
 # ── Scenario 24 (gap fix: WA rig step-2b-rig-tier2 must apply full filter chain) ─

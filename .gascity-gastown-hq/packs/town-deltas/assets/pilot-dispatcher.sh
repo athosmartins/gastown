@@ -421,13 +421,24 @@ PILOT_CTX_READY_QUERIES="${PILOT_CTX_READY_QUERIES:-1}"
 # without blocking HQ ctx:ready dispatch). Defaults to inherit PILOT_CTX_READY_QUERIES.
 PILOT_CTX_READY_RIG_QUERIES="${PILOT_CTX_READY_RIG_QUERIES:-$PILOT_CTX_READY_QUERIES}"
 
-# Which rigs the rig ctx:ready scan covers (space-list of rig NAMES). Default
-# "whatsapp_automation" — ga-mfeip's stated scope ("rigs além de whatsapp_automation
-# não faz parte desta entrega"). Set to "all" to scan every non-HQ rig. Scoping this
-# avoids wasted ctx:ready queries against rigs with no dispatchable backlog
-# (property_scrapers/marketing/lexbh/gastown/deacon are empty) → lighter Dolt footprint
-# per sweep. Expand the list deliberately when another rig is dispatch-ready.
-PILOT_CTX_READY_RIGS="${PILOT_CTX_READY_RIGS:-whatsapp_automation}"
+# Which rigs the rig ctx:ready scan (and, ga-3oxo5, the unconditional Tier-1
+# rig bug/tech-debt scan) covers (space-list of rig NAMES). Originally
+# "whatsapp_automation" only — ga-mfeip's stated scope ("rigs além de
+# whatsapp_automation não faz parte desta entrega") — reasoned from
+# marketing/lexbh/gastown/deacon being empty of dispatchable backlog AT THE
+# TIME. property_scrapers added ga-3oxo5 (2026-08-10): VERIFIED it now has
+# real, current backlog (1 open bug in the live rig DB, found via a
+# wa-worker correctly refusing cross-rig-framework bead wa-odbh9) — a static
+# allowlist default is a snapshot of what was true when it was written, not
+# a standing guarantee; this bug's own root cause was exactly that snapshot
+# going stale silently. Set to "all" to scan every non-HQ rig. Scoping this
+# avoids wasted queries against rigs with no dispatchable backlog → lighter
+# Dolt footprint per sweep (ga-7j5vf: Dolt has a measured concurrency knee).
+# Expand the list deliberately when another rig is dispatch-ready — and see
+# Step 2b-rig-tier1's own comment for why a rig outside this list is now
+# logged explicitly instead of silently skipped, so this doesn't go stale
+# unnoticed again.
+PILOT_CTX_READY_RIGS="${PILOT_CTX_READY_RIGS:-whatsapp_automation property_scrapers}"
 
 # Dry-run mode: show what WOULD happen, make zero changes.
 DRY_RUN="${DRY_RUN:-0}"
@@ -5331,6 +5342,99 @@ if [ "$PILOT_WA_RIG_APPROVED_QUERIES" = "1" ]; then
     && log "story:approved rig features total: $WA_RIG_TIER2_COUNT (across all rig DBs, Bug A fix)."
 fi
 
+# ── Step 2b-rig-tier1 (ga-3oxo5): non-HQ rig bugs/tech-debt — UNCONDITIONAL ───
+# Sibling of Step 2b-rig-tier2 immediately above, same fix shape (Bug A fix),
+# for the ONE candidate class that fix never covered: Tier-1 (bug/tech-debt)
+# beads living in a non-HQ rig DB. Before this, those were ONLY ever seen via
+# _scan_rig_fallback_pool's Step 2c fallback below — which only runs when the
+# ENTIRE merge above (TIER1+TIER2+CTXREADY+CTXREADY_RIG+WA_RIG_TIER2) found
+# NOTHING. HQ almost always has SOMETHING, so a rig-native bug/tech-debt bead
+# was invisible on nearly every real sweep — structural starvation for any
+# rig whose backlog is bug/tech-debt-shaped, not feature-shaped. MEASURED:
+# property_scrapers had real Tier-1 work (found via a wa-worker correctly
+# refusing cross-rig-framework bead wa-odbh9 and routing it to the Mayor).
+#
+# Same PILOT_CTX_READY_RIGS scoping as Step 2b-rig-tier2 (default
+# "whatsapp_automation") — deliberately kept, not bypassed: the allowlist
+# exists to bound Dolt query cost per sweep (ga-mfeip), and an unconditional
+# scan is exactly where that cost is paid every cycle, not just when HQ is
+# empty. See PILOT_CTX_READY_RIGS's own comment (~L430) for the updated
+# default, which now includes property_scrapers given this bug's own
+# evidence that the rig has real, current backlog — a static allowlist
+# default is a snapshot of what was true when it was written, not a
+# guarantee it stays true.
+#
+# ga-3oxo5 AC: an active rig outside the allowlist must not go invisible
+# SILENTLY — either it's in scope, or the log says so explicitly. The skip
+# branch below does the latter for every non-HQ rig this scan passes over,
+# once per sweep, so the exact failure mode that produced this bug (a rig
+# quietly starved with zero signal) can't recur unnoticed for a DIFFERENT
+# rig later.
+#
+# Gated by PILOT_RIG_TIER1_QUERIES (default 1); set to 0 in the plist to
+# disable independently. Test seam: PILOT_RIG_TIER1_OVERRIDE, same hermetic-
+# override convention as PILOT_WA_RIG_TIER2_OVERRIDE above.
+RIG_TIER1_JSON="[]"
+RIG_TIER1_UNCOND_COUNT="0"
+PILOT_RIG_TIER1_QUERIES="${PILOT_RIG_TIER1_QUERIES:-1}"
+if [ "$PILOT_RIG_TIER1_QUERIES" = "1" ]; then
+  if [ -n "${PILOT_RIG_TIER1_OVERRIDE+x}" ]; then
+    RIG_TIER1_JSON=$(echo "$PILOT_RIG_TIER1_OVERRIDE" \
+      | _filter_exec_manual | _filter_candidates | _reconcile_text_veto_labels "${GC_CITY}" | _filter_dispatch_gates | _filter_built \
+      | _filter_unblocked "${GC_CITY}" | _filter_explicit_deps "${GC_CITY}")
+  else
+    _rt1_json=""
+    if ! _rt1_json=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json); then
+      warn "gc rig list failed while selecting rigs for the Tier-1 rig-bug/debt scan — rig-side Tier-1 scan skipped this cycle (ga-07rb3)."
+    fi
+    _rt1_rows=$(printf '%s' "$_rt1_json" | jq -r '.rigs[] | select(.hq == false) | "\(.name)\t\(.path)"' 2>/dev/null)
+    while IFS=$'\t' read -r _rt1_name _rt1_path; do
+      [ -z "$_rt1_path" ] || [ ! -d "$_rt1_path" ] && continue
+      # Same scope gate as Step 2b-rig-tier2 — but LOUD on skip (ga-3oxo5 AC),
+      # not silent like the gate at L5198/L5295 that produced this bug.
+      case " $PILOT_CTX_READY_RIGS " in
+        *" all "*) : ;;
+        *" $_rt1_name "*) : ;;
+        *)
+          log "Rig '$_rt1_name' skipped for Tier-1 bug/tech-debt scan — not in PILOT_CTX_READY_RIGS (ga-3oxo5). Add it to the allowlist if this rig has real bug/tech-debt backlog."
+          continue
+          ;;
+      esac
+      _rt1_bugs=$(bd -C "$_rt1_path" list --json -t bug \
+        --exclude-label "story:in-flight" \
+        --exclude-label "story:done" \
+        --exclude-label "gate:passed" \
+        --exclude-label "pilot:dispatching" \
+        --exclude-label "gate:needs-human" \
+        --exclude-label "needs:engine-window" \
+        --exclude-label "pilot:dispatched" \
+        --exclude-type epic \
+        -n 0 2>/dev/null || echo "[]")
+      _rt1_bugs=$(echo "$_rt1_bugs" | _filter_exec_manual | _filter_candidates | _reconcile_text_veto_labels "$_rt1_path" | _filter_dispatch_gates | _filter_built | _filter_unblocked "$_rt1_path" | _filter_explicit_deps "$_rt1_path")
+      _rt1_debt=$(bd -C "$_rt1_path" list --json -l "tech-debt" \
+        --exclude-label "story:in-flight" \
+        --exclude-label "story:done" \
+        --exclude-label "gate:passed" \
+        --exclude-label "pilot:dispatching" \
+        --exclude-label "gate:needs-human" \
+        --exclude-label "needs:engine-window" \
+        --exclude-label "pilot:dispatched" \
+        --exclude-type epic \
+        -n 0 2>/dev/null || echo "[]")
+      _rt1_debt=$(echo "$_rt1_debt" | _filter_exec_manual | _filter_candidates | _reconcile_text_veto_labels "$_rt1_path" | _filter_dispatch_gates | _filter_built | _filter_unblocked "$_rt1_path" | _filter_explicit_deps "$_rt1_path")
+      _rt1_n=$(echo "$_rt1_bugs $_rt1_debt" | jq -s 'add // [] | unique_by(.id) | length' 2>/dev/null || echo "0")
+      if [ "${_rt1_n:-0}" -gt 0 ] 2>/dev/null; then
+        log "Tier-1 (bug/tech-debt) rig DB $_rt1_path: $_rt1_n candidate(s) (ga-3oxo5, unconditional)."
+        RIG_TIER1_JSON=$(echo "$RIG_TIER1_JSON $_rt1_bugs $_rt1_debt" \
+          | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "$RIG_TIER1_JSON")
+      fi
+    done <<< "$_rt1_rows"
+  fi
+  RIG_TIER1_UNCOND_COUNT=$(echo "$RIG_TIER1_JSON" | jq 'length' 2>/dev/null || echo "0")
+  [ "${RIG_TIER1_UNCOND_COUNT:-0}" -gt 0 ] 2>/dev/null \
+    && log "Tier-1 rig bug/tech-debt total: $RIG_TIER1_UNCOND_COUNT (across all allowlisted rig DBs, ga-3oxo5)."
+fi
+
 # Merge all pools into ONE candidate stream (wa-tm2a). dedup by id keeps a bead
 # that somehow matched more than one query from being double-counted. The merge is
 # the UNION — eligibility prefilters were applied identically to each pool above, so
@@ -5338,13 +5442,20 @@ fi
 # decides who goes first. CTXREADY_JSON is "[]" unless PILOT_CTX_READY_QUERIES=1,
 # CTXREADY_RIG_JSON is "[]" unless PILOT_CTX_READY_RIG_QUERIES=1 (ga-mfeip).
 # WA_RIG_TIER2_JSON is "[]" unless PILOT_WA_RIG_APPROVED_QUERIES=1 (Bug A fix).
-ALL_CANDIDATES_JSON=$(echo "$TIER1_JSON $TIER2_JSON $CTXREADY_JSON $CTXREADY_RIG_JSON $WA_RIG_TIER2_JSON" \
+# RIG_TIER1_JSON is "[]" unless PILOT_RIG_TIER1_QUERIES=1 (ga-3oxo5).
+ALL_CANDIDATES_JSON=$(echo "$TIER1_JSON $TIER2_JSON $CTXREADY_JSON $CTXREADY_RIG_JSON $WA_RIG_TIER2_JSON $RIG_TIER1_JSON" \
   | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
 HQ_MERGED_COUNT=$(echo "$ALL_CANDIDATES_JSON" | jq 'length' 2>/dev/null || echo "0")
 if [ "$HQ_MERGED_COUNT" -gt "0" ]; then
-  if [ "$TIER1_COUNT" -gt "0" ] && [ "$TIER2_COUNT" -gt "0" ]; then
+  # ga-3oxo5: this classification is log-text only (see the merge comment
+  # above — "retained ONLY as a hint for downstream log lines"), but a
+  # sweep whose ONLY candidates are rig-side Tier-1 bugs/debt should still
+  # say "bug", not "feature" — fold RIG_TIER1_UNCOND_COUNT into the same
+  # bucket TIER1_COUNT already drives.
+  _bug_total=$(( ${TIER1_COUNT:-0} + ${RIG_TIER1_UNCOND_COUNT:-0} )) || _bug_total=0
+  if [ "${_bug_total:-0}" -gt 0 ] && [ "$TIER2_COUNT" -gt "0" ]; then
     ALL_CANDIDATES_TIER="mixed"
-  elif [ "$TIER1_COUNT" -gt "0" ]; then
+  elif [ "${_bug_total:-0}" -gt 0 ]; then
     ALL_CANDIDATES_TIER="bug"
   else
     ALL_CANDIDATES_TIER="feature"
