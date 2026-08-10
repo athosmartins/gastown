@@ -852,6 +852,57 @@ gap2_arm_needs_remerge() {
   bd -C "$GC_CITY" comment "$bead_id" "ga-pa36 GAP-2 reconciler: sling bead $sling_id gate-passed+closed, but no independent evidence the parent's own fix ($bead_id) is merged into origin/main was found (checked branches fix/$bead_id*, feature/$bead_id*, and sling fix/$sling_id*, feature/$sling_id*). ga-6ync4 fix: never trust sling-passed alone. story:in-flight + pilot:dispatched cleared; gate:needs-fix + gate:needs-remerge set (ga-e2n96: needs-remerge is the distinct re-submission signal — no reviewer ever rejected this code) so Pilot resubmits the existing branch to the gate or escalates, instead of dispatching a builder with an empty brief. (If this parent's delivery is legitimately untracked, apply the delivery:untracked label — see ga-x2x63.)" 2>/dev/null || true
 }
 
+# gap2_apply_pass_verdict <bead_id> <sling_id> <is_story_approved> <verdict> —
+# ga-1un0n: the SHARED terminal action for free:pass-stranded's two
+# affirmative verdicts (close:merge-verified / close:untracked-delivery).
+# Extracted — like gap2_arm_needs_remerge and gap2_free_refused_stranded
+# above — so the selftest can call it directly with a mocked bd() and assert
+# on the ACTUAL label/close calls it makes.
+#
+# Root cause this closes: the OLD code let a story:approved parent skip
+# classify_gap2_bugtask_verdict ENTIRELY and set gate:passed straight off
+# "sling closed, didn't fail" — story:approved is PRODUCT approval, not proof
+# a reviewer ever ran. Measured live TWICE in ~1h (ga-qhca1, ga-x3e7p):
+# gate:passed landed on a parent while its real gate-run was still
+# gate-status:running, no verdict — story-delivery.sh's independent merge
+# verification (ga-mmdm2) is what actually stopped a real merge both times,
+# not this reconciler. Both parent types now reach this function through the
+# IDENTICAL classify_gap2_bugtask_verdict call (see the free:pass-stranded
+# arm below) — only the terminal action differs: a story hands off via
+# gate:passed (story-delivery.sh owns deploy + story:done, and re-verifies
+# merge itself, ga-mmdm2); a bug/task has no further delivery step, so it is
+# closed directly here, unchanged from before.
+#
+# Returns 1 (no-op, no bd calls) for any verdict other than the two close:*
+# ones — a caller must never be able to mistake "I called this with the
+# wrong verdict" for "it acted".
+gap2_apply_pass_verdict() {
+  local bead_id="$1" sling_id="$2" is_story="$3" verdict="$4" reason=""
+  case "$verdict" in
+    close:merge-verified)
+      reason="parent's own fix verified merged into origin/main (ga-6ync4)"
+      ;;
+    close:untracked-delivery)
+      reason="parent carries delivery:untracked (ga-x2x63) — no git artifact is expected by design, so merge verification was skipped and the sling-passed signal is trusted"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  bd -C "$GC_CITY" label remove "$bead_id" "story:in-flight"  -q 2>/dev/null || true
+  bd -C "$GC_CITY" label remove "$bead_id" "pilot:dispatched" -q 2>/dev/null || true
+
+  if [ "$is_story" = "1" ]; then
+    bd -C "$GC_CITY" label add "$bead_id" "gate:passed" -q 2>/dev/null || true
+    bd -C "$GC_CITY" comment "$bead_id" "ga-pa36 GAP-2 reconciler (ga-1un0n): sling bead $sling_id gate-passed and closed, and $reason. story:in-flight + pilot:dispatched cleared; gate:passed set — story-delivery will deploy and mark story:done." 2>/dev/null || true
+  else
+    bd -C "$GC_CITY" close "$bead_id" \
+      -r "ga-pa36 GAP-2 reconciler: sling bead $sling_id gate-passed and closed, and $reason — work is done; closing parent." \
+      2>/dev/null || warn "Could not close parent $bead_id after pass-stranded detection"
+  fi
+}
+
 # check_source_bead_park <space_sep_labels>
 # Pure decision: should the gate park a marker because the source-bead is in a
 # state that must not enter the review cycle?
@@ -2334,137 +2385,132 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
       free:pass-stranded)
         warn "GAP-2: $SC_ID stranded (sling $SLING_ID closed/passed) — freeing lane"
 
-        if echo "$SC_LABELS" | grep -q "story:approved"; then
-          # Story-type parent: set gate:passed so story-delivery finalizes it.
-          bd -C "$GC_CITY" label remove "$SC_ID" "story:in-flight"  -q 2>/dev/null || true
-          bd -C "$GC_CITY" label remove "$SC_ID" "pilot:dispatched" -q 2>/dev/null || true
-          bd -C "$GC_CITY" label add "$SC_ID" "gate:passed" -q 2>/dev/null || true
-          bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: parent stranded after sling bead $SLING_ID gate-passed+closed. story:in-flight + pilot:dispatched cleared; gate:passed set — story-delivery will deploy and mark story:done." 2>/dev/null || true
-        else
-          # Bug/task parent: sling-passed+closed is a done-SIGNAL, not proof the
-          # PARENT's own fix landed (ga-6ync4 — same root flaw as ga-266z8's
-          # story-delivery.sh task reconciler, different code path: trusting a
-          # done-signal instead of an ancestry/content merge check). Verify via
-          # the same branch-lookup + guard_content_merged check GAP-1 already
-          # uses just above (this file) before closing — try the parent's own
-          # id first, then the sling wrapper's id (a fix branch is occasionally
-          # named after the sling task instead of the parent; ga-vokwv precedent
-          # in merged-bead-janitor.sh's sibling sweep).
-          #
-          # ga-x2x63: a parent explicitly labeled delivery:untracked has a
-          # legitimate deliverable that is a git-ignored/untracked file edit (no
-          # worktree, no PR, no branch by design — see ga-liaaj precedent), so no
-          # fix/feature branch could ever exist to find. Skip the branch search
-          # for that case instead of letting it run and find nothing — running
-          # it anyway would collapse "structurally inapplicable" into "checked
-          # and not merged", the exact false-positive this bug reports.
-          #
-          # ga-4tgga: labels are now left UNTOUCHED (not just the verdict — the
-          # actual bd label calls below) until we know we are not simply waiting
-          # on the gate. The old code stripped story:in-flight/pilot:dispatched
-          # unconditionally before any of this ran, so even the "waiting on an
-          # active marker" case let Pilot redispatch a second builder the moment
-          # the strip landed, regardless of what the verdict turned out to be.
-          GAP2_HAS_UNTRACKED_MARKER=0
-          echo "$SC_LABELS" | grep -q "delivery:untracked" && GAP2_HAS_UNTRACKED_MARKER=1
+        # ga-1un0n: story:approved is PRODUCT approval, not proof a reviewer
+        # ever ran — it must NEVER bypass the verification below (it used to:
+        # this branch used to set gate:passed unconditionally the moment a
+        # sling closed without failing, with zero check that any review had
+        # started. Measured live TWICE in ~1h — ga-qhca1, ga-x3e7p — both
+        # times with the real gate-run still gate-status:running, no
+        # verdict). Every parent type now computes the SAME evidence
+        # (untracked-marker / active-marker / merge-ancestry) and reaches the
+        # SAME classify_gap2_bugtask_verdict call; only the terminal action on
+        # an affirmative verdict differs (gate:passed handoff vs. direct
+        # close), decided by gap2_apply_pass_verdict below.
+        GAP2_IS_STORY=0
+        echo "$SC_LABELS" | grep -q "story:approved" && GAP2_IS_STORY=1
 
-          # Check for an ACTIVE gate marker on the parent's OWN fix BEFORE
-          # running the (slower) merge-ancestry search below — same
-          # error-vs-empty shape as the untracked-delivery check above. "Not
-          # yet verified in origin/main" only means "abandoned" if nothing is
-          # currently reviewing it; a marker still ready/queued/claimed/
-          # dispatching/running for this exact source-bead means the fix
-          # simply hasn't finished its turn in the gate queue yet.
-          GAP2_HAS_ACTIVE_MARKER=0
-          GAP2_ACTIVE_HIT=""
-          if [ "$GAP2_HAS_UNTRACKED_MARKER" != "1" ]; then
-            GAP2_ACTIVE_MARKERS_JSON=$(gap2_query_active_markers)
-            GAP2_ACTIVE_HIT=$(gap2_marker_for_bead "$GAP2_ACTIVE_MARKERS_JSON" "$SC_ID")
-            [ -z "$GAP2_ACTIVE_HIT" ] && GAP2_ACTIVE_HIT=$(gap2_marker_for_bead "$GAP2_ACTIVE_MARKERS_JSON" "$SLING_ID")
-            [ -n "$GAP2_ACTIVE_HIT" ] && GAP2_HAS_ACTIVE_MARKER=1
-          fi
+        # sling-passed+closed is a done-SIGNAL, not proof the PARENT's own fix
+        # landed (ga-6ync4 — same root flaw as ga-266z8's story-delivery.sh
+        # task reconciler, different code path: trusting a done-signal
+        # instead of an ancestry/content merge check). Verify via the same
+        # branch-lookup + guard_content_merged check GAP-1 already uses just
+        # above (this file) before closing — try the parent's own id first,
+        # then the sling wrapper's id (a fix branch is occasionally named
+        # after the sling task instead of the parent; ga-vokwv precedent in
+        # merged-bead-janitor.sh's sibling sweep).
+        #
+        # ga-x2x63: a parent explicitly labeled delivery:untracked has a
+        # legitimate deliverable that is a git-ignored/untracked file edit (no
+        # worktree, no PR, no branch by design — see ga-liaaj precedent), so no
+        # fix/feature branch could ever exist to find. Skip the branch search
+        # for that case instead of letting it run and find nothing — running
+        # it anyway would collapse "structurally inapplicable" into "checked
+        # and not merged", the exact false-positive this bug reports.
+        #
+        # ga-4tgga: labels are now left UNTOUCHED (not just the verdict — the
+        # actual bd label calls below) until we know we are not simply waiting
+        # on the gate. The old code stripped story:in-flight/pilot:dispatched
+        # unconditionally before any of this ran, so even the "waiting on an
+        # active marker" case let Pilot redispatch a second builder the moment
+        # the strip landed, regardless of what the verdict turned out to be.
+        GAP2_HAS_UNTRACKED_MARKER=0
+        echo "$SC_LABELS" | grep -q "delivery:untracked" && GAP2_HAS_UNTRACKED_MARKER=1
 
-          GAP2_MERGE_VERIFIED=0
-          if [ "$GAP2_HAS_UNTRACKED_MARKER" = "1" ]; then
-            log "GAP-2: $SC_ID carries delivery:untracked — skipping branch/merge search"
-          elif [ "$GAP2_HAS_ACTIVE_MARKER" = "1" ]; then
-            log "GAP-2: $SC_ID — active gate marker found ($GAP2_ACTIVE_HIT) — skipping branch/merge search, waiting for the gate instead"
-          else
-            GAP2_MAIN_SHA=""
-            git -C "$GC_CITY" fetch origin main --quiet 2>/dev/null || true
-            GAP2_MAIN_SHA=$(git -C "$GC_CITY" rev-parse "origin/main" 2>/dev/null || echo "")
-
-            if [ -n "$GAP2_MAIN_SHA" ]; then
-              for GAP2_TRY_ID in "$SC_ID" "$SLING_ID"; do
-                [ -n "$GAP2_TRY_ID" ] || continue
-                GAP2_BRANCH_SHA=""
-                for GAP2_PAT in "refs/heads/fix/${GAP2_TRY_ID}" "refs/heads/fix/${GAP2_TRY_ID}-*" \
-                           "refs/heads/feature/${GAP2_TRY_ID}" "refs/heads/feature/${GAP2_TRY_ID}-*"; do
-                  GAP2_SHA=$(git -C "$GC_CITY" ls-remote origin "$GAP2_PAT" 2>/dev/null | head -1 | awk '{print $1}')
-                  if [ -z "$GAP2_SHA" ]; then
-                    GAP2_RREF="${GAP2_PAT/refs\/heads\//refs\/remotes\/origin\/}"
-                    GAP2_SHA=$(git -C "$GC_CITY" for-each-ref --format='%(objectname)' "$GAP2_RREF" 2>/dev/null | head -1)
-                  fi
-                  [ -n "$GAP2_SHA" ] && { GAP2_BRANCH_SHA="$GAP2_SHA"; break; }
-                done
-                [ -z "$GAP2_BRANCH_SHA" ] && continue
-
-                if git -C "$GC_CITY" merge-base --is-ancestor "$GAP2_BRANCH_SHA" "$GAP2_MAIN_SHA" 2>/dev/null; then
-                  GAP2_MERGE_VERIFIED=1; break
-                elif guard_content_merged "$GAP2_MAIN_SHA" "$GAP2_BRANCH_SHA"; then
-                  GAP2_MERGE_VERIFIED=1; break
-                fi
-              done
-            else
-              warn "GAP-2: $SC_ID — origin/main SHA unreachable — cannot verify merge; treating as NOT verified (fail-safe)"
-            fi
-          fi
-
-          GAP2_VERDICT=$(classify_gap2_bugtask_verdict "$GAP2_MERGE_VERIFIED" "$GAP2_HAS_UNTRACKED_MARKER" "$GAP2_HAS_ACTIVE_MARKER")
-          case "$GAP2_VERDICT" in
-            close:merge-verified)
-              bd -C "$GC_CITY" label remove "$SC_ID" "story:in-flight"  -q 2>/dev/null || true
-              bd -C "$GC_CITY" label remove "$SC_ID" "pilot:dispatched" -q 2>/dev/null || true
-              bd -C "$GC_CITY" close "$SC_ID" \
-                -r "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed and closed, and parent's own fix verified merged into origin/main (ga-6ync4) — work is done; closing parent." \
-                2>/dev/null || warn "Could not close parent $SC_ID after pass-stranded detection"
-              ;;
-            close:untracked-delivery)
-              bd -C "$GC_CITY" label remove "$SC_ID" "story:in-flight"  -q 2>/dev/null || true
-              bd -C "$GC_CITY" label remove "$SC_ID" "pilot:dispatched" -q 2>/dev/null || true
-              bd -C "$GC_CITY" close "$SC_ID" \
-                -r "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed and closed; parent carries delivery:untracked (ga-x2x63) — no git artifact is expected by design, so merge verification was skipped and the sling-passed signal is trusted; closing parent." \
-                2>/dev/null || warn "Could not close parent $SC_ID after pass-stranded detection (untracked delivery)"
-              ;;
-            wait:active-marker)
-              log "GAP-2: $SC_ID sling $SLING_ID gate-passed+closed, parent's own fix not yet verified in origin/main, but an ACTIVE gate marker ($GAP2_ACTIVE_HIT) is still processing it — not touching labels, waiting for the gate."
-              bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed+closed; parent's own fix not yet independently verified in origin/main, but an ACTIVE quality-gate-marker ($GAP2_ACTIVE_HIT) is currently processing it — still queued for review, not abandoned. No labels changed; will re-check next sweep. (ga-4tgga)" 2>/dev/null || true
-              ;;
-            *)
-              # ga-4tgga race guard: re-check for an active marker RIGHT before
-              # this mutation — the git branch-search above can take several
-              # seconds, wide enough for a fresh submission to land while it
-              # ran. Fail-safe toward NOT touching labels, per the bug's own
-              # cost asymmetry: a wrong redispatch costs a duplicate branch; a
-              # wrongly-skipped sweep costs one more reconciler pass (cheap,
-              # self-corrects next run).
-              GAP2_RECHECK_JSON=$(gap2_query_active_markers)
-              GAP2_RECHECK_HIT=$(gap2_marker_for_bead "$GAP2_RECHECK_JSON" "$SC_ID")
-              [ -z "$GAP2_RECHECK_HIT" ] && GAP2_RECHECK_HIT=$(gap2_marker_for_bead "$GAP2_RECHECK_JSON" "$SLING_ID")
-              if [ -n "$GAP2_RECHECK_HIT" ]; then
-                log "GAP-2: $SC_ID — active marker ($GAP2_RECHECK_HIT) appeared during merge-search — waiting instead of re-arming (race guard)"
-                bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed+closed; an active quality-gate-marker ($GAP2_RECHECK_HIT) for the parent's own fix appeared while this sweep was verifying merge state — treating as in-flight, not abandoned. No labels changed. (ga-4tgga)" 2>/dev/null || true
-              else
-                warn "GAP-2: $SC_ID sling $SLING_ID gate-passed+closed but parent's own fix NOT verified in origin/main (ga-6ync4 — sling-passed is a signal, not proof) — NOT closing; re-arming gate:needs-fix + gate:needs-remerge"
-                # ga-4tgga gate-feedback (attempt 2, blocking): extracted to
-                # gap2_arm_needs_remerge() (lib region above) so this arm's
-                # label-remove calls are independently unit-testable — see
-                # that function's doc-comment for why.
-                gap2_arm_needs_remerge "$SC_ID" "$SLING_ID"
-              fi
-              ;;
-          esac
+        # Check for an ACTIVE gate marker on the parent's OWN fix BEFORE
+        # running the (slower) merge-ancestry search below — same
+        # error-vs-empty shape as the untracked-delivery check above. "Not
+        # yet verified in origin/main" only means "abandoned" if nothing is
+        # currently reviewing it; a marker still ready/queued/claimed/
+        # dispatching/running for this exact source-bead means the fix
+        # simply hasn't finished its turn in the gate queue yet.
+        GAP2_HAS_ACTIVE_MARKER=0
+        GAP2_ACTIVE_HIT=""
+        if [ "$GAP2_HAS_UNTRACKED_MARKER" != "1" ]; then
+          GAP2_ACTIVE_MARKERS_JSON=$(gap2_query_active_markers)
+          GAP2_ACTIVE_HIT=$(gap2_marker_for_bead "$GAP2_ACTIVE_MARKERS_JSON" "$SC_ID")
+          [ -z "$GAP2_ACTIVE_HIT" ] && GAP2_ACTIVE_HIT=$(gap2_marker_for_bead "$GAP2_ACTIVE_MARKERS_JSON" "$SLING_ID")
+          [ -n "$GAP2_ACTIVE_HIT" ] && GAP2_HAS_ACTIVE_MARKER=1
         fi
+
+        GAP2_MERGE_VERIFIED=0
+        if [ "$GAP2_HAS_UNTRACKED_MARKER" = "1" ]; then
+          log "GAP-2: $SC_ID carries delivery:untracked — skipping branch/merge search"
+        elif [ "$GAP2_HAS_ACTIVE_MARKER" = "1" ]; then
+          log "GAP-2: $SC_ID — active gate marker found ($GAP2_ACTIVE_HIT) — skipping branch/merge search, waiting for the gate instead"
+        else
+          GAP2_MAIN_SHA=""
+          git -C "$GC_CITY" fetch origin main --quiet 2>/dev/null || true
+          GAP2_MAIN_SHA=$(git -C "$GC_CITY" rev-parse "origin/main" 2>/dev/null || echo "")
+
+          if [ -n "$GAP2_MAIN_SHA" ]; then
+            for GAP2_TRY_ID in "$SC_ID" "$SLING_ID"; do
+              [ -n "$GAP2_TRY_ID" ] || continue
+              GAP2_BRANCH_SHA=""
+              for GAP2_PAT in "refs/heads/fix/${GAP2_TRY_ID}" "refs/heads/fix/${GAP2_TRY_ID}-*" \
+                         "refs/heads/feature/${GAP2_TRY_ID}" "refs/heads/feature/${GAP2_TRY_ID}-*"; do
+                GAP2_SHA=$(git -C "$GC_CITY" ls-remote origin "$GAP2_PAT" 2>/dev/null | head -1 | awk '{print $1}')
+                if [ -z "$GAP2_SHA" ]; then
+                  GAP2_RREF="${GAP2_PAT/refs\/heads\//refs\/remotes\/origin\/}"
+                  GAP2_SHA=$(git -C "$GC_CITY" for-each-ref --format='%(objectname)' "$GAP2_RREF" 2>/dev/null | head -1)
+                fi
+                [ -n "$GAP2_SHA" ] && { GAP2_BRANCH_SHA="$GAP2_SHA"; break; }
+              done
+              [ -z "$GAP2_BRANCH_SHA" ] && continue
+
+              if git -C "$GC_CITY" merge-base --is-ancestor "$GAP2_BRANCH_SHA" "$GAP2_MAIN_SHA" 2>/dev/null; then
+                GAP2_MERGE_VERIFIED=1; break
+              elif guard_content_merged "$GAP2_MAIN_SHA" "$GAP2_BRANCH_SHA"; then
+                GAP2_MERGE_VERIFIED=1; break
+              fi
+            done
+          else
+            warn "GAP-2: $SC_ID — origin/main SHA unreachable — cannot verify merge; treating as NOT verified (fail-safe)"
+          fi
+        fi
+
+        GAP2_VERDICT=$(classify_gap2_bugtask_verdict "$GAP2_MERGE_VERIFIED" "$GAP2_HAS_UNTRACKED_MARKER" "$GAP2_HAS_ACTIVE_MARKER")
+        case "$GAP2_VERDICT" in
+          close:merge-verified|close:untracked-delivery)
+            gap2_apply_pass_verdict "$SC_ID" "$SLING_ID" "$GAP2_IS_STORY" "$GAP2_VERDICT"
+            ;;
+          wait:active-marker)
+            log "GAP-2: $SC_ID sling $SLING_ID gate-passed+closed, parent's own fix not yet verified in origin/main, but an ACTIVE gate marker ($GAP2_ACTIVE_HIT) is still processing it — not touching labels, waiting for the gate."
+            bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed+closed; parent's own fix not yet independently verified in origin/main, but an ACTIVE quality-gate-marker ($GAP2_ACTIVE_HIT) is currently processing it — still queued for review, not abandoned. No labels changed; will re-check next sweep. (ga-4tgga)" 2>/dev/null || true
+            ;;
+          *)
+            # ga-4tgga race guard: re-check for an active marker RIGHT before
+            # this mutation — the git branch-search above can take several
+            # seconds, wide enough for a fresh submission to land while it
+            # ran. Fail-safe toward NOT touching labels, per the bug's own
+            # cost asymmetry: a wrong redispatch costs a duplicate branch; a
+            # wrongly-skipped sweep costs one more reconciler pass (cheap,
+            # self-corrects next run).
+            GAP2_RECHECK_JSON=$(gap2_query_active_markers)
+            GAP2_RECHECK_HIT=$(gap2_marker_for_bead "$GAP2_RECHECK_JSON" "$SC_ID")
+            [ -z "$GAP2_RECHECK_HIT" ] && GAP2_RECHECK_HIT=$(gap2_marker_for_bead "$GAP2_RECHECK_JSON" "$SLING_ID")
+            if [ -n "$GAP2_RECHECK_HIT" ]; then
+              log "GAP-2: $SC_ID — active marker ($GAP2_RECHECK_HIT) appeared during merge-search — waiting instead of re-arming (race guard)"
+              bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed+closed; an active quality-gate-marker ($GAP2_RECHECK_HIT) for the parent's own fix appeared while this sweep was verifying merge state — treating as in-flight, not abandoned. No labels changed. (ga-4tgga)" 2>/dev/null || true
+            else
+              warn "GAP-2: $SC_ID sling $SLING_ID gate-passed+closed but parent's own fix NOT verified in origin/main (ga-6ync4 — sling-passed is a signal, not proof) — NOT marking gate:passed/closing; re-arming gate:needs-fix + gate:needs-remerge"
+              # ga-4tgga gate-feedback (attempt 2, blocking): extracted to
+              # gap2_arm_needs_remerge() (lib region above) so this arm's
+              # label-remove calls are independently unit-testable — see
+              # that function's doc-comment for why.
+              gap2_arm_needs_remerge "$SC_ID" "$SLING_ID"
+            fi
+            ;;
+        esac
         ;;
       skip:live-assignee)
         log "GAP-2: $SC_ID has live assignee ($SC_ASSIGNEE) — safe-skip"

@@ -59,6 +59,7 @@ type classify_gap2_bugtask_verdict >/dev/null 2>&1 || { echo "FATAL: classify_ga
 type gap2_query_active_markers     >/dev/null 2>&1 || { echo "FATAL: gap2_query_active_markers not defined by guard (ga-4tgga)"; exit 1; }
 type gap2_marker_for_bead          >/dev/null 2>&1 || { echo "FATAL: gap2_marker_for_bead not defined by guard (ga-4tgga)"; exit 1; }
 type gap2_arm_needs_remerge        >/dev/null 2>&1 || { echo "FATAL: gap2_arm_needs_remerge not defined by guard (ga-4tgga attempt 3)"; exit 1; }
+type gap2_apply_pass_verdict       >/dev/null 2>&1 || { echo "FATAL: gap2_apply_pass_verdict not defined by guard (ga-1un0n)"; exit 1; }
 type gap2_refused_token            >/dev/null 2>&1 || { echo "FATAL: gap2_refused_token not defined by guard (ga-eu75w)"; exit 1; }
 type gap2_free_refused_stranded    >/dev/null 2>&1 || { echo "FATAL: gap2_free_refused_stranded not defined by guard (ga-eu75w)"; exit 1; }
 type open_verdict_ids_from_json    >/dev/null 2>&1 || { echo "FATAL: open_verdict_ids_from_json not defined by guard (ga-g4m18)"; exit 1; }
@@ -700,6 +701,122 @@ grep -q 'free:refused-stranded)' "$GUARD" \
 grep -q 'gap2_free_refused_stranded "\$SC_ID" "\$SLING_ID" "\$SLING_REFUSED_TOKEN"' "$GUARD" \
   && ok "the free:refused-stranded arm actually calls gap2_free_refused_stranded" \
   || bad "gap2_free_refused_stranded is defined but the case-statement arm never calls it"
+
+# ── 6g. gap2_apply_pass_verdict (ga-1un0n: story:approved must not bypass verification) ──
+# Root incident (measured live, 2026-08-09/10, TWICE in ~1h — ga-qhca1, ga-x3e7p):
+# the free:pass-stranded arm's story:approved branch set gate:passed straight
+# off "sling closed, didn't fail" — story:approved is PRODUCT approval, not
+# proof a reviewer ever ran. Both times the real gate-run was still
+# gate-status:running with NO verdict when gate:passed landed on the parent.
+# gap2_apply_pass_verdict is the new SHARED terminal action both parent types
+# must route through, and it must never be the thing deciding whether
+# verification happened — it only decides what to do with a verdict the
+# caller already computed identically for every type.
+echo "── 6g. gap2_apply_pass_verdict (ga-1un0n: story:approved must not bypass verification) ──"
+
+GC_CITY=/tmp/ga-1un0n-fake-city
+
+GAP1UN0N_STORY_MERGED="$(mktemp)"
+bd() { printf '%s\n' "$*" >> "$GAP1UN0N_STORY_MERGED"; return 0; }
+gap2_apply_pass_verdict "ga-fake-story" "ga-fake-sling" 1 "close:merge-verified"
+unset -f bd
+grep -qF -- "-C $GC_CITY label add ga-fake-story gate:passed" "$GAP1UN0N_STORY_MERGED" \
+  && ok "story:approved + merge-verified → gate:passed IS set" \
+  || bad "story:approved + merge-verified did NOT set gate:passed"
+grep -qF -- "-C $GC_CITY close ga-fake-story" "$GAP1UN0N_STORY_MERGED" \
+  && bad "REGRESSION: story parent was bd-closed directly — story-delivery.sh would never run" \
+  || ok "story:approved + merge-verified does NOT close the parent directly (story-delivery finalizes it)"
+rm -f "$GAP1UN0N_STORY_MERGED"
+
+GAP1UN0N_BUGTASK_MERGED="$(mktemp)"
+bd() { printf '%s\n' "$*" >> "$GAP1UN0N_BUGTASK_MERGED"; return 0; }
+gap2_apply_pass_verdict "ga-fake-bug" "ga-fake-sling" 0 "close:merge-verified"
+unset -f bd
+grep -qF -- "-C $GC_CITY close ga-fake-bug" "$GAP1UN0N_BUGTASK_MERGED" \
+  && ok "non-story + merge-verified → parent IS closed directly (unchanged legacy behavior)" \
+  || bad "non-story + merge-verified did NOT close the parent"
+grep -qF -- "gate:passed" "$GAP1UN0N_BUGTASK_MERGED" \
+  && bad "REGRESSION: non-story parent got gate:passed — that label is story-delivery's trigger, not a bug/task's" \
+  || ok "non-story + merge-verified never touches gate:passed"
+rm -f "$GAP1UN0N_BUGTASK_MERGED"
+
+GAP1UN0N_STORY_UNTRACKED="$(mktemp)"
+bd() { printf '%s\n' "$*" >> "$GAP1UN0N_STORY_UNTRACKED"; return 0; }
+gap2_apply_pass_verdict "ga-fake-story2" "ga-fake-sling2" 1 "close:untracked-delivery"
+unset -f bd
+grep -qF -- "-C $GC_CITY label add ga-fake-story2 gate:passed" "$GAP1UN0N_STORY_UNTRACKED" \
+  && ok "story:approved + untracked-delivery → gate:passed IS set (ga-x2x63 path preserved for stories)" \
+  || bad "story:approved + untracked-delivery did NOT set gate:passed"
+rm -f "$GAP1UN0N_STORY_UNTRACKED"
+
+# THE regression fixture: neither "wait" nor "keep" is a close verdict —
+# gap2_apply_pass_verdict must be a pure no-op (zero bd calls, non-zero
+# return) if ever called with one, regardless of is_story. This is the exact
+# shape of the live incident: at the moment GAP-2 swept, the real verdict was
+# wait:active-marker (a marker existed, ready/queued, not yet claimed) — never
+# close:*. The OLD code never even computed a verdict for stories, so nothing
+# could ever distinguish this from close:merge-verified.
+GAP1UN0N_NOOP_CALLS="$(mktemp)"
+bd() { printf '%s\n' "$*" >> "$GAP1UN0N_NOOP_CALLS"; return 0; }
+gap2_apply_pass_verdict "ga-fake-story3" "ga-fake-sling3" 1 "wait:active-marker"      && NOOP_RC1=0 || NOOP_RC1=$?
+gap2_apply_pass_verdict "ga-fake-story4" "ga-fake-sling4" 1 "keep:merge-not-verified" && NOOP_RC2=0 || NOOP_RC2=$?
+unset -f bd
+if [ -s "$GAP1UN0N_NOOP_CALLS" ]; then
+  bad "REGRESSION ga-1un0n: gap2_apply_pass_verdict made a bd call for a non-close verdict — got: $(cat "$GAP1UN0N_NOOP_CALLS")"
+else
+  ok "gap2_apply_pass_verdict makes ZERO bd calls for wait:active-marker / keep:merge-not-verified — story:approved cannot force gate:passed on an unverified/still-reviewing parent"
+fi
+if [ "$NOOP_RC1" != "0" ] && [ "$NOOP_RC2" != "0" ]; then
+  ok "gap2_apply_pass_verdict signals non-success (rc!=0) on a non-close verdict, so a caller cannot mistake this for having acted"
+else
+  bad "gap2_apply_pass_verdict returned rc=0 on a non-close verdict"
+fi
+rm -f "$GAP1UN0N_NOOP_CALLS"
+
+# ── 6h. drift-guard: the OLD unconditional story:approved bypass is gone (ga-1un0n) ──
+echo "── 6h. drift-guard: GAP-2 story:approved must reach the SAME verification (ga-1un0n) ──"
+
+type gap2_apply_pass_verdict >/dev/null 2>&1 \
+  && ok "guard defines gap2_apply_pass_verdict (ga-1un0n)" \
+  || bad "guard missing gap2_apply_pass_verdict def"
+
+# Isolate the free:pass-stranded arm's own source text (from its case-label to
+# the next sibling arm) so these assertions cannot accidentally match some
+# UNRELATED story:approved / classify_gap2_bugtask_verdict occurrence
+# elsewhere in this 3000+ line file.
+GAP1UN0N_ARM_TEXT="$(awk '/^      free:pass-stranded\)/{flag=1} flag{print} /^      skip:live-assignee\)/{exit}' "$GUARD")"
+
+if [ -z "$GAP1UN0N_ARM_TEXT" ]; then
+  bad "could not isolate the free:pass-stranded arm's source text — drift-guard cannot run"
+else
+  ok "isolated the free:pass-stranded arm's source text ($(echo "$GAP1UN0N_ARM_TEXT" | wc -l | tr -d ' ') lines)"
+
+  # THE regression lock: the OLD bug's exact branching construct — an if/else
+  # that made classify_gap2_bugtask_verdict reachable ONLY on the else
+  # (non-story) side — must be gone. story:approved may still be READ (to
+  # pick the terminal action), just never used to SKIP verification.
+  if echo "$GAP1UN0N_ARM_TEXT" | grep -q 'if echo "\$SC_LABELS" | grep -q "story:approved"; then'; then
+    bad "REGRESSION ga-1un0n: the free:pass-stranded arm still branches on story:approved BEFORE verification — the exact bypass this bead reports"
+  else
+    ok "the free:pass-stranded arm no longer gates verification behind an if/else on story:approved"
+  fi
+
+  [ "$(echo "$GAP1UN0N_ARM_TEXT" | grep -c 'classify_gap2_bugtask_verdict "')" -eq 1 ] \
+    && ok "classify_gap2_bugtask_verdict is called EXACTLY once — one verification path for every parent type" \
+    || bad "expected exactly 1 classify_gap2_bugtask_verdict call site in this arm — got $(echo "$GAP1UN0N_ARM_TEXT" | grep -c 'classify_gap2_bugtask_verdict "') (verification path may have been duplicated or is still branch-specific)"
+
+  echo "$GAP1UN0N_ARM_TEXT" | grep -q 'gap2_apply_pass_verdict "\$SC_ID" "\$SLING_ID" "\$GAP2_IS_STORY"' \
+    && ok "the close:merge-verified|close:untracked-delivery arm actually calls gap2_apply_pass_verdict, passing the computed story flag" \
+    || bad "gap2_apply_pass_verdict is defined but the case-statement arm never calls it with the computed story flag"
+
+  # The OLD literal bug line: an UNCONDITIONAL gate:passed write keyed
+  # directly off $SC_ID, outside of any verdict-gated function. If this
+  # reappears anywhere in the arm, the bypass is back regardless of what
+  # else changed.
+  echo "$GAP1UN0N_ARM_TEXT" | grep -q 'label add "\$SC_ID" "gate:passed"' \
+    && bad "REGRESSION ga-1un0n: found an UNGATED 'label add \$SC_ID gate:passed' directly in the sweep — this is the exact bypass line the bug reports" \
+    || ok "no ungated gate:passed write remains in the sweep — it only happens inside the verdict-gated gap2_apply_pass_verdict"
+fi
 
 # ── 7. drift-guard: guard implements both GAP-1 and GAP-2 sweeps ──────────────
 echo "── 7. drift-guard: guard implements ga-pa36 GAP-1 + GAP-2 sweeps ──"
