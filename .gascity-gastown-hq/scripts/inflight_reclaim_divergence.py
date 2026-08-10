@@ -55,8 +55,27 @@ def fetch_sessions():
 
 def fetch_assigned_open_beads():
     """HQ + todos os rig stores (ga-mfeip pattern — mesma cobertura que
-    list_inflight_beads/list_stranded_inprogress_beads usam), não só HQ."""
-    stores = [(None, None)] + list(irg._list_rig_stores() or [])
+    list_inflight_beads/list_stranded_inprogress_beads usam), não só HQ.
+
+    ga-x3e7p GATE-FAIL (attempt 4, gate_run=ga-521y0): `_list_rig_stores() or
+    []` collapsed its documented 3-state contract (list on success / None
+    specifically when `gc rig list` failed) into a silent "proceed HQ-only"
+    — indistinguishable from a genuine zero-extra-rigs success, and unlike
+    the two sibling failure paths a few lines below (HQ bd-list failure
+    raises SystemExit(2); per-rig bd-list failure prints a ⚠️ warning), this
+    path emitted NOTHING. Verified by execution (monkeypatched
+    _list_rig_stores to return None, ran this function for real): silently
+    returned HQ-only beads with zero stderr output — main() could then print
+    "zero divergência ... sobre todas as beads abertas" having actually
+    audited only 1 of 6+ rig stores. Fixed: None is now its own branch with
+    an explicit warning, matching the per-rig failure's own visibility
+    convention, before falling back to HQ-only."""
+    _rig_stores = irg._list_rig_stores()
+    if _rig_stores is None:
+        print("⚠️  gc rig list falhou — comparação cobre SOMENTE HQ (rig stores indisponíveis)",
+              file=sys.stderr)
+        _rig_stores = []
+    stores = [(None, None)] + list(_rig_stores)
     all_beads = []
     for rig_name, rig_path in stores:
         cmd = ["bd"] + (["-C", rig_path] if rig_path else []) + [
