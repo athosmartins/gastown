@@ -1842,10 +1842,21 @@ def _close_pending_verdicts_for_run(rid, reason, context):
     r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "--limit", "0", "--include-infra",
             "-l", "gate-run:%s" % rid, "--json"])  # ga-h199q — same query shape as _run_pending_reviewers
     if not r or r.returncode != 0:
-        return closed  # fail-safe: never guess which verdicts are pending
+        # ga-9as9h self-audit: a query FAILURE and "queried fine, nothing open"
+        # both return [] below — that collapse is safe (both mean "close
+        # nothing"), but silent for the failure case would hide it from
+        # anyone reading the sweep log trying to explain why a stale verdict
+        # WASN'T reclaimed. Print, matching this file's own convention for
+        # every other fail-safe query skip (e.g. reap_hung_runs' "gate-run
+        # query unavailable — fail-safe skip").
+        print("[watchdog] %s: gate-run:%s verdict query failed — fail-safe skip (no blind close)"
+              % (context, rid), flush=True)
+        return closed
     try:
         rows = json.loads(r.stdout) or []
     except Exception:
+        print("[watchdog] %s: gate-run:%s verdict query returned unparseable JSON — fail-safe skip"
+              % (context, rid), flush=True)
         return closed
     for row in rows:
         vid = row.get("id")
