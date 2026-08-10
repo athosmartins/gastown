@@ -2260,7 +2260,16 @@ if [ "$ORPHAN_VERDICT_COUNT" -gt 0 ]; then
 
     OV_PARENT_STATE="unknown"
     if [ "$OV_HAS_GR_LABEL" = "1" ]; then
-      OV_GR_RAW=$(bd -C "$GC_CITY" show "$OV_GR_ID" --json 2>/dev/null)
+      # ga-qtc16 gate-fix (attempt 2): bare `VAR=$(bd show ...)` aborted the
+      # WHOLE script under `set -euo pipefail` the moment the parent gate-run
+      # was genuinely not found (bd show exit 1) — the exact case Step 0b.2
+      # exists to detect, so it recurred every sweep with any orphan queued.
+      # `|| true` is this file's own established idiom for this shape (see
+      # line ~3042's near-identical `bd show <id> --json ... || true`): the
+      # assignment still captures whatever stdout bd produced on either exit
+      # code (the not-found error envelope `{"error": ...}` parses as a JSON
+      # object same as before), only the abort-on-nonzero-exit is removed.
+      OV_GR_RAW=$(bd -C "$GC_CITY" show "$OV_GR_ID" --json 2>/dev/null) || true
       if printf '%s' "$OV_GR_RAW" | jq -e 'type == "object" or type == "array"' >/dev/null 2>&1; then
         OV_GR_FOUND_ID=$(printf '%s' "$OV_GR_RAW" | jq -r 'if type=="array" then (.[0].id // empty) else (.id // empty) end' 2>/dev/null)
         if [ -n "$OV_GR_FOUND_ID" ]; then
