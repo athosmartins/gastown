@@ -2104,7 +2104,7 @@ resolve_recycled_author() {
   fi
 }
 
-# resolve_rebase_author <trusted_submit_author> <branch> <marker_self_declared_author>
+# resolve_rebase_author <trusted_submit_author> <branch> <marker_self_declared_author> [<branch_commit_author>]
 # ga-6dp9 (bug 1 of 3): the rebase-path liveness check must be keyed on WHO
 # ACTUALLY WROTE the branch, not on the source bead's CURRENT assignee/owner —
 # that can be reassigned to an unrelated PM/babysitter long after the branch
@@ -2113,6 +2113,22 @@ resolve_recycled_author() {
 # owner was peter-wa, who never touched the branch; the real (already-dead)
 # author was an ephemeral wa-worker build. Treating peter-wa's liveness as
 # "the author is alive, wait" stalled the marker in an infinite retry.
+#
+# ga-gxbxu: <branch_commit_author> — the git commit-author NAME on the
+# branch's own tip (from branch_tip_commit_author, below) — now OUTRANKS
+# <trusted_submit_author> when present. <trusted_submit_author> answers "who
+# ran /gate-done"; this check needs "who could be pushing THIS BRANCH right
+# now", and those two diverge whenever a THIRD party (a rescue/resubmission
+# marker) submits on someone else's already-pushed branch. Measured live:
+# marker ga-ikk0i, gate.submitted_by=gastown__mayor (67-day uptime,
+# functionally immortal — "author alive" could never turn false), but every
+# one of the branch's own 5 commits was authored by gastown.dog-1 (already
+# exited). The branch waited forever for a push race that was never going to
+# happen — Mayor was never going to push it. gate.submitted_by remains the
+# identity used for AUTHORIZATION/AUDIT elsewhere (AUTHOR/AUTHOR_TRUSTED_SUBMIT
+# above are untouched by this change) — this function's output feeds ONLY the
+# rebase-liveness decision. Optional and last-positioned so every existing
+# 3-arg call site/test keeps its exact pre-ga-gxbxu behavior unchanged.
 #
 # <trusted_submit_author> is AUTHOR as resolved from the marker's
 # gate.submitted_by METADATA (set by the guard at the ACTUAL /gate-done
@@ -2132,7 +2148,11 @@ resolve_recycled_author() {
 # are available; author_is_alive("") is 0 (dead) — the FAIL-SAFE direction
 # (bounded-retry-then-escalate, never wait-forever on a phantom "live" author).
 resolve_rebase_author() {
-  local trusted="${1:-}" branch="${2:-}" marker_author="${3:-}"
+  local trusted="${1:-}" branch="${2:-}" marker_author="${3:-}" commit_author="${4:-}"
+  if [ -n "$commit_author" ] && [ "$commit_author" != "null" ]; then
+    printf '%s' "$commit_author"
+    return 0
+  fi
   if [ -n "$trusted" ] && [ "$trusted" != "null" ]; then
     printf '%s' "$trusted"
     return 0
@@ -2815,6 +2835,35 @@ branch_tip_is_merge_commit() {
   else
     printf '0'
   fi
+}
+
+# branch_tip_commit_author <branch_ref> — echoes the git commit-author NAME
+# (`%an`) of <branch_ref>'s tip commit, or "" if the ref cannot be resolved.
+# ga-gxbxu: resolve_rebase_author()'s rebase-liveness check needs to know WHO
+# ACTUALLY WROTE the branch — the one identity that could plausibly still be
+# pushing to it — never who SUBMITTED it to the gate (gate.submitted_by).
+# Those two normally coincide (a builder runs /gate-done for its own branch)
+# but diverge whenever a third party (a rescue marker, a resubmission) runs
+# /gate-done on someone else's already-pushed branch: gate.submitted_by then
+# correctly names the submitter for AUTHORIZATION/AUDIT but is the WRONG
+# signal for "is someone live who could be pushing this branch right now" — a
+# long-lived submitting session (e.g. the Mayor, 67-day uptime observed) reads
+# as permanently alive, and the branch waits forever for a push race that was
+# never going to happen. The branch's own git history is the one signal that
+# cannot be reassigned/misattributed after the fact — same reasoning
+# branch_tip_is_merge_commit above already relies on git_rig for. Gas Town
+# commits carry the committing agent's own alias as GIT_AUTHOR_NAME (verified:
+# `git log` on this repo shows author "gastown.dog-1", not a human name), so
+# `%an` lands in the exact identity namespace author_is_alive() already
+# matches against (session_name/name/alias/id/agent_name).
+# Fails toward "" (unresolvable) on any error — resolve_rebase_author's own
+# fallback chain (trusted submitter, then crew branch segment, then marker
+# self-declared author) already handles that case; this function never
+# guesses.
+branch_tip_commit_author() {
+  local branch_ref="${1:-}"
+  [ -z "$branch_ref" ] && { printf ''; return 0; }
+  git_rig log -1 --format='%an' "$branch_ref" 2>/dev/null || printf ''
 }
 
 # ── ga-y9a1d: BRANCH-CONTENT-COHERENCE (the merge-time safety net) ───────────
@@ -7413,7 +7462,15 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     # ga-pyzo/ga-ipf6 wiring unchanged (restored below, gate-fix-1: an
     # earlier revision of this fix accidentally repurposed that wiring for
     # the liveness decision instead of duplicating it — see the block below).
-    REBASE_AUTHOR=$(resolve_rebase_author "$AUTHOR_TRUSTED_SUBMIT" "$BRANCH" "$MARKER_AUTHOR")
+    #
+    # ga-gxbxu: resolve the branch's own git commit-author BEFORE the trusted
+    # submitter, from $BRANCH_SHA (already hardened/resolved above) — see
+    # branch_tip_commit_author()/resolve_rebase_author() for why: the
+    # /gate-done SUBMITTER (gate.submitted_by/$AUTHOR_TRUSTED_SUBMIT) is the
+    # wrong identity for "who could be pushing this branch right now" whenever
+    # a third party submits on someone else's branch.
+    REBASE_BRANCH_COMMIT_AUTHOR=$(branch_tip_commit_author "$BRANCH_SHA")
+    REBASE_AUTHOR=$(resolve_rebase_author "$AUTHOR_TRUSTED_SUBMIT" "$BRANCH" "$MARKER_AUTHOR" "$REBASE_BRANCH_COMMIT_AUTHOR")
 
     # ga-ipf6: unified with FAIL_AUTHOR_ALIVE via author_is_alive() — the old
     # inline predicate here (alias/name/agent only, no session_name) never

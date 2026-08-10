@@ -961,7 +961,7 @@ fi
 echo "Scenario 3e2: a pilot:held bead is excluded from the candidate pool (durable worker release)"
 _FC_FN="$(grep '^log()' "$DISPATCHER")
 $(sed -n '/^_log_exclusions() {/,/^}$/p' "$DISPATCHER")
-$(awk '/^_FILTER_PREAPPROVAL_LABELS=/{print} /^_FILTER_RECLAIM_CAP=/{print} /^_filter_candidates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+$(awk '/^_FILTER_PREAPPROVAL_LABELS=/{print} /^_FILTER_RECLAIM_CAP=/{print} /^_PILOT_ENGINE_REBUILD_RE=/{print} /^_filter_candidates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
 _fc() { ( eval "$_FC_FN"; SELF_BEAD_ID=""; echo "$1" | _filter_candidates | jq -rc '[.[].id]' ); }
 HELD='[{"id":"bd-held","assignee":null,"labels":["story:approved","pilot:held"],"description":"x"},{"id":"bd-free","assignee":null,"labels":["story:approved"],"description":"x"}]'
 [ "$(_fc "$HELD")" = '["bd-free"]' ] && ok "pilot:held bead excluded; free story:approved kept (durable release holds)" || bad "pilot:held not excluded (got: $(_fc "$HELD"))"
@@ -4744,8 +4744,8 @@ has "$DISPATCHER" '_filter_dispatch_gates | _filter_built' "_filter_built applie
 # story:approved) and exec:manual bugs (ga-v3o6i) leak in, get picked first by priority, are
 # REFUSED by the ownership guard, and head-of-line-block the lane so lower-priority rig work
 # (ps-mrfb/ps-joc0) starves. Contiguous (escaped) match so it can't pass on a partial chain.
-has "$DISPATCHER" '_filter_exec_manual \| _filter_candidates \| _filter_dispatch_gates \| _filter_built \| _filter_unblocked "\$rig_path"' \
-  "HQ-empty rig FALLBACK applies the full filter chain (exec_manual+dispatch_gates+built) — HOL-block + exec:manual leak fix"
+has "$DISPATCHER" '_filter_exec_manual \| _filter_candidates \| _reconcile_text_veto_labels "\$rig_path" \| _filter_dispatch_gates \| _filter_built \| _filter_unblocked "\$rig_path"' \
+  "HQ-empty rig FALLBACK applies the full filter chain (exec_manual+dispatch_gates+built) — HOL-block + exec:manual leak fix (ga-qt0mj: chain now also reconciles pilot:text-veto:* between candidates and dispatch-gates)"
 # NEVERSTARTED release MUST clear the dead worker's assignee — _filter_candidates requires an
 # empty assignee, so a bead released back to story:approved while still carrying its drained
 # builder's assignee is INVISIBLE to every candidate query forever (ps-mrfb/ps-joc0 stuck behind
@@ -5334,8 +5334,8 @@ fi
 
 # ── Scenario 24d: structural — full filter chain wired in the override seam ──
 echo "Scenario 24d: structural — _filter_exec_manual + _filter_dispatch_gates wired in WA rig tier-2"
-if grep -qF '_filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built' "$DISPATCHER"; then
-  ok "_filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built found in dispatcher (full chain)"
+if grep -qF '_filter_exec_manual | _filter_candidates | _reconcile_text_veto_labels "${GC_CITY}" | _filter_dispatch_gates | _filter_built' "$DISPATCHER"; then
+  ok "_filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built found in dispatcher (full chain; ga-qt0mj: now also reconciles pilot:text-veto:* in between)"
 else
   bad "Full filter chain NOT found in dispatcher — WA rig tier-2 gap fix may be incomplete"
 fi
@@ -5415,8 +5415,8 @@ fi
 
 # ── Scenario 25d: structural — TIER2 now applies the full gate chain ──────────
 echo "Scenario 25d: structural — HQ TIER2 filter chain now includes _filter_exec_manual + _filter_dispatch_gates + _filter_built"
-if grep -qF 'TIER2_JSON=$(echo "$TIER2_JSON" | _filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built)' "$DISPATCHER"; then
-  ok "HQ TIER2 filter chain includes full gate set (_filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built)"
+if grep -qF 'TIER2_JSON=$(echo "$TIER2_JSON" | _filter_exec_manual | _filter_candidates | _reconcile_text_veto_labels "$GC_CITY" | _filter_dispatch_gates | _filter_built)' "$DISPATCHER"; then
+  ok "HQ TIER2 filter chain includes full gate set (_filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built; ga-qt0mj: now also reconciles pilot:text-veto:* in between)"
 else
   bad "HQ TIER2 filter chain does NOT include full gate set — gate (b) regression on HQ TIER2"
 fi
@@ -6110,6 +6110,7 @@ echo "Scenario ga-uvfs6: _filter_candidates recognizes pilot:refused-reason:* sa
 _FC_UVFS6="$(grep '^log()' "$DISPATCHER")
 $(grep '^_FILTER_PREAPPROVAL_LABELS=' "$DISPATCHER")
 $(grep '^_FILTER_RECLAIM_CAP=' "$DISPATCHER")
+$(grep '^_PILOT_ENGINE_REBUILD_RE=' "$DISPATCHER")
 $(sed -n '/^_log_exclusions() {/,/^}$/p' "$DISPATCHER")
 $(awk '/^_filter_candidates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
 

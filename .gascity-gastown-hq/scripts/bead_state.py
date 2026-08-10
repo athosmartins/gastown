@@ -62,6 +62,49 @@ PARK_PREFIXES = (
     "gate:needs-human",
     "needs-human",   # bare, sem prefixo gate:/story: — usado p/ bugs/tech-debt (ga-3lsy1)
     "waiting-on:", "depends-on:",
+    # ga-98inr: absorvido de park_labels.py (ga-hzt8s, 2026-07-20) — um SEGUNDO
+    # módulo "canônico" que já consolidava 3 consumidores e que este módulo não
+    # conhecia. Da lista original do park_labels.py, só "next-action:" era
+    # genuinamente NOVA aqui — "gate:needs-human"/"needs:engine-window"/
+    # "waiting-on:" já estavam cobertas acima (linhas 50/62/64), e "pilot:held"
+    # (bare, como PREFIXO) foi DELIBERADAMENTE removida de novo durante o rebase
+    # com ga-98inr (2026-08-10): reintroduzia exatamente a colisão com
+    # pilot:held-count:<slug>:<n> que o comentário de PARK_EXACT abaixo já
+    # documenta como "o achado mais urgente da sessão" (mergeado 884e8a670) —
+    # como PREFIXO, "pilot:held" casa "pilot:held-count:..." também, prendendo
+    # a bead em 'parked' pra sempre; como EXACT (única forma correta, já
+    # presente em PARK_EXACT), casa só o label bare. "next-action:" leva ":"
+    # porque toda ocorrência medida na população viva (09/08) era sufixada por
+    # ":" — só next-action:athos é exceção, e ATHOS_TURN/branch 3 já intercepta
+    # ela antes deste branch.
+    "next-action:",
+    # ga-98inr, gate_run=ga-wdl56 (fix-attempt 2): _canonical_is_braked() em
+    # throughput-stall-watchdog.py assumia este módulo era SUPERSET de
+    # park_labels.py's BLOCKED_FAMILY_LABELS — falso. Reviewer mediu 4 formas
+    # reais que só o antigo _bead_is_braked() (label_matches: exato, ou
+    # sufixo ":"/"-") reconhecia: {story:approved, blocked},
+    # {..., blocked-on}, {..., blocked-on-external},
+    # {..., blocked-reason:capacity} — PARK_PREFIXES só tinha "blocked:"/
+    # "blocked-on:"/"blocked-by:" (sufixo ":" apenas); a forma bare e a
+    # dash-sufixada não batiam. "blocked" bare aqui replica o MESMO idiom já
+    # usado acima p/ "gate:needs-human"/"needs-human" (startswith cru cobre
+    # exato + ":..." + "-..." num só entry) — cobre "blocked", "blocked-on",
+    # "blocked-on-external" e "blocked-reason:capacity" de uma vez (o "-"
+    # de "blocked-" já é prefixo de todos). "blocked-reason:decision"
+    # continua indo pro Athos: ATHOS_TURN (regra 3) roda ANTES desta regra 4,
+    # então só as OUTRAS variantes de blocked-reason: caem aqui. Confirmado
+    # NÃO redundante com o exact "story:blocked" (linha ~100): esse cobre só
+    # a forma com prefixo "story:", que "blocked" bare (sem "story:") não
+    # alcança.
+    "blocked",
+    # ga-98inr, idem — 5ª forma do mesmo achado: {story:approved,
+    # needs:rehome-property}. "needs:rehome-property" é label REAL, citado
+    # pelo nome no próprio docstring de _bead_is_braked em throughput-stall-
+    # watchdog.py — não tinha NENHUMA entrada aqui (nem prefixo nem exact).
+    # Zero beads na população viva carregam esta forma hoje (medido 10/08),
+    # mas é vocabulário documentado, não hipotético — mesmo padrão de
+    # "confirmado latente, não vivo ainda" do achado do reviewer.
+    "needs:rehome",
 )
 PARK_EXACT = frozenset({
     "framework:engine", "no-auto-dispatch", "pilot:no-auto-dispatch",
@@ -86,6 +129,31 @@ PARK_EXACT = frozenset({
     "engine-window:pending",  # distinto de needs:engine-window (Fase 2 batched
                                # deliberadamente, não bloqueada — nomes quase iguais,
                                # significados opostos)
+    # ga-98inr: absorvido de park_labels.py — 10 ocorrências medidas na
+    # população viva (09/08), sem forma sufixada observada. "story:needs-human"
+    # NÃO é nova aqui (não-blocking, achado pelo reviewer no gate_run=ga-wdl56):
+    # já estava presente linha ~100 desde antes desta fatia (commit cfc0da0882)
+    # — frozenset dedup tornava a duplicata inofensiva, mas o comentário
+    # anterior implicava 2 absorções novas quando só "needs-label-review" é.
+    "needs-label-review",
+})
+# ga-98inr: pilot:reclaim-count:N é um LIMIAR NUMÉRICO, não um label a listar —
+# a mesma lição que park_labels.py já pagou uma vez (ga-hzt8s comment: uma versão
+# anterior deste vocabulário em OUTRO consumidor listava "pilot:reclaim-count:3"
+# como string exata, e um cap alterado teria parado de bater silenciosamente).
+# Mirrors park_labels.py's DEFAULT_RECLAIM_CAP — os dois não têm fonte única
+# entre si (pré-existente, fora do escopo desta fatia; mesma ressalva que
+# park_labels.py já documenta para MAX_RECLAIMS do inflight-reclaim-guard.py).
+RECLAIM_CAP = 3
+# ga-98inr: absorvido de park_labels.py's FLOWING_OR_DONE_LABELS. Um bead JÁ
+# despachado ou finalizado não é backlog ocioso — mas também não é "parked"
+# (que implica um bloqueio a resolver). CASO REAL AO VIVO (09/08): a própria
+# ga-98inr (o bug que absorve este gap) carrega ctx:ready+exec:auto+
+# story:approved+story:in-flight+pilot:dispatched — sem este vocabulário,
+# ARMED (branch 10) venceria e devolveria "ready", reoferecendo ao pool um
+# bead que já está sendo trabalhado. Mesmo padrão em ga-fup3m/ga-x3e7p.
+FLOWING_LABELS = frozenset({
+    "story:in-flight", "pilot:dispatched", "pilot:dispatching", "story:done",
 })
 # Estágios de refino: o bead ainda não é construível.
 UNREFINED = frozenset({
@@ -153,6 +221,48 @@ def _has_prefix(labels, prefixes) -> str | None:
     return None
 
 
+def _labels_after_expired_hold(labels, now):
+    """labels, minus an EXPIRED pilot:held hold — ga-fup3m, absorvido de
+    pilot-missing-route-watchdog.sh (81 refs, seus próprios Scenario 7/8).
+
+    pilot:held (bare) e pilot:held-until:<epoch> são escritos JUNTOS por
+    _mayor_deferred_hold_db (achado por ga-7qsxr). Sem held-until, o hold pareka
+    indefinidamente (comportamento preservado). Com held-until, o hold só continua
+    valendo enquanto o MAIOR timestamp presente ainda não passou — mirrors a lógica
+    'max(held-until) < now' do arquivo-fonte exatamente. now=None (não consultado)
+    NUNCA expira um hold, mesma direção segura que todo outro None neste módulo:
+    todo chamador que não passa now preserva o comportamento de hoje (park
+    indefinido), sem quebra.
+
+    Qualquer OUTRO motivo de park que a bead carregue independentemente do hold
+    continua no conjunto devolvido — só o par pilot:held/pilot:held-until é
+    removido, nunca o resto."""
+    if now is None:
+        return labels
+    until_values = []
+    for l in labels:
+        if l.startswith("pilot:held-until:"):
+            suffix = l[len("pilot:held-until:"):]
+            if suffix.isdigit():
+                until_values.append(int(suffix))
+    if not until_values or max(until_values) >= now:
+        return labels
+    return frozenset(l for l in labels if l != "pilot:held" and not l.startswith("pilot:held-until:"))
+
+
+def _reclaim_exhausted(labels) -> bool:
+    """True sse algum pilot:reclaim-count:N tem N >= RECLAIM_CAP — ga-98inr,
+    mirrors park_labels.py's is_reclaim_exhausted/parse_reclaim_count."""
+    best = 0
+    for l in labels:
+        if l.startswith("pilot:reclaim-count:"):
+            try:
+                best = max(best, int(l.rsplit(":", 1)[1]))
+            except (ValueError, IndexError):
+                pass
+    return best >= RECLAIM_CAP
+
+
 def is_ephemeral(actor: str) -> bool:
     """Worker efêmero NÃO é crew. Confundir os dois foi a causa do 'claude-wa'
     inexistente que quebrou o botão Cutucar (medido 09/08)."""
@@ -172,12 +282,27 @@ def crew_of(actor: str, known_crews: frozenset) -> str | None:
     return base if base in known_crews else None
 
 
+# ga-8lrud: absorvido de inflight-reclaim-guard.py's COORDINATOR_MARKERS/is_coordinator
+# (scripts/inflight-reclaim-guard.py:289-294,1144-1152) — MESMO vocabulário, substring
+# match, não prefixo/exato, de propósito (a guarda original já usa substring e vários
+# consumidores já dependem dessa amplitude via reclaim_liveness.claimant_provably_dead).
+# Papel sempre-ligado: nunca é candidato a "morto comprovado".
+COORDINATOR_MARKERS = ("mayor", "deacon")
+
+
+def is_coordinator(identity: str) -> bool:
+    if not identity:
+        return False
+    return any(marker in identity for marker in COORDINATOR_MARKERS)
+
+
 def holder_is_alive(assignee: str, live_sessions) -> bool | None:
     """O detentor do bead está vivo? True / False / None = NÃO DÁ PRA SABER.
 
-    ⚠️ DOIS ERROS MEDIDOS EM 09/08, os dois produzindo "abandonado" com confiança
-    sobre trabalho VIVO — que é o pior falso-positivo que este módulo pode ter,
-    porque a ação que ele autoriza é RECLAMAR o bead de quem está trabalhando nele.
+    ⚠️ TRÊS ERROS MEDIDOS, todos produzindo "abandonado" com confiança sobre
+    trabalho VIVO (ou, no 3º caso, sobre um papel que nunca "morre") — que é o
+    pior falso-positivo que este módulo pode ter, porque a ação que ele autoriza
+    é RECLAMAR o bead de quem está trabalhando nele.
 
     1. NOME COM SUFIXO. O assignee é o nome do crew (`mila-wa`); a sessão viva
        chama-se `mila-wa-awispm94omdp`. A comparação era `assignee in live_sessions`,
@@ -189,6 +314,20 @@ def holder_is_alive(assignee: str, live_sessions) -> bool | None:
        ERRADO. Por isso `live_sessions=None` agora significa NÃO CONSULTEI, é distinto
        de `frozenset()` = CONSULTEI E NÃO HÁ NINGUÉM, e só o segundo pode concluir
        "abandonado".
+    3. COORDENADOR SEM PROTEÇÃO (ga-8lrud, absorvido de inflight-reclaim-guard.py's
+       is_coordinator()/COORDINATOR_MARKERS). assignee="mayor"/"deacon" é um papel
+       sempre-ligado, mas a sessão viva se chama "gastown.mayor"/"gastown.deacon" —
+       um PREFIXO diferente do assignee bare, que o casamento por sufixo acima não
+       cobre (nem `s==assignee`, nem `s.startswith(assignee+"-")`, nem o inverso).
+       Sem esta guarda, um bead in_progress do mayor/deacon resolvia alive=False →
+       "stranded", oferecendo liberar_para_pool sobre um papel que nunca deveria ser
+       reclamado. R4 e R7 do lifecycle-coherence-janitor.sh já protegiam "mayor" à
+       mão (exclusão hardcoded antes mesmo de qualquer checagem de liveness) — prova
+       de que consumidores de produção já tinham aprendido essa lição; o modelo
+       canônico não. Nenhum bead in_progress de mayor/deacon existia no momento da
+       medição (09/08) — gap latente, não incidente vivo, mas real: qualquer
+       consumidor futuro que confie cegamente em holder_is_alive()/derive() herdaria
+       o mesmo buraco que a versão *hardcoded* já tinha fechado.
 
     ⭐ FONTE CANÔNICA DE VIVACIDADE — use esta, não invente a sua:
            gc session list --json      → 72 sessões (medido 09/08)
@@ -205,6 +344,13 @@ def holder_is_alive(assignee: str, live_sessions) -> bool | None:
         return None
     if not assignee:
         return False
+    if is_coordinator(assignee):
+        # None, não True: nunca verificamos vivacidade de fato para um coordenador —
+        # só recusamos concluir morte. Mesma semântica de live_sessions=None ("não
+        # consultei"), e produz o mesmo resultado em todo call site de derive() hoje
+        # (regra 7 só vira "stranded" com alive IS False; None e True são idênticos
+        # ali) — sem fingir uma certeza que não temos.
+        return None
     for s in live_sessions:
         if s == assignee or s.startswith(assignee + "-") or assignee.startswith(s + "-"):
             return True
@@ -213,13 +359,29 @@ def holder_is_alive(assignee: str, live_sessions) -> bool | None:
 
 def derive(bead: dict, live_sessions=None,
            known_crews: frozenset = frozenset(),
-           merged: bool | None = None) -> dict:
+           merged: bool | None = None,
+           now: int | None = None,
+           gate_active: bool | None = None) -> dict:
     """Estado canônico. PURA — todo fato de runtime entra por parâmetro.
 
     live_sessions: conjunto de sessões vivas, ou None = NÃO CONSULTEI. None nunca
             vira "ninguém vivo" — ver holder_is_alive().
     merged: True/False se o chamador verificou o merge; None = não verificou.
             None NUNCA é tratado como False (erro ≠ vazio).
+    now: epoch atual, ou None = não consultado. Usado só para expirar
+            pilot:held-until:<epoch> (ga-fup3m) — ver _labels_after_expired_hold().
+            None preserva o comportamento antigo (park indefinido), nunca expira.
+    gate_active: True/False se o chamador já resolveu via lookup de marker
+            (ex.: inflight-reclaim-guard.py's list_gate_active_source_beads() /
+            lifecycle-coherence-janitor.sh's _gate_active_beads()); None = não
+            resolvido, cai no heurístico de label (GATE_ACTIVE ∩ labels) — o
+            comportamento de hoje, preservado para todo chamador que não passa
+            este parâmetro (mesma convenção de `now`). Quando o chamador RESOLVE,
+            o veredito dele GANHA do label nos dois sentidos: um marker fechado
+            destrava mesmo com gate:queued residual (a lacuna que ga-zltsr
+            documentou — a mesma doença que painel_visibilidade.py parou de
+            confiar em gate:queued sozinho, ga-opzlf), e um marker aberto conta
+            como at_gate mesmo se o label ainda não sincronizou.
     """
     L = _labels(bead)
     status = bead.get("status") or ""
@@ -260,11 +422,15 @@ def derive(bead: dict, live_sessions=None,
         return {"state": "awaiting_athos", "turn": "athos", "actions": actions, "reasons": reasons}
 
     # 4. PARK EXPLÍCITO — decisão deliberada de não andar.
-    park = _has_prefix(L, PARK_PREFIXES) or next((l for l in L if l in PARK_EXACT), None)
-    if park or status == "deferred":
+    park_labels = _labels_after_expired_hold(L, now)
+    park = _has_prefix(park_labels, PARK_PREFIXES) or next((l for l in park_labels if l in PARK_EXACT), None)
+    exhausted = _reclaim_exhausted(L)  # ga-98inr: limiar numérico, não label
+    if park or exhausted or status == "deferred":
         ext = "story:awaiting-external-merge" in L or park == "blocked:external-quota-motherduck"
+        motivo = park or (f"pilot:reclaim-count esgotado (>={RECLAIM_CAP})" if exhausted
+                           else "status=deferred")
         return {"state": "parked", "turn": "external" if ext else "mayor",
-                "actions": ["despausar"], "reasons": {"despausar": f"parkeado por {park or 'status=deferred'}"}}
+                "actions": ["despausar"], "reasons": {"despausar": f"parkeado por {motivo}"}}
 
     # 5. GATE REPROVOU — vez de quem constrói, não do Athos.
     if L & GATE_FAILED:
@@ -280,8 +446,10 @@ def derive(bead: dict, live_sessions=None,
         return {"state": "gate_failed", "turn": ("crew:" + crew) if crew else "mayor",
                 "actions": actions, "reasons": reasons}
 
-    # 6. NO GATE
-    if L & GATE_ACTIVE:
+    # 6. NO GATE — gate_active resolvido pelo chamador GANHA do label; None cai no
+    # heurístico de label de sempre (ver docstring de derive()).
+    at_gate = (L & GATE_ACTIVE) if gate_active is None else gate_active
+    if at_gate:
         return {"state": "at_gate", "turn": "nobody", "actions": [], "reasons": {}}
 
     # 7. EM EXECUÇÃO — 'stranded' exige PROVA de que o detentor morreu.
@@ -302,7 +470,18 @@ def derive(bead: dict, live_sessions=None,
     if L & UNREFINED:
         return {"state": "unrefined", "turn": "mayor", "actions": ["refinar"], "reasons": {}}
 
-    # 9. exec:manual — o balde. O executor DEFINE de quem é a vez.
+    # 9. JÁ EM MOVIMENTO — ga-98inr. Despachado ou finalizado; não é backlog
+    # ocioso, mas também não é 'parked' (que implica bloqueio a resolver).
+    # Vem ANTES de exec:manual/ARMED de propósito: um bead pode carregar
+    # ctx:ready+exec:auto (labels que sobrevivem ao despacho) e AINDA assim já
+    # estar em voo — checar ARMED primeiro reofereceria ao pool um bead que já
+    # está sendo trabalhado (ver FLOWING_LABELS acima para o caso real medido).
+    if L & FLOWING_LABELS:
+        crew = crew_of(assignee, known_crews)
+        return {"state": "flowing", "turn": ("crew:" + crew) if crew else "pool",
+                "actions": [], "reasons": {}}
+
+    # 10. exec:manual — o balde. O executor DEFINE de quem é a vez.
     if "exec:manual" in L:
         crew = crew_of(assignee, known_crews)
         if crew:
@@ -312,32 +491,32 @@ def derive(bead: dict, live_sessions=None,
                 "actions": ["nomear_executor"],
                 "reasons": {"_diagnostico": "exec:manual sem executor — 'não sei quem' NÃO é 'o Athos faz'"}}
 
-    # 10. ARMADO E DESPACHÁVEL
+    # 11. ARMADO E DESPACHÁVEL
     if ARMED <= L:
         routed = (bead.get("metadata") or {}).get("gc.routed_to")
         if not routed:
             return {"state": "armed_unrouted", "turn": "mayor", "actions": ["rotear"], "reasons": {}}
         return {"state": "ready", "turn": "pool", "actions": [], "reasons": {}}
 
-    # 11. PINNED — nota de referência permanente. Não é trabalho.
+    # 12. PINNED — nota de referência permanente. Não é trabalho.
     if status == "pinned" or "pinned" in L:
         return {"state": "pinned", "turn": "nobody", "actions": [], "reasons": {}}
 
-    # 12. HOOKED — trabalho no hook de um agente, aguardando ele pegar.
+    # 13. HOOKED — trabalho no hook de um agente, aguardando ele pegar.
     if status == "hooked":
         crew = crew_of(assignee, known_crews)
         return {"state": "hooked", "turn": ("crew:" + crew) if crew else "pool",
                 "actions": ["cutucar"] if crew else [], "reasons": {}}
 
-    # 13. APROVADO MAS NÃO ARMADO — decisão de produto já tomada; falta armar.
+    # 14. APROVADO MAS NÃO ARMADO — decisão de produto já tomada; falta armar.
     if "story:approved" in L:
         return {"state": "approved_unarmed", "turn": "mayor", "actions": ["armar"], "reasons": {}}
 
-    # 14. BACKLOG — filado, ainda não aprovado nem armado. Vez de quem refina/prioriza.
+    # 15. BACKLOG — filado, ainda não aprovado nem armado. Vez de quem refina/prioriza.
     if status == "open":
         return {"state": "backlog", "turn": "mayor", "actions": ["refinar", "priorizar"], "reasons": {}}
 
-    # 15. DESCONHECIDO — default é o Mayor, jamais o Athos.
+    # 16. DESCONHECIDO — default é o Mayor, jamais o Athos.
     return {"state": "unknown", "turn": "mayor", "actions": ["triar"],
             "reasons": {"_diagnostico": "estado não classificável pelo modelo canônico"}}
 

@@ -387,6 +387,21 @@ _EXTRA_ALARM_SUPPRESS_PREFIXES = (
     # not just the bead that surfaced it, and would repeat every STARVE_MIN forever.
     ("needs:engine-window", "needs:engine-window (Mayor/operator-coordinated gc engine rebuild — no pool worker may build it)"),
     ("no-auto-dispatch", "no-auto-dispatch (explicitly parked out of automatic dispatch)"),
+    # ga-qt0mj: pilot-dispatcher.sh's _filter_candidates has 4 TEXT-based vetoes
+    # (engine-rebuild / DECISAO-title / "só o Athos decide" / 🚨 compliance-marker)
+    # that scan title+description directly and never touch a label — deliberately,
+    # because the equivalent label can be destroyed by the auto-refino --description
+    # rewrite before this filter ever runs (see the veto's own comment, ga-fnnyy).
+    # Before this entry, a bead vetoed purely by TEXT was invisible here too: this
+    # reconciler alarmed "matched NONE of this reconciler's known non-buildable
+    # signals" while blind to the real cause, which existed only in the Pilot's log
+    # (ga-4oc2k, 70min/14 occurrences). pilot-dispatcher.sh now reconciles
+    # pilot:text-veto:<pattern> onto the bead itself every sweep — added while the
+    # text matches, REMOVED the moment it stops matching (see
+    # _reconcile_text_veto_labels there) — so, unlike pilot:refused-reason above,
+    # this signal tracks the CURRENT text, not a permanent audit trail. _has_prefix
+    # matches the whole pilot:text-veto:* family from this one entry.
+    ("pilot:text-veto", "pilot:text-veto:* (Pilot's prose-only dispatch veto currently matches this bead's title/description — see the label suffix for which pattern, ga-qt0mj)"),
 )
 
 
