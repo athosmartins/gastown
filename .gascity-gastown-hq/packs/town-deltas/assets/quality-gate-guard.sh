@@ -2963,7 +2963,27 @@ log "Attempting to claim marker $MARKER_ID ..."
 # as ambiguous/UNKNOWN — inert, not destructive — and Vector A's CLAIM_TTL
 # reclaim (this file) already converges a marker stuck with two labels back
 # to one.
-VERIFY_JSON=$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null || echo "{}")
+# `bd show --json` returns an ARRAY, not an object. Without the array
+# normalization below, `jq '(.labels // [])'` errors out ("Cannot index array
+# with string labels"), 2>/dev/null swallows it, CURRENT_LABELS comes back
+# EMPTY, and the gate-status:ready check below can never match — so every
+# claim attempt reported "raced away before claim" and exit 0'd, forever, on
+# a marker that was sitting at gate-status:ready the whole time. Because that
+# exit 0 abandons the whole sweep, ONE marker head-of-line-blocked the entire
+# queue: measured 2026-08-10, ga-zwjmf failed identically on 7 consecutive
+# sweeps (14:19→14:32) while two other ready markers behind it were never
+# even attempted, and the dispatcher correctly logged "Found 0 queued
+# marker(s)" because nothing was ever promoted ready→queued.
+#
+# The two other `bd show --json` reads in this same file (SC_SHOW ~L2578,
+# SLING_JSON ~L2604) already carry this exact normalization — this call site
+# was the one that was missed, which is why the bug looked like a race
+# instead of a parse error. Note the failure mode this collapses: a read
+# error and a genuinely-empty label set produced the SAME value (""), so a
+# permanent parse failure was indistinguishable from — and got reported as —
+# a transient race.
+VERIFY_JSON=$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null \
+  | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "{}")
 CURRENT_LABELS=$(echo "$VERIFY_JSON" | jq -r '(.labels // []) | join(",")' 2>/dev/null || echo "")
 
 if echo "$CURRENT_LABELS" | grep -q "gate-status:claimed"; then
