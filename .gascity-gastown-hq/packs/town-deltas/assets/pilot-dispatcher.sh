@@ -2395,10 +2395,75 @@ _filter_explicit_deps() {
 # pilot:dispatching claim. exec:auto and unlabelled beads pass through unchanged
 # (conservative default: absent exec: label → dispatch is fine, never suppress).
 # Pure read (no side effects); fail-open → pass through unchanged on jq error.
+#
+# ga-10co2 (derive() swap slice 1/6, per docs/pilot-dispatcher-derive-swap-
+# decisions.md): this was the cleanest candidate to bridge to
+# bead_state.derive() — it already delegates to a question derive() answers
+# natively (rule 10: exec:manual → state manual_assigned/manual_unrouted).
+# Wires option (a) from the design doc: one `python3 -c` subprocess PER
+# CANDIDATE, not batched — this slice's whole job is to MEASURE whether that
+# per-candidate cost is acceptable before anyone builds the batched form: see
+# the wall-clock comparison in the ga-10co2 bead/commit, not new code here.
+#
+# Defensive/fail-open by construction (per the bead's own scope): if python3
+# or bead_state.py aren't reachable, OR the bridge produces anything other
+# than a clean state for EVERY candidate (one crash anywhere aborts the whole
+# bridge attempt, not just that candidate — a half-bridged result must never
+# silently drop a different set of beads than the proven jq check would),
+# fall back to the original jq label check UNCHANGED. bead_state.py is
+# resolved relative to THIS script's own location, not a static HQ default —
+# ga-8mzgn hit the same trap (a static default resolves to the shared
+# main-branch checkout, a different tree than whichever worktree is actually
+# running this script) and PILOT_CITY_OVERRIDE (the selftest's fixture-city
+# seam) doesn't point at a real scripts/ dir at all.
 _filter_exec_manual() {
   local _em_in _em_out
   _em_in=$(cat)
-  _em_out=$(printf '%s' "$_em_in" | jq '[ .[] | select(((.labels // []) | index("exec:manual")) == null) ]' 2>/dev/null)
+
+  local _em_bsp _em_sd
+  _em_bsp="${PILOT_BEAD_STATE_PY_OVERRIDE:-}"
+  if [ -z "$_em_bsp" ]; then
+    _em_sd="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    _em_bsp="${_em_sd:+$_em_sd/../../../scripts}/bead_state.py"
+  fi
+
+  _em_out=""
+  if command -v python3 >/dev/null 2>&1 && [ -f "$_em_bsp" ]; then
+    local _em_pydir _em_line _em_out1 _em_bridge_ok _em_states
+    _em_pydir="$(dirname "$_em_bsp")"
+    _em_bridge_ok=1
+    _em_states=""
+    while IFS= read -r _em_line; do
+      [ -z "$_em_line" ] && continue
+      _em_out1=$(printf '%s' "$_em_line" | PYTHONPATH="$_em_pydir" python3 -c '
+import sys, json
+from bead_state import derive
+b = json.load(sys.stdin)
+st = derive({"status": b.get("status", ""), "labels": b.get("labels") or [],
+              "assignee": b.get("assignee") or "", "metadata": b.get("metadata") or {}})
+print(str(b.get("id", "")) + "\t" + st["state"])
+' 2>/dev/null)
+      if [ -z "$_em_out1" ]; then
+        _em_bridge_ok=0
+        break
+      fi
+      _em_states="${_em_states}${_em_out1}
+"
+    done < <(printf '%s' "$_em_in" | jq -c '.[]' 2>/dev/null)
+
+    if [ "$_em_bridge_ok" = "1" ]; then
+      _em_out=$(printf '%s' "$_em_in" | jq -c --arg states "$_em_states" '
+        ($states | split("\n") | map(select(length>0) | split("\t"))
+          | map({(.[0]): .[1]}) | add // {}) as $st
+        | [ .[] | select(($st[.id] // "") as $s
+            | ($s != "manual_assigned" and $s != "manual_unrouted")) ]
+      ' 2>/dev/null)
+    fi
+  fi
+
+  if [ -z "$_em_out" ]; then
+    _em_out=$(printf '%s' "$_em_in" | jq '[ .[] | select(((.labels // []) | index("exec:manual")) == null) ]' 2>/dev/null)
+  fi
   if [ -z "$_em_out" ]; then
     printf '%s' "$_em_in"
     return
