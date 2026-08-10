@@ -279,7 +279,8 @@ def holder_is_alive(assignee: str, live_sessions) -> bool | None:
 def derive(bead: dict, live_sessions=None,
            known_crews: frozenset = frozenset(),
            merged: bool | None = None,
-           now: int | None = None) -> dict:
+           now: int | None = None,
+           gate_active: bool | None = None) -> dict:
     """Estado canônico. PURA — todo fato de runtime entra por parâmetro.
 
     live_sessions: conjunto de sessões vivas, ou None = NÃO CONSULTEI. None nunca
@@ -289,6 +290,17 @@ def derive(bead: dict, live_sessions=None,
     now: epoch atual, ou None = não consultado. Usado só para expirar
             pilot:held-until:<epoch> (ga-fup3m) — ver _labels_after_expired_hold().
             None preserva o comportamento antigo (park indefinido), nunca expira.
+    gate_active: True/False se o chamador já resolveu via lookup de marker
+            (ex.: inflight-reclaim-guard.py's list_gate_active_source_beads() /
+            lifecycle-coherence-janitor.sh's _gate_active_beads()); None = não
+            resolvido, cai no heurístico de label (GATE_ACTIVE ∩ labels) — o
+            comportamento de hoje, preservado para todo chamador que não passa
+            este parâmetro (mesma convenção de `now`). Quando o chamador RESOLVE,
+            o veredito dele GANHA do label nos dois sentidos: um marker fechado
+            destrava mesmo com gate:queued residual (a lacuna que ga-zltsr
+            documentou — a mesma doença que painel_visibilidade.py parou de
+            confiar em gate:queued sozinho, ga-opzlf), e um marker aberto conta
+            como at_gate mesmo se o label ainda não sincronizou.
     """
     L = _labels(bead)
     status = bead.get("status") or ""
@@ -350,8 +362,10 @@ def derive(bead: dict, live_sessions=None,
         return {"state": "gate_failed", "turn": ("crew:" + crew) if crew else "mayor",
                 "actions": actions, "reasons": reasons}
 
-    # 6. NO GATE
-    if L & GATE_ACTIVE:
+    # 6. NO GATE — gate_active resolvido pelo chamador GANHA do label; None cai no
+    # heurístico de label de sempre (ver docstring de derive()).
+    at_gate = (L & GATE_ACTIVE) if gate_active is None else gate_active
+    if at_gate:
         return {"state": "at_gate", "turn": "nobody", "actions": [], "reasons": {}}
 
     # 7. EM EXECUÇÃO — 'stranded' exige PROVA de que o detentor morreu.
