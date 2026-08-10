@@ -42,6 +42,23 @@ sobre um valor de runtime que nunca foi consultado.
 """
 from __future__ import annotations
 
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+# park_labels.py (ga-hzt8s) já resolveu "label X casa com base Y, incluindo
+# variante :sufixo ou -sufixo" para outra consolidação (approved-state-
+# reconciler.py / imparavel-check.py / throughput-stall-watchdog.py). Reusa a
+# mecânica de casamento aqui em vez de reimplementar prefix-matching pela
+# terceira vez — exatamente o tipo de duplicação que este módulo existe pra
+# acabar. NÃO importa o vocabulário (NEEDS_HUMAN_LABELS etc.) daquele módulo:
+# o conjunto de labels usado abaixo (is_needs_human) precisa casar EXATAMENTE
+# o que inflight-reclaim-guard.py's _has_needs_human_label já testava
+# (NH-1..4 selftests) — park_labels.NEEDS_HUMAN_LABELS é mais amplo (inclui
+# "story:needs-human" e "needs-label-review", que aquele consumidor nunca
+# reconheceu) e adotar isso aqui seria uma mudança de comportamento não
+# verificada, não uma migração.
+from park_labels import label_matches as _label_matches  # noqa: E402
+
 # ── vocabulário canônico ─────────────────────────────────────────────────────
 # Uma única lista por conceito. Consumidor NÃO mantém a sua cópia — importa daqui.
 
@@ -129,6 +146,39 @@ def is_athos_page(labels) -> bool:
     return any(str(l).startswith(pfx) and str(l)[len(pfx):] in ATHOS_GATE_HUMAN_SUFFIXES
                for l in lset)
 
+
+def is_needs_human(labels) -> bool:
+    """True sse o bead foi deliberadamente parqueado para revisão humana, em
+    QUALQUER variante: bare 'needs-human', bare 'gate:needs-human', ou
+    QUALQUER sufixo 'gate:needs-human:*' — incluindo ':product' (que TAMBÉM é
+    vez do Athos via is_athos_page(), mas aqui a pergunta é mais ampla: "um
+    humano precisa olhar, não interessa qual").
+
+    Vocabulário absorvido de inflight-reclaim-guard.py's _has_needs_human_label
+    (ga-hkpwv, ga-x3e7p) — lá é um invariante de segurança documentado ("NEVER
+    reclaims gate:needs-human beads"). is_athos_page() reconhece SÓ ':product'
+    como vez do Athos; is_needs_human() é o super-conjunto que outros
+    consumidores (ex.: guardas de reclaim) precisam para nunca tocar o bead,
+    independente de QUEM especificamente deve agir (Athos vs Mayor/crew).
+
+    ⚠️ Antes desta função, bead_state.py não tinha NENHUMA classificação para
+    'gate:needs-human:technical' (ou bare 'needs-human'/'gate:needs-human') —
+    nem is_athos_page (correto, testado: só ':product' é dele) nem PARK
+    (ausente de PARK_PREFIXES/PARK_EXACT). Um consumidor que substituísse
+    _has_needs_human_label por derive()["state"]=="parked" SEM esta função
+    teria regredido silenciosamente esse invariante.
+
+    Mecânica de casamento reusada de park_labels.label_matches (ga-hzt8s) —
+    vocabulário (quais bases) é próprio desta função, igual ao que
+    inflight-reclaim-guard.py's _has_needs_human_label já testava.
+    """
+    lset = labels if isinstance(labels, (set, frozenset)) else set(labels or [])
+    return any(
+        _label_matches(str(l), "gate:needs-human") or _label_matches(str(l), "needs-human")
+        for l in lset
+    )
+
+
 EPHEMERAL_MARKERS = ("-adhoc-", "claude-headless", "wa-worker-", "ps-worker-", "dog-")
 # Formas NUAS (sem sufixo à direita) dos mesmos templates de pool. "wa-worker" sozinho
 # não bate "wa-worker-" (falta o traço final) e "gastown.dog" não bate "dog-" (idem) —
@@ -139,6 +189,142 @@ EPHEMERAL_MARKERS = ("-adhoc-", "claude-headless", "wa-worker-", "ps-worker-", "
 # independentes. Sem isto, um crew_of() chamado com a forma nua resolveria como se
 # fosse um crew real.
 EPHEMERAL_EXACT = frozenset({"gastown.dog", "wa-worker", "ps-worker"})
+
+# ── vivacidade de sessão rica (absorvido de inflight-reclaim-guard.py) ───────
+# Vocabulário sobre SESSÕES (dicts de `gc session list --json`: id/name/
+# session_name/alias/agent_name/template/state/last_active) — distinto do
+# vocabulário de LABEL acima. inflight-reclaim-guard.py (ga-64usm, ga-7m191,
+# gt-fppb0) já tinha isto certo antes deste módulo existir; absorvido aqui
+# (ga-x3e7p) para ser fonte única em vez de cópia local.
+
+# Templates de pool BARE (não um nome de sessão concreto): 'gc hook'/dispatch
+# de pool carimba o nome ESTÁVEL do template (ex. 'gastown.dog'), não um id
+# por-sessão. Nunca aparece literalmente como identificador de sessão viva —
+# vivacidade para um destes exige casar por session.template, não por nome.
+EPHEMERAL_POOL_TEMPLATES = frozenset({"wa-worker", "gastown.dog"})
+
+# Sessões always-on que NUNCA são um builder dono de trabalho (ga-7m191) —
+# mayor/deacon nunca morrem, então sem esta exclusão um bead parqueado sob
+# o Mayor pareceria 'dono de sessão viva' para sempre.
+COORDINATOR_MARKERS = ("mayor", "deacon")
+
+LIVE_SESSION_STATES = frozenset({"active", "awake"})
+# Estados terminais que PROVAM que uma sessão não pode estar trabalhando.
+# archived/quarantined/failed-create: estados exóticos que também nunca
+# fazem trabalho; sem eles um worker morto pendurado num desses bloquearia
+# reclaim pra sempre.
+DEAD_SESSION_STATES = frozenset({
+    "asleep", "drained", "closed", "archived", "quarantined", "failed-create",
+})
+
+# 30min (ga-64usm): uma sessão em estado vivo cujo last_active é mais velho
+# que isto, E cujo bead não teve bd-update no mesmo intervalo, é um zumbi
+# congelado/sem-quota — não um dono ativo. VIVO ≠ TRABALHANDO.
+STALE_ACTIVITY_TTL = 1800
+
+
+def is_coordinator(identity) -> bool:
+    """True se identity nomeia um coordenador always-on (mayor/deacon), não
+    um builder. Substring, case-insensitive. Ver COORDINATOR_MARKERS."""
+    ident = (identity or "").lower()
+    return any(marker in ident for marker in COORDINATOR_MARKERS)
+
+
+def parse_iso_epoch(ts):
+    """Converte um timestamp ISO-8601 para epoch. None em qualquer falha.
+
+    Trata os dois dialetos que este ecossistema emite: `gc session list`
+    ('2026-06-10T11:33:28-03:00', offset local) e `bd` ('...Z', UTC bare) —
+    Python 3.9 aceita o primeiro mas rejeita 'Z' à direita, daí a normalização.
+    """
+    if not ts or not isinstance(ts, str):
+        return None
+    s = ts.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(s).timestamp()
+    except Exception:
+        return None
+
+
+def session_activity_age(session, now):
+    """Segundos desde o last_active de uma sessão. None se ausente/inválido —
+    CALLERS devem tratar None como 'desconhecido', nunca inferir staleness."""
+    age = parse_iso_epoch(session.get("last_active", ""))
+    if age is None:
+        return None
+    return max(0.0, now - age)
+
+
+def session_owner_is_healthy(matched_live, activity_age, bead_update_age,
+                              awaiting_human_input=False) -> bool:
+    """Dado que o assignee já casou com uma sessão em estado VIVO, decide se
+    isso é um dono SAUDÁVEL (bloqueia reclaim) ou um zumbi congelado/sem-quota
+    (libera reclaim) — ga-64usm: ALIVE != WORKING.
+
+    Conservador por construção: sem timestamp de atividade não dá pra provar
+    staleness, então mantém o comportamento pré-fix (trata como vivo) — nunca
+    reclama na força de um campo ausente. ga-nlaa: parado esperando decisão
+    humana (AskUserQuestion) produz a MESMA telemetria de um zumbi congelado —
+    se o CALLER já confirmou isso via peek (I/O, não pode viver aqui, função
+    pura), conta como saudável também.
+    """
+    if not matched_live:
+        return False
+    if activity_age is None:
+        return True
+    if activity_age <= STALE_ACTIVITY_TTL:
+        return True
+    if bead_update_age is not None and bead_update_age <= STALE_ACTIVITY_TTL:
+        return True
+    if awaiting_human_input:
+        return True
+    return False
+
+
+def claimant_provably_dead(assignee, sessions,
+                            coordinator_markers=COORDINATOR_MARKERS,
+                            dead_states=DEAD_SESSION_STATES) -> bool:
+    """True sse o detentor do bead está PROVADAMENTE morto (gt-fppb0):
+    TODO match — por template bare (session.template == assignee, ex.
+    'gastown.dog'/'wa-worker') OU por identificador concreto (assignee em
+    {id,name,session_name,alias,agent_name}) — está num estado
+    definitivamente morto, OU não há match algum (ausente de `gc session
+    list`).
+
+    ESTRITAMENTE MAIS FORTE que 'not alive': uma sessão viva-mas-quieta
+    (last_active velho — ga-64usm) OU em estado DESCONHECIDO NÃO é
+    provavelmente morta — o builder pode ainda estar vivo, então mantêm a
+    janela de histerese normal. Só um claimant CERTAMENTE ausente ganha o
+    caminho rápido (reclaim imediato, sem esperar TTL).
+
+    Conservador / fail-safe por construção:
+      - lista de sessões vazia/None       → False (não dá pra provar morte)
+      - assignee vazio/None ou coordenador → False (parqueado / outro rail)
+      - QUALQUER match em estado VIVO      → False (mesmo se quieto)
+      - QUALQUER match em estado DESCONHECIDO → False (ambíguo, nunca fast-path)
+    """
+    if not assignee or is_coordinator(assignee):
+        return False
+    if not sessions:
+        return False
+    for s in sessions:
+        identifiers = {
+            s.get("id", ""), s.get("name", ""), s.get("session_name", ""),
+            s.get("alias", ""), s.get("agent_name", ""),
+        }
+        identifiers.discard("")
+        matches = (s.get("template", "") == assignee) or (assignee in identifiers)
+        if not matches:
+            continue
+        if any(is_coordinator(idv) for idv in identifiers):
+            return False
+        state = (s.get("state") or "").lower()
+        if state not in dead_states:
+            return False
+    return True
 
 
 def _labels(bead) -> frozenset:
@@ -260,11 +446,18 @@ def derive(bead: dict, live_sessions=None,
         return {"state": "awaiting_athos", "turn": "athos", "actions": actions, "reasons": reasons}
 
     # 4. PARK EXPLÍCITO — decisão deliberada de não andar.
+    # is_needs_human() cobre bare 'needs-human'/'gate:needs-human' e todo
+    # sufixo 'gate:needs-human:*' não-':product' (ga-x3e7p) — seguro aqui
+    # porque o passo 3 (is_athos_page) já capturou ':product' e retornou antes
+    # de chegar neste ponto; qualquer needs-human restante é Mayor/crew, nunca
+    # Athos, e nunca "sem classificação" (era o gap: caía direto em 'executing').
     park = _has_prefix(L, PARK_PREFIXES) or next((l for l in L if l in PARK_EXACT), None)
-    if park or status == "deferred":
+    needs_human = is_needs_human(L)
+    if park or needs_human or status == "deferred":
         ext = "story:awaiting-external-merge" in L or park == "blocked:external-quota-motherduck"
+        why = park or ("needs-human" if needs_human else "status=deferred")
         return {"state": "parked", "turn": "external" if ext else "mayor",
-                "actions": ["despausar"], "reasons": {"despausar": f"parkeado por {park or 'status=deferred'}"}}
+                "actions": ["despausar"], "reasons": {"despausar": f"parkeado por {why}"}}
 
     # 5. GATE REPROVOU — vez de quem constrói, não do Athos.
     if L & GATE_FAILED:

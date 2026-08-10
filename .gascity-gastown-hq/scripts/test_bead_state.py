@@ -11,7 +11,11 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bead_state import derive, holder_is_alive, is_athos_page, is_ephemeral  # noqa: E402
+from bead_state import (  # noqa: E402
+    derive, holder_is_alive, is_athos_page, is_ephemeral, is_needs_human,
+    claimant_provably_dead, session_owner_is_healthy, session_activity_age,
+    parse_iso_epoch, is_coordinator, EPHEMERAL_POOL_TEMPLATES,
+)
 
 CREWS = frozenset({"mila-wa", "oracle-wa", "batista-wa", "batista-ps", "mayor"})
 
@@ -198,3 +202,154 @@ def test_outros_labels_park_absorvidos_de_pilot_dispatcher():
                    ["prod-experiment"], ["ban-risk"], ["engine-window:pending"],
                    ["waiting-on:ga-xyz"], ["depends-on:ga-xyz"]):
         assert derive(b(labels=labels), None, CREWS)["state"] == "parked", labels
+
+# ── needs-human: ga-x3e7p (absorvido de inflight-reclaim-guard.py) ───────────
+# Gap real encontrado lendo o consumidor: nada em bead_state.py classificava
+# 'gate:needs-human:technical' (nem bare 'needs-human'/'gate:needs-human') como
+# parqueado — is_athos_page corretamente só pega ':product'. Sem is_needs_human,
+# um bead nessas condições caía direto em 'executing' (status in_progress),
+# regredindo silenciosamente o invariante de segurança do consumidor ("NEVER
+# reclaims gate:needs-human beads").
+
+def test_is_needs_human_pega_todas_as_variantes():
+    assert is_needs_human(["needs-human"]) is True
+    assert is_needs_human(["gate:needs-human"]) is True
+    assert is_needs_human(["gate:needs-human:technical"]) is True
+    assert is_needs_human(["gate:needs-human:on-device"]) is True
+    assert is_needs_human(["gate:needs-human:product"]) is True  # também é vez do Athos, via is_athos_page
+    assert is_needs_human(["ctx:ready", "exec:auto"]) is False
+    assert is_needs_human([]) is False
+
+
+def test_needs_human_nao_product_e_parked_nao_executing():
+    """A regressão que este teste existe pra prevenir: ANTES desta função, esta
+    bead caía em 'executing' (turn=crew) porque status=in_progress e nada
+    classificava o label como park. O invariante do consumidor é 'nunca
+    reclama' — 'executing' até funciona por acidente enquanto o holder está
+    vivo, mas expõe o bead a stranded assim que a sessão cair, o que o
+    consumidor original proíbe explicitamente."""
+    st = derive(b(status="in_progress", labels=["gate:needs-human:technical"],
+                   assignee="mila-wa"), frozenset(), CREWS)
+    assert st["state"] == "parked"
+    assert st["turn"] == "mayor"
+
+
+def test_needs_human_bare_tambem_e_parked():
+    st = derive(b(status="in_progress", labels=["needs-human"], assignee="mila-wa"),
+                frozenset(), CREWS)
+    assert st["state"] == "parked"
+
+
+def test_needs_human_product_ainda_ganha_de_park_via_athos_page():
+    """':product' é dupla cidadania (is_needs_human E is_athos_page), mas
+    is_athos_page roda ANTES (passo 3) — a vez dele tem que vencer, não parked."""
+    st = derive(b(labels=["gate:needs-human:product"]), None, CREWS)
+    assert st["turn"] == "athos"
+    assert st["state"] == "awaiting_athos"
+
+
+# ── claimant_provably_dead: porta 1:1 dos CPD-1..10 de inflight-reclaim-guard.py
+# (ga-x3e7p) — contrato ESTRITAMENTE mais forte que 'not alive': só True quando
+# TODO match é estado morto, ou não há match algum. Ambíguo (estado
+# desconhecido) e vivo-mas-quieto (zumbi congelado) são False — a decisão de
+# reclamar rápido não pode se basear neles.
+
+def _sess(**kw):
+    d = {"id": "", "name": "", "session_name": "", "alias": "", "agent_name": "",
+         "template": "", "state": "", "last_active": ""}
+    d.update(kw)
+    return d
+
+
+def test_provably_dead_ausente_de_lista_nao_vazia():
+    other = _sess(id="s1", name="oracle-wa", template="oracle-wa", state="active")
+    assert claimant_provably_dead("gastown.dog", [other]) is True
+
+
+def test_provably_dead_falso_com_template_vivo():
+    live = _sess(id="d1", template="gastown.dog", state="active")
+    assert claimant_provably_dead("gastown.dog", [live]) is False
+
+
+def test_provably_dead_verdadeiro_so_com_estado_morto():
+    dead = _sess(id="d2", template="gastown.dog", state="asleep")
+    assert claimant_provably_dead("gastown.dog", [dead]) is True
+
+
+def test_provably_dead_falso_com_estado_desconhecido_ambiguo():
+    unknown = _sess(id="d1", template="gastown.dog", state="booting")
+    assert claimant_provably_dead("gastown.dog", [unknown]) is False
+
+
+def test_provably_dead_falso_quando_vivo_mas_quieto_zumbi():
+    """ga-64usm: vivo-mas-parado NÃO é prova de morte — mantém a histerese."""
+    stale_live = _sess(id="d1", template="gastown.dog", state="active",
+                        last_active="2020-01-01T00:00:00Z")
+    assert claimant_provably_dead("gastown.dog", [stale_live]) is False
+
+
+def test_provably_dead_falso_com_lista_vazia():
+    assert claimant_provably_dead("gastown.dog", []) is False
+    assert claimant_provably_dead("gastown.dog", None) is False
+
+
+def test_provably_dead_falso_para_coordenador():
+    other = _sess(id="s1", name="oracle-wa", template="oracle-wa", state="active")
+    assert claimant_provably_dead("gastown.mayor", [other]) is False
+
+
+def test_provably_dead_match_concreto_por_identificador():
+    dead = _sess(session_name="wa-worker-adhoc-x", agent_name="wa-worker-adhoc-x",
+                  template="wa-worker", state="closed")
+    assert claimant_provably_dead("wa-worker-adhoc-x", [dead]) is True
+
+
+def test_provably_dead_falso_com_assignee_vazio():
+    other = _sess(id="s1", name="oracle-wa", template="oracle-wa", state="active")
+    assert claimant_provably_dead("", [other]) is False
+
+
+def test_provably_dead_um_vivo_um_morto_vence_o_vivo():
+    dead = _sess(id="d2", template="gastown.dog", state="asleep")
+    live = _sess(id="d1", template="gastown.dog", state="active")
+    assert claimant_provably_dead("gastown.dog", [dead, live]) is False
+
+
+# ── session_owner_is_healthy: ALIVE != WORKING (ga-64usm / ga-nlaa) ──────────
+
+def test_healthy_falso_se_nao_bateu_sessao_viva():
+    assert session_owner_is_healthy(False, 10, 10) is False
+
+
+def test_healthy_conservador_sem_timestamp():
+    assert session_owner_is_healthy(True, None, None) is True
+
+
+def test_healthy_atividade_recente():
+    assert session_owner_is_healthy(True, 60, None) is True
+
+
+def test_healthy_atividade_velha_mas_bead_update_recente():
+    assert session_owner_is_healthy(True, 9999, 60) is True
+
+
+def test_healthy_falso_quando_tudo_stale_sem_isencao():
+    assert session_owner_is_healthy(True, 9999, 9999) is False
+
+
+def test_healthy_isencao_por_espera_humana():
+    """ga-nlaa: parado num AskUserQuestion produz a MESMA telemetria de zumbi
+    congelado — só conta como saudável com confirmação explícita do caller."""
+    assert session_owner_is_healthy(True, 9999, 9999, awaiting_human_input=True) is True
+
+
+def test_ephemeral_pool_templates_conhece_gastown_dog_e_wa_worker():
+    assert "gastown.dog" in EPHEMERAL_POOL_TEMPLATES
+    assert "wa-worker" in EPHEMERAL_POOL_TEMPLATES
+
+
+def test_is_coordinator_pega_mayor_e_deacon():
+    assert is_coordinator("gastown.mayor") is True
+    assert is_coordinator("hq-deacon") is True
+    assert is_coordinator("mila-wa") is False
+    assert is_coordinator("") is False

@@ -146,16 +146,28 @@ import sys as _sys
 _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 from gc_ledger import gc_ledger_append as _irg_ledger
 import datetime as _irg_datetime
+# ga-x3e7p: single-source vocabulary/safeguards absorbed into bead_state.py —
+# this consumer was more careful than that module before ga-x3e7p (canonical
+# liveness source, ALIVE != WORKING staleness, pool-template matching,
+# provably-dead classifier); these names are now DEFINED there and imported
+# here unchanged, so every existing reference below (and in _selftest())
+# keeps working with zero behavior change. See bead_state.py's own docstrings
+# for the full incident history (ga-64usm, ga-7m191, ga-nlaa, gt-fppb0).
+from bead_state import (
+    COORDINATOR_MARKERS, LIVE_SESSION_STATES as LIVE_STATES,
+    DEAD_SESSION_STATES as _POOL_DEAD_STATES, STALE_ACTIVITY_TTL,
+    EPHEMERAL_POOL_TEMPLATES as EPHEMERAL_POOL_ASSIGNEES,
+    is_coordinator, parse_iso_epoch, session_activity_age,
+    session_owner_is_healthy, claimant_provably_dead, is_needs_human,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 RECLAIM_TTL = 1500       # 25min: branch "recent" threshold AND hysteresis window
-STALE_ACTIVITY_TTL = 1800  # 30min (ga-64usm): a matched live session whose
-                         # last_active is older than this — AND with no bd update
-                         # on the bead within the same window — is a frozen /
-                         # credit-limited zombie, NOT a live owner. alive != working.
+# STALE_ACTIVITY_TTL (ga-64usm: alive != working) is now canonical in
+# bead_state.py — imported above, same value (1800 = 30min), same meaning.
 MAX_RECLAIMS = 3         # escalate instead of looping after this many reclaims
 
 # ga-be4x: a worker that EXPLICITLY refuses a bead (pool:refused[:reason] label,
@@ -192,7 +204,8 @@ POOL_DEAD_COOLDOWN = int(os.environ.get("IRG_POOL_DEAD_COOLDOWN_SEC", "1800"))
 # + the provably-dead fast-path (reclaim_decision) so a dead dog's claim is
 # reclaimed rather than re-offered. Dog branches follow the crew/gastown.dog/<id>
 # convention, already honored by get_branch_recent()'s segment matcher.
-EPHEMERAL_POOL_ASSIGNEES = frozenset({"wa-worker", "gastown.dog"})
+# ga-x3e7p: this set is now canonical in bead_state.py (EPHEMERAL_POOL_TEMPLATES)
+# — imported above under this same name, same two members, zero behavior change.
 
 # ga-hkpwv: minimum stranding window for bare-template pool zombies.
 # Longer than RECLAIM_TTL (25min): no Pilot marker is a weaker signal, and a
@@ -217,13 +230,8 @@ ORPHAN_SWEEP_SELFHEAL_SHIELD_SECS = int(os.environ.get("ORPHAN_SWEEP_SELFHEAL_SH
 
 # ga-hkpwv: session states that definitively prove a non-working session.
 # Used in pool_has_live_worker() to distinguish dead vs unknown states.
-# archived/quarantined/failed-create: exotic terminal states that also cannot
-# be doing any work; without them a lingering un-closed dead worker in one of
-# these states would permanently block reclaim for all beads in that pool.
-_POOL_DEAD_STATES = frozenset({
-    "asleep", "drained", "closed",
-    "archived", "quarantined", "failed-create",
-})
+# ga-x3e7p: now canonical in bead_state.py (DEAD_SESSION_STATES) — imported
+# above under this same name (_POOL_DEAD_STATES), same 6 members.
 
 STATE_FILE = ".gc/state/inflight-reclaim-guard.json"
 GC_CITY = "/Users/athos/gt/.gascity-gastown-hq"
@@ -283,15 +291,14 @@ REPOS = [
     "/Users/athos/gt/whatsapp_automation",
 ]
 
-# Session states that indicate a live active builder
-LIVE_STATES = {"active", "awake"}
-
-# Always-on COORDINATOR roles (ga-7m191). A story bead whose assignee names one
+# Session states that indicate a live active builder.
+# Always-on COORDINATOR roles (ga-7m191): a story bead whose assignee names one
 # of these is PARKED, not being actively built — these sessions never die, so
 # without this exclusion a dead-builder bead parked under the Mayor would look
 # 'owned by a healthy session' forever and never get reclaimed. Substring,
 # case-insensitive match against assignee/session identifiers.
-COORDINATOR_MARKERS = ("mayor", "deacon")
+# ga-x3e7p: both are now canonical in bead_state.py (LIVE_SESSION_STATES /
+# COORDINATOR_MARKERS) — imported above under these same names.
 
 # Gate pipeline states that mean a bead is actively being processed
 # (includes queued + claimed as belt-and-suspenders beyond what the spec names)
@@ -382,13 +389,17 @@ def _has_needs_human_label(labels):
     call to Assertiva support) carried only the bare form and was
     incorrectly auto-reclaimed as a result. Same bug class already fixed
     in production-stall-watchdog.py under ga-m0ksy.
+
+    ga-x3e7p: delegates to bead_state.is_needs_human — same vocabulary this
+    function has always used (bare "needs-human", bare "gate:needs-human",
+    every "gate:needs-human:*" suffix), now shared with derive()'s PARK step
+    instead of living only here. Absorbing this into bead_state.py FIRST (this
+    exact predicate, byte-for-byte) was required before any caller could safely
+    treat derive()'s "parked" state as a substitute for this check — before
+    that absorption, bead_state.py had no classification at all for the
+    non-':product' suffixes or the bare forms.
     """
-    return any(
-        lbl == "gate:needs-human"
-        or lbl.startswith("gate:needs-human:")
-        or lbl == "needs-human"
-        for lbl in labels
-    )
+    return is_needs_human(labels)
 
 
 def _has_refusal_label(labels):
@@ -1140,105 +1151,11 @@ def list_gate_active_source_beads():
 # ---------------------------------------------------------------------------
 # Liveness helpers
 # ---------------------------------------------------------------------------
-
-def is_coordinator(identity):
-    """Return True if an assignee/session identity names an always-on
-    coordinator (mayor/deacon) rather than a builder. Substring, case-insensitive.
-
-    ga-7m191: a story bead parked under a coordinator is NOT being actively
-    built — those sessions never die, so they must never count as a live owner.
-    """
-    ident = (identity or "").lower()
-    return any(marker in ident for marker in COORDINATOR_MARKERS)
-
-
-def parse_iso_epoch(ts):
-    """Parse an ISO-8601 timestamp to epoch seconds. Returns None on any failure.
-
-    Handles both timestamp dialects this guard sees: `gc session list` emits a
-    local offset form ('2026-06-10T11:33:28-03:00') and `bd` emits a bare-Z UTC
-    form ('2026-06-10T14:33:28Z'). Python 3.9's datetime.fromisoformat() accepts
-    the offset form but REJECTS a trailing 'Z', so normalize it to '+00:00'.
-    """
-    if not ts or not isinstance(ts, str):
-        return None
-    s = ts.strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    try:
-        from datetime import datetime
-        return datetime.fromisoformat(s).timestamp()
-    except Exception:
-        return None
-
-
-def session_activity_age(session, now):
-    """Seconds since a session's last_active timestamp. None if missing/unparseable.
-
-    A None return means "unknown" — callers must treat it conservatively (do not
-    infer staleness from a missing timestamp).
-    """
-    age = parse_iso_epoch(session.get("last_active", ""))
-    if age is None:
-        return None
-    return max(0.0, now - age)
-
-
-def session_owner_is_healthy(matched_live, activity_age, bead_update_age,
-                              awaiting_human_input=False):
-    """Pure predicate (ga-64usm): given that the bead's assignee matched a
-    live-state (active/awake) BUILDER session, decide whether that constitutes a
-    HEALTHY live owner (block reclaim) or a frozen/credit-limited zombie
-    (allow reclaim).
-
-    Args:
-        matched_live:     True if assignee matched a session in LIVE_STATES
-        activity_age:     seconds since session.last_active, or None if unknown
-        bead_update_age:  seconds since the bead's own updated_at, or None if unknown
-        awaiting_human_input: True if session_awaiting_human_input() (ga-nlaa)
-                          confirmed the session's pane is paused on an
-                          interactive human prompt (e.g. AskUserQuestion).
-                          Callers should only pay for that check (a `gc
-                          session peek`) once the cheaper signals below are
-                          already exhausted — see session_is_live() etc.
-
-    A matched live session is a healthy owner UNLESS it is *provably* frozen:
-    its terminal activity is older than STALE_ACTIVITY_TTL AND the bead itself
-    has had no bd update within STALE_ACTIVITY_TTL. Either fresh signal — recent
-    terminal output OR recent bead progress — keeps it classified healthy.
-
-    Conservative by construction: when the activity timestamp is unknown we
-    CANNOT prove staleness, so we keep the pre-fix behavior (treat as live) and
-    never reclaim on the strength of a missing field. The bug this fixes is
-    UNDER-reclaiming (a frozen session was live forever); we must not over-
-    correct into reclaiming a builder that is merely quiet.
-
-    ga-nlaa: stale-on-both is not automatically a zombie anymore — a session
-    legitimately paused on an interactive human prompt produces the identical
-    telemetry (no terminal output, no bd update) while being fully alive. If
-    the caller has independently confirmed that via session_awaiting_human_
-    input(), treat it as healthy too.
-    """
-    if not matched_live:
-        return False
-    # Can't prove staleness without an activity timestamp → stay conservative.
-    if activity_age is None:
-        return True
-    # Recent terminal activity → genuinely working builder.
-    if activity_age <= STALE_ACTIVITY_TTL:
-        return True
-    # Activity is stale. A recent bd update on the bead is the secondary progress
-    # signal (workers should bd-update during long work — ga-64usm secondary).
-    if bead_update_age is not None and bead_update_age <= STALE_ACTIVITY_TTL:
-        return True
-    # ga-nlaa: stale on both signals — but a session paused waiting on a human
-    # decision is not dead. This is an independent-of-commit-cadence signal,
-    # confirmed by the caller via a pane peek before reaching this branch.
-    if awaiting_human_input:
-        return True
-    # Frozen: stale terminal activity, no recent bead progress, and not
-    # paused-for-human → zombie.
-    return False
+# ga-x3e7p: is_coordinator, parse_iso_epoch, session_activity_age, and
+# session_owner_is_healthy (ga-7m191 / ga-64usm / ga-nlaa) are now canonical
+# in bead_state.py — imported above under these exact names. Every call site
+# below is unchanged; only the definition moved, so this consumer and every
+# future one share one implementation instead of a private copy.
 
 
 def session_awaiting_human_input(session_ref, lines=40):
@@ -1457,59 +1374,11 @@ def concrete_adhoc_session_is_live(assignee, sessions, now=None, bead_update_age
     return False
 
 
-def claimant_provably_dead(assignee, sessions):
-    """True iff the bead's claimant session is PROVABLY gone (gt-fppb0).
-
-    "Provably gone" means: EVERY session matching `assignee` — by bare pool
-    template (session.template == assignee, e.g. 'gastown.dog'/'wa-worker') OR by
-    concrete identifier (assignee in {id,name,session_name,alias,agent_name}) — is
-    in a definitively-dead state (_POOL_DEAD_STATES), OR no session matches at all
-    (the claimant is absent from `gc session list`).
-
-    This is STRICTLY STRONGER than `not <live-rail>()`. The liveness rails
-    (session_is_live / pool_has_live_worker / concrete_adhoc_session_is_live)
-    already return "not live" for a session that is present in a LIVE state but
-    merely quiet/frozen (stale last_active — ga-64usm) OR in an UNKNOWN state.
-    Those cases are NOT provably dead: the builder might still be alive, so they
-    must keep the RECLAIM_TTL / POOL_ZOMBIE_TTL hysteresis. Only a claimant that
-    is *certainly* gone earns the reclaim_decision fast-path (immediate reclaim).
-
-    Conservative / fail-safe by construction:
-      - empty/unknown session list          → False (cannot prove death)
-      - empty/None or coordinator assignee   → False (parked / other rails own it)
-      - ANY matching session in a LIVE state → False (even if stale — merely quiet)
-      - ANY matching session in an UNKNOWN   → False (ambiguous → never fast-path)
-        (state ∉ LIVE_STATES ∪ _POOL_DEAD_STATES)
-
-    Reuses the exact primitives the other liveness helpers use (_POOL_DEAD_STATES,
-    the identifier set, is_coordinator) so the "dead" verdict can never silently
-    diverge from what session_is_live()/pool_has_live_worker() consider dead.
-    """
-    if not assignee or is_coordinator(assignee):
-        return False
-    if not sessions:
-        return False  # unknown / probe returned nothing → cannot PROVE death
-    for s in sessions:
-        identifiers = {
-            s.get("id", ""),
-            s.get("name", ""),
-            s.get("session_name", ""),
-            s.get("alias", ""),
-            s.get("agent_name", ""),
-        }
-        identifiers.discard("")
-        matches = (s.get("template", "") == assignee) or (assignee in identifiers)
-        if not matches:
-            continue
-        # A parked-under-coordinator match is not our rail (ga-7m191).
-        if any(is_coordinator(idv) for idv in identifiers):
-            return False
-        state = s.get("state", "").lower()
-        if state not in _POOL_DEAD_STATES:
-            # LIVE (even stale/frozen) or UNKNOWN state → not provably dead.
-            return False
-    # Matched only definitively-dead sessions, or matched nothing at all → gone.
-    return True
+# ga-x3e7p: claimant_provably_dead (gt-fppb0) is now canonical in
+# bead_state.py — imported above under this same name, byte-for-byte the same
+# algorithm (verified against this file's own CPD-1..10 selftests before and
+# after the move). Every call site below (reclaim_decision fast-path,
+# run_cycle, reclaim_dead_dog_claims) is unchanged.
 
 
 def list_live_sling_source_beads(sessions, now):

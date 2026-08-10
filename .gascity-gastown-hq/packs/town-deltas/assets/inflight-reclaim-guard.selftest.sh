@@ -510,7 +510,15 @@ check_pattern "fail-safe: skip cycle on bd list failure" "bd list failed"
 check_pattern "fail-safe: skip cycle on session list failure" "session list failed"
 check_pattern "fail-safe: skip cycle on gate-marker failure" "gate-marker query failed"
 check_pattern "ga-7m191: coordinator markers defined" "COORDINATOR_MARKERS"
-check_pattern "ga-7m191: is_coordinator helper present" "def is_coordinator"
+# ga-x3e7p: is_coordinator/parse_iso_epoch/session_activity_age/
+# session_owner_is_healthy/STALE_ACTIVITY_TTL moved to bead_state.py (single
+# canonical source, imported here unchanged — see the guard's own import
+# block and its ga-x3e7p comment). "def NAME" no longer appears locally by
+# design; the bare name still must appear (as the imported symbol, and at
+# every call site) for the guard to even run — which the FUNCTIONAL selftest
+# below (scripts/inflight-reclaim-guard.py --selftest, 264 checks incl.
+# CPD-1..10/AH-1..12) is what actually proves correct, not this text grep.
+check_pattern "ga-7m191: is_coordinator helper present" "def is_coordinator|is_coordinator"
 check_pattern "ga-7m191: in-flight-alone query function present" "def list_inflight_beads"
 check_pattern "ga-7m191: epic exclusion in run_cycle" '"epic"'
 check_pattern "ga-vw26y: in_progress sweep function present" "def list_stranded_inprogress_beads"
@@ -518,10 +526,13 @@ check_pattern "ga-vw26y: scope predicate present" "def is_reclaimable_inprogress
 check_pattern "ga-vw26y: pilot-story markers defined" "PILOT_STORY_MARKERS"
 check_pattern "ga-vw26y: terminal/parked exclusion set defined" "TERMINAL_PARKED_LABELS"
 check_pattern "ga-vw26y: do_reclaim resets status open" 'bd.*update|"update"'
-check_pattern "ga-64usm: STALE_ACTIVITY_TTL constant present" "STALE_ACTIVITY_TTL\s*=\s*1800"
-check_pattern "ga-64usm: session_owner_is_healthy helper present" "def session_owner_is_healthy"
-check_pattern "ga-64usm: parse_iso_epoch helper present" "def parse_iso_epoch"
-check_pattern "ga-64usm: session_activity_age helper present" "def session_activity_age"
+# ga-x3e7p: value-correctness of STALE_ACTIVITY_TTL==1800 is now
+# bead_state.py's own responsibility (test_bead_state.py), not this
+# guard-specific grep — the guard only needs to prove it imported the name.
+check_pattern "ga-64usm: STALE_ACTIVITY_TTL constant present" "STALE_ACTIVITY_TTL"
+check_pattern "ga-64usm: session_owner_is_healthy helper present" "def session_owner_is_healthy|session_owner_is_healthy"
+check_pattern "ga-64usm: parse_iso_epoch helper present" "def parse_iso_epoch|parse_iso_epoch"
+check_pattern "ga-64usm: session_activity_age helper present" "def session_activity_age|session_activity_age"
 check_pattern "ga-64usm: session_is_live consults last_active" "last_active"
 
 # ---------------------------------------------------------------------------
