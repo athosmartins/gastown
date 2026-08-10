@@ -1481,7 +1481,15 @@ def list_live_sling_source_beads(sessions, now):
     # hiccup here just means fewer sling-protections apply for one cycle,
     # not a whole-cycle abort; this function computes a fresh, non-persisted
     # set each cycle, so there is no accumulated state for a hiccup to wipe).
-    for _rig_name, rig_path in (_list_rig_stores() or []):
+    # ga-1qqoi: that fallback was silent — a genuine `gc rig list` failure
+    # was indistinguishable from a real zero-non-HQ-rigs cycle in every log
+    # this guard writes. Signal it before falling back; behavior unchanged.
+    _rig_stores = _list_rig_stores()
+    if _rig_stores is None:
+        print("[INFLIGHT-RECLAIM] warn: gc rig list failed — sling-owner "
+              "protection covers HQ only this cycle", flush=True)
+        _rig_stores = []
+    for _rig_name, rig_path in _rig_stores:
         try:
             r = subprocess.run(
                 ["bd", "-C", rig_path, "list", "--status", "in_progress",
@@ -1618,7 +1626,14 @@ def list_refused_sling_source_beads():
     # ga-u8fly: `or []` preserves this function's own documented fail-open
     # contract when _list_rig_stores() reports a genuine enumeration
     # failure (None) — see the sibling comment in list_live_sling_source_beads.
-    for _rig_name, rig_path in (_list_rig_stores() or []):
+    # ga-1qqoi: that fallback was silent — signal it before falling back;
+    # behavior (fail-open, HQ-only this cycle) is unchanged.
+    _rig_stores = _list_rig_stores()
+    if _rig_stores is None:
+        print("[INFLIGHT-RECLAIM] warn: gc rig list failed — refused-sling "
+              "bridge covers HQ only this cycle", flush=True)
+        _rig_stores = []
+    for _rig_name, rig_path in _rig_stores:
         for status in ("open", "in_progress"):
             try:
                 r = subprocess.run(
@@ -2587,7 +2602,14 @@ def list_orphan_sweep_false_resets():
     # ga-u8fly: `or []` preserves this function's own documented fail-open
     # contract ("[] on query error... never worse than not healing at all")
     # when _list_rig_stores() reports a genuine enumeration failure (None).
-    for _rig_name, rig_path in (_list_rig_stores() or []):
+    # ga-1qqoi: that fallback was silent — signal it before falling back;
+    # behavior (fail-open, HQ-only this cycle) is unchanged.
+    _rig_stores = _list_rig_stores()
+    if _rig_stores is None:
+        print("[INFLIGHT-RECLAIM] warn: gc rig list failed — orphan-sweep "
+              "self-heal scan covers HQ only this cycle", flush=True)
+        _rig_stores = []
+    for _rig_name, rig_path in _rig_stores:
         try:
             r = subprocess.run(
                 ["bd", "-C", rig_path, "list", "--status", "open",
@@ -6045,6 +6067,74 @@ def _selftest():
     )
     check("RGL-5 (ga-u8fly): rig-store bd list call includes --limit 0",
           _rig_calls_have_limit_0, f"calls={_rig_bd_list_calls}")
+
+    # --- RGL-6..8 (ga-1qqoi, sibling of ga-x3e7p): three more list_*
+    # functions call _list_rig_stores() via `... or []`, deliberately
+    # preserving their OWN fail-open contract (ga-u8fly: each computes a
+    # fresh, non-persisted result every cycle, unlike list_inflight_beads/
+    # list_stranded_inprogress_beads above, so a rig-list hiccup here isn't
+    # the amnesia/prune hazard RGL-1..4 guard against) — but did so with zero
+    # signal. A genuine `gc rig list` failure was indistinguishable from a
+    # real zero-non-HQ-rigs cycle in every log this guard writes. Each check
+    # below confirms BOTH halves: the warning now fires, AND the fail-open
+    # return value/type is unchanged (no over-correction to None/abort —
+    # that would be the wrong fix, per ga-u8fly's own documented reasoning
+    # for why these three stay fail-open). ---
+    import io as _io
+
+    # RGL-6: list_live_sling_source_beads()
+    subprocess.run, _ = _rgl_stub(1, "")
+    _cap = _io.StringIO()
+    _orig_stdout = _sys.stdout
+    _sys.stdout = _cap
+    try:
+        _rgl_result6 = list_live_sling_source_beads({}, time.time())
+    finally:
+        _sys.stdout = _orig_stdout
+        subprocess.run = _orig_run_rgl
+    _out6 = _cap.getvalue()
+    check("RGL-6 (ga-1qqoi): list_live_sling_source_beads warns when gc rig "
+          "list fails",
+          "gc rig list failed" in _out6, f"captured={_out6!r}")
+    check("RGL-6 (ga-1qqoi): list_live_sling_source_beads still returns its "
+          "normal fail-open type (frozenset, not None) — behavior unchanged",
+          isinstance(_rgl_result6, frozenset), f"got {_rgl_result6!r}")
+
+    # RGL-7: list_refused_sling_source_beads()
+    subprocess.run, _ = _rgl_stub(1, "")
+    _cap = _io.StringIO()
+    _orig_stdout = _sys.stdout
+    _sys.stdout = _cap
+    try:
+        _rgl_result7 = list_refused_sling_source_beads()
+    finally:
+        _sys.stdout = _orig_stdout
+        subprocess.run = _orig_run_rgl
+    _out7 = _cap.getvalue()
+    check("RGL-7 (ga-1qqoi): list_refused_sling_source_beads warns when gc "
+          "rig list fails",
+          "gc rig list failed" in _out7, f"captured={_out7!r}")
+    check("RGL-7 (ga-1qqoi): list_refused_sling_source_beads still returns "
+          "its normal fail-open type (dict, not None) — behavior unchanged",
+          isinstance(_rgl_result7, dict), f"got {_rgl_result7!r}")
+
+    # RGL-8: list_orphan_sweep_false_resets()
+    subprocess.run, _ = _rgl_stub(1, "")
+    _cap = _io.StringIO()
+    _orig_stdout = _sys.stdout
+    _sys.stdout = _cap
+    try:
+        _rgl_result8 = list_orphan_sweep_false_resets()
+    finally:
+        _sys.stdout = _orig_stdout
+        subprocess.run = _orig_run_rgl
+    _out8 = _cap.getvalue()
+    check("RGL-8 (ga-1qqoi): list_orphan_sweep_false_resets warns when gc "
+          "rig list fails",
+          "gc rig list failed" in _out8, f"captured={_out8!r}")
+    check("RGL-8 (ga-1qqoi): list_orphan_sweep_false_resets still returns "
+          "its normal fail-open type (list, not None) — behavior unchanged",
+          isinstance(_rgl_result8, list), f"got {_rgl_result8!r}")
 
     # --- RCO-*: do_reclaim() must actually free the bead for re-dispatch.
     # bd assign refuses to overwrite another actor's live in_progress claim
