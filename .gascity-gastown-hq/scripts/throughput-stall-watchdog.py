@@ -272,10 +272,13 @@ def _canonical_is_braked(bead: dict):
     """True/False via bead_state.py's canonical park/state vocabulary, or None
     if the model is unavailable/erroring — the caller falls back to
     _bead_is_braked() (this file's park_labels-based check) on None. No
-    live_sessions/known_crews/merged passed: only the STATE NAME is read, and
-    none of _TSW_BRAKED_STATES's branches change name based on those inputs
-    (verified against bead_state.py's derive() — they only affect 'turn' and
-    'actions', which this check never reads)."""
+    live_sessions/known_crews/merged passed: derive()'s exec:manual branch DOES
+    pick between two different state names ('manual_assigned' vs
+    'manual_unrouted') based on known_crews, but both names are members of
+    _TSW_BRAKED_STATES below, so the braked verdict itself is unaffected by
+    leaving it at the default frozenset(). Every other branch in
+    _TSW_BRAKED_STATES uses a fixed state name regardless of these inputs —
+    they only ever vary 'turn'/'actions', which this check never reads."""
     if _CANONICAL_STATE_FN is None:
         return None
     try:
