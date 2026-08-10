@@ -533,10 +533,11 @@ reviewer_last_active_stale() {
 # — but it must not vanish silently either. Returns 0 if verified, 1 if not.
 # Args: <verdict_bead_id> <session_name> <context-label-for-logs>
 #
-# ga-mo7q: measured 30% of verdict beads created with assignee never set (this
-# was previously a bare 2-try loop with no backoff and no durable trace of a
-# final failure — a WARN line in the dispatcher log is the only record, and
-# nobody tails that log while a reviewer is stalling). Two changes:
+# ga-mo7q (now ga-qqtoo): measured 30% of verdict beads created with assignee
+# never set (this was previously a bare 2-try loop with no backoff and no
+# durable trace of a final failure — a WARN line in the dispatcher log is the
+# only record, and nobody tails that log while a reviewer is stalling). Two
+# changes from that fix:
 #   (a) 4 tries with a short sleep between attempts, not 2 back-to-back — the
 #       failures are consistent with transient read-after-write lag, and the
 #       cost of extra tries (<=3s) is negligible against the multi-minute gate
@@ -544,11 +545,25 @@ reviewer_last_active_stale() {
 #   (b) on final failure, label the bead `verdict:assignee-degraded` so it is
 #       cheaply queryable (a detector can find it, a human can grep for it)
 #       instead of leaving the only evidence in a log line. This does NOT
-#       replace the reviewer-side session_name fallback (ga-mo7q fix b, in the
-#       gate-reviewer prompt template) — it makes the degraded state visible
-#       independently of whether the reviewer's fallback happens to rescue it.
+#       replace the reviewer-side session_name fallback (the gate-reviewer
+#       prompt template) — it makes the degraded state visible independently
+#       of whether the reviewer's fallback happens to rescue it.
+#
+# ga-qqtoo: that fix only ever hardened the --assignee write. Measured live
+# 2026-08-10: 28 of 88 open verdict beads had BOTH assignee AND
+# metadata.gc.session_name null — genuinely unclaimable by either of the
+# reviewer poll's two documented channels, not just the assignee one. Two
+# real beads (ga-676t vs ga-yhxx, cited in gate-verdict-assignee-fallback.
+# selftest.sh) show the SAME `bd update --assignee` call sometimes lands
+# metadata.gc.session_name while the assignee column itself does not — so
+# check for that BEFORE burning a retry, and if all 4 attempts leave BOTH
+# fields unset, make one final EXPLICIT --set-metadata write (a distinct bd
+# write path from --assignee, so a race/contention scoped to the assignee
+# column specifically does not necessarily block it too) before giving up.
+# Every newly-linked bead now has this function try three distinct avenues,
+# not one, before it is allowed to end up silently unclaimable.
 assign_verdict_bead_verified() {
-  local _vb="$1" _sname="$2" _ctx="${3:-}" _seen _try
+  local _vb="$1" _sname="$2" _ctx="${3:-}" _seen _seen_meta _try
   [ -z "$_vb" ] && return 1
   [ -z "$_sname" ] && { warn "  Verdict-assign (${_ctx}): empty session name for bead ${_vb} — durable channel NOT wired."; return 1; }
   for _try in 1 2 3 4; do
@@ -566,9 +581,28 @@ assign_verdict_bead_verified() {
       [ "$_try" -gt 1 ] && log "  Verdict-assign (${_ctx}): bead ${_vb} → ${_sname} verified on retry ${_try}."
       return 0
     fi
+    # ga-qqtoo: the assignee write can partially land — see the header comment
+    # above. If metadata.gc.session_name is already there, the bead is
+    # discoverable via the reviewer's documented fallback channel; no need to
+    # keep chasing the assignee column specifically.
+    _seen_meta=$(bd -C "$GC_CITY" show "$_vb" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .metadata["gc.session_name"] // empty' 2>/dev/null || echo "")
+    if [ "$_seen_meta" = "$_sname" ]; then
+      log "  Verdict-assign (${_ctx}): bead ${_vb} assignee write didn't land but metadata.gc.session_name did (retry ${_try}) — durable link present via the fallback channel (ga-qqtoo)."
+      return 0
+    fi
     [ "$_try" -lt 4 ] && sleep 1
   done
-  warn "  Verdict-assign (${_ctx}): bead ${_vb} assignee read back as [${_seen:-None}], expected [${_sname}] after ${_try} attempts — durable pull channel DEGRADED (ga-mo7q). Labeling bead verdict:assignee-degraded (session_name-fallback + detector backstop)."
+  # ga-qqtoo: assignee retries exhausted AND metadata never landed as a side
+  # effect either. One last, EXPLICIT attempt at the metadata channel directly
+  # — a distinct bd write path, bounded to a single extra call, not a new
+  # retry loop.
+  bd -C "$GC_CITY" update "$_vb" --set-metadata "gc.session_name=$_sname" -q 2>/dev/null || true
+  _seen_meta=$(bd -C "$GC_CITY" show "$_vb" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .metadata["gc.session_name"] // empty' 2>/dev/null || echo "")
+  if [ "$_seen_meta" = "$_sname" ]; then
+    log "  Verdict-assign (${_ctx}): bead ${_vb} assignee never verified, but an explicit metadata.gc.session_name write succeeded — durable link established (ga-qqtoo)."
+    return 0
+  fi
+  warn "  Verdict-assign (${_ctx}): bead ${_vb} — BOTH assignee (read back as [${_seen:-None}], expected [${_sname}]) AND an explicit metadata.gc.session_name write failed after ${_try} attempts — durable pull channel DEGRADED, no known-working fallback (ga-qqtoo). Labeling bead verdict:assignee-degraded (detector backstop)."
   bd -C "$GC_CITY" label add "$_vb" "verdict:assignee-degraded" -q 2>/dev/null || true
   return 1
 }
