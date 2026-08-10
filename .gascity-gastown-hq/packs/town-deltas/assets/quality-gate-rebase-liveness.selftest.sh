@@ -470,6 +470,116 @@ grep -qF "re-anchoring means 'git merge origin/\$DEFAULT_BRANCH' into \$BRANCH, 
   && ok "dead-author genuine-conflict marker comment advises merge (not rebase) for a merge-commit-tip branch" \
   || bad "dead-author genuine-conflict merge-not-rebase advice missing/reworded"
 
+# ── 11. ga-gxbxu: rebase-liveness keyed on the branch's OWN commit author,
+#     never the /gate-done SUBMITTER ───────────────────────────────────────
+# BUG (ga-gxbxu): gate.submitted_by names who ran /gate-done — reliable for
+# AUTHORIZATION/AUDIT (untouched by this fix: AUTHOR/AUTHOR_TRUSTED_SUBMIT
+# still derive from it exactly as before) but WRONG for "is someone live who
+# could be pushing this branch right now" whenever a THIRD party submits on
+# someone else's already-pushed branch (a rescue/resubmission marker).
+# Measured live: marker ga-ikk0i, gate.submitted_by=gastown__mayor (67-day
+# uptime, functionally immortal), but all 5 of the branch's own commits were
+# authored by gastown.dog-1 (already exited per normal dog doctrine: close
+# bead, exit, pool recycles the slot). "Author alive" read permanently true
+# off the wrong identity, so the branch waited forever for a push race that
+# was never going to happen — Mayor was never going to push it. Fix: resolve
+# the rebase-liveness identity from the branch's own git history FIRST
+# (branch_tip_commit_author, new — mirrors branch_tip_is_merge_commit's git_rig
+# usage above), falling back to the pre-existing trusted/crew/marker-author
+# chain unchanged when git history is unavailable.
+echo "── 11. ga-gxbxu: rebase-liveness keyed on the branch's OWN commit author, never the /gate-done SUBMITTER ──"
+
+echo "── 11a. resolve_rebase_author: branch commit author (new 4th arg) OUTRANKS trusted submitter ──"
+eq "commit author present → wins outright, even with a trusted submitter also present" \
+  "$(resolve_rebase_author "gastown__mayor" "fix/ga-gxbxu" "" "gastown.dog-1")" \
+  "gastown.dog-1"
+eq "reproduces the live incident: resolved author is the actual committer, never the eternal-uptime submitter" \
+  "$([ "$(resolve_rebase_author "gastown__mayor" "fix/ga-gxbxu" "" "gastown.dog-1")" != "gastown__mayor" ] && echo "excluded" || echo "leaked")" \
+  "excluded"
+eq "REGRESSION (acceptance criterion): commit author omitted (3-arg call) → unchanged pre-ga-gxbxu behavior, trusted submitter still wins — nothing was deleted, only reordered" \
+  "$(resolve_rebase_author "gastown__mayor" "fix/ga-gxbxu" "")" \
+  "gastown__mayor"
+eq "commit author literal 'null' (unresolvable-ref artifact) treated as absent → falls to trusted submitter" \
+  "$(resolve_rebase_author "gastown__mayor" "fix/ga-gxbxu" "" "null")" \
+  "gastown__mayor"
+eq "commit author empty, trusted also absent → falls through to crew branch segment exactly as ga-6dp9 established" \
+  "$(resolve_rebase_author "" "crew/wa-worker/wa-aed6l" "" "")" \
+  "wa-worker"
+eq "commit author empty, no trusted, no crew → falls to marker author exactly as ga-6dp9 established" \
+  "$(resolve_rebase_author "" "fix/ga-6dp9-desc" "some-dog" "")" \
+  "some-dog"
+
+echo "── 11b. branch_tip_commit_author: real git fixture, not string matching ──"
+_AUTHOR_FIXTURE_REPO="$(mktemp -d "${TMPDIR:-/tmp}/gc-gate-commitauthor-fixture.XXXXXX")"
+git -C "$_AUTHOR_FIXTURE_REPO" init -q -b main
+git -C "$_AUTHOR_FIXTURE_REPO" -c user.email="t@t" -c user.name="t" commit -q --allow-empty -m "root"
+git -C "$_AUTHOR_FIXTURE_REPO" -c user.email="t@t" -c user.name="t" branch dog-branch
+git -C "$_AUTHOR_FIXTURE_REPO" -c user.email="t@t" -c user.name="t" checkout -q dog-branch
+git -C "$_AUTHOR_FIXTURE_REPO" -c user.email="gastown.dog-1@gascity.local" -c user.name="gastown.dog-1" \
+  commit -q --allow-empty -m "dog's own fix commit"
+
+# git_rig, as sourced from the dispatcher in lib-only mode, is UNDEFINED here
+# (same reasoning as section 10a above) — shim it to the fixture repo.
+git_rig() { git -C "$_AUTHOR_FIXTURE_REPO" "$@"; }
+
+eq "branch tip authored by gastown.dog-1 → echoes 'gastown.dog-1' (the real, git-verified committer)" \
+  "$(branch_tip_commit_author "dog-branch")" \
+  "gastown.dog-1"
+eq "empty ref → '' (fail toward resolve_rebase_author's existing fallback chain, never a guess)" \
+  "$(branch_tip_commit_author "")" \
+  ""
+eq "unresolvable ref → '' (same fail-safe direction)" \
+  "$(branch_tip_commit_author "refs/heads/does-not-exist-xyz")" \
+  ""
+
+unset -f git_rig
+rm -rf "$_AUTHOR_FIXTURE_REPO"
+
+echo "── 11c. End-to-end: the exact reported incident (marker ga-ikk0i shape) now resolves off the real committer ──"
+# "gastown.dog" (bare pool TEMPLATE, mirroring section 1's "wa-worker" probe)
+# can never be any real session's exact alias — real dog slots are always
+# numbered instances (gastown.dog-1, gastown.dog-2, ...) — so this
+# reproduces "the specific dog that wrote these commits is no longer
+# running" without depending on whatever dog-pool state happens to be live
+# when this selftest runs (same technique, same reasoning as section 5's
+# "wa-worker" probe above).
+_GXBXU_AUTHOR=$(resolve_rebase_author "gastown__mayor" "fix/ga-gxbxu" "" "gastown.dog")
+eq "incident: resolved rebase-liveness author is the real committer, not the immortal submitter" \
+  "$_GXBXU_AUTHOR" \
+  "gastown.dog"
+eq "incident: reproduces that resolution never leaks the submitter's identity into the liveness decision" \
+  "$([ "$_GXBXU_AUTHOR" != "gastown__mayor" ] && echo "excluded" || echo "leaked")" \
+  "excluded"
+_GXBXU_ALIVE=$(author_is_alive "$_GXBXU_AUTHOR")
+eq "incident: the exited dog's bare pool-template alias reads as dead — no more infinite wait on the eternal Mayor session" \
+  "$_GXBXU_ALIVE" \
+  "0"
+
+echo "── 11d. drift-guard: gate.submitted_by/AUTHOR_TRUSTED_SUBMIT untouched (still the audit/authorization identity), and the call site actually wires the new signal in ──"
+# REGRESSION GUARD (acceptance criterion: "quando o DONO da branch está vivo,
+# a supressão continua"): this fix does NOT touch REBASE_AUTHOR_ALIVE's own
+# definition, nor any of the branches that key off it (sections 3, 7, and 7b
+# above exercise those, unmodified by this change, and must still pass) — it
+# only changes WHICH identity string can win the priority chain that feeds
+# REBASE_AUTHOR. A live real author, however resolved, is still checked by
+# the same author_is_alive() and still drives the same bounce/retry
+# branches. A test that only proved "now it pushes" would pass equally if
+# the safeguard were deleted outright; sections 3/7/7b continuing to pass
+# unmodified, plus the "commit author omitted" non-regression case in 11a,
+# together prove the safeguard is retargeted, not disabled.
+grep -qF 'AUTHOR=$(printf '"'"'%s\n'"'"' "$VERIFY_JSON" | jq -r '"'"'if type=="array" then .[0] else . end | .metadata["gate.submitted_by"] // empty'"'"' 2>/dev/null || true)' "$DISPATCHER" \
+  && ok "AUTHOR is still derived from gate.submitted_by metadata (audit/authorization identity, unchanged by ga-gxbxu)" \
+  || bad "AUTHOR's gate.submitted_by derivation missing/reworded — this fix must NOT touch it"
+grep -qF 'AUTHOR_TRUSTED_SUBMIT="$AUTHOR"' "$DISPATCHER" \
+  && ok "AUTHOR_TRUSTED_SUBMIT snapshot still present, unchanged" \
+  || bad "AUTHOR_TRUSTED_SUBMIT snapshot missing — ga-6dp9 wiring regressed"
+grep -qF 'REBASE_BRANCH_COMMIT_AUTHOR=$(branch_tip_commit_author "$BRANCH_SHA")' "$DISPATCHER" \
+  && ok "REBASE_BRANCH_COMMIT_AUTHOR computed from BRANCH_SHA (the already-hardened, already-resolved branch tip) before the call" \
+  || bad "REBASE_BRANCH_COMMIT_AUTHOR computation missing/renamed"
+grep -qF 'REBASE_AUTHOR=$(resolve_rebase_author "$AUTHOR_TRUSTED_SUBMIT" "$BRANCH" "$MARKER_AUTHOR" "$REBASE_BRANCH_COMMIT_AUTHOR")' "$DISPATCHER" \
+  && ok "REBASE_AUTHOR call site passes the branch's own commit author as the new 4th argument — the fix is actually wired in, not just defined" \
+  || bad "REBASE_AUTHOR call site not updated — the fix is defined but never wired in"
+
 # ── Result ────────────────────────────────────────────────────────────────────
 echo ""
 if [ "$FAIL" = "0" ]; then
