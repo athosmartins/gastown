@@ -123,8 +123,8 @@ grep -Eq 'assign "\$BEAD_ID" ""'         "$GATE" && ok "gate clears source assig
 grep -q 'mail send mayor'                "$GATE" && ok "gate escalates to Mayor"             || bad "gate missing Mayor escalation"
 
 echo "── 6. drift-guard: pilot re-dispatches needs-fix, excludes needs-human ──"
-eq "pilot excludes gate:needs-human in every candidate query (13)" \
-   "$(grep -c 'exclude-label "gate:needs-human"' "$PILOT")" "13"
+eq "pilot excludes gate:needs-human in every candidate query (15)" \
+   "$(grep -c 'exclude-label "gate:needs-human"' "$PILOT")" "15"
 grep -q 'gate:needs-fix'   "$PILOT" && ok "pilot detects gate:needs-fix"        || bad "pilot missing gate:needs-fix path"
 grep -q 'GATE-FEEDBACK'    "$PILOT" && ok "pilot reads GATE-FEEDBACK comment"   || bad "pilot missing GATE-FEEDBACK read"
 grep -q 'GATE_FIX_SECTION' "$PILOT" && ok "pilot injects feedback into prompt"  || bad "pilot missing GATE_FIX_SECTION"
