@@ -2733,6 +2733,18 @@ gate_status_transition() {
 
   current=$(bd -C "$GC_CITY" show "$marker_id" --json 2>/dev/null \
     | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null)
+
+  # ga-qblq4: ADD before the REMOVE loop (same invariant as set_gate_status/
+  # ga-i0n83) — the prior order (remove every existing gate-status:* first,
+  # add the target last) has a window where the marker carries ZERO
+  # gate-status:* labels if interrupted, or simply while the remove loop is
+  # iterating a multi-label backlog. Zero is the dangerous state:
+  # gate-queue-composition.sh's classifier reads it as FANTASMA (safe to
+  # clean up), misreading live in-transition work as abandoned. Reordering
+  # trades that for at most two labels (old+new) briefly present, which the
+  # classifier reads as ambiguous/UNKNOWN instead — inert, not destructive.
+  bd -C "$GC_CITY" label add "$marker_id" "gate-status:$new_status" -q >/dev/null 2>&1 || true
+
   while IFS= read -r lbl; do
     case "$lbl" in
       gate-status:*)
@@ -2743,8 +2755,6 @@ gate_status_transition() {
   done <<EOF
 $current
 EOF
-
-  bd -C "$GC_CITY" label add "$marker_id" "gate-status:$new_status" -q >/dev/null 2>&1 || true
 
   # Verify + single repair pass: close the gap between our read above and
   # our write, in case a concurrent writer (e.g. the recovery watchdog) added
@@ -6410,12 +6420,19 @@ DESC=$(printf '%s\n' "$MARKER" | jq -r '.description // ""')
 log "Attempting to claim marker $MARKER_ID ..."
 
 # ── Step 1: Atomic claim — transition queued → dispatching ───────────────────
-# Remove queued label first. If another dispatcher process beat us, the re-fetch
-# will show the marker no longer in queued state.
-
-bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:queued" -q 2>/dev/null || true
-
-# Re-fetch to verify we won the race
+# ga-qblq4: verify FIRST (pure read, no mutation) — then add dispatching
+# BEFORE removing queued, same invariant as set_gate_status/ga-i0n83. The
+# prior shape (remove queued, THEN verify) put the live marker through a
+# window with ZERO gate-status:* labels while the verify+log steps ran below —
+# gate-queue-composition.sh's classifier reads "no gate-status label" as
+# FANTASMA (safe to clean up), so a marker caught in that window mid-claim,
+# live work, was misread as abandoned garbage (observed live: ga-4i49c read
+# 3x in ~2min, showed ready → FANTASMA → claimed — never actually orphaned).
+# Worst case now is a brief window with BOTH queued+dispatching, which the
+# classifier reads as ambiguous/UNKNOWN (its rule (b)) — inert, not
+# destructive — and the existing DISPATCHING_TTL_MINUTES self-heal (below,
+# ~L5774) already converges any marker stuck with two labels back to one via
+# set_gate_status, so this degraded state is not a dead end.
 VERIFY_JSON=$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null || echo "[]")
 VERIFY_LABELS=$(echo "$VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' 2>/dev/null || echo "")
 
@@ -6423,16 +6440,17 @@ if echo "$VERIFY_LABELS" | grep -q "gate-status:dispatching"; then
   log "Marker $MARKER_ID already dispatching by another process. Skipping."
   exit 0
 fi
-if echo "$VERIFY_LABELS" | grep -q "gate-status:queued"; then
-  log "Marker $MARKER_ID still queued after removal (race condition). Skipping."
+if ! echo "$VERIFY_LABELS" | grep -q "gate-status:queued"; then
+  log "Marker $MARKER_ID no longer queued (raced away before claim). Skipping."
   exit 0
 fi
 
-# We own it — add dispatching label
+# We believe we can claim it — add dispatching before removing queued.
 bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || {
   err "Failed to add gate-status:dispatching to $MARKER_ID. Aborting."
   exit 1
 }
+bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:queued" -q 2>/dev/null || true
 
 log "Marker $MARKER_ID claimed for dispatching."
 

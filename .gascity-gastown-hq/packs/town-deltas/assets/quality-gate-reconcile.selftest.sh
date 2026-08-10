@@ -1218,6 +1218,168 @@ case "$CLEAN_RESULT" in
 esac
 
 echo ""
+# ── 10. ga-qblq4: zero-gate-status-window closed at every remaining transition ──
+# Follow-up to ga-i0n83 (section 8, set_gate_status) and ga-7fwt1 (section 9,
+# dispatcher's simple inline pairs). Two more classes of site had the same
+# defect and survived both prior audits:
+#   (i)  The deliberate claim/lock sites (dispatcher queued→dispatching,
+#        guard ready→claimed). Section 9a's own comment above explicitly
+#        excused these: "they re-fetch and verify between remove and add —
+#        so they never match this shape and correctly never trigger this
+#        guard." That reasoning was INCOMPLETE: remove and add are not
+#        text-adjacent (verify/log code runs between them), but the LIVE
+#        MARKER still carries zero gate-status:* labels for the entire gap
+#        between the remove call and the add call, regardless of what
+#        non-label-mutating code executes in between. Observed live
+#        (ga-qblq4): marker ga-4i49c read 3x in ~2min showed
+#        ready → FANTASMA (0 gate-status, misclassified by
+#        gate-queue-composition.sh as abandoned) → claimed — it was never
+#        orphaned, only mid-claim.
+#   (ii) gate_status_transition() (dispatcher — ga-ia7m7's own "replace ALL
+#        gate-status:* atomically" helper, ironically not itself immune) and
+#        four guard.sh blocks (Vector A's two reclaim branches, the
+#        author-unresolvable defer, and claimed→queued parking) — none of
+#        these route through set_gate_status, so ga-i0n83's fix never
+#        reached them. None of them are in $DISPATCHER either, so section
+#        9a's drift-guard (which only scans $DISPATCHER) never covered them.
+# All seven sites reordered to add-before-remove, the proven set_gate_status/
+# ga-i0n83 invariant: worst case is now a brief window with BOTH labels
+# present (read as ambiguous/UNKNOWN by the composition analyzer — inert),
+# never zero (read as FANTASMA — destructive).
+echo "── 10a. gate_status_transition() ADDs before it REMOVEs (ga-qblq4) ──"
+GC_CITY=/tmp/ga-qblq4-fake-city
+_MOCK_LABELS="gate-status:dispatching"
+_CALL_LOG=""
+bd() {
+  local verb="$3"
+  if [ "$verb" = "show" ]; then
+    local arr="" l
+    for l in $_MOCK_LABELS; do arr="${arr}\"$l\","; done
+    printf '[{"labels":[%s]}]' "${arr%,}"
+    return 0
+  fi
+  if [ "$verb" = "label" ]; then
+    local op="$4" lbl="$6"
+    _CALL_LOG="$_CALL_LOG $op:$lbl"
+    case "$op" in
+      remove) _MOCK_LABELS=$(printf '%s\n' $_MOCK_LABELS | grep -vx "$lbl" | tr '\n' ' ' || true) ;;
+      add)    printf '%s\n' $_MOCK_LABELS | grep -qx "$lbl" || _MOCK_LABELS="$_MOCK_LABELS $lbl" ;;
+    esac
+    return 0
+  fi
+  return 0
+}
+gate_status_transition "fake-marker" "ready"
+ADD_POS=$(printf '%s\n' $_CALL_LOG | grep -n '^add:gate-status:ready$'             | head -1 | cut -d: -f1 || true)
+REMOVE_POS=$(printf '%s\n' $_CALL_LOG | grep -n '^remove:gate-status:dispatching$' | head -1 | cut -d: -f1 || true)
+[ -n "$ADD_POS" ] && [ -n "$REMOVE_POS" ] && [ "$ADD_POS" -lt "$REMOVE_POS" ] \
+  && ok "gate_status_transition: add lands BEFORE remove — no zero-gate-status window (ga-qblq4)" \
+  || bad "REGRESSION ga-qblq4: gate_status_transition removed before (or without) add — reintroduces the zero-gate-status window"
+_n=$(printf '%s\n' $_MOCK_LABELS | grep -c '^gate-status:' || true)
+eq "gate_status_transition: still exactly ONE gate-status:* label once both calls land" "$_n" "1"
+unset -f bd
+
+echo "── 10b. deliberate claim/lock sites: add lands before remove (ga-qblq4) ──"
+# These two sites re-fetch and verify BETWEEN the mutating calls, so they are
+# not text-adjacent (section 9a's adjacency check would never catch a
+# regression here) — but their add/remove targets are each globally unique in
+# their own file, so a direct line-number comparison proves the real
+# invariant (does the ADD line execute before the REMOVE line) without
+# needing to execute the block.
+D_ADD_LINE=$(grep -Fn 'label add "$MARKER_ID" "gate-status:dispatching"' "$DISPATCHER" | head -1 | cut -d: -f1 || true)
+D_REMOVE_LINE=$(grep -Fn 'label remove "$MARKER_ID" "gate-status:queued"' "$DISPATCHER" | head -1 | cut -d: -f1 || true)
+if [ -n "$D_ADD_LINE" ] && [ -n "$D_REMOVE_LINE" ] && [ "$D_ADD_LINE" -lt "$D_REMOVE_LINE" ]; then
+  ok "dispatcher queued→dispatching claim: add (L$D_ADD_LINE) precedes remove (L$D_REMOVE_LINE)"
+else
+  bad "REGRESSION ga-qblq4: dispatcher queued→dispatching claim removes queued before (or without) adding dispatching (add=$D_ADD_LINE remove=$D_REMOVE_LINE)"
+fi
+
+G_ADD_LINE=$(grep -Fn 'label add "$MARKER_ID" "gate-status:claimed"' "$GUARD" | head -1 | cut -d: -f1 || true)
+G_REMOVE_LINE=$(grep -Fn 'label remove "$MARKER_ID" "gate-status:ready"' "$GUARD" | head -1 | cut -d: -f1 || true)
+if [ -n "$G_ADD_LINE" ] && [ -n "$G_REMOVE_LINE" ] && [ "$G_ADD_LINE" -lt "$G_REMOVE_LINE" ]; then
+  ok "guard ready→claimed claim: add (L$G_ADD_LINE) precedes remove (L$G_REMOVE_LINE)"
+else
+  bad "REGRESSION ga-qblq4: guard ready→claimed claim removes ready before (or without) adding claimed (add=$G_ADD_LINE remove=$G_REMOVE_LINE)"
+fi
+
+echo "── 10c. guard.sh Vector A / defer / park-as-queued: add before remove (ga-qblq4) ──"
+# These four blocks share label PAIRS with a sibling block (Vector A's two
+# branches both touch dispatching+claimed; defer and park-as-queued both
+# remove "claimed"), so a bare grep for the label text alone would match the
+# wrong block. Anchor on each block's own unique log/warn message instead and
+# scan a small forward window — robust to the ambiguity and to unrelated
+# line-number drift elsewhere in the file.
+check_add_before_remove_near_anchor() {
+  local file="$1" desc="$2" anchor="$3" window="${4:-6}"
+  local result
+  result=$(awk -v anchor="$anchor" -v window="$window" '
+    index($0, anchor) > 0 { anchor_line = NR; next }
+    anchor_line && NR <= anchor_line + window {
+      if (!add_line    && index($0, "label add")    > 0 && index($0, "gate-status:") > 0) add_line = NR
+      if (!remove_line && index($0, "label remove") > 0 && index($0, "gate-status:") > 0) remove_line = NR
+    }
+    END {
+      if (add_line && remove_line) {
+        if (add_line < remove_line) print "PASS " add_line " " remove_line
+        else print "FAIL_ORDER " add_line " " remove_line
+      } else {
+        print "FAIL_NOTFOUND " add_line+0 " " remove_line+0
+      }
+    }
+  ' "$file")
+  set -- $result
+  case "$1" in
+    PASS)         ok "$desc: add (L$2) precedes remove (L$3)" ;;
+    FAIL_ORDER)   bad "REGRESSION ga-qblq4: $desc — remove landed before add (add=L$2 remove=L$3)" ;;
+    *)            bad "REGRESSION ga-qblq4: $desc — could not locate add/remove near anchor (add=$2 remove=$3)" ;;
+  esac
+}
+check_add_before_remove_near_anchor "$GUARD" "Vector A requeue:queued" \
+  'Vector A: requeueing zombie dispatching marker'
+check_add_before_remove_near_anchor "$GUARD" "Vector A requeue:ready" \
+  'Vector A: re-readying zombie claimed marker'
+check_add_before_remove_near_anchor "$GUARD" "author-unresolvable defer" \
+  'Cannot determine author authoritatively for bead $BEAD_ID — DEFERRING'
+check_add_before_remove_near_anchor "$GUARD" "guard parks marker as queued" \
+  'Guard: parking marker $MARKER_ID as gate-status:queued for autonomous dispatcher'
+
+# (mutation-test) Prove 10c's helper is not vacuous: reinject a
+# remove-before-add shaped block behind a fresh (unique) anchor and confirm
+# it reports the failure shape — mirrors section 9a's own mutation-test
+# discipline.
+MUT_10C="$(mktemp)"
+cp "$GUARD" "$MUT_10C"
+python3 - "$MUT_10C" <<'PYEOF'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+anchor = 'log "Attempting to claim marker $MARKER_ID ..."\n'
+assert text.count(anchor) == 1, "anchor not unique — mutation-test needs a different anchor"
+injected = (
+    anchor
+    + '  bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:mut-old" -q 2>/dev/null || true\n'
+    + '  bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:mut-new" -q 2>/dev/null || true\n'
+)
+text = text.replace(anchor, injected, 1)
+open(path, 'w').write(text)
+PYEOF
+MUT_RESULT=$(awk -v anchor='Attempting to claim marker' -v window=6 '
+  index($0, anchor) > 0 { anchor_line = NR; next }
+  anchor_line && NR <= anchor_line + window {
+    if (!add_line    && index($0, "label add")    > 0 && index($0, "gate-status:") > 0) add_line = NR
+    if (!remove_line && index($0, "label remove") > 0 && index($0, "gate-status:") > 0) remove_line = NR
+  }
+  END {
+    if (add_line && remove_line && add_line < remove_line) print "PASS"
+    else print "CAUGHT"
+  }
+' "$MUT_10C")
+[ "$MUT_RESULT" = "CAUGHT" ] \
+  && ok "mutation-test: reinjecting a remove-before-add pair turns 10c's helper red — guard is not vacuous" \
+  || bad "mutation-test: 10c's helper did not detect a deliberately reinjected remove-before-add pair"
+rm -f "$MUT_10C"
+
+echo ""
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"
 if [ "$FAIL" -gt 0 ]; then echo "  RESULT: FAIL"; exit 1; fi

@@ -1683,9 +1683,13 @@ if [ "$TRANSIENT_COUNT" -gt 0 ]; then
     case "$ACTION" in
       requeue:queued)
         warn "Vector A: requeueing zombie dispatching marker $T_ID (age=${T_AGE}m, reclaims=${T_COUNT})"
+        # ga-qblq4: add queued BEFORE removing dispatching/claimed — same
+        # invariant as set_gate_status/ga-i0n83 — so the marker is never left
+        # with ZERO gate-status:* labels (misread as FANTASMA by
+        # gate-queue-composition.sh) mid-reclaim.
+        bd -C "$GC_CITY" label add    "$T_ID" "gate-status:queued"      -q 2>/dev/null || true
         bd -C "$GC_CITY" label remove "$T_ID" "gate-status:dispatching" -q 2>/dev/null || true
         bd -C "$GC_CITY" label remove "$T_ID" "gate-status:claimed"     -q 2>/dev/null || true
-        bd -C "$GC_CITY" label add    "$T_ID" "gate-status:queued"      -q 2>/dev/null || true
         [ "$T_COUNT" -gt 0 ] && \
           bd -C "$GC_CITY" label remove "$T_ID" "gate-reclaim-count:${T_COUNT}" -q 2>/dev/null || true
         bd -C "$GC_CITY" label add "$T_ID" "gate-reclaim-count:$((T_COUNT+1))" -q 2>/dev/null || true
@@ -1693,9 +1697,11 @@ if [ "$TRANSIENT_COUNT" -gt 0 ]; then
         ;;
       requeue:ready)
         warn "Vector A: re-readying zombie claimed marker $T_ID (age=${T_AGE}m, reclaims=${T_COUNT})"
+        # ga-qblq4: add ready BEFORE removing claimed/dispatching — same
+        # invariant as the requeue:queued branch above.
+        bd -C "$GC_CITY" label add    "$T_ID" "gate-status:ready"       -q 2>/dev/null || true
         bd -C "$GC_CITY" label remove "$T_ID" "gate-status:claimed"     -q 2>/dev/null || true
         bd -C "$GC_CITY" label remove "$T_ID" "gate-status:dispatching" -q 2>/dev/null || true
-        bd -C "$GC_CITY" label add    "$T_ID" "gate-status:ready"       -q 2>/dev/null || true
         [ "$T_COUNT" -gt 0 ] && \
           bd -C "$GC_CITY" label remove "$T_ID" "gate-reclaim-count:${T_COUNT}" -q 2>/dev/null || true
         bd -C "$GC_CITY" label add "$T_ID" "gate-reclaim-count:$((T_COUNT+1))" -q 2>/dev/null || true
@@ -2855,10 +2861,17 @@ MARKER_ID=$(printf '%s\n' "$MARKER" | jq -r '.id')
 
 log "Attempting to claim marker $MARKER_ID ..."
 
-# Remove ready label (may be a no-op if another sweep beat us)
-bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:ready" -q 2>/dev/null || true
-
-# Re-fetch the marker to verify its current state
+# ga-qblq4: verify FIRST (pure read, no mutation) — then add claimed BEFORE
+# removing ready, same invariant as set_gate_status/ga-i0n83 and mirroring the
+# dispatcher's queued→dispatching claim fix (quality-gate-dispatcher.sh Step
+# 1). The prior shape (remove ready, THEN verify) put the live marker through
+# a window with ZERO gate-status:* labels while the verify+log steps ran —
+# gate-queue-composition.sh's classifier reads that as FANTASMA (safe to
+# clean up), misreading a marker mid-claim as abandoned garbage. Worst case
+# now is a brief window with BOTH ready+claimed, which the classifier reads
+# as ambiguous/UNKNOWN — inert, not destructive — and Vector A's CLAIM_TTL
+# reclaim (this file) already converges a marker stuck with two labels back
+# to one.
 VERIFY_JSON=$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null || echo "{}")
 CURRENT_LABELS=$(echo "$VERIFY_JSON" | jq -r '(.labels // []) | join(",")' 2>/dev/null || echo "")
 
@@ -2867,17 +2880,17 @@ if echo "$CURRENT_LABELS" | grep -q "gate-status:claimed"; then
   exit 0
 fi
 
-if echo "$CURRENT_LABELS" | grep -q "gate-status:ready"; then
-  # Someone re-added ready, or remove failed silently; abort to avoid double dispatch
-  log "Marker $MARKER_ID still in ready state after remove attempt (race condition). Skipping."
+if ! echo "$CURRENT_LABELS" | grep -q "gate-status:ready"; then
+  log "Marker $MARKER_ID no longer ready (raced away before claim). Skipping."
   exit 0
 fi
 
-# We removed ready without another process adding claimed — add claimed atomically
+# We believe we can claim it — add claimed before removing ready.
 bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:claimed" -q 2>/dev/null || {
   err "Failed to add gate-status:claimed to $MARKER_ID. Aborting."
   exit 1
 }
+bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:ready" -q 2>/dev/null || true
 
 log "Marker $MARKER_ID claimed."
 
@@ -3096,8 +3109,10 @@ AUTHOR_AGENT=$(resolve_author_agent_alias "$AUTHOR")
 
 if [ -z "$AUTHOR" ] || [ "$AUTHOR" = "null" ]; then
   warn "Cannot determine author authoritatively for bead $BEAD_ID — DEFERRING (fail-safe)."
-  bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:claimed"  -q 2>/dev/null || true
+  # ga-qblq4: add deferred BEFORE removing claimed (same invariant as
+  # set_gate_status/ga-i0n83) — avoids a zero-gate-status window.
   bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:deferred" -q 2>/dev/null || true
+  bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:claimed"  -q 2>/dev/null || true
   # Bug 3 fix: no Mayor mail — author-unresolvable is a bead data issue, not a Mayor task.
   # Comment on the marker bead with diagnostic info; ntfy alerts Athos if needed.
   bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard deferred: cannot determine author authoritatively for bead $BEAD_ID.
@@ -3392,8 +3407,10 @@ log "Gate-run tracking bead: $GATE_RUN_ID"
 
 log "Guard: parking marker $MARKER_ID as gate-status:queued for autonomous dispatcher (G)."
 
-bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:claimed" -q 2>/dev/null || true
+# ga-qblq4: add queued BEFORE removing claimed (same invariant as
+# set_gate_status/ga-i0n83) — avoids a zero-gate-status window.
 bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:queued"  -q 2>/dev/null || true
+bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:claimed" -q 2>/dev/null || true
 bd -C "$GC_CITY" update "$GATE_RUN_ID" \
   --notes "Guard claimed marker and created gate-run bead. Marker queued for autonomous dispatcher (G)." \
   2>/dev/null || true
