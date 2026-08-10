@@ -126,10 +126,12 @@ def main():
         shape, guard_alive = guard_verdict(assignee, sessions, now, bead_update_age)
         prov_dead = claimant_provably_dead(assignee, sessions)
 
-        # Comparação justa: já consultamos sessões reais, então dashboard_alive
-        # não deveria ser None aqui (None = "não consultei" — não é o caso).
-        diverges = (dashboard_alive is not guard_alive) and not (
-            dashboard_alive is None and guard_alive is False)
+        # `live_names` sempre vem de sessões REAIS já consultadas (nunca None
+        # aqui — ver fetch_sessions, que aborta em vez de seguir com dados
+        # ausentes) então dashboard_alive nunca é o 3º valor (None = "não
+        # consultei"); a comparação binária abaixo é honesta, não um colapso.
+        assert dashboard_alive is not None, "sessões deveriam estar sempre consultadas aqui"
+        diverges = dashboard_alive is not guard_alive
         if diverges:
             divergences.append((bid, assignee, shape, dashboard_alive, guard_alive, prov_dead))
 
