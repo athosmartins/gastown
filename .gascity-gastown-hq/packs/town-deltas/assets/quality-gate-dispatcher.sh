@@ -3643,6 +3643,39 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
               fi
             else
               git -C "$TMP_MR_WT" rebase --abort 2>/dev/null || true
+              # ga-qukyp: rebase-replay can fail even when a real 3-way merge
+              # is clean — it replays each commit as a flat patch, and a
+              # branch containing its OWN prior merge commit (a normal,
+              # recommended re-anchor pattern) can choke replaying that
+              # merge's already-resolved changes against a base that has
+              # since moved again, even when the two sides' final trees don't
+              # overlap in any file. MR_CONFLICT=0 above already proved (via
+              # `git merge-tree`, a real 3-way merge simulation — not replay)
+              # that this specific pair merges clean, so a rebase failure here
+              # is a structural replay artifact, not a content conflict. Fall
+              # back to an actual merge, which is safe to push WITHOUT force
+              # (unlike rebase, merge never rewrites the branch's existing
+              # commits — it only adds one new commit whose first parent is
+              # the current tip, so pushing it is a genuine fast-forward).
+              if [ "$MR_CONFLICT" = "0" ] && git -C "$TMP_MR_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" merge "origin/$DEFAULT_BRANCH" -m "Merge origin/$DEFAULT_BRANCH into $BRANCH (gate auto-merge fallback — rebase-replay failed despite zero merge-tree conflict, ga-qukyp)" 2>/dev/null; then
+                local NEW_TIP_MRM
+                NEW_TIP_MRM=$(git -C "$TMP_MR_WT" rev-parse HEAD 2>/dev/null || echo "")
+                # ga-y9a1d/ga-qukyp: same collapse guard as the rebase path —
+                # a merge cannot silently drop this branch's commits the way
+                # a rebase replay can, but verify anyway rather than assume.
+                local NEW_TIP_MRM_VERDICT
+                NEW_TIP_MRM_VERDICT=$(branch_bead_commit_verdict \
+                  "$(git -C "$TMP_MR_WT" rev-list --count "${CUR_MAIN}..${NEW_TIP_MRM}" 2>/dev/null || echo "")" \
+                  "$(git -C "$TMP_MR_WT" log --format='%B' "${CUR_MAIN}..${NEW_TIP_MRM}" 2>/dev/null || echo "")" \
+                  "$BEAD_ID")
+                if [ -n "$NEW_TIP_MRM" ] && [ "$NEW_TIP_MRM_VERDICT" = "yes" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" 2>/dev/null; then
+                  MR_OK=1
+                  log "  Merge-time merge fallback (ga-qukyp): rebase-replay failed but merge-tree pre-check showed zero conflict — merged instead, pushed $BRANCH → $NEW_TIP_MRM"
+                else
+                  [ "$NEW_TIP_MRM_VERDICT" != "yes" ] && err "  Merge-time merge fallback (ga-qukyp): merge onto $CUR_MAIN did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$NEW_TIP_MRM_VERDICT) — refusing to push."
+                  git -C "$TMP_MR_WT" merge --abort 2>/dev/null || true
+                fi
+              fi
             fi
             git_rig worktree remove "$TMP_MR_WT" --force 2>/dev/null || true
           fi
@@ -3672,6 +3705,25 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
               fi
             else
               git -C "$TMP_MR_WT" rebase --abort 2>/dev/null || true
+              # ga-qukyp: see the container-rig branch above for the full
+              # rationale — same replay-vs-merge-tree mismatch, same fix,
+              # self-repo git access.
+              if [ "$MR_CONFLICT" = "0" ] && git -C "$TMP_MR_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" merge "origin/$DEFAULT_BRANCH" -m "Merge origin/$DEFAULT_BRANCH into $BRANCH (gate auto-merge fallback — rebase-replay failed despite zero merge-tree conflict, ga-qukyp)" 2>/dev/null; then
+                local NEW_TIP_MRM_SR
+                NEW_TIP_MRM_SR=$(git -C "$TMP_MR_WT" rev-parse HEAD 2>/dev/null || echo "")
+                local NEW_TIP_MRM_SR_VERDICT
+                NEW_TIP_MRM_SR_VERDICT=$(branch_bead_commit_verdict \
+                  "$(git -C "$TMP_MR_WT" rev-list --count "${CUR_MAIN}..${NEW_TIP_MRM_SR}" 2>/dev/null || echo "")" \
+                  "$(git -C "$TMP_MR_WT" log --format='%B' "${CUR_MAIN}..${NEW_TIP_MRM_SR}" 2>/dev/null || echo "")" \
+                  "$BEAD_ID")
+                if [ -n "$NEW_TIP_MRM_SR" ] && [ "$NEW_TIP_MRM_SR_VERDICT" = "yes" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" 2>/dev/null; then
+                  MR_OK=1
+                  log "  Merge-time merge fallback (self-repo, ga-qukyp): rebase-replay failed but merge-tree pre-check showed zero conflict — merged instead, pushed $BRANCH → $NEW_TIP_MRM_SR"
+                else
+                  [ "$NEW_TIP_MRM_SR_VERDICT" != "yes" ] && err "  Merge-time merge fallback (self-repo, ga-qukyp): merge onto $CUR_MAIN did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$NEW_TIP_MRM_SR_VERDICT) — refusing to push."
+                  git -C "$TMP_MR_WT" merge --abort 2>/dev/null || true
+                fi
+              fi
             fi
             git -C "$GIT_DIR_PATH" worktree remove "$TMP_MR_WT" --force 2>/dev/null || true
           fi
