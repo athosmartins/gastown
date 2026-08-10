@@ -159,14 +159,28 @@ def is_needs_human(labels) -> bool:
     reclaims gate:needs-human beads"). is_athos_page() reconhece SÓ ':product'
     como vez do Athos; is_needs_human() é o super-conjunto que outros
     consumidores (ex.: guardas de reclaim) precisam para nunca tocar o bead,
-    independente de QUEM especificamente deve agir (Athos vs Mayor/crew).
+    independente de QUEM especificamente deve agir (Athos vs Mayor/crew). O
+    gap real que motivou esta função: o CONSUMIDOR tinha seu próprio
+    interpretador privado deste vocabulário (_has_needs_human_label) — agora
+    delega direto pra cá, sem passar por derive().
 
-    ⚠️ Antes desta função, bead_state.py não tinha NENHUMA classificação para
-    'gate:needs-human:technical' (ou bare 'needs-human'/'gate:needs-human') —
-    nem is_athos_page (correto, testado: só ':product' é dele) nem PARK
-    (ausente de PARK_PREFIXES/PARK_EXACT). Um consumidor que substituísse
-    _has_needs_human_label por derive()["state"]=="parked" SEM esta função
-    teria regredido silenciosamente esse invariante.
+    ⚠️ CORREÇÃO (gate_run=ga-b5y6y, code review): uma versão anterior deste
+    docstring afirmava que bead_state.py não tinha NENHUMA classificação de
+    PARK para essas labels antes desta função — falso. PARK_PREFIXES já
+    continha as entradas bare "gate:needs-human" e "needs-human" (qualquer
+    sufixo, via _has_prefix's raw startswith) desde o commit-pai direto desta
+    branch (cfc0da088/ga-7qsxr) — confirmado por
+    test_gate_needs_human_qualquer_sufixo_e_park_exceto_product e
+    test_needs_human_bare_prefix_bugs_tech_debt_e_park, ambos já existentes
+    ANTES desta função. Como label_matches (":"/"-"-delimitado) é subconjunto
+    estrito de startswith cru sobre a mesma base, tudo que is_needs_human()
+    reconhece já era `park`-truthy — em derive()'s passo 4, `needs_human`
+    NUNCA é hoje a razão decisiva (`park` sempre vence primeiro no `or`). A
+    wiring continua lá DELIBERADAMENTE, como rede de segurança: se
+    PARK_PREFIXES um dia perder essas 2 entradas (ex.: alguém as julgar
+    duplicadas e "limpar"), needs_human sozinho ainda força 'parked' — ver
+    test_needs_human_wiring_e_load_bearing_independente_de_park_prefixes, que
+    simula exatamente esse cenário e prova a wiring load-bearing, não morta.
 
     Mecânica de casamento reusada de park_labels.label_matches (ga-hzt8s) —
     vocabulário (quais bases) é próprio desta função, igual ao que
@@ -451,6 +465,11 @@ def derive(bead: dict, live_sessions=None,
     # porque o passo 3 (is_athos_page) já capturou ':product' e retornou antes
     # de chegar neste ponto; qualquer needs-human restante é Mayor/crew, nunca
     # Athos, e nunca "sem classificação" (era o gap: caía direto em 'executing').
+    # ⚠️ `needs_human` é HOJE redundante com `park` — PARK_PREFIXES já cobre as
+    # mesmas 2 bases via raw startswith (ver docstring de is_needs_human()) —
+    # mas fica ligado de propósito como rede de segurança contra regressão
+    # futura de PARK_PREFIXES, provada load-bearing por
+    # test_needs_human_wiring_e_load_bearing_independente_de_park_prefixes.
     park = _has_prefix(L, PARK_PREFIXES) or next((l for l in L if l in PARK_EXACT), None)
     needs_human = is_needs_human(L)
     if park or needs_human or status == "deferred":

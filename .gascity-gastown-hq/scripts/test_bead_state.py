@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bead_state import (  # noqa: E402
     derive, holder_is_alive, is_athos_page, is_ephemeral, is_needs_human,
     claimant_provably_dead, session_owner_is_healthy, session_activity_age,
-    parse_iso_epoch, is_coordinator, EPHEMERAL_POOL_TEMPLATES,
+    parse_iso_epoch, is_coordinator, EPHEMERAL_POOL_TEMPLATES, STALE_ACTIVITY_TTL,
 )
 
 CREWS = frozenset({"mila-wa", "oracle-wa", "batista-wa", "batista-ps", "mayor"})
@@ -204,12 +204,23 @@ def test_outros_labels_park_absorvidos_de_pilot_dispatcher():
         assert derive(b(labels=labels), None, CREWS)["state"] == "parked", labels
 
 # ── needs-human: ga-x3e7p (absorvido de inflight-reclaim-guard.py) ───────────
-# Gap real encontrado lendo o consumidor: nada em bead_state.py classificava
-# 'gate:needs-human:technical' (nem bare 'needs-human'/'gate:needs-human') como
-# parqueado — is_athos_page corretamente só pega ':product'. Sem is_needs_human,
-# um bead nessas condições caía direto em 'executing' (status in_progress),
-# regredindo silenciosamente o invariante de segurança do consumidor ("NEVER
-# reclaims gate:needs-human beads").
+# Gap real: o CONSUMIDOR (inflight-reclaim-guard.py's _has_needs_human_label)
+# tinha seu PRÓPRIO interpretador privado deste vocabulário — exatamente a
+# doença que bead_state.py existe pra curar. is_needs_human() é o substituto
+# canônico, chamado DIRETAMENTE pelo consumidor (sem passar por derive()).
+#
+# ⚠️ CORREÇÃO (gate_run=ga-b5y6y, code review): uma versão anterior deste
+# comentário afirmava que bead_state.py/PARK não classificava NENHUMA forma
+# disso antes de is_needs_human() existir — falso. PARK_PREFIXES já cobria
+# bare 'gate:needs-human' e 'needs-human' (qualquer sufixo, via raw
+# startswith) desde o commit-pai direto desta branch (cfc0da088/ga-7qsxr) —
+# ver test_gate_needs_human_qualquer_sufixo_e_park_exceto_product e
+# test_needs_human_bare_prefix_bugs_tech_debt_e_park logo acima, ambos
+# escritos ANTES desta seção. Em derive()'s passo 4, `needs_human` é hoje
+# redundante com `park` (nunca é a razão decisiva) — mantido como rede de
+# segurança contra uma futura remoção das entradas de PARK_PREFIXES (ver
+# test_needs_human_wiring_e_load_bearing_independente_de_park_prefixes,
+# que prova a wiring load-bearing simulando esse cenário).
 
 def test_is_needs_human_pega_todas_as_variantes():
     assert is_needs_human(["needs-human"]) is True
@@ -222,12 +233,14 @@ def test_is_needs_human_pega_todas_as_variantes():
 
 
 def test_needs_human_nao_product_e_parked_nao_executing():
-    """A regressão que este teste existe pra prevenir: ANTES desta função, esta
-    bead caía em 'executing' (turn=crew) porque status=in_progress e nada
-    classificava o label como park. O invariante do consumidor é 'nunca
-    reclama' — 'executing' até funciona por acidente enquanto o holder está
-    vivo, mas expõe o bead a stranded assim que a sessão cair, o que o
-    consumidor original proíbe explicitamente."""
+    """Hoje esta cobertura vem de PARK_PREFIXES (bare 'gate:needs-human',
+    qualquer sufixo — cfc0da088/ga-7qsxr), não da wiring de needs_human em
+    derive() — is_needs_human() sozinho é redundante aqui HOJE (ver
+    test_needs_human_wiring_e_load_bearing_independente_de_park_prefixes para
+    o cenário em que ele passaria a ser decisivo). Continua útil como
+    regression-guard end-to-end via derive(), agora com a causa correta
+    documentada em vez da alegação original (falsa) de que nada parqueava
+    isto antes de is_needs_human()."""
     st = derive(b(status="in_progress", labels=["gate:needs-human:technical"],
                    assignee="mila-wa"), frozenset(), CREWS)
     assert st["state"] == "parked"
@@ -235,9 +248,43 @@ def test_needs_human_nao_product_e_parked_nao_executing():
 
 
 def test_needs_human_bare_tambem_e_parked():
+    """Mesma causa que o teste acima (PARK_PREFIXES, não a wiring) — mas para
+    a forma bare 'needs-human' isolada, caso não coberto por nenhum teste
+    anterior a esta seção (test_needs_human_bare_prefix_bugs_tech_debt_e_park
+    só exercitava a variante sufixada 'needs-human-followup')."""
     st = derive(b(status="in_progress", labels=["needs-human"], assignee="mila-wa"),
                 frozenset(), CREWS)
     assert st["state"] == "parked"
+
+
+def test_needs_human_wiring_e_load_bearing_independente_de_park_prefixes():
+    """A wiring de needs_human em derive()'s passo 4 é redundante com o
+    conteúdo ATUAL de PARK_PREFIXES — mas não é código morto: é rede de
+    segurança para o dia em que essas 2 entradas ("gate:needs-human",
+    "needs-human") forem removidas de PARK_PREFIXES (ex.: alguém as julgar
+    duplicadas de is_needs_human() e "limpar"). Simula esse cenário via
+    monkeypatch do módulo e prova que needs_human SOZINHO — sem nenhuma ajuda
+    de PARK_PREFIXES — ainda força 'parked'. Sem este teste, as duas asserções
+    acima passariam mesmo que a wiring fosse deletada (elas testam o
+    RESULTADO de derive(), que PARK_PREFIXES já garante sozinho); este é o
+    único teste que distingue "a wiring existe e funciona" de "a wiring
+    poderia ser apagada sem quebrar nada visível hoje"."""
+    import bead_state
+    original = bead_state.PARK_PREFIXES
+    try:
+        bead_state.PARK_PREFIXES = tuple(
+            p for p in original if p not in ("gate:needs-human", "needs-human")
+        )
+        st = derive(b(status="in_progress", labels=["gate:needs-human:technical"],
+                       assignee="mila-wa"), frozenset(), CREWS)
+        assert st["state"] == "parked"
+        assert st["reasons"]["despausar"] == "parkeado por needs-human"
+
+        st_bare = derive(b(status="in_progress", labels=["needs-human"],
+                            assignee="mila-wa"), frozenset(), CREWS)
+        assert st_bare["state"] == "parked"
+    finally:
+        bead_state.PARK_PREFIXES = original
 
 
 def test_needs_human_product_ainda_ganha_de_park_via_athos_page():
@@ -316,6 +363,21 @@ def test_provably_dead_um_vivo_um_morto_vence_o_vivo():
 
 
 # ── session_owner_is_healthy: ALIVE != WORKING (ga-64usm / ga-nlaa) ──────────
+
+def test_stale_activity_ttl_e_1800():
+    """Pina o VALOR exato, não só a presença do nome. packs/town-deltas/assets/
+    inflight-reclaim-guard.selftest.sh's check_pattern só grepa o guard-script
+    consumidor (scripts/inflight-reclaim-guard.py) — desde que STALE_ACTIVITY_TTL
+    migrou pra cá (ga-x3e7p), aquele arquivo só IMPORTA o nome, não atribui o
+    valor, então o regex antigo (STALE_ACTIVITY_TTL\\s*=\\s*1800) não bate mais
+    lá por desenho. O selftest.sh foi ajustado pra checar só a presença do nome,
+    com um comentário dizendo que a correção do VALOR agora é responsabilidade
+    deste arquivo — este teste é essa responsabilidade, cumprida. Os testes de
+    session_owner_is_healthy abaixo usam idades hardcoded (60, 9999) que
+    passariam pra qualquer TTL num range largo — não substituem esta asserção
+    exata sobre a constante de 30min (ga-64usm) que gate reclaim/zumbi depende."""
+    assert STALE_ACTIVITY_TTL == 1800
+
 
 def test_healthy_falso_se_nao_bateu_sessao_viva():
     assert session_owner_is_healthy(False, 10, 10) is False
