@@ -200,5 +200,76 @@ class TestStuckExecutionWho(unittest.TestCase):
         self.assertIn("ga-noone (?) parado há", result)
 
 
+class TestStuckExecutionCanonicalPark(unittest.TestCase):
+    """Covers ga-qhca1: STUCK_EXEC_EXCLUDE_LABELS was a private 2-label park
+    vocabulary that went stale hours after ga-e5tn8 patched it — it alarmed
+    'STALL CONFIRMADO' on ga-w4k2z, which carries needs:engine-window,
+    no-auto-dispatch (no 'pilot:' prefix) and pool:refused:engine-rebuild-
+    required, none of which were in the list. scripts/bead_state.py is the
+    city's single canonical park vocabulary; this dimension must defer to it
+    instead of maintaining its own copy."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.psw = _load_psw()
+
+    def setUp(self):
+        self._orig_sh = self.psw.sh
+        self._orig_stuck_sec = self.psw.STUCK_EXEC_SEC
+        self.psw.STUCK_EXEC_SEC = 60  # deterministic 1min threshold for the test
+
+    def tearDown(self):
+        self.psw.sh = self._orig_sh
+        self.psw.STUCK_EXEC_SEC = self._orig_stuck_sec
+
+    def _stub_bd_list(self, bead):
+        payload = json.dumps([bead])
+
+        def _fake_sh(args, timeout=20):
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout=payload, stderr="")
+
+        self.psw.sh = _fake_sh
+
+    def test_ga_w4k2z_labels_excluded_via_canonical_model(self):
+        """The exact real-world miss: none of these 3 labels are in the old
+        hardcoded STUCK_EXEC_EXCLUDE_LABELS set, but all resolve to
+        state=='parked' under bead_state.derive() (needs:engine-window and
+        pool:refused are PARK_PREFIXES; no-auto-dispatch is PARK_EXACT)."""
+        self._stub_bd_list({
+            "id": "ga-w4k2z",
+            "assignee": "some-crew",
+            "labels": ["needs:engine-window", "no-auto-dispatch",
+                       "pool:refused:engine-rebuild-required"],
+            "updated_at": "1970-01-01T00:00:00Z",
+        })
+        result = self.psw.stuck_execution(now=100000.0)
+        self.assertIsNone(result)
+
+    def test_old_exclude_labels_still_excluded(self):
+        """Regression guard: the pre-existing vocabulary (pilot:no-auto-dispatch,
+        story:awaiting-external-merge — ga-e5tn8) must keep working after the
+        swap to the canonical model."""
+        self._stub_bd_list({
+            "id": "ga-old1",
+            "assignee": "some-crew",
+            "labels": ["story:awaiting-external-merge"],
+            "updated_at": "1970-01-01T00:00:00Z",
+        })
+        self.assertIsNone(self.psw.stuck_execution(now=100000.0))
+
+    def test_genuinely_stuck_bead_still_flagged(self):
+        """Regression guard: a bead with no park label at all must still
+        flag — the canonical swap must not become a blanket suppressor."""
+        self._stub_bd_list({
+            "id": "ga-reallystuck",
+            "assignee": "some-crew",
+            "labels": [],
+            "updated_at": "1970-01-01T00:00:00Z",
+        })
+        result = self.psw.stuck_execution(now=100000.0)
+        self.assertIsNotNone(result)
+        self.assertIn("ga-reallystuck", result)
+
+
 if __name__ == "__main__":
     unittest.main()

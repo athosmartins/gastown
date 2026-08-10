@@ -67,6 +67,17 @@ _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 from gc_ledger import gc_ledger_append as _ledger
 import datetime as _datetime
 
+# ga-qhca1: scripts/bead_state.py is the city's single canonical park
+# vocabulary (10 consumers used to each keep their own copy; every state bug
+# measured 2026-08-09 was a disagreement between two of them). Import is
+# DEFENSIVE and FAIL-OPEN to the old local list below — never crashes the
+# loop, matching this module's own design principle.
+_CANONICAL_STATE_FN = None
+try:
+    from bead_state import derive as _CANONICAL_STATE_FN  # type: ignore
+except Exception:
+    _CANONICAL_STATE_FN = None
+
 # ── paths / identities ───────────────────────────────────────────────────────
 CITY = os.environ.get("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
 DISPATCH_LOG = os.path.join(CITY, ".gc/logs/quality-gate-dispatcher.log")
@@ -308,7 +319,26 @@ def merge_stall(now=None):
 # (kill+redispatch). Flagging either as STUCK-EXECUTION contradicts what the
 # bead already says about its own state — see ga-5ksp5, flagged after 15h
 # while carrying both labels.
+#
+# ga-qhca1: this 2-label set is now a FALLBACK ONLY, used when the canonical
+# model (bead_state.py) is unavailable. It went stale hours after ga-e5tn8
+# created it: ga-w4k2z carried needs:engine-window, no-auto-dispatch (no
+# 'pilot:' prefix) and pool:refused:engine-rebuild-required — none in this
+# list — and still alarmed "STALL CONFIRMADO". See _canonical_is_parked().
 STUCK_EXEC_EXCLUDE_LABELS = {"story:awaiting-external-merge", "pilot:no-auto-dispatch"}
+
+
+def _canonical_is_parked(bead: dict):
+    """True/False via scripts/bead_state.py's canonical park vocabulary, or
+    None if the model is unavailable/erroring — the caller falls back to
+    STUCK_EXEC_EXCLUDE_LABELS on None. No live_sessions passed: this check
+    only reads park labels, never a liveness verdict."""
+    if _CANONICAL_STATE_FN is None:
+        return None
+    try:
+        return _CANONICAL_STATE_FN(bead).get("state") == "parked"
+    except Exception:
+        return None
 
 
 # ── DIMENSION 3: stuck-execution ──────────────────────────────────────────────
@@ -328,8 +358,11 @@ def stuck_execution(now=None):
     for b in beads:
         if not isinstance(b, dict):
             continue
-        if STUCK_EXEC_EXCLUDE_LABELS.intersection(b.get("labels") or []):
-            continue  # ga-e5tn8: legitimately waiting/parked, not an execution stall
+        parked = _canonical_is_parked(b)
+        if parked is True:
+            continue  # bead_state.py: deliberately parked, not an execution stall
+        if parked is None and STUCK_EXEC_EXCLUDE_LABELS.intersection(b.get("labels") or []):
+            continue  # canonical model unavailable — fall back to the old local list
         e = parse_iso_epoch(b.get("updated_at") or b.get("updated") or b.get("updatedAt"))
         if e is None:
             continue  # can't age it → don't flag (fail-safe)
