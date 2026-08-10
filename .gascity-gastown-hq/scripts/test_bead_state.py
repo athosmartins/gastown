@@ -432,3 +432,52 @@ def test_armed_sem_flowing_continua_ready():
                   metadata={"gc.routed_to": "gastown.dog"}),
                 None, CREWS)
     assert st["state"] == "ready"
+
+
+# ── família "blocked" / "needs:rehome" (ga-98inr, gate_run=ga-wdl56 fix-attempt 2) ──
+# Reviewer mediu, com as funções REAIS de _canonical_is_braked vs. o antigo
+# _bead_is_braked (park_labels.label_matches: exato, ou sufixo ":"/"-"), que
+# bead_state.py não era o superset assumido — estas 5 formas batiam no antigo
+# check e não no canônico, silenciosamente ENCOLHENDO a exclusão de backlog.
+
+def test_blocked_bare_e_parked():
+    assert derive(b(labels=["story:approved", "blocked"]), None, CREWS)["state"] == "parked"
+
+
+def test_blocked_on_e_parked():
+    assert derive(b(labels=["story:approved", "blocked-on"]), None, CREWS)["state"] == "parked"
+
+
+def test_blocked_on_external_e_parked():
+    assert derive(b(labels=["story:approved", "blocked-on-external"]), None, CREWS)["state"] == "parked"
+
+
+def test_blocked_reason_capacity_e_parked():
+    assert derive(b(labels=["story:approved", "blocked-reason:capacity"]), None, CREWS)["state"] == "parked"
+
+
+def test_needs_rehome_property_e_parked():
+    """needs:rehome-property: label real citado por nome no docstring de
+    _bead_is_braked em throughput-stall-watchdog.py — zero beads na população
+    viva hoje (10/08), mas vocabulário documentado, não hipotético."""
+    assert derive(b(labels=["story:approved", "needs:rehome-property"]), None, CREWS)["state"] == "parked"
+
+
+def test_blocked_reason_decision_continua_vez_do_athos():
+    """Regressão: a nova entrada bare 'blocked' em PARK_PREFIXES não pode roubar
+    a vez do Athos de blocked-reason:decision — ATHOS_TURN (regra 3) roda ANTES
+    da regra 4 (park) e precisa continuar ganhando."""
+    st = derive(b(labels=["ctx:ready", "blocked-reason:decision"]), None, CREWS)
+    assert st["turn"] == "athos"
+    assert st["state"] == "awaiting_athos"
+
+
+def test_story_blocked_prefixado_continua_sem_vocabulario():
+    """Não-regressão deliberada: 'story:blocked' é EXACT (não prefixo) e formas
+    sufixadas (story:blocked:x, story:blocked-x) não têm evidência real em código
+    nem na população viva (medido 10/08) — ao contrário de 'blocked'/
+    'needs:rehome', que o docstring de outros arquivos cita por nome. Este teste
+    documenta o escopo, não um bug: widening especulativo sem evidência é o
+    mesmo erro de forma oposta (over-match em vez de under-match)."""
+    st = derive(b(labels=["story:approved", "story:blocked:algumacoisa"]), None, CREWS)
+    assert st["state"] != "parked"

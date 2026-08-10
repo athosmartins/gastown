@@ -3299,6 +3299,29 @@ def _selftest():
     else:
         _bad("ga-98inr-3", "expected None on canonical error, got %s" % _g98_err_got)
 
+    print("\nScenario ga-98inr-4: gate_run=ga-wdl56 fix-attempt-2 review finding — the NARROWING "
+          "direction ga-98inr-1/2/3 above never tested (reviewer's exact words: 'None test the "
+          "narrowing direction this bug lives in, so the regression ships green'). "
+          "_canonical_is_braked() must not return a confident False for label families "
+          "park_labels.py's _bead_is_braked() already recognized as braked — 5 concrete forms "
+          "the reviewer measured diverging before this fix.")
+    _g98n_cases = [
+        (["story:approved", "blocked"], "bare 'blocked'"),
+        (["story:approved", "blocked-on"], "'blocked-on'"),
+        (["story:approved", "blocked-on-external"], "'blocked-on-external'"),
+        (["story:approved", "blocked-reason:capacity"], "'blocked-reason:capacity'"),
+        (["story:approved", "needs:rehome-property"], "'needs:rehome-property'"),
+    ]
+    for _g98n_labels, _g98n_desc in _g98n_cases:
+        _g98n_bead = {"status": "open", "labels": list(_g98n_labels)}
+        _g98n_old = _bead_is_braked(set(_g98n_labels))
+        _g98n_new = _canonical_is_braked(_g98n_bead)
+        if _g98n_old is True and _g98n_new is True:
+            _ok("ga-98inr-4: %s → old=True new=True (canonical no longer narrows)" % _g98n_desc)
+        else:
+            _bad("ga-98inr-4", "%s: old=%s new=%s (canonical must agree with old=True, not narrow)"
+                 % (_g98n_desc, _g98n_old, _g98n_new))
+
     # ── cleanup ───────────────────────────────────────────────────────────────────
     _read_pilot_log_lines = None
     _read_gate_log_lines  = None

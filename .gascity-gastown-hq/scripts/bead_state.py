@@ -78,6 +78,33 @@ PARK_PREFIXES = (
     # ":" — só next-action:athos é exceção, e ATHOS_TURN/branch 3 já intercepta
     # ela antes deste branch.
     "next-action:",
+    # ga-98inr, gate_run=ga-wdl56 (fix-attempt 2): _canonical_is_braked() em
+    # throughput-stall-watchdog.py assumia este módulo era SUPERSET de
+    # park_labels.py's BLOCKED_FAMILY_LABELS — falso. Reviewer mediu 4 formas
+    # reais que só o antigo _bead_is_braked() (label_matches: exato, ou
+    # sufixo ":"/"-") reconhecia: {story:approved, blocked},
+    # {..., blocked-on}, {..., blocked-on-external},
+    # {..., blocked-reason:capacity} — PARK_PREFIXES só tinha "blocked:"/
+    # "blocked-on:"/"blocked-by:" (sufixo ":" apenas); a forma bare e a
+    # dash-sufixada não batiam. "blocked" bare aqui replica o MESMO idiom já
+    # usado acima p/ "gate:needs-human"/"needs-human" (startswith cru cobre
+    # exato + ":..." + "-..." num só entry) — cobre "blocked", "blocked-on",
+    # "blocked-on-external" e "blocked-reason:capacity" de uma vez (o "-"
+    # de "blocked-" já é prefixo de todos). "blocked-reason:decision"
+    # continua indo pro Athos: ATHOS_TURN (regra 3) roda ANTES desta regra 4,
+    # então só as OUTRAS variantes de blocked-reason: caem aqui. Confirmado
+    # NÃO redundante com o exact "story:blocked" (linha ~100): esse cobre só
+    # a forma com prefixo "story:", que "blocked" bare (sem "story:") não
+    # alcança.
+    "blocked",
+    # ga-98inr, idem — 5ª forma do mesmo achado: {story:approved,
+    # needs:rehome-property}. "needs:rehome-property" é label REAL, citado
+    # pelo nome no próprio docstring de _bead_is_braked em throughput-stall-
+    # watchdog.py — não tinha NENHUMA entrada aqui (nem prefixo nem exact).
+    # Zero beads na população viva carregam esta forma hoje (medido 10/08),
+    # mas é vocabulário documentado, não hipotético — mesmo padrão de
+    # "confirmado latente, não vivo ainda" do achado do reviewer.
+    "needs:rehome",
 )
 PARK_EXACT = frozenset({
     "framework:engine", "no-auto-dispatch", "pilot:no-auto-dispatch",
@@ -102,9 +129,13 @@ PARK_EXACT = frozenset({
     "engine-window:pending",  # distinto de needs:engine-window (Fase 2 batched
                                # deliberadamente, não bloqueada — nomes quase iguais,
                                # significados opostos)
-    # ga-98inr: idem — 10 e 1 ocorrências medidas na população viva (09/08),
-    # nenhuma das duas com forma sufixada observada.
-    "needs-label-review", "story:needs-human",
+    # ga-98inr: absorvido de park_labels.py — 10 ocorrências medidas na
+    # população viva (09/08), sem forma sufixada observada. "story:needs-human"
+    # NÃO é nova aqui (não-blocking, achado pelo reviewer no gate_run=ga-wdl56):
+    # já estava presente linha ~100 desde antes desta fatia (commit cfc0da0882)
+    # — frozenset dedup tornava a duplicata inofensiva, mas o comentário
+    # anterior implicava 2 absorções novas quando só "needs-label-review" é.
+    "needs-label-review",
 })
 # ga-98inr: pilot:reclaim-count:N é um LIMIAR NUMÉRICO, não um label a listar —
 # a mesma lição que park_labels.py já pagou uma vez (ga-hzt8s comment: uma versão
