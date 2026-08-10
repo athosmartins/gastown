@@ -149,6 +149,7 @@ FROZEN_KILL_SECS = int(os.environ.get("GRW_FROZEN_KILL_SECS", "900"))           
 FROZEN_KILL_MAX_PER_SWEEP = int(os.environ.get("GRW_FROZEN_KILL_MAX_PER_SWEEP", "2"))  # blast-radius cap: if MANY reviewers are silent at once (systemic Dolt/quota outage) killing them only churns — cap it and let the infra detectors + Mayor escalation handle a mass outage
 GRW_FROZEN_REQUEUE_ENABLED = os.environ.get("GRW_FROZEN_REQUEUE_ENABLED", "1") != "0"  # ga-pp5vh: after FIX 3 kills a confirmed-frozen reviewer, ALSO supersede+requeue its now-orphaned run if that reviewer was the run's sole pending one — closing the ~15min(kill)->~29min(dispatcher Phase C timeout) gap that zeroed gate throughput 2026-07-22. Independent toggle from GRW_REAP_FROZEN_ENABLED so the requeue extension can be killed without disabling the frozen-reviewer kill itself.
 GRW_FROZEN_PERMISSION_CHECK_ENABLED = os.environ.get("GRW_FROZEN_PERMISSION_CHECK_ENABLED", "1") != "0"  # ga-42nfj: before a SUSTAINED-confirmed frozen reviewer is killed, check whether its pane shows an OPEN PERMISSION-PROMPT DIALOG (same class of bug as ga-lxk26, different mechanism — reap_hung_runs (FIX 1)/agent-stuck-escalation.sh never see this path at all) and skip the kill + escalate instead of destroying a session that is one human keypress from resolving. Independent toggle from GRW_REAP_FROZEN_ENABLED, same precedent as GRW_FROZEN_REQUEUE_ENABLED, so the permission check can be killed without disabling the frozen-reviewer reap itself.
+GRW_SUPERSEDE_RECLAIM_VERDICTS_ENABLED = os.environ.get("GRW_SUPERSEDE_RECLAIM_VERDICTS_ENABLED", "1") != "0"  # ga-9as9h: neither FIX 1 (reap_hung_runs) nor FIX 3's requeue extension (_requeue_run_after_frozen_kill) ever touched the superseded run's own STILL-OPEN verdict bead(s) — only the run bead got closed. A reviewer session that outlives the kill (or gets revived under the same name later) has its OWN startup/poll check ONLY its assigned in_progress work; finding the stale verdict bead still open+assigned, it resumes reviewing a run that can never land a verdict again, while the run that actually needs it sits at zero reviewers. Measured live 2026-08-10: two reviewer sessions each burned a full review on a dead run's verdict bead in a row (3 supersedes on one source-bead chain) before a human manually repointed one by hand. Independent toggle from GRW_REAP_FROZEN_ENABLED/GRW_FROZEN_REQUEUE_ENABLED, same precedent as GRW_FROZEN_PERMISSION_CHECK_ENABLED, so this reclaim step can be killed without disabling the supersede/requeue it rides along with.
 # FIX 4 — reap a QUEUED marker whose SOURCE is done, and clear a STALE gate:reviewing
 # label that STARVES a queued marker. Root (2026-07-02, a 9h head-of-line stall): a
 # reviewer that DRAINS during startup leaves `gate:reviewing` on its SOURCE bead with
@@ -1791,6 +1792,85 @@ def _run_pending_reviewers(run_id):
     return pending
 
 
+def _close_pending_verdicts_for_run(rid, reason, context):
+    """ga-9as9h: after a run is superseded, close any of its STILL-OPEN verdict
+    beads (label gate-run:<rid>, status != closed). Without this, a superseded
+    run leaves its pending verdict bead(s) open AND still assigned to whatever
+    reviewer session was working them. If that session outlives the supersede
+    (a `gc session kill` that doesn't actually terminate it — e.g. it was
+    blocked at an interactive wall, not truly dead — or gets revived under the
+    SAME name later), its OWN startup/poll only ever checks its OWN assigned
+    in_progress work (`gc bd list --assignee=$GC_SESSION_NAME ...`); finding
+    the stale verdict bead still open+assigned, it resumes reviewing a run
+    that can never land a verdict again — while the run that actually needs a
+    reviewer sits at zero. MEASURED LIVE (2026-08-10): a source-bead's gate
+    went through 3 superseded-run cycles; two reviewer sessions each burned a
+    full review on a dead run's verdict bead (closed with a verdict nobody
+    could use) before a human noticed and manually repointed one by hand.
+
+    This makes supersede's aftermath safe regardless of WHY the session was
+    classified frozen/hung — including a misclassification (e.g. a session
+    blocked at a weekly-quota /login wall, which looks exactly like 'active
+    but silent' to the frozen-reviewer check; this was ga-9as9h's own trigger,
+    9 sessions at once). Closing the verdict bead is idempotent: if the stale
+    session eventually does resume and tries to comment/close it anyway, that
+    lands on an already-closed bead — inert, not destructive or duplicating
+    (the dispatcher only ever finalizes OPEN gate-status:running runs, and
+    this run is already superseded+closed by the caller before we get here).
+
+    Deliberately does NOT try to repoint the freed reviewer identity onto a
+    replacement run's verdict bead. The dispatcher already has exactly this
+    repoint pattern WITHIN one run's live dispatch (respawn_reviewer_slot +
+    assign_verdict_bead_verified, ga-vdurb) — reusing it ACROSS runs here
+    would mean threading a specific session name into the next dispatch
+    cycle, risking a second reviewer racing the same bead if the repoint and
+    a fresh spawn both land. Reclaim alone already satisfies the
+    supersede-must-not-strand-a-live-session requirement: the freed identity
+    becomes an ordinary idle pool slot, available the next time this watchdog
+    or the dispatcher needs one — slower than a live repoint (~210s spawn vs
+    the ~seconds a manual repoint took) but simple and race-free. Recorded
+    here as the deliberate tradeoff call, not an oversight.
+
+    Best-effort; never raises (mirrors every other mutating helper in this
+    file — a bug here must not turn a successful supersede into an unhandled
+    sweep exception). Returns the list of verdict-bead ids closed."""
+    closed = []
+    if not GRW_ENABLED or not GRW_SUPERSEDE_RECLAIM_VERDICTS_ENABLED:
+        return closed
+    if not rid:
+        return closed
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "--limit", "0", "--include-infra",
+            "-l", "gate-run:%s" % rid, "--json"])  # ga-h199q — same query shape as _run_pending_reviewers
+    if not r or r.returncode != 0:
+        return closed  # fail-safe: never guess which verdicts are pending
+    try:
+        rows = json.loads(r.stdout) or []
+    except Exception:
+        return closed
+    for row in rows:
+        vid = row.get("id")
+        if not vid or row.get("status") == "closed":
+            continue
+        if GRW_DRY_RUN:
+            print("[watchdog] %s DRY would close pending verdict bead=%s (run=%s superseded) — %s"
+                  % (context, vid, rid, reason), flush=True)
+            _recovery_ledger("would_close_pending_verdict",
+                             {"run": rid, "verdict": vid, "context": context, "dry_run": True})
+            continue
+        sh(["bd", "-C", CITY, "comment", vid,
+            "gate-recovery-watchdog %s: %s. Closing this verdict bead — its run %s is superseded and can never land a usable verdict; nobody should keep working it. (ga-9as9h)"
+            % (context, reason, rid)], timeout=25)
+        cr = sh(["bd", "-C", CITY, "close", vid, "-r",
+                 "verdict moot: run %s superseded (grw %s verdict-reclaim, ga-9as9h)" % (rid, context)], timeout=25)
+        if cr and cr.returncode == 0:
+            closed.append(vid)
+            _recovery_ledger("close_pending_verdict_on_supersede", {"run": rid, "verdict": vid, "context": context})
+    if closed:
+        print("[watchdog] %s: closed %d pending verdict bead(s) for superseded run=%s: %s"
+              % (context, len(closed), rid, ",".join(closed)), flush=True)
+    return closed
+
+
 def hung_run_verdict(age_sec, hang_sec, n_verdict_beads, n_delivered,
                      reviewer_active, delivered_after_resample):
     """PURE decision: should a gate-status:running gate-run be reaped as HUNG?
@@ -2058,6 +2138,17 @@ def reap_hung_runs(sessions, now, rstate, open_running_runs):
             % (age // 60, eff_total, ",".join(sorted(names)) or "none", LIVENESS_RESAMPLE_SEC, marker_id or "unknown")], timeout=25)
         sh(["bd", "-C", CITY, "close", rid,
             "-r", "gate-run superseded: reviewer hung (grw auto-reap — 0 verdicts, dead reviewer, age %dm)" % (age // 60)], timeout=25)
+        # ga-9as9h: reclaim this run's own pending verdict bead(s) too — see
+        # _close_pending_verdicts_for_run's docstring. Step 1 above already
+        # drains the non-active session(s), but that closes the SESSION, not
+        # the verdict BEAD it was assigned — if the drain doesn't stick, or
+        # the identity gets reused later, a revived session finds the stale
+        # bead exactly like the FIX 3 incident this fix is named for.
+        _close_pending_verdicts_for_run(
+            rid,
+            "its reviewer session(s) [%s] were dead/idle SUSTAINED across 2 samples and reaped by FIX 1 (0/%d verdicts delivered, age %dm)"
+            % (",".join(sorted(names)) or "none", eff_total, age // 60),
+            "FIX1")
         # 3) re-queue the marker (with the same carve-outs as FIX 2).
         marker_action = "no-marker"
         if marker_id:
@@ -2467,6 +2558,16 @@ def _requeue_run_after_frozen_kill(killed_session, sid, now, rstate, open_runnin
             % (sid, marker_id or "unknown")], timeout=25)
         sh(["bd", "-C", CITY, "close", rid,
             "-r", "gate-run superseded: sole pending reviewer frozen+killed (grw FIX3 requeue, ga-pp5vh)"], timeout=25)
+        # ga-9as9h: reclaim THIS run's own pending verdict bead(s) too — see
+        # _close_pending_verdicts_for_run's docstring. Without this, the killed
+        # session (if it outlives the kill, or gets revived under the same
+        # name) rediscovers its stale verdict bead via its own assignee poll
+        # and resumes reviewing a run that can never land a verdict again.
+        _close_pending_verdicts_for_run(
+            rid,
+            "its sole pending reviewer session %s was frozen (active but last_active silent >=%dm) and killed by FIX 3"
+            % (sid, FROZEN_KILL_SECS // 60),
+            "FIX3")
         # 2) hand the marker to the shared FIX6 requeue-or-escalate mechanism.
         marker_action = "no-marker"
         if marker_id:
@@ -3880,6 +3981,93 @@ def _selftest():
     # free — this pins that inheritance explicitly rather than relying on the general
     # non-active-state case above.
     ok(frozen_reviewer_verdict("creating", 5000, 900) == "keep", "booting session (state=creating) → keep, NEVER killed (boot-grace inherited for free, AC3 ga-pp5vh)")
+    # ga-9as9h: _close_pending_verdicts_for_run — the verdict-reclaim step FIX 1
+    # and FIX 3 both call right after superseding a run's OWN close. Same
+    # monkeypatched-sh() pattern as the set_gate_status_py check above (real
+    # function, fake subprocess layer): this helper's whole job IS bd
+    # list/comment/close calls, not pure logic, so it can't be tested purely.
+    # The list query always goes through the `bash BD_LIST_CACHED ...` wrapper
+    # (args[0]=="bash"); comment/close go through bare `bd` (args[0]=="bd").
+    _cpv_calls = []
+    def _fake_sh_cpv(args, timeout=20, stdin=None):
+        _cpv_calls.append(list(args))
+        if args and args[0] == "bash":
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout=json.dumps([
+                {"id": "vid-open-1", "status": "open", "assignee": "gate-reviewer-adhoc-aaa"},
+                {"id": "vid-closed-1", "status": "closed", "assignee": "gate-reviewer-adhoc-bbb"},
+                {"status": "open"},  # malformed row, no id — must be skipped, never crash
+            ]))
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="")
+    _real_sh_cpv = globals()["sh"]
+    try:
+        globals()["sh"] = _fake_sh_cpv
+        closed = _close_pending_verdicts_for_run("run-X", "test reason", "TESTCTX")
+        ok(closed == ["vid-open-1"],
+           "ga-9as9h: closes exactly the OPEN verdict bead, skips the already-closed one and the malformed row (got %r)" % closed)
+        close_calls = [c for c in _cpv_calls if len(c) > 3 and c[3] == "close"]
+        ok(len(close_calls) == 1 and close_calls[0][4] == "vid-open-1",
+           "ga-9as9h: exactly one bd close call, targeting the open verdict bead (not the closed one)")
+        ok(not any(len(c) > 4 and c[4] == "vid-closed-1" for c in _cpv_calls),
+           "ga-9as9h: the already-closed verdict bead is never touched (idempotent — no double-close)")
+    finally:
+        globals()["sh"] = _real_sh_cpv
+    # ga-9as9h: dry-run must never mutate — same convention as every other FIX.
+    _cpv_dry_calls = []
+    def _fake_sh_cpv_dry(args, timeout=20, stdin=None):
+        _cpv_dry_calls.append(list(args))
+        if args and args[0] == "bash":
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout=json.dumps([
+                {"id": "vid-open-2", "status": "open", "assignee": "gate-reviewer-adhoc-ccc"},
+            ]))
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="")
+    _real_sh_cpv_dry = globals()["sh"]
+    _real_dry_run = globals()["GRW_DRY_RUN"]
+    try:
+        globals()["sh"] = _fake_sh_cpv_dry
+        globals()["GRW_DRY_RUN"] = True
+        closed_dry = _close_pending_verdicts_for_run("run-Y", "test reason", "TESTCTX")
+        ok(closed_dry == [], "ga-9as9h: dry-run reports nothing 'closed' (mutation never applied)")
+        ok(not any(len(c) > 3 and c[0] == "bd" for c in _cpv_dry_calls),
+           "ga-9as9h: dry-run issues zero bd comment/close calls — read-only preview only")
+    finally:
+        globals()["sh"] = _real_sh_cpv_dry
+        globals()["GRW_DRY_RUN"] = _real_dry_run
+    # ga-9as9h: fail-safe on query failure — never guess which verdicts are pending.
+    def _fake_sh_cpv_fail(args, timeout=20, stdin=None):
+        return subprocess.CompletedProcess(args=args, returncode=1, stdout="")
+    _real_sh_cpv_fail = globals()["sh"]
+    try:
+        globals()["sh"] = _fake_sh_cpv_fail
+        ok(_close_pending_verdicts_for_run("run-Z", "test reason", "TESTCTX") == [],
+           "ga-9as9h: bd list failure (returncode!=0) → fail-safe empty, no blind close")
+    finally:
+        globals()["sh"] = _real_sh_cpv_fail
+    # ga-9as9h: the master toggle must short-circuit before any I/O at all.
+    _cpv_toggle_calls = []
+    def _fake_sh_cpv_toggle(args, timeout=20, stdin=None):
+        _cpv_toggle_calls.append(list(args))
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="[]")
+    _real_sh_cpv_toggle = globals()["sh"]
+    _real_toggle = globals()["GRW_SUPERSEDE_RECLAIM_VERDICTS_ENABLED"]
+    try:
+        globals()["sh"] = _fake_sh_cpv_toggle
+        globals()["GRW_SUPERSEDE_RECLAIM_VERDICTS_ENABLED"] = False
+        ok(_close_pending_verdicts_for_run("run-W", "test reason", "TESTCTX") == [],
+           "ga-9as9h: GRW_SUPERSEDE_RECLAIM_VERDICTS_ENABLED=False → no-op")
+        ok(_cpv_toggle_calls == [],
+           "ga-9as9h: disabled toggle short-circuits BEFORE any sh() call (zero I/O, not just zero mutation)")
+    finally:
+        globals()["sh"] = _real_sh_cpv_toggle
+        globals()["GRW_SUPERSEDE_RECLAIM_VERDICTS_ENABLED"] = _real_toggle
+    # ga-9as9h: wiring drift-guards — prove BOTH known supersede-then-leaves-a-
+    # verdict-bead-dangling call sites actually call the reclaim helper, not
+    # just that the helper exists and works in isolation. Mirrors the
+    # _source_review_state/_source_bead_state structural check above (same
+    # "helper exists but nobody wired it in" failure shape).
+    ok("_close_pending_verdicts_for_run(" in inspect.getsource(_requeue_run_after_frozen_kill),
+       "ga-9as9h: FIX 3 (_requeue_run_after_frozen_kill) calls the verdict-reclaim helper after superseding its run")
+    ok("_close_pending_verdicts_for_run(" in inspect.getsource(reap_hung_runs),
+       "ga-9as9h: FIX 1 (reap_hung_runs) calls the verdict-reclaim helper after superseding its run")
     # FIX 2 — error_requeue_verdict (gate-status:error marker requeue decision; now
     # branch-merge-aware, ga-hckn3 — ports FIX 4's orphan_marker_verdict/FIX 7's
     # deferred_requeue_verdict branch_state discipline to the sibling gate-status:error
