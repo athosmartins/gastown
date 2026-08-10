@@ -209,6 +209,63 @@ S4B_IDS="$(printf '%s' "$S4B_OUT" | jq -c '[.[].id]' 2>/dev/null)"
   && bad "AC4: gate:needs-fix carve-out bead must NOT be logged as excluded (it wasn't excluded)" \
   || ok "AC4: gate:needs-fix carve-out produces no exclusion line"
 
+echo ""
+echo "Scenario 4c: _filter_built — gate:prod-deploy:* is a post-deploy checklist item, NOT a gate-cycle state (ga-ds3bl)"
+# Regression for ga-ds3bl: gate:prod-deploy:needs-athos-test shares the gate:
+# prefix with real gate-cycle labels (gate:queued/reviewing/passed/...) but
+# means something unrelated ("Athos tests in prod post-deploy"). Before the
+# fix, _filter_built's prefix-match treated it as "already built" and starved
+# the bead forever (label never clears). A REAL gate-cycle label (gate:reviewing)
+# rides along in the same batch to prove the carve-out doesn't leak and mask
+# a bead that IS actually in the gate.
+cat > "$WORK/s4c.sh" <<EOF
+$LOG_FN
+$LE_FN
+$FB_FN
+export PILOT_TEST_BRANCH_BEADS=""
+export PILOT_TEST_GATE_OPEN_BEADS=""
+export PILOT_TEST_GATE_ACTIVE_BEADS=""
+INPUT='[{"id":"ga-postdeploy","labels":["story:approved","gate:prod-deploy:needs-athos-test"]},{"id":"ga-ingate2","labels":["gate:reviewing"]}]'
+printf '%s' "\$INPUT" | _filter_built
+EOF
+S4C_OUT="$(bash "$WORK/s4c.sh" 2>"$WORK/s4c.stderr")"
+S4C_IDS="$(printf '%s' "$S4C_OUT" | jq -c '[.[].id]' 2>/dev/null)"
+[ "$S4C_IDS" = '["ga-postdeploy"]' ] \
+  && ok "_filter_built KEEPS gate:prod-deploy:* bead (not a gate-cycle state) while still dropping the real gate:reviewing bead" \
+  || bad "_filter_built gate:prod-deploy carve-out broke (got: '$S4C_IDS')"
+grep -qF 'ga-postdeploy' "$WORK/s4c.stderr" \
+  && bad "AC4: ga-postdeploy must NOT be logged as excluded (gate:prod-deploy is not a gate-cycle label)" \
+  || ok "AC4: gate:prod-deploy:* carve-out produces no exclusion line"
+grep -qF '[pilot] EXCLUÍDO ga-ingate2 por _filter_built:' "$WORK/s4c.stderr" \
+  && grep -qF 'gate:* lifecycle label present' "$WORK/s4c.stderr" \
+  && ok "AC1: ga-ingate2 (real gate:reviewing) still excluded — carve-out doesn't leak into true gate-cycle labels" \
+  || bad "AC1: ga-ingate2 exclusion line missing/imprecise — gate:prod-deploy carve-out may have broken real gate detection"
+
+echo ""
+echo "Scenario 4d: gate-resident lane accounting — same ga-ds3bl carve-out, second (more subtle) occurrence"
+# ga-ds3bl's own analysis: the identical prefix-match predicate is DUPLICATED
+# at the IN_FLIGHT_GATE_RESIDENT_JSON computation (lane-cap accounting), and a
+# missed carve-out there has a DIFFERENT effect than in _filter_built: a bead
+# that is actually still BUILDING (only carrying gate:prod-deploy:*, never a
+# real gate-cycle label) would be miscounted as "already in the gate" and have
+# its lane slot freed for another bead — overbooking the lane while a builder
+# is still working it. Extracted VERBATIM (not retyped) so this can't drift
+# from the shipped statement.
+GR_STMT="$(sed -n '/^IN_FLIGHT_GATE_RESIDENT_JSON=/,/2>\/dev\/null || echo "\[\]")/p' "$DISPATCHER")"
+if [ -z "$GR_STMT" ]; then
+  bad "Scenario 4d: could not extract IN_FLIGHT_GATE_RESIDENT_JSON statement from $DISPATCHER — has it been renamed/refactored?"
+else
+  S4D_RESULT="$(bash -c "
+IN_FLIGHT_JSON='[{\"id\":\"ga-postdeploy\",\"labels\":[\"gate:prod-deploy:needs-athos-test\"]},{\"id\":\"ga-ingate3\",\"labels\":[\"gate:reviewing\"]},{\"id\":\"ga-plain\",\"labels\":[]}]'
+$GR_STMT
+printf '%s' \"\$IN_FLIGHT_GATE_RESIDENT_JSON\"
+" 2>/dev/null)"
+  S4D_IDS="$(printf '%s' "$S4D_RESULT" | jq -c '[.[].id]' 2>/dev/null)"
+  [ "$S4D_IDS" = '["ga-ingate3"]' ] \
+    && ok "gate-resident accounting excludes gate:prod-deploy:* (builder keeps its lane slot) while still counting the real gate:reviewing bead" \
+    || bad "gate-resident accounting regression (got: '$S4D_IDS', want: '[\"ga-ingate3\"]') — a gate:prod-deploy:* bead would wrongly free its lane slot mid-build"
+fi
+
 # ════════════════════════════════════════════════════════════════════════════
 echo ""
 echo "Scenario 5: _filter_unblocked (AC1 + AC4, fake bd shim)"

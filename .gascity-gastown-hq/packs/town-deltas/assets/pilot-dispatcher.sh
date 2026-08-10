@@ -2570,6 +2570,7 @@ _filter_built() {
                 and (. != "gate:needs-fix") and (startswith("gate:needs-fix:") | not)
                 and (. != "gate:needs-human") and (startswith("gate:needs-human") | not)
                 and (startswith("gate:fix-attempt:") | not)
+                and (startswith("gate:prod-deploy") | not)
               )) | length) > 0) then "1" else "0" end)
         ] | @tsv' 2>/dev/null)
 
@@ -4669,6 +4670,7 @@ IN_FLIGHT_GATE_RESIDENT_JSON=$(echo "$IN_FLIGHT_JSON" | jq '
       and (. != "gate:needs-fix") and (startswith("gate:needs-fix:") | not)
       and (. != "gate:needs-human") and (startswith("gate:needs-human") | not)
       and (startswith("gate:fix-attempt:") | not)
+      and (startswith("gate:prod-deploy") | not)
     )) ]' 2>/dev/null || echo "[]")
 [ -z "$IN_FLIGHT_GATE_RESIDENT_JSON" ] && IN_FLIGHT_GATE_RESIDENT_JSON="[]"
 GATE_RESIDENT=$(echo "$IN_FLIGHT_GATE_RESIDENT_JSON" | jq 'length' 2>/dev/null || echo "0")
