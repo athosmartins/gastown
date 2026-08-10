@@ -462,12 +462,14 @@ verdict_count_from_query() {
 #
 # Pure: no bd/gc I/O, deterministic given the input string — the selftest
 # exercises it directly with a fixture instead of a mocked bd.
+# SELFTEST-EXTRACT open-verdict-ids-from-json-fn: BEGIN
 open_verdict_ids_from_json() {
   local vbs="$1"
   printf '%s\n' "$vbs" \
     | jq -r '.[]? | select((.status // "") != "closed") | .id // empty' \
     2>/dev/null || true
 }
+# SELFTEST-EXTRACT open-verdict-ids-from-json-fn: END
 
 # companion_liveness_from_query <query_ok: 0|1> <marker_found_running: 0|1>
 # Pure decision (ga-qj1xh): what has_live_companion_run should be, given whether
@@ -1820,6 +1822,77 @@ close_dead_reviewer_verdicts() {
   done
 }
 
+# close_pending_verdicts_for_run <gate_run_id> <reason_text> — I/O helper (ga-hgsqg).
+# Generic sibling of close_dead_reviewer_verdicts above (ga-g4m18, wired only
+# into supersede:dead-reviewers) and _close_pending_verdicts_for_run in
+# gate-recovery-watchdog.py (ga-9as9h, that file's FIX 1/FIX 3) — same fix,
+# same shape, THIS file's remaining gap. Between them, ga-g4m18 and ga-9as9h
+# cover every OTHER place a gate-run bead gets superseded; supersede:marker,
+# abort:age and supersede:duplicate below never got the same cascade, so a
+# run closed via any of those three left its own pending verdict bead(s)
+# open forever — invisible to every consumer (Phase C only ever queries
+# gate-status:running, never --all) and unreachable by either sweep meant to
+# mop up stragglers: Step 0b.1 requires a non-empty, CONFIRMED-DEAD assignee
+# (reconcile_dead_reviewer_verdict_action's own rule 1: reviewer_alive=1 →
+# skip, regardless of parent state), Step 0b.2 requires the parent to be
+# CONFIRMED GONE via bd show (reconcile_orphaned_verdict_action: parent
+# "found" — even closed-but-still-resolvable — → skip, not orphaned). A run
+# closed by supersede:marker/abort:age/supersede:duplicate is neither: its
+# assignee may be empty AND alive, and its parent is "found", just closed.
+# MEASURED LIVE (ga-hgsqg, 2026-08-10): ga-yv9z9 (parent ga-4z58o) and
+# ga-ht83i (parent ga-gpiwx) — both empty-assignee, both stuck exactly this
+# way, though produced by gate-recovery-watchdog.py's FIX3 before ga-9as9h
+# closed that specific file's version of the same gap; used here as the
+# fixture shapes for this fix's own selftest.
+#
+# Deliberately UNCONDITIONAL on the verdict's own assignee/reviewer-liveness
+# — unlike reconcile_dead_reviewer_verdict_action's grace/liveness gate, this
+# helper only ever runs AFTER the caller already independently decided the
+# RUN itself is terminal (it is called from inside the supersede:*/abort:age
+# branches only, never from skip — see this file's own selftest for the
+# structural proof). Once a run is terminal, nothing downstream ever reads
+# its verdicts again regardless of whether a reviewer is still alive and
+# about to write a real PASS/FAIL — closing early discards nothing a live
+# reviewer's own eventual close wouldn't have been discarded anyway
+# (idempotent either way: `bd close` on an already-closed bead is a no-op).
+#
+# Reason text is caller-supplied so each of the 3 call sites' bd comment
+# accurately reflects ITS OWN close reason (marker terminal/gone vs TTL abort
+# vs stale duplicate) instead of borrowing close_dead_reviewer_verdicts' own
+# dead-reviewer-specific wording, which would be an unverified — and for
+# supersede:marker/abort:age, often simply FALSE — claim: both fire with NO
+# reviewer-liveness check at all (reconcile_gaterun_action's priority order,
+# rules 1 and 3 above).
+#
+# ga-h199q precedent: queries `bd` directly, NOT through bd-list-cached.sh —
+# that shim's child-process `bash <path>` invocation can't see an in-shell
+# `bd` mock (confirmed the hard way: gate-verdict-drained-reviewer-rescue.
+# selftest.sh hit exactly this for a different function, 6 assertion
+# failures, documented at that function's own call site in
+# quality-gate-dispatcher.sh). This call fires at most once per gate-run's
+# entire lifetime — at its own close — not once per sweep like the polling
+# reads the shim exists to de-duplicate, so there's no real efficiency cost
+# to staying directly testable.
+#
+# (Live section only — uses bd; never called in lib-only mode. The pure
+# projection it depends on, open_verdict_ids_from_json, lives above the
+# GATE_GUARD_LIB_ONLY cutoff and IS selftest-exercised directly.)
+# SELFTEST-EXTRACT close-pending-verdicts-for-run-fn: BEGIN
+close_pending_verdicts_for_run() {
+  local gr_id="$1" reason="$2" vbs ids v_id
+  [ -z "$gr_id" ] && return
+  vbs=$(bd -C "$GC_CITY" list --json --all --limit 0 \
+    -l type:quality-gate-verdict -l "gate-run:$gr_id" 2>/dev/null || echo "[]")
+  ids=$(open_verdict_ids_from_json "$vbs")
+  [ -z "$ids" ] && return
+  for v_id in $ids; do
+    [ -z "$v_id" ] && continue
+    bd -C "$GC_CITY" comment "$v_id" "Vector B (ga-hgsqg): cascade-closed — parent gate-run $gr_id closed ($reason). Self-healed by guard." 2>/dev/null || true
+    bd -C "$GC_CITY" close "$v_id" -r "quality-gate-verdict orphaned (terminal) — parent gate-run $gr_id closed ($reason). Closed by guard (ga-hgsqg)." 2>/dev/null || true
+  done
+}
+# SELFTEST-EXTRACT close-pending-verdicts-for-run-fn: END
+
 # verdict_bead_count_for_run <gate_run_id> — I/O helper (ga-jfo7).
 # Total (open+closed) verdict beads ever created for this gate-run id. 0 means
 # no dispatcher-spawned reviewer was ever attached to THIS bead's id (see
@@ -1904,6 +1977,11 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
       set_gate_status "$GR_ID" "superseded"
       bd -C "$GC_CITY" comment "$GR_ID" "Vector B (ga-o57gn): stale duplicate — a newer running gate-run shares this marker/source-bead. Keep-newest dedup enforces ≤1 running gate-run per source-bead. Self-healed by guard." 2>/dev/null || true
       bd -C "$GC_CITY" close "$GR_ID" -r "gate-run superseded (terminal) — stale duplicate, newer running run exists. Closed by guard (ga-o57gn)." 2>/dev/null || true
+      # ga-hgsqg: cascade-close this run's own OPEN verdict beads too — a
+      # stale duplicate can have live reviewers already dispatched on it;
+      # once the newer sibling run wins, this run's verdicts can never be
+      # consumed by anything (see close_pending_verdicts_for_run's docstring).
+      close_pending_verdicts_for_run "$GR_ID" "stale duplicate — a newer running gate-run supersedes it, ga-o57gn dedup"
       continue
     fi
 
@@ -2001,6 +2079,13 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
         bd -C "$GC_CITY" comment "$GR_ID" "Vector B (ga-tmug): orphan gate-run superseded — companion marker $COMPANION_MARKER_ID is terminal/gone; run is no longer active. Self-healed by guard." 2>/dev/null || true
         # ga-jhyu: CLOSE at terminal so wisp-compact reaps it (was relabel-only → OPEN forever).
         bd -C "$GC_CITY" close "$GR_ID" -r "gate-run superseded (terminal) — companion marker $COMPANION_MARKER_ID terminal/gone. Closed by guard (ga-jhyu)." 2>/dev/null || true
+        # ga-hgsqg: cascade-close this run's own OPEN verdict beads too — the
+        # companion marker died/finished elsewhere with NO reviewer-liveness
+        # check here, so a live reviewer can genuinely still be mid-review;
+        # its verdict can never be consumed by anything once this run is
+        # superseded regardless (see close_pending_verdicts_for_run's
+        # docstring for why that's still safe to close, not destructive).
+        close_pending_verdicts_for_run "$GR_ID" "companion marker $COMPANION_MARKER_ID is terminal/gone, ga-tmug"
         ;;
       supersede:dead-reviewers)
         warn "Vector B: superseding ZOMBIE gate-run $GR_ID (age=${GR_AGE}m > zombie-age=${GATE_ZOMBIE_AGE_MINUTES}m [verdict-timeout ${GATE_VERDICT_TIMEOUT_MINUTES}m + margin ${GATE_DEAD_REVIEWER_MARGIN_MINUTES}m], no live reviewer — dispatcher abandoned it; ga-o57gn)"
@@ -2019,6 +2104,12 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
         bd -C "$GC_CITY" comment "$GR_ID" "Vector B (ga-tmug): gate-run aborted by guard TTL fallback (age=${GR_AGE}m > ${GATE_RUN_TTL_MINUTES}m; marker $COMPANION_MARKER_ID still active but run exceeded max wait)." 2>/dev/null || true
         # ga-jhyu: CLOSE at terminal so wisp-compact reaps it.
         bd -C "$GC_CITY" close "$GR_ID" -r "gate-run aborted (terminal) by TTL fallback (age=${GR_AGE}m > ${GATE_RUN_TTL_MINUTES}m). Closed by guard (ga-jhyu)." 2>/dev/null || true
+        # ga-hgsqg: cascade-close this run's own OPEN verdict beads too — the
+        # TTL fallback fires with NO reviewer-liveness check (reconcile_
+        # gaterun_action's rule 3), so a live reviewer can genuinely still be
+        # mid-review; its verdict can never be consumed once this run is
+        # aborted regardless (see close_pending_verdicts_for_run's docstring).
+        close_pending_verdicts_for_run "$GR_ID" "aborted by guard TTL fallback, age=${GR_AGE}m > ${GATE_RUN_TTL_MINUTES}m, ga-tmug"
         ;;
       skip)
         log "  Gate-run $GR_ID active (age=${GR_AGE}m, marker_active=${MARKER_ACTIVE}, reviewers_alive=${REVIEWERS_ALIVE}) — skipping."
