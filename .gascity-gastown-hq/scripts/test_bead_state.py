@@ -466,6 +466,19 @@ def test_is_coordinator_pega_mayor_e_deacon():
     assert is_coordinator("") is False
 
 
+def test_is_coordinator_case_insensitive_mixed_case():
+    """Regressão (ga-x3e7p GATE-FAIL attempt 2/3, achado pelo reviewer +
+    confirmado pelo Mayor): a consolidação inicial perdeu o .lower() que
+    inflight-reclaim-guard.py's cópia original tinha (case-insensitive, por
+    docstring). Sem ele, um identity 'Mayor'/'DEACON' deixaria de ser
+    reconhecido como coordenador — perdendo proteção contra reclaim em 4
+    call sites CORRECTNESS-CRITICAL do guard. FALHA no tip pré-fix, passa
+    depois do .lower() restaurado."""
+    assert is_coordinator("Gastown.Mayor") is True
+    assert is_coordinator("HQ-DEACON") is True
+    assert is_coordinator("MAYOR") is True
+
+
 # ── pilot:held-until expira (ga-fup3m, absorvido de pilot-missing-route-watchdog.sh) ──
 # scripts/pilot-missing-route-watchdog.sh (81 refs) já mede isto — seus próprios
 # Scenario 7/8 de selftest provam o comportamento certo: pilot:held bare SEM

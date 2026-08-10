@@ -115,6 +115,7 @@ def main():
     print("-" * 108)
 
     divergences = []
+    coordinator_rows = []
     for b in beads:
         bid = b.get("id", "")
         assignee = b.get("assignee") or ""
@@ -126,11 +127,35 @@ def main():
         shape, guard_alive = guard_verdict(assignee, sessions, now, bead_update_age)
         prov_dead = claimant_provably_dead(assignee, sessions)
 
-        # `live_names` sempre vem de sessões REAIS já consultadas (nunca None
-        # aqui — ver fetch_sessions, que aborta em vez de seguir com dados
-        # ausentes) então dashboard_alive nunca é o 3º valor (None = "não
-        # consultei"); a comparação binária abaixo é honesta, não um colapso.
-        assert dashboard_alive is not None, "sessões deveriam estar sempre consultadas aqui"
+        # holder_is_alive() tem contrato documentado de 3 estados
+        # (True/False/None). `live_names` sempre vem de sessões REAIS já
+        # consultadas (fetch_sessions aborta em vez de seguir com dados
+        # ausentes), mas isso cobre só METADE do contrato None: a outra
+        # metade é is_coordinator(assignee)==True, independente de sessões
+        # terem sido consultadas (bead_state.py's próprio docstring: "None,
+        # não True: nunca verificamos vivacidade de fato para um
+        # coordenador"). ga-x3e7p GATE-FAIL (attempt 2/3): a versão anterior
+        # tratava esse 3º valor como impossível (assert) e CRASHAVA na 1ª
+        # bead com assignee coordenador da população viva — confirmado:
+        # ga-7j5vf, assignee=mayor, status=open, passa por todo filtro de
+        # fetch_assigned_open_beads().
+        #
+        # Painel e guarda respondem perguntas DIFERENTES para coordenador —
+        # painel: "não avaliei, é papel sempre-ligado" (None); guarda:
+        # "False deliberado, nunca conta como builder vivo, protegido por
+        # outro rail" (ver session_is_live()/concrete_adhoc_session_is_live(),
+        # ambas com "Returning True there left dead-builder beads parked
+        # under the Mayor permanently un-reclaimable"). Não é a MESMA
+        # pergunta discordando — forçar None contra bool na comparação
+        # binária abaixo classificaria isso como "divergência" junto de
+        # desacordos REAIS, escondendo a distinção. Categoria própria,
+        # fora da lista de divergências.
+        if dashboard_alive is None:
+            coordinator_rows.append((bid, assignee, shape, guard_alive, prov_dead))
+            print(header % (bid, b.get("_rig", "hq"), assignee[:22], shape,
+                             "N/A(coord)", str(guard_alive), str(prov_dead), ""))
+            continue
+
         diverges = dashboard_alive is not guard_alive
         if diverges:
             divergences.append((bid, assignee, shape, dashboard_alive, guard_alive, prov_dead))
@@ -149,6 +174,13 @@ def main():
         for bid, assignee, shape, dash, guard, prov in divergences:
             print(f"   {bid}: assignee={assignee!r} forma={shape} "
                   f"painel={dash} guarda={guard} provavelmente_morto={prov}")
+    if coordinator_rows:
+        print()
+        print(f"ℹ️  {len(coordinator_rows)} bead(s) com assignee coordenador — painel não "
+              "avalia vivacidade (None por desenho), não contado como divergência:")
+        for bid, assignee, shape, guard, prov in coordinator_rows:
+            print(f"   {bid}: assignee={assignee!r} forma={shape} "
+                  f"guarda={guard} provavelmente_morto={prov}")
 
 
 if __name__ == "__main__":

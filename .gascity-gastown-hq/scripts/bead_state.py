@@ -240,9 +240,20 @@ COORDINATOR_MARKERS = ("mayor", "deacon")
 
 
 def is_coordinator(identity: str) -> bool:
+    """Substring, case-insensitive — ga-x3e7p GATE-FAIL (attempt 2/3): this
+    consolidation first shipped WITHOUT .lower(), silently weakening the 4
+    correctness-critical call sites in inflight-reclaim-guard.py that inherit
+    this function (the guard's own pre-consolidation copy DID lowercase
+    first). Every real identity in this repo is lowercase today (verified by
+    grep, so no live case was mis-handled), but an uppercase/mixed-case
+    coordinator identity would have silently lost reclaim protection — the
+    exact failure class this module exists to prevent. Restored to match the
+    guard's original, documented behavior; see
+    test_is_coordinator_case_insensitive_mixed_case."""
     if not identity:
         return False
-    return any(marker in identity for marker in COORDINATOR_MARKERS)
+    ident = identity.lower()
+    return any(marker in ident for marker in COORDINATOR_MARKERS)
 
 LIVE_SESSION_STATES = frozenset({"active", "awake"})
 # Estados terminais que PROVAM que uma sessão não pode estar trabalhando.
