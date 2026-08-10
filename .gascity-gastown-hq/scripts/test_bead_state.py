@@ -517,3 +517,35 @@ def test_pilot_held_multiplos_held_until_usa_o_maximo():
     st = derive(b(labels=["pilot:held", "pilot:held-until:1000000000", "pilot:held-until:3000000000"]),
                 None, CREWS, now=2000000000)
     assert st["state"] == "parked"   # o maior (3000000000) ainda não passou
+
+
+# ── gate_active resolvido por marker (ga-zltsr) ─────────────────────────────────
+# GATE_ACTIVE (regra 6) checava só os labels da própria bead — diferente de TODO
+# outro consumidor de produção de estado-de-gate (pilot-dispatcher.sh's
+# _filter_built, imparavel-check.py's classify_bead, painel_visibilidade.py pós
+# ga-opzlf), que já sabem que o label pode ficar STALE: gate:queued é escrito na
+# criação do marker e quase nunca limpo pelo pipeline principal (só 2 call sites de
+# remoção na cidade inteira, contra 12 de gate:reviewing) — casos reais medidos:
+# wa-nh37r e ga-tje7u carregaram gate:queued por DIAS depois do marker fechar.
+
+def test_gate_active_none_preserva_heuristico_de_label_de_sempre():
+    """gate_active=None (não resolvido) é o comportamento de TODO chamador
+    existente hoje — nenhum passa este parâmetro ainda. Não pode mudar nada."""
+    st = derive(b(labels=["gate:queued"]), None, CREWS)
+    assert st["state"] == "at_gate"
+
+
+def test_gate_active_false_destrava_apesar_do_label_residual():
+    """O achado real: gate:queued sobrevive ao marker fechar. Quando o chamador
+    CONSULTOU o marker (ex.: list_gate_active_source_beads()) e não achou nada
+    ativo, isso GANHA do label — mirrors wa-nh37r/ga-tje7u."""
+    st = derive(b(labels=["gate:queued"]), None, CREWS, gate_active=False)
+    assert st["state"] == "backlog"   # cai pro heurístico normal, não trava em at_gate
+
+
+def test_gate_active_true_conta_mesmo_sem_o_label_sincronizado():
+    """Simétrico: um marker recém-criado pode existir antes do label ser escrito
+    (ga-cxzby race) ou sem gate-status:* correspondente (wa-aogpc). O veredito do
+    chamador GANHA nesta direção também."""
+    st = derive(b(labels=[]), None, CREWS, gate_active=True)
+    assert st["state"] == "at_gate"

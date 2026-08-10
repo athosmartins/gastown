@@ -64,11 +64,16 @@ echo "Scenario 1: _filter_candidates — mixed drop reasons (AC1 + AC4)"
 FC_FN="$(extract_fn _filter_candidates)"
 PRE="$(grep '^_FILTER_PREAPPROVAL_LABELS=' "$DISPATCHER")"
 CAP="$(grep '^_FILTER_RECLAIM_CAP=' "$DISPATCHER")"
+# ga-qt0mj: _filter_candidates' local _cf_engine_rebuild_re now references this
+# script-level global (single source of truth, ga-ffop9) — omitting it here
+# leaves the var unbound under set -u, aborting _filter_candidates entirely.
+TVP="$(grep '^_PILOT_ENGINE_REBUILD_RE=' "$DISPATCHER")"
 cat > "$WORK/s1.sh" <<EOF
 $LOG_FN
 $LE_FN
 $PRE
 $CAP
+$TVP
 $FC_FN
 SELF_BEAD_ID=""
 INPUT='[
@@ -346,6 +351,7 @@ echo ""
 echo "Scenario 7: full chain, healthy sweep — zero exclusion lines (AC2)"
 PRE="$(grep '^_FILTER_PREAPPROVAL_LABELS=' "$DISPATCHER")"
 CAP="$(grep '^_FILTER_RECLAIM_CAP=' "$DISPATCHER")"
+TVP="$(grep '^_PILOT_ENGINE_REBUILD_RE=' "$DISPATCHER")"
 cat > "$SHIMBIN/bd" <<'SHIM'
 #!/usr/bin/env bash
 echo '[]'
@@ -357,6 +363,7 @@ $LOG_FN
 $LE_FN
 $PRE
 $CAP
+$TVP
 $FC_FN
 $EM_FN
 $DG_FN
@@ -412,6 +419,7 @@ if [ -n "$ORIG_DISPATCHER" ] && [ -f "$ORIG_DISPATCHER" ]; then
 $LE_FN
 $PRE
 $CAP
+$TVP
 $new_fn
 SELF_BEAD_ID=\"\"
 printf '%s' '$FIXTURES' | $fname" 2>/dev/null | jq -S . 2>/dev/null)
