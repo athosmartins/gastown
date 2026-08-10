@@ -393,11 +393,22 @@ def _has_needs_human_label(labels):
     ga-x3e7p: delegates to bead_state.is_needs_human — same vocabulary this
     function has always used (bare "needs-human", bare "gate:needs-human",
     every "gate:needs-human:*" suffix), now shared with derive()'s PARK step
-    instead of living only here. Absorbing this into bead_state.py FIRST (this
-    exact predicate, byte-for-byte) was required before any caller could safely
-    treat derive()'s "parked" state as a substitute for this check — before
-    that absorption, bead_state.py had no classification at all for the
-    non-':product' suffixes or the bare forms.
+    instead of living only here.
+
+    ⚠️ CORREÇÃO (gate_run=ga-b5y6y, code review): an earlier version of this
+    note claimed bead_state.py had NO classification at all for these labels
+    before this absorption — false, a sibling of the same false claim caught
+    and fixed in bead_state.py's own is_needs_human() docstring. derive()'s
+    PARK_PREFIXES already covered bare 'gate:needs-human' (any suffix) and
+    bare 'needs-human' via raw startswith, since the direct parent commit
+    (cfc0da088/ga-7qsxr) — so a bead with only these labels already resolved
+    to derive()["state"]=="parked" before is_needs_human() existed. What was
+    actually missing: a STANDALONE predicate this consumer could call
+    directly (without invoking the full derive() state machine) — this
+    function had its own private copy of that exact check, which is the real
+    gap ga-x3e7p closed (see bead_state.py's is_needs_human() docstring for
+    the full correction and the load-bearing test that proves the wiring
+    isn't just decorative).
     """
     return is_needs_human(labels)
 
