@@ -1854,6 +1854,15 @@ BDSTUB
         bad "scenario 44 (DRIFT DETECTED): bead_state.py no longer carries: $_MISSING — this file's jq filter is now a private, diverging interpreter for these"
       fi
       ;;
+    *)
+      # Unreachable today — _pmrw_s44_fetch_vocab's if/elif/.../else chain
+      # always sets one of the four cases above before returning. Kept as a
+      # fail-loud backstop, not a silent no-op, in case the function ever
+      # grows a new status without this dispatch being updated to match —
+      # the exact "third state nobody handled" shape this whole bead is
+      # about, applied to this dispatch itself.
+      bad "scenario 44 (INTERNAL ERROR): _pmrw_s44_fetch_vocab returned unrecognized status '$_S44_STATUS' — this case arm is missing, treat as broken, not as pass"
+      ;;
   esac
 
   # ── Scenario 45 (ga-8mzgn, gate fix-attempt 1/3): regression test for the
