@@ -1480,6 +1480,42 @@ gate_delivery_looks_partial() {
   return 1
 }
 
+# branch_bead_commit_verdict <unique_commit_count> <messages_blob> <bead_id>
+#   Mirrors quality-gate-dispatcher.sh's function of the SAME name — same
+#   contract, same anchored-match logic, deliberately kept in this strict,
+#   3-arg-only form FOREVER (ga-pj5va). fix-attempt-1 tried adding a 4th
+#   own_text parameter to the dispatcher's copy so a sliced sub-bead citing
+#   only its PARENT (this city's "item N of X" convention) would still pass
+#   — gate review FAILED it: bare co-mention in prose is not proof of a
+#   declared relationship, and it reopens the exact ga-y9a1d incident class
+#   (content merged under the wrong bead's identity) this check exists to
+#   catch. The corrected fix moves parent/child accommodation to the WRITER
+#   side (the commit-message convention documented in gate-done.md) instead
+#   of loosening either reader-side copy of this function. Do not add
+#   own_text/prose heuristics here, or to the dispatcher's copy — ever.
+#   Pure (no IO).
+#     skip — count is 0/empty/unparseable, or bead is empty.
+#     yes  — bead_id appears anchored somewhere in messages_blob.
+#     no   — count > 0 but bead_id appears nowhere.
+#
+#   ga-pj5va: defined HERE, above the GATE_GUARD_LIB_ONLY cutoff just below —
+#   NOT down at its call site (Step 5b-pre, near BEAD_CITY resolution). This
+#   is the exact defect class ga-zdkn1 already found and fixed once in this
+#   same section (see that comment a few screens up, on gc_json_or_unknown):
+#   a pure function defined past this cutoff is invisible to lib-only test
+#   sourcing, which returns right here and never reaches it.
+branch_bead_commit_verdict() {
+  local count="$1" messages="$2" bead="$3"
+  case "$count" in ''|*[!0-9]*|0) printf 'skip'; return 0 ;; esac
+  [ -z "$bead" ] && { printf 'skip'; return 0; }
+  local _anchored='(^|[^A-Za-z0-9])'"$bead"'([^A-Za-z0-9]|$)'
+  if [[ "$messages" =~ $_anchored ]]; then
+    printf 'yes'
+  else
+    printf 'no'
+  fi
+}
+
 # ── Lib-only mode: source with GATE_GUARD_LIB_ONLY=1 to load pure functions ──
 # without running the live guard sweep. Used by tests and by the dispatcher.
 if [ -n "${GATE_GUARD_LIB_ONLY:-}" ]; then
@@ -3401,6 +3437,54 @@ resolve_bead_city() {
 BEAD_CITY="$(resolve_bead_city "$BEAD_ID")"
 if [ "$BEAD_CITY" != "$GC_CITY" ]; then
   log "  gt-gwng6: source bead $BEAD_ID resolves to store $BEAD_CITY (NOT HQ $GC_CITY) — cross-store detach corrected."
+fi
+
+# ── Step 5b-pre (ga-pj5va): submission-time branch-content-coherence check ──
+# Moves the ga-y9a1d branch/bead-identity check from MERGE time (deep inside
+# quality-gate-dispatcher.sh's Step 10 — a full fix cycle away, often hours,
+# and a real miss escalates to gate:needs-human waiting on a person) to
+# SUBMISSION time: this same guard sweep, ~2 min after /gate-done, refused
+# with gate-status:error and an actionable comment — the same cost class as
+# any other Step 4 validation failure, not a human escalation.
+#
+# Fail-OPEN on any uncertainty (RIG_PATH unresolved, fetch/rev-parse/
+# merge-base failure): this is a NEW, additive safety net on top of the
+# existing merge-time check (which still runs regardless, unchanged) — it
+# must never itself become a new false-FAIL source (mirrors the caution the
+# dispatcher's own Step 10 comment states around this exact check).
+#
+# Hardcodes origin/main as the comparison base, deliberately: this mirrors
+# gate-done.md's OWN base_commit computation (`git rev-parse origin/main`),
+# which is what this entire submission convention already assumes — adding
+# a configurable default-branch lookup here is out of scope for ga-pj5va.
+# Recomputes the range from freshly-fetched refs rather than trusting the
+# marker's own declared base_commit field (a self-declared value in an
+# agent-authored marker) — same non-trusting posture as every other
+# security/coherence-relevant read in this file.
+if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
+  git -C "$RIG_PATH" fetch origin main "$BRANCH" --quiet 2>/dev/null || true
+  _CBC_MAIN_SHA=$(git -C "$RIG_PATH" rev-parse "origin/main" 2>/dev/null || echo "")
+  _CBC_BRANCH_SHA=$(git -C "$RIG_PATH" rev-parse "origin/$BRANCH" 2>/dev/null || echo "")
+  if [ -n "$_CBC_MAIN_SHA" ] && [ -n "$_CBC_BRANCH_SHA" ]; then
+    _CBC_BASE=$(git -C "$RIG_PATH" merge-base "$_CBC_BRANCH_SHA" "$_CBC_MAIN_SHA" 2>/dev/null || echo "")
+    if [ -n "$_CBC_BASE" ]; then
+      _CBC_COUNT=$(git -C "$RIG_PATH" rev-list --count "${_CBC_BASE}..${_CBC_BRANCH_SHA}" 2>/dev/null || echo "")
+      _CBC_MSGS=$(git -C "$RIG_PATH" log --format='%B' "${_CBC_BASE}..${_CBC_BRANCH_SHA}" 2>/dev/null || echo "")
+      _CBC_VERDICT=$(branch_bead_commit_verdict "$_CBC_COUNT" "$_CBC_MSGS" "$BEAD_ID")
+      if [ "$_CBC_VERDICT" = "no" ]; then
+        err "  branch-content-coherence (ga-pj5va): $_CBC_COUNT unique commit(s) on $BRANCH vs origin/main never mention bead $BEAD_ID. Refusing at submission."
+        set_gate_status "$MARKER_ID" "error"
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: branch-content-coherence check (ga-pj5va).
+None of the $_CBC_COUNT commit(s) unique to $BRANCH (vs origin/main) mention bead $BEAD_ID.
+If $BEAD_ID is a slice of a parent epic, citing the parent is fine — ADD a commit that also cites $BEAD_ID itself, don't cite only the parent:
+  git commit --allow-empty -m \"chore($BEAD_ID): registra o vinculo\"
+  git push origin $BRANCH
+Then re-run /gate-done. Marker set to gate-status:error (fixable + re-submittable, not lost)." 2>/dev/null || true
+        log "SUPPRESSED PUSH (wa-uthi non-terminal): branch-content-coherence pre-check failed for $MARKER_ID (gate-status:error)."
+        exit 1
+      fi
+    fi
+  fi
 fi
 
 # ── Step 5b (ga-e7zk7): detach source bead from the dog pool — gate owns it now ──

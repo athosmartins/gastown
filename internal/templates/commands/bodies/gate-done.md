@@ -35,6 +35,15 @@ git log --oneline origin/main..HEAD     # Must have at least 1 commit
 
 If uncommitted changes exist, commit them first.
 
+**Your commit range must cite YOUR OWN bead id (ga-pj5va).** At least one
+commit unique to your branch (vs origin/main) must mention your bead's id —
+`git log --oneline origin/main..HEAD` should show it somewhere. This is
+checked again, automatically, by the guard right after you submit (~2 min);
+missing it there gets your marker refused with `gate-status:error` instead of
+reviewed — see "branch-content-coherence" below for the fix. If your work is
+a slice of a parent epic, citing the parent is fine and encouraged — just
+ADD a commit citing your own bead too, don't cite only the parent's id.
+
 ## Pre-flight Self-Audit: THE THIRD STATE (mandatory — before you push)
 
 Six gate rejections in one day were the same defect class wearing different
@@ -576,6 +585,22 @@ echo "You are done. The gate-runner handles the rest."
 name. Alternatively, ensure you have an in_progress bead with label `story:in-flight`
 assigned to your session. /gate-done aborts rather than writing a marker with
 `bead_id=unknown` (which the guard would reject with `gate-status:error`).
+
+**Marker rejected with "branch-content-coherence (ga-pj5va)" / gate-status:error
+saying no commit mentions your bead**: your branch's commit range (vs
+origin/main) never cites your own bead's id — this used to slip through and
+only break hours later at merge time (escalating to `gate:needs-human`,
+waiting on a person); the guard now catches it right after submission
+instead, while you're still here. Common cause: your bead is a slice of a
+parent epic and every commit cites only the PARENT's id. Fix (30 seconds):
+add a commit that cites your OWN bead too — citing the parent in addition is
+fine, citing only the parent is not:
+```bash
+git commit --allow-empty -m "chore(<your-bead-id>): registra o vinculo"
+git push origin HEAD
+```
+Then re-run `/gate-done`. The marker is fixable + re-submittable, nothing is
+lost.
 
 **Found a third-state bug during the Pre-flight Self-Audit**: Fix it, commit,
 and `git push origin HEAD` again before continuing, then re-run the sequence
