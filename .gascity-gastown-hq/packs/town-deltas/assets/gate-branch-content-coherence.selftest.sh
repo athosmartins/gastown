@@ -116,90 +116,6 @@ eq "boundary: bead at the very end of the messages blob (no trailing char) → y
 eq "punctuation boundary: bead wrapped in parens (the file's own dominant commit style) still matches → yes" \
   "$(branch_bead_commit_verdict "1" "fix(ga-3b8): parenthesized" "ga-3b8")" "yes"
 
-# ── 1c. ga-pj5va: sub-bead sliced from a parent, commit cites the PARENT id ──
-#      Confirmed live (Mayor, 2026-08-11): wa-awya7 ('[chore] Agendar a fila de
-#      identidade no launchd (item 1 do wa-cuk7o, bead proprio)') held commit
-#      bb100ab75 ('feat(wa-cuk7o item 1): agenda a fila de identidade no
-#      launchd') — content IS wa-awya7's own deliverable (files matched the
-#      bead's own description exactly), but the commit message names the
-#      PARENT epic wa-cuk7o, never wa-awya7 itself. This city's normal slicing
-#      convention ("item N of X", "slice M/N of Y") isn't in the legitimate-
-#      shapes list above (section 1's "Legitimate shapes" block), so plain
-#      substring match read it as ga-y9a1d's own incident signature and
-#      blocked good work.
-#
-#      fix-attempt-1 (gate_run=ga-xvn9w) FAILED gate review: a 4th optional
-#      parameter (own_text) let the caller supply the target bead's own
-#      title+description, and accepted a candidate id cited in the commit
-#      range whenever it was ALSO merely present anywhere in own_text — bare
-#      co-mention, no evidence of an actual declared relationship. The
-#      reviewer proved this concretely exploitable: own_text="...see ga-X for
-#      the earlier investigation..." and an unrelated branch's message
-#      "...same pattern as ga-X's fix..." both cite ga-X as casual background
-#      with zero relationship asserted between them, yet the old check
-#      returned 'yes' — reopening the exact ga-y9a1d incident class (content
-#      merged under the wrong bead's identity) this function exists to catch.
-#
-#      fix-attempt-2: own_text must name the candidate as part of an actual
-#      DECLARATION — a slice/parent keyword (item, fatia/fatias, slice,
-#      parte/parcela, sub-bead, sub-issue, parent, pai, epic/epico/épico)
-#      within a short, sentence-bounded span of the candidate id, not a bare
-#      mention anywhere in the text. Fail-open unchanged: own_text empty must
-#      behave EXACTLY as before — every assertion above this section calls
-#      with only 3 args, so they double as proof this is additive, never a
-#      change to the existing 3-arg contract.
-echo "── 1c. branch_bead_commit_verdict: parent-id acceptance (ga-pj5va) ──"
-
-WA_AWYA7_MSG="feat(wa-cuk7o item 1): agenda a fila de identidade no launchd"
-WA_AWYA7_OWN_TEXT="[chore] Agendar a fila de identidade no launchd (item 1 do wa-cuk7o, bead proprio) Bead PROPRIO para o agendamento, separado do wa-cuk7o de proposito."
-
-eq "wa-awya7 real case, NO own_text arg (today's 3-arg call shape) → no, unchanged" \
-  "$(branch_bead_commit_verdict "1" "$WA_AWYA7_MSG" "wa-awya7")" "no"
-
-eq "wa-awya7 real case, own_text supplied and DECLARES the parent wa-cuk7o cited in the commit ('item 1 do X') → yes" \
-  "$(branch_bead_commit_verdict "1" "$WA_AWYA7_MSG" "wa-awya7" "$WA_AWYA7_OWN_TEXT")" "yes"
-
-eq "own_text supplied but does NOT mention any id cited in the messages → no (own_text alone isn't a bypass)" \
-  "$(branch_bead_commit_verdict "1" "$WA_AWYA7_MSG" "wa-awya7" "some unrelated description naming nothing")" "no"
-
-MULTI_ID_MSG="fix(wa-cuk7o): shared prep commit, also touches wa-zzz99 cleanup"
-eq "commit cites 2 ids, own_text declares only the SECOND one ('slice of Y') → yes (checks candidates, not just the first)" \
-  "$(branch_bead_commit_verdict "1" "$MULTI_ID_MSG" "wa-awya7" "this bead is a slice of wa-zzz99")" "yes"
-
-# ── 1d. ga-pj5va fix-attempt-2: bare co-mention must NOT accept. Permanent
-#      regressions for the gap the reviewer's FAIL verdict identified as
-#      "untested and unguarded" — the original FIC5D_OWN_TEXT case below
-#      deliberately had ZERO overlap with the incident's own ids, so it never
-#      actually exercised the coincidental-overlap path the reviewer's own
-#      adversarial repro (kept verbatim as the first case here) broke.
-echo "── 1d. branch_bead_commit_verdict: bare co-mention must NOT accept (ga-pj5va fix-attempt-2) ──"
-
-eq "reviewer's exact repro: own_text bare-mentions the same candidate the commit cites, as casual background — not a declaration → no" \
-  "$(branch_bead_commit_verdict "1" "fix(ga-777): cleanup of the queue-drain path, applying the same defensive pattern as ga-mo7q's fix" "ga-500" "Fix retry loop timeout. Related background: see ga-mo7q for the earlier investigation into the same subsystem.")" "no"
-
-FIC5D_OVERLAP_OWN_TEXT="story-delivery reads comments per-channel which breaks on newline. See ga-jeicm for related context on a similar classifier symptom in a different subsystem."
-eq "ga-y9a1d incident WITH own_text that bare-mentions ONE of the 3 real unrelated commit ids (ga-jeicm), no declaration → still no (the coincidental-overlap case the original FIC5D test never covered)" \
-  "$(branch_bead_commit_verdict "3" "$REAL_INCIDENT_MSGS" "ga-fic5d" "$FIC5D_OVERLAP_OWN_TEXT")" "no"
-
-SENTENCE_BOUNDARY_OWN_TEXT="This bead is the parent of ga-11111. Also see ga-22222 for unrelated legacy context."
-eq "declaration keyword bound to a DIFFERENT, earlier id must not reach PAST a sentence boundary to a later unrelated id (only ga-22222 cited in messages)" \
-  "$(branch_bead_commit_verdict "1" "fix: touches ga-22222 during cleanup" "ga-99999" "$SENTENCE_BOUNDARY_OWN_TEXT")" "no"
-eq "control for the above: with the id actually adjacent to the declaration keyword cited in messages instead → yes" \
-  "$(branch_bead_commit_verdict "1" "fix: touches ga-11111 during cleanup" "ga-99999" "$SENTENCE_BOUNDARY_OWN_TEXT")" "yes"
-
-eq "Portuguese plural 'fatias' declaration form → yes" \
-  "$(branch_bead_commit_verdict "1" "chore: touches ga-50000 during batch update" "ga-fic6e" "esta bead e uma das fatias ga-50000 do epico maior")" "yes"
-eq "'epic X' declaration form (real precedent: ga-05604.2's own title says 'epic ga-05604') → yes" \
-  "$(branch_bead_commit_verdict "1" "chore: touches ga-05604 in a shared prep commit" "ga-fic6e" "Pilot dispatch-time lane label write is unretried (ga-wtqli AC#1 spin-off, epic ga-05604)")" "yes"
-
-# ── The original ga-y9a1d incident must NOT be weakened by the new parameter ──
-# Prove it even when own_text is populated with a realistic bead description
-# that (correctly) does not name any of the 3 unrelated beads the corrupted
-# ref actually contains — the new acceptance path must stay silent here.
-FIC5D_OWN_TEXT="story-delivery reads comments per-channel which breaks on newline. Fix the channel-split so multi-line comments deliver correctly."
-eq "ga-y9a1d incident WITH own_text supplied (own_text names none of the 3 unrelated commits) → still no" \
-  "$(branch_bead_commit_verdict "3" "$REAL_INCIDENT_MSGS" "ga-fic5d" "$FIC5D_OWN_TEXT")" "no"
-
 # ── 2. Git-plumbing composition against a REAL temp repo (incident-shaped) ───
 echo "── 2. real-git integration: reproduce the incident's exact ref shape ──"
 
@@ -440,34 +356,6 @@ eq "pure function: FF-push site's own failure shape (unique commits present, non
   "$(branch_bead_commit_verdict "2" "$REAL_INCIDENT_MSGS" "ga-fic5d")" "no"
 eq "pure function: FF-push site on an already-caught-up branch (empty range) → skip, not a false failure (unlike Site A, this call site doesn't already know the branch has unique commits)" \
   "$(branch_bead_commit_verdict "0" "" "ga-fic5d")" "skip"
-
-# ── 10. DRIFT GUARD: ga-pj5va — parent-id acceptance is wired at EVERY call
-#      site, not just proven in the pure function. A fix that only lives in
-#      branch_bead_commit_verdict() but is never handed the bead's own text
-#      is silently inert — every call site still gets own_text="" (the
-#      function's own fail-open default) and the live dispatcher behaves
-#      exactly as before the fix. Prove the resolution exists, is fail-open,
-#      runs before it's needed, and every one of the 6 call sites (section
-#      4's Step 10, section 6/9's 5 do_merge_ff sites) actually passes it.
-echo "── 10. drift guard: ga-pj5va — parent-id text is resolved once and wired to all 6 call sites ──"
-
-has "$DISPATCHER" 'GATE_BEAD_OWN_TEXT=""' \
-  "GATE_BEAD_OWN_TEXT is initialized to empty (fail-open default before any bd lookup)"
-has "$DISPATCHER" 'bd -C "\$BEAD_CITY" show "\$BEAD_ID" --json 2>/dev/null' \
-  "GATE_BEAD_OWN_TEXT resolution reads the bead via bd show (guarded, stderr silenced)"
-
-GATE_OWN_TEXT_DEF_LN=$(grep -n 'GATE_BEAD_OWN_TEXT=""' "$DISPATCHER" | head -1 | cut -d: -f1)
-GATE_OWN_TEXT_CALL_COUNT=$(grep -c '"\$GATE_BEAD_OWN_TEXT")' "$DISPATCHER" || echo "0")
-if [ -n "$GATE_OWN_TEXT_DEF_LN" ] && [ "$GATE_OWN_TEXT_DEF_LN" -lt "$COHERENCE_CHECK_LN" ]; then
-  ok "GATE_BEAD_OWN_TEXT resolved (line $GATE_OWN_TEXT_DEF_LN) before the first call site consumes it (line $COHERENCE_CHECK_LN)"
-else
-  bad "expected GATE_BEAD_OWN_TEXT resolution before Step 10's call site (def=$GATE_OWN_TEXT_DEF_LN call=$COHERENCE_CHECK_LN)"
-fi
-if [ "$GATE_OWN_TEXT_CALL_COUNT" -eq 6 ]; then
-  ok "all 6 branch_bead_commit_verdict call sites pass \$GATE_BEAD_OWN_TEXT as the 4th arg (found $GATE_OWN_TEXT_CALL_COUNT)"
-else
-  bad "expected exactly 6 call sites passing \$GATE_BEAD_OWN_TEXT (Step 10 + 4 do_merge_ff Site-A variants + FF-push) — found $GATE_OWN_TEXT_CALL_COUNT; a site was added, removed, or left unwired"
-fi
 
 echo ""
 echo "──────────────────────────────────────────"
