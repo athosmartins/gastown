@@ -116,6 +116,53 @@ eq "boundary: bead at the very end of the messages blob (no trailing char) → y
 eq "punctuation boundary: bead wrapped in parens (the file's own dominant commit style) still matches → yes" \
   "$(branch_bead_commit_verdict "1" "fix(ga-3b8): parenthesized" "ga-3b8")" "yes"
 
+# ── 1c. ga-pj5va: sub-bead sliced from a parent, commit cites the PARENT id ──
+#      Confirmed live (Mayor, 2026-08-11): wa-awya7 ('[chore] Agendar a fila de
+#      identidade no launchd (item 1 do wa-cuk7o, bead proprio)') held commit
+#      bb100ab75 ('feat(wa-cuk7o item 1): agenda a fila de identidade no
+#      launchd') — content IS wa-awya7's own deliverable (files matched the
+#      bead's own description exactly), but the commit message names the
+#      PARENT epic wa-cuk7o, never wa-awya7 itself. This city's normal slicing
+#      convention ("item N of X", "slice M/N of Y") isn't in the legitimate-
+#      shapes list above (section 1's "Legitimate shapes" block), so plain
+#      substring match read it as ga-y9a1d's own incident signature and
+#      blocked good work.
+#
+#      FIX: a 4th optional parameter (own_text — the target bead's own
+#      title+description) lets the caller supply what THIS bead says about
+#      itself. When the direct match misses, extract candidate bead ids cited
+#      in the commit range and check whether any is named in own_text — if
+#      so, the branch cites a declared relative (its parent), not an
+#      unrelated bead. Fail-open: own_text empty must behave EXACTLY as
+#      before — every assertion above this section calls with only 3 args, so
+#      they double as proof this is additive, never a change to the existing
+#      3-arg contract.
+echo "── 1c. branch_bead_commit_verdict: parent-id acceptance (ga-pj5va) ──"
+
+WA_AWYA7_MSG="feat(wa-cuk7o item 1): agenda a fila de identidade no launchd"
+WA_AWYA7_OWN_TEXT="[chore] Agendar a fila de identidade no launchd (item 1 do wa-cuk7o, bead proprio) Bead PROPRIO para o agendamento, separado do wa-cuk7o de proposito."
+
+eq "wa-awya7 real case, NO own_text arg (today's 3-arg call shape) → no, unchanged" \
+  "$(branch_bead_commit_verdict "1" "$WA_AWYA7_MSG" "wa-awya7")" "no"
+
+eq "wa-awya7 real case, own_text supplied and NAMES the parent wa-cuk7o cited in the commit → yes" \
+  "$(branch_bead_commit_verdict "1" "$WA_AWYA7_MSG" "wa-awya7" "$WA_AWYA7_OWN_TEXT")" "yes"
+
+eq "own_text supplied but does NOT mention any id cited in the messages → no (own_text alone isn't a bypass)" \
+  "$(branch_bead_commit_verdict "1" "$WA_AWYA7_MSG" "wa-awya7" "some unrelated description naming nothing")" "no"
+
+MULTI_ID_MSG="fix(wa-cuk7o): shared prep commit, also touches wa-zzz99 cleanup"
+eq "commit cites 2 ids, own_text names only the SECOND one → yes (checks candidates, not just the first)" \
+  "$(branch_bead_commit_verdict "1" "$MULTI_ID_MSG" "wa-awya7" "this bead is a slice of wa-zzz99")" "yes"
+
+# ── The original ga-y9a1d incident must NOT be weakened by the new parameter ──
+# Prove it even when own_text is populated with a realistic bead description
+# that (correctly) does not name any of the 3 unrelated beads the corrupted
+# ref actually contains — the new acceptance path must stay silent here.
+FIC5D_OWN_TEXT="story-delivery reads comments per-channel which breaks on newline. Fix the channel-split so multi-line comments deliver correctly."
+eq "ga-y9a1d incident WITH own_text supplied (own_text names none of the 3 unrelated commits) → still no" \
+  "$(branch_bead_commit_verdict "3" "$REAL_INCIDENT_MSGS" "ga-fic5d" "$FIC5D_OWN_TEXT")" "no"
+
 # ── 2. Git-plumbing composition against a REAL temp repo (incident-shaped) ───
 echo "── 2. real-git integration: reproduce the incident's exact ref shape ──"
 
@@ -356,6 +403,34 @@ eq "pure function: FF-push site's own failure shape (unique commits present, non
   "$(branch_bead_commit_verdict "2" "$REAL_INCIDENT_MSGS" "ga-fic5d")" "no"
 eq "pure function: FF-push site on an already-caught-up branch (empty range) → skip, not a false failure (unlike Site A, this call site doesn't already know the branch has unique commits)" \
   "$(branch_bead_commit_verdict "0" "" "ga-fic5d")" "skip"
+
+# ── 10. DRIFT GUARD: ga-pj5va — parent-id acceptance is wired at EVERY call
+#      site, not just proven in the pure function. A fix that only lives in
+#      branch_bead_commit_verdict() but is never handed the bead's own text
+#      is silently inert — every call site still gets own_text="" (the
+#      function's own fail-open default) and the live dispatcher behaves
+#      exactly as before the fix. Prove the resolution exists, is fail-open,
+#      runs before it's needed, and every one of the 6 call sites (section
+#      4's Step 10, section 6/9's 5 do_merge_ff sites) actually passes it.
+echo "── 10. drift guard: ga-pj5va — parent-id text is resolved once and wired to all 6 call sites ──"
+
+has "$DISPATCHER" 'GATE_BEAD_OWN_TEXT=""' \
+  "GATE_BEAD_OWN_TEXT is initialized to empty (fail-open default before any bd lookup)"
+has "$DISPATCHER" 'bd -C "\$BEAD_CITY" show "\$BEAD_ID" --json 2>/dev/null' \
+  "GATE_BEAD_OWN_TEXT resolution reads the bead via bd show (guarded, stderr silenced)"
+
+GATE_OWN_TEXT_DEF_LN=$(grep -n 'GATE_BEAD_OWN_TEXT=""' "$DISPATCHER" | head -1 | cut -d: -f1)
+GATE_OWN_TEXT_CALL_COUNT=$(grep -c '"\$GATE_BEAD_OWN_TEXT")' "$DISPATCHER" || echo "0")
+if [ -n "$GATE_OWN_TEXT_DEF_LN" ] && [ "$GATE_OWN_TEXT_DEF_LN" -lt "$COHERENCE_CHECK_LN" ]; then
+  ok "GATE_BEAD_OWN_TEXT resolved (line $GATE_OWN_TEXT_DEF_LN) before the first call site consumes it (line $COHERENCE_CHECK_LN)"
+else
+  bad "expected GATE_BEAD_OWN_TEXT resolution before Step 10's call site (def=$GATE_OWN_TEXT_DEF_LN call=$COHERENCE_CHECK_LN)"
+fi
+if [ "$GATE_OWN_TEXT_CALL_COUNT" -eq 6 ]; then
+  ok "all 6 branch_bead_commit_verdict call sites pass \$GATE_BEAD_OWN_TEXT as the 4th arg (found $GATE_OWN_TEXT_CALL_COUNT)"
+else
+  bad "expected exactly 6 call sites passing \$GATE_BEAD_OWN_TEXT (Step 10 + 4 do_merge_ff Site-A variants + FF-push) — found $GATE_OWN_TEXT_CALL_COUNT; a site was added, removed, or left unwired"
+fi
 
 echo ""
 echo "──────────────────────────────────────────"
