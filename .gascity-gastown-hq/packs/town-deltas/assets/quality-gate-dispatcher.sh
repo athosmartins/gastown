@@ -2946,16 +2946,19 @@ branch_tip_commit_author() {
 # Only the real incident's signature — new commits exist, but NONE of them,
 # anywhere in the range, mention the bead at all — trips this.
 #
-# branch_bead_commit_verdict <unique_commit_count> <messages_blob> <bead_id>
-#   Pure (no IO — plain string/count matching, no git call of its own).
+# branch_bead_commit_verdict <unique_commit_count> <messages_blob> <bead_id> [own_text]
+#   Pure (no IO — plain string/count matching, no git call of its own; the
+#   optional 4th arg is caller-resolved text, never fetched here).
 #     skip — count is 0/empty/unparseable (nothing unique to check — an
 #            already-merged or not-yet-diverged branch is Step 4b/Step 0a-4's
 #            job, not this check's; also the fail-open case for a bead_id we
 #            couldn't resolve), or bead is empty.
-#     yes  — bead_id appears somewhere in messages_blob (normal case).
-#     no   — count > 0 but bead_id appears nowhere — ga-y9a1d's signature.
+#     yes  — bead_id appears somewhere in messages_blob (normal case), OR
+#            (ga-pj5va) a bead id cited in messages_blob is itself named in
+#            own_text — see below.
+#     no   — count > 0 but neither of the above holds — ga-y9a1d's signature.
 branch_bead_commit_verdict() {
-  local count="$1" messages="$2" bead="$3"
+  local count="$1" messages="$2" bead="$3" own_text="${4:-}"
   case "$count" in ''|*[!0-9]*|0) printf 'skip'; return 0 ;; esac
   [ -z "$bead" ] && { printf 'skip'; return 0; }
   # ga-unjpf (gate review fix-attempt-3 FAIL, caught live): anchor the match
@@ -2973,9 +2976,35 @@ branch_bead_commit_verdict() {
   local _anchored='(^|[^A-Za-z0-9])'"$bead"'([^A-Za-z0-9]|$)'
   if [[ "$messages" =~ $_anchored ]]; then
     printf 'yes'
-  else
-    printf 'no'
+    return 0
   fi
+  # ga-pj5va: sub-bead sliced from a parent epic, whose commit(s) cite the
+  # PARENT id instead of this bead's own (this city's normal slicing
+  # convention — "item 1 of X", "slice 4/6 of Y" — confirmed live on
+  # wa-awya7, citing parent wa-cuk7o, never itself). That shape isn't in the
+  # legitimate cases the header comment above enumerates, so the plain match
+  # above reads it as ga-y9a1d's own incident signature and blocks good work.
+  # Accept it when a candidate id cited in messages_blob is one THIS bead's
+  # own text (title+description, caller-resolved into own_text) names —
+  # i.e. the branch cites a relative this bead itself declares, not a
+  # stranger. Same extraction regex as GATE_Y9A1D_SUSPECTS below (proven
+  # portable in this file already); re-anchored per-candidate the same way
+  # $bead is above, so a candidate can't false-match own_text as a bare
+  # substring either. Fail-open: own_text empty (caller's bd lookup
+  # failed/skipped, or this call site predates the fix) falls straight
+  # through to 'no' — this is a NEW way to avoid blocking, never a new way
+  # to block.
+  if [ -n "$own_text" ]; then
+    local _cand _cand_anchored
+    for _cand in $(printf '%s' "$messages" | grep -oE '\b(ga|wa|dc|lexbh|marketing)-[a-z0-9]{4,7}\b' 2>/dev/null | sort -u); do
+      _cand_anchored='(^|[^A-Za-z0-9])'"$_cand"'([^A-Za-z0-9]|$)'
+      if [[ "$own_text" =~ $_cand_anchored ]]; then
+        printf 'yes'
+        return 0
+      fi
+    done
+  fi
+  printf 'no'
 }
 
 # Lib-only entrypoint for quality-gate-reconvene.selftest.sh: expose the helpers
@@ -3464,11 +3493,25 @@ fi
 # this is a new, additive safety net, not a load-bearing check; it must never
 # itself become a new false-FAIL source (ga-nooaw's own class of bug).
 if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH_SHA" ]; then
+  # ga-pj5va: resolve this bead's own title+description ONCE per run — feeds
+  # branch_bead_commit_verdict()'s parent-id acceptance path (see its header
+  # comment) at every call site below: this Step-10 check, plus do_merge_ff's
+  # up-to-4 merge-time re-checks (Site A rebase/merge-fallback, FF-push) that
+  # run later in this same PASS-guarded block. A plain global (no `local`),
+  # same pattern $BEAD_ID/$BEAD_CITY already use across this function, so
+  # do_merge_ff (defined inside this function's body) sees it too without a
+  # separate parameter. Fail-open: empty on any bd/jq failure just disables
+  # the parent-id acceptance path for this run — every call site below falls
+  # straight back to today's exact 3-arg behavior, never a new way to block.
+  GATE_BEAD_OWN_TEXT=""
+  if GATE_BEAD_OWN_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null); then
+    GATE_BEAD_OWN_TEXT=$(printf '%s' "$GATE_BEAD_OWN_JSON" | jq -r 'if type=="array" then .[0] else . end | "\(.title // "") \(.description // "")"' 2>/dev/null || echo "")
+  fi
   GATE_Y9A1D_BASE=$(git_rig merge-base "$BRANCH_SHA" "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
   if [ -n "$GATE_Y9A1D_BASE" ]; then
     GATE_Y9A1D_COUNT=$(git_rig rev-list --count "${GATE_Y9A1D_BASE}..${BRANCH_SHA}" 2>/dev/null || echo "")
     GATE_Y9A1D_MSGS=$(git_rig log --format='%B' "${GATE_Y9A1D_BASE}..${BRANCH_SHA}" 2>/dev/null || echo "")
-    GATE_Y9A1D_VERDICT=$(branch_bead_commit_verdict "$GATE_Y9A1D_COUNT" "$GATE_Y9A1D_MSGS" "$BEAD_ID")
+    GATE_Y9A1D_VERDICT=$(branch_bead_commit_verdict "$GATE_Y9A1D_COUNT" "$GATE_Y9A1D_MSGS" "$BEAD_ID" "$GATE_BEAD_OWN_TEXT")
     if [ "$GATE_Y9A1D_VERDICT" = "no" ]; then
       # Diagnostic value-add: surface which OTHER bead(s) the content actually
       # looks like, so a human doesn't have to re-derive it by hand (the
@@ -3631,7 +3674,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
               NEW_TIP_MR_VERDICT=$(branch_bead_commit_verdict \
                 "$(git -C "$TMP_MR_WT" rev-list --count "${CUR_MAIN}..${NEW_TIP_MR}" 2>/dev/null || echo "")" \
                 "$(git -C "$TMP_MR_WT" log --format='%B' "${CUR_MAIN}..${NEW_TIP_MR}" 2>/dev/null || echo "")" \
-                "$BEAD_ID")
+                "$BEAD_ID" "$GATE_BEAD_OWN_TEXT")
               # ga-y9a1d (self-audit catch): require an explicit "yes", not
               # merely "not no". If this rebase COMPLETELY collapses
               # (NEW_TIP_MR ends up literally equal to CUR_MAIN — zero
@@ -3677,7 +3720,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
                 NEW_TIP_MRM_VERDICT=$(branch_bead_commit_verdict \
                   "$(git -C "$TMP_MR_WT" rev-list --count "${CUR_MAIN}..${NEW_TIP_MRM}" 2>/dev/null || echo "")" \
                   "$(git -C "$TMP_MR_WT" log --format='%B' "${CUR_MAIN}..${NEW_TIP_MRM}" 2>/dev/null || echo "")" \
-                  "$BEAD_ID")
+                  "$BEAD_ID" "$GATE_BEAD_OWN_TEXT")
                 if [ -n "$NEW_TIP_MRM" ] && [ "$NEW_TIP_MRM_VERDICT" = "yes" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" 2>/dev/null; then
                   MR_OK=1
                   log "  Merge-time merge fallback (ga-qukyp): rebase-replay failed but merge-tree pre-check showed zero conflict — merged instead, pushed $BRANCH → $NEW_TIP_MRM"
@@ -3701,7 +3744,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
               NEW_TIP_MR_SR_VERDICT=$(branch_bead_commit_verdict \
                 "$(git -C "$TMP_MR_WT" rev-list --count "${CUR_MAIN}..${NEW_TIP_MR_SR}" 2>/dev/null || echo "")" \
                 "$(git -C "$TMP_MR_WT" log --format='%B' "${CUR_MAIN}..${NEW_TIP_MR_SR}" 2>/dev/null || echo "")" \
-                "$BEAD_ID")
+                "$BEAD_ID" "$GATE_BEAD_OWN_TEXT")
               # ga-y9a1d (self-audit catch): see the container-rig branch
               # above for the full rationale — require an explicit "yes",
               # not merely "not no" (a complete collapse yields "skip", an
@@ -3725,7 +3768,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
                 NEW_TIP_MRM_SR_VERDICT=$(branch_bead_commit_verdict \
                   "$(git -C "$TMP_MR_WT" rev-list --count "${CUR_MAIN}..${NEW_TIP_MRM_SR}" 2>/dev/null || echo "")" \
                   "$(git -C "$TMP_MR_WT" log --format='%B' "${CUR_MAIN}..${NEW_TIP_MRM_SR}" 2>/dev/null || echo "")" \
-                  "$BEAD_ID")
+                  "$BEAD_ID" "$GATE_BEAD_OWN_TEXT")
                 if [ -n "$NEW_TIP_MRM_SR" ] && [ "$NEW_TIP_MRM_SR_VERDICT" = "yes" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" 2>/dev/null; then
                   MR_OK=1
                   log "  Merge-time merge fallback (self-repo, ga-qukyp): rebase-replay failed but merge-tree pre-check showed zero conflict — merged instead, pushed $BRANCH → $NEW_TIP_MRM_SR"
@@ -3790,7 +3833,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       local FF_PUSH_COUNT FF_PUSH_MSGS FF_PUSH_VERDICT
       FF_PUSH_COUNT=$(git_rig rev-list --count "${CUR_MAIN}..${CUR_BRANCH}" 2>/dev/null || echo "")
       FF_PUSH_MSGS=$(git_rig log --format='%B' "${CUR_MAIN}..${CUR_BRANCH}" 2>/dev/null || echo "")
-      FF_PUSH_VERDICT=$(branch_bead_commit_verdict "$FF_PUSH_COUNT" "$FF_PUSH_MSGS" "$BEAD_ID")
+      FF_PUSH_VERDICT=$(branch_bead_commit_verdict "$FF_PUSH_COUNT" "$FF_PUSH_MSGS" "$BEAD_ID" "$GATE_BEAD_OWN_TEXT")
       if [ "$FF_PUSH_VERDICT" = "no" ]; then
         err "  FF push refused (ga-pfgnv): $CUR_BRANCH's $FF_PUSH_COUNT unique commit(s) vs $DEFAULT_BRANCH never mention bead $BEAD_ID — branch-content-coherence check caught at the actual push point."
         MERGE_RESULT="failed_branch_content_mismatch"
