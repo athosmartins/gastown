@@ -3369,7 +3369,7 @@ _session_is_live_builder() {
   fi
 
   if command -v python3 >/dev/null 2>&1 && [ -f "$_slb_bsp" ]; then
-    local _slb_pydir _slb_meta _slb_payload _slb_out
+    local _slb_pydir _slb_meta _slb_payload _slb_out _slb_rc
     _slb_pydir="$(dirname "$_slb_bsp")"
     _slb_meta=$(jq -n --arg live "${_LIVE_SESSION_IDS:-}" --arg asleep "${_ASLEEP_SESSION_IDS:-}" '
       ($live | split("\n") | map(select(length>0))) as $l
@@ -3386,13 +3386,31 @@ from bead_state import is_live_builder
 p = json.load(sys.stdin)
 print(is_live_builder(p["assignee"], p["session_meta"]))
 ' 2>/dev/null)
+      _slb_rc=$?
       case "$_slb_out" in
         True)  return 0 ;;
         False) return 1 ;;
-        # None (live_sessions vazio/não-consultado) ou saída inesperada: cai
-        # pro caminho bash original abaixo, nunca colapsa pra False — mesma
-        # disciplina do bridge de _session_is_active_owner (ga-9e8ks gate-fix
-        # attempt 3).
+        None)
+          : # Tri-state deliberado (live_sessions vazio/não-consultado, ou
+            # coordenador) — cai pro caminho bash original abaixo, nunca
+            # colapsa pra False, mesma disciplina do bridge de
+            # _session_is_active_owner (ga-9e8ks gate-fix attempt 3).
+          ;;
+        *)
+          # gate-fix attempt 1 (gate_run=ga-zefzz): saída vazia/inesperada
+          # com o bridge REALMENTE invocado (rc=$_slb_rc) normalmente é
+          # exceção não tratada (ImportError, AttributeError, um rename
+          # futuro de is_live_builder) — antes, isso caía no MESMO fallback
+          # bash que uma resposta correta e, como esta fatia é porta
+          # byte-fiel, o resultado batia igual: um bridge 100% quebrado
+          # ficava indistinguível de um funcionando (reviewer FAIL,
+          # gate_run=ga-zefzz, verificado ao vivo por mutation-test:
+          # renomear is_live_builder deixou os checks comportamentais
+          # originais reportando PASS). Torna isso visível SEM mudar o
+          # fallback — mesma disciplina fail-open desta fatia, só a
+          # observabilidade muda.
+          warn "[pilot] bridge is_live_builder() quebrado p/ assignee=$_slb_asg (python3 rc=$_slb_rc, saída='${_slb_out}') — usando checagem bash de fallback" >&2
+          ;;
       esac
     fi
   fi
@@ -3661,7 +3679,7 @@ _beadid_live_crew_owner() {
     _blc_sd="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
     _blc_bsp="${_blc_sd:+$_blc_sd/../../../scripts}/bead_state.py"
   fi
-  local _blc_alive=""
+  local _blc_alive="" _blc_rc=""
   if command -v python3 >/dev/null 2>&1 && [ -f "$_blc_bsp" ]; then
     local _blc_pydir _blc_meta _blc_payload
     _blc_pydir="$(dirname "$_blc_bsp")"
@@ -3677,12 +3695,29 @@ from bead_state import holder_is_alive
 p = json.load(sys.stdin)
 print(holder_is_alive(p["assignee"], p["session_meta"]))
 ' 2>/dev/null)
+      _blc_rc=$?
     fi
   fi
   case "$_blc_alive" in
     True)  : ;;                # confirmed alive — fall through to the rest of this function
     False) return 1 ;;
-    *) _session_is_live "$_asg" || return 1 ;;   # None/unavailable/unexpected → original check
+    None)  _session_is_live "$_asg" || return 1 ;;   # tri-state deliberado → original check
+    *)
+      # gate-fix attempt 1 (gate_run=ga-zefzz): mesma classe do bridge
+      # is_live_builder acima. $_blc_rc só fica não-vazio quando o bridge foi
+      # REALMENTE invocado (payload não-vazio, python3 chamado) — distingue
+      # "bridge nunca tentado" (python3/bead_state.py ausentes: $_blc_rc
+      # permanece "", silencioso, comportamento idêntico a antes desta
+      # fatia) de "bridge tentado e devolveu algo que não é True/False/None"
+      # (quase sempre uma exceção não tratada — ImportError, AttributeError,
+      # rename futuro de holder_is_alive). Este segundo bridge tem o MESMO
+      # formato swallow-then-silently-fallback que o reviewer sinalizou no
+      # is_live_builder, mas não era exercitado comportamentalmente pelo
+      # prod-test nenhuma vez (só grep-checado). Visível sem mudar o
+      # fallback:
+      [ -n "$_blc_rc" ] && warn "[pilot] bridge holder_is_alive() quebrado p/ assignee=$_asg (python3 rc=$_blc_rc, saída='${_blc_alive}') — usando checagem bash de fallback" >&2
+      _session_is_live "$_asg" || return 1
+      ;;
   esac
 
   # ── Phantom-claim guard ─────────────────────────────────────────────────────
