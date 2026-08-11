@@ -687,6 +687,41 @@ def is_active_owner(assignee: str, session_meta, idle_threshold_min: int = 180) 
     return idle < idle_threshold_min
 
 
+def is_live_builder(assignee: str, live_sessions) -> bool | None:
+    """True sse `assignee` é um BUILDER vivo agora: vivo (holder_is_alive) E,
+    se for um worker de pool efêmero (nome contém "-adhoc-"), NÃO asleep.
+
+    Decisão 1 (ga-5ot99) — substitui pilot-dispatcher.sh's
+    _session_is_live_builder (fatia 5/6, ga-5crlw): um worker …-adhoc… que
+    foi pra asleep já deu drain-ack (wake_mode=fresh → nunca retoma o build
+    em andamento pro qual foi despachado); tratá-lo como builder vivo prende
+    o bead dele (NEVERSTARTED) e segura falsamente o slot da pool (ga-mrfb).
+    Sessões nomeadas/não-adhoc mantêm a semântica plena de holder_is_alive —
+    um crew asleep ainda é dono do bead, e o caminho de REUSE do dispatch
+    acorda ele de propósito (gt-4st3n). O caso especial é só o padrão de
+    NOME "-adhoc-", não uma regra geral de vivacidade.
+
+    Tri-state por COMPOSIÇÃO com holder_is_alive (mesma disciplina de
+    is_active_owner — não reimplementa None-safety nem imunidade de
+    coordenador; um assignee -adhoc- nunca é coordenador na prática, mas o
+    caminho abaixo continua correto de qualquer forma porque só executa
+    quando holder_is_alive já confirmou True):
+      - holder_is_alive(assignee, live_sessions) is not True → devolve esse
+        valor sem alteração (False, ou None de live_sessions=None/
+        coordenador — nunca colapsa pra False).
+      - vivo E "-adhoc-" no nome E state == "asleep" (drenado)  → False.
+      - vivo E ("-adhoc-" não no nome OU state != "asleep")     → True.
+    """
+    alive = holder_is_alive(assignee, live_sessions)
+    if alive is not True:
+        return alive
+    if "-adhoc-" in assignee:
+        _, record = _match_live_session(assignee, live_sessions)
+        if (record.get("state") or "") == "asleep":
+            return False
+    return True
+
+
 def derive(bead: dict, live_sessions=None,
            known_crews: frozenset = frozenset(),
            merged: bool | None = None,

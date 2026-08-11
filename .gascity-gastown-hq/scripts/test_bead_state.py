@@ -16,7 +16,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bead_state import (  # noqa: E402
     derive, holder_is_alive, is_athos_page, is_ephemeral, is_needs_human,
     claimant_provably_dead, session_owner_is_healthy, session_activity_age,
-    parse_iso_epoch, is_coordinator, is_active_owner, EPHEMERAL_POOL_TEMPLATES,
+    parse_iso_epoch, is_coordinator, is_active_owner, is_live_builder,
+    EPHEMERAL_POOL_TEMPLATES,
     STALE_ACTIVITY_TTL,
 )
 
@@ -250,6 +251,75 @@ def test_active_owner_registro_ausente_ou_none_para_match_nao_quebra():
     dado extra', mesma direção segura de idle_minutes=None acima."""
     assert is_active_owner("mila-wa", {"mila-wa-x1": {}}) is True
     assert is_active_owner("mila-wa", {"mila-wa-x1": None}) is True
+
+
+def test_live_builder_nao_consultei_e_none():
+    assert is_live_builder("ps-worker-adhoc-x1", None) is None
+
+
+def test_live_builder_sem_match_e_false():
+    assert is_live_builder("ps-worker-adhoc-x1", {}) is False
+
+
+def test_live_builder_coordenador_e_none_nao_false():
+    """Herdado de holder_is_alive por composição (mesma disciplina de
+    is_active_owner) — nunca chega no check '-adhoc-' porque holder_is_alive
+    já retornou None antes."""
+    assert is_live_builder(
+        "mayor", {"gastown.mayor": {"state": "active", "idle_minutes": 0}}
+    ) is None
+
+
+def test_live_builder_nao_adhoc_asleep_ainda_e_vivo():
+    """O oposto de is_active_owner de propósito (Decisão 1 do design doc): um
+    crew NOMEADO/não-adhoc asleep ainda é dono do bead — o caminho de REUSE
+    do dispatch (gt-4st3n) acorda ele deliberadamente. Só workers -adhoc- têm
+    a regra 'asleep = morto'."""
+    asleep_named = {"thies-wa": {"state": "asleep", "idle_minutes": None}}
+    assert is_live_builder("thies-wa", asleep_named) is True
+
+
+def test_live_builder_adhoc_asleep_e_false():
+    """A regressão ga-mrfb: um worker …-adhoc… que foi pra asleep já deu
+    drain-ack (wake_mode=fresh) e nunca retoma o build — tratá-lo como vivo
+    prende o bead (NEVERSTARTED) e segura o slot da pool falsamente."""
+    asleep_adhoc = {
+        "ps-worker-adhoc-b942bd1523": {"state": "asleep", "idle_minutes": None}
+    }
+    assert is_live_builder("ps-worker-adhoc-b942bd1523", asleep_adhoc) is False
+
+
+def test_live_builder_adhoc_acordado_e_vivo():
+    awake_adhoc = {
+        "ps-worker-adhoc-AWAKE01": {"state": "active", "idle_minutes": None}
+    }
+    assert is_live_builder("ps-worker-adhoc-AWAKE01", awake_adhoc) is True
+
+
+def test_live_builder_casa_por_sufixo_como_holder_is_alive():
+    """Mesma primitiva de casamento de holder_is_alive/is_active_owner
+    (Decisão 1) — sem uma terceira reimplementação com um bug diferente."""
+    live = {"mila-wa-awispm94omdp": {"state": "active", "idle_minutes": 5}}
+    assert is_live_builder("mila-wa", live) is True
+
+
+def test_live_builder_aceita_forma_antiga_set_sem_registro_rico():
+    """Backward-compat explícito (Decisão 1): a forma antiga (set de
+    identificadores, sem state) ainda funciona — sem registro rico, o check
+    '-adhoc-'+asleep não pode confirmar 'asleep', então degrada pra
+    ativo/vivo (mesma direção segura de is_active_owner's fallback), nunca
+    lança exceção."""
+    assert is_live_builder(
+        "ps-worker-adhoc-x1", frozenset({"ps-worker-adhoc-x1"})
+    ) is True
+    assert is_live_builder("ps-worker-adhoc-x1", frozenset()) is False
+
+
+def test_live_builder_registro_ausente_ou_none_para_match_nao_quebra():
+    """Defensivo: um registro vazio/None pro match não lança AttributeError —
+    mesma proteção de is_active_owner, aqui aplicada ao check de state."""
+    assert is_live_builder("ps-worker-adhoc-x1", {"ps-worker-adhoc-x1": {}}) is True
+    assert is_live_builder("ps-worker-adhoc-x1", {"ps-worker-adhoc-x1": None}) is True
 
 
 # ── de quem é a vez ──────────────────────────────────────────────────────────

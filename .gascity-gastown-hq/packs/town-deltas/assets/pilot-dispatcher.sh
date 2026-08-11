@@ -3335,11 +3335,73 @@ _session_is_asleep() {
 # a live builder wedges its bead (NEVERSTARTED) and falsely holds its pool slot.
 # Named/non-adhoc sessions keep full _session_is_live semantics (an asleep crew is
 # still its bead's owner, and the dispatch REUSE path wakes it deliberately).
+#
+# ga-5crlw (derive() swap slice 5/6): bridges to bead_state.is_live_builder(
+# assignee, session_meta) instead of reimplementing the "-adhoc- + asleep = dead"
+# rule a second time — same resolution/fail-open discipline as ga-9e8ks's
+# _session_is_active_owner bridge (slice 4): bead_state.py located relative to
+# THIS script's own location (BASH_SOURCE) or PILOT_BEAD_STATE_PY_OVERRIDE, and
+# ANY bridge failure — python3/bead_state.py missing, unexpected output, or a
+# tri-state None (bridge didn't consult / genuinely can't tell) — falls back to
+# the pre-existing bash check unchanged, never a half-trusted result.
+#
+# session_meta here is built LOCALLY from $_LIVE_SESSION_IDS/$_ASLEEP_SESSION_IDS
+# (this function's own pre-existing dependencies), deliberately NOT reusing the
+# sweep-global $_SESSION_META_JSON that _session_is_active_owner consumes: that
+# global is computed further down the file, after this function's own
+# definition, and pilot-dispatcher.session-liveness.selftest.sh's awk extraction
+# (by design, per its own header) only pulls the range up through this
+# function's closing brace — reaching for a not-yet-extracted global here would
+# make the selftest silently exercise an empty/undefined meta dict instead of
+# the real bridge, the same class of test/reality mismatch ga-9e8ks's gate-fix
+# attempt 1 hit via a different mechanism (BASH_SOURCE resolution inside an
+# eval'd extraction). Building the (small) rich dict locally keeps this
+# function's dependency footprint identical to before this slice.
 _session_is_live_builder() {
   [ -n "${1:-}" ] || return 1
-  _session_is_live "$1" || return 1
-  case "$1" in
-    *-adhoc-*) _session_is_asleep "$1" && return 1 ;;   # drained ephemeral worker → dead builder
+  local _slb_asg="$1"
+
+  local _slb_bsp _slb_sd
+  _slb_bsp="${PILOT_BEAD_STATE_PY_OVERRIDE:-}"
+  if [ -z "$_slb_bsp" ]; then
+    _slb_sd="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    _slb_bsp="${_slb_sd:+$_slb_sd/../../../scripts}/bead_state.py"
+  fi
+
+  if command -v python3 >/dev/null 2>&1 && [ -f "$_slb_bsp" ]; then
+    local _slb_pydir _slb_meta _slb_payload _slb_out
+    _slb_pydir="$(dirname "$_slb_bsp")"
+    _slb_meta=$(jq -n --arg live "${_LIVE_SESSION_IDS:-}" --arg asleep "${_ASLEEP_SESSION_IDS:-}" '
+      ($live | split("\n") | map(select(length>0))) as $l
+      | ($asleep | split("\n") | map(select(length>0))) as $a
+      | [$l[] as $id | {($id): {state: (if ($a | index($id)) then "asleep" else "active" end)}}]
+      | add // {}' 2>/dev/null)
+    [ -n "$_slb_meta" ] || _slb_meta='{}'
+    _slb_payload=$(jq -n --arg asg "$_slb_asg" --argjson meta "$_slb_meta" \
+      '{assignee: $asg, session_meta: $meta}' 2>/dev/null)
+    if [ -n "$_slb_payload" ]; then
+      _slb_out=$(printf '%s' "$_slb_payload" | PYTHONPATH="$_slb_pydir" python3 -c '
+import sys, json
+from bead_state import is_live_builder
+p = json.load(sys.stdin)
+print(is_live_builder(p["assignee"], p["session_meta"]))
+' 2>/dev/null)
+      case "$_slb_out" in
+        True)  return 0 ;;
+        False) return 1 ;;
+        # None (live_sessions vazio/não-consultado) ou saída inesperada: cai
+        # pro caminho bash original abaixo, nunca colapsa pra False — mesma
+        # disciplina do bridge de _session_is_active_owner (ga-9e8ks gate-fix
+        # attempt 3).
+      esac
+    fi
+  fi
+
+  # Bridge indisponível, payload vazio, ou None/saída inesperada acima —
+  # checagem bash original, byte-idêntica à de antes desta fatia.
+  _session_is_live "$_slb_asg" || return 1
+  case "$_slb_asg" in
+    *-adhoc-*) _session_is_asleep "$_slb_asg" && return 1 ;;
   esac
   return 0
 }
@@ -3578,7 +3640,50 @@ _beadid_live_crew_owner() {
     | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
   { [ -z "$_asg" ] || [ "$_asg" = "null" ]; } && return 1
   case "$_asg" in gastown.dog|gastown.dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*) return 1 ;; esac
-  _session_is_live "$_asg" || return 1
+
+  # ga-5crlw (derive() swap slice 5/6): liveness sub-check bridges to
+  # bead_state.holder_is_alive(assignee, live_sessions) instead of the bash
+  # _session_is_live grep — plain (non-adhoc-aware) form, since pool-builder
+  # identities were already excluded by the case above, leaving only named
+  # crews/coordinators here, exactly _session_is_live's own semantics. Same
+  # fail-open discipline as the other two bridges this slice adds: bridge
+  # unavailable, empty payload, or a None verdict (live_sessions effectively
+  # unconsultable) all fall through to the original bash check, never a
+  # half-trusted result. live_sessions passed as a plain JSON array (the
+  # "old" shape holder_is_alive already accepts) built from
+  # $_LIVE_SESSION_IDS alone — this function's own pre-existing dependency,
+  # not the sweep-global $_SESSION_META_JSON (same locality reasoning as the
+  # _session_is_live_builder bridge above: keep this function's dependency
+  # footprint unchanged by this slice).
+  local _blc_bsp _blc_sd
+  _blc_bsp="${PILOT_BEAD_STATE_PY_OVERRIDE:-}"
+  if [ -z "$_blc_bsp" ]; then
+    _blc_sd="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    _blc_bsp="${_blc_sd:+$_blc_sd/../../../scripts}/bead_state.py"
+  fi
+  local _blc_alive=""
+  if command -v python3 >/dev/null 2>&1 && [ -f "$_blc_bsp" ]; then
+    local _blc_pydir _blc_meta _blc_payload
+    _blc_pydir="$(dirname "$_blc_bsp")"
+    _blc_meta=$(jq -n --arg live "${_LIVE_SESSION_IDS:-}" \
+      '$live | split("\n") | map(select(length>0))' 2>/dev/null)
+    [ -n "$_blc_meta" ] || _blc_meta='[]'
+    _blc_payload=$(jq -n --arg asg "$_asg" --argjson meta "$_blc_meta" \
+      '{assignee: $asg, session_meta: $meta}' 2>/dev/null)
+    if [ -n "$_blc_payload" ]; then
+      _blc_alive=$(printf '%s' "$_blc_payload" | PYTHONPATH="$_blc_pydir" python3 -c '
+import sys, json
+from bead_state import holder_is_alive
+p = json.load(sys.stdin)
+print(holder_is_alive(p["assignee"], p["session_meta"]))
+' 2>/dev/null)
+    fi
+  fi
+  case "$_blc_alive" in
+    True)  : ;;                # confirmed alive — fall through to the rest of this function
+    False) return 1 ;;
+    *) _session_is_live "$_asg" || return 1 ;;   # None/unavailable/unexpected → original check
+  esac
 
   # ── Phantom-claim guard ─────────────────────────────────────────────────────
   local _is_stale=0
