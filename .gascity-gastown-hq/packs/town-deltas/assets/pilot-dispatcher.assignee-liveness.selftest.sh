@@ -136,6 +136,46 @@ else
   ok "_session_is_live_builder(asleep adhoc)=dead — ga-mrfb fix untouched"
 fi
 
+echo "Scenario: _session_is_active_owner — coordinator (mayor/deacon) genuinely ACTIVE must read active, not collapsed to not-active (ga-9e8ks gate-fix attempt 3)"
+# Reviewer FAIL (gate-run ga-pxzv2): the bash bridge's case statement equated
+# is_active_owner()'s None (returned specifically for a coordinator identity,
+# per holder_is_alive's ga-8lrud immunity) with False — so a genuinely-alive
+# mayor/deacon ALWAYS read as "not active" regardless of the real roster,
+# authorizing exactly the double-dispatch (ga-htjni) / two-crews-one-bead
+# (wa-6m6h) races the surrounding call sites' own comments name as the
+# reason they exist. Real identity strings are "gastown.mayor"/
+# "gastown.deacon" (confirmed live against `gc session list --json` — not
+# the bare "mayor"/"deacon" the ORIGINAL slice's own regression analysis
+# checked); is_coordinator() substring-matches "mayor"/"deacon" against the
+# assignee, so both trigger the immunity path.
+COORD_RECENT="$(now_iso)"
+export _SESSIONS_JSON='{"sessions":[
+  {"session_name":"gastown__mayor","name":"gastown.mayor","alias":"gastown.mayor","agent_name":"gastown.mayor","state":"active","closed":false,"last_active":"'"$COORD_RECENT"'"},
+  {"session_name":"gastown__deacon","name":"gastown.deacon","alias":"gastown.deacon","agent_name":"gastown.deacon","state":"active","closed":false,"last_active":"'"$COORD_RECENT"'"}
+]}'
+eval "$SNIP"
+_t "genuinely-alive mayor (gastown.mayor, real identity shape)"   "gastown.mayor"  "active"
+_t "genuinely-alive deacon (gastown.deacon, real identity shape)" "gastown.deacon" "active"
+
+# Control: a coordinator with NO live session anywhere must still resolve
+# not-active (via the same grep-fallback mechanism the pre-bridge code always
+# used) — the fix must not manufacture false "active" for a coordinator that
+# really is gone; it only stops the bridge from LYING about one that's alive.
+export _SESSIONS_JSON='{"sessions":[]}'
+eval "$SNIP"
+_t "mayor with zero live sessions in roster (control — must NOT become permanently un-reclaimable)" "gastown.mayor" "not-active"
+
+# Mutation control: prove this scenario actually exercises the coordinator
+# path, not an accident of the fixture. A NON-coordinator identity shaped
+# identically (same liveness data, different name) must behave the same as
+# any other regular crew tested above — confirms the assertions above are
+# really about coordinator immunity, not some other divergence.
+export _SESSIONS_JSON='{"sessions":[
+  {"session_name":"regular-crew-shaped","state":"active","closed":false,"last_active":"'"$COORD_RECENT"'"}
+]}'
+eval "$SNIP"
+_t "non-coordinator identity, same liveness shape as mayor above (mutation control)" "regular-crew-shaped" "active"
+
 echo "Scenario: PILOT_ASSIGNEE_IDLE_MINUTES is env-overridable"
 (
   export PILOT_ASSIGNEE_IDLE_MINUTES=5
