@@ -3462,13 +3462,32 @@ p = json.load(sys.stdin)
 print(is_active_owner(p["assignee"], p["session_meta"], p["idle_threshold_min"]))
 ' 2>/dev/null)
       case "$_sao_out" in
-        True)       return 0 ;;
-        False|None) return 1 ;;
+        True)  return 0 ;;
+        False) return 1 ;;
+        # ga-9e8ks gate-fix (attempt 3): None is DELIBERATELY not handled here
+        # — it must NOT collapse to the same outcome as False. is_active_owner
+        # returns None specifically via holder_is_alive's coordinator immunity
+        # (ga-8lrud: assignee substring-matches "mayor"/"deacon", e.g. the
+        # real identity "gastown.mayor" — a role that never confirms dead).
+        # Falling through to the pre-existing grep fallback below (rather than
+        # trusting a binary-collapsed verdict) is not just "safer" — it is
+        # MORE CORRECT: unlike is_coordinator's assignee-string check, the
+        # grep genuinely re-consults the live roster, so a coordinator who
+        # really IS active (their identity string present as a roster
+        # synonym) is correctly found active, instead of the bridge's short-
+        # circuit always reporting "not active" regardless of the truth. A
+        # coordinator who genuinely isn't in the roster still resolves not-
+        # active via the SAME mechanism the pre-bridge code always used —
+        # never worse than status quo ante, and this is the exact call site
+        # ga-htjni (double-dispatch onto live coordinator work) and wa-6m6h
+        # (two crews, one bead) both exist to prevent. Any other unhandled/
+        # unparseable $_sao_out falls through here too, unchanged.
       esac
     fi
   fi
 
-  # Bridge unavailable or produced unexpected output — original jq/grep check.
+  # Bridge unavailable, produced unexpected output, or returned None (coordinator
+  # immunity — see the comment above) — original jq/grep check.
   printf '%s\n' "$_ACTIVE_OWNER_IDS" | grep -Fxq -- "$_sao_asg"
 }
 

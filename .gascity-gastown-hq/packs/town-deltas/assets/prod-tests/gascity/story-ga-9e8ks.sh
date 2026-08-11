@@ -84,6 +84,27 @@ _session_is_active_owner "prodtest-idle" \
 _session_is_active_owner "prodtest-asleep" \
   && fail "asleep session (zero-sentinel last_active) read as active (bridge lost the ga-46wq5 asleep check — the exact bug this predicate exists to fix)"
 
-log "behavioral checks OK: active/idle/asleep all resolve correctly through the real bead_state.py bridge"
+# ── 4. Behavioral: coordinator (mayor/deacon) immunity — None must not
+#      collapse to not-active (ga-9e8ks gate-fix attempt 3 — Decision 4's
+#      mandated omission-regression test; reviewer FAIL gate_run=ga-pxzv2).
+#      is_active_owner() returns None specifically for a coordinator-shaped
+#      assignee (is_coordinator() substring-matches "mayor"/"deacon"); the
+#      bridge must let that fall through to the pre-existing
+#      $_ACTIVE_OWNER_IDS grep fallback, never treat it as instant False. A
+#      genuinely-alive Mayor misread as "not active" is exactly what would
+#      authorize the ga-htjni double-dispatch / wa-6m6h two-crews-one-bead
+#      regressions the two real call sites of this predicate exist to
+#      prevent. Real identity shape confirmed against `gc session list
+#      --json` (session_name uses "__", name/alias/agent_name use ".").
+export _SESSIONS_JSON='{"sessions":[
+  {"session_name":"gastown__mayor","name":"gastown.mayor","alias":"gastown.mayor","agent_name":"gastown.mayor","state":"active","closed":false,"last_active":"'"$NOW_ISO"'"}
+]}'
+eval "$SNIP"
+
+_session_is_active_owner "gastown.mayor" \
+  || fail "genuinely-alive coordinator (gastown.mayor) read as not-active — None-collapsed-to-False regression (gate_run=ga-pxzv2)"
+
+log "coordinator immunity OK: genuinely-alive mayor resolves active, not collapsed to False"
+log "behavioral checks OK: active/idle/asleep/coordinator all resolve correctly through the real bead_state.py bridge"
 log "PASS — derive() swap fatia 4/6 (_session_is_active_owner -> is_active_owner) deployed and behaviorally correct"
 exit 0
