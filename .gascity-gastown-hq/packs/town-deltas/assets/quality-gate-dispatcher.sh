@@ -2954,8 +2954,10 @@ branch_tip_commit_author() {
 #            job, not this check's; also the fail-open case for a bead_id we
 #            couldn't resolve), or bead is empty.
 #     yes  — bead_id appears somewhere in messages_blob (normal case), OR
-#            (ga-pj5va) a bead id cited in messages_blob is itself named in
-#            own_text — see below.
+#            (ga-pj5va) a bead id cited in messages_blob is named in
+#            own_text as a DECLARED relative ("item N of X", "slice N/M of
+#            Y", "sub-bead of X", "parent: X" — not a bare co-mention
+#            anywhere in the text) — see below.
 #     no   — count > 0 but neither of the above holds — ga-y9a1d's signature.
 branch_bead_commit_verdict() {
   local count="$1" messages="$2" bead="$3" own_text="${4:-}"
@@ -2984,21 +2986,34 @@ branch_bead_commit_verdict() {
   # wa-awya7, citing parent wa-cuk7o, never itself). That shape isn't in the
   # legitimate cases the header comment above enumerates, so the plain match
   # above reads it as ga-y9a1d's own incident signature and blocks good work.
-  # Accept it when a candidate id cited in messages_blob is one THIS bead's
-  # own text (title+description, caller-resolved into own_text) names —
-  # i.e. the branch cites a relative this bead itself declares, not a
-  # stranger. Same extraction regex as GATE_Y9A1D_SUSPECTS below (proven
-  # portable in this file already); re-anchored per-candidate the same way
-  # $bead is above, so a candidate can't false-match own_text as a bare
-  # substring either. Fail-open: own_text empty (caller's bd lookup
-  # failed/skipped, or this call site predates the fix) falls straight
-  # through to 'no' — this is a NEW way to avoid blocking, never a new way
-  # to block.
+  #
+  # fix-attempt-1 FAIL (gate_run=ga-xvn9w, reviewer verdict verified live):
+  # the first cut accepted ANY candidate id merely CO-MENTIONED anywhere in
+  # own_text, with no evidence own_text was declaring it as a relative at
+  # all — concretely exploitable by two texts that each cite the SAME
+  # unrelated third bead as casual background (own_text "...see ga-X for
+  # the earlier investigation..." and messages "...same pattern as ga-X's
+  # fix...") even though neither asserts any relationship to ga-X.
+  #
+  # fix-attempt-2: require the candidate id to appear in own_text as part of
+  # an actual declaration, not a bare mention — a slice/parent keyword
+  # (item, fatia/fatias, slice, parte/parcela, sub-bead, sub-issue, parent,
+  # pai, epic/epico/épico — this city's observed vocabulary, Portuguese and
+  # English) at a non-alnum boundary (same style as $bead above), followed
+  # by a short connector run (ordinal/"do"/"de"/"of"/":" — up to 15 chars,
+  # never crossing '.'/'!'/'?' so a keyword bound to an EARLIER id in the
+  # same own_text can't reach PAST a sentence boundary to a LATER, unrelated
+  # id — "parent of ga-111. Also see ga-222" must accept ga-111 and still
+  # refuse ga-222), then THIS SPECIFIC candidate at its own non-alnum
+  # boundary. Fail-open: own_text empty, or no candidate satisfies the
+  # declaration shape, falls straight through to 'no' — this is a NEW way to
+  # avoid blocking, never a new way to block.
   if [ -n "$own_text" ]; then
-    local _cand _cand_anchored
+    local _cand _cand_decl_re
+    local _decl_kw='([ÉéEe]pico|[Ee]pic|[Ff]atias|[Ff]atia|[Ii]tem|[Ss]lice|[Pp]arcela|[Pp]arte|[Ss]ub-?bead|[Ss]ub-?issue|[Pp]arent|[Pp]ai)'
     for _cand in $(printf '%s' "$messages" | grep -oE '\b(ga|wa|dc|lexbh|marketing)-[a-z0-9]{4,7}\b' 2>/dev/null | sort -u); do
-      _cand_anchored='(^|[^A-Za-z0-9])'"$_cand"'([^A-Za-z0-9]|$)'
-      if [[ "$own_text" =~ $_cand_anchored ]]; then
+      _cand_decl_re='(^|[^A-Za-z0-9])'"$_decl_kw"'[^A-Za-z0-9][^.!?]{0,15}'"$_cand"'([^A-Za-z0-9]|$)'
+      if [[ "$own_text" =~ $_cand_decl_re ]]; then
         printf 'yes'
         return 0
       fi
