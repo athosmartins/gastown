@@ -403,6 +403,41 @@ should follow.
    used (`panel_state_divergence.py` repointed at the worktree) — zero
    divergence is the bar, not "tests pass."
 
+   **Addendum (`ga-qubtx`, verified 2026-08-11, after slices 1-5 shipped):**
+   re-investigated from scratch rather than trusting this slice list's stale
+   line numbers (5433-7277 above pre-dates slices 4-5's own +150-ish line
+   insertions; current span is 5928-7772, 1823 lines via
+   `awk '/^dispatch_one\(\) \{/{f=1} f{print; if (/^\}/) exit}'`). Exhaustive
+   grep across the full extracted body for every liveness-adjacent signal —
+   `_LIVE_SESSION_IDS`/`_ASLEEP_SESSION_IDS`/`_SESSIONS_JSON`/
+   `_SESSIONS_IDLE_JSON`/`_SESSION_META_JSON`/`_ACTIVE_OWNER_IDS` (the raw
+   roster globals), `PILOT_ASSIGNEE_IDLE_MINUTES`/`180` (idle-threshold
+   arithmetic), `-adhoc-` (the asleep-builder pattern) — found **zero**
+   direct/inline occurrences. Every liveness-consulting call site inside
+   `dispatch_one` is a call to a named function: `_beadid_live_crew_owner`
+   (2 sites, the `ga-lfvs6`/`ga-jazy9` domain- and lane-big-owner-honoring
+   paths) and `_session_is_active_owner` (1 site, the `ga-jzye0` gate-f
+   dedup check, whose own comment explicitly states it calls the existing
+   predicate "em vez de reimplementar a consulta ao roster" specifically to
+   avoid this duplication class). `_sling_is_live` (1 site) is correctly
+   excluded per Decision 3's boundary note — not a session predicate at all.
+   Both delegated-to functions were already bridged to `bead_state.py` by
+   slice 5 (`ga-5crlw`, `holder_is_alive`/`is_live_builder`) and slice 4
+   (`ga-9e8ks`, `is_active_owner`) respectively — via their "rewrite the
+   TARGET function's internals, not its external callers" strategy, which
+   transparently propagates the bridge to every existing caller, including
+   `dispatch_one`, with **no diff required in `dispatch_one`'s own body**.
+   **Conclusion: this slice's original finding (dispatch_one independently
+   reimplementing the principle a "third time") described `dispatch_one`
+   being a *consumer* of `_session_is_active_owner`/`_beadid_live_crew_owner`
+   — not a standalone duplicate implementation — and slices 4-5's chosen
+   strategy already resolved it as a side effect. Zero changes to
+   `dispatch_one`'s logic ship under `ga-qubtx`**; a structural regression
+   guard (`prod-tests/gascity/story-ga-qubtx.sh`) was added instead, to
+   catch a future re-introduction of an inline reimplementation or a
+   dropped delegation. This closes `ga-4oc2k`'s six-slice implementation
+   plan.
+
 After each slice: run the full existing selftest suite (the 9 files named
 in `ga-4oc2k`, not just the ones touched) — it's the safety net, and the
 instruction from `ga-4oc2k` stands: add to it, don't replace it.
