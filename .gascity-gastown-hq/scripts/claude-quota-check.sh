@@ -109,6 +109,35 @@
 #   CLAUDE_QUOTA_BURST_WINDOW_SECS  ga-burst: the recent window (in seconds) in which
 #                                 BURST_MIN_COUNT events must appear to declare LIMITED.
 #                                 Default 300 (5 min).
+#   CLAUDE_QUOTA_WEEKLY_FRESHNESS_SECS  ga-sdkqs: same freshness-guard idea as
+#                                 CLAUDE_QUOTA_FRESHNESS_SECS above (ga-z0n9f), applied to
+#                                 the WEEKLY track. An active weekly exhaustion is
+#                                 continuously re-logged as long as the gate/pilot
+#                                 dispatchers keep trying to spawn sessions (~every 2min)
+#                                 and keep re-hitting the same cap. If the STATED reset
+#                                 (days out) hasn't arrived yet but no fresh weekly-
+#                                 exhaustion line has appeared in this many seconds, that
+#                                 silence — despite continued spawn attempts — is strong
+#                                 evidence capacity came back early (e.g. a manual /login
+#                                 before the natural reset), not that the limit is still
+#                                 blocking. Without this guard, weekly.active would stay
+#                                 true for up to the 6h transcript-scan window after real
+#                                 recovery — a consumer that suppresses on weekly.active
+#                                 (e.g. gate-throughput-stall-watchdog.sh) would go blind
+#                                 to real stalls for that whole window. Default 1800 (30
+#                                 min) — longer than the SESSION default (20 min) because
+#                                 wrongly clearing WEEKLY early is the worse failure here:
+#                                 a consumer that kickstarts on a false "not limited" burns
+#                                 the very quota that is scarce, whereas staying suppressed
+#                                 a little longer just delays a real-stall alert. Set to 0
+#                                 to disable (legacy: weekly.active never self-clears).
+#   CLAUDE_QUOTA_SKIP_WINDOW   1 = skip the token-window scan (window_5h.*) even in
+#                                 --json/--human mode, forcing WANT_WINDOW=0. The window
+#                                 scan is the slow part (reads every transcript touched in
+#                                 the last 5h); callers that only need the fast ground-
+#                                 truth exhaustion verdict (.limited, .weekly.*) — e.g. an
+#                                 alerting daemon's sweep — can request --json without
+#                                 paying that cost. Default 0 (unchanged existing behavior).
 #
 # Dependencies: bash, jq, find, grep, date (BSD/macOS date semantics).
 
@@ -120,6 +149,7 @@ NOW="${CLAUDE_QUOTA_NOW:-$(date +%s)}"
 BUDGET="${CLAUDE_QUOTA_BUDGET_BILLABLE:-0}"
 WEEKLY_HARD="${CLAUDE_QUOTA_WEEKLY_HARD:-0}"   # ga-ot735: 1 = weekly also hard-pauses
 FRESHNESS_MAX_SECS="${CLAUDE_QUOTA_FRESHNESS_SECS:-1200}"  # ga-z0n9f: 20 min default; 0=disable
+WEEKLY_FRESHNESS_MAX_SECS="${CLAUDE_QUOTA_WEEKLY_FRESHNESS_SECS:-1800}"  # ga-sdkqs: 30 min default; 0=disable
 BURST_MIN_COUNT="${CLAUDE_QUOTA_BURST_MIN_COUNT:-2}"       # ga-burst: min events in window to be LIMITED
 BURST_WINDOW_SECS="${CLAUDE_QUOTA_BURST_WINDOW_SECS:-300}" # ga-burst: 5 min recent window for burst test
 WINDOW_SEC=18000   # 5h rolling session window
@@ -234,6 +264,7 @@ WEEKLY_ACTIVE=0
 WEEKLY_RESET_TEXT=""
 WEEKLY_RESET_EPOCH=0
 WEEKLY_LAST_EVENT_EPOCH=0   # ga-z0n9f: most-recent weekly exhaustion event time
+WEEKLY_STALE=0              # ga-sdkqs: 1 = freshness guard cleared the weekly latch
 
 scan_exhaustion() {
   local f scope text reset ev_iso ev_epoch reset_epoch matches files
@@ -328,6 +359,19 @@ iso_to_epoch() {
 resolve_verdict() {
   SESSION_STALE=0
   SESSION_BURST_LIMITED=0   # 1 = burst threshold met; 0 = sporadic (not a hard limit)
+
+  # ga-sdkqs: WEEKLY freshness guard, mirroring the SESSION one below (ga-z0n9f).
+  # Evaluated BEFORE the session/weekly branch so a stale WEEKLY_ACTIVE never reaches
+  # it — see CLAUDE_QUOTA_WEEKLY_FRESHNESS_SECS above for the full rationale.
+  WEEKLY_STALE=0
+  if [ "$WEEKLY_ACTIVE" = "1" ] \
+     && [ "$WEEKLY_FRESHNESS_MAX_SECS" -gt 0 ] \
+     && [ "$WEEKLY_LAST_EVENT_EPOCH" -gt 0 ] \
+     && [ $(( NOW - WEEKLY_LAST_EVENT_EPOCH )) -gt "$WEEKLY_FRESHNESS_MAX_SECS" ]; then
+    WEEKLY_STALE=1
+    WEEKLY_ACTIVE=0
+  fi
+
   if [ "$SESSION_ACTIVE" = "1" ]; then
     # ga-burst: require ≥ BURST_MIN_COUNT session-limit events within BURST_WINDOW_SECS.
     # A single or sporadic 429 (e.g. one every ~10 min on a borderline account)
@@ -405,6 +449,10 @@ scan_window() {
 WANT_WINDOW=0
 case "$MODE" in human|json) WANT_WINDOW=1 ;; esac
 [ "${CLAUDE_QUOTA_FORCE_WINDOW:-0}" = "1" ] && WANT_WINDOW=1
+# ga-sdkqs: explicit opt-out for callers (e.g. an alerting daemon's --json probe)
+# that want the fast ground-truth exhaustion verdict without paying for the
+# slower token-window scan. Checked last so it wins over FORCE_WINDOW.
+[ "${CLAUDE_QUOTA_SKIP_WINDOW:-0}" = "1" ] && WANT_WINDOW=0
 
 scan_exhaustion
 resolve_verdict          # ga-ot735: scope the hard verdict (session pauses, weekly advisory)
@@ -466,6 +514,8 @@ emit_json() {
     --arg weekly_reset "$WEEKLY_RESET_TEXT" \
     --argjson weekly_hard "$([ "$WEEKLY_HARD" = 1 ] && echo true || echo false)" \
     --argjson weekly_advisory "$([ "$WEEKLY_ADVISORY" = 1 ] && echo true || echo false)" \
+    --argjson weekly_stale "$([ "$WEEKLY_STALE" = 1 ] && echo true || echo false)" \
+    --argjson weekly_freshness_threshold_secs "$WEEKLY_FRESHNESS_MAX_SECS" \
     --argjson input "$TOK_INPUT" --argjson output "$TOK_OUTPUT" \
     --argjson cache_creation "$TOK_CACHE_CREATE" --argjson cache_read "$TOK_CACHE_READ" \
     --argjson billable "$TOK_BILLABLE" --argjson messages "$TOK_MSGS" \
@@ -490,7 +540,8 @@ emit_json() {
          sporadic: $session_sporadic
        },
        weekly: { active: $weekly_active, reset_time_text: $weekly_reset,
-                 hard: $weekly_hard, advisory: $weekly_advisory },
+                 hard: $weekly_hard, advisory: $weekly_advisory,
+                 stale: $weekly_stale, freshness_threshold_secs: $weekly_freshness_threshold_secs },
        window_5h: {
          input_tokens: $input, output_tokens: $output,
          cache_creation_tokens: $cache_creation, cache_read_tokens: $cache_read,

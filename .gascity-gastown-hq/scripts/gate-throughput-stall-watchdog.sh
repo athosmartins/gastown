@@ -31,7 +31,18 @@
 #      a. No ACTIVE markers → NOT a stall (idle pipeline, possibly with
 #         parked/needs-human markers sitting untouched — that's expected).
 #      b. "cota=LIMITED" or "quota-limited" in any Headroom DEFER line in the
-#         tail → quota-limited, self-heals on window reset; suppress.
+#         tail (B1), OR claude-quota-check.sh's hard verdict (B2, SESSION
+#         scope) → quota-limited, self-heals on window reset; suppress.
+#      b3. (ga-sdkqs) claude-quota-check.sh --json .weekly.active (WEEKLY
+#         scope) → quota-limited (semanal); suppress. B1/B2 only ever see the
+#         SESSION-scope hard limit — by ga-ot735 design a WEEKLY-only
+#         exhaustion never trips them (correct for the scheduler, which should
+#         keep sweeping on the still-available 5h window), so without this
+#         guard a citywide weekly exhaustion reads as "not quota-limited" and
+#         the watchdog escalates + kickstarts, burning the very quota that is
+#         scarce. weekly.active is freshness-guarded upstream (self-disarms
+#         once the account stops re-hitting the cap), so this guard does not
+#         stay stuck suppressing after a real recovery.
 #      c. A "Gate PASSED" line within the window → progress; not a stall.
 #      d. An active gate-reviewer session running (gc session list shows a live
 #         session named gate-reviewer*) → reviewer in-flight; not a stall.
@@ -51,7 +62,9 @@
 #
 # Selftest: bash gate-throughput-stall-watchdog.sh --selftest
 #   Scenarios: stall→alert, empty-queue→no-alert, quota-limited→no-alert,
-#   recent-progress→no-alert, active-reviewer→no-alert, autorecover-path.
+#   recent-progress→no-alert, active-reviewer→no-alert, autorecover-path,
+#   weekly-quota-limited→no-alert/no-kickstart, unreadable-quota-check→UNKNOWN
+#   fail-open, weekly-not-active→stall-still-fires (ga-sdkqs).
 set -uo pipefail
 
 # ── config (all env-overridable) ──────────────────────────────────────────────
@@ -100,6 +113,8 @@ log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || true; echo "[$(ts)] [gtsw] $
 #   GTSW_TEST_ACTIVE_MARKERS_JSON — fake `bd list` JSON (replaces the live query)
 #   GTSW_TEST_LOG_LINES    — newline-separated fake log content (replaces tail)
 #   GTSW_TEST_QUOTA_RC     — fake exit code for quota-check (0=ok, 2=limited)
+#   GTSW_TEST_QUOTA_JSON   — fake `claude-quota-check.sh --json` output (ga-sdkqs guard B3;
+#                            drives .weekly.active/.weekly.reset_time_text)
 #   GTSW_TEST_SESSIONS     — fake gc session list output
 #   GTSW_TEST_KICKSTARTS   — file to record kickstart calls (for assertions)
 #   GTSW_TEST_NOTIFIED     — file to record notify calls
@@ -185,12 +200,28 @@ run_sweep() {
   fi
 
   # ── FALSE-POSITIVE GUARD B: quota-limited ────────────────────────────────
-  # Two sub-checks:
+  # Three sub-checks:
   # B1. Scan the log tail for Headroom DEFER lines with "cota=LIMITED" or
   #     "quota-limited". If the MOST RECENT queued-markers line is followed
   #     (or accompanied) by such a DEFER line, quota is the reason — suppress.
   # B2. Run claude-quota-check.sh (exit 2 = LIMITED). Use B1 as primary (faster,
   #     no disk scan) and B2 as confirmation. Either → suppress.
+  # B3 (ga-sdkqs). claude-quota-check.sh's ga-ot735 design deliberately never
+  #     trips B2 for a WEEKLY-only exhaustion (the 5h window usually still has
+  #     headroom, and hard-pausing the gate for a multi-day ceiling was the
+  #     exact false-pause ga-ot735 killed). That is correct for the SCHEDULER
+  #     (gate/pilot should keep sweeping) but wrong for THIS watchdog: when the
+  #     account is weekly-exhausted, kickstarting the gate burns the very quota
+  #     that is scarce, and escalating "stall" is noise with a harmful
+  #     suggested remedy. B1/B2 above genuinely found nothing (ga-sdkqs's own
+  #     incident: 23 escalations from a citywide weekly exhaustion the existing
+  #     guards structurally cannot see). Read the same check's --json
+  #     weekly.active as an INDEPENDENT suppression signal — advisory for the
+  #     scheduler, but a hard suppression for the escalate-and-kickstart
+  #     decision here. weekly.active is itself freshness-guarded upstream
+  #     (claude-quota-check.sh's CLAUDE_QUOTA_WEEKLY_FRESHNESS_SECS) so it
+  #     self-disarms once the account stops re-hitting the cap — this watchdog
+  #     does not need its own staleness logic, only to read the field.
   local quota_limited=0
 
   # B1: log-pattern check (fast, Dolt-independent)
@@ -214,6 +245,47 @@ run_sweep() {
       quota_limited=1
       log "FALSE-POSITIVE GUARD B2: claude-quota-check.sh exit 2 (LIMITED) — suppressing"
     fi
+  fi
+
+  # B3: weekly-quota advisory via claude-quota-check.sh --json (only if B1/B2 didn't
+  # already confirm). CLAUDE_QUOTA_SKIP_WINDOW=1 skips the slow 5h token scan this
+  # watchdog doesn't need — B3 only reads the ground-truth exhaustion verdict.
+  if [ "$quota_limited" -eq 0 ]; then
+    local weekly_probe_ran=0 weekly_json=""
+    if [ -n "${GTSW_TEST_QUOTA_JSON+x}" ]; then
+      weekly_json="${GTSW_TEST_QUOTA_JSON}"
+      weekly_probe_ran=1
+    elif [ -x "$QUOTA_CHECK" ]; then
+      weekly_json="$(CLAUDE_QUOTA_SKIP_WINDOW=1 "$QUOTA_CHECK" --json 2>/dev/null)" || weekly_json=""
+      weekly_probe_ran=1
+    fi
+
+    if [ "$weekly_probe_ran" -eq 1 ]; then
+      local weekly_active=""
+      [ -n "$weekly_json" ] && weekly_active="$(printf '%s' "$weekly_json" \
+        | jq -r 'if (.weekly.active == true) then "true" elif (.weekly.active == false) then "false" else "" end' 2>/dev/null)"
+      case "$weekly_active" in
+        true)
+          quota_limited=1
+          local weekly_reset; weekly_reset="$(printf '%s' "$weekly_json" | jq -r '.weekly.reset_time_text // "unknown"' 2>/dev/null)"
+          log "FALSE-POSITIVE GUARD B3: claude-quota-check.sh reports quota-limited (semanal), reset ${weekly_reset} — suppressing stall alert (ga-sdkqs)"
+          ;;
+        false)
+          : # confirmed not weekly-limited; no suppression from this guard
+          ;;
+        *)
+          # ga-sdkqs (AC2): the probe ran but produced no readable .weekly.active
+          # (crash, empty stdout, malformed JSON) — a READ FAILURE, not
+          # confirmation of "not weekly-limited". Fail toward no-stall-verdict
+          # this sweep rather than let an unreadable signal pass as OK
+          # (error-vs-empty — this file's own FAIL-SAFE header rule).
+          log "WARN: claude-quota-check.sh --json unreadable (.weekly.active) — quota state UNKNOWN, fail-open (no stall verdict this sweep)"
+          return 0
+          ;;
+      esac
+    fi
+    # weekly_probe_ran=0 (tool not executable, no test seam): no weekly signal
+    # available; B1/B2 above already independently guard the hard-limit case.
   fi
 
   if [ "$quota_limited" -eq 1 ]; then
@@ -460,6 +532,13 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   COOLDOWN_FILE="$TMP/cooldown"
   RECOVER_MARKER_FILE="$TMP/recover-marker"
   GTSW_STATE_DIR="$TMP"
+  # ga-sdkqs: default guard-B3 seam to "weekly not active" for every scenario below.
+  # Without this, any scenario that doesn't set GTSW_TEST_QUOTA_RC=2/B1-suppress falls
+  # through to the REAL, live $QUOTA_CHECK (claude-quota-check.sh exists and is
+  # executable on a real checkout) — making the selftest's result depend on whatever
+  # this machine's actual Claude quota state happens to be right now. Scenarios that
+  # specifically exercise B3 (14/15/16) override this locally.
+  GTSW_TEST_QUOTA_JSON='{"weekly":{"active":false}}'
   GATE_STALL_COOLDOWN_S=7200
 
   # Stub notify and gc so they record calls but have no side effects
@@ -827,9 +906,79 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   run_sweep && ok "scenario 13b: malformed JSON fails open (return 0)" || bad "scenario 13b: malformed JSON should fail open, not alert"
   [ ! -s "$NOTIF13b" ] && ok "scenario 13b: no notify on malformed JSON" || bad "scenario 13b: notify fired despite malformed marker JSON"
 
+  # ── Scenario 14 (ga-sdkqs): WEEKLY quota-limited (fresh) → NOT a stall, no kickstart ──
+  # The exact reported incident: the city was weekly-exhausted (5/7 agent panes showed
+  # "You've hit your weekly limit"). B1 (log grep for cota=LIMITED) never fires for this —
+  # only the gate/pilot's own SESSION-scope defer line does. B2 (claude-quota-check.sh
+  # hard verdict) also stays "not limited" for a weekly-only exhaustion BY DESIGN
+  # (ga-ot735: weekly is advisory, doesn't hard-pause the scheduler). So pre-fix, NEITHER
+  # existing guard suppresses, and the watchdog escalates + kickstarts — which burns the
+  # very quota that is scarce. This is the exact bug ga-sdkqs reports.
+  echo "Scenario 14 (ga-sdkqs): weekly quota-limited (fresh, via claude-quota-check.sh --json) → NOT a stall, no kickstart"
+  rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true   # fresh episode
+  KICKS14="$TMP/kicks14"; : > "$KICKS14"
+  NOTIF14="$TMP/notif14"; : > "$NOTIF14"
+  MAIL14="$TMP/mail14"; : > "$MAIL14"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers queued queued queued queued queued)"
+  GTSW_TEST_LOG_LINES="$(make_log)"    # no "cota=LIMITED" in the tail — B1 does not catch this
+  GTSW_TEST_QUOTA_RC=0                 # B2 (session-scope hard verdict): NOT limited, by ga-ot735 design
+  GTSW_TEST_QUOTA_JSON='{"limited":false,"weekly":{"active":true,"reset_time_text":"Aug 13 at 9pm"}}'
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_KICKSTARTS="$KICKS14"
+  GTSW_TEST_NOTIFIED="$NOTIF14"
+  GTSW_TEST_MAILED="$MAIL14"
+  run_sweep && ok "scenario 14: weekly-limited suppresses alert (return 0)" || bad "scenario 14: weekly-limited did NOT suppress (the exact ga-sdkqs bug — kickstart would burn the scarce quota)"
+  [ ! -s "$NOTIF14" ] && ok "scenario 14: no Athos page when weekly-limited" || bad "scenario 14: Athos paged despite weekly-limited"
+  [ ! -s "$KICKS14" ] && ok "scenario 14: no kickstart when weekly-limited (kickstart would burn scarce quota)" || bad "scenario 14: kickstart fired despite weekly-limited"
+  [ ! -s "$MAIL14" ] && ok "scenario 14: no Mayor mail when weekly-limited (quiet, per AC1)" || bad "scenario 14: mail fired despite weekly-limited"
+  grep -q "quota-limited (semanal)" "$LOG" 2>/dev/null && ok "scenario 14: logged as weekly quota-limited with reset ETA (AC1)" || bad "scenario 14: weekly suppression not logged with the required wording"
+
+  # ── Scenario 15 (ga-sdkqs AC2): claude-quota-check.sh --json unreadable → UNKNOWN ──
+  # "Couldn't determine the weekly state" must never collapse into "confirmed not
+  # quota-limited" (the exact error-vs-empty class this file's own FAIL-SAFE header rule
+  # already names). A crashed/garbled quota-check must fail TOWARD no-stall-verdict, same
+  # direction as every other read-failure guard in this file (A, C-timestamp, D).
+  echo "Scenario 15 (ga-sdkqs AC2): claude-quota-check.sh --json unreadable → quota state UNKNOWN, fail-open (NOT treated as 'not quota-limited')"
+  rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true
+  KICKS15="$TMP/kicks15"; : > "$KICKS15"
+  NOTIF15="$TMP/notif15"; : > "$NOTIF15"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers queued queued queued)"
+  GTSW_TEST_LOG_LINES="$(make_log)"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_QUOTA_JSON="not valid json{{{"   # simulates a crashed/garbled quota-check
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_KICKSTARTS="$KICKS15"
+  GTSW_TEST_NOTIFIED="$NOTIF15"
+  GTSW_TEST_MAILED="$TMP/mail15"
+  run_sweep && ok "scenario 15: unreadable quota-check fails open (return 0, no stall verdict)" || bad "scenario 15: unreadable quota-check should fail open, not alert"
+  [ ! -s "$KICKS15" ] && ok "scenario 15: no kickstart when quota state is unknown" || bad "scenario 15: kickstart fired despite unknown quota state"
+  grep -q "quota state UNKNOWN" "$LOG" 2>/dev/null && ok "scenario 15: unreadable quota-check logged as UNKNOWN (distinguishable from confirmed-OK)" || bad "scenario 15: unreadable quota-check not logged distinctly"
+
+  # ── Scenario 16 (ga-sdkqs AC4, disarm): weekly.active=false → normal stall logic ──
+  # claude-quota-check.sh owns the staleness/disarm decision (its own freshness guard
+  # clears WEEKLY_ACTIVE once the account stops re-hitting the cap — see its selftest).
+  # This watchdog's job is simply to NOT get stuck suppressing once upstream reports
+  # weekly.active=false — proving it stays able to detect a REAL stall after quota
+  # recovers, rather than trading the false-negative for a permanent false-positive.
+  echo "Scenario 16 (ga-sdkqs AC4): weekly.active=false (claude-quota-check.sh's own freshness guard already cleared it) → stall fires normally, watchdog not permanently blind"
+  rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true   # fresh episode
+  KICKS16="$TMP/kicks16"; : > "$KICKS16"
+  MAIL16="$TMP/mail16"; : > "$MAIL16"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers queued queued queued queued)"
+  GTSW_TEST_LOG_LINES="$(make_log)"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_QUOTA_JSON='{"limited":false,"weekly":{"active":false,"reset_time_text":""}}'
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_KICKSTARTS="$KICKS16"
+  GTSW_TEST_NOTIFIED="$TMP/notif16"; : > "$TMP/notif16"
+  GTSW_TEST_MAILED="$MAIL16"
+  run_sweep && bad "scenario 16: weekly.active=false should NOT suppress — real stall must still fire" || ok "scenario 16: weekly.active=false does not block a real stall (return 1) — watchdog stays able to detect stalls after quota recovers"
+  grep -q "mail:" "$MAIL16" 2>/dev/null && ok "scenario 16: Mayor mailed (real stall, not masked by a stale/cleared weekly signal)" || bad "scenario 16: Mayor NOT mailed"
+  [ -s "$KICKS16" ] && ok "scenario 16: kickstart fires for a real stall once weekly is confirmed not-active" || bad "scenario 16: kickstart withheld despite weekly.active=false"
+
   # ── CLEANUP / SUMMARY ─────────────────────────────────────────────────────
   # Unset test seams so no state leaks
-  unset GTSW_TEST_ACTIVE_MARKERS_JSON GTSW_TEST_LOG_LINES GTSW_TEST_QUOTA_RC GTSW_TEST_SESSIONS
+  unset GTSW_TEST_ACTIVE_MARKERS_JSON GTSW_TEST_LOG_LINES GTSW_TEST_QUOTA_RC GTSW_TEST_QUOTA_JSON GTSW_TEST_SESSIONS
   unset GTSW_TEST_KICKSTARTS GTSW_TEST_NOTIFIED GTSW_TEST_MAILED
 
   echo ""

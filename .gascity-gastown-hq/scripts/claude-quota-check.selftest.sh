@@ -136,7 +136,11 @@ rm -f "$FIX/proj-b/session-expired.jsonl"
 #   This is the exact false-pause the fix kills: the old contract was exit 2.
 # ---------------------------------------------------------------------------
 : > "$FIX/proj-b/weekly-active.jsonl"
-exhaust_line -3600 "You've hit your weekly limit · resets Jun 12 at 8pm (America/Sao_Paulo)" >> "$FIX/proj-b/weekly-active.jsonl"
+# ga-sdkqs: recent offset (5min, not the old -3600) — a genuinely-active weekly
+# limit re-logs on every dispatcher spawn attempt (~2min cadence, same
+# assumption CLAUDE_QUOTA_WEEKLY_FRESHNESS_SECS relies on), so "active" fixtures
+# should look fresh. An old, non-re-logged event is CASE 9e below, not this one.
+exhaust_line -300 "You've hit your weekly limit · resets Jun 12 at 8pm (America/Sao_Paulo)" >> "$FIX/proj-b/weekly-active.jsonl"
 run bash "$SUT" --json
 if [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "false" ] \
    && [ "$(printf '%s' "$OUT" | jq -r '.weekly.active')" = "true" ] \
@@ -167,7 +171,7 @@ rm -f "$FIX/proj-b/weekly-active.jsonl"
 : > "$FIX/proj-b/both-active.jsonl"
 exhaust_line -240  "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)"        >> "$FIX/proj-b/both-active.jsonl"
 exhaust_line -60   "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)"        >> "$FIX/proj-b/both-active.jsonl"
-exhaust_line -3000 "You've hit your weekly limit · resets Jun 12 at 8pm (America/Sao_Paulo)"  >> "$FIX/proj-b/both-active.jsonl"
+exhaust_line -300  "You've hit your weekly limit · resets Jun 12 at 8pm (America/Sao_Paulo)"  >> "$FIX/proj-b/both-active.jsonl"   # ga-sdkqs: recent, see weekly-active.jsonl comment above
 run bash "$SUT" --json
 if [ "$RC" = "2" ] && [ "$(printf '%s' "$OUT" | jq -r '.scope')" = "session" ] \
    && printf '%s' "$OUT" | jq -e '.reset_time_text | test("1:00pm")' >/dev/null 2>&1 \
@@ -280,6 +284,69 @@ fi
 rm -f "$FIX/proj-b/session-mixed-age.jsonl"
 
 # ---------------------------------------------------------------------------
+# CASE 9e (ga-sdkqs): FRESH weekly latch (5 min old) → weekly.active=true, weekly.stale=false.
+# ---------------------------------------------------------------------------
+: > "$FIX/proj-b/weekly-fresh.jsonl"
+exhaust_line -300 "You've hit your weekly limit · resets Jun 12 at 8pm (America/Sao_Paulo)" >> "$FIX/proj-b/weekly-fresh.jsonl"
+run bash "$SUT" --json
+if [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | jq -r '.weekly.active')" = "true" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.weekly.stale')" = "false" ]; then
+  ok "fresh weekly latch (5 min old < 30 min threshold) → weekly.active=true, weekly.stale=false (ga-sdkqs)"
+else
+  bad "fresh weekly latch should not be stale" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '.weekly' 2>/dev/null)"
+fi
+rm -f "$FIX/proj-b/weekly-fresh.jsonl"
+
+# ---------------------------------------------------------------------------
+# CASE 9f (ga-sdkqs): STALE weekly latch — freshness guard clears it (exit 0).
+#   Weekly limit event 60 min ago (> 30 min WEEKLY_FRESHNESS default), stated
+#   reset still days out (future), but no fresh re-log despite the gate/pilot
+#   continuing to try → the "banner is a historical snapshot, not live state"
+#   trap the bug report warns about. Expected: weekly.active=false,
+#   weekly.stale=true — mirrors CASE 9's session_stale exactly.
+# ---------------------------------------------------------------------------
+: > "$FIX/proj-b/weekly-stale.jsonl"
+exhaust_line -3600 "You've hit your weekly limit · resets Jun 12 at 8pm (America/Sao_Paulo)" >> "$FIX/proj-b/weekly-stale.jsonl"
+run bash "$SUT" --json
+if [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "false" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.weekly.active')" = "false" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.weekly.stale')" = "true" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.weekly.advisory')" = "false" ]; then
+  ok "stale weekly latch (60 min old > 30 min threshold) → freshness guard clears it (weekly.active=false, weekly.stale=true) (ga-sdkqs)"
+else
+  bad "stale weekly latch freshness guard" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,weekly}' 2>/dev/null)"
+fi
+
+# CASE 9g (ga-sdkqs): CLAUDE_QUOTA_WEEKLY_FRESHNESS_SECS=0 disables the weekly guard
+#   (legacy: an active weekly event never self-clears, same escape hatch as
+#   CLAUDE_QUOTA_FRESHNESS_SECS=0 for session in CASE 9c). Reuses the SAME
+#   stale (-3600) fixture from 9f — with the guard off, it must read active again.
+OUT=$(env CLAUDE_PROJECTS_DIR="$FIX" CLAUDE_QUOTA_NOW="$NOW" CLAUDE_QUOTA_TZ="$TZ_RESET" \
+          CLAUDE_QUOTA_SCAN_ALL=1 CLAUDE_QUOTA_WEEKLY_FRESHNESS_SECS=0 \
+          bash "$SUT" --json 2>/dev/null); RC=$?
+if [ "$(printf '%s' "$OUT" | jq -r '.weekly.active')" = "true" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.weekly.stale')" = "false" ]; then
+  ok "CLAUDE_QUOTA_WEEKLY_FRESHNESS_SECS=0 → weekly guard disabled, stale event stays active (ga-sdkqs)"
+else
+  bad "WEEKLY_FRESHNESS_SECS=0 should disable the guard" "out=$(printf '%s' "$OUT" | jq -c '.weekly' 2>/dev/null)"
+fi
+rm -f "$FIX/proj-b/weekly-stale.jsonl"
+
+# CASE 9h (ga-sdkqs): CLAUDE_QUOTA_SKIP_WINDOW=1 zeroes window_5h without touching
+#   the exhaustion verdict — proves the fast-path a --json caller can opt into
+#   (e.g. an alerting daemon sweep) doesn't change .limited/.weekly at all.
+OUT=$(env CLAUDE_PROJECTS_DIR="$FIX" CLAUDE_QUOTA_NOW="$NOW" CLAUDE_QUOTA_TZ="$TZ_RESET" \
+          CLAUDE_QUOTA_SCAN_ALL=1 CLAUDE_QUOTA_SKIP_WINDOW=1 \
+          bash "$SUT" --json 2>/dev/null); RC=$?
+if [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "false" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.window_5h.billable_tokens')" = "0" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.window_5h.messages')" = "0" ]; then
+  ok "CLAUDE_QUOTA_SKIP_WINDOW=1 → window_5h zeroed, exhaustion verdict unaffected (ga-sdkqs)"
+else
+  bad "CLAUDE_QUOTA_SKIP_WINDOW=1 should zero window_5h only" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,window_5h}' 2>/dev/null)"
+fi
+
+# ---------------------------------------------------------------------------
 # CASE 6: budget % computed when CLAUDE_QUOTA_BUDGET_BILLABLE set
 #         billable=335, budget=1000 → 33.5%
 # ---------------------------------------------------------------------------
@@ -321,7 +388,7 @@ rm -f "$FIX/proj-b/session-active2.jsonl"
 # ---------------------------------------------------------------------------
 : > "$FIX/proj-b/mixed.jsonl"
 exhaust_line -3600 "You've hit your session limit · resets 11:30am (America/Sao_Paulo)" >> "$FIX/proj-b/mixed.jsonl"
-exhaust_line -3000 "You've hit your weekly limit · resets Jun 12 at 8pm (America/Sao_Paulo)" >> "$FIX/proj-b/mixed.jsonl"
+exhaust_line -300  "You've hit your weekly limit · resets Jun 12 at 8pm (America/Sao_Paulo)" >> "$FIX/proj-b/mixed.jsonl"   # ga-sdkqs: recent, see weekly-active.jsonl comment above
 run bash "$SUT" --json
 if [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "false" ] \
    && [ "$(printf '%s' "$OUT" | jq -r '.weekly.advisory')" = "true" ]; then
