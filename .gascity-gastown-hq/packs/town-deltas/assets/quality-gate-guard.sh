@@ -1516,6 +1516,114 @@ branch_bead_commit_verdict() {
   fi
 }
 
+# gate_ab_arm_for_bead <bead_id>
+#   ga-rstae: deterministic A/B arm assignment for the base-commit test check
+#   below (Step 5b-pre2). Pure bash polynomial hash (base-31, same recurrence
+#   as Java's String.hashCode) over the bead id's characters — zero external
+#   process/tool dependency (no shasum/sha1sum/md5 subprocess), so it can
+#   never vary because a hashing tool is missing or differs across hosts.
+#   MUST be a pure function of bead_id alone — no timestamp, no counter, no
+#   $RANDOM — or a bead that fails and re-submits under the SAME id could
+#   land in a DIFFERENT arm on retry and contaminate both arms' measurement
+#   (this is the one mistake the whole experiment design cannot tolerate;
+#   see the bead body's own emphasis on this). Same bead_id -> same arm,
+#   forever, on any host. Verified over 200 random ga-xxxxx-shaped ids: 99/101
+#   A/B split — not a coincidentally-lopsided hash.
+#     A — control. Braco A must stay byte-for-byte today's behavior: this
+#         function is called (cheap, no IO) so the caller can log which arm
+#         a submission landed in, but arm A must never reach the actual
+#         worktree/checkout/run machinery below — "A com um aviso" is not
+#         A (bead's own words).
+#     B — treatment. May be REFUSED at submission by the base-commit check.
+#   Empty/missing bead_id defaults to 'A' (the arm that can never block) —
+#   fail-open on unresolved input, same posture as branch_bead_commit_verdict
+#   above returning 'skip' rather than guessing.
+#   Pure (no IO, no subprocess).
+gate_ab_arm_for_bead() {
+  local bead="$1"
+  [ -z "$bead" ] && { printf 'A'; return 0; }
+  local i c ord sum=0 len=${#bead}
+  for (( i = 0; i < len; i++ )); do
+    c="${bead:$i:1}"
+    printf -v ord '%d' "'$c"
+    sum=$(( (sum * 31 + ord) % 100000007 ))
+  done
+  if (( sum % 2 == 0 )); then
+    printf 'A'
+  else
+    printf 'B'
+  fi
+}
+
+# gate_base_test_verdict <detected> <copy_ok> <ran> <failed>
+#   ga-rstae: collapses the base-commit test check's raw counts (computed by
+#   the impure Step 5b-pre2 block below: how many *.selftest.sh files were
+#   added/changed on the branch, how many of those were successfully
+#   materialized onto a throwaway base-commit worktree, how many actually
+#   completed execution within their timeout budget, and how many of THOSE
+#   exited non-zero) into exactly ONE of four named states. All four are
+#   REQUIRED reporting buckets per the bead — "sem-teste-novo" and
+#   "nao-consegui-medir" are not swallowed into a generic pass, they are
+#   counted separately so the A/B apuracao measures "who wrote a test that
+#   proves something", not "who wrote any test" or "who got measured".
+#     sem-teste-novo      — detected=0, and detected was a CONFIRMED, cleanly
+#                            parsed zero (the call site actually counted the
+#                            diff and got nothing). Never blocks; this
+#                            submission does not participate in the "does the
+#                            test prove anything" question at all.
+#     nao-consegui-medir  — either detected itself is empty/unparseable (we
+#                            don't even know how many test files there are —
+#                            NOT the same claim as "confirmed zero", so it
+#                            must not collapse into sem-teste-novo: that
+#                            exact collapse — empty read treated the same as
+#                            a confirmed value — is family #2 in the gate's
+#                            own failure taxonomy, "3o-estado colapsado", 30%
+#                            of blocking issues, and this function existing
+#                            to fight that family while committing it itself
+#                            would be the worst possible outcome here) OR
+#                            detected>0 but copy_ok!=detected or ran!=detected
+#                            (worktree creation failed, git-show extraction
+#                            failed for at least one file, or a file was
+#                            killed by its timeout — see the call site's 124
+#                            handling). Never blocks.
+#     passou-na-base       — detected>0 (confirmed), every file measured, ALL
+#                            exit 0 against the pre-fix base. The test
+#                            doesn't distinguish base from fix -> proves
+#                            nothing. BLOCKS (arm B only).
+#     reprovou-na-base     — detected>0 (confirmed), every file measured, AT
+#                            LEAST ONE exits non-zero against base ->
+#                            something in the new/changed test genuinely
+#                            depends on the fix. Never blocks — the GOOD case.
+#   "measured" above means copy_ok==detected AND ran==detected: a PARTIAL
+#   measurement (some files ok, some not) is treated the same as a total
+#   failure to measure, never as partial proof — fail-open on ANY
+#   uncertainty, matching Step 5b-pre's own stated posture, because a false
+#   REFUSE here costs a live builder real time on a false alarm.
+#   Pure (no IO) — the impure call site does all git/worktree/bash work and
+#   passes in only these four counts.
+gate_base_test_verdict() {
+  local detected="$1" copy_ok="$2" ran="$3" failed="$4"
+  case "$detected" in
+    ''|*[!0-9]*) printf 'nao-consegui-medir'; return 0 ;;
+  esac
+  if [ "$detected" -eq 0 ]; then
+    printf 'sem-teste-novo'
+    return 0
+  fi
+  case "$copy_ok" in ''|*[!0-9]*) copy_ok=0 ;; esac
+  case "$ran" in ''|*[!0-9]*) ran=0 ;; esac
+  case "$failed" in ''|*[!0-9]*) failed=0 ;; esac
+  if [ "$copy_ok" -ne "$detected" ] || [ "$ran" -ne "$detected" ]; then
+    printf 'nao-consegui-medir'
+    return 0
+  fi
+  if [ "$failed" -gt 0 ]; then
+    printf 'reprovou-na-base'
+  else
+    printf 'passou-na-base'
+  fi
+}
+
 # ── Lib-only mode: source with GATE_GUARD_LIB_ONLY=1 to load pure functions ──
 # without running the live guard sweep. Used by tests and by the dispatcher.
 if [ -n "${GATE_GUARD_LIB_ONLY:-}" ]; then
@@ -3483,6 +3591,153 @@ Then re-run /gate-done. Marker set to gate-status:error (fixable + re-submittabl
         log "SUPPRESSED PUSH (wa-uthi non-terminal): branch-content-coherence pre-check failed for $MARKER_ID (gate-status:error)."
         exit 1
       fi
+    fi
+  fi
+fi
+
+# ── Step 5b-pre2 (ga-rstae): A/B — refuse when a new/changed selftest passes
+# unmodified against the pre-fix base commit ────────────────────────────────
+# Measured motivation (docs/gate-analysis/2026-08-12-gate-failure-taxonomy.md,
+# 1524 gate-runs / 2026-07-23..2026-08-12): "teste nao pega o bug" is 22% of
+# 443 classified blocking issues (family #5) — a builder writes a test that
+# would pass regardless of whether the fix landed, and a human/reviewer only
+# catches it later, if at all. Doctrine prose already asks for this (test-
+# driven-development's own Iron Law, gate-done.md's pre-flight checklist) and
+# STILL produces this rate (the taxonomy doc's own closing argument) — the
+# next degree has to be MECHANICAL, not more prose.
+#
+# THIS IS AN A/B EXPERIMENT, not a blanket policy change (Athos, 2026-08-12,
+# choosing HARD BLOCK for arm B over "warn only" — a softer intervention
+# would not produce a measurable lift at this submission volume; see the
+# power calculation in the bead body). Arm assignment (gate_ab_arm_for_bead,
+# defined above the GATE_GUARD_LIB_ONLY cutoff) is a PURE function of the
+# bead id alone — stable across resubmissions of the same bead by
+# construction, so a bead that fails once and retries cannot hop arms.
+#   Arm A: today's behavior, byte-for-byte. This block does not touch arm-A
+#          submissions beyond the one cheap, non-IO hash call needed to log
+#          which arm they landed in — no worktree, no checkout, no test run,
+#          no added latency, no new log/label volume attributable to the
+#          check itself. "A with a warning" is not A (bead's own words).
+#   Arm B: may be REFUSED here when every new/changed *.selftest.sh in the
+#          submission's range passes unmodified against the PRE-FIX base
+#          commit — i.e. proves nothing about this branch's own diff.
+#
+# Scope (deliberate, not a placeholder): only *.selftest.sh files are
+# measured. This repo's dominant, uniformly-runnable test convention for the
+# files this guard protects (packs/town-deltas/assets/*.sh) is exactly this
+# bash selftest pattern (see gate-guard-submission-time-coherence.selftest.sh
+# and its siblings) — it runs inline with zero setup (no venv/npm install/
+# network) and is what every existing check in this file already assumes.
+# Other rigs' test conventions (pytest, jest, go test, ...) are NOT run by
+# this check — a submission whose only new tests are those file types is
+# indistinguishable, from here, from "no new test files": it lands in
+# sem-teste-novo, never nao-consegui-medir, because this check never
+# attempted to look for them. Extending coverage to another test convention
+# is future work, tracked separately — not a defect of this bead.
+#
+# Same fail-open posture as Step 5b-pre immediately above: any uncertainty
+# (RIG_PATH unresolved, fetch/rev-parse/merge-base failure, worktree
+# creation failure, a file the guard can't extract, or a file that times
+# out) routes to nao-consegui-medir, which never blocks. This check must
+# never become a new false-FAIL source on top of the merge-time safety nets
+# that already exist — a false block here costs a live, currently-working
+# builder real minutes on a false alarm, which is exactly what family #5
+# already costs them today, just moved earlier instead of removed.
+#
+# THIRD STATE IS MANDATORY HERE OF ALL PLACES: getting this wrong would be
+# the exact defect class (family #2, "3o-estado colapsado", 30% of the same
+# 443 issues) that this whole check exists downstream of. gate_base_test_
+# verdict (above) treats ANY partial measurement (some files copied/run,
+# some not) as nao-consegui-medir, never as passou-na-base — collapsing
+# "couldn't tell" into "proves nothing, refuse" would be worse than not
+# building this check at all.
+#
+# Every submission that reaches this point with arm=B gets a verdict label
+# + a structured "AB-BASE-TEST" log line, REGARDLESS of whether it blocks —
+# "sem-teste-novo" and "nao-consegui-medir" must be counted, not just
+# "passou-na-base", or the A/B apuracao measures "who wrote a test" instead
+# of "who wrote a test that proves something" (bead's own requirement).
+if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
+  _ABT_ARM=$(gate_ab_arm_for_bead "$BEAD_ID")
+  log "AB-ARM bead=$BEAD_ID arm=$_ABT_ARM marker=$MARKER_ID"
+
+  if [ "$_ABT_ARM" = "B" ]; then
+    _ABT_VERDICT="nao-consegui-medir"   # pessimistic default; only upgraded
+                                         # below once a stage actually succeeds
+    _ABT_DETECTED=0; _ABT_COPY_OK=0; _ABT_RAN=0; _ABT_FAILED=0
+    _ABT_BASE=""; _ABT_TEST_FILES=""
+
+    git -C "$RIG_PATH" fetch origin main "$BRANCH" --quiet 2>/dev/null || true
+    _ABT_MAIN_SHA=$(git -C "$RIG_PATH" rev-parse "origin/main" 2>/dev/null || echo "")
+    _ABT_BRANCH_SHA=$(git -C "$RIG_PATH" rev-parse "origin/$BRANCH" 2>/dev/null || echo "")
+    if [ -n "$_ABT_MAIN_SHA" ] && [ -n "$_ABT_BRANCH_SHA" ]; then
+      _ABT_BASE=$(git -C "$RIG_PATH" merge-base "$_ABT_BRANCH_SHA" "$_ABT_MAIN_SHA" 2>/dev/null || echo "")
+    fi
+
+    if [ -n "$_ABT_BASE" ]; then
+      _ABT_TEST_FILES=$(git -C "$RIG_PATH" diff --name-only --diff-filter=AM "${_ABT_BASE}..${_ABT_BRANCH_SHA}" -- '*.selftest.sh' 2>/dev/null || echo "")
+      [ -n "$_ABT_TEST_FILES" ] && _ABT_DETECTED=$(printf '%s\n' "$_ABT_TEST_FILES" | grep -c .)
+
+      if [ "$_ABT_DETECTED" -eq 0 ]; then
+        _ABT_VERDICT="sem-teste-novo"        # explicit success: we DID determine there's nothing new
+      elif [ "$_ABT_DETECTED" -gt 15 ]; then
+        # Safety cap, not a silent truncation: >15 changed selftest files in
+        # one submission is unprecedented in this codebase's actual usage —
+        # don't spend an unbounded guard-sweep budget attempting it. Still
+        # logged below via the shared AB-BASE-TEST line like any other
+        # nao-consegui-medir case, so a cap hit is visible, not silent.
+        _ABT_VERDICT="nao-consegui-medir"
+      else
+        _ABT_WT=$(mktemp -d "${TMPDIR:-/tmp}/gate-rstae-basetest.XXXXXX" 2>/dev/null || echo "")
+        if [ -n "$_ABT_WT" ] && git -C "$RIG_PATH" worktree add --detach --quiet "$_ABT_WT" "$_ABT_BASE" 2>/dev/null; then
+          while IFS= read -r _abt_f; do
+            [ -z "$_abt_f" ] && continue
+            mkdir -p "$(dirname "$_ABT_WT/$_abt_f")" 2>/dev/null
+            if git -C "$RIG_PATH" show "${_ABT_BRANCH_SHA}:$_abt_f" > "$_ABT_WT/$_abt_f" 2>/dev/null; then
+              _ABT_COPY_OK=$((_ABT_COPY_OK + 1))
+              if timeout 30 bash "$_ABT_WT/$_abt_f" >/dev/null 2>&1; then
+                _ABT_RAN=$((_ABT_RAN + 1))
+              else
+                _abt_rc=$?
+                # 124 = killed by timeout (coreutils convention): ambiguous by
+                # construction (would it have failed, or just needed more time
+                # in a throwaway worktree with no other context?) — do NOT
+                # count as ran, so gate_base_test_verdict's ran!=detected check
+                # routes this to nao-consegui-medir, never to a verdict this
+                # check isn't actually sure of.
+                if [ "$_abt_rc" != "124" ]; then
+                  _ABT_RAN=$((_ABT_RAN + 1))
+                  _ABT_FAILED=$((_ABT_FAILED + 1))
+                fi
+              fi
+            fi
+          done <<ABT_TEST_FILES_EOF
+$_ABT_TEST_FILES
+ABT_TEST_FILES_EOF
+          git -C "$RIG_PATH" worktree remove --force "$_ABT_WT" 2>/dev/null || rm -rf "$_ABT_WT" 2>/dev/null
+        else
+          [ -n "$_ABT_WT" ] && rm -rf "$_ABT_WT" 2>/dev/null   # mktemp ok but worktree add itself failed
+        fi
+        _ABT_VERDICT=$(gate_base_test_verdict "$_ABT_DETECTED" "$_ABT_COPY_OK" "$_ABT_RAN" "$_ABT_FAILED")
+      fi
+    fi
+
+    bd -C "$GC_CITY" label add "$MARKER_ID" "gate-ab:arm-b" -q 2>/dev/null || true
+    bd -C "$GC_CITY" label add "$MARKER_ID" "gate-ab-basetest:$_ABT_VERDICT" -q 2>/dev/null || true
+    log "AB-BASE-TEST bead=$BEAD_ID arm=B verdict=$_ABT_VERDICT branch=$BRANCH base=$_ABT_BASE detected=$_ABT_DETECTED copy_ok=$_ABT_COPY_OK ran=$_ABT_RAN failed=$_ABT_FAILED"
+
+    if [ "$_ABT_VERDICT" = "passou-na-base" ]; then
+      err "  base-commit-test-check (ga-rstae, arm B): $_ABT_DETECTED new/changed selftest(s) on $BRANCH ALL pass unmodified against pre-fix base $_ABT_BASE — proves nothing about this branch's own diff. Refusing at submission."
+      set_gate_status "$MARKER_ID" "error"
+      bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: base-commit test check (ga-rstae, A/B experiment arm B).
+$_ABT_DETECTED new/changed selftest file(s) on $BRANCH pass UNCHANGED when run against the pre-fix base commit ($_ABT_BASE) — meaning they don't actually exercise the bug/regression this branch claims to fix (test-driven-development's own Iron Law: a test that passes before your fix exists proves nothing).
+Files: $(printf '%s' "$_ABT_TEST_FILES" | tr '\n' ' ')
+Fix (this is the point of the check, not busywork): strengthen the test so it FAILS against base — i.e. it actually depends on your fix — then push again:
+  git push origin $BRANCH
+Then re-run /gate-done. Marker set to gate-status:error (fixable + re-submittable, not lost).
+(You landed in arm B of a running A/B experiment measuring this check's effect on first-attempt gate pass rate — ga-rstae. Arm A submissions never see this block.)" 2>/dev/null || true
+      log "SUPPRESSED PUSH (wa-uthi non-terminal): base-commit-test-check failed for $MARKER_ID (gate-status:error, arm B)."
+      exit 1
     fi
   fi
 fi

@@ -44,6 +44,21 @@ reviewed — see "branch-content-coherence" below for the fix. If your work is
 a slice of a parent epic, citing the parent is fine and encouraged — just
 ADD a commit citing your own bead too, don't cite only the parent's id.
 
+**If you added or changed a `*.selftest.sh` file, make sure it actually
+FAILS against the code that existed before your fix (ga-rstae).** This is
+just test-driven-development's own Iron Law — a test that passes with or
+without your fix proves nothing — but it is now also mechanically checked,
+for HALF of submissions, right after you push: an A/B experiment (arm
+assignment is a deterministic hash of your bead id, not something you
+control or predict) re-runs every new/changed selftest file against the
+commit your branch is based on, with none of your own fix applied. If EVERY
+one of them still passes there, the "arm B" half of the experiment refuses
+the marker with `gate-status:error` — see "base-commit test check" below for
+the fix. Arm A never sees this check; if you're in it, this paragraph is
+inert for you. You cannot tell which arm you're in ahead of time, and
+shouldn't try — writing a test that fails on base is simply correct practice
+either way.
+
 ## Pre-flight Self-Audit: THE THIRD STATE (mandatory — before you push)
 
 Six gate rejections in one day were the same defect class wearing different
@@ -601,6 +616,26 @@ git push origin HEAD
 ```
 Then re-run `/gate-done`. The marker is fixable + re-submittable, nothing is
 lost.
+
+**Marker rejected with "base-commit-test-check (ga-rstae, arm B)" / gate-status:error
+saying your selftest(s) pass unmodified against base**: you're in arm B of a
+running A/B experiment (arm is a deterministic hash of your bead id — you
+don't choose it and can't avoid it by resubmitting). Every `*.selftest.sh`
+file you added or changed was extracted, unmodified, into a throwaway
+worktree checked out at the commit your branch is based on (none of your
+fix applied there), and run — and ALL of them still passed. That means the
+test doesn't actually depend on your fix, so it proves nothing (the same
+thing test-driven-development's Iron Law already asks you to avoid). Fix:
+strengthen the assertion so it genuinely fails without your fix — e.g. call
+the new/changed behavior directly rather than asserting on something the
+base code already satisfies — then push again:
+```bash
+git push origin HEAD
+```
+Then re-run `/gate-done`. The marker is fixable + re-submittable, nothing is
+lost. If your submission touches no `*.selftest.sh` files, or uses a
+different test convention (pytest/jest/go test/...), this check does not
+apply to you at all — it only measures shell selftest files today.
 
 **Found a third-state bug during the Pre-flight Self-Audit**: Fix it, commit,
 and `git push origin HEAD` again before continuing, then re-run the sequence
