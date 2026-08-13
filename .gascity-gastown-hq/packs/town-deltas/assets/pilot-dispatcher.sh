@@ -726,22 +726,32 @@ rig_domain_exclude() {
   case "$1/$2" in
     whatsapp_automation/frontend|wa/frontend)       echo "digo-wa" ;;
     whatsapp_automation/real-estate|wa/real-estate) echo "oracle-wa digo-wa thies-wa" ;;
-    whatsapp_automation/warming|wa/warming)         echo "digo-wa mila-wa peter-wa thies-wa" ;;  # warming → SÓ oracle-wa (dono) ou DEFER; nunca mila/digo (ga-wisp-jmrn5q)
-    # ga-pp00f: NOTE THE DIFFERENT SHAPE — every other entry above lists NAMED
-    # crew, which pick_pool_builder's exclude-match compares against
-    # rig_to_builders' actual candidate set (wa-worker-1..4 for this rig,
-    # since pilot-rewire). None of those named crew are ever IN that set, so
-    # those three entries are inert dead code against today's pool — when
-    # e.g. oracle-wa (warming) is busy, dispatch_one's owner-busy fallback
-    # calls pick_pool_builder, which can still hand a warming bead to a
-    # wa-worker-N slot (untested by Scenario 17g/17h, which only exercise the
-    # idle-owner path; left as-is here, out of scope for this lane:small
-    # fix — flag for follow-up). For hex that same fallback would silently
-    # reproduce the exact reclaim-loop bug this fix exists to close, so hex
-    # lists the ACTUAL pool-slot names instead of a crew name — the form
-    # pick_pool_builder's exclude-match genuinely consumes today. Keep this
-    # in sync with rig_to_builders' whatsapp_automation mapping if that ever
-    # changes.
+    whatsapp_automation/warming|wa/warming)         echo "digo-wa mila-wa peter-wa thies-wa wa-worker-1 wa-worker-2 wa-worker-3 wa-worker-4" ;;  # warming → SÓ oracle-wa (dono) ou DEFER; nunca mila/digo (ga-wisp-jmrn5q). ga-ppx8h: pool-slot names appended so a busy-owner defer actually excludes the wa-worker-N fallback too (see block comment below).
+    # ga-pp00f/ga-ppx8h: NOTE THE DIFFERENT SHAPE — frontend and real-estate
+    # above list only NAMED crew, which pick_pool_builder's exclude-match
+    # compares against rig_to_builders' actual candidate set (wa-worker-1..4
+    # for this rig, since pilot-rewire). None of that crew is ever IN that
+    # set, so those two entries are inert dead code against today's pool —
+    # deliberately so: frontend/real-estate/data are NOT
+    # rig_domain_requires_persistent_owner, so pilot-rewire's pool-routing
+    # for them is intended behaviour (Scenario 17b/17f), and their exclude
+    # never needs to reach the pool.
+    #
+    # warming and hex are the two domains that ARE
+    # rig_domain_requires_persistent_owner (structurally pool-incompatible),
+    # so when their owner is busy, dispatch_one's fallback still calls
+    # pick_pool_builder — and an inert exclude there lets the bead leak onto
+    # a wa-worker-N slot, reproducing the exact ga-uvfs6/ga-pp00f misroute
+    # this mechanism exists to prevent. hex's rig_domain_exclude has always
+    # listed the actual pool-slot names for that reason; warming's did not
+    # (ga-ppx8h, found as a side-discovery while implementing ga-pp00f,
+    # confirmed still live: busy oracle-wa could leak an on-device bead into
+    # the wa-worker pool, untested by Scenario 17g/17h which only exercise
+    # the idle-owner path) — fixed by appending the pool-slot names to
+    # warming's exclude above, alongside (not replacing) its historical
+    # crew-name exclusion (ga-wisp-jmrn5q). Keep both warming's and hex's
+    # pool-slot list in sync with rig_to_builders' whatsapp_automation
+    # mapping if that ever changes.
     whatsapp_automation/hex|wa/hex)                 echo "wa-worker-1 wa-worker-2 wa-worker-3 wa-worker-4" ;;
     *)                                              echo ""        ;;
   esac

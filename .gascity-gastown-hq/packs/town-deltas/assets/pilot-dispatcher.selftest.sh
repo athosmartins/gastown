@@ -3084,6 +3084,70 @@ else
   bad "ga-uvfs6 control: data bug unexpectedly bypassed the pool (got: '${DATA_BUILDER:-none}') — rig_domain_requires_persistent_owner too broad"
 fi
 
+# ── Scenario ga-ppx8h: warming-domain WA bug with a BUSY oracle-wa DEFERS —
+# does NOT leak into the wa-worker pool ────────────────────────────────────
+# Bug ga-ppx8h (found as a side-discovery while implementing ga-pp00f, filed
+# without a live reproduction — this scenario supplies one): warming's
+# rig_domain_exclude entry listed only NAMED crew (digo-wa mila-wa peter-wa
+# thies-wa), which — like every domain except hex — does not intersect
+# rig_to_builders' actual WA pool (wa-worker-1..4, per pilot-rewire), so it
+# was inert dead code against pick_pool_builder's busy-owner fallback.
+# Scenario 17g/17h above only exercise the IDLE-owner path (oracle-wa free);
+# this is the busy-owner path Scenario ga-pp00f-c already proved for hex —
+# cloned here for warming with oracle-wa/WARM_BUG standing in for
+# batista-wa/HEX_BUG. ga-ppx8h's fix appends the actual pool-slot names to
+# warming's rig_domain_exclude (alongside its historical crew-name
+# exclusion), so this must now defer exactly like ga-pp00f-c, never leak.
+NOW_ISO_PPX8H="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+INFLIGHT_PPX8H="[{\"id\":\"if-oracle\",\"labels\":[\"story:in-flight\",\"lane:small\"],\"updated_at\":\"$NOW_ISO_PPX8H\",\"metadata\":{\"pilot.sling_bead\":\"tt-sling-oracle\"}}]"
+SESSIONS_PPX8H='{"sessions":[{"session_name":"oracle-wa","closed":false}]}'
+SLINGMAP_PPX8H='{"tt-sling-oracle":"oracle-wa"}'
+
+echo "Scenario ga-ppx8h-a: warming-domain WA bug with a BUSY oracle-wa DEFERS — does NOT leak into the wa-worker pool"
+LOG_PPX8H_A="$(run_capacity 10 "$INFLIGHT_PPX8H" 1 "$WARM_BUG" "$SESSIONS_PPX8H" "$SLINGMAP_PPX8H")"
+if echo "$LOG_PPX8H_A" | grep -q "Busy builders (live in-flight): oracle-wa"; then
+  ok "busy-builder set computed with oracle-wa busy (fixture wired correctly)"
+else
+  bad "did not compute oracle-wa as busy — fixture not wired as intended, the result below is not trustworthy"
+fi
+WARMBUILDER_PPX8H_A="$(builders_of "$LOG_PPX8H_A")"
+if echo "$WARMBUILDER_PPX8H_A" | grep -qE '^wa-worker-[0-9]+$'; then
+  bad "REGRESSION (ga-ppx8h): warming bug leaked into the wa-worker pool ($WARMBUILDER_PPX8H_A) when oracle-wa was busy — reproduces the on-device misroute this fix exists to close"
+elif [ -z "$WARMBUILDER_PPX8H_A" ]; then
+  ok "warming bug correctly DEFERRED (no dispatch) while oracle-wa is busy — never touches the wa-worker pool"
+else
+  bad "warming bug went to an unexpected target while oracle-wa was busy: '$WARMBUILDER_PPX8H_A'"
+fi
+if echo "$LOG_PPX8H_A" | grep -q "deferring tt-wawarm to next sweep"; then
+  ok "defer is logged explicitly (domain-excluded from the fallback pool, not a silent drop)"
+else
+  bad "no explicit defer log line found for tt-wawarm — investigate before trusting the outcome above"
+fi
+
+echo "Scenario ga-ppx8h-b (control): a non-warming WA bug in the SAME sweep as a busy-owner warming bug still dispatches normally"
+TWO_BUGS_PPX8H="[$(echo "$WARM_BUG" | jq -c '.[0]'),$(echo "$WA_ONE_BUG" | jq -c '.[0]')]"
+LOG_PPX8H_B="$(run_capacity 10 "$INFLIGHT_PPX8H" 1 "$TWO_BUGS_PPX8H" "$SESSIONS_PPX8H" "$SLINGMAP_PPX8H")"
+NONWARM_BUILDER_PPX8H_B="$(echo "$LOG_PPX8H_B" | grep 'Builder target:' | grep -v 'domain=warming' | sed -E 's/.*Builder target: ([^ ]+).*/\1/' | head -1)"
+if echo "$NONWARM_BUILDER_PPX8H_B" | grep -qE '^wa-worker-[0-9]+$'; then
+  ok "non-warming WA bug still dispatched to a wa-worker slot ($NONWARM_BUILDER_PPX8H_B) in the same sweep — warming exclusion is domain-scoped, not sweep-wide"
+else
+  bad "non-warming WA bug did not dispatch as expected (got: '${NONWARM_BUILDER_PPX8H_B:-none}') — warming fix may be over-broad"
+fi
+
+echo "Scenario ga-ppx8h-c: drift-guard — warming's rig_domain_exclude now includes the actual wa-worker pool-slot names"
+if grep -qE 'whatsapp_automation/warming\|wa/warming\)[[:space:]]*echo "[^"]*wa-worker-1 wa-worker-2 wa-worker-3 wa-worker-4' "$DISPATCHER"; then
+  ok "warming's rig_domain_exclude includes the wa-worker pool slots (the busy-owner leak fix)"
+else
+  bad "warming's rig_domain_exclude does not include the wa-worker pool slots — ga-ppx8h regression"
+fi
+# Control: re-assert the idle-owner path (Scenario 17g's own fixture/result) is
+# unaffected by appending the pool-slot names to the exclude list.
+if [ "$WARM_BUILDER" = "oracle-wa" ]; then
+  ok "ga-ppx8h control: warming (Scenario 17g fixture) still dispatches to oracle-wa when idle, unaffected by the exclude-list change"
+else
+  bad "ga-ppx8h REGRESSION: warming idle-owner routing changed after fixing the exclude list (got: '${WARM_BUILDER:-none}')"
+fi
+
 # ── Scenario 17: reuse existing crew session, never spawn a 2nd (gt-4st3n) ────
 # Bug gt-4st3n: the Pilot routed work to a crew identity via `gc sling <identity>`
 # + an immediate nudge. When that crew ALREADY had a session this spawned/resumed
