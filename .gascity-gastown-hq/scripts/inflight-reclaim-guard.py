@@ -136,6 +136,44 @@ own is_known_agent() check from failing, but it closes the window before a
 competing worker races into the reopened bead, and it self-limits (a
 genuinely dead session is correctly left alone for normal re-dispatch, and
 never carries a shield since it was never healed).
+
+ga-f6igb (self-heal can't tell DELIBERATE release from ORPHAN-SWEEP's
+accident): confirmed live 2026-08-05 (ga-wgvca) and 2026-08-08 (ga-wzl83) —
+the heal above restores ANY candidate whose stale gc.session_name still
+resolves to a live session, but "the claiming session is still alive" is
+also exactly what's true the instant that SAME session deliberately releases
+a claim it has no intention of resuming (an explicit refuse-then-reclaim, or
+a deliberate park like ga-wzl83's "done, just waiting on an external merge").
+Both look identical to a check that only asks "does this session still
+answer to that name?" — self-heal answered yes and restored the claim in
+both cases, undoing a correct, intentional release ~2 minutes after it was
+made. The bug's own suggested fix (compare the session's instance_token/
+generation at restore time) does NOT actually close this: ga-wgvca and
+ga-wzl83 were both the SAME generation deliberately releasing its own claim,
+so a generation check still says "still the original owner, still alive" and
+would still wrongly restore it — confirmed by ga-wzl83's own investigation
+notes before this fix landed. What DOES distinguish the two cases: a
+deliberate release is never silent — it leaves a label behind explaining WHY
+(pool:refused[:reason], gate:needs-human[:*], pilot:no-auto-dispatch,
+pilot:held[-until:*], story:awaiting-external-merge), because that is
+already this city's standing doctrine for how a worker stands down (see
+CLAUDE.md's engine-fix-refuse recipe and do_reclaim()'s own has_explicit_
+refusal handling above). order:orphan-sweep's blind reset never adds any of
+these — it only clears status+assignee. _has_deliberate_release_signal()
+below checks for that narrow, curated label set (NOT bead_state.py's full
+PARK_PREFIXES/PARK_EXACT union — see that function's own docstring for why
+the broader vocabulary would over-block: a bead merely carrying an unrelated
+park label, e.g. ctx:thin from a totally different process, would then sit
+open+unassigned+ctx:ready+exec:auto and become newly exposed to routed-pool
+re-dispatch, the exact double-claim harm this whole mechanism exists to
+prevent, just moved to a different trigger) and skips the restore entirely
+when present, regardless of how live the session still reads. Two audit
+trails were investigated and ruled out as of 2026-08-13: the flat-file
+.beads/interactions.jsonl (actor-per-mutation log a related memory
+recommends) has been silently stale since 2026-08-07 — bd migrated fully to
+a Dolt-native `interactions` table per commit 5184b2a0c, and that table is
+confirmed EMPTY (0 rows) on this city's live hq database, so per-mutation
+actor attribution is not currently recoverable at all, not just slow.
 """
 import json
 import os
@@ -2632,6 +2670,53 @@ def list_orphan_sweep_false_resets():
     return list(candidates.values())
 
 
+def _has_deliberate_release_signal(labels):
+    """True if labels show a DELIBERATE decision already stood this claim
+    down — the claiming session's own explicit refusal/park, or an
+    authority's active hold/escalation — as opposed to order:orphan-sweep's
+    blind, unexplained status/assignee reset (ga-f6igb; see the module
+    docstring's own "ga-f6igb" section for the two confirmed live incidents
+    this closes: ga-wgvca's refuse-then-reclaim, ga-wzl83's deliberate park).
+
+    heal_orphan_sweep_false_resets() must NEVER restore a claim when this is
+    True: doing so would silently undo an intentional decision rather than
+    compensate for an accidental one.
+
+    Reuses this file's own _has_refusal_label() (pool:refused[:reason]) and
+    _has_needs_human_label() (gate:needs-human[:*] / bare needs-human — also
+    covers the bead already having been escalated by this guard's own
+    do_escalate(), which must never be silently re-opened by this heal).
+    Adds three more markers by name, matching the exact literal strings
+    do_reclaim()/do_escalate() elsewhere in this file already stamp, rather
+    than importing bead_state.py's PARK_EXACT/PARK_PREFIXES wholesale:
+    pilot:no-auto-dispatch (explicit stand-down, ga-wzl83), pilot:held /
+    pilot:held-until:<epoch> (an active hold already governs re-dispatch —
+    checked as bare-exact + a distinct ":"-prefix, NOT a blanket "pilot:held"
+    prefix, because bead_state.py's own PARK_EXACT comment documents that a
+    raw prefix there collides with the never-cleared pilot:held-count:
+    <slug>:<n> bookkeeping counter), and story:awaiting-external-merge
+    (explicit "done, blocked on an outside event" park).
+
+    Deliberately NOT the full PARK_PREFIXES/PARK_EXACT union: labels like
+    ctx:thin/blocked/story:cancelled/on-device describe OTHER reasons a bead
+    might be unready, unrelated to whether THIS specific claim's release was
+    deliberate. Treating them as heal-blockers would leave a genuinely
+    orphan-sweep-false-reset bead sitting open+unassigned — its
+    ctx:ready/exec:auto/story:in-flight labels untouched by the reset, per
+    list_orphan_sweep_false_resets()'s own docstring — and newly exposed to
+    routed-pool re-dispatch: the exact double-claim harm ga-seuh4 exists to
+    prevent, just moved to a different trigger.
+    """
+    if _has_refusal_label(labels) or _has_needs_human_label(labels):
+        return True
+    for lbl in labels:
+        if lbl in ("pilot:no-auto-dispatch", "pilot:held", "story:awaiting-external-merge"):
+            return True
+        if lbl.startswith("pilot:held-until:"):
+            return True
+    return False
+
+
 def heal_orphan_sweep_false_resets(sessions, now):
     """Restore beads whose claim was wrongfully reset by order:orphan-sweep
     (ga-seuh4/ga-a8t68) while the claiming session was still genuinely alive.
@@ -2664,6 +2749,13 @@ def heal_orphan_sweep_false_resets(sessions, now):
     (concrete_adhoc_session_is_live → False) is left open for normal
     re-dispatch, exactly as orphan-sweep intended.
 
+    ga-f6igb: also never restores a candidate carrying an explicit deliberate-
+    release label (_has_deliberate_release_signal()) — a live session is
+    necessary but NOT sufficient evidence the reset was orphan-sweep's
+    accident; the SAME live session may have just deliberately stood the
+    claim down. See that helper's own docstring for the exact label set and
+    why it is a narrow, curated subset rather than every known park label.
+
     Returns count of beads healed this cycle.
     """
     candidates = list_orphan_sweep_false_resets()
@@ -2677,6 +2769,17 @@ def heal_orphan_sweep_false_resets(sessions, now):
         meta = b.get("metadata") or {}
         stale_assignee = meta.get("gc.session_name") or ""
         if not stale_assignee:
+            continue
+        # ga-f6igb: a deliberate stand-down (explicit refusal, park, active
+        # hold, or prior escalation) looks IDENTICAL to an orphan-sweep false
+        # reset from this point on — both leave gc.* metadata intact with the
+        # claiming session still live. Only a label can tell them apart; see
+        # _has_deliberate_release_signal()'s own docstring for the two
+        # confirmed live incidents (ga-wgvca, ga-wzl83) this check closes.
+        if _has_deliberate_release_signal(b.get("labels") or []):
+            emit(f"[INFLIGHT-RECLAIM] [SELF-HEAL-SKIPPED] bead={bead_id} "
+                 f"carries a deliberate-release label — NOT restoring "
+                 f"assignee={stale_assignee!r} (ga-f6igb)")
             continue
         # Freshness guard: this metadata shape (open + unassigned + stale
         # gc.session_name of a still-live session) is NOT unique to an
@@ -5681,9 +5784,10 @@ def _selftest():
     def _sh_ts(seconds_ago):
         return _irg_datetime.datetime.utcfromtimestamp(T_sh - seconds_ago).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    def _sh_bead(bead_id, stale_assignee, seconds_ago=60):
+    def _sh_bead(bead_id, stale_assignee, seconds_ago=60, labels=None):
         return {"id": bead_id, "status": "open", "assignee": "",
                 "updated_at": _sh_ts(seconds_ago),
+                "labels": list(labels) if labels else [],
                 "metadata": {"gc.routed_to": "gastown.dog",
                              "gc.session_name": stale_assignee,
                              "gc.work_dir": "/fake/work/dir"}}
@@ -5901,6 +6005,104 @@ def _selftest():
         _healed7 = heal_orphan_sweep_false_resets(_sh_live_sessions, T_sh)
         check("SH-7: candidate older than RECLAIM_TTL is NOT healed (freshness guard)",
               _healed7 == 0)
+    finally:
+        subprocess.run = _orig_run_sh
+
+    # SH-8 (ga-f6igb, AC2): a candidate carrying an explicit deliberate-release
+    # label must NEVER be healed, even though its stale gc.session_name still
+    # resolves to a live session and the update is fresh — this is the exact
+    # regression ga-wgvca/ga-wzl83 reported: self-heal reverted a correct,
+    # intentional stand-down within ~2 minutes because liveness alone can't
+    # distinguish it from orphan-sweep's blind reset. One sub-case per label
+    # _has_deliberate_release_signal() recognizes.
+    _sh8_labels = [
+        "pool:refused",                          # ga-wgvca: bare refusal
+        "pool:refused:engine-rebuild-required",  # ga-wgvca: refusal w/ reason
+        "gate:needs-human",                      # already escalated by do_escalate()
+        "gate:needs-human:technical",            # ":"-suffixed escalation sub-label
+        "needs-human",                           # bare, no gate: prefix
+        "pilot:no-auto-dispatch",                # ga-wzl83: deliberate park
+        "pilot:held",                            # active hold (do_reclaim's own stamp)
+        "pilot:held-until:9999999999",           # active hold, "-until:" prefix form
+        "story:awaiting-external-merge",         # done, blocked on an outside event
+    ]
+    for _sh8_label in _sh8_labels:
+        _sh8_update_calls = []
+
+        def _stub_sh8(cmd, _label=_sh8_label, _calls=_sh8_update_calls, **kw):
+            if cmd[:2] == ["bd", "list"]:
+                return _FakeGitResult(0, json.dumps(
+                    [_sh_bead("ga-shtest8", "dog-galive1", labels=[_label])]))
+            if cmd[:2] == ["bd", "update"]:
+                _calls.append(list(cmd))
+            return _FakeGitResult(0, "")
+
+        subprocess.run = _stub_sh8
+        try:
+            _healed8 = heal_orphan_sweep_false_resets(_sh_live_sessions, T_sh)
+            check(f"SH-8 ({_sh8_label!r}): deliberate-release label blocks "
+                  f"self-heal (ga-f6igb AC2)",
+                  _healed8 == 0 and _sh8_update_calls == [],
+                  f"healed={_healed8} calls={_sh8_update_calls!r}")
+        finally:
+            subprocess.run = _orig_run_sh
+
+    # SH-9 (ga-f6igb, AC3): a candidate WITHOUT any deliberate-release label —
+    # just the normal in-flight labels a genuinely-live builder's bead
+    # carries — is STILL healed. This is ga-seuh4's original protection;
+    # ga-f6igb must not regress it while fixing the false-restore case above.
+    _sh9_update_calls = []
+
+    def _stub_sh9(cmd, **kw):
+        if cmd[:2] == ["bd", "list"]:
+            return _FakeGitResult(0, json.dumps(
+                [_sh_bead("ga-shtest9", "dog-galive1",
+                          labels=["ctx:ready", "exec:auto", "story:in-flight"])]))
+        if cmd[:2] == ["bd", "update"]:
+            _sh9_update_calls.append(list(cmd))
+            return _FakeGitResult(0, "")
+        if cmd[:2] in (["bd", "label"], ["bd", "comment"]):
+            return _FakeGitResult(0, "")
+        return _FakeGitResult(0, "")
+
+    subprocess.run = _stub_sh9
+    try:
+        _healed9 = heal_orphan_sweep_false_resets(_sh_live_sessions, T_sh)
+        check("SH-9 (ga-f6igb AC3): normal in-flight labels (no deliberate-release "
+              "marker) do NOT block self-heal — preserves ga-seuh4's original case",
+              _healed9 == 1 and len(_sh9_update_calls) == 1,
+              f"healed={_healed9} calls={_sh9_update_calls!r}")
+    finally:
+        subprocess.run = _orig_run_sh
+
+    # SH-10 (ga-f6igb precision guard): an UNRELATED park label (ctx:thin —
+    # not in _has_deliberate_release_signal()'s curated set) must NOT block
+    # self-heal either. Proves the fix did not adopt bead_state.py's full
+    # PARK_PREFIXES/PARK_EXACT union — see that helper's own docstring for
+    # why the broader vocabulary would over-block a genuine orphan-sweep
+    # false-reset (leaving it open+unassigned+ctx:ready+exec:auto, newly
+    # exposed to routed-pool re-dispatch).
+    _sh10_update_calls = []
+
+    def _stub_sh10(cmd, **kw):
+        if cmd[:2] == ["bd", "list"]:
+            return _FakeGitResult(0, json.dumps(
+                [_sh_bead("ga-shtest10", "dog-galive1",
+                          labels=["ctx:thin", "ctx:ready", "exec:auto"])]))
+        if cmd[:2] == ["bd", "update"]:
+            _sh10_update_calls.append(list(cmd))
+            return _FakeGitResult(0, "")
+        if cmd[:2] in (["bd", "label"], ["bd", "comment"]):
+            return _FakeGitResult(0, "")
+        return _FakeGitResult(0, "")
+
+    subprocess.run = _stub_sh10
+    try:
+        _healed10 = heal_orphan_sweep_false_resets(_sh_live_sessions, T_sh)
+        check("SH-10 (ga-f6igb precision guard): unrelated park label (ctx:thin) "
+              "does NOT block self-heal — curated set, not the full park vocabulary",
+              _healed10 == 1 and len(_sh10_update_calls) == 1,
+              f"healed={_healed10} calls={_sh10_update_calls!r}")
     finally:
         subprocess.run = _orig_run_sh
 
