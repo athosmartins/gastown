@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
-# digest-sweep.selftest.sh — regression harness for digest-sweep.sh (ga-8f40w).
+# digest-sweep.selftest.sh — regression harness for digest-sweep.sh (ga-8f40w, ga-4tt37).
 #
 # Stubs `bd` entirely (PATH-shadowed) so no real database is touched. Proves
 # the acceptance criteria's explicit safety cases: a future-dated title and a
 # title with no parseable date must NEVER be closed — a failed/absent parse
 # must KEEP, never CLOSE, since closing by mistake destroys information.
+#
+# Also proves (ga-4tt37) that the `bd list` call actually requests
+# --include-infra: plain `bd list --status open` silently hides
+# issue_type=message beads (confirmed live, 774 open message-type beads
+# invisible without the flag) — digests archive as message (ga-8f40w), so
+# without this flag the sweep could never see a correctly-typed digest left
+# open, contradicting its own "catches ANY open digest" header claim.
 #
 # Exit 0 iff every assertion holds.
 set -uo pipefail
@@ -32,13 +39,17 @@ trap 'rm -rf "$FIXTURE_DIR"' EXIT
 
 CLOSED_LOG="$FIXTURE_DIR/closed.log"
 : > "$CLOSED_LOG"
+LIST_ARGS_LOG="$FIXTURE_DIR/list-args.log"
+: > "$LIST_ARGS_LOG"
 
-# Stub `bd`: `bd list ...` prints a fixed fixture; `bd close <id> ...` records
-# the id instead of touching any real database.
+# Stub `bd`: `bd list ...` records the exact args it was called with (so we
+# can assert --include-infra was requested) and prints a fixed fixture;
+# `bd close <id> ...` records the id instead of touching any real database.
 cat > "$FIXTURE_DIR/bd" <<STUB
 #!/usr/bin/env bash
 case "\$1" in
   list)
+    echo "\$*" >> "$LIST_ARGS_LOG"
     cat "$FIXTURE_DIR/fixture.json"
     ;;
   close)
@@ -102,6 +113,12 @@ echo "$CLOSED" | grep -qx "test-unrelated" \
 echo "-- exactly one bead closed this run --"
 N=$(printf '%s\n' "$CLOSED" | grep -c . || true)
 [ "$N" -eq 1 ] && ok "exactly 1 bead closed (only the past-day one)" || bad "expected exactly 1 close, got $N: $CLOSED"
+
+echo "-- bd list was called with --include-infra (ga-4tt37) --"
+LIST_ARGS="$(cat "$LIST_ARGS_LOG")"
+echo "$LIST_ARGS" | grep -q -- "--include-infra" \
+  && ok "bd list requested --include-infra (message-typed digests are visible)" \
+  || bad "bd list did NOT request --include-infra — message-typed digests (the ga-8f40w archive type) would be silently invisible to this sweep: $LIST_ARGS"
 
 echo ""
 echo "Results: $P passed, $F failed"

@@ -17,6 +17,15 @@
 # is today or in the future, is left untouched. Closing by mistake destroys
 # information; the asymmetric cost means erring toward keep (a failed/absent
 # parse must KEEP, never CLOSE).
+#
+# --include-infra (ga-4tt37, 2026-08-13): plain `bd list`, even with
+# --status open, silently hides issue_type=message beads (an "infra" type)
+# — confirmed live, 774 open message-type beads invisible without this
+# flag. Digests are supposed to archive as message (ga-8f40w). Without
+# --include-infra this sweep could only ever "catch" digests left open with
+# the WRONG type, making the "independent of issue_type, true safety net"
+# claim above false for exactly the type this fix produces. Add the flag or
+# the header comment lies about what this script actually does.
 set -euo pipefail
 
 __SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,7 +34,7 @@ __SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 TODAY="$(date -u +%Y-%m-%d)"
 
-bd list --status open --json --limit 0 2>/dev/null \
+bd list --status open --include-infra --json --limit 0 2>/dev/null \
   | jq -r --arg today "$TODAY" '
       .[]
       | select(.title | test("^Digest: [0-9]{4}-[0-9]{2}-[0-9]{2}$"))

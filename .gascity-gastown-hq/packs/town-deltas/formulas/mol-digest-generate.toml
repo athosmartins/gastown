@@ -13,6 +13,27 @@
 # Script vendored nowhere — this formula has no exec script, only agent-read
 # step descriptions, so the whole file is copied here (same recipe as
 # gate-sweep's vendor-and-override, applied to a formula instead of an order).
+#
+# Follow-up (ga-4tt37, 2026-08-13): the ga-8f40w fix above stops the type at
+# the RECIPE level but nothing verified the EXECUTING step actually followed
+# it — 3 post-fix runs (ga-wisp-olhjbwh, ga-ch6hk, ga-v6ti6 before a live
+# manual correction) still produced issue_type=task, left open, each time
+# with a close_reason on the work bead that falsely claimed the archive had
+# succeeded (same false-verification class as ga-8h185, this step's
+# mail-send sub-action). Confirmed via Dolt commit-history forensics
+# (dolt_diff_issues / AS OF, not guessed) that at least one instance
+# (ga-wisp-olhjbwh) had issue_type=task from its OWN creation commit — the
+# type was never message to begin with, ruling out a later mutation for
+# that case. generate-and-send's step description now requires an explicit
+# `bd show`-based verify-and-self-correct after both the mail-send and the
+# archive sub-actions, before either is cited as done in a close_reason.
+# Also fixed in the same pass: digest-sweep.sh's `bd list` was missing
+# --include-infra, so it could never see (and thus never sweep) a digest
+# left open with the CORRECT type (message is an infra type, hidden from
+# plain `bd list` even with --all) — confirmed live, 774 open message-type
+# beads invisible without the flag. That gap made the backstop's own
+# "catches ANY open digest regardless of issue_type" header comment false
+# for exactly the type this fix produces.
 description = """
 Generate activity digest for the mayor.
 
@@ -242,10 +263,24 @@ Transform data into a formatted digest and deliver it.
 - Throughput: N issues/day
 ```
 
-**2. Send to mayor:**
+**2. Send to mayor, then verify the send immediately (ga-8h185):**
 ```bash
 gc mail send mayor/ -s "Gas Town Digest: $DATE" -m "$DIGEST"
 ```
+
+A prior run's close_reason cited a specific mail-bead id and "verified
+assignee=gastown.mayor" — neither had happened; the send was silently
+dropped. Check right now, in this same step, not later: checking later is
+actively unsafe, because the mayor may archive the mail bead (an immediate
+hard delete, not a close — see docs/design/mail-protocol.md) before you look
+again, which makes a real send look like a false failure.
+```bash
+gc events --since=5m --type=mail.sent | tail -5
+```
+If no matching event appears, retry the send once. Do not cite the send as
+done in step 4's close_reason until this check has actually passed — if it
+still hasn't after the retry, say so plainly in that close_reason instead of
+asserting delivery.
 
 **3. Archive as bead — CLOSED, and NEVER type task/bug/chore:**
 
@@ -254,7 +289,10 @@ that day is over there is no pending action, so it must never enter
 the Pilot dispatch queue or the panel's Aprovadas column (both select
 on issue_type task/bug/chore). Archive as `message` and close it in
 the same breath — do not leave it open "for visibility"; closed beads
-remain fully findable via `bd show`/`bd list --all`.
+remain fully findable via `bd show`/`bd list --all --include-infra`
+(`message` is an infra type — plain `bd list`, even with `--all`, hides it;
+confirmed live 2026-08-13, ga-4tt37: 774 open message-type beads invisible
+without `--include-infra`).
 
 ```bash
 DIGEST_ID=$(gc bd create --type=message \
@@ -264,12 +302,42 @@ DIGEST_ID=$(gc bd create --type=message \
 gc bd close "$DIGEST_ID" --reason "Daily digest archived — informational artifact, no action pending"
 ```
 
+**Verify before claiming success anywhere (ga-4tt37).** This exact
+create+close pair has silently produced `issue_type=task`, left OPEN, on
+at least 3 separate runs — root cause unconfirmed (the executing step may
+not literally send `--type=message`, or something else reverts it), but
+every miss shared the same signature: the work bead's close_reason still
+asserted "archived as $DIGEST_ID" as if it had succeeded, and the wrong
+type meant `digest-sweep`'s daily backstop (which fixes `status` only,
+never `issue_type`) closed it late without ever correcting the type. Check,
+and self-correct once, before trusting the commands above worked:
+```bash
+V_TYPE=$(gc bd show "$DIGEST_ID" --json | jq -r '.[0].issue_type')
+V_STATUS=$(gc bd show "$DIGEST_ID" --json | jq -r '.[0].status')
+if [ "$V_TYPE" != "message" ] || [ "$V_STATUS" != "closed" ]; then
+  gc bd update "$DIGEST_ID" -t message
+  gc bd close "$DIGEST_ID" --reason "Daily digest archived — informational artifact, no action pending" 2>/dev/null || true
+  V_TYPE=$(gc bd show "$DIGEST_ID" --json | jq -r '.[0].issue_type')
+  V_STATUS=$(gc bd show "$DIGEST_ID" --json | jq -r '.[0].status')
+fi
+```
+If `$V_TYPE`/`$V_STATUS` still aren't `message`/`closed` after that retry,
+do NOT write a close_reason in step 4 claiming the digest was archived —
+comment the actual state (`gc bd comment <work-bead> "..."`) and word the
+close_reason honestly instead. A close_reason that asserts a success it
+never checked is worse than no close_reason (ga-8h185: the sibling
+false-verification bug, same step, the mail-send sub-action above).
+
 **4. Close work bead, signal reconciler, and exit:**
 ```bash
 gc bd close <work-bead> --reason "Digest generated and sent"
 gc runtime drain-ack
 exit
 ```
+Only use that exact close_reason if both verifications in steps 2 and 3
+actually passed. If either didn't, replace it with an honest account of
+what's still wrong — the work bead closing is about this step's own
+lifecycle, not a certificate that the digest was delivered.
 
 The deacon records this run via a `type:order-run` bead for cooldown
 tracking on the next patrol cycle."""
