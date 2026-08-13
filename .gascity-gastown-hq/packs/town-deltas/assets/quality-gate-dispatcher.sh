@@ -2047,6 +2047,76 @@ gate_no_branch_probe_local() {
   printf '%s %s' "$ref_exists" "$wt_dirty"
 }
 
+# ── ga-6mir5: cross-repo branch rescue (pure classifier + probe pair) ─────────
+# "Branch absent from origin" above is checked ONLY against the ONE rig $RIG
+# resolved to — but that resolution can itself be wrong. /gate-done's own rig
+# derivation (commands/gate-done.md) falls back to the bead-id PREFIX when its
+# cwd-based primary signal is empty, and this dispatcher's OWN Step 2 fallback
+# (label_fallback "bead-rig:", ~L6560s below) is worse: it feeds the
+# `bead-rig:` LABEL into $RIG. /gate-done (and gate-marker-rehome-janitor.py,
+# pilot-dispatcher.sh) write that label with BEAD_RIG semantics — "which store
+# holds the BEAD" (the bead's own prefix) — but $RIG means "which repo holds
+# the CODE". The two coincide for ordinary work and diverge for a
+# framework/doctrine fix: a wa-*/ps-*/lx-* bead whose fix lives in the
+# gascity/root repo. Real incident (ga-6mir5, 13/08): wa-sowus's branch was
+# live and pushed — in the ROOT repo — but the marker resolved
+# rig=whatsapp_automation, the dispatcher looked for the branch in
+# whatsapp_automation's origin, found nothing, and — before this fix — fell
+# straight into the ga-acb circuit-break below: a PERMANENT park plus a mail
+# to the author saying the work is "ABSENT from origin" and gone, when it was
+# never gone, just probed in the wrong repo.
+#
+# "Not found in the ONE repo we guessed" != "does not exist anywhere" — same
+# family as gate_no_branch_local_classify above (see
+# error-and-empty-must-not-produce-the-same-value). Before the destructive
+# ga-acb park below runs, sweep every OTHER registered rig's origin for the
+# same branch; self-correct only on an UNAMBIGUOUS single match — never guess
+# among several.
+#
+# gate_cross_repo_rescue_classify <match_count> — pure. 0 matches elsewhere ->
+# "not_found" (this really does look gone; the existing circuit-break below is
+# unaffected). 1 match -> "rescue" (unambiguous; self-correct RIG and retry).
+# 2+ matches -> "ambiguous" (can't safely pick one — same as not_found: fall
+# through to the existing circuit-break rather than guess).
+gate_cross_repo_rescue_classify() {
+  local n="${1:-0}"
+  case "$n" in
+    0) printf 'not_found' ;;
+    1) printf 'rescue' ;;
+    *) printf 'ambiguous' ;;
+  esac
+}
+
+# gate_cross_repo_branch_probe <branch> <rig_list_json> <exclude_rig_name> —
+# the I/O half. `git ls-remote` needs no prior fetch (queries the remote
+# directly), so this is safe to run against rigs this sweep never touched.
+# Bounded per-rig with `timeout` (same posture as the other network calls in
+# this file, e.g. the dolt-health probe) so one unreachable/misconfigured rig
+# can't hang the whole sweep. Echoes one TAB-separated "<name>\t<path>\t<sha>"
+# line per rig where the branch exists on origin; silent (no line) for a rig
+# where it doesn't, or where the probe itself fails — a failed probe reads the
+# same as "not found there", the same fail-open-to-"keep looking" posture
+# every other probe in this file uses. Never exits nonzero: best-effort
+# sweep, not a fatal check.
+gate_cross_repo_branch_probe() {
+  local branch="$1" rig_json="$2" exclude="$3"
+  local name path sha
+  while IFS=$'\t' read -r name path; do
+    [ -z "$name" ] && continue
+    [ "$name" = "$exclude" ] && continue
+    [ -d "$path" ] || continue
+    if [ -d "$path/.repo.git" ]; then
+      sha=$(timeout 15 git --git-dir="$path/.repo.git" ls-remote --heads origin "$branch" 2>/dev/null \
+        | awk '{print $1}' | head -1) || true
+    else
+      sha=$(timeout 15 git -C "$path" ls-remote --heads origin "$branch" 2>/dev/null \
+        | awk '{print $1}' | head -1) || true
+    fi
+    [ -n "$sha" ] && printf '%s\t%s\t%s\n' "$name" "$path" "$sha"
+  done < <(printf '%s' "$rig_json" | jq -r '.rigs[]? | [(.name // ""), (.path // "")] | @tsv' 2>/dev/null || true)
+  return 0
+}
+
 # ── ga-jyox: FAIL-time assignee-clear decision (pure; selftest-sourceable) ──────
 # On a gate FAIL, the dispatcher used to unconditionally clear the bead's
 # assignee so the Pilot could re-dispatch a fixer. That is correct for an
@@ -6982,6 +7052,48 @@ fi
 # Verify branch exists on remote (ga-ljbx: hardened — a ref pointing at a missing
 # object yields EMPTY here, so we fail to gate-status:error, never proceed on garbage)
 BRANCH_SHA=$(rig_resolve_commit "origin/$BRANCH")
+
+# ga-6mir5: before treating an empty BRANCH_SHA as "branch absent from
+# origin," check whether $RIG itself was mis-resolved — sweep every OTHER
+# registered rig's origin for the same branch and self-correct on an
+# unambiguous single match. See gate_cross_repo_branch_probe (above, next to
+# gate_no_branch_probe_local) for why this class of mistake happens. Gated on
+# the same emptiness check the existing block below uses, so the fast/common
+# path (branch found where expected) never pays for the extra network calls.
+# SELFTEST-EXTRACT no-branch-cross-repo-rescue: BEGIN
+if [ -z "$BRANCH_SHA" ]; then
+  _XR_MATCHES=$(gate_cross_repo_branch_probe "$BRANCH" "$RIG_LIST_JSON" "$RIG")
+  _XR_COUNT=$(printf '%s\n' "$_XR_MATCHES" | grep -c . || true)
+  _XR_CLASS=$(gate_cross_repo_rescue_classify "$_XR_COUNT")
+  case "$_XR_CLASS" in
+    rescue)
+      _XR_OLD_RIG="$RIG"
+      _XR_NAME=$(printf '%s\n' "$_XR_MATCHES" | cut -f1)
+      RIG="$_XR_NAME"
+      if gate_resolve_rig_context; then
+        git_rig fetch origin 2>/dev/null || warn "  ga-6mir5: git fetch failed for corrected rig '$RIG' (continuing with stale refs)."
+        BRANCH_SHA=$(rig_resolve_commit "origin/$BRANCH")
+        if [ -n "$BRANCH_SHA" ]; then
+          err "  ga-6mir5: branch $BRANCH absent from '$_XR_OLD_RIG' origin but found on '$RIG' origin at $BRANCH_SHA — rig was mis-resolved, not the branch missing. Self-corrected; continuing gate run against '$RIG', NOT circuit-breaking."
+          bd -C "$GC_CITY" comment "$MARKER_ID" "ga-6mir5: marker resolved rig='$_XR_OLD_RIG', but branch '$BRANCH' was never there — found on '$RIG' origin at $BRANCH_SHA instead (the bead's own rig and its CODE rig differ, e.g. a framework/doctrine fix delivered outside the bead's rig). Gate run self-corrected and continues against '$RIG'. NOT circuit-broken." 2>/dev/null || true
+        else
+          warn "  ga-6mir5: rig corrected to '$RIG' but branch $BRANCH still unresolved there after fetch — reverting to '$_XR_OLD_RIG' and falling through to the standard no_branch handling."
+          RIG="$_XR_OLD_RIG"
+          gate_resolve_rig_context || true
+        fi
+      else
+        warn "  ga-6mir5: found rescue candidate '$_XR_NAME' but could not re-resolve its rig context — reverting to '$_XR_OLD_RIG' and falling through to the standard no_branch handling."
+        RIG="$_XR_OLD_RIG"
+      fi
+      ;;
+    ambiguous)
+      warn "  ga-6mir5: branch $BRANCH absent from '$RIG' origin AND found on $_XR_COUNT other rigs' origins (ambiguous — refusing to guess): $(printf '%s' "$_XR_MATCHES" | cut -f1 | tr '\n' ' ')"
+      ;;
+    not_found) : ;;  # genuinely nowhere else either — fall through unchanged below
+  esac
+fi
+# SELFTEST-EXTRACT no-branch-cross-repo-rescue: END
+
 if [ -z "$BRANCH_SHA" ]; then
   err "Branch '$BRANCH' not found on remote origin (or ref points at a missing object). Aborting."
 

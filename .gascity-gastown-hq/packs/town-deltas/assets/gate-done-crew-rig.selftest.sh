@@ -67,18 +67,33 @@ RIG_LIST_JSON='{"rigs":[
   {"name":"deacon","prefix":"dc","path":"/Users/athos/gt/deacon"}
 ]}'
 
+# GC_CITY_PATH the real town sets for every session (also used standalone by
+# section (P)/(Q) below) — defined here so derive_rig()'s call sites can pass
+# the realistic value from the start, exactly like production always does.
+GC_CITY_PATH_STUB="/Users/athos/gt/.gascity-gastown-hq"
+
 # ── Replicas of the corrected gate-done.md logic ──────────────────────────────
 # These MUST mirror the deployed command exactly; section (G) asserts the source
 # still defines the same structure so the test cannot silently diverge.
 
-# derive_rig <cwd> <bead_id> <gc_agent>
+# derive_rig <cwd> <bead_id> <gc_agent> <gc_city_path>
 derive_rig() {
-  local cwd="$1" bead_id="$2" gc_agent="$3" rig="" bpfx asfx
+  local cwd="$1" bead_id="$2" gc_agent="$3" gc_city_path="${4:-}" rig="" bpfx asfx
   # PRIMARY: rig whose path == cwd OR is an ANCESTOR of cwd (longest match).
   # ga-8a9n: .path bound to $p BEFORE the pipe — see (I) below for why.
   rig=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg cwd "$cwd" '
     [ .rigs[] | select(.path as $p | ($cwd == $p) or ($cwd | startswith($p + "/"))) ]
     | sort_by(.path | length) | last | .name // empty' 2>/dev/null || echo "")
+  # ga-6mir5 PRIMARY-continued: the check above can never match gascity from
+  # ANY cwd — its registered path (gc_city_path) has no .git of its own, so
+  # CWD_TOP is always the outer repo root, never equal to or a subdir of it.
+  # Catch the reverse containment explicitly: gc_city_path itself is cwd, or
+  # a tracked subdir of it.
+  if { [ -z "$rig" ] || [ "$rig" = "null" ]; } && [ -n "$gc_city_path" ] && [ -n "$cwd" ]; then
+    case "$gc_city_path" in
+      "$cwd"|"$cwd"/*) rig="gascity" ;;
+    esac
+  fi
   # FALLBACK 1: source-bead prefix → rig.
   if [ -z "$rig" ] || [ "$rig" = "null" ]; then
     bpfx="${bead_id%%-*}"
@@ -175,25 +190,25 @@ echo "  source: $GATE_DONE"
 echo
 
 # ── (A) crew clone subdir → owning rig ────────────────────────────────────────
-R=$(derive_rig "/Users/athos/gt/whatsapp_automation/crew/batista" "wa-27jn" "batista-wa")
+R=$(derive_rig "/Users/athos/gt/whatsapp_automation/crew/batista" "wa-27jn" "batista-wa" "$GC_CITY_PATH_STUB")
 [ "$R" = "whatsapp_automation" ] \
   && ok "(A) crew clone subdir cwd → whatsapp_automation (got: $R)" \
   || bad "(A) crew clone subdir cwd → expected whatsapp_automation, got: $R"
 
-R=$(derive_rig "/Users/athos/gt/property_scrapers/crew/batista" "ps-7a1z" "batista-ps")
+R=$(derive_rig "/Users/athos/gt/property_scrapers/crew/batista" "ps-7a1z" "batista-ps" "$GC_CITY_PATH_STUB")
 [ "$R" = "property_scrapers" ] \
   && ok "(A2) ps crew clone subdir → property_scrapers (got: $R)" \
   || bad "(A2) ps crew clone subdir → expected property_scrapers, got: $R"
 
 # ── (B) dog/HQ cwd → gascity ──────────────────────────────────────────────────
-R=$(derive_rig "/Users/athos/gt/.gascity-gastown-hq/.gc/agents/dogs/gastown.dog-2" "ga-owfll" "gastown.dog-2")
+R=$(derive_rig "/Users/athos/gt/.gascity-gastown-hq/.gc/agents/dogs/gastown.dog-2" "ga-owfll" "gastown.dog-2" "$GC_CITY_PATH_STUB")
 [ "$R" = "gascity" ] \
   && ok "(B) dog HQ subdir cwd → gascity (got: $R)" \
   || bad "(B) dog HQ subdir cwd → expected gascity, got: $R"
 
 # ── (C) fallback maps agent SUFFIX through rig list, never the raw agent name ──
 # cwd that matches NO rig path → must fall back; agent batista-wa → wa → whatsapp_automation.
-R=$(derive_rig "/tmp/detached-checkout" "" "batista-wa")
+R=$(derive_rig "/tmp/detached-checkout" "" "batista-wa" "$GC_CITY_PATH_STUB")
 [ "$R" = "whatsapp_automation" ] \
   && ok "(C) no-path-match + agent batista-wa → whatsapp_automation (got: $R)" \
   || bad "(C) agent-suffix fallback → expected whatsapp_automation, got: $R"
@@ -202,7 +217,7 @@ R=$(derive_rig "/tmp/detached-checkout" "" "batista-wa")
   || bad "(C2) RIG leaked the raw agent name 'batista-wa' (the ga-owfll bug)"
 
 # ── (D) fallback via source-bead prefix ───────────────────────────────────────
-R=$(derive_rig "/tmp/detached-checkout" "wa-27jn" "")
+R=$(derive_rig "/tmp/detached-checkout" "wa-27jn" "" "$GC_CITY_PATH_STUB")
 [ "$R" = "whatsapp_automation" ] \
   && ok "(D) bead prefix wa-27jn → whatsapp_automation (got: $R)" \
   || bad "(D) bead-prefix fallback → expected whatsapp_automation, got: $R"
@@ -304,7 +319,7 @@ I2_RC=$?
 # PRIMARY. This is the case ga-8a9n flagged as silently passing through
 # fallback before the fix, poisoned by the OTHER (non-matching) array elements
 # during array construction — exactly like the crew/HQ ancestor cases in (A)/(B).
-R=$(derive_rig "/Users/athos/gt/whatsapp_automation" "" "")
+R=$(derive_rig "/Users/athos/gt/whatsapp_automation" "" "" "$GC_CITY_PATH_STUB")
 [ "$R" = "whatsapp_automation" ] \
   && ok "(I3) exact-path match via PRIMARY alone, no fallback available → whatsapp_automation (got: $R)" \
   || bad "(I3) exact-path PRIMARY-only match → expected whatsapp_automation, got: $R"
@@ -891,6 +906,130 @@ if [ -f "$GATE_DONE" ]; then
     || bad "(Q3) gate-done.md's ga-ljbx pin missing the empty-GC_CITY_PATH guard (P6 regression)"
 else
   bad "(Q) gate-done.md not found at $GATE_DONE"
+fi
+
+# ── (R) ga-6mir5: PRIMARY-continued reverse-containment match for the HQ/self
+#    rig, so a framework fix delivered from the repo root (not from inside
+#    .gascity-gastown-hq) no longer falls through to the bead-id-prefix
+#    fallback and gets mis-resolved to the BEAD's rig instead of the CODE's.
+#
+# Root bug (ga-6mir5, real incident 13/08, wa-sowus): PRIMARY's containment
+# check only recognizes cwd being INSIDE a rig's registered path. gascity's
+# registered path (.gascity-gastown-hq) has no .git of its own, so it is
+# ALWAYS a subdirectory of the git toplevel, never the reverse — PRIMARY can
+# never match it from any cwd. A wa-* bead whose fix was pushed from the repo
+# root fell straight to the bead-prefix fallback (wa- → whatsapp_automation),
+# even though the branch lived on origin in the ROOT repo the whole time. The
+# gate then searched the wrong repo, found nothing, and permanently
+# circuit-broke the marker — telling the author their pushed, live work had
+# vanished. (The ga-6mir5 dispatcher-side cross-repo-rescue fix is a separate,
+# complementary safety net for when RIG is STILL wrong for some other reason;
+# this section covers preventing the wrong value in the first place.)
+
+# (R1) primary repro: cwd is the repo root itself (not inside
+# .gascity-gastown-hq), bead is wa-* — must resolve gascity, not
+# whatsapp_automation from the bead prefix.
+R=$(derive_rig "/Users/athos/gt" "wa-sowus" "mayor" "$GC_CITY_PATH_STUB")
+[ "$R" = "gascity" ] \
+  && ok "(R1) cwd=repo root, bead=wa-sowus → gascity, not the bead's own rig (got: $R)" \
+  || bad "(R1) repo-root cwd with wa-* bead → expected gascity, got: $R (ga-6mir5 regression)"
+
+# (R2) real-git-topology check: derive_rig's <cwd> parameter is always fed
+# CWD_TOP — the git toplevel, already normalized by `git rev-parse
+# --show-toplevel` — never a raw un-normalized pwd. (R1) only proves the
+# LOGIC is correct given that premise; this proves the premise itself: a
+# worker physically standing in packs/town-deltas/assets/ (the exact
+# directory the real wa-sowus incident's file lives in, and NOT itself
+# nested under .gascity-gastown-hq) computes the IDENTICAL CWD_TOP as one
+# standing at the bare repo root or inside .gascity-gastown-hq — because
+# none of those three locations has a .git of its own. Real git, not a
+# hardcoded string — this is exactly the fact that made PRIMARY permanently
+# blind to gascity (verified live, 2026-08-13).
+R2_TOP_ROOT=$(git -C "$TOWN_ROOT" rev-parse --show-toplevel 2>/dev/null || echo "")
+R2_TOP_HQ=$(git -C "$TOWN_ROOT/.gascity-gastown-hq" rev-parse --show-toplevel 2>/dev/null || echo "")
+R2_TOP_PACKS=$(git -C "$TOWN_ROOT/packs/town-deltas/assets" rev-parse --show-toplevel 2>/dev/null || echo "")
+if [ -n "$R2_TOP_ROOT" ] && [ "$R2_TOP_ROOT" = "$R2_TOP_HQ" ] && [ "$R2_TOP_ROOT" = "$R2_TOP_PACKS" ]; then
+  ok "(R2) real git: toplevel from repo-root/.gascity-gastown-hq/packs-town-deltas-assets all agree ($R2_TOP_ROOT) — CWD_TOP is invariant across the whole repo, confirming the premise this fix depends on"
+else
+  bad "(R2) real git: toplevel mismatch — root='$R2_TOP_ROOT' hq='$R2_TOP_HQ' packs='$R2_TOP_PACKS' (if these differ, ga-6mir5's fix no longer applies as designed)"
+fi
+
+# (R3) a ps-* bead shows the same shape (not wa-specific) — the CLASS is "any
+# bead prefix, code delivered at the repo root", not one rig's prefix.
+R=$(derive_rig "/Users/athos/gt" "ps-9k2m" "digo-ps" "$GC_CITY_PATH_STUB")
+[ "$R" = "gascity" ] \
+  && ok "(R3) cwd=repo root, bead=ps-9k2m → gascity, proving this is a CLASS fix, not wa-specific (got: $R)" \
+  || bad "(R3) repo-root cwd with ps-* bead → expected gascity, got: $R"
+
+# (R4) control: a bead resolved via the crew-clone ANCESTOR match (test A)
+# must be COMPLETELY unaffected — PRIMARY already found a real, more specific
+# match before this new check even runs.
+R=$(derive_rig "/Users/athos/gt/whatsapp_automation/crew/batista" "wa-27jn" "batista-wa" "$GC_CITY_PATH_STUB")
+[ "$R" = "whatsapp_automation" ] \
+  && ok "(R4) control: crew-clone PRIMARY match still wins, untouched by the new check (got: $R)" \
+  || bad "(R4) control: crew-clone match → expected whatsapp_automation, got: $R"
+
+# (R5) control: with NO gc_city_path supplied (simulates an unset
+# $GC_CITY_PATH), the new check must not fire at all — the same repo-root cwd
+# falls through to the bead-prefix fallback exactly as it did before this fix,
+# rather than crashing or silently mismatching.
+R=$(derive_rig "/Users/athos/gt" "wa-sowus" "mayor" "")
+[ "$R" = "whatsapp_automation" ] \
+  && ok "(R5) control: empty gc_city_path → new check inert, old (bead-prefix) behavior preserved (got: $R)" \
+  || bad "(R5) control: empty gc_city_path → expected old fallback behavior (whatsapp_automation), got: $R"
+
+# (R6) mutation guard: the ORIGINAL (pre-ga-6mir5) derive_rig — PRIMARY plus
+# the two fallbacks, no reverse-containment check — given the EXACT (R1) repro
+# inputs, DOES mis-resolve to whatsapp_automation. Proves (R1) would actually
+# catch a reversion, not just happen to pass either way.
+derive_rig_prebug() {
+  local cwd="$1" bead_id="$2" gc_agent="$3" rig="" bpfx asfx
+  rig=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg cwd "$cwd" '
+    [ .rigs[] | select(.path as $p | ($cwd == $p) or ($cwd | startswith($p + "/"))) ]
+    | sort_by(.path | length) | last | .name // empty' 2>/dev/null || echo "")
+  if [ -z "$rig" ] || [ "$rig" = "null" ]; then
+    bpfx="${bead_id%%-*}"
+    if [ -n "$bpfx" ] && [ "$bpfx" != "$bead_id" ]; then
+      rig=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg p "$bpfx" \
+        '.rigs[] | select(.prefix == $p or .name == $p) | .name' 2>/dev/null | head -1 || echo "")
+    fi
+  fi
+  if [ -z "$rig" ] || [ "$rig" = "null" ]; then
+    asfx="${gc_agent##*-}"
+    if [ -n "$asfx" ] && [ "$asfx" != "$gc_agent" ]; then
+      rig=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg p "$asfx" \
+        '.rigs[] | select(.prefix == $p or .name == $p) | .name' 2>/dev/null | head -1 || echo "")
+    fi
+  fi
+  [ -z "$rig" ] || [ "$rig" = "null" ] && rig="unknown"
+  printf '%s' "$rig"
+}
+R=$(derive_rig_prebug "/Users/athos/gt" "wa-sowus" "mayor")
+[ "$R" = "whatsapp_automation" ] \
+  && ok "(R6) mutation check: pre-fix derive_rig mis-resolves the (R1) repro to whatsapp_automation, reproducing ga-6mir5" \
+  || bad "(R6) mutation check: pre-fix replica unexpectedly resolved to '$R' — (R1) would not catch a reversion"
+
+# ── (S) ga-6mir5 source drift-guard: deployed gate-done.md contains the
+#    PRIMARY-continued reverse-containment check, positioned BEFORE FALLBACK 1
+#    (so it takes priority over the bead-prefix heuristic, not just patches
+#    around it after the fact).
+if [ -f "$GATE_DONE" ]; then
+  src=$(cat "$GATE_DONE")
+  printf '%s' "$src" | grep -qF 'ga-6mir5 PRIMARY-continued' \
+    && ok "(S1) gate-done.md has the ga-6mir5 PRIMARY-continued reverse-containment check" \
+    || bad "(S1) gate-done.md missing the ga-6mir5 fix (regression)"
+  printf '%s' "$src" | grep -qF '"$GC_CITY_PATH" in' \
+    && ok "(S2) gate-done.md's new check tests containment against \$GC_CITY_PATH" \
+    || bad "(S2) gate-done.md's ga-6mir5 check missing the \$GC_CITY_PATH case pattern"
+  new_check_line=$(printf '%s\n' "$src" | grep -nF 'ga-6mir5 PRIMARY-continued' | head -1 | cut -d: -f1)
+  fallback1_line=$(printf '%s\n' "$src" | grep -nF 'ga-owfll FALLBACK 1' | head -1 | cut -d: -f1)
+  if [ -n "$new_check_line" ] && [ -n "$fallback1_line" ] && [ "$new_check_line" -lt "$fallback1_line" ]; then
+    ok "(S3) gate-done.md's ga-6mir5 check runs BEFORE FALLBACK 1 (line $new_check_line < $fallback1_line)"
+  else
+    bad "(S3) gate-done.md's ga-6mir5 check does not precede FALLBACK 1 (new_check_line='$new_check_line' fallback1_line='$fallback1_line')"
+  fi
+else
+  bad "(S) gate-done.md not found at $GATE_DONE"
 fi
 
 echo

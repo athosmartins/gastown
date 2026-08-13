@@ -298,6 +298,42 @@ RIG=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg cwd "$CWD_TOP" '
     [ .rigs[] | select(.path as $p | ($cwd == $p) or ($cwd | startswith($p + "/"))) ]
     | sort_by(.path | length) | last | .name // empty' 2>/dev/null || echo "")
 
+# ga-6mir5 PRIMARY-continued: PRIMARY above can NEVER match the HQ/self rig
+# ("gascity"), for ANYONE, from ANY subdirectory. gascity's registered path
+# ($GC_CITY_PATH, e.g. .gascity-gastown-hq) is a tracked SUBDIR of the git
+# toplevel with no .git of its own — `git -C "$GC_CITY_PATH" rev-parse
+# --show-toplevel` resolves to the outer repo root, same as CWD_TOP itself
+# (confirmed live 2026-08-13). So PRIMARY's containment test (cwd == rig.path,
+# or cwd is a SUBDIR of rig.path) only ever sees this one relationship
+# backwards and silently falls through to the bead-prefix/agent-suffix
+# fallbacks below — every time, for every worker, regardless of branch name.
+# That is how wa-sowus (a doctrine fix pushed from the repo root, not from
+# inside .gascity-gastown-hq) got mis-resolved to rig=whatsapp_automation from
+# its `wa-` bead prefix even though the branch was live on origin the whole
+# time (root-caused live, see ga-6mir5). The ga-ljbx pin further below patches
+# the SAME gap but only for fix/* branches whose author happened to be
+# standing physically inside $GC_CITY_PATH itself — it does not cover a
+# worker standing at the repo root (or any other root-level path) editing a
+# framework file that lives outside that one subdir (packs/town-deltas/
+# assets/*, internal/*, docs/*, ...), which is the common case.
+#
+# Catch the missing direction directly: if the HQ rig's own registered path
+# is $CWD_TOP itself or a tracked subdir of it, we ARE in that repo, full
+# stop — regardless of branch name or exact subdirectory. This can only be
+# true for the one rig that shares its parent's .git; a genuinely separate
+# rig repo (whatsapp_automation, property_scrapers, ...) has its OWN .git, so
+# ITS toplevel is itself, never $CWD_TOP, and this never misfires for those.
+# Runs only when PRIMARY found nothing, so a real nested-rig match (crew
+# clones etc.) still takes priority untouched.
+if { [ -z "$RIG" ] || [ "$RIG" = "null" ]; } && [ -n "$GC_CITY_PATH" ] && [ -n "$CWD_TOP" ]; then
+  case "$GC_CITY_PATH" in
+    "$CWD_TOP"|"$CWD_TOP"/*)
+      echo "Note: cwd ($CWD_TOP) is the git toplevel containing the HQ rig path ($GC_CITY_PATH) — resolving rig=gascity."
+      RIG="gascity"
+      ;;
+  esac
+fi
+
 # ga-owfll FALLBACK 1: map the source bead's PREFIX to a rig (wa-27jn → wa →
 # whatsapp_automation). The bead id already encodes its owning rig.
 if [ -z "$RIG" ] || [ "$RIG" = "null" ]; then
