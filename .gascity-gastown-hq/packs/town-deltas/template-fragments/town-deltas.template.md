@@ -63,6 +63,41 @@ pro faturamento, pro risco ou pra prioridade?" — pergunte ISSO. Se você NÃO
 consegue traduzir a decisão em impacto de produto/negócio, então ela é puramente
 técnica e **não é dele: decida você.**
 
+### REGRA Nº 3 — pôr algo na fila do Athos SEM dizer o que ele faz é bug
+
+⭐ **MANDATO (Athos, 2026-08-13, verbatim):** *"sempre que algo estiver no meu campo,
+a bead no painel tem que deixar SUPER EVIDENTE o que eu preciso fazer"*.
+
+Vale para TODO bead que cai em 👤 **Sua vez** — `exec:manual` sem assignee,
+`next-action:athos*`, `blocked-reason:decision`, `story:needs-approval`. Chegar na
+fila dele **sem instrução** só troca "escondido em Travadas" por "visível e
+ilegível": ele abre, não entende, e pergunta — que é o custo que essas regras existem
+pra eliminar.
+
+**Obrigatório ao mandar algo pra ele:**
+1. **Escreva a AÇÃO, não o assunto.** Uma a três linhas, em produto: o que ele abre,
+   confere ou decide. "Confirmar no billing do Google que a chamada de metadata é
+   gratuita, e parar se não for" é ação. "Camada de Street View" é assunto.
+2. **Em campo ESTRUTURADO, não em prosa.** Prosa não é lida por automação — e o
+   painel decide coluna por `assignee`, não por texto. Medido em 13/08: `wa-fbwsb`
+   dizia "Dono: batista-ps" na última linha da descrição e mesmo assim caiu na fila
+   do Athos por 1 dia, porque o campo estava vazio.
+3. **Diga o efeito do botão.** Se a ação dele libera despacho, diga isso. "Marcar
+   executada" NÃO fecha a bead: remove `exec:manual`, o bead segue aberto e vai pra
+   ✅ Aprovadas, e o Pilot despacha.
+
+❌ **Não use `exec:manual` como "não despache automático".** São coisas diferentes:
+`exec:manual` significa *um humano executa à mão*. Se você quer só impedir despacho,
+use o veto próprio (`pilot:no-auto-dispatch`) **e** nomeie um assignee. `exec:manual`
+sem assignee é lido pelo painel como "o Athos faz" — medido em 13/08: dos 8
+`exec:manual` abertos, 4 estavam na fila dele e **3 não eram dele** (dois eram
+reframe de acoplamento no path on-device; um era do batista-ps).
+
+**Regra de ouro:** antes de deixar um bead ir pra Sua vez, leia o card como se fosse
+ele — sem contexto da tua sessão, sem ler código. Se você não consegue dizer em 10
+segundos o que fazer, **ele também não vai**, e o bead volta como pergunta.
+(Mecanismo do painel em `wa-sowus`; contrato de colunas na skill `wa-travadas`.)
+
 **Travou numa decisão técnica difícil?** O caminho NÃO é o Athos. É: (a) decidir
 com o tradeoff explícito e registrar no bead; (b) chamar o especialista do
 domínio (oracle/peter/mila/thies/batista conforme o rig); ou (c) mandar pro gate
