@@ -660,8 +660,12 @@ def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
                                  REFUSAL_ESCALATE_THRESHOLD it short-circuits straight to
                                  "escalate" ahead of the generic MAX_RECLAIMS thrash cap —
                                  repeated re-dispatch cannot out-argue an already-reasoned,
-                                 already-corroborated refusal. Defaults False: callers that
-                                 don't pass it keep the pre-fix behavior exactly.
+                                 already-corroborated refusal. ga-vu718: also short-circuits
+                                 ahead of has_live_session (see the ordering comment at the
+                                 escalate check itself for why) — deliberately NOT ahead of
+                                 has_recent_branch, which is left exactly as designed.
+                                 Defaults False: callers that don't pass it keep the pre-fix
+                                 behavior exactly.
         refusal_count:           current pilot:refusal-count:N from bead labels (int) — the
                                  number of PRIOR explicit refusals already recorded for this
                                  bead, NOT counting the one has_explicit_refusal signals for
@@ -682,8 +686,6 @@ def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
     # Defer the whole decision rather than reclaim; the next cycle re-evaluates.
     if account_rate_limited:
         return "noop"
-    if has_live_session:
-        return "noop"
     if has_recent_branch:
         return "noop"
 
@@ -693,8 +695,27 @@ def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
     # thrash cap (which exists for *unexplained* death, a different failure
     # class) so a bead never has to wait out a 3rd death-style reclaim when 2
     # refusals already answered the question definitively.
+    #
+    # ga-vu718: this check must run BEFORE has_live_session, not after it (as
+    # it did pre-fix). has_live_session answers "is this session still trying
+    # right now?" — but a session that has already posted an explicit refusal
+    # is, by definition, no longer trying; it told us so. The pre-fix ordering
+    # conflated the two questions: a session that stayed continuously "active"
+    # across 2 independent refusals (busy posting the refusal comment itself,
+    # or a pool slot whose session name is regenerated deterministically and
+    # so never reads as absent) made has_live_session return "noop" on every
+    # single guard poll, so this branch was never reached even after the
+    # refusal count crossed REFUSAL_ESCALATE_THRESHOLD — the one safety net
+    # meant to catch exactly that case silently never fired (3 corroborated
+    # live incidents). Deliberately NOT reordered relative to has_recent_branch
+    # above, which stays ahead of this check unchanged: a fresh commit is
+    # evidence of new work, unlike mere liveness, and no incident reports that
+    # guard misfiring the same way.
     if has_explicit_refusal and (refusal_count + 1) >= REFUSAL_ESCALATE_THRESHOLD:
         return "escalate"
+
+    if has_live_session:
+        return "noop"
 
     # Bead is stranded — enforce hysteresis (wait for continuous stranding).
     # gt-fppb0 fast-path: a PROVABLY-DEAD claimant (session absent / in a
@@ -4731,16 +4752,32 @@ def _selftest():
           "(a stale/historical counter must not retroactively trigger anything without a fresh signal)",
           _rd(has_explicit_refusal=False, refusal_count=5) == "noop")
 
-    # --- RF-4..8: every existing safety guard still outranks refusal-escalate ---
-    check("RF-4: 2nd refusal BUT has_live_session → noop (live builder guard wins)",
-          _rd(has_explicit_refusal=True, refusal_count=1, has_live_session=True) == "noop")
+    # --- RF-4 (REVISED by ga-vu718 — was "has_live_session wins"): a live
+    #     session no longer masks a refusal that has crossed the escalate
+    #     threshold; see the reclaim_decision() ordering comment for why. This
+    #     assertion is an intentional reversal of the pre-fix expectation, not
+    #     a silent overwrite — pre-fix this exact input produced "noop" (that
+    #     was the bug: a continuously-alive session could refuse forever
+    #     without ever tripping REFUSAL_ESCALATE_THRESHOLD; 3 corroborated
+    #     live incidents). RF-4b anchors AC3: the original live-builder
+    #     protection stays fully intact for a refusal that has NOT yet
+    #     crossed the threshold. RF-5..8: every OTHER existing safety guard
+    #     still outranks refusal-escalate, unchanged. ---
+    check("RF-4: 2nd refusal + has_live_session → escalate (ga-vu718: liveness no longer "
+          "masks an already-crossed refusal threshold; was 'noop' pre-fix)",
+          _rd(has_explicit_refusal=True, refusal_count=1, has_live_session=True) == "escalate")
+    check("RF-4b (ga-vu718 AC3 anchor): 1st refusal (not yet crossing threshold) + "
+          "has_live_session → still noop (original live-builder protection intact)",
+          _rd(has_explicit_refusal=True, refusal_count=0, has_live_session=True) == "noop")
     check("RF-5: 2nd refusal BUT has_needs_human → noop (park guard wins)",
           _rd(has_explicit_refusal=True, refusal_count=1, has_needs_human=True) == "noop")
     check("RF-6: 2nd refusal BUT has_dispatching_marker → noop (gate guard wins)",
           _rd(has_explicit_refusal=True, refusal_count=1, has_dispatching_marker=True) == "noop")
     check("RF-7: 2nd refusal BUT account_rate_limited → noop (ga-ufr7 guard wins)",
           _rd(has_explicit_refusal=True, refusal_count=1, account_rate_limited=True) == "noop")
-    check("RF-8: 2nd refusal BUT has_recent_branch → noop (branch rail wins)",
+    check("RF-8 (ga-vu718: deliberately UNCHANGED): 2nd refusal BUT has_recent_branch → "
+          "noop (branch rail still wins — a fresh commit is evidence of new work, unlike "
+          "mere liveness, and no incident reports this guard misfiring the same way)",
           _rd(has_explicit_refusal=True, refusal_count=1, has_recent_branch=True) == "noop")
 
     # --- RF-9: generic MAX_RECLAIMS cap still holds as a backstop even on a
