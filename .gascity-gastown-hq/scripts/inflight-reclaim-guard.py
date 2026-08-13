@@ -733,6 +733,50 @@ def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
     return "reclaim"
 
 
+def should_fetch_branch_for_reclaim(has_live_session, has_needs_human,
+                                     has_dispatching_marker, has_suspended_owner,
+                                     has_explicit_refusal, refusal_count):
+    """Whether a reclaim_decision() caller should pay for the (potentially
+    slow) branch-recency git fetch, vs. defaulting has_recent_branch to False
+    as a fast-path. Pure, no I/O — unit-testable, same pattern as
+    update_strand_clock below.
+
+    ga-vu718 gate-fix-2: run_cycle()'s has_live_session=True fast-path (skip
+    the fetch, default has_recent_branch=False) was provably safe pre-fix,
+    because reclaim_decision's has_live_session noop-check fired
+    unconditionally right after has_recent_branch was consulted — so a
+    defaulted-False value could never change the final outcome. Reordering
+    the refusal-escalate check ahead of has_live_session (ga-vu718's own fix)
+    broke that invariant for one sub-case: a live session that has ALSO just
+    crossed REFUSAL_ESCALATE_THRESHOLD now hits the escalate check BEFORE
+    has_live_session is even consulted, so a defaulted-False has_recent_branch
+    can wrongly escalate a bead that actually has a fresh commit — exactly
+    the false-escalation-during-active-work outcome the branch rail exists to
+    prevent. Extracted as its own function (not left inline in run_cycle)
+    specifically so a regression test can call it directly: GATE-FEEDBACK on
+    the first attempt at this bead noted run_cycle() itself is never invoked
+    by _selftest() (only its own def and main() reference it), so a bug in
+    exactly this wiring could hide behind an all-green selftest suite
+    indefinitely otherwise.
+
+    Mirrors reclaim_decision()'s own short-circuit order: has_needs_human /
+    has_dispatching_marker / has_suspended_owner always noop regardless of
+    has_recent_branch (checked first in reclaim_decision too, or handled
+    entirely outside it for has_suspended_owner), so the fetch stays skipped
+    for those unconditionally — unchanged from pre-fix behavior, deliberately
+    NOT touched by this gate-fix.
+    """
+    if has_needs_human or has_dispatching_marker or has_suspended_owner:
+        return False
+    if not has_live_session:
+        return True
+    would_cross_refusal_threshold = (
+        has_explicit_refusal
+        and (refusal_count + 1) >= REFUSAL_ESCALATE_THRESHOLD
+    )
+    return would_cross_refusal_threshold
+
+
 def update_strand_clock(bead_state, is_currently_stranded, assignee, now):
     """Update a bead's per-cycle strand clock in bead_state; return
     (seconds_stranded, event).  Mutates only the passed bead_state dict — no
@@ -3400,10 +3444,28 @@ def run_cycle(state, escalated_alerted):
         if not has_live_session and bead_id in live_sling_owner_beads:
             has_live_session = True
 
-        # Branch check is potentially slow (git fetch); only run when needed
+        # ga-be4x: explicit refusal is a label read — pure, cheap, and, unlike
+        # provably_dead, not scoped to bare-pool-zombie assignees. A worker's
+        # STATED conclusion is unambiguous regardless of what kind of assignee
+        # held the bead, so any assignee shape (bare pool, concrete adhoc, or a
+        # named crew) can carry and benefit from this signal. Computed here
+        # (ahead of has_recent_branch, moved up from its old spot further down)
+        # because should_fetch_branch_for_reclaim() below needs it.
+        has_explicit_refusal = _has_refusal_label(labels)
+        refusal_count = parse_refusal_count(labels)
+
+        # Branch check is potentially slow (git fetch); only run when needed.
+        # ga-vu718 gate-fix-2: see should_fetch_branch_for_reclaim()'s
+        # docstring for why has_live_session=True alone is no longer
+        # sufficient to skip this safely.
         has_recent_branch = False
-        if (not has_live_session and not has_needs_human
-                and not has_dispatching_marker and not has_suspended_owner):
+        if should_fetch_branch_for_reclaim(
+                has_live_session=has_live_session,
+                has_needs_human=has_needs_human,
+                has_dispatching_marker=has_dispatching_marker,
+                has_suspended_owner=has_suspended_owner,
+                has_explicit_refusal=has_explicit_refusal,
+                refusal_count=refusal_count):
             has_recent_branch = get_branch_recent(bead_id)
 
         # --- Update stranded timestamp in state ---
@@ -3442,13 +3504,9 @@ def run_cycle(state, escalated_alerted):
 
         reclaim_count = parse_reclaim_count(labels)
 
-        # ga-be4x: explicit refusal is a label read — pure, cheap, and, unlike
-        # provably_dead, not scoped to bare-pool-zombie assignees. A worker's
-        # STATED conclusion is unambiguous regardless of what kind of assignee
-        # held the bead, so any assignee shape (bare pool, concrete adhoc, or a
-        # named crew) can carry and benefit from this signal.
-        has_explicit_refusal = _has_refusal_label(labels)
-        refusal_count = parse_refusal_count(labels)
+        # has_explicit_refusal / refusal_count: computed earlier now (see the
+        # has_recent_branch block above) — ga-vu718 gate-fix-2 needs them
+        # ahead of that computation, not here.
 
         # ga-hkpwv: pool-zombie beads (bare template AND concrete adhoc forms) use
         # POOL_ZOMBIE_TTL (2h) instead of the standard RECLAIM_TTL (25min) — a longer
@@ -4779,6 +4837,78 @@ def _selftest():
           "noop (branch rail still wins — a fresh commit is evidence of new work, unlike "
           "mere liveness, and no incident reports this guard misfiring the same way)",
           _rd(has_explicit_refusal=True, refusal_count=1, has_recent_branch=True) == "noop")
+
+    # --- RFB-*: should_fetch_branch_for_reclaim() — the run_cycle CALLER-side
+    #     wiring bug from the first ga-vu718 gate attempt (gate_run=ga-qzciy).
+    #     RF-4 above proves reclaim_decision() itself has the right truth
+    #     table; it does NOT prove run_cycle() feeds it an accurate
+    #     has_recent_branch. The gate reviewer's exact finding: run_cycle
+    #     defaulted has_recent_branch=False whenever has_live_session=True (a
+    #     perf shortcut, skips a real git fetch) — safe pre-fix (has_live_session
+    #     always noop'd regardless), but NOT safe once escalate could fire
+    #     ahead of has_live_session for an already-crossed refusal, and
+    #     invisible to _selftest() because run_cycle() itself is never called
+    #     by it. These tests exercise the extracted decision function
+    #     directly, closing exactly that blind spot. ---
+    check("RFB-1 (GATE-FEEDBACK regression anchor): has_live_session=True AND refusal "
+          "about to cross threshold → MUST fetch (this is the exact scenario the gate "
+          "reviewer found: a pool-slot worker's 2nd refusal, still reading as live, "
+          "with a real recent commit the pre-fix shortcut would have hidden)",
+          should_fetch_branch_for_reclaim(
+              has_live_session=True, has_needs_human=False, has_dispatching_marker=False,
+              has_suspended_owner=False, has_explicit_refusal=True, refusal_count=1) is True)
+    check("RFB-2 (AC3 preserved): has_live_session=True AND 1st refusal (not yet crossing) "
+          "→ skip fetch (original fast-path unchanged — matches RF-4b's noop outcome)",
+          should_fetch_branch_for_reclaim(
+              has_live_session=True, has_needs_human=False, has_dispatching_marker=False,
+              has_suspended_owner=False, has_explicit_refusal=True, refusal_count=0) is False)
+    check("RFB-3: has_live_session=True AND no refusal at all → skip fetch (base case, "
+          "unaffected by this bug or its fix)",
+          should_fetch_branch_for_reclaim(
+              has_live_session=True, has_needs_human=False, has_dispatching_marker=False,
+              has_suspended_owner=False, has_explicit_refusal=False, refusal_count=0) is False)
+    check("RFB-4: has_live_session=False → always fetch regardless of refusal state "
+          "(pre-existing behavior, this fix must not touch the non-live path)",
+          should_fetch_branch_for_reclaim(
+              has_live_session=False, has_needs_human=False, has_dispatching_marker=False,
+              has_suspended_owner=False, has_explicit_refusal=False, refusal_count=0) is True)
+    check("RFB-5: has_needs_human=True wins even with a live session AND a crossing "
+          "refusal → skip fetch (park guard outranks everything, matches RF-5)",
+          should_fetch_branch_for_reclaim(
+              has_live_session=True, has_needs_human=True, has_dispatching_marker=False,
+              has_suspended_owner=False, has_explicit_refusal=True, refusal_count=1) is False)
+    check("RFB-6: has_dispatching_marker=True wins even with a live session AND a "
+          "crossing refusal → skip fetch (gate guard outranks everything, matches RF-6)",
+          should_fetch_branch_for_reclaim(
+              has_live_session=True, has_needs_human=False, has_dispatching_marker=True,
+              has_suspended_owner=False, has_explicit_refusal=True, refusal_count=1) is False)
+    check("RFB-7: has_suspended_owner=True wins even with a live session AND a crossing "
+          "refusal → skip fetch (suspended-owner HOLD outranks everything, pre-existing "
+          "guard this fix deliberately leaves untouched)",
+          should_fetch_branch_for_reclaim(
+              has_live_session=True, has_needs_human=False, has_dispatching_marker=False,
+              has_suspended_owner=True, has_explicit_refusal=True, refusal_count=1) is False)
+
+    # --- RFB-8: END-TO-END closure of the gate reviewer's concrete failure
+    #     scenario — ties RFB-1 (the caller decides to fetch) and RF-8 (the
+    #     pure function honors a True result) into one assertion under the
+    #     reviewer's own labeling, so a future reader can confirm the exact
+    #     cited scenario is covered without combining two other tests by
+    #     hand. Precondition asserted first: this only proves anything if
+    #     should_fetch_branch_for_reclaim actually decides to fetch for these
+    #     inputs (the first gate attempt's code always defaulted False here,
+    #     which is precisely what RFB-1 catches independently). ---
+    assert should_fetch_branch_for_reclaim(
+        has_live_session=True, has_needs_human=False, has_dispatching_marker=False,
+        has_suspended_owner=False, has_explicit_refusal=True, refusal_count=1) is True, (
+        "RFB-8 precondition failed: should_fetch_branch_for_reclaim must fetch here "
+        "(same inputs as RFB-1) or this test isn't exercising the real wiring")
+    check("RFB-8 (end-to-end GATE-FEEDBACK closure): live session, 2nd refusal, AND a "
+          "real recent commit the fetch would have found → noop, NOT escalate (the "
+          "'branch rail still wins' guarantee this diff promises, actually delivered "
+          "through the full run_cycle wiring, not just the pure function in isolation)",
+          _rd(has_explicit_refusal=True, refusal_count=1, has_live_session=True,
+              has_recent_branch=True) == "noop")
 
     # --- RF-9: generic MAX_RECLAIMS cap still holds as a backstop even on a
     #     bead's FIRST refusal (defense-in-depth: refusal and unexplained-death
