@@ -80,18 +80,24 @@ pra eliminar.
    gratuita, e parar se não for" é ação. "Camada de Street View" é assunto.
 2. **Em campo ESTRUTURADO, não em prosa.** Prosa não é lida por automação — e o
    painel decide coluna por `assignee`, não por texto. Medido em 13/08: `wa-fbwsb`
-   dizia "Dono: batista-ps" na última linha da descrição e mesmo assim caiu na fila
-   do Athos por 1 dia, porque o campo estava vazio.
+   dizia "Dono: batista-ps" na última linha da descrição **e** tinha o label
+   `next-action:batista-constroi` — e mesmo assim caiu na fila do Athos, porque o
+   campo `assignee` estava vazio. O executor estava escrito em dois lugares que o
+   painel não lê.
 3. **Diga o efeito do botão.** Se a ação dele libera despacho, diga isso. "Marcar
-   executada" NÃO fecha a bead: remove `exec:manual`, o bead segue aberto e vai pra
-   ✅ Aprovadas, e o Pilot despacha.
+   executada" NÃO fecha a bead: remove `exec:manual` e o bead segue ABERTO, indo
+   pra ✅ Aprovadas (bug/chore/task caem lá direto, ga-uc0px). ⚠️ Ir pra Aprovadas
+   **não** garante despacho: o Pilot só pega com `gc.routed_to` preenchido — sem
+   ele o bead fica parado lá, em silêncio.
 
 ❌ **Não use `exec:manual` como "não despache automático".** São coisas diferentes:
 `exec:manual` significa *um humano executa à mão*. Se você quer só impedir despacho,
 use o veto próprio (`pilot:no-auto-dispatch`) **e** nomeie um assignee. `exec:manual`
 sem assignee é lido pelo painel como "o Athos faz" — medido em 13/08: dos 8
-`exec:manual` abertos, 4 estavam na fila dele e **3 não eram dele** (dois eram
-reframe de acoplamento no path on-device; um era do batista-ps).
+`exec:manual` abertos, **4 estavam sem assignee** e por isso caíram na fila dele;
+**desses 4, três não eram dele** (dois eram reframe de acoplamento no path
+on-device; um era do batista-ps). Os outros 4 tinham assignee e nunca entraram na
+fila do Athos.
 
 **Regra de ouro:** antes de deixar um bead ir pra Sua vez, leia o card como se fosse
 ele — sem contexto da tua sessão, sem ler código. Se você não consegue dizer em 10
