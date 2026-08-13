@@ -212,17 +212,43 @@ de um molecule, rode `bd mol current <root-bead-id>` antes de redigitar
 qualquer trabalho — o step pode já estar feito, faltando só fechar o
 bead.
 
-**Bead pede rebuild+swap do engine gascity? Refuse, não construa
-(pool:refused:engine-rebuild-required — ga-vhyd).** Go build + swap de
-binário + town bounce é Mayor-coordenado, por doutrina (alto blast radius:
-é o binário compartilhado que TODOS os agentes rodam) — nenhum worker de
-pool (dog, wa-worker, ps-worker) faz isso sozinho, mesmo com o source local
-buildable. Sinal no título/body do bead: "engine rebuild", "rebuild...
+**Bead pede rebuild+swap do engine gascity? ESCREVA o patch, mas NÃO faça o
+build+swap (pool:refused:engine-rebuild-required — ga-vhyd, escopo corrigido
+2026-08-13).** Go build + swap de binário + town bounce é Mayor-coordenado,
+por doutrina (alto blast radius: é o binário compartilhado que TODOS os
+agentes rodam) — nenhum worker de pool (dog, wa-worker, ps-worker) faz isso
+sozinho, mesmo com o source local buildable.
+
+⚠️ **O QUE É PROIBIDO É O DEPLOY, NÃO O CONSERTO.** Esta regra dizia "Refuse,
+não construa", sem separar as duas coisas — e o efeito medido (Mayor,
+2026-08-13, triagem da Travadas) foi bead de engine congelando por **8 a 27
+dias** sem ninguém escrever uma linha: ga-66wc (27d), ga-okcgb (P1, 8d),
+ga-gye3f, ga-f6igb, ga-vu718. Escrever o patch NÃO tem blast radius nenhum —
+quem tem é o build+swap. Congelar o conserto junto com o deploy é guarda
+larga demais, e o custo é backlog parado indefinidamente.
+
+**O caminho certo, que já é padrão provado nesta cidade** (7 patches vivos em
+`docs/pending-engine-window/`, dos quais 2 entraram na janela de 2026-08-13):
+1. **Escreva o fix** no source do engine e **valide** (teste que REPROVA no
+   HEAD anterior — não basta passar depois).
+2. **Gere o patch e commite ele** em `docs/pending-engine-window/<bead>-<slug>.patch`
+   (`git -C <src> diff > …`). O patch é versionado; a árvore do engine carrega
+   mudança não-commitada por desenho, então patch fora dela é o que sobrevive.
+3. **Verifique que aplica limpo**: `git -C <src> apply --check <patch>`. Se já
+   estiver na árvore, `--check --reverse` passa — diga isso no comentário.
+4. **NÃO** rode `go build`, **NÃO** troque symlink, **NÃO** faça kickstart do
+   supervisor. Aí sim aplique o label e devolva pro Mayor agendar a janela.
+5. No comentário do bead, diga o caminho do patch e o que ele entrega.
+
+Só use o refuse SEM patch quando o bead pedir literalmente o ato de deploy
+(ex.: "rodar a janela", "trocar o binário") e não haja conserto a escrever.
+
+Sinal no título/body do bead: "engine rebuild", "rebuild...
 gascity"/"gascity...rebuild", "swap...binário"/"binary swap", "town bounce",
 "engine window", ou label `framework:engine`. O Pilot já filtra a maioria
 disso na origem (`_filter_candidates` em pilot-dispatcher.sh), mas se um
 bead desses passar e você já tiver claimado — precedente real: dog-ga5tiy em
-ga-g7yt — refuse explicitamente em vez de só silenciar ou tentar construir:
+ga-g7yt — refuse explicitamente em vez de só silenciar ou tentar buildar:
 ```bash
 bd label add <id> pool:refused:engine-rebuild-required
 bd comment <id> "Refusing: <motivo — o que o bead precisa que este worker não faz>."
