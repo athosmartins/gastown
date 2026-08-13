@@ -5996,10 +5996,36 @@ if [ "$REVIEWER_SESSION_COUNT" -gt 0 ]; then
       # janitor owns reaping); we only EXCLUDE it from the headroom denominator,
       # which is the safe, headroom-calc-only fix — peek reads slow-alive as
       # alive, so a transient glitch can never under-count live reviewers.
+      # ga-wcd86: session_peek_reports_dead's "session not found" signal is
+      # IDENTICAL for a truly-drained session and one still inside its ~210s
+      # deferred-start boot window (ga-flfo) — a freshly-(re)spawned reviewer
+      # peeked at age=0m reads "gone" here even though it never ran. This
+      # block had no lower-bound grace before this fix, unlike Step 7b's ACK
+      # path (ga-xwdl) which already pairs the identical peek signal with
+      # session_is_booting + RECONVENE_GRACE_SECS for exactly this reason.
+      # Mirror that guard: only trust "peek says gone" as a real drain once
+      # the session is not currently booting (state!="creating") AND has been
+      # alive at least RECONVENE_GRACE_SECS seconds — otherwise a newborn
+      # reviewer gets excluded from LIVE_REVIEWERS (inflating apparent
+      # headroom in the wrong direction) and then sits idle for its whole
+      # life, since nothing else ever reconsiders an excluded-but-alive
+      # session (observed live: reviewer drained from headroom at age=0m,
+      # still idle 15+ minutes and several sweeps later).
       _R_PEEK_ERR=$(gc --city "$GC_CITY" session peek "$R_ID" --lines 1 2>&1 >/dev/null || true)
+      R_AGE_SECONDS=$(( NOW_EPOCH_R - R_EPOCH ))
+      R_BOOTING=$(session_is_booting "$R_STATE")
       if [ "$(session_peek_reports_dead "$_R_PEEK_ERR")" = "1" ]; then
-        log "Drained gate-reviewer session $R_ID (state=$R_STATE age=${R_AGE_MINUTES}m < TTL but peek reports session-gone) — excluding from headroom LIVE_REVIEWERS (gt-bewtm)."
-        DRAINED_REVIEWERS=$((DRAINED_REVIEWERS + 1))
+        if [ "$R_BOOTING" != "1" ] && [ "$R_AGE_SECONDS" -ge "$RECONVENE_GRACE_SECS" ]; then
+          log "Drained gate-reviewer session $R_ID (state=$R_STATE age=${R_AGE_MINUTES}m < TTL but peek reports session-gone) — excluding from headroom LIVE_REVIEWERS (gt-bewtm)."
+          DRAINED_REVIEWERS=$((DRAINED_REVIEWERS + 1))
+        else
+          # ga-wcd86: state the facts (booting flag, age, grace) rather than
+          # asserting a specific "age < grace" inequality — booting=1 alone
+          # can suppress exclusion even when age has already passed grace
+          # (a wedged boot, state stays "creating" past RECONVENE_GRACE_SECS),
+          # and a log line claiming "age < grace" would be false in that case.
+          log "Gate-reviewer session $R_ID (state=$R_STATE age=${R_AGE_MINUTES}m) peek reports session-gone but NOT excluded from headroom (ga-wcd86): booting=$R_BOOTING age=${R_AGE_SECONDS}s vs RECONVENE_GRACE_SECS=${RECONVENE_GRACE_SECS}s."
+        fi
       fi
     fi
   done
@@ -6188,11 +6214,13 @@ fi
 LIVE_REVIEWERS=$(headroom_live_reviewers "${REVIEWER_SESSION_COUNT:-0}" "${REAPED_REVIEWERS:-0}" "${DRAINED_REVIEWERS:-0}")
 
 # ── ga-309v3: burst-aware correction — DO NOT REMOVE ──────────────────────────
-# Step 0a-2's drained-exclusion calls session_peek_reports_dead with no booting
-# guard, and `gc session peek` reports "session not found" for BOTH a drained
-# session AND one still inside its ~210s deferred-start window (ga-flfo/ga-xwdl;
-# the ACK path at Step 7b pairs that probe with session_is_booting +
-# RECONVENE_GRACE_SECS for exactly this reason, this one does not).
+# Step 0a-2's drained-exclusion USED TO call session_peek_reports_dead with no
+# booting guard, and `gc session peek` reports "session not found" for BOTH a
+# drained session AND one still inside its ~210s deferred-start window
+# (ga-flfo/ga-xwdl; the ACK path at Step 7b pairs that probe with
+# session_is_booting + RECONVENE_GRACE_SECS for exactly this reason — UPDATE
+# ga-wcd86: Step 0a-2 now does too, closing this gap at the source instead of
+# only compensating for it here).
 #
 # A continuation round runs ~30-120s after the previous round called
 # `gc session new` — squarely inside that window. Its reviewers are still
@@ -6218,6 +6246,16 @@ if [ "${GATE_ADMITS_DONE:-0}" -gt 0 ] 2>/dev/null; then
   LIVE_REVIEWERS=$(( LIVE_REVIEWERS + _burst_admitted ))
   log "Multi-admit round ${GATE_ADMIT_ROUND} (${GATE_ADMITS_DONE} admit(s) so far): +${_burst_admitted} reviewer(s) added back to LIVE_REVIEWERS=${LIVE_REVIEWERS} — this burst's own spawns can still be inside the ~210s boot window and read as drained (ga-309v3/ga-991au)."
 fi
+# ga-wcd86 follow-up: now that Step 0a-2 has its own boot-grace guard (above),
+# a continuation round's own just-spawned reviewers are usually no longer
+# wrongly drained in the first place, which makes this add-back a frequent
+# no-op — or, when it does fire, an over-count on top of an already-correct
+# LIVE_REVIEWERS. Not a new hazard (the reasoning above already treats
+# over-counting as the safe direction), just possibly now-redundant. Whether
+# to shrink or retire it is tracked separately (ga-pqbn0) rather than folded
+# in here — it needs its own test coverage of the multi-admit burst path,
+# out of scope for ga-wcd86's fix to Step 0a-2 itself. DO NOT REMOVE this
+# block to "fix" that without ga-pqbn0's own evidence and non-regression pass.
 
 # ── Step 0b: Find a queued marker ────────────────────────────────────────────
 # quality-gate-guard.sh claims, validates, derives author, and parks markers as
