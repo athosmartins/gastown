@@ -6213,49 +6213,60 @@ fi
 # full (the 2026-06-12 town-wide deadlock).
 LIVE_REVIEWERS=$(headroom_live_reviewers "${REVIEWER_SESSION_COUNT:-0}" "${REAPED_REVIEWERS:-0}" "${DRAINED_REVIEWERS:-0}")
 
-# ── ga-309v3: burst-aware correction — DO NOT REMOVE ──────────────────────────
-# Step 0a-2's drained-exclusion USED TO call session_peek_reports_dead with no
-# booting guard, and `gc session peek` reports "session not found" for BOTH a
-# drained session AND one still inside its ~210s deferred-start window
-# (ga-flfo/ga-xwdl; the ACK path at Step 7b pairs that probe with
-# session_is_booting + RECONVENE_GRACE_SECS for exactly this reason — UPDATE
-# ga-wcd86: Step 0a-2 now does too, closing this gap at the source instead of
-# only compensating for it here).
+# ── ga-309v3/ga-pqbn0: burst-aware correction — RETIRED (superseded by ga-wcd86) ──
+# HISTORY: Step 0a-2's drained-exclusion used to call session_peek_reports_dead
+# with no booting guard, and `gc session peek` reports "session not found" for
+# BOTH a drained session AND one still inside its ~210s deferred-start window
+# (ga-flfo/ga-xwdl; the ACK path at Step 7b paired that probe with
+# session_is_booting + RECONVENE_GRACE_SECS for exactly this reason — Step
+# 0a-2 did not, yet). A continuation round runs ~30-120s after the previous
+# round called `gc session new` — squarely inside that window — so its own
+# reviewers, still state=creating, got counted as DRAINED and subtracted:
+# LIVE_REVIEWERS read 0 with a genuinely full plane, turning the multi-admit
+# burst into an UNBRAKED loop (the 2026-06-12 town-wide deadlock). ga-309v3
+# added the block that WAS here to compensate FROM OUTSIDE Step 0a-2: add
+# back `admits-so-far * reviewers-per-run`, deliberately erring toward
+# over-counting (safe direction — gate_headroom_decision is monotonic in
+# inflight, so a higher LIVE_REVIEWERS only ever defers earlier, never causes
+# an incorrect admit; ga-991au then fixed the block to charge ADMITS, not
+# rounds, so a skip round could not invent a phantom reviewer).
 #
-# A continuation round runs ~30-120s after the previous round called
-# `gc session new` — squarely inside that window. Its reviewers are still
-# state=creating, get counted as DRAINED and subtracted, so LIVE_REVIEWERS reads
-# 0 and the headroom gate believes the plane is empty. That turns the multi-admit
-# burst into an UNBRAKED loop: on a genuinely hot Dolt the `dolt-hot-floor`
-# in-flight==0 branch flips defer into admit on every round, and on the calm path
-# a burst starting near the cap can push past the gate-reviewer template's
-# max_active_sessions (the ga-zl277 vicious cycle, where the gate can no longer
-# spawn reviewers at all).
+# ga-wcd86 fixed the root cause AT Step 0a-2 itself (see the R_BOOTING check
+# above): state=creating now protects a reviewer from exclusion
+# UNCONDITIONALLY (any age), and RECONVENE_GRACE_SECS (360s deployed)
+# independently protects any peek-says-gone reviewer younger than that
+# regardless of state. A continuation round's own spawns, at ~30-120s old
+# per ga-309v3's own timing model above, are always caught by one of those
+# two conjuncts — so by the time this block used to run, Step 0a-2 had
+# ALREADY counted them correctly. The add-back was therefore firing on an
+# already-correct LIVE_REVIEWERS and double-counting every one of the
+# burst's own prior admits.
 #
-# Each prior round of THIS burst admitted exactly one run, so add back what those
-# rounds spawned. Over-counting (when the probe DOES see them) is the safe
-# direction — it defers earlier — whereas under-counting is what removes the
-# brake. This corrects the burst's own blind spot without touching the
-# pre-existing probe, which is a separate fix on its own bead.
-# ga-991au: charge the add-back to ADMITS, not rounds. A skip round spawned
-# nothing; counting it would invent a reviewer that does not exist and, on the
-# hot path, flip the ga-q4gqq dolt-hot-floor (which admits only at inflight==0)
-# from admit to defer — killing the burst in the exact degraded state it is for.
+# ga-pqbn0 measured this against the actually-deployed knobs
+# (GATE_CODE_REVIEWERS=1 -> GATE_REVIEWERS_PER_RUN=1, GATE_MAX_ADMITS_PER_SWEEP=3):
+# by round 2 of a 3-admit burst the phantom add-back reached +2 against a
+# GATE_MAX_REVIEWERS=6 ceiling — 33% of the ENTIRE calm-path headroom budget —
+# actively defeating ga-309v3's own throughput goal by deferring bursts that
+# had real spare capacity. Evidence, mutation test (proving correctness now
+# depends on Step 0a-2's ga-wcd86 guard staying wired — drift-guarded there),
+# and non-regression coverage for the original 2026-06-12 scenario all live in
+# gate-burst-addback-retire.selftest.sh — a real multi-round burst driven
+# through the REAL session_is_booting/session_peek_reports_dead/
+# headroom_live_reviewers, no live gc/Dolt required. Independently
+# adversarially reviewed before implementation (2026-08-13).
+#
+# The diagnostic below is a permanent, zero-cost MEASUREMENT, not a behavior
+# change: it logs what the retired formula would have contributed this round
+# (never applied to LIVE_REVIEWERS), so a live sweep produces its own
+# "Measured" evidence trail alongside the simulated one, matching this file's
+# own culture (ga-flfo, gt-bewtm, etc.) of leaving a real-world number rather
+# than a bare assertion. If this number is ever consistently large in
+# production, that is a signal the redundancy conclusion above needs
+# revisiting — file a fresh bead rather than reverting this comment blind.
 if [ "${GATE_ADMITS_DONE:-0}" -gt 0 ] 2>/dev/null; then
-  _burst_admitted=$(( GATE_ADMITS_DONE * GATE_REVIEWERS_PER_RUN ))
-  LIVE_REVIEWERS=$(( LIVE_REVIEWERS + _burst_admitted ))
-  log "Multi-admit round ${GATE_ADMIT_ROUND} (${GATE_ADMITS_DONE} admit(s) so far): +${_burst_admitted} reviewer(s) added back to LIVE_REVIEWERS=${LIVE_REVIEWERS} — this burst's own spawns can still be inside the ~210s boot window and read as drained (ga-309v3/ga-991au)."
+  _would_be_added=$(( GATE_ADMITS_DONE * GATE_REVIEWERS_PER_RUN ))
+  log "Multi-admit round ${GATE_ADMIT_ROUND} (${GATE_ADMITS_DONE} admit(s) so far): retired ga-309v3 add-back would have contributed +${_would_be_added} on top of LIVE_REVIEWERS=${LIVE_REVIEWERS} (not applied — ga-pqbn0: Step 0a-2's ga-wcd86 guard already counts this burst's own spawns correctly)."
 fi
-# ga-wcd86 follow-up: now that Step 0a-2 has its own boot-grace guard (above),
-# a continuation round's own just-spawned reviewers are usually no longer
-# wrongly drained in the first place, which makes this add-back a frequent
-# no-op — or, when it does fire, an over-count on top of an already-correct
-# LIVE_REVIEWERS. Not a new hazard (the reasoning above already treats
-# over-counting as the safe direction), just possibly now-redundant. Whether
-# to shrink or retire it is tracked separately (ga-pqbn0) rather than folded
-# in here — it needs its own test coverage of the multi-admit burst path,
-# out of scope for ga-wcd86's fix to Step 0a-2 itself. DO NOT REMOVE this
-# block to "fix" that without ga-pqbn0's own evidence and non-regression pass.
 
 # ── Step 0b: Find a queued marker ────────────────────────────────────────────
 # quality-gate-guard.sh claims, validates, derives author, and parks markers as

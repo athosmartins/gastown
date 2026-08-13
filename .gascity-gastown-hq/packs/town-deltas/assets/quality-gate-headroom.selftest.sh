@@ -606,20 +606,35 @@ _t309b="$TMPDIR_309/b1"; mkdir -p "$_t309b" 2>/dev/null
 ) && ok "ga-309v3 BLOCKER-1: a GENUINE continuation (exec preserves \$\$) is still accepted — burst does not deadlock on itself" \
   || bad "ga-309v3 BLOCKER-1: genuine continuation REJECTED — every burst would re-acquire and yield, silently disabling multi-admit"
 
-# BLOCKER 2 — the burst must add back its own spawns before the headroom probe.
-# Step 0a-2's drained-exclusion has no booting guard, so a round's own reviewers
-# (still inside the ~210s deferred-start window) read as drained and LIVE_REVIEWERS
-# collapses to 0 — leaving the burst with NO brake at all.
-has "$DISPATCHER" 'GATE_ADMITS_DONE \* GATE_REVIEWERS_PER_RUN' \
-  "ga-309v3 BLOCKER-2: prior ADMITS' spawns are added back into LIVE_REVIEWERS (ga-991au: skips must not count)"
-_L309_LR=$(grep -n '^LIVE_REVIEWERS=\$(headroom_live_reviewers' "$DISPATCHER" | tail -1 | cut -d: -f1 || true)
-_L309_ADD=$(grep -n 'GATE_ADMITS_DONE \* GATE_REVIEWERS_PER_RUN' "$DISPATCHER" | tail -1 | cut -d: -f1 || true)
-_L309_USE=$(grep -n '"\$HR_QLIM" "\$LIVE_REVIEWERS"' "$DISPATCHER" | tail -1 | cut -d: -f1 || true)
-if [ -n "$_L309_LR" ] && [ -n "$_L309_ADD" ] && [ -n "$_L309_USE" ] \
-   && [ "$_L309_LR" -lt "$_L309_ADD" ] && [ "$_L309_ADD" -lt "$_L309_USE" ]; then
-  ok "ga-309v3 BLOCKER-2: correction applied AFTER the count (L$_L309_LR->L$_L309_ADD) and BEFORE the headroom decision (L$_L309_USE)"
+# BLOCKER 2 (RETIRED 2026-08-13, ga-pqbn0) — the burst used to need to add
+# back its own spawns before the headroom probe, because Step 0a-2's
+# drained-exclusion had no booting guard: a round's own reviewers (still
+# inside the ~210s deferred-start window) read as drained and LIVE_REVIEWERS
+# collapsed to 0 — leaving the burst with NO brake at all (the 2026-06-12
+# town-wide deadlock).
+#
+# ga-wcd86 closed that gap AT Step 0a-2 itself (session_is_booting +
+# RECONVENE_GRACE_SECS, mirroring Step 7b's ACK path) — a continuation
+# round's own spawns are now counted correctly WITHOUT any outside
+# correction. ga-pqbn0 measured (real multi-round burst simulation, a
+# mutation test, and non-regression coverage for this exact 2026-06-12
+# scenario — see gate-burst-addback-retire.selftest.sh) that applying the
+# OLD add-back on top now DOUBLE-counts every prior admit: +2 against a
+# GATE_MAX_REVIEWERS=6 ceiling (33%) by round 2 of the deployed 3-admit
+# burst. The arithmetic is retired to a log-only diagnostic (still present,
+# just never applied to LIVE_REVIEWERS) — this assertion now protects the
+# NEW invariant instead of the old one.
+if grep -qE '^\s*LIVE_REVIEWERS=\$\(\(\s*LIVE_REVIEWERS\s*\+\s*_(burst_admitted|would_be_added)\s*\)\)' "$DISPATCHER"; then
+  bad "ga-309v3/ga-pqbn0: the retired add-back is STILL applied to LIVE_REVIEWERS — reintroduces the double-count ga-pqbn0 measured (see gate-burst-addback-retire.selftest.sh)"
 else
-  bad "ga-309v3 BLOCKER-2: ordering broken (count=$_L309_LR add=$_L309_ADD decide=$_L309_USE) — the burst would run unbraked"
+  ok "ga-309v3/ga-pqbn0: the add-back no longer mutates LIVE_REVIEWERS (retired to a log-only diagnostic)"
+fi
+has "$DISPATCHER" 'R_BOOTING=\$\(session_is_booting "\$R_STATE"\)' \
+  "ga-pqbn0: Step 0a-2's boot-grace guard (the SOLE remaining protection against the 2026-06-12 scenario) is still wired"
+if [ -f "$SELF_DIR/gate-burst-addback-retire.selftest.sh" ]; then
+  ok "ga-pqbn0: gate-burst-addback-retire.selftest.sh (the evidence + mutation test + non-regression coverage for this retirement) is present"
+else
+  bad "ga-pqbn0: gate-burst-addback-retire.selftest.sh is MISSING — the retirement's evidence trail is gone"
 fi
 
 # Bound hygiene (adversarial MINORs): upper clamp + octal safety.
@@ -795,13 +810,17 @@ else
   ok "ga-991au BLOCKER-B: no exec forwards \"\$@\" (script takes no arguments)"
 fi
 
-# Counter split: admits and rounds are different things now.
+# Counter split: admits and rounds are different things now. (ga-pqbn0: the
+# add-back this formula used to feed LIVE_REVIEWERS with is retired to a
+# log-only diagnostic — see the BLOCKER-2 block above — but the formula
+# itself survives AS that diagnostic, so this guard still matters: a wrong
+# diagnostic would be a misleading measurement, not just a redundant one.)
 has "$DISPATCHER" 'GATE_ADMITS_DONE \* GATE_REVIEWERS_PER_RUN' \
-  "ga-991au: the LIVE_REVIEWERS add-back is charged to real ADMITS, not to rounds"
+  "ga-991au/ga-pqbn0: the (now log-only) formula is still charged to real ADMITS, not to rounds"
 if grep -vE '^\s*#' "$DISPATCHER" | grep -q 'GATE_ADMIT_ROUND \* GATE_REVIEWERS_PER_RUN'; then
-  bad "ga-991au: add-back still multiplies by GATE_ADMIT_ROUND — a skip round would invent a phantom reviewer and flip the dolt-hot floor from admit to defer"
+  bad "ga-991au: diagnostic formula multiplies by GATE_ADMIT_ROUND — a skip round would invent a phantom reviewer in the measurement"
 else
-  ok "ga-991au: no phantom reviewers — skip rounds contribute nothing to the add-back"
+  ok "ga-991au: no phantom reviewers — skip rounds contribute nothing to the diagnostic"
 fi
 has "$DISPATCHER" 'GATE_MAX_ROUNDS_PER_SWEEP="\$\{GATE_MAX_ROUNDS_PER_SWEEP:-6\}"' \
   "ga-991au: total-round budget is separate from the admission cap"
