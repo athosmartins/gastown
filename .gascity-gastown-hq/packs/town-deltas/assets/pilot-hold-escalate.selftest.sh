@@ -331,6 +331,27 @@ fi
 echo "Scenario I5: drift-guard — the AC3 skip is wired into _pilot_hold_or_escalate"
 echo "$HOLD_FN" | grep -q 'pilot:no-auto-dispatch' && ok "_pilot_hold_or_escalate carries the pilot:no-auto-dispatch skip clause" || bad "pilot:no-auto-dispatch skip clause missing from _pilot_hold_or_escalate"
 
+# ── Scenario I6 (ga-rfpm9): bare "no-auto-dispatch" (no pilot: prefix) is a
+# DIFFERENT string this function's AC3 skip never recognized pre-fix — same
+# bare-label gap already fixed in _filter_candidates (pilot-dispatcher.selftest.sh
+# Scenario ga-rfpm9) and context_check_is_parked (context-check-dispatcher.
+# selftest.sh). Mirrors Scenario I exactly, bare label only.
+echo "Scenario I6 (ga-rfpm9): bare no-auto-dispatch bead ALSO skips hold/escalation entirely — no stamp, no mail, no comment"
+run_hold "db1" "bd-parked-bare" "ga-lfvs6" "no idle crew" "map a crew" '["no-auto-dispatch"]' 3 0
+if has_call "already parked by explicit decision"; then
+  ok "bare no-auto-dispatch also logs the skip reason (ga-rfpm9)"
+else
+  bad "REGRESSION: bare no-auto-dispatch did not skip (dump: $(cat "$CALLS" | tr '\n' '|'))"
+fi
+if grep -qE '^(bd|gc)	' "$CALLS"; then
+  bad "REGRESSION: bare no-auto-dispatch bead triggered a real bd/gc mutation (dump: $(cat "$CALLS" | tr '\n' '|'))"
+else
+  ok "no bd/gc mutation at all for a bare no-auto-dispatch bead (ga-rfpm9)"
+fi
+
+echo "Scenario I7: drift-guard — the bare no-auto-dispatch alias is wired into _pilot_hold_or_escalate (ga-rfpm9)"
+echo "$HOLD_FN" | grep -q '"no-auto-dispatch"' && ok "_pilot_hold_or_escalate carries the bare no-auto-dispatch skip clause" || bad "bare no-auto-dispatch skip clause missing from _pilot_hold_or_escalate"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "pilot-hold-escalate.selftest: $PASS passed, $FAIL failed"

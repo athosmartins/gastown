@@ -284,7 +284,13 @@ context_check_is_parked() {
       # ctx:ready/exec:auto — the exact ga-66wc/ga-0x4tv mechanism the
       # PARK-EXCLUSION comment above already warns about, just reachable via
       # an un-globbed label instead of a stripped one.
-      needs-human|needs-human:*|needs-human-*|story:blocked|pilot:no-auto-dispatch) echo "yes"; return ;;
+      # ga-rfpm9: bare "no-auto-dispatch" (no pilot: prefix) is a different
+      # string this case never matched — same bare-label gap already fixed in
+      # pilot-dispatcher.sh's _filter_candidates/_pilot_hold_or_escalate/late
+      # re-check (this bead's sibling fixes). This function is the ga-1mqdz/
+      # ga-bzbig CANONICAL consumer the header comment above already names, so
+      # it needs the same alias.
+      needs-human|needs-human:*|needs-human-*|story:blocked|pilot:no-auto-dispatch|no-auto-dispatch) echo "yes"; return ;;
       pool:refused:*) echo "yes"; return ;;
       # ga-7mbry (3rd occurrence of this bug class): four more park signals
       # this function was blind to, each already a real, established label

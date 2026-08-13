@@ -207,7 +207,11 @@ case "$args" in
           _sc2=$(cat "$_scf2" 2>/dev/null || echo 0)
           _sc2=$((_sc2 + 1))
           echo "$_sc2" > "$_scf2"
-          [ "$_sc2" -gt "$FAKE_NOAUTO_AFTER_SHOWS" ] && lbls="${lbls:+$lbls,}\"pilot:no-auto-dispatch\""
+          # ga-rfpm9: label text is now parametrized (default unchanged) so the
+          # SAME shim can inject either the prefixed or bare form — proves the
+          # late re-check's bare-label alias through the real dispatch_one()
+          # path, not just the isolated _filter_candidates unit test above.
+          [ "$_sc2" -gt "$FAKE_NOAUTO_AFTER_SHOWS" ] && lbls="${lbls:+$lbls,}\"${FAKE_NOAUTO_LABEL:-pilot:no-auto-dispatch}\""
         fi
         # ga-pd7j: mark the fixture as already in the gate-fix loop (stable label,
         # present from the start — unlike the counter-based escalation above, this
@@ -567,8 +571,11 @@ run_real_dispatch_escalate() { # FAKE_ESCALATE_AFTER_SHOWS
 # (ga-4iw15 / ga-9uwbw incident: the hold landed 253s before dispatch, well
 # inside the window, and was silently bypassed because the late re-check only
 # knew about 4 labels). Arg 1: FAKE_NOAUTO_AFTER_SHOWS (unset/empty = never
-# injects it, i.e. the plain happy path).
-run_real_dispatch_noauto() { # FAKE_NOAUTO_AFTER_SHOWS
+# injects it, i.e. the plain happy path). Arg 2 (ga-rfpm9): the exact label
+# TEXT to inject once the threshold trips — default "pilot:no-auto-dispatch"
+# keeps every pre-existing call site byte-identical; pass "no-auto-dispatch"
+# to exercise the bare-label alias through the SAME real dispatch_one() path.
+run_real_dispatch_noauto() { # FAKE_NOAUTO_AFTER_SHOWS [FAKE_NOAUTO_LABEL]
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
@@ -584,6 +591,7 @@ run_real_dispatch_noauto() { # FAKE_NOAUTO_AFTER_SHOWS
     FAKE_BLOCKED_IDS="" \
     FAKE_SUPPRESS_INFLIGHT=0 \
     FAKE_NOAUTO_AFTER_SHOWS="${1:-}" \
+    FAKE_NOAUTO_LABEL="${2:-pilot:no-auto-dispatch}" \
     FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
@@ -1142,6 +1150,25 @@ echo "Scenario ga-1mqdz: pilot:no-auto-dispatch bead is excluded from the candid
 NO_AUTO_DISPATCH='[{"id":"bd-no-auto","assignee":null,"labels":["pilot:no-auto-dispatch","ctx:ready","exec:auto"],"description":"x"},{"id":"bd-auto-free","assignee":null,"labels":["ctx:ready","exec:auto"],"description":"x"}]'
 [ "$(_fc "$NO_AUTO_DISPATCH")" = '["bd-auto-free"]' ] && ok "ga-1mqdz: pilot:no-auto-dispatch bead excluded even with ctx:ready+exec:auto present; clean sibling kept" || bad "ga-1mqdz: pilot:no-auto-dispatch bead leaked into candidates: $(_fc "$NO_AUTO_DISPATCH")"
 echo "$_FC_FN" | grep -q '"pilot:no-auto-dispatch"' && ok "_filter_candidates carries the pilot:no-auto-dispatch clause" || bad "pilot:no-auto-dispatch clause missing from _filter_candidates"
+
+# ── Scenario ga-rfpm9: bare "no-auto-dispatch" (no pilot: prefix) is a
+# DIFFERENT jq string than pilot:no-auto-dispatch — silently unrecognized
+# pre-fix even though it reads as an obvious synonym to whoever applies it.
+# 8 live beads carried the bare form (confirmed via ga-qntfo, dispatched via
+# sling ga-0ci7r 4 days after creation despite the bead's own body saying
+# "para o Pilot não despachar isto"). Same fixture shape as ga-1mqdz directly
+# above — ctx:ready+exec:auto deliberately present to prove the bare label
+# alone now holds, same standalone-sufficiency bar.
+echo "Scenario ga-rfpm9: bare no-auto-dispatch (no pilot: prefix) bead is ALSO excluded from the candidate pool standalone"
+NO_AUTO_DISPATCH_BARE='[{"id":"bd-no-auto-bare","assignee":null,"labels":["no-auto-dispatch","ctx:ready","exec:auto"],"description":"x"},{"id":"bd-auto-free2","assignee":null,"labels":["ctx:ready","exec:auto"],"description":"x"}]'
+[ "$(_fc "$NO_AUTO_DISPATCH_BARE")" = '["bd-auto-free2"]' ] && ok "ga-rfpm9: bare no-auto-dispatch bead excluded even with ctx:ready+exec:auto present; clean sibling kept" || bad "ga-rfpm9: bare no-auto-dispatch bead leaked into candidates: $(_fc "$NO_AUTO_DISPATCH_BARE")"
+echo "$_FC_FN" | grep -q '"no-auto-dispatch"' && ok "_filter_candidates carries the bare no-auto-dispatch clause" || bad "bare no-auto-dispatch clause missing from _filter_candidates"
+# Negative control: a label that merely SHARES the "no-auto-dispatch" substring
+# without being an exact standalone label must NOT false-positive — the fix
+# uses exact equality (. == "no-auto-dispatch"), not startswith/contains, so a
+# differently-named label sharing the tail can't shadow through it.
+NO_AUTO_DISPATCH_UNRELATED='[{"id":"bd-unrelated-tag","assignee":null,"labels":["team:no-auto-dispatch-followup","ctx:ready","exec:auto"],"description":"x"}]'
+[ "$(_fc "$NO_AUTO_DISPATCH_UNRELATED")" = '["bd-unrelated-tag"]' ] && ok "ga-rfpm9: unrelated label merely containing the substring is NOT excluded (exact match, no over-match)" || bad "ga-rfpm9: over-matched an unrelated label sharing the no-auto-dispatch substring: $(_fc "$NO_AUTO_DISPATCH_UNRELATED")"
 
 # AC1(b)/AC2 cross-check (mirrors ga-nf4x5): the routed-pool probes (wa-worker/
 # ps-worker) must carry the SAME bare-needs-human exclusion independently of
@@ -1883,6 +1910,30 @@ if [ -f "$STATE/tt-flight.inflight" ]; then
   ok "story:in-flight still set normally when nothing was held"
 else
   bad "REGRESSION: adding the AC1 re-check broke the ordinary happy-path dispatch"
+fi
+
+# ── Scenario ga-rfpm9 (late re-check): bare "no-auto-dispatch" landing
+# mid-dispatch is caught by the SAME _PREDISPATCH_HUMANGATE re-check as
+# Scenario 5h above — same ga-9uwbw race, same chokepoint, bare-label alias
+# only. Reuses run_real_dispatch_noauto's new second arg to inject the bare
+# text instead of the prefixed one, through the real dispatch_one() path (not
+# a reimplementation) — the same evidentiary bar as Scenario 5h/5i.
+echo "Scenario ga-rfpm9 (late re-check): bare no-auto-dispatch landing mid-dispatch ALSO aborts before a builder is dispatched"
+LOG5H_BARE="$(run_real_dispatch_noauto 1 "no-auto-dispatch")"
+if echo "$LOG5H_BARE" | grep -q "ga-4iw15:.*tt-flight.*no-auto-dispatch"; then
+  ok "pre-dispatch re-check also recognizes the bare no-auto-dispatch alias (ga-rfpm9)"
+else
+  bad "REGRESSION: bare no-auto-dispatch did not trip the ga-4iw15 pre-dispatch re-check (ga-rfpm9)"
+fi
+if [ -f "$STATE/tt-flight.inflight" ]; then
+  bad "REGRESSION: story:in-flight was set despite the mid-dispatch bare no-auto-dispatch hold"
+else
+  ok "story:in-flight was never set — dispatch correctly aborted (bare label, ga-rfpm9)"
+fi
+if echo "$LOG5H_BARE" | grep -q "Dispatch complete:"; then
+  bad "REGRESSION: dispatch completed (builder notified) despite the mid-dispatch bare no-auto-dispatch hold"
+else
+  ok "no builder was notified — aborted before the sling/nudge step (bare label, ga-rfpm9)"
 fi
 
 # ── Scenario 5j/5k: Mayor grace window independent of gate:needs-fix (ga-4iw15 AC2) ──

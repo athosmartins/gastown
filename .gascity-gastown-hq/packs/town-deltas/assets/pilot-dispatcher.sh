@@ -1772,6 +1772,11 @@ _pilot_hold_or_escalate() {
   if printf '%s' "$_phe_labels" | jq -e '
       (. // []) | any(
         . == "pilot:no-auto-dispatch"
+        # ga-rfpm9: same bare-label alias as _filter_candidates (~L2088) —
+        # this is the SECOND of (at least) three chokepoints in this file
+        # that checked only the prefixed string, exactly the "two chokepoints
+        # checking DIFFERENT lists" divergence class ga-3lsy1 already named.
+        or . == "no-auto-dispatch"
         or startswith("gate:needs-human")
         or startswith("needs-human")
         or . == "story:needs-human"
@@ -2086,6 +2091,17 @@ _filter_candidates() {
           # pilot-dispatcher / wa-0sk7n): "strip ctx:ready+exec:auto" was
           # never meant to be the ONLY way to pause a bead.
           or . == "pilot:no-auto-dispatch"
+          # ga-rfpm9: bare "no-auto-dispatch" (no pilot: prefix) is a DIFFERENT
+          # jq string than the one above — silently unrecognized by every
+          # dispatch script even though a human/agent applying it reads it as
+          # an obvious synonym. Confirmed live: 8 beads carried the bare form
+          # (ga-qntfo among them, dispatched via sling ga-0ci7r 4 days after
+          # creation despite its body explicitly saying "para o Pilot não
+          # despachar isto"). Accept it as an alias, same exact-match style as
+          # the prefixed clause directly above — not a prefix/startswith, so
+          # it can never shadow an unrelated label that merely contains this
+          # substring.
+          or . == "no-auto-dispatch"
           or . == "story:needs-device"
           or . == "on-device"
           or . == "story:blocked"
@@ -7172,8 +7188,18 @@ TASK
     # diverge from this one again. Reuses $_PREDISPATCH_LABELS — no extra
     # bd round-trip.
     local _PREDISPATCH_HUMANGATE
+    # ga-rfpm9: "no-auto-dispatch" (bare) added as a THIRD chokepoint fix for
+    # the same string-mismatch class as _filter_candidates (~L2088) and
+    # _pilot_hold_or_escalate above — a Mayor hold applied with the bare label
+    # would otherwise sail through this last-chance re-check too. Unanchored
+    # alternation, same style as every other entry in this pattern; leftmost-
+    # longest POSIX matching means a label that actually reads
+    # "pilot:no-auto-dispatch" still reports that fuller string (the
+    # "pilot:no-auto-dispatch" alternative starts matching one position
+    # earlier), so this never regresses the existing warn-message text for
+    # already-correct labels.
     _PREDISPATCH_HUMANGATE=$(echo "$_PREDISPATCH_LABELS" | grep -oE \
-      'pilot:no-auto-dispatch|blocked:[^,]*|story:needs-human|story:needs-approval|needs-human[^,]*|pool:refused[^,]*|pilot:refused-reason:[^,]*' \
+      'pilot:no-auto-dispatch|no-auto-dispatch|blocked:[^,]*|story:needs-human|story:needs-approval|needs-human[^,]*|pool:refused[^,]*|pilot:refused-reason:[^,]*' \
       | head -1)
     if [ -n "$_PREDISPATCH_HUMANGATE" ]; then
       warn "ga-4iw15: $STORY_ID now carries $_PREDISPATCH_HUMANGATE (human-gate label landed during builder-target resolution, after the ga-zzrts claim-verify passed clean — same TOCTOU class as the ga-88g2 checks above, extended to the full human-gate set). Releasing claim and skipping — NOT dispatching a builder onto a bead an explicit human/Mayor decision already parked."

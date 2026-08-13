@@ -149,6 +149,21 @@ echo "Scenario 4a: park-exclusion — needs-human/pool:refused:*/story:blocked/p
 [ "$(context_check_is_parked "area:infra,pilot:no-auto-dispatch,epic:ga-05604")" = "yes" ] \
   && ok "ga-0x4tv post-strip label set (no ctx:*, no exec:*, no story:approved) → still parked" || bad "ga-0x4tv post-strip set → expected parked"
 
+# ga-rfpm9: bare "no-auto-dispatch" (no pilot: prefix) is a DIFFERENT string
+# this case statement never matched pre-fix — this is the CANONICAL consumer
+# ga-bzbig's own comment above names, so the bare-label gap here is the
+# primary bug, not a defense-in-depth mirror (pilot-dispatcher.sh's three
+# chokepoints are the mirrors, fixed in the same story).
+[ "$(context_check_is_parked "no-auto-dispatch")" = "yes" ] && ok "ga-rfpm9: bare no-auto-dispatch → parked" || bad "ga-rfpm9: bare no-auto-dispatch → expected parked"
+[ "$(context_check_is_parked "area:infra,no-auto-dispatch,lane:small")" = "yes" ] && ok "ga-rfpm9: bare no-auto-dispatch mixed with unrelated labels → parked" || bad "ga-rfpm9: mixed labels → expected parked"
+[ "$(context_check_is_parked "area:infra,no-auto-dispatch,epic:ga-05604")" = "yes" ] \
+  && ok "ga-rfpm9: ga-0x4tv-shaped post-strip set with the BARE label → still parked" || bad "ga-rfpm9: bare-label post-strip set → expected parked"
+# Negative control: a label merely containing the substring, not equal to it,
+# must not false-positive (case-statement alternatives here are exact-match,
+# no wildcard on this one — mirrors the needs-humanoid-unrelated control above).
+[ "$(context_check_is_parked "team:no-auto-dispatch-followup")" = "no" ] \
+  && ok "ga-rfpm9: label merely containing the substring → NOT parked, no over-match" || bad "ga-rfpm9: expected NOT parked (over-match regression)"
+
 # ── Scenario 4a3 (ga-7mbry, 3rd occurrence): blocked:*/pilot:refused-reason:*/
 # needs:engine-window/gate:needs-human:* — four more park signals this function
 # was blind to. wa-ic1uw repro: a bead parked with `blocked:external-quota-
@@ -219,6 +234,11 @@ echo "Scenario 4b: context_check_is_candidate composes type+plumbing+ctx+lifecyc
 [ "$(context_check_is_candidate "ga-0x4tv" "chore" "area:infra,pilot:no-auto-dispatch,epic:ga-05604" "false" "no")" = "no" ] \
   && ok "ga-0x4tv-shaped bead (parked via pilot:no-auto-dispatch, ctx:* stripped) → NOT a candidate (no re-arm)" \
   || bad "REGRESSION ga-bzbig: Mayor-disarmed tracker with ctx:* stripped would be re-judged and re-armed"
+# ga-rfpm9: same ga-0x4tv shape, BARE label (no pilot: prefix) — the primary
+# bug this story fixes, end-to-end through context_check_is_candidate.
+[ "$(context_check_is_candidate "ga-0x4tv-bare" "chore" "area:infra,no-auto-dispatch,epic:ga-05604" "false" "no")" = "no" ] \
+  && ok "ga-rfpm9: ga-0x4tv-shaped bead parked via the BARE no-auto-dispatch label → NOT a candidate (no re-arm)" \
+  || bad "REGRESSION ga-rfpm9: bare-label-disarmed tracker with ctx:* stripped would be re-judged and re-armed"
 # ga-aq5cw: the exact ga-sh5zv/ga-mun9x shape — a freshly-created digest-archive
 # bead (type=task, label=digest,{{period}}, no ctx:* yet, no park label at all)
 # — must never be granted candidacy in the first place (there is no park label
