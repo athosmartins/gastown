@@ -136,7 +136,24 @@ _PROBE="$CITY/scripts/gc-dolt-probe.sh"
 # failure class this bead's own doctrine warns about). Falls back to the
 # configured default only if no live `dolt sql-server` process is found. ──
 live_dolt_port() {
-  local pid port
+  # port MUST be initialized, not just declared. This script runs under
+  # `set -u` (line 75). When NO `dolt sql-server` process exists, $pid is empty,
+  # the if-block never runs, and the line below reads a never-assigned variable,
+  # aborting the whole tick with "port: unbound variable".
+  #
+  # MEASURED, not theorized (2026-08-13, kernel panic + Dolt restart): the live
+  # launchd job logged this at line 144 in
+  # .gc/logs/dolt-latency-alarm-launchd.err. Reproduced 3/3 by running the
+  # pre-fix script with a `pgrep` stub returning nothing (i.e. Dolt absent);
+  # the fixed script is clean 3/3 under the identical stub.
+  #
+  # Why that is the worst possible place to die: the ONLY condition that leaves
+  # $pid empty is Dolt being ABSENT — precisely the total-outage case this alarm
+  # exists to report. The alarm would go silent exactly when it matters most,
+  # and silence here is indistinguishable from "Dolt is healthy". Same family as
+  # a guard blind to its own trigger condition: error and empty must never
+  # produce the same observable result.
+  local pid port=""
   pid=$(pgrep -f 'dolt sql-server' 2>/dev/null | head -1)
   if [ -n "$pid" ]; then
     port=$(lsof -nP -p "$pid" 2>/dev/null | grep LISTEN | grep -oE ':[0-9]+ \(LISTEN\)' | head -1 | grep -oE '[0-9]+')
