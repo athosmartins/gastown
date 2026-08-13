@@ -611,7 +611,7 @@ def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
                      reclaim_count, has_needs_human, has_dispatching_marker,
                      min_stranding_secs=None, account_rate_limited=False,
                      provably_dead=False, has_explicit_refusal=False,
-                     refusal_count=0):
+                     refusal_count=0, has_suspended_owner=False):
     """Compute the reclaim action for one stranded in-flight bead.
 
     Args:
@@ -621,6 +621,27 @@ def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
         reclaim_count:           current pilot:reclaim-count:N from bead labels (int)
         has_needs_human:         True if bead carries gate:needs-human (or :* variant)
         has_dispatching_marker:  True if quality-gate-marker with active gate state exists
+        has_suspended_owner:     True if the bead's assignee is a deliberately-suspended
+                                 agent/crew (gc agent list --json → suspended==true). A
+                                 DELIBERATE administrative stop, not a crash — the bead is
+                                 parked, not stranded, and must HOLD (wait for the crew to
+                                 resume) rather than be reclaimed or re-pooled, regardless
+                                 of session liveness, branch recency, or refusal count.
+                                 ga-vu718 gate-fix-3: previously this signal had NO path
+                                 into this function at all — it only drove an indirect
+                                 fetch-skip optimization (should_fetch_branch_for_reclaim)
+                                 and a strand-clock pin in run_cycle, both of which sit
+                                 downstream of the has_explicit_refusal escalate check
+                                 added by gate-fix-1. Once that check started firing ahead
+                                 of has_live_session/hysteresis, a suspended owner whose
+                                 refusal count had already crossed REFUSAL_ESCALATE_THRESHOLD
+                                 could reach "escalate" without either downstream mechanism
+                                 ever being consulted. Promoted to an explicit, top-tier
+                                 guard (same tier as has_needs_human/has_dispatching_marker)
+                                 so it outranks every other check unconditionally, closing
+                                 that gap at its root instead of patching each downstream
+                                 symptom. Defaults False: callers that don't pass it keep
+                                 the pre-fix behavior exactly.
         min_stranding_secs:      minimum continuous stranding before action; defaults to
                                  RECLAIM_TTL (25min). Pass POOL_ZOMBIE_TTL (2h) for
                                  bare-template pool-zombie beads (ga-hkpwv).
@@ -680,6 +701,14 @@ def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
     if has_needs_human:
         return "noop"
     if has_dispatching_marker:
+        return "noop"
+    # ga-vu718 gate-fix-3: a deliberately-suspended owner HOLDs unconditionally —
+    # checked here, at the same tier as has_needs_human/has_dispatching_marker
+    # above, so it outranks has_recent_branch, the refusal-escalate check, AND
+    # has_live_session/hysteresis below, not just the branch-fetch optimization
+    # in should_fetch_branch_for_reclaim(). See this param's docstring for the
+    # incident (2nd GATE-FEEDBACK, gate_run=ga-0uwrm) this closes.
+    if has_suspended_owner:
         return "noop"
     # ga-ufr7: a confirmed account-wide rate-limit means NO builder anywhere can
     # be making progress right now — "no progress" is not evidence of death.
@@ -761,10 +790,13 @@ def should_fetch_branch_for_reclaim(has_live_session, has_needs_human,
 
     Mirrors reclaim_decision()'s own short-circuit order: has_needs_human /
     has_dispatching_marker / has_suspended_owner always noop regardless of
-    has_recent_branch (checked first in reclaim_decision too, or handled
-    entirely outside it for has_suspended_owner), so the fetch stays skipped
-    for those unconditionally — unchanged from pre-fix behavior, deliberately
-    NOT touched by this gate-fix.
+    has_recent_branch, all three now checked first in reclaim_decision itself
+    (ga-vu718 gate-fix-3 promoted has_suspended_owner to an explicit top-tier
+    parameter there too — it used to be "handled outside" via an indirect
+    fetch-skip + strand-clock pin, which the 2nd GATE-FEEDBACK found did NOT
+    actually protect the escalate branch; see reclaim_decision()'s
+    has_suspended_owner docstring for the incident), so the fetch stays
+    skipped for those unconditionally AND the underlying decision agrees.
     """
     if has_needs_human or has_dispatching_marker or has_suspended_owner:
         return False
@@ -3544,6 +3576,7 @@ def run_cycle(state, escalated_alerted):
             provably_dead=provably_dead,
             has_explicit_refusal=has_explicit_refusal,
             refusal_count=refusal_count,
+            has_suspended_owner=has_suspended_owner,
         )
 
         idle_min = seconds_stranded / 60.0
@@ -4883,8 +4916,8 @@ def _selftest():
               has_live_session=True, has_needs_human=False, has_dispatching_marker=True,
               has_suspended_owner=False, has_explicit_refusal=True, refusal_count=1) is False)
     check("RFB-7: has_suspended_owner=True wins even with a live session AND a crossing "
-          "refusal → skip fetch (suspended-owner HOLD outranks everything, pre-existing "
-          "guard this fix deliberately leaves untouched)",
+          "refusal → skip fetch (this only proves the fetch-SKIP decision; it does NOT "
+          "prove reclaim_decision()'s actual downstream action — see RFB-9 for that)",
           should_fetch_branch_for_reclaim(
               has_live_session=True, has_needs_human=False, has_dispatching_marker=False,
               has_suspended_owner=True, has_explicit_refusal=True, refusal_count=1) is False)
@@ -4909,6 +4942,34 @@ def _selftest():
           "through the full run_cycle wiring, not just the pure function in isolation)",
           _rd(has_explicit_refusal=True, refusal_count=1, has_live_session=True,
               has_recent_branch=True) == "noop")
+
+    # --- RFB-9 (2nd GATE-FEEDBACK regression anchor, gate_run=ga-0uwrm): the
+    #     suspended-owner analog of RFB-8. RFB-7 above proves only that the
+    #     branch FETCH is skipped for a suspended owner — it says nothing
+    #     about reclaim_decision()'s actual downstream action, which is
+    #     exactly the gap the 2nd gate reviewer found: has_suspended_owner
+    #     had no path into reclaim_decision() at all (it only drove the
+    #     fetch-skip decision and the strand-clock pin), so a suspended
+    #     owner whose refusal has just crossed REFUSAL_ESCALATE_THRESHOLD
+    #     fell through to the escalate check — which now runs ahead of
+    #     has_live_session and the hysteresis check, the only two places
+    #     has_suspended_owner used to matter — and escalated. That is
+    #     exactly what must never happen to a parked crew (do_escalate()'s
+    #     own docstring: "must NOT be reclaimed... should WAIT for the crew
+    #     to resume, not re-pool"). has_suspended_owner is now its own
+    #     top-tier reclaim_decision() guard (same tier as has_needs_human /
+    #     has_dispatching_marker, checked ahead of has_recent_branch and the
+    #     escalate branch), so this must be noop regardless of
+    #     has_live_session or an already-crossed refusal count. ---
+    check("RFB-9 (GATE-FEEDBACK regression anchor #2): has_suspended_owner=True, live "
+          "session, 2nd refusal (crossed threshold) → noop, NOT escalate (suspended-"
+          "owner HOLD actually outranks the escalate branch itself, not just the "
+          "fetch-skip decision RFB-7 tests)",
+          _rd(has_suspended_owner=True, has_explicit_refusal=True, refusal_count=1,
+              has_live_session=True) == "noop")
+    check("RFB-9b: has_suspended_owner=True also outranks the plain reclaim/thrash-cap "
+          "path (no refusal in play at all) — same guard, non-escalate branch",
+          _rd(has_suspended_owner=True, reclaim_count=MAX_RECLAIMS) == "noop")
 
     # --- RF-9: generic MAX_RECLAIMS cap still holds as a backstop even on a
     #     bead's FIRST refusal (defense-in-depth: refusal and unexplained-death
