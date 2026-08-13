@@ -1,0 +1,208 @@
+diff --git a/cmd/gc/cmd_events.go b/cmd/gc/cmd_events.go
+index b03b87ba3..4e96e19db 100644
+--- a/cmd/gc/cmd_events.go
++++ b/cmd/gc/cmd_events.go
+@@ -1150,7 +1150,7 @@ func filterCityEvents(items []cliWireEvent, afterSeq uint64, typeFilter string,
+ 		if uint64(item.Seq) <= afterSeq {
+ 			continue
+ 		}
+-		if typeFilter != "" && item.Type != typeFilter {
++		if typeFilter != "" && !events.TypeMatches(item.Type, typeFilter) {
+ 			continue
+ 		}
+ 		if !matchPayload(item.Payload, payloadMatch) {
+@@ -1167,7 +1167,7 @@ func filterSupervisorEvents(items []cliWireTaggedEvent, typeFilter string, paylo
+ 	}
+ 	out := make([]cliWireTaggedEvent, 0, len(items))
+ 	for _, item := range items {
+-		if typeFilter != "" && item.Type != typeFilter {
++		if typeFilter != "" && !events.TypeMatches(item.Type, typeFilter) {
+ 			continue
+ 		}
+ 		if !matchPayload(item.Payload, payloadMatch) {
+@@ -1185,7 +1185,7 @@ func filterSupervisorEventsAfterCursor(items []cliWireTaggedEvent, cursor, typeF
+ 		if uint64(item.Seq) <= cursors[item.City] {
+ 			continue
+ 		}
+-		if typeFilter != "" && item.Type != typeFilter {
++		if typeFilter != "" && !events.TypeMatches(item.Type, typeFilter) {
+ 			continue
+ 		}
+ 		if !matchPayload(item.Payload, payloadMatch) {
+diff --git a/cmd/gc/cmd_events_test.go b/cmd/gc/cmd_events_test.go
+index b52320ed6..14ec5b4f5 100644
+--- a/cmd/gc/cmd_events_test.go
++++ b/cmd/gc/cmd_events_test.go
+@@ -17,6 +17,50 @@ import (
+ 	"github.com/gastownhall/gascity/internal/events"
+ )
+ 
++// TestFilterCityEvents_TypeCommaList reproduces ga-gye3f at the CLI's own
++// re-filter layer: even when the server-side query already OR-matched a
++// comma-joined --type, cmd/gc re-filters the response itself, and that
++// re-filter used to compare item.Type against the WHOLE comma string with
++// !=, which never equals a single type and silently dropped everything.
++func TestFilterCityEvents_TypeCommaList(t *testing.T) {
++	items := []cliWireEvent{
++		{Seq: 1, Type: "session.woke"},
++		{Seq: 2, Type: "session.stopped"},
++		{Seq: 3, Type: "bead.created"},
++	}
++	got := filterCityEvents(items, 0, "session.woke,session.stopped,session.crashed", nil)
++	if len(got) != 2 {
++		t.Fatalf("filterCityEvents with comma-list type = %d items, want 2 (session.woke + session.stopped); got=%+v", len(got), got)
++	}
++	for _, item := range got {
++		if item.Type != "session.woke" && item.Type != "session.stopped" {
++			t.Errorf("unexpected item in comma-list filter result: %+v", item)
++		}
++	}
++}
++
++func TestFilterSupervisorEvents_TypeCommaList(t *testing.T) {
++	items := []cliWireTaggedEvent{
++		{Seq: 1, Type: "session.woke", City: "gastown"},
++		{Seq: 2, Type: "bead.created", City: "gastown"},
++	}
++	got := filterSupervisorEvents(items, "session.woke,session.crashed", nil)
++	if len(got) != 1 || got[0].Type != "session.woke" {
++		t.Fatalf("filterSupervisorEvents with comma-list type = %+v, want only session.woke", got)
++	}
++}
++
++func TestFilterSupervisorEventsAfterCursor_TypeCommaList(t *testing.T) {
++	items := []cliWireTaggedEvent{
++		{Seq: 1, Type: "session.woke", City: "gastown"},
++		{Seq: 2, Type: "bead.created", City: "gastown"},
++	}
++	got := filterSupervisorEventsAfterCursor(items, "", "session.woke,session.crashed", nil)
++	if len(got) != 1 || got[0].Type != "session.woke" {
++		t.Fatalf("filterSupervisorEventsAfterCursor with comma-list type = %+v, want only session.woke", got)
++	}
++}
++
+ func TestDoEventsCityDefaultUsesJSONLItems(t *testing.T) {
+ 	items := []cliWireEvent{
+ 		{Actor: "human", Seq: 1, Subject: "gc-1", Ts: time.Unix(1700000000, 0).UTC(), Type: "bead.created"},
+diff --git a/internal/events/query_test.go b/internal/events/query_test.go
+index 559d72755..ab922dfe7 100644
+--- a/internal/events/query_test.go
++++ b/internal/events/query_test.go
+@@ -21,6 +21,65 @@ func TestMatchesFilter_Subject(t *testing.T) {
+ 	}
+ }
+ 
++// TestMatchesFilter_Type_CommaList reproduces ga-gye3f: `gc events
++// --type=session.woke,session.stopped,session.crashed` silently matched
++// zero events because the Type predicate compared the event's single Type
++// against the whole comma-joined filter string with ==. A comma-list filter
++// must OR-match, the same convention `bd list --status open,in_progress`
++// and `--exclude-type=convoy,epic` already use elsewhere in this CLI
++// family.
++func TestMatchesFilter_Type_CommaList(t *testing.T) {
++	woke := Event{Type: SessionWoke}
++	stopped := Event{Type: SessionStopped}
++	created := Event{Type: BeadCreated}
++
++	list := Filter{Type: "session.woke,session.stopped,session.crashed"}
++	if !matchesFilter(woke, list) {
++		t.Error("comma-list filter should match session.woke (one of the listed types)")
++	}
++	if !matchesFilter(stopped, list) {
++		t.Error("comma-list filter should match session.stopped (one of the listed types)")
++	}
++	if matchesFilter(created, list) {
++		t.Error("comma-list filter should not match bead.created (not one of the listed types)")
++	}
++
++	// A single (non-comma) Type filter must keep behaving exactly as
++	// before — this is not a behavior change for the common case.
++	single := Filter{Type: "session.woke"}
++	if !matchesFilter(woke, single) {
++		t.Error("single-type filter should still match its exact type")
++	}
++	if matchesFilter(stopped, single) {
++		t.Error("single-type filter should still reject a different type")
++	}
++}
++
++func TestTypeMatches(t *testing.T) {
++	cases := []struct {
++		name      string
++		eventType string
++		filter    string
++		want      bool
++	}{
++		{"empty filter matches anything", "session.woke", "", true},
++		{"single type match", "session.woke", "session.woke", true},
++		{"single type no match", "session.woke", "session.stopped", false},
++		{"comma list first element", "session.woke", "session.woke,session.stopped,session.crashed", true},
++		{"comma list middle element", "session.stopped", "session.woke,session.stopped,session.crashed", true},
++		{"comma list last element", "session.crashed", "session.woke,session.stopped,session.crashed", true},
++		{"comma list no match", "bead.created", "session.woke,session.stopped,session.crashed", false},
++		{"comma list tolerates whitespace", "session.stopped", "session.woke, session.stopped, session.crashed", true},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := TypeMatches(tc.eventType, tc.filter); got != tc.want {
++				t.Errorf("TypeMatches(%q, %q) = %v, want %v", tc.eventType, tc.filter, got, tc.want)
++			}
++		})
++	}
++}
++
+ func TestMatchesFilter_Until(t *testing.T) {
+ 	now := time.Now()
+ 	e := Event{Type: BeadCreated, Ts: now}
+diff --git a/internal/events/reader.go b/internal/events/reader.go
+index 258ff2bd5..45df041e6 100644
+--- a/internal/events/reader.go
++++ b/internal/events/reader.go
+@@ -10,6 +10,7 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"sort"
++	"strings"
+ 	"time"
+ )
+ 
+@@ -24,13 +25,38 @@ type Filter struct {
+ 	Limit    int       // cap results at this count (0 or negative = unlimited)
+ }
+ 
++// TypeMatches reports whether eventType satisfies filter, where filter is
++// either a single event type or a comma-separated list of types to
++// OR-match against — the same comma-list convention used elsewhere in this
++// CLI family (e.g. `bd list --status open,in_progress`,
++// `--exclude-type=convoy,epic`). An empty filter matches any type; callers
++// that need "no filter configured" to mean something else (e.g. skip the
++// predicate entirely) must check for "" themselves before calling this.
++//
++// Before this fix, every Type predicate in this package (and its mirrors
++// in cmd/gc/cmd_events.go) compared eventType against the raw filter string
++// with ==, so a comma-joined filter like "session.woke,session.stopped"
++// never equaled any single event's Type and silently matched zero events
++// instead of erroring or OR-matching — see ga-gye3f.
++func TypeMatches(eventType, filter string) bool {
++	if filter == "" {
++		return true
++	}
++	for _, part := range strings.Split(filter, ",") {
++		if eventType == strings.TrimSpace(part) {
++			return true
++		}
++	}
++	return false
++}
++
+ // matchesFilter reports whether e satisfies all non-zero predicates in f.
+ // It does not enforce Limit — that is applied by the caller.
+ func matchesFilter(e Event, f Filter) bool {
+ 	if f.AfterSeq > 0 && e.Seq <= f.AfterSeq {
+ 		return false
+ 	}
+-	if f.Type != "" && e.Type != f.Type {
++	if f.Type != "" && !TypeMatches(e.Type, f.Type) {
+ 		return false
+ 	}
+ 	if f.Actor != "" && e.Actor != f.Actor {
