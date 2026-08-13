@@ -651,6 +651,34 @@ bead_domain() {
         ((.labels // []) | join(" ")) ] | join("  ")
     ' 2>/dev/null || echo "")
   [ -z "$hay" ] && { echo ""; return 0; }
+  # ga-pp00f: Hex-notebook-native work checked FIRST, ahead of every functional
+  # domain below. This is a DELIVERY-MECHANISM signal, not a subject-matter
+  # one — a Hex cell can implement data/real-estate/frontend logic, but no
+  # pool worker can ever produce a git diff for it (the code lives in Hex's
+  # cloud notebook, not this checkout), so the constraint must win regardless
+  # of what the work is ABOUT. Without this, hex-native beads fell through to
+  # whichever functional domain their prose happened to match (often "data" —
+  # enrichment/scraper/dados keywords), got pool-routed there, and the pool
+  # worker refused in a loop (measured: 12 wa-* beads hit pool:refused:hex-
+  # native-*/pilot:refused-reason:hex-native-* across the corpus, 4 open at
+  # filing time — see ga-pp00f; wa-nr5b1 is a P1 data-correctness bug stuck in
+  # the loop for its 2nd time). Narrow/compound-phrase only (never bare
+  # "hex" — false-positives on hex COLOR codes, e.g. "muda a cor pra #FF5733
+  # (hex)"): requires "hex" adjacent to a Hex.tech-specific term actually
+  # observed in the cited beads (notebook/cell/célula/project/run/schedule/
+  # publish/draft/native/monitor/api/.tech).
+  # KNOWN false-positive class (measured against all 59 open WA beads at fix
+  # time, 1 hit — wa-odbh9): a bead that CITES another hex-native bead's
+  # title as background context (e.g. a triage summary listing "ps-vvq1
+  # DECISAO DO ATHOS: malha de qualidade pro notebook Hex" alongside unrelated
+  # beads) inherits the domain even though its OWN work isn't hex-native.
+  # Accepted for this lane:small stopgap: the misroute this can cause (to
+  # batista-wa instead of the pool) is cheap to notice/bounce and far
+  # smaller than the reclaim-loop this fix closes; a keyword regex over
+  # freeform prose cannot fully distinguish "is about" from "mentions".
+  if printf '%s' "$hay" | grep -iqE 'hex[ -]?notebook|notebook.{0,10}\bhex\b|hex[ -]?cell|c[ée]lula.{0,15}\bhex\b|hex-native|hex-monitor|hex-api|hex\.tech|hex[ -]?project|hex[ -]?run|hex[ -]?schedule|hex[ -]?publish|hex[ -]?draft'; then
+    echo "hex"; return 0
+  fi
   if printf '%s' "$hay" | grep -iqE 'urblink_design_system|design[ -]system|painel[ -]?hist|\bfrontend\b|\bui\b|\bux\b|\bkanban\b|\bcss\b|stylesheet|layout'; then
     echo "frontend"; return 0
   fi
@@ -678,10 +706,14 @@ bead_domain() {
 # (preferred pick if idle), or "" if none is mapped. Positive ownership only.
 rig_domain_owner() {
   case "$1/$2" in
-    whatsapp_automation/data|wa/data)               echo "digo-wa"   ;;
-    whatsapp_automation/real-estate|wa/real-estate) echo "peter-wa"  ;;
-    whatsapp_automation/warming|wa/warming)         echo "oracle-wa" ;;
-    *)                                              echo ""          ;;
+    whatsapp_automation/data|wa/data)               echo "digo-wa"    ;;
+    whatsapp_automation/real-estate|wa/real-estate) echo "peter-wa"   ;;
+    whatsapp_automation/warming|wa/warming)         echo "oracle-wa"  ;;
+    # ga-pp00f: batista-wa is already the crew absorbing hex-native WA work
+    # manually (per the bead's own diagnosis — self-assigned wa-nr5b1 to get
+    # it out of the pool-refusal loop). No other named owner is evidenced.
+    whatsapp_automation/hex|wa/hex)                 echo "batista-wa" ;;
+    *)                                              echo ""           ;;
   esac
 }
 
@@ -695,6 +727,22 @@ rig_domain_exclude() {
     whatsapp_automation/frontend|wa/frontend)       echo "digo-wa" ;;
     whatsapp_automation/real-estate|wa/real-estate) echo "oracle-wa digo-wa thies-wa" ;;
     whatsapp_automation/warming|wa/warming)         echo "digo-wa mila-wa peter-wa thies-wa" ;;  # warming → SÓ oracle-wa (dono) ou DEFER; nunca mila/digo (ga-wisp-jmrn5q)
+    # ga-pp00f: NOTE THE DIFFERENT SHAPE — every other entry above lists NAMED
+    # crew, which pick_pool_builder's exclude-match compares against
+    # rig_to_builders' actual candidate set (wa-worker-1..4 for this rig,
+    # since pilot-rewire). None of those named crew are ever IN that set, so
+    # those three entries are inert dead code against today's pool — when
+    # e.g. oracle-wa (warming) is busy, dispatch_one's owner-busy fallback
+    # calls pick_pool_builder, which can still hand a warming bead to a
+    # wa-worker-N slot (untested by Scenario 17g/17h, which only exercise the
+    # idle-owner path; left as-is here, out of scope for this lane:small
+    # fix — flag for follow-up). For hex that same fallback would silently
+    # reproduce the exact reclaim-loop bug this fix exists to close, so hex
+    # lists the ACTUAL pool-slot names instead of a crew name — the form
+    # pick_pool_builder's exclude-match genuinely consumes today. Keep this
+    # in sync with rig_to_builders' whatsapp_automation mapping if that ever
+    # changes.
+    whatsapp_automation/hex|wa/hex)                 echo "wa-worker-1 wa-worker-2 wa-worker-3 wa-worker-4" ;;
     *)                                              echo ""        ;;
   esac
 }
@@ -712,9 +760,18 @@ rig_domain_exclude() {
 # intentionally pool-routed — ordinary code builds the wa-worker pool is
 # designed to absorb. Do not add a domain here without an explicit Athos/
 # Mayor decision that it is likewise structurally pool-incompatible.
+#
+# ga-pp00f (Mayor decision, 2026-08-12): hex added for the SAME reason as
+# warming, one level more absolute — a wa-worker pool slot cannot merely
+# struggle with Hex-notebook-native work, it CANNOT complete it at all (no
+# git diff exists to push or gate; the code lives in Hex's cloud notebook,
+# not this checkout). See bead_domain's hex clause and rig_domain_exclude's
+# hex entry (which, unlike warming's, excludes the actual wa-worker-N slot
+# names so a busy owner defers instead of leaking into the pool).
 rig_domain_requires_persistent_owner() {
   case "$1/$2" in
     whatsapp_automation/warming|wa/warming) return 0 ;;
+    whatsapp_automation/hex|wa/hex)         return 0 ;;
     *)                                      return 1 ;;
   esac
 }

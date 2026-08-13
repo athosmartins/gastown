@@ -6789,6 +6789,135 @@ else
   bad "ga-2wcz6 REGRESSION: _ownership_guard_repos def (L${GA2WCZ6_DEF_LINE:-?}) is not safely before _filter_built (L${GA2WCZ6_FILTERBUILT_LINE:-?}) and/or the top-level _pilot_emit_dispatchable call (L${GA2WCZ6_EMIT_CALL_LINE:-?}) — reintroduces the painel built-check silent no-op"
 fi
 
+# ── Scenario ga-pp00f: hex-native WA work dispatches DIRECTLY to a crew, never
+# enters the wa-worker pool — even when the owner is busy ────────────────────
+# Bug ga-pp00f (Mayor decision, 2026-08-12): Hex-notebook-native work produces
+# no git diff, so a wa-worker pool slot can NEVER complete it — the worker
+# tries, discovers there is nothing to push/gate, refuses
+# (pool:refused:hex-native-no-git-diff / pilot:refused-reason:hex-native-*),
+# Pilot re-dispatches the same bead next sweep, and it refuses again. Measured
+# across the bead corpus at filing time: 12 wa-* beads hit this label family
+# historically, 4 still open (one, wa-nr5b1, a P1 data-correctness bug stuck in
+# the loop for its 2nd time). Same "domain structurally pool-incompatible"
+# shape as ga-uvfs6/warming (Scenario 17g/17h) — a hex domain is added to
+# bead_domain/rig_domain_owner/rig_domain_requires_persistent_owner so
+# hex-native WA beads dispatch DIRECTLY to batista-wa (the crew already
+# absorbing this work manually per the bead's own diagnosis), bypassing
+# wa-worker pool rotation entirely, exactly like warming→oracle-wa.
+#
+# ONE DELIBERATE DIVERGENCE from the warming precedent, found while tracing
+# pick_pool_builder: warming's rig_domain_exclude entry (digo-wa mila-wa
+# peter-wa thies-wa — NAMED crew) does not intersect rig_to_builders' actual
+# WA pool (wa-worker-1..4, per pilot-rewire) and is therefore INERT — when
+# oracle-wa is busy, a warming bead silently falls through to
+# pick_pool_builder and CAN land on a wa-worker-N slot (untested by 17g/17h,
+# which only exercise the idle-owner path). For hex that fallback would
+# reproduce the exact reclaim-loop bug this fix exists to close, so hex's
+# rig_domain_exclude is populated with the actual pool-slot names
+# ("wa-worker-1 wa-worker-2 wa-worker-3 wa-worker-4") — the form
+# pick_pool_builder's exclude-match genuinely consumes today — so a busy
+# batista-wa DEFERS the bead to the next sweep instead of leaking it into the
+# pool. Scenario ga-pp00f-c below is the busy-owner case; nothing in the
+# existing Scenario 17 suite exercises it for warming (noted, not fixed here —
+# out of scope for this lane:small change).
+HEX_BUG='[{"id":"tt-wahex","title":"celula Hex dedup: normaliza data sem format=mixed","priority":1,"issue_type":"bug","description":"a celula de notebook Hex que decide qual proprietario fica usa pd.to_datetime(errors=coerce) sem format=mixed","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:04Z","metadata":{"story.rig":"whatsapp_automation"}}]'
+
+echo "Scenario ga-pp00f-a: hex-native WA bug dispatches DIRECTLY to batista-wa (idle owner), bypassing the wa-worker pool"
+LOG_PP00F_A="$(run_capacity 10 "[]" 1 "$HEX_BUG")"
+HEX_BUILDER_A="$(builder_for_domain "$LOG_PP00F_A" hex)"
+if [ "$HEX_BUILDER_A" = "batista-wa" ]; then
+  ok "hex-native bug dispatched DIRECTLY to batista-wa (structural owner, ga-pp00f fix)"
+elif echo "$HEX_BUILDER_A" | grep -qE '^wa-worker-[0-9]+$'; then
+  bad "REGRESSION (ga-pp00f): hex-native bug went to the generic wa-worker pool ($HEX_BUILDER_A) — reproduces the reclaim-loop this fix exists to close"
+else
+  bad "hex-native bug routed unexpectedly (got: '${HEX_BUILDER_A:-none}')"
+fi
+if echo "$LOG_PP00F_A" | grep -q "gc.routed_to=wa-worker"; then
+  bad "REGRESSION (ga-pp00f): hex-native bug still stamped gc.routed_to=wa-worker despite direct batista-wa dispatch"
+else
+  ok "hex-native bug did NOT receive gc.routed_to=wa-worker stamp (named-crew path used instead)"
+fi
+
+echo "Scenario ga-pp00f-b (control): benign 'hex' color mention does NOT misclassify as the hex domain (regex not over-broad)"
+HEX_COLOR_BUG='[{"id":"tt-wahexcolor","title":"muda a cor do botao pra #FF5733 (hex) no painel","priority":0,"issue_type":"bug","description":"fixture body — context for veto test; a cosmetic color-code tweak, no other signal intended","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:05Z","metadata":{"story.rig":"whatsapp_automation"}}]'
+LOG_PP00F_B="$(run_capacity 10 "[]" 1 "$HEX_COLOR_BUG")"
+if echo "$LOG_PP00F_B" | grep -q "Builder target:.*domain=hex"; then
+  bad "REGRESSION (ga-pp00f): a bare 'hex' color-code mention misclassified as the hex domain (regex too broad)"
+else
+  ok "bare 'hex' color-code mention did NOT trigger the hex domain (compound-phrase regex holds)"
+fi
+HEXCOLOR_BUILDER="$(builders_of "$LOG_PP00F_B")"
+if echo "$HEXCOLOR_BUILDER" | grep -qE '^wa-worker-[0-9]+$'; then
+  ok "hex-color bug still dispatched to a normal wa-worker slot ($HEXCOLOR_BUILDER) — unaffected by the hex domain fix"
+else
+  bad "hex-color bug did not dispatch to a wa-worker slot as expected (got: '${HEXCOLOR_BUILDER:-none}')"
+fi
+
+echo "Scenario ga-pp00f-c: hex-native WA bug with a BUSY batista-wa DEFERS — does NOT leak into the wa-worker pool"
+# Reuses the exact busy-crew fixture shape from Scenario 15c/15f (live in-flight
+# work + a matching session + sling-map entry) to make batista-wa busy, then
+# confirms the hex bug is NOT among this sweep's dispatched builders — proving
+# hex's rig_domain_exclude (pool-slot names) actually blocks the fallback
+# pick_pool_builder path, unlike warming's inert named-crew exclude (see header
+# comment above).
+NOW_ISO_PP00F="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+INFLIGHT_PP00F_C="[{\"id\":\"if-batista\",\"labels\":[\"story:in-flight\",\"lane:small\"],\"updated_at\":\"$NOW_ISO_PP00F\",\"metadata\":{\"pilot.sling_bead\":\"tt-sling-batista\"}}]"
+SESSIONS_PP00F_C='{"sessions":[{"session_name":"batista-wa","closed":false}]}'
+SLINGMAP_PP00F_C='{"tt-sling-batista":"batista-wa"}'
+LOG_PP00F_C="$(run_capacity 10 "$INFLIGHT_PP00F_C" 1 "$HEX_BUG" "$SESSIONS_PP00F_C" "$SLINGMAP_PP00F_C")"
+if echo "$LOG_PP00F_C" | grep -q "Busy builders (live in-flight): batista-wa"; then
+  ok "busy-builder set computed with batista-wa busy (fixture wired correctly)"
+else
+  bad "did not compute batista-wa as busy — fixture not wired as intended, the result below is not trustworthy"
+fi
+HEXBUILDER_C="$(builders_of "$LOG_PP00F_C")"
+if echo "$HEXBUILDER_C" | grep -qE '^wa-worker-[0-9]+$'; then
+  bad "REGRESSION (ga-pp00f): hex-native bug leaked into the wa-worker pool ($HEXBUILDER_C) when batista-wa was busy — reproduces the reclaim loop on a timing window"
+elif [ -z "$HEXBUILDER_C" ]; then
+  ok "hex-native bug correctly DEFERRED (no dispatch) while batista-wa is busy — never touches the wa-worker pool"
+else
+  bad "hex-native bug went to an unexpected target while batista-wa was busy: '$HEXBUILDER_C'"
+fi
+if echo "$LOG_PP00F_C" | grep -q "deferring tt-wahex to next sweep"; then
+  ok "defer is logged explicitly (domain-excluded from the fallback pool, not a silent drop)"
+else
+  bad "no explicit defer log line found for tt-wahex — investigate before trusting the outcome above"
+fi
+
+echo "Scenario ga-pp00f-d (control): a non-hex WA bug in the SAME sweep as a busy-owner hex bug still dispatches normally"
+TWO_BUGS_PP00F="[$(echo "$HEX_BUG" | jq -c '.[0]'),$(echo "$WA_ONE_BUG" | jq -c '.[0]')]"
+LOG_PP00F_D="$(run_capacity 10 "$INFLIGHT_PP00F_C" 1 "$TWO_BUGS_PP00F" "$SESSIONS_PP00F_C" "$SLINGMAP_PP00F_C")"
+NONHEX_BUILDER_D="$(echo "$LOG_PP00F_D" | grep 'Builder target:' | grep -v 'domain=hex' | sed -E 's/.*Builder target: ([^ ]+).*/\1/' | head -1)"
+if echo "$NONHEX_BUILDER_D" | grep -qE '^wa-worker-[0-9]+$'; then
+  ok "non-hex WA bug still dispatched to a wa-worker slot ($NONHEX_BUILDER_D) in the same sweep — hex exclusion is domain-scoped, not sweep-wide"
+else
+  bad "non-hex WA bug did not dispatch as expected (got: '${NONHEX_BUILDER_D:-none}') — hex fix may be over-broad"
+fi
+
+echo "Scenario ga-pp00f-e: drift-guard — the hex domain map is wired into the live dispatcher"
+if grep -qE 'whatsapp_automation/hex\|wa/hex\)[[:space:]]*echo "batista-wa"' "$DISPATCHER"; then
+  ok "hex domain prefers batista-wa (rig_domain_owner)"
+else
+  bad "hex domain does not map to batista-wa in rig_domain_owner as expected"
+fi
+if grep -qE 'whatsapp_automation/hex\|wa/hex\)[[:space:]]*return 0' "$DISPATCHER"; then
+  ok "hex domain is marked as requiring a persistent owner (structurally pool-incompatible)"
+else
+  bad "hex domain is not marked as requiring a persistent owner in rig_domain_requires_persistent_owner"
+fi
+if grep -qE 'whatsapp_automation/hex\|wa/hex\)[[:space:]]*echo "wa-worker' "$DISPATCHER"; then
+  ok "hex domain excludes the wa-worker pool slots themselves (the busy-owner leak fix)"
+else
+  bad "hex domain does not exclude the wa-worker pool slots in rig_domain_exclude"
+fi
+# Control: re-assert warming (Scenario 17g's own fixture/result) is unaffected by
+# the hex addition — the new case must not widen or shadow the existing one.
+if [ "$WARM_BUILDER" = "oracle-wa" ]; then
+  ok "ga-pp00f control: warming (Scenario 17g fixture) still dispatches to oracle-wa, unaffected by the hex addition"
+else
+  bad "ga-pp00f REGRESSION: warming routing changed after adding the hex domain (got: '${WARM_BUILDER:-none}')"
+fi
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
