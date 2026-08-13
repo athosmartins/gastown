@@ -986,6 +986,31 @@ EOF
   printf ''
 }
 
+# gate_pick_terminal_failed_sibling <branch_TAB_status_lines> <this_branch> —
+# pure (no IO, set -e safe). Same input shape as gate_pick_active_sibling but
+# looks for a DIFFERENT branch whose status is the terminal "failed" — the
+# ga-divv8 signature: two builders raced the same bead on two branches, and
+# the loser's FAILED marker had already gone terminal (so gate_pick_active_
+# sibling's active-only scan sees nothing) by the time the winner reached its
+# own pre-merge check. Same-branch rows are never a match here either — a
+# same-branch FAILED marker is this submission's OWN fix-and-resubmit
+# history, not a competing one (identical reasoning to gate_pick_active_
+# sibling above). Prints "" if no terminal-failed sibling is found.
+gate_pick_terminal_failed_sibling() {
+  local lines="$1" this_branch="$2" branch status
+  while IFS=$'\t' read -r branch status; do
+    [ -z "$branch" ] && continue
+    [ "$branch" = "$this_branch" ] && continue
+    if [ "$status" = "failed" ]; then
+      printf '%s\t%s' "$branch" "$status"
+      return 0
+    fi
+  done <<EOF
+$lines
+EOF
+  printf ''
+}
+
 # gate_bead_active_sibling_branch <gc_city> <bead_id> <this_branch> — bd-
 # backed. Prints "<branch><TAB><status>" of another branch's marker/gate-run
 # currently active for the SAME source bead, or "" if none. Queries the HQ
@@ -1003,11 +1028,32 @@ EOF
 # never permanently wedge a legitimately-solo branch.
 gate_bead_active_sibling_branch() {
   local gc_city="$1" bead_id="$2" this_branch="$3"
-  local siblings_json count i sib marker_status labels desc branch status lines sib_id
+  local lines
   if [ -z "$bead_id" ] || [ -z "$this_branch" ]; then
     printf ''
     return 0
   fi
+  lines=$(gate_bead_sibling_status_lines "$gc_city" "$bead_id")
+  gate_pick_active_sibling "$lines" "$this_branch"
+}
+
+# gate_bead_sibling_status_lines <gc_city> <bead_id> — bd-backed. Builds the
+# "<branch><TAB><gate-status-value>" lines for every marker/gate-run tied to
+# $bead_id (source-bead:$bead_id label), skipping closed markers (ga-4wncs)
+# and alerting on open-but-ambiguous gate-status state (ga-kgtiw/ga-7fwt1).
+#
+# Extracted from gate_bead_active_sibling_branch (ga-lxz5w) unchanged — this
+# is the exact same marker-walk that used to live inline in that function,
+# now shared so a SECOND sibling-shaped check (ga-divv8: a terminal-FAILED
+# sibling on a different branch, invisible to the active-only scan above)
+# can reuse it instead of re-deriving this carefully-tuned logic. Behavior
+# of gate_bead_active_sibling_branch itself is unchanged by this extraction
+# — same fail-open-on-error, same closed-marker skip, same ambiguity alert —
+# and gate-sibling-branch-guard.selftest.sh is the regression guard proving
+# that. See gate_bead_terminal_failed_sibling_branch below for the new use.
+gate_bead_sibling_status_lines() {
+  local gc_city="$1" bead_id="$2"
+  local siblings_json count i sib marker_status labels desc branch status lines sib_id
   siblings_json=$(bd -C "$gc_city" list --label "source-bead:$bead_id" --all --json 2>/dev/null || echo "[]")
   if [ -z "$siblings_json" ] || [ "$siblings_json" = "null" ]; then siblings_json="[]"; fi
   count=$(printf '%s' "$siblings_json" | jq 'length' 2>/dev/null || echo "0")
@@ -1075,7 +1121,82 @@ gate_bead_active_sibling_branch() {
     lines="${lines}${branch}	${status}
 "
   done
-  gate_pick_active_sibling "$lines" "$this_branch"
+  printf '%s' "$lines"
+}
+
+# gate_bead_terminal_failed_sibling_branch <gc_city> <bead_id> <this_branch>
+# — bd-backed. ga-divv8: surfaces (does NOT block) a different-branch sibling
+# marker that already reached the terminal gate-status:failed for this same
+# source bead — evidence two builders concurrently submitted independent
+# branches for one bead, and the loser's FAIL-path labels (gate-sha-failed:*,
+# gate:fix-attempt:N) are about to sit on the bead forever even after THIS
+# branch passes, reading as "this bead's work is rejected" when the opposite
+# is true (real incident: wa-4hzpd — crew/wa-worker's branch FAILED review;
+# crew/batista's independent branch, which already had the same fix, PASSED
+# minutes later and merged, but the FAILED branch's labels never cleared).
+#
+# Deliberately does NOT block/escalate the way gate_bead_active_sibling_
+# branch does for a still-ACTIVE sibling (ga-lxz5w/wa-fnibd): that case is
+# genuinely ambiguous — both branches passed their own review, and picking
+# the right one needs human judgment. A TERMINAL-FAILED sibling is not
+# ambiguous in the same way — the gate itself already adjudicated that
+# branch defective, so preferring the branch that is currently PASSING is a
+# safe default, not a guess. See gate_finalize_pass_label_hygiene for what
+# the caller does with this result.
+gate_bead_terminal_failed_sibling_branch() {
+  local gc_city="$1" bead_id="$2" this_branch="$3"
+  local lines
+  if [ -z "$bead_id" ] || [ -z "$this_branch" ]; then
+    printf ''
+    return 0
+  fi
+  lines=$(gate_bead_sibling_status_lines "$gc_city" "$bead_id")
+  gate_pick_terminal_failed_sibling "$lines" "$this_branch"
+}
+
+# gate_finalize_pass_label_hygiene <bead_city> <bead_id> <branch> — ga-divv8
+# companion to the ga-tuk26 residue-clear (search this file for "ga-tuk26"
+# for the original PASS-path label sites this is called from — there are 3).
+# Two things a PASS must also do, on top of the existing gate:failed/
+# gate:needs-fix removal:
+#  1. Clear gate:fix-attempt:* — exactly like gate:failed/gate:needs-fix
+#     (ga-tuk26), this label is only ever ADDED on FAIL, never removed on
+#     PASS, so it sticks around forever once any fix cycle happened. Left in
+#     place, it is the exact failure-shaped residue that fed the ga-divv8
+#     incident: something reading "fix-attempt" residue on an already-PASSED
+#     bead re-routed it (gc.routed_to reset to wa-worker) for a THIRD
+#     implementation attempt on work that had already merged.
+#  2. If a DIFFERENT branch for this same bead already reached the terminal
+#     gate-status:failed (gate_bead_terminal_failed_sibling_branch), leave a
+#     comment saying so explicitly, instead of silently letting this PASS
+#     overwrite that history with no trace. This does NOT touch the
+#     sibling's gate-sha-failed:<sha>:code stamp — ga-nooaw's permanent-
+#     rejection invariant for that exact SHA is untouched by design, only
+#     the fact that two branches raced is made visible on the bead.
+# Best-effort throughout (`|| true` on every bd call): this is label/comment
+# hygiene on an ALREADY-decided PASS, never a reason to fail the gate run.
+gate_finalize_pass_label_hygiene() {
+  local bead_city="$1" bead_id="$2" branch="$3"
+  local cur_labels fa_label sibling sib_branch sib_status
+  [ -z "$bead_id" ] && return 0
+  cur_labels=$(bd -C "$bead_city" show "$bead_id" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null || true)
+  # Same idiom as the existing fix-attempt-counter-bump site (~line 4690,
+  # "Bump the attempt counter (drop any stale counters first)") — a `for`
+  # over a command substitution, NOT a pipe into `while read`. A trailing
+  # pipe's last stage runs in a subshell in this shell (no `shopt -s
+  # lastpipe`), so `bd` calls inside it still execute for real, but nothing
+  # else in this function could observe loop-local state afterward if it
+  # ever needed to.
+  for fa_label in $(printf '%s' "$cur_labels" | tr ' ' '\n' | grep '^gate:fix-attempt:'); do
+    bd -C "$bead_city" label remove "$bead_id" "$fa_label" -q 2>/dev/null || true
+  done
+  sibling=$(gate_bead_terminal_failed_sibling_branch "$GC_CITY" "$bead_id" "$branch" 2>/dev/null || true)
+  if [ -n "$sibling" ]; then
+    sib_branch=$(printf '%s' "$sibling" | cut -f1)
+    sib_status=$(printf '%s' "$sibling" | cut -f2)
+    bd -C "$bead_city" comment "$bead_id" "ga-divv8: this PASS (branch $branch) has a sibling branch '$sib_branch' that independently reached gate-status:$sib_status for the same bead -- two builders raced this bead concurrently. The winning branch ($branch) is what is live now; the sibling's gate-sha-failed/fix-attempt labels describe only its own rejected SHA, not this bead's current state." 2>/dev/null || true
+  fi
 }
 
 # gate_bead_live_merge_block <bead_city> <bead_id> — bd-backed. Re-reads the
@@ -4137,6 +4258,9 @@ fi
       # safe no-op on a bead that never failed.
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:failed" -q 2>/dev/null || true
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:needs-fix" -q 2>/dev/null || true
+      # ga-divv8: clear stale gate:fix-attempt:* residue and surface (not
+      # block) a terminal-FAILED sibling branch — see the function header.
+      gate_finalize_pass_label_hygiene "$BEAD_CITY" "$BEAD_ID" "$BRANCH"
       bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED. Branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA) via autonomous dispatcher (gate_run=$GATE_RUN_ID)." 2>/dev/null || true
 
       # Read the source bead state authoritatively (labels + live assignee).
@@ -6182,6 +6306,10 @@ if [ "$NEEDS_REBASE_COUNT" -gt 0 ]; then
             # PASS-path sibling (ga-esbg block, ~line 3545) for full rationale.
             bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:failed" -q 2>/dev/null || true
             bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:needs-fix" -q 2>/dev/null || true
+            # ga-divv8: clear stale gate:fix-attempt:* residue and surface
+            # (not block) a terminal-FAILED sibling branch — see the
+            # function header.
+            gate_finalize_pass_label_hygiene "$BEAD_CITY" "$BEAD_ID" "$NR_BRANCH"
             bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $NR_BRANCH already in $DEFAULT_BRANCH — gate skipped (marker $NR_MARKER_ID superseded, reaped from stranded needs-rebase). STORY: handed off to story-delivery (gate:passed set; story:approved kept; story:in-flight stripped). (ga-88sl7)" 2>/dev/null || true
           else
             bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:superseded" -q 2>/dev/null || true
@@ -7076,6 +7204,9 @@ if [ "$ALREADY_MERGED" = "1" ]; then
           # PASS-path sibling (ga-esbg block, ~line 3545) for full rationale.
           bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:failed" -q 2>/dev/null || true
           bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:needs-fix" -q 2>/dev/null || true
+          # ga-divv8: clear stale gate:fix-attempt:* residue and surface (not
+          # block) a terminal-FAILED sibling branch — see the function header.
+          gate_finalize_pass_label_hygiene "$BEAD_CITY" "$BEAD_ID" "$BRANCH"
           bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $BRANCH already in $DEFAULT_BRANCH — gate skipped (marker $MARKER_ID superseded), but this is a STORY: handed off to story-delivery (gate:passed set; story:approved kept; story:in-flight stripped; builder assignee cleared). Delivery will deploy + prod-test, then mark story:done and CLOSE with a delivery reason so it reaches painel Done (ga-i53ua)." 2>/dev/null || true
           log "Already-merged STORY $BEAD_ID handed off to delivery (gate:passed set; story:approved kept for delivery pickup)."
         else
