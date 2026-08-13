@@ -174,6 +174,55 @@ recommends) has been silently stale since 2026-08-07 — bd migrated fully to
 a Dolt-native `interactions` table per commit 5184b2a0c, and that table is
 confirmed EMPTY (0 rows) on this city's live hq database, so per-mutation
 actor attribution is not currently recoverable at all, not just slow.
+
+ga-f6igb, round 2 (GATE-FEEDBACK gate_run=ga-2esd2, 2026-08-13, both blocking):
+issue 2 was a straight downgrade — the SELF-HEAL-SKIPPED branch above used
+emit(), which pages (-p4 notify) unconditionally on every run_cycle() pass
+(POLL_SEC, default 600s) for as long as a labeled bead sits open+unassigned,
+routinely 8-27 days per this bug's own comment thread — 100+ redundant pages/
+day for a correctly-skipped, non-actionable event. Now print(), matching this
+function's other skip/warn paths.
+
+Issue 1 was sharper: round 1's label set is real but provably incomplete in
+general, not just in this one instance. dog-ga3wack's 2026-08-08 21:08
+comment on THIS bead (ga-5ksp5, a legitimately-finished, unlabeled release)
+is on-thread precedent — the labeled-release theory has a live counterexample
+in its own history. And it cannot be patched by adding more labels to the
+recognized set: order:orphan-sweep's own reset (orphan-sweep.sh:~315) is
+*always* unlabeled by construction, so the unlabeled bucket unavoidably
+contains BOTH every genuine accident (which this guard exists to heal) AND
+any deliberate release that happens to skip labeling (which it must not
+heal) — no labeling vocabulary, however complete, can separate two things
+that are label-identical by definition. Confirmed (not assumed) that no
+per-mutation actor signal closes this instead, beyond the two already ruled
+out above: `gc order history orphan-sweep --json` tracking beads carry no
+captured stdout (checked ga-wisp-5vpn58f, description+comments both empty);
+no durable orphan-sweep execution log exists on disk (`orphan-sweep:
+resetting $bead_id` never lands anywhere greppable — its echo is not
+persisted); orphan-sweep.sh's own CONFIRM_THRESHOLD ledger
+(orphan-sweep-counts.json) deletes a bead's entry at the exact moment it
+resets it (`jq 'del(.[$id])'`, Step 3), so there is nothing left to read
+post-hoc; `issues.actor` exists in the Dolt schema but is populated for
+event/order-dispatch rows, not general issue-mutation attribution (verified
+via `DESCRIBE issues`); dolt_log's committer/email is a generic service
+identity for bd-tool writes regardless of caller (this repo's own doctrine,
+corroborated — queries against it timed out on the live hq database rather
+than returning a useful answer). Inference from EXISTING state cannot close
+this gap. So this fix closes it from the other side: orphan-sweep.sh now
+stamps `orphan-sweep:reset` in the SAME `bd update` call that performs its
+reset (atomic, one invocation) — symmetric with the shield labels this guard
+already stamps in the other direction (orphan-sweep:shielded[-until:],
+below, which orphan-sweep.sh already honors unconditionally). Healing now
+requires this POSITIVE marker, not merely the absence of a deliberate-release
+label — collapsing "cannot determine" into "assume accident" is exactly the
+third-state failure GATE-FEEDBACK's mandatory check exists to catch. The
+marker is single-use: `_has_orphan_sweep_reset_marker()` is checked and the
+label is stripped immediately for every candidate this function evaluates,
+regardless of which branch ultimately decides the outcome — so a leftover
+marker from one incident can never be replayed as false evidence for a
+LATER, unrelated release of the same bead id (the same additive-residue
+trap documented against gate-sha-failed-style permanent labels elsewhere in
+this city's doctrine).
 """
 import json
 import os
@@ -2717,6 +2766,32 @@ def _has_deliberate_release_signal(labels):
     return False
 
 
+def _has_orphan_sweep_reset_marker(labels):
+    """True if labels carry "orphan-sweep:reset" — orphan-sweep.sh's own,
+    positive, same-call-atomic stamp that IT (not some other mechanism, not
+    a deliberate release) performed the status/assignee reset this candidate
+    is being evaluated for (ga-f6igb round 2, GATE-FEEDBACK gate_run=ga-2esd2
+    blocking issue 1).
+
+    This exists because labels describing DELIBERATE intent
+    (_has_deliberate_release_signal() above) cannot, even in principle, cover
+    every deliberate release: order:orphan-sweep's own reset is always
+    unlabeled, so "unlabeled" can never be read as "therefore accidental" —
+    it is also exactly what an unlabeled deliberate release looks like (the
+    on-thread ga-5ksp5 precedent). Flipping the source of truth to a marker
+    orphan-sweep.sh stamps ON ITSELF closes the gap from the side that CAN be
+    made reliable: orphan-sweep.sh is a single, fully-owned call site
+    (packs/town-deltas/assets/scripts/orphan-sweep.sh, Step 3), unlike every
+    OTHER place in this city a deliberate release can originate from.
+
+    See heal_orphan_sweep_false_resets() for the single-use contract (this
+    marker is stripped the moment it's read, for every candidate evaluated,
+    regardless of outcome — never trust a leftover instance of this label as
+    fresh evidence).
+    """
+    return "orphan-sweep:reset" in labels
+
+
 def heal_orphan_sweep_false_resets(sessions, now):
     """Restore beads whose claim was wrongfully reset by order:orphan-sweep
     (ga-seuh4/ga-a8t68) while the claiming session was still genuinely alive.
@@ -2756,6 +2831,19 @@ def heal_orphan_sweep_false_resets(sessions, now):
     claim down. See that helper's own docstring for the exact label set and
     why it is a narrow, curated subset rather than every known park label.
 
+    ga-f6igb round 2 (GATE-FEEDBACK gate_run=ga-2esd2): the label check above
+    is necessary but, on its own, NOT sufficient — order:orphan-sweep's own
+    reset is always unlabeled, so "no recognized label" cannot be read as
+    "therefore accidental" (see _has_orphan_sweep_reset_marker()'s docstring
+    and the module docstring's round-2 section for why no labeling vocabulary
+    can close this, and why no other attribution signal in this codebase
+    does either). Restoring a claim now ALSO requires orphan-sweep.sh's own
+    positive "orphan-sweep:reset" marker to be present — collapsing "cannot
+    determine whether this was deliberate" into "proceed as if it wasn't" is
+    the exact third-state failure this fix closes. The marker is read and
+    stripped (single-use) for every candidate this function evaluates,
+    whether or not that candidate goes on to heal.
+
     Returns count of beads healed this cycle.
     """
     candidates = list_orphan_sweep_false_resets()
@@ -2770,16 +2858,59 @@ def heal_orphan_sweep_false_resets(sessions, now):
         stale_assignee = meta.get("gc.session_name") or ""
         if not stale_assignee:
             continue
+        labels = b.get("labels") or []
+        rig_root = b.get("rig_root")
+        _bd = ["bd", "-C", rig_root] if rig_root else ["bd"]
+
+        # ga-f6igb round 2: read + immediately consume the positive
+        # orphan-sweep marker BEFORE any of the checks below, independent of
+        # which branch ultimately decides this candidate's outcome. This is
+        # deliberate, not incidental ordering — if the strip only happened
+        # inside the eventual heal branch, a marker attached to a candidate
+        # that gets skipped for an UNRELATED reason (e.g. it also happens to
+        # carry a stale deliberate-release label from a much earlier,
+        # already-resolved incident on the same bead id) would survive to be
+        # wrongly read as fresh evidence on some LATER, unrelated reset of
+        # that same id. Uses _remove_label_verified() (ga-jzye0), not a bare
+        # subprocess.run — this is the same risk class do_reclaim() already
+        # hardened elsewhere in this file: a `bd label remove` that reports
+        # rc=0 without durably landing (Dolt replication lag / transient
+        # hiccup) would leave the marker readable again on a later cycle,
+        # silently reopening the exact stale-residue window this consumption
+        # step exists to close. A confirmed-failed removal does NOT change
+        # THIS cycle's decision below (has_orphan_sweep_marker already
+        # reflects what was true at read time) — it only means a future
+        # cycle might see the marker again, which is logged honestly rather
+        # than silently assumed away.
+        has_orphan_sweep_marker = _has_orphan_sweep_reset_marker(labels)
+        if has_orphan_sweep_marker:
+            if not _remove_label_verified(_bd, bead_id, "orphan-sweep:reset"):
+                print(f"[INFLIGHT-RECLAIM] warn: could not confirm removal of "
+                      f"orphan-sweep:reset on bead={bead_id} after retries — "
+                      f"proceeding with this cycle's decision anyway; a future "
+                      f"cycle may still see this marker", flush=True)
+
         # ga-f6igb: a deliberate stand-down (explicit refusal, park, active
         # hold, or prior escalation) looks IDENTICAL to an orphan-sweep false
         # reset from this point on — both leave gc.* metadata intact with the
         # claiming session still live. Only a label can tell them apart; see
         # _has_deliberate_release_signal()'s own docstring for the two
         # confirmed live incidents (ga-wgvca, ga-wzl83) this check closes.
-        if _has_deliberate_release_signal(b.get("labels") or []):
-            emit(f"[INFLIGHT-RECLAIM] [SELF-HEAL-SKIPPED] bead={bead_id} "
-                 f"carries a deliberate-release label — NOT restoring "
-                 f"assignee={stale_assignee!r} (ga-f6igb)")
+        if _has_deliberate_release_signal(labels):
+            # GATE-FEEDBACK (gate_run=ga-2esd2, blocking issue 2): this branch
+            # is reached on every unconditional run_cycle() pass (POLL_SEC,
+            # default 600s) for as long as the bead sits open+unassigned+
+            # labeled — routinely 8-27 days per this bug's own thread (see
+            # Mayor's 2026-08-13 comments on this bead). emit() doesn't just
+            # log, it fires a real -p4 (high-priority) push notification —
+            # that's 100+ redundant pages/day for a correctly-skipped,
+            # non-actionable event. print() matches this same function's own
+            # convention for its other skip/warn paths a few lines below
+            # (self-heal update failed/exception) — informational, not
+            # page-worthy.
+            print(f"[INFLIGHT-RECLAIM] [SELF-HEAL-SKIPPED] bead={bead_id} "
+                  f"carries a deliberate-release label — NOT restoring "
+                  f"assignee={stale_assignee!r} (ga-f6igb)", flush=True)
             continue
         # Freshness guard: this metadata shape (open + unassigned + stale
         # gc.session_name of a still-live session) is NOT unique to an
@@ -2800,8 +2931,16 @@ def heal_orphan_sweep_false_resets(sessions, now):
             continue
         if not concrete_adhoc_session_is_live(stale_assignee, sessions, now):
             continue  # genuinely dead — leave for normal re-dispatch
-        rig_root = b.get("rig_root")
-        _bd = ["bd", "-C", rig_root] if rig_root else ["bd"]
+        if not has_orphan_sweep_marker:
+            # ga-f6igb round 2 (GATE-FEEDBACK blocking issue 1): no positive
+            # attribution to orphan-sweep — this reset could equally be an
+            # unlabeled deliberate release (the ga-5ksp5 shape). Absence of
+            # evidence is not evidence of absence: default to NOT healing.
+            print(f"[INFLIGHT-RECLAIM] [SELF-HEAL-SKIPPED] bead={bead_id} "
+                  f"no orphan-sweep:reset marker — cannot positively "
+                  f"attribute this reset to orphan-sweep, NOT restoring "
+                  f"assignee={stale_assignee!r} (ga-f6igb)", flush=True)
+            continue
         try:
             r = subprocess.run(
                 _bd + ["update", bead_id, "--status", "in_progress",
@@ -5799,7 +5938,12 @@ def _selftest():
 
     def _stub_sh_heal(cmd, **kw):
         if cmd[:2] == ["bd", "list"]:
-            return _FakeGitResult(0, json.dumps([_sh_bead("ga-shtest1", "dog-galive1")]))
+            # ga-f6igb round 2: the orphan-sweep:reset marker is what makes
+            # this a genuine, healable orphan-sweep reset post-fix — see
+            # SH-11/SH-12 below for the marker-absent/marker-present pair
+            # this file's docstring calls out explicitly.
+            return _FakeGitResult(0, json.dumps(
+                [_sh_bead("ga-shtest1", "dog-galive1", labels=["orphan-sweep:reset"])]))
         if cmd[:2] == ["bd", "update"]:
             _sh_update_calls.append(list(cmd))
             return _FakeGitResult(0, "")
@@ -5809,6 +5953,12 @@ def _selftest():
         if cmd[:2] == ["bd", "comment"]:
             _sh_comment_calls.append(list(cmd))
             return _FakeGitResult(0, "")
+        if cmd[:2] == ["bd", "show"]:
+            # ga-f6igb round 2: _remove_label_verified()'s read-back — confirm
+            # removal landed (label gone) so it returns True on attempt 1
+            # instead of retrying x4 with real sleeps (ga-jzye0 stub trap:
+            # an unstubbed `bd show` here reads as "can never confirm").
+            return _FakeGitResult(0, json.dumps({"id": "ga-shtest1", "labels": []}))
         return _FakeGitResult(0, "")
 
     subprocess.run = _stub_sh_heal
@@ -5847,11 +5997,20 @@ def _selftest():
 
     def _stub_sh_heal_label_fails(cmd, **kw):
         if cmd[:2] == ["bd", "list"]:
-            return _FakeGitResult(0, json.dumps([_sh_bead("ga-shtest1f", "dog-galive1")]))
+            # ga-f6igb round 2: marker required to heal post-fix (see SH-1 above).
+            return _FakeGitResult(0, json.dumps(
+                [_sh_bead("ga-shtest1f", "dog-galive1", labels=["orphan-sweep:reset"])]))
         if cmd[:2] == ["bd", "update"]:
             return _FakeGitResult(0, "")
         if cmd[:2] == ["bd", "label"]:
-            return _FakeGitResult(1, "")  # label add fails
+            return _FakeGitResult(1, "")  # label add/remove reports failure...
+        if cmd[:2] == ["bd", "show"]:
+            # ...but this stub's read-back shows it landed anyway (the exact
+            # race _remove_label_verified exists to catch — ga-jzye0) so the
+            # marker-removal step confirms quickly (attempt 1, no real sleep)
+            # and this test stays focused on ITS OWN purpose (shield-label
+            # failure must not block the heal / must not be misreported).
+            return _FakeGitResult(0, json.dumps({"id": "ga-shtest1f", "labels": []}))
         if cmd[:2] == ["bd", "comment"]:
             _sh_comment_calls_f.append(list(cmd))
             return _FakeGitResult(0, "")
@@ -6055,12 +6214,19 @@ def _selftest():
 
     def _stub_sh9(cmd, **kw):
         if cmd[:2] == ["bd", "list"]:
+            # ga-f6igb round 2: marker required to heal post-fix (see SH-1 above);
+            # this test's own point (in-flight labels don't block healing) is
+            # orthogonal to the marker requirement, so both are present here.
             return _FakeGitResult(0, json.dumps(
                 [_sh_bead("ga-shtest9", "dog-galive1",
-                          labels=["ctx:ready", "exec:auto", "story:in-flight"])]))
+                          labels=["ctx:ready", "exec:auto", "story:in-flight",
+                                  "orphan-sweep:reset"])]))
         if cmd[:2] == ["bd", "update"]:
             _sh9_update_calls.append(list(cmd))
             return _FakeGitResult(0, "")
+        if cmd[:2] == ["bd", "show"]:
+            # ga-f6igb round 2: confirm marker-removal read-back (see SH-1 above).
+            return _FakeGitResult(0, json.dumps({"id": "ga-shtest9", "labels": []}))
         if cmd[:2] in (["bd", "label"], ["bd", "comment"]):
             return _FakeGitResult(0, "")
         return _FakeGitResult(0, "")
@@ -6086,12 +6252,19 @@ def _selftest():
 
     def _stub_sh10(cmd, **kw):
         if cmd[:2] == ["bd", "list"]:
+            # ga-f6igb round 2: marker required to heal post-fix (see SH-1 above);
+            # this test's own point (ctx:thin doesn't block healing) is
+            # orthogonal to the marker requirement, so both are present here.
             return _FakeGitResult(0, json.dumps(
                 [_sh_bead("ga-shtest10", "dog-galive1",
-                          labels=["ctx:thin", "ctx:ready", "exec:auto"])]))
+                          labels=["ctx:thin", "ctx:ready", "exec:auto",
+                                  "orphan-sweep:reset"])]))
         if cmd[:2] == ["bd", "update"]:
             _sh10_update_calls.append(list(cmd))
             return _FakeGitResult(0, "")
+        if cmd[:2] == ["bd", "show"]:
+            # ga-f6igb round 2: confirm marker-removal read-back (see SH-1 above).
+            return _FakeGitResult(0, json.dumps({"id": "ga-shtest10", "labels": []}))
         if cmd[:2] in (["bd", "label"], ["bd", "comment"]):
             return _FakeGitResult(0, "")
         return _FakeGitResult(0, "")
@@ -6103,6 +6276,131 @@ def _selftest():
               "does NOT block self-heal — curated set, not the full park vocabulary",
               _healed10 == 1 and len(_sh10_update_calls) == 1,
               f"healed={_healed10} calls={_sh10_update_calls!r}")
+    finally:
+        subprocess.run = _orig_run_sh
+
+    # SH-11 (ga-f6igb round 2, GATE-FEEDBACK gate_run=ga-2esd2 blocking issue 1):
+    # a candidate with NEITHER a recognized deliberate-release label NOR the
+    # orphan-sweep:reset marker must NOT be healed. This is the exact gap the
+    # round-1 fix missed: order:orphan-sweep's own reset is always unlabeled,
+    # so "no recognized label" alone was silently read as "therefore
+    # accidental" (SH-9 above). Reproduces the ga-5ksp5 shape on-thread
+    # (dog-ga3wack's 2026-08-08 21:08 comment on this bead) — a legitimately-
+    # finished, unlabeled release that would have been WRONGLY restored by
+    # round-1's code. Also asserts emit()/notify is never reached on this
+    # path (would double as a regression guard for blocking issue 2 even if
+    # SH-8 above didn't already cover the labeled-skip case).
+    _sh11_update_calls = []
+    _sh11_notify_calls = []
+
+    def _stub_sh11(cmd, **kw):
+        if cmd[:2] == ["bd", "list"]:
+            return _FakeGitResult(0, json.dumps(
+                [_sh_bead("ga-shtest11", "dog-galive1", labels=[])]))
+        if cmd[:2] == ["bd", "update"]:
+            _sh11_update_calls.append(list(cmd))
+            return _FakeGitResult(0, "")
+        if cmd and "notify" in cmd[0]:
+            _sh11_notify_calls.append(list(cmd))
+            return _FakeGitResult(0, "")
+        return _FakeGitResult(0, "")
+
+    subprocess.run = _stub_sh11
+    try:
+        _healed11 = heal_orphan_sweep_false_resets(_sh_live_sessions, T_sh)
+        check("SH-11 (ga-f6igb round 2, AC2 unlabeled case): no deliberate-release "
+              "label AND no orphan-sweep:reset marker -> NOT healed (closes the "
+              "ga-5ksp5 gap round 1 missed)",
+              _healed11 == 0 and _sh11_update_calls == [],
+              f"healed={_healed11} calls={_sh11_update_calls!r}")
+        check("SH-11b (ga-f6igb round 2, blocking issue 2 regression guard): "
+              "SELF-HEAL-SKIPPED path never calls notify (print(), not emit())",
+              _sh11_notify_calls == [],
+              f"notify calls={_sh11_notify_calls!r}")
+    finally:
+        subprocess.run = _orig_run_sh
+
+    # SH-12 (ga-f6igb round 2, AC2 positive path): a candidate carrying the
+    # orphan-sweep:reset marker — the real shape orphan-sweep.sh now produces
+    # on every genuine reset (Step 3's own bd update, this fix's other half)
+    # — IS healed, and the marker is consumed (stripped) as part of
+    # processing it, so it can never be replayed as stale evidence for a
+    # later, unrelated reset of the same bead id.
+    _sh12_update_calls = []
+    _sh12_label_calls = []
+
+    def _stub_sh12(cmd, **kw):
+        if cmd[:2] == ["bd", "list"]:
+            return _FakeGitResult(0, json.dumps(
+                [_sh_bead("ga-shtest12", "dog-galive1", labels=["orphan-sweep:reset"])]))
+        if cmd[:2] == ["bd", "update"]:
+            _sh12_update_calls.append(list(cmd))
+            return _FakeGitResult(0, "")
+        if cmd[:2] == ["bd", "label"]:
+            _sh12_label_calls.append(list(cmd))
+            return _FakeGitResult(0, "")
+        if cmd[:2] == ["bd", "show"]:
+            # ga-f6igb round 2: confirm marker-removal read-back (see SH-1 above).
+            return _FakeGitResult(0, json.dumps({"id": "ga-shtest12", "labels": []}))
+        if cmd[:2] == ["bd", "comment"]:
+            return _FakeGitResult(0, "")
+        return _FakeGitResult(0, "")
+
+    subprocess.run = _stub_sh12
+    try:
+        _healed12 = heal_orphan_sweep_false_resets(_sh_live_sessions, T_sh)
+        check("SH-12 (ga-f6igb round 2, AC2 positive path): orphan-sweep:reset "
+              "marker present -> healed",
+              _healed12 == 1 and len(_sh12_update_calls) == 1,
+              f"healed={_healed12} calls={_sh12_update_calls!r}")
+        check("SH-12b (ga-f6igb round 2): marker is consumed (bd label remove "
+              "orphan-sweep:reset), single-use, not left to be replayed stale",
+              any(c[:2] == ["bd", "label"] and c[2:5] == ["remove", "ga-shtest12", "orphan-sweep:reset"]
+                  for c in _sh12_label_calls),
+              f"label calls={_sh12_label_calls!r}")
+    finally:
+        subprocess.run = _orig_run_sh
+
+    # SH-13 (ga-f6igb round 2, marker-strip is unconditional): a candidate
+    # that carries BOTH the orphan-sweep:reset marker AND a deliberate-
+    # release label must still have the marker stripped, even though the
+    # deliberate-release label wins and blocks the heal — otherwise the
+    # marker would survive this pass and could be misread as fresh evidence
+    # on a LATER, unrelated reset of the same bead id (see
+    # heal_orphan_sweep_false_resets()'s own comment on why the strip happens
+    # before, not inside, the eventual heal branch).
+    _sh13_update_calls = []
+    _sh13_label_calls = []
+
+    def _stub_sh13(cmd, **kw):
+        if cmd[:2] == ["bd", "list"]:
+            return _FakeGitResult(0, json.dumps(
+                [_sh_bead("ga-shtest13", "dog-galive1",
+                          labels=["orphan-sweep:reset", "pool:refused"])]))
+        if cmd[:2] == ["bd", "update"]:
+            _sh13_update_calls.append(list(cmd))
+            return _FakeGitResult(0, "")
+        if cmd[:2] == ["bd", "label"]:
+            _sh13_label_calls.append(list(cmd))
+            return _FakeGitResult(0, "")
+        if cmd[:2] == ["bd", "show"]:
+            # ga-f6igb round 2: confirm marker-removal read-back (see SH-1 above).
+            return _FakeGitResult(0, json.dumps({"id": "ga-shtest13", "labels": ["pool:refused"]}))
+        return _FakeGitResult(0, "")
+
+    subprocess.run = _stub_sh13
+    try:
+        _healed13 = heal_orphan_sweep_false_resets(_sh_live_sessions, T_sh)
+        check("SH-13 (ga-f6igb round 2, precedence): deliberate-release label "
+              "still wins over a present marker -> NOT healed",
+              _healed13 == 0 and _sh13_update_calls == [],
+              f"healed={_healed13} calls={_sh13_update_calls!r}")
+        check("SH-13b (ga-f6igb round 2): marker is still stripped even on the "
+              "label-wins-skip path (unconditional consumption, not tied to "
+              "the heal branch)",
+              any(c[:2] == ["bd", "label"] and c[2:5] == ["remove", "ga-shtest13", "orphan-sweep:reset"]
+                  for c in _sh13_label_calls),
+              f"label calls={_sh13_label_calls!r}")
     finally:
         subprocess.run = _orig_run_sh
 

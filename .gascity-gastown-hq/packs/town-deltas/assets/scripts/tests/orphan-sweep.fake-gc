@@ -33,6 +33,9 @@ case "$cmd $sub" in
     ;;
 "bd update")
     # orphan-sweep.sh calls: gc bd update "$bead_id" --status=open --assignee=""
+    # --add-label "orphan-sweep:reset" (ga-f6igb round 2). Only $3 (bead_id)
+    # is read below — the flags after it are intentionally ignored here, so
+    # adding --add-label did not require touching this shim's parsing.
     bead_id="${3:-}"
     printf '%s\n' "$bead_id" >> "${RESET_LOG:-/dev/null}"
     ;;

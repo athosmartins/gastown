@@ -311,8 +311,20 @@ while IFS=$'\t' read -r bead_id assignee update_age_secs shield_remaining; do
             # Confirmed orphaned across CONFIRM_THRESHOLD consecutive sweeps —
             # act. `gc bd update` auto-resolves the bead's prefix to the right
             # rig store, so HQ and rig beads update in the correct database.
+            # ga-f6igb round 2 (GATE-FEEDBACK gate_run=ga-2esd2): stamp
+            # orphan-sweep:reset atomically in this SAME update call — the
+            # positive, single-call-atomic marker inflight-reclaim-guard.py's
+            # heal_orphan_sweep_false_resets() now REQUIRES before restoring a
+            # claim. No per-mutation actor attribution exists anywhere in this
+            # codebase to tell a genuine orphan-sweep reset apart from an
+            # unlabeled deliberate release after the fact (both leave the
+            # identical bd-state shape; see that file's own module docstring
+            # for the full audit-trail investigation) — this closes the gap
+            # from the one side that CAN be made reliable: this call site is
+            # the only place order:orphan-sweep itself resets a claim, so
+            # self-stamping here is a complete, not partial, positive signal.
             echo "orphan-sweep: resetting $bead_id (assignee=$assignee, update_age=${update_age_secs}s, confirmed ${NEW}x consecutive sweeps)"
-            gc bd update "$bead_id" --status=open --assignee="" 2>/dev/null || true
+            gc bd update "$bead_id" --status=open --assignee="" --add-label "orphan-sweep:reset" 2>/dev/null || true
             ORPHANED=$((ORPHANED + 1))
             COUNTS=$(echo "$COUNTS" | jq --arg id "$bead_id" 'del(.[$id])') || true
         else
