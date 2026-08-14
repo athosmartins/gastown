@@ -1028,21 +1028,36 @@ gate_is_active_gate_status() {
   esac
 }
 
-# gate_pick_active_sibling <branch_TAB_status_lines> <this_branch> — pure (no
-# IO, set -e safe). Each input line is "<branch><TAB><gate-status-value>" for
-# one marker/gate-run tied to the same source bead. Prints the FIRST line
-# whose branch differs from $this_branch AND whose status is active — i.e. a
-# genuinely CONCURRENT competitor. Same-branch rows are always this run's own
-# earlier state, never a sibling (a `-reland` resubmission always gets a NEW
-# branch name — see ga-dupnv's Step 5b comment for why branch, not bead, is
-# the right key: same-bead-different-branch-over-time is a legitimate,
-# non-conflicting, sequential case that must NOT be flagged here). Prints ""
-# if no active sibling is found.
+# gate_pick_active_sibling <branch_TAB_status_TAB_rig_lines> <this_branch>
+# <this_rig> — pure (no IO, set -e safe). Each input line is "<branch><TAB>
+# <gate-status-value><TAB><rig>" for one marker/gate-run tied to the same
+# source bead (rig may be empty — see ga-cc0xu0 below). Prints the FIRST line
+# whose branch differs from $this_branch, whose rig doesn't rule it out (see
+# below), AND whose status is active — i.e. a genuinely CONCURRENT competitor.
+# Same-branch rows are always this run's own earlier state, never a sibling
+# (a `-reland` resubmission always gets a NEW branch name — see ga-dupnv's
+# Step 5b comment for why branch, not bead, is the right key: same-bead-
+# different-branch-over-time is a legitimate, non-conflicting, sequential
+# case that must NOT be flagged here). Prints "" if no active sibling is
+# found.
+#
+# ga-cc0xu0: a sibling whose rig differs from this_branch's own rig lives in
+# a DIFFERENT repo — it cannot possibly touch the same file, so it is not the
+# ambiguous same-repo race this guard exists for (real incident: ga-duwz22's
+# two complementary branches, one per repo, leapfrogged gate:needs-human
+# forever with zero actual conflict possible). Only skip when BOTH sides are
+# non-empty and differ — either side empty (a marker predating the rig:
+# field, or this_branch's own rig never resolved) falls back to the ORIGINAL
+# same-repo-assumed behavior. Same-repo races are completely unaffected: this
+# narrows the guard, it does not remove it.
 gate_pick_active_sibling() {
-  local lines="$1" this_branch="$2" branch status
-  while IFS=$'\t' read -r branch status; do
+  local lines="$1" this_branch="$2" this_rig="${3:-}" branch status rig
+  while IFS=$'\t' read -r branch status rig; do
     [ -z "$branch" ] && continue
     [ "$branch" = "$this_branch" ] && continue
+    if [ -n "$rig" ] && [ -n "$this_rig" ] && [ "$rig" != "$this_rig" ]; then
+      continue
+    fi
     if [ "$(gate_is_active_gate_status "$status")" = "yes" ]; then
       printf '%s\t%s' "$branch" "$status"
       return 0
@@ -1064,8 +1079,11 @@ EOF
 # history, not a competing one (identical reasoning to gate_pick_active_
 # sibling above). Prints "" if no terminal-failed sibling is found.
 gate_pick_terminal_failed_sibling() {
-  local lines="$1" this_branch="$2" branch status
-  while IFS=$'\t' read -r branch status; do
+  local lines="$1" this_branch="$2" branch status rig
+  # ga-cc0xu0: lines now carry a 3rd (rig) field — read it into $rig (unused
+  # here) so it doesn't bleed into $status via read's last-var-gets-remainder
+  # behavior, which would break the exact-match below.
+  while IFS=$'\t' read -r branch status rig; do
     [ -z "$branch" ] && continue
     [ "$branch" = "$this_branch" ] && continue
     if [ "$status" = "failed" ]; then
@@ -1078,36 +1096,46 @@ EOF
   printf ''
 }
 
-# gate_bead_active_sibling_branch <gc_city> <bead_id> <this_branch> — bd-
-# backed. Prints "<branch><TAB><status>" of another branch's marker/gate-run
-# currently active for the SAME source bead, or "" if none. Queries the HQ
-# city (source-bead: labels are always written there by gate-done.md and
-# Step 6, regardless of which rig bead_id itself lives in) — pass gc_city,
-# never bead_city. A gate-run bead has no branch: LABEL (only a marker does —
-# gate-done.md Step 3); it carries the branch in its description instead
-# (Step 6, "branch: $BRANCH"), so the label is tried first, description second
-# — mirrors the established extract()-from-description convention (see
-# docs/gate-marker-recipe.md) rather than a single brittle inline jq regex.
-# Deliberately reads live (no bd-list-cached.sh) — same freshness reasoning as
-# gate_bead_has_prior_sha_fail above: this gates a hard-to-reverse merge
-# decision. FAIL-OPEN ("" / no sibling found) on any bd/jq error or missing
-# fields — identical rationale as the SHA-fail check: a transient hiccup must
-# never permanently wedge a legitimately-solo branch.
+# gate_bead_active_sibling_branch <gc_city> <bead_id> <this_branch>
+# [this_rig] — bd-backed. Prints "<branch><TAB><status>" of another branch's
+# marker/gate-run currently active for the SAME source bead, or "" if none.
+# Queries the HQ city (source-bead: labels are always written there by
+# gate-done.md and Step 6, regardless of which rig bead_id itself lives in)
+# — pass gc_city, never bead_city. A gate-run bead has no branch: LABEL (only
+# a marker does — gate-done.md Step 3); it carries the branch in its
+# description instead (Step 6, "branch: $BRANCH"), so the label is tried
+# first, description second — mirrors the established extract()-from-
+# description convention (see docs/gate-marker-recipe.md) rather than a
+# single brittle inline jq regex. Deliberately reads live (no
+# bd-list-cached.sh) — same freshness reasoning as gate_bead_has_prior_sha_
+# fail above: this gates a hard-to-reverse merge decision. FAIL-OPEN ("" /
+# no sibling found) on any bd/jq error or missing fields — identical
+# rationale as the SHA-fail check: a transient hiccup must never permanently
+# wedge a legitimately-solo branch.
+#
+# ga-cc0xu0: this_rig (this run's own $RIG — "which repo holds the CODE",
+# NOT the bead-rig:/bead_rig: field, which means "which STORE holds the
+# BEAD" and diverges from $RIG for exactly a framework/doctrine fix — see
+# L2117-2126's warning against conflating the two) is threaded through to
+# gate_pick_active_sibling so a cross-repo sibling is never treated as a
+# blocking race. Optional/backward-compatible: an omitted or empty this_rig
+# falls back to the original same-repo-assumed behavior.
 gate_bead_active_sibling_branch() {
-  local gc_city="$1" bead_id="$2" this_branch="$3"
+  local gc_city="$1" bead_id="$2" this_branch="$3" this_rig="${4:-}"
   local lines
   if [ -z "$bead_id" ] || [ -z "$this_branch" ]; then
     printf ''
     return 0
   fi
   lines=$(gate_bead_sibling_status_lines "$gc_city" "$bead_id")
-  gate_pick_active_sibling "$lines" "$this_branch"
+  gate_pick_active_sibling "$lines" "$this_branch" "$this_rig"
 }
 
 # gate_bead_sibling_status_lines <gc_city> <bead_id> — bd-backed. Builds the
-# "<branch><TAB><gate-status-value>" lines for every marker/gate-run tied to
-# $bead_id (source-bead:$bead_id label), skipping closed markers (ga-4wncs)
-# and alerting on open-but-ambiguous gate-status state (ga-kgtiw/ga-7fwt1).
+# "<branch><TAB><gate-status-value><TAB><rig>" lines for every marker/gate-run
+# tied to $bead_id (source-bead:$bead_id label), skipping closed markers
+# (ga-4wncs) and alerting on open-but-ambiguous gate-status state
+# (ga-kgtiw/ga-7fwt1).
 #
 # Extracted from gate_bead_active_sibling_branch (ga-lxz5w) unchanged — this
 # is the exact same marker-walk that used to live inline in that function,
@@ -1118,9 +1146,20 @@ gate_bead_active_sibling_branch() {
 # — same fail-open-on-error, same closed-marker skip, same ambiguity alert —
 # and gate-sibling-branch-guard.selftest.sh is the regression guard proving
 # that. See gate_bead_terminal_failed_sibling_branch below for the new use.
+#
+# ga-cc0xu0: the 3rd field (rig) is description-only — extracted the same
+# head-1-first-match way as the branch fallback, from the sibling's OWN
+# "rig:" description line (docs/gate-marker-recipe.md). Deliberately NOT
+# read from the bead-rig:/bead_rig: label or field: that encodes which STORE
+# holds the bead, not which repo holds the branch's code, and the two
+# diverge for exactly the cross-repo case this field exists to detect (see
+# L2117-2126's warning against this same mix-up in a different function).
+# Both consumers below (gate_pick_active_sibling, gate_pick_terminal_failed_
+# sibling) now read 3 tab-separated fields per line — a 2-field reader would
+# silently fold "status" and "rig" into one corrupted value.
 gate_bead_sibling_status_lines() {
   local gc_city="$1" bead_id="$2"
-  local siblings_json count i sib marker_status labels desc branch status lines sib_id
+  local siblings_json count i sib marker_status labels desc branch status rig lines sib_id
   siblings_json=$(bd -C "$gc_city" list --label "source-bead:$bead_id" --all --json 2>/dev/null || echo "[]")
   if [ -z "$siblings_json" ] || [ "$siblings_json" = "null" ]; then siblings_json="[]"; fi
   count=$(printf '%s' "$siblings_json" | jq 'length' 2>/dev/null || echo "0")
@@ -1140,12 +1179,15 @@ gate_bead_sibling_status_lines() {
     marker_status=$(printf '%s' "$sib" | jq -r '.status // ""' 2>/dev/null || echo "")
     [ "$marker_status" = "closed" ] && continue
     labels=$(printf '%s' "$sib" | jq -r '(.labels // []) | join(" ")' 2>/dev/null || echo "")
+    desc=$(printf '%s' "$sib" | jq -r '.description // ""' 2>/dev/null || echo "")
     branch=$(printf '%s\n' "$labels" | tr ' ' '\n' | sed -n 's/^branch:\(.*\)$/\1/p' | head -1)
     if [ -z "$branch" ]; then
-      desc=$(printf '%s' "$sib" | jq -r '.description // ""' 2>/dev/null || echo "")
       branch=$(printf '%s\n' "$desc" | sed -n 's/^branch:[ \t]*\(.*\)$/\1/p' | head -1)
     fi
     [ -z "$branch" ] && continue
+    # ga-cc0xu0: rig: has no label form (only bead-rig:, wrong semantics —
+    # see this function's header comment) — description-only.
+    rig=$(printf '%s\n' "$desc" | sed -n 's/^rig:[ \t]*\(.*\)$/\1/p' | head -1)
     # ga-7fwt1: route through the shared marker_status_from_labels() (guard.sh,
     # sourced lib-only above this function's own call site — see the L2684
     # source and the author_is_alive()/session_matches_author() precedent for
@@ -1185,7 +1227,7 @@ gate_bead_sibling_status_lines() {
         "$(date '+%Y-%m-%d %H:%M:%S')" "${sib_id:-$(printf '%s' "$sib" | jq -r '.id // "unknown"' 2>/dev/null || echo unknown)}" "$bead_id" "$branch" "$_gs_reason" >&2
       continue
     fi
-    lines="${lines}${branch}	${status}
+    lines="${lines}${branch}	${status}	${rig}
 "
   done
   printf '%s' "$lines"
@@ -3750,7 +3792,7 @@ fi
 # already present and be caught by check (b) above instead, never re-entering
 # this block — no separate duplicate-mail guard needed.
 if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
-  GATE_LXZ5W_SIBLING="$(gate_bead_active_sibling_branch "$GC_CITY" "$BEAD_ID" "$BRANCH")"
+  GATE_LXZ5W_SIBLING="$(gate_bead_active_sibling_branch "$GC_CITY" "$BEAD_ID" "$BRANCH" "$RIG")"
   if [ -n "$GATE_LXZ5W_SIBLING" ]; then
     GATE_LXZ5W_SIB_BRANCH="${GATE_LXZ5W_SIBLING%%$'\t'*}"
     GATE_LXZ5W_SIB_STATUS="${GATE_LXZ5W_SIBLING#*$'\t'}"

@@ -85,6 +85,22 @@ eq "blank lines in input are skipped, not misread as a branch" \
   "$(gate_pick_active_sibling "$(printf '\ncrew/them/x\trunning\n')" "crew/me/x")" \
   "$(printf 'crew/them/x\trunning')"
 
+# ga-cc0xu0: 3rd field is rig (branch's home repo). A sibling in a DIFFERENT
+# repo cannot possibly touch the same file — not the ambiguous same-repo
+# race this guard exists for. Missing rig data on either side must fail
+# SAFE (still block) — this narrows the guard, it never weakens it.
+eq "ga-cc0xu0: cross-repo sibling (different non-empty rig on both sides) → NOT a sibling" \
+  "$(gate_pick_active_sibling "$(printf 'crew/them/x\trunning\tgascity')" "crew/me/x" "whatsapp_automation")" ""
+eq "ga-cc0xu0: same-repo sibling (identical rig on both sides) → still blocked (narrowed, not removed)" \
+  "$(gate_pick_active_sibling "$(printf 'crew/them/x\trunning\tgascity')" "crew/me/x" "gascity")" \
+  "$(printf 'crew/them/x\trunning')"
+eq "ga-cc0xu0: sibling has no rig data → fail-safe, still blocked" \
+  "$(gate_pick_active_sibling "$(printf 'crew/them/x\trunning\t')" "crew/me/x" "gascity")" \
+  "$(printf 'crew/them/x\trunning')"
+eq "ga-cc0xu0: this_rig unresolved/omitted → fail-safe, still blocked" \
+  "$(gate_pick_active_sibling "$(printf 'crew/them/x\trunning\tgascity')" "crew/me/x")" \
+  "$(printf 'crew/them/x\trunning')"
+
 # ── 3. gate_bead_active_sibling_branch — bd-backed resolver (mock bd) ────────
 echo "── 3. gate_bead_active_sibling_branch (bd list + label/description extraction, mock bd) ──"
 MOCK_LIST_JSON='[]'
@@ -152,6 +168,28 @@ MOCK_LIST_FAIL=1
 eq "(h) bd list fails (transient) → '' (fail-open)" \
   "$(gate_bead_active_sibling_branch city 'wa-fnibd' 'crew/wa-worker/wa-fnibd')" ""
 MOCK_LIST_FAIL=0
+
+# ga-cc0xu0 REGRESSION TEST — real-incident shape (ga-duwz22: fix/ga-duwz22-
+# autorizacao-citavel in rig=gascity vs fix/ga-duwz22-authorization-citation-
+# guard in rig=whatsapp_automation, both markers active for the same source
+# bead, zero file overlap possible across repos). This case MUST FAIL on
+# pre-fix HEAD (today it blocks unconditionally) and PASS after the fix.
+MOCK_LIST_JSON='[{"id":"m1","status":"open","labels":["type:quality-gate-marker","gate-status:queued","source-bead:ga-duwz22","branch:fix/ga-duwz22-authorization-citation-guard","bead-rig:gascity"],"description":"branch: fix/ga-duwz22-authorization-citation-guard\nbead_id: ga-duwz22\nrig: whatsapp_automation\nbead_rig: gascity"}]'
+eq "(i) ga-cc0xu0: cross-repo sibling (different rig:, both active) → '' (not blocked — no file overlap possible)" \
+  "$(gate_bead_active_sibling_branch city 'ga-duwz22' 'fix/ga-duwz22-autorizacao-citavel' 'gascity')" ""
+
+# Same shape, but THIS branch's own rig matches the sibling's rig → genuine
+# same-repo race, must stay blocked exactly like before this fix (AC #2:
+# narrowing the guard, not removing it).
+eq "(j) ga-cc0xu0: same-repo sibling (identical rig:) → still blocked" \
+  "$(gate_bead_active_sibling_branch city 'ga-duwz22' 'fix/ga-duwz22-autorizacao-citavel' 'whatsapp_automation')" \
+  "$(printf 'fix/ga-duwz22-authorization-citation-guard\tqueued')"
+
+# this_rig omitted (backward-compatible 3-arg call, e.g. a caller that never
+# resolved its own $RIG) → fail-safe, unchanged pre-fix behavior.
+eq "(k) ga-cc0xu0: this_rig omitted (3-arg backward-compat call) → still blocked" \
+  "$(gate_bead_active_sibling_branch city 'ga-duwz22' 'fix/ga-duwz22-autorizacao-citavel')" \
+  "$(printf 'fix/ga-duwz22-authorization-citation-guard\tqueued')"
 
 # ── 4. gate_bead_live_merge_block — bd-backed resolver (mock bd) ─────────────
 echo "── 4. gate_bead_live_merge_block (bd show + check_source_bead_park, mock bd) ──"
