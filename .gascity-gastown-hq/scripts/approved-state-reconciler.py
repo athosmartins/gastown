@@ -76,6 +76,15 @@ GATE_DISPATCHER_LOG = os.path.join(CITY, ".gc/logs/quality-gate-dispatcher.log")
 PILOT_DISPATCHABLE_FILE = os.environ.get(
     "PILOT_DISPATCHABLE_FILE",
     os.path.join(os.environ.get("HOME", os.path.expanduser("~")), ".gc/pilot-dispatchable.json"))
+# PILOT_SWEEP_PAUSE_STATE_FILE (ga-nq0jo): whether the Pilot's LAST sweep
+# exited with dispatched=0 for a whole-sweep pause (quota-limited ga-x3nmz,
+# cross-stage yield ga-d0hz3), written by _pilot_write_sweep_pause_state() in
+# pilot-dispatcher.sh. Deliberately a SEPARATE file from
+# PILOT_DISPATCHABLE_FILE above, not a new field on it — that contract
+# already has other consumers (the painel) depending on its current shape.
+PILOT_SWEEP_PAUSE_STATE_FILE = os.environ.get(
+    "PILOT_SWEEP_PAUSE_STATE_FILE",
+    os.path.join(os.environ.get("HOME", os.path.expanduser("~")), ".gc/pilot-sweep-pause-state.json"))
 # QPOS_ABSENT/QPOS_UNREADABLE (ga-tky97 GATE-FEEDBACK fix): a bead's queue
 # position can fail to resolve to an int for two causally different reasons —
 # the dispatch queue snapshot itself was unreadable this cycle (unmeasured),
@@ -197,6 +206,8 @@ _bd_branch_stranded = None  # (bead_id) -> (repo, ref, age_days)|None; ga-32u6s 
 # selftest scenarios below stub them as gate_queue_backlog.<name>, not a local global.
 _read_pilot_dispatchable_file = None  # () -> dict|None; parsed+freshness-checked
                                         # pilot-dispatchable.json (ga-tky97 test seam)
+_read_pilot_sweep_pause_state_file = None  # () -> dict|None; parsed+freshness-checked
+                                             # pilot-sweep-pause-state.json (ga-nq0jo test seam)
 
 
 # ── guarded subprocess ────────────────────────────────────────────────────────
@@ -1314,6 +1325,97 @@ def _read_pilot_dispatchable(now):
     return data
 
 
+# ga-nq0jo: same TTL convention as PILOT_DISPATCHABLE_TTL's default (600s =
+# one reconciler sweep interval) — a fixed constant here rather than a field
+# in the JSON itself, since this state is a single flag, not a queue the
+# writer might reasonably want to tune per-call.
+PILOT_SWEEP_PAUSE_TTL_SEC = 600
+
+
+def _read_pilot_sweep_pause_state(now):
+    """Return the parsed pilot-sweep-pause-state.json dict, or None if the
+    file is missing, unreadable, malformed, or older than
+    PILOT_SWEEP_PAUSE_TTL_SEC.
+
+    Contract (packs/town-deltas/assets/pilot-dispatcher.sh,
+    _pilot_write_sweep_pause_state): {"active": bool, "reason": str,
+    "detail": str, "at": "<ISO8601 UTC>"}. Written on EVERY sweep that
+    reaches the quota/cross-stage checks — active=true at the two whole-
+    sweep-pause exit points (ga-x3nmz, ga-d0hz3), active=false once a sweep
+    proceeds past both without pausing — so a stale file (past the TTL)
+    means the Pilot hasn't run a sweep recently at all, not "confirmed not
+    paused right now".
+
+    A stale/missing/malformed file means "cannot confirm sweep-pause state",
+    NEVER "confirmed not paused" (root-class:error-vs-empty, same convention
+    as _read_pilot_dispatchable) — callers must treat None as unmeasured.
+    """
+    if _read_pilot_sweep_pause_state_file is not None:
+        return _read_pilot_sweep_pause_state_file()   # test seam
+    try:
+        with open(PILOT_SWEEP_PAUSE_STATE_FILE) as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or "active" not in data:
+        return None
+    at = data.get("at") or ""
+    if not at:
+        return None
+    try:
+        at_epoch = datetime.datetime.strptime(
+            at[:19], "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+    except Exception:
+        return None
+    if (now - at_epoch) > PILOT_SWEEP_PAUSE_TTL_SEC:
+        return None
+    return data
+
+
+def _pilot_sweep_pause_suppress_reason(sweep_pause_state):
+    """Suppress reason if the Pilot's LAST sweep (within TTL) deliberately
+    paused the WHOLE sweep — quota-limited (ga-x3nmz) or cross-stage yield
+    to a congested Gate (ga-d0hz3) — else None (ga-nq0jo).
+
+    ROOT CAUSE (ga-sb11i.4, 2026-08-14 10:37-10:42): _alarm_starving had no
+    signal for "did the Pilot even attempt to dispatch this cycle at all."
+    A perfectly healthy, front-of-queue bead alarmed "dispatch path failing"
+    while the Pilot was deliberately yielding to a congested Gate — dispatch
+    was working exactly as designed (backpressure, ga-d0hz3), same failure
+    shape as ga-tky97's queue-position false positive, one level up: this
+    checks whether the Pilot ran AT ALL, not where in its queue a bead sits.
+    Checked FIRST among the measurement-based suppressions in
+    _process_store() — cheaper than the per-bead queue-position/gate-depth
+    checks, and if the whole sweep paused, it explains EVERY starving bead
+    identically, so there's nothing more specific to learn by checking the
+    others first.
+
+    Returns None (do NOT suppress — fall through to the other checks, and
+    possibly the alarm) when:
+      - sweep_pause_state is None (file missing/stale/unreadable — an
+        unmeasured pause state must never license a suppression,
+        root-class:error-vs-empty, same discipline as every sibling
+        suppress-reason function in this file)
+      - sweep_pause_state["active"] is not True (the Pilot's last sweep
+        within the TTL window ran normally — confirmed NOT paused, so this
+        check has nothing to explain the wait with)
+
+    A reason string (suppress) only when the state was measured, fresh, and
+    positively says the Pilot paused — never a default.
+    """
+    if sweep_pause_state is None:
+        return None
+    if sweep_pause_state.get("active") is not True:
+        return None
+    reason = sweep_pause_state.get("reason") or "unspecified"
+    detail = sweep_pause_state.get("detail") or ""
+    at = sweep_pause_state.get("at") or "?"
+    return ("Pilot's último sweep (%s) pausou o sweep inteiro deliberadamente "
+            "(%s%s) — despacho saudável, não é falha" % (
+            at, reason, (": " + detail) if detail else ""))
+
+
 def _pilot_queue_position(bead_id, dispatchable):
     """Return (index, total, ahead_by_priority) for bead_id within an already-
     read `dispatchable` dict (see _read_pilot_dispatchable), or None if
@@ -1635,7 +1737,8 @@ def _branch_stranded_reason(bead_id):
 
 # ── process one store ─────────────────────────────────────────────────────────
 def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
-                    gate_depth=None, gate_throughput=None, dispatchable=None):
+                    gate_depth=None, gate_throughput=None, dispatchable=None,
+                    sweep_pause_state=None):
     """Scan story:approved open beads in rig_root; classify and act on each one.
 
     built_ids: set of bead ids with a live BUILT marker (from _gate_marker_source_beads(),
@@ -2015,6 +2118,19 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
             alarmed += 1
             continue
 
+        # PILOT WHOLE-SWEEP PAUSE (ga-nq0jo): checked before the per-bead
+        # queue-position/gate-depth suppressions below — cheapest of the
+        # measurement-based checks (no per-bead lookup at all) and, if the
+        # Pilot's last sweep paused entirely, it explains EVERY starving bead
+        # in this cycle identically, so there is nothing more specific to
+        # learn from the others first. See _pilot_sweep_pause_suppress_
+        # reason()'s docstring for the ga-sb11i.4 false-positive this closes.
+        sweep_pause_reason = _pilot_sweep_pause_suppress_reason(sweep_pause_state)
+        if sweep_pause_reason is not None:
+            _log("  %s: no signal, daemon-age=%.0fmin, %s — no alarm" % (
+                 bead_id, starve_age_min, sweep_pause_reason))
+            continue
+
         # PILOT DISPATCH-QUEUE POSITION (ga-tky97): the Pilot's own fully-
         # filtered, dispatch-ordered candidate queue (pilot-dispatchable.json)
         # is a more direct, per-bead signal than any label or backlog estimate
@@ -2102,6 +2218,16 @@ def run_cycle(now, state):
              "queue-position suppression degrades to 'unmeasured' this cycle "
              "(see ga-tky97)")
 
+    # Pilot whole-sweep pause state (ga-nq0jo): also HQ-independent, read once
+    # per cycle. None = missing/stale/unreadable; _pilot_sweep_pause_suppress_
+    # reason() treats that as "cannot confirm pause state" (fail toward
+    # alarming), never as "confirmed not paused".
+    sweep_pause_state = _read_pilot_sweep_pause_state(now)
+    if sweep_pause_state is None:
+        _log("  pilot-sweep-pause-state.json missing/stale/unreadable — "
+             "starve-alarm sweep-pause suppression degrades to 'unmeasured' "
+             "this cycle (see ga-nq0jo)")
+
     total_p = total_r = total_a = 0
 
     for rig_root in RIG_ROOTS:
@@ -2123,7 +2249,7 @@ def run_cycle(now, state):
         try:
             p, r, a = _process_store(rig_root, now, state, pilot_alive, built_ids,
                                       blocked_ids, gate_depth, gate_throughput,
-                                      dispatchable)
+                                      dispatchable, sweep_pause_state)
             total_p += p
             total_r += r
             total_a += a
@@ -2344,7 +2470,7 @@ def _selftest():
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
     global _bd_blocked, _bd_show_full, _bd_has_built_branch, _bd_branch_stranded
-    global _read_pilot_dispatchable_file
+    global _read_pilot_dispatchable_file, _read_pilot_sweep_pause_state_file
     global DRY_RUN, STARVE_MIN, FLOW_GRACE_MIN, ROUTE_COOLDOWN_SEC, ALARM_COOLDOWN_SEC
     global _OWNERSHIP_REPOS
 
@@ -4220,6 +4346,101 @@ def _selftest():
         _bad("(ga-32u6s-e)", "SAFETY VIOLATION — unresolvable merge-base treated as "
              "confirmed-unmerged, would fire a FALSE stranded-branch alert to the "
              "Mayor; res_e_none=%r res_e_128=%r" % (res_e_none, res_e_128))
+
+    # ── ga-nq0jo: Pilot whole-sweep pause suppression ───────────────────────────
+    print("\nScenario (ga-nq0jo-a): THE EXACT ga-sb11i.4 REPRO — healthy front-of-"
+          "queue starving bead, Pilot's last sweep paused for cross-stage yield "
+          "→ starve alarm SUPPRESSED")
+    _read_pilot_sweep_pause_state_file = lambda: {
+        "active": True, "reason": "cross-stage-yield",
+        "detail": "gate_congested=1 quota_limited=0 dolt_hot=1",
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW)),
+    }
+    _read_pilot_dispatchable_file = lambda: None   # no queue-position excuse either — front of queue
+    _bd_approved = lambda root: [_make_bead("ga-sb11i4", age_min=_STARVE + 5.0)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    st["first_seen_approved"]["ga-sb11i4"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    if not mail_calls and not notify_calls:
+        _ok("(ga-nq0jo-a): sweep-pause active+fresh suppresses the alarm — "
+            "healthy backpressure, not dispatch failure")
+    else:
+        _bad("(ga-nq0jo-a)", "mail_calls=%s notify_calls=%s" % (mail_calls, notify_calls))
+
+    print("\nScenario (ga-nq0jo-b): falsification — sweep-pause CONFIRMED "
+          "inactive (Pilot's last sweep ran normally) → bead STILL alarms "
+          "(must not become a false negative)")
+    _read_pilot_sweep_pause_state_file = lambda: {
+        "active": False, "reason": "", "detail": "",
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW)),
+    }
+    _read_pilot_dispatchable_file = lambda: None
+    _bd_approved = lambda root: [_make_bead("ga-sb11i4b", age_min=_STARVE + 5.0)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    st["first_seen_approved"]["ga-sb11i4b"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    if mail_calls or notify_calls:
+        _ok("(ga-nq0jo-b): confirmed-inactive sweep-pause does NOT suppress — "
+            "alarm still fires (no false negative introduced)")
+    else:
+        _bad("(ga-nq0jo-b)", "SAFETY VIOLATION — a confirmed-healthy sweep "
+             "(active=False) suppressed a real starving bead; "
+             "mail_calls=%s notify_calls=%s" % (mail_calls, notify_calls))
+
+    print("\nScenario (ga-nq0jo-c): falsification (root-class:error-vs-empty) — "
+          "sweep-pause-state file missing/unreadable (seam returns None) → "
+          "bead STILL alarms (unmeasured must never license a suppression)")
+    _read_pilot_sweep_pause_state_file = lambda: None
+    _read_pilot_dispatchable_file = lambda: None
+    _bd_approved = lambda root: [_make_bead("ga-sb11i4c", age_min=_STARVE + 5.0)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    st["first_seen_approved"]["ga-sb11i4c"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    if mail_calls or notify_calls:
+        _ok("(ga-nq0jo-c): unmeasurable sweep-pause state does NOT suppress — "
+            "'don't know' never collapses into 'confirmed paused'")
+    else:
+        _bad("(ga-nq0jo-c)", "SAFETY VIOLATION — an UNREADABLE sweep-pause file "
+             "suppressed a real starving bead (root-class:error-vs-empty); "
+             "mail_calls=%s notify_calls=%s" % (mail_calls, notify_calls))
+
+    print("\nScenario (ga-nq0jo-d): REAL _read_pilot_sweep_pause_state() (seam "
+          "OFF) — a genuinely fresh file parses correctly, a stale one (past "
+          "PILOT_SWEEP_PAUSE_TTL_SEC) returns None, a missing file returns "
+          "None. Mirrors ga-tky97-f's real-file-I/O methodology.")
+    _read_pilot_sweep_pause_state_file = None   # un-stub — force the real function body
+    _tmp_ps_path = "/tmp/arc-selftest-pilot-sweep-pause-%d.json" % os.getpid()
+    _real_ps_const = PILOT_SWEEP_PAUSE_STATE_FILE
+    globals()["PILOT_SWEEP_PAUSE_STATE_FILE"] = _tmp_ps_path
+    _fresh_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW - 60))   # 1min old
+    _stale_at = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                               time.gmtime(NOW - PILOT_SWEEP_PAUSE_TTL_SEC - 120))  # past TTL
+    with open(_tmp_ps_path, "w") as _f:
+        json.dump({"active": True, "reason": "cross-stage-yield",
+                    "detail": "gate_congested=1", "at": _fresh_at}, _f)
+    fresh_result = _read_pilot_sweep_pause_state(NOW)
+    with open(_tmp_ps_path, "w") as _f:
+        json.dump({"active": True, "reason": "cross-stage-yield",
+                    "detail": "stale entry", "at": _stale_at}, _f)
+    stale_result = _read_pilot_sweep_pause_state(NOW)
+    os.remove(_tmp_ps_path)
+    missing_result = _read_pilot_sweep_pause_state(NOW)
+    globals()["PILOT_SWEEP_PAUSE_STATE_FILE"] = _real_ps_const
+    fresh_ok = (fresh_result is not None and fresh_result.get("active") is True)
+    stale_ok = stale_result is None
+    missing_ok = missing_result is None
+    if fresh_ok and stale_ok and missing_ok:
+        _ok("(ga-nq0jo-d): REAL file I/O — fresh file (1min old, ttl=%ds) "
+            "parses correctly; stale file (past ttl) → None; missing file → "
+            "None (never silently trusts unmeasured/stale data)" % PILOT_SWEEP_PAUSE_TTL_SEC)
+    else:
+        _bad("(ga-nq0jo-d)", "fresh_result=%r stale_result=%r missing_result=%r" % (
+             fresh_result, stale_result, missing_result))
+
+    _read_pilot_sweep_pause_state_file = None   # leave the seam clean for any test after this one
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))

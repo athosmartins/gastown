@@ -2971,6 +2971,53 @@ PILOT_EMIT_DISPATCHABLE="${PILOT_EMIT_DISPATCHABLE:-1}"
 PILOT_DISPATCHABLE_TTL="${PILOT_DISPATCHABLE_TTL:-600}"
 PILOT_DISPATCHABLE_FILE="${PILOT_DISPATCHABLE_FILE:-${HOME}/.gc/pilot-dispatchable.json}"
 
+# ga-nq0jo: a SEPARATE small state file recording whether the Pilot exited its
+# LAST sweep with dispatched=0 for a whole-sweep pause reason (quota-limited
+# ga-x3nmz, cross-stage yield ga-d0hz3) — deliberately NOT folded into
+# PILOT_DISPATCHABLE_FILE's schema above, which other consumers (the painel)
+# already depend on in its current {generated_at,ttl_seconds,count,items}
+# shape; a separate file is zero-risk to them. Read by
+# approved-state-reconciler.py's _pilot_sweep_pause_suppress_reason() so a
+# bead sitting at the front of a perfectly healthy dispatch queue, unpicked
+# only because the WHOLE sweep deliberately dispatched nothing, is not
+# misread as "dispatch path failing" (real incident: ga-sb11i.4, 2026-08-14
+# 10:37-10:42, cross-stage yield — see this bead's own filing). Same TTL
+# constant/convention as PILOT_DISPATCHABLE_TTL (600s = one reconciler sweep
+# interval) so a stale pause from hours ago can never suppress a CURRENT
+# alarm — the reconciler enforces the TTL on read, this just stamps `at`.
+PILOT_SWEEP_PAUSE_STATE_FILE="${PILOT_SWEEP_PAUSE_STATE_FILE:-${HOME}/.gc/pilot-sweep-pause-state.json}"
+
+# SELFTEST-EXTRACT pilot-write-sweep-pause-state: BEGIN
+# _pilot_write_sweep_pause_state <active:0|1> <reason> <detail> — atomic
+# best-effort write (mirrors _pilot_emit_dispatchable's own tmp+mv pattern and
+# fail-open discipline: a write failure logs and returns 0, NEVER alters the
+# sweep's actual dispatch decision, which has already been made by the time
+# this is called on every call site below).
+_pilot_write_sweep_pause_state() {
+  local _active="$1" _reason="$2" _detail="$3" _dir _tmp _now
+  _now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  _dir=$(dirname "$PILOT_SWEEP_PAUSE_STATE_FILE")
+  mkdir -p "$_dir" 2>/dev/null || { warn "pilot-sweep-pause-state: mkdir failed for $_dir — skipping (ga-nq0jo, non-fatal)"; return 0; }
+  _tmp="${PILOT_SWEEP_PAUSE_STATE_FILE}.tmp.$$"
+  # ga-nq0jo: --argjson active "$_active" with a bash "1"/"0" string produces
+  # a JSON INTEGER (1), not a JSON BOOLEAN (true) — confirmed live, and the
+  # reconciler's Python side checks `.get("active") is not True`, an identity
+  # check that never matches the integer 1. Pass the raw "1"/"0" as a plain
+  # string instead and let jq's own `== "1"` comparison produce a genuine
+  # boolean, so callers can keep this file's established "1"/"0" convention
+  # (matches _xstage_quota_limited etc. elsewhere in this script) without
+  # every caller needing to know about the JSON boolean-literal gotcha.
+  if jq -n --arg active_raw "$_active" --arg reason "$_reason" --arg detail "$_detail" --arg at "$_now" \
+       '{active:($active_raw == "1"), reason:$reason, detail:$detail, at:$at}' \
+       > "$_tmp" 2>/dev/null; then
+    mv -f "$_tmp" "$PILOT_SWEEP_PAUSE_STATE_FILE" 2>/dev/null || rm -f "$_tmp" 2>/dev/null
+  else
+    rm -f "$_tmp" 2>/dev/null || true
+    warn "pilot-sweep-pause-state: write failed for $PILOT_SWEEP_PAUSE_STATE_FILE — skipping (ga-nq0jo, non-fatal)"
+  fi
+}
+# SELFTEST-EXTRACT pilot-write-sweep-pause-state: END
+
 # _emit_query_one <db_dir> <store_label> — print the fully-filtered eligible
 # candidate array for ONE store, with a "store" field stamped on each item.
 # Mirrors the Tier-1 (bug + tech-debt), Tier-2 (story:approved) and optional
@@ -3121,6 +3168,7 @@ if [ "$(_pilot_quota_limited)" = "1" ]; then
   _q_eta=$(_pilot_quota_eta)
   warn "Claude 5h quota LIMITED — PAUSING all dispatch this sweep (builders would die mid-build). Stories stay queued; auto-resumes when the window resets${_q_eta:+ ($_q_eta)} (ga-x3nmz)."
   notify -t "⏸️ Pilot pausado: cota 5h" -p 3 "Pilot pausado — cota 5h do Claude esgotada; nenhum builder despachado, retoma quando resetar${_q_eta:+ ($_q_eta)} (ga-x3nmz)." 2>/dev/null || true
+  _pilot_write_sweep_pause_state 1 "quota-limited" "5h quota limited${_q_eta:+, eta $_q_eta}"
   log "=== Pilot sweep complete: dispatched=0 (paused: cota 5h limitada${_q_eta:+, $_q_eta}) ==="
   exit 0
 fi
@@ -3160,12 +3208,19 @@ if [ "$CROSS_STAGE_PRIORITY_ENABLED" = "1" ]; then
     if [ "$_xstage_gate_congested" = "1" ]; then
       warn "Cross-stage YIELD (ga-d0hz3): Gate is CONGESTED and resources are CONTENDED (quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot}) — DEFERRING new builds this sweep so the more-advanced Gate stage can drain first. Approved stories stay queued; auto-resumes when Dolt calms / quota frees. Most-advanced-first."
       notify -t "⏸️ Pilot cede ao Gate" -p 2 "Pilot adiou despachar builds novos — Gate congestionado + recurso contido (dolt_hot=${_xstage_dolt_hot}, quota_limited=${_xstage_quota_limited}). Retoma quando o recurso aliviar (ga-d0hz3)." 2>/dev/null || true
+      _pilot_write_sweep_pause_state 1 "cross-stage-yield" "gate_congested=1 quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot}"
       log "=== Pilot sweep complete: dispatched=0 (deferred: cross-stage gate-congested + resource-contended, ga-d0hz3) ==="
       exit 0
     fi
     log "Cross-stage check (ga-d0hz3): resources contended (quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot}) but Gate NOT congested — dispatching normally."
   fi
 fi
+# ga-nq0jo: reaching here means neither whole-sweep pause fired this cycle —
+# mark the state explicitly inactive so a PRIOR pause (possibly just one
+# sweep ago) cannot outlive its own TTL window in the reconciler's read and
+# suppress an alarm that is, right now, genuinely unexplained. Best-effort/
+# fail-open like every other call to this helper.
+_pilot_write_sweep_pause_state 0 "" ""
 
 # ── Step 0: TTL recovery — release stale pilot:dispatching claims (ga-2azzj) ───
 # A pilot:dispatching label means a dispatch is (or was) in progress. We may only
