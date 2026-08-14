@@ -154,6 +154,37 @@ PILOT_DOLT_CPU_OVERRIDE="${PILOT_DOLT_CPU_OVERRIDE:-}"
 PILOT_QUOTA_OVERRIDE="${PILOT_QUOTA_OVERRIDE:-}"
 PILOT_QUOTA_ETA_OVERRIDE="${PILOT_QUOTA_ETA_OVERRIDE:-}"
 
+# ── RAM-pressure back-off (ga-m2gqb, deferred remainder of ga-7xne1) ───────────
+# The mini froze 2026-07-27 (13 jetsam kills, hard reboot) when heavy weekly
+# evals converged with concurrent agent-pool load and drove RAM/swap to
+# exhaustion. ga-7xne1 shipped DETECTION (ram-pressure-monitor.sh, hourly
+# launchd, ~/.gastown/scripts/ — separate no-gate repo) and now durably records
+# its decided level (OK/WARN/EMERGENCY) + timestamp to RPM_LEVEL_FILE on every
+# run. This gate is the REMEDIATION half: a new agent-pool spawn while pressure
+# is signaled WARN or EMERGENCY risks repeating the exact convergence that froze
+# the machine, so — mirroring the quota PAUSE shape immediately above, not the
+# Dolt throttle-to-1 shape — the whole sweep is PAUSED (dispatch nothing, mutate
+# no marker) until a later sweep reads a clear/stale signal. Never redefines what
+# counts as pressure (uses the monitor's own already-computed level verbatim);
+# never kills anything already running (a PAUSE only withholds NEW dispatch).
+#
+# FAIL-OPEN (unlike Dolt's fail-safe): a missing/stale/corrupt level file most
+# often means the monitor hasn't run yet or this consumer has a bug — NEITHER
+# is evidence the machine is actually under pressure (unlike Dolt's own probe,
+# which queries Dolt directly, so an unreadable Dolt probe usually means Dolt
+# itself is too slow to answer). Gating city-wide dispatch on an unrelated
+# cron/parsing failure would be a new single point of failure worse than the
+# incident this guards against. Stale bound defaults to 2x the monitor's own
+# hourly StartInterval — generous margin over one delayed run while still
+# catching "the monitor stopped running entirely".
+#
+# PILOT_RAM_PRESSURE_OVERRIDE is a TEST-ONLY seam (mirrors PILOT_QUOTA_OVERRIDE):
+# "WARN"/"EMERGENCY" = blocks, anything else (including unset) = does not.
+# Never set in prod.
+PILOT_RAM_LEVEL_FILE="${PILOT_RAM_LEVEL_FILE:-${HOME}/.gastown/run/ram-pressure-monitor.level}"
+PILOT_RAM_MAX_AGE_SECS="${PILOT_RAM_MAX_AGE_SECS:-7200}"
+PILOT_RAM_PRESSURE_OVERRIDE="${PILOT_RAM_PRESSURE_OVERRIDE:-}"
+
 # ── Cross-stage priority — most-advanced-first / WIP-limit (ga-d0hz3) ──────────
 # The 4 stage dispatchers (auto-refino / refino-gate / quality-gate / pilot) are
 # INDEPENDENT launchd timers with no cross-stage coordination, so the system pulls
@@ -1534,6 +1565,48 @@ _pilot_quota_eta() {
     else "resets " + .reset_time_text
          + ( if (.reset_in_minutes // null) != null then " (in \(.reset_in_minutes)min)" else "" end )
     end' 2>/dev/null || printf ''
+}
+
+# _pilot_ram_pressure_blocks → "1" iff ram-pressure-monitor.sh's last-decided
+# level (PILOT_RAM_LEVEL_FILE, two lines: "<LEVEL>\n<unix_ts>\n") is WARN or
+# EMERGENCY and fresh (age <= PILOT_RAM_MAX_AGE_SECS), else "0". FAIL-OPEN on
+# every unreadable path (missing file, corrupt/non-numeric timestamp, stale
+# age) — see the RAM-pressure back-off header comment above for why fail-open
+# (not fail-safe like _dolt_saturated) is correct here: an unreadable Dolt
+# probe usually means Dolt itself is too slow to answer (informationally
+# entangled with the saturation), but a missing/stale level file usually just
+# means the monitor hasn't run yet — unrelated to whether the machine is
+# actually under pressure. Honors PILOT_RAM_PRESSURE_OVERRIDE (test seam,
+# mirrors PILOT_QUOTA_OVERRIDE). No mutation.
+_pilot_ram_pressure_blocks() {
+  if [ -n "$PILOT_RAM_PRESSURE_OVERRIDE" ]; then
+    case "$PILOT_RAM_PRESSURE_OVERRIDE" in
+      WARN|EMERGENCY) printf '1'; return 0 ;;
+      *) printf '0'; return 0 ;;
+    esac
+  fi
+  [ -f "$PILOT_RAM_LEVEL_FILE" ] || { printf '0'; return 0; }
+  local _level _ts _now
+  _level=$(sed -n '1p' "$PILOT_RAM_LEVEL_FILE" 2>/dev/null | tr -d '[:space:]')
+  _ts=$(sed -n '2p' "$PILOT_RAM_LEVEL_FILE" 2>/dev/null | tr -d '[:space:]')
+  case "$_ts" in ''|*[!0-9]*) printf '0'; return 0 ;; esac
+  _now=$(date +%s)
+  [ $(( _now - _ts )) -gt "$PILOT_RAM_MAX_AGE_SECS" ] && { printf '0'; return 0; }
+  case "$_level" in
+    WARN|EMERGENCY) printf '1'; return 0 ;;
+    *) printf '0'; return 0 ;;
+  esac
+}
+
+# _pilot_ram_pressure_level → raw level string ("OK"/"WARN"/"EMERGENCY"/"") for
+# LOGGING only (mirrors DOLT_SAT_REASON's role: diagnostic detail alongside a
+# separate boolean decision) — deliberately skips the staleness/override
+# short-circuiting _pilot_ram_pressure_blocks applies to its decision, so a
+# caller can log what the file literally says even in the fail-open path.
+_pilot_ram_pressure_level() {
+  [ -n "$PILOT_RAM_PRESSURE_OVERRIDE" ] && { printf '%s' "$PILOT_RAM_PRESSURE_OVERRIDE"; return 0; }
+  [ -f "$PILOT_RAM_LEVEL_FILE" ] || { printf ''; return 0; }
+  sed -n '1p' "$PILOT_RAM_LEVEL_FILE" 2>/dev/null | tr -d '[:space:]'
 }
 
 # _dolt_probe — populate DOLT_PID + DOLT_LATENCY_MS once. Honors the test seams.
@@ -3170,6 +3243,21 @@ if [ "$(_pilot_quota_limited)" = "1" ]; then
   notify -t "⏸️ Pilot pausado: cota 5h" -p 3 "Pilot pausado — cota 5h do Claude esgotada; nenhum builder despachado, retoma quando resetar${_q_eta:+ ($_q_eta)} (ga-x3nmz)." 2>/dev/null || true
   _pilot_write_sweep_pause_state 1 "quota-limited" "5h quota limited${_q_eta:+, eta $_q_eta}"
   log "=== Pilot sweep complete: dispatched=0 (paused: cota 5h limitada${_q_eta:+, $_q_eta}) ==="
+  exit 0
+fi
+
+# ── ga-m2gqb: RAM-pressure back-off — PAUSE dispatch when the machine is under
+# signaled pressure — see the RAM-pressure back-off config header above for the
+# full rationale (deferred remainder of ga-7xne1, the 2026-07-27 jetsam freeze).
+# Same full-PAUSE shape as the quota gate immediately above (not Dolt's
+# throttle-to-1): AC explicitly says "nenhum agente novo... começa" for EITHER
+# WARN or EMERGENCY, not a differentiated response per tier.
+if [ "$(_pilot_ram_pressure_blocks)" = "1" ]; then
+  _ram_level="$(_pilot_ram_pressure_level)"
+  warn "RAM pressure ${_ram_level} (ram-pressure-monitor.sh, ~/.gastown/run/ram-pressure-monitor.level) — PAUSING all dispatch this sweep (a new agent-pool spawn risks repeating the 2026-07-27 jetsam freeze). Retries automatically once a later sweep reads a clear/stale signal (ga-m2gqb)."
+  notify -t "⏸️ Pilot pausado: pressão de RAM" -p 4 "Pilot pausado — RAM em ${_ram_level}; nenhum builder despachado, retoma quando a pressão cair (ga-m2gqb)." 2>/dev/null || true
+  _pilot_write_sweep_pause_state 1 "ram-pressure" "RAM pressure ${_ram_level}"
+  log "=== Pilot sweep complete: dispatched=0 (paused: pressão de RAM ${_ram_level}) ==="
   exit 0
 fi
 

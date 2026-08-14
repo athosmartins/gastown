@@ -7033,6 +7033,104 @@ else
   bad "ga-pp00f REGRESSION: warming routing changed after adding the hex domain (got: '${WARM_BUILDER:-none}')"
 fi
 
+# ── Scenario 26: ga-m2gqb RAM-pressure back-off (deferred remainder of ga-7xne1) ──
+# The mini froze 2026-07-27 (13 jetsam kills) when heavy evals + agent-pool load
+# converged. ram-pressure-monitor.sh (separate ~/.gastown repo) now durably
+# records its decided level; this gate PAUSES the whole sweep (mirrors the
+# quota gate's shape, Scenario 14) when that level reads WARN or EMERGENCY.
+echo "Scenario 26a: _pilot_ram_pressure_blocks — pure decision function"
+_RPB_FN="$(awk '/^_pilot_ram_pressure_blocks\(\)/{s=1} s{print} s&&/^}$/{exit}' "$DISPATCHER")"
+_RPB_LVL="$(mktemp /tmp/pilot-ram-level-selftest.XXXXXX)"
+_rpb() { # $1=level $2=age_offset_secs (0=now, N=N seconds in the past) $3=file_exists(1/0,default1) $4=override(default "")
+  ( eval "$_RPB_FN"
+    PILOT_RAM_MAX_AGE_SECS=7200
+    PILOT_RAM_PRESSURE_OVERRIDE="${4:-}"
+    if [ "${3:-1}" = "0" ]; then
+      rm -f "$_RPB_LVL"
+    else
+      printf '%s\n%s\n' "$1" "$(( $(date +%s) - ${2:-0} ))" > "$_RPB_LVL"
+    fi
+    PILOT_RAM_LEVEL_FILE="$_RPB_LVL" _pilot_ram_pressure_blocks
+  )
+}
+[ "$(_rpb OK 0)" = "0" ]        && ok "level=OK → does not block" || bad "level=OK should not block"
+[ "$(_rpb WARN 0)" = "1" ]      && ok "level=WARN → blocks (AC: 'aviso ou emergência' get the same response)" || bad "level=WARN should block"
+[ "$(_rpb EMERGENCY 0)" = "1" ] && ok "level=EMERGENCY → blocks" || bad "level=EMERGENCY should block"
+[ "$(_rpb WARN 0 0)" = "0" ]    && ok "missing level file → fail-OPEN (does not block dispatch)" || bad "missing file should fail-open, not block"
+[ "$(_rpb WARN 10000)" = "0" ]  && ok "stale reading (10000s > 7200s max age) → fail-OPEN" || bad "stale reading should fail-open, not block"
+_rpb_corrupt() { ( eval "$_RPB_FN"; PILOT_RAM_MAX_AGE_SECS=7200; PILOT_RAM_PRESSURE_OVERRIDE=""; printf 'WARN\nnot-a-number\n' > "$_RPB_LVL"; PILOT_RAM_LEVEL_FILE="$_RPB_LVL" _pilot_ram_pressure_blocks ); }
+[ "$(_rpb_corrupt)" = "0" ]     && ok "corrupt timestamp → fail-OPEN (does not block)" || bad "corrupt timestamp should fail-open, not block"
+[ "$(_rpb OK 0 1 EMERGENCY)" = "1" ] && ok "override seam forces block regardless of actual file state (test-only seam)" || bad "override seam not honored"
+rm -f "$_RPB_LVL"
+
+echo "Scenario 26b-d: RAM-pressure back-off wired into the REAL sweep (DRY_RUN, SHIMBIN)"
+run_ram() { # $1=PILOT_RAM_PRESSURE_OVERRIDE
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=1 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
+    PILOT_DOLT_CPU_OVERRIDE=10 \
+    PILOT_RAM_PRESSURE_OVERRIDE="$1" \
+    FAKE_BLOCKED_IDS="" \
+    FAKE_BUGS_JSON='[{"id":"tt-ram","title":"ram fixture bug","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+echo "Scenario 26b: RAM WARN → PAUSE sweep, dispatch nothing"
+LOG26B="$(run_ram WARN)"
+if echo "$LOG26B" | grep -q "PAUSING all dispatch"; then
+  ok "RAM-WARN sweep logs the pause"
+else
+  bad "RAM-WARN sweep did NOT pause (expected 'PAUSING all dispatch')"
+fi
+if echo "$LOG26B" | grep -q "dispatched=0 (paused: pressão de RAM WARN)"; then
+  ok "sweep-complete line reports dispatched=0 (paused, level=WARN)"
+else
+  bad "sweep-complete did not report the RAM-paused state — got: $LOG26B"
+fi
+if echo "$LOG26B" | grep -qE "pegou uma história|gc sling|story:in-flight"; then
+  bad "REGRESSION: dispatched/slung a builder despite RAM WARN pressure"
+else
+  ok "no builder dispatched under RAM WARN (AC: nenhum agente novo começa)"
+fi
+
+echo "Scenario 26c: RAM EMERGENCY → PAUSE sweep too (AC: 'aviso ou emergência' — same response, not a differentiated throttle)"
+LOG26C="$(run_ram EMERGENCY)"
+if echo "$LOG26C" | grep -q "dispatched=0 (paused: pressão de RAM EMERGENCY)"; then
+  ok "RAM-EMERGENCY sweep also pauses identically to WARN"
+else
+  bad "RAM-EMERGENCY sweep did not pause — got: $LOG26C"
+fi
+
+echo "Scenario 26d: RAM clear (no override) → no pause, sweep proceeds normally"
+LOG26D="$(run_ram "")"
+if echo "$LOG26D" | grep -q "PAUSING all dispatch"; then
+  bad "REGRESSION: paused the sweep when RAM pressure was clear"
+else
+  ok "RAM-clear sweep does not pause on the RAM gate (proceeds to dispatch logic)"
+fi
+
+echo "Scenario 26e: drift-guard — the RAM back-off is wired into the live sweep"
+_ram_has() { if grep -qE "$2" "$1"; then ok "$3"; else bad "$3 — pattern not found: $2"; fi; }
+_ram_has "$DISPATCHER" '_pilot_ram_pressure_blocks\(\)' "RAM-pressure probe helper is defined"
+_ram_has "$DISPATCHER" '_pilot_ram_pressure_level\(\)'  "RAM-pressure level accessor is defined"
+_ram_has "$DISPATCHER" 'PILOT_RAM_PRESSURE_OVERRIDE'    "RAM-pressure override seam wired"
+_ram_has "$DISPATCHER" 'paused: pressão de RAM'         "RAM pause gate present in the sweep-complete log line"
+_ram_has "$DISPATCHER" 'ram-pressure-monitor\.level'    "RAM-pressure gate reads the monitor's own level-file path convention"
+if grep -qE '\[ -f "\$PILOT_RAM_LEVEL_FILE" \] \|\| \{ printf .0.; return 0; \}' "$DISPATCHER"; then
+  ok "RAM-pressure probe fail-opens when the level file is absent"
+else
+  bad "RAM-pressure probe missing the fail-open guard (absent file must not block dispatch)"
+fi
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
