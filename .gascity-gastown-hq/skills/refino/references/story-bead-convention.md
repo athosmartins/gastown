@@ -223,6 +223,46 @@ Before running step 2's `--description` update:
 If the current description has zero 🚨 lines, none of the above applies —
 proceed with step 2 as normal.
 
+### Preserving the full original description on rewrite (ga-poe83)
+
+The 🚨 rule above is a narrow, additional safety net for compliance/safety
+content specifically. It does not cover the general case: `--description` is
+a full REPLACE for every refino write-back, simplificado or completo,
+autonomous or Athos-guided — and the new text (Field 2, a short
+product-oriented summary) is, by design, much shorter than what it replaces.
+Everything else in the original description — the requester's verbatim ask,
+measurements, prior-art findings — is silently discarded, even on a
+perfectly legitimate refino pass.
+
+This has already cost a real loss: on `wa-4hzpd` the original description had
+to be preserved by hand, after the fact, by the refiner that happened to run
+that bead — nothing in the write-back procedure required it, so it is not
+guaranteed to happen again. `bd history` is not a dependable safety net to
+recover it later either — it can fail to return within any reasonable bound
+on a busy store, so treat pre-write preservation as the only real backstop.
+
+Do not try to make Field 2 long enough to hold everything — that fights its
+purpose (short, product-oriented). Instead, before running step 2's
+`--description` update:
+
+1. Read the CURRENT description (`bd show "$ID" --json | jq -r '.[0].description'`).
+2. Unless it is empty or placeholder text (nothing to lose), carry it forward
+   **verbatim** into `notes` — never into `description` — using
+   `--append-notes` (never `--notes`, which replaces instead of appending),
+   in the SAME atomic `bd update` call as the `--description` write:
+   ```bash
+   bd -C "$GC_CITY_PATH" update "$ID" \
+     --description "<F2 content>" \
+     --append-notes "PRÉ-REFINO (preservado verbatim antes do refino sobrescrever --description com o F2):
+
+   <cole aqui a descrição original lida no passo 1, inteira>" \
+     ...  # remaining --acceptance / --set-metadata flags unchanged
+   ```
+
+Apply this check alongside the 🚨 check above, not instead of it — a
+description can need both (a preserved 🚨 line inside the new `--description`
+text, and the full original verbatim in `notes`).
+
 ### Saving partial progress (session interrupted)
 
 ```bash

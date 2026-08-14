@@ -1324,6 +1324,18 @@ under a trailing "## Portoes preservados" heading. This applies on EVERY path
 below, REFINE or ESCALATE alike. If you find zero 🚨 lines in the original
 description, ignore this section entirely.
 
+PRESERVE THE FULL ORIGINAL DESCRIPTION TOO (ga-poe83) — separate from the 🚨
+check above, applies even when that one found nothing: --description is a
+full REPLACE, never an append. F2 is a short, product-oriented summary — by
+design it drops everything else in "Description / context" above: the
+requester's verbatim ask, measurements, prior-art findings. That has already
+cost a real loss once (wa-4hzpd needed it preserved by hand, after the fact;
+bd history is not a dependable way to recover it later — it can fail to
+return at all on a busy store). Do not stretch F2 to fit it all in — instead,
+on the SAME atomic bd update call below, carry "Description / context" above
+forward VERBATIM into --append-notes (never --notes, which replaces instead
+of adding). Skip only if it is already empty or placeholder text.
+
 SIMPLIFICADO FIELD SET (fill F1, F2, F6, F7, F8; F3/F4/F5 are skipped):
   F1 story.resumo       — headline em 1 frase (<=15 palavras, orientada a ação,
                           sem "sistema deve"/voz passiva).
@@ -1376,6 +1388,7 @@ needs-approval), then close the task bead:
 
 bd -C "$AR_BEAD_STORE" update "$STORY_ID" \\
   --description "<F2: o que é + por que importa>" \\
+  --append-notes "<PRÉ-REFINO (ga-poe83): cole aqui Description / context acima, inteira e verbatim>" \\
   --acceptance "<F6 criteria, newline or - bullets>" \\
   --set-metadata "story.resumo=<F1>" \\
   --set-metadata "story.o_que_e=<F2>" \\
