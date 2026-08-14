@@ -1609,6 +1609,28 @@ _pilot_ram_pressure_level() {
   sed -n '1p' "$PILOT_RAM_LEVEL_FILE" 2>/dev/null | tr -d '[:space:]'
 }
 
+# _pilot_ram_pressure_unreadable → "1" iff the signal is missing/stale/corrupt
+# (the fail-open path — dispatch proceeds either way), "0" iff a genuine
+# OK/WARN/EMERGENCY reading was read (confirmed, not assumed). Exists so the
+# call site can log the two "not blocking" cases DISTINCTLY: "confirmed
+# clear" and "couldn't tell, proceeding anyway" must never look identical in
+# the log the way they already correctly don't in the block/no-block DECISION
+# — a silent fail-open on a state-mutating path (new dispatch) is the exact
+# shape the third-state self-audit flags, even when the DEFAULT itself
+# (proceed) is the right call. Mirrors _pilot_ram_pressure_blocks's own
+# reads; duplicated rather than shared so this stays a pure, independently
+# correct function per this file's established convention.
+_pilot_ram_pressure_unreadable() {
+  [ -n "$PILOT_RAM_PRESSURE_OVERRIDE" ] && { printf '0'; return 0; }
+  [ -f "$PILOT_RAM_LEVEL_FILE" ] || { printf '1'; return 0; }
+  local _ts _now
+  _ts=$(sed -n '2p' "$PILOT_RAM_LEVEL_FILE" 2>/dev/null | tr -d '[:space:]')
+  case "$_ts" in ''|*[!0-9]*) printf '1'; return 0 ;; esac
+  _now=$(date +%s)
+  if [ $(( _now - _ts )) -gt "$PILOT_RAM_MAX_AGE_SECS" ]; then printf '1'; return 0; fi
+  printf '0'
+}
+
 # _dolt_probe — populate DOLT_PID + DOLT_LATENCY_MS once. Honors the test seams.
 _dolt_probe() {
   if [ -n "$PILOT_DOLT_LATENCY_OVERRIDE_MS" ]; then
@@ -3259,6 +3281,11 @@ if [ "$(_pilot_ram_pressure_blocks)" = "1" ]; then
   _pilot_write_sweep_pause_state 1 "ram-pressure" "RAM pressure ${_ram_level}"
   log "=== Pilot sweep complete: dispatched=0 (paused: pressão de RAM ${_ram_level}) ==="
   exit 0
+elif [ "$(_pilot_ram_pressure_unreadable)" = "1" ]; then
+  # ga-m2gqb: dispatch proceeds either way (fail-open is the right call — see
+  # header above) but "couldn't tell" must stay VISIBLE, not collapse silently
+  # into the same log-silence as "confirmed clear" on a state-mutating path.
+  log "RAM-pressure signal UNREADABLE (missing/stale/corrupt ${PILOT_RAM_LEVEL_FILE}) — fail-open, dispatch proceeding normally this sweep (ga-m2gqb)."
 fi
 
 # ── ga-d0hz3: CROSS-STAGE admission gate — most-advanced-first / WIP-limit ─────

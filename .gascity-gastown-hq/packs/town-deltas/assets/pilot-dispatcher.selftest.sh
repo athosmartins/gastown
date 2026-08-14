@@ -448,6 +448,7 @@ run_dispatch() { # $1=FAKE_BLOCKED_IDS  $2=FAKE_INCLUDE_ENGWIN(0|1)  $3=FAKE_DEP
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -469,6 +470,7 @@ run_step0() { # FAKE_STALE_JSON
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -495,6 +497,7 @@ run_neverstarted() {
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -524,6 +527,7 @@ run_real_dispatch() { # FAKE_SUPPRESS_INFLIGHT FAKE_SUPPRESS_LANE
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=0 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -550,6 +554,7 @@ run_real_dispatch_escalate() { # FAKE_ESCALATE_AFTER_SHOWS
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=0 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -582,6 +587,7 @@ run_real_dispatch_noauto() { # FAKE_NOAUTO_AFTER_SHOWS [FAKE_NOAUTO_LABEL]
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=0 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -630,6 +636,7 @@ run_real_dispatch_mayorhold() { # FAKE_STORY_COMMENTS_JSON [PILOT_MAYOR_HOLD_GRA
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=0 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -661,6 +668,7 @@ run_dispatch_remerge() { # $1=label  $2=PILOT_TEST_REMERGE_BEADS
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -682,6 +690,7 @@ run_dispatch_remerge_with_feedback() { # $1=label
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -703,6 +712,7 @@ run_sling_retry() { # $1=FAKE_SLING_FAIL_TIMES  $2=FAKE_SLING_ALWAYS_FAIL(0|1)
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=0 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -737,6 +747,7 @@ run_capacity() {
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -782,6 +793,7 @@ run_ctxready() {
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -815,6 +827,7 @@ run_emit() {
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -2202,6 +2215,7 @@ reset_state
 LOG10C="$(env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -2395,6 +2409,7 @@ run_quota() { # $1=PILOT_QUOTA_OVERRIDE  $2=PILOT_QUOTA_ETA_OVERRIDE
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -2945,6 +2960,7 @@ fi
 echo "Scenario 16i: PILOT_NEVERSTARTED_MINUTES=0 disables the detector"
 : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"; reset_state
 env -i PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" HOME="$HOME" DRY_RUN=1 \
+PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
   PILOT_CITY_OVERRIDE="$FIXCITY" PILOT_TEST_STATE="$STATE" \
   PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
   PILOT_NEVERSTARTED_MINUTES=0 FAKE_NEVERSTARTED_JSON="$NS_REL" \
@@ -3217,6 +3233,7 @@ run_capacity_reuse() { # $1=PILOT_REUSE_SESSION  $2=FAKE_BUGS_JSON  $3=FAKE_SESS
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -4217,6 +4234,7 @@ echo "Scenario 19f: a failed emit does NOT abort the dispatch sweep (fail-open)"
 reset_state
 env -i \
   PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" HOME="$HOME" DRY_RUN=1 \
+  PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
   PILOT_CITY_OVERRIDE="$FIXCITY" PILOT_TEST_STATE="$STATE" \
   PILOT_DOLT_LATENCY_OVERRIDE_MS=100 PILOT_DOLT_CPU_OVERRIDE=10 \
   PILOT_DISPATCHABLE_FILE="/this/path/does/not/exist/and/cannot/be/made/x.json" \
@@ -5354,6 +5372,7 @@ run_wa_rig_tier2() {
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -5442,6 +5461,7 @@ run_rig_tier1() {
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -5566,6 +5586,7 @@ run_hq_tier2() {
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -5897,6 +5918,7 @@ run_ps_worker_dispatch() {
   env -i \
     PATH="$PS_SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -5949,6 +5971,7 @@ run_ps_worker_dispatch_own_guard() {
   env -i \
     PATH="$PS_SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -6591,6 +6614,7 @@ run_y1m40() {
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -6619,6 +6643,7 @@ run_y1m40_stall() {
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=0 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -7061,6 +7086,17 @@ _rpb() { # $1=level $2=age_offset_secs (0=now, N=N seconds in the past) $3=file_
 _rpb_corrupt() { ( eval "$_RPB_FN"; PILOT_RAM_MAX_AGE_SECS=7200; PILOT_RAM_PRESSURE_OVERRIDE=""; printf 'WARN\nnot-a-number\n' > "$_RPB_LVL"; PILOT_RAM_LEVEL_FILE="$_RPB_LVL" _pilot_ram_pressure_blocks ); }
 [ "$(_rpb_corrupt)" = "0" ]     && ok "corrupt timestamp → fail-OPEN (does not block)" || bad "corrupt timestamp should fail-open, not block"
 [ "$(_rpb OK 0 1 EMERGENCY)" = "1" ] && ok "override seam forces block regardless of actual file state (test-only seam)" || bad "override seam not honored"
+
+echo "Scenario 26a-2: _pilot_ram_pressure_unreadable — visibility for the fail-open path (self-audit: 'couldn't tell' must not look like 'confirmed clear')"
+_RPU_FN="$(awk '/^_pilot_ram_pressure_unreadable\(\)/{s=1} s{print} s&&/^}$/{exit}' "$DISPATCHER")"
+_rpu() { ( eval "$_RPU_FN"; PILOT_RAM_MAX_AGE_SECS=7200; PILOT_RAM_PRESSURE_OVERRIDE=""
+  if [ "${2:-1}" = "0" ]; then rm -f "$_RPB_LVL"
+  else printf '%s\n%s\n' "$1" "$(( $(date +%s) - ${3:-0} ))" > "$_RPB_LVL"; fi
+  PILOT_RAM_LEVEL_FILE="$_RPB_LVL" _pilot_ram_pressure_unreadable ); }
+[ "$(_rpu OK 1 0)" = "0" ]     && ok "confirmed OK reading → NOT unreadable (0)" || bad "confirmed OK should not read as unreadable"
+[ "$(_rpu WARN 1 0)" = "0" ]   && ok "confirmed WARN reading → NOT unreadable (this is the blocking case, orthogonal to readability)" || bad "confirmed WARN should not read as unreadable"
+[ "$(_rpu "" 0)" = "1" ]       && ok "missing file → unreadable (1) — the fail-open path becomes VISIBLE, not silent" || bad "missing file should read as unreadable"
+[ "$(_rpu WARN 1 10000)" = "1" ] && ok "stale reading → unreadable (1), distinct from a confirmed clear signal" || bad "stale reading should read as unreadable"
 rm -f "$_RPB_LVL"
 
 echo "Scenario 26b-d: RAM-pressure back-off wired into the REAL sweep (DRY_RUN, SHIMBIN)"
@@ -7078,6 +7114,7 @@ run_ram() { # $1=PILOT_RAM_PRESSURE_OVERRIDE
     PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
     PILOT_DOLT_CPU_OVERRIDE=10 \
     PILOT_RAM_PRESSURE_OVERRIDE="$1" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     FAKE_BLOCKED_IDS="" \
     FAKE_BUGS_JSON='[{"id":"tt-ram","title":"ram fixture bug","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
@@ -7110,8 +7147,8 @@ else
   bad "RAM-EMERGENCY sweep did not pause — got: $LOG26C"
 fi
 
-echo "Scenario 26d: RAM clear (no override) → no pause, sweep proceeds normally"
-LOG26D="$(run_ram "")"
+echo "Scenario 26d: RAM confirmed OK → no pause, sweep proceeds normally"
+LOG26D="$(run_ram OK)"
 if echo "$LOG26D" | grep -q "PAUSING all dispatch"; then
   bad "REGRESSION: paused the sweep when RAM pressure was clear"
 else
@@ -7122,6 +7159,8 @@ echo "Scenario 26e: drift-guard — the RAM back-off is wired into the live swee
 _ram_has() { if grep -qE "$2" "$1"; then ok "$3"; else bad "$3 — pattern not found: $2"; fi; }
 _ram_has "$DISPATCHER" '_pilot_ram_pressure_blocks\(\)' "RAM-pressure probe helper is defined"
 _ram_has "$DISPATCHER" '_pilot_ram_pressure_level\(\)'  "RAM-pressure level accessor is defined"
+_ram_has "$DISPATCHER" '_pilot_ram_pressure_unreadable\(\)' "RAM-pressure unreadable accessor (fail-open visibility) is defined"
+_ram_has "$DISPATCHER" 'signal UNREADABLE'              "fail-open path logs visibly instead of collapsing silently into 'confirmed clear'"
 _ram_has "$DISPATCHER" 'PILOT_RAM_PRESSURE_OVERRIDE'    "RAM-pressure override seam wired"
 _ram_has "$DISPATCHER" 'paused: pressão de RAM'         "RAM pause gate present in the sweep-complete log line"
 _ram_has "$DISPATCHER" 'ram-pressure-monitor\.level'    "RAM-pressure gate reads the monitor's own level-file path convention"

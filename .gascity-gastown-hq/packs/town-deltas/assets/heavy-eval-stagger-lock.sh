@@ -95,6 +95,26 @@ _ram_pressure_blocks() {
   case "${level}" in WARN|EMERGENCY) return 0 ;; *) return 1 ;; esac
 }
 
+# _ram_pressure_unreadable → return 0 (true) iff the signal is missing/stale/
+# corrupt (the fail-open path — this wrapper proceeds either way), return 1
+# iff a genuine OK/WARN/EMERGENCY reading was read. Exists purely so the
+# caller can LOG "couldn't tell, proceeding anyway" distinctly from
+# "confirmed clear, proceeding" — a silent fail-open on a path that starts
+# real work is the exact shape the third-state self-audit flags, even though
+# the DEFAULT (proceed) is the correct decision. Duplicated from
+# _ram_pressure_blocks's own reads rather than shared, matching this file's
+# self-contained-pure-function convention.
+_ram_pressure_unreadable() {
+  [ -n "${HESL_TEST_RAM_LEVEL}" ] && return 1
+  [ -f "${RAM_LEVEL_FILE}" ] || return 0
+  local ts now
+  ts="$(sed -n '2p' "${RAM_LEVEL_FILE}" 2>/dev/null | tr -d '[:space:]')"
+  case "${ts}" in ''|*[!0-9]*) return 0 ;; esac
+  now=$(date +%s)
+  [ $(( now - ts )) -gt "${RAM_MAX_AGE_SECS}" ] && return 0
+  return 1
+}
+
 # _lock_is_stale <lockdir> <stale_min> → return 0 (true) iff lockdir exists and
 # its mtime is older than stale_min minutes (crash-recovery reclaim only).
 _lock_is_stale() {
@@ -172,6 +192,9 @@ main() {
   # this is what makes "at most one runs at a time" true for the whole
   # duration, not just at start.
   trap 'rmdir "${LOCKDIR}" 2>/dev/null || true' EXIT INT TERM
+  if _ram_pressure_unreadable; then
+    log "RAM-pressure signal UNREADABLE (missing/stale/corrupt ${RAM_LEVEL_FILE}) — fail-open, proceeding anyway (ga-m2gqb)."
+  fi
   log "acquired lock after $(( $(date +%s) - start_epoch ))s wait — starting: ${cmd_desc}"
   local run_start; run_start=$(date +%s)
   "$@"
@@ -202,6 +225,14 @@ if [ "${1:-}" = "--selftest" ]; then
   HESL_TEST_RAM_LEVEL=WARN HESL_TEST_RAM_AGE_SECS=10000 _ram_pressure_blocks && bad "stale (10000s>7200s) WARN should fail-open" || ok "stale reading → fail-OPEN"
   printf 'WARN\nnot-a-number\n' > "${_ST_RAMFILE}"
   HESL_TEST_RAM_LEVEL="" _ram_pressure_blocks && bad "corrupt timestamp should fail-open" || ok "corrupt timestamp in real file → fail-OPEN"
+  rm -f "${_ST_RAMFILE}"
+
+  echo "S1b: _ram_pressure_unreadable — visibility for the fail-open path (self-audit: 'couldn't tell' must not look like 'confirmed clear')"
+  HESL_TEST_RAM_LEVEL=OK   HESL_TEST_RAM_AGE_SECS=0 _ram_pressure_unreadable && bad "confirmed OK should not read as unreadable" || ok "confirmed OK reading → NOT unreadable"
+  HESL_TEST_RAM_LEVEL=WARN HESL_TEST_RAM_AGE_SECS=0 _ram_pressure_unreadable && bad "confirmed WARN should not read as unreadable" || ok "confirmed WARN reading → NOT unreadable (blocking is orthogonal to readability)"
+  HESL_TEST_RAM_LEVEL="" _ram_pressure_unreadable && ok "missing level file → unreadable (VISIBLE, not silent)" || bad "missing file should read as unreadable"
+  printf 'WARN\n%s\n' "$(( $(date +%s) - 10000 ))" > "${_ST_RAMFILE}"
+  HESL_TEST_RAM_LEVEL="" _ram_pressure_unreadable && ok "stale reading (10000s old) → unreadable" || bad "stale reading should read as unreadable"
   rm -f "${_ST_RAMFILE}"
 
   echo "S2: _lock_is_stale + _deadline_exceeded — pure arithmetic/mtime functions"
