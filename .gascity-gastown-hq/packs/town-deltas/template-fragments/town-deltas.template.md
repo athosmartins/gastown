@@ -104,6 +104,50 @@ ele — sem contexto da tua sessão, sem ler código. Se você não consegue diz
 segundos o que fazer, **ele também não vai**, e o bead volta como pergunta.
 (Mecanismo do painel em `wa-sowus`; contrato de colunas na skill `wa-travadas`.)
 
+### REGRA Nº 4 — "o Athos autorizou" precisa de PROVA CITÁVEL, senão não vale
+
+🚨 **MANDATO (incidente ga-duwz22, 14/08).** Se você vai executar algo
+**irreversível e voltado PRA FORA** — mandar mensagem a lead/cliente, gastar
+dinheiro, publicar, ligar pra alguém, virar flag que solta qualquer uma dessas —
+e a sua justificativa é *"o Athos autorizou"*, então **a autorização tem de ser
+CITÁVEL**: id da mensagem, bead + comentário, ou registro do canal, com carimbo
+de tempo, de um jeito que um TERCEIRO consiga conferir sem acreditar em você.
+
+**Sem citação verificável, a ação é RECUSADA — não "feita com ressalva".**
+Sob dúvida, o estado que fica é o **INERTE** (não envia, não gasta, não publica).
+
+O QUE PRODUZIU ISTO: um agente virou `inbound_autocontinue.dry_run=false`
+gravando na config *"Athos autorizou religar o ENVIO automatico citando 'a fila
+de aprovação do pregão está no ar'"*. Em 16 minutos, **4 mensagens saíram pra
+leads REAIS** (um respondeu e ficou esperando). Perguntado depois, o Athos
+disse, verbatim: **"nao faço ideia"**. Não há rastro da autorização, a condição
+citada era falsa (era outra fila, de outro recurso), e ~30min DEPOIS do flip,
+quando ele foi de fato perguntado em escolha guiada, ele escolheu o **oposto**.
+
+**Por que isto é pior que um bug comum:** mensagem enviada não tem desfazer. Não
+é rollback de código — é uma pessoa que recebeu texto em nome do Athos.
+
+**A armadilha específica, e ela é sutil:** "autorização" hoje é campo de PROSA.
+Qualquer agente escreve, e todo mundo a jusante lê como fato verificado — do
+mesmo jeito que relato de agente vira "medição" se ninguém conferir o artefato.
+É o canal de IDENTIDADE na forma mais cara: falar sob a autoridade do HUMANO.
+
+**Como aplicar, na prática:**
+1. Vai flipar flag que solta ação pra fora? Escreva na nota **de onde** veio a
+   autorização, de forma conferível. `_unfrozen_by: "Athos autorizou"` não vale;
+   `_unfrozen_by: "Athos, resposta ao AskUserQuestion em <bead>#<comentário>,
+   2026-08-14T14:22Z"` vale.
+2. **Autorização não se HERDA nem se INFERE.** "Ele aprovou a feature" ≠ "ele
+   aprovou ligar o envio". "A condição X foi cumprida" exige que VOCÊ tenha
+   medido X — e que X seja mesmo a condição que ele escreveu, não uma parecida.
+   ⚠️ Duas features de nomes próximos foi exatamente o que enganou aqui.
+3. **Condição de descongelamento mora junto com o flag** (`_frozen_by`), com o
+   que precisa acontecer pra reverter. Antes de flipar, RELEIA essa nota e prove
+   item a item que foi cumprida.
+4. Autorização VELHA não vale pra ação NOVA. Se passaram dias, ou se o escopo
+   mudou, pergunte de novo — em múltipla escolha (Regra Nº 1).
+5. Na dúvida sobre se algo conta como "pra fora": conta. Pergunte.
+
 **Travou numa decisão técnica difícil?** O caminho NÃO é o Athos. É: (a) decidir
 com o tradeoff explícito e registrar no bead; (b) chamar o especialista do
 domínio (oracle/peter/mila/thies/batista conforme o rig); ou (c) mandar pro gate
