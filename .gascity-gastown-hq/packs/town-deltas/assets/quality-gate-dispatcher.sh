@@ -2311,6 +2311,54 @@ default_pool_route_for_rig() {
   esac
 }
 
+# rebase_author_is_pool <author> — pure; selftest-sourceable. ga-tz0op.
+# True (echoes 1) iff <author> matches the pool/ephemeral identity class
+# gate_fail_assignee_action() above already special-cases for the FAIL path —
+# SAME case pattern, kept in sync by hand (that function's own header
+# comment enumerates the full rationale for each entry: gastown.dog[-*],
+# dog-*, wa-worker[-*], ps-worker[-*] are disposable build slots, never a
+# named crew PM/domain-owner; mayor/gastown.mayor/gastown__mayor is a
+# routing sentinel, never a genuine branch author).
+#
+# Used by the REBASE-liveness path (resolve_rebase_author / author_is_alive)
+# to short-circuit "is this EXACT instance alive" for identities that
+# structurally can never answer that question: a Pilot virtual slot label
+# (wa-worker-1, pure concurrency-accounting per pilot-dispatcher.sh:456,466,
+# 474 — never a real session identity), a bare template (wa-worker, with no
+# session_name/name/alias/id/agent_name of any live session ever equal to
+# just the template — real instances are always suffixed,
+# wa-worker-adhoc-<hash>), or an already-recycled pool instance
+# (wa-worker-<hash> whose specific session already exited normally, the same
+# auto-termination doctrine dogs themselves follow). author_is_alive() on any
+# of these ALWAYS returns 0 — not because the pool lacks capacity, but
+# because the question is the wrong category for an ephemeral worker that
+# exits on delivery. Measured live: wa-nxwqw/marker ga-wu1f0, REBASE_AUTHOR
+# resolved to "wa-worker-1", 2 real wa-worker sessions active at the time,
+# still circuit-broke as "no live author" (ga-tz0op).
+#
+# Deliberately DROPS the empty-string ('') arm gate_fail_assignee_action()
+# includes: an empty REBASE_AUTHOR means resolve_rebase_author() could not
+# resolve ANY signal at all (no trusted submitter, no branch commit author,
+# no crew segment, no marker-declared author) — a categorically different,
+# rarer condition from "we resolved a concrete pool identity". That case has
+# its own deliberate, already-reasoned fail-safe direction (see
+# resolve_rebase_author()'s docstring: author_is_alive("") is 0 by design,
+# so it keeps circuit-breaking toward gate:needs-human) which this bug's
+# acceptance criteria do not touch — folding '' into "return to pool" here
+# would silently mask a totally-unresolvable-author case as routine pool
+# churn instead of surfacing it. Do not "simplify" this to match
+# gate_fail_assignee_action()'s pattern exactly; the two functions answer
+# different questions (post-review cleanup vs. pre-review circuit-break) and
+# this divergence is intentional, not drift.
+rebase_author_is_pool() {
+  local author="${1:-}"
+  case "$author" in
+    mayor|gastown.mayor|gastown__mayor|gastown.dog|gastown.dog-*|dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*)
+      printf '1'; return 0 ;;
+  esac
+  printf '0'
+}
+
 # author_is_alive <author> — canonical liveness check for a gate marker's
 # AUTHOR. Echoes 1 if AUTHOR matches session_name, name, alias, id, or
 # agent_name of a live (non-closed) `gc session list` entry; 0 otherwise
@@ -8166,6 +8214,75 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       log "  ga-pyzo: notify author '$AUTHOR' session recycled but agent '$_RESOLVED_AUTHOR' has a live session — redirecting nudge/mail target to the agent."
       AUTHOR="$_RESOLVED_AUTHOR"
       AUTHOR_ALIVE=1
+    fi
+
+    # ga-tz0op: REBASE_AUTHOR resolved to a pool/ephemeral identity (virtual
+    # slot label, bare template, or a recycled pool instance) — intercept and
+    # exit BEFORE any of the ahead_dead/behind_dead/conflict decisions below,
+    # every one of which currently keys off REBASE_AUTHOR_ALIVE and would
+    # therefore treat this exactly like a genuinely dead named crew author
+    # (circuit-break to gate:needs-human, or bounce with a nudge nobody
+    # receives). Asking "is this EXACT instance alive" is the wrong question
+    # for this identity class (see rebase_author_is_pool()'s header comment
+    # above for why it structurally never matches) — the right remedy is the
+    # SAME one gate_fail_assignee_action()'s pool-class case already uses for
+    # the FAIL path: return the source bead to its rig's generic pool so a
+    # fresh worker self-serve-picks it up (default_pool_route_for_rig()),
+    # instead of parking on a human or nudging an identity that was never a
+    # real session. Checked once, unconditionally, regardless of which
+    # sub-condition (ahead-exceeded, behind-exceeded, genuine conflict,
+    # transient plumbing) triggered this rebase-liveness sweep — they all
+    # share the same root mistake for a pool-origin author.
+    REBASE_AUTHOR_IS_POOL=$(rebase_author_is_pool "$REBASE_AUTHOR")
+    if [ "$REBASE_AUTHOR_IS_POOL" = "1" ]; then
+      warn "Branch $BRANCH: rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity (ga-tz0op) — no fixed instance to wait for or nudge. Returning source bead to the ${RIG:-unknown} pool for a fresh worker instead of circuit-breaking or bouncing to a dead identity."
+      set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
+      bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED (ga-tz0op): branch $BRANCH needs a rebase, but its resolved rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity (virtual slot label, bare template, or a recycled pool instance) — structurally never a fixed session to wait for or notify (NOT the same as a dead named author; NOT the same as a live one to bounce to). Source bead $BEAD_ID returned to the ${RIG:-unknown} pool for a fresh worker to rebase and resubmit." 2>/dev/null || true
+      if [ -n "$BEAD_ID" ]; then
+        _TZ0OP_ROUTE=$(default_pool_route_for_rig "${RIG:-}")
+        bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-rebase"  -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"    -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" assign       "$BEAD_ID" ""                   -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" update       "$BEAD_ID" --set-metadata "gc.routed_to=$_TZ0OP_ROUTE" -q 2>/dev/null || true
+        # ga-p5q3 discipline: verify the write actually stuck rather than
+        # assuming it (same pattern as the ga-f54ui FAIL-path pool-return
+        # above) — a post-write read failure is its own third state, never
+        # collapsed into "restore failed".
+        _TZ0OP_VERIFY_JSON=""
+        _TZ0OP_VERIFY_READ_OK=1
+        _TZ0OP_VERIFY_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _TZ0OP_VERIFY_READ_OK=0
+        [ -n "$_TZ0OP_VERIFY_JSON" ] || _TZ0OP_VERIFY_READ_OK=0
+        if [ "$_TZ0OP_VERIFY_READ_OK" = "0" ]; then
+          _TZ0OP_ROUTE_OBS="gc.routed_to=UNVERIFIED (post-write read failed — state unknown, NOT a claim the restore failed)"
+        else
+          _TZ0OP_ROUTE_OBSERVED=$(printf '%s' "$_TZ0OP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .metadata["gc.routed_to"] // ""' 2>/dev/null || echo "")
+          if [ "$_TZ0OP_ROUTE_OBSERVED" = "$_TZ0OP_ROUTE" ]; then
+            _TZ0OP_ROUTE_OBS="gc.routed_to=$_TZ0OP_ROUTE (restored)"
+          else
+            _TZ0OP_ROUTE_OBS="gc.routed_to='${_TZ0OP_ROUTE_OBSERVED}' NOT $_TZ0OP_ROUTE — restore did not stick, needs investigation"
+          fi
+        fi
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate (ga-tz0op): branch $BRANCH needs a rebase, but its resolved rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity — no fixed session to wait for. Returned to the $_TZ0OP_ROUTE pool (assignee cleared) for a fresh worker to rebase and resubmit via /gate-done — verified post-write, not assumed: $_TZ0OP_ROUTE_OBS." 2>/dev/null || true
+      fi
+      REBASE_EVENT="dispatcher_needs_rebase_pool_author"
+      REBASE_VERDICT="NEEDS_REBASE (pool/ephemeral author '$REBASE_AUTHOR' — returned to pool, ga-tz0op)"
+      if [ "$(gate_marker_status_ensure "$MARKER_ID" "the pool-author rebase return")" = "repaired" ]; then
+        warn "ga-kgtiw SELF-HEAL: marker $MARKER_ID had no gate-status label after the pool-author rebase return — self-heal force-wrote and verified gate-status:error (see marker comment + Mayor mail for detail)."
+      fi
+      log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH — $REBASE_VERDICT."
+      mkdir -p "$(dirname "$QG_LOG")"
+      jq -c -n \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg branch "$BRANCH" \
+        --arg bead "$BEAD_ID" \
+        --arg rig "${RIG:-unknown}" \
+        --arg marker "$MARKER_ID" \
+        --arg author "$REBASE_AUTHOR" \
+        --arg event "$REBASE_EVENT" \
+        '{ts: $ts, event: $event, branch: $branch, bead: $bead, rig: $rig, marker: $marker, author: $author}' \
+        >> "$QG_LOG" 2>/dev/null || true
+      log "=== Dispatcher sweep complete: branch=$BRANCH verdict=$REBASE_VERDICT ==="
+      exit 0
     fi
 
     # Read current rebase-attempt counter from the marker labels.

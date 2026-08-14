@@ -521,7 +521,7 @@ trap - EXIT
 # ── 4. Drift guard: gate_marker_status_ensure wired at every rebase-fail exit ─
 echo "── 4. drift guard: self-heal called before every rebase-fail exit point ──"
 CALL_COUNT=$(grep -c 'gate_marker_status_ensure "\$MARKER_ID"' "$DISPATCHER")
-eq "gate_marker_status_ensure called exactly 6 times (one per rebase-fail exit point)" "$CALL_COUNT" "6"
+eq "gate_marker_status_ensure called exactly 7 times (one per rebase-fail exit point)" "$CALL_COUNT" "7"
 
 for context in \
   "the main-ref-unresolvable guard" \
@@ -529,6 +529,7 @@ for context in \
   "the ahead_dead circuit-break" \
   "the behind_dead circuit-break" \
   "the behind-envelope bounce" \
+  "the pool-author rebase return" \
   "the auto-rebase decision \(merge-conflict/transient-retry/circuit-break\)"; do
   has "$DISPATCHER" "gate_marker_status_ensure \"\\\$MARKER_ID\" \"${context}\"" \
     "self-heal wired at: ${context}"
@@ -549,7 +550,7 @@ BARE_CALL_COUNT=$(grep -cE '^\s*gate_marker_status_ensure "\$MARKER_ID"' "$DISPA
 eq "zero call sites invoke gate_marker_status_ensure as a bare statement" "$BARE_CALL_COUNT" "0"
 
 WRAPPED_CALL_COUNT=$(grep -cE 'if \[ "\$\(gate_marker_status_ensure "\$MARKER_ID"' "$DISPATCHER" || true)
-eq "all 6 call sites consume via if [ \"\$(gate_marker_status_ensure ...)\" = ... ]" "$WRAPPED_CALL_COUNT" "6"
+eq "all 7 call sites consume via if [ \"\$(gate_marker_status_ensure ...)\" = ... ]" "$WRAPPED_CALL_COUNT" "7"
 
 FN_BODY_START=$(grep -n '^gate_marker_status_ensure() {' "$DISPATCHER" | head -1 | cut -d: -f1)
 FN_BODY_END=$(awk -v start="$FN_BODY_START" 'NR>start && /^}/ {print NR; exit}' "$DISPATCHER")
@@ -592,7 +593,7 @@ STALE_NOOP_COUNT=$(grep -cF 'already logged, commented, and mailed inside gate_m
 eq "zero call sites still carry the stale gate-fix-3-era 'already logged inside' no-op comment" "$STALE_NOOP_COUNT" "0"
 
 CALLER_LOG_COUNT=$(grep -cE '(log|warn|err) "ga-kgtiw SELF-HEAL: marker \$MARKER_ID had no gate-status label after' "$DISPATCHER" || true)
-eq "all 6 call sites log on a 'repaired' outcome (caller logs after reading the signal, gate-fix-4)" "$CALLER_LOG_COUNT" "6"
+eq "all 7 call sites log on a 'repaired' outcome (caller logs after reading the signal, gate-fix-4)" "$CALLER_LOG_COUNT" "7"
 
 # ── 5. syntax ──────────────────────────────────────────────────────────────
 echo "── 5. syntax ──"

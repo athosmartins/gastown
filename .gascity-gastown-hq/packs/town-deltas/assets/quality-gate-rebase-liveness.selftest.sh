@@ -167,6 +167,18 @@ eq "incident: a silently-failed counter write is caught as stuck (would have for
   "$_INCIDENT_WRITE_STATUS" \
   "stuck"
 
+# ga-tz0op NOTE: the 4 assertions above remain factually true in isolation —
+# gate_behind_envelope_action("1","0") really does return circuit_break, and
+# that pure function is untouched by ga-tz0op. But this composition no longer
+# describes what the REAL dispatcher does end-to-end for THIS input. A bare
+# pool-template REBASE_AUTHOR ("wa-worker", exactly this section's own probe)
+# is now intercepted BEFORE gate_behind_envelope_action is ever called (see
+# rebase_author_is_pool() and its call site) — the dispatcher returns the
+# source bead to the pool instead of reaching this circuit-break at all.
+# Section 12 below covers the corrected end-to-end behavior for this exact
+# scenario; this section still documents the pure function's own contract in
+# isolation and both remain true simultaneously.
+
 # ── 6. Drift guard: all four functions must still be exported by the dispatcher ─
 echo "── 6. drift guard: ga-6dp9 functions present in lib-only mode ──"
 for _fn in resolve_rebase_author gate_behind_envelope_action gate_rebase_attempt_advanced; do
@@ -702,6 +714,124 @@ if [ "${_TRACE_MSG_COUNT:-0}" -ge 6 ]; then
 else
   bad "candidate trace interpolated into fewer than expected escalation messages (count=${_TRACE_MSG_COUNT:-0}) — AC3 may be incomplete"
 fi
+
+# ── 13. ga-tz0op: pool/ephemeral REBASE_AUTHOR is never asked "is this EXACT
+#     instance alive" — routed back to the pool instead of circuit-broken ────
+# BUG (ga-tz0op): a virtual Pilot slot label (wa-worker-1, pure concurrency
+# accounting, never a real session identity), a bare pool template
+# (wa-worker, no live session's session_name/name/alias/id/agent_name is ever
+# just the template — real instances are always suffixed) or an
+# already-recycled pool instance (wa-worker-<hash>, exited normally on
+# delivery) can NEVER match a live session by design. author_is_alive() on
+# any of these always answers 0 — not because the pool lacks capacity, but
+# because "is this exact string alive" is the wrong question for an
+# ephemeral identity class. Measured live: wa-nxwqw/marker ga-wu1f0,
+# REBASE_AUTHOR="wa-worker-1", 2 real wa-worker sessions active, still
+# circuit-broke as "no live author". Distinct root cause from ga-it1of (the
+# CREW case: a real, persistent, named session resolved via the wrong short
+# alias) — there IS no "right alias" to find for a pool identity; the
+# question itself is the wrong category. Fix: rebase_author_is_pool() reuses
+# gate_fail_assignee_action()'s existing pool/ephemeral case pattern (minus
+# the empty-string arm — see that function's own header for why '' stays
+# out) to short-circuit the ahead_dead/behind_dead/conflict decisions and
+# return the source bead to its rig's generic pool instead.
+echo "── 13. ga-tz0op: pool/ephemeral rebase-liveness authors routed to the pool, never circuit-broken as dead ──"
+
+echo "── 13a. rebase_author_is_pool: pure truth table ──"
+for _author in mayor gastown.mayor gastown__mayor gastown.dog gastown.dog-1 gastown.dog-gao05od dog-gaohnim wa-worker wa-worker-1 wa-worker-adhoc-e346188199 ps-worker ps-worker-3; do
+  eq "'$_author' classifies as pool/ephemeral (1)" \
+    "$(rebase_author_is_pool "$_author")" \
+    "1"
+done
+eq "a real named crew alias ('oracle-wa') is NOT pool (0) — this fix must never swallow a genuine crew author" \
+  "$(rebase_author_is_pool "oracle-wa")" \
+  "0"
+eq "another real named crew alias ('digo-wa') is NOT pool (0)" \
+  "$(rebase_author_is_pool "digo-wa")" \
+  "0"
+eq "empty author is deliberately NOT pool (0) — resolve_rebase_author()'s own unresolvable-author fail-safe (circuit-break toward needs-human) is untouched by this fix, a different bug class" \
+  "$(rebase_author_is_pool "")" \
+  "0"
+
+echo "── 13b. AC4: the exact reported incident shape (virtual slot, bare template, recycled instance) ──"
+eq "AC4 shape 1: virtual Pilot slot label 'wa-worker-1' (the literal ga-wu1f0 incident value) classifies as pool" \
+  "$(rebase_author_is_pool "wa-worker-1")" \
+  "1"
+eq "AC4 shape 2: bare pool template 'wa-worker' (no session ever matches just the template) classifies as pool" \
+  "$(rebase_author_is_pool "wa-worker")" \
+  "1"
+eq "AC4 shape 3: a recycled pool instance 'wa-worker-gadnuds' (already exited normally) classifies as pool" \
+  "$(rebase_author_is_pool "wa-worker-gadnuds")" \
+  "1"
+# AC1: none of these shapes are asked "is this exact instance alive" via the
+# individually-keyed liveness question — author_is_alive() itself is
+# untouched (still correctly answers 0 for all three, confirming the
+# dispatcher's early pool-intercept is what changes, not the liveness
+# predicate itself).
+eq "AC1: author_is_alive() itself is unchanged — still 0 for the virtual slot label (proves the FIX is the early intercept, not a liveness-predicate change)" \
+  "$(author_is_alive "wa-worker-1")" \
+  "0"
+
+echo "── 13c. drift-guard: the pool intercept is wired in AND positioned before every circuit-break/bounce decision ──"
+grep -qF 'REBASE_AUTHOR_IS_POOL=$(rebase_author_is_pool "$REBASE_AUTHOR")' "$DISPATCHER" \
+  && ok "REBASE_AUTHOR_IS_POOL is actually computed at the call site (fix wired in, not just defined)" \
+  || bad "REBASE_AUTHOR_IS_POOL computation missing — rebase_author_is_pool() defined but never called"
+grep -qF 'if [ "$REBASE_AUTHOR_IS_POOL" = "1" ]; then' "$DISPATCHER" \
+  && ok "dispatcher branches on REBASE_AUTHOR_IS_POOL" \
+  || bad "REBASE_AUTHOR_IS_POOL branch missing"
+
+_POOL_INTERCEPT_LN=$(grep -n 'REBASE_AUTHOR_IS_POOL=\$(rebase_author_is_pool "\$REBASE_AUTHOR")' "$DISPATCHER" | head -1 | cut -d: -f1)
+_AHEAD_DEAD_LN=$(grep -n '_ACB_AHEAD=\$(gate_circuit_break_check "ahead_dead"' "$DISPATCHER" | head -1 | cut -d: -f1)
+_BEHIND_ACTION_LN=$(grep -n '_BEHIND_ACTION=\$(gate_behind_envelope_action' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$_POOL_INTERCEPT_LN" ] && [ -n "$_AHEAD_DEAD_LN" ] && [ "$_POOL_INTERCEPT_LN" -lt "$_AHEAD_DEAD_LN" ]; then
+  ok "AC1: pool intercept (line $_POOL_INTERCEPT_LN) runs BEFORE the ahead_dead circuit-break (line $_AHEAD_DEAD_LN) — never reaches that decision for a pool author"
+else
+  bad "pool intercept is not positioned before the ahead_dead circuit-break (intercept=$_POOL_INTERCEPT_LN ahead_dead=$_AHEAD_DEAD_LN)"
+fi
+if [ -n "$_POOL_INTERCEPT_LN" ] && [ -n "$_BEHIND_ACTION_LN" ] && [ "$_POOL_INTERCEPT_LN" -lt "$_BEHIND_ACTION_LN" ]; then
+  ok "AC1: pool intercept (line $_POOL_INTERCEPT_LN) runs BEFORE gate_behind_envelope_action (line $_BEHIND_ACTION_LN) — never reaches that decision for a pool author"
+else
+  bad "pool intercept is not positioned before gate_behind_envelope_action (intercept=$_POOL_INTERCEPT_LN behind=$_BEHIND_ACTION_LN)"
+fi
+
+echo "── 13d. AC2/AC3: the pool branch routes via default_pool_route_for_rig and never reuses the collapsing 'dead author'/'no live author' phrasing ──"
+_POOL_BLOCK=$(sed -n '/ga-tz0op: REBASE_AUTHOR resolved to a pool\/ephemeral identity/,/Read current rebase-attempt counter from the marker labels/p' "$DISPATCHER")
+if [ -z "$_POOL_BLOCK" ]; then
+  bad "could not extract the ga-tz0op pool-intercept block — start/end anchor comments missing/renamed?"
+else
+  if printf '%s\n' "$_POOL_BLOCK" | grep -qF 'default_pool_route_for_rig "${RIG:-}"'; then
+    ok "AC2: pool branch routes the source bead via default_pool_route_for_rig (same mechanism as the FAIL-path pool-return, ga-f54ui)"
+  else
+    bad "AC2: pool branch does not call default_pool_route_for_rig — bead may not become self-serve-visible"
+  fi
+  if printf '%s\n' "$_POOL_BLOCK" | grep -qF 'bd -C "$BEAD_CITY" assign       "$BEAD_ID" ""'; then
+    ok "AC2: pool branch clears the source bead's assignee so a fresh worker can claim it"
+  else
+    bad "AC2: pool branch does not clear the source bead assignee"
+  fi
+  _DEAD_AUTHOR_HITS=$(printf '%s\n' "$_POOL_BLOCK" | { grep -c 'dead author' || true; })
+  eq "AC3: the pool-intercept block never uses the literal phrase 'dead author' (would collapse pool-origin into the same wording as a genuinely dead named author)" \
+    "$_DEAD_AUTHOR_HITS" \
+    "0"
+  _NO_LIVE_AUTHOR_HITS=$(printf '%s\n' "$_POOL_BLOCK" | { grep -c 'no live author' || true; })
+  eq "AC3: the pool-intercept block never uses the literal phrase 'no live author' (same collapsing wording used by the ahead_dead/behind_dead circuit-breaks)" \
+    "$_NO_LIVE_AUTHOR_HITS" \
+    "0"
+  _POOL_PHRASE_HITS=$(printf '%s\n' "$_POOL_BLOCK" | { grep -c 'pool/ephemeral identity' || true; })
+  if [ "${_POOL_PHRASE_HITS:-0}" -ge 1 ]; then
+    ok "AC3: the pool-intercept block names its own distinct category ('pool/ephemeral identity') instead"
+  else
+    bad "AC3: the pool-intercept block does not name a distinct category for this identity class"
+  fi
+fi
+
+echo "── 13e. non-regression: named crew authors still take the EXISTING ahead_dead/behind_dead/bounce paths, untouched ──"
+eq "a real crew author ('oracle-wa') is not pool — REBASE_AUTHOR_ALIVE still drives the pre-existing circuit-break/bounce decisions exactly as before ga-tz0op" \
+  "$(rebase_author_is_pool "oracle-wa")" \
+  "0"
+eq "gate_behind_envelope_action is UNCHANGED for a genuinely dead named author (rebase_author_is_pool only adds an earlier intercept, never edits this pure function)" \
+  "$(gate_behind_envelope_action "1" "0")" \
+  "circuit_break"
 
 # ── Result ────────────────────────────────────────────────────────────────────
 echo ""
