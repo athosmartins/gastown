@@ -10,7 +10,18 @@ the fields only in labels → BEAD_ID/BRANCH extract EMPTY → author unresolvab
 ```bash
 HQ=/Users/athos/gt/.gascity-gastown-hq
 BEAD=wa-xxxx; BR=crew/wa-worker/$BEAD; RIG=whatsapp_automation
+# ga-iwcu23: fetch BEFORE computing base_commit, and abort rather than submit
+# an empty/stale one. A base_commit computed from a stale local cache (or a
+# branch ref that was never actually pushed) can resolve to something real in
+# YOUR worktree while being absent from origin — every downstream consumer
+# (reviewers cloning from origin, the gate's rebase-distance circuit-breaker)
+# then measures against a base it can't resolve. Measured live in ga-jvzpb:
+# exactly this produced a base_commit origin rejected with "not our ref",
+# which fed a wrong "117 commits behind" into the circuit-breaker (the real,
+# freshly-fetched distance was 36) and permanently parked the marker.
+git -C ~/gt/$RIG fetch origin main "$BR" --quiet || { echo "ERROR: fetch failed — refusing to compute base_commit from a stale cache"; exit 1; }
 BASE=$(git -C ~/gt/$RIG merge-base origin/main origin/$BR)
+[ -z "$BASE" ] && { echo "ERROR: merge-base origin/main origin/$BR returned empty — base_commit unresolvable, do NOT submit a marker without one"; exit 1; }
 MID=$(bd -C "$HQ" create "ready-for-gate: $BR" -t chore \
   --description "branch: $BR
 bead_id: $BEAD

@@ -2529,6 +2529,41 @@ gate_behind_envelope_action() {
   fi
 }
 
+# gate_base_commit_trust <base_commit> <resolved_commit> <is_ancestor_0_1> <fetch_ok_0_1>
+# ga-iwcu23: decide whether a REBASE_BEHIND measurement is trustworthy enough
+# to justify the PERMANENT behind_dead circuit-break. base_commit is a
+# self-declared field from the marker's own description — untrusted by
+# construction, same posture as every other marker-text read in this file.
+# Measured live (ga-jvzpb): a marker's base_commit resolved fine in the
+# author's own worktree but was absent from origin ("not our ref"), which fed
+# a wrong "117 commits behind" into this same circuit-break (real distance,
+# merge-base off a fresh fetch: 36). Pure function — callers do the actual
+# git plumbing (fetch, rig_resolve_commit, merge-base --is-ancestor) and pass
+# in the results, so this is unit-testable without a live git repo, same as
+# gate_behind_envelope_action above.
+#
+# Prints "trusted" or "unverifiable:<reason>". A missing/absent base_commit
+# (fetch succeeded, but the marker never declared one) prints "trusted" —
+# base_commit is optional on older/hand-created markers and its absence is
+# pre-existing, unchanged behavior; this gate only fires when a DECLARED
+# base_commit turns out to be wrong, or the fetch itself couldn't be trusted.
+gate_base_commit_trust() {
+  local base_commit="${1:-}" resolved="${2:-}" is_ancestor="${3:-0}" fetch_ok="${4:-1}"
+  if [ "$fetch_ok" != "1" ]; then
+    printf 'unverifiable:fetch_failed'; return 0
+  fi
+  if [ -z "$base_commit" ] || [ "$base_commit" = "unknown" ]; then
+    printf 'trusted'; return 0
+  fi
+  if [ -z "$resolved" ]; then
+    printf 'unverifiable:object_missing'; return 0
+  fi
+  if [ "$is_ancestor" != "1" ]; then
+    printf 'unverifiable:not_origin_ancestor'; return 0
+  fi
+  printf 'trusted'
+}
+
 # gate_branch_already_merged <branch> <default_branch>
 # ga-88sl7: reusable predicate wrapping the SAME already-merged detection
 # Step 4b uses (is-ancestor, then a patch-id fallback for a rebase-merge
@@ -7118,7 +7153,14 @@ fi
 
 # Fetch to ensure we have the latest remote state
 log "Fetching remote for rig $RIG ..."
-git_rig fetch origin 2>/dev/null || warn "git fetch failed (continuing with stale refs)"
+# ga-iwcu23: remember whether this actually succeeded (not just log a warning
+# and move on) — a behind-envelope measurement taken against stale refs is
+# exactly what fed a wrong "117 commits behind" into the ga-6dp9
+# circuit-breaker (see the base_commit trust gate further below). This flag
+# does not change fetch's own fail-open behavior here; it only lets the
+# later trust gate refuse to act on a measurement it can't stand behind.
+GIT_FETCH_OK=1
+git_rig fetch origin 2>/dev/null || { GIT_FETCH_OK=0; warn "git fetch failed (continuing with stale refs)"; }
 
 # ── ga-ymbv: shallow-clone preflight ──────────────────────────────────────────
 # A SHALLOW rig checkout can make every ancestry-walking command below
@@ -7631,6 +7673,15 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
   # script's `set -u`, even when HAS_CONFLICT was already 1 and the envelope
   # checks are skipped entirely.
   REBASE_BEHIND_EXCEEDED=0
+  # ga-iwcu23: same "always defined under set -u" reasoning as
+  # REBASE_BEHIND_EXCEEDED just above — the call site further below only
+  # dereferences BASE_COMMIT_TRUST when REBASE_BEHIND_EXCEEDED="1" (which, by
+  # construction, can only become true inside the HAS_CONFLICT=0 block that
+  # also sets this), so this default is never actually READ on the skipped
+  # path today; it exists so that invariant isn't the only thing standing
+  # between this variable and an unbound-variable crash if that call site
+  # ever changes.
+  BASE_COMMIT_TRUST="not_applicable"
   # ga-agtqm: true iff the ahead-commit-count cap below is the SOLE reason
   # this branch is out of envelope — i.e. the real merge-tree check that
   # gates entry to this whole block (HAS_CONFLICT=0 test just below) already
@@ -7646,6 +7697,21 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
   if [ "$HAS_CONFLICT" = "0" ]; then
     REBASE_AHEAD=$(git_rig rev-list --count "origin/$DEFAULT_BRANCH..origin/$BRANCH" 2>/dev/null || echo "")
     REBASE_BEHIND=$(git_rig rev-list --count "origin/$BRANCH..origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
+
+    # ga-iwcu23: cross-check the marker's own declared base_commit (if any)
+    # against the same freshly-fetched origin state the counts above just
+    # used — feeds gate_base_commit_trust below, which gates ONLY the
+    # permanent behind_dead circuit-break, not this measurement itself or
+    # the existing needs-rebase/bounce paths.
+    _BC_RESOLVED=""
+    _BC_IS_ANCESTOR=0
+    if [ -n "${BASE_COMMIT:-}" ] && [ "$BASE_COMMIT" != "unknown" ]; then
+      _BC_RESOLVED=$(rig_resolve_commit "$BASE_COMMIT")
+      if [ -n "$_BC_RESOLVED" ] && git_rig merge-base --is-ancestor "$_BC_RESOLVED" "origin/$DEFAULT_BRANCH" 2>/dev/null; then
+        _BC_IS_ANCESTOR=1
+      fi
+    fi
+    BASE_COMMIT_TRUST=$(gate_base_commit_trust "${BASE_COMMIT:-}" "$_BC_RESOLVED" "$_BC_IS_ANCESTOR" "$GIT_FETCH_OK")
 
     # ga-agtqm: an explicit human/Mayor release decision — label
     # gate:allow-large-divergence on the SOURCE BEAD — bypasses the ahead-cap
@@ -8144,6 +8210,19 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     # ahead_dead above (independent condition; both can be simultaneously
     # true — ahead_dead's own circuit-break, if it already fired, exited above
     # and this code is unreached).
+    # ga-iwcu23: a behind-envelope measurement we can't independently verify
+    # must never trigger the PERMANENT circuit-break below — downgrade to
+    # not-exceeded for THIS decision only (gate_behind_envelope_action then
+    # returns "not_applicable" and falls through to the existing generic
+    # dispatch, same as any other in-envelope branch; REBASE_IN_ENVELOPE
+    # above is untouched, so a blind auto-rebase still won't run either).
+    # Logged AND commented so "couldn't verify" stays visibly distinct from
+    # "verified and fine" rather than silently collapsing into it.
+    if [ "$REBASE_BEHIND_EXCEEDED" = "1" ] && [ "$BASE_COMMIT_TRUST" != "trusted" ]; then
+      warn "  ga-iwcu23: REBASE_BEHIND=${REBASE_BEHIND:-?} exceeds GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}, but base_commit trust check says '$BASE_COMMIT_TRUST' — refusing the permanent behind_dead circuit-break this sweep."
+      bd -C "$GC_CITY" comment "$MARKER_ID" "ga-iwcu23: this sweep measured branch $BRANCH as ${REBASE_BEHIND:-?} commits behind main (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}), which would normally trigger the ga-6dp9 behind_dead circuit-break — but the marker's base_commit (${BASE_COMMIT:-<empty>}) could not be independently verified against a freshly-fetched origin/$DEFAULT_BRANCH ($BASE_COMMIT_TRUST). No destructive action taken; will re-measure on a later sweep once origin state is verifiable." 2>/dev/null || true
+      REBASE_BEHIND_EXCEEDED=0
+    fi
     _BEHIND_ACTION=$(gate_behind_envelope_action "$REBASE_BEHIND_EXCEEDED" "$REBASE_AUTHOR_ALIVE")
     if [ "$_BEHIND_ACTION" = "circuit_break" ]; then
       err "  ga-6dp9: circuit-breaking marker $MARKER_ID (behind_dead): behind=${REBASE_BEHIND:-?} > GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX} and author dead/empty."

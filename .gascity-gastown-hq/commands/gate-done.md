@@ -1,7 +1,7 @@
 ---
 description: Signal work ready for quality gate (writes durable marker; launchd guard picks it up within ~2 min)
 argument-hint: ""
-allowed-tools: Bash(git status:*), Bash(git push:*), Bash(git rev-parse:*), Bash(git log:*), Bash(git diff:*), Bash(git config:*), Bash(bd create:*), Bash(bd label:*), Bash(bd list:*), Bash(bd show:*), Bash(gc rig list:*)
+allowed-tools: Bash(git status:*), Bash(git push:*), Bash(git rev-parse:*), Bash(git fetch:*), Bash(git log:*), Bash(git diff:*), Bash(git config:*), Bash(bd create:*), Bash(bd label:*), Bash(bd list:*), Bash(bd show:*), Bash(gc rig list:*)
 ---
 
 # Gate Done — Signal Work Ready for Quality Gate
@@ -279,7 +279,27 @@ if [ -z "$BEAD_ID" ]; then
   exit 1
 fi
 AUTHOR="${GC_ALIAS:-${BEADS_ACTOR:-$(git config user.name)}}"
-BASE_COMMIT=$(git rev-parse origin/main 2>/dev/null || echo "unknown")
+
+# ga-iwcu23 FAIL CLOSED: base_commit must come from a FRESH fetch of
+# origin/main — a stale/absent local cache can silently record a base_commit
+# that origin doesn't actually have, and every downstream consumer (reviewers
+# cloning from origin, the rebase-distance circuit-breaker) then measures
+# against a base it can't resolve. Measured live in ga-jvzpb: a hand-created
+# marker skipped this fetch entirely and recorded a base_commit that existed
+# only in the author's local worktree — origin refused it ("not our ref"),
+# which fed a wrong "117 commits behind" into the gate's circuit-breaker (the
+# real, freshly-fetched distance was 36) and permanently parked the marker.
+if ! git fetch origin main --quiet 2>/dev/null; then
+  echo "ERROR: 'git fetch origin main' failed — cannot establish a trustworthy base_commit."
+  echo "  Marker NOT created. Check network/auth to origin, then re-run /gate-done."
+  exit 1
+fi
+BASE_COMMIT=$(git rev-parse origin/main 2>/dev/null || echo "")
+if [ -z "$BASE_COMMIT" ]; then
+  echo "ERROR: origin/main did not resolve to a commit after a successful fetch — cannot record base_commit."
+  echo "  Marker NOT created. Re-run /gate-done."
+  exit 1
+fi
 # Rig list (RIG_LIST_JSON) was already fetched above during bead_id validation.
 CWD_TOP=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 
