@@ -279,6 +279,73 @@ gate_nudge() {
   return 0
 }
 
+# ga-fe5at: cascade extracted from ga-z3i2p's Step 5a fix (quality-gate-guard.sh)
+# — the SAME undeliverable-bare-name defect existed at 4 more mail(NOTIFY_AUTHOR)
+# sites in THIS file, each copy-pasting a bare `gc mail send "$NOTIFY_AUTHOR"`
+# (not shared even among themselves, let alone with guard.sh's own copy).
+# NOTIFY_AUTHOR is often a BARE crew-branch segment (e.g. "oracle" from
+# crew/oracle/wa-166gf), but live session mailboxes are rig-qualified (e.g.
+# "oracle-wa") — gc mail send resolves recipients by EXACT session_name/alias
+# match, no prefix/fuzzy fallback (internal/session/resolve.go
+# ResolveSessionID), so the bare segment silently fails for any persistent
+# named crew member (pool/template aliases like wa-worker/mayor are already
+# exact and keep working unchanged).
+#
+# Args: <bead_id> <notify_author> <author> <subject> <body> <fail_context>
+# Tries, in order: the bare notify_author (covers already-exact aliases), the
+# segment qualified with the bead's own rig-code suffix (oracle -> oracle-wa —
+# derived from bead_id's own prefix, since THIS bead's rig is the only one it
+# could possibly be, no cross-rig guessing), then author (historically
+# deliverable, ga-409f4's own bug was about the WRONG PERSON, not an
+# undeliverable address). If EVERY candidate fails: mail mayor + a durable bd
+# comment on bead_id, so "could not notify" can never look identical to
+# "notified" in a bd list/painel view — fail_context (a short string naming
+# the incident, e.g. "sibling-branch race on $BEAD_ID (ga-lxz5w)") appears in
+# both the warn log and the mayor escalation.
+#
+# Returns 0 if any candidate received the mail; 1 if every candidate failed
+# OR notify_author was empty (matches this call's pre-existing behavior —
+# there was never anyone to notify, not a new failure to escalate). On a 1
+# from a non-empty notify_author, the mayor escalation + bd comment have
+# ALREADY been sent — the caller needs no further fallback of its own.
+# SELFTEST-EXTRACT notify-author-with-fallback: BEGIN
+notify_author_with_fallback() {
+  local _bead_id="$1" _notify_author="$2" _author="$3" _subject="$4" _body="$5" _fail_context="$6"
+  [ -z "$_notify_author" ] && return 1
+  local _candidates="$_notify_author"
+  if [ -n "$_bead_id" ]; then
+    local _bid_prefix="${_bead_id%%-*}"
+    case "$_bid_prefix" in
+      ga|"") ;;  # HQ/gascity beads: no verified rig-suffix convention to guess
+      *)
+        case "$_notify_author" in
+          *"-$_bid_prefix") ;;  # already qualified (e.g. crew segment was "oracle-wa")
+          *) _candidates="$_candidates ${_notify_author}-${_bid_prefix}" ;;
+        esac
+        ;;
+    esac
+  fi
+  if [ -n "$_author" ] && [ "$_author" != "$_notify_author" ]; then
+    _candidates="$_candidates $_author"
+  fi
+  local _notified="" _candidate
+  for _candidate in $_candidates; do
+    gc --city "$GC_CITY" mail send "$_candidate" -s "$_subject" -m "$_body" 2>/dev/null \
+      && { _notified="$_candidate"; break; }
+  done
+  [ -n "$_notified" ] && return 0
+  warn "Could not mail any author candidate ($_candidates) for $_fail_context — escalating to mayor"
+  gc --city "$GC_CITY" mail send mayor \
+    -s "Gate: author unreachable for $_bead_id" \
+    -m "$_fail_context — could not mail ANY author candidate ($_candidates); the author was never notified. Please relay." \
+    2>/dev/null || true
+  bd -C "$GC_CITY" comment "$_bead_id" \
+    "Author-notify FAILED for every candidate ($_candidates) for: $_fail_context — escalated to mayor by mail instead so this failure stays visible (ga-fe5at)." \
+    2>/dev/null || true
+  return 1
+}
+# SELFTEST-EXTRACT notify-author-with-fallback: END
+
 # ── ga-dupnv (bug 1): one branch = one authoritative gate-run. SIBLING_RUN_STALE
 # is the age (minutes) past which a still-running gate-run for a branch is judged
 # ABANDONED (its dispatcher died mid-run and never drove it terminal) and may be
@@ -3632,13 +3699,11 @@ if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; the
     # $AUTHOR — see the header comment at the top of this function. This site
     # nudges/mails whoever should actually act on the outcome, not whoever
     # the bead happens to be assigned to.
-    if [ -n "$NOTIFY_AUTHOR" ]; then
-      gc --city "$GC_CITY" mail send "$NOTIFY_AUTHOR" \
-        -s "Your gate PASS is held for reconciliation: 2 branches on $BEAD_ID (ga-lxz5w)" \
-        -m "$(printf 'Your branch %s PASSED gate review, but it was NOT merged.\n\nA sibling branch %s is concurrently active in the gate for the same source bead %s (gate-status:%s). Auto-merging either branch would silently discard the other, so %s was labeled gate:needs-human and the Pilot will not re-dispatch it.\n\nNothing to do from your side right now — a human must pick the correct/superset branch and clear gate:needs-human before either can proceed.\n\nBead: %s   Rig: %s\nYour branch: %s (gate run %s)\nSibling branch: %s (gate-status:%s)' \
-          "$BRANCH" "$GATE_LXZ5W_SIB_BRANCH" "$BEAD_ID" "$GATE_LXZ5W_SIB_STATUS" "$BRANCH" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID" "$GATE_LXZ5W_SIB_BRANCH" "$GATE_LXZ5W_SIB_STATUS")" \
-        2>/dev/null || warn "Could not mail author $NOTIFY_AUTHOR for sibling-branch race on $BEAD_ID (ga-lxz5w)"
-    fi
+    notify_author_with_fallback "$BEAD_ID" "$NOTIFY_AUTHOR" "$AUTHOR" \
+      "Your gate PASS is held for reconciliation: 2 branches on $BEAD_ID (ga-lxz5w)" \
+      "$(printf 'Your branch %s PASSED gate review, but it was NOT merged.\n\nA sibling branch %s is concurrently active in the gate for the same source bead %s (gate-status:%s). Auto-merging either branch would silently discard the other, so %s was labeled gate:needs-human and the Pilot will not re-dispatch it.\n\nNothing to do from your side right now — a human must pick the correct/superset branch and clear gate:needs-human before either can proceed.\n\nBead: %s   Rig: %s\nYour branch: %s (gate run %s)\nSibling branch: %s (gate-status:%s)' \
+        "$BRANCH" "$GATE_LXZ5W_SIB_BRANCH" "$BEAD_ID" "$GATE_LXZ5W_SIB_STATUS" "$BRANCH" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID" "$GATE_LXZ5W_SIB_BRANCH" "$GATE_LXZ5W_SIB_STATUS")" \
+      "sibling-branch race on $BEAD_ID (ga-lxz5w)"
     warn "ga-lxz5w: sibling branch $GATE_LXZ5W_SIB_BRANCH (gate-status:$GATE_LXZ5W_SIB_STATUS) active for bead $BEAD_ID — downgrading $BRANCH's PASS to FAIL, labeling gate:needs-human."
   fi
 fi
@@ -3691,13 +3756,11 @@ if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH_SHA" ];
         -m "$(printf 'Branch %s (rig %s) reached the gate merge step for bead %s, but its own commits do not reference that bead at all.\n\n%s\n\nThis is the exact incident ga-y9a1d described: a branch ref silently reused by unrelated work, with the branch name intact and nothing else failing. Labeled gate:needs-human on %s; the Pilot will not re-dispatch it.\n\nBead: %s   Rig: %s\nBranch: %s (sha %s, gate run %s)\nBase (merge-base with %s): %s' \
           "$BRANCH" "$RIG" "$BEAD_ID" "$FAIL_REASONS" "$BEAD_ID" "$BEAD_ID" "$RIG" "$BRANCH" "$BRANCH_SHA" "$GATE_RUN_ID" "$DEFAULT_BRANCH" "$GATE_Y9A1D_BASE")" \
         2>/dev/null || warn "Could not mail Mayor escalation for branch-content mismatch on $BEAD_ID (ga-y9a1d)"
-      if [ -n "$NOTIFY_AUTHOR" ]; then
-        gc --city "$GC_CITY" mail send "$NOTIFY_AUTHOR" \
-          -s "Your gate submission is held: branch content mismatch on $BEAD_ID (ga-y9a1d)" \
-          -m "$(printf 'Your branch %s reached the gate merge step for bead %s, but its own commits do not reference that bead at all.\n\n%s\n\nNothing to do from your side unless you recognize this — a human is reconciling. If your real fix is still sitting as a local/unpushed commit somewhere, it is not lost: `git log --all -S '"'"'<a distinctive string from your fix>'"'"'` will find it on any ref, including ones never merged.\n\nBead: %s   Rig: %s\nBranch: %s (sha %s, gate run %s)' \
-            "$BRANCH" "$BEAD_ID" "$FAIL_REASONS" "$BEAD_ID" "$RIG" "$BRANCH" "$BRANCH_SHA" "$GATE_RUN_ID")" \
-          2>/dev/null || warn "Could not mail author $NOTIFY_AUTHOR for branch-content mismatch on $BEAD_ID (ga-y9a1d)"
-      fi
+      notify_author_with_fallback "$BEAD_ID" "$NOTIFY_AUTHOR" "$AUTHOR" \
+        "Your gate submission is held: branch content mismatch on $BEAD_ID (ga-y9a1d)" \
+        "$(printf 'Your branch %s reached the gate merge step for bead %s, but its own commits do not reference that bead at all.\n\n%s\n\nNothing to do from your side unless you recognize this — a human is reconciling. If your real fix is still sitting as a local/unpushed commit somewhere, it is not lost: `git log --all -S '"'"'<a distinctive string from your fix>'"'"'` will find it on any ref, including ones never merged.\n\nBead: %s   Rig: %s\nBranch: %s (sha %s, gate run %s)' \
+          "$BRANCH" "$BEAD_ID" "$FAIL_REASONS" "$BEAD_ID" "$RIG" "$BRANCH" "$BRANCH_SHA" "$GATE_RUN_ID")" \
+        "branch-content mismatch on $BEAD_ID (ga-y9a1d)"
       warn "ga-y9a1d: branch $BRANCH's $GATE_Y9A1D_COUNT unique commit(s) never mention bead $BEAD_ID (suspects: ${GATE_Y9A1D_SUSPECTS:-none found}) — downgrading PASS to FAIL, labeling gate:needs-human."
     fi
   fi
@@ -4448,13 +4511,11 @@ $PARTIAL_EVIDENCE" 2>/dev/null || true
             "$BEAD_ID" "$BRANCH" "$MERGE_SHA" "$GATE_RUN_ID" "$PARTIAL_EVIDENCE" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID" "$MERGE_SHA")" \
           2>/dev/null || warn "Could not mail Mayor scope-hold escalation for $BEAD_ID (ga-k2wjn)"
         # ga-409f4: NOTIFY_AUTHOR (branch-author-aware), not the bead-derived $AUTHOR.
-        if [ -n "$NOTIFY_AUTHOR" ]; then
-          gc --city "$GC_CITY" mail send "$NOTIFY_AUTHOR" \
-            -s "Your gate PASS is held for scope review: $BEAD_ID (ga-k2wjn)" \
-            -m "$(printf 'Your branch %s PASSED gate review and merged (sha %s), but the source bead %s was NOT closed.\n\nga-k2wjn/ga-zhfk8: the bead body looks like it enumerates multiple approved deliverables (>=3 consecutive numbered or lettered list items), and a gate PASS only proves this diff does what it claims, not that the full scope of the bead is done. Held as delivery:partial + scope:needs-review pending Mayor review.\n\n%s\n\nIf this diff genuinely covers every enumerated item, add label scope_covered:all and close manually (or re-submit to the gate); otherwise the remaining items are still live on this bead.\n\nBead: %s   Rig: %s\nBranch: %s (gate run %s)' \
-              "$BRANCH" "$MERGE_SHA" "$BEAD_ID" "$PARTIAL_EVIDENCE" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID")" \
-            2>/dev/null || warn "Could not mail author $NOTIFY_AUTHOR for scope-hold on $BEAD_ID (ga-k2wjn)"
-        fi
+        notify_author_with_fallback "$BEAD_ID" "$NOTIFY_AUTHOR" "$AUTHOR" \
+          "Your gate PASS is held for scope review: $BEAD_ID (ga-k2wjn)" \
+          "$(printf 'Your branch %s PASSED gate review and merged (sha %s), but the source bead %s was NOT closed.\n\nga-k2wjn/ga-zhfk8: the bead body looks like it enumerates multiple approved deliverables (>=3 consecutive numbered or lettered list items), and a gate PASS only proves this diff does what it claims, not that the full scope of the bead is done. Held as delivery:partial + scope:needs-review pending Mayor review.\n\n%s\n\nIf this diff genuinely covers every enumerated item, add label scope_covered:all and close manually (or re-submit to the gate); otherwise the remaining items are still live on this bead.\n\nBead: %s   Rig: %s\nBranch: %s (gate run %s)' \
+            "$BRANCH" "$MERGE_SHA" "$BEAD_ID" "$PARTIAL_EVIDENCE" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID")" \
+          "scope-hold on $BEAD_ID (ga-k2wjn)"
       else
         # BUG/TASK → close it. bd list defaults to OPEN-only, so closing removes
         # the bead from EVERY open-work selector (Pilot Tier-1 bug & tech-debt),
@@ -4735,13 +4796,11 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         # her she was stuck (only Mayor was mailed; mail, not nudge, survives a
         # dead/restarted author session). ga-409f4: NOTIFY_AUTHOR
         # (branch-author-aware), not the bead-derived $AUTHOR.
-        if [ -n "$NOTIFY_AUTHOR" ]; then
-          gc --city "$GC_CITY" mail send "$NOTIFY_AUTHOR" \
-            -s "Gate needs-human: your branch $BRANCH exhausted $GATE_FIX_CAP fix attempts" \
-            -m "$(printf 'Your branch %s (bead %s) failed the quality gate %s times. Auto-retry is now DISABLED (label gate:needs-human): the Pilot will NOT re-dispatch this bead, and any further /gate-done resubmission will be silently parked until a human resolves this.\n\nGate run: %s\n\nLast blocking reasons:\n%s\n\nA human or the Mayor must intervene before this can proceed.' \
-              "$BRANCH" "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$GATE_RUN_ID" "$(echo -e "$FAIL_REASONS")")" \
-            2>/dev/null || warn "Could not mail author $NOTIFY_AUTHOR for gate-fix-cap escalation on $BEAD_ID"
-        fi
+        notify_author_with_fallback "$BEAD_ID" "$NOTIFY_AUTHOR" "$AUTHOR" \
+          "Gate needs-human: your branch $BRANCH exhausted $GATE_FIX_CAP fix attempts" \
+          "$(printf 'Your branch %s (bead %s) failed the quality gate %s times. Auto-retry is now DISABLED (label gate:needs-human): the Pilot will NOT re-dispatch this bead, and any further /gate-done resubmission will be silently parked until a human resolves this.\n\nGate run: %s\n\nLast blocking reasons:\n%s\n\nA human or the Mayor must intervene before this can proceed.' \
+            "$BRANCH" "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$GATE_RUN_ID" "$(echo -e "$FAIL_REASONS")")" \
+          "gate-fix-cap escalation on $BEAD_ID"
       fi
       # ga-5w0hr: a needs-human bead has NO active worker — the gate just gave up
       # auto-retry. Mirror the needs-fix-branch cleanup so the bead is honestly
