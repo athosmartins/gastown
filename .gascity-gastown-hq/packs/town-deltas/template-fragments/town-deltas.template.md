@@ -78,6 +78,28 @@ pra eliminar.
 1. **Escreva a AÇÃO, não o assunto.** Uma a três linhas, em produto: o que ele abre,
    confere ou decide. "Confirmar no billing do Google que a chamada de metadata é
    gratuita, e parar se não for" é ação. "Camada de Street View" é assunto.
+
+   🚨 **O CAMPO TEM NOME, E É `athos.acao`. Escreva NELE:**
+   ```bash
+   bd -C <rig> update <id> --set-metadata athos.acao="<o que ele faz, 1-3 linhas>"
+   ```
+   O painel lê ESSE metadata (`_athos_acao`, painel_visibilidade.py) e renderiza
+   como "O QUE VOCÊ FAZ" no card. Sem ele, o card mostra
+   **"⚠️ ninguém escreveu o que você precisa fazer"** — o aviso amarelo que o
+   Athos vê hoje em praticamente todo bead da fila dele.
+
+   ⚠️ **MEDIDO 14/08, e é por isso que este parágrafo existe:** dos **26 beads**
+   na fila do Athos (20 no WA + 6 no HQ), **ZERO** tinham `athos.acao`
+   preenchido. 100% mostravam o aviso amarelo. A regra existia desde 13/08 e a
+   adesão foi nula — porque ela mandava escrever "em campo ESTRUTURADO" sem
+   dizer QUAL campo. Instrução que não nomeia o destino não é cumprível.
+   (O Mayor violou a própria regra uma hora depois de mergeá-la: um subagente
+   dele filou o wa-rh1rm na fila do Athos sem preencher o campo.)
+
+   ⚠️ **NÃO existe fallback**: o painel não deriva a ação do título nem da
+   descrição, de propósito — uma instrução adivinhada seria pior que um
+   "faltando" honesto, porque teria a mesma cara de confiança e poderia mandar
+   o Athos fazer a coisa ERRADA.
 2. **Em campo ESTRUTURADO, não em prosa.** Prosa não é lida por automação — e o
    painel decide coluna por `assignee`, não por texto. Medido em 13/08: `wa-fbwsb`
    dizia "Dono: batista-ps" na última linha da descrição **e** tinha o label
