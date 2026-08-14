@@ -580,6 +580,129 @@ grep -qF 'REBASE_AUTHOR=$(resolve_rebase_author "$AUTHOR_TRUSTED_SUBMIT" "$BRANC
   && ok "REBASE_AUTHOR call site passes the branch's own commit author as the new 4th argument — the fix is actually wired in, not just defined" \
   || bad "REBASE_AUTHOR call site not updated — the fix is defined but never wired in"
 
+# ── 12. ga-it1of: REBASE_AUTHOR_ALIVE tries a rig-qualified crew-segment
+#     candidate before giving up, closing a gap AUTHOR_AGENT cannot ─────────
+# BUG (ga-it1of): two real incidents in one day (wa-qtwh3/marker ga-jvzpb:
+# "CIRCUIT-BREAK (behind=117 > max=50, dead author)"; wa-si1vj/marker
+# ga-c89o7: "Author session is gone — gate cannot self-heal") both declared
+# the author dead while `gc session list` showed the real session (oracle-wa,
+# digo-wa respectively) alive and responsive. Root cause, measured directly
+# (NOT the bug report's own initial suspicion of a bare crew-segment lookup —
+# that theory was wrong): both markers were created BY HAND by the Mayor
+# (self_audit text on both confirms this, bypassing /gate-done — so
+# AUTHOR_AGENT/gate.submitted_by_agent was never recorded, and the ga-pyzo
+# recycled-session fallback above had nothing to try), AND on both branches
+# `git log -1 --format=%an` on the tip commit — resolve_rebase_author()'s
+# HIGHEST-priority candidate — was the STATIC git identity "athosmartins" on
+# every single commit (verified directly against origin for both branches),
+# not any agent's alias at all. That identity can never match a live session
+# no matter how it is spelled, and resolve_rebase_author() never even reaches
+# its own crew-segment fallback when commit_author is non-empty — so the old
+# code had no further candidate to try and concluded dead. The fix adds ONE
+# more fallback, independent of whatever resolve_rebase_author already
+# committed to: the branch's own crew segment, qualified with the bead's rig
+# suffix (oracle -> oracle-wa) — the same convention ga-z3i2p already shipped
+# for Step 5a's park-notify cascade in quality-gate-guard.sh.
+echo "── 12. ga-it1of: crew-segment liveness fallback closes the hand-made-marker gap ──"
+
+for _fn in branch_crew_segment rig_qualify_candidate; do
+  type "$_fn" >/dev/null 2>&1 \
+    || { echo "FATAL: $_fn not defined by dispatcher (ga-it1of fix missing?)"; exit 1; }
+done
+
+echo "── 12a. branch_crew_segment: pure extraction, no live IO ──"
+eq "crew/oracle/wa-qtwh3 (the real wa-qtwh3 incident branch) → oracle" \
+  "$(branch_crew_segment "crew/oracle/wa-qtwh3")" \
+  "oracle"
+eq "crew/digo/wa-si1vj (the real wa-si1vj incident branch) → digo" \
+  "$(branch_crew_segment "crew/digo/wa-si1vj")" \
+  "digo"
+eq "non-crew branch (dog fix/* convention) → empty, no segment to extract" \
+  "$(branch_crew_segment "fix/ga-it1of-gate-author-liveness")" \
+  ""
+eq "empty branch → empty" \
+  "$(branch_crew_segment "")" \
+  ""
+
+echo "── 12b. rig_qualify_candidate: bead-id-prefix-derived suffix, mirrors ga-z3i2p's shipped convention ──"
+eq "oracle + wa-qtwh3 (real incident bead) → oracle-wa" \
+  "$(rig_qualify_candidate "oracle" "wa-qtwh3")" \
+  "oracle-wa"
+eq "digo + wa-si1vj (real incident bead) → digo-wa" \
+  "$(rig_qualify_candidate "digo" "wa-si1vj")" \
+  "digo-wa"
+eq "already-qualified bare identity → empty (never double-qualify to oracle-wa-wa)" \
+  "$(rig_qualify_candidate "oracle-wa" "wa-qtwh3")" \
+  ""
+eq "HQ/gascity bead prefix (ga-) → empty, no verified rig-suffix convention to guess" \
+  "$(rig_qualify_candidate "gastown.dog-1" "ga-it1of")" \
+  ""
+eq "empty bare identity → empty (nothing to qualify)" \
+  "$(rig_qualify_candidate "" "wa-qtwh3")" \
+  ""
+eq "bead id with no '-' at all → empty (no real prefix to read, not a false qualify)" \
+  "$(rig_qualify_candidate "oracle" "nodash")" \
+  ""
+eq "ps-rig bead → batista-ps (the convention generalizes beyond wa)" \
+  "$(rig_qualify_candidate "batista" "ps-abc12")" \
+  "batista-ps"
+
+echo "── 12c. End-to-end: the exact wa-qtwh3 incident shape now finds a live candidate the old code never tried ──"
+# Reproduces the real incident's resolve_rebase_author() inputs: no trusted
+# submitter (hand-made marker, no gate.submitted_by), branch crew/oracle/...,
+# no marker self-declared author consulted (commit_author wins outright), and
+# commit_author = "athosmartins" (the measured real value on both incident
+# branches — see the section-12 header comment).
+_IT1OF_AUTHOR=$(resolve_rebase_author "" "crew/oracle/wa-qtwh3" "" "athosmartins")
+eq "resolve_rebase_author picks the branch's own (mis-attributed) commit author, exactly as production did" \
+  "$_IT1OF_AUTHOR" \
+  "athosmartins"
+_IT1OF_ALIVE=$(author_is_alive "$_IT1OF_AUTHOR")
+eq "the static git identity 'athosmartins' is not any agent's alias → reads as dead (the OLD code stopped here and circuit-broke)" \
+  "$_IT1OF_ALIVE" \
+  "0"
+# THE FIX: derive the crew-qualified candidate independently of REBASE_AUTHOR
+# and check IT too, before giving up.
+_IT1OF_CREW_CANDIDATE=$(rig_qualify_candidate "$(branch_crew_segment "crew/oracle/wa-qtwh3")" "wa-qtwh3")
+eq "the fix's independently-derived candidate is oracle-wa — the SAME alias 'gc session list' showed alive in the real incident" \
+  "$_IT1OF_CREW_CANDIDATE" \
+  "oracle-wa"
+# Live author_is_alive call against a real, persistent named-crew alias — same
+# established technique as gate-recycled-session-author-fallback.selftest.sh's
+# PART B (line ~194, "batista-wa" asserted alive directly against the live
+# session roster). oracle-wa is itself one of this city's persistent named
+# crew members (same class as batista-wa), so this is the same bet that
+# selftest already makes, not a new one.
+_IT1OF_CREW_ALIVE=$(author_is_alive "$_IT1OF_CREW_CANDIDATE")
+eq "oracle-wa (a persistent named crew member) reads alive — the fix's candidate succeeds where the old code's only candidate failed" \
+  "$_IT1OF_CREW_ALIVE" \
+  "1"
+
+echo "── 12d. drift guard: the crew-segment fallback is actually WIRED into the REBASE_AUTHOR_ALIVE cascade, not just defined ──"
+grep -qF '_REBASE_CREW_CANDIDATE=$(rig_qualify_candidate "$(branch_crew_segment "$BRANCH")" "$BEAD_ID")' "$DISPATCHER" \
+  && ok "the call site derives the crew-qualified candidate from \$BRANCH/\$BEAD_ID" \
+  || bad "crew-qualified candidate derivation missing/renamed at the call site — fix defined but not wired in"
+grep -qF 'if [ "$REBASE_AUTHOR_ALIVE" != "1" ]; then' "$DISPATCHER" \
+  && ok "the fallback only fires when REBASE_AUTHOR is still dead after the ga-pyzo recycled-session check" \
+  || bad "REBASE_AUTHOR_ALIVE guard missing/renamed — fallback may fire unconditionally or not at all"
+grep -qF 'REBASE_AUTHOR="$_REBASE_CREW_CANDIDATE"' "$DISPATCHER" \
+  && ok "a live crew-qualified candidate actually redirects REBASE_AUTHOR (not just logged)" \
+  || bad "REBASE_AUTHOR redirect assignment missing — candidate found but never used"
+grep -qF 'REBASE_AUTHOR_ALIVE=1' "$DISPATCHER" \
+  && ok "a live crew-qualified candidate actually flips REBASE_AUTHOR_ALIVE (the circuit-break/escalation gate variable itself)" \
+  || bad "REBASE_AUTHOR_ALIVE=1 redirect missing — candidate found but the decision variable never updated"
+
+echo "── 12e. drift guard: AC3 — escalation messages state which candidates were checked ──"
+grep -qF 'REBASE_LIVENESS_TRACE="$REBASE_AUTHOR:$([ "$REBASE_AUTHOR_ALIVE" = "1" ] && printf alive || printf dead)"' "$DISPATCHER" \
+  && ok "REBASE_LIVENESS_TRACE is initialized from the first (commit-author-derived) candidate" \
+  || bad "REBASE_LIVENESS_TRACE initialization missing/renamed"
+_TRACE_MSG_COUNT=$(grep -c 'ga-it1of liveness check: ${REBASE_LIVENESS_TRACE:-none}\|Liveness candidates checked (ga-it1of): ${REBASE_LIVENESS_TRACE:-none}' "$DISPATCHER" || true)
+if [ "${_TRACE_MSG_COUNT:-0}" -ge 6 ]; then
+  ok "the candidate trace is interpolated into the escalation messages (ahead_dead, behind_dead, genuine-conflict, retry_dead — comment+mail pairs), count=$_TRACE_MSG_COUNT"
+else
+  bad "candidate trace interpolated into fewer than expected escalation messages (count=${_TRACE_MSG_COUNT:-0}) — AC3 may be incomplete"
+fi
+
 # ── Result ────────────────────────────────────────────────────────────────────
 echo ""
 if [ "$FAIL" = "0" ]; then
