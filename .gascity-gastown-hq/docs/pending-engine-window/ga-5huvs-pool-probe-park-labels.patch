@@ -1,0 +1,180 @@
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 0000000..0000000 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -3181,8 +3181,20 @@
+ // v55 do engine..." — required a Mayor-coordinated engine rebuild, exactly
+ // the class of work a pool worker must never execute off its own hook per
+ // ga-vhyd).
++//
++// ga-5huvs: needs:engine-window, pilot:no-auto-dispatch, and story:blocked
++// are appended last of all — the remaining exact-match park labels
++// context_check_is_parked() already recognizes (ga-7mbry) but this function
++// did not. Live-reproduced on ga-9kjzz: a bead whose fix was fully written,
++// tested, committed, pushed, and labeled needs:engine-window still
++// re-surfaced as unassigned/ready dog-pool work four separate times over the
++// next 5h20m, each occurrence costing a full dog session's re-investigation.
++// The PREFIX half of this same park-label set (blocked:<reason>,
++// pilot:refused-reason:<slug>, gate:needs-human(:<reason>)) is handled in
++// poolDemandLabelFilterJQ below, for the same reason pool:refused:*/
++// pilot:held* are: --exclude-label cannot express a prefix match.
+ func bdReadyPoolDemandExcludeLabelArgs() string {
+-	return ` --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic"`
++	return ` --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked"`
+ }
+ 
+ // poolDemandLabelFilterJQ is the PREFIX half of the routed-pool predicate: the
+@@ -3209,6 +3221,20 @@
+ // are required, neither is redundant. Anchored at the start with a colon/
+ // whitespace delimiter so a title that merely mentions "epic" mid-sentence
+ // (e.g. a bug report about this exact gap) is never over-matched.
++//
++// ga-5huvs: also excludes blocked:<reason>, pilot:refused-reason:<slug>, and
++// gate:needs-human(:<reason>) — the PREFIX half of the same park-label parity
++// gap bdReadyPoolDemandExcludeLabelArgs closes above for the exact-match half
++// (needs:engine-window/pilot:no-auto-dispatch/story:blocked). All three are
++// already-established park signals context_check_is_parked() recognizes
++// (ga-7mbry). blocked:<reason> is deliberately colon-only — NOT a "blocked-*"
++// glob — so an unrelated dependency-pointer label like blocked-by:<id> (a
++// different label family: what blocks a bead, not "this bead IS blocked")
++// cannot false-positive through here, mirroring context-check-dispatcher.sh's
++// own guard. gate:needs-human matches both the bare label and every
++// colon-suffixed sub-reason (:technical, :partial-delivery, :refused, etc.)
++// via a single startswith, since the bare string is itself a prefix of every
++// suffixed variant.
+ func poolDemandLabelFilterJQ() string {
+ 	return `jq -c --argjson now_ts "$(date +%s)" ` + shellquote.Quote(
+ 		`[ .[] `+
+@@ -3216,7 +3242,10 @@
+ 			`| select((((.labels // []) | map(select(startswith("pilot:held"))) | length) == 0) `+
+ 			`or (((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber)) `+
+ 			`| if length > 0 then (max < $now_ts) else false end)) `+
+-			`| select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) ]`)
++			`| select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) `+
++			`| select(((.labels // []) | map(select(startswith("blocked:"))) | length) == 0) `+
++			`| select(((.labels // []) | map(select(startswith("pilot:refused-reason:"))) | length) == 0) `+
++			`| select(((.labels // []) | map(select(startswith("gate:needs-human"))) | length) == 0) ]`)
+ }
+ 
+ // bdReadyPoolDemandMigrationShell is a temporary raw compatibility probe for
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index 0000000..0000000 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -1725,7 +1725,7 @@
+ 	if strings.Contains(got, `--include-ephemeral`) {
+ 		t.Errorf("EffectiveWorkQuery() default must be bd 1.0.4-compatible without --include-ephemeral: %q", got)
+ 	}
+-	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --json --sort oldest --limit=20`) {
++	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json --sort oldest --limit=20`) {
+ 		t.Errorf("EffectiveWorkQuery() missing tier 3 pool-demand probe: %q", got)
+ 	}
+ 	if !strings.Contains(got, "-- mayor") {
+@@ -1747,7 +1747,7 @@
+ func TestEffectiveWorkQueryBD105CompatibilityOptIn(t *testing.T) {
+ 	a := Agent{Name: "mayor"}
+ 	got := a.EffectiveWorkQueryForBeads(BeadsConfig{BDCompatibility: BeadsBDCompatibility105})
+-	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --json --sort oldest --limit=20`) {
++	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json --sort oldest --limit=20`) {
+ 		t.Errorf("EffectiveWorkQueryForBeads(bd-1.0.5) missing include-ephemeral routed probe: %q", got)
+ 	}
+ 	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=1`) {
+@@ -2019,7 +2019,71 @@
+ 	got := bdReadyPoolDemandExcludeLabelArgs()
+ 	if !strings.Contains(got, `--exclude-label "story:epic"`) {
+ 		t.Fatalf("bdReadyPoolDemandExcludeLabelArgs() = %q, missing --exclude-label \"story:epic\"", got)
++	}
++}
++
++// TestBdReadyPoolDemandExcludeLabelArgsIncludesEngineWindowAndParkLabels
++// (ga-5huvs): needs:engine-window, pilot:no-auto-dispatch, and story:blocked
++// are established town-wide park labels — context_check_is_parked() in
++// context-check-dispatcher.sh already recognizes all three (ga-7mbry/ga-ipm4)
++// — but were missing from the dog pool's own exact-match exclude list here.
++// Live-reproduced on ga-9kjzz: a bead whose fix was fully written, tested,
++// committed, pushed, AND labeled needs:engine-window at 07:16 still
++// re-surfaced as unassigned/ready dog-pool work four separate times over the
++// following 5h20m (dog-garsibd, dog-ga6shkr x2, dog-gao05od) — each
++// occurrence costing a full session's re-investigation before it could
++// re-conclude "nothing left for a dog to do here."
++func TestBdReadyPoolDemandExcludeLabelArgsIncludesEngineWindowAndParkLabels(t *testing.T) {
++	got := bdReadyPoolDemandExcludeLabelArgs()
++	for _, want := range []string{
++		`--exclude-label "needs:engine-window"`,
++		`--exclude-label "pilot:no-auto-dispatch"`,
++		`--exclude-label "story:blocked"`,
++	} {
++		if !strings.Contains(got, want) {
++			t.Fatalf("bdReadyPoolDemandExcludeLabelArgs() = %q, missing %q", got, want)
++		}
++	}
++}
++
++// TestPoolDemandLabelFilterJQExcludesParkLabels (ga-5huvs) is the PREFIX half
++// of the same fix: blocked:<reason>, pilot:refused-reason:<slug>, and
++// gate:needs-human(:<reason>) cannot be expressed via bd's exact-match
++// --exclude-label, so poolDemandLabelFilterJQ must exclude them the same way
++// it already excludes pool:refused:*/pilot:held* — mirroring
++// context_check_is_parked()'s coverage (ga-7mbry). Negative control:
++// blocked-by:<id> is a DIFFERENT label family (points at what blocks a bead,
++// not "this bead IS blocked") and must survive — same colon-only discipline
++// context-check-dispatcher.sh's own guard uses to avoid over-matching it.
++func TestPoolDemandLabelFilterJQExcludesParkLabels(t *testing.T) {
++	if _, err := exec.LookPath("jq"); err != nil {
++		t.Skip("jq not available; poolDemandLabelFilterJQ is a jq pipeline")
++	}
++
++	// needs:engine-window is deliberately NOT a case here — it's exact-match,
++	// so it's filtered by bd's own --exclude-label (bdReadyPoolDemandExcludeLabelArgs,
++	// covered by TestBdReadyPoolDemandExcludeLabelArgsIncludesEngineWindowAndParkLabels)
++	// before this jq filter ever sees the bead, not by poolDemandLabelFilterJQ itself.
++	input := `[{"id":"blocked-reason","labels":["blocked:external-quota-motherduck"]},{"id":"refused-reason","labels":["pilot:refused-reason:oracle-named-executor"]},{"id":"gate-bare","labels":["gate:needs-human"]},{"id":"gate-suffixed","labels":["gate:needs-human:technical"]},{"id":"blocked-by-survives","labels":["blocked-by:wa-10srb"]},{"id":"clean-survives","labels":["area:infra","lane:small"]}]`
++
++	shellCmd := "printf '%s' '" + input + "' | " + poolDemandLabelFilterJQ()
++	cmd := exec.Command("sh", "-c", shellCmd)
++	out, err := cmd.Output()
++	if err != nil {
++		t.Fatalf("run poolDemandLabelFilterJQ: %v", err)
++	}
++
++	got := strings.TrimSpace(string(out))
++	for _, wantAbsent := range []string{`"blocked-reason"`, `"refused-reason"`, `"gate-bare"`, `"gate-suffixed"`} {
++		if strings.Contains(got, wantAbsent) {
++			t.Errorf("poolDemandLabelFilterJQ() output = %s, must not contain park-labeled id %s", got, wantAbsent)
++		}
+ 	}
++	for _, wantPresent := range []string{`"blocked-by-survives"`, `"clean-survives"`} {
++		if !strings.Contains(got, wantPresent) {
++			t.Errorf("poolDemandLabelFilterJQ() output = %s, missing non-parked id %s (over-matched)", got, wantPresent)
++		}
++	}
+ }
+ 
+ func TestEffectiveAssignedReadyQueryControlDispatcherClaimsLegacyAssignedWork(t *testing.T) {
+@@ -2233,7 +2297,7 @@
+ 	}, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  "ready --metadata-field gc.routed_to=hello-world/worker --unassigned --exclude-type=epic --exclude-label story:needs-human --exclude-label needs-human --exclude-label ctx:thin --exclude-label story:needs-approval --exclude-label story:epic --json --sort oldest --limit=20")
++  "ready --metadata-field gc.routed_to=hello-world/worker --unassigned --exclude-type=epic --exclude-label story:needs-human --exclude-label needs-human --exclude-label ctx:thin --exclude-label story:needs-approval --exclude-label story:epic --exclude-label needs:engine-window --exclude-label pilot:no-auto-dispatch --exclude-label story:blocked --json --sort oldest --limit=20")
+     printf '[{"id":"older-no-history","priority":2,"created_at":"2026-05-20T06:09:30Z","no_history":true}]'
+     ;;
+   *)
+@@ -2382,7 +2446,7 @@
+ 	// resume its own assigned ephemeral epic wisp (the patrol-loop pattern).
+ 	wantPresent := []string{
+ 		// routed/pool tier still excludes epics (gc-udx guard)
+-		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --json`,
++		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json`,
+ 		// assigned tiers carry NO epic exclusion
+ 		`bd list --status in_progress --assignee="$id" --json`,
+ 		`bd ready --assignee="$id" --json`,
+@@ -2408,7 +2472,7 @@
+ 	a := Agent{Name: ControlDispatcherAgentName, Dir: "gascity"}
+ 	got := a.EffectiveWorkQuery()
+ 	wantPresent := []string{
+-		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --json`,
++		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json`,
+ 		`bd list --status in_progress --assignee="$cand" --json`,
+ 		`bd ready --assignee="$cand" --json`,
+ 		`-- gascity/control-dispatcher gascity/workflow-control`,
