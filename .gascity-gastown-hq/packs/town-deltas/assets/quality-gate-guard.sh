@@ -3450,13 +3450,62 @@ To re-enter the gate: resolve the blocking condition on $BEAD_ID (get it approve
       *)                   UNBLOCK_HINT="Resolve the blocking condition on $BEAD_ID" ;;
     esac
     # ga-409f4: NOTIFY_AUTHOR (branch-author-aware), not the bead-derived $AUTHOR.
-    if [ -n "$NOTIFY_AUTHOR" ]; then
-      gc --city "$GC_CITY" mail send "$NOTIFY_AUTHOR" \
+    # ga-z3i2p: NOTIFY_AUTHOR is often a BARE crew-branch segment (e.g. "oracle"
+    # from crew/oracle/wa-166gf), but live session mailboxes are rig-qualified
+    # (e.g. "oracle-wa") — gc mail send resolves recipients by EXACT
+    # session_name/alias match, no prefix/fuzzy fallback (internal/session/
+    # resolve.go ResolveSessionID), so the bare segment silently fails to
+    # resolve for any persistent named crew member (pool/template aliases like
+    # wa-worker/mayor ARE already exact and keep working unchanged). Real
+    # incident: "WARN: Could not mail author oracle for Step 5a park on
+    # wa-166gf" (marker ga-gq8x5) — oracle-wa never got the notice this park
+    # exists specifically to guarantee (ga-oo66).
+    # Try, in order: the bare segment (covers pool/template aliases), the
+    # segment qualified with the source bead's rig-code suffix (covers
+    # persistent named crew: oracle -> oracle-wa; derived the same way
+    # RIG_PATH is resolved below — bead-id prefix, since THIS bead's own rig is
+    # the only one it could possibly be), then the bead-derived $AUTHOR
+    # (historically deliverable — ga-409f4's own bug was about the WRONG
+    # PERSON, not an undeliverable address). This park is TERMINAL: no retry
+    # will ever re-attempt this notification, so a SECOND destination (mail
+    # Mayor + a durable marker comment) fires when EVERY candidate fails —
+    # "could not notify" must never look identical to "notified".
+    # SELFTEST-EXTRACT park-author-notify: BEGIN
+    PARK_NOTIFY_CANDIDATES="$NOTIFY_AUTHOR"
+    if [ -n "$BEAD_ID" ]; then
+      _park_bid_prefix="${BEAD_ID%%-*}"
+      case "$_park_bid_prefix" in
+        ga|"") ;;  # HQ/gascity beads: no verified rig-suffix convention to guess
+        *)
+          case "$NOTIFY_AUTHOR" in
+            *"-$_park_bid_prefix") ;;  # already qualified (e.g. crew segment was "oracle-wa")
+            *) PARK_NOTIFY_CANDIDATES="$PARK_NOTIFY_CANDIDATES ${NOTIFY_AUTHOR}-${_park_bid_prefix}" ;;
+          esac
+          ;;
+      esac
+    fi
+    if [ -n "$AUTHOR" ] && [ "$AUTHOR" != "$NOTIFY_AUTHOR" ]; then
+      PARK_NOTIFY_CANDIDATES="$PARK_NOTIFY_CANDIDATES $AUTHOR"
+    fi
+    PARK_NOTIFIED=""
+    for _park_candidate in $PARK_NOTIFY_CANDIDATES; do
+      gc --city "$GC_CITY" mail send "$_park_candidate" \
         -s "Gate marker parked (not queued): $BEAD_ID" \
         -m "$(printf 'Your gate marker %s (bead %s, branch %s) was PARKED, not queued — %s.\n\nNo gate-run was created and no reviewer was spawned. This is different from "queued, reviewers incoming": nothing further will happen on this marker.\n\n%s, then submit a fresh gate marker. Until then, any further /gate-done resubmission for this bead will keep being silently parked — this mail is the one signal you get for THIS attempt.' \
           "$MARKER_ID" "$BEAD_ID" "$BRANCH" "$PARK_REASON" "$UNBLOCK_HINT")" \
-        2>/dev/null || warn "Could not mail author $NOTIFY_AUTHOR for Step 5a park on $BEAD_ID (marker $MARKER_ID)"
+        2>/dev/null && { PARK_NOTIFIED="$_park_candidate"; break; }
+    done
+    if [ -z "$PARK_NOTIFIED" ]; then
+      warn "Could not mail any author candidate ($PARK_NOTIFY_CANDIDATES) for Step 5a park on $BEAD_ID (marker $MARKER_ID) — escalating to mayor"
+      gc --city "$GC_CITY" mail send mayor \
+        -s "Gate park: author unreachable for $BEAD_ID" \
+        -m "Step 5a parked marker $MARKER_ID (bead $BEAD_ID, branch $BRANCH) — $PARK_REASON. Could not mail ANY author candidate ($PARK_NOTIFY_CANDIDATES); the author was never notified of this terminal park. Please relay: $UNBLOCK_HINT." \
+        2>/dev/null || true
+      bd -C "$GC_CITY" comment "$MARKER_ID" \
+        "Step 5a park: author-notify FAILED for every candidate ($PARK_NOTIFY_CANDIDATES) — escalated to mayor by mail instead so this failure stays visible (ga-z3i2p)." \
+        2>/dev/null || true
     fi
+    # SELFTEST-EXTRACT park-author-notify: END
     bd -C "$GC_CITY" close "$MARKER_ID" \
       -r "Gate guard Step 5a: marker parked (terminal) — $PARK_REASON. No gate-run created." \
       2>/dev/null || true

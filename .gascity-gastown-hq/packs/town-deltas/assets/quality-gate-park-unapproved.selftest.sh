@@ -179,11 +179,25 @@ grep -qE 'if \[ -n "\$BEAD_RAW" \]' "$GUARD" \
 # ga-409f4: the mail target is now $NOTIFY_AUTHOR (branch-author-aware),
 # not the bead-derived $AUTHOR — same durable-mail property, different
 # (more correct) identity source. Both patterns are accepted below.
-echo "── 7. drift-guard: ga-oo66 — AUTHOR is mailed on Step 5a park (not just commented) ──"
+# ga-z3i2p: $NOTIFY_AUTHOR alone is often UNDELIVERABLE (a bare crew-branch
+# segment like "oracle" vs the real session alias "oracle-wa" — gc mail send
+# resolves by exact match, no fuzzy/prefix fallback). Step 5a now tries a
+# small candidate list (see gate-park-notify-address-fallback.selftest.sh for
+# the full cascade + mutation tests) and, if EVERY candidate fails, escalates
+# to mayor + leaves a durable marker comment instead of a bare log WARN — a
+# terminal park must never let "could not notify" look identical to
+# "notified". The checks below only prove the STRUCTURAL shape (mails a
+# resolved candidate, distinguishes park from queued, escalates on total
+# failure, fires before close); the address-resolution cascade itself is
+# unit-tested end-to-end in the dedicated selftest.
+echo "── 7. drift-guard: ga-oo66/ga-z3i2p — AUTHOR is mailed on Step 5a park (not just commented) ──"
 STEP5A_BLOCK=$(awk '/# ── Step 5a:/{f=1} f{print} f&&/# ── Resolve the store that OWNS the source bead/{exit}' "$GUARD")
-printf '%s\n' "$STEP5A_BLOCK" | grep -Eq 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"' \
-  && ok "Step 5a mails AUTHOR on park (ga-oo66)" \
+printf '%s\n' "$STEP5A_BLOCK" | grep -Eq 'mail send "\$_park_candidate"' \
+  && ok "Step 5a mails a resolved author candidate on park (ga-oo66/ga-z3i2p)" \
   || bad "Step 5a still only comments — author has no durable park signal (ga-oo66 regression)"
+printf '%s\n' "$STEP5A_BLOCK" | grep -qF 'PARK_NOTIFY_CANDIDATES="$NOTIFY_AUTHOR"' \
+  && ok "Step 5a candidate list is seeded from NOTIFY_AUTHOR (still author-derived, not an arbitrary target)" \
+  || bad "Step 5a candidate list no longer seeded from NOTIFY_AUTHOR — may notify the wrong identity"
 # Both park reasons (needs-approval, needs-human) plus the fail-open default
 # each compute their own unblock hint — exactly 3 assignments, mirroring
 # ga-u4yi's "exactly N sites" counting style.
@@ -193,23 +207,26 @@ eq "Step 5a covers all 3 park-action branches with a tailored unblock hint" \
 printf '%s\n' "$STEP5A_BLOCK" | grep -qi 'not queued' \
   && ok "Step 5a mail explicitly distinguishes 'parked' from 'queued, reviewers incoming'" \
   || bad "Step 5a mail does not distinguish park from queued — the ga-oo66 root-cause silence survives"
-printf '%s\n' "$STEP5A_BLOCK" | grep -q '|| warn "Could not mail author' \
-  && ok "Step 5a author mail is best-effort (mail failure does not abort the park)" \
-  || bad "Step 5a author mail is not best-effort-guarded"
-# Ordering: mail before close, mirroring the comment-then-mail-then-close
-# sequence used at the dispatcher's own ga-u4yi sites.
+printf '%s\n' "$STEP5A_BLOCK" | grep -qF 'gc --city "$GC_CITY" mail send mayor' \
+  && ok "Step 5a escalates to mayor when every author candidate fails (ga-z3i2p AC2)" \
+  || bad "Step 5a has no mayor-escalation fallback — a total mail failure is silent again"
+printf '%s\n' "$STEP5A_BLOCK" | grep -qF 'bd -C "$GC_CITY" comment "$MARKER_ID"' \
+  && ok "Step 5a leaves a durable marker comment when author-notify fails (ga-z3i2p AC2, second signal)" \
+  || bad "Step 5a does not mark the bead on notify failure — 'could not notify' looks identical to 'notified'"
+# Ordering: notify attempt before close, mirroring the comment-then-mail-then-
+# close sequence used at the dispatcher's own ga-u4yi sites.
 # The `|| true` on each is required, not decorative: under set -euo pipefail,
 # a legitimate zero-match grep (exactly the pre-fix case this line exists to
 # catch) would otherwise abort the whole script instead of flowing into the
 # "missing" branch below — the same error/empty conflation this codebase's
 # own ga-p5q3 doctrine warns against, just inverted (empty caught as a hard
 # abort instead of a graceful signal).
-MAIL_LINE=$(printf '%s\n' "$STEP5A_BLOCK" | grep -nE 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"' | head -1 | cut -d: -f1 || true)
+MAIL_LINE=$(printf '%s\n' "$STEP5A_BLOCK" | grep -nF 'for _park_candidate in $PARK_NOTIFY_CANDIDATES' | head -1 | cut -d: -f1 || true)
 CLOSE_LINE=$(printf '%s\n' "$STEP5A_BLOCK" | grep -n 'close "\$MARKER_ID"' | head -1 | cut -d: -f1 || true)
 if [ -n "$MAIL_LINE" ] && [ -n "$CLOSE_LINE" ] && [ "$MAIL_LINE" -lt "$CLOSE_LINE" ]; then
-  ok "Step 5a author mail fires BEFORE the marker close"
+  ok "Step 5a author-notify attempt fires BEFORE the marker close"
 else
-  bad "Step 5a author mail ordering wrong (mail must precede close): mail=${MAIL_LINE:-missing} close=${CLOSE_LINE:-missing}"
+  bad "Step 5a author-notify ordering wrong (notify attempt must precede close): notify=${MAIL_LINE:-missing} close=${CLOSE_LINE:-missing}"
 fi
 
 # ── 8. ga-o5de8: gate:needs-human:partial-delivery must NOT park ─────────────
