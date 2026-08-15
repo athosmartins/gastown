@@ -84,14 +84,46 @@
 #      pane_shows_active_child_process()/tokens_rising_or_first_sample()
 #      abaixo.
 #
+#   8. RETOMADA AUTOMÁTICA ANTES DE ESCALAR (ga-nrkh92, Athos aprovou
+#      2026-08-15: "a cidade deve ACORDAR SOZINHA e avisar depois"): quando
+#      TODAS as camadas 1-7 acima confirmam travamento genérico real (não
+#      BLOQUEADO-EM-PROMPT — esse caso continua só mail, ver item 6) E há
+#      uma sessão viva pra acordar, o daemon NÃO manda mail direto mais —
+#      primeiro tenta retomar pelo canal interativo (gc session nudge + tmux
+#      send-keys direto no pane, texto e Enter em chamadas separadas — ver
+#      send_idle_resume()), registra o estado em RESUMEDIR, e só escala
+#      (mail+notify, via o MESMO send_escalation() de sempre) se
+#      RESUME_GRACE_SEC se passar SEM o transcript voltar a avançar. Uma
+#      sessão genuinamente ausente (sem pane pra acordar) continua indo
+#      direto pra escalação, sem essa etapa — comportamento inalterado.
+#      Dois cuidados adicionais, medidos ao vivo pelo Mayor no incidente que
+#      originou este bead (3 crews nomeadas paradas 7-13h numa noite):
+#        (b) NÃO usa %cpu do `ps` pra decidir se está realmente ocioso — é
+#            média da vida do processo, não discrimina. Usa TIME acumulado,
+#            amostrado 2x com IDLE_CPU_SAMPLE_SEC de intervalo (delta==0 =
+#            ocioso confirmado). Ver pane_truly_idle()/pane_cpu_time_secs().
+#        (f) Um bead pode declarar metadata "gc.active_window"="HH:MM-HH:MM"
+#            (tolera virada de meia-noite) — fora dessa janela, ociosidade é
+#            ESPERADA e correta; o daemon não retoma nem escala. Sem essa
+#            metadata (o default hoje), a janela nunca se aplica. Ver
+#            now_outside_active_window().
+#      Ao escalar por falta de resposta, a mensagem prova "trabalho único
+#      em risco" via `git cherry origin/main HEAD` (patch-id), NUNCA via
+#      ref-não-mergeada — uma branch pode parecer não-mergeada e ainda assim
+#      ter todo o conteúdo em main por outro commit/fatia (medido ao vivo no
+#      próprio dia deste bead, wa-x92yd). Ver has_unique_work() (critério e).
+#
 # ANTI-SPAM: uma escalação por bead por janela COOLDOWN_SEC (padrão 3h).
 #   Per-bead state: .gc/state/agent-stuck-escalation/<bead-id>
+#   Per-bead resume state (ga-nrkh92): .gc/state/agent-idle-resume/<bead-id>
+#     (linha 1 = epoch do último nudge de retomada enviado)
 #   Quando bead sai do in_progress (fecha ou avança) → GC limpa o estado dele.
 #
 # Launchd: com.gascity.agent-stuck-escalation (StartInterval 300)
 # Log: .gc/logs/agent-stuck-escalation.log
 # Kill-switch: .gc/state/agent-stuck-escalation.disabled
-# DRY_RUN=1: log/notify apenas, sem mail ao Mayor (selftest/supervised)
+# DRY_RUN=1: log/notify apenas, sem mail ao Mayor nem retomada real via tmux
+#   (selftest/supervised — send_idle_resume() ainda loga a tentativa)
 
 set -uo pipefail
 
@@ -99,15 +131,20 @@ CITY="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
 GC="${GC:-gc}"
 BD="${BD:-bd}"
 NOTIFY="${NOTIFY_BIN:-notify}"
+TMUX="${TMUX_BIN:-tmux}"     # ga-nrkh92: retomada interativa (send_idle_resume)
+GIT="${GIT_BIN:-git}"        # ga-nrkh92: prova de trabalho único (has_unique_work)
 LOG_DIR="$CITY/.gc/logs"
 LOG="$LOG_DIR/agent-stuck-escalation.log"
 STATE_DIR="$CITY/.gc/state"
 ESCDIR="$STATE_DIR/agent-stuck-escalation"
 TOKDIR="$STATE_DIR/agent-stuck-escalation-tokens"  # ga-0xmxt: per-bead last-seen token count
+RESUMEDIR="$STATE_DIR/agent-idle-resume"  # ga-nrkh92: per-bead last-resume-nudge timestamp
 
 STUCK_AGENT_SEC="${STUCK_AGENT_SEC:-3600}"   # 60min sem update → travado (ga-0xmxt: subiu de 1800s — medido ao vivo um turno de max-effort em 33m18s e ainda rodando, 1800s dava zero margem)
 COOLDOWN_SEC="${COOLDOWN_SEC:-10800}"        # 3h antes de re-escalar o mesmo bead
 TRANSCRIPT_FRESH_SEC="${TRANSCRIPT_FRESH_SEC:-$STUCK_AGENT_SEC}"  # ga-hehi: transcript escrito há menos disso = avançando
+RESUME_GRACE_SEC="${RESUME_GRACE_SEC:-900}"  # ga-nrkh92: prazo após o nudge de retomada, antes de escalar por falta de resposta (~3 ciclos de StartInterval)
+IDLE_CPU_SAMPLE_SEC="${IDLE_CPU_SAMPLE_SEC:-5}"  # ga-nrkh92: intervalo entre as 2 amostras de TIME acumulado do pane (pane_truly_idle)
 MAYOR_ADDR="${MAYOR_ADDR:-mayor}"
 DRY_RUN="${DRY_RUN:-0}"
 # Bead stores to scan (space-separated paths; HQ must be .gascity-gastown-hq, NOT the gt root)
@@ -126,7 +163,7 @@ fi
 # Types to skip — utility/infrastructure beads, not work items
 SKIP_TYPES="warrant sling wisp"
 
-mkdir -p "$LOG_DIR" "$STATE_DIR" "$ESCDIR" "$TOKDIR"
+mkdir -p "$LOG_DIR" "$STATE_DIR" "$ESCDIR" "$TOKDIR" "$RESUMEDIR"
 
 if [ "$DRY_RUN" != "1" ]; then
     exec >> "$LOG" 2>&1
@@ -764,6 +801,168 @@ is_human_assignee() {
     esac
 }
 
+# now_outside_active_window (ga-nrkh92, critério f): um bead pode declarar,
+# via metadata "gc.active_window" = "HH:MM-HH:MM" (hora local da máquina,
+# tolera virada de meia-noite), a janela em que sua ociosidade é ESPERADA e
+# correta — fora dela, ociosidade NÃO é sinal de travamento e este daemon
+# não deve nem tentar retomar nem escalar. Sem essa metadata (o caso default
+# hoje — nenhum bead na cidade declara isso ainda), a checagem sempre
+# retorna "dentro da janela" (nunca suprime). Concreto: wa-x92yd só pode
+# medir aparelho 20:00-07:00; o Mayor mediu, no próprio dia deste bead, que
+# acordar um agente assim fora da janela é PIOR que não fazer nada (empurra
+# o agente a mexer em aparelho durante campanha real de envio).
+#
+# Formato inválido (digitado errado) FAIL-OPEN pra "dentro da janela" —
+# nunca suprime por um erro de digitação silencioso.
+#
+#   0 = FORA da janela declarada (ociosidade esperada — não agir)
+#   1 = dentro da janela (ou sem janela declarada, ou formato inválido)
+now_outside_active_window() {
+    local window="$1" start_hm end_hm cur_hm start_min end_min cur_min
+    [ -z "$window" ] && return 1
+    case "$window" in
+        [0-2][0-9]:[0-5][0-9]-[0-2][0-9]:[0-5][0-9]) ;;
+        *) return 1 ;;
+    esac
+    start_hm="${window%-*}"; end_hm="${window#*-}"
+    start_min=$(( 10#${start_hm%%:*} * 60 + 10#${start_hm##*:} ))
+    end_min=$(( 10#${end_hm%%:*} * 60 + 10#${end_hm##*:} ))
+    cur_hm="$(date +%H:%M)"
+    cur_min=$(( 10#${cur_hm%%:*} * 60 + 10#${cur_hm##*:} ))
+    if [ "$start_min" -le "$end_min" ]; then
+        [ "$cur_min" -ge "$start_min" ] && [ "$cur_min" -lt "$end_min" ] && return 1
+        return 0
+    else
+        # janela cruza meia-noite (ex.: 20:00-07:00)
+        { [ "$cur_min" -ge "$start_min" ] || [ "$cur_min" -lt "$end_min" ]; } && return 1
+        return 0
+    fi
+}
+
+# pane_pid_for_session / pane_cpu_time_secs / pane_truly_idle (ga-nrkh92,
+# critério b): nenhum comando `gc` expõe o PID do pane de uma sessão
+# (levantado — gc session list/peek não trazem PID); resolve via tmux
+# diretamente. Usado SÓ pra corroborar ociosidade real antes de mandar uma
+# retomada: %cpu do `ps` é MÉDIA da vida do processo — num processo de
+# horas, atividade recente desaparece na média (medido ao vivo pelo Mayor:
+# os 3 painéis marcavam 0.0% mesmo DEPOIS de retomarem). TIME acumulado,
+# amostrado 2x com IDLE_CPU_SAMPLE_SEC de intervalo, é o discriminador que
+# funcionou (confirmado: 1-2s de CPU em 25s quando os painéis retomaram).
+pane_pid_for_session() {
+    local sess="$1" pid
+    pid="$(timeout 10 "$TMUX" list-panes -t "$sess" -F '#{pane_pid}' 2>/dev/null | head -1)"
+    [ -z "$pid" ] && return 1
+    printf '%s' "$pid"
+}
+
+pane_cpu_time_secs() {
+    local pid="$1" raw
+    raw="$(ps -o time= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+    [ -z "$raw" ] && return 1
+    python3 -c "
+parts = '$raw'.split(':')
+try:
+    parts = [float(p) for p in parts]
+except Exception:
+    raise SystemExit(1)
+secs = 0.0
+for p in parts:
+    secs = secs * 60 + p
+print(int(secs))
+" 2>/dev/null
+}
+
+#   0 = ocioso CONFIRMADO (TIME idêntico nas 2 amostras)
+#   1 = NÃO ocioso CONFIRMADO (TIME mudou entre as 2 amostras)
+#   2 = DESCONHECIDO (PID não resolvido via tmux, ou `ps` falhou) — NUNCA
+#       deve travar a retomada. Mesma direção tri-state que
+#       transcript_is_advancing()/tokens_rising_or_first_sample() já usam
+#       neste arquivo (pergunta que falha nunca vira veredito confirmado),
+#       mas aplicada ao INVERSO aqui de propósito: quem chama esta função
+#       já chegou até este ponto porque 7 camadas anteriores CONFIRMARAM
+#       travamento real — este check é só uma corroboração ADICIONAL pro
+#       caso de computação silenciosa (critério b do bead), e sua própria
+#       falha não pode desfazer um veredito que já estava estabelecido. Se
+#       "desconhecido" suprimisse aqui, qualquer falha de resolução de PID
+#       (tmux ausente, nome de sessão não-tmux, etc.) desligaria retomada E
+#       escalação silenciosamente pra sempre nesse bead — pior que o
+#       comportamento de antes desta mudança, que sempre acabava escalando.
+pane_truly_idle() {
+    local sess="$1" pid t1 t2
+    pid="$(pane_pid_for_session "$sess")" || return 2
+    t1="$(pane_cpu_time_secs "$pid")" || return 2
+    sleep "$IDLE_CPU_SAMPLE_SEC"
+    t2="$(pane_cpu_time_secs "$pid")" || return 2
+    [ "$t2" -eq "$t1" ] && return 0
+    return 1
+}
+
+# session_work_dir (ga-nrkh92): resolve session_name -> work_dir a partir do
+# MESMO `gc session list --json` já buscado nesta passada (TMP_SESS) — sem
+# spawnar `gc` de novo. Usado só por has_unique_work() abaixo.
+session_work_dir() {
+    local sess="$1"
+    [ -n "${TMP_SESS:-}" ] && [ -f "$TMP_SESS" ] || return 1
+    python3 - "$TMP_SESS" "$sess" <<'PY' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        data = json.load(fh)
+    target = sys.argv[2]
+    for s in (data.get("sessions") or []):
+        for field in ("session_name", "name", "alias", "id"):
+            if (s.get(field) or "") == target:
+                print(s.get("work_dir") or "")
+                raise SystemExit(0)
+except Exception:
+    pass
+PY
+}
+
+# has_unique_work (ga-nrkh92, critério e — ver memória
+# branch-not-merged-is-not-proof-of-pending-work-use-git-cherry): antes de
+# alegar "trabalho em risco" numa escalação, prova via patch-id (git
+# cherry), NUNCA via ref-não-mergeada — uma branch pode aparecer
+# não-mergeada e mesmo assim ter TODO o conteúdo em main via outro
+# commit/fatia (medido ao vivo no próprio dia deste bead, wa-x92yd: o
+# Mayor citou "branch não mergeada" como prova de risco quando `git cherry`
+# devolvia só "-", ou seja, casca vazia). Conta linhas "+" (commit cujo
+# patch-id está AUSENTE de origin/main = único); "-" já está em main por
+# outro caminho, não conta.
+#
+# Falha (não é repo git, sem origin/main, timeout, ...) → nada impresso,
+# rc=1 — quem chama trata como "não determinado", nunca como "sem risco"
+# nem "com risco": omite a alegação, não afirma nenhum dos dois lados.
+has_unique_work() {
+    local work_dir="$1" out
+    [ -n "$work_dir" ] && [ -d "$work_dir" ] || return 1
+    out="$(timeout 20 "$GIT" -C "$work_dir" cherry origin/main HEAD 2>/dev/null)" || return 1
+    printf '%s\n' "$out" | grep -c '^+' || true
+}
+
+# send_idle_resume (ga-nrkh92): tenta acordar uma sessão ociosa pelo canal
+# interativo. `gc session nudge` primeiro (canal padrão da cidade — é o que
+# o próprio mol-shutdown-dance usa pros seus health-checks) E, também
+# (não como fallback condicional: a ÚNICA evidência empírica que este bead
+# traz — medida pelo Mayor no mesmo dia, contra os 3 casos reais do
+# incidente — é que `tmux send-keys` acordou 3/3; `gc session nudge` nunca
+# foi validado para ESTE caso específico de prompt-vazio-limpo, só se sabe
+# que ele FALHA quando há um diálogo de permissão bloqueando, caso
+# diferente já tratado por pane_shows_permission_prompt acima), injeta
+# também via tmux diretamente — texto e Enter em DUAS chamadas SEPARADAS
+# (send-keys sem Enter só digita, não envia — ver build_permission_prompt_body
+# acima, mesma doutrina). Belt-and-suspenders barato: nudge não tem efeito
+# colateral negativo se redundante, e dá rastreamento via
+# last_nudge_delivered_at no `gc session list`.
+send_idle_resume() {
+    local sess="$1" msg="$2"
+    timeout 15 "$GC" session nudge "$sess" "$msg" >/dev/null 2>&1 || true
+    if timeout 10 "$TMUX" has-session -t "$sess" 2>/dev/null; then
+        timeout 10 "$TMUX" send-keys -t "$sess" -- "$msg" 2>/dev/null || true
+        timeout 10 "$TMUX" send-keys -t "$sess" Enter 2>/dev/null || true
+    fi
+}
+
 printf '%s %s\n' "$$" "$(date +%s)" > "$STATE_DIR/agent-stuck-escalation.startup"
 
 log "=== pass start (PID $$, STUCK=${STUCK_AGENT_SEC}s, COOLDOWN=${COOLDOWN_SEC}s, DRY_RUN=$DRY_RUN) ==="
@@ -844,7 +1043,10 @@ except Exception:
 PY
 )"
 PY_RC=$?
-rm -f "$TMP_SESS"
+# ga-nrkh92: NÃO apaga $TMP_SESS aqui (mudança do comportamento original) —
+# session_work_dir() precisa reconsultar o mesmo JSON mais adiante, na
+# escalação por falta de resposta à retomada, pra resolver work_dir sem
+# spawnar `gc session list` de novo. Removido no fim do script.
 
 # ga-2tpd fix (part 2): a FAILED `session list` query (nonzero exit, empty
 # stdout, or unparseable JSON) must never collapse to the same value as a
@@ -922,7 +1124,12 @@ for b in beads:
     title = (b.get("title") or b.get("summary") or "?")[:80].replace("|", "_")
     labels = b.get("labels") or []
     labels_str = ",".join(labels) if isinstance(labels, list) else str(labels)
-    print("stuck|%s|%s|%d|%s|%s" % (bead_id, assignee, int(age), title, labels_str))
+    # ga-nrkh92 (critério f): metadata declarada de janela de operação —
+    # sanitizada como title (sem "|"/newline), vazio se ausente/não-string.
+    meta = b.get("metadata") or {}
+    aw = meta.get("gc.active_window") if isinstance(meta, dict) else None
+    active_window = str(aw or "").replace("|", "_").replace("\n", " ")
+    print("stuck|%s|%s|%d|%s|%s|%s" % (bead_id, assignee, int(age), title, labels_str, active_window))
 PY
 )"
 rm -f "$TMP_BEADS"
@@ -964,13 +1171,24 @@ for tf in "$TOKDIR"/*; do
     fi
 done
 
+# GC (ga-nrkh92): same cleanup for the per-bead idle-resume state — a bead
+# that closes or advances shouldn't leave a stale "nudged at T" marker
+# behind for a future, unrelated stuck episode to misread as already-nudged.
+for rf in "$RESUMEDIR"/*; do
+    [ -f "$rf" ] || continue
+    bn="$(basename "$rf")"
+    if ! printf '%s' " $ALL_INPROGRESS_IDS " | grep -qF " $bn "; then
+        rm -f "$rf"
+    fi
+done
+
 if [ -z "$STUCK_ITEMS" ]; then
     log "no stuck beads (all in_progress beads updated within ${STUCK_AGENT_SEC}s)"
     exit 0
 fi
 
 # ── Process each stuck bead ───────────────────────────────────────────────────
-while IFS='|' read -r bead_id assignee age_secs title labels; do
+while IFS='|' read -r bead_id assignee age_secs title labels active_window; do
     [ -z "$bead_id" ] && continue
 
     age_min=$(( age_secs / 60 ))
@@ -1161,6 +1379,14 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
     fi
 
     if [ "$transcript_state" = "advancing" ]; then
+        # ga-nrkh92: se havia um nudge de retomada pendente pra este bead, o
+        # transcript voltando a avançar É a prova de que funcionou — limpa o
+        # estado pra um episódio de ociosidade FUTURO começar do zero (não
+        # pular direto pra "grace esgotado" com um nudged_at velho).
+        if [ -f "$RESUMEDIR/$bead_id" ]; then
+            log "$bead_id: transcript voltou a avançar após retomada — RESOLVIDO (ga-nrkh92), limpando estado de retomada"
+            rm -f "$RESUMEDIR/$bead_id"
+        fi
         log "$bead_id: bead.updated_at parado ${age_min}min mas transcript de $live_session_name avançando (escrita <${TRANSCRIPT_FRESH_SEC}s) — sess=$sess_status — SUPRIMINDO escalação (trabalho longo legítimo)"
         continue
     fi
@@ -1232,20 +1458,21 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
     [ -z "$failure_markers" ] && failure_markers="nenhum"
 
     if [ "$permission_prompt_detected" = "1" ]; then
+        # Inalterado (ga-iog1v/ga-q640n): diálogo de permissão tem remédio
+        # próprio (1 tecla), já documentado na própria mensagem — não é o
+        # caso "ocioso, precisa de retomada" que ga-nrkh92 endereça abaixo.
         log "$bead_id: BLOQUEADO-EM-PROMPT ${age_min}min — assignee=$assignee sess=$sess_status comando=[$blocked_cmd] labels=$labels"
-    else
-        log "$bead_id: STUCK ${age_min}min — assignee=$assignee sess=$sess_status transcript=$transcript_note labels=$labels"
+        body="$(build_permission_prompt_body "$bead_id" "$title" "$assignee" "$live_session_name" "$blocked_cmd" "$age_min" "$failure_markers" "$observed_at")"
+        send_escalation "$bead_id" "$title" "$labels" "$age_min" "$assignee" "1" "Agente BLOQUEADO EM PROMPT (1 tecla resolve)" "$body" "$sf"
+        continue
     fi
 
-    # Build diagnostic mail body — differenciada (ga-iog1v/AC2) quando um
-    # diálogo de confirmação de permissão foi confirmado aberto no pane:
-    # NÃO é um stall genérico, precisa de um remédio específico, barato e
-    # não-destrutivo (responder o prompt), não o menu de kill/reclaim abaixo.
-    mail_subject_prefix="Agente travado"
-    if [ "$permission_prompt_detected" = "1" ]; then
-        mail_subject_prefix="Agente BLOQUEADO EM PROMPT (1 tecla resolve)"
-        body="$(build_permission_prompt_body "$bead_id" "$title" "$assignee" "$live_session_name" "$blocked_cmd" "$age_min" "$failure_markers" "$observed_at")"
-    else
+    log "$bead_id: STUCK ${age_min}min — assignee=$assignee sess=$sess_status transcript=$transcript_note labels=$labels"
+
+    # ga-nrkh92: sem sessão viva pra retomar (assignee confirmado
+    # ausente/morto, não apenas ocioso) — não há pane pra acordar. Escala
+    # direto, comportamento IDÊNTICO ao de antes desta mudança.
+    if [ -z "$live_session_name" ]; then
         body="$(cat <<BODY
 CAMADA 2 — ESCALAÇÃO AUTOMÁTICA: bead in_progress sem ESCRITA detectada há
 ${age_min}min. Isto NÃO é confirmação de travamento — pode ser falso
@@ -1260,6 +1487,9 @@ Sessão:    $sess_status
 Transcript: $transcript_note
 Marcadores de falha: $failure_markers
 
+Nenhuma sessão viva encontrada — não há pane pra tentar retomada automática
+(ga-nrkh92); o assignee está ausente/morto, não apenas ocioso.
+
 AÇÃO SUGERIDA (nesta ordem — passo 1 é obrigatório antes de qualquer ação destrutiva):
 1. gc session peek ${assignee:-<assignee>} — confirme se realmente travado ou só lento/em turno longo
 2. gc bd show $bead_id — veja estado atual do bead
@@ -1271,11 +1501,108 @@ Limiar configurável via STUCK_AGENT_SEC (atual: ${STUCK_AGENT_SEC}s).
 (Daemon: agent-stuck-escalation · ga-qw3p.2 · falso-positivo de turno longo: ga-0xmxt)
 BODY
 )"
+        send_escalation "$bead_id" "$title" "$labels" "$age_min" "$assignee" "0" "Agente travado" "$body" "$sf"
+        continue
     fi
 
-    send_escalation "$bead_id" "$title" "$labels" "$age_min" "$assignee" "$permission_prompt_detected" "$mail_subject_prefix" "$body" "$sf"
+    # ga-nrkh92, critério f: janela de operação declarada — fora dela,
+    # ociosidade é esperada e correta. Checado só aqui (ponto em que uma
+    # AÇÃO seria tomada), não repetido a cada ciclo de espera. Limitação
+    # conhecida e aceita: se a janela FECHAR entre o nudge e o fim do
+    # prazo, a re-abertura pode ler um nudged_at velho como "sem resposta"
+    # — sem custo real hoje porque nenhum bead na cidade usa esta metadata
+    # ainda (levantamento em ga-nrkh92).
+    if now_outside_active_window "$active_window"; then
+        log "$bead_id: fora da janela de operação declarada ($active_window) — ociosidade esperada, NÃO retomando nem escalando (ga-nrkh92 critério f)"
+        continue
+    fi
+
+    # ga-nrkh92, critério b: corrobora ociosidade REAL via TIME acumulado do
+    # pane antes de mandar qualquer retomada — %cpu não discrimina (é média
+    # da vida do processo); TIME sim. As camadas 1-7 acima já cobrem os
+    # sinais VISÍVEIS (indicador "Running…", contador de tokens); esta
+    # camada cobre o computation silencioso que não deixa nenhum dos dois.
+    pane_truly_idle "$live_session_name"
+    _pti_rc=$?
+    if [ "$_pti_rc" = "1" ]; then
+        log "$bead_id: transcript CONGELADO mas TIME acumulado do pane mudou durante amostragem (${IDLE_CPU_SAMPLE_SEC}s) — SUPRIMINDO retomada/escalação (fail-safe ga-nrkh92: %cpu não discrimina, TIME sim)"
+        continue
+    fi
+    # _pti_rc==0 (ocioso confirmado) OU ==2 (PID não resolvido/desconhecido)
+    # seguem ambos em frente — ver docstring de pane_truly_idle() acima
+    # pro porquê de "desconhecido" NÃO suprimir aqui.
+
+    rf="$RESUMEDIR/$bead_id"
+    nudged_at=""
+    [ -f "$rf" ] && nudged_at="$(head -1 "$rf" 2>/dev/null || echo "")"
+
+    if [ -z "$nudged_at" ]; then
+        # Primeira vez vendo este bead ocioso nesta janela — tenta acordar
+        # pelo canal interativo, ainda NÃO escala.
+        resume_msg="[AUTO-RESUME] Ocioso ha ${age_min}min com bead ${bead_id} in_progress. ANTES de agir: rode 'bd show ${bead_id}', releia seus ultimos comentarios e o git log/estado da branch, e reporte em 1-2 linhas onde parou e o que falta — nao refaca se ja estiver completo (aguardando gate/merge conta como completo)."
+        if [ "$DRY_RUN" = "1" ]; then
+            log "  [DRY_RUN] would send_idle_resume to $live_session_name for $bead_id"
+        else
+            send_idle_resume "$live_session_name" "$resume_msg"
+        fi
+        printf '%s\n' "$now" > "$rf"
+        log "$bead_id: RETOMADA enviada a $live_session_name (nudge + tmux send-keys) — aguardando resposta até ${RESUME_GRACE_SEC}s (ga-nrkh92)"
+        continue
+    fi
+
+    elapsed_since_nudge=$(( now - nudged_at ))
+    if [ "$elapsed_since_nudge" -lt "$RESUME_GRACE_SEC" ]; then
+        log "$bead_id: retomada enviada há ${elapsed_since_nudge}s — aguardando resposta (prazo ${RESUME_GRACE_SEC}s, ga-nrkh92)"
+        continue
+    fi
+
+    # Prazo esgotado e o transcript CONTINUA congelado (senão o bloco
+    # transcript_state=="advancing" acima já teria suprimido antes de
+    # chegar aqui, e limpo este mesmo $rf) — a retomada não funcionou.
+    # Escala UMA vez: send_escalation grava $sf, e o cooldown no TOPO do
+    # loop (linhas ~979-988) impede reescalar nos próximos ciclos até
+    # COOLDOWN_SEC — não precisa de um segundo flag "escalated" aqui.
+    unique_note="não determinado (sem acesso ao worktree da sessão)"
+    _wd="$(session_work_dir "$live_session_name" 2>/dev/null || true)"
+    if [ -n "$_wd" ]; then
+        _n="$(has_unique_work "$_wd" 2>/dev/null || true)"
+        case "$_n" in
+            ''|*[!0-9]*) : ;;  # não determinado — não afirma nenhum dos dois lados (critério e)
+            0) unique_note="nenhum — HEAD já está inteiramente em origin/main (git cherry por patch-id, não por ref não-mergeada)" ;;
+            *) unique_note="${_n} commit(s) só nesta sessão (git cherry origin/main HEAD) — NÃO estão em origin/main ainda" ;;
+        esac
+    fi
+    body="$(cat <<BODY
+CAMADA 2 — ESCALAÇÃO AUTOMÁTICA: agente ocioso não respondeu à retomada
+automática (ga-nrkh92).
+
+Bead:      $bead_id — $title
+Assignee:  $assignee
+Sessão:    $live_session_name
+Ocioso há: ${age_min} minutos
+Retomada enviada há: $(( elapsed_since_nudge / 60 )) minutos (gc session nudge + tmux send-keys, sem resposta)
+Trabalho não mergeado: $unique_note
+Marcadores de falha: $failure_markers
+
+O daemon já tentou acordar esta sessão sozinho (canal interativo — nudge +
+tecla direta no pane) e ela não reagiu no prazo. Isto é DIFERENTE de um
+alerta genérico: já foi dada a chance de responder antes de qualquer
+sugestão destrutiva.
+
+AÇÃO SUGERIDA:
+1. gc session peek $live_session_name --lines 60 — confira o estado atual do pane
+2. Se ainda ocioso: shutdown-dance (3 nudges via dog pool) ou kill+re-despache
+3. Se working mas devagar (turno realmente longo que escapou das camadas de supressão): bd comment $bead_id pra reduzir ruído futuro
+
+Limiar configurável via STUCK_AGENT_SEC (atual: ${STUCK_AGENT_SEC}s) · retomada: RESUME_GRACE_SEC (atual: ${RESUME_GRACE_SEC}s).
+(Daemon: agent-stuck-escalation · ga-qw3p.2 · retomada automática: ga-nrkh92)
+BODY
+)"
+    send_escalation "$bead_id" "$title" "$labels" "$age_min" "$assignee" "0" "Agente ocioso nao respondeu a retomada" "$body" "$sf"
 
 done <<< "$STUCK_ITEMS"
+
+rm -f "$TMP_SESS"
 
 log "=== pass complete ==="
 exit 0

@@ -115,6 +115,11 @@ case "$1 $2" in
     fi
     exit 0
     ;;
+  "session nudge")
+    # gc session nudge <target> <message> (ga-nrkh92)
+    echo "nudge:${3:-}|${4:-}" >> "$ACTIONS_FILE"
+    exit 0
+    ;;
   "mail send")
     # $3 = recipient; subject after -s flag (unchanged format/behavior);
     # body after -m flag written to MAIL_BODY_FILE (ga-0xmxt: needed to
@@ -146,6 +151,43 @@ exit 0
 SHIM
 chmod +x "$SHIM/notify"
 
+# ── tmux shim (ga-nrkh92) ────────────────────────────────────────────────────
+# has-session -t <name>            → exit 0/1 from $TMUX_SESSIONS_DIR/<name> presence
+# list-panes -t <name> -F '...'    → prints the PID recorded in that fixture file
+# send-keys -t <name> [--] <text>  → records "tmux-send-keys:<name>|<text>" to ACTIONS
+cat > "$SHIM/tmux" <<'SHIM'
+#!/usr/bin/env bash
+case "$1" in
+  has-session)
+    _name="${3:-}"
+    [ -f "${TMUX_SESSIONS_DIR:-/dev/null}/$_name" ] && exit 0
+    exit 1
+    ;;
+  list-panes)
+    _name="${3:-}"
+    _f="${TMUX_SESSIONS_DIR:-}/$_name"
+    [ -n "${TMUX_SESSIONS_DIR:-}" ] && [ -f "$_f" ] && cat "$_f" && exit 0
+    exit 1
+    ;;
+  send-keys)
+    shift
+    _name=""
+    _rest=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -t) _name="$2"; shift 2 ;;
+        --) shift ;;
+        *) _rest+=("$1"); shift ;;
+      esac
+    done
+    echo "tmux-send-keys:${_name}|${_rest[*]}" >> "$ACTIONS_FILE"
+    exit 0
+    ;;
+esac
+exit 0
+SHIM
+chmod +x "$SHIM/tmux"
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 run_script() {
     : > "$ACTIONS"
@@ -153,6 +195,8 @@ run_script() {
     GC="$SHIM/gc" \
     BD="$SHIM/bd" \
     NOTIFY_BIN="$SHIM/notify" \
+    TMUX_BIN="$SHIM/tmux" \
+    GIT_BIN="${GIT_BIN_OVERRIDE:-git}" \
     BEADS_FIXTURE="${BEADS_FIXTURE:-}" \
     SESSIONS_FIXTURE="${SESSIONS_FIXTURE:-}" \
     SESSIONS_QUERY_FAIL="${SESSIONS_QUERY_FAIL:-0}" \
@@ -160,13 +204,40 @@ run_script() {
     PEEK_FIXTURE_DIR="${PEEK_FIXTURE_DIR:-}" \
     GATE_MARKERS_DIR="${GATE_MARKERS_DIR:-}" \
     GATE_VERDICTS_DIR="${GATE_VERDICTS_DIR:-}" \
+    TMUX_SESSIONS_DIR="${TMUX_SESSIONS_DIR:-}" \
     ACTIONS_FILE="$ACTIONS" \
     MAIL_BODY_FILE="$WORK/last_mail_body.txt" \
     STUCK_AGENT_SEC="${STUCK_AGENT_SEC:-1800}" \
     COOLDOWN_SEC="${COOLDOWN_SEC:-10800}" \
     TRANSCRIPT_FRESH_SEC="${TRANSCRIPT_FRESH_SEC:-1800}" \
+    RESUME_GRACE_SEC="${RESUME_GRACE_SEC:-99999}" \
+    IDLE_CPU_SAMPLE_SEC="${IDLE_CPU_SAMPLE_SEC:-1}" \
     ESCALATION_STORES="$WORK/city" \
     bash "$SCRIPT" 2>&1
+}
+
+# seed_resume_state <bead-id> [nudged_secs_ago] (ga-nrkh92): pre-seeds the
+# idle-resume state file as if a PRIOR pass already sent the interactive
+# nudge <nudged_secs_ago> ago (default: far past RESUME_GRACE_SEC). Lets a
+# single run_script call land past the grace period, so tests written
+# before this feature existed — which assert immediate escalation for a
+# live+frozen session — keep testing their OWN original suppression-layer
+# signal instead of re-proving the two-phase resume ladder every time.
+seed_resume_state() {
+    local bid="$1" age="${2:-999999}"
+    mkdir -p "$WORK/city/.gc/state/agent-idle-resume"
+    python3 -c "import time; print(int(time.time()-$age))" > "$WORK/city/.gc/state/agent-idle-resume/$bid"
+}
+
+# seed_tmux_pane <session-name> <pid> (ga-nrkh92): registers the fixture the
+# tmux shim's has-session/list-panes cases read — makes pane_pid_for_session
+# resolve to a REAL pid the test controls (a backgrounded sleep for "idle",
+# a backgrounded busy-loop for "not idle") instead of stubbing `ps` itself.
+seed_tmux_pane() {
+    local sess="$1" pid="$2"
+    mkdir -p "$WORK/tmuxsessions"
+    printf '%s' "$pid" > "$WORK/tmuxsessions/$sess"
+    export TMUX_SESSIONS_DIR="$WORK/tmuxsessions"
 }
 
 # Build a fake city dir
@@ -354,9 +425,10 @@ echo '{"sessions":[{"name":"oracle-wa","state":"active"}]}' > "$SESSIONS_FIXTURE
 make_transcript_fixture oracle-wa 3600   # written 1h ago — past the 1800s threshold
 printf '[%s]' "$(make_bead ga-test06 oracle-wa 2200)" > "$BEADS_FIXTURE"
 rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test06"
+seed_resume_state ga-test06   # ga-nrkh92: past-grace nudge already recorded — this test proves T14's ORIGINAL signal (transcript frozen despite live session), not the resume ladder itself (see T53+)
 : > "$ACTIONS"
 STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
-assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test06" "T14: escalation fires — transcript frozen despite live session"
+assert_contains "$ACTIONS" "mail:mayor|Agente ocioso nao respondeu a retomada: ga-test06" "T14: escalation fires — transcript frozen despite live session"
 log_contains "T14" "CONGELADO" "T14: log notes transcript frozen"
 rm -f "$LOGS_FIXTURE_DIR/oracle-wa.json"
 
@@ -424,9 +496,10 @@ echo '{"sessions":[{"name":"peter-wa","state":"active"}]}' > "$SESSIONS_FIXTURE"
 make_transcript_fixture peter-wa 3600
 printf '[%s]' "$(make_bead_json ga-gate06 peter-wa 2200 '["ctx:ready"]')" > "$BEADS_FIXTURE"
 rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-gate06"
+seed_resume_state ga-gate06   # ga-nrkh92: see T14 note above
 : > "$ACTIONS"
 STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
-assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-gate06" "T21: building bead with no gate signal still escalates (ga-hehi intact)"
+assert_contains "$ACTIONS" "mail:mayor|Agente ocioso nao respondeu a retomada: ga-gate06" "T21: building bead with no gate signal still escalates (ga-hehi intact)"
 rm -f "$LOGS_FIXTURE_DIR/peter-wa.json"
 
 # ── T22: session alive but 'gc session logs' FAILS (ok:false) → UNKNOWN, ────
@@ -601,9 +674,10 @@ echo '{"sessions":[{"name":"batista-wa","state":"active"}]}' > "$SESSIONS_FIXTUR
 make_transcript_fixture batista-wa 3600 '[{"type":"assistant","message":{"stop_reason":"tool_use"},"blocks":[{"type":"tool_use","name":"Bash"}]}]'
 printf '[%s]' "$(make_bead ga-test16 batista-wa 2200)" > "$BEADS_FIXTURE"
 rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test16"
+seed_resume_state ga-test16   # ga-nrkh92: see T14 note above
 : > "$ACTIONS"
 STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
-assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test16" "T30: escalation fires — mid-tool-call is a real hang, not awaiting-human"
+assert_contains "$ACTIONS" "mail:mayor|Agente ocioso nao respondeu a retomada: ga-test16" "T30: escalation fires — mid-tool-call is a real hang, not awaiting-human"
 rm -f "$LOGS_FIXTURE_DIR/batista-wa.json"
 
 # ── T31: session alive, transcript frozen, last turn IS the AskUserQuestion ──
@@ -630,9 +704,10 @@ echo '{"sessions":[{"name":"thies-wa","state":"active"}]}' > "$SESSIONS_FIXTURE"
 make_transcript_fixture thies-wa 3600 '[{"type":"assistant","message":{"stop_reason":"tool_use"},"blocks":[{"type":"tool_use","name":"Bash"}]},{"type":"user","blocks":[{"type":"tool_result"}]}]'
 printf '[%s]' "$(make_bead ga-test18 thies-wa 2200)" > "$BEADS_FIXTURE"
 rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test18"
+seed_resume_state ga-test18   # ga-nrkh92: see T14 note above
 : > "$ACTIONS"
 STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
-assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test18" "T32: escalation fires — last entry is tool_result, not an assistant awaiting-human shape"
+assert_contains "$ACTIONS" "mail:mayor|Agente ocioso nao respondeu a retomada: ga-test18" "T32: escalation fires — last entry is tool_result, not an assistant awaiting-human shape"
 rm -f "$LOGS_FIXTURE_DIR/thies-wa.json"
 
 # ── T33: assignee is a human identity (email), no session → suppressed ──────
@@ -683,9 +758,10 @@ make_transcript_fixture dog-test2 3600 '[{"type":"assistant","message":{"stop_re
 } > "$PEEK_FIXTURE_DIR/dog-test2.txt"
 printf '[%s]' "$(make_bead ga-test21 dog-test2 2200)" > "$BEADS_FIXTURE"
 rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test21"
+seed_resume_state ga-test21   # ga-nrkh92: see T14 note above
 : > "$ACTIONS"
 STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
-assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test21" "T35: generic escalation — pane content doesn't match the permission-prompt signature"
+assert_contains "$ACTIONS" "mail:mayor|Agente ocioso nao respondeu a retomada: ga-test21" "T35: generic escalation — pane content doesn't match the permission-prompt signature"
 log_contains "T35" "ga-test21: STUCK" "T35: log uses the generic STUCK marker, not BLOQUEADO-EM-PROMPT"
 rm -f "$LOGS_FIXTURE_DIR/dog-test2.json" "$PEEK_FIXTURE_DIR/dog-test2.txt"
 
@@ -698,9 +774,10 @@ make_transcript_fixture dog-test3 3600 '[{"type":"assistant","message":{"stop_re
 } > "$PEEK_FIXTURE_DIR/dog-test3.txt"
 printf '[%s]' "$(make_bead ga-test22 dog-test3 2200)" > "$BEADS_FIXTURE"
 rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test22"
+seed_resume_state ga-test22   # ga-nrkh92: see T14 note above
 : > "$ACTIONS"
 STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
-assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test22" "T37: generic escalation — prompt text is stale scrollback, not the pane's current tail"
+assert_contains "$ACTIONS" "mail:mayor|Agente ocioso nao respondeu a retomada: ga-test22" "T37: generic escalation — prompt text is stale scrollback, not the pane's current tail"
 rm -f "$LOGS_FIXTURE_DIR/dog-test3.json" "$PEEK_FIXTURE_DIR/dog-test3.txt"
 
 echo "T38: pane shows 'requires confirmation' phrasing alone (no 'Do you want to proceed?' line) → still detected"
@@ -756,9 +833,10 @@ echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
 make_transcript_fixture dog-gav6ols-b 3600      # resolvable transcript, 1h stale
 printf '[%s]' "$(make_bead ga-test26 dog-gav6ols-b 2200)" > "$BEADS_FIXTURE"
 rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test26"
+seed_resume_state ga-test26   # ga-nrkh92: see T14 note above (live_session_name is set here via the direct-probe path, ga-v6ols)
 : > "$ACTIONS"
 STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
-assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test26" "T41: escalation still fires — batch-absent + confirmed-frozen (no false-negative regression)"
+assert_contains "$ACTIONS" "mail:mayor|Agente ocioso nao respondeu a retomada: ga-test26" "T41: escalation still fires — batch-absent + confirmed-frozen (no false-negative regression)"
 log_contains "T41" "CONGELADO" "T41: log shows CONGELADO via the direct probe (ga-v6ols), not the old bare n/d"
 rm -f "$LOGS_FIXTURE_DIR/dog-gav6ols-b.json"
 
@@ -929,9 +1007,10 @@ make_transcript_fixture dog-ga0xmxt-1b 3600
 } > "$PEEK_FIXTURE_DIR/dog-ga0xmxt-1b.txt"
 printf '[%s]' "$(make_bead ga-test29 dog-ga0xmxt-1b 2200)" > "$BEADS_FIXTURE"
 rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test29"
+seed_resume_state ga-test29   # ga-nrkh92: see T14 note above
 : > "$ACTIONS"
 STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
-assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test29" "T43b: escalation fires — 'Ran N shell commands' is a past-tense completed-turn summary, not live activity"
+assert_contains "$ACTIONS" "mail:mayor|Agente ocioso nao respondeu a retomada: ga-test29" "T43b: escalation fires — 'Ran N shell commands' is a past-tense completed-turn summary, not live activity"
 rm -f "$LOGS_FIXTURE_DIR/dog-ga0xmxt-1b.json" "$PEEK_FIXTURE_DIR/dog-ga0xmxt-1b.txt"
 
 echo "T44: transcript frozen, pane shows a live token counter, FIRST sample for this bead → suppressed (grace pass, ga-0xmxt FIXTURE: rising tokens part 1)"
@@ -961,9 +1040,10 @@ assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test30" "T45b: no mail �
 [ "$(cat "$WORK/city/.gc/state/agent-stuck-escalation-tokens/ga-test30" 2>/dev/null)" = "45.0" ] && ok "T45b: token baseline updated to the lower value (45.0) — proves != is being used, not > alone" || bad "T45b: token baseline not updated"
 
 echo "T46: SAME bead, fourth pass with the SAME (flat) token count as T45b → escalation FINALLY fires (ga-0xmxt CONTROLE: a stale/frozen counter is not indefinitely suppressed; also proves the fix isn't >= — equality must NOT suppress)"
+seed_resume_state ga-test30   # ga-nrkh92: this is the FIRST pass ga-test30 ever reaches the resume ladder (T44-T45b were all suppressed earlier, by the token-counter check) — see T14 note above
 : > "$ACTIONS"
 STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
-assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test30" "T46: escalation fires — token count is flat (45.0 == 45.0), the one value that proves a frozen pane"
+assert_contains "$ACTIONS" "mail:mayor|Agente ocioso nao respondeu a retomada: ga-test30" "T46: escalation fires — token count is flat (45.0 == 45.0), the one value that proves a frozen pane"
 rm -f "$LOGS_FIXTURE_DIR/dog-ga0xmxt-2.json" "$PEEK_FIXTURE_DIR/dog-ga0xmxt-2.txt"
 
 echo "T47: transcript frozen, NO active child process, NO token counter, session genuinely absent → escalation still fires (ga-0xmxt CONTROLE: real hang, no regression)"
@@ -1010,9 +1090,10 @@ make_transcript_fixture dog-ga0xmxt-5 3600
 } > "$PEEK_FIXTURE_DIR/dog-ga0xmxt-5.txt"
 printf '[%s]' "$(make_bead ga-test34 dog-ga0xmxt-5 2200)" > "$BEADS_FIXTURE"
 rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test34" "$WORK/city/.gc/state/agent-stuck-escalation-tokens/ga-test34"
+seed_resume_state ga-test34   # ga-nrkh92: see T14 note above
 : > "$ACTIONS"
 STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
-assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test34" "T49: generic escalation — activity text is stale scrollback, not the pane's current tail"
+assert_contains "$ACTIONS" "mail:mayor|Agente ocioso nao respondeu a retomada: ga-test34" "T49: generic escalation — activity text is stale scrollback, not the pane's current tail"
 rm -f "$LOGS_FIXTURE_DIR/dog-ga0xmxt-5.json" "$PEEK_FIXTURE_DIR/dog-ga0xmxt-5.txt"
 
 echo "T50: STUCK_AGENT_SEC unset entirely → script's own internal default is 3600s, not the old 1800s (ga-0xmxt threshold raise)"
@@ -1063,6 +1144,215 @@ assert_contains "$WORK/last_mail_body.txt" "coletada às" "T52: body timestamps 
 assert_absent "$WORK/last_mail_body.txt" "nudge aqui." "T52: nudge is no longer banned unconditionally"
 assert_contains "$WORK/last_mail_body.txt" "nudge é a ferramenta certa" "T52: body allows nudge once the dialog is confirmed gone"
 rm -f "$LOGS_FIXTURE_DIR/dog-test6.json" "$PEEK_FIXTURE_DIR/dog-test6.txt"
+
+# ── T53-T56: ga-nrkh92 resume-then-escalate ladder (the core of this bead) ──
+# T53 = first idle pass → resume attempted (nudge + tmux send-keys text+Enter
+#       as SEPARATE calls), no escalation yet, resume state recorded.
+# T54 = second pass within RESUME_GRACE_SEC → still waiting, no re-nudge.
+# T55 = grace expires, still frozen, no response → escalates with the
+#       differentiated subject (distinct from the plain "Agente travado" used
+#       when there's no live session to even attempt a resume against).
+# T56 = agent recovers (transcript advances again) before grace expires →
+#       resume state cleared, never escalates.
+
+echo "T53: first idle pass with a live session → resume attempted (nudge + tmux send-keys), no escalation yet (ga-nrkh92 critério a)"
+echo '{"sessions":[{"name":"dog-idle53","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-idle53 3600
+printf '[%s]' "$(make_bead ga-idle53 dog-idle53 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-idle53" "$WORK/city/.gc/state/agent-idle-resume/ga-idle53"
+# Fake pane PID (need not be a real live process — pane_truly_idle's own
+# tri-state treats a `ps`-unresolvable PID as UNKNOWN, which proceeds, not
+# suppresses; see T59/T60 for the REAL-process idle/busy corroboration
+# itself). This just needs `tmux has-session` to succeed so send_idle_resume
+# actually attempts the tmux injection, not only the gc session nudge call.
+seed_tmux_pane dog-idle53 999999999
+: > "$ACTIONS"
+RESUME_GRACE_SEC=99999 run_script > /dev/null
+assert_absent  "$ACTIONS" "mail:mayor" "T53: no escalation on first idle pass — resume is attempted first"
+assert_contains "$ACTIONS" "nudge:dog-idle53|" "T53: gc session nudge sent to the idle session"
+assert_contains "$ACTIONS" "tmux-send-keys:dog-idle53|[AUTO-RESUME]" "T53: tmux send-keys injects the resume message text"
+assert_contains "$ACTIONS" "tmux-send-keys:dog-idle53|Enter" "T53: tmux send-keys presses Enter as a SEPARATE call (send-keys without Enter only types, never submits)"
+[ -f "$WORK/city/.gc/state/agent-idle-resume/ga-idle53" ] && ok "T53: resume state file recorded" || bad "T53: missing resume state file"
+log_contains "T53" "RETOMADA enviada a dog-idle53" "T53: log records the resume attempt for audit (ga-nrkh92 critério d)"
+rm -f "$LOGS_FIXTURE_DIR/dog-idle53.json"
+
+echo "T54: second pass within RESUME_GRACE_SEC → still waiting, no re-nudge, no escalation"
+echo '{"sessions":[{"name":"dog-idle53","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-idle53 3600
+_prior_nudged_at="$(cat "$WORK/city/.gc/state/agent-idle-resume/ga-idle53")"
+: > "$ACTIONS"
+RESUME_GRACE_SEC=99999 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor" "T54: still no escalation — within grace"
+assert_absent "$ACTIONS" "nudge:dog-idle53|" "T54: no re-nudge while still within grace"
+assert_absent "$ACTIONS" "tmux-send-keys:dog-idle53|" "T54: no re-injection while still within grace"
+[ "$(cat "$WORK/city/.gc/state/agent-idle-resume/ga-idle53")" = "$_prior_nudged_at" ] && ok "T54: nudged_at unchanged (not re-armed)" || bad "T54: nudged_at was rewritten unexpectedly"
+log_contains "T54" "aguardando resposta" "T54: log notes still waiting for a response"
+rm -f "$LOGS_FIXTURE_DIR/dog-idle53.json"
+
+echo "T55: grace expires, still frozen, no response → escalates with the differentiated subject (ga-nrkh92 critério a/d)"
+echo '{"sessions":[{"name":"dog-idle53","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-idle53 3600
+seed_resume_state ga-idle53   # simulates the nudge above having been sent long ago
+: > "$ACTIONS"
+RESUME_GRACE_SEC=1 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente ocioso nao respondeu a retomada: ga-idle53" "T55: escalation fires after grace with no response"
+assert_contains "$ACTIONS" "notify" "T55: notify also fires"
+assert_contains "$WORK/last_mail_body.txt" "O daemon já tentou acordar esta sessão sozinho" "T55: mail body states a resume was already attempted (ga-nrkh92 critério d — different from the plain no-session body)"
+rm -f "$LOGS_FIXTURE_DIR/dog-idle53.json"
+
+echo "T56: agent recovers (transcript starts advancing) before grace expires → state cleared, never escalates"
+echo '{"sessions":[{"name":"dog-idle56","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-idle56 3600
+printf '[%s]' "$(make_bead ga-idle56 dog-idle56 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-idle56" "$WORK/city/.gc/state/agent-idle-resume/ga-idle56"
+: > "$ACTIONS"
+RESUME_GRACE_SEC=99999 run_script > /dev/null   # pass 1: nudges
+[ -f "$WORK/city/.gc/state/agent-idle-resume/ga-idle56" ] && ok "T56: resume state recorded after first nudge" || bad "T56: missing resume state after first nudge"
+make_transcript_fixture dog-idle56 30   # agent "wakes up" — transcript now fresh
+: > "$ACTIONS"
+RESUME_GRACE_SEC=99999 run_script > /dev/null   # pass 2: should see recovery
+assert_absent "$ACTIONS" "mail:mayor" "T56: no escalation — agent recovered"
+[ ! -f "$WORK/city/.gc/state/agent-idle-resume/ga-idle56" ] && ok "T56: resume state cleared on recovery" || bad "T56: stale resume state left behind after recovery"
+log_contains "T56" "RESOLVIDO" "T56: log notes the recovery"
+rm -f "$LOGS_FIXTURE_DIR/dog-idle56.json"
+
+# ── T57-T58: gc.active_window metadata (ga-nrkh92 critério f) ───────────────
+echo "T57: bead declares gc.active_window and NOW is OUTSIDE it → no nudge, no escalation (ga-nrkh92 critério f)"
+echo '{"sessions":[{"name":"dog-idle57","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-idle57 3600
+_now_hm="$(date +%H:%M)"
+_now_min=$(( 10#${_now_hm%%:*} * 60 + 10#${_now_hm##*:} ))
+_end_min=$(( (_now_min - 2 + 1440) % 1440 ))
+_start_min=$(( (_end_min - 60 + 1440) % 1440 ))
+_win="$(printf "%02d:%02d-%02d:%02d" $((_start_min/60)) $((_start_min%60)) $((_end_min/60)) $((_end_min%60)))"
+printf '[{"id":"ga-idle57","title":"Test bead ga-idle57","assignee":"dog-idle57","status":"in_progress","issue_type":"feature","updated_at":"%s","labels":[],"metadata":{"gc.active_window":"%s"}}]' \
+    "$(python3 -c "import time, datetime; e=time.time()-2200; print(datetime.datetime.utcfromtimestamp(e).strftime('%Y-%m-%dT%H:%M:%SZ'))")" \
+    "$_win" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-idle57" "$WORK/city/.gc/state/agent-idle-resume/ga-idle57"
+: > "$ACTIONS"
+RESUME_GRACE_SEC=99999 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor" "T57: no escalation — outside declared active window"
+assert_absent "$ACTIONS" "nudge:dog-idle57|" "T57: no nudge — outside declared active window"
+[ ! -f "$WORK/city/.gc/state/agent-idle-resume/ga-idle57" ] && ok "T57: no resume state written — window check happens before any action" || bad "T57: resume state written despite being outside the window"
+log_contains "T57" "fora da janela de operação declarada" "T57: log notes the window exemption"
+rm -f "$LOGS_FIXTURE_DIR/dog-idle57.json"
+
+echo "T58: bead declares gc.active_window and NOW is INSIDE it → normal resume behavior (ga-nrkh92 critério f, CONTROL)"
+echo '{"sessions":[{"name":"dog-idle58","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-idle58 3600
+_now_hm="$(date +%H:%M)"
+_now_min=$(( 10#${_now_hm%%:*} * 60 + 10#${_now_hm##*:} ))
+_start_min=$(( (_now_min - 30 + 1440) % 1440 ))
+_end_min=$(( (_now_min + 30) % 1440 ))
+_win="$(printf "%02d:%02d-%02d:%02d" $((_start_min/60)) $((_start_min%60)) $((_end_min/60)) $((_end_min%60)))"
+printf '[{"id":"ga-idle58","title":"Test bead ga-idle58","assignee":"dog-idle58","status":"in_progress","issue_type":"feature","updated_at":"%s","labels":[],"metadata":{"gc.active_window":"%s"}}]' \
+    "$(python3 -c "import time, datetime; e=time.time()-2200; print(datetime.datetime.utcfromtimestamp(e).strftime('%Y-%m-%dT%H:%M:%SZ'))")" \
+    "$_win" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-idle58" "$WORK/city/.gc/state/agent-idle-resume/ga-idle58"
+: > "$ACTIONS"
+RESUME_GRACE_SEC=99999 run_script > /dev/null
+assert_contains "$ACTIONS" "nudge:dog-idle58|" "T58: nudge still fires — inside the declared window"
+rm -f "$LOGS_FIXTURE_DIR/dog-idle58.json"
+
+# ── T59-T60: pane_truly_idle TIME-based corroboration (ga-nrkh92 critério b) ─
+# Uses REAL backgrounded processes (not a stubbed `ps`) so the sampling logic
+# is proven against the actual primitive, not a mock of it.
+echo "T59: pane_truly_idle CONFIRMS busy (real CPU-consuming process, TIME changes across the sample) → no nudge sent (ga-nrkh92 critério b — %cpu doesn't discriminate but TIME does)"
+echo '{"sessions":[{"name":"dog-idle59","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-idle59 3600
+printf '[%s]' "$(make_bead ga-idle59 dog-idle59 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-idle59" "$WORK/city/.gc/state/agent-idle-resume/ga-idle59"
+bash -c 'x=0; end=$((SECONDS+5)); while [ $SECONDS -lt $end ]; do x=$((x+1)); done' &
+_busy_pid=$!
+seed_tmux_pane dog-idle59 "$_busy_pid"
+: > "$ACTIONS"
+RESUME_GRACE_SEC=99999 IDLE_CPU_SAMPLE_SEC=1 run_script > /dev/null
+wait "$_busy_pid" 2>/dev/null
+assert_absent "$ACTIONS" "nudge:dog-idle59|" "T59: no nudge — pane confirmed NOT idle (TIME accumulated during the sample)"
+assert_absent "$ACTIONS" "mail:mayor" "T59: no escalation either — this session is genuinely busy"
+log_contains "T59" "TIME acumulado do pane mudou" "T59: log notes the TIME-based busy confirmation"
+unset TMUX_SESSIONS_DIR
+rm -f "$LOGS_FIXTURE_DIR/dog-idle59.json"
+
+echo "T60: pane_truly_idle CONFIRMS idle (real sleeping process, TIME unchanged across the sample) → nudge proceeds (ga-nrkh92 critério b, positive control)"
+echo '{"sessions":[{"name":"dog-idle60","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-idle60 3600
+printf '[%s]' "$(make_bead ga-idle60 dog-idle60 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-idle60" "$WORK/city/.gc/state/agent-idle-resume/ga-idle60"
+sleep 30 &
+_idle_pid=$!
+seed_tmux_pane dog-idle60 "$_idle_pid"
+: > "$ACTIONS"
+RESUME_GRACE_SEC=99999 IDLE_CPU_SAMPLE_SEC=1 run_script > /dev/null
+kill "$_idle_pid" 2>/dev/null; wait "$_idle_pid" 2>/dev/null
+assert_contains "$ACTIONS" "nudge:dog-idle60|" "T60: nudge fires — pane confirmed genuinely idle (TIME identical across the sample)"
+unset TMUX_SESSIONS_DIR
+rm -f "$LOGS_FIXTURE_DIR/dog-idle60.json"
+
+# ── T61-T62: has_unique_work via git cherry, not ref-merged (ga-nrkh92 ──────
+# critério e — see memory branch-not-merged-is-not-proof-of-pending-work-
+# use-git-cherry). T62 is THE wa-x92yd regression test: a branch whose ref
+# is genuinely NOT an ancestor of origin/main (a naive merge-base/--merged
+# check says "not merged, at risk") but whose PATCH is already upstream via
+# a different commit (git cherry says "-") must NOT be reported as work at
+# risk.
+echo "T61: has_unique_work — real repo with a commit NOT in origin/main → escalation body states the count (ga-nrkh92 critério e)"
+_gitrepo="$WORK/gitrepo61"
+mkdir -p "$_gitrepo"
+git -C "$_gitrepo" init -q
+git -C "$_gitrepo" config user.email t@t.com
+git -C "$_gitrepo" config user.name t
+echo base > "$_gitrepo/f.txt"; git -C "$_gitrepo" add f.txt; git -C "$_gitrepo" commit -qm base
+_base_sha="$(git -C "$_gitrepo" rev-parse HEAD)"
+git -C "$_gitrepo" update-ref refs/remotes/origin/main "$_base_sha"
+echo unique >> "$_gitrepo/f.txt"; git -C "$_gitrepo" commit -qam "unique local change"
+echo '{"sessions":[{"name":"dog-idle61","state":"active","work_dir":"'"$_gitrepo"'"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-idle61 3600
+printf '[%s]' "$(make_bead ga-idle61 dog-idle61 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-idle61"
+seed_resume_state ga-idle61
+: > "$ACTIONS"
+RESUME_GRACE_SEC=1 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente ocioso nao respondeu a retomada: ga-idle61" "T61: escalation fires"
+assert_contains "$WORK/last_mail_body.txt" "1 commit(s) só nesta sessão" "T61: mail body reports the real unique-commit count via git cherry"
+rm -f "$LOGS_FIXTURE_DIR/dog-idle61.json"
+
+echo "T62: has_unique_work — branch NOT an ancestor of origin/main by ref, but its patch is ALREADY upstream via a different commit (git cherry '-') → body says NO risk, not a ref-based false alarm (ga-nrkh92 critério e, the wa-x92yd regression)"
+_gitrepo="$WORK/gitrepo62"
+mkdir -p "$_gitrepo"
+git -C "$_gitrepo" init -q
+git -C "$_gitrepo" config user.email t@t.com
+git -C "$_gitrepo" config user.name t
+echo base > "$_gitrepo/f.txt"; git -C "$_gitrepo" add f.txt; git -C "$_gitrepo" commit -qm base
+_base_sha="$(git -C "$_gitrepo" rev-parse HEAD)"
+echo change >> "$_gitrepo/f.txt"; git -C "$_gitrepo" commit -qam "same-patch-content"
+_local_sha="$(git -C "$_gitrepo" rev-parse HEAD)"
+# Simulate the SAME patch having landed on origin/main via a DIFFERENT commit
+# (e.g. a squash-merge from another slice, as in the real wa-x92yd/wa-si81e
+# incident): cherry-pick onto a throwaway branch from the same base, forcing
+# a different SHA via an explicit committer/author date override (otherwise
+# a fast, conflict-free cherry-pick can reproduce a byte-identical commit and
+# this fixture would degenerate into testing plain ref-ancestry instead).
+git -C "$_gitrepo" checkout -q -b other-slice "$_base_sha"
+GIT_COMMITTER_DATE="2020-01-01T00:00:00" GIT_AUTHOR_DATE="2020-01-01T00:00:00" \
+    git -C "$_gitrepo" cherry-pick "$_local_sha" >/dev/null
+git -C "$_gitrepo" update-ref refs/remotes/origin/main other-slice
+git -C "$_gitrepo" checkout -q -
+_cherry_check="$(git -C "$_gitrepo" cherry origin/main HEAD)"
+_naive_ancestor="no"
+git -C "$_gitrepo" merge-base --is-ancestor origin/main HEAD 2>/dev/null && _naive_ancestor="yes"
+printf '%s' "$_cherry_check" | grep -q '^-' && ok "T62 fixture: git cherry correctly says '-' (already upstream)" || bad "T62 fixture setup failed — git cherry did not report '-' (got: $_cherry_check)"
+[ "$_naive_ancestor" = "no" ] && ok "T62 fixture: naive ref-ancestor check says NOT merged — this is the false-alarm shape the fix must not reproduce" || bad "T62 fixture degenerate — origin/main IS a plain ancestor, doesn't exercise the ref-vs-patch-id distinction"
+echo '{"sessions":[{"name":"dog-idle62","state":"active","work_dir":"'"$_gitrepo"'"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-idle62 3600
+printf '[%s]' "$(make_bead ga-idle62 dog-idle62 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-idle62"
+seed_resume_state ga-idle62
+: > "$ACTIONS"
+RESUME_GRACE_SEC=1 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente ocioso nao respondeu a retomada: ga-idle62" "T62: escalation still fires (the session itself IS unresponsive — only the unique-work CLAIM changes)"
+assert_contains "$WORK/last_mail_body.txt" "nenhum — HEAD já está inteiramente em origin/main" "T62: body correctly reports NO unique work via git cherry (patch-id), even though the branch ref itself was never an ancestor of origin/main"
+rm -f "$LOGS_FIXTURE_DIR/dog-idle62.json"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""

@@ -17,9 +17,18 @@
        atrás E cujo pane não mostra atividade real (ga-0xmxt) é "travado".
        Exclui tipos de infraestrutura (warrant/sling/wisp).
 
+       RETOMADA (ga-nrkh92, Athos 2026-08-15: "a cidade deve ACORDAR SOZINHA e
+       avisar depois"): quando há uma sessão viva (não apenas um assignee morto)
+       o daemon NÃO manda mail direto — primeiro tenta retomar pelo canal
+       interativo (gc session nudge + tmux send-keys no pane), registra o
+       estado em .gc/state/agent-idle-resume/, e só escala se RESUME_GRACE_SEC
+       se passar sem resposta. Uma sessão genuinamente ausente continua indo
+       direto pra escalação, sem essa etapa.
+
        ESCALAÇÃO: gc mail send mayor com diagnóstico (bead, assignee, tempo parado,
-       status da sessão, marcadores de falha). Notify -p 4 ao Athos primeiro
-       (imp07 invariant: Dolt-independent).
+       status da sessão, marcadores de falha, e — se houve retomada — se a
+       sessão respondeu). Notify -p 4 ao Athos primeiro (imp07 invariant:
+       Dolt-independent).
 
        ANTI-SPAM: uma escalação por bead por 3h (state: .gc/state/agent-stuck-escalation/).
        Quando bead fecha ou avança (updated_at move) → estado limpo no próximo pass.
