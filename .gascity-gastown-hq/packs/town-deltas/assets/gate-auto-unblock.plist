@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  gate-auto-unblock (ga-stu930) — tira o porteiro humano da trava do gate.
+
+  CADÊNCIA: 20 min. O número vem do dano medido, não de preferência:
+  em 2026-08-15 beads ficaram presas ATÉ UMA SEMANA porque o intervalo
+  efetivo era infinito (ninguém varria). 20min é curto o bastante para
+  que "travou" nunca vire "travou e ninguém viu", e longo o bastante
+  para não competir com o gate em si.
+
+  ⚠️ INSTALAR NÃO É MERGEAR. Este arquivo entrar em main NÃO faz o job
+  rodar — precisa ser copiado para ~/Library/LaunchAgents e carregado.
+  Medido 3x em 2026-08-15 (owner-recheck, fila de re-checagem, guard do
+  athos.acao): código mergeado, testado, e inerte por dias porque o
+  passo de instalar nunca aconteceu.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gascity.gate-auto-unblock</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/gate-auto-unblock.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+    <key>StartInterval</key>
+    <integer>1200</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-auto-unblock-launchd.out</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-auto-unblock-launchd.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/.local/bin</string>
+        <key>GC_CITY_PATH</key>
+        <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    </dict>
+</dict>
+</plist>
