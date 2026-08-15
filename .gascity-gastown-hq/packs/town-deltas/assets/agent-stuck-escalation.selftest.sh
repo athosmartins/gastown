@@ -1563,6 +1563,35 @@ else
 fi
 rm -f "$LOGS_FIXTURE_DIR/dog-idle69.json"
 
+# T70/T71 = gate-fix (attempt 5): the resume-state file write on the
+# first-nudge branch used to run unconditionally, outside the DRY_RUN
+# if/else -- so a DRY_RUN preview (documented as sending no real
+# interactive nudge) still recorded nudged_at as if it had. A later REAL
+# pass for the same bead+session would read that phantom timestamp as
+# genuine (the reassignment-mismatch guard only fires on a SESSION
+# mismatch, not on a DRY_RUN-vs-real mismatch) and, once RESUME_GRACE_SEC
+# elapsed, escalate to the Mayor claiming a nudge had already been tried
+# -- false. T70 checks the immediate effect (no state file after a DRY_RUN
+# pass); T71 checks the actual consequence the reviewer described: the
+# NEXT real pass must still take the first-nudge branch, not skip straight
+# to a false grace-expired escalation.
+echo "T70: DRY_RUN=1 does not write the resume-state file on the first-nudge branch — a preview must leave no persistent trace (ga-nrkh92 gate-fix, attempt 5)"
+echo '{"sessions":[{"name":"dog-idle70","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-idle70 3600
+printf '[%s]' "$(make_bead ga-idle70 dog-idle70 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-idle70" "$WORK/city/.gc/state/agent-idle-resume/ga-idle70"
+: > "$ACTIONS"
+RESUME_GRACE_SEC=99999 DRY_RUN=1 run_script > /dev/null
+assert_absent "$ACTIONS" "nudge:dog-idle70|" "T70: sanity — DRY_RUN must not send a real interactive nudge either"
+[ ! -f "$WORK/city/.gc/state/agent-idle-resume/ga-idle70" ] && ok "T70: no resume-state file written under DRY_RUN — the preview left no trace" || bad "T70: resume-state file written under DRY_RUN — a later real pass would misread this as an already-sent nudge"
+
+echo "T71: after a DRY_RUN preview leaves no trace, the NEXT REAL pass for the same bead still takes the first-nudge branch, not a false grace-expired escalation (ga-nrkh92 gate-fix, attempt 5, end-to-end)"
+: > "$ACTIONS"
+RESUME_GRACE_SEC=99999 run_script > /dev/null
+assert_contains "$ACTIONS" "nudge:dog-idle70|" "T71: real nudge fires on the first REAL pass — proves the DRY_RUN preview left no phantom nudged_at behind"
+assert_absent "$ACTIONS" "mail:mayor" "T71: no escalation — this is genuinely the first real nudge attempt, grace period hasn't even started"
+rm -f "$LOGS_FIXTURE_DIR/dog-idle70.json"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

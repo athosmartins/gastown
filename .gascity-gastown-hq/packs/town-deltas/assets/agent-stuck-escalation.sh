@@ -1620,13 +1620,26 @@ BODY
         # envio real mesmo em DRY_RUN, onde send_idle_resume nunca roda
         # (mesma classe de defeito que o self-audit deste gate existe pra
         # pegar: comentário/log prometendo mais do que o código ao lado faz).
+        #
+        # ga-nrkh92 gate-fix (attempt 5): a mesma disciplina vale pro
+        # ARQUIVO de estado, não só pro log — e aqui o preço de errar é
+        # maior. Até esta correção, o printf abaixo ficava FORA do
+        # if/else, gravando $rf mesmo em DRY_RUN. Um preview (DRY_RUN=1,
+        # "sem retomada real via tmux" por doutrina) deixava rastro
+        # persistente de um nudge que nunca saiu; um pass REAL seguinte
+        # pra esse mesmo bead+sessão lia esse nudged_at como genuíno (o
+        # guard de reatribuição não pega isso — mesma sessão, sem
+        # mismatch), e ao esgotar RESUME_GRACE_SEC escalava pro Mayor
+        # afirmando "o daemon já tentou acordar esta sessão" — falso,
+        # nenhuma retomada real foi enviada. Grava $rf só no ramo que
+        # realmente tentou (else), como o log já fazia.
         if [ "$DRY_RUN" = "1" ]; then
             log "$bead_id: [DRY_RUN] retomada NÃO enviada de verdade — teria chamado gc session nudge + tmux send-keys pra $live_session_name (ga-nrkh92)"
         else
             send_idle_resume "$live_session_name" "$resume_msg"
             log "$bead_id: RETOMADA enviada a $live_session_name (nudge + tmux send-keys) — aguardando resposta até ${RESUME_GRACE_SEC}s (ga-nrkh92)"
+            printf '%s\n%s\n' "$now" "$live_session_name" > "$rf"
         fi
-        printf '%s\n%s\n' "$now" "$live_session_name" > "$rf"
         continue
     fi
 
