@@ -26,27 +26,56 @@ run() { HOME="$FAKE_HOME" python3 "$SCRIPT" "$@"; }
 
 echo "=== safe-clean.selftest.sh ==="
 
-# ── 1. scratchpad passes ───────────────────────────────────────────────────
-SCRATCH="/private/tmp/claude-selftest-$$/sub"
-mkdir -p "$SCRATCH"
-echo x > "$SCRATCH/file.txt"
-OUT=$(run "/private/tmp/claude-selftest-$$" 2>&1); RC=$?
-if [ "$RC" -eq 0 ] && [ ! -e "/private/tmp/claude-selftest-$$" ]; then
-  ok "session scratchpad removed, exit 0"
+# Real layout is /private/tmp/claude-<uid>/<project-slug>/<session-id>/...  —
+# claude-<uid> is SHARED by every concurrent session/project for that user
+# (ga-gkap9p gate-fix 3). Synthesize that same shape everywhere below
+# (.../proj/sess/...) instead of a bare claude-<n> root, so these tests
+# exercise a genuinely-allowed path, not one that only happens to still work
+# because it's shallow.
+
+# ── 1. scratchpad passes, at and below the session-id boundary ─────────────
+UIDROOT1="/private/tmp/claude-selftest1-$$"
+SESSDIR1="$UIDROOT1/proj/sess"
+mkdir -p "$SESSDIR1/scratchpad"
+echo x > "$SESSDIR1/scratchpad/file.txt"
+OUT=$(run "$SESSDIR1" 2>&1); RC=$?
+if [ "$RC" -eq 0 ] && [ ! -e "$SESSDIR1" ]; then
+  ok "session-id dir (uid/proj/sess) removed, exit 0 — right at the boundary"
 else
-  bad "scratchpad removal failed (rc=$RC): $OUT"
+  bad "session-id dir removal failed (rc=$RC): $OUT"
 fi
-rm -rf "/private/tmp/claude-selftest-$$" 2>/dev/null
+rm -rf "$UIDROOT1" 2>/dev/null
+
+# ── 1b. the shared claude-<uid> root itself, and claude-<uid>/<project>, are
+# ── refused — the exact cross-session-collision bug (ga-gkap9p gate-fix 3):
+# ── these used to match the allow rule at depth 3 and get wiped wholesale,
+# ── taking every OTHER concurrent session's scratchpad with them ───────────
+UIDROOT1B="/private/tmp/claude-selftest1b-$$"
+mkdir -p "$UIDROOT1B/other-session/scratchpad"
+echo not-mine > "$UIDROOT1B/other-session/scratchpad/file.txt"
+OUT=$(run "$UIDROOT1B" 2>&1); RC=$?
+if [ "$RC" -eq 2 ] && [ -e "$UIDROOT1B/other-session/scratchpad/file.txt" ]; then
+  ok "bare claude-<uid> root refused (exit 2); other sessions' data survives"
+else
+  bad "bare claude-<uid> root should be refused, not wiped (rc=$RC): $OUT"
+fi
+OUT=$(run "$UIDROOT1B/other-session" 2>&1); RC=$?
+if [ "$RC" -eq 2 ] && [ -e "$UIDROOT1B/other-session/scratchpad/file.txt" ]; then
+  ok "claude-<uid>/<project> root (one level short) also refused, survives"
+else
+  bad "claude-<uid>/<project> root should also be refused (rc=$RC): $OUT"
+fi
+rm -rf "$UIDROOT1B" 2>/dev/null
 
 # ── 2. protected dirs refuse, even NESTED INSIDE an allowed scratchpad ─────
 # (this is also the deny-wins-over-allow-on-double-match test: the parent
-# dir matches the /private/tmp/claude-* allow rule, but .gc-worktrees is a
-# path component inside it, and deny must still win.)
+# dir matches the /private/tmp/claude-*/*/*/** allow rule, but .gc-worktrees
+# is a path component inside it, and deny must still win.)
 for name in .gc-worktrees .beads .dolt crew; do
-  TARGET="/private/tmp/claude-selftest2-$$/$name/wip-file"
+  TARGET="/private/tmp/claude-selftest2-$$/proj/sess/$name/wip-file"
   mkdir -p "$(dirname "$TARGET")"
   echo important > "$TARGET"
-  OUT=$(run "/private/tmp/claude-selftest2-$$/$name" 2>&1); RC=$?
+  OUT=$(run "/private/tmp/claude-selftest2-$$/proj/sess/$name" 2>&1); RC=$?
   if [ "$RC" -eq 2 ] && [ -e "$TARGET" ]; then
     ok "$name/ refused (exit 2), survives, even nested under an allowed scratchpad"
   else
@@ -93,13 +122,13 @@ else
 fi
 
 # ── 6. multi-arg is all-or-nothing ──────────────────────────────────────────
-mkdir -p "/private/tmp/claude-selftest6-$$"
-echo x > "/private/tmp/claude-selftest6-$$/ok-file"
-DENY_TARGET="/private/tmp/claude-selftest6b-$$/.beads/db"
+mkdir -p "/private/tmp/claude-selftest6-$$/proj/sess"
+echo x > "/private/tmp/claude-selftest6-$$/proj/sess/ok-file"
+DENY_TARGET="/private/tmp/claude-selftest6b-$$/proj/sess/.beads/db"
 mkdir -p "$(dirname "$DENY_TARGET")"
 echo x > "$DENY_TARGET"
-OUT=$(run "/private/tmp/claude-selftest6-$$" "/private/tmp/claude-selftest6b-$$/.beads" 2>&1); RC=$?
-if [ "$RC" -eq 2 ] && [ -e "/private/tmp/claude-selftest6-$$/ok-file" ] && [ -e "$DENY_TARGET" ]; then
+OUT=$(run "/private/tmp/claude-selftest6-$$/proj/sess" "/private/tmp/claude-selftest6b-$$/proj/sess/.beads" 2>&1); RC=$?
+if [ "$RC" -eq 2 ] && [ -e "/private/tmp/claude-selftest6-$$/proj/sess/ok-file" ] && [ -e "$DENY_TARGET" ]; then
   ok "mixed allow+deny call refuses the whole batch; nothing deleted"
 else
   bad "multi-arg call was not all-or-nothing (rc=$RC): $OUT"
@@ -107,7 +136,7 @@ fi
 rm -rf "/private/tmp/claude-selftest6-$$" "/private/tmp/claude-selftest6b-$$" 2>/dev/null
 
 # ── 7. idempotent: removing an already-absent allowed path is still success ─
-ALREADY_GONE="/private/tmp/claude-selftest7-$$/gone"
+ALREADY_GONE="/private/tmp/claude-selftest7-$$/proj/sess/gone"
 OUT=$(run "$ALREADY_GONE" 2>&1); RC=$?
 if [ "$RC" -eq 0 ]; then
   ok "already-absent path under an allowed prefix is a no-op success"
@@ -126,9 +155,9 @@ else
 fi
 
 # ── 9. --check classifies without deleting ──────────────────────────────────
-mkdir -p "/private/tmp/claude-selftest9-$$"
-OUT=$(run --check "/private/tmp/claude-selftest9-$$" 2>&1); RC=$?
-if [ "$RC" -eq 0 ] && [ -e "/private/tmp/claude-selftest9-$$" ]; then
+mkdir -p "/private/tmp/claude-selftest9-$$/proj/sess"
+OUT=$(run --check "/private/tmp/claude-selftest9-$$/proj/sess" 2>&1); RC=$?
+if [ "$RC" -eq 0 ] && [ -e "/private/tmp/claude-selftest9-$$/proj/sess" ]; then
   ok "--check reports allow (exit 0) without deleting"
 else
   bad "--check should classify without deleting (rc=$RC): $OUT"
@@ -179,11 +208,11 @@ rm -rf "/private/tmp/claude-selftest11-$$" 2>/dev/null
 
 # ── 12. a partial removal failure is reported, never silently reported as
 # ── success (the exact swallow that ignore_errors=True would produce) ──────
-PARTIAL="/private/tmp/claude-selftest12-$$/locked-dir"
+PARTIAL="/private/tmp/claude-selftest12-$$/proj/sess/locked-dir"
 mkdir -p "$PARTIAL"
 echo x > "$PARTIAL/stuck-file"
 chmod 555 "$PARTIAL"
-OUT=$(run "/private/tmp/claude-selftest12-$$" 2>&1); RC=$?
+OUT=$(run "/private/tmp/claude-selftest12-$$/proj/sess" 2>&1); RC=$?
 chmod 755 "$PARTIAL"
 if [ "$RC" -eq 3 ] && [ -e "$PARTIAL/stuck-file" ]; then
   ok "partial removal failure is reported (exit 3), not silently swallowed as success"
@@ -198,10 +227,10 @@ rm -rf "/private/tmp/claude-selftest12-$$" 2>/dev/null
 # ── CWD and check the SAME resolved path against policy, so any relative
 # ── argument typed while sitting in an allowed scratchpad silently inherited
 # ── an ALLOW verdict regardless of what it actually named) ─────────────────
-mkdir -p "/private/tmp/claude-selftest13-$$/sub"
-echo important > "/private/tmp/claude-selftest13-$$/sub/file.txt"
-OUT=$(cd "/private/tmp/claude-selftest13-$$" && HOME="$FAKE_HOME" python3 "$SCRIPT" "sub" 2>&1); RC=$?
-if [ "$RC" -eq 2 ] && [ -e "/private/tmp/claude-selftest13-$$/sub/file.txt" ]; then
+mkdir -p "/private/tmp/claude-selftest13-$$/proj/sess/sub"
+echo important > "/private/tmp/claude-selftest13-$$/proj/sess/sub/file.txt"
+OUT=$(cd "/private/tmp/claude-selftest13-$$/proj/sess" && HOME="$FAKE_HOME" python3 "$SCRIPT" "sub" 2>&1); RC=$?
+if [ "$RC" -eq 2 ] && [ -e "/private/tmp/claude-selftest13-$$/proj/sess/sub/file.txt" ]; then
   ok "relative path refused even though CWD is inside an allowed scratchpad; survives"
 else
   bad "relative path should be refused regardless of CWD (rc=$RC): $OUT"

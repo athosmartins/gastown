@@ -89,7 +89,19 @@ def deny_reason(resolved_path):
 def allow_reason(resolved_path):
     parts = parts_of(resolved_path)
 
-    if len(parts) >= 3 and parts[0] == "private" and parts[1] == "tmp" and parts[2].startswith("claude-"):
+    # /private/tmp/claude-<uid>/<project-slug>/<session-id>/... — the
+    # claude-<uid> segment (parts[2]) is SHARED by every concurrent Claude
+    # Code session and project for that user, not scoped to one session.
+    # Only from the session-id segment down (parts[4], i.e. len(parts) >= 5)
+    # is a target actually confined to a single session's own area; a bare
+    # claude-<uid> or claude-<uid>/<project-slug> target must be refused,
+    # not silently treated as "this session's disposable scratchpad".
+    if (
+        len(parts) >= 5
+        and parts[0] == "private"
+        and parts[1] == "tmp"
+        and parts[2].startswith("claude-")
+    ):
         return ALLOW_SCRATCHPAD_REASON
 
     for sub, why in ALLOW_HOME_PREFIXES:
@@ -129,7 +141,11 @@ def classify(raw_path):
 
 def policy_text():
     lines = ["ALLOW (removed without approval):"]
-    lines.append(f"  /private/tmp/claude-*/**            {ALLOW_SCRATCHPAD_REASON}")
+    lines.append(f"  /private/tmp/claude-*/*/*/**        {ALLOW_SCRATCHPAD_REASON}")
+    lines.append("                                       (must reach the session-id level;")
+    lines.append("                                        the bare claude-<uid> or")
+    lines.append("                                        claude-<uid>/<project> root is")
+    lines.append("                                        shared across sessions and refused)")
     for sub, why in ALLOW_HOME_PREFIXES:
         lines.append(f"  ~/{'/'.join(sub)}/**{' ' * max(1, 24 - len('/'.join(sub)))}{why}")
     for comp, why in ALLOW_COMPONENTS:

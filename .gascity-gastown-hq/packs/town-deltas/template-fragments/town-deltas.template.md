@@ -537,9 +537,11 @@ claude-*` continua negado). `safe-clean --help` imprime a lista completa e
 por quê; resumo:
 
 ```
-PERMITE (some sem aprovação): /private/tmp/claude-*/**, ~/.cache/**,
-  ~/Library/Caches/go-build/**, ~/.npm/_cacache/**, node_modules/,
-  __pycache__/, .pytest_cache/, *.pyc
+PERMITE (some sem aprovação): /private/tmp/claude-*/*/*/** (precisa alcançar o
+  nível de session-id -- a raiz claude-<uid> ou claude-<uid>/<projeto> sozinha
+  é COMPARTILHADA entre sessões concorrentes e é recusada, gate-fix 3,
+  ga-gkap9p), ~/.cache/**, ~/Library/Caches/go-build/**, ~/.npm/_cacache/**,
+  node_modules/, __pycache__/, .pytest_cache/, *.pyc
 NEGA SEMPRE (vence PERMITE mesmo em match duplo): .dolt/, .beads/,
   .gc-worktrees/, crew/, .git/, ~/Library/CloudStorage/**,
   ~/gt/*/shared/data/**
