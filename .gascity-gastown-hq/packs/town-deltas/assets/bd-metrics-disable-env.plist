@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.bd-metrics-disable-env</string>
+
+  <!-- ga-8g9ki5: bd's own telemetry flusher (bd send-metrics, spawned detached by
+       every bd invocation) hangs in kernel-level uninterruptible wait once
+       ~/.beads/eventsData hits the filesystem's 65535-hardlink ceiling — a state
+       no application-level timeout can interrupt (confirmed: RunSendMetrics
+       already has a 30s context timeout that does nothing against this). The
+       spawn itself is skipped entirely when metrics are disabled
+       (shouldSpawnFlusher checks Enabled() before exec.Command), so the fix is
+       to keep metrics off, durably, everywhere — not to chase the hang itself.
+       `bd metrics off` already persists to a config file, but BD_DISABLE_METRICS
+       is a bidirectional env override that wins over that config even if
+       something turns it back on. Mayor set it via `tmux set-environment -g`
+       (reaches new tmux panes only); this plist sets it at the launchd-domain
+       level via `launchctl setenv`, which every launchd-spawned process
+       (LaunchAgents, non-shell invocations tmux doesn't cover) inherits. Paired
+       with `export BD_DISABLE_METRICS=1` in ~/.zshrc for the interactive-shell
+       path. See bd-metrics-off-alarm.plist for the companion watch that alerts
+       if metrics ever get re-enabled despite this. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/launchctl</string>
+    <string>setenv</string>
+    <string>BD_DISABLE_METRICS</string>
+    <string>1</string>
+  </array>
+
+  <!-- One-shot at login: launchctl setenv persists for the whole launchd session
+       until logout/reboot, so there is nothing to re-assert on an interval. -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/bd-metrics-disable-env-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/bd-metrics-disable-env-launchd.err</string>
+</dict>
+</plist>
