@@ -773,7 +773,19 @@ run_sweep() {
       # distinguishable label + log line naming every conflicting label, and
       # move on — never trade the routing loop for a per-sweep alert loop (this
       # runs at most once per bead per sweep, same as every other R7 outcome).
-      local labels_json; labels_json=$(echo "$bead_json" | jq -c 'if type=="array" then .[0] else . end | (.labels // [])' 2>/dev/null)
+      # FAIL-SAFE (mirrors _GATE_UNKNOWN_SENTINEL above): every id in $non_imp_beads
+      # was already proven to carry ≥1 non-implementable label by the candidate
+      # query, so a labels_json read that comes back empty/unparseable here is a
+      # DESYNC signal, not "no labels" — treating it as "no story:approved" would
+      # fall through to the OLD clear-the-route behavior on exactly the read
+      # failure this fix cannot afford to guess wrong on. Skip the bead entirely
+      # this sweep instead (next sweep retries) — same shape as R3/R7's existing
+      # gate-active fail-safe, applied to this new read.
+      local labels_json
+      if ! labels_json=$(echo "$bead_json" | jq -c 'if type=="array" then .[0] else . end | (.labels // [])' 2>/dev/null) || [ -z "$labels_json" ] || [ "$labels_json" = "[]" ]; then
+        log "R7 skip-unreadable-labels (ga-ehwjvf fail-safe): $id ($(basename "$store")) — could not confirm labels this sweep (desync: candidate query found a match but the per-bead read came back empty), skipping mutation rather than risk clearing an approved bead's route"
+        continue
+      fi
       if printf '%s' "$labels_json" | jq -e 'any(. == "story:approved")' >/dev/null 2>&1; then
         local conflict_labels; conflict_labels=$(printf '%s' "$labels_json" | jq -r --arg re "$R7_NONIMPL_RE" '[.[] | select(test($re))] | join(",")' 2>/dev/null)
         _add "$store" "$id" lifecycle:label-conflict
