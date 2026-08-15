@@ -773,10 +773,24 @@ run_sweep() {
       # non-implementable bead (R7's real target) clears this cutoff by
       # definition and is cleared as before; a real fresh circuit-break
       # still gets cleared, just on a later sweep instead of losing a race a
-      # human has no way to win. Missing/unparseable updated_at (e.g. a
-      # minimal test fixture) fails OPEN to the pre-existing behavior —
-      # proceed with the mutation — rather than silently protecting a bead
-      # this check cannot actually evaluate.
+      # human has no way to win.
+      #
+      # THIRD STATE: missing/unparseable updated_at fails OPEN (proceed with
+      # the pre-existing behavior), not closed. This is deliberately NOT the
+      # same choice as the labels_json fail-safe a few lines below — and that
+      # asymmetry is safe, not inconsistent, for two independent reasons: (1)
+      # `updated_at` is a NOT NULL, DEFAULT-generated column (see `issues`
+      # schema) — a real `bd show` response always carries it; this branch is
+      # reachable in practice only from a minimal test fixture that never set
+      # it, never from a genuinely-corrupt production read. (2) Even in the
+      # hypothetical case bead_json itself came back broken, THIS check
+      # reuses that same bead_json rather than issuing its own fresh read, so
+      # a broken read leaves `routed_to`/`status` empty too — and the
+      # PRE-EXISTING labels_json fail-safe immediately below independently
+      # catches exactly that case and skips the mutation regardless of what
+      # this check decided. Failing open here only means "this ADDITIONAL
+      # layer of protection didn't activate," never "all protection was
+      # bypassed."
       R7_GRACE_MIN="${R7_GRACE_MIN:-5}"
       local updated_epoch
       updated_epoch=$(echo "$bead_json" | jq -r 'if type=="array" then .[0] else . end | ((.updated_at // .created_at // "") | fromdateiso8601?) // empty' 2>/dev/null)
