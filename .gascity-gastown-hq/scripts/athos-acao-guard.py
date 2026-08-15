@@ -205,25 +205,39 @@ def scan_rig(rig_path):
 
 
 def run_cycle():
+    """Scan every rig once; return an explicit result dict.
+
+    ga-ypwdug pre-submission self-audit: an earlier draft returned a plain
+    (flagged, resolved) tuple, which was (0, 0) BOTH for "scanned everything,
+    genuinely zero gaps" and for "rig enumeration failed outright, scanned
+    nothing" — the failure message printed separately, but a log reader
+    scanning only the per-cycle summary line could not tell the two apart.
+    enumeration_ok / rigs_failed make that distinction part of the return
+    value itself, not just a transient print the summary line could outrun.
+    """
     rigs = _list_rig_stores()
     if rigs is None:
-        print("[ATHOS-ACAO-GUARD] cycle: rig enumeration failed, skipping", flush=True)
-        return 0, 0
+        print("[ATHOS-ACAO-GUARD] cycle: rig enumeration FAILED — 0 rigs scanned this cycle",
+              flush=True)
+        return {"flagged": 0, "resolved": 0, "rigs_ok": 0, "rigs_failed": 0,
+                "enumeration_ok": False}
 
-    total_gaps = 0
-    total_resolved = 0
+    result = {"flagged": 0, "resolved": 0, "rigs_ok": 0, "rigs_failed": 0,
+              "enumeration_ok": True}
     for rig_name, rig_path in rigs:
-        result = scan_rig(rig_path)
-        if result is None:
+        scan = scan_rig(rig_path)
+        if scan is None:
             print(f"[ATHOS-ACAO-GUARD] {rig_name}: query failed, skipping", flush=True)
+            result["rigs_failed"] += 1
             continue
-        gaps, resolved = result
+        result["rigs_ok"] += 1
+        gaps, resolved = scan
         for bid in gaps:
             r = _bd(rig_path, "label", "add", bid, MARKER_LABEL, timeout=15)
             if r.returncode == 0:
                 emit(f"[ATHOS-ACAO-GUARD] [FLAGGED] {rig_name}/{bid} missing athos.acao "
                      f"— labeled {MARKER_LABEL}")
-                total_gaps += 1
+                result["flagged"] += 1
             else:
                 print(f"[ATHOS-ACAO-GUARD] [FLAG-FAILED] {rig_name}/{bid}: "
                       f"{r.stderr.strip()[:200]}", flush=True)
@@ -232,19 +246,26 @@ def run_cycle():
             if r.returncode == 0:
                 print(f"[ATHOS-ACAO-GUARD] [RESOLVED] {rig_name}/{bid} athos.acao now set "
                       f"— marker removed", flush=True)
-                total_resolved += 1
+                result["resolved"] += 1
             else:
                 print(f"[ATHOS-ACAO-GUARD] [RESOLVE-FAILED] {rig_name}/{bid}: "
                       f"{r.stderr.strip()[:200]}", flush=True)
-    return total_gaps, total_resolved
+    return result
+
+
+def _cycle_summary_line(r):
+    status = "OK" if (r["enumeration_ok"] and r["rigs_failed"] == 0) else "DEGRADED"
+    return (f"[ATHOS-ACAO-GUARD] cycle: flagged={r['flagged']} resolved={r['resolved']} "
+            f"rigs_ok={r['rigs_ok']} rigs_failed={r['rigs_failed']} "
+            f"enumeration_ok={r['enumeration_ok']} [{status}]")
 
 
 def main():
     print(f"[ATHOS-ACAO-GUARD] [STARTUP] poll={POLL_SEC}s marker={MARKER_LABEL}", flush=True)
     while True:
         try:
-            gaps, resolved = run_cycle()
-            print(f"[ATHOS-ACAO-GUARD] cycle: flagged={gaps} resolved={resolved}", flush=True)
+            result = run_cycle()
+            print(_cycle_summary_line(result), flush=True)
         except Exception as exc:
             # Never crash the guard loop.
             print(f"[ATHOS-ACAO-GUARD] cycle exception: {exc}", flush=True)
@@ -289,7 +310,8 @@ if __name__ == "__main__":
         ok = _selftest()
         _sys.exit(0 if ok else 1)
     if "--once" in _sys.argv:
-        gaps, resolved = run_cycle()
-        print(f"[ATHOS-ACAO-GUARD] single cycle: flagged={gaps} resolved={resolved}", flush=True)
-        _sys.exit(0)
+        result = run_cycle()
+        print("[ATHOS-ACAO-GUARD] single " + _cycle_summary_line(result)[len("[ATHOS-ACAO-GUARD] "):],
+              flush=True)
+        _sys.exit(0 if result["enumeration_ok"] else 1)
     main()
