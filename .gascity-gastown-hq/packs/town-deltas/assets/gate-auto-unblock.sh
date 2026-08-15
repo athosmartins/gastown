@@ -134,14 +134,27 @@ branch_for() {
     | awk -F/ -v id="$id" '$NF==id || substr($NF,1,length(id)+1)==id"-" {print; exit}'
 }
 
-# has_own_work <rig> <branch> → 0 se a branch tem trabalho ÚNICO.
+# has_own_work <rig> <branch> → "yes" | "no" | "unknown" (git cherry falhou).
 # Armadilha (B): usa git cherry (patch-id), não "branch --merged" (ref).
 # '-' = patch já está em main por outro caminho ⇒ NÃO é trabalho único.
+# "unknown" (git cherry não RODOU — lock, rig indisponível, ref stale) NÃO
+# pode virar "no": um comando que falha e um comando que roda e não acha
+# nada não são a mesma coisa, e só o segundo prova órfã. Achado no
+# self-audit pré-gate: a versão anterior colapsava os dois em `return 1`,
+# e R1 (que APAGA o label de verdade) disparava em cima de "não sei".
 has_own_work() {
   local rig="$1" br="$2" out
-  [ -n "$br" ] || return 1
-  out="$("$GIT" -C "$rig" cherry origin/main "$br" 2>/dev/null)" || return 1
-  printf '%s' "$out" | grep -q '^+'
+  [ -n "$br" ] || { printf 'no'; return 0; }
+  out="$("$GIT" -C "$rig" cherry origin/main "$br" 2>/dev/null)"
+  if [ $? -ne 0 ]; then
+    printf 'unknown'
+    return 0
+  fi
+  if printf '%s' "$out" | grep -q '^+'; then
+    printf 'yes'
+  else
+    printf 'no'
+  fi
 }
 
 # branch_tip_epoch <rig> <branch> → epoch do último commit, ou vazio.
@@ -196,12 +209,18 @@ decide() {
   br="$(branch_for "$rig" "$id")"
 
   # R1 — sem trabalho: trava órfã.
-  if [ -z "$br" ] || ! has_own_work "$rig" "$br"; then
-    if [ -z "$br" ]; then
-      printf 'R1|sem branch no remoto e sem commit próprio: não há o que revisar'
-    else
-      printf 'R1|branch %s existe mas git cherry não acusa trabalho único (patch já em main por outro caminho)' "$br"
-    fi
+  if [ -z "$br" ]; then
+    printf 'R1|sem branch no remoto e sem commit próprio: não há o que revisar'
+    return 0
+  fi
+  local work_state
+  work_state="$(has_own_work "$rig" "$br")"
+  if [ "$work_state" = "no" ]; then
+    printf 'R1|branch %s existe mas git cherry não acusa trabalho único (patch já em main por outro caminho)' "$br"
+    return 0
+  fi
+  if [ "$work_state" = "unknown" ]; then
+    printf 'R5|git cherry falhou ao comparar %s com origin/main (rig indisponível, lock, ou ref stale) — não dá pra confirmar se há trabalho único, não é seguro tratar como órfã' "$br"
     return 0
   fi
 

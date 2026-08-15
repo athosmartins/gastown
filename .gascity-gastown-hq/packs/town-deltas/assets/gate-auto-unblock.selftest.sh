@@ -56,6 +56,7 @@ if printf '%s ' "$@" | grep -q 'for-each-ref'; then
   cat "$FX/branches.txt" 2>/dev/null; exit 0
 fi
 if printf '%s ' "$@" | grep -q ' cherry '; then
+  [ -f "$FX/cherry_fail" ] && exit 1
   cat "$FX/cherry.txt" 2>/dev/null; exit 0
 fi
 if printf '%s ' "$@" | grep -q 'log -1'; then
@@ -133,6 +134,19 @@ setup ga-xyz '["gate:needs-human"]' 'origin/fix/ga-xyz' '+ abc' '1700000000' \
 OUT="$(run)"
 case "$OUT" in *"R5 ga-xyz"*escalado*) ok "R5: nada decidiu → escala COM o motivo escrito";;
   *) bad "R5: deveria escalar dizendo por que R1-R4 não bastaram" "$OUT";; esac
+
+# ── self-audit pré-gate: git cherry FALHA ≠ git cherry acha nada ───────
+# Achado varrendo o diff inteiro antes de submeter (não um caso citado por
+# revisor). has_own_work colapsava "comando não rodou" (lock, rig
+# indisponível, ref stale) em "não achou trabalho" — e essa leitura
+# disparava R1, que APAGA o label de verdade. Erro tem que virar R5
+# (escala), nunca a mesma saída que "rodei e confirmei vazio".
+setup wa-lockfail '["gate:needs-human"]' 'origin/crew/thies/wa-lockfail' '' ''
+touch "$TMP/fx.wa-lockfail/cherry_fail"
+OUT="$(run)"
+case "$OUT" in *"R5 wa-lockfail"*"git cherry falhou"*)
+    ok "self-audit: git cherry falhando (lock/rig indisponível) escala via R5, não vira R1 (falso órfão)";;
+  *) bad "erro de git cherry deveria escalar (R5), não ser lido como 'sem trabalho único' (R1)" "$OUT";; esac
 
 # ── armadilha D: label "failed" sem veredito FAIL (ga-xt8zrf) ──────────
 # O marker dizia "failed", o revisor tinha dado PASS — quem falhou foi
