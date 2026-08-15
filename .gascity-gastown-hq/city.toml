@@ -52,16 +52,24 @@ suspended = true
 dir = ""
 name = "gastown.mayor"
 suspended = false
+# ga-tkd2ll: verify the Claude Code credential is usable before this session
+# spawns. Shadow mode by default (detects + alerts, never blocks) — see the
+# script's own header for the staged-rollout rationale.
+pre_start = ["/Users/athos/gt/.gascity-gastown-hq/scripts/claude-credential-preflight.sh"]
 
 [[patches.agent]]
 dir = ""
 name = "gastown.boot"
 suspended = true
+# ga-tkd2ll: see gastown.mayor's identical entry above for rationale.
+pre_start = ["/Users/athos/gt/.gascity-gastown-hq/scripts/claude-credential-preflight.sh"]
 
 [[patches.agent]]
 dir = ""
 name = "gastown.deacon"
 suspended = true
+# ga-tkd2ll: see gastown.mayor's identical entry above for rationale.
+pre_start = ["/Users/athos/gt/.gascity-gastown-hq/scripts/claude-credential-preflight.sh"]
 
 [[patches.agent]]
 dir = ""
@@ -72,7 +80,13 @@ provider = "claude-headless"
 # gastown.dog) can't re-adopt a dead claimant's zombie and burn in a respawn
 # loop. Fast + FAIL-OPEN (SIGALRM budget + catch-all → always exit 0); it never
 # blocks a spawn. inflight-reclaim-guard's poll is the authoritative backstop.
-pre_start = ["/Users/athos/gt/.gascity-gastown-hq/scripts/dog-pool-preflight-reclaim.py"]
+# ga-tkd2ll: also verify the Claude Code credential is usable before spawn.
+# Shadow mode by default (detects + alerts, never blocks) — see the script's
+# own header for the staged-rollout rationale.
+pre_start = [
+  "/Users/athos/gt/.gascity-gastown-hq/scripts/dog-pool-preflight-reclaim.py",
+  "/Users/athos/gt/.gascity-gastown-hq/scripts/claude-credential-preflight.sh",
+]
 
 # BEGIN ga-23z6a eval-window-concurrency-guard (managed by
 # packs/town-deltas/assets/scripts/eval-window-concurrency-guard.sh — do not
