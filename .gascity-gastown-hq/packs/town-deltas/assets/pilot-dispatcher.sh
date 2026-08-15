@@ -5527,8 +5527,60 @@ DEBT_JSON=$(bd -C "$GC_CITY" list --json \
   2>/dev/null || echo "[]")
 DEBT_JSON=$(echo "$DEBT_JSON" | _filter_candidates | _reconcile_text_veto_labels "$GC_CITY")
 
-# Merge bugs + debt, deduplicate by id
-TIER1_JSON=$(echo "$BUGS_JSON $DEBT_JSON" \
+# ga-ciyypt: chore/task never got the unconditional Tier-1 treatment BUGS_JSON/
+# DEBT_JSON give bug/tech-debt above — they ONLY flowed through CTXREADY_JSON
+# below, which hard-requires -l ctx:ready. painel_visibilidade.py doctrine
+# (L124-132, L602-607: _AUTO_DISPATCH_TYPES) documents bug/chore/task ALIKE as
+# "despachados direto" — no readiness label required, only ctx:thin excluded
+# (painel's own _is_auto_dispatch_card gate, L3850, never checks ctx:ready
+# either). This closes the gap for the one type pair doctrine never got in
+# practice. Mirrors BUGS_JSON exactly (same lifecycle/epic exclusions), PLUS
+# excludes ctx:thin (matches painel's gate) AND excludes type:quality-gate-
+# marker/-run/-verdict: those are internal gate-bookkeeping beads conventionally
+# typed "chore" (hand-made-gate-marker-must-be-type-chore) that were, until now,
+# kept out of CTXREADY_JSON only by the ACCIDENT of never being ctx:ready-
+# labeled — removing that requirement here would otherwise expose them as bogus
+# dispatch candidates for the first time. Verified empirically: `bd list -t
+# chore --json` (no --include-gates) already returns type:quality-gate-marker
+# beads — that CLI flag does not hide them, so the exclusion must be explicit.
+CHORE_JSON=$(bd -C "$GC_CITY" list --json \
+  -t chore \
+  --exclude-label "ctx:thin" \
+  --exclude-label "type:quality-gate-marker" \
+  --exclude-label "type:quality-gate-run" \
+  --exclude-label "type:quality-gate-verdict" \
+  --exclude-label "story:in-flight" \
+  --exclude-label "story:done" \
+  --exclude-label "gate:passed" \
+  --exclude-label "pilot:dispatching" \
+  --exclude-label "gate:needs-human" \
+  --exclude-label "needs:engine-window" \
+  --exclude-label "pilot:dispatched" \
+  --exclude-type epic \
+  -n 0 \
+  2>/dev/null || echo "[]")
+CHORE_JSON=$(echo "$CHORE_JSON" | _filter_candidates | _reconcile_text_veto_labels "$GC_CITY")
+
+TASK_JSON=$(bd -C "$GC_CITY" list --json \
+  -t task \
+  --exclude-label "ctx:thin" \
+  --exclude-label "type:quality-gate-marker" \
+  --exclude-label "type:quality-gate-run" \
+  --exclude-label "type:quality-gate-verdict" \
+  --exclude-label "story:in-flight" \
+  --exclude-label "story:done" \
+  --exclude-label "gate:passed" \
+  --exclude-label "pilot:dispatching" \
+  --exclude-label "gate:needs-human" \
+  --exclude-label "needs:engine-window" \
+  --exclude-label "pilot:dispatched" \
+  --exclude-type epic \
+  -n 0 \
+  2>/dev/null || echo "[]")
+TASK_JSON=$(echo "$TASK_JSON" | _filter_candidates | _reconcile_text_veto_labels "$GC_CITY")
+
+# Merge bugs + debt + chore + task, deduplicate by id
+TIER1_JSON=$(echo "$BUGS_JSON $DEBT_JSON $CHORE_JSON $TASK_JSON" \
   | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
 
 # Drop candidates blocked by unresolved deps (ga-5ew). Filtering BEFORE the count
@@ -5539,7 +5591,7 @@ TIER1_JSON=$(echo "$TIER1_JSON" | _filter_unblocked "$GC_CITY")
 TIER1_JSON=$(echo "$TIER1_JSON" | _filter_explicit_deps "$GC_CITY")
 
 TIER1_COUNT=$(echo "$TIER1_JSON" | jq 'length' 2>/dev/null || echo "0")
-log "Bugs + tech-debt: $TIER1_COUNT open candidate(s) in HQ DB"
+log "Bugs + tech-debt + chore/task (ga-ciyypt): $TIER1_COUNT open candidate(s) in HQ DB"
 
 ALL_CANDIDATES_JSON="[]"
 # ALL_CANDIDATES_TIER is retained ONLY as a hint for downstream log lines; the
@@ -5894,10 +5946,45 @@ if [ "$PILOT_RIG_TIER1_QUERIES" = "1" ]; then
         --exclude-type epic \
         -n 0 2>/dev/null || echo "[]")
       _rt1_debt=$(echo "$_rt1_debt" | _filter_exec_manual | _filter_candidates | _reconcile_text_veto_labels "$_rt1_path" | _filter_dispatch_gates | _filter_built | _filter_unblocked "$_rt1_path" | _filter_explicit_deps "$_rt1_path")
-      _rt1_n=$(echo "$_rt1_bugs $_rt1_debt" | jq -s 'add // [] | unique_by(.id) | length' 2>/dev/null || echo "0")
+      # ga-ciyypt: same unconditional treatment for rig-native chore/task —
+      # CTXREADY_RIG_JSON below still hard-requires ctx:ready for these types,
+      # the same doctrine gap _rt1_bugs/_rt1_debt already closed for bug/debt
+      # (ga-3oxo5). ctx:thin + type:quality-gate-marker/-run/-verdict excluded
+      # for the same reasons as the HQ CHORE_JSON/TASK_JSON siblings above.
+      _rt1_chore=$(bd -C "$_rt1_path" list --json -t chore \
+        --exclude-label "ctx:thin" \
+        --exclude-label "type:quality-gate-marker" \
+        --exclude-label "type:quality-gate-run" \
+        --exclude-label "type:quality-gate-verdict" \
+        --exclude-label "story:in-flight" \
+        --exclude-label "story:done" \
+        --exclude-label "gate:passed" \
+        --exclude-label "pilot:dispatching" \
+        --exclude-label "gate:needs-human" \
+        --exclude-label "needs:engine-window" \
+        --exclude-label "pilot:dispatched" \
+        --exclude-type epic \
+        -n 0 2>/dev/null || echo "[]")
+      _rt1_chore=$(echo "$_rt1_chore" | _filter_exec_manual | _filter_candidates | _reconcile_text_veto_labels "$_rt1_path" | _filter_dispatch_gates | _filter_built | _filter_unblocked "$_rt1_path" | _filter_explicit_deps "$_rt1_path")
+      _rt1_task=$(bd -C "$_rt1_path" list --json -t task \
+        --exclude-label "ctx:thin" \
+        --exclude-label "type:quality-gate-marker" \
+        --exclude-label "type:quality-gate-run" \
+        --exclude-label "type:quality-gate-verdict" \
+        --exclude-label "story:in-flight" \
+        --exclude-label "story:done" \
+        --exclude-label "gate:passed" \
+        --exclude-label "pilot:dispatching" \
+        --exclude-label "gate:needs-human" \
+        --exclude-label "needs:engine-window" \
+        --exclude-label "pilot:dispatched" \
+        --exclude-type epic \
+        -n 0 2>/dev/null || echo "[]")
+      _rt1_task=$(echo "$_rt1_task" | _filter_exec_manual | _filter_candidates | _reconcile_text_veto_labels "$_rt1_path" | _filter_dispatch_gates | _filter_built | _filter_unblocked "$_rt1_path" | _filter_explicit_deps "$_rt1_path")
+      _rt1_n=$(echo "$_rt1_bugs $_rt1_debt $_rt1_chore $_rt1_task" | jq -s 'add // [] | unique_by(.id) | length' 2>/dev/null || echo "0")
       if [ "${_rt1_n:-0}" -gt 0 ] 2>/dev/null; then
-        log "Tier-1 (bug/tech-debt) rig DB $_rt1_path: $_rt1_n candidate(s) (ga-3oxo5, unconditional)."
-        RIG_TIER1_JSON=$(echo "$RIG_TIER1_JSON $_rt1_bugs $_rt1_debt" \
+        log "Tier-1 (bug/tech-debt/chore/task) rig DB $_rt1_path: $_rt1_n candidate(s) (ga-3oxo5 + ga-ciyypt, unconditional)."
+        RIG_TIER1_JSON=$(echo "$RIG_TIER1_JSON $_rt1_bugs $_rt1_debt $_rt1_chore $_rt1_task" \
           | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "$RIG_TIER1_JSON")
       fi
     done <<< "$_rt1_rows"
