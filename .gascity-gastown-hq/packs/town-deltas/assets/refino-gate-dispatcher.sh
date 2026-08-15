@@ -191,6 +191,24 @@ refino_resolve_refiner() {
   echo ""
 }
 
+# refino_verdict_bead_action <found 0|1> — echo reuse | create. PURE.
+#   found=1: an OPEN verdict bead (type:refino-gate-verdict, refino-story:<id>,
+#            verdict:pending) already exists for this story — an earlier
+#            sweep's review that never resolved (dispatcher/reviewer died, or
+#            the outer TIMEOUT fired and requeued the story — Step 1 leaves
+#            story:refino-review in place on purpose so the retry does not
+#            burn a bounce-back round). Reuse it instead of creating a
+#            duplicate (ga-2llva3): the dedup key is the STORY under review,
+#            not the run id — each sweep is a legitimately distinct run, but
+#            at most one verdict bead may be outstanding per story at a time.
+#   found=0 (or anything else — fail-safe): no pending verdict bead found —
+#            create a fresh one, exactly as before this fix.
+refino_verdict_bead_action() {
+  local found="$1"
+  [ "$found" = "1" ] && { echo "reuse"; return 0; }
+  echo "create"
+}
+
 # ── ga-4u16h PORT: pure reviewer-liveness helpers (unit-tested in lib mode) ────
 # These are PORTED VERBATIM (same logic, same names) from the CODE gate
 # (quality-gate-dispatcher.sh) so the refino-gate's re-convene reuses the gate's
@@ -273,6 +291,24 @@ _refino_gate_relabel() {
   bd_ update "$sid" --add-label "$target" --remove-label "story:refino-review" -q 2>/dev/null || true
 }
 
+# _refino_gate_find_pending_verdict <story_id> — echo the id of an existing
+# OPEN, still-undecided verdict bead for this story (type:refino-gate-verdict,
+# refino-story:<story_id>, verdict:pending), if one exists; empty otherwise.
+# Ga-2llva3 root cause: Step 4 used to create a brand-new verdict bead (and
+# Step 5 a brand-new reviewer session) on EVERY sweep that selected this
+# story, with no check for an already-outstanding one — so a story whose
+# reviewer died or timed out (which intentionally leaves story:refino-review
+# in place, see Step 1) got a fresh verdict bead + reviewer EVERY SWEEP
+# instead of a retry on the SAME one, accumulating orphaned wisp beads
+# (measured live: up to 4 for a single story) and desynchronizing which
+# reviewer session a reminder should point at.
+# Oldest-first: normally at most one exists; if pre-fix residue left more
+# than one, pick deterministically rather than the most recently touched.
+_refino_gate_find_pending_verdict() {
+  local story_id="$1"
+  bd_ query --json "ephemeral=true AND status=open AND label=type:refino-gate-verdict AND label=refino-story:$story_id AND label=verdict:pending" --limit 0 2>/dev/null \
+    | jq -r 'sort_by(.created_at // "") | .[0].id // empty' 2>/dev/null
+}
 
 # ── ga-g0af2: a mensagem de bounce, quando NAO ha notas legiveis ──────────────
 # O gate le as notas do VERDICT BEAD, que e efemero (wisp) e e purgado. Se a
@@ -433,12 +469,37 @@ M_MODE=$(J '.metadata["story.refino_mode"]')
 S_TYPE=$(J '.issue_type')
 [ -z "$S_TYPE" ] && S_TYPE=$(J '.type')
 
-# ── Step 4: Create the verdict bead the reviewer will close ───────────────────
+# ── Step 4: Reuse an outstanding verdict bead, or create a fresh one ──────────
+# Ga-2llva3 root cause: this used to call `bd_ create` unconditionally on every
+# sweep that selected this story, with no check for an already-pending verdict
+# bead from an earlier sweep. Step 1's TIMEOUT/requeue path deliberately keeps
+# story:refino-review in place (so a dead reviewer does not burn a bounce-back
+# round) — which means the SAME story can be re-selected sweep after sweep
+# while its previous verdict bead sits abandoned, still verdict:pending.
+# Unconditional create turned each retry into a NEW verdict bead + a NEW
+# reviewer session instead of a retry on the existing one — measured live: up
+# to 4 orphaned wisp beads for a single story. The dedup key is the STORY
+# under review (refino-story:$STORY_ID) with an open verdict:pending bead, NOT
+# the run id — each sweep is a legitimately distinct run; what must not
+# duplicate is the outstanding review ARTIFACT for the same story.
 REFINO_RUN_ID="refino-$(date -u +%Y%m%dT%H%M%SZ)-$STORY_ID"
 VERDICT_BEAD_ID=""
+EXISTING_VERDICT_BEAD_ID=$(_refino_gate_find_pending_verdict "$STORY_ID")
+VERDICT_FOUND_FLAG=0
+[ -n "$EXISTING_VERDICT_BEAD_ID" ] && VERDICT_FOUND_FLAG=1
+VERDICT_ACTION=$(refino_verdict_bead_action "$VERDICT_FOUND_FLAG")
+
 if [ "$DRY_RUN" = "1" ]; then
-  log "WOULD create verdict bead for $STORY_ID (run $REFINO_RUN_ID) — DRY_RUN"
+  if [ "$VERDICT_ACTION" = "reuse" ]; then
+    log "WOULD reuse existing pending verdict bead $EXISTING_VERDICT_BEAD_ID for $STORY_ID (run $REFINO_RUN_ID) — DRY_RUN"
+  else
+    log "WOULD create verdict bead for $STORY_ID (run $REFINO_RUN_ID) — DRY_RUN"
+  fi
   VERDICT_BEAD_ID="dry-verdict"
+elif [ "$VERDICT_ACTION" = "reuse" ]; then
+  VERDICT_BEAD_ID="$EXISTING_VERDICT_BEAD_ID"
+  log "  Verdict bead: $VERDICT_BEAD_ID (reused — earlier sweep's review for $STORY_ID never resolved, ga-2llva3)"
+  bd_ comment "$VERDICT_BEAD_ID" "Refino-gate: nova tentativa de revisão (run $REFINO_RUN_ID). A tentativa anterior não produziu veredito (reviewer morreu ou expirou). Reusando este bead em vez de criar outro (ga-2llva3)." 2>/dev/null || true
 else
   VERDICT_BEAD_ID=$(bd_ create \
     "refino-verdict: $STORY_ID (round $THIS_ROUND)" \
@@ -458,7 +519,7 @@ The reviewer closes this bead with verdict:PASS or verdict:FAIL + notes." \
     bd_ label remove "$STORY_ID" "refino-gate:reviewing" -q 2>/dev/null || true
     exit 1
   fi
-  log "  Verdict bead: $VERDICT_BEAD_ID"
+  log "  Verdict bead: $VERDICT_BEAD_ID (created)"
 fi
 
 # The review task = the rubric (Definition of Refined) + the exact bd commands.

@@ -509,6 +509,141 @@ else
   ok "escalate nao usa mais o fallback antigo (mudanca posterior — nao e regressao deste bead)"
 fi
 
+
+# ── ga-2llva3: verdict-bead dedup — reuse instead of duplicate-create ─────────
+# Root cause: Step 4 called `bd_ create` unconditionally on every sweep that
+# selected a story, with no check for an already-pending verdict bead from an
+# earlier sweep whose reviewer died/timed out. Measured live: one story
+# (wa-8heyr) accumulated 4 orphaned pending verdict beads across 4 separate
+# sweeps over ~2 hours; another (wa-iynqf) got 3, with a reviewer receiving a
+# reminder pointing at a DIFFERENT session's verdict bead.
+echo "Scenario ga-2llva3: refino_verdict_bead_action pure decision"
+[ "$(refino_verdict_bead_action 1)" = "reuse" ] && ok "found=1 → reuse (an outstanding pending verdict exists)" || bad "found=1 → expected reuse"
+[ "$(refino_verdict_bead_action 0)" = "create" ] && ok "found=0 → create (no pending verdict — fresh bead)" || bad "found=0 → expected create"
+[ "$(refino_verdict_bead_action '')" = "create" ] && ok "found=empty → create (fail-safe: never silently skip creation on ambiguous input)" || bad "found=empty → expected create"
+[ "$(refino_verdict_bead_action 'garbage')" = "create" ] && ok "found=garbage → create (fail-safe)" || bad "found=garbage → expected create"
+
+# ── Fixture proof (AC4: a test that FAILS against the pre-fix behavior). ──────
+# Models the real bug end-to-end: simulates N sweeps selecting the SAME story,
+# first replaying the OLD (buggy) call shape — unconditional bd_ create, no
+# check — to CHARACTERIZE that it really does produce N beads (proves the
+# fixture is faithful to the reported bug, not just to the fix). Then drives
+# the ACTUAL SHIPPED functions (_refino_gate_find_pending_verdict +
+# refino_verdict_bead_action) against an in-memory stand-in for Dolt, proving
+# repeated sweeps for a story with an unresolved verdict reuse the SAME bead,
+# while a story whose verdict genuinely resolved still gets a fresh one for
+# its next round (guards against the failure mode the bug's own diagnosis
+# warned about: "a guard that hides the re-trigger, leaving the story
+# re-evaluated forever, just silently").
+echo "Fixture: N sweeps for the same story, verdict never resolves"
+
+_dedup_fixture_reset() {
+  DEDUP_PENDING_ID=""     # id of the current open+pending verdict bead, if any
+  DEDUP_CREATED_COUNT=0   # total DISTINCT beads ever created this fixture run
+  DEDUP_CREATED_IDS=""    # space-separated log, for failure messages
+}
+
+# bd_ stub — only the two calls Step 4's logic actually makes. Ignores the
+# query expression content (this fixture only ever has one story in play);
+# the real jq parsing inside _refino_gate_find_pending_verdict still runs
+# against this stub's real JSON output, so that function's OWN logic is what
+# gets exercised, not a re-implementation of it.
+bd_() {
+  case "$1" in
+    query)
+      if [ -n "$DEDUP_PENDING_ID" ]; then
+        printf '[{"id":"%s","created_at":"2026-01-01T00:00:00Z"}]' "$DEDUP_PENDING_ID"
+      else
+        printf '[]'
+      fi
+      ;;
+    create)
+      DEDUP_CREATED_COUNT=$((DEDUP_CREATED_COUNT + 1))
+      local newid="dedup-verdict-$DEDUP_CREATED_COUNT"
+      DEDUP_PENDING_ID="$newid"
+      DEDUP_CREATED_IDS="${DEDUP_CREATED_IDS}${DEDUP_CREATED_IDS:+ }$newid"
+      printf '{"id":"%s"}' "$newid"
+      ;;
+  esac
+}
+
+# OLD (pre-ga-2llva3) Step 4: unconditional create, no check at all.
+# NOTE on shape: the dispatcher (sourced above) sets `set -euo pipefail`
+# itself, and sourcing does not sandbox `set` options — errexit stays active
+# for the REST of this selftest process. A bare `[ cond ] && cmd` as a
+# function's last statement, called as a bare top-level statement, silently
+# kills the whole script the moment cond is false (the "&&/|| list"
+# exemption only covers non-final commands in the list, not the function
+# call itself). Explicit if/then/fi + a trailing `return 0` sidesteps that
+# trap entirely — same defensive shape the rest of this file already uses.
+_dedup_sweep_old() {
+  bd_ create >/dev/null
+  return 0
+}
+
+# NEW (shipped) Step 4 decision, via the REAL functions under test.
+_dedup_sweep_new() {
+  local existing found_flag action
+  existing=$(_refino_gate_find_pending_verdict "fixture-story")
+  if [ -n "$existing" ]; then found_flag=1; else found_flag=0; fi
+  action=$(refino_verdict_bead_action "$found_flag")
+  if [ "$action" = "create" ]; then
+    bd_ create >/dev/null
+  fi
+  return 0
+}
+
+echo "Characterization: OLD unconditional-create behavior really does produce N beads for N sweeps (proves the fixture is faithful to the reported bug)"
+_dedup_fixture_reset
+_dedup_sweep_old; _dedup_sweep_old; _dedup_sweep_old
+[ "$DEDUP_CREATED_COUNT" -eq 3 ] && ok "characterization: 3 unguarded sweeps → 3 distinct verdict beads created (the ga-2llva3 bug, reproduced)" \
+  || bad "characterization: expected 3 beads from 3 unguarded sweeps, got $DEDUP_CREATED_COUNT"
+
+echo "Fix: repeated sweeps for a story whose verdict never resolves reuse the SAME bead"
+_dedup_fixture_reset
+_dedup_sweep_new; _dedup_sweep_new; _dedup_sweep_new
+[ "$DEDUP_CREATED_COUNT" -eq 1 ] && ok "fix: 3 sweeps for the same still-pending story → only 1 verdict bead ever created (ga-2llva3)" \
+  || bad "REGRESSION (ga-2llva3): expected exactly 1 verdict bead across 3 sweeps for the same pending story, got $DEDUP_CREATED_COUNT (ids: $DEDUP_CREATED_IDS)"
+
+echo "Fix: a GENUINELY resolved verdict does not block the next round's fresh bead"
+_dedup_fixture_reset
+_dedup_sweep_new                # round 1 — creates bead #1
+DEDUP_PENDING_ID=""              # simulate resolution: PASS/FAIL recorded, no longer verdict:pending
+_dedup_sweep_new                # round 2 — nothing pending → must create a genuinely new bead
+[ "$DEDUP_CREATED_COUNT" -eq 2 ] && ok "fix: resolving a verdict does not suppress the next round's fresh bead (2 sweeps, resolved between them → 2 distinct beads — guard does not hide re-review forever)" \
+  || bad "REGRESSION (ga-2llva3): a resolved verdict should allow a fresh bead for the next round, got $DEDUP_CREATED_COUNT bead(s)"
+unset -f bd_ _dedup_sweep_old _dedup_sweep_new
+
+# ── Drift guard ga-2llva3: the REAL Step 4 call site uses the dedup guard ─────
+# (not dead code sitting unused beside the old unconditional create).
+echo "Drift guard ga-2llva3: Step 4 call site actually uses the dedup guard"
+if grep -q '_refino_gate_find_pending_verdict "\$STORY_ID"' "$DISPATCHER"; then
+  ok "Step 4 calls _refino_gate_find_pending_verdict before deciding create-vs-reuse"
+else
+  bad "REGRESSION (ga-2llva3): Step 4 no longer calls _refino_gate_find_pending_verdict — dedup guard is dead code or was removed"
+fi
+if grep -q 'refino_verdict_bead_action "\$VERDICT_FOUND_FLAG"' "$DISPATCHER"; then
+  ok "Step 4 calls refino_verdict_bead_action to decide reuse vs create"
+else
+  bad "REGRESSION (ga-2llva3): Step 4 no longer calls refino_verdict_bead_action"
+fi
+# Ordering: the pending-verdict check must run BEFORE the create call — that
+# ordering IS the fix (the bug was creating first and never checking).
+FIND_LINE=$(grep -n '_refino_gate_find_pending_verdict "\$STORY_ID"' "$DISPATCHER" | head -1 | cut -d: -f1)
+CREATE_LINE=$(grep -n 'VERDICT_BEAD_ID=\$(bd_ create' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$FIND_LINE" ] && [ -n "$CREATE_LINE" ] && [ "$FIND_LINE" -lt "$CREATE_LINE" ]; then
+  ok "the pending-verdict check runs BEFORE the create call (guard precedes the write, ga-2llva3)"
+else
+  bad "REGRESSION (ga-2llva3): the create call is not clearly gated after the pending-verdict check (find_line=$FIND_LINE create_line=$CREATE_LINE)"
+fi
+# The reuse branch must not silently skip telling anyone — a comment on the
+# reused bead is how a human reading its history sees the retry happened.
+if grep -q 'bd_ comment "\$VERDICT_BEAD_ID" "Refino-gate: nova tentativa' "$DISPATCHER"; then
+  ok "reuse path leaves a comment explaining the retry on the reused bead"
+else
+  bad "REGRESSION (ga-2llva3): reuse path no longer explains itself on the reused bead"
+fi
+
 echo ""
 echo "refino-gate-dispatcher.selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
