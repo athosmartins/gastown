@@ -108,6 +108,15 @@ def allow_reason(resolved_path):
 
 
 def classify(raw_path):
+    if not os.path.isabs(raw_path):
+        # Never resolve a relative path: that would judge the deletion
+        # against the process's CWD, an ambient value this tool must not
+        # trust for a safety decision (and which this exact environment has
+        # a documented history of resetting unexpectedly between commands).
+        # Refusing outright — instead of realpath()-ing it and letting the
+        # result land wherever CWD happens to put it — keeps the allow/deny
+        # policy a pure function of the argument the caller actually wrote.
+        return ("unmatched", raw_path, "relative path refused — safe-clean only accepts absolute paths (fail-closed; CWD is never trusted for a deletion decision)")
     resolved = os.path.realpath(raw_path)
     deny = deny_reason(resolved)
     if deny:
@@ -139,6 +148,9 @@ def policy_text():
     lines.append("Matching is on the RESOLVED path (symlinks and .. included);")
     lines.append("deletion itself acts on the literal argument, so a symlink is")
     lines.append("only ever unlinked, never dereferenced for deletion.")
+    lines.append("Only ABSOLUTE paths are accepted; a relative path is refused")
+    lines.append("outright (fail-closed) rather than resolved against CWD, which")
+    lines.append("this tool never trusts for a deletion decision.")
     return "\n".join(lines)
 
 

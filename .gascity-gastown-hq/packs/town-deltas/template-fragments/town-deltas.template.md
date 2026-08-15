@@ -553,5 +553,8 @@ não for. Nesse caso caia pro `rm -rf` normal, que vai pedir aprovação como
 sempre — isso é o comportamento correto, não um bug. `safe-clean` NÃO
 substitui `rm -rf` como comando geral, só cobre a lista PERMITE explícita
 acima; passar múltiplos caminhos é tudo-ou-nada (se qualquer um for negado,
-nenhum é removido).
+nenhum é removido). **Só aceita caminho ABSOLUTO** — um caminho relativo é
+recusado (fail-closed), nunca resolvido contra o CWD do processo (gate-fix
+2, ga-gkap9p: CWD é estado ambiente que este comando nunca deve confiar para
+uma decisão de deleção).
 {{ end }}

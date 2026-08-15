@@ -192,5 +192,21 @@ else
 fi
 rm -rf "/private/tmp/claude-selftest12-$$" 2>/dev/null
 
+# ── 13. relative path refused even when CWD sits inside an allowed tree —
+# ── CWD must never influence a deletion decision (ga-gkap9p gate-fix 2:
+# ── classify() used to realpath() a relative argument against the process's
+# ── CWD and check the SAME resolved path against policy, so any relative
+# ── argument typed while sitting in an allowed scratchpad silently inherited
+# ── an ALLOW verdict regardless of what it actually named) ─────────────────
+mkdir -p "/private/tmp/claude-selftest13-$$/sub"
+echo important > "/private/tmp/claude-selftest13-$$/sub/file.txt"
+OUT=$(cd "/private/tmp/claude-selftest13-$$" && HOME="$FAKE_HOME" python3 "$SCRIPT" "sub" 2>&1); RC=$?
+if [ "$RC" -eq 2 ] && [ -e "/private/tmp/claude-selftest13-$$/sub/file.txt" ]; then
+  ok "relative path refused even though CWD is inside an allowed scratchpad; survives"
+else
+  bad "relative path should be refused regardless of CWD (rc=$RC): $OUT"
+fi
+rm -rf "/private/tmp/claude-selftest13-$$" 2>/dev/null
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
