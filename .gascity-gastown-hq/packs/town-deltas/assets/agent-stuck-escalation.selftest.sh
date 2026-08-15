@@ -1411,6 +1411,46 @@ assert_absent "$WORK/city/.gc/logs/agent-stuck-escalation.log" "XXXNEVERMATCHXXX
 log_contains "T64" "RETOMADA enviada a dog-idle64" "T64: log confirms the resume path actually ran (window did not suppress it)"
 rm -f "$LOGS_FIXTURE_DIR/dog-idle64.json"
 
+# T65 = gate-fix attempt 3: now_outside_active_window's <= branch requires
+# cur_min >= start_min AND cur_min < end_min, unsatisfiable for ANY cur_min
+# when start_min == end_min (e.g. "10:00-10:00") — a validly-formatted,
+# in-hour-range, but zero-width window. Sibling of T64's out-of-range-hour
+# case: same permanent-silent-suppression failure mode, different trigger.
+echo "T65: gc.active_window with equal start/end (10:00-10:00, zero-width) fails OPEN — does not permanently suppress resume/escalation (ga-nrkh92 gate-fix attempt 3)"
+echo '{"sessions":[{"name":"dog-idle65","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-idle65 3600
+printf '[{"id":"ga-idle65","title":"Test bead ga-idle65","assignee":"dog-idle65","status":"in_progress","issue_type":"feature","updated_at":"%s","labels":[],"metadata":{"gc.active_window":"10:00-10:00"}}]' \
+    "$(python3 -c "import time, datetime; e=time.time()-2200; print(datetime.datetime.utcfromtimestamp(e).strftime('%Y-%m-%dT%H:%M:%SZ'))")" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-idle65" "$WORK/city/.gc/state/agent-idle-resume/ga-idle65"
+seed_tmux_pane dog-idle65 999999996
+: > "$ACTIONS"
+RESUME_GRACE_SEC=99999 run_script > /dev/null
+assert_contains "$ACTIONS" "nudge:dog-idle65|" "T65: nudge still fires — a zero-width window (start==end) must fail OPEN like any other degenerate window (pre-fix: start_min==end_min made the <= branch's cur_min<end_min test unsatisfiable for any cur_min, ALWAYS outside, permanently suppressing)"
+log_contains "T65" "RETOMADA enviada a dog-idle65" "T65: log confirms the resume path actually ran (window did not suppress it)"
+rm -f "$LOGS_FIXTURE_DIR/dog-idle65.json"
+
+# T66 = CONTROL for T65: proves the start_min == end_min guard is an EXACT
+# equality check that doesn't leak into narrow-but-genuinely-distinct
+# windows — a real (non-degenerate) 2-minute window not containing "now"
+# must still suppress normally.
+echo "T66: gc.active_window narrow-but-VALID 2-minute window NOT containing now still suppresses correctly (ga-nrkh92 gate-fix attempt 3, CONTROL — the equality guard must not broaden past exact start==end)"
+echo '{"sessions":[{"name":"dog-idle66","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-idle66 3600
+_now_hm="$(date +%H:%M)"
+_now_min=$(( 10#${_now_hm%%:*} * 60 + 10#${_now_hm##*:} ))
+_start_min=$(( (_now_min + 10) % 1440 ))
+_end_min=$(( (_start_min + 2) % 1440 ))
+_win="$(printf "%02d:%02d-%02d:%02d" $((_start_min/60)) $((_start_min%60)) $((_end_min/60)) $((_end_min%60)))"
+printf '[{"id":"ga-idle66","title":"Test bead ga-idle66","assignee":"dog-idle66","status":"in_progress","issue_type":"feature","updated_at":"%s","labels":[],"metadata":{"gc.active_window":"%s"}}]' \
+    "$(python3 -c "import time, datetime; e=time.time()-2200; print(datetime.datetime.utcfromtimestamp(e).strftime('%Y-%m-%dT%H:%M:%SZ'))")" \
+    "$_win" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-idle66" "$WORK/city/.gc/state/agent-idle-resume/ga-idle66"
+: > "$ACTIONS"
+RESUME_GRACE_SEC=99999 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor" "T66: no escalation — narrow-but-distinct window (start_min != end_min) correctly still suppresses"
+assert_absent "$ACTIONS" "nudge:dog-idle66|" "T66: no nudge — proves the T65 fix's equality guard is exact and doesn't broaden to near-equal-but-distinct windows"
+rm -f "$LOGS_FIXTURE_DIR/dog-idle66.json"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

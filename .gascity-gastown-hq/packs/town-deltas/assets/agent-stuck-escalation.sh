@@ -839,6 +839,18 @@ now_outside_active_window() {
     fi
     start_min=$(( 10#${start_hm%%:*} * 60 + 10#${start_hm##*:} ))
     end_min=$(( 10#${end_hm%%:*} * 60 + 10#${end_hm##*:} ))
+    # ga-nrkh92 gate-fix attempt 3: start_min == end_min (e.g. "10:00-10:00",
+    # "00:00-00:00") is a degenerate-but-validly-formatted zero-width window —
+    # same failure mode as the out-of-range-hour case above, different
+    # trigger. The <= branch below requires cur_min >= start_min AND
+    # cur_min < end_min, which is unsatisfiable for any cur_min when the two
+    # are equal, so the function would silently and permanently return
+    # "outside" for every call — the opposite of the fail-OPEN contract
+    # documented above. Resolve it the same way as the hour-bound case: fail
+    # open.
+    if [ "$start_min" -eq "$end_min" ]; then
+        return 1
+    fi
     cur_hm="$(date +%H:%M)"
     cur_min=$(( 10#${cur_hm%%:*} * 60 + 10#${cur_hm##*:} ))
     if [ "$start_min" -le "$end_min" ]; then
