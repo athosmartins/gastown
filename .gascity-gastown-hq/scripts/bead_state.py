@@ -895,6 +895,24 @@ def derive(bead: dict, live_sessions=None,
         if crew:
             return {"state": "manual_assigned", "turn": "crew:" + crew, "actions": ["cutucar"], "reasons": {}}
         # ⭐ SEM EXECUTOR: vai pra TRIAGEM DO MAYOR, nunca pro Athos.
+        #
+        # ga-jobeqe: divergência CONHECIDA e deliberada com o layer operativo
+        # — whatsapp_automation/daemons/painel_visibilidade.py's
+        # _travada_reason (a função que hoje renderiza "Sua vez"/Travadas de
+        # verdade) trata o MESMO predicado (exec:manual sem assignee) como
+        # turn:"athos", não "mayor" (decisão wa-w7pds, 05/08: sem isso, 5
+        # beads P1/P2 ficavam escondidos em Travadas — coluna que ele não
+        # olha — por dias). Essa heurística do painel já foi medida como
+        # ERRADA na maioria dos casos (REGRA Nº 3 do CLAUDE.md, 13/08: de 4
+        # exec:manual órfãos medidos, 3 não eram do Athos) — mas a correção
+        # adotada foi disciplina de quem APLICA o label (sempre nomear
+        # assignee, ou usar pilot:no-auto-dispatch se só quer vetar
+        # despacho), não reverter o heurístico do painel: reverter
+        # reintroduziria o dano original que wa-w7pds mediu. Se você está
+        # construindo um NOVO consumidor de derive() para decidir "é a vez
+        # do Athos?" em UI, NÃO confie só nesta regra — verifique o
+        # comportamento atual de _travada_reason primeiro; as duas fontes
+        # discordam de propósito e nenhuma é obviamente "a errada".
         return {"state": "manual_unrouted", "turn": "mayor",
                 "actions": ["nomear_executor"],
                 "reasons": {"_diagnostico": "exec:manual sem executor — 'não sei quem' NÃO é 'o Athos faz'"}}
