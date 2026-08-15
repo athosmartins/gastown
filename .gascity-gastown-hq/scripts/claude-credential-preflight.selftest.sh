@@ -225,6 +225,32 @@ else
   bad "known-email allowlist override" "rc=$RC (want 0) out=$OUT notify_log=$(cat "$NOTIFY_LOG" 2>/dev/null) mail_log=$(cat "$MAIL_LOG" 2>/dev/null)"
 fi
 
+# ---------------------------------------------------------------------------
+# 11. SECURITY REGRESSION: a malicious `email` value (attacker-shaped as a
+#     shell single-quote breakout, e.g. from a compromised/spoofed
+#     `claude auth status` response) must NOT achieve command execution via
+#     the alert path. Confirmed exploitable against an earlier draft that
+#     built one string via `bash -c "$_NOTIFY_CMD ... '$msg'"` -- that hands
+#     the already-expanded string to a SECOND shell parse, so a literal `'`
+#     inside $msg's data closes the intended quoted argument early and lets
+#     text after it run as real shell syntax (verified live in a throwaway
+#     repro against that exact pattern before writing this test: the canary
+#     file WAS created). The current code invokes $_NOTIFY_CMD/$_MAIL_CMD
+#     directly with $msg as one double-quoted argv entry -- no second parse,
+#     so this payload must land as inert data only.
+# ---------------------------------------------------------------------------
+CANARY="$SBX/pwned-canary"
+rm -f "$CANARY"
+PAYLOAD="x'; touch $CANARY #"
+stage_auth 0 "$(printf '{"loggedIn":true,"email":"%s"}' "$PAYLOAD")"
+run CLAUDE_CRED_PREFLIGHT_ENFORCE=1
+if [ ! -e "$CANARY" ] && [ "$RC" = 0 ] && alerted; then
+  ok "malicious email payload does not achieve command injection via alert path"
+else
+  bad "command injection regression" "canary_exists=$([ -e "$CANARY" ] && echo YES-VULNERABLE || echo no) rc=$RC out=$OUT notify_log=$(cat "$NOTIFY_LOG" 2>/dev/null) mail_log=$(cat "$MAIL_LOG" 2>/dev/null)"
+fi
+rm -f "$CANARY"
+
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

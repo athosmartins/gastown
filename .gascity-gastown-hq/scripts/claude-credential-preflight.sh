@@ -78,8 +78,20 @@ _log() { printf '[CRED-PREFLIGHT] %s\n' "$*"; }
 _alert() {
   local subject="$1" msg="$2"
   _log "ALERT $subject -- $msg"
-  bash -c "$_NOTIFY_CMD -t 'Claude cred preflight: $subject' -p 4 '$msg'" >/dev/null 2>&1 || true
-  bash -c "$_MAIL_CMD -s 'Claude cred preflight: $subject' -m '$msg'" >/dev/null 2>&1 || true
+  # SECURITY: $subject/$msg can carry data this script does not fully
+  # control (claude auth status's own `email` field; $_WHO from
+  # GC_AGENT/GC_SESSION_NAME). Earlier drafts built one string via bash -c
+  # "$_NOTIFY_CMD -t '...' -p 4 '$msg'" -- that hands the ALREADY-expanded
+  # string to a SECOND shell parse, so any shell metacharacter inside
+  # $subject/$msg's own content (not just a literal quote) could break out
+  # of the intended argument and be re-interpreted as shell syntax. Fixed
+  # by invoking directly instead of through bash -c: $_NOTIFY_CMD/$_MAIL_CMD
+  # are intentionally left unquoted (word-split into a command+args prefix,
+  # e.g. "gc mail send mayor" -- operator/config-controlled, not data), but
+  # $subject/$msg are double-quoted and passed as direct argv entries with
+  # NO re-parse step, so their content is always inert data, never syntax.
+  $_NOTIFY_CMD -t "Claude cred preflight: $subject" -p 4 "$msg" >/dev/null 2>&1 || true
+  $_MAIL_CMD -s "Claude cred preflight: $subject" -m "$msg" >/dev/null 2>&1 || true
 }
 
 main() {
@@ -89,7 +101,13 @@ main() {
   fi
 
   local out rc
-  out=$(timeout "$_BUDGET_SEC" bash -c "$_AUTH_STATUS_CMD" 2>&1)
+  # $_AUTH_STATUS_CMD intentionally unquoted (word-split command+args
+  # prefix, same rationale as _NOTIFY_CMD/_MAIL_CMD in _alert() above) --
+  # no untrusted data is concatenated into this value, only a config
+  # override, but avoiding bash -c "$STRING" here too keeps one invocation
+  # style throughout instead of leaving a second instance of the pattern
+  # a reviewer would otherwise have to re-verify is safe on its own.
+  out=$(timeout "$_BUDGET_SEC" $_AUTH_STATUS_CMD 2>&1)
   rc=$?
 
   if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
@@ -135,13 +153,6 @@ main() {
   done
 
   if [ "$known" -eq 0 ]; then
-    # Note: no single quotes embedded in this message, deliberately -- _alert()
-    # wraps $msg in single quotes for bash -c, and an embedded literal single
-    # quote here would depend on bash's adjacent-quoted/unquoted-token
-    # concatenation rule to still parse as one word (verified it does today,
-    # since email/$_KNOWN_EMAILS never contain whitespace next to a quote --
-    # but that is a fragile invariant to lean on, not a guarantee, so avoid
-    # the embedded quote entirely instead of relying on it).
     local msg="claude auth status reports loggedIn=true but email=$email is not in the known pool ($_KNOWN_EMAILS). Session about to spawn: $_WHO. Never auto-blocked -- confirm and add to the known list if legitimate, or investigate if not."
     _alert "unrecognized account" "$msg"
     return 0
