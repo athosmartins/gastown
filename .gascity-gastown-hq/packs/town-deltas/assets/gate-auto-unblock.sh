@@ -114,10 +114,26 @@ ENABLED="${GATE_AUTO_UNBLOCK_ENABLED:-1}"
 # desenho, não por esquecimento — ver bloco acima.
 UNBLOCKABLE_VARIANTS="${GATE_AUTO_UNBLOCK_VARIANTS:-gate:needs-human gate:needs-human:technical gate:needs-human:branch-content-mismatch gate:needs-human:partial-delivery}"
 
+LOCK_FILE="${GATE_AUTO_UNBLOCK_LOCK:-$CITY/.gc/runtime/gate-auto-unblock.lock}"
+
 log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG" 2>/dev/null || true; }
 say() { printf '%s\n' "$*"; log "$*"; }
 
 [ "$ENABLED" = "1" ] || { say "gate-auto-unblock: DESLIGADO (GATE_AUTO_UNBLOCK_ENABLED=0)"; exit 0; }
+
+# ⚠️ (revisor, gate-run ga-2ywzoo): trava de instância única — SEM ela,
+# este guard é exatamente o precedente já documentado nesta cidade
+# (ga-y0g5x): StartInterval sem lock, um run que ultrapassa o próprio
+# intervalo sob carga, launchd empilha execuções (4 simultâneas medidas
+# no incidente real), e mutações concorrentes de bd label/comment em 3
+# bancos (CITY+WA_RIG+PS_RIG) derrubaram o bd/Dolt da cidade inteira. O
+# custo por run deste script ESCALA com o tamanho da fila needs-human E
+# com a latência do Dolt — exatamente as duas coisas que sobem juntas
+# num Dolt degradado, que é precisamente quando este guard mais rodaria.
+# `flock -n` sai imediatamente (silencioso, não é erro) se outra
+# instância já segura o lock — não enfileira, não espera.
+exec 9>"$LOCK_FILE" 2>/dev/null || { say "gate-auto-unblock: não consegui abrir $LOCK_FILE para lock — saindo (fail-safe, não roda sem garantia de instância única)"; exit 0; }
+flock -n 9 || { say "gate-auto-unblock: outra instância já rodando (lock $LOCK_FILE) — saindo"; exit 0; }
 
 # ── helpers ────────────────────────────────────────────────────────────
 

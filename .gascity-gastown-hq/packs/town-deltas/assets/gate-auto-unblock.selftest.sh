@@ -148,7 +148,8 @@ setup() {
 }
 run() {
   GC_CITY_PATH="$TMP" WA_RIG="$TMP" PS_RIG="$TMP" \
-  GATE_AUTO_UNBLOCK_LOG="$TMP/log" BD=bd GIT=git \
+  GATE_AUTO_UNBLOCK_LOG="$TMP/log" GATE_AUTO_UNBLOCK_LOCK="$TMP/gate-auto-unblock.lock" \
+  BD=bd GIT=git \
   bash "$SCRIPT" 2>&1
 }
 
@@ -450,6 +451,38 @@ else
   bad "achado C: cut -c1-200 sob LC_ALL=C corrompeu UTF-8 (corte no meio de ç/ã) — precisa de iconv -c" "$OUT"
 fi
 
+# ── flock: trava de instância única (revisor, gate-run ga-2ywzoo) ──────
+# Precedente real desta cidade (ga-y0g5x): guard StartInterval SEM trava
+# de instância única teve execuções empilhadas pelo launchd sob carga (4
+# simultâneas medidas) e derrubou o bd/Dolt da cidade inteira. Prova de
+# exclusão mútua DE VERDADE, não só leitura de código: um processo
+# SEPARADO segura o MESMO arquivo de lock via flock antes do script
+# rodar; o script tem que sair IMEDIATAMENTE, sem tocar em nenhum bead,
+# nunca esperar o lock liberar.
+LOCKTEST="$TMP/flocktest.lock"
+READYFILE="$TMP/flocktest.ready"
+rm -f "$READYFILE"
+setup ga-lockheld '["gate:needs-human"]' '' '' ''
+(
+  exec 9>"$LOCKTEST"
+  flock -n 9 || exit 1
+  touch "$READYFILE"
+  sleep 2
+) &
+HOLDER_PID=$!
+# poll curto até o holder confirmar que pegou o lock — evita race de
+# tempo fixo (sleep N) contra quando o subshell de fato adquire o flock.
+for _i in $(seq 1 50); do [ -f "$READYFILE" ] && break; sleep 0.05; done
+OUT="$(GC_CITY_PATH="$TMP" WA_RIG="$TMP" PS_RIG="$TMP" GATE_AUTO_UNBLOCK_LOG="$TMP/log" \
+  GATE_AUTO_UNBLOCK_LOCK="$LOCKTEST" BD=bd GIT=git bash "$SCRIPT" 2>&1)"
+wait "$HOLDER_PID" 2>/dev/null
+if printf '%s' "$OUT" | grep -q "outra instância já rodando" \
+   && [ ! -s "$TMP/fx.ga-lockheld/removed.log" ] && [ ! -s "$TMP/fx.ga-lockheld/comments.log" ]; then
+  ok "flock: trava de instância única funciona de verdade — 2ª execução sai sem tocar nenhum bead (precedente ga-y0g5x)"
+else
+  bad "flock: com o lock já detido por outro processo, o script deveria sair imediatamente sem mutar nada" "$OUT"
+fi
+
 # ── kill switch ────────────────────────────────────────────────────────
 setup ga-off '["gate:needs-human"]' '' '' ''
 OUT="$(GATE_AUTO_UNBLOCK_ENABLED=0 GC_CITY_PATH="$TMP" WA_RIG="$TMP" PS_RIG="$TMP" \
@@ -460,7 +493,8 @@ case "$OUT" in *DESLIGADO*) ok "kill switch desliga tudo (GATE_AUTO_UNBLOCK_ENAB
 # ── DRY_RUN não muta ───────────────────────────────────────────────────
 setup ga-dry '["gate:needs-human"]' '' '' ''
 DRY_RUN=1 GC_CITY_PATH="$TMP" WA_RIG="$TMP" PS_RIG="$TMP" \
-  GATE_AUTO_UNBLOCK_LOG="$TMP/log" bash "$SCRIPT" >/dev/null 2>&1
+  GATE_AUTO_UNBLOCK_LOG="$TMP/log" GATE_AUTO_UNBLOCK_LOCK="$TMP/gate-auto-unblock-dry.lock" \
+  bash "$SCRIPT" >/dev/null 2>&1
 if [ ! -s "$TMP/fx.ga-dry/removed.log" ] && [ ! -s "$TMP/fx.ga-dry/comments.log" ]; then
   ok "DRY_RUN=1 decide mas não muta nada"
 else
