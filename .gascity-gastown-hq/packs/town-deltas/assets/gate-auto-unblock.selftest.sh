@@ -134,6 +134,17 @@ OUT="$(run)"
 case "$OUT" in *"R5 ga-xyz"*escalado*) ok "R5: nada decidiu → escala COM o motivo escrito";;
   *) bad "R5: deveria escalar dizendo por que R1-R4 não bastaram" "$OUT";; esac
 
+# ── armadilha D: label "failed" sem veredito FAIL (ga-xt8zrf) ──────────
+# O marker dizia "failed", o revisor tinha dado PASS — quem falhou foi
+# corrida entre branches irmãs. Sem veredito FAIL nos comentários, R5 tem
+# que dizer ISSO, não fingir que houve reprovação e a branch não mudou.
+setup ga-xt8zrf '["gate:needs-human"]' 'origin/fix/ga-xt8zrf' '+ dead1234' '1700000000' \
+  '[{"created_at":"2026-08-15T10:00:00Z","text":"VERDICT: PASS — reviewer 1 clean"}]'
+OUT="$(run)"
+case "$OUT" in *"R5 ga-xt8zrf"*"nenhum veredito FAIL"*)
+    ok "armadilha D: sem VERDICT:FAIL nos comentários → R5 diz isso, não finge reprovação (ga-xt8zrf)";;
+  *) bad "armadilha D: deveria escalar dizendo que não há veredito FAIL, não 'sem commit após a reprovação'" "$OUT";; esac
+
 # ── VARIANTES: as três que este script NÃO pode tocar ──────────────────
 for v in gate:needs-human:product gate:needs-human:on-device gate:needs-human:refused; do
   setup ga-var "[\"$v\"]" '' '' ''

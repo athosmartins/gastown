@@ -236,7 +236,19 @@ decide() {
   fi
 
   # R5 — nada decidiu.
-  printf 'R5|R1 não (branch %s tem trabalho único) · R2 não (sem commit após a reprovação) · R4 não (%s reprovações, abaixo de 3) · R3 não (veredito não nomeia arquivo)' "$br" "${fails:-0}"
+  # Armadilha (D): se last_fail_epoch está vazio, não é que a branch não
+  # mudou "depois" da reprovação — é que NENHUM veredito FAIL foi achado
+  # (ga-xt8zrf: label dizia "failed", revisor tinha dado PASS, quem falhou
+  # foi corrida entre irmãs). A mensagem de R2 tem que dizer a diferença,
+  # senão o Mayor lê "houve reprovação, branch não mudou" quando na
+  # verdade não há reprovação nenhuma registrada.
+  local r2_why
+  if [ -z "${last_fail_epoch:-}" ]; then
+    r2_why='nenhum veredito FAIL encontrado nos comentários — o label pode ser espúrio (armadilha D: reprovação de processo, não de qualidade)'
+  else
+    r2_why='sem commit após a reprovação'
+  fi
+  printf 'R5|R1 não (branch %s tem trabalho único) · R2 não (%s) · R4 não (%s reprovações, abaixo de 3) · R3 não (veredito não nomeia arquivo)' "$br" "$r2_why" "${fails:-0}"
 }
 
 # ── varredura ──────────────────────────────────────────────────────────
