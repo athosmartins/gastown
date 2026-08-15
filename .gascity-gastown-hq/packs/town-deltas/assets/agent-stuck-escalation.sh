@@ -1064,6 +1064,7 @@ fi
 SESS_RAW="$(timeout 20 "$GC" session list --json 2>/dev/null)"
 SESS_RC=$?
 TMP_SESS="$(mktemp)"
+trap 'rm -f "$TMP_SESS"' EXIT
 printf '%s' "$SESS_RAW" > "$TMP_SESS"
 ACTIVE_SESSIONS="$(python3 - "$TMP_SESS" <<'PY'
 import json, sys
@@ -1085,7 +1086,18 @@ PY_RC=$?
 # ga-nrkh92: NÃO apaga $TMP_SESS aqui (mudança do comportamento original) —
 # session_work_dir() precisa reconsultar o mesmo JSON mais adiante, na
 # escalação por falta de resposta à retomada, pra resolver work_dir sem
-# spawnar `gc session list` de novo. Removido no fim do script.
+# spawnar `gc session list` de novo.
+#
+# ga-nrkh92 gate-fix (blocking issue, attempt 4): a versão original deste
+# comentário dizia "removido no fim do script" — falso pros passes comuns.
+# O `rm -f "$TMP_SESS"` que existia so' rodava DEPOIS do loop por bead
+# (apos "done <<< $STUCK_ITEMS"), mas o bloco pre-existente e inalterado
+# `if [ -z "$STUCK_ITEMS" ]; then ...; exit 0; fi` fica ENTRE a criacao de
+# $TMP_SESS e essa limpeza — e sai primeiro. Todo pass sem bead travado (o
+# estado saudavel comum, que este daemon de StartInterval=300s bate
+# rotineiramente) vazava o arquivo do mktemp, indefinidamente. O
+# `trap ... EXIT` logo acima cobre esse caminho e qualquer outro exit
+# futuro apos este ponto — sem precisar enumerar cada um a mao.
 
 # ga-2tpd fix (part 2): a FAILED `session list` query (nonzero exit, empty
 # stdout, or unparseable JSON) must never collapse to the same value as a
@@ -1685,8 +1697,6 @@ BODY
     rm -f "$rf"
 
 done <<< "$STUCK_ITEMS"
-
-rm -f "$TMP_SESS"
 
 log "=== pass complete ==="
 exit 0

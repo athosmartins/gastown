@@ -1514,6 +1514,55 @@ assert_contains "$ACTIONS" "mail:mayor|Agente ocioso nao respondeu a retomada: g
 [ ! -f "$WORK/city/.gc/state/agent-idle-resume/ga-idle68" ] && ok "T68: resume-state file cleared after escalation — the next post-cooldown cycle starts with a fresh nudge, not a stale timestamp" || bad "T68: resume-state file still present after escalation — next cycle would misread the ancient nudged_at and skip send_idle_resume again"
 rm -f "$LOGS_FIXTURE_DIR/dog-idle68.json"
 
+# T69 = gate-fix (blocking issue, attempt 4): the old deferred-cleanup
+# comment on $TMP_SESS claimed it was "removido no fim do script", but the
+# only rm -f "$TMP_SESS" sat AFTER the per-bead loop while the pre-existing
+# empty-STUCK_ITEMS branch (a bead exists but none are currently stuck --
+# the ordinary healthy-city case) exits BEFORE that loop even runs,
+# leaking the mktemp file on every such pass.
+#
+# Verification approach (NOTE: a first draft of this test overrode TMPDIR
+# to a sandbox and counted files before/after -- that draft passed even
+# against the unfixed script, a false pass caught by the "does the test
+# fail on the pre-fix code" check this org's doctrine requires. Root
+# cause, confirmed empirically: this machine's mktemp does NOT honor a
+# TMPDIR override the way GNU mktemp does -- it always resolves to the
+# Darwin per-user temp dir regardless, so nothing the sandbox is watching
+# ever appears in it, leak or no leak). Instead: run the script under
+# `bash -x` (not run_script()'s plain invocation) and read the ACTUAL
+# resolved path straight out of the xtrace ("+ TMP_SESS=/real/path"),
+# then check THAT specific path's existence after the script exits --- no
+# guessing where mktemp puts files, just asking bash what it did.
+echo "T69: a healthy pass (bead present but none currently stuck) does not leak the TMP_SESS mktemp file (ga-nrkh92 gate-fix, blocking issue, attempt 4)"
+echo '{"sessions":[{"name":"dog-idle69","state":"active"}]}' > "$SESSIONS_FIXTURE"
+printf '[%s]' "$(make_bead ga-idle69 dog-idle69 60)" > "$BEADS_FIXTURE"
+: > "$ACTIONS"
+_t69_trace="$(
+    GC_CITY_PATH="$WORK/city" GC="$SHIM/gc" BD="$SHIM/bd" NOTIFY_BIN="$SHIM/notify" \
+    TMUX_BIN="$SHIM/tmux" GIT_BIN="${GIT_BIN_OVERRIDE:-git}" \
+    BEADS_FIXTURE="${BEADS_FIXTURE:-}" SESSIONS_FIXTURE="${SESSIONS_FIXTURE:-}" \
+    SESSIONS_QUERY_FAIL="${SESSIONS_QUERY_FAIL:-0}" LOGS_FIXTURE_DIR="${LOGS_FIXTURE_DIR:-}" \
+    PEEK_FIXTURE_DIR="${PEEK_FIXTURE_DIR:-}" GATE_MARKERS_DIR="${GATE_MARKERS_DIR:-}" \
+    GATE_VERDICTS_DIR="${GATE_VERDICTS_DIR:-}" TMUX_SESSIONS_DIR="${TMUX_SESSIONS_DIR:-}" \
+    ACTIONS_FILE="$ACTIONS" MAIL_BODY_FILE="$WORK/last_mail_body.txt" \
+    STUCK_AGENT_SEC=1800 COOLDOWN_SEC="${COOLDOWN_SEC:-10800}" \
+    TRANSCRIPT_FRESH_SEC="${TRANSCRIPT_FRESH_SEC:-1800}" RESUME_GRACE_SEC="${RESUME_GRACE_SEC:-99999}" \
+    IDLE_CPU_SAMPLE_SEC="${IDLE_CPU_SAMPLE_SEC:-1}" ESCALATION_STORES="$WORK/city" \
+    DRY_RUN=1 \
+    bash -x "$SCRIPT" 2>&1
+)"
+_t69_path="$(printf '%s\n' "$_t69_trace" | grep -oE '^\+ TMP_SESS=.*' | tail -1 | sed 's/^+ TMP_SESS=//')"
+assert_absent "$ACTIONS" "mail:mayor" "T69: sanity — the one bead is fresh (60s old, 1800s threshold), this run must take the empty-STUCK_ITEMS path, not escalate"
+if [ -z "$_t69_path" ]; then
+    bad "T69: could not find TMP_SESS's resolved path in the xtrace — test setup broken, not a real pass/fail signal"
+elif [ -f "$_t69_path" ]; then
+    bad "T69: TMP_SESS leaked at $_t69_path — still present after the script exited on a healthy (no-stuck-beads) pass"
+    rm -f "$_t69_path"
+else
+    ok "T69: TMP_SESS ($_t69_path) was cleaned up even on the empty-STUCK_ITEMS early exit"
+fi
+rm -f "$LOGS_FIXTURE_DIR/dog-idle69.json"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
