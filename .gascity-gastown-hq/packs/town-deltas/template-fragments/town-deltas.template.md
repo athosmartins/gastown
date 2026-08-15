@@ -512,4 +512,46 @@ DOIS padrões — um grep textual `bd list.*--json` pega o shell, mas PERDE o
 Python: `["bd", "list", ...]` não tem "bd list" adjacente como substring
 (há vírgula+aspas no meio), então precisa de um grep separado por `"bd",`
 seguido de `"list"` numa janela de poucas linhas.
+
+**`rm -rf` trava agente num prompt de aprovação — pra caminho DESCARTÁVEL, use
+`safe-clean <caminho...>` em vez de `rm -rf` direto (ga-gkap9p).**
+`~/.claude/settings.json` tem `Bash(rm -rf:*)` em `ask`. Essa regra VENCE
+tanto as `allow` rules específicas de `/tmp`/`/private/tmp` (a camada `ask`
+sempre vence `allow` — especificidade da regra não importa) quanto o bypass
+de permissão da própria sessão de pool (`ask` explícito sobrepõe
+`bypassPermissions`). Resultado medido 15/08: todo `rm -rf`, inclusive
+limpeza banal de scratchpad, pede aprovação humana — e um pool agent sem
+humano por perto fica parado no prompt até alguém apertar uma tecla (3 casos
+no mesmo dia, 54-86min cada, ~14h de sessão somadas). NÃO editar
+`~/.claude/settings.json` — decisão explícita do Athos (15/08): a `ask` rule
+fica como rede de segurança pra quem chama `rm` direto.
+
+A saída é `safe-clean`: comando com NOME PRÓPRIO (não casa `Bash(rm -rf:*)`,
+não precisa de allow rule nova) em `~/.local/bin/safe-clean` — symlink pro
+script real em `packs/town-deltas/assets/scripts/safe-clean.py`. Ele resolve
+cada caminho (symlink e `..` incluídos) e só remove se o caminho RESOLVIDO
+cair numa árvore comprovadamente descartável; nega tudo o mais, inclusive o
+que não reconhece (fail-closed) — e a negação vence a permissão mesmo em
+match duplo (ex.: `.gc-worktrees/` dentro de um scratchpad `/private/tmp/
+claude-*` continua negado). `safe-clean --help` imprime a lista completa e
+por quê; resumo:
+
+```
+PERMITE (some sem aprovação): /private/tmp/claude-*/**, ~/.cache/**,
+  ~/Library/Caches/go-build/**, ~/.npm/_cacache/**, node_modules/,
+  __pycache__/, .pytest_cache/, *.pyc
+NEGA SEMPRE (vence PERMITE mesmo em match duplo): .dolt/, .beads/,
+  .gc-worktrees/, crew/, .git/, ~/Library/CloudStorage/**,
+  ~/gt/*/shared/data/**
+```
+
+**Como aplicar:** ao limpar scratchpad/cache/build-artifact num script ou
+comando ad-hoc, prefira `safe-clean <caminho>` a `rm -rf <caminho>` — some
+sem pedir aprovação se o alvo for reconhecidamente descartável, e funciona
+como recusa segura (não deleta nada, exit 2, imprime o motivo por caminho) se
+não for. Nesse caso caia pro `rm -rf` normal, que vai pedir aprovação como
+sempre — isso é o comportamento correto, não um bug. `safe-clean` NÃO
+substitui `rm -rf` como comando geral, só cobre a lista PERMITE explícita
+acima; passar múltiplos caminhos é tudo-ou-nada (se qualquer um for negado,
+nenhum é removido).
 {{ end }}

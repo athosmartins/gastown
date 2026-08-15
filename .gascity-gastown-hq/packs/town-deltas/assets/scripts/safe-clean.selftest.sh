@@ -1,0 +1,181 @@
+#!/bin/bash
+# safe-clean.selftest.sh — hermetic behavioral test for safe-clean.py
+# (ga-gkap9p: rm -rf's ask-rule stalls agents on disposable-path cleanup).
+#
+# Hermetic: everything happens under a mktemp -d WORKDIR, including a fake
+# HOME for the ~-anchored rules, so this never touches the real filesystem
+# outside that tree. Runs the REAL script as a subprocess (not a
+# reimplementation of its logic), so this exercises the actual code path.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT="$HERE/safe-clean.py"
+
+PASS=0; FAIL=0
+ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
+bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
+
+WORKDIR=$(mktemp -d)
+trap 'rm -rf "$WORKDIR"' EXIT
+
+# Fake HOME so ~-anchored rules (~/.cache, ~/Library/CloudStorage,
+# ~/gt/*/shared/data) are exercised without touching the real home dir.
+FAKE_HOME="$WORKDIR/home"
+mkdir -p "$FAKE_HOME"
+run() { HOME="$FAKE_HOME" python3 "$SCRIPT" "$@"; }
+
+echo "=== safe-clean.selftest.sh ==="
+
+# ── 1. scratchpad passes ───────────────────────────────────────────────────
+SCRATCH="/private/tmp/claude-selftest-$$/sub"
+mkdir -p "$SCRATCH"
+echo x > "$SCRATCH/file.txt"
+OUT=$(run "/private/tmp/claude-selftest-$$" 2>&1); RC=$?
+if [ "$RC" -eq 0 ] && [ ! -e "/private/tmp/claude-selftest-$$" ]; then
+  ok "session scratchpad removed, exit 0"
+else
+  bad "scratchpad removal failed (rc=$RC): $OUT"
+fi
+rm -rf "/private/tmp/claude-selftest-$$" 2>/dev/null
+
+# ── 2. protected dirs refuse, even NESTED INSIDE an allowed scratchpad ─────
+# (this is also the deny-wins-over-allow-on-double-match test: the parent
+# dir matches the /private/tmp/claude-* allow rule, but .gc-worktrees is a
+# path component inside it, and deny must still win.)
+for name in .gc-worktrees .beads .dolt crew; do
+  TARGET="/private/tmp/claude-selftest2-$$/$name/wip-file"
+  mkdir -p "$(dirname "$TARGET")"
+  echo important > "$TARGET"
+  OUT=$(run "/private/tmp/claude-selftest2-$$/$name" 2>&1); RC=$?
+  if [ "$RC" -eq 2 ] && [ -e "$TARGET" ]; then
+    ok "$name/ refused (exit 2), survives, even nested under an allowed scratchpad"
+  else
+    bad "$name/ should have been refused and preserved (rc=$RC): $OUT"
+  fi
+done
+rm -rf "/private/tmp/claude-selftest2-$$" 2>/dev/null
+
+# ── 3. symlink pointing outward is not a free pass ─────────────────────────
+IMPORTANT_DIR="$WORKDIR/important-elsewhere"
+mkdir -p "$IMPORTANT_DIR"
+echo do-not-delete-me > "$IMPORTANT_DIR/secret.txt"
+mkdir -p "/private/tmp/claude-selftest3-$$"
+ln -s "$IMPORTANT_DIR" "/private/tmp/claude-selftest3-$$/escape-link"
+OUT=$(run "/private/tmp/claude-selftest3-$$/escape-link" 2>&1); RC=$?
+if [ "$RC" -eq 2 ] && [ -e "$IMPORTANT_DIR/secret.txt" ]; then
+  ok "symlink out of the allowed tree is refused; target survives"
+else
+  bad "symlink escape was not caught (rc=$RC): $OUT"
+fi
+rm -rf "/private/tmp/claude-selftest3-$$" 2>/dev/null
+
+# ── 4. ".." pointing outward is not a free pass ─────────────────────────────
+mkdir -p "/private/tmp/claude-selftest4-$$/sub"
+# textually walks out to $WORKDIR then into the important dir — no symlink involved
+REL_TRAVERSAL="/private/tmp/claude-selftest4-$$/sub/../../..$IMPORTANT_DIR"
+OUT=$(run "$REL_TRAVERSAL" 2>&1); RC=$?
+if [ "$RC" -eq 2 ] && [ -e "$IMPORTANT_DIR/secret.txt" ]; then
+  ok "'..' traversal out of the allowed tree is refused; target survives"
+else
+  bad "'..' traversal was not caught (rc=$RC): $OUT"
+fi
+rm -rf "/private/tmp/claude-selftest4-$$" 2>/dev/null
+
+# ── 5. injection / "prose" safety: a weird literal argument is just a
+# ── nonexistent path, never shell-evaluated ────────────────────────────────
+CANARY="$WORKDIR/canary"
+mkdir -p "$CANARY"
+OUT=$(run '; rm -rf '"$CANARY"' #' 2>&1); RC=$?
+if [ "$RC" -eq 2 ] && [ -d "$CANARY" ]; then
+  ok "shell-metacharacter-laden argument is treated as a literal path, refused, no injection"
+else
+  bad "injection-shaped argument misbehaved (rc=$RC), canary present=$([ -d "$CANARY" ] && echo yes || echo no): $OUT"
+fi
+
+# ── 6. multi-arg is all-or-nothing ──────────────────────────────────────────
+mkdir -p "/private/tmp/claude-selftest6-$$"
+echo x > "/private/tmp/claude-selftest6-$$/ok-file"
+DENY_TARGET="/private/tmp/claude-selftest6b-$$/.beads/db"
+mkdir -p "$(dirname "$DENY_TARGET")"
+echo x > "$DENY_TARGET"
+OUT=$(run "/private/tmp/claude-selftest6-$$" "/private/tmp/claude-selftest6b-$$/.beads" 2>&1); RC=$?
+if [ "$RC" -eq 2 ] && [ -e "/private/tmp/claude-selftest6-$$/ok-file" ] && [ -e "$DENY_TARGET" ]; then
+  ok "mixed allow+deny call refuses the whole batch; nothing deleted"
+else
+  bad "multi-arg call was not all-or-nothing (rc=$RC): $OUT"
+fi
+rm -rf "/private/tmp/claude-selftest6-$$" "/private/tmp/claude-selftest6b-$$" 2>/dev/null
+
+# ── 7. idempotent: removing an already-absent allowed path is still success ─
+ALREADY_GONE="/private/tmp/claude-selftest7-$$/gone"
+OUT=$(run "$ALREADY_GONE" 2>&1); RC=$?
+if [ "$RC" -eq 0 ]; then
+  ok "already-absent path under an allowed prefix is a no-op success"
+else
+  bad "already-absent path should be a no-op success (rc=$RC): $OUT"
+fi
+
+# ── 8. unmatched path fails closed ──────────────────────────────────────────
+UNMATCHED="$WORKDIR/nothing-in-policy-covers-this"
+mkdir -p "$UNMATCHED"
+OUT=$(run "$UNMATCHED" 2>&1); RC=$?
+if [ "$RC" -eq 2 ] && [ -d "$UNMATCHED" ]; then
+  ok "path matching neither allow nor deny fails closed, survives"
+else
+  bad "unmatched path should fail closed (rc=$RC): $OUT"
+fi
+
+# ── 9. --check classifies without deleting ──────────────────────────────────
+mkdir -p "/private/tmp/claude-selftest9-$$"
+OUT=$(run --check "/private/tmp/claude-selftest9-$$" 2>&1); RC=$?
+if [ "$RC" -eq 0 ] && [ -e "/private/tmp/claude-selftest9-$$" ]; then
+  ok "--check reports allow (exit 0) without deleting"
+else
+  bad "--check should classify without deleting (rc=$RC): $OUT"
+fi
+rm -rf "/private/tmp/claude-selftest9-$$" 2>/dev/null
+
+# ── 10. non-regression: fake-HOME rules also work (~/.cache, CloudStorage,
+# ── ~/gt/<rig>/shared/data) ─────────────────────────────────────────────────
+mkdir -p "$FAKE_HOME/.cache/some-tool"
+echo x > "$FAKE_HOME/.cache/some-tool/blob"
+OUT=$(run "$FAKE_HOME/.cache/some-tool" 2>&1); RC=$?
+if [ "$RC" -eq 0 ] && [ ! -e "$FAKE_HOME/.cache/some-tool" ]; then
+  ok "~/.cache/** allowed and removed"
+else
+  bad "~/.cache/** should be allowed (rc=$RC): $OUT"
+fi
+
+mkdir -p "$FAKE_HOME/Library/CloudStorage/GoogleDrive-athos/My Drive/doc"
+OUT=$(run "$FAKE_HOME/Library/CloudStorage/GoogleDrive-athos" 2>&1); RC=$?
+if [ "$RC" -eq 2 ] && [ -e "$FAKE_HOME/Library/CloudStorage/GoogleDrive-athos/My Drive/doc" ]; then
+  ok "~/Library/CloudStorage/** refused, survives"
+else
+  bad "~/Library/CloudStorage/** should be refused (rc=$RC): $OUT"
+fi
+
+mkdir -p "$FAKE_HOME/gt/whatsapp_automation/shared/data"
+echo x > "$FAKE_HOME/gt/whatsapp_automation/shared/data/prod.db"
+OUT=$(run "$FAKE_HOME/gt/whatsapp_automation/shared/data" 2>&1); RC=$?
+if [ "$RC" -eq 2 ] && [ -e "$FAKE_HOME/gt/whatsapp_automation/shared/data/prod.db" ]; then
+  ok "~/gt/<rig>/shared/data/** refused, survives"
+else
+  bad "~/gt/<rig>/shared/data/** should be refused (rc=$RC): $OUT"
+fi
+
+# ── 11. symlink that resolves to ANOTHER allowed location: deletion must
+# ── remove the symlink pointer, never the real target it points at ─────────
+mkdir -p "$FAKE_HOME/.cache/real-target"
+echo precious > "$FAKE_HOME/.cache/real-target/data"
+mkdir -p "/private/tmp/claude-selftest11-$$"
+ln -s "$FAKE_HOME/.cache/real-target" "/private/tmp/claude-selftest11-$$/link-to-other-allowed"
+OUT=$(run "/private/tmp/claude-selftest11-$$/link-to-other-allowed" 2>&1); RC=$?
+if [ "$RC" -eq 0 ] && [ ! -e "/private/tmp/claude-selftest11-$$/link-to-other-allowed" ] && [ -e "$FAKE_HOME/.cache/real-target/data" ]; then
+  ok "symlink to another allowed location: only the pointer is removed, real target untouched"
+else
+  bad "symlink deletion should remove only the pointer, not dereference into the target (rc=$RC): $OUT — target present=$([ -e "$FAKE_HOME/.cache/real-target/data" ] && echo yes || echo no)"
+fi
+rm -rf "/private/tmp/claude-selftest11-$$" 2>/dev/null
+
+echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
+[ "$FAIL" -eq 0 ]
