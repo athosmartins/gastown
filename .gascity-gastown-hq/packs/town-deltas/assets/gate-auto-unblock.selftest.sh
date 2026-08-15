@@ -31,10 +31,21 @@ if printf '%s ' "$@" | grep -q ' list '; then
   cat "$FX/list.json" 2>/dev/null || echo '[]'
   exit 0
 fi
-# bd -C <rig> show <id> --json
+# bd -C <rig> show <id> --json [--include-comments]
+# ⚠️ FIEL ao bd real (ga-di6t52): --json SEM --include-comments OMITE
+# comments (confirmado ao vivo: sem a flag, .comments ausente do JSON —
+# nem vazio, AUSENTE). A versão anterior deste shim devolvia comments
+# incondicionalmente, então TODO teste passava mesmo quando o script
+# esquecia a flag — o mesmo bug que o revisor achou em produção era
+# estruturalmente invisível aqui. Dois arquivos de fixture: um fiel ao
+# "sem flag" (sem comments) e um ao "com flag" (com comments).
 if printf '%s ' "$@" | grep -q ' show '; then
   for a in "$@"; do case "$a" in ga-*|wa-*|ps-*) ID="$a";; esac; done
-  cat "$FX/show.$ID.json" 2>/dev/null || echo '[]'
+  if printf '%s ' "$@" | grep -q ' --include-comments '; then
+    cat "$FX/show.$ID.full.json" 2>/dev/null || echo '[]'
+  else
+    cat "$FX/show.$ID.json" 2>/dev/null || echo '[]'
+  fi
   exit 0
 fi
 # bd label remove <id> <label>  → grava o que foi removido
@@ -72,8 +83,13 @@ mk_shims
 # setup <id> <labels-json> <branches> <cherry> <tip_epoch> [comments-json]
 setup() {
   FX="$TMP/fx.$1"; rm -rf "$FX"; mkdir -p "$FX"; export FX_DIR="$FX"
+  # show.$1.json: bd show --json SEM --include-comments (shape real: sem
+  # a chave "comments", com "comments_omitted":true — ver nota no shim).
+  printf '[{"id":"%s","status":"open","labels":%s,"comments_omitted":true}]\n' \
+    "$1" "$2" > "$FX/show.$1.json"
+  # show.$1.full.json: bd show --json --include-comments (com a chave).
   printf '[{"id":"%s","status":"open","labels":%s,"comments":%s}]\n' \
-    "$1" "$2" "${6:-[]}" > "$FX/show.$1.json"
+    "$1" "$2" "${6:-[]}" > "$FX/show.$1.full.json"
   printf '[{"id":"%s","status":"open","labels":%s}]\n' "$1" "$2" > "$FX/list.json"
   printf '%s\n' "$3" > "$FX/branches.txt"
   printf '%s\n' "$4" > "$FX/cherry.txt"

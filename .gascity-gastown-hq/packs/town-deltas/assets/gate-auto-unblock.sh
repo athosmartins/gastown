@@ -258,7 +258,22 @@ decide() {
   # de AGORA, e last_fail_epoch nunca mais fica vazio — quebrando a própria
   # detecção de armadilha D mais abaixo. Sem "$d" não HÁ o que parsear:
   # sai vazio, sem tentar nenhum comando de data.
-  last_fail_epoch="$("$BD" -C "$rig" show "$id" --json 2>/dev/null \
+  #
+  # ⚠️ self-audit ciclo 3 (revisor, ga-di6t52): `bd show --json` OMITE
+  # comments por padrão — precisa de --include-comments explícito
+  # (confirmado ao vivo contra o bd real: .comments ausente do JSON sem a
+  # flag, mesmo em bead com comentário de verdade). Sem isto, tanto
+  # last_fail_epoch quanto verdict (mais abaixo) ficavam SEMPRE vazios em
+  # produção — R2 e R3 nunca disparavam, e a mensagem de armadilha D em R5
+  # mentia pra TODO bead, inclusive os com veredito FAIL real registrado.
+  # O selftest não pegou porque o shim de `bd` sempre devolvia comments,
+  # flag ou não (ver nota em gate-auto-unblock.selftest.sh). Busca UMA
+  # vez com a flag e reaproveita pro verdict abaixo — antes eram duas
+  # chamadas bd show por bead, e --include-comments é documentadamente
+  # mais custosa ("may be slow on issues with many comments").
+  local show_json
+  show_json="$("$BD" -C "$rig" show "$id" --json --include-comments 2>/dev/null)"
+  last_fail_epoch="$(printf '%s' "$show_json" \
     | jq -r '[.[0].comments[]?|select((.text//"")|test("GATE-FEEDBACK|VERDICT: FAIL"))]|last|.created_at // empty' 2>/dev/null \
     | { read -r d; [ -n "${d:-}" ] || exit 0; date -j -f '%Y-%m-%dT%H:%M:%SZ' "$d" '+%s' 2>/dev/null || date -d "$d" '+%s' 2>/dev/null; })"
 
@@ -280,7 +295,9 @@ decide() {
   fi
 
   # R3 — veredito nomeia trabalho delimitado.
-  verdict="$("$BD" -C "$rig" show "$id" --json 2>/dev/null \
+  # Reaproveita show_json (buscado acima com --include-comments) — mesmo
+  # bug/mesmo fix que last_fail_epoch, mesma chamada bd show.
+  verdict="$(printf '%s' "$show_json" \
     | jq -r '[.[0].comments[]?|select((.text//"")|test("VERDICT: FAIL"))]|last|.text // empty' 2>/dev/null)"
   if printf '%s' "$verdict" | grep -qE '\.(py|sh|go|js|html|json)\b'; then
     printf 'R3|veredito nomeia arquivo específico: trabalho delimitado, redespachar COM a instrução extraída'
