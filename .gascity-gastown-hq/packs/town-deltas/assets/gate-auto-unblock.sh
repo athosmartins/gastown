@@ -136,11 +136,34 @@ rig_dir() {
 # Casa o id exato E variantes com sufixo (-r2, -v2, -fix…), com a mesma
 # regra literal do lifecycle-auditor (ga-luyz48): o hífen ancora a
 # fronteira, então wa-v89e3 não casa a branch de wa-v89e3.9.
+#
+# ⚠️ (revisor, gate-run ga-oaqy39, blocking issue 2): busca DUAS
+# namespaces (crew/*/* e fix/*) numa só chamada, e for-each-ref devolve
+# tudo ORDENADO ALFABETICAMENTE — "crew" < "fix" sempre. A versão antiga
+# pegava o PRIMEIRO match ({print; exit}), então se o MESMO bead tivesse
+# ref em ambas (crew abandonada + fix real, ou vice-versa — a branch
+# ativa de um bead pode legitimamente migrar de namespace ao longo da
+# vida dele), a escolha era um acidente alfabético, nunca a mais
+# recente — podendo apagar a trava da branch ERRADA e deixar o trabalho
+# real sem exame e sem lock. Agora coleta TODOS os matches e escolhe
+# pelo commit TIP mais recente. Se a busca de epoch falhar pra algum
+# candidato (raro — a ref acabou de ser listada), ainda devolve o
+# PRIMEIRO candidato visto como fallback, nunca vazio quando existe pelo
+# menos um match — vazio só quando não há match nenhum (R1 genuíno).
 branch_for() {
-  local rig="$1" id="$2"
-  "$GIT" -C "$rig" for-each-ref --format='%(refname:short)' \
-    'refs/remotes/origin/crew/*/*' 'refs/remotes/origin/fix/*' 2>/dev/null \
-    | awk -F/ -v id="$id" '$NF==id || substr($NF,1,length(id)+1)==id"-" {print; exit}'
+  local rig="$1" id="$2" ref best="" best_epoch=-1 epoch first=""
+  while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    [ -n "$first" ] || first="$ref"
+    epoch="$("$GIT" -C "$rig" log -1 --format='%ct' "$ref" 2>/dev/null)"
+    if [ -n "${epoch:-}" ] && [ "$epoch" -gt "$best_epoch" ] 2>/dev/null; then
+      best="$ref"
+      best_epoch="$epoch"
+    fi
+  done < <("$GIT" -C "$rig" for-each-ref --format='%(refname:short)' \
+      'refs/remotes/origin/crew/*/*' 'refs/remotes/origin/fix/*' 2>/dev/null \
+    | awk -F/ -v id="$id" '$NF==id || substr($NF,1,length(id)+1)==id"-"')
+  printf '%s' "${best:-$first}"
 }
 
 # has_own_work <rig> <branch> → "yes" | "no" | "unknown" (git cherry falhou).
@@ -171,14 +194,34 @@ branch_tip_epoch() {
   "$GIT" -C "$1" log -1 --format='%ct' "$2" 2>/dev/null
 }
 
-# labels_of <rig> <bead> → labels, um por linha.
-labels_of() {
-  "$BD" -C "$1" show "$2" --json 2>/dev/null | jq -r '.[0].labels[]?' 2>/dev/null
+# fetch_labels <rig> <bead> → labels crus, um por linha, via stdout.
+# Devolve via CÓDIGO DE SAÍDA se bd show teve sucesso (0) ou falhou (1)
+# — stdout fica vazio nos DOIS casos ("confirmado zero labels" vs "não
+# consegui saber"), então quem chama TEM que checar o código de saída,
+# nunca só o conteúdo.
+# ⚠️ (revisor, 2ª rodada adversarial pré-resubmissão): a versão anterior
+# (labels_of) era chamada em SEPARADO por lock_variant, has_protected_variant
+# E strip_lock — três chamadas bd show sem cache, cada uma podendo falhar
+# independente das outras. Reprodução real: has_protected_variant chama
+# falha (transição momentânea, "query latency alta" já documentado como
+# comportamento medido do Dolt nesta cidade) e devolve "não protegido" por
+# falta de dado — mas strip_lock, chamado segundos depois, tem sua PRÓPRIA
+# chamada bem-sucedida e vê o estado REAL (com uma label protegida
+# co-presente) — e remove tudo que vê, sem saber que a checagem de proteção
+# rodou sobre dado incompleto. Buscada UMA vez por bead em main() agora e
+# propagada por parâmetro pras três funções — elimina a corrida por
+# construção, não só trata a falha graciosamente.
+fetch_labels() {
+  local out rc
+  out="$("$BD" -C "$1" show "$2" --json 2>/dev/null)"
+  rc=$?
+  [ "$rc" -eq 0 ] && [ -n "$out" ] || return 1
+  printf '%s\n' "$out" | jq -r '.[0].labels[]?' 2>/dev/null
 }
 
-# lock_variant <rig> <bead> → a variante de trava presente, ou vazio.
+# lock_variant <labels-multilinha> → a variante de trava presente, ou vazio.
 lock_variant() {
-  labels_of "$1" "$2" | grep '^gate:needs-human' | head -1
+  printf '%s\n' "$1" | grep '^gate:needs-human' | head -1
 }
 
 # is_unblockable <variante> → 0 se este script pode mexer.
@@ -193,43 +236,63 @@ is_unblockable() {
   return 1
 }
 
-# has_protected_variant <rig> <bead> → 0 se QUALQUER label presente cai
-# fora de UNBLOCKABLE_VARIANTS (armadilha E). lock_variant() só olha a
-# PRIMEIRA label (head -1); esta função varre TODAS as gate:needs-human*
-# presentes, então detecta uma protegida mesmo co-presente com uma
-# unblockable — o caso que escapava antes e que strip_lock() apagaria.
+# has_protected_variant <labels-multilinha> → 0 se QUALQUER label
+# presente cai fora de UNBLOCKABLE_VARIANTS (armadilha E). lock_variant()
+# só olha a PRIMEIRA label (head -1); esta função varre TODAS as
+# gate:needs-human* presentes NA LISTA JÁ BUSCADA, então detecta uma
+# protegida mesmo co-presente com uma unblockable — o caso que escapava
+# antes e que strip_lock() apagaria.
 has_protected_variant() {
-  local rig="$1" id="$2" v
+  local v
   while IFS= read -r v; do
     [ -n "$v" ] || continue
+    case "$v" in gate:needs-human*) : ;; *) continue ;; esac
     is_unblockable "$v" || return 0
-  done < <(labels_of "$rig" "$id" | grep '^gate:needs-human')
+  done <<< "$1"
   return 1
 }
 
-# strip_lock <rig> <bead> — remove TODAS as variantes presentes, não a
-# que eu supus estar lá (ver acima). Só é chamada depois que main()
-# confirma has_protected_variant=false, então "todas as presentes" já
-# está restrito a variantes unblockable neste ponto.
+# strip_lock <rig> <bead> <labels-multilinha> — remove TODAS as
+# variantes gate:needs-human* PRESENTES NA LISTA JÁ FORNECIDA (mesma
+# leitura que has_protected_variant já validou como segura — não
+# rebusca, ver fetch_labels acima pro motivo). Só é chamada depois que
+# main() confirma has_protected_variant=false sobre esta MESMA lista.
+# ⚠️ (revisor, gate-run ga-oaqy39, blocking issue 1): retorna 0 SÓ se
+# TODA remoção confirmou sucesso (ou DRY_RUN) — antes, `>/dev/null 2>&1`
+# sem checar `$?` fazia uma `bd label remove` falha ficar indistinguível
+# de sucesso pra quem chama. Ver main() pra como isto agora é usado.
 strip_lock() {
-  local rig="$1" id="$2" v
+  local rig="$1" id="$2" labels="$3" v ok=1
   while IFS= read -r v; do
     [ -n "$v" ] || continue
-    [ "$DRY_RUN" = "1" ] || "$BD" -C "$rig" label remove "$id" "$v" >/dev/null 2>&1
-  done < <(labels_of "$rig" "$id" | grep '^gate:needs-human')
+    case "$v" in gate:needs-human*) : ;; *) continue ;; esac
+    if [ "$DRY_RUN" != "1" ]; then
+      "$BD" -C "$rig" label remove "$id" "$v" >/dev/null 2>&1 || ok=0
+    fi
+  done <<< "$labels"
+  [ "$ok" = "1" ]
 }
 
 # note <rig> <bead> <texto> — registra a decisão NO bead. Sem isto, o
 # auto-destrave vira mutação silenciosa e ninguém audita a regra.
+# ⚠️ (revisor, gate-run ga-oaqy39, blocking issue 1): retorna o exit
+# status real de `bd comment` (ou 0 em DRY_RUN) — mesmo motivo do
+# strip_lock acima. Pior sub-caso que isto evita: strip_lock funciona
+# (label removida de verdade) e note falha — sem isto, zero rastro de
+# auditoria e o script ainda afirmava sucesso, exatamente o que este
+# comentário original já dizia que "não pode" acontecer.
 note() {
   [ "$DRY_RUN" = "1" ] && return 0
   "$BD" -C "$1" comment "$2" "$3" >/dev/null 2>&1
 }
 
 # ── as regras ──────────────────────────────────────────────────────────
-# decide <rig> <bead> → imprime "Rn|explicação". Não muta.
+# decide <rig> <bead> <labels-multilinha> → imprime "Rn|explicação". Não
+# muta. <labels-multilinha> é a mesma lista já buscada por main() (ver
+# fetch_labels) — reusada aqui pra contar gate-sha-failed:* sem mais uma
+# chamada bd show.
 decide() {
-  local rig="$1" id="$2" br tip last_fail_epoch verdict
+  local rig="$1" id="$2" labels="$3" br tip last_fail_epoch verdict
 
   br="$(branch_for "$rig" "$id")"
 
@@ -271,8 +334,17 @@ decide() {
   # vez com a flag e reaproveita pro verdict abaixo — antes eram duas
   # chamadas bd show por bead, e --include-comments é documentadamente
   # mais custosa ("may be slow on issues with many comments").
-  local show_json
+  # ⚠️ self-audit final (mesma classe, agora aplicada a esta PRÓPRIA
+  # chamada): captura show_rc — se este bd show falhar, last_fail_epoch
+  # e verdict ficam vazios pelo MESMO motivo de "confirmei vazio", mas
+  # aqui o motivo real é "não consegui checar". Não-destrutivo (R2/R3 já
+  # ficam seguros com last_fail_epoch/verdict vazios, e R5 nunca muta) —
+  # mas a MENSAGEM de R5 não pode dizer "nenhum veredito FAIL encontrado"
+  # (que implica checagem bem-sucedida) quando na verdade a checagem nem
+  # rodou. show_rc alimenta essa distinção na mensagem de R5 abaixo.
+  local show_json show_rc
   show_json="$("$BD" -C "$rig" show "$id" --json --include-comments 2>/dev/null)"
+  show_rc=$?
   last_fail_epoch="$(printf '%s' "$show_json" \
     | jq -r '[.[0].comments[]?|select((.text//"")|test("GATE-FEEDBACK|VERDICT: FAIL"))]|last|.created_at // empty' 2>/dev/null \
     | { read -r d; [ -n "${d:-}" ] || exit 0; date -j -f '%Y-%m-%dT%H:%M:%SZ' "$d" '+%s' 2>/dev/null || date -d "$d" '+%s' 2>/dev/null; })"
@@ -287,8 +359,9 @@ decide() {
 
   # R4 antes de R3: se o mesmo ponto falhou N vezes, o problema é de
   # ESCOPO. Redespachar com instrução (R3) produziria a 5ª rodada.
+  # Conta sobre $labels (já buscado por main()) — não mais bd show novo.
   local fails
-  fails="$(labels_of "$rig" "$id" | grep -c '^gate-sha-failed:')"
+  fails="$(printf '%s\n' "$labels" | grep -c '^gate-sha-failed:')"
   if [ "${fails:-0}" -ge 3 ]; then
     printf 'R4|%s reprovações registradas: escala de ESCOPO — exigir conserto de classe + teste estrutural, não mais um caso' "$fails"
     return 0
@@ -300,7 +373,29 @@ decide() {
   verdict="$(printf '%s' "$show_json" \
     | jq -r '[.[0].comments[]?|select((.text//"")|test("VERDICT: FAIL"))]|last|.text // empty' 2>/dev/null)"
   if printf '%s' "$verdict" | grep -qE '\.(py|sh|go|js|html|json)\b'; then
-    printf 'R3|veredito nomeia arquivo específico: trabalho delimitado, redespachar COM a instrução extraída'
+    # ⚠️ (revisor, gate-run ga-oaqy39, blocking issue 3): $verdict era
+    # extraído e usado SÓ no teste grep -q acima — o texto nunca chegava
+    # ao retorno de decide() nem ao comentário de main(), então
+    # "redespachar COM a instrução do veredito" era uma alegação sem
+    # efeito (comentário promete mais do que o código entrega). Sanitiza
+    # pra UMA linha limitada — sem newline (main()'s `IFS='|' read -r
+    # rule why <<<` só lê a primeira linha, um veredito real e
+    # multi-linha truncaria em silêncio) e sem '|' (é o separador de
+    # campo do protocolo Rn|why deste script) — e propaga de verdade.
+    # ⚠️ (revisor, 2ª rodada adversarial): `cut -c1-200` é POR BYTE sob
+    # LC_ALL=C (confirmado ao vivo neste host — locale desta cidade, e o
+    # plist launchd nem seta LC_ALL/LANG, então herda C por padrão), não
+    # por CARACTERE — um corte no meio de um caractere UTF-8 multi-byte
+    # (ç, ã, é — este texto é majoritariamente PT-BR) produz bytes
+    # inválidos que quebram o `jq` de QUALQUER leitura futura deste bead.
+    # `iconv -f UTF-8 -t UTF-8 -c` descarta silenciosamente a sequência
+    # incompleta ao final em vez de propagá-la — verificado empiricamente
+    # (corte forçado no meio de "çã": sem isto vira erro de decode; com
+    # isto, UTF-8 válido).
+    local verdict_line
+    verdict_line="$(printf '%s' "$verdict" | tr '\n' ' ' | tr '|' '-' | cut -c1-200 \
+      | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null)"
+    printf 'R3|veredito nomeia arquivo específico: trabalho delimitado, redespachar COM a instrução extraída — "%s"' "$verdict_line"
     return 0
   fi
 
@@ -312,7 +407,9 @@ decide() {
   # senão o Mayor lê "houve reprovação, branch não mudou" quando na
   # verdade não há reprovação nenhuma registrada.
   local r2_why
-  if [ -z "${last_fail_epoch:-}" ]; then
+  if [ "$show_rc" -ne 0 ]; then
+    r2_why='bd show --include-comments falhou — não dá pra confirmar se há ou não veredito FAIL, não é seguro presumir nenhum (distinto de armadilha D: aqui a checagem não RODOU)'
+  elif [ -z "${last_fail_epoch:-}" ]; then
     r2_why='nenhum veredito FAIL encontrado nos comentários — o label pode ser espúrio (armadilha D: reprovação de processo, não de qualidade)'
   else
     r2_why='sem commit após a reprovação'
@@ -320,40 +417,99 @@ decide() {
   printf 'R5|R1 não (branch %s tem trabalho único) · R2 não (%s) · R4 não (%s reprovações, abaixo de 3) · R3 não (veredito não nomeia arquivo)' "$br" "$r2_why" "${fails:-0}"
 }
 
+# apply_and_report <rig> <id> <labels> <rule> <why> <sucesso-sufixo> —
+# chamada comum a R1-R4: strip_lock + note. Devolve 0 SÓ se as duas
+# confirmarem sucesso de verdade (revisor, gate-run ga-oaqy39, blocking
+# issue 1) — main() reporta FALHA em vez de contar como "destravada"
+# quando qualquer uma falha, em vez do say/acted++ incondicional de antes.
+# ⚠️ (revisor, 2ª rodada adversarial, achado D): o TEXTO do comentário é
+# escolhido DEPOIS de strip_lock rodar, não antes — a versão anterior
+# montava o texto de sucesso e mandava pro note() incondicionalmente,
+# então mesmo quando o log do script já dizia "FALHA", o COMENTÁRIO
+# PERMANENTE no bead ainda afirmava "labels removidos... nenhum humano
+# precisou olhar". O rastro de auditoria tem que refletir o que
+# REALMENTE aconteceu, não o que a regra pretendia fazer.
+# ⚠️ (self-audit, achando o achado D próprio, ao escrever o teste): a
+# PRIMEIRA correção passava o <sucesso-sufixo> JÁ MONTADO pra dentro da
+# mensagem de FALHA também ("Tentativa era: ..."), pra dar contexto — mas
+# esse sufixo de sucesso ("Nenhum humano precisou olhar") é EXATAMENTE o
+# tipo de frase que um leitor futuro (humano ou automação fazendo
+# substring-match) pode ler fora de contexto e concluir sucesso onde
+# houve falha. Agora <rule>/<why> (a DECISÃO, neutra) são compartilhados
+# entre os dois casos, e o sufixo de OUTCOME ("Nenhum humano precisou
+# olhar", "Re-submeter ao gate", etc.) só entra na mensagem quando o
+# sucesso é REAL — a mensagem de falha nunca contém frase de sucesso.
+apply_and_report() {
+  local rig="$1" id="$2" labels="$3" rule="$4" why="$5" success_suffix="$6"
+  local strip_ok=1 note_ok=1 note_text
+  strip_lock "$rig" "$id" "$labels" || strip_ok=0
+  if [ "$strip_ok" = "1" ]; then
+    note_text="AUTO-DESTRAVE $rule (ga-stu930): $why. $success_suffix"
+  else
+    note_text="AUTO-DESTRAVE $rule FALHOU (ga-stu930): $why — mas bd label remove falhou pra uma ou mais variantes gate:needs-human*; label(s) podem AINDA ESTAR PRESENTES, NÃO trate este bead como destravado."
+  fi
+  note "$rig" "$id" "$note_text" || note_ok=0
+  [ "$strip_ok" = "1" ] && [ "$note_ok" = "1" ]
+}
+
 # ── varredura ──────────────────────────────────────────────────────────
 main() {
-  local rig id variant rule why n=0 acted=0
+  local rig id variant rule why n=0 acted=0 labels
   for rig in "$CITY" "${WA_RIG:-/Users/athos/gt/whatsapp_automation}" "${PS_RIG:-/Users/athos/gt/property_scrapers}"; do
     [ -d "$rig" ] || continue
     while IFS= read -r id; do
       [ -n "$id" ] || continue
       n=$((n+1))
-      variant="$(lock_variant "$rig" "$id")"
-      if has_protected_variant "$rig" "$id"; then
+      # ⚠️ (revisor, 2ª rodada adversarial, achados A/B): labels buscadas
+      # UMA vez aqui e propagadas — não mais uma chamada bd show por
+      # função (lock_variant/has_protected_variant/strip_lock/decide
+      # antes cada uma rebuscava, sem cache, criando uma corrida real
+      # entre validar proteção e agir). Se a busca falhar, NÃO dá pra
+      # confirmar proteção nem trabalho — pula o bead (a próxima
+      # varredura tenta de novo), nunca trata "não consegui saber" como
+      # "confirmei que está tudo bem".
+      labels="$(fetch_labels "$rig" "$id")"
+      if [ $? -ne 0 ]; then
+        say "SKIP $id — bd show falhou ao buscar labels; não é seguro decidir sem confirmar o estado atual (próxima varredura tenta de novo)"
+        continue
+      fi
+      variant="$(lock_variant "$labels")"
+      if has_protected_variant "$labels"; then
         say "SKIP $id — carrega variante protegida (NAO TOCA) entre as labels gate:needs-human* presentes (pode coexistir com uma unblockable, ex. '$variant' — armadilha E); nenhuma label é tocada"
         continue
       fi
-      IFS='|' read -r rule why <<< "$(decide "$rig" "$id")"
+      IFS='|' read -r rule why <<< "$(decide "$rig" "$id" "$labels")"
       case "$rule" in
         R1)
-          strip_lock "$rig" "$id"
-          note "$rig" "$id" "AUTO-DESTRAVE R1 (ga-stu930): trava órfã — $why. Labels de gate removidos; bead volta à fila. Nenhum humano precisou olhar."
-          say "R1 $id — $why"; acted=$((acted+1)) ;;
+          if apply_and_report "$rig" "$id" "$labels" "R1" "trava órfã — $why" "Labels de gate removidos; bead volta à fila. Nenhum humano precisou olhar."; then
+            say "R1 $id — $why"; acted=$((acted+1))
+          else
+            say "FALHA R1 $id — bd label remove ou bd comment falhou (label pode ainda estar presente); verificar manualmente — $why"
+          fi ;;
         R2)
-          strip_lock "$rig" "$id"
-          note "$rig" "$id" "AUTO-DESTRAVE R2 (ga-stu930): $why. Re-submeter ao gate: o veredito anterior é sobre código que já mudou."
-          say "R2 $id — $why"; acted=$((acted+1)) ;;
+          if apply_and_report "$rig" "$id" "$labels" "R2" "$why" "Re-submeter ao gate: o veredito anterior é sobre código que já mudou."; then
+            say "R2 $id — $why"; acted=$((acted+1))
+          else
+            say "FALHA R2 $id — bd label remove ou bd comment falhou (label pode ainda estar presente); verificar manualmente — $why"
+          fi ;;
         R3)
-          strip_lock "$rig" "$id"
-          note "$rig" "$id" "AUTO-DESTRAVE R3 (ga-stu930): $why. Redespachado com a instrução do veredito, não com 'conserte'."
-          say "R3 $id — $why"; acted=$((acted+1)) ;;
+          if apply_and_report "$rig" "$id" "$labels" "R3" "$why" "Redespachado com a instrução do veredito, não com 'conserte'."; then
+            say "R3 $id — $why"; acted=$((acted+1))
+          else
+            say "FALHA R3 $id — bd label remove ou bd comment falhou (label pode ainda estar presente); verificar manualmente — $why"
+          fi ;;
         R4)
-          strip_lock "$rig" "$id"
-          note "$rig" "$id" "AUTO-DESTRAVE R4 (ga-stu930): $why. ⚠️ NÃO faça o 5º conserto pontual — o padrão de repetição É o achado. Exigir teste ESTRUTURAL, que trave a forma do código."
-          say "R4 $id — $why"; acted=$((acted+1)) ;;
+          if apply_and_report "$rig" "$id" "$labels" "R4" "$why" "⚠️ NÃO faça o 5º conserto pontual — o padrão de repetição É o achado. Exigir teste ESTRUTURAL, que trave a forma do código."; then
+            say "R4 $id — $why"; acted=$((acted+1))
+          else
+            say "FALHA R4 $id — bd label remove ou bd comment falhou (label pode ainda estar presente); verificar manualmente — $why"
+          fi ;;
         R5)
-          note "$rig" "$id" "AUTO-DESTRAVE R5 (ga-stu930): nenhuma regra decidiu — $why. Escalando ao Mayor COM o motivo, que é o que a trava antiga não fazia."
-          say "R5 $id — escalado: $why" ;;
+          if note "$rig" "$id" "AUTO-DESTRAVE R5 (ga-stu930): nenhuma regra decidiu — $why. Escalando ao Mayor COM o motivo, que é o que a trava antiga não fazia."; then
+            say "R5 $id — escalado: $why"
+          else
+            say "FALHA R5 $id — bd comment falhou, escalação NÃO registrada no bead; verificar manualmente — $why"
+          fi ;;
         *)
           say "ERRO $id — decide() não devolveu regra (saída: '$rule')" ;;
       esac

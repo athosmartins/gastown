@@ -25,54 +25,104 @@ mk_shims() {
 cat > "$BIN/bd" <<'SH'
 #!/usr/bin/env bash
 FX="${FX_DIR:?}"
-case "$1$2$3" in *) :;; esac
-# bd -C <rig> list --json --limit 0
-if printf '%s ' "$@" | grep -q ' list '; then
-  cat "$FX/list.json" 2>/dev/null || echo '[]'
-  exit 0
-fi
-# bd -C <rig> show <id> --json [--include-comments]
-# ⚠️ FIEL ao bd real (ga-di6t52): --json SEM --include-comments OMITE
-# comments (confirmado ao vivo: sem a flag, .comments ausente do JSON —
-# nem vazio, AUSENTE). A versão anterior deste shim devolvia comments
-# incondicionalmente, então TODO teste passava mesmo quando o script
-# esquecia a flag — o mesmo bug que o revisor achou em produção era
-# estruturalmente invisível aqui. Dois arquivos de fixture: um fiel ao
-# "sem flag" (sem comments) e um ao "com flag" (com comments).
-if printf '%s ' "$@" | grep -q ' show '; then
-  for a in "$@"; do case "$a" in ga-*|wa-*|ps-*) ID="$a";; esac; done
-  if printf '%s ' "$@" | grep -q ' --include-comments '; then
-    cat "$FX/show.$ID.full.json" 2>/dev/null || echo '[]'
-  else
-    cat "$FX/show.$ID.json" 2>/dev/null || echo '[]'
-  fi
-  exit 0
-fi
-# bd label remove <id> <label>  → grava o que foi removido
-if printf '%s ' "$@" | grep -q ' label remove '; then
-  printf '%s %s\n' "${@: -2:1}" "${@: -1}" >> "$FX/removed.log"
-  exit 0
-fi
-# bd comment
-if printf '%s ' "$@" | grep -q ' comment '; then
-  printf '%s\n' "${@: -1}" >> "$FX/comments.log"
-  exit 0
-fi
+# Dispatch por POSIÇÃO ($3 = subcomando, sempre após "-C <rig>"), NUNCA
+# por substring do argv inteiro. ⚠️ Achado ao vivo (2ª rodada
+# adversarial, achado D): o TEXTO de nota/comentário deste script FALA
+# SOBRE comandos bd — ex. "bd label remove falhou" — e um dispatch por
+# `grep -q ' label remove '` casava esse TEXTO (passado como argumento
+# de `bd comment`) com o comando ERRADO (label remove), fazendo a
+# fixture de falha de label-remove disparar por acidente numa chamada
+# de comment que não tinha nada a ver. Dispatch posicional não tem essa
+# ambiguidade: o subcomando é sempre argv[3], nunca texto livre.
+SUBCMD="${3:-}"
+case "$SUBCMD" in
+  list)
+    cat "$FX/list.json" 2>/dev/null || echo '[]'
+    exit 0
+    ;;
+  show)
+    # bd -C <rig> show <id> --json [--include-comments]
+    # ⚠️ FIEL ao bd real (ga-di6t52): --json SEM --include-comments OMITE
+    # comments (confirmado ao vivo: sem a flag, .comments ausente do
+    # JSON — nem vazio, AUSENTE). Dois arquivos de fixture: um fiel ao
+    # "sem flag" (sem comments) e um ao "com flag" (com comments).
+    # show_fail (arquivo-gatilho): simula bd show FALHANDO de verdade
+    # (exit != 0), distinto de "bd show teve sucesso e devolveu bead sem
+    # labels" — testa achados A/B da 2ª rodada adversarial.
+    ID="${4:-}"
+    [ -f "$FX/show_fail.$ID" ] && exit 1
+    HAS_COMMENTS_FLAG=0
+    for a in "$@"; do [ "$a" = "--include-comments" ] && HAS_COMMENTS_FLAG=1; done
+    # show_fail_with_comments (arquivo-gatilho): falha SÓ a variante
+    # --include-comments, deixando a chamada simples (main()'s
+    # fetch_labels) intacta — testa decide()'s própria show_json fetch
+    # falhando isoladamente (self-audit final, mesma classe de A/B).
+    if [ "$HAS_COMMENTS_FLAG" = "1" ] && [ -f "$FX/show_fail_with_comments.$ID" ]; then
+      exit 1
+    fi
+    if [ "$HAS_COMMENTS_FLAG" = "1" ]; then
+      cat "$FX/show.$ID.full.json" 2>/dev/null || echo '[]'
+    else
+      cat "$FX/show.$ID.json" 2>/dev/null || echo '[]'
+    fi
+    exit 0
+    ;;
+  label)
+    # bd -C <rig> label remove <id> <label>  → grava o que foi removido,
+    # ou falha se a fixture pedir (label_remove_fail — blocking issue 1).
+    [ "${4:-}" = "remove" ] || exit 0
+    [ -f "$FX/label_remove_fail" ] && exit 1
+    printf '%s %s\n' "${5:-}" "${6:-}" >> "$FX/removed.log"
+    exit 0
+    ;;
+  comment)
+    # bd -C <rig> comment <id> <texto> → grava, ou falha se a fixture
+    # pedir (comment_fail) — "pior sub-caso" citado pelo revisor.
+    [ -f "$FX/comment_fail" ] && exit 1
+    printf '%s\n' "${@: -1}" >> "$FX/comments.log"
+    exit 0
+    ;;
+esac
 exit 0
 SH
 cat > "$BIN/git" <<'SH'
 #!/usr/bin/env bash
 FX="${FX_DIR:?}"
-if printf '%s ' "$@" | grep -q 'for-each-ref'; then
-  cat "$FX/branches.txt" 2>/dev/null; exit 0
-fi
-if printf '%s ' "$@" | grep -q ' cherry '; then
-  [ -f "$FX/cherry_fail" ] && exit 1
-  cat "$FX/cherry.txt" 2>/dev/null; exit 0
-fi
-if printf '%s ' "$@" | grep -q 'log -1'; then
-  cat "$FX/tip_epoch.txt" 2>/dev/null; exit 0
-fi
+# Mesmo princípio do shim bd acima: dispatch por $3 (subcomando),
+# não por substring do argv inteiro.
+SUBCMD="${3:-}"
+case "$SUBCMD" in
+  for-each-ref)
+    cat "$FX/branches.txt" 2>/dev/null
+    exit 0
+    ;;
+  cherry)
+    # git -C <rig> cherry origin/main <branch> — o ÚLTIMO arg é o
+    # branch. Fixture POR-BRANCH (cherry.<branch-saneado>.txt) tem
+    # prioridade sobre a genérica (cherry.txt) — testa blocking issue 2:
+    # dois branches do MESMO bead precisam responder DIFERENTE.
+    BR="${@: -1}"; SAFE="$(printf '%s' "$BR" | tr '/' '_')"
+    [ -f "$FX/cherry_fail.$SAFE" ] && exit 1
+    [ -f "$FX/cherry_fail" ] && exit 1
+    if [ -f "$FX/cherry.$SAFE.txt" ]; then
+      cat "$FX/cherry.$SAFE.txt"
+    else
+      cat "$FX/cherry.txt" 2>/dev/null
+    fi
+    exit 0
+    ;;
+  log)
+    # git -C <rig> log -1 --format=... <branch> — mesma lógica
+    # por-branch (blocking issue 2).
+    BR="${@: -1}"; SAFE="$(printf '%s' "$BR" | tr '/' '_')"
+    if [ -f "$FX/tip_epoch.$SAFE.txt" ]; then
+      cat "$FX/tip_epoch.$SAFE.txt"
+    else
+      cat "$FX/tip_epoch.txt" 2>/dev/null
+    fi
+    exit 0
+    ;;
+esac
 exit 0
 SH
 chmod +x "$BIN/bd" "$BIN/git"
@@ -141,8 +191,14 @@ setup wa-uknuq '["gate:needs-human","gate-sha-failed:a:code"]' \
   'origin/crew/mila/wa-uknuq-r3' '+ eaf78abb' '1700000000' \
   '[{"created_at":"2026-08-15T10:00:00Z","text":"VERDICT: FAIL tests/test_pregao.py precisa da chave nova"}]'
 OUT="$(run)"
-case "$OUT" in *"R3 wa-uknuq"*) ok "R3: 1 falha + veredito nomeia arquivo → trabalho delimitado (wa-uknuq)";;
-  *) bad "R3: deveria dar R3, não R4 — senão tudo vira 'conserto de classe'" "$OUT";; esac
+# ⚠️ (revisor, gate-run ga-oaqy39, blocking issue 3): não basta disparar
+# R3 — o TEXTO do veredito extraído precisa aparecer de verdade na saída,
+# senão "redespachar COM a instrução do veredito" é só alegação. A versão
+# antiga disparava R3 mas o texto nunca chegava a lugar nenhum.
+case "$OUT" in
+  *"R3 wa-uknuq"*"tests/test_pregao.py precisa da chave nova"*)
+    ok "R3: 1 falha + veredito nomeia arquivo → trabalho delimitado, instrução real propagada (wa-uknuq)";;
+  *) bad "R3: deveria dar R3 E propagar o TEXTO do veredito extraído (não só disparar a regra) — senão 'instrução extraída' é alegação sem efeito" "$OUT";; esac
 
 # ── R5: nada decide → escala COM motivo ────────────────────────────────
 setup ga-xyz '["gate:needs-human"]' 'origin/fix/ga-xyz' '+ abc' '1700000000' \
@@ -163,6 +219,32 @@ OUT="$(run)"
 case "$OUT" in *"R5 wa-lockfail"*"git cherry falhou"*)
     ok "self-audit: git cherry falhando (lock/rig indisponível) escala via R5, não vira R1 (falso órfão)";;
   *) bad "erro de git cherry deveria escalar (R5), não ser lido como 'sem trabalho único' (R1)" "$OUT";; esac
+
+# ── blocking issue 2 (revisor, gate-run ga-oaqy39): branch_for deve
+# escolher o branch mais RECENTE entre múltiplos matches, não o que
+# ordena primeiro alfabeticamente ───────────────────────────────────────
+# for-each-ref devolve crew/*/* e fix/* JUNTOS, ORDENADOS — "crew" < "fix"
+# sempre. Sem este fix, se o MESMO bead tivesse branch nas duas
+# namespaces (uma abandonada, outra real — a branch ativa de um bead
+# pode legitimamente migrar de namespace ao longo da vida dele), a
+# escolha era sempre a crew/*/* por acidente alfabético, nunca a mais
+# recente. Fixture: branch crew ANTIGA sem trabalho único (dispararia R1
+# destrutivo se fosse escolhida) + branch fix mais NOVA com trabalho
+# único de verdade. Só passa se a nova for a escolhida.
+setup wa-multi '["gate:needs-human"]' \
+  "$(printf 'origin/crew/oldcrew/wa-multi\norigin/fix/wa-multi-newer')" '' ''
+echo '-' > "$TMP/fx.wa-multi/cherry.origin_crew_oldcrew_wa-multi.txt"
+echo '1000000000' > "$TMP/fx.wa-multi/tip_epoch.origin_crew_oldcrew_wa-multi.txt"
+echo '+ abcdef01' > "$TMP/fx.wa-multi/cherry.origin_fix_wa-multi-newer.txt"
+echo '1900000000' > "$TMP/fx.wa-multi/tip_epoch.origin_fix_wa-multi-newer.txt"
+OUT="$(run)"
+case "$OUT" in
+  *"R5 wa-multi"*"origin/fix/wa-multi-newer"*)
+    ok "blocking issue 2: escolhe o branch mais RECENTE (fix/wa-multi-newer), não o alfabeticamente primeiro (crew/oldcrew/wa-multi)";;
+  *"R1 wa-multi"*)
+    bad "blocking issue 2: escolheu a branch crew ABANDONADA (alfabeticamente primeira) e disparou R1 — a branch fix REAL com trabalho pendente ficaria sem lock e sem exame" "$OUT";;
+  *) bad "blocking issue 2: resultado inesperado" "$OUT";;
+esac
 
 # ── armadilha D: label "failed" sem veredito FAIL (ga-xt8zrf) ──────────
 # O marker dizia "failed", o revisor tinha dado PASS — quem falhou foi
@@ -244,6 +326,128 @@ if grep -q 'AUTO-DESTRAVE R1' "$TMP/fx.ga-note/comments.log" 2>/dev/null; then
   ok "grava no bead qual regra decidiu e por quê (sem isso é mutação silenciosa)"
 else
   bad "não registrou a decisão no bead" "$(cat "$TMP/fx.ga-note/comments.log" 2>/dev/null)"
+fi
+
+# ── blocking issue 1 (revisor, gate-run ga-oaqy39): bd label remove
+# falhando NÃO pode ser reportado como sucesso ──────────────────────────
+# Antes, `strip_lock`/`note` engoliam `>/dev/null 2>&1` sem checar $?, e
+# main() fazia say+acted++ incondicional logo depois — uma falha real
+# ficava indistinguível de sucesso no log e na linha-resumo.
+setup ga-labelfail '["gate:needs-human"]' '' '' ''
+touch "$TMP/fx.ga-labelfail/label_remove_fail"
+OUT="$(run)"
+if printf '%s' "$OUT" | grep -q "FALHA R1 ga-labelfail" \
+   && printf '%s' "$OUT" | grep -q "0 destravadas sem humano"; then
+  ok "blocking issue 1: bd label remove falhando → reportado como FALHA, não contado como destravada"
+else
+  bad "blocking issue 1: label remove falhando deveria reportar FALHA e não incrementar 'destravadas'" "$OUT"
+fi
+
+# ── blocking issue 1, pior sub-caso citado pelo revisor: strip_lock
+# FUNCIONA (label removida de verdade) e note FALHA (zero rastro) ──────
+setup ga-notefail '["gate:needs-human"]' '' '' ''
+touch "$TMP/fx.ga-notefail/comment_fail"
+OUT="$(run)"
+if printf '%s' "$OUT" | grep -q "FALHA R1 ga-notefail" \
+   && [ -s "$TMP/fx.ga-notefail/removed.log" ] \
+   && printf '%s' "$OUT" | grep -q "0 destravadas sem humano"; then
+  ok "blocking issue 1 (pior sub-caso): label REALMENTE removida + comentário falho → ainda reportado como FALHA, não como sucesso silencioso"
+else
+  bad "blocking issue 1: quando note falha após strip_lock ter sucesso, o script não pode alegar sucesso (mutação real sem rastro de auditoria)" \
+    "OUT=$OUT REMOVED=$(cat "$TMP/fx.ga-notefail/removed.log" 2>/dev/null)"
+fi
+
+# ── achado D (2ª rodada adversarial): quando strip_lock FALHA, o
+# COMENTÁRIO PERMANENTE no bead precisa dizer FALHA — não só o stdout do
+# script. Reprodução do revisor: script dizia "FALHA" no log, mas o
+# comentário gravado NO BEAD ainda afirmava "Labels de gate removidos...
+# Nenhum humano precisou olhar" — o rastro de auditoria (o que sobrevive
+# de verdade, o que um humano investigando o bead realmente lê) mentia.
+setup ga-labelfail-note '["gate:needs-human"]' '' '' ''
+touch "$TMP/fx.ga-labelfail-note/label_remove_fail"
+run >/dev/null 2>&1
+# ⚠️ auto-descoberto ao escrever este teste (não citado pelo revisor):
+# uma PRIMEIRA versão do fix embutia o texto de SUCESSO inteiro dentro da
+# mensagem de falha, como contexto ("Tentativa era: ..."). Isso incluía
+# "Nenhum humano precisou olhar" — a MESMA frase que este teste checa a
+# AUSÊNCIA — dentro de uma mensagem que É uma falha. Corrigido pra
+# construir a mensagem de falha SEM nenhuma frase de outcome de sucesso.
+if grep -q 'AUTO-DESTRAVE R1 FALHOU' "$TMP/fx.ga-labelfail-note/comments.log" 2>/dev/null \
+   && ! grep -q 'Nenhum humano precisou olhar' "$TMP/fx.ga-labelfail-note/comments.log" 2>/dev/null; then
+  ok "achado D: comentário PERMANENTE no bead diz FALHOU quando strip_lock falha, sem nenhuma frase de sucesso misturada"
+else
+  bad "achado D: o comentário gravado no bead precisa refletir a falha real, sem reusar frase de outcome de sucesso" \
+    "$(cat "$TMP/fx.ga-labelfail-note/comments.log" 2>/dev/null)"
+fi
+
+# ── achados A/B (2ª rodada adversarial): bd show FALHANDO (não "bead
+# sem labels", de verdade FALHANDO) não pode ser lido como "confirmei
+# zero labels" em NENHUM consumidor — nem proteção, nem contagem de
+# reprovações, nem remoção. Antes, labels_of() era rebuscado
+# separadamente por lock_variant/has_protected_variant/strip_lock, sem
+# cache, e uma falha intermitente entre essas chamadas podia fazer
+# has_protected_variant aprovar um bead que strip_lock (numa chamada
+# BEM-SUCEDIDA logo depois) via como tendo uma label protegida — e
+# removia mesmo assim. Agora main() busca UMA vez via fetch_labels() e
+# propaga; se a busca falhar, o bead inteiro é pulado, nunca tratado
+# como "sem labels" ou "sem proteção". Fixture: bead com label PROTEGIDA
+# (:refused) e bd show configurado pra FALHAR sempre.
+setup ga-showfail '["gate:needs-human","gate:needs-human:refused"]' '' '' ''
+touch "$TMP/fx.ga-showfail/show_fail.ga-showfail"
+OUT="$(run)"
+if printf '%s' "$OUT" | grep -q "SKIP ga-showfail.*bd show falhou" \
+   && [ ! -s "$TMP/fx.ga-showfail/removed.log" ]; then
+  ok "achados A/B: bd show falhando → bead inteiro pulado, label protegida NUNCA removida (elimina a corrida de rebusca separada)"
+else
+  bad "achados A/B: bd show falhando deveria pular o bead sem tocar nenhuma label, nunca tratar 'não consegui saber' como 'confirmei seguro'" \
+    "OUT=$OUT REMOVED=$(cat "$TMP/fx.ga-showfail/removed.log" 2>/dev/null)"
+fi
+
+# ── self-audit final (mesma classe de A/B, achada por mim ao reler o
+# arquivo inteiro antes de resubmeter, não pelo revisor): decide()'s
+# PRÓPRIA busca de show_json (--include-comments, pra last_fail_epoch e
+# verdict) não checava seu próprio código de saída — se falhasse, R5
+# dizia "nenhum veredito FAIL encontrado" (que implica checagem
+# bem-sucedida) quando na verdade a checagem nem rodou. Não-destrutivo
+# (R5 nunca muta labels), mas é a mesma classe "não sei" virando "sei que
+# não" que o revisor já cobrou 3x. Fixture: fetch_labels (chamada SEM
+# --include-comments) funciona normal, mas a chamada COM
+# --include-comments falha.
+setup ga-showjsonfail '["gate:needs-human"]' 'origin/fix/ga-showjsonfail' '+ abc999' '1700000000'
+touch "$TMP/fx.ga-showjsonfail/show_fail_with_comments.ga-showjsonfail"
+OUT="$(run)"
+if printf '%s' "$OUT" | grep -q "R5 ga-showjsonfail" \
+   && printf '%s' "$OUT" | grep -q "não consegui checar\|checagem não RODOU\|não RODOU"; then
+  ok "self-audit final: decide()'s show_json falhando → R5 diz 'não consegui checar', não finge que checou e não achou nada"
+else
+  bad "self-audit final: quando a própria busca de comments falha, a mensagem de R5 não pode alegar que checou e não achou veredito FAIL" "$OUT"
+fi
+
+# ── achado C (2ª rodada adversarial): cut -c é POR BYTE sob LC_ALL=C
+# (confirmado ao vivo neste host) — corte no meio de um caractere UTF-8
+# multi-byte (ç, ã, é) produz bytes inválidos que quebram QUALQUER
+# leitura futura do bead via jq. Fixture: veredito longo o bastante pra
+# cair EXATAMENTE no limite de 200 no meio de "çã".
+# ⚠️ bash 3.2 (stock macOS) tem uma armadilha DESTE PRÓPRIO harness (não
+# do script sob teste): passar um "$(...)" com chaves {..,..} DIRETO como
+# argumento de comando (não numa atribuição VAR=) faz bash 3.2 aplicar
+# BRACE EXPANSION mesmo dentro de aspas duplas aninhadas, partindo o JSON
+# em DOIS comandos python3 separados. Atribuir a uma var PRIMEIRO evita.
+LONG_VERDICT="VERDICT: FAIL tests/x.py $(python3 -c "print('a'*175)")çãXXXXXXXXXX"
+UTF8_COMMENTS_JSON="$(python3 -c "import json,sys; print(json.dumps([{'created_at':'2026-08-15T10:00:00Z','text':sys.argv[1]}]))" "$LONG_VERDICT")"
+setup ga-utf8 '["gate:needs-human"]' 'origin/fix/ga-utf8' '+ abc123' '1700000000' "$UTF8_COMMENTS_JSON"
+OUT="$(LC_ALL=C run)"
+if printf '%s' "$OUT" | python3 -c "
+import sys
+try:
+    sys.stdin.buffer.read().decode('utf-8')
+    print('VALID')
+except UnicodeDecodeError:
+    print('INVALID')
+" | grep -q VALID; then
+  ok "achado C: verdict_line truncado permanece UTF-8 válido mesmo cortando no meio de um caractere multi-byte"
+else
+  bad "achado C: cut -c1-200 sob LC_ALL=C corrompeu UTF-8 (corte no meio de ç/ã) — precisa de iconv -c" "$OUT"
 fi
 
 # ── kill switch ────────────────────────────────────────────────────────
