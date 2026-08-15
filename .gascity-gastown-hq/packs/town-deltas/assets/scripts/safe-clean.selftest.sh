@@ -177,5 +177,20 @@ else
 fi
 rm -rf "/private/tmp/claude-selftest11-$$" 2>/dev/null
 
+# ── 12. a partial removal failure is reported, never silently reported as
+# ── success (the exact swallow that ignore_errors=True would produce) ──────
+PARTIAL="/private/tmp/claude-selftest12-$$/locked-dir"
+mkdir -p "$PARTIAL"
+echo x > "$PARTIAL/stuck-file"
+chmod 555 "$PARTIAL"
+OUT=$(run "/private/tmp/claude-selftest12-$$" 2>&1); RC=$?
+chmod 755 "$PARTIAL"
+if [ "$RC" -eq 3 ] && [ -e "$PARTIAL/stuck-file" ]; then
+  ok "partial removal failure is reported (exit 3), not silently swallowed as success"
+else
+  bad "a removal that partially fails must not report exit 0 (rc=$RC): $OUT"
+fi
+rm -rf "/private/tmp/claude-selftest12-$$" 2>/dev/null
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

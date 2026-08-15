@@ -182,13 +182,26 @@ def main(argv):
 
     import shutil
 
+    failures = []
     for raw, verdict, resolved, reason in verdicts:
         if os.path.islink(raw) or os.path.exists(raw):
-            if os.path.isdir(raw) and not os.path.islink(raw):
-                shutil.rmtree(raw, ignore_errors=True)
-            else:
-                os.remove(raw)
+            try:
+                if os.path.isdir(raw) and not os.path.islink(raw):
+                    shutil.rmtree(raw)
+                else:
+                    os.remove(raw)
+            except OSError as e:
+                # A partial failure here must not look like success: swallowing
+                # it (e.g. rmtree(ignore_errors=True)) would report exit 0 for
+                # a target that's still partly on disk, indistinguishable from
+                # one that was fully removed.
+                failures.append((raw, str(e)))
         # Already absent: idempotent no-op, not an error.
+
+    if failures:
+        for raw, err in failures:
+            print(f"safe-clean: failed to remove {raw}: {err}", file=sys.stderr)
+        return 3
 
     return 0
 
