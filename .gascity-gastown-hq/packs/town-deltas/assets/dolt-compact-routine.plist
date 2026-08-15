@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.dolt-compact-routine</string>
+
+  <!-- ga-6uz7yn (Athos's decision, 14/08: a routine, not a bigger disk).
+       Daily CHECK, not daily compaction — the wrapped `gc dolt compact`
+       already decides per-db whether anything is actually due (commit
+       threshold ~2000, crossed roughly every 2 weeks per db); most days
+       this fires, checks, and finds nothing to do (silent — see the
+       script's own header). 04:30 = 30min after com.gascity.dolt-s3-backup's
+       04:00 StartCalendarInterval, so a fresh backup is virtually always
+       already on disk by the time the backup-freshness precondition checks
+       for it, AND this is empirically the city's quiet window (ga-1dx2v:
+       "foi quando load caiu pra 6 e a fila do gate zerou"), which is what
+       the city-quiet precondition needs to actually pass most days instead
+       of refusing. See scripts/dolt-compact-routine.sh for the full 4
+       preconditions + mandatory post-verification this wrapper adds on top
+       of the existing (already-safe, already-conditional) compact command. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/dolt-compact-routine.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>4</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/dolt-compact-routine-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/dolt-compact-routine-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+  </dict>
+</dict>
+</plist>
