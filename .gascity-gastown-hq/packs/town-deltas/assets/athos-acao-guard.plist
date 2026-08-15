@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.athos-acao-guard</string>
+
+  <!-- athos.acao coverage guard (ga-ypwdug). Poll loop (~15min).
+       Detects beads that qualify for Athos's 👤 Sua vez queue in the panel
+       (blocked-reason:decision/:feasibility, exec:manual with no assignee,
+       next-action:athos*, story:needs-approval, refino:policy-gap) but carry
+       no athos.acao metadata — the field the panel needs to render "O QUE
+       VOCÊ FAZ" instead of "⚠️ ninguém escreveu o que você precisa fazer".
+       Never guesses/writes athos.acao itself (deliberate — see script
+       docstring); only applies/clears the durable athos-acao:missing marker
+       label so the gap is visible and self-clears once filled.
+       Silence = healthy. Emits only on a state change:
+         [ATHOS-ACAO-GUARD] [FLAGGED]  <rig>/<id> newly missing athos.acao
+         [ATHOS-ACAO-GUARD] [RESOLVED] <rig>/<id> athos.acao now set
+       Each FLAGGED line is also sent via notify CLI (priority 3). -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/athos-acao-guard.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/athos-acao-guard-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/athos-acao-guard-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>BD_ACTOR</key>
+    <string>automation</string>
+  </dict>
+</dict>
+</plist>
