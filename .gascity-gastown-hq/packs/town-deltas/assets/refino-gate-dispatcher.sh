@@ -307,7 +307,7 @@ _refino_gate_relabel() {
 _refino_gate_find_pending_verdict() {
   local story_id="$1"
   bd_ query --json "ephemeral=true AND status=open AND label=type:refino-gate-verdict AND label=refino-story:$story_id AND label=verdict:pending" --limit 0 2>/dev/null \
-    | jq -r 'sort_by(.created_at // "") | .[0].id // empty' 2>/dev/null
+    | jq -r 'sort_by(.created_at // "") | .[0].id // empty' 2>/dev/null || echo ""
 }
 
 # ── ga-g0af2: a mensagem de bounce, quando NAO ha notas legiveis ──────────────

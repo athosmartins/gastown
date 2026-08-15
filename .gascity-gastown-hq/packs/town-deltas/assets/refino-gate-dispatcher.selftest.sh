@@ -644,6 +644,58 @@ else
   bad "REGRESSION (ga-2llva3): reuse path no longer explains itself on the reused bead"
 fi
 
+# ── Regression guard (gate-run ga-indr6o FAIL): unguarded bd_ query pipeline
+# inside _refino_gate_find_pending_verdict, under the dispatcher's own
+# set -euo pipefail (active here too — sourcing doesn't sandbox it, see the
+# comment above the OLD/NEW sweep fixture), silently kills the sweep on a
+# transient Dolt failure — BEFORE refino_verdict_bead_action's documented
+# "ambiguous → create" fail-safe ever runs, and before Step 4's existing
+# graceful-failure cleanup (label release + exit 1) a few lines below. Proven
+# with a hand-authored pre-fix shape (the real function is already fixed, so
+# the broken shape has to be reconstructed — same reasoning as the OLD sweep
+# function above) to confirm the fixture is faithful, then against the REAL
+# shipped function to confirm it survives the identical failure. Uses a
+# BEFORE/AFTER stdout marker rather than just the subshell's exit code,
+# because a bare exit code can't distinguish "died mid-pipeline" from
+# "finished normally but happened to return non-zero."
+echo "Regression: _refino_gate_find_pending_verdict survives a failing bd_ query (gate-run ga-indr6o)"
+
+OLD_PROBE_OUTPUT=$(
+  set -euo pipefail
+  bd_() { return 1; }  # simulate Dolt down / query timeout / connection refused
+  _predates_fix_probe() {
+    local story_id="$1"
+    bd_ query --json "whatever" --limit 0 2>/dev/null \
+      | jq -r 'sort_by(.created_at // "") | .[0].id // empty' 2>/dev/null
+  }
+  echo "BEFORE"
+  _predates_fix_probe "fixture-story" >/dev/null 2>&1
+  echo "AFTER"
+) 2>/dev/null || true
+
+if printf '%s' "$OLD_PROBE_OUTPUT" | grep -q "AFTER"; then
+  bad "characterization: expected the pre-fix shape to die under set -euo pipefail before printing AFTER — it didn't (fixture not faithful to gate-run ga-indr6o); output=[$OLD_PROBE_OUTPUT]"
+elif printf '%s' "$OLD_PROBE_OUTPUT" | grep -q "BEFORE"; then
+  ok "characterization: pre-fix shape (no fallback) dies under set -euo pipefail when bd_ query fails, stopping before AFTER (gate-run ga-indr6o, reproduced)"
+else
+  bad "characterization: probe didn't even reach BEFORE — harness is broken, not the fixture; output=[$OLD_PROBE_OUTPUT]"
+fi
+
+NEW_PROBE_OUTPUT=$(
+  set -euo pipefail
+  bd_() { return 1; }  # identical simulated failure, against the REAL function
+  echo "BEFORE"
+  _refino_gate_find_pending_verdict "fixture-story" >/dev/null 2>&1
+  echo "AFTER"
+) 2>/dev/null || true
+
+if printf '%s' "$NEW_PROBE_OUTPUT" | grep -q "AFTER"; then
+  ok "fix: the REAL _refino_gate_find_pending_verdict survives a failing bd_ query — falls through to the documented fail-safe instead of killing the sweep (gate-run ga-indr6o)"
+else
+  bad "REGRESSION (gate-run ga-indr6o): _refino_gate_find_pending_verdict still dies under set -euo pipefail when bd_ query fails — the || echo fallback is missing or was reverted; output=[$NEW_PROBE_OUTPUT]"
+fi
+unset -f bd_ _predates_fix_probe 2>/dev/null || true
+
 echo ""
 echo "refino-gate-dispatcher.selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
