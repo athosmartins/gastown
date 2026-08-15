@@ -69,6 +69,87 @@ install_plist() {
     launchctl kickstart "gui/$uid/$label" >/dev/null 2>&1 || true
 }
 
+# _plist_label <plist-path> — extract <key>Label</key>'s <string> value.
+# Same awk logic as daemon-presence-watchdog.sh's _plist_label (ga-u04vp) —
+# duplicated here rather than sourced, since that file is a standalone
+# daemon with its own side-effecting main loop, not a library. Handles both
+# the compact same-line style and the expanded multi-line style a
+# canonicalized (plutil/launchctl-rewritten) plist uses.
+_plist_label() {
+    awk '
+        /<key>Label<\/key>/ { want=1 }
+        want && /<string>/ {
+            line=$0
+            sub(/.*<string>/, "", line); sub(/<\/string>.*/, "", line)
+            if (line != "") { print line; exit }
+        }
+    ' "$1" 2>/dev/null
+}
+
+# _is_loaded <label> — true if launchd currently has this label registered.
+# Broken out as its own function (not inlined) so a test can override it
+# after sourcing with SKILL_INTEGRITY_LIB_ONLY=1, without needing real
+# launchd or root state.
+_is_loaded() { launchctl list "$1" >/dev/null 2>&1; }
+
+# scan_and_install_new_plists <dir> — for every *.plist directly under <dir>
+# (non-recursive, matching daemon-presence-watchdog.sh's own scan scope)
+# whose Label starts with com.gascity. and is NOT currently loaded, install
+# it via install_plist() above (ga-7ryjey, discovered-from ga-stu930).
+#
+# Without this, a brand-new plist merged into packs/town-deltas/assets/ sits
+# inert until someone remembers to hand-wire an install_plist call here —
+# measured 4x in this city already (owner-recheck, fila de re-checagem,
+# guard do athos.acao, gate-auto-unblock).
+#
+# ⚠️ Deliberately asymmetric: an ALREADY-loaded label is never touched by
+# this loop, even if its content changed — the two hand-wired calls below
+# already cover "keep this specific daemon's code fresh on every deploy";
+# this loop only covers "this daemon has never run at all yet". Reloading
+# every com.gascity.* daemon on every gascity story-merge (this runs as
+# part of deploy_cmd, which fires per merged story, not on a fixed timer)
+# would restart daemons unrelated to whatever actually changed — including
+# mid-run interruption of a daemon that happens to be executing at that
+# moment. The accepted tradeoff: a daemon a human deliberately paused
+# (`launchctl bootout`, not decommissioned) looks identical to "never
+# installed" to this loop and would get silently reinstalled on the next
+# gascity deploy — same ambiguity daemon-presence-watchdog.sh's alerting
+# already has, just with an action attached instead of just a mail.
+scan_and_install_new_plists() {
+    local dir="$1" f label
+    for f in "$dir"/*.plist; do
+        [[ -f "$f" ]] || continue
+        label="$(_plist_label "$f")"
+        case "$label" in
+            com.gascity.*) ;;
+            *) continue ;;
+        esac
+        if _is_loaded "$label"; then
+            continue
+        fi
+        say "NEW PLIST detected (label not loaded, never installed): $label ($f) -- installing"
+        install_plist "$f" "$label"
+        # ga-7ryjey acceptance criterion b): verify via a FRESH launchctl
+        # query after install, don't infer success from install_plist's own
+        # "bootstrap OK" message (which only reflects the bootstrap COMMAND's
+        # exit code, not that the label is actually registered afterward —
+        # ga-stu930's whole saga was about exactly this gap: don't trust an
+        # action's own report, check the artifact).
+        if _is_loaded "$label"; then
+            say "VERIFIED: $label now loaded (confirmed via launchctl, not inferred)."
+        else
+            say "WARNING: installed $label but launchctl still does not show it loaded — verify manually."
+        fi
+    done
+}
+
+# Test seam (mirrors story-delivery.sh's STORY_DELIVERY_LIB_ONLY): source
+# this file with SKILL_INTEGRITY_LIB_ONLY=1 to get install_plist/_plist_label/
+# _is_loaded/scan_and_install_new_plists as pure, callable functions with
+# ZERO side effects — skips baseline-adopt, the two hardcoded installs, and
+# the verify step below.
+[ "${SKILL_INTEGRITY_LIB_ONLY:-0}" = "1" ] && return 0
+
 # ── 1. Baseline adopt ─────────────────────────────────────────────────────────
 say "Adopting current canonical as baseline for unmanaged skills..."
 mkdir -p "$(dirname "$MANIFEST")"
@@ -140,6 +221,11 @@ install_plist "$PLIST_SRC" "$LABEL"
 # bootstrap (run by the gascity deploy_cmd) installs + loads it; story-delivery's
 # daemon_restarts then kickstarts it after every deploy.
 install_plist "$CITY/packs/town-deltas/assets/crew-hang-detector.plist" "com.gascity.crew-hang-detector"
+# Any OTHER *.plist under packs/town-deltas/assets/ that has never been
+# loaded gets installed automatically here (ga-7ryjey) — see
+# scan_and_install_new_plists() above for the "never touch an
+# already-loaded plist" safety property and its documented tradeoff.
+scan_and_install_new_plists "$CITY/packs/town-deltas/assets"
 
 # ── 3. Verify ─────────────────────────────────────────────────────────────────
 say "Running auditor to verify..."
