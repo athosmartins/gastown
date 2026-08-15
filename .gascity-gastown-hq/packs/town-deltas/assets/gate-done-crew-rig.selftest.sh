@@ -1215,6 +1215,167 @@ else
   bad "(U) gate-done.md not found at $GATE_DONE"
 fi
 
+# ── (V) gate-feedback ga-3xuanq attempt 1: the exact-identity upgrade's
+#    identity probe (bd show --json | jq .id) must FAIL CLOSED when the
+#    probe itself is inconclusive (bd RPC failure, garbled JSON, or a
+#    response missing .id) — not silently keep the UNVERIFIED candidate.
+#
+# Root bug (reviewer finding on marker ga-qqnftg / gate-run ga-5geigo,
+# 15/08): the original one-line pipeline
+#   _RESOLVED_FULL_ID=$(bd ... --json | jq -r '...' || echo "")
+# cannot tell "resolved and already correct" apart from "the bd/jq call
+# itself failed" — both collapse into the same downstream behavior (BEAD_ID
+# left unchanged), so a transient Dolt hiccup during the SECOND probe
+# silently shipped the truncated, unverified candidate — reproducing the
+# very ga-3xuanq/ga-tyi7k3 bug this diff exists to fix. The fix captures
+# bd's own exit status and raw stdout BEFORE ever handing input to jq, so a
+# failed probe is its own state and gets the same discard-and-fallback
+# treatment the sibling existence check above already applies.
+
+# resolve_identity_probe <mode> <bead> <resolved> <branch_seg> — replica of
+# the FIXED gate-done.md identity-upgrade block. <mode> simulates the second
+# bd probe's outcome:
+#   ok_same     — probe succeeds, resolved id equals the candidate (no-op)
+#   ok_diff     — probe succeeds, resolved id differs, branch text confirms it
+#   ok_mismatch — probe succeeds, resolved id differs, branch text does NOT
+#                 confirm it (coincidental unrelated prefix — existing
+#                 accepted fuzzy behavior, must stay a no-op)
+#   fail_hard   — bd itself exits nonzero (transient RPC failure)
+#   fail_garbled— bd exits 0 but prints unparseable/truncated JSON
+#   fail_no_id  — bd exits 0 with valid JSON that has no .id field
+resolve_identity_probe() {
+  local mode="$1" bead="$2" resolved="$3" branch_seg="$4"
+  local rc=0 json="" full="" known=""
+  case "$mode" in
+    ok_same)      rc=0; json="{\"id\":\"$bead\"}" ;;
+    ok_diff)      rc=0; json="{\"id\":\"$resolved\"}" ;;
+    ok_mismatch)  rc=0; json="{\"id\":\"$resolved\"}" ;;
+    fail_hard)    rc=1; json="" ;;
+    fail_garbled) rc=0; json='{"id": "wa-c' ;;
+    fail_no_id)   rc=0; json='{}' ;;
+  esac
+  if [ "$rc" -eq 0 ] && [ -n "$json" ]; then
+    full=$(printf '%s' "$json" | jq -r 'if type=="array" then .[0] else . end | .id // empty' 2>/dev/null)
+    [ $? -eq 0 ] && [ -n "$full" ] && known=1
+  fi
+  if [ -n "$known" ]; then
+    if [ "$full" != "$bead" ]; then
+      case "$branch_seg" in
+        "$full"|"$full"-*) bead="$full" ;;
+      esac
+    fi
+  else
+    bead=""
+  fi
+  printf '%s' "$bead"
+}
+
+# resolve_identity_probe_prebug <mode> <bead> <resolved> <branch_seg> —
+# replica of the ORIGINAL (pre-fix) block: a single collapsed pipeline with
+# `|| echo ""` as the only failure handling, which cannot distinguish
+# "resolved and equal" from "probe failed" — both produce the effective
+# no-upgrade outcome, so on failure the UNVERIFIED candidate survives.
+resolve_identity_probe_prebug() {
+  local mode="$1" bead="$2" resolved="$3" branch_seg="$4"
+  local json="" full=""
+  case "$mode" in
+    ok_same)      json="{\"id\":\"$bead\"}" ;;
+    ok_diff)      json="{\"id\":\"$resolved\"}" ;;
+    ok_mismatch)  json="{\"id\":\"$resolved\"}" ;;
+    fail_hard)    json="" ;;
+    fail_garbled) json='{"id": "wa-c' ;;
+    fail_no_id)   json='{}' ;;
+  esac
+  full=$(printf '%s' "$json" | jq -r 'if type=="array" then .[0] else . end | .id // empty' 2>/dev/null || echo "")
+  if [ -n "$full" ] && [ "$full" != "$bead" ]; then
+    case "$branch_seg" in
+      "$full"|"$full"-*) bead="$full" ;;
+    esac
+  fi
+  printf '%s' "$bead"
+}
+
+# (V1) already correct — no upgrade needed, unchanged.
+B=$(resolve_identity_probe ok_same "wa-27jn" "wa-27jn" "wa-27jn-desc")
+[ "$B" = "wa-27jn" ] \
+  && ok "(V1) probe confirms already-correct id, no upgrade (got: $B)" \
+  || bad "(V1) expected wa-27jn unchanged, got: $B"
+
+# (V2) primary repro: probe succeeds, confirms the longer id, branch text
+# backs it up -> upgrade.
+B=$(resolve_identity_probe ok_diff "wa-campanha" "wa-campanha-diaria" "wa-campanha-diaria")
+[ "$B" = "wa-campanha-diaria" ] \
+  && ok "(V2) probe confirms truncated->full upgrade (got: $B)" \
+  || bad "(V2) expected wa-campanha-diaria, got: $B"
+
+# (V3) control: coincidental unrelated-prefix hit — branch text does not
+# back up the resolved id, so the short candidate survives unchanged (same
+# fuzzy edge case that predates this fix, not a regression to close here).
+B=$(resolve_identity_probe ok_mismatch "wa-campanha" "wa-campanha-outro" "wa-campanha-diaria")
+[ "$B" = "wa-campanha" ] \
+  && ok "(V3) control: coincidental prefix hit stays unchanged (got: $B)" \
+  || bad "(V3) control regression: expected wa-campanha, got: $B"
+
+# (V4) blocking issue repro: bd itself fails (transient RPC hiccup) -> MUST
+# fail closed (discard), never silently trust the unverified candidate.
+B=$(resolve_identity_probe fail_hard "wa-campanha" "wa-campanha-diaria" "wa-campanha-diaria")
+[ -z "$B" ] \
+  && ok "(V4) bd RPC failure discards the unverified candidate (got: '$B')" \
+  || bad "(V4) expected discard (empty), got: '$B' — unverified truncated id survived a failed probe"
+
+# (V5) same class: bd exits 0 but the JSON is garbled/truncated.
+B=$(resolve_identity_probe fail_garbled "wa-campanha" "wa-campanha-diaria" "wa-campanha-diaria")
+[ -z "$B" ] \
+  && ok "(V5) garbled JSON response discards the unverified candidate (got: '$B')" \
+  || bad "(V5) expected discard (empty), got: '$B'"
+
+# (V6) same class: bd exits 0 with valid JSON but no .id field.
+B=$(resolve_identity_probe fail_no_id "wa-campanha" "wa-campanha-diaria" "wa-campanha-diaria")
+[ -z "$B" ] \
+  && ok "(V6) response with no .id field discards the unverified candidate (got: '$B')" \
+  || bad "(V6) expected discard (empty), got: '$B'"
+
+# (V7) mutation guard: the ORIGINAL (pre-fix) replica, given the EXACT (V4)
+# repro, silently ships the truncated 'wa-campanha' instead of discarding —
+# proves (V4) would have caught the actual reviewed regression, not just
+# happened to pass either way.
+B=$(resolve_identity_probe_prebug fail_hard "wa-campanha" "wa-campanha-diaria" "wa-campanha-diaria")
+[ "$B" = "wa-campanha" ] \
+  && ok "(V7) mutation check: pre-fix replica ships unverified 'wa-campanha' on a failed probe" \
+  || bad "(V7) mutation check: pre-fix replica unexpectedly produced '$B' — (V4) would not catch a reversion"
+
+# (V8) mutation guard for the garbled-JSON failure mode.
+B=$(resolve_identity_probe_prebug fail_garbled "wa-campanha" "wa-campanha-diaria" "wa-campanha-diaria")
+[ "$B" = "wa-campanha" ] \
+  && ok "(V8) mutation check: pre-fix replica ships unverified 'wa-campanha' on garbled JSON" \
+  || bad "(V8) mutation check: pre-fix replica unexpectedly produced '$B'"
+
+# ── (W) gate-feedback ga-3xuanq attempt 1 source drift-guard: deployed
+#    gate-done.md carries the two-step capture (bd's exit status checked
+#    BEFORE jq ever runs) instead of the collapsed one-line pipeline. Does
+#    NOT grep for the removed `|| echo ""` idiom itself — that construct is
+#    used legitimately elsewhere in the file for unrelated probes, so its
+#    mere presence/absence is not a reliable signal; only markers unique to
+#    THIS fix are checked.
+if [ -f "$GATE_DONE" ]; then
+  src=$(cat "$GATE_DONE")
+  printf '%s' "$src" | grep -qF '_BEAD_ID_JSON_RC' \
+    && ok "(W1) gate-done.md captures bd's own exit status separately from jq's parse" \
+    || bad "(W1) gate-done.md missing _BEAD_ID_JSON_RC (gate-feedback ga-3xuanq attempt 1 regression)"
+  printf '%s' "$src" | grep -qF '_RESOLVED_FULL_ID_KNOWN' \
+    && ok "(W2) gate-done.md tracks whether the identity probe positively resolved" \
+    || bad "(W2) gate-done.md missing _RESOLVED_FULL_ID_KNOWN (gate-feedback ga-3xuanq attempt 1 regression)"
+  known_line=$(printf '%s\n' "$src" | grep -nF '_RESOLVED_FULL_ID_KNOWN=1' | head -1 | cut -d: -f1)
+  discard_line=$(printf '%s\n' "$src" | grep -nF 'identity probe failed' | head -1 | cut -d: -f1)
+  if [ -n "$known_line" ] && [ -n "$discard_line" ] && [ "$known_line" -lt "$discard_line" ]; then
+    ok "(W3) gate-done.md's fail-closed discard runs in the else of the known-identity check (line $known_line < $discard_line)"
+  else
+    bad "(W3) gate-done.md's fail-closed discard not positioned correctly (known_line='$known_line' discard_line='$discard_line')"
+  fi
+else
+  bad "(W) gate-done.md not found at $GATE_DONE"
+fi
+
 echo
 echo "  PASS=$PASS  FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -272,15 +272,39 @@ if [ -n "$BEAD_ID" ]; then
     # was a coincidental, unrelated prefix hit and the short candidate is left
     # as-is (same fuzzy edge case that already existed before this fix, not a
     # new regression).
-    _RESOLVED_FULL_ID=$(bd -C "$_BEAD_HOME_RIG_PATH" show "$BEAD_ID" --json 2>/dev/null \
-      | jq -r 'if type=="array" then .[0] else . end | .id // empty' 2>/dev/null || echo "")
-    if [ -n "$_RESOLVED_FULL_ID" ] && [ "$_RESOLVED_FULL_ID" != "$BEAD_ID" ]; then
-      case "$_BRANCH_SEG" in
-        "$_RESOLVED_FULL_ID"|"$_RESOLVED_FULL_ID"-*)
-          echo "Note: '$BEAD_ID' parsed from branch '$BRANCH' was a truncated prefix of the real bead '$_RESOLVED_FULL_ID' — using the full id."
-          BEAD_ID="$_RESOLVED_FULL_ID"
-          ;;
-      esac
+    #
+    # gate-feedback ga-3xuanq attempt 1: the original one-line pipeline
+    # (`... || echo ""`) could not tell "resolved and already correct" apart
+    # from "the bd or jq call itself failed" — a transient RPC hiccup and a
+    # genuine no-upgrade-needed result both surfaced as the same empty
+    # _RESOLVED_FULL_ID, so on failure the code silently kept the UNVERIFIED
+    # (possibly truncated) candidate instead of failing closed like the
+    # existence check above does. Capture bd's exit status and raw output
+    # separately from jq's parse so a failed/inconclusive probe is its own
+    # state, never folded into "nothing to upgrade".
+    _BEAD_ID_JSON=$(bd -C "$_BEAD_HOME_RIG_PATH" show "$BEAD_ID" --json 2>/dev/null)
+    _BEAD_ID_JSON_RC=$?
+    _RESOLVED_FULL_ID=""
+    _RESOLVED_FULL_ID_KNOWN=""
+    if [ $_BEAD_ID_JSON_RC -eq 0 ] && [ -n "$_BEAD_ID_JSON" ]; then
+      _RESOLVED_FULL_ID=$(printf '%s' "$_BEAD_ID_JSON" \
+        | jq -r 'if type=="array" then .[0] else . end | .id // empty' 2>/dev/null)
+      [ $? -eq 0 ] && [ -n "$_RESOLVED_FULL_ID" ] && _RESOLVED_FULL_ID_KNOWN=1
+    fi
+    if [ -n "$_RESOLVED_FULL_ID_KNOWN" ]; then
+      if [ "$_RESOLVED_FULL_ID" != "$BEAD_ID" ]; then
+        case "$_BRANCH_SEG" in
+          "$_RESOLVED_FULL_ID"|"$_RESOLVED_FULL_ID"-*)
+            echo "Note: '$BEAD_ID' parsed from branch '$BRANCH' was a truncated prefix of the real bead '$_RESOLVED_FULL_ID' — using the full id."
+            BEAD_ID="$_RESOLVED_FULL_ID"
+            ;;
+        esac
+      fi
+    else
+      echo "Note: could not verify '$BEAD_ID' parsed from branch '$BRANCH' is the real bead's full id (identity probe failed) — discarding, will try fallback."
+      BEAD_ID=""
+      _BEAD_HOME_RIG=""
+      _BEAD_HOME_RIG_PATH=""
     fi
   fi
 fi
