@@ -733,9 +733,15 @@ run_sweep() {
     # R4/R8's candidate sets are a handful — a per-row python3 dispatch here
     # would be materially more expensive for no correctness gain over a
     # hand-verified literal mirror.
+    # ga-ehwjvf (2026-08-15): single source of truth for the "non-implementable"
+    # label regex — referenced by BOTH the candidate query below AND the
+    # story:approved contradiction check inside the loop. A second hand-copied
+    # regex there would be exactly the drift class this file keeps re-discovering
+    # (see R8's canonical-park-vocabulary rationale above for the same lesson).
+    local R7_NONIMPL_RE='^story:epic$|^story:unrefined$|^story:needs-approval$|^story:refino-|^story:refinement-in-progress$|^refino:policy-gap$|^refino:info-gap$|^auto-refino:escalated$|^gate:needs-human(:.*)?$|^ctx:thin$|^story:triage$'
     local non_imp_beads
     non_imp_beads=$("$BD" -C "$store" list --all --json 2>/dev/null \
-                    | jq -r '.[] | select([.labels[]?] | any(test("^story:epic$|^story:unrefined$|^story:needs-approval$|^story:refino-|^story:refinement-in-progress$|^refino:policy-gap$|^refino:info-gap$|^auto-refino:escalated$|^gate:needs-human(:.*)?$|^ctx:thin$|^story:triage$")) ) | .id' 2>/dev/null)
+                    | jq -r --arg re "$R7_NONIMPL_RE" '.[] | select([.labels[]?] | any(test($re)) ) | .id' 2>/dev/null)
     for id in $non_imp_beads; do
       [ -n "$id" ] || continue
       case "$_gate_active" in
@@ -748,6 +754,33 @@ run_sweep() {
       local routed_to; routed_to=$(echo "$bead_json" | jq -r 'if type=="array" then .[0] else . end | (.metadata // {})["gc.routed_to"] // ""' 2>/dev/null)
       local status; status=$(echo "$bead_json" | jq -r 'if type=="array" then .[0] else . end | .status // ""' 2>/dev/null)
       local mutated=0
+
+      # ga-ehwjvf (2026-08-15): story:approved contradicts every label in
+      # $R7_NONIMPL_RE — a bead can be re-labelled story:approved (implementable)
+      # while a stale story:unrefined/needs-approval/refino-escalado/etc. from an
+      # earlier stage is never stripped (measured live: wa-v89e3.9 carried both
+      # story:approved AND story:unrefined at once). R7 used to resolve that
+      # CONTRADICTION unilaterally — clear the route, same as any other
+      # non-implementable bead — while pilot-missing-route-watchdog.sh resolves
+      # the SAME contradiction the OPPOSITE way (story:approved with no route is
+      # a bug to alert on): Mayor re-routes, R7 clears again, forever (two
+      # identical mails observed live, ga-wisp-od7ly53/q8ifza4). The fix is not
+      # "R7 is wrong" — a bead with ONLY a non-implementable label and no
+      # story:approved must still be cleared exactly as before (see the
+      # t-unrefined/t-refinement/etc. fixtures below, unchanged). The fix is
+      # DETECTING the contradiction and signaling instead of silently picking a
+      # side: leave routing/molecule/sling completely untouched, stamp a
+      # distinguishable label + log line naming every conflicting label, and
+      # move on — never trade the routing loop for a per-sweep alert loop (this
+      # runs at most once per bead per sweep, same as every other R7 outcome).
+      local labels_json; labels_json=$(echo "$bead_json" | jq -c 'if type=="array" then .[0] else . end | (.labels // [])' 2>/dev/null)
+      if printf '%s' "$labels_json" | jq -e 'any(. == "story:approved")' >/dev/null 2>&1; then
+        local conflict_labels; conflict_labels=$(printf '%s' "$labels_json" | jq -r --arg re "$R7_NONIMPL_RE" '[.[] | select(test($re))] | join(",")' 2>/dev/null)
+        _add "$store" "$id" lifecycle:label-conflict
+        log "R7 label-conflict (ga-ehwjvf): $id ($(basename "$store")) — story:approved contradicts [$conflict_labels], route left untouched, signaling only"
+        n=$((n+1))
+        continue
+      fi
 
       # 1. Clear routing metadata if set
       if [ -n "$routed_to" ] && [ "$routed_to" != "null" ]; then
@@ -999,12 +1032,13 @@ case "\$a" in
   # the third enumerated blocker (refino:info-gap, alongside t-refino's refino:policy-gap).
   # ga-6dpoa: t-scope-review carries the scope guard's OWN label (scope:needs-review,
   # never gate:needs-human) — proves the two systems no longer share a label.
-  *"list --all"*)                               echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}},{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-8yw4i.1","status":"in_progress","assignee":"mila-wa","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-unrefined","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refinement","status":"open","labels":["story:refinement-in-progress"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino","status":"open","labels":["refino:policy-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-infogap","status":"open","labels":["refino:info-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-swept","status":"open","labels":["refino:creator-swept"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-done","status":"open","labels":["refino:done"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-combo","status":"open","labels":["refino:creator-swept","auto-refino:escalated"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto","status":"open","labels":["auto-refino:escalated"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto-generic","status":"open","labels":["auto-refino:foo"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human","status":"open","labels":["gate:needs-human:bar"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human-bare","status":"open","labels":["gate:needs-human"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-scope-review","status":"open","labels":["delivery:partial","gate:passed","scope:needs-review"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-valid","status":"in_progress","labels":["story:in-flight"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-mayor-assigned","status":"in_progress","assignee":"mayor","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-gate-protect","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"r7-original-target","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-ctxthin","status":"open","labels":["ctx:thin"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-triage","status":"open","labels":["story:triage"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"list --all"*)                               echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}},{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-8yw4i.1","status":"in_progress","assignee":"mila-wa","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-unrefined","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refinement","status":"open","labels":["story:refinement-in-progress"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino","status":"open","labels":["refino:policy-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-infogap","status":"open","labels":["refino:info-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-swept","status":"open","labels":["refino:creator-swept"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-done","status":"open","labels":["refino:done"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-combo","status":"open","labels":["refino:creator-swept","auto-refino:escalated"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto","status":"open","labels":["auto-refino:escalated"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto-generic","status":"open","labels":["auto-refino:foo"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human","status":"open","labels":["gate:needs-human:bar"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human-bare","status":"open","labels":["gate:needs-human"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-scope-review","status":"open","labels":["delivery:partial","gate:passed","scope:needs-review"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-valid","status":"in_progress","labels":["story:in-flight"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-mayor-assigned","status":"in_progress","assignee":"mayor","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-gate-protect","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"r7-original-target","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-ctxthin","status":"open","labels":["ctx:thin"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-triage","status":"open","labels":["story:triage"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-approved-unrefined","status":"open","labels":["story:approved","story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show wa-o4kuh"*)                             echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}}]' ;;
   *"show wa-06yog"*)                             echo '[{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show wa-8yw4i.1"*)                           echo '[{"id":"wa-8yw4i.1","status":"in_progress","assignee":"mila-wa","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-mayor-assigned"*)                     echo '[{"id":"t-mayor-assigned","status":"in_progress","assignee":"mayor","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-unrefined"*)                          echo '[{"id":"t-unrefined","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"show t-approved-unrefined"*)                 echo '[{"id":"t-approved-unrefined","status":"open","labels":["story:approved","story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-ctxthin"*)                            echo '[{"id":"t-ctxthin","status":"open","labels":["ctx:thin"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-triage"*)                             echo '[{"id":"t-triage","status":"open","labels":["story:triage"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-refinement"*)                         echo '[{"id":"t-refinement","status":"open","labels":["story:refinement-in-progress"],"metadata":{"gc.routed_to":"pool"}}]' ;;
@@ -1230,6 +1264,16 @@ GITSHIM
   grep -q 'update t-human --unset-metadata gc.routed_to' "$ACT" && ok "R7: unset gc.routed_to on gate:needs-human:bar" || bad "R7 did not unset gc.routed_to on t-human"
   grep -q 'update t-human-bare --unset-metadata gc.routed_to' "$ACT" && ok "R7 (gate_run=ga-wisp-05leh8 fix): unset gc.routed_to on BARE gate:needs-human" || bad "R7 did not unset gc.routed_to on t-human-bare (bare-label trigger still broken)"
   grep -q 't-valid' "$ACT" && bad "R7: modified a valid in-flight bead (t-valid)" || ok "R7 left valid bead t-valid alone"
+  # ga-ehwjvf: story:approved + story:unrefined together (wa-v89e3.9's live shape) is a
+  # DATA contradiction, not a non-implementable bead — R7 must signal, not pick a side.
+  grep -q 'update t-approved-unrefined --unset-metadata' "$ACT" && bad "R7 (ga-ehwjvf): cleared gc.routed_to on a story:approved+story:unrefined bead — the exact silent side-picking this fix exists to stop (route MUST survive so the downstream route-watchdog has nothing to alert on)" || ok "R7 (ga-ehwjvf): left t-approved-unrefined's route untouched (contradiction detected, not acted on)"
+  grep -q 'label add t-approved-unrefined lifecycle:label-conflict' "$ACT" && ok "R7 (ga-ehwjvf): stamped lifecycle:label-conflict on the contradictory bead" || bad "R7 (ga-ehwjvf): did not stamp the inconsistency label on t-approved-unrefined"
+  [ "$(grep -c 'label add t-approved-unrefined lifecycle:label-conflict' "$ACT")" = "1" ] && ok "R7 (ga-ehwjvf) AC(d): signaled exactly once per bead per sweep, not a new alert loop" || bad "R7 (ga-ehwjvf) AC(d): signaled t-approved-unrefined more than once in a single sweep"
+  grep -q 'R7 label-conflict' "$TMP/log" 2>/dev/null && ok "R7 (ga-ehwjvf) AC(c): log line uses a tag (R7 label-conflict) distinguishable from R7 non-implementable-cleanup" || bad "R7 (ga-ehwjvf) AC(c): label-conflict log line missing or not text-distinguishable from non-implementable-cleanup"
+  # AC(b) regression anchor: a bead with ONLY story:unrefined (no story:approved) must still
+  # be cleared exactly as before — t-unrefined's existing assertion above already proves this
+  # (unchanged), so this just makes the AC(b) intent explicit rather than implicit.
+  grep -q 'update t-unrefined --unset-metadata gc.routed_to' "$ACT" && ok "R7 (ga-ehwjvf) AC(b): story:unrefined WITHOUT story:approved is still cleared normally (no regression from the contradiction check)" || bad "R7 (ga-ehwjvf) AC(b) regression: story:unrefined-only bead stopped being cleared"
   # ga-rccry: refino:creator-swept and refino:done are bookkeeping/terminal, not blocking —
   # must be left alone. auto-refino:foo is a non-enumerated auto-refino:* label — also left
   # alone (allowlist, not denylist). t-refino-combo carries creator-swept (bookkeeping) AND
