@@ -1451,6 +1451,69 @@ assert_absent "$ACTIONS" "mail:mayor" "T66: no escalation — narrow-but-distinc
 assert_absent "$ACTIONS" "nudge:dog-idle66|" "T66: no nudge — proves the T65 fix's equality guard is exact and doesn't broaden to near-equal-but-distinct windows"
 rm -f "$LOGS_FIXTURE_DIR/dog-idle66.json"
 
+# T67 = gate-fix (blocking issue 1): pane_cpu_time_secs used to truncate to
+# whole seconds (print(int(secs))) before the value left the function. At
+# the SHIPPED production IDLE_CPU_SAMPLE_SEC default (5s), a genuinely-busy
+# pane matching the feature's own cited ~4-8% duty cycle only accumulates
+# ~0.2-0.4s of real CPU per sample -- whole-second truncation could (and,
+# per the gate reviewer's math, usually would) lose that entire delta,
+# reading a working session as idle. T59/T60 only ever exercise the two
+# extremes (100%-CPU spin, fully-blocked sleep) at an OVERRIDDEN
+# IDLE_CPU_SAMPLE_SEC=1 -- neither shape nor interval exercises this gap.
+# This test uses a REAL background process (not a stub) that burns CPU in
+# short bursts at a low, continuous duty cycle for its whole lifetime (so
+# the exact moment t1 happens to sample never matters -- there is always a
+# real, small, ongoing delta across any subsequent 5s window), at the
+# actual shipped IDLE_CPU_SAMPLE_SEC=5.
+echo "T67: pane_truly_idle at the SHIPPED production sample interval (5s, not T59/T60's overridden 1s) correctly detects a REAL low-duty-cycle busy process, not just the 100%-spin/fully-blocked extremes (ga-nrkh92 gate-fix, blocking issue 1)"
+echo '{"sessions":[{"name":"dog-idle67","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-idle67 3600
+printf '[%s]' "$(make_bead ga-idle67 dog-idle67 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-idle67" "$WORK/city/.gc/state/agent-idle-resume/ga-idle67"
+python3 -c '
+import time
+end = time.time() + 20
+while time.time() < end:
+    t0 = time.process_time()
+    while time.process_time() - t0 < 0.02:
+        pass
+    time.sleep(0.48)
+' &
+_lowduty_pid=$!
+seed_tmux_pane dog-idle67 "$_lowduty_pid"
+: > "$ACTIONS"
+RESUME_GRACE_SEC=99999 IDLE_CPU_SAMPLE_SEC=5 run_script > /dev/null
+kill "$_lowduty_pid" 2>/dev/null; wait "$_lowduty_pid" 2>/dev/null
+assert_absent "$ACTIONS" "nudge:dog-idle67|" "T67: no nudge — pane correctly confirmed NOT idle even at a low duty cycle (centisecond precision catches a sub-1s delta whole-second truncation would very likely have missed)"
+assert_absent "$ACTIONS" "mail:mayor" "T67: no escalation either — this session is genuinely (if quietly) busy"
+log_contains "T67" "TIME acumulado do pane mudou" "T67: log confirms the busy-confirmation branch fired, not a false-idle read"
+unset TMUX_SESSIONS_DIR
+rm -f "$LOGS_FIXTURE_DIR/dog-idle67.json"
+
+# T68 = gate-fix (blocking issue 2): once RESUME_GRACE_SEC expires with no
+# response and the "no response to resume" escalation fires, the resume-
+# state file used to survive untouched -- the only two places that ever
+# clear it (top-of-pass GC, and the transcript-advancing branch) never run
+# on the escalation path itself. Across more than one COOLDOWN_SEC window
+# this meant every escalation after the first skipped send_idle_resume
+# entirely (a stale nudged_at already far past RESUME_GRACE_SEC by the time
+# cooldown lets the bead be re-evaluated), silently reverting to "just
+# mail" behavior. seed_resume_state fixture simulates exactly that: a nudge
+# recorded long ago (999999s), matching the live session (no reassignment
+# mismatch), so this run lands directly on the "no response" escalation
+# branch on its first pass.
+echo "T68: after escalating with no response to the resume nudge, the resume-state file is cleared so the NEXT cycle (post-cooldown) gets its own fresh nudge instead of reading a stale nudged_at (ga-nrkh92 gate-fix, blocking issue 2)"
+echo '{"sessions":[{"name":"dog-idle68","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-idle68 3600
+printf '[%s]' "$(make_bead ga-idle68 dog-idle68 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-idle68" "$WORK/city/.gc/state/agent-idle-resume/ga-idle68"
+seed_resume_state ga-idle68 999999 dog-idle68
+: > "$ACTIONS"
+run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente ocioso nao respondeu a retomada: ga-idle68" "T68: escalation fires — grace period long expired, no response to the earlier nudge"
+[ ! -f "$WORK/city/.gc/state/agent-idle-resume/ga-idle68" ] && ok "T68: resume-state file cleared after escalation — the next post-cooldown cycle starts with a fresh nudge, not a stale timestamp" || bad "T68: resume-state file still present after escalation — next cycle would misread the ancient nudged_at and skip send_idle_resume again"
+rm -f "$LOGS_FIXTURE_DIR/dog-idle68.json"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

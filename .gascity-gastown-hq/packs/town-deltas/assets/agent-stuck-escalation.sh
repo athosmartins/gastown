@@ -879,6 +879,21 @@ pane_pid_for_session() {
     printf '%s' "$pid"
 }
 
+# pane_cpu_time_secs (ga-nrkh92 gate-fix, blocking issue 1): returns
+# CENTISECONDS (not whole seconds). `ps -o time=` reports M:SS.ss precision
+# (confirmed live on this machine — e.g. "0:00.00", "30:13.66") — the
+# original version parsed that correctly but then did print(int(secs)),
+# throwing the fraction away before the value ever left the function.
+# pane_truly_idle()'s own justification cites a real measurement of ~4-8%
+# duty cycle for a genuinely-busy pane (1-2s of CPU across a 25s sample);
+# at the shipped IDLE_CPU_SAMPLE_SEC default of 5s that predicts only
+# ~0.2-0.4s of real accumulated CPU per sample — which the old
+# whole-second truncation had a measured 60-80% chance of losing entirely
+# (both samples truncating to the same integer second), reading a
+# genuinely-working pane as "idle" and firing send_idle_resume()'s tmux
+# send-keys into a live session on a false premise. Comparing centiseconds
+# instead of truncated seconds needs the real delta to be below 0.01s
+# (i.e. no meaningful work happened) before two samples can read equal.
 pane_cpu_time_secs() {
     local pid="$1" raw
     raw="$(ps -o time= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
@@ -892,7 +907,7 @@ except Exception:
 secs = 0.0
 for p in parts:
     secs = secs * 60 + p
-print(int(secs))
+print(int(round(secs * 100)))
 " 2>/dev/null
 }
 
@@ -1652,6 +1667,22 @@ Limiar configurável via STUCK_AGENT_SEC (atual: ${STUCK_AGENT_SEC}s) · retomad
 BODY
 )"
     send_escalation "$bead_id" "$title" "$labels" "$age_min" "$assignee" "0" "Agente ocioso nao respondeu a retomada" "$body" "$sf"
+    # ga-nrkh92 gate-fix (blocking issue 2): $rf ficava intocado apos esta
+    # escalacao. Os dois unicos outros pontos que o limpam (GC no topo do
+    # pass, e o ramo "transcript voltou a avancar") nunca rodam aqui — se o
+    # transcript tivesse voltado a avancar, o bloco correspondente acima ja
+    # teria dado `continue` bem antes deste ponto. Sem isso, um bead preso
+    # por MAIS de um COOLDOWN_SEC (3h — o proprio cenario que originou este
+    # bead: "3 crews travadas 7-13h", 2-4 janelas de cooldown) tinha cada
+    # escalacao APOS a primeira pulando send_idle_resume: o cooldown suprime
+    # reavaliacao por 3h; quando o bead reaparece, elapsed_since_nudge ja
+    # esta horas alem de RESUME_GRACE_SEC, e escala de novo sem NUNCA tentar
+    # retomar de novo — revertendo pro comportamento pre-ga-nrkh92 ("so
+    # mail") em toda escalacao apos a primeira, o oposto do proposito do
+    # bead. Limpar aqui faz a proxima reavaliacao (apos o cooldown) cair de
+    # volta no ramo de primeira retomada — cada ciclo de escalacao ganha sua
+    # propria tentativa de retomada fresca.
+    rm -f "$rf"
 
 done <<< "$STUCK_ITEMS"
 
