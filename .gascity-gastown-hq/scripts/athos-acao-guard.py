@@ -63,6 +63,17 @@ threaded through this guard: they come from a structurally separate lane
 --status open filter — see painel_visibilidade.py ~L3547-3581), not from
 _travada_reason's precedence cascade, so they carry no analogous gap.
 
+CORRECTED (ga-5zug1f, attempt 3/3 FAIL): "so they carry no analogous gap"
+above was wrong. Verified against the live source: story:needs-approval IS
+status-gated (--status open, single fetch site) and refino:policy-gap
+reaches Sua vez only via the open/in_progress/deferred conveyor — but the
+predicate checked neither, so a bead carrying either label OUTSIDE that
+window still got flagged. Same failure shape as the attempt-2 finding (a
+clause firing without checking the reachability condition the real source
+actually enforces), same side effect (marker + notify) — just a STATUS
+window instead of a LABEL precedence chain. Now threaded through via
+_APPROVAL_STATUSES/_POLICY_GAP_STATUSES.
+
 DELIBERATELY DOES NOT auto-fill athos.acao. The field requires judgment — a
 guessed instruction derived from title/description would carry the same
 confident look as a real one and could tell Athos to do the WRONG thing
@@ -106,14 +117,37 @@ MARKER_LABEL = "athos-acao:missing"
 
 # bd's --status filter takes an explicit allowlist (matches this codebase's
 # established "explicit status filter, never rely on the open-only default"
-# convention — see inflight-reclaim-guard.py's ga-vw26y note). These are every
-# non-terminal status a Sua-vez-eligible bead can carry; "closed" is the only
-# terminal one that matters here (painel's own _STATUS_SETTLED gate).
-NON_TERMINAL_STATUSES = ("open", "in_progress", "deferred", "blocked")
+# convention — see inflight-reclaim-guard.py's ga-vw26y note). Every bd status
+# except "closed" — painel_visibilidade.py's _STATUS_SETTLED is literally
+# frozenset({"closed"}), the ONLY terminal status the real panel recognizes.
+#
+# GATE FIX (ga-5zug1f, 2026-08-15, attempt 3/3 FAIL): this used to list only
+# ("open", "in_progress", "deferred", "blocked") — 4 of bd's 7 real statuses
+# (`bd statuses`), silently missing "pinned" and "hooked". The story:blocked
+# bucket that feeds 🔒 Travadas is fetched with an UNRESTRICTED --all filter
+# specifically because status doesn't gate it (painel_visibilidade.py
+# ~L2887, verified live), so a hooked- or pinned-status bead carrying
+# story:blocked + blocked-reason:decision DOES render in the real panel's
+# 👤 Sua vez — but the old allowlist meant scan_rig()'s own
+# "bd list --status ..." query could never RETURN that bead in the first
+# place, so this guard could never see the gap: not a precedence bug like
+# ga-96xden's (the predicate itself was never wrong for that case), a
+# narrower one — the ENUMERATION never reached the bead at all, silently
+# indistinguishable from "scanned it, found no gap" to every downstream
+# consumer. Now every non-"closed" status is fetched, matching painel's own
+# single terminal-status invariant exactly instead of re-deriving a subset.
+NON_TERMINAL_STATUSES = ("open", "in_progress", "deferred", "blocked", "pinned", "hooked")
 
 # blocked-reason:decision / :feasibility — painel_visibilidade.py's
 # _BLOCKED_REASON_ATHOS (line 408).
 ATHOS_DECISION_LABELS = frozenset({"blocked-reason:decision", "blocked-reason:feasibility"})
+
+# GATE FIX (ga-5zug1f, attempt 3/3 FAIL): story:needs-approval and
+# refino:policy-gap are each reachable in the real panel only within a
+# NARROWER status window than the rest of this guard's scan — see the
+# is_sua_vez_acao_gap docstring for the verified fetch sites behind each set.
+_APPROVAL_STATUSES = frozenset({"open"})
+_POLICY_GAP_STATUSES = frozenset({"open", "in_progress", "deferred"})
 
 
 def _preempts_exec_manual(lset, status):
@@ -231,9 +265,25 @@ def is_sua_vez_acao_gap(labels, assignee, athos_acao, status=""):
     the exec:manual-orphan and next-action:athos* clauses correctly: in the
     real source neither fires if a higher-precedence branch already claimed
     turn:"other" first (see _preempts_exec_manual/_preempts_next_action).
-    Defaults to "" (never matches "blocked") so existing callers that don't
-    pass it keep their prior behavior for every case that doesn't depend on
-    status.
+
+    GATE FIX (ga-5zug1f, attempt 3/3 FAIL): `status` is ALSO required to
+    resolve story:needs-approval and refino:policy-gap correctly.
+    story:needs-approval is fetched in the real panel EXCLUSIVELY with
+    --status open (painel_visibilidade.py ~L3581 — a single, unambiguous
+    fetch site, verified no other caller exists). refino:policy-gap reaches
+    👤 Sua vez only via the Triagem/story:unrefined conveyor, whose combined
+    fetch statuses are open+in_progress (Triagem) union deferred
+    (story:unrefined adds it) — never blocked/pinned/hooked. A bead carrying
+    either label OUTSIDE its real status window is invisible in the real
+    panel, so flagging it here was a false positive with a real side effect
+    (marker label + push notification) that never self-clears — see
+    _APPROVAL_STATUSES/_POLICY_GAP_STATUSES.
+
+    Defaults to "" (never matches "blocked", nor _APPROVAL_STATUSES /
+    _POLICY_GAP_STATUSES) so a caller that omits status only affects
+    blocked-reason:decision/feasibility (ATHOS_DECISION_LABELS) — the one
+    branch below that is genuinely status-independent in the real source too
+    (_travada_reason's unconditional first check).
     """
     if (athos_acao or "").strip():
         return False
@@ -246,9 +296,9 @@ def is_sua_vez_acao_gap(labels, assignee, athos_acao, status=""):
     if (any(str(l).startswith("next-action:") and "athos" in str(l) for l in lset)
             and not _preempts_next_action(lset, status)):
         return True
-    if "story:needs-approval" in lset:
+    if "story:needs-approval" in lset and status in _APPROVAL_STATUSES:
         return True
-    if "refino:policy-gap" in lset:
+    if "refino:policy-gap" in lset and status in _POLICY_GAP_STATUSES:
         return True
     return False
 
@@ -419,7 +469,37 @@ def _selftest():
          "story:awaiting-external-merge preempts next-action:athos*"),
         (["next-action:athos-decide", "exec:manual"], "oracle-wa", None, "open", False,
          "exec:manual (even WITH assignee) precedes+preempts next-action:athos* in real source"),
+        # ── ga-5zug1f gate finding (2026-08-15, attempt 3/3 FAIL): needs-approval
+        # and policy-gap are each reachable in the real panel only within a
+        # narrower status window than the rest of this predicate. ──────────────
+        (["story:needs-approval"], "", None, "in_progress", False,
+         "gate counter-example: story:needs-approval is fetched --status open ONLY "
+         "in the real panel — in_progress is invisible there"),
+        (["story:needs-approval"], "", None, "blocked", False,
+         "story:needs-approval + blocked also outside the real open-only fetch"),
+        (["story:needs-approval"], "", None, "", False,
+         "story:needs-approval with unknown/omitted status fails closed"),
+        (["refino:policy-gap"], "", None, "in_progress", True,
+         "refino:policy-gap reachable via Triagem's open+in_progress fetch"),
+        (["refino:policy-gap"], "", None, "deferred", True,
+         "refino:policy-gap reachable via story:unrefined's +deferred fetch"),
+        (["refino:policy-gap"], "", None, "blocked", False,
+         "gate counter-example: refino:policy-gap+blocked — the conveyor never "
+         "fetches blocked, so this is invisible in the real panel's Sua vez"),
+        (["refino:policy-gap"], "", None, "hooked", False,
+         "refino:policy-gap+hooked also outside the conveyor's status window"),
+        # blocked-reason:decision stays reachable regardless of status (real
+        # source's unconditional first check) — guards against a future edit
+        # accidentally threading status into ATHOS_DECISION_LABELS too.
+        (["blocked-reason:decision"], "", None, "hooked", True,
+         "blocked-reason:decision unaffected by ga-5zug1f — still status-independent"),
+        (["blocked-reason:decision"], "", None, "pinned", True,
+         "blocked-reason:decision unaffected by ga-5zug1f — still status-independent"),
     ]
+    assert "pinned" in NON_TERMINAL_STATUSES and "hooked" in NON_TERMINAL_STATUSES, (
+        "GATE FIX ga-5zug1f regression: NON_TERMINAL_STATUSES must include every "
+        "bd status except closed — pinned/hooked-status beads are live in the "
+        "real panel (painel's only terminal status is _STATUS_SETTLED={'closed'})")
     failures = []
     for labels, assignee, acao, status, expected, desc in cases:
         got = is_sua_vez_acao_gap(labels, assignee, acao, status)
