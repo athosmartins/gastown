@@ -135,7 +135,14 @@ main() {
   done
 
   if [ "$known" -eq 0 ]; then
-    local msg="claude auth status reports loggedIn=true but email='$email' is not in the known pool ($_KNOWN_EMAILS). Session about to spawn: $_WHO. Never auto-blocked -- confirm and add to the known list if legitimate, or investigate if not."
+    # Note: no single quotes embedded in this message, deliberately -- _alert()
+    # wraps $msg in single quotes for bash -c, and an embedded literal single
+    # quote here would depend on bash's adjacent-quoted/unquoted-token
+    # concatenation rule to still parse as one word (verified it does today,
+    # since email/$_KNOWN_EMAILS never contain whitespace next to a quote --
+    # but that is a fragile invariant to lean on, not a guarantee, so avoid
+    # the embedded quote entirely instead of relying on it).
+    local msg="claude auth status reports loggedIn=true but email=$email is not in the known pool ($_KNOWN_EMAILS). Session about to spawn: $_WHO. Never auto-blocked -- confirm and add to the known list if legitimate, or investigate if not."
     _alert "unrecognized account" "$msg"
     return 0
   fi
