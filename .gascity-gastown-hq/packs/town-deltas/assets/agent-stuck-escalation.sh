@@ -229,6 +229,34 @@ except Exception:
     return 1
 }
 
+# session_exists_via_peek (ga-5o2mj6): a THIRD, structurally-independent
+# read, used only as a tie-breaker when BOTH the batch `gc session list`
+# scan and the direct `gc session logs` probe (transcript_is_advancing)
+# already came back empty-handed for the same assignee. `gc session peek`
+# resolves against the live pane/process directly rather than whatever
+# enumeration/transcript-path resolution the other two draw on — it is
+# literally the same check this script's own escalation mail already tells
+# a human to run BY HAND as step 1 before trusting an "ausente" verdict
+# (see the mail body below: "gc session peek ... — confirme se realmente
+# travado"). Returns 0 only on an affirmative ok:true (peek resolved
+# SOMETHING for this name); 1 on any failure/timeout/unparseable response —
+# fails toward "still can't tell", never toward "confirmed alive" on a
+# parse error.
+session_exists_via_peek() {
+    local sess="$1" out ok
+    out="$(timeout 15 "$GC" session peek "$sess" --lines 1 --json 2>/dev/null || true)"
+    [ -z "$out" ] && return 1
+    ok="$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print("true" if d.get("ok") else "false")
+except Exception:
+    print("false")
+' 2>/dev/null)"
+    [ "$ok" = "true" ]
+}
+
 # session_awaiting_human_input (wa-y0620): distinguishes case (a) WEDGED
 # real (transcript frozen, agent mid-tool-call or genuinely dead) from case
 # (b) AGUARDANDO-HUMANO (transcript frozen because the agent correctly
@@ -776,6 +804,32 @@ print(n)
     case "$hit" in ''|0) return 1 ;; *) return 0 ;; esac
 }
 
+# pool_refused_label_present (ga-5o2mj6): true iff the comma-joined label
+# list $1 carries a pool:refused:* label. A dog/worker that refuses a bead
+# (pool:refused:<reason>, e.g. pool:refused:engine-rebuild-required) EXITS
+# by design without reassigning it (see this pack's own CLAUDE.md refuse
+# protocol) — the bead is left in_progress+assigned to a now-gone session
+# ON PURPOSE, pending a human/Mayor-scheduled follow-up (e.g. an engine
+# window). "No progress" is the PERMANENT, correct state for it, not a
+# stall — the same shape ga-n937 already suppresses for the gate queue
+# below. Concrete victim: wa-msxg5 (pool:refused:engine-rebuild-required +
+# needs:engine-window) re-escalating "sem progresso" every pass forever,
+# since that label combination never resolves on its own.
+pool_refused_label_present() {
+    local labels_csv="${1:-}" lbl
+    local -a lbls=()
+    IFS=',' read -ra lbls <<< "$labels_csv"
+    for lbl in "${lbls[@]:-}"; do
+        [ -z "$lbl" ] && continue
+        case "$lbl" in
+            pool:refused|pool:refused:*)
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
 # is_human_assignee (ga-tiwmm): an in_progress bead assigned to a HUMAN
 # identity (e.g. "athosmartins@gmail.com") has no Gas Town agent
 # session-template by construction — "sessão ausente" is not a stall signal
@@ -1305,6 +1359,19 @@ while IFS='|' read -r bead_id assignee age_secs title labels active_window; do
         continue
     fi
 
+    # pool:refused:* (ga-5o2mj6): a worker that refused this bead already
+    # exited by design (see pool_refused_label_present above) — the
+    # assignee session is gone on purpose and "no progress" never resolves
+    # on its own. Runs before the assignee-empty/session-health checks below
+    # since a refused bead keeps its original assignee (the now-exited
+    # worker) and would otherwise fall straight into the absent-session
+    # escalation path, repaging forever for a state nothing but a human/
+    # engine-window follow-up can change.
+    if pool_refused_label_present "$labels"; then
+        log "$bead_id: bead.updated_at parado ${age_min}min — label pool:refused:* presente (labels=$labels) — SUPRIMINDO escalação (recusado por design, aguardando follow-up, ga-5o2mj6)"
+        continue
+    fi
+
     # Empty/absent assignee on an in_progress bead (ga-79vq): there's no name
     # to check — not a confirmed-dead session, just an INDETERMINATE owner.
     # Before this fix, the session-health block below (gated on `-n
@@ -1411,6 +1478,28 @@ while IFS='|' read -r bead_id assignee age_secs title labels active_window; do
         # already-correct default — per AC2 the two signals are still
         # consulted independently either way, this just doesn't let an
         # unproven result overturn a state that was already settled.
+        #
+        # ga-5o2mj6: tried collapsing this inconclusive case straight to
+        # "unknown" first — measured empirically, that's WAY too strong: it
+        # silently disables escalation for the daemon's single most common
+        # and foundational case (a genuinely dead assignee with literally no
+        # session anywhere — T2/T6/T15/T19/T20/T27/T47/... broke, 18 tests,
+        # not just the 3 this bug is actually about). AC1/AC4 of ga-v6ols
+        # stand for that case: "não-encontrada" alone still escalates below,
+        # unchanged. What's added here is narrower — see
+        # session_exists_via_peek() above: when the direct probe is ALSO
+        # inconclusive, try ONE more, structurally-independent read before
+        # accepting "não-encontrada". `gc session peek` doesn't share
+        # whatever enumeration/transcript-path machinery the other two draw
+        # on — live evidence showed exactly this combination (batch miss +
+        # inconclusive logs probe) on wa-worker-adhoc-d3e966bf09, a session
+        # `gc session list`/`peek` by hand confirmed active 46min in. An
+        # affirmative peek here means we now have positive evidence the
+        # assignee EXISTS (just not whether its transcript is fresh) — mark
+        # UNKNOWN (suppress, fail-safe) instead of escalating against
+        # evidence we now hold. Peek ALSO failing changes nothing: falls
+        # through to the unchanged AC1/AC4 escalation, exactly as before
+        # this fix.
         transcript_is_advancing "$assignee"
         case "$?" in
             0)
@@ -1424,7 +1513,13 @@ while IFS='|' read -r bead_id assignee age_secs title labels active_window; do
                 sess_status="$sess_status — checagem direta (gc session logs $assignee): transcript CONGELADO (ga-v6ols)"
                 ;;
             *)
-                : # inconclusive — no new evidence; "não-encontrada" stands, escalation path below unchanged (AC1/AC4)
+                if session_exists_via_peek "$assignee"; then
+                    transcript_state="unknown"
+                    sess_status="$sess_status — checagem direta (gc session peek $assignee) contradiz: sessão EXISTE (ga-5o2mj6)"
+                fi
+                # else: inconclusive on all three reads — no new evidence;
+                # "não-encontrada" stands, escalation path below unchanged
+                # (AC1/AC4)
                 ;;
         esac
     fi
@@ -1442,7 +1537,16 @@ while IFS='|' read -r bead_id assignee age_secs title labels active_window; do
         continue
     fi
     if [ "$transcript_state" = "unknown" ]; then
-        log "$bead_id: bead.updated_at parado ${age_min}min — 'gc session logs $live_session_name' falhou (ok:false/sem resposta) — transcript DESCONHECIDO (não confirmado congelado) — SUPRIMINDO escalação (fail-safe ga-4tmc: pergunta que falha nunca vira veredito de vazio)"
+        # ga-5o2mj6: ${live_session_name:-$assignee} (not the bare
+        # variable) — in the fallback/direct-probe branch above,
+        # live_session_name is still "" when this fires (only the 0/1 cases
+        # set it), so the bare variable printed an empty session name here.
+        # Also now logs sess=$sess_status (previously omitted here, unlike
+        # the "advancing" suppression log line below) — needed so the
+        # session_exists_via_peek() contradiction note actually surfaces
+        # instead of being silently swallowed by an otherwise-generic
+        # DESCONHECIDO line.
+        log "$bead_id: bead.updated_at parado ${age_min}min — 'gc session logs ${live_session_name:-$assignee}' falhou (ok:false/sem resposta) — transcript DESCONHECIDO (não confirmado congelado) — sess=$sess_status — SUPRIMINDO escalação (fail-safe ga-4tmc: pergunta que falha nunca vira veredito de vazio)"
         continue
     fi
 

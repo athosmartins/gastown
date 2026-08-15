@@ -110,6 +110,23 @@ case "$1 $2" in
   "session peek")
     _target="${3:-}"
     _f="${PEEK_FIXTURE_DIR:-}/${_target}.txt"
+    # ga-5o2mj6: --json mode (session_exists_via_peek()) gets a proper
+    # ok:true/false envelope mirroring real `gc session peek --json`
+    # (verified live: ok:false + exit 1 for an unresolvable name). Existing
+    # non-json callers (pane_shows_permission_prompt et al., none of which
+    # ever pass --json) are UNCHANGED below — this branch only intercepts
+    # when --json is actually present in argv.
+    for _a in "$@"; do
+        if [ "$_a" = "--json" ]; then
+            if [ -n "${PEEK_FIXTURE_DIR:-}" ] && [ -f "$_f" ]; then
+                echo '{"ok":true,"output":"(fixture)"}'
+                exit 0
+            else
+                echo '{"ok":false,"error":{"message":"session not found"}}'
+                exit 1
+            fi
+        fi
+    done
     if [ -n "${PEEK_FIXTURE_DIR:-}" ] && [ -f "$_f" ]; then
         cat "$_f"
     fi
@@ -1591,6 +1608,55 @@ RESUME_GRACE_SEC=99999 run_script > /dev/null
 assert_contains "$ACTIONS" "nudge:dog-idle70|" "T71: real nudge fires on the first REAL pass — proves the DRY_RUN preview left no phantom nudged_at behind"
 assert_absent "$ACTIONS" "mail:mayor" "T71: no escalation — this is genuinely the first real nudge attempt, grace period hasn't even started"
 rm -f "$LOGS_FIXTURE_DIR/dog-idle70.json"
+
+# ── T72: batch miss + inconclusive direct probe, but `gc session peek` ──────
+# confirms the session EXISTS → suppressed as UNKNOWN, not escalated
+# (ga-5o2mj6 — the falsifiable reproduction of the actual reported false
+# positive). T42 above already covers "batch miss + inconclusive logs probe,
+# nothing else to go on → still escalates" (AC1/AC4 of ga-v6ols, unchanged).
+# This test adds the ONE signal the real incident had that T42 doesn't
+# model: wa-worker-adhoc-d3e966bf09 was independently confirmed alive by a
+# human running `gc session list`/`peek` BY HAND, moments after the
+# daemon's own automated pass — using the SAME assignee name — logged
+# "sess=AUSENTE" and escalated. Before this fix, this exact fixture shape
+# (batch miss, no LOGS_FIXTURE_DIR entry, PEEK_FIXTURE_DIR entry present)
+# reproduces that: it fails against the pre-ga-5o2mj6 script (no
+# session_exists_via_peek() tie-breaker existed, so the peek fixture was
+# never consulted and this bead escalated same as T42's ga-test27).
+echo "T72: batch miss + inconclusive logs probe, but gc session peek confirms EXISTS → suppressed, not escalated (ga-5o2mj6)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"   # batch scan misses this assignee entirely (like T42)
+echo "some live pane output" > "$PEEK_FIXTURE_DIR/wa-worker-ga5o2mj6.txt"   # but peek DOES resolve it
+printf '[%s]' "$(make_bead ga-5o2mj6-a wa-worker-ga5o2mj6 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-5o2mj6-a"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-5o2mj6-a" "T72: no mail — peek tie-breaker overrides a double batch/logs miss (ga-5o2mj6)"
+assert_absent "$ACTIONS" "notify" "T72: no notify — suppressed as unknown"
+[ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-5o2mj6-a" ] && ok "T72: no escalation state written (suppression is log-only)" || bad "T72: unexpected state file written on suppression"
+log_contains "T72" "sessão EXISTE" "T72: log shows the peek tie-breaker contradiction note"
+rm -f "$PEEK_FIXTURE_DIR/wa-worker-ga5o2mj6.txt"
+
+# ── T73: bead carries pool:refused:* → suppressed, never escalates ──────────
+# (ga-5o2mj6 AC2). A dog/worker that refuses a bead (e.g.
+# pool:refused:engine-rebuild-required) exits by design without
+# reassigning it — the bead sits in_progress, assigned to a now-gone
+# session, on purpose, until a human/Mayor-scheduled follow-up (an engine
+# window) closes it. "No progress" is the permanent expected state, not a
+# stall — mirrors T16 (gate:queued suppression, ga-n937) in shape, for a
+# different label family. Uses make_bead_json for caller-controlled labels;
+# session absent entirely (empty sessions fixture) proves the suppression
+# fires BEFORE the assignee/session-health checks below it would otherwise
+# use to escalate.
+echo "T73: bead with pool:refused:* label → suppressed (recusado por design, ga-5o2mj6)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+printf '[%s]' "$(make_bead_json ga-5o2mj6-b dog-ga5o2mj6-refused 2200 '["pool:refused:engine-rebuild-required","needs:engine-window"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-5o2mj6-b"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-5o2mj6-b" "T73: no mail — pool:refused:* bead is parked by design"
+assert_absent "$ACTIONS" "notify" "T73: no notify — pool:refused suppresses"
+[ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-5o2mj6-b" ] && ok "T73: no escalation state written (suppression is log-only)" || bad "T73: unexpected state file written on suppression"
+log_contains "T73" "recusado por design" "T73: log notes the pool:refused suppression"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
