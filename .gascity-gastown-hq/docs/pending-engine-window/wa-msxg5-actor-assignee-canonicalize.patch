@@ -1,0 +1,1580 @@
+diff --git a/cmd/bd/unclaim_conditional_embedded_test.go b/cmd/bd/unclaim_conditional_embedded_test.go
+index 1c202be55..97ab1401b 100644
+--- a/cmd/bd/unclaim_conditional_embedded_test.go
++++ b/cmd/bd/unclaim_conditional_embedded_test.go
+@@ -57,6 +57,36 @@ func TestUnclaimIfAssigneeCLI(t *testing.T) {
+ 	_ = bdUnclaimFail(t, bd, dir, issue.ID, "--if-assignee", "alice")
+ }
+ 
++// TestUnclaimIfAssigneeCLIDifferentSpelling drives `bd unclaim --if-assignee`
++// with an expectation that names the current holder under a different Gas
++// Town identity spelling than the stored assignee (dot vs underscore
++// separator — ga-5ksp5). This must count as a match, not a stale-expectation
++// refusal: both the Go-side actorMatches precheck and the row_lock CAS that
++// replaced the old verbatim `assignee = ?` SQL predicate need to agree it is
++// the same identity, or the release silently affects zero rows even though
++// the precheck said the CAS should succeed.
++func TestUnclaimIfAssigneeCLIDifferentSpelling(t *testing.T) {
++	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
++		t.Skip("set BEADS_TEST_EMBEDDED_DOLT=1 to run embedded dolt integration tests")
++	}
++	t.Parallel()
++
++	bd := buildEmbeddedBD(t)
++	dir, _, _ := bdInit(t, bd, "--prefix", "uw")
++
++	issue := bdCreate(t, bd, dir, "Conditional release, spelling variant", "--type", "task")
++	bdUpdate(t, bd, dir, issue.ID, "--assignee", "gastown.mayor", "--status", "in_progress")
++
++	bdUnclaim(t, bd, dir, issue.ID, "--if-assignee", "gastown_mayor")
++	got := bdShow(t, bd, dir, issue.ID)
++	if got.Assignee != "" {
++		t.Errorf("after same-identity --if-assignee: assignee = %q, want empty", got.Assignee)
++	}
++	if got.Status != types.StatusOpen {
++		t.Errorf("after same-identity --if-assignee: status = %q, want open", got.Status)
++	}
++}
++
+ // TestUnclaimIfAssigneeFlagValidation drives the CLI guards that keep the
+ // conditional-release contract unambiguous. A conditional unclaim is selected by
+ // the *presence* of --if-assignee, so an explicitly empty --if-assignee "" (an
+diff --git a/cmd/bd/unclaim_embedded_test.go b/cmd/bd/unclaim_embedded_test.go
+index 731c35bdd..b5535fcd2 100644
+--- a/cmd/bd/unclaim_embedded_test.go
++++ b/cmd/bd/unclaim_embedded_test.go
+@@ -219,4 +219,25 @@ func TestEmbeddedUnclaim(t *testing.T) {
+ 			t.Errorf("expected status open after --force unclaim, got %s", got.Status)
+ 		}
+ 	})
++
++	// The owner may release its own claim under a different spelling of its own
++	// identity (ga-5ksp5): dot vs underscore separator is the same Gas Town
++	// identity at two different layers, and both the Go-side ownership
++	// precheck and the SQL CAS predicate must recognize that — not just the
++	// former, or the UPDATE would silently affect zero rows and the release
++	// would fail even though the Go precheck said it should succeed.
++	t.Run("unclaim_owner_different_spelling_succeeds", func(t *testing.T) {
++		issue := bdCreate(t, bd, dir, "Owner spelling variant", "--type", "task")
++		bdUpdate(t, bd, dir, issue.ID, "--claim", "--actor", "gastown.mayor")
++
++		bdUnclaim(t, bd, dir, issue.ID, "--actor", "gastown_mayor")
++
++		got := bdShow(t, bd, dir, issue.ID)
++		if got.Assignee != "" {
++			t.Errorf("expected assignee to be cleared after same-identity unclaim, got %q", got.Assignee)
++		}
++		if got.Status != types.StatusOpen {
++			t.Errorf("expected status open after same-identity unclaim, got %s", got.Status)
++		}
++	})
+ }
+diff --git a/internal/storage/domain/db/issue.go b/internal/storage/domain/db/issue.go
+index 7673c9294..37854d950 100644
+--- a/internal/storage/domain/db/issue.go
++++ b/internal/storage/domain/db/issue.go
+@@ -375,12 +375,15 @@ func (r *issueSQLRepositoryImpl) Claim(ctx context.Context, id, actor string, op
+ 	if err != nil {
+ 		return domain.ClaimRowResult{}, fmt.Errorf("db: Claim %s: resolve claim pools: %w", id, err)
+ 	}
+-	assigneePredicate := "assignee = '' OR assignee IS NULL OR assignee = ?"
+-	assigneeArgs := []any{actor}
+-	for _, pool := range pools {
+-		assigneePredicate += " OR assignee = ?"
+-		assigneeArgs = append(assigneeArgs, pool)
+-	}
++
++	// Claimability of the assignee slot, judged in Go against oldIssue rather
++	// than as a spelling-sensitive SQL predicate (ga-v2k49, mirroring the
++	// same-day fix to issueops.ClaimIssueInTx — this dual must stay in
++	// lockstep, per the comment above): empty/unassigned, already this actor
++	// — including a spelling difference across layers (ga-wzl83) — or a
++	// claim-pool alias. issueops.ActorMatches is the exported form of the
++	// primary path's package-local actorMatches, kept for exactly this dual.
++	assigneeOK := oldIssue.Assignee == "" || issueops.ActorMatches(oldIssue.Assignee, actor) || slices.Contains(pools, oldIssue.Assignee)
+ 
+ 	// Same lockstep for the source statuses (bd-pq7m2): claimable from "open"
+ 	// plus custom active-category statuses, like the primary path — not a
+@@ -396,36 +399,46 @@ func (r *issueSQLRepositoryImpl) Claim(ctx context.Context, id, actor string, op
+ 		statusArgs = append(statusArgs, st)
+ 	}
+ 
+-	var res sql.Result
+-	if startedWasZero {
+-		args := append([]any{actor, now, now}, rowLockArgs...)
+-		args = append(args, id)
+-		args = append(args, statusArgs...)
+-		args = append(args, assigneeArgs...)
+-		//nolint:gosec // G201: table is one of two hardcoded constants
+-		res, err = r.runner.ExecContext(ctx, fmt.Sprintf(`
+-			UPDATE %s
+-			SET assignee = ?, status = 'in_progress', updated_at = ?, started_at = ?, %s
+-			WHERE id = ? AND (%s) AND (%s)
+-		`, table, rowLockClause, statusPredicate, assigneePredicate), args...)
+-	} else {
+-		args := append([]any{actor, now}, rowLockArgs...)
+-		args = append(args, id)
+-		args = append(args, statusArgs...)
+-		args = append(args, assigneeArgs...)
+-		//nolint:gosec // G201: table is one of two hardcoded constants
+-		res, err = r.runner.ExecContext(ctx, fmt.Sprintf(`
+-			UPDATE %s
+-			SET assignee = ?, status = 'in_progress', updated_at = ?, %s
+-			WHERE id = ? AND (%s) AND (%s)
+-		`, table, rowLockClause, statusPredicate, assigneePredicate), args...)
+-	}
+-	if err != nil {
+-		return domain.ClaimRowResult{}, fmt.Errorf("db: Claim %s: %w", id, err)
+-	}
+-	rows, err := res.RowsAffected()
+-	if err != nil {
+-		return domain.ClaimRowResult{}, fmt.Errorf("db: Claim %s: rows affected: %w", id, err)
++	// Conditional UPDATE, attempted only while assigneeOK — otherwise there
++	// is nothing this actor could win, so skip straight to the rows==0
++	// disambiguation below (matches the primary path's ga-v2k49 fix). CASed
++	// on row_lock rather than re-checking assignee in SQL: row_lock is
++	// rewritten by every path that mutates status/assignee/started_at (see
++	// the freshRowLock invariant in issueops/lease.go), so requiring it to
++	// still equal oldIssue.RowVersion detects a race exactly as precisely as
++	// the old assignee predicate did, without embedding a spelling-sensitive
++	// string comparison in SQL.
++	var rows int64
++	if assigneeOK {
++		var res sql.Result
++		if startedWasZero {
++			args := append([]any{actor, now, now}, rowLockArgs...)
++			args = append(args, id, oldIssue.RowVersion)
++			args = append(args, statusArgs...)
++			//nolint:gosec // G201: table is one of two hardcoded constants
++			res, err = r.runner.ExecContext(ctx, fmt.Sprintf(`
++				UPDATE %s
++				SET assignee = ?, status = 'in_progress', updated_at = ?, started_at = ?, %s
++				WHERE id = ? AND row_lock = ? AND (%s)
++			`, table, rowLockClause, statusPredicate), args...)
++		} else {
++			args := append([]any{actor, now}, rowLockArgs...)
++			args = append(args, id, oldIssue.RowVersion)
++			args = append(args, statusArgs...)
++			//nolint:gosec // G201: table is one of two hardcoded constants
++			res, err = r.runner.ExecContext(ctx, fmt.Sprintf(`
++				UPDATE %s
++				SET assignee = ?, status = 'in_progress', updated_at = ?, %s
++				WHERE id = ? AND row_lock = ? AND (%s)
++			`, table, rowLockClause, statusPredicate), args...)
++		}
++		if err != nil {
++			return domain.ClaimRowResult{}, fmt.Errorf("db: Claim %s: %w", id, err)
++		}
++		rows, err = res.RowsAffected()
++		if err != nil {
++			return domain.ClaimRowResult{}, fmt.Errorf("db: Claim %s: rows affected: %w", id, err)
++		}
+ 	}
+ 
+ 	if rows == 0 {
+diff --git a/internal/storage/domain/issue.go b/internal/storage/domain/issue.go
+index 27875763e..9977c2a47 100644
+--- a/internal/storage/domain/issue.go
++++ b/internal/storage/domain/issue.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/steveyegge/beads/internal/storage"
+ 	"github.com/steveyegge/beads/internal/storage/dberrors"
+ 	"github.com/steveyegge/beads/internal/types"
++	"github.com/steveyegge/beads/internal/validation"
+ 	publicops "github.com/steveyegge/beads/issueops"
+ )
+ 
+@@ -566,7 +567,7 @@ func (u *issueUseCaseImpl) claim(ctx context.Context, id, actor string, useWisp
+ 	if row.Updated {
+ 		return ClaimResult{}, nil
+ 	}
+-	if row.CurrentAssignee == actor && row.CurrentStatus == types.StatusInProgress {
++	if validation.ActorMatches(row.CurrentAssignee, actor) && row.CurrentStatus == types.StatusInProgress {
+ 		return ClaimResult{AlreadyClaimed: true, PriorAssignee: actor}, nil
+ 	}
+ 	// The refusal carries the assignee and status the repository read back in
+@@ -586,7 +587,7 @@ func (u *issueUseCaseImpl) claim(ctx context.Context, id, actor string, useWisp
+ 	// domain-stack twin of that producer and must answer the same three ways
+ 	// (bd-at6rc).
+ 	refusal := fmt.Errorf("%w%s%s", storage.ErrNotClaimable, storage.NotClaimableStatusFragment, row.CurrentStatus)
+-	if row.CurrentAssignee != "" && row.CurrentAssignee != actor {
++	if row.CurrentAssignee != "" && !validation.ActorMatches(row.CurrentAssignee, actor) {
+ 		switch {
+ 		// Pool aliases refuse on the STATUS, checked first so a pool never
+ 		// reaches the holder-steering copy below.
+@@ -612,6 +613,14 @@ func (u *issueUseCaseImpl) claim(ctx context.Context, id, actor string, useWisp
+ 	}
+ }
+ 
++// ApplyUpdate applies spec's guarded field updates and returns the resulting
++// issue. When ExpectedAssignee is set, the guard compares under
++// validation.ActorMatches, not verbatim ==, so two spellings of the same
++// identity (ga-wzl83) don't false-mismatch — the unit-of-work twin of
++// issueops.CheckExpectedFieldsInTx's SQL-CAS guard; both paths of
++// AuthorizeAssigneeTransferWithPools already made this fix, this was the
++// third, previously-split verbatim-comparison surface (ga-5ksp5, gate review
++// on #5439).
+ func (u *issueUseCaseImpl) ApplyUpdate(ctx context.Context, id string, spec UpdateSpec, actor string) (*types.Issue, error) {
+ 	if id == "" {
+ 		return nil, fmt.Errorf("ApplyUpdate: id must not be empty")
+@@ -638,7 +647,7 @@ func (u *issueUseCaseImpl) ApplyUpdate(ctx context.Context, id string, spec Upda
+ 		if spec.ExpectedVersion != nil && current.RowVersion != *spec.ExpectedVersion {
+ 			return nil, fmt.Errorf("%w: expected %d, got %d", storage.ErrVersionMismatch, *spec.ExpectedVersion, current.RowVersion)
+ 		}
+-		if spec.ExpectedAssignee != nil && current.Assignee != *spec.ExpectedAssignee {
++		if spec.ExpectedAssignee != nil && !validation.ActorMatches(current.Assignee, *spec.ExpectedAssignee) {
+ 			return nil, fmt.Errorf("%w: %s is held by %q, expected %q",
+ 				storage.ErrAssigneeMismatch, id, current.Assignee, *spec.ExpectedAssignee)
+ 		}
+diff --git a/internal/storage/embeddeddolt/lease_test.go b/internal/storage/embeddeddolt/lease_test.go
+index 508248705..cb712b1a8 100644
+--- a/internal/storage/embeddeddolt/lease_test.go
++++ b/internal/storage/embeddeddolt/lease_test.go
+@@ -184,6 +184,58 @@ func TestReclaimExpiredLeaseSurvivesRestartEmbedded(t *testing.T) {
+ 	}
+ }
+ 
++// TestHeartbeatMatchesActorAcrossSpellingEmbedded pins ga-v2k49 (the
++// remaining-sites follow-up to ga-wzl83/ga-5ksp5): a heartbeat succeeds when
++// actor is a different layer's spelling of the same identity the issue was
++// claimed under, and still refuses a genuinely different identity. The
++// primary UPDATE's own holder=? predicate stays verbatim SQL by design (see
++// lease.go); this test exercises the fallback path that makes the caller's
++// experience correct anyway, including that it re-arms the lease row under
++// actor's current spelling so the NEXT heartbeat hits the fast path.
++func TestHeartbeatMatchesActorAcrossSpellingEmbedded(t *testing.T) {
++	skipUnlessEmbeddedDolt(t)
++
++	te := newTestEnv(t, "lease_spelling")
++	ctx := t.Context()
++
++	issue := &types.Issue{
++		ID:        "lease-spelling-1",
++		Title:     "heartbeat across spelling",
++		Status:    types.StatusOpen,
++		Priority:  2,
++		IssueType: types.TypeTask,
++	}
++	if err := te.store.CreateIssue(ctx, issue, "seeder"); err != nil {
++		t.Fatalf("CreateIssue: %v", err)
++	}
++	if err := te.store.ClaimIssue(ctx, "lease-spelling-1", "gastown.mayor"); err != nil {
++		t.Fatalf("ClaimIssue: %v", err)
++	}
++
++	// Same identity, dot-separator form sanitized to double-underscore (the
++	// exact ga-wzl83 repro shape) — must succeed, not ErrAlreadyClaimed.
++	if err := te.store.HeartbeatIssue(ctx, "lease-spelling-1", "gastown__mayor"); err != nil {
++		t.Fatalf("cross-spelling HeartbeatIssue: %v, want success (same identity, different separator)", err)
++	}
++
++	// The re-arm re-wrote holder under the caller's current spelling, so the
++	// NEXT heartbeat under that same spelling hits the primary UPDATE's fast
++	// path directly (0 rows would mean it fell to the fallback again).
++	var holder string
++	te.queryScalar(t, ctx, "SELECT holder FROM leases WHERE issue_id = ?", []any{"lease-spelling-1"}, &holder)
++	if holder != "gastown__mayor" {
++		t.Errorf("lease holder after cross-spelling heartbeat = %q, want re-armed to %q", holder, "gastown__mayor")
++	}
++
++	// Control: a genuinely different identity — canonicalActor's own doc
++	// comment names this exact pair as one that must stay distinct — is still
++	// refused. Without this, a broken canonicalization that matched everyone
++	// would pass the assertion above for the wrong reason.
++	if err := te.store.HeartbeatIssue(ctx, "lease-spelling-1", "gastown.dog-3"); !errors.Is(err, storage.ErrAlreadyClaimed) {
++		t.Errorf("stranger heartbeat err = %v, want ErrAlreadyClaimed", err)
++	}
++}
++
+ func TestHeartbeatRejectsWispEmbedded(t *testing.T) {
+ 	skipUnlessEmbeddedDolt(t)
+ 
+diff --git a/internal/storage/issueops/aggregate.go b/internal/storage/issueops/aggregate.go
+index 12ea0616d..3478e19b9 100644
+--- a/internal/storage/issueops/aggregate.go
++++ b/internal/storage/issueops/aggregate.go
+@@ -145,13 +145,26 @@ func ValidateScalarUpdates(ctx context.Context, tx DBTX, updates map[string]inte
+ // it, so the two cannot drift into disagreeing about which transfers are
+ // fenced.
+ //
++// The no-op and self-transfer exits (request.Patch.Assignee.Value against
++// before.Assignee, and before.Assignee against request.Actor) are judged
++// under actorMatches, not verbatim equality (ga-5ksp5): the same Gas Town
++// identity arrives here spelled differently depending on which layer
++// produced the string (a dotted alias vs its session-name form — see
++// canonicalActor), and a byte-for-byte comparison would wrongly fence a
++// holder editing its own claim, or reject an idempotent re-assert, just
++// because the caller named the holder under a different layer's spelling.
++//
+ // Passing nil pools answers every question except pool membership, so a caller
+ // that wants the config read only when it matters calls with nil first and
+ // re-evaluates with the loaded aliases on refusal.
+ func AuthorizeAssigneeTransferWithPools(before *types.Issue, request publicops.UpdateRequest, pools []string) error {
+-	if !request.Patch.Assignee.Set || request.Patch.Assignee.Value == before.Assignee || request.ExpectedAssignee != nil || request.ForceAssigneeTransfer || before.Status != types.StatusInProgress || before.Assignee == "" || before.Assignee == request.Actor {
++	if !request.Patch.Assignee.Set || actorMatches(request.Patch.Assignee.Value, before.Assignee) || request.ExpectedAssignee != nil || request.ForceAssigneeTransfer || before.Status != types.StatusInProgress || before.Assignee == "" || actorMatches(before.Assignee, request.Actor) {
+ 		return nil
+ 	}
++	// Exact-string membership, deliberately not actorMatches (ga-v2k49, same
++	// reason as claim.go's identical pool checks): a pool alias is a literal
++	// claim.pools config value, not a Gas Town identity that gets respelled
++	// per layer, so there is no cross-spelling variant to reconcile.
+ 	for _, pool := range pools {
+ 		if pool == before.Assignee {
+ 			return nil
+diff --git a/internal/storage/issueops/aggregate_authorize_transfer_test.go b/internal/storage/issueops/aggregate_authorize_transfer_test.go
+index f9950f682..615e130c2 100644
+--- a/internal/storage/issueops/aggregate_authorize_transfer_test.go
++++ b/internal/storage/issueops/aggregate_authorize_transfer_test.go
+@@ -73,6 +73,31 @@ func TestAuthorizeAssigneeTransferWithPools(t *testing.T) {
+ 			before:  held(),
+ 			request: transfer(func(r *publicops.UpdateRequest) { r.Actor = "holder" }),
+ 		},
++		{
++			// ga-5ksp5: the same Gas Town identity spelled two different
++			// ways (dot vs underscore separator) must still count as
++			// "actor already holds it", not a foreign transfer.
++			name:    "actor already holds it under a different spelling",
++			before:  &types.Issue{ID: "bd-1", Status: types.StatusInProgress, Assignee: "gastown.mayor"},
++			request: transfer(func(r *publicops.UpdateRequest) { r.Actor = "gastown_mayor" }),
++		},
++		{
++			// ga-5ksp5: reasserting the current holder under a different
++			// (and doubled-separator) spelling is still the same
++			// idempotent no-op as reasserting it verbatim.
++			name:    "reasserts the current assignee under a different spelling",
++			before:  &types.Issue{ID: "bd-1", Status: types.StatusInProgress, Assignee: "gastown.mayor"},
++			request: transfer(func(r *publicops.UpdateRequest) { r.Patch.Assignee.Value = "gastown__mayor" }),
++		},
++		{
++			// ga-5ksp5: canonicalization must not over-match — an actor
++			// whose identity genuinely differs from the holder (not just
++			// a respelling of it) stays refused.
++			name:    "foreign actor with an unrelated identity is still refused",
++			before:  &types.Issue{ID: "bd-1", Status: types.StatusInProgress, Assignee: "gastown.mayor"},
++			request: transfer(func(r *publicops.UpdateRequest) { r.Actor = "gastown_dog-1" }),
++			refuse:  true,
++		},
+ 		{
+ 			name:    "holder is a configured pool alias",
+ 			before:  &types.Issue{ID: "bd-1", Status: types.StatusInProgress, Assignee: "crew"},
+diff --git a/internal/storage/issueops/claim.go b/internal/storage/issueops/claim.go
+index 6355a9983..3772906b1 100644
+--- a/internal/storage/issueops/claim.go
++++ b/internal/storage/issueops/claim.go
+@@ -76,48 +76,63 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to resolve claim pools: %w", err)
+ 	}
+-	assigneePredicate := "assignee = '' OR assignee IS NULL OR assignee = ?"
+-	assigneeArgs := []interface{}{actor}
+-	if len(pools) > 0 {
+-		poolPlaceholders, poolArgs := buildSQLInClause(pools)
+-		assigneePredicate += " OR assignee IN (" + poolPlaceholders + ")"
+-		assigneeArgs = append(assigneeArgs, poolArgs...)
+-	}
+ 
+-	// Conditional UPDATE: only succeeds while the issue is still claimable.
+-	// Also set started_at on first transition to in_progress (GH#2796); preserve
+-	// any existing value so re-claims don't overwrite the original start time.
+-	var (
+-		result sql.Result
+-	)
+-	if oldIssue.StartedAt == nil {
+-		args := append([]interface{}{actor, now, now}, rowLockArgs...)
+-		args = append(args, id)
+-		args = append(args, statusArgs...)
+-		args = append(args, assigneeArgs...)
+-		result, err = tx.ExecContext(ctx, fmt.Sprintf(`
+-			UPDATE %s
+-			SET assignee = ?, status = 'in_progress', updated_at = ?, started_at = ?, %s
+-			WHERE id = ? AND status IN (%s) AND (%s)
+-		`, issueTable, rowLockClause, statusPlaceholders, assigneePredicate), args...)
+-	} else {
+-		args := append([]interface{}{actor, now}, rowLockArgs...)
+-		args = append(args, id)
+-		args = append(args, statusArgs...)
+-		args = append(args, assigneeArgs...)
+-		result, err = tx.ExecContext(ctx, fmt.Sprintf(`
+-			UPDATE %s
+-			SET assignee = ?, status = 'in_progress', updated_at = ?, %s
+-			WHERE id = ? AND status IN (%s) AND (%s)
+-		`, issueTable, rowLockClause, statusPlaceholders, assigneePredicate), args...)
+-	}
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to claim issue: %w", err)
+-	}
++	// Claimability of the assignee slot, judged in Go against oldIssue (the
++	// pre-image read above, inside this same transaction) rather than as a
++	// spelling-sensitive SQL predicate (ga-v2k49, same shape as ga-5ksp5's
++	// unclaim.go fix): empty/unassigned, already this actor — including an
++	// idempotent re-claim spelled under a different layer's separator
++	// convention (ga-wzl83) — or assigned to a claim-pool alias. That last
++	// membership test is deliberately exact-string, unlike actorMatches right
++	// beside it: a pool alias (e.g. "fable-crew") is a literal claim.pools
++	// config value, not a Gas Town identity that gets respelled per layer, so
++	// there is no cross-spelling variant to reconcile — canonicalizing it
++	// could only blur two administratively-distinct pool names into one.
++	assigneeOK := oldIssue.Assignee == "" || actorMatches(oldIssue.Assignee, actor) || slices.Contains(pools, oldIssue.Assignee)
+ 
+-	rowsAffected, err := result.RowsAffected()
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to get rows affected: %w", err)
++	// Conditional UPDATE: only attempted while the issue was still claimable
++	// as of oldIssue, and even then CASed on row_lock rather than re-checking
++	// assignee/status in SQL — row_lock is rewritten by every path that
++	// mutates status/assignee/started_at (see the freshRowLock invariant in
++	// lease.go), so requiring it to still equal oldIssue.RowVersion detects a
++	// race (reassigned, unclaimed, or transitioned between our read and this
++	// write) exactly as precisely as the old predicate did, without
++	// embedding a spelling-sensitive string comparison in SQL. When
++	// assigneeOK is false, skip the UPDATE entirely (there is nothing this
++	// actor could win) and fall straight into the same rowsAffected==0
++	// disambiguation path below — matches today's behavior without a wasted
++	// write attempt. Also set started_at on first transition to in_progress
++	// (GH#2796); preserve any existing value so re-claims don't overwrite the
++	// original start time.
++	var rowsAffected int64
++	if assigneeOK {
++		var result sql.Result
++		if oldIssue.StartedAt == nil {
++			args := append([]interface{}{actor, now, now}, rowLockArgs...)
++			args = append(args, id, oldIssue.RowVersion)
++			args = append(args, statusArgs...)
++			result, err = tx.ExecContext(ctx, fmt.Sprintf(`
++				UPDATE %s
++				SET assignee = ?, status = 'in_progress', updated_at = ?, started_at = ?, %s
++				WHERE id = ? AND row_lock = ? AND status IN (%s)
++			`, issueTable, rowLockClause, statusPlaceholders), args...)
++		} else {
++			args := append([]interface{}{actor, now}, rowLockArgs...)
++			args = append(args, id, oldIssue.RowVersion)
++			args = append(args, statusArgs...)
++			result, err = tx.ExecContext(ctx, fmt.Sprintf(`
++				UPDATE %s
++				SET assignee = ?, status = 'in_progress', updated_at = ?, %s
++				WHERE id = ? AND row_lock = ? AND status IN (%s)
++			`, issueTable, rowLockClause, statusPlaceholders), args...)
++		}
++		if err != nil {
++			return nil, fmt.Errorf("failed to claim issue: %w", err)
++		}
++		rowsAffected, err = result.RowsAffected()
++		if err != nil {
++			return nil, fmt.Errorf("failed to get rows affected: %w", err)
++		}
+ 	}
+ 
+ 	if rowsAffected == 0 {
+@@ -125,10 +140,11 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to get current claim state: %w", err)
+ 		}
+-		// Idempotent: if already claimed in_progress by the same actor, treat as success.
+-		// This supports agent retry workflows where claim may be called multiple
+-		// times after transient failures (GH#8).
+-		if assignee == actor && currentStatus == types.StatusInProgress {
++		// Idempotent: if already claimed in_progress by the same actor —
++		// including a spelling difference across layers (ga-wzl83) — treat as
++		// success. This supports agent retry workflows where claim may be
++		// called multiple times after transient failures (GH#8).
++		if actorMatches(assignee, actor) && currentStatus == types.StatusInProgress {
+ 			return &ClaimResult{OldIssue: oldIssue, IsWisp: isWisp}, nil
+ 		}
+ 		// The refusal carries the state that lost the CAS, read just above in
+@@ -143,12 +159,15 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
+ 		// wraps, which errors.Is, ParseClaimConflict and the proxied batch
+ 		// exit code all key on.
+ 		refusal := fmt.Errorf("%w%s%s", storage.ErrNotClaimable, storage.NotClaimableStatusFragment, currentStatus)
+-		if assignee != "" && assignee != actor {
++		if assignee != "" && !actorMatches(assignee, actor) {
+ 			switch {
+ 			// A pool-assigned issue reaches here only when the CAS lost for a
+ 			// non-assignee reason (status changed underneath us): report the
+ 			// status rather than a misleading held-by-someone refusal. Checked
+ 			// FIRST, so a pool alias never falls into the holder-steering copy.
++			// Exact-string membership, same reason as assigneeOK's identical
++			// term above: a pool alias is a literal config value, not a
++			// respelled identity.
+ 			case slices.Contains(pools, assignee):
+ 				// refusal already names the status.
+ 			case currentStatus == types.StatusOpen:
+diff --git a/internal/storage/issueops/execution.go b/internal/storage/issueops/execution.go
+index ccc7b776b..0c4b591c1 100644
+--- a/internal/storage/issueops/execution.go
++++ b/internal/storage/issueops/execution.go
+@@ -167,7 +167,7 @@ func ExecuteUpdate(ctx context.Context, tx *sql.Tx, request publicops.UpdateRequ
+ 		if err != nil {
+ 			return publicops.UpdateResult{}, nil, err
+ 		}
+-		if claimed.OldIssue.Status != types.StatusInProgress || claimed.OldIssue.Assignee != attempt.Actor {
++		if claimAdvancedTheRow(claimed, attempt.Actor) {
+ 			changedAny = true
+ 			issueTable, _, eventTable, _ := WispTableRouting(claimed.IsWisp)
+ 			tables.Add(issueTable, eventTable)
+@@ -256,6 +256,19 @@ func ExecuteUpdate(ctx context.Context, tx *sql.Tx, request publicops.UpdateRequ
+ 	return publicops.UpdateResult{Issue: hydrated, Changed: changedAny}, tables, nil
+ }
+ 
++// claimAdvancedTheRow reports whether ClaimIssueInTx's CAS represents a real
++// mutation from the pre-image it read, as opposed to an idempotent re-claim
++// that matched the CAS but changed nothing worth staging. Comparing the
++// pre-image assignee to actor verbatim (ga-v2k49, steveyegge's #5479
++// re-review) mistook a holder re-claiming under a respelled identity — a
++// dotted alias vs. its sanitized form, ga-wzl83's repro shape — for a fresh
++// mutation: ClaimIssueInTx's own CAS already treats the two spellings as the
++// same holder and writes nothing, but this check disagreed and staged a
++// phantom issues+events mutation for a request that changed no bytes.
++func claimAdvancedTheRow(claimed *ClaimResult, actor string) bool {
++	return claimed.OldIssue.Status != types.StatusInProgress || !actorMatches(claimed.OldIssue.Assignee, actor)
++}
++
+ // ExecuteClose applies a guarded close in tx and reports durable tables changed.
+ func ExecuteClose(ctx context.Context, tx *sql.Tx, request publicops.CloseRequest) (publicops.CloseResult, ChangedTables, error) {
+ 	attempt := CloneCloseRequest(request)
+diff --git a/internal/storage/issueops/execution_test.go b/internal/storage/issueops/execution_test.go
+new file mode 100644
+index 000000000..b8ebfe3c1
+--- /dev/null
++++ b/internal/storage/issueops/execution_test.go
+@@ -0,0 +1,64 @@
++package issueops
++
++import (
++	"testing"
++
++	"github.com/steveyegge/beads/internal/types"
++)
++
++// TestClaimAdvancedTheRow pins ga-v2k49 (steveyegge's #5479 re-review, the
++// blocking fix-class): ExecuteUpdate's --claim path decided whether to stage
++// a mutation by comparing claimed.OldIssue.Assignee to attempt.Actor
++// verbatim, so a holder re-claiming under a respelled identity (dotted vs
++// sanitized separator, ga-wzl83's repro shape) staged a phantom issues+events
++// mutation for a CAS that ClaimIssueInTx itself correctly treated as a no-op.
++// claimAdvancedTheRow is the extracted decision, tested directly the same
++// way ManageLeaseOnUpdate is above: no SQL involved, ClaimIssueInTx's own
++// CAS semantics are pinned separately by public_claim_test.go.
++func TestClaimAdvancedTheRow(t *testing.T) {
++	tests := []struct {
++		name        string
++		oldStatus   types.Status
++		oldAssignee string
++		actor       string
++		want        bool
++	}{
++		{
++			name: "fresh claim from open and unassigned", oldStatus: types.StatusOpen, oldAssignee: "",
++			actor: "alice", want: true,
++		},
++		{
++			name: "idempotent reclaim by the holder, same spelling", oldStatus: types.StatusInProgress,
++			oldAssignee: "alice", actor: "alice", want: false,
++		},
++		{
++			// ga-v2k49's own repro shape (ga-wzl83): the same identity, spelled
++			// under two layers' different separator conventions.
++			name: "idempotent reclaim by the holder, cross-spelling", oldStatus: types.StatusInProgress,
++			oldAssignee: "gastown__mayor", actor: "gastown.mayor", want: false,
++		},
++		{
++			// Not-a-no-op control (canonicalActor's own doc-comment pair): a
++			// canonicalization broad enough to match everyone would pass the
++			// case above for the wrong reason.
++			name: "genuinely different identity despite similar separator style", oldStatus: types.StatusInProgress,
++			oldAssignee: "gastown.mayor", actor: "gastown.dog-3", want: true,
++		},
++		{
++			// A pool-alias claim (ClaimPoolAliasesInTx) can win the CAS while
++			// already in_progress: the row transitions from the pool alias to
++			// the real claimant, which is a genuine mutation despite the status
++			// staying in_progress throughout.
++			name: "pool-alias claim transitions to the real claimant", oldStatus: types.StatusInProgress,
++			oldAssignee: "pool:dogs", actor: "alice", want: true,
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			claimed := &ClaimResult{OldIssue: &types.Issue{Status: tt.oldStatus, Assignee: tt.oldAssignee}}
++			if got := claimAdvancedTheRow(claimed, tt.actor); got != tt.want {
++				t.Errorf("claimAdvancedTheRow() = %v, want %v", got, tt.want)
++			}
++		})
++	}
++}
+diff --git a/internal/storage/issueops/identity.go b/internal/storage/issueops/identity.go
+new file mode 100644
+index 000000000..ccac9a240
+--- /dev/null
++++ b/internal/storage/issueops/identity.go
+@@ -0,0 +1,69 @@
++package issueops
++
++import "strings"
++
++// canonicalActor normalizes an identity string so two spellings of the same
++// Gas Town identity compare equal. The same identity arrives at bd in more
++// than one spelling depending on which layer produced the string it was
++// handed: a dotted alias like "gastown.mayor" gets its dot replaced wherever
++// a dot is unsafe for that context — "__" in a session name, "_" in a Dolt
++// table/database name, "-" elsewhere — and bd only ever sees the resulting
++// string, never the substitution itself (ga-wzl83). None of ".", "_", "-"
++// carries meaning in an identity string: each is always a positional
++// separator between a rig and a role/agent name, never part of either name.
++// Collapsing any run of them to one canonical separator lets two spellings
++// of the same identity compare equal without weakening comparisons between
++// genuinely different identities, whose non-separator characters still
++// differ (e.g. "gastown.mayor" vs "gastown.dog-3" stay distinct).
++//
++// Empty stays empty: an actual absence of an actor must never canonicalize
++// to the same value as a non-empty one, or a caller comparing against an
++// unassigned issue would start matching everyone.
++//
++// This is a package-local duplicate of internal/validation/issue.go's
++// canonicalActor (ga-wzl83): issueops sits below validation in the layering
++// (storage depending on a higher-level validation package would invert it),
++// so the two copies stay independent rather than sharing an import. Keep
++// them in sync if the separator set or normalization rule ever changes
++// (ga-5ksp5).
++func canonicalActor(s string) string {
++	if s == "" {
++		return ""
++	}
++	var b strings.Builder
++	b.Grow(len(s))
++	inSeparator := false
++	for _, r := range s {
++		switch r {
++		case '.', '_', '-':
++			if !inSeparator {
++				b.WriteByte('_')
++				inSeparator = true
++			}
++		default:
++			b.WriteRune(r)
++			inSeparator = false
++		}
++	}
++	return b.String()
++}
++
++// actorMatches reports whether a and b denote the same identity: either
++// they're byte-identical, or they canonicalize to the same string (see
++// canonicalActor). The byte-identical check is not redundant — it avoids
++// paying canonicalization on the overwhelmingly common exact-match path.
++func actorMatches(a, b string) bool {
++	return a == b || canonicalActor(a) == canonicalActor(b)
++}
++
++// ActorMatches is the exported form of actorMatches. Exported for the
++// proxied-server (uow) claim path in internal/storage/domain/db (ga-v2k49),
++// which builds its own claim UPDATE rather than calling ClaimIssueInTx —
++// same reason lease.go's RowLockClause and FreshRowLock are exported, and
++// same package-local-duplicate-over-cross-layer-import tradeoff documented on
++// canonicalActor above: domain/db already depends on issueops for the
++// row_lock and pool/status helpers, so reusing this one too adds no new
++// layering edge, unlike importing validation would.
++func ActorMatches(a, b string) bool {
++	return actorMatches(a, b)
++}
+diff --git a/internal/storage/issueops/identity_parity_test.go b/internal/storage/issueops/identity_parity_test.go
+new file mode 100644
+index 000000000..189272ebf
+--- /dev/null
++++ b/internal/storage/issueops/identity_parity_test.go
+@@ -0,0 +1,71 @@
++package issueops
++
++import (
++	"testing"
++
++	"github.com/steveyegge/beads/internal/validation"
++)
++
++// TestIdentityCanonicalizationParityWithValidation guards the two
++// intentionally-duplicated copies of the identity-canonicalization rule
++// (this package's canonicalActor/actorMatches, internal/validation's
++// exported CanonicalActor/ActorMatches) against silent drift. issueops
++// cannot import internal/storage/domain — internal/storage/issueops already
++// imports internal/storage/domain in several files (config_helpers.go,
++// dependencies.go, etc.), so the reverse import would cycle — but it CAN
++// safely import internal/validation (validation depends only on
++// internal/types), and does so here for test purposes only. Per the ga-3ipxu
++// gate review on #5439: "I won't hold the PR for extraction to a shared leaf
++// package, but two keep-in-sync copies need at least a cross-package parity
++// test so the tables can't drift silently." Run the identical case tables
++// TestCanonicalActor/TestActorMatches already pin in
++// internal/validation/issue_test.go through BOTH implementations; a future
++// edit to either separator set or matching rule that isn't mirrored in the
++// other fails here, not in production.
++func TestIdentityCanonicalizationParityWithValidation(t *testing.T) {
++	canonicalCases := []struct {
++		name string
++		in   string
++	}{
++		{name: "empty stays empty", in: ""},
++		{name: "no separators is unchanged", in: "alice"},
++		{name: "dot separator canonicalizes", in: "gastown.mayor"},
++		{name: "double-underscore separator canonicalizes to the same form", in: "gastown__mayor"},
++		{name: "hyphen separator canonicalizes to the same form", in: "gastown-mayor"},
++		{name: "single underscore is already canonical", in: "gastown_mayor"},
++		{name: "mixed separators each collapse to one canonical separator", in: "gastown.dog-3"},
++		{name: "leading separator is preserved as a separator, not dropped", in: ".mayor"},
++		{name: "trailing separator is preserved as a separator, not dropped", in: "mayor."},
++	}
++	for _, tc := range canonicalCases {
++		t.Run("CanonicalActor/"+tc.name, func(t *testing.T) {
++			local := canonicalActor(tc.in)
++			shared := validation.CanonicalActor(tc.in)
++			if local != shared {
++				t.Errorf("issueops.canonicalActor(%q) = %q, internal/validation.CanonicalActor(%q) = %q — the two copies have drifted apart",
++					tc.in, local, tc.in, shared)
++			}
++		})
++	}
++
++	matchCases := []struct {
++		name            string
++		assignee, actor string
++	}{
++		{name: "byte-identical matches", assignee: "alice", actor: "alice"},
++		{name: "different spellings of the same identity match (ga-wzl83)", assignee: "gastown.mayor", actor: "gastown__mayor"},
++		{name: "genuinely different identities do not match", assignee: "gastown.mayor", actor: "gastown.dog-3"},
++		{name: "both empty match", assignee: "", actor: ""},
++		{name: "empty assignee never matches a non-empty actor", assignee: "", actor: "mayor"},
++	}
++	for _, tc := range matchCases {
++		t.Run("ActorMatches/"+tc.name, func(t *testing.T) {
++			local := actorMatches(tc.assignee, tc.actor)
++			shared := validation.ActorMatches(tc.assignee, tc.actor)
++			if local != shared {
++				t.Errorf("issueops.actorMatches(%q, %q) = %v, internal/validation.ActorMatches(%q, %q) = %v — the two copies have drifted apart",
++					tc.assignee, tc.actor, local, tc.assignee, tc.actor, shared)
++			}
++		})
++	}
++}
+diff --git a/internal/storage/issueops/lease.go b/internal/storage/issueops/lease.go
+index 8ec9be638..cdff351f1 100644
+--- a/internal/storage/issueops/lease.go
++++ b/internal/storage/issueops/lease.go
+@@ -259,6 +259,16 @@ func RestoreLeaseOnImportInTx(ctx context.Context, tx DBTX, issue *types.Issue,
+ 	// An upsert over an existing row may have ended or transferred the claim
+ 	// (e.g. a newer snapshot closed the issue): drop a lease row that no
+ 	// longer matches a live claim by its holder.
++	//
++	// This join is a SQL equality (i.assignee = leases.holder), not
++	// actorMatches — a query predicate can't canonicalize across a join the
++	// way Go code can, so a lease granted under one spelling of an identity
++	// can be dropped here if the issue's stored assignee is later written
++	// under a different, equivalent spelling (ga-v2k49). Bounded and
++	// self-healing: HeartbeatIssueInTx's disambiguation fallback re-arms the
++	// lease under the caller's current spelling on the next beat, so the gap
++	// is one issue briefly in_progress with no lease row (visible to
++	// stale/reclaim reads), never a stuck state.
+ 	if !isNew {
+ 		_, err := tx.ExecContext(ctx, `
+ 			DELETE FROM leases WHERE issue_id = ?
+@@ -323,14 +333,28 @@ func HeartbeatIssueInTx(ctx context.Context, tx DBTX, id, actor string) error {
+ 		if qerr != nil {
+ 			return fmt.Errorf("%w: %s", storage.ErrNotClaimable, id)
+ 		}
+-		if assignee != "" && assignee != actor {
++		// Judged under actorMatches, not verbatim (ga-v2k49): the primary
++		// UPDATE's own `holder = ?` predicate above stays a verbatim SQL
++		// comparison deliberately — fixing it would mean pre-reading the
++		// lease row on every heartbeat (the hottest write in the fleet, see
++		// above) just to bind back its own holder value. A spelling
++		// difference across layers (ga-wzl83) already makes that predicate
++		// affect 0 rows and fall here; fixing the disambiguation instead
++		// means the caller still self-heals correctly (re-arms below, under
++		// its current spelling) at the cost of the slow path on a spelling
++		// mismatch, never on the byte-identical common case.
++		if assignee != "" && !actorMatches(assignee, actor) {
+ 			return fmt.Errorf("%w by %s", storage.ErrAlreadyClaimed, assignee)
+ 		}
+-		if !isWisp && assignee == actor && status == string(types.StatusInProgress) {
++		if !isWisp && actorMatches(assignee, actor) && status == string(types.StatusInProgress) {
+ 			// The caller genuinely holds the claim but has no lease row — e.g.
+ 			// the claim was hand-doled through a generic update (which never
+-			// arms a lease, bd-9hpgf) and the worker is now opting into lease
+-			// semantics. A real worker's heartbeat re-arms recovery.
++			// arms a lease, bd-9hpgf), the worker is now opting into lease
++			// semantics, or (ga-v2k49) the existing lease row's holder is a
++			// different spelling of the same identity (ga-wzl83) and the
++			// primary UPDATE's verbatim predicate above missed it. A real
++			// worker's heartbeat re-arms recovery — under actor's current
++			// spelling, which is what the next heartbeat's fast path will see.
+ 			return UpsertLeaseInTx(ctx, tx, id, actor, now, leaseTTL(ctx))
+ 		}
+ 		return fmt.Errorf("%w: %s status %s", storage.ErrNotClaimable, id, status)
+diff --git a/internal/storage/issueops/public_claim.go b/internal/storage/issueops/public_claim.go
+index 3b19eaeab..dcf8c6e86 100644
+--- a/internal/storage/issueops/public_claim.go
++++ b/internal/storage/issueops/public_claim.go
+@@ -40,8 +40,15 @@ func ExecuteClaim(ctx context.Context, tx *sql.Tx, request publicops.ClaimReques
+ 	// progress, and ClaimIssueInTx reports that as success. The pre-image is
+ 	// what tells the two apart, and staging nothing for the idempotent case is
+ 	// what keeps a polling caller from minting empty version-control commits.
++	// Judged under actorMatches, not verbatim (ga-v2k49): a caller re-claiming
++	// its own in-progress issue under a different layer's spelling of its own
++	// identity (ga-wzl83) is still a no-op — ClaimIssueInTx's own idempotency
++	// check already agrees under the same comparison, and this site would
++	// otherwise disagree with it and stage a phantom mutation for a request
++	// that wrote nothing (caught by TestExecuteClaimIdempotentReclaimAcross-
++	// SpellingStagesNothing during this fix, not cited by the original review).
+ 	tables := ChangedTables{}
+-	changed := claimed.OldIssue.Status != types.StatusInProgress || claimed.OldIssue.Assignee != request.Actor
++	changed := claimed.OldIssue.Status != types.StatusInProgress || !actorMatches(claimed.OldIssue.Assignee, request.Actor)
+ 	if changed {
+ 		issueTable, _, eventTable, _ := WispTableRouting(claimed.IsWisp)
+ 		tables.Add(issueTable, eventTable)
+diff --git a/internal/storage/issueops/public_claim_test.go b/internal/storage/issueops/public_claim_test.go
+index 828ce95a5..72c7811a1 100644
+--- a/internal/storage/issueops/public_claim_test.go
++++ b/internal/storage/issueops/public_claim_test.go
+@@ -115,14 +115,21 @@ func TestExecuteClaimReportsTheStateThatLostTheCAS(t *testing.T) {
+ 		// still carries the holder it read; only the wire decides whether to
+ 		// publish it.
+ 		wantAssignee string
++		// attemptsUpdate: ClaimIssueInTx only issues the UPDATE when the
++		// pre-image says the actor could possibly win the CAS (ga-v2k49 —
++		// same early-skip shape as unclaim.go's ownership precheck). "held by
++		// another actor" never could, so no UPDATE is attempted at all; "not
++		// in a claimable state" has an empty (claimable-by-anyone) assignee,
++		// so the UPDATE is attempted and loses on the status predicate.
++		attemptsUpdate bool
+ 	}{
+ 		{
+ 			name: "held by another actor", assignee: "bob", status: types.StatusOpen,
+-			sentinel: storage.ErrAlreadyClaimed, wantAssignee: "bob",
++			sentinel: storage.ErrAlreadyClaimed, wantAssignee: "bob", attemptsUpdate: false,
+ 		},
+ 		{
+ 			name: "not in a claimable state", assignee: "", status: types.StatusClosed,
+-			sentinel: storage.ErrNotClaimable,
++			sentinel: storage.ErrNotClaimable, attemptsUpdate: true,
+ 		},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+@@ -130,7 +137,9 @@ func TestExecuteClaimReportsTheStateThatLostTheCAS(t *testing.T) {
+ 
+ 			const id = "bd-1"
+ 			expectClaimableRead(mock, id, tc.assignee, tc.status)
+-			mock.ExpectExec(`(?s)UPDATE issues\s+SET assignee`).WillReturnResult(sqlmock.NewResult(0, 0))
++			if tc.attemptsUpdate {
++				mock.ExpectExec(`(?s)UPDATE issues\s+SET assignee`).WillReturnResult(sqlmock.NewResult(0, 0))
++			}
+ 			expectClaimStateRead(mock, id, tc.assignee, tc.status)
+ 			// The role's own re-read, which is what carries the state out.
+ 			expectClaimStateRead(mock, id, tc.assignee, tc.status)
+@@ -196,6 +205,80 @@ func TestExecuteClaimIdempotentReclaimStagesNothing(t *testing.T) {
+ 	}
+ }
+ 
++// TestExecuteClaimIdempotentReclaimAcrossSpellingStagesNothing pins ga-v2k49
++// (the ga-wzl83/ga-5ksp5 follow-up steveyegge's #5438 review enumerated): the
++// idempotent re-claim above must also hold when the caller's actor and the
++// stored assignee are the same identity spelled under two different layers'
++// separator conventions (dot vs sanitized double-underscore — the ga-wzl83
++// repro shape), not just byte-identical.
++func TestExecuteClaimIdempotentReclaimAcrossSpellingStagesNothing(t *testing.T) {
++	_, mock, tx := beginMockTx(t)
++
++	const id = "bd-1"
++	const storedAssignee = "gastown__mayor" // sanitized form, as persisted
++	const actor = "gastown.mayor"           // dotted form, as this caller spells itself
++	expectClaimableRead(mock, id, storedAssignee, types.StatusInProgress)
++	mock.ExpectExec(`(?s)UPDATE issues\s+SET assignee`).WillReturnResult(sqlmock.NewResult(0, 0))
++	expectClaimStateRead(mock, id, storedAssignee, types.StatusInProgress)
++	mock.ExpectQuery(regexp.QuoteMeta("SELECT " + IssueSelectColumns + " FROM issues " + sqlbuild.LeaseJoin("issues") + " WHERE id = ?")).
++		WithArgs(id).
++		WillReturnRows(claimIssueRow(id, storedAssignee, types.StatusInProgress))
++	mock.ExpectQuery(regexp.QuoteMeta("SELECT label FROM labels WHERE issue_id = ? ORDER BY label")).
++		WithArgs(id).
++		WillReturnRows(sqlmock.NewRows([]string{"label"}))
++
++	result, tables, err := ExecuteClaim(context.Background(), tx, publicops.ClaimRequest{Actor: actor, IssueID: id})
++	if err != nil {
++		t.Fatalf("ExecuteClaim: %v, want success (same identity, different separator spelling)", err)
++	}
++	if result.Changed {
++		t.Error("a cross-spelling re-claim by the holder reported a persisted mutation")
++	}
++	if len(tables) != 0 {
++		t.Errorf("a cross-spelling re-claim by the holder staged %v; nothing changed, so nothing may be committed", tables)
++	}
++	if result.Issue == nil || result.Issue.Assignee != storedAssignee || result.Issue.Status != types.StatusInProgress {
++		t.Errorf("result issue = %+v, want the post-state row (assignee stays in its stored spelling %q)", result.Issue, storedAssignee)
++	}
++	if err := mock.ExpectationsWereMet(); err != nil {
++		t.Fatalf("unmet SQL expectations: %v", err)
++	}
++}
++
++// TestExecuteClaimRefusesGenuinelyDifferentIdentityDespiteSimilarSpelling is
++// the not-a-no-op control for the cross-spelling fix above (steveyegge's
++// #5438 review flagged exactly this shape as the right guard): the pair named
++// in canonicalActor's own doc comment as one that must stay distinct despite
++// sharing a separator style. Without this, a canonicalization broad enough to
++// match everyone would pass the idempotent test above for the wrong reason.
++func TestExecuteClaimRefusesGenuinelyDifferentIdentityDespiteSimilarSpelling(t *testing.T) {
++	_, mock, tx := beginMockTx(t)
++
++	const id = "bd-1"
++	const storedAssignee = "gastown.mayor"
++	const actor = "gastown.dog-3"
++	expectClaimableRead(mock, id, storedAssignee, types.StatusInProgress)
++	// No ExpectExec: a genuinely different identity never had a chance to win
++	// the CAS, so ClaimIssueInTx skips the UPDATE attempt entirely (ga-v2k49
++	// — see attemptsUpdate above).
++	expectClaimStateRead(mock, id, storedAssignee, types.StatusInProgress)
++
++	_, tables, err := ExecuteClaim(context.Background(), tx, publicops.ClaimRequest{Actor: actor, IssueID: id})
++	if !errors.Is(err, storage.ErrAlreadyClaimed) {
++		t.Fatalf("err = %v, want ErrAlreadyClaimed for a genuinely different identity", err)
++	}
++	var conflict *publicops.ClaimConflictError
++	if !errors.As(err, &conflict) || conflict.Assignee != storedAssignee {
++		t.Fatalf("conflict = %+v, want it to name the real holder %q", conflict, storedAssignee)
++	}
++	if len(tables) != 0 {
++		t.Errorf("a refused claim staged %v", tables)
++	}
++	if err := mock.ExpectationsWereMet(); err != nil {
++		t.Fatalf("unmet SQL expectations: %v", err)
++	}
++}
++
+ // TestExecuteClaimStagesTheRowAndEventItWrote: a claim that wins the CAS is a
+ // history-worthy mutation, so it stages the issues and events tables — the
+ // lease grant rides the ephemeral table and is deliberately not staged.
+diff --git a/internal/storage/issueops/unclaim.go b/internal/storage/issueops/unclaim.go
+index 9f9ed7854..e5d2ec95c 100644
+--- a/internal/storage/issueops/unclaim.go
++++ b/internal/storage/issueops/unclaim.go
+@@ -18,8 +18,11 @@ import (
+ //
+ // Ownership: only the current assignee may release its own claim. A mismatched
+ // actor is rejected with storage.ErrNotOwner rather than a silent no-op, so a
+-// second agent cannot yank a claim it does not hold. Pass force=true to bypass
+-// the ownership check (admin/reaper use, threaded from `bd unclaim --force`).
++// second agent cannot yank a claim it does not hold. Ownership is compared
++// under actorMatches (ga-5ksp5), so two spellings of the same Gas Town
++// identity (e.g. a dotted alias vs its session-name form) both count as the
++// owner — see canonicalActor. Pass force=true to bypass the ownership check
++// (admin/reaper use, threaded from `bd unclaim --force`).
+ //
+ // Only works on issues that have an assignee and status is "open" or
+ // "in_progress". Returns error if:
+@@ -51,8 +54,10 @@ func UnclaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string, for
+ 	}
+ 
+ 	// Validate ownership unless the caller forced the release. Without force, a
+-	// process may only release its own claim.
+-	if !force && oldIssue.Assignee != actor {
++	// process may only release its own claim. Compared under actorMatches, not
++	// verbatim, so a caller naming its own identity under a different layer's
++	// spelling (ga-5ksp5) is not refused as a stranger.
++	if !force && !actorMatches(oldIssue.Assignee, actor) {
+ 		return fmt.Errorf("%w: %s is held by %s; coordinate with the holder — pass --force only if their claim is abandoned (crashed agent, expired lease)",
+ 			storage.ErrNotOwner, id, oldIssue.Assignee)
+ 	}
+@@ -60,23 +65,23 @@ func UnclaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string, for
+ 	now := time.Now().UTC()
+ 
+ 	// Atomic UPDATE: clear assignee, reset status to open, clear started_at,
+-	// and rewrite row_lock. The predicate re-checks ownership (unless forced)
+-	// so a claim that changed hands between the read above and this write is
+-	// not clobbered. row_lock forces a racing reclaim/close on the same row to
+-	// conflict rather than silently merge (see lease.go invariant).
+-	ownerPredicate := "AND assignee = ?"
+-	args := []interface{}{now, freshRowLock(), id, actor}
+-	if force {
+-		// Force still requires a current assignee, but from anyone.
+-		ownerPredicate = "AND assignee != ''"
+-		args = []interface{}{now, freshRowLock(), id}
+-	}
++	// and rewrite row_lock. The predicate CASes on row_lock rather than
++	// assignee (ga-5ksp5): ownership was already authorized above (or bypassed
++	// by force) against the row read into oldIssue, and row_lock is rewritten
++	// by every path that mutates status/assignee/started_at (see the
++	// freshRowLock invariant in lease.go) — so requiring it to still equal
++	// oldIssue.RowVersion detects a claim that changed hands (or was released,
++	// or closed) between that read and this write exactly as precisely as the
++	// old `assignee = <actor>` predicate did, without embedding a
++	// spelling-sensitive string comparison in SQL. force does not exempt this
++	// check: force only widens WHO may unclaim, not whether the row is still
++	// the one we read.
+ 	result, err := tx.ExecContext(ctx, fmt.Sprintf(`
+ 		UPDATE %s
+ 		SET assignee = '', status = 'open', updated_at = ?,
+ 		    started_at = NULL, row_lock = ?
+-		WHERE id = ? AND status IN ('open', 'in_progress') %s
+-	`, issueTable, ownerPredicate), args...)
++		WHERE id = ? AND status IN ('open', 'in_progress') AND row_lock = ?
++	`, issueTable), now, freshRowLock(), id, oldIssue.RowVersion)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to unclaim issue: %w", err)
+ 	}
+@@ -89,12 +94,12 @@ func UnclaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string, for
+ 	if rowsAffected == 0 {
+ 		// The pre-checks passed, so a 0-row result means the row changed
+ 		// underneath us: re-read to disambiguate an ownership change from a
+-		// status change.
++		// status change. actorMatches, not verbatim, mirrors the precheck above.
+ 		current, gerr := GetIssueInTx(ctx, tx, id)
+ 		if gerr != nil {
+ 			return fmt.Errorf("failed to unclaim issue %s: no matching row", id)
+ 		}
+-		if !force && current.Assignee != actor {
++		if !force && !actorMatches(current.Assignee, actor) {
+ 			return fmt.Errorf("%w: %s is held by %s; coordinate with the holder — pass --force only if their claim is abandoned (crashed agent, expired lease)",
+ 				storage.ErrNotOwner, id, current.Assignee)
+ 		}
+@@ -127,12 +132,16 @@ func finishUnclaimInTx(ctx context.Context, tx DBTX, eventTable string, id strin
+ 
+ // UnclaimIssueIfAssigneeInTx atomically releases a claim only while the issue is
+ // still assigned to expectedAssignee — the compare-and-swap inverse of
+-// ClaimIssueInTx: a conditional UPDATE ... WHERE id = ? AND assignee = ? with
+-// RowsAffected as the verdict, so a stale releaser can never clobber a claim
+-// that has since moved to (or been re-taken by) someone else. On success it
+-// applies the same transition as UnclaimIssueInTx (assignee cleared, status
+-// reopened, started_at cleared, lease dropped, row_lock rewritten, "unclaimed"
+-// event recorded). When the current assignee differs from expectedAssignee —
++// ClaimIssueInTx: a Go-side actorMatches precheck (ga-5ksp5) plus a conditional
++// UPDATE CASed on row_lock, with RowsAffected as the verdict, so a stale
++// releaser can never clobber a claim that has since moved to (or been
++// re-taken by) someone else. "Still assigned to expectedAssignee" is judged
++// under actorMatches, not verbatim equality, so a caller naming the current
++// holder under a different layer's spelling of the same identity is a match,
++// not a mismatch — see canonicalActor. On success it applies the same
++// transition as UnclaimIssueInTx (assignee cleared, status reopened,
++// started_at cleared, lease dropped, row_lock rewritten, "unclaimed" event
++// recorded). When the current assignee does not match expectedAssignee —
+ // including when the issue is no longer assigned at all — it returns
+ // storage.ErrAssigneeMismatch naming the current holder and leaves the row
+ // untouched. actor is recorded as the event author.
+@@ -159,25 +168,34 @@ func UnclaimIssueIfAssigneeInTx(ctx context.Context, tx DBTX, id string, actor s
+ 	}
+ 
+ 	// Compare-and-swap precheck: a mismatched holder — including an
+-	// already-released issue (empty assignee) — is a loud, typed no-op. The read
+-	// and the UPDATE below run in the same transaction, so this check and the
+-	// CAS WHERE clause see the same row state.
+-	if oldIssue.Assignee != expectedAssignee {
++	// already-released issue (empty assignee) — is a loud, typed no-op. Judged
++	// under actorMatches (ga-5ksp5), not verbatim equality, so expectedAssignee
++	// spelled under a different layer's separator convention than the stored
++	// assignee still counts as a match. The read and the UPDATE below run in
++	// the same transaction, so this check and the CAS WHERE clause see the
++	// same row state.
++	if !actorMatches(oldIssue.Assignee, expectedAssignee) {
+ 		return fmt.Errorf("%w: %s is held by %q, expected %q", storage.ErrAssigneeMismatch, id, oldIssue.Assignee, expectedAssignee)
+ 	}
+ 
+ 	now := time.Now().UTC()
+ 
+-	// Atomic UPDATE pinned to the expected assignee (CAS), applying the same
+-	// transition as UnclaimIssueInTx: clear assignee, reset status to open,
+-	// clear started_at, and rewrite row_lock so a racing reclaim/close on the
+-	// same row conflicts rather than silently merging (see lease.go invariant).
++	// Atomic UPDATE CASed on row_lock rather than assignee (ga-5ksp5): the
++	// Go-side check above already authorized the swap under actorMatches
++	// against the row read into oldIssue, and row_lock is rewritten by every
++	// path that mutates status/assignee/started_at (see the freshRowLock
++	// invariant in lease.go) — so requiring it to still equal
++	// oldIssue.RowVersion applies the same transition as UnclaimIssueInTx
++	// (assignee cleared, status reopened, started_at cleared, row_lock
++	// rewritten) while detecting a racing reclaim/close on the same row exactly
++	// as precisely as the old `assignee = <expectedAssignee>` predicate did,
++	// without embedding a spelling-sensitive string comparison in SQL.
+ 	result, err := tx.ExecContext(ctx, fmt.Sprintf(`
+ 		UPDATE %s
+ 		SET assignee = '', status = 'open', updated_at = ?,
+ 		    started_at = NULL, row_lock = ?
+-		WHERE id = ? AND status IN ('open', 'in_progress') AND assignee = ?
+-	`, issueTable), now, freshRowLock(), id, expectedAssignee)
++		WHERE id = ? AND status IN ('open', 'in_progress') AND row_lock = ?
++	`, issueTable), now, freshRowLock(), id, oldIssue.RowVersion)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to unclaim issue: %w", err)
+ 	}
+@@ -191,13 +209,13 @@ func UnclaimIssueIfAssigneeInTx(ctx context.Context, tx DBTX, id string, actor s
+ 		// The precheck passed and the read + UPDATE share this transaction, so a
+ 		// 0-row result is not an assignee race (the row cannot change under us
+ 		// mid-tx). Re-read and disambiguate, mirroring UnclaimIssueInTx: a
+-		// mismatched holder is the CAS verdict (ErrAssigneeMismatch), otherwise
+-		// the status is no longer releasable.
++		// mismatched holder (under actorMatches) is the CAS verdict
++		// (ErrAssigneeMismatch), otherwise the status is no longer releasable.
+ 		current, gerr := GetIssueInTx(ctx, tx, id)
+ 		if gerr != nil {
+ 			return fmt.Errorf("failed to unclaim issue %s: no matching row", id)
+ 		}
+-		if current.Assignee != expectedAssignee {
++		if !actorMatches(current.Assignee, expectedAssignee) {
+ 			return fmt.Errorf("%w: %s is held by %q, expected %q", storage.ErrAssigneeMismatch, id, current.Assignee, expectedAssignee)
+ 		}
+ 		return fmt.Errorf("failed to unclaim issue %s: no matching row", id)
+diff --git a/internal/storage/issueops/update.go b/internal/storage/issueops/update.go
+index 646021091..0c5c47560 100644
+--- a/internal/storage/issueops/update.go
++++ b/internal/storage/issueops/update.go
+@@ -237,6 +237,13 @@ func ManageLeaseOnUpdate(oldIssue *types.Issue, updates map[string]interface{})
+ 		}
+ 	}
+ 
++	// newAssignee == oldIssue.Assignee is deliberately verbatim, not
++	// actorMatches (ga-v2k49): a generic update that hand-doles the same
++	// identity back under a different layer's spelling genuinely rewrites the
++	// assignee column's bytes, so clearing the lease here (as any other
++	// transfer would) is defensible rather than a false positive — it costs
++	// the holder's live lease, but HeartbeatIssueInTx's fallback re-arms one
++	// under the caller's current spelling on the next beat, so it self-heals.
+ 	sameClaim := newStatus == string(types.StatusInProgress) && newAssignee != "" &&
+ 		oldIssue.Status == types.StatusInProgress && newAssignee == oldIssue.Assignee
+ 	return !sameClaim
+diff --git a/internal/storage/issueops/update_cas.go b/internal/storage/issueops/update_cas.go
+index 101dc5515..4d389a5bd 100644
+--- a/internal/storage/issueops/update_cas.go
++++ b/internal/storage/issueops/update_cas.go
+@@ -24,6 +24,12 @@ import (
+ // retry loop replays — the replayed attempt re-reads here and refuses.
+ // Together they close the read-then-write window.
+ //
++// The assignee guard compares under actorMatches, not verbatim ==, so two
++// spellings of the same identity (ga-wzl83) don't false-mismatch — the same
++// fix already shipped for UnclaimIssueInTx's SQL-CAS predicate and
++// AuthorizeAssigneeTransferWithPools; this was the third, previously-split
++// verbatim-comparison surface (ga-5ksp5, gate review on #5439).
++//
+ //nolint:gosec // G201: table name comes from WispTableRouting (hardcoded constants)
+ func CheckExpectedFieldsInTx(ctx context.Context, tx DBTX, id string, expectedAssignee, expectedStatus *string) error {
+ 	if expectedAssignee == nil && expectedStatus == nil {
+@@ -43,7 +49,7 @@ func CheckExpectedFieldsInTx(ctx context.Context, tx DBTX, id string, expectedAs
+ 	if err != nil {
+ 		return fmt.Errorf("failed to read assignee/status for %s: %w", id, err)
+ 	}
+-	if expectedAssignee != nil && assignee.String != *expectedAssignee {
++	if expectedAssignee != nil && !actorMatches(assignee.String, *expectedAssignee) {
+ 		return fmt.Errorf("%w: %s is held by %q, expected %q", storage.ErrAssigneeMismatch, id, assignee.String, *expectedAssignee)
+ 	}
+ 	if expectedStatus != nil && status != *expectedStatus {
+diff --git a/internal/storage/uow/issue_operations.go b/internal/storage/uow/issue_operations.go
+index cd43dddef..887fd8863 100644
+--- a/internal/storage/uow/issue_operations.go
++++ b/internal/storage/uow/issue_operations.go
+@@ -228,7 +228,11 @@ func (o *issueOperations) Update(ctx context.Context, request publicops.UpdateRe
+ 				return publicops.UpdateResult{}, "", err
+ 			}
+ 		}
+-		claimChanged := attempt.Claim && (before.Status != types.StatusInProgress || before.Assignee != attempt.Actor)
++		// ActorMatches (not a verbatim compare, ga-v2k49): a holder re-claiming
++		// under a respelled identity is a real CAS win one layer down (domain/db's
++		// Claim already canonicalizes), so this bookkeeping must recognize it as
++		// the same no-op rather than staging a phantom history entry.
++		claimChanged := attempt.Claim && (before.Status != types.StatusInProgress || !storageissueops.ActorMatches(before.Assignee, attempt.Actor))
+ 		updated, err := uw.IssueUseCase().ApplyUpdate(ctx, attempt.IssueID, spec, attempt.Actor)
+ 		if err != nil {
+ 			return publicops.UpdateResult{}, "", err
+diff --git a/internal/storage/uow/issue_operations_claim_contract_test.go b/internal/storage/uow/issue_operations_claim_contract_test.go
+index bea4ab77c..c4c84067b 100644
+--- a/internal/storage/uow/issue_operations_claim_contract_test.go
++++ b/internal/storage/uow/issue_operations_claim_contract_test.go
+@@ -8,6 +8,7 @@ import (
+ 	"testing"
+ 
+ 	"github.com/steveyegge/beads/internal/storage/domain"
++	storageissueops "github.com/steveyegge/beads/internal/storage/issueops"
+ 	"github.com/steveyegge/beads/internal/types"
+ 	publicops "github.com/steveyegge/beads/issueops"
+ )
+@@ -100,9 +101,21 @@ func (s *claimContractIssues) ReopenIssue(ctx context.Context, id string, _ doma
+ 	return domain.ReopenIssueResult{Issue: issue, Reopened: reopened}, err
+ }
+ 
++// ApplyUpdate mirrors the real CAS's idempotent-preserves-spelling contract
++// (domain/db's Claim, itself required to stay in lockstep with
++// issueops.ClaimIssueInTx, ga-v2k49): a holder re-claiming under a respelled
++// identity wins the CAS without writing, so the stored spelling survives
++// unchanged. Only a genuine transition (not already in_progress under a
++// matching identity) rewrites assignee/status — a fake that overwrote
++// unconditionally would make every cross-spelling reclaim look like a real
++// mutation via semanticIssueEqual, for a reason that has nothing to do with
++// claimChanged itself.
+ func (s *claimContractIssues) ApplyUpdate(ctx context.Context, id string, spec domain.UpdateSpec, actor string) (*types.Issue, error) {
+ 	if spec.Claim && s.issue != nil {
+-		s.issue.Assignee, s.issue.Status = actor, types.StatusInProgress
++		alreadyHeld := s.issue.Status == types.StatusInProgress && storageissueops.ActorMatches(s.issue.Assignee, actor)
++		if !alreadyHeld {
++			s.issue.Assignee, s.issue.Status = actor, types.StatusInProgress
++		}
+ 	}
+ 	if s.isWisp {
+ 		return s.GetWisp(ctx, id)
+@@ -211,6 +224,98 @@ func TestIdempotentClaimRecordsNoHistoryEntry(t *testing.T) {
+ 	}
+ }
+ 
++// TestIdempotentClaimAcrossSpellingRecordsNoHistoryEntry pins ga-v2k49
++// (steveyegge's #5479 re-review, blocking fix-class): the idempotent-reclaim
++// contract above must also hold when the caller's actor and the stored
++// assignee are the same identity spelled under two different layers'
++// separator conventions (ga-wzl83's repro shape: dotted vs. sanitized
++// double-underscore), not just byte-identical. This backend builds its own
++// claimChanged decision rather than routing through ClaimIssueInTx, so it
++// needs its own regression pin independent of public_claim_test.go's.
++func TestIdempotentClaimAcrossSpellingRecordsNoHistoryEntry(t *testing.T) {
++	held := &types.Issue{ID: "bd-1", Status: types.StatusInProgress, Assignee: "gastown__mayor"}
++	operations, uw := newClaimContract(t, held, false)
++
++	result, err := operations.Update(context.Background(), publicops.UpdateRequest{
++		Actor: "gastown.mayor", IssueID: "bd-1", Claim: true, Provenance: "bd serve: claim bd-1 by gastown.mayor",
++	})
++	if err != nil {
++		t.Fatalf("Update: %v, want success (same identity, different separator spelling)", err)
++	}
++	if result.Changed {
++		t.Error("a cross-spelling re-claim by the holder reports a change")
++	}
++	if len(uw.commits) != 0 {
++		t.Errorf("history entries = %q, want none for a claim that wrote nothing", uw.commits)
++	}
++}
++
++// TestClaimByGenuinelyDifferentIdentityRecordsAHistoryEntry is the
++// not-a-no-op control for the cross-spelling fix above: canonicalActor's own
++// documented pair that must stay distinct despite sharing a separator style.
++// Without this, a canonicalization broad enough to match everyone would pass
++// the idempotent test above for the wrong reason.
++func TestClaimByGenuinelyDifferentIdentityRecordsAHistoryEntry(t *testing.T) {
++	held := &types.Issue{ID: "bd-1", Status: types.StatusInProgress, Assignee: "gastown.mayor"}
++	operations, uw := newClaimContract(t, held, false)
++
++	result, err := operations.Update(context.Background(), publicops.UpdateRequest{
++		Actor: "gastown.dog-3", IssueID: "bd-1", Claim: true, Provenance: "bd serve: claim bd-1 by gastown.dog-3",
++	})
++	if err != nil {
++		t.Fatalf("Update: %v", err)
++	}
++	if !result.Changed {
++		t.Error("a claim transferring to a genuinely different identity reports no change")
++	}
++	if len(uw.commits) != 1 {
++		t.Errorf("history entries = %q, want exactly one for a real transfer", uw.commits)
++	}
++}
++
++// TestBatchRunUpdateIdempotentClaimAcrossSpellingReportsNoChange pins the
++// SAME ga-v2k49 contract as TestIdempotentClaimAcrossSpellingRecordsNoHistoryEntry,
++// against uowApplyRun.runUpdate (batch_applier.go) — the batch/plan path's own
++// independent claimChanged expression, reached through ApplyPlan rather than
++// Update. runUpdate's own doc comment says it is reached from
++// issueOperations.Update "so the two cannot drift on ... the Changed rule";
++// that describes an intent, not a mechanism — nothing stops two independent
++// expressions disagreeing, which is exactly what this bug did until both
++// were fixed. runUpdate only touches r.uw, so the same fake UOW plugs in
++// directly without the full BatchApplier/ApplyPlan machinery.
++func TestBatchRunUpdateIdempotentClaimAcrossSpellingReportsNoChange(t *testing.T) {
++	held := &types.Issue{ID: "bd-1", Status: types.StatusInProgress, Assignee: "gastown__mayor"}
++	run := &uowApplyRun{uw: &claimContractUOW{issues: &claimContractIssues{issue: held}}}
++
++	result, err := run.runUpdate(context.Background(), publicops.UpdateRequest{
++		Actor: "gastown.mayor", IssueID: "bd-1", Claim: true,
++	})
++	if err != nil {
++		t.Fatalf("runUpdate: %v, want success (same identity, different separator spelling)", err)
++	}
++	if result.Changed {
++		t.Error("a cross-spelling re-claim by the holder reports a change")
++	}
++}
++
++// TestBatchRunUpdateClaimByGenuinelyDifferentIdentityReportsAChange is the
++// batch-path twin of TestClaimByGenuinelyDifferentIdentityRecordsAHistoryEntry
++// — the not-a-no-op control for the fix above.
++func TestBatchRunUpdateClaimByGenuinelyDifferentIdentityReportsAChange(t *testing.T) {
++	held := &types.Issue{ID: "bd-1", Status: types.StatusInProgress, Assignee: "gastown.mayor"}
++	run := &uowApplyRun{uw: &claimContractUOW{issues: &claimContractIssues{issue: held}}}
++
++	result, err := run.runUpdate(context.Background(), publicops.UpdateRequest{
++		Actor: "gastown.dog-3", IssueID: "bd-1", Claim: true,
++	})
++	if err != nil {
++		t.Fatalf("runUpdate: %v", err)
++	}
++	if !result.Changed {
++		t.Error("a claim transferring to a genuinely different identity reports no change")
++	}
++}
++
+ // An update that carries a patch still records its entry even when the
+ // post-state compares equal: the row was written, whatever the comparison says.
+ func TestSameValueUpdateStillRecordsItsHistoryEntry(t *testing.T) {
+diff --git a/internal/validation/issue.go b/internal/validation/issue.go
+index 4d5561f20..e445cceb5 100644
+--- a/internal/validation/issue.go
++++ b/internal/validation/issue.go
+@@ -3,6 +3,7 @@ package validation
+ import (
+ 	"fmt"
+ 	"slices"
++	"strings"
+ 
+ 	"github.com/steveyegge/beads/internal/types"
+ )
+@@ -70,14 +71,65 @@ func NotPinned(force bool) IssueValidator {
+ 	}
+ }
+ 
++// CanonicalActor normalizes an identity string so two spellings of the same
++// Gas Town identity compare equal. The same identity arrives at bd in more
++// than one spelling depending on which layer produced the string it was
++// handed: a dotted alias like "gastown.mayor" gets its dot replaced wherever
++// a dot is unsafe for that context — "__" in a session name, "_" in a Dolt
++// table/database name, "-" elsewhere — and bd only ever sees the resulting
++// string, never the substitution itself (ga-wzl83). None of ".", "_", "-"
++// carries meaning in an identity string: each is always a positional
++// separator between a rig and a role/agent name, never part of either name.
++// Collapsing any run of them to one canonical separator lets two spellings
++// of the same identity compare equal without weakening comparisons between
++// genuinely different identities, whose non-separator characters still
++// differ (e.g. "gastown.mayor" vs "gastown.dog-3" stay distinct).
++//
++// Empty stays empty: an actual absence of an actor must never canonicalize
++// to the same value as a non-empty one, or AssigneeMatches would start
++// accepting an empty actor against an assigned issue.
++func CanonicalActor(s string) string {
++	if s == "" {
++		return ""
++	}
++	var b strings.Builder
++	b.Grow(len(s))
++	inSeparator := false
++	for _, r := range s {
++		switch r {
++		case '.', '_', '-':
++			if !inSeparator {
++				b.WriteByte('_')
++				inSeparator = true
++			}
++		default:
++			b.WriteRune(r)
++			inSeparator = false
++		}
++	}
++	return b.String()
++}
++
++// ActorMatches reports whether actor has the same authority as assignee:
++// either they're byte-identical, or they canonicalize to the same identity
++// (see CanonicalActor). The byte-identical check is not redundant — it
++// avoids paying canonicalization on the overwhelmingly common exact-match
++// path (ga-5ksp5 gate review, #5438: fixes a garbled doc comment, no
++// behavior change).
++func ActorMatches(assignee, actor string) bool {
++	return assignee == actor || CanonicalActor(assignee) == CanonicalActor(actor)
++}
++
+ // AssigneeMatches validates that the actor has authority to close the issue.
+ // Authority means the issue is unassigned or the actor matches the current
+ // assignee. Returns an error on mismatch unless force is true.
+ //
+-// Authority is identity-by-string: actor is compared verbatim to assignee, so
+-// two principals sharing one actor name both pass. bd has no identity layer,
+-// so this matches the existing semantics of the actor field — the guard
+-// removes silent cross-actor closes without adding new identity guarantees.
++// Authority is identity-by-string: actor is compared to assignee under
++// CanonicalActor, so two principals sharing one canonical actor name both
++// pass — including the same principal spelled two different ways by two
++// different layers of Gas Town (ga-wzl83). bd has no identity layer, so this
++// matches the existing semantics of the actor field — the guard removes
++// silent cross-actor closes without adding new identity guarantees.
+ //
+ // This guards against the silent-success bug where actor A closes a bead that
+ // was concurrently re-claimed by actor B: storage accepts the close (id-only
+@@ -88,7 +140,7 @@ func AssigneeMatches(actor string, force bool) IssueValidator {
+ 		if issue == nil || force {
+ 			return nil
+ 		}
+-		if issue.Assignee == "" || issue.Assignee == actor {
++		if issue.Assignee == "" || ActorMatches(issue.Assignee, actor) {
+ 			return nil
+ 		}
+ 		return fmt.Errorf("cannot close %s: assignee is %q, actor is %q; reclaim or use --force to override", id, issue.Assignee, actor)
+@@ -101,10 +153,14 @@ func AssigneeMatches(actor string, force bool) IssueValidator {
+ // stripping a live claim is what bd unclaim refuses without --force).
+ //
+ // The refusal fires only when every clause holds; each one is load-bearing:
+-//   - Assignee != ""          — unassigned issues are freely assignable.
+-//   - Assignee != actor       — an actor editing its own claim is untouched.
+-//   - Assignee != newAssignee — an idempotent re-assert of the current holder
+-//     stays a success (retry/replay safety on the proxied path).
++//   - Assignee != ""                    — unassigned issues are freely
++//     assignable.
++//   - Assignee doesn't canonicalize to actor       — an actor editing its
++//     own claim is untouched, under any spelling of its own identity.
++//   - Assignee doesn't canonicalize to newAssignee — an idempotent re-assert
++//     of the current holder stays a success (retry/replay safety on the
++//     proxied path), even when the re-assert names the holder under a
++//     different spelling.
+ //   - Status == in_progress   — reassigning an OPEN bead stays frictionless:
+ //     dispatchers hand-dole open beads and pool-queue takes happen constantly,
+ //     which is why this cannot reuse the unclaim/close ownership rule verbatim.
+@@ -114,15 +170,18 @@ func AssigneeMatches(actor string, force bool) IssueValidator {
+ //     bead. poolAliases is a thunk so call sites don't pay the config read on
+ //     the overwhelmingly common non-conflicting paths.
+ //
+-// Like AssigneeMatches, authority is identity-by-string: bd has no identity
+-// layer, so this removes silent cross-actor takeovers without adding new
+-// identity guarantees.
++// Like AssigneeMatches, authority is identity-by-string — compared under
++// CanonicalActor rather than verbatim (ga-wzl83), so this removes silent
++// cross-actor takeovers without adding new identity guarantees, and without
++// falsely treating the current holder as a stranger when actor or
++// newAssignee names it under a different layer's spelling of the same
++// identity.
+ func AssigneeNotStolen(actor, newAssignee string, poolAliases func() []string, force bool) IssueValidator {
+ 	return func(id string, issue *types.Issue) error {
+ 		if issue == nil || force {
+ 			return nil
+ 		}
+-		if issue.Assignee == "" || issue.Assignee == actor || issue.Assignee == newAssignee {
++		if issue.Assignee == "" || ActorMatches(issue.Assignee, actor) || ActorMatches(issue.Assignee, newAssignee) {
+ 			return nil
+ 		}
+ 		if issue.Status != types.StatusInProgress {
+diff --git a/internal/validation/issue_test.go b/internal/validation/issue_test.go
+index 3096d4da2..d75f5d04b 100644
+--- a/internal/validation/issue_test.go
++++ b/internal/validation/issue_test.go
+@@ -144,6 +144,55 @@ func TestNotPinned(t *testing.T) {
+ 	}
+ }
+ 
++func TestCanonicalActor(t *testing.T) {
++	tests := []struct {
++		name string
++		in   string
++		want string
++	}{
++		{name: "empty stays empty", in: "", want: ""},
++		{name: "no separators is unchanged", in: "alice", want: "alice"},
++		{name: "dot separator canonicalizes", in: "gastown.mayor", want: "gastown_mayor"},
++		{name: "double-underscore separator canonicalizes to the same form", in: "gastown__mayor", want: "gastown_mayor"},
++		{name: "hyphen separator canonicalizes to the same form", in: "gastown-mayor", want: "gastown_mayor"},
++		{name: "single underscore is already canonical", in: "gastown_mayor", want: "gastown_mayor"},
++		{name: "mixed separators each collapse to one canonical separator", in: "gastown.dog-3", want: "gastown_dog_3"},
++		{name: "leading separator is preserved as a separator, not dropped", in: ".mayor", want: "_mayor"},
++		{name: "trailing separator is preserved as a separator, not dropped", in: "mayor.", want: "mayor_"},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := CanonicalActor(tt.in); got != tt.want {
++				t.Errorf("CanonicalActor(%q) = %q, want %q", tt.in, got, tt.want)
++			}
++		})
++	}
++}
++
++func TestActorMatches(t *testing.T) {
++	tests := []struct {
++		name     string
++		assignee string
++		actor    string
++		want     bool
++	}{
++		{name: "byte-identical matches", assignee: "alice", actor: "alice", want: true},
++		{name: "different spellings of the same identity match (ga-wzl83)", assignee: "gastown.mayor", actor: "gastown__mayor", want: true},
++		{name: "genuinely different identities do not match", assignee: "gastown.mayor", actor: "gastown.dog-3", want: false},
++		{name: "both empty match", assignee: "", actor: "", want: true},
++		{name: "empty assignee never matches a non-empty actor", assignee: "", actor: "mayor", want: false},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := ActorMatches(tt.assignee, tt.actor); got != tt.want {
++				t.Errorf("ActorMatches(%q, %q) = %v, want %v", tt.assignee, tt.actor, got, tt.want)
++			}
++		})
++	}
++}
++
+ func TestAssigneeMatches(t *testing.T) {
+ 	tests := []struct {
+ 		name        string
+@@ -193,6 +242,41 @@ func TestAssigneeMatches(t *testing.T) {
+ 			wantErr:     true,
+ 			wantErrFrag: "assignee is",
+ 		},
++		// ga-wzl83: the assignee is stored under one layer's spelling of an
++		// identity ("gastown.mayor") while actor resolution can hand back a
++		// DIFFERENT layer's spelling of the SAME identity — a session name
++		// sanitizes the dot to "__" because a dot is unsafe there. The owner
++		// closing its own bead must not need --force just because two layers
++		// spelled its name differently.
++		{
++			name:    "same identity under session-name spelling passes (ga-wzl83)",
++			issue:   &types.Issue{ID: "bd-test", Assignee: "gastown.mayor"},
++			actor:   "gastown__mayor",
++			wantErr: false,
++		},
++		{
++			name:    "same identity under hyphen spelling passes",
++			issue:   &types.Issue{ID: "bd-test", Assignee: "gastown.mayor"},
++			actor:   "gastown-mayor",
++			wantErr: false,
++		},
++		{
++			name:    "same identity under single-underscore spelling passes",
++			issue:   &types.Issue{ID: "bd-test", Assignee: "gastown.mayor"},
++			actor:   "gastown_mayor",
++			wantErr: false,
++		},
++		// The control that keeps the guard from becoming a no-op: a genuinely
++		// DIFFERENT agent must still be refused, even though its own name also
++		// contains separator characters that canonicalize.
++		{
++			name:        "genuinely different identity stays rejected despite shared separators",
++			issue:       &types.Issue{ID: "bd-test", Assignee: "gastown.mayor"},
++			actor:       "gastown.dog-3",
++			force:       false,
++			wantErr:     true,
++			wantErrFrag: "assignee is",
++		},
+ 	}
+ 
+ 	for _, tt := range tests {
+@@ -301,6 +385,31 @@ func TestAssigneeNotStolen(t *testing.T) {
+ 			pools:       nil,
+ 			wantErr:     true,
+ 		},
++		// ga-wzl83: same class as AssigneeMatches — actor and newAssignee are
++		// compared against the stored assignee under CanonicalActor, so a
++		// different layer's spelling of the current holder's own identity is
++		// not mistaken for a stranger.
++		{
++			name:        "actor editing its own claim passes under a different spelling",
++			issue:       inProgress("gastown.mayor"),
++			actor:       "gastown__mayor",
++			newAssignee: "bob",
++			wantErr:     false,
++		},
++		{
++			name:        "idempotent re-assert under a different spelling of the current holder passes",
++			issue:       inProgress("gastown.mayor"),
++			actor:       "alice",
++			newAssignee: "gastown__mayor",
++			wantErr:     false,
++		},
++		{
++			name:        "different identity with shared separators still refused",
++			issue:       inProgress("gastown.mayor"),
++			actor:       "gastown.dog-3",
++			newAssignee: "gastown.dog-3",
++			wantErr:     true,
++		},
+ 	}
+ 
+ 	for _, tt := range tests {
