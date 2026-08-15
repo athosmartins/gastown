@@ -159,6 +159,29 @@ case "$OUT" in *"R5 ga-xt8zrf"*"nenhum veredito FAIL"*)
     ok "armadilha D: sem VERDICT:FAIL nos comentários → R5 diz isso, não finge reprovação (ga-xt8zrf)";;
   *) bad "armadilha D: deveria escalar dizendo que não há veredito FAIL, não 'sem commit após a reprovação'" "$OUT";; esac
 
+# ── self-audit pré-gate (resubmissão): last_fail_epoch não pode virar
+# "agora" quando $d vem vazio ────────────────────────────────────────
+# A versão antiga usava `date -d "${d:-now}"` como fallback. Neste Mac
+# (BSD date) isso FALHA e mascara o problema — mas em qualquer host onde
+# `date -d now` tenha sucesso (GNU date), "não há veredito FAIL" vira
+# silenciosamente "o veredito foi AGORA", quebrando a própria mensagem de
+# armadilha D. Shim de `date` que aceita -d e recusa -j -f (perfil GNU),
+# escopado só a este run via PATH — não afeta o resto do arquivo.
+FAKE_DATE_BIN="$TMP/fakedate"; mkdir -p "$FAKE_DATE_BIN"
+cat > "$FAKE_DATE_BIN/date" <<'SH'
+#!/usr/bin/env bash
+for a in "$@"; do [ "$a" = "-j" ] && exit 1; done
+printf '9999999999\n'
+SH
+chmod +x "$FAKE_DATE_BIN/date"
+
+setup ga-xt8zrf-gnu '["gate:needs-human"]' 'origin/fix/ga-xt8zrf-gnu' '+ dead1234' '1700000000' \
+  '[{"created_at":"2026-08-15T10:00:00Z","text":"VERDICT: PASS — reviewer 1 clean"}]'
+OUT="$(PATH="$FAKE_DATE_BIN:$PATH" run)"
+case "$OUT" in *"R5 ga-xt8zrf-gnu"*"nenhum veredito FAIL"*)
+    ok "armadilha D sobrevive em host com GNU date (last_fail_epoch não vira 'agora' quando \$d vazio)";;
+  *) bad "em host GNU-date, last_fail_epoch viraria 'agora' e a mensagem mudaria para 'sem commit apos a reprovacao'" "$OUT";; esac
+
 # ── VARIANTES: as três que este script NÃO pode tocar ──────────────────
 for v in gate:needs-human:product gate:needs-human:on-device gate:needs-human:refused; do
   setup ga-var "[\"$v\"]" '' '' ''

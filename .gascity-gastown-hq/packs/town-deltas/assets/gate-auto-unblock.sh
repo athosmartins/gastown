@@ -250,9 +250,17 @@ decide() {
   fi
 
   # Epoch da última reprovação, do MARKER (não do label — armadilha C).
+  # ⚠️ self-audit pré-gate (resubmissão): a versão anterior usava
+  # `date -d "${d:-now}"` como fallback quando $d vinha vazio (sem veredito
+  # FAIL, caso normal da armadilha D) — em qualquer host onde `date -d now`
+  # tenha sucesso (GNU date; BSD date FALHA nisso, o que mascarava o bug
+  # neste Mac), isso substitui silenciosamente "não sei/não há" pelo epoch
+  # de AGORA, e last_fail_epoch nunca mais fica vazio — quebrando a própria
+  # detecção de armadilha D mais abaixo. Sem "$d" não HÁ o que parsear:
+  # sai vazio, sem tentar nenhum comando de data.
   last_fail_epoch="$("$BD" -C "$rig" show "$id" --json 2>/dev/null \
     | jq -r '[.[0].comments[]?|select((.text//"")|test("GATE-FEEDBACK|VERDICT: FAIL"))]|last|.created_at // empty' 2>/dev/null \
-    | { read -r d; [ -n "${d:-}" ] && date -j -f '%Y-%m-%dT%H:%M:%SZ' "$d" '+%s' 2>/dev/null || date -d "${d:-now}" '+%s' 2>/dev/null; })"
+    | { read -r d; [ -n "${d:-}" ] || exit 0; date -j -f '%Y-%m-%dT%H:%M:%SZ' "$d" '+%s' 2>/dev/null || date -d "$d" '+%s' 2>/dev/null; })"
 
   tip="$(branch_tip_epoch "$rig" "$br")"
 
