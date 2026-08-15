@@ -12,7 +12,8 @@
 #   long time before anyone notices. ga-d3eg2's own one-off measurement found 8
 #   such beads, some stuck 10+ days — different root causes per bead (stale
 #   label, branch conflicts needing re-anchor, already-merged-but-bead-
-#   never-closed, or intentionally parked at gate:needs-human/blocked-by:*).
+#   never-closed, or intentionally parked at gate:needs-human/blocked-by:*/
+#   blocked:*).
 #   gate-throughput-stall-watchdog.sh answers "is the GATE stalled" (queue-level);
 #   this answers "is this ONE BEAD stranded" (bead-level) — a bead can be
 #   individually stuck while the gate itself is healthy and processing other work.
@@ -35,8 +36,9 @@
 #      (no artifact at all, OR only parked/terminal ones like needs-rebase/
 #      error/passed/failed/superseded/deferred, OR a closed artifact) → a
 #      CANDIDATE for flagging.
-#   4. Split candidates into orphan-suspect vs. parado-de-proposito (ga-cjk1j):
-#      a bead carrying gate:needs-human* / blocked-by:* / status=blocked is a
+#   4. Split candidates into orphan-suspect vs. parado-de-proposito (ga-cjk1j,
+#      blocked:* added ga-te41ft): a bead carrying gate:needs-human* /
+#      blocked-by:* / blocked:* / status=blocked is a
 #      human's self-declared park — it's counted (see the "PARK:" log line and
 #      the mail summary) but never enters the age-based alert/cooldown/comment
 #      pipeline below. Everything else is an orphan-suspect and flows through
@@ -69,6 +71,17 @@
 # pipeline entirely and only contributes to a count (see the "PARK:" log line
 # and the mail summary) — it is still logged every sweep, but it no longer
 # competes for attention with a bead nobody decided to leave alone.
+#
+# blocked:* GAP (ga-te41ft, same class reappearing in a sibling namespace):
+# the ga-cjk1j fix above only ever excluded blocked-by:* (a DEPENDENCY
+# POINTER — "what blocks this bead"). It never covered blocked:* (colon, no
+# hyphen) — the town's actual deliberate self-park label family
+# (blocked:sem-prioridade, blocked:needs-oracle-approval, etc. — 8 distinct
+# labels measured live 2026-08-15, all intentional parks). Every blocked:*
+# bead re-alerted every cooldown cycle exactly like the original bug this
+# file exists to fix — same precision-erosion mechanism, different label
+# prefix. blocked:* is now excluded alongside blocked-by:* in the is_park
+# check below.
 #
 # NOTIFY PRIORITY: low (-p 2), not the -p 4 used by throughput-stall-watchdog.
 # That watchdog pages Athos only when auto-recovery of a SYSTEMIC stall fails
@@ -446,6 +459,14 @@ run_sweep() {
     # unambiguous. status=blocked is the other park signal (ga-cjk1j AC3): 4 of
     # the 11 known intentional parks carry status=blocked with NO
     # gate:needs-human label at all — a labels-only check would miss them.
+    # blocked:* (colon — ga-te41ft): a DIFFERENT namespace from blocked-by:*
+    # (a dependency pointer, "what blocks this bead" — deliberately NOT park,
+    # mirrors context-check-dispatcher.sh's ga-7mbry convention). blocked:* is
+    # the town's actual self-park label (e.g. blocked:sem-prioridade,
+    # blocked:needs-oracle-approval). The original ga-cjk1j fix only excluded
+    # blocked-by:*, so every blocked:*-labeled bead re-alerted forever — 8
+    # measured live 2026-08-15, one (wa-kty2h) stuck ~4.8 days despite being
+    # correctly and deliberately parked on an open dependency.
     ids_labels=$(printf '%s' "$aged_json" | jq -r '
         .[] | . as $b
         | ($b.labels // []) as $L
@@ -454,6 +475,7 @@ run_sweep() {
             ($b.updated_at // $b.created_at // ""),
             ( if ( ($L | any(startswith("gate:needs-human")))
                    or ($L | any(startswith("blocked-by:")))
+                   or ($L | any(startswith("blocked:")))
                    or (($b.status // "") == "blocked") )
               then "1" else "0" end )
           ] | @tsv
@@ -502,7 +524,7 @@ run_sweep() {
   flagged_tsv="$orphan_tsv"
 
   if [ "$park_count" -gt 0 ]; then
-    log "PARK: ${park_count} bead(s) parado(s) de proposito (gate:needs-human*/blocked-by:*/status=blocked) — nao contam para o alerta de orfao"
+    log "PARK: ${park_count} bead(s) parado(s) de proposito (gate:needs-human*/blocked-by:*/blocked:*/status=blocked) — nao contam para o alerta de orfao"
     printf '%b' "$park_tsv" | while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount; do
       [ -z "${bid:-}" ] && continue
       log "  - PARK $bid ($(_store_name "$store2")) age=${age_min}min labels=[${labels}]"
@@ -616,7 +638,7 @@ run_sweep() {
   local msg
   while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount; do
     [ -z "${bid:-}" ] && continue
-    msg="gate-orphaned-label-watchdog (ga-l8yh6): this bead carries gate:* label(s) [${labels}] with no ACTIVE quality-gate-marker/-run for >= ${GOLW_STALE_MINUTES}min (age: ${age_min}min). Last known gate artifact: ${lstatus} (${lcount} open artifact(s) referencing this bead; 0 = none ever found in the HQ store). Detection-only report — no label/status/assignee was touched. Common causes seen historically (ga-d3eg2): stale label after a manual fix, branch conflicts needing re-anchor, or already-merged-but-never-closed (an intentional park via gate:needs-human*/blocked-by:*/status=blocked is excluded from this alert entirely — see ga-cjk1j) — a human/Mayor should triage."
+    msg="gate-orphaned-label-watchdog (ga-l8yh6): this bead carries gate:* label(s) [${labels}] with no ACTIVE quality-gate-marker/-run for >= ${GOLW_STALE_MINUTES}min (age: ${age_min}min). Last known gate artifact: ${lstatus} (${lcount} open artifact(s) referencing this bead; 0 = none ever found in the HQ store). Detection-only report — no label/status/assignee was touched. Common causes seen historically (ga-d3eg2): stale label after a manual fix, branch conflicts needing re-anchor, or already-merged-but-never-closed (an intentional park via gate:needs-human*/blocked-by:*/blocked:*/status=blocked is excluded from this alert entirely — see ga-cjk1j/ga-te41ft) — a human/Mayor should triage."
     if [ -n "${GOLW_TEST_COMMENTS_LOG:-}" ]; then
       echo "comment:${store2}:${bid}:${msg}" >> "$GOLW_TEST_COMMENTS_LOG" 2>/dev/null || true
     else
@@ -629,7 +651,7 @@ run_sweep() {
   local unchanged_count=$(( total_flagged - new_count ))
   local summary="GATE ORPHANED LABEL: ${new_count} new/due, ${resolved_count} resolved, ${unchanged_count} unchanged-already-reported — ${total_flagged} total currently flagged (>=${GOLW_STALE_MINUTES}min)."
   if [ "$park_count" -gt 0 ]; then
-    summary="${summary} +${park_count} parado(s) por decisao humana (gate:needs-human*/blocked-by:*/status=blocked) — nao contam para o alerta acima."
+    summary="${summary} +${park_count} parado(s) por decisao humana (gate:needs-human*/blocked-by:*/blocked:*/status=blocked) — nao contam para o alerta acima."
   fi
 
   if [ -n "${GOLW_TEST_NOTIFIED:-}" ]; then
@@ -678,7 +700,7 @@ This is SURFACE-ONLY — no label/status/assignee was touched on any bead. Commo
 root causes seen historically (ga-d3eg2's own measurement): a stale label left
 after a manual fix, a branch that conflicts with main and needs re-anchor, or
 work already merged but the bead never closed. Beads carrying an intentional
-park signal (gate:needs-human*, blocked-by:*, status=blocked) are excluded from
+park signal (gate:needs-human*, blocked-by:*, blocked:*, status=blocked) are excluded from
 this list entirely (ga-cjk1j) — see the parked-count line above.
 
 Per-bead detail for NEW/DUE beads is also posted as a comment on each bead.
@@ -1435,6 +1457,49 @@ BDSTUB
   grep -qE "OK:|FLAGGED:" "$LOG28" 2>/dev/null && bad "scenario 28: sweep RAN despite a live holder with a stale heartbeat — age wrongly overrode liveness (the exact GATE-FEEDBACK regression)" || ok "scenario 28: sweep did NOT run — live holder protected despite a stale heartbeat"
   grep -q "backing off (single-instance guard" "$LOG28" 2>/dev/null && ok "scenario 28: second run backed off silently, as required" || bad "scenario 28: no back-off log line — second run may not have deferred correctly"
   rm -rf "$LOCKTEST28"
+
+  # ── Scenario 29 (ga-te41ft, FIXTURE — REPROVES on HEAD before this fix): a
+  # bead carrying blocked:sem-prioridade (colon, the town's real self-park
+  # label — distinct from blocked-by:*, a dependency pointer already handled
+  # since ga-cjk1j) alongside real gate:* lifecycle labels, stale → must NOT
+  # enter NEW/DUE at all; counted as PARK only. Mirrors the exact shape of the
+  # live victim (wa-kty2h): [blocked:sem-prioridade, story:approved,
+  # gate:failed, gate:fix-attempt:2, gate:needs-fix]. Before this fix, is_park
+  # only checked blocked-by:* (hyphen) — blocked:* (colon) fell through and
+  # this bead alerted every cooldown cycle despite being a deliberate,
+  # correct park on an open dependency. ─────────────────────────────────────
+  echo "Scenario 29 (ga-te41ft fixture): blocked:sem-prioridade (colon) + gate:* labels, stale → NOT flagged as orphan, counted as PARK only"
+  printf '[%s]' "$(mk_candidate cand-park3 "$TMP/hq" "blocked:sem-prioridade,story:approved,gate:failed,gate:fix-attempt:2,gate:needs-fix" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-park3.json"
+  NOTIF29="$TMP/notif29"; MAIL29="$TMP/mail29"; COMM29="$TMP/comm29"
+  : > "$NOTIF29"; : > "$MAIL29"; : > "$COMM29"; : > "$LOG"
+  GOLW_TEST_NOTIFIED="$NOTIF29" GOLW_TEST_MAILED="$MAIL29" GOLW_TEST_COMMENTS_LOG="$COMM29" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 29: blocked:-labeled bead does not enter NEW/DUE (return 0)" || bad "scenario 29 (ga-te41ft regression — the exact bug): a blocked:sem-prioridade bead was treated as an orphan-suspect, got $rc"
+  [ ! -s "$COMM29" ] && ok "scenario 29: no comment posted on the blocked:-parked bead" || bad "scenario 29 (ga-te41ft regression): comment posted on a bead carrying blocked:sem-prioridade (should be excluded)"
+  [ ! -s "$NOTIF29" ] && ok "scenario 29: no notify fired for a blocked:-park-only sweep" || bad "scenario 29: notify fired despite only a blocked:-parked bead being present"
+  [ ! -s "$MAIL29" ] && ok "scenario 29: no mail fired for a blocked:-park-only sweep" || bad "scenario 29: mail fired despite only a blocked:-parked bead being present"
+  grep -q "PARK: 1 bead" "$LOG" 2>/dev/null && ok "scenario 29: log records the park count for the blocked:-labeled bead" || bad "scenario 29: log missing the PARK count line for a blocked:-labeled park"
+  grep -q "cand-park3" "$LOG" 2>/dev/null && ok "scenario 29: log names the blocked:-parked bead" || bad "scenario 29: log does not name the parked bead cand-park3"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 30 (ga-te41ft, CONTROL — blocked-by:* must keep meaning
+  # "dependency pointer", NOT self-park, per context-check-dispatcher.sh's
+  # ga-7mbry convention this file already shares): a bead carrying ONLY
+  # blocked-by:<id> with no gate:needs-human/blocked:/status=blocked signal is
+  # already parked today (ga-cjk1j) — this fix must not change that. ────────
+  echo "Scenario 30 (ga-te41ft control): blocked-by:<id> alone still parks exactly as before this fix (no regression on the ga-cjk1j behavior)"
+  printf '[%s]' "$(mk_candidate cand-park4 "$TMP/hq" "blocked-by:wa-v8rkm,gate:queued" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-park4.json"
+  NOTIF30="$TMP/notif30"; MAIL30="$TMP/mail30"; COMM30="$TMP/comm30"
+  : > "$NOTIF30"; : > "$MAIL30"; : > "$COMM30"; : > "$LOG"
+  GOLW_TEST_NOTIFIED="$NOTIF30" GOLW_TEST_MAILED="$MAIL30" GOLW_TEST_COMMENTS_LOG="$COMM30" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 30: blocked-by:-labeled bead still does not enter NEW/DUE (return 0)" || bad "scenario 30 (regression on ga-cjk1j behavior): a blocked-by: bead was treated as an orphan-suspect, got $rc"
+  [ ! -s "$COMM30" ] && ok "scenario 30: no comment posted on the blocked-by:-parked bead" || bad "scenario 30: comment posted on a bead carrying blocked-by: (should still be excluded)"
+  rm -f "$STATE_FILE" 2>/dev/null
 
   echo ""
   echo "gate-orphaned-label-watchdog selftest: PASS=$PASS FAIL=$FAIL"
