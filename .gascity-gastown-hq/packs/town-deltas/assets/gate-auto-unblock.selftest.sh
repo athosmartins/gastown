@@ -170,6 +170,22 @@ for v in gate:needs-human:product gate:needs-human:on-device gate:needs-human:re
   fi
 done
 
+# ── armadilha E: variante protegida co-presente com uma unblockable ────
+# Achado pelo revisor do gate (ga-5l5v76), não citado por mim: lock_variant
+# só valida a PRIMEIRA label (head -1). Um bead com
+# ["gate:needs-human","gate:needs-human:refused"] tem a bare validada como
+# unblockable — e a versão antiga de strip_lock() removia AS DUAS,
+# apagando a trava :refused em silêncio. Repro exato do revisor: sem
+# branch (forçaria R1 se a variante protegida não travasse o bead antes).
+setup ga-mixed '["gate:needs-human","gate:needs-human:refused"]' '' '' ''
+OUT="$(run)"
+if printf '%s' "$OUT" | grep -q "SKIP ga-mixed" && [ ! -s "$TMP/fx.ga-mixed/removed.log" ]; then
+  ok "armadilha E: variante protegida co-presente com unblockable → SKIP, nenhuma label tocada (ga-5l5v76)"
+else
+  bad "armadilha E: deveria pular o bead inteiro sem remover nenhuma label" \
+    "OUT=$OUT REMOVED=$(cat "$TMP/fx.ga-mixed/removed.log" 2>/dev/null)"
+fi
+
 # ── REGRESSÃO do meu erro de 15/08: prefixo vs exato ───────────────────
 # Busquei travadas por PREFIXO (^gate:needs-human) e removi por texto
 # EXATO ("gate:needs-human"). A busca achava, a remoção nunca casava, e

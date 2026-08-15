@@ -84,6 +84,15 @@
 #      falhou foi corrida entre branches irmãs.
 #      ⇒ "failed" não significa "código ruim".
 #
+#   E) lock_variant() só valida a PRIMEIRA label presente (head -1), mas
+#      a versão original de strip_lock() removia TODAS as gate:needs-human*
+#      presentes. Achado pelo revisor do gate (ga-5l5v76), não por mim:
+#      um bead com ["gate:needs-human","gate:needs-human:refused"] tem a
+#      bare validada como unblockable (sorta antes da sufixada) e as DUAS
+#      removidas — apagando silenciosamente uma trava NAO TOCA.
+#      ⇒ se QUALQUER label presente cai fora de UNBLOCKABLE_VARIANTS, o
+#        bead inteiro fica de fora — ver has_protected_variant().
+#
 # ────────────────────────────────────────────────────────────────────
 # TEST SEAM: BD/GC/GIT/NOTIFY são sobreponíveis para o selftest hermético.
 # DRY_RUN=1 → decide e loga, não muta nada.
@@ -184,8 +193,24 @@ is_unblockable() {
   return 1
 }
 
+# has_protected_variant <rig> <bead> → 0 se QUALQUER label presente cai
+# fora de UNBLOCKABLE_VARIANTS (armadilha E). lock_variant() só olha a
+# PRIMEIRA label (head -1); esta função varre TODAS as gate:needs-human*
+# presentes, então detecta uma protegida mesmo co-presente com uma
+# unblockable — o caso que escapava antes e que strip_lock() apagaria.
+has_protected_variant() {
+  local rig="$1" id="$2" v
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    is_unblockable "$v" || return 0
+  done < <(labels_of "$rig" "$id" | grep '^gate:needs-human')
+  return 1
+}
+
 # strip_lock <rig> <bead> — remove TODAS as variantes presentes, não a
-# que eu supus estar lá (ver acima).
+# que eu supus estar lá (ver acima). Só é chamada depois que main()
+# confirma has_protected_variant=false, então "todas as presentes" já
+# está restrito a variantes unblockable neste ponto.
 strip_lock() {
   local rig="$1" id="$2" v
   while IFS= read -r v; do
@@ -279,8 +304,8 @@ main() {
       [ -n "$id" ] || continue
       n=$((n+1))
       variant="$(lock_variant "$rig" "$id")"
-      if ! is_unblockable "$variant"; then
-        say "SKIP $id — variante '$variant' tem dono fora deste script"
+      if has_protected_variant "$rig" "$id"; then
+        say "SKIP $id — carrega variante protegida (NAO TOCA) entre as labels gate:needs-human* presentes (pode coexistir com uma unblockable, ex. '$variant' — armadilha E); nenhuma label é tocada"
         continue
       fi
       IFS='|' read -r rule why <<< "$(decide "$rig" "$id")"
