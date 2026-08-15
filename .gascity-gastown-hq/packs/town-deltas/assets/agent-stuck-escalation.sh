@@ -1540,13 +1540,18 @@ BODY
         # Primeira vez vendo este bead ocioso nesta janela — tenta acordar
         # pelo canal interativo, ainda NÃO escala.
         resume_msg="[AUTO-RESUME] Ocioso ha ${age_min}min com bead ${bead_id} in_progress. ANTES de agir: rode 'bd show ${bead_id}', releia seus ultimos comentarios e o git log/estado da branch, e reporte em 1-2 linhas onde parou e o que falta — nao refaca se ja estiver completo (aguardando gate/merge conta como completo)."
+        # ga-nrkh92: cada ramo loga só o que REALMENTE aconteceu nele — um
+        # log incondicional de "RETOMADA enviada" depois do if/else afirmaria
+        # envio real mesmo em DRY_RUN, onde send_idle_resume nunca roda
+        # (mesma classe de defeito que o self-audit deste gate existe pra
+        # pegar: comentário/log prometendo mais do que o código ao lado faz).
         if [ "$DRY_RUN" = "1" ]; then
-            log "  [DRY_RUN] would send_idle_resume to $live_session_name for $bead_id"
+            log "$bead_id: [DRY_RUN] retomada NÃO enviada de verdade — teria chamado gc session nudge + tmux send-keys pra $live_session_name (ga-nrkh92)"
         else
             send_idle_resume "$live_session_name" "$resume_msg"
+            log "$bead_id: RETOMADA enviada a $live_session_name (nudge + tmux send-keys) — aguardando resposta até ${RESUME_GRACE_SEC}s (ga-nrkh92)"
         fi
         printf '%s\n' "$now" > "$rf"
-        log "$bead_id: RETOMADA enviada a $live_session_name (nudge + tmux send-keys) — aguardando resposta até ${RESUME_GRACE_SEC}s (ga-nrkh92)"
         continue
     fi
 
