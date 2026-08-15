@@ -1032,6 +1032,189 @@ else
   bad "(S) gate-done.md not found at $GATE_DONE"
 fi
 
+# ── (T) ga-3xuanq: crew/generic branch bead-id extraction no longer TRUNCATES
+#    a custom bead id that embeds a '-' beyond the {2,8} char-class cap, and
+#    no longer silently ships that truncated id when it "exists" only as a
+#    PREFIX of a longer real bead.
+#
+# Root bug (ga-3xuanq, filed by digo-wa from a live incident, 15/08): a
+# crew/<name>/<STORY_ID>[-desc] branch where STORY_ID itself is a custom id
+# with an embedded hyphen (wa-campanha-diaria, created via `bd create --id`)
+# truncates to "wa-campanha" (8-char cap on the second regex token). The
+# ga-pkvfc identity/boundary guard ("$BEAD_ID"|"$BEAD_ID"-*) cannot catch
+# this: "wa-campanha-diaria" legitimately starts with "wa-campanha-", so the
+# guard reads it as "id=wa-campanha, desc=diaria" — syntactically
+# indistinguishable from a real '-desc' suffix. Because `bd show` itself
+# resolves by PREFIX, the existing ga-u4yi existence-only validation (H/K
+# above) also can't catch it: "wa-campanha" "exists" (it resolves onto
+# wa-campanha-diaria), so the marker ships with the WRONG, truncated
+# source-bead. Live repro: marker ga-tyi7k3 shipped source-bead:wa-campanha
+# for branch crew/digo/wa-campanha-diaria; fixed by hand before the sweep.
+#
+# The SAME char-class cap exists in the generic (fix/*, feat/*, ...) branch
+# convention with NO guard at all — the (T) tests below cover both paths.
+
+# Extend the fixture stores with the exact repro bead, plus the ga-pkvfc
+# dotted sub-bead ITSELF (not just its parent epic — PS_BEADS above only
+# carried "ps-8iuu" because the older existence-only stub never needed to
+# resolve the full dotted id; the new prefix-resolving stub does), so the
+# resolution replica below can be probed against realistic data rather than
+# synthetic candidates.
+WA_BEADS=" wa-27jn wa-iv51 wa-lstd wa-campanha-diaria "
+PS_BEADS=" ps-8iuu ps-8iuu.4 "
+
+# bead_resolve_prefix_in_store <path> <candidate> — mirrors `bd -C <path>
+# show <candidate> --json | jq .id`: bd resolves by PREFIX (ga-3xuanq's own
+# bug report: "bd resolve por PREFIXO"), succeeding iff the candidate is an
+# unambiguous (exactly one match) prefix of some bead's real id in that
+# store, returning that bead's REAL id. This is a DIFFERENT (stricter, more
+# accurate) stub than bead_exists_in_store above, which only checks EXACT
+# membership and therefore cannot reproduce this bug class at all — "wa-
+# campanha" is not itself a member of WA_BEADS, only a prefix of one of its
+# entries.
+bead_resolve_prefix_in_store() {
+  local path="$1" candidate="$2" list="" b n=0 found=""
+  case "$path" in
+    */.gascity-gastown-hq) list="$HQ_BEADS" ;;
+    */whatsapp_automation) list="$WA_BEADS" ;;
+    */property_scrapers) list="$PS_BEADS" ;;
+    *) printf ''; return ;;
+  esac
+  for b in $list; do
+    case "$b" in
+      "$candidate"*) n=$((n+1)); found="$b" ;;
+    esac
+  done
+  [ "$n" -eq 1 ] && printf '%s' "$found" || printf ''
+}
+
+# resolve_bead_id_from_branch <branch> — FULL replica of the FIXED gate-done.md
+# logic: extract_bead_from_branch() (UNCHANGED, still the exact deployed
+# regex+guard) -> prefix-resolve across stores, HQ then every registered rig
+# (same probe order validate_bead_id above already uses) -> exact-identity
+# upgrade against the real (untruncated) branch segment.
+resolve_bead_id_from_branch() {
+  local branch="$1" seg bead resolved rig_path
+  case "$branch" in
+    crew/*/*) seg=${branch#crew/*/} ;;
+    */*) seg=${branch#*/} ;;
+    *) seg="" ;;
+  esac
+  bead=$(extract_bead_from_branch "$branch")
+  [ -z "$bead" ] && { printf ''; return; }
+  resolved=$(bead_resolve_prefix_in_store "$GC_CITY_PATH_STUB" "$bead")
+  if [ -z "$resolved" ]; then
+    for rig_path in $(printf '%s' "$RIG_LIST_JSON" | jq -r '.rigs[].path // empty' 2>/dev/null); do
+      resolved=$(bead_resolve_prefix_in_store "$rig_path" "$bead")
+      [ -n "$resolved" ] && break
+    done
+  fi
+  [ -z "$resolved" ] && { printf ''; return; }
+  if [ "$resolved" != "$bead" ]; then
+    case "$seg" in
+      "$resolved"|"$resolved"-*) bead="$resolved" ;;
+    esac
+  fi
+  printf '%s' "$bead"
+}
+
+# resolve_bead_id_from_branch_prebug <branch> — replica of the ORIGINAL
+# (pre-ga-3xuanq) resolution: existence via prefix is trusted AS INPUT
+# IDENTITY — the candidate is kept verbatim once any store resolves it,
+# never upgraded to the store's own longer id. This is exactly what real
+# `bd show "$BEAD_ID" >/dev/null 2>&1` (exit-code-only) checking did.
+resolve_bead_id_from_branch_prebug() {
+  local branch="$1" bead resolved rig_path
+  bead=$(extract_bead_from_branch "$branch")
+  [ -z "$bead" ] && { printf ''; return; }
+  resolved=$(bead_resolve_prefix_in_store "$GC_CITY_PATH_STUB" "$bead")
+  if [ -n "$resolved" ]; then printf '%s' "$bead"; return; fi
+  for rig_path in $(printf '%s' "$RIG_LIST_JSON" | jq -r '.rigs[].path // empty' 2>/dev/null); do
+    resolved=$(bead_resolve_prefix_in_store "$rig_path" "$bead")
+    if [ -n "$resolved" ]; then printf '%s' "$bead"; return; fi
+  done
+  printf ''
+}
+
+# (T1) primary repro: crew branch, custom id with an embedded hyphen, NO
+# desc suffix at all — the exact live incident shape.
+B=$(resolve_bead_id_from_branch "crew/digo/wa-campanha-diaria")
+[ "$B" = "wa-campanha-diaria" ] \
+  && ok "(T1) crew/digo/wa-campanha-diaria -> wa-campanha-diaria, not truncated (got: $B)" \
+  || bad "(T1) embedded-hyphen crew id -> expected wa-campanha-diaria, got: $B"
+
+# (T2) mutation guard: the ORIGINAL (pre-fix) resolution, given the EXACT
+# (T1) repro, DOES ship the truncated id — proves (T1) would have caught the
+# live ga-tyi7k3 incident, not just happened to pass either way.
+B=$(resolve_bead_id_from_branch_prebug "crew/digo/wa-campanha-diaria")
+[ "$B" = "wa-campanha" ] \
+  && ok "(T2) mutation check: pre-fix resolution ships truncated 'wa-campanha', reproducing the ga-tyi7k3 incident" \
+  || bad "(T2) mutation check: pre-fix replica unexpectedly produced '$B' — (T1) would not catch a reversion"
+
+# (T3) same class, GENERIC (non-crew) branch convention — no guard at all
+# protected this path before the fix.
+B=$(resolve_bead_id_from_branch "fix/wa-campanha-diaria-desc")
+[ "$B" = "wa-campanha-diaria" ] \
+  && ok "(T3) fix/wa-campanha-diaria-desc -> wa-campanha-diaria, not truncated (got: $B)" \
+  || bad "(T3) embedded-hyphen generic id -> expected wa-campanha-diaria, got: $B"
+
+# (T4) mutation guard for the generic path.
+B=$(resolve_bead_id_from_branch_prebug "fix/wa-campanha-diaria-desc")
+[ "$B" = "wa-campanha" ] \
+  && ok "(T4) mutation check: pre-fix generic-path resolution also ships truncated 'wa-campanha'" \
+  || bad "(T4) mutation check: pre-fix generic replica unexpectedly produced '$B'"
+
+# (T5) control: a real bead whose id does NOT need extending (short id, real
+# '-desc' suffix) must resolve exactly as before — no upgrade, no regression.
+B=$(resolve_bead_id_from_branch "crew/batista/wa-27jn-desc")
+[ "$B" = "wa-27jn" ] \
+  && ok "(T5) control: short real id with genuine -desc suffix still resolves to wa-27jn (got: $B)" \
+  || bad "(T5) control regression: expected wa-27jn, got: $B"
+
+# (T6) control: the ga-u4yi phantom-bead case (demand-mobile-phase2) must
+# still be discarded entirely — no store resolves any prefix of it, so the
+# upgrade path never even engages.
+B=$(resolve_bead_id_from_branch "crew/thies/demand-mobile-phase2")
+[ -z "$B" ] \
+  && ok "(T6) control: phantom bead 'demand-mobile-phase2' still discarded (got: '$B')" \
+  || bad "(T6) control regression: expected discard, got: '$B'"
+
+# (T7) control: the ga-pkvfc dotted sub-bead case (ps-8iuu.4) still resolves
+# to its own full id, not its parent epic — proves the new upgrade path
+# doesn't interfere with the existing dotted-suffix protection.
+B=$(resolve_bead_id_from_branch "crew/ps-worker/ps-8iuu.4")
+[ "$B" = "ps-8iuu.4" ] \
+  && ok "(T7) control: dotted sub-bead ps-8iuu.4 still resolves correctly (got: $B)" \
+  || bad "(T7) control regression: expected ps-8iuu.4, got: $B"
+
+# ── (U) ga-3xuanq source drift-guard: deployed gate-done.md carries the
+#    exact-identity upgrade step, positioned to run AFTER the existing
+#    ga-u4yi existence check (not replacing it).
+if [ -f "$GATE_DONE" ]; then
+  src=$(cat "$GATE_DONE")
+  printf '%s' "$src" | grep -qF 'ga-3xuanq' \
+    && ok "(U1) gate-done.md references the ga-3xuanq fix" \
+    || bad "(U1) gate-done.md missing the ga-3xuanq fix marker (regression)"
+  printf '%s' "$src" | grep -qF '_BRANCH_SEG=""' \
+    && ok "(U2) gate-done.md initializes _BRANCH_SEG before the branch-convention case" \
+    || bad "(U2) gate-done.md missing _BRANCH_SEG initialization (ga-3xuanq regression)"
+  printf '%s' "$src" | grep -qF '_RESOLVED_FULL_ID=' \
+    && ok "(U3) gate-done.md queries the resolving store for the bead's own full id" \
+    || bad "(U3) gate-done.md missing the _RESOLVED_FULL_ID exact-identity lookup (ga-3xuanq regression)"
+  # The upgrade must run AFTER the ga-u4yi existence check succeeds, not
+  # before/instead of it — it depends on $_BEAD_HOME_RIG_PATH, which only the
+  # existence check populates.
+  existence_line=$(printf '%s\n' "$src" | grep -nF '_BEAD_ID_RESOLVED=1' | head -1 | cut -d: -f1)
+  upgrade_line=$(printf '%s\n' "$src" | grep -nF '_RESOLVED_FULL_ID=' | head -1 | cut -d: -f1)
+  if [ -n "$existence_line" ] && [ -n "$upgrade_line" ] && [ "$existence_line" -lt "$upgrade_line" ]; then
+    ok "(U4) gate-done.md's exact-identity upgrade runs AFTER the ga-u4yi existence check (line $existence_line < $upgrade_line)"
+  else
+    bad "(U4) gate-done.md's upgrade does not follow the existence check (existence_line='$existence_line' upgrade_line='$upgrade_line')"
+  fi
+else
+  bad "(U) gate-done.md not found at $GATE_DONE"
+fi
+
 echo
 echo "  PASS=$PASS  FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

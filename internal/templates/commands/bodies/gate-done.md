@@ -1,7 +1,7 @@
 ---
 description: Signal work ready for quality gate (writes durable marker; launchd guard picks it up within ~2 min)
 argument-hint: ""
-allowed-tools: Bash(git status:*), Bash(git push:*), Bash(git rev-parse:*), Bash(git log:*), Bash(git diff:*), Bash(git config:*), Bash(bd create:*), Bash(bd label:*), Bash(bd list:*), Bash(bd show:*), Bash(gc rig list:*)
+allowed-tools: Bash(git status:*), Bash(git push:*), Bash(git rev-parse:*), Bash(git fetch:*), Bash(git log:*), Bash(git diff:*), Bash(git config:*), Bash(bd create:*), Bash(bd label:*), Bash(bd list:*), Bash(bd show:*), Bash(gc rig list:*)
 ---
 
 # Gate Done — Signal Work Ready for Quality Gate
@@ -177,9 +177,11 @@ echo "City DB path: $GC_CITY_PATH"
 #                                    submissions used to fall through to the session
 #                                    lookup and pick the wrong bead — ga-owfll.
 #   <prefix>/<STORY_ID>-<desc>     — builder convention (e.g. fix/ga-dx5-my-fix → ga-dx5)
+_BRANCH_SEG=""
 case "$BRANCH" in
   crew/*/*)
     _CREW_SEG=${BRANCH#crew/*/}
+    _BRANCH_SEG="$_CREW_SEG"
     # ga-pkvfc: capture an optional dotted sub-bead suffix (ps-8iuu.4) — the
     # char class alone has no '.', so a dotted sub-bead id used to truncate at
     # the dot (ps-8iuu.4 -> ps-8iuu, the PARENT epic).
@@ -193,6 +195,12 @@ case "$BRANCH" in
     # followed by a '-desc' separator — any other continuation (e.g. a '.'
     # the regex didn't capture) proves truncation; discard here so the
     # existence check below never gets a chance to accept it anyway.
+    # ga-3xuanq: this guard alone cannot tell truncation apart from a real
+    # '-desc' suffix when the custom bead id ITSELF embeds a '-' beyond what
+    # the {2,8} char class captures (wa-campanha-diaria -> wa-campanha) — the
+    # crew segment legitimately starts with "$BEAD_ID-" either way. It stays
+    # as a cheap syntactic pre-filter; the exact-identity upgrade below (also
+    # ga-3xuanq) resolves the ambiguity against the real store content.
     if [ -n "$BEAD_ID" ]; then
       case "$_CREW_SEG" in
         "$BEAD_ID"|"$BEAD_ID"-*) : ;;
@@ -200,9 +208,13 @@ case "$BRANCH" in
       esac
     fi
     ;;
-  *)
+  */*)
+    _BRANCH_SEG=${BRANCH#*/}
     BEAD_ID=$(echo "$BRANCH" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}-' \
       | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo "")
+    ;;
+  *)
+    BEAD_ID=""
     ;;
 esac
 
@@ -247,6 +259,29 @@ if [ -n "$BEAD_ID" ]; then
     BEAD_ID=""
     _BEAD_HOME_RIG=""
     _BEAD_HOME_RIG_PATH=""
+  else
+    # ga-3xuanq: existence via $BEAD_ID is a PREFIX match, not an identity
+    # match — bd resolves e.g. "wa-campanha" onto the real bead
+    # "wa-campanha-diaria" without error, so a candidate the {2,8} char class
+    # above truncated "exists" and silently ships wrong (the marker's
+    # source-bead: label and bead_id: field carry the truncated id). Ask the
+    # resolving store what the bead's OWN id actually is; if it's longer than
+    # what we asked for, only trust the upgrade when the extra length is
+    # consistent with the real branch text (the branch segment IS that longer
+    # id, or that longer id followed by a '-desc' separator) — otherwise this
+    # was a coincidental, unrelated prefix hit and the short candidate is left
+    # as-is (same fuzzy edge case that already existed before this fix, not a
+    # new regression).
+    _RESOLVED_FULL_ID=$(bd -C "$_BEAD_HOME_RIG_PATH" show "$BEAD_ID" --json 2>/dev/null \
+      | jq -r 'if type=="array" then .[0] else . end | .id // empty' 2>/dev/null || echo "")
+    if [ -n "$_RESOLVED_FULL_ID" ] && [ "$_RESOLVED_FULL_ID" != "$BEAD_ID" ]; then
+      case "$_BRANCH_SEG" in
+        "$_RESOLVED_FULL_ID"|"$_RESOLVED_FULL_ID"-*)
+          echo "Note: '$BEAD_ID' parsed from branch '$BRANCH' was a truncated prefix of the real bead '$_RESOLVED_FULL_ID' — using the full id."
+          BEAD_ID="$_RESOLVED_FULL_ID"
+          ;;
+      esac
+    fi
   fi
 fi
 
@@ -279,7 +314,27 @@ if [ -z "$BEAD_ID" ]; then
   exit 1
 fi
 AUTHOR="${GC_ALIAS:-${BEADS_ACTOR:-$(git config user.name)}}"
-BASE_COMMIT=$(git rev-parse origin/main 2>/dev/null || echo "unknown")
+
+# ga-iwcu23 FAIL CLOSED: base_commit must come from a FRESH fetch of
+# origin/main — a stale/absent local cache can silently record a base_commit
+# that origin doesn't actually have, and every downstream consumer (reviewers
+# cloning from origin, the rebase-distance circuit-breaker) then measures
+# against a base it can't resolve. Measured live in ga-jvzpb: a hand-created
+# marker skipped this fetch entirely and recorded a base_commit that existed
+# only in the author's local worktree — origin refused it ("not our ref"),
+# which fed a wrong "117 commits behind" into the gate's circuit-breaker (the
+# real, freshly-fetched distance was 36) and permanently parked the marker.
+if ! git fetch origin main --quiet 2>/dev/null; then
+  echo "ERROR: 'git fetch origin main' failed — cannot establish a trustworthy base_commit."
+  echo "  Marker NOT created. Check network/auth to origin, then re-run /gate-done."
+  exit 1
+fi
+BASE_COMMIT=$(git rev-parse origin/main 2>/dev/null || echo "")
+if [ -z "$BASE_COMMIT" ]; then
+  echo "ERROR: origin/main did not resolve to a commit after a successful fetch — cannot record base_commit."
+  echo "  Marker NOT created. Re-run /gate-done."
+  exit 1
+fi
 # Rig list (RIG_LIST_JSON) was already fetched above during bead_id validation.
 CWD_TOP=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 
