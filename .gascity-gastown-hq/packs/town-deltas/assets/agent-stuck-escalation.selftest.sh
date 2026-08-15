@@ -216,17 +216,27 @@ run_script() {
     bash "$SCRIPT" 2>&1
 }
 
-# seed_resume_state <bead-id> [nudged_secs_ago] (ga-nrkh92): pre-seeds the
-# idle-resume state file as if a PRIOR pass already sent the interactive
-# nudge <nudged_secs_ago> ago (default: far past RESUME_GRACE_SEC). Lets a
-# single run_script call land past the grace period, so tests written
-# before this feature existed — which assert immediate escalation for a
-# live+frozen session — keep testing their OWN original suppression-layer
-# signal instead of re-proving the two-phase resume ladder every time.
+# seed_resume_state <bead-id> [nudged_secs_ago] [session] (ga-nrkh92):
+# pre-seeds the idle-resume state file as if a PRIOR pass already sent the
+# interactive nudge <nudged_secs_ago> ago (default: far past
+# RESUME_GRACE_SEC). Lets a single run_script call land past the grace
+# period, so tests written before this feature existed — which assert
+# immediate escalation for a live+frozen session — keep testing their OWN
+# original suppression-layer signal instead of re-proving the two-phase
+# resume ladder every time.
+#
+# [session] is OPTIONAL (ga-nrkh92 gate-fix, blocking issue 1): when given,
+# also writes the session the nudge was recorded for (line 2 of $rf) — use
+# this to simulate a stale nudge from a DIFFERENT, since-reassigned session
+# (see T63). Omitted (the 13 pre-existing call sites), this writes the old
+# single-line format, which the production mismatch check treats as "no
+# evidence either way" and leaves the pre-existing elapsed-time behavior
+# unchanged — those tests are not exercising the reassignment path at all.
 seed_resume_state() {
-    local bid="$1" age="${2:-999999}"
+    local bid="$1" age="${2:-999999}" sess="${3:-}"
     mkdir -p "$WORK/city/.gc/state/agent-idle-resume"
     python3 -c "import time; print(int(time.time()-$age))" > "$WORK/city/.gc/state/agent-idle-resume/$bid"
+    [ -n "$sess" ] && printf '%s\n' "$sess" >> "$WORK/city/.gc/state/agent-idle-resume/$bid"
 }
 
 # seed_tmux_pane <session-name> <pid> (ga-nrkh92): registers the fixture the
@@ -1353,6 +1363,53 @@ RESUME_GRACE_SEC=1 run_script > /dev/null
 assert_contains "$ACTIONS" "mail:mayor|Agente ocioso nao respondeu a retomada: ga-idle62" "T62: escalation still fires (the session itself IS unresponsive — only the unique-work CLAIM changes)"
 assert_contains "$WORK/last_mail_body.txt" "nenhum — HEAD já está inteiramente em origin/main" "T62: body correctly reports NO unique work via git cherry (patch-id), even though the branch ref itself was never an ancestor of origin/main"
 rm -f "$LOGS_FIXTURE_DIR/dog-idle62.json"
+
+# ── T63-T64: gate-fix regression tests (ga-nrkh92, gate verdict on ─────────
+# bf1f03e46 — both were gaps the T53-T62 suite above did not cover) ────────
+
+# T63 = blocking issue 1: $rf keyed only by bead_id, with no session
+# identity, misreads a nudge sent to an OLD (since-reassigned) session as
+# proof the CURRENT session was already nudged — skipping straight to
+# "grace expired" and escalating on the new session's very first idle
+# observation, without this daemon ever attempting to wake it.
+echo "T63: resume state recorded for a DIFFERENT (reassigned-away) session → treated as first nudge for the CURRENT session, not an expired grace (ga-nrkh92 gate-fix, blocking issue 1)"
+echo '{"sessions":[{"name":"dog-idle63","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-idle63 3600
+printf '[%s]' "$(make_bead ga-idle63 dog-idle63 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-idle63" "$WORK/city/.gc/state/agent-idle-resume/ga-idle63"
+# Simulate: an EARLIER session (dog-oldsess63 — since killed/respawned or
+# manually reassigned away) was nudged long ago and never responded. The
+# bead is now live under dog-idle63, which this daemon has never nudged.
+seed_resume_state ga-idle63 999999 dog-oldsess63
+seed_tmux_pane dog-idle63 999999998
+: > "$ACTIONS"
+RESUME_GRACE_SEC=99999 run_script > /dev/null
+assert_absent  "$ACTIONS" "mail:mayor" "T63: no escalation — the CURRENT session was never actually nudged, despite the stale record for the old session"
+assert_contains "$ACTIONS" "nudge:dog-idle63|" "T63: fresh nudge sent to the CURRENT session"
+assert_contains "$ACTIONS" "tmux-send-keys:dog-idle63|[AUTO-RESUME]" "T63: tmux send-keys also injects into the current session"
+[ "$(sed -n '2p' "$WORK/city/.gc/state/agent-idle-resume/ga-idle63")" = "dog-idle63" ] && ok "T63: resume state now records the CURRENT session" || bad "T63: resume state still references the stale session"
+log_contains "T63" "bead foi reatribuido" "T63: log notes the reassignment detection"
+rm -f "$LOGS_FIXTURE_DIR/dog-idle63.json"
+
+# T64 = blocking issue 2: now_outside_active_window's format check bounds
+# each hour DIGIT independently ([0-2][0-9] accepts 20-29), not the
+# two-digit VALUE. A window entirely past 23:59 (e.g. "24:30-25:00") passes
+# that check but can never match the real clock — the function then ALWAYS
+# returns "outside", permanently suppressing resume+escalation, the
+# opposite of its documented fail-OPEN contract for malformed input.
+echo "T64: gc.active_window with an out-of-range hour (24:30-25:00) fails OPEN — does not permanently suppress resume/escalation (ga-nrkh92 gate-fix, blocking issue 2)"
+echo '{"sessions":[{"name":"dog-idle64","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-idle64 3600
+printf '[{"id":"ga-idle64","title":"Test bead ga-idle64","assignee":"dog-idle64","status":"in_progress","issue_type":"feature","updated_at":"%s","labels":[],"metadata":{"gc.active_window":"24:30-25:00"}}]' \
+    "$(python3 -c "import time, datetime; e=time.time()-2200; print(datetime.datetime.utcfromtimestamp(e).strftime('%Y-%m-%dT%H:%M:%SZ'))")" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-idle64" "$WORK/city/.gc/state/agent-idle-resume/ga-idle64"
+seed_tmux_pane dog-idle64 999999997
+: > "$ACTIONS"
+RESUME_GRACE_SEC=99999 run_script > /dev/null
+assert_contains "$ACTIONS" "nudge:dog-idle64|" "T64: nudge still fires — an out-of-range hour must fail OPEN like any other malformed window (pre-fix: [0-2][0-9] accepted hours 20-29 and this window would ALWAYS read as outside, permanently suppressing)"
+assert_absent "$WORK/city/.gc/logs/agent-stuck-escalation.log" "XXXNEVERMATCHXXX" "T64: sanity — log file itself is readable (guards against a silently-empty log masking a false pass above)"
+log_contains "T64" "RETOMADA enviada a dog-idle64" "T64: log confirms the resume path actually ran (window did not suppress it)"
+rm -f "$LOGS_FIXTURE_DIR/dog-idle64.json"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""

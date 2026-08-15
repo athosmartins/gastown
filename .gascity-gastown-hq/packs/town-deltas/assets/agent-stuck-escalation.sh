@@ -825,6 +825,18 @@ now_outside_active_window() {
         *) return 1 ;;
     esac
     start_hm="${window%-*}"; end_hm="${window#*-}"
+    # ga-nrkh92 gate-fix (blocking issue 2): the case pattern above bounds
+    # each hour DIGIT independently ([0-2][0-9] accepts 20-29, not just
+    # 00-23). A window entirely past 23:59 (e.g. "24:30-25:00") passes that
+    # check but cur_min (from the real clock, always 0-1439) can never
+    # satisfy the in-window test below — this function would then ALWAYS
+    # return "outside", permanently suppressing both resume and escalation
+    # for that bead, the opposite of the fail-OPEN contract documented
+    # above. Bound the parsed hour values explicitly; fail-open (return 1)
+    # on violation, same as any other malformed window.
+    if [ "$((10#${start_hm%%:*}))" -gt 23 ] || [ "$((10#${end_hm%%:*}))" -gt 23 ]; then
+        return 1
+    fi
     start_min=$(( 10#${start_hm%%:*} * 60 + 10#${start_hm##*:} ))
     end_min=$(( 10#${end_hm%%:*} * 60 + 10#${end_hm##*:} ))
     cur_hm="$(date +%H:%M)"
@@ -1534,11 +1546,35 @@ BODY
 
     rf="$RESUMEDIR/$bead_id"
     nudged_at=""
-    [ -f "$rf" ] && nudged_at="$(head -1 "$rf" 2>/dev/null || echo "")"
+    nudged_session=""
+    if [ -f "$rf" ]; then
+        nudged_at="$(sed -n '1p' "$rf" 2>/dev/null || echo "")"
+        nudged_session="$(sed -n '2p' "$rf" 2>/dev/null || echo "")"
+    fi
+
+    # ga-nrkh92 gate-fix (blocking issue 1): $rf is keyed only by bead_id —
+    # if this bead was reassigned to a DIFFERENT live session while it
+    # stayed in_progress (kill+re-despache, or a pool-slot respawn under a
+    # reused name — dog-pool-slot-inherits-prior-incarnation-work), a nudge
+    # recorded for the OLD session is not evidence the NEW session was ever
+    # nudged. Reading it as such would let the grace clock start before the
+    # new session's very first idle observation, escalating immediately
+    # without this daemon ever attempting to wake it — silently defeating
+    # ga-nrkh92's whole purpose for exactly the beads that already needed
+    # one manual intervention. A missing/blank nudged_session (an
+    # old-format single-line $rf, e.g. written before this fix) is NOT
+    # treated as a mismatch — there is no evidence of reassignment either
+    # way, so it falls through to the pre-existing elapsed-time check
+    # unchanged.
+    if [ -n "$nudged_at" ] && [ -n "$nudged_session" ] && [ "$nudged_session" != "$live_session_name" ]; then
+        log "$bead_id: retomada anterior registrada p/ sessao '$nudged_session', atual e '$live_session_name' — bead foi reatribuido; tratando como primeira retomada pra esta sessao (ga-nrkh92 gate-fix, issue 1)"
+        nudged_at=""
+    fi
 
     if [ -z "$nudged_at" ]; then
-        # Primeira vez vendo este bead ocioso nesta janela — tenta acordar
-        # pelo canal interativo, ainda NÃO escala.
+        # Primeira vez vendo este bead ocioso nesta janela (ou reatribuído
+        # p/ nova sessão, acima) — tenta acordar pelo canal interativo,
+        # ainda NÃO escala.
         resume_msg="[AUTO-RESUME] Ocioso ha ${age_min}min com bead ${bead_id} in_progress. ANTES de agir: rode 'bd show ${bead_id}', releia seus ultimos comentarios e o git log/estado da branch, e reporte em 1-2 linhas onde parou e o que falta — nao refaca se ja estiver completo (aguardando gate/merge conta como completo)."
         # ga-nrkh92: cada ramo loga só o que REALMENTE aconteceu nele — um
         # log incondicional de "RETOMADA enviada" depois do if/else afirmaria
@@ -1551,7 +1587,7 @@ BODY
             send_idle_resume "$live_session_name" "$resume_msg"
             log "$bead_id: RETOMADA enviada a $live_session_name (nudge + tmux send-keys) — aguardando resposta até ${RESUME_GRACE_SEC}s (ga-nrkh92)"
         fi
-        printf '%s\n' "$now" > "$rf"
+        printf '%s\n%s\n' "$now" "$live_session_name" > "$rf"
         continue
     fi
 
