@@ -2718,6 +2718,55 @@ def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=N
             pass
         return all_reason_slugs
 
+    # ga-egd5av (2026-08-15): reset pilot:reclaim-count so a human clearing
+    # gate:needs-human automatically grants a genuinely FRESH reclaim budget —
+    # mirroring the gate:fix-attempt:0 reset convention quality-gate-
+    # dispatcher.sh already supports for its own, separate retry cap. Without
+    # this, the label stays pinned at MAX_RECLAIMS forever: a human clears
+    # gate:needs-human (the only guard that makes reclaim_decision() noop —
+    # see has_needs_human at the top of that function), but reclaim_count is
+    # UNCHANGED, so the very next time this bead is found stranded past TTL
+    # for ANY reason — even one unrelated to the original reclaims, e.g. the
+    # newly re-routed owner simply hasn't started yet — reclaim_decision()
+    # skips straight back to "escalate" (reclaim_count >= MAX_RECLAIMS is
+    # still true) and silently re-adds gate:needs-human, undoing the human's
+    # fix. Measured live on wa-uknuq (ga-egd5av): Mayor cleared
+    # gate:needs-human + set gc.routed_to=mila-wa at 05:39Z; this exact
+    # stale-count replay re-escalated at 09:02:18Z with NO new reclaim in
+    # between — reclaim_count was 3 both times, since do_reclaim() never
+    # fires again once capped (reclaim_decision always returns "escalate",
+    # never "reclaim", once the count reaches the cap), so the sticky label
+    # can never organically grow past MAX_RECLAIMS on its own.
+    #
+    # Swap the numeric pilot:reclaim-count:<N> label for a non-numeric
+    # "spent" marker rather than deleting it outright (keeps a permanent,
+    # readable audit trail of the escalation on the bead, and mirrors
+    # do_reclaim()'s own remove-old/add-new bump shape immediately below).
+    # parse_reclaim_count() already treats an unparseable suffix as "keep
+    # looking, default 0" (`except ValueError: pass`, falls through to the
+    # trailing `return 0`), so once this is the only pilot:reclaim-count:*
+    # label left, the NEXT reclaim_decision() call reads reclaim_count=0 —
+    # genuinely fresh, not a replay — and a future stranding reclaims
+    # normally (up to MAX_RECLAIMS more times) instead of instantly
+    # re-escalating on the same exhausted count. Only reached from the
+    # non-refusal cap path (has_explicit_refusal already returned above): a
+    # refusal escalation is inherently fresh evidence every time it fires
+    # (it requires a NEW pool:refused label posted THIS cycle), so
+    # pilot:refusal-count is intentionally left untouched here.
+    if reclaim_count > 0:
+        try:
+            subprocess.run(
+                _bd + ["label", "remove", bead_id, f"pilot:reclaim-count:{reclaim_count}", "-q"],
+                capture_output=True, text=True, timeout=15)
+        except Exception:
+            pass  # old label may already be missing; ignore
+    try:
+        subprocess.run(
+            _bd + ["label", "add", bead_id, f"pilot:reclaim-count:escalated-at-{reclaim_count}", "-q"],
+            capture_output=True, text=True, timeout=15)
+    except Exception as exc:
+        print(f"[INFLIGHT-RECLAIM] warn: mark reclaim-count spent {bead_id}: {exc}", flush=True)
+
     try:
         subprocess.run(
             _bd + ["comment", bead_id,
@@ -2725,8 +2774,10 @@ def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=N
              f"({MAX_RECLAIMS}) exhausted. Bead stranded {idle_min:.0f}min with no "
              f"live builder or branch progress across {reclaim_count} reclaims. "
              f"Marked gate:needs-human; story:in-flight RETAINED (not re-cleared) "
-             f"to avoid a dispatch↔reclaim loop. Human/Mayor must investigate "
-             f"and re-queue."],
+             f"to avoid a dispatch↔reclaim loop. pilot:reclaim-count reset "
+             f"(ga-egd5av) — clearing gate:needs-human alone now grants a fresh "
+             f"reclaim budget, no extra manual step needed. Human/Mayor must "
+             f"investigate and re-queue."],
             capture_output=True, text=True, timeout=15)
     except Exception:
         pass
@@ -5133,15 +5184,24 @@ def _selftest():
         subprocess.run = _orig_run_rf
 
     # --- RF-14: do_escalate() on a NON-refusal (generic MAX_RECLAIMS) escalation
-    #     is completely unchanged — only gate:needs-human:technical, generic
-    #     comment text, no :refused label (AC2 regression anchor for do_escalate
-    #     specifically, mirroring RF-10/RF-10b at the reclaim_decision layer). ---
+    #     — gate:needs-human:technical, generic comment text, no :refused label
+    #     (AC2 regression anchor for do_escalate specifically, mirroring
+    #     RF-10/RF-10b at the reclaim_decision layer). RF-14e/f/g (ga-egd5av)
+    #     additionally anchor the reclaim-count RESET this escalation now
+    #     performs — see that fix's docstring on do_escalate() for the full
+    #     incident (wa-uknuq re-escalated on a stale, never-reset count). ---
+    # ga-egd5av: realistic starting labels include the numeric counter this
+    # escalation is triggered by (the wa-uknuq bead genuinely carried
+    # pilot:reclaim-count:3 when it escalated) — needed so RF-14g below can
+    # derive the true post-escalation label set from do_escalate()'s own
+    # recorded mutations instead of a hand-typed literal.
+    _rf14_start_labels = ["story:in-flight", "pilot:dispatched", f"pilot:reclaim-count:{MAX_RECLAIMS}"]
     _rf_mutations.clear()
     subprocess.run = _stub_run_rf
     try:
         _rf14_result = do_escalate(
             "ga-dead1", "some other bead", reclaim_count=MAX_RECLAIMS, idle_min=40.0,
-            labels=["story:in-flight", "pilot:dispatched"],
+            labels=_rf14_start_labels,
         )
         check("RF-14a: do_escalate (no refusal) does NOT add gate:needs-human:refused",
               ["bd", "label", "add", "ga-dead1", "gate:needs-human:refused", "-q"] not in _rf_mutations,
@@ -5150,12 +5210,60 @@ def _selftest():
               ["bd", "label", "add", "ga-dead1", "gate:needs-human:technical", "-q"] in _rf_mutations,
               f"mutations={_rf_mutations!r}")
         _rf_comment_calls2 = [m for m in _rf_mutations if len(m) >= 2 and m[1] == "comment"]
-        check("RF-14c: do_escalate (no refusal) comment uses the ORIGINAL ga-6ow4v generic text, unchanged",
+        check("RF-14c: do_escalate (no refusal) comment still names ga-6ow4v + reclaim cap",
               len(_rf_comment_calls2) == 1 and "ga-6ow4v" in _rf_comment_calls2[0][-1]
               and "reclaim cap" in _rf_comment_calls2[0][-1],
               f"comment_calls={_rf_comment_calls2!r}")
         check("RF-14d: do_escalate (no refusal) returns an empty reason list (no promotion helper call)",
               _rf14_result == [], f"result={_rf14_result!r}")
+        # ga-egd5av: the escalation must consume the stale numeric counter so
+        # a later human clearing gate:needs-human gets a genuinely fresh
+        # budget, not an instant re-escalation on the same exhausted count.
+        check("RF-14e (ga-egd5av): do_escalate removes the OLD numeric pilot:reclaim-count label",
+              ["bd", "label", "remove", "ga-dead1", f"pilot:reclaim-count:{MAX_RECLAIMS}", "-q"] in _rf_mutations,
+              f"mutations={_rf_mutations!r}")
+        check("RF-14f (ga-egd5av): do_escalate adds a non-numeric 'spent' reclaim-count marker",
+              ["bd", "label", "add", "ga-dead1", f"pilot:reclaim-count:escalated-at-{MAX_RECLAIMS}", "-q"] in _rf_mutations,
+              f"mutations={_rf_mutations!r}")
+
+        # --- RF-14g (ga-egd5av): FALSIFIABLE end-to-end proof, per the bug's
+        #     own AC3 ("remover gate:needs-human, disparar o mecanismo
+        #     suspeito, e provar que o label NAO volta sem causa nova").
+        #     Derives the post-escalation label set from do_escalate()'s OWN
+        #     recorded mutations (never hand-typed — a literal would pass
+        #     unchanged even if do_escalate regressed back to leaving the
+        #     stale label in place, defeating the point of an integration
+        #     test), then simulates a human clearing gate:needs-human (that
+        #     label is simply excluded — do_escalate never removes it itself,
+        #     only a human/Mayor does) and the bead stranding again with ZERO
+        #     new reclaims in between — the exact wa-uknuq sequence. Before
+        #     this fix, reclaim_decision would see the untouched
+        #     pilot:reclaim-count:3 and return "escalate" again on pure
+        #     replay; after the fix it must return "reclaim" — attempt 1 of a
+        #     genuinely fresh budget, not a resurrection. ---
+        _post_escalate_labels = set(_rf14_start_labels)
+        for _m in _rf_mutations:
+            if len(_m) == 6 and _m[0] == "bd" and _m[1] == "label" and _m[3] == "ga-dead1":
+                if _m[2] == "add":
+                    _post_escalate_labels.add(_m[4])
+                elif _m[2] == "remove":
+                    _post_escalate_labels.discard(_m[4])
+        check("RF-14g-setup (ga-egd5av): derived post-escalation labels no longer carry the "
+              "OLD numeric pilot:reclaim-count (proves the derivation isn't vacuous)",
+              f"pilot:reclaim-count:{MAX_RECLAIMS}" not in _post_escalate_labels,
+              f"labels={_post_escalate_labels!r}")
+        _post_escalate_count = parse_reclaim_count(list(_post_escalate_labels))
+        check("RF-14g (ga-egd5av): parse_reclaim_count reads 0 from the REAL post-escalation labels "
+              "(gate:needs-human cleared by a human is now sufficient — no separate manual reset needed)",
+              _post_escalate_count == 0, f"parsed={_post_escalate_count!r} labels={_post_escalate_labels!r}")
+        _second_strand_decision = reclaim_decision(
+            has_live_session=False, has_recent_branch=False, seconds_stranded=RECLAIM_TTL + 60,
+            reclaim_count=_post_escalate_count, has_needs_human=False, has_dispatching_marker=False,
+        )
+        check("RF-14g (ga-egd5av) FALSIFIABLE: bead stranding again right after a human-granted fresh "
+              "attempt reclaims (attempt 1 of a NEW budget) instead of instantly re-escalating on the "
+              "stale cap — this is the exact wa-uknuq resurrection this fix closes",
+              _second_strand_decision == "reclaim", f"decision={_second_strand_decision!r}")
     finally:
         subprocess.run = _orig_run_rf
 

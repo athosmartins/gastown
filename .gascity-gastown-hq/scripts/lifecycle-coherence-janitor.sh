@@ -755,6 +755,39 @@ run_sweep() {
       local status; status=$(echo "$bead_json" | jq -r 'if type=="array" then .[0] else . end | .status // ""' 2>/dev/null)
       local mutated=0
 
+      # ga-egd5av (2026-08-15): grace period — a bead updated very recently
+      # is left alone THIS sweep even though it already carries a
+      # non-implementable label. Same rationale and same shape as
+      # R3_GRACE_MIN above (a fast sweep racing a legitimate, very-recent
+      # state change): R7 sweeps run every ~1-2min (observed live), and a
+      # human/Mayor resolving a circuit-break (clear gate:needs-human,
+      # re-set gc.routed_to) is exactly the kind of fresh, deliberate write
+      # this race clobbers. Measured live: wa-uknuq's gc.routed_to (freshly
+      # set by the Mayor) was wiped by R7 ~100s after inflight-reclaim-guard
+      # re-added gate:needs-human on a stale reclaim-count replay
+      # (ga-egd5av — see that fix in inflight-reclaim-guard.py for the root
+      # cause of the relabel; R7 was correct given the label it saw, but had
+      # zero opportunity to distinguish "this route was just set on purpose"
+      # from "this route has been stale for hours"). A short grace window
+      # buys exactly that distinction cheaply: a genuinely-stale
+      # non-implementable bead (R7's real target) clears this cutoff by
+      # definition and is cleared as before; a real fresh circuit-break
+      # still gets cleared, just on a later sweep instead of losing a race a
+      # human has no way to win. Missing/unparseable updated_at (e.g. a
+      # minimal test fixture) fails OPEN to the pre-existing behavior —
+      # proceed with the mutation — rather than silently protecting a bead
+      # this check cannot actually evaluate.
+      R7_GRACE_MIN="${R7_GRACE_MIN:-5}"
+      local updated_epoch
+      updated_epoch=$(echo "$bead_json" | jq -r 'if type=="array" then .[0] else . end | ((.updated_at // .created_at // "") | fromdateiso8601?) // empty' 2>/dev/null)
+      if [ -n "$updated_epoch" ]; then
+        local _r7_cutoff=$(( $(date +%s) - R7_GRACE_MIN * 60 ))
+        if [ "$updated_epoch" -gt "$_r7_cutoff" ] 2>/dev/null; then
+          log "R7 skip-fresh (ga-egd5av, <${R7_GRACE_MIN}m old): $id ($(basename "$store")) — updated too recently to safely clear routing; a later sweep re-checks"
+          continue
+        fi
+      fi
+
       # ga-ehwjvf (2026-08-15): story:approved contradicts every label in
       # $R7_NONIMPL_RE — a bead can be re-labelled story:approved (implementable)
       # while a stale story:unrefined/needs-approval/refino-escalado/etc. from an
@@ -1044,13 +1077,20 @@ case "\$a" in
   # the third enumerated blocker (refino:info-gap, alongside t-refino's refino:policy-gap).
   # ga-6dpoa: t-scope-review carries the scope guard's OWN label (scope:needs-review,
   # never gate:needs-human) — proves the two systems no longer share a label.
-  *"list --all"*)                               echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}},{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-8yw4i.1","status":"in_progress","assignee":"mila-wa","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-unrefined","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refinement","status":"open","labels":["story:refinement-in-progress"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino","status":"open","labels":["refino:policy-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-infogap","status":"open","labels":["refino:info-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-swept","status":"open","labels":["refino:creator-swept"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-done","status":"open","labels":["refino:done"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-combo","status":"open","labels":["refino:creator-swept","auto-refino:escalated"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto","status":"open","labels":["auto-refino:escalated"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto-generic","status":"open","labels":["auto-refino:foo"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human","status":"open","labels":["gate:needs-human:bar"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human-bare","status":"open","labels":["gate:needs-human"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-scope-review","status":"open","labels":["delivery:partial","gate:passed","scope:needs-review"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-valid","status":"in_progress","labels":["story:in-flight"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-mayor-assigned","status":"in_progress","assignee":"mayor","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-gate-protect","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"r7-original-target","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-ctxthin","status":"open","labels":["ctx:thin"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-triage","status":"open","labels":["story:triage"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-approved-unrefined","status":"open","labels":["story:approved","story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"list --all"*)                               echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}},{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-8yw4i.1","status":"in_progress","assignee":"mila-wa","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-unrefined","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refinement","status":"open","labels":["story:refinement-in-progress"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino","status":"open","labels":["refino:policy-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-infogap","status":"open","labels":["refino:info-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-swept","status":"open","labels":["refino:creator-swept"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-done","status":"open","labels":["refino:done"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-combo","status":"open","labels":["refino:creator-swept","auto-refino:escalated"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto","status":"open","labels":["auto-refino:escalated"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto-generic","status":"open","labels":["auto-refino:foo"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human","status":"open","labels":["gate:needs-human:bar"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human-bare","status":"open","labels":["gate:needs-human"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-scope-review","status":"open","labels":["delivery:partial","gate:passed","scope:needs-review"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-valid","status":"in_progress","labels":["story:in-flight"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-mayor-assigned","status":"in_progress","assignee":"mayor","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-gate-protect","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"r7-original-target","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-ctxthin","status":"open","labels":["ctx:thin"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-triage","status":"open","labels":["story:triage"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-approved-unrefined","status":"open","labels":["story:approved","story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-fresh-needs-human","status":"open","labels":["gate:needs-human"],"metadata":{"gc.routed_to":"mila-wa"}},{"id":"t-stale-needs-human","status":"open","labels":["gate:needs-human"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show wa-o4kuh"*)                             echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}}]' ;;
   *"show wa-06yog"*)                             echo '[{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show wa-8yw4i.1"*)                           echo '[{"id":"wa-8yw4i.1","status":"in_progress","assignee":"mila-wa","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-mayor-assigned"*)                     echo '[{"id":"t-mayor-assigned","status":"in_progress","assignee":"mayor","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-unrefined"*)                          echo '[{"id":"t-unrefined","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-approved-unrefined"*)                 echo '[{"id":"t-approved-unrefined","status":"open","labels":["story:approved","story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  # ga-egd5av: t-fresh-needs-human's updated_at is baked in AT SHIM-GENERATION TIME (this
+  # heredoc's delimiter is unquoted, same idiom as R3_GRACE_MIN's own live-timestamp fixture
+  # above) — always "just now" relative to the grace check the sweep runs moments later.
+  # t-stale-needs-human uses the same ancient 2020 date as R3's stale fixtures: proves the
+  # grace period does NOT over-protect a genuinely-stale non-implementable bead.
+  *"show t-fresh-needs-human"*)                  echo '[{"id":"t-fresh-needs-human","status":"open","labels":["gate:needs-human"],"metadata":{"gc.routed_to":"mila-wa"},"updated_at":"'"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"'"}]' ;;
+  *"show t-stale-needs-human"*)                  echo '[{"id":"t-stale-needs-human","status":"open","labels":["gate:needs-human"],"metadata":{"gc.routed_to":"pool"},"updated_at":"2020-01-01T00:00:00Z"}]' ;;
   *"show t-ctxthin"*)                            echo '[{"id":"t-ctxthin","status":"open","labels":["ctx:thin"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-triage"*)                             echo '[{"id":"t-triage","status":"open","labels":["story:triage"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-refinement"*)                         echo '[{"id":"t-refinement","status":"open","labels":["story:refinement-in-progress"],"metadata":{"gc.routed_to":"pool"}}]' ;;
@@ -1306,6 +1346,18 @@ GITSHIM
   # ctx:thin with gc.routed_to still set.
   grep -q 'update t-ctxthin --unset-metadata gc.routed_to' "$ACT" && ok "R7 (ga-8lrud): unset gc.routed_to on ctx:thin (canonical UNREFINED, previously missing from R7's enumeration)" || bad "R7 (ga-8lrud) did not unset gc.routed_to on t-ctxthin"
   grep -q 'update t-triage --unset-metadata gc.routed_to' "$ACT" && ok "R7 (ga-8lrud): unset gc.routed_to on story:triage (canonical UNREFINED, previously missing from R7's enumeration)" || bad "R7 (ga-8lrud) did not unset gc.routed_to on t-triage"
+
+  # ga-egd5av: R7 grace period — FALSIFIABLE regression anchor for the wa-uknuq
+  # incident (a human's freshly-set gc.routed_to was wiped by R7 ~100s after
+  # inflight-reclaim-guard re-added gate:needs-human on a stale reclaim-count
+  # replay). t-fresh-needs-human's updated_at is "now" (baked in at shim
+  # generation, see the show-mock comment above) — R7 must leave it COMPLETELY
+  # untouched this sweep. t-stale-needs-human is the control: same labels, an
+  # ancient updated_at — R7 must still clear it exactly as before, proving the
+  # grace period does not blanket-protect every gate:needs-human bead, only
+  # ones updated within the R7_GRACE_MIN window.
+  grep -q 't-fresh-needs-human' "$ACT" && bad "R7 (ga-egd5av): touched a bead updated within the grace window — races a human's very-recent fix, reproducing the wa-uknuq incident" || ok "R7 (ga-egd5av): left a freshly-updated gate:needs-human bead alone (grace period held)"
+  grep -q 'update t-stale-needs-human --unset-metadata gc.routed_to' "$ACT" && ok "R7 (ga-egd5av): still clears gc.routed_to on a STALE gate:needs-human bead (grace period does not over-protect)" || bad "R7 (ga-egd5av): grace period incorrectly protected a genuinely-stale non-implementable bead"
 
   # R8 (ga-ipm4): park+arm invariant — a parked bead (needs-human/pool:refused:*/
   # story:blocked) must never keep exec:auto/ctx:ready. Reproduced live on ga-66wc.
