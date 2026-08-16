@@ -42,7 +42,11 @@
 #      human's self-declared park — it's counted (see the "PARK:" log line and
 #      the mail summary) but never enters the age-based alert/cooldown/comment
 #      pipeline below. Everything else is an orphan-suspect and flows through
-#      step 5 exactly as before this split.
+#      step 5 exactly as before this split. A THIRD bucket (ga-eiaidn) is
+#      split out the same way: status=in_progress with a session-VERIFIED-
+#      live assignee (gc session list) — counted separately (see the
+#      "ACTIVE:" log line) and likewise excluded from the pipeline below
+#      while that session remains live.
 #   5. Report only — this daemon NEVER mutates a bead (no label/status/assignee/
 #      close calls of any kind). Per-bead: `bd comment` (durable, lives on the
 #      bead itself). Aggregate: `notify` (low priority — see note below) +
@@ -82,6 +86,39 @@
 # file exists to fix — same precision-erosion mechanism, different label
 # prefix. blocked:* is now excluded alongside blocked-by:* in the is_park
 # check below.
+#
+# IN-PROGRESS+LIVE-ASSIGNEE SPLIT (ga-eiaidn, follow-up of ga-te41ft AC2 —
+# split out rather than folded in, mirroring this file's own precedent of
+# ga-h8rcp being deferred out of ga-cjk1j): a bead can be status=in_progress,
+# genuinely and correctly owned by a LIVE, working session, and still
+# re-alert forever — measured live: wa-nxwqw (assignee=oracle-wa, a
+# crew-style persistent worker) received 5 separate watchdog comments over
+# 31+ hours, ~6h apart, exactly matching GOLW_ALERT_COOLDOWN_S, as its
+# updated_at flip-flopped below/above GOLW_STALE_MINUTES every time
+# oracle-wa touched it and then went stale again before the next touch. This
+# is NOT the same bug as the park split above: nobody declared this bead
+# parked — it is actively being worked, just not continuously enough to stay
+# under the age gate. The obvious shortcut (exclude any status=in_progress
+# bead with a non-empty assignee, is_park's own shape) was checked against
+# live data and rejected: `bd list --id wa-nxwqw --all --json | jq
+# '{heartbeat_at,lease_expires_at}'` returned BOTH null despite a real, live
+# assignee — crew-style singleton workers don't populate the claim-lease
+# heartbeat fields ephemeral dog/wa-worker/ps-worker pool sessions do, so
+# there is no cheap, already-in-the-JSON signal here. A bead stuck
+# in_progress with a genuinely DEAD/crashed assignee is a REAL orphan this
+# watchdog must keep catching (this is exactly the failure mode
+# lifecycle-coherence-janitor.sh's R4/R5 history warns about, cited in WHY
+# DETECTION-ONLY below) — so this fix adds actual session-liveness
+# verification (`gc session list --json --state active`, one fetch per
+# sweep, cross-referenced against the assignee string — see
+# _golw_active_sessions_json/_golw_session_alive) rather than a label/status
+# heuristic. The fail-safe DIRECTION here is the OPPOSITE of the FAIL-OPEN
+# rule below: elsewhere in this file, an unreadable query must never be
+# treated as a confirmed negative; here, an unreadable query — or simply no
+# matching live session — must never be treated as a confirmed POSITIVE. A
+# wrong "declared alive" would silently blind this watchdog to a real
+# orphan, which is worse than the noise this bug is about, so uncertainty
+# always falls through to the pre-existing alert behavior, unchanged.
 #
 # NOTIFY PRIORITY: low (-p 2), not the -p 4 used by throughput-stall-watchdog.
 # That watchdog pages Athos only when auto-recovery of a SYSTEMIC stall fails
@@ -260,6 +297,75 @@ _gate_artifact_probe() {
   fi
 }
 
+# _golw_active_sessions_json — one-shot fetch of the live session roster
+# (`gc session list --json --state active`), reused for every
+# status=in_progress candidate's liveness check this sweep instead of
+# re-querying per bead (same reasoning GOLW_STORES' own header comment gives
+# for not calling `gc rig list` every cycle — avoid paying a repeated cost
+# for data that can't change mid-sweep). gc's own --state active filter
+# already draws exactly the line this probe needs: verified live
+# (2026-08-16) that sessions in "asleep" or "start-pending" state are NOT
+# returned under --state active — neither is a session that could touch a
+# bead again soon, so neither should count as verified-alive here.
+# Prints the `.sessions` array as compact JSON, or "[]" on any read/parse
+# failure — see _golw_session_alive for why an unreadable roster and an
+# empty roster are treated identically (ga-eiaidn: this file's usual
+# FAIL-OPEN direction is inverted for liveness checks).
+# Test seam: routes through $GC_BIN, stubbed in --selftest.
+_golw_active_sessions_json() {
+  local _out _rc
+  _out=$("$GC_BIN" session list --json --state active 2>/dev/null)
+  _rc=$?
+  if [ "$_rc" -ne 0 ] || [ -z "${_out:-}" ]; then
+    log "WARN: gc session list failed (exit $_rc) — session-liveness checks this sweep default to NOT verified-alive (fail-safe toward the pre-existing alert behavior, ga-eiaidn)"
+    printf '[]'
+    return 0
+  fi
+  printf '%s' "$_out" | jq -c '.sessions // []' 2>/dev/null || printf '[]'
+}
+
+# _golw_session_alive <assignee> <active_sessions_json>
+# Verifies whether <assignee> — a bd bead's raw .assignee string — names a
+# CURRENTLY ACTIVE gc session. Matches against every identity field a bd
+# assignee value is known to carry in this city (measured live 2026-08-16):
+# crew-style singleton workers (oracle-wa, mila-wa, thies-wa, ...) store the
+# STABLE role name as .name/.agent_name/.alias/.template but a per-spawn
+# RANDOM-SUFFIXED .session_name (e.g. "thies-wa-awisp559gquj") — and bd's
+# own assignee value for these is the stable role name, never the suffixed
+# one. Ephemeral dog/wa-worker/ps-worker pool sessions are the mirror image:
+# bd's assignee is the per-spawn .session_name (e.g. "dog-gach4yyi"), while
+# .agent_name/.alias is the reusable POOL SLOT name (e.g. "gastown.dog-1"),
+# which is NOT what bd recorded as assignee. Matching only one field (only
+# .agent_name, or only .session_name) silently misses one of these two
+# worker families entirely — matching all five is what makes this uniform
+# across both without needing to know which family a given assignee is.
+# WRONG-DIRECTION WARNING (ga-eiaidn, the bug's own explicit caution): a
+# false "1" here SUPPRESSES a real alert on a genuinely-dead assignee — a
+# wrong "declared alive" is worse than the noise this bug exists to fix.
+# Uncertainty (empty assignee, empty/unreadable roster, no match) always
+# resolves to "0" — the opposite fail-direction from _gate_artifact_probe
+# above, where uncertainty must not resolve to a confirmed NEGATIVE. Here it
+# must not resolve to a confirmed POSITIVE.
+# Prints "1" (verified alive) or "0" (dead, unknown, unmatched, or the
+# roster itself could not be read).
+_golw_session_alive() {
+  local _assignee="$1" _sessions="$2" _out
+  [ -z "${_assignee:-}" ] && { printf '0'; return 0; }
+  [ -z "${_sessions:-}" ] && { printf '0'; return 0; }
+  _out=$(printf '%s' "$_sessions" | jq -r --arg a "$_assignee" '
+      ( map(select(
+          (.name // "") == $a or (.agent_name // "") == $a or
+          (.alias // "") == $a or (.template // "") == $a or
+          (.session_name // "") == $a
+        )) | length ) as $n
+      | if $n > 0 then "1" else "0" end
+    ' 2>/dev/null)
+  case "$_out" in
+    1) printf '1' ;;
+    *) printf '0' ;;
+  esac
+}
+
 # _bead_recheck_status <bead_id> <store> <exclude_prefixes_json>
 # Individually re-verifies ONE bead's current orphan-suspect status directly
 # against its store — the ga-tqe4j fix. Used ONLY when a bead already tracked
@@ -393,6 +499,12 @@ run_sweep() {
   # _golw_resolve_tracked_state before anything gets pruned.
   local state; state="$(_state_load)"
 
+  # ga-eiaidn: one-shot fetch, reused by every status=in_progress candidate's
+  # liveness check below via _golw_session_alive — see
+  # _golw_active_sessions_json for why this is fetched once per sweep
+  # instead of once per candidate.
+  local active_sessions_json; active_sessions_json="$(_golw_active_sessions_json)"
+
   # Accumulate flagged candidates as TSV lines: id\tstore\tage_min\tlabels\tartifact_status\tartifact_count
   local flagged_tsv=""
   local store cand_json aged_json
@@ -467,6 +579,12 @@ run_sweep() {
     # blocked-by:*, so every blocked:*-labeled bead re-alerted forever — 8
     # measured live 2026-08-15, one (wa-kty2h) stuck ~4.8 days despite being
     # correctly and deliberately parked on an open dependency.
+    # bstatus/bassignee (ga-eiaidn): carried through unchanged from $b so the
+    # while-loop below can decide, per candidate, whether a session-liveness
+    # check even applies (status=in_progress with a non-empty assignee) —
+    # see _golw_session_alive. Plain passthrough fields, not a park-style
+    # boolean, because "in_progress with a live assignee" is a DIFFERENT
+    # bucket from is_park (counted separately — see the ACTIVE split below).
     ids_labels=$(printf '%s' "$aged_json" | jq -r '
         .[] | . as $b
         | ($b.labels // []) as $L
@@ -477,13 +595,15 @@ run_sweep() {
                    or ($L | any(startswith("blocked-by:")))
                    or ($L | any(startswith("blocked:")))
                    or (($b.status // "") == "blocked") )
-              then "1" else "0" end )
+              then "1" else "0" end ),
+            ($b.status // ""),
+            ($b.assignee // "")
           ] | @tsv
       ' 2>/dev/null)
     [ -z "${ids_labels:-}" ] && continue
 
-    local bid blabels bts is_park age_min probe active lstatus lcount
-    while IFS=$'\t' read -r bid blabels bts is_park; do
+    local bid blabels bts is_park bstatus bassignee age_min probe active lstatus lcount is_live
+    while IFS=$'\t' read -r bid blabels bts is_park bstatus bassignee; do
       [ -z "${bid:-}" ] && continue
       probe="$(_gate_artifact_probe "$bid")"
       active="$(printf '%s' "$probe" | cut -f1)"
@@ -500,7 +620,15 @@ run_sweep() {
       else
         age_min="?"
       fi
-      flagged_tsv="${flagged_tsv}${bid}\t${store}\t${age_min}\t${blabels}\t${lstatus}\t${lcount}\t${is_park}\n"
+      # ga-eiaidn: only worth a liveness lookup when it could change the
+      # verdict — a bead already headed for park_tsv (is_park=1) stays
+      # parked regardless, and only status=in_progress with a non-empty
+      # assignee is even eligible for the ACTIVE bucket at all.
+      is_live="0"
+      if [ "$is_park" != "1" ] && [ "$bstatus" = "in_progress" ] && [ -n "${bassignee:-}" ]; then
+        is_live="$(_golw_session_alive "$bassignee" "$active_sessions_json")"
+      fi
+      flagged_tsv="${flagged_tsv}${bid}\t${store}\t${age_min}\t${blabels}\t${lstatus}\t${lcount}\t${is_park}\t${is_live}\n"
     done <<< "$ids_labels"
   done
 
@@ -510,13 +638,20 @@ run_sweep() {
   # means every downstream stage operates on orphan_tsv exactly as it did
   # before this fix — an un-parked bead's behavior is byte-for-byte identical
   # (AC2 control: a real orphan must keep alerting exactly as today). ────────
-  local orphan_tsv="" park_tsv="" park_count=0
-  local bid store2 age_min labels lstatus lcount is_park
-  while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount is_park; do
+  local orphan_tsv="" park_tsv="" park_count=0 active_tsv="" active_count=0
+  local bid store2 age_min labels lstatus lcount is_park is_live
+  while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount is_park is_live; do
     [ -z "${bid:-}" ] && continue
     if [ "$is_park" = "1" ]; then
       park_tsv="${park_tsv}${bid}\t${store2}\t${age_min}\t${labels}\t${lstatus}\t${lcount}\n"
       park_count=$((park_count + 1))
+    elif [ "$is_live" = "1" ]; then
+      # ga-eiaidn: is_park takes precedence above — a bead carrying BOTH a
+      # park label and a live in_progress assignee is counted as parked, not
+      # active-live, matching how a deliberate human signal already outranks
+      # everything else in this split.
+      active_tsv="${active_tsv}${bid}\t${store2}\t${age_min}\t${labels}\t${lstatus}\t${lcount}\n"
+      active_count=$((active_count + 1))
     else
       orphan_tsv="${orphan_tsv}${bid}\t${store2}\t${age_min}\t${labels}\t${lstatus}\t${lcount}\n"
     fi
@@ -531,9 +666,18 @@ run_sweep() {
     done
   fi
 
+  if [ "$active_count" -gt 0 ]; then
+    log "ACTIVE: ${active_count} bead(s) in_progress com sessao de assignee viva confirmada via gc session list (ga-eiaidn) — nao contam para o alerta de orfao"
+    printf '%b' "$active_tsv" | while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount; do
+      [ -z "${bid:-}" ] && continue
+      log "  - ACTIVE $bid ($(_store_name "$store2")) age=${age_min}min labels=[${labels}]"
+    done
+  fi
+
   if [ -z "${flagged_tsv:-}" ]; then
     local park_suffix=""
-    [ "$park_count" -gt 0 ] && park_suffix=" (${park_count} parked, excluded)"
+    [ "$park_count" -gt 0 ] && park_suffix="${park_suffix} (${park_count} parked, excluded)"
+    [ "$active_count" -gt 0 ] && park_suffix="${park_suffix} (${active_count} active-live, excluded)"
     if [ "$state" = "{}" ]; then
       # Nothing currently orphaned AND nothing was ever tracked — genuine
       # no-op, nothing to verify or prune.
@@ -620,7 +764,8 @@ run_sweep() {
 
   if [ "${new_count:-0}" -eq 0 ] && [ "${resolved_count:-0}" -eq 0 ]; then
     local park_suffix2=""
-    [ "$park_count" -gt 0 ] && park_suffix2=" (+${park_count} parked, excluded)"
+    [ "$park_count" -gt 0 ] && park_suffix2="${park_suffix2} (+${park_count} parked, excluded)"
+    [ "$active_count" -gt 0 ] && park_suffix2="${park_suffix2} (+${active_count} active-live, excluded)"
     log "OK: all ${total_flagged} flagged bead(s) already alerted within cooldown (${GOLW_ALERT_COOLDOWN_S}s) — no new notification${park_suffix2}"
     if [ "${GOLW_DRY_RUN:-0}" != "1" ]; then
       mkdir -p "$GOLW_STATE_DIR" 2>/dev/null || true
@@ -652,6 +797,9 @@ run_sweep() {
   local summary="GATE ORPHANED LABEL: ${new_count} new/due, ${resolved_count} resolved, ${unchanged_count} unchanged-already-reported — ${total_flagged} total currently flagged (>=${GOLW_STALE_MINUTES}min)."
   if [ "$park_count" -gt 0 ]; then
     summary="${summary} +${park_count} parado(s) por decisao humana (gate:needs-human*/blocked-by:*/blocked:*/status=blocked) — nao contam para o alerta acima."
+  fi
+  if [ "$active_count" -gt 0 ]; then
+    summary="${summary} +${active_count} em andamento com sessao viva (status=in_progress, assignee confirmado ativo via gc session list, ga-eiaidn) — nao contam para o alerta acima."
   fi
 
   if [ -n "${GOLW_TEST_NOTIFIED:-}" ]; then
@@ -701,7 +849,10 @@ root causes seen historically (ga-d3eg2's own measurement): a stale label left
 after a manual fix, a branch that conflicts with main and needs re-anchor, or
 work already merged but the bead never closed. Beads carrying an intentional
 park signal (gate:needs-human*, blocked-by:*, blocked:*, status=blocked) are excluded from
-this list entirely (ga-cjk1j) — see the parked-count line above.
+this list entirely (ga-cjk1j) — see the parked-count line above. Beads that are
+status=in_progress with a session-verified-live assignee (gc session list,
+ga-eiaidn) are also excluded while that session remains active — see the
+active-live count line above.
 
 Per-bead detail for NEW/DUE beads is also posted as a comment on each bead.
 Re-alerts for an already-flagged bead are suppressed for ${GOLW_ALERT_COOLDOWN_S}s
@@ -783,7 +934,32 @@ esac
 BDSTUB
   chmod +x "$BD_BIN"
   printf '#!/usr/bin/env bash\necho "notify:$*" >> "$GOLW_TEST_NOTIFIED" 2>/dev/null; exit 0\n' > "$NOTIFY_BIN"
-  printf '#!/usr/bin/env bash\n[ "$1" = "mail" ] && echo "mail:$*" >> "$GOLW_TEST_MAILED" 2>/dev/null; exit 0\n' > "$GC_BIN"
+  # Fake gc: "mail send mayor" keeps its pre-existing (effectively unused —
+  # run_sweep only shells out to $GC_BIN for mail when GOLW_TEST_MAILED is
+  # UNSET, which no selftest scenario does) behavior byte-for-byte. "session
+  # list" (ga-eiaidn) is the new, actually-exercised path: reads a
+  # fixture-driven active-session roster so _golw_session_alive's matching
+  # can be tested without a live gc/session subsystem. __GC_FAIL__ mirrors
+  # BD_BIN's own sentinel convention for simulating a genuine query failure.
+  cat > "$GC_BIN" <<'GCSTUB'
+#!/usr/bin/env bash
+case "$1" in
+  mail)
+    echo "mail:$*" >> "${GOLW_TEST_MAILED:-/dev/null}" 2>/dev/null
+    ;;
+  session)
+    if [ "$2" = "list" ]; then
+      f="$GOLW_TEST_FIXTURES_DIR/sessions-active.json"
+      if [ -f "$f" ] && grep -qx '__GC_FAIL__' "$f" 2>/dev/null; then
+        echo "simulated gc session list failure" >&2
+        exit 1
+      fi
+      [ -f "$f" ] && cat "$f" || echo '{"sessions":[]}'
+    fi
+    ;;
+esac
+exit 0
+GCSTUB
   chmod +x "$NOTIFY_BIN" "$GC_BIN"
 
   export GOLW_TEST_FIXTURES_DIR="$TMP/fixtures"
@@ -801,6 +977,16 @@ BDSTUB
     local id="$1" labels="$3" upd="$4"
     local labels_json; labels_json="$(printf '%s' "$labels" | tr ',' '\n' | jq -R . | jq -s -c .)"
     printf '{"id":"%s","status":"open","updated_at":"%s","labels":%s}' "$id" "$upd" "$labels_json"
+  }
+
+  # ga-eiaidn: separate builder (not a mk_candidate signature change — every
+  # existing scenario above relies on mk_candidate's hardcoded status=open
+  # and absent .assignee) for the in_progress+assignee shape the new
+  # session-liveness scenarios below need.
+  mk_candidate_inprogress() {  # id store labels_csv updated_at assignee
+    local id="$1" labels="$3" upd="$4" assignee="$5"
+    local labels_json; labels_json="$(printf '%s' "$labels" | tr ',' '\n' | jq -R . | jq -s -c .)"
+    printf '{"id":"%s","status":"in_progress","assignee":"%s","updated_at":"%s","labels":%s}' "$id" "$assignee" "$upd" "$labels_json"
   }
 
   # ── Scenario 1: no artifact at all + stale → FLAG (ga-hn3kh shape) ────────
@@ -1500,6 +1686,149 @@ BDSTUB
   [ "$rc" -eq 0 ] && ok "scenario 30: blocked-by:-labeled bead still does not enter NEW/DUE (return 0)" || bad "scenario 30 (regression on ga-cjk1j behavior): a blocked-by: bead was treated as an orphan-suspect, got $rc"
   [ ! -s "$COMM30" ] && ok "scenario 30: no comment posted on the blocked-by:-parked bead" || bad "scenario 30: comment posted on a bead carrying blocked-by: (should still be excluded)"
   rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 31 (ga-eiaidn AC1 FIXTURE — reproduces the exact wa-nxwqw
+  # shape): a bead status=in_progress, assignee is a crew-style role name,
+  # stale (>180min), gate:* labels, with a session VERIFIED alive in the
+  # roster (matched via .agent_name/.alias/.template — NOT .session_name,
+  # which carries an unrelated per-spawn suffix, mirroring the real
+  # oracle-wa production shape measured live 2026-08-16) → must NOT enter
+  # NEW/DUE; counted as ACTIVE only. ─────────────────────────────────────
+  echo "Scenario 31 (ga-eiaidn AC1 fixture): in_progress bead with a session-verified-live assignee → NOT flagged as orphan, counted as ACTIVE only"
+  printf '[%s]' "$(mk_candidate_inprogress cand-live1 "$TMP/hq" "gate:failed,gate:fix-attempt:2,gate:needs-fix" "$OLD_TS" "oracle-wa")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-live1.json"
+  echo '{"sessions":[{"name":"oracle-wa","agent_name":"oracle-wa","alias":"oracle-wa","template":"oracle-wa","session_name":"oracle-wa-awisp9z8x1","state":"active"}]}' > "$TMP/fixtures/sessions-active.json"
+  NOTIF31="$TMP/notif31"; MAIL31="$TMP/mail31"; COMM31="$TMP/comm31"
+  : > "$NOTIF31"; : > "$MAIL31"; : > "$COMM31"; : > "$LOG"
+  GOLW_TEST_NOTIFIED="$NOTIF31" GOLW_TEST_MAILED="$MAIL31" GOLW_TEST_COMMENTS_LOG="$COMM31" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 31: in_progress bead with a live-verified assignee does not enter NEW/DUE (return 0)" || bad "scenario 31 (ga-eiaidn AC1 regression — the exact wa-nxwqw bug): a bead with a verified-live assignee was treated as an orphan-suspect, got $rc"
+  [ ! -s "$COMM31" ] && ok "scenario 31: no comment posted on the active-live bead" || bad "scenario 31: comment posted on a bead with a verified-live assignee (should be excluded)"
+  [ ! -s "$NOTIF31" ] && ok "scenario 31: no notify fired for an active-live-only sweep" || bad "scenario 31: notify fired despite only an active-live bead being present"
+  [ ! -s "$MAIL31" ] && ok "scenario 31: no mail fired for an active-live-only sweep" || bad "scenario 31: mail fired despite only an active-live bead being present"
+  grep -q "ACTIVE: 1 bead" "$LOG" 2>/dev/null && ok "scenario 31: log records the active-live count" || bad "scenario 31: log missing the ACTIVE count line"
+  grep -q "cand-live1" "$LOG" 2>/dev/null && ok "scenario 31: log names the active-live bead" || bad "scenario 31: log does not name the active-live bead cand-live1"
+  rm -f "$STATE_FILE" "$TMP/fixtures/sessions-active.json" 2>/dev/null
+
+  # ── Scenario 32 (ga-eiaidn AC2 CONTROL — the real-orphan control that
+  # keeps 31 honest): same in_progress+assignee shape, but the assignee is
+  # NOT present in the active-session roster (dead/crashed session) → must
+  # continue alerting exactly as before this fix. If this fails, the fix
+  # blinded the watchdog to a genuine orphan — worse than the bug it fixes
+  # (bug body, criterio de aceite #2). ──────────────────────────────────────
+  echo "Scenario 32 (ga-eiaidn AC2 control): in_progress bead with a DEAD assignee (absent from active roster) → still flags exactly as before this fix"
+  printf '[%s]' "$(mk_candidate_inprogress cand-dead1 "$TMP/hq" "gate:failed,gate:fix-attempt:2,gate:needs-fix" "$OLD_TS" "oracle-wa")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-dead1.json"
+  echo '{"sessions":[{"name":"mila-wa","agent_name":"mila-wa","alias":"mila-wa","template":"mila-wa","session_name":"mila-wa-awispother","state":"active"}]}' > "$TMP/fixtures/sessions-active.json"
+  NOTIF32="$TMP/notif32"; MAIL32="$TMP/mail32"; COMM32="$TMP/comm32"
+  : > "$NOTIF32"; : > "$MAIL32"; : > "$COMM32"
+  GOLW_TEST_NOTIFIED="$NOTIF32" GOLW_TEST_MAILED="$MAIL32" GOLW_TEST_COMMENTS_LOG="$COMM32" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 32: in_progress bead with a dead assignee still flags (return 1)" || bad "scenario 32 (ga-eiaidn AC2 regression): a dead-assignee in_progress bead was wrongly excluded, got $rc"
+  grep -q "cand-dead1" "$COMM32" 2>/dev/null && ok "scenario 32: comment posted on the dead-assignee orphan" || bad "scenario 32 (ga-eiaidn AC2 regression): no comment on cand-dead1 — the fix silenced a real alert"
+  [ -s "$NOTIF32" ] && ok "scenario 32: notify still fires for a dead-assignee orphan" || bad "scenario 32: notify did not fire for a dead-assignee orphan"
+  rm -f "$STATE_FILE" "$TMP/fixtures/sessions-active.json" 2>/dev/null
+
+  # ── Scenario 33 (ga-eiaidn AC2 CONTROL2 — the crux of the inverted
+  # fail-direction): the `gc session list` query itself fails (e.g. gc down,
+  # transient error) → liveness is UNVERIFIABLE, and per this bug's own
+  # explicit caution (criterio de aceite #4: "a wrong 'declared alive' is
+  # worse than the noise this bug is about"), unverifiable must resolve to
+  # NOT-alive — still alerts exactly as before this fix, the OPPOSITE
+  # direction from every other fail-open probe in this file. ───────────────
+  echo "Scenario 33 (ga-eiaidn AC2 control2): gc session list query FAILS → liveness unverifiable, still flags (inverted fail-direction from the rest of this file)"
+  printf '[%s]' "$(mk_candidate_inprogress cand-unk1 "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS" "oracle-wa")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-unk1.json"
+  printf '%s\n' "__GC_FAIL__" > "$TMP/fixtures/sessions-active.json"
+  NOTIF33="$TMP/notif33"; MAIL33="$TMP/mail33"; COMM33="$TMP/comm33"
+  : > "$NOTIF33"; : > "$MAIL33"; : > "$COMM33"; : > "$LOG"
+  GOLW_TEST_NOTIFIED="$NOTIF33" GOLW_TEST_MAILED="$MAIL33" GOLW_TEST_COMMENTS_LOG="$COMM33" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 33: unreadable session roster → still flags (return 1)" || bad "scenario 33 (ga-eiaidn AC2 regression — the exact wrong-direction bug): an unverifiable liveness check was treated as confirmed-alive, got $rc"
+  grep -q "cand-unk1" "$COMM33" 2>/dev/null && ok "scenario 33: comment posted despite the unreadable roster" || bad "scenario 33: no comment on cand-unk1 — an unreadable roster wrongly suppressed a real alert"
+  grep -q "WARN: gc session list failed" "$LOG" 2>/dev/null && ok "scenario 33: WARN logged for the failed session-list query" || bad "scenario 33: no WARN logged for the failed gc session list query"
+  rm -f "$STATE_FILE" "$TMP/fixtures/sessions-active.json" 2>/dev/null
+
+  # ── Scenario 34 (ga-eiaidn control — status gating): a bead whose
+  # assignee matches a live session, but the bead's own status is "open"
+  # (not "in_progress") → the exclusion must NOT fire. This proves the new
+  # check is scoped to in_progress specifically, not "any bead whose
+  # assignee happens to be a live session name." ───────────────────────────
+  echo "Scenario 34 (ga-eiaidn control): status=open (not in_progress) bead with a live-matching assignee still flags — exclusion is status-gated"
+  printf '[{"id":"cand-open-live","status":"open","assignee":"oracle-wa","updated_at":"%s","labels":["gate:queued"]}]' "$OLD_TS" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-open-live.json"
+  echo '{"sessions":[{"name":"oracle-wa","agent_name":"oracle-wa","alias":"oracle-wa","template":"oracle-wa","session_name":"oracle-wa-awisp9z8x1","state":"active"}]}' > "$TMP/fixtures/sessions-active.json"
+  NOTIF34="$TMP/notif34"; MAIL34="$TMP/mail34"; COMM34="$TMP/comm34"
+  : > "$NOTIF34"; : > "$MAIL34"; : > "$COMM34"
+  GOLW_TEST_NOTIFIED="$NOTIF34" GOLW_TEST_MAILED="$MAIL34" GOLW_TEST_COMMENTS_LOG="$COMM34" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 34: status=open bead with a live-matching assignee still flags (return 1)" || bad "scenario 34 (regression): the active-live exclusion fired on a non-in_progress bead, got $rc"
+  grep -q "cand-open-live" "$COMM34" 2>/dev/null && ok "scenario 34: comment posted — status=open is not exempted by this fix" || bad "scenario 34: no comment on cand-open-live — the exclusion wrongly applied to a non-in_progress bead"
+  rm -f "$STATE_FILE" "$TMP/fixtures/sessions-active.json" 2>/dev/null
+
+  # ── Scenario 35 (ga-eiaidn mixed, mirrors Scenario 19's style): 1 real
+  # orphan + 1 parked bead + 1 active-live bead in the SAME sweep. Verifies
+  # the three-way split doesn't cross-contaminate: the orphan alerts on its
+  # own merits, neither excluded bead leaks into its comment/mail, and both
+  # exclusion counts are correct and independent. ──────────────────────────
+  echo "Scenario 35 (ga-eiaidn mixed): 1 real orphan + 1 parked bead + 1 active-live bead in the same sweep"
+  printf '[%s,%s,%s]' \
+    "$(mk_candidate cand-mix2-orphan "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" \
+    "$(mk_candidate cand-mix2-park "$TMP/hq" "gate:fix-attempt:1,gate:needs-human:technical" "$OLD_TS")" \
+    "$(mk_candidate_inprogress cand-mix2-live "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS" "oracle-wa")" \
+    > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-mix2-orphan.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-mix2-park.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-mix2-live.json"
+  echo '{"sessions":[{"name":"oracle-wa","agent_name":"oracle-wa","alias":"oracle-wa","template":"oracle-wa","session_name":"oracle-wa-awisp9z8x1","state":"active"}]}' > "$TMP/fixtures/sessions-active.json"
+  NOTIF35="$TMP/notif35"; MAIL35="$TMP/mail35"; COMM35="$TMP/comm35"
+  : > "$NOTIF35"; : > "$MAIL35"; : > "$COMM35"; : > "$LOG"
+  GOLW_TEST_NOTIFIED="$NOTIF35" GOLW_TEST_MAILED="$MAIL35" GOLW_TEST_COMMENTS_LOG="$COMM35" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 35: mixed sweep still flags the real orphan (return 1)" || bad "scenario 35: mixed sweep should flag cand-mix2-orphan, got $rc"
+  grep -q "cand-mix2-orphan" "$COMM35" 2>/dev/null && ok "scenario 35: comment posted on the real orphan only" || bad "scenario 35: no comment on cand-mix2-orphan"
+  grep -q "cand-mix2-park" "$COMM35" 2>/dev/null && bad "scenario 35 (regression): comment posted on the parked bead" || ok "scenario 35: no comment on the parked bead"
+  grep -q "cand-mix2-live" "$COMM35" 2>/dev/null && bad "scenario 35 (regression): comment posted on the active-live bead" || ok "scenario 35: no comment on the active-live bead"
+  grep -q "PARK: 1 bead" "$LOG" 2>/dev/null && ok "scenario 35: log records park_count=1" || bad "scenario 35: log missing PARK count of 1"
+  grep -q "ACTIVE: 1 bead" "$LOG" 2>/dev/null && ok "scenario 35: log records active_count=1" || bad "scenario 35: log missing ACTIVE count of 1"
+  grep -q "cand-mix2-park" "$MAIL35" 2>/dev/null && bad "scenario 35 (regression): mail individually names the parked bead" || ok "scenario 35: mail does not individually name cand-mix2-park"
+  grep -q "cand-mix2-live" "$MAIL35" 2>/dev/null && bad "scenario 35 (regression): mail individually names the active-live bead" || ok "scenario 35: mail does not individually name cand-mix2-live"
+  rm -f "$STATE_FILE" "$TMP/fixtures/sessions-active.json" 2>/dev/null
+
+  # ── Scenario 36 (ga-eiaidn × ga-tqe4j interaction — defensive check, not
+  # required by the bug's own AC but this file's history makes it cheap
+  # insurance): a bead tracked in state from a sweep where its assignee was
+  # DEAD, then the SAME bead transitions to a verified-live assignee on the
+  # next sweep. Its gate:* labels are UNCHANGED throughout — only its
+  # liveness verdict changed — so it must NOT be declared RESOLVED (that
+  # would be the exact ga-tqe4j class of mistake: absence-from-flagged-set
+  # misread as "confirmed cleared"). It should simply stop re-alerting
+  # (excluded via the ACTIVE bucket) while staying tracked/UNVERIFIED. ─────
+  echo "Scenario 36 (ga-eiaidn x ga-tqe4j): bead transitions dead-assignee -> live-assignee across sweeps → NOT declared RESOLVED"
+  rm -f "$STATE_FILE" 2>/dev/null
+  printf '[%s]' "$(mk_candidate_inprogress cand-transition "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS" "oracle-wa")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-transition.json"
+  echo '{"sessions":[]}' > "$TMP/fixtures/sessions-active.json"
+  GOLW_TEST_NOTIFIED="$TMP/notif36a" GOLW_TEST_MAILED="$TMP/mail36a" GOLW_TEST_COMMENTS_LOG="$TMP/comm36a" run_sweep >/dev/null
+  [ -s "$STATE_FILE" ] && ok "scenario 36: state file written after 1st sweep (dead assignee, real alert)" || bad "scenario 36: state file missing after 1st sweep"
+  echo '{"sessions":[{"name":"oracle-wa","agent_name":"oracle-wa","alias":"oracle-wa","template":"oracle-wa","session_name":"oracle-wa-awispnew","state":"active"}]}' > "$TMP/fixtures/sessions-active.json"
+  # recheck fixture: _bead_recheck_status only reads status/labels — the
+  # gate:* label is still there (assignee liveness isn't part of that
+  # check), so a correct implementation must report "present", not "gone".
+  printf '[%s]' "$(mk_candidate_inprogress cand-transition "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS" "oracle-wa")" > "$TMP/fixtures/recheck-cand-transition.json"
+  : > "$LOG"
+  GOLW_TEST_NOTIFIED="$TMP/notif36b" GOLW_TEST_MAILED="$TMP/mail36b" GOLW_TEST_COMMENTS_LOG="$TMP/comm36b" run_sweep >/dev/null
+  grep -q '"cand-transition"' "$STATE_FILE" 2>/dev/null && ok "scenario 36: cand-transition SURVIVES in state after becoming active-live (not wiped)" || bad "scenario 36 (ga-tqe4j-class regression): cand-transition was pruned from state after merely becoming active-live"
+  grep -q "RESOLVED: cand-transition" "$LOG" 2>/dev/null && bad "scenario 36 (ga-tqe4j-class regression — the exact bug): cand-transition logged as RESOLVED merely because its assignee became live" || ok "scenario 36: cand-transition never logged as RESOLVED"
+  grep -q "ACTIVE: 1 bead" "$LOG" 2>/dev/null && ok "scenario 36: 2nd sweep logs it under ACTIVE (no longer re-alerting)" || bad "scenario 36: 2nd sweep did not record the active-live count"
+  [ ! -s "$TMP/comm36b" ] && ok "scenario 36: no NEW comment posted on the 2nd sweep" || bad "scenario 36: a comment was posted on the 2nd sweep despite the assignee now being live"
+  rm -f "$TMP/fixtures/recheck-cand-transition.json" "$STATE_FILE" "$TMP/fixtures/sessions-active.json" 2>/dev/null
 
   echo ""
   echo "gate-orphaned-label-watchdog selftest: PASS=$PASS FAIL=$FAIL"
