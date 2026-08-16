@@ -26,6 +26,27 @@
 #        matches are IDENTICAL to what _filter_candidates' own trace mirror
 #        would report — guards against the two copies drifting apart, since
 #        this function intentionally does not touch _filter_candidates itself.
+#   AC10. ga-fgdmol: reachability through the REAL production chain ORDER.
+#        At all 19 real call sites, this function used to be chained AFTER
+#        _filter_candidates (`_filter_candidates | _reconcile_text_veto_labels
+#        "<db>"`) — but _filter_candidates' own select already drops a
+#        text-veto-matching bead from its stdout before this function ever
+#        saw it as stdin, making its "add" branch structurally unreachable in
+#        production even though every scenario above (which invokes it
+#        directly on raw fixtures) passed green. Fixed by reordering to
+#        `_reconcile_text_veto_labels "<db>" | _filter_candidates` at all 19
+#        sites — mirroring ga-iu3xc5's own Scenario 7/8, which proved the
+#        identical shape for the sibling _reconcile_empty_description_signal.
+#        Scenario 9 proves the FIXED order lets the label reach bd for real;
+#        Scenario 10 is the negative control proving the OLD order does not
+#        (documents why the reorder was necessary, not a bug in this fix).
+#   AC11. Structural: the LIVE file itself has zero call sites remaining in
+#        the old (unreachable) order and exactly 19 in the fixed order. AC10
+#        proves the two orderings behave differently in principle; AC11 is
+#        what actually proves the shipped script was edited — a passing AC10
+#        alone would not have caught the original bug, since the functions
+#        always composed correctly in isolation regardless of which order
+#        production actually wired them in.
 #
 # Runs entirely against extracted function bodies (same awk/sed-extraction
 # idiom as pilot-dispatcher.exclusion-trace.selftest.sh) with a PATH-shimmed
@@ -222,6 +243,74 @@ for _id in ga-d-engine ga-d-decisao ga-d-athos ga-d-marker; do
     && ok "AC9: _filter_candidates' own trace also excludes $_id (both copies agree)" \
     || bad "AC9: _filter_candidates' trace does NOT mention $_id — drift between the two pattern copies? (trace: $FC_TRACE)"
 done
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "Scenario 9: AC10 (the critical one) — reachable through the REAL production chain (fixed order)"
+echo "  _reconcile_text_veto_labels \"<db>\" | _filter_candidates"
+echo "  (this is the exact ordering shipped at all 19 real call sites, post ga-fgdmol)"
+: > "$CALLLOG"
+cat > "$WORK/chain.sh" <<EOF
+export PATH="$SHIMBIN:\$PATH"
+$LOG_FN
+$LE_FN
+$PRE
+$CAP
+$TVP
+$FC_FN
+$RTV_FN
+SELF_BEAD_ID=''
+printf '%s' '$IN1' | _reconcile_text_veto_labels /fake/db | _filter_candidates
+EOF
+CHAIN_OUT="$(bash "$WORK/chain.sh" 2>"$WORK/chain.stderr")"
+[ "$CHAIN_OUT" = "[]" ] \
+  && ok "AC10: bead still correctly excluded from the dispatchable output through the real chain (transparent — never alters what dispatches)" \
+  || bad "AC10: expected [] (excluded), got: $CHAIN_OUT"
+grep -qF "$(printf '/fake/db\tadd\tga-add1\tpilot:text-veto:engine-rebuild-text-pattern')" "$CALLLOG" \
+  && ok "AC10: label ADD reaches bd through the FIXED production pipe ordering" \
+  || bad "AC10: expected label ADD call missing through the fixed chain (calllog: $(cat "$CALLLOG")) — if this fails, the wiring order regressed to AFTER _filter_candidates"
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "Scenario 10: AC10 negative control — the OLD order (_filter_candidates | _reconcile_text_veto_labels,"
+echo "  i.e. this function's placement before the ga-fgdmol fix) reproduces the unreachable-add defect"
+echo "  this fix's reordering was chosen specifically to avoid. Not testing a bug in THIS fix — proving"
+echo "  the design rationale documented in this function's header."
+: > "$CALLLOG"
+cat > "$WORK/wrongorder.sh" <<EOF
+export PATH="$SHIMBIN:\$PATH"
+$LOG_FN
+$LE_FN
+$PRE
+$CAP
+$TVP
+$FC_FN
+$RTV_FN
+SELF_BEAD_ID=''
+printf '%s' '$IN1' | _filter_candidates | _reconcile_text_veto_labels /fake/db
+EOF
+bash "$WORK/wrongorder.sh" >/dev/null 2>&1
+[ ! -s "$CALLLOG" ] \
+  && ok "AC10 negative control: confirms the OLD order (filter-then-reconcile) is unreachable — validates why ga-fgdmol reorders to reconcile-then-filter" \
+  || bad "AC10 negative control: expected zero calls when wired filter-then-reconcile, got: $(cat "$CALLLOG")"
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "Scenario 11: AC11 — structural check: the LIVE file has ZERO call sites left in the old,"
+echo "  unreachable order, and exactly 19 in the fixed order. This is what actually proves the"
+echo "  shipped script was edited (Scenario 9/10 alone would pass regardless of live wiring, since"
+echo "  the functions always compose correctly in isolation). Comment lines are excluded — this"
+echo "  counts real code, not prose that happens to mention the pipe shape (this file's own header"
+echo "  comment above _reconcile_text_veto_labels quotes the fixed order as an example)."
+CODE_ONLY="$(grep -v '^[[:space:]]*#' "$DISPATCHER")"
+OLD_ORDER_SITES="$(grep -c '_filter_candidates | _reconcile_text_veto_labels' <<<"$CODE_ONLY")"
+NEW_ORDER_SITES="$(grep -c '_reconcile_text_veto_labels "[^"]*" | _filter_candidates' <<<"$CODE_ONLY")"
+[ "$OLD_ORDER_SITES" = "0" ] \
+  && ok "AC11: zero call sites remain wired in the old, unreachable order" \
+  || bad "AC11: found $OLD_ORDER_SITES call site(s) still wired _filter_candidates | _reconcile_text_veto_labels — the bug ga-fgdmol addresses"
+[ "$NEW_ORDER_SITES" = "19" ] \
+  && ok "AC11: exactly 19 call sites confirmed wired in the fixed order (none lost, none duplicated)" \
+  || bad "AC11: expected exactly 19 call sites in the fixed order, found $NEW_ORDER_SITES"
 
 # ════════════════════════════════════════════════════════════════════════════
 echo ""

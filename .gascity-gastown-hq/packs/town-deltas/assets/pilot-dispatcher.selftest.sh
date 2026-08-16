@@ -4881,8 +4881,8 @@ has "$DISPATCHER" '_filter_dispatch_gates | _filter_built' "_filter_built applie
 # story:approved) and exec:manual bugs (ga-v3o6i) leak in, get picked first by priority, are
 # REFUSED by the ownership guard, and head-of-line-block the lane so lower-priority rig work
 # (ps-mrfb/ps-joc0) starves. Contiguous (escaped) match so it can't pass on a partial chain.
-has "$DISPATCHER" '_filter_exec_manual \| _filter_candidates \| _reconcile_text_veto_labels "\$rig_path" \| _filter_dispatch_gates \| _filter_built \| _filter_unblocked "\$rig_path"' \
-  "HQ-empty rig FALLBACK applies the full filter chain (exec_manual+dispatch_gates+built) — HOL-block + exec:manual leak fix (ga-qt0mj: chain now also reconciles pilot:text-veto:* between candidates and dispatch-gates)"
+has "$DISPATCHER" '_filter_exec_manual \| _reconcile_empty_description_signal "\$rig_path" \| _reconcile_text_veto_labels "\$rig_path" \| _filter_candidates \| _filter_dispatch_gates \| _filter_built \| _filter_unblocked "\$rig_path"' \
+  "HQ-empty rig FALLBACK applies the full filter chain (exec_manual+dispatch_gates+built) — HOL-block + exec:manual leak fix (ga-qt0mj: chain now also reconciles pilot:text-veto:* between candidates and dispatch-gates; ga-fgdmol: reconcile now sits before candidates, not after)"
 # NEVERSTARTED release MUST clear the dead worker's assignee — _filter_candidates requires an
 # empty assignee, so a bead released back to story:approved while still carrying its drained
 # builder's assignee is INVISIBLE to every candidate query forever (ps-mrfb/ps-joc0 stuck behind
@@ -5551,8 +5551,8 @@ fi
 
 # ── Scenario 24d: structural — full filter chain wired in the override seam ──
 echo "Scenario 24d: structural — _filter_exec_manual + _filter_dispatch_gates wired in WA rig tier-2"
-if grep -qF '_filter_exec_manual | _filter_candidates | _reconcile_text_veto_labels "${GC_CITY}" | _filter_dispatch_gates | _filter_built' "$DISPATCHER"; then
-  ok "_filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built found in dispatcher (full chain; ga-qt0mj: now also reconciles pilot:text-veto:* in between)"
+if grep -qF '_filter_exec_manual | _reconcile_empty_description_signal "${GC_CITY}" | _reconcile_text_veto_labels "${GC_CITY}" | _filter_candidates | _filter_dispatch_gates | _filter_built' "$DISPATCHER"; then
+  ok "_filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built found in dispatcher (full chain; ga-qt0mj: now also reconciles pilot:text-veto:* in between; ga-fgdmol: reconcile now sits before candidates, not after)"
 else
   bad "Full filter chain NOT found in dispatcher — WA rig tier-2 gap fix may be incomplete"
 fi
@@ -5633,8 +5633,8 @@ fi
 
 # ── Scenario 25d: structural — TIER2 now applies the full gate chain ──────────
 echo "Scenario 25d: structural — HQ TIER2 filter chain now includes _filter_exec_manual + _filter_dispatch_gates + _filter_built"
-if grep -qF 'TIER2_JSON=$(echo "$TIER2_JSON" | _filter_exec_manual | _filter_candidates | _reconcile_text_veto_labels "$GC_CITY" | _filter_dispatch_gates | _filter_built)' "$DISPATCHER"; then
-  ok "HQ TIER2 filter chain includes full gate set (_filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built; ga-qt0mj: now also reconciles pilot:text-veto:* in between)"
+if grep -qF 'TIER2_JSON=$(echo "$TIER2_JSON" | _filter_exec_manual | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_dispatch_gates | _filter_built)' "$DISPATCHER"; then
+  ok "HQ TIER2 filter chain includes full gate set (_filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built; ga-qt0mj: now also reconciles pilot:text-veto:* in between; ga-fgdmol: reconcile now sits before candidates, not after)"
 else
   bad "HQ TIER2 filter chain does NOT include full gate set — gate (b) regression on HQ TIER2"
 fi

@@ -1978,11 +1978,25 @@ _TEXT_VETO_PATTERNS=$(jq -n --arg engine_re "$_PILOT_ENGINE_REBUILD_RE" '[
 # a permanent audit trail like pilot:refused-reason above it in that table.
 #
 # Transparent pass-through: echoes its stdin back to stdout completely
-# unchanged before doing anything else, so it is safe to insert anywhere in an
-# existing filter pipe — it can never alter what actually dispatches (verified
-# by this bead's selftest's AC3-style differential). All diagnostics/errors go
-# to fd 2 explicitly (`log ... >&2`) — this function's fd 1 is someone else's
-# pipe, exactly like _log_exclusions already has to be careful about.
+# unchanged before doing anything else, so it can never alter what actually
+# dispatches regardless of where it sits in a filter pipe (verified by this
+# bead's selftest's AC3-style differential). All diagnostics/errors go to fd 2
+# explicitly (`log ... >&2`) — this function's fd 1 is someone else's pipe,
+# exactly like _log_exclusions already has to be careful about.
+#
+# ⚠️ MUST be called BEFORE _filter_candidates, NOT chained after it (ga-fgdmol,
+# fixed 2026-08-16 — mirrors the identical fix already applied to
+# _reconcile_empty_description_signal directly below for ga-iu3xc5). At all 19
+# real call sites this was originally wired `_filter_candidates |
+# _reconcile_text_veto_labels "<db>"` — _filter_candidates' own select already
+# drops a text-veto-matching bead from its stdout before this function ever
+# saw it as stdin, making the "add" branch below structurally unreachable in
+# production even though every isolated-invocation selftest scenario (this
+# function fed raw, unfiltered fixtures directly) passed green throughout.
+# Reordered to `_reconcile_text_veto_labels "<db>" | _filter_candidates` at
+# all 19 sites; see pilot-dispatcher.text-veto-label.selftest.sh Scenario
+# 9-11 for the chained-reachability proof (positive, negative control, and a
+# structural check against the live call sites themselves).
 _reconcile_text_veto_labels() {
   local _rtv_db="$1"
   local _rtv_in; _rtv_in=$(cat)
@@ -2039,11 +2053,12 @@ _reconcile_text_veto_labels() {
 # produces ZERO bd calls. _filter_candidates' own select already drops the
 # matching bead from its stdout, so nothing chained downstream of it ever
 # sees the bead to label.
-# That is a pre-existing, separate latent defect in _reconcile_text_veto_labels'
-# OWN wiring for its 4 patterns (filed separately — ga-fgdmol — not fixed here:
-# different function, different risk profile, out of scope for this bug). This
-# function avoids repeating that mistake by sitting upstream of the select
-# instead, where it always sees the full pre-filter candidate set.
+# That was a pre-existing, separate latent defect in _reconcile_text_veto_labels'
+# OWN wiring for its 4 patterns (filed separately as ga-fgdmol, out of scope
+# for this bug at the time — different function, different risk profile; since
+# fixed 2026-08-16 with the identical reorder applied here). This function
+# avoids repeating that mistake by sitting upstream of the select instead,
+# where it always sees the full pre-filter candidate set.
 #
 # blocked:sem-descricao (not a pilot:text-veto:* label) deliberately reuses
 # the painel's ALREADY-existing generic `blocked:` prefix handling
@@ -3256,7 +3271,7 @@ _emit_query_one() {
   # leaking exec:manual + status=blocked/deferred + blocked-on:* + design-first into
   # "dispatchable" — so blocked/manual work showed as READY in Aprovadas. Now matches the
   # real chain: + _filter_exec_manual + _filter_dispatch_gates + _filter_built.)
-  _merged=$(echo "$_merged" | _filter_exec_manual | _reconcile_empty_description_signal "$_db" | _filter_candidates | _reconcile_text_veto_labels "$_db" | _filter_dispatch_gates | _filter_built | _filter_unblocked "$_db" | _filter_explicit_deps "$_db")
+  _merged=$(echo "$_merged" | _filter_exec_manual | _reconcile_empty_description_signal "$_db" | _reconcile_text_veto_labels "$_db" | _filter_candidates | _filter_dispatch_gates | _filter_built | _filter_unblocked "$_db" | _filter_explicit_deps "$_db")
   # Stamp the originating store on every item (so the painel knows where it lives).
   echo "$_merged" | jq --arg store "$_store" '[ .[] | . + {"_emit_store": $store} ]' 2>/dev/null || echo "[]"
 }
@@ -5607,7 +5622,7 @@ BUGS_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-type epic \
   -n 0 \
   2>/dev/null || echo "[]")
-BUGS_JSON=$(echo "$BUGS_JSON" | _reconcile_empty_description_signal "$GC_CITY" | _filter_candidates | _reconcile_text_veto_labels "$GC_CITY")
+BUGS_JSON=$(echo "$BUGS_JSON" | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates)
 
 DEBT_JSON=$(bd -C "$GC_CITY" list --json \
   -l "tech-debt" \
@@ -5621,7 +5636,7 @@ DEBT_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-type epic \
   -n 0 \
   2>/dev/null || echo "[]")
-DEBT_JSON=$(echo "$DEBT_JSON" | _reconcile_empty_description_signal "$GC_CITY" | _filter_candidates | _reconcile_text_veto_labels "$GC_CITY")
+DEBT_JSON=$(echo "$DEBT_JSON" | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates)
 
 # ga-ciyypt: chore/task never got the unconditional Tier-1 treatment BUGS_JSON/
 # DEBT_JSON give bug/tech-debt above — they ONLY flowed through CTXREADY_JSON
@@ -5655,7 +5670,7 @@ CHORE_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-type epic \
   -n 0 \
   2>/dev/null || echo "[]")
-CHORE_JSON=$(echo "$CHORE_JSON" | _reconcile_empty_description_signal "$GC_CITY" | _filter_candidates | _reconcile_text_veto_labels "$GC_CITY")
+CHORE_JSON=$(echo "$CHORE_JSON" | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates)
 
 TASK_JSON=$(bd -C "$GC_CITY" list --json \
   -t task \
@@ -5673,7 +5688,7 @@ TASK_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-type epic \
   -n 0 \
   2>/dev/null || echo "[]")
-TASK_JSON=$(echo "$TASK_JSON" | _reconcile_empty_description_signal "$GC_CITY" | _filter_candidates | _reconcile_text_veto_labels "$GC_CITY")
+TASK_JSON=$(echo "$TASK_JSON" | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates)
 
 # Merge bugs + debt + chore + task, deduplicate by id
 TIER1_JSON=$(echo "$BUGS_JSON $DEBT_JSON $CHORE_JSON $TASK_JSON" \
@@ -5717,7 +5732,7 @@ TIER2_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-type epic \
   -n 0 \
   2>/dev/null || echo "[]")
-TIER2_JSON=$(echo "$TIER2_JSON" | _filter_exec_manual | _reconcile_empty_description_signal "$GC_CITY" | _filter_candidates | _reconcile_text_veto_labels "$GC_CITY" | _filter_dispatch_gates | _filter_built)
+TIER2_JSON=$(echo "$TIER2_JSON" | _filter_exec_manual | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_dispatch_gates | _filter_built)
 # Drop features blocked by unresolved deps (ga-5ew) or an open explicit dep (ga-do8jj).
 TIER2_JSON=$(echo "$TIER2_JSON" | _filter_unblocked "$GC_CITY")
 TIER2_JSON=$(echo "$TIER2_JSON" | _filter_explicit_deps "$GC_CITY")
@@ -5790,7 +5805,7 @@ if [ "$PILOT_CTX_READY_QUERIES" = "1" ]; then
   # SAME filter chain as Tier-1/Tier-2 (empty-veto, lifecycle blocklist, epic guard,
   # self-exclusion, unresolved deps, explicit deps). exec:manual safety belt applied
   # even though the query already excludes that label (defense-in-depth, fail-open).
-  CTXREADY_JSON=$(echo "$CTXREADY_JSON" | _filter_exec_manual | _reconcile_empty_description_signal "$GC_CITY" | _filter_candidates | _reconcile_text_veto_labels "$GC_CITY" | _filter_dispatch_gates | _filter_built)
+  CTXREADY_JSON=$(echo "$CTXREADY_JSON" | _filter_exec_manual | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_dispatch_gates | _filter_built)
   CTXREADY_JSON=$(echo "$CTXREADY_JSON" | _filter_unblocked "$GC_CITY")
   CTXREADY_JSON=$(echo "$CTXREADY_JSON" | _filter_explicit_deps "$GC_CITY")
   CTXREADY_COUNT=$(echo "$CTXREADY_JSON" | jq 'length' 2>/dev/null || echo "0")
@@ -5871,7 +5886,7 @@ if [ "$PILOT_CTX_READY_RIG_QUERIES" = "1" ]; then
               or (((.labels // []) | index("tech-debt")) != null)
           ) ]' 2>/dev/null || echo "[]")
     # Same filter chain + exec:manual safety belt + ga-mfeip dispatch quality gates.
-    _rig_ctx_typed=$(echo "$_rig_ctx_typed" | _filter_exec_manual | _reconcile_empty_description_signal "$_rig_ctx_path" | _filter_candidates | _reconcile_text_veto_labels "$_rig_ctx_path" | _filter_dispatch_gates | _filter_built)
+    _rig_ctx_typed=$(echo "$_rig_ctx_typed" | _filter_exec_manual | _reconcile_empty_description_signal "$_rig_ctx_path" | _reconcile_text_veto_labels "$_rig_ctx_path" | _filter_candidates | _filter_dispatch_gates | _filter_built)
     _rig_ctx_typed=$(echo "$_rig_ctx_typed" | _filter_unblocked "$_rig_ctx_path")
     _rig_ctx_typed=$(echo "$_rig_ctx_typed" | _filter_explicit_deps "$_rig_ctx_path")
     _rig_ctx_n=$(echo "$_rig_ctx_typed" | jq 'length' 2>/dev/null || echo "0")
@@ -5910,7 +5925,7 @@ if [ "$PILOT_WA_RIG_APPROVED_QUERIES" = "1" ]; then
     # Hermetic test seam: use the override JSON directly (skips gc/bd, no rig loop).
     # Apply the FULL filter chain — same as the real loop — so tests exercise the gates.
     WA_RIG_TIER2_JSON=$(echo "$PILOT_WA_RIG_TIER2_OVERRIDE" \
-      | _filter_exec_manual | _reconcile_empty_description_signal "${GC_CITY}" | _filter_candidates | _reconcile_text_veto_labels "${GC_CITY}" | _filter_dispatch_gates | _filter_built \
+      | _filter_exec_manual | _reconcile_empty_description_signal "${GC_CITY}" | _reconcile_text_veto_labels "${GC_CITY}" | _filter_candidates | _filter_dispatch_gates | _filter_built \
       | _filter_unblocked "${GC_CITY}" | _filter_explicit_deps "${GC_CITY}")
   else
     # ga-07rb3: same "gates which rigs get scanned" shape as PILOT_CTX_READY_RIG_QUERIES
@@ -5947,7 +5962,7 @@ if [ "$PILOT_WA_RIG_APPROVED_QUERIES" = "1" ]; then
       # human-dependent approved features (e.g. wa-i02u Fala.BR CPF, wa-0z8e R&D device)
       # dispatch autonomously instead of deferring (gap reported mila mail ga-wisp-a1radr).
       _wa_rig2_filtered=$(echo "$_wa_rig2_raw" \
-        | _filter_exec_manual | _reconcile_empty_description_signal "$_wa_rig2_path" | _filter_candidates | _reconcile_text_veto_labels "$_wa_rig2_path" | _filter_dispatch_gates | _filter_built \
+        | _filter_exec_manual | _reconcile_empty_description_signal "$_wa_rig2_path" | _reconcile_text_veto_labels "$_wa_rig2_path" | _filter_candidates | _filter_dispatch_gates | _filter_built \
         | _filter_unblocked "$_wa_rig2_path" | _filter_explicit_deps "$_wa_rig2_path")
       _wa_rig2_n=$(echo "$_wa_rig2_filtered" | jq 'length' 2>/dev/null || echo "0")
       if [ "${_wa_rig2_n:-0}" -gt 0 ] 2>/dev/null; then
@@ -6000,7 +6015,7 @@ PILOT_RIG_TIER1_QUERIES="${PILOT_RIG_TIER1_QUERIES:-1}"
 if [ "$PILOT_RIG_TIER1_QUERIES" = "1" ]; then
   if [ -n "${PILOT_RIG_TIER1_OVERRIDE+x}" ]; then
     RIG_TIER1_JSON=$(echo "$PILOT_RIG_TIER1_OVERRIDE" \
-      | _filter_exec_manual | _reconcile_empty_description_signal "${GC_CITY}" | _filter_candidates | _reconcile_text_veto_labels "${GC_CITY}" | _filter_dispatch_gates | _filter_built \
+      | _filter_exec_manual | _reconcile_empty_description_signal "${GC_CITY}" | _reconcile_text_veto_labels "${GC_CITY}" | _filter_candidates | _filter_dispatch_gates | _filter_built \
       | _filter_unblocked "${GC_CITY}" | _filter_explicit_deps "${GC_CITY}")
   else
     _rt1_json=""
@@ -6030,7 +6045,7 @@ if [ "$PILOT_RIG_TIER1_QUERIES" = "1" ]; then
         --exclude-label "pilot:dispatched" \
         --exclude-type epic \
         -n 0 2>/dev/null || echo "[]")
-      _rt1_bugs=$(echo "$_rt1_bugs" | _filter_exec_manual | _reconcile_empty_description_signal "$_rt1_path" | _filter_candidates | _reconcile_text_veto_labels "$_rt1_path" | _filter_dispatch_gates | _filter_built | _filter_unblocked "$_rt1_path" | _filter_explicit_deps "$_rt1_path")
+      _rt1_bugs=$(echo "$_rt1_bugs" | _filter_exec_manual | _reconcile_empty_description_signal "$_rt1_path" | _reconcile_text_veto_labels "$_rt1_path" | _filter_candidates | _filter_dispatch_gates | _filter_built | _filter_unblocked "$_rt1_path" | _filter_explicit_deps "$_rt1_path")
       _rt1_debt=$(bd -C "$_rt1_path" list --json -l "tech-debt" \
         --exclude-label "story:in-flight" \
         --exclude-label "story:done" \
@@ -6041,7 +6056,7 @@ if [ "$PILOT_RIG_TIER1_QUERIES" = "1" ]; then
         --exclude-label "pilot:dispatched" \
         --exclude-type epic \
         -n 0 2>/dev/null || echo "[]")
-      _rt1_debt=$(echo "$_rt1_debt" | _filter_exec_manual | _reconcile_empty_description_signal "$_rt1_path" | _filter_candidates | _reconcile_text_veto_labels "$_rt1_path" | _filter_dispatch_gates | _filter_built | _filter_unblocked "$_rt1_path" | _filter_explicit_deps "$_rt1_path")
+      _rt1_debt=$(echo "$_rt1_debt" | _filter_exec_manual | _reconcile_empty_description_signal "$_rt1_path" | _reconcile_text_veto_labels "$_rt1_path" | _filter_candidates | _filter_dispatch_gates | _filter_built | _filter_unblocked "$_rt1_path" | _filter_explicit_deps "$_rt1_path")
       # ga-ciyypt: same unconditional treatment for rig-native chore/task —
       # CTXREADY_RIG_JSON below still hard-requires ctx:ready for these types,
       # the same doctrine gap _rt1_bugs/_rt1_debt already closed for bug/debt
@@ -6061,7 +6076,7 @@ if [ "$PILOT_RIG_TIER1_QUERIES" = "1" ]; then
         --exclude-label "pilot:dispatched" \
         --exclude-type epic \
         -n 0 2>/dev/null || echo "[]")
-      _rt1_chore=$(echo "$_rt1_chore" | _filter_exec_manual | _reconcile_empty_description_signal "$_rt1_path" | _filter_candidates | _reconcile_text_veto_labels "$_rt1_path" | _filter_dispatch_gates | _filter_built | _filter_unblocked "$_rt1_path" | _filter_explicit_deps "$_rt1_path")
+      _rt1_chore=$(echo "$_rt1_chore" | _filter_exec_manual | _reconcile_empty_description_signal "$_rt1_path" | _reconcile_text_veto_labels "$_rt1_path" | _filter_candidates | _filter_dispatch_gates | _filter_built | _filter_unblocked "$_rt1_path" | _filter_explicit_deps "$_rt1_path")
       _rt1_task=$(bd -C "$_rt1_path" list --json -t task \
         --exclude-label "ctx:thin" \
         --exclude-label "type:quality-gate-marker" \
@@ -6076,7 +6091,7 @@ if [ "$PILOT_RIG_TIER1_QUERIES" = "1" ]; then
         --exclude-label "pilot:dispatched" \
         --exclude-type epic \
         -n 0 2>/dev/null || echo "[]")
-      _rt1_task=$(echo "$_rt1_task" | _filter_exec_manual | _reconcile_empty_description_signal "$_rt1_path" | _filter_candidates | _reconcile_text_veto_labels "$_rt1_path" | _filter_dispatch_gates | _filter_built | _filter_unblocked "$_rt1_path" | _filter_explicit_deps "$_rt1_path")
+      _rt1_task=$(echo "$_rt1_task" | _filter_exec_manual | _reconcile_empty_description_signal "$_rt1_path" | _reconcile_text_veto_labels "$_rt1_path" | _filter_candidates | _filter_dispatch_gates | _filter_built | _filter_unblocked "$_rt1_path" | _filter_explicit_deps "$_rt1_path")
       _rt1_n=$(echo "$_rt1_bugs $_rt1_debt $_rt1_chore $_rt1_task" | jq -s 'add // [] | unique_by(.id) | length' 2>/dev/null || echo "0")
       if [ "${_rt1_n:-0}" -gt 0 ] 2>/dev/null; then
         log "Tier-1 (bug/tech-debt/chore/task) rig DB $_rt1_path: $_rt1_n candidate(s) (ga-3oxo5 + ga-ciyypt, unconditional)."
@@ -6147,7 +6162,7 @@ _scan_rig_fallback_pool() {
   if [ -n "${PILOT_RIG_FALLBACK_OVERRIDE+x}" ]; then
     local _rfp_filtered
     _rfp_filtered=$(echo "$PILOT_RIG_FALLBACK_OVERRIDE" \
-      | _filter_exec_manual | _reconcile_empty_description_signal "${GC_CITY}" | _filter_candidates | _reconcile_text_veto_labels "${GC_CITY}" | _filter_dispatch_gates | _filter_built \
+      | _filter_exec_manual | _reconcile_empty_description_signal "${GC_CITY}" | _reconcile_text_veto_labels "${GC_CITY}" | _filter_candidates | _filter_dispatch_gates | _filter_built \
       | _filter_unblocked "${GC_CITY}" | _filter_explicit_deps "${GC_CITY}")
     RIG_TIER1_COUNT=$(echo "$_rfp_filtered" | jq '[ .[] | select(
         (((.issue_type // .type // "") | ascii_downcase) == "bug")
@@ -6185,7 +6200,7 @@ _scan_rig_fallback_pool() {
       --exclude-label "pilot:dispatched" \
       --exclude-type epic \
       -n 0 2>/dev/null || echo "[]")
-    RIG_BUGS=$(echo "$RIG_BUGS" | _filter_exec_manual | _reconcile_empty_description_signal "$rig_path" | _filter_candidates | _reconcile_text_veto_labels "$rig_path" | _filter_dispatch_gates | _filter_built | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
+    RIG_BUGS=$(echo "$RIG_BUGS" | _filter_exec_manual | _reconcile_empty_description_signal "$rig_path" | _reconcile_text_veto_labels "$rig_path" | _filter_candidates | _filter_dispatch_gates | _filter_built | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
     ALL_RIG_TIER1=$(echo "$ALL_RIG_TIER1 $RIG_BUGS" | jq -s 'add // []' 2>/dev/null || echo "[]")
 
     # Tier 1: tech-debt from rig DB
@@ -6199,7 +6214,7 @@ _scan_rig_fallback_pool() {
       --exclude-label "pilot:dispatched" \
       --exclude-type epic \
       -n 0 2>/dev/null || echo "[]")
-    RIG_DEBT=$(echo "$RIG_DEBT" | _filter_exec_manual | _reconcile_empty_description_signal "$rig_path" | _filter_candidates | _reconcile_text_veto_labels "$rig_path" | _filter_dispatch_gates | _filter_built | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
+    RIG_DEBT=$(echo "$RIG_DEBT" | _filter_exec_manual | _reconcile_empty_description_signal "$rig_path" | _reconcile_text_veto_labels "$rig_path" | _filter_candidates | _filter_dispatch_gates | _filter_built | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
     ALL_RIG_TIER1=$(echo "$ALL_RIG_TIER1 $RIG_DEBT" | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
 
     # Tier 2: story:approved features from rig DB
@@ -6213,7 +6228,7 @@ _scan_rig_fallback_pool() {
       --exclude-label "pilot:dispatched" \
       --exclude-type epic \
       -n 0 2>/dev/null || echo "[]")
-    RIG_FEATURES=$(echo "$RIG_FEATURES" | _filter_exec_manual | _reconcile_empty_description_signal "$rig_path" | _filter_candidates | _reconcile_text_veto_labels "$rig_path" | _filter_dispatch_gates | _filter_built | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
+    RIG_FEATURES=$(echo "$RIG_FEATURES" | _filter_exec_manual | _reconcile_empty_description_signal "$rig_path" | _reconcile_text_veto_labels "$rig_path" | _filter_candidates | _filter_dispatch_gates | _filter_built | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
     ALL_RIG_TIER2=$(echo "$ALL_RIG_TIER2 $RIG_FEATURES" | jq -s 'add // []' 2>/dev/null || echo "[]")
   done <<< "$RIG_PATHS"
 
