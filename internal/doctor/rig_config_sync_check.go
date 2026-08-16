@@ -88,6 +88,23 @@ func (c *RigConfigSyncCheck) Run(ctx *CheckContext) *CheckResult {
 	c.dbCheckErrors = nil
 	var details []string
 
+	// dc-62si: a rig whose dolt_database equals the TOWN's own database (e.g.
+	// "hq") is a legitimate, deliberate configuration, not drift — it already
+	// satisfies the broader town-beads-consistency invariant. Resolved once,
+	// outside the per-rig loop below, since it's the same value for every rig
+	// in a single Run(). Read failures leave it "" (never matches), so a town
+	// without this file behaves exactly as before.
+	townDBName := ""
+	townMetadataPath := filepath.Join(ctx.TownRoot, ".beads", "metadata.json")
+	if townMetadataBytes, err := os.ReadFile(townMetadataPath); err == nil {
+		var townMetadata struct {
+			DoltDatabase string `json:"dolt_database"`
+		}
+		if err := json.Unmarshal(townMetadataBytes, &townMetadata); err == nil {
+			townDBName = townMetadata.DoltDatabase
+		}
+	}
+
 	for rigName, entry := range rigsConfig.Rigs {
 		rigPath := filepath.Join(ctx.TownRoot, rigName)
 		configPath := filepath.Join(rigPath, "config.json")
@@ -196,8 +213,11 @@ func (c *RigConfigSyncCheck) Run(ctx *CheckContext) *CheckResult {
 			expectedDBName := rigName
 
 			if expectedDBName != "" {
-				// Check if database name matches the rig directory name
-				if metadata.DoltDatabase != expectedDBName {
+				// Check if database name matches the rig directory name, OR the
+				// town-wide database (dc-62si: also a valid, deliberate config —
+				// see townDBName resolution above).
+				pointsAtTownDB := townDBName != "" && metadata.DoltDatabase == townDBName
+				if metadata.DoltDatabase != expectedDBName && !pointsAtTownDB {
 					c.dbNameMismatches = append(c.dbNameMismatches, dbMismatch{
 						rigName:    rigName,
 						prefix:     configPrefix,

@@ -519,6 +519,184 @@ exit 0
 	}
 }
 
+// writeFakeBdShowingBead installs a fake `bd` on PATH that answers `bd show
+// <id> --json` with a payload containing that id, so rigBeadExists() finds
+// the rig's identity bead and the test's only signal is dbNameMismatches.
+func writeFakeBdShowingBead(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake bd stub is shell-specific")
+	}
+	binDir := t.TempDir()
+	script := "#!/usr/bin/env bash\nif [ \"$1\" = show ]; then echo \"[{\\\"id\\\":\\\"$2\\\"}]\"; fi\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// writeLocalDoltDatabase creates a minimal-but-valid local Dolt database
+// directory under <townRoot>/.dolt-data/<name> so doltDatabaseExists (local,
+// non-remote mode — no GT_DOLT_HOST set) reports it present.
+func writeLocalDoltDatabase(t *testing.T, townRoot, name string) {
+	t.Helper()
+	manifestDir := filepath.Join(townRoot, ".dolt-data", name, ".dolt", "noms")
+	if err := os.MkdirAll(manifestDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(manifestDir, "manifest"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// dc-62si: after the deacon->hq town-wide beads migration, a rig whose
+// metadata.json dolt_database equals the TOWN's own database (e.g. "hq") is
+// a legitimate, deliberate configuration — not drift — even though it
+// doesn't equal the rig's own directory name. Verifies rig-config-sync no
+// longer flags it as a mismatch (and, since Fix() only ever acts on entries
+// in dbNameMismatches, no longer risks renaming the shared town database out
+// from under the rest of the city).
+func TestRigConfigSyncCheck_RigPointingAtTownDatabaseIsNotAMismatch(t *testing.T) {
+	writeFakeBdShowingBead(t)
+
+	tmpDir := t.TempDir()
+	mayorDir := filepath.Join(tmpDir, "mayor")
+	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	rigsJSON := `{
+		"version": 1,
+		"rigs": {
+			"deacon": {
+				"git_url": "https://github.com/test/test.git",
+				"beads": {"prefix": "dc"}
+			}
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Town-level beads point at "hq", same as production after the
+	// deacon->hq migration.
+	townBeadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(townBeadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	townMetadata := `{"backend":"dolt","dolt_mode":"server","dolt_database":"hq"}`
+	if err := os.WriteFile(filepath.Join(townBeadsDir, "metadata.json"), []byte(townMetadata), 0644); err != nil {
+		t.Fatal(err)
+	}
+	writeLocalDoltDatabase(t, tmpDir, "hq")
+
+	rigDir := filepath.Join(tmpDir, "deacon")
+	beadsDir := filepath.Join(rigDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	configJSON := `{
+		"type": "rig",
+		"version": 1,
+		"name": "deacon",
+		"git_url": "https://github.com/test/test.git",
+		"beads": {"prefix": "dc"}
+	}`
+	if err := os.WriteFile(filepath.Join(rigDir, "config.json"), []byte(configJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("prefix: dc\nissue-prefix: \"dc\"\nexport.auto: \"false\"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// deacon's own database is "hq" — the town-wide database, not "deacon".
+	rigMetadata := `{"backend":"dolt","dolt_mode":"server","dolt_database":"hq"}`
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(rigMetadata), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := &CheckContext{TownRoot: tmpDir}
+	check := NewRigConfigSyncCheck()
+	result := check.Run(ctx)
+
+	if len(check.dbNameMismatches) != 0 {
+		t.Fatalf("dbNameMismatches = %#v, want none (rig db == town db is legitimate)", check.dbNameMismatches)
+	}
+	if result.Status != StatusOK {
+		t.Fatalf("Status = %v, want %v: %s (details: %v)", result.Status, StatusOK, result.Message, result.Details)
+	}
+}
+
+// Companion to the test above: a rig pointing at a database that is neither
+// its own name NOR the town database is still a genuine mismatch and must
+// still be flagged (the town-db exception must not swallow real drift).
+func TestRigConfigSyncCheck_RigPointingAtUnrelatedDatabaseIsStillAMismatch(t *testing.T) {
+	writeFakeBdShowingBead(t)
+
+	tmpDir := t.TempDir()
+	mayorDir := filepath.Join(tmpDir, "mayor")
+	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	rigsJSON := `{
+		"version": 1,
+		"rigs": {
+			"deacon": {
+				"git_url": "https://github.com/test/test.git",
+				"beads": {"prefix": "dc"}
+			}
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	townBeadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(townBeadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	townMetadata := `{"backend":"dolt","dolt_mode":"server","dolt_database":"hq"}`
+	if err := os.WriteFile(filepath.Join(townBeadsDir, "metadata.json"), []byte(townMetadata), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	rigDir := filepath.Join(tmpDir, "deacon")
+	beadsDir := filepath.Join(rigDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	configJSON := `{
+		"type": "rig",
+		"version": 1,
+		"name": "deacon",
+		"git_url": "https://github.com/test/test.git",
+		"beads": {"prefix": "dc"}
+	}`
+	if err := os.WriteFile(filepath.Join(rigDir, "config.json"), []byte(configJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("prefix: dc\nissue-prefix: \"dc\"\nexport.auto: \"false\"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Neither "deacon" (rig name) nor "hq" (town db) — genuine drift.
+	rigMetadata := `{"backend":"dolt","dolt_mode":"server","dolt_database":"wrongdb"}`
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(rigMetadata), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := &CheckContext{TownRoot: tmpDir}
+	check := NewRigConfigSyncCheck()
+	result := check.Run(ctx)
+
+	if len(check.dbNameMismatches) != 1 {
+		t.Fatalf("dbNameMismatches = %#v, want exactly 1 (genuine drift must still be flagged)", check.dbNameMismatches)
+	}
+	if got := check.dbNameMismatches[0]; got.rigName != "deacon" || got.currentDB != "wrongdb" || got.expectedDB != "deacon" {
+		t.Fatalf("dbNameMismatches[0] = %#v, want {rigName:deacon currentDB:wrongdb expectedDB:deacon}", got)
+	}
+	if result.Status != StatusWarning {
+		t.Fatalf("Status = %v, want %v: %s", result.Status, StatusWarning, result.Message)
+	}
+}
+
 func TestStaleRuntimeFilesCheck_StalePIDFiles(t *testing.T) {
 	// Create temp town root
 	tmpDir := t.TempDir()
