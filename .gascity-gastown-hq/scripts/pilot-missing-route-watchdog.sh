@@ -150,11 +150,36 @@
 #   unreliable bonus probe must not undermine the primary fix's
 #   reliability).
 #
+# THIRTEENTH exclusion (ga-8bcc5m): a non-empty .assignee → excluded. Root
+# cause: this is THIS watchdog's own instance of the crew+pool double-dispatch
+# bug ga-8bcc5m reports (wa-snzzo: dispatched to crew oracle-wa AND slung to
+# wa-worker via gc.routed_to at the same time — ~2h of duplicated work, only
+# caught at git push). pilot-dispatcher.sh's own ownership guard
+# (_ownership_guard_should_refuse) already refuses to dispatch onto a bead with
+# a live assignee — but this watchdog's repair path is a SEPARATE writer of
+# gc.routed_to that never consulted it (by design, per this file's own header:
+# it deliberately does not source pilot-dispatcher.sh's 7000+ line filter
+# chain). Before this fix, none of the twelve exclusions above looked at
+# .assignee at all: a bead the Mayor/a crew had already claimed (assignee set,
+# e.g. mid hand-off before the crew flips status to in_progress) but that
+# still read open+armed+unrouted got gc.routed_to auto-repaired anyway —
+# handing a SECOND builder (the pool) a bead a crew already owned. Zero extra
+# cost: .assignee is already present on every candidate row this sweep already
+# read, no new query. Deliberately no exception for pool-worker-shaped
+# assignees (gastown.dog-*/wa-worker-*/ps-worker-*, the way
+# _ownership_guard_should_refuse's signal (c) exempts them) — a genuinely
+# in-flight pool claim already flips status to in_progress at claim time
+# (this watchdog's own first filter, status=open, already excludes it on that
+# basis alone), so the ONLY way an assignee survives here with status still
+# open is a hand-off/hand-assignment gap, which is exactly the "already
+# owned, don't also route to the pool" state this exclusion exists to catch.
+# See pilot-missing-route-watchdog.selftest scenario 46.
+#
 # What's left: status=open, NOT epic, ctx:ready AND exec:auto BOTH present
 # (the "looks ready in the panel" signal ga-f54ui's own text uses),
-# gc.routed_to empty/absent, no story:* label, aged past grace, none of the
-# twelve holds/wrappers/graph-steps/parks/active-gates/recent-dispatches
-# above applying.
+# gc.routed_to empty/absent, no story:* label, unassigned, aged past grace,
+# none of the thirteen holds/wrappers/graph-steps/parks/active-gates/
+# recent-dispatches/ownership above applying.
 #
 # GRACE PERIOD (PMRW_GRACE_MINUTES, default 10): unlike GMMSW's gate-status
 # loss (happens once, atomically, at marker creation — 5min grace), an armed
@@ -669,6 +694,7 @@ run_sweep() {
               | select(((.labels // []) | (index("needs:engine-window") or index("framework:engine"))) | not)
               | select(((.labels // []) | (index("no-auto-dispatch") or index("pilot:no-auto-dispatch"))) | not)
               | select(((.labels // []) | any(startswith("blocked-on:") or startswith("blocked-by:") or startswith("blocked:"))) | not)
+              | select(((.assignee // "") | test("\\S")) | not)
               | select( ((( .updated_at // .created_at // "") | fromdateiso8601?) // 9999999999) < $cut )
         ]
       ' 2>/dev/null)
@@ -1892,6 +1918,32 @@ CRASHPY
   else
     echo "  skip scenario 45: python3 unavailable — same precondition scenario 44 itself skips on"
   fi
+
+  # ── Scenario 46 (ga-8bcc5m): armed + unrouted + aged but ASSIGNED (a crew
+  # owns it) → excluded, gc.routed_to never written. This is the watchdog's
+  # own instance of the crew+pool double-dispatch bug ga-8bcc5m reports: the
+  # twelve exclusions before this fix never checked .assignee, so a bead the
+  # Mayor/a crew had already claimed (assignee set, e.g. mid hand-off before
+  # the crew flips status to in_progress) but that still read
+  # open+armed+unrouted got its gc.routed_to silently auto-repaired anyway —
+  # handing a SECOND builder (the pool) a bead a crew already owned. Mirrors
+  # scenario 2's "already has an owning signal → never flags" shape, one
+  # level earlier — .assignee is free (already on every candidate row, no
+  # extra query), unlike gc.routed_to which IS the thing being repaired.
+  # Asserts on PMRW_TEST_UPDATE_CALLS_LOG (not just rc/comment) so a future
+  # refactor can't silently reintroduce a write-then-suppress-the-alert
+  # variant of the same bug — the repair WRITE itself must never fire.
+  echo "Scenario 46 (ga-8bcc5m): armed+unrouted+aged but ASSIGNED (crew owner) → excluded, no repair write, no flag"
+  reset_stores
+  printf '[%s]' "$(mk ga-46 open 'ctx:ready,exec:auto' "$OLD_TS" | jq -c '. + {assignee:"oracle-wa-awisp9x"}')" > "$TMP/fixtures/store-a.json"
+  N46="$TMP/notif46"; M46="$TMP/mail46"; C46="$TMP/comm46"; U46="$TMP/upd46"
+  : > "$N46"; : > "$M46"; : > "$C46"; : > "$U46"
+  PMRW_TEST_NOTIFIED="$N46" PMRW_TEST_MAILED="$M46" PMRW_TEST_COMMENTS_LOG="$C46" PMRW_TEST_UPDATE_CALLS_LOG="$U46" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 46: assigned bead excluded (return 0)" || bad "scenario 46: assigned (crew-owned) bead must be excluded, got $rc"
+  [ ! -s "$U46" ] && ok "scenario 46: NO gc.routed_to write attempted (would double-dispatch onto a crew's bead)" || bad "scenario 46 (REGRESSION ga-8bcc5m): watchdog wrote gc.routed_to on an ASSIGNED bead — this IS the double-dispatch bug"
+  [ ! -s "$C46" ] && ok "scenario 46: no comment posted" || bad "scenario 46: comment posted on an assigned bead"
+  [ ! -s "$N46" ] && ok "scenario 46: no notify fired" || bad "scenario 46: notify fired on an assigned bead"
 
   echo ""
   echo "pilot-missing-route-watchdog selftest: PASS=$PASS FAIL=$FAIL"
