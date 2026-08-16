@@ -667,6 +667,59 @@ def _starved_lanes(slots, candidates):
                     if candidates[lane] > 0 and slots[lane] <= 0) or "?"
 
 
+def _lane_gap(slots, candidates):
+    """PURE (no I/O — unit-testable). Per-lane demand-vs-capacity breakdown for
+    THIS sweep, using ONLY the live (slots, candidates) pair _pool_saturated()
+    already consults — never a["stuck"]'s per-bead lane labels (same staleness
+    concern _starved_lanes' docstring documents: pilot-dispatchable.json can be
+    up to snapshot-ttl stale and disagree with what THIS sweep just measured).
+
+    ga-g9o5zm: _pool_saturated() is already lane-aware (ga-zkxdw DEFEITO 1) but
+    is a single sweep-wide boolean — it goes False as soon as ANY lane could
+    dispatch, even when that lane carries a tiny sliver of demand and another
+    lane is carrying the overwhelming majority, fully starved (measured live:
+    slots small=0/big=2, candidates small=44/big=1 — small is 44/45 ≈ 98% of
+    demand and cannot move, but _pool_saturated()==False because big's 1
+    candidate technically could). Treating that as an ordinary, fully-open
+    stall overstates the alarm across the WHOLE stuck queue. This function
+    exposes the per-lane split so the caller can tell 'open' (room AND
+    demand — a real question mark if 0 dispatched) apart from 'starved'
+    (demand, no room — healthy backpressure) instead of collapsing both into
+    one sweep-wide flag.
+
+    Returns None if slots or candidates is None/falsy (unknown — caller must
+    not act on unknown, same fail-open convention as _pool_saturated).
+    Otherwise {'open': [...], 'starved': [...], 'idle': [...]} partitioning
+    ('small', 'big') by:
+      open    — candidates[lane] > 0 and slots[lane] > 0.
+      starved — candidates[lane] > 0 and slots[lane] <= 0.
+      idle    — candidates[lane] <= 0 (nothing waiting in this lane)."""
+    if not slots or not candidates:
+        return None
+    gap = {"open": [], "starved": [], "idle": []}
+    for lane in ("small", "big"):
+        if candidates[lane] <= 0:
+            gap["idle"].append(lane)
+        elif slots[lane] > 0:
+            gap["open"].append(lane)
+        else:
+            gap["starved"].append(lane)
+    return gap
+
+
+def _mixed_lane_demand(slots, candidates):
+    """PURE (no I/O — unit-testable). True when _pool_saturated(slots,
+    candidates) is False (some lane COULD dispatch) but the demand is
+    genuinely MIXED: at least one lane is 'open' (room+demand) AND at least
+    one OTHER lane is 'starved' (demand, no room). This is the gap
+    _pool_saturated()'s single sweep-wide boolean cannot express — see
+    _lane_gap()'s docstring for the measured ga-g9o5zm incident this covers.
+    False (not True) when _lane_gap() returns None (unknown slots/candidates)
+    — fail-open, never downgrade on an unreadable signal."""
+    gap = _lane_gap(slots, candidates)
+    return bool(gap and gap["open"] and gap["starved"])
+
+
 def _saturation_note(reason, slots, candidates, stuck):
     """Builds the pool_saturated ℹ️ note text for the given reason (see
     _saturation_reason) — shared by the inline note and the ✅ summary recap
@@ -714,6 +767,27 @@ def _saturation_summary(reason, slots, candidates):
                 " small=%d big=%d)"
                 % (slots["small"], slots["big"], candidates["small"], candidates["big"]))
     return "Pool cheio (slots small=%d big=%d)" % (slots["small"], slots["big"])
+
+
+def _mixed_lane_note(slots, candidates):
+    """Builds the ⚠️ warn text for a _mixed_lane_demand()==True sweep (ga-g9o5zm).
+    Names ONLY the lane-level facts from (slots, candidates) — the same live,
+    same-sweep pair _pool_saturated()/_lane_gap() already consult — never
+    a["stuck"]'s per-bead lane labels (staleness risk, see _starved_lanes).
+    Caller must only pass a (slots, candidates) pair for which
+    _mixed_lane_demand() is True — i.e. _lane_gap() returned at least one
+    'open' AND at least one 'starved' lane."""
+    gap = _lane_gap(slots, candidates)
+    open_desc = ", ".join("%s (slots=%d livre, %d candidato(s))" % (l, slots[l], candidates[l])
+                          for l in gap["open"])
+    starved_desc = ", ".join("%s (0 vaga, %d candidato(s))" % (l, candidates[l])
+                             for l in gap["starved"])
+    return ("demanda MISTURADA entre lanes neste sweep: %s tem vaga livre E candidato(s) —"
+            " 0 despachado(s) aí é o que fica sem explicação (pode ser falha real, mas"
+            " ISOLADA a essa lane); %s está saturada (candidatos sem vaga) — isso é"
+            " backpressure saudável, não falha. Não dá pra afirmar ✅ com honestidade, mas"
+            " também não é 'toda a fila travada'."
+            % (open_desc, starved_desc))
 
 
 def _last_sweep_boundary(lines):
@@ -839,6 +913,44 @@ def main():
     sweep_in_flight = _sweep_in_flight(pilot_log_lines)
     sweep_elapsed_min = _sweep_in_flight_elapsed_min(pilot_log_lines)
 
+    # REAL building count across ALL stores (HQ+rigs). The dispatchable flowing_count is
+    # ~0 by construction (dispatchable = not-yet-dispatched); rig-native builds (ps-/wa-)
+    # carry story:in-flight in their OWN store, invisible to an HQ-only view (the same
+    # cross-store class that bit the daemons). This is the honest "is the machine
+    # producing RIGHT NOW?" signal — without it the check under-reports active builds.
+    #
+    # ga-26us5: a story:in-flight label alone is NOT proof of progress — a worker can
+    # reach a terminal state (device flaky, crashed, abandoned) and leave the label
+    # stale. Cross-check each bead's updated_at against the delivery-stall threshold
+    # (DELIVERY_STALL_HOURS, imported above) and exclude anything past it from
+    # "building now"; name it explicitly instead so it reads as awaiting-human, not
+    # phantom progress. Query intentionally unchanged from before (no --status flag
+    # at all, so it is NOT subject to _bd_json's status="open" default, which would
+    # silently drop the in_progress beads a fresh dispatch normally sits in).
+    #
+    # ga-g9o5zm DEFEITO 1: computed HERE (before the buildable-queue verdict below)
+    # so that verdict can cite the REAL count instead of a hardcoded "0 em build" —
+    # moved earlier specifically so building_now exists before it's needed; nothing
+    # below depends on fails/warns/notes/a/g/p/d, only on RIGS.
+    stall_min = DELIVERY_STALL_HOURS * 60
+    building_ids, stalled_ids = [], []
+    for _bn_name, _bn_root in RIGS:
+        try:
+            _bn_out = subprocess.run([BD, "-C", _bn_root, "list", "-l", "story:in-flight", "--json"],
+                                     capture_output=True, text=True, timeout=15)
+            for _bn_b in json.loads(_bn_out.stdout or "[]"):
+                _bn_id = _bn_b.get("id", "")
+                if not _bn_id or "wisp" in _bn_id:
+                    continue
+                _bn_age = _age_min(_bn_b.get("updated_at"))
+                if classify_in_flight(_bn_age, stall_min) == "building":
+                    building_ids.append("%s/%s" % (_bn_name, _bn_id))
+                else:
+                    stalled_ids.append("%s/%s" % (_bn_name, _bn_id))
+        except Exception:
+            pass
+    building_now = len(building_ids)
+
     fails, warns, notes = [], [], []
 
     if _TSW_LOAD_WARN:
@@ -864,6 +976,14 @@ def main():
     # own verdict or than each other.
     saturation_reason = _saturation_reason(slots, candidates)
 
+    # ga-g9o5zm DEFEITO 2: _pool_saturated() above is a single sweep-wide
+    # boolean — it goes False as soon as ANY lane could dispatch, even when
+    # that lane is a tiny sliver of demand and another lane (fully starved)
+    # is carrying nearly all of it. mixed_lane_demand catches that gap: at
+    # least one lane genuinely open (room+demand) AND at least one OTHER lane
+    # genuinely starved (demand, no room) at the same time — see _lane_gap().
+    mixed_lane_demand = _mixed_lane_demand(slots, candidates)
+
     # ga-zkxdw attempt 4 GATE-FEEDBACK: a positively in-flight sweep may only
     # justify downgrading FAIL->WARN for as long as ITS OWN elapsed time stays
     # within budget — otherwise a hung sweep (deadlock, stuck subprocess) reads
@@ -887,6 +1007,13 @@ def main():
                 " antes de julgar stall: %s"
                 % (len(a["stuck"]), sweep_elapsed_min, SWEEP_IN_FLIGHT_BUDGET_MIN,
                    ", ".join("%s/%s" % (s["rig"], s["id"]) for s in a["stuck"][:6])))
+        elif mixed_lane_demand:
+            # ga-g9o5zm DEFEITO 2: neither fully saturated (some lane could
+            # dispatch) nor fully open (another lane genuinely can't) — name
+            # both facts instead of blaming the WHOLE stuck count as if none
+            # of it were explained. WARN not FAIL: honest that ✅ can't be
+            # claimed, without the false "aja AGORA" imperative fails carries.
+            warns.append(_mixed_lane_note(slots, candidates))
         else:
             reason = ""
             if sweep_wait_expired:
@@ -897,9 +1024,14 @@ def main():
                          (" [sweep em voo, mas timestamp do 'sweep start' ilegível —"
                           " não medido; tratando como stall em vez de esperar sem teto]"))
             if a.get("from_dispatchable"):
+                # ga-g9o5zm DEFEITO 1: building_now (computed above, before this
+                # verdict) is the SAME number the body's "🔨 EM BUILD AGORA" line
+                # prints — cite it here instead of a hardcoded "0 em build" that
+                # used to contradict the body whenever building_now > 0 (AC4).
+                build_now_clause = ("%d em build agora" % building_now) if building_now else "0 em build"
                 fails.append(
-                    "%d bead(s) CONSTRUÍVEIS na fila do Pilot, 0 em build (pilot vivo)%s: %s"
-                    % (len(a["stuck"]), reason,
+                    "%d bead(s) CONSTRUÍVEIS na fila do Pilot, %s (pilot vivo)%s: %s"
+                    % (len(a["stuck"]), build_now_clause, reason,
                        ", ".join("%s/%s" % (s["rig"], s["id"]) for s in a["stuck"][:6])))
             else:
                 # fallback path
@@ -919,39 +1051,6 @@ def main():
         fails.append("PILOT (dispatcher) MORTO: último sweep há %s min" % p.get("last_sweep_min"))
     if not d.get("responsive"):
         fails.append("DOLT não responde (bd query falhou) — coletar diagnóstico antes de reiniciar")
-
-    # REAL building count across ALL stores (HQ+rigs). The dispatchable flowing_count is
-    # ~0 by construction (dispatchable = not-yet-dispatched); rig-native builds (ps-/wa-)
-    # carry story:in-flight in their OWN store, invisible to an HQ-only view (the same
-    # cross-store class that bit the daemons). This is the honest "is the machine
-    # producing RIGHT NOW?" signal — without it the check under-reports active builds.
-    #
-    # ga-26us5: a story:in-flight label alone is NOT proof of progress — a worker can
-    # reach a terminal state (device flaky, crashed, abandoned) and leave the label
-    # stale. Cross-check each bead's updated_at against the delivery-stall threshold
-    # (DELIVERY_STALL_HOURS, imported above) and exclude anything past it from
-    # "building now"; name it explicitly instead so it reads as awaiting-human, not
-    # phantom progress. Query intentionally unchanged from before (no --status flag
-    # at all, so it is NOT subject to _bd_json's status="open" default, which would
-    # silently drop the in_progress beads a fresh dispatch normally sits in).
-    stall_min = DELIVERY_STALL_HOURS * 60
-    building_ids, stalled_ids = [], []
-    for _bn_name, _bn_root in RIGS:
-        try:
-            _bn_out = subprocess.run([BD, "-C", _bn_root, "list", "-l", "story:in-flight", "--json"],
-                                     capture_output=True, text=True, timeout=15)
-            for _bn_b in json.loads(_bn_out.stdout or "[]"):
-                _bn_id = _bn_b.get("id", "")
-                if not _bn_id or "wisp" in _bn_id:
-                    continue
-                _bn_age = _age_min(_bn_b.get("updated_at"))
-                if classify_in_flight(_bn_age, stall_min) == "building":
-                    building_ids.append("%s/%s" % (_bn_name, _bn_id))
-                else:
-                    stalled_ids.append("%s/%s" % (_bn_name, _bn_id))
-        except Exception:
-            pass
-    building_now = len(building_ids)
 
     # --- Report ---
     print("═══ CHECK IMPARÁVEL — %s ═══" % time.strftime("%Y-%m-%d %H:%M %Z"))

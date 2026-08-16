@@ -1021,6 +1021,173 @@ m.subprocess.run = _if_orig_run
 m.check_approved, m.check_gate, m.check_pilot, m.check_dolt, m.RIGS = _i_ca, _i_cg, _i_cp, _i_cd, _i_rigs
 m._pilot_slots, m._pilot_candidates, m._sweep_in_flight = _i_orig_slots, _i_orig_cand, _i_orig_swf
 
+print("── ga-g9o5zm DEFEITO 2: _lane_gap()/_mixed_lane_demand() — mixed lane demand pure "
+      "functions (unit) ──")
+eq("live incident shape (small=0/big=2 slots, candidatos small=44/big=1): big open, small starved",
+   m._lane_gap({"small": 0, "big": 2}, {"small": 44, "big": 1}),
+   {"open": ["big"], "starved": ["small"], "idle": []})
+eq("live incident shape: _mixed_lane_demand True",
+   m._mixed_lane_demand({"small": 0, "big": 2}, {"small": 44, "big": 1}), True)
+eq("Cenário A shape (small=0/big=2, candidatos ALL small 9/0): small starved, big idle (not "
+   "open) -> gap has no open lane",
+   m._lane_gap({"small": 0, "big": 2}, {"small": 9, "big": 0}),
+   {"open": [], "starved": ["small"], "idle": ["big"]})
+eq("Cenário A: _mixed_lane_demand False (no open lane at all — _pool_saturated already "
+   "handles this shape correctly)",
+   m._mixed_lane_demand({"small": 0, "big": 2}, {"small": 9, "big": 0}), False)
+eq("Cenário C shape (small=1/big=0 slots, candidatos small=1/big=0): small open, big idle",
+   m._lane_gap({"small": 1, "big": 0}, {"small": 1, "big": 0}),
+   {"open": ["small"], "starved": [], "idle": ["big"]})
+eq("Cenário C: _mixed_lane_demand False (no starved lane — a real stall, must not be "
+   "downgraded)", m._mixed_lane_demand({"small": 1, "big": 0}, {"small": 1, "big": 0}), False)
+eq("Cenário E shape (both lanes 0 slots, candidatos small=5/big=3): both starved, no open",
+   m._lane_gap({"small": 0, "big": 0}, {"small": 5, "big": 3}),
+   {"open": [], "starved": ["small", "big"], "idle": []})
+eq("Cenário E: _mixed_lane_demand False (no open lane — _pool_saturated already handles "
+   "both-empty)", m._mixed_lane_demand({"small": 0, "big": 0}, {"small": 5, "big": 3}), False)
+eq("unknown slots -> _lane_gap None (fail-open, same convention as _pool_saturated)",
+   m._lane_gap(None, {"small": 1, "big": 1}), None)
+eq("unknown candidates -> _lane_gap None", m._lane_gap({"small": 1, "big": 1}, None), None)
+eq("unknown slots -> _mixed_lane_demand False (never act on an unreadable signal)",
+   m._mixed_lane_demand(None, {"small": 1, "big": 1}), False)
+
+_note_g9 = m._mixed_lane_note({"small": 0, "big": 2}, {"small": 44, "big": 1})
+eq("_mixed_lane_note names the open lane (big) with its own numbers",
+   "big (slots=2 livre, 1 candidato" in _note_g9, True)
+eq("_mixed_lane_note names the starved lane (small) with its own numbers",
+   "small (0 vaga, 44 candidato" in _note_g9, True)
+eq("_mixed_lane_note frames the starved lane as healthy backpressure, not failure",
+   "backpressure saudável" in _note_g9, True)
+
+print("── main() end-to-end: ga-g9o5zm — the EXACT live-measured false negative (slots "
+      "small=0/big=2, candidatos small=44/big=1, sweep complete) must not read as ❌ NÃO "
+      "IMPARÁVEL, and must not carry the false 'act now' imperative ──")
+_g9_ca, _g9_cg, _g9_cp, _g9_cd, _g9_rigs = m.check_approved, m.check_gate, m.check_pilot, m.check_dolt, m.RIGS
+_g9_slots, _g9_cand, _g9_swf = m._pilot_slots, m._pilot_candidates, m._sweep_in_flight
+_g9_read_tail = m._read_pilot_log_tail
+_g9_run = m.subprocess.run
+
+m.check_approved = lambda: {
+    "total": 23, "parked_count": 0, "in_gate_count": 0, "buildable_count": 23,
+    "flowing_count": 0, "held_count": 0,
+    "stuck": [{"id": "wa-S%d" % i, "rig": "WA", "title": "small candidate", "lane": "small"}
+              for i in range(22)] + [{"id": "wa-BIG1", "rig": "WA", "title": "big candidate", "lane": "big"}],
+    "read_err": [], "warns": [], "from_dispatchable": True, "snap_age_min": 1.0,
+}
+m.check_gate = lambda: {"active": [], "parked": [], "last_pass_min": 5.0,
+                         "reviewer_alive": True, "oldest_active_min": None,
+                         "stalled": False, "stall_reason": ""}
+m.check_pilot = lambda: {"alive": True, "last_sweep_min": 0.5}
+m.check_dolt = lambda: {"responsive": True, "latency_ms": 10}
+m.RIGS = [("HQ", "/fake/hq/root")]
+m._pilot_slots = lambda lines: {"small": 0, "big": 2}
+m._pilot_candidates = lambda lines: {"small": 44, "big": 1}
+m._sweep_in_flight = lambda lines: False
+m._read_pilot_log_tail = lambda: None
+
+def _g9_fake_run(args, **kwargs):
+    return types.SimpleNamespace(returncode=0, stdout=json.dumps(
+        [{"id": "ga-building%d" % i,
+          "updated_at": _time4.strftime("%Y-%m-%dT%H:%M:%SZ", _time4.gmtime(m.NOW - 1 * 60))}
+         for i in range(7)]))
+m.subprocess.run = _g9_fake_run
+
+_bufG9 = io.StringIO()
+_exitG9 = None
+try:
+    with contextlib.redirect_stdout(_bufG9):
+        m.main()
+except SystemExit as e:
+    _exitG9 = e.code
+_outG9 = _bufG9.getvalue()
+
+eq("ga-g9o5zm repro: exit 2 (⚠️ INCERTO), never ❌ — the reported false negative", _exitG9, 2)
+eq("ga-g9o5zm repro: report does NOT say NÃO IMPARÁVEL", "NÃO IMPARÁVEL" in _outG9, False)
+eq("ga-g9o5zm repro: report does NOT carry the false 'act now' imperative",
+   "deve agir AGORA" in _outG9, False)
+eq("ga-g9o5zm repro: mixed-lane note explains it (MISTURADA)", "MISTURADA" in _outG9, True)
+eq("ga-g9o5zm repro: body still shows the real building-now count (7), unaffected",
+   "🔨 EM BUILD AGORA (real, todos os stores): 7" in _outG9, True)
+eq("ga-g9o5zm repro: the literal '0 em build' phrase never appears (nothing computes it here "
+   "any more; superseded by the mixed-lane note)", "0 em build" in _outG9, False)
+
+m.check_approved, m.check_gate, m.check_pilot, m.check_dolt, m.RIGS = _g9_ca, _g9_cg, _g9_cp, _g9_cd, _g9_rigs
+m._pilot_slots, m._pilot_candidates, m._sweep_in_flight = _g9_slots, _g9_cand, _g9_swf
+m._read_pilot_log_tail = _g9_read_tail
+m.subprocess.run = _g9_run
+
+print("── main() end-to-end: ga-g9o5zm DEFEITO 1 (AC4) — a genuine, non-mixed real stall "
+      "must still say NÃO IMPARÁVEL, and must cite the REAL building-now count instead of a "
+      "hardcoded '0 em build' whenever something else IS building ──")
+_g1_ca, _g1_cg, _g1_cp, _g1_cd, _g1_rigs = m.check_approved, m.check_gate, m.check_pilot, m.check_dolt, m.RIGS
+_g1_slots, _g1_cand, _g1_swf = m._pilot_slots, m._pilot_candidates, m._sweep_in_flight
+_g1_read_tail = m._read_pilot_log_tail
+_g1_run = m.subprocess.run
+
+# Same shape as the existing Cenário C control (room+demand+sweep done+0 dispatch, a REAL
+# stall, no starved lane at all — see the _lane_gap unit test above) — but now with a fresh
+# in-flight bead building ELSEWHERE, so building_now=1>0 while this bead is still stuck.
+m.check_approved = lambda: {
+    "total": 1, "parked_count": 0, "in_gate_count": 0, "buildable_count": 1,
+    "flowing_count": 0, "held_count": 0,
+    "stuck": [{"id": "wa-REALSTALL2", "rig": "WA", "title": "room+demand+sweep done", "lane": "small"}],
+    "read_err": [], "warns": [], "from_dispatchable": True, "snap_age_min": 1.0,
+}
+m.check_gate = lambda: {"active": [], "parked": [], "last_pass_min": 1.0,
+                         "reviewer_alive": True, "oldest_active_min": None,
+                         "stalled": False, "stall_reason": ""}
+m.check_pilot = lambda: {"alive": True, "last_sweep_min": 0.5}
+m.check_dolt = lambda: {"responsive": True, "latency_ms": 10}
+m.RIGS = [("HQ", "/fake/hq/root")]
+m._pilot_slots = lambda lines: {"small": 1, "big": 0}
+m._pilot_candidates = lambda lines: {"small": 1, "big": 0}
+m._sweep_in_flight = lambda lines: False
+m._read_pilot_log_tail = lambda: None
+
+def _g1_fake_run(args, **kwargs):
+    return types.SimpleNamespace(returncode=0, stdout=json.dumps(
+        [{"id": "ga-elsewhere",
+          "updated_at": _time4.strftime("%Y-%m-%dT%H:%M:%SZ", _time4.gmtime(m.NOW - 1 * 60))}]))
+m.subprocess.run = _g1_fake_run
+
+_bufG1 = io.StringIO()
+_exitG1 = None
+try:
+    with contextlib.redirect_stdout(_bufG1):
+        m.main()
+except SystemExit as e:
+    _exitG1 = e.code
+_outG1 = _bufG1.getvalue()
+
+eq("AC4 real-stall control: exit 1 (❌ preserved — a genuine stall must still fail)", _exitG1, 1)
+eq("AC4 real-stall control: report DOES say NÃO IMPARÁVEL", "NÃO IMPARÁVEL" in _outG1, True)
+eq("AC4 real-stall control: body shows 1 building elsewhere",
+   "🔨 EM BUILD AGORA (real, todos os stores): 1" in _outG1, True)
+eq("AC4: veredicto does NOT say the contradictory '0 em build' while 1 IS building",
+   "0 em build" in _outG1, False)
+eq("AC4: veredicto cites the real count instead ('1 em build agora')",
+   "1 em build agora" in _outG1, True)
+
+# Control-of-the-control: identical fixture, but with NOTHING building anywhere (RIGS empty)
+# — proves the fix doesn't ALWAYS hide '0 em build', only when it would be dishonest to say it.
+m.RIGS = []
+_bufG1b = io.StringIO()
+_exitG1b = None
+try:
+    with contextlib.redirect_stdout(_bufG1b):
+        m.main()
+except SystemExit as e:
+    _exitG1b = e.code
+_outG1b = _bufG1b.getvalue()
+eq("control: with nothing building anywhere, '0 em build' legitimately still appears",
+   "0 em build" in _outG1b, True)
+eq("control: exit 1 unaffected", _exitG1b, 1)
+
+m.check_approved, m.check_gate, m.check_pilot, m.check_dolt, m.RIGS = _g1_ca, _g1_cg, _g1_cp, _g1_cd, _g1_rigs
+m._pilot_slots, m._pilot_candidates, m._sweep_in_flight = _g1_slots, _g1_cand, _g1_swf
+m._read_pilot_log_tail = _g1_read_tail
+m.subprocess.run = _g1_run
+
 print()
 print("RESULT: %d passed, %d failed" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
