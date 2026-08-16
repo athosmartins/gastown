@@ -68,10 +68,24 @@ CAP="$(grep '^_FILTER_RECLAIM_CAP=' "$DISPATCHER")"
 # script-level global (single source of truth, ga-ffop9) — omitting it here
 # leaves the var unbound under set -u, aborting _filter_candidates entirely.
 TVP="$(grep '^_PILOT_ENGINE_REBUILD_RE=' "$DISPATCHER")"
+# ga-vmn7kv: same reason as PRE/CAP/TVP above — _filter_candidates' select now
+# also references $framework_markers (--argjson), so the source line plus the
+# derived JSON array both need extracting alongside it, or the whole jq call
+# errors out (empty --argjson is invalid JSON) and every scenario below
+# silently collapses to "[]" regardless of its own fixture. NOT a literal copy
+# of the dispatcher's own source line: that one resolves
+# $(dirname "${BASH_SOURCE[0]}") relative to itself, which is correct in the
+# real dispatcher but resolves to $WORK (the extracted script's temp-file
+# location) here instead of this directory — inject an absolute path using
+# this harness's own already-correct $SELF_DIR instead.
+FMS="source \"$SELF_DIR/framework-marker-labels.sh\""
+FML="$(grep '^_FILTER_FRAMEWORK_MARKER_LABELS=' "$DISPATCHER")"
 cat > "$WORK/s1.sh" <<EOF
 $LOG_FN
 $LE_FN
 $PRE
+$FMS
+$FML
 $CAP
 $TVP
 $FC_FN
@@ -352,6 +366,11 @@ echo "Scenario 7: full chain, healthy sweep — zero exclusion lines (AC2)"
 PRE="$(grep '^_FILTER_PREAPPROVAL_LABELS=' "$DISPATCHER")"
 CAP="$(grep '^_FILTER_RECLAIM_CAP=' "$DISPATCHER")"
 TVP="$(grep '^_PILOT_ENGINE_REBUILD_RE=' "$DISPATCHER")"
+# ga-vmn7kv: see the matching comment on Scenario 1's FMS/FML above — same
+# fix, same reason (absolute $SELF_DIR path, not a literal copy of the
+# dispatcher's own BASH_SOURCE-relative source line).
+FMS="source \"$SELF_DIR/framework-marker-labels.sh\""
+FML="$(grep '^_FILTER_FRAMEWORK_MARKER_LABELS=' "$DISPATCHER")"
 cat > "$SHIMBIN/bd" <<'SHIM'
 #!/usr/bin/env bash
 echo '[]'
@@ -362,6 +381,8 @@ export PATH="$SHIMBIN:\$PATH"
 $LOG_FN
 $LE_FN
 $PRE
+$FMS
+$FML
 $CAP
 $TVP
 $FC_FN

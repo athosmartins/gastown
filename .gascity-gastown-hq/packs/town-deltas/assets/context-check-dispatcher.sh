@@ -164,7 +164,12 @@ CONTEXT_CHECK_EXEC_CLASS="${CONTEXT_CHECK_EXEC_CLASS:-1}"
 # cycling"). Same shape as pinned above — dc-etn4/dc-3okx/dc-oq0g were
 # dispatched via the TIER2 fallback as ordinary feature stories with nothing
 # to build.
-CONTEXT_CHECK_EXCLUDE_LABELS="${CONTEXT_CHECK_EXCLUDE_LABELS:-gt:agent gt:rig gt:convoy gc:nudge digest pinned gt:message}"
+# ga-vmn7kv: default now comes from the shared source of truth
+# (framework-marker-labels.sh) instead of a literal copy here — see that
+# file's header for why. An explicit CONTEXT_CHECK_EXCLUDE_LABELS env var
+# (e.g. the plist pin) still overrides it, unchanged from before this fix.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/framework-marker-labels.sh"
+CONTEXT_CHECK_EXCLUDE_LABELS="${CONTEXT_CHECK_EXCLUDE_LABELS:-$GC_FRAMEWORK_MARKER_LABELS}"
 # Label PREFIXES that mark plumbing (matched as startswith). Covers the gate
 # marker/run/verdict family, gate-status:*, nudge:*, reviewer-index:*, source:*,
 # and the ctx:* family itself (idempotence).

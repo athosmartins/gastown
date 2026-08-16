@@ -85,6 +85,14 @@ RED_FN="$(sed -n '/^_reconcile_empty_description_signal() {/,/^}$/p' "$DISPATCHE
 FC_FN="$(sed -n '/^_filter_candidates() {/,/^}$/p' "$DISPATCHER")"
 PRE="$(grep '^_FILTER_PREAPPROVAL_LABELS=' "$DISPATCHER")"
 CAP="$(grep '^_FILTER_RECLAIM_CAP=' "$DISPATCHER")"
+# ga-vmn7kv: _filter_candidates' select now also references $framework_markers
+# (--argjson) — without this, the whole jq call errors (empty --argjson is
+# invalid JSON) and every scenario below silently collapses to "[]". Absolute
+# $SELF_DIR path, not a literal copy of the dispatcher's own BASH_SOURCE-
+# relative source line: that one resolves against $WORK (this extracted
+# script's temp-file location) here, not this directory.
+FMS="source \"$SELF_DIR/framework-marker-labels.sh\""
+FML="$(grep '^_FILTER_FRAMEWORK_MARKER_LABELS=' "$DISPATCHER")"
 
 if [ -z "$RED_FN" ]; then
   echo "FATAL: _reconcile_empty_description_signal() not found in $DISPATCHER — has ga-iu3xc5 landed?" >&2
@@ -252,6 +260,8 @@ export GC_CITY=/fake/db
 $LOG_FN
 $LE_FN
 $PRE
+$FMS
+$FML
 $CAP
 $TVP
 $FC_FN
@@ -284,6 +294,8 @@ export GC_CITY=/fake/db
 $LOG_FN
 $LE_FN
 $PRE
+$FMS
+$FML
 $CAP
 $TVP
 $FC_FN

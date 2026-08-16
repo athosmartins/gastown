@@ -1803,6 +1803,15 @@ _log_exclusions() {
 }
 
 _FILTER_PREAPPROVAL_LABELS='["story:unrefined","story:refinement-in-progress","story:triage","story:cancelled"]'
+# ga-vmn7kv: framework/identity marker labels (gt:rig, gt:agent, ...) — never
+# real dispatchable work. Single source of truth shared with
+# context-check-dispatcher.sh's CONTEXT_CHECK_EXCLUDE_LABELS, see
+# framework-marker-labels.sh's header. Before this fix, _filter_candidates
+# had NO gt:* exclusion at all except the hand-added gt:message case below —
+# context-check knew the full list, Pilot knew none of it. Add a new marker
+# to the shared file and both consumers exclude it, no second copy here.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/framework-marker-labels.sh"
+_FILTER_FRAMEWORK_MARKER_LABELS=$(printf '%s\n' $GC_FRAMEWORK_MARKER_LABELS | jq -R . | jq -s -c .)
 # ga-am6h: mirrors MAX_RECLAIMS in scripts/inflight-reclaim-guard.py (line ~101) —
 # keep the two in sync by hand; there is no shared bash/python helper (see that
 # script's own reclaim_decision(), which is Python-private and not import-safe
@@ -2194,6 +2203,7 @@ _filter_candidates() {
      --argjson now_ts "$_now_ts" --argjson reclaim_cap "$_FILTER_RECLAIM_CAP" \
      --arg engine_rebuild_re "$_cf_engine_rebuild_re" \
      --argjson roster_ok "$_cf_roster_ok" --argjson active_owner_ids "$_cf_active_owner_ids_json" \
+     --argjson framework_markers "$_FILTER_FRAMEWORK_MARKER_LABELS" \
     '[.[] | select(
         .id != $self
         # ga-46wq5: an assignee alone is no longer an unconditional veto. It
@@ -2266,6 +2276,24 @@ _filter_candidates() {
             else true end)
         )
         and (((.labels // []) - $preapproval) | length) == ((.labels // []) | length)
+        # ga-vmn7kv: framework/identity marker (gt:rig, gt:agent, ...) — a
+        # rig/agent registry record, not work. Same set-difference idiom as
+        # $preapproval above; list lives in framework-marker-labels.sh, shared
+        # with context-check-dispatcher.sh (see _FILTER_FRAMEWORK_MARKER_LABELS
+        # above). gt:message/pinned are ALSO covered individually further below
+        # (older, more narrowly-commented fixes, ga-4yii8z/ga-gzv7g) — kept as
+        # belt-and-suspenders rather than removed, so this clause is purely
+        # additive and cannot regress either of those.
+        # EXCEPT "digest": unlike the other 6 markers, a digest bead has real
+        # work to run (the formula steps mol-digest-generate stamps on it) —
+        # ga-mhbyc, framework-dog-exempt reason (e), further down the
+        # pipeline, routes it to the dog pool specifically. That routing can
+        # only fire if the bead survives as a candidate this far, so it must
+        # NOT be excluded here — the OWN, unrelated reason
+        # context-check-dispatcher.sh treats digest as nothing to build (no
+        # autonomous-agent code to write) stays correct and untouched; only
+        # this candidate gate carves digest out.
+        and (((.labels // []) - ($framework_markers - ["digest"])) | length) == ((.labels // []) | length)
         and ((.labels // []) | map(select(
           startswith("gate:needs-human")
           # ga-3lsy1: bugs/tech-debt (issue_type=bug, -l tech-debt) never carry the
@@ -2505,7 +2533,8 @@ _filter_candidates() {
   printf '%s' "$_cf_in" | jq -r --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
       --argjson now_ts "$_now_ts" --argjson reclaim_cap "$_FILTER_RECLAIM_CAP" --argjson kept "$_cf_kept" \
       --arg engine_rebuild_re "$_cf_engine_rebuild_re" \
-      --argjson roster_ok "$_cf_roster_ok" --argjson active_owner_ids "$_cf_active_owner_ids_json" '
+      --argjson roster_ok "$_cf_roster_ok" --argjson active_owner_ids "$_cf_active_owner_ids_json" \
+      --argjson framework_markers "$_FILTER_FRAMEWORK_MARKER_LABELS" '
       .[] | . as $b | ($b.id // "") as $id | ($b.labels // []) as $L
       | select($id != "" and (($kept | index($id)) | not))
       | [
@@ -2538,6 +2567,16 @@ _filter_candidates() {
            then "pilot:reclaim-count>=cap(\($reclaim_cap))" else empty end),
           ( ($L | map(select(. as $x | $preapproval | index($x)))) as $pa
             | if ($pa | length) > 0 then "preapproval-label:\($pa | join(","))" else empty end ),
+          # ga-vmn7kv: mirrors the framework-marker select-clause exclusion
+          # above (~L2180), digest carve-out included (ga-mhbyc) — keep these
+          # two in sync, same lesson ga-3lsy1/ga-nimyz already taught this
+          # function for pilot.sling_for. (The carve-out is a no-op here in
+          # practice — $kept already restricts this pass to ids the select
+          # actually dropped, and digest no longer is one — but matching the
+          # set exactly avoids a textual mismatch a future reader has to
+          # puzzle over.)
+          ( ($L | map(select(. as $x | ($framework_markers - ["digest"]) | index($x)))) as $fm
+            | if ($fm | length) > 0 then "framework-marker-label:\($fm | join(","))" else empty end ),
           ( ($L | map(select(
               startswith("gate:needs-human")
               or startswith("needs-human")

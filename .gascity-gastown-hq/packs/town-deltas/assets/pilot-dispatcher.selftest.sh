@@ -982,7 +982,7 @@ fi
 echo "Scenario 3e2: a pilot:held bead is excluded from the candidate pool (durable worker release)"
 _FC_FN="$(grep '^log()' "$DISPATCHER")
 $(sed -n '/^_log_exclusions() {/,/^}$/p' "$DISPATCHER")
-$(awk '/^_FILTER_PREAPPROVAL_LABELS=/{print} /^_FILTER_RECLAIM_CAP=/{print} /^_PILOT_ENGINE_REBUILD_RE=/{print} /^_filter_candidates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+$(awk '/^_FILTER_PREAPPROVAL_LABELS=/{print} /^source .*framework-marker-labels\.sh/{print} /^_FILTER_FRAMEWORK_MARKER_LABELS=/{print} /^_FILTER_RECLAIM_CAP=/{print} /^_PILOT_ENGINE_REBUILD_RE=/{print} /^_filter_candidates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
 _fc() { ( eval "$_FC_FN"; SELF_BEAD_ID=""; echo "$1" | _filter_candidates | jq -rc '[.[].id]' ); }
 HELD='[{"id":"bd-held","assignee":null,"labels":["story:approved","pilot:held"],"description":"x"},{"id":"bd-free","assignee":null,"labels":["story:approved"],"description":"x"}]'
 [ "$(_fc "$HELD")" = '["bd-free"]' ] && ok "pilot:held bead excluded; free story:approved kept (durable release holds)" || bad "pilot:held not excluded (got: $(_fc "$HELD"))"
@@ -6346,6 +6346,8 @@ echo "Scenario ga-uvfs6: _filter_candidates recognizes pilot:refused-reason:* sa
 # globals (_FILTER_PREAPPROVAL_LABELS, _FILTER_RECLAIM_CAP) extracted alongside it.
 _FC_UVFS6="$(grep '^log()' "$DISPATCHER")
 $(grep '^_FILTER_PREAPPROVAL_LABELS=' "$DISPATCHER")
+$(grep '^source .*framework-marker-labels\.sh' "$DISPATCHER")
+$(grep '^_FILTER_FRAMEWORK_MARKER_LABELS=' "$DISPATCHER")
 $(grep '^_FILTER_RECLAIM_CAP=' "$DISPATCHER")
 $(grep '^_PILOT_ENGINE_REBUILD_RE=' "$DISPATCHER")
 $(sed -n '/^_log_exclusions() {/,/^}$/p' "$DISPATCHER")

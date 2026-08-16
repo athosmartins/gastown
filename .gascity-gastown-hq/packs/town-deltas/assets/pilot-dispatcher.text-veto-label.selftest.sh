@@ -81,6 +81,14 @@ RTV_FN="$(sed -n '/^_reconcile_text_veto_labels() {/,/^}$/p' "$DISPATCHER")"
 FC_FN="$(sed -n '/^_filter_candidates() {/,/^}$/p' "$DISPATCHER")"
 PRE="$(grep '^_FILTER_PREAPPROVAL_LABELS=' "$DISPATCHER")"
 CAP="$(grep '^_FILTER_RECLAIM_CAP=' "$DISPATCHER")"
+# ga-vmn7kv: _filter_candidates' select now also references $framework_markers
+# (--argjson) — without this, the whole jq call errors (empty --argjson is
+# invalid JSON) and every scenario below silently collapses to "[]". Absolute
+# $SELF_DIR path, not a literal copy of the dispatcher's own BASH_SOURCE-
+# relative source line: BASH_SOURCE does not point at this directory inside
+# a `bash -c "..."` subprocess.
+FMS="source \"$SELF_DIR/framework-marker-labels.sh\""
+FML="$(grep '^_FILTER_FRAMEWORK_MARKER_LABELS=' "$DISPATCHER")"
 
 if [ -z "$TVP" ]; then
   echo "FATAL: _TEXT_VETO_PATTERNS not found in $DISPATCHER — has ga-qt0mj landed?" >&2
@@ -227,6 +235,8 @@ D_FIXTURES='[
 FC_TRACE="$(bash -c "$LOG_FN
 $LE_FN
 $PRE
+$FMS
+$FML
 $CAP
 $TVP
 $FC_FN
@@ -255,6 +265,8 @@ export PATH="$SHIMBIN:\$PATH"
 $LOG_FN
 $LE_FN
 $PRE
+$FMS
+$FML
 $CAP
 $TVP
 $FC_FN
@@ -282,6 +294,8 @@ export PATH="$SHIMBIN:\$PATH"
 $LOG_FN
 $LE_FN
 $PRE
+$FMS
+$FML
 $CAP
 $TVP
 $FC_FN
