@@ -4037,6 +4037,18 @@ def _selftest():
                 {"id": "vid-closed-1", "status": "closed", "assignee": "gate-reviewer-adhoc-bbb"},
                 {"status": "open"},  # malformed row, no id — must be skipped, never crash
             ]))
+        # ga-o2dlg8: close must carry --force or it's refused, mirroring the
+        # REAL ownership guard (this watchdog's actor resolves to
+        # "automation", never equal to a verdict bead's per-session
+        # assignee — verified live via `env -u BEADS_ACTOR BD_ACTOR=automation
+        # bd close <id>`). A fake that returns 0 unconditionally would let
+        # this whole scenario pass even if --force were silently dropped
+        # again — the exact regression ga-o2dlg8 filed (zero real production
+        # successes ever, only this test's own always-succeeds fake made it
+        # look covered).
+        if "close" in args and "--force" not in args:
+            return subprocess.CompletedProcess(args=args, returncode=1, stdout="",
+                stderr='cannot close: assignee is "gate-reviewer-adhoc-aaa", actor is "automation"; reclaim or use --force to override')
         return subprocess.CompletedProcess(args=args, returncode=0, stdout="")
     _real_sh_cpv = globals()["sh"]
     try:
@@ -4049,6 +4061,8 @@ def _selftest():
            "ga-9as9h: exactly one bd close call, targeting the open verdict bead (not the closed one)")
         ok(not any(len(c) > 4 and c[4] == "vid-closed-1" for c in _cpv_calls),
            "ga-9as9h: the already-closed verdict bead is never touched (idempotent — no double-close)")
+        ok(bool(close_calls) and "--force" in close_calls[0],
+           "ga-o2dlg8: the close call carries --force -- without it this fake refuses (mirrors the real actor!=assignee ownership guard), so 'closed' above would be [] instead of ['vid-open-1']")
     finally:
         globals()["sh"] = _real_sh_cpv
     # ga-9as9h: dry-run must never mutate — same convention as every other FIX.
