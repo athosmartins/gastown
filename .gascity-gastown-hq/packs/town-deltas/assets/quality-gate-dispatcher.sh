@@ -2593,27 +2593,101 @@ resolve_rebase_author() {
   printf ''
 }
 
-# gate_behind_envelope_action <behind_exceeded_0_1> <author_alive_0_1>
+# bead_field_grep <raw_json_text> <field_name>
+# Extracts a simple string field from potentially-malformed JSON output.
+# Uses grep/sed instead of jq because gc bd output may contain literal newlines
+# embedded in string values (invalid JSON per RFC7159) that cause jq 1.8.1+ to fail.
+# ga-ivzbuz: relocated here (was originally defined inline near its first use,
+# further down in the main AUTHOR-resolution flow) — deliberately defined
+# BEFORE the GATE_DISPATCHER_LIB_ONLY early-return below, same reasoning as
+# gate_branch_already_merged() above, so resolve_bead_owner() (next function)
+# can call it under lib-only sourcing; see
+# quality-gate-rebase-liveness.selftest.sh section 14b. Behavior is unchanged
+# for a real (non-lib-only) run — bash registers every function name during
+# the initial top-to-bottom source, so a definition's line position relative
+# to its own call sites never mattered there, only relative to the lib-only
+# early-return.
+bead_field_grep() {
+  local raw="$1" field="$2"
+  # The || true prevents pipefail from aborting when grep finds no match (exits 1).
+  echo "$raw" | grep -o "\"${field}\": *\"[^\"]*\"" \
+    | sed "s/\"${field}\": *\"\(.*\)\"/\1/" \
+    | head -1 || true
+}
+
+# resolve_bead_owner <bead_id> — ga-ivzbuz. Best-effort fetch of a bead's
+# "owner" field (bd's OWNER column, e.g. "Owner: oracle-wa" in `bd show`'s
+# human-readable header) via the SAME cross-rig-then-HQ-fallback bd lookup
+# AUTHOR's own bead-derivation fallback uses above (ga-tkvsa), reusing
+# gc_json_or_unknown + bead_field_grep rather than inventing a new lookup
+# strategy. Deliberately independent of $AUTHOR/$BEAD_RAW: those are only
+# populated when gate.submitted_by was empty (ga-tkvsa's TOCTOU-avoidance
+# skip) — by the time an ad-hoc pool worker's marker reaches the behind_dead
+# check below, gate.submitted_by is essentially always present (the guard
+# stamps it at claim time), so $BEAD_RAW is very often never fetched at all
+# in that run. This function does its own independent lookup rather than
+# depend on that side effect. Echoes "" when unresolvable (bead not found in
+# either lookup, or no owner field set) — callers must treat that as "no
+# owner to fall back to", the same fail-safe direction resolve_rebase_author()
+# uses for its own empty-string contract.
+resolve_bead_owner() {
+  local bead_id="${1:-}" raw=""
+  [ -z "$bead_id" ] && { printf ''; return 0; }
+  raw=$(gc_json_or_unknown gc --city "$GC_CITY" bd show "$bead_id" --json) || raw=""
+  if [ -z "$raw" ]; then
+    raw=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" show "$bead_id" --json 2>/dev/null || echo "")
+  fi
+  bead_field_grep "$raw" "owner"
+}
+
+# gate_behind_envelope_action <behind_exceeded_0_1> <author_alive_0_1> <owner_alive_0_1>
 # ga-6dp9 (bug 2 of 3): decide what to do when main has moved further ahead of
 # the branch's base than GATE_REBASE_BEHIND_MAX allows. This is ALWAYS a
 # permanent condition — main only ever moves forward, it never self-heals by
-# waiting — so the only two valid outcomes are "circuit_break" (no live
-# author to fix it) or "bounce" (live author can manually rebase). NEVER
-# "retry": the old behavior funneled this into the generic transient-retry
-# bucket, re-queueing a permanent condition as if it might clear on its own —
-# an infinite "attempt 1/3" loop in production (the delta only ever grows,
-# never shrinks on its own). Echoes "not_applicable" when behind_exceeded=0
-# (this check does not apply; fall through to the existing generic dispatch
-# unchanged).
+# waiting — so "retry" is NEVER a valid outcome: the old behavior funneled
+# this into the generic transient-retry bucket, re-queueing a permanent
+# condition as if it might clear on its own — an infinite "attempt 1/3" loop
+# in production (the delta only ever grows, never shrinks on its own).
+# Echoes "not_applicable" when behind_exceeded=0 (this check does not apply;
+# fall through to the existing generic dispatch unchanged).
+#
+# ga-ivzbuz (bug 3, extends bug 2): added <owner_alive_0_1>. REBASE_AUTHOR is
+# the branch's actual committer — for an ad-hoc pool worker
+# (wa-worker-adhoc-<hash>, ps-worker-adhoc-<hash>) that session is ALWAYS gone
+# by the time this sweep runs, by design (build, commit, submit /gate-done,
+# exit — the same auto-termination doctrine dogs themselves follow, see
+# rebase_author_is_pool()'s header above). That population can never satisfy
+# author_alive, so behind_dead was circuit-breaking on completely normal
+# ad-hoc submissions at a rig running >90 commits/day on main (50 commits =
+# well under half a day, inside one gate review round-trip). Real cases:
+# wa-nxwqw (84 behind), wa-983jj (61 behind), wa-zg6xf (89 behind), all
+# 2026-08-16, all circuit-broke with a live, capable bead OWNER (oracle-wa,
+# thies-wa) who fixed both reachable cases by hand within minutes once
+# nudged directly — proving a live owner is a valid rescue path the
+# dispatcher was not using. owner_alive is consulted ONLY as a fallback when
+# author_alive=0 (never races or overrides the author check — REBASE_AUTHOR
+# stays the first-choice signal, unchanged priority) and drives a NEW
+# 'bounce_owner' outcome — never silently promoted to plain 'bounce', because
+# the call site must know to nudge the OWNER, not REBASE_AUTHOR: they are
+# different, unrelated identities, and conflating them repeats the exact
+# divergent-signal/target bug already fixed once at this function's call site
+# (ga-6dp9 gate-fix-2: decide via one identity's liveness, notify a DIFFERENT
+# one — nobody actually gets notified). Falls through to circuit_break,
+# unchanged, when NEITHER author nor owner is alive — the human safety net
+# this bug's own acceptance criteria (#3) requires is exactly as strict as
+# before this change.
 gate_behind_envelope_action() {
-  local behind_exceeded="${1:-0}" author_alive="${2:-0}"
+  local behind_exceeded="${1:-0}" author_alive="${2:-0}" owner_alive="${3:-0}"
   case "$behind_exceeded" in ''|*[!0-9]*) behind_exceeded=0 ;; esac
   case "$author_alive"    in ''|*[!0-9]*) author_alive=0    ;; esac
+  case "$owner_alive"     in ''|*[!0-9]*) owner_alive=0     ;; esac
   if [ "$behind_exceeded" != "1" ]; then
     printf 'not_applicable'; return 0
   fi
   if [ "$author_alive" = "1" ]; then
     printf 'bounce'
+  elif [ "$owner_alive" = "1" ]; then
+    printf 'bounce_owner'
   else
     printf 'circuit_break'
   fi
@@ -7084,18 +7158,6 @@ AUTHOR_TRUSTED_SUBMIT="$AUTHOR"
 AUTHOR_AGENT=$(printf '%s\n' "$VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .metadata["gate.submitted_by_agent"] // empty' 2>/dev/null || true)
 [ "$AUTHOR_AGENT" = "null" ] && AUTHOR_AGENT=""
 
-# bead_field_grep <raw_json_text> <field_name>
-# Extracts a simple string field from potentially-malformed JSON output.
-# Uses grep/sed instead of jq because gc bd output may contain literal newlines
-# embedded in string values (invalid JSON per RFC7159) that cause jq 1.8.1+ to fail.
-bead_field_grep() {
-  local raw="$1" field="$2"
-  # The || true prevents pipefail from aborting when grep finds no match (exits 1).
-  echo "$raw" | grep -o "\"${field}\": *\"[^\"]*\"" \
-    | sed "s/\"${field}\": *\"\(.*\)\"/\1/" \
-    | head -1 || true
-}
-
 # ga-tkvsa: only re-derive from the (possibly by-now-cleared) source bead when
 # the trusted marker-recorded value above didn't already resolve AUTHOR.
 if [ -z "$AUTHOR" ] && [ -n "$BEAD_ID" ]; then
@@ -7751,7 +7813,33 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
   #       .git dir — signs of a prior interrupted git operation that a worktree
   #       rebase would collide with.
   GATE_REBASE_AHEAD_MAX="${GATE_REBASE_AHEAD_MAX:-10}"
-  GATE_REBASE_BEHIND_MAX="${GATE_REBASE_BEHIND_MAX:-50}"
+  # ga-ivzbuz: GATE_REBASE_BEHIND_MAX used to be one global default (50)
+  # regardless of rig. Measured real per-rig main velocity (git log, last 10
+  # days, 2026-08-16): whatsapp_automation peaked at 122 commits/day (recent
+  # active-day average ~79/day) — at that speed 50 commits is under 10 hours,
+  # inside a single gate review round-trip (submit -> review -> needs-fix ->
+  # fix -> resubmit), so every branch surviving one review round was
+  # structurally guaranteed to trip the behind_dead circuit-break regardless
+  # of code quality (real cases: wa-nxwqw 84 behind, wa-983jj 61 behind,
+  # wa-zg6xf 89 behind, all same day). gascity peaked at 56/day over the same
+  # window (confirmed via .gc/quality-gate.jsonl's own "rig" field — the only
+  # two rig values with real gate-marker traffic in recent history).
+  # property_scrapers was also measured (peak 5/day) and deliberately left on
+  # the default — at that speed 50 commits is already ~10 days, no override
+  # needed (the bug's own "rig parado, 50 e semanas" case). Each override
+  # below is 3x the highest single day observed in the 10-day window, rounded
+  # up to the nearest 50 — a bounded, finite safety margin for a slow/backed-
+  # up gate queue, not a disabled check. Unmeasured/future rigs keep the
+  # original global default (50) until someone measures and adds them here —
+  # a fixed per-rig table, not a live per-sweep git-log computation, per the
+  # bug's own CONSERTO PEDIDO #3 ("se ficar fixo, que seja por rig e com o
+  # numero justificado pela medicao"). Raw git-log data behind these numbers
+  # is recorded on ga-ivzbuz's own comment log.
+  case "${RIG:-}" in
+    whatsapp_automation) GATE_REBASE_BEHIND_MAX="${GATE_REBASE_BEHIND_MAX:-400}" ;;
+    gascity)              GATE_REBASE_BEHIND_MAX="${GATE_REBASE_BEHIND_MAX:-200}" ;;
+    *)                    GATE_REBASE_BEHIND_MAX="${GATE_REBASE_BEHIND_MAX:-50}"  ;;
+  esac
   REBASE_IN_ENVELOPE=1
   REBASE_SKIP_REASON=""
   # ga-6dp9 (bug 2 of 3): tracks specifically whether the BEHIND-envelope check
@@ -8382,7 +8470,21 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       bd -C "$GC_CITY" comment "$MARKER_ID" "ga-iwcu23: this sweep measured branch $BRANCH as ${REBASE_BEHIND:-?} commits behind main (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}), which would normally trigger the ga-6dp9 behind_dead circuit-break — but the marker's base_commit (${BASE_COMMIT:-<empty>}) could not be independently verified against a freshly-fetched origin/$DEFAULT_BRANCH ($BASE_COMMIT_TRUST). No destructive action taken; will re-measure on a later sweep once origin state is verifiable." 2>/dev/null || true
       REBASE_BEHIND_EXCEEDED=0
     fi
-    _BEHIND_ACTION=$(gate_behind_envelope_action "$REBASE_BEHIND_EXCEEDED" "$REBASE_AUTHOR_ALIVE")
+    # ga-ivzbuz: only resolve+check the bead OWNER when we're actually about
+    # to consider circuit-breaking on behind_dead (behind exceeded AND
+    # REBASE_AUTHOR already dead) — avoids an extra bd lookup on every sweep
+    # for the far more common in-envelope or author-alive paths, where this
+    # signal is never consulted.
+    OWNER=""
+    OWNER_ALIVE=0
+    if [ "$REBASE_BEHIND_EXCEEDED" = "1" ] && [ "$REBASE_AUTHOR_ALIVE" != "1" ] && [ -n "$BEAD_ID" ]; then
+      OWNER=$(resolve_bead_owner "$BEAD_ID")
+      if [ -n "$OWNER" ] && [ "$OWNER" != "null" ]; then
+        OWNER_ALIVE=$(author_is_alive "$OWNER")
+        log "  ga-ivzbuz: REBASE_AUTHOR ($REBASE_AUTHOR) dead and behind-envelope exceeded; bead owner '$OWNER' alive=$OWNER_ALIVE (fallback rescue check before circuit-break)."
+      fi
+    fi
+    _BEHIND_ACTION=$(gate_behind_envelope_action "$REBASE_BEHIND_EXCEEDED" "$REBASE_AUTHOR_ALIVE" "$OWNER_ALIVE")
     if [ "$_BEHIND_ACTION" = "circuit_break" ]; then
       err "  ga-6dp9: circuit-breaking marker $MARKER_ID (behind_dead): behind=${REBASE_BEHIND:-?} > GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX} and author dead/empty."
       set_gate_status "$MARKER_ID" "error"  # ga-7fwt1
@@ -8455,6 +8557,36 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
         --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         --arg branch "$BRANCH" --arg bead "$BEAD_ID" --arg rig "${RIG:-unknown}" \
         --arg marker "$MARKER_ID" --arg author "$AUTHOR" --arg main_sha "$MAIN_HEAD_SHA" \
+        --arg conflicts "${CONFLICT_FILES:-unknown}" --arg event "$REBASE_EVENT" \
+        '{ts: $ts, event: $event, branch: $branch, bead: $bead, rig: $rig, marker: $marker, author: $author, main_sha: $main_sha, conflicts: $conflicts}' \
+        >> "$QG_LOG" 2>/dev/null || true
+      log "=== Dispatcher sweep complete: branch=$BRANCH verdict=$REBASE_VERDICT ==="
+      exit 0
+    elif [ "$_BEHIND_ACTION" = "bounce_owner" ]; then
+      warn "Branch $BRANCH: main is ${REBASE_BEHIND:-?} commits ahead of branch base (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}); rebase author $REBASE_AUTHOR is dead, but bead owner $OWNER is live — bouncing to owner instead of circuit-breaking (ga-ivzbuz)."
+      set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
+      bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED (ga-ivzbuz, extends ga-6dp9): branch $BRANCH's base is ${REBASE_BEHIND:-?} commits behind current main (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}). This is a permanent condition (main only moves forward) — auto-retry cannot help. The branch's own rebase author ($REBASE_AUTHOR) has no live session — that is EXPECTED for an ad-hoc pool worker that already submitted and exited normally (ga-ivzbuz DEFEITO 2), not evidence of abandoned work. Bead owner $OWNER is live and has been nudged to re-anchor. Action required: rebase $BRANCH onto current origin/$DEFAULT_BRANCH and re-run /gate-done." 2>/dev/null || true
+      if [ -n "$BEAD_ID" ]; then
+        bd -C "$BEAD_CITY" label add  "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate blocked (ga-ivzbuz, extends ga-6dp9): branch $BRANCH's base is ${REBASE_BEHIND:-?} commits behind main (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}). Rebase author $REBASE_AUTHOR has no live session (expected for an ad-hoc worker that already submitted normally) — bead owner $OWNER is live and was nudged instead of parking this on gate:needs-human. Manual rebase required — re-run /gate-done after rebasing." 2>/dev/null || true
+      fi
+      # ga-ivzbuz: nudge the identity actually verified alive for THIS
+      # decision (OWNER), not REBASE_AUTHOR (confirmed dead in this branch) —
+      # same signal/target-matching discipline as ga-6dp9 gate-fix-2 above.
+      gc --city "$GC_CITY" session nudge "$OWNER" \
+        "GATE BLOCKED for branch $BRANCH: base is ${REBASE_BEHIND:-?} commits behind main (> ${GATE_REBASE_BEHIND_MAX} max) — this is permanent, not a transient race. Rebase author $REBASE_AUTHOR has no live session (likely already submitted and exited normally). You're the bead owner and live — please rebase onto origin/$DEFAULT_BRANCH and re-run /gate-done, or reassign. Bead: $BEAD_ID" \
+        --delivery wait-idle 2>/dev/null || warn "Could not nudge owner $OWNER for rebase"
+      REBASE_EVENT="dispatcher_needs_rebase_behind_envelope_owner_fallback"
+      REBASE_VERDICT="NEEDS_REBASE (main delta > envelope, rebase author dead, owner $OWNER live, bounced — ga-ivzbuz)"
+      if [ "$(gate_marker_status_ensure "$MARKER_ID" "the behind-envelope owner-fallback bounce")" = "repaired" ]; then
+        warn "ga-kgtiw SELF-HEAL: marker $MARKER_ID had no gate-status label after the behind-envelope owner-fallback bounce — self-heal force-wrote and verified gate-status:error (see marker comment + Mayor mail for detail)."
+      fi
+      log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH — $REBASE_VERDICT."
+      mkdir -p "$(dirname "$QG_LOG")"
+      jq -c -n \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg branch "$BRANCH" --arg bead "$BEAD_ID" --arg rig "${RIG:-unknown}" \
+        --arg marker "$MARKER_ID" --arg author "$OWNER" --arg main_sha "$MAIN_HEAD_SHA" \
         --arg conflicts "${CONFLICT_FILES:-unknown}" --arg event "$REBASE_EVENT" \
         '{ts: $ts, event: $event, branch: $branch, bead: $bead, rig: $rig, marker: $marker, author: $author, main_sha: $main_sha, conflicts: $conflicts}' \
         >> "$QG_LOG" 2>/dev/null || true

@@ -833,6 +833,143 @@ eq "gate_behind_envelope_action is UNCHANGED for a genuinely dead named author (
   "$(gate_behind_envelope_action "1" "0")" \
   "circuit_break"
 
+# ── 14. ga-ivzbuz: behind-envelope circuit-break has an unreachable ceiling on
+#    a high-velocity rig, and treats a normally-exited ad-hoc worker's dead
+#    session as "abandoned" with no owner-liveness fallback ─────────────────
+# Composed bug: (1) GATE_REBASE_BEHIND_MAX=50 is under 10 hours of branch life
+# on a rig doing 90-122 commits/day on main — any branch surviving one gate
+# review round-trip trips the circuit-break regardless of code quality; (2) an
+# ad-hoc pool worker (wa-worker-adhoc-<hash>) ALWAYS reads as a dead author by
+# the time this sweep runs (build, commit, submit /gate-done, exit — the same
+# doctrine dogs themselves follow), which the old code could not distinguish
+# from a worker that crashed mid-task; (3) the dispatcher had no fallback to
+# the bead's OWNER before circuit-breaking, even though the Mayor manually
+# rescued the two real cases below by nudging the owner directly. Real
+# incident, 2026-08-16: wa-nxwqw (84 behind, owner oracle-wa), wa-983jj (61
+# behind, owner thies-wa), wa-zg6xf (89 behind) — 3 branches auto-circuit-
+# broken to gate:needs-human in ~40min, all normal ad-hoc submissions.
+echo "── 14. ga-ivzbuz: owner-liveness fallback before circuit-break, per-rig behind-ceiling ──"
+
+echo "── 14a. gate_behind_envelope_action: 3rd arg (owner_alive) truth table ──"
+eq "not exceeded, dead author, dead owner → not_applicable (unchanged)" \
+  "$(gate_behind_envelope_action "0" "0" "0")" \
+  "not_applicable"
+eq "exceeded, dead author, dead owner → circuit_break (safety net intact — AC3)" \
+  "$(gate_behind_envelope_action "1" "0" "0")" \
+  "circuit_break"
+eq "exceeded, dead author, LIVE owner → bounce_owner (NEW — AC1/AC2, never a bare 'bounce' with the wrong nudge target)" \
+  "$(gate_behind_envelope_action "1" "0" "1")" \
+  "bounce_owner"
+eq "exceeded, LIVE author, dead owner → bounce (author still wins outright — unchanged priority, owner_alive irrelevant when author is alive)" \
+  "$(gate_behind_envelope_action "1" "1" "0")" \
+  "bounce"
+eq "exceeded, LIVE author, LIVE owner → bounce (author priority preserved even when both are alive — never bounce_owner)" \
+  "$(gate_behind_envelope_action "1" "1" "1")" \
+  "bounce"
+eq "2-arg legacy call (owner_alive omitted) → circuit_break, UNCHANGED behavior for any caller not yet passing the 3rd arg" \
+  "$(gate_behind_envelope_action "1" "0")" \
+  "circuit_break"
+eq "garbage owner_alive sanitizes to 0, exceeded=1, dead author → circuit_break (fail-safe, never a phantom rescue)" \
+  "$(gate_behind_envelope_action "1" "0" "xx")" \
+  "circuit_break"
+
+echo "── 14b. resolve_bead_owner: extracts bd's 'owner' field via the cross-rig-then-HQ-fallback lookup (hermetic, gc stubbed) ──"
+# Stub `gc` so this test is hermetic — same spirit as this file's own
+# log/warn/err no-op stubs above — scoped to this subsection only.
+gc() {
+  if [ "$1" = "--city" ] && [ "$3" = "bd" ] && [ "$4" = "show" ] && [ "$5" = "wa-nxwqw-fake" ]; then
+    printf '{"owner":"oracle-wa","assignee":"","created_by":""}'
+    return 0
+  fi
+  return 1
+}
+eq "resolve_bead_owner extracts the 'owner' field from a live gc bd show lookup" \
+  "$(resolve_bead_owner "wa-nxwqw-fake")" \
+  "oracle-wa"
+eq "resolve_bead_owner falls back to \"\" when neither the cross-rig nor HQ lookup resolves the bead (fail-safe, matches resolve_rebase_author's empty-string contract)" \
+  "$(resolve_bead_owner "totally-unknown-bead")" \
+  ""
+eq "resolve_bead_owner(\"\") short-circuits to \"\" without attempting any lookup" \
+  "$(resolve_bead_owner "")" \
+  ""
+unset -f gc
+
+echo "── 14c. drift-guard: OWNER/OWNER_ALIVE actually computed and wired into the 3-arg call ──"
+grep -qF 'OWNER=$(resolve_bead_owner "$BEAD_ID")' "$DISPATCHER" \
+  && ok "OWNER is actually resolved at the call site (fix wired in, not just defined)" \
+  || bad "OWNER resolution missing at call site — resolve_bead_owner() defined but never called"
+grep -qF 'OWNER_ALIVE=$(author_is_alive "$OWNER")' "$DISPATCHER" \
+  && ok "OWNER_ALIVE computed via the canonical author_is_alive() — same liveness predicate as every other identity in this file" \
+  || bad "OWNER_ALIVE computation missing"
+grep -qF 'gate_behind_envelope_action "$REBASE_BEHIND_EXCEEDED" "$REBASE_AUTHOR_ALIVE" "$OWNER_ALIVE"' "$DISPATCHER" \
+  && ok "call site passes OWNER_ALIVE as the 3rd arg (behavior actually reachable, not just defined)" \
+  || bad "call site NOT passing OWNER_ALIVE — gate_behind_envelope_action's 3rd arg is dead code"
+
+echo "── 14d. drift-guard: AC2/gate-fix-2 discipline — bounce_owner nudges OWNER, never REBASE_AUTHOR (which is confirmed dead in this branch) ──"
+_BOUNCE_OWNER_BLOCK=$(sed -n '/elif \[ "\$_BEHIND_ACTION" = "bounce_owner" \]; then/,/^    fi$/p' "$DISPATCHER")
+if [ -z "$_BOUNCE_OWNER_BLOCK" ]; then
+  bad "could not extract the bounce_owner block — anchor text missing/renamed?"
+else
+  if printf '%s\n' "$_BOUNCE_OWNER_BLOCK" | grep -qF 'gc --city "$GC_CITY" session nudge "$OWNER"'; then
+    ok "bounce_owner nudges \$OWNER — the identity actually verified alive for this decision"
+  else
+    bad "bounce_owner does not nudge \$OWNER — repeats the exact gate-fix-2 signal/target divergence bug"
+  fi
+  if printf '%s\n' "$_BOUNCE_OWNER_BLOCK" | grep -qF 'session nudge "$REBASE_AUTHOR"'; then
+    bad "bounce_owner nudges \$REBASE_AUTHOR — that identity is confirmed DEAD in this branch by construction"
+  else
+    ok "bounce_owner never nudges the confirmed-dead \$REBASE_AUTHOR"
+  fi
+  # Matches the actual label-add call shape (e.g. `label add "$BEAD_ID"
+  # "gate:needs-human"`), not a bare substring — the block's OWN explanatory
+  # prose legitimately mentions the phrase "gate:needs-human" to say what did
+  # NOT happen ("nudged instead of parking this on gate:needs-human"), which
+  # a plain -F substring match would misfire on.
+  if printf '%s\n' "$_BOUNCE_OWNER_BLOCK" | grep -qE 'label +add.*"gate:needs-human'; then
+    bad "bounce_owner applies gate:needs-human — defeats AC1 (must NOT circuit-break when owner is live)"
+  else
+    ok "bounce_owner never applies gate:needs-human (AC1: does not park on the human path when owner is live)"
+  fi
+fi
+
+echo "── 14e. End-to-end: the two real 2026-08-16 incidents now bounce to their owner instead of circuit-breaking (AC1, AC2 'provado com os dois casos') ──"
+_WA_NXWQW_ACTION=$(gate_behind_envelope_action "1" "0" "1")
+eq "wa-nxwqw shape (84 behind, dead ad-hoc author, live owner oracle-wa) → bounce_owner, not circuit_break" \
+  "$_WA_NXWQW_ACTION" \
+  "bounce_owner"
+_WA_983JJ_ACTION=$(gate_behind_envelope_action "1" "0" "1")
+eq "wa-983jj shape (61 behind, dead ad-hoc author, live owner thies-wa) → bounce_owner, not circuit_break — SAME code path proves both cases (AC2)" \
+  "$_WA_983JJ_ACTION" \
+  "bounce_owner"
+_WA_ZG6XF_NO_OWNER_ACTION=$(gate_behind_envelope_action "1" "0" "0")
+eq "wa-zg6xf shape, IF no live owner either (worst case) → circuit_break still fires — AC3 safety net is not weakened by this fix" \
+  "$_WA_ZG6XF_NO_OWNER_ACTION" \
+  "circuit_break"
+
+echo "── 14f. GATE_REBASE_BEHIND_MAX per-rig ceiling: behavioral test executing the REAL shipped case-statement (not a re-typed copy) ──"
+_CEILING_BLOCK=$(sed -n '/^  case "\${RIG:-}" in$/,/^  esac$/p' "$DISPATCHER")
+if [ -z "$_CEILING_BLOCK" ]; then
+  bad "could not extract the ga-ivzbuz per-rig ceiling case-statement — anchor text missing/renamed?"
+else
+  _CEILING_SCRIPT="$_CEILING_BLOCK"$'\nprintf "%s" "$GATE_REBASE_BEHIND_MAX"'
+  _WA_MAX=$(RIG=whatsapp_automation bash -c "$_CEILING_SCRIPT" 2>&1)
+  _GASCITY_MAX=$(RIG=gascity bash -c "$_CEILING_SCRIPT" 2>&1)
+  _UNMEASURED_MAX=$(RIG=some_future_rig bash -c "$_CEILING_SCRIPT" 2>&1)
+  _UNSET_MAX=$(bash -c "$_CEILING_SCRIPT" 2>&1)
+  eq "whatsapp_automation ceiling = 400 (3x measured peak 122/day, rounded up to nearest 50)" \
+    "$_WA_MAX" "400"
+  eq "gascity ceiling = 200 (3x measured peak 56/day, rounded up to nearest 50)" \
+    "$_GASCITY_MAX" "200"
+  eq "an unmeasured/future rig keeps the ORIGINAL global default (50) — fail-safe, no silent over-permissive default" \
+    "$_UNMEASURED_MAX" "50"
+  eq "RIG completely unset keeps the original global default (50) — fail-safe" \
+    "$_UNSET_MAX" "50"
+fi
+_ENV_OVERRIDE_MAX=$(RIG=whatsapp_automation GATE_REBASE_BEHIND_MAX=999 bash -c "${_CEILING_BLOCK}"$'\nprintf "%s" "$GATE_REBASE_BEHIND_MAX"' 2>&1)
+eq "an explicit GATE_REBASE_BEHIND_MAX env var still overrides the per-rig default (operator escape hatch preserved)" \
+  "$_ENV_OVERRIDE_MAX" \
+  "999"
+
 # ── Result ────────────────────────────────────────────────────────────────────
 echo ""
 if [ "$FAIL" = "0" ]; then
