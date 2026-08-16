@@ -257,70 +257,49 @@ story_merge_verdict() {
   fi
 }
 
-# _gate_delivery_header_class <line> — ga-1yxyt. Mirrors
-# quality-gate-guard.sh's copy VERBATIM. See that copy for the full
-# rationale; kept in sync by inspection.
-_gate_delivery_header_class() {
-  local norm
-  norm=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]' \
-    | sed -e 's/[ÁÀÂÃ]/A/g; s/[ÉÊ]/E/g; s/[ÍÎ]/I/g; s/[ÓÔÕ]/O/g; s/[ÚÛ]/U/g; s/Ç/C/g')
-  if printf '%s' "$norm" | grep -Eq 'FIX PEDIDO|ENTREGAVEIS|ESCOPO|CRITERIO DE ACEITE|O QUE FAZER'; then
-    echo "scope"; return 0
-  fi
-  if printf '%s' "$norm" | grep -Eq 'O CICLO|A CADEIA|SINTOMA|A MEDICAO|O DEFEITO|EVIDENCIA|COMO ACONTECE'; then
-    echo "diagnostic"; return 0
-  fi
-  echo "unknown"
-}
+# gate_delivery_looks_partial() and its helpers (_gate_delivery_header_class,
+# _gate_delivery_list_run, plus v4's _gate_delivery_norm/_enumerates/
+# _item_is_verification/_run_verdict) used to be copy-pasted here, with a
+# comment claiming they mirrored quality-gate-guard.sh's copy "VERBATIM...
+# kept in sync by inspection". That claim went stale — guard.sh advanced to
+# v4 (ga-cjrxh: catches UPPERCASE lettered lists and title-level enumeration;
+# AC3: distinguishes an empty body from an evaluated-and-clean one on stderr)
+# while this copy stayed at v3 — and nothing caught the drift, because the
+# comment itself told the next reader to stop looking (ga-3k70w2). Source the
+# real implementation instead of maintaining a second one to drift, same
+# pattern quality-gate-dispatcher.sh already uses for this exact file (see
+# its GATE_GUARD_LIB_ONLY source, ga-bnu1). Resolved relative to this
+# script's own location (not $GC_CITY) so a caller running from a review
+# worktree still pairs with the guard.sh from the SAME checkout.
+_STORY_DELIVERY_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GATE_GUARD_LIB_ONLY=1 source "${_STORY_DELIVERY_SELF_DIR}/quality-gate-guard.sh" 2>/dev/null || true
+unset _STORY_DELIVERY_SELF_DIR
+# guard.sh sets its OWN LOG=$LOG_DIR/quality-gate-guard.log at source time —
+# restore ours (GC_CITY/LOG_DIR are already identical in both files, so only
+# LOG needs it). Mirrors quality-gate-dispatcher.sh's identical restore right
+# after its own guard.sh source (ga-l47b7) — without it this script's own log
+# output would silently start flowing into quality-gate-guard.log instead.
+LOG="$LOG_DIR/story-delivery.log"
 
-# _gate_delivery_list_run <text> <line_regex> <label> — ga-zhfk8 (tightened
-# again in fix attempt 2: tolerate indented wrapped-continuation lines;
-# ga-1yxyt: skip runs headed by a DIAGNOSTIC/OBSERVATION label, see
-# quality-gate-guard.sh for the full rationale). Mirrors quality-gate-guard.sh's
-# copy VERBATIM. See that copy for the full rationale; kept in sync by
-# inspection.
-_gate_delivery_list_run() {
-  local text="$1" pattern="$2" label="$3" line
-  local run="" run_n=0 best="" best_n=0
-  local run_header="" pending_header=""
-  while IFS= read -r line; do
-    if printf '%s\n' "$line" | grep -Eq "$pattern"; then
-      [ "$run_n" -eq 0 ] && run_header="$pending_header"
-      run="${run}${line}"$'\n'
-      run_n=$((run_n + 1))
-    elif printf '%s' "$line" | grep -Eq '^[[:space:]]+[^[:space:]]'; then
-      : # indented, non-blank, non-matching: wrapped continuation of the
-        # current item's text — does not break the run, not counted, and
-        # (ga-1yxyt) never updates pending_header — a continuation is part
-        # of the item's own text, not a new section header.
-    else
-      if [ "$run_n" -gt "$best_n" ] && [ "$(_gate_delivery_header_class "$run_header")" != "diagnostic" ]; then
-        best="$run"; best_n=$run_n
-      fi
-      run=""; run_n=0; run_header=""
-      [ -n "$line" ] && pending_header="$line"
-    fi
-  done <<EOF
-$text
-EOF
-  if [ "$run_n" -gt "$best_n" ] && [ "$(_gate_delivery_header_class "$run_header")" != "diagnostic" ]; then
-    best="$run"; best_n=$run_n
+# task_reconciler_is_partial <already_partial 0|1> <scope_covered_all 0|1> <text> [title]
+#   Pure decision (ga-3k70w2 DEFEITO 4): scope_covered:all is an explicit
+#   author override and must win even over a PRIOR delivery:partial hold —
+#   this sweep applies delivery:partial itself when it holds (see call site),
+#   so once held, testing already_partial first meant scope_covered:all could
+#   never run again on a later sweep: the exact label the hold-mail tells a
+#   human to add then had no effect, holding the bead forever (the real
+#   wa-agkop case, 2026-08-16). Order here is deliberate and load-bearing —
+#   do not swap it back.
+#   Prints partial evidence (if any) on stdout; rc0 iff the bead is partial.
+task_reconciler_is_partial() {
+  local already_partial="$1" scope_covered_all="$2" text="$3" title="${4:-}"
+  if [ "$scope_covered_all" = "1" ]; then
+    return 1
+  elif [ "$already_partial" = "1" ]; then
+    return 0
+  else
+    gate_delivery_looks_partial "$text" "$title"
   fi
-  [ "$best_n" -ge 3 ] || return 1
-  printf 'detectei (%s):\n%s' "$label" "$best"
-  return 0
-}
-
-# gate_delivery_looks_partial <bead_text> — ga-k2wjn, tightened by ga-zhfk8,
-# then by ga-1yxyt (header-aware run classification). Mirrors
-# quality-gate-guard.sh's copy VERBATIM (one proven heuristic, not a
-# second one to drift — same discipline as the rig_gitdir-adjacent helpers
-# above). See that copy for the full rationale; kept in sync by inspection.
-gate_delivery_looks_partial() {
-  local text="${1:-}"
-  _gate_delivery_list_run "$text" '^[[:space:]]*[0-9]{1,2}\.[[:space:]]' 'lista numerada' && return 0
-  _gate_delivery_list_run "$text" '^[[:space:]]*[a-z]\.[[:space:]]' 'lista com letras' && return 0
-  return 1
 }
 
 # Lib-only mode: `STORY_DELIVERY_LIB_ONLY=1 source story-delivery.sh` defines the
@@ -693,22 +672,21 @@ if [ -z "$FORCE_STORY_ID" ]; then
       # ga-k2wjn: does the task bead ALREADY carry delivery:partial (primary
       # dispatcher already held+escalated it — nothing new to do here beyond
       # not closing) or scope_covered:all (explicit author override — trust
-      # it), or — the crash-window case, primary dispatcher never reached
-      # this decision — does its OWN body look like it enumerates multiple
-      # approved deliverables? gate_delivery_looks_partial mirrors
-      # quality-gate-guard.sh's copy verbatim (see that copy for rationale).
+      # it, and let it override a prior hold too, ga-3k70w2), or — the
+      # crash-window case, primary dispatcher never reached this decision —
+      # does its OWN body look like it enumerates multiple approved
+      # deliverables? Precedence lives in task_reconciler_is_partial above.
       TASK_ALREADY_PARTIAL=$(echo "$TASK_BEAD" | jq -r 'if ((.labels // []) | contains(["delivery:partial"])) then "1" else "0" end' 2>/dev/null || echo "0")
       TASK_SCOPE_COVERED_ALL=$(echo "$TASK_BEAD" | jq -r 'if ((.labels // []) | contains(["scope_covered:all"])) then "1" else "0" end' 2>/dev/null || echo "0")
+      TASK_TEXT=$(echo "$TASK_BEAD" | jq -r '((.description // "") + "\n" + (.notes // ""))' 2>/dev/null || echo "")
       TASK_IS_PARTIAL=0
-      TASK_PARTIAL_EVIDENCE=""
-      if [ "$TASK_ALREADY_PARTIAL" = "1" ]; then
+      # ga-zhfk8: capture the detected list lines (stdout on a hit) so the
+      # hold message below can cite them instead of asserting without
+      # showing. ga-3k70w2: pass the title too (guard.sh's v4 signature) —
+      # the backstop used to call this text-only, which is one more way it
+      # was weaker than the primary (title-level enumeration went undetected).
+      if TASK_PARTIAL_EVIDENCE=$(task_reconciler_is_partial "$TASK_ALREADY_PARTIAL" "$TASK_SCOPE_COVERED_ALL" "$TASK_TEXT" "$TASK_BEAD_TITLE"); then
         TASK_IS_PARTIAL=1
-      elif [ "$TASK_SCOPE_COVERED_ALL" != "1" ]; then
-        TASK_TEXT=$(echo "$TASK_BEAD" | jq -r '((.description // "") + "\n" + (.notes // ""))' 2>/dev/null || echo "")
-        # ga-zhfk8: capture the detected list lines (stdout on a hit) so the
-        # hold message below can cite them instead of asserting without
-        # showing.
-        if TASK_PARTIAL_EVIDENCE=$(gate_delivery_looks_partial "$TASK_TEXT"); then TASK_IS_PARTIAL=1; fi
       fi
 
       TASK_VERDICT=$(task_reconciler_verdict "$TASK_CONTRADICTED" "$TASK_MERGE_VERIFIED" "$TASK_IS_PARTIAL")

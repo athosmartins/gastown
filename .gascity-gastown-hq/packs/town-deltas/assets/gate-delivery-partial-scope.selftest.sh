@@ -542,9 +542,20 @@ else
   ok "story-delivery.sh's keep:partial-delivery arm does not add gate:needs-human (ga-6dpoa)"
 fi
 
-# ga-zhfk8 fix 3, mirrored: same evidence-capture-and-quote discipline.
-if grep -qF 'TASK_PARTIAL_EVIDENCE=$(gate_delivery_looks_partial' "$DELIVERY"; then
-  ok "story-delivery.sh captures gate_delivery_looks_partial's stdout evidence"
+# ga-zhfk8 fix 3, mirrored: same evidence-capture-and-quote discipline. Since
+# ga-3k70w2, the call site goes through task_reconciler_is_partial (which
+# fixes the scope_covered:all-must-beat-delivery:partial ordering bug, then
+# delegates to gate_delivery_looks_partial) instead of calling
+# gate_delivery_looks_partial directly — check both halves of that chain:
+# the wrapper still reaches the real heuristic, and the call site still
+# captures ITS output (not asserting without showing).
+if grep -qF 'gate_delivery_looks_partial "$text" "$title"' "$DELIVERY"; then
+  ok "story-delivery.sh's task_reconciler_is_partial delegates to gate_delivery_looks_partial (ga-3k70w2)"
+else
+  bad "story-delivery.sh's task_reconciler_is_partial does not call gate_delivery_looks_partial — evidence path broken (ga-3k70w2)"
+fi
+if grep -qF 'TASK_PARTIAL_EVIDENCE=$(task_reconciler_is_partial' "$DELIVERY"; then
+  ok "story-delivery.sh captures task_reconciler_is_partial's stdout evidence (ga-3k70w2)"
 else
   bad "story-delivery.sh does not capture evidence (still asserting without showing)"
 fi

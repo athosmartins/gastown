@@ -44,7 +44,8 @@ STORY_DELIVERY_LIB_ONLY=1 source "$SCRIPT" \
 for fn in rig_gitdir git_in token_bounded subject_impl_scopes_bead \
           scan_commit_subject_for_bead task_reconciler_verdict \
           task_reconciler_failed_sha_resolved \
-          extract_gate_merge_info story_merge_verdict; do
+          extract_gate_merge_info story_merge_verdict \
+          gate_delivery_looks_partial task_reconciler_is_partial; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by story-delivery.sh"; exit 1; }
 done
 
@@ -312,6 +313,78 @@ eq "ga-as3p1: mixed stamps (one merged + one never-merged) → no (one live reje
 eq "gate-sha-failed on a sha that never existed at all → no (fail-closed, not false-yes)" \
    "$(task_reconciler_failed_sha_resolved "$BARE_GDIR" "$BARE_CONTAINER" "main" "gate-sha-failed:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef:code")" \
    "no"
+
+# ── 8. ga-3k70w2: scope-review backstop parity with the primary ────────────
+# The backstop's gate_delivery_looks_partial used to be a hand-copied v3
+# duplicate of quality-gate-guard.sh's, with a comment falsely claiming it
+# was kept in sync "by inspection". It is now the SAME function (sourced,
+# not copied) — these assertions would have failed against the pre-fix
+# local copy for the reasons noted on each one.
+echo "── 8. ga-3k70w2: scope-review backstop parity with the primary ──"
+
+# DEFEITO 2: the pre-fix backstop matched only lowercase 'a.'..'z.' list
+# markers ('^[[:space:]]*[a-z]\.[[:space:]]'). A real deliverables list
+# enumerated "A." .. "H." (wa-se0zu's actual shape) passed straight through
+# undetected. guard.sh's v4 matches [A-Za-z] — sourcing it fixes this for
+# free.
+UPPER_LIST=$'Entregaveis:\nA. primeiro item da lista\nB. segundo item da lista\nC. terceiro item da lista\nD. quarto item da lista'
+if gate_delivery_looks_partial "$UPPER_LIST" "" >/dev/null 2>&1; then
+  ok "DEFEITO2: corpo com lista A./B./C./D. (maiuscula) -> detecta partial"
+else
+  bad "DEFEITO2: corpo com lista maiuscula NAO detectado (regrediu ao regex [a-z]-only do v3)"
+fi
+
+# DEFEITO 3: the pre-fix backstop had no branch at all for an empty body —
+# it fell through both list checks straight to `return 1`, identical to the
+# "evaluated it, found no list" outcome, with no stderr message either way.
+# guard.sh's v4 names which one happened (AC3: error and empty must not
+# produce the same value) — prove the two cases now print DIFFERENT
+# messages, not just that both return 1.
+# `|| true`: both calls below are EXPECTED to return 1 (not-partial) — a bare
+# VAR=$(...) on a failing command trips this script's inherited `set -e`
+# (sourced in from story-delivery.sh/guard.sh, both `set -euo pipefail`) and
+# would silently truncate the rest of this suite before the PASS/FAIL summary
+# — same idiom as $FOUND_SHA above, and the same class of footgun DEFEITO3
+# itself is about (a swallowed distinction nobody notices).
+EMPTY_MSG=$(gate_delivery_looks_partial "" "" 2>&1 >/dev/null) || true
+case "$EMPTY_MSG" in
+  *nao-avaliavel*) ok "DEFEITO3: corpo E titulo vazios -> stderr diz nao-avaliavel (distinto de 'avaliei e limpo')" ;;
+  *) bad "DEFEITO3: corpo vazio nao produziu a mensagem nao-avaliavel (got: $EMPTY_MSG)" ;;
+esac
+CLEAN_MSG=$(gate_delivery_looks_partial "Corrigido o bug relatado. Nenhuma mudanca adicional necessaria." "" 2>&1 >/dev/null) || true
+case "$CLEAN_MSG" in
+  *nao-avaliavel*) bad "DEFEITO3: corpo preenchido e limpo produziu a MESMA mensagem do corpo vazio (nao-avaliavel) — colapso reintroduzido" ;;
+  *nao-detectado*) ok "DEFEITO3: corpo preenchido e limpo -> stderr diz nao-detectado (distinto de 'nao-avaliavel')" ;;
+  *) bad "DEFEITO3: corpo limpo nao produziu nao-detectado (got: $CLEAN_MSG)" ;;
+esac
+
+# Title-enumeration parity: the pre-fix backstop's call site never passed a
+# title at all (gate_delivery_looks_partial "$TASK_TEXT" only, no 2nd arg),
+# so a bead whose BODY has no list but whose TITLE enumerates a count (this
+# very bead's own title shape: "...diverge da primaria em 4 pontos") was
+# invisible to it. Empty body + a counting title must still be caught.
+if gate_delivery_looks_partial "" "Backstop diverge da primaria em 4 pontos" >/dev/null 2>&1; then
+  ok "titulo com enumeracao (4 pontos) + corpo vazio -> detecta partial (call site now passes title)"
+else
+  bad "titulo com enumeracao NAO detectado — call site ainda nao passa o titulo"
+fi
+
+# DEFEITO 4: task_reconciler_is_partial <already_partial> <scope_covered_all> <text> [title]
+# Order is the whole point of this bug — scope_covered:all must win even
+# when delivery:partial was already applied by a PRIOR sweep, or the label
+# the hold-mail tells a human to add ("add label scope_covered:all and close
+# manually") has no effect and the bead is held forever (the real wa-agkop
+# case cited in the bug report).
+echo "── 8b. task_reconciler_is_partial precedence (DEFEITO 4) ──"
+if task_reconciler_is_partial 1 1 "" "" >/dev/null 2>&1; then
+  bad "ja-partial + scope_covered:all -> ainda segura (o bug real: scope_covered:all nunca vence)"
+else
+  ok "ja-partial + scope_covered:all -> libera (scope_covered:all vence, nao fica preso para sempre)"
+fi
+rc0 task_reconciler_is_partial 1 0 "" ""   # already held, no override -> stays held (dedup preserved)
+rc1 task_reconciler_is_partial 0 1 "$UPPER_LIST" ""   # override alone releases even with partial-looking text
+rc0 task_reconciler_is_partial 0 0 "$UPPER_LIST" ""   # neither flag: falls through to the real heuristic
+rc1 task_reconciler_is_partial 0 0 "Corrigido o bug relatado. Nenhuma mudanca adicional necessaria." ""   # neither flag, clean text: not partial
 
 echo ""
 echo "═══════════════════════════════════════"
