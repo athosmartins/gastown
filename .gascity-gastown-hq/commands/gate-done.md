@@ -210,7 +210,14 @@ case "$BRANCH" in
     ;;
   */*)
     _BRANCH_SEG=${BRANCH#*/}
-    BEAD_ID=$(echo "$BRANCH" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}-' \
+    # ga-ghnff9: the trailing '-' after the bead id is OPTIONAL — a bare
+    # <prefix>/<bead-id> branch with no '-desc' suffix (e.g. fix/ga-okcgb) has
+    # nothing after the id at all, and requiring a literal '-' made the whole
+    # match fail, leaving BEAD_ID empty even though the id is right there.
+    # Accept either a '-' (desc follows) or end-of-string (bare id) right
+    # after the id token — mirrors how the crew/*/* case above already
+    # accepts a bare id via its "$BEAD_ID"|"$BEAD_ID"-* guard.
+    BEAD_ID=$(echo "$BRANCH" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}(-|$)' \
       | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo "")
     ;;
   *)

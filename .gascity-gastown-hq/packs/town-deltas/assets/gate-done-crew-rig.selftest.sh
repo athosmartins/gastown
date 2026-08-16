@@ -131,6 +131,35 @@ extract_bead_from_branch() {
       fi
       ;;
     *)
+      # ga-ghnff9: trailing '-' is OPTIONAL — a bare <prefix>/<bead-id> branch
+      # (no '-desc' suffix) has nothing after the id, so the '$' alternative
+      # matches end-of-string in place of the '-' — see the deployed source
+      # for the full rationale.
+      bead=$(echo "$branch" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}(-|$)' \
+        | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo "")
+      ;;
+  esac
+  printf '%s' "$bead"
+}
+
+# extract_bead_from_branch_prebug <branch> — replica of the ORIGINAL
+# (pre-ga-ghnff9) generic-case regex: requires a LITERAL trailing '-'
+# immediately after the bead id, so a bare (no-desc) branch never matches.
+# The crew/*/* arm is unchanged (that convention already handled bare ids).
+extract_bead_from_branch_prebug() {
+  local branch="$1" bead="" seg
+  case "$branch" in
+    crew/*/*)
+      seg=${branch#crew/*/}
+      bead=$(printf '%s\n' "$seg" | grep -oE '^[a-z]{2,8}-[a-z0-9]{2,8}(\.[0-9]+)?' | head -1 2>/dev/null || echo "")
+      if [ -n "$bead" ]; then
+        case "$seg" in
+          "$bead"|"$bead"-*) : ;;
+          *) bead="" ;;
+        esac
+      fi
+      ;;
+    *)
       bead=$(echo "$branch" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}-' \
         | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo "")
       ;;
@@ -1374,6 +1403,68 @@ if [ -f "$GATE_DONE" ]; then
   fi
 else
   bad "(W) gate-done.md not found at $GATE_DONE"
+fi
+
+# ── (X) ga-ghnff9: a bare <prefix>/<bead-id> branch with NO '-desc' suffix
+#    (e.g. fix/ga-okcgb) failed to resolve at all — a DIFFERENT failure mode
+#    than ga-3xuanq's silent truncation (missing-match vs wrong-match),
+#    found while fixing ga-3xuanq in the exact same case block and scoped
+#    out at the time. The generic '*/*)' arm's first grep required a
+#    literal trailing '-' right after the bead id; a bare id has nothing
+#    after it at all, so the match failed outright, BEAD_ID came back
+#    empty, and Step 2 hit the fail-closed guard: "ERROR: Cannot resolve
+#    owning story bead...". Live incidents: fix/ga-okcgb (2026-08-13) and
+#    fix/ga-7mbry (2026-08-09), both hand-worked around by renaming the
+#    branch to add a throwaway -desc suffix.
+
+# (X1) primary repro: bare generic branch, no desc suffix at all.
+B=$(extract_bead_from_branch "fix/ga-okcgb")
+[ "$B" = "ga-okcgb" ] \
+  && ok "(X1) fix/ga-okcgb -> ga-okcgb, bare id resolves (got: $B)" \
+  || bad "(X1) bare generic branch -> expected ga-okcgb, got: '$B'"
+
+# (X2) mutation guard: the ORIGINAL (pre-ga-ghnff9) generic regex, given the
+# EXACT (X1) repro, returns empty — proves (X1) would have caught the live
+# fix/ga-okcgb incident, not just happened to pass either way.
+B=$(extract_bead_from_branch_prebug "fix/ga-okcgb")
+[ -z "$B" ] \
+  && ok "(X2) mutation check: pre-fix generic regex returns empty on a bare branch, reproducing the fix/ga-okcgb incident" \
+  || bad "(X2) mutation check: pre-fix replica unexpectedly produced '$B' — (X1) would not catch a reversion"
+
+# (X3) control: a real '-desc' suffix still resolves exactly as before — no
+# regression on the case this regex already handled correctly.
+B=$(extract_bead_from_branch "fix/ga-dx5-my-fix")
+[ "$B" = "ga-dx5" ] \
+  && ok "(X3) control: fix/ga-dx5-my-fix still resolves to ga-dx5 (got: $B)" \
+  || bad "(X3) control regression: expected ga-dx5, got: '$B'"
+
+# (X4) control: the crew/*/* arm (a separate case branch, untouched by this
+# fix) still resolves a bare crew id exactly as before.
+B=$(extract_bead_from_branch "crew/thies/ga-dx5")
+[ "$B" = "ga-dx5" ] \
+  && ok "(X4) control: crew/thies/ga-dx5 (bare, crew convention) still resolves to ga-dx5 (got: $B)" \
+  || bad "(X4) control regression: expected ga-dx5, got: '$B'"
+
+# (X5) end-to-end: the bare id survives the FULL pipeline (extraction +
+# prefix-store existence probe), not just the low-level regex — a real bead
+# that exists in a non-HQ rig store, referenced by a bare fix/* branch.
+B=$(resolve_bead_id_from_branch "fix/wa-27jn")
+[ "$B" = "wa-27jn" ] \
+  && ok "(X5) end-to-end: fix/wa-27jn resolves through the full pipeline (got: $B)" \
+  || bad "(X5) end-to-end regression: expected wa-27jn, got: '$B'"
+
+# (X6) source drift-guard: deployed gate-done.md's generic-case regex
+# carries the '(-|$)' alternation, not just a literal trailing '-'.
+if [ -f "$GATE_DONE" ]; then
+  src=$(cat "$GATE_DONE")
+  printf '%s' "$src" | grep -qF 'ga-ghnff9' \
+    && ok "(X6a) gate-done.md references the ga-ghnff9 fix" \
+    || bad "(X6a) gate-done.md missing the ga-ghnff9 fix marker (regression)"
+  printf '%s' "$src" | grep -qF '[a-z]{2,8}-[a-z0-9]{2,8}(-|$)' \
+    && ok "(X6b) gate-done.md's generic-case regex accepts end-of-string as an alternative to a trailing '-'" \
+    || bad "(X6b) gate-done.md's generic-case regex missing the '(-|\$)' alternation (ga-ghnff9 regression)"
+else
+  bad "(X6) gate-done.md not found at $GATE_DONE"
 fi
 
 echo
