@@ -50,7 +50,7 @@ fi
 
 # Pin the exclude sets the pure plumbing classifier reads (the dispatcher sets
 # defaults; we re-assert them so the selftest is hermetic).
-CONTEXT_CHECK_EXCLUDE_LABELS="gt:agent gt:rig gt:convoy gc:nudge digest pinned"
+CONTEXT_CHECK_EXCLUDE_LABELS="gt:agent gt:rig gt:convoy gc:nudge digest pinned gt:message"
 CONTEXT_CHECK_EXCLUDE_PREFIXES="type:quality-gate gate-status: nudge: reviewer-index: verdict: refino-gate: auto-refino: gate-reclaim-count: order-run: ctx:"
 # Pin heuristic thresholds so length-based assertions are deterministic.
 CONTEXT_CHECK_THIN_MAXLEN=40
@@ -83,6 +83,10 @@ echo "Scenario 2: plumbing exclusion — engine-internal coordination is NOT hum
 # Mayor's pre-restart capture of unsubmitted Athos instructions) — not human
 # work to be judged/dispatched.
 [ "$(context_check_is_plumbing "ga-x" "pinned" "false")" = "yes" ]                    && ok "pinned label → plumbing (ga-gzv7g)" || bad "pinned → expected plumbing"
+# ga-4yii8z: gt:message marks a self-continuity handoff/patrol note an agent
+# leaves for itself across session cycling (e.g. "🤝 HANDOFF: Patrol cycling")
+# — same shape as pinned above, not human work to be judged/dispatched.
+[ "$(context_check_is_plumbing "ga-x" "gt:message" "false")" = "yes" ]                && ok "gt:message label → plumbing (ga-4yii8z)" || bad "gt:message → expected plumbing"
 
 # ── Scenario 3: idempotence — an already-judged bead is never re-judged ───────
 echo "Scenario 3: idempotence / anti-loop (ga-it11w lesson) — ctx:* already present"
@@ -253,6 +257,12 @@ echo "Scenario 4b: context_check_is_candidate composes type+plumbing+ctx+lifecyc
 [ "$(context_check_is_candidate "ga-sxbvj" "task" "pinned" "false" "no")" = "no" ] \
   && ok "pinned bead (task, label=pinned) → NOT a candidate (ga-gzv7g)" \
   || bad "REGRESSION ga-gzv7g: pinned preservation-note bead would be armed ctx:ready+exec:auto with nothing to build"
+# ga-4yii8z: the exact dc-etn4/dc-3okx/dc-oq0g shape — a self-continuity
+# handoff/patrol note (label=gt:message, no other park label) — must never be
+# granted candidacy in the first place, same gate as the pinned case above.
+[ "$(context_check_is_candidate "dc-etn4" "task" "gt:message" "false" "no")" = "no" ] \
+  && ok "gt:message bead (task, label=gt:message) → NOT a candidate (ga-4yii8z)" \
+  || bad "REGRESSION ga-4yii8z: gt:message handoff-note bead would be armed ctx:ready+exec:auto with nothing to build"
 # ga-mzkx2: the exact ga-tdaeq shape — a freshly-minted sling-task stub (task,
 # "fix bug <id>: ..." title, 0-char description, no labels yet) — must never be
 # granted candidacy (and thus never get ctx:thin), so Step 1c's dog-pool probe

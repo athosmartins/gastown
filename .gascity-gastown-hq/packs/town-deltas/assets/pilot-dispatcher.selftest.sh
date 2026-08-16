@@ -1281,6 +1281,23 @@ PINNED_NOTE='[{"id":"bd-pinned-note","assignee":null,"labels":["ctx:ready","exec
 [ "$(_fc "$PINNED_NOTE")" = '["bd-free8"]' ] && ok "ga-gzv7g: pinned bead excluded; free story:approved kept (permanent-reference note honored)" || bad "ga-gzv7g: pinned not excluded (got: $(_fc "$PINNED_NOTE"))"
 grep -qE '"pinned"' "$DISPATCHER" && ok "_filter_candidates carries the pinned clause" || bad "pinned clause missing from _filter_candidates"
 
+# ── Scenario 3e2m (ga-4yii8z): gt:message excluded from candidates ────────────
+# Same shape as ga-gzv7g's pinned fix, one label over: gt:message marks a
+# self-continuity handoff/patrol note an agent leaves for itself across
+# session cycling ("🤝 HANDOFF: Patrol cycling", "Context cycling. Check bd
+# ready for pending work.") — not build work. Confirmed live: dc-etn4
+# (gastown/refinery), dc-3okx (whatsapp_automation/refinery), dc-oq0g
+# (whatsapp_automation/digo) were all dispatched via the TIER2 fallback
+# ("no open bugs/tech-debt") as ordinary feature stories with empty AC/
+# Estrela Guia/Equilíbrios (ga-f9j0iq/ga-bfkhmx/ga-o3y4uo slings) — one
+# reached in_progress before the assigned dog read the full body and stood
+# down. _filter_candidates must exclude gt:message the same static way it
+# excludes pinned/story:blocked/on-device.
+echo "Scenario 3e2m (ga-4yii8z): gt:message bead is excluded from the candidate pool (self-continuity handoff note, not build work)"
+GT_MESSAGE_NOTE='[{"id":"bd-handoff-note","assignee":null,"labels":["gt:message","pilot:dispatched","story:in-flight"],"description":"x"},{"id":"bd-free9","assignee":null,"labels":["story:approved"],"description":"x"}]'
+[ "$(_fc "$GT_MESSAGE_NOTE")" = '["bd-free9"]' ] && ok "ga-4yii8z: gt:message bead excluded; free story:approved kept (handoff note honored)" || bad "ga-4yii8z: gt:message not excluded (got: $(_fc "$GT_MESSAGE_NOTE"))"
+grep -qE '"gt:message"' "$DISPATCHER" && ok "_filter_candidates carries the gt:message clause" || bad "gt:message clause missing from _filter_candidates"
+
 # ── Scenario 3e2k (ga-xdukc/ga-hd87d): DECISAO-titled / Athos-decide-phrased beads
 # excluded via body-text veto, independent of labels ────────────────────────────
 # wa-5ch02 ("DECISAO (Athos): classificacao deve pagar conexoes (R$0,32/CPF) ou

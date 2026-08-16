@@ -57,11 +57,11 @@
     <!-- Pin the plumbing exclude set at the deployment layer (defense-in-depth so
          launchd never runs the daemon with an empty exclude set). This env var
          WINS over the script's own default (${VAR:-default} only applies when
-         unset) — ga-aq5cw's `digest` addition (and ga-gzv7g's `pinned`) must be
-         mirrored here too, or the script-level fix is a silent no-op in the
-         actual running daemon. -->
+         unset) — ga-aq5cw's `digest` addition (ga-gzv7g's `pinned`, ga-4yii8z's
+         `gt:message`) must be mirrored here too, or the script-level fix is a
+         silent no-op in the actual running daemon. -->
     <key>CONTEXT_CHECK_EXCLUDE_LABELS</key>
-    <string>gt:agent gt:rig gt:convoy gc:nudge digest pinned</string>
+    <string>gt:agent gt:rig gt:convoy gc:nudge digest pinned gt:message</string>
     <key>CONTEXT_CHECK_EXCLUDE_PREFIXES</key>
     <string>type:quality-gate gate-status: nudge: reviewer-index: verdict: refino-gate: auto-refino: gate-reclaim-count: order-run: ctx:</string>
   </dict>

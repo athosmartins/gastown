@@ -130,7 +130,12 @@ CONTEXT_CHECK_EXEC_CLASS="${CONTEXT_CHECK_EXEC_CLASS:-1}"
 # digest above: often an operational action, not code, so granting
 # ctx:ready+exec:auto armed a pinned note (ga-sxbvj) for ordinary Tier-2
 # feature dispatch (ga-lvtqi) with nothing to build.
-CONTEXT_CHECK_EXCLUDE_LABELS="${CONTEXT_CHECK_EXCLUDE_LABELS:-gt:agent gt:rig gt:convoy gc:nudge digest pinned}"
+# `gt:message` (ga-4yii8z): a self-continuity handoff/patrol note an agent
+# leaves for itself across session cycling (e.g. "🤝 HANDOFF: Patrol
+# cycling"). Same shape as pinned above — dc-etn4/dc-3okx/dc-oq0g were
+# dispatched via the TIER2 fallback as ordinary feature stories with nothing
+# to build.
+CONTEXT_CHECK_EXCLUDE_LABELS="${CONTEXT_CHECK_EXCLUDE_LABELS:-gt:agent gt:rig gt:convoy gc:nudge digest pinned gt:message}"
 # Label PREFIXES that mark plumbing (matched as startswith). Covers the gate
 # marker/run/verdict family, gate-status:*, nudge:*, reviewer-index:*, source:*,
 # and the ctx:* family itself (idempotence).

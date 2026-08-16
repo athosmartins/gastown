@@ -2356,6 +2356,19 @@ _filter_candidates() {
           # the full body before forcing a fake branch/gate-done. Honor it
           # the same static way as story:blocked/on-device above.
           or . == "pinned"
+          # ga-4yii8z: gt:message marks a self-continuity handoff/patrol note
+          # an agent leaves for itself across session cycling (e.g. "🤝
+          # HANDOFF: Patrol cycling", "Context cycling. Check bd ready for
+          # pending work."). Same shape as pinned above: nothing previously
+          # excluded it here, so dc-etn4/dc-3okx/dc-oq0g (owned by
+          # gastown/refinery, whatsapp_automation/refinery,
+          # whatsapp_automation/digo respectively) were dispatched via the
+          # TIER2 "no open bugs/tech-debt" fallback as ordinary feature
+          # stories with empty AC/Estrela Guia/Equilíbrios (ga-f9j0iq/
+          # ga-bfkhmx/ga-o3y4uo slings) — one reached in_progress before the
+          # assigned dog read the full body and stood down. Honor it the
+          # same static way as pinned.
+          or . == "gt:message"
         )) | length) == 0
         and ((.description // "") | test("\\S"))
         # ga-vhyd: needs:engine-window (excluded above via --exclude-label at
@@ -2510,6 +2523,7 @@ _filter_candidates() {
               or . == "framework:engine"
               or . == "story:awaiting-external-merge"
               or . == "pinned"
+              or . == "gt:message"
             ))) as $bl
             | if ($bl | length) > 0 then "blocking-label:\($bl | join(","))" else empty end ),
           (if ((($b.description // "") | test("\\S")) | not) then "empty-description" else empty end),
