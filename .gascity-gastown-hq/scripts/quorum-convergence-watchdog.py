@@ -431,10 +431,9 @@ def _convene_quorum(bead: dict, quorum_crews: list[str], now: float) -> str | No
     # Mark original bead as quorum:convening.
     _run([BD, "label", "add", bid, "quorum:convening", "-q"], timeout=BD_TIMEOUT)
     _run([BD, "update", bid,
-          "--metadata", json.dumps({
-              "quorum.session_id": quorum_id,
-              "quorum.convened_at": int(now),
-          })], timeout=BD_TIMEOUT)
+          "--set-metadata", "quorum.session_id=%s" % quorum_id,
+          "--set-metadata", "quorum.convened_at=%d" % int(now)],
+         timeout=BD_TIMEOUT)
 
     # Nudge each crew with the quorum request.
     nudge_msg = (

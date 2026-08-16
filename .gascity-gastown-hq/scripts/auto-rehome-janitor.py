@@ -357,10 +357,11 @@ def _bd_update_metadata(rig_root, bead_id, merged_metadata):
         return True
     if _bd_update_fn is not None:
         return _bd_update_fn(rig_root, bead_id, merged_metadata)
-    r = _sh([BD_BIN, "-C", rig_root, "update", bead_id,
-             "--metadata", json.dumps(merged_metadata),
-             "--actor", "auto-rehome-janitor"],
-            timeout=BD_TIMEOUT)
+    cmd = [BD_BIN, "-C", rig_root, "update", bead_id]
+    for k, v in merged_metadata.items():
+        cmd += ["--set-metadata", "%s=%s" % (k, v)]
+    cmd += ["--actor", "auto-rehome-janitor"]
+    r = _sh(cmd, timeout=BD_TIMEOUT)
     return bool(r and r.returncode == 0)
 
 
@@ -1339,6 +1340,56 @@ def _selftest():
     else:
         _bad("(q)", "created=%s closed=%s" % (created, closed))
     globals()["_file_exists_fn"] = None
+
+    # ── (r) ga-c9gwhu: _bd_update_metadata must use --set-metadata (additive),
+    # never --metadata (whole-object replace) — a concurrent write the caller's
+    # in-memory snapshot doesn't know about must survive the update.
+    print("\nScenario (r): _bd_update_metadata uses --set-metadata (additive) — survives a key it didn't write")
+    globals()["_bd_update_fn"] = None  # exercise the REAL _sh(...) path, not the test seam
+    _sh_orig_r = globals()["_sh"]
+    meta_store = {"ga-meta-test": {
+        "gc.routed_to": "gastown.dog",
+        "gc.session_name": "keepme",
+        "pilot.concurrent": "written-after-caller-snapshot",
+    }}
+
+    class _FakeCP:
+        returncode = 0
+
+    def _fake_sh_metadata(args, timeout=20):
+        bead_id = args[4]  # [BD_BIN, "-C", rig_root, "update", bead_id, ...]
+        bead = meta_store.setdefault(bead_id, {})
+        i = 5
+        while i < len(args):
+            if args[i] == "--metadata":
+                bead.clear()
+                bead.update(json.loads(args[i + 1]))
+                i += 2
+            elif args[i] == "--set-metadata":
+                k, _, v = args[i + 1].partition("=")
+                bead[k] = v
+                i += 2
+            else:
+                i += 1
+        return _FakeCP()
+
+    globals()["_sh"] = _fake_sh_metadata
+    # Caller's merged_metadata simulates a snapshot taken BEFORE "pilot.concurrent"
+    # was written by someone else — it does not mention that key at all.
+    ok_r = _bd_update_metadata("/hq", "ga-meta-test", {
+        "gc.routed_to": "gastown.dog",
+        "gc.session_name": "keepme",
+        "gc.rehomed_to": "ps-999",
+    })
+    globals()["_sh"] = _sh_orig_r
+    survived = meta_store["ga-meta-test"]
+    if (ok_r and survived.get("pilot.concurrent") == "written-after-caller-snapshot"
+            and survived.get("gc.routed_to") == "gastown.dog"
+            and survived.get("gc.session_name") == "keepme"
+            and survived.get("gc.rehomed_to") == "ps-999"):
+        _ok("(r): --set-metadata is additive — concurrent key survives, new key lands")
+    else:
+        _bad("(r)", "ok=%s store=%s" % (ok_r, survived))
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[rehome selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
