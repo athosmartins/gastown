@@ -532,9 +532,10 @@ else:
 # pin the ported equivalent here.
 
 class _FakeResult:
-    def __init__(self, returncode, stdout):
+    def __init__(self, returncode, stdout, stderr=""):
         self.returncode = returncode
         self.stdout = stdout
+        self.stderr = stderr
 
 def _fake_sh(responses):
     """Stand-in for m.sh() keyed on the last arg (the sysctl key). Missing
@@ -795,6 +796,127 @@ finally:
     m.LIVENESS_RESAMPLE_SEC = _real_resample_42
     m.RECOVERY_LOG = _real_reclog_42
     os.unlink(_tmp_reclog_42.name)
+
+# ── ga-o2dlg8: _close_pending_verdicts_for_run actually closes in production ──
+# ga-9as9h built this reclaim step but its `bd close` call (no --force, no
+# explicit actor override) refuses deterministically: the watchdog's own actor
+# resolves to "automation" (BD_ACTOR in the launchd plist), which never
+# matches a verdict bead's assignee (a per-session name). Confirmed live:
+# every real close attempt since ga-9as9h shipped failed silently (only 4
+# close_pending_verdict_on_supersede ledger events ever, all from the
+# 2026-08-10 TESTCTX selftest run, zero from real production triggers) while
+# the "Closing this verdict bead" comment was posted unconditionally BEFORE
+# the close was even attempted — so the bead's own thread narrated success
+# that never happened. These two scenarios drive the REAL function against a
+# fake `bd` that reproduces the exact observed refusal (verified live via
+# `env -u BEADS_ACTOR BD_ACTOR=automation bd close <id>` — see ga-o2dlg8), so
+# Scenario RECLAIM-1 would FAIL against the pre-fix code (no --force in the
+# close argv -> the fake refuses -> closed stays empty) and only PASSES once
+# --force is present. RECLAIM-2 is the negative control: even with --force,
+# an unrelated close failure (Dolt hiccup, etc.) must be reported, never
+# silently claimed as success.
+
+FIXTURE_RID = "ga-fixture-run-o2dlg8"
+FIXTURE_VID = "ga-fixture-verdict-o2dlg8"
+
+def _mk_pending_verdict_row(vid):
+    return {"id": vid, "status": "in_progress", "assignee": "gate-reviewer-adhoc-fixture"}
+
+print("Scenario RECLAIM-1: close succeeds only once --force is sent (reproduces the real actor!=assignee refusal)")
+_calls_r1 = []
+def _fake_sh_reclaim1(args, timeout=20, stdin=None):
+    _calls_r1.append(list(args))
+    if args and args[0] == "bash":
+        return _FakeResult(0, m.json.dumps([_mk_pending_verdict_row(FIXTURE_VID)]))
+    if "close" in args:
+        if "--force" in args:
+            return _FakeResult(0, "")
+        return _FakeResult(1, "", 'cannot close %s: assignee is "gate-reviewer-adhoc-fixture", actor is "automation"; reclaim or use --force to override' % FIXTURE_VID)
+    if "comment" in args:
+        return _FakeResult(0, "")
+    return _FakeResult(0, "")
+
+_real_sh_r1 = m.sh
+_real_reclog_r1 = m.RECOVERY_LOG
+_tmp_reclog_r1 = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
+_tmp_reclog_r1.close()
+m.RECOVERY_LOG = _tmp_reclog_r1.name
+m.sh = _fake_sh_reclaim1
+m.GRW_ENABLED = True
+m.GRW_SUPERSEDE_RECLAIM_VERDICTS_ENABLED = True
+m.GRW_DRY_RUN = False
+try:
+    closed_r1 = m._close_pending_verdicts_for_run(FIXTURE_RID, "run superseded", "RECLAIM1")
+finally:
+    m.sh = _real_sh_r1
+    ledger_r1 = [m.json.loads(l) for l in open(_tmp_reclog_r1.name) if l.strip()]
+    m.RECOVERY_LOG = _real_reclog_r1
+    os.unlink(_tmp_reclog_r1.name)
+
+close_calls_r1 = [c for c in _calls_r1 if "close" in c]
+comment_calls_r1 = [c for c in _calls_r1 if "comment" in c]
+if len(close_calls_r1) == 1 and "--force" in close_calls_r1[0]:
+    ok("close call carries --force (the real fix -- pre-fix code never sent this)")
+else:
+    bad("expected exactly one close call containing --force, got %r" % (close_calls_r1,))
+if closed_r1 == [FIXTURE_VID]:
+    ok("verdict bead reported closed after the forced close succeeded")
+else:
+    bad("expected closed==[%r], got %r" % (FIXTURE_VID, closed_r1))
+if len(comment_calls_r1) == 1 and "Closed this verdict bead" in comment_calls_r1[0][-1]:
+    ok("success comment uses past tense ('Closed', not 'Closing') and was posted")
+else:
+    bad("expected exactly one past-tense success comment, got %r" % (comment_calls_r1,))
+if comment_calls_r1 and close_calls_r1 and _calls_r1.index(comment_calls_r1[0]) > _calls_r1.index(close_calls_r1[0]):
+    ok("comment posted AFTER the close call, not before -- fixes the unconditional-announce bug")
+else:
+    bad("expected the comment call to occur strictly after the close call in %r" % (_calls_r1,))
+success_events_r1 = [e for e in ledger_r1 if e.get("event") == "close_pending_verdict_on_supersede"]
+if len(success_events_r1) == 1 and success_events_r1[0].get("verdict") == FIXTURE_VID:
+    ok("ledger recorded close_pending_verdict_on_supersede for the closed bead")
+else:
+    bad("expected one close_pending_verdict_on_supersede ledger event for %r, got %r" % (FIXTURE_VID, ledger_r1))
+
+print("Scenario RECLAIM-2: close fails even WITH --force (e.g. unrelated Dolt hiccup) -> reported, never silently claimed as success")
+_calls_r2 = []
+def _fake_sh_reclaim2(args, timeout=20, stdin=None):
+    _calls_r2.append(list(args))
+    if args and args[0] == "bash":
+        return _FakeResult(0, m.json.dumps([_mk_pending_verdict_row(FIXTURE_VID)]))
+    if "close" in args:
+        return _FakeResult(1, "", "dolt: connection refused")
+    if "comment" in args:
+        return _FakeResult(0, "")
+    return _FakeResult(0, "")
+
+_real_sh_r2 = m.sh
+_real_reclog_r2 = m.RECOVERY_LOG
+_tmp_reclog_r2 = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
+_tmp_reclog_r2.close()
+m.RECOVERY_LOG = _tmp_reclog_r2.name
+m.sh = _fake_sh_reclaim2
+try:
+    closed_r2 = m._close_pending_verdicts_for_run(FIXTURE_RID, "run superseded", "RECLAIM2")
+finally:
+    m.sh = _real_sh_r2
+    ledger_r2 = [m.json.loads(l) for l in open(_tmp_reclog_r2.name) if l.strip()]
+    m.RECOVERY_LOG = _real_reclog_r2
+    os.unlink(_tmp_reclog_r2.name)
+
+comment_calls_r2 = [c for c in _calls_r2 if "comment" in c]
+if closed_r2 == []:
+    ok("a real close failure does NOT get reported as closed")
+else:
+    bad("expected closed==[] on close failure, got %r" % (closed_r2,))
+if not any("Closed this verdict bead" in c[-1] for c in comment_calls_r2):
+    ok("no success comment posted when the close actually failed -- the exact ga-1pej8n regression this fix closes")
+else:
+    bad("posted a success comment despite the close failing: %r" % (comment_calls_r2,))
+failed_events_r2 = [e for e in ledger_r2 if e.get("event") == "close_pending_verdict_on_supersede_FAILED"]
+if len(failed_events_r2) == 1 and failed_events_r2[0].get("returncode") == 1 and "dolt" in failed_events_r2[0].get("stderr", ""):
+    ok("ledger recorded the FAILED event with returncode+stderr for diagnosis -- symmetric with this function's existing query-failure fail-safe prints")
+else:
+    bad("expected one close_pending_verdict_on_supersede_FAILED ledger event with returncode/stderr, got %r" % (ledger_r2,))
 
 print("")
 print("Results: %d passed, %d failed" % (PASS, FAIL))

@@ -1868,14 +1868,43 @@ def _close_pending_verdicts_for_run(rid, reason, context):
             _recovery_ledger("would_close_pending_verdict",
                              {"run": rid, "verdict": vid, "context": context, "dry_run": True})
             continue
-        sh(["bd", "-C", CITY, "comment", vid,
-            "gate-recovery-watchdog %s: %s. Closing this verdict bead — its run %s is superseded and can never land a usable verdict; nobody should keep working it. (ga-9as9h)"
-            % (context, reason, rid)], timeout=25)
-        cr = sh(["bd", "-C", CITY, "close", vid, "-r",
+        # ga-o2dlg8: this watchdog's own actor resolves to "automation" (see
+        # BD_ACTOR in the launchd plist), which never matches a verdict
+        # bead's assignee (a per-session name like gate-reviewer-adhoc-XXXX)
+        # — bd close's ownership guard refuses that deterministically, every
+        # time, unless --force is passed (the guard's own error message
+        # names --force as the override). Confirmed safe by this function's
+        # own docstring: closing an already-superseded run's verdict bead is
+        # idempotent, never destructive. --force also bypasses the
+        # pinned/unsatisfied-gates checks bd close --help documents, but
+        # neither applies to a quality-gate-verdict bead.
+        cr = sh(["bd", "-C", CITY, "close", vid, "--force", "-r",
                  "verdict moot: run %s superseded (grw %s verdict-reclaim, ga-9as9h)" % (rid, context)], timeout=25)
         if cr and cr.returncode == 0:
+            # ga-o2dlg8: only claim success — in the comment, the ledger,
+            # and the caller's `closed` list — AFTER the close is verified.
+            # The prior version posted this comment unconditionally BEFORE
+            # attempting the close, so every deterministic close failure
+            # above left a bead thread narrating "Closing this verdict
+            # bead" in present tense while the bead sat in_progress forever
+            # — the exact shape ga-1pej8n's half of this bug named ("code
+            # announces success without verifying it").
+            sh(["bd", "-C", CITY, "comment", vid,
+                "gate-recovery-watchdog %s: %s. Closed this verdict bead — its run %s is superseded and can never land a usable verdict; nobody should keep working it. (ga-9as9h)"
+                % (context, reason, rid)], timeout=25)
             closed.append(vid)
             _recovery_ledger("close_pending_verdict_on_supersede", {"run": rid, "verdict": vid, "context": context})
+        else:
+            # ga-o2dlg8: symmetric with this function's existing query-failure
+            # fail-safe prints above — a close failure must be as visible in
+            # the sweep log/ledger as a query failure already is, not silent.
+            stderr_snip = ((cr.stderr or "") if cr else "(sh() returned None — exception or timeout)")[:300]
+            print("[watchdog] %s: gate-run:%s verdict=%s CLOSE FAILED (returncode=%s): %s"
+                  % (context, rid, vid, (cr.returncode if cr else "N/A"), stderr_snip), flush=True)
+            _recovery_ledger("close_pending_verdict_on_supersede_FAILED",
+                             {"run": rid, "verdict": vid, "context": context,
+                              "returncode": (cr.returncode if cr else None),
+                              "stderr": stderr_snip})
     if closed:
         print("[watchdog] %s: closed %d pending verdict bead(s) for superseded run=%s: %s"
               % (context, len(closed), rid, ",".join(closed)), flush=True)
