@@ -173,7 +173,7 @@
 # basis alone), so the ONLY way an assignee survives here with status still
 # open is a hand-off/hand-assignment gap, which is exactly the "already
 # owned, don't also route to the pool" state this exclusion exists to catch.
-# See pilot-missing-route-watchdog.selftest scenario 46.
+# See this script's own --selftest scenario 46.
 #
 # What's left: status=open, NOT epic, ctx:ready AND exec:auto BOTH present
 # (the "looks ready in the panel" signal ga-f54ui's own text uses),
