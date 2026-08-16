@@ -198,6 +198,19 @@ STALE_REVIEW_MARKER_MINUTES = int(os.environ.get("GRW_STALE_REVIEW_MARKER_MINUTE
 STALE_REVIEW_MAX_PER_SWEEP = int(os.environ.get("GRW_STALE_REVIEW_MAX_PER_SWEEP", "5"))
 STALE_REVIEW_MAX_ATTEMPTS = int(os.environ.get("GRW_STALE_REVIEW_MAX_ATTEMPTS", "3"))  # after K requeues of the SAME marker (reviewers keep dying on this branch), escalate to needs-human instead of an infinite re-review loop
 GRW_STALE_REVIEW_LABEL_RE = re.compile(r"^grw-stale-review:(\d+)$")                 # restart-safe per-marker stale-review requeue counter
+# ga-bt12x0: durable anchor for "when did THIS marker's CURRENT gate-status begin"
+# — every FIX 4/6 staleness check below used to read `now - updated_at`, but
+# EVERY gate-status transition (this watchdog's own set_gate_status_py, its shell
+# twin, or a human's raw `bd label add`) is a label-only mutation, and `bd label
+# add`/`remove` never bumps updated_at (confirmed empirically: created_at ==
+# updated_at survived a label add+remove; only `bd update`/`--set-metadata`
+# moved it). So `now - updated_at` silently measured time since the bead's last
+# NON-label write, not time since the current status began — a manual
+# parked-needs-human -> queued re-queue left updated_at frozen ~190min in the
+# past, and the very next sweep read that as ancient and re-parked it within a
+# minute, making manual recovery useless (the ga-tyi7k3/wa-campanha-diaria
+# incident this bead is filed from). See gate_status_anchor_verdict() below.
+GRW_STATUS_ANCHOR_KEY = "grw.gate_status_since"                                     # metadata key, value '<status>@<epoch>'
 # FIX 7 — recover a gate-status:deferred marker (ga-y1kk). quality-gate-dispatcher.sh's
 # Step 3 (and quality-gate-guard.sh's own Step 5 copy) fail-safes to gate-status:deferred
 # when AUTHOR cannot be derived (no gate.submitted_by metadata on the marker, no
@@ -1378,6 +1391,54 @@ def _label_value(bead, prefix):
         if lb.startswith(prefix):
             return lb[len(prefix):]
     return ""
+
+
+def gate_status_anchor_verdict(anchor_raw, cur_status, now):
+    """PURE decision (no I/O, unit-tested): given the raw GRW_STATUS_ANCHOR_KEY
+    metadata value ('<status>@<epoch>', or '' if never stamped) and a marker's
+    CURRENT gate-status label, decide the staleness age and whether the anchor
+    needs (re)stamping.
+
+    Returns (age_sec, needs_write):
+      - anchor missing/unparseable, or its recorded status != cur_status: the
+        current status is new to us — either this is the first sweep that has
+        ever looked at this bead, or the label changed since our last sweep
+        (indistinguishable, and both cases must reset the clock the same way,
+        since neither means the CURRENT status is actually stale yet).
+        -> age=0, needs_write=True.
+      - anchor's recorded status == cur_status: the label hasn't moved since we
+        last stamped it.
+        -> age = now - anchor_epoch, needs_write=False."""
+    status_part, sep, epoch_part = (anchor_raw or "").partition("@")
+    epoch = None
+    if sep:
+        try:
+            epoch = float(epoch_part)
+        except (TypeError, ValueError):
+            epoch = None
+    if sep and status_part == cur_status and epoch is not None:
+        return (max(0, int(now - epoch)), False)
+    return (0, True)
+
+
+def _gate_status_age_sec(bead_id, m, cur_status, now):
+    """I/O wrapper around gate_status_anchor_verdict — see GRW_STATUS_ANCHOR_KEY's
+    comment for WHY this exists instead of `now - updated_at` (label-only
+    transitions never bump it) or a live dolt_diff_labels query (a point-query
+    scoped by issue_id still timed out past 20s on a single fresh bead — far too
+    slow for a per-marker per-sweep check). Reads the anchor already present in
+    `m['metadata']` (bd list/show both include it — no extra query), and — only
+    when the PURE verdict says the status just changed — stamps a fresh anchor
+    via `bd update --set-metadata`. Best-effort write: a failure here just means
+    the next sweep tries the stamp again; this sweep's returned age is correct
+    (0) either way. Skips the write entirely under GRW_DRY_RUN, matching every
+    other FIX's dry-run contract in this file (observe only, touch nothing)."""
+    anchor_raw = (m.get("metadata") or {}).get(GRW_STATUS_ANCHOR_KEY, "")
+    age, needs_write = gate_status_anchor_verdict(anchor_raw, cur_status, now)
+    if needs_write and not GRW_DRY_RUN:
+        sh(["bd", "-C", CITY, "update", bead_id, "--set-metadata",
+            "%s=%s@%d" % (GRW_STATUS_ANCHOR_KEY, cur_status, int(now))], timeout=20)
+    return age
 
 
 def set_gate_status_py(bead_id, new_status):
@@ -2662,9 +2723,10 @@ def reap_orphan_and_stale_markers(now):
         mid = m.get("id")
         if not mid:
             continue
-        if _label_value(m, "gate-status:") not in ("queued", "ready", "claimed"):
+        cur_status = _label_value(m, "gate-status:")
+        if cur_status not in ("queued", "ready", "claimed"):
             continue
-        age = int(now - (_iso_epoch(m.get("updated_at")) or now))
+        age = _gate_status_age_sec(mid, m, cur_status, now)  # ga-bt12x0: not `now - updated_at`
         src = _label_value(m, "source-bead:")
         rig = _label_value(m, "bead-rig:") or _label_value(m, "rig:")
         resolved, closed, reviewing, store = _source_review_state(src, rig)
@@ -2793,13 +2855,13 @@ def _requeue_or_escalate_review_marker(mid, m, status, reason, now, rstate, cont
     grw-stale-review:<n> counter: a reviewer dying via one path counts toward the
     other's cap too. `reason` is the caller-specific why-clause folded into the bd
     comment/escalation message; `context` is a short provenance tag ('FIX6'/'FIX3')
-    for logs/ledger. `m` must carry at least id/labels/updated_at (a list row or a
-    _bead_row() fetch both qualify). Returns (action, attempts_shown,
+    for logs/ledger. `m` must carry at least id/labels/metadata/updated_at (a list
+    row or a _bead_row() fetch both qualify). Returns (action, attempts_shown,
     cleared_reviewing) — action is 'requeued'|'escalated'."""
     src = _label_value(m, "source-bead:")
     rig = _label_value(m, "bead-rig:") or _label_value(m, "rig:")
     branch = _label_value(m, "branch:")
-    age = int(now - (_iso_epoch(m.get("updated_at")) or now))
+    age = _gate_status_age_sec(mid, m, status, now)  # ga-bt12x0: not `now - updated_at`
     attempts = 0
     for lb in (m.get("labels") or []):
         mm = GRW_STALE_REVIEW_LABEL_RE.match(str(lb))
@@ -2880,7 +2942,7 @@ def reap_stale_review_markers(now, rstate, open_running_runs):
         status = _label_value(m, "gate-status:")
         if status not in ("dispatching", "reviewing"):
             continue
-        age = int(now - (_iso_epoch(m.get("updated_at")) or now))
+        age = _gate_status_age_sec(mid, m, status, now)  # ga-bt12x0: not `now - updated_at`
         has_open_run = None if open_run_markers is None else (mid in open_run_markers)
         v = stale_review_marker_verdict(status, age, STALE_REVIEW_MARKER_MINUTES * 60, has_open_run)
         if v != "requeue":
@@ -3015,8 +3077,7 @@ def requeue_error_markers(now, rstate):
         mid = mk.get("id")
         if not mid:
             continue
-        upd = _iso_epoch(mk.get("updated_at")) or _iso_epoch(mk.get("created_at"))
-        age = int(now - upd) if upd else 0
+        age = _gate_status_age_sec(mid, mk, "error", now)  # ga-bt12x0: not `now - updated_at`
         labels = mk.get("labels") or []
         source_bead = _label_value(mk, "source-bead:")
         rig_name = _label_value(mk, "bead-rig:")
@@ -3189,8 +3250,7 @@ def requeue_deferred_markers(now, rstate):
         mid = mk.get("id")
         if not mid:
             continue
-        upd = _iso_epoch(mk.get("updated_at")) or _iso_epoch(mk.get("created_at"))
-        age = int(now - upd) if upd else 0
+        age = _gate_status_age_sec(mid, mk, "deferred", now)  # ga-bt12x0: not `now - updated_at`
         labels = mk.get("labels") or []
         source_bead = _label_value(mk, "source-bead:")
         rig_name = _label_value(mk, "bead-rig:")
@@ -3582,8 +3642,7 @@ def recover_needs_rebase_markers(now, rstate):
         mid = mk.get("id")
         if not mid:
             continue
-        upd = _iso_epoch(mk.get("updated_at")) or _iso_epoch(mk.get("created_at"))
-        age = int(now - upd) if upd else 0
+        age = _gate_status_age_sec(mid, mk, "needs-rebase", now)  # ga-bt12x0: not `now - updated_at`
         source_bead = _label_value(mk, "source-bead:")
         rig_name = _label_value(mk, "bead-rig:")
         branch = _label_value(mk, "branch:")
@@ -3854,6 +3913,21 @@ def _selftest():
     # the two forms above name the SAME instant → equal epochs (offset math correct)
     a = _last_active_epoch("2026-07-02T16:06:29-03:00"); b = _last_active_epoch("2026-07-02T19:06:29Z")
     ok(a is not None and b is not None and abs(a - b) < 1, "-03:00 and its UTC-Z equivalent map to the same epoch")
+    # gate_status_anchor_verdict — ga-bt12x0: durable per-marker staleness anchor
+    # (`bd label add`/`remove` — the ONLY mechanism any gate-status transition ever
+    # uses — never bumps a bead's updated_at; only `bd update`/`--set-metadata` do.
+    # This replaces every `now - updated_at` staleness read across FIX 2/4/6/7/
+    # needs-rebase with a watchdog-owned anchor that resets whenever the CURRENT
+    # label doesn't match what was last recorded — whether that's this watchdog's
+    # own prior transition or a human's raw manual relabel, indistinguishable and
+    # both must reset the clock the same way).
+    ok(gate_status_anchor_verdict("", "queued", 1000) == (0, True), "no anchor yet (first sight of this bead) → age=0, stamp needed")
+    ok(gate_status_anchor_verdict("garbage", "queued", 1000) == (0, True), "unparseable anchor (no '@') → age=0, stamp needed (fail-open, never falsely ancient)")
+    ok(gate_status_anchor_verdict("parked-needs-human@100", "queued", 1000) == (0, True), "anchor status != current status (the ga-tyi7k3 manual re-queue shape) → age=0, clock RESET")
+    ok(gate_status_anchor_verdict("queued@100", "queued", 1000) == (900, False), "anchor status == current status → age = now - anchor epoch, no re-stamp")
+    ok(gate_status_anchor_verdict("dispatching@bogus", "dispatching", 1000) == (0, True), "unparseable epoch half → age=0, stamp needed (fail-open)")
+    ok(gate_status_anchor_verdict("dispatching@1000", "dispatching", 1000) == (0, False), "zero elapsed since stamp → age=0, and no re-stamp needed (status already matches)")
+    ok(gate_status_anchor_verdict("dispatching@2000", "dispatching", 1000) == (0, False), "future-dated anchor (clock skew) → clamped to age=0, never negative")
     # FIX 4 — orphan_marker_verdict (queued-marker cleanup; now branch-merge-aware)
     M = 15 * 60
     ok(orphan_marker_verdict(9 * 60, M, True, True, True, "merged") == "wait", "young marker (9m<15m) → wait (spin-up race window)")
