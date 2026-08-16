@@ -2693,6 +2693,43 @@ gate_behind_envelope_action() {
   fi
 }
 
+# gate_ahead_envelope_action <ahead_cap_only_0_1>
+# ga-hzhn6k: decide what to do when a branch is out of the auto-rebase
+# envelope SOLELY because it has more own commits than GATE_REBASE_AHEAD_MAX
+# (ahead_cap_only=1 — the caller only ever passes 1 when the behind-cap and
+# clean-tree guards did NOT also fire; see REBASE_AHEAD_CAP_ONLY's reset
+# logic at each of those guards). By construction this state is ONLY
+# reachable when the merge-tree pre-check already proved the branch merges
+# into main with ZERO conflicts (HAS_CONFLICT=0 gates entry to the whole
+# ahead/behind envelope block) — so there is nothing here for anyone, alive
+# or dead, to resolve. The old behavior recorded "I decided not to attempt
+# the rebase" as HAS_CONFLICT=1/CONFLICT_KIND=transient — indistinguishable
+# from a real failed attempt — which bumped gate:rebase-fail-count and
+# gate:exiled-tier5 every sweep forever, since the branch's own commit count
+# never shrinks on its own (measured: wa-campanha-diaria, ahead=29, 7 cycles,
+# zero reviews). A REBASE would replay each of the N commits individually
+# against a new base (real risk of undetected logical conflicts per-commit —
+# the reason the ahead-cap exists in the first place); a MERGE does not
+# replay anything — it materializes the exact same clean union merge-tree
+# already verified, as a single commit. So the correct action is to
+# re-anchor via merge (reusing ga-kyxih's sibling remedy for the "tip is
+# itself a merge commit" case) instead of exiling into a retry loop that can
+# never self-clear.
+# Echoes "merge_reanchor" | "skip" ("skip" preserves the pre-existing
+# out-of-envelope transient-conflict behavior — still correct for every
+# OTHER out-of-envelope reason: behind-cap-exceeded (ga-6dp9's own,
+# already-correct permanent circuit-break), unclean rig .git dir, mutex
+# held, etc. — none of which this bead touches).
+gate_ahead_envelope_action() {
+  local ahead_cap_only="${1:-0}"
+  case "$ahead_cap_only" in ''|*[!0-9]*) ahead_cap_only=0 ;; esac
+  if [ "$ahead_cap_only" = "1" ]; then
+    printf 'merge_reanchor'
+  else
+    printf 'skip'
+  fi
+}
+
 # gate_base_commit_trust <base_commit> <resolved_commit> <is_ancestor_0_1> <fetch_ok_0_1>
 # ga-iwcu23: decide whether a REBASE_BEHIND measurement is trustworthy enough
 # to justify the PERMANENT behind_dead circuit-break. base_commit is a
@@ -7871,6 +7908,14 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
   # those are independent, already-correctly-severe conditions (ga-6dp9)
   # this bead does not touch.
   REBASE_AHEAD_CAP_ONLY=0
+  # ga-hzhn6k: set below (skip-vs-merge_reanchor decision) only when
+  # REBASE_AHEAD_CAP_ONLY=1 survives to that point. Defined here,
+  # unconditionally, for the same "always defined under set -u" reason as
+  # REBASE_BEHIND_EXCEEDED/BASE_COMMIT_TRUST just above — the call site that
+  # reads it (the container-rig / self-repo merge-vs-rebase branches further
+  # below) runs on every path through this function, including ones where
+  # HAS_CONFLICT was already 1 before this block even started.
+  FORCE_MERGE_REANCHOR=0
 
   if [ "$HAS_CONFLICT" = "0" ]; then
     REBASE_AHEAD=$(git_rig rev-list --count "origin/$DEFAULT_BRANCH..origin/$BRANCH" 2>/dev/null || echo "")
@@ -7950,10 +7995,21 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     fi
 
     if [ "$REBASE_IN_ENVELOPE" = "0" ]; then
-      warn "  Auto-rebase skipped (imp22 envelope): ${REBASE_SKIP_REASON}"
-      HAS_CONFLICT=1
-      CONFLICT_KIND="transient"
-      CONFLICT_FILES="out-of-envelope: ${REBASE_SKIP_REASON}"
+      _AHEAD_ENVELOPE_ACTION=$(gate_ahead_envelope_action "$REBASE_AHEAD_CAP_ONLY")
+      if [ "$_AHEAD_ENVELOPE_ACTION" = "merge_reanchor" ]; then
+        # ga-hzhn6k: do NOT mark this a conflict — merge-tree already proved
+        # the merge clean (that's the only way REBASE_AHEAD_CAP_ONLY=1 gets
+        # here). Leave HAS_CONFLICT=0 so the block below actually attempts
+        # the re-anchor instead of recording a policy decision as a failed
+        # attempt.
+        log "  Branch $BRANCH is $REBASE_AHEAD commits ahead (> GATE_REBASE_AHEAD_MAX=${GATE_REBASE_AHEAD_MAX}) but merge-tree already proved the merge clean — re-anchoring via merge instead of skipping (ga-hzhn6k)."
+        FORCE_MERGE_REANCHOR=1
+      else
+        warn "  Auto-rebase skipped (imp22 envelope): ${REBASE_SKIP_REASON}"
+        HAS_CONFLICT=1
+        CONFLICT_KIND="transient"
+        CONFLICT_FILES="out-of-envelope: ${REBASE_SKIP_REASON}"
+      fi
     fi
   fi
 
@@ -7985,17 +8041,34 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       fi
     fi
 
+    # ga-hzhn6k: human-readable reason for merging instead of rebasing,
+    # shared by both the container-rig and self-repo branches below so the
+    # sweep log and the marker comment always say WHY — distinct from
+    # ga-kyxih's pre-existing tip-is-a-merge-commit reason, so a reader of
+    # either the log or the bead comment never sees "tip was already a merge
+    # commit" attributed to a branch whose tip is a plain, linear commit.
+    _MERGE_NOT_REBASE_WHY=""
+    if [ "$FORCE_MERGE_REANCHOR" = "1" ]; then
+      _MERGE_NOT_REBASE_WHY="ga-hzhn6k: $REBASE_AHEAD commits ahead of GATE_REBASE_AHEAD_MAX=${GATE_REBASE_AHEAD_MAX}, but merge-tree already proved the merge clean — re-anchoring instead of exiling into an unresolvable retry loop"
+    elif [ "$BRANCH_TIP_IS_MERGE_COMMIT" = "1" ]; then
+      _MERGE_NOT_REBASE_WHY="ga-kyxih: tip is itself a merge commit — rebase is not applicable"
+    fi
+
     if [ "$IS_CONTAINER_RIG" = "1" ] && [ "$HAS_CONFLICT" = "0" ]; then
       # Container rig (bare repo): worktree uses the bare .repo.git
       if git_rig worktree add "$TMP_REBASE_WT" "origin/$BRANCH" 2>/dev/null; then
-        if [ "$BRANCH_TIP_IS_MERGE_COMMIT" = "1" ]; then
+        if [ "$BRANCH_TIP_IS_MERGE_COMMIT" = "1" ] || [ "$FORCE_MERGE_REANCHOR" = "1" ]; then
           # ga-kyxih: this branch's own tip is already a merge commit — `git
           # rebase` (the else-branch below) linearizes/mishandles that
           # history (see branch_tip_is_merge_commit() above for why). Use a
           # real `git merge` instead; merge-tree already predicted this would
           # be clean (HAS_CONFLICT=0 to have reached this block at all).
-          log "  Auto-merge (ga-kyxih: tip is itself a merge commit — rebase is not applicable): merging $DEFAULT_BRANCH into $BRANCH instead of rebasing ..."
-          if git -C "$TMP_REBASE_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" merge "origin/$DEFAULT_BRANCH" -m "Merge origin/$DEFAULT_BRANCH into $BRANCH (gate auto-merge — tip was a merge commit, ga-kyxih)" 2>/dev/null; then
+          # ga-hzhn6k: the SAME merge remedy also applies — and is now also
+          # triggered — when the branch is merely too far ahead for the
+          # rebase envelope; see _MERGE_NOT_REBASE_WHY above for which of the
+          # two reasons applies this sweep.
+          log "  Auto-merge (${_MERGE_NOT_REBASE_WHY}): merging $DEFAULT_BRANCH into $BRANCH instead of rebasing ..."
+          if git -C "$TMP_REBASE_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" merge "origin/$DEFAULT_BRANCH" -m "Merge origin/$DEFAULT_BRANCH into $BRANCH (gate auto-merge — ${_MERGE_NOT_REBASE_WHY})" 2>/dev/null; then
             NEW_TIP=$(git -C "$TMP_REBASE_WT" rev-parse HEAD 2>/dev/null || echo "")
             if [ -z "$NEW_TIP" ]; then
               warn "  Auto-merge: rev-parse HEAD after merge returned empty for $BRANCH — treating as push failure"
@@ -8005,8 +8078,8 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               if git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>"$_PUSH_ERR_FILE"; then
                 AUTO_REBASE_OK=1
                 BRANCH_SHA="$NEW_TIP"
-                log "  Auto-merge success: $BRANCH pushed to $NEW_TIP (merged $DEFAULT_BRANCH in — tip was already a merge commit, ga-kyxih)"
-                bd -C "$GC_CITY" comment "$MARKER_ID" "Gate dispatcher auto-merged origin/$DEFAULT_BRANCH into $BRANCH ($MAIN_HEAD_SHA) instead of rebasing — this branch's tip was already a merge commit (ga-kyxih). New tip: $NEW_TIP. Proceeding with review." 2>/dev/null || true
+                log "  Auto-merge success: $BRANCH pushed to $NEW_TIP (merged $DEFAULT_BRANCH in — ${_MERGE_NOT_REBASE_WHY})"
+                bd -C "$GC_CITY" comment "$MARKER_ID" "Gate dispatcher auto-merged origin/$DEFAULT_BRANCH into $BRANCH ($MAIN_HEAD_SHA) instead of rebasing (${_MERGE_NOT_REBASE_WHY}). New tip: $NEW_TIP. Proceeding with review." 2>/dev/null || true
                 git_rig fetch origin 2>/dev/null || true
                 BRANCH_SHA=$(rig_resolve_commit "origin/$BRANCH"); [ -z "$BRANCH_SHA" ] && BRANCH_SHA="$NEW_TIP"
                 if git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null; then
@@ -8071,12 +8144,15 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     elif [ "$HAS_CONFLICT" = "0" ]; then
       # Self-repo rig
       if git -C "$GIT_DIR_PATH" worktree add "$TMP_REBASE_WT" "origin/$BRANCH" 2>/dev/null; then
-        if [ "$BRANCH_TIP_IS_MERGE_COMMIT" = "1" ]; then
+        if [ "$BRANCH_TIP_IS_MERGE_COMMIT" = "1" ] || [ "$FORCE_MERGE_REANCHOR" = "1" ]; then
           # ga-kyxih: see the container-rig branch above for why — this
           # branch's own tip is already a merge commit, so `git rebase` (the
           # elif-branch below) is not applicable; use a real `git merge`.
-          log "  Auto-merge (self-repo, ga-kyxih: tip is itself a merge commit — rebase is not applicable): merging $DEFAULT_BRANCH into $BRANCH instead of rebasing ..."
-          if git -C "$TMP_REBASE_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" merge "origin/$DEFAULT_BRANCH" -m "Merge origin/$DEFAULT_BRANCH into $BRANCH (gate auto-merge — tip was a merge commit, ga-kyxih)" 2>/dev/null; then
+          # ga-hzhn6k: same merge remedy, also triggered when the branch is
+          # merely too far ahead for the rebase envelope — see
+          # _MERGE_NOT_REBASE_WHY above for which reason applies this sweep.
+          log "  Auto-merge (self-repo, ${_MERGE_NOT_REBASE_WHY}): merging $DEFAULT_BRANCH into $BRANCH instead of rebasing ..."
+          if git -C "$TMP_REBASE_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" merge "origin/$DEFAULT_BRANCH" -m "Merge origin/$DEFAULT_BRANCH into $BRANCH (gate auto-merge — ${_MERGE_NOT_REBASE_WHY})" 2>/dev/null; then
             NEW_TIP=$(git -C "$TMP_REBASE_WT" rev-parse HEAD 2>/dev/null || echo "")
             if [ -z "$NEW_TIP" ]; then
               warn "  Auto-merge (self-repo): rev-parse HEAD after merge returned empty for $BRANCH — treating as push failure"
@@ -8086,8 +8162,8 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               if git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>"$_PUSH_ERR_FILE"; then
                 AUTO_REBASE_OK=1
                 BRANCH_SHA="$NEW_TIP"
-                log "  Auto-merge success (self-repo): $BRANCH pushed to $NEW_TIP (tip was already a merge commit, ga-kyxih)"
-                bd -C "$GC_CITY" comment "$MARKER_ID" "Gate dispatcher auto-merged origin/$DEFAULT_BRANCH into $BRANCH ($MAIN_HEAD_SHA) instead of rebasing — this branch's tip was already a merge commit (ga-kyxih). New tip: $NEW_TIP. Proceeding with review." 2>/dev/null || true
+                log "  Auto-merge success (self-repo): $BRANCH pushed to $NEW_TIP (${_MERGE_NOT_REBASE_WHY})"
+                bd -C "$GC_CITY" comment "$MARKER_ID" "Gate dispatcher auto-merged origin/$DEFAULT_BRANCH into $BRANCH ($MAIN_HEAD_SHA) instead of rebasing (${_MERGE_NOT_REBASE_WHY}). New tip: $NEW_TIP. Proceeding with review." 2>/dev/null || true
                 git_rig fetch origin 2>/dev/null || true
                 BRANCH_SHA=$(rig_resolve_commit "origin/$BRANCH"); [ -z "$BRANCH_SHA" ] && BRANCH_SHA="$NEW_TIP"
                 if git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null; then

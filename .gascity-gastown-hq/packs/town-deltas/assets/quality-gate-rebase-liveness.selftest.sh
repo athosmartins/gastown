@@ -442,11 +442,19 @@ unset -f git_rig
 rm -rf "$_FIXTURE_REPO"
 
 echo "── 10b. drift-guard: both rebase-attempt sites route on BRANCH_TIP_IS_MERGE_COMMIT before falling to git rebase ──"
-_MERGE_ROUTE_COUNT=$(grep -c 'if \[ "\$BRANCH_TIP_IS_MERGE_COMMIT" = "1" \]; then' "$DISPATCHER" || true)
+# ga-hzhn6k: the routing condition at these two call sites now also ORs in
+# FORCE_MERGE_REANCHOR (a branch too far ahead for the rebase envelope, but
+# already merge-tree-proven clean, re-anchors via the SAME merge path) — so
+# the literal condition text this drift-guard pins on gained a clause. Match
+# the new text with -F (fixed string) rather than count a bare
+# BRANCH_TIP_IS_MERGE_COMMIT substring, which would also match unrelated
+# occurrences elsewhere in the file (a different rebase-retry sweep) and
+# could pass without ever actually exercising these two sites.
+_MERGE_ROUTE_COUNT=$(grep -cF 'if [ "$BRANCH_TIP_IS_MERGE_COMMIT" = "1" ] || [ "$FORCE_MERGE_REANCHOR" = "1" ]; then' "$DISPATCHER" || true)
 if [ "${_MERGE_ROUTE_COUNT:-0}" -ge 2 ]; then
-  ok "BRANCH_TIP_IS_MERGE_COMMIT routing present at both rig-type call sites (count=$_MERGE_ROUTE_COUNT)"
+  ok "BRANCH_TIP_IS_MERGE_COMMIT||FORCE_MERGE_REANCHOR routing present at both rig-type call sites (count=$_MERGE_ROUTE_COUNT)"
 else
-  bad "BRANCH_TIP_IS_MERGE_COMMIT routing found fewer than 2 times (count=${_MERGE_ROUTE_COUNT:-0}) — one rig-type call site may be missing the fix"
+  bad "BRANCH_TIP_IS_MERGE_COMMIT||FORCE_MERGE_REANCHOR routing found fewer than 2 times (count=${_MERGE_ROUTE_COUNT:-0}) — one rig-type call site may be missing the fix"
 fi
 grep -qF 'elif git -C "$TMP_REBASE_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then' "$DISPATCHER" \
   && ok "the ORIGINAL rebase invocation is preserved verbatim as the elif fallback (AC3 non-regression: linear branches still rebase)" \
@@ -456,11 +464,20 @@ grep -qF 'BRANCH_TIP_IS_MERGE_COMMIT=$(branch_tip_is_merge_commit "origin/$BRANC
   || bad "BRANCH_TIP_IS_MERGE_COMMIT computation call site missing/renamed"
 
 echo "── 10c. drift-guard: AC2 — merge-commit-tip auto-fix path is logged distinctly from a real git-rebase failure ──"
-grep -qF 'Auto-merge (ga-kyxih: tip is itself a merge commit — rebase is not applicable)' "$DISPATCHER" \
-  && ok "auto-merge path (container-rig) logs a distinct message naming the merge-commit-tip cause" \
+# ga-hzhn6k: the two per-rig-type log lines now interpolate a shared
+# _MERGE_NOT_REBASE_WHY reason string (computed once, so the log line and
+# the marker comment always agree) instead of hardcoding the ga-kyxih
+# wording inline at each call site. The distinctive wording itself is
+# unchanged and still lives in the source, verbatim, in that assignment —
+# check there instead of at the (now-parameterized) log call sites.
+grep -qF '_MERGE_NOT_REBASE_WHY="ga-kyxih: tip is itself a merge commit — rebase is not applicable"' "$DISPATCHER" \
+  && ok "the ga-kyxih merge-commit-tip reason text is still present verbatim (now shared via _MERGE_NOT_REBASE_WHY)" \
+  || bad "ga-kyxih merge-commit-tip reason text missing/reworded"
+grep -qF 'log "  Auto-merge (${_MERGE_NOT_REBASE_WHY}): merging $DEFAULT_BRANCH into $BRANCH instead of rebasing ..."' "$DISPATCHER" \
+  && ok "auto-merge path (container-rig) logs the shared reason string distinctly from a real git-rebase failure" \
   || bad "container-rig auto-merge log message missing/reworded"
-grep -qF 'Auto-merge (self-repo, ga-kyxih: tip is itself a merge commit — rebase is not applicable)' "$DISPATCHER" \
-  && ok "auto-merge path (self-repo-rig) logs a distinct message naming the merge-commit-tip cause" \
+grep -qF 'log "  Auto-merge (self-repo, ${_MERGE_NOT_REBASE_WHY}): merging $DEFAULT_BRANCH into $BRANCH instead of rebasing ..."' "$DISPATCHER" \
+  && ok "auto-merge path (self-repo-rig) logs the shared reason string distinctly from a real git-rebase failure" \
   || bad "self-repo-rig auto-merge log message missing/reworded"
 grep -qF 'warn "  Auto-rebase git rebase command failed (unexpected — merge-tree reported no conflicts)"' "$DISPATCHER" \
   && ok "the original 'real rebase failed' warning text is untouched — still distinguishable from the new auto-merge messages" \
