@@ -168,8 +168,14 @@ CONTEXT_CHECK_EXEC_CLASS="${CONTEXT_CHECK_EXEC_CLASS:-1}"
 # (framework-marker-labels.sh) instead of a literal copy here — see that
 # file's header for why. An explicit CONTEXT_CHECK_EXCLUDE_LABELS env var
 # (e.g. the plist pin) still overrides it, unchanged from before this fix.
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/framework-marker-labels.sh"
-CONTEXT_CHECK_EXCLUDE_LABELS="${CONTEXT_CHECK_EXCLUDE_LABELS:-$GC_FRAMEWORK_MARKER_LABELS}"
+# Third fallback layer: if the sibling file is ever missing/unreadable (it
+# should never be, same directory, same deploy — but "don't know" must not
+# silently collapse into "exclude nothing"), keep the exact pre-fix literal
+# as a last-resort default so a read failure degrades to old-but-correct
+# behavior, not a silent, broader ctx:ready+exec:auto grant on every digest/
+# pinned/gt:message/etc bead.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/framework-marker-labels.sh" 2>/dev/null || true
+CONTEXT_CHECK_EXCLUDE_LABELS="${CONTEXT_CHECK_EXCLUDE_LABELS:-${GC_FRAMEWORK_MARKER_LABELS:-gt:agent gt:rig gt:convoy gc:nudge digest pinned gt:message}}"
 # Label PREFIXES that mark plumbing (matched as startswith). Covers the gate
 # marker/run/verdict family, gate-status:*, nudge:*, reviewer-index:*, source:*,
 # and the ctx:* family itself (idempotence).

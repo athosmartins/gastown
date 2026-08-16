@@ -1810,7 +1810,24 @@ _FILTER_PREAPPROVAL_LABELS='["story:unrefined","story:refinement-in-progress","s
 # had NO gt:* exclusion at all except the hand-added gt:message case below —
 # context-check knew the full list, Pilot knew none of it. Add a new marker
 # to the shared file and both consumers exclude it, no second copy here.
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/framework-marker-labels.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/framework-marker-labels.sh" 2>/dev/null || true
+# Third-state guard: check the SOURCE variable directly, before the jq
+# conversion below — an empty/unset $GC_FRAMEWORK_MARKER_LABELS means either
+# the sibling file is missing/unreadable or it produced no markers, and
+# either way the exclusion below silently becomes a no-op (safe direction:
+# degrades to this clause's own pre-fix state, never to excluding something
+# it should not). But "silently" is the part to avoid — a missing file that
+# goes unnoticed means gt:rig/gt:agent identity beads start slipping through
+# again with no signal why. Warn once per process so it shows up in the
+# dispatcher log instead of vanishing. (Checking the jq OUTPUT for "[]"
+# instead would miss this: printf '%s\n' with zero args still emits one
+# empty line per POSIX printf semantics, so an empty/unset input actually
+# produces the JSON array ["\"\""] — one element, an empty string — not [].
+# Functionally still inert either way (no real label is ever ""), but a
+# string-match on the wrong literal would silently never fire.)
+if [ -z "$GC_FRAMEWORK_MARKER_LABELS" ]; then
+  warn "ga-vmn7kv: GC_FRAMEWORK_MARKER_LABELS is empty after sourcing framework-marker-labels.sh — missing/unreadable/empty file? gt:rig/gt:agent/etc exclusion in _filter_candidates is a no-op until this is fixed."
+fi
 _FILTER_FRAMEWORK_MARKER_LABELS=$(printf '%s\n' $GC_FRAMEWORK_MARKER_LABELS | jq -R . | jq -s -c .)
 # ga-am6h: mirrors MAX_RECLAIMS in scripts/inflight-reclaim-guard.py (line ~101) —
 # keep the two in sync by hand; there is no shared bash/python helper (see that
