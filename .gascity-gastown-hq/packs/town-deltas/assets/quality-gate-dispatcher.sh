@@ -825,9 +825,27 @@ classify_sibling_run() {
 # gate-status:running at all (it is now gate-status:claimed), so it is
 # correctly excluded up front by THIS function's own bd query, for the right
 # reason instead of an accidental one.
+#
+# ga-tvpo6z: matching also REQUIRES the candidate's own `rig:` line to equal
+# the caller's <rig> arg. A branch NAME can legitimately recur across
+# different rigs (rig A has a live run for "feat/x-shared"; rig B submits an
+# unrelated diff under the identical branch STRING) — the same cross-rig-story
+# convention that produced ga-95tq3p's confirmed-live false match in this
+# function's sibling, dup_marker_ids_for_branch (quality-gate-guard.sh).
+# Without a CONFIRMED rig on our own side there is no way to tell a genuine
+# same-repo sibling from an unrelated run in a different repo that just reused
+# the branch string, so an unconfirmed rig on EITHER side fails toward this
+# function's own existing FAIL-OPEN default (return "" / proceed) rather than
+# risk yielding to a run we cannot prove is ours — mirrors ga-95tq3p's
+# fail-toward-not-superseding idiom, adapted to this function's fail-toward-
+# not-yielding direction (a false-yield here only costs a delay, never silent
+# data loss, per this function's own docstring above). "unknown" is
+# gate-done.md's own placeholder for an unresolved rig, not a confirmed
+# identity, so it is never treated as a match on either side.
 live_sibling_run_for_branch() {
-  local branch="$1" now_epoch run_json count i id status desc started started_epoch age_min verdict
+  local branch="$1" rig="$2" now_epoch run_json count i id status desc started started_epoch age_min verdict run_rig
   [ -z "$branch" ] && return 0
+  case "$rig" in ''|unknown) return 0 ;; esac
   now_epoch=$(date +%s)
   # ga-h199q: NOT routed through the read-cache shim (unlike the 3 siblings of
   # this exact query below) — gate-dup-run-guard.selftest.sh mocks `bd` as an
@@ -852,6 +870,11 @@ live_sibling_run_for_branch() {
     [ "$status" = "open" ] || continue   # closed/superseded/errored sibling is NEVER live
     desc=$(printf '%s\n' "$run_json" | jq -r ".[$i].description // \"\"" 2>/dev/null || echo "")
     printf '%s\n' "$desc" | grep -qF "Autonomous gate run for ${branch}." || continue
+    # ga-tvpo6z: candidate's own rig must also be confirmed and equal to ours
+    # — same fail-toward-not-yielding direction as the caller-rig check above.
+    run_rig=$(printf '%s\n' "$desc" | grep -E '^rig:' | head -1 | sed 's/^rig: *//' || true)
+    case "$run_rig" in ''|unknown) continue ;; esac
+    [ "$run_rig" = "$rig" ] || continue
     started=$(printf '%s\n' "$desc" | grep -E '^started_at:' | head -1 | sed 's/^started_at: *//' || true)
     if [ -z "$started" ]; then echo "LIVE $id"; return 0; fi   # no ts → conservative LIVE
     started_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "${started%%Z*}" "+%s" 2>/dev/null \
@@ -7755,7 +7778,7 @@ log "  Branch $BRANCH not yet merged into $DEFAULT_BRANCH — proceeding with re
 # caught before reviewers are spawned, just not before THIS marker's own
 # rebase/force-push (a narrower, rarer window than the one this hoist closes).
 if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
-  SIBLING_VERDICT=$(live_sibling_run_for_branch "$BRANCH" || echo "")
+  SIBLING_VERDICT=$(live_sibling_run_for_branch "$BRANCH" "$RIG" || echo "")
   case "$SIBLING_VERDICT" in
     "LIVE "*)
       SIBLING_RUN_ID="${SIBLING_VERDICT#LIVE }"
@@ -9177,7 +9200,7 @@ log "Tier: $TIER  required_reviewers: $REQUIRED_REVIEWERS"
 # where a sibling run starts DURING Step 4c/Step 5 (auto-rebase, tier
 # classification) — rare, but a real gap the early check alone cannot close.
 if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
-  SIBLING_VERDICT=$(live_sibling_run_for_branch "$BRANCH" || echo "")
+  SIBLING_VERDICT=$(live_sibling_run_for_branch "$BRANCH" "$RIG" || echo "")
   case "$SIBLING_VERDICT" in
     "LIVE "*)
       SIBLING_RUN_ID="${SIBLING_VERDICT#LIVE }"
