@@ -1810,7 +1810,30 @@ _FILTER_PREAPPROVAL_LABELS='["story:unrefined","story:refinement-in-progress","s
 # had NO gt:* exclusion at all except the hand-added gt:message case below —
 # context-check knew the full list, Pilot knew none of it. Add a new marker
 # to the shared file and both consumers exclude it, no second copy here.
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/framework-marker-labels.sh" 2>/dev/null || true
+# ga-vmn7kv (gate FAIL, run ga-gdlzv6): the `|| true` here does NOT make this
+# safe, and neither does `2>/dev/null`. This file runs under `set -euo pipefail`
+# (line 74), and bash's `source`/`.` is a POSIX special builtin: when the file
+# cannot be read, the shell terminates IMMEDIATELY — the `|| true` never runs.
+# Reproduced on this machine's /bin/bash 3.2.57:
+#     set -euo pipefail; source /missing.sh 2>/dev/null || true; echo REACHED
+#   -> exit 1, "REACHED" never printed, zero stdout, zero stderr.
+# So a missing sibling did not degrade to the documented "exclusion becomes a
+# no-op" — it silently killed the dispatcher's top-level init before ANY log or
+# warn call could fire. That is the whole autonomous dispatch loop going dark
+# every ~300s cycle with no explanation anywhere, and this diff is what would
+# have introduced that brand-new hard dependency (pre-fix this file could not
+# fail this way at all).
+# `[ -f ]` is NOT sufficient — an existing-but-unreadable file still kills it
+# (measured: exit 1, "Permission denied"). `[ -r ]` covers both missing and
+# unreadable, so the third-state guard below is actually REACHABLE and the
+# degradation is the documented one. stderr is deliberately NOT suppressed on
+# the source itself: a corrupt sibling (syntax error) should be loud, not
+# silent — it is a deploy fault, not a legitimate absence.
+_GC_FML_SIBLING="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/framework-marker-labels.sh"
+if [ -r "$_GC_FML_SIBLING" ]; then
+  source "$_GC_FML_SIBLING"
+fi
+unset _GC_FML_SIBLING
 # Third-state guard: check the SOURCE variable directly, before the jq
 # conversion below — an empty/unset $GC_FRAMEWORK_MARKER_LABELS means either
 # the sibling file is missing/unreadable or it produced no markers, and

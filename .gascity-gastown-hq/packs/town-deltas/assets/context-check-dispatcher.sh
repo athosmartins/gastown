@@ -174,7 +174,25 @@ CONTEXT_CHECK_EXEC_CLASS="${CONTEXT_CHECK_EXEC_CLASS:-1}"
 # as a last-resort default so a read failure degrades to old-but-correct
 # behavior, not a silent, broader ctx:ready+exec:auto grant on every digest/
 # pinned/gt:message/etc bead.
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/framework-marker-labels.sh" 2>/dev/null || true
+# ga-vmn7kv (gate FAIL, run ga-gdlzv6): `|| true` does NOT protect this. This
+# file runs under `set -euo pipefail` (line 63) and bash's `source` is a POSIX
+# special builtin — an unreadable file terminates the shell IMMEDIATELY, before
+# the `|| true` is ever evaluated. Measured on /bin/bash 3.2.57: exit 1, nothing
+# after the source line runs.
+# That made the "third fallback layer" promised in the comment directly above
+# DEAD CODE in exactly the scenario it was written for: the CONTEXT_CHECK_
+# EXCLUDE_LABELS line below (the pre-fix literal, the "last-resort default") is
+# the very next line, and it never executed — the process was already gone. The
+# comment promised a graceful degrade the code could not deliver, which is worse
+# than no comment: it tells the next reader to stop looking.
+# `[ -r ]`, not `[ -f ]`: an existing-but-unreadable file still kills it
+# (measured). stderr intentionally not suppressed on the source — a corrupt
+# sibling should be loud; only ABSENCE is a legitimate, silent degrade.
+_GC_FML_SIBLING="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/framework-marker-labels.sh"
+if [ -r "$_GC_FML_SIBLING" ]; then
+  source "$_GC_FML_SIBLING"
+fi
+unset _GC_FML_SIBLING
 CONTEXT_CHECK_EXCLUDE_LABELS="${CONTEXT_CHECK_EXCLUDE_LABELS:-${GC_FRAMEWORK_MARKER_LABELS:-gt:agent gt:rig gt:convoy gc:nudge digest pinned gt:message}}"
 # Label PREFIXES that mark plumbing (matched as startswith). Covers the gate
 # marker/run/verdict family, gate-status:*, nudge:*, reviewer-index:*, source:*,
