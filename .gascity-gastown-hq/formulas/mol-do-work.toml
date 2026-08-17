@@ -29,6 +29,15 @@ branch to the latest `origin/main` inside the isolated worktree — whether it
 was just created or is being reused from a prior attempt — so a redispatched
 bead never silently builds on a stale base.
 
+## Park path (ga-rswuxy)
+Not every dispatched bead is fixable by code. Step 1 ends with an explicit
+fork: if the real blocker is external (unmerged dependency, engine-window
+gate, anything no code change on THIS bead resolves), the PARK PROCEDURE
+there records the blocker, strips dispatch eligibility, and closes your own
+sling — skipping steps 2-6 (branch/implement/push/gate) entirely. This is
+the same park mechanics used city-wide, now enforced in the formula instead
+of living only in individual agent judgment.
+
 ## Variables
 
 | Variable | Source | Description |
@@ -36,7 +45,7 @@ bead never silently builds on a stale base.
 | issue | caller | The STORY/bug bead you are fixing (e.g. `ga-xau4z`) — **NOT** your own ephemeral sling/task dispatch bead (e.g. `ga-e1yv1`, often available as `$GC_BEAD_ID`). Both are "assigned to this agent," but this formula's own step 5 writes `{{issue}}` directly into the gate marker's `bead_id`/`source-bead` fields when it creates the marker — a wrong `{{issue}}` corrupts those fields at that moment, independent of the branch name (see ga-pyxar). |
 """
 formula = "mol-do-work"
-version = 3
+version = 4
 
 [vars]
 [vars.issue]
@@ -60,6 +69,50 @@ gc mail inbox                     # Check for context/handoff messages
 ```
 
 Read the bead's title and description carefully. This is your task.
+
+**Decide: build or park?**
+
+If the real blocker is external — an unmerged dependency, an
+engine-window-gated change, anything no code change on THIS bead can
+resolve — park it instead of building: run the PARK PROCEDURE below, then
+go straight to the drain step. Do not run steps 2-6 (the build path) —
+no branch, no implementation, no gate marker.
+
+If this is a normal code-level fix, skip the PARK PROCEDURE and continue
+to step 2.
+
+**PARK PROCEDURE (blocked on infra, not code):**
+
+```bash
+# === MOL-DO-WORK PARK PROCEDURE BEGIN (ga-rswuxy) ===
+# 1. Record the real blocker as a self-healing dependency edge — {{issue}}
+#    becomes dispatch-eligible again automatically once the blocker
+#    closes, no manual unpark step needed.
+bd dep <blocking-bead-id> --blocks {{issue}}
+
+# 2. Strip auto-dispatch eligibility (comma-separated = one call).
+bd label remove {{issue}} ctx:ready,exec:auto,story:in-flight
+
+# 3. Add the park label in the SAME pass as the strip above — order
+#    matters: strip first kills immediate eligibility, add second survives
+#    later re-arm sweeps.
+bd label add {{issue}} pilot:no-auto-dispatch
+
+# 4. Explain the block so the next reader doesn't redo this investigation.
+bd comment {{issue}} "Parked on <blocking-bead-id>: <why it blocks, and why this is infra not code>."
+
+# 5. Close your own sling now — this step's park-path equivalent of what
+#    step 6 does for the build path (mirrors it: same bead, same
+#    gc.outcome/status/notes shape, different verdict).
+if [ -n "${GC_BEAD_ID:-}" ] && [ "$GC_BEAD_ID" != "{{issue}}" ]; then
+  bd update "$GC_BEAD_ID" --set-metadata gc.outcome=parked --status=closed \
+    --notes "Parked {{issue}} on <blocking-bead-id>. No branch — blocked on infra, not code."
+fi
+# === MOL-DO-WORK PARK PROCEDURE END (ga-rswuxy) ===
+```
+
+PARK PROCEDURE done → go directly to the drain step (below this one). Do
+not run steps 2-6.
 
 **2. Create a safe feature branch (MANDATORY before any code change):**
 
@@ -282,6 +335,9 @@ echo "DO NOT close bead {{issue}} — G does it on pass."
 
 **6. Close this formula step (NOT the source bead):**
 
+Build path only — if you parked instead, step 5 of the PARK PROCEDURE
+above already closed your sling; skip this.
+
 ```bash
 if [ -n "${GC_BEAD_ID:-}" ] && [ "$GC_BEAD_ID" != "{{issue}}" ]; then
   bd update "$GC_BEAD_ID" --set-metadata gc.outcome=pass --status=closed \
@@ -294,20 +350,30 @@ If you get stuck or need clarification, check your inbox:
 gc mail inbox
 ```
 
-**Exit criteria:** Branch pushed, gate marker created, formula step closed.
-Source bead {{issue}} remains open — G closes it when the gate passes."""
+**Exit criteria:** EITHER branch pushed + gate marker created + formula
+step closed (build path), OR blocker dependency recorded + labels updated
++ formula step closed (park path). Source bead {{issue}} remains open in
+both cases — G closes it when the gate passes (build path), or the
+self-healing dependency makes it dispatch-eligible again once the blocker
+closes (park path)."""
 
 [[steps]]
 id = "drain"
 title = "Close drain step and signal completion"
 needs = ["do-work"]
 description = """
-Work is submitted to the gate. Close this drain step, then signal the
-controller to reclaim this session:
+Work is submitted to the gate (build path) or parked (park path) — either
+way your sling should already be closed, by step 6 or by the PARK
+PROCEDURE. Close it here only as a backstop if it's somehow still open —
+never overwrite an outcome ("pass" or "parked") a prior step already
+recorded — then signal the controller to reclaim this session:
 
 ```bash
 if [ -n "${GC_BEAD_ID:-}" ]; then
-  bd update "$GC_BEAD_ID" --set-metadata gc.outcome=pass --status=closed --notes "Drain acknowledged. Gate marker submitted."
+  SLING_STATUS=$(bd show "$GC_BEAD_ID" --json 2>/dev/null | jq -r '.[0].status // ""')
+  if [ "$SLING_STATUS" != "closed" ]; then
+    bd update "$GC_BEAD_ID" --set-metadata gc.outcome=pass --status=closed --notes "Drain acknowledged. Gate marker submitted."
+  fi
 fi
 gc runtime drain-ack
 ```
