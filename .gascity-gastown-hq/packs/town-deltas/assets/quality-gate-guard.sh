@@ -517,26 +517,42 @@ dedup_gaterun_action() {
   echo "supersede:duplicate"
 }
 
-# dup_marker_ids_for_branch <markers_json> <branch> <exclude_id>
+# dup_marker_ids_for_branch <markers_json> <branch> <exclude_id> <rig>
 # Pure (no bd/gc I/O — takes the query result as data): given the JSON array of
 # type:quality-gate-marker beads already filtered by the caller to
 # gate-status:{ready,queued,needs-rebase} (ga-o64z1's Step 4b query), return the
 # ids (one per line, empty output = none) whose description carries a `branch:`
-# line EXACTLY equal to <branch>, excluding <exclude_id> (the marker THIS sweep
-# just claimed) and re-checking status=open per-candidate as defense-in-depth
-# (mirrors live_sibling_run_for_branch's own belt-and-suspenders status gate in
-# quality-gate-dispatcher.sh — ga-tgj23 showed a label/list inconsistency can
-# otherwise surface a closed bead as a false candidate). Matches on the
-# DESCRIPTION's branch: line, not the branch: LABEL — the label is display-only
-# for the painel (docs/gate-marker-recipe.md), the description is the field
-# every real consumer (including this guard's own Step 3 extract()) trusts.
-# Exact string equality, not substring/regex — avoids fix/ga-1 matching
-# fix/ga-10.
+# line EXACTLY equal to <branch> AND a `rig:` line EXACTLY equal to <rig>,
+# excluding <exclude_id> (the marker THIS sweep just claimed) and re-checking
+# status=open per-candidate as defense-in-depth (mirrors live_sibling_run_for_
+# branch's own belt-and-suspenders status gate in quality-gate-dispatcher.sh —
+# ga-tgj23 showed a label/list inconsistency can otherwise surface a closed
+# bead as a false candidate). Matches on the DESCRIPTION's branch:/rig: lines,
+# not the branch: LABEL — the label is display-only for the painel
+# (docs/gate-marker-recipe.md), the description is the field every real
+# consumer (including this guard's own Step 3 extract()) trusts. Exact string
+# equality, not substring/regex — avoids fix/ga-1 matching fix/ga-10.
+#
+# ga-95tq3p: branch name ALONE is not a safe duplicate key. Two independent
+# repos (e.g. gascity/HQ and whatsapp_automation) can legitimately reuse the
+# same branch string for a cross-rig story, each carrying unrelated content —
+# live incident: a WA marker covering one consumer superseded (silently
+# closed) an HQ marker covering 5 OTHER consumers of the same story, purely
+# because both used the same branch name. rig_of() reads the same `rig:` line
+# gate-done.md Step 2 already writes into every marker description (this
+# guard's own Step 3 extracts it into $RIG). <rig> and the candidate's parsed
+# rig must BOTH be non-empty AND equal to count as a duplicate — a missing or
+# unparseable rig on EITHER side is never treated as a match (mirrors the
+# existing "missing status field -> not confirmed open -> excluded" idiom,
+# test case (f) below): superseding is the destructive/hard-to-reverse
+# direction here, so ambiguous rig data must fail toward NOT superseding
+# rather than falling back to the pre-fix branch-only behavior.
 dup_marker_ids_for_branch() {
-  local markers_json="$1" branch="$2" exclude_id="$3"
-  printf '%s\n' "$markers_json" | jq -r --arg mid "$exclude_id" --arg branch "$branch" '
+  local markers_json="$1" branch="$2" exclude_id="$3" rig="$4"
+  printf '%s\n' "$markers_json" | jq -r --arg mid "$exclude_id" --arg branch "$branch" --arg rig "$rig" '
     def branch_of(d): (d // "") | split("\n") | map(select(startswith("branch:"))) | (.[0] // "") | ltrimstr("branch:") | sub("^ +"; "");
-    [ .[] | select(.id != $mid) | select((.status // "") == "open") | select(branch_of(.description) == $branch) | .id ] | .[]
+    def rig_of(d): (d // "") | split("\n") | map(select(startswith("rig:"))) | (.[0] // "") | ltrimstr("rig:") | sub("^ +"; "");
+    [ .[] | select(.id != $mid) | select((.status // "") == "open") | select(branch_of(.description) == $branch) | select($rig != "" and rig_of(.description) == $rig) | .id ] | .[]
   ' 2>/dev/null || true
 }
 
@@ -3282,7 +3298,7 @@ if [ "$DUP_QUERY_OK" = "0" ]; then
   # of silently passing as a clean branch.
   warn "Step 4b: sibling-marker query failed for branch $BRANCH — dedup check SKIPPED (non-fatal, distinct from '0 duplicates found')."
 else
-  DUP_IDS=$(dup_marker_ids_for_branch "$DUP_MARKERS_JSON" "$BRANCH" "$MARKER_ID")
+  DUP_IDS=$(dup_marker_ids_for_branch "$DUP_MARKERS_JSON" "$BRANCH" "$MARKER_ID" "$RIG")
   DUP_COUNT=$(printf '%s\n' "$DUP_IDS" | grep -c . || true)
   case "$DUP_COUNT" in ''|*[!0-9]*) DUP_COUNT=0 ;; esac
 
