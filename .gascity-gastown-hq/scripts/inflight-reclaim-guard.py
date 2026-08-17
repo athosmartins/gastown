@@ -2075,11 +2075,16 @@ def _sling_has_unmerged_branch(bead_id):
     (preserve_unpushed_branch) fetches every REPOS entry earlier in the same
     call, so this never fetches again.
 
-    Fail-safe like every other branch check in this file: a git error on a
-    candidate branch is read as "can't confirm merged" -> treated as
-    unmerged. Refusing to close a sling that turns out to have been safe
-    just leaves it for the sling-task-janitor backstop; wrongly closing live
-    work has no backstop.
+    Fail-safe like every other branch check in this file: a git error is
+    read as "can't confirm merged" -> treated as unmerged — this covers BOTH
+    a failed merge-base on a found branch AND a failed ref-scan itself (if
+    for-each-ref can't be trusted for a repo, "no branches found" there is
+    indistinguishable from "confirmed no branches exist" unless the scan
+    failure is surfaced as its own blocking outcome, not silently skipped —
+    same collapse this function exists to avoid on the branch-merge question
+    itself). Refusing to close a sling that turns out to have been safe just
+    leaves it for the sling-task-janitor backstop; wrongly closing live work
+    has no backstop.
     """
     for repo in REPOS:
         try:
@@ -2088,9 +2093,9 @@ def _sling_has_unmerged_branch(bead_id):
                  "--format=%(refname) %(objectname)", "refs/remotes/origin/"],
                 capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
-                continue
-        except Exception:
-            continue
+                return f"<ref-scan failed rc={r.returncode} in {repo}>"
+        except Exception as _exc:
+            return f"<ref-scan error in {repo}: {_exc}>"
         for line in r.stdout.splitlines():
             line = line.strip()
             if not line:
@@ -2441,7 +2446,18 @@ def _close_orphaned_sling(bd_prefix, sling_bead_id, target_bead_id, hold_secs):
     if sling.get("status") != "open" or (sling.get("assignee") or ""):
         return False
 
-    _sling_type = sling.get("issue_type") or sling.get("type") or ""
+    # ga-p2dqmd: closing a bead is destructive (that's this whole bug), so an
+    # UNREADABLE type must never be treated the same as a CONFIRMED-safe one
+    # — "don't know" fails closed here, same direction as guard 3 below.
+    _UNKNOWN = object()
+    _sling_type = sling.get("issue_type", _UNKNOWN)
+    if _sling_type is _UNKNOWN:
+        _sling_type = sling.get("type", _UNKNOWN)
+    if _sling_type is _UNKNOWN or not _sling_type:
+        print(f"[INFLIGHT-RECLAIM] ga-p2dqmd: sling {sling_bead_id} has no readable "
+              f"issue_type — cannot confirm it is a disposable wrapper, refusing to "
+              f"close, target {target_bead_id}", flush=True)
+        return False  # guard 2: unknown type -> fail closed
     if _sling_type in ("bug", "feature", "story"):
         print(f"[INFLIGHT-RECLAIM] ga-p2dqmd: sling {sling_bead_id} has issue_type="
               f"{_sling_type!r} (not a disposable wrapper) — refusing to close, "
@@ -7174,9 +7190,10 @@ def _selftest():
         already cover the target's own label/status/assignee mechanics).
 
         sling_issue_type (ga-p2dqmd, default None): omitted from the `bd show`
-        payload entirely when None, so SLC-1..5 (which never set it) exercise
-        guard 2's real production shape — a sling response with no issue_type
-        key at all — unchanged. Set it to exercise guard 2 directly (SLC-7)."""
+        payload entirely when None — used by SLC-9 to exercise guard 2's
+        fail-closed behavior on a response with no issue_type key at all.
+        Callers exercising a normal close (SLC-1) or a blocked close on a
+        known-precious type (SLC-7) must pass this explicitly."""
         sling_state = {"status": sling_status, "assignee": sling_assignee}
         calls = []
 
@@ -7210,9 +7227,11 @@ def _selftest():
     os.environ["RECLAIM_RELOOP_HOLD_SECS"] = "3600"
     try:
         # SLC-1 (AC1): reclaim_count=1 (2nd reclaim -> hold fires this cycle)
-        # + sling open, unassigned -> the sling gets closed, citing the
-        # target id and the superseded-by-reclaim-hold reason.
-        subprocess.run, _slc_calls1, _ = _make_slc_stub("ga-sling1", "open", "")
+        # + sling open, unassigned, issue_type=task (a genuine `gc sling`
+        # wrapper's real shape) -> the sling gets closed, citing the target
+        # id and the superseded-by-reclaim-hold reason.
+        subprocess.run, _slc_calls1, _ = _make_slc_stub("ga-sling1", "open", "",
+                                                          sling_issue_type="task")
         try:
             do_reclaim("ga-target1", "some bead", reclaim_count=1, idle_min=40.0,
                         labels=["story:in-flight"], sling_bead_id="ga-sling1")
@@ -7395,6 +7414,70 @@ def _selftest():
         check("SLC-8 (ga-p2dqmd guard 3): sling has an unmerged remote branch -> "
               "never closed even though open+unassigned with issue_type=task",
               len(_slc8_close) == 0, f"calls={_slc_calls8!r}")
+
+        # SLC-9 (ga-p2dqmd guard 2, third-state): a `bd show` response with NO
+        # issue_type key at all (open+unassigned, otherwise would qualify)
+        # must NOT be treated the same as a confirmed-safe wrapper type —
+        # "can't tell" must fail closed on a destructive action, same as
+        # every other unreadable-state check in this file.
+        subprocess.run, _slc_calls9, _ = _make_slc_stub("ga-sling9", "open", "")
+        try:
+            do_reclaim("ga-target9", "some bead", reclaim_count=1, idle_min=40.0,
+                        labels=["story:in-flight"], sling_bead_id="ga-sling9")
+        finally:
+            subprocess.run = _orig_run_slc
+        _slc9_close = [c for c in _slc_calls9 if len(c) >= 3 and c[0] == "bd"
+                       and c[1] == "close" and c[2] == "ga-sling9"]
+        check("SLC-9 (ga-p2dqmd guard 2, third-state): sling response with NO "
+              "issue_type key at all is never closed (unknown type fails closed, "
+              "not treated as a confirmed-safe wrapper)",
+              len(_slc9_close) == 0, f"calls={_slc_calls9!r}")
+
+        # SLC-10 (ga-p2dqmd guard 3, third-state): bd show is fine
+        # (open+unassigned, issue_type=task -> passes guards 1+2), but the
+        # branch scan itself (git for-each-ref) fails for every repo. This
+        # must NOT be read the same as "confirmed no matching branch" —
+        # inability to check is exactly the "don't know" case that must fail
+        # toward not-closing.
+        def _make_slc_scanfail_stub(sling_id):
+            calls = []
+
+            def _run(cmd, **kw):
+                if not isinstance(cmd, (list, tuple)):
+                    return _SlcResult(0, "")
+                calls.append(list(cmd))
+                if cmd and cmd[0] == "bd":
+                    args = list(cmd[1:])
+                    sub = args[0] if args else ""
+                    if sub == "show" and len(args) >= 2:
+                        if args[1] == sling_id:
+                            return _SlcResult(0, json.dumps([
+                                {"id": sling_id, "status": "open", "assignee": "",
+                                 "issue_type": "task"}]))
+                        return _SlcResult(0, json.dumps([{"id": args[1], "labels": []}]))
+                    if sub == "close":
+                        return _SlcResult(0, "")
+                    return _SlcResult(0, "")
+                if cmd and cmd[0] == "git":
+                    sub = cmd[3] if len(cmd) > 3 else ""
+                    if sub == "for-each-ref":
+                        return _SlcResult(1, "", "fatal: simulated ref-scan failure")
+                    return _SlcResult(0, "")
+                return _SlcResult(0, "")
+            return _run, calls
+
+        subprocess.run, _slc_calls10 = _make_slc_scanfail_stub("ga-sling10")
+        try:
+            do_reclaim("ga-target10", "some bead", reclaim_count=1, idle_min=40.0,
+                        labels=["story:in-flight"], sling_bead_id="ga-sling10")
+        finally:
+            subprocess.run = _orig_run_slc
+        _slc10_close = [c for c in _slc_calls10 if len(c) >= 3 and c[0] == "bd"
+                        and c[1] == "close" and c[2] == "ga-sling10"]
+        check("SLC-10 (ga-p2dqmd guard 3, third-state): a failed branch scan "
+              "(for-each-ref errors on every repo) is never treated as "
+              "'confirmed no branch' — sling is not closed",
+              len(_slc10_close) == 0, f"calls={_slc_calls10!r}")
     finally:
         subprocess.run = _orig_run_slc
         if _orig_reloop_env is None:
