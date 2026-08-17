@@ -95,10 +95,22 @@ to step 2.
 # already happened, so a retry never redoes a step that already
 # succeeded.
 
-# 1. Record the real blocker as a self-healing dependency edge — {{issue}}
-#    becomes dispatch-eligible again automatically once the blocker
-#    closes, no manual unpark step needed. This edge is the whole park's
-#    safety net — if it fails, stop before touching anything else.
+# 1. Record the real blocker as a dependency edge. This alone stops Pilot
+#    from PREMATURELY re-dispatching {{issue}} while the blocker stays
+#    open (verified: pilot-dispatcher.sh's _filter_unblocked, ga-5ew,
+#    excludes any bead in `bd blocked` from every candidate source) — but
+#    it does NOT make {{issue}} fully dispatch-eligible again on its own.
+#    Step 3 below adds pilot:no-auto-dispatch, a deliberate,
+#    human/Mayor-only-clearable veto by design (pilot-dispatcher.sh
+#    ga-1mqdz: "the label alone must hold") — and nothing in this
+#    codebase auto-restores ctx:ready/exec:auto/story:in-flight either
+#    (gate feedback, ga-rswuxy fix-attempt 2; not fixed then due to a
+#    review race — see ga-2e520n). A human must clear
+#    pilot:no-auto-dispatch and restore those three labels once the
+#    blocker closes for {{issue}} to actually resume — do not claim "no
+#    manual unpark step needed" anywhere in this file, it is false. This
+#    edge is the park's safety net against premature dispatch only — if
+#    it fails, stop before touching anything else.
 bd dep <blocking-bead-id> --blocks {{issue}} \
   || { echo "FATAL: could not record <blocking-bead-id> as blocking {{issue}} — nothing else has run yet. Check <blocking-bead-id> was substituted with a real bead id (it's a manual placeholder, not a templated var) and retry step 1." >&2; exit 1; }
 
@@ -369,9 +381,11 @@ gc mail inbox
 **Exit criteria:** EITHER branch pushed + gate marker created + formula
 step closed (build path), OR blocker dependency recorded + labels updated
 + formula step closed (park path). Source bead {{issue}} remains open in
-both cases — G closes it when the gate passes (build path), or the
-self-healing dependency makes it dispatch-eligible again once the blocker
-closes (park path)."""
+both cases — G closes it when the gate passes (build path); for the park
+path, the dependency edge only prevents PREMATURE re-dispatch while
+blocked — a human must clear pilot:no-auto-dispatch and restore
+ctx:ready/exec:auto/story:in-flight once the blocker closes before
+{{issue}} actually resumes (see step 1's PARK PROCEDURE comment above)."""
 
 [[steps]]
 id = "drain"
