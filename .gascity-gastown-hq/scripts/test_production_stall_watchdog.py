@@ -17,6 +17,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -269,6 +270,76 @@ class TestStuckExecutionCanonicalPark(unittest.TestCase):
         result = self.psw.stuck_execution(now=100000.0)
         self.assertIsNotNone(result)
         self.assertIn("ga-reallystuck", result)
+
+
+class TestMergeStallQuietHours(unittest.TestCase):
+    """Covers ga-lda92s: merge_stall() didn't know about quiet hours (00h-08h
+    local, ga-dxyvxr) — the deliberate overnight admission pause read as
+    "no merge for MERGE_STALL_SEC" and fired a false stall. The fix discounts
+    quiet-hours time from the elapsed-since-last-merge clock rather than
+    blanket-silencing the whole window (which would trade this false-positive
+    for a false-negative: a real stall starting 00h30 would go unseen for
+    7h30 — see quiet_hours.elapsed_adjustment's own docstring)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.psw = _load_psw()
+
+    def setUp(self):
+        self._orig_file_fresh = self.psw.file_fresh
+        self._orig_tail_lines = self.psw.tail_lines
+        self._orig_sh = self.psw.sh
+        self._orig_merge_stall_sec = self.psw.MERGE_STALL_SEC
+        self.psw.file_fresh = lambda path, max_age, now: True
+        self.psw.sh = lambda args, timeout=20: subprocess.CompletedProcess(
+            args=args, returncode=0, stdout="[]", stderr="")
+        self.psw.MERGE_STALL_SEC = 10800  # 3h, matches the real PROD_STALL_MERGE_SEC default
+        self._today = time.strftime("%Y-%m-%d")
+
+    def tearDown(self):
+        self.psw.file_fresh = self._orig_file_fresh
+        self.psw.tail_lines = self._orig_tail_lines
+        self.psw.sh = self._orig_sh
+        self.psw.MERGE_STALL_SEC = self._orig_merge_stall_sec
+        import os as _os
+        _os.environ.pop("QUIET_HOURS_OVERRIDE", None)
+
+    def _at(self, hms):
+        return time.mktime(time.strptime("%s %s" % (self._today, hms), "%Y-%m-%d %H:%M:%S"))
+
+    def _stub_log(self, merge_ts_epoch):
+        merge_line = "[%s] [quality-gate-dispatcher] Gate PASSED: branch=crew/x tier=CODE\n" % \
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(merge_ts_epoch))
+        queued_line = "[%s] [quality-gate-dispatcher] Found 2 queued marker(s)\n" % \
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(merge_ts_epoch))
+        self.psw.tail_lines = lambda path, n: [merge_line, queued_line]
+
+    def test_quiet_hours_explains_stale_merge_not_a_stall(self):
+        """Raw gap 00:30 -> 08:05 = 455min > 180min (MERGE_STALL_SEC=3h), but
+        quiet hours (00h-08h) explains ~450 of those minutes — effective gap
+        ~5min → NOT a stall (None)."""
+        self._stub_log(self._at("00:30:00"))
+        result = self.psw.merge_stall(now=self._at("08:05:00"))
+        self.assertIsNone(result, "quiet-hours-explained gap must not report a stall, got: %r" % (result,))
+
+    def test_override_open_forces_real_stall(self):
+        """Same-night construction, but the live signal reads OPEN (override)
+        while 'now' is still inside tonight's window → the override-safety
+        check must NOT trust today's portion → stall still fires. Literal
+        bug-AC bidirectional pair with the QUIET case above."""
+        import os as _os
+        _os.environ["QUIET_HOURS_OVERRIDE"] = "OPEN"
+        yesterday_2300 = self._at("00:00:00") - 3600  # yesterday 23:00
+        self._stub_log(yesterday_2300)
+        result = self.psw.merge_stall(now=self._at("03:00:00"))
+        self.assertIsNotNone(result, "OPEN-override gap must still report a stall (fix must not be a blanket mute)")
+
+    def test_daytime_gap_unaffected(self):
+        """Gap entirely during the day (no quiet-window overlap at all) →
+        adjustment is a no-op, stall fires exactly as before this fix."""
+        self._stub_log(self._at("09:00:00"))
+        result = self.psw.merge_stall(now=self._at("14:00:00"))
+        self.assertIsNotNone(result, "ordinary daytime gap has nothing to discount, must still report a stall")
 
 
 if __name__ == "__main__":

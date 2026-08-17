@@ -66,6 +66,7 @@ import sys as _sys
 _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 from gc_ledger import gc_ledger_append as _ledger
 import datetime as _datetime
+import quiet_hours
 
 # ga-qhca1: scripts/bead_state.py is the city's single canonical park
 # vocabulary (10 consumers used to each keep their own copy; every state bug
@@ -279,8 +280,18 @@ def merge_stall(now=None):
             e = log_ts_epoch(l)
             if e is not None:
                 last_merge = e if last_merge is None else max(last_merge, e)
-    if last_merge is not None and (now - last_merge) <= MERGE_STALL_SEC:
-        return None  # merged recently → flowing
+    if last_merge is not None:
+        # ga-lda92s: discount time the city spent in QUIET hours (deliberate
+        # admission pause) from the elapsed clock — NOT a blanket silence for
+        # the whole window (that would trade this false-positive for a
+        # false-negative: a real stall starting 00h30 would go unseen for
+        # 7h30). A stall that begins during quiet hours and is still
+        # unresolved once the discount runs out still alarms, just correctly
+        # later.
+        quiet_adj = quiet_hours.elapsed_adjustment(last_merge, now, now=now)
+        effective_elapsed = max(0, (now - last_merge) - quiet_adj)
+        if effective_elapsed <= MERGE_STALL_SEC:
+            return None  # merged recently (quiet-hours-adjusted) → flowing
 
     # Pending demand? latest "Found N queued marker(s)" in the log.
     queued = 0

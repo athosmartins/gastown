@@ -104,6 +104,21 @@ case "$GTSW_RECOVER_GRACE_SECS" in ''|*[!0-9]*) GTSW_RECOVER_GRACE_SECS=420 ;; e
 SUPERVISOR_LABEL="${GTSW_SUPERVISOR_LABEL:-com.gascity.supervisor}"
 GATE_LABEL="${GTSW_GATE_LABEL:-com.gascity.quality-gate-dispatcher}"
 
+# ga-lda92s: quiet-hours elapsed-clock adjustment — shared sibling-source
+# convention this pack already uses (see pilot-dispatcher.sh). Readability
+# checked BEFORE sourcing (not `2>/dev/null || true` after) so a missing
+# sibling fails loud via the sentinel check below instead of leaving
+# _quiet_elapsed_adjustment silently undefined.
+_GTSW_QHC_SIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../packs/town-deltas/assets/quiet-hours-check.sh"
+if [ -r "$_GTSW_QHC_SIB" ]; then
+  source "$_GTSW_QHC_SIB"
+fi
+unset _GTSW_QHC_SIB
+# Plain stderr echo, not log() — log() is not defined yet at this point in
+# this file (same ordering trap pilot-dispatcher.sh's own sourcing block
+# documents), and this check must not depend on definition order.
+[ -n "${QUIET_HOURS_LEVEL_FILE:-}" ] || echo "WARN: ga-lda92s: quiet-hours-check.sh failed to source — elapsed-clock adjustment is INERT this run (fail-open: stall detection proceeds on raw wall-clock elapsed, same as before this fix)" >&2
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || true; echo "[$(ts)] [gtsw] $*" >> "$LOG" 2>/dev/null || true; }
@@ -119,6 +134,10 @@ log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || true; echo "[$(ts)] [gtsw] $
 #   GTSW_TEST_KICKSTARTS   — file to record kickstart calls (for assertions)
 #   GTSW_TEST_NOTIFIED     — file to record notify calls
 #   GTSW_TEST_MAILED       — file to record gc mail calls
+#   GTSW_TEST_NOW          — fake `date +%s` for "now" (ga-lda92s) — without this,
+#                            quiet-hours scenarios would need real wall-clock time
+#                            to fall inside/outside the night window, making the
+#                            selftest's result depend on what time it happens to run.
 
 run_sweep() {
   # Kill-switch
@@ -127,7 +146,7 @@ run_sweep() {
     return 0
   fi
 
-  local now; now="$(date +%s)"
+  local now; now="${GTSW_TEST_NOW:-$(date +%s)}"
   local stall_window_sec; stall_window_sec=$(( ${GTSW_STALL_MINUTES:-165} * 60 ))
 
   # ── SIGNAL READ: tail the dispatcher log ─────────────────────────────────
@@ -322,13 +341,36 @@ run_sweep() {
     fi
   done <<< "$log_lines"
 
-  if [ "$last_passed_epoch" -gt 0 ] && [ $(( now - last_passed_epoch )) -le "$stall_window_sec" ] 2>/dev/null; then
-    local age_min; age_min=$(( (now - last_passed_epoch) / 60 ))
+  # ga-lda92s: discount time the city spent in QUIET hours (deliberate
+  # admission pause) from the elapsed clock — NOT a blanket silence for the
+  # whole window (that would trade this false-positive for a false-negative:
+  # a real stall starting 00h30 would go unseen for 7h30). A stall that
+  # begins during quiet hours and is still unresolved once the discount runs
+  # out still alarms, just correctly later.
+  local quiet_adj_sec=0 wall_elapsed_sec=0 effective_elapsed_sec=0
+  if [ "$last_passed_epoch" -gt 0 ] 2>/dev/null; then
+    wall_elapsed_sec=$(( now - last_passed_epoch ))
+    quiet_adj_sec="$(_quiet_elapsed_adjustment "$last_passed_epoch" "$now" 2>/dev/null)"
+    case "$quiet_adj_sec" in ''|*[!0-9]*) quiet_adj_sec=0 ;; esac
+    effective_elapsed_sec=$(( wall_elapsed_sec - quiet_adj_sec ))
+    [ "$effective_elapsed_sec" -lt 0 ] && effective_elapsed_sec=0
+  fi
+
+  if [ "$last_passed_epoch" -gt 0 ] && [ "$effective_elapsed_sec" -le "$stall_window_sec" ] 2>/dev/null; then
+    local age_min; age_min=$(( wall_elapsed_sec / 60 ))
     # COOLDOWN RESET: Gate PASSED recently → stall cleared; disarm so next episode re-alerts immediately
     [ -f "${COOLDOWN_FILE}" ] && { rm -f "${COOLDOWN_FILE}" 2>/dev/null || true; log "COOLDOWN RESET: Gate PASSED ${age_min}min ago — cooldown disarmed"; }
     # ga-evjs2: also clear the recover-marker so a NEW episode starts recover-first (no stale escalation)
     [ -f "${RECOVER_MARKER_FILE}" ] && { rm -f "${RECOVER_MARKER_FILE}" 2>/dev/null || true; log "RECOVER-MARKER RESET: Gate PASSED ${age_min}min ago — next episode recovers before paging Athos"; }
-    log "OK: Gate PASSED ${age_min}min ago (within ${GTSW_STALL_MINUTES}min window) — not a stall"
+    if [ "$quiet_adj_sec" -gt 0 ] && [ "$wall_elapsed_sec" -gt "$stall_window_sec" ] 2>/dev/null; then
+      # Raw elapsed alone WOULD have crossed the window — quiet hours is what
+      # explains the silence. Say so explicitly (not just "OK") so a human
+      # reading the log later sees the detector ran and decided, not that it
+      # went dead.
+      log "SUPPRESSED (quiet hours): raw ${age_min}min, quiet-adjusted $((effective_elapsed_sec / 60))min (within ${GTSW_STALL_MINUTES}min window) — not a stall"
+    else
+      log "OK: Gate PASSED ${age_min}min ago (within ${GTSW_STALL_MINUTES}min window) — not a stall"
+    fi
     return 0
   fi
 
@@ -976,10 +1018,74 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   grep -q "mail:" "$MAIL16" 2>/dev/null && ok "scenario 16: Mayor mailed (real stall, not masked by a stale/cleared weekly signal)" || bad "scenario 16: Mayor NOT mailed"
   [ -s "$KICKS16" ] && ok "scenario 16: kickstart fires for a real stall once weekly is confirmed not-active" || bad "scenario 16: kickstart withheld despite weekly.active=false"
 
+  # ── Scenario 17 (ga-lda92s): quiet hours explain a raw-stale Gate PASSED → NOT a stall ──
+  # Helper: build a "Gate PASSED" log line at an ABSOLUTE local timestamp (not
+  # relative to real now like make_log — GTSW_TEST_NOW pins "now" independently,
+  # so the embedded timestamp must be constructed independently too).
+  make_log_at() {
+    local hms="$1"  # "YYYY-MM-DD HH:MM:SS"
+    echo "[$(date -u '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] === Dispatcher sweep start (DRY_RUN=0) ==="
+    echo "[${hms}] [quality-gate-dispatcher] Gate PASSED (origin=Pilot): branch=fix/ga-test tier=CODE merge_sha=abc123 elapsed=300s"
+  }
+  TODAY="$(date +%Y-%m-%d)"
+
+  echo "Scenario 17 (ga-lda92s): last Gate PASSED at 00:30, now=08:05 (raw 455min > 165min window) — quiet hours (00h-08h) explains it → NOT a stall"
+  rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true
+  unset QUIET_HOURS_OVERRIDE
+  GTSW_TEST_NOW="$(date -j -f "%Y-%m-%d %H:%M:%S" "${TODAY} 08:05:00" +%s)"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers queued queued)"
+  GTSW_TEST_LOG_LINES="$(make_log_at "${TODAY} 00:30:00")"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS=""
+  NOTIF17="$TMP/notif17"; : > "$NOTIF17"
+  MAIL17="$TMP/mail17"; : > "$MAIL17"
+  GTSW_TEST_KICKSTARTS="$TMP/kicks17"; : > "$TMP/kicks17"
+  GTSW_TEST_NOTIFIED="$NOTIF17"
+  GTSW_TEST_MAILED="$MAIL17"
+  run_sweep && ok "scenario 17: quiet-hours-explained gap suppresses alert (return 0)" || bad "scenario 17: should NOT alert — raw gap is fully explained by quiet hours"
+  [ ! -s "$MAIL17" ] && ok "scenario 17: no Mayor mail (quiet-hours suppressed)" || bad "scenario 17: Mayor mailed despite quiet-hours-explained gap"
+  grep -q "SUPPRESSED (quiet hours): raw 455min, quiet-adjusted 5min" "$LOG" 2>/dev/null && ok "scenario 17: suppression logged distinctly with raw+adjusted minutes (detector ran and decided, not silent)" || bad "scenario 17: suppression not logged with expected raw/adjusted figures"
+
+  # ── Scenario 17b: SAME timestamps, but the live signal says OPEN (override
+  # engaged) while "now" is still inside tonight's calendar window → the
+  # override-safety check must NOT trust today's portion → stall fires anyway.
+  # This is the literal bug-AC bidirectional pair: QUIET must not mail, OPEN
+  # must — proving the fix is conditional, not a blanket mute.
+  echo "Scenario 17b (ga-lda92s): same-night gap, but live signal reads OPEN (override) at a 'now' still inside the window → stall still fires"
+  rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true
+  QUIET_HOURS_OVERRIDE=OPEN
+  GTSW_TEST_NOW="$(date -j -f "%Y-%m-%d %H:%M:%S" "${TODAY} 03:00:00" +%s)"
+  GTSW_TEST_LOG_LINES="$(make_log_at "${TODAY} 00:00:01")"
+  NOTIF17B="$TMP/notif17b"; : > "$NOTIF17B"
+  MAIL17B="$TMP/mail17b"; : > "$MAIL17B"
+  GTSW_TEST_KICKSTARTS="$TMP/kicks17b"; : > "$TMP/kicks17b"
+  GTSW_TEST_NOTIFIED="$NOTIF17B"
+  GTSW_TEST_MAILED="$MAIL17B"
+  run_sweep && bad "scenario 17b: should alert — override means the window was NOT actually enforced" || ok "scenario 17b: OPEN-override gap still alerts (return 1) — quiet-hours fix is not a blanket mute"
+  grep -q "mail:" "$MAIL17B" 2>/dev/null && ok "scenario 17b: Mayor mailed (real stall, override means quiet hours does not apply)" || bad "scenario 17b: Mayor NOT mailed despite override-confirmed non-quiet gap"
+  unset QUIET_HOURS_OVERRIDE
+
+  # ── Scenario 17c: gap entirely in daytime hours (no quiet-window overlap
+  # at all) → adjustment is a no-op, real stall fires exactly as before this
+  # fix — proves ordinary daytime stalls are untouched.
+  echo "Scenario 17c (ga-lda92s): raw-stale gap entirely during the day (no quiet-hours overlap) → stall fires unaffected"
+  rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true
+  GTSW_TEST_NOW="$(date -j -f "%Y-%m-%d %H:%M:%S" "${TODAY} 12:30:00" +%s)"
+  GTSW_TEST_LOG_LINES="$(make_log_at "${TODAY} 09:00:00")"
+  NOTIF17C="$TMP/notif17c"; : > "$NOTIF17C"
+  MAIL17C="$TMP/mail17c"; : > "$MAIL17C"
+  GTSW_TEST_KICKSTARTS="$TMP/kicks17c"; : > "$TMP/kicks17c"
+  GTSW_TEST_NOTIFIED="$NOTIF17C"
+  GTSW_TEST_MAILED="$MAIL17C"
+  run_sweep && bad "scenario 17c: should alert — daytime gap has nothing to discount" || ok "scenario 17c: daytime stall (no quiet-hours overlap) still alerts (return 1)"
+  grep -q "mail:" "$MAIL17C" 2>/dev/null && ok "scenario 17c: Mayor mailed (ordinary daytime stall unaffected by this fix)" || bad "scenario 17c: Mayor NOT mailed for an ordinary daytime stall"
+  rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true
+  unset GTSW_TEST_NOW
+
   # ── CLEANUP / SUMMARY ─────────────────────────────────────────────────────
   # Unset test seams so no state leaks
   unset GTSW_TEST_ACTIVE_MARKERS_JSON GTSW_TEST_LOG_LINES GTSW_TEST_QUOTA_RC GTSW_TEST_QUOTA_JSON GTSW_TEST_SESSIONS
-  unset GTSW_TEST_KICKSTARTS GTSW_TEST_NOTIFIED GTSW_TEST_MAILED
+  unset GTSW_TEST_KICKSTARTS GTSW_TEST_NOTIFIED GTSW_TEST_MAILED GTSW_TEST_NOW QUIET_HOURS_OVERRIDE
 
   echo ""
   echo "gate-throughput-stall-watchdog selftest: PASS=$PASS FAIL=$FAIL"

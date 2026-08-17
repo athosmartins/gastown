@@ -34,6 +34,12 @@ QUIET_HOURS_LEVEL_FILE="${QUIET_HOURS_LEVEL_FILE:-${HOME}/.gastown/run/city-quie
 # under normal jitter, while still catching a genuinely dead writer well
 # inside one quiet-hours window.
 QUIET_HOURS_MAX_AGE_SECS="${QUIET_HOURS_MAX_AGE_SECS:-1800}"
+# Mirrors city-night-window.sh's own NIGHT_START_HOUR/NIGHT_END_HOUR defaults
+# (00h-08h local, end exclusive) — the calendar-overlap math below needs the
+# same boundary the writer uses, or a caller could discount a range the writer
+# never actually paused.
+NIGHT_START_HOUR="${NIGHT_START_HOUR:-0}"
+NIGHT_END_HOUR="${NIGHT_END_HOUR:-8}"
 
 # _quiet_hours_blocks → "1" iff the level file says QUIET and is fresh, else
 # "0" (covers OPEN, missing, stale, and corrupt — all fail open the same way).
@@ -78,4 +84,81 @@ _quiet_hours_unreadable() {
   _now=$(date +%s)
   if [ $(( _now - _ts )) -gt "$QUIET_HOURS_MAX_AGE_SECS" ]; then printf '1'; return 0; fi
   printf '0'
+}
+
+# ── elapsed-clock adjustment (ga-lda92s) ────────────────────────────────────
+# The three functions above answer "is it quiet RIGHT NOW" — the admission
+# gate's only question. A STALL WATCHDOG asks a different question: "how much
+# of [event_ts, now] was the city actually expected to be flowing?" A watchdog
+# that just calls _quiet_hours_blocks and silences itself for the WHOLE window
+# trades a false-positive for a false-negative (a real stall starting 00h30
+# would go unseen for 7h30 — see ga-lda92s). The fix is to discount ONLY the
+# quiet portion of the elapsed clock, not the whole verdict.
+
+# _quiet_window_overlap_seconds <start_ts> <end_ts> — PURE calendar math: total
+# seconds of [start_ts, end_ts) that fall within local
+# [NIGHT_START_HOUR:00, NIGHT_END_HOUR:00) on any day. No file I/O, no live
+# state — deterministic and safe to unit-test directly with constructed
+# timestamps. Does NOT know about a live override; see
+# _quiet_elapsed_adjustment below for the safety wrapper that does.
+_quiet_window_overlap_seconds() {
+  local start_ts="${1:-}" end_ts="${2:-}"
+  case "$start_ts" in ''|*[!0-9]*) printf '0'; return 0 ;; esac
+  case "$end_ts" in ''|*[!0-9]*) printf '0'; return 0 ;; esac
+  [ "$end_ts" -le "$start_ts" ] 2>/dev/null && { printf '0'; return 0; }
+
+  local nsh="${NIGHT_START_HOUR:-0}" neh="${NIGHT_END_HOUR:-8}"
+  local day day_str total=0 iterations=0
+  day_str="$(date -j -f "%s" "$start_ts" "+%Y-%m-%d" 2>/dev/null)"
+  [ -z "$day_str" ] && { printf '0'; return 0; }
+  day="$(date -j -f "%Y-%m-%d %H:%M:%S" "${day_str} 00:00:00" +%s 2>/dev/null)"
+  [ -z "$day" ] && { printf '0'; return 0; }
+
+  # Bounded to 32 days (real callers span at most a few hours) — defensive,
+  # never meant to trip, just a hard stop against a date-arithmetic bug
+  # turning into an infinite loop.
+  while [ "$day" -lt "$end_ts" ] && [ "$iterations" -lt 32 ]; do
+    local win_start=$(( day + nsh * 3600 ))
+    local win_end=$(( day + neh * 3600 ))
+    local ov_start=$(( start_ts > win_start ? start_ts : win_start ))
+    local ov_end=$(( end_ts < win_end ? end_ts : win_end ))
+    [ "$ov_end" -gt "$ov_start" ] && total=$(( total + (ov_end - ov_start) ))
+    day=$(( day + 86400 ))
+    iterations=$(( iterations + 1 ))
+  done
+  printf '%s' "$total"
+}
+
+# _quiet_elapsed_adjustment <start_ts> <end_ts> — seconds to SUBTRACT from a
+# raw (end_ts - start_ts) elapsed duration to discount legitimate quiet-hours
+# pause. Composes the pure calendar overlap above with a live-signal safety
+# check: if end_ts's own calendar day says "still in tonight's window" but the
+# LIVE signal disagrees (a human override is active — see
+# city-night-window.sh's ESCAPE PARA TRABALHAR DE MADRUGADA — or the writer is
+# stale/down), we cannot confirm TODAY's portion was actually enforced, so we
+# don't discount it — only prior days (if the range spans more than one
+# night) stay discounted. Errs toward NOT discounting, i.e. toward the
+# wall-clock elapsed a real stall would need anyway — never toward silence.
+_quiet_elapsed_adjustment() {
+  local start_ts="${1:-}" end_ts="${2:-}"
+  local raw; raw="$(_quiet_window_overlap_seconds "$start_ts" "$end_ts")"
+  case "$raw" in ''|0) printf '0'; return 0 ;; esac
+
+  local nsh="${NIGHT_START_HOUR:-0}" neh="${NIGHT_END_HOUR:-8}"
+  local day_str end_midnight
+  day_str="$(date -j -f "%s" "$end_ts" "+%Y-%m-%d" 2>/dev/null)"
+  [ -z "$day_str" ] && { printf '%s' "$raw"; return 0; }
+  end_midnight="$(date -j -f "%Y-%m-%d %H:%M:%S" "${day_str} 00:00:00" +%s 2>/dev/null)"
+  [ -z "$end_midnight" ] && { printf '%s' "$raw"; return 0; }
+
+  local win_start=$(( end_midnight + nsh * 3600 ))
+  local win_end=$(( end_midnight + neh * 3600 ))
+  if [ "$end_ts" -ge "$win_start" ] && [ "$end_ts" -lt "$win_end" ] && [ "$(_quiet_hours_blocks)" != "1" ]; then
+    if [ "$win_start" -gt "$start_ts" ] 2>/dev/null; then
+      raw="$(_quiet_window_overlap_seconds "$start_ts" "$win_start")"
+    else
+      raw=0
+    fi
+  fi
+  printf '%s' "$raw"
 }

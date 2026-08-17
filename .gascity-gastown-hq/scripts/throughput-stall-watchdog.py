@@ -70,6 +70,7 @@ from gc_ledger import gc_ledger_append as _tsw_ledger
 import datetime as _tsw_datetime
 import park_labels
 import reclaim_liveness
+import quiet_hours
 
 # ga-98inr: scripts/bead_state.py is the city's single canonical state model
 # (10 consumers used to each keep their own park-label copy — this file's own
@@ -619,6 +620,23 @@ def _tick_blind_and_dolt(signals_errored, now, state):
 #   (0, ...)      → readable, genuinely zero (idle, no false alarm)
 #   (N>0, ...)    → readable, flow present
 _SIGNAL_ERROR = (None, None)
+
+def _quiet_expanded_lookback_sec(now, window_sec):
+    """ga-lda92s: expand `window_sec` so its NON-quiet portion still equals
+    window_sec, given "now" as the fixed end of the range. Fixed-point: the
+    quiet overlap of [now-X, now) is bounded (at most one night per calendar
+    day spanned) and monotonic in X, so a handful of iterations converges —
+    each step's added overlap keeps shrinking until expanding further stops
+    finding any more quiet time to compensate for."""
+    expanded = window_sec
+    for _ in range(4):
+        adj = quiet_hours.elapsed_adjustment(now - expanded, now, now=now)
+        new_expanded = window_sec + adj
+        if new_expanded == expanded:
+            break
+        expanded = new_expanded
+    return expanded
+
 
 def dispatch_signal(now, window_sec):
     """Returns (count, last_dispatch_epoch) where count is dispatches in window.
@@ -1725,17 +1743,30 @@ def run_tick(now, state):
     DOLT-HEALTH (imp08): Dolt is probed every tick independently of the three throughput signals.
     A confirmed unhealthy Dolt → distinct "dolt" escalation after DOLT_CONFIRM_SWEEPS sweeps."""
     window_sec = STALL_HOURS * 3600
+    # ga-lda92s: quiet hours (00h-08h local) deliberately pause new-work
+    # admission — "0 dispatches/merges in the last STALL_HOURS" during that
+    # window is not evidence of a stall, it's the pause working as designed.
+    # Rather than silence the whole window (a real stall starting 00h30 would
+    # then go unseen for 7h30 — trading this false-positive for a false-
+    # negative), EXPAND the lookback so its NON-quiet portion still equals
+    # STALL_HOURS: dispatch/merge signals look further back by however much
+    # of that extra range was quiet, so a stall is still caught once there
+    # has genuinely been STALL_HOURS of open-admission silence.
+    lookback_sec = _quiet_expanded_lookback_sec(now, window_sec)
+    if lookback_sec > window_sec:
+        _log("tick: quiet-hours adjustment — lookback expanded %.1fh -> %.1fh (%.1fh quiet overlap) so the deliberate admission pause is not read as a stall"
+             % (window_sec / 3600.0, lookback_sec / 3600.0, (lookback_sec - window_sec) / 3600.0))
     signals_errored = []   # names of signals that ERROR this sweep (for imp08 blind-floor)
 
     # SIGNAL 1: dispatch
-    dispatch_count, last_dispatch_epoch = dispatch_signal(now, window_sec)
+    dispatch_count, last_dispatch_epoch = dispatch_signal(now, lookback_sec)
     if dispatch_count is None:
         # ERROR: fail-open for stall logic; count for blind-floor
         _log("tick: dispatch_signal ERROR → fail-open (treat as dispatched)")
         signals_errored.append("dispatch")
 
     # SIGNAL 2: merge
-    merge_count, last_merge_epoch = merge_signal(now, window_sec)
+    merge_count, last_merge_epoch = merge_signal(now, lookback_sec)
     if merge_count is None:
         _log("tick: merge_signal ERROR → fail-open (treat as merged)")
         signals_errored.append("merge")
@@ -3321,6 +3352,67 @@ def _selftest():
         else:
             _bad("ga-98inr-4", "%s: old=%s new=%s (canonical must agree with old=True, not narrow)"
                  % (_g98n_desc, _g98n_old, _g98n_new))
+
+    # ── ga-lda92s: quiet-hours-aware lookback expansion ─────────────────────────
+    # Uses REAL local calendar timestamps (not the synthetic NOW above) — the
+    # quiet-hours math is calendar-of-day-based, so it needs a genuine 00h-08h
+    # span to discount, constructed the same way as the bash watchdogs'
+    # equivalent selftest scenarios (parity worked example: 00:30 -> 08:05).
+    _today = time.strftime("%Y-%m-%d")
+
+    def _at(hms):
+        return time.mktime(time.strptime(_today + " " + hms, "%Y-%m-%d %H:%M:%S"))
+
+    print("\nScenario ga-lda92s-1: _quiet_expanded_lookback_sec pure math")
+    _exp_night = _quiet_expanded_lookback_sec(_at("08:05:00"), 4 * 3600)
+    if _exp_night > 4 * 3600 + 3600:
+        _ok("ga-lda92s-1: lookback expands well past 4h when 'now' sits right after a quiet window (got %.1fh)" % (_exp_night / 3600))
+    else:
+        _bad("ga-lda92s-1", "expected meaningful expansion past 4h, got %.1fh" % (_exp_night / 3600))
+
+    _exp_day = _quiet_expanded_lookback_sec(_at("14:00:00"), 4 * 3600)
+    if _exp_day == 4 * 3600:
+        _ok("ga-lda92s-1b: lookback unchanged for a pure-daytime window (no quiet overlap to expand into)")
+    else:
+        _bad("ga-lda92s-1b", "expected no expansion for a daytime window, got %.1fh" % (_exp_day / 3600))
+
+    # ── ga-lda92s-2: a REAL Gate PASSED at 00:30 is invisible to the raw 4h
+    # window at now=08:05 (455min gap), but the quiet-hours-expanded lookback
+    # reaches back past it → flow found → NOT a stall (pending stays 0).
+    print("\nScenario ga-lda92s-2: Gate PASSED at 00:30, now=08:05 — raw 4h window misses it, quiet-hours-expanded lookback finds it → NOT a stall")
+    _q_ts = time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(_at("00:30:00")))
+    # Non-empty (but zero-dispatched) pilot log, same shape as Scenario A's
+    # _pilot_lines(0, n) — an EMPTY list reads as "log unreadable" to
+    # dispatch_signal, which fails the tick open at the dispatch-signal check
+    # BEFORE ever reaching the merge/gate_passed logic this scenario means to
+    # exercise (caught live: an earlier version of this test used `lambda: []`
+    # and passed for the wrong reason — dispatch fail-open short-circuited the
+    # tick, never touching the quiet-hours-expanded lookback at all).
+    _read_pilot_log_lines = lambda: _pilot_lines(0, 3)
+    _read_gate_log_lines  = lambda: ["%s [quality-gate-dispatcher] Gate PASSED: branch=crew/x tier=CODE\n" % _q_ts]
+    _git_log_count        = lambda root, since: 0
+    _bd_backlog           = lambda root: _backlog(3)
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(_at("08:05:00"), st)
+    if st["pending"] == 0 and not mail_calls:
+        _ok("ga-lda92s-2: quiet-hours-expanded lookback finds the 00:30 Gate PASSED (pending stays 0, no mail)")
+    else:
+        _bad("ga-lda92s-2", "pending=%d mails=%d (expanded lookback should have found the 00:30 Gate PASSED)" % (st["pending"], len(mail_calls)))
+
+    # ── ga-lda92s-3: SAME shape, but the gap is entirely in daytime hours (no
+    # quiet-window overlap at all) — expansion is a no-op, stall fires exactly
+    # as it did before this fix (first tick → pending=1, matching Scenario A).
+    print("\nScenario ga-lda92s-3: Gate PASSED at 09:00, now=14:00 (no quiet-hours overlap) — stall detection unaffected")
+    _q_ts_day = time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(_at("09:00:00")))
+    _read_gate_log_lines  = lambda: ["%s [quality-gate-dispatcher] Gate PASSED: branch=crew/x tier=CODE\n" % _q_ts_day]
+    mail_calls.clear(); notify_calls.clear()
+    st2 = _reset()
+    run_tick(_at("14:00:00"), st2)
+    if st2["pending"] == 1:
+        _ok("ga-lda92s-3: ordinary daytime gap still increments pending on first tick (unaffected by this fix)")
+    else:
+        _bad("ga-lda92s-3", "pending=%d (daytime gap has nothing to discount, should behave exactly as before this fix)" % st2["pending"])
 
     # ── cleanup ───────────────────────────────────────────────────────────────────
     _read_pilot_log_lines = None

@@ -228,6 +228,20 @@ BD_BIN="${GOLW_BD_BIN:-bd}"
 GOLW_STATE_DIR="${GOLW_STATE_DIR:-$HOME/.gastown/state}"
 STATE_FILE="${GOLW_STATE_FILE:-$GOLW_STATE_DIR/gate-orphaned-label-watchdog.state.json}"
 
+# ga-lda92s: quiet-hours elapsed-clock adjustment — shared sibling-source
+# convention this pack already uses (see pilot-dispatcher.sh). Readability
+# checked BEFORE sourcing (not `2>/dev/null || true` after) so a missing
+# sibling fails loud via the sentinel check below instead of leaving
+# _quiet_elapsed_adjustment silently undefined.
+_GOLW_QHC_SIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../packs/town-deltas/assets/quiet-hours-check.sh"
+if [ -r "$_GOLW_QHC_SIB" ]; then
+  source "$_GOLW_QHC_SIB"
+fi
+unset _GOLW_QHC_SIB
+# Plain stderr echo, not log() — log() is not defined yet at this point in
+# this file, and this check must not depend on definition order.
+[ -n "${QUIET_HOURS_LEVEL_FILE:-}" ] || echo "WARN: ga-lda92s: quiet-hours-check.sh failed to source — elapsed-clock adjustment is INERT this run (fail-open: staleness detection proceeds on raw wall-clock age, same as before this fix)" >&2
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || true; echo "[$(ts)] [golw] $*" >> "$LOG" 2>/dev/null || true; }
@@ -486,7 +500,11 @@ run_sweep() {
   fi
 
   local now cutoff
-  now="$(date +%s)"
+  # GOLW_TEST_NOW (ga-lda92s): fake "now" for quiet-hours selftest scenarios —
+  # without it, a scenario asserting quiet-hours suppression would need real
+  # wall-clock time to fall inside the night window, making the result depend
+  # on when the selftest happens to run.
+  now="${GOLW_TEST_NOW:-$(date +%s)}"
   cutoff=$(( now - GOLW_STALE_MINUTES * 60 ))
 
   local exclude_prefixes_json
@@ -617,6 +635,25 @@ run_sweep() {
       bepoch="$(printf '%s' "$bts" | jq -Rr 'fromdateiso8601? // empty' 2>/dev/null)"
       if [ -n "${bepoch:-}" ]; then
         age_min=$(( (now - bepoch) / 60 ))
+        # ga-lda92s: jq's cutoff filter above (line ~555) is a RAW-age
+        # pre-filter — it can only ever ADMIT candidates, never wrongly
+        # exclude one the quiet-adjusted check below would still flag (the
+        # discount is non-negative, so effective age <= raw age always).
+        # Here, per-bead (not a single global cutoff — two beads aged 200min
+        # can have different quiet-overlap if their bts differ), discount
+        # time the city spent in QUIET hours from THIS bead's age. If that
+        # drops it back under the threshold, the staleness is fully explained
+        # by the deliberate admission pause — skip it (log why, same as the
+        # active/error skips above) rather than flag a non-orphan.
+        local _golw_quiet_adj _golw_eff_age_sec
+        _golw_quiet_adj="$(_quiet_elapsed_adjustment "$bepoch" "$now" 2>/dev/null)"
+        case "$_golw_quiet_adj" in ''|*[!0-9]*) _golw_quiet_adj=0 ;; esac
+        _golw_eff_age_sec=$(( (now - bepoch) - _golw_quiet_adj ))
+        [ "$_golw_eff_age_sec" -lt 0 ] && _golw_eff_age_sec=0
+        if [ "$_golw_quiet_adj" -gt 0 ] && [ "$_golw_eff_age_sec" -lt $(( GOLW_STALE_MINUTES * 60 )) ] 2>/dev/null; then
+          log "SUPPRESSED (quiet hours): $bid raw age=${age_min}min, quiet-adjusted=$(( _golw_eff_age_sec / 60 ))min (< ${GOLW_STALE_MINUTES}min) — not flagging"
+          continue
+        fi
       else
         age_min="?"
       fi
@@ -1829,6 +1866,65 @@ GCSTUB
   grep -q "ACTIVE: 1 bead" "$LOG" 2>/dev/null && ok "scenario 36: 2nd sweep logs it under ACTIVE (no longer re-alerting)" || bad "scenario 36: 2nd sweep did not record the active-live count"
   [ ! -s "$TMP/comm36b" ] && ok "scenario 36: no NEW comment posted on the 2nd sweep" || bad "scenario 36: a comment was posted on the 2nd sweep despite the assignee now being live"
   rm -f "$TMP/fixtures/recheck-cand-transition.json" "$STATE_FILE" "$TMP/fixtures/sessions-active.json" 2>/dev/null
+
+  # ── Scenario Q1 (ga-lda92s): stale bead whose staleness is fully explained
+  # by quiet hours → NOT flagged. "now" pinned outside tonight's window
+  # (08:05) so this scenario needs no live-signal isolation — the override
+  # safety check never triggers (see _quiet_elapsed_adjustment), it's pure
+  # calendar math, hermetic regardless of the real production level file.
+  echo "Scenario Q1 (ga-lda92s): bead updated 00:30, now=08:05 (raw 455min > 180min) — quiet hours (00h-08h) explains it → NOT flagged"
+  TODAY="$(date +%Y-%m-%d)"
+  epoch_at() { date -j -f "%Y-%m-%d %H:%M:%S" "${TODAY} $1" +%s; }
+  iso_at()   { date -u -r "$(epoch_at "$1")" +%Y-%m-%dT%H:%M:%SZ; }
+  GOLW_TEST_NOW="$(epoch_at 08:05:00)"
+  printf '[%s]' "$(mk_candidate cand-quiet1 "$TMP/hq" "gate:fix-attempt:1" "$(iso_at 00:30:00)")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-quiet1.json"
+  NOTIFQ1="$TMP/notifq1"; MAILQ1="$TMP/mailq1"; COMMQ1="$TMP/commq1"
+  : > "$NOTIFQ1"; : > "$MAILQ1"; : > "$COMMQ1"
+  GOLW_TEST_NOTIFIED="$NOTIFQ1" GOLW_TEST_MAILED="$MAILQ1" GOLW_TEST_COMMENTS_LOG="$COMMQ1" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario Q1: quiet-hours-explained staleness NOT flagged (return 0)" || bad "scenario Q1: should NOT flag — raw age is fully explained by quiet hours, got $rc"
+  [ ! -s "$COMMQ1" ] && ok "scenario Q1: no comment posted (not flagged)" || bad "scenario Q1: comment posted despite quiet-hours-explained staleness"
+  grep -q "SUPPRESSED (quiet hours): cand-quiet1 raw age=455min, quiet-adjusted=5min" "$LOG" 2>/dev/null && ok "scenario Q1: suppression logged distinctly with raw+adjusted minutes" || bad "scenario Q1: suppression not logged with expected raw/adjusted figures"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario Q2: same-night construction, but live signal reads OPEN
+  # (override) while "now" is still inside tonight's window → the override-
+  # safety check must NOT trust today's portion → still flagged. Literal
+  # bug-AC bidirectional pair with Q1: QUIET-explained must not flag, an
+  # OPEN-confirmed non-quiet gap must — proving this is not a blanket mute.
+  echo "Scenario Q2 (ga-lda92s): bead updated yesterday 23:00, now=today 03:00 (raw 240min > 180min), but live signal reads OPEN (override) → still flagged"
+  QUIET_HOURS_OVERRIDE=OPEN
+  GOLW_TEST_NOW="$(epoch_at 03:00:00)"
+  YDAY_2300_ISO="$(date -u -r "$(( $(epoch_at 00:00:00) - 3600 ))" +%Y-%m-%dT%H:%M:%SZ)"
+  printf '[%s]' "$(mk_candidate cand-quiet2 "$TMP/hq" "gate:fix-attempt:1" "$YDAY_2300_ISO")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-quiet2.json"
+  NOTIFQ2="$TMP/notifq2"; MAILQ2="$TMP/mailq2"; COMMQ2="$TMP/commq2"
+  : > "$NOTIFQ2"; : > "$MAILQ2"; : > "$COMMQ2"
+  GOLW_TEST_NOTIFIED="$NOTIFQ2" GOLW_TEST_MAILED="$MAILQ2" GOLW_TEST_COMMENTS_LOG="$COMMQ2" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario Q2: OPEN-override gap still flagged (return 1) — quiet-hours fix is not a blanket mute" || bad "scenario Q2: should flag — override means the window was NOT actually enforced, got $rc"
+  grep -q "cand-quiet2" "$COMMQ2" 2>/dev/null && ok "scenario Q2: comment posted (real staleness, override means quiet hours does not apply)" || bad "scenario Q2: no comment posted despite override-confirmed non-quiet gap"
+  unset QUIET_HOURS_OVERRIDE
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario Q3: staleness entirely during daytime (no quiet-window
+  # overlap at all) → adjustment is a no-op, flags exactly as before this fix.
+  echo "Scenario Q3 (ga-lda92s): bead updated 09:00, now=14:00 (no quiet-hours overlap) → flagged unaffected"
+  GOLW_TEST_NOW="$(epoch_at 14:00:00)"
+  printf '[%s]' "$(mk_candidate cand-quiet3 "$TMP/hq" "gate:fix-attempt:1" "$(iso_at 09:00:00)")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-quiet3.json"
+  NOTIFQ3="$TMP/notifq3"; MAILQ3="$TMP/mailq3"; COMMQ3="$TMP/commq3"
+  : > "$NOTIFQ3"; : > "$MAILQ3"; : > "$COMMQ3"
+  GOLW_TEST_NOTIFIED="$NOTIFQ3" GOLW_TEST_MAILED="$MAILQ3" GOLW_TEST_COMMENTS_LOG="$COMMQ3" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario Q3: ordinary daytime staleness still flagged (return 1)" || bad "scenario Q3: should flag — daytime gap has nothing to discount, got $rc"
+  grep -q "cand-quiet3" "$COMMQ3" 2>/dev/null && ok "scenario Q3: comment posted (ordinary daytime staleness unaffected by this fix)" || bad "scenario Q3: no comment posted for ordinary daytime staleness"
+  rm -f "$STATE_FILE" 2>/dev/null
+  unset GOLW_TEST_NOW
 
   echo ""
   echo "gate-orphaned-label-watchdog selftest: PASS=$PASS FAIL=$FAIL"
