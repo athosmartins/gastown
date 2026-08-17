@@ -7238,6 +7238,44 @@ else
   bad "RAM-pressure probe missing the fail-open guard (absent file must not block dispatch)"
 fi
 
+# ── Scenario ga-nxj7kc: dispatch template's "Claim your work" assign must match
+# bd heartbeat's default actor ───────────────────────────────────────────────
+# Bug ga-nxj7kc: both DISPATCH_TASK heredocs' "## Claim your work (do this
+# first)" section ran `bd assign "$STORY_ID" "$GC_ALIAS"` (the dispatched
+# dog's STABLE pool-slot name, e.g. "gastown.dog-1"). mol-do-work.toml's own
+# next step calls bare `bd heartbeat {{issue}}` with no --actor, which
+# resolves its actor from $BEADS_ACTOR (bd's own default chain, per `bd
+# --help`) — in this city, $BEADS_ACTOR is the per-incarnation session name
+# (e.g. "dog-ga5esp5s"), a DIFFERENT string than $GC_ALIAS for every pool
+# worker (dog/wa-worker/ps-worker). bd's actor-vs-assignee check is a plain
+# string compare, so it refused every dispatched dog's first heartbeat with
+# "issue already claimed by <alias>" even though it was genuinely the same
+# session — silently breaking the lease refresh mol-do-work.toml itself
+# calls non-fatal-but-load-bearing (weakens inflight-reclaim-guard staleness
+# detection across every dispatch). Fix: assign via
+# "${BEADS_ACTOR:-$GC_ALIAS}" instead — matches what bd heartbeat will
+# resolve to whenever $BEADS_ACTOR is set (the normal case, confirmed live:
+# gc bd update --claim already assigns via this same identity), falling back
+# to the old $GC_ALIAS-only behavior only if $BEADS_ACTOR is somehow unset.
+#
+# A bare grep for "GC_ALIAS" would stay green even if only one of the two
+# DISPATCH_TASK sites (bug-tier, feature-tier) were fixed — count exact
+# occurrences of both the retired buggy pattern and the fixed pattern, the
+# same dual-count style already used above for $LIVE_VERIFY_SECTION.
+BUGGY_ASSIGN_COUNT=$(grep -cF 'assign "$STORY_ID" "\$GC_ALIAS"' "$DISPATCHER")
+if [ "$BUGGY_ASSIGN_COUNT" -eq 0 ]; then
+  ok "ga-nxj7kc: no DISPATCH_TASK site assigns via bare \$GC_ALIAS (would desync from bd heartbeat's \$BEADS_ACTOR default)"
+else
+  bad "ga-nxj7kc: REGRESSION — $BUGGY_ASSIGN_COUNT DISPATCH_TASK site(s) still assign via bare \$GC_ALIAS — every dispatched dog's first heartbeat will be refused"
+fi
+
+FIXED_ASSIGN_COUNT=$(grep -cF 'assign "$STORY_ID" "\${BEADS_ACTOR:-\$GC_ALIAS}"' "$DISPATCHER")
+if [ "$FIXED_ASSIGN_COUNT" -eq 2 ]; then
+  ok "ga-nxj7kc: both DISPATCH_TASK 'Claim your work' sites (bug-tier + feature-tier) assign via \${BEADS_ACTOR:-\$GC_ALIAS} — matches bd heartbeat's own actor default"
+else
+  bad "ga-nxj7kc: expected 2 sites assigning via \${BEADS_ACTOR:-\$GC_ALIAS} (bug-tier + feature-tier), found $FIXED_ASSIGN_COUNT — one DISPATCH_TASK template may be missing the fix"
+fi
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

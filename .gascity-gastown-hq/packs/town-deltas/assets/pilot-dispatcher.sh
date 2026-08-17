@@ -7533,7 +7533,7 @@ $WORKTREE_DIRECTIVE
 $DISPATCH_STEP5
 
 ## Claim your work (do this first)
-bd -C "$STORY_BEAD_CITY" assign "$STORY_ID" "\$GC_ALIAS"
+bd -C "$STORY_BEAD_CITY" assign "$STORY_ID" "\${BEADS_ACTOR:-\$GC_ALIAS}"
 bd -C "$STORY_BEAD_CITY" status in_progress "$STORY_ID"
 
 Start now. Do not wait for permission.
@@ -7576,7 +7576,7 @@ $WORKTREE_DIRECTIVE
 $DISPATCH_STEP5
 
 ## Claim your work (do this first)
-bd -C "$STORY_BEAD_CITY" assign "$STORY_ID" "\$GC_ALIAS"
+bd -C "$STORY_BEAD_CITY" assign "$STORY_ID" "\${BEADS_ACTOR:-\$GC_ALIAS}"
 bd -C "$STORY_BEAD_CITY" status in_progress "$STORY_ID"
 
 Start now. Do not wait for permission.
