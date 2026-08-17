@@ -1389,7 +1389,11 @@ echo "$_FC_FN" | grep -qF '🚨' && ok "_filter_candidates carries the 🚨 comp
 # raced terminal/blocked status), while still allowing the states that must dispatch.
 # Extracted-function harness (mirrors _fc): stub bd/branch/session, assert the reason.
 echo "Scenario OWN-GUARD (ga-htjni ext): guard refuses external in_progress crew self-claim, allows the legit states"
-_OG_FN="$(awk '/^_ownership_guard_should_refuse\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+# ga-xohllv: _ownership_guard_should_refuse calls _beadid_branch_signal (signal a's
+# in-flight check), which itself calls _beadid_matched_crew_branch_ref — neither was
+# extracted here (Scenario ga-rcees further below has the proven-complete reference
+# for this chain).
+_OG_FN="$(awk '/^_ownership_guard_should_refuse\(\)/{f=1} /^_beadid_matched_crew_branch_ref\(\)/{f=1} /^_beadid_branch_signal\(\)/{f=1} f{print} f&&/^}$/{f=0}' "$DISPATCHER")"
 # Also extract signal (d)'s helper so the guard's real composition is tested (not a
 # stub). With PILOT_TEST_GATE_ACTIVE_BEADS UNDEFINED (the default in the (1)-(5)
 # cases below) it short-circuits to the stubbed bd → empty → return 1 (no active
@@ -1531,7 +1535,13 @@ _og_e() { (
     eval "$_OG_FN"; eval "$_ATT_FN"
     SELF_BEAD_ID=""; _DEADWORKER_OK=1
     bd() { case "$*" in *" show "*) printf '%s' "${OG_BEAD_JSON:-}" ;; *) : ;; esac; }
-    _beadid_has_crew_branch()          { return 1; }   # isolate (a)
+    _beadid_has_crew_branch()          { return 1; }   # isolate (a), legacy name (kept for parity with _og() above)
+    _beadid_branch_signal()            { return 1; }   # ga-xohllv/ga-8jxe1: signal (a)'s REAL entry point is this one
+                                                         # now (_ownership_guard_should_refuse calls it directly, not
+                                                         # _beadid_has_crew_branch) — without this stub the real,
+                                                         # extracted _beadid_branch_signal runs and falls through to
+                                                         # live git/_ownership_guard_repos, which this hermetic
+                                                         # scenario never sets up (mirrors _og()'s own stub above).
     _beadid_has_active_gate_artifact() { return 1; }   # isolate (d)
     _session_is_live()                 { return 1; }   # isolate (b)/(c)
     _session_is_active_owner()         { return 1; }   # ga-46wq5: signal (b) now calls this, not _session_is_live
@@ -4607,9 +4617,23 @@ has "$DISPATCHER" 'exclude-label "gate:needs-fix"' "ctx:ready query excludes gat
 # _filter_built now also consults the HQ gate markers (wa-8y45 leak), so extract its two
 # gate helpers alongside it. Gate seams are set EMPTY (defined→hermetic, no live Dolt) in
 # the branch-only cases so the gate consultation is a no-op there.
+# ga-xohllv: _filter_built also calls _beadid_branch_signal (ga-8jxe1, to classify a
+# matched branch as orphan/merged/etc.) — that dependency grew onto _filter_built AFTER
+# this extraction was written and was never added here. Under this file's `set -uo
+# pipefail` (no -e), the undefined-function call inside $(...) failed with "command not
+# found" and silently expanded to an empty string rather than aborting; _filter_built's
+# own fallback then treats an empty signal as "not orphan" — the same branch every
+# PILOT_TEST_BRANCH_BEADS fixture below actually wants, so this was stderr noise, not a
+# false pass (none of these scenarios assert on orphan-branch classification; that's
+# covered separately and correctly by Scenario ga-rcees's own from-scratch extraction).
+# Still a real drift-class bug: the FIRST scenario here to test orphan-branch behavior
+# via $_FB_FN would have silently tested nothing. _beadid_branch_signal itself calls
+# _beadid_matched_crew_branch_ref (see Scenario ga-rcees's own extraction further
+# below, the proven-complete reference for this chain) — that dependency is needed
+# too, or this only trades one undefined-function gap for another.
 _FB_FN="$(grep '^log()' "$DISPATCHER")
 $(sed -n '/^_log_exclusions() {/,/^}$/p' "$DISPATCHER")
-$(awk '/^_beadid_has_active_gate_artifact\(\)/{f=1} /^_beadid_has_open_gate_marker\(\)/{f=1} /^_filter_built\(\)/{f=1} f{print} f&&/^}$/{f=0}' "$DISPATCHER")"
+$(awk '/^_beadid_has_active_gate_artifact\(\)/{f=1} /^_beadid_has_open_gate_marker\(\)/{f=1} /^_beadid_matched_crew_branch_ref\(\)/{f=1} /^_beadid_branch_signal\(\)/{f=1} /^_filter_built\(\)/{f=1} f{print} f&&/^}$/{f=0}' "$DISPATCHER")"
 FB_OUT="$(eval "$_FB_FN"; export PILOT_TEST_BRANCH_BEADS="wa-built" PILOT_TEST_GATE_OPEN_BEADS="" PILOT_TEST_GATE_ACTIVE_BEADS=""; printf '%s' '[{"id":"wa-built"},{"id":"wa-fresh"}]' | _filter_built | jq -rc '[.[].id]' 2>/dev/null)"
 if [ "$FB_OUT" = '["wa-fresh"]' ]; then
   ok "_filter_built drops the built (branched) bead, keeps the fresh candidate"
@@ -5023,7 +5047,8 @@ esac
 
 # (3)-(4) need signal (d) live (not stubbed away), so extract it fresh alongside the
 # real guard rather than reusing _OG_FNS (which only carries the branch-signal chain).
-_OG_D3EG2_FN="$(awk '/^_ownership_guard_should_refuse\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+# ga-xohllv: same missing branch-signal chain as _OG_FN above.
+_OG_D3EG2_FN="$(awk '/^_ownership_guard_should_refuse\(\)/{f=1} /^_beadid_matched_crew_branch_ref\(\)/{f=1} /^_beadid_branch_signal\(\)/{f=1} f{print} f&&/^}$/{f=0}' "$DISPATCHER")"
 _GATE_D3EG2_FN="$(awk '/^_beadid_has_active_gate_artifact\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
 [ -n "$_OG_D3EG2_FN" ] && [ -n "$_GATE_D3EG2_FN" ] \
   || bad "ga-d3eg2: failed to extract _ownership_guard_should_refuse/_beadid_has_active_gate_artifact from $DISPATCHER — awk markers drifted"
@@ -6224,9 +6249,15 @@ git -C "$GJ6_PUSHER" commit -q --allow-empty -m init
 git -C "$GJ6_PUSHER" remote add origin "$GJ6_BARE"
 git -C "$GJ6_PUSHER" push -q origin HEAD:refs/heads/fix/gj6-remoteonly-slug
 
+# ga-xohllv: _filter_built calls _beadid_branch_signal (ga-8jxe1), which itself calls
+# _beadid_matched_crew_branch_ref — both missing from the extraction below. This
+# scenario sets up REAL git repos with real branches, so unlike the synthetic
+# PILOT_TEST_BRANCH_BEADS fixtures elsewhere in this file, the missing dependency
+# here was live-exercised, not just noise (Scenario ga-rcees's own complete extraction
+# further above is the proven-correct reference for this chain).
 _GJ6_FILTER_BUILT_FN="$(grep '^log()' "$DISPATCHER")
 $(sed -n '/^_log_exclusions() {/,/^}$/p' "$DISPATCHER")
-$(awk '/^_beadid_has_active_gate_artifact\(\)/{f=1} /^_beadid_has_open_gate_marker\(\)/{f=1} /^_filter_built\(\)/{f=1} f{print} f&&/^}$/{f=0}' "$DISPATCHER")"
+$(awk '/^_beadid_has_active_gate_artifact\(\)/{f=1} /^_beadid_has_open_gate_marker\(\)/{f=1} /^_beadid_matched_crew_branch_ref\(\)/{f=1} /^_beadid_branch_signal\(\)/{f=1} /^_filter_built\(\)/{f=1} f{print} f&&/^}$/{f=0}' "$DISPATCHER")"
 _GJ6_TARGET_HAS_REAL_BRANCH_FN="$(awk '/^_target_has_real_branch\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
 _GJ6_HAS_CREW_BRANCH_FN="$(awk '/^_beadid_has_crew_branch\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
 
