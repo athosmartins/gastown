@@ -96,40 +96,76 @@ EOF
   ( /bin/bash "$dir/probe.sh" 2>/dev/null )
 }
 
+# ga-5a87qv (gate FAIL, run ga-zpj88y): for mol-dog-doctor.sh's two sites
+# specifically, "survives" is the WRONG expectation — see the FATAL checks
+# added right after each [ -r ] guard in the real file. dolt_sql() calls
+# run_bounded (runtime.sh) inside `if ! dolt_sql ...; then`, a set -e
+# EXEMPTED context; an undefined run_bounded there reads as "the Dolt query
+# failed" and the script mails the Mayor a FALSE "Dolt server unreachable"
+# escalation for what was actually a missing sibling script. now_ms()
+# (latency.sh) is called unconditionally, so it WOULD crash correctly on its
+# own — but with a bare "command not found" pointing at the wrong line, not
+# a message naming the real missing dependency. Both sites now hard-exit
+# with a FATAL message naming the actual undefined symbol, immediately after
+# the guard, instead of letting either failure mode reach downstream code.
+# This test extracts guard+check together (sed range, not a single grep
+# line) and asserts the CORRECTED three-way contract: missing/unreadable →
+# loud, correctly-attributed FATAL exit (not silent survival, not a
+# misattributed error); present-and-actually-defines-the-symbol → normal
+# REACHED.
+run_gc_city_probe_capture_err() {
+  local idiom="$1" dir="$2"
+  cat > "$dir/probe.sh" <<EOF
+#!/bin/bash
+set -euo pipefail
+GC_CITY_PATH="$dir"
+$idiom
+echo "REACHED"
+EOF
+  ( /bin/bash "$dir/probe.sh" 2>&1 )
+}
+
 test_mol_dog_doctor_site() {
-  local label="$1" line_re="$2" rel_path="$3"
+  local label="$1" start_re="$2" rel_path="$3" symbol="$4"
   local idiom
-  idiom="$(grep -E "$line_re" "$SELF_DIR/mol-dog-doctor.sh" | grep -vE '^[[:space:]]*#')"
+  # ga-5a87qv fix2: '#' delimiter, not '/' — $start_re contains literal '/'
+  # (dolt/assets/scripts/...), which collides with sed's default '/' address
+  # delimiter (BSD sed: "command a expects \ followed by text").
+  idiom="$(sed -n "\\#$start_re#,/^}\$/p" "$SELF_DIR/mol-dog-doctor.sh" | grep -vE '^[[:space:]]*#')"
   if [ -z "$(printf '%s' "$idiom" | tr -d '[:space:]')" ]; then
-    bad "$label: could not find the source line in mol-dog-doctor.sh (did it move?)"
+    bad "$label: could not extract the guard+FATAL-check block from mol-dog-doctor.sh (did it move?)"
     return
   fi
 
   local d1 out1
   d1=$(mktemp -d "$WORK/gccity_missing.XXXXXX")
-  out1=$(run_gc_city_probe "$idiom" "$d1")
-  [ "$out1" = "REACHED" ] \
-    && ok "$label: sibling MISSING survives (pre-fix: died before REACHED)" \
-    || bad "$label: sibling MISSING killed execution (got: '${out1:-<empty>}')"
+  out1=$(run_gc_city_probe_capture_err "$idiom" "$d1")
+  case "$out1" in
+    *FATAL*"$symbol"*) ok "$label: sibling MISSING fails LOUDLY, correctly naming '$symbol' (not silent survival, not a misattributed downstream error)" ;;
+    *REACHED*) bad "$label: sibling MISSING silently reached downstream code (ga-5a87qv gate-FAIL regression — should FATAL naming '$symbol', not survive)" ;;
+    *) bad "$label: sibling MISSING produced an unattributed failure (got: '${out1:-<empty>}')" ;;
+  esac
 
   local d2 out2
   d2=$(mktemp -d "$WORK/gccity_noread.XXXXXX")
   mkdir -p "$d2/$(dirname "$rel_path")"
   printf 'true\n' > "$d2/$rel_path"
   chmod 000 "$d2/$rel_path"
-  out2=$(run_gc_city_probe "$idiom" "$d2")
-  [ "$out2" = "REACHED" ] \
-    && ok "$label: sibling UNREADABLE survives" \
-    || bad "$label: sibling UNREADABLE killed execution (got: '${out2:-<empty>}')"
+  out2=$(run_gc_city_probe_capture_err "$idiom" "$d2")
+  case "$out2" in
+    *FATAL*"$symbol"*) ok "$label: sibling UNREADABLE fails LOUDLY, correctly naming '$symbol'" ;;
+    *REACHED*) bad "$label: sibling UNREADABLE silently reached downstream code (ga-5a87qv gate-FAIL regression)" ;;
+    *) bad "$label: sibling UNREADABLE produced an unattributed failure (got: '${out2:-<empty>}')" ;;
+  esac
 
   local d3 out3
   d3=$(mktemp -d "$WORK/gccity_present.XXXXXX")
   mkdir -p "$d3/$(dirname "$rel_path")"
-  printf 'true\n' > "$d3/$rel_path"
-  out3=$(run_gc_city_probe "$idiom" "$d3")
+  printf '%s() { :; }\n' "$symbol" > "$d3/$rel_path"
+  out3=$(run_gc_city_probe_capture_err "$idiom" "$d3")
   [ "$out3" = "REACHED" ] \
-    && ok "$label: sibling PRESENT still loads (guard did not make it permanently inert)" \
-    || bad "$label: sibling PRESENT case broke (got: '${out3:-<empty>}')"
+    && ok "$label: sibling PRESENT and defines '$symbol' → reaches REACHED normally (guard did not make it permanently inert)" \
+    || bad "$label: sibling PRESENT-and-defines-'$symbol' case broke (got: '${out3:-<empty>}')"
 }
 
 echo ""
@@ -155,9 +191,9 @@ test_bd_trace_site "_bd_trace.sh source" "digest-sweep.sh" \
 echo ""
 echo "-- mol-dog-doctor.sh --"
 test_mol_dog_doctor_site "runtime.sh source" \
-  '^\[ -r .*dolt/assets/scripts/runtime\.sh' ".gc/system/packs/dolt/assets/scripts/runtime.sh"
+  '^\[ -r .*dolt/assets/scripts/runtime\.sh' ".gc/system/packs/dolt/assets/scripts/runtime.sh" "run_bounded"
 test_mol_dog_doctor_site "latency.sh source" \
-  '^\[ -r .*dolt/assets/scripts/latency\.sh' ".gc/system/packs/dolt/assets/scripts/latency.sh"
+  '^\[ -r .*dolt/assets/scripts/latency\.sh' ".gc/system/packs/dolt/assets/scripts/latency.sh" "now_ms"
 
 echo ""
 echo "dog-formula-source-guard.selftest: PASS=$PASS FAIL=$FAIL"

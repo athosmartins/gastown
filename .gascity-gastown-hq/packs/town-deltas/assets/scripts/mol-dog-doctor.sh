@@ -44,6 +44,23 @@ set -euo pipefail
 # guarding against a regression back to the self-relative $PACK_DIR that
 # caused ga-gquc1's attempt-1 bootstrap crash.
 [ -r "${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt/assets/scripts/runtime.sh" ] && GC_PACK_DIR="${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt" . "${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt/assets/scripts/runtime.sh" || true
+# ga-5a87qv (gate FAIL, run ga-zpj88y): surviving a missing runtime.sh is not
+# enough on its own — dolt_sql() below calls run_bounded (defined ONLY in
+# runtime.sh), and dolt_sql is invoked as `if ! dolt_sql ...; then` further
+# down, which is a set -e EXEMPTED context. An undefined run_bounded there
+# doesn't crash — "command not found" (exit 127) reads as "dolt_sql failed",
+# and the script proceeds into the Dolt-unreachable branch: a FALSE CRITICAL
+# escalation mailed to the Mayor ("Dolt server unreachable") for a problem
+# that was actually a missing sibling script, never a Dolt query. That is
+# WORSE than the pre-fix crash (which at least died honestly, right at this
+# source line, with no misattributed mail) — this guard's whole point was to
+# avoid a worse failure mode, not manufacture one further downstream. Check
+# the symbol the rest of this script actually depends on, not just whether
+# the source line itself survived.
+command -v run_bounded >/dev/null 2>&1 || {
+  echo "FATAL: runtime.sh failed to load (missing/unreadable sibling — a partial/desynced deploy of the dolt pack, NOT a Dolt server problem) — run_bounded is undefined, dolt_sql() cannot run safely. See ga-5a87qv." >&2
+  exit 1
+}
 # ga-br5sw: ms-resolution now_ms()/latency_should_warn() — see latency.sh's own
 # header for why whole-second `date +%s` quantizes a sub-second probe to 0s/1s.
 # Same live-sourcing rationale as runtime.sh above (not vendored, so both stay
@@ -51,6 +68,16 @@ set -euo pipefail
 # ga-5a87qv: same source-guard reasoning and one-line-for-head-truncation
 # constraint as runtime.sh above.
 [ -r "${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt/assets/scripts/latency.sh" ] && . "${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt/assets/scripts/latency.sh" || true
+# ga-5a87qv: same reasoning as the run_bounded check above — now_ms() is
+# called unconditionally at PROBE_START_MS=$(now_ms) below, OUTSIDE any
+# set -e-exempted context, so an undefined now_ms WOULD crash there — but
+# with a bare "command not found" pointing at the wrong line, not a message
+# that names the actual missing dependency. Fail loud and correctly here
+# instead of letting that happen a few lines down.
+command -v now_ms >/dev/null 2>&1 || {
+  echo "FATAL: latency.sh failed to load (missing/unreadable sibling — a partial/desynced deploy of the dolt pack, NOT a Dolt server problem) — now_ms is undefined, cannot measure probe latency. See ga-5a87qv." >&2
+  exit 1
+}
 
 PORT="$GC_DOLT_PORT"
 HOST="${GC_DOLT_HOST:-127.0.0.1}"
