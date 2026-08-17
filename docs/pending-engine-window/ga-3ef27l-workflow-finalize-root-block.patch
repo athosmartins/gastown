@@ -1,0 +1,193 @@
+diff --git a/internal/dispatch/runtime.go b/internal/dispatch/runtime.go
+index 57eef0813..443b59fa0 100644
+--- a/internal/dispatch/runtime.go
++++ b/internal/dispatch/runtime.go
+@@ -679,7 +679,24 @@ func processWorkflowFinalize(store beads.Store, bead beads.Bead, opts ProcessOpt
+ 			}
+ 			return ControlResult{Processed: true, Action: "workflow-missing_root"}, nil
+ 		}
+-		return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: completing workflow head: %w", rootID, err))
++		retryErr := err
++		if isSelfBlockedCloseError(err, bead.ID) {
++			// addWorkflowRootDeps (internal/formula/compile.go) wires the
++			// root's sole structural dependency to this finalize step, so
++			// the close above always sees the root as blocked by US - we
++			// haven't closed ourselves yet at this point in the function.
++			// Our own blockers (the formula's sink steps) were already
++			// confirmed closed by resolveFinalizeOutcome, so close now and
++			// retry the root once; the setOutcomeAndClose(bead.ID) below is
++			// a no-op against an already-closed bead. See ga-3ef27l.
++			if closeErr := setOutcomeAndClose(store, bead.ID, "pass"); closeErr != nil {
++				return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: closing finalizer to unblock root retry: %w", bead.ID, closeErr))
++			}
++			retryErr = setOutcomeAndClose(store, rootID, outcome)
++		}
++		if retryErr != nil {
++			return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: completing workflow head: %w", rootID, retryErr))
++		}
+ 	}
+ 	if outcome == "pass" {
+ 		if err := closeSourceBeadChain(store, rootID, opts); err != nil {
+@@ -1366,6 +1383,21 @@ func findScopeBody(all []beads.Bead, rootID, scopeRef string) (beads.Bead, bool)
+ 	return beads.Bead{}, false
+ }
+ 
++// isSelfBlockedCloseError reports whether err is the beads store's "cannot
++// close blocked issue" refusal with blockerID cited as (one of) the
++// blockers. String-matched, not errors.Is: the underlying sentinel
++// (third_party/beads' issueops.ErrCloseBlocked) lives in a different Go
++// module's internal/ package and is not importable from here - the same
++// constraint IsTransientControllerError's doc comment already notes for
++// wrapped store-boundary errors in general.
++func isSelfBlockedCloseError(err error, blockerID string) bool {
++	if err == nil || blockerID == "" {
++		return false
++	}
++	msg := err.Error()
++	return strings.Contains(msg, "blocked by") && strings.Contains(msg, blockerID)
++}
++
+ func setOutcomeAndClose(store beads.Store, beadID, outcome string) error {
+ 	status := "closed"
+ 	return store.Update(beadID, beads.UpdateOpts{
+diff --git a/internal/dispatch/runtime_test.go b/internal/dispatch/runtime_test.go
+index 359b644fe..c30622ede 100644
+--- a/internal/dispatch/runtime_test.go
++++ b/internal/dispatch/runtime_test.go
+@@ -1860,6 +1860,136 @@ func TestProcessWorkflowFinalizeTreatsQuarantinedControlAsFailure(t *testing.T)
+ 	}
+ }
+ 
++// selfBlockedRootCloseStore reproduces the real beads store's close-policy
++// refusal (third_party/beads' "cannot close blocked issue") for closing
++// blockedID: it fails with a "... is blocked by [blockerID]" error for as
++// long as blockerID is still open in the wrapped store, and delegates
++// otherwise. addWorkflowRootDeps (internal/formula/compile.go) wires a
++// graph.v2 root's sole structural dependency to its auto-added
++// workflow-finalize step, so this is what the root's own close actually
++// sees in production every time - not a scripted one-shot failure - which
++// is why the fake checks live state instead of just counting calls.
++type selfBlockedRootCloseStore struct {
++	*beads.MemStore
++	blockedID, blockerID string
++}
++
++func (s *selfBlockedRootCloseStore) Update(id string, opts beads.UpdateOpts) error {
++	if id == s.blockedID && opts.Status != nil && *opts.Status == "closed" {
++		blocker, err := s.Get(s.blockerID)
++		if err != nil {
++			return err
++		}
++		if blocker.Status != "closed" {
++			return fmt.Errorf("cannot close blocked issue: %s is blocked by [%s]", s.blockedID, s.blockerID)
++		}
++	}
++	return s.MemStore.Update(id, opts)
++}
++
++// TestProcessWorkflowFinalizeRecoversWhenRootBlockedBySelf is the ga-3ef27l
++// regression: a graph.v2 root's only blocker is its own workflow-finalize
++// step, but the finalize step used to close itself LAST - so the root's
++// close always raced its own not-yet-closed finalizer and got quarantined
++// (control_dispatch_error), leaving the root dangling open+unassigned
++// forever. The fix must close the finalizer first so the retry succeeds.
++func TestProcessWorkflowFinalizeRecoversWhenRootBlockedBySelf(t *testing.T) {
++	t.Parallel()
++
++	mem := beads.NewMemStore()
++	workflow := mustCreateWorkflowBead(t, mem, beads.Bead{
++		Title: "workflow",
++		Type:  "task",
++		Metadata: map[string]string{
++			"gc.kind":             "workflow",
++			"gc.formula_contract": "graph.v2",
++		},
++	})
++	sink := mustCreateWorkflowBead(t, mem, beads.Bead{
++		Title:  "sink step",
++		Type:   "task",
++		Status: "closed",
++		Metadata: map[string]string{
++			"gc.outcome": "pass",
++		},
++	})
++	finalizer := mustCreateWorkflowBead(t, mem, beads.Bead{
++		Title: "Finalize workflow",
++		Type:  "task",
++		Metadata: map[string]string{
++			"gc.kind":         "workflow-finalize",
++			"gc.root_bead_id": workflow.ID,
++		},
++	})
++	mustDepAdd(t, mem, finalizer.ID, sink.ID, "blocks")
++	mustDepAdd(t, mem, workflow.ID, finalizer.ID, "blocks")
++
++	store := &selfBlockedRootCloseStore{MemStore: mem, blockedID: workflow.ID, blockerID: finalizer.ID}
++
++	result, err := ProcessControl(store, finalizer, ProcessOptions{})
++	if err != nil {
++		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
++	}
++	if !result.Processed || result.Action != "workflow-pass" {
++		t.Fatalf("result = %+v, want processed workflow-pass", result)
++	}
++
++	rootAfter := mustGetBead(t, mem, workflow.ID)
++	if rootAfter.Status != "closed" {
++		t.Fatalf("workflow status = %q, want closed", rootAfter.Status)
++	}
++	if got := rootAfter.Metadata["gc.outcome"]; got != "pass" {
++		t.Fatalf("workflow outcome = %q, want pass", got)
++	}
++	finalizerAfter := mustGetBead(t, mem, finalizer.ID)
++	if finalizerAfter.Status != "closed" {
++		t.Fatalf("finalizer status = %q, want closed", finalizerAfter.Status)
++	}
++}
++
++// TestProcessWorkflowFinalizeDoesNotRetryWhenRootBlockedByUnrelatedBead
++// guards the fix's scope: only a root-close refusal citing the finalize
++// bead ITSELF as blocker should trigger the close-finalizer-then-retry
++// recovery. A refusal citing some other bead is a genuine, unexpected
++// graph problem and must still hard-fail (and get quarantined by the
++// caller) exactly as before, not be silently retried.
++func TestProcessWorkflowFinalizeDoesNotRetryWhenRootBlockedByUnrelatedBead(t *testing.T) {
++	t.Parallel()
++
++	mem := beads.NewMemStore()
++	workflow := mustCreateWorkflowBead(t, mem, beads.Bead{
++		Title: "workflow",
++		Type:  "task",
++		Metadata: map[string]string{
++			"gc.kind":             "workflow",
++			"gc.formula_contract": "graph.v2",
++		},
++	})
++	finalizer := mustCreateWorkflowBead(t, mem, beads.Bead{
++		Title: "Finalize workflow",
++		Type:  "task",
++		Metadata: map[string]string{
++			"gc.kind":         "workflow-finalize",
++			"gc.root_bead_id": workflow.ID,
++		},
++	})
++
++	rootCloseErr := fmt.Errorf("cannot close blocked issue: %s is blocked by [some-other-bead]", workflow.ID)
++	store := updateErrorStore{Store: mem, failID: workflow.ID, err: rootCloseErr}
++
++	_, err := ProcessControl(store, finalizer, ProcessOptions{})
++	if err == nil {
++		t.Fatal("ProcessControl(workflow-finalize) err = nil, want root close failure")
++	}
++	if !strings.Contains(err.Error(), rootCloseErr.Error()) {
++		t.Fatalf("ProcessControl error = %v, want root close failure", err)
++	}
++	finalizerAfter := mustGetBead(t, mem, finalizer.ID)
++	if finalizerAfter.Status == "closed" {
++		t.Fatal("finalizer status = closed; want open - root is blocked by an unrelated bead, not itself, so no retry should have fired")
++	}
++}
++
+ func TestProcessWorkflowFinalizeOrphanedRootClosesFinalizerWithoutError(t *testing.T) {
+ 	t.Parallel()
+ 
