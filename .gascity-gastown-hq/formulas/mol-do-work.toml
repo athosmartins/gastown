@@ -380,14 +380,28 @@ needs = ["do-work"]
 description = """
 Work is submitted to the gate (build path) or parked (park path) — either
 way your sling should already be closed, by step 6 or by the PARK
-PROCEDURE. Close it here only as a backstop if it's somehow still open —
-never overwrite an outcome ("pass" or "parked") a prior step already
-recorded — then signal the controller to reclaim this session:
+PROCEDURE. Close it here only as a backstop if it's CONFIRMED still
+open — never overwrite an outcome ("pass" or "parked") a prior step
+already recorded, and never treat a failed/unreadable status check as
+"still open": if the read itself fails, that's UNKNOWN, not open — the
+same collapse the PARK PROCEDURE guards above exist to prevent (ga-rswuxy
+fix-attempt 2) would silently stamp gc.outcome=pass with a false "Gate
+marker submitted" note over a real gc.outcome=parked if a transient read
+failure were treated as "not closed". On unknown, skip the backstop —
+city reclaim/reaper sweeps already cover a genuinely-stuck open sling —
+then signal the controller to reclaim this session:
 
 ```bash
 if [ -n "${GC_BEAD_ID:-}" ]; then
-  SLING_STATUS=$(bd show "$GC_BEAD_ID" --json 2>/dev/null | jq -r '.[0].status // ""')
-  if [ "$SLING_STATUS" != "closed" ]; then
+  SLING_JSON=$(bd show "$GC_BEAD_ID" --json 2>/dev/null)
+  SLING_JSON_RC=$?
+  SLING_STATUS=""
+  if [ "$SLING_JSON_RC" -eq 0 ] && [ -n "$SLING_JSON" ]; then
+    SLING_STATUS=$(printf '%s' "$SLING_JSON" | jq -r '.[0].status // empty' 2>/dev/null)
+  fi
+  if [ -z "$SLING_STATUS" ]; then
+    echo "Warning: could not confirm $GC_BEAD_ID's status (bd show rc=$SLING_JSON_RC) -- skipping the backstop close rather than risk overwriting an outcome a prior step may already have recorded." >&2
+  elif [ "$SLING_STATUS" != "closed" ]; then
     bd update "$GC_BEAD_ID" --set-metadata gc.outcome=pass --status=closed --notes "Drain acknowledged. Gate marker submitted."
   fi
 fi
