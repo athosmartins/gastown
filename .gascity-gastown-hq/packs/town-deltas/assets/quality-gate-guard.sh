@@ -517,26 +517,46 @@ dedup_gaterun_action() {
   echo "supersede:duplicate"
 }
 
-# dup_marker_ids_for_branch <markers_json> <branch> <exclude_id>
+# dup_marker_ids_for_branch <markers_json> <branch> <exclude_id> <rig>
 # Pure (no bd/gc I/O — takes the query result as data): given the JSON array of
 # type:quality-gate-marker beads already filtered by the caller to
 # gate-status:{ready,queued,needs-rebase} (ga-o64z1's Step 4b query), return the
 # ids (one per line, empty output = none) whose description carries a `branch:`
-# line EXACTLY equal to <branch>, excluding <exclude_id> (the marker THIS sweep
-# just claimed) and re-checking status=open per-candidate as defense-in-depth
-# (mirrors live_sibling_run_for_branch's own belt-and-suspenders status gate in
+# line EXACTLY equal to <branch> AND a `rig:` line EXACTLY equal to <rig>,
+# excluding <exclude_id> (the marker THIS sweep just claimed) and re-checking
+# status=open per-candidate as defense-in-depth (mirrors
+# live_sibling_run_for_branch's own belt-and-suspenders status gate in
 # quality-gate-dispatcher.sh — ga-tgj23 showed a label/list inconsistency can
 # otherwise surface a closed bead as a false candidate). Matches on the
-# DESCRIPTION's branch: line, not the branch: LABEL — the label is display-only
-# for the painel (docs/gate-marker-recipe.md), the description is the field
-# every real consumer (including this guard's own Step 3 extract()) trusts.
-# Exact string equality, not substring/regex — avoids fix/ga-1 matching
-# fix/ga-10.
+# DESCRIPTION's branch:/rig: lines, not the branch: LABEL — the label is
+# display-only for the painel (docs/gate-marker-recipe.md), the description is
+# the field every real consumer (including this guard's own Step 3 extract())
+# trusts. Exact string equality, not substring/regex — avoids fix/ga-1
+# matching fix/ga-10.
+#
+# ga-95tq3p: rig is REQUIRED to match too, not just branch. Two different
+# repos (e.g. gascity and whatsapp_automation) can legitimately carry a
+# branch with the identical NAME for an unrelated diff each — a cross-rig
+# story naturally produces this (this exact guard did, live: ga-dxyvxr's HQ
+# marker ga-3uct94 and WA marker ga-z9npl3 shared the branch string
+# "feat/ga-dxyvxr-quiet-hours-gate" and Step 4b wrongly superseded the HQ one
+# for a WA one it never touched). Both sides' rig must be non-empty, not the
+# literal "unknown" (gate-done.md's own fallback when its RIG derivation
+# can't resolve a repo — two markers from genuinely different, unresolved
+# repos would otherwise collide on that shared placeholder), AND equal to
+# count as a duplicate. Any of empty/unparseable/"unknown" on either side is
+# NOT confirmed-same-repo, so it is excluded rather than assumed a match:
+# superseding (closing) is the destructive, hard-to-reverse direction here,
+# so "can't confirm" must fail toward NOT superseding, same idiom as the
+# missing-status-field case below.
 dup_marker_ids_for_branch() {
-  local markers_json="$1" branch="$2" exclude_id="$3"
-  printf '%s\n' "$markers_json" | jq -r --arg mid "$exclude_id" --arg branch "$branch" '
+  local markers_json="$1" branch="$2" exclude_id="$3" rig="$4"
+  printf '%s\n' "$markers_json" | jq -r --arg mid "$exclude_id" --arg branch "$branch" --arg rig "$rig" '
     def branch_of(d): (d // "") | split("\n") | map(select(startswith("branch:"))) | (.[0] // "") | ltrimstr("branch:") | sub("^ +"; "");
-    [ .[] | select(.id != $mid) | select((.status // "") == "open") | select(branch_of(.description) == $branch) | .id ] | .[]
+    def rig_of(d): (d // "") | split("\n") | map(select(startswith("rig:"))) | (.[0] // "") | ltrimstr("rig:") | sub("^ +"; "");
+    def confirmed_rig(r): r != "" and r != "unknown";
+    [ .[] | select(.id != $mid) | select((.status // "") == "open") | select(branch_of(.description) == $branch)
+      | select(confirmed_rig($rig) and confirmed_rig(rig_of(.description)) and rig_of(.description) == $rig) | .id ] | .[]
   ' 2>/dev/null || true
 }
 
@@ -3240,7 +3260,7 @@ Marker set to gate-status:error. Fix the marker fields and re-submit." 2>/dev/nu
   exit 1
 fi
 
-# ── Step 4b (ga-o64z1): supersede duplicate open markers for the same branch ──
+# ── Step 4b (ga-o64z1): supersede duplicate open markers for the same branch — rig-scoped since ga-95tq3p ──
 # BUG: every /gate-done resubmission (gate FAIL -> author fixes -> resubmit)
 # creates a brand-new marker, but nothing ever closes the PRIOR marker for the
 # same branch. Confirmed live: fix/ga-0xmxt-midturn-liveness accumulated 3
@@ -3282,7 +3302,7 @@ if [ "$DUP_QUERY_OK" = "0" ]; then
   # of silently passing as a clean branch.
   warn "Step 4b: sibling-marker query failed for branch $BRANCH — dedup check SKIPPED (non-fatal, distinct from '0 duplicates found')."
 else
-  DUP_IDS=$(dup_marker_ids_for_branch "$DUP_MARKERS_JSON" "$BRANCH" "$MARKER_ID")
+  DUP_IDS=$(dup_marker_ids_for_branch "$DUP_MARKERS_JSON" "$BRANCH" "$MARKER_ID" "$RIG")
   DUP_COUNT=$(printf '%s\n' "$DUP_IDS" | grep -c . || true)
   case "$DUP_COUNT" in ''|*[!0-9]*) DUP_COUNT=0 ;; esac
 

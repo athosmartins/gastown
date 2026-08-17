@@ -18,6 +18,16 @@
 #   gate-status:{ready,queued,needs-rebase}. dispatching/running are left
 #   alone (a legitimate live run is the dispatcher's own Step 5b's job).
 #
+#   ga-95tq3p (2026-08-17): the original fix above matched on branch NAME
+#   only. Two DIFFERENT repos (e.g. gascity and whatsapp_automation) can
+#   legitimately share a branch name for unrelated diffs — a cross-rig story
+#   naturally produces this — and the guard wrongly superseded one repo's
+#   real, unmerged submission for the other's. Confirmed live: ga-dxyvxr's HQ
+#   marker (rig=gascity) vs WA marker (rig=whatsapp_automation), same branch
+#   string, HQ one silently closed. FIX: dup_marker_ids_for_branch now also
+#   requires the candidate's `rig:` line to equal the submitting marker's own
+#   rig — both non-empty — before counting it as a duplicate.
+#
 # This harness sources the guard in lib-only mode to unit-test the REAL pure
 # function (dup_marker_ids_for_branch) and exercise the REAL set_gate_status
 # I/O helper against an in-shell bd() mock (file-backed state — the system
@@ -53,43 +63,64 @@ err()  { :; }
 
 GC_CITY="/tmp/gate-marker-dedup-test-city"
 
-# ── 1. dup_marker_ids_for_branch — the pure per-branch filter ────────────────
-echo "── 1. dup_marker_ids_for_branch (branch-exact match, self/status/closed guards) ──"
+# ── 1. dup_marker_ids_for_branch — the pure per-(branch,rig) filter ──────────
+echo "── 1. dup_marker_ids_for_branch (branch+rig-exact match, self/status/closed guards) ──"
 
 eq "(a) empty marker list -> no duplicates" \
-  "$(dup_marker_ids_for_branch '[]' 'fix/ga-x' 'ga-new')" ""
+  "$(dup_marker_ids_for_branch '[]' 'fix/ga-x' 'ga-new' 'gascity')" ""
 
-eq "(b) one other open marker, same branch -> matched" \
-  "$(dup_marker_ids_for_branch '[{"id":"ga-old","status":"open","description":"branch: fix/ga-x\n"}]' 'fix/ga-x' 'ga-new')" \
+eq "(b) one other open marker, same branch, same rig -> matched" \
+  "$(dup_marker_ids_for_branch '[{"id":"ga-old","status":"open","description":"branch: fix/ga-x\nrig: gascity\n"}]' 'fix/ga-x' 'ga-new' 'gascity')" \
   "ga-old"
 
-eq "(c) the marker THIS sweep just claimed is excluded even if same branch" \
-  "$(dup_marker_ids_for_branch '[{"id":"ga-new","status":"open","description":"branch: fix/ga-x\n"}]' 'fix/ga-x' 'ga-new')" \
+eq "(c) the marker THIS sweep just claimed is excluded even if same branch+rig" \
+  "$(dup_marker_ids_for_branch '[{"id":"ga-new","status":"open","description":"branch: fix/ga-x\nrig: gascity\n"}]' 'fix/ga-x' 'ga-new' 'gascity')" \
   ""
 
 eq "(d) AC3 — a DIFFERENT branch's marker is never matched" \
-  "$(dup_marker_ids_for_branch '[{"id":"ga-other","status":"open","description":"branch: fix/ga-DIFFERENT\n"}]' 'fix/ga-x' 'ga-new')" \
+  "$(dup_marker_ids_for_branch '[{"id":"ga-other","status":"open","description":"branch: fix/ga-DIFFERENT\nrig: gascity\n"}]' 'fix/ga-x' 'ga-new' 'gascity')" \
   ""
 
 eq "(e) closed candidate excluded (defense-in-depth, mirrors ga-tgj23)" \
-  "$(dup_marker_ids_for_branch '[{"id":"ga-old","status":"closed","description":"branch: fix/ga-x\n"}]' 'fix/ga-x' 'ga-new')" \
+  "$(dup_marker_ids_for_branch '[{"id":"ga-old","status":"closed","description":"branch: fix/ga-x\nrig: gascity\n"}]' 'fix/ga-x' 'ga-new' 'gascity')" \
   ""
 
 eq "(f) missing status field -> not confirmed open -> excluded" \
-  "$(dup_marker_ids_for_branch '[{"id":"ga-old","description":"branch: fix/ga-x\n"}]' 'fix/ga-x' 'ga-new')" \
+  "$(dup_marker_ids_for_branch '[{"id":"ga-old","description":"branch: fix/ga-x\nrig: gascity\n"}]' 'fix/ga-x' 'ga-new' 'gascity')" \
   ""
 
 eq "(g) substring safety: fix/ga-1 does NOT match fix/ga-10" \
-  "$(dup_marker_ids_for_branch '[{"id":"ga-old","status":"open","description":"branch: fix/ga-10\n"}]' 'fix/ga-1' 'ga-new')" \
+  "$(dup_marker_ids_for_branch '[{"id":"ga-old","status":"open","description":"branch: fix/ga-10\nrig: gascity\n"}]' 'fix/ga-1' 'ga-new' 'gascity')" \
   ""
 
-eq "(h) multiple siblings for the same branch are all returned" \
-  "$(dup_marker_ids_for_branch '[{"id":"ga-m1","status":"open","description":"branch: fix/ga-x\n"},{"id":"ga-m2","status":"open","description":"branch: fix/ga-x\n"}]' 'fix/ga-x' 'ga-new' | sort | tr '\n' ' ')" \
+eq "(h) multiple siblings for the same branch+rig are all returned" \
+  "$(dup_marker_ids_for_branch '[{"id":"ga-m1","status":"open","description":"branch: fix/ga-x\nrig: gascity\n"},{"id":"ga-m2","status":"open","description":"branch: fix/ga-x\nrig: gascity\n"}]' 'fix/ga-x' 'ga-new' 'gascity' | sort | tr '\n' ' ')" \
   "ga-m1 ga-m2 "
 
 eq "(i) open + closed + other-branch mixed -> only the one real duplicate" \
-  "$(dup_marker_ids_for_branch '[{"id":"ga-dead","status":"closed","description":"branch: fix/ga-x\n"},{"id":"ga-live","status":"open","description":"branch: fix/ga-x\n"},{"id":"ga-elsewhere","status":"open","description":"branch: fix/ga-y\n"}]' 'fix/ga-x' 'ga-new')" \
+  "$(dup_marker_ids_for_branch '[{"id":"ga-dead","status":"closed","description":"branch: fix/ga-x\nrig: gascity\n"},{"id":"ga-live","status":"open","description":"branch: fix/ga-x\nrig: gascity\n"},{"id":"ga-elsewhere","status":"open","description":"branch: fix/ga-y\nrig: gascity\n"}]' 'fix/ga-x' 'ga-new' 'gascity')" \
   "ga-live"
+
+# ga-95tq3p: THE regression — same branch NAME, two different repos. This is
+# the exact live shape of ga-dxyvxr's HQ marker ga-3uct94 (rig=gascity) vs WA
+# marker ga-z9npl3 (rig=whatsapp_automation), both branch
+# "feat/ga-dxyvxr-quiet-hours-gate" — pre-fix, this returned a match and the
+# guard wrongly closed the HQ marker for an unrelated WA diff.
+eq "(j) ga-95tq3p: same branch, DIFFERENT rig -> NOT matched (cross-rig false-positive)" \
+  "$(dup_marker_ids_for_branch '[{"id":"ga-other-repo","status":"open","description":"branch: fix/ga-x\nrig: whatsapp_automation\n"}]' 'fix/ga-x' 'ga-new' 'gascity')" \
+  ""
+
+eq "(k) ga-95tq3p: candidate missing rig: line entirely (legacy marker) -> NOT matched, fail toward not-superseding" \
+  "$(dup_marker_ids_for_branch '[{"id":"ga-legacy","status":"open","description":"branch: fix/ga-x\n"}]' 'fix/ga-x' 'ga-new' 'gascity')" \
+  ""
+
+eq "(l) ga-95tq3p: caller's own rig is empty -> NOT matched even though candidate has a rig value" \
+  "$(dup_marker_ids_for_branch '[{"id":"ga-old","status":"open","description":"branch: fix/ga-x\nrig: gascity\n"}]' 'fix/ga-x' 'ga-new' '')" \
+  ""
+
+eq "(m) ga-95tq3p: both sides rig=unknown (gate-done's own fallback) -> NOT matched, unknown is a placeholder not a confirmed identity" \
+  "$(dup_marker_ids_for_branch '[{"id":"ga-old","status":"open","description":"branch: fix/ga-x\nrig: unknown\n"}]' 'fix/ga-x' 'ga-new' 'unknown')" \
+  ""
 
 # ── 2. AC4 — fixture: 3 pre-existing markers, submit the 4th, exactly 1 open ──
 echo "── 2. AC4 fixture: 3 markers same branch -> after the 4th, exactly 1 open ──"
@@ -149,13 +180,13 @@ bd() {
 BRANCH="fix/ga-ac4-test"
 NEW_MARKER_ID="ga-m4"
 MOCK_MARKERS_JSON='[
-  {"id":"ga-m1","status":"open","description":"branch: fix/ga-ac4-test\nbead_id: ga-src\n"},
-  {"id":"ga-m2","status":"open","description":"branch: fix/ga-ac4-test\nbead_id: ga-src\n"},
-  {"id":"ga-m3","status":"open","description":"branch: fix/ga-ac4-test\nbead_id: ga-src\n"},
-  {"id":"ga-m4","status":"open","description":"branch: fix/ga-ac4-test\nbead_id: ga-src\n"}
+  {"id":"ga-m1","status":"open","description":"branch: fix/ga-ac4-test\nbead_id: ga-src\nrig: gascity\n"},
+  {"id":"ga-m2","status":"open","description":"branch: fix/ga-ac4-test\nbead_id: ga-src\nrig: gascity\n"},
+  {"id":"ga-m3","status":"open","description":"branch: fix/ga-ac4-test\nbead_id: ga-src\nrig: gascity\n"},
+  {"id":"ga-m4","status":"open","description":"branch: fix/ga-ac4-test\nbead_id: ga-src\nrig: gascity\n"}
 ]'
 
-DUP_IDS=$(dup_marker_ids_for_branch "$MOCK_MARKERS_JSON" "$BRANCH" "$NEW_MARKER_ID")
+DUP_IDS=$(dup_marker_ids_for_branch "$MOCK_MARKERS_JSON" "$BRANCH" "$NEW_MARKER_ID" "gascity")
 DUP_COUNT=$(printf '%s\n' "$DUP_IDS" | grep -c . || true)
 eq "AC4: submitting the 4th finds exactly 3 pre-existing duplicates" "$DUP_COUNT" "3"
 
@@ -182,13 +213,13 @@ fi
 # ── 3. AC3 — two DIFFERENT branches with simultaneous markers stay untouched ──
 echo "── 3. AC3 non-regression: two different branches, each keeps its own siblings ──"
 MOCK_TWO_BRANCHES='[
-  {"id":"ga-a-old","status":"open","description":"branch: fix/ga-branch-A\n"},
-  {"id":"ga-a-new","status":"open","description":"branch: fix/ga-branch-A\n"},
-  {"id":"ga-b-old","status":"open","description":"branch: fix/ga-branch-B\n"},
-  {"id":"ga-b-new","status":"open","description":"branch: fix/ga-branch-B\n"}
+  {"id":"ga-a-old","status":"open","description":"branch: fix/ga-branch-A\nrig: gascity\n"},
+  {"id":"ga-a-new","status":"open","description":"branch: fix/ga-branch-A\nrig: gascity\n"},
+  {"id":"ga-b-old","status":"open","description":"branch: fix/ga-branch-B\nrig: gascity\n"},
+  {"id":"ga-b-new","status":"open","description":"branch: fix/ga-branch-B\nrig: gascity\n"}
 ]'
-DUP_A=$(dup_marker_ids_for_branch "$MOCK_TWO_BRANCHES" "fix/ga-branch-A" "ga-a-new")
-DUP_B=$(dup_marker_ids_for_branch "$MOCK_TWO_BRANCHES" "fix/ga-branch-B" "ga-b-new")
+DUP_A=$(dup_marker_ids_for_branch "$MOCK_TWO_BRANCHES" "fix/ga-branch-A" "ga-a-new" "gascity")
+DUP_B=$(dup_marker_ids_for_branch "$MOCK_TWO_BRANCHES" "fix/ga-branch-B" "ga-b-new" "gascity")
 eq "AC3: branch A's dedup finds only ga-a-old (never touches branch B)" "$DUP_A" "ga-a-old"
 eq "AC3: branch B's dedup finds only ga-b-old (never touches branch A)" "$DUP_B" "ga-b-old"
 
@@ -204,6 +235,8 @@ else
   bad "Step 4b must sit between Step 4 and Step 5 (got Step4=$STEP4_LN Step4b=$STEP4B_LN Step5=$STEP5_LN)"
 fi
 has "$GUARD" 'DUP_IDS=\$\(dup_marker_ids_for_branch' "Step 4b calls the real dup_marker_ids_for_branch (not a re-inlined query)"
+has "$GUARD" 'dup_marker_ids_for_branch "\$DUP_MARKERS_JSON" "\$BRANCH" "\$MARKER_ID" "\$RIG"' \
+  "ga-95tq3p: Step 4b passes \$RIG as the 4th arg (a future refactor can't silently drop rig-scoping)"
 
 # ── 5. DRIFT GUARD: AC1 — only ready/queued/needs-rebase are queried; ────────
 #    dispatching/running (a legitimate live run) are never touched by Step 4b.
