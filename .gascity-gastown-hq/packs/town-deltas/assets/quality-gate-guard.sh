@@ -1472,8 +1472,16 @@ gate_delivery_looks_partial() {
   # error that this bead exists to stop. Release, and say exactly what was
   # seen and why it was let through.
   if [ -n "${_GDLR_ADVISORY:-}" ]; then
-    printf 'escopo-multiplo:possivel — %s. LIBERADO (ga-cjrxh: segurar trabalho bom e o erro caro e silencioso, liberar custa uma conferida); confira se o diff cobre todo o escopo.\n' \
-      "$_GDLR_ADVISORY" >&2
+    # ga-a7bt6u: _GDLR_ADVISORY_EVIDENCE used to be computed here and then
+    # thrown away — only the label+count description reached stderr, never
+    # the actual detected item lines. Both callers invoke this function
+    # inside `$(...)`, which forks a subshell, so a caller can never read
+    # these two "global" variables directly (they die with the subshell) —
+    # stderr is the only channel that survives. Append the evidence to it so
+    # a caller building a bead comment from this has something to CITE,
+    # instead of just "pode ter algo".
+    printf 'escopo-multiplo:possivel — %s. LIBERADO (ga-cjrxh: segurar trabalho bom e o erro caro e silencioso, liberar custa uma conferida); confira se o diff cobre todo o escopo.\n%s\n' \
+      "$_GDLR_ADVISORY" "$_GDLR_ADVISORY_EVIDENCE" >&2
     return 1
   fi
   echo "escopo-multiplo:nao-detectado (avaliei corpo e titulo; nenhuma lista de >=3 entregaveis, nem enumeracao no titulo ou no cabecalho)" >&2

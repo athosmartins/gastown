@@ -685,8 +685,30 @@ if [ -z "$FORCE_STORY_ID" ]; then
       # showing. ga-3k70w2: pass the title too (guard.sh's v4 signature) —
       # the backstop used to call this text-only, which is one more way it
       # was weaker than the primary (title-level enumeration went undetected).
-      if TASK_PARTIAL_EVIDENCE=$(task_reconciler_is_partial "$TASK_ALREADY_PARTIAL" "$TASK_SCOPE_COVERED_ALL" "$TASK_TEXT" "$TASK_BEAD_TITLE"); then
+      TASK_PARTIAL_REASON_FILE=$(mktemp 2>/dev/null || echo "/tmp/tgdlp-$$.err")
+      if TASK_PARTIAL_EVIDENCE=$(task_reconciler_is_partial "$TASK_ALREADY_PARTIAL" "$TASK_SCOPE_COVERED_ALL" "$TASK_TEXT" "$TASK_BEAD_TITLE" 2>"$TASK_PARTIAL_REASON_FILE"); then
         TASK_IS_PARTIAL=1
+      fi
+      TASK_PARTIAL_REASON_RAW=$(cat "$TASK_PARTIAL_REASON_FILE" 2>/dev/null || echo "")
+      rm -f "$TASK_PARTIAL_REASON_FILE"
+      # ga-a7bt6u: the advisory sub-case (rc=1, an unclassifiable-header run
+      # cleared the >=3-item bar under gate_delivery_looks_partial) used to
+      # just fall into this script's own log (exec redirects the whole
+      # script's stderr to $LOG at top, see above) — captured, but nowhere a
+      # human reviewing THIS bead would look. Mirrors
+      # quality-gate-dispatcher.sh's advisory consumption; this backstop
+      # needs its own capture since it only runs the crash-window case (the
+      # primary dispatcher never reached this bead). scope:advisory is
+      # additive/non-blocking — never delivery:partial or scope:needs-review,
+      # which hold the bead; that would reopen exactly the deadlock
+      # ga-cjrxh's release-over-hold bias exists to prevent.
+      if [ "$TASK_IS_PARTIAL" != "1" ] && printf '%s' "$TASK_PARTIAL_REASON_RAW" | grep -q '^escopo-multiplo:possivel'; then
+        if [ "$DRY_RUN" = "1" ]; then
+          log "DRY_RUN=1 — WOULD: bd -C $TASK_STORE comment $TASK_BEAD_ID (scope advisory, ga-a7bt6u) + label scope:advisory"
+        else
+          bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Gate scope advisory (ga-a7bt6u, task reconciler backstop): $TASK_PARTIAL_REASON_RAW" 2>/dev/null || true
+          bd -C "$TASK_STORE" label add "$TASK_BEAD_ID" "scope:advisory" -q 2>/dev/null || true
+        fi
       fi
 
       TASK_VERDICT=$(task_reconciler_verdict "$TASK_CONTRADICTED" "$TASK_MERGE_VERIFIED" "$TASK_IS_PARTIAL")

@@ -4721,11 +4721,28 @@ fi
           PARTIAL_REASON_FILE=$(mktemp 2>/dev/null || echo "/tmp/gdlp-$$.err")
           if PARTIAL_EVIDENCE=$(gate_delivery_looks_partial "$SRC_DESC" "$SRC_TITLE" 2>"$PARTIAL_REASON_FILE"); then IS_PARTIAL=1; fi
           PARTIAL_REASON=$(tr '\n' ' ' < "$PARTIAL_REASON_FILE" 2>/dev/null || echo "")
+          # ga-a7bt6u: raw (newline-preserving) copy of the same capture —
+          # $PARTIAL_REASON above collapses newlines for the single-line log
+          # below, but the advisory sub-case needs its evidence lines legible
+          # in a bead comment, not squashed onto one line.
+          PARTIAL_REASON_RAW=$(cat "$PARTIAL_REASON_FILE" 2>/dev/null || echo "")
           rm -f "$PARTIAL_REASON_FILE"
           # `|| true`: this is the last statement of the branch, and a bare
           # short-circuited AND-list must not become the block's exit status
           # under the errexit this script runs with.
           { [ -n "$PARTIAL_REASON" ] && log "escopo $BEAD_ID: $PARTIAL_REASON"; } || true
+          # ga-a7bt6u: the advisory sub-case (rc=1, an unclassifiable-header
+          # run cleared the >=3-item bar) used to die right here — captured
+          # into the log line above and nowhere else anyone reads. Post it to
+          # the bead's own record so "confira se o diff cobre todo o escopo"
+          # reaches someone who can act on it. scope:advisory is additive and
+          # non-blocking on purpose — never delivery:partial or
+          # scope:needs-review, which HOLD the bead; ga-cjrxh's
+          # release-over-hold bias for this class of signal stays intact.
+          if [ "$IS_PARTIAL" != "1" ] && printf '%s' "$PARTIAL_REASON_RAW" | grep -q '^escopo-multiplo:possivel'; then
+            bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate scope advisory (ga-a7bt6u): $PARTIAL_REASON_RAW" 2>/dev/null || true
+            bd -C "$BEAD_CITY" label add "$BEAD_ID" "scope:advisory" -q 2>/dev/null || true
+          fi
         fi
       fi
 

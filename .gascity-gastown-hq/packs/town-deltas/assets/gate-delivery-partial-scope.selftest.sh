@@ -315,6 +315,14 @@ UNKNOWN_HEADER_LIST="$(printf 'ALGUMA SECAO SEM NOME RECONHECIVEL:\n1. item um\n
 rc1 gate_delivery_looks_partial "$UNKNOWN_HEADER_LIST"
 err_has "escopo-multiplo:possivel" -- gate_delivery_looks_partial "$UNKNOWN_HEADER_LIST"
 err_has "ALGUMA SECAO SEM NOME RECONHECIVEL" -- gate_delivery_looks_partial "$UNKNOWN_HEADER_LIST"
+# ga-a7bt6u: _GDLR_ADVISORY_EVIDENCE (the actual detected item lines) used to
+# be computed and thrown away — only the label+count description reached
+# stderr, never evidence a caller could cite in a bead comment ("confira se o
+# diff cobre todo o escopo" without anything to look AT is not actionable).
+# This FAILS on the pre-ga-a7bt6u code (stderr carried the description line
+# only) and passes once the advisory branch also emits the evidence.
+err_has "1. item um" -- gate_delivery_looks_partial "$UNKNOWN_HEADER_LIST"
+err_has "3. item tres" -- gate_delivery_looks_partial "$UNKNOWN_HEADER_LIST"
 # ...and the three outcomes stay mutually distinguishable (ga-1yxyt's real
 # invariant, restated as ga-cjrxh AC3): held / released-with-warning /
 # nothing-to-read.
@@ -608,6 +616,47 @@ eq "contradicted + verified + NOT partial → close with distinct verdict string
    "$(task_reconciler_verdict 1 1 0)" "close:contradicted-but-commit-verified-in-origin-main"
 eq "contradicted + UNVERIFIED + not partial → still kept, unconditionally (ga-tuk26 fail-safe control)" \
    "$(task_reconciler_verdict 1 0 0)" "keep:contradicted-by-gate-failed-or-needs-fix"
+
+# ── 7. Wiring: advisory-sub-case consumption (ga-a7bt6u) ───────────────────
+# The advisory verdict (rc=1, _GDLR_ADVISORY set) used to be computed and
+# discarded — captured into a log line in dispatcher.sh, or not captured at
+# all in story-delivery.sh. Both callers must now post it to the bead's own
+# record (a comment) with a light, non-blocking label — never delivery:partial
+# or scope:needs-review, which HOLD the bead; the whole point of ga-cjrxh's
+# design is that this class of signal does NOT hold.
+echo "── 7. Wiring: advisory-sub-case consumption (ga-a7bt6u) ──"
+
+if grep -qF 'label add "$BEAD_ID" "scope:advisory"' "$DISPATCHER"; then
+  ok "dispatcher.sh labels scope:advisory on the advisory sub-case (ga-a7bt6u)"
+else
+  bad "dispatcher.sh does not label scope:advisory (ga-a7bt6u)"
+fi
+if grep -qF 'comment "$BEAD_ID" "Gate scope advisory' "$DISPATCHER"; then
+  ok "dispatcher.sh posts the advisory as a bead comment (ga-a7bt6u)"
+else
+  bad "dispatcher.sh does not post the advisory as a bead comment (ga-a7bt6u)"
+fi
+if grep -qF 'PARTIAL_REASON_RAW=$(cat "$PARTIAL_REASON_FILE"' "$DISPATCHER"; then
+  ok "dispatcher.sh captures the raw (multi-line) advisory text, not just the collapsed log copy (ga-a7bt6u)"
+else
+  bad "dispatcher.sh does not capture the raw advisory text (ga-a7bt6u)"
+fi
+
+if grep -qF 'label add "$TASK_BEAD_ID" "scope:advisory"' "$DELIVERY"; then
+  ok "story-delivery.sh labels scope:advisory on the advisory sub-case (ga-a7bt6u)"
+else
+  bad "story-delivery.sh does not label scope:advisory (ga-a7bt6u)"
+fi
+if grep -qF 'comment "$TASK_BEAD_ID" "Gate scope advisory' "$DELIVERY"; then
+  ok "story-delivery.sh posts the advisory as a bead comment (ga-a7bt6u)"
+else
+  bad "story-delivery.sh does not post the advisory as a bead comment (ga-a7bt6u)"
+fi
+if grep -qF 'task_reconciler_is_partial "$TASK_ALREADY_PARTIAL" "$TASK_SCOPE_COVERED_ALL" "$TASK_TEXT" "$TASK_BEAD_TITLE" 2>"$TASK_PARTIAL_REASON_FILE"' "$DELIVERY"; then
+  ok "story-delivery.sh now captures stderr from the task_reconciler_is_partial call (ga-a7bt6u — previously uncaptured, went straight to this script's own log)"
+else
+  bad "story-delivery.sh does not capture stderr from task_reconciler_is_partial (ga-a7bt6u)"
+fi
 
 echo ""
 echo "== gate-delivery-partial-scope: PASS=$PASS FAIL=$FAIL =="
