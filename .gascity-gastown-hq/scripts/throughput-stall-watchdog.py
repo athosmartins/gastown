@@ -622,20 +622,80 @@ def _tick_blind_and_dolt(signals_errored, now, state):
 _SIGNAL_ERROR = (None, None)
 
 def _quiet_expanded_lookback_sec(now, window_sec):
-    """ga-lda92s: expand `window_sec` so its NON-quiet portion still equals
-    window_sec, given "now" as the fixed end of the range. Fixed-point: the
-    quiet overlap of [now-X, now) is bounded (at most one night per calendar
-    day spanned) and monotonic in X, so a handful of iterations converges —
-    each step's added overlap keeps shrinking until expanding further stops
-    finding any more quiet time to compensate for."""
-    expanded = window_sec
-    for _ in range(4):
-        adj = quiet_hours.elapsed_adjustment(now - expanded, now, now=now)
-        new_expanded = window_sec + adj
-        if new_expanded == expanded:
-            break
-        expanded = new_expanded
-    return expanded
+    """ga-lda92s (gate-review fix-attempt 2): expand `window_sec` backward
+    from `now` so the NON-quiet portion of [now-X, now) equals window_sec
+    exactly. Direct interval arithmetic, NOT a fixed-point re-solve.
+
+    fix-attempt 1 iterated `expanded = window_sec + quiet_overlap(now -
+    expanded, now)` to a fixed point. That converges in principle, but the
+    per-step growth is exactly however much MORE quiet time the previous
+    step's growth revealed -- when `now - window_sec` lands close to a
+    quiet-window boundary, that growth can be seconds, not hours. Measured
+    (this attempt's own test, before this rewrite): now=11:00 converged in
+    ~9 steps at a ~1h/step pace by coincidence of round numbers, but
+    now=11:59 crept at 60 SECONDS per step and hadn't converged after 400+
+    iterations -- there is no small fixed cap that's safe, because the
+    creep rate depends on how close `now - window_sec` sits to a boundary,
+    not on how much total time needs crossing.
+
+    This version instead walks backward one quiet/non-quiet CALENDAR
+    SEGMENT at a time: at any point `cursor`, the enclosing day has at most
+    one quiet window `[ws, we)`, so the segment ending at `cursor` is
+    exactly one of "after we" / "inside [ws,we)" / "before ws" -- an O(1)
+    lookup, not a search. Each step consumes a whole segment (or returns
+    the exact crossover point inside it), so the iteration count is bounded
+    by the number of calendar-day boundaries crossed, never by proximity to
+    one -- the failure mode above cannot occur here.
+    """
+    nsh = int(os.environ.get("NIGHT_START_HOUR", quiet_hours.NIGHT_START_HOUR))
+    neh = int(os.environ.get("NIGHT_END_HOUR", quiet_hours.NIGHT_END_HOUR))
+
+    today_mid = quiet_hours._local_midnight(now)
+    ws_today = today_mid + nsh * 3600
+    we_today = today_mid + neh * 3600
+    # Mirrors elapsed_adjustment's live-safety-check, computed once since it
+    # depends only on the fixed `now`, never on the backward-walking cursor:
+    # if `now` itself sits inside today's nominal window but the live signal
+    # can't confirm it was actually enforced (override active, or the
+    # writer is stale/down), don't discount today's window -- only prior,
+    # already-elapsed nights.
+    exclude_today = (ws_today <= now < we_today) and not quiet_hours.blocks(now)
+
+    remaining = window_sec  # non-quiet seconds still needed
+    cursor = now            # right edge of the not-yet-accounted-for range
+    iterations = 0
+    # Bounded to 400 calendar days -- each iteration crosses at least one
+    # full day boundary, so this covers over a year of lookback, far past
+    # any window_sec this codebase configures (hours). Defensive only, like
+    # window_overlap_seconds's own day-count bound; never meant to trip.
+    while remaining > 0 and iterations < 400:
+        iterations += 1
+        day_mid = quiet_hours._local_midnight(cursor - 1)
+        ws = day_mid + nsh * 3600
+        we = day_mid + neh * 3600
+        excluded = (day_mid == today_mid) and exclude_today
+
+        if cursor > we:
+            boundary, is_quiet = we, False
+        elif cursor > ws:
+            boundary, is_quiet = ws, not excluded
+        else:
+            boundary, is_quiet = day_mid, False
+
+        seg_len = cursor - boundary
+        if not is_quiet:
+            if remaining <= seg_len:
+                return (now - cursor) + remaining
+            remaining -= seg_len
+        cursor = boundary
+
+    if remaining > 0:
+        _log("_quiet_expanded_lookback_sec: did not resolve within 400 "
+             "day-segments (now=%r window_sec=%.0f remaining=%.0f) -- "
+             "returning partial expansion; this should not happen for any "
+             "sane NIGHT_START_HOUR/NIGHT_END_HOUR config"
+             % (now, window_sec, remaining))
+    return now - cursor
 
 
 def dispatch_signal(now, window_sec):
@@ -3375,6 +3435,38 @@ def _selftest():
         _ok("ga-lda92s-1b: lookback unchanged for a pure-daytime window (no quiet overlap to expand into)")
     else:
         _bad("ga-lda92s-1b", "expected no expansion for a daytime window, got %.1fh" % (_exp_day / 3600))
+
+    # ── ga-lda92s-1c: gate-review regression (fix-attempt 1 FAILED here) ────────
+    # The morning-band bug: the true fixed point for a 4h window is 12h
+    # (4h + one full 8h quiet window) for any `now` comfortably past 08:00 --
+    # verified by hand for both 08:05 (ga-lda92s-1 above) and this point, same
+    # underlying quiet window being fully re-covered either way. The old
+    # 4-iteration fixed-point loop only reached 12h by coincidence at 08:05
+    # (needed exactly 4 steps); at 11:00 the same math needs ~9 steps and the
+    # old code silently returned 8.0h instead -- a real, reproducible
+    # under-expansion in the exact 10:01-11:59 band the gate reviewer traced
+    # by hand. This scenario pins the EXACT correct value, not just "some
+    # expansion happened", so a future regression that under-converges by a
+    # smaller margin still gets caught.
+    _exp_late_morning = _quiet_expanded_lookback_sec(_at("11:00:00"), 4 * 3600)
+    if _exp_late_morning == 12 * 3600:
+        _ok("ga-lda92s-1c: lookback reaches the true 12h fixed point at now=11:00 (gate-review regression)")
+    else:
+        _bad("ga-lda92s-1c", "expected exactly 12.0h at now=11:00 (true fixed point), got %.2fh -- "
+             "under-expansion reintroduces the false-stall-alarm bug in a morning band"
+             % (_exp_late_morning / 3600))
+
+    # The reviewer's OTHER cited point, described as "barely more than the
+    # raw 4h window -- almost total failure" (old code returned 4.20h here,
+    # vs the true 12h): `now - window_sec` lands just 1 minute before the
+    # 08:00 boundary, which is exactly the creep-to-a-crawl case the old
+    # fixed-point loop couldn't handle at any small iteration cap.
+    _exp_worst = _quiet_expanded_lookback_sec(_at("11:57:00"), 4 * 3600)
+    if _exp_worst == 12 * 3600:
+        _ok("ga-lda92s-1d: lookback reaches the true 12h fixed point at now=11:57 (reviewer's 'almost total failure' point)")
+    else:
+        _bad("ga-lda92s-1d", "expected exactly 12.0h at now=11:57 (true fixed point), got %.2fh"
+             % (_exp_worst / 3600))
 
     # ── ga-lda92s-2: a REAL Gate PASSED at 00:30 is invisible to the raw 4h
     # window at now=08:05 (455min gap), but the quiet-hours-expanded lookback
