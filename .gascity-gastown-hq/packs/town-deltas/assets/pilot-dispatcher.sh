@@ -185,6 +185,22 @@ PILOT_RAM_LEVEL_FILE="${PILOT_RAM_LEVEL_FILE:-${HOME}/.gastown/run/ram-pressure-
 PILOT_RAM_MAX_AGE_SECS="${PILOT_RAM_MAX_AGE_SECS:-7200}"
 PILOT_RAM_PRESSURE_OVERRIDE="${PILOT_RAM_PRESSURE_OVERRIDE:-}"
 
+# ga-dxyvxr: quiet-hours admission gate (00h-08h, Athos 2026-08-16) — shared
+# read-side helper, see quiet-hours-check.sh's own header for the full
+# rationale. Same directory, same sibling-source convention this file already
+# uses elsewhere in this pack.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/quiet-hours-check.sh" 2>/dev/null || true
+# ga-dxyvxr third-state hardening: if sourcing failed (missing/unreadable
+# sibling file), QUIET_HOURS_LEVEL_FILE never gets set (quiet-hours-check.sh
+# always sets it via its own ${VAR:-default}, so its absence here proves the
+# source itself never ran) — meaning _quiet_hours_blocks below would be an
+# undefined function ("command not found" inside $(...), which does NOT
+# trip set -e there — the classic command-substitution-swallows-failure
+# gotcha) and the gate goes silently, permanently inert with zero signal.
+# Plain stderr echo, not warn() — warn() is not defined yet at this point in
+# this file, and this check must not depend on definition order.
+[ -n "${QUIET_HOURS_LEVEL_FILE:-}" ] || echo "WARN: ga-dxyvxr: quiet-hours-check.sh failed to source — quiet-hours gate is INERT this run (fail-open: dispatch proceeds normally, but cannot pause even during real quiet hours until this is fixed)" >&2
+
 # ── Cross-stage priority — most-advanced-first / WIP-limit (ga-d0hz3) ──────────
 # The 4 stage dispatchers (auto-refino / refino-gate / quality-gate / pilot) are
 # INDEPENDENT launchd timers with no cross-stage coordination, so the system pulls
@@ -3411,6 +3427,26 @@ elif [ "$(_pilot_ram_pressure_unreadable)" = "1" ]; then
   # header above) but "couldn't tell" must stay VISIBLE, not collapse silently
   # into the same log-silence as "confirmed clear" on a state-mutating path.
   log "RAM-pressure signal UNREADABLE (missing/stale/corrupt ${PILOT_RAM_LEVEL_FILE}) — fail-open, dispatch proceeding normally this sweep (ga-m2gqb)."
+fi
+
+# ── ga-dxyvxr: quiet-hours back-off — PAUSE dispatch 00h-08h (Athos, 2026-08-16)
+# Same full-PAUSE shape as the two gates immediately above: dispatch nothing,
+# mutate no marker, let candidates be re-picked automatically once a later
+# sweep reads OPEN. "gc suspend" already covers the reconciler; this closes
+# the launchd-dispatcher half of the night-window gap (ga-dxyvxr, see
+# scripts/city-night-window.sh's own header). FAIL-OPEN via
+# _quiet_hours_blocks/_quiet_hours_unreadable — see quiet-hours-check.sh.
+if [ "$(_quiet_hours_blocks)" = "1" ]; then
+  warn "Quiet hours (city-night-window.sh, ~/.gastown/run/city-quiet-hours.level) — PAUSING all dispatch this sweep (00h-08h, Athos 2026-08-16: a cidade toda dorme). Retries automatically once a later sweep reads OPEN or a stale signal (ga-dxyvxr)."
+  notify -t "🌙 Pilot pausado: quiet hours" -p 2 "Pilot pausado — janela noturna 00h-08h; nenhum builder despachado, retoma as 08h (ga-dxyvxr)." 2>/dev/null || true
+  _pilot_write_sweep_pause_state 1 "quiet-hours" "Quiet hours 00h-08h"
+  log "=== Pilot sweep complete: dispatched=0 (paused: quiet hours) ==="
+  exit 0
+elif [ "$(_quiet_hours_unreadable)" = "1" ]; then
+  # ga-dxyvxr: same third-state discipline as the RAM-pressure gate above —
+  # "couldn't tell" must stay visible, never collapse silently into the same
+  # log-silence as "confirmed OPEN".
+  log "Quiet-hours signal UNREADABLE (missing/stale/corrupt ${QUIET_HOURS_LEVEL_FILE}) — fail-open, dispatch proceeding normally this sweep (ga-dxyvxr)."
 fi
 
 # ── ga-d0hz3: CROSS-STAGE admission gate — most-advanced-first / WIP-limit ─────

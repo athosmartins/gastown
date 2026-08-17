@@ -56,6 +56,22 @@
 set -euo pipefail
 
 GC_CITY="${REFINO_CITY_OVERRIDE:-/Users/athos/gt/.gascity-gastown-hq}"
+
+# ga-dxyvxr: quiet-hours admission gate (00h-08h, Athos 2026-08-16) — shared
+# read-side helper, sibling in this same pack. Provides
+# _quiet_hours_blocks/_quiet_hours_state/_quiet_hours_unreadable; see
+# quiet-hours-check.sh's own header for the full rationale.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/quiet-hours-check.sh" 2>/dev/null || true
+# ga-dxyvxr third-state hardening: if sourcing failed (missing/unreadable
+# sibling file), QUIET_HOURS_LEVEL_FILE never gets set (quiet-hours-check.sh
+# always sets it via its own ${VAR:-default}, so its absence here proves the
+# source itself never ran) — meaning _quiet_hours_blocks below would be an
+# undefined function ("command not found" inside $(...), which does NOT
+# trip set -e there — the classic command-substitution-swallows-failure
+# gotcha) and the gate goes silently, permanently inert with zero signal.
+# Plain stderr echo, not warn() — warn() is not defined yet at this point in
+# this file, and this check must not depend on definition order.
+[ -n "${QUIET_HOURS_LEVEL_FILE:-}" ] || echo "WARN: ga-dxyvxr: quiet-hours-check.sh failed to source — quiet-hours gate is INERT this run (fail-open: dispatch proceeds normally, but cannot pause even during real quiet hours until this is fixed)" >&2
 LOG_DIR="$GC_CITY/.gc/logs"
 LOG="$LOG_DIR/refino-gate-dispatcher.log"
 RG_LOG="$GC_CITY/.gc/refino-gate.jsonl"
@@ -391,6 +407,20 @@ echo "$STUCK_JSON" | jq -c '.[]?' 2>/dev/null | while IFS= read -r row; do
     fi
   fi
 done
+
+# ── ga-dxyvxr: quiet-hours admission gate — PAUSE new review admission 00h-08h ─
+# Probed AFTER Step 0's TTL recovery above (repairs EXISTING stuck claims —
+# safe/expected every sweep, quiet hours or not) and BEFORE Step 1 finds/claims
+# a NEW queued story. Dispatch nothing, mutate no marker: the queue stays as-is
+# and a later sweep picks it back up once OPEN. FAIL-OPEN via
+# _quiet_hours_blocks/_quiet_hours_unreadable — see quiet-hours-check.sh.
+if [ "$(_quiet_hours_blocks)" = "1" ]; then
+  warn "Quiet hours (city-night-window.sh, ~/.gastown/run/city-quiet-hours.level) — PAUSING refino-gate admission this sweep (00h-08h, Athos 2026-08-16). Queue stays as-is; auto-resumes when a later sweep reads OPEN (ga-dxyvxr)."
+  log "Refino gate sweep deferred (quiet hours, ga-dxyvxr). No mutation."
+  exit 0
+elif [ "$(_quiet_hours_unreadable)" = "1" ]; then
+  log "Quiet-hours signal UNREADABLE (missing/stale/corrupt ${QUIET_HOURS_LEVEL_FILE:-unset}) — fail-open, refino-gate proceeding normally this sweep (ga-dxyvxr)."
+fi
 
 # ── Step 1: Find queued stories (refined, awaiting refino-gate) ───────────────
 # Eligible = story:refino-review, NOT already being reviewed, NOT escalated, and

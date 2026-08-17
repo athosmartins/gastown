@@ -63,6 +63,22 @@
 set -euo pipefail
 
 GC_CITY="${CONTEXT_CHECK_CITY_OVERRIDE:-${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}}"
+
+# ga-dxyvxr: quiet-hours admission gate (00h-08h, Athos 2026-08-16) — shared
+# read-side helper, sibling in this same pack. Provides
+# _quiet_hours_blocks/_quiet_hours_state/_quiet_hours_unreadable; see
+# quiet-hours-check.sh's own header for the full rationale.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/quiet-hours-check.sh" 2>/dev/null || true
+# ga-dxyvxr third-state hardening: if sourcing failed (missing/unreadable
+# sibling file), QUIET_HOURS_LEVEL_FILE never gets set (quiet-hours-check.sh
+# always sets it via its own ${VAR:-default}, so its absence here proves the
+# source itself never ran) — meaning _quiet_hours_blocks below would be an
+# undefined function ("command not found" inside $(...), which does NOT
+# trip set -e there — the classic command-substitution-swallows-failure
+# gotcha) and the gate goes silently, permanently inert with zero signal.
+# Plain stderr echo, not warn() — warn() is not defined yet at this point in
+# this file, and this check must not depend on definition order.
+[ -n "${QUIET_HOURS_LEVEL_FILE:-}" ] || echo "WARN: ga-dxyvxr: quiet-hours-check.sh failed to source — quiet-hours gate is INERT this run (fail-open: dispatch proceeds normally, but cannot pause even during real quiet hours until this is fixed)" >&2
 LOG_DIR="$GC_CITY/.gc/logs"
 LOG="$LOG_DIR/context-check-dispatcher.log"
 CC_LOG="$GC_CITY/.gc/context-check.jsonl"
@@ -751,6 +767,24 @@ TASK
 }
 
 log "Context-check sweep start (actor=$CONTEXT_CHECK_ACTOR, max/sweep=$CONTEXT_CHECK_MAX_PER_SWEEP, max-sonnet/sweep=$CONTEXT_CHECK_MAX_SONNET_PER_SWEEP, dry_run=$DRY_RUN)"
+
+# ── ga-dxyvxr: quiet-hours admission gate — PAUSE new classification 00h-08h ───
+# This daemon has no in-flight/long-held claims to protect (each bead is
+# classified fresh, one pass, no multi-minute review state) — the whole sweep
+# IS new-work admission, so the gate sits right at the top, before Step 1
+# gathers anything. Still worth pausing: the heuristic-inconclusive path can
+# spawn a real Sonnet classification session (CONTEXT_CHECK_MAX_SONNET_PER_SWEEP),
+# which is exactly the kind of new-session token burn quiet hours exists to
+# avoid. Dispatch nothing, mutate no label: unclassified beads stay as-is and
+# a later sweep classifies them once OPEN. FAIL-OPEN via
+# _quiet_hours_blocks/_quiet_hours_unreadable — see quiet-hours-check.sh.
+if [ "$(_quiet_hours_blocks)" = "1" ]; then
+  warn "Quiet hours (city-night-window.sh, ~/.gastown/run/city-quiet-hours.level) — PAUSING classification this sweep (00h-08h, Athos 2026-08-16). Unclassified beads stay as-is; auto-resumes when a later sweep reads OPEN (ga-dxyvxr)."
+  log "Context-check sweep deferred (quiet hours, ga-dxyvxr). No mutation."
+  exit 0
+elif [ "$(_quiet_hours_unreadable)" = "1" ]; then
+  log "Quiet-hours signal UNREADABLE (missing/stale/corrupt ${QUIET_HOURS_LEVEL_FILE:-unset}) — fail-open, classification proceeding normally this sweep (ga-dxyvxr)."
+fi
 
 # ── Step 1: Gather candidates ──────────────────────────────────────────────────
 # Actionable work types: bug / chore / task / debt + feature (feature is filtered

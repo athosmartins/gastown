@@ -38,6 +38,24 @@ QG_LOG="$GC_CITY/.gc/quality-gate.jsonl"
 _GLH_SCRIPT="${GC_CITY}/scripts/git-lock-hygiene.sh"
 [ -f "$_GLH_SCRIPT" ] && { GIT_LOCK_HYGIENE_LIB=1 source "$_GLH_SCRIPT" 2>/dev/null; } || true
 unset _GLH_SCRIPT
+
+# ga-dxyvxr: quiet-hours admission gate (00h-08h, Athos 2026-08-16) — same
+# source-fail-soft convention as git-lock-hygiene.sh above. Provides
+# _quiet_hours_blocks/_quiet_hours_state/_quiet_hours_unreadable; see
+# quiet-hours-check.sh's own header for the full rationale.
+_QHC_SCRIPT="${GC_CITY}/packs/town-deltas/assets/quiet-hours-check.sh"
+[ -f "$_QHC_SCRIPT" ] && { source "$_QHC_SCRIPT" 2>/dev/null; } || true
+unset _QHC_SCRIPT
+# ga-dxyvxr third-state hardening: if sourcing failed (missing/unreadable
+# sibling file), QUIET_HOURS_LEVEL_FILE never gets set (quiet-hours-check.sh
+# always sets it via its own ${VAR:-default}, so its absence here proves the
+# source itself never ran) — meaning _quiet_hours_blocks below would be an
+# undefined function ("command not found" inside $(...), which does NOT
+# trip set -e there — the classic command-substitution-swallows-failure
+# gotcha) and the gate goes silently, permanently inert with zero signal.
+# Plain stderr echo, not warn() — warn() is not defined yet at this point in
+# this file, and this check must not depend on definition order.
+[ -n "${QUIET_HOURS_LEVEL_FILE:-}" ] || echo "WARN: ga-dxyvxr: quiet-hours-check.sh failed to source — quiet-hours gate is INERT this run (fail-open: dispatch proceeds normally, but cannot pause even during real quiet hours until this is fixed)" >&2
 # glh source clobbers LOG with its own jsonl path — restore ours (ga-l47b7 log-redirect fix)
 LOG="$LOG_DIR/quality-gate-dispatcher.log"
 
@@ -6839,6 +6857,22 @@ log "Found $COUNT queued marker(s)"
 if [ "$COUNT" = "0" ]; then
   log "No queued markers. Exiting."
   exit 0
+fi
+
+# ── ga-dxyvxr: quiet-hours admission gate — PAUSE new-run admission 00h-08h ────
+# There IS queued work (COUNT>0 above), but Athos's quiet-hours decision
+# (2026-08-16) says the city pauses admission of NEW work overnight. Runs
+# BEFORE the atomic claim (same reasoning as the headroom gate immediately
+# below: a deferred sweep never strands a marker in gate-status:dispatching)
+# and AFTER Phase C / the Step 0a janitors above, which finalize/repair
+# EXISTING state rather than admit anything new — in-flight reviews are never
+# interrupted, only new-run admission pauses. FAIL-OPEN via
+# _quiet_hours_blocks/_quiet_hours_unreadable — see quiet-hours-check.sh.
+if [ "$(_quiet_hours_blocks)" = "1" ]; then
+  log "Quiet hours (city-night-window.sh, ~/.gastown/run/city-quiet-hours.level) — PAUSING new-run admission this sweep (00h-08h, Athos 2026-08-16), leaving $COUNT marker(s) queued (ga-dxyvxr)."
+  exit 0
+elif [ "$(_quiet_hours_unreadable)" = "1" ]; then
+  log "Quiet-hours signal UNREADABLE (missing/stale/corrupt ${QUIET_HOURS_LEVEL_FILE:-unset}) — fail-open, admission proceeding normally this sweep (ga-dxyvxr)."
 fi
 
 # ── Step 0b-1 (ga-cw4pm): dynamic-concurrency headroom gate ───────────────────
