@@ -2057,6 +2057,64 @@ def get_branch_recent(bead_id, fetch=True, window_seconds=None):
     return False
 
 
+def _sling_has_unmerged_branch(bead_id):
+    """Return the first matching remote branch name (any REPOS entry, any
+    naming convention recognized by _branch_segment_matches_bead) whose tip
+    is not an ancestor of origin/main. None if no matching branch exists or
+    every matching branch is already merged.
+
+    ga-p2dqmd guard 3: used by _close_orphaned_sling() as a check independent
+    of the self-reference and issue_type guards there — a genuine disposable
+    dispatch wrapper never carries its own code, so any matching branch not
+    yet merged into main means this id is not safe to close via that path,
+    regardless of id/type. Uses the same `git merge-base --is-ancestor` idiom
+    already established elsewhere in this codebase (and cited directly in
+    ga-p2dqmd's own investigation).
+
+    Relies on refs/remotes/origin/* already being fresh: do_reclaim() step 0
+    (preserve_unpushed_branch) fetches every REPOS entry earlier in the same
+    call, so this never fetches again.
+
+    Fail-safe like every other branch check in this file: a git error on a
+    candidate branch is read as "can't confirm merged" -> treated as
+    unmerged. Refusing to close a sling that turns out to have been safe
+    just leaves it for the sling-task-janitor backstop; wrongly closing live
+    work has no backstop.
+    """
+    for repo in REPOS:
+        try:
+            r = subprocess.run(
+                ["git", "-C", repo, "for-each-ref",
+                 "--format=%(refname) %(objectname)", "refs/remotes/origin/"],
+                capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                continue
+        except Exception:
+            continue
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            refname, sha = parts
+            segment = refname.rsplit("/", 1)[-1]
+            if not _branch_segment_matches_bead(segment, bead_id):
+                continue
+            branch = refname[len("refs/remotes/origin/"):]
+            try:
+                chk = subprocess.run(
+                    ["git", "-C", repo, "merge-base", "--is-ancestor",
+                     sha, "refs/remotes/origin/main"],
+                    capture_output=True, text=True, timeout=30)
+                if chk.returncode != 0:
+                    return branch  # not an ancestor of main -> unmerged
+            except Exception:
+                return branch  # can't confirm merged -> fail-safe unmerged
+    return None
+
+
 def parse_reclaim_count(labels):
     """Extract pilot:reclaim-count:N from labels. Returns int (0 if absent or invalid)."""
     for lbl in labels:
@@ -2329,9 +2387,39 @@ def _close_orphaned_sling(bd_prefix, sling_bead_id, target_bead_id, hold_secs):
     (sling_bead_id falsy) is a normal case — not every in-flight bead was
     dispatched via `gc sling` — and must not raise or otherwise disturb the
     caller's own reclaim.
+
+    CONTROL (ga-p2dqmd guard 1 — self-reference): rig-native dispatch (the
+    bead lives in a rig's own Dolt store, e.g. property_scrapers,
+    whatsapp_automation) has no separate wrapper bead — pilot-dispatcher.sh's
+    rig-native path stamps metadata.pilot.sling_bead onto the STORY bead's
+    OWN id (the bead id itself acts as the dispatch hook), so sling_bead_id
+    legitimately equals target_bead_id for that dispatch style. Closing "the
+    sling" in that case closes the story/bug/feature itself — confirmed as
+    the ga-p2dqmd/wa-dqwkj failure: all 18 of 19 beads wrongly closed via
+    this path were self-referential exactly this way. A genuine `gc sling`
+    HQ-native wrapper always has its own distinct id (pilot-dispatcher.sh's
+    HQ-native path) — never equal to the target.
+
+    CONTROL (ga-p2dqmd guard 2 — issue_type): independent of guard 1 — a
+    disposable dispatch wrapper is never itself a bug/feature/story, so this
+    also protects against any future call path that hands this function a
+    real work item's id through some other route besides self-reference.
+
+    CONTROL (ga-p2dqmd guard 3 — unmerged branch): independent of guards 1
+    and 2 — a genuine dispatch wrapper never carries its own code, so any
+    remote branch matching this id that is not yet merged into main means
+    the id is not safe to close as a disposable sling, regardless of
+    id/type. See _sling_has_unmerged_branch().
     """
     if not sling_bead_id:
         return False  # ga-xlnkf AC3: no sling metadata is normal, not an error
+
+    if sling_bead_id == target_bead_id:
+        print(f"[INFLIGHT-RECLAIM] ga-p2dqmd: sling_bead_id == target_bead_id "
+              f"({target_bead_id}) — rig-native self-referential dispatch, not a "
+              f"real orphaned sling; leaving it alone", flush=True)
+        return False  # guard 1: self-reference
+
     try:
         r = subprocess.run(bd_prefix + ["show", sling_bead_id, "--json"],
                             capture_output=True, text=True, timeout=15)
@@ -2352,6 +2440,20 @@ def _close_orphaned_sling(bd_prefix, sling_bead_id, target_bead_id, hold_secs):
     # needs no action either. Only the exact open+unassigned shape qualifies.
     if sling.get("status") != "open" or (sling.get("assignee") or ""):
         return False
+
+    _sling_type = sling.get("issue_type") or sling.get("type") or ""
+    if _sling_type in ("bug", "feature", "story"):
+        print(f"[INFLIGHT-RECLAIM] ga-p2dqmd: sling {sling_bead_id} has issue_type="
+              f"{_sling_type!r} (not a disposable wrapper) — refusing to close, "
+              f"target {target_bead_id}", flush=True)
+        return False  # guard 2: issue_type
+
+    _unmerged_branch = _sling_has_unmerged_branch(sling_bead_id)
+    if _unmerged_branch:
+        print(f"[INFLIGHT-RECLAIM] ga-p2dqmd: sling {sling_bead_id} has unmerged "
+              f"branch {_unmerged_branch} — refusing to close, target {target_bead_id}",
+              flush=True)
+        return False  # guard 3: unmerged branch
 
     try:
         r = subprocess.run(
@@ -7062,13 +7164,19 @@ def _selftest():
             self.stdout = out
             self.stderr = err
 
-    def _make_slc_stub(sling_id, sling_status="open", sling_assignee=""):
+    def _make_slc_stub(sling_id, sling_status="open", sling_assignee="",
+                        sling_issue_type=None):
         """Only the SLING's state is modeled (status/assignee, mutated by a
         `close`). Any `bd show` for a DIFFERENT id — i.e. do_reclaim's own
         _remove_label_verified() read-back on the TARGET bead itself — reports
         the label already gone, so step 1 verifies clean and execution reaches
         step 3b, the thing this section actually exercises (Section 9b/12
-        already cover the target's own label/status/assignee mechanics)."""
+        already cover the target's own label/status/assignee mechanics).
+
+        sling_issue_type (ga-p2dqmd, default None): omitted from the `bd show`
+        payload entirely when None, so SLC-1..5 (which never set it) exercise
+        guard 2's real production shape — a sling response with no issue_type
+        key at all — unchanged. Set it to exercise guard 2 directly (SLC-7)."""
         sling_state = {"status": sling_status, "assignee": sling_assignee}
         calls = []
 
@@ -7081,9 +7189,11 @@ def _selftest():
                 sub = args[0] if args else ""
                 if sub == "show" and len(args) >= 2:
                     if args[1] == sling_id:
-                        return _SlcResult(0, json.dumps([
-                            {"id": sling_id, "status": sling_state["status"],
-                             "assignee": sling_state["assignee"]}]))
+                        _payload = {"id": sling_id, "status": sling_state["status"],
+                                    "assignee": sling_state["assignee"]}
+                        if sling_issue_type is not None:
+                            _payload["issue_type"] = sling_issue_type
+                        return _SlcResult(0, json.dumps([_payload]))
                     return _SlcResult(0, json.dumps([{"id": args[1], "labels": []}]))
                 if sub == "close" and len(args) >= 2 and args[1] == sling_id:
                     sling_state["status"] = "closed"
@@ -7183,6 +7293,108 @@ def _selftest():
               "the sling, even if it is open+unassigned — this fix is scoped to "
               "reclaim+HOLD, not every reclaim",
               len(_slc5_sling_calls) == 0, f"calls={_slc_calls5!r}")
+
+        # SLC-6 (ga-p2dqmd guard 1 — self-reference): rig-native dispatch
+        # stamps metadata.pilot.sling_bead onto the bead's OWN id (no
+        # separate wrapper bead exists for that dispatch style). Reproduces
+        # the confirmed wa-dqwkj failure: sling_bead_id == target_bead_id,
+        # both open+unassigned (do_reclaim's own steps 2/2b already reset
+        # the target by the time step 3b runs) — pre-fix, this closed the
+        # bead ITSELF, citing itself as "the target" in the close reason.
+        def _make_slc_selfref_stub(bead_id):
+            calls = []
+
+            def _run(cmd, **kw):
+                if not isinstance(cmd, (list, tuple)):
+                    return _SlcResult(0, "")
+                calls.append(list(cmd))
+                if cmd and cmd[0] == "bd":
+                    args = list(cmd[1:])
+                    sub = args[0] if args else ""
+                    if sub == "show" and len(args) >= 2 and args[1] == bead_id:
+                        return _SlcResult(0, json.dumps([
+                            {"id": bead_id, "status": "open", "assignee": "",
+                             "labels": [], "issue_type": "bug"}]))
+                    if sub == "close" and len(args) >= 2 and args[1] == bead_id:
+                        return _SlcResult(0, "")
+                    return _SlcResult(0, "")
+                return _SlcResult(0, "")
+            return _run, calls
+
+        subprocess.run, _slc_calls6 = _make_slc_selfref_stub("ga-target6")
+        try:
+            do_reclaim("ga-target6", "some bead", reclaim_count=1, idle_min=40.0,
+                        labels=["story:in-flight"], sling_bead_id="ga-target6")
+        finally:
+            subprocess.run = _orig_run_slc
+        _slc6_close = [c for c in _slc_calls6 if len(c) >= 3 and c[0] == "bd"
+                       and c[1] == "close" and c[2] == "ga-target6"]
+        check("SLC-6 (ga-p2dqmd guard 1): sling_bead_id == target_bead_id "
+              "(rig-native self-referential dispatch) is NEVER closed via the "
+              "orphaned-sling path",
+              len(_slc6_close) == 0, f"calls={_slc_calls6!r}")
+
+        # SLC-7 (ga-p2dqmd guard 2 — issue_type): a distinct sling id that is
+        # open+unassigned (would otherwise qualify) but carries issue_type
+        # "bug" — never a disposable wrapper — must not be closed.
+        subprocess.run, _slc_calls7, _ = _make_slc_stub("ga-sling7", "open", "",
+                                                          sling_issue_type="bug")
+        try:
+            do_reclaim("ga-target7", "some bead", reclaim_count=1, idle_min=40.0,
+                        labels=["story:in-flight"], sling_bead_id="ga-sling7")
+        finally:
+            subprocess.run = _orig_run_slc
+        _slc7_close = [c for c in _slc_calls7 if len(c) >= 3 and c[0] == "bd"
+                       and c[1] == "close" and c[2] == "ga-sling7"]
+        check("SLC-7 (ga-p2dqmd guard 2): sling issue_type=bug (not a disposable "
+              "wrapper type) is never closed even though open+unassigned",
+              len(_slc7_close) == 0, f"calls={_slc_calls7!r}")
+
+        # SLC-8 (ga-p2dqmd guard 3 — unmerged branch): a distinct sling id,
+        # open+unassigned, issue_type=task (passes guards 1+2) but with a
+        # matching remote branch that is NOT an ancestor of origin/main —
+        # must not be closed.
+        def _make_slc_branch_stub(sling_id, sha="d" * 40):
+            calls = []
+
+            def _run(cmd, **kw):
+                if not isinstance(cmd, (list, tuple)):
+                    return _SlcResult(0, "")
+                calls.append(list(cmd))
+                if cmd and cmd[0] == "bd":
+                    args = list(cmd[1:])
+                    sub = args[0] if args else ""
+                    if sub == "show" and len(args) >= 2:
+                        if args[1] == sling_id:
+                            return _SlcResult(0, json.dumps([
+                                {"id": sling_id, "status": "open", "assignee": "",
+                                 "issue_type": "task"}]))
+                        return _SlcResult(0, json.dumps([{"id": args[1], "labels": []}]))
+                    if sub == "close":
+                        return _SlcResult(0, "")
+                    return _SlcResult(0, "")
+                if cmd and cmd[0] == "git":
+                    sub = cmd[3] if len(cmd) > 3 else ""
+                    if sub == "for-each-ref":
+                        return _SlcResult(
+                            0, f"refs/remotes/origin/crew/wa-worker/{sling_id} {sha}\n")
+                    if sub == "merge-base":
+                        return _SlcResult(1, "", "")  # not an ancestor -> unmerged
+                    return _SlcResult(0, "")
+                return _SlcResult(0, "")
+            return _run, calls
+
+        subprocess.run, _slc_calls8 = _make_slc_branch_stub("ga-sling8")
+        try:
+            do_reclaim("ga-target8", "some bead", reclaim_count=1, idle_min=40.0,
+                        labels=["story:in-flight"], sling_bead_id="ga-sling8")
+        finally:
+            subprocess.run = _orig_run_slc
+        _slc8_close = [c for c in _slc_calls8 if len(c) >= 3 and c[0] == "bd"
+                       and c[1] == "close" and c[2] == "ga-sling8"]
+        check("SLC-8 (ga-p2dqmd guard 3): sling has an unmerged remote branch -> "
+              "never closed even though open+unassigned with issue_type=task",
+              len(_slc8_close) == 0, f"calls={_slc_calls8!r}")
     finally:
         subprocess.run = _orig_run_slc
         if _orig_reloop_env is None:
