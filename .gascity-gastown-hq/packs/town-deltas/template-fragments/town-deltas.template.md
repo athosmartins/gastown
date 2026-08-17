@@ -547,16 +547,49 @@ NEGA SEMPRE (vence PERMITE mesmo em match duplo): .dolt/, .beads/,
   ~/gt/*/shared/data/**
 ```
 
-**Como aplicar:** ao limpar scratchpad/cache/build-artifact num script ou
-comando ad-hoc, prefira `safe-clean <caminho>` a `rm -rf <caminho>` — some
-sem pedir aprovação se o alvo for reconhecidamente descartável, e funciona
-como recusa segura (não deleta nada, exit 2, imprime o motivo por caminho) se
-não for. Nesse caso caia pro `rm -rf` normal, que vai pedir aprovação como
-sempre — isso é o comportamento correto, não um bug. `safe-clean` NÃO
-substitui `rm -rf` como comando geral, só cobre a lista PERMITE explícita
-acima; passar múltiplos caminhos é tudo-ou-nada (se qualquer um for negado,
-nenhum é removido). **Só aceita caminho ABSOLUTO** — um caminho relativo é
-recusado (fail-closed), nunca resolvido contra o CWD do processo (gate-fix
-2, ga-gkap9p: CWD é estado ambiente que este comando nunca deve confiar para
-uma decisão de deleção).
+**Como aplicar — TESTE DE DECISÃO IMPERATIVO, três casos, nunca invente um
+quarto (medido 4x, 15–16/08, ver abaixo — "prefira" não segurou):**
+  - Caminho é de WORKTREE (vai recriar ou reusar um `git worktree`, ex. um
+    "<bead>-base" pra A/B test do gate)? → idioma copiável abaixo. NUNCA
+    `rm -rf <path> && git worktree add ...`.
+  - Caminho é scratchpad/cache/build-artifact (reconhecidamente
+    descartável)? → `safe-clean <caminho>`. NUNCA `rm -rf <caminho>` direto.
+  - Qualquer outra coisa? → PARE e pergunte — não improvise `rm -rf`.
+
+Idioma WORKTREE (copie as duas linhas inteiras, nunca invoca `rm`):
+```
+git -C <repo> worktree remove --force <path> 2>/dev/null || true
+git -C <repo> worktree add --detach <path> <sha>
+```
+
+**Por que o idioma acima nunca invoca `rm`:** `git worktree remove --force`
+casa `Bash(git:*)` (`allow` em `~/.claude/settings.json`), NÃO casa
+`Bash(rm -rf:*)` (`ask`) — não dispara prompt de aprovação. E ele limpa o
+REGISTRO do git no mesmo comando: um `rm -rf` sozinho no diretório do
+worktree apaga os arquivos mas deixa o worktree "fantasma" registrado
+(`git worktree list` continua listando o path morto), e um `git worktree
+add` seguinte no MESMO path falha com "already exists" — exatamente o
+idioma que travou `gate-reviewer-adhoc-0bf04c9bcb` por 97min tentando
+recriar `.../scratchpad/wa-e2nc1-base` (bead wa-e2nc1, ga-lv680n). Os
+scripts do próprio gate já usam esse idioma (`gate-guard-ab-base-test-check
+.selftest.sh`, `mol-quality-gate-runner.toml`) — mas isso vivia em CÓDIGO
+que o agente não lê ao improvisar um comando ad-hoc; agora está na doutrina
+que ele lê.
+
+**Caso scratchpad/cache, IMPERATIVO — não "prefira":** medido 4x (3 casos em
+15/08, 54–86min cada, ~14h de sessão somadas; +1 em 16/08, 97min,
+gate-reviewer-adhoc-0bf04c9bcb): `rm -rf` ad-hoc — mesmo limpeza banal de
+scratchpad, ou recriação de worktree — trava um agente de pool SEM HUMANO
+POR PERTO no prompt de aprovação `Bash(rm -rf:*)`, minutos a horas, até
+alguém apertar uma tecla. `safe-clean` some sem pedir aprovação se o alvo
+for reconhecidamente descartável, e funciona como recusa segura (não deleta
+nada, exit 2, imprime o motivo por caminho) se não for. Nesse caso caia pro
+`rm -rf` normal, que vai pedir aprovação como sempre — isso é o
+comportamento correto, não um bug. `safe-clean` NÃO substitui `rm -rf` como
+comando geral, só cobre a lista PERMITE explícita acima; passar múltiplos
+caminhos é tudo-ou-nada (se qualquer um for negado, nenhum é removido). Só
+aceita caminho ABSOLUTO — um caminho relativo é recusado (fail-closed),
+nunca resolvido contra o CWD do processo (gate-fix 2, ga-gkap9p: CWD é
+estado ambiente que este comando nunca deve confiar para uma decisão de
+deleção).
 {{ end }}
