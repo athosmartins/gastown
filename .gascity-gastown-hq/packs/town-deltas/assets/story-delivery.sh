@@ -935,7 +935,18 @@ fi
 # majority — this is always empty and nothing here changes behavior. A
 # non-empty result means a genuinely different, still-open submission
 # exists for this same story.
-OPEN_SIBLINGS=$(gate_bead_sibling_status_lines "$GC_CITY" "$STORY_ID" 2>/dev/null || echo "")
+#
+# ga-0m6tgc gate-fix (attempt 2): deliberately NOT `2>/dev/null` here. The
+# function's own header documents writing its ALERT lines straight to
+# stderr specifically so they survive being captured by `$(...)` and reach
+# whatever this caller's stderr is directed to — which for this script is
+# LOG (the `exec >> "$LOG" 2>&1` above), the same convention every OTHER
+# caller of this function/its siblings already relies on (quality-gate-
+# dispatcher.sh's gate_bead_active_sibling_branch/gate_bead_terminal_failed_
+# sibling_branch call sites carry no local stderr redirect either). A local
+# `2>/dev/null` here silently discarded the bd-query-failure ALERT this same
+# fix adds — the one call site in the codebase that would have hidden it.
+OPEN_SIBLINGS=$(gate_bead_sibling_status_lines "$GC_CITY" "$STORY_ID" || echo "")
 if [ -n "$OPEN_SIBLINGS" ]; then
   log "Story $STORY_ID has an OPEN sibling gate marker — holding (ga-0m6tgc), not deploying:"
   printf '%s\n' "$OPEN_SIBLINGS" | while IFS="$(printf '\t')" read -r _sib_branch _sib_status _sib_rig; do

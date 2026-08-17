@@ -113,6 +113,101 @@ MOCK_LIST_JSON='[{"id":"m1","status":"closed","labels":["type:quality-gate-marke
 eq "(d) both markers now terminal (2nd closed too) → '' (proceeds normally, per AC)" \
   "$(gate_bead_sibling_status_lines city 'ga-dxyvxr')" ""
 
+# ── 1b. GATE-FEEDBACK regression (attempt 2, gate-run ga-ihxdja): a bd/Dolt
+#       query FAILURE must NOT read the same as "confirmed zero siblings" ──
+# The reviewer reproduced this by hand with a failing bd() mock: pre-fix,
+# `siblings_json=$(bd ... || echo "[]")` swallowed the failure and this
+# function returned "" — byte-identical to test (a) above (genuinely zero
+# markers) — so story-delivery.sh's `if [ -n "$OPEN_SIBLINGS" ]` took the
+# PROCEED branch on a transient hiccup exactly as readily as on a real
+# all-clear. This section is RED on the attempt-1 code, GREEN after the fix.
+echo "── 1b. bd query FAILURE must NOT collapse to '' (gate-run ga-ihxdja fix) ──"
+bd() {
+  case " $* " in
+    *" list "*) echo "bd: connection refused (mock failure)" >&2; return 1 ;;
+    *) return 0 ;;
+  esac
+}
+FAIL_RESULT=$(gate_bead_sibling_status_lines city 'ga-dxyvxr' 2>/dev/null)
+FAIL_STDERR=$(gate_bead_sibling_status_lines city 'ga-dxyvxr' 2>&1 1>/dev/null)
+
+if [ -n "$FAIL_RESULT" ]; then
+  ok "(e) bd query FAILS → non-empty result: [$FAIL_RESULT] (must hold, not read as 'no siblings')"
+else
+  bad "(e) bd query FAILS → got EMPTY result — indistinguishable from confirmed-zero-siblings, the exact regression this section exists to catch"
+fi
+
+FAIL_STATUS=$(printf '%s' "$FAIL_RESULT" | head -1 | cut -f2)
+if [ "$FAIL_STATUS" = "failed" ]; then
+  bad "(e2) bd-failure sentinel's status is the literal string 'failed' ([$FAIL_STATUS]) — would be misread as a genuine terminal-failed sibling by gate_pick_terminal_failed_sibling's exact-match check"
+else
+  ok "(e2) bd-failure sentinel's status ([$FAIL_STATUS]) is not the literal 'failed' — inert to gate_pick_terminal_failed_sibling's exact-match"
+fi
+
+case "$FAIL_STDERR" in
+  *ALERT*) ok "(e3) bd query failure is surfaced on stderr (visible/counted, not silent)" ;;
+  *) bad "(e3) expected an ALERT on stderr for a bd query failure, got: [$FAIL_STDERR]" ;;
+esac
+
+# Restore the success-shaped mock so nothing appended below this point is
+# affected by the failure mock.
+bd() {
+  case " $* " in
+    *" list "*) printf '%s\n' "$MOCK_LIST_JSON" ;;
+    *) : ;;
+  esac
+  return 0
+}
+
+# ga-0m6tgc gate-fix (attempt 2): the story-delivery.sh call site must not
+# suppress this function's own stderr — a local `2>/dev/null` there would
+# silently discard the ALERT just proven above. Static drift guard (the
+# runtime alert-delivery is proven end-to-end by the 1c end-to-end replay
+# below, which sources this exact line).
+echo "── 1b2. drift guard: story-delivery.sh call site does not suppress stderr ──"
+CALL_SITE_LINE=$(grep -n 'OPEN_SIBLINGS=\$(gate_bead_sibling_status_lines' "$STORY_DELIVERY" | head -1 | cut -d: -f2-)
+case "$CALL_SITE_LINE" in
+  *"2>/dev/null"*) bad "story-delivery.sh's call site still redirects stderr to /dev/null — this discards the bd-query-failure ALERT: $CALL_SITE_LINE" ;;
+  *) ok "story-delivery.sh's call site does not suppress stderr — the bd-query-failure ALERT reaches the script's own log" ;;
+esac
+
+# ── 1c. END-TO-END: replay story-delivery.sh's OWN call-site expression
+#       (not a re-implementation of it) under the failing mock ────────────
+echo "── 1c. end-to-end: story-delivery.sh's real OPEN_SIBLINGS expression, bd failing ──"
+bd() {
+  case " $* " in
+    *" list "*) echo "bd: connection refused (mock failure)" >&2; return 1 ;;
+    *) return 0 ;;
+  esac
+}
+GC_CITY="city"
+STORY_ID="ga-dxyvxr"
+# Extract and eval the actual assignment line from the live script, so a
+# future edit to it (e.g. reintroducing 2>/dev/null, or changing the `||`
+# fallback) is caught here even if nobody thinks to update this test.
+REAL_ASSIGNMENT=$(grep -E '^OPEN_SIBLINGS=\$\(gate_bead_sibling_status_lines' "$STORY_DELIVERY" | head -1)
+if [ -z "$REAL_ASSIGNMENT" ]; then
+  bad "could not find the OPEN_SIBLINGS assignment line in story-delivery.sh to replay"
+else
+  eval "$REAL_ASSIGNMENT"
+  if [ -n "$OPEN_SIBLINGS" ]; then
+    ok "(f) story-delivery.sh's actual OPEN_SIBLINGS expression is non-empty under a failing bd query — takes the HOLD branch, not PROCEED"
+  else
+    bad "(f) story-delivery.sh's actual OPEN_SIBLINGS expression is EMPTY under a failing bd query — takes the PROCEED branch, the exact silent/irreversible regression this bead exists to close"
+  fi
+fi
+unset GC_CITY STORY_ID OPEN_SIBLINGS
+
+# Restore the success-shaped mock again before the (unrelated) drift-guard
+# and syntax sections below.
+bd() {
+  case " $* " in
+    *" list "*) printf '%s\n' "$MOCK_LIST_JSON" ;;
+    *) : ;;
+  esac
+  return 0
+}
+
 # ── 2. DRIFT GUARD: the hold-check is wired into the main loop, in the right
 #      place (after idempotency skips, before the delivery:running claim,
 #      before Step 2/rig determination and Step 8/story:done) ──────────────

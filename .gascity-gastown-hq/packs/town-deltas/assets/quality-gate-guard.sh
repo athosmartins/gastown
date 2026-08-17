@@ -1697,7 +1697,40 @@ gate_base_test_verdict() {
 gate_bead_sibling_status_lines() {
   local gc_city="$1" bead_id="$2"
   local siblings_json count i sib marker_status labels desc branch status rig lines sib_id
-  siblings_json=$(bd -C "$gc_city" list --label "source-bead:$bead_id" --all --json 2>/dev/null || echo "[]")
+  local bd_rc
+  # ga-0m6tgc gate-fix (attempt 2, gate-run ga-ihxdja): capture bd's REAL exit
+  # code via the errexit-safe `if VAR=$(...); then` idiom (same shape as
+  # gc_json_or_unknown above) instead of `... || echo "[]"`, which collapsed
+  # "the query failed" and "confirmed zero open siblings" into the identical
+  # empty result. Reproduced by the reviewer with a failing bd() mock: this
+  # function returned "" either way, so story-delivery.sh's only caller (the
+  # `if [ -n "$OPEN_SIBLINGS" ]` check at story-delivery.sh:918) took the
+  # "proceed toward deploy/story:done" branch on both — and once story:done
+  # lands, the bead permanently stops matching Step 1's own selector
+  # (story-delivery.sh:902), so a false-negative here is silent and
+  # irreversible.
+  if siblings_json=$(bd -C "$gc_city" list --label "source-bead:$bead_id" --all --json 2>/dev/null); then
+    bd_rc=0
+  else
+    bd_rc=$?
+  fi
+  if [ "$bd_rc" -ne 0 ]; then
+    # Fail toward the SAME branch a genuine open sibling takes — hold, retry
+    # next sweep, costs only a delay — never toward "proceed", matching the
+    # fail-toward-non-destructive convention already established for this
+    # bug class (ga-95tq3p). The synthetic line's status ("query-failed") is
+    # not in gate_active_gate_statuses() and does not equal "failed", so
+    # gate_pick_active_sibling/gate_pick_terminal_failed_sibling (this
+    # function's other two callers, quality-gate-dispatcher.sh) treat it as
+    # inert rather than a fabricated real sibling — those two callers keep
+    # their own, already-documented fail-OPEN-on-error behavior (a
+    # pre-merge race check, not an irreversible-once-triggered delivery
+    # gate; see gate_bead_active_sibling_branch's header).
+    printf '[%s] [quality-gate-guard] ALERT: gate_bead_sibling_status_lines query FAILED for bead %s (bd -C %s list exit %s) — cannot confirm zero open siblings; treating as unknown/still-open, not clear.\n' \
+      "$(date '+%Y-%m-%d %H:%M:%S')" "$bead_id" "$gc_city" "$bd_rc" >&2
+    printf 'unknown\tquery-failed\tunknown\n'
+    return 0
+  fi
   if [ -z "$siblings_json" ] || [ "$siblings_json" = "null" ]; then siblings_json="[]"; fi
   count=$(printf '%s' "$siblings_json" | jq 'length' 2>/dev/null || echo "0")
   case "$count" in ''|*[!0-9]*) count=0 ;; esac
