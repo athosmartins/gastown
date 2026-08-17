@@ -55,6 +55,22 @@ set -euo pipefail
 
 GC_CITY="${AUTO_REFINO_CITY_OVERRIDE:-${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}}"
 
+# ga-dxyvxr: quiet-hours admission gate (00h-08h, Athos 2026-08-16) — shared
+# read-side helper, sibling in this same pack. Provides
+# _quiet_hours_blocks/_quiet_hours_state/_quiet_hours_unreadable; see
+# quiet-hours-check.sh's own header for the full rationale.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/quiet-hours-check.sh" 2>/dev/null || true
+# ga-dxyvxr third-state hardening: if sourcing failed (missing/unreadable
+# sibling file), QUIET_HOURS_LEVEL_FILE never gets set (quiet-hours-check.sh
+# always sets it via its own ${VAR:-default}, so its absence here proves the
+# source itself never ran) — meaning _quiet_hours_blocks below would be an
+# undefined function ("command not found" inside $(...), which does NOT
+# trip set -e there — the classic command-substitution-swallows-failure
+# gotcha) and the gate goes silently, permanently inert with zero signal.
+# Plain stderr echo, not warn() — warn() is not defined yet at this point in
+# this file, and this check must not depend on definition order.
+[ -n "${QUIET_HOURS_LEVEL_FILE:-}" ] || echo "WARN: ga-dxyvxr: quiet-hours-check.sh failed to source — quiet-hours gate is INERT this run (fail-open: dispatch proceeds normally, but cannot pause even during real quiet hours until this is fixed)" >&2
+
 # ── Multi-store funnel (Mayor-diagnosed rig-store starvation) ─────────────────
 # Feature stories live in THREE separate bead stores: the HQ city store plus the
 # WhatsApp-automation (WA) and property-scrapers (PS) rig stores. The original
@@ -921,6 +937,22 @@ echo "$RECONCILE_JSON" | jq -c '.[]?' 2>/dev/null | while IFS= read -r row; do
   fi
 done
 done  # end maintenance per-store loop (Step 0 + 0c)
+
+# ── ga-dxyvxr: quiet-hours admission gate — PAUSE new refine admission 00h-08h ─
+# Probed AFTER the cheap self-healing maintenance passes above (which repair
+# EXISTING stuck claims and are safe/expected to run every sweep, quiet hours
+# or not) and BEFORE any candidate query / claim / spawn — the same placement
+# rule FIX B (cross-stage yield) documents immediately below, and for the same
+# reason: dispatch nothing, mutate no marker, so Triagem stays queued and a
+# later sweep picks it back up once OPEN. FAIL-OPEN via
+# _quiet_hours_blocks/_quiet_hours_unreadable — see quiet-hours-check.sh.
+if [ "$(_quiet_hours_blocks)" = "1" ]; then
+  warn "Quiet hours (city-night-window.sh, ~/.gastown/run/city-quiet-hours.level) — PAUSING refino admission this sweep (00h-08h, Athos 2026-08-16). Triagem stays queued; auto-resumes when a later sweep reads OPEN (ga-dxyvxr)."
+  log "Auto-refino sweep deferred (quiet hours, ga-dxyvxr). No mutation."
+  exit 0
+elif [ "$(_quiet_hours_unreadable)" = "1" ]; then
+  log "Quiet-hours signal UNREADABLE (missing/stale/corrupt ${QUIET_HOURS_LEVEL_FILE:-unset}) — fail-open, refino proceeding normally this sweep (ga-dxyvxr)."
+fi
 
 # ── FIX B: CROSS-STAGE contention-yield (mirrors the Pilot daemon, ga-d0hz3) ─
 # Refino is the LOWEST stage. BEFORE gathering candidates / spawning a refiner,
