@@ -982,7 +982,25 @@ fi
 echo "Scenario 3e2: a pilot:held bead is excluded from the candidate pool (durable worker release)"
 _FC_FN="$(grep '^log()' "$DISPATCHER")
 $(sed -n '/^_log_exclusions() {/,/^}$/p' "$DISPATCHER")
-$(awk '/^_FILTER_PREAPPROVAL_LABELS=/{print} /^source .*framework-marker-labels\.sh/{print} /^_FILTER_FRAMEWORK_MARKER_LABELS=/{print} /^_FILTER_RECLAIM_CAP=/{print} /^_PILOT_ENGINE_REBUILD_RE=/{print} /^_filter_candidates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+source \"$SELF_DIR/framework-marker-labels.sh\"
+$(awk '/^_FILTER_PREAPPROVAL_LABELS=/{print} /^_FILTER_FRAMEWORK_MARKER_LABELS=/{print} /^_FILTER_RECLAIM_CAP=/{print} /^_PILOT_ENGINE_REBUILD_RE=/{print} /^_filter_candidates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+# ga-vmn7kv: the awk extraction above CANNOT capture the real dispatcher's
+# `source "$_GC_FML_SIBLING"` line — that line references a variable, not a
+# literal "framework-marker-labels.sh" filename, so no textual grep/awk
+# pattern will ever match it. A dedicated hardcoded `source` statement above
+# (mirroring pilot-dispatcher.exclusion-trace.selftest.sh's Scenario 1 FMS)
+# is the only reliable way to inject this dependency into an extracted
+# function body. Without it, $GC_FRAMEWORK_MARKER_LABELS stays unbound under
+# this file's `set -uo pipefail`: nounset then kills the `printf | jq -R . |
+# jq -s -c .` pipeline's FIRST stage before it forks, but the downstream jq
+# stages still see a clean (merely empty) stdin and slurp it into a valid
+# `[]` — so _FILTER_FRAMEWORK_MARKER_LABELS silently becomes "no markers
+# defined" instead of erroring, and the framework-marker exclusion clause in
+# _filter_candidates becomes a permanent, silent no-op for every scenario
+# reusing $_FC_FN (verified: none of them exercise gt:rig/gt:agent fixtures
+# today, so this was not yet a false-pass — but it was one stray "unbound
+# variable" line on stderr per invocation, and a landmine for the next
+# framework-marker test written against this helper).
 _fc() { ( eval "$_FC_FN"; SELF_BEAD_ID=""; echo "$1" | _filter_candidates | jq -rc '[.[].id]' ); }
 HELD='[{"id":"bd-held","assignee":null,"labels":["story:approved","pilot:held"],"description":"x"},{"id":"bd-free","assignee":null,"labels":["story:approved"],"description":"x"}]'
 [ "$(_fc "$HELD")" = '["bd-free"]' ] && ok "pilot:held bead excluded; free story:approved kept (durable release holds)" || bad "pilot:held not excluded (got: $(_fc "$HELD"))"
@@ -6346,7 +6364,7 @@ echo "Scenario ga-uvfs6: _filter_candidates recognizes pilot:refused-reason:* sa
 # globals (_FILTER_PREAPPROVAL_LABELS, _FILTER_RECLAIM_CAP) extracted alongside it.
 _FC_UVFS6="$(grep '^log()' "$DISPATCHER")
 $(grep '^_FILTER_PREAPPROVAL_LABELS=' "$DISPATCHER")
-$(grep '^source .*framework-marker-labels\.sh' "$DISPATCHER")
+source \"$SELF_DIR/framework-marker-labels.sh\"
 $(grep '^_FILTER_FRAMEWORK_MARKER_LABELS=' "$DISPATCHER")
 $(grep '^_FILTER_RECLAIM_CAP=' "$DISPATCHER")
 $(grep '^_PILOT_ENGINE_REBUILD_RE=' "$DISPATCHER")

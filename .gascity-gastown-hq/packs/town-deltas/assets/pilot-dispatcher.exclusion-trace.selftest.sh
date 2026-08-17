@@ -119,6 +119,82 @@ grep -qF 'ga-pass1' "$WORK/s1.stderr" \
 
 # ════════════════════════════════════════════════════════════════════════════
 echo ""
+echo "Scenario 1b: ga-vmn7kv — gt:rig/gt:agent framework-marker beads excluded from _filter_candidates"
+# ga-vmn7kv CRITERIO DE PRONTO #1 (the bug's own acceptance criterion, not yet
+# covered by any prior commit on this branch): "um bead com gt:rig (e outro
+# com gt:agent) sendo aceito por _filter_candidates hoje, e rejeitado depois."
+# Scenario 8's AC3 differential only proves NON-framework-marker beads are
+# UNCHANGED; it never exercises a gt:rig/gt:agent fixture, so it cannot stand
+# in for this. Reuses Scenario 1's already-extracted FC_FN/PRE/CAP/TVP/FMS/FML.
+cat > "$WORK/s1b.sh" <<EOF
+$LOG_FN
+$LE_FN
+$PRE
+$FMS
+$FML
+$CAP
+$TVP
+$FC_FN
+SELF_BEAD_ID=""
+INPUT='[
+  {"id":"ga-pass1","assignee":null,"labels":[],"description":"a real task with content"},
+  {"id":"wa-rig-whatsapp_automation","assignee":null,"labels":["gt:rig"],"description":"rig identity record"},
+  {"id":"ps-v3o","assignee":null,"labels":["gt:agent"],"description":"agent identity record"},
+  {"id":"ga-digest1","assignee":null,"labels":["digest"],"description":"daily digest — real dispatchable work (mol-digest-generate)"}
+]'
+printf '%s' "\$INPUT" | _filter_candidates
+EOF
+S1B_OUT="$(bash "$WORK/s1b.sh" 2>"$WORK/s1b.stderr")"
+S1B_IDS="$(printf '%s' "$S1B_OUT" | jq -c '[.[].id] | sort' 2>/dev/null)"
+[ "$S1B_IDS" = '["ga-digest1","ga-pass1"]' ] \
+  && ok "_filter_candidates excludes gt:rig + gt:agent beads, keeps the digest carve-out and the plain bead" \
+  || bad "_filter_candidates output wrong (got: '$S1B_IDS') — expected only ga-pass1 + ga-digest1 to survive"
+grep -qF '[pilot] EXCLUÍDO wa-rig-whatsapp_automation por _filter_candidates: framework-marker-label:gt:rig' "$WORK/s1b.stderr" \
+  && ok "AC1: gt:rig exclusion logged with id+filter+specific reason" \
+  || bad "AC1: gt:rig exclusion line missing/wrong (got: $(cat "$WORK/s1b.stderr" 2>/dev/null))"
+grep -qF '[pilot] EXCLUÍDO ps-v3o por _filter_candidates: framework-marker-label:gt:agent' "$WORK/s1b.stderr" \
+  && ok "AC1: gt:agent exclusion logged with id+filter+specific reason" \
+  || bad "AC1: gt:agent exclusion line missing/wrong (got: $(cat "$WORK/s1b.stderr" 2>/dev/null))"
+grep -qF 'ga-digest1' "$WORK/s1b.stderr" \
+  && bad "AC4/ga-mhbyc: digest carve-out — ga-digest1 must NOT appear in the exclusion trace (it is real dispatchable work)" \
+  || ok "AC4/ga-mhbyc: digest bead survives the framework-marker filter (carve-out intact), no exclusion line"
+
+if [ -n "$ORIG_DISPATCHER" ] && [ -f "$ORIG_DISPATCHER" ]; then
+  # Literal proof of CRITERIO DE PRONTO #1's "reprova no HEAD anterior" half:
+  # the SAME two identity beads, run through the UNPATCHED _filter_candidates,
+  # must come back ACCEPTED (the reported bug) — self-contained extraction,
+  # deliberately not reusing Scenario 8's later-defined O_* vars/helpers since
+  # this scenario runs before that block.
+  O1B_LE_FN="$(sed -n '/^_log_exclusions() {/,/^}$/p' "$ORIG_DISPATCHER")"
+  O1B_PRE="$(grep '^_FILTER_PREAPPROVAL_LABELS=' "$ORIG_DISPATCHER")"
+  O1B_CAP="$(grep '^_FILTER_RECLAIM_CAP=' "$ORIG_DISPATCHER")"
+  O1B_TVP="$(grep '^_PILOT_ENGINE_REBUILD_RE=' "$ORIG_DISPATCHER")"
+  O1B_FC_FN="$(sed -n '/^_filter_candidates() {/,/^}$/p' "$ORIG_DISPATCHER")"
+  cat > "$WORK/s1b_orig.sh" <<EOF
+$LOG_FN
+$O1B_LE_FN
+$O1B_PRE
+$O1B_CAP
+$O1B_TVP
+$O1B_FC_FN
+SELF_BEAD_ID=""
+INPUT='[
+  {"id":"wa-rig-whatsapp_automation","assignee":null,"labels":["gt:rig"],"description":"rig identity record"},
+  {"id":"ps-v3o","assignee":null,"labels":["gt:agent"],"description":"agent identity record"}
+]'
+printf '%s' "\$INPUT" | _filter_candidates
+EOF
+  S1B_ORIG_OUT="$(bash "$WORK/s1b_orig.sh" 2>/dev/null)"
+  S1B_ORIG_IDS="$(printf '%s' "$S1B_ORIG_OUT" | jq -c '[.[].id] | sort' 2>/dev/null)"
+  [ "$S1B_ORIG_IDS" = '["ps-v3o","wa-rig-whatsapp_automation"]' ] \
+    && ok "ga-vmn7kv CRITERIO #1: pre-patch _filter_candidates WRONGLY accepted both identity beads (this test reproves the reported bug on the pre-fix dispatcher)" \
+    || bad "ga-vmn7kv CRITERIO #1: pre-patch baseline did not reproduce the reported bug as expected (got: '$S1B_ORIG_IDS') — differential proof is not meaningful"
+else
+  echo "  (skipped pre-patch differential — set ORIG_DISPATCHER to also prove this reproves-on-HEAD^)"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
 echo "Scenario 2: _filter_exec_manual (AC1 + AC4)"
 EM_FN="$(extract_fn _filter_exec_manual)"
 cat > "$WORK/s2.sh" <<EOF
