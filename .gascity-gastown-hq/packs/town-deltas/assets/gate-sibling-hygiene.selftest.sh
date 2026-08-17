@@ -39,6 +39,7 @@ set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCHER="$SELF_DIR/quality-gate-dispatcher.sh"
+GUARD="$SELF_DIR/quality-gate-guard.sh"
 
 PASS=0
 FAIL=0
@@ -184,7 +185,7 @@ eq "empty bead_id → no bd calls at all" "$CALL_LOG" ""
 # ── 4. DRIFT GUARD: new helpers are selftest-sourceable (defined before lib-only cutoff) ──
 echo "── 4. drift guard: new helpers defined before the lib-only cutoff ──"
 CUTOFF_LN=$(grep -n 'if \[ -n "\${GATE_DISPATCHER_LIB_ONLY:-}" \]; then' "$DISPATCHER" | head -1 | cut -d: -f1)
-for fn in gate_bead_sibling_status_lines gate_bead_terminal_failed_sibling_branch gate_finalize_pass_label_hygiene; do
+for fn in gate_bead_terminal_failed_sibling_branch gate_finalize_pass_label_hygiene; do
   DEF_LN=$(grep -n "^${fn}() {" "$DISPATCHER" | head -1 | cut -d: -f1)
   if [ -n "$DEF_LN" ] && [ -n "$CUTOFF_LN" ] && [ "$DEF_LN" -lt "$CUTOFF_LN" ]; then
     ok "$fn (line $DEF_LN) defined before the lib-only cutoff (line $CUTOFF_LN)"
@@ -192,6 +193,25 @@ for fn in gate_bead_sibling_status_lines gate_bead_terminal_failed_sibling_branc
     bad "$fn must be defined before the GATE_DISPATCHER_LIB_ONLY cutoff (def=$DEF_LN cutoff=$CUTOFF_LN)"
   fi
 done
+
+# ga-0m6tgc: gate_bead_sibling_status_lines moved OUT of the dispatcher into
+# quality-gate-guard.sh (so story-delivery.sh can reach it too, via its own
+# existing GATE_GUARD_LIB_ONLY source) — check it against GUARD's own cutoff,
+# not the dispatcher's. type() above already proved it is transitively
+# reachable through the dispatcher's lib-only source of guard.sh; this
+# proves the more specific claim (right file, right side of ITS cutoff).
+GUARD_CUTOFF_LN=$(grep -n 'if \[ -n "\${GATE_GUARD_LIB_ONLY:-}" \]; then' "$GUARD" | head -1 | cut -d: -f1)
+GUARD_DEF_LN=$(grep -n '^gate_bead_sibling_status_lines() {' "$GUARD" | head -1 | cut -d: -f1)
+if [ -n "$GUARD_DEF_LN" ] && [ -n "$GUARD_CUTOFF_LN" ] && [ "$GUARD_DEF_LN" -lt "$GUARD_CUTOFF_LN" ]; then
+  ok "gate_bead_sibling_status_lines (guard.sh line $GUARD_DEF_LN) defined before guard's lib-only cutoff (line $GUARD_CUTOFF_LN)"
+else
+  bad "gate_bead_sibling_status_lines must be defined in quality-gate-guard.sh before its GATE_GUARD_LIB_ONLY cutoff (def=$GUARD_DEF_LN cutoff=$GUARD_CUTOFF_LN)"
+fi
+if grep -q '^gate_bead_sibling_status_lines() {' "$DISPATCHER" 2>/dev/null; then
+  bad "gate_bead_sibling_status_lines should no longer be (re-)defined directly in quality-gate-dispatcher.sh — it would silently shadow guard.sh's copy (ga-0m6tgc: exactly the drift this move exists to prevent)"
+else
+  ok "gate_bead_sibling_status_lines has no shadowing re-definition in quality-gate-dispatcher.sh"
+fi
 
 # ── 5. DRIFT GUARD: all 3 PASS-path sites call the new hygiene function ─────
 echo "── 5. drift guard: all 3 known PASS-path label sites call gate_finalize_pass_label_hygiene ──"

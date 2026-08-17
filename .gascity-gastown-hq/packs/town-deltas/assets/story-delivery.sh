@@ -910,6 +910,52 @@ if echo "$STORY_LABELS" | grep -q "delivery:running"; then
   continue
 fi
 
+# ga-0m6tgc: cross-rig/multi-marker awareness. quality-gate-dispatcher.sh
+# adds gate:passed to the shared source bead unconditionally, per-marker,
+# with no check for a SIBLING marker still pending on the SAME story. A
+# cross-rig or resubmitted story can carry more than one gate marker citing
+# it (source-bead:$STORY_ID); the FIRST to reach PASS+merge makes this bead
+# selectable by Step 1 above even while a second marker, submitted
+# separately, is still open/under review elsewhere. Deploying and marking
+# story:done on that first marker alone would silently ship only part of
+# the story's acceptance criteria while the rest sits unmerged, with
+# nothing left watching the still-open marker once this bead reaches
+# story:done (it stops matching Step 1's own selector).
+#
+# gate_bead_sibling_status_lines (quality-gate-guard.sh, sourced above —
+# ga-0m6tgc moved it there from quality-gate-dispatcher.sh specifically so
+# this file could reach it) returns one "<branch><TAB><status><TAB><rig>"
+# line per NON-CLOSED marker/gate-run citing source-bead:$STORY_ID, always
+# queried against GC_CITY (source-bead: labels are always written to the HQ
+# city regardless of which store the story bead itself lives in — see that
+# function's own header). This branch's OWN marker is already closed by the
+# time gate:passed lands on the bead (the PASS path in quality-gate-
+# dispatcher.sh closes the marker before setting the label, same
+# invocation), so in the ordinary single-marker story — the overwhelming
+# majority — this is always empty and nothing here changes behavior. A
+# non-empty result means a genuinely different, still-open submission
+# exists for this same story.
+OPEN_SIBLINGS=$(gate_bead_sibling_status_lines "$GC_CITY" "$STORY_ID" 2>/dev/null || echo "")
+if [ -n "$OPEN_SIBLINGS" ]; then
+  log "Story $STORY_ID has an OPEN sibling gate marker — holding (ga-0m6tgc), not deploying:"
+  printf '%s\n' "$OPEN_SIBLINGS" | while IFS="$(printf '\t')" read -r _sib_branch _sib_status _sib_rig; do
+    [ -n "$_sib_branch" ] && log "  sibling: branch=$_sib_branch status=$_sib_status rig=${_sib_rig:-?}"
+  done
+  if [ "$DRY_RUN" != "1" ]; then
+    bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:blocked-sibling" -q 2>/dev/null || true
+    bd -C "$STORY_STORE" comment "$STORY_ID" "$(printf 'Delivery HELD (ga-0m6tgc): gate:passed is set, but at least one OTHER gate marker/run citing this story via source-bead: is still open (not yet terminal):\n\n%s\n\nA cross-rig or resubmitted story can have more than one marker; deploying/marking story:done on the first one to pass would silently ship only part of the scope while the rest is still in review. Re-checked every delivery sweep — this proceeds automatically once every marker reaches a terminal state.' "$OPEN_SIBLINGS")" 2>/dev/null || true
+  fi
+  # Non-terminal, retried every sweep — same posture as the wa-uthi holds
+  # elsewhere in this file (no push, no story:done, just wait and re-check).
+  continue
+fi
+# No open siblings (the common single-marker case, or every marker for this
+# story has now reached a terminal state) — clear a stale hold label from a
+# prior sweep, if any, before proceeding.
+if [ "$DRY_RUN" != "1" ]; then
+  bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:blocked-sibling" -q 2>/dev/null || true
+fi
+
 # Mark as running (claim)
 if [ "$DRY_RUN" != "1" ]; then
   bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:running" -q 2>/dev/null || {

@@ -1180,107 +1180,16 @@ gate_bead_active_sibling_branch() {
   gate_pick_active_sibling "$lines" "$this_branch" "$this_rig"
 }
 
-# gate_bead_sibling_status_lines <gc_city> <bead_id> — bd-backed. Builds the
-# "<branch><TAB><gate-status-value><TAB><rig>" lines for every marker/gate-run
-# tied to $bead_id (source-bead:$bead_id label), skipping closed markers
-# (ga-4wncs) and alerting on open-but-ambiguous gate-status state
-# (ga-kgtiw/ga-7fwt1).
-#
-# Extracted from gate_bead_active_sibling_branch (ga-lxz5w) unchanged — this
-# is the exact same marker-walk that used to live inline in that function,
-# now shared so a SECOND sibling-shaped check (ga-divv8: a terminal-FAILED
-# sibling on a different branch, invisible to the active-only scan above)
-# can reuse it instead of re-deriving this carefully-tuned logic. Behavior
-# of gate_bead_active_sibling_branch itself is unchanged by this extraction
-# — same fail-open-on-error, same closed-marker skip, same ambiguity alert —
-# and gate-sibling-branch-guard.selftest.sh is the regression guard proving
-# that. See gate_bead_terminal_failed_sibling_branch below for the new use.
-#
-# ga-cc0xu0: the 3rd field (rig) is description-only — extracted the same
-# head-1-first-match way as the branch fallback, from the sibling's OWN
-# "rig:" description line (docs/gate-marker-recipe.md). Deliberately NOT
-# read from the bead-rig:/bead_rig: label or field: that encodes which STORE
-# holds the bead, not which repo holds the branch's code, and the two
-# diverge for exactly the cross-repo case this field exists to detect (see
-# L2117-2126's warning against this same mix-up in a different function).
-# Both consumers below (gate_pick_active_sibling, gate_pick_terminal_failed_
-# sibling) now read 3 tab-separated fields per line — a 2-field reader would
-# silently fold "status" and "rig" into one corrupted value.
-gate_bead_sibling_status_lines() {
-  local gc_city="$1" bead_id="$2"
-  local siblings_json count i sib marker_status labels desc branch status rig lines sib_id
-  siblings_json=$(bd -C "$gc_city" list --label "source-bead:$bead_id" --all --json 2>/dev/null || echo "[]")
-  if [ -z "$siblings_json" ] || [ "$siblings_json" = "null" ]; then siblings_json="[]"; fi
-  count=$(printf '%s' "$siblings_json" | jq 'length' 2>/dev/null || echo "0")
-  case "$count" in ''|*[!0-9]*) count=0 ;; esac
-  if [ "$count" = "0" ]; then
-    printf ''
-    return 0
-  fi
-  lines=""
-  for i in $(seq 0 $((count - 1))); do
-    sib=$(printf '%s' "$siblings_json" | jq ".[$i]" 2>/dev/null) || continue
-    # A closed marker keeps its residual gate-status:* label forever (nothing
-    # strips it on close) — that label alone would misread a discarded/
-    # superseded submission as a live concurrent one (ga-4wncs). Skip on
-    # lifecycle .status, not the label. Fail-open on jq error (marker_status
-    # empty, not "closed") so a transient hiccup never hides a real sibling.
-    marker_status=$(printf '%s' "$sib" | jq -r '.status // ""' 2>/dev/null || echo "")
-    [ "$marker_status" = "closed" ] && continue
-    labels=$(printf '%s' "$sib" | jq -r '(.labels // []) | join(" ")' 2>/dev/null || echo "")
-    desc=$(printf '%s' "$sib" | jq -r '.description // ""' 2>/dev/null || echo "")
-    branch=$(printf '%s\n' "$labels" | tr ' ' '\n' | sed -n 's/^branch:\(.*\)$/\1/p' | head -1)
-    if [ -z "$branch" ]; then
-      branch=$(printf '%s\n' "$desc" | sed -n 's/^branch:[ \t]*\(.*\)$/\1/p' | head -1)
-    fi
-    [ -z "$branch" ] && continue
-    # ga-cc0xu0: rig: has no label form (only bead-rig:, wrong semantics —
-    # see this function's header comment) — description-only.
-    rig=$(printf '%s\n' "$desc" | sed -n 's/^rig:[ \t]*\(.*\)$/\1/p' | head -1)
-    # ga-7fwt1: route through the shared marker_status_from_labels() (guard.sh,
-    # sourced lib-only above this function's own call site — see the L2684
-    # source and the author_is_alive()/session_matches_author() precedent for
-    # why that ordering already makes lib functions safe to call here in both
-    # production and lib-only/selftest mode) instead of a bare `head -1`. A
-    # sibling mid-transition through one of ga-7fwt1's now-fixed add-before-
-    # remove sites (or any future interruption) can briefly carry TWO
-    # gate-status:* labels; blind `head -1` would pick one arbitrarily and
-    # could feed gate_pick_active_sibling/gate_bead_live_merge_block a WRONG
-    # status, hiding or fabricating a genuinely concurrent sibling during a
-    # merge decision. marker_status_from_labels() returns the value IFF
-    # exactly one match exists, else empty — 0 and 2+ both collapse to the
-    # same safe "unknown" outcome handled below, never a guess.
-    status=$(marker_status_from_labels "$labels")
-    if [ -z "$status" ]; then
-      # ga-kgtiw: an OPEN marker/gate-run with a real branch but NO gate-status
-      # label is the exact invisible-forever signature (every dispatcher sweep
-      # selects its work via `-l gate-status:<value>`, so this sibling matches
-      # none of them, ever). This scan is the one place in the dispatcher that
-      # walks every marker for a bead regardless of its gate-status, so it is
-      # the one place that can actually SEE the gap — surface it instead of
-      # silently continuing past it like before. Written straight to stderr
-      # (not via warn/log, which echo to stdout): this function's own return
-      # value is captured via "$(...)" by every caller, and a stdout write
-      # here would corrupt that captured string.
-      # ga-7fwt1: $status is now ALSO empty on 2+ ambiguous gate-status labels
-      # (not just 0) — distinguish the two in the alert text so a human
-      # reading it isn't told "NO gate-status label" when there were actually
-      # several and marker_status_from_labels() correctly refused to guess.
-      _gs_count=$(printf '%s\n' "$labels" | tr ' ' '\n' | grep -c '^gate-status:' || true)
-      if [ "${_gs_count:-0}" = "0" ]; then
-        _gs_reason="NO gate-status label"
-      else
-        _gs_reason="AMBIGUOUS gate-status state (${_gs_count} labels: $(printf '%s\n' "$labels" | tr ' ' '\n' | grep '^gate-status:' | tr '\n' ',' | sed 's/,$//'))"
-      fi
-      printf '[%s] [quality-gate-dispatcher] ALERT: sibling marker %s (bead %s, branch %s) is OPEN with %s — ga-kgtiw/ga-7fwt1 invisible-or-ambiguous-marker signature. Excluded from sibling-race detection; needs manual gate-status repair.\n' \
-        "$(date '+%Y-%m-%d %H:%M:%S')" "${sib_id:-$(printf '%s' "$sib" | jq -r '.id // "unknown"' 2>/dev/null || echo unknown)}" "$bead_id" "$branch" "$_gs_reason" >&2
-      continue
-    fi
-    lines="${lines}${branch}	${status}	${rig}
-"
-  done
-  printf '%s' "$lines"
-}
+# gate_bead_sibling_status_lines <gc_city> <bead_id> — MOVED to
+# quality-gate-guard.sh (ga-0m6tgc), sourced above via the existing
+# GATE_GUARD_LIB_ONLY include (L3559-ish). story-delivery.sh needed this same
+# marker-walk (to hold a story with a still-open sibling gate marker instead
+# of deploying on the first marker to pass) but only sources guard.sh, not
+# this file — relocating to the shared lib was cheaper and safer than a
+# second copy to drift (the exact anti-pattern ga-3k70w2 just fixed
+# elsewhere in this file class). Callers here (gate_bead_active_sibling_
+# branch, gate_bead_terminal_failed_sibling_branch, both just below)
+# are unchanged — they call the same function, now defined one file over.
 
 # gate_bead_terminal_failed_sibling_branch <gc_city> <bead_id> <this_branch>
 # — bd-backed. ga-divv8: surfaces (does NOT block) a different-branch sibling
