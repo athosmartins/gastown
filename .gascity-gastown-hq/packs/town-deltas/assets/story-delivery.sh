@@ -271,9 +271,30 @@ story_merge_verdict() {
 # its GATE_GUARD_LIB_ONLY source, ga-bnu1). Resolved relative to this
 # script's own location (not $GC_CITY) so a caller running from a review
 # worktree still pairs with the guard.sh from the SAME checkout.
+# ga-q4sadt: `2>/dev/null || true` does NOT guard this. `source` is a POSIX
+# special builtin, and this file runs under `set -euo pipefail` (L32) — an
+# unreadable target kills the shell IMMEDIATELY, before `|| true` is ever
+# evaluated (measured on /bin/bash 3.2.57: `source /missing.sh 2>/dev/null ||
+# true; echo REACHED` exits 1, REACHED never prints). A briefly missing or
+# desynced quality-gate-guard.sh sibling — the exact partial-deploy failure
+# class packs/town-deltas/assets/ has hit before — would silently kill this
+# script's entire top-level init, before any log/warn call exists: the
+# delivery reconciler goes dark every launchd cycle, and merged beads never
+# close, with nothing anywhere explaining why. Same defect ga-vmn7kv already
+# fixed in pilot-dispatcher.sh/context-check-dispatcher.sh; this file and
+# quality-gate-dispatcher.sh were the two pre-existing instances left out of
+# that diff on purpose (scope). Check readability BEFORE sourcing instead:
+# `[ -r ]`, not `[ -f ]` — an existing-but-unreadable file still kills a bare
+# `source` (measured: exit 1, "Permission denied"). stderr on the source
+# itself is intentionally NOT suppressed: a corrupt sibling (syntax error)
+# should be loud, not silent — that's a deploy fault, not a legitimate
+# absence.
 _STORY_DELIVERY_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GATE_GUARD_LIB_ONLY=1 source "${_STORY_DELIVERY_SELF_DIR}/quality-gate-guard.sh" 2>/dev/null || true
-unset _STORY_DELIVERY_SELF_DIR
+_STORY_DELIVERY_GUARD_SIB="${_STORY_DELIVERY_SELF_DIR}/quality-gate-guard.sh"
+if [ -r "$_STORY_DELIVERY_GUARD_SIB" ]; then
+  GATE_GUARD_LIB_ONLY=1 source "$_STORY_DELIVERY_GUARD_SIB"
+fi
+unset _STORY_DELIVERY_SELF_DIR _STORY_DELIVERY_GUARD_SIB
 # guard.sh sets its OWN LOG=$LOG_DIR/quality-gate-guard.log at source time —
 # restore ours (GC_CITY/LOG_DIR are already identical in both files, so only
 # LOG needs it). Mirrors quality-gate-dispatcher.sh's identical restore right

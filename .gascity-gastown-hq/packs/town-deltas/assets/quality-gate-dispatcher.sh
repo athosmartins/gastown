@@ -35,16 +35,24 @@ LOG="$LOG_DIR/quality-gate-dispatcher.log"
 QG_LOG="$GC_CITY/.gc/quality-gate.jsonl"
 
 # imp18: Per-repo git mutation mutex lib — source fail-soft; provides git_mutex_acquire/release.
+# ga-q4sadt: [ -f ] alone is not enough — an existing-but-unreadable file
+# still kills a bare `source` under this file's `set -euo pipefail` (L30),
+# same special-builtin behavior documented at the two call sites below.
+# [ -r ] covers both missing and unreadable.
 _GLH_SCRIPT="${GC_CITY}/scripts/git-lock-hygiene.sh"
-[ -f "$_GLH_SCRIPT" ] && { GIT_LOCK_HYGIENE_LIB=1 source "$_GLH_SCRIPT" 2>/dev/null; } || true
+[ -r "$_GLH_SCRIPT" ] && { GIT_LOCK_HYGIENE_LIB=1 source "$_GLH_SCRIPT" 2>/dev/null; } || true
 unset _GLH_SCRIPT
 
 # ga-dxyvxr: quiet-hours admission gate (00h-08h, Athos 2026-08-16) — same
 # source-fail-soft convention as git-lock-hygiene.sh above. Provides
 # _quiet_hours_blocks/_quiet_hours_state/_quiet_hours_unreadable; see
 # quiet-hours-check.sh's own header for the full rationale.
+# ga-q4sadt: [ -f ] alone is not enough — an existing-but-unreadable file
+# still kills a bare `source` under this file's `set -euo pipefail` (same
+# special-builtin behavior fixed above for git-lock-hygiene.sh, L37-43).
+# [ -r ] covers both missing and unreadable.
 _QHC_SCRIPT="${GC_CITY}/packs/town-deltas/assets/quiet-hours-check.sh"
-[ -f "$_QHC_SCRIPT" ] && { source "$_QHC_SCRIPT" 2>/dev/null; } || true
+[ -r "$_QHC_SCRIPT" ] && { source "$_QHC_SCRIPT" 2>/dev/null; } || true
 unset _QHC_SCRIPT
 # ga-dxyvxr third-state hardening: if sourcing failed (missing/unreadable
 # sibling file), QUIET_HOURS_LEVEL_FILE never gets set (quiet-hours-check.sh
@@ -3578,9 +3586,29 @@ branch_bead_commit_verdict() {
 # script's own real location instead, so the two files loaded together
 # always come from the same checkout/commit regardless of which tree
 # dispatcher.sh itself is running from.
+# ga-q4sadt: `2>/dev/null || true` does NOT guard this. `source` is a POSIX
+# special builtin, and this file runs under `set -euo pipefail` (L30) — an
+# unreadable target kills the shell IMMEDIATELY, before `|| true` is ever
+# evaluated (measured on /bin/bash 3.2.57: `source /missing.sh 2>/dev/null ||
+# true; echo REACHED` exits 1, REACHED never prints). A briefly missing or
+# desynced quality-gate-guard.sh sibling — the exact partial-deploy failure
+# class packs/town-deltas/assets/ has hit before — would silently kill this
+# dispatcher's entire top-level init, before any log/warn call exists: the
+# gate goes dark every launchd cycle with nothing anywhere explaining why.
+# Same defect ga-vmn7kv already fixed in pilot-dispatcher.sh/
+# context-check-dispatcher.sh; this file and story-delivery.sh were the two
+# pre-existing instances left out of that diff on purpose (scope). Check
+# readability BEFORE sourcing instead: `[ -r ]`, not `[ -f ]` — an
+# existing-but-unreadable file still kills a bare `source` (measured: exit 1,
+# "Permission denied"). stderr on the source itself is intentionally NOT
+# suppressed: a corrupt sibling (syntax error) should be loud, not silent —
+# that's a deploy fault, not a legitimate absence.
 _GATE_DISPATCHER_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GATE_GUARD_LIB_ONLY=1 source "${_GATE_DISPATCHER_SELF_DIR}/quality-gate-guard.sh" 2>/dev/null || true
-unset _GATE_DISPATCHER_SELF_DIR
+_GATE_DISPATCHER_GUARD_SIB="${_GATE_DISPATCHER_SELF_DIR}/quality-gate-guard.sh"
+if [ -r "$_GATE_DISPATCHER_GUARD_SIB" ]; then
+  GATE_GUARD_LIB_ONLY=1 source "$_GATE_DISPATCHER_GUARD_SIB"
+fi
+unset _GATE_DISPATCHER_SELF_DIR _GATE_DISPATCHER_GUARD_SIB
 # guard.sh sets its OWN `LOG=$LOG_DIR/quality-gate-guard.log` (L25) at source time —
 # restore ours, exactly like the `glh` source is already undone at L41-42 (ga-l47b7).
 # Without this the `exec >> "$LOG"` below sends this dispatcher's ENTIRE output to

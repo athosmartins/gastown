@@ -59,7 +59,20 @@ GC_CITY="${AUTO_REFINO_CITY_OVERRIDE:-${GC_CITY_PATH:-/Users/athos/gt/.gascity-g
 # read-side helper, sibling in this same pack. Provides
 # _quiet_hours_blocks/_quiet_hours_state/_quiet_hours_unreadable; see
 # quiet-hours-check.sh's own header for the full rationale.
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/quiet-hours-check.sh" 2>/dev/null || true
+# ga-q4sadt: `2>/dev/null || true` does not guard `source` under this file's
+# `set -euo pipefail` (L54) — a POSIX special builtin dies immediately on a
+# missing/unreadable target, before `|| true` is ever evaluated (same defect
+# ga-vmn7kv fixed for framework-marker-labels.sh; this quiet-hours-check.sh
+# source — introduced alongside it by ga-dxyvxr — carried the identical
+# unguarded idiom in all 4 non-quality-gate dispatchers). The third-state
+# comment right below (QUIET_HOURS_LEVEL_FILE unset => degraded gracefully)
+# was therefore dead code: the process would already be gone by the time it
+# could run. Check readability BEFORE sourcing instead.
+_AUTO_REFINO_QHC_SIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/quiet-hours-check.sh"
+if [ -r "$_AUTO_REFINO_QHC_SIB" ]; then
+  source "$_AUTO_REFINO_QHC_SIB"
+fi
+unset _AUTO_REFINO_QHC_SIB
 # ga-dxyvxr third-state hardening: if sourcing failed (missing/unreadable
 # sibling file), QUIET_HOURS_LEVEL_FILE never gets set (quiet-hours-check.sh
 # always sets it via its own ${VAR:-default}, so its absence here proves the
