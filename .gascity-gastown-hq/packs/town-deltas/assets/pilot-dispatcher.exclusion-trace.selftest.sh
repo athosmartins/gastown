@@ -416,6 +416,16 @@ if [ -n "$ORIG_DISPATCHER" ] && [ -f "$ORIG_DISPATCHER" ]; then
   extract_orig() { sed -n "/^$1() {/,/^}\$/p" "$ORIG_DISPATCHER"; }
   O_PRE="$(grep '^_FILTER_PREAPPROVAL_LABELS=' "$ORIG_DISPATCHER")"
   O_CAP="$(grep '^_FILTER_RECLAIM_CAP=' "$ORIG_DISPATCHER")"
+  # ga-vmn7kv: the pre-patch side needs its OWN copies of the two deps the new
+  # side already injects as $LE_FN/$TVP, extracted from $ORIG_DISPATCHER (never
+  # borrowed from the patched file — a baseline built out of post-patch parts is
+  # not a baseline). Pre-patch _filter_candidates calls _log_exclusions and
+  # reads $_PILOT_ENGINE_REBUILD_RE (via local _cf_engine_rebuild_re); without
+  # them old_out came back as literal `[]` for every filter. That empty baseline
+  # is what made the AC3 differential pass vacuously — `[]` == `[]` whenever the
+  # new side was ALSO crippled (see the FMS/FML note in diff_filter below).
+  O_LE_FN="$(sed -n '/^_log_exclusions() {/,/^}$/p' "$ORIG_DISPATCHER")"
+  O_TVP="$(grep '^_PILOT_ENGINE_REBUILD_RE=' "$ORIG_DISPATCHER")"
   O_FC_FN="$(extract_orig _filter_candidates)"
   O_EM_FN="$(extract_orig _filter_exec_manual)"
   O_DG_FN="$(extract_orig _filter_dispatch_gates)"
@@ -436,16 +446,32 @@ if [ -n "$ORIG_DISPATCHER" ] && [ -f "$ORIG_DISPATCHER" ]; then
   diff_filter() {
     local fname="$1" new_fn="$2" old_fn="$3"
     local new_out old_out
+    # ga-vmn7kv (gate FAIL, run ga-77hyvo): $FMS/$FML MUST be injected here, the
+    # same way Scenario 1 (~L81) and Scenario 7 (~L372) do it. Without them the
+    # patched _filter_candidates still REFERENCES
+    # _FILTER_FRAMEWORK_MARKER_LABELS (3 times) but the var is undefined in this
+    # subshell — and there is no `set -u` here, so it expands to EMPTY instead of
+    # aborting. The gt:* marker exclusion then matches nothing, the patched
+    # filter behaves exactly like the pre-patch one, and this AC3 differential
+    # passes VACUOUSLY: it would be comparing pre-patch against a patch whose
+    # feature is switched off, i.e. asserting "behavior unchanged" about code
+    # that was never exercised. The old_out side below must NOT get these lines —
+    # the pre-patch function has no such var and injecting it there would be
+    # fabricating a baseline that never existed.
     new_out=$(bash -c "$LOG_FN
 $LE_FN
 $PRE
+$FMS
+$FML
 $CAP
 $TVP
 $new_fn
 SELF_BEAD_ID=\"\"
 printf '%s' '$FIXTURES' | $fname" 2>/dev/null | jq -S . 2>/dev/null)
     old_out=$(bash -c "$LOG_FN
+$O_LE_FN
 $O_PRE
+$O_TVP
 $O_CAP
 $old_fn
 SELF_BEAD_ID=\"\"
