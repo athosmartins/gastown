@@ -22,8 +22,15 @@ set -euo pipefail
 
 # Trace bd invocations to $GC_BD_TRACE when set (no-op otherwise).
 __SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ga-5a87qv: `.`/source is a POSIX special builtin — under this file's
+# `set -euo pipefail`, a missing/unreadable target kills the shell
+# immediately, before any log/warn call exists (same defect class ga-q4sadt
+# fixed for the core gate/dispatch pipeline). Check readability BEFORE
+# sourcing instead.
 # shellcheck disable=SC1091
-. "$__SCRIPT_DIR/_bd_trace.sh" "gate-sweep"
+if [ -r "$__SCRIPT_DIR/_bd_trace.sh" ]; then
+  . "$__SCRIPT_DIR/_bd_trace.sh" "gate-sweep"
+fi
 
 bd gate check --type=timer --escalate
 bd gate check --type=gh --escalate || true

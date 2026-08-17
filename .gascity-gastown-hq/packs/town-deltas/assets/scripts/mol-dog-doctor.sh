@@ -30,13 +30,27 @@ set -euo pipefail
 # ga-v75ka: engine exports GC_PACK_DIR=town-deltas (the pack owning this order),
 # but runtime.sh:209 trusts GC_PACK_DIR to find its sibling port_resolve.sh —
 # override it to dolt's own pack dir for this source, or the dog dies on boot.
-GC_PACK_DIR="${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt" \
-    . "${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt/assets/scripts/runtime.sh"
+# ga-5a87qv: `.`/source is a POSIX special builtin — under this file's
+# `set -euo pipefail` (L27), a missing/unreadable target kills the shell
+# immediately, before any log/warn call exists (same defect class ga-q4sadt
+# fixed for the core gate/dispatch pipeline). Check readability BEFORE
+# sourcing instead — deliberately ONE line (`[ -r ] && ... || true`, same
+# shape as quality-gate-dispatcher.sh's git-lock-hygiene.sh source), not an
+# `if/fi` block: the real-bootstrap selftest below locates this source line
+# by line number (grep -n) and truncates the file there with `head -n` to
+# execute a live snippet — a multi-line if/fi would get cut mid-block and
+# fail with a bash syntax error. Single line also keeps the GC_CITY_PATH-
+# anchored literal directly on the `.` line for the drift-guard greps below,
+# guarding against a regression back to the self-relative $PACK_DIR that
+# caused ga-gquc1's attempt-1 bootstrap crash.
+[ -r "${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt/assets/scripts/runtime.sh" ] && GC_PACK_DIR="${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt" . "${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt/assets/scripts/runtime.sh" || true
 # ga-br5sw: ms-resolution now_ms()/latency_should_warn() — see latency.sh's own
 # header for why whole-second `date +%s` quantizes a sub-second probe to 0s/1s.
 # Same live-sourcing rationale as runtime.sh above (not vendored, so both stay
 # in lockstep with the dolt pack's copy instead of drifting independently).
-. "${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt/assets/scripts/latency.sh"
+# ga-5a87qv: same source-guard reasoning and one-line-for-head-truncation
+# constraint as runtime.sh above.
+[ -r "${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt/assets/scripts/latency.sh" ] && . "${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt/assets/scripts/latency.sh" || true
 
 PORT="$GC_DOLT_PORT"
 HOST="${GC_DOLT_HOST:-127.0.0.1}"
