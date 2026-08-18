@@ -2874,11 +2874,24 @@ print(str(b.get("id", "")) + "\t" + st["state"])
     done < <(printf '%s' "$_em_in" | jq -c '.[]' 2>/dev/null)
 
     if [ "$_em_bridge_ok" = "1" ]; then
+      # ga-0kqjl: the derived-state check ALONE is not sufficient. derive()'s
+      # rule cascade (bead_state.py) evaluates PARK (rule 4, e.g. the
+      # PARK_EXACT label needs-label-review) BEFORE exec:manual (rule 10) —
+      # so a bead carrying exec:manual PLUS any earlier-firing label (park,
+      # needs-human, gate-active, flowing, ...) never reaches
+      # manual_assigned/manual_unrouted at all, and survived this filter
+      # unfiltered. Reproduced live: wa-2tp0p (exec:manual + needs-label-
+      # review) dispatched to oracle-wa 38min after the Mayor added
+      # exec:manual specifically to prevent it. Keep the direct label check
+      # as an independent, always-authoritative condition — it can never be
+      # pre-empted by derive()'s rule ordering, unlike the derived state.
       _em_out=$(printf '%s' "$_em_in" | jq -c --arg states "$_em_states" '
         ($states | split("\n") | map(select(length>0) | split("\t"))
           | map({(.[0]): .[1]}) | add // {}) as $st
-        | [ .[] | select(($st[.id] // "") as $s
-            | ($s != "manual_assigned" and $s != "manual_unrouted")) ]
+        | [ .[] | select(
+            (((.labels // []) | index("exec:manual")) == null)
+            and (($st[.id] // "") as $s
+              | ($s != "manual_assigned" and $s != "manual_unrouted"))) ]
       ' 2>/dev/null)
     fi
   fi

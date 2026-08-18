@@ -5625,6 +5625,31 @@ else
   bad "Override test seam does NOT apply _filter_exec_manual — filter tests are hollow"
 fi
 
+# ── Scenario 24e (ga-0kqjl): exec:manual co-occurring with a PARK_EXACT/PARK_
+# PREFIXES label must still be excluded ──────────────────────────────────────
+# Reproduced live 2026-08-18: wa-2tp0p carried BOTH exec:manual AND
+# needs-label-review (a bead_state.py PARK_EXACT member). derive()'s rule 4
+# (park) fires BEFORE rule 10 (exec:manual → manual_assigned/manual_unrouted)
+# — see bead_state.py derive(), rules ordered 1..16 — so a bead in this shape
+# is classified state="parked", never reaching the exec:manual-specific
+# state. _filter_exec_manual's python-bridge branch only excluded beads whose
+# DERIVED STATE was exactly manual_assigned/manual_unrouted — it never
+# independently checked the raw exec:manual label — so this bead survived the
+# filter and got dispatched (Pilot → oracle-wa, wa-2tp0p, 2026-08-18 11:09:54
+# UTC, 38min after the Mayor added exec:manual specifically to prevent this).
+# The existing Scenario 24a fixture (wa-i02u-fx) does NOT reproduce this: it
+# carries ONLY exec:manual + story:approved, no co-occurring park label, so
+# derive() falls through straight to rule 10 and the bridge's narrow check
+# happens to work by coincidence — it never exercised the rule-ordering gap.
+echo "Scenario 24e: exec:manual + co-occurring park label (needs-label-review) is EXCLUDED (ga-0kqjl)"
+WA_RIG_EXECMANUAL_PARKED_FX='[{"id":"wa-2tp0p-fx","title":"exec:manual + needs-label-review fixture (ga-0kqjl)","priority":1,"issue_type":"feature","description":"fixture reproducing ga-0kqjl: exec:manual co-occurring with a PARK_EXACT label (needs-label-review) must still be excluded from dispatch — derive() rule 4 (park) fires before rule 10 (exec:manual), so a derived-state-only check misses it","status":"open","labels":["story:approved","exec:manual","needs-label-review"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{"story.rig":"whatsapp_automation"}}]'
+LOG24E="$(run_wa_rig_tier2 "$WA_RIG_EXECMANUAL_PARKED_FX" "$HQ_BUG_FX")"
+if echo "$LOG24E" | grep -q "wa-2tp0p-fx.*story:in-flight\|story:in-flight.*wa-2tp0p-fx\|build story wa-2tp0p-fx\|Selected.*wa-2tp0p-fx"; then
+  bad "REGRESSION: exec:manual+needs-label-review WA feature (wa-2tp0p-fx) dispatched — ga-0kqjl gap not fixed (derive() rule-4 park pre-empts rule-10 exec:manual; bridge-only state check misses it)"
+else
+  ok "exec:manual+needs-label-review WA feature (wa-2tp0p-fx) NOT dispatched (ga-0kqjl fixed — direct label check no longer depends on derive() rule ordering)"
+fi
+
 # ── Scenario 25: HQ TIER2 story:approved path now applies the full gate chain ─
 # Before this fix, the HQ TIER2 path (Step 2b) used only _filter_candidates +
 # _filter_unblocked + _filter_explicit_deps — no _filter_exec_manual,
