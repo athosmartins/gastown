@@ -263,6 +263,36 @@ else
     "OUT1=$OUT1 OUT2=$OUT2 COMMENTS=$(cat "$TMP/fx.ga-r5count/comments.log" 2>/dev/null)"
 fi
 
+# ── blocking issue 1 (revisor, gate-run ga-woesw): R5 falhando ao
+# ESCALAR (bd comment falha) não pode consumir o cooldown ─────────────
+# should_alert_r5() gravava o stamp (epoch+contador) ANTES de main() sequer
+# tentar note() — o R5 case block só decide chamar note() DEPOIS de já ter
+# recebido rc0 de should_alert_r5, que por sua vez já tinha gravado o
+# arquivo como efeito colateral da própria chamada. Se note() falhasse
+# (bd comment real falhando), o script reportava "FALHA R5 ... escalação
+# NÃO registrada" — mas o stamp já dizia "tentativa #1 feita agora", então
+# a PRÓXIMA varredura via cooldown ainda quente e SUPRIMIA, achando que já
+# tinha escalado quando na verdade nunca chegou a postar nada: o bead fica
+# mudo até o cooldown (6h) decorrer, mesmo bug de fundo do ticket original
+# (escalação que devia ser acionável vira silêncio), só que agora causado
+# pelo PRÓPRIO mecanismo de cooldown em vez da falta dele.
+setup ga-r5notefail '["gate:needs-human"]' 'origin/fix/ga-r5notefail' '+ fadefeed' '1700000000' \
+  '[{"created_at":"2026-08-15T10:00:00Z","text":"VERDICT: FAIL sem detalhe"}]'
+touch "$TMP/fx.ga-r5notefail/comment_fail"
+OUT1="$(run)"
+rm -f "$TMP/fx.ga-r5notefail/comment_fail"
+OUT2="$(run)"
+R5_COMMENTS3="$(grep -c 'AUTO-DESTRAVE R5' "$TMP/fx.ga-r5notefail/comments.log" 2>/dev/null || echo 0)"
+if printf '%s' "$OUT1" | grep -q "FALHA R5 ga-r5notefail" \
+   && printf '%s' "$OUT2" | grep -q "R5 ga-r5notefail.*escalado" \
+   && printf '%s' "$OUT2" | grep -q 'tentativa #1' \
+   && [ "$R5_COMMENTS3" -eq 1 ]; then
+  ok "blocking issue 1 (ga-woesw): note() falhando NÃO consome o cooldown — retenta e escala na próxima varredura, ainda na tentativa #1"
+else
+  bad "blocking issue 1 (ga-woesw): quando bd comment falha, should_alert_r5 não pode ter gravado o stamp — a próxima varredura tem que RETENTAR (não suprimir achando que já escalou)" \
+    "OUT1=$OUT1 OUT2=$OUT2 R5_COMMENTS3=$R5_COMMENTS3 COMMENTS=$(cat "$TMP/fx.ga-r5notefail/comments.log" 2>/dev/null)"
+fi
+
 # ── self-audit pré-gate: git cherry FALHA ≠ git cherry acha nada ───────
 # Achado varrendo o diff inteiro antes de submeter (não um caso citado por
 # revisor). has_own_work colapsava "comando não rodou" (lock, rig

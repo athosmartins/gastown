@@ -54,12 +54,15 @@
 #       lê aprende a ignorar — mesma classe de dano que watchdog-fatigue
 #       já causou nesta cidade, só que ao contrário: repetição sem sinal
 #       novo em vez de alerta que só cresce). R5 agora passa por
-#       should_alert_r5() antes de postar — mesmo idioma de cooldown de
+#       r5_alert_eligible() antes de postar — mesmo idioma de cooldown de
 #       gate-merge-survival-sweep.sh / gate-needs-human-divergence-
 #       sweep.sh (stamp por bead, LOUD mas não spam): continua
 #       re-escalando enquanto ninguém resolver, só que a cada
 #       R5_ALERT_COOLDOWN (6h por padrão) em vez de a cada sweep, com um
-#       contador de tentativa visível no comentário.
+#       contador de tentativa visível no comentário. O stamp só é gravado
+#       por mark_r5_alerted(), chamado DEPOIS que note() confirma que o
+#       comentário foi postado de verdade (ga-woesw) — uma falha de bd
+#       comment não pode consumir o cooldown sem nunca ter escalado nada.
 #
 # ────────────────────────────────────────────────────────────────────
 # ⚠️ AS SETE VARIANTES (medidas 2026-08-15) — "needs-human" é SETE
@@ -325,15 +328,28 @@ note() {
   "$BD" -C "$1" comment "$2" "$3" >/dev/null 2>&1
 }
 
-# should_alert_r5 <bead_id> → rc0 iff the R5 cooldown has elapsed for this
-# bead (ga-9e0j8). Stamps + bumps the bead's attempt counter as a side
-# effect (format "<epoch> <count>", one file per bead under R5_ALERT_DIR)
-# whenever it allows a fire — same idiom as gate-merge-survival-sweep.sh /
-# gate-needs-human-divergence-sweep.sh's should_alert(). Echoes the
-# attempt count on stdout either way, so main() can report a suppression
-# WITH the running count instead of just going quiet. Stamped ONLY when
-# not DRY_RUN, same convention as the sibling sweeps.
-should_alert_r5() {
+# r5_alert_eligible <bead_id> → rc0 iff the R5 cooldown has elapsed for
+# this bead (ga-9e0j8) — READ-ONLY, never persists anything. Echoes the
+# attempt number this call would use on stdout either way (the still-
+# cooling-down count unchanged when suppressed, or the next count when
+# eligible), so main() can report a suppression WITH the running count
+# instead of just going quiet.
+#
+# ⚠️ (revisor, gate-run ga-woesw, blocking issue 1): this used to be one
+# function ("should_alert_r5") that stamped the cooldown file AS PART OF
+# deciding rc0 — before the caller had even attempted note(), let alone
+# learned whether it succeeded. If note() then failed (bd comment really
+# failing), the stamp already said "escalated just now", so the NEXT sweep
+# saw a hot cooldown and SUPPRESSED — silently eating the retry and going
+# quiet for the full cooldown window even though nothing was ever actually
+# posted to the bead. Same failure shape as the original bug (actionable
+# escalation collapses into silence), just relocated into the fix itself.
+# Splitting eligibility (this function, read-only) from commit
+# (mark_r5_alerted, below) lets the caller persist the stamp ONLY after
+# note() is confirmed to have succeeded — a failed attempt leaves no
+# stamp, so the next sweep retries immediately instead of waiting out a
+# cooldown for something that never happened.
+r5_alert_eligible() {
   local id="$1"
   local stamp="$R5_ALERT_DIR/$id" last=0 count=0 age now
   now="$(date -u +%s)"
@@ -346,13 +362,23 @@ should_alert_r5() {
       return 1
     fi
   fi
-  count=$((count + 1))
-  if [ "$DRY_RUN" != "1" ]; then
-    mkdir -p "$R5_ALERT_DIR" 2>/dev/null
-    printf '%s %s' "$now" "$count" > "$stamp" 2>/dev/null
-  fi
-  printf '%s' "$count"
+  printf '%s' "$((count + 1))"
   return 0
+}
+
+# mark_r5_alerted <bead_id> <count> — persist the R5 cooldown stamp
+# (format "<epoch> <count>", one file per bead under R5_ALERT_DIR). Call
+# ONLY after the caller has confirmed the escalation was actually
+# delivered (note() returned rc0) — same idiom as gate-merge-survival-
+# sweep.sh / gate-needs-human-divergence-sweep.sh's should_alert(), but
+# split out here so a failed delivery never gets recorded as a success.
+# Stamped ONLY when not DRY_RUN, same convention as the sibling sweeps.
+mark_r5_alerted() {
+  local id="$1" count="$2"
+  local stamp="$R5_ALERT_DIR/$id"
+  [ "$DRY_RUN" = "1" ] && return 0
+  mkdir -p "$R5_ALERT_DIR" 2>/dev/null
+  printf '%s %s' "$(date -u +%s)" "$count" > "$stamp" 2>/dev/null
 }
 
 # ── as regras ──────────────────────────────────────────────────────────
@@ -575,10 +601,11 @@ main() {
           fi ;;
         R5)
           local r5_count r5_rc
-          r5_count="$(should_alert_r5 "$id")"; r5_rc=$?
+          r5_count="$(r5_alert_eligible "$id")"; r5_rc=$?
           if [ "$r5_rc" -ne 0 ]; then
             say "R5 $id — escalação suprimida (cooldown ${R5_ALERT_COOLDOWN}s não decorrido desde a tentativa #$r5_count; mesmo motivo, nada mudou) — $why"
           elif note "$rig" "$id" "AUTO-DESTRAVE R5 (ga-stu930): nenhuma regra decidiu — $why. Escalando ao Mayor COM o motivo, que é o que a trava antiga não fazia. (tentativa #$r5_count — próxima re-escalação só após ${R5_ALERT_COOLDOWN}s se ainda não resolvido; ga-9e0j8)"; then
+            mark_r5_alerted "$id" "$r5_count"
             say "R5 $id — escalado (tentativa #$r5_count): $why"
           else
             say "FALHA R5 $id — bd comment falhou, escalação NÃO registrada no bead; verificar manualmente — $why"
