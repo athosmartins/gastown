@@ -37,8 +37,8 @@ Thumbs.db
 # spawn time via agent overlay_dir), not local Claude Code session state —
 # needs an explicit re-include like commands/skills above, since it's also
 # nested under a .claude/ dir the blanket rule matches.
-!packs/town-deltas/assets/claude-overlays/pool/.claude/
-!packs/town-deltas/assets/claude-overlays/pool/.claude/settings.json
+!.gascity-gastown-hq/packs/town-deltas/assets/claude-overlays/pool/.claude/
+!.gascity-gastown-hq/packs/town-deltas/assets/claude-overlays/pool/.claude/settings.json
 
 # Test
 coverage.out
