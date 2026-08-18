@@ -158,7 +158,21 @@ def _gate_queue_depth():
         # 1.1.0. Without this flag a genuinely nonzero queue depth reads as
         # 0, which (per the docstring above) risks silently licensing a
         # suppression that isn't actually justified.
-        r = _sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--json", "--include-infra",
+        # --limit 0 (ga-t02io, found during throughput-stall-watchdog.py's
+        # migration onto this shared function): `bd list --json` silently
+        # truncates at 50 rows with no signal in the JSON itself when the
+        # flag is omitted. throughput-stall-watchdog.py's own pre-migration
+        # copy of this query already carried --limit 0; this module's copy
+        # did not, so approved-state-reconciler.py's ga-dbfm9 adoption has
+        # been running with a latent undercount risk (docstring already
+        # cites 30-43 markers as a real historical depth, below 50 today but
+        # not guaranteed to stay there) since it shipped. An undercounted
+        # depth understates the projected drain time, which makes
+        # _gate_queue_suppress_reason() LESS eager to suppress — fails
+        # toward a spurious alarm rather than a hidden one, but it is still
+        # a wrong number, not the honest "≥50" this flag makes unnecessary.
+        r = _sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--json", "--limit", "0",
+                 "--include-infra",
                  "-l", "type:quality-gate-marker", "-l", "gate-status:queued"],
                 timeout=BD_TIMEOUT)
         if r is None or r.returncode != 0:
