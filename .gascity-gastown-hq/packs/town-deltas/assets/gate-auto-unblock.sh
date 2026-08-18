@@ -44,6 +44,23 @@
 #   R5  Nada decidiu → escala, dizendo por que R1–R4 não bastaram.
 #       Exceção rara. Sem o "por quê", vira a trava velha de novo.
 #
+#       ⚠️ (ga-9e0j8, 2026-08-18): R5 é a ÚNICA regra que não muta
+#       nenhuma label — R1-R4 chamam strip_lock, que tira o bead do
+#       filtro gate:needs-human* da PRÓXIMA varredura de main(); R5 não
+#       tem esse freio natural. Sem cooldown, decide() devolvia o MESMO
+#       R5|why sweep após sweep, e o bloco R5 postava um comentário
+#       IDÊNTICO toda vez — medido: 60+ comentários idênticos em ~20h
+#       numa bead real (wa-wpbfi), sem nunca virar algo acionável (quem
+#       lê aprende a ignorar — mesma classe de dano que watchdog-fatigue
+#       já causou nesta cidade, só que ao contrário: repetição sem sinal
+#       novo em vez de alerta que só cresce). R5 agora passa por
+#       should_alert_r5() antes de postar — mesmo idioma de cooldown de
+#       gate-merge-survival-sweep.sh / gate-needs-human-divergence-
+#       sweep.sh (stamp por bead, LOUD mas não spam): continua
+#       re-escalando enquanto ninguém resolver, só que a cada
+#       R5_ALERT_COOLDOWN (6h por padrão) em vez de a cada sweep, com um
+#       contador de tentativa visível no comentário.
+#
 # ────────────────────────────────────────────────────────────────────
 # ⚠️ AS SETE VARIANTES (medidas 2026-08-15) — "needs-human" é SETE
 # estados diferentes achatados sob um prefixo. Tratar como um só manda
@@ -115,6 +132,12 @@ ENABLED="${GATE_AUTO_UNBLOCK_ENABLED:-1}"
 UNBLOCKABLE_VARIANTS="${GATE_AUTO_UNBLOCK_VARIANTS:-gate:needs-human gate:needs-human:technical gate:needs-human:branch-content-mismatch gate:needs-human:partial-delivery}"
 
 LOCK_FILE="${GATE_AUTO_UNBLOCK_LOCK:-$CITY/.gc/runtime/gate-auto-unblock.lock}"
+
+# R5 escalation rate-limit (ga-9e0j8) — see the R5 rule comment above for
+# why this exists. Same idiom as the sibling sweeps' should_alert(): a
+# stamp file per bead, cooldown gates re-alerts.
+R5_ALERT_DIR="${GATE_AUTO_UNBLOCK_R5_ALERT_DIR:-$CITY/.gc/runtime/gate-auto-unblock-r5-alerted}"
+R5_ALERT_COOLDOWN="${GATE_AUTO_UNBLOCK_R5_COOLDOWN:-21600}"  # 6h, matches gate-merge-survival-sweep.sh
 
 log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG" 2>/dev/null || true; }
 say() { printf '%s\n' "$*"; log "$*"; }
@@ -300,6 +323,36 @@ strip_lock() {
 note() {
   [ "$DRY_RUN" = "1" ] && return 0
   "$BD" -C "$1" comment "$2" "$3" >/dev/null 2>&1
+}
+
+# should_alert_r5 <bead_id> → rc0 iff the R5 cooldown has elapsed for this
+# bead (ga-9e0j8). Stamps + bumps the bead's attempt counter as a side
+# effect (format "<epoch> <count>", one file per bead under R5_ALERT_DIR)
+# whenever it allows a fire — same idiom as gate-merge-survival-sweep.sh /
+# gate-needs-human-divergence-sweep.sh's should_alert(). Echoes the
+# attempt count on stdout either way, so main() can report a suppression
+# WITH the running count instead of just going quiet. Stamped ONLY when
+# not DRY_RUN, same convention as the sibling sweeps.
+should_alert_r5() {
+  local id="$1"
+  local stamp="$R5_ALERT_DIR/$id" last=0 count=0 age now
+  now="$(date -u +%s)"
+  if [ -f "$stamp" ]; then
+    read -r last count < "$stamp" 2>/dev/null
+    last="${last:-0}"; count="${count:-0}"
+    age=$(( now - last ))
+    if [ "$age" -lt "$R5_ALERT_COOLDOWN" ] 2>/dev/null; then
+      printf '%s' "$count"
+      return 1
+    fi
+  fi
+  count=$((count + 1))
+  if [ "$DRY_RUN" != "1" ]; then
+    mkdir -p "$R5_ALERT_DIR" 2>/dev/null
+    printf '%s %s' "$now" "$count" > "$stamp" 2>/dev/null
+  fi
+  printf '%s' "$count"
+  return 0
 }
 
 # ── as regras ──────────────────────────────────────────────────────────
@@ -521,8 +574,12 @@ main() {
             say "FALHA R4 $id — bd label remove ou bd comment falhou (label pode ainda estar presente); verificar manualmente — $why"
           fi ;;
         R5)
-          if note "$rig" "$id" "AUTO-DESTRAVE R5 (ga-stu930): nenhuma regra decidiu — $why. Escalando ao Mayor COM o motivo, que é o que a trava antiga não fazia."; then
-            say "R5 $id — escalado: $why"
+          local r5_count r5_rc
+          r5_count="$(should_alert_r5 "$id")"; r5_rc=$?
+          if [ "$r5_rc" -ne 0 ]; then
+            say "R5 $id — escalação suprimida (cooldown ${R5_ALERT_COOLDOWN}s não decorrido desde a tentativa #$r5_count; mesmo motivo, nada mudou) — $why"
+          elif note "$rig" "$id" "AUTO-DESTRAVE R5 (ga-stu930): nenhuma regra decidiu — $why. Escalando ao Mayor COM o motivo, que é o que a trava antiga não fazia. (tentativa #$r5_count — próxima re-escalação só após ${R5_ALERT_COOLDOWN}s se ainda não resolvido; ga-9e0j8)"; then
+            say "R5 $id — escalado (tentativa #$r5_count): $why"
           else
             say "FALHA R5 $id — bd comment falhou, escalação NÃO registrada no bead; verificar manualmente — $why"
           fi ;;

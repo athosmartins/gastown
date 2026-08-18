@@ -208,6 +208,61 @@ OUT="$(run)"
 case "$OUT" in *"R5 ga-xyz"*escalado*) ok "R5: nada decidiu → escala COM o motivo escrito";;
   *) bad "R5: deveria escalar dizendo por que R1-R4 não bastaram" "$OUT";; esac
 
+# ── ga-9e0j8: R5 SEM cooldown reescalona IDENTICAMENTE a cada varredura
+# ──────────────────────────────────────────────────────────────────────
+# R5 é a ÚNICA regra que não muta nenhuma label (R1-R4 chamam strip_lock,
+# que tira o bead do filtro de main() na PRÓXIMA varredura — R5 não tem
+# esse freio). Sem cooldown, decide() devolve o MESMO R5|why sempre que a
+# fixture não muda, e o script postava um comentário idêntico a CADA
+# chamada. Medido numa bead real (wa-wpbfi): 60+ comentários idênticos em
+# ~20h. Repro: MESMA fixture, script rodado 2x em sequência (as duas
+# dentro do cooldown padrão de 6h) — a 2ª chamada tem que ser SUPRIMIDA,
+# não postar um 2º comentário idêntico.
+setup ga-r5loop '["gate:needs-human"]' 'origin/fix/ga-r5loop' '+ dead5678' '1700000000' \
+  '[{"created_at":"2026-08-15T10:00:00Z","text":"VERDICT: FAIL sem detalhe"}]'
+OUT1="$(run)"
+OUT2="$(run)"
+R5_COMMENTS="$(grep -c 'AUTO-DESTRAVE R5' "$TMP/fx.ga-r5loop/comments.log" 2>/dev/null || echo 0)"
+if printf '%s' "$OUT1" | grep -q "R5 ga-r5loop.*escalado" \
+   && printf '%s' "$OUT2" | grep -qi "R5 ga-r5loop.*suprimid" \
+   && [ "$R5_COMMENTS" -eq 1 ]; then
+  ok "ga-9e0j8: R5 escala na 1ª varredura, SUPRIME a 2ª (cooldown) — nunca mais de 1 comentário idêntico por janela"
+else
+  bad "ga-9e0j8: R5 deveria escalar só 1x dentro do cooldown, não repetir o comentário a cada varredura (era o bug real: 60+ comentários idênticos em 20h)" \
+    "OUT1=$OUT1 OUT2=$OUT2 R5_COMMENTS=$R5_COMMENTS COMMENTS=$(cat "$TMP/fx.ga-r5loop/comments.log" 2>/dev/null)"
+fi
+
+# ── ga-9e0j8: depois que o cooldown REALMENTE decorre, R5 volta a
+# escalar COM contador visível ──────────────────────────────────────────
+# Cobre a outra metade do pedido do bug: suprimir não pode virar "nunca
+# mais", e a mensagem tem que mostrar QUANTAS vezes já tentou. Simula o
+# tempo passando adiantando o stamp diretamente (sem sleep real de 6h) —
+# a varredura em si usa sempre o R5_ALERT_COOLDOWN PADRÃO (21600s); só o
+# relógio é simulado, não o mecanismo. (Não usa
+# GATE_AUTO_UNBLOCK_R5_COOLDOWN=0 aqui de propósito: este harness aponta
+# GC_CITY_PATH/WA_RIG/PS_RIG pro MESMO $TMP, então main() varre a mesma
+# fixture 3x por chamada de run() — com cooldown=0 as 3 passadas internas
+# disparam TODAS, o que testaria o comparador de fronteira, não o
+# "reescala depois que o tempo passa" que este caso quer cobrir.)
+setup ga-r5count '["gate:needs-human"]' 'origin/fix/ga-r5count' '+ beef9012' '1700000000' \
+  '[{"created_at":"2026-08-15T10:00:00Z","text":"VERDICT: FAIL sem detalhe"}]'
+OUT1="$(run)"
+R5_DIR="$TMP/.gc/runtime/gate-auto-unblock-r5-alerted"
+STAMP_COUNT="$(awk '{print $2}' "$R5_DIR/ga-r5count" 2>/dev/null)"
+# adianta o stamp pra "9h atrás" (> cooldown de 6h), mantendo o contador —
+# é exatamente o que o tempo passando faria, só sem esperar de verdade.
+printf '%s %s' "$(( $(date -u +%s) - 32400 ))" "${STAMP_COUNT:-1}" > "$R5_DIR/ga-r5count"
+OUT2="$(run)"
+R5_COMMENTS2="$(grep -c 'AUTO-DESTRAVE R5' "$TMP/fx.ga-r5count/comments.log" 2>/dev/null || echo 0)"
+if [ "$R5_COMMENTS2" -eq 2 ] \
+   && grep -q 'tentativa #1' "$TMP/fx.ga-r5count/comments.log" 2>/dev/null \
+   && grep -q 'tentativa #2' "$TMP/fx.ga-r5count/comments.log" 2>/dev/null; then
+  ok "ga-9e0j8: depois que o cooldown decorre, R5 volta a escalar com contador visível (#1 → #2)"
+else
+  bad "ga-9e0j8: depois do cooldown decorrido deveria reescalar 1x mais E mostrar o contador crescendo" \
+    "OUT1=$OUT1 OUT2=$OUT2 COMMENTS=$(cat "$TMP/fx.ga-r5count/comments.log" 2>/dev/null)"
+fi
+
 # ── self-audit pré-gate: git cherry FALHA ≠ git cherry acha nada ───────
 # Achado varrendo o diff inteiro antes de submeter (não um caso citado por
 # revisor). has_own_work colapsava "comando não rodou" (lock, rig
