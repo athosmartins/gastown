@@ -109,6 +109,31 @@ name = "oracle-wa"
 min_active_sessions = 1
 # END ga-23z6a eval-window-concurrency-guard
 
+# ga-hnn7l: pool sessions (dog/wa-worker/ps-worker) get zero scoped
+# .claude/settings.json today, so Athos's global "ask" rule for
+# Bash(rm -rf:*)/Bash(sudo:*) can deadlock an unsupervised session forever
+# (ga-q640n P0 — a dog froze 7h on a harmless __pycache__ cleanup). Athos's
+# decision (2026-08-18, multiple-choice): deny both, scoped to pool roles
+# only — his own interactive ask rule is untouched.
+# overlay_dir is copied into each session's workdir at spawn time and
+# JSON-merges into .claude/settings.json (internal/overlay/merge.go
+# mergeablePaths); deny wins over ask regardless of which scope contributed
+# either rule, so this shadows the global ask for pool sessions only.
+# Path confirmed to resolve via realizePoolDesiredSessions ->
+# resolveTemplateForSessionBead -> prepareTemplateResolution ->
+# materializeProviderOverlaysBeforeFingerprint (cmd/gc/build_desired_state.go).
+[[patches.agent]]
+name = "gastown.dog"
+overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"
+
+[[patches.agent]]
+name = "wa-worker"
+overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"
+
+[[patches.agent]]
+name = "ps-worker"
+overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"
+
 [daemon]
 # nudge_dispatcher: EXPLICITAMENTE "legacy" — nao remova sem MEDIR (ga-yxuab).
 # O modo runtime (socket wake) e melhor no papel: o poll `gc nudge poll` por sessao
