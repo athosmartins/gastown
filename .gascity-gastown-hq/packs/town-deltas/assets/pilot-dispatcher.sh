@@ -4706,6 +4706,19 @@ _beadid_branch_signal() {
 # when PILOT_TEST_REMERGE_BEADS is DEFINED, keeps the selftest hermetic (no
 # real git/network). FAIL-OPEN when undecidable: no git / no repos / no match
 # → return 1 (caller falls back to human escalation, never a silent re-dispatch).
+#
+# ga-r7uec: matches BOTH fix/<bead>-<slug> (the documented convention above)
+# AND the bare fix/<bead> shape (no slug) — a branch has reached the gate
+# without a slug at least once in the wild (ga-y9a1d: origin/fix/ga-y9a1d,
+# tip 48a365ae, 2 commits, already reviewed) despite the convention, and the
+# old suffix-only glob (refs/heads/fix/<bead>-*, requiring a literal "-"
+# right after the id) never matched it — this guard concluded "no branch"
+# for a bead that had one and escalated a good commit to gate:needs-human.
+# The added exact-id pattern cannot collide with an unrelated LONGER id:
+# `git for-each-ref "refs/heads/fix/<bead>"` (no trailing glob) matches only
+# that literal ref, never one merely prefixed by it — verified empirically
+# and covered by pilot-dispatcher.remerge-branch-match.selftest.sh's decoy
+# case, so this stays as safe as the pre-existing suffix pattern.
 _beadid_needs_remerge_branch() {
   local _bid="${1:-}" _repo _match
   [ -n "$_bid" ] || return 1
@@ -4722,14 +4735,17 @@ _beadid_needs_remerge_branch() {
   [ -n "$_repos" ] || return 1
   while IFS= read -r _repo; do
     [ -n "$_repo" ] && [ -d "$_repo" ] || continue
-    _match=$(git -C "$_repo" for-each-ref --format='%(refname:short)' "refs/heads/fix/${_bid}-*" "refs/remotes/origin/fix/${_bid}-*" 2>/dev/null | head -1)
+    _match=$(git -C "$_repo" for-each-ref --format='%(refname:short)' \
+      "refs/heads/fix/${_bid}" "refs/heads/fix/${_bid}-*" \
+      "refs/remotes/origin/fix/${_bid}" "refs/remotes/origin/fix/${_bid}-*" \
+      2>/dev/null | head -1)
     if [ -n "$_match" ]; then
       printf '%s\t%s' "$_repo" "${_match#origin/}"
       return 0
     fi
     if git -C "$_repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1 \
        || git -C "$_repo" remote 2>/dev/null | grep -q .; then
-      _match=$(timeout 8 git -C "$_repo" ls-remote --heads origin "fix/${_bid}-*" 2>/dev/null | head -1 | awk '{print $2}')
+      _match=$(timeout 8 git -C "$_repo" ls-remote --heads origin "fix/${_bid}" "fix/${_bid}-*" 2>/dev/null | head -1 | awk '{print $2}')
       if [ -n "$_match" ]; then
         printf '%s\t%s' "$_repo" "${_match#refs/heads/}"
         return 0
@@ -6708,11 +6724,11 @@ submitted_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         warn "ga-e2n96: found branch $REMERGE_REF for $STORY_ID but FAILED to create gate marker — leaving labels as-is for next sweep to retry."
       fi
     else
-      warn "ga-e2n96: $STORY_ID carries gate:needs-fix/needs-remerge with zero feedback and NO existing fix/$STORY_ID-* branch found — escalating to human instead of blind-dispatching a builder."
+      warn "ga-e2n96: $STORY_ID carries gate:needs-fix/needs-remerge with zero feedback and NO existing fix/$STORY_ID or fix/$STORY_ID-* branch found (checked local+remote refs, both the bare id and the id+slug shape) — escalating to human instead of blind-dispatching a builder."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "gate:needs-fix"     -q 2>/dev/null || true
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "gate:needs-remerge" -q 2>/dev/null || true
       bd -C "$STORY_BEAD_CITY" label add    "$STORY_ID" "gate:needs-human"   -q 2>/dev/null || true
-      bd -C "$STORY_BEAD_CITY" comment "$STORY_ID" "ga-e2n96: Pilot found gate:needs-fix/needs-remerge with zero reviewer feedback and no existing fix/$STORY_ID-* branch to resubmit — escalating to gate:needs-human rather than dispatching a builder with an empty brief." 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" comment "$STORY_ID" "ga-e2n96: Pilot found gate:needs-fix/needs-remerge with zero reviewer feedback and no existing fix/$STORY_ID or fix/$STORY_ID-* branch to resubmit (ga-r7uec: checked both the bare-id and id+slug branch shapes, local and remote) — escalating to gate:needs-human rather than dispatching a builder with an empty brief." 2>/dev/null || true
     fi
     return 1
   fi
