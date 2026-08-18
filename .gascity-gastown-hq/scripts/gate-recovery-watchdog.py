@@ -74,6 +74,7 @@ import json, time, datetime, subprocess, os, re, inspect
 import sys as _sys
 _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 from gc_ledger import gc_ledger_append as _grw_ledger
+import quiet_hours
 
 CITY = os.environ.get("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
 DISPATCH_LOG = os.path.join(CITY, ".gc/logs/quality-gate-dispatcher.log")
@@ -2139,9 +2140,18 @@ class RecoveryState:
         self.escalated = {}        # key -> last-escalation epoch
         self.orphan_gate_label_hits = {}  # (bead_id, label) -> FIX 8 consecutive-sweep count seen unreferenced
 
-    def escalate_once(self, key, now, window=None):
+    def escalate_once(self, key, now, window=None, quiet_adjust=False):
         w = WAKE_BACKOFF_MAX_SEC if window is None else window
-        if now - self.escalated.get(key, 0) < w:
+        last = self.escalated.get(key, 0)
+        elapsed = now - last
+        if quiet_adjust and last:
+            # ga-mb253h: discount quiet-hours time from the re-escalation
+            # clock, same pattern as production-stall-watchdog.py's
+            # merge_stall() (ga-lda92s) — opt-in only, so the other 5
+            # escalate_once call sites in this file (none flow-gated by the
+            # admission pause) keep their exact prior behavior.
+            elapsed = max(0, elapsed - quiet_hours.elapsed_adjustment(last, now, now=now))
+        if elapsed < w:
             return False
         self.escalated[key] = now
         return True
@@ -3685,7 +3695,7 @@ def recover_needs_rebase_markers(now, rstate):
             continue
 
         # verdict == "escalate"
-        if rstate.escalate_once("needs-rebase:%s" % mid, now, window=NEEDS_REBASE_ALERT_COOLDOWN_SEC):
+        if rstate.escalate_once("needs-rebase:%s" % mid, now, window=NEEDS_REBASE_ALERT_COOLDOWN_SEC, quiet_adjust=True):
             notify("🚨 Gate: marker %s (branch %s) preso em needs-rebase há %dmin, ninguém tinha sido avisado. Precisa de uma decisão (re-anchor/rebuild). (grw FIX9)"
                    % (mid, branch or "?", age // 60), 4)
             _grw_ledger("human-touch",

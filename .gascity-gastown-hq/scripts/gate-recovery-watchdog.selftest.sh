@@ -918,6 +918,54 @@ if len(failed_events_r2) == 1 and failed_events_r2[0].get("returncode") == 1 and
 else:
     bad("expected one close_pending_verdict_on_supersede_FAILED ledger event with returncode/stderr, got %r" % (ledger_r2,))
 
+# ═══ ga-mb253h: RecoveryState.escalate_once quiet-hours discount (needs-rebase ═══
+# ═══ re-escalation only) ══════════════════════════════════════════════════════
+# The 7th quiet-hours false alarm cited in ga-lda92s ("marker preso em
+# needs-rebase, ninguem foi avisado"), traced to THIS file's own re-escalation
+# cooldown -- NOT one of the 4 watchdogs ga-lda92s fixed
+# (production-stall-watchdog.py etc). Same bidirectional acceptance bar as
+# ga-lda92s's own tests: QUIET explains a gap -> no re-page; OPEN (or
+# unconfirmed) -> still pages. Uses the real NEEDS_REBASE_ALERT_COOLDOWN_SEC
+# constant so a future change to it is exercised here too, not a hand-picked
+# stand-in value.
+
+print("Scenario ga-mb253h-1: escalate_once(quiet_adjust=True) -- quiet-hours-explained gap does NOT re-page")
+_qh_today = time.strftime("%Y-%m-%d")
+def _qh_at(hms, day_offset=0):
+    t = time.mktime(time.strptime("%s %s" % (_qh_today, hms), "%Y-%m-%d %H:%M:%S"))
+    return t + day_offset * 86400
+_qh_rs = m.RecoveryState()
+_qh_rs.escalate_once("qh:a", _qh_at("00:30:00"), window=m.NEEDS_REBASE_ALERT_COOLDOWN_SEC, quiet_adjust=True)  # seed
+if _qh_rs.escalate_once("qh:a", _qh_at("08:05:00"), window=m.NEEDS_REBASE_ALERT_COOLDOWN_SEC, quiet_adjust=True) is False:
+    ok("raw gap 00:30->08:05 (455min) exceeds the 6h cooldown, but quiet hours (00h-08h) explain ~450 of those minutes -- effective ~5min -> no re-page")
+else:
+    bad("REGRESSION ga-mb253h: quiet-hours-explained gap wrongly re-paged")
+
+print("Scenario ga-mb253h-2: live signal OPEN inside tonight's window -- re-page still fires (bidirectional pair)")
+_qh_rs.escalate_once("qh:b", _qh_at("21:00:00", day_offset=-1), window=m.NEEDS_REBASE_ALERT_COOLDOWN_SEC, quiet_adjust=True)  # seed, yesterday 21:00
+os.environ["QUIET_HOURS_OVERRIDE"] = "OPEN"
+try:
+    if _qh_rs.escalate_once("qh:b", _qh_at("03:30:00"), window=m.NEEDS_REBASE_ALERT_COOLDOWN_SEC, quiet_adjust=True) is True:
+        ok("live signal reads OPEN: raw gap 6.5h still exceeds the 6h cooldown with nothing discounted -> re-page fires (the fix must not be a blanket mute)")
+    else:
+        bad("REGRESSION ga-mb253h: OPEN-override gap did not re-page (fix over-suppressed)")
+finally:
+    os.environ.pop("QUIET_HOURS_OVERRIDE", None)
+
+print("Scenario ga-mb253h-3: ordinary daytime gap is unaffected by the discount")
+_qh_rs.escalate_once("qh:c", _qh_at("09:00:00"), window=m.NEEDS_REBASE_ALERT_COOLDOWN_SEC, quiet_adjust=True)  # seed
+if _qh_rs.escalate_once("qh:c", _qh_at("17:00:00"), window=m.NEEDS_REBASE_ALERT_COOLDOWN_SEC, quiet_adjust=True) is True:
+    ok("gap entirely during the day (09:00->17:00, no night-window overlap) -> adjustment is a no-op, re-page fires exactly as before this fix")
+else:
+    bad("REGRESSION ga-mb253h: ordinary daytime gap wrongly suppressed")
+
+print("Scenario ga-mb253h-4: quiet_adjust defaults to False -- the other 5 escalate_once call sites are unaffected")
+_qh_rs.escalate_once("qh:d", _qh_at("00:30:00"), window=m.NEEDS_REBASE_ALERT_COOLDOWN_SEC)  # seed, quiet_adjust omitted
+if _qh_rs.escalate_once("qh:d", _qh_at("08:05:00"), window=m.NEEDS_REBASE_ALERT_COOLDOWN_SEC) is True:
+    ok("the SAME quiet-hours-shaped gap that Scenario ga-mb253h-1 discounts still re-pages when the caller doesn't opt in -- proves the other 5 escalate_once call sites in this file keep their exact prior behavior")
+else:
+    bad("REGRESSION: quiet_adjust default changed behavior for callers that don't pass it")
+
 print("")
 print("Results: %d passed, %d failed" % (PASS, FAIL))
 if FAIL == 0:
