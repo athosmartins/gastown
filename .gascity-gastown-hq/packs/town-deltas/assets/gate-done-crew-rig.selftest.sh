@@ -1467,6 +1467,156 @@ else
   bad "(X6) gate-done.md not found at $GATE_DONE"
 fi
 
+# ── (Y) ga-5nshv: the ga-ljbx pin no longer stomps a correctly-derived
+#    non-gascity RIG just because the worktree is PHYSICALLY parked under
+#    $GC_CITY_PATH — it now checks whether the worktree's own git origin
+#    unambiguously belongs to a DIFFERENT, distinct-origin rig first.
+#
+# Root bug (ga-5nshv, filed by dog-ga7z8hj from a live near-miss): this
+# city's own documented worktree-parking convention
+# ($GC_CITY_PATH/.gc-worktrees/, packs/town-deltas CLAUDE.md's "Idioma
+# WORKTREE" recipe) places a worktree's DIRECTORY under HQ regardless of
+# which repo/rig the worktree's CODE actually belongs to — a worktree's
+# physical location and its git identity (origin, object store, commit
+# history) are independent facts. The (P)/(Q) pin above already correctly
+# gates on physical containment vs. branch text (ga-3dhdg) but still
+# conflates "physically under HQ" with "code belongs to gascity" — exactly
+# the gap ga-3dhdg's own SUGGESTED FIX DIRECTION flagged as unresolved.
+# Reproduced live: a fix/wa-* worktree created off whatsapp_automation's
+# main but parked at .gascity-gastown-hq/.gc-worktrees/ga-1bxea-fix got
+# pinned to rig=gascity, where neither the branch nor its base_commit SHA
+# resolve — a gate-runner following that value would strand or error.
+# Two more worktrees already living under this convention right now
+# (.gc-worktrees/ga-xd0zg-rebase, ga-ydpng-rebase, for fix/wa-xd0zg-rebase
+# / fix/wa-ydpng-rebase) were AT RISK of the exact same mis-pin.
+
+# apply_ljbx_pin_with_origin <branch> <cwd_physical> <cwd_top> <rig>
+# <gc_city_path> <rig_list_json> — replica of the FIXED pin. Uses REAL git
+# calls against the REAL, live registered-rig directories already used
+# elsewhere in this file (no synthetic repos needed) — cwd_top is
+# deliberately a SEPARATE parameter from cwd_physical, exactly modeling the
+# bug: a worktree's git identity (what `git -C <path> remote get-url
+# origin` reports) and its physical parking directory are independent.
+apply_ljbx_pin_with_origin() {
+  local branch="$1" cwd_physical="$2" cwd_top="$3" rig="$4" gc_city_path="$5" rig_list_json="$6"
+  case "$branch" in
+    fix/*)
+      if [ -n "$gc_city_path" ]; then
+        case "$cwd_physical" in
+          "$gc_city_path"|"$gc_city_path"/*)
+            local cwd_origin_url cwd_origin_norm origin_match_rig="" origin_match_count=0
+            local orig_rig_name orig_rig_path orig_rig_url orig_rig_norm
+            cwd_origin_url=$(git -C "$cwd_top" remote get-url origin 2>/dev/null || echo "")
+            if [ -n "$cwd_origin_url" ]; then
+              cwd_origin_norm=$(printf '%s' "$cwd_origin_url" | sed -E 's#\.git/?$##; s#/$##')
+              for orig_rig_name in $(printf '%s' "$rig_list_json" | jq -r '.rigs[].name // empty' 2>/dev/null); do
+                orig_rig_path=$(printf '%s' "$rig_list_json" | jq -r --arg n "$orig_rig_name" '.rigs[] | select(.name==$n) | .path' 2>/dev/null | head -1)
+                [ -z "$orig_rig_path" ] && continue
+                orig_rig_url=$(git -C "$orig_rig_path" remote get-url origin 2>/dev/null || echo "")
+                [ -z "$orig_rig_url" ] && continue
+                orig_rig_norm=$(printf '%s' "$orig_rig_url" | sed -E 's#\.git/?$##; s#/$##')
+                if [ "$orig_rig_norm" = "$cwd_origin_norm" ]; then
+                  origin_match_rig="$orig_rig_name"
+                  origin_match_count=$((origin_match_count + 1))
+                fi
+              done
+            fi
+            if [ "$origin_match_count" -eq 1 ] && [ "$origin_match_rig" != "gascity" ]; then
+              rig="$origin_match_rig"
+            elif [ "$rig" != "gascity" ]; then
+              rig="gascity"
+            fi
+            ;;
+        esac
+      fi
+      ;;
+  esac
+  printf '%s' "$rig"
+}
+
+# (Y1) primary repro: the EXACT at-risk worktree named in the bug report
+# (fix/wa-xd0zg-rebase, parked at .gc-worktrees/ga-xd0zg-rebase under HQ,
+# code from whatsapp_automation — a real repo with its own distinct
+# origin). RIG going in is already correctly "whatsapp_automation" (as
+# FALLBACK 1's bead-prefix derivation would produce for a wa-* bead) — the
+# OLD pin stomped this correct value to gascity purely from physical
+# location; the fix must leave it alone.
+R=$(apply_ljbx_pin_with_origin "fix/wa-xd0zg-rebase" \
+  "$GC_CITY_PATH_STUB/.gc-worktrees/ga-xd0zg-rebase" \
+  "/Users/athos/gt/whatsapp_automation" "whatsapp_automation" "$GC_CITY_PATH_STUB" "$RIG_LIST_JSON")
+[ "$R" = "whatsapp_automation" ] \
+  && ok "(Y1) worktree under HQ with whatsapp_automation origin keeps RIG=whatsapp_automation, not stomped to gascity (got: $R)" \
+  || bad "(Y1) worktree-under-HQ + distinct-origin repro → expected whatsapp_automation, got: $R (ga-5nshv regression)"
+
+# (Y2) control: a GENUINE HQ self-fix worktree (cwd_top really is gascity's
+# own registered path) must still pin to gascity — ga-ljbx's original
+# protective intent, unchanged.
+R=$(apply_ljbx_pin_with_origin "fix/ga-5nshv-gate-done-rig" \
+  "$GC_CITY_PATH_STUB/.gc-worktrees/fix-ga-5nshv-gate-done-rig" \
+  "$GC_CITY_PATH_STUB" "unknown" "$GC_CITY_PATH_STUB" "$RIG_LIST_JSON")
+[ "$R" = "gascity" ] \
+  && ok "(Y2) control: a genuine HQ self-fix worktree still pins to gascity (got: $R)" \
+  || bad "(Y2) control: genuine HQ self-fix → expected gascity, got: $R (ga-ljbx protection lost)"
+
+# (Y3) ambiguous-collision control: cwd_top is gastown's real registered
+# path — gastown shares ONE origin URL with gascity AND deacon (all three
+# are tracked subdirs of the same outer monorepo, verified live 2026-08-18,
+# no rig has its own .git). An origin match against 3 candidates is exactly
+# as inconclusive as no match — must fall through to the OLD physical-path
+# pin (gascity) rather than guess, proving the fix does not misfire on the
+# case it cannot actually disambiguate.
+R=$(apply_ljbx_pin_with_origin "fix/gt-abc123-something" \
+  "$GC_CITY_PATH_STUB/.gc-worktrees/gt-abc123-something" \
+  "/Users/athos/gt/gastown" "unknown" "$GC_CITY_PATH_STUB" "$RIG_LIST_JSON")
+[ "$R" = "gascity" ] \
+  && ok "(Y3) ambiguous-origin worktree (shared by gascity/gastown/deacon) safely falls through to the old pin, not a wrong guess (got: $R)" \
+  || bad "(Y3) ambiguous-origin worktree → expected safe fallthrough to gascity, got: $R"
+
+# (Y4) control: non-fix/* branch is never touched, exactly like (P4) —
+# proves the outer case-branch gating is unchanged by this addition.
+R=$(apply_ljbx_pin_with_origin "crew/batista/wa-27jn" \
+  "$GC_CITY_PATH_STUB" "/Users/athos/gt/whatsapp_automation" "whatsapp_automation" "$GC_CITY_PATH_STUB" "$RIG_LIST_JSON")
+[ "$R" = "whatsapp_automation" ] \
+  && ok "(Y4) control: non-fix/* branch is never touched by the origin check (got: $R)" \
+  || bad "(Y4) control: non-fix/* branch → expected untouched whatsapp_automation, got: $R"
+
+# (Y5) mutation guard: the ORIGINAL (pre-ga-5nshv) pin — apply_ljbx_pin(),
+# already defined above for (P), which has no concept of cwd_top/origin at
+# all — given the EXACT (Y1) repro's branch/cwd_physical/rig/gc_city_path,
+# DOES incorrectly stomp to gascity. Proves (Y1) would have caught this
+# live near-miss, not just happened to pass either way.
+R=$(apply_ljbx_pin "fix/wa-xd0zg-rebase" \
+  "$GC_CITY_PATH_STUB/.gc-worktrees/ga-xd0zg-rebase" "whatsapp_automation" "$GC_CITY_PATH_STUB")
+[ "$R" = "gascity" ] \
+  && ok "(Y5) mutation check: pre-fix pin stomps the (Y1) repro to gascity, reproducing ga-5nshv" \
+  || bad "(Y5) mutation check: pre-fix pin unexpectedly did not stomp — (Y1) would not catch a reversion"
+
+# (Y6) source drift-guard: deployed gate-done.md's ga-ljbx pin block checks
+# the worktree's own git origin before pinning to gascity.
+if [ -f "$GATE_DONE" ]; then
+  src=$(cat "$GATE_DONE")
+  printf '%s' "$src" | grep -qF 'ga-5nshv' \
+    && ok "(Y6a) gate-done.md references the ga-5nshv fix" \
+    || bad "(Y6a) gate-done.md missing the ga-5nshv fix marker (regression)"
+  printf '%s' "$src" | grep -qF 'git -C "$CWD_TOP" remote get-url origin' \
+    && ok "(Y6b) gate-done.md's ga-ljbx pin checks the worktree's own git origin before pinning" \
+    || bad "(Y6b) gate-done.md missing the origin-URL check (ga-5nshv regression)"
+  printf '%s' "$src" | grep -qF '_ORIGIN_MATCH_COUNT" -eq 1' \
+    && ok "(Y6c) gate-done.md only trusts an UNAMBIGUOUS (single) origin match, never a guess among several" \
+    || bad "(Y6c) gate-done.md missing the single-match-only guard (would misresolve the gascity/gastown/deacon collision)"
+  # The origin check must run BEFORE the unconditional pin, not after — an
+  # after-the-fact check can't prevent the stomp it's meant to prevent.
+  origin_check_line=$(printf '%s\n' "$src" | grep -nF '_CWD_ORIGIN_URL=$(git -C "$CWD_TOP"' | head -1 | cut -d: -f1)
+  pin_line=$(printf '%s\n' "$src" | grep -nE 'echo "Note: framework self-fix branch' | head -1 | cut -d: -f1)
+  if [ -n "$origin_check_line" ] && [ -n "$pin_line" ] && [ "$origin_check_line" -lt "$pin_line" ]; then
+    ok "(Y6d) gate-done.md's origin check runs BEFORE the unconditional gascity pin (line $origin_check_line < $pin_line)"
+  else
+    bad "(Y6d) gate-done.md's origin check does not precede the pin (origin_check_line='$origin_check_line' pin_line='$pin_line')"
+  fi
+else
+  bad "(Y6) gate-done.md not found at $GATE_DONE"
+fi
+
 echo
 echo "  PASS=$PASS  FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

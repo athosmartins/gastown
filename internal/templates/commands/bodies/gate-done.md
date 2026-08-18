@@ -473,7 +473,52 @@ case "$BRANCH" in
     if [ -n "$GC_CITY_PATH" ]; then
       case "$CWD_PHYSICAL" in
         "$GC_CITY_PATH"|"$GC_CITY_PATH"/*)
-          if [ "$RIG" != "gascity" ]; then
+          # ga-5nshv: physical nesting under $GC_CITY_PATH is NOT proof the
+          # CODE belongs to gascity — this city's own documented worktree
+          # convention (packs/town-deltas CLAUDE.md's "Idioma WORKTREE"
+          # recipe) parks a worktree for ANY rig's fix/* branch under
+          # $GC_CITY_PATH/.gc-worktrees/, regardless of which repo the code
+          # actually lives in: a worktree's directory location and its git
+          # origin are independent facts (`git worktree add <path> <ref>`
+          # can point <path> anywhere on disk, and the worktree still shares
+          # its originating repo's remotes/config/object store — reproduced
+          # live, dog-ga7z8hj: a whatsapp_automation-origin worktree parked
+          # under .gc-worktrees/ got wrongly pinned to gascity by this exact
+          # block). Before pinning, check whether this worktree's own origin
+          # remote resolves to exactly ONE, DIFFERENT rig — if so, that rig
+          # is authoritative and the pin below must not fire.
+          #
+          # This only works for rigs with their OWN dedicated remote
+          # (whatsapp_automation, property_scrapers, lexbh, ...). It does
+          # NOT disambiguate gascity from gastown/deacon: verified live
+          # 2026-08-18, all three are tracked SUBDIRS of this SAME outer
+          # monorepo (no .git of their own — same shape ga-6mir5 already
+          # documented for gascity alone) and therefore share ONE origin
+          # URL. An origin match against MULTIPLE candidates is exactly as
+          # inconclusive as no match at all, so it falls through to the
+          # existing pin unchanged — this only changes behavior for the
+          # single-distinct-origin case the bug actually reports.
+          _CWD_ORIGIN_URL=$(git -C "$CWD_TOP" remote get-url origin 2>/dev/null || echo "")
+          _ORIGIN_MATCH_RIG=""
+          _ORIGIN_MATCH_COUNT=0
+          if [ -n "$_CWD_ORIGIN_URL" ]; then
+            _CWD_ORIGIN_NORM=$(printf '%s' "$_CWD_ORIGIN_URL" | sed -E 's#\.git/?$##; s#/$##')
+            for _ORIG_RIG_NAME in $(printf '%s' "$RIG_LIST_JSON" | jq -r '.rigs[].name // empty' 2>/dev/null); do
+              _ORIG_RIG_PATH=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg n "$_ORIG_RIG_NAME" '.rigs[] | select(.name==$n) | .path' 2>/dev/null | head -1)
+              [ -z "$_ORIG_RIG_PATH" ] && continue
+              _ORIG_RIG_URL=$(git -C "$_ORIG_RIG_PATH" remote get-url origin 2>/dev/null || echo "")
+              [ -z "$_ORIG_RIG_URL" ] && continue
+              _ORIG_RIG_NORM=$(printf '%s' "$_ORIG_RIG_URL" | sed -E 's#\.git/?$##; s#/$##')
+              if [ "$_ORIG_RIG_NORM" = "$_CWD_ORIGIN_NORM" ]; then
+                _ORIGIN_MATCH_RIG="$_ORIG_RIG_NAME"
+                _ORIGIN_MATCH_COUNT=$((_ORIGIN_MATCH_COUNT + 1))
+              fi
+            done
+          fi
+          if [ "$_ORIGIN_MATCH_COUNT" -eq 1 ] && [ "$_ORIGIN_MATCH_RIG" != "gascity" ]; then
+            echo "Note: worktree at $CWD_PHYSICAL is nested under HQ but its git origin ($_CWD_ORIGIN_URL) unambiguously belongs to rig '$_ORIGIN_MATCH_RIG', not gascity — using '$_ORIGIN_MATCH_RIG' (was: ${RIG:-unknown}), NOT pinning to gascity (ga-5nshv)."
+            RIG="$_ORIGIN_MATCH_RIG"
+          elif [ "$RIG" != "gascity" ]; then
             echo "Note: framework self-fix branch ($BRANCH) authored inside HQ ($CWD_PHYSICAL) — pinning rig=gascity (was: ${RIG:-unknown})."
             RIG="gascity"
           fi
