@@ -652,8 +652,19 @@ run_sweep() {
   if [ "${PMRW_AUTO_REPAIR:-1}" = "1" ] && [ "${PMRW_DRY_RUN:-0}" != "1" ]; then
     _pmrw_repair_was_active=1
   fi
+  # ga-qpfza: coverage counters — the final verdict must be a function of how
+  # many stores were actually readable this sweep, not just what was found in
+  # the ones that were (7/7 unreadable previously still logged "OK: 0", the
+  # same false all-clear a totally-blind sweep gives a normal one). stores_total
+  # counts loop iterations; stores_read only advances past BOTH fail-open
+  # checks below (cand_json parse AND the sel_json filter) — a store that
+  # silently produced garbage counts as unread, same as one bd/jq errored on
+  # outright. A legitimately-empty read (sel_json=="[]", zero candidates) is
+  # NOT a failure and still advances stores_read.
+  local stores_total=0 stores_read=0
   local store cand_json sel_json
   for store in $PMRW_STORES; do
+    stores_total=$((stores_total + 1))
     # Re-stamp the lock heartbeat once per store (mirrors quality-gate-
     # dispatcher.sh's per-verdict-poll re-stamp — see header). Guarded via
     # `command -v`: during in-process selftest scenarios (run_sweep called
@@ -702,6 +713,7 @@ run_sweep() {
       log "WARN: filter jq failed for store '$store' — skipping this store (fail-open)"
       continue
     fi
+    stores_read=$((stores_read + 1))
 
     local rows
     rows=$(printf '%s' "$sel_json" | jq -r --argjson now_ts "$now" '
@@ -832,8 +844,19 @@ run_sweep() {
   [ -z "${resolved_count:-}" ] && resolved_count=0
 
   if [ -z "${flagged_tsv:-}" ]; then
-    if [ "$resolved_count" -eq 0 ] && [ "${repaired_count:-0}" -eq 0 ] && [ "$state" = "{}" ]; then
-      log "OK: 0 armed-but-unrouted bead(s) found across ${#PMRW_STORES} store(s)"
+    # ga-qpfza: the verdict is a function of COVERAGE first, count second —
+    # "found nothing" and "couldn't check anything" must never print the same
+    # line (real incident: 7/7 stores unreadable during a Dolt restart still
+    # logged "OK: 0 armed-but-unrouted bead(s)", an all-clear a blind sweep
+    # has no right to claim). stores_read/stores_total come from the loop
+    # above; UNKNOWN and PARTIAL never use the bare "OK:" prefix so a reader
+    # scanning only for that word can't mistake either for a clean sweep.
+    if [ "$stores_read" -eq 0 ]; then
+      log "UNKNOWN: sweep cego (0/${stores_total} stores legíveis) — nenhuma conclusão possível"
+    elif [ "$stores_read" -lt "$stores_total" ]; then
+      log "PARTIAL: ${stores_read}/${stores_total} stores lidas; resultado cobre apenas essas (0 armed-but-unrouted nas stores lidas, ${resolved_count} resolved, ${repaired_count:-0} auto-repaired)"
+    elif [ "$resolved_count" -eq 0 ] && [ "${repaired_count:-0}" -eq 0 ] && [ "$state" = "{}" ]; then
+      log "OK: 0 armed-but-unrouted bead(s) found across ${stores_total} store(s)"
     else
       log "OK: 0 armed-but-unrouted bead(s) this sweep (${resolved_count} resolved, ${repaired_count:-0} auto-repaired)"
     fi
@@ -850,7 +873,15 @@ run_sweep() {
     # shape ("faz quanto tempo?" vs "ainda existe?" are different
     # questions; same family here: "resolved something?" vs "repaired
     # something?" must both independently make this a non-trivial sweep).
-    if [ "$resolved_count" -gt 0 ] || [ "${repaired_count:-0}" -gt 0 ]; then
+    # A totally-blind sweep (stores_read==0) gets its own exit code (2),
+    # distinct from both "ran clean" (0) and "ran, something changed" (1) —
+    # ga-qpfza's own acceptance criterion — checked first since it overrides
+    # the resolved/repaired signal (which can't fire on a blind sweep anyway,
+    # as _pmrw_resolve_tracked_state still ran against a full flagged_ids
+    # set of zero either way).
+    if [ "$stores_read" -eq 0 ]; then
+      return 2
+    elif [ "$resolved_count" -gt 0 ] || [ "${repaired_count:-0}" -gt 0 ]; then
       return 1
     else
       return 0
@@ -883,7 +914,16 @@ run_sweep() {
   done
 
   if [ "${new_count:-0}" -eq 0 ] && [ "${resolved_count:-0}" -eq 0 ]; then
-    log "OK: all ${total_flagged} flagged bead(s) already alerted within cooldown (${PMRW_ALERT_COOLDOWN_S}s) — no new notification"
+    # ga-qpfza: same bare-"OK:" collapse as the empty-flagged branch above,
+    # one branch over — total_flagged only reflects stores that were
+    # actually read this sweep, so an unread store's own candidates are
+    # silently absent from it. stores_read==0 can't reach this branch
+    # (flagged_tsv would be empty), so only the partial tier applies here.
+    if [ "$stores_read" -lt "$stores_total" ]; then
+      log "PARTIAL: ${stores_read}/${stores_total} stores lidas; ${total_flagged} flagged bead(s) (from stores read) already alerted within cooldown — coverage incomplete, unread stores may hold more"
+    else
+      log "OK: all ${total_flagged} flagged bead(s) already alerted within cooldown (${PMRW_ALERT_COOLDOWN_S}s) — no new notification"
+    fi
     if [ "${PMRW_DRY_RUN:-0}" != "1" ]; then
       mkdir -p "$PMRW_STATE_DIR" 2>/dev/null || true
       printf '%s' "$state" > "$STATE_FILE" 2>/dev/null || true
@@ -1945,6 +1985,63 @@ CRASHPY
   [ ! -s "$C46" ] && ok "scenario 46: no comment posted" || bad "scenario 46: comment posted on an assigned bead"
   [ ! -s "$N46" ] && ok "scenario 46: no notify fired" || bad "scenario 46: notify fired on an assigned bead"
 
+  # ── Scenario 47 (ga-qpfza): ALL stores unreadable → the reported incident.
+  # Real case (2026-08-08, Dolt mid-restart): 7/7 stores failed to read and
+  # the sweep still logged "OK: 0 armed-but-unrouted bead(s)" — a blind sweep
+  # printing the exact same verdict as a genuinely clean one. This is the
+  # bead's own mandatory acceptance test: confirmed RED against the pre-fix
+  # source (bare "OK: 0" present, return 0) before this scenario was added
+  # to the fixed file; GREEN here. ─────────────────────────────────────────
+  echo "Scenario 47 (ga-qpfza): ALL stores fail to read → UNKNOWN verdict (never bare OK), exit 2"
+  reset_stores
+  echo '__BD_FAIL__' > "$TMP/fixtures/store-a.json"
+  echo '__BD_FAIL__' > "$TMP/fixtures/store-b.json"
+  : > "$LOG"
+  N47="$TMP/notif47"; M47="$TMP/mail47"; C47="$TMP/comm47"; : > "$N47"; : > "$M47"; : > "$C47"
+  PMRW_TEST_NOTIFIED="$N47" PMRW_TEST_MAILED="$M47" PMRW_TEST_COMMENTS_LOG="$C47" run_sweep
+  rc=$?
+  [ "$rc" -eq 2 ] && ok "scenario 47: totally blind sweep returns 2 (distinct from both 'ran clean' and 'ran, something changed')" || bad "scenario 47 (ga-qpfza REGRESSION): expected return 2 for a fully-blind sweep, got $rc"
+  grep -q "UNKNOWN: sweep cego (0/2 stores" "$LOG" 2>/dev/null && ok "scenario 47: UNKNOWN verdict logged with 0/2 coverage" || bad "scenario 47 (ga-qpfza REGRESSION): no UNKNOWN verdict logged"
+  grep -q "OK: 0 armed-but-unrouted" "$LOG" 2>/dev/null && bad "scenario 47 (ga-qpfza REGRESSION — THE ORIGINAL BUG): a fully-blind sweep printed a bare 'OK: 0' line, the exact false all-clear this bead reports" || ok "scenario 47: no bare 'OK: 0' line printed while blind"
+  [ ! -s "$C47" ] && ok "scenario 47: no comment posted (nothing to report on)" || bad "scenario 47: comment posted despite total blindness"
+  [ ! -s "$N47" ] && ok "scenario 47: no notify fired" || bad "scenario 47: notify fired despite total blindness"
+
+  # ── Scenario 48 (ga-qpfza): PARTIAL coverage (1 of 2 stores read), zero
+  # findings among the readable ones → must say PARTIAL, never bare OK —
+  # "found nothing in what I could see" is not the same claim as "found
+  # nothing" when part of the city was never even checked. ─────────────────
+  echo "Scenario 48 (ga-qpfza): partial coverage (1/2 stores read), 0 findings among readable → PARTIAL verdict, never bare OK"
+  reset_stores
+  echo '__BD_FAIL__' > "$TMP/fixtures/store-a.json"
+  echo '[]' > "$TMP/fixtures/store-b.json"
+  : > "$LOG"
+  N48="$TMP/notif48"; M48="$TMP/mail48"; C48="$TMP/comm48"; : > "$N48"; : > "$M48"; : > "$C48"
+  PMRW_TEST_NOTIFIED="$N48" PMRW_TEST_MAILED="$M48" PMRW_TEST_COMMENTS_LOG="$C48" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 48: partial-coverage zero-finding sweep still returns 0 (only total blindness gets the distinct code)" || bad "scenario 48: expected return 0, got $rc"
+  grep -q "PARTIAL: 1/2 stores lidas" "$LOG" 2>/dev/null && ok "scenario 48: PARTIAL verdict logged with 1/2 coverage" || bad "scenario 48 (ga-qpfza REGRESSION): no PARTIAL verdict logged"
+  grep -q "OK: 0 armed-but-unrouted" "$LOG" 2>/dev/null && bad "scenario 48 (ga-qpfza REGRESSION): partial-coverage sweep printed a bare 'OK: 0' line" || ok "scenario 48: no bare 'OK: 0' line printed under partial coverage"
+
+  # ── Scenario 49 (ga-qpfza): the SAME bare-OK collapse one branch over — a
+  # bead already alerted+cooling-down, but THIS sweep only has partial
+  # coverage. total_flagged only reflects stores actually read, so "OK: all
+  # N already alerted" would silently claim full coverage it doesn't have. ──
+  echo "Scenario 49 (ga-qpfza): flagged bead already alerted, but THIS sweep has partial coverage → PARTIAL, never bare 'OK: all'"
+  reset_stores
+  printf '[%s]' "$(mk ga-49 open 'ctx:ready,exec:auto' "$OLD_TS")" > "$TMP/fixtures/store-a.json"
+  echo '[]' > "$TMP/fixtures/store-b.json"
+  N49a="$TMP/notif49a"; M49a="$TMP/mail49a"; C49a="$TMP/comm49a"; : > "$N49a"; : > "$M49a"; : > "$C49a"
+  PMRW_TEST_NOTIFIED="$N49a" PMRW_TEST_MAILED="$M49a" PMRW_TEST_COMMENTS_LOG="$C49a" run_sweep >/dev/null
+  # First sweep: full coverage, real finding — establishes the baseline alert (not under test).
+  echo '__BD_FAIL__' > "$TMP/fixtures/store-b.json"
+  : > "$LOG"
+  N49b="$TMP/notif49b"; M49b="$TMP/mail49b"; C49b="$TMP/comm49b"; : > "$N49b"; : > "$M49b"; : > "$C49b"
+  PMRW_TEST_NOTIFIED="$N49b" PMRW_TEST_MAILED="$M49b" PMRW_TEST_COMMENTS_LOG="$C49b" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 49: still-cooling-down alert with partial coverage returns 1 (unchanged)" || bad "scenario 49: expected return 1, got $rc"
+  grep -q "PARTIAL: 1/2 stores lidas" "$LOG" 2>/dev/null && ok "scenario 49: PARTIAL verdict logged on the already-alerted path under partial coverage" || bad "scenario 49 (ga-qpfza REGRESSION): no PARTIAL verdict on the already-alerted path"
+  grep -q "OK: all" "$LOG" 2>/dev/null && bad "scenario 49 (ga-qpfza REGRESSION): partial-coverage already-alerted sweep printed bare 'OK: all ... already alerted'" || ok "scenario 49: no bare 'OK: all ...' line printed under partial coverage"
+
   echo ""
   echo "pilot-missing-route-watchdog selftest: PASS=$PASS FAIL=$FAIL"
   [ "$FAIL" -eq 0 ] && exit 0 || exit 1
@@ -2125,4 +2222,15 @@ if [ "$PMRW_LOCK_ENABLED" = "1" ]; then
   fi
 fi
 
-run_sweep; exit 0  # daemon health = "ran OK"; findings (if any) already sent via comment+notify+mail
+run_sweep; _pmrw_sweep_rc=$?
+# ga-qpfza: findings (if any) are still communicated via comment+notify+mail,
+# never via this process's own exit code — that design is unchanged (see the
+# comment this replaces). The ONE exception is a totally-blind sweep
+# (stores_read==0, run_sweep return 2): that isn't "ran OK and found
+# something", it's "ran but could not do its job at all", worth surfacing to
+# anything watching this daemon's exit status (e.g. `launchctl list`), not
+# just the log. Every other outcome (0 or 1) still exits 0, same as before.
+if [ "$_pmrw_sweep_rc" = "2" ]; then
+  exit 2  # sweep cego — distinct from "ran OK", see run_sweep's UNKNOWN verdict in the log
+fi
+exit 0  # daemon health = "ran OK"; findings (if any) already sent via comment+notify+mail
