@@ -875,10 +875,14 @@ run_sweep() {
     # something?" must both independently make this a non-trivial sweep).
     # A totally-blind sweep (stores_read==0) gets its own exit code (2),
     # distinct from both "ran clean" (0) and "ran, something changed" (1) —
-    # ga-qpfza's own acceptance criterion — checked first since it overrides
-    # the resolved/repaired signal (which can't fire on a blind sweep anyway,
-    # as _pmrw_resolve_tracked_state still ran against a full flagged_ids
-    # set of zero either way).
+    # ga-qpfza's own acceptance criterion — checked FIRST, ahead of the
+    # resolved/repaired signal. That signal is NOT guaranteed zero here:
+    # _pmrw_resolve_tracked_state's per-id recheck (_bead_recheck_status) is
+    # an independent targeted query per previously-tracked bead, not gated
+    # on the bulk per-store reads this counts, so resolved_count could in
+    # principle be nonzero even on a blind sweep — "the sweep couldn't read
+    # anything this round" is still the more operationally significant fact
+    # and must win regardless of what one side-channel recheck turned up.
     if [ "$stores_read" -eq 0 ]; then
       return 2
     elif [ "$resolved_count" -gt 0 ] || [ "${repaired_count:-0}" -gt 0 ]; then
