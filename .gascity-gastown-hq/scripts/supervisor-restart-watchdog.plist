@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.gascity.supervisor-restart-watchdog</string>
+
+  <!-- Detection-only restart counter (ga-b0gltl): com.gascity.supervisor dies
+       periodically and launchd's KeepAlive silently respawns it, so the
+       crash never surfaces as a visible failure — only as an unattributed
+       dispatch gap. This job takes ONE sample per invocation (`launchctl
+       print`), diffs the `runs` counter against the previous sample, and
+       appends one JSONL record to .gc/logs/supervisor-restart-watchdog.jsonl
+       with the delta and, when there is one, a reason (non-zero exit code,
+       or an OS_REASON_*/codesign match in the bytes of supervisor.log
+       appended since the previous sample). It never restarts, reconfigures,
+       or otherwise touches the supervisor — see the script header and
+       ga-b0gltl for why that is explicitly out of scope until this counter
+       tells us the real frequency. Single-instance-locked (ga-y0g5x
+       pattern): a measured run takes ~0.08s, so StartInterval=900 leaves a
+       huge margin and this will never stack concurrent instances. -->
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/supervisor-restart-watchdog.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><true/>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/supervisor-restart-watchdog-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/supervisor-restart-watchdog-launchd.err</string>
+
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key><string>/Users/athos</string>
+  </dict>
+</dict></plist>
