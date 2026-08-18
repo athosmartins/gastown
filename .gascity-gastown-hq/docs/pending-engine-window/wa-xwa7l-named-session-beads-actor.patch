@@ -1,0 +1,143 @@
+diff --git a/cmd/gc/build_desired_state.go b/cmd/gc/build_desired_state.go
+index 36184fc46..806938341 100644
+--- a/cmd/gc/build_desired_state.go
++++ b/cmd/gc/build_desired_state.go
+@@ -729,6 +729,9 @@ func buildDesiredStateWithSessionBeads(
+ 		tp.Env["GC_ALIAS"] = identity
+ 		tp.Env["GC_AGENT"] = identity
+ 		tp.Env["GC_SESSION_ORIGIN"] = "named"
++		// bd's actor-resolution chain has no other way to learn this named
++		// session's identity — see setTemplateEnvIdentity (wa-xwa7l).
++		tp.Env["BEADS_ACTOR"] = identity
+ 		// When a canonical bead exists, use ITS session_name as the
+ 		// desiredState key so syncSessionBeads finds it in bySessionName
+ 		// and takes the UPDATE path. Without this, resolveSessionName
+@@ -2465,6 +2468,12 @@ func setTemplateEnvIdentity(tp *TemplateParams, identity string) {
+ 	}
+ 	tp.Env["GC_AGENT"] = identity
+ 	tp.Env["GC_ALIAS"] = identity
++	// bd's own actor-resolution chain (--actor flag, then $BEADS_ACTOR, then
++	// git config user.name, then $USER) has no other way to learn this
++	// session's identity — without this, a session whose env is stamped only
++	// through this helper falls through to whatever BEADS_ACTOR the tmux
++	// server's ambient environment happens to carry (wa-xwa7l).
++	tp.Env["BEADS_ACTOR"] = identity
+ 	tp.EnvIdentityStamped = true
+ }
+ 
+diff --git a/cmd/gc/build_desired_state_beads_actor_env_test.go b/cmd/gc/build_desired_state_beads_actor_env_test.go
+new file mode 100644
+index 000000000..5597378ab
+--- /dev/null
++++ b/cmd/gc/build_desired_state_beads_actor_env_test.go
+@@ -0,0 +1,77 @@
++package main
++
++import (
++	"io"
++	"testing"
++
++	"github.com/gastownhall/gascity/internal/beads"
++	"github.com/gastownhall/gascity/internal/config"
++)
++
++// TestSetTemplateEnvIdentityIncludesBeadsActor guards against wa-xwa7l: a
++// session whose env is stamped through this helper (pool desired-state
++// materialization at line ~649, the dependency-floor path at ~1975, pool
++// alias restamping at ~2292) must carry an explicit BEADS_ACTOR alongside
++// GC_AGENT/GC_ALIAS. Without it, `bd` (run interactively inside that
++// session) falls back through its own actor-resolution chain — BEADS_ACTOR
++// env, then git config user.name, then $USER — none of which know this
++// session's identity, and if the tmux server's own ambient environment
++// happens to carry BEADS_ACTOR=controller (set deliberately by `gc
++// supervisor run` on itself via defaultSupervisorBeadsActor in
++// cmd_supervisor_lifecycle.go, for its own hook-subprocess attribution),
++// every bd write from the affected session is silently misattributed to
++// actor "controller" instead of the real session identity.
++func TestSetTemplateEnvIdentityIncludesBeadsActor(t *testing.T) {
++	tp := &TemplateParams{}
++	setTemplateEnvIdentity(tp, "batista-wa-gawispekvmub")
++
++	if got, want := tp.Env["GC_AGENT"], "batista-wa-gawispekvmub"; got != want {
++		t.Fatalf("GC_AGENT = %q, want %q", got, want)
++	}
++	if got, want := tp.Env["GC_ALIAS"], "batista-wa-gawispekvmub"; got != want {
++		t.Fatalf("GC_ALIAS = %q, want %q", got, want)
++	}
++	if got, want := tp.Env["BEADS_ACTOR"], "batista-wa-gawispekvmub"; got != want {
++		t.Fatalf("BEADS_ACTOR = %q, want %q (setTemplateEnvIdentity must stamp BEADS_ACTOR alongside GC_AGENT/GC_ALIAS, or bd's actor-resolution chain has no way to learn the session identity)", got, want)
++	}
++}
++
++func TestSetTemplateEnvIdentityNoopOnEmptyIdentity(t *testing.T) {
++	tp := &TemplateParams{}
++	setTemplateEnvIdentity(tp, "")
++
++	if tp.Env != nil {
++		t.Fatalf("Env = %#v, want nil (empty identity must be a no-op, matching the existing GC_AGENT/GC_ALIAS guard)", tp.Env)
++	}
++}
++
++// TestResolvePreservedConfiguredNamedSessionTemplateIncludesBeadsActor covers
++// the sibling half of wa-xwa7l: a PRESERVED (already-running, reconciled in
++// place) configured named session — e.g. a persistent crew identity like
++// batista-wa — must also get BEADS_ACTOR stamped on its resolved template,
++// or a session that has been reconciled through this path (rather than
++// freshly created) never has it set at all.
++func TestResolvePreservedConfiguredNamedSessionTemplateIncludesBeadsActor(t *testing.T) {
++	env := newReconcilerTestEnv()
++	env.cfg = &config.City{
++		Workspace:     config.Workspace{Name: "test-city"},
++		Agents:        []config.Agent{{Name: "worker", StartCommand: "true", MaxActiveSessions: intPtr(2)}},
++		NamedSessions: []config.NamedSession{{Template: "worker", Mode: "on_demand"}},
++	}
++	sessionName := config.NamedSessionRuntimeName(env.cfg.Workspace.Name, env.cfg.Workspace, "worker")
++	session := env.createSessionBead(sessionName, "worker")
++	env.markSessionActive(&session)
++	env.setSessionMetadata(&session, map[string]string{
++		namedSessionMetadataKey:      "true",
++		namedSessionIdentityMetadata: "worker",
++		namedSessionModeMetadata:     "on_demand",
++	})
++
++	tp, err := resolvePreservedConfiguredNamedSessionTemplate(".", env.cfg.Workspace.Name, env.cfg, env.sp, env.store, []beads.Bead{session}, session, env.clk, io.Discard)
++	if err != nil {
++		t.Fatalf("resolve preserved named session: %v", err)
++	}
++	if got, want := tp.Env["BEADS_ACTOR"], "worker"; got != want {
++		t.Errorf("Env[BEADS_ACTOR] = %q, want %q (bd's actor-resolution chain has no other source for this named session's identity)", got, want)
++	}
++}
+diff --git a/cmd/gc/build_desired_state_test.go b/cmd/gc/build_desired_state_test.go
+index d67219e7b..f52251557 100644
+--- a/cmd/gc/build_desired_state_test.go
++++ b/cmd/gc/build_desired_state_test.go
+@@ -5341,6 +5341,14 @@ func TestBuildDesiredState_OnDemandNamedSession_DefaultRoutedTemplateMaterialize
+ 		}
+ 		if tp.ConfiguredNamedIdentity == "primary" {
+ 			foundNamed = true
++			// wa-xwa7l: a materialized named session must carry an explicit
++			// BEADS_ACTOR matching its identity, or bd's actor-resolution
++			// chain (no other source of this identity) falls through to
++			// whatever the tmux server's ambient environment happens to
++			// carry once the session is spawned.
++			if got, want := tp.Env["BEADS_ACTOR"], "primary"; got != want {
++				t.Errorf("named session Env[BEADS_ACTOR] = %q, want %q", got, want)
++			}
+ 			continue
+ 		}
+ 		t.Fatalf("routed singleton template created generic worker session: %+v", tp)
+diff --git a/cmd/gc/session_reconciler.go b/cmd/gc/session_reconciler.go
+index 4c70c41fa..9121cb05b 100644
+--- a/cmd/gc/session_reconciler.go
++++ b/cmd/gc/session_reconciler.go
+@@ -2713,6 +2713,9 @@ func resolvePreservedConfiguredNamedSessionTemplate(
+ 	tp.Env["GC_ALIAS"] = identity
+ 	tp.Env["GC_AGENT"] = identity
+ 	tp.Env["GC_SESSION_ORIGIN"] = "named"
++	// bd's actor-resolution chain has no other way to learn this named
++	// session's identity — see setTemplateEnvIdentity (wa-xwa7l).
++	tp.Env["BEADS_ACTOR"] = identity
+ 	installAgentSideEffects(bp, spec.Agent, tp, stderr)
+ 	return tp, nil
+ }
