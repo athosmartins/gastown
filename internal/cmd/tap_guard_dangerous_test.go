@@ -63,6 +63,17 @@ func TestMatchesDangerousRmRf(t *testing.T) {
 		{"rm -rf /*", "rm -rf /*", true},
 		{"rm -rf / with sudo", "sudo rm -rf /", true},
 
+		// gt-h08r1: recursive+force split across separate tokens must block
+		// just like the combined-flag form — this is the exact matrix that
+		// bypassed the guard before (-r -f / and -f -r / both passed with
+		// exit 0, silently deleting the target the guard promises to stop).
+		{"rm -r -f / (separate tokens)", "rm -r -f /", true},
+		{"rm -f -r / (separate tokens, reversed)", "rm -f -r /", true},
+		{"rm -fr / (combined, reversed order)", "rm -fr /", true},
+		{"rm --recursive --force /", "rm --recursive --force /", true},
+		{"rm -r --force /", "rm -r --force /", true},
+		{"rm --recursive -f /", "rm --recursive -f /", true},
+
 		// Should allow (normal cleanup commands)
 		{"rm -rf ./build/", "rm -rf ./build/", false},
 		{"rm -rf node_modules/", "rm -rf node_modules/", false},
@@ -70,6 +81,8 @@ func TestMatchesDangerousRmRf(t *testing.T) {
 		{"rm -rf relative dir", "rm -rf build", false},
 		{"rm single file", "rm foo.txt", false},
 		{"rm -r no force", "rm -r /", false},
+		{"rm -f no recursive", "rm -f /", false},
+		{"rm -r -f relative dir (not root)", "rm -r -f ./build/", false},
 		{"no rm at all", "echo hello", false},
 	}
 	for _, tt := range tests {

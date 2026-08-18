@@ -157,15 +157,26 @@ func matchesDangerousRmRf(command string) string {
 	}
 	fields := strings.Fields(command)
 	hasRm := false
-	hasRecursiveForce := false
+	hasRecursive := false
+	hasForce := false
 	for _, f := range fields {
 		if f == "rm" {
 			hasRm = true
 		}
-		if strings.HasPrefix(f, "-") && strings.Contains(f, "r") && strings.Contains(f, "f") {
-			hasRecursiveForce = true
+		// gt-h08r1: recursive and force are accumulated INDEPENDENTLY across
+		// tokens now, not required in the same token. The old single-token
+		// check (`Contains(f,"r") && Contains(f,"f")`) matched "-rf"/"-fr"
+		// but never "-r -f"/"-f -r" — two separate flags, same effect, that
+		// bypassed the guard entirely. Short-flag clusters (anything "-x..."
+		// that isn't "--long") are matched by letter, same as the original
+		// heuristic; long forms are matched by exact name.
+		if f == "--recursive" || (strings.HasPrefix(f, "-") && !strings.HasPrefix(f, "--") && strings.Contains(f, "r")) {
+			hasRecursive = true
 		}
-		if hasRm && hasRecursiveForce && (f == "/" || f == "/*") {
+		if f == "--force" || (strings.HasPrefix(f, "-") && !strings.HasPrefix(f, "--") && strings.Contains(f, "f")) {
+			hasForce = true
+		}
+		if hasRm && hasRecursive && hasForce && (f == "/" || f == "/*") {
 			return "filesystem destruction (rm -rf /)"
 		}
 	}
