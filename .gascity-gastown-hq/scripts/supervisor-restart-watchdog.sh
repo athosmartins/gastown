@@ -203,13 +203,21 @@ if [ "$EXIT_CODE_JSON" != "null" ] && [ "$EXIT_CODE_JSON" != "0" ]; then
   REASON_EXIT_NONZERO=true
 fi
 
+# LOG_CHECKED distinguishes "grepped the log window, found 0 matches" from
+# "never attempted the grep this sample" (log file missing/rotated, no valid
+# prior offset yet, or no restart to explain) — both would otherwise report
+# reason_log_matches=0, making "confirmed never codesign" indistinguishable
+# from "we have no idea, the check never ran" over the 7-day observation
+# window this bead's acceptance criteria depends on.
 LOG_SIZE=0
 CODESIGN_MATCHES=0
+LOG_CHECKED=false
 if [ -f "$SUPERVISOR_LOG" ]; then
   LOG_SIZE="$(stat -f %z "$SUPERVISOR_LOG" 2>/dev/null || stat -c %s "$SUPERVISOR_LOG" 2>/dev/null || echo 0)"
   if [ "$DELTA" -gt 0 ] && [ "$HAVE_PREV_LOG_OFFSET" = "true" ] && [ "$LOG_SIZE" -ge "$PREV_LOG_OFFSET" ]; then
     CODESIGN_MATCHES="$(tail -c "+$((PREV_LOG_OFFSET + 1))" "$SUPERVISOR_LOG" 2>/dev/null | grep -Eic 'OS_REASON|codesign' || true)"
     case "$CODESIGN_MATCHES" in ''|*[!0-9]*) CODESIGN_MATCHES=0 ;; esac
+    LOG_CHECKED=true
   fi
 fi
 
@@ -220,8 +228,8 @@ fi
 # either an integer, a bash-literal true/false, or a timestamp WE generated —
 # none can contain a quote/backslash/newline, so no escaping is needed and no
 # external process sits on the write's atomicity.
-RECORD=$(printf '{"ts":"%s","runs":%s,"last_exit_code":%s,"delta_since_last":%s,"counter_reset":%s,"reason_exit_nonzero":%s,"reason_log_matches":%s,"log_offset":%s}' \
-  "$SAMPLE_TS" "$RUNS" "$EXIT_CODE_JSON" "$DELTA" "$COUNTER_RESET" "$REASON_EXIT_NONZERO" "$CODESIGN_MATCHES" "$LOG_SIZE")
+RECORD=$(printf '{"ts":"%s","runs":%s,"last_exit_code":%s,"delta_since_last":%s,"counter_reset":%s,"reason_exit_nonzero":%s,"reason_log_matches":%s,"log_checked":%s,"log_offset":%s}' \
+  "$SAMPLE_TS" "$RUNS" "$EXIT_CODE_JSON" "$DELTA" "$COUNTER_RESET" "$REASON_EXIT_NONZERO" "$CODESIGN_MATCHES" "$LOG_CHECKED" "$LOG_SIZE")
 printf '%s\n' "$RECORD" >> "$LEDGER_FILE"
 
 # ---- persist state (atomic replace via temp+mv; jq is fine here since the

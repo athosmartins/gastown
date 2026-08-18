@@ -136,6 +136,7 @@ REC=$(last_record "$CITY_F")
 MATCHES=$(field reason_log_matches "$REC")
 [ "$MATCHES" -ge 1 ] 2>/dev/null && ok "F: OS_REASON_CODESIGNING appended since last offset -> reason_log_matches=$MATCHES" \
   || bad "F: expected reason_log_matches>=1: $REC"
+[ "$(field log_checked "$REC")" = "true" ] && ok "F: log_checked=true (the grep actually ran)" || bad "F: $REC"
 
 # G. Same log content, but delta=0 (no restart happened) -> must NOT
 #    attribute a reason to a restart that never occurred.
@@ -147,6 +148,24 @@ REC=$(last_record "$CITY_G")
 [ "$(field delta_since_last "$REC")" = "0" ] && [ "$(field reason_log_matches "$REC")" = "0" ] \
   && ok "G: matching text present but delta=0 -> reason_log_matches stays 0 (no restart, no reason)" \
   || bad "G: reason must not attach to a non-event: $REC"
+[ "$(field log_checked "$REC")" = "false" ] \
+  && ok "G: log_checked=false (delta=0, the grep never ran — distinct from '0 confirmed')" \
+  || bad "G: $REC"
+
+# G2. A real restart (delta>0) but the log file is MISSING entirely (rotated
+#     away, path broken) -> reason_log_matches=0 same as a genuine
+#     zero-match, but log_checked=false must say "we have no idea" instead
+#     of silently asserting "confirmed, not codesign". This is the exact
+#     absent-vs-zero collapse the mandatory gate-done self-audit exists to
+#     catch — reason_log_matches alone cannot tell these two states apart.
+CITY_G2="$SCRATCH_ROOT/city-g2"; LOG_G2="$SCRATCH_ROOT/supervisor-g2-MISSING.log"
+run_watchdog "$CITY_G2" "$LOG_G2" env FAKE_LAUNCHCTL_RUNS=1 FAKE_LAUNCHCTL_EXIT_NEVER=1
+run_watchdog "$CITY_G2" "$LOG_G2" env FAKE_LAUNCHCTL_RUNS=2 FAKE_LAUNCHCTL_EXIT_NEVER=1
+REC=$(last_record "$CITY_G2")
+[ "$(field delta_since_last "$REC")" = "1" ] && [ "$(field reason_log_matches "$REC")" = "0" ] \
+  && [ "$(field log_checked "$REC")" = "false" ] \
+  && ok "G2: real restart, log file missing -> reason_log_matches=0 but log_checked=false (not conflated with a confirmed zero)" \
+  || bad "G2: $REC"
 
 echo "== ga-b0gltl: unreadable/empty launchctl output is skipped, never crashes, never fabricates a record =="
 
