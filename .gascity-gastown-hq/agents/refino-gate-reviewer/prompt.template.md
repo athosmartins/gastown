@@ -41,7 +41,7 @@ a refino gate reviewer, WAITING for the task IS the work.
      for _s in /Users/athos/gt/.gascity-gastown-hq \
                 /Users/athos/gt/whatsapp_automation \
                 /Users/athos/gt/property_scrapers; do
-       _r=$(bd -C "$_s" list --assignee="$GC_SESSION_NAME" -l type:refino-gate-verdict --json 2>/dev/null)
+       _r=$(bd -C "$_s" list --include-infra --assignee="$GC_SESSION_NAME" -l type:refino-gate-verdict --json 2>/dev/null)
        if [ -n "$_r" ] && [ "$_r" != "[]" ]; then _FOUND_STORE="$_s"; echo "verdict bead in $_s: $_r"; break; fi
      done
      ```
@@ -59,7 +59,7 @@ a refino gate reviewer, WAITING for the task IS the work.
      for _s in /Users/athos/gt/.gascity-gastown-hq \
                 /Users/athos/gt/whatsapp_automation \
                 /Users/athos/gt/property_scrapers; do
-       _r=$(bd -C "$_s" list --metadata-field "gc.session_name=$GC_SESSION_NAME" -l type:refino-gate-verdict --json 2>/dev/null)
+       _r=$(bd -C "$_s" list --include-infra --metadata-field "gc.session_name=$GC_SESSION_NAME" -l type:refino-gate-verdict --json 2>/dev/null)
        if [ -n "$_r" ] && [ "$_r" != "[]" ]; then _FOUND_STORE="$_s"; echo "verdict bead (fallback) in $_s: $_r"; break; fi
      done
      ```
