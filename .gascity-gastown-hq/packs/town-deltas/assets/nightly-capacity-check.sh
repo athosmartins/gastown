@@ -44,7 +44,7 @@ CITY="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
 LOG="${NCC_LOG:-${CITY}/.gc/logs/nightly-capacity-check.log}"
 TREND_LOG="${NCC_TREND_LOG:-${HOME}/.gastown/logs/nightly-capacity-check-trend.log}"
 
-JETSAM_REPORTS_DIR="${NCC_JETSAM_REPORTS_DIR:-${HOME}/Library/Logs/DiagnosticReports}"
+JETSAM_REPORTS_DIR="${NCC_JETSAM_REPORTS_DIR:-/Library/Logs/DiagnosticReports}"
 JETSAM_LOOKBACK_MIN="${NCC_JETSAM_LOOKBACK_MIN:-1440}"   # 24h
 
 # Swap floor: a persistent-across-days reading at/above this counts toward the
@@ -203,6 +203,9 @@ print(f"Ultimos {len(lines)} dias: swap pico {peak_swap}MB, jetsam total {total_
 if [ "${1:-}" = "--selftest" ]; then
   PASS=0; FAIL=0; ok(){ PASS=$((PASS+1)); echo "  ✓ $1"; }; bad(){ FAIL=$((FAIL+1)); echo "  ✗ $1"; }
 
+  _ST_ROOT="$(mktemp -d /tmp/ncc-selftest.XXXXXX)"
+  trap 'rm -rf "${_ST_ROOT}"' EXIT
+
   echo "S0: this script NEVER calls reboot/shutdown as a command — static guard"
   # A line is SAFE iff every occurrence of reboot/shutdown on it is either (a)
   # after a '#' (a comment) or (b) inside a quoted string — single OR double
@@ -235,10 +238,49 @@ print("\n".join(bad))
   [ "$(NCC_TEST_SWAP_MB=999 read_swap_used_mb)" = "999" ] && ok "read_swap_used_mb override" || bad "override failed"
   [ "$(NCC_TEST_JETSAM_COUNT=3 read_jetsam_count)" = "3" ] && ok "read_jetsam_count override" || bad "override failed"
   [ "$(NCC_TEST_DISK_FREE_GB=50 read_disk_free_gb)" = "50" ] && ok "read_disk_free_gb override" || bad "override failed"
+  # Regression coverage for the gate-rejected bug (ga-u40uo): JETSAM_REPORTS_DIR
+  # defaulted to a $HOME-scoped path while the cited source (ram-pressure-
+  # monitor.sh) reads the system-wide path where JetsamEvent files actually
+  # land — making read_jetsam_count() always return 0 in production. Every
+  # OTHER jetsam test above uses NCC_TEST_JETSAM_COUNT, which bypasses the
+  # real find-based lookup entirely and never exercised this. Two checks:
+  # (1) the DEFAULT value itself is the system-wide path, matching the cited
+  # source exactly (static, since the default is a module-level assignment
+  # computed once at parse time -- re-sourcing to test env-var absence isn't
+  # worth the complexity for a one-line literal), and (2) the real find-based
+  # lookup mechanism itself behaves correctly when pointed at a controlled dir.
+  #
+  # CAUGHT WHILE WRITING THIS: NCC_JETSAM_REPORTS_DIR=... read_jetsam_count
+  # does NOT work as an override at call time -- read_jetsam_count() reads
+  # $JETSAM_REPORTS_DIR (the module-level var, resolved ONCE at parse time
+  # from NCC_JETSAM_REPORTS_DIR), not $NCC_JETSAM_REPORTS_DIR itself. Setting
+  # the NCC_-prefixed var on the call has no effect on the already-computed
+  # module var -- the exact same class of bug S6's own comment below already
+  # documents for LOG/TREND_LOG ("export here can't retroactively change
+  # them"). First version of this test silently read the REAL system
+  # directory instead of the controlled fixture and only "passed" by
+  # coincidence (production happened to have exactly 2 real jetsam events in
+  # the lookback window right now). Fixed by reassigning the already-parsed
+  # JETSAM_REPORTS_DIR directly, the same pattern S6 already uses.
+  grep -q '^JETSAM_REPORTS_DIR="\${NCC_JETSAM_REPORTS_DIR:-/Library/Logs/DiagnosticReports}"' "${BASH_SOURCE[0]}" \
+    && ok "JETSAM_REPORTS_DIR default is the system-wide path (matches ram-pressure-monitor.sh)" \
+    || bad "JETSAM_REPORTS_DIR default is wrong or HOME-scoped -- read_jetsam_count() would always see 0 in production"
+  _ST_JETSAM_DIR="${_ST_ROOT}/diag-reports"
+  mkdir -p "${_ST_JETSAM_DIR}"
+  touch "${_ST_JETSAM_DIR}/JetsamEvent-2026-08-18-120000.ips" "${_ST_JETSAM_DIR}/JetsamEvent-2026-08-18-130000.ips"
+  touch "${_ST_JETSAM_DIR}/not-a-jetsam-file.ips"
+  _ST_JETSAM_DIR_SAVED="${JETSAM_REPORTS_DIR}"
+  JETSAM_REPORTS_DIR="${_ST_JETSAM_DIR}"
+  [ "$(read_jetsam_count)" = "2" ] \
+    && ok "real find-based lookup counts JetsamEvent files (2), ignores non-matching file" \
+    || bad "find-based jetsam count wrong"
+  JETSAM_REPORTS_DIR="${_ST_ROOT}/nonexistent-diag-dir"
+  [ "$(read_jetsam_count)" = "0" ] \
+    && ok "missing directory -> 0 via find's own 2>/dev/null, not an error" \
+    || bad "missing dir should give 0, not error/crash"
+  JETSAM_REPORTS_DIR="${_ST_JETSAM_DIR_SAVED}"
 
   echo "S2: _swap_persisted_floor — needs BOTH today AND yesterday at/above floor"
-  _ST_ROOT="$(mktemp -d /tmp/ncc-selftest.XXXXXX)"
-  trap 'rm -rf "${_ST_ROOT}"' EXIT
   _ST_TREND="${_ST_ROOT}/trend.log"
   _swap_persisted_floor 3000 "${_ST_TREND}" 2048 && bad "no trend log at all should fail-closed" || ok "missing trend log -> not persisted (fail-closed)"
   printf '2020-01-01 free_pct=50 swap_mb=1000 jetsam=0 disk_free_gb=100\n' > "${_ST_TREND}"
