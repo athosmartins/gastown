@@ -1052,6 +1052,40 @@ case "$(_fc "$HELD_ACCUM_EXP")" in
   *) bad "ga-4aree: all-expired accumulated hold incorrectly skipped: $(_fc "$HELD_ACCUM_EXP")" ;;
 esac
 
+# ── Scenario 3e2e (ga-6pe8d): _held_until_purge_decision — write-side safety ──
+# ga-4aree's fix above is the READER (max-epoch, never .[0]) — already correct.
+# The purge loops that STAMP a new hold (ga-4zqwm mayor-deferred, ga-lfvs6/imp20
+# domain-route-guard) shared a DIFFERENT bug: unconditionally removing every
+# OTHER pilot:held-until stamp, assuming they were all this same mechanism's
+# own earlier self-stamps. Real incident (wa-2lzmz, 18/08): a human/Mayor
+# business hold (48h) shares the same label namespace as these short automatic
+# holds — an unconditional purge would delete the business hold's actual
+# value, not just lose a max() comparison. Pure function, no bd/gc calls.
+echo "Scenario 3e2e (ga-6pe8d): _held_until_purge_decision — never purge a stamp >= the new one"
+_PD_FN="$(sed -n '/^_held_until_purge_decision() {/,/^}$/p' "$DISPATCHER")"
+[ -n "$_PD_FN" ] || bad "ga-6pe8d: could not extract _held_until_purge_decision from $DISPATCHER — function renamed/removed?"
+_pd() { ( eval "$_PD_FN"; _held_until_purge_decision "$1" "$2" ); }
+
+[ "$(_pd 100 200)" = "purge" ] \
+  && ok "ga-6pe8d: stale epoch (100) < new (200) → purge (genuinely older self-stamp)" \
+  || bad "ga-6pe8d: expected purge for 100 vs 200, got $(_pd 100 200)"
+
+[ "$(_pd 300 200)" = "keep-not-older" ] \
+  && ok "ga-6pe8d: stale epoch (300) > new (200) → keep-not-older (could be a longer hold from elsewhere — THE core fix)" \
+  || bad "ga-6pe8d: expected keep-not-older for 300 vs 200 (the wa-2lzmz shape), got $(_pd 300 200)"
+
+[ "$(_pd 200 200)" = "keep-not-older" ] \
+  && ok "ga-6pe8d: stale epoch == new epoch → keep-not-older (the just-added stamp itself must never self-purge)" \
+  || bad "ga-6pe8d: expected keep-not-older for equal epochs, got $(_pd 200 200)"
+
+[ "$(_pd '' 200)" = "keep-unparseable" ] \
+  && ok "ga-6pe8d: empty stale epoch → keep-unparseable (never touch what we can't verify)" \
+  || bad "ga-6pe8d: expected keep-unparseable for empty input, got $(_pd '' 200)"
+
+[ "$(_pd 'garbage' 200)" = "keep-unparseable" ] \
+  && ok "ga-6pe8d: non-numeric stale epoch → keep-unparseable" \
+  || bad "ga-6pe8d: expected keep-unparseable for non-numeric input, got $(_pd 'garbage' 200)"
+
 # ── Scenario 3e3 (ga-iu9m/ga-enfe): graph.v2 workflow steps excluded from candidates ──
 # ga-knfh ("Determine digest time range", a mol-digest-generate step) was dispatched as
 # a code-build story 8x over 5.25h before being reclaimed each time — there is no repo

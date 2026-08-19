@@ -1923,6 +1923,34 @@ PILOT_HOLD_ESCALATE_CAP="${PILOT_HOLD_ESCALATE_CAP:-3}"
 # `mail send mayor` call site in this pack), and logs ESCALATED. Respects
 # DRY_RUN (logs WOULD-* only, no mutation) exactly like every other mutation
 # in this file.
+
+# ga-6pe8d: pure decision for the pilot:held-until purge loops below (ga-4zqwm,
+# ga-lfvs6/imp20) — "keep" or "purge" for one stale stamp given the epoch we're
+# about to stamp. pilot:held-until has TWO logical writers sharing one label
+# namespace: this file's own short/medium automatic holds, and a human/Mayor's
+# deliberate long-duration business hold (Athos's "wait 48h for production
+# stability" gate is a real example — wa-2lzmz, 18/08). Before this fix, both
+# purge loops removed EVERY other held-until stamp unconditionally on the
+# assumption that all prior stamps were this same mechanism's own earlier
+# self-stamps — true most of the time, but not always, and when it was
+# wrong it silently deleted a business hold's actual value, not just raced
+# the max-based reader (bead_state.py's _labels_after_expired_hold and this
+# file's own _filter_candidates already read the MAX of all stamps
+# correctly — ga-4aree/ga-fup3m — so the reader was never the bug; only the
+# writer's purge was). No bd/gc calls — pure string/int logic, trivially
+# testable in isolation.
+_held_until_purge_decision() {
+  local _stale_epoch="$1" _new_epoch="$2"
+  case "$_stale_epoch" in
+    ''|*[!0-9]*) echo "keep-unparseable"; return 0 ;;
+  esac
+  if [ "$_stale_epoch" -ge "$_new_epoch" ]; then
+    echo "keep-not-older"
+  else
+    echo "purge"
+  fi
+}
+
 _pilot_hold_or_escalate() {
   local _phe_db="$1" _phe_id="$2" _phe_slug="$3" _phe_reason="$4" _phe_unblock="$5"
   local _phe_labels="${6:-[]}" _phe_cap="${7:-$PILOT_HOLD_ESCALATE_CAP}"
@@ -5475,8 +5503,20 @@ _mayor_deferred_hold_db() {
     # _filter_candidates treats as skip-forever).
     bd -C "$_db" label add "$_bid" "pilot:held-until:${_hold_until}" -q 2>/dev/null || true
     bd -C "$_db" label add "$_bid" "pilot:held" -q 2>/dev/null || true
+    # ga-6pe8d: see _held_until_purge_decision's own comment — never purge a
+    # stamp that might be a longer hold from elsewhere (e.g. a human/Mayor
+    # business hold).
     for _stale in $(bd -C "$_db" show "$_bid" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[] | select(startswith("pilot:held-until:"))' 2>/dev/null); do
-      [ "$_stale" = "pilot:held-until:${_hold_until}" ] || bd -C "$_db" label remove "$_bid" "$_stale" -q 2>/dev/null || true
+      [ "$_stale" = "pilot:held-until:${_hold_until}" ] && continue
+      _stale_epoch="${_stale#pilot:held-until:}"
+      case "$(_held_until_purge_decision "$_stale_epoch" "$_hold_until")" in
+        keep-unparseable)
+          log "ga-6pe8d: $_bid keeping unparseable $_stale — not purging what we can't verify" ;;
+        keep-not-older)
+          log "ga-6pe8d: $_bid keeping $_stale (>= our own ${_hold_until}) — may be a longer hold from elsewhere, not purging" ;;
+        purge)
+          bd -C "$_db" label remove "$_bid" "$_stale" -q 2>/dev/null || true ;;
+      esac
     done
     log "ga-4zqwm: $_bid stamped pilot:held-until:${_hold_until} then pilot:held (${MAYOR_DEFERRED_HOLD_SECS}s — sling $_sling carries pool:refused:mayor-deferred) — Pilot stops re-dispatching until the hold expires or a human clears it"
     # ga-2n7xw AC4: this hold's OWN log line says "until the hold expires OR A
@@ -7415,10 +7455,24 @@ LIVESEC
                 # don't accumulate unboundedly. Safe order: the fresh held-until + pilot:held are
                 # already present (above), so removing OLD stamps never leaves the
                 # pilot:held-without-until trap even if this loop dies partway.
+                # ga-6pe8d: this is a mere 1h automatic hold — the SHORTEST of the two purge
+                # sites sharing this pattern, so the most likely to run into a much longer
+                # human/Mayor business hold on the same bead. See _held_until_purge_decision's
+                # own comment (real incident this guards: wa-2lzmz, 18/08 — this exact
+                # unconditional purge would have deleted a 48h hold's value outright).
                 for _stale in $(bd -C "$STORY_BEAD_CITY" show "$STORY_ID" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[] | select(startswith("pilot:held-until:"))' 2>/dev/null); do
-                  [ "$_stale" = "pilot:held-until:${_hold_until}" ] || bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "$_stale" -q 2>/dev/null || true
+                  [ "$_stale" = "pilot:held-until:${_hold_until}" ] && continue
+                  _stale_epoch="${_stale#pilot:held-until:}"
+                  case "$(_held_until_purge_decision "$_stale_epoch" "$_hold_until")" in
+                    keep-unparseable)
+                      log "ga-6pe8d: $STORY_ID keeping unparseable $_stale — not purging what we can't verify" ;;
+                    keep-not-older)
+                      log "ga-6pe8d: $STORY_ID keeping $_stale (>= our own ${_hold_until}) — may be a longer hold from elsewhere, not purging" ;;
+                    purge)
+                      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "$_stale" -q 2>/dev/null || true ;;
+                  esac
                 done
-                log "ga-lfvs6/imp20: $STORY_ID stamped pilot:held-until:${_hold_until} then pilot:held (1h timed hold; prior held-until stamps purged — ga-4aree)"
+                log "ga-lfvs6/imp20: $STORY_ID stamped pilot:held-until:${_hold_until} then pilot:held (1h timed hold; prior held-until stamps purged if older — ga-4aree/ga-6pe8d)"
               fi
               # ga-2n7xw: count this hold toward the shared refusal-successor
               # escalation cap — a domain build stuck with no idle crew must
