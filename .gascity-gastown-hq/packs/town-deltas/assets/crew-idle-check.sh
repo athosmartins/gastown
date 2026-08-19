@@ -149,10 +149,26 @@ _crew_no_uncommitted_work() {
 # AUTONOMOUS CLOSE (fail-closed — "couldn't tell" must count as "assume a
 # marker exists," never as "confirmed none").
 _bead_has_open_gate_marker() {
-  local bid="$1" arts hit
-  [ -n "$bid" ] || return 1
-  arts="$(timeout 15 "$BD" -C "$CITY" list --include-infra -l "source-bead:$bid" --json --limit 0 2>/dev/null)" || return 1
-  [ -n "$arts" ] || return 0   # no artifacts at all → confirmed none, not an error
+  local bid="$1" arts bd_rc hit
+  # Every non-confirmed path below returns 0 ("assume a marker exists") — the
+  # ONLY path that returns 1 ("no marker") is a positively parsed, confirmed
+  # zero count. Caught in gate-done's own mandatory third-state self-audit:
+  # an earlier version of this function returned 1 (its "no marker" value) on
+  # bid-empty, bd-exec-failure, AND python-parse-failure — exactly backwards
+  # from the fail-closed intent stated in this function's own header comment
+  # above, and never caught by the selftest because every mocked scenario
+  # returned well-formed JSON, never simulating a raw bd/parse failure. Fixed
+  # by making "confirmed zero" the single narrow path to 1, everything else 0.
+  [ -n "$bid" ] || return 0
+  arts="$(timeout 15 "$BD" -C "$CITY" list --include-infra -l "source-bead:$bid" --json --limit 0 2>/dev/null)"
+  bd_rc=$?
+  [ "$bd_rc" -eq 0 ] || return 0
+  # Empty stdout on a successful exit is itself anomalous, not a confirmed
+  # zero-result read — every other bd-JSON reader in this file (e.g.
+  # _crew_no_inprogress_bead) already treats a genuinely empty string as
+  # unreadable rather than "confirmed empty list", since a real zero-match
+  # `bd list --json` prints "[]" (2 bytes), not nothing.
+  [ -n "$arts" ] || return 0
   hit="$(printf '%s' "$arts" | python3 -c '
 import json, sys
 try:
@@ -174,9 +190,9 @@ for b in d:
 print(n)
 ' 2>/dev/null)"
   case "$hit" in
-    -1) return 1 ;;   # parse error → fail-closed (assume marker exists)
-    0) return 1 ;;     # 0 = "no open marker" = the PASS condition → caller wants rc=0... see below
-    *) return 0 ;;
+    0) return 1 ;;        # CONFIRMED zero open markers — the only "no marker" path
+    ''|-1) return 0 ;;    # parse failure — unconfirmed, assume marker exists
+    *) return 0 ;;        # N>0 confirmed open markers
   esac
 }
 # NOTE on the inversion above: this function's own return convention is
@@ -380,6 +396,9 @@ for a in "$@"; do
   case "$a" in
     source-bead:marked-bead) echo '[{"status":"open","labels":["type:quality-gate-marker"]}]'; exit 0 ;;
     source-bead:clean-bead) echo '[]'; exit 0 ;;
+    source-bead:error-bead) exit 1 ;;
+    source-bead:empty-stdout-bead) exit 0 ;;
+    source-bead:garbage-bead) echo 'not json'; exit 0 ;;
   esac
 done
 case "$MOCK_BD2_MODE" in
@@ -392,6 +411,15 @@ MOCKBD2
   chmod +x "${_ST_BD2}"
   BD="${_ST_BD2}" _bead_has_open_gate_marker marked-bead && ok "open marker found -> rc=0 (has one)" || bad "should find the marker"
   BD="${_ST_BD2}" _bead_has_open_gate_marker clean-bead && bad "no marker should be rc=1" || ok "no marker -> rc=1 (none found)"
+  # These four assert the gate-done self-audit fix directly: every
+  # non-confirmed read must fail toward "assume a marker exists" (rc=0), the
+  # bug this fixed had these returning rc=1 ("no marker") instead — silently
+  # collapsing "couldn't tell" into "confirmed none" on the path that gates
+  # an autonomous crew close.
+  BD="${_ST_BD2}" _bead_has_open_gate_marker '' && ok "empty bid -> rc=0 (assume has marker, can't identify what to check)" || bad "empty bid should fail toward 'has marker'"
+  BD="${_ST_BD2}" _bead_has_open_gate_marker error-bead && ok "bd exec failure -> rc=0 (assume has marker)" || bad "bd failure should fail toward 'has marker', not 'no marker'"
+  BD="${_ST_BD2}" _bead_has_open_gate_marker empty-stdout-bead && ok "empty stdout on success -> rc=0 (assume has marker, anomalous not confirmed-zero)" || bad "empty stdout should fail toward 'has marker'"
+  BD="${_ST_BD2}" _bead_has_open_gate_marker garbage-bead && ok "malformed JSON -> rc=0 (assume has marker)" || bad "parse failure should fail toward 'has marker'"
   BD="${_ST_BD2}" MOCK_BD2_MODE=has_marked _crew_no_open_gate_marker ident /rig 999999 && bad "recent closed bead WITH open marker should NOT pass" \
     || ok "recent bead has open marker -> fail (not idle-eligible)"
   BD="${_ST_BD2}" MOCK_BD2_MODE=all_clean _crew_no_open_gate_marker ident /rig 999999 && ok "recent closed bead with no marker -> pass" \
