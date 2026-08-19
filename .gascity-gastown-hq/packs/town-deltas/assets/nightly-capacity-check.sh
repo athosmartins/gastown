@@ -146,7 +146,7 @@ _is_sunday() { [ "${1:-}" = "7" ]; }
 main() {
   local free_pct swap_mb jetsam disk_free_gb
   free_pct="$(read_free_pct)"; free_pct="${free_pct:-unknown}"
-  swap_mb="$(read_swap_used_mb)"; swap_mb="${swap_mb:-0}"
+  swap_mb="$(read_swap_used_mb)"; swap_mb="${swap_mb:-unknown}"
   jetsam="$(read_jetsam_count)"; jetsam="${jetsam:-0}"
   disk_free_gb="$(read_disk_free_gb)"; disk_free_gb="${disk_free_gb:-unknown}"
 
@@ -329,6 +329,28 @@ print("\n".join(bad))
   [ -f "${_s6_mail_marker}" ] && ok "jetsam=2 -> mail sent" || bad "should have mailed a recommendation"
   grep -q "swap_mb=500" "${NCC_TREND_LOG}" && ok "trend log line appended with correct swap_mb" || bad "trend log missing/wrong"
   unset -f gc
+
+  echo "S6b: main() — unreadable swap must NOT fabricate a measured zero (ga-a46jl)"
+  # NCC_TEST_SWAP_MB set to EMPTY (not unset) simulates read_swap_used_mb's
+  # real pipeline producing empty stdout on failure (sysctl error, or its
+  # output format changing) -- the +x check in read_swap_used_mb still
+  # takes the override branch and echoes nothing, exactly like the real
+  # failure path would. Before this fix, main()'s swap_mb="${swap_mb:-0}"
+  # silently turned that into a fabricated "0", written to the trend log
+  # and later surfaced by the weekly digest as a genuine "peak swap"
+  # reading -- indistinguishable from an actually-measured zero.
+  NCC_TREND_LOG="${_ST_ROOT}/s6b-trend.log"; TREND_LOG="${NCC_TREND_LOG}"
+  NCC_TEST_SWAP_MB='' NCC_TEST_FREE_PCT=30 NCC_TEST_JETSAM_COUNT=0 NCC_TEST_DISK_FREE_GB=80 main >/dev/null 2>&1
+  grep -q "swap_mb=unknown" "${NCC_TREND_LOG}" && ok "unreadable swap logged as 'unknown', not fabricated as 0" \
+    || bad "REGRESSION: unreadable swap silently recorded as swap_mb=0"
+  # Isolated single-line trend log (not S6's accumulated one, which already
+  # has a real 500MB reading that would mask this check either way): if the
+  # bug were present (swap_mb=0 fabricated), the digest's peak-swap would
+  # read "0MB" here since it's the only line; correctly excluded, it must
+  # read "n/a" (no numeric swap readings at all in this log).
+  _s6b_digest="$(_weekly_digest "${NCC_TREND_LOG}")"
+  echo "$_s6b_digest" | grep -q "swap pico n/aMB" && ok "unknown swap reading excluded from weekly digest peak calc (n/a, not fabricated 0)" \
+    || bad "REGRESSION: unknown swap counted as a real data point in the digest: $_s6b_digest"
 
   echo ""; echo "nightly-capacity-check selftest: PASS=$PASS FAIL=$FAIL"; [ "$FAIL" -eq 0 ] && exit 0 || exit 1
 fi
