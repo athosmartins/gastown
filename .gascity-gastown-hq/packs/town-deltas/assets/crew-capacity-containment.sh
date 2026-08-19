@@ -264,8 +264,14 @@ main() {
       log "SKIP ${agent}: human attached — never asked about, never closed."
       continue
     fi
-    work_dir="$(_session_field "$sessions_json" "$agent" work_dir)"
-    [ -n "$work_dir" ] || { log "SKIP ${agent}: live session has no work_dir — cannot evaluate."; continue; }
+    # ga-ego18: derive work_dir from the agent's OWN agent.toml, not from `gc
+    # session list`'s JSON. Gate review found that field is not schema-
+    # guaranteed on the live-controller API code path this command normally
+    # takes (only the no-controller local fallback is documented to carry
+    # it) -- crew-idle-check.sh's own _agent_work_dir reads the same
+    # first-party source _layer1_crew_names already trusts for identity.
+    work_dir="$(_agent_work_dir "$agent")"
+    [ -n "$work_dir" ] || { log "SKIP ${agent}: no work_dir in agent.toml — cannot evaluate."; continue; }
     rig="$(_rig_path_for_work_dir "$work_dir")" || { log "SKIP ${agent}: could not derive rig path from ${work_dir}."; continue; }
 
     local report idle reasons
@@ -426,6 +432,39 @@ MOCKBD5
   gc() { touch "${_s8_marker}"; }
   CREW_IDLE_AGENTS_DIR="${_ST_AGENTS5}" CCC_TEST_RAM_LEVEL=OK main >/dev/null 2>&1
   [ -f "${_s8_marker}" ] && bad "REGRESSION: gc was called even though pressure is OK" || ok "level=OK -> gc never invoked, immediate no-op"
+  unset -f gc
+
+  echo "S8b: main() end-to-end — evaluates a crew even when the session JSON carries NO work_dir key at all (ga-ego18)"
+  # Simulates the exact schema the gate review described for the live-
+  # controller API code path: a session row with no work_dir field
+  # whatsoever (not just empty -- ABSENT), unlike every other fixture above
+  # which bakes work_dir into the session JSON itself. Before this fix,
+  # main() read work_dir via _session_field on this JSON and would SKIP the
+  # crew here ("no work_dir -- cannot evaluate"), never asking or closing --
+  # the exact silently-dead-feature shape the review was concerned about.
+  #
+  # Uses a DISTINCT agent identity ("testcrew2") rather than reusing
+  # "testcrew" -- S5 already asked about "testcrew" and _ask_rate_limited's
+  # 4h stamp (keyed by agent name, in the same shared RUN_DIR every S5-S10
+  # section reuses) would otherwise make this hit the RATE-LIMITED branch
+  # instead of ASK, which looks identical from the "no mail sent" outside
+  # view and silently tests the wrong thing (caught by first running this
+  # with a raw log dump instead of trusting the pass/fail alone). Points at
+  # the SAME already-initialized git repo/work_dir S5 set up, since the
+  # underlying idle-check reads by work_dir content, not by agent name.
+  _ST_AGENTS5_2="${_ST_ROOT}/agents5-2"; mkdir -p "${_ST_AGENTS5_2}/testcrew2"
+  printf 'max_active_sessions = 1\nwork_dir = "%s/crew/testcrew"\n' "${_ST_ROOT}" > "${_ST_AGENTS5_2}/testcrew2/agent.toml"
+  _ST_SESS8B="${_ST_ROOT}/sessions8b.json"
+  printf '[{"name":"testcrew2","template":"testcrew2","attached":false}]' > "${_ST_SESS8B}"
+  _s8b_mail_marker="${_ST_ROOT}/s8b-mail-called"
+  rm -f "${_s8b_mail_marker}"
+  gc() { case "$1" in mail) touch "${_s8b_mail_marker}" ;; esac; }
+  CREW_IDLE_AGENTS_DIR="${_ST_AGENTS5_2}" BD="${_ST_BD5}" CREW_IDLE_SESSION_OVERRIDE=idle \
+    CCC_TEST_RAM_LEVEL=EMERGENCY CCC_ASK_WINDOW_START_HOUR=0 CCC_ASK_WINDOW_END_HOUR=24 \
+    CCC_SESSIONS_JSON_FILE="${_ST_SESS8B}" \
+    main >/dev/null 2>&1
+  [ -f "${_s8b_mail_marker}" ] && ok "crew evaluated and asked about despite work_dir being ABSENT from session JSON (sourced from agent.toml instead)" \
+    || bad "REGRESSION: crew was skipped -- work_dir dependency on session JSON is back"
   unset -f gc
 
   echo "S9: _acquire_lock / _release_lock — singleton-run protection (defense in depth, gate review ga-bjmp6)"

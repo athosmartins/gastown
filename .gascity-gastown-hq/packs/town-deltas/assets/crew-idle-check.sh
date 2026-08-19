@@ -82,6 +82,30 @@ _layer1_crew_names() {
   done
 }
 
+# _agent_work_dir <agent_name> → prints the agent's work_dir straight from
+# its own agent.toml (same file+field _layer1_crew_names already trusts to
+# derive Layer-1 identity in the first place), or nothing + return 1 if the
+# agent.toml is missing/unreadable or has no work_dir line. Deliberately
+# does NOT read `gc session list`: gate review ga-ego18 found that field is
+# not schema-guaranteed on the live-controller API code path (only the
+# no-controller local fallback path is documented to populate it) --
+# crew-capacity-containment.sh's own per-crew loop used to depend on it via
+# `gc session list --json`, which is exactly the fragile external
+# dependency this reads around. Re-checks CREW_IDLE_AGENTS_DIR fresh on
+# every call (not just AGENTS_DIR's parse-time default) for the same reason
+# _layer1_crew_names does two lines below -- a caller overriding the agents
+# dir on a later call needs that to take effect immediately.
+_agent_work_dir() {
+  local agent="$1" dir_root="${CREW_IDLE_AGENTS_DIR:-$AGENTS_DIR}" dir wd
+  [ -n "$agent" ] || return 1
+  dir="${dir_root}/${agent}"
+  [ -f "${dir}/agent.toml" ] || return 1
+  wd="$(grep -E '^work_dir[[:space:]]*=' "${dir}/agent.toml" 2>/dev/null \
+        | sed -E 's/^work_dir[[:space:]]*=[[:space:]]*"(.*)"[[:space:]]*$/\1/')"
+  [ -n "$wd" ] || return 1
+  printf '%s' "$wd"
+}
+
 # _rig_path_for_work_dir <work_dir> → the rig root ("/Users/.../gt/<rig>"),
 # derived by stripping the "/crew/<name>" suffix. A crew's own beads live in
 # ITS RIG's bd store, not HQ's (confirmed live: bd -C HQ --assignee=oracle-wa
@@ -357,6 +381,21 @@ if [ "${1:-}" = "--selftest" ] && [ "${CREW_IDLE_CHECK_LIB:-0}" != "1" ]; then
   _rig_path_for_work_dir '/no/such/segment/nope' >/dev/null 2>&1 && bad "path with no /crew/ substring should fail" \
     || ok "no /crew/ segment anywhere in path -> return 1"
   _rig_path_for_work_dir '' >/dev/null 2>&1 && bad "empty input should fail" || ok "empty work_dir -> return 1"
+
+  echo "S2b: _agent_work_dir — reads agent.toml directly, no gc/session dependency (ga-ego18)"
+  # Reuses S1's _ST_AGENTS fixture: oracle-wa has a real work_dir line,
+  # gate-reviewer has an agent.toml with NO work_dir line, broken/ has no
+  # agent.toml at all -- covers both failure shapes, not just the happy path.
+  [ "$(CREW_IDLE_AGENTS_DIR="${_ST_AGENTS}" _agent_work_dir oracle-wa)" = "/x/whatsapp_automation/crew/oracle" ] \
+    && ok "reads work_dir straight from agent.toml" || bad "should read oracle-wa's work_dir"
+  CREW_IDLE_AGENTS_DIR="${_ST_AGENTS}" _agent_work_dir gate-reviewer >/dev/null 2>&1 \
+    && bad "agent.toml with no work_dir line should fail" || ok "agent.toml present but no work_dir line -> return 1"
+  CREW_IDLE_AGENTS_DIR="${_ST_AGENTS}" _agent_work_dir broken >/dev/null 2>&1 \
+    && bad "missing agent.toml should fail" || ok "no agent.toml at all -> return 1"
+  CREW_IDLE_AGENTS_DIR="${_ST_AGENTS}" _agent_work_dir nosuchagent >/dev/null 2>&1 \
+    && bad "nonexistent agent should fail" || ok "agent directory doesn't exist -> return 1"
+  CREW_IDLE_AGENTS_DIR="${_ST_AGENTS}" _agent_work_dir '' >/dev/null 2>&1 \
+    && bad "empty agent name should fail" || ok "empty agent name -> return 1"
 
   echo "S3: _crew_no_inprogress_bead — mocked BD"
   _ST_BD="${_ST_ROOT}/mock-bd"
