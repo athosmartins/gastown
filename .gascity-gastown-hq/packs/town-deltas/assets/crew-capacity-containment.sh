@@ -5,9 +5,10 @@
 #   Layer 0 (mayor, control-dispatcher, dolt): never touched, not evaluated here.
 #   Layer 2 (dog, wa-worker, ps-worker, gate-reviewer — elastic pools): already
 #     drained/contained by ga-m2gqb's dispatch pause at WARN+. This script does
-#     NOT duplicate that — it only logs the pool census for the audit trail,
-#     confirming containment order (pools first, always) before ever touching
-#     a named crew.
+#     NOT duplicate that — it only logs a generic containment-order assertion
+#     for the audit trail (no actual pool census: it does not count or list
+#     live dog/wa-worker/ps-worker/gate-reviewer sessions), confirming pools
+#     are addressed before ever touching a named crew.
 #   Layer 1 (named crews, live-derived by crew-idle-check.sh): evaluated ONLY
 #     at EMERGENCY (not WARN) — closing a named crew loses accumulated context
 #     that's expensive to rebuild, so it's reserved for the more severe tier;
@@ -48,6 +49,15 @@ RUN_DIR="${CCC_RUN_DIR:-${HOME}/.gastown/run}"
 
 RAM_LEVEL_FILE="${CCC_RAM_LEVEL_FILE:-${RUN_DIR}/ram-pressure-monitor.level}"
 RAM_MAX_AGE_SECS="${CCC_RAM_MAX_AGE_SECS:-7200}"   # mirrors PILOT_RAM_MAX_AGE_SECS
+
+# StartInterval=600s launchd jobs do NOT wait for the prior run to finish
+# before starting a new one -- a slow cycle (more named crews over time, or
+# bd/git latency, which tends to co-occur with the exact EMERGENCY pressure
+# this script only runs under) can let launchd stack concurrent invocations.
+# This is the same failure shape as a previously-recorded incident in this
+# city (concurrent guard instances overloading bd). Singleton lock, defense
+# in depth, per gate review ga-bjmp6's non-blocking note.
+LOCK_FILE="${CCC_LOCK_FILE:-${RUN_DIR}/crew-capacity-containment.lock}"
 
 ASK_WINDOW_START_HOUR="${CCC_ASK_WINDOW_START_HOUR:-7}"
 ASK_WINDOW_END_HOUR="${CCC_ASK_WINDOW_END_HOUR:-22}"
@@ -144,6 +154,43 @@ sys.exit(1)
 # ORCHESTRATION (side-effecting)
 # ════════════════════════════════════════════════════════════════════════════
 
+# _acquire_lock <lock_file> → 0 iff no OTHER live process holds the lock (and
+# stamps our own PID into it); 1 iff a live process already holds it. A
+# pidfile whose PID is missing/unparseable/dead is treated as stale, not as
+# "locked" — `kill -0` confirms liveness rather than trusting the file's mere
+# existence, so a crash that leaves a stale pidfile behind can never wedge
+# every future run.
+_acquire_lock() {
+  local lock="$1" existing_pid
+  [ -n "$lock" ] || return 1
+  mkdir -p "$(dirname "$lock")" 2>/dev/null
+  if [ -f "$lock" ]; then
+    if existing_pid="$(cat "$lock" 2>/dev/null)"; then
+      existing_pid="$(printf '%s' "$existing_pid" | tr -d '[:space:]')"
+      case "$existing_pid" in
+        ''|*[!0-9]*) : ;;   # successfully read, but empty/garbage content -> stale, reclaim
+        *) kill -0 "$existing_pid" 2>/dev/null && return 1 ;;   # a live process holds it
+      esac
+    else
+      # -f confirmed the file exists but the read itself failed (TOCTOU race
+      # with a concurrent release, permissions, ...) -- cannot confirm this
+      # is stale, so it must NOT be treated the same as a confirmed-empty
+      # read. Fail closed (assume locked, skip this cycle); the alternative
+      # of reclaiming on an unconfirmed read risks the exact concurrent
+      # double-run this lock exists to prevent.
+      return 1
+    fi
+  fi
+  { echo "$$" > "$lock"; } 2>/dev/null || return 1
+  return 0
+}
+
+_release_lock() {
+  local lock="$1"
+  [ -n "$lock" ] || return 0
+  rm -f "$lock" 2>/dev/null
+}
+
 _send_ask() {
   local agent="$1" work_dir="$2" reasons_summary="$3"
   local body
@@ -183,6 +230,12 @@ main() {
   esac
 
   log "EMERGENCY pressure — layer 2 (elastic pools) already contained via ga-m2gqb dispatch pause; evaluating layer 1 (named crews)."
+
+  if ! _acquire_lock "$LOCK_FILE"; then
+    log "SKIP: another instance already holds the lock — not stacking concurrent invocations."
+    return 0
+  fi
+  trap '_release_lock "$LOCK_FILE"' RETURN
 
   local sessions_json="${CCC_SESSIONS_JSON_FILE:-}"
   local _tmp_sess=""
@@ -251,7 +304,7 @@ if [ "${1:-}" = "--selftest" ]; then
   _ST_ROOT="$(mktemp -d /tmp/ccc-selftest.XXXXXX)"
   trap 'rm -rf "${_ST_ROOT}"' EXIT
   export CCC_LOG="${_ST_ROOT}/log" CCC_RUN_DIR="${_ST_ROOT}/run" CCC_NOTIFY=/nonexistent
-  LOG="${CCC_LOG}"; RUN_DIR="${CCC_RUN_DIR}"
+  LOG="${CCC_LOG}"; RUN_DIR="${CCC_RUN_DIR}"; LOCK_FILE="${_ST_ROOT}/run/crew-capacity-containment.lock"
 
   echo "S1: _ram_pressure_level — mirrors pilot-dispatcher.sh's fail-open contract"
   _ST_RAM="${_ST_ROOT}/ram.level"
@@ -374,6 +427,66 @@ MOCKBD5
   CREW_IDLE_AGENTS_DIR="${_ST_AGENTS5}" CCC_TEST_RAM_LEVEL=OK main >/dev/null 2>&1
   [ -f "${_s8_marker}" ] && bad "REGRESSION: gc was called even though pressure is OK" || ok "level=OK -> gc never invoked, immediate no-op"
   unset -f gc
+
+  echo "S9: _acquire_lock / _release_lock — singleton-run protection (defense in depth, gate review ga-bjmp6)"
+  _ST_LOCK="${_ST_ROOT}/s9.lock"
+  rm -f "${_ST_LOCK}"
+  _acquire_lock "${_ST_LOCK}" && ok "no existing lock -> acquired" || bad "should acquire a fresh lock"
+  [ "$(cat "${_ST_LOCK}" 2>/dev/null)" = "$$" ] && ok "lock file stamped with our own PID" || bad "lock file should contain our PID"
+  _acquire_lock "${_ST_LOCK}" && bad "a live-held lock (our own PID, definitely alive) should NOT be acquirable" || ok "lock held by a live PID -> acquire fails"
+  _release_lock "${_ST_LOCK}"
+  [ -f "${_ST_LOCK}" ] && bad "release should remove the lock file" || ok "release -> lock file removed"
+  _acquire_lock "${_ST_LOCK}" && ok "after release -> acquirable again" || bad "should reacquire after release"
+  _release_lock "${_ST_LOCK}"
+  # Stale lock: a PID that has genuinely exited (not just "a big unlikely
+  # number", which is flaky) -- reclaimed, not treated as still-held.
+  ( sleep 0 ) & _st_dead_pid=$!
+  wait "${_st_dead_pid}" 2>/dev/null
+  echo "${_st_dead_pid}" > "${_ST_LOCK}"
+  _acquire_lock "${_ST_LOCK}" && ok "stale lock (dead PID) -> reclaimed, not blocked" || bad "dead PID should not block acquisition"
+  _release_lock "${_ST_LOCK}"
+  echo "not-a-pid" > "${_ST_LOCK}"
+  _acquire_lock "${_ST_LOCK}" && ok "garbage lock content -> treated as stale, reclaimed" || bad "unparseable pidfile should not block acquisition"
+  _release_lock "${_ST_LOCK}"
+  _acquire_lock "/nonexistent-dir-xyz/sub/lock" && bad "unwritable lock path should fail closed" || ok "unwritable lock path -> acquire fails safely"
+  # A lock file that -f confirms exists but whose CONTENT cannot actually be
+  # read (permission race, TOCTOU) must NOT be treated the same as a
+  # confirmed-empty/garbage read -- that would silently reclaim a lock we
+  # never actually confirmed was stale. Mode 200 (write-only, no read)
+  # isolates exactly this: unlike 000, it does NOT also block the reclaim
+  # write, so a test relying on return-code-alone would pass for the WRONG
+  # reason under the old (buggy) code too (both the read AND the writeback
+  # would fail under 000, "fail closed" by accident of a second unrelated
+  # permission failure, not because the fix's read/write distinction fired).
+  # Skipped when running as root (uid 0 ignores unix file permissions).
+  if [ "$(id -u)" != "0" ]; then
+    echo "12345" > "${_ST_LOCK}"
+    chmod 200 "${_ST_LOCK}"
+    _acquire_lock "${_ST_LOCK}"
+    _st_acquire_rc=$?
+    chmod 644 "${_ST_LOCK}" 2>/dev/null
+    _st_lock_content="$(cat "${_ST_LOCK}" 2>/dev/null)"
+    [ "$_st_acquire_rc" -ne 0 ] && ok "existing lock file we cannot read -> acquire fails closed (rc=${_st_acquire_rc})" \
+      || bad "unreadable-but-existing lock file should fail closed, not reclaim (rc=${_st_acquire_rc})"
+    [ "$_st_lock_content" = "12345" ] && ok "lock content left untouched -> confirmed no silent reclaim happened" \
+      || bad "REGRESSION: lock content changed to '${_st_lock_content}' -- reclaimed despite unreadable original"
+    rm -f "${_ST_LOCK}"
+  else
+    log "S9: skipping unreadable-lock-file case — running as root, chmod has no effect"
+  fi
+
+  echo "S10: main() end-to-end — held lock skips evaluation entirely, even with an idle crew under EMERGENCY"
+  echo "$$" > "${LOCK_FILE}"
+  _s10_marker="${_ST_ROOT}/s10-any-action"
+  rm -f "${_s10_marker}"
+  gc() { touch "${_s10_marker}"; }
+  CREW_IDLE_AGENTS_DIR="${_ST_AGENTS5}" BD="${_ST_BD5}" CREW_IDLE_SESSION_OVERRIDE=idle \
+    CCC_TEST_RAM_LEVEL=EMERGENCY CCC_ASK_WINDOW_START_HOUR=0 CCC_ASK_WINDOW_END_HOUR=24 \
+    CCC_SESSIONS_JSON_FILE="${_ST_SESS5}" \
+    main >/dev/null 2>&1
+  [ -f "${_s10_marker}" ] && bad "REGRESSION: gc was called despite an already-held lock" || ok "held lock -> main() skips this cycle entirely, no gc calls"
+  unset -f gc
+  rm -f "${LOCK_FILE}"
 
   echo ""; echo "crew-capacity-containment selftest: PASS=$PASS FAIL=$FAIL"; [ "$FAIL" -eq 0 ] && exit 0 || exit 1
 fi

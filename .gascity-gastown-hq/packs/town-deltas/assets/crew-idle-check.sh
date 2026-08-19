@@ -227,7 +227,14 @@ for b in d:
     try:
         ts = datetime.datetime.fromisoformat(ca.replace("Z", "+00:00")).timestamp()
     except Exception:
-        ts = 0
+        # Unparseable/missing date: cannot confirm this bead is OUTSIDE the
+        # lookback window, so it must be included (checked) -- same
+        # fail-toward-inclusion contract as _bead_has_open_gate_marker
+        # above. A ts=0 fallback would silently exclude it instead (0 never
+        # satisfies ">= cutoff"), which is the exact bug this branch was
+        # gate-rejected for (ga-bjmp6).
+        print(b.get("id") or "")
+        continue
     if ts >= cutoff:
         print(b.get("id") or "")
 ' 2>/dev/null)" || return 1
@@ -399,6 +406,8 @@ for a in "$@"; do
     source-bead:error-bead) exit 1 ;;
     source-bead:empty-stdout-bead) exit 0 ;;
     source-bead:garbage-bead) echo 'not json'; exit 0 ;;
+    source-bead:unparseable-with-marker) echo '[{"status":"open","labels":["type:quality-gate-marker"]}]'; exit 0 ;;
+    source-bead:unparseable-no-marker) echo '[]'; exit 0 ;;
   esac
 done
 case "$MOCK_BD2_MODE" in
@@ -406,6 +415,8 @@ case "$MOCK_BD2_MODE" in
   all_clean) echo '[{"id":"clean-bead","closed_at":"2026-08-18T10:00:00Z"}]' ;;
   old_only) echo '[{"id":"marked-bead","closed_at":"2020-01-01T00:00:00Z"}]' ;;
   empty) echo '[]' ;;
+  unparseable_date_has_marker) echo '[{"id":"unparseable-with-marker","closed_at":"not-a-valid-date"}]' ;;
+  unparseable_date_no_marker) echo '[{"id":"unparseable-no-marker"}]' ;;
 esac
 MOCKBD2
   chmod +x "${_ST_BD2}"
@@ -427,6 +438,21 @@ MOCKBD2
   BD="${_ST_BD2}" MOCK_BD2_MODE=old_only _crew_no_open_gate_marker ident /rig 1 && ok "marked bead OUTSIDE lookback window -> pass (not counted)" \
     || bad "old bead should be excluded by lookback cutoff"
   BD="${_ST_BD2}" MOCK_BD2_MODE=empty _crew_no_open_gate_marker ident /rig 999999 && ok "no closed beads at all -> pass" || bad "empty list should pass"
+  # Regression coverage for the gate-rejected bug (ga-bjmp6): a per-bead date
+  # parse failure used to fall back to ts=0, which can never satisfy ">=
+  # cutoff" -- silently excluding the bead from the checked set instead of
+  # including it. These two cases fail against that old behavior (the marker
+  # case would wrongly report "pass") and pass against the fix.
+  # NOTE: lookback_hours must be a realistic value here (48, matching the
+  # real GATE_MARKER_LOOKBACK_HOURS default), NOT the 999999 used by the
+  # other cases above -- at that magnitude cutoff=now-999999*3600 goes
+  # NEGATIVE, and ts=0 >= a negative cutoff is true, which accidentally
+  # masks this exact bug instead of exercising it (caught via mutation
+  # testing: reverting the fix to ts=0 still passed with 999999).
+  BD="${_ST_BD2}" MOCK_BD2_MODE=unparseable_date_has_marker _crew_no_open_gate_marker ident /rig 48 && bad "bead with unparseable closed_at that HAS an open marker should NOT pass" \
+    || ok "unparseable date -> bead still gets checked, its open marker is found -> fail (not idle-eligible)"
+  BD="${_ST_BD2}" MOCK_BD2_MODE=unparseable_date_no_marker _crew_no_open_gate_marker ident /rig 48 && ok "bead with unparseable/missing date but no marker -> pass" \
+    || bad "should still pass when the checked bead genuinely has no marker"
 
   echo "S6: _crew_session_idle — override seam"
   CREW_IDLE_SESSION_OVERRIDE=idle _crew_session_idle whatever && ok "override=idle -> rc=0" || bad "override=idle should give rc=0"
