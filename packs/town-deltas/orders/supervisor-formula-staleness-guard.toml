@@ -1,0 +1,17 @@
+# ga-4tt37: detects com.gascity.supervisor running continuously since before
+# the last edit to a formula file backing a `type=formula` gc order (e.g.
+# digest-generate -> mol-digest-generate). Those orders are materialized by
+# the supervisor's own process, not a fresh CLI invocation per tick, so a
+# long-lived supervisor can silently pour stale, pre-edit step instructions
+# for its entire uptime with zero error signal. Detection-only (notify;
+# never restarts the supervisor itself — far higher blast radius than a leaf
+# daemon, needs a deliberate human/Mayor call). Deliberately a gc order
+# (fresh exec each tick), not a raw KeepAlive plist, so this guard can never
+# itself join the bug class it exists to detect. 1h cadence: a
+# structural-drift check on a rare event (formula edits), not an urgent
+# throughput guard.
+[order]
+description = "Detect com.gascity.supervisor materializing formula orders older than the formula's last edit"
+trigger = "cooldown"
+interval = "1h"
+exec = "$PACK_DIR/assets/scripts/supervisor-formula-staleness-guard.sh"

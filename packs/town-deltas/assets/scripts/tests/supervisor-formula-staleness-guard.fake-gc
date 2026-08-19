@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# fake-gc — argv-dispatch stub for supervisor-formula-staleness-guard.selftest.sh.
+# Handles exactly the two invocation shapes the real script uses:
+#   gc order list --json
+#   gc bd formula show <name> --json
+set -euo pipefail
+
+case "${1:-}/${2:-}" in
+    order/list)
+        printf '%s' "${FAKE_ORDER_LIST_JSON:-}"
+        ;;
+    bd/formula)
+        # gc bd formula show <name> --json
+        name="${4:-}"
+        src=$(printf '%s\n' "${FAKE_FORMULA_SOURCES:-}" | awk -F'\t' -v n="$name" '$1==n {print $2; found=1} END{if(!found) exit 1}') || exit 1
+        printf '{"source":"%s"}' "$src"
+        ;;
+    *)
+        echo "fake-gc: unhandled: $*" >&2
+        exit 1
+        ;;
+esac

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# fake-notify — stub for supervisor-formula-staleness-guard.selftest.sh.
+# Records every call so the selftest can assert on notify count/content
+# instead of paging a real device.
+printf 'NOTIFY %s\n' "$*" >> "${NOTIFY_LOG:-/dev/null}"

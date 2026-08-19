@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# fake-ps — stub for supervisor-formula-staleness-guard.selftest.sh.
+# Ignores argv (the real script only ever calls `ps -eo pid=,etime=,command=`
+# one way) and prints the fixture the selftest injected via FAKE_PS_OUTPUT.
+printf '%s\n' "${FAKE_PS_OUTPUT:-}"
