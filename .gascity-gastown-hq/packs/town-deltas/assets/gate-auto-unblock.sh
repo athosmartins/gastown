@@ -179,19 +179,30 @@ rig_dir() {
 # regra literal do lifecycle-auditor (ga-luyz48): o hífen ancora a
 # fronteira, então wa-v89e3 não casa a branch de wa-v89e3.9.
 #
-# ⚠️ (revisor, gate-run ga-oaqy39, blocking issue 2): busca DUAS
-# namespaces (crew/*/* e fix/*) numa só chamada, e for-each-ref devolve
-# tudo ORDENADO ALFABETICAMENTE — "crew" < "fix" sempre. A versão antiga
-# pegava o PRIMEIRO match ({print; exit}), então se o MESMO bead tivesse
-# ref em ambas (crew abandonada + fix real, ou vice-versa — a branch
-# ativa de um bead pode legitimamente migrar de namespace ao longo da
-# vida dele), a escolha era um acidente alfabético, nunca a mais
-# recente — podendo apagar a trava da branch ERRADA e deixar o trabalho
-# real sem exame e sem lock. Agora coleta TODOS os matches e escolhe
-# pelo commit TIP mais recente. Se a busca de epoch falhar pra algum
-# candidato (raro — a ref acabou de ser listada), ainda devolve o
-# PRIMEIRO candidato visto como fallback, nunca vazio quando existe pelo
-# menos um match — vazio só quando não há match nenhum (R1 genuíno).
+# ⚠️ (revisor, gate-run ga-oaqy39, blocking issue 2): busca TRÊS
+# namespaces (crew/*/*, fix/* e feat/*) numa só chamada, e for-each-ref
+# devolve tudo ORDENADO ALFABETICAMENTE — "crew" < "feat" < "fix"
+# sempre. A versão antiga pegava o PRIMEIRO match ({print; exit}), então
+# se o MESMO bead tivesse ref em mais de uma (crew abandonada + fix
+# real, ou vice-versa — a branch ativa de um bead pode legitimamente
+# migrar de namespace ao longo da vida dele), a escolha era um acidente
+# alfabético, nunca a mais recente — podendo apagar a trava da branch
+# ERRADA e deixar o trabalho real sem exame e sem lock. Agora coleta
+# TODOS os matches e escolhe pelo commit TIP mais recente. Se a busca de
+# epoch falhar pra algum candidato (raro — a ref acabou de ser listada),
+# ainda devolve o PRIMEIRO candidato visto como fallback, nunca vazio
+# quando existe pelo menos um match — vazio só quando não há match
+# nenhum (R1 genuíno).
+#
+# 🚨 (ga-rdx5h, evidência ao vivo ga-06mt3k): 'refs/remotes/origin/feat/*'
+# faltava desta lista. feat/* é o prefixo OBRIGATÓRIO pra branch de
+# story/feature nesta cidade (o push guard rejeita story/* e exige
+# feat/*) — sem esse namespace, TODO bead cujo trabalho vive numa branch
+# feat/<id>-... fazia branch_for() devolver vazio incondicionalmente,
+# disparando R1 ("sem branch no remoto e sem commit próprio") mesmo com
+# a branch existindo com commits reais, e apply_and_report removia o
+# gate:needs-human de verdade — derrotando o circuit breaker (ga-stu930)
+# silenciosamente pra essa classe inteira de branch.
 branch_for() {
   local rig="$1" id="$2" ref best="" best_epoch=-1 epoch first=""
   while IFS= read -r ref; do
@@ -203,7 +214,8 @@ branch_for() {
       best_epoch="$epoch"
     fi
   done < <("$GIT" -C "$rig" for-each-ref --format='%(refname:short)' \
-      'refs/remotes/origin/crew/*/*' 'refs/remotes/origin/fix/*' 2>/dev/null \
+      'refs/remotes/origin/crew/*/*' 'refs/remotes/origin/fix/*' \
+      'refs/remotes/origin/feat/*' 2>/dev/null \
     | awk -F/ -v id="$id" '$NF==id || substr($NF,1,length(id)+1)==id"-"')
   printf '%s' "${best:-$first}"
 }

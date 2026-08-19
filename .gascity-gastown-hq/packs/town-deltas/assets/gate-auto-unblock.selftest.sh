@@ -93,7 +93,33 @@ FX="${FX_DIR:?}"
 SUBCMD="${3:-}"
 case "$SUBCMD" in
   for-each-ref)
-    cat "$FX/branches.txt" 2>/dev/null
+    # git -C <rig> for-each-ref --format=... <pattern1> [<pattern2> ...]
+    # Filtra branches.txt pelos padrões de path recebidos, como o git
+    # real faria — sem filtrar, o shim devolve tudo sempre e não
+    # consegue provar que o SUT pediu o namespace certo (ga-rdx5h:
+    # branch_for não buscava refs/remotes/origin/feat/*, e um mock que
+    # ignora os padrões mascararia esse bug pra sempre — qualquer teste
+    # passaria com ou sem o fix).
+    shift 3
+    patterns=()
+    for a in "$@"; do
+      case "$a" in
+        --format=*) ;;
+        *) patterns+=("$a") ;;
+      esac
+    done
+    while IFS= read -r ln; do
+      [ -n "$ln" ] || continue
+      # branches.txt guarda refname:short ("origin/fix/…"); os padrões
+      # recebidos são full ref path ("refs/remotes/origin/fix/*") — o
+      # git real casa contra o nome INTEIRO da ref, não o short form.
+      full="refs/remotes/$ln"
+      for p in "${patterns[@]}"; do
+        case "$full" in
+          $p) printf '%s\n' "$ln"; break ;;
+        esac
+      done
+    done < "$FX/branches.txt" 2>/dev/null
     exit 0
     ;;
   cherry)
@@ -330,6 +356,26 @@ case "$OUT" in
   *"R1 wa-multi"*)
     bad "blocking issue 2: escolheu a branch crew ABANDONADA (alfabeticamente primeira) e disparou R1 — a branch fix REAL com trabalho pendente ficaria sem lock e sem exame" "$OUT";;
   *) bad "blocking issue 2: resultado inesperado" "$OUT";;
+esac
+
+# ── ga-rdx5h: branch_for ignora refs/remotes/origin/feat/* ─────────────
+# Caso real (ga-06mt3k, branch feat/ga-06mt3k-capacity-hierarchy): o
+# glob de for-each-ref só busca 'crew/*/*' e 'fix/*' — 'feat/*' (o
+# prefixo OBRIGATÓRIO pra branch de story/feature nesta cidade, exigido
+# pelo push guard) nunca é considerado. branch_for() devolve vazio
+# mesmo com a branch existindo com commits reais, R1 dispara
+# "sem branch no remoto e sem commit próprio", e apply_and_report
+# remove o gate:needs-human de verdade — silenciosamente derrotando o
+# circuit breaker (ga-stu930) pra toda uma classe de branch.
+setup ga-06mt3k '["gate:needs-human"]' \
+  'origin/feat/ga-06mt3k-capacity-hierarchy' '+ 173b5ffc5' '1755000000'
+OUT="$(run)"
+case "$OUT" in
+  *"R1 ga-06mt3k"*)
+    bad "ga-rdx5h: branch feat/* com trabalho único foi lida como órfã (R1) — branch_for não busca refs/remotes/origin/feat/*, derrotando o circuit breaker" "$OUT";;
+  *"ga-06mt3k"*"feat/ga-06mt3k-capacity-hierarchy"*)
+    ok "ga-rdx5h: branch feat/* agora é resolvida por branch_for — não vira mais órfão falso (ga-06mt3k, evidência ao vivo do bug)";;
+  *) bad "ga-rdx5h: resultado inesperado para branch feat/*" "$OUT";;
 esac
 
 # ── armadilha D: label "failed" sem veredito FAIL (ga-xt8zrf) ──────────
