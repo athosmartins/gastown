@@ -1,0 +1,162 @@
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 02a2e0614..86988edf7 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -3258,8 +3258,26 @@ func bdReadyPoolDemandShell(limitFlag string, includeEphemeralReady bool) string
+ // pilot:refused-reason:<slug>, gate:needs-human(:<reason>)) is handled in
+ // poolDemandLabelFilterJQ below, for the same reason pool:refused:*/
+ // pilot:held* are: --exclude-label cannot express a prefix match.
++//
++// ga-s1d5o: needs-human-decision, the refino-stage family (story:refinement-
++// in-progress, story:unrefined, refino:policy-gap, refino:info-gap,
++// auto-refino:escalated, story:refino-escalado, story:refino-review,
++// auto-refino:refining), and the manual-execution family (exec:manual,
++// on-device, story:needs-device, phone-proxy) are appended last of all.
++// This function's own doc-comment above claims it "mirrors
++// agents/wa-worker/prompt.template.md Step 1b3", but ga-znlvl (commit
++// 34a64626c) added exactly these labels to Step 1b3's hardcoded text only —
++// never here. Because EffectiveRoutedPoolQuery (built on this function) is
++// what wa-worker/ps-worker render as Step 1b2, which runs BEFORE Step 1b3
++// and is not gated for a genuinely ephemeral session, the two queries
++// silently diverged: Step 1b2 could still hand back a bead Step 1b3 would
++// have correctly rejected. Live-reproduced: wa-41cep (exec:manual,
++// ctx:ready, no pool:refused/pilot:refused-reason) surfaced as Step 1b2's #1
++// candidate for an ephemeral wa-worker session. Same root as ga-znlvl —
++// this probe never learned a label another consumer already knew about —
++// just a second, previously-unaudited call site for it.
+ func bdReadyPoolDemandExcludeLabelArgs() string {
+-	return ` --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked"`
++	return ` --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "needs-human-decision" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy"`
+ }
+ 
+ // poolDemandLabelFilterJQ is the PREFIX half of the routed-pool predicate: the
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index 05df06935..2b9a512e8 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -1725,7 +1725,7 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
+ 	if strings.Contains(got, `--include-ephemeral`) {
+ 		t.Errorf("EffectiveWorkQuery() default must be bd 1.0.4-compatible without --include-ephemeral: %q", got)
+ 	}
+-	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json --sort oldest --limit=20`) {
++	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "needs-human-decision" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --json --sort oldest --limit=20`) {
+ 		t.Errorf("EffectiveWorkQuery() missing tier 3 pool-demand probe: %q", got)
+ 	}
+ 	if !strings.Contains(got, "-- mayor") {
+@@ -1747,7 +1747,7 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
+ func TestEffectiveWorkQueryBD105CompatibilityOptIn(t *testing.T) {
+ 	a := Agent{Name: "mayor"}
+ 	got := a.EffectiveWorkQueryForBeads(BeadsConfig{BDCompatibility: BeadsBDCompatibility105})
+-	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json --sort oldest --limit=20`) {
++	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "needs-human-decision" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --json --sort oldest --limit=20`) {
+ 		t.Errorf("EffectiveWorkQueryForBeads(bd-1.0.5) missing include-ephemeral routed probe: %q", got)
+ 	}
+ 	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=1`) {
+@@ -2046,6 +2046,80 @@ func TestBdReadyPoolDemandExcludeLabelArgsIncludesEngineWindowAndParkLabels(t *t
+ 	}
+ }
+ 
++// TestBdReadyPoolDemandExcludeLabelArgsIncludesManualExecutionAndRefinoStageLabels
++// (ga-s1d5o): this function's own doc-comment claims it mirrors
++// agents/wa-worker/prompt.template.md Step 1b3, but ga-znlvl (commit
++// 34a64626c) and its six sibling fixes (ga-y8qh, ga-nf4x5, ga-en2s, ga-uvfs6,
++// ga-3lsy1, ga-7ha7g) only ever touched Step 1b3's hardcoded shell text —
++// never this shared Go function, which independently renders
++// EffectiveRoutedPoolQuery (wa-worker/ps-worker Step 1b2, run BEFORE Step
++// 1b3 and not gated for a genuinely ephemeral session) and the dog pool's own
++// EffectiveWorkQuery tier 3. Live-reproduced: wa-41cep (exec:manual,
++// ctx:ready, no pool:refused/pilot:refused-reason) surfaced as Step 1b2's #1
++// candidate for an ephemeral wa-worker session, even though the corrected
++// Step 1b3 immediately downstream would have excluded it — Step 1b2 runs
++// first and returns before Step 1b3 is ever reached. Fold Step 1b3's
++// exec:manual + refino-stage + on-device/device/phone-proxy list into this
++// shared function so both call sites stay in sync going forward, the way the
++// doc-comment already claims they do.
++func TestBdReadyPoolDemandExcludeLabelArgsIncludesManualExecutionAndRefinoStageLabels(t *testing.T) {
++	got := bdReadyPoolDemandExcludeLabelArgs()
++	for _, want := range []string{
++		`--exclude-label "needs-human-decision"`,
++		`--exclude-label "story:refinement-in-progress"`,
++		`--exclude-label "story:unrefined"`,
++		`--exclude-label "refino:policy-gap"`,
++		`--exclude-label "refino:info-gap"`,
++		`--exclude-label "auto-refino:escalated"`,
++		`--exclude-label "story:refino-escalado"`,
++		`--exclude-label "story:refino-review"`,
++		`--exclude-label "auto-refino:refining"`,
++		`--exclude-label "exec:manual"`,
++		`--exclude-label "on-device"`,
++		`--exclude-label "story:needs-device"`,
++		`--exclude-label "phone-proxy"`,
++	} {
++		if !strings.Contains(got, want) {
++			t.Fatalf("bdReadyPoolDemandExcludeLabelArgs() = %q, missing %q", got, want)
++		}
++	}
++}
++
++// TestEffectiveRoutedPoolQueryExcludesManualExecutionBead (ga-s1d5o) is the
++// end-to-end regression for the wa-41cep live repro: a bead carrying
++// exec:manual must never be the candidate EffectiveRoutedPoolQuery (wa-worker/
++// ps-worker Step 1b2) hands back, even though bd's own exact-match
++// --exclude-label filtering happens inside the real `bd` binary and can't be
++// simulated by the fake stub here. What this test CAN and does verify end to
++// end: the generated command actually invokes bd with the exec:manual
++// exclusion flag present (regressing this would silently drop the flag from
++// the rendered shell even if the string-only test above still passed against
++// stale expectations), and that a fake bd honoring that flag correctly
++// produces no candidate.
++func TestEffectiveRoutedPoolQueryExcludesManualExecutionBead(t *testing.T) {
++	a := Agent{Name: "worker", Dir: "hello-world"}
++	got := a.EffectiveRoutedPoolQuery()
++	if !strings.Contains(got, `--exclude-label "exec:manual"`) {
++		t.Fatalf("EffectiveRoutedPoolQuery() = %q, missing --exclude-label \"exec:manual\"", got)
++	}
++
++	out := runShellWithFakeBd(t, got, nil, `#!/bin/sh
++set -eu
++case "$*" in
++  *"metadata-field gc.routed_to=hello-world/worker"*"exclude-label exec:manual"*)
++    printf '[]'
++    ;;
++  *"metadata-field gc.routed_to=hello-world/worker"*)
++    printf '[{"id":"wa-41cep","labels":["exec:manual"]}]'
++    ;;
++  *) printf '[]' ;;
++esac
++`)
++	if strings.TrimSpace(out) != `[]` {
++		t.Fatalf("EffectiveRoutedPoolQuery() output = %q, want [] (exec:manual bead must not surface as a candidate)", out)
++	}
++}
++
+ // TestPoolDemandLabelFilterJQExcludesParkLabels (ga-5huvs) is the PREFIX half
+ // of the same fix: blocked:<reason>, pilot:refused-reason:<slug>, and
+ // gate:needs-human(:<reason>) cannot be expressed via bd's exact-match
+@@ -2297,7 +2371,7 @@ func TestEffectiveWorkQueryRoutedQueueUsesNativeOldestSortAcrossReadyTiers(t *te
+ 	}, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  "ready --metadata-field gc.routed_to=hello-world/worker --unassigned --exclude-type=epic --exclude-label story:needs-human --exclude-label needs-human --exclude-label ctx:thin --exclude-label story:needs-approval --exclude-label story:epic --exclude-label needs:engine-window --exclude-label pilot:no-auto-dispatch --exclude-label story:blocked --json --sort oldest --limit=20")
++  "ready --metadata-field gc.routed_to=hello-world/worker --unassigned --exclude-type=epic --exclude-label story:needs-human --exclude-label needs-human --exclude-label ctx:thin --exclude-label story:needs-approval --exclude-label story:epic --exclude-label needs:engine-window --exclude-label pilot:no-auto-dispatch --exclude-label story:blocked --exclude-label needs-human-decision --exclude-label story:refinement-in-progress --exclude-label story:unrefined --exclude-label refino:policy-gap --exclude-label refino:info-gap --exclude-label auto-refino:escalated --exclude-label story:refino-escalado --exclude-label story:refino-review --exclude-label auto-refino:refining --exclude-label exec:manual --exclude-label on-device --exclude-label story:needs-device --exclude-label phone-proxy --json --sort oldest --limit=20")
+     printf '[{"id":"older-no-history","priority":2,"created_at":"2026-05-20T06:09:30Z","no_history":true}]'
+     ;;
+   *)
+@@ -2446,7 +2520,7 @@ func TestEffectiveWorkQueryExcludesEpics(t *testing.T) {
+ 	// resume its own assigned ephemeral epic wisp (the patrol-loop pattern).
+ 	wantPresent := []string{
+ 		// routed/pool tier still excludes epics (gc-udx guard)
+-		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json`,
++		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "needs-human-decision" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --json`,
+ 		// assigned tiers carry NO epic exclusion
+ 		`bd list --status in_progress --assignee="$id" --json`,
+ 		`bd ready --assignee="$id" --json`,
+@@ -2472,7 +2546,7 @@ func TestEffectiveWorkQueryExcludesEpicsControlDispatcher(t *testing.T) {
+ 	a := Agent{Name: ControlDispatcherAgentName, Dir: "gascity"}
+ 	got := a.EffectiveWorkQuery()
+ 	wantPresent := []string{
+-		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json`,
++		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "needs-human-decision" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --json`,
+ 		`bd list --status in_progress --assignee="$cand" --json`,
+ 		`bd ready --assignee="$cand" --json`,
+ 		`-- gascity/control-dispatcher gascity/workflow-control`,
