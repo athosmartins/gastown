@@ -157,6 +157,7 @@ notify_once() {
 
 checked=0
 stale=0
+unresolved=0
 
 proc=$(find_process "$SUPERVISOR_NEEDLE") || { echo "supervisor-formula-staleness-guard: com.gascity.supervisor not found running — skipping cycle."; exit 0; }
 sup_pid=$(printf '%s' "$proc" | awk '{print $1}')
@@ -171,17 +172,41 @@ while IFS=$'\t' read -r order_name formula_name; do
     [ -n "$formula_name" ] || continue
     checked=$((checked+1))
 
-    formula_json=$("$GC_BIN" bd formula show "$formula_name" --json 2>/dev/null) || continue
-    [ -n "$formula_json" ] || continue
-    src=$(printf '%s' "$formula_json" | jq -r '.source // empty' 2>/dev/null) || continue
-    [ -n "$src" ] || continue
-    real_src=$(resolve_real_path "$src") || continue
-    [ -n "$real_src" ] || continue
+    # GATE FIX (blocking issue 2): every branch below that `continue`s without
+    # reaching the stale/fresh verdict now increments `unresolved` first. This
+    # is the SAME "don't know" bucket regardless of WHICH lookup step failed
+    # (gc bd formula show erroring, a reshaped/missing .source field, a
+    # broken symlink, or git log failing for a reason other than "never
+    # committed") -- what matters for the third-state check below is only
+    # that this order's staleness could NOT be determined, not why. A future
+    # `gc` output-shape change that breaks every lookup at once must be
+    # VISIBLE, not silently indistinguishable from "checked everything, all
+    # fresh" (verified live: forcing every `gc bd formula show` call to fail
+    # while `gc order list` still succeeds previously produced zero stdout,
+    # zero notify, exit 0 -- identical to a genuinely healthy cycle).
+    formula_json=$("$GC_BIN" bd formula show "$formula_name" --json 2>/dev/null) || { unresolved=$((unresolved+1)); continue; }
+    [ -n "$formula_json" ] || { unresolved=$((unresolved+1)); continue; }
+    src=$(printf '%s' "$formula_json" | jq -r '.source // empty' 2>/dev/null) || { unresolved=$((unresolved+1)); continue; }
+    [ -n "$src" ] || { unresolved=$((unresolved+1)); continue; }
+    real_src=$(resolve_real_path "$src") || { unresolved=$((unresolved+1)); continue; }
+    [ -n "$real_src" ] || { unresolved=$((unresolved+1)); continue; }
 
-    commit_epoch=$("$GIT_BIN" -C "$CITY" log -1 --format='%ct' origin/main -- "$real_src" 2>/dev/null) || continue
-    case "$commit_epoch" in ''|*[!0-9]*) continue ;; esac   # not git-tracked (e.g. a .gc/system materialized copy) -- no evidence, skip rather than guess
+    commit_epoch=$("$GIT_BIN" -C "$CITY" log -1 --format='%ct' origin/main -- "$real_src" 2>/dev/null) || { unresolved=$((unresolved+1)); continue; }
+    case "$commit_epoch" in
+        '')
+            # Empty output: either never git-committed (a legitimate state --
+            # e.g. a .gc/system materialized copy, no evidence either way) OR
+            # `git log` itself failed silently. Can't tell which from here,
+            # but either way this order's staleness is genuinely unknown, not
+            # "confirmed fresh" -- count it so an ALL-unresolved cycle is
+            # still visible even when every failure is this specific shape.
+            unresolved=$((unresolved+1)); continue ;;
+        *[!0-9]*) unresolved=$((unresolved+1)); continue ;;
+    esac
 
-    [ "$commit_epoch" -gt "$sup_start_epoch" ] || continue
+    if [ "$commit_epoch" -le "$sup_start_epoch" ]; then
+        continue   # positively confirmed fresh -- a real verdict, not a skip
+    fi
 
     stale=$((stale+1))
     stale_h=$(( (commit_epoch - sup_start_epoch) / 3600 ))
@@ -193,8 +218,18 @@ while IFS=$'\t' read -r order_name formula_name; do
         || true
 done < <(printf '%s' "$orders_json" | jq -r '.orders[]? | select(.type=="formula") | "\(.name)\t\(.formula)"' 2>/dev/null)
 
-echo "$SEEN_JSON" > "$SEEN_FILE" 2>/dev/null || true
-
-if [ "$stale" -gt 0 ]; then
-    echo "supervisor-formula-staleness-guard: $stale/$checked formula order(s) potentially stale under the current supervisor run"
+# GATE FIX (blocking issue 2, continued): a summary line is now ALWAYS
+# printed, not gated behind `stale > 0` -- silence must mean "confirmed
+# healthy," never "confirmed healthy OR gave up on everything," and a log
+# reader (or a future automated consumer of this guard's output) needs the
+# unresolved count to tell those apart.
+if [ "$checked" -gt 0 ] && [ "$unresolved" -eq "$checked" ]; then
+    echo "supervisor-formula-staleness-guard: $unresolved/$checked formula order(s) could not be checked at all this cycle (every lookup failed) -- staleness UNKNOWN, not confirmed fresh."
+    notify_once "supervisor-formula-guard-degraded" "Guard de staleness do supervisor não conseguiu checar nada" \
+        "supervisor-formula-staleness-guard: $unresolved/$checked orders falharam em TODAS as tentativas de lookup nesse ciclo -- possivelmente gc order list/bd formula show mudou de formato. Staleness dos formulas ficou desconhecida, não confirmada como saudável." \
+        || true
+elif [ "$stale" -gt 0 ] || [ "$unresolved" -gt 0 ]; then
+    echo "supervisor-formula-staleness-guard: checked=$checked stale=$stale unresolved=$unresolved"
 fi
+
+echo "$SEEN_JSON" > "$SEEN_FILE" 2>/dev/null || true

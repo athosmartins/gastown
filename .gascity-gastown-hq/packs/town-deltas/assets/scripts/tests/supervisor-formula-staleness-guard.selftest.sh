@@ -57,10 +57,23 @@ GIT_AUTHOR_DATE="@$OLD" GIT_COMMITTER_DATE="@$OLD" \
     git -C "$CITY" commit -q -m "chore: formula-b stub"
 
 # formula-c: order-c is type=EXEC, not formula -- must never be looked up
-# at all. If the type filter ever breaks, fake-gc has no FAKE_FORMULA_SOURCES
-# entry for "formula-c" and would exit 1, which the real script already
-# treats as "skip this order" -- so a broken filter would go undetected by
-# that alone. Assert directly on notify output instead (section 2 below).
+# at all. GATE FIX (blocking issue 1): a prior version of this fixture gave
+# order-c NO resolvable formula, so a completely REMOVED type filter would
+# still silently `continue` on the resulting formula_name="null" lookup
+# (jq's `\(.formula)` on a missing field renders literally "null", which
+# has no FAKE_FORMULA_SOURCES entry) -- indistinguishable from a working
+# filter (verified live: replacing `select(.type=="formula")` with
+# `select(true)` in the real script still passed this selftest 10/10).
+# formula-c is now git-committed at NOW, the SAME stale shape as formula-a,
+# and DOES have a FAKE_FORMULA_SOURCES entry -- so if the type filter is
+# ever weakened or removed, order-c reaches the exact same successful
+# lookup path formula-a does and gets reported STALE, a positive, wrong
+# signal the assertion below can actually catch, instead of relying on a
+# downstream lookup coincidentally failing for an unrelated reason.
+echo "# stub-c" > "$CITY/formulas/formula-c.toml"
+git -C "$CITY" add formulas/formula-c.toml
+GIT_AUTHOR_DATE="@$NOW" GIT_COMMITTER_DATE="@$NOW" \
+    git -C "$CITY" commit -q -m "chore: formula-c stub (same stale shape as formula-a)"
 
 # formula-d: order-d is type=formula but its source resolves to a file that
 # was NEVER git-committed -- `git log` returns empty -- must be skipped
@@ -73,7 +86,7 @@ ORDER_LIST_JSON=$(cat <<EOF
 {"ok":true,"orders":[
   {"name":"order-a","type":"formula","formula":"formula-a"},
   {"name":"order-b","type":"formula","formula":"formula-b"},
-  {"name":"order-c","type":"exec","exec":"echo hi"},
+  {"name":"order-c","type":"exec","exec":"echo hi","formula":"formula-c"},
   {"name":"order-d","type":"formula","formula":"formula-d"}
 ]}
 EOF
@@ -81,6 +94,7 @@ EOF
 
 FORMULA_SOURCES="formula-a	$CITY/.beads/formulas/formula-a.formula.toml
 formula-b	$CITY/formulas/formula-b.toml
+formula-c	$CITY/formulas/formula-c.toml
 formula-d	$CITY/formulas/formula-d.toml"
 
 run_guard() {
@@ -110,7 +124,7 @@ OUT1=$(run_guard "$SUP_PS_OUTPUT")
 
 if printf '%s' "$OUT1" | grep -q "order=order-a "; then ok "order-a (stale, formula edited after supervisor start) reported"; else bad "order-a NOT reported (should be stale)"; fi
 if printf '%s' "$OUT1" | grep -q "order=order-b "; then bad "order-b (fresh, formula edited before supervisor start) incorrectly reported"; else ok "order-b correctly silent"; fi
-if printf '%s' "$OUT1" | grep -q "order-c"; then bad "order-c (type=exec, not formula) was looked up at all -- type filter broken"; else ok "order-c (type=exec) correctly excluded by the type=formula filter"; fi
+if printf '%s' "$OUT1" | grep -q "order=order-c "; then bad "order-c (type=exec, not formula) was reported STALE -- type filter let it through despite having a resolvable, stale-shaped formula (formula-c)"; else ok "order-c (type=exec, formula=formula-c resolvable+stale if ever reached) correctly excluded by the type=formula filter"; fi
 if printf '%s' "$OUT1" | grep -q "order=order-d "; then bad "order-d (untracked formula file, no git evidence) incorrectly reported as stale"; else ok "order-d (no git history for its formula file) correctly skipped, no crash, no guessed verdict"; fi
 
 echo "── 3. functional: notify fires exactly once (only order-a is stale) ──"
@@ -138,6 +152,38 @@ echo "── 6. functional: a run past the escalate window DOES re-notify (dedup
 TEST_ESCALATE_AFTER_S=0 run_guard "$SUP_PS_OUTPUT" >/dev/null
 NOTIFY_COUNT_THIRD=$(wc -l < "$NOTIFY_LOG" | tr -d ' ')
 if [ "$NOTIFY_COUNT_THIRD" -gt "$NOTIFY_COUNT_SECOND" ]; then ok "re-notified after escalate window elapsed ($NOTIFY_COUNT_SECOND -> $NOTIFY_COUNT_THIRD)"; else bad "did NOT re-notify after escalate window elapsed (stuck at $NOTIFY_COUNT_THIRD) -- a real still-stale supervisor would go silent forever"; fi
+
+echo "── 7. functional (GATE FIX, blocking issue 2): every per-order lookup failing must be VISIBLE, never silently identical to a healthy cycle ──"
+# Verified live before this fix existed: forcing every `gc bd formula show`
+# call to fail while `gc order list --json` still succeeds produced ZERO
+# stdout, ZERO notify calls, exit 0 -- byte-identical to a genuinely healthy
+# "checked everything, all fresh" cycle. Two orders here, neither with a
+# FAKE_FORMULA_SOURCES entry, so both hit the unresolved path regardless of
+# type filtering (order-x/y are both type=formula).
+ORDER_LIST_JSON_ALL_UNRESOLVED='{"ok":true,"orders":[
+  {"name":"order-x","type":"formula","formula":"formula-x-no-fixture"},
+  {"name":"order-y","type":"formula","formula":"formula-y-no-fixture"}
+]}'
+: > "$NOTIFY_LOG"
+rm -f "$WORK/seen.json"
+OUT3=$(env -i \
+    PATH="/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    GC_CITY_PATH="$CITY" \
+    STALE_FORMULA_SEEN_FILE="$WORK/seen.json" \
+    STALE_FORMULA_ESCALATE_AFTER_S=86400 \
+    PS_BIN="$FAKE_PS" \
+    GC_BIN="$FAKE_GC" \
+    NOTIFY_BIN="$FAKE_NOTIFY" \
+    FAKE_PS_OUTPUT="$SUP_PS_OUTPUT" \
+    FAKE_ORDER_LIST_JSON="$ORDER_LIST_JSON_ALL_UNRESOLVED" \
+    FAKE_FORMULA_SOURCES="" \
+    NOTIFY_LOG="$NOTIFY_LOG" \
+    bash "$SCRIPT")
+if printf '%s' "$OUT3" | grep -qi "could not be checked at all\|UNKNOWN"; then ok "all-unresolved cycle prints an explicit degraded-state message"; else bad "all-unresolved cycle produced no distinguishing message -- silent, indistinguishable from a healthy cycle (the exact defect this section exists to catch)"; fi
+NOTIFY_COUNT_DEGRADED=$(wc -l < "$NOTIFY_LOG" | tr -d ' ')
+if [ "$NOTIFY_COUNT_DEGRADED" -ge "1" ]; then ok "all-unresolved cycle fires a notify ($NOTIFY_COUNT_DEGRADED call(s))"; else bad "all-unresolved cycle fired NO notify -- would go dark with nothing to page on"; fi
+if grep -qi "conseguiu checar nada" "$NOTIFY_LOG"; then ok "degraded notify carries a distinct message from the per-order stale alert"; else bad "degraded notify text does not distinguish itself from a normal stale alert"; fi
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
