@@ -213,11 +213,11 @@ EOF
 _do_autoclose() {
   local agent="$1" work_dir="$2" reasons_summary="$3"
   local body="Fechando ${agent} (${work_dir}) sozinho — janela noturna (22h-07h), ociosa confirmada (${reasons_summary}), sem trabalho nao commitado. Politica: ga-06mt3k / decisao Athos 14/08."
-  if "${GC}" session kill "$agent" >/dev/null 2>&1; then
+  if "${GC}" session close "$agent" >/dev/null 2>&1; then
     log "AUTOCLOSE: ${agent} closed. ${body}"
     "${GC}" mail send mayor -s "Capacidade: fechei ${agent} (janela noturna)" -m "${body}" >/dev/null 2>&1 || true
   else
-    log "AUTOCLOSE-FAILED: gc session kill ${agent} did not succeed — left as-is, will retry next cycle."
+    log "AUTOCLOSE-FAILED: gc session close ${agent} did not succeed — left as-is, will retry next cycle."
   fi
 }
 
@@ -375,7 +375,7 @@ MOCKBD5
   # real binary and cannot see a shell function override — so session data is
   # injected via CCC_SESSIONS_JSON_FILE (a supported override seam) instead of
   # trying to mock that call. The gc() function below only needs to intercept
-  # the NOT-timeout-wrapped calls: `mail send` and `session kill`.
+  # the NOT-timeout-wrapped calls: `mail send` and `session close`.
   gc() {
     case "$1" in
       session) echo "S5-REGRESSION: session ${2:-} should not be called in ask window" >> "${_ST_ROOT}/s5-unexpected-close" ;;
@@ -387,7 +387,7 @@ MOCKBD5
     CCC_SESSIONS_JSON_FILE="${_ST_SESS5}" \
     main >/dev/null 2>&1
   [ -f "${_s5_mail_marker}" ] && ok "day window, idle crew -> mail sent (asked)" || bad "should have sent a mail asking"
-  [ -f "${_ST_ROOT}/s5-unexpected-close" ] && bad "REGRESSION: session kill called during ask window" || ok "session kill NOT called during ask window"
+  [ -f "${_ST_ROOT}/s5-unexpected-close" ] && bad "REGRESSION: session close called during ask window" || ok "session close NOT called during ask window"
   unset -f gc
 
   echo "S6: main() end-to-end — EMERGENCY, autoclose window, idle crew -> closes, does not just ask"
@@ -396,7 +396,7 @@ MOCKBD5
   rm -f "${_s6_kill_marker}" "${_s6_mail_marker}"
   gc() {
     case "$1" in
-      session) [ "${2:-}" = "kill" ] && { touch "${_s6_kill_marker}"; return 0; } ;;
+      session) [ "${2:-}" = "close" ] && { touch "${_s6_kill_marker}"; return 0; } ;;
       mail) touch "${_s6_mail_marker}" ;;
     esac
   }
@@ -404,7 +404,7 @@ MOCKBD5
     CCC_TEST_RAM_LEVEL=EMERGENCY CCC_ASK_WINDOW_START_HOUR=25 CCC_ASK_WINDOW_END_HOUR=26 \
     CCC_SESSIONS_JSON_FILE="${_ST_SESS5}" \
     main >/dev/null 2>&1
-  [ -f "${_s6_kill_marker}" ] && ok "autoclose window, idle crew -> gc session kill called" || bad "should have called session kill"
+  [ -f "${_s6_kill_marker}" ] && ok "autoclose window, idle crew -> gc session close called" || bad "should have called session close"
   [ -f "${_s6_mail_marker}" ] && ok "autoclose still sends a durable mail record" || bad "autoclose should still mail (log+comentario requirement)"
   unset -f gc
 
