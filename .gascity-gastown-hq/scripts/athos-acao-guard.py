@@ -359,9 +359,14 @@ def _fetch_notes_and_comments(rig_path, bid):
     """Return (notes, comments) for one bead, or ("", []) on any failure —
     fail-open toward "no narrated decision found" (the normal MARKER_LABEL
     flow still fires either way; this only ever adds the second, stronger
-    signal, never blocks the first). Only called for beads that already
-    qualify as a NEW gap this cycle, so this is a handful of extra `bd show`
-    calls per cycle, not one per bead scanned."""
+    signal, never blocks the first). Called for any bead that currently
+    qualifies as a gap and does not yet carry NARRATED_MARKER_LABEL — a
+    brand-new gap this cycle, OR one already carrying MARKER_LABEL from a
+    prior cycle that has never been narration-checked (GATE FIX ga-1dpb7,
+    attempt 1/3 FAIL: the dominant real-world shape — 5/6 sampled beads were
+    exactly this). Still bounded to a handful of `bd show` calls per cycle,
+    not one per bead scanned, since it stops once NARRATED_MARKER_LABEL is
+    applied."""
     try:
         r = _bd(rig_path, "show", bid, "--json", "--include-comments", timeout=20)
         if r.returncode != 0 or not r.stdout.strip():
@@ -374,6 +379,32 @@ def _fetch_notes_and_comments(rig_path, bid):
         return "", []
 
 
+def _classify_bead(qualifies_gap, has_marker, has_narrated_marker):
+    """Pure decision function for scan_rig()'s per-bead branching.
+
+    Extracted (GATE FIX ga-1dpb7, attempt 1/3 FAIL) so the has_marker+
+    still-qualifying case can be regression-tested without a live bd/
+    subprocess dependency — the original inline if/elif in scan_rig() had no
+    test coverage of its own branch selection, only of the pure predicates
+    it calls, which is exactly where the reported defect lived.
+
+    Returns (is_new_gap, needs_narration_check, is_resolved):
+      is_new_gap: MARKER_LABEL should be (re-)added — bid goes in `gaps`.
+      needs_narration_check: notes/latest-comment should be fetched and
+        tested via _has_narrated_decision. True whenever the bead currently
+        qualifies as a gap and does not yet carry NARRATED_MARKER_LABEL —
+        covers a brand-new gap AND an already-marked bead that still
+        qualifies but was never narration-checked (the bug: a decision can
+        be narrated AFTER the bead was first flagged, and the old code could
+        never see it once MARKER_LABEL was applied).
+      is_resolved: both marker labels should be removed — bid goes in
+        `resolved`.
+    """
+    if qualifies_gap:
+        return (not has_marker, not has_narrated_marker, False)
+    return (False, False, has_marker or has_narrated_marker)
+
+
 def scan_rig(rig_path):
     """Return (gaps, resolved, narrated) bead-id lists for one rig store, or
     None on error.
@@ -383,11 +414,16 @@ def scan_rig(rig_path):
     resolved: EITHER marker label is present, but athos.acao is now filled OR
           the bead no longer qualifies (status settled / labels changed) —
           both markers should be removed so neither outlives the gap.
-    narrated: SUBSET of gaps (ga-1dpb7) where notes/latest-comment already
-          narrate the decision in prose — gets the stronger NARRATED_MARKER_LABEL
-          in addition to MARKER_LABEL, same cycle.
-    Already-flagged-and-still-a-gap beads are intentionally excluded from all
-    three lists: they need no action this cycle (silence = healthy).
+    narrated: bead IDs (ga-1dpb7) where notes/latest-comment already narrate
+          the decision in prose and NARRATED_MARKER_LABEL is not yet applied
+          — gets that stronger marker this cycle. NOT a subset of `gaps`
+          (GATE FIX, attempt 1/3 FAIL): it also includes already-marked
+          beads that still qualify as a gap, so a decision narrated AFTER
+          the initial flag is still caught on a later cycle.
+    A bead that already carries MARKER_LABEL, still qualifies, and has
+    already been narration-checked (has NARRATED_MARKER_LABEL either way)
+    needs no action this cycle — that is the only case excluded from all
+    three lists (silence = healthy).
     """
     try:
         r = _bd(rig_path, "list", "--status", ",".join(NON_TERMINAL_STATUSES),
@@ -412,12 +448,15 @@ def scan_rig(rig_path):
         has_marker = MARKER_LABEL in labels
         has_narrated_marker = NARRATED_MARKER_LABEL in labels
         qualifies_gap = is_sua_vez_acao_gap(labels, assignee, acao, status)
-        if qualifies_gap and not has_marker:
+        is_new_gap, needs_narration_check, is_resolved = _classify_bead(
+            qualifies_gap, has_marker, has_narrated_marker)
+        if is_new_gap:
             gaps.append(bid)
+        if needs_narration_check:
             notes, comments = _fetch_notes_and_comments(rig_path, bid)
             if _has_narrated_decision(notes, comments):
                 narrated.append(bid)
-        elif (has_marker or has_narrated_marker) and not qualifies_gap:
+        if is_resolved:
             resolved.append(bid)
     return gaps, resolved, narrated
 
@@ -450,7 +489,6 @@ def run_cycle():
             continue
         result["rigs_ok"] += 1
         gaps, resolved, narrated = scan
-        narrated_set = set(narrated)
         for bid in gaps:
             r = _bd(rig_path, "label", "add", bid, MARKER_LABEL, timeout=15)
             if r.returncode == 0:
@@ -460,18 +498,20 @@ def run_cycle():
             else:
                 print(f"[ATHOS-ACAO-GUARD] [FLAG-FAILED] {rig_name}/{bid}: "
                       f"{r.stderr.strip()[:200]}", flush=True)
-            if bid in narrated_set:
-                # ga-1dpb7: second, stronger marker — decision already narrated
-                # in prose, just never copied into athos.acao. Additive to the
-                # normal FLAGGED handling above, never a replacement for it.
-                rn = _bd(rig_path, "label", "add", bid, NARRATED_MARKER_LABEL, timeout=15)
-                if rn.returncode == 0:
-                    emit(f"[ATHOS-ACAO-GUARD] [NARRATED] {rig_name}/{bid} decision already "
-                         f"in notes/comments — copy it into athos.acao (labeled "
-                         f"{NARRATED_MARKER_LABEL})")
-                else:
-                    print(f"[ATHOS-ACAO-GUARD] [NARRATED-FLAG-FAILED] {rig_name}/{bid}: "
-                          f"{rn.stderr.strip()[:200]}", flush=True)
+        for bid in narrated:
+            # ga-1dpb7: second, stronger marker — decision already narrated in
+            # prose, just never copied into athos.acao. Independent of the
+            # FLAGGED loop above (GATE FIX, attempt 1/3 FAIL): `narrated` also
+            # covers beads already carrying MARKER_LABEL from a prior cycle,
+            # so this must not be gated on `bid in gaps`.
+            rn = _bd(rig_path, "label", "add", bid, NARRATED_MARKER_LABEL, timeout=15)
+            if rn.returncode == 0:
+                emit(f"[ATHOS-ACAO-GUARD] [NARRATED] {rig_name}/{bid} decision already "
+                     f"in notes/comments — copy it into athos.acao (labeled "
+                     f"{NARRATED_MARKER_LABEL})")
+            else:
+                print(f"[ATHOS-ACAO-GUARD] [NARRATED-FLAG-FAILED] {rig_name}/{bid}: "
+                      f"{rn.stderr.strip()[:200]}", flush=True)
         for bid in resolved:
             ok = True
             for label in (MARKER_LABEL, NARRATED_MARKER_LABEL):
@@ -619,13 +659,47 @@ def _selftest():
             failures.append(f"FAIL: {desc} — notes={notes!r} comments={comments!r} "
                              f"expected={expected} got={got}")
 
+    # ga-1dpb7 gate finding (attempt 1/3 FAIL): _classify_bead's branch
+    # selection — specifically the has_marker+still-qualifying case scan_rig
+    # itself was never tested for. (qualifies_gap, has_marker,
+    # has_narrated_marker) -> (is_new_gap, needs_narration_check, is_resolved)
+    classify_cases = [
+        (True, False, False, (True, True, False),
+         "brand-new gap: flag it and run the narration check"),
+        (True, True, False, (False, True, False),
+         "THE BUG: already carries MARKER_LABEL from a prior cycle and still "
+         "qualifies -- must still run the narration check (old code's "
+         "if/elif matched neither branch here, so this bead could never be "
+         "narration-checked, not this cycle nor any future one)"),
+        (True, True, True, (False, False, False),
+         "already marked and already narration-checked -- nothing to do"),
+        (True, False, True, (True, False, False),
+         "qualifies gap, base marker missing but narrated marker present -- "
+         "restore the base marker, skip re-checking narration"),
+        (False, True, False, (False, False, True),
+         "no longer qualifies, base marker present -- resolve (strip markers)"),
+        (False, False, True, (False, False, True),
+         "no longer qualifies, narrated marker present -- resolve"),
+        (False, True, True, (False, False, True),
+         "no longer qualifies, both markers present -- resolve"),
+        (False, False, False, (False, False, False),
+         "never qualified, no markers -- nothing to do"),
+    ]
+    for qualifies_gap, has_marker, has_narrated_marker, expected, desc in classify_cases:
+        got = _classify_bead(qualifies_gap, has_marker, has_narrated_marker)
+        if got != expected:
+            failures.append(
+                f"FAIL: {desc} — qualifies_gap={qualifies_gap} has_marker={has_marker} "
+                f"has_narrated_marker={has_narrated_marker} expected={expected} got={got}")
+
     if failures:
         for f in failures:
             print(f, flush=True)
-        print(f"[ATHOS-ACAO-GUARD] [SELFTEST] {len(failures)}/{len(cases) + len(narrated_cases)} "
+        print(f"[ATHOS-ACAO-GUARD] [SELFTEST] "
+              f"{len(failures)}/{len(cases) + len(narrated_cases) + len(classify_cases)} "
               f"FAILED", flush=True)
         return False
-    total = len(cases) + len(narrated_cases)
+    total = len(cases) + len(narrated_cases) + len(classify_cases)
     print(f"[ATHOS-ACAO-GUARD] [SELFTEST] {total}/{total} passed", flush=True)
     return True
 
