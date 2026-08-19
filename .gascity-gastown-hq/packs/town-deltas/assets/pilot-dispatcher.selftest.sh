@@ -1109,6 +1109,36 @@ UNRELATED_META='[{"id":"bd-has-meta","assignee":null,"labels":[],"description":"
 
 echo "$_FC_FN" | grep -q 'gc.root_bead_id' && ok "_filter_candidates carries the gc.root_bead_id workflow-step exclusion clause" || bad "gc.root_bead_id exclusion clause missing from _filter_candidates"
 
+# ── Scenario 3e3b (ga-vhzy1): _reconcile_empty_description_signal exempts graph.v2
+# control beads from blocked:sem-descricao, mirroring _filter_candidates' own
+# exemption above. _filter_candidates already keeps these off the dispatch queue
+# (Scenario 3e3), but _reconcile_empty_description_signal runs BEFORE it in the
+# pipe and lacked the same exemption — every graph.v2 root/step bead with an
+# empty description (empty by design: they're direct-execution runbooks, not
+# code-build specs) got flagged blocked:sem-descricao + mailed the Mayor, on
+# every occurrence. Live repro: ga-5soui (mol-digest-generate's daily
+# workflow-finalize step, gc.kind=workflow-finalize) fired this every run.
+echo "Scenario 3e3b (ga-vhzy1): _reconcile_empty_description_signal exempts graph.v2 control beads from sem-descricao"
+_RED_FN="$(grep '^log()' "$DISPATCHER")
+$(sed -n '/^_reconcile_empty_description_signal() {/,/^}$/p' "$DISPATCHER")"
+_red() { ( eval "$_RED_FN"; DRY_RUN=1; printf '%s' "$1" | _reconcile_empty_description_signal "dummydb" 2>&1 1>/dev/null ); }
+
+RED_STEP='[{"id":"ga-5soui","description":"","labels":[],"created_by":"control-dispatcher","metadata":{"gc.root_bead_id":"ga-033hc","gc.kind":"workflow-finalize"}}]'
+RED_OUT="$(_red "$RED_STEP")"
+[ -z "$(printf '%s' "$RED_OUT" | grep 'WOULD add')" ] && ok "ga-vhzy1: graph.v2 workflow-finalize step with empty description is NOT flagged sem-descricao" || bad "ga-vhzy1: graph.v2 step wrongly flagged (got: $RED_OUT)"
+
+RED_ROOT='[{"id":"ga-033hc","description":"","labels":[],"created_by":"mol-digest-generate","metadata":{"gc.formula_contract":"graph.v2","gc.kind":"workflow"}}]'
+RED_OUT2="$(_red "$RED_ROOT")"
+[ -z "$(printf '%s' "$RED_OUT2" | grep 'WOULD add')" ] && ok "ga-vhzy1: graph.v2 workflow root with empty description is NOT flagged sem-descricao" || bad "ga-vhzy1: graph.v2 root wrongly flagged (got: $RED_OUT2)"
+
+RED_STALE='[{"id":"ga-5soui","description":"","labels":["blocked:sem-descricao"],"created_by":"control-dispatcher","metadata":{"gc.root_bead_id":"ga-033hc","gc.kind":"workflow-finalize"}}]'
+RED_OUT3="$(_red "$RED_STALE")"
+printf '%s' "$RED_OUT3" | grep -q 'WOULD remove.*ga-5soui' && ok "ga-vhzy1: already-mislabeled graph.v2 bead has the stale label scheduled for removal" || bad "ga-vhzy1: stale label not scheduled for removal (got: $RED_OUT3)"
+
+RED_NORMAL='[{"id":"dc-abcde","description":"","labels":[],"created_by":"someone","metadata":{}}]'
+RED_OUT4="$(_red "$RED_NORMAL")"
+printf '%s' "$RED_OUT4" | grep -q 'WOULD add.*dc-abcde' && ok "ga-vhzy1: ordinary non-graph.v2 empty-description bead is STILL flagged (non-regression)" || bad "ga-vhzy1: non-regression broken -- ordinary empty-description bead not flagged (got: $RED_OUT4)"
+
 # ── Scenario 3e4 (ga-nimyz): Pilot's own sling/dispatch-wrapper beads excluded ──
 # Live reproduction: dispatching ga-4iw15 created sling bead ga-mr8ej
 # (ga-4iw15.metadata.pilot.sling_bead=ga-mr8ej). ga-mr8ej inherited

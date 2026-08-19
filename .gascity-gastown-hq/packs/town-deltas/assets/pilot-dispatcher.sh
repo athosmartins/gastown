@@ -2187,10 +2187,27 @@ _reconcile_empty_description_signal() {
 
   local _red_lbl="blocked:sem-descricao"
   local _red_actions
+  # ga-vhzy1: mirror _filter_candidates' graph.v2/workflow exemption (~L2302-2306
+  # above) into this function's own $empty computation. A graph.v2 control bead
+  # (root or step: gc.root_bead_id set, gc.formula_contract set, or gc.kind in
+  # the control-kind list) has an empty description BY DESIGN — it's a direct-
+  # execution runbook serviced by control-dispatcher, not a code-build spec for
+  # a generic agent. _filter_candidates already keeps these off the dispatch
+  # queue at zero cost; without this same exemption here, this earlier-running
+  # function still flags every one of them blocked:sem-descricao + mails the
+  # Mayor, on every occurrence — pure noise (no bead is ever actually stuck),
+  # but it recurs on every graph.v2 formula run (e.g. daily mol-digest-generate's
+  # workflow-finalize step, ga-5soui) until fixed here too.
   _red_actions=$(printf '%s' "$_red_in" | jq -r --arg lbl "$_red_lbl" '
       .[] | . as $b | ($b.id // "") as $id | (($b.labels // [])) as $L
       | select($id != "")
-      | ((($b.description // "") | test("\\S")) | not) as $empty
+      | (($b.metadata["gc.root_bead_id"] // "") | test("\\S")) as $has_root
+      | (($b.metadata["gc.formula_contract"] // "") | test("\\S")) as $has_contract
+      | ((($b.metadata["gc.kind"] // "") as $k
+          | ["workflow","scope","ralph","retry","check","fanout","retry-eval","scope-check","workflow-finalize"]
+          | index($k)) != null) as $is_control_kind
+      | ($has_root or $has_contract or $is_control_kind) as $is_graph_v2_control
+      | (((($b.description // "") | test("\\S")) | not) and ($is_graph_v2_control | not)) as $empty
       | (($L | index($lbl)) != null) as $has
       | if ($empty and ($has | not)) then [$id, "add", ($b.created_by // "")]
         elif ((($empty | not)) and $has) then [$id, "remove", ""]
