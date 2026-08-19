@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gascity.crew-capacity-containment</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/crew-capacity-containment.sh</string>
+    </array>
+
+    <!-- Same cadence rationale as com.gascity.city-night-window.plist: a
+         single idempotent job re-checking state every 10min, not a
+         one-shot triggered by the RAM guard itself — ga-06mt3k's own scope
+         explicitly excludes building INTO ga-7xne1/ga-m2gqb, this consumes
+         their signal file independently on its own schedule. No action is
+         taken unless the signal currently reads EMERGENCY, so most runs are
+         a fast no-op. -->
+    <key>StartInterval</key>
+    <integer>600</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/crew-capacity-containment-launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/crew-capacity-containment-launchd.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/.local/bin</string>
+        <key>HOME</key>
+        <string>/Users/athos</string>
+        <key>GC_CITY_PATH</key>
+        <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    </dict>
+</dict>
+</plist>

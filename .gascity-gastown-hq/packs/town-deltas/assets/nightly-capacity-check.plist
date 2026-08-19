@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gascity.nightly-capacity-check</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/nightly-capacity-check.sh</string>
+    </array>
+
+    <!-- 05:00 local (-03): inside the 00h-08h citywide quiet window
+         (com.gascity.city-night-window.plist), well after any late-evening
+         activity settles and with real buffer before the 08:00 wake-up, so
+         the reading reflects overnight steady-state rather than a transient
+         spike from the city still shutting down. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>5</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/nightly-capacity-check-launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/nightly-capacity-check-launchd.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/.local/bin</string>
+        <key>HOME</key>
+        <string>/Users/athos</string>
+        <key>GC_CITY_PATH</key>
+        <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    </dict>
+</dict>
+</plist>
