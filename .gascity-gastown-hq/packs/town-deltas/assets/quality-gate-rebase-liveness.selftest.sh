@@ -456,9 +456,15 @@ if [ "${_MERGE_ROUTE_COUNT:-0}" -ge 2 ]; then
 else
   bad "BRANCH_TIP_IS_MERGE_COMMIT||FORCE_MERGE_REANCHOR routing found fewer than 2 times (count=${_MERGE_ROUTE_COUNT:-0}) — one rig-type call site may be missing the fix"
 fi
-grep -qF 'elif git -C "$TMP_REBASE_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then' "$DISPATCHER" \
-  && ok "the ORIGINAL rebase invocation is preserved verbatim as the elif fallback (AC3 non-regression: linear branches still rebase)" \
-  || bad "original rebase invocation (as an elif fallback) not found verbatim — AC3 non-regression may be broken"
+# ga-byfbd: the stderr redirect changed from 2>/dev/null to a captured temp
+# file (DEFEITO 1 — the rebase's own stderr was the one call in this block
+# still being discarded while push already captured its own) — the pin
+# below tracks that new form. The underlying invariant this check protects
+# (AC3: the plain-rebase elif branch, gated on the SAME condition, still
+# exists and still fires for a linear branch) is unaffected by that change.
+grep -qF 'elif git -C "$TMP_REBASE_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" rebase "origin/$DEFAULT_BRANCH" 2>"$_REBASE_ERR_FILE"; then' "$DISPATCHER" \
+  && ok "the ORIGINAL rebase invocation is preserved as the elif fallback, now with captured stderr (AC3 non-regression: linear branches still rebase; ga-byfbd)" \
+  || bad "original rebase invocation (as an elif fallback) not found — AC3 non-regression may be broken"
 grep -qF 'BRANCH_TIP_IS_MERGE_COMMIT=$(branch_tip_is_merge_commit "origin/$BRANCH")' "$DISPATCHER" \
   && ok "BRANCH_TIP_IS_MERGE_COMMIT is computed once per sweep from the live branch tip" \
   || bad "BRANCH_TIP_IS_MERGE_COMMIT computation call site missing/renamed"
@@ -479,9 +485,17 @@ grep -qF 'log "  Auto-merge (${_MERGE_NOT_REBASE_WHY}): merging $DEFAULT_BRANCH 
 grep -qF 'log "  Auto-merge (self-repo, ${_MERGE_NOT_REBASE_WHY}): merging $DEFAULT_BRANCH into $BRANCH instead of rebasing ..."' "$DISPATCHER" \
   && ok "auto-merge path (self-repo-rig) logs the shared reason string distinctly from a real git-rebase failure" \
   || bad "self-repo-rig auto-merge log message missing/reworded"
-grep -qF 'warn "  Auto-rebase git rebase command failed (unexpected — merge-tree reported no conflicts)"' "$DISPATCHER" \
-  && ok "the original 'real rebase failed' warning text is untouched — still distinguishable from the new auto-merge messages" \
-  || bad "original rebase-failure warning text missing/reworded — AC2 distinction may have regressed"
+# ga-byfbd: this message's wording changed — the branch it lives in no
+# longer just gives up on a real rebase failure, it now falls back to a
+# merge attempt (DEFEITO 2, ported from do_merge_ff's ga-qukyp fallback), so
+# "unexpected ... reported no conflicts" (implying nothing more will be
+# tried) would now be an inaccurate comment. The AC2 property this check
+# protects — distinguishable from the auto-merge-instead-of-rebase messages
+# at 10c above — still holds: this wording is unique to the rebase-failed
+# path and shares no text with 'Auto-merge (${_MERGE_NOT_REBASE_WHY})'.
+grep -qF 'warn "  Auto-rebase git rebase command failed (merge-tree reported no conflicts) — trying merge fallback (ga-byfbd/ga-qukyp): ${AUTO_REBASE_SETUP_ERR:-<no stderr captured>}"' "$DISPATCHER" \
+  && ok "the rebase-failed warning is still distinguishable from the auto-merge messages, now naming the merge fallback it leads into (ga-byfbd)" \
+  || bad "rebase-failure warning text missing/unexpectedly reworded — AC2 distinction may have regressed"
 
 echo "── 10d. drift-guard: AC4 — merge-commit-tip transient retries tell the author what to do, others keep 'no action needed' ──"
 grep -qF "don't wait: run 'git merge origin/\$DEFAULT_BRANCH' into \$BRANCH yourself and push" "$DISPATCHER" \

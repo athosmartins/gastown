@@ -8035,6 +8035,17 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     # captured-but-empty stderr (AUTO_REBASE_PUSH_RC is the actual failure signal).
     AUTO_REBASE_PUSH_ERR=""
     AUTO_REBASE_PUSH_RC=""
+    # ga-byfbd (DEFEITO 1): captured worktree-add/rebase stderr, reset every
+    # sweep iteration same as AUTO_REBASE_PUSH_ERR above — a prior branch's
+    # setup failure must never leak into this branch's diagnostic.
+    AUTO_REBASE_SETUP_ERR=""
+    # ga-byfbd: the merge FALLBACK's own stderr, kept in a SEPARATE variable
+    # from AUTO_REBASE_SETUP_ERR above rather than overwriting it — if the
+    # fallback's own stderr happens to be empty (git does not always write
+    # to stderr on every failure mode), overwriting would silently discard
+    # the still-valid, still-relevant rebase diagnostic already captured.
+    # Both are shown together below when the fallback also fails.
+    AUTO_MERGE_FALLBACK_ERR=""
 
     # imp18: Acquire per-repo mutation mutex before any git worktree/rebase/push ops.
     # If a live holder exists, treat as transient (next sweep retries; mutex + janitor
@@ -8067,7 +8078,14 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
 
     if [ "$IS_CONTAINER_RIG" = "1" ] && [ "$HAS_CONFLICT" = "0" ]; then
       # Container rig (bare repo): worktree uses the bare .repo.git
-      if git_rig worktree add "$TMP_REBASE_WT" "origin/$BRANCH" 2>/dev/null; then
+      # ga-byfbd (DEFEITO 1): both files created up front — the worktree-add
+      # redirect target must already be resolved by the time the `if` below
+      # evaluates it; the rebase one likewise before its own `elif` further
+      # down. Mirrors _PUSH_ERR_FILE's existing capture-to-tempfile pattern.
+      _WT_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gc-gate-autorebase-wt.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-autorebase-wt.$$")
+      _REBASE_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gc-gate-autorebase-rebase.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-autorebase-rebase.$$")
+      if git_rig worktree add "$TMP_REBASE_WT" "origin/$BRANCH" 2>"$_WT_ERR_FILE"; then
+        rm -f "$_WT_ERR_FILE" 2>/dev/null || true
         if [ "$BRANCH_TIP_IS_MERGE_COMMIT" = "1" ] || [ "$FORCE_MERGE_REANCHOR" = "1" ]; then
           # ga-kyxih: this branch's own tip is already a merge commit — `git
           # rebase` (the else-branch below) linearizes/mishandles that
@@ -8113,7 +8131,8 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
         # ga-euopg: identity scoped via -c to this invocation only — see note
         # at the merge-time-rebase call site above for why (was leaking into
         # shared repo config, repo-wide, every auto-rebase cycle).
-        elif git -C "$TMP_REBASE_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
+        elif git -C "$TMP_REBASE_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" rebase "origin/$DEFAULT_BRANCH" 2>"$_REBASE_ERR_FILE"; then
+          rm -f "$_REBASE_ERR_FILE" 2>/dev/null || true
           NEW_TIP=$(git -C "$TMP_REBASE_WT" rev-parse HEAD 2>/dev/null || echo "")
           if [ -z "$NEW_TIP" ]; then
             warn "  Auto-rebase: rev-parse HEAD after rebase returned empty for $BRANCH — treating as push failure"
@@ -8145,16 +8164,90 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
             rm -f "$_PUSH_ERR_FILE" 2>/dev/null || true
           fi
         else
-          warn "  Auto-rebase git rebase command failed (unexpected — merge-tree reported no conflicts)"
+          # ga-byfbd (DEFEITO 1): capture the rebase's own stderr instead of
+          # discarding it — the single command whose failure most directly
+          # explains a stranded branch, and the last one in this block still
+          # using 2>/dev/null while push already captured its own (ga-g0v96).
+          # Read into CONFLICT_FILES further below only if the merge fallback
+          # right after this also fails — a successful fallback means this
+          # diagnostic never has to surface.
+          AUTO_REBASE_SETUP_ERR=$(tr '\n' ' ' < "$_REBASE_ERR_FILE" 2>/dev/null | cut -c1-500)
+          rm -f "$_REBASE_ERR_FILE" 2>/dev/null || true
           git -C "$TMP_REBASE_WT" rebase --abort 2>/dev/null || true
+          # ga-byfbd (DEFEITO 2): `git rebase` REPLAYS each commit as a flat
+          # patch — it can fail even when the two sides' FINAL TREES don't
+          # actually conflict (e.g. the branch carries an earlier re-anchor
+          # merge commit somewhere in its history — see do_merge_ff's
+          # ga-qukyp comment above for the full replay-vs-3-way-merge
+          # mechanism; branch_tip_is_merge_commit above only catches a merge
+          # commit AT THE TIP, not one further back, so this case reaches
+          # here instead of the upfront merge branch). merge-tree already
+          # proved this exact pair clean (HAS_CONFLICT=0 is what got us into
+          # this whole block), so a rebase failure here is a structural
+          # replay artifact, not a real conflict. do_merge_ff already has
+          # this fallback at MERGE time; this ports it to GATE time — the
+          # gap ga-byfbd reports (measured live, wa-wpbfi: rebase failed 5x
+          # across bounded retries, the tip merged clean with zero conflict).
+          warn "  Auto-rebase git rebase command failed (merge-tree reported no conflicts) — trying merge fallback (ga-byfbd/ga-qukyp): ${AUTO_REBASE_SETUP_ERR:-<no stderr captured>}"
+          _MERGE_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gc-gate-autorebase-merge.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-autorebase-merge.$$")
+          if git -C "$TMP_REBASE_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" merge "origin/$DEFAULT_BRANCH" -m "Merge origin/$DEFAULT_BRANCH into $BRANCH (gate auto-merge fallback — rebase-replay failed despite zero merge-tree conflict, ga-byfbd/ga-qukyp)" 2>"$_MERGE_ERR_FILE"; then
+            rm -f "$_MERGE_ERR_FILE" 2>/dev/null || true
+            NEW_TIP=$(git -C "$TMP_REBASE_WT" rev-parse HEAD 2>/dev/null || echo "")
+            if [ -z "$NEW_TIP" ]; then
+              warn "  Auto-merge fallback: rev-parse HEAD after merge returned empty for $BRANCH — treating as push failure"
+              AUTO_REBASE_PUSH_ERR="rev-parse HEAD after merge fallback returned empty (merge produced no commit?)"
+            else
+              _PUSH_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gc-gate-autorebase-push.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-autorebase-push.$$")
+              # Plain push, safe to send WITHOUT force: unlike rebase, merge
+              # never rewrites the branch's existing commits — it only adds
+              # one new commit whose first parent is the current tip, so
+              # pushing it is a genuine fast-forward (same reasoning as
+              # do_merge_ff's ga-qukyp fallback above).
+              if git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" 2>"$_PUSH_ERR_FILE"; then
+                AUTO_REBASE_OK=1
+                BRANCH_SHA="$NEW_TIP"
+                log "  Auto-merge fallback success: $BRANCH pushed to $NEW_TIP (rebase-replay failed, merge-tree pre-check showed zero conflict — merged instead, ga-byfbd/ga-qukyp)"
+                bd -C "$GC_CITY" comment "$MARKER_ID" "Gate dispatcher: rebase-replay of $BRANCH onto main failed despite merge-tree showing zero conflict (a replay-vs-3-way-merge discrepancy, ga-qukyp) — fell back to a real merge instead (ga-byfbd). New tip: $NEW_TIP. Proceeding with review." 2>/dev/null || true
+                git_rig fetch origin 2>/dev/null || true
+                BRANCH_SHA=$(rig_resolve_commit "origin/$BRANCH"); [ -z "$BRANCH_SHA" ] && BRANCH_SHA="$NEW_TIP"
+                if git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null; then
+                  BRANCH_IS_CURRENT=1
+                else
+                  warn "  Post-auto-merge-fallback stale check still fails — falling through to bounce."
+                  AUTO_REBASE_OK=0
+                fi
+              else
+                AUTO_REBASE_PUSH_RC=$?
+                AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
+                warn "  Auto-merge fallback push failed for $BRANCH (exit=$AUTO_REBASE_PUSH_RC): ${AUTO_REBASE_PUSH_ERR:-<no stderr captured>}"
+              fi
+              rm -f "$_PUSH_ERR_FILE" 2>/dev/null || true
+            fi
+          else
+            # ga-byfbd: this is the FINAL remedy — capture its stderr too,
+            # into its OWN variable (never overwriting AUTO_REBASE_SETUP_ERR
+            # — see its declaration above for why an overwrite would risk
+            # silently discarding the still-valid rebase diagnostic if this
+            # capture happens to come back empty).
+            AUTO_MERGE_FALLBACK_ERR=$(tr '\n' ' ' < "$_MERGE_ERR_FILE" 2>/dev/null | cut -c1-500)
+            rm -f "$_MERGE_ERR_FILE" 2>/dev/null || true
+            warn "  Auto-merge fallback git merge command also failed (unexpected — merge-tree reported no conflicts): ${AUTO_MERGE_FALLBACK_ERR:-<no stderr captured>}"
+            git -C "$TMP_REBASE_WT" merge --abort 2>/dev/null || true
+          fi
         fi
         git_rig worktree remove "$TMP_REBASE_WT" --force 2>/dev/null || true
       else
-        warn "  Could not create auto-rebase worktree at $TMP_REBASE_WT"
+        AUTO_REBASE_SETUP_ERR=$(tr '\n' ' ' < "$_WT_ERR_FILE" 2>/dev/null | cut -c1-500)
+        rm -f "$_WT_ERR_FILE" "$_REBASE_ERR_FILE" 2>/dev/null || true
+        warn "  Could not create auto-rebase worktree at $TMP_REBASE_WT: ${AUTO_REBASE_SETUP_ERR:-<no stderr captured>}"
       fi
     elif [ "$HAS_CONFLICT" = "0" ]; then
       # Self-repo rig
-      if git -C "$GIT_DIR_PATH" worktree add "$TMP_REBASE_WT" "origin/$BRANCH" 2>/dev/null; then
+      # ga-byfbd (DEFEITO 1): see the container-rig branch above for why.
+      _WT_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gc-gate-autorebase-wt.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-autorebase-wt.$$")
+      _REBASE_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gc-gate-autorebase-rebase.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-autorebase-rebase.$$")
+      if git -C "$GIT_DIR_PATH" worktree add "$TMP_REBASE_WT" "origin/$BRANCH" 2>"$_WT_ERR_FILE"; then
+        rm -f "$_WT_ERR_FILE" 2>/dev/null || true
         if [ "$BRANCH_TIP_IS_MERGE_COMMIT" = "1" ] || [ "$FORCE_MERGE_REANCHOR" = "1" ]; then
           # ga-kyxih: see the container-rig branch above for why — this
           # branch's own tip is already a merge commit, so `git rebase` (the
@@ -8195,7 +8288,8 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
             git -C "$TMP_REBASE_WT" merge --abort 2>/dev/null || true
           fi
         # ga-euopg: see identity-scoping note above (container-rig branch).
-        elif git -C "$TMP_REBASE_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
+        elif git -C "$TMP_REBASE_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" rebase "origin/$DEFAULT_BRANCH" 2>"$_REBASE_ERR_FILE"; then
+          rm -f "$_REBASE_ERR_FILE" 2>/dev/null || true
           NEW_TIP=$(git -C "$TMP_REBASE_WT" rev-parse HEAD 2>/dev/null || echo "")
           if [ -z "$NEW_TIP" ]; then
             warn "  Auto-rebase (self-repo): rev-parse HEAD after rebase returned empty for $BRANCH — treating as push failure"
@@ -8224,12 +8318,60 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
             rm -f "$_PUSH_ERR_FILE" 2>/dev/null || true
           fi
         else
-          warn "  Auto-rebase git rebase failed (self-repo)"
+          # ga-byfbd (DEFEITO 1/2): see the container-rig branch above for
+          # the full rationale — same stderr capture, same rebase-replay-vs-
+          # merge-tree discrepancy, same fallback, self-repo git access.
+          AUTO_REBASE_SETUP_ERR=$(tr '\n' ' ' < "$_REBASE_ERR_FILE" 2>/dev/null | cut -c1-500)
+          rm -f "$_REBASE_ERR_FILE" 2>/dev/null || true
           git -C "$TMP_REBASE_WT" rebase --abort 2>/dev/null || true
+          warn "  Auto-rebase git rebase failed (self-repo, merge-tree reported no conflicts) — trying merge fallback (ga-byfbd/ga-qukyp): ${AUTO_REBASE_SETUP_ERR:-<no stderr captured>}"
+          _MERGE_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gc-gate-autorebase-merge.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-autorebase-merge.$$")
+          if git -C "$TMP_REBASE_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" merge "origin/$DEFAULT_BRANCH" -m "Merge origin/$DEFAULT_BRANCH into $BRANCH (gate auto-merge fallback — rebase-replay failed despite zero merge-tree conflict, ga-byfbd/ga-qukyp)" 2>"$_MERGE_ERR_FILE"; then
+            rm -f "$_MERGE_ERR_FILE" 2>/dev/null || true
+            NEW_TIP=$(git -C "$TMP_REBASE_WT" rev-parse HEAD 2>/dev/null || echo "")
+            if [ -z "$NEW_TIP" ]; then
+              warn "  Auto-merge fallback (self-repo): rev-parse HEAD after merge returned empty for $BRANCH — treating as push failure"
+              AUTO_REBASE_PUSH_ERR="rev-parse HEAD after merge fallback returned empty (merge produced no commit?)"
+            else
+              _PUSH_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gc-gate-autorebase-push.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-autorebase-push.$$")
+              # Plain push, safe to send WITHOUT force — see the
+              # container-rig branch above for why (merge never rewrites
+              # existing commits).
+              if git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" 2>"$_PUSH_ERR_FILE"; then
+                AUTO_REBASE_OK=1
+                BRANCH_SHA="$NEW_TIP"
+                log "  Auto-merge fallback success (self-repo): $BRANCH pushed to $NEW_TIP (rebase-replay failed, merge-tree pre-check showed zero conflict — merged instead, ga-byfbd/ga-qukyp)"
+                bd -C "$GC_CITY" comment "$MARKER_ID" "Gate dispatcher: rebase-replay of $BRANCH onto main failed despite merge-tree showing zero conflict (a replay-vs-3-way-merge discrepancy, ga-qukyp) — fell back to a real merge instead (ga-byfbd). New tip: $NEW_TIP. Proceeding with review." 2>/dev/null || true
+                git_rig fetch origin 2>/dev/null || true
+                BRANCH_SHA=$(rig_resolve_commit "origin/$BRANCH"); [ -z "$BRANCH_SHA" ] && BRANCH_SHA="$NEW_TIP"
+                if git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null; then
+                  BRANCH_IS_CURRENT=1
+                else
+                  warn "  Post-auto-merge-fallback stale check still fails (self-repo) — falling through to bounce."
+                  AUTO_REBASE_OK=0
+                fi
+              else
+                AUTO_REBASE_PUSH_RC=$?
+                AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
+                warn "  Auto-merge fallback push failed (self-repo) for $BRANCH (exit=$AUTO_REBASE_PUSH_RC): ${AUTO_REBASE_PUSH_ERR:-<no stderr captured>}"
+              fi
+              rm -f "$_PUSH_ERR_FILE" 2>/dev/null || true
+            fi
+          else
+            # ga-byfbd: see the container-rig branch above for why this
+            # final-remedy stderr goes into its OWN variable, never
+            # overwriting AUTO_REBASE_SETUP_ERR.
+            AUTO_MERGE_FALLBACK_ERR=$(tr '\n' ' ' < "$_MERGE_ERR_FILE" 2>/dev/null | cut -c1-500)
+            rm -f "$_MERGE_ERR_FILE" 2>/dev/null || true
+            warn "  Auto-merge fallback git merge command also failed (self-repo, unexpected — merge-tree reported no conflicts): ${AUTO_MERGE_FALLBACK_ERR:-<no stderr captured>}"
+            git -C "$TMP_REBASE_WT" merge --abort 2>/dev/null || true
+          fi
         fi
         git -C "$GIT_DIR_PATH" worktree remove "$TMP_REBASE_WT" --force 2>/dev/null || true
       else
-        warn "  Could not create auto-rebase worktree (self-repo) at $TMP_REBASE_WT"
+        AUTO_REBASE_SETUP_ERR=$(tr '\n' ' ' < "$_WT_ERR_FILE" 2>/dev/null | cut -c1-500)
+        rm -f "$_WT_ERR_FILE" "$_REBASE_ERR_FILE" 2>/dev/null || true
+        warn "  Could not create auto-rebase worktree (self-repo) at $TMP_REBASE_WT: ${AUTO_REBASE_SETUP_ERR:-<no stderr captured>}"
       fi
     fi
     # imp18: release the per-repo mutex (noop if never acquired or lib not loaded)
@@ -8246,13 +8388,26 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       fi
       # Fall through to Step 5 with updated BRANCH_SHA
     else
-      # Auto-rebase failed despite no conflicts (worktree/push failure).
+      # Auto-rebase (and, ga-byfbd, the merge fallback) both failed despite
+      # no conflicts.
       # ga-g0v96 (AC3): surface the CAPTURED diagnostic when we have one, instead
       # of the old zero-information "worktree/push error" string.
       HAS_CONFLICT=1
       CONFLICT_KIND="transient"   # ga-q3ig2: plumbing failure, not a real conflict — retry is worthwhile.
       if [ -n "$AUTO_REBASE_PUSH_ERR" ]; then
         CONFLICT_FILES="auto-rebase push failed (exit=${AUTO_REBASE_PUSH_RC:-?}): $AUTO_REBASE_PUSH_ERR"
+      elif [ -n "${AUTO_MERGE_FALLBACK_ERR:-}" ]; then
+        # ga-byfbd (DEFEITO 2): the merge fallback (ga-qukyp) was tried and
+        # ALSO failed — genuinely unexpected, since merge-tree already
+        # proved this pair clean. Show both diagnostics: the rebase's own
+        # (which is what triggered the fallback in the first place — may be
+        # empty if git wrote nothing to stderr there) and the fallback's own.
+        CONFLICT_FILES="auto-rebase failed (${AUTO_REBASE_SETUP_ERR:-no stderr captured}); merge fallback (ga-byfbd/ga-qukyp) also failed: $AUTO_MERGE_FALLBACK_ERR"
+      elif [ -n "${AUTO_REBASE_SETUP_ERR:-}" ]; then
+        # ga-byfbd (DEFEITO 1): rebase/worktree-add's own captured stderr —
+        # reached when the merge fallback was never attempted (e.g.
+        # worktree-add itself failed, before any rebase was even tried).
+        CONFLICT_FILES="auto-rebase failed: $AUTO_REBASE_SETUP_ERR"
       else
         CONFLICT_FILES="auto-rebase failed (worktree/push error) — no stderr captured"
       fi
