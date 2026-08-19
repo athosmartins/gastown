@@ -108,12 +108,56 @@ import os
 import subprocess
 import sys as _sys
 import time
+import unicodedata
 
 GC_CITY = os.environ.get("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
 POLL_SEC = int(os.environ.get("ATHOS_ACAO_GUARD_POLL_SEC", "900"))  # 15min
 NOTIFY_BIN = "/Users/athos/.local/bin/notify"
 
 MARKER_LABEL = "athos-acao:missing"
+
+# ga-1dpb7: a SECOND, higher-priority marker for the subset of gaps where the
+# decision is already narrated in prose (a Mayor/worker comment or the notes
+# field literally says the call was made) — only athos.acao itself was never
+# populated. Sampled live (18-19/08): 5 of 6 checked athos-acao:missing beads
+# were exactly this shape, including one saying "DECISÃO DO ATHOS já tomada —
+# não re-perguntar" verbatim. This does NOT guess athos.acao's CONTENT (the
+# module docstring's core invariant) — it only detects that a decision marker
+# PHRASE is present, via a fixed keyword list, same class of cheap check as
+# MARKER_LABEL's own label/status matching. Whoever reads this marker still
+# decides what to copy into athos.acao; the guard never writes it itself.
+NARRATED_MARKER_LABEL = "athos-acao:missing-but-narrated"
+
+# Accent-stripped (see _fold), lowercase substrings — matched against the full
+# notes field and the single latest comment's text. Deliberately short and
+# literal (a keyword list, not NLP) — sourced from the actual phrasings found
+# live during the 18-19/08 sample, not invented ahead of a real case.
+_NARRATED_DECISION_PHRASES = (
+    "nao re-perguntar",
+    "decisao do athos",
+    "decisao ja tomada",
+    "ja decidido",
+    "ja decidiu",
+    "decisao tomada",
+)
+
+
+def _fold(s):
+    """Lowercase + strip accents, so 'DECISÃO' and 'decisao' compare equal
+    without needing every accented variant spelled out in the phrase list."""
+    s = unicodedata.normalize("NFKD", s or "")
+    return "".join(c for c in s if not unicodedata.combining(c)).lower()
+
+
+def _has_narrated_decision(notes, comments):
+    """True iff the notes field or the LATEST comment's text contains one of
+    _NARRATED_DECISION_PHRASES. Pure function — no bd/gc calls, easily tested
+    in isolation from _selftest(). `comments` is the list bd returns with
+    --include-comments (chronological; last entry is most recent)."""
+    haystacks = [_fold(notes or "")]
+    if comments:
+        haystacks.append(_fold((comments[-1] or {}).get("text") or ""))
+    return any(phrase in h for h in haystacks for phrase in _NARRATED_DECISION_PHRASES)
 
 # bd's --status filter takes an explicit allowlist (matches this codebase's
 # established "explicit status filter, never rely on the open-only default"
@@ -311,16 +355,39 @@ def _bd(rig_path, *args, timeout=20):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
+def _fetch_notes_and_comments(rig_path, bid):
+    """Return (notes, comments) for one bead, or ("", []) on any failure —
+    fail-open toward "no narrated decision found" (the normal MARKER_LABEL
+    flow still fires either way; this only ever adds the second, stronger
+    signal, never blocks the first). Only called for beads that already
+    qualify as a NEW gap this cycle, so this is a handful of extra `bd show`
+    calls per cycle, not one per bead scanned."""
+    try:
+        r = _bd(rig_path, "show", bid, "--json", "--include-comments", timeout=20)
+        if r.returncode != 0 or not r.stdout.strip():
+            return "", []
+        d = json.loads(r.stdout)
+        if isinstance(d, list):
+            d = d[0] if d else {}
+        return d.get("notes") or "", d.get("comments") or []
+    except Exception:
+        return "", []
+
+
 def scan_rig(rig_path):
-    """Return (gaps, resolved) bead-id lists for one rig store, or None on error.
+    """Return (gaps, resolved, narrated) bead-id lists for one rig store, or
+    None on error.
 
     gaps: Sua-vez-eligible, athos.acao empty, marker label NOT yet applied
           (i.e. a genuinely NEW finding this cycle).
-    resolved: marker label IS present, but athos.acao is now filled OR the
-          bead no longer qualifies (status settled / labels changed) — the
-          marker should be removed so it never outlives the gap.
-    Already-flagged-and-still-a-gap beads are intentionally excluded from
-    both lists: they need no action this cycle (silence = healthy).
+    resolved: EITHER marker label is present, but athos.acao is now filled OR
+          the bead no longer qualifies (status settled / labels changed) —
+          both markers should be removed so neither outlives the gap.
+    narrated: SUBSET of gaps (ga-1dpb7) where notes/latest-comment already
+          narrate the decision in prose — gets the stronger NARRATED_MARKER_LABEL
+          in addition to MARKER_LABEL, same cycle.
+    Already-flagged-and-still-a-gap beads are intentionally excluded from all
+    three lists: they need no action this cycle (silence = healthy).
     """
     try:
         r = _bd(rig_path, "list", "--status", ",".join(NON_TERMINAL_STATUSES),
@@ -333,7 +400,7 @@ def scan_rig(rig_path):
     except Exception:
         return None
 
-    gaps, resolved = [], []
+    gaps, resolved, narrated = [], [], []
     for b in data:
         bid = b.get("id", "")
         if not bid:
@@ -343,12 +410,16 @@ def scan_rig(rig_path):
         status = (b.get("status") or "").strip().lower()
         acao = (b.get("metadata") or {}).get("athos.acao")
         has_marker = MARKER_LABEL in labels
+        has_narrated_marker = NARRATED_MARKER_LABEL in labels
         qualifies_gap = is_sua_vez_acao_gap(labels, assignee, acao, status)
         if qualifies_gap and not has_marker:
             gaps.append(bid)
-        elif has_marker and not qualifies_gap:
+            notes, comments = _fetch_notes_and_comments(rig_path, bid)
+            if _has_narrated_decision(notes, comments):
+                narrated.append(bid)
+        elif (has_marker or has_narrated_marker) and not qualifies_gap:
             resolved.append(bid)
-    return gaps, resolved
+    return gaps, resolved, narrated
 
 
 def run_cycle():
@@ -378,7 +449,8 @@ def run_cycle():
             result["rigs_failed"] += 1
             continue
         result["rigs_ok"] += 1
-        gaps, resolved = scan
+        gaps, resolved, narrated = scan
+        narrated_set = set(narrated)
         for bid in gaps:
             r = _bd(rig_path, "label", "add", bid, MARKER_LABEL, timeout=15)
             if r.returncode == 0:
@@ -388,15 +460,30 @@ def run_cycle():
             else:
                 print(f"[ATHOS-ACAO-GUARD] [FLAG-FAILED] {rig_name}/{bid}: "
                       f"{r.stderr.strip()[:200]}", flush=True)
+            if bid in narrated_set:
+                # ga-1dpb7: second, stronger marker — decision already narrated
+                # in prose, just never copied into athos.acao. Additive to the
+                # normal FLAGGED handling above, never a replacement for it.
+                rn = _bd(rig_path, "label", "add", bid, NARRATED_MARKER_LABEL, timeout=15)
+                if rn.returncode == 0:
+                    emit(f"[ATHOS-ACAO-GUARD] [NARRATED] {rig_name}/{bid} decision already "
+                         f"in notes/comments — copy it into athos.acao (labeled "
+                         f"{NARRATED_MARKER_LABEL})")
+                else:
+                    print(f"[ATHOS-ACAO-GUARD] [NARRATED-FLAG-FAILED] {rig_name}/{bid}: "
+                          f"{rn.stderr.strip()[:200]}", flush=True)
         for bid in resolved:
-            r = _bd(rig_path, "label", "remove", bid, MARKER_LABEL, timeout=15)
-            if r.returncode == 0:
+            ok = True
+            for label in (MARKER_LABEL, NARRATED_MARKER_LABEL):
+                r = _bd(rig_path, "label", "remove", bid, label, timeout=15)
+                if r.returncode != 0:
+                    ok = False
+                    print(f"[ATHOS-ACAO-GUARD] [RESOLVE-FAILED] {rig_name}/{bid} ({label}): "
+                          f"{r.stderr.strip()[:200]}", flush=True)
+            if ok:
                 print(f"[ATHOS-ACAO-GUARD] [RESOLVED] {rig_name}/{bid} athos.acao now set "
-                      f"— marker removed", flush=True)
+                      f"— marker(s) removed", flush=True)
                 result["resolved"] += 1
-            else:
-                print(f"[ATHOS-ACAO-GUARD] [RESOLVE-FAILED] {rig_name}/{bid}: "
-                      f"{r.stderr.strip()[:200]}", flush=True)
     return result
 
 
@@ -506,12 +593,40 @@ def _selftest():
         if got != expected:
             failures.append(f"FAIL: {desc} — labels={labels} assignee={assignee!r} "
                              f"acao={acao!r} status={status!r} expected={expected} got={got}")
+
+    # ga-1dpb7: _has_narrated_decision — real phrasings sampled live 18-19/08,
+    # plus counter-examples proving it does NOT fire on ordinary prose.
+    narrated_cases = [
+        # (notes, comments, expected, description)
+        ("DECISAO DO ATHOS (ja tomada, 07/08 e 09/08 -- nao re-perguntar).", [], True,
+         "unaccented ASCII phrasing (as actually typed live)"),
+        ("DECISÃO DO ATHOS (já tomada, 07/08 e 09/08 — não re-perguntar).", [], True,
+         "accented phrasing (wa-2tp0p's real note) — _fold must equate the two above"),
+        ("Athos já decidiu isso na conversa de ontem, so falta registrar.", [], True,
+         "'ja decidido' substring inside a longer sentence"),
+        ("", [{"text": "Decisão do Athos: manter o gate ate ele validar."}], True,
+         "phrase in the LATEST comment, not notes"),
+        ("Trabalho tecnico comum, sem decisao de produto envolvida.", [], False,
+         "ordinary technical note — must not fire on 'decisao' alone without a trigger phrase"),
+        ("", [], False, "empty notes, no comments"),
+        ("", [{"text": "Athos já decidiu isto"}, {"text": "so um comentario tecnico qualquer"}],
+         False, "trigger phrase only in an OLDER comment, not the latest one — by design"),
+        (None, None, False, "None notes/comments must not crash"),
+    ]
+    for notes, comments, expected, desc in narrated_cases:
+        got = _has_narrated_decision(notes, comments)
+        if got != expected:
+            failures.append(f"FAIL: {desc} — notes={notes!r} comments={comments!r} "
+                             f"expected={expected} got={got}")
+
     if failures:
         for f in failures:
             print(f, flush=True)
-        print(f"[ATHOS-ACAO-GUARD] [SELFTEST] {len(failures)}/{len(cases)} FAILED", flush=True)
+        print(f"[ATHOS-ACAO-GUARD] [SELFTEST] {len(failures)}/{len(cases) + len(narrated_cases)} "
+              f"FAILED", flush=True)
         return False
-    print(f"[ATHOS-ACAO-GUARD] [SELFTEST] {len(cases)}/{len(cases)} passed", flush=True)
+    total = len(cases) + len(narrated_cases)
+    print(f"[ATHOS-ACAO-GUARD] [SELFTEST] {total}/{total} passed", flush=True)
     return True
 
 
