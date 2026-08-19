@@ -211,6 +211,23 @@
 # (whatsapp_automation->wa-worker, property_scrapers->ps-worker, else->
 # gastown.dog) already trusted to write real bead metadata today.
 #
+# UPDATE (ga-no6qa, 2026-08-19): the paragraph above is no longer the WHOLE
+# story — kept rather than rewritten because the store-keyed mapping it
+# describes is still exactly correct as a FALLBACK, just no longer the only
+# step. _pmrw_default_route_for_store() alone keyed the restored route on the
+# bead's STORE, which is wrong for a domain-feature bead that lives in the HQ
+# store because a rig-scoped identity (e.g. digo-wa-<session-suffix>) filed it
+# there directly — confirmed live (ga-ypa6u) as this watchdog's own self-heal
+# mechanism restoring gc.routed_to=gastown.dog on a WA-owned bead, 11 minutes
+# after creation. _pmrw_resolve_route() now checks the bead's own created_by
+# FIRST (_pmrw_owner_rig_route(), a faithful subset of pilot-dispatcher.sh's
+# already-vetted ga-nlh79 owner-authoritative guard — see that function's own
+# header for the exact scope tradeoff), falling back to
+# _pmrw_default_route_for_store() only when created_by carries no *-wa/
+# ps-worker signal. Still not a guess: created_by is a bead field this
+# watchdog already reads elsewhere (_bead_recheck_status), not parsed from a
+# branch name or inferred from content keywords.
+#
 # WHY REPAIR, NOT JUST A BETTER DETECTOR: ga-9tgos's own investigation (2026-
 # 08-06 through 09, 29 comments) found the population this bug touches is
 # much larger than "a handful of known cases a human fixes by hand" — the
@@ -501,7 +518,71 @@ _pmrw_default_route_for_store() {
   esac
 }
 
-# _pmrw_repair_route <bead_id> <store>
+# _pmrw_owner_rig_route <created_by>
+# ga-no6qa: owner-authoritative rig inference for the repair fallback, a
+# faithful SUBSET of pilot-dispatcher.sh's own already-vetted ga-nlh79 guard
+# (packs/town-deltas/assets/pilot-dispatcher.sh, "OWNER-AUTHORITATIVE rig
+# precedence") — created_by carrying a *-wa/ps-worker crew identity is a
+# stronger domain-rig signal than the bead's STORE: a domain-feature bead
+# authored by a rig crew but filed directly against the HQ store (e.g.
+# digo-wa-<session-suffix>, mila-wa-<session-suffix> — created_by always
+# carries a session-id suffix, so `*-wa` alone would miss it; match `*-wa-*`
+# too, same ga-nlh79 fix) must not fall through to the gastown.dog wildcard
+# just because its store is HQ.
+#
+# Only created_by is checked, not assignee: this function is only ever called
+# on candidates from run_sweep's own sel_json filter, which already excludes
+# every bead with a non-empty assignee (a bead this watchdog acts on is
+# always unassigned by definition) — an assignee check here could never fire
+# and would be dead code, unlike ga-nlh79's original guard, whose candidate
+# population has no such precondition.
+#
+# Deliberately does NOT replicate ga-nlh79's ga-zzqza HQ-exclusive-path-
+# existence override (a bead citing a path that exists ONLY in HQ overrides
+# the owner signal back to framework/dog-routed) — that override needs to
+# parse the bead's cited file paths/basenames and probe every rig's live tree
+# for existence, infrastructure this watchdog does not have, and a materially
+# larger change than this bug's lane:small scope. Tradeoff, not an oversight:
+# a pure-framework bead authored by a *-wa identity that also cites an
+# HQ-only path will be owner-routed to wa-worker here instead of staying on
+# gastown.dog — rare (a rig crew filing pure-framework work) and
+# non-destructive (wa-worker can still see/triage/reroute it, nothing is
+# lost) — against the status quo, which unconditionally misroutes the far
+# more common case this bug tracks.
+#
+# Prints 'wa-worker' or 'ps-worker' on a match, empty on no signal (caller
+# falls through to the per-store default).
+_pmrw_owner_rig_route() {
+  local _created_by="$1"
+  case "$_created_by" in
+    *-wa|*-wa-*|wa-worker*) printf 'wa-worker' ;;
+    ps-worker*)             printf 'ps-worker' ;;
+  esac
+}
+
+# _pmrw_resolve_route <created_by> <store_path>
+# ga-no6qa: the actual value this watchdog restores gc.routed_to to —
+# owner-authoritative signal (_pmrw_owner_rig_route) first, falling back to
+# the store-keyed default (_pmrw_default_route_for_store) only when
+# created_by carries no *-wa/ps-worker signal. See _pmrw_owner_rig_route's
+# own header for the full rationale and scope tradeoff.
+_pmrw_resolve_route() {
+  local _created_by="$1" _store="$2" _owner_route
+  _owner_route="$(_pmrw_owner_rig_route "$_created_by")"
+  if [ -n "$_owner_route" ]; then
+    printf '%s' "$_owner_route"
+  else
+    _pmrw_default_route_for_store "$_store"
+  fi
+}
+
+# _pmrw_repair_route <bead_id> <store> [created_by]
+# ga-no6qa: optional 3rd param threads the bead's created_by through to
+# _pmrw_resolve_route so an owner-authoritative signal can override the
+# store-keyed default before this function's own retry/verify loop runs.
+# Omitted (or empty) falls straight through to the pre-existing store-only
+# behavior — every pre-ga-no6qa caller and selftest scenario that doesn't
+# pass it is unaffected.
 # ga-9tgos: attempts to RESTORE gc.routed_to on a candidate run_sweep's
 # per-bead loop already confirmed survived every exclusion filter (called
 # from there only — never speculatively). Writes via --set-metadata (the
@@ -537,8 +618,8 @@ _pmrw_default_route_for_store() {
 # Never touches state or alert plumbing — the caller (run_sweep) decides what
 # to do with the outcome.
 _pmrw_repair_route() {
-  local _bid="$1" _store="$2" _route _attempt _status
-  _route="$(_pmrw_default_route_for_store "$_store")"
+  local _bid="$1" _store="$2" _created_by="${3:-}" _route _attempt _status
+  _route="$(_pmrw_resolve_route "$_created_by" "$_store")"
   _status="error"
   _attempt=1
   while [ "$_attempt" -le "${PMRW_REPAIR_MAX_ATTEMPTS:-3}" ]; do
@@ -716,7 +797,20 @@ run_sweep() {
     stores_read=$((stores_read + 1))
 
     local rows
-    rows=$(printf '%s' "$sel_json" | jq -r --argjson now_ts "$now" '
+    # ga-no6qa: joined with an explicit unit-separator byte (octal 037 / US),
+    # not @tsv/tab. Bash's `read` treats tab as IFS "whitespace" (like space or
+    # newline) and COLLAPSES consecutive whitespace delimiters regardless of what
+    # IFS is set to -- so a run of empty fields (pilot.dispatched_at and
+    # pilot.sling_bead are both routinely empty) silently shifts every field
+    # after them one slot left. Harmless before this fix (both were last in the
+    # list, so the shift only ate trailing emptiness); NOT harmless once
+    # created_by follows them -- caught live by ga-no6qa selftest scenarios
+    # 50/51 (the correct route computed empty and the write silently fell back
+    # to the store default). US is not IFS-whitespace, so `read` preserves
+    # empty fields correctly regardless of position (verified directly: comma
+    # behaves this way, tab does not).
+    local _pmrw_fs; _pmrw_fs="$(printf '\037')"
+    rows=$(printf '%s' "$sel_json" | jq -r --argjson now_ts "$now" --arg fs "$_pmrw_fs" '
         .[] | . as $b
         | ($b.labels // []) as $L
         | ( (($b.updated_at // $b.created_at // "") | fromdateiso8601?) // null ) as $epoch
@@ -725,12 +819,13 @@ run_sweep() {
             ($b.issue_type // $b.type // "?"),
             ( if $epoch then (((($now_ts) - $epoch) / 60) | floor | tostring) else "?" end ),
             ($b.metadata["pilot.dispatched_at"] // ""),
-            ($b.metadata["pilot.sling_bead"] // "")
-          ] | @tsv
+            ($b.metadata["pilot.sling_bead"] // ""),
+            ($b.created_by // "")
+          ] | join($fs)
       ' 2>/dev/null)
     [ -z "${rows:-}" ] && continue
     local gate_active dispatched_at sling_bead dispatch_age_s recency_threshold_s sling_status sling_override sling_note repair_status
-    while IFS=$'\t' read -r bid blabels btype age_min dispatched_at sling_bead; do
+    while IFS="$_pmrw_fs" read -r bid blabels btype age_min dispatched_at sling_bead created_by; do
       [ -z "${bid:-}" ] && continue
 
       # ga-hhj7u: recent pilot.dispatched_at → normally excluded (route
@@ -777,11 +872,11 @@ run_sweep() {
       # switch, kept separate from PMRW_DRY_RUN so an operator can force
       # detection-only in production without also silencing alerts).
       if [ "$_pmrw_repair_was_active" = "1" ]; then
-        repair_status="$(_pmrw_repair_route "$bid" "$store")"
+        repair_status="$(_pmrw_repair_route "$bid" "$store" "$created_by")"
         case "$repair_status" in
           repaired)
-            repaired_tsv="${repaired_tsv}${bid}\t${store}\t$(_pmrw_default_route_for_store "$store")\n"
-            log "  - REPAIRED $bid ($(_store_name "$store")): gc.routed_to restored to $(_pmrw_default_route_for_store "$store") and verified — not flagging this sweep"
+            repaired_tsv="${repaired_tsv}${bid}\t${store}\t$(_pmrw_resolve_route "$created_by" "$store")\n"
+            log "  - REPAIRED $bid ($(_store_name "$store")): gc.routed_to restored to $(_pmrw_resolve_route "$created_by" "$store") and verified — not flagging this sweep"
             continue
             ;;
           already-resolved)
@@ -1220,12 +1315,12 @@ BDSTUB
   DISPATCH_RECENT_EPOCH=$(( $(date +%s) - 1800 ))    # 30min ago — within the 240min default window
   DISPATCH_OLD_EPOCH=$(( $(date +%s) - 18000 ))      # 5h ago — past the 240min default window
 
-  mk() {  # id status labels_csv updated_at [metadata_json]
-    local id="$1" status="$2" labels="$3" updated="$4" meta="${5:-}"
+  mk() {  # id status labels_csv updated_at [metadata_json] [created_by]
+    local id="$1" status="$2" labels="$3" updated="$4" meta="${5:-}" created_by="${6:-}"
     [ -z "$meta" ] && meta='{}'
     local labels_json; labels_json="$(printf '%s' "$labels" | tr ',' '\n' | jq -R . | jq -s -c .)"
-    printf '{"id":"%s","status":"%s","updated_at":"%s","labels":%s,"issue_type":"bug","metadata":%s}' \
-      "$id" "$status" "$updated" "$labels_json" "$meta"
+    printf '{"id":"%s","status":"%s","updated_at":"%s","labels":%s,"issue_type":"bug","metadata":%s,"created_by":"%s"}' \
+      "$id" "$status" "$updated" "$labels_json" "$meta" "$created_by"
   }
   reset_stores() {
     echo '[]' > "$TMP/fixtures/store-a.json"
@@ -2045,6 +2140,47 @@ CRASHPY
   [ "$rc" -eq 1 ] && ok "scenario 49: still-cooling-down alert with partial coverage returns 1 (unchanged)" || bad "scenario 49: expected return 1, got $rc"
   grep -q "PARTIAL: 1/2 stores lidas" "$LOG" 2>/dev/null && ok "scenario 49: PARTIAL verdict logged on the already-alerted path under partial coverage" || bad "scenario 49 (ga-qpfza REGRESSION): no PARTIAL verdict on the already-alerted path"
   grep -q "OK: all" "$LOG" 2>/dev/null && bad "scenario 49 (ga-qpfza REGRESSION): partial-coverage already-alerted sweep printed bare 'OK: all ... already alerted'" || ok "scenario 49: no bare 'OK: all ...' line printed under partial coverage"
+
+  # ── Scenario 50 (ga-no6qa): owner-authoritative created_by overrides the
+  # store-keyed default — a domain-feature bead created by a *-wa identity
+  # but living in a non-wa/ps store (e.g. HQ) must repair to wa-worker, not
+  # fall through to the store's own gastown.dog wildcard. Mirrors the live,
+  # confirmed instance (ga-ypa6u, created_by=digo-wa-gawisp7iqcpw).
+  echo "Scenario 50 (ga-no6qa): created_by=*-wa-* on a non-wa/ps store → repairs to wa-worker, not the store default"
+  reset_stores
+  printf '[%s]' "$(mk ga-50 open 'ctx:ready,exec:auto' "$OLD_TS" '{}' 'digo-wa-gawisp7iqcpw')" > "$TMP/fixtures/store-a.json"
+  echo 0 > "$PMRW_TEST_REPAIR_FAILCOUNT_DIR/store-a-ga-50"
+  : > "$LOG"
+  C50="$TMP/comm50"; U50="$TMP/upd50"; : > "$C50"; : > "$U50"
+  PMRW_TEST_COMMENTS_LOG="$C50" PMRW_TEST_UPDATE_CALLS_LOG="$U50" run_sweep >/dev/null
+  grep -qx "repaired:ga-50" "$C50" 2>/dev/null && ok "scenario 50: self-healed (owner signal, not store default)" || bad "scenario 50: repair did not self-heal"
+  grep -q "ga-50 (store-a): gc.routed_to -> wa-worker" "$LOG" 2>/dev/null && ok "scenario 50: created_by owner signal routed to wa-worker despite non-wa store" || bad "scenario 50 (ga-no6qa REGRESSION): expected wa-worker route from owner signal, not logged"
+
+  # ── Scenario 51 (ga-no6qa): same owner-authoritative signal for a
+  # ps-worker* creator — mirrors ga-nlh79's PS branch exactly (created_by
+  # only, ps-worker* prefix, no *-ps/*-ps-* form — faithful subset, not a
+  # redesign).
+  echo "Scenario 51 (ga-no6qa): created_by=ps-worker* on a non-wa/ps store → repairs to ps-worker"
+  reset_stores
+  printf '[%s]' "$(mk ga-51 open 'ctx:ready,exec:auto' "$OLD_TS" '{}' 'ps-worker-3')" > "$TMP/fixtures/store-a.json"
+  echo 0 > "$PMRW_TEST_REPAIR_FAILCOUNT_DIR/store-a-ga-51"
+  : > "$LOG"
+  C51="$TMP/comm51"; : > "$C51"
+  PMRW_TEST_COMMENTS_LOG="$C51" run_sweep >/dev/null
+  grep -q "ga-51 (store-a): gc.routed_to -> ps-worker" "$LOG" 2>/dev/null && ok "scenario 51: ps-worker* created_by routed to ps-worker despite non-ps store" || bad "scenario 51 (ga-no6qa REGRESSION): expected ps-worker route from owner signal, not logged"
+
+  # ── Scenario 52 (ga-no6qa): NO regression — a created_by with no *-wa/ps
+  # signal (e.g. a dog or the mayor filed it directly) still falls through to
+  # the plain store default exactly as before this fix (gastown.dog for a
+  # non-wa/ps store) — the owner check must never invent a false signal.
+  echo "Scenario 52 (ga-no6qa): created_by with no owner signal → unchanged store-default behavior (no false positive)"
+  reset_stores
+  printf '[%s]' "$(mk ga-52 open 'ctx:ready,exec:auto' "$OLD_TS" '{}' 'dog-ga8co7e')" > "$TMP/fixtures/store-a.json"
+  echo 0 > "$PMRW_TEST_REPAIR_FAILCOUNT_DIR/store-a-ga-52"
+  : > "$LOG"
+  C52="$TMP/comm52"; : > "$C52"
+  PMRW_TEST_COMMENTS_LOG="$C52" run_sweep >/dev/null
+  grep -q "ga-52 (store-a): gc.routed_to -> gastown.dog" "$LOG" 2>/dev/null && ok "scenario 52: non-owner-signal created_by still falls through to store default" || bad "scenario 52 (ga-no6qa REGRESSION): store-default fallback broken for a plain/dog creator"
 
   echo ""
   echo "pilot-missing-route-watchdog selftest: PASS=$PASS FAIL=$FAIL"
