@@ -2051,19 +2051,45 @@ _pilot_hold_or_escalate() {
 # second inline copy anywhere (including here) fails that check on purpose.
 _PILOT_ENGINE_REBUILD_RE='gascity.*rebuild|rebuild.*gascity|swap.*bin[áa]rio|swap.*binary|binary swap|town bounce'
 
-# ga-qt0mj: single source of truth for _filter_candidates' 4 TEXT-only vetoes
-# (engine-rebuild / DECISAO-title / "só o Athos decide" / 🚨 compliance-marker —
-# see that function, ~L1990-2042, trace mirror ~L2118-2131) so
-# _reconcile_text_veto_labels below can never drift from what actually vetoes.
-# "field":"title" mirrors the DECISAO clause's own title-only scope (line 2019);
-# every other pattern scans title+description, matching its own clause. Built
-# via jq --arg (not a static literal) so the engine-rebuild entry pulls from
-# $_PILOT_ENGINE_REBUILD_RE rather than duplicating it (ga-ffop9 above).
-_TEXT_VETO_PATTERNS=$(jq -n --arg engine_re "$_PILOT_ENGINE_REBUILD_RE" '[
+# ga-4lsu7: THE single literal definition of the diagnostic-only-body veto
+# pattern text — _filter_candidates' inline select clause (below) and
+# _TEXT_VETO_PATTERNS (right below this) both consume this ONE value, same
+# discipline ga-ffop9 established for the engine-rebuild pattern above (do
+# not reintroduce a second inline copy anywhere). Catches a bead whose OWN
+# body explicitly scopes itself as non-buildable — measured incident:
+# ga-9n9z7 (AC/Estrela Guia/Equilíbrios all empty, dispatched anyway via the
+# Tier-2 "no open bugs/tech-debt" filler fallback as an ordinary build story,
+# sling ga-r11bw; correctly refused by dog-ga8co7e with
+# pool:refused:needs-architecture-decision, but only after a full dispatch +
+# investigation cycle was already spent). Deliberately phrase-level, not
+# bare "diagnostico"/"arquitetura" alone (would false-positive on any bead
+# that merely discusses architecture or diagnostics as part of real,
+# buildable work) — each alternative requires the FULL disclaiming phrase.
+# Accent-tolerant since real bodies use both forms: ga-9n9z7 itself used the
+# unaccented "nao propoe implementacao"/"decisao de arquitetura"; refined
+# story text commonly uses the accented "não propõe implementação"/"decisão
+# de arquitetura". Deliberately does NOT gate on empty acceptance_criteria/
+# story.criterios alone — a legitimate small bug fix commonly has no formal
+# AC (see _filter_dispatch_gates' own spec-floor gate for that different,
+# narrower problem) and gating dispatch on bare AC-absence would block a
+# large share of legitimate bug work, not just diagnostic-only stories.
+_PILOT_DIAGNOSTIC_ONLY_RE='s[óo] diagn[óo]stico|n[ãa]o prop[õo]e implementa[çc][ãa]o|decis[ãa]o de arquitetura'
+
+# ga-qt0mj: single source of truth for _filter_candidates' 5 TEXT-only vetoes
+# (engine-rebuild / DECISAO-title / "só o Athos decide" / 🚨 compliance-marker /
+# diagnostic-only-body, ga-4lsu7 — see that function, ~L1990-2042, trace
+# mirror ~L2118-2131) so _reconcile_text_veto_labels below can never drift
+# from what actually vetoes. "field":"title" mirrors the DECISAO clause's own
+# title-only scope (line 2019); every other pattern scans title+description,
+# matching its own clause. Built via jq --arg (not a static literal) so the
+# engine-rebuild/diagnostic-only entries pull from their shared shell vars
+# rather than duplicating the literal (ga-ffop9 above).
+_TEXT_VETO_PATTERNS=$(jq -n --arg engine_re "$_PILOT_ENGINE_REBUILD_RE" --arg diag_re "$_PILOT_DIAGNOSTIC_ONLY_RE" '[
   {"slug":"engine-rebuild-text-pattern","re":$engine_re},
   {"slug":"decisao-title-text-pattern","re":"^\\s*(DECIS[ÃA]O|DECISION)\\b","field":"title"},
   {"slug":"athos-decide-phrase-text-pattern","re":"s[óo] o athos decide"},
-  {"slug":"compliance-marker-text-pattern","re":"🚨"}
+  {"slug":"compliance-marker-text-pattern","re":"🚨"},
+  {"slug":"diagnostic-only-text-pattern","re":$diag_re}
 ]')
 
 # _reconcile_text_veto_labels <db>
@@ -2287,6 +2313,17 @@ _filter_candidates() {
   # consumer could share it too; this local is just that global under its
   # historical name. Do not reintroduce a second inline literal anywhere.
   local _cf_engine_rebuild_re="$_PILOT_ENGINE_REBUILD_RE"
+  # ga-4lsu7: same local-copy-of-the-shared-literal shape as the line above.
+  # ${...:-} (not bare $_PILOT_DIAGNOSTIC_ONLY_RE) so a caller that extracts
+  # only this function body (e.g. a selftest harness written before this var
+  # existed) degrades safely under `set -u` instead of aborting — the jq
+  # clause below treats an empty pattern as "nothing to check" (see the
+  # length-guard there), never as "match everything" (an empty regex matches
+  # every string in jq/Oniguruma test(), which would silently reject EVERY
+  # dispatch candidate — a full Pilot outage, not just a missed veto. Same
+  # empty-vs-real-value discipline as elsewhere in this file: an absent
+  # signal must never collapse to the same behavior as a positive match).
+  local _cf_diagnostic_only_re="${_PILOT_DIAGNOSTIC_ONLY_RE:-}"
   # ga-46wq5: local, self-defending defaults for the active-owner globals —
   # NOT just the early top-of-file default (that one only protects the real
   # dispatcher's first in-process call site; a test or any other caller that
@@ -2301,6 +2338,7 @@ _filter_candidates() {
   _cf_out=$(printf '%s' "$_cf_in" | jq --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
      --argjson now_ts "$_now_ts" --argjson reclaim_cap "$_FILTER_RECLAIM_CAP" \
      --arg engine_rebuild_re "$_cf_engine_rebuild_re" \
+     --arg diagnostic_only_re "$_cf_diagnostic_only_re" \
      --argjson roster_ok "$_cf_roster_ok" --argjson active_owner_ids "$_cf_active_owner_ids_json" \
      --argjson framework_markers "$_FILTER_FRAMEWORK_MARKER_LABELS" \
     '[.[] | select(
@@ -2607,6 +2645,24 @@ _filter_candidates() {
         # NOTE: no literal apostrophes anywhere in this comment block —
         # same reason as the DECISAO comment above (single-quoted jq arg).
         and (((.title // "") + " " + (.description // "")) | test("🚨") | not)
+        # ga-4lsu7: fifth text-only veto, same standalone-sufficient shape as
+        # the four above — a bead whose OWN body explicitly scopes itself as
+        # non-buildable ("só diagnóstico", "não propõe implementação",
+        # "decisão de arquitetura") is not a build story regardless of which
+        # tier/pool selected it (see $_PILOT_DIAGNOSTIC_ONLY_RE above for the
+        # incident this fixes and why it does not also gate on bare
+        # acceptance-criteria absence). Scans title+description like the
+        # majority of the vetoes above, not title-only like DECISAO.
+        # NOTE: no literal apostrophes anywhere in this comment block —
+        # same reason as the DECISAO comment above (single-quoted jq arg).
+        # Length-guarded: an EMPTY pattern (extraction gap, not a real
+        # "no diagnostic-only text" case) must mean "nothing to check", not
+        # "matches everything" — see the _cf_diagnostic_only_re comment
+        # above for the outage this specifically avoids.
+        and (($diagnostic_only_re | length) == 0
+             or (((.title // "") + " " + (.description // ""))
+                 | test($diagnostic_only_re; "i")
+                 | not))
      )]' \
     2>/dev/null)
   [ -z "$_cf_out" ] && _cf_out="[]"
@@ -2632,6 +2688,7 @@ _filter_candidates() {
   printf '%s' "$_cf_in" | jq -r --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
       --argjson now_ts "$_now_ts" --argjson reclaim_cap "$_FILTER_RECLAIM_CAP" --argjson kept "$_cf_kept" \
       --arg engine_rebuild_re "$_cf_engine_rebuild_re" \
+      --arg diagnostic_only_re "$_cf_diagnostic_only_re" \
       --argjson roster_ok "$_cf_roster_ok" --argjson active_owner_ids "$_cf_active_owner_ids_json" \
       --argjson framework_markers "$_FILTER_FRAMEWORK_MARKER_LABELS" '
       .[] | . as $b | ($b.id // "") as $id | ($b.labels // []) as $L
@@ -2707,7 +2764,15 @@ _filter_candidates() {
            then "athos-decide-phrase-text-pattern"
            else empty end),
           (if ( ((($b.title // "") + " " + ($b.description // "")) | test("🚨")) )
-           then "compliance-marker-text-pattern" else empty end)
+           then "compliance-marker-text-pattern" else empty end),
+          # ga-4lsu7: mirrors the select-clause veto directly above — keep
+          # these two in sync, same lesson ga-ffop9 already taught this
+          # function for the engine-rebuild pattern. Same length-guard as
+          # the select clause (empty pattern = nothing to report, not a
+          # false "matched" reason for every excluded bead).
+          (if ( ($diagnostic_only_re | length) > 0
+                and ((($b.title // "") + " " + ($b.description // "")) | test($diagnostic_only_re; "i")) )
+           then "diagnostic-only-text-pattern" else empty end)
         ] as $reasons
       | select(($reasons | length) > 0)
       | [$id, ($reasons | join(";"))] | @tsv
