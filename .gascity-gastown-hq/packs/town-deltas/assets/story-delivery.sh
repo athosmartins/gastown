@@ -323,6 +323,25 @@ task_reconciler_is_partial() {
   fi
 }
 
+# refino_criteria_status_line <missing_meta>
+#   Pure decision (ga-t6wlfb): the Step 8 "Delivery COMPLETE" comment must
+#   reflect Step 7's OWN finding about refino metadata (story.estrela_guia,
+#   story.equilibrios, story.dashboard), never assert "verified" when Step 7
+#   already found (and warned about) fields missing on this same bead in this
+#   same delivery run. Previously both COMPLETE templates hardcoded the
+#   "verified" line unconditionally, contradicting the WARNING comment posted
+#   two seconds earlier by Step 7 whenever $missing_meta was non-empty.
+#   <missing_meta>: space-prefixed list of missing field names, or "" if none
+#   missing (the exact $MISSING_META value Step 7 already computed).
+refino_criteria_status_line() {
+  local missing_meta="${1:-}"
+  if [ -n "$missing_meta" ]; then
+    echo "Refino criteria: INCOMPLETE (missing:$missing_meta) — see WARNING above"
+  else
+    echo "Criteria verified: estrela_guia, equilibrios, dashboard (see bead metadata)"
+  fi
+}
+
 # Lib-only mode: `STORY_DELIVERY_LIB_ONLY=1 source story-delivery.sh` defines the
 # helpers above without running the live sweep, so the selftest exercises the
 # real functions (one source of truth, no copy-drift). Mirrors merged-bead-janitor.sh.
@@ -1635,7 +1654,7 @@ Rig: $RIG
 Deploy: $DEPLOY_CMD
 Prod test: $DONE_TEST_LINE
 Elapsed: ${ELAPSED}s
-Criteria verified: estrela_guia, equilibrios, dashboard (see bead metadata)
+$(refino_criteria_status_line "${MISSING_META:-}")
 NOTE: $DONE_NOTE" 2>/dev/null || true
     # wa-uthi: TERMINAL SUCCESS (story:done) — push KEPT. wa-wzvg: Pilot-differentiated.
     notify -t "${PILOT_PREFIX}Story DONE (untested)" -p 2 "${PILOT_PREFIX}Story $STORY_ID ($STORY_TITLE) — deployed, $DONE_PUSH_TAIL" 2>/dev/null || true
@@ -1656,7 +1675,7 @@ Rig: $RIG
 Deploy: $DEPLOY_CMD
 Prod test: $DONE_TEST_LINE
 Elapsed: ${ELAPSED}s
-Criteria verified: estrela_guia, equilibrios, dashboard (see bead metadata)" 2>/dev/null || true
+$(refino_criteria_status_line "${MISSING_META:-}")" 2>/dev/null || true
     # wa-uthi: TERMINAL SUCCESS (story:done) — push KEPT. wa-wzvg: Pilot-differentiated.
     notify -t "${PILOT_PREFIX}Story DONE" -p 2 "${PILOT_PREFIX}Story $STORY_ID ($STORY_TITLE) — $DONE_PUSH_TAIL" 2>/dev/null || true
   fi

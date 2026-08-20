@@ -45,7 +45,8 @@ for fn in rig_gitdir git_in token_bounded subject_impl_scopes_bead \
           scan_commit_subject_for_bead task_reconciler_verdict \
           task_reconciler_failed_sha_resolved \
           extract_gate_merge_info story_merge_verdict \
-          gate_delivery_looks_partial task_reconciler_is_partial; do
+          gate_delivery_looks_partial task_reconciler_is_partial \
+          refino_criteria_status_line; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by story-delivery.sh"; exit 1; }
 done
 
@@ -385,6 +386,29 @@ rc0 task_reconciler_is_partial 1 0 "" ""   # already held, no override -> stays 
 rc1 task_reconciler_is_partial 0 1 "$UPPER_LIST" ""   # override alone releases even with partial-looking text
 rc0 task_reconciler_is_partial 0 0 "$UPPER_LIST" ""   # neither flag: falls through to the real heuristic
 rc1 task_reconciler_is_partial 0 0 "Corrigido o bug relatado. Nenhuma mudanca adicional necessaria." ""   # neither flag, clean text: not partial
+
+# ── 9. refino_criteria_status_line (ga-t6wlfb) ──────────────────────────────
+# The real bug: Step 8's "Delivery COMPLETE" comment hardcoded "Criteria
+# verified: estrela_guia, equilibrios, dashboard" UNCONDITIONALLY, even when
+# Step 7 (same delivery run, same bead) had just found fields missing and
+# posted an accurate WARNING two seconds earlier. Prove the line now
+# discriminates on $MISSING_META instead of always asserting "verified".
+echo "── 9. refino_criteria_status_line (ga-t6wlfb) ──"
+ALL_PRESENT_LINE=$(refino_criteria_status_line "")
+case "$ALL_PRESENT_LINE" in
+  "Criteria verified: estrela_guia, equilibrios, dashboard (see bead metadata)")
+    ok "all 3 fields present (missing_meta='') -> exact verified line, unchanged from before the fix" ;;
+  *) bad "all-present case regressed: got [$ALL_PRESENT_LINE]" ;;
+esac
+
+MISSING_LINE=$(refino_criteria_status_line " story.estrela_guia story.dashboard")
+case "$MISSING_LINE" in
+  *"Criteria verified: estrela_guia, equilibrios, dashboard"*)
+    bad "fields KNOWN missing but line still claims 'Criteria verified' (the exact ga-t6wlfb bug)" ;;
+  *"INCOMPLETE"*"story.estrela_guia"*"story.dashboard"*)
+    ok "fields missing -> INCOMPLETE line naming the missing fields, no false 'verified' claim" ;;
+  *) bad "missing case produced neither expected shape: got [$MISSING_LINE]" ;;
+esac
 
 echo ""
 echo "═══════════════════════════════════════"
