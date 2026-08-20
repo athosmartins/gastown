@@ -69,6 +69,7 @@ errou por 5x.
 [[steps]]
 id = "read-what-changed"
 title = "Ler o que mudou no upstream — procurando dor nossa"
+needs = ["measure-and-prove"]
 description = """
 Para o repo com maior atraso, LEIA o que mudou — não resuma o log.
 
@@ -93,6 +94,7 @@ que esta cidade remendou 2x sozinha (ga-v2k49, ga-wzl83).
 [[steps]]
 id = "report-or-be-silent"
 title = "Abrir bead por achado, ou encerrar em silêncio"
+needs = ["read-what-changed"]
 description = """
 Produza bead OU silêncio. Nunca um relatório de números.
 
