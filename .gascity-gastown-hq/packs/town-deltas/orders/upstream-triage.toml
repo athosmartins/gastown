@@ -1,0 +1,20 @@
+# town-deltas order (Athos 2026-08-20): agenda a triagem periódica de upstream.
+#
+# Intervalo de 14 dias, não 24h nem semanal, e a escolha é deliberada:
+#  · o sentinela de DISTÂNCIA já roda semanal (com.gascity.upstream-drift-sentinel)
+#    e cobre "quanto"; esta formula cobre "vale a pena", que muda muito mais devagar.
+#  · o upstream do gascity ficou ~27 dias sem commit no período medido (13/08 a
+#    20/08 sem movimento) — rodar toda semana produziria "nada novo" na maioria
+#    das vezes, que é exatamente como um detector vira ruído ignorado.
+#  · 14 dias mantém o atraso na casa de dezenas de commits entre triagens, em vez
+#    das centenas que se acumularam quando ninguém olhava o conteúdo.
+#
+# Se o resultado for silêncio 3-4 rodadas seguidas, AUMENTE o intervalo em vez de
+# manter — a formula existe pra achar coisa, não pra provar que roda.
+
+[order]
+description = "Triagem do upstream: o que mudou lá resolve dor nossa? (não atualiza nada)"
+formula = "mol-upstream-triage"
+trigger = "cooldown"
+interval = "336h"
+pool = "dog"

@@ -1,0 +1,119 @@
+# mol-upstream-triage (ga-<bead>, Athos 2026-08-20)
+#
+# POR QUE ISTO EXISTE, e por que NÃO é "mais um sentinela":
+# o com.gascity.upstream-drift-sentinel já roda semanal desde 01/08 e mede a
+# DISTÂNCIA (quantos commits atrás). Ele funciona. E mesmo assim o atraso
+# chegou a 1695 commits no motor sem ninguém agir — porque "você está 1695
+# commits atrás" não é acionável: não diz o que se GANHA nem o que CUSTA.
+# Medição sem ponto de decisão vira ruído, e o leitor aprende a ignorar.
+#
+# Esta formula responde a pergunta que falta: "tem algo lá dentro que resolve
+# dor NOSSA?". O produto dela é bead ou silêncio — nunca um número.
+#
+# ⚠️ NÃO É UM UPGRADE. Nenhum passo aqui atualiza, builda, troca binário ou
+# toca banco. Atualizar por calendário é assumir risco independente de haver
+# ganho — e há precedente concreto contra: o changelog do beads documenta uma
+# versão que migrava schema silenciosamente e não deixava reverter. O produto
+# desta formula é INFORMAÇÃO PRA DECIDIR, e a decisão continua humana
+# (ga-27bqn1 / ga-gle4yl / ga-wzpy2q são os beads que carregam os
+# procedimentos seguros de cada upgrade).
+#
+# LIÇÃO EMBUTIDA (aprendida errando em 19-20/08): uma pesquisa dedicada com 2
+# agentes reportou "310 commits atrás" pro motor. Estava errado por 5x — mediu
+# o repositório LEGADO (~/gt, projeto steveyegge/gastown, sem cmd/gc) achando
+# que era o motor. Os 3 repos têm nomes e layouts parecidos, e
+# ~/gt/.gascity-gastown-hq COMPARTILHA o .git do ~/gt. Por isso o passo 1
+# abaixo obriga a NOMEAR e PROVAR qual repo foi medido antes de qualquer
+# conclusão.
+
+formula = "mol-upstream-triage"
+version = 1
+
+description = """
+Triagem periódica do que mudou no upstream — responde "vale a pena?", não "quanto".
+
+Formula periódica, despachada pelo passo `periodic-formulas` do deacon quando o
+cooldown vence. Roda no pool de dogs.
+
+NÃO atualiza nada. Lê, avalia, e produz bead OU silêncio.
+"""
+
+[[steps]]
+id = "measure-and-prove"
+title = "Medir a distância de cada repo e PROVAR qual foi medido"
+description = """
+Meça a distância de CADA repo e PROVE qual você mediu. Não confie em nome.
+
+Os três repos desta cidade têm nomes confusamente parecidos:
+
+  motor gc .......... /Users/athos/gt/.local-patches/_src-hookfix
+                      vs https://github.com/gastownhall/gascity.git
+                      PROVA de que é o certo: `ls cmd/gc` existe.
+  beads (bd) ........ /Users/athos/gt/beads
+                      vs https://github.com/gastownhall/beads.git
+  legado ............ /Users/athos/gt
+                      vs https://github.com/steveyegge/gastown.git
+                      ⚠️ este NÃO tem cmd/gc — ships cmd/gt. Se você mediu
+                      aqui achando que era o motor, seu número está errado.
+
+Para cada um:
+  git -C <path> fetch <url> main
+  git -C <path> rev-list --count HEAD..FETCH_HEAD
+
+REGISTRE no relatório final: o path, a URL, o número, E o resultado do
+`ls cmd/gc` (existe/não existe) para o que você chamar de motor. Sem essa
+prova o número não vale — foi exatamente assim que uma medição anterior
+errou por 5x.
+"""
+
+[[steps]]
+id = "read-what-changed"
+title = "Ler o que mudou no upstream — procurando dor nossa"
+description = """
+Para o repo com maior atraso, LEIA o que mudou — não resuma o log.
+
+Priorize, nesta ordem:
+ 1. CHANGELOG / release notes, se existirem (sinal muito mais denso que
+    mensagens de commit cruas).
+ 2. Commits cuja mensagem indique CORREÇÃO de bug em subsistema que esta
+    cidade usa: dolt, sessão, pool, dispatch, gate, eventos, mail, labels.
+ 3. Qualquer coisa marcada como breaking / migration / schema.
+
+A pergunta a responder NÃO é "o que mudou". É:
+  "algo aqui resolve uma dor que a gente TEM hoje?"
+
+Contexto pra reconhecer dor nossa: consulte os beads abertos de bug com
+label area:infra (`bd list --status open --type bug`). Se um commit upstream
+conserta a mesma classe de um bead nosso aberto, isso é achado de primeira
+ordem — significa que estamos remendando à mão algo já resolvido lá.
+Precedente real: o upstream já tinha corrigido o bug de identidade de ator
+que esta cidade remendou 2x sozinha (ga-v2k49, ga-wzl83).
+"""
+
+[[steps]]
+id = "report-or-be-silent"
+title = "Abrir bead por achado, ou encerrar em silêncio"
+description = """
+Produza bead OU silêncio. Nunca um relatório de números.
+
+SE achou algo que vale:
+  Abra UM bead por achado, com:
+   · o que o upstream conserta, em linguagem de sintoma (o que o Athos veria)
+   · o commit/PR upstream específico (link ou sha) — sem isso ninguém confere
+   · se existe bead NOSSO aberto que isso resolveria (cite o id) — é o que
+     transforma "seria bom" em "para de sangrar"
+   · o custo aparente: arquivos tocados, se mexe em schema/dado, se é
+     cherry-pick isolado ou exige o catch-up inteiro
+  Prioridade: P2 por padrão. P1 só se resolver bead nosso já aberto como P1.
+  NÃO abra bead de "estamos N commits atrás" — isso já é medido pelo
+  sentinela semanal e não é acionável.
+
+SE NÃO achou nada relevante:
+  NÃO mande mail, NÃO abra bead. Registre no log da própria formula e encerre.
+  Silêncio é resultado válido e esperado na maioria das rodadas. Um detector
+  que fala toda vez ensina o leitor a ignorá-lo — foi assim que o sentinela
+  de distância virou ruído.
+
+⚠️ Em NENHUMA hipótese: atualizar, buildar, trocar binário, tocar banco, ou
+aplicar patch. Se o achado for urgente, o bead diz isso e um humano decide.
+"""
