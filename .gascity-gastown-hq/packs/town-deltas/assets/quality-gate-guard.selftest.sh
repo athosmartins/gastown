@@ -152,6 +152,32 @@ r=$(classify_external_pr_gap3 OPEN CHANGES_REQUESTED); [ "$r" = "flag:changes-re
 r=$(classify_external_pr_gap3 ''); [ "$r" = "skip:indeterminate" ] && ok "empty pr_state (gh call failed / PR not found) → skip:indeterminate (fail-safe, never guess)" || bad "empty pr_state got '$r'"
 r=$(classify_external_pr_gap3 DRAFT); [ "$r" = "skip:indeterminate" ] && ok "unrecognized pr_state → skip:indeterminate (fail-safe)" || bad "unrecognized pr_state got '$r'"
 
+# ── classify_external_pr_gap3 changes_addressed (3rd arg) — ga-rmtzrg ────────
+# Bug: GAP-3 could not tell "CHANGES_REQUESTED, never addressed" from
+# "CHANGES_REQUESTED, a newer commit has since addressed it, awaiting
+# re-review" — both classified identically as flag:changes-requested, so a
+# builder who pushed a fix commit and posted a PR comment got raced by the
+# next sweep re-flipping story:awaiting-external-merge -> gate:needs-fix
+# forever (observed twice same day on the same bead, ga-rmtzrg). The 3rd arg
+# is "1" only when the caller has POSITIVELY confirmed (via reviews[].commit.oid
+# vs headRefOid) that the head has moved past the CHANGES_REQUESTED review's
+# commit. Omitted/empty/anything-but-"1" must reproduce the exact pre-fix
+# behavior — never guess "addressed" from incomplete data (same fail-safe
+# convention as classify_parent_gap2's optional sling_refused 6th arg above).
+echo "classify_external_pr_gap3: changes_addressed 3rd arg (ga-rmtzrg re-review gap)"
+r=$(classify_external_pr_gap3 OPEN CHANGES_REQUESTED); [ "$r" = "flag:changes-requested" ] && ok "3rd arg omitted → flag:changes-requested unchanged (backward-compat regression guard)" || bad "3rd-arg-omitted got '$r'"
+r=$(classify_external_pr_gap3 OPEN CHANGES_REQUESTED ''); [ "$r" = "flag:changes-requested" ] && ok "3rd arg explicit empty → flag:changes-requested unchanged" || bad "3rd-arg-empty got '$r'"
+r=$(classify_external_pr_gap3 OPEN CHANGES_REQUESTED 0); [ "$r" = "flag:changes-requested" ] && ok "changes_addressed=0 (head still at reviewed commit — genuinely unaddressed) → flag:changes-requested" || bad "changes_addressed=0 got '$r'"
+r=$(classify_external_pr_gap3 OPEN CHANGES_REQUESTED 1); [ "$r" = "wait:awaiting-rereview" ] && ok "ga-rmtzrg ACCEPTANCE CRITERION: changes_addressed=1 (head moved past reviewed commit — fix pushed, awaiting re-review) → wait:awaiting-rereview, NOT flag:changes-requested (stop the false re-flip)" || bad "changes_addressed=1 got '$r'"
+r=$(classify_external_pr_gap3 OPEN CHANGES_REQUESTED garbage); [ "$r" = "flag:changes-requested" ] && ok "changes_addressed=garbage (anything but literal '1') → fail-safe flag:changes-requested, never guess addressed" || bad "changes_addressed=garbage got '$r'"
+r=$(classify_external_pr_gap3 OPEN CHANGES_REQUESTED 01); [ "$r" = "flag:changes-requested" ] && ok "changes_addressed='01' (not exactly '1') → fail-safe flag:changes-requested" || bad "changes_addressed=01 got '$r'"
+# 3rd arg must be inert everywhere it isn't consulted — terminal states and
+# the non-CHANGES_REQUESTED OPEN branches ignore it entirely.
+r=$(classify_external_pr_gap3 MERGED '' 1); [ "$r" = "close:merged" ] && ok "3rd arg irrelevant once terminal (MERGED)" || bad "MERGED+3rd-arg got '$r'"
+r=$(classify_external_pr_gap3 CLOSED '' 1); [ "$r" = "flag:closed-not-merged" ] && ok "3rd arg irrelevant once terminal (CLOSED)" || bad "CLOSED+3rd-arg got '$r'"
+r=$(classify_external_pr_gap3 OPEN '' 1); [ "$r" = "wait:pending" ] && ok "3rd arg irrelevant when review_decision isn't CHANGES_REQUESTED" || bad "OPEN-no-review+3rd-arg got '$r'"
+r=$(classify_external_pr_gap3 OPEN APPROVED 1); [ "$r" = "wait:pending" ] && ok "3rd arg irrelevant when review_decision=APPROVED" || bad "OPEN-approved+3rd-arg got '$r'"
+
 # ── reconcile_dead_reviewer_verdict_action <age> <grace> <reviewer_alive> <parent_terminal> ─
 # ga-u07fn: verdict-scoped sibling of reconcile_gaterun_action — releases ONE
 # stuck verdict for re-convocation (parent run still alive) or closes it

@@ -693,7 +693,7 @@ classify_gap2_bugtask_verdict() {
   echo "keep:merge-not-verified"
 }
 
-# classify_external_pr_gap3 <pr_state> <review_decision>
+# classify_external_pr_gap3 <pr_state> <review_decision> [changes_addressed]
 # Pure decision for ga-jto05 GAP-3: a story:awaiting-external-merge bead's real
 # deliverable is a PR in a DIFFERENT repo (fork -> PR -> upstream-review flow,
 # e.g. the beads CLI's own gastownhall/beads — bd-binary-separate-from-gascity-
@@ -709,15 +709,33 @@ classify_gap2_bugtask_verdict() {
 #   PR could not be resolved — all fold to the same fail-safe skip:indeterminate).
 # review_decision: APPROVED | CHANGES_REQUESTED | REVIEW_REQUIRED | "" (none
 #   yet). Only consulted when pr_state=OPEN — irrelevant once the PR is terminal.
-# Returns: close:merged | flag:closed-not-merged | flag:changes-requested | wait:pending | skip:indeterminate
+# changes_addressed (ga-rmtzrg): "1" ONLY when the caller has POSITIVELY
+#   confirmed — via reviews[].commit.oid vs headRefOid — that the PR's head has
+#   moved past the commit the CHANGES_REQUESTED review was made against, i.e. a
+#   fix was pushed after the rejection and awaits re-review. GitHub's own
+#   reviewDecision does not clear itself on a push, only on an explicit
+#   re-review/dismiss by someone with write access — and this city's fork
+#   account is push:false upstream, so nobody here can clear it. Without this
+#   signal, GAP-3 re-flips story:awaiting-external-merge -> gate:needs-fix on
+#   EVERY sweep for as long as the stale review sits there, racing a builder's
+#   own in-flight label correction (observed twice same day on the same bead:
+#   the root incident this parameter exists to fix). Any value other than the
+#   literal string "1" (unset, empty, "0", garbage) reproduces the exact
+#   pre-fix behavior — never guess "addressed" from incomplete data, same
+#   fail-safe convention as classify_parent_gap2's optional sling_refused arg.
+# Returns: close:merged | flag:closed-not-merged | flag:changes-requested | wait:pending | wait:awaiting-rereview | skip:indeterminate
 classify_external_pr_gap3() {
-  local pr_state="$1" review_decision="${2:-}"
+  local pr_state="$1" review_decision="${2:-}" changes_addressed="${3:-}"
   case "$pr_state" in
     MERGED) echo "close:merged" ;;
     CLOSED) echo "flag:closed-not-merged" ;;
     OPEN)
       if [ "$review_decision" = "CHANGES_REQUESTED" ]; then
-        echo "flag:changes-requested"
+        if [ "$changes_addressed" = "1" ]; then
+          echo "wait:awaiting-rereview"
+        else
+          echo "flag:changes-requested"
+        fi
       else
         echo "wait:pending"
       fi
@@ -3187,7 +3205,11 @@ else
     EXT_REPO="${EXT_PR_REF%% *}"
     EXT_NUM="${EXT_PR_REF##* }"
 
-    EXT_PR_JSON=$(gh pr view "$EXT_NUM" --repo "$EXT_REPO" --json state,reviewDecision,mergedAt,mergeCommit,url 2>/dev/null || echo "")
+    # ga-rmtzrg: reviews,headRefOid added to the field set so classify_external_pr_gap3
+    # can tell "CHANGES_REQUESTED, never addressed" apart from "CHANGES_REQUESTED,
+    # already fixed by a later push, awaiting re-review" — see that function's
+    # docstring for the full rationale.
+    EXT_PR_JSON=$(gh pr view "$EXT_NUM" --repo "$EXT_REPO" --json state,reviewDecision,mergedAt,mergeCommit,url,reviews,headRefOid 2>/dev/null || echo "")
 
     if [ -z "$EXT_PR_JSON" ]; then
       log "GAP-3: $EXT_ID — gh pr view $EXT_NUM --repo $EXT_REPO failed (network/auth/not-found) — safe-skip"
@@ -3200,7 +3222,26 @@ else
     EXT_URL=$(echo "$EXT_PR_JSON" | jq -r '.url // ""' 2>/dev/null || echo "")
     [ -z "$EXT_URL" ] && EXT_URL="https://github.com/$EXT_REPO/pull/$EXT_NUM"
 
-    EXT_ACTION=$(classify_external_pr_gap3 "$EXT_STATE" "$EXT_REVIEW")
+    # ga-rmtzrg: changes_addressed is "1" ONLY on positive confirmation — both
+    # SHAs present AND different. Any jq/field-missing failure leaves either
+    # var empty, which falls through to "0" (== old, pre-fix behavior) via
+    # classify_external_pr_gap3's own fail-safe default — never guess addressed
+    # from a partial read. The most-recent-by-submittedAt CHANGES_REQUESTED
+    # review is used as "the" reviewed commit; this deliberately does not
+    # attempt to fully replicate GitHub's own multi-reviewer reviewDecision
+    # rollup — it only needs to answer "has a fix landed since the review that's
+    # driving CHANGES_REQUESTED right now," which the most recent one is.
+    EXT_HEAD_SHA=$(echo "$EXT_PR_JSON" | jq -r '.headRefOid // ""' 2>/dev/null || echo "")
+    EXT_CR_COMMIT=$(echo "$EXT_PR_JSON" | jq -r '
+      [ .reviews // [] | .[] | select(.state == "CHANGES_REQUESTED") ] |
+      sort_by(.submittedAt // "") | last | .commit.oid // ""
+    ' 2>/dev/null || echo "")
+    EXT_CHANGES_ADDRESSED="0"
+    if [ -n "$EXT_HEAD_SHA" ] && [ -n "$EXT_CR_COMMIT" ] && [ "$EXT_HEAD_SHA" != "$EXT_CR_COMMIT" ]; then
+      EXT_CHANGES_ADDRESSED="1"
+    fi
+
+    EXT_ACTION=$(classify_external_pr_gap3 "$EXT_STATE" "$EXT_REVIEW" "$EXT_CHANGES_ADDRESSED")
 
     case "$EXT_ACTION" in
       close:merged)
@@ -3224,6 +3265,9 @@ else
         ;;
       wait:pending)
         log "GAP-3: $EXT_ID — PR $EXT_URL is OPEN, reviewDecision=${EXT_REVIEW:-none} — still genuinely pending, no action"
+        ;;
+      wait:awaiting-rereview)
+        log "GAP-3: $EXT_ID — PR $EXT_URL has CHANGES_REQUESTED but head ($EXT_HEAD_SHA) has moved past the reviewed commit ($EXT_CR_COMMIT) — a fix was already pushed, awaiting re-review. Leaving story:awaiting-external-merge alone (ga-rmtzrg: do NOT re-flip to gate:needs-fix on an already-addressed review), no action"
         ;;
       skip:indeterminate)
         log "GAP-3: $EXT_ID — PR state indeterminate (state='$EXT_STATE') — safe-skip"
