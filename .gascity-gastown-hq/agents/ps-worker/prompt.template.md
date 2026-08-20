@@ -73,10 +73,23 @@ You are disposable. You do not carry state between runs. When your bead is done,
 #     the left branch is TRUE for those beads and the OR short-circuits, so an ACTIVE
 #     hold is never checked: live repro wa-qgdw1 (held-until ~4.7h in the future) came
 #     back as the probe's top-1 candidate. The left branch must mean "no hold label AT
-#     ALL" — `map(select(startswith("pilot:held"))) | length == 0` — which covers both
-#     `pilot:held` and `pilot:held-until:*`; only then is the expiry branch reachable.
+#     ALL" — but NOT via a bare `startswith("pilot:held")` either (see ga-jfz9t1 below).
 #   • held-until labels ACCUMULATE (never pruned here), so use MAX not .[0] (ga-4aree)
 #     — the bead is still held iff its LATEST stamp is in the future.
+#   • ga-jfz9t1: `startswith("pilot:held")` (no colon) is ALSO wrong, the other
+#     direction — it matches the unrelated sticky `pilot:held-count:<slug>:<n>`
+#     label (pilot-dispatcher.sh's _pilot_hold_or_escalate — an escalation-cap
+#     counter documented there as surviving hold expiry, i.e. NEVER cleared once
+#     stamped). A bead carrying only pilot:held-count:* has zero pilot:held-until:
+#     labels to compute an expiry from, so the old broad match fell into the
+#     "else false" branch with no escape hatch and was excluded FOREVER. Confirmed
+#     live: ga-281ri4/ga-fkc1vx were re-approved (ctx:ready/exec:auto/
+#     story:approved) after an earlier unrelated lane:big refusal, but the leftover
+#     held-count label kept them invisible to this exact probe until removed by
+#     hand. The correct left branch is exactly the two label forms that ever
+#     represent an actual hold — `. == "pilot:held" or startswith("pilot:held-until:")`
+#     — covering both the ga-en2s-2 non-atomic-stamping case above AND excluding
+#     pilot:held-count:*, simultaneously. Do not simplify either direction.
 # ga-3lsy1: bugs/tech-debt/tasks never carry the story:* refino convention, so their
 # human-gate signal is the BARE needs-human label instead of story:needs-human — this
 # probe bypasses Pilot's _filter_candidates entirely (same class as ga-nf4x5's
@@ -138,7 +151,7 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # was applied only here and never backported to the Go side (see ga-s1d5o).
 # Bringing both lists to the same superset in one pass so neither direction
 # of drift is left standing.
-bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json --sort oldest --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:held"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select((.labels // []) | map(select(startswith("blocked:"))) | length == 0) | select((.labels // []) | map(select(startswith("gate:needs-human"))) | length == 0)] | .[:1]'
+bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json --sort oldest --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select((.labels // []) | map(select(startswith("blocked:"))) | length == 0) | select((.labels // []) | map(select(startswith("gate:needs-human"))) | length == 0)] | .[:1]'
 # If it returns a bead (output is NOT []), THAT BEAD IS YOURS. Claim it FIRST:
 #     gc bd update <id> --claim
 # verify the claim set assignee to your session, then go to the Build Protocol and build it.
