@@ -136,11 +136,21 @@ chmod +x "$SHIMBIN/bd"
 
 cat > "$SHIMBIN/gc" <<SHIM
 #!/usr/bin/env bash
-# Records 'gc --city <city> mail send mayor -s <subj> -m <body>' calls.
+# Records 'gc --city <city> mail send <target> -s <subj> -m <body>' calls for
+# ANY target (mayor or otherwise — ga-281ri4 now targets the creator when
+# resolvable). Also answers 'gc agent list --json' with a small fixed fake
+# roster so ga-281ri4's creator-resolution logic has something real to
+# resolve against, without touching any live city config.
+if [ "\$1" = "agent" ] && [ "\$2" = "list" ] && [ "\$3" = "--json" ]; then
+  cat <<'ROSTER'
+{"agents":[{"name":"digo-wa"},{"name":"mila-wa"},{"name":"auto-refiner"}]}
+ROSTER
+  exit 0
+fi
 if [ "\$1" = "--city" ]; then
   city="\$2"; shift 2
-  if [ "\$1" = "mail" ] && [ "\$2" = "send" ] && [ "\$3" = "mayor" ]; then
-    shift 3
+  if [ "\$1" = "mail" ] && [ "\$2" = "send" ]; then
+    target="\$3"; shift 3
     subj=""; body=""
     while [ \$# -gt 0 ]; do
       case "\$1" in
@@ -149,7 +159,7 @@ if [ "\$1" = "--city" ]; then
         *) shift ;;
       esac
     done
-    printf '%s\t%s\t%s\n' "\$city" "\$subj" "\$body" >> "$MAILLOG"
+    printf '%s\t%s\t%s\t%s\n' "\$city" "\$target" "\$subj" "\$body" >> "$MAILLOG"
     exit 0
   fi
 fi
@@ -327,6 +337,73 @@ grep -q "comment" "$CALLLOG" 2>/dev/null \
 grep -qF "FAILED to add blocked:sem-descricao on ga-add1" "$WORK/s9.stderr" \
   && ok "AC9: failure is logged explicitly (visible, not silent) so the operator can tell a hiccup from a healthy no-op sweep" \
   || bad "AC9: expected FAILED log line missing (stderr: $(cat "$WORK/s9.stderr"))"
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "Scenario 10 (ga-281ri4 AC1) — creator resolves EXACTLY to a configured agent"
+echo "  → mail goes to the creator directly, NOT the Mayor"
+IN10='[{"id":"ga-cr1","labels":[],"description":"","created_by":"digo-wa"}]'
+OUT10="$(run_red /fake/db "$IN10")"
+[ "$OUT10" = "$IN10" ] && ok "AC6: stdout byte-identical to stdin" || bad "AC6: pass-through altered input"
+grep -qF "$(printf 'digo-wa\tSua bead')" "$MAILLOG" \
+  && ok "ga-281ri4: exact-match creator 'digo-wa' is mailed directly" \
+  || bad "ga-281ri4: expected direct mail to digo-wa missing (maillog: $(cat "$MAILLOG"))"
+grep -qF "	mayor	" "$MAILLOG" \
+  && bad "ga-281ri4: Mayor should NOT be mailed when the creator resolves (maillog: $(cat "$MAILLOG"))" \
+  || ok "ga-281ri4: Mayor is not cc'd/mailed when the creator resolves"
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "Scenario 11 (ga-281ri4 AC2) — creator carries a per-session suffix"
+echo "  (e.g. digo-wa-gawisp7iqcpw) → still resolves to the configured 'digo-wa'"
+IN11='[{"id":"ga-cr2","labels":[],"description":"","created_by":"digo-wa-gawisp7iqcpw"}]'
+OUT11="$(run_red /fake/db "$IN11")"
+[ "$OUT11" = "$IN11" ] && ok "AC6: stdout byte-identical to stdin" || bad "AC6: pass-through altered input"
+grep -qF "$(printf 'digo-wa\tSua bead')" "$MAILLOG" \
+  && ok "ga-281ri4: session-suffixed creator resolves to the bare configured agent 'digo-wa'" \
+  || bad "ga-281ri4: expected direct mail to digo-wa missing for suffixed creator (maillog: $(cat "$MAILLOG"))"
+grep -qF "	mayor	" "$MAILLOG" \
+  && bad "ga-281ri4: Mayor should NOT be mailed when the suffixed creator resolves" \
+  || ok "ga-281ri4: Mayor is not mailed when the suffixed creator resolves"
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "Scenario 12 (ga-281ri4 AC3) — creator superficially resembles a configured"
+echo "  agent but is NOT a boundary-correct prefix match (digo-walker vs digo-wa)"
+echo "  → must fall back to the Mayor, never a bare-substring false-positive"
+IN12='[{"id":"ga-cr3","labels":[],"description":"","created_by":"digo-walker"}]'
+OUT12="$(run_red /fake/db "$IN12")"
+[ "$OUT12" = "$IN12" ] && ok "AC6: stdout byte-identical to stdin" || bad "AC6: pass-through altered input"
+grep -qF "$(printf '\tmayor\t')" "$MAILLOG" \
+  && ok "ga-281ri4: non-boundary near-match ('digo-walker') correctly falls back to Mayor" \
+  || bad "ga-281ri4: expected Mayor fallback missing for non-boundary creator (maillog: $(cat "$MAILLOG"))"
+grep -qF "digo-wa	Sua bead" "$MAILLOG" \
+  && bad "ga-281ri4: 'digo-walker' must NOT bare-substring-match 'digo-wa' (maillog: $(cat "$MAILLOG"))" \
+  || ok "ga-281ri4: no false-positive substring match on the near-miss creator"
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "Scenario 13 (ga-281ri4, documented limitation) — an ephemeral pool creator"
+echo "  (auto-refiner-adhoc-831d3f2efb) prefix-matches the pool TEMPLATE name"
+echo "  'auto-refiner' and is mailed there anyway — a known, accepted limitation"
+echo "  (that specific instance is already gone; no worse than the old"
+echo "  always-mail-Mayor behavior, which could not reach it either)."
+IN13='[{"id":"ga-cr4","labels":[],"description":"","created_by":"auto-refiner-adhoc-831d3f2efb"}]'
+OUT13="$(run_red /fake/db "$IN13")"
+[ "$OUT13" = "$IN13" ] && ok "AC6: stdout byte-identical to stdin" || bad "AC6: pass-through altered input"
+grep -qF "$(printf 'auto-refiner\tSua bead')" "$MAILLOG" \
+  && ok "ga-281ri4: documented limitation reproduced as designed (locks the accepted tradeoff, not a silent surprise)" \
+  || bad "ga-281ri4: expected mail to 'auto-refiner' missing (maillog: $(cat "$MAILLOG"))"
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "Scenario 14 (ga-281ri4 regression) — unresolvable creator (Scenario 1's"
+echo "  'some-daemon') still falls back to the Mayor exactly as before this fix"
+OUT14="$(run_red /fake/db "$IN1")"
+[ "$OUT14" = "$IN1" ] && ok "AC6: stdout byte-identical to stdin" || bad "AC6: pass-through altered input"
+grep -qF "$(printf '\tmayor\t')" "$MAILLOG" && grep -qF "ga-add1" "$MAILLOG" && grep -qF "some-daemon" "$MAILLOG" \
+  && ok "ga-281ri4 regression: unresolvable creator ('some-daemon') still falls back to Mayor mail, citing bead id + creator" \
+  || bad "ga-281ri4 regression: expected Mayor fallback for unresolvable creator missing/changed (maillog: $(cat "$MAILLOG"))"
 
 # ════════════════════════════════════════════════════════════════════════════
 echo ""

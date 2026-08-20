@@ -2301,11 +2301,80 @@ _reconcile_empty_description_signal() {
       bd -C "$_red_db" comment "$_red_id" \
         "pilot-dispatcher (ga-iu3xc5): esta bead não tem descrição (só título) e por isso NUNCA é despachada — um agente genérico não tem spec pra construir. Isto se repetia em silêncio a cada sweep (só um log que ninguém lê); agora fica marcado com $_red_lbl. Para destravar: complete a descrição (o que fazer, por quê, critério de aceite) e o label some sozinho — ou feche como sucata se não for mais válida." \
         2>/dev/null || true
-      gc --city "$GC_CITY" mail send mayor \
-        -s "Bead sem descrição, nunca despachada: $_red_id" \
-        -m "$(printf '%s foi excluída de todo sweep de dispatch por descrição vazia — nunca vira candidata, sem alarme até agora (ga-iu3xc5).\n\n  criada por: %s\n\nLabel %s + comentário já aplicados na bead. Ação: dar descrição real (dono/criador) ou fechar como sucata. O label some sozinho quando a descrição deixar de ser vazia.' \
-          "$_red_id" "${_red_creator:-desconhecido}" "$_red_lbl")" \
-        2>/dev/null || true
+
+      # ga-281ri4: notify the CREATOR directly instead of the Mayor when
+      # resolvable — only the creator has the context to write the missing
+      # description (~30s of real work per the incident that filed this);
+      # the Mayor's only useful move was always "find the creator and
+      # relay", a guaranteed extra hop measured live on wa-r4wgq/ga-281ri4
+      # itself. Resolved lazily against `gc agent list` (the city's
+      # CONFIGURED/persistent roster) — fetched at most once per sweep,
+      # only when an "add" transition actually fires (rare; most sweeps
+      # never reach this line at all).
+      #
+      # created_by frequently carries a raw per-session suffix rather than
+      # the bare configured name (e.g. "digo-wa-gawisp7iqcpw" for the
+      # configured agent "digo-wa" — stamping is per-instance, the config
+      # is per-agent) — matched by prefix (exact name, or name immediately
+      # followed by "-"), taking the LONGEST matching configured name so a
+      # shorter name can never swallow a more specific one that also
+      # matches. A boundary-exact prefix, not a bare substring test:
+      # "digo-walker" must NOT match "digo-wa" (no trailing "-" after the
+      # candidate), the same discipline blocked:<reason> already applies
+      # elsewhere in this file against blocked-by:<id>.
+      #
+      # Third-state judgment call, recorded rather than silently made: an
+      # EPHEMERAL pool creator (dog-*, auto-refiner-adhoc-*, ...) may
+      # prefix-match a pool TEMPLATE name (e.g. auto-refiner-adhoc-831d3f2efb
+      # matching "auto-refiner") and still resolve to a specific, already-
+      # gone instance that mail can never reach — accepted as a known
+      # limitation, not silently swept under: it is NO WORSE than today's
+      # unconditional Mayor-mail for that same case, since the Mayor could
+      # never relay to a dead session either. A human creator (e.g. a raw
+      # "athosmartins") or an unknown/empty one correctly falls through to
+      # the Mayor fallback below by simple non-match — no separate
+      # human-detection logic needed.
+      # ga-281ri4 / set -euo pipefail (this file, L74): both command
+      # substitutions below MUST be guarded with `|| true` — under
+      # pipefail, a non-zero exit anywhere in either pipe (gc down, jq
+      # parse error, ...) would otherwise abort the WHOLE dispatcher sweep
+      # via errexit, not just this notification. Same idiom this file
+      # already uses everywhere else a `bd`/`gc` call's failure must stay
+      # non-fatal (e.g. the labeling calls above).
+      if [ -z "${_red_agents_json:-}" ]; then
+        _red_agents_json=$(gc agent list --json 2>/dev/null \
+          | jq -c '[.agents[].name] | unique' 2>/dev/null) || true
+        [ -z "$_red_agents_json" ] && _red_agents_json="[]"
+      fi
+      _red_target=""
+      if [ -n "$_red_creator" ] && [ "$_red_creator" != "null" ]; then
+        # ga-8a9n class: `$c | startswith(. + "-")` would rebind `.` to $c
+        # for the WHOLE piped expression, including the argument — so the
+        # bare `.` inside `startswith(. + "-")` would silently become $c
+        # itself, not the agent name, making the prefix branch permanently
+        # false (caught live by this fix's own selftest, not by inspection
+        # alone — Scenario 11 failed against the first version of this
+        # line). Capture the agent name into $agent BEFORE ever piping $c,
+        # so it stays stable regardless of what `.` gets rebound to.
+        _red_target=$(printf '%s' "$_red_agents_json" | jq -r --arg c "$_red_creator" '
+            [ .[] | . as $agent | select(($c == $agent) or ($c | startswith($agent + "-"))) ]
+            | sort_by(length) | last // empty
+          ' 2>/dev/null) || true
+      fi
+
+      if [ -n "$_red_target" ]; then
+        gc --city "$GC_CITY" mail send "$_red_target" \
+          -s "Sua bead sem descrição, nunca despachada: $_red_id" \
+          -m "$(printf 'Você criou %s sem descrição — por isso ela nunca é despachada (nenhum agente genérico tem spec pra construir a partir só do título). Só quem criou tem o contexto do que ela deveria dizer.\n\nLabel %s + comentário já aplicados na bead. Ação: complete a descrição (o que fazer, por quê, critério de aceite) e o label some sozinho — ou feche como sucata se não for mais válida.' \
+            "$_red_id" "$_red_lbl")" \
+          2>/dev/null || true
+      else
+        gc --city "$GC_CITY" mail send mayor \
+          -s "Bead sem descrição, nunca despachada: $_red_id" \
+          -m "$(printf '%s foi excluída de todo sweep de dispatch por descrição vazia — nunca vira candidata, sem alarme até agora (ga-iu3xc5).\n\n  criada por: %s (não resolvida a um agente configurado — notificação direta ao criador não foi possível)\n\nLabel %s + comentário já aplicados na bead. Ação: dar descrição real (dono/criador) ou fechar como sucata. O label some sozinho quando a descrição deixar de ser vazia.' \
+            "$_red_id" "${_red_creator:-desconhecido}" "$_red_lbl")" \
+          2>/dev/null || true
+      fi
     fi
   done
   return 0
