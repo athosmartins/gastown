@@ -830,6 +830,42 @@ pool_refused_label_present() {
     return 1
 }
 
+# human_turn_label_present (ga-fkc1vx): true iff the comma-joined label
+# list $1 carries a label that puts the BEAD ITSELF in the human's queue
+# by design — next-action:athos, story:needs-approval, story:refino-
+# escalado, or gate:needs-human:product. This is a property of the bead,
+# independent of whether the assignee's session is alive or frozen: the
+# agent correctly stopped touching this specific bead (usually to work
+# something else) and "no progress in Nmin" is the expected, correct
+# state, not a stall. Measured 20/08: wa-1v7kn escalated as "1112min sem
+# progresso, assignee=peter-wa" while peter-wa was demonstrably alive
+# (peek showed it answering something else 1m34s earlier) — the AGENT
+# wasn't stuck, the BEAD was parked by design (next-action:athos +
+# exec:manual since 18/08). The escalation's own suggested remedy
+# (shutdown-dance/kill+re-despache) would kill a healthy session over
+# work that isn't its turn.
+#
+# EXACT match only — no gate:needs-human:* prefix/glob. Bare
+# gate:needs-human (no :product suffix) means something ELSE here (the
+# gate's own quorum already bounced to a human, possibly needing just one
+# keypress — see gate_reviewer_permission_prompt_session/ga-lxk26 below)
+# and must keep escalating; only the :product sub-reason (a genuine
+# product decision blocking the bead) parks it.
+human_turn_label_present() {
+    local labels_csv="${1:-}" lbl
+    local -a lbls=()
+    IFS=',' read -ra lbls <<< "$labels_csv"
+    for lbl in "${lbls[@]:-}"; do
+        [ -z "$lbl" ] && continue
+        case "$lbl" in
+            next-action:athos|story:needs-approval|story:refino-escalado|gate:needs-human:product)
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
 # is_human_assignee (ga-tiwmm): an in_progress bead assigned to a HUMAN
 # identity (e.g. "athosmartins@gmail.com") has no Gas Town agent
 # session-template by construction — "sessão ausente" is not a stall signal
@@ -1292,6 +1328,14 @@ if [ -z "$STUCK_ITEMS" ]; then
     exit 0
 fi
 
+# human_turn_count (ga-fkc1vx): beads suppressed by human_turn_label_present
+# below, reported in a separate RESUMO line after the loop — never silently
+# dropped from the report (precedent: gate-orphaned-label-watchdog.sh's
+# park_count, ga-cjk1j). This is a top-level (non-function) script, and the
+# loop below runs via `<<<` (a here-string), NOT a piped `| while` — so it
+# does NOT spawn a subshell, and increments inside the loop are visible here.
+human_turn_count=0
+
 # ── Process each stuck bead ───────────────────────────────────────────────────
 while IFS='|' read -r bead_id assignee age_secs title labels active_window; do
     [ -z "$bead_id" ] && continue
@@ -1369,6 +1413,22 @@ while IFS='|' read -r bead_id assignee age_secs title labels active_window; do
     # engine-window follow-up can change.
     if pool_refused_label_present "$labels"; then
         log "$bead_id: bead.updated_at parado ${age_min}min — label pool:refused:* presente (labels=$labels) — SUPRIMINDO escalação (recusado por design, aguardando follow-up, ga-5o2mj6)"
+        continue
+    fi
+
+    # Human-turn label present (ga-fkc1vx): the bead itself declares it's
+    # parked awaiting a HUMAN decision (next-action:athos/story:needs-
+    # approval/story:refino-escalado/gate:needs-human:product) — a
+    # property of the BEAD, independent of whether the assignee's session
+    # is alive. Runs before the assignee-empty/session-health checks below
+    # for the same reason as pool_refused_label_present just above: it
+    # must win before the "session absent" branch ever gets a chance to
+    # escalate. Counted separately (human_turn_count) and reported in the
+    # run summary instead of silently vanishing from the report —
+    # precedent: gate-orphaned-label-watchdog.sh's park_count (ga-cjk1j).
+    if human_turn_label_present "$labels"; then
+        human_turn_count=$((human_turn_count + 1))
+        log "$bead_id: bead.updated_at parado ${age_min}min — label de turno-do-humano presente (labels=$labels) — SUPRIMINDO escalação (bead parado por design aguardando decisão do Athos, ga-fkc1vx)"
         continue
     fi
 
@@ -1814,6 +1874,13 @@ BODY
     rm -f "$rf"
 
 done <<< "$STUCK_ITEMS"
+
+# RESUMO (ga-fkc1vx AC2): report beads parked awaiting a human decision as a
+# separate count instead of letting them vanish silently from the log —
+# same shape as gate-orphaned-label-watchdog.sh's "PARK:" line (ga-cjk1j).
+if [ "$human_turn_count" -gt 0 ]; then
+    log "RESUMO: ${human_turn_count} bead(s) na fila do humano (next-action:athos/story:needs-approval/story:refino-escalado/gate:needs-human:product) — nao contam para escalacao (ga-fkc1vx)."
+fi
 
 log "=== pass complete ==="
 exit 0

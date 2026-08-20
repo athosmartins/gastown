@@ -1658,6 +1658,97 @@ assert_absent "$ACTIONS" "notify" "T73: no notify — pool:refused suppresses"
 [ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-5o2mj6-b" ] && ok "T73: no escalation state written (suppression is log-only)" || bad "T73: unexpected state file written on suppression"
 log_contains "T73" "recusado por design" "T73: log notes the pool:refused suppression"
 
+# ── T74-T80: human-turn label present → suppressed, separate count ──────────
+# (ga-fkc1vx). agent-stuck-escalation previously treated a bead's own
+# updated_at staleness as sufficient to escalate once the assignee's
+# session read absent/frozen — even when the BEAD itself declares it's
+# parked awaiting a HUMAN decision, independent of the agent. Measured
+# 20/08: wa-1v7kn (next-action:athos + exec:manual since 18/08) escalated
+# as "1112min sem progresso, assignee=peter-wa" while peter-wa was
+# demonstrably alive working OTHER beads — the bead was correctly parked,
+# the agent wasn't stuck. The escalation's own suggested remedy
+# (shutdown-dance/kill+re-despache) would have killed a healthy session
+# over work that isn't the agent's turn to advance.
+#
+# T74-T77 each reproduce the FAILING shape (empty sessions fixture, same
+# as T73's pool:refused proof): before this fix, an absent session + stale
+# updated_at escalates regardless of these labels; after, the label alone
+# suppresses. T78/T79 are negative controls proving the new check stays
+# narrowly scoped: a bead with NEITHER label still escalates (no
+# regression, AC5), and bare gate:needs-human (no :product suffix — a
+# DIFFERENT meaning, already owned by gate_reviewer_permission_prompt_
+# session's BLOQUEADO-EM-PROMPT path, ga-lxk26) still escalates too — an
+# accidental prefix/glob match here would silently re-break that path.
+# T80 proves the separate-count reporting (AC2; precedent: gate-orphaned-
+# label-watchdog.sh's park_count, ga-cjk1j) across TWO suppressed beads in
+# one pass.
+
+echo "T74: bead with next-action:athos → suppressed, not escalated (ga-fkc1vx AC1, wa-1v7kn reproduction)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+printf '[%s]' "$(make_bead_json ga-fkc1vx-1 peter-wa-ga-fkc1vx 2200 '["exec:manual","next-action:athos"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-fkc1vx-1"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-fkc1vx-1" "T74: no mail — next-action:athos parks the bead by design"
+assert_absent "$ACTIONS" "notify" "T74: no notify — next-action:athos suppresses"
+[ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-fkc1vx-1" ] && ok "T74: no escalation state written (suppression is log-only)" || bad "T74: unexpected state file written on suppression"
+log_contains "T74" "turno-do-humano" "T74: log notes the human-turn suppression"
+
+echo "T75: bead with story:needs-approval → suppressed, not escalated (ga-fkc1vx AC1)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+printf '[%s]' "$(make_bead_json ga-fkc1vx-2 dog-ga-fkc1vx-2 2200 '["story:needs-approval"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-fkc1vx-2"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-fkc1vx-2" "T75: no mail — story:needs-approval parks the bead by design"
+[ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-fkc1vx-2" ] && ok "T75: no escalation state written" || bad "T75: unexpected state file written"
+
+echo "T76: bead with story:refino-escalado → suppressed, not escalated (ga-fkc1vx AC1)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+printf '[%s]' "$(make_bead_json ga-fkc1vx-3 dog-ga-fkc1vx-3 2200 '["story:refino-escalado"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-fkc1vx-3"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-fkc1vx-3" "T76: no mail — story:refino-escalado parks the bead by design"
+[ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-fkc1vx-3" ] && ok "T76: no escalation state written" || bad "T76: unexpected state file written"
+
+echo "T77: bead with gate:needs-human:product → suppressed, not escalated (ga-fkc1vx AC1)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+printf '[%s]' "$(make_bead_json ga-fkc1vx-4 dog-ga-fkc1vx-4 2200 '["gate:needs-human:product"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-fkc1vx-4"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-fkc1vx-4" "T77: no mail — gate:needs-human:product parks the bead by design"
+[ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-fkc1vx-4" ] && ok "T77: no escalation state written" || bad "T77: unexpected state file written"
+
+echo "T78: bead with NO human-turn label → still escalates (ga-fkc1vx AC5, no-regression control)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+printf '[%s]' "$(make_bead_json ga-fkc1vx-5 dog-ga-fkc1vx-5 2200 '["area:infra"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-fkc1vx-5"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-fkc1vx-5" "T78: still escalates — genuinely idle bead with no human-turn signal (no regression)"
+
+echo "T79: bead with bare gate:needs-human (no :product suffix) → still escalates (ga-fkc1vx, exact-match control — ga-lxk26's BLOQUEADO-EM-PROMPT path already owns this label alone)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+printf '[%s]' "$(make_bead_json ga-fkc1vx-6 dog-ga-fkc1vx-6 2200 '["gate:needs-human"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-fkc1vx-6"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-fkc1vx-6" "T79: still escalates — bare gate:needs-human is NOT the same label as gate:needs-human:product (exact-match, not prefix)"
+
+echo "T80: two suppressed beads in one pass → RESUMO line reports the count, not silence (ga-fkc1vx AC2, precedent gate-orphaned-label-watchdog park_count/ga-cjk1j)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+printf '[%s,%s]' \
+    "$(make_bead_json ga-fkc1vx-7 dog-ga-fkc1vx-7 2200 '["next-action:athos"]')" \
+    "$(make_bead_json ga-fkc1vx-8 dog-ga-fkc1vx-8 2200 '["story:needs-approval"]')" \
+    > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-fkc1vx-7" "$WORK/city/.gc/state/agent-stuck-escalation/ga-fkc1vx-8"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor" "T80: neither bead escalates"
+log_contains "T80" "2 bead(s) na fila do humano" "T80: RESUMO line reports the count of suppressed beads, not silence"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
