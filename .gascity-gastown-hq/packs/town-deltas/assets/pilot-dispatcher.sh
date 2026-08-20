@@ -990,6 +990,25 @@ rig_domain_default_builder() {
   esac
 }
 
+# rig_has_persistent_crew_capability <rig> — rc 0 if the rig has ANY persistent-
+# crew build path (a single named crew per rig_domain_default_builder, OR a crew
+# POOL like WA's wa-worker/mila-wa/digo-wa/etc.), rc 1 if the rig's only possible
+# builder is the ephemeral dog pool. Deliberately NOT the same question as
+# rig_domain_default_builder: that function's "" return means two DIFFERENT facts
+# — "pool-based, no single named owner" (whatsapp_automation) or "no persistent
+# crew of ANY kind" (gascity/gastown/lexbh/marketing) — and a caller escalating to
+# the Mayor needs to say which one is true. ga-r7h3lf: "assign a live persistent
+# crew" is impossible advice when no persistent crew of any kind ever builds this
+# rig; the real remedy then is a human/Mayor taking ownership directly, not a
+# crew-assignment action that has no target. Pure string match, no I/O — cannot
+# fail, so callers need no fail-open guard around it.
+rig_has_persistent_crew_capability() {
+  case "$1" in
+    whatsapp_automation|wa) return 0 ;;  # pool-based (wa-worker + named WA crews)
+    *) [ -n "$(rig_domain_default_builder "$1" 2>/dev/null)" ] ;;
+  esac
+}
+
 # ── ga-xzfl: PATH-authoritative rig inference (the router-sabotages-itself bug) ─
 # ROOT: rig inference uses KEYWORDS (bead_content_rig/bead_domain), so a bead ABOUT
 # the routing machinery — cites packs/town-deltas/assets/pilot-dispatcher.sh +
@@ -7621,9 +7640,26 @@ LIVESEC
           # defer with NO label at all, no trace, no counter. At minimum,
           # stamp the shared counter so a bead stuck here forever eventually
           # escalates to the Mayor instead of vanishing silently.
+          # ga-r7h3lf: "assign a live persistent crew" is only real advice when
+          # this rig actually HAS a persistent-crew build path. For a rig with
+          # NONE (e.g. gascity/gastown HQ-engine work — only the ephemeral dog
+          # pool ever builds it), the old message prescribed an action nobody
+          # can take: ga-r150x9 (a genuinely lane:big HQ bead) looped 4 holds on
+          # exactly this text before anyone noticed the "remedy" doesn't exist
+          # for this rig. Say the real fact plainly instead, and point at the
+          # remedy that's actually available (a human/Mayor takes ownership
+          # directly, or the bead is reclassified off lane:big) — creating a
+          # persistent crew for the rig is a separate resourcing decision, not
+          # a per-bead unblock.
+          local _JAZY9_REASON="lane:big story with no live persistent-crew owner — dogs (~25-min TTL) cannot build a big subsystem"
+          local _JAZY9_UNBLOCK="assign a live persistent crew to $STORY_ID, or route it off lane:big"
+          if ! rig_has_persistent_crew_capability "$STORY_RIG"; then
+            _JAZY9_REASON="lane:big story in rig $STORY_RIG, which has NO persistent-crew build path at all (only the ephemeral dog pool, TTL ~25min) — this is not a busy/unavailable crew, no such crew exists for this rig"
+            _JAZY9_UNBLOCK="a human or the Mayor must take ownership of $STORY_ID directly (bd assign), or route it off lane:big — creating a persistent crew for $STORY_RIG is a separate resourcing decision, not a per-bead fix"
+          fi
           _pilot_hold_or_escalate "$STORY_BEAD_CITY" "$STORY_ID" "ga-jazy9" \
-            "lane:big story with no live persistent-crew owner — dogs (~25-min TTL) cannot build a big subsystem" \
-            "assign a live persistent crew to $STORY_ID, or route it off lane:big" \
+            "$_JAZY9_REASON" \
+            "$_JAZY9_UNBLOCK" \
             "$(echo "$STORY" | jq -c '.labels // []' 2>/dev/null || echo '[]')"
           return 1
         fi

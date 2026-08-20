@@ -6712,6 +6712,33 @@ else
   bad "ga-jazy9 3rd hold did not escalate as expected (log: $LOG_2N7XW_D)"
 fi
 
+# ── Scenario ga-r7h3lf: ga-jazy9 escalation message must be HONEST about
+# whether a persistent crew exists for the rig, not prescribe "assign a live
+# persistent crew" when none can ever exist (ga-r150x9 looped 4 holds on that
+# impossible advice before anyone noticed the rig — gascity — has no
+# persistent-crew build path at all, only the ephemeral dog pool). Reuses
+# GENERIC_BIG_HELD2 (id prefix "ga" → STORY_RIG infers to "gascity", which has
+# no capability) from scenario ga-2n7xw-d above — same fixture, new assertion
+# on the escalation TEXT rather than just the fact that it escalated.
+echo "Scenario ga-r7h3lf-a: ga-jazy9 escalation for a no-crew-capability rig (gascity) states the real fact and does NOT prescribe impossible advice"
+if echo "$LOG_2N7XW_D" | grep -qF "to Mayor: lane:big story in rig gascity, which has NO persistent-crew build path at all"; then
+  ok "AC: escalation reason states plainly that gascity has no persistent-crew build path"
+else
+  bad "AC regression: escalation reason did not state the no-crew-capability fact for gascity (log: $LOG_2N7XW_D) — this is the RED state pre-fix (rig_has_persistent_crew_capability not yet implemented/wired)"
+fi
+if echo "$LOG_2N7XW_D" | grep -qF "to Mayor: lane:big story with no live persistent-crew owner — dogs"; then
+  bad "REGRESSION: escalation reason reverted to the old generic (impossible-advice-adjacent) text for a no-capability rig"
+else
+  ok "old generic reason text no longer appears for a no-capability rig"
+fi
+
+echo "Scenario ga-r7h3lf-b: rig_has_persistent_crew_capability wired into the live dispatcher (drift-guard)"
+if grep -qF 'if ! rig_has_persistent_crew_capability "$STORY_RIG"; then' "$DISPATCHER"; then
+  ok "drift-guard: the ga-jazy9 site still calls rig_has_persistent_crew_capability on STORY_RIG"
+else
+  bad "drift-guard: the ga-jazy9 site no longer calls rig_has_persistent_crew_capability — message-honesty fix silently dropped"
+fi
+
 # ── Scenario ga-mhbyc (2026-07-29): framework-dog-exempt reason (e) — digest label ─
 # ROOT (found investigating ga-7ti1t AC5, same live bead ga-j54v3): a digest bead's
 # OWN auto-generated "By Rig" table names EVERY rig (including property_scrapers/
