@@ -3552,14 +3552,38 @@ if [ -n "$BEAD_ID" ]; then
     BEAD_RAW=$(bd -C "$GC_CITY" show "$BEAD_ID" --json 2>/dev/null || echo "")
   fi
 
-  # Extract fields using grep (robust to embedded-newline JSON from gc bd)
-  # Try assignee first, then owner/creator
-  AUTHOR=$(bead_field_grep "$BEAD_RAW" "assignee")
-  if [ -z "$AUTHOR" ] || [ "$AUTHOR" = "null" ]; then
-    AUTHOR=$(bead_field_grep "$BEAD_RAW" "created_by")
-  fi
-  if [ -z "$AUTHOR" ] || [ "$AUTHOR" = "null" ]; then
-    AUTHOR=$(bead_field_grep "$BEAD_RAW" "owner")
+  # ga-b3gso9: prefer a FROZEN author gate-done already recorded on THIS
+  # marker at original submission time (--set-metadata gate.submitted_by,
+  # written synchronously in the same tool call that created the marker —
+  # zero race window). Re-deriving from the bead's CURRENT assignee below is
+  # a TOCTOU race: between marker creation and this guard's sweep claiming
+  # it (up to ~2min, launchd StartInterval), an unrelated pool-claim probe
+  # can legitimately claim the source bead — its gc.routed_to is not cleared
+  # until Step 5b further down in THIS SAME run — and become the new
+  # assignee. Reproduced live: wa-pwzn2/ga-0aanz7 froze gate.submitted_by as
+  # the SECOND claimer (wa-worker-gaa1934f), not the actual fixer
+  # (wa-worker-ga43ei3l) who submitted — silently stealing the pass/fail
+  # notification. Old markers (pre-dating this fix, or created by any path
+  # that doesn't set gate.submitted_by) carry no frozen value —
+  # MARKER_AUTHOR_FROZEN stays empty and the existing bead-derivation below
+  # runs exactly as before; no regression for in-flight legacy markers.
+  MARKER_JSON_FOR_AUTHOR=$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null || echo "")
+  MARKER_AUTHOR_FROZEN=$(printf '%s\n' "$MARKER_JSON_FOR_AUTHOR" \
+    | jq -r 'if type=="array" then .[0] else . end | .metadata["gate.submitted_by"] // empty' 2>/dev/null || true)
+
+  if [ -n "$MARKER_AUTHOR_FROZEN" ] && [ "$MARKER_AUTHOR_FROZEN" != "null" ]; then
+    AUTHOR="$MARKER_AUTHOR_FROZEN"
+    log "  Author frozen on marker by gate-done at submit time: $AUTHOR (trusted, ga-b3gso9; skipping bead re-derivation)."
+  else
+    # Extract fields using grep (robust to embedded-newline JSON from gc bd)
+    # Try assignee first, then owner/creator
+    AUTHOR=$(bead_field_grep "$BEAD_RAW" "assignee")
+    if [ -z "$AUTHOR" ] || [ "$AUTHOR" = "null" ]; then
+      AUTHOR=$(bead_field_grep "$BEAD_RAW" "created_by")
+    fi
+    if [ -z "$AUTHOR" ] || [ "$AUTHOR" = "null" ]; then
+      AUTHOR=$(bead_field_grep "$BEAD_RAW" "owner")
+    fi
   fi
 fi
 

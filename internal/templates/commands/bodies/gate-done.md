@@ -695,6 +695,42 @@ _BEAD_STORE="$GC_CITY_PATH"
 [ "$BEAD_RIG" != "gascity" ] && [ "$BEAD_RIG" != "unknown" ] && [ -n "${_BEAD_RIG_PATH:-}" ] && _BEAD_STORE="$_BEAD_RIG_PATH"
 bd -C "$_BEAD_STORE" label add "$BEAD_ID" "gate:queued" -q 2>/dev/null || true
 
+# ga-b3gso9: freeze the marker's trusted-author field (gate.submitted_by) at
+# THIS exact instant — the true "original submission moment" — instead of
+# leaving it to the guard's later sweep (~2min, launchd StartInterval) to
+# derive from whatever the bead's assignee happens to be BY THEN. Between now
+# and that sweep, gc.routed_to on the source bead is not yet cleared (that
+# happens inside the guard's OWN claim step, later), so an unrelated
+# pool-claim probe can legitimately claim this bead in the gap and become its
+# new assignee — reproduced live: wa-pwzn2/ga-0aanz7 froze gate.submitted_by
+# as a SECOND session that merely claimed after the real fixer had already
+# submitted, silently stealing the pass/fail notification.
+#
+# SECURITY: this reads the SAME authoritative DB fields the guard itself
+# trusts (assignee -> created_by -> owner, quality-gate-guard.sh Step 5) —
+# NOT $AUTHOR (this script's own GC_ALIAS/git-config self-declaration,
+# already embedded above as plain-text `author:` in the marker description,
+# for logging only — the guard has never trusted that field, by design). A
+# worker cannot spoof this by exporting GC_ALIAS: the value written here
+# comes from the bead's OWN row in the DB, read at the earliest possible
+# moment after marker creation, not from anything the calling session merely
+# claims about itself.
+_SUBMIT_BEAD_JSON=$(bd -C "$_BEAD_STORE" show "$BEAD_ID" --json 2>/dev/null)
+_SUBMIT_AUTHOR=$(printf '%s' "$_SUBMIT_BEAD_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // empty' 2>/dev/null || echo "")
+if [ -z "$_SUBMIT_AUTHOR" ] || [ "$_SUBMIT_AUTHOR" = "null" ]; then
+  _SUBMIT_AUTHOR=$(printf '%s' "$_SUBMIT_BEAD_JSON" | jq -r 'if type=="array" then .[0] else . end | .created_by // empty' 2>/dev/null || echo "")
+fi
+if [ -z "$_SUBMIT_AUTHOR" ] || [ "$_SUBMIT_AUTHOR" = "null" ]; then
+  _SUBMIT_AUTHOR=$(printf '%s' "$_SUBMIT_BEAD_JSON" | jq -r 'if type=="array" then .[0] else . end | .owner // empty' 2>/dev/null || echo "")
+fi
+# Third state: if none of assignee/created_by/owner resolve, do NOT invent a
+# value — leave gate.submitted_by unset. The guard's own Step 5 derivation
+# (same 3-tier priority, same source) is the existing, unchanged fallback for
+# markers where this freeze could not happen.
+if [ -n "$_SUBMIT_AUTHOR" ] && [ "$_SUBMIT_AUTHOR" != "null" ]; then
+  bd -C "$GC_CITY_PATH" update "$MARKER_ID" --set-metadata "gate.submitted_by=$_SUBMIT_AUTHOR" -q 2>/dev/null || true
+fi
+
 # ga-6lwpy: auto-close the CALLING sling/task bead now, instead of leaving it as a
 # manual post-gate-done step. Root incident: a dog built+pushed+gate-done'd a fix via
 # sling bead ga-0l58y but exited/recycled before manually closing ga-0l58y itself (the
