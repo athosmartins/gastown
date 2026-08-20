@@ -406,17 +406,60 @@ city reclaim/reaper sweeps already cover a genuinely-stuck open sling —
 then signal the controller to reclaim this session:
 
 ```bash
-if [ -n "${GC_BEAD_ID:-}" ]; then
-  SLING_JSON=$(bd show "$GC_BEAD_ID" --json 2>/dev/null)
+# ga-0ttcdl: $GC_BEAD_ID reflects whatever bead this session was originally
+# dispatched/hooked to (do-work's own step) -- it is NOT refreshed when this
+# SAME session internally advances to this drain step. Observed live: empty
+# here even though the drain step bead is genuinely in_progress+assigned to
+# this session. Upstream gascity (commit fd56f1048, not yet in this city's
+# engine build) confirms the claude provider tracks "the bead behind this
+# turn" separately as $GC_TRIGGER_BEAD_ID, correctly re-scoped per step
+# (including drain) where $GC_BEAD_ID is not -- so try that env var too
+# before paying for a live query. Then fall back to a live, precisely-
+# scoped query -- the same "in_progress assigned to me" resolution
+# `bd mol current` itself uses, narrowed to this exact step so an unrelated
+# in-flight bead can never be mistaken for this one.
+STEP_BEAD_ID="${GC_BEAD_ID:-${GC_TRIGGER_BEAD_ID:-}}"
+# ga-0ttcdl pre-flight self-audit: `bd list --assignee=""` is NOT a safe
+# "match nothing" filter -- verified live, it behaves as NO FILTER AT ALL
+# and returns every in_progress bead city-wide. If $GC_SESSION_NAME were
+# ever empty here, the query below would stop being scoped to THIS session
+# and could resolve to (and close) some OTHER session's drain step. Refuse
+# to even attempt the query without a non-empty session name -- that's an
+# unresolvable state exactly like zero/multiple candidates, not a query to
+# run unscoped.
+if [ -z "$STEP_BEAD_ID" ] && [ -n "${GC_SESSION_NAME:-}" ]; then
+  FALLBACK_JSON=$(bd list --status in_progress --assignee="$GC_SESSION_NAME" --type=step --metadata-field "gc.step_ref=mol-do-work.drain" --json --limit=0 2>/dev/null)
+  FALLBACK_COUNT=$(printf '%s' "${FALLBACK_JSON:-[]}" | jq 'length' 2>/dev/null || echo 0)
+  if [ "$FALLBACK_COUNT" = "1" ]; then
+    STEP_BEAD_ID=$(printf '%s' "$FALLBACK_JSON" | jq -r '.[0].id')
+  fi
+fi
+
+if [ -z "$STEP_BEAD_ID" ]; then
+  # Third state (neither "resolved" nor safe to treat as "nothing to do"):
+  # do NOT fall through to drain-ack in silence -- that is exactly how this
+  # bug produced a stuck step bead + a silent pool-worker respawn loop. Log
+  # loud and escalate, but still drain below so the session itself doesn't
+  # hang forever -- city reclaim/reaper sweeps already backstop a
+  # genuinely-stuck sling (see this step's own doc above).
+  if [ -z "${GC_SESSION_NAME:-}" ]; then
+    RESOLVE_DETAIL="GC_SESSION_NAME is also empty -- the live fallback query was never attempted (an empty --assignee filter matches every in-flight bead city-wide, not just this session's)"
+  else
+    RESOLVE_DETAIL="live fallback query (assignee=$GC_SESSION_NAME, type=step, gc.step_ref=mol-do-work.drain) found ${FALLBACK_COUNT:-0} candidates (need exactly 1)"
+  fi
+  echo "ERROR(ga-0ttcdl): could not resolve this drain step's own bead id. GC_BEAD_ID and GC_TRIGGER_BEAD_ID were both empty; $RESOLVE_DETAIL. Backstop-close skipped -- this step bead may remain stuck open." >&2
+  gc session nudge deacon "STEP_UNRESOLVED(ga-0ttcdl): mol-do-work drain step could not resolve its own bead id -- session=${GC_SESSION_NAME:-unknown} work_dir=$(pwd) -- check for a stuck step bead (bd mol current, or bd list --status in_progress --assignee=${GC_SESSION_NAME:-unknown} --type=step)" 2>/dev/null || true
+else
+  SLING_JSON=$(bd show "$STEP_BEAD_ID" --json 2>/dev/null)
   SLING_JSON_RC=$?
   SLING_STATUS=""
   if [ "$SLING_JSON_RC" -eq 0 ] && [ -n "$SLING_JSON" ]; then
     SLING_STATUS=$(printf '%s' "$SLING_JSON" | jq -r '.[0].status // empty' 2>/dev/null)
   fi
   if [ -z "$SLING_STATUS" ]; then
-    echo "Warning: could not confirm $GC_BEAD_ID's status (bd show rc=$SLING_JSON_RC) -- skipping the backstop close rather than risk overwriting an outcome a prior step may already have recorded." >&2
+    echo "Warning: could not confirm $STEP_BEAD_ID's status (bd show rc=$SLING_JSON_RC) -- skipping the backstop close rather than risk overwriting an outcome a prior step may already have recorded." >&2
   elif [ "$SLING_STATUS" != "closed" ]; then
-    bd update "$GC_BEAD_ID" --set-metadata gc.outcome=pass --status=closed --notes "Drain acknowledged. Gate marker submitted."
+    bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=pass --status=closed --notes "Drain acknowledged. Gate marker submitted."
   fi
 fi
 gc runtime drain-ack
