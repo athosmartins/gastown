@@ -945,6 +945,8 @@ bead_content_rig() {
 # path-probe against. Deliberately narrow: explicit repo names/paths only, never
 # bare "bd"/"beads" — those appear constantly in unrelated bug text (bd commands,
 # bead terminology) and would false-positive on nearly every bug in this file.
+# ga-51c63z: URLs are stripped from the haystack before matching, so a beads-repo
+# link cited only as EVIDENCE (not as the bug's own fix target) doesn't trigger.
 bead_targets_beads_repo() {
   local bead="$1" hay
   hay=$(echo "$bead" | jq -r '
@@ -952,6 +954,18 @@ bead_targets_beads_repo() {
         ((.labels // []) | join(" ")) ] | join("  ")
     ' 2>/dev/null || echo "")
   [ -z "$hay" ] && { echo ""; return 0; }
+  # ga-51c63z (3rd recurrence of this defect shape, new SOURCE): strip URLs
+  # before matching — mirrors _bead_path_haystack's own URL-stripping further
+  # below in this file (added for ga-xzfl, same rationale: a hostname/path
+  # inside a URL is a citation, not the bug naming its own subject). Without
+  # this, the literal substring "gastownhall/beads" inside ANY cited beads-repo
+  # URL (issue, PR, comment permalink — routine whenever a bug's own
+  # investigation touches beads-CLI work, e.g. dc-* stories) false-positives
+  # IS_BEADS_REPO_FIX regardless of what the bug's real fix target is. A bug
+  # naming its OWN fix target as a bare URL is rare; fail-open in the SAFE
+  # direction here — a false negative just means normal doctrine dispatches
+  # (unchanged pre-fix behaviour), never a misroute.
+  hay=$(printf '%s' "$hay" | sed -E 's#https?://[^[:space:]]*##g' 2>/dev/null || printf '%s' "$hay")
   # ga-yn5w8: added bd-binary-separate-from-gascity-engine — the HQ memory slug
   # that IS the beads-CLI/gascity-engine distinction, cited verbatim by bugs
   # that describe the beads-repo symptom in "bd binary" terms instead of

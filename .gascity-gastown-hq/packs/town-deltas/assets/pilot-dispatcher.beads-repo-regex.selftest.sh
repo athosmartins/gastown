@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # pilot-dispatcher.beads-repo-regex.selftest.sh — Regression guard for
-# bead_targets_beads_repo() keyword coverage (ga-yn5w8).
+# bead_targets_beads_repo() keyword coverage (ga-yn5w8, ga-51c63z).
 #
 # Bug ga-yn5w8: bead_targets_beads_repo() only matched six literal repo
 # names/paths (steveyegge/beads, gastownhall/beads, athosmartins/beads,
@@ -17,6 +17,19 @@
 #
 # Fix: add the memory slug as a seventh literal, same false-positive
 # profile as the existing six (specific, narrow, stable compound string).
+#
+# Bug ga-51c63z (3rd recurrence, new failure SOURCE): ga-rmtzrg's body cited
+# a beads-repo GitHub URL as supporting EVIDENCE for an unrelated diagnosis
+# (found while working dc-6jaq), not as its own fix target — the bug's real,
+# only fix target was an HQ file (quality-gate-guard.sh). The literal
+# substring "gastownhall/beads" inside that cited URL still matched, so
+# IS_BEADS_REPO_FIX false-positived on a normal HQ bugfix. Same defect shape
+# as ga-yn5w8/ga-j0f6 (keyword match can't tell subject from incidental
+# mention), new source (a URL citation, not doctrine/phrasing text).
+#
+# Fix: strip URLs from the haystack before matching (mirrors
+# _bead_path_haystack's own URL-stripping below in this file, added for
+# ga-xzfl) — a bug rarely names its OWN fix target as a bare URL.
 #
 # This harness extracts the REAL function body verbatim (sed -n range,
 # matching the convention already used by gate-bd-show-jq-pipeline-guard.
@@ -100,6 +113,25 @@ if [ "$RESULT" = "" ]; then
   ok "empty title+description stays fail-open"
 else
   bad "empty title+description unexpectedly matched (got '$RESULT', want '')"
+fi
+
+echo "── 7. ga-51c63z real repro: beads-repo URL cited as EVIDENCE must NOT match ──"
+RESULT=$(bead_targets_beads_repo "$(bead_json \
+  'quality-gate-guard.sh GAP-3 false-reflip on the new staleness guard' \
+  'Found while working an unrelated beads-CLI story (dc-6jaq). See https://github.com/gastownhall/beads/pull/5826#issuecomment-5350930119 for background on how this was found. The actual, only fix target is packs/town-deltas/assets/quality-gate-guard.sh.')")
+if [ "$RESULT" = "" ]; then
+  ok "beads-repo URL cited only as evidence correctly stays fail-open (got '$RESULT')"
+else
+  bad "beads-repo URL cited only as evidence FALSE-POSITIVED (got '$RESULT', want '') — the ga-51c63z symptom"
+fi
+
+echo "── 8. bare (non-URL) repo mention still matches even beside an unrelated URL ──"
+RESULT=$(bead_targets_beads_repo "$(bead_json 'fix the gastownhall/beads CLI parser' \
+  'See https://example.com/unrelated/thread for background context.')")
+if [ "$RESULT" = "1" ]; then
+  ok "bare repo-name mention still matches with an unrelated URL present (URL-strip didn't over-widen)"
+else
+  bad "bare repo-name mention stopped matching (got '$RESULT', want '1') — URL-strip fix over-widened"
 fi
 
 echo
