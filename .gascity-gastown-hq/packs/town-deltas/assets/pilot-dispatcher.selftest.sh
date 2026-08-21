@@ -7271,16 +7271,25 @@ _rpb_corrupt() { ( eval "$_RPB_FN"; PILOT_RAM_MAX_AGE_SECS=7200; PILOT_RAM_PRESS
 [ "$(_rpb_corrupt)" = "0" ]     && ok "corrupt timestamp → fail-OPEN (does not block)" || bad "corrupt timestamp should fail-open, not block"
 [ "$(_rpb OK 0 1 EMERGENCY)" = "1" ] && ok "override seam forces block regardless of actual file state (test-only seam)" || bad "override seam not honored"
 
-echo "Scenario 26a-2: _pilot_ram_pressure_unreadable — visibility for the fail-open path (self-audit: 'couldn't tell' must not look like 'confirmed clear')"
+echo "Scenario 26a-2: _pilot_ram_pressure_unreadable — visibility for the fail-open path (self-audit: 'couldn't tell' must not look like 'confirmed clear'; ga-cgls6: ABSENT must not look like STALE/CORRUPT either — same shape ga-w8kbf fixed for quiet-hours)"
 _RPU_FN="$(awk '/^_pilot_ram_pressure_unreadable\(\)/{s=1} s{print} s&&/^}$/{exit}' "$DISPATCHER")"
 _rpu() { ( eval "$_RPU_FN"; PILOT_RAM_MAX_AGE_SECS=7200; PILOT_RAM_PRESSURE_OVERRIDE=""
   if [ "${2:-1}" = "0" ]; then rm -f "$_RPB_LVL"
   else printf '%s\n%s\n' "$1" "$(( $(date +%s) - ${3:-0} ))" > "$_RPB_LVL"; fi
   PILOT_RAM_LEVEL_FILE="$_RPB_LVL" _pilot_ram_pressure_unreadable ); }
+_rpu_corrupt() { ( eval "$_RPU_FN"; PILOT_RAM_MAX_AGE_SECS=7200; PILOT_RAM_PRESSURE_OVERRIDE=""; printf 'WARN\nnot-a-number\n' > "$_RPB_LVL"; PILOT_RAM_LEVEL_FILE="$_RPB_LVL" _pilot_ram_pressure_unreadable ); }
 [ "$(_rpu OK 1 0)" = "0" ]     && ok "confirmed OK reading → NOT unreadable (0)" || bad "confirmed OK should not read as unreadable"
 [ "$(_rpu WARN 1 0)" = "0" ]   && ok "confirmed WARN reading → NOT unreadable (this is the blocking case, orthogonal to readability)" || bad "confirmed WARN should not read as unreadable"
-[ "$(_rpu "" 0)" = "1" ]       && ok "missing file → unreadable (1) — the fail-open path becomes VISIBLE, not silent" || bad "missing file should read as unreadable"
-[ "$(_rpu WARN 1 10000)" = "1" ] && ok "stale reading → unreadable (1), distinct from a confirmed clear signal" || bad "stale reading should read as unreadable"
+[ "$(_rpu "" 0)" = "0" ]       && ok "ga-cgls6: missing file → NOT unreadable (0) — absent-by-design must not look like a broken reading (was '1' before this fix)" || bad "ga-cgls6 REGRESSION: missing file should not read as unreadable"
+[ "$(_rpu WARN 1 10000)" = "1" ] && ok "stale reading → unreadable (1), must stay VISIBLE — ga-cgls6's fix must not blind this genuine anomaly" || bad "stale reading should read as unreadable"
+[ "$(_rpu_corrupt)" = "1" ]    && ok "corrupt (non-numeric) timestamp → unreadable (1), must stay VISIBLE — ga-cgls6's fix must not blind this genuine anomaly" || bad "corrupt timestamp should read as unreadable"
+ABSENT_RPU="$(_rpu "" 0)"
+STALE_RPU="$(_rpu WARN 1 10000)"
+if [ "$ABSENT_RPU" != "$STALE_RPU" ]; then
+  ok "ga-cgls6: absent ('$ABSENT_RPU') and stale ('$STALE_RPU') produce DIFFERENT outputs — this is the exact bug ga-cgls6 fixes"
+else
+  bad "ga-cgls6 REGRESSION: absent and stale collapsed to the SAME output ('$ABSENT_RPU')"
+fi
 rm -f "$_RPB_LVL"
 
 echo "Scenario 26b-d: RAM-pressure back-off wired into the REAL sweep (DRY_RUN, SHIMBIN)"
@@ -7352,6 +7361,16 @@ if grep -qE '\[ -f "\$PILOT_RAM_LEVEL_FILE" \] \|\| \{ printf .0.; return 0; \}'
   ok "RAM-pressure probe fail-opens when the level file is absent"
 else
   bad "RAM-pressure probe missing the fail-open guard (absent file must not block dispatch)"
+fi
+# ga-cgls6: scoped to the FULL "RAM-pressure signal UNREADABLE (missing/..."
+# prefix, not a bare "UNREADABLE (missing/stale/corrupt" suffix match — a
+# loose match here is exactly what let ga-w8kbf's own fix-commit `sed` reword
+# this UNRELATED line by accident (caught by gate review, reverted in
+# 996129930). Never loosen this back to a bare suffix match.
+if grep -q "RAM-pressure signal UNREADABLE (missing/stale/corrupt" "$DISPATCHER"; then
+  bad "ga-cgls6 REGRESSION: RAM-pressure log line still claims 'missing' is a possible UNREADABLE cause (absent can no longer be the cause once this fires)"
+else
+  ok "ga-cgls6: RAM-pressure log wording corrected (no 'missing' claim on its own line)"
 fi
 
 # ── Scenario ga-nxj7kc: dispatch template's "Claim your work" assign must match

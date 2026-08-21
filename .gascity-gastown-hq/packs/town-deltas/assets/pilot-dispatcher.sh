@@ -1671,20 +1671,41 @@ _pilot_ram_pressure_level() {
   sed -n '1p' "$PILOT_RAM_LEVEL_FILE" 2>/dev/null | tr -d '[:space:]'
 }
 
-# _pilot_ram_pressure_unreadable → "1" iff the signal is missing/stale/corrupt
-# (the fail-open path — dispatch proceeds either way), "0" iff a genuine
-# OK/WARN/EMERGENCY reading was read (confirmed, not assumed). Exists so the
-# call site can log the two "not blocking" cases DISTINCTLY: "confirmed
-# clear" and "couldn't tell, proceeding anyway" must never look identical in
-# the log the way they already correctly don't in the block/no-block DECISION
-# — a silent fail-open on a state-mutating path (new dispatch) is the exact
-# shape the third-state self-audit flags, even when the DEFAULT itself
-# (proceed) is the right call. Mirrors _pilot_ram_pressure_blocks's own
-# reads; duplicated rather than shared so this stays a pure, independently
-# correct function per this file's established convention.
+# _pilot_ram_pressure_unreadable → "1" iff the signal is STALE or CORRUPT (the
+# fail-open path — dispatch proceeds either way; this is purely a LOGGING
+# signal, distinct from the dispatch decision _pilot_ram_pressure_blocks
+# already makes correctly for every case), "0" iff a genuine OK/WARN/EMERGENCY
+# reading was read (confirmed, not assumed) OR the file is simply ABSENT.
+#
+# ga-cgls6: ABSENT is not the same third state as STALE/CORRUPT, and
+# collapsing them here was the bug — same shape ga-w8kbf already fixed for
+# quiet-hours-check.sh's analogous function. A missing file is the SILENT,
+# EXPECTED shape before ram-pressure-monitor.sh's first run (or if it's ever
+# deliberately disabled, the same way the night-window mechanism was), while a
+# file that EXISTS but carries a stale timestamp or an unparseable one means a
+# writer that WAS running has since broken or hung: a real anomaly worth a log
+# line. Before this fix both produced "1", so this call site would have
+# logged "UNREADABLE (missing/stale/corrupt)" on every sweep for a state that
+# is both permanent and correct the day the monitor stops running — the same
+# error-vs-empty conflation ga-w8kbf found and fixed, just dormant here since
+# the monitor was confirmed live (not presumed) when this bead was filed.
+# Absence now returns "0": nothing to report, matches _pilot_ram_pressure_blocks'
+# own (already-correct) treatment of "no file" as "not blocking, not an
+# anomaly". Stale/corrupt still return "1" — this fix must not blind the
+# genuine-anomaly case, only the absent-by-design one.
+#
+# Exists so the call site can log the two "not blocking" cases DISTINCTLY:
+# "confirmed clear" and "couldn't tell, proceeding anyway" must never look
+# identical in the log the way they already correctly don't in the
+# block/no-block DECISION — a silent fail-open on a state-mutating path (new
+# dispatch) is the exact shape the third-state self-audit flags, even when
+# the DEFAULT itself (proceed) is the right call. Mirrors
+# _pilot_ram_pressure_blocks's own reads; duplicated rather than shared so
+# this stays a pure, independently correct function per this file's
+# established convention.
 _pilot_ram_pressure_unreadable() {
   [ -n "$PILOT_RAM_PRESSURE_OVERRIDE" ] && { printf '0'; return 0; }
-  [ -f "$PILOT_RAM_LEVEL_FILE" ] || { printf '1'; return 0; }
+  [ -f "$PILOT_RAM_LEVEL_FILE" ] || { printf '0'; return 0; }
   local _ts _now
   _ts=$(sed -n '2p' "$PILOT_RAM_LEVEL_FILE" 2>/dev/null | tr -d '[:space:]')
   case "$_ts" in ''|*[!0-9]*) printf '1'; return 0 ;; esac
@@ -3743,7 +3764,7 @@ elif [ "$(_pilot_ram_pressure_unreadable)" = "1" ]; then
   # ga-m2gqb: dispatch proceeds either way (fail-open is the right call — see
   # header above) but "couldn't tell" must stay VISIBLE, not collapse silently
   # into the same log-silence as "confirmed clear" on a state-mutating path.
-  log "RAM-pressure signal UNREADABLE (missing/stale/corrupt ${PILOT_RAM_LEVEL_FILE}) — fail-open, dispatch proceeding normally this sweep (ga-m2gqb)."
+  log "RAM-pressure signal UNREADABLE (stale/corrupt ${PILOT_RAM_LEVEL_FILE}) — fail-open, dispatch proceeding normally this sweep (ga-m2gqb)."
 fi
 
 # ── ga-dxyvxr: quiet-hours back-off — PAUSE dispatch 00h-08h (Athos, 2026-08-16)
