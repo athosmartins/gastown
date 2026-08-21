@@ -376,30 +376,52 @@ scan_js_empty_catch() {
 # ── C1: Python bare `except: pass` ──────────────────────────────────────────
 # See scan_js_empty_catch's comment above: matching is done via `grep -E`,
 # not bash `[[ =~ ]]`, for verified reliability on this host's bash 3.2.
+#
+# ga-jd3kux perf fix: same technique as ga-kqznp's scan_shell_query_masking
+# rewrite (a single external process over the whole file instead of a bash
+# `while read` loop forking per line) — but this detector has genuine
+# cross-line state a plain grep-candidate-extraction cannot express: a bare
+# `except:` on one line is only a finding if the FIRST NON-BLANK line after
+# it is `pass` (skipping any number of blank lines in between). Rather than
+# "grep finds candidates, then a second command fetches line N+1 per
+# candidate" (one extra fork per candidate for the lookahead), the whole
+# waiting/start state machine below is ported 1:1 into a single awk
+# program, which tracks "waiting for the next non-blank line" natively
+# across records — one process for the whole file, not one per line or even
+# one per candidate. Emits "LINENO<TAB>TEXT" per would-be finding; the bash
+# loop below then applies the SAME shared _allowlisted check the original
+# code called inline, only for that small set of actual candidates.
+# Falsified against the selftest (including the blank-line-skip, two-
+# independent-blocks, and EOF-mid-wait edge cases added alongside this fix)
+# and a full-tree output diff (before/after: empty) before trusting this as
+# behavior-preserving, not just faster — same standard as every other perf
+# fix in this file.
 scan_py_bare_except() {
-  local file="$1" lineno=0 waiting=0 start=0 line compact
-  while IFS= read -r line || [ -n "$line" ]; do
-    lineno=$((lineno + 1))
-    if [ "$waiting" = "1" ]; then
-      compact="$(printf '%s' "$line" | tr -d '[:space:]')"
-      if [ -z "$compact" ]; then continue; fi
-      case "$compact" in
-        pass | pass'#'*) _allowlisted "$file" "$start" || echo "${file}:${start}:C1:bare except: pass (multi-line)" ;;
-      esac
-      waiting=0
-      continue
-    fi
-    case "$line" in
-      *except*) ;;
-      *) continue ;;
-    esac
-    if printf '%s\n' "$line" | grep -Eq '^[[:space:]]*except([[:space:]]+[A-Za-z_][A-Za-z0-9_.,[:space:]]*)?:[[:space:]]*pass[[:space:]]*(#.*)?$'; then
-      _allowlisted "$file" "$lineno" || echo "${file}:${lineno}:C1:${line}"
-    elif printf '%s\n' "$line" | grep -Eq '^[[:space:]]*except([[:space:]]+[A-Za-z_][A-Za-z0-9_.,[:space:]]*)?:[[:space:]]*(#.*)?$'; then
-      waiting=1
-      start=$lineno
-    fi
-  done < "$file"
+  local file="$1" lineno text
+  while IFS=$'\t' read -r lineno text; do
+    [ -z "$lineno" ] && continue
+    _allowlisted "$file" "$lineno" || echo "${file}:${lineno}:C1:${text}"
+  done < <(awk '
+    BEGIN { waiting = 0; start = 0 }
+    {
+      if (waiting == 1) {
+        compact = $0
+        gsub(/[[:space:]]/, "", compact)
+        if (compact == "") { next }
+        if (compact == "pass" || compact ~ /^pass#/) {
+          print start "\t" "bare except: pass (multi-line)"
+        }
+        waiting = 0
+        next
+      }
+      if ($0 ~ /^[[:space:]]*except([[:space:]]+[A-Za-z_][A-Za-z0-9_.,[:space:]]*)?:[[:space:]]*pass[[:space:]]*(#.*)?$/) {
+        print NR "\t" $0
+      } else if ($0 ~ /^[[:space:]]*except([[:space:]]+[A-Za-z_][A-Za-z0-9_.,[:space:]]*)?:[[:space:]]*(#.*)?$/) {
+        waiting = 1
+        start = NR
+      }
+    }
+  ' "$file")
 }
 
 # ── C3: launchd job with no failure-notification path ───────────────────────
@@ -667,24 +689,39 @@ scan_bd_formatted_output_parsed() {
 # file is a heuristic grep-class scanner by its own stated design, not a
 # parser; in practice a `$?` on a line with a real pipe is checking that
 # pipe's result in the overwhelming majority of real code.
+# ga-jd3kux perf fix: the ga-q0n6a fix above made the per-line body itself
+# fork-free (bash builtins only), but the bash `while read` loop iterating
+# one line at a time is still slower than a single external process doing
+# the same work natively — same rationale as scan_py_bare_except's rewrite
+# just above. The one-line lookback (prev_has_pipe/prev_line) ports directly
+# into awk, which tracks "the previous record" across iterations the same
+# way the bash version's prev_* variables did across loop iterations. Emits
+# "LINENO<TAB>TEXT" per would-be finding; the bash loop below applies the
+# same shared _allowlisted check the original code called inline. Falsified
+# against the selftest (including the chained-$?-carry-forward and first-
+# line-$?-with-no-prior-line edge cases added alongside this fix) and a
+# full-tree output diff (before/after: empty).
 scan_pipe_then_exit_code() {
-  local file="$1" lineno=0 prev_has_pipe=0 prev_line="" line stripped has_pipe has_dollarq
-  while IFS= read -r line || [ -n "$line" ]; do
-    lineno=$((lineno + 1))
-    stripped="${line//||/}"
-    case "$stripped" in *'|'*) has_pipe=1 ;; *) has_pipe=0 ;; esac
-    case "$line" in *'$?'*) has_dollarq=1 ;; *) has_dollarq=0 ;; esac
+  local file="$1" lineno text
+  while IFS=$'\t' read -r lineno text; do
+    [ -z "$lineno" ] && continue
+    _allowlisted "$file" "$lineno" || echo "${file}:${lineno}:C7:${text}"
+  done < <(awk '
+    {
+      stripped = $0
+      gsub(/\|\|/, "", stripped)
+      has_pipe = (stripped ~ /\|/) ? 1 : 0
+      has_dollarq = ($0 ~ /\$\?/) ? 1 : 0
 
-    if [ "$has_pipe" = "1" ] && [ "$has_dollarq" = "1" ]; then
-      # Same-line shape: `cmd1 | cmd2; echo $?` (or `[ $? ... ]`, `if [ $? ...`).
-      _allowlisted "$file" "$lineno" || echo "${file}:${lineno}:C7:${line}"
-    elif [ "$prev_has_pipe" = "1" ] && [ "$has_dollarq" = "1" ]; then
-      # Adjacent-line shape: pipe on the line before, $? read on this one.
-      _allowlisted "$file" "$((lineno - 1))" || echo "${file}:$((lineno - 1)):C7:${prev_line}"
-    fi
-    prev_has_pipe="$has_pipe"
-    prev_line="$line"
-  done <"$file"
+      if (has_pipe == 1 && has_dollarq == 1) {
+        print NR "\t" $0
+      } else if (prev_has_pipe == 1 && has_dollarq == 1) {
+        print (NR-1) "\t" prev_line
+      }
+      prev_has_pipe = has_pipe
+      prev_line = $0
+    }
+  ' "$file")
 }
 
 # ── C8: `jq '.field | length'` used as an existence test ─────────────────────

@@ -900,6 +900,98 @@ r="$(scan_bd_formatted_output_parsed "$FIXDIR/mixed/good_j34ml_c6_and_unrelated_
 [ -z "$r" ] && ok "ga-j34ml FIX: unrelated pipe (ps|grep) before a bare 'bd show', joined by && → NOT flagged" \
   || bad "ga-j34ml REGRESSION: && false positive reproduced — unrelated pipe misattributed to bd show: '$r'"
 
+# ═════════════════════════════════════════════════════════════════════════
+# ga-jd3kux: state-machine parity hardening for scan_py_bare_except and
+# scan_pipe_then_exit_code, added BEFORE porting their bash while-read loops
+# to a single awk pass each — these two detectors carry real cross-line
+# state (multi-line lookahead / adjacent-line lookback) that a naive
+# per-line grep-candidate rewrite cannot reproduce, per the bead's own
+# stated risk ("a subtly wrong multi-line/adjacent-line rewrite could
+# silently drop real findings"). Own scratch dir, deliberately NOT under
+# $FIXDIR/mixed or $FIXDIR/clean: these are direct-function parity tests
+# for the state machine itself (does the port preserve exact behavior,
+# including its existing quirks?), not new detector coverage — folding them
+# into the run_scan end-to-end aggregate counts below would only add risk
+# of an arithmetic slip to that already-long-running total for zero
+# additional confidence (file-discovery/exclusion, what that aggregate
+# actually tests, is untouched by this bead).
+# ═════════════════════════════════════════════════════════════════════════
+EDGEDIR="$(mktemp -d)"
+
+echo "── scan_py_bare_except: state-machine edge cases (ga-jd3kux) ──"
+
+# Blank line(s) between the bare 'except:' and 'pass' — the ORIGINAL bash
+# loop's `continue` (without resetting waiting=0) on a blank line keeps
+# waiting for the next NON-blank line; a port that resets waiting on ANY
+# line (including blank ones) would silently miss this.
+cat > "$EDGEDIR/blank_between.py" <<'EOF'
+try:
+    do_thing()
+except:
+
+    pass
+EOF
+r="$(scan_py_bare_except "$EDGEDIR/blank_between.py")"
+case "$r" in *:C1:*) ok "ga-jd3kux: blank line(s) between bare except: and pass → still flagged (waiting persists across blanks)" ;;
+  *) bad "ga-jd3kux REGRESSION: blank-line-separated except:/pass not flagged — waiting state reset too early: '$r'" ;; esac
+
+# Two independent multi-line blocks in one file — proves waiting/start do
+# not leak from the first block into the second.
+cat > "$EDGEDIR/two_blocks.py" <<'EOF'
+try:
+    a()
+except:
+    pass
+
+try:
+    b()
+except:
+    log.warning("swallowed on purpose")
+EOF
+r="$(scan_py_bare_except "$EDGEDIR/two_blocks.py")"
+n=$(printf '%s\n' "$r" | grep -c ':C1:')
+[ "$n" = "1" ] && ok "ga-jd3kux: 2 independent multi-line except blocks, only 1st is bare pass → exactly 1 flagged (no state leak between blocks)" \
+  || bad "ga-jd3kux REGRESSION: expected exactly 1 finding across 2 independent blocks, got $n: '$r'"
+
+# Bare 'except:' as the LAST line of the file, no trailing newline — no line
+# ever follows, so the original loop simply ends with waiting still 1,
+# never resolving it (existing, deliberate non-behavior — parity check,
+# not new coverage).
+printf 'try:\n    do_thing()\nexcept:' > "$EDGEDIR/eof_unresolved.py"
+r="$(scan_py_bare_except "$EDGEDIR/eof_unresolved.py")"
+[ -z "$r" ] && ok "ga-jd3kux: bare except: at true EOF (no following line, no trailing newline) → NOT flagged (matches pre-existing loop-ends-mid-wait behavior)" \
+  || bad "ga-jd3kux REGRESSION: EOF-unresolved except: produced a finding: '$r'"
+
+echo "── scan_pipe_then_exit_code: state-machine edge cases (ga-jd3kux) ──"
+
+# Same-line finding on line 1, whose pipe ALSO satisfies line 2's bare $?
+# check via the adjacent-line rule — hand-traced against the ORIGINAL bash
+# version: prev_has_pipe carries line 1's pipe forward regardless of
+# whether the same-line branch already fired on line 1, so this file
+# produces 2 findings, BOTH attributed to line 1. This is pre-existing
+# behavior (a "improved" port that suppresses the second would itself be a
+# behavior change, not the behavior-preserving speedup this bead asks for).
+cat > "$EDGEDIR/chained_dollarq.sh" <<'EOF'
+risky | head -1; echo $?
+echo $?
+EOF
+r="$(scan_pipe_then_exit_code "$EDGEDIR/chained_dollarq.sh")"
+n=$(printf '%s\n' "$r" | grep -c ':C7:')
+[ "$n" = "2" ] && ok "ga-jd3kux: line 1's pipe satisfies both its own same-line rule and line 2's adjacent-line rule → 2 findings, both attributed to line 1 (exact parity with original prev_has_pipe carry-forward)" \
+  || bad "ga-jd3kux: expected 2 findings (parity with original state carry-forward), got $n: '$r'"
+
+# $? on the very FIRST line of a file — no previous line exists at all;
+# proves the awk port's uninitialized prev_has_pipe defaults to false
+# exactly like the bash version's prev_has_pipe=0 initial value.
+cat > "$EDGEDIR/dollarq_first_line.sh" <<'EOF'
+echo $?
+EOF
+r="$(scan_pipe_then_exit_code "$EDGEDIR/dollarq_first_line.sh")"
+[ -z "$r" ] && ok "ga-jd3kux: \$? on the very first line (no previous line to have a pipe) → NOT flagged" \
+  || bad "ga-jd3kux REGRESSION: first-line \$? with no prior line produced a finding: '$r'"
+
+rm -rf "$EDGEDIR"
+
 echo "── run_scan end-to-end (mixed fixture dir) ──"
 MIXED_OUT="$(mktemp)"
 run_scan "$MIXED_OUT" "$FIXDIR/mixed"
