@@ -104,7 +104,25 @@ _allowlisted() {
   local file="$1" lineno="$2"
   [ -z "$lineno" ] && return 1
   case "$lineno" in ''|*[!0-9]*) return 1 ;; esac
-  sed -n "${lineno}p" "$file" 2>/dev/null | grep -qi 'erro-vs-vazio:[[:space:]]*ok'
+  # ga-kqznp perf fix: this is the single hottest helper in the whole
+  # scanner — called once per CANDIDATE line by every one of C4/C5/C6/C8
+  # (not just once per finding, like C1/C2's own use of it), so its own
+  # per-call cost multiplies by however many candidates a real scan turns
+  # up. The old `sed -n "${lineno}p" file | grep -qi ...` forked TWO
+  # external processes per call; one `awk` call does the line-selection
+  # (NR==n) and the case-insensitive match (tolower()) together, halving
+  # the fork count. `[[:space:]]` is a POSIX ERE bracket class, portable
+  # to awk exactly as it already is to this file's existing grep -E
+  # patterns — no BSD/GNU divergence risk here (unlike the sed `I`
+  # case-insensitive address flag, which IS GNU-only and was deliberately
+  # NOT used). Verified byte-for-byte identical to the old sed+grep across
+  # a match/no-match/case-variant/past-EOF test matrix before trusting
+  # this as behavior-preserving, not just faster (same falsification
+  # standard as scan_shell_query_masking's rewrite above).
+  awk -v n="$lineno" '
+    NR==n { if (tolower($0) ~ /erro-vs-vazio:[[:space:]]*ok/) found=1 }
+    END { exit !found }
+  ' "$file" 2>/dev/null
 }
 
 # _allowlisted_range <file> <start> <end> — ga-a4gfd gate-feedback fix.
@@ -209,30 +227,28 @@ _join_continued_lines() {
 # masked by an empty-looking fallback (C2) or by an unconditional `|| true`
 # (C1) instead of an explicit `if ! VAR=$(cmd); then ...` rc capture.
 scan_shell_query_masking() {
-  local file="$1" lineno=0 line
-  while IFS= read -r line || [ -n "$line" ]; do
-    lineno=$((lineno + 1))
-    case "$line" in
-      *'=$('*) ;;
-      *) continue ;;
-    esac
-    printf '%s' "$line" | grep -Eq "$QUERY_TOOL_RE" || continue
-    # ga-50m2: TUDO passa pela classificação POR SUBSTITUIÇÃO agora — não há mais um
-    # `case` sobre a LINHA INTEIRA aqui. A versão anterior tinha um `case` que casava
-    # `gc_json_or_unknown`/`|| echo <empty>`/`|| true` na linha inteira e decidia
-    # (excluir ou flagrar) direto, e só o fallback `*)` chamava a função por-
-    # substituição que checa fonte inerte. MEDIDO (ga-50m2): 181 de 304 achados no HQ
-    # (60%) eram `VAR=$(echo "$var" | jq ... || echo "")` — fonte INERTE — flagrados
-    # como C2 porque o `|| echo ""` os pegava no caminho cego-à-fonte, ANTES do
-    # fallback. A MESMA bifurcação deixava a exclusão do gc_json_or_unknown (ga-l4nx1)
-    # vulnerável ao bug do revisor (ga-wisp-3ip2my) também: numa linha com um
-    # gc_json_or_unknown seguro E uma substituição arriscada separada, o match
-    # whole-line da exclusão vencia primeiro e a arriscada nunca era vista — um falso-
-    # negativo, pior que o falso-positivo original. Agora as três decisões (fonte
-    # inerte, gc_json_or_unknown, idioma de mascaramento) passam todas pela MESMA porta
-    # por substituição — ver _c2_scan_substitutions logo abaixo.
-    _c2_scan_substitutions "$file" "$lineno" "$line"
-  done < "$file"
+  # ga-kqznp perf fix: candidate lines found via ONE piped grep pass over the
+  # whole file (grep's own compiled loop) instead of a bash while-read loop
+  # testing every line — the identical technique C4-C9 below already use,
+  # for the same reason (this function's per-file bash loop was the measured
+  # dominant cost: 14.4s of the scan's ~53s total, ga-kqznp). Two conditions,
+  # ANDed in the same order the old per-line bash case+grep checked them: the
+  # line must contain the literal substring `=$(` (first grep, -F fixed-
+  # string — matches the old `case "$line" in *'=$('*)` pattern's literal-
+  # substring semantics exactly, since neither `$` nor the quoted `(` were
+  # glob-special there either) AND match QUERY_TOOL_RE (second grep, over
+  # the surviving candidates only). `grep -n` numbers physical lines
+  # 1-indexed, the same scheme the old `lineno=$((lineno + 1))` counter
+  # used, and — like the old loop's `read ... || [ -n "$line" ]` guard —
+  # still matches a final line with no trailing newline. Falsified against
+  # the selftest (30 mixed-fixture findings, 0 clean-fixture findings, both
+  # unchanged) and a full-tree output diff (before/after this fix: empty)
+  # before trusting this as behavior-preserving, not just faster.
+  local file="$1" lineno rest
+  while IFS=: read -r lineno rest; do
+    [ -z "$lineno" ] && continue
+    _c2_scan_substitutions "$file" "$lineno" "$rest"
+  done < <(grep -n -F '=$(' "$file" 2>/dev/null | grep -E "$QUERY_TOOL_RE")
 }
 
 # ── C2/C1-shell: classifica CADA `VAR=$(...)` da linha, isoladamente ────────
@@ -507,7 +523,15 @@ scan_launchd_no_notify() {
 scan_bd_list_no_limit() {
   local file="$1" joined="${2:-}" start end frag stmt
   [ -z "$joined" ] && joined="$(_join_continued_lines "$file")"
-  while IFS="$(printf '\t')" read -r start end frag; do
+  # ga-kqznp perf fix: IFS="$(printf '\t')" forks a NEW subshell on EVERY
+  # loop iteration (bash re-evaluates a while-condition's leading assignment
+  # each pass) — measured 43x slower than computing the tab once (4.3s vs
+  # 0.1s over 5000 iterations, isolated benchmark). $'\t' is bash ANSI-C
+  # quoting, a builtin with zero fork, and — like this file's existing \b/\s
+  # avoidance in grep -E patterns above — has been available since long
+  # before this host's frozen bash 3.2.57, so it carries none of that
+  # documented portability risk.
+  while IFS=$'\t' read -r start end frag; do
     [ -z "$start" ] && continue
     while IFS= read -r stmt || [ -n "$stmt" ]; do
       [ -z "$stmt" ] && continue
@@ -543,7 +567,15 @@ scan_bd_gate_no_infra() {
   [ -z "$joined" ] && joined="$(_join_continued_lines "$file")"
   # Perf: piped grep over the whole blob, not a per-line bash loop — see
   # scan_bd_list_no_limit's docstring above for why this matters.
-  while IFS="$(printf '\t')" read -r start end frag; do
+  # ga-kqznp perf fix: IFS="$(printf '\t')" forks a NEW subshell on EVERY
+  # loop iteration (bash re-evaluates a while-condition's leading assignment
+  # each pass) — measured 43x slower than computing the tab once (4.3s vs
+  # 0.1s over 5000 iterations, isolated benchmark). $'\t' is bash ANSI-C
+  # quoting, a builtin with zero fork, and — like this file's existing \b/\s
+  # avoidance in grep -E patterns above — has been available since long
+  # before this host's frozen bash 3.2.57, so it carries none of that
+  # documented portability risk.
+  while IFS=$'\t' read -r start end frag; do
     [ -z "$start" ] && continue
     while IFS= read -r stmt || [ -n "$stmt" ]; do
       [ -z "$stmt" ] && continue
@@ -586,7 +618,15 @@ scan_bd_formatted_output_parsed() {
   [ -z "$joined" ] && joined="$(_join_continued_lines "$file")"
   # Perf: piped grep chain over the whole blob, not a per-line bash loop —
   # see scan_bd_list_no_limit's docstring above.
-  while IFS="$(printf '\t')" read -r start end frag; do
+  # ga-kqznp perf fix: IFS="$(printf '\t')" forks a NEW subshell on EVERY
+  # loop iteration (bash re-evaluates a while-condition's leading assignment
+  # each pass) — measured 43x slower than computing the tab once (4.3s vs
+  # 0.1s over 5000 iterations, isolated benchmark). $'\t' is bash ANSI-C
+  # quoting, a builtin with zero fork, and — like this file's existing \b/\s
+  # avoidance in grep -E patterns above — has been available since long
+  # before this host's frozen bash 3.2.57, so it carries none of that
+  # documented portability risk.
+  while IFS=$'\t' read -r start end frag; do
     [ -z "$start" ] && continue
     while IFS= read -r stmt || [ -n "$stmt" ]; do
       [ -z "$stmt" ] && continue
@@ -680,7 +720,15 @@ scan_jq_length_as_existence() {
   [ -z "$joined" ] && joined="$(_join_continued_lines "$file")"
   # Perf: piped grep chain over the whole blob, not a per-line bash loop —
   # see scan_bd_list_no_limit's docstring above.
-  while IFS="$(printf '\t')" read -r start end frag; do
+  # ga-kqznp perf fix: IFS="$(printf '\t')" forks a NEW subshell on EVERY
+  # loop iteration (bash re-evaluates a while-condition's leading assignment
+  # each pass) — measured 43x slower than computing the tab once (4.3s vs
+  # 0.1s over 5000 iterations, isolated benchmark). $'\t' is bash ANSI-C
+  # quoting, a builtin with zero fork, and — like this file's existing \b/\s
+  # avoidance in grep -E patterns above — has been available since long
+  # before this host's frozen bash 3.2.57, so it carries none of that
+  # documented portability risk.
+  while IFS=$'\t' read -r start end frag; do
     [ -z "$start" ] && continue
     _allowlisted_range "$file" "$start" "$end" && continue
     echo "${file}:${start}:C8:${frag}"
@@ -808,7 +856,15 @@ run_scan() {
       scan_bd_formatted_output_parsed "$f" "$_joined" >>"$findings_file"
     fi
 
-    if grep -q '|' "$f" 2>/dev/null; then
+    # ga-kqznp perf fix: added the '$?' co-occurrence half of this gate.
+    # scan_pipe_then_exit_code can only ever produce a finding on a line (or
+    # its immediate successor) that contains a literal '$?' — a file with
+    # ZERO '$?' occurrences anywhere cannot match either of the function's
+    # two shapes, so skipping it there is provably a no-op on findings, not
+    # an approximation. Measured: only 57/138 canonical .sh files have BOTH
+    # '|' and '$?' (vs. 136/138 for '|' alone) — this halves the file set
+    # that pays this loop's cost for zero change in output.
+    if grep -q '|' "$f" 2>/dev/null && grep -q '\$?' "$f" 2>/dev/null; then
       scan_pipe_then_exit_code "$f" >>"$findings_file"
     fi
 
@@ -825,7 +881,16 @@ run_scan() {
   done < <(find "${roots[@]}" -type f \( -name '*.js' -o -name '*.ts' -o -name '*.jsx' -o -name '*.tsx' \) "${EXCL[@]}" -print0 2>/dev/null)
 
   while IFS= read -r -d '' f; do
-    scan_py_bare_except "$f" >>"$findings_file"
+    # ga-kqznp perf fix: file-level pre-filter, same rationale as the
+    # scan_pipe_then_exit_code gate above — every finding path in
+    # scan_py_bare_except is gated on the line containing the substring
+    # "except", so a file with zero occurrences can never produce one.
+    # Smaller win here (34/41 .py files already contain "except"), added
+    # anyway since it is free and matches this driver's own established
+    # pattern for every other detector below it.
+    if grep -q 'except' "$f" 2>/dev/null; then
+      scan_py_bare_except "$f" >>"$findings_file"
+    fi
   done < <(find "${roots[@]}" -type f -name '*.py' "${EXCL[@]}" -print0 2>/dev/null)
 
   while IFS= read -r -d '' f; do
