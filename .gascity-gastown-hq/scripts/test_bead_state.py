@@ -873,6 +873,31 @@ def test_next_action_athos_continua_vez_do_athos():
     assert st["turn"] == "athos"
 
 
+def test_next_action_in_progress_tambem_e_parked():
+    """ga-1ygf6o: bead in_progress (não só status=open, que
+    test_next_action_nao_athos_e_parked já cobria) também vira 'parked' com
+    next-action:<alguém> — é o caso real: wa-u6ak0 ficou 76min 'em execução'
+    pro painel/Pilot enquanto o crew esperava decisão do Mayor, porque nenhum
+    label sinalizava a espera. A regra 4 (park) roda ANTES da regra 7
+    (executing) independente de status — faltava só a prova de que isso vale
+    também com in_progress, que é o status real do caso medido."""
+    for who in ("mayor", "batista-constroi", "oracle-constroi"):
+        st = derive(b(status="in_progress", labels=["ctx:ready", f"next-action:{who}"]),
+                     None, CREWS)
+        assert st["state"] == "parked", (who, st)
+    st_mayor = derive(b(status="in_progress", labels=["next-action:mayor"]), None, CREWS)
+    assert st_mayor["turn"] == "mayor", st_mayor
+
+
+def test_next_action_athos_in_progress_continua_vez_do_athos():
+    """Controle simétrico a test_next_action_athos_continua_vez_do_athos: o
+    intercept de ATHOS_TURN (regra 3, roda antes do park) não pode regredir
+    só porque o status é in_progress em vez de open."""
+    st = derive(b(status="in_progress", labels=["next-action:athos"]), None, CREWS)
+    assert st["turn"] == "athos", st
+    assert st["state"] == "awaiting_athos", st
+
+
 def test_waiting_on_e_parked():
     """3 ocorrências (waiting-on:external, :vespasiano-response, :wa-4e2m8)."""
     assert derive(b(labels=["story:approved", "waiting-on:external"]), None, CREWS)["state"] == "parked"

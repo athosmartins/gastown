@@ -592,4 +592,50 @@ aceita caminho ABSOLUTO — um caminho relativo é recusado (fail-closed),
 nunca resolvido contra o CWD do processo (gate-fix 2, ga-gkap9p: CWD é
 estado ambiente que este comando nunca deve confiar para uma decisão de
 deleção).
+
+**Vai PARAR esperando decisão de outro agente (Mayor, tipicamente)? Grave na
+BEAD antes de parar — nudge sozinho te deixa INVISÍVEL (ga-1ygf6o).** MEDIDO
+ao vivo 21/08: um crew perguntou ao Mayor o que fazer, escreveu a pergunta
+(repetida 3x) só na PRÓPRIA sessão, e ficou **76min parado** — a bead seguia
+`in_progress`/`story:in-flight`, `updated_at` congelado, e pro painel/Pilot
+parecia "em execução" normal. O Mayor só descobriu por acaso, via um alarme
+de OUTRO assunto que passou perto.
+
+**Por quê `gc session nudge` não basta:** confirmado na fonte
+(`cmd_nudge.go`) — é estruturalmente UM SENTIDO SÓ. A entrega não escreve em
+bead nenhuma (nem label, nem comment), não carrega identidade do remetente
+além de texto livre, e a eventual resposta do destinatário chega só no SEU
+terminal. Se ele não estiver olhando NAQUELE instante, a pergunta evapora —
+e nada na bead sinalizava que ela esperava alguém.
+
+**Convenção obrigatória, ANTES de parar esperando decisão:**
+1. `bd label add <bead-id> next-action:mayor` (troque `mayor` pelo alvo real
+   se for outro coordenador — ex. `next-action:deacon`)
+2. `bd comment <bead-id> "Pergunta: <a pergunta exata + contexto suficiente
+   pra responder sem abrir mais nada>"`
+3. SÓ DEPOIS, como atalho de latência — nunca como substituto de 1-2:
+   `gc session nudge mayor/ "Decisão pendente em <bead-id>, ver comentário."`
+
+Isso NÃO precisa de código novo nem de dashboard novo — os dois consumidores
+já existem e já leem certo:
+- `bead_state.py`: `next-action:` já é prefixo reconhecido em `PARK_PREFIXES`,
+  e a regra 4 (park) do `derive()` roda ANTES da regra 7 (executing) —
+  **mesmo com `status=in_progress`**. Gravar o label muda o estado canônico
+  de `executing/turn=crew:você` pra `parked/turn=mayor` no mesmo instante, e
+  todo consumidor de `derive()` (inflight-reclaim-guard, throughput-stall-
+  watchdog, production-stall-watchdog, lifecycle-coherence-janitor) já para
+  de tratar a bead como travada/órfã.
+- `painel_visibilidade.py` (rig WA): já renderiza `next-action:mayor` como
+  "⏳ aguarda condição" com o pill "próx: mayor" — não é teórico, tem casos
+  reais em produção (wa-77wyn, wa-odbh9, wa-rygy0). A metade "visível no
+  painel" do critério de aceite já funciona hoje, ao vivo, no instante em que
+  o label é gravado.
+`next-action:athos` continua reservado — é interceptado ANTES (regra 3,
+`ATHOS_TURN`, e o próprio painel WA) e vai pra fila do Athos, não pra esta.
+
+⚠️ **O que este parágrafo NÃO cobre:** um alarme PROATIVO (empurrar, não só
+deixar consultável) para quando uma bead nova ganha `next-action:mayor`.
+Rede de segurança pra quem esquecer o passo 1 — deliberadamente deferida pra
+`ga-njj5zk`, mesmo padrão de split que `ga-te41ft` usou pra `ga-eiaidn`
+(convenção e detector não vão na mesma entrega).
 {{ end }}
