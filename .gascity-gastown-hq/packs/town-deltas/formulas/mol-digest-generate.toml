@@ -57,7 +57,7 @@ for the dog pool. A dog picks it up and runs this formula.
 
 A formatted markdown digest covering:
 - Issues filed and closed (by rig, by type)
-- Merge activity
+- Commit activity
 - Incidents and escalations
 - Agent health summary
 - Trends (backlog direction, throughput)
@@ -126,9 +126,43 @@ gc bd list --created-after=$SINCE --created-before=$UNTIL --json --limit=0
 gc bd list --status=closed --closed-after=$SINCE --closed-before=$UNTIL --json --limit=0
 ```
 
-b) **Merge activity** — also bounded, or today's not-yet-elapsed merges bleed in:
+b) **Commit activity** — also bounded, or today's not-yet-elapsed commits
+bleed in. **Not `--merges`:** this city's gate workflow (`/gate-done` →
+autonomous dispatcher) lands via fast-forward/squash, never a 2-parent merge
+commit — a `--merges` query returns **0** here structurally, on every rig,
+always (confirmed live 2026-08-21, ga-x3b4ro: a 14+64-real-commit day still
+measured 0 merges — a digest reporting "Merges: 0" reads as "nothing shipped"
+when the opposite is true). Count plain commits instead, scoped correctly per
+rig:
+
 ```bash
-git -C <rig-path> log --merges --since=$SINCE --until=$UNTIL --oneline main
+RIG_PATH=<rig-path>   # from `gc rig list`
+TOPLEVEL=$(git -C "$RIG_PATH" rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$TOPLEVEL" ]; then
+  # rev-parse --show-toplevel fails on some worktrees (property_scrapers,
+  # lexbh — a `.git` file points at a sibling `.repo.git` without full
+  # worktree registration) even though the repo is perfectly readable —
+  # `git log` only needs the git-dir, not the worktree, so it silently
+  # returns a correct (not a loud-failing) answer either way. Use the
+  # explicit form so correctness doesn't depend on that per-subcommand
+  # accident; these two rigs are standalone repos, so no pathspec needed.
+  COMMIT_COUNT=$(git --git-dir="$RIG_PATH/.repo.git" --work-tree="$RIG_PATH" \
+    log --since=$SINCE --until=$UNTIL --oneline main | wc -l | tr -d ' ')
+elif [ "$TOPLEVEL" = "$RIG_PATH" ]; then
+  # standalone repo, the rig IS the toplevel (marketing, whatsapp_automation)
+  COMMIT_COUNT=$(git -C "$RIG_PATH" log --since=$SINCE --until=$UNTIL --oneline main | wc -l | tr -d ' ')
+else
+  # rig is a subdirectory of a bigger shared repo — gascity, gastown, and
+  # deacon all resolve to the SAME toplevel (/Users/athos/gt), so an
+  # unscoped count here would be town-wide, not per-rig. Scope to just
+  # this rig's subtree via pathspec (verified 2026-08-21: per-subtree
+  # counts sum exactly to the town-wide total across a 3-week sample, no
+  # cross-subtree overlap found — though a single commit touching two
+  # rigs' subtrees at once is structurally possible and would double-
+  # count across rigs if it ever happens; not observed so far).
+  REL=${RIG_PATH#$TOPLEVEL/}
+  COMMIT_COUNT=$(git -C "$TOPLEVEL" log --since=$SINCE --until=$UNTIL --oneline main -- "$REL" | wc -l | tr -d ' ')
+fi
 ```
 
 c) **Incidents:**
@@ -246,9 +280,9 @@ Transform data into a formatted digest and deliver it.
 - **Net change**: +/-N
 
 ## By Rig
-| Rig | Filed | Closed | Merges |
-|-----|-------|--------|--------|
-| ... | ...   | ...    | ...    |
+| Rig | Filed | Closed | Commits |
+|-----|-------|--------|---------|
+| ... | ...   | ...    | ...     |
 
 ## Highlights
 - Notable completions
