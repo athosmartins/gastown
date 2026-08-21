@@ -42,9 +42,21 @@ DB="${1:-}"
 CITY="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
 BACKUP_ROOT="${GC_BACKUP_ARTIFACT_DIR:-$CITY/.dolt-backup}"
 LOG="${RESEED_LOG:-$CITY/.gc/logs/dolt-backup-reseed.log}"
-# Margem sobre o tamanho vivo: o sync precisa de espaço para o novo backup
-# ENQUANTO o antigo ainda existe (não trocamos antes de verificar).
-DISK_MARGIN_PCT="${RESEED_DISK_MARGIN_PCT:-150}"
+# ⚠️ MARGEM — a conta que eu ERREI na primeira versão (pego pelo gate, ga-kawer3).
+# Eu dimensionei para UMA cópia extra ("o novo enquanto o antigo existe") e o
+# mecanismo cria DUAS ao mesmo tempo. O pico real de consumo NOVO é:
+#     NEW_DIR (backup novo, ~1x vivo)
+#   + VERIFY_DIR (restauração de verificação, ~1x vivo)   <-- eu tinha esquecido
+#   = ~2x o tamanho vivo
+# e as duas coexistem ANTES da troca (o BACKUP_DIR original ainda está lá, mas
+# esse não é consumo novo). VERIFY_DIR fica sob /tmp, no MESMO volume de dados
+# que o preflight mede — não é espaço "de outro lugar".
+# Medido no hq: vivo 4.167MB -> minha checagem antiga exigia 6.251MB, pico real
+# 8.335MB. Passaria no preflight e estouraria durante a restauração — que é
+# exatamente a falha que este script existe para evitar (ga-vs55, 14/07).
+# 250% = 2x do pico + 0,5x de folga para a cidade continuar escrevendo durante
+# a operação (ela nunca para).
+DISK_MARGIN_PCT="${RESEED_DISK_MARGIN_PCT:-250}"
 DOLT_BIN="${DOLT_BIN:-dolt}"
 GC_BIN="${GC_BIN:-gc}"
 
@@ -127,6 +139,12 @@ if [ -z "$RESTORED_COUNT" ]; then
   rm -rf "$NEW_DIR"
   die "restaurou mas NÃO consegui LER o dado restaurado. 'Não sei' não é 'está ok' — nada foi trocado."
 fi
+
+# Libera a cópia de verificação ASSIM QUE o dado foi lido. Não reduz o PICO
+# (que acontece durante a restauração), mas encurta a janela em que ele
+# persiste — antes ficava ocupado até o fim do script, atravessando a troca.
+rm -rf "$VERIFY_DIR" 2>/dev/null
+trap cleanup_remote EXIT
 
 log "conferência: restaurado=$RESTORED_COUNT vs vivo=$LIVE_COUNT"
 # A origem pode ter crescido durante o sync (a cidade escreve o tempo todo), por
