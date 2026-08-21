@@ -1665,10 +1665,12 @@ _attmention() { (
 # to avoid being confounded by that exemption.
 ATT_SESSIONS_JSON='{"sessions":[{"alias":"wa-worker-attached-1","closed":false,"attached":true}]}'
 
-# (u1) real match: peek output mentions the bead id as a whole token.
-ATT_PEEK_OUTPUT="🔨 ga-n9bw (engine-window) — implementando agora."
-_attmention "ga-n9bw" && ok "OWN-GUARD(e-unit1): real cache/grep matches a mentioned bead id" \
-                      || bad "OWN-GUARD(e-unit1): real cache/grep missed a genuine mention — signal (e) is inert"
+# (u1) real match: peek output mentions the bead id as a whole token AND
+# carries work evidence (bd command) on the same line (ga-2pft1n: a bare
+# mention alone no longer suffices — see (u9)-(u13) below).
+ATT_PEEK_OUTPUT="🔨 ga-n9bw (engine-window) — bd claim ga-n9bw; implementando agora."
+_attmention "ga-n9bw" && ok "OWN-GUARD(e-unit1): real cache/grep matches a mentioned bead id with work evidence" \
+                      || bad "OWN-GUARD(e-unit1): real cache/grep missed a genuine mention with work evidence — signal (e) is inert"
 
 # (u2) no mention → allow.
 ATT_PEEK_OUTPUT="nothing relevant here"
@@ -1713,8 +1715,8 @@ _attmention "ga-t1ub9" && bad "OWN-GUARD(e-unit6): Mayor-only mention wrongly fi
 # the exemption excludes only the Mayor's own session from the peek roster,
 # it is not a global cache bypass.
 ATT_SESSIONS_JSON='{"sessions":[{"alias":"gastown.mayor","closed":false,"attached":true},{"alias":"wa-worker-1","closed":false,"attached":true}]}'
-ATT_PEEK_OUTPUT="🔨 ga-t1ub9 — implementando agora."
-_attmention "ga-t1ub9" && ok "OWN-GUARD(e-unit7): live crew mention STILL fires signal (e) even when the Mayor is also attached (exemption scoped correctly, not a global cache bypass)" \
+ATT_PEEK_OUTPUT="🔨 ga-t1ub9 — gc bd update ga-t1ub9 --claim; implementando agora."
+_attmention "ga-t1ub9" && ok "OWN-GUARD(e-unit7): live crew mention with work evidence STILL fires signal (e) even when the Mayor is also attached (exemption scoped correctly, not a global cache bypass)" \
                        || bad "OWN-GUARD(e-unit7): crew mention wrongly suppressed when the Mayor is also attached — real owner protection lost"
 
 # (u8) belt-and-suspenders: the Mayor identified ONLY by the double-underscore
@@ -1725,6 +1727,54 @@ ATT_SESSIONS_JSON='{"sessions":[{"session_name":"gastown__mayor","closed":false,
 ATT_PEEK_OUTPUT="ga-t1ub9 mentioned via session_name-only Mayor record"
 _attmention "ga-t1ub9" && bad "OWN-GUARD(e-unit8): Mayor identified only by session_name still wrongly fired signal (e)" \
                        || ok "OWN-GUARD(e-unit8): Mayor identified only by session_name is ALSO exempt (ga-ipf6-class form covered)"
+
+# ── ga-2pft1n: a bare mention is not ownership — require work evidence ────────
+# ROOT (measured live, 2026-08-21): batista-wa's own accountability report to
+# Athos named wa-1ccdz in a status table and in past-tense narration recounting
+# an earlier mistake diagnosing the SAME bead. Neither line is the session
+# doing anything to wa-1ccdz, but the OLD bare-token grep couldn't tell the
+# difference and refused every Pilot sweep for as long as the report stayed in
+# the 80-line peek window — a completely free (open, unassigned, no branch) P1
+# bug starved 301 minutes behind a session merely writing ABOUT it. (u9)-(u11)
+# reproduce the false-positive directly; (u12)-(u13) prove the evidence check
+# still fires for genuine work and doesn't leak across lines.
+ATT_SESSIONS_JSON='{"sessions":[{"alias":"batista-wa","closed":false,"attached":true}]}'
+
+# (u9) prose-only STATUS TABLE row — half of the actual repro — must NOT fire.
+ATT_PEEK_OUTPUT="| wa-1ccdz | Travadas | Mesmo erro (ja tinha corrigido ha pouco) | Aprovadas |"
+_attmention "wa-1ccdz" && bad "OWN-GUARD(e-unit9): status-table row wrongly counted as ownership evidence (ga-2pft1n regression)" \
+                        || ok "OWN-GUARD(e-unit9): status-table row naming the bead does NOT fire signal (e)"
+
+# (u10) prose-only past-tense NARRATION — the other half of the actual repro —
+# must NOT fire.
+ATT_PEEK_OUTPUT="Cobranca justa -- e eu ja errei nisso uma vez hoje (o wa-1ccdz estava travado e eu dizia 'aguarda o pilot')."
+_attmention "wa-1ccdz" && bad "OWN-GUARD(e-unit10): retrospective narration wrongly counted as ownership evidence (ga-2pft1n regression)" \
+                        || ok "OWN-GUARD(e-unit10): past-tense narration naming the bead does NOT fire signal (e)"
+
+# (u11) end-to-end: BOTH lines together, exactly as they appeared in the live
+# transcript that produced the 301-minute stall — the direct regression test
+# for ga-2pft1n.
+ATT_PEEK_OUTPUT="Cobranca justa -- e eu ja errei nisso uma vez hoje (o wa-1ccdz estava travado e eu dizia 'aguarda o pilot').
+| wa-1ccdz | Travadas | Mesmo erro (ja tinha corrigido ha pouco) | Aprovadas |"
+_attmention "wa-1ccdz" && bad "OWN-GUARD(e-unit11): full live repro (narration + table row) still starves the bead (ga-2pft1n NOT fixed)" \
+                        || ok "OWN-GUARD(e-unit11): full live repro (narration + table row) no longer fires signal (e) — ga-2pft1n fixed"
+
+# (u12) positive control: the SAME session actually claiming the bead — a
+# bd/gc invocation on the SAME line as the mention — must STILL fire. The fix
+# narrows the signal, it must not neuter it.
+ATT_PEEK_OUTPUT="bd claim wa-1ccdz"
+_attmention "wa-1ccdz" && ok "OWN-GUARD(e-unit12): a real bd claim on the bead still fires signal (e)" \
+                        || bad "OWN-GUARD(e-unit12): a real bd claim no longer fires signal (e) — fix over-tightened, signal (e) is now inert"
+
+# (u13) precision guard: work evidence present ELSEWHERE in the cache (a
+# different line, an unrelated bd command on an unrelated bead) must NOT leak
+# into validating a bare mention of OUR bead on its own separate line — the
+# evidence has to be co-located with the mention, not merely present
+# somewhere in the transcript.
+ATT_PEEK_OUTPUT="bd claim some-other-bead
+| wa-1ccdz | Travadas | Mesmo erro (ja tinha corrigido ha pouco) | Aprovadas |"
+_attmention "wa-1ccdz" && bad "OWN-GUARD(e-unit13): unrelated evidence on another line wrongly validated a bare mention (evidence check is not line-scoped)" \
+                        || ok "OWN-GUARD(e-unit13): evidence on an unrelated line does NOT validate a bare mention elsewhere (line-scoped correctly)"
 
 # ── Scenario 3f: pre-approval lifecycle stories are excluded (ga-w7wvm) ─────────
 # The Pilot dispatches ONLY story:approved features; pre-approval lifecycle states

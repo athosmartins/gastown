@@ -5200,25 +5200,63 @@ ${_out}"
 
 # _beadid_mentioned_in_attached_session <bead_id> — exit 0 iff a live ATTACHED
 # session's recent output mentions <bead_id> as a whole token (boundary-safe:
-# a longer id sharing the same prefix/suffix never false-matches). The Mayor's
-# own session is excluded from the scan (ga-lluq1 — see
+# a longer id sharing the same prefix/suffix never false-matches) ON A LINE
+# THAT ALSO CARRIES EVIDENCE OF ACTUAL WORK on that bead — a bd/gc/git CLI
+# invocation, or a branch-name path segment ending in the id. The Mayor's own
+# session is excluded from the scan (ga-lluq1 — see
 # _attached_session_peek_cache above): a mention that appears ONLY in the
 # Mayor's transcript never fires this signal, while a mention in any other
 # live attached (crew/builder) session still does.
+#
+# ga-2pft1n (2026-08-21): a BARE mention used to be sufficient, and that was
+# the bug. A crew/builder session's recent output routinely contains STATUS
+# REPORTS — retrospective tables, "eu ja errei nisso" narration written FOR
+# the human — that name a bead id without the session doing anything to it.
+# Concrete repro: batista-wa's own accountability report to Athos named
+# wa-1ccdz in a markdown status table ("| wa-1ccdz | Travadas | ... |
+# Aprovadas |") and in a past-tense sentence recounting an earlier mistake;
+# neither is the session claiming or working the bead, but the old bare-token
+# grep couldn't tell the difference — it refused every Pilot sweep for as
+# long as that report text stayed in the session's 80-line peek window,
+# starving a completely free (open, unassigned, no branch) P1 bug for
+# 301 minutes. Writing ABOUT a stuck bead was itself what kept it stuck, and
+# the author had no way to notice.
+#
+# Fix: require the mention to co-occur, on the SAME line, with a command-
+# shaped signal. This is an ALLOW-list of what counts as evidence, not a
+# deny-list of "looks like a report": prose shape is unbounded (tables,
+# narration, any language), but CLI invocation syntax is not. A status table
+# or retrospective sentence naming the id has no reason to also carry a bare
+# "bd"/"gc"/"git" word or a branch-shaped path segment ending in the id; a
+# session actually claiming/building/committing the bead routinely does. This
+# doesn't need to be exhaustive to be a large improvement — it already
+# excludes both problem lines in the concrete repro above, and any residual
+# false positive is bounded by this being one heuristic among five (a)-(e),
+# never the only thing standing between a bead and dispatch.
+#
 # Test seam: PILOT_TEST_ATTACHED_MENTION_BEADS (space-list), consulted when
-# DEFINED, keeps the selftest hermetic (no live gc / sessions). FAIL-OPEN: no
-# gc, no attached sessions, any read error, or no match → return 1 (allow) —
-# this signal must never wedge a genuinely-free dispatch.
+# DEFINED, keeps the selftest hermetic (no live gc / sessions) — and, by
+# design, bypasses the evidence check below: it stands in for "signal (e)
+# fired," which the existing composition tests (OWN-GUARD e1/e3/e4) still
+# need to drive deterministically. The evidence requirement is exercised
+# directly against the real cache/grep path in the OWN-GUARD (e) unit
+# scenarios instead (see pilot-dispatcher.selftest.sh). FAIL-OPEN: no gc, no
+# attached sessions, any read error, no mention, or a mention with no work
+# evidence on any matching line → return 1 (allow) — this signal must never
+# wedge a genuinely-free dispatch.
 _beadid_mentioned_in_attached_session() {
   local _bid="${1:-}"
   [ -n "$_bid" ] || return 1
   if [ -n "${PILOT_TEST_ATTACHED_MENTION_BEADS+x}" ]; then
     case " $PILOT_TEST_ATTACHED_MENTION_BEADS " in *" $_bid "*) return 0 ;; *) return 1 ;; esac
   fi
-  local _cache
+  local _cache _hit_lines
   _cache=$(_attached_session_peek_cache)
   [ -n "$_cache" ] || return 1
-  printf '%s' "$_cache" | grep -qE "(^|[^A-Za-z0-9_-])${_bid}([^A-Za-z0-9_-]|\$)"
+  _hit_lines=$(printf '%s' "$_cache" | grep -E "(^|[^A-Za-z0-9_-])${_bid}([^A-Za-z0-9_-]|\$)") || return 1
+  [ -n "$_hit_lines" ] || return 1
+  printf '%s' "$_hit_lines" \
+    | grep -qE '(^|[^A-Za-z0-9_-])(bd|gc|git)([^A-Za-z0-9_-]|$)|[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]*'"${_bid}"
 }
 
 # _ownership_guard_should_refuse <bead_id> <bead_json> <bead_city> — emit a short
@@ -5230,9 +5268,11 @@ _beadid_mentioned_in_attached_session() {
 #   (c) fresh rig-DB re-read shows an EXTERNAL active claim      → "external-claim:<...>"
 #   (b) live assignee: a non-empty, NON-pilot crew assignee whose session is live
 #       in the once-per-sweep roster                            → "owner:<crew>"
-#   (e) a live ATTACHED session's recent output mentions <bead_id> (ga-48vb;
-#       heuristic, not authoritative — same needs-fix carve-out as (a); the
-#       Mayor's own session is exempt from this scan per ga-lluq1)
+#   (e) a live ATTACHED session's recent output mentions <bead_id> ON A LINE
+#       WITH WORK EVIDENCE — a bd/gc/git invocation or branch reference, not
+#       a bare mention (ga-48vb, tightened ga-2pft1n; heuristic, not
+#       authoritative — same needs-fix carve-out as (a); the Mayor's own
+#       session is exempt from this scan per ga-lluq1)
 #                                                                 → "attached-session:mention"
 # Re-reads the bead's CURRENT assignee (race-safe: the candidate query required an
 # EMPTY assignee, but a competing claim could have set one between snapshot and
