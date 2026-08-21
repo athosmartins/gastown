@@ -146,11 +146,11 @@ if [ -z "$TOPLEVEL" ]; then
   # returns a correct (not a loud-failing) answer either way. Use the
   # explicit form so correctness doesn't depend on that per-subcommand
   # accident; these two rigs are standalone repos, so no pathspec needed.
-  COMMIT_COUNT=$(git --git-dir="$RIG_PATH/.repo.git" --work-tree="$RIG_PATH" \
-    log --since=$SINCE --until=$UNTIL --oneline main | wc -l | tr -d ' ')
+  LOG_OUT=$(git --git-dir="$RIG_PATH/.repo.git" --work-tree="$RIG_PATH" \
+    log --since=$SINCE --until=$UNTIL --oneline main)
 elif [ "$TOPLEVEL" = "$RIG_PATH" ]; then
   # standalone repo, the rig IS the toplevel (marketing, whatsapp_automation)
-  COMMIT_COUNT=$(git -C "$RIG_PATH" log --since=$SINCE --until=$UNTIL --oneline main | wc -l | tr -d ' ')
+  LOG_OUT=$(git -C "$RIG_PATH" log --since=$SINCE --until=$UNTIL --oneline main)
 else
   # rig is a subdirectory of a bigger shared repo — gascity, gastown, and
   # deacon all resolve to the SAME toplevel (/Users/athos/gt), so an
@@ -161,16 +161,33 @@ else
   # rigs' subtrees at once is structurally possible and would double-
   # count across rigs if it ever happens; not observed so far).
   REL=${RIG_PATH#$TOPLEVEL/}
-  COMMIT_COUNT=$(git -C "$TOPLEVEL" log --since=$SINCE --until=$UNTIL --oneline main -- "$REL" | wc -l | tr -d ' ')
+  LOG_OUT=$(git -C "$TOPLEVEL" log --since=$SINCE --until=$UNTIL --oneline main -- "$REL")
+fi
+# Check git log's own exit status IMMEDIATELY, with NO pipe in between —
+# gate-fix history (ga-x3b4ro attempt 1): a prior version of this fix piped
+# straight into `| wc -l | tr -d ' '` and checked `$?` after that, but wc/tr
+# succeed unconditionally no matter what git log did upstream, so `$?` there
+# reflected tr's status, not git log's (reproduced live: `COMMIT_COUNT=$(false
+# | wc -l | tr -d " "); echo "$COMMIT_COUNT $?"` prints "0 0", identical to
+# the genuine-zero case) — the exact bug this fix exists to prevent,
+# reproduced one level down inside its own fix. Capturing raw output into
+# LOG_OUT first sidesteps the pipe entirely: POSIX defines an `if/elif/else`
+# block's own exit status as the status of the last command run in whichever
+# branch executed, which here is always the `LOG_OUT=$(git ... log ...)`
+# assignment — so the `$?` below is always git log's real exit status.
+if [ $? -ne 0 ]; then
+  COMMIT_COUNT="?"
+elif [ -z "$LOG_OUT" ]; then
+  COMMIT_COUNT=0
+else
+  COMMIT_COUNT=$(printf '%s\n' "$LOG_OUT" | wc -l | tr -d ' ')
 fi
 ```
 
-**If the `git log` above ever errors (check its exit status, not just
-`COMMIT_COUNT`'s value)**, do not report `COMMIT_COUNT=0` — a failed command
-and a genuinely quiet rig must not collapse into the same number, the exact
-bug this fix exists to avoid, just moved one level down. Note that rig's
-count as `?` in the table and say so in Highlights instead of asserting no
-activity happened.
+**A failed `git log` above renders `COMMIT_COUNT="?"`, never `0`** — a failed
+command and a genuinely quiet rig must never collapse into the same number.
+If a rig shows `?` in the table, say so in Highlights instead of asserting
+no activity happened.
 
 c) **Incidents:**
 ```bash
