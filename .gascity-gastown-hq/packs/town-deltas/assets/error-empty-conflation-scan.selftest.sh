@@ -992,6 +992,47 @@ r="$(scan_pipe_then_exit_code "$EDGEDIR/dollarq_first_line.sh")"
 
 rm -rf "$EDGEDIR"
 
+# ═════════════════════════════════════════════════════════════════════════
+# ga-jd3kux: PERFORMANCE regression fixture. The state-machine parity
+# fixtures above deliberately pass unmodified against the OLD (pre-fix)
+# bash-loop implementation too — that is what "behavior-preserving" means,
+# and it is by design, not an oversight. But it also means those fixtures
+# alone cannot tell old code from new: this is the complementary check that
+# actually depends on the fix landing. A large synthetic file, engineered
+# to be a worst case for the OLD per-line loop (thousands of lines
+# containing the substring "except" but matching neither full regex,
+# forcing 2 grep forks per line in the old code) but trivial for the new
+# single-pass awk port (zero per-line forks), is timed against a generous
+# threshold. Calibrated live before writing this, on this same host, under
+# TODAY's extreme system load (65+ load average — not a quiet box): 4000
+# such lines measured ~19.6s against the OLD implementation and ~0.019s
+# against the NEW one, a >1000x gap. A direct fork-cost probe on this same
+# host under this same load (2000 `printf | grep` pairs) measured ~7.7ms/
+# pair; even a generous 10x speedup from a much lighter load would still
+# put old code around ~8s here — comfortably over the threshold below. New
+# code's margin is >400x, effectively immune to load-based flakiness in
+# either direction.
+echo "── scan_py_bare_except: performance regression (ga-jd3kux) ──"
+PERFDIR="$(mktemp -d)"
+{
+  i=0
+  while [ "$i" -lt 4000 ]; do
+    case $((i % 3)) in
+      0) printf '    except SomeSpecificError%d as e:  # handled, not bare\n' "$i" ;;
+      1) printf '        log.warning("exception %%s", e)\n' ;;
+      *) printf '    do_thing_%d()\n' "$i" ;;
+    esac
+    i=$((i + 1))
+  done
+} > "$PERFDIR/big_except.py"
+
+_perf_start=$(date +%s)
+scan_py_bare_except "$PERFDIR/big_except.py" >/dev/null
+_perf_elapsed=$(( $(date +%s) - _perf_start ))
+[ "$_perf_elapsed" -le 10 ] && ok "ga-jd3kux PERF: scan_py_bare_except on a 4000-line worst-case file completes in ${_perf_elapsed}s (<=10s threshold; measured ~0.019s when this fix was written vs ~19.6s for the old bash-loop implementation on the identical fixture under equal load — this assertion genuinely depends on the awk-port fix landing, unlike the parity fixtures above)" \
+  || bad "ga-jd3kux PERF REGRESSION: scan_py_bare_except took ${_perf_elapsed}s on the 4000-line worst-case file, expected <=10s (measured ~0.019s when this fix was written) — check for an accidental reintroduction of a per-line fork"
+rm -rf "$PERFDIR"
+
 echo "── run_scan end-to-end (mixed fixture dir) ──"
 MIXED_OUT="$(mktemp)"
 run_scan "$MIXED_OUT" "$FIXDIR/mixed"
