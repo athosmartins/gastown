@@ -880,13 +880,19 @@ def test_next_action_in_progress_tambem_e_parked():
     pro painel/Pilot enquanto o crew esperava decisão do Mayor, porque nenhum
     label sinalizava a espera. A regra 4 (park) roda ANTES da regra 7
     (executing) independente de status — faltava só a prova de que isso vale
-    também com in_progress, que é o status real do caso medido."""
+    também com in_progress, que é o status real do caso medido.
+
+    ga-fwfcq6 (gate FAIL no attempt 1): turn é SEMPRE 'mayor' pra QUALQUER
+    next-action:<x> — derive() não extrai <x>. O attempt 1 deste teste
+    iterava 3 alvos mas só afirmava state=='parked', nunca turn, escondendo
+    exatamente esse fato. Afirma turn=='mayor' pros 3 explicitamente agora,
+    pra nenhuma doc conseguir reivindicar generalização que o código não tem
+    sem quebrar este teste."""
     for who in ("mayor", "batista-constroi", "oracle-constroi"):
         st = derive(b(status="in_progress", labels=["ctx:ready", f"next-action:{who}"]),
                      None, CREWS)
         assert st["state"] == "parked", (who, st)
-    st_mayor = derive(b(status="in_progress", labels=["next-action:mayor"]), None, CREWS)
-    assert st_mayor["turn"] == "mayor", st_mayor
+        assert st["turn"] == "mayor", (who, st)  # hoje SEMPRE mayor, nunca <who>
 
 
 def test_next_action_athos_in_progress_continua_vez_do_athos():

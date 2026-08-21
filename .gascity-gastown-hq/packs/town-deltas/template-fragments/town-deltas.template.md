@@ -609,27 +609,45 @@ terminal. Se ele não estiver olhando NAQUELE instante, a pergunta evapora —
 e nada na bead sinalizava que ela esperava alguém.
 
 **Convenção obrigatória, ANTES de parar esperando decisão:**
-1. `bd label add <bead-id> next-action:mayor` (troque `mayor` pelo alvo real
-   se for outro coordenador — ex. `next-action:deacon`)
+1. `bd label add <bead-id> next-action:mayor` (hoje só `mayor` é seguro —
+   ver "por isso" abaixo antes de usar outro alvo)
 2. `bd comment <bead-id> "Pergunta: <a pergunta exata + contexto suficiente
    pra responder sem abrir mais nada>"`
 3. SÓ DEPOIS, como atalho de latência — nunca como substituto de 1-2:
    `gc session nudge mayor/ "Decisão pendente em <bead-id>, ver comentário."`
 
-Isso NÃO precisa de código novo nem de dashboard novo — os dois consumidores
-já existem e já leem certo:
+Isso NÃO precisa de código novo nem de dashboard novo pro caso `mayor` — mas
+os dois consumidores leem em GRAUS DIFERENTES de "certo", e a diferença
+importa:
 - `bead_state.py`: `next-action:` já é prefixo reconhecido em `PARK_PREFIXES`,
   e a regra 4 (park) do `derive()` roda ANTES da regra 7 (executing) —
   **mesmo com `status=in_progress`**. Gravar o label muda o estado canônico
   de `executing/turn=crew:você` pra `parked/turn=mayor` no mesmo instante, e
   todo consumidor de `derive()` (inflight-reclaim-guard, throughput-stall-
   watchdog, production-stall-watchdog, lifecycle-coherence-janitor) já para
-  de tratar a bead como travada/órfã.
-- `painel_visibilidade.py` (rig WA): já renderiza `next-action:mayor` como
-  "⏳ aguarda condição" com o pill "próx: mayor" — não é teórico, tem casos
-  reais em produção (wa-77wyn, wa-odbh9, wa-rygy0). A metade "visível no
-  painel" do critério de aceite já funciona hoje, ao vivo, no instante em que
-  o label é gravado.
+  de tratar a bead como travada/órfã. ⚠️ **Verificado em código (regra 4 de
+  `derive()`): `turn` é SEMPRE `"mayor"` (ou `"external"`, só pras 2
+  condições não-relacionadas a next-action) pra QUALQUER `next-action:<x>` —
+  o campo não extrai `<x>`. `next-action:deacon` produz o MESMO
+  `turn=mayor` que `next-action:mayor` (testado diretamente contra o
+  `derive()` real, gate ga-fwfcq6). Trocar o alvo NÃO muda quem os
+  watchdogs/reclaim-guard tratam como dono da decisão — hoje é sempre Mayor.**
+- `painel_visibilidade.py` (rig WA): esse sim é genérico — extrai o texto
+  depois de `next-action:` e renderiza o pill "próx: `<x>`" pro que estiver
+  lá, não é teórico, tem casos reais em produção (wa-77wyn, wa-odbh9,
+  wa-rygy0). Só que como `bead_state.py` (acima) NÃO é genérico, usar
+  `next-action:deacon` hoje produz sinal MISTO: o pill mostra "próx: deacon"
+  mas os watchdogs automatizados continuam tratando a decisão como turno do
+  Mayor — pior que não nomear ninguém, porque parece roteado e não está.
+
+**Por isso, hoje: use SEMPRE `next-action:mayor`, mesmo quando quem
+precisa decidir é outro coordenador** — cite o alvo real no COMENTÁRIO da
+pergunta (passo 2), não no label. Rotear o label de verdade pra outros
+coordenadores exige estender o enum fechado de `turn` em `bead_state.py`
+(hoje `athos | mayor | crew:<nome> | pool | external | nobody`) e auditar
+os 4 consumidores citados acima por match exato no valor — fora do escopo
+deste fix, que resolve o caso medido (Mayor).
+
 `next-action:athos` continua reservado — é interceptado ANTES (regra 3,
 `ATHOS_TURN`, e o próprio painel WA) e vai pra fila do Athos, não pra esta.
 
