@@ -6832,7 +6832,7 @@ if [ "$(_quiet_hours_blocks)" = "1" ]; then
   log "Quiet hours (city-night-window.sh, ~/.gastown/run/city-quiet-hours.level) — PAUSING new-run admission this sweep (00h-08h, Athos 2026-08-16), leaving $COUNT marker(s) queued (ga-dxyvxr)."
   exit 0
 elif [ "$(_quiet_hours_unreadable)" = "1" ]; then
-  log "Quiet-hours signal UNREADABLE (missing/stale/corrupt ${QUIET_HOURS_LEVEL_FILE:-unset}) — fail-open, admission proceeding normally this sweep (ga-dxyvxr)."
+  log "Quiet-hours signal UNREADABLE (stale/corrupt ${QUIET_HOURS_LEVEL_FILE:-unset}) — fail-open, admission proceeding normally this sweep (ga-dxyvxr)."
 fi
 
 # ── Step 0b-1 (ga-cw4pm): dynamic-concurrency headroom gate ───────────────────

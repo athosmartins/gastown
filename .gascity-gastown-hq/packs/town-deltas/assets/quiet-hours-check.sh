@@ -26,7 +26,10 @@
 # harder than the problem it closes.
 #
 # Sourced by: pilot-dispatcher.sh, quality-gate-dispatcher.sh,
-# auto-refino-dispatcher.sh, refino-gate-dispatcher.sh.
+# auto-refino-dispatcher.sh, refino-gate-dispatcher.sh, and
+# context-check-dispatcher.sh — 5 consumers, not 4 (ga-w8kbf: this list
+# itself was stale, missing context-check-dispatcher.sh, until that bead's
+# fix corrected it here alongside the actual bug).
 
 QUIET_HOURS_LEVEL_FILE="${QUIET_HOURS_LEVEL_FILE:-${HOME}/.gastown/run/city-quiet-hours.level}"
 # city-night-window.sh runs every 10min; 1800s (30min = 3 missed cycles) gives
@@ -72,12 +75,31 @@ _quiet_hours_state() {
   sed -n '1p' "$QUIET_HOURS_LEVEL_FILE" 2>/dev/null | tr -d '[:space:]'
 }
 
-# _quiet_hours_unreadable → "1" iff the signal is missing/stale/corrupt (the
-# fail-open path — dispatch proceeds either way), "0" iff a genuine QUIET/OPEN
-# reading was read (confirmed, not assumed).
+# _quiet_hours_unreadable → "1" iff the signal is STALE or CORRUPT (the
+# fail-open path — dispatch proceeds either way; this is purely a LOGGING
+# signal, distinct from the dispatch decision _quiet_hours_blocks already
+# makes correctly for every case), "0" iff a genuine QUIET/OPEN reading was
+# read (confirmed, not assumed) OR the file is simply ABSENT.
+#
+# ga-w8kbf: ABSENT is not the same third state as STALE/CORRUPT, and
+# collapsing them here was the bug — a missing file is the SILENT, EXPECTED
+# shape when the night-window mechanism itself is disabled (no writer
+# running by design, e.g. after `launchctl bootout` of
+# com.gascity.city-night-window — see scripts/city-night-window.sh), while
+# a file that EXISTS but carries a stale timestamp or an unparseable one
+# means a writer that WAS running has since broken or hung: a real anomaly
+# worth a log line. Before this fix both produced "1", so 4 dispatchers
+# (pilot, quality-gate, auto-refino, refino-gate) logged "UNREADABLE
+# (missing/stale/corrupt)" every single sweep, forever, for a state that is
+# both permanent and correct — training the reader to ignore the message,
+# which is exactly the day a REAL stale/corrupt writer would also go
+# unnoticed. Absence now returns "0": nothing to report, matches
+# _quiet_hours_blocks' own (already-correct) treatment of "no file" as
+# "not blocking, not an anomaly". Stale/corrupt still return "1" — this fix
+# must not blind the genuine-anomaly case, only the deliberately-off one.
 _quiet_hours_unreadable() {
   [ -n "${QUIET_HOURS_OVERRIDE:-}" ] && { printf '0'; return 0; }
-  [ -f "$QUIET_HOURS_LEVEL_FILE" ] || { printf '1'; return 0; }
+  [ -f "$QUIET_HOURS_LEVEL_FILE" ] || { printf '0'; return 0; }
   local _ts _now
   _ts=$(sed -n '2p' "$QUIET_HOURS_LEVEL_FILE" 2>/dev/null | tr -d '[:space:]')
   case "$_ts" in ''|*[!0-9]*) printf '1'; return 0 ;; esac

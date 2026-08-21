@@ -432,7 +432,7 @@ if [ "$(_quiet_hours_blocks)" = "1" ]; then
   log "Refino gate sweep deferred (quiet hours, ga-dxyvxr). No mutation."
   exit 0
 elif [ "$(_quiet_hours_unreadable)" = "1" ]; then
-  log "Quiet-hours signal UNREADABLE (missing/stale/corrupt ${QUIET_HOURS_LEVEL_FILE:-unset}) — fail-open, refino-gate proceeding normally this sweep (ga-dxyvxr)."
+  log "Quiet-hours signal UNREADABLE (stale/corrupt ${QUIET_HOURS_LEVEL_FILE:-unset}) — fail-open, refino-gate proceeding normally this sweep (ga-dxyvxr)."
 fi
 
 # ── Step 1: Find queued stories (refined, awaiting refino-gate) ───────────────
