@@ -158,8 +158,16 @@ fi
 log "verificação OK. Trocando."
 mv "$BACKUP_DIR" "$OLD_DIR" || die "falhou ao mover o backup antigo; nada trocado"
 if ! mv "$NEW_DIR" "$BACKUP_DIR"; then
-  mv "$OLD_DIR" "$BACKUP_DIR"   # rollback
-  die "falhou ao promover o backup novo — RESTAURADO o antigo ao lugar."
+  # gate-fix 2 (ga-kawer3): o rollback abaixo não pode se autodeclarar
+  # bem-sucedido sem checar o próprio resultado -- é a REGRA INEGOCIÁVEL do
+  # topo do arquivo (nunca declarar êxito sem verificar) aplicada ao próprio
+  # caminho de recuperação. "mv foi chamado" e "o antigo está de volta" são
+  # perguntas diferentes; só a segunda autoriza dizer "RESTAURADO".
+  if mv "$OLD_DIR" "$BACKUP_DIR"; then
+    die "falhou ao promover o backup novo — rollback confirmado, antigo RESTAURADO em $BACKUP_DIR. O novo (verificado, mas não promovido) segue intacto em $NEW_DIR para investigação; não foi apagado."
+  else
+    die "FALHA DUPLA -- o cenário mais grave que este script pode produzir: falhou ao promover o novo E o rollback do antigo TAMBÉM falhou. $BACKUP_DIR pode estar ausente ou vazio agora. NÃO toque em nada: o antigo (bom) pode ainda estar em $OLD_DIR e o novo (verificado) em $NEW_DIR, mas qual sobreviveu não está confirmado. Investigue manualmente antes de qualquer ação."
+  fi
 fi
 
 # Reaponta o remote canônico (o caminho não mudou, mas o conteúdo sim).
