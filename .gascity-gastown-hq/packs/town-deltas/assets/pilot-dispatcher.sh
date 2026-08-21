@@ -3743,7 +3743,7 @@ elif [ "$(_pilot_ram_pressure_unreadable)" = "1" ]; then
   # ga-m2gqb: dispatch proceeds either way (fail-open is the right call — see
   # header above) but "couldn't tell" must stay VISIBLE, not collapse silently
   # into the same log-silence as "confirmed clear" on a state-mutating path.
-  log "RAM-pressure signal UNREADABLE (stale/corrupt ${PILOT_RAM_LEVEL_FILE}) — fail-open, dispatch proceeding normally this sweep (ga-m2gqb)."
+  log "RAM-pressure signal UNREADABLE (missing/stale/corrupt ${PILOT_RAM_LEVEL_FILE}) — fail-open, dispatch proceeding normally this sweep (ga-m2gqb)."
 fi
 
 # ── ga-dxyvxr: quiet-hours back-off — PAUSE dispatch 00h-08h (Athos, 2026-08-16)

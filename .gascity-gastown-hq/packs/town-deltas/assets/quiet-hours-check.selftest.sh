@@ -183,10 +183,19 @@ for d in $DISPATCHERS; do
   else
     bad "drift-guard: $d does NOT source quiet-hours-check.sh — the 5-consumer list is stale again"
   fi
-  if grep -q "UNREADABLE (missing/stale/corrupt" "$DF"; then
-    bad "drift-guard: $d still has the stale 'missing/stale/corrupt' wording (absent can no longer be the cause)"
+  # ga-w8kbf gate-fix-1: scoped to the "Quiet-hours signal" line SPECIFICALLY
+  # — a bare "UNREADABLE (missing/stale/corrupt" match is exactly the
+  # too-broad pattern that let the real fix's own `sed` silently reword an
+  # UNRELATED line (pilot-dispatcher.sh's RAM-pressure monitor, ga-m2gqb,
+  # never touched by this bead's actual code change) and falsely claim
+  # "missing" was no longer a possible cause there too. Caught by gate
+  # review, not by this test, the first time — this test had the identical
+  # flaw and would have missed it. Never loosen this back to a bare suffix
+  # match.
+  if grep -q "Quiet-hours signal UNREADABLE (missing/stale/corrupt" "$DF"; then
+    bad "drift-guard: $d still has the stale 'missing/stale/corrupt' wording on its QUIET-HOURS line (absent can no longer be the cause there)"
   else
-    ok "drift-guard: $d has the corrected log wording (no 'missing' claim)"
+    ok "drift-guard: $d has the corrected quiet-hours log wording (no 'missing' claim)"
   fi
 done
 
