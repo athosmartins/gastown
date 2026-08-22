@@ -189,12 +189,23 @@ command and a genuinely quiet rig must never collapse into the same number.
 If a rig shows `?` in the table, say so in Highlights instead of asserting
 no activity happened.
 
-c) **Incidents:** this city's `incident` bead label has zero hits, ever, city-wide —
-confirmed independently across 4 separate digest runs (ga-iad7b, ga-avd8g6, ga-8oz9o5,
-plus ga-2c2daa's own investigation thread). It is not part of this city's actual label
-taxonomy. Report **N/A — not bead-tracked in this city**, not a bare 0 (a 0 reads as
-"measured and quiet"; this is "the concept has no tracked data"). Do not re-run
-`gc bd list --label=incident` to re-confirm this each day — it is settled.
+c) **Incidents** — per rig, bounded [SINCE, UNTIL), including closed beads (many
+incidents are filed and resolved within minutes — `--all` is required or they're
+invisible even inside a correctly-bounded date range):
+```bash
+RIG_PATH=<rig-path>   # from `gc rig list`, one rig at a time — see 2b's commit loop
+gc bd -C "$RIG_PATH" list --label=incident --all --created-after=$SINCE --created-before=$UNTIL --json --limit=0
+```
+The `incident` label is real and in live use — e.g. `ps-t80` (property_scrapers,
+filed and closed within 5 seconds, 2026-05-20) — just lightly used and scattered
+per-rig, never visible from one city-wide view. A prior version of this recipe
+checked only the unscoped `gc bd list` (no `-C`, resolves to HQ/gascity only) and
+generalized that single rig's zero into a permanent "zero, ever, city-wide, never
+recheck" claim — gate-failed for exactly this (ga-2c2daa, 2026-08-22): every rig
+has its own separate bd database (confirmed via `gc rig list` + direct `-C`
+queries), so a city-wide answer needs the per-rig loop above, every run. Expect
+most days to genuinely read 0 — that's a real quiet day, not evidence the label
+is unused.
 
 **Why every query above needs BOTH bounds:** this formula fires on the
 deacon's cooldown trigger, not a midnight cron — it can run at any
@@ -276,29 +287,42 @@ quiet, and the digest should say so explicitly rather than report a count
 that reads as complete. Tracked separately as a `gc events` capability gap,
 not a recipe bug — see the formula's own bug history for the follow-up.
 
-b) **Escalations:** there is no universal `escalation` bead label in this city (0 hits,
-confirmed across 3+ independent runs, including a `--label-pattern '*escalat*'` sweep that
-only found incidental substring matches, e.g. a branch name containing "escalate"). Real
-escalation tracking exists only per-domain, under different conventions — the one confirmed
-convention today is `auto-refino:escalated`, used only in the `deacon` rig (prefix `dc`,
-currently suspended — verified live 2026-08-22 that its bd database is still queryable
-despite suspension):
+b) **Escalations** — no universal `escalation` bead label exists in this city (0
+hits, confirmed across 3+ independent runs, including a `--label-pattern
+'*escalat*'` sweep that only found incidental substring matches). Real escalation
+tracking exists only per-domain, under different label conventions — the one
+confirmed-real convention is `auto-refino:escalated`. **Check every rig, not one
+guessed by name:**
 ```bash
-DEACON_RIG_PATH=<deacon-rig-path>   # from `gc rig list` (prefix dc)
-gc bd -C "$DEACON_RIG_PATH" list --label=auto-refino:escalated --created-after=$SINCE --created-before=$UNTIL --json --limit=0
+RIG_PATH=<rig-path>   # from `gc rig list`, one rig at a time
+gc bd -C "$RIG_PATH" list --label=auto-refino:escalated --all --created-after=$SINCE --created-before=$UNTIL --json --limit=0
 ```
-Report this as a labeled partial count ("deacon rig auto-refino escalations: N — no other
-rig has a confirmed equivalent convention yet"), never as a bare city-wide
-"Escalations: N" — that reads as complete while measuring one rig's one convention. If this
-query itself fails, say so and report N/A for this sub-item rather than treating a query
-failure as zero.
+A prior version of this recipe hardcoded one rig (deacon, guessed from the
+label's own "auto-refino" domain name) and produced a permanent false zero two
+ways at once — both found and reproduced live, gate-failed on ga-2c2daa
+(2026-08-22): (1) the deacon rig's bd database is actually empty (`gc bd -C
+<deacon-rig-path> list --all --json` → `[]`) — a bead's ID prefix does not
+reliably indicate which rig's database it lives in; `dc-yla3`, a real
+`dc`-prefixed bead, actually lives in the gascity/HQ database, not `deacon`'s
+own; (2) the query itself was missing `--all` — of 17 `auto-refino:escalated`
+beads found city-wide in the same sweep, 16 were already closed, so even the
+right rigs would have undercounted by ~94% without it. Sum across rigs and
+report the per-rig breakdown, labeled as covering only this one confirmed
+convention ("auto-refino:escalated escalations: N — no other rig has a
+confirmed equivalent convention yet"), never as a bare unqualified
+"Escalations: N". If any rig's query fails, say so and report N/A for that rig
+rather than treating a query failure as zero.
 
-c) **Warrants filed:** this dog pool's own `mol-shutdown-dance` warrants are not persisted
-as durable beads, wisp-types, or event-types anywhere in this city — confirmed
-independently across 3+ runs (0 hits via `--label=warrant`, a wisp-type scan, and an
-event-type scan, every time). They are ephemeral/nudge-based in the current
-implementation. Report **N/A — warrants are not bead-tracked in this city today**, not a
-bare 0. Do not re-run this query to re-confirm; this is settled.
+c) **Warrants filed:** this dog pool's own `mol-shutdown-dance` warrants are not
+persisted as durable beads, wisp-types, or event-types anywhere in this city —
+confirmed independently across 3+ runs (0 hits via `--label=warrant --all`
+across all 7 rigs, a wisp-type scan, and an event-type scan, every time). Report
+**N/A — warrants are not bead-tracked in this city today**, not a bare 0. This is
+the current best understanding, not a permanent fact exempt from ever
+rechecking — the identical "settled, never recheck" framing on this step's
+Incidents/Escalations sub-items above was itself gate-failed for going stale
+(ga-2c2daa, 2026-08-22): if a future run ever finds a real `--label=warrant
+--all` hit anywhere, report the count instead of N/A.
 
 Close this step when all data is collected."""
 
