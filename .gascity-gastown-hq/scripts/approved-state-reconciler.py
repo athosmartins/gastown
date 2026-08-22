@@ -1404,11 +1404,22 @@ _PILOT_DISPATCHABLE_REASON_TEXT = {
 }
 
 
-# ga-nq0jo: same TTL convention as PILOT_DISPATCHABLE_TTL's default (600s =
-# one reconciler sweep interval) — a fixed constant here rather than a field
-# in the JSON itself, since this state is a single flag, not a queue the
-# writer might reasonably want to tune per-call.
-PILOT_SWEEP_PAUSE_TTL_SEC = 600
+# ga-ndh7jm: MEASURED (15/15 consecutive real sweep-to-sweep intervals, read
+# from pilot-dispatcher.log's per-sweep "Dolt health OK/SATURATED/UNREADABLE"
+# marker — logged moments before this file's own write on every sweep, so
+# consecutive marker timestamps are a direct proxy for this file's real
+# write-to-write cadence): 731 713 759 736 706 641 644 640 648 641 755 729
+# 702 711 737 seconds — every single one exceeds the old 600s default, same
+# bug class ga-abfcdz just fixed for PILOT_DISPATCHABLE_TTL (this file is
+# written a few cheap checks after that one, within the same sweep, so the
+# two share essentially the same cadence). Raised to 1800s to match
+# PILOT_DISPATCHABLE_TTL exactly — same convention (600s == one nominal
+# StartInterval, still a fixed Python-side constant rather than a field in
+# the JSON, since this state is a single flag, not a queue the writer might
+# reasonably want to tune per-call), same margin reasoning (~2.5x the
+# measured median, comfortably above the measured max, while still going
+# stale if a sweep is genuinely abnormal).
+PILOT_SWEEP_PAUSE_TTL_SEC = 1800
 
 
 def _read_pilot_sweep_pause_state(now):
@@ -4590,6 +4601,39 @@ def _selftest():
              fresh_result, stale_result, missing_result))
 
     _read_pilot_sweep_pause_state_file = None   # leave the seam clean for any test after this one
+
+    print("\nScenario (ga-ndh7jm): the SHIPPED DEFAULT PILOT_SWEEP_PAUSE_TTL_SEC "
+          "must comfortably exceed the measured real sweep-to-sweep intervals, "
+          "not just equal the nominal StartInterval (same bug class as ga-abfcdz)")
+    # 15 real consecutive intervals measured from pilot-dispatcher.log's per-sweep
+    # "Dolt health OK/SATURATED/UNREADABLE" marker (logged moments before this
+    # file's own write on every sweep — see this constant's own comment above):
+    # 731 713 759 736 706 641 644 640 648 641 755 729 702 711 737. The OLD
+    # default (600s = StartInterval) was LESS than every single one — proven RED
+    # against the pre-fix 600 default (600 < 759, the measured max) and GREEN
+    # against this fix's 1800.
+    _MAX_MEASURED_SWEEP_PAUSE = 759
+    if PILOT_SWEEP_PAUSE_TTL_SEC > _MAX_MEASURED_SWEEP_PAUSE:
+        _ok("(ga-ndh7jm): shipped PILOT_SWEEP_PAUSE_TTL_SEC default (%d) exceeds "
+            "the measured max real interval (%ds) — a fresh write is reachable, "
+            "not permanently stale" % (
+                PILOT_SWEEP_PAUSE_TTL_SEC, _MAX_MEASURED_SWEEP_PAUSE))
+    else:
+        _bad("(ga-ndh7jm)", "REGRESSION: shipped PILOT_SWEEP_PAUSE_TTL_SEC "
+             "default (%d) does NOT exceed the measured max real interval "
+             "(%ds) — consumers can never confirm a fresh read" % (
+                 PILOT_SWEEP_PAUSE_TTL_SEC, _MAX_MEASURED_SWEEP_PAUSE))
+    # Upper sanity bound (ga-00qma2's own lesson, applied here too — same as
+    # ga-abfcdz's sibling scenario): a TTL so generous that staleness becomes
+    # structurally unreachable is the same bug in the other direction.
+    if PILOT_SWEEP_PAUSE_TTL_SEC < 7200:
+        _ok("(ga-ndh7jm): shipped PILOT_SWEEP_PAUSE_TTL_SEC default (%d) is not "
+            "so generous that staleness becomes unreachable (< 7200s ceiling, "
+            "ga-00qma2 lesson)" % PILOT_SWEEP_PAUSE_TTL_SEC)
+    else:
+        _bad("(ga-ndh7jm)", "shipped PILOT_SWEEP_PAUSE_TTL_SEC default (%d) is "
+             ">= 7200s — staleness may be structurally unreachable again, same "
+             "class as ga-00qma2" % PILOT_SWEEP_PAUSE_TTL_SEC)
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
