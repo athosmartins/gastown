@@ -595,17 +595,29 @@ set_gate_status() {
 # classify_inflight_gap1 <status> <has_gate_passed> <has_live_assignee> <branch_merged>
 # Pure decision for ga-pa36 GAP-1: OPEN story:in-flight bead whose fix branch
 # was already merged to origin/main but has no gate:passed label.
-# branch_merged: 1=merged, 0=not-merged, anything-else=indeterminate (safe-skip).
-# Returns: strip:merged | skip:already-handled | skip:live-builder | skip:not-merged | skip:indeterminate
+# branch_merged: 1=merged, 0=not-merged, none=no fix/feature branch was ever
+# found for this bead (ga-bz4nsi 3rd form — see below), anything-else=
+# indeterminate (safe-skip).
+# ga-bz4nsi: "none" is deliberately a DIFFERENT outcome from "0" (not-merged).
+# A bead with a real branch that just hasn't merged YET must keep waiting
+# (skip:not-merged) — stripping it would abandon real in-progress work. A bead
+# with NO branch at all, no live assignee, no gate:passed and no
+# pilot:dispatched never actually started building: story:in-flight there is a
+# leaked lane slot, not a build in progress (strip:no-branch). Collapsing the
+# two into one outcome would either strand real work or never free a
+# genuinely-abandoned slot — see caller for the "no branch found" evidence
+# this depends on.
+# Returns: strip:merged | strip:no-branch | skip:already-handled | skip:live-builder | skip:not-merged | skip:indeterminate
 classify_inflight_gap1() {
   local status="$1" has_gate_passed="$2" has_live_assignee="$3" branch_merged="$4"
   [ "$status" = "closed" ]       && { echo "skip:already-handled"; return; }
   [ "$has_gate_passed" = "1" ]   && { echo "skip:already-handled"; return; }
   [ "$has_live_assignee" = "1" ] && { echo "skip:live-builder"; return; }
   case "$branch_merged" in
-    1) echo "strip:merged" ;;
-    0) echo "skip:not-merged" ;;
-    *) echo "skip:indeterminate" ;;
+    1)    echo "strip:merged" ;;
+    0)    echo "skip:not-merged" ;;
+    none) echo "strip:no-branch" ;;
+    *)    echo "skip:indeterminate" ;;
   esac
 }
 
@@ -631,6 +643,58 @@ guard_content_merged() {
   local main_ref="$1" branch_ref="$2" n
   n=$(git -C "$GC_CITY" rev-list --count --cherry-pick --right-only "${main_ref}...${branch_ref}" 2>/dev/null || echo ERR)
   [ "$n" = "0" ]
+}
+
+# _gap1_city_ready_for_branch_check <city_path> — ga-bz4nsi: before trusting an
+# EMPTY branch-search result as positive proof "no fix/feature branch was ever
+# created" (the evidence classify_inflight_gap1's strip:no-branch case acts
+# on), confirm this city's git checkout can actually answer the question.
+# Verified live 2026-08-22 against this city's own rig list: some rig paths
+# throw "fatal: this operation must be run in a work tree" on ANY `git -C`
+# invocation, and others are real work trees with no "origin" remote
+# configured. Both failure modes make `git ls-remote origin <pattern>` /
+# `git for-each-ref` return empty for a reason that has NOTHING to do with
+# whether a branch exists — silently treating that as "no branch" would strip
+# story:in-flight from a bead we have no actual evidence about, exactly the
+# wrong-direction error this bead warns against (releasing real in-progress
+# work). rc0 iff <city_path> is a usable git work tree with a resolvable
+# "origin" remote; rc1 otherwise (caller must treat "no branch found" as
+# indeterminate, not as proof, when this returns rc1).
+_gap1_city_ready_for_branch_check() {
+  local city="$1"
+  git -C "$city" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
+  git -C "$city" remote get-url origin >/dev/null 2>&1 || return 1
+  return 0
+}
+
+# _gap1_ensure_lifecycle_backstop <city_path> <bead_id> — ga-bz4nsi requirement
+# 3: a GAP-1 strip (either sub-case) only ever removes story:in-flight. If the
+# bead had no OTHER lifecycle label to fall back on, that removal leaves it
+# invisible to every dispatch query all over again — trading one invisible
+# limbo for another. Bugs and tech-debt-labeled beads bypass the refino funnel
+# entirely (pilot-dispatcher.sh Tier-1: "bugs/chores/tasks... pass through
+# untouched", ga-ciyypt) and never need story:approved, so they are exempt. A
+# feature/story left with no story:approved would otherwise simply fail every
+# candidate query forever (the ps-mrfb/ps-joc0-shaped bug, mirrored here for
+# this reconciler's own release path) — so re-stamp story:approved, matching
+# the exact convention pilot-dispatcher.sh's own NEVERSTARTED release already
+# uses ("back to story:approved for re-dispatch", ga-v3z4z). No-op (and safe
+# to call unconditionally after every strip) when the bead already carries
+# story:approved or doesn't need it.
+_gap1_ensure_lifecycle_backstop() {
+  local city="$1" bead_id="$2"
+  local show issue_type has_approved has_tech_debt
+  show=$(bd -C "$city" show "$bead_id" --json 2>/dev/null \
+    | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "")
+  issue_type=$(echo "$show" | jq -r '(.issue_type // .type // "")' 2>/dev/null || echo "")
+  [ "$issue_type" = "bug" ] && return 0
+  has_tech_debt=$(echo "$show" | jq -r '((.labels // []) | contains(["tech-debt"]))' 2>/dev/null || echo "false")
+  [ "$has_tech_debt" = "true" ] && return 0
+  has_approved=$(echo "$show" | jq -r '((.labels // []) | contains(["story:approved"]))' 2>/dev/null || echo "false")
+  [ "$has_approved" = "true" ] && return 0
+  warn "$bead_id has no dispatchable lifecycle label after GAP-1 release (type=$issue_type, no tech-debt label, no story:approved) — stamping story:approved so it does not fall into a new invisible limbo (ga-bz4nsi requirement 3)."
+  bd -C "$city" label add "$bead_id" "story:approved" -q 2>/dev/null || true
+  bd -C "$city" comment "$bead_id" "ga-bz4nsi GAP-1 reconciler: stamped story:approved after releasing story:in-flight — bead had no other lifecycle label and is not type=bug/tech-debt, so without this it would have gone from one invisible limbo (leaked in-flight) straight into another (no candidate query would ever find it). Self-healed." 2>/dev/null || true
 }
 
 # classify_parent_gap2 <has_pilot_dispatched> <has_live_assignee> <sling_found> <sling_needs_fix> <sling_closed> [sling_refused]
@@ -2811,6 +2875,9 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
     git -C "$GC_CITY" fetch origin main --quiet 2>/dev/null || true
     G1_MAIN_SHA=$(git -C "$GC_CITY" rev-parse "origin/main" 2>/dev/null || echo "")
 
+    G1_CITY_GIT_READY=0
+    _gap1_city_ready_for_branch_check "$GC_CITY" && G1_CITY_GIT_READY=1
+
     for OI_ID in $GAP1_IDS; do
       [ -z "$OI_ID" ] && continue
 
@@ -2850,7 +2917,22 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
       done
 
       if [ -z "$OI_BRANCH_SHA" ]; then
-        log "GAP-1: $OI_ID — no branch matching fix/$OI_ID* or feature/$OI_ID* — safe-skip"
+        if [ "$G1_CITY_GIT_READY" != "1" ]; then
+          log "GAP-1: $OI_ID — no branch matching fix/$OI_ID* or feature/$OI_ID*, but git is not usable for this city (no work tree or no origin remote) — cannot trust the empty result, safe-skip (ga-bz4nsi)"
+          continue
+        fi
+        ACTION=$(classify_inflight_gap1 "open" "0" "$HAS_LIVE_ASSIGNEE" "none")
+        case "$ACTION" in
+          strip:no-branch)
+            warn "GAP-1: $OI_ID has no branch matching fix/$OI_ID* or feature/$OI_ID*, no live assignee, no gate:passed, no pilot:dispatched — never actually started, stripping story:in-flight (ga-bz4nsi)"
+            bd -C "$GC_CITY" comment "$OI_ID" "ga-bz4nsi GAP-1 reconciler: stripped orphaned story:in-flight — no fix/feature branch was ever found for this bead, no live assignee, no gate:passed, no pilot:dispatched. This is the never-started shape (not merged-and-forgotten): the lane slot was leaked before any build began. Self-healed." 2>/dev/null || true
+            bd -C "$GC_CITY" label remove "$OI_ID" "story:in-flight" -q 2>/dev/null || true
+            _gap1_ensure_lifecycle_backstop "$GC_CITY" "$OI_ID"
+            ;;
+          *)
+            log "GAP-1: $OI_ID action=$ACTION — skip"
+            ;;
+        esac
         continue
       fi
 
@@ -2874,6 +2956,7 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
             bd -C "$GC_CITY" comment "$OI_ID" "ga-pa36 GAP-1 reconciler: stripped orphaned story:in-flight — branch tip $OI_BRANCH_SHA already merged to origin/main, no gate:passed label, no live builder. Lane slot freed." 2>/dev/null || true
           fi
           bd -C "$GC_CITY" label remove "$OI_ID" "story:in-flight" -q 2>/dev/null || true
+          _gap1_ensure_lifecycle_backstop "$GC_CITY" "$OI_ID"
           ;;
         skip:not-merged)
           log "GAP-1: $OI_ID branch tip $OI_BRANCH_SHA not yet merged — skip"
