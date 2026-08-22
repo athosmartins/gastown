@@ -7517,6 +7517,37 @@ else
   bad "ga-nxj7kc: expected 2 sites assigning via \${BEADS_ACTOR:-\$GC_ALIAS} (bug-tier + feature-tier), found $FIXED_ASSIGN_COUNT — one DISPATCH_TASK template may be missing the fix"
 fi
 
+# ── Scenario ga-gdy2kk: dispatch template's "Claim your work" status-set must
+# use a real per-issue setter, not the database-wide dashboard verb ───────────
+# Bug ga-gdy2kk: both DISPATCH_TASK heredocs' "## Claim your work (do this
+# first)" section ran `bd status in_progress "$STORY_ID"` as their second
+# line. `bd status` (no subcommand args consumed) is bd's DATABASE-WIDE
+# DASHBOARD verb — it prints total/open/in-progress/closed counts across the
+# whole store and silently IGNORES trailing "in_progress <id>" arguments; it
+# is not a per-issue status setter. A builder who follows this documented "do
+# this first" step literally ends up with the story bead ASSIGNED but still
+# status=open, never transitioning to in_progress. The correct form already
+# exists elsewhere in this file, in the routed-pool dispatch path: `bd update
+# <id> --status in_progress -q`.
+#
+# Same dual-count style as the ga-nxj7kc scenario immediately above (same two
+# DISPATCH_TASK sites) — a bare grep for "status in_progress" would stay
+# green even if only one of the two sites were fixed, or even on the WHOLLY
+# UNFIXED file, since "status in_progress" is a substring of the fix too.
+BUGGY_STATUS_COUNT=$(grep -cF 'bd -C "$STORY_BEAD_CITY" status in_progress "$STORY_ID"' "$DISPATCHER")
+if [ "$BUGGY_STATUS_COUNT" -eq 0 ]; then
+  ok "ga-gdy2kk: no DISPATCH_TASK site uses the broken 'bd status in_progress <id>' dashboard-verb no-op"
+else
+  bad "ga-gdy2kk: REGRESSION — $BUGGY_STATUS_COUNT DISPATCH_TASK site(s) still use 'bd status in_progress <id>' (silent no-op — the story bead never reaches in_progress)"
+fi
+
+FIXED_STATUS_COUNT=$(grep -cF 'bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --status in_progress -q' "$DISPATCHER")
+if [ "$FIXED_STATUS_COUNT" -eq 2 ]; then
+  ok "ga-gdy2kk: both DISPATCH_TASK 'Claim your work' sites (bug-tier + feature-tier) set status via 'update ... --status in_progress -q'"
+else
+  bad "ga-gdy2kk: expected 2 sites setting status via 'update ... --status in_progress -q', found $FIXED_STATUS_COUNT — one DISPATCH_TASK template may be missing the fix"
+fi
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
