@@ -1,0 +1,12 @@
+# ga-njj5zk: proactive safety net for ga-1ygf6o's next-action:mayor/deacon
+# convention. Detection-only (notify + gc mail send + best-effort bd
+# comment); never labels, reassigns, or closes anything. 15m cadence: the
+# acceptance criterion is "alerted within a few minutes of the label
+# landing", so this needs to run closer to the city's throughput-guard
+# cadence than a slow structural-drift check like stale-persistent-daemon-
+# guard's 30m.
+[order]
+description = "Alert Mayor/deacon proactively when a bead gains next-action:mayor or next-action:deacon"
+trigger = "cooldown"
+interval = "15m"
+exec = "$PACK_DIR/assets/scripts/next-action-coordinator-alert.sh"

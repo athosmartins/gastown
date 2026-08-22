@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# fake-notify — stub for next-action-coordinator-alert.selftest.sh. Records
+# every call so the selftest can assert on notify count instead of paging a
+# real device.
+printf 'NOTIFY %s\n' "$*" >> "${NOTIFY_LOG:-/dev/null}"

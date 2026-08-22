@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# fake-gc — argv-dispatch stub for next-action-coordinator-alert.selftest.sh.
+# Handles exactly the one invocation shape the real script uses:
+#   gc mail send <target> -s <subject> -m <body>
+set -euo pipefail
+
+cmd="${1:-}"; sub="${2:-}"
+case "$cmd $sub" in
+    "mail send")
+        shift 2
+        target="${1:-}"; shift || true
+        subject=""; body=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                -s) subject="$2"; shift 2 ;;
+                -m) body="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        printf 'MAIL %s|||%s\n' "$target" "$subject" >> "${MAIL_LOG:-/dev/null}"
+        {
+            printf '%s\n' "$body"
+            echo "---BODY-END---"
+        } >> "${MAIL_BODY_LOG:-/dev/null}"
+        ;;
+    *)
+        echo "fake-gc: unhandled: $*" >&2
+        exit 1
+        ;;
+esac

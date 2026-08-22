@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# fake-bd — argv-dispatch stub for next-action-coordinator-alert.selftest.sh.
+# Handles exactly the three invocation shapes the real script uses:
+#   bd -C <store> list --status <status> --json --limit 0
+#   bd -C <store> show <id> --json --include-comments
+#   bd -C <store> comment <id> <text>
+# Fixtures are read from files under <store>/ (list-<status>.json,
+# show-<id>.json), so the selftest can give two different fake stores two
+# different bead sets and prove the multi-store loop actually iterates.
+set -euo pipefail
+shift || true   # drop -C
+store="${1:-}"; shift || true
+sub="${1:-}"; shift || true
+
+case "$sub" in
+    list)
+        status=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --status) status="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        f="$store/list-$status.json"
+        if [ -f "$f" ]; then cat "$f"; else echo "[]"; fi
+        ;;
+    show)
+        id="${1:-}"
+        f="$store/show-$id.json"
+        if [ -f "$f" ]; then cat "$f"; else exit 1; fi
+        ;;
+    comment)
+        id="${1:-}"; text="${2:-}"
+        printf 'COMMENT %s %s|||%s\n' "$store" "$id" "$text" >> "${BD_LOG:-/dev/null}"
+        ;;
+    *)
+        echo "fake-bd: unhandled: $sub $*" >&2
+        exit 1
+        ;;
+esac
