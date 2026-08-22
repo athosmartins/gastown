@@ -315,16 +315,26 @@ confirmed equivalent convention yet"), never as a bare unqualified
 "Escalations: N". If any rig's query fails, say so and report N/A for that rig
 rather than treating a query failure as zero.
 
-c) **Warrants filed:** this dog pool's own `mol-shutdown-dance` warrants are not
+c) **Warrants filed** — this dog pool's own `mol-shutdown-dance` warrants are not
 persisted as durable beads, wisp-types, or event-types anywhere in this city —
 confirmed independently across 3+ runs (0 hits via `--label=warrant --all`
-across all 7 rigs, a wisp-type scan, and an event-type scan, every time). Report
-**N/A — warrants are not bead-tracked in this city today**, not a bare 0. This is
-the current best understanding, not a permanent fact exempt from ever
-rechecking — the identical "settled, never recheck" framing on this step's
-Incidents/Escalations sub-items above was itself gate-failed for going stale
-(ga-2c2daa, 2026-08-22): if a future run ever finds a real `--label=warrant
---all` hit anywhere, report the count instead of N/A.
+across all 7 rigs, a wisp-type scan, and an event-type scan, every time). Check
+anyway, every run, same as Incidents/Escalations above — the query costs
+nothing even while it stays empty, and "checked and empty" is a different,
+verifiable fact from "asserted empty with no way left to check":
+```bash
+RIG_PATH=<rig-path>   # from `gc rig list`, one rig at a time
+gc bd -C "$RIG_PATH" list --label=warrant --all --created-after=$SINCE --created-before=$UNTIL --json --limit=0
+```
+Report **N/A — warrants are not bead-tracked in this city today**, not a bare
+0, unless this query actually finds a hit — then report the real count
+instead. This is the current best understanding, not a permanent fact: a
+prior version of this recipe deleted the live check entirely while keeping
+prose that promised a future run would still "find" a hit — an unreachable
+promise with no query left to run it, gate-failed on ga-2c2daa (2026-08-22)
+as the identical "settled, never recheck" shape its own Incidents/Escalations
+fixes exist to eliminate. If any rig's query fails, say so and report N/A for
+that rig rather than treating a query failure as zero.
 
 Close this step when all data is collected."""
 
