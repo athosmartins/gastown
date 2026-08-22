@@ -4411,6 +4411,36 @@ has "$DISPATCHER" '_pilot_emit_dispatchable'        "emit function is defined"
 has "$DISPATCHER" 'PILOT_EMIT_DISPATCHABLE'         "emit env-gate knob is wired"
 has "$DISPATCHER" 'PILOT_DISPATCHABLE_FILE'         "emit output-path seam is wired"
 
+echo "Scenario 19i (ga-abfcdz): the SHIPPED DEFAULT PILOT_DISPATCHABLE_TTL must comfortably exceed the measured real emission-to-emission intervals, not just equal the nominal StartInterval"
+# 11 real consecutive intervals measured live between pilot-dispatchable.json
+# emissions (ga-abfcdz bug report): 975 673 1394 827 863 825 804 950 863 856 823.
+# The OLD default (600s = StartInterval) was LESS than every single one of
+# these — the file was stale by its own ttl_seconds 100% of the time,
+# immediately before every refresh, so approved-state-reconciler.py's
+# starve-alarm cross-check could never confirm a queue position. This exercises
+# run_emit()'s REAL dispatcher run (PILOT_DISPATCHABLE_TTL deliberately left
+# UNSET in run_emit's env -i, so whatever the shipped default actually is
+# lands in the JSON) rather than asserting a hardcoded test literal — proven
+# RED against the pre-fix 600 default (600 < 1394, the measured max) and GREEN
+# against this fix's 1800.
+F19I="$(run_emit)"
+_TTL19I=$(jq -r '.ttl_seconds' "$F19I" 2>/dev/null)
+_MAX_MEASURED=1394
+if [ -n "$_TTL19I" ] && [ "$_TTL19I" -gt "$_MAX_MEASURED" ] 2>/dev/null; then
+  ok "shipped PILOT_DISPATCHABLE_TTL default ($_TTL19I) exceeds the measured max real interval (${_MAX_MEASURED}s) — a fresh emission is reachable, not permanently stale"
+else
+  bad "ga-abfcdz REGRESSION: shipped PILOT_DISPATCHABLE_TTL default ($_TTL19I) does NOT exceed the measured max real interval (${_MAX_MEASURED}s) — consumers can never confirm a fresh read"
+fi
+# Upper sanity bound (ga-00qma2's own lesson, applied here too): a TTL so
+# generous that staleness becomes structurally unreachable is the SAME bug in
+# the other direction — 2h is a generous ceiling that still leaves room for
+# the measured interval (max 1394s) with more than 5x headroom.
+if [ -n "$_TTL19I" ] && [ "$_TTL19I" -lt 7200 ] 2>/dev/null; then
+  ok "shipped PILOT_DISPATCHABLE_TTL default ($_TTL19I) is not so generous that staleness becomes unreachable (< 7200s ceiling, ga-00qma2 lesson)"
+else
+  bad "shipped PILOT_DISPATCHABLE_TTL default ($_TTL19I) is >= 7200s — staleness may be structurally unreachable again, same class as ga-00qma2"
+fi
+
 # ── Scenario 20 (ctx:ready auto-dispatch — PILOT_CTX_READY_QUERIES default-on) ─
 # Athos directive: the Pilot must ALSO pull plain ctx:ready chore/task/debt beads
 # (no story:* label) that fell in no tier and sat idle forever. These four

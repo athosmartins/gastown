@@ -206,6 +206,10 @@ _bd_branch_stranded = None  # (bead_id) -> (repo, ref, age_days)|None; ga-32u6s 
 # selftest scenarios below stub them as gate_queue_backlog.<name>, not a local global.
 _read_pilot_dispatchable_file = None  # () -> dict|None; parsed+freshness-checked
                                         # pilot-dispatchable.json (ga-tky97 test seam)
+_pilot_dispatchable_reason_file = None  # () -> "absent"|"malformed"|"stale"|None
+                                          # (ga-abfcdz test seam for the companion
+                                          # classifier below, independent of the
+                                          # _read_pilot_dispatchable_file seam above)
 _read_pilot_sweep_pause_state_file = None  # () -> dict|None; parsed+freshness-checked
                                              # pilot-sweep-pause-state.json (ga-nq0jo test seam)
 
@@ -982,7 +986,7 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
     else:
         cur_qpos_pos = _pilot_queue_position(bead_id, dispatchable)
         cur_qpos = cur_qpos_pos[0] if cur_qpos_pos is not None else QPOS_ABSENT
-    queue_line = _pilot_queue_body_line(bead_id, dispatchable)
+    queue_line = _pilot_queue_body_line(bead_id, dispatchable, now)
     if alarm_ordinal > 1 and prev_qpos_known:
         def _qpos_desc(q):
             if q == QPOS_UNREADABLE:
@@ -1325,6 +1329,81 @@ def _read_pilot_dispatchable(now):
     return data
 
 
+def _pilot_dispatchable_unreadable_reason(now):
+    """Classify WHY _read_pilot_dispatchable(now) returned None this cycle
+    (ga-abfcdz) — mirrors pilot-dispatcher.sh's _pilot_ram_pressure_unreadable()
+    convention: a companion classifier, duplicated rather than shared, kept
+    pure so a caller can log/render WHICH failure mode occurred without
+    changing _read_pilot_dispatchable's existing dict-or-None contract
+    (already relied on by every other caller and by the embedded selftest's
+    _read_pilot_dispatchable_file seam).
+
+    Returns one of "absent" (file does not exist), "malformed" (exists but
+    fails a shape/field/timestamp check), "stale" (parses fine but
+    now - generated_at > ttl_seconds), or None (file reads fresh and valid —
+    a caller that already knows _read_pilot_dispatchable(now) returned None
+    this same cycle should never see this, but None is returned rather than
+    guessing if called out of that context).
+
+    WHY the distinction matters (root-class:error-vs-empty): "absent" means
+    the Pilot's own emit never ran at all — a real anomaly. "stale" is, as of
+    ga-abfcdz, the COMMON, non-anomalous state (the write-side TTL was
+    raised to 1800s specifically because real emission intervals run
+    673-1394s — even after that fix, an occasional abnormally slow sweep can
+    still legitimately go stale). Collapsing both into one "missing/stale/
+    unreadable" phrase told the same false story either way: it could not
+    say whether the writer is broken or just running a bit slow this cycle.
+
+    ga-abfcdz gate-fix 1 (found live, in this function's OWN selftest run):
+    when _read_pilot_dispatchable_file is stubbed (the OLD, still-common
+    seam style — a scenario simulating dict-or-None abstractly, with no
+    fixture file on disk at all) but no reason-seam was set for that same
+    scenario, falling through to a REAL open() here read whatever this
+    process's PILOT_DISPATCHABLE_FILE actually resolves to — on a live Gas
+    Town machine, that can be the ACTUAL production file, making this
+    "classifier" itself a source of non-hermetic, environment-dependent test
+    results (the exact silent-guess shape this function exists to prevent,
+    reproduced in its own harness). Treat "main seam stubbed, no reason-seam"
+    as reason genuinely UNKNOWN (None) rather than guessing via uncontrolled
+    I/O — callers already fall back to the old generic phrasing when this
+    returns None, so every pre-existing scenario keeps its exact prior
+    behavior untouched.
+    """
+    if _pilot_dispatchable_reason_file is not None:
+        return _pilot_dispatchable_reason_file()   # test seam
+    if _read_pilot_dispatchable_file is not None:
+        return None   # main reader stubbed abstractly; no real file to classify
+    try:
+        with open(PILOT_DISPATCHABLE_FILE) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return "absent"
+    except Exception:
+        return "malformed"
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        return "malformed"
+    gen = data.get("generated_at") or ""
+    ttl = data.get("ttl_seconds")
+    if not gen or not isinstance(ttl, (int, float)):
+        return "malformed"
+    try:
+        gen_epoch = datetime.datetime.strptime(
+            gen[:19], "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+    except Exception:
+        return "malformed"
+    if (now - gen_epoch) > ttl:
+        return "stale"
+    return None
+
+
+_PILOT_DISPATCHABLE_REASON_TEXT = {
+    "absent": "MISSING (file does not exist — the Pilot's own emit may not be running)",
+    "malformed": "MALFORMED (exists but failed a shape/field/timestamp check — possible corruption)",
+    "stale": "STALE (past its own ttl_seconds — the Pilot may simply be mid-sweep; see PILOT_DISPATCHABLE_TTL in pilot-dispatcher.sh)",
+}
+
+
 # ga-nq0jo: same TTL convention as PILOT_DISPATCHABLE_TTL's default (600s =
 # one reconciler sweep interval) — a fixed constant here rather than a field
 # in the JSON itself, since this state is a single flag, not a queue the
@@ -1482,7 +1561,7 @@ def _pilot_queue_suppress_reason(bead_id, dispatchable):
              % (index, ahead_desc, index + 1, total))
 
 
-def _pilot_queue_body_line(bead_id, dispatchable):
+def _pilot_queue_body_line(bead_id, dispatchable, now):
     """Format the Pilot dispatch-queue context line for _alarm_starving's mail
     body (ga-tky97 AC1-AC3) — NEVER silent, NEVER fabricates a position for a
     queue that could not be read (mirrors _gate_queue_body_line's convention).
@@ -1490,12 +1569,22 @@ def _pilot_queue_body_line(bead_id, dispatchable):
     Only reached for a bead _pilot_queue_suppress_reason() did NOT suppress, so
     in practice this only ever describes 'unreadable', 'not found', or 'first'
     — the index>0 branch below is kept for defensive completeness only.
+
+    `now` (ga-abfcdz): only consulted when dispatchable is None, to classify
+    WHY via _pilot_dispatchable_unreadable_reason() — absent/malformed/stale
+    must not share the same phrase (root-class:error-vs-empty); see that
+    function's docstring. Keeps "COULD NOT READ"/"UNCERTAIN" as stable
+    substrings other callers and the embedded selftest already key off of.
     """
     if dispatchable is None:
+        _reason = _pilot_dispatchable_unreadable_reason(now)
+        _reason_text = _PILOT_DISPATCHABLE_REASON_TEXT.get(
+            _reason, "missing/stale/unreadable")
         return ("Pilot dispatch queue (pilot-dispatchable.json): COULD NOT READ "
-                 "(missing/stale/unreadable) — position-based suppression NOT "
+                 "— %s — position-based suppression NOT "
                  "applied; alarm kept but UNCERTAIN: cannot confirm this is a "
-                 "genuine dispatch failure vs. an unread queue position.")
+                 "genuine dispatch failure vs. an unread queue position."
+                 % _reason_text)
     pos = _pilot_queue_position(bead_id, dispatchable)
     total = len(dispatchable.get("items") or [])
     if pos is None:
@@ -2214,9 +2303,14 @@ def run_cycle(now, state):
     # never as "bead not queued".
     dispatchable = _read_pilot_dispatchable(now)
     if dispatchable is None:
-        _log("  pilot-dispatchable.json missing/stale/unreadable — starve-alarm "
+        # ga-abfcdz: absent/malformed/stale must not share one log phrase —
+        # see _pilot_dispatchable_unreadable_reason()'s docstring.
+        _dispatchable_reason = _pilot_dispatchable_unreadable_reason(now)
+        _dispatchable_reason_text = _PILOT_DISPATCHABLE_REASON_TEXT.get(
+            _dispatchable_reason, "missing/stale/unreadable")
+        _log("  pilot-dispatchable.json %s — starve-alarm "
              "queue-position suppression degrades to 'unmeasured' this cycle "
-             "(see ga-tky97)")
+             "(see ga-tky97, ga-abfcdz)" % _dispatchable_reason_text)
 
     # Pilot whole-sweep pause state (ga-nq0jo): also HQ-independent, read once
     # per cycle. None = missing/stale/unreadable; _pilot_sweep_pause_suppress_
@@ -2471,6 +2565,7 @@ def _selftest():
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
     global _bd_blocked, _bd_show_full, _bd_has_built_branch, _bd_branch_stranded
     global _read_pilot_dispatchable_file, _read_pilot_sweep_pause_state_file
+    global _pilot_dispatchable_reason_file
     global DRY_RUN, STARVE_MIN, FLOW_GRACE_MIN, ROUTE_COOLDOWN_SEC, ALARM_COOLDOWN_SEC
     global _OWNERSHIP_REPOS
 
@@ -4159,6 +4254,60 @@ def _selftest():
     else:
         _bad("(ga-tky97-f)", "fresh_result=%r stale_result=%r missing_result=%r" % (
              fresh_result, stale_result, missing_result))
+
+    # (ga-abfcdz-a) the reader's bare None collapses absent/malformed/stale —
+    # this proves the COMPANION classifier tells them apart via REAL file I/O
+    # (both seams off, mirroring ga-tky97-f's own methodology exactly), not
+    # just via a mocked seam.
+    print("\nScenario (ga-abfcdz-a): REAL _pilot_dispatchable_unreadable_reason() "
+          "(both seams OFF) — absent/malformed/stale classified DISTINCTLY, "
+          "never collapsed to one value")
+    _read_pilot_dispatchable_file = None      # un-stub (mirrors ga-tky97-f)
+    _pilot_dispatchable_reason_file = None    # un-stub — force the real function body
+    _tmp_pdr_path = "/tmp/arc-selftest-pilot-dispatchable-reason-%d.json" % os.getpid()
+    _real_pdr_const = PILOT_DISPATCHABLE_FILE
+    globals()["PILOT_DISPATCHABLE_FILE"] = _tmp_pdr_path
+    if os.path.exists(_tmp_pdr_path):
+        os.remove(_tmp_pdr_path)
+    absent_reason = _pilot_dispatchable_unreadable_reason(NOW)
+    with open(_tmp_pdr_path, "w") as _f:
+        _f.write("{not valid json at all")
+    malformed_reason = _pilot_dispatchable_unreadable_reason(NOW)
+    with open(_tmp_pdr_path, "w") as _f:
+        json.dump({"generated_at": _stale_gen, "ttl_seconds": 600, "count": 0,
+                    "items": []}, _f)
+    stale_reason = _pilot_dispatchable_unreadable_reason(NOW)
+    os.remove(_tmp_pdr_path)
+    globals()["PILOT_DISPATCHABLE_FILE"] = _real_pdr_const
+    if absent_reason == "absent" and malformed_reason == "malformed" and stale_reason == "stale":
+        _ok("(ga-abfcdz-a): REAL file I/O correctly classifies all 3 distinctly "
+            "— absent=%r malformed=%r stale=%r (never the same value)" % (
+            absent_reason, malformed_reason, stale_reason))
+    else:
+        _bad("(ga-abfcdz-a)", "absent_reason=%r malformed_reason=%r stale_reason=%r "
+             "(want 'absent'/'malformed'/'stale')" % (
+             absent_reason, malformed_reason, stale_reason))
+
+    # (ga-abfcdz-b) the actual human-facing text must differ too, not just the
+    # internal reason value — this is what a reviewer/Mayor reading the mail
+    # body or the cycle log actually sees.
+    print("\nScenario (ga-abfcdz-b): _pilot_queue_body_line renders DISTINCT "
+          "text for absent vs stale — no longer the same 'missing/stale/"
+          "unreadable' phrase for both (ga-abfcdz)")
+    _pilot_dispatchable_reason_file = lambda: "absent"
+    absent_body = _pilot_queue_body_line("some-bead", None, NOW)
+    _pilot_dispatchable_reason_file = lambda: "stale"
+    stale_body = _pilot_queue_body_line("some-bead", None, NOW)
+    _pilot_dispatchable_reason_file = None
+    if (absent_body != stale_body
+            and "MISSING" in absent_body and "STALE" in stale_body
+            and "COULD NOT READ" in absent_body and "COULD NOT READ" in stale_body
+            and "UNCERTAIN" in absent_body and "UNCERTAIN" in stale_body):
+        _ok("(ga-abfcdz-b): absent and stale render DISTINCT body text (absent "
+            "says MISSING, stale says STALE) while both keep the stable "
+            "'COULD NOT READ'/'UNCERTAIN' substrings older callers key off of")
+    else:
+        _bad("(ga-abfcdz-b)", "absent_body=%r stale_body=%r" % (absent_body, stale_body))
 
     # (ga-tky97-g..j) GATE-FEEDBACK fix (attempt 1 FAIL): qpos=None used to mean
     # both ABSENT (queue read fine, bead not in it) and UNREADABLE (queue snapshot

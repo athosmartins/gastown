@@ -3554,7 +3554,20 @@ _filter_built() {
 # output path (TEST-ONLY seam, mirrors PILOT_CITY_OVERRIDE); production resolves to
 # ~/.gc/pilot-dispatchable.json (HOME is set in the launchd plist).
 PILOT_EMIT_DISPATCHABLE="${PILOT_EMIT_DISPATCHABLE:-1}"
-PILOT_DISPATCHABLE_TTL="${PILOT_DISPATCHABLE_TTL:-600}"
+# ga-abfcdz: the old 600s default equaled StartInterval (com.gascity.pilot.plist)
+# but real emission-to-emission gaps run 673-1394s (11/11 measured samples,
+# see the bead) — the emit call happens after the lock + a bounded Dolt probe
+# + a per-store bd-list query loop, none of which fire at an exact 600s clock
+# edge, so the file was stale by its OWN ttl_seconds 100% of the time,
+# immediately before every refresh. Consumers cross-checking against this
+# file (approved-state-reconciler.py's starve-alarm) could therefore NEVER
+# confirm a queue position — the same shape ga-00qma2 just fixed for the
+# RAM-pressure level file: a small (~2-3x) multiple of the REAL production
+# interval, not the nominal scheduler interval. 1800s comfortably exceeds the
+# measured max (1394s) with margin while still going stale if a sweep is
+# genuinely abnormal (see pilot-dispatcher.selftest.sh's Scenario asserting
+# this against the 11 measured samples, not a hardcoded test literal).
+PILOT_DISPATCHABLE_TTL="${PILOT_DISPATCHABLE_TTL:-1800}"
 PILOT_DISPATCHABLE_FILE="${PILOT_DISPATCHABLE_FILE:-${HOME}/.gc/pilot-dispatchable.json}"
 
 # ga-nq0jo: a SEPARATE small state file recording whether the Pilot exited its
