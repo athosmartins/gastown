@@ -683,14 +683,26 @@ _gap1_city_ready_for_branch_check() {
 # story:approved or doesn't need it.
 _gap1_ensure_lifecycle_backstop() {
   local city="$1" bead_id="$2"
-  local show issue_type has_approved has_tech_debt
-  show=$(bd -C "$city" show "$bead_id" --json 2>/dev/null \
-    | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "")
-  issue_type=$(echo "$show" | jq -r '(.issue_type // .type // "")' 2>/dev/null || echo "")
+  local raw show issue_type has_approved has_tech_debt
+  # ga-bz4nsi third-state guard: a failed/unparseable read must NOT fall
+  # through to the same branch as "read succeeded, bead needs no approval" —
+  # that would stamp story:approved on a bead we never actually verified,
+  # possibly a bug/tech-debt/already-approved one, based on nothing. Default
+  # to inert (no write) whenever the read itself is not trustworthy.
+  raw=$(bd -C "$city" show "$bead_id" --json 2>/dev/null)
+  if [ -z "$raw" ]; then
+    warn "_gap1_ensure_lifecycle_backstop: bd show returned nothing for $bead_id in $city — cannot verify lifecycle state, skipping backstop (ga-bz4nsi third-state guard)"
+    return 1
+  fi
+  show=$(printf '%s' "$raw" | jq -e 'if type=="array" then .[0] else . end' 2>/dev/null) || {
+    warn "_gap1_ensure_lifecycle_backstop: $bead_id's bd show output did not parse as JSON — skipping backstop (ga-bz4nsi third-state guard)"
+    return 1
+  }
+  issue_type=$(printf '%s' "$show" | jq -r '(.issue_type // .type // "")' 2>/dev/null || echo "")
   [ "$issue_type" = "bug" ] && return 0
-  has_tech_debt=$(echo "$show" | jq -r '((.labels // []) | contains(["tech-debt"]))' 2>/dev/null || echo "false")
+  has_tech_debt=$(printf '%s' "$show" | jq -r '((.labels // []) | contains(["tech-debt"]))' 2>/dev/null || echo "false")
   [ "$has_tech_debt" = "true" ] && return 0
-  has_approved=$(echo "$show" | jq -r '((.labels // []) | contains(["story:approved"]))' 2>/dev/null || echo "false")
+  has_approved=$(printf '%s' "$show" | jq -r '((.labels // []) | contains(["story:approved"]))' 2>/dev/null || echo "false")
   [ "$has_approved" = "true" ] && return 0
   warn "$bead_id has no dispatchable lifecycle label after GAP-1 release (type=$issue_type, no tech-debt label, no story:approved) — stamping story:approved so it does not fall into a new invisible limbo (ga-bz4nsi requirement 3)."
   bd -C "$city" label add "$bead_id" "story:approved" -q 2>/dev/null || true

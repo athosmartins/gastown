@@ -137,6 +137,44 @@ _gap1_ensure_lifecycle_backstop /tmp/fake-city fake-bead-bug
   && ok "type=bug: backstop is a no-op (bugs never need story:approved)" \
   || bad "backstop wrongly touched a bug-typed bead: added [$_MOCK_LABEL_ADD_LOG]"
 
+# ga-bz4nsi third-state regression: a failed/unreadable bd show must NOT
+# collapse to "read succeeded, bead needs no approval" — that would stamp
+# story:approved based on nothing (the bead could well be a bug we simply
+# couldn't verify). Swap in a bd() that returns EMPTY on "show" specifically,
+# simulating a Dolt hiccup / unreadable bead, and confirm the backstop stays
+# inert rather than guessing.
+_MOCK_LABEL_ADD_LOG=""
+bd() {
+  local verb="$3"
+  [ "$verb" = "show" ] && { printf ''; return 1; }
+  if [ "$verb" = "label" ]; then
+    local op="$4" lbl="$6"
+    [ "$op" = "add" ] && _MOCK_LABEL_ADD_LOG="$_MOCK_LABEL_ADD_LOG $lbl"
+    return 0
+  fi
+  return 0
+}
+_gap1_ensure_lifecycle_backstop /tmp/fake-city fake-bead-unreadable
+[ -z "$_MOCK_LABEL_ADD_LOG" ] \
+  && ok "bd show failure: backstop stays inert (does not guess story:approved on an unverified bead, ga-bz4nsi third-state guard)" \
+  || bad "REGRESSION: backstop stamped story:approved despite an unreadable bd show — collapsed 'could not verify' into 'confirmed needs approval': added [$_MOCK_LABEL_ADD_LOG]"
+# Restore the full show-capable mock for the remaining cases below.
+bd() {
+  local verb="$3"
+  if [ "$verb" = "show" ]; then
+    local arr="" l
+    for l in $_MOCK_LABELS; do arr="${arr}\"$l\","; done
+    printf '[{"issue_type":"%s","labels":[%s]}]' "$_MOCK_TYPE" "${arr%,}"
+    return 0
+  fi
+  if [ "$verb" = "label" ]; then
+    local op="$4" lbl="$6"
+    [ "$op" = "add" ] && _MOCK_LABEL_ADD_LOG="$_MOCK_LABEL_ADD_LOG $lbl"
+    return 0
+  fi
+  return 0
+}
+
 _MOCK_TYPE="feature"; _MOCK_LABELS="tech-debt"; _MOCK_LABEL_ADD_LOG=""
 _gap1_ensure_lifecycle_backstop /tmp/fake-city fake-bead-techdebt
 [ -z "$_MOCK_LABEL_ADD_LOG" ] \
