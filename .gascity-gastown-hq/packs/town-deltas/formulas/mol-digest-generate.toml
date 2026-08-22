@@ -189,10 +189,12 @@ command and a genuinely quiet rig must never collapse into the same number.
 If a rig shows `?` in the table, say so in Highlights instead of asserting
 no activity happened.
 
-c) **Incidents:**
-```bash
-gc bd list --label=incident --created-after=$SINCE --created-before=$UNTIL --json --limit=0
-```
+c) **Incidents:** this city's `incident` bead label has zero hits, ever, city-wide —
+confirmed independently across 4 separate digest runs (ga-iad7b, ga-avd8g6, ga-8oz9o5,
+plus ga-2c2daa's own investigation thread). It is not part of this city's actual label
+taxonomy. Report **N/A — not bead-tracked in this city**, not a bare 0 (a 0 reads as
+"measured and quiet"; this is "the concept has no tracked data"). Do not re-run
+`gc bd list --label=incident` to re-confirm this each day — it is settled.
 
 **Why every query above needs BOTH bounds:** this formula fires on the
 deacon's cooldown trigger, not a midnight cron — it can run at any
@@ -274,15 +276,29 @@ quiet, and the digest should say so explicitly rather than report a count
 that reads as complete. Tracked separately as a `gc events` capability gap,
 not a recipe bug — see the formula's own bug history for the follow-up.
 
-b) **Escalations:**
+b) **Escalations:** there is no universal `escalation` bead label in this city (0 hits,
+confirmed across 3+ independent runs, including a `--label-pattern '*escalat*'` sweep that
+only found incidental substring matches, e.g. a branch name containing "escalate"). Real
+escalation tracking exists only per-domain, under different conventions — the one confirmed
+convention today is `auto-refino:escalated`, used only in the `deacon` rig (prefix `dc`,
+currently suspended — verified live 2026-08-22 that its bd database is still queryable
+despite suspension):
 ```bash
-gc bd list --label=escalation --created-after=$SINCE --created-before=$UNTIL --json --limit=0
+DEACON_RIG_PATH=<deacon-rig-path>   # from `gc rig list` (prefix dc)
+gc bd -C "$DEACON_RIG_PATH" list --label=auto-refino:escalated --created-after=$SINCE --created-before=$UNTIL --json --limit=0
 ```
+Report this as a labeled partial count ("deacon rig auto-refino escalations: N — no other
+rig has a confirmed equivalent convention yet"), never as a bare city-wide
+"Escalations: N" — that reads as complete while measuring one rig's one convention. If this
+query itself fails, say so and report N/A for this sub-item rather than treating a query
+failure as zero.
 
-c) **Warrants filed:**
-```bash
-gc bd list --label=warrant --created-after=$SINCE --created-before=$UNTIL --json --limit=0
-```
+c) **Warrants filed:** this dog pool's own `mol-shutdown-dance` warrants are not persisted
+as durable beads, wisp-types, or event-types anywhere in this city — confirmed
+independently across 3+ runs (0 hits via `--label=warrant`, a wisp-type scan, and an
+event-type scan, every time). They are ephemeral/nudge-based in the current
+implementation. Report **N/A — warrants are not bead-tracked in this city today**, not a
+bare 0. Do not re-run this query to re-confirm; this is settled.
 
 Close this step when all data is collected."""
 
