@@ -205,7 +205,9 @@ recheck" claim — gate-failed for exactly this (ga-2c2daa, 2026-08-22): every r
 has its own separate bd database (confirmed via `gc rig list` + direct `-C`
 queries), so a city-wide answer needs the per-rig loop above, every run. Expect
 most days to genuinely read 0 — that's a real quiet day, not evidence the label
-is unused.
+is unused. If any rig's query fails, say so and report N/A for that rig rather
+than treating a query failure as zero — same rule as the Escalations query
+below.
 
 **Why every query above needs BOTH bounds:** this formula fires on the
 deacon's cooldown trigger, not a midnight cron — it can run at any
