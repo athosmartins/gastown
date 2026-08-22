@@ -154,6 +154,25 @@ PILOT_ALIVE_WINDOW_MIN = int(os.environ.get("ARC_PILOT_ALIVE_WINDOW_MIN", "20"))
 LOG_TAIL = int(os.environ.get("ARC_LOG_TAIL", "2000"))
 # GATE_LOG_TAIL/GATE_QUEUE_WINDOW_MIN moved to gate_queue_backlog.py (ga-ahn3v) —
 # imported above alongside the 4 gate-queue-backlog functions.
+# PILOT_SWEEP_HISTORY_* (ga-tma6wc): a separate, much larger tail budget + lookback
+# cap for _pilot_sweep_pause_history() — that function answers "how many of the
+# Pilot's sweeps across THIS BEAD'S WHOLE WAIT were a deliberate whole-sweep pause",
+# which can span many hours (a starving bead's age_min), unlike LOG_TAIL's 2000-line
+# budget sized only for PILOT_ALIVE_WINDOW_MIN's ~20min liveness check above.
+# Measured live 2026-08-22 against the real pilot-dispatcher.log: ~150-170 lines
+# between consecutive "Pilot sweep complete" markers under normal load, with one
+# observed burst to ~2427 during a heavy dispatch-decision sweep; 20000 gives
+# multi-day margin under typical load and comfortable same-day margin even across a
+# couple of bursts. Capped separately at 24h of wall-clock lookback so a bead that
+# has been starving for days (e.g. ga-il5hs, 49h) doesn't force an ever-growing read
+# — matches the daily granularity the Mayor's own manual measurement used (ga-tma6wc:
+# "91 sweeps completos" counted over one day). Both are fail-safe in the UNDER
+# direction only: _pilot_sweep_pause_history() returns unmeasurable (None, None)
+# rather than a falsely-low count whenever the read tail doesn't reach back the full
+# window — see that function's own docstring.
+PILOT_SWEEP_HISTORY_TAIL = int(os.environ.get("ARC_PILOT_SWEEP_HISTORY_TAIL", "20000"))
+PILOT_SWEEP_HISTORY_MAX_WINDOW_MIN = int(
+    os.environ.get("ARC_PILOT_SWEEP_HISTORY_MAX_WINDOW_MIN", "1440"))
 FLOW_AUTHORITY_TTL_SEC = int(os.environ.get("ARC_FLOW_AUTHORITY_TTL_SEC", "3600"))
 # Marker label stamped on a bead after its first Step 1b keyword-flag comment. Idempotency
 # gate (ga-1iz2e/AC1): a bead that already carries this label is skipped — comment once,
@@ -186,6 +205,15 @@ _BLOCKED_PATS = [
 # ── log timestamp pattern ─────────────────────────────────────────────────────
 _TS_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
 _PILOT_SWEEP_RE = re.compile(r"Pilot sweep complete:")
+# _PILOT_SWEEP_PAUSED_RE (ga-tma6wc): matches the exact 4 whole-sweep pause/yield
+# reasons pilot-dispatcher.sh logs right where it also calls
+# _pilot_write_sweep_pause_state(1, ...) — quota-limited/ram-pressure/quiet-hours
+# ("... dispatched=0 (paused: ...)") and cross-stage-yield ("... dispatched=0
+# (deferred: ...)"). Deliberately the SAME 4 reasons _pilot_sweep_pause_suppress_
+# reason() already treats as suppression-worthy (ga-nq0jo) — this regex counts
+# HISTORY across many sweeps, that function checks only the latest one.
+_PILOT_SWEEP_PAUSED_RE = re.compile(
+    r"Pilot sweep complete: dispatched=0 \((?:paused|deferred):")
 
 # ── test seams (monkeypatched in --selftest) ───────────────────────────────────
 # These module-level callables let selftests redirect I/O without spawning subprocesses.
@@ -580,6 +608,91 @@ def _is_pilot_alive(now):
     return False
 
 
+def _pilot_sweep_pause_history(now, age_min):
+    """Count how many of the Pilot's logged sweep-completions, within this bead's
+    own wait window (min(age_min, PILOT_SWEEP_HISTORY_MAX_WINDOW_MIN) minutes back
+    from `now`), were a deliberate whole-sweep pause/yield (quota-limited/ram-
+    pressure/quiet-hours/cross-stage-yield — the same 4 reasons
+    _pilot_sweep_pause_suppress_reason() already treats as suppression-worthy for
+    the LATEST sweep, ga-nq0jo; see _PILOT_SWEEP_PAUSED_RE).
+
+    Returns (paused_n, total_m), or (None, None) if unmeasurable — log missing/
+    unreadable, OR the read tail doesn't itself reach back the full window
+    (mirrors _gate_queue_throughput()'s oldest-timestamp completeness check: an
+    undercounted read must never silently report a falsely-low paused fraction —
+    root-class:error-vs-empty, same discipline as every sibling measurement in
+    this file).
+
+    ga-tma6wc: this is a HISTORY/CONTEXT signal, not a suppression — unlike
+    _pilot_sweep_pause_suppress_reason() (latest sweep only, can fully suppress
+    the alarm before it ever fires), this looks back across the bead's WHOLE wait
+    and is only ever used to ANNOTATE an alarm that is firing anyway. Two real
+    alarms (wa-1ccdz age=301min, ga-il5hs age=2954min, both 2026-08-21) each fired
+    for a legitimate CURRENT reason — by the time they fired, the suppress-reason
+    check had already correctly stopped applying (the pause had cleared, the
+    queue-position explanation was exhausted too — verified in
+    .gc/logs/approved-state-reconciler.out: both beads logged correct sweep-pause
+    "no alarm" suppressions for over an hour earlier in the same wait) — but a
+    human reading either alarm in isolation had no way to see that a large chunk
+    of that SAME elapsed age was, in fact, RAM-pressure pause time already caught
+    correctly by earlier cycles. Reading "dispatch path failing" against the
+    bead's full age as if it were 100% unexplained overstates the problem.
+    """
+    window_min = min(age_min, PILOT_SWEEP_HISTORY_MAX_WINDOW_MIN)
+    if _read_pilot_log_lines is not None:
+        lines = _read_pilot_log_lines()   # test seam (shared with _is_pilot_alive)
+    else:
+        lines = _tail(PILOT_LOG, PILOT_SWEEP_HISTORY_TAIL)
+    if not lines:
+        return None, None
+
+    cutoff = now - window_min * 60
+    total = 0
+    paused = 0
+    oldest_epoch = None
+    for line in lines:
+        epoch = _ts_epoch(line)
+        if epoch is None:
+            continue
+        if oldest_epoch is None or epoch < oldest_epoch:
+            oldest_epoch = epoch
+        if epoch < cutoff:
+            continue
+        if not _PILOT_SWEEP_RE.search(line):
+            continue
+        total += 1
+        if _PILOT_SWEEP_PAUSED_RE.search(line):
+            paused += 1
+
+    if oldest_epoch is None or oldest_epoch > cutoff:
+        return None, None  # tail doesn't reach back the full window — unmeasurable
+    if total == 0:
+        return None, None
+    return paused, total
+
+
+def _pilot_sweep_pause_body_line(paused, total):
+    """Format a 'Pilot pausado em N dos últimos M sweeps' context line for the
+    starving alarm's body (ga-tma6wc) — mirrors _gate_queue_body_line()'s
+    convention (gate_queue_backlog.py) of ALWAYS rendering something, NEVER
+    silently omitting a dimension the alarm checked, even when the measurement
+    itself failed or came back a clean zero."""
+    if paused is None or total is None:
+        return ("Pilot sweep-pause history: NÃO MEDIDO (pilot-dispatcher.log "
+                "indisponível, ou o tail lido não cobre toda a janela de espera "
+                "deste bead) — não é possível dizer quanto do atraso acima é "
+                "pausa deliberada do Pilot.")
+    if paused == 0:
+        return ("Pilot sweep-pause history: 0 dos últimos %d sweeps logados "
+                "durante a espera deste bead foram pausados deliberadamente — o "
+                "atraso acima não é explicado por pausa do Pilot." % total)
+    return ("Pilot sweep-pause history: %d dos últimos %d sweeps logados durante "
+            "a espera deste bead foram pausados deliberadamente (RAM pressure, "
+            "cota 5h, quiet-hours ou cross-stage-yield — ver pilot-dispatcher.log) "
+            "— parte do atraso acima é despacho pausado de propósito, não "
+            "necessariamente falha de despacho." % (paused, total))
+
+
 def _pilot_still_held_reason(labels, now):
     """Suppress reason if pilot-dispatcher.sh's _filter_candidates would currently
     treat this bead as held, else None.
@@ -948,17 +1061,34 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
              bead_id, age_min, alarm_ordinal))
         return  # no state update, no mutations
 
+    # PILOT SWEEP-PAUSE HISTORY (ga-tma6wc): measured ONCE here (not inside a
+    # _body_line-style pure formatter, matching gate_depth/gate_throughput's own
+    # measure-once-in-the-caller convention) so both the subject suffix and the
+    # body line below come from the exact same read — see
+    # _pilot_sweep_pause_history()'s docstring for why this is a HISTORY signal,
+    # distinct from the sweep_pause_reason suppression already checked upstream
+    # in _process_store() before this function is ever called.
+    pause_n, pause_m = _pilot_sweep_pause_history(now, age_min)
+    pause_line = _pilot_sweep_pause_body_line(pause_n, pause_m)
+    # Subject stays terse (a notification/inbox-preview surface) — only add the
+    # suffix when there's an actual nonzero count to report; "0/M" or "NÃO
+    # MEDIDO" in a one-line subject would be noise, unlike in the always-explicit
+    # body line above.
+    pause_subject_suffix = (" (Pilot pausado %d/%d sweeps recentes)" % (pause_n, pause_m)
+                             if pause_n else "")
+
     # AC4: repeats are a known-issue heartbeat, not a fresh incident — tag the
     # subject distinctly (filterable/collapsible) and demote notify priority so
     # they don't bury a genuinely different alert class (disk-floor, circuit-
     # break, lca) landing in the same inbox window.
     if alarm_ordinal == 1:
-        subject = ("Reconciler: buildable bead %s starving %dmin — dispatch failing"
-                   % (bead_id, int(age_min)))
+        subject = ("Reconciler: buildable bead %s starving %dmin — dispatch failing%s"
+                   % (bead_id, int(age_min), pause_subject_suffix))
         notify_prio = 4
     else:
         subject = ("Reconciler: buildable bead %s STILL starving %dmin (repeat #%d) "
-                   "— dispatch failing" % (bead_id, int(age_min), alarm_ordinal))
+                   "— dispatch failing%s" % (bead_id, int(age_min), alarm_ordinal,
+                                              pause_subject_suffix))
         notify_prio = 2
 
     # AC2: the old body asserted "This bead has NO explicit non-buildable signal"
@@ -1019,6 +1149,7 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
         "Status: story:approved, age: %dmin, not dispatched, pilot alive, "
         "alarm #%d for this incident\n"
         "%s\n"
+        "%s\n"
         "%s\n\n"
         "This bead matched NONE of this reconciler's known non-buildable signals\n"
         "(blocked-on:*, waiting-on:*, depends-on:*, next-action:*, pool:refused:*,\n"
@@ -1034,8 +1165,8 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
         "   este reconciler ainda não reconhece — ver _process_store()/\n"
         "   _extra_alarm_suppress_reason() em scripts/approved-state-reconciler.py antes\n"
         "   de re-despachar manualmente ou adicionar story:approved de volta.\n"
-    ) % (bead_id, title, int(age_min), alarm_ordinal, gate_line, queue_line, STARVE_MIN, rig_root,
-         bead_id)
+    ) % (bead_id, title, int(age_min), alarm_ordinal, gate_line, queue_line, pause_line,
+         STARVE_MIN, rig_root, bead_id)
 
     notify_msg = ("STARVE ALARM%s: bead %s story:approved há %dmin, pilot alive, "
                   "não despachado — dispatch path failing" % (
@@ -4634,6 +4765,118 @@ def _selftest():
         _bad("(ga-ndh7jm)", "shipped PILOT_SWEEP_PAUSE_TTL_SEC default (%d) is "
              ">= 7200s — staleness may be structurally unreachable again, same "
              "class as ga-00qma2" % PILOT_SWEEP_PAUSE_TTL_SEC)
+
+    # ── ga-tma6wc: sweep-pause HISTORY context on the starving alarm ───────────
+    def _sweep_log_line(epoch, paused_reason=None):
+        ts = time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(epoch))
+        if paused_reason:
+            return ("%s [pilot-dispatcher] === Pilot sweep complete: dispatched=0 "
+                     "(paused: %s) ===" % (ts, paused_reason))
+        return ("%s [pilot-dispatcher] === Pilot sweep complete: dispatched=3 "
+                 "(small_slots=2 big_slots=1) ===" % ts)
+
+    print("\nScenario (ga-tma6wc-a): _pilot_sweep_pause_history() counts paused "
+          "vs total sweeps WITHIN the bead's wait window, correctly EXCLUDING an "
+          "older paused sweep that falls outside it (boundary correctness)")
+    _read_pilot_log_lines = lambda: [
+        _sweep_log_line(NOW - 4000, "ram-pressure"),   # OUTSIDE 60min window — must be excluded
+        _sweep_log_line(NOW - 600),                     # in-window, normal
+        _sweep_log_line(NOW - 500),                     # in-window, normal
+        _sweep_log_line(NOW - 400, "ram-pressure"),      # in-window, paused
+        _sweep_log_line(NOW - 300, "quota-limited"),     # in-window, paused
+        _sweep_log_line(NOW - 200, "quiet-hours"),       # in-window, paused
+        _sweep_log_line(NOW - 100, "ram-pressure"),      # in-window, paused
+    ]
+    paused_a, total_a = _pilot_sweep_pause_history(NOW, 60.0)
+    if (paused_a, total_a) == (4, 6):
+        _ok("(ga-tma6wc-a): 4 paused / 6 total within the 60min window — the "
+            "older paused sweep outside the window was correctly excluded from "
+            "both counts, not just from 'paused'")
+    else:
+        _bad("(ga-tma6wc-a)", "got (paused, total)=(%r, %r), want (4, 6)" % (paused_a, total_a))
+
+    print("\nScenario (ga-tma6wc-b): falsification (root-class:error-vs-empty) — "
+          "tail doesn't reach back the full window → UNMEASURABLE (None, None), "
+          "never a falsely-low count; body line says NÃO MEDIDO, never fabricates 0")
+    _read_pilot_log_lines = lambda: [
+        _sweep_log_line(NOW - 600),
+        _sweep_log_line(NOW - 500),
+        _sweep_log_line(NOW - 400, "ram-pressure"),
+    ]   # oldest line is only 600s back — does NOT reach the 3600s (60min) cutoff
+    paused_b, total_b = _pilot_sweep_pause_history(NOW, 60.0)
+    body_b = _pilot_sweep_pause_body_line(paused_b, total_b)
+    if paused_b is None and total_b is None and "NÃO MEDIDO" in body_b:
+        _ok("(ga-tma6wc-b): incomplete tail → (None, None), body line says NÃO "
+            "MEDIDO — never silently reports a falsely-low paused count")
+    else:
+        _bad("(ga-tma6wc-b)", "got (paused, total)=(%r, %r) body=%r" % (
+             paused_b, total_b, body_b))
+
+    print("\nScenario (ga-tma6wc-c): END-TO-END, mirrors the real wa-1ccdz/"
+          "ga-il5hs repro — a starving bead that is NOT currently suppressed "
+          "(sweep-pause confirmed inactive, no queue-position excuse) still "
+          "alarms (correctly — something IS currently unexplained), but the "
+          "fired alarm's subject+body now NAME the sweep-pause history instead "
+          "of leaving the reader to think the full age is 100% unexplained "
+          "dispatch failure")
+    _read_pilot_sweep_pause_state_file = lambda: {
+        "active": False, "reason": "", "detail": "",
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW)),
+    }
+    _read_pilot_dispatchable_file = lambda: None
+    _bd_approved = lambda root: [_make_bead("ga-tma6wc-c", age_min=70.0)]
+    _read_pilot_log_lines = lambda: [
+        _sweep_log_line(NOW - 4300, "ram-pressure"),   # OUTSIDE 70min window — excluded
+        _sweep_log_line(NOW - 3000, "ram-pressure"),    # in-window, paused
+        _sweep_log_line(NOW - 2000, "ram-pressure"),    # in-window, paused
+        _sweep_log_line(NOW - 1000),                    # in-window, normal
+        _sweep_log_line(NOW - 500),                     # in-window, normal
+        _sweep_log_line(NOW - 100),                     # in-window, normal (also satisfies pilot-alive)
+    ]
+    st = _reset()
+    st["first_seen_approved"]["ga-tma6wc-c"] = NOW - 70.0 * 60
+    run_cycle(NOW, st)
+    fired = [c for c in mail_calls if "ga-tma6wc-c" in c[0]]
+    if fired:
+        subject, body = fired[0]
+        subject_ok = "Pilot pausado 2/5 sweeps recentes" in subject
+        body_ok = "2 dos últimos 5 sweeps" in body and "dispatch failing" in subject
+        if subject_ok and body_ok:
+            _ok("(ga-tma6wc-c): alarm still fires (genuinely unexplained by any "
+                "current suppression) AND subject/body now name the sweep-pause "
+                "history (2/5) instead of presenting the full age as unexplained")
+        else:
+            _bad("(ga-tma6wc-c)", "subject=%r body=%r" % (subject, body))
+    else:
+        _bad("(ga-tma6wc-c)", "expected an alarm (nothing currently suppresses "
+             "this bead) but none fired — mail_calls=%s" % (mail_calls,))
+
+    print("\nScenario (ga-tma6wc-d): falsification — zero paused sweeps measured "
+          "in the window → subject gets NO suffix (no noise on the common case), "
+          "body still explicitly says '0 dos últimos M sweeps' (never silent)")
+    _read_pilot_dispatchable_file = lambda: None
+    _bd_approved = lambda root: [_make_bead("ga-tma6wc-d", age_min=70.0)]
+    _read_pilot_log_lines = lambda: [
+        _sweep_log_line(NOW - 4300),   # OUTSIDE window, satisfies completeness
+        _sweep_log_line(NOW - 3000),
+        _sweep_log_line(NOW - 1000),
+        _sweep_log_line(NOW - 100),
+    ]
+    st = _reset()
+    st["first_seen_approved"]["ga-tma6wc-d"] = NOW - 70.0 * 60
+    run_cycle(NOW, st)
+    fired_d = [c for c in mail_calls if "ga-tma6wc-d" in c[0]]
+    if fired_d:
+        subject_d, body_d = fired_d[0]
+        if ("Pilot pausado" not in subject_d
+                and "0 dos últimos 3 sweeps" in body_d):
+            _ok("(ga-tma6wc-d): zero-paused case adds no subject noise, "
+                "body still explicit ('0 dos últimos 3 sweeps')")
+        else:
+            _bad("(ga-tma6wc-d)", "subject=%r body=%r" % (subject_d, body_d))
+    else:
+        _bad("(ga-tma6wc-d)", "expected an alarm but none fired — "
+             "mail_calls=%s" % (mail_calls,))
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
