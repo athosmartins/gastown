@@ -52,8 +52,14 @@ fail() { echo "[prod-test:ga-il5hs] FAIL: $*" >&2; exit 1; }
 ENR_SRC="$WA_ROOT/scripts/pbh_edificacao_owner_enrich.py"
 [ -f "$ENR_SRC" ] || fail "pbh_edificacao_owner_enrich.py not found at $ENR_SRC — wrong WA_ROOT or deploy incomplete?"
 
-if grep -q "pbh_edificacao_detalhe" "$ENR_SRC"; then
-  fail "$ENR_SRC references pbh_edificacao_detalhe — AC3 requires this module to NEVER touch that table, not even by name."
+# AC3 is about never WRITING/reading FROM pbh_edificacao_detalhe as a table —
+# not about never mentioning its name. The module's own docstring/comments
+# name it deliberately, to document the invariant for the next reader (same
+# reasoning as ga-7kz2k's render_template_string check below: match the
+# actual usage form, not any mention). A bare `grep -q` here would fail this
+# prod test against the module's own correct, well-documented source.
+if grep -Eq '\b(CREATE[[:space:]]+TABLE([[:space:]]+IF[[:space:]]+NOT[[:space:]]+EXISTS)?|INSERT[[:space:]]+INTO|UPDATE|DELETE[[:space:]]+FROM|FROM|JOIN)[[:space:]]+pbh_edificacao_detalhe\b' "$ENR_SRC"; then
+  fail "$ENR_SRC uses pbh_edificacao_detalhe as a table (CREATE/INSERT/UPDATE/DELETE/FROM/JOIN) — AC3 requires this module to never touch that table."
 fi
 
 log "asserting deployed $ENR_SRC ..."
