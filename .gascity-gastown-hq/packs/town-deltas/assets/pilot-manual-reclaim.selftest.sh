@@ -3,13 +3,22 @@
 #
 # Drives the REAL script (packs/town-deltas/assets/pilot-manual-reclaim.sh)
 # with a PATH-stubbed bd that logs every mutation, proving:
-#   1. STALE (bd reclaim flips status to open): pilot:dispatched,
-#      pilot:dispatching, and pilot.dispatched_at are all cleared.
+#   1. STALE (bd reclaim flips status to open, markers actually clear):
+#      pilot:dispatched, pilot:dispatching, and pilot.dispatched_at are all
+#      removed, and the script reports success.
 #   2. NOT-STALE (bd reclaim no-ops, bead still in_progress): NO mutation —
 #      a still-legitimately in-flight bead is never exposed to re-dispatch.
+#   3. MISSING (bad bead id): NO mutation, graceful exit.
+#   4. STUCK (status flips open, but the label/metadata removal doesn't
+#      stick — e.g. a transient Dolt hiccup): the script does NOT claim
+#      success — it verifies the post-state and reports failure honestly
+#      instead of trusting the removal commands' suppressed exit codes.
 #
-# Falsifiable: against a naive "always strip the labels" script, scenario 2
-# would show the same 3 mutations as scenario 1 and its check would fail.
+# Falsifiable: against a naive "always print success after the removal
+# attempts" script (no post-state verification), scenario 4 would still
+# print "markers cleared" and exit 0 — its check would fail. Against a naive
+# "always strip the labels regardless of status" script, scenario 2 would
+# show the same mutations as scenario 1 and its check would fail.
 #
 # Run:  bash packs/town-deltas/assets/pilot-manual-reclaim.selftest.sh
 set -u
@@ -27,7 +36,10 @@ trap 'rm -rf "$WORK"' EXIT
 BINS="$WORK/bin"; MUT="$WORK/mutations.log"; mkdir -p "$BINS"; : >"$MUT"
 export PMR_MUT="$MUT"
 
-# --- stub: bd (logs every mutating call; `show` reflects PMR_SCENARIO) ---
+# --- stub: bd (logs every mutating call; `show` reflects PMR_SCENARIO and
+#     tracks its own call count, since the real script now calls `show`
+#     twice per run: once to check status after reclaim, once to verify
+#     the labels/metadata actually cleared) ---
 cat >"$BINS/bd" <<'EOF'
 #!/usr/bin/env bash
 sub="$1"; shift || true
@@ -36,9 +48,21 @@ case "$sub" in
     echo "MUT reclaim $*" >>"${PMR_MUT}"
     exit 0 ;;
   show)
+    _CF="${PMR_MUT}.showcount"
+    _N=$(( $(cat "$_CF" 2>/dev/null || echo 0) + 1 ))
+    echo "$_N" >"$_CF"
     case "${PMR_SCENARIO:-}" in
-      stale)     echo '[{"id":"'"$1"'","status":"open"}]' ;;
-      not-stale) echo '[{"id":"'"$1"'","status":"in_progress"}]' ;;
+      stale)
+        if [ "$_N" -eq 1 ]; then
+          echo '[{"id":"'"$1"'","status":"open","labels":["pilot:dispatched","pilot:dispatching"],"metadata":{"pilot.dispatched_at":"123"}}]'
+        else
+          echo '[{"id":"'"$1"'","status":"open","labels":[],"metadata":{}}]'
+        fi ;;
+      stuck)
+        # status flips open, but the markers never actually clear (simulates
+        # a transient failure in the label-remove/metadata-unset commands)
+        echo '[{"id":"'"$1"'","status":"open","labels":["pilot:dispatched"],"metadata":{}}]' ;;
+      not-stale) echo '[{"id":"'"$1"'","status":"in_progress","labels":["pilot:dispatched"],"metadata":{}}]' ;;
       missing)   echo '[]' ;;
     esac
     exit 0 ;;
@@ -54,11 +78,13 @@ EOF
 chmod +x "$BINS"/*
 
 run_script() {
+  rm -f "${MUT}.showcount"
   PMR_SCENARIO="$1" PATH="$BINS:$PATH" bash "$SCRIPT" "gt-testbead" >"$WORK/out.log" 2>"$WORK/err.log"
   echo $?
 }
 
-# STALE: reclaim flips status open -> all 3 Pilot markers cleared
+# STALE: reclaim flips status open, removal verified -> all 3 markers
+# cleared AND the script reports success.
 : >"$MUT"
 rc=$(run_script stale)
 labels_cleared=0
@@ -68,6 +94,7 @@ grep -q 'MUT update gt-testbead --unset-metadata pilot.dispatched_at' "$MUT" && 
 labels_cleared=1
 ck "STALE: exit code 0" 0 "$rc"
 ck "STALE: all 3 Pilot claim markers cleared" 1 "$labels_cleared"
+ck "STALE: reports success" 1 "$(grep -qc 'markers cleared' "$WORK/out.log" >/dev/null 2>&1 && echo 1 || echo 0)"
 
 # NOT-STALE: reclaim no-ops (still in_progress) -> NO label/metadata mutation
 : >"$MUT"
@@ -85,6 +112,15 @@ no_mutation_missing=1
 [ -s "$MUT" ] && grep -qE '^MUT (label|update) ' "$MUT" && no_mutation_missing=0
 ck "MISSING: exit code 0 (graceful, no crash)" 0 "$rc"
 ck "MISSING: no Pilot claim marker touched" 1 "$no_mutation_missing"
+
+# STUCK: status flips open, but the markers never actually clear -> the
+# script must NOT claim success. This is the case a naive "|| true and
+# print cleared unconditionally" implementation gets wrong.
+: >"$MUT"
+rc=$(run_script stuck)
+ck "STUCK: exit code 1 (does not silently succeed)" 1 "$rc"
+ck "STUCK: does NOT claim markers cleared" 0 "$(grep -qc 'markers cleared' "$WORK/out.log" >/dev/null 2>&1 && echo 1 || echo 0)"
+ck "STUCK: reports which marker is still present" 1 "$(grep -qc 'pilot:dispatched' "$WORK/err.log" >/dev/null 2>&1 && echo 1 || echo 0)"
 
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

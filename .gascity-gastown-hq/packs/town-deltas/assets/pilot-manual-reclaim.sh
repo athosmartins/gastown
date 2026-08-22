@@ -43,12 +43,27 @@ BD=(bd)
 STATUS=$("${BD[@]}" show "$BEAD_ID" --json 2>/dev/null | jq -r '.[0].status // empty' 2>/dev/null)
 
 if [ "$STATUS" != "open" ]; then
-  echo "pilot-manual-reclaim: $BEAD_ID is not open after reclaim (status=${STATUS:-unknown}) — lease was not stale, nothing reclaimed. Pilot claim markers left untouched." >&2
+  echo "pilot-manual-reclaim: $BEAD_ID is not open after reclaim (status=${STATUS:-unknown}) — reclaim did not confirm a state change (lease not stale, bead not found, or read failed). Pilot claim markers left untouched." >&2
   exit 0
 fi
 
 "${BD[@]}" label remove "$BEAD_ID" "pilot:dispatched"  -q 2>/dev/null || true
 "${BD[@]}" label remove "$BEAD_ID" "pilot:dispatching" -q 2>/dev/null || true
 "${BD[@]}" update "$BEAD_ID" --unset-metadata "pilot.dispatched_at" -q 2>/dev/null || true
+
+# Verify the actual post-state rather than trusting the removal commands'
+# exit codes (suppressed above with `|| true` since "label was never set" is
+# a harmless non-error case too) — don't claim "cleared" unless it is.
+REMAINING=$("${BD[@]}" show "$BEAD_ID" --json 2>/dev/null | jq -r '
+  .[0] as $b
+  | ([($b.labels // [])[] | select(. == "pilot:dispatched" or . == "pilot:dispatching")]
+     + (if (($b.metadata["pilot.dispatched_at"] // "") != "") then ["pilot.dispatched_at"] else [] end))
+  | join(",")
+' 2>/dev/null)
+
+if [ -n "$REMAINING" ]; then
+  echo "pilot-manual-reclaim: $BEAD_ID reclaimed (status=open) but could NOT confirm all Pilot claim markers cleared — still present: $REMAINING. Retry the label/metadata removal manually." >&2
+  exit 1
+fi
 
 echo "pilot-manual-reclaim: $BEAD_ID reclaimed (status=open) and Pilot claim markers cleared — visible to Pilot re-dispatch again."
