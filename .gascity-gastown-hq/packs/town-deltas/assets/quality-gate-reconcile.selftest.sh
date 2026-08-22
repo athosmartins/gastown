@@ -393,6 +393,26 @@ eq "branch state unknown → safe-skip"      "$(classify_inflight_gap1 open   0 
 eq "live builder trumps merged branch"     "$(classify_inflight_gap1 open   0 1 1)"   "skip:live-builder"
 eq "already-handled before live check"     "$(classify_inflight_gap1 closed 0 1 1)"   "skip:already-handled"
 
+# ── 5b. classify_inflight_gap1 "none" (ga-bz4nsi 3rd form: never-branched) ───
+# wa-qfb6j (P0): open + story:in-flight + no live assignee + no gate:passed +
+# no pilot:dispatched + NO branch ever created. Pre-fix, the caller never even
+# reached classify_inflight_gap1 for this shape (it unconditionally hardcoded
+# `continue` on empty branch search) — so "none" used to fall through this
+# function's own `*` case as skip:indeterminate too. Locking strip:no-branch
+# as a THIRD, distinct outcome from skip:not-merged is the regression this
+# guards: collapsing the two would either abandon a bead whose branch is
+# genuinely still being built (skip:not-merged's job) or permanently ignore a
+# bead that never started (strip:no-branch's job).
+echo "── 5b. classify_inflight_gap1 'none' — never-branched (ga-bz4nsi) ──"
+eq "no branch ever created, no live builder → strip:no-branch"  "$(classify_inflight_gap1 open   0 0 none)" "strip:no-branch"
+eq "live builder still wins over 'none'"                        "$(classify_inflight_gap1 open   0 1 none)" "skip:live-builder"
+eq "closed still wins over 'none'"                               "$(classify_inflight_gap1 closed 0 0 none)" "skip:already-handled"
+eq "gate:passed still wins over 'none'"                          "$(classify_inflight_gap1 open   1 0 none)" "skip:already-handled"
+eq "'none' is NOT the same outcome as not-merged (0)" "$(classify_inflight_gap1 open 0 0 none)" "strip:no-branch"
+[ "$(classify_inflight_gap1 open 0 0 0)" != "$(classify_inflight_gap1 open 0 0 none)" ] \
+  && ok "skip:not-merged and strip:no-branch are distinct outcomes (a real building branch is never released)" \
+  || bad "REGRESSION: 'not merged yet' and 'never branched' collapsed to the same outcome — would abandon real in-progress work"
+
 # ── 6. classify_parent_gap2 (ga-pa36 GAP-2: parent-story stranding) ──────────
 # Signature: classify_parent_gap2 <has_pilot_dispatched> <has_live_assignee> <sling_found> <sling_needs_fix> <sling_closed> [sling_refused]
 echo "── 6. classify_parent_gap2 (GAP-2: parent-story stranding) ──"

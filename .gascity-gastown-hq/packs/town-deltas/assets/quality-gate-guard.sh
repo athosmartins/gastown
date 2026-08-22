@@ -2811,6 +2811,134 @@ if [ "$ORPHAN_VERDICT_COUNT" -gt 0 ]; then
   done
 fi
 
+# ── Step 0b (ga-bz4nsi): rig-DB sweep for orphaned story:in-flight ──────────
+# Step 0c/0c.1 below only ever scan $GC_CITY (HQ). A rig-native bead (wa-*,
+# ps-*, ...) accumulating either shape of orphaned story:in-flight — closed/
+# gate:passed (ga-3h8l) or never-branched (GAP-1 3rd form, ga-bz4nsi) — was
+# invisible to this whole reconciler, independent of which shape it matched.
+# wa-qfb6j (the P0 that motivated this bead) is exactly this: a
+# whatsapp_automation-native bead, not an HQ one.
+#
+# This block mirrors Step 0c + the never-branched half of Step 0c.1 for every
+# non-HQ rig, using its OWN, distinctly-prefixed (RIGSCAN_) variables — it
+# must NOT reuse INFLIGHT_JSON/INFLIGHT_COUNT/GAP1_IDS/etc, which Step 0c.2
+# (GAP-2) further below reads back out expecting Step 0c.1's LAST-COMPUTED
+# (HQ) values. The merged-branch half of GAP-1 (strip:merged) is deliberately
+# NOT ported here yet: it relies on guard_content_merged(), which still
+# hardcodes $GC_CITY internally and is locked by an exact-string drift-guard
+# in gate-guard-gap1-content-merge-check.selftest.sh. This is a documented
+# follow-up, not a correctness gap today — a foreign rig SHA checked against
+# gascity-hq's own repo simply never resolves, so it safely degrades to
+# "not merged" (this block just logs and skips once a branch IS found,
+# rather than risk a false "merged" from the wrong repo).
+#
+# Fail-open: a `gc rig list` hiccup here skips rig scanning for this sweep
+# only — HQ's own Step 0c/0c.1 below run regardless, exactly as before.
+RIGSCAN_JSON=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json) || true
+RIGSCAN_PATHS=""
+if [ -n "$RIGSCAN_JSON" ]; then
+  RIGSCAN_PATHS=$(printf '%s' "$RIGSCAN_JSON" | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null || echo "")
+fi
+
+for RIGSCAN_CITY in $RIGSCAN_PATHS; do
+  [ -d "$RIGSCAN_CITY" ] || continue
+
+  log "Checking for orphaned story:in-flight labels (ga-3h8l reconciler, rig=$RIGSCAN_CITY)..."
+
+  RIGSCAN_INFLIGHT_JSON=$(bd -C "$RIGSCAN_CITY" list --json --all \
+    -l "story:in-flight" \
+    -n 0 \
+    2>/dev/null || echo "[]")
+  RIGSCAN_INFLIGHT_COUNT=$(echo "$RIGSCAN_INFLIGHT_JSON" | jq 'length' 2>/dev/null || echo "0")
+
+  if [ "$RIGSCAN_INFLIGHT_COUNT" -gt 0 ]; then
+    RIGSCAN_ORPHAN_IDS=$(echo "$RIGSCAN_INFLIGHT_JSON" | jq -r '
+      .[] |
+      select(
+        .status == "closed" or
+        ((.labels // []) | contains(["gate:passed"]))
+      ) | .id' 2>/dev/null || echo "")
+
+    for RIGSCAN_ORP_ID in $RIGSCAN_ORPHAN_IDS; do
+      [ -z "$RIGSCAN_ORP_ID" ] && continue
+      warn "Stripping orphaned story:in-flight from $RIGSCAN_ORP_ID (ga-3h8l reconciler: closed or gate:passed, rig=$RIGSCAN_CITY)"
+      bd -C "$RIGSCAN_CITY" label remove "$RIGSCAN_ORP_ID" "story:in-flight" -q 2>/dev/null || true
+      bd -C "$RIGSCAN_CITY" comment "$RIGSCAN_ORP_ID" "ga-3h8l reconciler: stripped orphaned story:in-flight (bead is closed or carries gate:passed — lane slot was permanently leaked). Self-healed." 2>/dev/null || true
+    done
+  fi
+
+  log "Step 0c.1 (ga-pa36 GAP-1, never-branched sub-case): sweep never-branched story:in-flight beads (rig=$RIGSCAN_CITY)..."
+
+  if [ "$RIGSCAN_INFLIGHT_COUNT" -gt 0 ]; then
+    RIGSCAN_GAP1_IDS=$(echo "$RIGSCAN_INFLIGHT_JSON" | jq -r '
+      .[] |
+      select(
+        .status != "closed" and
+        ((.labels // []) | contains(["gate:passed"]) | not) and
+        ((.labels // []) | contains(["pilot:dispatched"]) | not)
+      ) | .id' 2>/dev/null || echo "")
+
+    if [ -n "$RIGSCAN_GAP1_IDS" ]; then
+      RIGSCAN_GIT_READY=0
+      _gap1_city_ready_for_branch_check "$RIGSCAN_CITY" && RIGSCAN_GIT_READY=1
+
+      for RIGSCAN_OI_ID in $RIGSCAN_GAP1_IDS; do
+        [ -z "$RIGSCAN_OI_ID" ] && continue
+
+        RIGSCAN_OI_SHOW=$(bd -C "$RIGSCAN_CITY" show "$RIGSCAN_OI_ID" --json 2>/dev/null \
+          | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "")
+        RIGSCAN_OI_ASSIGNEE=$(echo "$RIGSCAN_OI_SHOW" | jq -r '.assignee // ""' 2>/dev/null || echo "")
+
+        RIGSCAN_HAS_LIVE_ASSIGNEE=0
+        if [ -n "$RIGSCAN_OI_ASSIGNEE" ] && [ "$RIGSCAN_OI_ASSIGNEE" != "null" ]; then
+          RIGSCAN_SESSION_JSON=$(bash "$GC_CITY/scripts/gc-session-list-cached.sh" 2>/dev/null || echo "{}")
+          [ "$(session_matches_author "$RIGSCAN_OI_ASSIGNEE" "$RIGSCAN_SESSION_JSON")" = "1" ] && RIGSCAN_HAS_LIVE_ASSIGNEE=1
+        fi
+
+        RIGSCAN_ACTION=$(classify_inflight_gap1 "open" "0" "$RIGSCAN_HAS_LIVE_ASSIGNEE" "unknown")
+        if [ "$RIGSCAN_ACTION" = "skip:live-builder" ]; then
+          log "GAP-1: $RIGSCAN_OI_ID has live assignee ($RIGSCAN_OI_ASSIGNEE) — safe-skip (rig=$RIGSCAN_CITY)"
+          continue
+        fi
+
+        if [ "$RIGSCAN_GIT_READY" != "1" ]; then
+          log "GAP-1: $RIGSCAN_OI_ID — git not usable for rig=$RIGSCAN_CITY (no work tree or no origin remote) — cannot verify branch existence, safe-skip (ga-bz4nsi)"
+          continue
+        fi
+
+        RIGSCAN_BRANCH_SHA=""
+        for RIGSCAN_PAT in "refs/heads/fix/${RIGSCAN_OI_ID}" "refs/heads/fix/${RIGSCAN_OI_ID}-*" \
+                   "refs/heads/feature/${RIGSCAN_OI_ID}" "refs/heads/feature/${RIGSCAN_OI_ID}-*"; do
+          RIGSCAN_SHA=$(git -C "$RIGSCAN_CITY" ls-remote origin "$RIGSCAN_PAT" 2>/dev/null | head -1 | awk '{print $1}')
+          if [ -z "$RIGSCAN_SHA" ]; then
+            RIGSCAN_RREF="${RIGSCAN_PAT/refs\/heads\//refs\/remotes\/origin\/}"
+            RIGSCAN_SHA=$(git -C "$RIGSCAN_CITY" for-each-ref --format='%(objectname)' "$RIGSCAN_RREF" 2>/dev/null | head -1)
+          fi
+          [ -n "$RIGSCAN_SHA" ] && { RIGSCAN_BRANCH_SHA="$RIGSCAN_SHA"; break; }
+        done
+
+        if [ -n "$RIGSCAN_BRANCH_SHA" ]; then
+          log "GAP-1: $RIGSCAN_OI_ID has branch tip $RIGSCAN_BRANCH_SHA (rig=$RIGSCAN_CITY) — merged-branch detection for rigs is a documented follow-up (ga-bz4nsi), skip for now"
+          continue
+        fi
+
+        RIGSCAN_ACTION=$(classify_inflight_gap1 "open" "0" "$RIGSCAN_HAS_LIVE_ASSIGNEE" "none")
+        case "$RIGSCAN_ACTION" in
+          strip:no-branch)
+            warn "GAP-1: $RIGSCAN_OI_ID has no branch matching fix/$RIGSCAN_OI_ID* or feature/$RIGSCAN_OI_ID*, no live assignee, no gate:passed, no pilot:dispatched (rig=$RIGSCAN_CITY) — never actually started, stripping story:in-flight (ga-bz4nsi)"
+            bd -C "$RIGSCAN_CITY" comment "$RIGSCAN_OI_ID" "ga-bz4nsi GAP-1 reconciler: stripped orphaned story:in-flight — no fix/feature branch was ever found for this bead, no live assignee, no gate:passed, no pilot:dispatched. This is the never-started shape (not merged-and-forgotten): the lane slot was leaked before any build began. Self-healed." 2>/dev/null || true
+            bd -C "$RIGSCAN_CITY" label remove "$RIGSCAN_OI_ID" "story:in-flight" -q 2>/dev/null || true
+            _gap1_ensure_lifecycle_backstop "$RIGSCAN_CITY" "$RIGSCAN_OI_ID"
+            ;;
+          *)
+            log "GAP-1: $RIGSCAN_OI_ID action=$RIGSCAN_ACTION — skip (rig=$RIGSCAN_CITY)"
+            ;;
+        esac
+      done
+    fi
+  fi
+done
+
 # ── Step 0c: ga-3h8l — sweep orphaned story:in-flight labels ─────────────────
 # story:in-flight is the Pilot's lane-occupancy signal. It is stripped at merge
 # (gate PASS+merge dispatcher path) as of ga-3h8l. But beads can accumulate
