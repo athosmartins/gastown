@@ -58,7 +58,11 @@ LOCKDIR="${HESL_LOCKDIR:-${HOME}/.gastown/run/.heavy-eval-stagger.lock.d}"
 LOCK_STALE_MIN="${HESL_LOCK_STALE_MIN:-360}"
 
 RAM_LEVEL_FILE="${HESL_RAM_LEVEL_FILE:-${HOME}/.gastown/run/ram-pressure-monitor.level}"
-RAM_MAX_AGE_SECS="${HESL_RAM_MAX_AGE_SECS:-7200}"   # mirrors PILOT_RAM_MAX_AGE_SECS (pilot-dispatcher.sh)
+# ga-00qma2: mirrors PILOT_RAM_MAX_AGE_SECS (pilot-dispatcher.sh) — 3x the
+# monitor's now-600s StartInterval, not the old 7200 (2x the monitor's old
+# 3600s interval, which made staleness unreachable; see pilot-dispatcher.sh's
+# fuller comment on this same constant for the full rationale).
+RAM_MAX_AGE_SECS="${HESL_RAM_MAX_AGE_SECS:-1800}"
 
 MAX_WAIT_SECS="${HESL_MAX_WAIT_SECS:-14400}"   # 4h bound; giving up skips this cycle, next scheduled fire retries
 POLL_SECS="${HESL_POLL_SECS:-60}"

@@ -48,7 +48,11 @@ LOG="${CCC_LOG:-${CITY}/.gc/logs/crew-capacity-containment.log}"
 RUN_DIR="${CCC_RUN_DIR:-${HOME}/.gastown/run}"
 
 RAM_LEVEL_FILE="${CCC_RAM_LEVEL_FILE:-${RUN_DIR}/ram-pressure-monitor.level}"
-RAM_MAX_AGE_SECS="${CCC_RAM_MAX_AGE_SECS:-7200}"   # mirrors PILOT_RAM_MAX_AGE_SECS
+# ga-00qma2: mirrors PILOT_RAM_MAX_AGE_SECS (pilot-dispatcher.sh) — 3x the
+# monitor's now-600s StartInterval, not the old 7200 (2x the monitor's old
+# 3600s interval, which made staleness unreachable; see pilot-dispatcher.sh's
+# fuller comment on this same constant for the full rationale).
+RAM_MAX_AGE_SECS="${CCC_RAM_MAX_AGE_SECS:-1800}"
 
 # StartInterval=600s launchd jobs do NOT wait for the prior run to finish
 # before starting a new one -- a slow cycle (more named crews over time, or

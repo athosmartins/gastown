@@ -7340,6 +7340,32 @@ if [ "$ABSENT_RPU" != "$STALE_RPU" ]; then
 else
   bad "ga-cgls6 REGRESSION: absent and stale collapsed to the SAME output ('$ABSENT_RPU')"
 fi
+
+echo "Scenario 26a-3: ga-00qma2 — the SHIPPED DEFAULT PILOT_RAM_MAX_AGE_SECS must make a 59min-old reading STALE, not authoritative (monitor now runs every 600s; a reading this old predates ~6 sampling cycles)"
+# Unlike 26a/26a-2 above (which hardcode PILOT_RAM_MAX_AGE_SECS=7200 to test
+# the DECISION functions in isolation), this scenario extracts the dispatcher's
+# own top-level default-assignment line and evals it with the var unset, so it
+# exercises whatever value actually ships — the exact thing ga-00qma2's AC3
+# asks to prove was broken (a 59min/3540s-old reading was silently treated as
+# fresh because 3540 < the old 7200s bound).
+_RPB_DEFAULT_LINE="$(grep -E '^PILOT_RAM_MAX_AGE_SECS=' "$DISPATCHER")"
+[ -n "$_RPB_DEFAULT_LINE" ] || bad "ga-00qma2 setup: could not find PILOT_RAM_MAX_AGE_SECS default line in $DISPATCHER"
+_rpb_shipped_default() { # $1=level $2=age_offset_secs — level+unreadable using the file's own default, not a test literal
+  ( unset PILOT_RAM_MAX_AGE_SECS
+    eval "$_RPB_DEFAULT_LINE"
+    eval "$_RPB_FN"
+    eval "$_RPU_FN"
+    PILOT_RAM_PRESSURE_OVERRIDE=""
+    printf '%s\n%s\n' "$1" "$(( $(date +%s) - ${2:-0} ))" > "$_RPB_LVL"
+    PILOT_RAM_LEVEL_FILE="$_RPB_LVL" _pilot_ram_pressure_blocks
+    printf ' '
+    PILOT_RAM_LEVEL_FILE="$_RPB_LVL" _pilot_ram_pressure_unreadable
+  )
+}
+_R59=$(_rpb_shipped_default WARN 3540)
+[ "$_R59" = "0 1" ] && ok "shipped default: a 59min-old WARN reading reads as STALE (blocks='0' fail-open, unreadable='1' visible) — got '$_R59'" || bad "ga-00qma2 REGRESSION: shipped default still treats a 59min-old WARN reading as fresh (want blocks='0' unreadable='1', got '$_R59')"
+_O59=$(_rpb_shipped_default OK 3540)
+[ "$_O59" = "0 1" ] && ok "shipped default: a 59min-old OK reading is flagged unreadable ('couldn't tell' must stay visible even when the last-known level was calm) — got '$_O59'" || bad "ga-00qma2 REGRESSION: shipped default silently trusts a 59min-old OK reading as current (want blocks='0' unreadable='1', got '$_O59')"
 rm -f "$_RPB_LVL"
 
 echo "Scenario 26b-d: RAM-pressure back-off wired into the REAL sweep (DRY_RUN, SHIMBIN)"

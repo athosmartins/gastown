@@ -174,15 +174,27 @@ PILOT_QUOTA_ETA_OVERRIDE="${PILOT_QUOTA_ETA_OVERRIDE:-}"
 # which queries Dolt directly, so an unreadable Dolt probe usually means Dolt
 # itself is too slow to answer). Gating city-wide dispatch on an unrelated
 # cron/parsing failure would be a new single point of failure worse than the
-# incident this guards against. Stale bound defaults to 2x the monitor's own
-# hourly StartInterval — generous margin over one delayed run while still
-# catching "the monitor stopped running entirely".
+# incident this guards against.
+#
+# ga-00qma2: the monitor's own StartInterval was 3600s (hourly) against this
+# sweep's 600s cadence, with a 7200s stale bound — exactly 2x the monitor's
+# interval, so a reading could be up to ~60min behind reality and STILL read
+# as "fresh" (60min < 7200s). Since the thrash this gate exists to catch rises
+# in *minutes* (measured: swapin 17x its own WARN threshold inside one
+# sampling window), staleness was structurally unreachable in normal
+# operation and the fail-open/UNREADABLE path below was dead code. Fixed by
+# moving the monitor's own StartInterval down to 600s (matches this sweep's
+# cadence — single owner of the measurement, ga-00qma2 ask #1) and tightening
+# this bound to a small (3x) multiple of that REAL interval, not the old one.
+# 1800s still absorbs a single delayed monitor run (the original margin's
+# intent) while making "the monitor stalled" or "this reading predates the
+# last ~30min of reality" both reachable, loggable states again.
 #
 # PILOT_RAM_PRESSURE_OVERRIDE is a TEST-ONLY seam (mirrors PILOT_QUOTA_OVERRIDE):
 # "WARN"/"EMERGENCY" = blocks, anything else (including unset) = does not.
 # Never set in prod.
 PILOT_RAM_LEVEL_FILE="${PILOT_RAM_LEVEL_FILE:-${HOME}/.gastown/run/ram-pressure-monitor.level}"
-PILOT_RAM_MAX_AGE_SECS="${PILOT_RAM_MAX_AGE_SECS:-7200}"
+PILOT_RAM_MAX_AGE_SECS="${PILOT_RAM_MAX_AGE_SECS:-1800}"
 PILOT_RAM_PRESSURE_OVERRIDE="${PILOT_RAM_PRESSURE_OVERRIDE:-}"
 
 # ga-dxyvxr: quiet-hours admission gate (00h-08h, Athos 2026-08-16) — shared
