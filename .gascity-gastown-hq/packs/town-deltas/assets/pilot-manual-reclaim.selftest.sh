@@ -64,6 +64,22 @@ case "$sub" in
         echo '[{"id":"'"$1"'","status":"open","labels":["pilot:dispatched"],"metadata":{}}]' ;;
       not-stale) echo '[{"id":"'"$1"'","status":"in_progress","labels":["pilot:dispatched"],"metadata":{}}]' ;;
       missing)   echo '[]' ;;
+      verify-empty)
+        # status flips open on the 1st read; the 2nd read (post-removal
+        # verification) returns NOTHING — simulates a transient Dolt read
+        # hiccup on exactly the call the gt-1kkgu gate-fail was about.
+        if [ "$_N" -eq 1 ]; then
+          echo '[{"id":"'"$1"'","status":"open","labels":["pilot:dispatched","pilot:dispatching"],"metadata":{"pilot.dispatched_at":"123"}}]'
+        fi ;;
+      verify-garbage)
+        # status flips open on the 1st read; the 2nd read returns a
+        # not-found-shaped error object instead of a 1-element array (the
+        # real bd show response shape observed live for an unreadable id).
+        if [ "$_N" -eq 1 ]; then
+          echo '[{"id":"'"$1"'","status":"open","labels":["pilot:dispatched","pilot:dispatching"],"metadata":{"pilot.dispatched_at":"123"}}]'
+        else
+          echo '{"error":"no issue found","schema_version":1}'
+        fi ;;
     esac
     exit 0 ;;
   label)
@@ -121,6 +137,27 @@ rc=$(run_script stuck)
 ck "STUCK: exit code 1 (does not silently succeed)" 1 "$rc"
 ck "STUCK: does NOT claim markers cleared" 0 "$(grep -qc 'markers cleared' "$WORK/out.log" >/dev/null 2>&1 && echo 1 || echo 0)"
 ck "STUCK: reports which marker is still present" 1 "$(grep -qc 'pilot:dispatched' "$WORK/err.log" >/dev/null 2>&1 && echo 1 || echo 0)"
+
+# VERIFY-EMPTY: status flips open and the label/metadata removal calls DO
+# fire, but the post-removal verification read (2nd bd show) returns
+# nothing — simulating a transient Dolt read hiccup. The script must not
+# collapse "confirmed zero remaining" and "could not read the confirmation"
+# into the same success claim (the gate-failed bug from gt-1kkgu attempt 1;
+# none of the 4 scenarios above exercise a failing 2nd read — MISSING fails
+# at the earlier STATUS gate before the verification read ever runs).
+: >"$MUT"
+rc=$(run_script verify-empty)
+ck "VERIFY-EMPTY: exit code 1 (does not silently succeed)" 1 "$rc"
+ck "VERIFY-EMPTY: does NOT claim markers cleared" 0 "$(grep -qc 'markers cleared' "$WORK/out.log" >/dev/null 2>&1 && echo 1 || echo 0)"
+
+# VERIFY-GARBAGE: same setup, but the 2nd read returns a not-found-shaped
+# error object instead of empty output or a 1-element array. Exercises the
+# jq-parse-failure guard specifically (distinct code path from the
+# empty-string guard above).
+: >"$MUT"
+rc=$(run_script verify-garbage)
+ck "VERIFY-GARBAGE: exit code 1 (does not silently succeed)" 1 "$rc"
+ck "VERIFY-GARBAGE: does NOT claim markers cleared" 0 "$(grep -qc 'markers cleared' "$WORK/out.log" >/dev/null 2>&1 && echo 1 || echo 0)"
 
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

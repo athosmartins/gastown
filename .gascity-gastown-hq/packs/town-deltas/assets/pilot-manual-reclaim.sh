@@ -53,13 +53,32 @@ fi
 
 # Verify the actual post-state rather than trusting the removal commands'
 # exit codes (suppressed above with `|| true` since "label was never set" is
-# a harmless non-error case too) — don't claim "cleared" unless it is.
-REMAINING=$("${BD[@]}" show "$BEAD_ID" --json 2>/dev/null | jq -r '
+# a harmless non-error case too) — don't claim "cleared" unless it is. A
+# failed/unreadable verification read must NOT collapse into the same empty
+# value as "positively confirmed zero markers remain" (mirrors the STATUS
+# check above, which already fails closed on empty read output).
+VERIFY_JSON=$("${BD[@]}" show "$BEAD_ID" --json 2>/dev/null)
+
+if [ -z "$VERIFY_JSON" ]; then
+  echo "pilot-manual-reclaim: $BEAD_ID reclaimed (status=open) but the post-removal verification read returned nothing — could NOT confirm Pilot claim markers cleared. Re-run bd show $BEAD_ID manually to check." >&2
+  exit 1
+fi
+
+REMAINING=$(printf '%s' "$VERIFY_JSON" | jq -r '
   .[0] as $b
-  | ([($b.labels // [])[] | select(. == "pilot:dispatched" or . == "pilot:dispatching")]
-     + (if (($b.metadata["pilot.dispatched_at"] // "") != "") then ["pilot.dispatched_at"] else [] end))
-  | join(",")
+  | if $b == null then error("verification read did not return the issue")
+    else
+      ([($b.labels // [])[] | select(. == "pilot:dispatched" or . == "pilot:dispatching")]
+       + (if (($b.metadata["pilot.dispatched_at"] // "") != "") then ["pilot.dispatched_at"] else [] end))
+      | join(",")
+    end
 ' 2>/dev/null)
+JQ_STATUS=$?
+
+if [ "$JQ_STATUS" -ne 0 ]; then
+  echo "pilot-manual-reclaim: $BEAD_ID reclaimed (status=open) but the post-removal verification response could NOT be parsed — could NOT confirm Pilot claim markers cleared. Re-run bd show $BEAD_ID manually to check." >&2
+  exit 1
+fi
 
 if [ -n "$REMAINING" ]; then
   echo "pilot-manual-reclaim: $BEAD_ID reclaimed (status=open) but could NOT confirm all Pilot claim markers cleared — still present: $REMAINING. Retry the label/metadata removal manually." >&2
