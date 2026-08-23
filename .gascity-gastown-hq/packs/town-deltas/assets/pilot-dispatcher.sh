@@ -3251,6 +3251,38 @@ _filter_dispatch_gates() {
   printf '%s' "$_dg_out"
 }
 
+# _filter_terminal_status — ga-mdpe4c: drop status=blocked/closed/deferred
+# candidates, same as gate (a) of _filter_dispatch_gates above, but WITHOUT
+# gates (b)/(c)/(d) (spec-floor, precondition-label, waiting-on). Exists
+# because the HQ Tier-1 queries below (BUGS_JSON/DEBT_JSON/CHORE_JSON/
+# TASK_JSON) never ran _filter_dispatch_gates at all — unlike TIER2_JSON,
+# CTXREADY_JSON, and every rig-side pool, which all do — so a status=deferred
+# bug/debt/chore/task bead (dc-4v71: status=deferred, priority=3, zero labels)
+# kept re-entering the pool every sweep, getting logged as "Selected" and
+# refused downstream by the ownership guard, instead of being excluded at the
+# source the way `bd ready` already excludes deferred by definition.
+# Deliberately NOT reusing _filter_dispatch_gates wholesale here: doing so
+# would ALSO newly apply gate (b)'s 20-char spec floor and gates (c)/(d)'s
+# label checks to every HQ Tier-1 bug/debt/chore/task for the first time — a
+# materially larger behavior change than this bug asks for, and one with a
+# real blast radius (confirmed empirically: it silently dropped a real
+# fixture bug whose only "defect" was an intentionally short, unrelated-test
+# description — see pilot-dispatcher.selftest.sh Scenario 7/8, tt-depblk).
+# Tier 1 bugs/debt/chore/task are still gated on spec/precondition/waiting-on
+# by nothing (same as before this fix) — only the status leak is closed here.
+_filter_terminal_status() {
+  local _fts_in _fts_out
+  _fts_in=$(cat)
+  _fts_out=$(printf '%s' "$_fts_in" | jq '[.[] | select(
+      ((.status) // "open") as $s | ($s != "blocked" and $s != "closed" and $s != "deferred")
+    )]' 2>/dev/null)
+  if [ -z "$_fts_out" ] || [ "$_fts_out" = "null" ]; then
+    printf '%s' "$_fts_in"
+  else
+    printf '%s' "$_fts_out"
+  fi
+}
+
 # ── ga-htjni: ownership / in-flight collision guard helpers ───────────────────
 # _ownership_guard_repos — newline list of repos a `crew/<owner>/<bead>` branch
 # could live in (the shared town root + every registered rig path), de-duped and
@@ -6103,7 +6135,11 @@ BUGS_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-type epic \
   -n 0 \
   2>/dev/null || echo "[]")
-BUGS_JSON=$(echo "$BUGS_JSON" | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates)
+# ga-mdpe4c: BUGS_JSON/DEBT_JSON/CHORE_JSON/TASK_JSON below never excluded a
+# status=blocked/closed/deferred candidate — see _filter_terminal_status's own
+# comment (above _filter_dispatch_gates) for why a narrow filter, not the full
+# _filter_dispatch_gates gate bundle, is used here.
+BUGS_JSON=$(echo "$BUGS_JSON" | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_terminal_status)
 
 DEBT_JSON=$(bd -C "$GC_CITY" list --json \
   -l "tech-debt" \
@@ -6117,7 +6153,7 @@ DEBT_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-type epic \
   -n 0 \
   2>/dev/null || echo "[]")
-DEBT_JSON=$(echo "$DEBT_JSON" | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates)
+DEBT_JSON=$(echo "$DEBT_JSON" | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_terminal_status)
 
 # ga-ciyypt: chore/task never got the unconditional Tier-1 treatment BUGS_JSON/
 # DEBT_JSON give bug/tech-debt above — they ONLY flowed through CTXREADY_JSON
@@ -6151,7 +6187,7 @@ CHORE_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-type epic \
   -n 0 \
   2>/dev/null || echo "[]")
-CHORE_JSON=$(echo "$CHORE_JSON" | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates)
+CHORE_JSON=$(echo "$CHORE_JSON" | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_terminal_status)
 
 TASK_JSON=$(bd -C "$GC_CITY" list --json \
   -t task \
@@ -6169,7 +6205,7 @@ TASK_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-type epic \
   -n 0 \
   2>/dev/null || echo "[]")
-TASK_JSON=$(echo "$TASK_JSON" | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates)
+TASK_JSON=$(echo "$TASK_JSON" | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_terminal_status)
 
 # Merge bugs + debt + chore + task, deduplicate by id
 TIER1_JSON=$(echo "$BUGS_JSON $DEBT_JSON $CHORE_JSON $TASK_JSON" \

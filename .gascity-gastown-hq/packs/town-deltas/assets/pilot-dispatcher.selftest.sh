@@ -4749,6 +4749,63 @@ has "$DISPATCHER" 'PILOT_CTX_READY_RIGS' "rig-scan scope allowlist defined (defa
 # brace pattern no longer matches; check the current default string instead.
 has "$DISPATCHER" 'whatsapp_automation property_scrapers}"' "rig-scan scope defaults to whatsapp_automation + property_scrapers (ga-mfeip scope, widened by ga-3oxo5)"
 
+# ── Scenario 22i: gate (a)-only — HQ Tier-1 (bug/debt/chore/task) never
+# excluded a status=blocked/closed/deferred candidate the way it already
+# excludes a ctx:ready one (22b2) — only TIER2_JSON/CTXREADY_JSON/rig-side
+# pools got that treatment. Live incident (ga-mdpe4c): dc-4v71 (status=
+# deferred, priority=3, zero labels) kept winning "Selected feature" every
+# sweep for 40+ minutes, refused downstream by the ownership guard each time.
+# tt-deferred below is P0 (wins the pick outright if the gap is open) with a
+# null assignee, so — absent the fix — nothing stops dispatch_one() from
+# actually building it, not just wastefully selecting it.
+#
+# The fix is the NARROW _filter_terminal_status (gate (a) only), not the full
+# _filter_dispatch_gates bundle: reusing the full bundle was tried first and
+# reverted — it also newly applied gate (b)'s 20-char spec floor to Tier-1,
+# which broke Scenario 7/8 below (tt-depblk's fixture description is 12
+# chars). tt-shortdesc proves that boundary holds: same short description
+# shape, status=open, still dispatches.
+echo "Scenario 22i: gate (a) — a status=deferred HQ Tier-1 bug is NOT re-selected/dispatched (ga-mdpe4c)"
+FAKE_TIER1_DEFERRED='[
+  {"id":"tt-deferred","title":"Deferred bug must not be reselected","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"deferred","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}},
+  {"id":"tt-open-keep","title":"Open bug should still dispatch","priority":1,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}}
+]'
+LOG22I="$(run_capacity 10 "[]" 1 "$FAKE_TIER1_DEFERRED")"
+if echo "$LOG22I" | grep -q "Selected .* tt-deferred"; then
+  bad "REGRESSION (ga-mdpe4c): status=deferred HQ Tier-1 bug was re-selected/logged — gate (a) leak reopened"
+else
+  ok "status=deferred HQ Tier-1 bug was NOT selected (gate (a) — same treatment ctx:ready already got in 22b2)"
+fi
+if echo "$LOG22I" | grep -q "Lane picks — small: tt-deferred"; then
+  bad "REGRESSION (ga-mdpe4c): status=deferred HQ Tier-1 bug was DISPATCHED (would have built a deferred bead)"
+else
+  ok "status=deferred HQ Tier-1 bug was NOT dispatched"
+fi
+if echo "$LOG22I" | grep -q "Lane picks — small: tt-open-keep"; then
+  ok "the open P1 bug WAS dispatched instead (only the deferred P0 one is gated — no over-filtering)"
+else
+  bad "the open bug was NOT dispatched — gate (a) over-filtered the HQ Tier-1 pool"
+fi
+has "$DISPATCHER" 'BUGS_JSON=\$\(echo "\$BUGS_JSON" .* _filter_candidates \| _filter_terminal_status\)' \
+  "structural: BUGS_JSON pipes through _filter_terminal_status (ga-mdpe4c)"
+has "$DISPATCHER" 'DEBT_JSON=\$\(echo "\$DEBT_JSON" .* _filter_candidates \| _filter_terminal_status\)' \
+  "structural: DEBT_JSON pipes through _filter_terminal_status (ga-mdpe4c)"
+has "$DISPATCHER" 'CHORE_JSON=\$\(echo "\$CHORE_JSON" .* _filter_candidates \| _filter_terminal_status\)' \
+  "structural: CHORE_JSON pipes through _filter_terminal_status (ga-mdpe4c)"
+has "$DISPATCHER" 'TASK_JSON=\$\(echo "\$TASK_JSON" .* _filter_candidates \| _filter_terminal_status\)' \
+  "structural: TASK_JSON pipes through _filter_terminal_status (ga-mdpe4c)"
+
+echo "Scenario 22j: gate (a)-only boundary — a short-description (<20 char) HQ Tier-1 bug still dispatches (gate (b) NOT applied, ga-mdpe4c)"
+FAKE_TIER1_SHORTDESC='[
+  {"id":"tt-shortdesc","title":"Short-description bug fixture","priority":0,"issue_type":"bug","description":"fixture body","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}}
+]'
+LOG22J="$(run_capacity 10 "[]" 1 "$FAKE_TIER1_SHORTDESC")"
+if echo "$LOG22J" | grep -q "Lane picks — small: tt-shortdesc"; then
+  ok "a short-description (12-char), status=open HQ Tier-1 bug still dispatches — gate (b)'s spec floor deliberately NOT extended to Tier-1 by this fix"
+else
+  bad "REGRESSION (ga-mdpe4c): a short-description status=open HQ Tier-1 bug was NOT dispatched — _filter_terminal_status is over-filtering (did it become the full _filter_dispatch_gates again?)"
+fi
+
 # ── Scenario 22g: HOL-block fix — built/gate-failed beads excluded from ctx:ready pool
 # A bead that is already built (has a crew branch) or gate-failed must NOT be a ctx:ready
 # candidate: it is picked first by priority, refused by the ownership guard, and head-of-
