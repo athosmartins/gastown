@@ -334,10 +334,14 @@ import inspect
 src = inspect.getsource(m.do_escalate)
 assert 'gate:needs-human' in src, 'do_escalate must add gate:needs-human'
 assert '\"add\"' in src, 'do_escalate must ADD the needs-human label'
-# Must NOT issue any bd label-remove / assign-clear in escalation — those would
-# re-clear the bead and re-arm the loop. The reclaim path (do_reclaim) clears;
-# escalation deliberately does not.
-assert '\"remove\"' not in src, 'escalate must not remove labels (no re-clear loop)'
+# ga-y3cods: check the actual anti-pattern (removing story:in-flight)
+# structurally instead of a blind whole-function 'remove' substring —
+# do_escalate legitimately removes the spent pilot:reclaim-count:<N>
+# marker (ga-egd5av bump-shape swap, a different label) on a line that
+# never mentions story:in-flight; only a remove call that ALSO names
+# story:in-flight on the same line would re-arm the loop.
+danger_lines = [ln for ln in src.splitlines() if '\"remove\"' in ln and 'story:in-flight' in ln]
+assert not danger_lines, f'escalate must not remove story:in-flight (no re-clear loop): {danger_lines}'
 print('OK escalate adds needs-human, no re-clear')
 " "OK escalate adds needs-human, no re-clear"
 
