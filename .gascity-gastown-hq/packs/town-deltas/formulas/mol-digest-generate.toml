@@ -120,9 +120,15 @@ gc rig list
 
 **2. For each rig, collect:**
 
-a) **Issues filed and closed** — bounded on BOTH ends, [SINCE, UNTIL):
+a) **Issues filed and closed** — bounded on BOTH ends, [SINCE, UNTIL). The
+filed-count query needs `--all`: `bd list` with no `--status`/`--all` flag
+silently excludes anything already closed by query time, so any issue
+created in-window but since closed (common for this rig's own same-day
+chore/session/step/molecule bookkeeping beads) vanishes from the count —
+same reason item 2c below carries `--all`. The closed-count query is
+unaffected; it already passes `--status=closed` explicitly:
 ```bash
-gc bd list --created-after=$SINCE --created-before=$UNTIL --json --limit=0
+gc bd list --all --created-after=$SINCE --created-before=$UNTIL --json --limit=0
 gc bd list --status=closed --closed-after=$SINCE --closed-before=$UNTIL --json --limit=0
 ```
 
