@@ -603,10 +603,10 @@ index 000000000..b8ebfe3c1
 +}
 diff --git a/internal/storage/issueops/identity.go b/internal/storage/issueops/identity.go
 new file mode 100644
-index 000000000..ccac9a240
+index 000000000..a4ced87ba
 --- /dev/null
 +++ b/internal/storage/issueops/identity.go
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,94 @@
 +package issueops
 +
 +import "strings"
@@ -657,12 +657,37 @@ index 000000000..ccac9a240
 +	return b.String()
 +}
 +
-+// actorMatches reports whether a and b denote the same identity: either
-+// they're byte-identical, or they canonicalize to the same string (see
-+// canonicalActor). The byte-identical check is not redundant — it avoids
-+// paying canonicalization on the overwhelmingly common exact-match path.
++// canonicalSessionSuffix reports whether long is a session incarnation of
++// short: long, once canonicalized, consists of short's canonical form
++// followed by the canonical separator and (optionally) more — an agent's
++// bare name ("batista-wa") and that agent's own session-qualified actor
++// string ("batista-wa-awisplqy3swl") are the same identity at two
++// granularities (wa-msxg5). Both arguments must already be canonicalized;
++// short == "" always returns false. This is a package-local duplicate of
++// internal/validation/issue.go's canonicalSessionSuffix — see that copy for
++// the full rationale, including the documented scope limit (structural
++// check, not a registry lookup) and why the two copies stay independent
++// (same layering constraint as canonicalActor above). Keep them in sync.
++func canonicalSessionSuffix(short, long string) bool {
++	if short == "" {
++		return false
++	}
++	return strings.HasPrefix(long, short+"_")
++}
++
++// actorMatches reports whether a and b denote the same identity: they're
++// byte-identical, they canonicalize to the same string (see canonicalActor),
++// or one canonicalizes to a session incarnation of the other (see
++// canonicalSessionSuffix, wa-msxg5), checked both directions since callers
++// don't always pass assignee-then-actor. The byte-identical check is not
++// redundant — it avoids paying canonicalization on the overwhelmingly common
++// exact-match path.
 +func actorMatches(a, b string) bool {
-+	return a == b || canonicalActor(a) == canonicalActor(b)
++	if a == b {
++		return true
++	}
++	ca, cb := canonicalActor(a), canonicalActor(b)
++	return ca == cb || canonicalSessionSuffix(ca, cb) || canonicalSessionSuffix(cb, ca)
 +}
 +
 +// ActorMatches is the exported form of actorMatches. Exported for the
@@ -678,10 +703,10 @@ index 000000000..ccac9a240
 +}
 diff --git a/internal/storage/issueops/identity_parity_test.go b/internal/storage/issueops/identity_parity_test.go
 new file mode 100644
-index 000000000..189272ebf
+index 000000000..023332939
 --- /dev/null
 +++ b/internal/storage/issueops/identity_parity_test.go
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,74 @@
 +package issueops
 +
 +import (
@@ -741,6 +766,9 @@ index 000000000..189272ebf
 +		{name: "genuinely different identities do not match", assignee: "gastown.mayor", actor: "gastown.dog-3"},
 +		{name: "both empty match", assignee: "", actor: ""},
 +		{name: "empty assignee never matches a non-empty actor", assignee: "", actor: "mayor"},
++		{name: "session suffix of the assignee matches (wa-msxg5)", assignee: "batista-wa", actor: "batista-wa-awisplqy3swl"},
++		{name: "a different agent's session does not match (wa-msxg5 regression guard)", assignee: "batista-wa", actor: "thies-wa-gapfne3"},
++		{name: "a name that only looks like a prefix does not match (wa-msxg5 collision guard)", assignee: "X", actor: "X2-something"},
 +	}
 +	for _, tc := range matchCases {
 +		t.Run("ActorMatches/"+tc.name, func(t *testing.T) {
@@ -1312,7 +1340,7 @@ index bea4ab77c..c4c84067b 100644
  // post-state compares equal: the row was written, whatever the comparison says.
  func TestSameValueUpdateStillRecordsItsHistoryEntry(t *testing.T) {
 diff --git a/internal/validation/issue.go b/internal/validation/issue.go
-index 4d5561f20..e445cceb5 100644
+index 4d5561f20..ba2022b60 100644
 --- a/internal/validation/issue.go
 +++ b/internal/validation/issue.go
 @@ -3,6 +3,7 @@ package validation
@@ -1323,7 +1351,7 @@ index 4d5561f20..e445cceb5 100644
  
  	"github.com/steveyegge/beads/internal/types"
  )
-@@ -70,14 +71,65 @@ func NotPinned(force bool) IssueValidator {
+@@ -70,14 +71,124 @@ func NotPinned(force bool) IssueValidator {
  	}
  }
  
@@ -1366,14 +1394,73 @@ index 4d5561f20..e445cceb5 100644
 +	return b.String()
 +}
 +
++// canonicalSessionSuffix reports whether long is a session incarnation of
++// short: long, once canonicalized, consists of short's canonical form
++// followed by the canonical separator and (optionally) more. Gas Town
++// assigns an issue to an agent's bare name ("batista-wa") but performs the
++// write under that agent's per-session actor string
++// ("batista-wa-awisplqy3swl") — the session is an incarnation of the agent,
++// not a different identity (wa-msxg5), but no amount of delimiter-folding
++// alone (CanonicalActor) makes a shorter assignee string equal a longer,
++// session-qualified actor string naming the same agent. Both arguments must
++// already be canonicalized; short == "" always returns false, or an
++// unassigned issue (CanonicalActor("") == "") would match every actor whose
++// canonical form happens to start with a separator.
++//
++// SCOPE LIMIT, read before extending this: this is a structural check, not
++// an identity check. It cannot confirm the suffix names a session bd has
++// actually seen — bd has no session registry, only the two strings a caller
++// hands it (confirmed by reading every ActorMatches/actorMatches call site
++// in internal/storage: assignee and actor arrive as bare strings, nothing
++// more). The fix originally proposed for wa-msxg5 was to resolve actor to
++// its owning agent via a registry (the same agent_name -> template
++// relationship `gc session list` exposes) and compare agent-to-agent,
++// specifically to close the hole this scope limit leaves open: a genuinely
++// distinct agent whose own name happens to be "<other-agent>-<word>" (e.g. a
++// future "batista-wa-backup") would have ITS sessions match against
++// "batista-wa" too, incorrectly. That registry lookup is not reachable from
++// here — it lives in Gas Town's gc/gascity layer, a dependency this package
++// cannot take without inverting bd's layering (and bd is used outside Gas
++// Town, where no such registry would exist at all).
++//
++// Accepted as the pragmatic fix instead because: (a) it strictly narrows the
++// originally-proposed bare-prefix design, which matched on any shared
++// prefix — this requires an exact canonical-separator boundary, so
++// "batista-wa2" no longer matches "batista-wa"; (b) no agent name in the
++// current Gas Town roster is a separator-extension of another agent's name
++// (verified 2026-08-23, at the time this landed); (c) the bug this fixes
++// (P1, reproduced independently by three agents, blocks every agent from
++// closing its own beads without --force) is real and active today, while
++// the collision this leaves open is hypothetical and, per (b), not
++// currently live. Whoever names a new Gas Town agent should avoid
++// "<existing-agent>-<word>" shapes; whoever later plumbs session-registry
++// data down to bd should replace this with the registry check rather than
++// extend it further.
++func canonicalSessionSuffix(short, long string) bool {
++	if short == "" {
++		return false
++	}
++	return strings.HasPrefix(long, short+"_")
++}
++
 +// ActorMatches reports whether actor has the same authority as assignee:
-+// either they're byte-identical, or they canonicalize to the same identity
-+// (see CanonicalActor). The byte-identical check is not redundant — it
-+// avoids paying canonicalization on the overwhelmingly common exact-match
-+// path (ga-5ksp5 gate review, #5438: fixes a garbled doc comment, no
-+// behavior change).
++// they're byte-identical, they canonicalize to the same identity (see
++// CanonicalActor), or one canonicalizes to a session incarnation of the
++// other (see canonicalSessionSuffix, wa-msxg5) — an agent's bare name and
++// that agent's own session-qualified actor string are the same identity at
++// two granularities, and either may legitimately appear in either argument
++// position (some callers compare two assignee-shaped values against each
++// other, not just assignee-then-actor, so the session-suffix check runs
++// both directions). The byte-identical check is not redundant — it avoids
++// paying canonicalization on the overwhelmingly common exact-match path
++// (ga-5ksp5 gate review, #5438: fixes a garbled doc comment, no behavior
++// change).
 +func ActorMatches(assignee, actor string) bool {
-+	return assignee == actor || CanonicalActor(assignee) == CanonicalActor(actor)
++	if assignee == actor {
++		return true
++	}
++	ca, cb := CanonicalActor(assignee), CanonicalActor(actor)
++	return ca == cb || canonicalSessionSuffix(ca, cb) || canonicalSessionSuffix(cb, ca)
 +}
 +
  // AssigneeMatches validates that the actor has authority to close the issue.
@@ -1393,7 +1480,7 @@ index 4d5561f20..e445cceb5 100644
  //
  // This guards against the silent-success bug where actor A closes a bead that
  // was concurrently re-claimed by actor B: storage accepts the close (id-only
-@@ -88,7 +140,7 @@ func AssigneeMatches(actor string, force bool) IssueValidator {
+@@ -88,7 +199,7 @@ func AssigneeMatches(actor string, force bool) IssueValidator {
  		if issue == nil || force {
  			return nil
  		}
@@ -1402,7 +1489,7 @@ index 4d5561f20..e445cceb5 100644
  			return nil
  		}
  		return fmt.Errorf("cannot close %s: assignee is %q, actor is %q; reclaim or use --force to override", id, issue.Assignee, actor)
-@@ -101,10 +153,14 @@ func AssigneeMatches(actor string, force bool) IssueValidator {
+@@ -101,10 +212,14 @@ func AssigneeMatches(actor string, force bool) IssueValidator {
  // stripping a live claim is what bd unclaim refuses without --force).
  //
  // The refusal fires only when every clause holds; each one is load-bearing:
@@ -1421,7 +1508,7 @@ index 4d5561f20..e445cceb5 100644
  //   - Status == in_progress   — reassigning an OPEN bead stays frictionless:
  //     dispatchers hand-dole open beads and pool-queue takes happen constantly,
  //     which is why this cannot reuse the unclaim/close ownership rule verbatim.
-@@ -114,15 +170,18 @@ func AssigneeMatches(actor string, force bool) IssueValidator {
+@@ -114,15 +229,18 @@ func AssigneeMatches(actor string, force bool) IssueValidator {
  //     bead. poolAliases is a thunk so call sites don't pay the config read on
  //     the overwhelmingly common non-conflicting paths.
  //
@@ -1445,10 +1532,10 @@ index 4d5561f20..e445cceb5 100644
  		}
  		if issue.Status != types.StatusInProgress {
 diff --git a/internal/validation/issue_test.go b/internal/validation/issue_test.go
-index 3096d4da2..d75f5d04b 100644
+index 3096d4da2..a9d6349af 100644
 --- a/internal/validation/issue_test.go
 +++ b/internal/validation/issue_test.go
-@@ -144,6 +144,55 @@ func TestNotPinned(t *testing.T) {
+@@ -144,6 +144,71 @@ func TestNotPinned(t *testing.T) {
  	}
  }
  
@@ -1490,6 +1577,22 @@ index 3096d4da2..d75f5d04b 100644
 +		{name: "genuinely different identities do not match", assignee: "gastown.mayor", actor: "gastown.dog-3", want: false},
 +		{name: "both empty match", assignee: "", actor: "", want: true},
 +		{name: "empty assignee never matches a non-empty actor", assignee: "", actor: "mayor", want: false},
++		// wa-msxg5: an agent's bare name and that agent's own session-qualified
++		// actor string are the same identity at two granularities.
++		{name: "session suffix of the assignee matches (wa-msxg5)", assignee: "batista-wa", actor: "batista-wa-awisplqy3swl", want: true},
++		{name: "session suffix match is symmetric in argument order (wa-msxg5)", assignee: "batista-wa-awisplqy3swl", actor: "batista-wa", want: true},
++		{name: "session suffix composes with delimiter canonicalization (wa-msxg5)", assignee: "gastown.mayor", actor: "gastown_mayor__somesession", want: true},
++		{name: "exact repro from the bug report matches (wa-msxg5)", assignee: "peter-wa", actor: "peter-wa-gack5xf", want: true},
++		// Regression guards — the whole point of the fix is to stop matching
++		// on a bare shared prefix, only on a real canonical-separator boundary.
++		{name: "a different agent's session does not match (wa-msxg5 regression guard)", assignee: "batista-wa", actor: "thies-wa-gapfne3", want: false},
++		{name: "a name that only looks like a prefix does not match (wa-msxg5 collision guard)", assignee: "X", actor: "X2-something", want: false},
++		{name: "empty assignee never matches a session-suffixed actor either (wa-msxg5)", assignee: "", actor: "-session", want: false},
++		// Documented scope limit (see canonicalSessionSuffix): this is a
++		// structural check, not a registry lookup, so any well-formed suffix
++		// passes — bd has no way to confirm the suffix names a session it has
++		// actually seen.
++		{name: "any well-formed suffix matches — no session registry to verify against (wa-msxg5, documented scope limit)", assignee: "batista-wa", actor: "batista-wa-anything-at-all", want: true},
 +	}
 +
 +	for _, tt := range tests {
@@ -1504,7 +1607,7 @@ index 3096d4da2..d75f5d04b 100644
  func TestAssigneeMatches(t *testing.T) {
  	tests := []struct {
  		name        string
-@@ -193,6 +242,41 @@ func TestAssigneeMatches(t *testing.T) {
+@@ -193,6 +258,41 @@ func TestAssigneeMatches(t *testing.T) {
  			wantErr:     true,
  			wantErrFrag: "assignee is",
  		},
@@ -1546,7 +1649,7 @@ index 3096d4da2..d75f5d04b 100644
  	}
  
  	for _, tt := range tests {
-@@ -301,6 +385,31 @@ func TestAssigneeNotStolen(t *testing.T) {
+@@ -301,6 +401,31 @@ func TestAssigneeNotStolen(t *testing.T) {
  			pools:       nil,
  			wantErr:     true,
  		},
