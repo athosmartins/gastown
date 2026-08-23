@@ -265,6 +265,23 @@ MAX_RECLAIMS = 3         # escalate instead of looping after this many reclaims
 # out-argue an already-reasoned refusal, so this threshold is intentionally
 # lower than MAX_RECLAIMS. See reclaim_decision()'s has_explicit_refusal param.
 REFUSAL_ESCALATE_THRESHOLD = 2
+
+# ga-5ure2d: a bead's FIRST explicit refusal (refusal_count still 0) is only
+# reachable via do_reclaim(), which is itself gated behind has_live_session
+# being False (see reclaim_decision()'s ordering comment). For a pool slot
+# whose session identity is deterministically reused across restarts (`gc
+# session list` never observes it absent), has_live_session never goes False,
+# so refusal_count can NEVER leave 0 and REFUSAL_ESCALATE_THRESHOLD can never
+# be reached even in principle — confirmed live, ga-espeh/ga-ojh09,
+# 2026-08-23 (stranded 50+min, zero pilot:refusal-count:* ever written).
+# REFUSAL_LIVE_GRACE_SECS bounds how long a live session's UNCROSSED first
+# refusal is still protected (RF-4b's original intent: the refusing session
+# might be mid-write, e.g. still finishing its own refusal comment) before
+# reclaim_decision() concludes liveness has stopped being useful information
+# for this specific bead and lets it through anyway. 2x POLL_SEC's default so
+# persistence is confirmed across multiple polls, not a single noisy one; far
+# short of the multi-hour/multi-day stuckness this bug causes without it.
+REFUSAL_LIVE_GRACE_SECS = 2 * 600  # 20min
 POLL_SEC = int(os.environ.get("RECLAIM_POLL_SEC", "600"))  # default 10min; was 5min
 REALERT_SEC = 900        # 15min re-alert cadence for escalated beads
 
@@ -611,7 +628,8 @@ def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
                      reclaim_count, has_needs_human, has_dispatching_marker,
                      min_stranding_secs=None, account_rate_limited=False,
                      provably_dead=False, has_explicit_refusal=False,
-                     refusal_count=0, has_suspended_owner=False):
+                     refusal_count=0, has_suspended_owner=False,
+                     refusal_age_secs=0.0):
     """Compute the reclaim action for one stranded in-flight bead.
 
     Args:
@@ -691,6 +709,24 @@ def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
                                  number of PRIOR explicit refusals already recorded for this
                                  bead, NOT counting the one has_explicit_refusal signals for
                                  the current cycle. Ignored unless has_explicit_refusal=True.
+        refusal_age_secs:        ga-5ure2d: seconds has_explicit_refusal has been continuously
+                                 True for THIS bead (from update_refusal_clock(), independent of
+                                 has_live_session — unlike seconds_stranded, which resets to 0
+                                 whenever has_live_session=True and so cannot answer this).
+                                 Once >= REFUSAL_LIVE_GRACE_SECS, a first refusal (refusal_count
+                                 still 0, not yet crossing REFUSAL_ESCALATE_THRESHOLD) stops
+                                 being protected by has_live_session below — the same "worker
+                                 already told us it is done" rationale the hysteresis check
+                                 already applies, just extended to this gate too, after a
+                                 bounded wait instead of immediately. Without this, a bead whose
+                                 assignee is a deterministically-reused pool-slot session name
+                                 can never accumulate its first pilot:refusal-count:N label at
+                                 all (that label is written only inside do_reclaim()/
+                                 do_escalate(), both unreachable while has_live_session=True),
+                                 so REFUSAL_ESCALATE_THRESHOLD can never be reached even in
+                                 principle. Ignored unless has_explicit_refusal=True. Defaults
+                                 0.0: callers that don't pass it keep the pre-fix behavior
+                                 exactly (RF-4b unaffected).
 
     Returns:
         action in {"reclaim", "escalate", "noop"}
@@ -743,8 +779,19 @@ def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
     if has_explicit_refusal and (refusal_count + 1) >= REFUSAL_ESCALATE_THRESHOLD:
         return "escalate"
 
-    if has_live_session:
-        return "noop"
+    # ga-5ure2d: an UNCROSSED first refusal (refusal_count still 0) that has
+    # remained live-blocked for at least REFUSAL_LIVE_GRACE_SECS is no longer
+    # protected by has_live_session. RF-4b's original intent — a session that
+    # JUST refused might still be mid-write (e.g. finishing its own refusal
+    # comment) — only needs a short window, not indefinite protection; a
+    # deterministically-reused pool-slot session name can otherwise trap a
+    # bead here forever, since do_reclaim() (the only place refusal_count
+    # ever gets incremented) is itself gated behind this same has_live_session
+    # check just below — refusal_count could never reach 1, so the escalate
+    # branch above could never fire either, no matter how long this cycles.
+    if not (has_explicit_refusal and refusal_age_secs >= REFUSAL_LIVE_GRACE_SECS):
+        if has_live_session:
+            return "noop"
 
     # Bead is stranded — enforce hysteresis (wait for continuous stranding).
     # gt-fppb0 fast-path: a PROVABLY-DEAD claimant (session absent / in a
@@ -764,7 +811,8 @@ def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
 
 def should_fetch_branch_for_reclaim(has_live_session, has_needs_human,
                                      has_dispatching_marker, has_suspended_owner,
-                                     has_explicit_refusal, refusal_count):
+                                     has_explicit_refusal, refusal_count,
+                                     refusal_age_secs=0.0):
     """Whether a reclaim_decision() caller should pay for the (potentially
     slow) branch-recency git fetch, vs. defaulting has_recent_branch to False
     as a fast-path. Pure, no I/O — unit-testable, same pattern as
@@ -806,7 +854,16 @@ def should_fetch_branch_for_reclaim(has_live_session, has_needs_human,
         has_explicit_refusal
         and (refusal_count + 1) >= REFUSAL_ESCALATE_THRESHOLD
     )
-    return would_cross_refusal_threshold
+    # ga-5ure2d: mirrors reclaim_decision()'s own grace-period bypass — once
+    # an uncrossed first refusal has aged past REFUSAL_LIVE_GRACE_SECS, the
+    # decision no longer stops at has_live_session, so has_recent_branch
+    # starts mattering to the outcome again and the fast-path default (False)
+    # is no longer safe to assume.
+    would_bypass_on_refusal_age = (
+        has_explicit_refusal
+        and refusal_age_secs >= REFUSAL_LIVE_GRACE_SECS
+    )
+    return would_cross_refusal_threshold or would_bypass_on_refusal_age
 
 
 def update_strand_clock(bead_state, is_currently_stranded, assignee, now):
@@ -856,6 +913,30 @@ def update_strand_clock(bead_state, is_currently_stranded, assignee, now):
         if event is None:
             event = "progress_reset"
     return 0.0, event
+
+
+def update_refusal_clock(bead_state, has_explicit_refusal, now):
+    """Update a bead's per-cycle refusal-age clock in bead_state; return
+    refusal_age_secs. Mutates only the passed bead_state dict — no I/O — same
+    pattern as update_strand_clock(), but deliberately NOT the same clock:
+    this one is keyed purely on has_explicit_refusal and is NEVER reset by
+    has_live_session, has_recent_branch, or any other progress signal — the
+    strand clock resets on exactly those, which is precisely why it cannot
+    answer "how long has this refusal been sitting behind a live session"
+    (ga-5ure2d; see reclaim_decision()'s refusal_age_secs docstring for why
+    that distinction matters).
+
+    Shares the same bead_state dict as update_strand_clock() (both are keyed
+    by bead_id in the guard's persisted state file) but uses its own key
+    ("refusal_first_seen") so the two clocks never collide.
+    """
+    if has_explicit_refusal:
+        if "refusal_first_seen" not in bead_state:
+            bead_state["refusal_first_seen"] = now
+        return now - bead_state["refusal_first_seen"]
+    # No explicit refusal this cycle (label absent/removed) -> reset.
+    bead_state.pop("refusal_first_seen", None)
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -3655,6 +3736,14 @@ def run_cycle(state, escalated_alerted):
         has_explicit_refusal = _has_refusal_label(labels)
         refusal_count = parse_refusal_count(labels)
 
+        # ga-5ure2d: bead_state (and the refusal-age clock it backs) must
+        # exist before should_fetch_branch_for_reclaim() below, which now
+        # also depends on refusal_age_secs — moved up from its previous spot
+        # in the "Update stranded timestamp" block just for that reason; the
+        # strand-clock update further down still shares this same bead_state.
+        bead_state = state.setdefault(bead_id, {})
+        refusal_age_secs = update_refusal_clock(bead_state, has_explicit_refusal, now)
+
         # Branch check is potentially slow (git fetch); only run when needed.
         # ga-vu718 gate-fix-2: see should_fetch_branch_for_reclaim()'s
         # docstring for why has_live_session=True alone is no longer
@@ -3666,11 +3755,11 @@ def run_cycle(state, escalated_alerted):
                 has_dispatching_marker=has_dispatching_marker,
                 has_suspended_owner=has_suspended_owner,
                 has_explicit_refusal=has_explicit_refusal,
-                refusal_count=refusal_count):
+                refusal_count=refusal_count,
+                refusal_age_secs=refusal_age_secs):
             has_recent_branch = get_branch_recent(bead_id)
 
         # --- Update stranded timestamp in state ---
-        bead_state = state.setdefault(bead_id, {})
         is_currently_stranded = (
             not has_live_session and
             not has_recent_branch and
@@ -3746,6 +3835,7 @@ def run_cycle(state, escalated_alerted):
             has_explicit_refusal=has_explicit_refusal,
             refusal_count=refusal_count,
             has_suspended_owner=has_suspended_owner,
+            refusal_age_secs=refusal_age_secs,
         )
 
         idle_min = seconds_stranded / 60.0
@@ -5029,6 +5119,55 @@ def _selftest():
     check("RF-4b (ga-vu718 AC3 anchor): 1st refusal (not yet crossing threshold) + "
           "has_live_session → still noop (original live-builder protection intact)",
           _rd(has_explicit_refusal=True, refusal_count=0, has_live_session=True) == "noop")
+
+    # --- RF-15..RF-18 (ga-5ure2d): a deterministically-reused pool-slot
+    #     session name can make has_live_session=True on EVERY poll forever,
+    #     which — pre-fix — traps a bead here permanently: do_reclaim() (the
+    #     only place pilot:refusal-count:N is ever written) is unreachable
+    #     while has_live_session=True, so refusal_count can never leave 0, so
+    #     RF-4 above (which needs refusal_count already >= 1) can never fire
+    #     either. REFUSAL_LIVE_GRACE_SECS bounds how long RF-4b's protection
+    #     lasts once a refusal is stuck behind a live session, without
+    #     weakening RF-4b itself (age=0, the default, is untouched — proven
+    #     by RF-4b above still passing unmodified). Confirmed live,
+    #     ga-espeh/ga-ojh09, 2026-08-23. ---
+    check("RF-15 (ga-5ure2d): 1st refusal + has_live_session, age BELOW grace → "
+          "still noop (RF-4b's protection holds for the bulk of the grace window, "
+          "not just at age=0)",
+          _rd(has_explicit_refusal=True, refusal_count=0, has_live_session=True,
+              refusal_age_secs=REFUSAL_LIVE_GRACE_SECS - 1) == "noop")
+    check("RF-16 (ga-5ure2d): 1st refusal + has_live_session, age AT/PAST grace → "
+          "reclaim, NOT noop (the fix: liveness stops being useful information "
+          "once a stated refusal has sat behind it this long)",
+          _rd(has_explicit_refusal=True, refusal_count=0, has_live_session=True,
+              refusal_age_secs=REFUSAL_LIVE_GRACE_SECS) == "reclaim")
+    check("RF-17 (ga-5ure2d): same as RF-16 BUT has_recent_branch → noop (branch "
+          "rail still wins — mirrors RF-8's guarantee for the escalate path, now "
+          "extended to the grace-bypass path too)",
+          _rd(has_explicit_refusal=True, refusal_count=0, has_live_session=True,
+              refusal_age_secs=REFUSAL_LIVE_GRACE_SECS, has_recent_branch=True) == "noop")
+    check("RF-18 (ga-5ure2d): 2nd refusal (already crossing threshold) + "
+          "has_live_session, age=0 → still escalate, unaffected (the escalate "
+          "check above is unconditional on refusal_age_secs — this fix only "
+          "touches the has_live_session gate below it, never the ga-vu718 "
+          "escalate branch itself)",
+          _rd(has_explicit_refusal=True, refusal_count=1, has_live_session=True,
+              refusal_age_secs=0.0) == "escalate")
+    check("RF-19 (ga-5ure2d, adversarial-review gap): grace bypass eligible "
+          "(age AT/PAST grace) BUT has_needs_human → noop, park guard still "
+          "outranks it (has_needs_human is checked at the very top of "
+          "reclaim_decision, unconditionally ahead of everything else — this "
+          "fix's new branch sits well below it and is never reached)",
+          _rd(has_explicit_refusal=True, refusal_count=0, has_live_session=True,
+              refusal_age_secs=REFUSAL_LIVE_GRACE_SECS, has_needs_human=True) == "noop")
+    check("RF-20 (ga-5ure2d, adversarial-review gap): grace bypass eligible "
+          "BUT has_suspended_owner → noop, HOLD guard still outranks it (same "
+          "reasoning as RF-19 — has_suspended_owner is the other top-tier "
+          "guard checked before this fix's branch is ever reached; a parked "
+          "crew must never be reclaimed regardless of any refusal signal)",
+          _rd(has_explicit_refusal=True, refusal_count=0, has_live_session=True,
+              refusal_age_secs=REFUSAL_LIVE_GRACE_SECS, has_suspended_owner=True) == "noop")
+
     check("RF-5: 2nd refusal BUT has_needs_human → noop (park guard wins)",
           _rd(has_explicit_refusal=True, refusal_count=1, has_needs_human=True) == "noop")
     check("RF-6: 2nd refusal BUT has_dispatching_marker → noop (gate guard wins)",
@@ -5069,6 +5208,23 @@ def _selftest():
           should_fetch_branch_for_reclaim(
               has_live_session=True, has_needs_human=False, has_dispatching_marker=False,
               has_suspended_owner=False, has_explicit_refusal=False, refusal_count=0) is False)
+    check("RFB-10 (ga-5ure2d): has_live_session=True, 1st refusal, age BELOW grace → "
+          "still skip fetch (mirrors RFB-2 — the grace bypass hasn't fired yet, so "
+          "has_recent_branch still can't change the noop outcome)",
+          should_fetch_branch_for_reclaim(
+              has_live_session=True, has_needs_human=False, has_dispatching_marker=False,
+              has_suspended_owner=False, has_explicit_refusal=True, refusal_count=0,
+              refusal_age_secs=REFUSAL_LIVE_GRACE_SECS - 1) is False)
+    check("RFB-11 (ga-5ure2d regression anchor): has_live_session=True, 1st refusal, "
+          "age AT/PAST grace → MUST fetch (mirrors RFB-1 — reclaim_decision() no "
+          "longer stops at has_live_session here, so a defaulted-False "
+          "has_recent_branch could wrongly reclaim a bead with real branch "
+          "activity; this is RF-17's precondition, same GATE-FEEDBACK-shaped gap "
+          "RFB-1 closed for the escalate path, now closed for the grace path too)",
+          should_fetch_branch_for_reclaim(
+              has_live_session=True, has_needs_human=False, has_dispatching_marker=False,
+              has_suspended_owner=False, has_explicit_refusal=True, refusal_count=0,
+              refusal_age_secs=REFUSAL_LIVE_GRACE_SECS) is True)
     check("RFB-4: has_live_session=False → always fetch regardless of refusal state "
           "(pre-existing behavior, this fix must not touch the non-live path)",
           should_fetch_branch_for_reclaim(
@@ -6915,6 +7071,36 @@ def _selftest():
           "clock instead of inheriting 3h of the prior claim's staleness",
           _ctrl_event == "fresh_claim_reset" and _ctrl_secs == 0.0,
           f"event={_ctrl_event} secs={_ctrl_secs}")
+
+    # --- RC-*: update_refusal_clock() (ga-5ure2d) — deliberately a SEPARATE,
+    #     simpler clock from update_strand_clock() above: keyed only on
+    #     has_explicit_refusal, with no has_live_session/has_recent_branch
+    #     input at all, so it keeps accumulating across cycles regardless of
+    #     liveness — the whole point being it can answer a question the
+    #     strand clock structurally cannot (see its own docstring). ---
+    _rc_state = {}
+    _rc_secs = update_refusal_clock(_rc_state, has_explicit_refusal=True, now=1000.0)
+    check("RC-1 (ga-5ure2d): first observation starts the clock at 0.0 and "
+          "records the start time",
+          _rc_secs == 0.0 and _rc_state.get("refusal_first_seen") == 1000.0,
+          f"secs={_rc_secs} state={_rc_state}")
+    _rc_secs = update_refusal_clock(
+        _rc_state, has_explicit_refusal=True, now=1000.0 + REFUSAL_LIVE_GRACE_SECS)
+    check("RC-2 (ga-5ure2d): keeps accumulating across calls while the refusal "
+          "persists — no has_live_session input exists to reset it, unlike "
+          "the strand clock",
+          _rc_secs == REFUSAL_LIVE_GRACE_SECS,
+          f"secs={_rc_secs}")
+    _rc_secs = update_refusal_clock(_rc_state, has_explicit_refusal=False, now=1000.0 + 5000)
+    check("RC-3 (ga-5ure2d): refusal label removed → resets to 0.0 and clears "
+          "the stored start time (not just returns 0 while leaving state stale)",
+          _rc_secs == 0.0 and "refusal_first_seen" not in _rc_state,
+          f"secs={_rc_secs} state={_rc_state}")
+    _rc_secs = update_refusal_clock(_rc_state, has_explicit_refusal=True, now=1000.0 + 5000)
+    check("RC-4 (ga-5ure2d): a NEW refusal after a reset starts a fresh clock — "
+          "does not inherit the pre-reset elapsed time",
+          _rc_secs == 0.0,
+          f"secs={_rc_secs}")
 
     # --- RGL-*: _list_rig_stores() must distinguish a genuine query FAILURE
     # (gc rig list errors/times out) from a genuine empty result, and that
