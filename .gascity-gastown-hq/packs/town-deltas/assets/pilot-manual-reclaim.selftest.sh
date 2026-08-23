@@ -13,12 +13,23 @@
 #      stick — e.g. a transient Dolt hiccup): the script does NOT claim
 #      success — it verifies the post-state and reports failure honestly
 #      instead of trusting the removal commands' suppressed exit codes.
+#   5. VERIFY-EMPTY (status flips open, removal fires, but the POST-removal
+#      verification read itself returns nothing): the script must not
+#      collapse "confirmed zero markers remain" and "could not read the
+#      confirmation" into the same success claim.
+#   6. VERIFY-GARBAGE (same as 5, but the verification read returns a
+#      not-found-shaped error object instead of empty output): same
+#      requirement, exercised via the jq-parse-failure path instead of the
+#      empty-string path.
 #
 # Falsifiable: against a naive "always print success after the removal
 # attempts" script (no post-state verification), scenario 4 would still
 # print "markers cleared" and exit 0 — its check would fail. Against a naive
 # "always strip the labels regardless of status" script, scenario 2 would
-# show the same mutations as scenario 1 and its check would fail.
+# show the same mutations as scenario 1 and its check would fail. Against
+# the actual pre-fix gt-1kkgu script (verification read piped straight into
+# jq with no read-failure guard), scenarios 5 and 6 both fail — confirmed by
+# running this exact suite against that script before writing the fix.
 #
 # Run:  bash packs/town-deltas/assets/pilot-manual-reclaim.selftest.sh
 set -u
