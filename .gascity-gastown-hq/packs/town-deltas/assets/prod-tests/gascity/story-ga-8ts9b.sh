@@ -45,7 +45,17 @@ DAYS="$(jq -r '.cleanupPeriodDays // empty' "$SETTINGS" 2>/dev/null)"
 log "  cleanupPeriodDays=$DAYS ✓"
 
 if [[ -d "$PROJECTS_ROOT" ]]; then
-  STALE_COUNT="$(find "$PROJECTS_ROOT" -name '*.jsonl' -mtime +35 2>/dev/null | wc -l | tr -d ' ')"
+  # find's own failure (permission error, etc.) must not collapse to the same
+  # "0 stale" value a genuine all-fresh result produces — capture its exit
+  # status separately rather than losing it through `2>/dev/null | wc -l`.
+  STALE_LIST="$(find "$PROJECTS_ROOT" -name '*.jsonl' -mtime +35 2>&1)"
+  FIND_RC=$?
+  [[ $FIND_RC -eq 0 ]] || fail "find under $PROJECTS_ROOT failed (rc=$FIND_RC): $STALE_LIST — cannot verify local retention is running"
+  if [[ -z "$STALE_LIST" ]]; then
+    STALE_COUNT=0
+  else
+    STALE_COUNT="$(printf '%s\n' "$STALE_LIST" | wc -l | tr -d ' ')"
+  fi
   # 35d grace (30d retention + 5d slack for the cleanup's own run cadence) —
   # a transcript older than that proves the reaper is configured but not
   # actually running, not just mid-cycle.
@@ -59,12 +69,18 @@ fi
 #    prunes projects/), but measured growth is a few lines per backup run —
 #    tripwire, not a fabricated fix for a non-problem ─────────────────────
 if [[ -f "$BACKUP_LOG" ]]; then
-  LOG_KB="$(du -k "$BACKUP_LOG" 2>/dev/null | awk '{print $1}')"
+  # Same principle as the find check above: du's own failure must not read
+  # as "0KB, well within bound" — capture its exit status explicitly.
+  DU_OUT="$(du -k "$BACKUP_LOG" 2>&1)"
+  DU_RC=$?
+  [[ $DU_RC -eq 0 ]] || fail "du failed on $BACKUP_LOG (rc=$DU_RC): $DU_OUT"
+  LOG_KB="$(printf '%s' "$DU_OUT" | awk '{print $1}')"
+  [[ -n "$LOG_KB" ]] || fail "could not parse du output for $BACKUP_LOG: $DU_OUT"
   # 5MB tripwire: measured growth was ~8KB/156 lines (~3 lines/run/day,
   # ~60-80KB/year) at story time. A log 60x that size means growth
   # assumptions changed — investigate rather than silently let an
   # unrotated log run away.
-  [[ "${LOG_KB:-0}" -lt 5120 ]] || fail "$BACKUP_LOG is ${LOG_KB}KB — unexpected growth vs ~8KB at story time; investigate before assuming still-negligible"
+  [[ "$LOG_KB" -lt 5120 ]] || fail "$BACKUP_LOG is ${LOG_KB}KB — unexpected growth vs ~8KB at story time; investigate before assuming still-negligible"
   log "  $BACKUP_LOG is ${LOG_KB}KB — within expected negligible-growth bound ✓"
 else
   log "  $BACKUP_LOG does not exist — nothing to verify (WARN, not a failure)"
