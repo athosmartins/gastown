@@ -75,8 +75,13 @@ fi
 # "recently". A past OK record is permanent evidence the action was taken;
 # re-checking on every future deploy of unrelated stories is intentional
 # (cheap, and confirms the summary-bead trail from item 3 stayed intact).
+# _file_summary_bead() builds title/description as "...OK: $results" / "...banco:\n$results"
+# — "hq=OK(" is always preceded by a space or an escaped newline in the JSON
+# output, NEVER by a raw '"' (gate-caught: the previous pattern required a
+# leading '"' and could never match anything). Match the literal status
+# token itself, including the paren so a differently-named db can't collide.
 HQ_VERIFY_COUNT="$(timeout 30 "$BD_BIN" -C "$CITY" list --label=restore-verify --all --json --limit=0 2>/dev/null \
-  | grep -c '"hq=OK' || true)"
+  | grep -c 'hq=OK(' || true)"
 [[ "${HQ_VERIFY_COUNT:-0}" -ge 1 ]] \
   || fail "no restore-verify summary bead recording an OK result for 'hq' was found — the story's own required one-time verification (scope item 4) has no durable record"
 log "found $HQ_VERIFY_COUNT restore-verify summary bead(s) recording an OK result for 'hq'"

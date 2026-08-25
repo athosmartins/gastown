@@ -61,11 +61,16 @@ _avail_gb() {
 
 # _need_gb <live_kb> <margin_pct> — pure arithmetic. Fail-closed (empty) on
 # non-numeric input so a read failure can never masquerade as "need 0GB".
+# ORDER MATTERS: multiply by pct BEFORE dividing down to GB. Dividing to GB
+# first (live_kb/1024/1024) truncates to 0 for any live db under 1GB —
+# whatsapp_automation (~788MB) is a real one — which then discards the whole
+# margin (0 * pct = 0) regardless of DISK_MARGIN_PCT. Multiplying first keeps
+# the sub-GB precision alive until the final division.
 _need_gb() {
   local live_kb="$1" pct="$2"
   case "$live_kb" in ''|*[!0-9]*) echo ""; return ;; esac
   case "$pct" in ''|*[!0-9]*) echo ""; return ;; esac
-  echo $(( (live_kb / 1024 / 1024) * pct / 100 + 1 ))
+  echo $(( (live_kb * pct / 100) / 1024 / 1024 + 1 ))
 }
 
 # _headroom_ok <avail_gb> <need_gb> — fail-closed on any non-numeric input.
@@ -160,6 +165,13 @@ _verify_one_db() {
 # any FAIL is actionable — filed as an OPEN bug, routed to gastown.dog (the
 # pool that owns this domain), and deliberately left open: closing it here
 # would hide the exact failure this whole story exists to surface.
+# overall_rc=2 is a THIRD state (gate-caught, ga-jz7gg fix-attempt 1): every
+# db SKIPped, so nothing was actually verified this run — e.g. dolt
+# unreachable, or disk tight city-wide for every db in turn. Filing this
+# identically to overall_rc=0 would record "checked, all clean" for a run
+# that checked nothing — the exact SKIP/OK collapse _verify_one_db's own
+# header warns against, just one level up. Filed as an open bug like FAIL,
+# but lower priority: it needs eyes, but it isn't a proven integrity break.
 _file_summary_bead() {
   local results="$1" overall_rc="$2" title body bead_id meta
   body="Verificacao de restore automatizada (ga-jz7gg). Resultado por banco:
@@ -170,6 +182,10 @@ Log completo: $LOG"
     title="Restore-verify semanal OK: $results"
     bead_id=$(timeout 30 "$BD_BIN" -C "$CITY" create --title="$title" --type=chore --priority=3 --labels=restore-verify --description="$body" --silent 2>/dev/null)
     [ -n "$bead_id" ] && timeout 30 "$BD_BIN" -C "$CITY" close "$bead_id" --reason "restore-verify semanal limpo" -q 2>/dev/null
+  elif [ "$overall_rc" -eq 2 ]; then
+    title="Restore-verify semanal SEM VERIFICACAO (todos os bancos SKIP): $results"
+    meta='{"gc.routed_to":"gastown.dog"}'
+    bead_id=$(timeout 30 "$BD_BIN" -C "$CITY" create --title="$title" --type=bug --priority=2 --labels=restore-verify --description="$body" --metadata="$meta" --silent 2>/dev/null)
   else
     title="Restore-verify semanal FALHOU: $results"
     meta='{"gc.routed_to":"gastown.dog"}'
@@ -190,7 +206,7 @@ Log completo: $LOG"
 }
 
 main() {
-  local db_list results="" overall_rc=0 db one_result one_rc
+  local db_list results="" overall_rc=0 db one_result one_rc ok_count=0 fail_seen=0
   if [ -n "$ONLY_DBS" ]; then db_list="$ONLY_DBS"; else db_list="$(_discover_dbs "$BACKUP_ROOT")"; fi
   if [ -z "$db_list" ]; then
     log "nenhum banco encontrado em $BACKUP_ROOT — nada a verificar"
@@ -200,8 +216,18 @@ main() {
     log "=== restore-verify de '$db' ==="
     one_result="$(_verify_one_db "$db")"; one_rc=$?
     results="${results}${one_result} "
-    [ "$one_rc" -ne 0 ] && overall_rc=1
+    case "$one_result" in "${db}=OK("*) ok_count=$((ok_count + 1)) ;; esac
+    [ "$one_rc" -ne 0 ] && fail_seen=1
   done
+  if [ "$fail_seen" -eq 1 ]; then
+    overall_rc=1
+  elif [ "$ok_count" -eq 0 ]; then
+    # Every db this run SKIPped -- nothing was actually verified. Distinct
+    # from overall_rc=0, which requires at least one real restore+compare;
+    # collapsing this into rc=0 would file a "clean" bead on a run that
+    # proved nothing (see _file_summary_bead's overall_rc=2 branch).
+    overall_rc=2
+  fi
   log "=== resumo: $results ==="
   _file_summary_bead "$results" "$overall_rc"
   return "$overall_rc"

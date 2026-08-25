@@ -93,6 +93,12 @@ esac
 
 echo "── _need_gb <live_kb> <margin_pct> ──"
 [ "$(_need_gb 1048576 200 2>/dev/null)" = "3" ] && ok "1GB live at 200% margin -> 3GB needed (2x + 1 rounding floor)" || bad "expected 3, got '$(_need_gb 1048576 200)'"
+# Gate-caught (ga-jz7gg fix-attempt 1): a live db UNDER 1GB used to truncate
+# to 0 before margin_pct was ever applied, flooring need_gb to a flat 1
+# regardless of margin. 806912 KB (~788MB) is whatsapp_automation's real
+# size per this city's own docs -- a size class that actually exists in
+# production, not a synthetic edge case.
+[ "$(_need_gb 806912 200 2>/dev/null)" = "2" ] && ok "788MB live (real prod size, sub-1GB) at 200% margin -> 2GB needed, not floored to 1 by early truncation" || bad "expected 2, got '$(_need_gb 806912 200)'"
 [ -z "$(_need_gb '' 200 2>/dev/null)" ] && ok "empty live_kb -> empty (fail-closed, not silently 0)" || bad "empty live_kb should produce empty"
 [ -z "$(_need_gb abc 200 2>/dev/null)" ] && ok "non-numeric live_kb -> empty" || bad "non-numeric live_kb should produce empty"
 [ -z "$(_need_gb 1048576 '' 2>/dev/null)" ] && ok "empty margin_pct -> empty" || bad "empty margin_pct should produce empty"
@@ -199,6 +205,18 @@ grep -q "BD-CALLED.*create.*--type=bug" "$SCRATCH/fake-bd.log" && ok "a failure 
 grep -q "gastown.dog" "$SCRATCH/fake-bd.log" && ok "failure is routed to gastown.dog via gc.routed_to metadata" || bad "expected gc.routed_to routing metadata"
 grep -q "BD-CALLED.*close" "$SCRATCH/fake-bd.log" && bad "a failed run must NOT close its own bead — it needs to stay open and actionable" || ok "failure bead is left open (no close call)"
 
+echo "── _file_summary_bead: an all-SKIP run (nothing verified) files an OPEN bug, distinct from OK ──"
+# Gate-caught (ga-jz7gg fix-attempt 1): overall_rc=2 means every db SKIPped —
+# e.g. dolt unreachable, or disk tight city-wide. This must NOT be filed
+# identically to a genuine overall_rc=0 (at least one real verification) —
+# that would record "checked, all clean" for a run that checked nothing.
+: > "$SCRATCH/fake-bd.log"
+FAKE_BD_LOG="$SCRATCH/fake-bd.log" _file_summary_bead "hq=SKIP(sem-baseline) " 2
+grep -q "BD-CALLED.*create.*--type=bug" "$SCRATCH/fake-bd.log" && ok "an all-SKIP run files a --type=bug (not silently recorded as clean)" || bad "expected a bug create call: $(cat "$SCRATCH/fake-bd.log")"
+grep -q "gastown.dog" "$SCRATCH/fake-bd.log" && ok "all-SKIP run is routed to gastown.dog like a real failure" || bad "expected gc.routed_to routing metadata"
+grep -q "BD-CALLED.*close" "$SCRATCH/fake-bd.log" && bad "an all-SKIP run must NOT close its own bead — nothing was actually verified" || ok "all-SKIP bead is left open (no close call)"
+grep -q "SEM VERIFICACAO" "$SCRATCH/fake-bd.log" && ok "title is textually distinct from the OK case, not just same-title-different-type" || bad "expected a distinguishing title for the all-SKIP case"
+
 echo "── _file_summary_bead: bd itself is unreachable — the summary bead-create call fails ──"
 # Self-audit finding (ga-jz7gg /gate-done pre-flight sweep): the summary bead
 # IS the only channel the digest reads (mol-digest-generate.toml's
@@ -232,6 +250,18 @@ FAKE_GC_SQL_OUTPUT='| 500' FAKE_DOLT_SQL_OUTPUT='| 499' FAKE_BD_LOG="$SCRATCH/fa
 RC=$?
 [ "$RC" -ne 0 ] && ok "any single db FAIL makes the aggregate exit nonzero" || bad "expected nonzero exit when a db regressed"
 grep -q "BD-CALLED.*create.*--type=bug" "$SCRATCH/fake-bd.log" && ok "aggregate failure files the bug-type summary" || bad "expected a bug-type summary bead"
+
+echo "── main: every db legitimately SKIPs -> overall_rc=2, distinct from OK(0) and FAIL(1) ──"
+# Gate-caught (ga-jz7gg fix-attempt 1): reuses city2's alpha/beta (both have
+# live+backup dirs from the block above), but with no FAKE_GC_SQL_OUTPUT ->
+# live_count is unreadable for both -> both legitimately SKIP(sem-baseline).
+# Before the fix, main() only ever set overall_rc on a FAIL, so this exact
+# shape (every db SKIP, zero FAIL) silently exited 0 and filed a "clean" bead.
+: > "$SCRATCH/fake-bd.log"; : > "$RESTORE_VERIFY_LOG"
+FAKE_BD_LOG="$SCRATCH/fake-bd.log" main
+RC=$?
+[ "$RC" -eq 2 ] && ok "all-SKIP run exits 2, distinct from both OK(0) and FAIL(1)" || bad "expected exit 2 when every db SKIPs, got $RC"
+grep -q "BD-CALLED.*create.*--type=bug" "$SCRATCH/fake-bd.log" && ok "main's all-SKIP run files the bug-type summary, not a clean chore" || bad "expected a bug-type summary bead for an all-SKIP main() run: $(cat "$SCRATCH/fake-bd.log")"
 
 echo "── main: empty backup root -> clean no-op, no bead filed ──"
 rm -rf "$SCRATCH/city3"; DOLTDIR="$SCRATCH/city3/doltdir"; BACKUP_ROOT="$SCRATCH/city3/backup"
