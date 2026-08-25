@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.dolt-restore-verify</string>
+
+  <!-- ga-jz7gg (scope items 3+4): weekly, disk-safe, READ-ONLY integrity
+       check — restores each backed-up db to a scratch dir, compares its
+       issue count against the live db, deletes the scratch copy. Sunday
+       05:00 = 30min after com.gascity.dolt-compact-routine's 04:30 slot (so
+       the freshest possible reseed has usually already landed) and outside
+       com.gascity.dolt-s3-backup's 04:00 window, on what this city's own
+       quiet-window doctrine (ga-1dx2v, cited in dolt-compact-routine.plist)
+       already established as a low-load hour. Weekly, not daily: a restore-
+       verify's own disk peak (~1x the live db) is real cost for a check
+       that doesn't need daily freshness — the story's own naming lesson is
+       that this exact operation ALMOST BROUGHT DOWN THE DISK once already
+       when run manually at peak time (25/08), which is why the script's
+       OWN per-db preflight (not just this schedule) is what actually keeps
+       it safe: see scripts/dolt-restore-verify.sh's header. Every db is
+       checked in one run (RESTORE_VERIFY_ONLY_DBS left unset); any db
+       without disk headroom right now is individually SKIPPED, not force-
+       run — this is by design, not a silent gap (the skip reason is named
+       in the run's own summary bead, labeled restore-verify). -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/dolt-restore-verify.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key><integer>0</integer>
+    <key>Hour</key><integer>5</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/dolt-restore-verify-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/dolt-restore-verify-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+  </dict>
+</dict>
+</plist>

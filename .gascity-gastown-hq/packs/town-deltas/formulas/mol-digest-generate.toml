@@ -215,6 +215,33 @@ is unused. If any rig's query fails, say so and report N/A for that rig rather
 than treating a query failure as zero — same rule as the Escalations query
 below.
 
+d) **Restore-verify (integridade do backup Dolt)** — ga-jz7gg: verificação
+semanal automatizada que restaura cada backup Dolt para um diretório
+temporário, compara a contagem de issues contra o banco vivo, e apaga a
+cópia. Roda só aos domingos 05:00 (`com.gascity.dolt-restore-verify`,
+escopado a gascity/HQ apenas — diferente de Incidentes/Escalações acima,
+NÃO é per-rig, então não precisa do loop):
+```bash
+gc bd -C "/Users/athos/gt/.gascity-gastown-hq" list --label=restore-verify --all --created-after=$SINCE --created-before=$UNTIL --json --limit=0
+```
+Uma execução limpa fecha o próprio bead na hora (`type=chore`); uma falha
+fica ABERTA (`type=bug`, roteada para `gastown.dog`) — então qualquer
+resultado aberto com esse label dentro da janela é, por si só, digno de
+Highlights, independente de quantos outros houve.
+
+**Silêncio aqui não é "tudo limpo" — é "não rodou nesta janela", e as duas
+coisas parecem idênticas até você checar.** Como o job só dispara uma vez
+por semana, um digest diário vai ler zero na maioria dos dias por DESENHO
+— isso é esperado, mesma lógica de "dia tranquilo" da seção de Incidentes.
+Mas zero também é o que aparece se o launchd job parou de disparar (mesma
+falha de classe que já pegou `nightly-capacity-check-trend.log`: um
+mecanismo "deveria escrever isto" que ninguém nunca confirmou que escreve).
+Distinga as duas checando a bead MAIS RECENTE com esse label, SEM limite de
+data (`--all --limit=1` ordenado por criação, fora da janela [SINCE,UNTIL)):
+se ela tem mais de ~9 dias (folga sobre o ciclo semanal de 7), reporte
+explicitamente "restore-verify não roda há Nd, esperado semanal" em vez de
+deixar um resultado vazio no período se disfarçar de "mais um dia tranquilo".
+
 **Why every query above needs BOTH bounds:** this formula fires on the
 deacon's cooldown trigger, not a midnight cron — it can run at any
 wall-clock hour. A `--created-after=$SINCE` with no `--created-before=$UNTIL`

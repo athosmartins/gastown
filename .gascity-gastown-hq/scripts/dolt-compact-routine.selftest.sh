@@ -40,6 +40,14 @@ echo "GC-CALLED $*" >> "${FAKE_GC_LOG:-/dev/null}"
 exit 0
 EOF
 chmod +x "$GC"
+RESEED_SCRIPT="$SCRATCH/fake-reseed.sh"
+cat > "$RESEED_SCRIPT" <<'EOF'
+#!/bin/bash
+echo "RESEED-CALLED $*" >> "${FAKE_RESEED_LOG:-/dev/null}"
+[ "$1" = "${FAKE_RESEED_FAIL_DB:-}" ] && [ -n "${FAKE_RESEED_FAIL_DB:-}" ] && exit 1
+exit 0
+EOF
+chmod +x "$RESEED_SCRIPT"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
@@ -399,6 +407,63 @@ ENABLED=0
 _decide_and_run
 [ "$RUN_COMPACT_CALLS" -eq 0 ] && ok "DOLT_COMPACT_ROUTINE_ENABLED=0 → hard no-op" || bad "kill switch should have prevented everything"
 ENABLED=1
+
+# ════════════════════════════════════════════════════════════════════════════
+# 4. Post-compaction reseed hook (ga-jz7gg, scope item 1) — after a
+#    successful, clean-verified compact, each ATTEMPTED db must trigger
+#    scripts/dolt-backup-reseed.sh <db>, exactly once, so the append-only
+#    .dolt-backup staging area doesn't accumulate orphan blobs (3 prior
+#    occurrences: 9.6G/12G/13G — see the story's own description). A skip-only
+#    (nothing flattened) run must NEVER trigger reseed. A reseed failure is a
+#    best-effort concern, not a data-integrity one — it must notify (silent
+#    failure would recreate the exact bug this hook exists to close) but must
+#    NEVER write a HALT sentinel (compact's own post-verification already
+#    proved the DATA is fine; reseed only refreshes the BACKUP of that data).
+# ════════════════════════════════════════════════════════════════════════════
+echo "── _decide_and_run: reseed runs after a clean compact, once per attempted db ──"
+_setup_fixture_city
+RUN_COMPACT_CALLS=0
+: > "$SCRATCH/fake-reseed.log"
+: > "$SCRATCH/fake-notify.log"
+_check_backup()   { return 0; }
+_check_headroom() { return 0; }
+_check_quiet()    { return 0; }
+_snapshot_db()          { echo "10 ga-fixture-1 3"; }
+_rescan_control_bead()  { echo "3"; }
+_run_compact() { RUN_COMPACT_CALLS=$((RUN_COMPACT_CALLS + 1)); _COMPACT_STDOUT="compact: db=whatsapp_automation commits=2500 root=abc tables=9 — flattening...
+compact: db=whatsapp_automation flatten OK"; _COMPACT_RC=0; }
+FAKE_RESEED_LOG="$SCRATCH/fake-reseed.log" FAKE_NOTIFY_LOG="$SCRATCH/fake-notify.log" _decide_and_run
+grep -q "RESEED-CALLED whatsapp_automation" "$SCRATCH/fake-reseed.log" 2>/dev/null && ok "clean compact of an attempted db triggers reseed with that db's name" || bad "expected 'RESEED-CALLED whatsapp_automation' in $SCRATCH/fake-reseed.log, got: $(cat "$SCRATCH/fake-reseed.log" 2>/dev/null)"
+[ "$(grep -c 'RESEED-CALLED whatsapp_automation' "$SCRATCH/fake-reseed.log" 2>/dev/null)" = "1" ] && ok "reseed fires exactly once per attempted db, not more" || bad "expected exactly 1 reseed call for whatsapp_automation"
+
+echo "── _decide_and_run: reseed only fires for ATTEMPTED dbs, never on a skip-only (noop) run ──"
+_setup_fixture_city
+: > "$SCRATCH/fake-reseed.log"
+_run_compact() { _COMPACT_STDOUT="compact: db=whatsapp_automation commits=1200 below_threshold=2000 — skip"; _COMPACT_RC=0; }
+FAKE_RESEED_LOG="$SCRATCH/fake-reseed.log" _decide_and_run
+[ ! -s "$SCRATCH/fake-reseed.log" ] && ok "skip-only compact never triggers reseed (nothing was actually flattened)" || bad "reseed should not fire when nothing was attempted, got: $(cat "$SCRATCH/fake-reseed.log" 2>/dev/null)"
+
+echo "── _decide_and_run: a reseed failure notifies but does NOT halt ──"
+_setup_fixture_city
+: > "$SCRATCH/fake-notify.log"
+_check_backup()   { return 0; }
+_check_headroom() { return 0; }
+_check_quiet()    { return 0; }
+_snapshot_db()          { echo "10 ga-fixture-1 3"; }
+_rescan_control_bead()  { echo "3"; }
+_run_compact() { _COMPACT_STDOUT="compact: db=whatsapp_automation commits=2500 root=abc tables=9 — flattening...
+compact: db=whatsapp_automation flatten OK"; _COMPACT_RC=0; }
+FAKE_RESEED_FAIL_DB="whatsapp_automation" FAKE_NOTIFY_LOG="$SCRATCH/fake-notify.log" _decide_and_run
+[ ! -f "$HALT_SENTINEL" ] && ok "reseed failure does not write a HALT sentinel (compact's own data integrity was already verified clean; reseed is a separate, best-effort backup refresh)" || bad "reseed failure should never halt compact"
+RESEED_NOTIFY_LINE="$(grep -i "reseed" "$SCRATCH/fake-notify.log" 2>/dev/null)"
+[ -n "$RESEED_NOTIFY_LINE" ] && ok "reseed failure IS surfaced via notify (silent failure would recreate the exact orphan-blob problem this hook exists to close)" || bad "expected a notify call mentioning reseed, got: $(cat "$SCRATCH/fake-notify.log" 2>/dev/null)"
+# Deliberately grep the isolated reseed-notify LINE, not the whole log — the
+# unrelated "✅ compacted: whatsapp_automation" success notify ALSO contains
+# the db name, and a whole-log grep would false-pass here even with the
+# reseed-failure notify never implemented at all (caught live while writing
+# this test: the whole-log version passed before the feature existed).
+printf '%s' "$RESEED_NOTIFY_LINE" | grep -q "whatsapp_automation" && ok "notify names which db's reseed failed" || bad "notify should name the failing db, got: $RESEED_NOTIFY_LINE"
+FAKE_RESEED_FAIL_DB=""
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

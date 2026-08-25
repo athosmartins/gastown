@@ -99,6 +99,14 @@ BACKUP_LOG="${DOLT_COMPACT_ROUTINE_BACKUP_LOG:-$CITY/.gc/logs/dolt-s3-backup.log
 NOTIFY="/Users/athos/.local/bin/notify"
 GC="${GC_BIN:-gc}"
 BD="$(command -v bd 2>/dev/null || echo /Users/athos/.local/bin/bd)"
+# ga-jz7gg: dolt-backup-reseed.sh (ga-ydrg9) re-seeds ONE db's .dolt-backup
+# staging dir. .dolt-backup is append-only, so a compaction's history-squash
+# never shrinks it on its own — without this hook, orphan blobs accumulate
+# exactly like the 3 prior incidents this story cites (9.6G/12G/13G). The
+# reseed script owns its own disk/data preflight; this hook never duplicates
+# that logic, only decides WHEN to call it (after a real, clean-verified
+# flatten of that specific db).
+RESEED_SCRIPT="$CITY/scripts/dolt-backup-reseed.sh"
 
 ENABLED="${DOLT_COMPACT_ROUTINE_ENABLED:-1}"
 
@@ -734,6 +742,38 @@ $gain_report"
   log "post-verification clean (bead counts + control-bead comments identical for all $(printf '%s' "$ELIGIBLE_DBS" | wc -l | tr -d ' ') eligible db(s); gc dolt status ok; bd latency=${lat_ms}ms)"
   log "disk sizes: $gain_report"
   "$NOTIFY" -t "Dolt compact routine" -p 3 "✅ compacted: $(printf '%s' "$attempted" | paste -sd, -) — verification clean (bd latency ${lat_ms}ms). $(printf '%s' "$gain_report" | tr '\n' ' ')" 2>/dev/null || true
+
+  # ga-jz7gg scope item 1: re-seed the backup staging dir for every db that
+  # was actually flattened above — ONLY reached after the divergence check
+  # returned early (line ~722), so this never fires on a HALTed/unverified db.
+  _reseed_after_compact "$attempted"
+}
+
+# _reseed_after_compact <newline-separated attempted dbs> — best-effort
+# follow-up, never a data-integrity gate. Compact's own post-verification
+# (above) already proved the DATA is correct; this only refreshes the BACKUP
+# of that data, so a reseed failure must notify (silent failure recreates the
+# exact orphan-blob accumulation this hook exists to close — see file header)
+# but must NEVER write a HALT sentinel or block a future run. One db's
+# failure does not stop the others (best-effort per db, not all-or-nothing).
+_reseed_after_compact() {
+  local dbs="$1" db rc failures=""
+  while IFS= read -r db; do
+    [ -n "$db" ] || continue
+    log "reseed: iniciando '$db' pos-compactacao"
+    if timeout "${RESEED_TIMEOUT_SECS:-1800}" "$RESEED_SCRIPT" "$db" >>"$LOG" 2>&1; then
+      log "reseed: '$db' OK"
+    else
+      rc=$?
+      log "reseed: '$db' FALHOU (rc=$rc) — ver $LOG"
+      failures="${failures}${db}(rc=$rc) "
+    fi
+  done <<EOF
+$dbs
+EOF
+  if [ -n "$failures" ]; then
+    "$NOTIFY" -t "Dolt compact routine" -p 4 "⚠️ reseed pos-compactacao falhou: $failures— blobs orfaos podem acumular no .dolt-backup, ver $LOG" 2>/dev/null || true
+  fi
 }
 
 main() { _decide_and_run; }
