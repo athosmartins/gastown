@@ -465,6 +465,38 @@ else
   ok "refuses an empty new-defer target before any bd call — cannot accidentally clear defer_until"
 fi
 
+echo "Scenario D9 (errexit safety, ga-061ua): _pilot_defer_extend survives set -euo pipefail with a genuinely failing bd — does not crash the caller"
+# ga-061ua: gate review caught that the D7 fail-closed path above was
+# UNREACHABLE in production — pilot-dispatcher.sh runs under `set -euo
+# pipefail` (its own line 74), and a bare `VAR=$(cmd); rc=$?` never reaches
+# the rc= line when cmd fails, since the assignment's own failure aborts the
+# whole dispatcher right there. D7 (above) uses a shell FUNCTION override for
+# bd, which runs in THIS file's own harness (set -uo pipefail — no -e), so it
+# could never have caught that class of bug: it proves the DECISION LOGIC is
+# right, not that the caller survives to reach it. This scenario runs the
+# extracted function in a FRESH bash process with -e actually enabled (the
+# same option the real dispatcher runs under) and a `bd` that genuinely
+# returns non-zero, so a regression back to the unguarded pattern fails here
+# even though D7 would still pass.
+D9_SCRIPT="$WORK/errexit-check.sh"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -euo pipefail'
+  echo 'log() { :; }'
+  echo 'DRY_RUN=0'
+  echo 'bd() { return 17; }'
+  printf '%s\n' "$DEFER_FN"
+  echo '_pilot_defer_extend "propdb" "bd-errexit-test" "2026-08-25T22:00:00Z"'
+  echo 'echo SURVIVED'
+} > "$D9_SCRIPT"
+D9_OUT="$(bash "$D9_SCRIPT" 2>&1)"
+D9_RC=$?
+if [ "$D9_RC" -eq 0 ] && printf '%s' "$D9_OUT" | grep -q "SURVIVED"; then
+  ok "survives set -e with a failing bd show (does not abort the dispatcher mid-sweep)"
+else
+  bad "REGRESSION (ga-061ua): crashes under set -e when bd show fails (rc=$D9_RC, out: $D9_OUT)"
+fi
+
 echo "Scenario D6: drift-guard — both timed-hold call sites (ga-lfvs6, ga-4zqwm) wire in _pilot_defer_extend"
 if grep -qF -- '_pilot_defer_extend "$STORY_BEAD_CITY" "$STORY_ID"' "$DISPATCHER"; then
   ok "ga-lfvs6 site calls _pilot_defer_extend"

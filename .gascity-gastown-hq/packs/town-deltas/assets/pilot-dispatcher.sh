@@ -2054,23 +2054,40 @@ _held_until_purge_decision() {
 #   --defer ""` CLEARS the field (per its own --help), so silently passing one
 #   through (e.g. from a caller-side date-formatting failure) would erase
 #   protection instead of adding it.
+#
+#   gate-run ga-061ua (FAIL): this file runs under `set -euo pipefail` (line
+#   74). A bare `VAR=$(cmd)` followed by a SEPARATE `rc=$?` line never reaches
+#   that second line when `cmd` fails — under errexit, the assignment's own
+#   failure terminates the whole dispatcher mid-sweep right there, which is
+#   exactly the crash this function exists to avoid, not a graceful skip
+#   (verified empirically, not just reasoned about: `x=$(false); rc=$?` exits
+#   the script before `rc=$?` runs). Every read below instead uses `cmd ||
+#   rc=$?` in a SINGLE statement — the exemption bash grants to the non-final
+#   member of an `||` list — confirmed empirically to survive a failing `bd`
+#   AND a failing `jq` (including a failing pipeline under pipefail) without
+#   tripping -e. Separately, EVERY exit from this function is `return 0`:
+#   under -e, a bare (unguarded) function-call statement — which is how both
+#   call sites below invoke this — treats the function's own non-zero return
+#   the same as any other failing simple command and aborts the script, so a
+#   deliberate `return 1` here would crash the caller exactly like the bug
+#   above, just one level out. Matches this file's existing convention:
+#   _pilot_hold_or_escalate (below) never returns non-zero either.
 _pilot_defer_extend() {
   local _pde_db="$1" _pde_id="$2" _pde_new_iso="$3"
   if [ -z "$_pde_new_iso" ]; then
     log "ga-sfj3i.1: $_pde_id — empty new-defer target, refusing to touch defer_until (would otherwise clear it)"
-    return 1
+    return 0
   fi
-  local _pde_show_json _pde_show_rc _pde_cur_iso _pde_cur_known=""
-  _pde_show_json=$(bd -C "$_pde_db" show "$_pde_id" --json 2>/dev/null)
-  _pde_show_rc=$?
+  local _pde_show_json="" _pde_show_rc=0 _pde_jq_rc=0 _pde_cur_iso="" _pde_cur_known=""
+  _pde_show_json=$(bd -C "$_pde_db" show "$_pde_id" --json 2>/dev/null) || _pde_show_rc=$?
   if [ "$_pde_show_rc" -eq 0 ] && [ -n "$_pde_show_json" ]; then
     _pde_cur_iso=$(printf '%s' "$_pde_show_json" \
-      | jq -r 'if type=="array" then .[0] else . end | (.defer_until // "")' 2>/dev/null)
-    [ $? -eq 0 ] && _pde_cur_known=1
+      | jq -r 'if type=="array" then .[0] else . end | (.defer_until // "")' 2>/dev/null) || _pde_jq_rc=$?
+    [ "$_pde_jq_rc" -eq 0 ] && _pde_cur_known=1
   fi
   if [ -z "$_pde_cur_known" ]; then
-    log "ga-sfj3i.1: $_pde_id could not verify current defer_until (bd show failed/unreadable, rc=$_pde_show_rc) — skipping defer to avoid clobbering an unknown existing hold; pilot:held-until label still stands"
-    return 1
+    log "ga-sfj3i.1: $_pde_id could not verify current defer_until (bd show rc=$_pde_show_rc, jq rc=$_pde_jq_rc) — skipping defer to avoid clobbering an unknown existing hold; pilot:held-until label still stands"
+    return 0
   fi
   if [ -n "$_pde_cur_iso" ] && [[ "$_pde_cur_iso" > "$_pde_new_iso" || "$_pde_cur_iso" == "$_pde_new_iso" ]]; then
     log "ga-sfj3i.1: $_pde_id keeping existing defer_until=$_pde_cur_iso (>= our own $_pde_new_iso) — not shortening an existing defer"
@@ -2082,6 +2099,7 @@ _pilot_defer_extend() {
   fi
   bd -C "$_pde_db" update "$_pde_id" --defer "$_pde_new_iso" -q 2>/dev/null || true
   log "ga-sfj3i.1: $_pde_id deferred until $_pde_new_iso — now hidden from bd ready (Pilot's own re-dispatch scan AND every pool self-serve probe), not just the pilot:held label"
+  return 0
 }
 
 _pilot_hold_or_escalate() {
