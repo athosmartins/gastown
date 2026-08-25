@@ -58,12 +58,22 @@ case "$1" in
   -C) shift 2 ;;
 esac
 case "$1" in
-  create) echo "${FAKE_BD_NEW_ID:-fake-bead-1}" ;;
+  create)
+    [ "${FAKE_BD_CREATE_FAIL:-0}" = "1" ] && exit 1
+    echo "${FAKE_BD_NEW_ID:-fake-bead-1}"
+    ;;
   close)  ;;
 esac
 exit 0
 EOF
 chmod +x "$BD_BIN"
+
+NOTIFY="$SCRATCH/fake-notify.sh"
+cat > "$NOTIFY" <<'EOF'
+#!/bin/bash
+echo "NOTIFY-CALLED $*" >> "${FAKE_NOTIFY_LOG:-/dev/null}"
+EOF
+chmod +x "$NOTIFY"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
@@ -188,6 +198,19 @@ FAKE_BD_LOG="$SCRATCH/fake-bd.log" _file_summary_bead "hq=FAIL(nao-restaura-ou-s
 grep -q "BD-CALLED.*create.*--type=bug" "$SCRATCH/fake-bd.log" && ok "a failure files a --type=bug (actionable, not a silent record)" || bad "expected a bug create call: $(cat "$SCRATCH/fake-bd.log")"
 grep -q "gastown.dog" "$SCRATCH/fake-bd.log" && ok "failure is routed to gastown.dog via gc.routed_to metadata" || bad "expected gc.routed_to routing metadata"
 grep -q "BD-CALLED.*close" "$SCRATCH/fake-bd.log" && bad "a failed run must NOT close its own bead — it needs to stay open and actionable" || ok "failure bead is left open (no close call)"
+
+echo "── _file_summary_bead: bd itself is unreachable — the summary bead-create call fails ──"
+# Self-audit finding (ga-jz7gg /gate-done pre-flight sweep): the summary bead
+# IS the only channel the digest reads (mol-digest-generate.toml's
+# restore-verify section queries beads, not this log file). If bd is down
+# specifically at THIS step, a log-only warning is invisible to anything
+# that isn't tailing this exact file — an independent channel (notify, which
+# doesn't depend on bd/Dolt at all) must also fire, or a real integrity
+# result silently never reaches anyone.
+: > "$SCRATCH/fake-notify.log"; : > "$RESTORE_VERIFY_LOG"
+FAKE_BD_CREATE_FAIL=1 FAKE_NOTIFY_LOG="$SCRATCH/fake-notify.log" _file_summary_bead "hq=OK(500) " 0
+grep -q "NOTIFY-CALLED" "$SCRATCH/fake-notify.log" && ok "bd being unreachable for the summary bead fires an independent notify (not just a log line nobody watches)" || bad "expected a notify call when bd create fails: $(cat "$SCRATCH/fake-notify.log" 2>/dev/null)"
+grep -q "restore-verify" "$RESTORE_VERIFY_LOG" && ok "the failure is still recorded in the log too (belt and suspenders, not notify-only)" || bad "expected the failure logged to $RESTORE_VERIFY_LOG as well"
 
 # ════════════════════════════════════════════════════════════════════════════
 # 4. main() orchestration

@@ -31,6 +31,7 @@ LOG="${RESTORE_VERIFY_LOG:-$CITY/.gc/logs/dolt-restore-verify.log}"
 DOLT_BIN="${DOLT_BIN:-dolt}"
 GC_BIN="${GC_BIN:-gc}"
 BD_BIN="${BD_BIN:-bd}"
+NOTIFY="${NOTIFY:-/Users/athos/.local/bin/notify}"
 # Own, independently-tunable margin — deliberately NOT the same env var name
 # as dolt-backup-reseed.sh's RESEED_DISK_MARGIN_PCT, so tuning one script's
 # safety margin can never silently change the other's. 200% (not 250%) is
@@ -177,7 +178,14 @@ Log completo: $LOG"
   if [ -n "$bead_id" ]; then
     log "bead de resumo: $bead_id"
   else
+    # The summary bead is the ONLY channel mol-digest-generate.toml's
+    # restore-verify section reads — a log-only warning here is invisible to
+    # anything not tailing this exact file. notify is an INDEPENDENT channel
+    # (a plain HTTP POST to ntfy.sh, no bd/Dolt dependency at all), so it
+    # still fires even when bd itself is the thing that's down — exactly the
+    # case a log line alone cannot cover.
     log "AVISO: falhei ao criar o bead de resumo — resultado so existe no log ($LOG)"
+    "$NOTIFY" -t "Dolt restore-verify" -p 4 "⚠️ restore-verify rodou mas falhou ao registrar o bead de resumo (bd indisponivel?) — resultado: $results ver $LOG" 2>/dev/null || true
   fi
 }
 
