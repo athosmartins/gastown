@@ -291,6 +291,16 @@ REALERT_SEC = 900        # 15min re-alert cadence for escalated beads
 POOL_DEAD_MIN      = int(os.environ.get("IRG_POOL_DEAD_MIN", "3"))
 POOL_DEAD_COOLDOWN = int(os.environ.get("IRG_POOL_DEAD_COOLDOWN_SEC", "1800"))
 
+# Guard self-blindness alert configuration (ga-8cjfr3)
+# Emit a [GUARD-BLIND] Mayor mail once one of run_cycle's fail-safe queries
+# (bd list, in_progress sweep, session list, gate-marker, sling-owner) has
+# returned None for QUERY_FAIL_MIN_CYCLES consecutive cycles — Dolt
+# contention is what strands beads AND what blinds this exact detector, so a
+# silent skip-and-return here is a blind spot maximally correlated with the
+# condition it exists to catch.
+QUERY_FAIL_MIN_CYCLES = int(os.environ.get("IRG_QUERY_FAIL_MIN_CYCLES", "10"))
+QUERY_FAIL_COOLDOWN   = int(os.environ.get("IRG_QUERY_FAIL_COOLDOWN_SEC", str(REALERT_SEC)))
+
 # ga-hkpwv: bare pool-template assignee names (NOT concrete session names like
 # 'wa-worker-adhoc-<hash>'). A bead in_progress with one of these assignees is
 # a Pilot pool dispatch that never engaged — no Pilot markers (pilot:dispatched /
@@ -1067,6 +1077,110 @@ def _check_pool_dead(pool_zombies, now):
             ps["last_alert_epoch"] = now
 
         _save_pool_dead_state(pool, ps)
+
+
+# ---------------------------------------------------------------------------
+# Guard self-blindness detection (ga-8cjfr3)
+# State file: ${STATE_FILE}.query-fail
+# Stores {"consecutive_cycles": N, "last_alert_epoch": T, "last_reason": "<str>"}
+#
+# run_cycle()'s fail-safe queries each skip the cycle silently on a None
+# result (necessary — a transient Dolt blip must never fall through into a
+# bad reclaim) but historically that meant zero counter, zero threshold,
+# zero escalation: the guard could go blind for hours with nothing to show
+# for it but log lines nobody watches in real time. Mirrors _check_pool_dead's
+# state shape, but with no 2-cycle hysteresis on the way up (see
+# _note_query_failure's docstring) and immediate reset on the way down (see
+# _note_query_success's docstring) — recovery is unambiguous in a way a
+# single successful query result never is for zombie-bead detection.
+# ---------------------------------------------------------------------------
+
+def _query_fail_state_path():
+    """Path to the query-failure state file (alongside the main state file)."""
+    return STATE_FILE + ".query-fail"
+
+
+def _load_query_fail_state():
+    """Load query-fail state. Returns default dict on any error."""
+    try:
+        with open(_query_fail_state_path()) as f:
+            return json.load(f)
+    except Exception:
+        return {"consecutive_cycles": 0, "last_alert_epoch": 0, "last_reason": ""}
+
+
+def _save_query_fail_state(qs):
+    """Save query-fail state. Best-effort; never crashes."""
+    try:
+        path = _query_fail_state_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(qs, f)
+    except Exception as exc:
+        print(f"[INFLIGHT-RECLAIM] query-fail state save failed: {exc}", flush=True)
+
+
+def _note_query_failure(reason, now):
+    """Record a fail-safe query failure that caused run_cycle to skip the cycle.
+
+    Call at each of run_cycle's `... is None` skip points, before returning.
+    Unlike POOL-DEAD's 2-cycle hysteresis (which exists to absorb one noisy
+    cycle before trusting a *positive* zombie signal), every consecutive
+    failure counts here — a query failure is never itself ambiguous, only
+    its persistence is what determines whether it's worth escalating. Fires
+    a [GUARD-BLIND] Mayor alert once QUERY_FAIL_MIN_CYCLES consecutive
+    cycles have failed, rate-limited to one alert per QUERY_FAIL_COOLDOWN
+    seconds. Fail-open: any error (including the mail call) is logged and
+    swallowed — this function must never be why a cycle crashes.
+    """
+    try:
+        qs = _load_query_fail_state()
+        qs["consecutive_cycles"] = qs.get("consecutive_cycles", 0) + 1
+        qs["last_reason"] = reason
+        n = qs["consecutive_cycles"]
+
+        if (n >= QUERY_FAIL_MIN_CYCLES
+                and now - qs.get("last_alert_epoch", 0) > QUERY_FAIL_COOLDOWN):
+            emit(f"[INFLIGHT-RECLAIM] [GUARD-BLIND] {n} consecutive cycles failed "
+                 f"(latest: {reason}) — the guard cannot currently see stranded beads")
+            try:
+                result = subprocess.run(
+                    ["gc", "mail", "send", "mayor",
+                     "-s", "[GUARD-BLIND] inflight-reclaim-guard cannot query Dolt",
+                     "-m", (f"inflight-reclaim-guard has failed its own bd/session query for "
+                            f"{n} consecutive cycles (latest reason: {reason}). The guard "
+                            f"cannot currently detect or reclaim stranded beads. This usually "
+                            f"self-resolves with the underlying Dolt contention; escalating "
+                            f"because the safety net itself is blind in the meantime.")],
+                    timeout=20, capture_output=True)
+                if result.returncode != 0:
+                    print(f"[INFLIGHT-RECLAIM] [GUARD-BLIND] mail non-zero exit rc={result.returncode}: "
+                          f"{result.stderr.decode(errors='replace').strip()}", flush=True)
+            except Exception as exc:
+                print(f"[INFLIGHT-RECLAIM] [GUARD-BLIND] mail failed: {exc}", flush=True)
+            qs["last_alert_epoch"] = now
+
+        _save_query_fail_state(qs)
+    except Exception as exc:
+        print(f"[INFLIGHT-RECLAIM] warn: _note_query_failure failed: {exc}", flush=True)
+
+
+def _note_query_success():
+    """Reset the consecutive-failure counter once a cycle clears every fail-safe query.
+
+    Called once run_cycle has passed all of its `... is None` skip points.
+    Resets to 0 immediately, no hysteresis: a single successful cycle is
+    unambiguous proof the guard can see again (unlike POOL-DEAD's zombie
+    detection, where one clean cycle could still be a blip in the underlying
+    condition, not the detector's own ability to observe it).
+    """
+    try:
+        qs = _load_query_fail_state()
+        if qs.get("consecutive_cycles", 0) > 0:
+            qs["consecutive_cycles"] = 0
+            _save_query_fail_state(qs)
+    except Exception as exc:
+        print(f"[INFLIGHT-RECLAIM] warn: _note_query_success failed: {exc}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -3565,6 +3679,7 @@ def run_cycle(state, escalated_alerted):
     beads = list_inflight_beads()
     if beads is None:
         print("[INFLIGHT-RECLAIM] bd list failed — skipping cycle", flush=True)
+        _note_query_failure("bd list failed", now)
         return 0, 0
 
     # --- ga-vw26y: also sweep in_progress Pilot stories that lost story:in-flight
@@ -3573,6 +3688,7 @@ def run_cycle(state, escalated_alerted):
     inprogress = list_stranded_inprogress_beads()
     if inprogress is None:
         print("[INFLIGHT-RECLAIM] in_progress sweep failed — skipping cycle (safe)", flush=True)
+        _note_query_failure("in_progress sweep failed", now)
         return len(beads), 0
 
     # Merge + dedup by id (a bead can match both queries).
@@ -3587,6 +3703,7 @@ def run_cycle(state, escalated_alerted):
     sessions = list_active_sessions()
     if sessions is None:
         print("[INFLIGHT-RECLAIM] session list failed — skipping cycle", flush=True)
+        _note_query_failure("session list failed", now)
         return len(beads), 0
 
     # ga-seuh4/ga-a8t68: self-heal any bead order:orphan-sweep wrongfully
@@ -3608,6 +3725,7 @@ def run_cycle(state, escalated_alerted):
     gate_active_beads = list_gate_active_source_beads()
     if gate_active_beads is None:
         print("[INFLIGHT-RECLAIM] gate-marker query failed — skipping cycle (safe)", flush=True)
+        _note_query_failure("gate-marker query failed", now)
         return len(beads), 0
 
     # --- Query live sling-owner source beads (ga-qfo3, fail-safe: None → skip
@@ -3615,7 +3733,13 @@ def run_cycle(state, escalated_alerted):
     live_sling_owner_beads = list_live_sling_source_beads(sessions, now)
     if live_sling_owner_beads is None:
         print("[INFLIGHT-RECLAIM] sling-owner query failed — skipping cycle (safe)", flush=True)
+        _note_query_failure("sling-owner query failed", now)
         return len(beads), 0
+
+    # ga-8cjfr3: every fail-safe skip point above has now been cleared this
+    # cycle — reset the consecutive-failure counter immediately (see
+    # _note_query_success's docstring for why no hysteresis is needed here).
+    _note_query_success()
 
     # --- Query refused sling-source beads (ga-9d80l). Fail-OPEN contract —
     #     unlike the two queries above, a lookup error here degrades to {}
@@ -4123,7 +4247,96 @@ def _selftest():
                   "wa-worker" in _out and "rc=1" in _out,
                   f"captured={_out!r}")
 
+            # -------------------------------------------------------------------
+            # Section 2b: GUARD-BLIND scenarios (ga-8cjfr3) — same tmpdir +
+            # STATE_FILE + subprocess.run stub as the POOL-DEAD block above.
+            # -------------------------------------------------------------------
+            try:
+                os.remove(STATE_FILE + ".query-fail")
+            except Exception:
+                pass
+            _mail_log.clear()
+
+            # --- GUARD-BLIND-1: fewer than QUERY_FAIL_MIN_CYCLES failures → no alert ---
+            for i in range(QUERY_FAIL_MIN_CYCLES - 1):
+                _note_query_failure("bd list failed", T + i)
+            check("GUARD-BLIND-1: below threshold → no alert",
+                  len(_mail_log) == 0, f"mail_log={_mail_log}")
+            check("GUARD-BLIND-1: counter reflects accumulated failures",
+                  _load_query_fail_state()["consecutive_cycles"] == QUERY_FAIL_MIN_CYCLES - 1,
+                  f"state={_load_query_fail_state()}")
+
+            # --- GUARD-BLIND-2: Nth consecutive failure → [GUARD-BLIND] alert fires ---
+            _note_query_failure("bd list failed", T + QUERY_FAIL_MIN_CYCLES - 1)
+            check("GUARD-BLIND-2: threshold reached → mail emitted",
+                  len(_mail_log) == 1, f"mail_log={_mail_log}")
+            check("GUARD-BLIND-2: mail subject contains [GUARD-BLIND]",
+                  len(_mail_log) == 1 and "[GUARD-BLIND]" in " ".join(_mail_log[0]),
+                  f"mail_log={_mail_log}")
+            check("GUARD-BLIND-2: mail body names the failing query",
+                  len(_mail_log) == 1 and "bd list failed" in " ".join(_mail_log[0]),
+                  f"mail_log={_mail_log}")
+
+            # --- GUARD-BLIND-3: further failure within cooldown → no repeat alert ---
+            _note_query_failure("bd list failed", T + QUERY_FAIL_MIN_CYCLES)
+            check("GUARD-BLIND-3: within cooldown → no repeat alert",
+                  len(_mail_log) == 1, f"mail_log={_mail_log}")
+
+            # --- GUARD-BLIND-4: after cooldown expires → alert fires again ---
+            _note_query_failure("session list failed",
+                                 T + QUERY_FAIL_MIN_CYCLES + QUERY_FAIL_COOLDOWN + 30)
+            check("GUARD-BLIND-4: after cooldown → second alert fires",
+                  len(_mail_log) == 2, f"mail_log={_mail_log}")
+            check("GUARD-BLIND-4: second alert names the NEW failing query",
+                  len(_mail_log) == 2 and "session list failed" in " ".join(_mail_log[1]),
+                  f"mail_log={_mail_log}")
+
+            # --- GUARD-BLIND-5: a clean cycle resets the counter (no hysteresis) ---
+            try:
+                os.remove(STATE_FILE + ".query-fail")
+            except Exception:
+                pass
+            _mail_log.clear()
+            for i in range(QUERY_FAIL_MIN_CYCLES - 1):
+                _note_query_failure("bd list failed", T + i)      # 1 short of threshold
+            _note_query_success()                                  # cycle recovers
+            check("GUARD-BLIND-5: success resets counter to 0",
+                  _load_query_fail_state()["consecutive_cycles"] == 0,
+                  f"state={_load_query_fail_state()}")
+            _note_query_failure("bd list failed", T + 1000)         # 1 failure post-recovery
+            check("GUARD-BLIND-5: post-recovery failure doesn't inherit old count",
+                  _load_query_fail_state()["consecutive_cycles"] == 1,
+                  f"state={_load_query_fail_state()}")
+            check("GUARD-BLIND-5: no alert (never reached threshold post-reset)",
+                  len(_mail_log) == 0, f"mail_log={_mail_log}")
+
+            # --- GUARD-BLIND-6: mail non-zero exit → failure log is emitted ---
+            try:
+                os.remove(STATE_FILE + ".query-fail")
+            except Exception:
+                pass
+            _mail_log.clear()
+            subprocess.run = _stub_run_fail
+            _cap2 = _io.StringIO()
+            _orig_stdout2 = _sys.stdout
+            _sys.stdout = _cap2
+            try:
+                for i in range(QUERY_FAIL_MIN_CYCLES):
+                    _note_query_failure("bd list failed", T + i)
+            finally:
+                _sys.stdout = _orig_stdout2
+                subprocess.run = _stub_run
+
+            _out2 = _cap2.getvalue()
+            check("GUARD-BLIND-6: mail non-zero exit → failure log emitted",
+                  "[GUARD-BLIND] mail non-zero exit" in _out2,
+                  f"captured={_out2!r}")
+
         finally:
+            try:
+                os.remove(STATE_FILE + ".query-fail")
+            except Exception:
+                pass
             subprocess.run = _orig_run
             STATE_FILE = _orig_state
     finally:
