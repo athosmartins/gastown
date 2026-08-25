@@ -106,6 +106,25 @@ refresh token"*, this is almost certainly the cause — re-run
 against this remote until you've confirmed `grep refresh_token
 ~/.config/rclone/rclone.conf` finds it.
 
+### The `gc bd` under-launchd gotcha (read this before touching `mini-restic-restore-test.sh`)
+
+`gc bd -C <path> create` is **not** enough to satisfy Gas City's city
+detection on its own — reproduced live: run under launchd's default
+working directory (`/`, since none of these 3 plists set a
+`WorkingDirectory` key), `gc bd -C "$BEAD_REPO" create ...` failed with
+*"not in a city directory (no city.toml or .gc/ found)"* even though `-C`
+named a perfectly valid one. `cd`-ing into `$BEAD_REPO` first fixes it
+regardless of `-C`. This bit the very first launchd-triggered run of
+`mini-restic-restore-test.sh` during setup: the restore itself passed, but
+the audit bead silently failed to get created — `rc` stayed 0 because
+nothing checked `gc bd create`'s output before using it, so the failure
+produced no log warning and no notification. Fixed two ways: the script
+now `cd`s into `$BEAD_REPO` before any `gc bd` call, *and* an empty
+`bead_id` after a passing restore now logs a WARNING and fires a `notify`
+of its own — so a future recurrence of this class of bug (city detection,
+or anything else that makes `gc bd create` return empty) can't go silent
+again the same way.
+
 ## Cadence (all via launchd, `com.athos.mini-restic-*`)
 
 | Job | Schedule | Script | Does |
