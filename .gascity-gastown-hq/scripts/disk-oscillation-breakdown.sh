@@ -105,7 +105,17 @@ for t in "${TARGETS[@]}"; do
     continue
   fi
   sz_kb="$(printf '%s' "$sz_line" | awk '{print $1}')"
-  [ -n "$sz_kb" ] || sz_kb=0
+  if [ -z "$sz_kb" ]; then
+    # du exited without timing out but produced no parseable total (e.g. a
+    # top-level access error, or the target vanishing between the -d check
+    # above and this call). This is a FAILED measurement, not a confirmed
+    # zero — defaulting to 0 would silently fold "couldn't measure" into
+    # "measured, and it's 0 bytes," understating the true gap with no
+    # visible signal. Count it as blocked instead.
+    log "  UNREADABLE (rc=${rc}): $t — no parseable du output, counted as blocked, not summed"
+    blocked_n=$((blocked_n + 1))
+    continue
+  fi
   measured_kb=$((measured_kb + sz_kb))
   [ "$err_n" -gt 0 ] && blocked_n=$((blocked_n + 1))
   log "  ${sz_kb}K  ${t}  (permission-errors: ${err_n})"
