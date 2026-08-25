@@ -366,19 +366,22 @@ if [ -z "$DEFER_FN" ]; then
   exit 2
 fi
 
-# run_defer <db> <id> <new_iso> [<cur_defer_iso_or_empty>] [<dry(0|1)>]
+# run_defer <db> <id> <new_iso> [<cur_defer_iso_or_empty>] [<dry(0|1)>] [<simulate_show_failure(0|1)>]
 # The fake bd() here additionally SERVES `show <id> --json` with a
 # controllable current defer_until, since _pilot_defer_extend reads it back
 # before deciding whether to extend — the plain call-logging fake bd() at the
-# top of this file (used by run_hold) can't do that.
+# top of this file (used by run_hold) can't do that. simulate_show_failure=1
+# makes the fake `show` return non-zero with no output, exercising the
+# fail-closed path (a real Dolt hiccup must not be read as "no current hold").
 run_defer() {
   : > "$CALLS"
   ( DRY_RUN="${5:-0}"
-    _RD_ID="$2" _RD_CUR="${4:-}"
+    _RD_ID="$2" _RD_CUR="${4:-}" _RD_FAIL="${6:-0}"
     bd() {
       printf 'bd\t%s\n' "$*" >> "$CALLS"
       case "$*" in
         *"show $_RD_ID --json"*)
+          [ "$_RD_FAIL" = "1" ] && return 1
           if [ -n "$_RD_CUR" ]; then
             printf '[{"defer_until":"%s"}]' "$_RD_CUR"
           else
@@ -439,6 +442,27 @@ if has_call "update bd-14 --defer"; then
   bad "REGRESSION: DRY_RUN performed a real bd update"
 else
   ok "DRY_RUN performs no real mutation"
+fi
+
+echo "Scenario D7 (fail-closed, third-state): bd show fails/unreadable — does NOT write a defer (never clobber an unverifiable existing hold)"
+run_defer "propdb" "bd-15" "2026-08-25T22:00:00Z" "" 0 1
+if has_call "bd	-C propdb update bd-15 --defer"; then
+  bad "REGRESSION: wrote a defer despite being unable to verify the current value"
+else
+  ok "fail-closed: no defer written when the current value could not be verified"
+fi
+if has_call "could not verify current defer_until"; then
+  ok "logs the fail-closed reason (not silent)"
+else
+  bad "did not log why the write was skipped"
+fi
+
+echo "Scenario D8 (empty new_iso guard): an empty new-defer target is refused outright, never reaches bd update"
+run_defer "propdb" "bd-16" "" "" 0
+if grep -qE '^bd\t' "$CALLS"; then
+  bad "REGRESSION: made a bd call at all for an empty new-defer target (would risk clearing defer_until via --defer '')"
+else
+  ok "refuses an empty new-defer target before any bd call — cannot accidentally clear defer_until"
 fi
 
 echo "Scenario D6: drift-guard — both timed-hold call sites (ga-lfvs6, ga-4zqwm) wire in _pilot_defer_extend"

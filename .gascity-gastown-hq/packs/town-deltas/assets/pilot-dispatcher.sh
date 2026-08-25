@@ -2043,11 +2043,35 @@ _held_until_purge_decision() {
 #   a plain string compare is enough, no date-parsing of the CURRENT value
 #   needed. <new_iso> must already be in that same format (callers compute it
 #   via `date -u -r <epoch> +"%Y-%m-%dT%H:%M:%SZ"`).
+#
+#   Third-state guard (gate-done self-audit): a failed/unreadable `bd show`
+#   must NOT be treated the same as "read succeeded, no current defer" — that
+#   would collapse "don't know" into "safe to overwrite" and could clobber an
+#   unverifiable longer hold. Capture the show call's own exit status and the
+#   jq parse's own success separately from the extracted value, and skip the
+#   write entirely (fail closed) unless the current value was positively
+#   confirmed readable. Also refuse an empty <new_iso> outright — `bd update
+#   --defer ""` CLEARS the field (per its own --help), so silently passing one
+#   through (e.g. from a caller-side date-formatting failure) would erase
+#   protection instead of adding it.
 _pilot_defer_extend() {
   local _pde_db="$1" _pde_id="$2" _pde_new_iso="$3"
-  local _pde_cur_iso
-  _pde_cur_iso=$(bd -C "$_pde_db" show "$_pde_id" --json 2>/dev/null \
-    | jq -r 'if type=="array" then .[0] else . end | (.defer_until // "")' 2>/dev/null)
+  if [ -z "$_pde_new_iso" ]; then
+    log "ga-sfj3i.1: $_pde_id — empty new-defer target, refusing to touch defer_until (would otherwise clear it)"
+    return 1
+  fi
+  local _pde_show_json _pde_show_rc _pde_cur_iso _pde_cur_known=""
+  _pde_show_json=$(bd -C "$_pde_db" show "$_pde_id" --json 2>/dev/null)
+  _pde_show_rc=$?
+  if [ "$_pde_show_rc" -eq 0 ] && [ -n "$_pde_show_json" ]; then
+    _pde_cur_iso=$(printf '%s' "$_pde_show_json" \
+      | jq -r 'if type=="array" then .[0] else . end | (.defer_until // "")' 2>/dev/null)
+    [ $? -eq 0 ] && _pde_cur_known=1
+  fi
+  if [ -z "$_pde_cur_known" ]; then
+    log "ga-sfj3i.1: $_pde_id could not verify current defer_until (bd show failed/unreadable, rc=$_pde_show_rc) — skipping defer to avoid clobbering an unknown existing hold; pilot:held-until label still stands"
+    return 1
+  fi
   if [ -n "$_pde_cur_iso" ] && [[ "$_pde_cur_iso" > "$_pde_new_iso" || "$_pde_cur_iso" == "$_pde_new_iso" ]]; then
     log "ga-sfj3i.1: $_pde_id keeping existing defer_until=$_pde_cur_iso (>= our own $_pde_new_iso) — not shortening an existing defer"
     return 0
