@@ -69,6 +69,27 @@ r=$(marker_status_from_labels '');
 r=$(reconcile_zero_verdict_run_action 30 15 "$(marker_status_from_labels 'gate-status:claimed gate-status:queued')")
 [ "$r" = "skip" ] && ok "end-to-end: two-label marker_status feeds reconcile_zero_verdict_run_action → skip (never supersede:requeue-marker on an ambiguous read)" || bad "REGRESSION ga-i0n83: two-label chain produced '$r', not skip"
 
+# ── marker_active_from_labels <labels> — ga-usdm6p ───────────────────────────
+# Vector B's own active-state check. Canonical active set is ready/queued/
+# claimed/dispatching/running — already established elsewhere in the guard
+# (gap2_query_active_markers' own --label-any list; the ga-4tgga docstring on
+# classify_gap2_bugtask_verdict spells it out verbatim). The live incident this
+# regression-guards: marker ga-c683w6 sat gate-status:ready with a genuinely
+# live companion review; the OLD inline check recognized only queued/claimed/
+# dispatching, read `ready` as terminal/gone, and superseded the live gate-run
+# — cascade-closing an in-progress reviewer verdict (ga-bqxcv7) in the process.
+echo "marker_active_from_labels: full active-state vocabulary, not just queued/claimed/dispatching"
+r=$(marker_active_from_labels "type:quality-gate-marker gate-status:ready branch:crew/x"); [ "$r" = "1" ] && ok "ga-usdm6p ACCEPTANCE: gate-status:ready → active (this was the live incident's exact miss)" || bad "REGRESSION ga-usdm6p: gate-status:ready got '$r', not active"
+r=$(marker_active_from_labels "type:quality-gate-marker gate-status:running"); [ "$r" = "1" ] && ok "gate-status:running → active (also missing from the old regex)" || bad "running got '$r'"
+r=$(marker_active_from_labels "type:quality-gate-marker gate-status:queued"); [ "$r" = "1" ] && ok "gate-status:queued → active (unchanged)" || bad "queued got '$r'"
+r=$(marker_active_from_labels "type:quality-gate-marker gate-status:claimed"); [ "$r" = "1" ] && ok "gate-status:claimed → active (unchanged)" || bad "claimed got '$r'"
+r=$(marker_active_from_labels "type:quality-gate-marker gate-status:dispatching"); [ "$r" = "1" ] && ok "gate-status:dispatching → active (unchanged)" || bad "dispatching got '$r'"
+r=$(marker_active_from_labels "type:quality-gate-marker gate-status:passed"); [ "$r" = "0" ] && ok "gate-status:passed → terminal (genuine terminal state, correctly NOT active)" || bad "passed got '$r'"
+r=$(marker_active_from_labels "type:quality-gate-marker gate-status:failed"); [ "$r" = "0" ] && ok "gate-status:failed → terminal" || bad "failed got '$r'"
+r=$(marker_active_from_labels "type:quality-gate-marker gate-status:superseded"); [ "$r" = "0" ] && ok "gate-status:superseded → terminal" || bad "superseded got '$r'"
+r=$(marker_active_from_labels "type:quality-gate-marker branch:crew/x"); [ "$r" = "1" ] && ok "no gate-status label at all → fail-safe active (never guess terminal from absence)" || bad "no-label got '$r'"
+r=$(marker_active_from_labels ""); [ "$r" = "1" ] && ok "empty label string → fail-safe active" || bad "empty got '$r'"
+
 # ── dedup_gaterun_action <group_count> <is_newest> — ga-f1ngu ────────────────
 # This is what retires the guard's own claim-receipt bead (gate-status:claimed
 # as of ga-f1ngu) the sweep after a real gate-run bead (gate-status:running)
@@ -83,6 +104,29 @@ r=$(dedup_gaterun_action 3 0); [ "$r" = "supersede:duplicate" ] && ok "3-member 
 r=$(dedup_gaterun_action 3 1); [ "$r" = "keep" ] && ok "3-member group, this IS newest → keep" || bad "newest-of-3 got '$r'"
 r=$(dedup_gaterun_action abc 0); [ "$r" = "keep" ] && ok "non-numeric group_count → keep (fail-safe, never guess)" || bad "non-numeric group_count got '$r'"
 r=$(dedup_gaterun_action '' 0);  [ "$r" = "keep" ] && ok "empty group_count → keep (fail-safe)" || bad "empty group_count got '$r'"
+
+# ── is_newest_alive_in_group <id> <created> <siblings_tsv> <closed_ids> — ga-usdm6p ─
+# Feeds dedup_gaterun_action's is_newest arg above. The live incident this
+# regression-guards: two gate-run beads shared a marker key. Sibling A
+# (ga-j8bc62) was closed via supersede:marker EARLIER in the same sweep. 12s
+# later, sibling B (ga-ibema9)'s OWN dedup check — built from the sweep's
+# single per-run snapshot fetched once at sweep start, unaware A had just been
+# closed moments before — concluded "A is a newer running sibling" and closed
+# B too, citing a run the sweep itself had already killed 12s earlier. That
+# false, self-contradicting reason ("a newer running run exists" naming an
+# already-closed run) cost real investigation time. Excluding closed_ids fixes it.
+echo "is_newest_alive_in_group: excludes siblings this sweep's own loop already closed"
+SIBS=$'ga-j8bc62\t2026-08-24T22:10:00Z'
+r=$(is_newest_alive_in_group "ga-ibema9" "2026-08-24T22:05:00Z" "$SIBS" "ga-j8bc62"); [ "$r" = "1" ] && ok "ga-usdm6p ACCEPTANCE: sole alive sibling is the one THIS sweep already closed → this run is the surviving newest, not a duplicate" || bad "REGRESSION ga-usdm6p: got '$r' — would wrongly cite an already-closed sibling as still-newer"
+r=$(is_newest_alive_in_group "ga-ibema9" "2026-08-24T22:05:00Z" "$SIBS" ""); [ "$r" = "0" ] && ok "same siblings, A NOT in closed_ids (still genuinely alive) → A is newer, correctly not-newest" || bad "alive-newer-sibling got '$r'"
+r=$(is_newest_alive_in_group "ga-newest1" "2026-08-24T23:00:00Z" "$SIBS" ""); [ "$r" = "1" ] && ok "this item genuinely newest (later created_at than the only sibling) → newest" || bad "genuinely-newest got '$r'"
+r=$(is_newest_alive_in_group "ga-solo" "2026-08-24T22:00:00Z" "" ""); [ "$r" = "1" ] && ok "no siblings in group at all → trivially newest" || bad "no-siblings got '$r'"
+r=$(is_newest_alive_in_group "ga-aaa" "2026-08-24T22:00:00Z" $'ga-zzz\t2026-08-24T22:00:00Z' ""); [ "$r" = "0" ] && ok "tie on created_at, sibling id lexically greater → sibling wins tiebreak, this is not newest" || bad "tie-lexical-loses got '$r'"
+r=$(is_newest_alive_in_group "ga-zzz" "2026-08-24T22:00:00Z" $'ga-aaa\t2026-08-24T22:00:00Z' ""); [ "$r" = "1" ] && ok "tie on created_at, this id lexically greater → this wins tiebreak, is newest" || bad "tie-lexical-wins got '$r'"
+MULTI=$'ga-old1\t2026-08-24T21:00:00Z\nga-mid-closed\t2026-08-24T22:30:00Z\nga-new-alive\t2026-08-24T23:30:00Z'
+r=$(is_newest_alive_in_group "ga-this" "2026-08-24T22:00:00Z" "$MULTI" "ga-mid-closed"); [ "$r" = "0" ] && ok "3-sibling group, nearest-newer excluded (closed) but a further sibling is alive+newer → still correctly not-newest" || bad "multi-sibling got '$r'"
+r=$(is_newest_alive_in_group "ga-this" "2026-08-24T22:00:00Z" "$MULTI" "ga-mid-closed ga-new-alive"); [ "$r" = "1" ] && ok "3-sibling group, ALL newer siblings closed this sweep → this survives as newest-alive" || bad "all-newer-closed got '$r'"
+r=$(is_newest_alive_in_group "ga-x" "2026-08-24T22:00:00Z" $'\nga-y\t2026-08-24T21:00:00Z' ""); [ "$r" = "1" ] && ok "blank row in siblings_tsv skipped without crashing, older real sibling correctly not-newer-than-this" || bad "blank-row got '$r'"
 
 # ── classify_parent_gap2 <dispatched> <live_assignee> <sling_found> <sling_needs_fix> <sling_closed> [sling_refused] ─
 echo "classify_parent_gap2: dispatch/assignee/sling routing"
