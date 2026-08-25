@@ -53,7 +53,7 @@ def format_result(rank: int, r: dict) -> str:
 
 
 def ensure_index(force_rebuild: bool, verbose_progress) -> "rl.RecallIndex":
-    idx = rl.load_index()
+    idx = rl.load_index(progress=verbose_progress)
     if idx is None:
         verbose_progress("recall: no index yet — building the initial index (first run, ~1min)...")
         idx = rl.build_full_index(progress=verbose_progress)

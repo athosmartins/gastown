@@ -263,6 +263,118 @@ class TestParseBdJson(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Index persistence -- atomic writes + corruption self-heal (ga-zy725).
+#
+# Root cause reproduced live before this fix: a disk-full mid-write left
+# chunk_vecs.npy truncated (640 of 12,647,040 elements missing). Every
+# subsequent `recall` call crashed with a raw numpy ValueError -- including
+# `recall --rebuild`, because load_index() ran (and raised) before the
+# rebuild flag was ever consulted, so the documented recovery path didn't
+# recover anything. Two independent halves, both covered here: save_index()
+# must never let a killed write reach the real path (tmp+rename), and
+# load_index() must treat an already-corrupted file as a cache miss rather
+# than propagate the raw exception.
+# ---------------------------------------------------------------------------
+class TestIndexPersistenceAtomicity(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._index_dir = Path(self._tmpdir.name) / "recall-index"
+        self._patcher = mock.patch.object(rl, "INDEX_DIR", self._index_dir)
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        self._tmpdir.cleanup()
+
+    def _sample_index(self):
+        import numpy as np
+        corpus = [{"id": "ga-1", "store": "HQ", "title": "x", "description": "", "comments": [],
+                   "close_reason": "", "closed_at": "2026-08-01T00:00:00Z", "issue_type": "bug",
+                   "priority": 2, "_ntok_full": 5}]
+        vecs = np.ones((3, 384), dtype=np.float32)
+        bead_idx = np.array([0, 0, 0], dtype=np.int64)
+        meta = {"schema_version": rl.SCHEMA_VERSION, "n_beads": 1, "n_chunks": 3}
+        return rl.RecallIndex(corpus, vecs, bead_idx, meta)
+
+    def test_round_trip_save_then_load(self):
+        idx = self._sample_index()
+        rl.save_index(idx)
+        loaded = rl.load_index()
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.corpus, idx.corpus)
+        self.assertEqual(loaded.chunk_vecs.tolist(), idx.chunk_vecs.tolist())
+        self.assertEqual(loaded.chunk_bead_idx.tolist(), idx.chunk_bead_idx.tolist())
+        self.assertEqual(loaded.meta, idx.meta)
+
+    def test_save_index_never_leaves_tmp_files_behind(self):
+        rl.save_index(self._sample_index())
+        leftovers = list(self._index_dir.glob("*.tmp"))
+        self.assertEqual(leftovers, [], f"tmp files left behind: {leftovers}")
+
+    def test_load_index_self_heals_on_truncated_npy(self):
+        """Direct regression for the observed failure: a truncated
+        chunk_vecs.npy (the exact disk-full mid-write shape -- tail bytes
+        missing) must make load_index() return None, not raise."""
+        rl.save_index(self._sample_index())
+        vecs_path = rl._paths()["vecs"]
+        vecs_path.write_bytes(vecs_path.read_bytes()[:-8])  # truncate the tail, like a killed write
+
+        # Pre-fix, this line raised ValueError("... file seems not fully
+        # written?") straight out of np.load -- reproduced live against the
+        # real corrupted index before writing this fix.
+        idx = rl.load_index()
+        self.assertIsNone(idx)
+
+    def test_load_index_self_heals_on_truncated_npy_reports_via_progress(self):
+        rl.save_index(self._sample_index())
+        vecs_path = rl._paths()["vecs"]
+        vecs_path.write_bytes(vecs_path.read_bytes()[:-8])
+
+        messages = []
+        idx = rl.load_index(progress=messages.append)
+        self.assertIsNone(idx)
+        self.assertTrue(any("corrupt" in m.lower() for m in messages), messages)
+
+    def test_load_index_self_heals_on_truncated_json(self):
+        rl.save_index(self._sample_index())
+        corpus_path = rl._paths()["corpus"]
+        corpus_path.write_text(corpus_path.read_text()[:-5])  # truncate valid JSON -> parse error
+
+        idx = rl.load_index()
+        self.assertIsNone(idx)
+
+    def test_save_index_atomic_write_failure_leaves_original_file_untouched(self):
+        """If the write_fn itself fails partway (simulating ENOSPC mid-write
+        to the tmp file), the file at the target path must be exactly what
+        it was before the attempt, and the dead tmp file must be cleaned up
+        -- proves the failure mode is 'old good copy survives, no debris',
+        never 'a truncated file lands at the real path'."""
+        rl.save_index(self._sample_index())  # establish a good baseline on disk
+        vecs_path = rl._paths()["vecs"]
+        original_bytes = vecs_path.read_bytes()
+
+        def boom(f):
+            f.write(b"\x00" * 10)
+            raise OSError("ENOSPC: disk full (simulated)")
+
+        with self.assertRaises(OSError):
+            rl._atomic_write(vecs_path, boom)
+
+        self.assertEqual(vecs_path.read_bytes(), original_bytes, "original file must survive a failed write")
+        self.assertFalse(vecs_path.with_name(vecs_path.name + ".tmp").exists(),
+                          "failed tmp file must not be left behind")
+
+    def test_missing_index_files_return_none_not_corruption_path(self):
+        """Baseline: a directory that simply has no index yet (first run)
+        must still take the pre-existing None-and-no-progress-message path,
+        not the new corruption-detection path."""
+        messages = []
+        idx = rl.load_index(progress=messages.append)
+        self.assertIsNone(idx)
+        self.assertEqual(messages, [])
+
+
+# ---------------------------------------------------------------------------
 # Staleness decision (pure logic)
 # ---------------------------------------------------------------------------
 class TestShouldRebuild(unittest.TestCase):

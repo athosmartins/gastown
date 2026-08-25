@@ -438,28 +438,63 @@ def _paths():
     }
 
 
-def load_index():
-    """Returns a RecallIndex or None if no index has been built yet."""
+def load_index(progress=lambda msg: None):
+    """Returns a RecallIndex, or None if no index has been built yet OR the
+    on-disk index is corrupted/unreadable (ga-zy725: a disk-full mid-write
+    truncated chunk_vecs.npy — 640 of 12,647,040 elements missing — and
+    np.load raised on every subsequent call, with no self-heal; `recall
+    --rebuild` couldn't recover either, since this function ran, and raised,
+    before the rebuild flag was ever consulted). Either way the caller
+    (ensure_index) already knows how to recover from None: treat it as "no
+    usable cache, build fresh from bd" — it doesn't need to know *why* the
+    cache was unusable, only that it was. save_index() below writes via
+    tmp+rename so a live process being killed mid-write can no longer
+    produce a truncated file in the first place; this is the complementary
+    half — self-heal from a corrupt file left behind by the OLD non-atomic
+    writer, or from any other on-disk damage."""
     p = _paths()
     if not all(path.exists() for path in p.values()):
         return None
     import numpy as np
-    corpus = json.loads(p["corpus"].read_text())
-    vecs = np.load(p["vecs"])
-    bead_idx = np.array(json.loads(p["bead_idx"].read_text()), dtype=np.int64)
-    meta = json.loads(p["meta"].read_text())
+    try:
+        corpus = json.loads(p["corpus"].read_text())
+        vecs = np.load(p["vecs"])
+        bead_idx = np.array(json.loads(p["bead_idx"].read_text()), dtype=np.int64)
+        meta = json.loads(p["meta"].read_text())
+    except (OSError, ValueError, EOFError, json.JSONDecodeError) as e:
+        progress(f"recall: on-disk index is corrupted/unreadable ({e}) -- rebuilding from scratch")
+        return None
     return RecallIndex(corpus, vecs, bead_idx, meta)
+
+
+def _atomic_write(path: Path, write_fn) -> None:
+    """Write via a tmp file in the same directory + os.replace, so a process
+    killed mid-write (e.g. disk-full) leaves either the old complete file or
+    the new complete file -- never a truncated one. The tmp file lives next
+    to `path` so the rename is same-filesystem (required for atomicity;
+    os.replace across filesystems silently falls back to non-atomic
+    copy+delete on some platforms). On failure the partial tmp file is
+    best-effort removed (never masking the original error) so a disk that's
+    still full doesn't also litter the index dir with dead .tmp files."""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp, "wb") as f:
+            write_fn(f)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def save_index(idx: RecallIndex) -> None:
     import numpy as np
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
     p = _paths()
-    p["corpus"].write_text(json.dumps(idx.corpus))
-    np.save(p["vecs"], idx.chunk_vecs.astype(np.float32))
+    _atomic_write(p["corpus"], lambda f: f.write(json.dumps(idx.corpus).encode()))
+    _atomic_write(p["vecs"], lambda f: np.save(f, idx.chunk_vecs.astype(np.float32)))
     bead_idx_list = idx.chunk_bead_idx.tolist() if hasattr(idx.chunk_bead_idx, "tolist") else list(idx.chunk_bead_idx)
-    p["bead_idx"].write_text(json.dumps(bead_idx_list))
-    p["meta"].write_text(json.dumps(idx.meta, indent=2))
+    _atomic_write(p["bead_idx"], lambda f: f.write(json.dumps(bead_idx_list).encode()))
+    _atomic_write(p["meta"], lambda f: f.write(json.dumps(idx.meta, indent=2).encode()))
 
 
 # ---------------------------------------------------------------------------
