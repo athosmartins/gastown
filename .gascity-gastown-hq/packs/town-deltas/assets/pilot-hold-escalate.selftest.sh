@@ -352,6 +352,107 @@ fi
 echo "Scenario I7: drift-guard — the bare no-auto-dispatch alias is wired into _pilot_hold_or_escalate (ga-rfpm9)"
 echo "$HOLD_FN" | grep -q '"no-auto-dispatch"' && ok "_pilot_hold_or_escalate carries the bare no-auto-dispatch skip clause" || bad "bare no-auto-dispatch skip clause missing from _pilot_hold_or_escalate"
 
+# ── _pilot_defer_extend (ga-sfj3i.1) ───────────────────────────────────────────
+# A Pilot timed hold (the pilot:held-until label stamped by ga-lfvs6/ga-4zqwm)
+# never actually stopped a bd-ready-based self-serve pool probe (dog Step
+# 1a/1c, wa-worker/ps-worker) from claiming the bead mid-hold — confirmed live
+# on ga-z297h. _pilot_defer_extend makes a timed hold ALSO set the bead's real
+# defer_until (the one field every such probe already respects), with an
+# "extend, never shorten" guard so a short automatic hold can never clobber a
+# longer hold already in place (wa-2lzmz-class incident).
+DEFER_FN="$(awk '/^_pilot_defer_extend\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+if [ -z "$DEFER_FN" ]; then
+  echo "FATAL: _pilot_defer_extend() not found in $DISPATCHER (extraction pattern drifted?)" >&2
+  exit 2
+fi
+
+# run_defer <db> <id> <new_iso> [<cur_defer_iso_or_empty>] [<dry(0|1)>]
+# The fake bd() here additionally SERVES `show <id> --json` with a
+# controllable current defer_until, since _pilot_defer_extend reads it back
+# before deciding whether to extend — the plain call-logging fake bd() at the
+# top of this file (used by run_hold) can't do that.
+run_defer() {
+  : > "$CALLS"
+  ( DRY_RUN="${5:-0}"
+    _RD_ID="$2" _RD_CUR="${4:-}"
+    bd() {
+      printf 'bd\t%s\n' "$*" >> "$CALLS"
+      case "$*" in
+        *"show $_RD_ID --json"*)
+          if [ -n "$_RD_CUR" ]; then
+            printf '[{"defer_until":"%s"}]' "$_RD_CUR"
+          else
+            printf '[{"defer_until":null}]'
+          fi
+          ;;
+      esac
+    }
+    eval "$DEFER_FN"
+    _pilot_defer_extend "$1" "$2" "$3" )
+}
+
+echo "Scenario D1: no existing defer_until — sets defer to the new target"
+run_defer "propdb" "bd-10" "2026-08-25T22:00:00Z" "" 0
+if has_call "bd	-C propdb update bd-10 --defer 2026-08-25T22:00:00Z -q"; then
+  ok "sets defer_until when none existed"
+else
+  bad "did not set defer_until (dump: $(cat "$CALLS" | tr '\n' '|'))"
+fi
+
+echo "Scenario D2: existing defer_until EARLIER than new target — extends to the new (later) value"
+run_defer "propdb" "bd-11" "2026-08-26T10:00:00Z" "2026-08-25T09:00:00Z" 0
+if has_call "bd	-C propdb update bd-11 --defer 2026-08-26T10:00:00Z -q"; then
+  ok "extends defer_until to the later target"
+else
+  bad "did not extend defer_until (dump: $(cat "$CALLS" | tr '\n' '|'))"
+fi
+
+echo "Scenario D3 (never-shorten): existing defer_until LATER than new target — does not shorten"
+run_defer "propdb" "bd-12" "2026-08-25T10:00:00Z" "2026-08-27T00:00:00Z" 0
+if has_call "bd	-C propdb update bd-12 --defer"; then
+  bad "REGRESSION: shortened an existing longer defer (wa-2lzmz-class incident)"
+else
+  ok "never-shorten: kept the existing longer defer_until untouched"
+fi
+if has_call "keeping existing defer_until"; then
+  ok "logs why the shorter hold was skipped"
+else
+  bad "did not log the never-shorten decision"
+fi
+
+echo "Scenario D4 (equal boundary): existing defer_until EQUAL to new target — treated as not-older, no redundant update"
+run_defer "propdb" "bd-13" "2026-08-25T10:00:00Z" "2026-08-25T10:00:00Z" 0
+if has_call "bd	-C propdb update bd-13 --defer"; then
+  bad "REGRESSION: re-issued an update for an equal (not actually longer) target"
+else
+  ok "equal defer_until treated as not-older — no redundant bd update"
+fi
+
+echo "Scenario D5: DRY_RUN — logs WOULD defer, no real bd update call"
+run_defer "propdb" "bd-14" "2026-08-25T22:00:00Z" "" 1
+if has_call "WOULD defer bd-14"; then
+  ok "DRY_RUN logs the intended defer"
+else
+  bad "DRY_RUN did not log WOULD defer"
+fi
+if has_call "update bd-14 --defer"; then
+  bad "REGRESSION: DRY_RUN performed a real bd update"
+else
+  ok "DRY_RUN performs no real mutation"
+fi
+
+echo "Scenario D6: drift-guard — both timed-hold call sites (ga-lfvs6, ga-4zqwm) wire in _pilot_defer_extend"
+if grep -qF -- '_pilot_defer_extend "$STORY_BEAD_CITY" "$STORY_ID"' "$DISPATCHER"; then
+  ok "ga-lfvs6 site calls _pilot_defer_extend"
+else
+  bad "ga-lfvs6 site does not call _pilot_defer_extend — pilot:held-until would again be probe-invisible"
+fi
+if grep -qF -- '_pilot_defer_extend "$_db" "$_bid"' "$DISPATCHER"; then
+  ok "ga-4zqwm site calls _pilot_defer_extend"
+else
+  bad "ga-4zqwm site does not call _pilot_defer_extend — pilot:held-until would again be probe-invisible"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "pilot-hold-escalate.selftest: $PASS passed, $FAIL failed"

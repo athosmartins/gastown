@@ -2017,6 +2017,49 @@ _held_until_purge_decision() {
   fi
 }
 
+# _pilot_defer_extend <db> <bead_id> <new_iso>
+#   ga-sfj3i.1: a Pilot timed hold (the pilot:held-until label stamped by the
+#   ga-lfvs6/ga-4zqwm sites) never actually stopped a self-serve pool probe
+#   (dog Step 1a/1c, wa-worker/ps-worker) from claiming the bead mid-hold —
+#   none of those probes read pilot:held* labels at all. They (and Pilot's
+#   own re-dispatch scan) all sit on `bd ready` underneath, and the ONE thing
+#   `bd ready` itself already respects is the bead's real defer_until field
+#   (confirmed live repeatedly — see ga-qntfo/ga-avvu2). Confirmed broken
+#   live: ga-z297h was routed+ready+unassigned with an unexpired
+#   pilot:held-until label, and the dog pool's Step 1c handed it out anyway
+#   (3rd occurrence of this "veto vocabulary narrower than the city's" class).
+#   This helper makes a timed hold ALSO set defer_until, closing the gap for
+#   every current and future `bd ready`-based consumer at once, with no
+#   per-probe filter to keep in sync.
+#
+#   Same "extend, never shorten" invariant as _held_until_purge_decision
+#   above, but for the SCALAR defer_until field instead of the accumulating
+#   held-until label family: defer_until has overwrite semantics (one value,
+#   not a set read via max()), so a short automatic hold must never clobber
+#   a longer hold already in place — same real incident this guards against
+#   (wa-2lzmz, 18/08: a deliberate 48h human/Mayor business hold). bd's own
+#   defer_until format is a fixed-width ISO8601 UTC string
+#   ("2026-08-25T22:00:00Z"), which sorts lexically in chronological order —
+#   a plain string compare is enough, no date-parsing of the CURRENT value
+#   needed. <new_iso> must already be in that same format (callers compute it
+#   via `date -u -r <epoch> +"%Y-%m-%dT%H:%M:%SZ"`).
+_pilot_defer_extend() {
+  local _pde_db="$1" _pde_id="$2" _pde_new_iso="$3"
+  local _pde_cur_iso
+  _pde_cur_iso=$(bd -C "$_pde_db" show "$_pde_id" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | (.defer_until // "")' 2>/dev/null)
+  if [ -n "$_pde_cur_iso" ] && [[ "$_pde_cur_iso" > "$_pde_new_iso" || "$_pde_cur_iso" == "$_pde_new_iso" ]]; then
+    log "ga-sfj3i.1: $_pde_id keeping existing defer_until=$_pde_cur_iso (>= our own $_pde_new_iso) — not shortening an existing defer"
+    return 0
+  fi
+  if [ "$DRY_RUN" = "1" ]; then
+    log "ga-sfj3i.1: WOULD defer $_pde_id until $_pde_new_iso (was: ${_pde_cur_iso:-none})"
+    return 0
+  fi
+  bd -C "$_pde_db" update "$_pde_id" --defer "$_pde_new_iso" -q 2>/dev/null || true
+  log "ga-sfj3i.1: $_pde_id deferred until $_pde_new_iso — now hidden from bd ready (Pilot's own re-dispatch scan AND every pool self-serve probe), not just the pilot:held label"
+}
+
 _pilot_hold_or_escalate() {
   local _phe_db="$1" _phe_id="$2" _phe_slug="$3" _phe_reason="$4" _phe_unblock="$5"
   local _phe_labels="${6:-[]}" _phe_cap="${7:-$PILOT_HOLD_ESCALATE_CAP}"
@@ -5805,6 +5848,10 @@ _mayor_deferred_hold_db() {
     # _filter_candidates treats as skip-forever).
     bd -C "$_db" label add "$_bid" "pilot:held-until:${_hold_until}" -q 2>/dev/null || true
     bd -C "$_db" label add "$_bid" "pilot:held" -q 2>/dev/null || true
+    # ga-sfj3i.1: the label alone doesn't stop a bd-ready-based self-serve
+    # pool probe from claiming this bead mid-hold — only defer_until does.
+    # See _pilot_defer_extend's own comment.
+    _pilot_defer_extend "$_db" "$_bid" "$(date -u -r "$_hold_until" +"%Y-%m-%dT%H:%M:%SZ")"
     # ga-6pe8d: see _held_until_purge_decision's own comment — never purge a
     # stamp that might be a longer hold from elsewhere (e.g. a human/Mayor
     # business hold).
@@ -7757,6 +7804,10 @@ LIVESEC
                 # The until label alone is harmless (no skip); pilot:held alone is the trap.
                 bd -C "$STORY_BEAD_CITY" label add "$STORY_ID" "pilot:held-until:${_hold_until}" -q 2>/dev/null || true
                 bd -C "$STORY_BEAD_CITY" label add "$STORY_ID" "pilot:held" -q 2>/dev/null || true
+                # ga-sfj3i.1: see ga-4zqwm's identical call above — the label
+                # alone doesn't stop a bd-ready-based self-serve pool probe
+                # from claiming this bead mid-hold.
+                _pilot_defer_extend "$STORY_BEAD_CITY" "$STORY_ID" "$(date -u -r "$_hold_until" +"%Y-%m-%dT%H:%M:%SZ")"
                 # ga-4aree: purge PRIOR held-until stamps (keep only the just-added one) so they
                 # don't accumulate unboundedly. Safe order: the fresh held-until + pilot:held are
                 # already present (above), so removing OLD stamps never leaves the
