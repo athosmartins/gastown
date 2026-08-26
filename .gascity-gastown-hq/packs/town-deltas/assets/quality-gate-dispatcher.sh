@@ -3478,11 +3478,15 @@ branch_bead_commit_verdict() {
 # reporting success. Retries once on a miss (this file's own doctrine: Dolt
 # label writes are `-q 2>/dev/null || true` everywhere, deliberately fail-open
 # — a transient hiccup is the common, recoverable case). Echoes "armed" if
-# gate:needs-human is verified present after up to 2 tries, "failed"
-# otherwise. The optional sub_label is attempted opportunistically on every
-# try but does NOT gate the armed/failed verdict — it is classification
-# metadata, not the safety mechanism itself (that is the bare label, which is
-# what the Pilot's candidate queries and the guard's park-check key on).
+# gate:needs-human is verified present after up to 2 tries, "failed" if a
+# genuine read verified it absent, "unverified" if EVERY read attempt itself
+# errored (bd or jq failed) — see ga-h48cm below for why that third case must
+# never collapse into "failed". The optional sub_label is attempted
+# opportunistically on every try but does NOT gate the verdict — it is
+# classification metadata, not the safety mechanism itself (that is the bare
+# label, which is what the Pilot's candidate queries and the guard's
+# park-check key on). Always returns 0 — see ga-h48cm defect 3 below for why
+# the verdict lives ONLY in the echoed string, never in the exit code.
 #
 # ga-55syh (P0): built because TWO independent sources (an escalation mail
 # and the builder's own bead comment) once announced gate:needs-human was
@@ -3494,34 +3498,95 @@ branch_bead_commit_verdict() {
 # fix-attempt-cap site (the one this bug's own reproduction hit); the other 8
 # sites share the same underlying gap and are a documented follow-up (see the
 # gate-fix-attempt-cap-needs-human-verify.selftest.sh header).
+#
+# ga-h48cm (P1): the verified re-read above shipped with three of its own
+# defects, all pushing toward the SAME false verdict this helper exists to
+# prevent (armed label reported as NOT applied when it actually was, or a
+# diagnostic hiccup reported as a confirmed failure):
+#   1. NO BACKOFF. Write and re-read (and the two tries) ran back-to-back.
+#      Two reads milliseconds apart are, for Dolt commit-propagation
+#      purposes, effectively ONE read — under load the write hasn't
+#      propagated yet and both reads miss together (same family as ga-dv2gk:
+#      "sob Dolt lento, uma unica releitura nao decide", and the same
+#      between-tries backoff shape assign_verdict_bead_verified() above
+#      already uses for this identical race).
+#   2. READ ERROR COLLAPSED INTO "ABSENT". `... || echo ""` on the whole
+#      `bd show | jq` pipe (this file runs under `set -o pipefail`, L30)
+#      made a `bd`/`jq` failure indistinguishable from a successful read
+#      that found no label — the third state ("could not verify") collapsed
+#      into "failed", so a transient diagnostic hiccup got reported as a
+#      confirmed-absent circuit-breaker.
+#   3. RETURN 1 ON "failed" CRASHED THE WHOLE DISPATCHER. Found while fixing
+#      #2, by direct reproduction (not just reading): every one of the 9
+#      call sites consumes this helper as `_NH_STATUS=$(gate_apply_needs_human
+#      ...)` — a bare/guarded command-substitution ASSIGNMENT, never a
+#      condition or pipeline. Under `set -e`, a failing command substitution
+#      used to populate a plain assignment aborts the shell immediately,
+#      before the very next line — confirmed against the REAL (pre-fix)
+#      function: a minimal harness matching a real call site's exact shape
+#      dies at the assignment, so the warn/comment/mail composition that was
+#      supposed to follow never runs. None of the 9 call sites ever check
+#      `$?` (only the echoed string via `[ "$_NH_STATUS" != "armed" ]`), so
+#      the non-zero return served no purpose except to be a landmine — fixed
+#      by returning 0 unconditionally and moving the entire verdict into the
+#      echoed string, which is the only thing any caller ever reads anyway.
+# Fixed by (1) a real sleep between write→reread and between the two tries,
+# (2) tracking the read pipe's own exit status so a read error is reported
+# as "unverified", never silently promoted to "failed", and (3) always
+# returning 0. gate_needs_human_clause() below carries a matching third
+# message so the bead-facing text never asserts "did not arm" when the truth
+# is "could not check".
+GATE_NEEDS_HUMAN_VERIFY_BACKOFF_SECS="${GATE_NEEDS_HUMAN_VERIFY_BACKOFF_SECS:-1}"
+case "$GATE_NEEDS_HUMAN_VERIFY_BACKOFF_SECS" in ''|*[!0-9]*) GATE_NEEDS_HUMAN_VERIFY_BACKOFF_SECS=1 ;; esac
 gate_apply_needs_human() {
-  local city="$1" bead_id="$2" sub="${3:-}" try labels
+  local city="$1" bead_id="$2" sub="${3:-}" try labels read_rc verified_absent=0
   for try in 1 2; do
+    [ "$try" -gt 1 ] && { sleep "$GATE_NEEDS_HUMAN_VERIFY_BACKOFF_SECS" 2>/dev/null || true; }
     bd -C "$city" label add "$bead_id" "gate:needs-human" -q 2>/dev/null || true
     [ -n "$sub" ] && { bd -C "$city" label add "$bead_id" "$sub" -q 2>/dev/null || true; }
+    sleep "$GATE_NEEDS_HUMAN_VERIFY_BACKOFF_SECS" 2>/dev/null || true
+    read_rc=0
     labels=$(bd -C "$city" show "$bead_id" --json 2>/dev/null \
-      | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' 2>/dev/null || echo "")
-    case ",$labels," in
-      *,gate:needs-human,*) echo "armed"; return 0 ;;
-    esac
+      | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' 2>/dev/null) || read_rc=$?
+    if [ "$read_rc" -eq 0 ]; then
+      case ",$labels," in
+        *,gate:needs-human,*) echo "armed"; return 0 ;;
+      esac
+      verified_absent=1
+    fi
   done
-  echo "failed"
-  return 1
+  if [ "$verified_absent" -eq 1 ]; then
+    echo "failed"
+  else
+    echo "unverified"
+  fi
+  return 0
 }
 
 # gate_needs_human_clause <status> — the ONE sentence every gate:needs-human
 # message uses to describe the circuit-breaker's ACTUAL state, sourced from
-# gate_apply_needs_human()'s verified read (status is "armed" or "failed"),
-# never from having merely attempted the write. Substituting this clause in
-# place of a hardcoded "Auto-retry is now DISABLED" assertion is what makes a
-# failed write change the message's WORDING instead of appending a warning
-# next to a claim that is still false (ga-55syh AC1+AC2).
+# gate_apply_needs_human()'s verified read (status is "armed", "failed", or
+# "unverified" — ga-h48cm), never from having merely attempted the write.
+# Substituting this clause in place of a hardcoded "Auto-retry is now
+# DISABLED" assertion is what makes a failed write change the message's
+# WORDING instead of appending a warning next to a claim that is still false
+# (ga-55syh AC1+AC2). The "unverified" branch exists so a read error is
+# reported as "could not check" and never as "did not arm" (ga-h48cm AC2) —
+# an unrecognized status falls back to the alarming "failed" text on purpose:
+# for a message that exists to prompt human action on a possibly-unprotected
+# bead, defaulting to loud is the safe failure mode.
 gate_needs_human_clause() {
-  if [ "$1" = "armed" ]; then
-    echo "Auto-retry is now DISABLED (label gate:needs-human, verified applied); the Pilot will not re-dispatch it."
-  else
-    echo "COULD NOT ARM THE CIRCUIT-BREAKER: gate:needs-human FAILED to apply after retry and is NOT present on the bead. This bead remains re-dispatchable with NO protection — a human must apply the label by hand immediately and investigate why the write failed."
-  fi
+  case "$1" in
+    armed)
+      echo "Auto-retry is now DISABLED (label gate:needs-human, verified applied); the Pilot will not re-dispatch it."
+      ;;
+    unverified)
+      echo "COULD NOT VERIFY THE CIRCUIT-BREAKER: gate:needs-human was written, but every read-back attempt errored (bd/jq failure) before it could be confirmed — whether it actually landed is UNKNOWN, this is NOT a confirmed failure. A human should check the bead's labels directly and apply gate:needs-human by hand if it turns out to be missing."
+      ;;
+    *)
+      echo "COULD NOT ARM THE CIRCUIT-BREAKER: gate:needs-human FAILED to apply after retry and is NOT present on the bead. This bead remains re-dispatchable with NO protection — a human must apply the label by hand immediately and investigate why the write failed."
+      ;;
+  esac
 }
 
 # gate_full_suite_verdict <branch_rc> <main_rc> <main_measured> — ga-3wgx8: pure

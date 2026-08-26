@@ -43,11 +43,15 @@ T="$(mktemp -d 2>/dev/null || mktemp -d -t ga55syh)"
 trap 'rm -rf "$T" 2>/dev/null || true' EXIT
 FAKE_LABELS_FILE="$T/labels.txt"
 FAKE_LABEL_ADD_FAIL_COUNT=0
+FAKE_SHOW_FAIL=0
 
 # Stub `bd` — simulates a single bead's label set via a state file, with a
 # controllable failure mode for `label add` (silently no-ops N times before
 # it starts actually recording the label, mirroring a transient write
-# failure that the real `-q 2>/dev/null || true` would swallow identically).
+# failure that the real `-q 2>/dev/null || true` would swallow identically),
+# and a controllable failure mode for `show` (ga-h48cm: FAKE_SHOW_FAIL=1
+# makes every read attempt error out — no stdout, exit 1 — simulating a bd
+# outage/timeout distinct from "read succeeded, no label found").
 bd() {
   case "$3" in
     label)
@@ -61,6 +65,9 @@ bd() {
       return 0
       ;;
     show)
+      if [ "$FAKE_SHOW_FAIL" = "1" ]; then
+        return 1
+      fi
       local labels_json
       labels_json=$(sort -u "$FAKE_LABELS_FILE" 2>/dev/null | jq -R . 2>/dev/null | jq -s . 2>/dev/null || echo "[]")
       printf '[{"id":"fake-bead","labels":%s}]\n' "$labels_json"
@@ -124,6 +131,81 @@ if grep -qF 'Auto-retry is now DISABLED (label gate:needs-human); the Pilot will
 else
   ok "old hardcoded unconditional success text removed from the fix-attempt-cap block"
 fi
+
+# ── 7. ga-h48cm defect 2: a READ ERROR must not collapse into "failed" ─────
+# The exact shape the bug describes: bd/jq errors on every attempt. Before
+# the fix this indistinguishably produced labels="" (via the old
+# `... || echo ""` on the pipe) → same as "read succeeded, no label" →
+# "failed". It must now report the distinct "unverified" state instead.
+echo "── 7. bd show persistently errors (read failure) → unverified, NOT failed ──"
+: > "$FAKE_LABELS_FILE"; FAKE_LABEL_ADD_FAIL_COUNT=0; FAKE_SHOW_FAIL=1
+eq "read error on every try → unverified (not silently promoted to failed)" \
+   "$(gate_apply_needs_human "$T" "fake-bead" "")" "unverified"
+FAKE_SHOW_FAIL=0
+
+# ── 8. ga-h48cm defect 1: real backoff, not a back-to-back reread ──────────
+# Proves the pause is REAL wall-clock time, not a no-op — using $SECONDS
+# (bash's auto-incrementing elapsed-time counter) so the assertion doesn't
+# depend on parsing `date` output. GATE_NEEDS_HUMAN_VERIFY_BACKOFF_SECS
+# defaults to 1s and is sourced from the live dispatcher (not redeclared
+# here), so this exercises the REAL default, not a test-only override.
+echo "── 8. backoff: write→reread pause is real elapsed time, not immediate ──"
+: > "$FAKE_LABELS_FILE"; FAKE_LABEL_ADD_FAIL_COUNT=0; FAKE_SHOW_FAIL=0
+_t0=$SECONDS
+gate_apply_needs_human "$T" "fake-bead" "" >/dev/null
+_elapsed=$((SECONDS - _t0))
+if [ "$_elapsed" -ge 1 ]; then
+  ok "immediate-success path still paused for backoff before its verify read (elapsed=${_elapsed}s)"
+else
+  bad "immediate-success path returned in ${_elapsed}s — no real backoff between write and reread"
+fi
+
+# ── 9. ga-h48cm defect 3: the verdict must survive the REAL call-site shape ─
+# All 9 real call sites consume this helper as a bare/guarded command-
+# substitution ASSIGNMENT (`_NH_STATUS=$(gate_apply_needs_human ...)`), never
+# as a tested condition or a function argument. Under `set -e`, a failing
+# command substitution used to populate a plain assignment aborts the shell
+# immediately — confirmed by direct reproduction against the PRE-FIX
+# function (see ga-h48cm's defect-3 note in the dispatcher header comment).
+# This harness reproduces that EXACT shape in a child `set -e` subshell so a
+# regression here is caught even though every OTHER assertion in this file
+# calls gate_apply_needs_human as a function argument (a shape that never
+# triggered the crash in the first place — the gap that let this ship).
+echo "── 9. crash-safety: the real \$(...)  assignment shape survives set -e for every verdict ──"
+: > "$FAKE_LABELS_FILE"; FAKE_LABEL_ADD_FAIL_COUNT=99; FAKE_SHOW_FAIL=0
+_crash_rc=0
+_crash_out=$(
+  set -euo pipefail
+  echo "before"
+  _NH_STATUS=$(gate_apply_needs_human "$T" "fake-bead" "")
+  echo "after:$_NH_STATUS"
+) 2>&1 || _crash_rc=$?
+FAKE_LABEL_ADD_FAIL_COUNT=0
+contains "verified-absent (\"failed\") verdict: real call-site shape does not abort the shell" \
+  "$_crash_out" "after:failed"
+eq "verified-absent (\"failed\") verdict: subshell exit code" "$_crash_rc" "0"
+
+: > "$FAKE_LABELS_FILE"; FAKE_LABEL_ADD_FAIL_COUNT=0; FAKE_SHOW_FAIL=1
+_crash_rc=0
+_crash_out=$(
+  set -euo pipefail
+  echo "before"
+  _NH_STATUS=$(gate_apply_needs_human "$T" "fake-bead" "")
+  echo "after:$_NH_STATUS"
+) 2>&1 || _crash_rc=$?
+FAKE_SHOW_FAIL=0
+contains "unverified verdict: real call-site shape does not abort the shell" \
+  "$_crash_out" "after:unverified"
+eq "unverified verdict: subshell exit code" "$_crash_rc" "0"
+
+# ── 10. gate_needs_human_clause: the "unverified" message says COULD NOT ──
+#       VERIFY, never "did not arm" — ga-h48cm AC2's exact requirement
+echo "── 10. gate_needs_human_clause: unverified message is honest, not alarmist ──"
+UNVERIFIED_MSG="$(gate_needs_human_clause "unverified")"
+contains     "unverified message says COULD NOT VERIFY"            "$UNVERIFIED_MSG" "COULD NOT VERIFY"
+not_contains "unverified message does NOT claim it failed to apply" "$UNVERIFIED_MSG" "FAILED to apply"
+not_contains "unverified message does NOT claim armed/disabled"     "$UNVERIFIED_MSG" "is now DISABLED"
+not_contains "unverified message does NOT claim confirmed absence"  "$UNVERIFIED_MSG" "COULD NOT ARM THE CIRCUIT-BREAKER"
 
 echo ""
 echo "──────────────────────────────────────────"
