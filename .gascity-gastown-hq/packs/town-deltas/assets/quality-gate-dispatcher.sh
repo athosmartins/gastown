@@ -3524,6 +3524,35 @@ gate_needs_human_clause() {
   fi
 }
 
+# gate_full_suite_verdict <branch_rc> <main_rc> <main_measured> — ga-3wgx8: pure
+# decision table for the full-suite regression check (see gate_full_suite_check,
+# defined later alongside git_rig — it needs live git/worktree access so it
+# can't live before this file's LIB_ONLY cutoff below; this predicate is pure
+# so it can, and quality-gate-full-suite-check.selftest.sh unit-tests it here).
+# branch_rc/main_rc are the rig's own `.gate-full-suite.sh` exit codes
+# (0=green); main_measured is "1" iff main's own run was actually attempted
+# (it is skipped whenever branch is already green — the common case pays for
+# exactly one suite run, not two).
+#
+# "regression" fires ONLY when branch is red AND main is provably green. A
+# branch red on a test that is ALREADY red on main is pre-existing debt, not
+# this branch's fault — mirrors tests/test_plists_parseiam.py's own baseline/
+# skip mechanism (wa-z0e2g) and avoids permanently locking a rig out of
+# merging anything once any debt exists (main is red RIGHT NOW, from the
+# incident this check exists to prevent — see ga-3wgx8).
+gate_full_suite_verdict() {
+  local branch_rc="$1" main_rc="$2" main_measured="$3"
+  if [ "$branch_rc" = "0" ]; then
+    echo "pass"
+  elif [ "$main_measured" != "1" ]; then
+    echo "unmeasured"
+  elif [ "$main_rc" = "0" ]; then
+    echo "regression"
+  else
+    echo "preexisting-debt"
+  fi
+}
+
 # Lib-only entrypoint for quality-gate-reconvene.selftest.sh: expose the helpers
 # above WITHOUT running the live dispatcher (mirrors quality-gate-guard.sh's
 # GATE_GUARD_LIB_ONLY). Must precede the log-redirect + live work below. Never
@@ -4074,6 +4103,41 @@ if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH_SHA" ];
       warn "ga-y9a1d: branch $BRANCH's $GATE_Y9A1D_COUNT unique commit(s) never mention bead $BEAD_ID (suspects: ${GATE_Y9A1D_SUSPECTS:-none found}) — downgrading PASS to FAIL (needs-human armed=$_NH_STATUS)."
     fi
   fi
+fi
+
+# ── ga-3wgx8: full-suite regression check (opt-in per rig) ────────────────────
+# Diff-scoped review (the REVIEW_TASK prompt below) has no structural reason to
+# run a pre-existing test the diff never touches — see gate_full_suite_check's
+# own header comment (above, near rig_content_merged) for the full incident
+# this closes. This is an additive safety net exactly like ga-y9a1d just above:
+# it only ever downgrades an existing PASS, and fails open (never blocks) on
+# any uncertainty.
+if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH_SHA" ]; then
+  gate_full_suite_check "$BRANCH_SHA" "origin/$DEFAULT_BRANCH"
+  case "$GATE_FS_VERDICT" in
+    regression)
+      OVERALL_VERDICT="FAIL"
+      FAIL_REASONS="$GATE_FS_DETAIL"
+      _NH_STATUS=$(gate_apply_needs_human "$BEAD_CITY" "$BEAD_ID" "gate:needs-human:full-suite-regression")
+      [ "$_NH_STATUS" != "armed" ] && warn "gate:needs-human FAILED TO APPLY on $BEAD_ID after retry (ga-3wgx8) — circuit-breaker NOT armed."
+      bd -C "$BEAD_CITY" comment "$BEAD_ID" "Dispatcher (ga-3wgx8): held $BRANCH at merge time — $FAIL_REASONS $(gate_needs_human_clause "$_NH_STATUS")" 2>/dev/null || true
+      gc --city "$GC_CITY" mail send mayor \
+        -s "Gate needs-human: full-suite regression on $BEAD_ID (ga-3wgx8)" \
+        -m "$(printf 'Branch %s (rig %s) reached the gate merge step for bead %s with a reviewer PASS, but the rig'"'"'s own full test suite is red on this branch and green on %s — a regression outside the diff (ga-3wgx8'"'"'s own class of incident).\n\n%s\n\n%s\n\nBead: %s   Rig: %s\nBranch: %s (sha %s, gate run %s)' \
+          "$BRANCH" "${RIG:-unknown}" "$BEAD_ID" "$DEFAULT_BRANCH" "$FAIL_REASONS" "$(gate_needs_human_clause "$_NH_STATUS")" "$BEAD_ID" "${RIG:-unknown}" "$BRANCH" "$BRANCH_SHA" "$GATE_RUN_ID")" \
+        2>/dev/null || warn "Could not mail Mayor for ga-3wgx8 full-suite regression on $BEAD_ID"
+      notify_author_with_fallback "$BEAD_ID" "$NOTIFY_AUTHOR" "$AUTHOR" \
+        "Your gate submission is held: full-suite regression on $BEAD_ID (ga-3wgx8)" \
+        "$(printf 'Your branch %s reached the gate merge step for bead %s with a reviewer PASS, but the rig'"'"'s own full test suite is red on this branch and green on %s — a regression outside your diff.\n\n%s\n\nNothing to do from your side unless you recognize this — a human is reconciling.\n\nBead: %s   Rig: %s\nBranch: %s (sha %s, gate run %s)' \
+          "$BRANCH" "$BEAD_ID" "$DEFAULT_BRANCH" "$FAIL_REASONS" "$BEAD_ID" "${RIG:-unknown}" "$BRANCH" "$BRANCH_SHA" "$GATE_RUN_ID")" \
+        "full-suite regression on $BEAD_ID (ga-3wgx8)"
+      warn "ga-3wgx8: ${RIG:-unknown} full suite red on $BRANCH, green on $DEFAULT_BRANCH — downgrading PASS to FAIL (needs-human armed=$_NH_STATUS)."
+      ;;
+    preexisting-debt|unmeasured)
+      log "$GATE_FS_DETAIL"
+      ;;
+    pass|skipped) : ;;
+  esac
 fi
 
 if [ "$OVERALL_VERDICT" = "PASS" ]; then
@@ -5464,6 +5528,94 @@ rig_content_merged() {
   local n
   n=$(git_rig rev-list --count --cherry-pick --right-only "${main_ref}...${branch_ref}" 2>/dev/null || echo ERR)
   [ "$n" = "0" ]
+}
+
+# gate_full_suite_check <branch_sha> <default_branch_ref> [timeout_secs] —
+# ga-3wgx8: opt-in full-suite regression check. Sets GATE_FS_VERDICT
+# (pass|regression|preexisting-debt|unmeasured|skipped) and GATE_FS_DETAIL in
+# the OUTER scope (mirrors do_merge_ff's MERGE_SHA/MERGE_RESULT convention —
+# this file targets /bin/bash 3.2 per its launchd ProgramArguments, so no
+# associative arrays / no `trap RETURN`, hence explicit cleanup at every
+# return path below instead of a scoped trap).
+#
+# Motivation: a pre-existing, unrelated test can be broken by a branch that
+# never touches that test's own file (e.g. a new plist a parametrized test
+# auto-collects) and no reviewer — diff-scoped by construction, see the
+# REVIEW_TASK prompt below — has any structural reason to notice. This is
+# exactly how origin/main (whatsapp_automation) went red on
+# tests/test_plists_parseiam.py after a branch with a PASSED verdict merged
+# (ga-3wgx8's own measured incident).
+#
+# Opt-in, not blanket: engages ONLY when the branch tip itself carries an
+# executable .gate-full-suite.sh at its root — same "well-known filename, rig
+# owns it" idiom as this file's *.selftest.sh convention, checked via a cheap
+# `git_rig ls-tree` so the 6+ rigs that haven't opted in pay zero cost (closes,
+# for opted-in rigs, the gap quality-gate-guard.sh ga-rstae's comment names as
+# "future work, tracked separately: other rigs' test conventions... not run").
+#
+# Fail-open on ANY uncertainty (script missing/non-executable, worktree
+# creation failure, timeout): GATE_FS_VERDICT stays "skipped", never blocks —
+# additive only, mirroring ga-y9a1d's stated posture at its call site below.
+gate_full_suite_check() {
+  local branch_sha="$1" default_branch_ref="$2"
+  local timeout_secs="${3:-${GATE_FULL_SUITE_TIMEOUT_SECS:-600}}"
+  GATE_FS_VERDICT="skipped"
+  GATE_FS_DETAIL=""
+
+  local script_mode
+  script_mode=$(git_rig ls-tree "$branch_sha" -- .gate-full-suite.sh 2>/dev/null | awk '{print $1}' || echo "")
+  [ "$script_mode" = "100755" ] || return 0
+
+  local branch_wt="/tmp/gc-gate-fs-branch-$$"
+  local branch_log
+  branch_log=$(mktemp /tmp/gc-gate-fs-branch-log-XXXXXX 2>/dev/null) || return 0
+  if ! git_rig worktree add --detach "$branch_wt" "$branch_sha" >/dev/null 2>&1; then
+    GATE_FS_DETAIL="ga-3wgx8: could not create worktree for $branch_sha — skipping full-suite check (fail-open)."
+    rm -f "$branch_log" 2>/dev/null || true
+    return 0
+  fi
+
+  local branch_rc=0
+  ( cd "$branch_wt" && timeout "$timeout_secs" ./.gate-full-suite.sh ) > "$branch_log" 2>&1 || branch_rc=$?
+
+  if [ "$branch_rc" = "0" ]; then
+    GATE_FS_VERDICT="pass"
+    git_rig worktree remove --force "$branch_wt" 2>/dev/null || true
+    rm -f "$branch_log" 2>/dev/null || true
+    return 0
+  fi
+
+  # Branch is red — before blocking, measure whether $default_branch_ref is
+  # ALSO red on its own .gate-full-suite.sh (pre-existing debt vs. a real
+  # regression this branch introduced).
+  local main_measured=0 main_rc=0 main_log=""
+  local main_wt="/tmp/gc-gate-fs-main-$$"
+  main_log=$(mktemp /tmp/gc-gate-fs-main-log-XXXXXX 2>/dev/null) || main_log="/dev/null"
+  if git_rig worktree add --detach "$main_wt" "$default_branch_ref" >/dev/null 2>&1; then
+    if [ -x "$main_wt/.gate-full-suite.sh" ]; then
+      ( cd "$main_wt" && timeout "$timeout_secs" ./.gate-full-suite.sh ) > "$main_log" 2>&1 || main_rc=$?
+      main_measured=1
+    fi
+    git_rig worktree remove --force "$main_wt" 2>/dev/null || true
+  fi
+
+  GATE_FS_VERDICT=$(gate_full_suite_verdict "$branch_rc" "$main_rc" "$main_measured")
+  case "$GATE_FS_VERDICT" in
+    regression)
+      GATE_FS_DETAIL="ga-3wgx8: full test suite is RED on this branch (exit $branch_rc) but GREEN on $default_branch_ref — this branch introduces a regression outside its own diff. Suite output (tail):
+$(tail -60 "$branch_log" 2>/dev/null)"
+      ;;
+    preexisting-debt)
+      GATE_FS_DETAIL="ga-3wgx8: full suite red on BOTH this branch (exit $branch_rc) and $default_branch_ref (exit $main_rc) — pre-existing debt, not this branch's regression; not blocking."
+      ;;
+    unmeasured)
+      GATE_FS_DETAIL="ga-3wgx8: branch red (exit $branch_rc) but could not measure $default_branch_ref's own run (worktree/script issue) — fail-open, not blocking on an unmeasured baseline."
+      ;;
+  esac
+
+  git_rig worktree remove --force "$branch_wt" 2>/dev/null || true
+  rm -f "$branch_log" "$main_log" 2>/dev/null || true
+  return 0
 }
 
 # SELFTEST-EXTRACT gate-mergedriver-precheck: BEGIN
