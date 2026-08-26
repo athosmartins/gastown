@@ -36,6 +36,7 @@ echo "hello" > "$SCRATCH/dirA/file.txt"
 DF_BIN="$SCRATCH/fake-df.sh"
 cat > "$DF_BIN" <<'EOF'
 #!/bin/bash
+[ "${FAKE_DF_FAIL:-0}" = "1" ] && exit 1
 echo "Filesystem 1024-blocks Used Available Capacity Mounted"
 echo "dummy ${FAKE_DF_TOTAL_KB:-1000000} ${FAKE_DF_USED_KB:-500000} 1 1% /"
 EOF
@@ -336,6 +337,55 @@ FAKE_DF_TOTAL_KB=209715200 FAKE_DF_USED_KB=104857600 FAKE_AWS_BYTES=1073741824 \
 RC=$?
 [ "$RC" -ne 0 ] && ok "unwritable doc -> nonzero exit rather than silently 'succeeding'" || bad "expected nonzero exit when the doc write itself fails"
 grep -q "BD-CALLED.*create.*--type=bug" "$SCRATCH/fake-bd.log" && ok "doc-write failure still files a bug summary bead" || bad "expected a bug-type summary bead for the doc-write failure"
+
+echo "── main: baseline run for the N/A-collapse regression tests below ──"
+cat > "$DOC_PATH" <<'EOF'
+# Intro
+
+## Parte 0: Mapa
+
+| # | Local |
+|---|---|
+| 1 | Mac mini |
+
+---
+
+## Parte 1: SQLite — shared/data/
+EOF
+: > "$SCRATCH/fake-bd.log"; : > "$STORAGE_INVENTORY_LOG"
+FAKE_DF_TOTAL_KB=209715200 FAKE_DF_USED_KB=104857600 FAKE_AWS_BYTES=1073741824 \
+  FAKE_DRIVE_OUTPUT="12.00 15.00 80.0" FAKE_MD_VERDICT="45.2h/mes projetado (abaixo do teto 92h)" \
+  FAKE_BD_LOG="$SCRATCH/fake-bd.log" main >/dev/null
+[ $? -eq 0 ] && ok "baseline run for N/A-collapse tests below is clean" || bad "baseline setup run unexpectedly failed"
+
+echo "── main: one vector fails (N/A) while all others are healthy -> must NOT report OK (GATE-FEEDBACK ga-z297h attempt 1, blocking issue 1) ──"
+: > "$SCRATCH/fake-bd.log"
+FAKE_DF_TOTAL_KB=209715200 FAKE_DF_USED_KB=104857600 FAKE_AWS_BYTES=1073741824 \
+  FAKE_DRIVE_OUTPUT="12.00 15.00 80.0" FAKE_MD_FAIL=1 \
+  FAKE_BD_LOG="$SCRATCH/fake-bd.log" main
+RC=$?
+[ "$RC" -ne 0 ] && ok "MotherDuck fails (N/A) even though every other vector is healthy -> nonzero exit, not silently OK" || bad "expected nonzero exit when one vector is N/A, got $RC"
+grep -q "BD-CALLED.*create.*--type=bug" "$SCRATCH/fake-bd.log" && ok "N/A-only run files an OPEN bug, not an auto-closed chore" || bad "expected a bug-type summary bead for a partial-N/A run: $(cat "$SCRATCH/fake-bd.log")"
+
+echo "── main: mac-mini measurement fails this round -> next baseline must carry the LAST REAL value forward, never 0 (GATE-FEEDBACK ga-z297h attempt 1, blocking issue 2) ──"
+: > "$SCRATCH/fake-bd.log"
+FAKE_DF_FAIL=1 FAKE_AWS_BYTES=1073741824 \
+  FAKE_DRIVE_OUTPUT="12.00 15.00 80.0" FAKE_MD_VERDICT="45.2h/mes projetado (abaixo do teto 92h)" \
+  FAKE_BD_LOG="$SCRATCH/fake-bd.log" main
+RC=$?
+[ "$RC" -ne 0 ] && ok "mac-mini N/A this round -> nonzero exit" || bad "expected nonzero exit, got $RC"
+DATA_LINE="$(grep -m1 '^<!-- storage-inventory:data ' "$DOC_PATH")"
+PRESERVED="$(_extract_field "$DATA_LINE" mac_mini_used_gb)"
+[ "$PRESERVED" = "100.00" ] && ok "failed measurement carries the last REAL baseline (100.00) forward, not a fabricated 0" || bad "expected mac_mini_used_gb=100.00 preserved, got '$PRESERVED' (data line: $DATA_LINE)"
+
+echo "── main: mac-mini recovers next round -> must compare against the PRESERVED baseline, not a reset 'novo' ──"
+: > "$SCRATCH/fake-bd.log"; : > "$STORAGE_INVENTORY_LOG"
+FAKE_DF_TOTAL_KB=209715200 FAKE_DF_USED_KB=104857600 FAKE_AWS_BYTES=1073741824 \
+  FAKE_DRIVE_OUTPUT="12.00 15.00 80.0" FAKE_MD_VERDICT="45.2h/mes projetado (abaixo do teto 92h)" \
+  FAKE_BD_LOG="$SCRATCH/fake-bd.log" main
+RC=$?
+[ "$RC" -eq 0 ] && ok "mac-mini back to 100.00 (same as the preserved baseline) -> healthy, exit 0" || bad "expected exit 0 once mac-mini recovers at the same value, got $RC"
+grep -q "Mac mini:.*status=✅" "$STORAGE_INVENTORY_LOG" && ok "recovery run compares against the PRESERVED real baseline (status=✅), not a reset 'novo'" || bad "expected status=✅ against preserved baseline: $(grep 'Mac mini:' "$STORAGE_INVENTORY_LOG")"
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

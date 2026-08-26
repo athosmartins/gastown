@@ -374,7 +374,12 @@ main() {
 
   # Overall verdict — plain equality checks (not a case pattern) so this
   # never depends on none of the status strings containing glob metachars.
-  if [ "$mm_status" = "⚠️" ] || [ "$s3_status" = "⚠️" ] || [ "$drv_status" = "⚠️" ] || [ "$md_status" = "⚠️" ]; then
+  # N/A (measurement failed) must trip this exactly like ⚠️: "couldn't
+  # measure" and "measured and healthy" are different outcomes, and
+  # collapsing them let a failed vector auto-close this run as OK
+  # (GATE-FEEDBACK ga-z297h attempt 1, blocking issue 1).
+  if [ "$mm_status" = "⚠️" ] || [ "$s3_status" = "⚠️" ] || [ "$drv_status" = "⚠️" ] || [ "$md_status" = "⚠️" ] \
+    || [ "$mm_status" = "N/A" ] || [ "$s3_status" = "N/A" ] || [ "$drv_status" = "N/A" ] || [ "$md_status" = "N/A" ]; then
     overall_rc=1
   fi
 
@@ -394,7 +399,13 @@ main() {
     echo "> Gerado por \`storage-inventory-monthly.sh\` (launchd \`com.gascity.storage-inventory-monthly\`, mensal). Não edite manualmente entre os marcadores — a próxima rodada sobrescreve. ⚠️ = vetor saiu de ±${DEVIATION_PCT}% da rodada anterior."
     echo ""
     echo "$BEGIN_MARK"
-    echo "<!-- storage-inventory:data mac_mini_used_gb=${mm_used:-0} s3_total_gb=${s3_total:-0} drive_sa_used_gb=${drv_used:-0} ts=$now_date -->"
+    # On a failed measurement (mm_used/s3_total/drv_used empty), carry the
+    # PREVIOUS recorded value forward instead of writing 0 — a literal 0
+    # here becomes next month's baseline, and _pct_delta's own zero-case
+    # then reads that fabricated 0 as "no baseline", silently erasing the
+    # last real measurement (GATE-FEEDBACK ga-z297h attempt 1, blocking
+    # issue 2).
+    echo "<!-- storage-inventory:data mac_mini_used_gb=${mm_used:-$mm_prev} s3_total_gb=${s3_total:-$s3_prev} drive_sa_used_gb=${drv_used:-$drv_prev} ts=$now_date -->"
     echo "$table_md"
     echo ""
     echo "**Diretórios-chave (\`~/gt\` e afins), medidos $now_date:**"

@@ -476,7 +476,9 @@ Transform data into a formatted digest and deliver it.
   ~NH (or "stable", or "N/A — <reason>")
 
 ## Storage — inventário mensal (ga-z297h)
-- Última rodada: <data> — OK / ATENÇÃO (N vetor(es) fora de ±20%) / N/A —
+- Última rodada: <data> — OK / ATENÇÃO (N vetor(es) fora de ±20% e/ou N
+  vetor(es) não pôde(ram) ser medido(s) nesta rodada — as duas causas abrem
+  bug e não são a mesma coisa; ver a tabela do bead para qual delas) / N/A —
   não rodou há Nd (esperado mensal)
 - (quando houver rodada dentro da janela) tabela de vetores medidos, com Δ e
   status — ver o corpo do bead `storage-inventory` mais recente
