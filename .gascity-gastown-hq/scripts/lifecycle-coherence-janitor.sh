@@ -108,6 +108,18 @@ _add() {    # store id label
   [ "$LCJ_DRY_RUN" = "1" ] && { log "  DRY: would add $3 to $2"; return 0; }
   "$BD" -C "$1" label add "$2" "$3" -q >/dev/null 2>&1 || true
 }
+_undefer() {  # store id — ga-sfj3i.1: dedicated command, not _open() + manual
+  # defer_until clear. `bd defer`/`bd ready --help` confirm bd ready excludes
+  # by the STORED status field alone (in_progress/blocked/deferred/hooked) —
+  # it never dynamically compares defer_until to now, so a bead a Pilot hold
+  # deferred does NOT self-revert once defer_until passes; something must
+  # explicitly undefer it. `bd undefer` does the full, correct job in one
+  # call: flips status back to open AND clears defer_until to null (verified
+  # live, ga-z2tl2) — a raw `_open()` (--status open) would leave a stale
+  # past-dated defer_until sitting on the bead.
+  [ "$LCJ_DRY_RUN" = "1" ] && { log "  DRY: would undefer $2"; return 0; }
+  "$BD" -C "$1" undefer "$2" >/dev/null 2>&1 || true
+}
 _unassign() {  # store id — clear a stale assignee (R4)
   [ "$LCJ_DRY_RUN" = "1" ] && { log "  DRY: would clear assignee of $2"; return 0; }
   "$BD" -C "$1" update "$2" --assignee "" -q >/dev/null 2>&1 || true
@@ -604,6 +616,22 @@ run_sweep() {
     # R6 (imp19 pilot:held expiry): pilot:held + pilot:held-until:<past-epoch> → strip both
     # (the hold expired). pilot:held + NO pilot:held-until:* → set a 24h default expiry so
     # permanent trapdoors are impossible: every hold now has a ceiling.
+    #
+    # ga-sfj3i.1: since that fix, ga-lfvs6/ga-4zqwm ALSO set the bead's real
+    # defer_until (bd ready's own field) alongside these labels — but nothing
+    # about defer_until self-expires. `bd ready --help` confirms it excludes
+    # by the STORED status field alone (in_progress/blocked/deferred/hooked),
+    # never by comparing defer_until to now; a bead status=deferred stays
+    # status=deferred, and thus permanently invisible to Pilot's own scan AND
+    # every pool self-serve probe, until something explicitly calls `bd
+    # undefer` — verified live (ga-z2tl2): stayed status=deferred and hidden
+    # for 45s+ past its own defer_until with zero self-recovery, then flipped
+    # instantly on an explicit undefer. Without this, ga-sfj3i.1 would trade
+    # "occasionally dispatched slightly early" for "stuck invisible forever" —
+    # strictly worse. `_undefer` is a safe no-op on a bead that was never
+    # actually deferred (status=open the whole time, from before this fix, or
+    # from ga-jazy9 which never sets defer_until) — verified live (ga-ua2ve):
+    # exit 0, no state change, just an informational message.
     _now_lcj=$(date +%s)
     for id in $("$BD" -C "$store" list -l pilot:held --json -n 0 2>/dev/null | jq -r '.[].id' 2>/dev/null); do
       [ -n "$id" ] || continue
@@ -616,7 +644,8 @@ run_sweep() {
         _expiry_ep=$(echo "$_expiry_lbl" | cut -d: -f3)
         if [ "$(( _expiry_ep + 0 ))" -lt "$_now_lcj" ] 2>/dev/null; then
           _strip "$store" "$id" pilot:held; _strip "$store" "$id" "$_expiry_lbl"
-          log "R6 pilot-held-expired: $id ($(basename "$store")) — hold expired at $(date -r "$_expiry_ep" 2>/dev/null || echo "$_expiry_ep"), stripped"; n=$((n+1))
+          _undefer "$store" "$id"
+          log "R6 pilot-held-expired: $id ($(basename "$store")) — hold expired at $(date -r "$_expiry_ep" 2>/dev/null || echo "$_expiry_ep"), stripped + undeferred (ga-sfj3i.1)"; n=$((n+1))
         fi
       else
         # No expiry: stamp a 24h ceiling so the hold can't be permanent
@@ -1160,7 +1189,7 @@ case "\$a" in
     echo '[{"id":"r8-parked-auto","labels":["exec:auto","pool:refused:engine-rebuild-required"]},{"id":"r8-parked-auto2","labels":["exec:auto","pool:refused:some-other-reason"]},{"id":"r8-parked-both","labels":["exec:auto","ctx:ready","story:blocked"]},{"id":"r8-clean-auto","labels":["exec:auto","lane:small"]},{"id":"r8-parked-canon-exact","labels":["exec:auto","framework:engine"]},{"id":"r8-parked-canon-prefix","labels":["exec:auto","pilot:refused-reason:engine-rebuild-required"]}]' ;;
   *"list -l ctx:ready --json"*)
     echo '[{"id":"r8-parked-ready","labels":["ctx:ready","needs-human"]},{"id":"r8-parked-both","labels":["exec:auto","ctx:ready","story:blocked"]},{"id":"r8-locked","labels":["ctx:ready","needs-human"]},{"id":"r8-clean-ready","labels":["ctx:ready","lane:small"]},{"id":"r8-parked-canon-blockedon","labels":["ctx:ready","blocked-on:wa-d9a0j"]}]' ;;
-  *"label remove"*|*"label add"*|*"update"*|*"dolt commit"*) echo "\$a" >> "$ACT" ;;
+  *"label remove"*|*"label add"*|*"update"*|*"dolt commit"*|*"undefer"*) echo "\$a" >> "$ACT" ;;
   *) echo '[]' ;;
 esac
 SHIM
@@ -1280,6 +1309,14 @@ GITSHIM
   grep -q 'label remove r6-exp pilot:held'     "$ACT" && ok "R6 (imp19): expired pilot:held-until → stripped pilot:held" || bad "R6 did not strip expired pilot:held"
   grep -q 'label remove r6-exp pilot:held-until:1000000' "$ACT" && ok "R6 (imp19): stripped the expiry label" || bad "R6 did not strip expiry label"
   grep -q 'label add r6-noexp pilot:held-until:' "$ACT" && ok "R6 (imp19): pilot:held with no expiry → stamped default 24h expiry" || bad "R6 did not stamp default expiry"
+  # ga-sfj3i.1: an expired hold must ALSO undefer the bead — the label strip
+  # alone never did (bd ready excludes by the STORED status field, not by
+  # comparing defer_until to now; verified live, see the fix's own comment).
+  # Without this, a bead ga-lfvs6/ga-4zqwm deferred stays status=deferred and
+  # invisible to every bd-ready-based probe FOREVER once its hold expires,
+  # trading "dispatched slightly early" for "stuck invisible forever".
+  grep -q 'undefer r6-exp'    "$ACT" && ok "R6 (ga-sfj3i.1): expired hold → also undeferred (restores bd-ready visibility, not just the label)" || bad "R6 (ga-sfj3i.1) regression: expired hold did not undefer — a real-world hold would stay invisible forever"
+  grep -q 'undefer r6-noexp'  "$ACT" && bad "R6 (ga-sfj3i.1) regression: undeferred a bead whose hold has NOT expired this pass (it just got a fresh default-ceiling stamp)" || ok "R6 (ga-sfj3i.1): did not undefer the fresh-ceiling bead (no expiry to act on yet)"
   grep -q 'label remove r5 ctx:ready'         "$ACT" && ok "R5 (imp15): closed+ctx:ready → stripped (Aprovadas zombie fix)" || bad "R5 did not strip ctx:ready"
   grep -q 'label add r5 story:done'           "$ACT" && ok "R5 (imp15): closed ctx:ready bead → set story:done" || bad "R5 did not set story:done"
 
