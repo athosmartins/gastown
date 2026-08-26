@@ -109,7 +109,13 @@ QGE_PERIOD_SEC=604800    # 7 days, matches its launchd StartInterval
 QGE_BUFFER_SEC=1200      # ±20min around the predicted fire (drift + advisory-only impact)
 
 # ── PROFILE VALUES ──────────────────────────────────────────────────────────────
-DOG_MAX_NORMAL=3;      DOG_MAX_THROTTLED=1
+# DOG_MAX_NORMAL is env-overridable (e.g. via this launchd job's plist
+# EnvironmentVariables) so a citywide capacity reduction (ga-xsd03) can lower
+# the outside-window baseline without hand-editing city.toml — a hand-edit
+# gets silently reverted by this guard's own next pass (ga-wdkzk). Default
+# unchanged at 3; the selftest does not set the env var, so it still exercises
+# the default.
+DOG_MAX_NORMAL="${DOG_MAX_NORMAL:-3}"; DOG_MAX_THROTTLED=1
 ORACLE_MIN_NORMAL=1;   ORACLE_MIN_THROTTLED=0
 BEADS_HEALTH_NORMAL="120s";     BEADS_HEALTH_THROTTLED="300s"
 GATE_SWEEP_NORMAL="60s";        GATE_SWEEP_THROTTLED="150s"
