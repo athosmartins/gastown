@@ -154,6 +154,21 @@ echo "Scenario 2b-orphan (ga-kb0kz): stale in-progress with EMPTY assignee → b
   && ok "ga-p5qgk shape (3d stale) → bounce" \
   || bad "ga-p5qgk shape → expected bounce"
 
+echo "Scenario 2d (ga-kb0kz gate-fix, blocking issue 2): orphan age fails CLOSED on an unparseable timestamp"
+[ "$(auto_refino_orphan_age_min 0 999999)" = "0" ] \
+  && ok "upd_epoch=0 (date-parse fallback) → age clamped to 0, never 'definitely stale enough'" \
+  || bad "epoch-0 fallback → expected clamp to 0 (destructive reclaim must fail closed on unknown age)"
+[ "$(auto_refino_orphan_age_min 1787740000 51)" = "51" ] \
+  && ok "valid upd_epoch → raw age_min passed through unchanged" \
+  || bad "valid timestamp → expected age_min passed through unchanged"
+# End-to-end: run the clamp's own output through the real classifier. The RAW
+# (unclamped) age here would trivially clear any real-world orphan_ttl, so
+# this only passes if the clamp is actually applied before classification.
+CLAMPED_AGE=$(auto_refino_orphan_age_min 0 999999)
+[ "$(auto_refino_lifecycle_state "story:refinement-in-progress" "" "$ACTOR" "$CLAMPED_AGE" 50)" = "skip" ] \
+  && ok "epoch-0 candidate run through the real clamp → classifier says skip, not bounce" \
+  || bad "epoch-0 candidate → expected skip (unknown age reclaimed as if definitely stale — regression)"
+
 echo "Scenario 2c: past-the-daemon / terminal states are NEVER candidates"
 for L in auto-refino:refining auto-refino:escalated refino-gate:reviewing story:refino-review story:needs-approval story:approved story:in-flight story:done story:cancelled; do
   st=$(auto_refino_lifecycle_state "$L" "" "$ACTOR")
@@ -1790,7 +1805,7 @@ if grep -qF '<(echo "$FRESH_JSON") <(echo "$UNREF_JSON") <(echo "$BOUNCE_JSON") 
 else
   bad "20b. ORPHAN_JSON exists but is not merged into CANDIDATES — dead query, never reaches classification"
 fi
-if grep -qF 'auto_refino_lifecycle_state "$c_labels" "$c_assignee" "$AUTO_REFINO_ACTOR" "$c_age_min" "$AUTO_REFINO_ORPHAN_TTL_MINUTES"' "$DISPATCHER"; then
+if grep -qF 'auto_refino_lifecycle_state "$c_labels" "$c_assignee" "$AUTO_REFINO_ACTOR" "$c_orphan_age_min" "$AUTO_REFINO_ORPHAN_TTL_MINUTES"' "$DISPATCHER"; then
   ok "20c. the classification loop passes age_min + orphan TTL to the classifier (not just the 3-arg backward-compat form)"
 else
   bad "20c. classification loop still calls the classifier with 3 args — orphan branch can never trigger from live candidates"
@@ -1808,6 +1823,27 @@ if [ -n "$_ORPHAN_DEF_LN" ] && [ -n "$_CANDIDATES_LN" ] && [ "$_ORPHAN_DEF_LN" -
   ok "20e. ORPHAN_JSON is defined before the CANDIDATES merge that consumes it"
 else
   bad "20e. ORPHAN_JSON ordering wrong relative to the CANDIDATES merge"
+fi
+# gate-fix (fix-attempt 1 reviewer, blocking issue 1): Step 1's classify loop
+# is not the only call site — Step 1b re-classifies the SAME selected
+# candidate into $STATE, which Step 7's requeue-on-timeout branch later reads
+# to decide whether to restore refinement-in-progress (bounce) or unrefined
+# (fresh). Scenario 2b-orphan already proves the classifier returns "skip"
+# when called without age_min/orphan_ttl — this proves the STATE= site was
+# updated to NOT hit that default, same shape as 20c above but for the second
+# call site the first fix-attempt missed.
+if grep -qF 'STATE=$(auto_refino_lifecycle_state "$STORY_LABELS" "$STORY_ASSIGNEE" "$AUTO_REFINO_ACTOR" "$c_orphan_age_min" "$AUTO_REFINO_ORPHAN_TTL_MINUTES")' "$DISPATCHER"; then
+  ok "20f. the STATE-capture site (Step 1b) also threads age_min + orphan TTL — not the 3-arg backward-compat form"
+else
+  bad "20f. STATE-capture site still calls the classifier with 3 args — an orphan-originated candidate is misclassified skip, corrupting Step 7's requeue-on-timeout branch"
+fi
+# gate-fix blocking issue 2: both call sites must use the CLAMPED age
+# (c_orphan_age_min), never the raw c_age_min the RAW_MIN_AGE guard uses —
+# confirms the fail-closed guard is actually wired into the destructive path.
+if grep -qF 'c_orphan_age_min=$(auto_refino_orphan_age_min "$c_upd_epoch" "$c_age_min")' "$DISPATCHER"; then
+  ok "20g. the classify loop derives c_orphan_age_min via the fail-closed clamp, not raw c_age_min directly"
+else
+  bad "20g. c_orphan_age_min is not derived via auto_refino_orphan_age_min — epoch-0 fallback can reclaim on an unknown age again"
 fi
 
 echo ""

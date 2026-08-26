@@ -234,6 +234,26 @@ auto_refino_type_eligible() {
   esac
 }
 
+# auto_refino_orphan_age_min <upd_epoch> <raw_age_min>
+#   ga-kb0kz gate-fix (fix-attempt 1 reviewer, blocking issue 2): clamp the age
+#   fed to the orphan-reclaim branch to 0 whenever upd_epoch is the "0"
+#   sentinel (unparseable/missing updated_at). The date-parse fallback that
+#   produces upd_epoch=0 makes raw_age_min HUGE (NOW_EPOCH - 0 minutes), which
+#   the orphan branch would otherwise read as "definitely stale enough to
+#   reclaim". A destructive reclaim must fail CLOSED on an unknown age instead
+#   — mirrors the sibling Step-0 TTL guard's `[ "$upd_epoch" = "0" ] &&
+#   continue`. Callers that just want the pre-existing "fails open" behaviour
+#   (e.g. the RAW_MIN_AGE guard) keep using raw_age_min directly — this only
+#   guards the value threaded into auto_refino_lifecycle_state.
+auto_refino_orphan_age_min() {
+  local upd_epoch="$1" raw_age_min="$2"
+  if [ "$upd_epoch" = "0" ]; then
+    echo 0
+  else
+    echo "$raw_age_min"
+  fi
+}
+
 # auto_refino_lifecycle_state <labels_csv> <assignee> <daemon_actor> [age_min] [orphan_ttl]
 #   Classify a candidate by its lifecycle labels. Emits one of:
 #     fresh    — story:triage or story:unrefined, untouched → refine it.
@@ -1199,9 +1219,16 @@ while IFS= read -r row; do
   c_upd_epoch=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$c_updated" +%s 2>/dev/null \
     || date -u -d "$c_updated" +%s 2>/dev/null || echo 0)
   c_age_min=$(( (NOW_EPOCH - c_upd_epoch) / 60 ))
+  # ga-kb0kz gate-fix (fix-attempt 1 reviewer, blocking issue 2): c_age_min
+  # above fails OPEN by design for the pre-existing RAW_MIN_AGE guard below
+  # (comment two lines up) — safe there (worst case: ingest sooner). The
+  # orphan-reclaim branch this diff adds is DESTRUCTIVE, so it needs the
+  # opposite default; auto_refino_orphan_age_min supplies it without touching
+  # c_age_min itself.
+  c_orphan_age_min=$(auto_refino_orphan_age_min "$c_upd_epoch" "$c_age_min")
   [ "$(auto_refino_type_eligible "$c_type")" = "yes" ] || { log "  skip $c_id: type '$c_type' not in funnel (bug/chore/task bypass)"; continue; }
   [ "$(auto_refino_is_product_story "$c_labels" "$AUTO_REFINO_EXCLUDE_LABELS")" = "yes" ] || { log "  skip $c_id: carries build/non-product label (auto-refino excludes: $AUTO_REFINO_EXCLUDE_LABELS) — not a product story"; continue; }
-  state=$(auto_refino_lifecycle_state "$c_labels" "$c_assignee" "$AUTO_REFINO_ACTOR" "$c_age_min" "$AUTO_REFINO_ORPHAN_TTL_MINUTES")
+  state=$(auto_refino_lifecycle_state "$c_labels" "$c_assignee" "$AUTO_REFINO_ACTOR" "$c_orphan_age_min" "$AUTO_REFINO_ORPHAN_TTL_MINUTES")
   case "$state" in
     bounce)
       # ga-kb0kz: the ONLY way "bounce" comes back with an empty assignee is
@@ -1308,7 +1335,17 @@ fi
 
 STORY_LABELS=$(_labels_csv "$STORY")
 STORY_ASSIGNEE=$(echo "$STORY" | jq -r '.assignee // empty')
-STATE=$(auto_refino_lifecycle_state "$STORY_LABELS" "$STORY_ASSIGNEE" "$AUTO_REFINO_ACTOR")
+# ga-kb0kz gate-fix (fix-attempt 1 reviewer, blocking issue 1): re-classifies
+# the SAME candidate Step 1 just selected, but STORY_ASSIGNEE is still empty
+# for an orphan pick at this point — the 3-arg form silently defaulted
+# age_min=0/orphan_ttl=50 and always fell through to "skip" instead of
+# "bounce", even though Step 1 (~line 1204) just classified this exact row as
+# "bounce" via the orphan branch. STATE drives real behaviour later (Step 7's
+# requeue-on-timeout branch, not just this log line), so the mismatch was a
+# real bug. Reuse c_orphan_age_min — still in scope from Step 1's loop (no
+# subshell: process substitution) and is exactly the age that produced this
+# candidate.
+STATE=$(auto_refino_lifecycle_state "$STORY_LABELS" "$STORY_ASSIGNEE" "$AUTO_REFINO_ACTOR" "$c_orphan_age_min" "$AUTO_REFINO_ORPHAN_TTL_MINUTES")
 log "Selected story for auto-refino: $STORY_ID ($STATE) — $STORY_TITLE"
 
 # ── Step 2: Atomic claim — mark as being refined ──────────────────────────────
