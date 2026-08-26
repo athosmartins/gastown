@@ -167,11 +167,106 @@ phase_rollback() {
   log "rollback OK: $(readlink "$SYMLINK")"
 }
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FASE 2 — o que roda SOZINHO depois do reboot.
+#
+# POR QUE DUAS FASES: o reboot mata quem o disparou. Um "reboot && build" numa
+# linha so nunca chega no build. Entao a fase 1 ARMA um job do launchd que
+# dispara no proximo boot, e a fase 2 e esse job.
+#
+# POR QUE EU NAO REBOOTO: reiniciar a maquina e ato do Athos, nao meu (guardrail
+# permanente: nada de restart da cidade sem avisar antes). O 'arm' valida, arma e
+# PARA — quem aperta o botao e ele.
+# ─────────────────────────────────────────────────────────────────────────────
+PLIST="$HOME/Library/LaunchAgents/com.gascity.engine-window-postboot.plist"
+LABEL_PLIST="com.gascity.engine-window-postboot"
+
+phase_arm() {
+  phase_check || log "AVISO: check reprovou (esperado se o swap ainda nao foi devolvido — o reboot resolve isso). Armando mesmo assim."
+  cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL_PLIST</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$(cd "$(dirname "$0")" && pwd)/$(basename "$0")</string>
+    <string>post-boot</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$LOG</string>
+  <key>StandardErrorPath</key><string>$LOG</string>
+</dict></plist>
+PLISTEOF
+  # NAO carregamos aqui de proposito. RunAtLoad dispara no LOAD, e um
+  # bootstrap agora faria o build rodar NA HORA, no meio do dia (medido:
+  # aconteceu na primeira versao deste script, 17:33 — o guard de recursos
+  # barrou o build, mas o job nunca deveria ter disparado). Deixar o plist
+  # no diretorio basta: o launchd carrega no proximo login/boot, e e ai que
+  # o RunAtLoad deve disparar.
+  [ -f "$PLIST" ] || die "nao consegui escrever o plist"
+  log "=== ARMADO ==="
+  log "  O build vai rodar SOZINHO no proximo boot e trocar o binario se passar."
+  log "  Resultado + rollback: $LOG"
+  log ""
+  log "  AGORA E COM VOCE: reinicie a maquina quando quiser."
+  log "  Pra desarmar sem reiniciar: $(basename "$0") disarm"
+}
+
+phase_disarm() {
+  launchctl bootout "gui/$(id -u)/$LABEL_PLIST" 2>/dev/null || launchctl unload "$PLIST" 2>/dev/null || true
+  rm -f "$PLIST" 2>/dev/null
+  log "DESARMADO — nada vai rodar no proximo boot."
+}
+
+phase_post_boot() {
+  # Guarda: so rode se a maquina REALMENTE acabou de bootar. Sem isto, um
+  # load manual do plist dispara um build pesado no meio do expediente.
+  local boot_s now_s up_min
+  boot_s=$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/^{ *sec *= *\([0-9]*\).*/\1/p')
+  now_s=$(date +%s)
+  if [ -n "$boot_s" ]; then
+    up_min=$(( (now_s - boot_s) / 60 ))
+    if [ "$up_min" -gt 30 ]; then
+      log "POS-BOOT RECUSADO: maquina de pe ha ${up_min}min (>30). Isto nao e um boot recente."
+      phase_disarm
+      return 0
+    fi
+  else
+    log "POS-BOOT RECUSADO: nao consegui ler kern.boottime — sob duvida, nao rodo."
+    phase_disarm; return 0
+  fi
+  log "=== POS-BOOT: janela do engine disparou (uptime ${up_min}min) ==="
+  # Desarma PRIMEIRO. Se o build travar, o job nao pode disparar de novo no
+  # boot seguinte — um job que se re-arma sozinho e como o guard que virou a
+  # carga que deveria observar.
+  phase_disarm
+  # A cidade sobe pelo supervisor; da tempo dela assentar antes de competir por CPU.
+  local waited=0
+  while [ "$waited" -lt 300 ]; do
+    pgrep -f 'gc supervisor run' >/dev/null 2>&1 && break
+    sleep 15; waited=$((waited+15))
+  done
+  log "supervisor visivel apos ${waited}s (ou timeout) — seguindo"
+  sleep 60   # deixa o swap/IO do boot assentar antes de medir recursos
+  phase_build || { log "BUILD FALHOU — NADA foi trocado. Binario atual intacto."; \
+    command -v notify >/dev/null 2>&1 && notify -p 4 -t 'Janela do engine FALHOU' "build nao passou; nada trocado. Ver $LOG"; return 1; }
+  phase_swap  || { log "SWAP FALHOU — binario atual intacto."; return 1; }
+  log "=== JANELA CONCLUIDA COM SUCESSO ==="
+  command -v notify >/dev/null 2>&1 && notify -t 'Janela do engine OK' \
+    "engine trocado pro build novo e verificado. Rollback: engine-window-run.sh rollback"
+}
+
 mkdir -p "$(dirname "$LOG")"
 case "${1:-check}" in
   check)    phase_check ;;
   build)    phase_build "$@" ;;
   swap)     phase_swap ;;
-  rollback) phase_rollback ;;
-  *) echo "uso: $(basename "$0") [check|build|swap|rollback]"; exit 2 ;;
+  rollback)  phase_rollback ;;
+  arm)       phase_arm ;;
+  disarm)    phase_disarm ;;
+  post-boot) phase_post_boot ;;
+  *) echo "uso: $(basename "$0") [check|build|swap|rollback|arm|disarm]"; exit 2 ;;
 esac
