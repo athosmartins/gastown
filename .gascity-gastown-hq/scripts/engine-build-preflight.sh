@@ -69,6 +69,16 @@
 #                                     `go clean -cache && time make build` numa
 #                                     janela supervisionada e substituindo
 #                                     este default pela medicao direta.
+#
+# Load nao tem piso em GB (nao e um recurso de disco) — ga-6o4bh gate-fix-1
+# (gate_run=ga-d6zk9): verdict_load usa a mesma classificacao de TENDENCIA ja
+# calculada em load_trend (SUBINDO/ESTAVEL/CAINDO, razao 1m/15m > 1.15 ou <
+# 0.85 — nao env-overridable hoje, mesma logica de antes deste fix) em vez de
+# um teto absoluto: o incidente de origem (21,97 -> 38,81) e sobre a CURVA
+# subindo durante o build, nao sobre um numero fixo que varia por maquina/
+# nucleos. SUBINDO ou load1/load15 ilegivel agora REPROVAM a recomendacao —
+# antes eram so um sufixo informativo (SUBINDO) ou nem chegavam a aparecer no
+# veredito (ilegivel), o gap que este fix fecha.
 
 set -uo pipefail
 
@@ -236,6 +246,35 @@ print("\n".join(bad))
     && ok "sinal DESCONHECIDO reprova a recomendacao final" \
     || bad "sinal DESCONHECIDO nao deveria deixar passar: $_s5_out"
 
+  echo "S6 (ga-6o4bh gate-fix-1, gate_run=ga-d6zk9): load ISOLADO — os outros 3"
+  echo "sinais saudaveis, so load subindo — antes deste fix isto passava"
+  echo "(bad so olhava disco/swap/gocache; load_trend era so um sufixo"
+  echo "informativo). Isola exatamente o gap que S3 nao isolava (todo caso"
+  echo "que ali reprova ja reprova por swap/gocache)."
+  _s6_out=$(PREFLIGHT_TEST_DISK_FREE_GB=20 PREFLIGHT_TEST_SWAP_FREE_GB=8 \
+    PREFLIGHT_TEST_GOCACHE_GB=3 PREFLIGHT_TEST_LOADAVG_RAW='{ 38.81 30 21.97 }' \
+    bash "${BASH_SOURCE[0]}" --json)
+  printf '%s' "$_s6_out" | grep -q '"load_verdict":"SUBINDO"' \
+    && ok "load subindo marcado SUBINDO" || bad "load subindo nao marcado: $_s6_out"
+  printf '%s' "$_s6_out" | grep -q '"recommendation":"NAO RECOMENDADO' \
+    && ok "load SUBINDO sozinho ja reprova a recomendacao (nao so um sufixo ATENCAO)" \
+    || bad "load subindo com os outros 3 saudaveis ainda recomendou seguir (bug original, isolado): $_s6_out"
+  printf '%s' "$_s6_out" | grep -qi 'ATENCAO' \
+    && bad "sufixo ATENCAO obsoleto ainda presente — deveria ter sido substituido pelo bad-gate: $_s6_out" \
+    || ok "sufixo ATENCAO obsoleto removido (load agora reprova de verdade, nao so avisa)"
+
+  echo "S7 (ga-6o4bh gate-fix-1): load COMPLETAMENTE ilegivel, os outros 3"
+  echo "saudaveis — antes deste fix isto tambem passava (load_trend ficava"
+  echo "'desconhecida' mas nada olhava pra isso na decisao)."
+  _s7_out=$(PREFLIGHT_TEST_DISK_FREE_GB=20 PREFLIGHT_TEST_SWAP_FREE_GB=8 \
+    PREFLIGHT_TEST_GOCACHE_GB=3 PREFLIGHT_TEST_LOADAVG_RAW='__UNKNOWN__' \
+    bash "${BASH_SOURCE[0]}" --json)
+  printf '%s' "$_s7_out" | grep -q '"load_verdict":"DESCONHECIDO"' \
+    && ok "load ilegivel marcado DESCONHECIDO" || bad "load ilegivel nao marcado: $_s7_out"
+  printf '%s' "$_s7_out" | grep -q '"recommendation":"NAO RECOMENDADO' \
+    && ok "load DESCONHECIDO sozinho ja reprova a recomendacao (4o sinal, mesma regra dos outros 3)" \
+    || bad "load ilegivel com os outros 3 saudaveis ainda recomendou seguir (bug original, isolado): $_s7_out"
+
   echo
   echo "selftest: $PASS ok, $FAIL fail"
   [ "$FAIL" = "0" ]
@@ -289,25 +328,54 @@ if [ -n "$load1" ] && [ -n "$load15" ]; then
     'BEGIN{ if (a > b*1.15) print "SUBINDO"; else if (a < b*0.85) print "CAINDO"; else print "ESTAVEL" }')
 fi
 
+# ga-6o4bh gate-fix-1 (gate_run=ga-d6zk9): load_trend above was purely
+# informational — never consulted by the `bad` computation below, despite
+# this file's own docstring (TERCEIRO ESTADO) promising the guarantee
+# applies to "um sinal" (any of the four), unqualified. A completely
+# unmeasurable load (sysctl failing) or a load actively climbing — the
+# exact ga-v7nk4 incident shape, 21.97 -> 38.81 in 20min — both used to
+# recommend "OK PARA COMECAR", the second with only an advisory suffix
+# appended rather than flipping the verdict. verdict_load closes that gap
+# using the same OK/DESCONHECIDO shape as the other three signals; SUBINDO
+# is its own distinct fail state (not folded into DESCONHECIDO) since it IS
+# a measured, known-bad reading, not an absent one — the two must stay
+# distinguishable in the report for the same reason none of the other
+# verdicts collapse "measured bad" into "couldn't measure".
+verdict_load="DESCONHECIDO"
+if [ -n "$load1" ] && [ -n "$load15" ]; then
+  case "$load_trend" in
+    SUBINDO) verdict_load="SUBINDO" ;;
+    *) verdict_load="OK" ;;
+  esac
+fi
+
 bad=0
 case "$verdict_disk" in OK) ;; *) bad=1 ;; esac
 case "$verdict_swap" in OK) ;; *) bad=1 ;; esac
 case "$verdict_gocache" in QUENTE|FRIO-COM-FOLGA) ;; *) bad=1 ;; esac
+case "$verdict_load" in OK) ;; *) bad=1 ;; esac
 
 if [ "$bad" = "1" ]; then
   recommendation="NAO RECOMENDADO - pelo menos um sinal reprovou ou nao pode ser medido (ver detalhe acima). Decisao de seguir ou adiar continua sendo de quem executa a janela."
 else
+  # ga-6o4bh gate-fix-1: the old "ATENCAO: load esta SUBINDO" suffix appended
+  # here (while still LEADING with "OK PARA COMECAR") is gone — verdict_load
+  # now participates in `bad` above, so SUBINDO already routes to the branch
+  # above instead. This branch is only reachable when load_trend is ESTAVEL,
+  # CAINDO, or the load1/load15 pair was itself unmeasurable in a way that
+  # still left verdict_load="OK" — which cannot happen given verdict_load's
+  # own definition, so in practice this else is reached only on a genuinely
+  # healthy, non-rising load.
   recommendation="OK PARA COMECAR - os 4 sinais medidos passam nos pisos configurados."
-  [ "$load_trend" = "SUBINDO" ] && recommendation="$recommendation ATENCAO: load esta SUBINDO -- remeca este pre-voo o mais perto possivel do inicio real do build."
 fi
 
 if [ "$JSON_OUT" = "1" ]; then
   json_num() { [ -n "${1:-}" ] && printf '%s' "$1" || printf 'null'; }
-  printf '{"disk_free_gb":%s,"disk_floor_gb":%s,"disk_verdict":"%s","swap_free_gb":%s,"swap_floor_gb":%s,"swap_verdict":"%s","gocache_gb":%s,"gocache_warm_floor_gb":%s,"gocache_verdict":"%s","load1":%s,"load5":%s,"load15":%s,"load_trend":"%s","recommendation":"%s"}\n' \
+  printf '{"disk_free_gb":%s,"disk_floor_gb":%s,"disk_verdict":"%s","swap_free_gb":%s,"swap_floor_gb":%s,"swap_verdict":"%s","gocache_gb":%s,"gocache_warm_floor_gb":%s,"gocache_verdict":"%s","load1":%s,"load5":%s,"load15":%s,"load_trend":"%s","load_verdict":"%s","recommendation":"%s"}\n' \
     "$(json_num "$disk_free_gb")" "$DISK_FLOOR_GB" "$verdict_disk" \
     "$(json_num "$swap_free_gb")" "$SWAP_FLOOR_GB" "$verdict_swap" \
     "$(json_num "$gocache_gb")" "$GOCACHE_WARM_GB" "$verdict_gocache" \
-    "$(json_num "$load1")" "$(json_num "$load5")" "$(json_num "$load15")" "$load_trend" \
+    "$(json_num "$load1")" "$(json_num "$load5")" "$(json_num "$load15")" "$load_trend" "$verdict_load" \
     "$recommendation"
   exit 0
 fi
@@ -330,9 +398,9 @@ else
   echo "  3. GOCACHE ....... nao consegui verificar (go env / du falhou)           DESCONHECIDO"
 fi
 if [ -n "$load1" ]; then
-  echo "  4. Load avg ...... 1m=$load1  5m=$load5  15m=$load15  -- tendencia: $load_trend"
+  echo "  4. Load avg ...... 1m=$load1  5m=$load5  15m=$load15  -- tendencia: $load_trend      $verdict_load"
 else
-  echo "  4. Load avg ...... nao consegui verificar (sysctl vm.loadavg falhou)     DESCONHECIDO"
+  echo "  4. Load avg ...... nao consegui verificar (sysctl vm.loadavg falhou)     $verdict_load"
 fi
 echo
 echo "  RECOMENDACAO: $recommendation"
