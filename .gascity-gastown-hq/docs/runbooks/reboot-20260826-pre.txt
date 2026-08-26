@@ -1,0 +1,14 @@
+SNAPSHOT PRE-REBOOT — 2026-08-26T10:39:29Z
+
+boottime ANTES: { sec = 1787402717, usec = 703480 } Sat Aug 22 09:45:17 2026
+uptime:  7:39  up 3 days, 21:54, 5 users, load averages: 36.81 28.88 31.40
+
+disco: 6.8Gi
+swapfiles: 11
+swap: total = 11264.00M  used = 10168.56M  free = 1095.44M  (encrypted)
+
+sessoes vivas: 13
+binario gc: /Users/athos/.local/libexec/gc-1.1.1-vendor110
+
+MOTIVO: Athos autorizou 26/08 07:3x pra quebrar o laco memoria/disco.
+ESPERADO DEPOIS: swapfiles=0 ou poucos, disco ~19GB, daemons presos a login ate o Athos destravar.
