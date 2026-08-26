@@ -226,6 +226,21 @@ def sample(now=None, ps_fixture=None, sessions_fixture=None, compute_rig=True):
     moment the machine is already under RAM pressure is the wrong trade."""
     now = now if now is not None else int(time.time())
     tbl = ps_snapshot(ps_fixture)
+    if not tbl:
+        # An empty ps table means `ps` itself failed/returned nothing — the
+        # machine cannot legitimately have zero running processes. Returning
+        # a normal-shaped record with total_rss_kb=0, by_owner={} here would
+        # be indistinguishable from "measured, genuinely near-zero," and
+        # would poison growth-since-last (a false -100% dip immediately
+        # followed by a false +inf% recovery on the next real sample) and
+        # historical medians (the fixture-driven test above only exercises
+        # the success path, so this specific failure shape would have
+        # shipped uncaught). Same "measurement gap, not a real reading"
+        # idiom as machine-utilization-sampler.py's dolt_ok()-failure state.
+        return {"ts": now, "error": "ps_snapshot_empty", "total_rss_kb": None,
+                "unresolved_kb": None, "n_procs": 0, "swap_used_mb": None,
+                "swap_total_mb": None, "free_pct": None, "by_owner": {},
+                "owner_kind": {}, "by_rig": {}}
     sess = sessions_by_key(sessions_fixture)
 
     by_owner = {}

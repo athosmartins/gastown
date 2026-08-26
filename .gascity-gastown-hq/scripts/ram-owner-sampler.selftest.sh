@@ -98,5 +98,28 @@ rc=$?
 grep -qi 'ram-owner-sampler' "$TMP/notify.log" 2>/dev/null && ok "notify_fail fired on uncaught exception" || bad "uncaught exception did NOT notify"
 
 echo ""
+echo "── Scenario: ps itself failed (empty ps table) -> measurement gap, not a fake zero-RSS sample ──"
+: > "$TMP/empty_ps.txt"   # simulates a `ps` call that returned nothing
+: > "$TMP/notify2.log"
+cat > "$TMP/notify2" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$TMP/notify2.log"
+EOF
+chmod +x "$TMP/notify2"
+BEFORE_LINES=0
+[ -f "$TMP/gap.jsonl" ] && BEFORE_LINES=$(wc -l < "$TMP/gap.jsonl")
+RAM_OWNER_PS_FIXTURE="$TMP/empty_ps.txt" \
+RAM_OWNER_SESSIONS_FIXTURE="$TMP/sessions.json" \
+RAM_OWNER_OUT="$TMP/gap.jsonl" \
+RAM_OWNER_NOW_EPOCH=1787700000 \
+RAM_OWNER_NOTIFY="$TMP/notify2" \
+PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH" \
+  python3 "$SAMPLER" >/dev/null 2>"$TMP/stderr4"
+rc=$?
+[ "$rc" -eq 0 ] && ok "a measurement gap is not treated as a crash (exits 0, not a hard failure)" || bad "expected rc=0 for a graceful skip, got $rc"
+[ ! -f "$TMP/gap.jsonl" ] && ok "no JSONL record written for a failed ps read (would have poisoned growth/median math with a false zero)" || bad "a fake zero-RSS record was written to history despite the ps read failing: $(cat "$TMP/gap.jsonl")"
+grep -qi 'ps_snapshot_empty\|amostra pulada' "$TMP/notify2.log" 2>/dev/null && ok "the skipped sample still notifies (visible, not silent)" || bad "skipped sample was silent — no notify fired"
+
+echo ""
 echo "ram-owner-sampler selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1

@@ -84,6 +84,16 @@ def rotate_if_needed(path, max_days, now):
 def main():
     try:
         rec = lib.sample(now=NOW, ps_fixture=PS_FIXTURE, sessions_fixture=SESSIONS_FIXTURE)
+        if rec.get("error"):
+            # A failed ps read is a measurement gap, not a real zero-RSS
+            # sample — writing it to the JSONL would poison every downstream
+            # growth/median calculation with a false dip-then-spike (see
+            # ram_owner_lib.sample()'s own comment on this). Skip the write,
+            # but never silently: notify so a persistently-failing `ps` is
+            # visible, same as any other crash path here.
+            print(f"(aviso: amostra pulada — {rec['error']})", file=sys.stderr)
+            notify_fail(f"ram-owner-sampler: amostra pulada — {rec['error']}")
+            return
         rotate_if_needed(OUT, ROTATE_MAX_DAYS, NOW)
         os.makedirs(os.path.dirname(OUT), exist_ok=True)
         with open(OUT, "a") as f:

@@ -198,6 +198,11 @@ def cmd_top(n):
     JSONL touched — this must keep working even if history/rotation is
     broken, since ram-pressure-monitor.sh calls this at alert time."""
     rec = lib.sample(now=NOW, ps_fixture=PS_FIXTURE, sessions_fixture=SESSIONS_FIXTURE, compute_rig=False)
+    if rec.get("error"):
+        # Distinct from "no significant owners" — the ps read itself failed.
+        # Worth saying plainly to whoever's reading a RAM alert right now.
+        print(f"top RSS: (falha na leitura — {rec['error']})")
+        return
     ranked = sorted(rec.get("by_owner", {}).items(), key=lambda kv: -kv[1])[:n]
     parts = [f"{name}={fmt_mb(kb)}" for name, kb in ranked]
     unresolved = rec.get("unresolved_kb", 0)
