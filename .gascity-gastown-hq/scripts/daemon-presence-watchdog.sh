@@ -1887,10 +1887,20 @@ GCSTUB43
   # this session's own memory warns about). The boundary is found dynamically
   # (not a hardcoded line number) so it can never silently go stale as the
   # file grows.
-  awk '/if \[ "\$\{1:-\}" = "--selftest"/{exit} {print}' "$0" \
-    | grep -qF 'src_path="$(_loaded_plist_source "$label")"' \
-    && ok "run_presence_drift_sweep calls _loaded_plist_source" \
-    || bad "wiring to _loaded_plist_source missing — REGRESSION risk"
+  # ga-sb1wu gate-fix-2 (gate_run=ga-czgxx): piping awk straight into
+  # `grep -qF` is racy under this file's `set -uo pipefail` — grep exits on
+  # its first match and closes the pipe while awk may still be writing, so
+  # awk can catch SIGPIPE (exit 141), which pipefail then reports as the
+  # pipeline's status even though grep DID match (reproduced live: 5/6 runs
+  # spuriously FAILed). Capturing to a variable first and matching via a
+  # herestring (backed by a temp file, not a live pipe) removes the race:
+  # awk has already exited before grep ever runs.
+  prod_code="$(awk '/if \[ "\$\{1:-\}" = "--selftest"/{exit} {print}' "$0")"
+  if grep -qF 'src_path="$(_loaded_plist_source "$label")"' <<< "$prod_code"; then
+    ok "run_presence_drift_sweep calls _loaded_plist_source"
+  else
+    bad "wiring to _loaded_plist_source missing — REGRESSION risk"
+  fi
 
   echo ""
   echo "daemon-presence-watchdog selftest: PASS=$PASS FAIL=$FAIL"
