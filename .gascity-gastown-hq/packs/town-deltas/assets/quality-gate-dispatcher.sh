@@ -3471,6 +3471,59 @@ branch_bead_commit_verdict() {
   fi
 }
 
+# gate_apply_needs_human <bead_city> <bead_id> [sub_label] — apply the
+# gate:needs-human circuit-breaker (plus an optional classification sub-label
+# like gate:needs-human:technical) to a bead, then RE-READ the bead's own
+# labels to verify the bare gate:needs-human label actually landed before
+# reporting success. Retries once on a miss (this file's own doctrine: Dolt
+# label writes are `-q 2>/dev/null || true` everywhere, deliberately fail-open
+# — a transient hiccup is the common, recoverable case). Echoes "armed" if
+# gate:needs-human is verified present after up to 2 tries, "failed"
+# otherwise. The optional sub_label is attempted opportunistically on every
+# try but does NOT gate the armed/failed verdict — it is classification
+# metadata, not the safety mechanism itself (that is the bare label, which is
+# what the Pilot's candidate queries and the guard's park-check key on).
+#
+# ga-55syh (P0): built because TWO independent sources (an escalation mail
+# and the builder's own bead comment) once announced gate:needs-human was
+# applied on wa-klhib — a bead that autonomously charges a real credit card
+# with no human in the loop — and it had never actually landed. Every one of
+# this file's 9 gate:needs-human call sites shared the identical shape: fire
+# `label add ... || true` and immediately compose a message asserting success
+# from the ATTEMPT, never from a verified read. This helper is wired at the
+# fix-attempt-cap site (the one this bug's own reproduction hit); the other 8
+# sites share the same underlying gap and are a documented follow-up (see the
+# gate-fix-attempt-cap-needs-human-verify.selftest.sh header).
+gate_apply_needs_human() {
+  local city="$1" bead_id="$2" sub="${3:-}" try labels
+  for try in 1 2; do
+    bd -C "$city" label add "$bead_id" "gate:needs-human" -q 2>/dev/null || true
+    [ -n "$sub" ] && { bd -C "$city" label add "$bead_id" "$sub" -q 2>/dev/null || true; }
+    labels=$(bd -C "$city" show "$bead_id" --json 2>/dev/null \
+      | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' 2>/dev/null || echo "")
+    case ",$labels," in
+      *,gate:needs-human,*) echo "armed"; return 0 ;;
+    esac
+  done
+  echo "failed"
+  return 1
+}
+
+# gate_needs_human_clause <status> — the ONE sentence every gate:needs-human
+# message uses to describe the circuit-breaker's ACTUAL state, sourced from
+# gate_apply_needs_human()'s verified read (status is "armed" or "failed"),
+# never from having merely attempted the write. Substituting this clause in
+# place of a hardcoded "Auto-retry is now DISABLED" assertion is what makes a
+# failed write change the message's WORDING instead of appending a warning
+# next to a claim that is still false (ga-55syh AC1+AC2).
+gate_needs_human_clause() {
+  if [ "$1" = "armed" ]; then
+    echo "Auto-retry is now DISABLED (label gate:needs-human, verified applied); the Pilot will not re-dispatch it."
+  else
+    echo "COULD NOT ARM THE CIRCUIT-BREAKER: gate:needs-human FAILED to apply after retry and is NOT present on the bead. This bead remains re-dispatchable with NO protection — a human must apply the label by hand immediately and investigate why the write failed."
+  fi
+}
+
 # Lib-only entrypoint for quality-gate-reconvene.selftest.sh: expose the helpers
 # above WITHOUT running the live dispatcher (mirrors quality-gate-guard.sh's
 # GATE_GUARD_LIB_ONLY). Must precede the log-redirect + live work below. Never
@@ -5048,31 +5101,38 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       # (c) RETRY CAP REACHED — stop auto-retry, escalate to the Mayor ONCE.
       log "Gate fix-attempt cap reached for $BEAD_ID (prev=$PREV_ATTEMPT >= $GATE_FIX_CAP). Escalating; no further auto-retry."
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:needs-fix"   -q 2>/dev/null || true
-      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human"           -q 2>/dev/null || true
-      # imp13: sub-label classifies this as a TECHNICAL circuit-breaker park (not a product decision).
-      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human:technical" -q 2>/dev/null || true
-      bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate auto-fix cap ($GATE_FIX_CAP attempts) exhausted — labeled gate:needs-human. The machine could not resolve this after $GATE_FIX_CAP fix cycles; the Pilot will NOT re-dispatch it. Human/Mayor intervention required." 2>/dev/null || true
+      # ga-55syh (P0): apply-then-VERIFY, not apply-then-assume. Every message
+      # below now branches on gate_apply_needs_human()'s re-read of the
+      # bead's actual labels — see that function's header for why (two
+      # independent sources once announced this label was applied on a bead
+      # that autonomously charges a real credit card, wa-klhib, when it
+      # never actually landed).
+      _NH_STATUS=$(gate_apply_needs_human "$BEAD_CITY" "$BEAD_ID" "gate:needs-human:technical")
+      [ "$_NH_STATUS" != "armed" ] && warn "gate:needs-human FAILED TO APPLY on $BEAD_ID after retry (ga-55syh) — circuit-breaker NOT armed, bead remains re-dispatchable."
+      bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate auto-fix cap ($GATE_FIX_CAP attempts) exhausted. $(gate_needs_human_clause "$_NH_STATUS") The machine could not resolve this after $GATE_FIX_CAP fix cycles; human/Mayor intervention required." 2>/dev/null || true
       # imp13: emit human-touch ledger entry (technical kind) for 99% metric.
       { source "$GC_CITY/scripts/gc-ledger.sh" 2>/dev/null && \
-        gc_ledger_append "human-touch" "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"source_daemon\":\"quality-gate-dispatcher\",\"stage\":\"executa\",\"kind\":\"technical\",\"bead_id\":\"${BEAD_ID}\",\"reason\":\"Gate fix-cap exhausted (${GATE_FIX_CAP} attempts) — circuit-breaker park\"}"; } 2>/dev/null || true
+        gc_ledger_append "human-touch" "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"source_daemon\":\"quality-gate-dispatcher\",\"stage\":\"executa\",\"kind\":\"technical\",\"bead_id\":\"${BEAD_ID}\",\"reason\":\"Gate fix-cap exhausted (${GATE_FIX_CAP} attempts) — circuit-breaker park (armed=$_NH_STATUS)\"}"; } 2>/dev/null || true
       # Escalate EXACTLY once: only mail if gate:needs-human was not already set.
       if ! printf '%s' "$SRC_LABELS" | grep -q "gate:needs-human"; then
+        _NH_MAIL_SUBJ="Gate needs-human: $BEAD_ID exhausted $GATE_FIX_CAP fix attempts"
+        [ "$_NH_STATUS" != "armed" ] && _NH_MAIL_SUBJ="CIRCUIT-BREAKER FAILED TO ARM: $BEAD_ID exhausted $GATE_FIX_CAP fix attempts, NOT protected"
         gc --city "$GC_CITY" mail send mayor \
-          -s "Gate needs-human: $BEAD_ID exhausted $GATE_FIX_CAP fix attempts" \
-          -m "$(printf 'Source bead %s failed the quality gate %s times. Auto-retry is now DISABLED (label gate:needs-human); the Pilot will not re-dispatch it.\n\nBranch: %s\nRig: %s\nGate run: %s\n\nLast blocking reasons:\n%s\n\nA human or the Mayor must intervene.' \
-            "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$BRANCH" "$RIG" "$GATE_RUN_ID" "$(echo -e "$FAIL_REASONS")")" \
+          -s "$_NH_MAIL_SUBJ" \
+          -m "$(printf 'Source bead %s failed the quality gate %s times. %s\n\nBranch: %s\nRig: %s\nGate run: %s\n\nLast blocking reasons:\n%s\n\nA human or the Mayor must intervene.' \
+            "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$(gate_needs_human_clause "$_NH_STATUS")" "$BRANCH" "$RIG" "$GATE_RUN_ID" "$(echo -e "$FAIL_REASONS")")" \
           2>/dev/null || warn "Could not mail Mayor escalation for $BEAD_ID"
-        notify -t "Gate needs-human" -p 4 "$BEAD_ID exhausted $GATE_FIX_CAP gate fix attempts — Mayor escalated" 2>/dev/null || true
+        notify -t "Gate needs-human" -p 4 "$BEAD_ID exhausted $GATE_FIX_CAP gate fix attempts — Mayor escalated (armed=$_NH_STATUS)" 2>/dev/null || true
         # ga-u4yi: durable mail to the AUTHOR too — a bd comment alone left
         # thies-wa's branch rotting 20h in silence because nothing durable told
         # her she was stuck (only Mayor was mailed; mail, not nudge, survives a
         # dead/restarted author session). ga-409f4: NOTIFY_AUTHOR
         # (branch-author-aware), not the bead-derived $AUTHOR.
         notify_author_with_fallback "$BEAD_ID" "$NOTIFY_AUTHOR" "$AUTHOR" \
-          "Gate needs-human: your branch $BRANCH exhausted $GATE_FIX_CAP fix attempts" \
-          "$(printf 'Your branch %s (bead %s) failed the quality gate %s times. Auto-retry is now DISABLED (label gate:needs-human): the Pilot will NOT re-dispatch this bead, and any further /gate-done resubmission will be silently parked until a human resolves this.\n\nGate run: %s\n\nLast blocking reasons:\n%s\n\nA human or the Mayor must intervene before this can proceed.' \
-            "$BRANCH" "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$GATE_RUN_ID" "$(echo -e "$FAIL_REASONS")")" \
-          "gate-fix-cap escalation on $BEAD_ID"
+          "$_NH_MAIL_SUBJ" \
+          "$(printf 'Your branch %s (bead %s) failed the quality gate %s times. %s\n\nGate run: %s\n\nLast blocking reasons:\n%s\n\nA human or the Mayor must intervene before this can proceed.' \
+            "$BRANCH" "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$(gate_needs_human_clause "$_NH_STATUS")" "$GATE_RUN_ID" "$(echo -e "$FAIL_REASONS")")" \
+          "gate-fix-cap escalation on $BEAD_ID (armed=$_NH_STATUS)"
       fi
       # ga-5w0hr: a needs-human bead has NO active worker — the gate just gave up
       # auto-retry. Mirror the needs-fix-branch cleanup so the bead is honestly
