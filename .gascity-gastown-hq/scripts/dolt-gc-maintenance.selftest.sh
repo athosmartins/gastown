@@ -63,6 +63,26 @@ _gc_dolt_cpu_pct() { echo "62.4"; }    # dot-locale variant
 n="$(_dolt_cpu_pct)"; [ "$n" = "62" ] && ok "cpu locale: '62.4' → 62 (dot stripped)" || bad "cpu locale dot got: '$n'"
 unset -f _gc_dolt_cpu_pct
 
+# ── _gc_headroom_ok: disk headroom gate before dolt_gc() (ga-sfj3i.4) ────────────
+_gc_headroom_ok 500 200 250 && ok "headroom: avail=500 size=200 required=500 (250%) → boundary ok (>=)" || bad "headroom: 500>=500 should pass"
+_gc_headroom_ok 499 200 250 && bad "headroom: avail=499 < required=500 should fail" || ok "headroom: avail=499 < required=500 → not enough room"
+_gc_headroom_ok 10000 200 250 && ok "headroom: plenty of room → ok" || bad "headroom: 10000 avail should pass"
+_gc_headroom_ok ""    200 250 && bad "headroom: empty avail should fail-closed" || ok "headroom: unmeasurable avail (empty) → fail-closed, not proceed"
+_gc_headroom_ok 500   ""  250 && bad "headroom: empty size should fail-closed" || ok "headroom: unmeasurable size (empty) → fail-closed, not proceed"
+_gc_headroom_ok 500   200 ""  && bad "headroom: empty pct should fail-closed" || ok "headroom: unmeasurable pct (empty) → fail-closed, not proceed"
+_gc_headroom_ok "abc" 200 250 && bad "headroom: non-numeric avail should fail-closed" || ok "headroom: non-numeric avail → fail-closed"
+
+# ── _avail_mb: free-space read against the real filesystem ──────────────────────
+# No mock — matches this file's own _backup_fresh tests below, which also exercise
+# real filesystem paths rather than stubbing find/stat.
+m="$(_avail_mb /tmp)"
+case "$m" in
+  ''|*[!0-9]*) bad "avail_mb: expected a non-negative integer for /tmp, got '$m'" ;;
+  *) ok "avail_mb: real path /tmp → numeric MB ($m)" ;;
+esac
+m="$(_avail_mb /this/path/does/not/exist/ga-sfj3i-4-selftest)"
+[ -z "$m" ] && ok "avail_mb: nonexistent path → empty (never a fabricated 0 or number — error and empty must not read the same as 'plenty of room')" || bad "avail_mb: nonexistent path got: '$m'"
+
 # ── _backup_fresh: prune is gated on a recent backup ─────────────────────────────
 TMPB="$(mktemp -d)"; mkdir -p "$TMPB/hq"
 _backup_fresh "$TMPB" hq 26 && ok "backup: fresh staging dir within window → allow" || bad "backup: fresh dir should pass"

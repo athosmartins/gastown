@@ -31,6 +31,17 @@
 #      history so chunks freed by prune can GC off DISK. Flatten is HEAVY and
 #      IRREVERSIBLE (destroys all Dolt commit history / time-travel) — DEFAULT OFF,
 #      backup-gated, at most once per ISO-week inside a quiet local-hour window.
+#      ga-sfj3i.4: the size-gated dolt_gc() call is now ALSO gated on disk headroom
+#      (GC_MIN_FREE_PCT, default 250% of hq's own on-disk size — see _gc_headroom_ok
+#      below for the measured basis). Before this fix it had ZERO disk-space
+#      awareness and ran unconditionally every 2h whenever hq>=THRESHOLD_G (i.e.
+#      continuously, since hq is essentially always over that floor) — a
+#      disk-exhausted dolt_gc mid-store-rewrite can panic the WHOLE Dolt server
+#      (all databases, not just hq), see ga-vs55. This step also has NO awareness
+#      of hq's own compact-quarantine marker (a separate, narrower concern about
+#      post-FLATTEN integrity verification that a bare dolt_gc() — no flatten
+#      involved — does not share; deliberately left alone here, out of scope for
+#      this fix).
 #
 # Size-triggered gc (not pure time) self-adjusts to the bloat rate and never gc's a
 # store that's already small. See memory: gate-reviewer-spawn-failure-playbook,
@@ -59,6 +70,9 @@ DB="hq"
 PORT="52756"
 THRESHOLD_G="1"            # online gc when hq store >= 1 GB (ga-ftmci: re-bloats fast;
                            # a bigger store slows the per-rig reconcile full-table scan).
+GC_MIN_FREE_PCT="${GC_MIN_FREE_PCT:-250}"  # ga-sfj3i.4: required free space on the
+                           # data-dir volume before running dolt_gc(), as a percentage
+                           # of hq's own on-disk size. See _gc_headroom_ok below.
 LOG="${DOLT_GC_MAINT_LOG:-$CITY/.gc/logs/dolt-gc-maintenance.log}"
 NOTIFY="/Users/athos/.local/bin/notify"
 DOLTDIR="$CITY/.beads/dolt/$DB"
@@ -126,6 +140,39 @@ _should_skip_hot() {
   local cpu="$1" thr="$2"
   case "$cpu" in ''|*[!0-9]*) return 1 ;; esac
   [ "$cpu" -gt "$thr" ]
+}
+
+# _avail_mb [path] — free space in MB, empty (not 0) on failure. Same idiom as
+# dolt-compact-routine.sh's own _avail_mb (`df -k` + one division; macOS/BSD df
+# has no -g) — matched deliberately for consistency across this codebase's two
+# dolt-gc-adjacent scripts. Empty, not 0: a failed read must never read the
+# same as "plenty of room" (error and empty must not produce the same value).
+_avail_mb() {
+  local path="${1:-$DOLTDIR}" kb
+  kb="$(df -k "$path" 2>/dev/null | awk 'NR==2 {print $4}')"
+  case "$kb" in ''|*[!0-9]*) echo ""; return ;; esac
+  echo $(( kb / 1024 ))
+}
+
+# _gc_headroom_ok <avail_mb> <db_size_mb> <pct> → 0 = enough room to run
+# dolt_gc(), 1 = not enough (or unmeasurable — fail-closed). Pure arithmetic,
+# same shape as dolt-compact-routine.sh's _headroom_ok.
+#
+# ga-sfj3i.4: measured 2026-08-26 (isolated copy of gastown, flattened then
+# `dolt gc --full`, disk usage polled every ~0.1s during the call): peak
+# disk usage during gc tracked pre-gc-size + the size of the live data being
+# rewritten into the new generation (peak=38376KB, pre-gc=35228KB,
+# live-after-gc=3180KB; 35228+3180=38408, matches within sampling noise).
+# Live data can never exceed the pre-gc size, so that additive relationship
+# bounds the worst case (a db with nothing to collect as garbage) at 2x
+# pre-gc size. 250 (the GC_MIN_FREE_PCT default) adds margin on top of that
+# proven bound for filesystem overhead and concurrent writers.
+_gc_headroom_ok() {
+  local avail="$1" size="$2" pct="$3"
+  case "$avail" in ''|*[!0-9]*) return 1 ;; esac
+  case "$size" in ''|*[!0-9]*) return 1 ;; esac
+  case "$pct" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$avail" -ge $(( size * pct / 100 )) ]
 }
 
 # _backup_fresh <staging_dir> <db> <max_age_h> → 0 if <staging_dir>/<db> was written
@@ -272,14 +319,33 @@ main() {
   if [ "$FLATTEN_ENABLED" = "1" ] && [ -x "$BD" ]; then _run_flatten; flattened=$?; fi
   if [ "$flattened" -eq 0 ]; then log "size-gc skipped — flatten already reclaimed this run"; return 0; fi
 
-  # 4) ONLINE size-gated dolt_gc (always) — unchanged behavior.
-  local size_g; size_g="$(du -sg "$DOLTDIR" 2>/dev/null | awk '{print $1}')"
-  case "$size_g" in ''|*[!0-9]*) size_g=0 ;; esac
+  # 4) ONLINE size-gated dolt_gc (always). size_mb replaces the old bare
+  # `du -sg` read (same truncated-whole-GB value via integer division, so
+  # the THRESHOLD_G comparison below is unchanged) — MB precision is what
+  # the new headroom check below needs; see _largest_db_mb's own comment in
+  # dolt-compact-routine.sh for why whole-GB truncation is unsafe for a
+  # multiplier computation.
+  local size_mb; size_mb="$(du -sm "$DOLTDIR" 2>/dev/null | awk '{print $1}')"
+  case "$size_mb" in ''|*[!0-9]*) size_mb="" ;; esac
+  local size_g=$(( ${size_mb:-0} / 1024 ))
   if [ "$size_g" -lt "$THRESHOLD_G" ]; then
     log "hq=${size_g}G < ${THRESHOLD_G}G threshold — skip gc"; return 0
   fi
+
+  # ga-sfj3i.4: disk headroom gate — see _gc_headroom_ok for the measured
+  # basis. Always logs the three numbers when both measurements succeed,
+  # including on runs that proceed, so headroom stays visible in the log.
+  local avail_mb; avail_mb="$(_avail_mb "$DOLTDIR")"
+  local required_mb=""
+  [ -n "$size_mb" ] && required_mb=$(( size_mb * GC_MIN_FREE_PCT / 100 ))
+  log "hq disk headroom check: size=${size_mb:-<unmeasured>}MB avail=${avail_mb:-<unmeasured>}MB required=${required_mb:-<unmeasured>}MB (${GC_MIN_FREE_PCT}% of size)"
+  if ! _gc_headroom_ok "$avail_mb" "$size_mb" "$GC_MIN_FREE_PCT"; then
+    log "hq size=${size_mb:-<unmeasured>}MB avail=${avail_mb:-<unmeasured>}MB required=${required_mb:-<unmeasured>}MB — insufficient free space (or unmeasurable) for dolt_gc — skip this cycle, will retry in 2h"
+    return 0
+  fi
+
   local pre; pre="$(du -sh "$DOLTDIR" 2>/dev/null | awk '{print $1}')"
-  log "hq=${pre} >= ${THRESHOLD_G}G — running online dolt_gc ..."
+  log "hq=${pre} >= ${THRESHOLD_G}G, headroom ok — running online dolt_gc ..."
   if DOLT_CLI_PASSWORD='' timeout 300 dolt --host 127.0.0.1 --port "$PORT" --user root --no-tls \
        sql -q "USE \`$DB\`; CALL dolt_gc();" >> "$LOG" 2>&1; then
     local post; post="$(du -sh "$DOLTDIR" 2>/dev/null | awk '{print $1}')"
