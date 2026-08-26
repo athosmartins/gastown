@@ -716,17 +716,42 @@ bd -C "$_BEAD_STORE" label add "$BEAD_ID" "gate:queued" -q 2>/dev/null || true
 # moment after marker creation, not from anything the calling session merely
 # claims about itself.
 _SUBMIT_BEAD_JSON=$(bd -C "$_BEAD_STORE" show "$BEAD_ID" --json 2>/dev/null)
-_SUBMIT_AUTHOR=$(printf '%s' "$_SUBMIT_BEAD_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // empty' 2>/dev/null || echo "")
+# ga-fahqt: for a dog-pool/Pilot sling dispatch, the STORY bead is
+# deliberately left WITHOUT an assignee for its whole gate cycle — only the
+# sling/task wrapper bead (metadata.pilot.sling_bead) gets assigned+
+# in_progress (see the sling-close logic below, which already relies on this
+# same fact). Falling straight through the story bead's own assignee ->
+# created_by -> owner chain always lands on created_by for this whole
+# dispatch class — whoever originally FILED the story (typically the Pilot
+# dispatcher itself), never the session that actually authored the fix.
+# Prefer the SLING bead's own assignee first when one exists and differs
+# from the story bead (same guard the sling-close logic below already uses),
+# falling through to the story bead's own chain unchanged if the sling
+# lookup comes back empty (bead not found, no assignee yet, lookup failed —
+# any of these degrade to the existing behavior, never a wrong value).
+# Slings are always HQ-native for this dispatch shape (gc sling creates the
+# wrapper in $GC_CITY_PATH regardless of which store the story itself lives
+# in — same convention pilot-dispatcher.sh's _mayor_deferred_hold_db uses).
+_SLING_FOR_AUTHOR=$(printf '%s' "$_SUBMIT_BEAD_JSON" | jq -r 'if type=="array" then .[0] else . end | .metadata["pilot.sling_bead"] // empty' 2>/dev/null || echo "")
+_SUBMIT_AUTHOR=""
+if [ -n "$_SLING_FOR_AUTHOR" ] && [ "$_SLING_FOR_AUTHOR" != "$BEAD_ID" ]; then
+  _SUBMIT_AUTHOR=$(bd -C "$GC_CITY_PATH" show "$_SLING_FOR_AUTHOR" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | .assignee // empty' 2>/dev/null || echo "")
+fi
+if [ -z "$_SUBMIT_AUTHOR" ] || [ "$_SUBMIT_AUTHOR" = "null" ]; then
+  _SUBMIT_AUTHOR=$(printf '%s' "$_SUBMIT_BEAD_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // empty' 2>/dev/null || echo "")
+fi
 if [ -z "$_SUBMIT_AUTHOR" ] || [ "$_SUBMIT_AUTHOR" = "null" ]; then
   _SUBMIT_AUTHOR=$(printf '%s' "$_SUBMIT_BEAD_JSON" | jq -r 'if type=="array" then .[0] else . end | .created_by // empty' 2>/dev/null || echo "")
 fi
 if [ -z "$_SUBMIT_AUTHOR" ] || [ "$_SUBMIT_AUTHOR" = "null" ]; then
   _SUBMIT_AUTHOR=$(printf '%s' "$_SUBMIT_BEAD_JSON" | jq -r 'if type=="array" then .[0] else . end | .owner // empty' 2>/dev/null || echo "")
 fi
-# Third state: if none of assignee/created_by/owner resolve, do NOT invent a
-# value — leave gate.submitted_by unset. The guard's own Step 5 derivation
-# (same 3-tier priority, same source) is the existing, unchanged fallback for
-# markers where this freeze could not happen.
+# Third state: if none of sling-assignee/assignee/created_by/owner resolve,
+# do NOT invent a value — leave gate.submitted_by unset. The guard's own
+# Step 5 derivation (same 3-tier priority minus the sling preference, same
+# source) is the existing, unchanged fallback for markers where this freeze
+# could not happen.
 if [ -n "$_SUBMIT_AUTHOR" ] && [ "$_SUBMIT_AUTHOR" != "null" ]; then
   bd -C "$GC_CITY_PATH" update "$MARKER_ID" --set-metadata "gate.submitted_by=$_SUBMIT_AUTHOR" -q 2>/dev/null || true
 fi
