@@ -577,9 +577,47 @@ _pd_last_get()   { local f; f="$(_pd_state_file "$1")"; [ -f "$f" ] && cat "$f" 
 _pd_last_set()   { local f; f="$(_pd_state_file "$1")"; mkdir -p "$(dirname "$f")" 2>/dev/null || true; printf '%s\n' "$2" > "$f" 2>/dev/null || true; }
 _pd_last_clear() { rm -f "$(_pd_state_file "$1")" 2>/dev/null || true; }
 
+# ── ga-sb1wu: NON-CANONICAL-PATH detection — a LOADED daemon is not the same
+# thing as a SAFELY-loaded one. ga-u04vp's presence-drift sweep above already
+# distinguishes "not loaded" correctly (confirmed by direct log/artifact
+# evidence, not assumed — see this bead's own comment thread for the timeline
+# proof that a specific PRESENCE-DRIFT alert was NOT a false positive: the job
+# genuinely was not loaded yet at alert time, and became loaded ~20 minutes
+# later when a human ran `launchctl bootstrap` by hand). What that incident's
+# own investigation surfaced as a REAL, DISTINCT, still-open gap: a daemon can
+# be genuinely LOADED right now while still being fragile, because it was
+# bootstrapped directly from its versioned source path (scripts/ or
+# packs/town-deltas/assets/) instead of the canonical, stable copy under
+# ~/Library/LaunchAgents/. If that source file is later reverted, moved, or
+# the working tree cleaned, the job disappears with no warning at all — the
+# exact risk this file's header already names for PRESENCE-DRIFT, just for a
+# LOADED daemon instead of a missing one. `_loaded()` alone cannot see this:
+# it only asks launchd "is this label loaded", never "loaded from where".
+#
+# _loaded_plist_source() asks launchd directly (`launchctl print`) for the
+# path it actually bootstrapped <label> from — never inferred from a file's
+# presence in any directory, so this cannot regress into the same
+# file-presence-as-load-state conflation the original bug report suspected
+# (and which turned out not to be true, but is still the right thing to keep
+# guarding against structurally).
+_loaded_plist_source() {
+  launchctl print "gui/$UID_NUM/$1" 2>/dev/null | awk '/^[[:space:]]*path[[:space:]]*=/ {print $NF; exit}'
+}
+
+# Own cooldown/dedup, independent of _pd_*'s "undeployed" tracking above —
+# these are two DIFFERENT states (not loaded vs. loaded-but-fragile) with
+# different recommended actions (bootstrap vs. move+re-bootstrap), so a label
+# transitioning between them must not inherit or corrupt the other's cooldown.
+DPW_NONCANONICAL_COOLDOWN_SEC="${DPW_NONCANONICAL_COOLDOWN_SEC:-10800}"
+_ncp_state_file() { echo "${STATE}.noncanonical-path/$1"; }
+_ncp_last_get()   { local f; f="$(_ncp_state_file "$1")"; [ -f "$f" ] && cat "$f" 2>/dev/null || echo 0; }
+_ncp_last_set()   { local f; f="$(_ncp_state_file "$1")"; mkdir -p "$(dirname "$f")" 2>/dev/null || true; printf '%s\n' "$2" > "$f" 2>/dev/null || true; }
+_ncp_last_clear() { rm -f "$(_ncp_state_file "$1")" 2>/dev/null || true; }
+
 run_presence_drift_sweep() {
   [ "${DPW_PRESENCE_DRIFT_ENABLED:-1}" = "1" ] || return 0
   local dir f label undeployed="" alerted="" to_mark="" now last since remaining
+  local noncanon="" noncanon_alerted="" noncanon_to_mark="" noncanon_unknown="" src_path canon_path
   now="${DPW_TEST_NOW:-$(date +%s)}"
   for dir in $DPW_PRESENCE_DIRS; do
     [ -d "$dir" ] || continue
@@ -593,6 +631,35 @@ run_presence_drift_sweep() {
       case " $DPW_CRITICAL " in *" $label "*) continue ;; esac
       if _loaded "$label"; then
         _pd_last_clear "$label"
+        # ga-sb1wu: loaded is not the same as safely loaded — ask launchd
+        # WHERE it loaded this label from, not whether it loaded it at all.
+        # See this function's own header note (above _loaded_plist_source)
+        # for why this is a separate, real gap from the undeployed check
+        # just above, not a rename of it.
+        canon_path="$LAUNCH_DIR/$label.plist"
+        src_path="$(_loaded_plist_source "$label")"
+        if [ -z "$src_path" ]; then
+          # AC3: launchd could not be asked (print failed/empty) — this is
+          # NOT the same as "confirmed canonical". Log plainly, don't guess,
+          # don't alert on an unconfirmed guess.
+          noncanon_unknown="$noncanon_unknown $label"
+          log "PRESENCE-DRIFT $label: loaded, but could not verify its source path (launchctl print returned nothing) — NOT asserting canonical or non-canonical."
+          continue
+        fi
+        if [ "$src_path" = "$canon_path" ]; then
+          _ncp_last_clear "$label"
+          continue
+        fi
+        noncanon="$noncanon $label"
+        last="$(_ncp_last_get "$label")"
+        since=$(( now - last ))
+        if [ "$since" -lt "$DPW_NONCANONICAL_COOLDOWN_SEC" ] 2>/dev/null; then
+          remaining=$(( (DPW_NONCANONICAL_COOLDOWN_SEC - since) / 60 ))
+          log "PRESENCE-DRIFT $label: loaded from non-canonical path $src_path — already alerted ${since}s ago (cooldown ${remaining}min remaining)"
+        else
+          noncanon_alerted="$noncanon_alerted $label(loaded-from:$src_path)"
+          noncanon_to_mark="$noncanon_to_mark $label"
+        fi
         continue
       fi
       undeployed="$undeployed $label"
@@ -629,10 +696,34 @@ run_presence_drift_sweep() {
       log "PRESENCE-DRIFT: send failed — per-label cooldowns NOT marked for:$to_mark (will retry next sweep)"
     fi
   fi
-  if [ -n "$undeployed" ]; then
+  if [ -n "$noncanon_alerted" ]; then
+    # ga-sb1wu AC2: distinguishable wording AND a different recommended
+    # action from the undeployed case above — "move + re-bootstrap", never
+    # "bootstrap" (it is already running; bootstrapping again on top would
+    # either no-op confusingly or double-load).
+    local ncmsg="Daemon-presence watchdog: LOADED-FROM-NON-CANONICAL-PATH —${noncanon_alerted} (each shown with the path launchd actually loaded it from). These daemons ARE running right now — do NOT bootstrap them again. They were loaded directly from a versioned source tree instead of the stable ~/Library/LaunchAgents copy, so a later revert/move/clean of that source file silently kills them with no warning. Action: copy the plist to ~/Library/LaunchAgents/<label>.plist, then \`launchctl bootout gui/\$(id -u)/<label>\` + \`launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/<label>.plist\` to re-anchor it at the canonical path (ga-sb1wu)."
+    log "ALERT $ncmsg"
+    if _alert "presence-drift (loaded, non-canonical path)" "$ncmsg" 1; then
+      local _ncp_label
+      for _ncp_label in $noncanon_to_mark; do
+        _ncp_last_set "$_ncp_label" "$now"
+      done
+    else
+      log "PRESENCE-DRIFT (non-canonical): send failed — per-label cooldowns NOT marked for:$noncanon_to_mark (will retry next sweep)"
+    fi
+  fi
+  # ga-sb1wu AC4: report the count of the sweep, even when it is zero — an
+  # absent number reads the same as an absent problem, and this file's own
+  # doctrine (ga-u04vp above) is built specifically against that collapse.
+  if [ -n "$noncanon" ]; then
+    log "PRESENCE-DRIFT: $(echo $noncanon | wc -w | tr -d ' ') label(s) loaded from a non-canonical path:$noncanon"
+  else
+    log "OK: non-canonical-path sweep — 0 loaded com.gascity.*/com.gastown.* labels are running from outside $LAUNCH_DIR"
+  fi
+  if [ -n "$undeployed" ] || [ -n "$noncanon" ]; then
     return 1
   fi
-  log "OK: presence-drift sweep — every com.gascity.*/com.gastown.* plist in $DPW_PRESENCE_DIRS is loaded"
+  log "OK: presence-drift sweep — every com.gascity.*/com.gastown.* plist in $DPW_PRESENCE_DIRS is loaded, from its canonical path"
   return 0
 }
 
@@ -873,21 +964,37 @@ if [ "${1:-}" = "--selftest" ] || [ "${DPW_SELFTEST:-0}" = "1" ]; then
   bad() { FAIL=$((FAIL+1)); echo "  ✗ $1"; }
   TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
   # Stub launchctl/notify/gc so the sweep is hermetic. SCEN drives loaded/exit per label.
-  cat > "$TMP/launchctl" <<'STUB'
+  cat > "$TMP/launchctl" <<STUB
 #!/usr/bin/env bash
-case "$1" in
+case "\$1" in
   list)
-    if [ -n "${2:-}" ]; then
-      # `launchctl list <label>` → success iff label is in DPW_TEST_LOADED.
-      case " $DPW_TEST_LOADED " in *" $2 "*) exit 0 ;; *) exit 1 ;; esac
+    if [ -n "\${2:-}" ]; then
+      # \`launchctl list <label>\` → success iff label is in DPW_TEST_LOADED.
+      case " \$DPW_TEST_LOADED " in *" \$2 "*) exit 0 ;; *) exit 1 ;; esac
     fi
     # table form: emit "PID EXIT LABEL" for loaded labels (exit from DPW_TEST_EXIT map).
-    for l in $DPW_TEST_LOADED; do
-      e=0; for kv in $DPW_TEST_EXIT; do case "$kv" in "$l:"*) e="${kv#*:}";; esac; done
-      printf '%s\t%s\t%s\n' "-" "$e" "$l"
+    for l in \$DPW_TEST_LOADED; do
+      e=0; for kv in \$DPW_TEST_EXIT; do case "\$kv" in "\$l:"*) e="\${kv#*:}";; esac; done
+      printf '%s\t%s\t%s\n' "-" "\$e" "\$l"
     done ;;
-  bootstrap) echo "$2 $3" >> "$DPW_TEST_BOOTSTRAPS"; exit 0 ;;
-  kickstart) echo "$*" >> "$DPW_TEST_KICKSTARTS"; exit 0 ;;
+  bootstrap) echo "\$2 \$3" >> "\$DPW_TEST_BOOTSTRAPS"; exit 0 ;;
+  kickstart) echo "\$*" >> "\$DPW_TEST_KICKSTARTS"; exit 0 ;;
+  print)
+    # ga-sb1wu: \`launchctl print gui/<uid>/<label>\` → emit a "path = ..." line.
+    # DPW_TEST_PLIST_PATH is a space-separated "label:path" override list; a
+    # label not listed there defaults to the CANONICAL path under
+    # \$TMP/agents (this stub's own LAUNCH_DIR) so every PRE-EXISTING scenario
+    # that never heard of this feature keeps seeing "canonical" by default —
+    # only the scenarios that explicitly opt in (via DPW_TEST_PLIST_PATH) or
+    # opt out (DPW_TEST_PLIST_PATH_UNKNOWN, simulating print returning
+    # nothing at all) exercise the new non-canonical/could-not-verify paths.
+    _lbl="\${2##*/}"
+    case " \$DPW_TEST_PLIST_PATH_UNKNOWN " in *" \$_lbl "*) exit 0 ;; esac
+    for kv in \$DPW_TEST_PLIST_PATH; do
+      case "\$kv" in "\$_lbl:"*) printf '\tpath = %s\n' "\${kv#*:}"; exit 0 ;; esac
+    done
+    printf '\tpath = %s/%s.plist\n' "\$LAUNCH_DIR" "\$_lbl"
+    exit 0 ;;
 esac
 exit 0
 STUB
@@ -898,6 +1005,7 @@ STUB
   # Override the SCRIPT vars directly — the top-level `LAUNCH_DIR=${DPW_LAUNCH_DIR:-…}`
   # already ran at load, so setting DPW_LAUNCH_DIR now would be too late.
   LAUNCH_DIR="$TMP/agents"; mkdir -p "$LAUNCH_DIR"
+  export LAUNCH_DIR   # ga-sb1wu: the launchctl print stub (a subprocess) needs this to compute the default "canonical" path
   LOG="$TMP/log"; STATE="$TMP/state"
   # ga-95bi4: STATE (and so ${STATE}.alert-cooldown/) is set ONCE for the whole
   # selftest run, not per-scenario — a nonzero window would let one scenario's
@@ -929,6 +1037,7 @@ PLIST
   printf '#!/bin/bash\nexit 0\n' > "$TMP/fake-script.sh"; chmod +x "$TMP/fake-script.sh"
 
   export DPW_TEST_LOADED DPW_TEST_EXIT DPW_RELOAD   # exported so the stub subprocess sees them
+  export DPW_TEST_PLIST_PATH DPW_TEST_PLIST_PATH_UNKNOWN   # ga-sb1wu: same reasoning, for the print stub
   ALL="com.gascity.alpha com.gascity.beta com.gascity.gamma"
 
   # Disable provenance checks for scenarios 1-12 (tested explicitly in scenarios 13-17)
@@ -1147,6 +1256,17 @@ case "$1" in
     done ;;
   bootstrap) echo "$2 $3" >> "$DPW_TEST_BOOTSTRAPS"; exit 0 ;;
   kickstart) echo "$*" >> "$DPW_TEST_KICKSTARTS"; exit 0 ;;
+  print)
+    # ga-sb1wu: this stub PERSISTS at $TMP/launchctl for every scenario after
+    # this one (nothing reinstalls the fuller stub above), so later presence-
+    # drift scenarios (27+) need this case too, same as the first stub.
+    _lbl="${2##*/}"
+    case " $DPW_TEST_PLIST_PATH_UNKNOWN " in *" $_lbl "*) exit 0 ;; esac
+    for kv in $DPW_TEST_PLIST_PATH; do
+      case "$kv" in "$_lbl:"*) printf '\tpath = %s\n' "${kv#*:}"; exit 0 ;; esac
+    done
+    printf '\tpath = %s/%s.plist\n' "$LAUNCH_DIR" "$_lbl"
+    exit 0 ;;
 esac
 exit 0
 STUB
@@ -1670,6 +1790,85 @@ GCSTUB41
   [ ! -s "$MAILSENT41" ] && ok "3rd drift sweep, same persisting drift: mail suppressed (per-label cooldown correctly armed after a confirmed successful send)" || bad "3rd drift sweep: mail wrongly re-sent — per-label cooldown not armed after a successful send"
   unset DPW_TEST_NOW
   DPW_PRESENCE_DIRS=""
+
+  # ── ga-sb1wu: NON-CANONICAL-PATH scenarios ──────────────────────────────────
+  # ga-sb1wu's own investigation found the specific alarm that prompted it was
+  # NOT actually a false positive (direct log/artifact timestamps proved the
+  # daemon genuinely was not loaded yet at alert time) — but it surfaced a
+  # real, separate, still-open gap this file's own PRESENCE-DRIFT doctrine
+  # already cared about: a LOADED daemon bootstrapped straight from its
+  # versioned source path instead of the canonical ~/Library/LaunchAgents
+  # copy is fragile in exactly the way the header comment already describes
+  # for undeployed daemons, and `_loaded()` alone cannot see it.
+  DPW_CRITICAL="$ALL"; rm -rf "${STATE}.noncanonical-path"
+  PDIR2="$TMP/presence-src2"; mkdir -p "$PDIR2"
+  cat > "$PDIR2/zeta.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.gascity.zeta</string>
+</dict></plist>
+PLIST
+  DPW_PRESENCE_DIRS="$PDIR2"; DPW_TEST_LOADED="com.gascity.zeta"
+  DPW_TEST_PLIST_PATH=""; DPW_TEST_PLIST_PATH_UNKNOWN=""
+
+  echo "Scenario 42 (ga-sb1wu): loaded from its CANONICAL path → no alert, no log mention at all"
+  : > "$LOG"
+  run_presence_drift_sweep && ok "canonical-path daemon: sweep returns 0" || bad "canonical-path daemon wrongly flagged"
+  grep -q "com.gascity.zeta" "$LOG" && bad "canonical-path daemon should not appear in the log at all" || ok "canonical-path daemon silent in the log (matches undeployed-check's own silence-when-fine behavior)"
+
+  echo "Scenario 43 (ga-sb1wu): loaded from a NON-canonical path → distinct alert, names the real source, says move+re-bootstrap (never 'bootstrap')"
+  : > "$LOG"; MAILSENT43="$TMP/mailsent43"; : > "$MAILSENT43"
+  cat > "$TMP/gc" <<GCSTUB43
+#!/usr/bin/env bash
+if [ "\$1" = "mail" ] && [ "\$2" = "send" ]; then echo sent >> "$MAILSENT43"; exit 0; fi
+exit 0
+GCSTUB43
+  chmod +x "$TMP/gc"
+  DPW_TEST_PLIST_PATH="com.gascity.zeta:$PDIR2/zeta.plist"
+  run_presence_drift_sweep && bad "non-canonical-path daemon should return 1 (alert)" || ok "non-canonical-path daemon alerts (return 1)"
+  grep -q "com.gascity.zeta" "$LOG" && ok "alert names the non-canonical label (zeta)" || bad "alert missing the non-canonical label"
+  grep -q "$PDIR2/zeta.plist" "$LOG" && ok "alert names the ACTUAL loaded-from path, not just the label" || bad "alert does not cite the real source path"
+  grep -qi "move" "$LOG" && ok "message recommends move+re-bootstrap" || bad "message missing the move+re-bootstrap action"
+  grep -qi "do NOT bootstrap" "$LOG" && ok "message explicitly warns against re-bootstrapping an already-running daemon" || bad "message does not warn against a duplicate bootstrap"
+  grep -q "never bootstrapped, or fell out silently" "$LOG" && bad "non-canonical alert wrongly reused the UNDEPLOYED wording (these are different states, ga-sb1wu AC2)" || ok "non-canonical alert wording is distinct from the undeployed-plist wording"
+  [ -s "$MAILSENT43" ] && ok "non-canonical drift mails (distinct subject from undeployed drift)" || bad "non-canonical drift did not mail"
+
+  echo "Scenario 44 (ga-sb1wu): non-canonical-path cooldown — persisting drift on the same label is not re-mailed every sweep"
+  : > "$MAILSENT43"
+  run_presence_drift_sweep >/dev/null 2>&1
+  grep -q "already alerted" "$LOG" || run_presence_drift_sweep >/dev/null 2>&1   # 2nd call if 1st already logged cooldown
+  [ ! -s "$MAILSENT43" ] && ok "repeat non-canonical drift within cooldown window does not re-mail" || bad "non-canonical drift re-mailed within its own cooldown window"
+
+  echo "Scenario 45 (ga-sb1wu AC3): launchctl print returns nothing → 'could not verify', never silently treated as canonical OR non-canonical"
+  : > "$LOG"; rm -rf "${STATE}.noncanonical-path"
+  DPW_TEST_PLIST_PATH=""; DPW_TEST_PLIST_PATH_UNKNOWN="com.gascity.zeta"
+  run_presence_drift_sweep >/dev/null 2>&1
+  grep -q "could not verify" "$LOG" && ok "unverifiable source path logs 'could not verify' explicitly" || bad "missing explicit could-not-verify message"
+  grep -qi "loaded from non-canonical path" "$LOG" && bad "unverifiable case wrongly asserted non-canonical" || ok "unverifiable case does not assert non-canonical (no guess)"
+  DPW_TEST_PLIST_PATH_UNKNOWN=""
+
+  echo "Scenario 46 (ga-sb1wu AC4): sweep reports the non-canonical count even when it is zero — silence must not read as 'no problem measured'"
+  : > "$LOG"; DPW_TEST_PLIST_PATH=""; DPW_TEST_LOADED="com.gascity.zeta"
+  run_presence_drift_sweep >/dev/null 2>&1
+  grep -q "0 loaded com.gascity.\*/com.gastown.\* labels are running from outside" "$LOG" \
+    && ok "zero-count reported explicitly as a number, not silence" \
+    || bad "zero-count case did not report an explicit count"
+
+  DPW_PRESENCE_DIRS=""; DPW_TEST_PLIST_PATH=""; DPW_TEST_PLIST_PATH_UNKNOWN=""
+
+  echo "Scenario 47 (ga-sb1wu): drift-guard — the helper and its wiring are present, not silently reverted"
+  type _loaded_plist_source >/dev/null 2>&1 && ok "_loaded_plist_source defined" || bad "_loaded_plist_source missing"
+  # Bounded to the PRODUCTION code above the --selftest guard — searching the
+  # whole file ($0) would also match this very grep's own quoted literal
+  # below the guard, making the check pass unconditionally regardless of
+  # whether the real wiring exists (the exact self-triggering-fixture class
+  # this session's own memory warns about). The boundary is found dynamically
+  # (not a hardcoded line number) so it can never silently go stale as the
+  # file grows.
+  awk '/if \[ "\$\{1:-\}" = "--selftest"/{exit} {print}' "$0" \
+    | grep -qF 'src_path="$(_loaded_plist_source "$label")"' \
+    && ok "run_presence_drift_sweep calls _loaded_plist_source" \
+    || bad "wiring to _loaded_plist_source missing — REGRESSION risk"
 
   echo ""
   echo "daemon-presence-watchdog selftest: PASS=$PASS FAIL=$FAIL"
