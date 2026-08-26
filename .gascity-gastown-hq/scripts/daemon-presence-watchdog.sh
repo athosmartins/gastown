@@ -349,11 +349,21 @@ _plist_program_path() {
 # ── imp05: binary-provenance check ───────────────────────────────────────────
 # Returns 0 if the marker is found, 1 if not, 2 if the binary is missing/unreadable (skip).
 _binary_has_marker() {
-  local bin="$1" marker="$2" resolved
+  local bin="$1" marker="$2" resolved bin_strings
   # Resolve symlink if possible
   resolved="$(readlink -f "$bin" 2>/dev/null)" || resolved="$bin"
   [ -f "$resolved" ] || return 2
-  strings "$resolved" 2>/dev/null | grep -qF "$marker" && return 0 || return 1
+  # ga-vfob8 (same class as ga-sb1wu gate-fix-2): piping strings straight
+  # into `grep -qF` is racy under this file's `set -uo pipefail` — grep
+  # exits on its first match and closes the pipe while strings may still be
+  # writing, so strings can catch SIGPIPE (exit 141), which pipefail then
+  # reports as the pipeline's status even though grep DID match (reproduced
+  # live: 20/20 runs spuriously returned 1 on a marker planted early in a
+  # large input). Capturing to a variable first and matching via a
+  # herestring (backed by a temp file, not a live pipe) removes the race:
+  # strings has already exited before grep ever runs.
+  bin_strings="$(strings "$resolved" 2>/dev/null)"
+  grep -qF "$marker" <<< "$bin_strings" && return 0 || return 1
 }
 
 # ── imp05: ledger append (wired by imp02/imp04 once gc_ledger_append lands) ──
@@ -1900,6 +1910,69 @@ GCSTUB43
     ok "run_presence_drift_sweep calls _loaded_plist_source"
   else
     bad "wiring to _loaded_plist_source missing — REGRESSION risk"
+  fi
+
+  echo "Scenario 48 (ga-vfob8): _binary_has_marker no longer races strings|grep under pipefail"
+  # _binary_has_marker is intentionally `unset -f`d by Scenario 16/17 above
+  # (cleanup after locally stubbing it — see their comments) and never
+  # redefined afterward, so by this point in the run the real function is
+  # gone from the shell's function table. Re-source its CURRENT definition
+  # straight from this file's own source (the same text the top-of-file
+  # definition loaded originally) so this scenario tests the real, live
+  # source rather than a hand-copied duplicate that could silently drift
+  # from it.
+  eval "$(awk '/^_binary_has_marker\(\) \{/{f=1} f{print} f && /^}/{exit}' "$0")"
+  # Mechanism proof: build a file whose FIRST printable string is the
+  # marker, followed by enough additional content that `strings` still has
+  # output queued when `grep -qF` matches on the first line and closes the
+  # pipe — this is what made the pre-fix `strings ... | grep -qF ...`
+  # one-liner racy under this file's own `set -uo pipefail` (grep exits
+  # early, strings can catch SIGPIPE=141, pipefail reports that instead of
+  # grep's real match). Reproduced live before this fix: 20/20 runs of the
+  # pre-fix one-liner spuriously returned 1 against a fixture of this shape
+  # (same class as ga-sb1wu gate-fix-2's awk|grep -qF race, Scenario 47).
+  _S48_MARKER="GA_VFOB8_SELFTEST_MARKER_$$"
+  _S48_FILE="$TMP/ga-vfob8-marker-fixture"
+  {
+    echo "$_S48_MARKER"
+    for _s48_i in $(seq 1 5000); do
+      echo "filler_line_${_s48_i}____________________________padding_to_make_this_line_longer"
+    done
+  } > "$_S48_FILE"
+  _S48_FAIL=0
+  for _s48_r in 1 2 3 4 5; do
+    ( _binary_has_marker "$_S48_FILE" "$_S48_MARKER" )
+    [ $? -ne 0 ] && _S48_FAIL=$((_S48_FAIL+1))
+  done
+  if [ "$_S48_FAIL" -eq 0 ]; then
+    ok "_binary_has_marker finds an early marker in a large file across 5/5 runs (no SIGPIPE false-negative)"
+  else
+    bad "_binary_has_marker false-negatived $_S48_FAIL/5 runs against the marker-early fixture — SIGPIPE race regression"
+  fi
+  ( _binary_has_marker "$_S48_FILE" "GA_VFOB8_MARKER_THAT_IS_NOT_THERE" )
+  [ $? -eq 1 ] && ok "_binary_has_marker still correctly returns 1 for a genuinely absent marker" \
+    || bad "_binary_has_marker did not return 1 for a genuinely absent marker"
+  ( _binary_has_marker "$TMP/ga-vfob8-does-not-exist" "anything" )
+  [ $? -eq 2 ] && ok "_binary_has_marker still correctly returns 2 for a missing file" \
+    || bad "_binary_has_marker did not return 2 for a missing file"
+
+  # Drift-guard: the live source must no longer contain the racy direct-pipe
+  # form, and must contain the herestring-based fix. Bounded to the
+  # PRODUCTION code above the --selftest guard, same technique as Scenario
+  # 47 above and for the same reason: searching the whole file ($0) would
+  # also match THIS grep's own quoted literal a few lines below, making the
+  # "must be absent" check fail unconditionally regardless of the real
+  # function's content (confirmed live while writing this scenario).
+  _s48_prod_code="$(awk '/if \[ "\$\{1:-\}" = "--selftest"/{exit} {print}' "$0")"
+  if grep -qF 'strings "$resolved" 2>/dev/null | grep -qF "$marker"' <<< "$_s48_prod_code"; then
+    bad "_binary_has_marker regressed to the racy strings|grep -qF direct-pipe form"
+  else
+    ok "_binary_has_marker's racy direct-pipe form is gone"
+  fi
+  if grep -qF 'grep -qF "$marker" <<< "$bin_strings"' <<< "$_s48_prod_code"; then
+    ok "_binary_has_marker uses the herestring fix (no live pipe)"
+  else
+    bad "_binary_has_marker's herestring fix is missing — REGRESSION risk"
   fi
 
   echo ""
