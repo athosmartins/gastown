@@ -720,7 +720,19 @@ run_presence_drift_sweep() {
   else
     log "OK: non-canonical-path sweep — 0 loaded com.gascity.*/com.gastown.* labels are running from outside $LAUNCH_DIR"
   fi
-  if [ -n "$undeployed" ] || [ -n "$noncanon" ]; then
+  # ga-36ta4 gate-fix-1 (gate feedback on ga-sb1wu, gate_run=ga-68hea): a label
+  # whose source path could NOT be verified (noncanon_unknown, AC3 above) was
+  # captured and logged but then dropped before the sweep's own pass/fail
+  # signal — so "don't know" and "confirmed clean" returned the identical 0 /
+  # "OK ... canonical" claim, the third-state collapse this file's doctrine
+  # (ga-u04vp) exists to prevent. Report its count the same way as noncanon's
+  # (even zero), and fold it into the same non-OK return-1 decision.
+  if [ -n "$noncanon_unknown" ]; then
+    log "PRESENCE-DRIFT: $(echo $noncanon_unknown | wc -w | tr -d ' ') label(s) loaded but UNVERIFIABLE (launchctl print returned no source path):$noncanon_unknown"
+  else
+    log "OK: non-canonical-path sweep — 0 loaded com.gascity.*/com.gastown.* labels have an unverifiable source path"
+  fi
+  if [ -n "$undeployed" ] || [ -n "$noncanon" ] || [ -n "$noncanon_unknown" ]; then
     return 1
   fi
   log "OK: presence-drift sweep — every com.gascity.*/com.gastown.* plist in $DPW_PRESENCE_DIRS is loaded, from its canonical path"
@@ -1842,9 +1854,19 @@ GCSTUB43
   echo "Scenario 45 (ga-sb1wu AC3): launchctl print returns nothing → 'could not verify', never silently treated as canonical OR non-canonical"
   : > "$LOG"; rm -rf "${STATE}.noncanonical-path"
   DPW_TEST_PLIST_PATH=""; DPW_TEST_PLIST_PATH_UNKNOWN="com.gascity.zeta"
-  run_presence_drift_sweep >/dev/null 2>&1
+  run_presence_drift_sweep >/dev/null 2>&1; rc45=$?
   grep -q "could not verify" "$LOG" && ok "unverifiable source path logs 'could not verify' explicitly" || bad "missing explicit could-not-verify message"
   grep -qi "loaded from non-canonical path" "$LOG" && bad "unverifiable case wrongly asserted non-canonical" || ok "unverifiable case does not assert non-canonical (no guess)"
+  # ga-36ta4 gate-fix-1 (gate_run=ga-68hea): the two checks above only grepped
+  # per-label log lines — neither the sweep's own return code nor its closing
+  # "OK ... canonical" line was ever checked, so an unverified label could
+  # (and did) still exit 0 asserting "every ... plist ... is loaded, from its
+  # canonical path", the exact claim the per-label code just refused to make.
+  [ "$rc45" -eq 1 ] && ok "unverifiable label makes the sweep return 1 (not silently OK)" || bad "unverifiable label did NOT make the sweep return 1 — got rc=$rc45"
+  grep -q "every com.gascity.\*/com.gastown.\* plist .* is loaded, from its canonical path" "$LOG" \
+    && bad "sweep's closing log line wrongly asserts full canonical confirmation despite an unverifiable label" \
+    || ok "sweep's closing log line does not claim canonical confirmation when a label was unverifiable"
+  grep -q "1 label(s) loaded but UNVERIFIABLE" "$LOG" && ok "unverifiable count reported explicitly (AC4 parity)" || bad "missing explicit unverifiable-count log line"
   DPW_TEST_PLIST_PATH_UNKNOWN=""
 
   echo "Scenario 46 (ga-sb1wu AC4): sweep reports the non-canonical count even when it is zero — silence must not read as 'no problem measured'"
