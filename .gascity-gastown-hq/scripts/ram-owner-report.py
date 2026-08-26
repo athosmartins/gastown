@@ -168,13 +168,20 @@ def top3_opportunities(latest, medians, sess_by_key, now):
     return candidates[:3]
 
 
-def render_table(latest, growth, top3, medians):
+def render_table(latest, growth, top3, medians, sess_ok=True):
     lines = []
     lines.append(f"=== QUEM consome quanto (ts={latest.get('ts')}) ===")
     lines.append(f"total_rss={fmt_mb(latest.get('total_rss_kb'))}  "
                   f"nao-atribuido={fmt_mb(latest.get('unresolved_kb'))}  "
                   f"swap={latest.get('swap_used_mb')}MB/{latest.get('swap_total_mb')}MB  "
                   f"free={latest.get('free_pct')}%")
+    if not sess_ok:
+        # Same visibility gap as cmd_top()'s AVISO: this run's live session
+        # lookup (used only for the idle-session half of top3_opportunities,
+        # see below) failed — idle-session candidates may be silently
+        # unfindable this round, distinct from "there genuinely are none."
+        lines.append("AVISO: busca de sessoes ao vivo falhou nesta chamada — "
+                      "candidatos de sessao ociosa podem nao ter sido detectados")
     lines.append(f"{'dono':<38} {'RSS':>8} {'Δ ult. amostra':>16}")
     for owner, kb in sorted(latest.get("by_owner", {}).items(), key=lambda kv: -kv[1])[:15]:
         d = growth.get(owner)
@@ -209,6 +216,12 @@ def cmd_top(n):
     line = "top RSS: " + ", ".join(parts) if parts else "top RSS: (sem dados)"
     if unresolved:
         line += f" | nao-atribuido={fmt_mb(unresolved)}"
+    if rec.get("sessions_lookup_failed"):
+        # The RSS numbers above are still real — only per-session naming is
+        # degraded (every claude PID falls into "claude (no session-id
+        # match)"). Say so plainly: this is the exact visibility gap
+        # ga-yr8vm's gate review caught (error and empty must not look alike).
+        line += " | AVISO: busca de sessoes falhou nesta amostra — atribuicao por sessao pode estar degradada"
     print(line)
 
 
@@ -237,16 +250,17 @@ def main(argv):
     latest = rows[-1]
     growth = growth_since_last(rows)
     medians = historical_medians(rows)
-    sess = lib.sessions_by_key(SESSIONS_FIXTURE)
+    sess, sess_ok = lib.sessions_by_key(SESSIONS_FIXTURE)
     top3 = top3_opportunities(latest, medians, sess, NOW)
 
     if "--json" in argv:
         print(json.dumps({
             "latest": latest, "growth_since_last_kb": growth,
             "historical_medians_kb": medians, "top3_opportunities": top3,
+            "sessions_lookup_failed": not sess_ok,
         }, indent=2))
     else:
-        print(render_table(latest, growth, top3, medians))
+        print(render_table(latest, growth, top3, medians, sess_ok))
     return 0
 
 

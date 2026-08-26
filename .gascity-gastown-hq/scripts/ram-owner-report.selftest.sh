@@ -75,13 +75,40 @@ echo "── Scenario: active-sess (idle <2h) must NOT appear as a cut opportuni
 jget "['top3_opportunities']" | grep -q "active-sess" && bad "active-sess leaked into top3 despite being active <2h" || ok "active-sess correctly excluded from top3 (not idle long enough)"
 
 echo ""
-echo "── Scenario: --top N live mode never touches the JSONL, works with zero history ──"
-TOP_OUT=$(RAM_OWNER_NOW_EPOCH="$NOW" \
-  RAM_OWNER_PS_FIXTURE="$SELF_DIR/../scripts/ram-owner-sampler.selftest.sh" \
+echo "── Scenario: --top N live mode, ps read fails -> explicit failure message, not a happy-path-shaped line ──"
+# Genuinely empty ps fixture. (A prior version of this scenario fed
+# $SELF_DIR/../scripts/ram-owner-sampler.selftest.sh itself as "garbage" —
+# it isn't: that sibling file's own heredoc embeds a verbatim, well-formed
+# "pid ppid rss comm args" row for ITS fixtures, so ps_snapshot() parsed one
+# real process out of it and this scenario silently exercised the HAPPY path
+# while claiming to prove the FAILURE path. Caught in ga-yr8vm gate review,
+# attempt 1.) RAM_OWNER_SESSIONS_FIXTURE is set too so a future reordering of
+# sample()'s failure check couldn't silently make this scenario shell out to
+# a live `gc session list`.
+TOP_FAIL_OUT=$(RAM_OWNER_NOW_EPOCH="$NOW" \
+  RAM_OWNER_PS_FIXTURE="$TMP/empty_ps.txt" \
+  RAM_OWNER_SESSIONS_FIXTURE="$TMP/sessions.json" \
   python3 "$REPORT" --top 3 2>&1)
-# (feeding it a nonsense fixture on purpose — a bash script, not a ps table —
-#  to prove --top degrades to "no data" instead of crashing on garbage input)
-echo "$TOP_OUT" | grep -qi "top RSS" && ok "--top prints a compact 'top RSS: ...' line even against garbage ps input" || bad "--top crashed or produced no output: $TOP_OUT"
+echo "$TOP_FAIL_OUT" | grep -qi "falha na leitura" && ok "--top on a failed ps read prints the explicit failure message" || bad "--top did not degrade explicitly on empty ps: $TOP_FAIL_OUT"
+
+echo ""
+echo "── Scenario: --top N live mode, real ps data -> resolves owners, never touches the JSONL ──"
+cat > "$TMP/top_ps.txt" <<EOF
+100 1 40000 dolt dolt sql-server
+200 50000 362576 claude claude --settings {} --model sonnet --session-id 5923529a-5a66-49c7-a5eb-cced45033d61 --effort max
+EOF
+python3 -c "
+import json
+print(json.dumps({'sessions': [
+  {'session_key': '5923529a-5a66-49c7-a5eb-cced45033d61', 'name': 'gastown.dog-2', 'template': 'gastown.dog', 'work_dir': '/x'},
+]}))
+" > "$TMP/top_sessions.json"
+TOP_OK_OUT=$(RAM_OWNER_NOW_EPOCH="$NOW" \
+  RAM_OWNER_PS_FIXTURE="$TMP/top_ps.txt" \
+  RAM_OWNER_SESSIONS_FIXTURE="$TMP/top_sessions.json" \
+  python3 "$REPORT" --top 3 2>&1)
+echo "$TOP_OK_OUT" | grep -q "gastown.dog-2=354MB" && ok "--top resolves a real claude PID to its session name via --session-id join" || bad "--top did not resolve real owners: $TOP_OK_OUT"
+echo "$TOP_OK_OUT" | grep -qi "AVISO" && bad "--top wrongly showed the session-lookup-failed AVISO despite a successful lookup: $TOP_OK_OUT" || ok "--top shows no AVISO when the session lookup actually succeeded"
 
 echo ""
 echo "── Scenario: no history file yet -> graceful message, not a crash ──"

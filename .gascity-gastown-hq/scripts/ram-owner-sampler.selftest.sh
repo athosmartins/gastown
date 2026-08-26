@@ -58,6 +58,7 @@ py_get() { python3 -c "import json,sys; d=json.loads(sys.argv[1]); print(d$1)" "
 [ "$(py_get '["unresolved_kb"]')" = "3000" ] && ok "unreachable-parent process (pid 600) bucketed as unresolved, not silently dropped or misattributed" || bad "unresolved_kb wrong: $(py_get '["unresolved_kb"]')"
 [ "$(py_get '["by_rig"]["hq"]')" = "362576" ] && ok "gastown.dog-2 (HQ work_dir) attributed to rig=hq" || bad "rig hq total wrong: $(py_get '["by_rig"]')"
 [ "$(py_get '["by_rig"]["whatsapp_automation"]')" = "150000" ] && ok "wa-worker-x (whatsapp_automation work_dir) attributed to rig=whatsapp_automation" || bad "rig whatsapp_automation total wrong"
+[ "$(py_get '["sessions_lookup_failed"]')" = "False" ] && ok "sessions_lookup_failed is False when the session lookup actually succeeded" || bad "sessions_lookup_failed wrong on a successful lookup: $(py_get '["sessions_lookup_failed"]')"
 
 TOTAL=$(py_get '["total_rss_kb"]')
 # every row in the ps fixture counts, including launchd (100) and tmux (500)
@@ -119,6 +120,30 @@ rc=$?
 [ "$rc" -eq 0 ] && ok "a measurement gap is not treated as a crash (exits 0, not a hard failure)" || bad "expected rc=0 for a graceful skip, got $rc"
 [ ! -f "$TMP/gap.jsonl" ] && ok "no JSONL record written for a failed ps read (would have poisoned growth/median math with a false zero)" || bad "a fake zero-RSS record was written to history despite the ps read failing: $(cat "$TMP/gap.jsonl")"
 grep -qi 'ps_snapshot_empty\|amostra pulada' "$TMP/notify2.log" 2>/dev/null && ok "the skipped sample still notifies (visible, not silent)" || bad "skipped sample was silent — no notify fired"
+
+echo ""
+echo "── Scenario: session lookup itself fails (bad fixture path) -> flagged explicitly, not indistinguishable from 'confirmed zero sessions' ──"
+# Reuses the main ps.txt fixture (3 claude PIDs) but points the sessions
+# fixture at a file that does not exist, so sessions_by_key() hits its
+# open()-failure branch (ok=False) instead of parsing a real, empty {"sessions":
+# []} — the exact "error vs. empty" distinction ga-yr8vm's gate review (attempt
+# 1) found missing: a transient `gc session list` failure used to collapse to
+# the same {} as a genuine zero-sessions reading, silently degrading every
+# claude PID's attribution with no signal anywhere that the LOOKUP failed.
+RAM_OWNER_PS_FIXTURE="$TMP/ps.txt" \
+RAM_OWNER_SESSIONS_FIXTURE="$TMP/does-not-exist.json" \
+RAM_OWNER_OUT="$TMP/sessfail.jsonl" \
+RAM_OWNER_NOW_EPOCH=1787700000 \
+RAM_OWNER_NOTIFY="$TMP/notify" \
+PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH" \
+  python3 "$SAMPLER" >/dev/null 2>"$TMP/stderr5"
+rc=$?
+[ "$rc" -eq 0 ] && ok "a failed session lookup alone does not crash the sampler" || bad "expected rc=0, got $rc"
+SESSFAIL_REC=$(tail -1 "$TMP/sessfail.jsonl" 2>/dev/null)
+sessfail_get() { python3 -c "import json,sys; d=json.loads(sys.argv[1]); print(d$1)" "$SESSFAIL_REC" 2>/dev/null; }
+[ "$(sessfail_get '["sessions_lookup_failed"]')" = "True" ] && ok "sessions_lookup_failed is explicitly True when the lookup itself failed" || bad "sessions_lookup_failed not flagged: $(sessfail_get '["sessions_lookup_failed"]')"
+EXPECT_UNMATCHED=$((362576+150000+50000))
+[ "$(sessfail_get '["by_owner"]["claude (no session-id match)"]')" = "$EXPECT_UNMATCHED" ] && ok "all 3 claude PIDs still counted (RSS not lost), merged into the fallback bucket since no session data was available to disambiguate them" || bad "unmatched-claude bucket wrong during a failed lookup: $(sessfail_get '["by_owner"]')"
 
 echo ""
 echo "ram-owner-sampler selftest: PASS=$PASS FAIL=$FAIL"

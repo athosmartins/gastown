@@ -64,6 +64,20 @@ def sh(args, timeout=20):
         return ""
 
 
+def _sh_checked(args, timeout=20):
+    """Like sh(), but reports success/failure explicitly instead of collapsing
+    a subprocess failure (nonzero exit, timeout, or exception) into the same
+    "" a genuinely-empty-but-successful call would produce. Only
+    sessions_by_key() needs this distinction today (see its docstring) — the
+    other sh() callers already treat a failure as an honest per-field
+    "unknown" (None) without ever asserting it as a false confirmed value."""
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0, r.stdout
+    except Exception:
+        return False, ""
+
+
 def ps_snapshot(fixture_path=None):
     """One atomic ps read: pid -> {ppid, rss_kb, comm, args_head}.
 
@@ -94,7 +108,21 @@ def ps_snapshot(fixture_path=None):
 
 
 def sessions_by_key(fixture_path=None):
-    """session_key -> {name, template, work_dir} from `gc session list --json`.
+    """session_key -> {name, template, work_dir} from `gc session list --json`,
+    plus an ok flag distinguishing "confirmed" from "could not determine".
+
+    Returns (by_key, ok). ok=False means the underlying source (the live `gc`
+    call, or a supplied fixture file) could not be read/parsed — by_key is {}
+    in that case, indistinguishable BY SHAPE from a genuine "zero live
+    sessions" reading, so callers MUST check ok before treating an empty
+    by_key as confirmed rather than unknown. Collapsing the two was the exact
+    gap ga-yr8vm's gate review caught: a transient `gc` failure silently
+    degraded every claude process's owner_of() resolution into the generic
+    "claude (no session-id match)" bucket — indistinguishable from a real
+    no-session-id process — with no signal anywhere that the LOOKUP failed,
+    not the process. A fixture that parses successfully, even to an empty
+    list, reports ok=True: a deliberately empty test fixture is a valid
+    confirmed-zero input, not a failure.
 
     fixture_path (test seam): a JSON file shaped like the real command's
     {"sessions": [...]} (or a bare list) output.
@@ -103,14 +131,19 @@ def sessions_by_key(fixture_path=None):
         try:
             with open(fixture_path) as f:
                 d = json.load(f)
+            ok = True
         except Exception:
-            d = []
+            d, ok = [], False
     else:
-        out = sh(["gc", "session", "list", "--json"], timeout=25)
-        try:
-            d = json.loads(out or "[]")
-        except Exception:
-            d = []
+        got, out = _sh_checked(["gc", "session", "list", "--json"], timeout=25)
+        if got:
+            try:
+                d = json.loads(out or "[]")
+                ok = True
+            except Exception:
+                d, ok = [], False
+        else:
+            d, ok = [], False
     sessions = d.get("sessions", d) if isinstance(d, dict) else d
     by_key = {}
     for s in sessions or []:
@@ -123,7 +156,7 @@ def sessions_by_key(fixture_path=None):
             "work_dir": s.get("work_dir") or "",
             "last_active": s.get("last_active") or s.get("created_at") or "",
         }
-    return by_key
+    return by_key, ok
 
 
 def label(args_head):
@@ -240,8 +273,8 @@ def sample(now=None, ps_fixture=None, sessions_fixture=None, compute_rig=True):
         return {"ts": now, "error": "ps_snapshot_empty", "total_rss_kb": None,
                 "unresolved_kb": None, "n_procs": 0, "swap_used_mb": None,
                 "swap_total_mb": None, "free_pct": None, "by_owner": {},
-                "owner_kind": {}, "by_rig": {}}
-    sess = sessions_by_key(sessions_fixture)
+                "owner_kind": {}, "by_rig": {}, "sessions_lookup_failed": None}
+    sess, sess_ok = sessions_by_key(sessions_fixture)
 
     by_owner = {}
     owner_kind = {}
@@ -306,6 +339,7 @@ def sample(now=None, ps_fixture=None, sessions_fixture=None, compute_rig=True):
         "by_owner": by_owner,
         "owner_kind": owner_kind,
         "by_rig": by_rig,
+        "sessions_lookup_failed": not sess_ok,
     }
 
 
