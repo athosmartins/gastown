@@ -85,3 +85,27 @@ lsof -nP -p <pid>     # confirme o binário realmente mapeado
 - `ga-3azujf` — bead que rastreia a fila de engine.
 - `ga-ju6ob` — senha do Mac no Bitwarden (precisa do Athos).
 - Compactação: ~3GB do hq se auto-curam às 04:30 via marker `pending_gc`.
+
+## COMO ACIONAR (pedido do Athos: "pronto pra, quando precisar, ser fácil acionar")
+
+Não há nada agendado. Nenhum plist, nenhum cron. A janela só acontece quando
+você chamar:
+
+```bash
+~/gt/.gascity-gastown-hq/scripts/engine-window-run.sh          # check (read-only)
+~/gt/.gascity-gastown-hq/scripts/engine-window-run.sh build    # builda, NÃO troca
+~/gt/.gascity-gastown-hq/scripts/engine-window-run.sh swap     # troca o symlink
+~/gt/.gascity-gastown-hq/scripts/engine-window-run.sh rollback # desfaz a troca
+```
+
+`check` sozinho não muda nada e diz se dá pra seguir. Hoje ele reprova só no
+swap livre (1.5GB < 3GB) — é o portão que **só o reboot** abre.
+
+**O swap do binário NÃO derruba a cidade.** O SO resolve o symlink no exec:
+processo em execução segue no binário antigo, sessão nova pega o novo. É troca
+gradual, sem bounce — ao contrário do caso do tmux, onde o servidor precisava
+sair inteiro.
+
+`build` se recusa a rodar se o `check` reprovar (tem `--force`, deliberado).
+`swap` se recusa se o binário não existir ou não executar. `rollback` se recusa
+se não houver alvo anterior gravado. Testado: os três falham fechado.

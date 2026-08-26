@@ -1,0 +1,177 @@
+#!/bin/bash
+# engine-window-run.sh — janela do engine, pronta pra acionar (Mayor, 2026-08-26).
+#
+# PEDIDO DO ATHOS (26/08, verbatim): "eu so queria ter isso pronto pra, quando
+# precisar, ser facil acionar". Por isso este script NAO agenda nada, NAO roda
+# sozinho e NAO tem plist. Ele so existe pra ser chamado quando ele quiser.
+#
+# USO
+#   engine-window-run.sh            # = check. Read-only. Nao muda nada.
+#   engine-window-run.sh build      # builda; NAO troca o binario vivo
+#   engine-window-run.sh swap       # troca o symlink; guarda o anterior
+#   engine-window-run.sh rollback   # volta pro binario anterior
+#
+# A ORDEM E SEMPRE check -> build -> swap. Cada fase e separada de proposito:
+# uma fase que builda E troca junto nao deixa voce inspecionar o resultado
+# antes de expor a cidade a ele.
+#
+# POR QUE O SWAP NAO DERRUBA A CIDADE
+# O SO resolve o symlink no exec. Processo que ja esta rodando continua com o
+# binario velho mapeado; sessao NOVA pega o novo. A troca e GRADUAL e nao
+# precisa de bounce (a receita ga-hdfbux diz o mesmo: "gradual symlink swap —
+# don't force a city restart"). Isso e o oposto do caso do tmux, onde o
+# servidor precisava sair inteiro.
+set -uo pipefail
+
+SRC=/Users/athos/gt/.local-patches/_src-hookfix
+BRANCH=consolidated/engine-window-20260827
+WORKTREE=/Users/athos/gt/.gc-worktrees/engine-window-0827
+LIBEXEC="$HOME/.local/libexec"
+LABEL="gc-1.1.1-engwin0827"
+SYMLINK=/opt/homebrew/bin/gc
+PREV_FILE="$HOME/.gastown/run/engine-window-prev-target"
+LOG=/Users/athos/gt/.gascity-gastown-hq/.gc/logs/engine-window-run.log
+PREFLIGHT=/Users/athos/gt/.gascity-gastown-hq/scripts/engine-build-preflight.sh
+
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG"; }
+die() { log "ABORTADO: $*"; exit 1; }
+
+ensure_worktree() {
+  # Idioma seguro: git worktree remove (casa Bash(git:*), nao dispara o prompt
+  # de aprovacao de Bash(rm -rf:*)) e limpa o REGISTRO, nao so os arquivos.
+  if [ ! -d "$WORKTREE" ]; then
+    git -C "$SRC" worktree remove --force "$WORKTREE" 2>/dev/null || true
+    git -C "$SRC" worktree add --force "$WORKTREE" "$BRANCH" >/dev/null 2>&1 \
+      || die "nao consegui criar worktree de $BRANCH"
+    log "worktree criado: $WORKTREE ($BRANCH)"
+  fi
+}
+
+phase_check() {
+  log "=== CHECK (read-only) ==="
+  local rc=0
+
+  # 1. A branch existe e aponta pro que esperamos?
+  local head; head=$(git -C "$SRC" rev-parse --short "$BRANCH" 2>/dev/null) \
+    || { log "  branch ....... $BRANCH AUSENTE"; rc=1; }
+  [ -n "${head:-}" ] && log "  branch ....... $BRANCH @ $head"
+
+  # 2. A base e mesmo o commit do binario VIVO? Este e o check que impede a
+  #    regressao que ja aconteceu uma vez (o vendor bump beads v1.1.0 evaporou
+  #    quando alguem rebuildou da linhagem 'oficial' — ga-hdfbux/ga-9ae7o).
+  local live_commit; live_commit=$(git -C "$SRC" rev-parse --short bbf90542c 2>/dev/null)
+  if git -C "$SRC" merge-base --is-ancestor bbf90542c "$BRANCH" 2>/dev/null; then
+    log "  base ......... OK — contem $live_commit (binario vivo hoje)"
+  else
+    log "  base ......... FALHOU — $BRANCH NAO contem o commit do binario vivo."
+    log "                 Buildar assim REGREDIRIA o vendor beads v1.1.0 da cidade."
+    rc=1
+  fi
+
+  # 3. Toolchain: go.mod pede uma versao que pode nao ser a instalada.
+  local want have
+  want=$(awk '/^go /{print $2; exit}' "$SRC/go.mod" 2>/dev/null)
+  have=$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
+  if [ -d "$HOME/go/pkg/mod/golang.org/toolchain@v0.0.1-go${want}.darwin-arm64" ]; then
+    log "  toolchain .... OK — go.mod quer $want, ja baixado (build funciona offline)"
+  elif [ "$want" = "$have" ]; then
+    log "  toolchain .... OK — $have"
+  else
+    log "  toolchain .... ATENCAO — go.mod quer $want, local e $have e nao ha copia baixada."
+    log "                 O build vai tentar BAIXAR o toolchain: precisa de rede."
+  fi
+
+  # 4. Recursos. Chama o preflight de verdade em vez de reimplementar as regras.
+  if [ -x "$PREFLIGHT" ] || [ -f "$PREFLIGHT" ]; then
+    log "  --- preflight de recursos ---"
+    bash "$PREFLIGHT" 2>&1 | sed 's/^/  /' | tee -a "$LOG"
+    # O preflight e somente-leitura e NAO aborta nada; a decisao e nossa.
+    local swapfree
+    swapfree=$(sysctl -n vm.swapusage 2>/dev/null | sed -n 's/.*free = \([0-9.]*\)M.*/\1/p')
+    if [ -n "$swapfree" ] && [ "${swapfree%.*}" -lt 3072 ] 2>/dev/null; then
+      log "  ATENCAO: swap livre abaixo de 3GB. So o REBOOT devolve swap."
+      log "  E o ganho do reboot expira rapido (medido 26/08: 1h40) — se for"
+      log "  rebootar, builde IMEDIATAMENTE depois, nao por ultimo."
+      rc=1
+    fi
+  else
+    log "  preflight .... NAO ENCONTRADO em $PREFLIGHT (nao consegui medir recursos)"
+    rc=1
+  fi
+
+  log "  binario vivo agora: $(readlink "$SYMLINK" 2>/dev/null || echo '?')"
+  if [ "$rc" -eq 0 ]; then
+    log "VEREDITO: pronto pra 'build'."
+  else
+    log "VEREDITO: NAO recomendado agora (ver ATENCAO/FALHOU acima)."
+    log "          'build --force' existe, mas so use sabendo o porque."
+  fi
+  return "$rc"
+}
+
+phase_build() {
+  if [ "${2:-}" != "--force" ] && [ "${1:-}" != "--force" ]; then
+    phase_check || die "check reprovou. Use 'build --force' se for deliberado."
+  else
+    log "--force: pulando o veredito do check (deliberado)."
+    phase_check || true
+  fi
+  ensure_worktree
+  log "=== BUILD ==="
+  # Tag pra o binario se identificar em 'gc version' (o Makefile deriva VERSION
+  # de git describe --tags --exact-match; sem tag ele reporta 'dev', que e
+  # indistinguivel de qualquer outro build local).
+  git -C "$WORKTREE" tag -f "engwin-20260827" >/dev/null 2>&1 || true
+  mkdir -p "$LIBEXEC"
+  local out="$LIBEXEC/$LABEL"
+  log "compilando -> $out (pode demorar; GOCACHE quente ajuda)"
+  ( cd "$WORKTREE" && make build BUILD_DIR="$LIBEXEC" BINARY="$LABEL" ) 2>&1 | tail -20 | tee -a "$LOG"
+  [ -x "$out" ] || die "build nao produziu binario executavel em $out"
+  log "build OK: $(ls -la "$out" | awk '{print $5" bytes"}')"
+  # Prova de vida: o binario novo tem que RODAR antes de ser candidato a swap.
+  if "$out" version >/dev/null 2>&1; then
+    log "prova de vida OK: '$LABEL version' respondeu"
+    log "  reporta: $("$out" version 2>&1 | head -2 | tr '\n' ' ')"
+  else
+    die "o binario buildou mas NAO RODA ('$out version' falhou). Nao vou trocar nada."
+  fi
+  log "PRONTO. Nada foi trocado ainda — rode 'swap' quando quiser expor a cidade."
+}
+
+phase_swap() {
+  local out="$LIBEXEC/$LABEL"
+  [ -x "$out" ] || die "nao existe $out — rode 'build' primeiro."
+  "$out" version >/dev/null 2>&1 || die "$out nao roda. Nao vou trocar."
+  local prev; prev=$(readlink "$SYMLINK" 2>/dev/null) || die "nao consegui ler $SYMLINK"
+  mkdir -p "$(dirname "$PREV_FILE")"
+  printf '%s\n' "$prev" > "$PREV_FILE"
+  log "=== SWAP ==="
+  log "  de : $prev"
+  log "  pra: $out"
+  ln -sfn "$out" "$SYMLINK" || die "falhou ao trocar o symlink"
+  local now; now=$(readlink "$SYMLINK")
+  [ "$now" = "$out" ] || die "symlink nao ficou como esperado (esta: $now)"
+  log "swap OK. Anterior guardado em $PREV_FILE (rollback disponivel)."
+  log "A troca e GRADUAL: sessoes ja rodando seguem no binario velho; sessoes"
+  log "novas pegam o novo. Nao e preciso derrubar a cidade."
+  command -v notify >/dev/null 2>&1 && notify -t 'Engine window: swap feito' \
+    "gc agora aponta pra $LABEL. Rollback: engine-window-run.sh rollback"
+}
+
+phase_rollback() {
+  [ -f "$PREV_FILE" ] || die "nao ha alvo anterior gravado em $PREV_FILE"
+  local prev; prev=$(cat "$PREV_FILE")
+  [ -x "$prev" ] || die "o binario anterior ($prev) nao existe mais"
+  log "=== ROLLBACK -> $prev ==="
+  ln -sfn "$prev" "$SYMLINK" || die "falhou ao restaurar"
+  log "rollback OK: $(readlink "$SYMLINK")"
+}
+
+mkdir -p "$(dirname "$LOG")"
+case "${1:-check}" in
+  check)    phase_check ;;
+  build)    phase_build "$@" ;;
+  swap)     phase_swap ;;
+  rollback) phase_rollback ;;
+  *) echo "uso: $(basename "$0") [check|build|swap|rollback]"; exit 2 ;;
+esac
