@@ -675,9 +675,10 @@ transcript reaping) recovered ${reclaimed_gb}GB this cycle (avail ${avail_before
 (below the ${VM_SIGNIFICANT_GB}GB significance threshold, or unmeasured) and is not implicated here."
         else
           diagnosis_detail="File-based reclaim returned essentially 0 bytes this cycle (avail
-${avail_before}GB -> ${avail}GB) but vm_swap (${vm_gb:-unmeasured}GB) is below the
-${VM_SIGNIFICANT_GB}GB significance threshold too — neither known cause explains this reading.
-Investigate manually (df -h, du -sh on shared/data and .gc/logs)."
+${avail_before}GB -> ${avail}GB), and vm_swap (${vm_gb:-unmeasured}GB) is not a confirmed
+significant contributor either (below the ${VM_SIGNIFICANT_GB}GB threshold, or unmeasured) —
+neither known cause explains this reading. Investigate manually (df -h, du -sh on shared/data
+and .gc/logs)."
         fi
         # NOTE: deliberately NOT a heredoc — bash 3.2 (macOS system /bin/bash, what
         # launchd invokes per the plist) mis-parses a heredoc nested inside a $(...)
