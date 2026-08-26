@@ -1052,7 +1052,7 @@ gap2_arm_needs_remerge() {
   # instead of slinging a builder.
   bd -C "$GC_CITY" label add "$bead_id" "gate:needs-fix" -q 2>/dev/null || true
   bd -C "$GC_CITY" label add "$bead_id" "gate:needs-remerge" -q 2>/dev/null || true
-  bd -C "$GC_CITY" comment "$bead_id" "ga-pa36 GAP-2 reconciler: sling bead $sling_id gate-passed+closed, but no independent evidence the parent's own fix ($bead_id) is merged into origin/main was found (checked branches fix/$bead_id*, feature/$bead_id*, crew/*/$bead_id*, and sling fix/$sling_id*, feature/$sling_id*, crew/*/$sling_id*). ga-6ync4 fix: never trust sling-passed alone. story:in-flight + pilot:dispatched cleared; gate:needs-fix + gate:needs-remerge set (ga-e2n96: needs-remerge is the distinct re-submission signal — no reviewer ever rejected this code) so Pilot resubmits the existing branch to the gate or escalates, instead of dispatching a builder with an empty brief. (If this parent's delivery is legitimately untracked, apply the delivery:untracked label — see ga-x2x63.)" 2>/dev/null || true
+  bd -C "$GC_CITY" comment "$bead_id" "ga-pa36 GAP-2 reconciler: sling bead $sling_id gate-passed+closed, but no independent evidence the parent's own fix ($bead_id) is merged into origin/main was found (checked branches fix/$bead_id*, feat/$bead_id*, feature/$bead_id*, refactor/$bead_id*, docs/$bead_id*, chore/$bead_id*, test/$bead_id*, crew/*/$bead_id*, and sling fix/$sling_id*, feat/$sling_id*, feature/$sling_id*, refactor/$sling_id*, docs/$sling_id*, chore/$sling_id*, test/$sling_id*, crew/*/$sling_id*). ga-6ync4 fix: never trust sling-passed alone. story:in-flight + pilot:dispatched cleared; gate:needs-fix + gate:needs-remerge set (ga-e2n96: needs-remerge is the distinct re-submission signal — no reviewer ever rejected this code) so Pilot resubmits the existing branch to the gate or escalates, instead of dispatching a builder with an empty brief. (If this parent's delivery is legitimately untracked, apply the delivery:untracked label — see ga-x2x63.)" 2>/dev/null || true
 }
 
 # gap2_apply_pass_verdict <bead_id> <sling_id> <is_story_approved> <verdict> —
@@ -2993,7 +2993,12 @@ for RIGSCAN_CITY in $RIGSCAN_PATHS; do
 
         RIGSCAN_BRANCH_SHA=""
         for RIGSCAN_PAT in "refs/heads/fix/${RIGSCAN_OI_ID}" "refs/heads/fix/${RIGSCAN_OI_ID}-*" \
+                   "refs/heads/feat/${RIGSCAN_OI_ID}" "refs/heads/feat/${RIGSCAN_OI_ID}-*" \
                    "refs/heads/feature/${RIGSCAN_OI_ID}" "refs/heads/feature/${RIGSCAN_OI_ID}-*" \
+                   "refs/heads/refactor/${RIGSCAN_OI_ID}" "refs/heads/refactor/${RIGSCAN_OI_ID}-*" \
+                   "refs/heads/docs/${RIGSCAN_OI_ID}" "refs/heads/docs/${RIGSCAN_OI_ID}-*" \
+                   "refs/heads/chore/${RIGSCAN_OI_ID}" "refs/heads/chore/${RIGSCAN_OI_ID}-*" \
+                   "refs/heads/test/${RIGSCAN_OI_ID}" "refs/heads/test/${RIGSCAN_OI_ID}-*" \
                    "refs/heads/crew/*/${RIGSCAN_OI_ID}" "refs/heads/crew/*/${RIGSCAN_OI_ID}-*"; do
           RIGSCAN_SHA=$(git -C "$RIGSCAN_CITY" ls-remote origin "$RIGSCAN_PAT" 2>/dev/null | head -1 | awk '{print $1}')
           if [ -z "$RIGSCAN_SHA" ]; then
@@ -3011,8 +3016,8 @@ for RIGSCAN_CITY in $RIGSCAN_PATHS; do
         RIGSCAN_ACTION=$(classify_inflight_gap1 "open" "0" "$RIGSCAN_HAS_LIVE_ASSIGNEE" "none")
         case "$RIGSCAN_ACTION" in
           strip:no-branch)
-            warn "GAP-1: $RIGSCAN_OI_ID has no branch matching fix/$RIGSCAN_OI_ID*, feature/$RIGSCAN_OI_ID*, or crew/*/$RIGSCAN_OI_ID*, no live assignee, no gate:passed, no pilot:dispatched (rig=$RIGSCAN_CITY) — never actually started, stripping story:in-flight (ga-bz4nsi)"
-            bd -C "$RIGSCAN_CITY" comment "$RIGSCAN_OI_ID" "ga-bz4nsi GAP-1 reconciler: stripped orphaned story:in-flight — no fix/feature/crew branch was ever found for this bead, no live assignee, no gate:passed, no pilot:dispatched. This is the never-started shape (not merged-and-forgotten): the lane slot was leaked before any build began. Self-healed." 2>/dev/null || true
+            warn "GAP-1: $RIGSCAN_OI_ID has no branch matching fix/$RIGSCAN_OI_ID*, feat/$RIGSCAN_OI_ID*, feature/$RIGSCAN_OI_ID*, refactor/$RIGSCAN_OI_ID*, docs/$RIGSCAN_OI_ID*, chore/$RIGSCAN_OI_ID*, test/$RIGSCAN_OI_ID*, or crew/*/$RIGSCAN_OI_ID*, no live assignee, no gate:passed, no pilot:dispatched (rig=$RIGSCAN_CITY) — never actually started, stripping story:in-flight (ga-bz4nsi)"
+            bd -C "$RIGSCAN_CITY" comment "$RIGSCAN_OI_ID" "ga-bz4nsi GAP-1 reconciler: stripped orphaned story:in-flight — no fix/feat/feature/refactor/docs/chore/test/crew branch was ever found for this bead, no live assignee, no gate:passed, no pilot:dispatched. This is the never-started shape (not merged-and-forgotten): the lane slot was leaked before any build began. Self-healed." 2>/dev/null || true
             bd -C "$RIGSCAN_CITY" label remove "$RIGSCAN_OI_ID" "story:in-flight" -q 2>/dev/null || true
             _gap1_ensure_lifecycle_backstop "$RIGSCAN_CITY" "$RIGSCAN_OI_ID"
             ;;
@@ -3117,11 +3122,17 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
         break
       fi
 
-      # Find branch tip by convention: fix/<id>*, feature/<id>*, or crew/<agent>/<id>*
+      # Find branch tip by convention: fix/<id>*, feat/<id>*, feature/<id>*,
+      # refactor/<id>*, docs/<id>*, chore/<id>*, test/<id>*, or crew/<agent>/<id>*
       # Prefer ls-remote (live) with for-each-ref as local cache fallback.
       OI_BRANCH_SHA=""
       for PAT in "refs/heads/fix/${OI_ID}" "refs/heads/fix/${OI_ID}-*" \
+                 "refs/heads/feat/${OI_ID}" "refs/heads/feat/${OI_ID}-*" \
                  "refs/heads/feature/${OI_ID}" "refs/heads/feature/${OI_ID}-*" \
+                 "refs/heads/refactor/${OI_ID}" "refs/heads/refactor/${OI_ID}-*" \
+                 "refs/heads/docs/${OI_ID}" "refs/heads/docs/${OI_ID}-*" \
+                 "refs/heads/chore/${OI_ID}" "refs/heads/chore/${OI_ID}-*" \
+                 "refs/heads/test/${OI_ID}" "refs/heads/test/${OI_ID}-*" \
                  "refs/heads/crew/*/${OI_ID}" "refs/heads/crew/*/${OI_ID}-*"; do
         SHA=$(git -C "$GC_CITY" ls-remote origin "$PAT" 2>/dev/null | head -1 | awk '{print $1}')
         if [ -z "$SHA" ]; then
@@ -3133,14 +3144,14 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
 
       if [ -z "$OI_BRANCH_SHA" ]; then
         if [ "$G1_CITY_GIT_READY" != "1" ]; then
-          log "GAP-1: $OI_ID — no branch matching fix/$OI_ID*, feature/$OI_ID*, or crew/*/$OI_ID*, but git is not usable for this city (no work tree or no origin remote) — cannot trust the empty result, safe-skip (ga-bz4nsi)"
+          log "GAP-1: $OI_ID — no branch matching fix/$OI_ID*, feat/$OI_ID*, feature/$OI_ID*, refactor/$OI_ID*, docs/$OI_ID*, chore/$OI_ID*, test/$OI_ID*, or crew/*/$OI_ID*, but git is not usable for this city (no work tree or no origin remote) — cannot trust the empty result, safe-skip (ga-bz4nsi)"
           continue
         fi
         ACTION=$(classify_inflight_gap1 "open" "0" "$HAS_LIVE_ASSIGNEE" "none")
         case "$ACTION" in
           strip:no-branch)
-            warn "GAP-1: $OI_ID has no branch matching fix/$OI_ID*, feature/$OI_ID*, or crew/*/$OI_ID*, no live assignee, no gate:passed, no pilot:dispatched — never actually started, stripping story:in-flight (ga-bz4nsi)"
-            bd -C "$GC_CITY" comment "$OI_ID" "ga-bz4nsi GAP-1 reconciler: stripped orphaned story:in-flight — no fix/feature/crew branch was ever found for this bead, no live assignee, no gate:passed, no pilot:dispatched. This is the never-started shape (not merged-and-forgotten): the lane slot was leaked before any build began. Self-healed." 2>/dev/null || true
+            warn "GAP-1: $OI_ID has no branch matching fix/$OI_ID*, feat/$OI_ID*, feature/$OI_ID*, refactor/$OI_ID*, docs/$OI_ID*, chore/$OI_ID*, test/$OI_ID*, or crew/*/$OI_ID*, no live assignee, no gate:passed, no pilot:dispatched — never actually started, stripping story:in-flight (ga-bz4nsi)"
+            bd -C "$GC_CITY" comment "$OI_ID" "ga-bz4nsi GAP-1 reconciler: stripped orphaned story:in-flight — no fix/feat/feature/refactor/docs/chore/test/crew branch was ever found for this bead, no live assignee, no gate:passed, no pilot:dispatched. This is the never-started shape (not merged-and-forgotten): the lane slot was leaked before any build began. Self-healed." 2>/dev/null || true
             bd -C "$GC_CITY" label remove "$OI_ID" "story:in-flight" -q 2>/dev/null || true
             _gap1_ensure_lifecycle_backstop "$GC_CITY" "$OI_ID"
             ;;
@@ -3357,7 +3368,12 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
               [ -n "$GAP2_TRY_ID" ] || continue
               GAP2_BRANCH_SHA=""
               for GAP2_PAT in "refs/heads/fix/${GAP2_TRY_ID}" "refs/heads/fix/${GAP2_TRY_ID}-*" \
+                         "refs/heads/feat/${GAP2_TRY_ID}" "refs/heads/feat/${GAP2_TRY_ID}-*" \
                          "refs/heads/feature/${GAP2_TRY_ID}" "refs/heads/feature/${GAP2_TRY_ID}-*" \
+                         "refs/heads/refactor/${GAP2_TRY_ID}" "refs/heads/refactor/${GAP2_TRY_ID}-*" \
+                         "refs/heads/docs/${GAP2_TRY_ID}" "refs/heads/docs/${GAP2_TRY_ID}-*" \
+                         "refs/heads/chore/${GAP2_TRY_ID}" "refs/heads/chore/${GAP2_TRY_ID}-*" \
+                         "refs/heads/test/${GAP2_TRY_ID}" "refs/heads/test/${GAP2_TRY_ID}-*" \
                          "refs/heads/crew/*/${GAP2_TRY_ID}" "refs/heads/crew/*/${GAP2_TRY_ID}-*"; do
                 GAP2_SHA=$(git -C "$GC_CITY" ls-remote origin "$GAP2_PAT" 2>/dev/null | head -1 | awk '{print $1}')
                 if [ -z "$GAP2_SHA" ]; then
