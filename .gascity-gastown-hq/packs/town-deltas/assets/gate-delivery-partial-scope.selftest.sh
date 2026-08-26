@@ -697,7 +697,7 @@ fi
 # referenced by name at each site, so this counts variable REFERENCES
 # (1 definition + 3 uses = 4), not occurrences of the git-log command text
 # (which appears literally only once, in the definition).
-DISPATCHER_CHECK_REFS=$(grep -cF 'SCOPE_HOLD_ALWAYS_CHECK' "$DISPATCHER")
+DISPATCHER_CHECK_REFS=$(grep -cF 'SCOPE_HOLD_ALWAYS_CHECK' "$DISPATCHER") || true
 if [ "$DISPATCHER_CHECK_REFS" -ge 4 ]; then
   ok "dispatcher.sh's always-check note is defined once and reaches all 3 message sites — found $DISPATCHER_CHECK_REFS references (ga-pm93k)"
 else
@@ -721,7 +721,7 @@ else
 fi
 # Same reference-counting rationale as the dispatcher check above, mirrored
 # for the 2-site backstop (1 definition + 2 uses = 3).
-DELIVERY_CHECK_REFS=$(grep -cF 'TASK_SCOPE_HOLD_ALWAYS_CHECK' "$DELIVERY")
+DELIVERY_CHECK_REFS=$(grep -cF 'TASK_SCOPE_HOLD_ALWAYS_CHECK' "$DELIVERY") || true
 if [ "$DELIVERY_CHECK_REFS" -ge 3 ]; then
   ok "story-delivery.sh's always-check note is defined once and reaches both message sites — found $DELIVERY_CHECK_REFS references (ga-pm93k)"
 else
