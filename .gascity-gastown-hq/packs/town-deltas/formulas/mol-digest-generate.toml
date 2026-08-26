@@ -242,6 +242,32 @@ se ela tem mais de ~9 dias (folga sobre o ciclo semanal de 7), reporte
 explicitamente "restore-verify não roda há Nd, esperado semanal" em vez de
 deixar um resultado vazio no período se disfarçar de "mais um dia tranquilo".
 
+e) **Storage inventory (ga-z297h)** — inventário mensal leve que reusa os
+comandos já listados na coluna "Medir" da Parte 0 do Atlas
+(`whatsapp_automation/docs/data_dictionary.md`): `df` do Mac mini + ~10
+diretórios-chave, `aws s3 ls --summarize` por bucket, quota da Drive service
+account (`about.get storageQuota`), e o veredito de compute do MotherDuck
+(`motherduck_invoice_usage_check.py` — Part 0's storage bytes pra MotherDuck
+não tem comando de re-medição real hoje; ver o próprio script para o porquê).
+Escreve um bloco delimitado logo após a tabela da Parte 0 (nunca reescreve as
+células da tabela em si) e roda mensal (`com.gascity.storage-inventory-
+monthly`, dia 1, 05:30) — escopado a gascity/HQ apenas, mesmo padrão do item
+(d), não precisa do loop per-rig:
+```bash
+gc bd -C "/Users/athos/gt/.gascity-gastown-hq" list --label=storage-inventory --all --created-after=$SINCE --created-before=$UNTIL --json --limit=0
+```
+Mesma convenção do item (d): execução limpa fecha o bead na hora
+(`type=chore`); qualquer vetor fora de ±20% da rodada anterior fica ABERTA
+(`type=bug`, roteada para `gastown.dog`) — reporte esse resultado aberto em
+Highlights independente de quantos outros houve.
+
+**Mesma distinção "silêncio ≠ limpo" do item (d), com o período mensal em vez
+de semanal:** o job só dispara uma vez por mês, então um digest diário ou
+semanal vai ler zero na maioria das vezes por DESENHO. Checando a bead mais
+recente com esse label (`--all --limit=1`, sem limite de data): se ela tem
+mais de ~35 dias, reporte "storage-inventory não roda há Nd, esperado
+mensal" em vez de deixar um período vazio parecer "mais um mês tranquilo".
+
 **Why every query above needs BOTH bounds:** this formula fires on the
 deacon's cooldown trigger, not a midnight cron — it can run at any
 wall-clock hour. A `--created-after=$SINCE` with no `--created-before=$UNTIL`
@@ -448,6 +474,12 @@ Transform data into a formatted digest and deliver it.
   container as Dolt's data-dir
 - Projected time to WARN floor at the average VM growth pace since boot:
   ~NH (or "stable", or "N/A — <reason>")
+
+## Storage — inventário mensal (ga-z297h)
+- Última rodada: <data> — OK / ATENÇÃO (N vetor(es) fora de ±20%) / N/A —
+  não rodou há Nd (esperado mensal)
+- (quando houver rodada dentro da janela) tabela de vetores medidos, com Δ e
+  status — ver o corpo do bead `storage-inventory` mais recente
 
 ## Trends
 - Backlog: increasing / stable / decreasing

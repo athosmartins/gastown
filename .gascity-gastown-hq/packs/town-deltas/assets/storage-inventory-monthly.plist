@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.storage-inventory-monthly</string>
+
+  <!-- ga-z297h: lightweight monthly storage inventory — reuses the
+       measurement commands already listed in the Atlas Part 0 table
+       (whatsapp_automation/docs/data_dictionary.md) for Mac mini disk + ~10
+       key directories, S3 buckets, and Drive service-account quota; reports
+       MotherDuck's own compute verdict. Writes a delimited auto-generated
+       block right after Part 0 and flags any vector that moved >20% since
+       the prior run. Day 1 of every month, 05:30 — after
+       com.gascity.dolt-compact-routine's 04:30 daily slot and outside
+       com.gascity.dolt-s3-backup's 04:00 window (same quiet-window doctrine
+       cited in dolt-compact-routine.plist / dolt-restore-verify.plist);
+       independent of weekday, unlike the weekly restore-verify job, since
+       this fires on day-of-month rather than Weekday. Read-mostly (df/du/
+       aws s3 ls/Drive about.get are all read-only); the one write is a
+       narrow, single-file commit+push of the doc's own delimited block —
+       see scripts/storage-inventory-monthly.sh's header. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/storage-inventory-monthly.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Day</key><integer>1</integer>
+    <key>Hour</key><integer>5</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/storage-inventory-monthly-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/storage-inventory-monthly-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+  </dict>
+</dict>
+</plist>
