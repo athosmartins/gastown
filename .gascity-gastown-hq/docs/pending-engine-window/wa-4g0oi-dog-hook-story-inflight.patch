@@ -1,0 +1,35 @@
+diff --git a/internal/cmd/hook.go b/internal/cmd/hook.go
+index 4d6318cc1..a34fa29bf 100644
+--- a/internal/cmd/hook.go
++++ b/internal/cmd/hook.go
+@@ -403,6 +403,30 @@ func runHook(_ *cobra.Command, args []string) error {
+ 		break
+ 	}
+
++	// wa-4g0oi: flip the lifecycle label at the SAME point assignee/status were
++	// just written above, mirroring pilot-dispatcher.sh's `story:in-flight`
++	// stamp on its own claim paths. This dog-pool claim (gt hook) never went
++	// through that script, so a dog-claimed bead kept its stale story:approved
++	// label and rendered as "stuck" (🔒 Travadas) on the whatsapp_automation
++	// painel dashboard despite being actively worked — see
++	// docs/pending-engine-window/wa-4g0oi-dog-hook-story-inflight.patch for the
++	// full incident writeup. Best-effort: a failed label write must not fail
++	// the hook itself — the claim above already succeeded and is the source of
++	// truth; story:in-flight is a display convenience, not correctness-critical
++	// dispatch state. The pre-existing reconciler family
++	// (quality-gate-guard.sh's classify_inflight_gap1,
++	// inflight-reclaim-guard.py's reclaim_dead_dog_claims) already strips this
++	// label generically on release/reclaim regardless of who set it, so this
++	// does not introduce a new orphaned-label class.
++	if err := BdCmd("label", "add", beadID, "story:in-flight", "-q").
++		Dir(resolveBeadDir(beadID)).
++		StripBeadsDir().
++		WithAutoCommit().
++		Run(); err != nil {
++		fmt.Printf("%s story:in-flight label failed for %s (non-fatal, claim already succeeded): %v\n",
++			style.Warning.Render("⚠"), beadID, err)
++	}
++
+ 	// Emit a propulsion signal if the target is the mayor.
+ 	// This allows the ACP propeller to react to hook changes event-driven.
+ 	if agentID == "mayor/" {
