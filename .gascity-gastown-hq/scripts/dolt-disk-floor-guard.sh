@@ -111,6 +111,16 @@ ENABLED="${DOLT_DISK_FLOOR_GUARD_ENABLED:-1}"
 FLOOR_WARN_GB="${DOLT_DISK_FLOOR_WARN_GB:-8}"
 FLOOR_CRITICAL_GB="${DOLT_DISK_FLOOR_CRITICAL_GB:-3}"
 
+# ga-sfj3i.3: GB of macOS virtual-memory residency (/System/Volumes/VM)
+# treated as a "significant" consumer when deciding whether a floor breach
+# is VM-bound (file cleanup cannot help — see _vm_bound_pressure) vs
+# file-bound (cleanup can help). Independent axis from the two floors
+# above: those gate on Dolt's own remaining headroom; this gates on how
+# much of the SAME container is VM, regardless of avail. Default picked
+# from the bead's own "varios GB" framing (more than a rounding blip), not
+# yet tuned against production history.
+VM_SIGNIFICANT_GB="${DOLT_DISK_FLOOR_VM_SIGNIFICANT_GB:-2}"
+
 NOTIFY_COOLDOWN_SECS="${DOLT_DISK_FLOOR_NOTIFY_COOLDOWN_SECS:-3600}"   # 1h — tighter
                         # than disk-pressure-monitor's 6h; this is Dolt-specific
                         # last-resort protection, not general city monitoring.
@@ -170,6 +180,20 @@ _vm_swap_gb() {
   echo $(( kb / 1024 / 1024 ))
 }
 
+# _top_rss_processes [n] → top N processes on this host by resident set size
+# (RSS, KB), one "PID RSS_KB COMMAND" line per process, highest first —
+# ga-sfj3i.3 item 4: "top 5 RSS so the kill decision is informed, not a
+# guess." This guard still never kills anything itself (see OUT OF SCOPE
+# above) — purely informational, for whoever reads the alert. Best-effort:
+# empty output (not a crash) if `ps` is missing or produces no rows; callers
+# must treat empty as "unmeasured", same contract as _avail_gb/_vm_swap_gb,
+# never as "no processes running". Not gated by ENABLED — this is a read,
+# not a reclaim action, same precedent as _vm_swap_gb above.
+_top_rss_processes() {
+  local n="${1:-5}"
+  ps -Ao pid,rss,comm 2>/dev/null | tail -n +2 | sort -rn -k2 | head -n "$n"
+}
+
 # _floor_class <avail_gb> <warn_gb> <crit_gb> → NONE|WARN|CRITICAL|UNKNOWN.
 # UNKNOWN (empty/non-numeric avail_gb, e.g. df failed) is NEVER silently treated as
 # NONE — a failed read must fail LOUD, not collapse into "no problem" (ga-p5q3:
@@ -180,6 +204,27 @@ _floor_class() {
   if [ "$avail" -le "$crit" ]; then echo "CRITICAL"; return; fi
   if [ "$avail" -le "$warn" ]; then echo "WARN"; return; fi
   echo "NONE"
+}
+
+# _vm_bound_pressure <reclaimed_gb> <vm_gb> <threshold_gb> → 0 (true) when
+# the three floor-triggered reclaim levers (_safe_reclaim, _reap_dead_scratch,
+# _reap_dead_transcripts — NOT _reap_growing_logs, which always runs before
+# any of this is even measured) returned ~0 bytes (reclaimed_gb <= 0) AND
+# macOS virtual-memory residency is a significant, MEASURED consumer
+# (vm_gb >= threshold_gb). This is the exact ga-sfj3i.3 incident shape:
+# "reclaim OK — avail X -> X" while GB are actually stuck in
+# /System/Volumes/VM. Requires vm_gb to be a valid measurement — same
+# never-silently-assume discipline as _floor_class's own UNKNOWN handling —
+# an unmeasurable vm_gb (empty; non-macOS host or the volume absent) can
+# never confirm VM-bound pressure, only ever false/unknown. reclaimed_gb is
+# a caller-computed arithmetic result (avail_after - avail_before, always a
+# clean signed integer when both reads succeeded) and threshold_gb is a
+# config value — both trusted without re-validation here, same trust level
+# _floor_class already extends to its own warn/crit params.
+_vm_bound_pressure() {
+  local reclaimed="$1" vm="$2" threshold="$3"
+  case "$vm" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$reclaimed" -le 0 ] && [ "$vm" -ge "$threshold" ]
 }
 
 # _worsening <current_avail_gb> <last_notified_avail_gb_or_empty> → 0 (true) only
@@ -505,6 +550,11 @@ main() {
   local was_critical=0
   [ "$class" = "CRITICAL" ] && was_critical=1
 
+  # ga-sfj3i.3: snapshot avail BEFORE the three floor-triggered levers run,
+  # so their combined effect can be measured (reclaimed_gb below) instead of
+  # only inferred from the reclassified `class`.
+  local avail_before="$avail"
+
   _read_state
   _safe_reclaim "$avail"
   _reap_dead_scratch "$was_critical"
@@ -519,6 +569,21 @@ main() {
   [ -n "$avail_after" ] && avail="$avail_after"
   class="$(_floor_class "$avail" "$FLOOR_WARN_GB" "$FLOOR_CRITICAL_GB")"
   [ "$class" = "CRITICAL" ] && was_critical=1
+
+  # ga-sfj3i.3: how much did the three floor-triggered levers actually free?
+  # Empty (not 0) when either read failed — an unmeasurable reclaim must
+  # never be treated as "reclaimed nothing" (ga-p5q3: error and empty must
+  # not collapse to the same value). vm_bound requires a NON-empty
+  # reclaimed_gb, so an unmeasurable reclaim can never spuriously confirm
+  # VM-bound pressure either.
+  local reclaimed_gb=""
+  if [ -n "$avail_before" ] && [ -n "$avail_after" ]; then
+    reclaimed_gb=$(( avail_after - avail_before ))
+  fi
+  local vm_bound=0
+  if [ -n "$reclaimed_gb" ] && _vm_bound_pressure "$reclaimed_gb" "${vm_gb:-}" "$VM_SIGNIFICANT_GB"; then
+    vm_bound=1
+  fi
 
   # ga-q4cqr: any cycle that is NOT critical (post-reclaim) breaks a
   # CRITICAL-mail sustain streak, regardless of which of the three
@@ -544,8 +609,38 @@ main() {
   if [ "$do_notify" = "1" ]; then
     local prio=3
     [ "$was_critical" = "1" ] && prio=5
+
+    # ga-sfj3i.3: distinguish the two opposite remedies instead of always
+    # emitting the same "reclaim attempted" text (item 3) — exhaustive over
+    # four cases so an unmeasurable reclaim is never mistaken for a specific
+    # known cause (ga-p5q3 discipline, same as the rest of this file).
+    local diagnosis
+    if [ "$vm_bound" = "1" ]; then
+      diagnosis="cleanup will NOT resolve this — ${vm_gb}GB stuck in virtual memory; the only lever is reducing RAM pressure"
+    elif [ -z "$reclaimed_gb" ]; then
+      diagnosis="reclaim effect unmeasured (post-reclaim df read failed)"
+    elif [ "$reclaimed_gb" -gt 0 ]; then
+      diagnosis="file cleanup recovered ${reclaimed_gb}GB"
+    else
+      diagnosis="file cleanup found nothing to reclaim; cause not identified"
+    fi
+    log "diagnosis: ${diagnosis} (reclaimed=${reclaimed_gb:-unmeasured}GB avail_before=${avail_before}GB vm_swap=${vm_gb:-unknown}GB vm_threshold=${VM_SIGNIFICANT_GB}GB)"
+
+    # ga-sfj3i.3 item 4: top RSS consumers, so a kill decision (made by a
+    # human/Mayor — this guard still never kills anything itself) is
+    # informed rather than a guess. Logged only when actually alerting, not
+    # every cycle — unlike vm_swap_gb, this isn't needed for historical
+    # mining, only for the moment someone has to act.
+    local top_rss; top_rss="$(_top_rss_processes 5)"
+    if [ -n "$top_rss" ]; then
+      log "top RSS processes (PID RSS_KB COMMAND):"
+      printf '%s\n' "$top_rss" | while IFS= read -r _rss_line; do log "  $_rss_line"; done
+    else
+      log "top RSS processes: unmeasured (ps produced no rows)"
+    fi
+
     log "class=${class} was_critical=${was_critical}: avail=${avail}GB (warn=${FLOOR_WARN_GB}GB crit=${FLOOR_CRITICAL_GB}GB) — notifying"
-    "$NOTIFY" -t "Dolt disk-floor guard" -p "$prio" "🚨 [${class}] Dolt data-dir avail=${avail}GB (vm_swap=${vm_gb:-?}GB, non-recoverable) — reclaim attempted. See ga-gpzr." 2>/dev/null || true
+    "$NOTIFY" -t "Dolt disk-floor guard" -p "$prio" "🚨 [${class}] Dolt data-dir avail=${avail}GB, vm_swap=${vm_gb:-unknown}GB — ${diagnosis}. See ga-gpzr." 2>/dev/null || true
     if [ "$was_critical" = "1" ]; then
       # ga-q4cqr sustain-guard: require CRITICAL_MAIL_SUSTAIN consecutive
       # CRITICAL cycles before mailing the Mayor — debounces a single
@@ -556,26 +651,54 @@ main() {
       _write_critical_sustain "$pending"
       if _sustain_confirmed "$pending" "$CRITICAL_MAIL_SUSTAIN"; then
         log "CRITICAL sustain confirmed (${pending}/${CRITICAL_MAIL_SUSTAIN} consecutive cycles) — mailing Mayor"
+        # ga-sfj3i.3: same exhaustive four-way split as the short `diagnosis`
+        # above, expanded to a full paragraph for the durable mail channel.
+        # Opposite remedies (file cleanup vs reduce RAM pressure) must never
+        # produce the same paragraph — that was the bug this bead exists to
+        # fix (item 3).
+        local diagnosis_detail
+        if [ "$vm_bound" = "1" ]; then
+          diagnosis_detail="File-based reclaim (dolt-cleanup + scratchpad/transcript reaping) returned
+essentially 0 bytes this cycle (avail ${avail_before}GB -> ${avail}GB) while ${vm_gb}GB sits in
+macOS virtual memory (/System/Volumes/VM, same APFS container as this data-dir). That space is
+NOT visible to du (root-owned, outside the user tree) and will NOT be freed by this guard's
+reclaim levers or by any du-guided cleanup — it only shrinks when RAM pressure drops or on
+reboot. The only lever left is reducing RAM pressure (see the RSS listing below)."
+        elif [ -z "$reclaimed_gb" ]; then
+          diagnosis_detail="Could not measure how much the file-based reclaim levers freed this
+cycle (the post-reclaim df read failed). vm_swap is ${vm_gb:-also unmeasured}GB. Investigate
+manually (df -h, du -sh on shared/data and .gc/logs)."
+        elif [ "$reclaimed_gb" -gt 0 ]; then
+          diagnosis_detail="File cleanup worked: file-based reclaim (dolt-cleanup + scratchpad/
+transcript reaping) recovered ${reclaimed_gb}GB this cycle (avail ${avail_before}GB -> ${avail}GB)
+— a file-fillable event, not a virtual-memory one. vm_swap is currently ${vm_gb:-an unmeasured amount}GB
+(below the ${VM_SIGNIFICANT_GB}GB significance threshold, or unmeasured) and is not implicated here."
+        else
+          diagnosis_detail="File-based reclaim returned essentially 0 bytes this cycle (avail
+${avail_before}GB -> ${avail}GB) but vm_swap (${vm_gb:-unmeasured}GB) is below the
+${VM_SIGNIFICANT_GB}GB significance threshold too — neither known cause explains this reading.
+Investigate manually (df -h, du -sh on shared/data and .gc/logs)."
+        fi
         # NOTE: deliberately NOT a heredoc — bash 3.2 (macOS system /bin/bash, what
         # launchd invokes per the plist) mis-parses a heredoc nested inside a $(...)
         # command substitution when the body contains an apostrophe (confirmed by
         # direct repro on this machine). A plain multi-line double-quoted assignment
         # has no such bug and is otherwise equivalent.
         local mail_body="dolt-disk-floor-guard: Dolt data-dir hit CRITICAL floor (<= ${FLOOR_CRITICAL_GB}GB) for ${pending} consecutive cycles.
-Safe reclaim (gc dolt-cleanup --force) and dead-session scratchpad cleanup were already attempted -
-avail is now ${avail}GB (post-reclaim, currently classified ${class}). This is the same class of
-event that killed the HQ Dolt server on 2026-07-14 (ga-vs55): a full disk hitting Dolt
-mid-journal-write. Recommend checking what is consuming space now (df -h, du -sh on shared/data
-and .gc/logs) even if the current reading looks recovered — CRITICAL persisted across multiple
-cycles and could recur.
+Safe reclaim (gc dolt-cleanup --force), dead-session scratchpad cleanup, and dead-session
+transcript cleanup were already attempted this cycle. This is the same class of event that
+killed the HQ Dolt server on 2026-07-14 (ga-vs55): a full disk hitting Dolt mid-journal-write.
+CRITICAL persisted across multiple cycles and could recur even if the current reading looks
+recovered.
 
-Additionally, ${vm_gb:-an unmeasured amount}GB of this host's disk is currently resident in
-macOS virtual memory (/System/Volumes/VM, same APFS container as this data-dir). That space is
-NOT visible to du (root-owned, outside the user tree the du -sh above will scan) and will NOT be
-freed by this guard's reclaim levers or by any du-guided cleanup - it only shrinks on reboot.
-Treat it as a known non-recoverable floor consumer, not as an explanation for this specific
-CRITICAL event by itself (see ga-sfj3i.2 for the measurement and the Mayor's own follow-up
-falsifying a broader causal claim against 40 days of this guard's history)."
+DIAGNOSIS (ga-sfj3i.3): ${diagnosis}. ${diagnosis_detail}
+
+Top 5 processes by resident memory (PID  RSS_KB  COMMAND), for an informed decision on what to
+bring down if RAM pressure is the lever (this guard never kills anything itself):
+${top_rss:-  (unmeasured — ps produced no rows)}
+
+(ga-sfj3i.2 measured the vm_swap<->disk correlation and the Mayor's own follow-up falsified a
+broader causal claim against 40 days of this guard's history — see that bead for the raw numbers.)"
         "$GC" mail send mayor -s "Dolt disk-floor CRITICAL: avail=${avail}GB" -m "$mail_body" 2>/dev/null || log "WARN: gc mail send mayor failed"
       else
         log "CRITICAL sample ${pending}/${CRITICAL_MAIL_SUSTAIN} — PENDING, not yet mailing Mayor (single-cycle dip may self-recover; notify above already fired unconditionally)"

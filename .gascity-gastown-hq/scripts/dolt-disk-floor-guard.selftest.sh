@@ -100,6 +100,69 @@ _sustain_confirmed "" 2  && bad "sustain_confirmed: empty pending should fail CL
 _sustain_confirmed abc 2 && bad "sustain_confirmed: non-numeric pending should fail CLOSED"              || ok "sustain_confirmed: non-numeric pending → fails closed"
 _sustain_confirmed 1 1   && ok "sustain_confirmed: threshold=1 (sustain disabled/immediate) → confirmed on 1st sample" || bad "sustain_confirmed: 1>=1 should confirm"
 
+# ── _top_rss_processes: real ps/sort parsing (NOT stubbed — proves the
+#    pid,rss,comm/-k2 sort matches this machine's actual `ps` output format,
+#    same rationale as the _avail_gb(/tmp) and _vm_swap_gb() real tests
+#    above; ga-sfj3i.3 item 4) ────────────────────────────────────────────
+g="$(_top_rss_processes 5)"
+line_count="$(printf '%s\n' "$g" | grep -c .)"
+[ "$line_count" -eq 5 ] && ok "_top_rss_processes(5) returns exactly 5 lines" || bad "_top_rss_processes(5) returned $line_count lines (expected 5): $g"
+g2="$(_top_rss_processes 2)"
+line_count2="$(printf '%s\n' "$g2" | grep -c .)"
+[ "$line_count2" -eq 2 ] && ok "_top_rss_processes(2) respects the N argument" || bad "_top_rss_processes(2) returned $line_count2 lines (expected 2)"
+# each line: PID RSS_KB COMMAND — first two whitespace fields must be numeric.
+# Guard explicitly on empty output first — a `while read` over an empty
+# variable still iterates once with an empty line, which would otherwise
+# leave bad_line/order_bad at their innocent defaults and PASS vacuously
+# (ga-p5q3: empty must never grade the same as "checked and fine").
+if [ -z "$g" ]; then
+  bad_line="(no output — cannot check shape)"
+else
+  bad_line=""
+  while IFS= read -r ln; do
+    pid_f="$(printf '%s' "$ln" | awk '{print $1}')"
+    rss_f="$(printf '%s' "$ln" | awk '{print $2}')"
+    case "$pid_f" in ''|*[!0-9]*) bad_line="$ln" ;; esac
+    case "$rss_f" in ''|*[!0-9]*) bad_line="$ln" ;; esac
+  done <<RSS_SHAPE
+$g
+RSS_SHAPE
+fi
+[ -z "$bad_line" ] && ok "_top_rss_processes: every line has numeric PID + RSS_KB as its first two fields" || bad "_top_rss_processes: non-numeric PID/RSS or no output: '$bad_line'"
+# descending order: field 2 (RSS) must be non-increasing line-to-line
+if [ -z "$g" ]; then
+  order_bad=1
+else
+  prev_rss=""
+  order_bad=0
+  while IFS= read -r ln; do
+    rss_f="$(printf '%s' "$ln" | awk '{print $2}')"
+    if [ -n "$prev_rss" ] && [ "$rss_f" -gt "$prev_rss" ]; then order_bad=1; fi
+    prev_rss="$rss_f"
+  done <<RSS_ORDER
+$g
+RSS_ORDER
+fi
+[ "$order_bad" -eq 0 ] && ok "_top_rss_processes: rows sorted by RSS descending" || bad "_top_rss_processes: rows NOT sorted descending by RSS (or no output)"
+
+# ── _top_rss_processes: ps failure → "" (surfaces as unmeasured, never a
+#    silent empty-looking-like-zero-processes — same ga-p5q3 discipline) ────
+ps() { echo "not process output"; }
+g="$(_top_rss_processes 5 | grep -c .)"
+unset -f ps
+[ "$g" -eq 0 ] && ok "_top_rss_processes: unparseable ps output → no rows (failure surfaces as empty, not fabricated rows)" || bad "_top_rss_processes(ps failure) got $g rows (expected 0)"
+
+# ── _vm_bound_pressure: reclaimed<=0 AND vm>=threshold → VM-bound (the exact
+#    ga-sfj3i incident shape: "reclaim OK — avail X -> X" while GB are stuck
+#    in virtual memory) ──────────────────────────────────────────────────
+_vm_bound_pressure 0 5 2   && ok "vm_bound: reclaimed=0, vm=5>=2 → VM-bound"                      || bad "vm_bound 0/5/2 should be true"
+_vm_bound_pressure -3 5 2  && ok "vm_bound: reclaimed=-3 (worse), vm=5>=2 → VM-bound"              || bad "vm_bound -3/5/2 should be true"
+_vm_bound_pressure 0 2 2   && ok "vm_bound: vm==threshold → VM-bound (boundary inclusive)"         || bad "vm_bound 0/2/2 should be true (inclusive boundary)"
+_vm_bound_pressure 5 5 2   && bad "vm_bound: reclaimed=5 (cleanup worked) should NOT be VM-bound"  || ok "vm_bound: positive reclaim → not VM-bound"
+_vm_bound_pressure 0 1 2   && bad "vm_bound: vm=1 below threshold=2 should NOT be VM-bound"        || ok "vm_bound: vm below threshold → not VM-bound"
+_vm_bound_pressure 0 "" 2  && bad "vm_bound: unmeasurable vm should NEVER confirm VM-bound"        || ok "vm_bound: empty vm → not VM-bound (unmeasurable, not false-negative-as-fine)"
+_vm_bound_pressure 0 abc 2 && bad "vm_bound: non-numeric vm should NEVER confirm VM-bound"         || ok "vm_bound: non-numeric vm → not VM-bound"
+
 echo ""
 echo "=== _reap_dead_scratch: production sentinel wiring (ga-h565g) ==="
 # _reap_dead_scratch is the REAL caller scratchpad-reaper.sh's own header
@@ -380,6 +443,12 @@ _avail_gb() {
 # a fixed, known value lets the log-line assertion below (Scenario A) check
 # the EXACT logged number instead of merely "some number" (ga-sfj3i.2).
 _vm_swap_gb() { echo "7"; }
+# _top_rss_processes is real, hermetic (ps -Ao pid,rss,comm, read-only,
+# already proven correct in isolation above) but STUBBED here anyway so
+# main()-scenario assertions on log/mail content don't depend on this
+# host's actual process table at test time — same rationale as the
+# _vm_swap_gb stub immediately above (ga-sfj3i.3).
+_top_rss_processes() { printf '%s\n' "51664 1925776 dolt" "11357 253072 claude"; }
 
 # _safe_reclaim's own mechanics (gc dolt-cleanup --force, health probe) are
 # EXECUTION code out of scope for this file (see section banner above) —
@@ -413,27 +482,42 @@ _reap_dead_transcripts() { REAP_TRANSCRIPT_CALLS=$((REAP_TRANSCRIPT_CALLS+1)); }
 REAP_LOGS_CALLS=0
 _reap_growing_logs() { REAP_LOGS_CALLS=$((REAP_LOGS_CALLS+1)); }
 
-NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""
+NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""
 record_notify() {
   NOTIFY_CALLS=$((NOTIFY_CALLS+1))
   while [ $# -gt 0 ]; do
     case "$1" in
       -p) NOTIFY_LAST_PRIO="$2"; shift 2 ;;
-      *) shift ;;
+      # ga-sfj3i.3: capture the message text too (last positional arg wins,
+      # same loop shape as before — -t's title value passes through here
+      # too, but the actual message is genuinely the LAST token processed).
+      *) NOTIFY_LAST_MSG="$1"; shift ;;
     esac
   done
 }
 # shellcheck disable=SC2034  # read by main() in the sourced script
 NOTIFY=record_notify
 
-GC_MAIL_CALLS=0
+GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""
 record_gc() {
-  [ "$1" = "mail" ] && [ "$2" = "send" ] && GC_MAIL_CALLS=$((GC_MAIL_CALLS+1))
+  if [ "$1" = "mail" ] && [ "$2" = "send" ]; then
+    GC_MAIL_CALLS=$((GC_MAIL_CALLS+1))
+    GC_MAIL_LAST_BODY=""
+    shift 2
+    # ga-sfj3i.3: capture the -m body too, so scenarios can assert on the
+    # actual diagnosis/RSS content mailed to the Mayor, not just the count.
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -m) GC_MAIL_LAST_BODY="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+  fi
 }
 # shellcheck disable=SC2034  # read by main() in the sourced script
 GC=record_gc
 
-reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; GC_MAIL_CALLS=0; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; }
+reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; }
 seed_state() {
   if [ -n "$1" ]; then echo "$1" > "$STATE_EPOCH_FILE"; else rm -f "$STATE_EPOCH_FILE"; fi
   if [ -n "$2" ]; then echo "$2" > "$STATE_AVAIL_FILE"; else rm -f "$STATE_AVAIL_FILE"; fi
@@ -548,6 +632,94 @@ if [ "$NOTIFY_CALLS" = "0" ] && [ "$GC_MAIL_CALLS" = "0" ]; then
 else
   bad "main(): non-critical WARN->NONE early-return regressed (notify_calls=$NOTIFY_CALLS mail_calls=$GC_MAIL_CALLS)"
 fi
+
+echo ""
+echo "=== main(): VM-bound vs file-bound diagnosis (ga-sfj3i.3) ==="
+# WHY: the real incident this bead exists for — the 4 reclaim levers ran,
+# reclaimed ~0 bytes, and the guard said "reclaim OK — avail X -> X" while
+# 15GB sat in /System/Volumes/VM. These scenarios prove the alert now
+# distinguishes "cleanup will help" from "cleanup cannot help" instead of
+# emitting the same text either way. Default VM_SIGNIFICANT_GB=2 throughout
+# (not overridden).
+
+# Scenario G — VM-bound CRITICAL: reclaim achieves nothing (2GB -> 2GB) AND
+# vm_swap (stubbed 7GB, well above the 2GB threshold) is significant. Must
+# say explicitly that cleanup will not help and name the GB figure — the
+# bead's own item 2 wording.
+reset_capture; seed_state "" ""; seed_critical_sustain 1
+queue_avail 2 2
+main
+if [ "$NOTIFY_CALLS" = "1" ] && [ "$NOTIFY_LAST_PRIO" = "5" ]; then
+  ok "main(): VM-bound CRITICAL still notifies unconditionally (prio 5)"
+else
+  bad "main(): VM-bound CRITICAL notify wrong (notify_calls=$NOTIFY_CALLS prio=$NOTIFY_LAST_PRIO)"
+fi
+case "$NOTIFY_LAST_MSG" in
+  *"will NOT resolve"*"7GB"*) ok "main(): VM-bound notify message states cleanup will not resolve it, with the GB figure" ;;
+  *) bad "main(): VM-bound notify message missing the explicit non-resolution statement — got: $NOTIFY_LAST_MSG" ;;
+esac
+if [ "$GC_MAIL_CALLS" = "1" ]; then
+  case "$GC_MAIL_LAST_BODY" in
+    *"will NOT resolve"*"reducing RAM pressure"*"51664 1925776 dolt"*)
+      ok "main(): VM-bound mail body states the RAM-pressure-only remedy AND includes the top-RSS listing" ;;
+    *)
+      bad "main(): VM-bound mail body missing diagnosis and/or RSS listing — got: $(printf '%s' "$GC_MAIL_LAST_BODY" | tr '\n' ';' | cut -c1-400)" ;;
+  esac
+else
+  bad "main(): expected VM-bound CRITICAL (sustain already 1) to confirm and mail this cycle, GC_MAIL_CALLS=$GC_MAIL_CALLS"
+fi
+if grep -q "diagnosis:.*VM-bound\|diagnosis:.*NOT resolve" "$LOG" 2>/dev/null; then
+  ok "main(): VM-bound diagnosis is logged for the permanent record"
+else
+  bad "main(): no VM-bound diagnosis line found in LOG"
+fi
+
+# Scenario H — file-bound CRITICAL: reclaim actually recovers a lot (2GB ->
+# 20GB) while vm_swap is stubbed low (1GB, below the 2GB threshold). Must
+# credit file cleanup, NOT claim virtual memory is the blocker — opposite
+# remedies must not produce the same message (bead item 3).
+reset_capture; seed_state "" ""; seed_critical_sustain 1
+_vm_swap_gb() { echo "1"; }
+queue_avail 2 20
+main
+_vm_swap_gb() { echo "7"; }   # restore default stub for later scenarios
+case "$NOTIFY_LAST_MSG" in
+  *"will NOT resolve"*) bad "main(): file-bound case wrongly claimed VM is the blocker — got: $NOTIFY_LAST_MSG" ;;
+  *"recovered 18GB"*)   ok "main(): file-bound notify message credits file cleanup with the actual GB recovered" ;;
+  *) bad "main(): file-bound notify message missing the recovered-GB framing — got: $NOTIFY_LAST_MSG" ;;
+esac
+case "$GC_MAIL_LAST_BODY" in
+  *"will NOT resolve"*) bad "main(): file-bound mail body wrongly used the VM-bound framing" ;;
+  *"cleanup worked"*)   ok "main(): file-bound mail body uses the file-cleanup-worked framing, not the VM one" ;;
+  *) bad "main(): file-bound mail body missing the cleanup-worked framing — got: $(printf '%s' "$GC_MAIL_LAST_BODY" | tr '\n' ';' | cut -c1-400)" ;;
+esac
+
+# Scenario I — unresolved CRITICAL: reclaim achieves nothing (2GB -> 2GB) AND
+# vm_swap (1GB) is below the significance threshold too. Neither known cause
+# applies — must say so honestly rather than guessing one of the two.
+reset_capture; seed_state "" ""; seed_critical_sustain 1
+_vm_swap_gb() { echo "1"; }
+queue_avail 2 2
+main
+_vm_swap_gb() { echo "7"; }   # restore default stub for later scenarios
+case "$NOTIFY_LAST_MSG" in
+  *"will NOT resolve"*|*"recovered"*) bad "main(): unresolved case wrongly claimed a specific known cause — got: $NOTIFY_LAST_MSG" ;;
+  *"cause not identified"*)           ok "main(): unresolved case honestly states neither known cause applies" ;;
+  *) bad "main(): unresolved notify message missing the honest-unknown framing — got: $NOTIFY_LAST_MSG" ;;
+esac
+
+# Scenario J — reclaim effect UNMEASURABLE (post-reclaim df read itself
+# fails, e.g. a transient df hiccup): must say "could not measure", never
+# silently fall back to claiming either specific cause on fabricated data
+# (ga-p5q3 discipline extended to this new diagnosis).
+reset_capture; seed_state "" ""; seed_critical_sustain 1
+queue_avail 2   # only ONE reading queued — the post-reclaim _avail_gb call empties the queue and returns ""
+main
+case "$NOTIFY_LAST_MSG" in
+  *"will NOT resolve"*|*"recovered"*|*"cause not identified"*) bad "main(): unmeasurable-reclaim case fabricated a specific diagnosis — got: $NOTIFY_LAST_MSG" ;;
+  *"unmeasured"*) ok "main(): unmeasurable post-reclaim reading honestly says so, not a fabricated cause" ;;
+  *) bad "main(): unmeasurable-reclaim notify message missing the honest-unmeasured framing — got: $NOTIFY_LAST_MSG" ;;
+esac
 
 echo ""
 echo "=== main(): scratchpad + transcript reap integration (ga-02pnu, ga-t1ub9) ==="
