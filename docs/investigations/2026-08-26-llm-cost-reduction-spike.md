@@ -123,6 +123,39 @@ foi testado — ficaria como especulação, não medição.
 alguém decidir formalmente se vale o risco de ToS de multi-conta — e isso é uma
 decisão de negócio, não técnica.**
 
+### 2.1 Adendo — Gemini/Codex (correção, não estava no escopo original da
+pesquisa)
+
+Esta história absorveu o escopo do ga-pmiwj ("Gemini/Codex por assinatura",
+fechado como superseded), mas o agente de pesquisa que rodei pra AC1 só cobriu
+GLM/Qwen/Kimi/MiniMax + agregadores — Gemini e Codex/OpenAI NÃO estavam no
+briefing que dei a ele. Percebi o buraco só depois de já ter fechado o ga-pmiwj
+citando isso como coberto — errado, e corrijo aqui em vez de deixar a citação
+errada de pé (a correção foi feita também no comentário do ga-pmiwj).
+
+Checagem rápida (2 buscas, 26/08), suficiente pra não deixar a lacuna aberta:
+
+- **Codex/OpenAI:** mesma forma que os outros 4 — embutido nos planos do
+  ChatGPT (Go $8, Plus $20, Pro $100-200/mês), limite por janela de 5h (Plus:
+  15-280 "tarefas" dependendo do modelo interno; Pro: 5x-20x isso). A CLI do
+  Codex já é um preset registrado no Gas City (confirmado em ga-9oyvj, 06/08).
+  Mesma conclusão esperada dos outros 4: dimensionado pra 1 dev, não pra
+  frota — mas não medi o teto exato do tier Pro/20x em tokens, então isto é
+  uma extrapolação por semelhança de forma, não uma medição direta como os
+  outros 4.
+- **Gemini/Google — achado DIFERENTE dos outros 4, vale registrar:** a
+  assinatura INDIVIDUAL/consumidor pro Gemini Code Assist foi DESCONTINUADA
+  em 18/06/2026 (redirecionada pro produto "Antigravity" — que, por
+  coincidência, já aparece na lista de skills desta sessão). O que sobra é
+  **licenciamento por ASSENTO da Google Cloud** (Standard $19-22,80/assento/
+  mês) — estruturalmente diferente dos outros 4: é desenhado pra escalar
+  por número de assentos comprados, não uma conta única com teto fixo. Isso
+  muda a pergunta de "cabe numa conta?" pra "cabe no orçamento por N
+  assentos?" — mas eu **não tenho o teto de uso por assento** (tokens ou
+  requisições), então não dá pra concluir se compensa. **Fica como pergunta
+  em aberto, não como "não" nem como "sim"** — sinalizando o gap em vez de
+  fingir que medi.
+
 ## 3. AC2 — Self-host compensa?
 
 Pesquisa dedicada (agente separado, 22 chamadas de busca/fetch, todas as fontes
@@ -318,10 +351,17 @@ incidente vira guarda automatizada, o parágrafo de prosa que a registrou pode s
 da doutrina viva. Dono natural: quem mantém essa doutrina, não este bead.
 
 **Não recomendado agora, revisar só se a premissa mudar:**
-- AC1 (multi-conta GLM/Qwen/Kimi/MiniMax): revisar apenas se o crescimento da
-  frota algum dia tornar N×US$740 uma comparação real — decisão de negócio
-  (risco de ToS), não técnica.
+- AC1 (multi-conta GLM/Qwen/Kimi/MiniMax/Codex): revisar apenas se o
+  crescimento da frota algum dia tornar N×US$740 uma comparação real —
+  decisão de negócio (risco de ToS), não técnica.
 - AC2 (self-host): mesma condição de gatilho.
+
+**Pendência real, não fechada (não confundir com "não recomendado"):** o
+licenciamento por assento do Gemini Code Assist (Seção 2.1) tem forma
+estruturalmente diferente dos outros candidatos — eu não tenho o teto de uso
+por assento pra concluir se compensa. Não é "não vale a pena", é "não sei
+ainda". Quem pegar isso a seguir: comece por aí, é o único fio solto deste
+spike com pergunta em aberto real.
 
 ## 7. Gasto registrado
 
