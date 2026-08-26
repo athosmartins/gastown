@@ -44,6 +44,18 @@ trap 'rm -rf "$T" 2>/dev/null || true' EXIT
 FAKE_LABELS_FILE="$T/labels.txt"
 FAKE_LABEL_ADD_FAIL_COUNT=0
 FAKE_SHOW_FAIL=0
+# ga-h48cm gate-feedback: FAKE_SHOW_FAIL is all-or-nothing for the whole call
+# and can't express "try 1's read succeeds, try 2's read errors" — the exact
+# interleaving that exposed the monotonic verified_absent bug. This pair adds
+# per-call control, mirroring FAKE_LABEL_ADD_FAIL_COUNT's countdown shape:
+# FAKE_SHOW_FAIL_AT_CALL=N makes only the Nth `bd show` call (1-indexed) fail;
+# 0 disables it. The counter itself MUST be a file, not a plain variable:
+# `bd ... show ... | jq ...` puts this branch on the left side of a pipe, so
+# bash runs it in a subshell — a variable write there never reaches the
+# parent shell, only a file write does (same reason FAKE_LABELS_FILE below is
+# a file and not a variable).
+FAKE_SHOW_FAIL_AT_CALL=0
+FAKE_SHOW_CALL_FILE="$T/show_call_count"
 
 # Stub `bd` — simulates a single bead's label set via a state file, with a
 # controllable failure mode for `label add` (silently no-ops N times before
@@ -65,7 +77,10 @@ bd() {
       return 0
       ;;
     show)
-      if [ "$FAKE_SHOW_FAIL" = "1" ]; then
+      local _show_call_n
+      _show_call_n=$(( $(cat "$FAKE_SHOW_CALL_FILE" 2>/dev/null || echo 0) + 1 ))
+      echo "$_show_call_n" > "$FAKE_SHOW_CALL_FILE"
+      if [ "$FAKE_SHOW_FAIL" = "1" ] || [ "$_show_call_n" = "$FAKE_SHOW_FAIL_AT_CALL" ]; then
         return 1
       fi
       local labels_json
@@ -206,6 +221,24 @@ contains     "unverified message says COULD NOT VERIFY"            "$UNVERIFIED_
 not_contains "unverified message does NOT claim it failed to apply" "$UNVERIFIED_MSG" "FAILED to apply"
 not_contains "unverified message does NOT claim armed/disabled"     "$UNVERIFIED_MSG" "is now DISABLED"
 not_contains "unverified message does NOT claim confirmed absence"  "$UNVERIFIED_MSG" "COULD NOT ARM THE CIRCUIT-BREAKER"
+
+# ── 11. GATE-FEEDBACK (gate_run=ga-r71og): a try-1 confirmed-absent must ───
+#        NOT survive a try-2 READ ERROR — only the LAST read's outcome may
+#        decide "failed". The reviewer's exact trace: try 1's read succeeds
+#        and finds the label absent (verified_absent=1). Try 2's write may
+#        have actually landed this time, but try 2's OWN read errors (a
+#        second, independent bd/jq hiccup) — whether it landed is genuinely
+#        unknown. The pre-fix code left verified_absent=1 untouched (it is
+#        only ever set, never reset) and confidently echoed "failed" from
+#        try 1's now-stale evidence. It must echo "unverified" instead —
+#        exactly what a read-error-on-the-only-try already produces (see
+#        assertion 7) — because the LAST attempt never confirmed anything.
+echo "── 11. read succeeds+absent on try 1, then ERRORS on try 2 → unverified, not failed (stale absent must not survive a later read error) ──"
+: > "$FAKE_LABELS_FILE"; FAKE_LABEL_ADD_FAIL_COUNT=99; FAKE_SHOW_FAIL=0
+rm -f "$FAKE_SHOW_CALL_FILE"; FAKE_SHOW_FAIL_AT_CALL=2
+eq "try-1 confirmed-absent must not survive try-2's read error" \
+   "$(gate_apply_needs_human "$T" "fake-bead" "")" "unverified"
+FAKE_SHOW_FAIL_AT_CALL=0
 
 echo ""
 echo "──────────────────────────────────────────"

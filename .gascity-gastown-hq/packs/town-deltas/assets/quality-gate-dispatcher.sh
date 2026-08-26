@@ -3545,7 +3545,14 @@ gate_apply_needs_human() {
     bd -C "$city" label add "$bead_id" "gate:needs-human" -q 2>/dev/null || true
     [ -n "$sub" ] && { bd -C "$city" label add "$bead_id" "$sub" -q 2>/dev/null || true; }
     sleep "$GATE_NEEDS_HUMAN_VERIFY_BACKOFF_SECS" 2>/dev/null || true
+    # ga-h48cm gate-feedback: reset every iteration, not just once before the
+    # loop — otherwise a try-1 confirmed-absent survives a try-2 READ ERROR
+    # (verified_absent stays 1 from try 1 because the read-error branch below
+    # never touches it), producing a confident "failed" from an outcome the
+    # LAST attempt never actually confirmed. Only the most recent read may
+    # decide the verdict.
     read_rc=0
+    verified_absent=0
     labels=$(bd -C "$city" show "$bead_id" --json 2>/dev/null \
       | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' 2>/dev/null) || read_rc=$?
     if [ "$read_rc" -eq 0 ]; then
