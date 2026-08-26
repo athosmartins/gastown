@@ -37,6 +37,27 @@ esac
 g="$(_avail_gb "/nonexistent/path/$$/does-not-exist")"
 [ "$g" = "" ] && ok "_avail_gb(nonexistent path) → '' (df failure surfaces, not masked)" || bad "_avail_gb(nonexistent) got: '$g' (expected empty)"
 
+# ── _vm_swap_gb: real du parsing on this host's macOS virtual-memory volume
+#    (NOT stubbed — proves the -k/1024/1024 math against this machine's
+#    actual du output, same rationale as the _avail_gb(/tmp) test above;
+#    ga-sfj3i.2) ─────────────────────────────────────────────────────────────
+g="$(_vm_swap_gb)"
+case "$g" in
+  ''|*[!0-9]*) bad "_vm_swap_gb() did not return an integer (got: '$g')" ;;
+  *) [ "$g" -ge 0 ] && ok "_vm_swap_gb() returns a non-negative integer GB ($g)" || bad "_vm_swap_gb() returned negative: $g" ;;
+esac
+
+# ── _vm_swap_gb: du failure → "" (surfaces as "unknown" in the log line,
+#    never a silent 0 — same ga-p5q3 error/empty discipline as _avail_gb
+#    above). Shadows `du` with a local function for exactly one call
+#    (function lookup wins over PATH in bash) rather than reparameterizing
+#    _vm_swap_gb, since its whole point is one fixed, non-configurable
+#    target path, unlike _avail_gb's optional [path] arg. ───────────────────
+du() { echo "not a number"; }
+g="$(_vm_swap_gb)"
+unset -f du
+[ "$g" = "" ] && ok "_vm_swap_gb() → '' when du output is unparseable (failure surfaces, not masked)" || bad "_vm_swap_gb(du failure) got: '$g' (expected empty)"
+
 # ── _floor_class: NONE / WARN / CRITICAL / UNKNOWN boundaries (warn=8 crit=3) ─────
 [ "$(_floor_class 20 8 3)" = "NONE" ]      && ok "class: 20GB avail, floors(8,3) → NONE"                    || bad "class 20/8/3 wrong: $(_floor_class 20 8 3)"
 [ "$(_floor_class 8  8 3)" = "WARN" ]      && ok "class: avail==warn floor → WARN (boundary inclusive)"     || bad "class 8/8/3 wrong: $(_floor_class 8 8 3)"
@@ -353,6 +374,13 @@ _avail_gb() {
   mv "$AVAIL_QUEUE_FILE.tmp" "$AVAIL_QUEUE_FILE"
   echo "$v"
 }
+# _vm_swap_gb is real, hermetic (du -sk, read-only, already proven correct in
+# isolation above) but STUBBED here anyway so these main()-scenario
+# assertions don't depend on this host's actual VM-swap size at test time —
+# a fixed, known value lets the log-line assertion below (Scenario A) check
+# the EXACT logged number instead of merely "some number" (ga-sfj3i.2).
+_vm_swap_gb() { echo "7"; }
+
 # _safe_reclaim's own mechanics (gc dolt-cleanup --force, health probe) are
 # EXECUTION code out of scope for this file (see section banner above) —
 # stubbed as a no-op here too, same as every other main()-only side effect.
@@ -433,6 +461,11 @@ if [ "$NOTIFY_CALLS" = "1" ] && [ "$NOTIFY_LAST_PRIO" = "5" ] && [ "$GC_MAIL_CAL
   ok "main(): CRITICAL avail fully recovered by reclaim still notifies (prio 5); mail debounced (pending 1/2)"
 else
   bad "main(): CRITICAL->NONE recovery — notify/debounce wrong (notify_calls=$NOTIFY_CALLS prio=$NOTIFY_LAST_PRIO mail_calls=$GC_MAIL_CALLS pending=$(read_critical_sustain_state))"
+fi
+if grep -q "vm_swap_gb=7" "$LOG" 2>/dev/null; then
+  ok "main(): logs vm_swap_gb as its own metric line every cycle, not just on breach (ga-sfj3i.2)"
+else
+  bad "main(): expected a 'vm_swap_gb=7' log line this cycle, log contains: $(tr '\n' ';' < "$LOG" 2>/dev/null | tail -c 300)"
 fi
 
 # Scenario A2 — ga-q4cqr sustain confirm: a SECOND consecutive CRITICAL cycle
@@ -555,6 +588,7 @@ fi
 # above warn on the FIRST read) must take the top early-return and never touch
 # the scratch/transcript dead-session reapers — proves neither reap call got
 # hoisted above the floor check.
+VM_LOG_PRE_COUNT=$(grep -c "vm_swap_gb=" "$LOG" 2>/dev/null || echo 0)
 reset_capture; seed_state "" ""
 queue_avail 20
 main
@@ -562,6 +596,18 @@ if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ]; then
   ok "main(): avail above floor on first read never invokes either dead-session reaper"
 else
   bad "main(): expected zero dead-session reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS"
+fi
+# ga-sfj3i.2: the exact case this acceptance criterion exists for — a cycle
+# that never breaches ANY floor is precisely where the pre-fix guard logged
+# nothing extra at all. Prove the vm_swap_gb line still fires here, by COUNT
+# (not a bare grep -q, since $LOG accumulates across every scenario in this
+# file and Scenario A already put one occurrence in it) — an unconditional
+# line hoisted above the floor check must appear exactly once more.
+VM_LOG_POST_COUNT=$(grep -c "vm_swap_gb=" "$LOG" 2>/dev/null || echo 0)
+if [ "$VM_LOG_POST_COUNT" -eq $(( VM_LOG_PRE_COUNT + 1 )) ]; then
+  ok "main(): vm_swap_gb still logs even when avail never breaches any floor (not silence — ga-sfj3i.2)"
+else
+  bad "main(): vm_swap_gb log line missing on a floor-never-breached cycle (pre=$VM_LOG_PRE_COUNT post=$VM_LOG_POST_COUNT)"
 fi
 
 # Scenario F2 (ga-dnc2m) — UNLIKE the two dead-session reapers just proven

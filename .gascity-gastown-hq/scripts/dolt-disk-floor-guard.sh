@@ -156,6 +156,20 @@ _avail_gb() {
   echo $(( kb / 1024 / 1024 ))
 }
 
+# _vm_swap_gb → integer GB currently resident in macOS virtual memory
+# (/System/Volumes/VM), or "" if unmeasurable (non-macOS host, or the volume
+# is absent). Lives in the SAME APFS container as $DOLTDIR but is root-owned,
+# kernel-managed, grows monotonically within a boot, and is untouched by any
+# of this guard's four reclaim levers — see ga-sfj3i.2. `du -sk` works
+# without sudo: directory listing/size is readable even though individual
+# swapfile *contents* are root-only (mode 0600).
+_vm_swap_gb() {
+  local kb
+  kb="$(du -sk /System/Volumes/VM 2>/dev/null | awk '{print $1}')"
+  case "$kb" in ''|*[!0-9]*) echo ""; return ;; esac
+  echo $(( kb / 1024 / 1024 ))
+}
+
 # _floor_class <avail_gb> <warn_gb> <crit_gb> → NONE|WARN|CRITICAL|UNKNOWN.
 # UNKNOWN (empty/non-numeric avail_gb, e.g. df failed) is NEVER silently treated as
 # NONE — a failed read must fail LOUD, not collapse into "no problem" (ga-p5q3:
@@ -457,6 +471,16 @@ main() {
   now=$(date +%s)
   class="$(_floor_class "$avail" "$FLOOR_WARN_GB" "$FLOOR_CRITICAL_GB")"
 
+  # ga-sfj3i.2: log macOS virtual memory residency as its OWN metric line
+  # EVERY cycle, regardless of class or whether avail was even readable —
+  # an unmeasurable reading must be a logged "unknown", never silence, so
+  # this guard's own log (the same file 40 days of avail-GB history were
+  # mined from for ga-sfj3i.2) carries this consumer as a real, gate-able
+  # line instead of an absence. This space is NOT one of the four reclaim
+  # levers below — it is non-recoverable without a reboot.
+  local vm_gb; vm_gb="$(_vm_swap_gb)"
+  log "vm_swap_gb=${vm_gb:-unknown} (macOS virtual memory, /System/Volumes/VM — same APFS container as \$DOLTDIR, non-recoverable without reboot; ga-sfj3i.2)"
+
   if [ "$class" = "UNKNOWN" ]; then
     log "WARN: could not read avail space for $DOLTDIR (df failed/unparseable) — cannot verify Dolt's disk floor this cycle"
     "$NOTIFY" -t "Dolt disk-floor guard" -p 3 "⚠️ disk-floor guard couldn't read df for Dolt's data dir — check manually" 2>/dev/null || true
@@ -521,7 +545,7 @@ main() {
     local prio=3
     [ "$was_critical" = "1" ] && prio=5
     log "class=${class} was_critical=${was_critical}: avail=${avail}GB (warn=${FLOOR_WARN_GB}GB crit=${FLOOR_CRITICAL_GB}GB) — notifying"
-    "$NOTIFY" -t "Dolt disk-floor guard" -p "$prio" "🚨 [${class}] Dolt data-dir avail=${avail}GB — reclaim attempted. See ga-gpzr." 2>/dev/null || true
+    "$NOTIFY" -t "Dolt disk-floor guard" -p "$prio" "🚨 [${class}] Dolt data-dir avail=${avail}GB (vm_swap=${vm_gb:-?}GB, non-recoverable) — reclaim attempted. See ga-gpzr." 2>/dev/null || true
     if [ "$was_critical" = "1" ]; then
       # ga-q4cqr sustain-guard: require CRITICAL_MAIL_SUSTAIN consecutive
       # CRITICAL cycles before mailing the Mayor — debounces a single
@@ -543,7 +567,15 @@ avail is now ${avail}GB (post-reclaim, currently classified ${class}). This is t
 event that killed the HQ Dolt server on 2026-07-14 (ga-vs55): a full disk hitting Dolt
 mid-journal-write. Recommend checking what is consuming space now (df -h, du -sh on shared/data
 and .gc/logs) even if the current reading looks recovered — CRITICAL persisted across multiple
-cycles and could recur."
+cycles and could recur.
+
+Additionally, ${vm_gb:-an unmeasured amount}GB of this host's disk is currently resident in
+macOS virtual memory (/System/Volumes/VM, same APFS container as this data-dir). That space is
+NOT visible to du (root-owned, outside the user tree the du -sh above will scan) and will NOT be
+freed by this guard's reclaim levers or by any du-guided cleanup - it only shrinks on reboot.
+Treat it as a known non-recoverable floor consumer, not as an explanation for this specific
+CRITICAL event by itself (see ga-sfj3i.2 for the measurement and the Mayor's own follow-up
+falsifying a broader causal claim against 40 days of this guard's history)."
         "$GC" mail send mayor -s "Dolt disk-floor CRITICAL: avail=${avail}GB" -m "$mail_body" 2>/dev/null || log "WARN: gc mail send mayor failed"
       else
         log "CRITICAL sample ${pending}/${CRITICAL_MAIL_SUSTAIN} — PENDING, not yet mailing Mayor (single-cycle dip may self-recover; notify above already fired unconditionally)"

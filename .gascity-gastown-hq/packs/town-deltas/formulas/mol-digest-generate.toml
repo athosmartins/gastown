@@ -369,6 +369,47 @@ as the identical "settled, never recheck" shape its own Incidents/Escalations
 fixes exist to eliminate. If any rig's query fails, say so and report N/A for
 that rig rather than treating a query failure as zero.
 
+d) **Disk — macOS virtual memory floor (ga-sfj3i.2)** — `/System/Volumes/VM`
+(macOS swap) lives in the SAME APFS container as Dolt's data-dir, grows
+monotonically within a boot, and is never reclaimed by any of
+`dolt-disk-floor-guard.sh`'s four levers (kernel-managed, root-owned, and
+outside the `du`-summed user tree — structurally invisible to every other
+disk instrument in this city). Measure it directly (readable without sudo —
+only file *contents* are root-restricted, not directory listing/size):
+```bash
+BOOT_EPOCH=$(sysctl -n kern.boottime | grep -oE '[0-9]+' | head -1)
+NOW_EPOCH=$(date -u +%s)
+UPTIME_H=$(( (NOW_EPOCH - BOOT_EPOCH) / 3600 )); [ "$UPTIME_H" -lt 1 ] && UPTIME_H=1
+VM_KB=$(du -sk /System/Volumes/VM 2>/dev/null | awk '{print $1}')
+DOLT_AVAIL_KB=$(df -k "$CITY/.beads/dolt" 2>/dev/null | awk 'NR==2{print $4}')
+WARN_GB="${DOLT_DISK_FLOOR_WARN_GB:-8}"
+```
+If `VM_KB` or `DOLT_AVAIL_KB` is empty (du/df failed, or this isn't a macOS
+APFS host), report **N/A — could not measure /System/Volumes/VM on this
+host** for the whole subsection, not a zero. Otherwise compute and report:
+```bash
+VM_GB=$(( VM_KB / 1024 / 1024 ))
+DOLT_AVAIL_GB=$(( DOLT_AVAIL_KB / 1024 / 1024 ))
+RATE_GB_PER_H=$(awk -v vm="$VM_GB" -v h="$UPTIME_H" 'BEGIN{printf "%.2f", vm/h}')
+PROJECTION=$(awk -v avail="$DOLT_AVAIL_GB" -v warn="$WARN_GB" -v rate="$RATE_GB_PER_H" 'BEGIN{
+  if (rate<=0) { print "stable — no VM growth this boot" }
+  else if (avail<=warn) { print "already at/below floor" }
+  else { printf "~%.0fh at the average VM growth pace since boot", (avail-warn)/rate }
+}')
+```
+Report uptime (`UPTIME_H`h since boot), `VM_GB`GB resident, and
+`PROJECTION`. **Label the projection exactly as conditional** — it is VM's
+OWN average growth in isolation since boot, extrapolated flat. It does
+**NOT** explain or predict the city's actual ~2x/week disk-crisis cadence:
+the Mayor's own follow-up on this bead (see `ga-sfj3i.2`'s comments)
+falsified that broader causal claim against 40 days of the guard's own
+history — total available space swings tens of GB from a separate, still-
+unattributed source (see `ga-lc17m`). Report this projection as one known,
+monotonic, non-recoverable-until-reboot floor consumer — never as a forecast
+of the next CRITICAL event, and never propose a reboot-policy recommendation
+here (explicitly suspended on `ga-sfj3i.2` until that separate oscillation is
+attributed).
+
 Close this step when all data is collected."""
 
 [[steps]]
@@ -400,6 +441,13 @@ Transform data into a formatted digest and deliver it.
 ## Agent Health
 - Agents started/stopped/crashed: N/N/N
 - Warrants filed: N (pardoned: X, executed: Y)
+
+## Disk — macOS virtual memory (ga-sfj3i.2)
+- Uptime: Nh (boot: <UTC timestamp>)
+- VM swap resident: NGB — non-recoverable without reboot, same APFS
+  container as Dolt's data-dir
+- Projected time to WARN floor at the average VM growth pace since boot:
+  ~NH (or "stable", or "N/A — <reason>")
 
 ## Trends
 - Backlog: increasing / stable / decreasing
