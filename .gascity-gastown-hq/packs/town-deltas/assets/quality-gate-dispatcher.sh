@@ -3530,12 +3530,20 @@ branch_bead_commit_verdict() {
 #      the non-zero return served no purpose except to be a landmine — fixed
 #      by returning 0 unconditionally and moving the entire verdict into the
 #      echoed string, which is the only thing any caller ever reads anyway.
+#   4. (gate-feedback, gate_run=ga-r71og) defect 2's own fix was itself
+#      monotonic: verified_absent was only ever SET across the two tries,
+#      never reset, so a try-1 confirmed-absent read could survive an
+#      INDEPENDENT try-2 read error untouched and still echo "failed" — the
+#      exact false-negative this helper exists to prevent, one level deeper
+#      in the same fix. Only the LAST attempt's read outcome may decide the
+#      verdict; see the reset inside the loop body below.
 # Fixed by (1) a real sleep between write→reread and between the two tries,
 # (2) tracking the read pipe's own exit status so a read error is reported
-# as "unverified", never silently promoted to "failed", and (3) always
-# returning 0. gate_needs_human_clause() below carries a matching third
-# message so the bead-facing text never asserts "did not arm" when the truth
-# is "could not check".
+# as "unverified", never silently promoted to "failed", (3) always
+# returning 0, and (4) resetting that tracking every iteration so a stale
+# result from an earlier try can never outlive a later one. gate_needs_human_clause()
+# below carries a matching third message so the bead-facing text never
+# asserts "did not arm" when the truth is "could not check".
 GATE_NEEDS_HUMAN_VERIFY_BACKOFF_SECS="${GATE_NEEDS_HUMAN_VERIFY_BACKOFF_SECS:-1}"
 case "$GATE_NEEDS_HUMAN_VERIFY_BACKOFF_SECS" in ''|*[!0-9]*) GATE_NEEDS_HUMAN_VERIFY_BACKOFF_SECS=1 ;; esac
 gate_apply_needs_human() {
