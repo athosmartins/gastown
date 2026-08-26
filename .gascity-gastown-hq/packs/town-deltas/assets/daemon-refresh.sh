@@ -33,11 +33,28 @@
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
 #
+# PROOF (ga-vmq1i): VERDICT=OK/SKIPPED collapses two very different situations
+# — "we positively confirmed a live daemon came up fresh" and "we never
+# actually confirmed anything is running the new code" — into the same green
+# light. The caller used to phrase BOTH as "deployed + verified in prod",
+# which is a false claim for the second case. PROOF disambiguates:
+#   verified       — a live daemon was restarted AND confirmed to start after
+#                     DEPLOY_EPOCH. The only value that earns "verified".
+#   not_applicable — structurally certain there was nothing live to verify
+#                     (no source changed, no rig daemons exist at all, or the
+#                     only daemon(s) tied to the change have no live PID to
+#                     begin with — e.g. a scheduled job, not a dormant one).
+#   not_verified   — everything else: environment prevented checking (not a
+#                     git work tree), or changed code could not be confidently
+#                     tied to any live daemon by this script's (documented,
+#                     single-hop) detection — which is NOT the same as
+#                     confidently ruled out. Default when unset — fail closed.
+#
 # Output: machine-readable key=value lines + a trailing JSON object on STDOUT;
 # all human logging goes to STDERR.
 #   VERDICT=OK|SKIPPED|VERIFY_FAILED|NEEDS_GUARDED_RESTART
 #   AFFECTED=<labels>   RESTARTED=<labels>   FRESH_FAIL=<labels>   GUARDED=<labels>
-#   REASON=<text>
+#   REASON=<text>   PROOF=verified|not_applicable|not_verified
 # Exit 0 when VERDICT is OK/SKIPPED (or DRY_RUN=1); non-zero otherwise.
 #
 # Inputs (env):
@@ -73,23 +90,24 @@ VERIFY_INTERVAL="${VERIFY_INTERVAL:-1}"
 log() { echo "[daemon-refresh] $*" >&2; }
 
 # ── emit result + exit ────────────────────────────────────────────────────────
-emit() {  # emit <verdict> <reason>
-  local verdict="$1" reason="$2"
+emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified — fail closed)
+  local verdict="$1" reason="$2" proof="${3:-not_verified}"
   echo "VERDICT=$verdict"
   echo "AFFECTED=${AFFECTED:-}"
   echo "RESTARTED=${RESTARTED:-}"
   echo "FRESH_FAIL=${FRESH_FAIL:-}"
   echo "GUARDED=${GUARDED:-}"
   echo "REASON=$reason"
+  echo "PROOF=$proof"
   # Trailing JSON for the caller's bead comment / jsonl log.
-  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" <<'PY' 2>/dev/null || true
+  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" <<'PY' 2>/dev/null || true
 import json, sys
-v, reason, aff, res, ff, gd = sys.argv[1:7]
+v, reason, aff, res, ff, gd, proof = sys.argv[1:8]
 sp = lambda s: [x for x in s.split() if x]
 print("JSON=" + json.dumps({
     "verdict": v, "reason": reason,
     "affected": sp(aff), "restarted": sp(res),
-    "fresh_fail": sp(ff), "guarded": sp(gd),
+    "fresh_fail": sp(ff), "guarded": sp(gd), "proof": proof,
 }))
 PY
   if [ "$DRY_RUN" = "1" ]; then exit 0; fi
@@ -101,11 +119,11 @@ AFFECTED=""; RESTARTED=""; FRESH_FAIL=""; GUARDED=""
 # ── preconditions ─────────────────────────────────────────────────────────────
 if [ -z "$RUNTIME_DIR" ] || ! git -C "$RUNTIME_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   log "runtime '$RUNTIME_DIR' is not a git work tree — skip (static daemon_restarts still apply)."
-  emit SKIPPED "runtime not a git work tree"
+  emit SKIPPED "runtime not a git work tree" not_verified
 fi
 if [ -z "$PRE_DEPLOY_SHA" ] || [ -z "$POST_DEPLOY_SHA" ] || [ "$PRE_DEPLOY_SHA" = "$POST_DEPLOY_SHA" ]; then
   log "no SHA delta ($PRE_DEPLOY_SHA .. $POST_DEPLOY_SHA) — deploy changed nothing — skip."
-  emit SKIPPED "no source change in deploy"
+  emit SKIPPED "no source change in deploy" not_applicable
 fi
 
 # ── Step 1: changed files in this deploy ──────────────────────────────────────
@@ -114,7 +132,7 @@ CHANGED_PY="$(echo "$CHANGED" | grep -E '\.py$' || true)"
 CHANGED_TEMPLATES="$(echo "$CHANGED" | grep -E '\.(html|htm|jinja2?|j2)$' || true)"
 if [ -z "$CHANGED_PY" ] && [ -z "$CHANGED_TEMPLATES" ]; then
   log "deploy changed no *.py or template files — no daemon code affected — OK."
-  emit OK "no python source or template changed"
+  emit OK "no python source or template changed" not_applicable
 fi
 log "changed python files:"; echo "$CHANGED_PY" | sed 's/^/[daemon-refresh]   /' >&2
 log "changed template files:"; echo "$CHANGED_TEMPLATES" | sed 's/^/[daemon-refresh]   /' >&2
@@ -202,7 +220,7 @@ shopt -u nullglob
 
 if [ -z "${DAEMON_LABELS// /}" ]; then
   log "no rig daemons discovered under $LAUNCH_AGENTS_DIR for runtime $RUNTIME_DIR — OK (nothing to refresh)."
-  emit OK "no rig daemons discovered"
+  emit OK "no rig daemons discovered" not_applicable
 fi
 
 # precompute changed basenames + stems for matching
@@ -290,8 +308,14 @@ done
 
 AFFECTED="$(echo "$AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
 if [ -z "${AFFECTED// /}" ]; then
+  # ga-vmq1i: py/template files DID change but detection (single-hop entrypoint
+  # scan — see the import-level/template-level comments above) tied them to no
+  # live daemon. That is NOT the same certainty as "nothing daemon-relevant
+  # changed" (the earlier not_applicable emits) — it may be a real non-issue,
+  # or it may be exactly the blind spot the detection comments already flag.
+  # Report not_verified so the caller never claims this was confirmed live.
   log "no running daemon is affected by the changed code — OK."
-  emit OK "changed code touches no live daemon"
+  emit OK "changed code touches no live daemon" not_verified
 fi
 
 # ── Step 4: restart (safe) / flag (sensitive) + verify freshness ──────────────
@@ -368,9 +392,18 @@ GUARDED="$(echo "$GUARDED" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ 
 
 # ── Step 5: verdict ───────────────────────────────────────────────────────────
 if [ -n "${FRESH_FAIL// /}" ]; then
-  emit VERIFY_FAILED "restarted daemon(s) did not come up fresh:${FRESH_FAIL}"
+  emit VERIFY_FAILED "restarted daemon(s) did not come up fresh:${FRESH_FAIL}" not_verified
 elif [ -n "${GUARDED// /}" ]; then
-  emit NEEDS_GUARDED_RESTART "sensitive hot-path daemon(s) need a guarded restart:${GUARDED}"
+  emit NEEDS_GUARDED_RESTART "sensitive hot-path daemon(s) need a guarded restart:${GUARDED}" not_verified
+elif [ -n "${RESTARTED// /}" ]; then
+  emit OK "all affected daemons restarted + verified fresh:${RESTARTED}" verified
 else
-  emit OK "all affected daemons restarted + verified fresh:${RESTARTED}"
+  # ga-vmq1i: AFFECTED was non-empty, but every affected daemon was skipped for
+  # having no live PID (a scheduled/one-shot job, per the Step-4 loop above) —
+  # RESTARTED is empty, so nothing was actually restarted or confirmed fresh.
+  # The pre-fix code emitted this exact case as "...restarted + verified
+  # fresh:" with a literally empty list, which is the concrete false-positive
+  # ga-vmq1i reports. Nothing live exists to be stale, so not_applicable —
+  # never "verified".
+  emit OK "no affected daemon currently running — nothing live to refresh" not_applicable
 fi

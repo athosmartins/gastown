@@ -16,6 +16,11 @@
 #      render_template(...) marks it affected even with zero *.py changes (the
 #      ga-jkj0 scenario — Jinja templates are cached in-process). An unrelated
 #      template change (not referenced by any daemon) stays OK, no restart.
+#   7. (ga-vmq1i) Emits a PROOF=verified|not_applicable|not_verified field
+#      distinguishing a POSITIVE restart+fresh confirmation from a VERDICT=OK/
+#      SKIPPED that never actually confirmed anything live is running the new
+#      code — the caller (story-delivery.sh) must never say "verified in prod"
+#      on anything but PROOF=verified.
 #
 # All external effects (launchctl, ps) are injected via LAUNCHCTL_BIN / PS_BIN
 # and a mock state dir, so the test touches NO real daemons. The plist scan and
@@ -173,6 +178,9 @@ V=$(field VERDICT "$OUT")
 [ "$V" = "OK" ] && ok "T1 verdict OK on no daemon change" || nok "T1 verdict" "got '$V' rc=$RC out=[$OUT]"
 [ "$RC" -eq 0 ] && ok "T1 exit 0" || nok "T1 exit" "rc=$RC"
 [ ! -f "$MOCK/kicks.log" ] && ok "T1 no kickstart called" || nok "T1 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+# ga-vmq1i: nothing daemon-relevant changed — a structurally-certain non-issue,
+# not a positive verification. Must NOT claim "verified".
+[ "$(field PROOF "$OUT")" = "not_applicable" ] && ok "T1 PROOF=not_applicable (nothing daemon-relevant changed)" || nok "T1 proof" "got '$(field PROOF "$OUT")'"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T2: affected SAFE dashboard → restarted + fresh → OK
@@ -189,6 +197,9 @@ V=$(field VERDICT "$OUT")
 echo "$(field AFFECTED "$OUT")" | grep -q "com.test.ban-risk-dashboard" && ok "T2 dashboard affected" || nok "T2 affected" "$(field AFFECTED "$OUT")"
 echo "$(field RESTARTED "$OUT")" | grep -q "com.test.ban-risk-dashboard" && ok "T2 dashboard restarted" || nok "T2 restarted" "$(field RESTARTED "$OUT")"
 grep -q "com.test.ban-risk-dashboard" "$MOCK/kicks.log" 2>/dev/null && ok "T2 kickstart invoked" || nok "T2 kickstart" "log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+# ga-vmq1i: a live daemon was actually restarted AND confirmed fresh — the one
+# case that earns the word "verified".
+[ "$(field PROOF "$OUT")" = "verified" ] && ok "T2 PROOF=verified (real restart+fresh confirmed)" || nok "T2 proof" "got '$(field PROOF "$OUT")'"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T3: affected SAFE dashboard, but stays stale after restart → VERIFY_FAILED
@@ -203,6 +214,7 @@ V=$(field VERDICT "$OUT")
 [ "$V" = "VERIFY_FAILED" ] && ok "T3 verdict VERIFY_FAILED" || nok "T3 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -ne 0 ] && ok "T3 non-zero exit (halts delivery)" || nok "T3 exit" "rc=$RC (must be non-zero)"
 echo "$(field FRESH_FAIL "$OUT")" | grep -q "com.test.ban-risk-dashboard" && ok "T3 dashboard in FRESH_FAIL" || nok "T3 fresh_fail" "$(field FRESH_FAIL "$OUT")"
+[ "$(field PROOF "$OUT")" = "not_verified" ] && ok "T3 PROOF=not_verified" || nok "T3 proof" "got '$(field PROOF "$OUT")'"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T4: affected SENSITIVE hot-path daemon → flagged, NOT bounced → NEEDS_GUARDED_RESTART
@@ -222,6 +234,7 @@ V=$(field VERDICT "$OUT")
 [ "$RC" -ne 0 ] && ok "T4 non-zero exit (halts delivery)" || nok "T4 exit" "rc=$RC (must be non-zero)"
 echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" && ok "T4 sensitive daemon flagged GUARDED" || nok "T4 guarded" "$(field GUARDED "$OUT")"
 ! grep -q "com.test.central-sender" "$MOCK/kicks.log" 2>/dev/null && ok "T4 sensitive daemon NOT auto-bounced" || nok "T4 no-bounce" "kickstart was called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+[ "$(field PROOF "$OUT")" = "not_verified" ] && ok "T4 PROOF=not_verified" || nok "T4 proof" "got '$(field PROOF "$OUT")'"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T5: import-level — changed routes/*.py marks the dashboard that imports it
@@ -240,6 +253,7 @@ OUT=$(run_helper routes/channel_admin_api.py); RC=$?
 V=$(field VERDICT "$OUT")
 echo "$(field AFFECTED "$OUT")" | grep -q "com.test.ban-risk-dashboard" && ok "T5 importing dashboard marked affected" || nok "T5 affected" "$(field AFFECTED "$OUT")"
 [ "$V" = "OK" ] && ok "T5 verdict OK after fresh restart" || nok "T5 verdict" "got '$V' out=[$OUT]"
+[ "$(field PROOF "$OUT")" = "verified" ] && ok "T5 PROOF=verified" || nok "T5 proof" "got '$(field PROOF "$OUT")'"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T6: affected daemon is NOT currently running (no PID — e.g. a scheduled job) →
@@ -255,6 +269,14 @@ V=$(field VERDICT "$OUT")
 [ "$RC" -eq 0 ] && ok "T6 exit 0" || nok "T6 exit" "rc=$RC"
 [ ! -f "$MOCK/kicks.log" ] && ok "T6 scheduled/down job NOT kickstarted" || nok "T6 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 echo "$(field RESTARTED "$OUT")" | grep -q "daily-scraper" && nok "T6 should not restart" "restarted=$(field RESTARTED "$OUT")" || ok "T6 not in RESTARTED"
+# ga-vmq1i (THE BUG THIS FIX IS ABOUT): AFFECTED is non-empty here but RESTARTED
+# is empty (the daemon was never running to restart). Before this fix, the
+# fall-through branch unconditionally emitted "all affected daemons restarted
+# + verified fresh:" with a literally EMPTY restarted list — VERDICT=OK with
+# zero daemons actually confirmed fresh, which is exactly the false-positive
+# "verified in prod" claim ga-vmq1i reports. Must be not_applicable (nothing
+# LIVE to verify), never "verified".
+[ "$(field PROOF "$OUT")" = "not_applicable" ] && ok "T6 PROOF=not_applicable (affected daemon not live — nothing to verify, must NOT claim verified)" || nok "T6 proof" "got '$(field PROOF "$OUT")'"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T7: template-only change — a changed *.html a dashboard renders via
@@ -279,6 +301,7 @@ V=$(field VERDICT "$OUT")
 echo "$(field AFFECTED "$OUT")" | grep -q "com.test.map-viewer" && ok "T7 template-rendering dashboard marked affected" || nok "T7 affected" "$(field AFFECTED "$OUT")"
 [ "$V" = "OK" ] && ok "T7 verdict OK after fresh restart" || nok "T7 verdict" "got '$V' out=[$OUT]"
 grep -q "com.test.map-viewer" "$MOCK/kicks.log" 2>/dev/null && ok "T7 kickstart invoked" || nok "T7 kickstart" "log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+[ "$(field PROOF "$OUT")" = "verified" ] && ok "T7 PROOF=verified" || nok "T7 proof" "got '$(field PROOF "$OUT")'"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T8: unrelated template change — a changed *.html NOT referenced by any
@@ -303,6 +326,13 @@ V=$(field VERDICT "$OUT")
 [ "$V" = "OK" ] && ok "T8 verdict OK on unrelated template change" || nok "T8 verdict" "got '$V' out=[$OUT]"
 echo "$(field AFFECTED "$OUT")" | grep -q "com.test.map-viewer" && nok "T8 should not be affected" "$(field AFFECTED "$OUT")" || ok "T8 map-viewer not marked affected"
 [ ! -f "$MOCK/kicks.log" ] && ok "T8 no kickstart called (no cascade)" || nok "T8 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+# ga-vmq1i: a template DID change (CHANGED_TEMPLATES non-empty) but detection
+# tied it to no live daemon. Unlike T1 (structurally certain nothing relevant
+# changed), this is the single-hop-detection blind spot the script's own
+# comments acknowledge (render_template only checked one hop deep) — we
+# cannot be CONFIDENT this is a true negative, so it must read as
+# not_verified, not a confident not_applicable/verified.
+[ "$(field PROOF "$OUT")" = "not_verified" ] && ok "T8 PROOF=not_verified (py/template changed but tied to no live daemon — can't confidently call it N/A)" || nok "T8 proof" "got '$(field PROOF "$OUT")'"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""

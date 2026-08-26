@@ -1458,6 +1458,9 @@ fi
 # mid-run; they are handled by config-drift-watcher + the static daemon_restarts
 # above. Also skipped when runtime_dir is unset.
 REFRESH_HELPER="$GC_CITY/packs/town-deltas/assets/daemon-refresh.sh"
+# ga-vmq1i: fresh on every story in the sweep loop (fail closed) — never let a
+# PRIOR story's REFRESH_PROOF leak into one that takes a skip branch below.
+REFRESH_PROOF="not_verified"
 if [ -z "$RUNTIME_DIR" ] || [ "$RUNTIME_DIR" = "$GC_CITY" ]; then
   log "Daemon refresh skipped — framework/town-root or no runtime_dir (RUNTIME_DIR='$RUNTIME_DIR')."
 elif [ ! -f "$REFRESH_HELPER" ]; then
@@ -1475,7 +1478,18 @@ else
   REFRESH_RESTARTED=$(echo "$REFRESH_OUT" | grep '^RESTARTED=' | head -1 | sed 's/^RESTARTED=//')
   REFRESH_GUARDED=$(echo "$REFRESH_OUT" | grep '^GUARDED=' | head -1 | sed 's/^GUARDED=//')
   REFRESH_FRESHFAIL=$(echo "$REFRESH_OUT" | grep '^FRESH_FAIL=' | head -1 | sed 's/^FRESH_FAIL=//')
-  log "Daemon refresh verdict=$REFRESH_VERDICT restarted=[$REFRESH_RESTARTED] guarded=[$REFRESH_GUARDED] freshfail=[$REFRESH_FRESHFAIL] reason=$REFRESH_REASON"
+  # ga-vmq1i: PROOF disambiguates a positive restart+fresh confirmation from a
+  # VERDICT=OK/SKIPPED that never actually confirmed anything live — fail
+  # closed to not_verified if the helper's output predates this field or is
+  # otherwise unparseable. Unlike VERDICT/REASON/etc. above (always emitted,
+  # so their grep always matches), PROOF may be genuinely absent (an older
+  # daemon-refresh.sh, or a mid-window deploy of one without the other) — under
+  # this script's `set -euo pipefail`, an unmatched grep piped into head/sed
+  # still propagates a non-zero pipeline status and kills the whole sweep, so
+  # the fallback below needs `|| true` here to ever be reached.
+  REFRESH_PROOF=$(echo "$REFRESH_OUT" | grep '^PROOF=' | head -1 | sed 's/^PROOF=//' || true)
+  [ -n "$REFRESH_PROOF" ] || REFRESH_PROOF="not_verified"
+  log "Daemon refresh verdict=$REFRESH_VERDICT restarted=[$REFRESH_RESTARTED] guarded=[$REFRESH_GUARDED] freshfail=[$REFRESH_FRESHFAIL] proof=$REFRESH_PROOF reason=$REFRESH_REASON"
   case "$REFRESH_VERDICT" in
     OK|SKIPPED)
       if [ -n "${REFRESH_RESTARTED// /}" ]; then
@@ -1655,6 +1669,17 @@ else
   PILOT_PREFIX=""
   [ "$PILOT_ORIGIN" = "1" ] && PILOT_PREFIX="🤖 [Pilot] "
 
+  # ga-vmq1i: was the daemon actually serving this deploy ever confirmed live?
+  # Orthogonal to which prod-test path ran below — apply to both branches.
+  # Only "verified" (positive restart+fresh) and "not_applicable" (structurally
+  # nothing live to check) may stay silent; everything else gets an explicit,
+  # queryable label so "delivery:tested" alone can never be read as "daemon
+  # confirmed live" the way the bug's own incident (wa-3dfnw) was misread.
+  case "$REFRESH_PROOF" in
+    verified|not_applicable) : ;;
+    *) bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:daemon-unverified" -q 2>/dev/null || true ;;
+  esac
+
   # UNTESTED terminal success is now NO_HARNESS=1 ONLY (ga-857v FIX 2: a missing
   # story-specific test runs the rig baseline → delivery:tested, handled below).
   if [ "$NO_HARNESS" = "1" ]; then
@@ -1682,6 +1707,16 @@ NOTE: $DONE_NOTE" 2>/dev/null || true
       DONE_TEST_LINE="$PROD_TEST_SCRIPT (STORY_ID=$STORY_ID)"
       DONE_PUSH_TAIL="deployed + tested in prod"
     fi
+    # ga-vmq1i (THE FIX): the prod-test harness passing proves the CODE TREE is
+    # consistent — it says nothing about whether a live daemon is running it.
+    # "deployed + tested in prod" wrongly implied both. Only override wording
+    # when daemon liveness was NOT positively confirmed and there genuinely was
+    # something live to check (not_applicable — e.g. no daemon serves this
+    # change at all — keeps the wording above, since nothing false is claimed).
+    case "$REFRESH_PROOF" in
+      verified|not_applicable) : ;;
+      *) DONE_PUSH_TAIL="deployed (rig harness passed); DAEMON LIVENESS NOT VERIFIED — merged code may still be dormant, see delivery:daemon-unverified" ;;
+    esac
     bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery COMPLETE. story:done (delivery:tested).
 Rig: $RIG
 Deploy: $DEPLOY_CMD
@@ -1723,7 +1758,11 @@ $(refino_criteria_status_line "${MISSING_META:-}")" 2>/dev/null || true
   # now genuinely deployed; stale markers must not linger on a delivered story.
   bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:deploy-pending" -q 2>/dev/null || true
   bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:failed"          -q 2>/dev/null || true
-  DELIVERY_CLOSE_REASON="Story DELIVERED — deployed + verified in prod, story:done (rig $RIG, ${DONE_PUSH_TAIL:-delivered}). Closed by story-delivery (ga-i53ua durable terminal)."
+  # ga-vmq1i: do not hardcode "verified in prod" here — DONE_PUSH_TAIL above is
+  # already the single, accurate source of truth for what was actually
+  # confirmed (including the NOT-verified case); repeating a blanket "verified"
+  # claim in the same sentence would just contradict it.
+  DELIVERY_CLOSE_REASON="Story DELIVERED — story:done (rig $RIG, ${DONE_PUSH_TAIL:-delivered}). Closed by story-delivery (ga-i53ua durable terminal)."
   CLOSE_STATUS_NOW=$(bd -C "$STORY_STORE" show "$STORY_ID" --json 2>/dev/null \
     | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || echo "open")
   if [ "$CLOSE_STATUS_NOW" != "closed" ]; then
