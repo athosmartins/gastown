@@ -91,8 +91,12 @@ case "$1" in
     else [ "${FAKE_GIT_DIFF_EMPTY:-0}" = "1" ] && exit 0 || echo "+++ fake diff +++"; fi
     ;;
   reset) exit 0 ;;
-  commit) [ "${FAKE_GIT_COMMIT_FAIL:-0}" = "1" ] && exit 1; exit 0 ;;
-  push) [ "${FAKE_GIT_PUSH_FAIL:-0}" = "1" ] && exit 1; exit 0 ;;
+  commit)
+    [ "${FAKE_GIT_HOOK_NOISE:-0}" = "1" ] && printf 'OK — 736 plist(s) checked\n\nsome multi-line hook report\nmore lines\n'
+    [ "${FAKE_GIT_COMMIT_FAIL:-0}" = "1" ] && exit 1; exit 0 ;;
+  push)
+    [ "${FAKE_GIT_HOOK_NOISE:-0}" = "1" ] && printf 'pre-push: running plist audit...\n27 plist(s) skipped: unresolvable entrypoint\n'
+    [ "${FAKE_GIT_PUSH_FAIL:-0}" = "1" ] && exit 1; exit 0 ;;
 esac
 EOF
 chmod +x "$GIT_BIN"
@@ -270,6 +274,19 @@ case "$RESULT" in staged-inesperado:*) ok "unexpected extra staged file -> abort
 echo "── _commit_doc: clean single-file diff -> commits and pushes ──"
 RESULT="$(_commit_doc "$DOC_PATH")"
 [ "$RESULT" = "commitado" ] && ok "clean single-file change -> committed" || bad "expected commitado, got '$RESULT'"
+
+echo "── _commit_doc: a hook prints multi-line noise on commit+push -> return channel stays clean ──"
+# Live-caught regression (2026-08-26, real build-time verification run):
+# whatsapp_automation's real pre-push hook prints a multi-line plist-audit
+# report on every push. With commit/push stdout left inherited, that report
+# became PART of commit_result via the caller's $(...) capture, so the
+# `case "$commit_result" in commitado|...)` match failed on the polluted
+# string and a fully successful push got misclassified as a failure -- the
+# summary bead was filed as an open bug ("atencao necessaria") for a run
+# that had nothing wrong with it. This is the exact scenario, reproduced
+# hermetically.
+RESULT="$(FAKE_GIT_HOOK_NOISE=1 _commit_doc "$DOC_PATH")"
+[ "$RESULT" = "commitado" ] && ok "hook noise on commit+push never leaks into the return value" || bad "expected exactly 'commitado', got polluted result: '$RESULT'"
 
 echo "── _commit_doc: empty staged diff -> no-op, not a failure ──"
 RESULT="$(FAKE_GIT_DIFF_EMPTY=1 _commit_doc "$DOC_PATH")"

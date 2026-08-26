@@ -252,24 +252,35 @@ _update_doc_block() {
 # exactly); if that fails (diverged tree) or the staged diff touches
 # anything but $doc, the edit is left uncommitted on disk and this returns
 # non-zero rather than forcing anything.
+#
+# Every git subcommand below redirects its OWN stdout/stderr to $LOG, never
+# left inheriting this function's stdout. Live-verified failure mode
+# (2026-08-26 build-time run): whatsapp_automation's pre-push hook prints a
+# multi-line plist audit report on every push (unrelated to this change, it
+# runs on all pushes) — with inherited stdout, that report became PART OF
+# commit_result via the caller's `$(...)` capture, so the later `case
+# "$commit_result" in commitado|...)` match failed (the captured string was
+# the whole report, not the literal word "commitado"), and a fully successful
+# push got misclassified as a failure. `-q` only silences git's OWN messages,
+# never a hook's.
 _commit_doc() {
   local doc="$1" rel
   [ "$SKIP_GIT" = "1" ] && { echo "git-pulado(SKIP_GIT=1)"; return 0; }
   rel="${doc#"$WA_ROOT"/}"
-  "$GIT_BIN" -C "$WA_ROOT" pull --ff-only >/dev/null 2>&1 || { echo "pull-nao-ff"; return 1; }
-  "$GIT_BIN" -C "$WA_ROOT" add "$rel" || { echo "add-falhou"; return 1; }
+  "$GIT_BIN" -C "$WA_ROOT" pull --ff-only >>"$LOG" 2>&1 || { echo "pull-nao-ff"; return 1; }
+  "$GIT_BIN" -C "$WA_ROOT" add "$rel" >>"$LOG" 2>&1 || { echo "add-falhou"; return 1; }
   local staged
-  staged="$("$GIT_BIN" -C "$WA_ROOT" diff --cached --name-only)"
+  staged="$("$GIT_BIN" -C "$WA_ROOT" diff --cached --name-only 2>>"$LOG")"
   if [ "$staged" != "$rel" ]; then
-    "$GIT_BIN" -C "$WA_ROOT" reset -q -- "$rel" 2>/dev/null
+    "$GIT_BIN" -C "$WA_ROOT" reset -q -- "$rel" >>"$LOG" 2>&1
     echo "staged-inesperado:$staged"; return 1
   fi
-  if [ -z "$("$GIT_BIN" -C "$WA_ROOT" diff --cached)" ]; then
-    "$GIT_BIN" -C "$WA_ROOT" reset -q -- "$rel" 2>/dev/null
+  if [ -z "$("$GIT_BIN" -C "$WA_ROOT" diff --cached 2>>"$LOG")" ]; then
+    "$GIT_BIN" -C "$WA_ROOT" reset -q -- "$rel" >>"$LOG" 2>&1
     echo "sem-mudanca"; return 0
   fi
-  "$GIT_BIN" -C "$WA_ROOT" commit -q -m "chore(ga-z297h): inventario mensal de storage automatizado" || { echo "commit-falhou"; return 1; }
-  "$GIT_BIN" -C "$WA_ROOT" push -q || { echo "push-falhou"; return 1; }
+  "$GIT_BIN" -C "$WA_ROOT" commit -q -m "chore(ga-z297h): inventario mensal de storage automatizado" >>"$LOG" 2>&1 || { echo "commit-falhou"; return 1; }
+  "$GIT_BIN" -C "$WA_ROOT" push -q >>"$LOG" 2>&1 || { echo "push-falhou"; return 1; }
   echo "commitado"
 }
 
