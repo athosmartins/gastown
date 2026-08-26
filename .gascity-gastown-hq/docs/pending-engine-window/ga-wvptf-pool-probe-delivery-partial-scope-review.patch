@@ -1,0 +1,111 @@
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 02a2e0614..bff7580ec 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -3258,8 +3258,25 @@ func bdReadyPoolDemandShell(limitFlag string, includeEphemeralReady bool) string
+ // pilot:refused-reason:<slug>, gate:needs-human(:<reason>)) is handled in
+ // poolDemandLabelFilterJQ below, for the same reason pool:refused:*/
+ // pilot:held* are: --exclude-label cannot express a prefix match.
++//
++// ga-wvptf: delivery:partial and scope:needs-review are appended last of
++// all. story-delivery.sh's task reconciler (ga-k2wjn) and
++// quality-gate-dispatcher.sh's primary path apply this exact-match pair to
++// a bead whose gate PASSED but whose body enumerates multiple deliverables
++// the diff didn't obviously cover in full — deliberately NOT
++// gate:needs-human(:partial-delivery), per ga-6dpoa, because that prefix
++// collides with lifecycle-coherence-janitor's R7 rule (treats any
++// gate:needs-human* as non-implementable and strips gc.routed_to). The
++// intended disposition is a human/Mayor decision (both call sites mail
++// mayor) — gc.routed_to is deliberately left untouched, so nothing else
++// in this function's existing exact-match or prefix (poolDemandLabelFilterJQ)
++// list happens to catch it. Live-reproduced on ga-jz7gg: resurfaced as the
++// dog pool's #1 Step-1c candidate twice in the same session, ~10min apart,
++// despite already carrying a clear investigate-and-release comment from the
++// first occurrence — same shape as ga-9kjzz/ga-5huvs, just two labels this
++// function never learned.
+ func bdReadyPoolDemandExcludeLabelArgs() string {
+-	return ` --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked"`
++	return ` --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "delivery:partial" --exclude-label "scope:needs-review"`
+ }
+ 
+ // poolDemandLabelFilterJQ is the PREFIX half of the routed-pool predicate: the
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index 05df06935..f39af0063 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -1725,7 +1725,7 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
+ 	if strings.Contains(got, `--include-ephemeral`) {
+ 		t.Errorf("EffectiveWorkQuery() default must be bd 1.0.4-compatible without --include-ephemeral: %q", got)
+ 	}
+-	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json --sort oldest --limit=20`) {
++	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "delivery:partial" --exclude-label "scope:needs-review" --json --sort oldest --limit=20`) {
+ 		t.Errorf("EffectiveWorkQuery() missing tier 3 pool-demand probe: %q", got)
+ 	}
+ 	if !strings.Contains(got, "-- mayor") {
+@@ -1747,7 +1747,7 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
+ func TestEffectiveWorkQueryBD105CompatibilityOptIn(t *testing.T) {
+ 	a := Agent{Name: "mayor"}
+ 	got := a.EffectiveWorkQueryForBeads(BeadsConfig{BDCompatibility: BeadsBDCompatibility105})
+-	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json --sort oldest --limit=20`) {
++	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "delivery:partial" --exclude-label "scope:needs-review" --json --sort oldest --limit=20`) {
+ 		t.Errorf("EffectiveWorkQueryForBeads(bd-1.0.5) missing include-ephemeral routed probe: %q", got)
+ 	}
+ 	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=1`) {
+@@ -2046,6 +2046,30 @@ func TestBdReadyPoolDemandExcludeLabelArgsIncludesEngineWindowAndParkLabels(t *t
+ 	}
+ }
+ 
++// TestBdReadyPoolDemandExcludeLabelArgsIncludesDeliveryPartialScopeReview
++// (ga-wvptf): delivery:partial + scope:needs-review is the exact-match pair
++// story-delivery.sh's task reconciler (ga-k2wjn) and
++// quality-gate-dispatcher.sh's primary path apply to a gate:passed bead
++// whose body enumerates multiple deliverables the diff may not fully
++// cover — both call sites mail Mayor and deliberately leave gc.routed_to
++// set, expecting a human/Mayor decision, not dog-pool self-serve.
++// Live-reproduced on ga-jz7gg: resurfaced as this dog's Step-1c #1
++// candidate twice in the same session, ~10min apart, despite already
++// carrying a clear investigate-and-release comment from the first
++// occurrence — same shape as ga-9kjzz/ga-5huvs above, just two labels this
++// function never learned.
++func TestBdReadyPoolDemandExcludeLabelArgsIncludesDeliveryPartialScopeReview(t *testing.T) {
++	got := bdReadyPoolDemandExcludeLabelArgs()
++	for _, want := range []string{
++		`--exclude-label "delivery:partial"`,
++		`--exclude-label "scope:needs-review"`,
++	} {
++		if !strings.Contains(got, want) {
++			t.Fatalf("bdReadyPoolDemandExcludeLabelArgs() = %q, missing %q", got, want)
++		}
++	}
++}
++
+ // TestPoolDemandLabelFilterJQExcludesParkLabels (ga-5huvs) is the PREFIX half
+ // of the same fix: blocked:<reason>, pilot:refused-reason:<slug>, and
+ // gate:needs-human(:<reason>) cannot be expressed via bd's exact-match
+@@ -2297,7 +2321,7 @@ func TestEffectiveWorkQueryRoutedQueueUsesNativeOldestSortAcrossReadyTiers(t *te
+ 	}, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  "ready --metadata-field gc.routed_to=hello-world/worker --unassigned --exclude-type=epic --exclude-label story:needs-human --exclude-label needs-human --exclude-label ctx:thin --exclude-label story:needs-approval --exclude-label story:epic --exclude-label needs:engine-window --exclude-label pilot:no-auto-dispatch --exclude-label story:blocked --json --sort oldest --limit=20")
++  "ready --metadata-field gc.routed_to=hello-world/worker --unassigned --exclude-type=epic --exclude-label story:needs-human --exclude-label needs-human --exclude-label ctx:thin --exclude-label story:needs-approval --exclude-label story:epic --exclude-label needs:engine-window --exclude-label pilot:no-auto-dispatch --exclude-label story:blocked --exclude-label delivery:partial --exclude-label scope:needs-review --json --sort oldest --limit=20")
+     printf '[{"id":"older-no-history","priority":2,"created_at":"2026-05-20T06:09:30Z","no_history":true}]'
+     ;;
+   *)
+@@ -2446,7 +2470,7 @@ func TestEffectiveWorkQueryExcludesEpics(t *testing.T) {
+ 	// resume its own assigned ephemeral epic wisp (the patrol-loop pattern).
+ 	wantPresent := []string{
+ 		// routed/pool tier still excludes epics (gc-udx guard)
+-		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json`,
++		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "delivery:partial" --exclude-label "scope:needs-review" --json`,
+ 		// assigned tiers carry NO epic exclusion
+ 		`bd list --status in_progress --assignee="$id" --json`,
+ 		`bd ready --assignee="$id" --json`,
+@@ -2472,7 +2496,7 @@ func TestEffectiveWorkQueryExcludesEpicsControlDispatcher(t *testing.T) {
+ 	a := Agent{Name: ControlDispatcherAgentName, Dir: "gascity"}
+ 	got := a.EffectiveWorkQuery()
+ 	wantPresent := []string{
+-		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json`,
++		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "delivery:partial" --exclude-label "scope:needs-review" --json`,
+ 		`bd list --status in_progress --assignee="$cand" --json`,
+ 		`bd ready --assignee="$cand" --json`,
+ 		`-- gascity/control-dispatcher gascity/workflow-control`,
