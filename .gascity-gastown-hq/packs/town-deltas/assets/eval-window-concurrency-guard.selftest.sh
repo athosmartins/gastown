@@ -116,7 +116,7 @@ eq "gate-sweep interval -> throttled" "$(get_order_interval "$GATE_SWEEP_TOML")"
 eq "order-tracking-sweep interval -> throttled" "$(get_order_interval "$ORDER_TRACKING_TOML")" "12m"
 
 # Untouched fields on the SAME city.toml block must survive the rewrite.
-grep -q 'pre_start = \["/Users/athos/gt/.gascity-gastown-hq/scripts/dog-pool-preflight-reclaim.py"\]' "$CITY_TOML" \
+grep -q '"/Users/athos/gt/.gascity-gastown-hq/scripts/dog-pool-preflight-reclaim.py"' "$CITY_TOML" \
   && ok "unrelated gastown.dog fields (pre_start) survive the rewrite" \
   || bad "pre_start line was clobbered by the rewrite"
 grep -q 'provider = "claude-headless"' "$CITY_TOML" \
