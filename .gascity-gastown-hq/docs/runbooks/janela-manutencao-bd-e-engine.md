@@ -46,8 +46,12 @@ para o comando mais destrutivo da cidade.
 # fila do gate vazia? (se houver trabalho real, espere)
 bash ~/gt/.gascity-gastown-hq/scripts/gate-queue-composition.sh
 
-# disco: precisa de folga pro backup
-df -h /
+# recursos pro BUILD do engine (ga-6o4bh): disco sozinho engana — mede
+# tambem swap livre, estado do GOCACHE e tendencia de load, e recomenda.
+# NAO auto-aborta; a decisao de seguir/adiar continua sua. Rode de novo o
+# mais perto possivel do inicio real do build (os numeros mudam em minutos —
+# foi exatamente o que aconteceu na janela abortada de 26/08, ver ga-v7nk4).
+bash ~/gt/.gascity-gastown-hq/scripts/engine-build-preflight.sh
 
 # derive porta e data_dir do PROCESSO VIVO, nunca de doc
 DOLT_PID=$(pgrep -f 'dolt sql-server' | head -1)
