@@ -135,8 +135,10 @@ extract_bead_from_branch() {
       # (no '-desc' suffix) has nothing after the id, so the '$' alternative
       # matches end-of-string in place of the '-' — see the deployed source
       # for the full rationale.
-      bead=$(echo "$branch" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}(-|$)' \
-        | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo "")
+      # ga-stmh8: optional dotted sub-bead suffix, mirroring the crew/*/*
+      # arm's ga-pkvfc fix — see the deployed source for the full rationale.
+      bead=$(echo "$branch" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}(\.[0-9]+)?(-|$)' \
+        | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}(\.[0-9]+)?' 2>/dev/null || echo "")
       ;;
   esac
   printf '%s' "$bead"
@@ -161,6 +163,21 @@ extract_bead_from_branch_prebug() {
       ;;
     *)
       bead=$(echo "$branch" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}-' \
+        | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo "")
+      ;;
+  esac
+  printf '%s' "$bead"
+}
+
+# extract_bead_from_branch_pre_stmh8 <branch> — replica of the deployed
+# generic-case regex BETWEEN ga-ghnff9 and ga-stmh8: has the bare-id '(-|$)'
+# alternation but no dotted sub-bead capture group (only the crew/*/* arm
+# got that, under ga-pkvfc). Used as the (Z) mutation guard.
+extract_bead_from_branch_pre_stmh8() {
+  local branch="$1" bead=""
+  case "$branch" in
+    */*)
+      bead=$(echo "$branch" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}(-|$)' \
         | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo "")
       ;;
   esac
@@ -1460,7 +1477,11 @@ if [ -f "$GATE_DONE" ]; then
   printf '%s' "$src" | grep -qF 'ga-ghnff9' \
     && ok "(X6a) gate-done.md references the ga-ghnff9 fix" \
     || bad "(X6a) gate-done.md missing the ga-ghnff9 fix marker (regression)"
-  printf '%s' "$src" | grep -qF '[a-z]{2,8}-[a-z0-9]{2,8}(-|$)' \
+  # ga-stmh8 legitimately inserted '(\.[0-9]+)?' between the char class and
+  # this alternation (see (Z7b) below), so this no longer requires exact
+  # adjacency to the char class — just that the alternation itself survives
+  # somewhere in the generic-case pattern.
+  printf '%s' "$src" | grep -qF '(-|$)' \
     && ok "(X6b) gate-done.md's generic-case regex accepts end-of-string as an alternative to a trailing '-'" \
     || bad "(X6b) gate-done.md's generic-case regex missing the '(-|\$)' alternation (ga-ghnff9 regression)"
 else
@@ -1615,6 +1636,80 @@ if [ -f "$GATE_DONE" ]; then
   fi
 else
   bad "(Y6) gate-done.md not found at $GATE_DONE"
+fi
+
+# ── (Z) ga-stmh8: generic (non-crew) branch regex — dotted sub-bead id no
+#    longer fails to match at all. Same bug family as ga-pkvfc (K above),
+#    but the OTHER case arm: crew/*/* got the '(\.[0-9]+)?' capture group
+#    under ga-pkvfc; the generic fix/*, feature/*, etc. arm (used by every
+#    dog-pool/Pilot-dispatched builder) never did.
+#
+# Root bug (ga-stmh8, filed by gastown.dog-1 from a live incident, 5th
+# independent occurrence across 3 weeks and 4 different dogs — see memory
+# gate-done-branch-regex-drops-dot-in-dotted-subbead-id.md): the generic
+# arm's first grep requires a '-' or end-of-string immediately after the
+# bead-id char class. A dotted sub-bead id (ga-sfj3i.4) has neither — the
+# next char is '.' — so the WHOLE first grep fails to match ANYWHERE
+# (total non-match, not truncation like the crew arm's pre-ga-pkvfc bug),
+# and BEAD_ID comes back empty, hitting Step 2's fail-closed guard.
+
+# (Z1) primary repro: dotted sub-bead with a '-desc' suffix.
+B=$(extract_bead_from_branch "fix/ga-sfj3i.4-desc")
+[ "$B" = "ga-sfj3i.4" ] \
+  && ok "(Z1) fix/ga-sfj3i.4-desc -> ga-sfj3i.4, not empty/truncated (got: $B)" \
+  || bad "(Z1) generic dotted sub-bead extraction -> expected ga-sfj3i.4, got: '$B'"
+
+# (Z2) primary repro variant: dotted sub-bead with NO desc suffix at all —
+# combines the ga-ghnff9 bare-id fix and the ga-stmh8 dotted fix in the
+# same branch name.
+B=$(extract_bead_from_branch "fix/ga-sfj3i.4")
+[ "$B" = "ga-sfj3i.4" ] \
+  && ok "(Z2) fix/ga-sfj3i.4 (bare, dotted) -> ga-sfj3i.4 (got: $B)" \
+  || bad "(Z2) bare dotted sub-bead extraction -> expected ga-sfj3i.4, got: '$B'"
+
+# (Z3) mutation guard: the deployed-BETWEEN-ga-ghnff9-and-ga-stmh8 regex
+# replica, given the EXACT (Z1) repro, returns EMPTY — proves (Z1)/(Z2)
+# would have caught the live incidents (ga-05604.2, ga-sfj3i.4), not just
+# happened to pass either way.
+B=$(extract_bead_from_branch_pre_stmh8 "fix/ga-sfj3i.4-desc")
+[ -z "$B" ] \
+  && ok "(Z3) mutation check: pre-ga-stmh8 generic regex returns empty on a dotted sub-bead branch, reproducing the incident" \
+  || bad "(Z3) mutation check: pre-fix replica unexpectedly produced '$B' — (Z1) would not catch a reversion"
+
+# (Z4) double-digit sub-bead suffix does not truncate/fail in the generic
+# arm either — guards against an off-by-bound regression in the digit
+# class, mirroring (K5) for the crew arm.
+B=$(extract_bead_from_branch "fix/ps-8iuu.12-worker-fix")
+[ "$B" = "ps-8iuu.12" ] \
+  && ok "(Z4) double-digit sub-bead suffix survives in the generic arm: ps-8iuu.12 (got: $B)" \
+  || bad "(Z4) double-digit sub-bead suffix -> expected ps-8iuu.12, got: '$B'"
+
+# (Z5) control: a non-dotted generic branch still resolves exactly as
+# before — no regression on the case ga-ghnff9 already fixed.
+B=$(extract_bead_from_branch "fix/ga-dx5-my-fix")
+[ "$B" = "ga-dx5" ] \
+  && ok "(Z5) control: fix/ga-dx5-my-fix still resolves to ga-dx5 (got: $B)" \
+  || bad "(Z5) control regression: expected ga-dx5, got: '$B'"
+
+# (Z6) control: the crew/*/* arm (already fixed under ga-pkvfc, untouched
+# by this change) still resolves a dotted sub-bead correctly.
+B=$(extract_bead_from_branch "crew/ps-worker/ps-8iuu.4")
+[ "$B" = "ps-8iuu.4" ] \
+  && ok "(Z6) control: crew/ps-worker/ps-8iuu.4 still resolves to ps-8iuu.4 (got: $B)" \
+  || bad "(Z6) control regression: expected ps-8iuu.4, got: '$B'"
+
+# (Z7) source drift-guard: deployed gate-done.md's generic-case regex
+# carries the dotted sub-bead capture group, not just the crew arm.
+if [ -f "$GATE_DONE" ]; then
+  src=$(cat "$GATE_DONE")
+  printf '%s' "$src" | grep -qF 'ga-stmh8' \
+    && ok "(Z7a) gate-done.md references the ga-stmh8 fix" \
+    || bad "(Z7a) gate-done.md missing the ga-stmh8 fix marker (regression)"
+  printf '%s' "$src" | grep -qF '[a-z]{2,8}-[a-z0-9]{2,8}(\.[0-9]+)?(-|$)' \
+    && ok "(Z7b) gate-done.md's generic-case regex captures the optional dotted sub-bead suffix" \
+    || bad "(Z7b) gate-done.md's generic-case regex missing the dotted sub-bead capture group (ga-stmh8 regression)"
+else
+  bad "(Z7) gate-done.md not found at $GATE_DONE"
 fi
 
 echo

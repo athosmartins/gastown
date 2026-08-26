@@ -217,8 +217,14 @@ case "$BRANCH" in
     # Accept either a '-' (desc follows) or end-of-string (bare id) right
     # after the id token — mirrors how the crew/*/* case above already
     # accepts a bare id via its "$BEAD_ID"|"$BEAD_ID"-* guard.
-    BEAD_ID=$(echo "$BRANCH" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}(-|$)' \
-      | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo "")
+    # ga-stmh8: optional dotted sub-bead suffix (ga-sfj3i.4), mirroring the
+    # crew/*/* arm's ga-pkvfc fix above — the char class alone has no '.',
+    # so on a dotted sub-bead branch the char right after the id run is '.',
+    # which is neither '-' nor end-of-string: the WHOLE match used to fail
+    # here (unlike the crew arm, which truncated at the dot instead), and
+    # BEAD_ID came back empty.
+    BEAD_ID=$(echo "$BRANCH" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}(\.[0-9]+)?(-|$)' \
+      | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}(\.[0-9]+)?' 2>/dev/null || echo "")
     ;;
   *)
     BEAD_ID=""
