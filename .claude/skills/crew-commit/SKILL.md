@@ -2,10 +2,11 @@
 name: crew-commit
 description: >
   Canonical commit workflow for Gas Town crew members: pre-flight checks,
-  branch creation, gt commit with agent identity, push, and PR creation.
+  branch creation, commit with your own agent identity (not gt commit's
+  broken GT_ROLE auto-detect), push, and PR creation.
   Use when ready to commit and submit work for review.
 allowed-tools: "Bash(git *), Bash(gt *), Bash(gh *), Bash(gc *)"
-version: "1.1.0"
+version: "1.2.0"
 author: "Gas Town"
 ---
 
@@ -207,18 +208,39 @@ git add -p    # Interactive staging — review each hunk
 
 ---
 
-## Step 5: Commit with gt commit
+## Step 5: Commit with Your Own Agent Identity
 
-Use `gt commit` instead of `git commit`. It automatically sets the correct
-agent identity (name + email) based on your `GT_ROLE`.
+**Do not rely on `gt commit`'s auto-detection.** It only sets identity when
+`GT_ROLE` (the legacy Gas Town env var) is set — this city assigns agents
+`GC_AGENT`/`GC_ALIAS` instead, so `gt commit` silently takes its "no
+GT_ROLE → human passthrough" branch and the commit inherits whatever
+`user.name`/`user.email` already sits in that worktree's `.git/config`
+(shared across worktrees of the same repo — often stale, or simply the
+human's own identity, never yours). This is how crew commits in rigs like
+whatsapp_automation ended up authored `athosmartins <athosmartins@gmail.com>`
+instead of the crew member's own alias (ga-qpsen).
+
+Set your identity explicitly, per commit, with `-c` — this overrides identity
+for this one invocation only and never mutates the shared `.git/config`, so
+it's safe even in a worktree or shared clone:
 
 ```bash
-gt commit -m "$(cat <<'EOF'
+IDENTITY="${GC_ALIAS:-${GC_AGENT:-}}"
+
+MSG="$(cat <<'EOF'
 <type>: <concise description of what and why>
 
 <optional body: context, motivation, or notable details>
 EOF
 )"
+
+if [ -n "$IDENTITY" ]; then
+  git -c user.name="$IDENTITY" -c user.email="${IDENTITY}@gascity.local" commit -m "$MSG"
+else
+  # No GC_ALIAS/GC_AGENT set (human/interactive session, not an agent) —
+  # fall through to whatever identity is already configured.
+  git commit -m "$MSG"
+fi
 ```
 
 **Commit message format:**
@@ -290,7 +312,8 @@ notify "PR ready: <brief description> — #<PR number>"
 - [ ] On a feature branch (NOT main), in an isolated workspace (clone/worktree)
 - [ ] Submodules NOT accidentally staged
 - [ ] Specific files staged (no secrets, no debug code)
-- [ ] Used `gt commit` (not `git commit`)
+- [ ] Committed with your own agent identity (`-c user.name=...`, Step 5 —
+      not bare `gt commit`, which silently falls back to human/stale identity)
 - [ ] Branch pushed to origin
 - [ ] PR created via `gh pr create`
 
@@ -302,7 +325,7 @@ notify "PR ready: <brief description> — #<PR number>"
 |----------|--------------|
 | `git checkout -b` in a bare rig root | Run Step 1.5 guard → branch in a worktree |
 | `git push origin main` | Push feature branch, create PR |
-| `git commit` directly | `gt commit` (sets agent identity) |
+| `git commit` or bare `gt commit` (inherits stale/human identity) | `git -c user.name=... -c user.email=...` (Step 5) |
 | `git add .` blindly | Stage specific files, verify with `git status` |
 | Include `shared/` or `config/` without intent | Check `git submodule status` first |
 | Force-push without understanding why | Resolve the root cause |

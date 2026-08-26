@@ -115,10 +115,19 @@ git status                    # Review what changed
 git add <specific-files>      # Stage intentionally
 ```
 
-Commit using `gt commit` for automatic agent identity:
+**Do not use bare `gt commit`** — it only sets identity when the legacy
+`GT_ROLE` env var is set, which this city never sets (agents carry
+`GC_AGENT`/`GC_ALIAS` instead), so it silently falls back to whatever
+identity is already sitting in the worktree's `.git/config` (often the
+human's own, not yours — ga-qpsen). Set identity explicitly, per commit:
 
 ```bash
-gt commit -m "<type>: <description>"
+IDENTITY="${GC_ALIAS:-${GC_AGENT:-}}"
+if [ -n "$IDENTITY" ]; then
+  git -c user.name="$IDENTITY" -c user.email="${IDENTITY}@gascity.local" commit -m "<type>: <description>"
+else
+  git commit -m "<type>: <description>"
+fi
 ```
 
 Commit message conventions:

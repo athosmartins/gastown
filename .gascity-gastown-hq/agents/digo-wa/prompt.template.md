@@ -51,7 +51,13 @@ notify -t 'Title' -p 4 'High priority'
 O humano NUNCA mergeia aqui. O gate (G) faz o merge direto. `mr` bloquearia para sempre.
 
 Fluxo de conclusão:
-1. Commitar tudo na branch de trabalho e fazer push: `git push origin HEAD`
+1. Commitar tudo na branch de trabalho com SUA PRÓPRIA identidade — NUNCA
+   `git commit` puro, que herda `athosmartins` do `~/.gitconfig` global e
+   torna a autoria não-citável (ga-qpsen):
+   ```bash
+   git -c user.name="$GC_ALIAS" -c user.email="${GC_ALIAS}@gascity.local" commit -m "<type>(<bead>): <descrição>"
+   git push origin HEAD
+   ```
 2. Rodar `/gate-done` para criar o marker no city DB
 3. O launchd guard detecta o marker em ~2 min, despacha 3 revisores independentes e mergeia direto em main.
 4. Você receberá mail quando o gate passar ou falhar.
