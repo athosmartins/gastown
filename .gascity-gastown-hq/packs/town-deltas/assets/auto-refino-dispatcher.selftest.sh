@@ -131,6 +131,29 @@ echo "Scenario 2: lifecycle classification — fresh Triagem input"
 echo "Scenario 2b: gate bounce-back (refinement-in-progress assigned to us) → bounce"
 [ "$(auto_refino_lifecycle_state "story:refinement-in-progress" "$ACTOR" "$ACTOR")" = "bounce" ] && ok "in-progress assigned to us → bounce" || bad "bounce-back → expected bounce"
 [ "$(auto_refino_lifecycle_state "story:refinement-in-progress" "peter-wa" "$ACTOR")" = "skip" ] && ok "in-progress owned by ANOTHER refiner → skip (no double-refine)" || bad "another refiner's in-progress → expected skip"
+echo "Scenario 2b-orphan (ga-kb0kz): stale in-progress with EMPTY assignee → bounce; foreign assignee never reclaimed regardless of age"
+[ "$(auto_refino_lifecycle_state "story:refinement-in-progress" "" "$ACTOR" 51 50)" = "bounce" ] \
+  && ok "in-progress, no assignee, 51m (>50m TTL) → bounce (orphan reclaimed)" \
+  || bad "stale orphan → expected bounce"
+[ "$(auto_refino_lifecycle_state "story:refinement-in-progress" "" "$ACTOR" 49 50)" = "skip" ] \
+  && ok "in-progress, no assignee, 49m (<50m TTL) → skip (still might be mid-transition)" \
+  || bad "fresh-ish orphan → expected skip"
+[ "$(auto_refino_lifecycle_state "story:refinement-in-progress" "" "$ACTOR")" = "skip" ] \
+  && ok "in-progress, no assignee, age/ttl omitted (default 0/50) → skip (backward-compat: old 3-arg callers unaffected)" \
+  || bad "3-arg backward-compat call → expected skip"
+[ "$(auto_refino_lifecycle_state "story:refinement-in-progress" "peter-wa" "$ACTOR" 9999 50)" = "skip" ] \
+  && ok "in-progress owned by ANOTHER refiner, even wildly stale (9999m) → skip (no double-refine — staleness never overrides a LIVE foreign/interactive claim)" \
+  || bad "stale foreign claim → expected skip (regression: must never auto-steal another actor's claim)"
+# The exact confirmed-live shapes from ga-kb0kz (ga-w6vbc: 17 days stale; ga-p5qgk: 3 days stale).
+[ "$(auto_refino_lifecycle_state "ctx:ready,exec:auto,framework,lane:big,story:refinement-in-progress" "" "$ACTOR" 24000 50)" = "bounce" ] \
+  && ok "ga-w6vbc shape (refiner-wisp-timeout residual, 17d stale) → bounce" \
+  || bad "ga-w6vbc shape → expected bounce"
+# Classifier-only (auto_refino_is_product_story is a separate, later gate the
+# live loop applies before this one — not exercised here; see Scenario 1b).
+[ "$(auto_refino_lifecycle_state "ctx:ready,discovery:source,exec:auto,parent:ga-jazy9,scraper:build,story:refinement-in-progress" "" "$ACTOR" 4300 50)" = "bounce" ] \
+  && ok "ga-p5qgk shape (3d stale) → bounce" \
+  || bad "ga-p5qgk shape → expected bounce"
+
 echo "Scenario 2c: past-the-daemon / terminal states are NEVER candidates"
 for L in auto-refino:refining auto-refino:escalated refino-gate:reviewing story:refino-review story:needs-approval story:approved story:in-flight story:done story:cancelled; do
   st=$(auto_refino_lifecycle_state "$L" "" "$ACTOR")
@@ -1744,6 +1767,47 @@ if grep -qF 'FIRST — check whether this story is a RE-ATTEMPT on an ALREADY-RE
   ok "19d. REFINE_TASK heredoc teaches the refiner the SPLIT report-back path (PATH C, ga-9mfnw)"
 else
   bad "19d. REFINE_TASK heredoc missing the SPLIT pre-check / PATH C — refiner still has to invent the mitigation"
+fi
+
+# ── Scenario 20 (ga-kb0kz): orphaned refinement-in-progress claims are
+#    re-discoverable, not permanently invisible ─────────────────────────────
+# The pure-function tests above (Scenario 2b-orphan) prove the classifier
+# WOULD say "bounce" given the right inputs — these drift-guards prove the
+# live query loop actually FEEDS it those inputs: a bd query that can return
+# an empty-assignee in-progress bead, that source merged into CANDIDATES, and
+# the classification-loop call site threading age_min + the TTL through
+# (not just calling the classifier with the old 3-arg backward-compat shape,
+# which would silently never re-detect anything already broken).
+echo "Scenario 20: orphaned in-progress claims are re-discovered (ga-kb0kz)"
+if grep -qF 'ORPHAN_JSON=$(bd_ list --label story:refinement-in-progress' "$DISPATCHER" \
+   && grep -qF -- '--no-assignee' "$DISPATCHER"; then
+  ok "20a. a query source for empty-assignee in-progress beads exists (--no-assignee, mirrors --assignee on BOUNCE_JSON)"
+else
+  bad "20a. no query source fetches empty-assignee story:refinement-in-progress beads — orphans stay invisible"
+fi
+if grep -qF '<(echo "$FRESH_JSON") <(echo "$UNREF_JSON") <(echo "$BOUNCE_JSON") <(echo "$ORPHAN_JSON") <(echo "$RAW_JSON")' "$DISPATCHER"; then
+  ok "20b. ORPHAN_JSON is merged into CANDIDATES alongside the other 4 sources"
+else
+  bad "20b. ORPHAN_JSON exists but is not merged into CANDIDATES — dead query, never reaches classification"
+fi
+if grep -qF 'auto_refino_lifecycle_state "$c_labels" "$c_assignee" "$AUTO_REFINO_ACTOR" "$c_age_min" "$AUTO_REFINO_ORPHAN_TTL_MINUTES"' "$DISPATCHER"; then
+  ok "20c. the classification loop passes age_min + orphan TTL to the classifier (not just the 3-arg backward-compat form)"
+else
+  bad "20c. classification loop still calls the classifier with 3 args — orphan branch can never trigger from live candidates"
+fi
+if grep -qF 'AUTO_REFINO_ORPHAN_TTL_MINUTES="${AUTO_REFINO_ORPHAN_TTL_MINUTES:-50}"' "$DISPATCHER"; then
+  ok "20d. orphan TTL is an env-overridable tunable with a sane default (mirrors AUTO_REFINO_REFINING_TTL_MINUTES)"
+else
+  bad "20d. orphan TTL tunable missing or not env-overridable"
+fi
+# Ordering: ORPHAN_JSON must be gathered BEFORE the CANDIDATES merge that
+# consumes it (a query defined after the merge would just be an unused var).
+_ORPHAN_DEF_LN=$(grep -n -F 'ORPHAN_JSON=$(bd_ list --label story:refinement-in-progress' "$DISPATCHER" | head -1 | cut -d: -f1) || true
+_CANDIDATES_LN=$(grep -n -F '<(echo "$FRESH_JSON") <(echo "$UNREF_JSON") <(echo "$BOUNCE_JSON") <(echo "$ORPHAN_JSON") <(echo "$RAW_JSON")' "$DISPATCHER" | head -1 | cut -d: -f1) || true
+if [ -n "$_ORPHAN_DEF_LN" ] && [ -n "$_CANDIDATES_LN" ] && [ "$_ORPHAN_DEF_LN" -lt "$_CANDIDATES_LN" ]; then
+  ok "20e. ORPHAN_JSON is defined before the CANDIDATES merge that consumes it"
+else
+  bad "20e. ORPHAN_JSON ordering wrong relative to the CANDIDATES merge"
 fi
 
 echo ""

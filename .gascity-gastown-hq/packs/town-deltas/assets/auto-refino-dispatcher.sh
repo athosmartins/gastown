@@ -141,6 +141,14 @@ AUTO_REFINO_REFINER_TEMPLATE="${AUTO_REFINO_REFINER_TEMPLATE:-auto-refiner}"
 # died mid-run — recover the story back to the Triagem queue. Same spirit as the
 # gate's REFINO_REVIEW_TTL_MINUTES.
 AUTO_REFINO_REFINING_TTL_MINUTES="${AUTO_REFINO_REFINING_TTL_MINUTES:-50}"
+# ga-kb0kz: a story:refinement-in-progress bead whose assignee is EMPTY (not a
+# live foreign claim — see the classifier comment) and that has sat untouched
+# this long is an ORPHAN, not an active claim: the claimant died between
+# setting the lifecycle label and setting auto-refino:refining+assignee (or a
+# cleanup path cleared the assignee without clearing the label). Same 50m
+# default as the sibling TTL above — same "presumed dead" spirit, on the
+# in-progress+empty-assignee shape instead of the auto-refino:refining shape.
+AUTO_REFINO_ORPHAN_TTL_MINUTES="${AUTO_REFINO_ORPHAN_TTL_MINUTES:-50}"
 # Labels that mark a bead as BUILD / INFRA / SCRAPER-CONFIG work — NOT a refinable
 # product story. A candidate carrying ANY of these is excluded from the funnel even
 # if it (mis)carries a story:* lifecycle label. This is what keeps scraper-config
@@ -226,22 +234,32 @@ auto_refino_type_eligible() {
   esac
 }
 
-# auto_refino_lifecycle_state <labels_csv> <assignee> <daemon_actor>
+# auto_refino_lifecycle_state <labels_csv> <assignee> <daemon_actor> [age_min] [orphan_ttl]
 #   Classify a candidate by its lifecycle labels. Emits one of:
 #     fresh    — story:triage or story:unrefined, untouched → refine it.
 #     bounce   — story:refinement-in-progress assigned to US (gate bounced a FAIL
 #                back to the daemon) and NOT currently being refined → re-refine.
+#                ALSO emitted (ga-kb0kz) for an ORPHANED claim: assignee EMPTY
+#                (nobody's live claim — see the "NOT ours" skip case below,
+#                unchanged) and stale beyond orphan_ttl minutes. age_min/
+#                orphan_ttl default to 0/50 so any caller that omits them keeps
+#                today's exact behaviour (age 0 never clears a 50m floor).
 #     skip     — anything else: already refining (auto-refino:refining), already
 #                handed to the gate (story:refino-review / refino-gate:*),
 #                escalated (auto-refino:escalated), in Athos's queue
-#                (story:needs-approval), approved/in-flight/done/cancelled, or a
-#                refinement-in-progress that is NOT ours (another refiner owns it).
+#                (story:needs-approval), approved/in-flight/done/cancelled, a
+#                refinement-in-progress that is NOT ours (another refiner OR an
+#                interactive /refino session owns it — non-empty foreign
+#                assignee is NEVER reclaimed regardless of age: "no double-
+#                refine" holds for live claims, only a truly-empty assignee is
+#                ever an orphan), or an in-progress+empty-assignee bead that
+#                hasn't yet crossed orphan_ttl (still might be mid-transition).
 #   GUARANTEE: a story already past the daemon (refino-review, needs-approval,
 #   approved, in-flight, done, cancelled, escalated) is NEVER reclassified as a
 #   candidate — the daemon cannot re-touch work it (or Athos, or the gate) has
 #   already moved forward.
 auto_refino_lifecycle_state() {
-  local labels="$1" assignee="$2" actor="$3"
+  local labels="$1" assignee="$2" actor="$3" age_min="${4:-0}" orphan_ttl="${5:-50}"
   local csv=",$labels,"
 
   # Terminal / past-the-daemon states are NEVER candidates.
@@ -263,11 +281,24 @@ auto_refino_lifecycle_state() {
   esac
 
   # Gate bounce-back: in-progress AND assigned to us → re-refine.
+  # Orphan reclaim (ga-kb0kz): in-progress, NO assignee at all, and stale beyond
+  # the TTL → re-refine, same remediation as a bounce. Deliberately scoped to
+  # EMPTY assignee only, never a foreign non-empty one (self-test "in-progress
+  # owned by ANOTHER refiner → skip" pins this): a non-empty foreign assignee
+  # can be a LIVE claim (another refiner, or an interactive /refino session —
+  # skills/refino/SKILL.md sets this exact label+assignee shape with no
+  # auto-refino:refining marker), and staleness alone cannot tell a dead claim
+  # from a human who stepped away mid-session. An empty assignee has no such
+  # ambiguity: nobody is holding it.
   case "$csv" in
     *,story:refinement-in-progress,*)
       if [ -n "$assignee" ] && [ "$assignee" = "$actor" ]; then
         echo "bounce"; return
-      fi ;;
+      fi
+      if [ -z "$assignee" ] && [ "$age_min" -ge "$orphan_ttl" ] 2>/dev/null; then
+        echo "bounce"; return
+      fi
+      ;;
   esac
 
   echo "skip"
@@ -1038,6 +1069,19 @@ BOUNCE_JSON=$(bd_ list --label story:refinement-in-progress --type feature --sta
   --exclude-label auto-refino:refining \
   --exclude-label auto-refino:escalated \
   --json 2>/dev/null || echo "[]")
+# Orphaned claims (ga-kb0kz): in-progress stories with NO assignee at all — the
+# BOUNCE query above requires --assignee "$AUTO_REFINO_ACTOR", so it structurally
+# can never return one of these, and they'd otherwise be invisible forever (no
+# other source query matches story:refinement-in-progress). Query narrows to
+# --no-assignee; the classifier (auto_refino_lifecycle_state, given age_min +
+# AUTO_REFINO_ORPHAN_TTL_MINUTES below) is what actually decides staleness —
+# this just gathers candidates, same "query narrows, classifier disqualifies"
+# split as every other source here.
+ORPHAN_JSON=$(bd_ list --label story:refinement-in-progress --type feature --status open \
+  --no-assignee \
+  --exclude-label auto-refino:refining \
+  --exclude-label auto-refino:escalated \
+  --json 2>/dev/null || echo "[]")
 
 # ── 4th source: RAW Triagem stories with NO story:* lifecycle label ───────────
 # (Mayor-diagnosed starvation fix; gated by AUTO_REFINO_INGEST_RAW_TRIAGEM.)
@@ -1129,7 +1173,7 @@ else
 fi
 
 CANDIDATES=$(jq -s 'add | unique_by(.id)' \
-  <(echo "$FRESH_JSON") <(echo "$UNREF_JSON") <(echo "$BOUNCE_JSON") <(echo "$RAW_JSON") 2>/dev/null || echo "[]")
+  <(echo "$FRESH_JSON") <(echo "$UNREF_JSON") <(echo "$BOUNCE_JSON") <(echo "$ORPHAN_JSON") <(echo "$RAW_JSON") 2>/dev/null || echo "[]")
 CCOUNT=$(echo "$CANDIDATES" | jq 'length' 2>/dev/null || echo 0)
 if [ "$CCOUNT" -eq 0 ] 2>/dev/null; then
   log "  No Triagem stories in this store — next store."
@@ -1157,9 +1201,16 @@ while IFS= read -r row; do
   c_age_min=$(( (NOW_EPOCH - c_upd_epoch) / 60 ))
   [ "$(auto_refino_type_eligible "$c_type")" = "yes" ] || { log "  skip $c_id: type '$c_type' not in funnel (bug/chore/task bypass)"; continue; }
   [ "$(auto_refino_is_product_story "$c_labels" "$AUTO_REFINO_EXCLUDE_LABELS")" = "yes" ] || { log "  skip $c_id: carries build/non-product label (auto-refino excludes: $AUTO_REFINO_EXCLUDE_LABELS) — not a product story"; continue; }
-  state=$(auto_refino_lifecycle_state "$c_labels" "$c_assignee" "$AUTO_REFINO_ACTOR")
+  state=$(auto_refino_lifecycle_state "$c_labels" "$c_assignee" "$AUTO_REFINO_ACTOR" "$c_age_min" "$AUTO_REFINO_ORPHAN_TTL_MINUTES")
   case "$state" in
-    fresh|bounce) STORY="$row"; RAW_INGEST=0; break ;;
+    bounce)
+      # ga-kb0kz: the ONLY way "bounce" comes back with an empty assignee is
+      # the new orphan branch (the assignee==actor branch requires a non-empty
+      # match) — log it distinctly so a reclaim is auditable, same as every
+      # other self-heal path in this file (Step 0 TTL recovery, Step 0c, etc).
+      [ -z "$c_assignee" ] && log "  reclaim $c_id: orphaned refinement-in-progress (empty assignee, ${c_age_min}m stale >= ${AUTO_REFINO_ORPHAN_TTL_MINUTES}m TTL) — treating as bounce (ga-kb0kz)"
+      STORY="$row"; RAW_INGEST=0; break ;;
+    fresh) STORY="$row"; RAW_INGEST=0; break ;;
     *)
       # Not a labelled candidate. If raw-ingestion is on and this bead is a RAW
       # Triagem story (no story:* label, not automation/build), INGEST it: select
