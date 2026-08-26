@@ -4751,7 +4751,7 @@ _inflight_drop_dead_workers() {
 # may exist" → KEEP). Test seam PILOT_TEST_BRANCH_BEADS (space-list of branched
 # ids), consulted when DEFINED, keeps the selftest hermetic (no real git).
 _beadid_has_branch() {
-  local _bid="${1:-}" _repo
+  local _bid="${1:-}" _repo _refs
   [ -n "$_bid" ] || return 1
   if [ -n "${PILOT_TEST_BRANCH_BEADS+x}" ]; then
     case " $PILOT_TEST_BRANCH_BEADS " in *" $_bid "*) return 0 ;; *) return 1 ;; esac
@@ -4768,8 +4768,19 @@ _beadid_has_branch() {
   [ -n "${_NS_BRANCH_REPOS:-}" ] || return 0
   while IFS= read -r _repo; do
     [ -n "$_repo" ] && [ -d "$_repo" ] || continue
-    if git -C "$_repo" for-each-ref --format='%(refname)' refs/heads refs/remotes 2>/dev/null \
-        | grep -qiF "$_bid"; then
+    # ga-8w22n: piping for-each-ref straight into `grep -q` is racy under
+    # this file's `set -euo pipefail` on an active checkout with many refs —
+    # grep exits on its first match and closes the pipe while for-each-ref
+    # may still be writing later refs, so for-each-ref can catch SIGPIPE
+    # (exit 141), which pipefail then reports as the pipeline's status even
+    # though grep DID match. Reproduced live: with ~600 refs this false-
+    # negatived 22/30 runs; a bead with a real branch would read as
+    # branchless and get re-dispatched, colliding with the live worker.
+    # Capturing to a variable first and matching via a herestring (backed by
+    # a temp file, not a live pipe) removes the race entirely — for-each-ref
+    # has already exited before grep ever runs.
+    _refs=$(git -C "$_repo" for-each-ref --format='%(refname)' refs/heads refs/remotes 2>/dev/null)
+    if grep -qiF "$_bid" <<< "$_refs"; then
       return 0
     fi
   done <<< "${_NS_BRANCH_REPOS:-}"
@@ -4891,7 +4902,7 @@ done <<< "$_ttl_rig_paths"
 # "assume branch") so the guard never blocks on an unprobable environment; the
 # distinct dead-worker/never-started reclaim paths still own true-orphan recovery.
 _beadid_has_crew_branch() {
-  local _bid="${1:-}" _repo
+  local _bid="${1:-}" _repo _refs
   [ -n "$_bid" ] || return 1
   if [ -n "${PILOT_TEST_CREW_BRANCH_BEADS+x}" ]; then
     case " $PILOT_TEST_CREW_BRANCH_BEADS " in *" $_bid "*) return 0 ;; *) return 1 ;; esac
@@ -4909,8 +4920,13 @@ _beadid_has_crew_branch() {
   while IFS= read -r _repo; do
     [ -n "$_repo" ] && [ -d "$_repo" ] || continue
     # 1. Already-fetched local + remote-tracking refs (cheap, offline).
-    if git -C "$_repo" for-each-ref --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null \
-        | grep -qiE "$_re"; then
+    # ga-8w22n: same SIGPIPE-under-pipefail race as _beadid_has_branch above
+    # (this file's set -euo pipefail + grep -q's early exit racing
+    # for-each-ref's write on an active checkout) — reproduced live at
+    # 100% with 1500 refs. Capture first, match via a herestring: removes
+    # the live pipe, not just the race's window.
+    _refs=$(git -C "$_repo" for-each-ref --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null)
+    if grep -qiE "$_re" <<< "$_refs"; then
       return 0
     fi
     # 2. Best-effort authoritative remote probe (bounded; the live origin/crew/*
@@ -4952,15 +4968,29 @@ _beadid_matched_crew_branch_ref() {
     esac
   fi
   command -v git >/dev/null 2>&1 || return 1
-  local _repos _re _match
+  local _repos _re _match _refs
   _ownership_guard_repos >/dev/null
   _repos="${_OWNERSHIP_GUARD_REPOS:-}"
   [ -n "$_repos" ] || return 1
   _re="(crew/([^/]+/)?${_bid}|fix/${_bid}-[^/]+)\$"
   while IFS= read -r _repo; do
     [ -n "$_repo" ] && [ -d "$_repo" ] || continue
-    _match=$(git -C "$_repo" for-each-ref --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null \
-        | grep -iE "$_re" | head -1)
+    # ga-8w22n: worse than the sibling functions' false-negative shape — this
+    # 3-stage pipe (for-each-ref | grep | head -1) could SIGPIPE either
+    # producer (for-each-ref cut off by grep, or grep itself cut off by
+    # head -1 once it has its one line) under this file's set -euo pipefail,
+    # and the bare `_match=$(...)` assignment then propagates that nonzero
+    # status to ABORT THE WHOLE SCRIPT, not just misreport a boolean —
+    # reproduced live: 15/15 runs died with exit 141 (SIGPIPE) against a
+    # checkout with thousands of matching refs. Capture for-each-ref's
+    # output first (removing the live pipe to it entirely), then use grep's
+    # own `-m 1` to stop after the first match instead of piping to `head`
+    # — grep reading a herestring has no live producer to SIGPIPE, so this
+    # removes both failure mechanisms, not just narrows them. `|| true`
+    # guards the ordinary "no match in this repo" case (grep exit 1, ALSO a
+    # bare assignment) from tripping set -e on a normal, expected outcome.
+    _refs=$(git -C "$_repo" for-each-ref --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null)
+    _match=$(grep -m 1 -iE "$_re" <<< "$_refs") || true
     if [ -n "$_match" ]; then
       printf '%s\t%s' "$_repo" "$_match"
       return 0
