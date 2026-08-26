@@ -117,7 +117,14 @@ if [ -z "$BARE_AUTHOR_NOTIFY" ]; then
 else
   bad "gate_finalize_run() still has a notify call site targeting bare \$AUTHOR: $BARE_AUTHOR_NOTIFY"
 fi
-NOTIFY_COUNT=$(printf '%s\n' "$GFR_BLOCK" | grep -cE '(nudge|mail send) "\$NOTIFY_AUTHOR"')
+# ga-36ta4: also recognize notify_author_with_fallback(...) calls that pass
+# NOTIFY_AUTHOR as an argument — several sites (ga-lxz5w, the fix-attempt-cap
+# site, and ga-36ta4's own conversions) route through that wrapper rather
+# than a bare `mail send "$NOTIFY_AUTHOR"`. Confirmed pre-existing: this
+# count was already 2 (not the expected >=5) right after ga-55syh merged,
+# before any ga-36ta4 change — same root cause as every other drift-guard
+# fixed in that bead, just not caught until now.
+NOTIFY_COUNT=$(printf '%s\n' "$GFR_BLOCK" | grep -cE '(nudge|mail send) "\$NOTIFY_AUTHOR"|notify_author_with_fallback.*NOTIFY_AUTHOR')
 if [ "$NOTIFY_COUNT" -ge 5 ]; then
   ok "gate_finalize_run() has $NOTIFY_COUNT NOTIFY_AUTHOR-targeted call sites (>=5 expected)"
 else

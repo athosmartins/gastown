@@ -212,8 +212,11 @@ assert_exit0_after() {
   esac
 }
 
+# ga-36ta4: anchor text updated — the log line now reports the verified
+# armed/failed status (gate_apply_needs_human(), ga-55syh) instead of
+# unconditionally asserting "needs-human.".
 assert_exit0_after \
-  'log "ga-acb circuit-break: branch $BRANCH absent from origin — marker $MARKER_ID parked, bead $BEAD_ID needs-human."' \
+  'log "ga-acb circuit-break: branch $BRANCH absent from origin — marker $MARKER_ID parked, bead $BEAD_ID needs-human armed=$_NH_STATUS."' \
   "no_branch circuit-break (ga-acb)" \
   6
 assert_exit0_after \

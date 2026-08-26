@@ -170,11 +170,18 @@ echo "── 8. drift-guard: ga-u4yi — AUTHOR (not just Mayor) is mailed at ev
 # no count to bump. It also self-updates for sites added by unrelated work, e.g. ga-lxz5w's
 # sibling-branch-race site — if such a site is itself missing its author-mail, this guard
 # names its line instead of staying silently green.)
-NEEDS_HUMAN_SITES=$(grep -nE 'label add[[:space:]]+"\$BEAD_ID"[[:space:]]+"gate:needs-human"' "$GATE" \
-  | grep -v 'gate:needs-human:' | cut -d: -f1)
+# ga-36ta4: site detection now looks for gate_apply_needs_human() calls, not
+# the raw `label add ... "gate:needs-human"` line — ga-55syh replaced every
+# site's inline label-add with a call to that shared verify-then-apply
+# helper (see gate-needs-human-divergence-sweep.selftest.sh's copy of this
+# same fix for the full rationale). The AUTHOR-mail-nearby check is also
+# widened to recognize notify_author_with_fallback(), not just a literal
+# `mail send "$AUTHOR"`/`"$NOTIFY_AUTHOR"` call.
+NEEDS_HUMAN_SITES=$(grep -nE '_NH_STATUS=\$\(gate_apply_needs_human "\$BEAD_CITY" "\$BEAD_ID"' "$GATE" \
+  | cut -d: -f1)
 _bij_ok=1; _bij_bad_line=""
 for _site in $NEEDS_HUMAN_SITES; do
-  if ! sed -n "${_site},$((_site + 40))p" "$GATE" | grep -Eq 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"'; then
+  if ! sed -n "${_site},$((_site + 40))p" "$GATE" | grep -Eq 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"|notify_author_with_fallback'; then
     _bij_ok=0; _bij_bad_line="$_site"; break
   fi
 done
@@ -191,7 +198,9 @@ grep -Eq 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"' "$GATE" \
 # guard as the existing Mayor mail, or a bead already needs-human before this
 # code path re-triggers (defensively) would re-mail the author every time.
 CAP_MAIL_BLOCK="$(awk '/Escalate EXACTLY once/{f=1} f{print} f&&/^      fi[[:space:]]*$/{exit}' "$GATE")"
-printf '%s\n' "$CAP_MAIL_BLOCK" | grep -Eq 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"' \
+# ga-36ta4: widened to also recognize notify_author_with_fallback() — same
+# reasoning as the bijection fix above.
+printf '%s\n' "$CAP_MAIL_BLOCK" | grep -Eq 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"|notify_author_with_fallback' \
   && ok "cap-exhaustion author-mail is inside the escalate-exactly-once guard" \
   || bad "cap-exhaustion author-mail is OUTSIDE the once-only guard — would spam on re-entry"
 

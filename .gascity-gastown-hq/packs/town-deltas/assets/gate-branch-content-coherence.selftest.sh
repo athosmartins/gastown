@@ -180,7 +180,9 @@ fi
 echo "── 4. drift guard: content-coherence check precedes the merge, follows the sibling check ──"
 has "$DISPATCHER" 'branch_bead_commit_verdict "\$GATE_Y9A1D_COUNT" "\$GATE_Y9A1D_MSGS" "\$BEAD_ID"' \
   "call site invokes branch_bead_commit_verdict with COUNT/MSGS/BEAD_ID"
-has "$DISPATCHER" 'label add "\$BEAD_ID" "gate:needs-human:branch-content-mismatch"' \
+# ga-36ta4: replaced by a call to the shared verify-then-apply helper
+# (ga-55syh), which still receives the distinct sub-label as its argument.
+has "$DISPATCHER" 'gate_apply_needs_human "\$BEAD_CITY" "\$BEAD_ID" "gate:needs-human:branch-content-mismatch"' \
   "content-mismatch failure labels the source bead distinctly (not just generic gate:needs-human)"
 has "$DISPATCHER" 'Gate needs-human: branch content mismatch on \$BEAD_ID \(ga-y9a1d\)' \
   "content-mismatch failure escalates to the Mayor via durable mail (distinct subject line)"

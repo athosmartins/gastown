@@ -253,8 +253,11 @@ has "$DISPATCHER" 'gate_bead_live_merge_block "\$BEAD_CITY" "\$BEAD_ID"' \
   "live re-check (b) calls gate_bead_live_merge_block with BEAD_CITY/BEAD_ID"
 has "$DISPATCHER" 'gate_bead_active_sibling_branch "\$GC_CITY" "\$BEAD_ID" "\$BRANCH"' \
   "sibling check (a) calls gate_bead_active_sibling_branch with GC_CITY/BEAD_ID/BRANCH"
-has "$DISPATCHER" 'label add "\$BEAD_ID" "gate:needs-human"' \
-  "sibling check (a) labels the source bead gate:needs-human"
+# ga-36ta4: label add "$BEAD_ID" "gate:needs-human" was replaced by a call to
+# the shared verify-then-apply helper (ga-55syh) — same effect, now verified
+# instead of fire-and-forget.
+has "$DISPATCHER" 'gate_apply_needs_human "\$BEAD_CITY" "\$BEAD_ID" "gate:needs-human:sibling-race"' \
+  "sibling check (a) labels the source bead gate:needs-human (via gate_apply_needs_human)"
 has "$DISPATCHER" 'mail send mayor' \
   "sibling check (a) escalates to the Mayor via durable mail"
 

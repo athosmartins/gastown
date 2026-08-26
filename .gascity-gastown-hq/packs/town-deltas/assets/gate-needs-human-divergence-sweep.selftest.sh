@@ -211,11 +211,29 @@ if [ -f "$DISPATCHER" ]; then
   # real-identity signal, just no longer always the bead-assignee-derived one
   # (see quality-gate-dispatcher.sh's gate_finalize_run header comment for why
   # the two variables coexist).
-  NEEDS_HUMAN_SITES=$(grep -nE 'label add[[:space:]]+"\$BEAD_ID"[[:space:]]+"gate:needs-human"' "$DISPATCHER" \
-    | grep -v 'gate:needs-human:' | cut -d: -f1)
+  #
+  # ga-36ta4: site detection now looks for gate_apply_needs_human() calls, not
+  # the raw `label add ... "gate:needs-human"` line — ga-55syh replaced every
+  # site's inline label-add with a call to that shared verify-then-apply
+  # helper, so the old pattern now matches ZERO sites (this check would have
+  # gone from a real bijection proof to a silent "0 sites, vacuously fine" —
+  # caught here specifically BECAUSE this check demands _n_sites >= 1, so it
+  # would have failed loudly rather than passing quietly; fixed properly
+  # instead of just re-lowering the bar).
+  #
+  # ga-36ta4 (found during that same fix, unrelated to the detection-pattern
+  # change above): the AUTHOR-mail-nearby check ALSO only recognized a literal
+  # `mail send "$AUTHOR"`/`"$NOTIFY_AUTHOR"` call, not the
+  # notify_author_with_fallback() wrapper several sites (including the
+  # long-standing ga-lxz5w one) already use — confirmed as a real
+  # false-positive by running this exact check against a clean, unmodified
+  # dispatcher.sh at HEAD before any ga-55syh/ga-36ta4 changes existed. Widened
+  # to recognize either form.
+  NEEDS_HUMAN_SITES=$(grep -nE '_NH_STATUS=\$\(gate_apply_needs_human "\$BEAD_CITY" "\$BEAD_ID"' "$DISPATCHER" \
+    | cut -d: -f1)
   _bij_ok=1; _bij_bad_line=""
   for _site in $NEEDS_HUMAN_SITES; do
-    if ! sed -n "${_site},$((_site + 40))p" "$DISPATCHER" | grep -Eq 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"'; then
+    if ! sed -n "${_site},$((_site + 40))p" "$DISPATCHER" | grep -Eq 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"|notify_author_with_fallback'; then
       _bij_ok=0; _bij_bad_line="$_site"; break
     fi
   done
