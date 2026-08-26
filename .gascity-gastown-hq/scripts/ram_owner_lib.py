@@ -175,7 +175,22 @@ def label(args_head):
     m = re.search(r'\bbd\s+([a-z-]+)', a)
     if m:
         return "bd " + m.group(1)
-    tok = a.split()[0] if a.split() else a
+    # Fallback: basename of "the command portion" -- split on the first
+    # CLI-flag-looking token (whitespace immediately followed by '-'), not on
+    # the first bare space. A naive a.split()[0] truncates any executable
+    # PATH whose own final component contains a space -- macOS is full of
+    # these ("Google Chrome.app/Contents/MacOS/Google Chrome", "Visual Studio
+    # Code.app/..."), and truncating at that internal space produces a
+    # generic first-word label ("Google") that silently MERGES every such
+    # app's distinct (often large) helper processes into one bucket. Proven
+    # live, not inferred: ga-yr8vm gate review attempt 2 measured 34 real
+    # Chrome-family pids (~900MB combined RSS) collapsed into a single
+    # "Google" owner on this exact machine. Only apply basename-of-whole-part
+    # when a '/' is present (a real path) -- a bare multi-word command with
+    # no slash (e.g. "npm run build") has no such ambiguity, and its first
+    # token alone remains the more useful label.
+    cmd_part = re.split(r'\s+(?=-)', a, maxsplit=1)[0]
+    tok = cmd_part if "/" in cmd_part else (cmd_part.split()[0] if cmd_part.split() else cmd_part)
     return os.path.basename(tok)[:40]
 
 
@@ -191,6 +206,19 @@ def owner_of(pid, tbl, sess_by_key):
     — parent is launchd => this process IS the service, label its own args;
     a generic client (bd/gc/python wrapper) climbs further; anything else
     stops and labels itself.
+
+    comm_base is derived from args_head's own first token, NOT from ps's
+    separately-reported comm= column. macOS's ps truncates comm= to a fixed
+    ~16 chars regardless of how many other columns are requested (confirmed
+    live, ga-yr8vm gate review attempt 2: a real claude process invoked via
+    /Users/athos/.local/bin/claude truncates to "/Users/athos/.lo", whose
+    basename is ".lo" -- silently missing the comm_base=="claude" check
+    entirely and merging that session's RSS into a generic bucket instead of
+    attributing it by name). args_head is not subject to that truncation.
+    basename()'s last-'/'-only semantics also make this safe against a
+    leading portion of args_head being corrupted by some other means (only
+    the FINAL path segment matters here, and any such corruption can only
+    ever eat into the FRONT of a string, never its tail).
     """
     seen = set()
     cur = pid
@@ -199,7 +227,8 @@ def owner_of(pid, tbl, sess_by_key):
         seen.add(cur)
         hops += 1
         node = tbl[cur]
-        comm_base = os.path.basename(node["comm"])
+        args_tok = node["args_head"].split()[0] if node["args_head"].split() else ""
+        comm_base = os.path.basename(args_tok)
         if comm_base == "claude":
             m = _SESSION_ID_RE.search(node["args_head"])
             if m and m.group(1) in sess_by_key:
@@ -212,8 +241,7 @@ def owner_of(pid, tbl, sess_by_key):
         pargs = tbl.get(ppid, {}).get("args_head", "")
         if "launchd" in pargs or ppid <= 1:
             return label(node["args_head"]), "daemon", None
-        base = os.path.basename(node["args_head"].split()[0]) if node["args_head"].split() else ""
-        if base in ("bd", "gc", "beads", "python", "python3", "Python") or _NOISE.match(node["args_head"]):
+        if comm_base in ("bd", "gc", "beads", "python", "python3", "Python") or _NOISE.match(node["args_head"]):
             cur = ppid
             continue
         return label(node["args_head"]), "daemon", None

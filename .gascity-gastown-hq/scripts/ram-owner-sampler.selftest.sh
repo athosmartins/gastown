@@ -146,5 +146,57 @@ EXPECT_UNMATCHED=$((362576+150000+50000))
 [ "$(sessfail_get '["by_owner"]["claude (no session-id match)"]')" = "$EXPECT_UNMATCHED" ] && ok "all 3 claude PIDs still counted (RSS not lost), merged into the fallback bucket since no session data was available to disambiguate them" || bad "unmatched-claude bucket wrong during a failed lookup: $(sessfail_get '["by_owner"]')"
 
 echo ""
+echo "── Scenario: claude invoked via a full path whose ps comm= column would truncate away 'claude' -- still attributed by session, not merged into a generic bucket ──"
+# macOS ps truncates its comm= column to a fixed ~16 chars regardless of how
+# many other columns are requested (confirmed live against this exact
+# machine, ga-yr8vm gate review attempt 2) -- a real running session invoked
+# via /Users/athos/.local/bin/claude truncated to "/Users/athos/.lo", whose
+# basename is ".lo", not "claude". The comm field below is deliberately wrong
+# ("whatever-wrong-value") to prove owner_of() no longer depends on ps's
+# comm= column at all -- only on args_head, which is not truncated.
+cat > "$TMP/fullpath_ps.txt" <<'EOF'
+500 50000 300000 whatever-wrong-value /Users/athos/.local/bin/claude --settings {} --model sonnet --session-id 22222222-2222-2222-2222-222222222222 --effort max
+EOF
+python3 -c "
+import json
+print(json.dumps({'sessions': [
+  {'session_key': '22222222-2222-2222-2222-222222222222', 'name': 'full-path-session', 'template': 'x', 'work_dir': '/x'},
+]}))
+" > "$TMP/fullpath_sessions.json"
+RAM_OWNER_PS_FIXTURE="$TMP/fullpath_ps.txt" \
+RAM_OWNER_SESSIONS_FIXTURE="$TMP/fullpath_sessions.json" \
+RAM_OWNER_OUT="$TMP/fullpath.jsonl" \
+RAM_OWNER_NOW_EPOCH=1787700000 \
+RAM_OWNER_NOTIFY="$TMP/notify" \
+PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH" \
+  python3 "$SAMPLER" >/dev/null 2>"$TMP/stderr6"
+FULLPATH_REC=$(tail -1 "$TMP/fullpath.jsonl" 2>/dev/null)
+fullpath_get() { python3 -c "import json,sys; d=json.loads(sys.argv[1]); print(d$1)" "$FULLPATH_REC" 2>/dev/null; }
+[ "$(fullpath_get '["by_owner"]["full-path-session"]')" = "300000" ] && ok "full-path claude session attributed by its real session name despite a wrong/truncated-looking comm field" || bad "full-path claude session not attributed: $(fullpath_get '["by_owner"]')"
+[ "$(fullpath_get '["owner_kind"]["full-path-session"]')" = "session" ] && ok "kind is 'session', not merged into a generic daemon bucket" || bad "kind wrong: $(fullpath_get '["owner_kind"]')"
+
+echo ""
+echo "── Scenario: macOS app-bundle path with an embedded space in its final component -- label preserves the full name, not the first word ──"
+# a.split()[0] on ".../Google Chrome.app/Contents/MacOS/Google Chrome
+# --type=renderer ..." truncates at the space inside "Google Chrome",
+# producing the generic label "Google" -- which every OTHER app whose path
+# happens to share that truncated prefix then also collapses into. Proven
+# live: 34 real Chrome-family pids (~900MB) merged into one "Google" bucket
+# before this fix (ga-yr8vm gate review attempt 2).
+cat > "$TMP/chrome_ps.txt" <<'EOF'
+501 1 400000 Google /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --type=renderer --field-trial-handle=abc
+EOF
+RAM_OWNER_PS_FIXTURE="$TMP/chrome_ps.txt" \
+RAM_OWNER_SESSIONS_FIXTURE="$TMP/does-not-exist.json" \
+RAM_OWNER_OUT="$TMP/chrome.jsonl" \
+RAM_OWNER_NOW_EPOCH=1787700000 \
+RAM_OWNER_NOTIFY="$TMP/notify" \
+PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH" \
+  python3 "$SAMPLER" >/dev/null 2>"$TMP/stderr7"
+CHROME_REC=$(tail -1 "$TMP/chrome.jsonl" 2>/dev/null)
+chrome_get() { python3 -c "import json,sys; d=json.loads(sys.argv[1]); print(d$1)" "$CHROME_REC" 2>/dev/null; }
+[ "$(chrome_get '["by_owner"]["Google Chrome"]')" = "400000" ] && ok "app-bundle path labeled by its full name 'Google Chrome', not truncated to 'Google'" || bad "chrome label wrong: $(chrome_get '["by_owner"]')"
+
+echo ""
 echo "ram-owner-sampler selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1
