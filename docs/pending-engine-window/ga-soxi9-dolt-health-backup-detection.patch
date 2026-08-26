@@ -1,8 +1,51 @@
 diff --git a/examples/dolt/commands/health/run.sh b/examples/dolt/commands/health/run.sh
-index feb09aa3e..68355a919 100755
+index feb09aa3e..0af7995dd 100755
 --- a/examples/dolt/commands/health/run.sh
 +++ b/examples/dolt/commands/health/run.sh
-@@ -120,8 +120,14 @@ _meta_cache=$(mktemp)
+@@ -88,6 +88,28 @@ now_ms() {
+   esac
+ }
+ 
++# Always export DOLT_CLI_PASSWORD (even empty) so no dolt invocation in this
++# script ever prompts for a password on stdin. Without this, any `dolt
++# --user ...` call silently fails with "Failed to parse credentials:
++# operation not supported by device" on sessions without a controlling TTY.
++# ga-soxi9 gate-fix-1 (gate_run=ga-g3hay): this used to live INSIDE the
++# server_running branch below, which the SQL probe (--user via $conn_args)
++# never reached when the server was down anyway — but the per-database
++# backup-freshness loop further down deliberately runs regardless of
++# server_reachable (backups are on-disk and worth checking even when the
++# server is down), and ALSO passes --user. Scoping the export to
++# server_running meant every "dolt --user ... backup -v" call would hit the
++# same interactive-prompt failure precisely when the server is down —
++# reproduced live: 100% of databases reported query-failed in that state,
++# even ones with a perfectly good, freshly-synced backup, defeating the
++# whole point of checking backups independent of server reachability.
++# Exporting unconditionally costs nothing for the server_running path
++# (identical value, just set slightly earlier) and is safe file-wide: every
++# `dolt` invocation in this script already passes --user (verified by
++# inspection — the two conn_args-based SQL calls and this backup call are
++# the only three).
++export DOLT_CLI_PASSWORD="${GC_DOLT_PASSWORD:-}"
++
+ # Find dolt PID by port.
+ pid=$(managed_runtime_listener_pid "$GC_DOLT_PORT" || true)
+ if [ -n "$pid" ] || managed_runtime_tcp_reachable "$GC_DOLT_PORT"; then
+@@ -96,13 +118,6 @@ if [ -n "$pid" ] || managed_runtime_tcp_reachable "$GC_DOLT_PORT"; then
+   # Measure query latency.
+   start_ms=$(now_ms)
+   conn_args="--host $host --port $GC_DOLT_PORT --user $GC_DOLT_USER --no-tls"
+-  # Always export DOLT_CLI_PASSWORD (even empty) so the client does not
+-  # prompt for a password on stdin. Without this, the SELECT 1 probe
+-  # silently fails with "Failed to parse credentials: operation not
+-  # supported by device" on sessions without a controlling TTY —
+-  # which then left the health report claiming "server: running" but
+-  # never reporting per-database detail.
+-  export DOLT_CLI_PASSWORD="${GC_DOLT_PASSWORD:-}"
+   # Bound the ping. A TCP-reachable but unresponsive server (stuck
+   # goroutine, saturated pool, migration lock) would otherwise hang.
+   if run_bounded 5 dolt $conn_args sql -q "SELECT 1" >/dev/null 2>&1; then
+@@ -120,8 +135,14 @@ _meta_cache=$(mktemp)
  # mutated through the pipe); the survivors are spooled here and read back in
  # the parent shell.
  _zombie_scan_out=$(mktemp)
@@ -18,7 +61,7 @@ index feb09aa3e..68355a919 100755
  
  # Collect database info.
  #
-@@ -185,23 +191,128 @@ if [ -d "$data_dir" ] && [ "$server_reachable" = true ]; then
+@@ -185,23 +206,132 @@ if [ -d "$data_dir" ] && [ "$server_reachable" = true ]; then
    done
  fi
  
@@ -90,12 +133,16 @@ index feb09aa3e..68355a919 100755
 +
 +    # --user must precede the subcommand (dolt's global-flag position) and
 +    # is required here even though `backup -v` makes no server connection:
-+    # DOLT_CLI_PASSWORD is exported above (even as "") for the SQL probe and
-+    # leaks into every dolt invocation for the rest of this script's
++    # DOLT_CLI_PASSWORD is exported unconditionally above (even as "") and
++    # applies to every dolt invocation for the rest of this script's
 +    # lifetime — without a matching --user, dolt's credential parser treats
 +    # a present password with no user as a hard error ("Failed to parse
 +    # credentials"), not a timeout, and every database failed identically
-+    # until this was added (reproduced live on this host).
++    # until this was added (reproduced live on this host). The export was
++    # gate-fixed (ga-g3hay) to be unconditional, not scoped to
++    # server_running, specifically so this call — which runs regardless of
++    # server reachability — never falls back to dolt's interactive password
++    # prompt when the server is down.
 +    if (cd "$d" && run_bounded 5 dolt --user "$GC_DOLT_USER" backup -v 2>/dev/null) > "$_backup_remotes_tmp"; then
 +      # grep -c always writes a count to stdout, including "0" for zero
 +      # matches — but a "0" result also has a non-zero EXIT status (no match
@@ -162,7 +209,7 @@ index feb09aa3e..68355a919 100755
  fi
  
  # Find orphan databases.
-@@ -371,11 +482,18 @@ JSONEOF
+@@ -371,11 +501,18 @@ JSONEOF
    cat <<JSONEOF
  
    ],
@@ -186,18 +233,18 @@ index feb09aa3e..68355a919 100755
    "orphans": [
  JSONEOF
    first=true
-@@ -419,14 +537,36 @@ if [ -n "$db_info" ]; then
+@@ -419,14 +556,36 @@ if [ -n "$db_info" ]; then
    done
  fi
  
 -if [ -n "$backup_freshness" ]; then
 -  stale=""
 -  [ "$backup_stale" = true ] && stale=" [STALE]"
--  echo ""
--  echo "Backups: ${backup_freshness} ago${stale}"
--else
 +if [ -n "$backup_info" ]; then
    echo ""
+-  echo "Backups: ${backup_freshness} ago${stale}"
+-else
+-  echo ""
 -  echo "Backups: none found"
 +  echo "Backups:"
 +  echo "$backup_info" | while IFS='|' read -r name state age path size remote_count verified_count stale; do
