@@ -858,13 +858,25 @@ if [ -z "$FORCE_STORY_ID" ]; then
               # primary-path sibling of this block for the full rationale.
               bd -C "$TASK_STORE" label add "$TASK_BEAD_ID" "delivery:partial" -q 2>/dev/null || true
               bd -C "$TASK_STORE" label add "$TASK_BEAD_ID" "scope:needs-review" -q 2>/dev/null || true
-              bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-k2wjn/ga-zhfk8 backstop): gate:passed is set and this bead is not a story, but its body looks like it enumerates multiple approved deliverables (>=3 consecutive numbered or lettered list items — see detected lines below). The primary gate dispatcher never labeled this (crash-window — ga-esbg did not complete on it), so this sweep is doing so now instead of closing. If this diff genuinely covers every enumerated item, add label scope_covered:all and close manually; otherwise the remaining items are still live on this bead.
+              # ga-pm93k: mirrors quality-gate-dispatcher.sh's primary-path
+              # sibling of this block verbatim (existing convention) — the
+              # message stops asserting the list-structure signal as a
+              # verified deliverable count (an "OU"/"ou alternativamente"/
+              # "OR"-led item is an alternative to the item before it, not
+              # an extra deliverable) and always requests the git-log check
+              # that actually discriminates "gate passed" from "is ready",
+              # independent of whether the primary dispatcher or this
+              # crash-window backstop produced the hold. See that sibling
+              # block for the full rationale.
+              TASK_SCOPE_HOLD_WEAK_SIGNAL_NOTE="this bead body CONTAINS a numbered/lettered list structure (>=3 consecutive items — see detected lines below) that MAY enumerate multiple approved deliverables. This is a structural signal, not a verified count: an item starting with an alternative conjunction (OU, ou alternativamente, OR) is an ALTERNATIVE to the item before it, not an extra deliverable, so the real scope can be smaller than the item count suggests — read the detected lines before assuming N separate deliverables."
+              TASK_SCOPE_HOLD_ALWAYS_CHECK="Before deciding, ALWAYS also run: git log --oneline --all --grep=$TASK_BEAD_ID — and compare the result against origin/$TASK_DEFAULT_BRANCH. A bead commit that exists but never reached that branch is what actually discriminates gate passed from ready, independent of this list signal."
+              bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-k2wjn/ga-zhfk8 backstop): gate:passed is set and this bead is not a story, but $TASK_SCOPE_HOLD_WEAK_SIGNAL_NOTE The primary gate dispatcher never labeled this (crash-window — ga-esbg did not complete on it), so this sweep is doing so now instead of closing. $TASK_SCOPE_HOLD_ALWAYS_CHECK If this diff genuinely covers every enumerated item, add label scope_covered:all and close manually; otherwise the remaining items are still live on this bead.
 
 $TASK_PARTIAL_EVIDENCE" 2>/dev/null || true
               gc --city "$GC_CITY" mail send mayor \
                 -s "Gate held for scope review: $TASK_BEAD_ID (ga-k2wjn backstop)" \
-                -m "$(printf 'Task bead %s carries gate:passed and looks merged, but its body looks like it enumerates multiple approved deliverables (ga-k2wjn/ga-zhfk8: >=3 consecutive numbered or lettered list items). The primary gate dispatcher never labeled it delivery:partial (crash-window), so the story-delivery task reconciler is holding it now instead of closing.\n\n%s\n\nReview the diff against the full enumerated scope: if complete, add label scope_covered:all and close manually; if partial, the remaining items are still live on this bead.\n\nBead: %s   Store: %s' \
-                  "$TASK_BEAD_ID" "$TASK_PARTIAL_EVIDENCE" "$TASK_BEAD_ID" "$TASK_STORE")" \
+                -m "$(printf 'Task bead %s carries gate:passed and looks merged, but %s The primary gate dispatcher never labeled it delivery:partial (crash-window), so the story-delivery task reconciler is holding it now instead of closing.\n\n%s\n\n%s\n\nReview the diff against the full enumerated scope: if complete, add label scope_covered:all and close manually; if partial, the remaining items are still live on this bead.\n\nBead: %s   Store: %s' \
+                  "$TASK_BEAD_ID" "$TASK_SCOPE_HOLD_WEAK_SIGNAL_NOTE" "$TASK_PARTIAL_EVIDENCE" "$TASK_SCOPE_HOLD_ALWAYS_CHECK" "$TASK_BEAD_ID" "$TASK_STORE")" \
                 2>/dev/null || warn "Task reconciler: could not mail Mayor scope-hold escalation for $TASK_BEAD_ID (ga-k2wjn)"
             fi
           fi

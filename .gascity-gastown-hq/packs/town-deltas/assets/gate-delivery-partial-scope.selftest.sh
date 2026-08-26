@@ -658,6 +658,90 @@ else
   bad "story-delivery.sh does not capture stderr from task_reconciler_is_partial (ga-a7bt6u)"
 fi
 
+# ── 8. Wiring: honest weak-signal message + always-check-git-log (ga-pm93k) ─
+# ga-pm93k: a real hold (ga-sfj3i.1) enumerated "1. / OU (alternativa) 2. /
+# 3." — item 2 is an ALTERNATIVE to item 1, not an additional deliverable,
+# but this guard does not parse conjunctions and the hold message ASSERTED
+# "enumerates multiple approved deliverables" as verified fact. That wrong
+# reason nearly misdirected a reviewer into verifying the wrong claim (full
+# incident in the bead). Rather than add yet another per-token parser to an
+# already-repeatedly-patched counting heuristic (v1..v4: ga-k2wjn, ga-zhfk8,
+# ga-1yxyt, ga-cjrxh — this bead's own stated preference), the fix is in the
+# MESSAGE: it stops asserting the count as verified fact, names the
+# alternative-conjunction case explicitly, and always asks for the one check
+# that actually discriminates "gate passed" from "is ready" — a bead commit
+# that exists but never reached the default branch — regardless of which
+# detection path produced the hold. The hold itself is UNCHANGED (still
+# holds; sections 4-5 above already cover that wiring and must still pass).
+echo "── 8. Wiring: honest weak-signal message + always-check-git-log (ga-pm93k) ──"
+
+if grep -qF 'git log --oneline --all --grep=' "$DISPATCHER"; then
+  ok "dispatcher.sh's scope-hold message always requests the git-log-vs-origin check (ga-pm93k AC1)"
+else
+  bad "dispatcher.sh's scope-hold message does not request the git-log-vs-origin check (ga-pm93k AC1)"
+fi
+if grep -qF 'ALTERNATIVE to the item before it' "$DISPATCHER"; then
+  ok "dispatcher.sh's scope-hold message names the alternative-conjunction case (ga-pm93k AC2)"
+else
+  bad "dispatcher.sh's scope-hold message does not name the alternative-conjunction case (ga-pm93k AC2)"
+fi
+if grep -qF 'this bead body looks like it enumerates multiple approved deliverables' "$DISPATCHER"; then
+  bad "dispatcher.sh still ASSERTS the enumeration as verified fact (ga-pm93k regression — must be a MAY/structural-signal framing instead)"
+else
+  ok "dispatcher.sh no longer asserts the enumeration as verified fact (ga-pm93k AC2)"
+fi
+# All 3 message sites (bead comment, mayor mail, author notify) must carry
+# the always-check note, not just one — a future edit could update the
+# comment and forget its mail/notify siblings, since they are separate
+# printf calls. The note is defined ONCE in $SCOPE_HOLD_ALWAYS_CHECK and
+# referenced by name at each site, so this counts variable REFERENCES
+# (1 definition + 3 uses = 4), not occurrences of the git-log command text
+# (which appears literally only once, in the definition).
+DISPATCHER_CHECK_REFS=$(grep -cF 'SCOPE_HOLD_ALWAYS_CHECK' "$DISPATCHER")
+if [ "$DISPATCHER_CHECK_REFS" -ge 4 ]; then
+  ok "dispatcher.sh's always-check note is defined once and reaches all 3 message sites — found $DISPATCHER_CHECK_REFS references (ga-pm93k)"
+else
+  bad "dispatcher.sh's always-check note does not reach all 3 message sites — found only $DISPATCHER_CHECK_REFS references, expected >=4 (1 definition + 3 uses) (ga-pm93k)"
+fi
+
+if grep -qF 'git log --oneline --all --grep=' "$DELIVERY"; then
+  ok "story-delivery.sh's scope-hold backstop message always requests the git-log-vs-origin check (ga-pm93k AC1)"
+else
+  bad "story-delivery.sh's scope-hold backstop message does not request the git-log-vs-origin check (ga-pm93k AC1)"
+fi
+if grep -qF 'ALTERNATIVE to the item before it' "$DELIVERY"; then
+  ok "story-delivery.sh's scope-hold backstop message names the alternative-conjunction case (ga-pm93k AC2)"
+else
+  bad "story-delivery.sh's scope-hold backstop message does not name the alternative-conjunction case (ga-pm93k AC2)"
+fi
+if grep -qF 'its body looks like it enumerates multiple approved deliverables' "$DELIVERY"; then
+  bad "story-delivery.sh still ASSERTS the enumeration as verified fact (ga-pm93k regression — must be a MAY/structural-signal framing instead)"
+else
+  ok "story-delivery.sh no longer asserts the enumeration as verified fact (ga-pm93k AC2)"
+fi
+# Same reference-counting rationale as the dispatcher check above, mirrored
+# for the 2-site backstop (1 definition + 2 uses = 3).
+DELIVERY_CHECK_REFS=$(grep -cF 'TASK_SCOPE_HOLD_ALWAYS_CHECK' "$DELIVERY")
+if [ "$DELIVERY_CHECK_REFS" -ge 3 ]; then
+  ok "story-delivery.sh's always-check note is defined once and reaches both message sites — found $DELIVERY_CHECK_REFS references (ga-pm93k)"
+else
+  bad "story-delivery.sh's always-check note does not reach both message sites — found only $DELIVERY_CHECK_REFS references, expected >=3 (1 definition + 2 uses) (ga-pm93k)"
+fi
+
+# ga-pm93k AC3 ("não remover o hold"): a message-only fix could accidentally
+# have also loosened the actual hold condition. Re-confirm both control-flow
+# anchors that sections 4-5 already established still exist verbatim.
+if grep -qF 'elif [ "$IS_PARTIAL" = "1" ]; then' "$DISPATCHER"; then
+  ok "dispatcher.sh's IS_PARTIAL hold branch is still intact (ga-pm93k AC3 — hold not removed)"
+else
+  bad "dispatcher.sh's IS_PARTIAL hold branch is missing (ga-pm93k AC3 regression)"
+fi
+if grep -qF 'keep:partial-delivery)' "$DELIVERY"; then
+  ok "story-delivery.sh's keep:partial-delivery arm is still intact (ga-pm93k AC3 — hold not removed)"
+else
+  bad "story-delivery.sh's keep:partial-delivery arm is missing (ga-pm93k AC3 regression)"
+fi
+
 echo ""
 echo "== gate-delivery-partial-scope: PASS=$PASS FAIL=$FAIL =="
 [ "$FAIL" -eq 0 ]

@@ -4829,19 +4829,40 @@ fi
         bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
         bd -C "$BEAD_CITY" label add "$BEAD_ID" "delivery:partial" -q 2>/dev/null || true
         bd -C "$BEAD_CITY" label add "$BEAD_ID" "scope:needs-review" -q 2>/dev/null || true
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED and branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA) — but NOT closing (ga-k2wjn/ga-zhfk8): this bead body looks like it enumerates multiple approved deliverables (>=3 consecutive numbered or lettered list items — see detected lines below), and the gate only reviewed this one diff. The gate verdict is about the DIFF, not about whether the full scope of the BEAD is done — those are different claims. Labeled delivery:partial + scope:needs-review; Pilot will not re-dispatch it. If this diff genuinely covers every enumerated item, add label scope_covered:all and re-run the gate (or close manually).
+        # ga-pm93k: the list-structure signal above is a HEURISTIC, not a
+        # verified count of deliverables — an item that opens with an
+        # alternative conjunction ("OU"/"ou alternativamente"/"OR") is an
+        # ALTERNATIVE to the item before it, not an additional deliverable,
+        # and this guard does not parse conjunctions. Real incident:
+        # ga-sfj3i.1 was held with this exact miscount as the stated reason,
+        # which misdirected the reviewer toward verifying "3 deliverables"
+        # when the real scope was 2 — a wrong reason is not neutral, it
+        # steers the check. Rather than add yet another per-token parser to
+        # an already-repeatedly-patched heuristic (v1..v4: ga-k2wjn,
+        # ga-zhfk8, ga-1yxyt, ga-cjrxh), the message stops ASSERTING the
+        # count as fact and says what it actually is: a structural signal
+        # worth a human glance. The hold itself is unchanged — still holds,
+        # just says so honestly (ga-pm93k AC2/AC3).
+        SCOPE_HOLD_WEAK_SIGNAL_NOTE="this bead body CONTAINS a numbered/lettered list structure (>=3 consecutive items — see detected lines below) that MAY enumerate multiple approved deliverables. This is a structural signal, not a verified count: an item starting with an alternative conjunction (OU, ou alternativamente, OR) is an ALTERNATIVE to the item before it, not an extra deliverable, so the real scope can be smaller than the item count suggests — read the detected lines before assuming N separate deliverables."
+        # ga-pm93k AC1: the check that actually discriminates "gate passed"
+        # from "is ready", independent of WHY this hold fired. ga-sfj3i.1
+        # was almost released on this heuristic's word alone; only an
+        # unrelated manual git-log check caught a genuinely unmerged commit
+        # fixing a real risk. Always requested from here on.
+        SCOPE_HOLD_ALWAYS_CHECK="Before deciding, ALWAYS also run: git log --oneline --all --grep=$BEAD_ID — and compare the result against origin/$DEFAULT_BRANCH. A bead commit that exists but never reached that branch is what actually discriminates gate passed from ready, independent of this list signal."
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED and branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA) — but NOT closing (ga-k2wjn/ga-zhfk8): $SCOPE_HOLD_WEAK_SIGNAL_NOTE The gate only reviewed this one diff, which is not the same claim as the full scope of the BEAD being done. $SCOPE_HOLD_ALWAYS_CHECK Labeled delivery:partial + scope:needs-review; Pilot will not re-dispatch it. If this diff genuinely covers every enumerated item, add label scope_covered:all and re-run the gate (or close manually).
 
 $PARTIAL_EVIDENCE" 2>/dev/null || true
         gc --city "$GC_CITY" mail send mayor \
           -s "Gate held for scope review: $BEAD_ID (ga-k2wjn)" \
-          -m "$(printf 'Source bead %s PASSED the quality gate and merged (branch %s, sha %s, gate_run %s) but was NOT closed.\n\nga-k2wjn/ga-zhfk8: the bead body looks like it enumerates multiple approved deliverables (>=3 consecutive numbered or lettered list items), and a gate PASS only proves this one diff does what it claims, not that the full scope of the bead is done.\n\n%s\n\nLabeled delivery:partial + scope:needs-review; Pilot will not re-dispatch it.\n\nReview the diff against the full enumerated scope: if complete, add label scope_covered:all and close manually (or re-submit to the gate); if partial, the remaining items are still live on this bead.\n\nBead: %s   Rig: %s\nBranch: %s (gate run %s, sha %s)' \
-            "$BEAD_ID" "$BRANCH" "$MERGE_SHA" "$GATE_RUN_ID" "$PARTIAL_EVIDENCE" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID" "$MERGE_SHA")" \
+          -m "$(printf 'Source bead %s PASSED the quality gate and merged (branch %s, sha %s, gate_run %s) but was NOT closed.\n\nga-k2wjn/ga-zhfk8: %s\n\n%s\n\n%s\n\nLabeled delivery:partial + scope:needs-review; Pilot will not re-dispatch it.\n\nReview the diff against the full enumerated scope: if complete, add label scope_covered:all and close manually (or re-submit to the gate); if partial, the remaining items are still live on this bead.\n\nBead: %s   Rig: %s\nBranch: %s (gate run %s, sha %s)' \
+            "$BEAD_ID" "$BRANCH" "$MERGE_SHA" "$GATE_RUN_ID" "$SCOPE_HOLD_WEAK_SIGNAL_NOTE" "$PARTIAL_EVIDENCE" "$SCOPE_HOLD_ALWAYS_CHECK" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID" "$MERGE_SHA")" \
           2>/dev/null || warn "Could not mail Mayor scope-hold escalation for $BEAD_ID (ga-k2wjn)"
         # ga-409f4: NOTIFY_AUTHOR (branch-author-aware), not the bead-derived $AUTHOR.
         notify_author_with_fallback "$BEAD_ID" "$NOTIFY_AUTHOR" "$AUTHOR" \
           "Your gate PASS is held for scope review: $BEAD_ID (ga-k2wjn)" \
-          "$(printf 'Your branch %s PASSED gate review and merged (sha %s), but the source bead %s was NOT closed.\n\nga-k2wjn/ga-zhfk8: the bead body looks like it enumerates multiple approved deliverables (>=3 consecutive numbered or lettered list items), and a gate PASS only proves this diff does what it claims, not that the full scope of the bead is done. Held as delivery:partial + scope:needs-review pending Mayor review.\n\n%s\n\nIf this diff genuinely covers every enumerated item, add label scope_covered:all and close manually (or re-submit to the gate); otherwise the remaining items are still live on this bead.\n\nBead: %s   Rig: %s\nBranch: %s (gate run %s)' \
-            "$BRANCH" "$MERGE_SHA" "$BEAD_ID" "$PARTIAL_EVIDENCE" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID")" \
+          "$(printf 'Your branch %s PASSED gate review and merged (sha %s), but the source bead %s was NOT closed.\n\nga-k2wjn/ga-zhfk8: %s Held as delivery:partial + scope:needs-review pending Mayor review.\n\n%s\n\n%s\n\nIf this diff genuinely covers every enumerated item, add label scope_covered:all and close manually (or re-submit to the gate); otherwise the remaining items are still live on this bead.\n\nBead: %s   Rig: %s\nBranch: %s (gate run %s)' \
+            "$BRANCH" "$MERGE_SHA" "$BEAD_ID" "$SCOPE_HOLD_WEAK_SIGNAL_NOTE" "$PARTIAL_EVIDENCE" "$SCOPE_HOLD_ALWAYS_CHECK" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID")" \
           "scope-hold on $BEAD_ID (ga-k2wjn)"
       else
         # BUG/TASK → close it. bd list defaults to OPEN-only, so closing removes
