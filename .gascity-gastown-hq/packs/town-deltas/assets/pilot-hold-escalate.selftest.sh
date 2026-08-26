@@ -48,6 +48,23 @@ if [ -z "$HOLD_FN" ]; then
   exit 2
 fi
 
+# ── _pilot_defer_extend (ga-sfj3i.1) — extracted here, near the top, NOT next
+# to its own D1-D9 scenarios below, because Scenario H (further down) needs it
+# in scope too. ga-m365u: _mayor_deferred_hold_db now calls _pilot_defer_extend,
+# but Scenario H's isolated subshell only ever eval'd MDH_FN+HOLD_FN — under
+# this file's own `set -uo pipefail` (no -e), the resulting "command not
+# found" was silently swallowed (Scenario H's assertions check OTHER bd calls
+# that still fire regardless), so 50/50 passed while the wiring was actually
+# broken. Extracting DEFER_FN here — before Scenario H's subshell — and eval'ing
+# it there alongside the other two closes the gap at its root: any function a
+# scenario's real call graph touches must be in scope BEFORE that scenario
+# runs, not just before its own dedicated section.
+DEFER_FN="$(awk '/^_pilot_defer_extend\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+if [ -z "$DEFER_FN" ]; then
+  echo "FATAL: _pilot_defer_extend() not found in $DISPATCHER (extraction pattern drifted?)" >&2
+  exit 2
+fi
+
 # ── Workspace + call-log capture ───────────────────────────────────────────────
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pilot-hold-escalate-selftest.XXXXXX")"
 cleanup() { rm -rf "$WORK"; }
@@ -256,6 +273,7 @@ else
     warn() { printf 'warn\t%s\n' "$*" >> "$CALLS"; }
     eval "$MDH_FN"
     eval "$HOLD_FN"
+    eval "$DEFER_FN"
     _mayor_deferred_hold_db "hq" "$(date +%s)"
   )
   if has_call "bd	-C hq label add mh-bead1 pilot:held -q"; then
@@ -272,6 +290,19 @@ else
     ok "AC4: escalates to the Mayor on the FIRST genuinely-qualifying hold, end-to-end"
   else
     bad "AC4 regression: did not escalate end-to-end (dump: $(cat "$CALLS" | tr '\n' '|'))"
+  fi
+  # ga-m365u: the assertions above only prove the PRE-EXISTING labels/escalation
+  # still fire — none of them ever checked the NEW _pilot_defer_extend wiring
+  # itself. Without DEFER_FN in scope (fixed above), this call would silently
+  # fail to even happen; now that it's in scope, assert the real bd update
+  # --defer call actually fires with a well-formed ISO8601 target (the exact
+  # timestamp is wall-clock-dependent — _now is real `date +%s` at test-run
+  # time plus MAYOR_DEFERRED_HOLD_SECS — so match the STRUCTURE, not a literal
+  # value).
+  if grep -qE '^bd	-C hq update mh-bead1 --defer [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z -q$' "$CALLS"; then
+    ok "ga-m365u: the real bd -C hq update mh-bead1 --defer <iso> call fires end-to-end — proves the epoch-to-ISO wiring between _mayor_deferred_hold_db and _pilot_defer_extend actually connects, not just that both functions exist in isolation"
+  else
+    bad "ga-m365u regression: the end-to-end defer call never fired from _mayor_deferred_hold_db (dump: $(cat "$CALLS" | tr '\n' '|'))"
   fi
 fi
 
@@ -359,12 +390,9 @@ echo "$HOLD_FN" | grep -q '"no-auto-dispatch"' && ok "_pilot_hold_or_escalate ca
 # on ga-z297h. _pilot_defer_extend makes a timed hold ALSO set the bead's real
 # defer_until (the one field every such probe already respects), with an
 # "extend, never shorten" guard so a short automatic hold can never clobber a
-# longer hold already in place (wa-2lzmz-class incident).
-DEFER_FN="$(awk '/^_pilot_defer_extend\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
-if [ -z "$DEFER_FN" ]; then
-  echo "FATAL: _pilot_defer_extend() not found in $DISPATCHER (extraction pattern drifted?)" >&2
-  exit 2
-fi
+# longer hold already in place (wa-2lzmz-class incident). DEFER_FN itself is
+# extracted near the top of this file (before Scenario H), not here — see the
+# ga-m365u comment there for why.
 
 # run_defer <db> <id> <new_iso> [<cur_defer_iso_or_empty>] [<dry(0|1)>] [<simulate_show_failure(0|1)>]
 # The fake bd() here additionally SERVES `show <id> --json` with a
