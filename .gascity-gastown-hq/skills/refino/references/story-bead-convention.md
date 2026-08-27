@@ -180,16 +180,32 @@ bd -C "$GC_CITY_PATH" update "$ID" \
 #    this exact way, traced to this recipe never setting the route). Pool
 #    mapping mirrors painel_visibilidade.py's _default_pool_for_store
 #    (wa-t9jbv) and quality-gate-guard.sh's _gap1_default_pool_for_city
-#    (ga-yikyf) — keep all three in sync if a new rig is ever added.
+#    (ga-yikyf) — keep all three in sync if a new rig is ever added,
+#    INCLUDING the empty-for-unrecognized fallback below: a wrong guess
+#    silently claims the bead into a pool with no context on that rig, which
+#    is the same invisible-limbo failure class this whole fix exists to
+#    close, just moved one file over (gate review, ga-yikyf attempt 1).
 case "$GC_CITY_PATH" in
-  */whatsapp_automation) POOL=wa-worker ;;
-  */property_scrapers)   POOL=ps-worker ;;
-  *)                       POOL=gastown.dog ;;
+  */whatsapp_automation)  POOL=wa-worker ;;
+  */property_scrapers)    POOL=ps-worker ;;
+  */.gascity-gastown-hq)  POOL=gastown.dog ;;
+  *)                       POOL="" ;;
 esac
-bd -C "$GC_CITY_PATH" update "$ID" \
-  --add-label ctx:ready \
-  --add-label exec:auto \
-  --set-metadata "gc.routed_to=$POOL"
+if [ -n "$POOL" ]; then
+  bd -C "$GC_CITY_PATH" update "$ID" \
+    --add-label ctx:ready \
+    --add-label exec:auto \
+    --set-metadata "gc.routed_to=$POOL"
+else
+  # Unrecognized rig (not wa/ps/HQ) — do NOT guess a route. Flag for a human
+  # instead, same as quality-gate-guard.sh's _gap1_default_pool_for_city does
+  # for the identical case.
+  bd -C "$GC_CITY_PATH" update "$ID" \
+    --add-label ctx:ready \
+    --add-label exec:auto \
+    --add-label needs-human
+  echo "AVISO: \$GC_CITY_PATH ($GC_CITY_PATH) não é whatsapp_automation/property_scrapers/HQ — gc.routed_to NÃO setado, needs-human adicionado. Roteie manualmente."
+fi
 
 echo "Story bead created: $ID"
 ```
@@ -209,18 +225,29 @@ bd -C "$GC_CITY_PATH" update "$ID" \
   --set-metadata "story.aprovado_em=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # Arm for dispatch — same reasoning as step 5 of "Creating a new story bead"
-# above. SKIP this block if you just added needs-human + pilot:no-auto-dispatch
-# per the 🚨 compliance-block section below — an unresolved compliance/safety
-# gate must NOT be armed for auto-dispatch.
+# above (including the empty-for-unrecognized-rig fallback: a wrong guess is
+# worse than none, gate review ga-yikyf attempt 1). SKIP this block if you
+# just added needs-human + pilot:no-auto-dispatch per the 🚨 compliance-block
+# section below — an unresolved compliance/safety gate must NOT be armed for
+# auto-dispatch.
 case "$GC_CITY_PATH" in
-  */whatsapp_automation) POOL=wa-worker ;;
-  */property_scrapers)   POOL=ps-worker ;;
-  *)                       POOL=gastown.dog ;;
+  */whatsapp_automation)  POOL=wa-worker ;;
+  */property_scrapers)    POOL=ps-worker ;;
+  */.gascity-gastown-hq)  POOL=gastown.dog ;;
+  *)                       POOL="" ;;
 esac
-bd -C "$GC_CITY_PATH" update "$ID" \
-  --add-label ctx:ready \
-  --add-label exec:auto \
-  --set-metadata "gc.routed_to=$POOL"
+if [ -n "$POOL" ]; then
+  bd -C "$GC_CITY_PATH" update "$ID" \
+    --add-label ctx:ready \
+    --add-label exec:auto \
+    --set-metadata "gc.routed_to=$POOL"
+else
+  bd -C "$GC_CITY_PATH" update "$ID" \
+    --add-label ctx:ready \
+    --add-label exec:auto \
+    --add-label needs-human
+  echo "AVISO: \$GC_CITY_PATH ($GC_CITY_PATH) não é whatsapp_automation/property_scrapers/HQ — gc.routed_to NÃO setado, needs-human adicionado. Roteie manualmente."
+fi
 ```
 
 ### Preserving 🚨 compliance/safety blocks on rewrite (ga-fnnyy)
