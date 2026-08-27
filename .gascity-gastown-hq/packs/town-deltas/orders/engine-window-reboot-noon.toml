@@ -1,5 +1,13 @@
-# ga-3azujf: lembrete one-shot de meio-dia (decisao do Athos, 27/08 08:4x —
-# "agendar pra meio dia mas me confirma antes de fazer"). O cron e diario
+# ga-3azujf: lembrete one-shot de meio-dia
+#
+# ARMADILHA (medida 27/08, errei nela): o cron destes orders e avaliado em UTC,
+# NAO na hora local. Prova: mol-dog-stale-db (0 */4 * * *) executou as
+# 2026-08-27T15:00:34Z, que e 12:00 local (-03). Eu tinha escrito "0 12 * * *"
+# querendo meio-dia local; isso apontava pras 09:00 da manha e o lembrete nunca
+# disparou no horario combinado. Meio-dia local (-03) = 15:00 UTC.
+#
+# Decisao do Athos (27/08 08:4x): "agendar pra meio dia mas me confirma antes
+# de fazer". O cron e diario
 # porque o trigger nao tem forma one-shot; a semantica de UMA vez vem do
 # marker em ~/.gastown/run/engine-window-reboot-noon.fired, que o script grava
 # no primeiro disparo. O script SO AVISA — nunca reinicia (o reboot e ato
@@ -7,5 +15,5 @@
 [order]
 description = "Meio-dia: lembrar o Athos de confirmar o reboot que dispara a janela do engine (ga-3azujf) — nunca reinicia sozinho"
 trigger = "cron"
-schedule = "0 12 * * *"
+schedule = "0 15 * * *"
 exec = "$PACK_DIR/assets/scripts/engine-window-reboot-noon.sh"
