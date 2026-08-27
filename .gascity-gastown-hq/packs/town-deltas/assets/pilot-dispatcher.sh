@@ -2142,7 +2142,7 @@ _pilot_hold_or_escalate() {
   local _phe_prefix="pilot:held-count:${_phe_slug}:"
   local _phe_cur _phe_new
   _phe_cur=$(printf '%s' "$_phe_labels" | jq -r --arg p "$_phe_prefix" \
-    '(. // []) | map(select(startswith($p)) | ltrimstr($p) | [scan("[0-9]+")] | if length > 0 then (last | tonumber) else empty end) | if length > 0 then max else 0 end' \
+    '(. // []) | map(select(startswith($p)) | ltrimstr($p) | select(test("^[0-9]+$")) | tonumber) | if length > 0 then max else 0 end' \
     2>/dev/null)
   case "$_phe_cur" in ''|*[!0-9]*) _phe_cur=0 ;; esac
   _phe_new=$((_phe_cur + 1))
@@ -2598,7 +2598,7 @@ _filter_candidates() {
           # OLDEST/expired stamp → the filter judged an actively-held bead "expired" →
           # re-selected it every sweep → refused → re-stamped → the clog loop. The bead is
           # still held iff its LATEST hold is in the future.
-          ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | [scan("[0-9]+")] | if length > 0 then (last | tonumber) else empty end) |
+          ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | select(test("^[0-9]+$")) | tonumber) |
             if length > 0
             then (max < $now_ts)
             else false end)
@@ -2613,7 +2613,7 @@ _filter_candidates() {
           # does not slip back into the candidate pool just because a timer ran out.
           # Nothing decrements this label — only a human or mayor, or the escalation
           # labels the guard sets on its own, re-admit the bead.
-          ((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | [scan("[0-9]+")] | if length > 0 then (last | tonumber) else empty end) |
+          ((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+$")) | tonumber) |
             if length > 0
             then (max < $reclaim_cap)
             else true end)
@@ -2921,10 +2921,10 @@ _filter_candidates() {
           # taught this function twice.
           (if (($b.metadata["pilot.sling_for"] // "") | test("\\S")) then "pilot-sling-wrapper:pilot.sling_for" else empty end),
           (if ( ($L | index("pilot:held"))
-                and (($L | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | [scan("[0-9]+")] | if length > 0 then (last | tonumber) else empty end)) |
+                and (($L | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | select(test("^[0-9]+$")) | tonumber)) |
                      if length > 0 then (max >= $now_ts) else true end) )
            then "pilot:held(not-expired)" else empty end),
-          (if ( ($L | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | [scan("[0-9]+")] | if length > 0 then (last | tonumber) else empty end)) |
+          (if ( ($L | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+$")) | tonumber)) |
                 if length > 0 then (max >= $reclaim_cap) else false end )
            then "pilot:reclaim-count>=cap(\($reclaim_cap))" else empty end),
           ( ($L | map(select(. as $x | $preapproval | index($x)))) as $pa
