@@ -120,6 +120,37 @@
 # orphan, which is worse than the noise this bug is about, so uncertainty
 # always falls through to the pre-existing alert behavior, unchanged.
 #
+# DESIGN-FIRST / PILOT:NO-AUTO-DISPATCH PARK SIGNALS (ga-52zhb — the FIFTH
+# instance of this file's own recurring class, after gate:needs-human*
+# (ga-l8yh6), blocked-by:* (ga-cjk1j), blocked:* (ga-te41ft), and
+# in_progress+live-assignee (ga-eiaidn) above): two more deliberate-park
+# signals were missing, and on 2026-08-27 they accounted for HALF of one
+# day's alerts (2 of 4) — wa-tozk and wa-i6a1j, both correctly parked, both
+# reported as orphan-suspects.
+#   - design-first: the Pilot's OWN dispatch-gate veto (_filter_dispatch_gates
+#     clause (a) in pilot-dispatcher.sh) — a bead whose title+description
+#     matches the narrow literal phrase "design[ -]?first" (case-insensitive)
+#     is a deliberate "spec needs Athos's approval before coding" gate
+#     (wa-1my1, wa-tozk). This watchdog only ever looked at LABELS, never at
+#     title/description text, so it had no way to see this signal — replicated
+#     here as the EXACT SAME jq regex pilot-dispatcher.sh already uses, so the
+#     two can never silently drift apart on what counts as "design-first."
+#   - pilot:no-auto-dispatch, and its bare sibling no-auto-dispatch (no
+#     "pilot:" prefix) — added even though ga-52zhb only named the prefixed
+#     form, per this file's own "fix the CLASS, not the cited instance"
+#     lesson: bead_state.py's PARK_EXACT already treats both forms as
+#     identical park signals, and pilot-dispatcher.sh needed a THIRD
+#     chokepoint fix (ga-rfpm9) specifically because the bare form was missed
+#     the first time — the same drift this file already paid for once with
+#     blocked-by:*/blocked:*. Signals an explicit human/Mayor stand-down of
+#     auto-dispatch (ga-1mqdz); wa-i6a1j carried it with a live owner
+#     (oracle-wa) and was still flagged as an orphan-suspect.
+# Both feed the SAME is_park computation as every other signal above —
+# counted in the "PARK:" log line and the mail summary, never entering the
+# age-based alert/cooldown/comment pipeline. No label/status/assignee
+# mutation added; this stays detection-only, per ga-52zhb's own suggested-fix
+# scope.
+#
 # NOTIFY PRIORITY: low (-p 2), not the -p 4 used by throughput-stall-watchdog.
 # That watchdog pages Athos only when auto-recovery of a SYSTEMIC stall fails
 # (Athos, 2026-06-30: "só me notifique quando a máquina precisar de mim"). A
@@ -597,6 +628,15 @@ run_sweep() {
     # blocked-by:*, so every blocked:*-labeled bead re-alerted forever — 8
     # measured live 2026-08-15, one (wa-kty2h) stuck ~4.8 days despite being
     # correctly and deliberately parked on an open dependency.
+    # pilot:no-auto-dispatch / no-auto-dispatch + design-first (ga-52zhb, see
+    # header comment): the FIFTH sibling in this same family. The label check
+    # matches BOTH the "pilot:"-prefixed and bare forms exactly — bead_state.py's
+    # PARK_EXACT treats them identically, and matching only one would repeat
+    # the same blocked-by:*/blocked:* drift this file already paid for once.
+    # design-first is the only non-label park signal here — a title+description
+    # regex using the identical jq test pilot-dispatcher.sh's
+    # _filter_dispatch_gates already applies, so the two can never silently
+    # disagree on what counts as "design-first."
     # bstatus/bassignee (ga-eiaidn): carried through unchanged from $b so the
     # while-loop below can decide, per candidate, whether a session-liveness
     # check even applies (status=in_progress with a non-empty assignee) —
@@ -612,7 +652,9 @@ run_sweep() {
             ( if ( ($L | any(startswith("gate:needs-human")))
                    or ($L | any(startswith("blocked-by:")))
                    or ($L | any(startswith("blocked:")))
-                   or (($b.status // "") == "blocked") )
+                   or (($b.status // "") == "blocked")
+                   or ($L | any(. == "pilot:no-auto-dispatch" or . == "no-auto-dispatch"))
+                   or ( ((($b.title) // "") + " " + (($b.description) // "")) | ascii_downcase | test("design[ -]?first") ) )
               then "1" else "0" end ),
             ($b.status // ""),
             ($b.assignee // "")
@@ -696,7 +738,7 @@ run_sweep() {
   flagged_tsv="$orphan_tsv"
 
   if [ "$park_count" -gt 0 ]; then
-    log "PARK: ${park_count} bead(s) parado(s) de proposito (gate:needs-human*/blocked-by:*/blocked:*/status=blocked) — nao contam para o alerta de orfao"
+    log "PARK: ${park_count} bead(s) parado(s) de proposito (gate:needs-human*/blocked-by:*/blocked:*/status=blocked/design-first/pilot:no-auto-dispatch) — nao contam para o alerta de orfao"
     printf '%b' "$park_tsv" | while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount; do
       [ -z "${bid:-}" ] && continue
       log "  - PARK $bid ($(_store_name "$store2")) age=${age_min}min labels=[${labels}]"
@@ -820,7 +862,7 @@ run_sweep() {
   local msg
   while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount; do
     [ -z "${bid:-}" ] && continue
-    msg="gate-orphaned-label-watchdog (ga-l8yh6): this bead carries gate:* label(s) [${labels}] with no ACTIVE quality-gate-marker/-run for >= ${GOLW_STALE_MINUTES}min (age: ${age_min}min). Last known gate artifact: ${lstatus} (${lcount} open artifact(s) referencing this bead; 0 = none ever found in the HQ store). Detection-only report — no label/status/assignee was touched. Common causes seen historically (ga-d3eg2): stale label after a manual fix, branch conflicts needing re-anchor, or already-merged-but-never-closed (an intentional park via gate:needs-human*/blocked-by:*/blocked:*/status=blocked is excluded from this alert entirely — see ga-cjk1j/ga-te41ft) — a human/Mayor should triage."
+    msg="gate-orphaned-label-watchdog (ga-l8yh6): this bead carries gate:* label(s) [${labels}] with no ACTIVE quality-gate-marker/-run for >= ${GOLW_STALE_MINUTES}min (age: ${age_min}min). Last known gate artifact: ${lstatus} (${lcount} open artifact(s) referencing this bead; 0 = none ever found in the HQ store). Detection-only report — no label/status/assignee was touched. Common causes seen historically (ga-d3eg2): stale label after a manual fix, branch conflicts needing re-anchor, or already-merged-but-never-closed (an intentional park via gate:needs-human*/blocked-by:*/blocked:*/status=blocked/design-first/pilot:no-auto-dispatch is excluded from this alert entirely — see ga-cjk1j/ga-te41ft/ga-52zhb) — a human/Mayor should triage."
     if [ -n "${GOLW_TEST_COMMENTS_LOG:-}" ]; then
       echo "comment:${store2}:${bid}:${msg}" >> "$GOLW_TEST_COMMENTS_LOG" 2>/dev/null || true
     else
@@ -833,7 +875,7 @@ run_sweep() {
   local unchanged_count=$(( total_flagged - new_count ))
   local summary="GATE ORPHANED LABEL: ${new_count} new/due, ${resolved_count} resolved, ${unchanged_count} unchanged-already-reported — ${total_flagged} total currently flagged (>=${GOLW_STALE_MINUTES}min)."
   if [ "$park_count" -gt 0 ]; then
-    summary="${summary} +${park_count} parado(s) por decisao humana (gate:needs-human*/blocked-by:*/blocked:*/status=blocked) — nao contam para o alerta acima."
+    summary="${summary} +${park_count} parado(s) por decisao humana (gate:needs-human*/blocked-by:*/blocked:*/status=blocked/design-first/pilot:no-auto-dispatch) — nao contam para o alerta acima."
   fi
   if [ "$active_count" -gt 0 ]; then
     summary="${summary} +${active_count} em andamento com sessao viva (status=in_progress, assignee confirmado ativo via gc session list, ga-eiaidn) — nao contam para o alerta acima."
@@ -1024,6 +1066,17 @@ GCSTUB
     local id="$1" labels="$3" upd="$4" assignee="$5"
     local labels_json; labels_json="$(printf '%s' "$labels" | tr ',' '\n' | jq -R . | jq -s -c .)"
     printf '{"id":"%s","status":"in_progress","assignee":"%s","updated_at":"%s","labels":%s}' "$id" "$assignee" "$upd" "$labels_json"
+  }
+
+  # ga-52zhb: separate builder (not a mk_candidate signature change — every
+  # existing scenario relies on mk_candidate having no description field at
+  # all) for the title/description-text park signal (design-first) this fix
+  # adds.
+  mk_candidate_designfirst() {  # id store labels_csv updated_at description
+    local id="$1" labels="$3" upd="$4" desc="$5"
+    local labels_json; labels_json="$(printf '%s' "$labels" | tr ',' '\n' | jq -R . | jq -s -c .)"
+    local desc_json; desc_json="$(printf '%s' "$desc" | jq -Rs .)"
+    printf '{"id":"%s","status":"open","updated_at":"%s","description":%s,"labels":%s}' "$id" "$upd" "$desc_json" "$labels_json"
   }
 
   # ── Scenario 1: no artifact at all + stale → FLAG (ga-hn3kh shape) ────────
@@ -1925,6 +1978,81 @@ GCSTUB
   grep -q "cand-quiet3" "$COMMQ3" 2>/dev/null && ok "scenario Q3: comment posted (ordinary daytime staleness unaffected by this fix)" || bad "scenario Q3: no comment posted for ordinary daytime staleness"
   rm -f "$STATE_FILE" 2>/dev/null
   unset GOLW_TEST_NOW
+
+  # ── Scenario 37 (ga-52zhb FIXTURE — REPROVES on HEAD before this fix): a
+  # bead whose description carries the Pilot's own "design-first" marker
+  # (wa-tozk shape — awaiting Athos's approval before any code is written)
+  # alongside real gate:* lifecycle labels, stale → must NOT enter NEW/DUE;
+  # counted as PARK only. Before this fix, is_park never inspected
+  # title/description at all, so this signal was invisible to it. ──────────
+  echo "Scenario 37 (ga-52zhb fixture): design-first bead (wa-tozk shape) + gate:* labels, stale → NOT flagged as orphan, counted as PARK only"
+  printf '[%s]' "$(mk_candidate_designfirst cand-design1 "$TMP/hq" "story:approved,gate:queued" "$OLD_TS" "DESIGN-FIRST — aguardando aprovacao do Athos antes de codar (wa-tozk class)")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-design1.json"
+  NOTIF37="$TMP/notif37"; MAIL37="$TMP/mail37"; COMM37="$TMP/comm37"
+  : > "$NOTIF37"; : > "$MAIL37"; : > "$COMM37"; : > "$LOG"
+  GOLW_TEST_NOTIFIED="$NOTIF37" GOLW_TEST_MAILED="$MAIL37" GOLW_TEST_COMMENTS_LOG="$COMM37" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 37: design-first bead does not enter NEW/DUE (return 0)" || bad "scenario 37 (ga-52zhb regression — the exact bug): a design-first bead was treated as an orphan-suspect, got $rc"
+  [ ! -s "$COMM37" ] && ok "scenario 37: no comment posted on the design-first bead" || bad "scenario 37 (ga-52zhb regression): comment posted on a bead carrying a design-first marker (should be excluded, wa-tozk class)"
+  [ ! -s "$NOTIF37" ] && ok "scenario 37: no notify fired for a design-first-park-only sweep" || bad "scenario 37: notify fired despite only a design-first-parked bead being present"
+  [ ! -s "$MAIL37" ] && ok "scenario 37: no mail fired for a design-first-park-only sweep" || bad "scenario 37: mail fired despite only a design-first-parked bead being present"
+  grep -q "PARK: 1 bead" "$LOG" 2>/dev/null && ok "scenario 37: log records the park count for the design-first bead" || bad "scenario 37: log missing the PARK count line for a design-first park"
+  grep -q "cand-design1" "$LOG" 2>/dev/null && ok "scenario 37: log names the design-first-parked bead" || bad "scenario 37: log does not name the parked bead cand-design1"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 38 (ga-52zhb CONTROL): a bead that merely mentions "design"
+  # (not "design-first") must NOT be excluded — the regex stays as narrow as
+  # pilot-dispatcher.sh's own, so this fix introduces no false-negative on a
+  # real orphan-suspect. ────────────────────────────────────────────────────
+  echo "Scenario 38 (ga-52zhb control): description merely mentions 'design' (not 'design-first') → still flagged as orphan (regex stays narrow)"
+  printf '[%s]' "$(mk_candidate_designfirst cand-design2 "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS" "Revisar o design da tabela de precos")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-design2.json"
+  NOTIF38="$TMP/notif38"; MAIL38="$TMP/mail38"; COMM38="$TMP/comm38"
+  : > "$NOTIF38"; : > "$MAIL38"; : > "$COMM38"; : > "$LOG"
+  GOLW_TEST_NOTIFIED="$NOTIF38" GOLW_TEST_MAILED="$MAIL38" GOLW_TEST_COMMENTS_LOG="$COMM38" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 38: generic 'design' mention still flags (return 1) — narrow regex has no false-negative" || bad "scenario 38: a bead merely mentioning 'design' (not 'design-first') was wrongly excluded, got $rc"
+  grep -q "cand-design2" "$COMM38" 2>/dev/null && ok "scenario 38: comment posted (ordinary design-mention bead is a real orphan-suspect)" || bad "scenario 38: no comment posted for a bead that merely mentions 'design'"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 39 (ga-52zhb FIXTURE — REPROVES on HEAD before this fix): a
+  # bead carrying pilot:no-auto-dispatch with a live owner (wa-i6a1j shape —
+  # oracle-wa, an explicit auto-dispatch veto) alongside contradictory
+  # gate:passed+gate:failed labels, stale → must NOT enter NEW/DUE; counted as
+  # PARK only (is_park takes precedence over the ACTIVE/live-assignee split,
+  # per the ga-eiaidn precedent this file already documents). ──────────────
+  echo "Scenario 39 (ga-52zhb fixture): pilot:no-auto-dispatch + live assignee (wa-i6a1j shape) + gate:* labels, stale → NOT flagged as orphan, counted as PARK only"
+  printf '[%s]' "$(mk_candidate_inprogress cand-noauto1 "$TMP/hq" "pilot:no-auto-dispatch,gate:passed,gate:failed" "$OLD_TS" "oracle-wa")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-noauto1.json"
+  echo '{"sessions":[]}' > "$TMP/fixtures/sessions-active.json"
+  NOTIF39="$TMP/notif39"; MAIL39="$TMP/mail39"; COMM39="$TMP/comm39"
+  : > "$NOTIF39"; : > "$MAIL39"; : > "$COMM39"; : > "$LOG"
+  GOLW_TEST_NOTIFIED="$NOTIF39" GOLW_TEST_MAILED="$MAIL39" GOLW_TEST_COMMENTS_LOG="$COMM39" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 39: pilot:no-auto-dispatch bead does not enter NEW/DUE (return 0)" || bad "scenario 39 (ga-52zhb regression — the exact bug): a pilot:no-auto-dispatch bead was treated as an orphan-suspect, got $rc"
+  [ ! -s "$COMM39" ] && ok "scenario 39: no comment posted on the pilot:no-auto-dispatch bead" || bad "scenario 39 (ga-52zhb regression): comment posted on a bead carrying pilot:no-auto-dispatch (should be excluded, wa-i6a1j class)"
+  grep -q "PARK: 1 bead" "$LOG" 2>/dev/null && ok "scenario 39: log records the park count for the pilot:no-auto-dispatch bead" || bad "scenario 39: log missing the PARK count line for a pilot:no-auto-dispatch park"
+  rm -f "$TMP/fixtures/sessions-active.json" "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 40 (ga-52zhb class-fix, bead_state.py PARK_EXACT precedent):
+  # the bare "no-auto-dispatch" form (no "pilot:" prefix) must park exactly
+  # like the prefixed form — bead_state.py already treats both as identical,
+  # and pilot-dispatcher.sh needed a dedicated third-chokepoint fix (ga-rfpm9)
+  # after missing this exact bare form once. ────────────────────────────────
+  echo "Scenario 40 (ga-52zhb class-fix): bare no-auto-dispatch (no pilot: prefix) + gate:* labels, stale → NOT flagged, counted as PARK only"
+  printf '[%s]' "$(mk_candidate cand-noauto2 "$TMP/hq" "no-auto-dispatch,gate:fix-attempt:1" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-noauto2.json"
+  NOTIF40="$TMP/notif40"; MAIL40="$TMP/mail40"; COMM40="$TMP/comm40"
+  : > "$NOTIF40"; : > "$MAIL40"; : > "$COMM40"; : > "$LOG"
+  GOLW_TEST_NOTIFIED="$NOTIF40" GOLW_TEST_MAILED="$MAIL40" GOLW_TEST_COMMENTS_LOG="$COMM40" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 40: bare no-auto-dispatch bead does not enter NEW/DUE (return 0)" || bad "scenario 40: a bare no-auto-dispatch bead was treated as an orphan-suspect, got $rc"
+  [ ! -s "$COMM40" ] && ok "scenario 40: no comment posted on the bare no-auto-dispatch bead" || bad "scenario 40: comment posted on a bead carrying bare no-auto-dispatch (should be excluded per bead_state.py PARK_EXACT precedent)"
+  rm -f "$STATE_FILE" 2>/dev/null
 
   echo ""
   echo "gate-orphaned-label-watchdog selftest: PASS=$PASS FAIL=$FAIL"
