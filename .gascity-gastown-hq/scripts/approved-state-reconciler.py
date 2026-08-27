@@ -2525,8 +2525,9 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
         # can have a free pool session slot AND sit at queue index 0 (nothing
         # ahead of it) while its own lane is still at zero slots — exactly the
         # wa-zvs2s/wa-3mqpj false positives. See _lane_capacity_suppress_
-        # reason()'s docstring for the full root-cause writeup. Checked last
-        # among the measurement-based suppressions, same class as the two above.
+        # reason()'s docstring for the full root-cause writeup. Checked here,
+        # right after queue-position and before the gate-queue backlog check
+        # below — same class of measurement-based suppression as both.
         lane_reason = _lane_capacity_suppress_reason(labels, now)
         if lane_reason is not None:
             _log("  %s: no signal, daemon-age=%.0fmin, %s — no alarm" % (
