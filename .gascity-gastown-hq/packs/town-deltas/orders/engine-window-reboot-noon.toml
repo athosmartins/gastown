@@ -1,0 +1,11 @@
+# ga-3azujf: lembrete one-shot de meio-dia (decisao do Athos, 27/08 08:4x —
+# "agendar pra meio dia mas me confirma antes de fazer"). O cron e diario
+# porque o trigger nao tem forma one-shot; a semantica de UMA vez vem do
+# marker em ~/.gastown/run/engine-window-reboot-noon.fired, que o script grava
+# no primeiro disparo. O script SO AVISA — nunca reinicia (o reboot e ato
+# humano, pos-confirmacao). Remover este order depois que o reboot acontecer.
+[order]
+description = "Meio-dia: lembrar o Athos de confirmar o reboot que dispara a janela do engine (ga-3azujf) — nunca reinicia sozinho"
+trigger = "cron"
+schedule = "0 12 * * *"
+exec = "$PACK_DIR/assets/scripts/engine-window-reboot-noon.sh"
