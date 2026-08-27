@@ -215,13 +215,24 @@ _PILOT_SWEEP_RE = re.compile(r"Pilot sweep complete:")
 _PILOT_SWEEP_PAUSED_RE = re.compile(
     r"Pilot sweep complete: dispatched=0 \((?:paused|deferred):")
 # _PILOT_SWEEP_SLOTS_RE (ga-2yyez case 3 "lane x pool"): extracts small_slots/
-# big_slots from a NORMAL (non-paused/non-deferred) sweep-complete line, e.g.
-# "=== Pilot sweep complete: dispatched=3 (small_slots=2 big_slots=1) ===".
-# A paused/deferred line has no slot counts to report and will not match —
-# see _latest_sweep_lane_slots(), which relies on that to know when the most
-# recent sweep has nothing to say about lane capacity.
+# big_slots from a NORMAL (non-paused/non-deferred) sweep-complete line.
+#
+# GATE-FIX (ga-5d5se attempt 1 FAIL): the first version of this regex ended
+# in a literal `\)` right after big_slots=(\d+) — matching only a HYPOTHETICAL
+# line shaped like "...(small_slots=2 big_slots=1)===", built from a
+# paraphrased log excerpt quoted in this bead's own comments and this file's
+# OWN test fixture, never checked against the real emission site. The actual
+# writer (packs/town-deltas/assets/pilot-dispatcher.sh:9053) is:
+#   log "=== Pilot sweep complete: dispatched=$DISPATCHED (small_slots=$SMALL_SLOTS big_slots=$BIG_SLOTS dolt_saturated_at_start=${PILOT_DOLT_SATURATED_AT_START:-0}) ==="
+# — a THIRD field, dolt_saturated_at_start=N, always sits between big_slots=N
+# and the closing paren, so the old regex could never match a single real
+# production line: this reconciler's whole case-3 fix was dead code. Fixed by
+# not anchoring on the closing paren at all — matches regardless of what
+# follows big_slots=(\d+), so a FUTURE field added the same way (another
+# `... foo=$FOO)`) doesn't reproduce this exact bug again. Verified directly
+# against the real source line above, not against this file's own fixture.
 _PILOT_SWEEP_SLOTS_RE = re.compile(
-    r"Pilot sweep complete: dispatched=\d+ \(small_slots=(\d+) big_slots=(\d+)\)")
+    r"Pilot sweep complete: dispatched=\d+ \(small_slots=(\d+) big_slots=(\d+)")
 
 # ── test seams (monkeypatched in --selftest) ───────────────────────────────────
 # These module-level callables let selftests redirect I/O without spawning subprocesses.
@@ -5130,10 +5141,20 @@ def _selftest():
              "mail_calls=%s" % (mail_calls,))
 
     # ── ga-2yyez case 3 "lane x pool": lane capacity check ───────────────────
-    def _sweep_log_line_slots(epoch, small, big):
+    # ga-5d5se gate-fix: this fixture used to omit the trailing
+    # dolt_saturated_at_start=N field that the REAL writer
+    # (pilot-dispatcher.sh:9053) always includes — every scenario below was
+    # validating _PILOT_SWEEP_SLOTS_RE against a format that does not occur
+    # in production, which is exactly how the regex's original `\)`-anchored
+    # bug passed every test here while matching zero real log lines. Mirror
+    # the real emission line exactly (verified against 3 live lines pulled
+    # from .gc/logs/pilot-dispatcher.log) so these scenarios only pass when
+    # the regex actually works against reality.
+    def _sweep_log_line_slots(epoch, small, big, dolt_saturated=0):
         ts = time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(epoch))
         return ("%s [pilot-dispatcher] === Pilot sweep complete: dispatched=1 "
-                "(small_slots=%d big_slots=%d) ===" % (ts, small, big))
+                "(small_slots=%d big_slots=%d dolt_saturated_at_start=%d) ===" % (
+                ts, small, big, dolt_saturated))
 
     print("\nScenario (ga-2yyez-lane-a): _latest_sweep_lane_slots() reads "
           "small_slots/big_slots off the MOST RECENT normal sweep line, not "
