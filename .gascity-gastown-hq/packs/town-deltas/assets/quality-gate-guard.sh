@@ -726,6 +726,31 @@ _gap1_city_ready_for_branch_check() {
   return 0
 }
 
+# _gap1_default_pool_for_city <city_path> — pure. ga-yikyf: mirrors
+# painel_visibilidade.py's _default_pool_for_store (wa-t9jbv) — maps a city/
+# rig PATH (not a bare rig name — this file's own callers below hold
+# $GC_CITY/$RIGSCAN_CITY paths, not names) to the pool that self-serves it.
+# Returns empty for an unrecognized path rather than guessing, same
+# reasoning as the Python original: routing to the WRONG pool is worse than
+# leaving the bead unrouted-but-visible (a human/the existing
+# pilot-missing-route-watchdog can still find and route it by hand; a
+# misrouted bead gets silently claimed by workers who can't do the work).
+# Deliberately does NOT default unknown->gastown.dog the way
+# quality-gate-dispatcher.sh's sibling default_pool_route_for_rig() does —
+# that function only ever receives an already-known rig NAME extracted
+# elsewhere, so its default arm is unreachable in practice; this one is fed
+# raw city PATHS across a multi-rig scan where an unrecognized path is a
+# real, expected case, not a can't-happen.
+_gap1_default_pool_for_city() {
+  local city="${1%/}"
+  case "$city" in
+    */whatsapp_automation) printf 'wa-worker' ;;
+    */property_scrapers)   printf 'ps-worker' ;;
+    "$GC_CITY")             printf 'gastown.dog' ;;
+    *)                       printf '' ;;
+  esac
+}
+
 # _gap1_ensure_lifecycle_backstop <city_path> <bead_id> — ga-bz4nsi requirement
 # 3: a GAP-1 strip (either sub-case) only ever removes story:in-flight. If the
 # bead had no OTHER lifecycle label to fall back on, that removal leaves it
@@ -742,7 +767,7 @@ _gap1_city_ready_for_branch_check() {
 # story:approved or doesn't need it.
 _gap1_ensure_lifecycle_backstop() {
   local city="$1" bead_id="$2"
-  local raw show issue_type has_approved has_tech_debt
+  local raw show issue_type has_approved has_tech_debt routed_to pool wrote
   # ga-bz4nsi third-state guard: a failed/unparseable read must NOT fall
   # through to the same branch as "read succeeded, bead needs no approval" —
   # that would stamp story:approved on a bead we never actually verified,
@@ -766,6 +791,33 @@ _gap1_ensure_lifecycle_backstop() {
   warn "$bead_id has no dispatchable lifecycle label after GAP-1 release (type=$issue_type, no tech-debt label, no story:approved) — stamping story:approved so it does not fall into a new invisible limbo (ga-bz4nsi requirement 3)."
   bd -C "$city" label add "$bead_id" "story:approved" -q 2>/dev/null || true
   bd -C "$city" comment "$bead_id" "ga-bz4nsi GAP-1 reconciler: stamped story:approved after releasing story:in-flight — bead had no other lifecycle label and is not type=bug/tech-debt, so without this it would have gone from one invisible limbo (leaked in-flight) straight into another (no candidate query would ever find it). Self-healed." 2>/dev/null || true
+  # ga-yikyf: a story:approved stamp with no gc.routed_to is the SAME
+  # invisible limbo one label later — the Pilot only dispatches a bead whose
+  # route is filled in. Backfill it in the same pass, mirroring
+  # painel_visibilidade.py's _ensure_routed_or_pending (never overwrite an
+  # existing route; verify the write by reading it back rather than trusting
+  # the CLI's own exit code — ga-9tgos's own finding is that a write can
+  # report success while silently not persisting).
+  routed_to=$(printf '%s' "$show" | jq -r '((.metadata["gc.routed_to"]) // "")' 2>/dev/null || echo "")
+  if [ -n "$routed_to" ]; then
+    return 0
+  fi
+  pool=$(_gap1_default_pool_for_city "$city")
+  if [ -z "$pool" ]; then
+    warn "_gap1_ensure_lifecycle_backstop: $bead_id has no gc.routed_to and city '$city' maps to no known pool — flagging needs-human instead of guessing a route (ga-yikyf)"
+    bd -C "$city" label add "$bead_id" "needs-human" -q 2>/dev/null || true
+    bd -C "$city" comment "$bead_id" "ga-yikyf GAP-1 reconciler: stamped story:approved above, but this bead also has no gc.routed_to and city '$city' does not map to a known pool — flagged needs-human rather than guessing, since a wrong route is worse than none." 2>/dev/null || true
+    return 0
+  fi
+  bd -C "$city" update "$bead_id" --set-metadata "gc.routed_to=$pool" -q 2>/dev/null || true
+  wrote=$(bd -C "$city" show "$bead_id" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | ((.metadata["gc.routed_to"]) // "")' 2>/dev/null || echo "")
+  if [ "$wrote" = "$pool" ]; then
+    bd -C "$city" comment "$bead_id" "ga-yikyf GAP-1 reconciler: backfilled gc.routed_to=$pool alongside the story:approved stamp above — a bead armed without a route is invisible to the Pilot the same way one with no lifecycle label is. Verified by re-reading the field after write." 2>/dev/null || true
+  else
+    warn "_gap1_ensure_lifecycle_backstop: $bead_id gc.routed_to backfill to '$pool' did not verify on read-back (got '$wrote') — flagging needs-human (ga-yikyf)"
+    bd -C "$city" label add "$bead_id" "needs-human" -q 2>/dev/null || true
+    bd -C "$city" comment "$bead_id" "ga-yikyf GAP-1 reconciler: tried to backfill gc.routed_to=$pool alongside the story:approved stamp above, but the write did not verify on read-back (got '$wrote'). Bead may still be unrouted and invisible to the Pilot — flagged needs-human rather than assuming the write worked." 2>/dev/null || true
+  fi
 }
 
 # classify_parent_gap2 <has_pilot_dispatched> <has_live_assignee> <sling_found> <sling_needs_fix> <sling_closed> [sling_refused]

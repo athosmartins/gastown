@@ -285,6 +285,24 @@ r=$(gaterun_status_terminal claimed);    [ "$r" = "0" ] && ok "claimed → NOT t
 r=$(gaterun_status_terminal '');         [ "$r" = "0" ] && ok "empty/unreadable → fail-safe NOT terminal (never close a verdict on a guess)" || bad "empty got '$r'"
 r=$(gaterun_status_terminal weird-future-status); [ "$r" = "0" ] && ok "unrecognized future value → fail-safe NOT terminal" || bad "unrecognized got '$r'"
 
+# ── _gap1_default_pool_for_city <city_path> — ga-yikyf ───────────────────────
+# A story:approved bead with no gc.routed_to is invisible to the Pilot the
+# same way one with no lifecycle label at all is (the bug this whole GAP-1
+# backstop exists to prevent, one label later). Mirrors
+# painel_visibilidade.py's _default_pool_for_store (wa-t9jbv) exactly: suffix
+# match for whatsapp_automation/property_scrapers, EXACT match against this
+# file's own $GC_CITY for the HQ, empty (never a guessed default) for
+# anything unrecognized — a wrong route is worse than no route.
+echo "_gap1_default_pool_for_city: city-path -> pool mapping, empty on unknown"
+r=$(_gap1_default_pool_for_city "/Users/athos/gt/whatsapp_automation"); [ "$r" = "wa-worker" ] && ok "whatsapp_automation path -> wa-worker" || bad "wa path got '$r'"
+r=$(_gap1_default_pool_for_city "/Users/athos/gt/whatsapp_automation/"); [ "$r" = "wa-worker" ] && ok "trailing slash stripped -> wa-worker" || bad "wa trailing-slash got '$r'"
+r=$(_gap1_default_pool_for_city "/Users/athos/gt/property_scrapers"); [ "$r" = "ps-worker" ] && ok "property_scrapers path -> ps-worker" || bad "ps path got '$r'"
+r=$(_gap1_default_pool_for_city "$GC_CITY"); [ "$r" = "gastown.dog" ] && ok "exact \$GC_CITY match -> gastown.dog" || bad "GC_CITY got '$r'"
+r=$(_gap1_default_pool_for_city "/Users/athos/gt/whatsapp_automation-backup"); [ "$r" = "" ] && ok "suffix-only match: a lookalike dir name (not an exact last-segment match) -> empty, not wa-worker" || bad "REGRESSION: lookalike dir got '$r' — would misroute into a pool that can't do the work"
+r=$(_gap1_default_pool_for_city "/Users/athos/gt/whatsapp_automation/crew/worker"); [ "$r" = "" ] && ok "nested subdir inside the rig (not the city root itself) -> empty, never guess" || bad "nested-subdir got '$r'"
+r=$(_gap1_default_pool_for_city "/Users/athos/gt/lexbh"); [ "$r" = "" ] && ok "unrecognized rig -> empty (a wrong route is worse than no route, per the Python original's own reasoning)" || bad "unrecognized rig got '$r'"
+r=$(_gap1_default_pool_for_city ""); [ "$r" = "" ] && ok "empty input -> empty, no crash" || bad "empty input got '$r'"
+
 echo ""
 echo "Results: $P passed, $F failed"
 [ "$F" -eq 0 ] && { echo "SELFTEST PASS"; exit 0; } || { echo "SELFTEST FAIL"; exit 1; }

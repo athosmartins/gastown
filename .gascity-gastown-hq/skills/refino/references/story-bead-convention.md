@@ -173,6 +173,24 @@ bd -C "$GC_CITY_PATH" update "$ID" \
   --set-metadata "story.aprovado_por=athos" \
   --set-metadata "story.aprovado_em=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
+# 5. Arm for dispatch. Without gc.routed_to the bead sits in ✅ Aprovadas
+#    looking ready — story:approved, but the Pilot only dispatches a bead
+#    whose route is filled in, so it never gets picked up. Silent death:
+#    the card looks fine, nobody notices (ga-yikyf: two beads stuck 3h/4h
+#    this exact way, traced to this recipe never setting the route). Pool
+#    mapping mirrors painel_visibilidade.py's _default_pool_for_store
+#    (wa-t9jbv) and quality-gate-guard.sh's _gap1_default_pool_for_city
+#    (ga-yikyf) — keep all three in sync if a new rig is ever added.
+case "$GC_CITY_PATH" in
+  */whatsapp_automation) POOL=wa-worker ;;
+  */property_scrapers)   POOL=ps-worker ;;
+  *)                       POOL=gastown.dog ;;
+esac
+bd -C "$GC_CITY_PATH" update "$ID" \
+  --add-label ctx:ready \
+  --add-label exec:auto \
+  --set-metadata "gc.routed_to=$POOL"
+
 echo "Story bead created: $ID"
 ```
 
@@ -189,6 +207,20 @@ bd -C "$GC_CITY_PATH" update "$ID" \
 bd -C "$GC_CITY_PATH" update "$ID" \
   --set-metadata "story.estrela_guia=Nova métrica atualizada" \
   --set-metadata "story.aprovado_em=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# Arm for dispatch — same reasoning as step 5 of "Creating a new story bead"
+# above. SKIP this block if you just added needs-human + pilot:no-auto-dispatch
+# per the 🚨 compliance-block section below — an unresolved compliance/safety
+# gate must NOT be armed for auto-dispatch.
+case "$GC_CITY_PATH" in
+  */whatsapp_automation) POOL=wa-worker ;;
+  */property_scrapers)   POOL=ps-worker ;;
+  *)                       POOL=gastown.dog ;;
+esac
+bd -C "$GC_CITY_PATH" update "$ID" \
+  --add-label ctx:ready \
+  --add-label exec:auto \
+  --set-metadata "gc.routed_to=$POOL"
 ```
 
 ### Preserving 🚨 compliance/safety blocks on rewrite (ga-fnnyy)
