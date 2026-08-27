@@ -4875,6 +4875,13 @@ fi
       # every enumerated item.
       IS_PARTIAL=0
       PARTIAL_EVIDENCE=""
+      # ga-l7n3v: set inside the BUG/TASK close branch below when a merged fix
+      # in a rig's shared code left a daemon unverified/needing a guarded
+      # restart — declared here (not just inside that branch) so the
+      # POST-MERGE VERIFICATION exemption further down can reference it
+      # unconditionally, mirroring how IS_PARTIAL is declared before its own
+      # computation block.
+      IS_DAEMON_HOLD=0
       if [ "$IS_STORY" != "1" ]; then
         if printf '%s' "$SRC_LABELS" | grep -q "scope_covered:all"; then
           IS_PARTIAL=0
@@ -5009,26 +5016,218 @@ $PARTIAL_EVIDENCE" 2>/dev/null || true
             "$BRANCH" "$MERGE_SHA" "$BEAD_ID" "$SCOPE_HOLD_WEAK_SIGNAL_NOTE" "$PARTIAL_EVIDENCE" "$SCOPE_HOLD_ALWAYS_CHECK" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID")" \
           "scope-hold on $BEAD_ID (ga-k2wjn)"
       else
-        # BUG/TASK → close it. bd list defaults to OPEN-only, so closing removes
-        # the bead from EVERY open-work selector (Pilot Tier-1 bug & tech-debt),
-        # and — combined with the assignee clear — from the pool crash-recovery
-        # query. Closing is the durable fix for non-story source beads.
-        log "Closing source bug/task $BEAD_ID (gate PASS + merged sha=$MERGE_SHA)."
-        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
-        _CLOSE_REASON="Quality gate PASSED — branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA, gate_run=$GATE_RUN_ID). Closed by autonomous dispatcher (ga-esbg)."
-        # ga-v5acl: gate_close_source_terminal now owns the retry-on-refusal
-        # path (lease-aware `bd reclaim --older-than 0s`, then (ga-2emo8) a
-        # merge-verified --force). Was: unconditional `bd assign --force` +
-        # `bd close --force` on ANY close failure, regardless of whether the
-        # claim was actually abandoned — exactly what bd's own --force
-        # --help text warns against ("use only for abandoned claims...
-        # prefer bd reclaim"). See ga-esbg/wa-j824s for the original
-        # incident this replaces the ad hoc escalation for. merge_verified=1:
-        # same confirmed-merge precondition as the assignee-clear above.
-        if gate_close_source_terminal "$BEAD_ID" "$_CLOSE_REASON" 1; then
-          log "  Source bead $BEAD_ID closed (gate PASS + merged)."
+        # BUG/TASK → verify daemon liveness BEFORE closing (ga-l7n3v). THE BUG
+        # this closes: this branch used to close unconditionally on gate PASS
+        # + merge — but for a rig-native fix (e.g. whatsapp_automation), a
+        # merged change to a shared lib/*.py can leave a long-lived launchd
+        # daemon serving the OLD code indefinitely (deploy_daemons.sh only
+        # auto-restarts a daemon on its OWN file changing or a curated
+        # closure-allowlist hit; most daemons get neither). The bead closed
+        # here is GONE from every open-work selector, so nothing was left to
+        # ever notice — "gate passed" and "is live" had silently become
+        # different claims (wa-jj1ou, wa-1bsvc: same lib/ file, 90min apart,
+        # confirmed the class repeats, not a one-off).
+        #
+        # This mirrors story-delivery.sh's Step 5b (ga-iwv0) — deploy the
+        # rig's runtime dir via its runbook deploy_cmd, then hand off to
+        # daemon-refresh.sh (already used, tested, and proven via the STORY
+        # path) to restart affected SAFE daemons and verify each comes up
+        # AFTER this deploy, while never auto-bouncing sensitive hot-path
+        # daemons. Reusing it — rather than adding new restart logic here —
+        # is deliberate: its verify_fresh() poll loop (up to VERIFY_TIMEOUT)
+        # is also what absorbs the `launchctl kickstart -k` port-bind race
+        # the Mayor measured live merging THIS bead's own prior attempt
+        # (ACHADO 2: SIGTERM'd the old process, the new one raced its port
+        # release and lost, ~1min with nothing listening on :8095) — a bare
+        # kickstart loop here would reproduce that exact race across every
+        # future bug/task merge that touches a shared file.
+        #
+        # Framework/gascity self-fixes SKIP this (runtime_dir resolves to
+        # $GC_CITY, same condition story-delivery.sh already uses to skip
+        # itself) — this reconciler/dispatcher's own process must not be
+        # self-restarted mid-run, and it already deploys via a separate,
+        # unrelated mechanism (config-drift-watcher).
+        DR_RUNTIME_DIR=""
+        DR_DEPLOY_CMD=""
+        DR_SENSITIVE=""
+        DAEMON_HOLD_VERDICT=""
+        DAEMON_HOLD_REASON=""
+        DAEMON_HOLD_DETAIL=""
+        DAEMON_SOFT_WARN=""
+        _gl7n3v_runbook_field() {  # _gl7n3v_runbook_field <rig> <field>
+          # Standalone re-implementation of story-delivery.sh's own
+          # get_runbook_field() — duplicated rather than sourced, matching
+          # this codebase's existing convention that quality-gate-dispatcher.sh
+          # and story-delivery.sh are both fully self-contained scripts (grep
+          # confirms neither sources the other or a shared lib today). Reading
+          # the SAME delivery-runbooks.toml the STORY path already trusts.
+          local rig_name="$1" field="$2"
+          python3 - <<PYEOF 2>/dev/null
+import re
+rig_name = '''$rig_name'''
+field = '''$field'''
+with open('$GC_CITY/packs/town-deltas/assets/delivery-runbooks.toml') as f:
+    content = f.read()
+for block in re.split(r'\[\[rig\]\]', content):
+    m = re.search(r'name\s*=\s*"([^"]+)"', block)
+    if m and m.group(1) == rig_name:
+        fm = re.search(rf'{re.escape(field)}\s*=\s*"([^"]*)"', block)
+        if fm:
+            print(fm.group(1))
+        else:
+            am = re.search(rf'{re.escape(field)}\s*=\s*\[([^\]]*)\]', block)
+            if am:
+                items = [x.strip().strip('"') for x in am.group(1).split(',') if x.strip().strip('"')]
+                print('\n'.join(items))
+        break
+PYEOF
+        }
+        # `|| true` on every call: the function's last statement is a python3
+        # heredoc — if it ever throws (e.g. delivery-runbooks.toml missing),
+        # the assignment would otherwise trip this script's set -e and abort
+        # the whole dispatcher mid-sweep. Empty output degrades safely to the
+        # "runtime_dir unresolved → skip this check" branch below, same
+        # fail-toward-existing-behavior direction as the rest of this patch.
+        DR_RUNTIME_DIR=$(_gl7n3v_runbook_field "$RIG" "runtime_dir" || true)
+        if [ -n "$DR_RUNTIME_DIR" ] && [ "$DR_RUNTIME_DIR" != "$GC_CITY" ] \
+           && [ -f "$GC_CITY/packs/town-deltas/assets/daemon-refresh.sh" ] \
+           && git -C "$DR_RUNTIME_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+          DR_DEPLOY_CMD=$(_gl7n3v_runbook_field "$RIG" "deploy_cmd" || true)
+          DR_SENSITIVE=$(_gl7n3v_runbook_field "$RIG" "sensitive_daemons" | tr '\n' ' ' || true)
+          DR_PRE_SHA=$(git -C "$DR_RUNTIME_DIR" rev-parse HEAD 2>/dev/null || echo "")
+          DR_EPOCH=$(date +%s)
+          if [ -n "$DR_DEPLOY_CMD" ]; then
+            if [ "$DRY_RUN" = "1" ]; then
+              log "ga-l7n3v: DRY_RUN=1 — WOULD deploy rig $RIG runtime ($DR_RUNTIME_DIR): $DR_DEPLOY_CMD"
+            else
+              log "ga-l7n3v: deploying rig $RIG runtime ($DR_RUNTIME_DIR) before daemon-liveness check: $DR_DEPLOY_CMD"
+              eval "$DR_DEPLOY_CMD" >&2 2>&1 \
+                || warn "ga-l7n3v: deploy_cmd for rig $RIG exited non-zero (continuing — daemon-refresh below verifies ACTUAL state, not the deploy's own exit code)"
+            fi
+          fi
+          DR_POST_SHA=$(git -C "$DR_RUNTIME_DIR" rev-parse HEAD 2>/dev/null || echo "")
+          DR_OUT=$(RUNTIME_DIR="$DR_RUNTIME_DIR" PRE_DEPLOY_SHA="$DR_PRE_SHA" POST_DEPLOY_SHA="$DR_POST_SHA" \
+            DEPLOY_EPOCH="$DR_EPOCH" SENSITIVE_DAEMONS="$DR_SENSITIVE" DRY_RUN="$DRY_RUN" \
+            bash "$GC_CITY/packs/town-deltas/assets/daemon-refresh.sh" 2>&1 || true)
+          # ga-l7n3v: `|| true` on all three — under this script's set -euo
+          # pipefail, an unmatched grep piped into head/sed still propagates a
+          # non-zero pipeline status and would abort the ENTIRE dispatcher
+          # mid-sweep (same hazard story-delivery.sh:1490 already documents
+          # for its own PROOF line). daemon-refresh.sh's emit() is the only
+          # exit path in that script and always prints all three fields, so
+          # this should never actually fire — but the empty-VERDICT branch
+          # below exists SPECIFICALLY to handle it gracefully if it ever does,
+          # and that branch can only be reached if the pipeline is allowed to
+          # report empty instead of killing the script first.
+          DR_VERDICT=$(echo "$DR_OUT" | grep '^VERDICT=' | head -1 | sed 's/^VERDICT=//' || true)
+          DR_REASON=$(echo "$DR_OUT" | grep '^REASON=' | head -1 | sed 's/^REASON=//' || true)
+          DR_PROOF=$(echo "$DR_OUT" | grep '^PROOF=' | head -1 | sed 's/^PROOF=//' || true)
+          log "ga-l7n3v daemon-refresh: rig=$RIG runtime=$DR_RUNTIME_DIR verdict=$DR_VERDICT proof=$DR_PROOF reason=$DR_REASON"
+          case "$DR_VERDICT" in
+            OK|SKIPPED)
+              # root-class:error-vs-empty (ga-vmq1i's own distinction, reused
+              # here): VERDICT=OK does not by itself mean daemon liveness was
+              # POSITIVELY confirmed — PROOF disambiguates. Only surface the
+              # soft warning when proof is neither "verified" nor
+              # "not_applicable" (never silently claim confidence the helper
+              # itself didn't have); never block the close on this alone.
+              case "$DR_PROOF" in
+                verified|not_applicable) : ;;
+                *) DAEMON_SOFT_WARN="$DR_VERDICT ($DR_REASON, proof=$DR_PROOF)" ;;
+              esac
+              ;;
+            "")
+              # The helper produced NO parseable verdict at all (missing
+              # python3, unreadable runbook, or some other environment
+              # failure — every real code path in daemon-refresh.sh emits a
+              # VERDICT line via its own emit() function, so an empty result
+              # here means the HELPER itself is broken, not that a daemon is
+              # stale). Fail toward the PRE-ga-l7n3v behavior (close as
+              # before) rather than stranding every future bug/task bead
+              # citywide on one broken helper — but stay VISIBLE, not
+              # silent, by recording it in the close reason below.
+              warn "ga-l7n3v: daemon-refresh.sh produced no parseable VERDICT for rig $RIG (helper output: ${DR_OUT:0:300}) — proceeding to close (degraded, not blocked; see ga-l7n3v if this recurs)."
+              DAEMON_SOFT_WARN="daemon-refresh.sh produced no verdict (helper-level failure, not a confirmed-stale daemon)"
+              ;;
+            *)
+              DAEMON_HOLD_VERDICT="$DR_VERDICT"
+              DAEMON_HOLD_REASON="$DR_REASON"
+              DAEMON_HOLD_DETAIL="$DR_OUT"
+              ;;
+          esac
         else
-          warn "Could not close source bead $BEAD_ID even after lease-aware reclaim — re-pick vector remains, see post-merge verification below (ga-v5acl)"
+          log "ga-l7n3v: daemon-liveness check skipped for $BEAD_ID (rig=$RIG runtime_dir='${DR_RUNTIME_DIR:-<none>}')."
+        fi
+
+        if [ -n "$DAEMON_HOLD_VERDICT" ]; then
+          # HELD — mirrors the IS_PARTIAL branch's shape exactly (hold, don't
+          # close, comment + mail Mayor + notify author), for a DIFFERENT
+          # reason (daemon staleness, not scope). Deliberately NOT
+          # gate:needs-human* (ga-6dpoa's own warning, reused here): that
+          # family is read by lifecycle-coherence-janitor's R7 rule as "not
+          # implementable" and strips gc.routed_to — this bead is implemented
+          # and merged, just not yet confirmed LIVE. delivery:pending-restart
+          # is a new, namespaced-consistent label (delivery:*, matching
+          # delivery:partial/failed/deploy-pending/daemon-unverified) with no
+          # existing consumer to collide with (verified via repo-wide grep
+          # before choosing it) — deliberately NOT delivery:deploy-pending,
+          # whose only existing consumer (story-delivery.sh's task
+          # reconciler) re-arms story:approved, a STORY-only mechanism this
+          # bug/task bead does not carry and should not trigger.
+          IS_DAEMON_HOLD=1
+          log "Source bug/task $BEAD_ID merged but daemon verification $DAEMON_HOLD_VERDICT (ga-l7n3v) — holding, NOT closing."
+          bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
+          bd -C "$BEAD_CITY" label add "$BEAD_ID" "delivery:pending-restart" -q 2>/dev/null || true
+          DAEMON_HOLD_ACTION="investigate why the affected daemon(s) did not come up fresh (crash on boot? port in use? — see ga-l7n3v ACHADO 2 for a known launchctl kickstart -k port-bind race), fix forward, then close this bead manually once confirmed live."
+          if [ "$DAEMON_HOLD_VERDICT" = "NEEDS_GUARDED_RESTART" ]; then
+            DAEMON_HOLD_ACTION="perform a guarded/graceful restart of the flagged hot-path daemon(s) — drain in-flight work first — then close this bead manually once confirmed live."
+          fi
+          bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED and branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA) — but NOT closing (ga-l7n3v): daemon verification $DAEMON_HOLD_VERDICT — $DAEMON_HOLD_REASON
+
+A long-lived daemon serving rig '$RIG' may still be running code older than this merge. Closure is WITHHELD until this is resolved — a dormant merge must never be marked done (ga-l7n3v). Labeled delivery:pending-restart; gate:passed (already set) keeps the Pilot from re-dispatching this bead.
+ACTION: $DAEMON_HOLD_ACTION
+
+Refresh detail:
+$DAEMON_HOLD_DETAIL" 2>/dev/null || true
+          gc --city "$GC_CITY" mail send mayor \
+            -s "Gate held for daemon verification: $BEAD_ID (ga-l7n3v)" \
+            -m "$(printf 'Source bead %s PASSED the quality gate and merged (branch %s, sha %s, gate_run %s) but was NOT closed.\n\nga-l7n3v: daemon verification %s — %s\n\nA long-lived daemon serving rig %s may still be running code older than this merge. Labeled delivery:pending-restart; gate:passed keeps the Pilot from re-dispatching it.\n\nACTION: %s\n\nBead: %s   Rig: %s\nBranch: %s (gate run %s, sha %s)' \
+              "$BEAD_ID" "$BRANCH" "$MERGE_SHA" "$GATE_RUN_ID" "$DAEMON_HOLD_VERDICT" "$DAEMON_HOLD_REASON" "$RIG" "$DAEMON_HOLD_ACTION" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID" "$MERGE_SHA")" \
+            2>/dev/null || warn "Could not mail Mayor daemon-verification hold for $BEAD_ID (ga-l7n3v)"
+          # ga-409f4 convention (reused): NOTIFY_AUTHOR (branch-author-aware) first, $AUTHOR fallback.
+          notify_author_with_fallback "$BEAD_ID" "$NOTIFY_AUTHOR" "$AUTHOR" \
+            "Your gate PASS is held for daemon verification: $BEAD_ID (ga-l7n3v)" \
+            "$(printf 'Your branch %s PASSED gate review and merged (sha %s), but the source bead %s was NOT closed.\n\nga-l7n3v: daemon verification %s — %s. Held as delivery:pending-restart.\n\nACTION: %s\n\nBead: %s   Rig: %s\nBranch: %s (gate run %s)' \
+              "$BRANCH" "$MERGE_SHA" "$BEAD_ID" "$DAEMON_HOLD_VERDICT" "$DAEMON_HOLD_REASON" "$DAEMON_HOLD_ACTION" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID")" \
+            "daemon-hold on $BEAD_ID (ga-l7n3v)"
+        else
+          # BUG/TASK, daemon-verified (or check skipped/not applicable/degraded)
+          # → close it as before. bd list defaults to OPEN-only, so closing
+          # removes the bead from EVERY open-work selector (Pilot Tier-1 bug &
+          # tech-debt), and — combined with the assignee clear — from the pool
+          # crash-recovery query. Closing is the durable fix for non-story
+          # source beads.
+          log "Closing source bug/task $BEAD_ID (gate PASS + merged sha=$MERGE_SHA)."
+          bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
+          _CLOSE_REASON="Quality gate PASSED — branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA, gate_run=$GATE_RUN_ID). Closed by autonomous dispatcher (ga-esbg)."
+          if [ -n "$DAEMON_SOFT_WARN" ]; then
+            bd -C "$BEAD_CITY" label add "$BEAD_ID" "delivery:daemon-unverified" -q 2>/dev/null || true
+            _CLOSE_REASON="$_CLOSE_REASON (ga-l7n3v: daemon liveness not positively confirmed — $DAEMON_SOFT_WARN; see delivery:daemon-unverified.)"
+          fi
+          # ga-v5acl: gate_close_source_terminal now owns the retry-on-refusal
+          # path (lease-aware `bd reclaim --older-than 0s`, then (ga-2emo8) a
+          # merge-verified --force). Was: unconditional `bd assign --force` +
+          # `bd close --force` on ANY close failure, regardless of whether the
+          # claim was actually abandoned — exactly what bd's own --force
+          # --help text warns against ("use only for abandoned claims...
+          # prefer bd reclaim"). See ga-esbg/wa-j824s for the original
+          # incident this replaces the ad hoc escalation for. merge_verified=1:
+          # same confirmed-merge precondition as the assignee-clear above.
+          if gate_close_source_terminal "$BEAD_ID" "$_CLOSE_REASON" 1; then
+            log "  Source bead $BEAD_ID closed (gate PASS + merged)."
+          else
+            warn "Could not close source bead $BEAD_ID even after lease-aware reclaim — re-pick vector remains, see post-merge verification below (ga-v5acl)"
+          fi
         fi
       fi
 
@@ -5055,7 +5254,10 @@ $PARTIAL_EVIDENCE" 2>/dev/null || true
       #      deliberately left open+unassigned pending Mayor review, and would
       #      otherwise false-flag as a respawn vector here even though
       #      gate:passed already keeps Pilot from re-dispatching it.
-      if [ "$IS_STORY" != "1" ] && [ "$IS_PARTIAL" != "1" ]; then
+      #      ga-l7n3v: a held-as-delivery:pending-restart bead is exempt for
+      #      the identical reason — deliberately left open+unassigned pending
+      #      daemon verification, same gate:passed protection.
+      if [ "$IS_STORY" != "1" ] && [ "$IS_PARTIAL" != "1" ] && [ "$IS_DAEMON_HOLD" != "1" ]; then
         if _still_listed -t bug;        then RESPAWN_HITS="$RESPAWN_HITS pilot:open-bug"; fi
         if _still_listed -l tech-debt;  then RESPAWN_HITS="$RESPAWN_HITS pilot:open-tech-debt"; fi
       fi
