@@ -429,6 +429,14 @@ _EXTRA_ALARM_SUPPRESS_PREFIXES = (
     # This affects the whole engine-window class (ga-yxuab, ga-s2eri, ga-hssb1, …),
     # not just the bead that surfaced it, and would repeat every STARVE_MIN forever.
     ("needs:engine-window", "needs:engine-window (Mayor/operator-coordinated gc engine rebuild — no pool worker may build it)"),
+    # ga-1mqdz/ga-rfpm9: the Pilot hard-honors BOTH spellings as a stop order, and
+    # treats them as DIFFERENT labels (pilot-dispatcher.sh ~L2699/L2700). _has_prefix
+    # is a PREFIX match, so the bare entry below does NOT cover the pilot: form --
+    # "pilot:no-auto-dispatch".startswith("no-auto-dispatch") is False. Without this
+    # line the reconciler alarms "dispatch failing" at a bead the Pilot is correctly
+    # declining to dispatch (measured: wa-iaan0, 1088min, repeat alarm #2) -- exactly
+    # the blame-the-Pilot class this tuple's own docstring warns about.
+    ("pilot:no-auto-dispatch", "pilot:no-auto-dispatch (Mayor/human stop order; the Pilot hard-honors it, ga-1mqdz AC1)"),
     ("no-auto-dispatch", "no-auto-dispatch (explicitly parked out of automatic dispatch)"),
     # ga-qt0mj: pilot-dispatcher.sh's _filter_candidates has 4 TEXT-based vetoes
     # (engine-rebuild / DECISAO-title / "só o Athos decide" / 🚨 compliance-marker)
