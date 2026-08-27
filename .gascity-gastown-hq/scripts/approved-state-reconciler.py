@@ -214,6 +214,14 @@ _PILOT_SWEEP_RE = re.compile(r"Pilot sweep complete:")
 # HISTORY across many sweeps, that function checks only the latest one.
 _PILOT_SWEEP_PAUSED_RE = re.compile(
     r"Pilot sweep complete: dispatched=0 \((?:paused|deferred):")
+# _PILOT_SWEEP_SLOTS_RE (ga-2yyez case 3 "lane x pool"): extracts small_slots/
+# big_slots from a NORMAL (non-paused/non-deferred) sweep-complete line, e.g.
+# "=== Pilot sweep complete: dispatched=3 (small_slots=2 big_slots=1) ===".
+# A paused/deferred line has no slot counts to report and will not match —
+# see _latest_sweep_lane_slots(), which relies on that to know when the most
+# recent sweep has nothing to say about lane capacity.
+_PILOT_SWEEP_SLOTS_RE = re.compile(
+    r"Pilot sweep complete: dispatched=\d+ \(small_slots=(\d+) big_slots=(\d+)\)")
 
 # ── test seams (monkeypatched in --selftest) ───────────────────────────────────
 # These module-level callables let selftests redirect I/O without spawning subprocesses.
@@ -357,6 +365,27 @@ def _has_prefix(labels, prefix):
         if lab == prefix or lab.startswith(prefix + ":"):
             return True
     return False
+
+
+def _is_epic(bead):
+    """True iff bead.issue_type (or legacy .type) is 'epic' (ga-2yyez case 1).
+
+    pilot-dispatcher.sh excludes issue_type=='epic' from dispatch BY DESIGN,
+    in three places (its line-15 comment, its jq candidate filter, and
+    --exclude-type epic on every candidate query) — an epic is a container
+    for its own sliced children, never dispatched itself. This reconciler had
+    NO concept of issue_type at all (grep 'issue_type|epic' on this file was
+    0 hits): every suppression check here is LABEL-based, and issue_type is
+    not a label, so an epic fell through every one of them and alarmed
+    "dispatch path failing" against a Pilot that was correctly, permanently
+    declining to dispatch it (wa-ielq6, 5 alarms/33h).
+
+    Checks BOTH field names because different JSON producers surface one or
+    the other — mirrors pilot-dispatcher.sh's own (.issue_type // .type)
+    fallback; replicating only .issue_type would leave the same blind spot
+    for whichever producer uses .type instead.
+    """
+    return (bead.get("issue_type") or bead.get("type") or "") == "epic"
 
 
 def _parse_reclaim_count(labels):
@@ -876,6 +905,96 @@ def _pool_has_capacity(rig_root, now):
     if active >= max_active:
         return False, "%s pool saturated (%d/%d active/creating)" % (template, active, max_active)
     return True, "%s pool has capacity (%d/%d active/creating)" % (template, active, max_active)
+
+
+# ── lane capacity check (ga-2yyez case 3 "lane x pool") ───────────────────────
+def _latest_sweep_lane_slots(now):
+    """Return (small_slots, big_slots) from the most recently logged NORMAL
+    'Pilot sweep complete' line, or None if unmeasurable — log missing/
+    unreadable, the most recent sweep-complete line found is a whole-sweep
+    pause/yield (no slots to report), or that line is older than
+    PILOT_ALIVE_WINDOW_MIN (stale — the Pilot may be down or between sweeps).
+
+    root-class:error-vs-empty: None means "cannot confirm lane capacity",
+    NEVER "lane has capacity" — callers must fail toward alarming, the same
+    discipline as every sibling measurement in this file (_is_pilot_alive,
+    _pilot_sweep_pause_history, etc., all of which share this exact log tail).
+    """
+    if _read_pilot_log_lines is not None:
+        lines = _read_pilot_log_lines()   # test seam (shared with _is_pilot_alive)
+    else:
+        lines = _tail(PILOT_LOG, LOG_TAIL)
+    if not lines:
+        return None
+
+    window_sec = PILOT_ALIVE_WINDOW_MIN * 60
+    for line in reversed(lines):
+        if not _PILOT_SWEEP_RE.search(line):
+            continue
+        # Most recent sweep-complete line, whichever kind it is. A whole-sweep
+        # pause/yield reports no slots — stop here rather than scanning further
+        # back for an older normal line, which would describe a stale sweep
+        # (and, in practice, a paused latest sweep is already suppressed
+        # earlier in _process_store()'s cascade by _pilot_sweep_pause_suppress_
+        # reason() before this function is ever reached).
+        epoch = _ts_epoch(line)
+        if epoch is None or (now - epoch) > window_sec:
+            return None
+        m = _PILOT_SWEEP_SLOTS_RE.search(line)
+        if not m:
+            return None
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def _lane_capacity_suppress_reason(labels, now):
+    """Suppress reason if the bead's OWN lane (lane:small / lane:big label) had
+    zero free slots in the most recently logged sweep, else None.
+
+    ROOT CAUSE (ga-2yyez case 3): _pool_has_capacity() above mirrors the
+    Pilot's PER-POOL session-count saturation check (e.g. wa-worker sessions
+    vs its own configured max) — a completely different resource from the
+    LANE budget that actually gates dispatch order (pilot-dispatcher.sh:
+    SMALL_SLOTS = MAX_SMALL - IN_FLIGHT_SMALL, a city-wide budget derived
+    from in-flight work across every store, not from any one pool's session
+    count). A pool can have a free session slot while its own lane is fully
+    saturated — exactly what happened to wa-zvs2s (P1, front of the Pilot's
+    own dispatch queue, lane=small, that same sweep logged small_slots=0
+    big_slots=1) and wa-3mqpj (two alarms while small_slots=0; it dispatched
+    on its own, unassisted, the moment a later sweep logged small_slots=1).
+    Neither was a dispatch failure — both were healthy capacity queuing this
+    reconciler had no signal for. This is also the blind spot in
+    _pilot_queue_suppress_reason(): a bead at queue index 0 ("nothing ahead
+    of it") is assumed to have nothing explaining its wait, but the Pilot's
+    dispatch-queue snapshot carries no per-lane slot info — index 0 across
+    the WHOLE queue can still mean zero slots in the bead's OWN lane while a
+    different lane has room.
+
+    Returns None (do NOT suppress — fail toward alarming) when:
+      - the bead carries neither lane:small nor lane:big (can't determine
+        which budget applies, root-class:error-vs-empty)
+      - _latest_sweep_lane_slots() is unmeasurable (None)
+      - the bead's own lane had >=1 free slot in the most recent sweep
+
+    A reason string (suppress) only when the bead's own lane is positively
+    measured at zero slots in the most recently logged sweep.
+    """
+    if "lane:small" in labels:
+        lane = "small"
+    elif "lane:big" in labels:
+        lane = "big"
+    else:
+        return None
+    slots = _latest_sweep_lane_slots(now)
+    if slots is None:
+        return None
+    small_slots, big_slots = slots
+    free = small_slots if lane == "small" else big_slots
+    if free > 0:
+        return None
+    return ("lane:%s saturated (small_slots=%d big_slots=%d in the most recent "
+            "Pilot sweep) — legitimately queued behind the city-wide lane "
+            "budget, not a dispatch failure (ga-2yyez)" % (lane, small_slots, big_slots))
 
 
 # ── route a bead out of story:approved ───────────────────────────────────────
@@ -2061,6 +2180,17 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
         bead_id = bead.get("id") or bead.get("issue_id") or "?"
         labels = _get_labels(bead)
 
+        # ── Step 0: issue_type == 'epic' → structurally never dispatchable ──
+        # (ga-2yyez case 1). Checked before Step 1's _classify() — an epic
+        # should never be routed, flagged, OR alarmed; unlike every other
+        # suppression below it does not depend on labels, age, or any
+        # measured signal, so there is nothing to gain by deferring it. See
+        # _is_epic()'s docstring for the wa-ielq6 root-cause repro.
+        if _is_epic(bead):
+            _log("  %s: issue_type=epic — structurally non-dispatchable "
+                 "(pilot-dispatcher.sh excludes epic by design) — no alarm" % bead_id)
+            continue
+
         # ── Step 1: explicit label-based signal → route out ────────────────
         route_to, signal = _classify(bead)
 
@@ -2388,6 +2518,21 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
                  bead_id, starve_age_min, pilot_queue_suppress_reason))
             continue
 
+        # LANE CAPACITY (ga-2yyez case 3 "lane x pool"): _pool_has_capacity above
+        # and _pilot_queue_suppress_reason above both miss the same resource —
+        # neither knows about the city-wide per-LANE slot budget that actually
+        # gates dispatch (pilot-dispatcher.sh's SMALL_SLOTS/BIG_SLOTS). A bead
+        # can have a free pool session slot AND sit at queue index 0 (nothing
+        # ahead of it) while its own lane is still at zero slots — exactly the
+        # wa-zvs2s/wa-3mqpj false positives. See _lane_capacity_suppress_
+        # reason()'s docstring for the full root-cause writeup. Checked last
+        # among the measurement-based suppressions, same class as the two above.
+        lane_reason = _lane_capacity_suppress_reason(labels, now)
+        if lane_reason is not None:
+            _log("  %s: no signal, daemon-age=%.0fmin, %s — no alarm" % (
+                 bead_id, starve_age_min, lane_reason))
+            continue
+
         # GATE QUEUE BACKLOG (ga-dbfm9): the gate-review queue is a separate resource
         # from the builder pool _pool_has_capacity already checked above; a deep
         # backlog there paces down how fast the Pilot effectively gets to new
@@ -2710,6 +2855,38 @@ def _selftest():
                 branch. Exercises the REAL function (not the
                 _bd_branch_stranded stub scenarios a-d use), matching how
                 the gate reviewer who caught this actually reproduced it.
+      (ga-2yyez-epic-a) _is_epic() recognizes issue_type and the legacy .type
+                fallback, and only the literal value 'epic'
+      (ga-2yyez-epic-b) epic + story:approved, starving, pilot alive, zero
+                other signals → NO alarm, NOT routed, NOT flagged (wa-ielq6:
+                5 alarms/33h against a bead the Pilot never dispatches by
+                design — issue_type is not a label, so it matched none of
+                this reconciler's label-based suppressions)
+      (ga-2yyez-epic-c) falsification: same shape but issue_type='bug' (not
+                epic) → STILL alarms (fix isn't over-permissive)
+      (ga-2yyez-lane-a..d) _latest_sweep_lane_slots(): reads small_slots/
+                big_slots off the MOST RECENT normal sweep line (a); a
+                paused most-recent sweep has no slots to report → None, never
+                borrowed from an older normal line (b); a stale most-recent
+                line → None (root-class:error-vs-empty) (c); no log lines →
+                None (d)
+      (ga-2yyez-lane-e) _lane_capacity_suppress_reason(): suppresses iff the
+                bead's OWN lane (lane:small/lane:big label) is measured at
+                zero slots in the latest sweep; never suppresses when the
+                bead carries neither lane label or when slots are
+                unmeasurable
+      (ga-2yyez-lane-f) END-TO-END, mirrors wa-zvs2s: lane:small bead, front
+                of an unmeasurable dispatch queue, pool has capacity, but the
+                latest sweep logged small_slots=0 → NO alarm — the false
+                positive neither _pool_has_capacity (measures POOL session
+                count) nor _pilot_queue_suppress_reason (measures queue
+                POSITION, not per-lane slots) can catch alone
+      (ga-2yyez-lane-g) falsification, mirrors wa-3mqpj sweep B: same shape
+                but small_slots=1 → STILL alarms (fix is not a blanket
+                suppress)
+      (ga-2yyez-lane-h) cross-lane isolation: small_slots=0 but the bead is
+                lane:big with big_slots=1 → STILL alarms — small-lane
+                saturation must never suppress a big-lane bead
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
@@ -2862,10 +3039,10 @@ def _selftest():
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _make_bead(bid, labels=None, title="Test story", assignee="",
-                   age_min=5.0, body=""):
+                   age_min=5.0, body="", issue_type=None):
         """Create a minimal bead dict; age_min=minutes since last updated."""
         epoch = NOW - age_min * 60.0
-        return {
+        bead = {
             "id": bid,
             "title": title,
             "body": body,
@@ -2873,6 +3050,9 @@ def _selftest():
             "assignee": assignee,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(epoch)),
         }
+        if issue_type is not None:
+            bead["issue_type"] = issue_type
+        return bead
 
     def _pilot_recent(n=1):
         """n pilot sweep-complete lines within PILOT_ALIVE_WINDOW_MIN of NOW."""
@@ -4884,6 +5064,211 @@ def _selftest():
             _bad("(ga-tma6wc-d)", "subject=%r body=%r" % (subject_d, body_d))
     else:
         _bad("(ga-tma6wc-d)", "expected an alarm but none fired — "
+             "mail_calls=%s" % (mail_calls,))
+
+    # ── ga-2yyez case 1: issue_type=='epic' → structurally never dispatchable ──
+    print("\nScenario (ga-2yyez-epic-a): _is_epic() recognizes issue_type and "
+          "the legacy .type fallback, and only the literal value 'epic'")
+    if (_is_epic({"issue_type": "epic"}) and _is_epic({"type": "epic"})
+            and not _is_epic({"issue_type": "bug"}) and not _is_epic({})):
+        _ok("(ga-2yyez-epic-a): true for issue_type/type=='epic', false for "
+            "other issue_type and for a bead with neither field")
+    else:
+        _bad("(ga-2yyez-epic-a)", "issue_type=%r type=%r bug=%r empty=%r" % (
+             _is_epic({"issue_type": "epic"}), _is_epic({"type": "epic"}),
+             _is_epic({"issue_type": "bug"}), _is_epic({})))
+
+    print("\nScenario (ga-2yyez-epic-b): epic + story:approved, starving, "
+          "pilot alive, zero other signals → NO alarm, NOT routed, NOT "
+          "flagged (wa-ielq6 repro — 5 alarms/33h before this fix)")
+    _bd_approved = lambda root: [_make_bead(
+        "ga-2yyez-b", labels=["story:approved"], issue_type="epic")]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    _read_pilot_sweep_pause_state_file = lambda: {
+        "active": False, "reason": "", "detail": "",
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW)),
+    }
+    st = _reset()
+    # Deliberately aged PAST STARVE_MIN (not left at the fresh/grace-window
+    # default) — otherwise this scenario would pass on unfixed code too, for
+    # the wrong reason (grace window, not the epic check), and never actually
+    # falsify the fix. Caught by running this exact scenario against the
+    # fix reverted: without pre-seeding, it reported "ok" despite no Step 0
+    # existing at all.
+    st["first_seen_approved"]["ga-2yyez-b"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    alarmed_b = any("ga-2yyez-b" in subj for subj, _ in mail_calls)
+    routed_b = ("ga-2yyez-b", "story:approved") in label_removes
+    flagged_b = any(bid == "ga-2yyez-b" for bid, _ in comments)
+    if not alarmed_b and not routed_b and not flagged_b:
+        _ok("(ga-2yyez-epic-b): epic bead never alarms/routes/flags "
+            "regardless of age (wa-ielq6 root cause)")
+    else:
+        _bad("(ga-2yyez-epic-b)", "mail_calls=%s label_removes=%s comments=%s" % (
+             mail_calls, label_removes, comments))
+
+    print("\nScenario (ga-2yyez-epic-c): falsification — SAME shape but "
+          "issue_type='bug' (not epic) → STILL alarms (fix isn't over-"
+          "permissive)")
+    _bd_approved = lambda root: [_make_bead(
+        "ga-2yyez-c", labels=["story:approved"], issue_type="bug")]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    _read_pilot_sweep_pause_state_file = lambda: {
+        "active": False, "reason": "", "detail": "",
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW)),
+    }
+    st = _reset()
+    st["first_seen_approved"]["ga-2yyez-c"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    alarmed_c = any("ga-2yyez-c" in subj for subj, _ in mail_calls)
+    if alarmed_c:
+        _ok("(ga-2yyez-epic-c): non-epic starving bead still alarms "
+            "(regression guard)")
+    else:
+        _bad("(ga-2yyez-epic-c)", "expected an alarm but none fired — "
+             "mail_calls=%s" % (mail_calls,))
+
+    # ── ga-2yyez case 3 "lane x pool": lane capacity check ───────────────────
+    def _sweep_log_line_slots(epoch, small, big):
+        ts = time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(epoch))
+        return ("%s [pilot-dispatcher] === Pilot sweep complete: dispatched=1 "
+                "(small_slots=%d big_slots=%d) ===" % (ts, small, big))
+
+    print("\nScenario (ga-2yyez-lane-a): _latest_sweep_lane_slots() reads "
+          "small_slots/big_slots off the MOST RECENT normal sweep line, not "
+          "an older one")
+    _read_pilot_log_lines = lambda: [
+        _sweep_log_line_slots(NOW - 600, 2, 1),
+        _sweep_log_line_slots(NOW - 100, 0, 1),
+    ]
+    slots_a = _latest_sweep_lane_slots(NOW)
+    if slots_a == (0, 1):
+        _ok("(ga-2yyez-lane-a): most recent sweep's slots read correctly, (0, 1)")
+    else:
+        _bad("(ga-2yyez-lane-a)", "got %r, want (0, 1)" % (slots_a,))
+
+    print("\nScenario (ga-2yyez-lane-b): most recent sweep was a whole-sweep "
+          "pause (no slots reported) → unmeasurable (None), never a stale "
+          "value borrowed from an older normal line")
+    _read_pilot_log_lines = lambda: [
+        _sweep_log_line_slots(NOW - 600, 2, 1),
+        _sweep_log_line(NOW - 100, "ram-pressure"),
+    ]
+    slots_b = _latest_sweep_lane_slots(NOW)
+    if slots_b is None:
+        _ok("(ga-2yyez-lane-b): most recent sweep paused → None, not the "
+            "older normal line's slots")
+    else:
+        _bad("(ga-2yyez-lane-b)", "got %r, want None" % (slots_b,))
+
+    print("\nScenario (ga-2yyez-lane-c): falsification (root-class:error-vs-"
+          "empty) — most recent sweep line is STALE (older than "
+          "PILOT_ALIVE_WINDOW_MIN) → unmeasurable (None), never a falsely-"
+          "confident slot count")
+    _read_pilot_log_lines = lambda: [
+        _sweep_log_line_slots(NOW - (PILOT_ALIVE_WINDOW_MIN + 5) * 60, 0, 0),
+    ]
+    slots_c = _latest_sweep_lane_slots(NOW)
+    if slots_c is None:
+        _ok("(ga-2yyez-lane-c): stale sweep line → None")
+    else:
+        _bad("(ga-2yyez-lane-c)", "got %r, want None" % (slots_c,))
+
+    print("\nScenario (ga-2yyez-lane-d): no log lines at all → unmeasurable (None)")
+    _read_pilot_log_lines = lambda: []
+    slots_d = _latest_sweep_lane_slots(NOW)
+    if slots_d is None:
+        _ok("(ga-2yyez-lane-d): empty log → None")
+    else:
+        _bad("(ga-2yyez-lane-d)", "got %r, want None" % (slots_d,))
+
+    print("\nScenario (ga-2yyez-lane-e): _lane_capacity_suppress_reason() — "
+          "lane:small at small_slots=0 suppresses; lane:small with a free "
+          "slot does not; lane:big saturated suppresses; no lane label never "
+          "suppresses (can't tell which budget applies); unmeasurable slots "
+          "never suppress")
+    checks = [
+        (["lane:small"], (0, 1), True, "lane:small saturated"),
+        (["lane:small"], (1, 1), False, "lane:small has a free slot"),
+        (["lane:big"], (2, 0), True, "lane:big saturated"),
+        ([], (0, 0), False, "no lane label — can't determine budget"),
+    ]
+    all_ok = True
+    for lbls, slots_tuple, expect_suppress, desc in checks:
+        _read_pilot_log_lines = lambda: [
+            _sweep_log_line_slots(NOW - 100, slots_tuple[0], slots_tuple[1])]
+        reason = _lane_capacity_suppress_reason(lbls, NOW)
+        got_suppress = reason is not None
+        if got_suppress != expect_suppress:
+            all_ok = False
+            _bad("(ga-2yyez-lane-e)", "%s: got reason=%r, expected suppress=%s" % (
+                 desc, reason, expect_suppress))
+    _read_pilot_log_lines = lambda: []
+    reason_unmeasurable = _lane_capacity_suppress_reason(["lane:small"], NOW)
+    if reason_unmeasurable is not None:
+        all_ok = False
+        _bad("(ga-2yyez-lane-e)", "unmeasurable slots must never suppress, "
+             "got %r" % (reason_unmeasurable,))
+    if all_ok:
+        _ok("(ga-2yyez-lane-e): suppress/no-suppress correct across "
+            "saturated/free/no-label/unmeasurable cases")
+
+    print("\nScenario (ga-2yyez-lane-f): END-TO-END, mirrors wa-zvs2s — bead "
+          "is lane:small, dispatch queue position unmeasurable (so "
+          "_pilot_queue_suppress_reason alone would NOT suppress) and pool "
+          "has capacity (so _pool_has_capacity alone would NOT suppress "
+          "either), but the latest sweep logged small_slots=0 → NO alarm")
+    _bd_approved = lambda root: [_make_bead(
+        "ga-2yyez-f", labels=["story:approved", "lane:small"])]
+    _read_pilot_log_lines = lambda: [_sweep_log_line_slots(NOW - 100, 0, 1)]
+    _read_pilot_dispatchable_file = lambda: None
+    _read_pilot_sweep_pause_state_file = lambda: {
+        "active": False, "reason": "", "detail": "",
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW)),
+    }
+    st = _reset()
+    st["first_seen_approved"]["ga-2yyez-f"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    alarmed_f = any("ga-2yyez-f" in subj for subj, _ in mail_calls)
+    if not alarmed_f:
+        _ok("(ga-2yyez-lane-f): lane:small bead with small_slots=0 does NOT "
+            "alarm — legitimately queued behind the lane budget (wa-zvs2s)")
+    else:
+        _bad("(ga-2yyez-lane-f)", "expected no alarm, got mail_calls=%s" % (mail_calls,))
+
+    print("\nScenario (ga-2yyez-lane-g): falsification, mirrors wa-3mqpj "
+          "sweep B — SAME bead shape, but the latest sweep logged "
+          "small_slots=1 (a slot opened up) → STILL alarms (fix is not a "
+          "blanket suppress)")
+    _bd_approved = lambda root: [_make_bead(
+        "ga-2yyez-g", labels=["story:approved", "lane:small"])]
+    _read_pilot_log_lines = lambda: [_sweep_log_line_slots(NOW - 100, 1, 0)]
+    st = _reset()
+    st["first_seen_approved"]["ga-2yyez-g"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    alarmed_g = any("ga-2yyez-g" in subj for subj, _ in mail_calls)
+    if alarmed_g:
+        _ok("(ga-2yyez-lane-g): lane:small bead with a free small_slots "
+            "still alarms (regression guard)")
+    else:
+        _bad("(ga-2yyez-lane-g)", "expected an alarm but none fired — "
+             "mail_calls=%s" % (mail_calls,))
+
+    print("\nScenario (ga-2yyez-lane-h): cross-lane isolation — "
+          "small_slots=0 but THIS bead is lane:big with big_slots=1 → STILL "
+          "alarms; small-lane saturation must never suppress a big-lane bead")
+    _bd_approved = lambda root: [_make_bead(
+        "ga-2yyez-h", labels=["story:approved", "lane:big"])]
+    _read_pilot_log_lines = lambda: [_sweep_log_line_slots(NOW - 100, 0, 1)]
+    st = _reset()
+    st["first_seen_approved"]["ga-2yyez-h"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    alarmed_h = any("ga-2yyez-h" in subj for subj, _ in mail_calls)
+    if alarmed_h:
+        _ok("(ga-2yyez-lane-h): lane:big bead unaffected by small-lane "
+            "saturation, still alarms (cross-lane isolation)")
+    else:
+        _bad("(ga-2yyez-lane-h)", "expected an alarm but none fired — "
              "mail_calls=%s" % (mail_calls,))
 
     # ── result ────────────────────────────────────────────────────────────────
