@@ -4259,10 +4259,36 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       # Arguments: IS_CONTAINER_RIG, BRANCH, DEFAULT_BRANCH — all from outer scope.
       # Returns: sets MERGE_SHA and MERGE_RESULT in outer scope.
       # Strategy per attempt:
+      #   0. Re-verify full history (ga-0eh7o — see below)
       #   1. git fetch (get current remote state)
       #   2. If main moved (branch no longer FF-able): auto-rebase if clean
       #   3. FF push branch SHA to main
       #   4. Verify landing
+
+      # ga-0eh7o: re-check shallow state HERE, immediately before the
+      # ancestry checks below (IS_ANC / rig_merge_has_conflict), not just
+      # once at the Step-4 ga-ymbv preflight (further down this file).
+      # Confirmed live: review can take ~19min, and something can re-shallow
+      # the shared git-dir DURING that window — the Step-4 preflight already
+      # passed clean, but by the time do_merge_ff() ran, merge-base/
+      # merge-tree silently misread the shallow-truncated boundary as "no
+      # common ancestor" and failed non-retryably (failed_sha_resolution)
+      # even though the branch really was mergeable (byte-verified: the
+      # truncated commit's own parent link was intact via `git cat-file -p`).
+      # Re-running this on EVERY attempt (not just once) also self-heals
+      # across MAX_MERGE_RETRIES retries if re-shallowing recurs mid-loop.
+      # Same check as the ga-ymbv preflight below — duplicated rather than
+      # extracted into a shared helper to keep this fix small and localized
+      # to the one function that needed it; keep both in sync if the check
+      # logic ever changes.
+      if [ "$(git_rig rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+        log "  Rig checkout ($GIT_DIR_PATH) is a shallow clone — running git fetch --unshallow before ancestry checks (ga-ymbv/ga-0eh7o, attempt $((MERGE_ATTEMPT+1)))."
+        if git_rig fetch origin --unshallow >/dev/null 2>&1; then
+          log "  unshallow OK."
+        else
+          warn "  unshallow FAILED (non-fatal) — ancestry checks below may still misreport merge-base=none for branches rooted past the fetch boundary."
+        fi
+      fi
 
       git_rig fetch origin 2>/dev/null || warn "Pre-merge fetch failed (attempt $((MERGE_ATTEMPT+1)))"
       # ga-ljbx: hardened — resolve to REAL commit objects so a dangling ref
@@ -8005,6 +8031,13 @@ git_rig fetch origin 2>/dev/null || { GIT_FETCH_OK=0; warn "git fetch failed (co
 # transient network hiccup) is non-fatal — downstream ancestry checks simply
 # fall back to the pre-existing gate-status:error retry path, same as before
 # this fix.
+#
+# ga-0eh7o: this preflight only runs ONCE, before review starts — a repo that
+# goes shallow again DURING the review window (which can run 15-20+ minutes)
+# reaches merge time with a stale "not shallow" assumption. The identical
+# check is re-run at the top of do_merge_ff() (this file, near
+# MAX_MERGE_RETRIES) so every merge attempt/retry self-heals independently of
+# this one-time preflight.
 if [ "$(git_rig rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
   log "  Rig checkout ($GIT_DIR_PATH) is a shallow clone — running git fetch --unshallow so merge-base/merge-tree see full history (ga-ymbv)."
   if git_rig fetch origin --unshallow >/dev/null 2>&1; then

@@ -18,10 +18,24 @@
 # `git fetch origin --unshallow` once so all downstream ancestry checks operate
 # on full history.
 #
+# ga-0eh7o: that preflight only runs ONCE, before review starts. A review can
+# take 15-20+ minutes, and something can re-shallow the shared git-dir DURING
+# that window — confirmed live, byte-verified via `git cat-file -p` that the
+# truncated commit's own parent link was intact (a pure shallow-boundary
+# problem, not object corruption). The Step-4 preflight had already passed
+# clean, but do_merge_ff()'s own ancestry checks (IS_ANC / merge-base /
+# merge-tree via rig_merge_has_conflict) then silently misread the
+# re-introduced truncation as "no common ancestor" and failed non-retryably
+# (failed_sha_resolution) even though the branch really was mergeable. Fix:
+# the identical is-shallow-repository + fetch --unshallow check now also runs
+# at the top of do_merge_ff() itself, so every merge attempt/retry (up to
+# MAX_MERGE_RETRIES) self-heals independently of the one-time preflight.
+#
 # This harness (1) reproduces the bug class in isolation with real throwaway
 # git repos to prove shallow clones actually cause merge-base/merge-tree to
-# misreport ancestry this way, (2) proves --unshallow fixes it, and (3)
-# drift-guards the real fix in the dispatcher source. Exit 0 iff all hold.
+# misreport ancestry this way, (2) proves --unshallow fixes it, (3)
+# drift-guards the Step-4 preflight fix in the dispatcher source, and (4)
+# drift-guards the do_merge_ff() re-check (ga-0eh7o). Exit 0 iff all hold.
 
 set -uo pipefail
 
@@ -111,6 +125,23 @@ if [ -f "$GATE" ]; then
     ok "dispatcher runs the shallow-clone preflight (is-shallow-repository + fetch --unshallow) before BRANCH_SHA resolution"
   else
     bad "dispatcher is MISSING the shallow-clone preflight ahead of BRANCH_SHA resolution (ga-ymbv regression)"
+  fi
+else
+  bad "quality-gate-dispatcher.sh not found next to selftest at $GATE"
+fi
+
+# ── 4. Drift-guard (ga-0eh7o): the SAME preflight must ALSO run at the top of
+#    do_merge_ff(), immediately before its own ancestry checks (IS_ANC /
+#    merge-base), not just once at Step 4 above — closing the window where a
+#    repo re-shallows DURING the review window, after Step 4 already passed
+#    clean. ────────────────────────────────────────────────────────────────
+if [ -f "$GATE" ]; then
+  MERGE_FF_BLOCK="$(awk '/^[[:space:]]*do_merge_ff\(\) \{/{c=1} c{print} /^[[:space:]]*local IS_ANC/{if(c) exit}' "$GATE" 2>/dev/null || true)"
+  if printf '%s' "$MERGE_FF_BLOCK" | grep -q -- 'is-shallow-repository' \
+     && printf '%s' "$MERGE_FF_BLOCK" | grep -q -- 'fetch origin --unshallow'; then
+    ok "do_merge_ff() re-checks shallow state before its own ancestry checks (ga-0eh7o)"
+  else
+    bad "do_merge_ff() is MISSING the shallow-clone re-check before its ancestry checks (ga-0eh7o regression: a repo re-shallowed DURING review would silently fail merge with failed_sha_resolution even though the branch is mergeable)"
   fi
 else
   bad "quality-gate-dispatcher.sh not found next to selftest at $GATE"
