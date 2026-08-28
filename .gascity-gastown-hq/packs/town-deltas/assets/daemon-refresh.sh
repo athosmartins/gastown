@@ -29,6 +29,27 @@
 #      NEVER auto-bounced (in-flight messages/webhooks must be drained first).
 #      They are FLAGGED for a guarded restart unless a DRAIN_CMD_<label> is
 #      provided, in which case drain → kickstart → verify.
+#   6. (ga-ylr2m) SENSITIVE_DAEMONS is a small, hand-maintained substring list
+#      — the exact registry-drift gap this closes: it silently auto-kickstarted
+#      frota_dashboard/demand_dashboard/campaign_dashboard, all notify_only_
+#      locked or vetoed for a physical or in-flight-state reason in WA's own
+#      restart_policy.yaml, because nobody had copied their names here yet.
+#      When the rig ships that file at $RUNTIME_DIR/daemons/restart_policy.yaml
+#      (e.g. whatsapp_automation), it is consulted DIRECTLY: a daemon whose
+#      .py entrypoint is not explicitly listed under that file's 'auto'/
+#      'deploy_restart' allowlists is ALSO treated SENSITIVE here — matching
+#      the policy file's own documented default ("unlisted = manual"),
+#      instead of requiring a human to keep a second copy of the same list in
+#      sync. SENSITIVE_DAEMONS and the policy file are a UNION (either source
+#      calling a daemon sensitive makes it sensitive) — this only ever ADDS
+#      scrutiny, never removes it, and a rig with no restart_policy.yaml
+#      behaves identically to before. Independently, any daemon named in that
+#      file's 'restart_guard_scripts:' has its guard script consulted
+#      immediately before EVERY kickstart of it (SAFE or drained-SENSITIVE) —
+#      this script was a 4th, previously-unguarded restart trigger alongside
+#      WA's own three (deploy_daemons.sh's two loops + auto_restart_daemons.py's
+#      deploy_restart branch), closing the classification_dashboard
+#      send-in-flight gap for this trigger too.
 #
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
@@ -59,6 +80,8 @@
 #
 # Inputs (env):
 #   RUNTIME_DIR       deployed git work tree (e.g. /Users/athos/gt/whatsapp_automation)
+#                     (ga-ylr2m) if $RUNTIME_DIR/daemons/restart_policy.yaml
+#                     exists, it is consulted directly — see header point 6.
 #   PRE_DEPLOY_SHA    HEAD before deploy
 #   POST_DEPLOY_SHA   HEAD after deploy
 #   DEPLOY_EPOCH      unix epoch captured immediately before deploy
@@ -88,6 +111,90 @@ VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-20}"
 VERIFY_INTERVAL="${VERIFY_INTERVAL:-1}"
 
 log() { echo "[daemon-refresh] $*" >&2; }
+
+# ── restart_policy.yaml consultation (ga-ylr2m) ───────────────────────────────
+# See header point 6. Parsed once, up front, into space-separated .py-basename
+# lists (POLICY_AUTO / POLICY_DEPLOY_RESTART / POLICY_NOTIFY_ONLY_LOCKED) plus
+# a "daemon.py=script/relpath" pair list (POLICY_GUARDS). Missing/unreadable/
+# unparseable file → every POLICY_* var stays empty, which makes
+# policy_says_sensitive()/guard_allows_restart() below unconditional no-ops —
+# IDENTICAL to this script's pre-ga-ylr2m behavior. Never fatal: a broken
+# policy file must not block delivery for OTHER rigs, and must never degrade
+# scrutiny below "ask SENSITIVE_DAEMONS only" (i.e. it can only ADD caution).
+RESTART_POLICY_YAML="$RUNTIME_DIR/daemons/restart_policy.yaml"
+POLICY_AUTO=""; POLICY_DEPLOY_RESTART=""; POLICY_NOTIFY_ONLY_LOCKED=""; POLICY_GUARDS=""
+if [ -f "$RESTART_POLICY_YAML" ]; then
+  eval "$(python3 - "$RESTART_POLICY_YAML" <<'PY' 2>/dev/null
+import re, shlex, sys
+
+def scalar(v):
+    v = v.strip()
+    if v[:1] in "'\"" and v[-1:] == v[:1]:
+        return v[1:-1]
+    low = v.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    if low in ("null", "~", ""):
+        return None
+    if low == "{}":
+        return {}
+    if re.fullmatch(r"-?\d+", v):
+        return int(v)
+    return v
+
+def load_policy(path):
+    # Subset-YAML reader mirroring whatsapp_automation/scripts/
+    # lint_restart_policy.py's load_policy(): top-level 'k: v', '- item'
+    # lists, indented 'k: v' nested dicts; full-line and trailing ' #'
+    # comments stripped. Keep the two in sync if that file's supported
+    # subset ever changes — this is a deliberate, documented duplication of
+    # a small (~30-line) already-reviewed parser, not a second design.
+    out = {}
+    cur_key = None
+    cur_kind = None  # 'list' | 'dict'
+    for raw in open(path, encoding="utf-8"):
+        line = raw.split(" #", 1)[0].rstrip() if " #" in raw else raw.rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indented = line[0] in " \t"
+        s = line.strip()
+        if not indented:
+            key, _, val = s.partition(":")
+            key = key.strip()
+            if val.strip() == "":
+                out[key], cur_key, cur_kind = None, key, None
+            else:
+                out[key], cur_key, cur_kind = scalar(val), None, None
+        elif s.startswith("- "):
+            if cur_kind != "list":
+                out[cur_key], cur_kind = [], "list"
+            out[cur_key].append(scalar(s[2:]))
+        else:
+            if cur_kind != "dict":
+                out[cur_key], cur_kind = {}, "dict"
+            k, _, v = s.partition(":")
+            out[cur_key][k.strip()] = scalar(v)
+    return out
+
+try:
+    policy = load_policy(sys.argv[1])
+except Exception:
+    policy = {}
+
+def strlist(key):
+    return " ".join(str(x) for x in (policy.get(key) or []) if isinstance(x, str))
+
+print("POLICY_AUTO=" + shlex.quote(strlist("auto")))
+print("POLICY_DEPLOY_RESTART=" + shlex.quote(strlist("deploy_restart")))
+print("POLICY_NOTIFY_ONLY_LOCKED=" + shlex.quote(strlist("notify_only_locked")))
+guards = policy.get("restart_guard_scripts") or {}
+if isinstance(guards, dict):
+    pairs = " ".join(f"{d}={s}" for d, s in guards.items()
+                      if isinstance(d, str) and isinstance(s, str))
+    print("POLICY_GUARDS=" + shlex.quote(pairs))
+PY
+)" 2>/dev/null || true
+fi
 
 # ── emit result + exit ────────────────────────────────────────────────────────
 emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified — fail closed)
@@ -238,6 +345,76 @@ is_sensitive() {
   return 1
 }
 
+# policy_says_sensitive <label> (ga-ylr2m) -> 0 if restart_policy.yaml (when
+# present) does NOT explicitly clear ALL of this daemon's entrypoints for
+# auto-restart. Mirrors that file's own documented default ("unlisted =
+# manual, notify-only") instead of this script's historical default
+# ("unlisted = safe") — the registry-drift gap ga-ylr2m closes. No policy
+# file, or a daemon whose entrypoint didn't resolve to a relpath (see
+# resolve_relpath), means no opinion — returns 1 (not sensitive BY THIS
+# SOURCE; SENSITIVE_DAEMONS is still checked independently by the caller via
+# `||` — this only ever ADDS scrutiny, never removes it). Reads $DISCO_DIR/
+# $label, populated for every label by Step 2 above.
+policy_says_sensitive() {
+  local label="$1" entries entry base locked_hit
+  [ -f "$RESTART_POLICY_YAML" ] || return 1
+  entries="$(cat "$DISCO_DIR/$label" 2>/dev/null || true)"
+  [ -n "${entries// /}" ] || return 1
+  for entry in $entries; do
+    base="$(basename "$entry")"
+    case " $POLICY_AUTO $POLICY_DEPLOY_RESTART " in
+      *" $base "*) continue ;;   # this entrypoint is explicitly allow-listed safe
+    esac
+    locked_hit=0
+    case " $POLICY_NOTIFY_ONLY_LOCKED " in *" $base "*) locked_hit=1 ;; esac
+    if [ "$locked_hit" -eq 1 ]; then
+      log "$label ($base): restart_policy.yaml notify_only_locked — human trava, never auto."
+    else
+      log "$label ($base): not in restart_policy.yaml's 'auto'/'deploy_restart' — unlisted defaults to manual there."
+    fi
+    return 0   # at least one entrypoint is NOT explicitly safe -> sensitive
+  done
+  return 1   # every entrypoint explicitly allow-listed safe
+}
+
+# guard_allows_restart <label> (ga-ylr2m) -> 0 if no configured guard objects.
+# Consults restart_policy.yaml's restart_guard_scripts: for ANY of this
+# daemon's entrypoints, mirroring whatsapp_automation/scripts/
+# auto_restart_daemons.py's guard_allows_restart(): guard script exit 0 =
+# proceed; any non-zero (1=in-flight, 2=don't know, a crash, a timeout) = do
+# NOT restart — the third state ("don't know") collapses to the safe one,
+# never to "proceed" (ga-mlsc0's own discipline, reused verbatim here). No
+# entry for this daemon -> always allowed, IDENTICAL to before this change —
+# the guard only ever SUBTRACTS a restart that would otherwise have happened,
+# never adds one. Closes the "consult restart_guard_scripts before an
+# auto-kickstart" half of ga-ylr2m: this script was a 4th, previously-
+# unguarded restart trigger alongside WA's own three.
+guard_allows_restart() {
+  local label="$1" entries entry base pair d s script rc
+  [ -n "$POLICY_GUARDS" ] || return 0
+  entries="$(cat "$DISCO_DIR/$label" 2>/dev/null || true)"
+  for entry in $entries; do
+    base="$(basename "$entry")"
+    for pair in $POLICY_GUARDS; do
+      d="${pair%%=*}"; s="${pair#*=}"
+      [ "$d" = "$base" ] || continue
+      script="$RUNTIME_DIR/$s"
+      if [ ! -f "$script" ]; then
+        log "$label ($base) guard script declared but missing on disk: $script — treating as refused (fail closed)."
+        return 1
+      fi
+      timeout 15 python3 "$script" --quiet
+      rc=$?
+      if [ "$rc" -ne 0 ]; then
+        log "$label ($base) guard $s refused (exit $rc) — not restarting."
+        return 1
+      fi
+      log "$label ($base) guard $s: OK."
+    done
+  done
+  return 0
+}
+
 # extract literal render_template("...") / render_template('...') first-arg
 # names referenced in a file — same single-hop precision as the import-level
 # .py match below (checks the daemon's own entrypoint, not its full transitive
@@ -350,11 +527,16 @@ for label in $AFFECTED; do
     log "AFFECTED $label is not currently running (scheduled/one-shot or down) — not a dormant-running-daemon; skipping refresh."
     continue
   fi
-  if is_sensitive "$label"; then
+  if is_sensitive "$label" || policy_says_sensitive "$label"; then
     sani="${label//[^A-Za-z0-9_]/_}"
     drain_var="DRAIN_CMD_${sani}"
     drain="${!drain_var:-}"
     if [ -n "$drain" ]; then
+      if ! guard_allows_restart "$label"; then
+        log "SENSITIVE $label: guard refused — NOT draining/restarting; flagged for guarded restart."
+        GUARDED="$GUARDED $label"
+        continue
+      fi
       log "SENSITIVE $label: draining via \$$drain_var then restarting (guarded path)."
       if [ "$DRY_RUN" != "1" ]; then
         eval "$drain" >&2 2>&1 || log "WARN: drain command for $label failed (rc=$?) — continuing to restart."
@@ -373,7 +555,13 @@ for label in $AFFECTED; do
     continue
   fi
 
-  # SAFE (read-only dashboard etc.): auto kickstart, then verify freshness.
+  # SAFE (read-only dashboard etc.): consult any configured guard (ga-ylr2m),
+  # then kickstart -k + verify freshness.
+  if ! guard_allows_restart "$label"; then
+    log "SAFE $label: guard refused — NOT auto-bounced; flagged for guarded restart."
+    GUARDED="$GUARDED $label"
+    continue
+  fi
   log "SAFE $label: kickstart -k + verify fresh."
   if [ "$DRY_RUN" != "1" ]; then
     $LAUNCHCTL_BIN kickstart -k "gui/$(id -u)/$label" 2>/dev/null \

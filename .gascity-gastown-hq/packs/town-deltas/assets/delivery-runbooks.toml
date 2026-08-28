@@ -18,6 +18,16 @@
 #                     instead FLAGGED for a guarded restart and HALTS delivery
 #                     (story:done withheld) so dormant hot-path code is never
 #                     silently marked done. Empty list = treat all as safe.
+#                     (ga-ylr2m) This is a hand-maintained COPY, and copies
+#                     drift — it used to omit daemons WA's own, stricter
+#                     $runtime_dir/daemons/restart_policy.yaml already locked
+#                     to notify-only. daemon-refresh.sh now reads that file
+#                     DIRECTLY when the rig ships one, treating any daemon
+#                     not explicitly in its 'auto'/'deploy_restart' as
+#                     sensitive too — this list and that file are a UNION
+#                     (either one calling a daemon sensitive makes it
+#                     sensitive), so this field stays useful for rigs (or
+#                     daemons) that have no restart_policy.yaml of their own.
 #   prod_test_script — absolute path to a shell script that exits 0 on pass,
 #                     non-zero on failure. If absent, delivery halts with
 #                     "no prod test — cannot mark done".

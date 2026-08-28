@@ -334,6 +334,123 @@ echo "$(field AFFECTED "$OUT")" | grep -q "com.test.map-viewer" && nok "T8 shoul
 # not_verified, not a confident not_applicable/verified.
 [ "$(field PROOF "$OUT")" = "not_verified" ] && ok "T8 PROOF=not_verified (py/template changed but tied to no live daemon — can't confidently call it N/A)" || nok "T8 proof" "got '$(field PROOF "$OUT")'"
 
+# ════════════════════════════════════════════════════════════════════════════
+# T9 (ga-ylr2m): a daemon whose .py is NOT in restart_policy.yaml's 'auto'/
+# 'deploy_restart' (simply unlisted here) is treated SENSITIVE by the POLICY
+# alone — even though its launchd label matches NO SENSITIVE_DAEMONS
+# substring. This is the exact registry-drift gap ga-ylr2m closes:
+# daemon-refresh.sh used to auto-kickstart anything not in the small
+# hand-copied SENSITIVE_DAEMONS list, bypassing WA's own stricter
+# "unlisted = manual" default (the real incident: frota_dashboard/
+# demand_dashboard/campaign_dashboard auto-kickstarted despite being
+# notify_only_locked/vetoed in restart_policy.yaml).
+# ════════════════════════════════════════════════════════════════════════════
+new_case t9
+cat > "$RUNTIME/daemons/frota_dashboard.py" <<<'print("frota")'
+make_plist "$AGENTS" com.test.frota-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/frota_dashboard.py"
+seed_running com.test.frota-dashboard 8001 "$STALE_LSTART"
+cat > "$RUNTIME/daemons/restart_policy.yaml" <<'EOF'
+auto:
+  - chip_kpi_dashboard.py
+deploy_restart:
+  - central_sender.py
+notify_only_locked:
+  - frota_dashboard.py
+EOF
+OUT=$(run_helper daemons/frota_dashboard.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T9 verdict NEEDS_GUARDED_RESTART (policy-sensitive, no SENSITIVE_DAEMONS match)" || nok "T9 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -ne 0 ] && ok "T9 non-zero exit (halts delivery)" || nok "T9 exit" "rc=$RC"
+echo "$(field GUARDED "$OUT")" | grep -q "com.test.frota-dashboard" && ok "T9 flagged GUARDED by restart_policy.yaml alone" || nok "T9 guarded" "$(field GUARDED "$OUT")"
+! grep -q "com.test.frota-dashboard" "$MOCK/kicks.log" 2>/dev/null && ok "T9 NOT auto-bounced" || nok "T9 no-bounce" "kickstart was called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T10 (ga-ylr2m): a daemon EXPLICITLY listed in restart_policy.yaml's 'auto'
+# still auto-restarts normally — the policy consultation only ADDS scrutiny
+# for unlisted daemons, never blocks one the policy explicitly clears (no
+# regression for the already-reviewed-safe majority).
+# ════════════════════════════════════════════════════════════════════════════
+new_case t10
+cat > "$RUNTIME/daemons/chip_kpi_dashboard.py" <<<'print("kpi")'
+make_plist "$AGENTS" com.test.chip-kpi "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/chip_kpi_dashboard.py"
+seed_running com.test.chip-kpi 8101 "$STALE_LSTART"
+seed_restart com.test.chip-kpi 8199 "$FRESH_LSTART"
+cat > "$RUNTIME/daemons/restart_policy.yaml" <<'EOF'
+auto:
+  - chip_kpi_dashboard.py
+notify_only_locked:
+  - frota_dashboard.py
+EOF
+OUT=$(run_helper daemons/chip_kpi_dashboard.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T10 verdict OK (policy-cleared daemon still auto-restarts)" || nok "T10 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -eq 0 ] && ok "T10 exit 0" || nok "T10 exit" "rc=$RC"
+grep -q "com.test.chip-kpi" "$MOCK/kicks.log" 2>/dev/null && ok "T10 kickstart invoked" || nok "T10 kickstart" "log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+[ "$(field PROOF "$OUT")" = "verified" ] && ok "T10 PROOF=verified" || nok "T10 proof" "got '$(field PROOF "$OUT")'"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T11 (ga-ylr2m): a daemon in 'auto' (policy-cleared, and NOT matching
+# SENSITIVE_DAEMONS either) but with a restart_guard_scripts: entry whose
+# guard script exits 1 (something in flight) — the guard BLOCKS the
+# auto-kickstart. Closes the classification_dashboard send-in-flight gap:
+# daemon-refresh.sh was a previously-unguarded 4th restart trigger alongside
+# WA's own three.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t11
+cat > "$RUNTIME/daemons/classification_dashboard.py" <<<'print("cls")'
+make_plist "$AGENTS" com.test.classification-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/classification_dashboard.py"
+seed_running com.test.classification-dashboard 8201 "$STALE_LSTART"
+mkdir -p "$RUNTIME/scripts"
+cat > "$RUNTIME/scripts/cls_guard.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+print("1 send in flight", file=sys.stderr)
+sys.exit(1)
+EOF
+chmod +x "$RUNTIME/scripts/cls_guard.py"
+cat > "$RUNTIME/daemons/restart_policy.yaml" <<'EOF'
+auto:
+  - classification_dashboard.py
+restart_guard_scripts:
+  classification_dashboard.py: scripts/cls_guard.py
+EOF
+OUT=$(run_helper daemons/classification_dashboard.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T11 verdict NEEDS_GUARDED_RESTART (guard refused)" || nok "T11 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -ne 0 ] && ok "T11 non-zero exit (halts delivery)" || nok "T11 exit" "rc=$RC"
+echo "$(field GUARDED "$OUT")" | grep -q "com.test.classification-dashboard" && ok "T11 flagged GUARDED by guard script refusal" || nok "T11 guarded" "$(field GUARDED "$OUT")"
+! grep -q "com.test.classification-dashboard" "$MOCK/kicks.log" 2>/dev/null && ok "T11 NOT auto-bounced (guard blocked kickstart)" || nok "T11 no-bounce" "kickstart was called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T12 (ga-ylr2m): same daemon+guard as T11, but the guard script exits 0
+# (nothing in flight) — kickstart proceeds normally.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t12
+cat > "$RUNTIME/daemons/classification_dashboard.py" <<<'print("cls")'
+make_plist "$AGENTS" com.test.classification-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/classification_dashboard.py"
+seed_running com.test.classification-dashboard 8301 "$STALE_LSTART"
+seed_restart com.test.classification-dashboard 8399 "$FRESH_LSTART"
+mkdir -p "$RUNTIME/scripts"
+cat > "$RUNTIME/scripts/cls_guard.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+print("nothing in flight", file=sys.stderr)
+sys.exit(0)
+EOF
+chmod +x "$RUNTIME/scripts/cls_guard.py"
+cat > "$RUNTIME/daemons/restart_policy.yaml" <<'EOF'
+auto:
+  - classification_dashboard.py
+restart_guard_scripts:
+  classification_dashboard.py: scripts/cls_guard.py
+EOF
+OUT=$(run_helper daemons/classification_dashboard.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T12 verdict OK (guard allowed)" || nok "T12 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -eq 0 ] && ok "T12 exit 0" || nok "T12 exit" "rc=$RC"
+grep -q "com.test.classification-dashboard" "$MOCK/kicks.log" 2>/dev/null && ok "T12 kickstart invoked (guard allowed)" || nok "T12 kickstart" "log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+[ "$(field PROOF "$OUT")" = "verified" ] && ok "T12 PROOF=verified" || nok "T12 proof" "got '$(field PROOF "$OUT")'"
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"
