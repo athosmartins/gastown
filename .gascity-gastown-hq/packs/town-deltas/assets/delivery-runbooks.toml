@@ -52,7 +52,29 @@ daemon_restarts = []   # WA worker managed by gc session; no STATIC launchd rest
 # webhook routing, slot scheduling, conversation monitoring) are NEVER
 # auto-bounced — they are flagged for a guarded restart (drain first) and halt
 # delivery if their code changed, so dormant hot-path code can't be marked done.
-sensitive_daemons = ["central-sender", "webhook-receiver", "slot-scheduler", "conversation-monitor"]
+#
+# ga-3xq0u: this list defaults OPEN (unlisted = safe to auto-bounce) while WA's
+# OWN registry — daemons/restart_policy.yaml — defaults CLOSED ("Default
+# (não-listado) = manual (notify-only)", its line 2) and only promotes a daemon
+# to auto-restart after a named, adversarially-reviewed justification. The two
+# registries are unintegrated (daemon-refresh.sh reads neither restart_policy.yaml
+# nor restart_guard_scripts:), so any WA daemon NOT yet added here defaults to
+# "safe" from gascity's side even when WA's own review says otherwise. Confirmed
+# LIVE in story-delivery.log: daemon-refresh.sh has auto-kickstarted 4 of the 6
+# names added below multiple times (frota-dashboard + demand-dashboard together
+# on 2026-07-30 14:19:26Z; campaign-dashboard on 06-29/07-16/07-30/08-13) despite
+# restart_policy.yaml explicitly classifying all of them notify_only_locked or
+# vetoing them from auto — i.e. this gap has already bypassed a deliberate human
+# safety lock in production, not just a theoretical risk. Added here from
+# restart_policy.yaml's current notify_only_locked list + CRITICAL_LAUNCHD_JOBS
+# vetoes + the new send-in-flight guard (classification_dashboard_restart_safe.py,
+# wa-mlsc0) that only WA's OWN restart path consults — gascity's binary
+# safe/sensitive model can't express "safe only when idle", so the conservative
+# choice is sensitive until daemon-refresh.sh can consult restart_guard_scripts
+# too (tracked follow-up, see ga-3xq0u decision comment for the structural fix:
+# derive this list FROM restart_policy.yaml instead of hand-copying it, so the
+# two registries can't drift again).
+sensitive_daemons = ["central-sender", "webhook-receiver", "slot-scheduler", "conversation-monitor", "campaign-dashboard", "clientes-dashboard", "map-viewer", "frota-dashboard", "demand-dashboard", "daemon-health-monitor", "classification-dashboard"]
 # ga-857v FIX 2: rig-level smoke harness — asserts painel :8202 (200 + title +
 # SSTI closed) and the admin :8097 registration. WA deliveries now reach
 # story:done with delivery:tested instead of the ga-dqp interim delivery:untested.
