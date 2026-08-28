@@ -34,6 +34,37 @@
 # beads invisible without the flag. That gap made the backstop's own
 # "catches ANY open digest regardless of issue_type" header comment false
 # for exactly the type this fix produces.
+#
+# Follow-up (ga-cke56, 2026-08-28): even with the ga-4tt37 fix landed (type
+# correctly ends up "message", closed same-step), the digest bead was still
+# LOST within about a day. `gc bd create --type=message ...` (no
+# --storage-class flag anywhere in this recipe) creates an EPHEMERAL wisp
+# (`ga-wisp-*` id, `ephemeral:true` in its JSON) — confirmed this is bd's
+# own per-type default on this install, not a city config override
+# (`bd config get storage-class.message` -> "not set in config.yaml").
+# mol-dog-reaper purges closed wisps past purge_age, so "archived as a
+# digest bead" (this file's own top-of-file description, unchanged since
+# before ga-8f40w) was never true for a message-typed digest. Confirmed two
+# ways: the digest cited in the bug report (`ga-wisp-0fphfl`, closed
+# 2026-08-27T17:43:25Z) is gone from the live DB as of this fix ("no issue
+# found"); the one instance still alive when this fix landed
+# (`ga-wisp-r4d1hb`, "Digest: 2026-08-27") was promoted by hand alongside
+# this recipe change, so it isn't lost too.
+# Tried and REJECTED first: passing --storage-class versioned on the
+# original `gc bd create` call, hoping to skip the ephemeral path entirely.
+# Empirically falsified in an isolated throwaway `bd init` sandbox (never
+# trust the flag's own --help text alone) — the created bead still came
+# back `ephemeral:true`; the per-type ephemeral default appears to win
+# regardless of an explicit --storage-class override at create time on this
+# bd version. What DOES work, confirmed in the same sandbox (create
+# ephemeral wisp -> close -> `bd promote` -> re-check): `bd promote`
+# reliably clears `ephemeral` while preserving status, labels, and the
+# original id (a promoted digest keeps its `wisp-`-shaped id forever —
+# cosmetic only, not a sign promotion failed). Fix: promote the digest
+# right after the existing type/status verify-and-self-correct block below,
+# with its own verify-and-self-correct in the same style — same "don't
+# claim success you didn't check" discipline as the mail-send and
+# type/status sub-actions.
 description = """
 Generate activity digest for the mayor.
 
@@ -553,14 +584,53 @@ close_reason honestly instead. A close_reason that asserts a success it
 never checked is worse than no close_reason (ga-8h185: the sibling
 false-verification bug, same step, the mail-send sub-action above).
 
+**3b. Promote the digest to a permanent bead — the reaper purges ephemeral
+wisps, and a `message`-typed bead is ephemeral by default on this install
+(ga-cke56):**
+
+`$DIGEST_ID` above is still an ephemeral wisp at this point even though its
+type/status are now correct — `issue_type=message` defaults to ephemeral
+storage here (confirmed: no `storage-class.message` override in city
+config, so this is bd's own built-in per-type default, and passing
+`--storage-class versioned` on the original create call does NOT bypass
+it — confirmed empirically, don't re-try that path). Left alone,
+`mol-dog-reaper` purges it once it's been closed past `purge_age` — i.e.
+"archived as a digest bead" would keep being untrue even with the
+type/status fix above. Promote on the already-verified `$DIGEST_ID`:
+
+```bash
+gc bd promote "$DIGEST_ID" --reason "digest archive must survive wisp purge (ga-cke56)"
+```
+
+**Verify before claiming success (same discipline as 3 above) — a promoted
+bead keeps its original `wisp-`-shaped id forever, so check the `ephemeral`
+field, never the id shape. Three real outcomes here, not two: `bd show`
+prints the literal text `null` for a confirmed-durable bead (not a missing
+key — verified live), `true` for confirmed-still-ephemeral, and an EMPTY
+string only when the show/jq call itself failed (bad id, Dolt hiccup) — an
+empty result is "couldn't check," never treat it the same as `null`
+("checked, and it's durable"):**
+```bash
+V_EPHEMERAL=$(gc bd show "$DIGEST_ID" --json 2>/dev/null | jq -r '.[0].ephemeral' 2>/dev/null)
+if [ "$V_EPHEMERAL" = "true" ]; then
+  gc bd promote "$DIGEST_ID" --reason "digest archive must survive wisp purge (ga-cke56), retry" 2>/dev/null || true
+  V_EPHEMERAL=$(gc bd show "$DIGEST_ID" --json 2>/dev/null | jq -r '.[0].ephemeral' 2>/dev/null)
+fi
+```
+If `$V_EPHEMERAL` is not exactly `null` after that retry (still `true`, or
+empty because the check itself failed), do NOT claim the digest was
+durably archived in step 4's close_reason — comment the actual state on
+the work bead instead, same rule as the mail-send and type/status checks
+above: an unchecked success claim is worse than an honest gap.
+
 **4. Close work bead, signal reconciler, and exit:**
 ```bash
 gc bd close <work-bead> --reason "Digest generated and sent"
 gc runtime drain-ack
 exit
 ```
-Only use that exact close_reason if both verifications in steps 2 and 3
-actually passed. If either didn't, replace it with an honest account of
+Only use that exact close_reason if the verifications in steps 2, 3, and 3b
+all actually passed. If any didn't, replace it with an honest account of
 what's still wrong — the work bead closing is about this step's own
 lifecycle, not a certificate that the digest was delivered.
 
