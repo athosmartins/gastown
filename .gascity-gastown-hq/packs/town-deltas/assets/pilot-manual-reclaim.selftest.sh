@@ -4,8 +4,10 @@
 # Drives the REAL script (packs/town-deltas/assets/pilot-manual-reclaim.sh)
 # with a PATH-stubbed bd that logs every mutation, proving:
 #   1. STALE (bd reclaim flips status to open, markers actually clear):
-#      pilot:dispatched, pilot:dispatching, and pilot.dispatched_at are all
-#      removed, and the script reports success.
+#      pilot:dispatched, pilot:dispatching, pilot.dispatched_at, AND
+#      story:in-flight (ga-xoa3n — the label that actually occupies a
+#      dispatch lane slot; see pilot-dispatcher.sh's in-flight query) are
+#      all removed, and the script reports success.
 #   2. NOT-STALE (bd reclaim no-ops, bead still in_progress): NO mutation —
 #      a still-legitimately in-flight bead is never exposed to re-dispatch.
 #   3. MISSING (bad bead id): NO mutation, graceful exit.
@@ -65,29 +67,32 @@ case "$sub" in
     case "${PMR_SCENARIO:-}" in
       stale)
         if [ "$_N" -eq 1 ]; then
-          echo '[{"id":"'"$1"'","status":"open","labels":["pilot:dispatched","pilot:dispatching"],"metadata":{"pilot.dispatched_at":"123"}}]'
+          echo '[{"id":"'"$1"'","status":"open","labels":["pilot:dispatched","pilot:dispatching","story:in-flight"],"metadata":{"pilot.dispatched_at":"123"}}]'
         else
           echo '[{"id":"'"$1"'","status":"open","labels":[],"metadata":{}}]'
         fi ;;
       stuck)
         # status flips open, but the markers never actually clear (simulates
-        # a transient failure in the label-remove/metadata-unset commands)
-        echo '[{"id":"'"$1"'","status":"open","labels":["pilot:dispatched"],"metadata":{}}]' ;;
-      not-stale) echo '[{"id":"'"$1"'","status":"in_progress","labels":["pilot:dispatched"],"metadata":{}}]' ;;
+        # a transient failure in the label-remove/metadata-unset commands).
+        # Includes story:in-flight (ga-xoa3n) so the fail-safe verification
+        # path is proven to catch THIS marker surviving too, not just the
+        # original 2.
+        echo '[{"id":"'"$1"'","status":"open","labels":["pilot:dispatched","story:in-flight"],"metadata":{}}]' ;;
+      not-stale) echo '[{"id":"'"$1"'","status":"in_progress","labels":["pilot:dispatched","story:in-flight"],"metadata":{}}]' ;;
       missing)   echo '[]' ;;
       verify-empty)
         # status flips open on the 1st read; the 2nd read (post-removal
         # verification) returns NOTHING — simulates a transient Dolt read
         # hiccup on exactly the call the gt-1kkgu gate-fail was about.
         if [ "$_N" -eq 1 ]; then
-          echo '[{"id":"'"$1"'","status":"open","labels":["pilot:dispatched","pilot:dispatching"],"metadata":{"pilot.dispatched_at":"123"}}]'
+          echo '[{"id":"'"$1"'","status":"open","labels":["pilot:dispatched","pilot:dispatching","story:in-flight"],"metadata":{"pilot.dispatched_at":"123"}}]'
         fi ;;
       verify-garbage)
         # status flips open on the 1st read; the 2nd read returns a
         # not-found-shaped error object instead of a 1-element array (the
         # real bd show response shape observed live for an unreadable id).
         if [ "$_N" -eq 1 ]; then
-          echo '[{"id":"'"$1"'","status":"open","labels":["pilot:dispatched","pilot:dispatching"],"metadata":{"pilot.dispatched_at":"123"}}]'
+          echo '[{"id":"'"$1"'","status":"open","labels":["pilot:dispatched","pilot:dispatching","story:in-flight"],"metadata":{"pilot.dispatched_at":"123"}}]'
         else
           echo '{"error":"no issue found","schema_version":1}'
         fi ;;
@@ -118,10 +123,12 @@ labels_cleared=0
 grep -q 'MUT label remove gt-testbead pilot:dispatched'  "$MUT" && \
 grep -q 'MUT label remove gt-testbead pilot:dispatching' "$MUT" && \
 grep -q 'MUT update gt-testbead --unset-metadata pilot.dispatched_at' "$MUT" && \
+grep -q 'MUT label remove gt-testbead story:in-flight'   "$MUT" && \
 labels_cleared=1
 ck "STALE: exit code 0" 0 "$rc"
-ck "STALE: all 3 Pilot claim markers cleared" 1 "$labels_cleared"
+ck "STALE: all 4 markers cleared (incl. story:in-flight, ga-xoa3n)" 1 "$labels_cleared"
 ck "STALE: reports success" 1 "$(grep -qc 'markers cleared' "$WORK/out.log" >/dev/null 2>&1 && echo 1 || echo 0)"
+ck "STALE: reports story:in-flight removed (lane slot freed)" 1 "$(grep -qc 'story:in-flight removed' "$WORK/out.log" >/dev/null 2>&1 && echo 1 || echo 0)"
 
 # NOT-STALE: reclaim no-ops (still in_progress) -> NO label/metadata mutation
 : >"$MUT"
@@ -130,7 +137,7 @@ no_label_mutation=1
 grep -q '^MUT label ' "$MUT" && no_label_mutation=0
 grep -q '^MUT update ' "$MUT" && no_label_mutation=0
 ck "NOT-STALE: exit code 0 (graceful no-op)" 0 "$rc"
-ck "NOT-STALE: no Pilot claim marker touched (still in-flight, real work)" 1 "$no_label_mutation"
+ck "NOT-STALE: no marker touched incl. story:in-flight (still in-flight, real work)" 1 "$no_label_mutation"
 
 # MISSING: bd show returns nothing (bad id) -> NO mutation, no crash
 : >"$MUT"
@@ -148,6 +155,7 @@ rc=$(run_script stuck)
 ck "STUCK: exit code 1 (does not silently succeed)" 1 "$rc"
 ck "STUCK: does NOT claim markers cleared" 0 "$(grep -qc 'markers cleared' "$WORK/out.log" >/dev/null 2>&1 && echo 1 || echo 0)"
 ck "STUCK: reports which marker is still present" 1 "$(grep -qc 'pilot:dispatched' "$WORK/err.log" >/dev/null 2>&1 && echo 1 || echo 0)"
+ck "STUCK: reports story:in-flight still present too (ga-xoa3n)" 1 "$(grep -qc 'story:in-flight' "$WORK/err.log" >/dev/null 2>&1 && echo 1 || echo 0)"
 
 # VERIFY-EMPTY: status flips open and the label/metadata removal calls DO
 # fire, but the post-removal verification read (2nd bd show) returns

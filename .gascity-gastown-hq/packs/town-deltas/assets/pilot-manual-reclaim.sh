@@ -23,11 +23,12 @@
 #   rig-path: optional -C target for a rig-native bead (default: HQ / bd
 #             auto-discovery from CWD).
 #
-# Safety: only strips the Pilot claim markers when the reclaim actually
-# flipped the bead to status=open. If the lease had not expired yet (bd
-# reclaim no-ops, or the bead was never in_progress to begin with), nothing
-# is touched — a still-legitimately in-flight bead is never exposed to
-# re-dispatch just because this script ran.
+# Safety: only strips the Pilot claim markers (and the story:in-flight
+# lane-occupancy label, ga-xoa3n) when the reclaim actually flipped the bead
+# to status=open. If the lease had not expired yet (bd reclaim no-ops, or the
+# bead was never in_progress to begin with), nothing is touched — a
+# still-legitimately in-flight bead is never exposed to re-dispatch just
+# because this script ran.
 set -uo pipefail
 
 BEAD_ID="${1:?usage: pilot-manual-reclaim.sh <bead-id> [rig-path]}"
@@ -50,6 +51,13 @@ fi
 "${BD[@]}" label remove "$BEAD_ID" "pilot:dispatched"  -q 2>/dev/null || true
 "${BD[@]}" label remove "$BEAD_ID" "pilot:dispatching" -q 2>/dev/null || true
 "${BD[@]}" update "$BEAD_ID" --unset-metadata "pilot.dispatched_at" -q 2>/dev/null || true
+# ga-xoa3n: story:in-flight is what makes a bead count against the dispatch
+# lane's cap (pilot-dispatcher.sh's in-flight query keys on this label, not
+# on the Pilot markers above) — a reclaim that clears assignee/status but
+# leaves this label behind keeps permanently occupying a lane slot even
+# though nobody is building the bead anymore. Strip it in the same
+# status==open-gated path as the Pilot markers.
+"${BD[@]}" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
 
 # Verify the actual post-state rather than trusting the removal commands'
 # exit codes (suppressed above with `|| true` since "label was never set" is
@@ -68,7 +76,7 @@ REMAINING=$(printf '%s' "$VERIFY_JSON" | jq -r '
   .[0] as $b
   | if $b == null then error("verification read did not return the issue")
     else
-      ([($b.labels // [])[] | select(. == "pilot:dispatched" or . == "pilot:dispatching")]
+      ([($b.labels // [])[] | select(. == "pilot:dispatched" or . == "pilot:dispatching" or . == "story:in-flight")]
        + (if (($b.metadata["pilot.dispatched_at"] // "") != "") then ["pilot.dispatched_at"] else [] end))
       | join(",")
     end
@@ -85,4 +93,4 @@ if [ -n "$REMAINING" ]; then
   exit 1
 fi
 
-echo "pilot-manual-reclaim: $BEAD_ID reclaimed (status=open) and Pilot claim markers cleared — visible to Pilot re-dispatch again."
+echo "pilot-manual-reclaim: $BEAD_ID reclaimed (status=open), Pilot claim markers cleared, and story:in-flight removed — bead no longer occupies a dispatch lane slot and is visible to Pilot re-dispatch again."
