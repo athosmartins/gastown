@@ -115,14 +115,30 @@ log() { echo "[daemon-refresh] $*" >&2; }
 # ── restart_policy.yaml consultation (ga-ylr2m) ───────────────────────────────
 # See header point 6. Parsed once, up front, into space-separated .py-basename
 # lists (POLICY_AUTO / POLICY_DEPLOY_RESTART / POLICY_NOTIFY_ONLY_LOCKED) plus
-# a "daemon.py=script/relpath" pair list (POLICY_GUARDS). Missing/unreadable/
-# unparseable file → every POLICY_* var stays empty, which makes
-# policy_says_sensitive()/guard_allows_restart() below unconditional no-ops —
-# IDENTICAL to this script's pre-ga-ylr2m behavior. Never fatal: a broken
-# policy file must not block delivery for OTHER rigs, and must never degrade
-# scrutiny below "ask SENSITIVE_DAEMONS only" (i.e. it can only ADD caution).
+# a "daemon.py=script/relpath" pair list (POLICY_GUARDS). Three distinct states,
+# kept distinct on purpose (self-audit finding — "not found" and "found but
+# unreadable" must NOT collapse to the same value just because both end up with
+# empty POLICY_* lists):
+#   no file at all       → RESTART_POLICY_YAML doesn't exist. This rig genuinely
+#                           has no stricter registry; defer entirely to
+#                           SENSITIVE_DAEMONS, IDENTICAL to pre-ga-ylr2m behavior.
+#   file exists, parses  → POLICY_PARSE_OK=1. Empty lists here are a REAL "this
+#                           policy clears nothing", handled correctly by
+#                           policy_says_sensitive()'s normal per-entrypoint logic.
+#   file exists, does
+#   NOT parse (rare —
+#   e.g. a future edit
+#   breaks this subset
+#   parser's assumptions) → POLICY_PARSE_OK stays unset even though the file is
+#                           present. We cannot prove this rig has nothing extra
+#                           to be careful about — the third state — so
+#                           policy_says_sensitive()/guard_allows_restart() below
+#                           treat this as "everything on this rig is sensitive
+#                           and every restart is refused" until the file parses
+#                           again. This can only ADD caution vs. the no-file
+#                           case, never silently fall back to it.
 RESTART_POLICY_YAML="$RUNTIME_DIR/daemons/restart_policy.yaml"
-POLICY_AUTO=""; POLICY_DEPLOY_RESTART=""; POLICY_NOTIFY_ONLY_LOCKED=""; POLICY_GUARDS=""
+POLICY_AUTO=""; POLICY_DEPLOY_RESTART=""; POLICY_NOTIFY_ONLY_LOCKED=""; POLICY_GUARDS=""; POLICY_PARSE_OK=""
 if [ -f "$RESTART_POLICY_YAML" ]; then
   eval "$(python3 - "$RESTART_POLICY_YAML" <<'PY' 2>/dev/null
 import re, shlex, sys
@@ -179,21 +195,30 @@ def load_policy(path):
 try:
     policy = load_policy(sys.argv[1])
 except Exception:
-    policy = {}
+    policy = None   # distinct from "parsed to an empty dict" — see bash comment above
 
 def strlist(key):
     return " ".join(str(x) for x in (policy.get(key) or []) if isinstance(x, str))
 
-print("POLICY_AUTO=" + shlex.quote(strlist("auto")))
-print("POLICY_DEPLOY_RESTART=" + shlex.quote(strlist("deploy_restart")))
-print("POLICY_NOTIFY_ONLY_LOCKED=" + shlex.quote(strlist("notify_only_locked")))
-guards = policy.get("restart_guard_scripts") or {}
-if isinstance(guards, dict):
-    pairs = " ".join(f"{d}={s}" for d, s in guards.items()
-                      if isinstance(d, str) and isinstance(s, str))
-    print("POLICY_GUARDS=" + shlex.quote(pairs))
+# Only emit POLICY_* (including the OK marker) on a SUCCESSFUL parse. On
+# failure this prints nothing at all, so the eval below is a no-op and every
+# POLICY_* var (POLICY_PARSE_OK included) keeps its pre-set empty default —
+# the signal bash checks for the unparseable third state.
+if policy is not None:
+    print("POLICY_AUTO=" + shlex.quote(strlist("auto")))
+    print("POLICY_DEPLOY_RESTART=" + shlex.quote(strlist("deploy_restart")))
+    print("POLICY_NOTIFY_ONLY_LOCKED=" + shlex.quote(strlist("notify_only_locked")))
+    guards = policy.get("restart_guard_scripts") or {}
+    if isinstance(guards, dict):
+        pairs = " ".join(f"{d}={s}" for d, s in guards.items()
+                          if isinstance(d, str) and isinstance(s, str))
+        print("POLICY_GUARDS=" + shlex.quote(pairs))
+    print("POLICY_PARSE_OK=1")
 PY
 )" 2>/dev/null || true
+  if [ -z "$POLICY_PARSE_OK" ]; then
+    log "WARN: $RESTART_POLICY_YAML exists but could not be parsed — cannot verify its content, so every daemon on this rig is treated as policy-sensitive and every guarded restart is refused until it parses again (fail closed, not silently ignored)."
+  fi
 fi
 
 # ── emit result + exit ────────────────────────────────────────────────────────
@@ -353,11 +378,18 @@ is_sensitive() {
 # file, or a daemon whose entrypoint didn't resolve to a relpath (see
 # resolve_relpath), means no opinion — returns 1 (not sensitive BY THIS
 # SOURCE; SENSITIVE_DAEMONS is still checked independently by the caller via
-# `||` — this only ever ADDS scrutiny, never removes it). Reads $DISCO_DIR/
-# $label, populated for every label by Step 2 above.
+# `||` — this only ever ADDS scrutiny, never removes it). A policy file that
+# EXISTS but failed to parse (POLICY_PARSE_OK unset — see the loader comment
+# above) is the third state: unconditionally sensitive, since "couldn't read
+# it" must never collapse into the same value as "read it, nothing applies".
+# Reads $DISCO_DIR/$label, populated for every label by Step 2 above.
 policy_says_sensitive() {
   local label="$1" entries entry base locked_hit
   [ -f "$RESTART_POLICY_YAML" ] || return 1
+  if [ -z "$POLICY_PARSE_OK" ]; then
+    log "$label: restart_policy.yaml exists but did not parse — treating as sensitive (fail closed, unverifiable != cleared)."
+    return 0
+  fi
   entries="$(cat "$DISCO_DIR/$label" 2>/dev/null || true)"
   [ -n "${entries// /}" ] || return 1
   for entry in $entries; do
@@ -388,9 +420,17 @@ policy_says_sensitive() {
 # the guard only ever SUBTRACTS a restart that would otherwise have happened,
 # never adds one. Closes the "consult restart_guard_scripts before an
 # auto-kickstart" half of ga-ylr2m: this script was a 4th, previously-
-# unguarded restart trigger alongside WA's own three.
+# unguarded restart trigger alongside WA's own three. A policy file that
+# EXISTS but failed to parse (POLICY_PARSE_OK unset) refuses unconditionally
+# — we cannot rule out a real guard entry we simply failed to read, and
+# "couldn't verify" must fail the same way an active guard refusal does, not
+# the same way "verified, no guard configured" does.
 guard_allows_restart() {
   local label="$1" entries entry base pair d s script rc
+  if [ -f "$RESTART_POLICY_YAML" ] && [ -z "$POLICY_PARSE_OK" ]; then
+    log "$label: restart_policy.yaml exists but did not parse — cannot verify whether a guard applies; refusing restart (fail closed)."
+    return 1
+  fi
   [ -n "$POLICY_GUARDS" ] || return 0
   entries="$(cat "$DISCO_DIR/$label" 2>/dev/null || true)"
   for entry in $entries; do

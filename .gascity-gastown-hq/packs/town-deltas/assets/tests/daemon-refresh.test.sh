@@ -451,6 +451,63 @@ V=$(field VERDICT "$OUT")
 grep -q "com.test.classification-dashboard" "$MOCK/kicks.log" 2>/dev/null && ok "T12 kickstart invoked (guard allowed)" || nok "T12 kickstart" "log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 [ "$(field PROOF "$OUT")" = "verified" ] && ok "T12 PROOF=verified" || nok "T12 proof" "got '$(field PROOF "$OUT")'"
 
+# ════════════════════════════════════════════════════════════════════════════
+# T13 (ga-ylr2m, self-audit finding): restart_policy.yaml EXISTS but fails to
+# parse (invalid UTF-8 — a stand-in for "this rig's file broke the subset
+# parser's assumptions"). This is a DIFFERENT state from "no policy file" and
+# must NOT collapse to the same value: since we cannot verify what the file
+# says, the daemon must be treated as sensitive (not silently safe) — the
+# exact third-state defect class the mandatory pre-gate self-audit exists to
+# catch. Locks in policy_says_sensitive()'s documented parse-failure contract
+# directly. NOTE, verified by hand: for THIS specific daemon shape (no
+# SENSITIVE_DAEMONS match, no DRAIN_CMD), the pre-fix code reaches the same
+# NEEDS_GUARDED_RESTART verdict BY COINCIDENCE — an unparsed file silently
+# left POLICY_AUTO/POLICY_DEPLOY_RESTART empty, and an empty allowlist never
+# contains any daemon either way, sensitive-by-omission regardless of WHY it's
+# empty. This test does not by itself prove the fix (it passes before and
+# after); it pins the intended behavior against a future regression. T14
+# below isolates the one path (guard_allows_restart, reached via
+# SENSITIVE_DAEMONS + DRAIN_CMD, bypassing policy_says_sensitive entirely)
+# where the pre-fix silent-empty behavior was a real, provable gap.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t13
+cat > "$RUNTIME/daemons/unremarkable_dashboard.py" <<<'print("plain")'
+make_plist "$AGENTS" com.test.unremarkable "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/unremarkable_dashboard.py"
+seed_running com.test.unremarkable 8401 "$STALE_LSTART"
+printf '\xff\xfeauto:\n  - unremarkable_dashboard.py\n' > "$RUNTIME/daemons/restart_policy.yaml"
+OUT=$(run_helper daemons/unremarkable_dashboard.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T13 verdict NEEDS_GUARDED_RESTART (unparseable policy fails closed)" || nok "T13 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -ne 0 ] && ok "T13 non-zero exit (halts delivery)" || nok "T13 exit" "rc=$RC"
+echo "$(field GUARDED "$OUT")" | grep -q "com.test.unremarkable" && ok "T13 flagged GUARDED despite being in the (unreadable) 'auto' list" || nok "T13 guarded" "$(field GUARDED "$OUT")"
+! grep -q "com.test.unremarkable" "$MOCK/kicks.log" 2>/dev/null && ok "T13 NOT auto-bounced" || nok "T13 no-bounce" "kickstart was called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T14 (ga-ylr2m, self-audit finding — the one path T13 alone does not reach):
+# a SENSITIVE_DAEMONS-matched daemon WITH a configured DRAIN_CMD, on a rig
+# whose restart_policy.yaml exists but fails to parse. is_sensitive() already
+# routes this into the SENSITIVE+DRAIN branch regardless of what the policy
+# file says, so policy_says_sensitive()'s own fail-closed behavior is never
+# even consulted here — this isolates guard_allows_restart()'s OWN fail-closed
+# check. Pre-fix, an unparseable file silently produced an empty POLICY_GUARDS
+# — indistinguishable from "no guard configured" — so the drain+kickstart
+# would proceed even though the (unreadable) file might have named a guard
+# that would have refused it.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t14
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+seed_running com.test.central-sender 8501 "$STALE_LSTART"
+printf '\xff\xfeauto:\n  - central_sender.py\n' > "$RUNTIME/daemons/restart_policy.yaml"
+export DRAIN_CMD_com_test_central_sender="true"
+OUT=$(run_helper daemons/central_sender.py); RC=$?
+unset DRAIN_CMD_com_test_central_sender
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T14 verdict NEEDS_GUARDED_RESTART (unparseable policy blocks even the DRAIN_CMD path)" || nok "T14 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -ne 0 ] && ok "T14 non-zero exit (halts delivery)" || nok "T14 exit" "rc=$RC"
+echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" && ok "T14 flagged GUARDED" || nok "T14 guarded" "$(field GUARDED "$OUT")"
+! grep -q "com.test.central-sender" "$MOCK/kicks.log" 2>/dev/null && ok "T14 NOT drained/bounced" || nok "T14 no-bounce" "kickstart was called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"
