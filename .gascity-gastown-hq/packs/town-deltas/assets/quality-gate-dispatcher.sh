@@ -5096,65 +5096,96 @@ PYEOF
           DR_SENSITIVE=$(_gl7n3v_runbook_field "$RIG" "sensitive_daemons" | tr '\n' ' ' || true)
           DR_PRE_SHA=$(git -C "$DR_RUNTIME_DIR" rev-parse HEAD 2>/dev/null || echo "")
           DR_EPOCH=$(date +%s)
+          DR_DEPLOY_FAILED=0
+          DR_DEPLOY_OUTPUT=""
+          DR_DEPLOY_RC=0
           if [ -n "$DR_DEPLOY_CMD" ]; then
             if [ "$DRY_RUN" = "1" ]; then
               log "ga-l7n3v: DRY_RUN=1 — WOULD deploy rig $RIG runtime ($DR_RUNTIME_DIR): $DR_DEPLOY_CMD"
             else
               log "ga-l7n3v: deploying rig $RIG runtime ($DR_RUNTIME_DIR) before daemon-liveness check: $DR_DEPLOY_CMD"
-              eval "$DR_DEPLOY_CMD" >&2 2>&1 \
-                || warn "ga-l7n3v: deploy_cmd for rig $RIG exited non-zero (continuing — daemon-refresh below verifies ACTUAL state, not the deploy's own exit code)"
+              # ga-l7n3v GATE-FIX (root-class:error-vs-empty, reviewer-caught):
+              # the first version of this patch discarded the deploy's own
+              # exit code into a bare `|| warn ...` and kept going — a FAILED
+              # `git pull` leaves DR_POST_SHA == DR_PRE_SHA below, which
+              # daemon-refresh.sh's own precondition then reports as
+              # SKIPPED/not_applicable ("no source change in deploy") —
+              # collapsing "deploy failed" and "deploy genuinely had nothing
+              # to do" into the IDENTICAL downstream signal, so a broken
+              # deploy closed the bead just as cleanly as a no-op one. Capture
+              # DR_DEPLOY_RC explicitly and check it BEFORE it can be
+              # laundered through that ambiguity — mirrors story-delivery.sh's
+              # own DEPLOY_RC idiom exactly (:1317), which halts on deploy
+              # failure rather than proceeding to story:done.
+              DR_DEPLOY_OUTPUT=$(eval "$DR_DEPLOY_CMD" 2>&1) && DR_DEPLOY_RC=$? || DR_DEPLOY_RC=$?
+              log "ga-l7n3v: deploy output: $DR_DEPLOY_OUTPUT"
+              if [ "$DR_DEPLOY_RC" -ne 0 ]; then
+                DR_DEPLOY_FAILED=1
+                warn "ga-l7n3v: deploy_cmd for rig $RIG FAILED (rc=$DR_DEPLOY_RC) — holding; not checking daemon freshness against a tree that never actually deployed."
+              fi
             fi
           fi
-          DR_POST_SHA=$(git -C "$DR_RUNTIME_DIR" rev-parse HEAD 2>/dev/null || echo "")
-          DR_OUT=$(RUNTIME_DIR="$DR_RUNTIME_DIR" PRE_DEPLOY_SHA="$DR_PRE_SHA" POST_DEPLOY_SHA="$DR_POST_SHA" \
-            DEPLOY_EPOCH="$DR_EPOCH" SENSITIVE_DAEMONS="$DR_SENSITIVE" DRY_RUN="$DRY_RUN" \
-            bash "$GC_CITY/packs/town-deltas/assets/daemon-refresh.sh" 2>&1 || true)
-          # ga-l7n3v: `|| true` on all three — under this script's set -euo
-          # pipefail, an unmatched grep piped into head/sed still propagates a
-          # non-zero pipeline status and would abort the ENTIRE dispatcher
-          # mid-sweep (same hazard story-delivery.sh:1490 already documents
-          # for its own PROOF line). daemon-refresh.sh's emit() is the only
-          # exit path in that script and always prints all three fields, so
-          # this should never actually fire — but the empty-VERDICT branch
-          # below exists SPECIFICALLY to handle it gracefully if it ever does,
-          # and that branch can only be reached if the pipeline is allowed to
-          # report empty instead of killing the script first.
-          DR_VERDICT=$(echo "$DR_OUT" | grep '^VERDICT=' | head -1 | sed 's/^VERDICT=//' || true)
-          DR_REASON=$(echo "$DR_OUT" | grep '^REASON=' | head -1 | sed 's/^REASON=//' || true)
-          DR_PROOF=$(echo "$DR_OUT" | grep '^PROOF=' | head -1 | sed 's/^PROOF=//' || true)
-          log "ga-l7n3v daemon-refresh: rig=$RIG runtime=$DR_RUNTIME_DIR verdict=$DR_VERDICT proof=$DR_PROOF reason=$DR_REASON"
-          case "$DR_VERDICT" in
-            OK|SKIPPED)
-              # root-class:error-vs-empty (ga-vmq1i's own distinction, reused
-              # here): VERDICT=OK does not by itself mean daemon liveness was
-              # POSITIVELY confirmed — PROOF disambiguates. Only surface the
-              # soft warning when proof is neither "verified" nor
-              # "not_applicable" (never silently claim confidence the helper
-              # itself didn't have); never block the close on this alone.
-              case "$DR_PROOF" in
-                verified|not_applicable) : ;;
-                *) DAEMON_SOFT_WARN="$DR_VERDICT ($DR_REASON, proof=$DR_PROOF)" ;;
-              esac
-              ;;
-            "")
-              # The helper produced NO parseable verdict at all (missing
-              # python3, unreadable runbook, or some other environment
-              # failure — every real code path in daemon-refresh.sh emits a
-              # VERDICT line via its own emit() function, so an empty result
-              # here means the HELPER itself is broken, not that a daemon is
-              # stale). Fail toward the PRE-ga-l7n3v behavior (close as
-              # before) rather than stranding every future bug/task bead
-              # citywide on one broken helper — but stay VISIBLE, not
-              # silent, by recording it in the close reason below.
-              warn "ga-l7n3v: daemon-refresh.sh produced no parseable VERDICT for rig $RIG (helper output: ${DR_OUT:0:300}) — proceeding to close (degraded, not blocked; see ga-l7n3v if this recurs)."
-              DAEMON_SOFT_WARN="daemon-refresh.sh produced no verdict (helper-level failure, not a confirmed-stale daemon)"
-              ;;
-            *)
-              DAEMON_HOLD_VERDICT="$DR_VERDICT"
-              DAEMON_HOLD_REASON="$DR_REASON"
-              DAEMON_HOLD_DETAIL="$DR_OUT"
-              ;;
-          esac
+          if [ "$DR_DEPLOY_FAILED" = "1" ]; then
+            # Deploy itself failed: skip daemon-refresh.sh entirely (checking
+            # freshness against an undeployed tree would only produce a
+            # misleading SKIPPED/not_applicable, exactly the bug this
+            # gate-fix closes) and hold directly, reusing the SAME hold path
+            # as a VERIFY_FAILED/NEEDS_GUARDED_RESTART verdict below.
+            DAEMON_HOLD_VERDICT="DEPLOY_FAILED"
+            DAEMON_HOLD_REASON="rig $RIG deploy_cmd failed (rc=$DR_DEPLOY_RC): $DR_DEPLOY_CMD"
+            DAEMON_HOLD_DETAIL="$DR_DEPLOY_OUTPUT"
+          else
+            DR_POST_SHA=$(git -C "$DR_RUNTIME_DIR" rev-parse HEAD 2>/dev/null || echo "")
+            DR_OUT=$(RUNTIME_DIR="$DR_RUNTIME_DIR" PRE_DEPLOY_SHA="$DR_PRE_SHA" POST_DEPLOY_SHA="$DR_POST_SHA" \
+              DEPLOY_EPOCH="$DR_EPOCH" SENSITIVE_DAEMONS="$DR_SENSITIVE" DRY_RUN="$DRY_RUN" \
+              bash "$GC_CITY/packs/town-deltas/assets/daemon-refresh.sh" 2>&1 || true)
+            # ga-l7n3v: `|| true` on all three — under this script's set -euo
+            # pipefail, an unmatched grep piped into head/sed still propagates a
+            # non-zero pipeline status and would abort the ENTIRE dispatcher
+            # mid-sweep (same hazard story-delivery.sh:1490 already documents
+            # for its own PROOF line). daemon-refresh.sh's emit() is the only
+            # exit path in that script and always prints all three fields, so
+            # this should never actually fire — but the empty-VERDICT branch
+            # below exists SPECIFICALLY to handle it gracefully if it ever does,
+            # and that branch can only be reached if the pipeline is allowed to
+            # report empty instead of killing the script first.
+            DR_VERDICT=$(echo "$DR_OUT" | grep '^VERDICT=' | head -1 | sed 's/^VERDICT=//' || true)
+            DR_REASON=$(echo "$DR_OUT" | grep '^REASON=' | head -1 | sed 's/^REASON=//' || true)
+            DR_PROOF=$(echo "$DR_OUT" | grep '^PROOF=' | head -1 | sed 's/^PROOF=//' || true)
+            log "ga-l7n3v daemon-refresh: rig=$RIG runtime=$DR_RUNTIME_DIR verdict=$DR_VERDICT proof=$DR_PROOF reason=$DR_REASON"
+            case "$DR_VERDICT" in
+              OK|SKIPPED)
+                # root-class:error-vs-empty (ga-vmq1i's own distinction, reused
+                # here): VERDICT=OK does not by itself mean daemon liveness was
+                # POSITIVELY confirmed — PROOF disambiguates. Only surface the
+                # soft warning when proof is neither "verified" nor
+                # "not_applicable" (never silently claim confidence the helper
+                # itself didn't have); never block the close on this alone.
+                case "$DR_PROOF" in
+                  verified|not_applicable) : ;;
+                  *) DAEMON_SOFT_WARN="$DR_VERDICT ($DR_REASON, proof=$DR_PROOF)" ;;
+                esac
+                ;;
+              "")
+                # The helper produced NO parseable verdict at all (missing
+                # python3, unreadable runbook, or some other environment
+                # failure — every real code path in daemon-refresh.sh emits a
+                # VERDICT line via its own emit() function, so an empty result
+                # here means the HELPER itself is broken, not that a daemon is
+                # stale). Fail toward the PRE-ga-l7n3v behavior (close as
+                # before) rather than stranding every future bug/task bead
+                # citywide on one broken helper — but stay VISIBLE, not
+                # silent, by recording it in the close reason below.
+                warn "ga-l7n3v: daemon-refresh.sh produced no parseable VERDICT for rig $RIG (helper output: ${DR_OUT:0:300}) — proceeding to close (degraded, not blocked; see ga-l7n3v if this recurs)."
+                DAEMON_SOFT_WARN="daemon-refresh.sh produced no verdict (helper-level failure, not a confirmed-stale daemon)"
+                ;;
+              *)
+                DAEMON_HOLD_VERDICT="$DR_VERDICT"
+                DAEMON_HOLD_REASON="$DR_REASON"
+                DAEMON_HOLD_DETAIL="$DR_OUT"
+                ;;
+            esac
+          fi
         else
           log "ga-l7n3v: daemon-liveness check skipped for $BEAD_ID (rig=$RIG runtime_dir='${DR_RUNTIME_DIR:-<none>}')."
         fi
@@ -5179,9 +5210,14 @@ PYEOF
           bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
           bd -C "$BEAD_CITY" label add "$BEAD_ID" "delivery:pending-restart" -q 2>/dev/null || true
           DAEMON_HOLD_ACTION="investigate why the affected daemon(s) did not come up fresh (crash on boot? port in use? — see ga-l7n3v ACHADO 2 for a known launchctl kickstart -k port-bind race), fix forward, then close this bead manually once confirmed live."
-          if [ "$DAEMON_HOLD_VERDICT" = "NEEDS_GUARDED_RESTART" ]; then
-            DAEMON_HOLD_ACTION="perform a guarded/graceful restart of the flagged hot-path daemon(s) — drain in-flight work first — then close this bead manually once confirmed live."
-          fi
+          case "$DAEMON_HOLD_VERDICT" in
+            NEEDS_GUARDED_RESTART)
+              DAEMON_HOLD_ACTION="perform a guarded/graceful restart of the flagged hot-path daemon(s) — drain in-flight work first — then close this bead manually once confirmed live."
+              ;;
+            DEPLOY_FAILED)
+              DAEMON_HOLD_ACTION="investigate why the rig deploy_cmd itself failed (see Refresh detail below for its output) — the merged code was never even pulled onto the runtime checkout, so no daemon could possibly be serving it yet. Fix the deploy (conflict? auth? network?), re-run it manually, confirm the runtime is on sha=$MERGE_SHA, then close this bead manually once confirmed live."
+              ;;
+          esac
           bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED and branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA) — but NOT closing (ga-l7n3v): daemon verification $DAEMON_HOLD_VERDICT — $DAEMON_HOLD_REASON
 
 A long-lived daemon serving rig '$RIG' may still be running code older than this merge. Closure is WITHHELD until this is resolved — a dormant merge must never be marked done (ga-l7n3v). Labeled delivery:pending-restart; gate:passed (already set) keeps the Pilot from re-dispatching this bead.
