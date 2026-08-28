@@ -21,6 +21,12 @@
 #      SKIPPED that never actually confirmed anything live is running the new
 #      code — the caller (story-delivery.sh) must never say "verified in prod"
 #      on anything but PROOF=verified.
+#   8. (ga-j3j6s) Does NOT flag a SENSITIVE daemon for a guarded restart when
+#      its live process already started after the deploy via some OTHER
+#      restart path (e.g. the rig's own auto-deploy) — false-positive alarms
+#      push a human toward an unnecessary hot-path restart. A genuinely-stale
+#      SENSITIVE sibling in the SAME deploy still correctly wins the overall
+#      verdict (NEEDS_GUARDED_RESTART is never masked).
 #
 # All external effects (launchctl, ps) are injected via LAUNCHCTL_BIN / PS_BIN
 # and a mock state dir, so the test touches NO real daemons. The plist scan and
@@ -507,6 +513,60 @@ V=$(field VERDICT "$OUT")
 [ "$RC" -ne 0 ] && ok "T14 non-zero exit (halts delivery)" || nok "T14 exit" "rc=$RC"
 echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" && ok "T14 flagged GUARDED" || nok "T14 guarded" "$(field GUARDED "$OUT")"
 ! grep -q "com.test.central-sender" "$MOCK/kicks.log" 2>/dev/null && ok "T14 NOT drained/bounced" || nok "T14 no-bounce" "kickstart was called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T15 (ga-j3j6s): a SENSITIVE hot-path daemon whose CURRENT process already
+# started AFTER the deploy (some OTHER mechanism — e.g. the rig's own
+# auto-deploy — already restarted it) must NOT be flagged NEEDS_GUARDED_RESTART.
+# Before this fix, the sensitive-with-no-drain-path branch unconditionally
+# flagged GUARDED without ever checking whether the live process is already
+# running the new code — a false positive that sends a human toward an
+# unnecessary hot-path restart (real incident: com.whatsapp.map-viewer,
+# auto-deploy had already restarted it before the alarm fired). The freshness
+# check reuses DEPLOY_EPOCH/pid-start-epoch — the SAME comparison
+# verify_fresh() already uses elsewhere in this file — never a file-mtime
+# comparison (the ga-j3j6s bead's own caution: a daemon can serve from a
+# different tree than the changed file, which would make an mtime check lie).
+# ════════════════════════════════════════════════════════════════════════════
+new_case t15
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+# already fresh: the live process started AFTER DEPLOY_EPOCH, exactly like
+# verify_fresh() would confirm — but NOTHING in this script triggered that
+# restart; some other mechanism (e.g. auto-deploy) did.
+seed_running com.test.central-sender 9001 "$FRESH_LSTART"
+OUT=$(run_helper daemons/central_sender.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T15 verdict OK (already-fresh sensitive daemon not flagged)" || nok "T15 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -eq 0 ] && ok "T15 exit 0" || nok "T15 exit" "rc=$RC"
+echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" && nok "T15 should NOT be GUARDED" "$(field GUARDED "$OUT")" || ok "T15 not flagged GUARDED"
+echo "$(field ALREADY_FRESH "$OUT")" | grep -q "com.test.central-sender" && ok "T15 recorded in ALREADY_FRESH" || nok "T15 already_fresh" "$(field ALREADY_FRESH "$OUT")"
+! grep -q "com.test.central-sender" "$MOCK/kicks.log" 2>/dev/null && ok "T15 NOT kickstarted (already fresh — no restart needed at all)" || nok "T15 no-kickstart" "kickstart was called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+[ "$(field PROOF "$OUT")" = "verified" ] && ok "T15 PROOF=verified (freshness positively confirmed, just via a different restart path)" || nok "T15 proof" "got '$(field PROOF "$OUT")'"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T16 (ga-j3j6s): a MIXED deploy — one SENSITIVE daemon already fresh (skipped,
+# no flag) and a DIFFERENT SENSITIVE daemon still genuinely stale (correctly
+# flagged) — the overall verdict must still be NEEDS_GUARDED_RESTART (GUARDED
+# outranks ALREADY_FRESH), proving the already-fresh short-circuit for one
+# daemon can never mask a real guarded-restart need for another daemon in the
+# same deploy.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t16
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+cat > "$RUNTIME/daemons/slot_scheduler.py" <<<'print("sched")'
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+make_plist "$AGENTS" com.test.slot-scheduler "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/slot_scheduler.py"
+seed_running com.test.central-sender 9101 "$FRESH_LSTART"   # already fresh
+seed_running com.test.slot-scheduler 9201 "$STALE_LSTART"   # still stale
+OUT=$(run_helper daemons/central_sender.py daemons/slot_scheduler.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T16 verdict NEEDS_GUARDED_RESTART (one stale daemon still wins over an already-fresh sibling)" || nok "T16 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -ne 0 ] && ok "T16 non-zero exit (halts delivery)" || nok "T16 exit" "rc=$RC"
+echo "$(field GUARDED "$OUT")" | grep -q "com.test.slot-scheduler" && ok "T16 stale daemon flagged GUARDED" || nok "T16 guarded (stale)" "$(field GUARDED "$OUT")"
+echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" && nok "T16 fresh daemon should NOT be in GUARDED" "$(field GUARDED "$OUT")" || ok "T16 fresh daemon not in GUARDED"
+echo "$(field ALREADY_FRESH "$OUT")" | grep -q "com.test.central-sender" && ok "T16 fresh daemon recorded in ALREADY_FRESH" || nok "T16 already_fresh" "$(field ALREADY_FRESH "$OUT")"
+! grep -q "com.test.central-sender" "$MOCK/kicks.log" 2>/dev/null && ok "T16 fresh daemon NOT kickstarted" || nok "T16 no-kickstart" "kickstart log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""

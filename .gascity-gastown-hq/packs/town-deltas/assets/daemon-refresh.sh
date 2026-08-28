@@ -50,6 +50,19 @@
 #      WA's own three (deploy_daemons.sh's two loops + auto_restart_daemons.py's
 #      deploy_restart branch), closing the classification_dashboard
 #      send-in-flight gap for this trigger too.
+#   7. (ga-j3j6s) Before flagging a SENSITIVE daemon at all (drain path or
+#      not), check whether its CURRENT live process already started after
+#      DEPLOY_EPOCH — the same pid-start-epoch comparison verify_fresh() uses
+#      to confirm a restart THIS script performed. If it's already fresh, some
+#      OTHER mechanism (e.g. the rig's own auto-deploy) already restarted it;
+#      flagging NEEDS_GUARDED_RESTART here is a false positive that pushes a
+#      human toward an unnecessary, non-zero-risk hot-path restart (real
+#      incident: com.whatsapp.map-viewer flagged ~1m45s after auto-deploy had
+#      already restarted it and was serving the new template). Deliberately
+#      NOT a file-mtime comparison — a daemon can serve from a different tree
+#      than the changed file, which would make an mtime check lie; DEPLOY_EPOCH
+#      is a process-clock timestamp tied to the deploy event itself, compared
+#      only against the live PID's own start time (never a file path).
 #
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
@@ -59,8 +72,11 @@
 # actually confirmed anything is running the new code" — into the same green
 # light. The caller used to phrase BOTH as "deployed + verified in prod",
 # which is a false claim for the second case. PROOF disambiguates:
-#   verified       — a live daemon was restarted AND confirmed to start after
-#                     DEPLOY_EPOCH. The only value that earns "verified".
+#   verified       — a live daemon was confirmed running code from after
+#                     DEPLOY_EPOCH: either restarted by THIS script and then
+#                     confirmed fresh, or (ga-j3j6s) already running fresh via
+#                     some OTHER restart path (e.g. the rig's own auto-deploy)
+#                     — same positive pid-start-epoch confirmation either way.
 #   not_applicable — structurally certain there was nothing live to verify
 #                     (no source changed, no rig daemons exist at all, or the
 #                     only daemon(s) tied to the change have no live PID to
@@ -229,24 +245,26 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   echo "RESTARTED=${RESTARTED:-}"
   echo "FRESH_FAIL=${FRESH_FAIL:-}"
   echo "GUARDED=${GUARDED:-}"
+  echo "ALREADY_FRESH=${ALREADY_FRESH:-}"
   echo "REASON=$reason"
   echo "PROOF=$proof"
   # Trailing JSON for the caller's bead comment / jsonl log.
-  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" <<'PY' 2>/dev/null || true
+  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" <<'PY' 2>/dev/null || true
 import json, sys
-v, reason, aff, res, ff, gd, proof = sys.argv[1:8]
+v, reason, aff, res, ff, gd, proof, afr = sys.argv[1:9]
 sp = lambda s: [x for x in s.split() if x]
 print("JSON=" + json.dumps({
     "verdict": v, "reason": reason,
     "affected": sp(aff), "restarted": sp(res),
     "fresh_fail": sp(ff), "guarded": sp(gd), "proof": proof,
+    "already_fresh": sp(afr),
 }))
 PY
   if [ "$DRY_RUN" = "1" ]; then exit 0; fi
   case "$verdict" in OK|SKIPPED) exit 0 ;; *) exit 1 ;; esac
 }
 
-AFFECTED=""; RESTARTED=""; FRESH_FAIL=""; GUARDED=""
+AFFECTED=""; RESTARTED=""; FRESH_FAIL=""; GUARDED=""; ALREADY_FRESH=""
 
 # ── preconditions ─────────────────────────────────────────────────────────────
 if [ -z "$RUNTIME_DIR" ] || ! git -C "$RUNTIME_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -556,6 +574,21 @@ verify_fresh() {  # verify_fresh <label> -> 0 if a process started after DEPLOY_
   return 1
 }
 
+# already_fresh <label> (ga-j3j6s) -> 0 if the CURRENTLY-live process already
+# started after DEPLOY_EPOCH — a ONE-SHOT snapshot check (no wait/retry loop,
+# unlike verify_fresh()): we are not waiting for a restart WE are about to
+# perform, we are asking whether one already happened via some other path.
+# Same primitives as verify_fresh() (daemon_pid + pid_start_epoch), so this
+# carries the identical evidentiary weight — see header point 7 for why a
+# file-mtime comparison would be the wrong (and misleading) alternative.
+already_fresh() {  # already_fresh <label>
+  local label="$1" pid se
+  pid="$(daemon_pid "$label")"
+  [ -n "$pid" ] || return 1
+  se="$(pid_start_epoch "$pid" || echo 0)"
+  [ -n "$se" ] && [ "$se" -gt "$DEPLOY_EPOCH" ] 2>/dev/null
+}
+
 for label in $AFFECTED; do
   # Only refresh LONG-LIVED daemons that are running RIGHT NOW (have a live PID).
   # A discovered job with no current PID is a scheduled/one-shot agent (e.g. a
@@ -568,6 +601,11 @@ for label in $AFFECTED; do
     continue
   fi
   if is_sensitive "$label" || policy_says_sensitive "$label"; then
+    if already_fresh "$label"; then
+      log "SENSITIVE $label: current process already started after deploy (DEPLOY_EPOCH=$DEPLOY_EPOCH) — already running the new code via some other restart path; not flagging for guarded restart (ga-j3j6s)."
+      ALREADY_FRESH="$ALREADY_FRESH $label"
+      continue
+    fi
     sani="${label//[^A-Za-z0-9_]/_}"
     drain_var="DRAIN_CMD_${sani}"
     drain="${!drain_var:-}"
@@ -617,6 +655,7 @@ done
 RESTARTED="$(echo "$RESTARTED" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
 FRESH_FAIL="$(echo "$FRESH_FAIL" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
 GUARDED="$(echo "$GUARDED" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
+ALREADY_FRESH="$(echo "$ALREADY_FRESH" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
 
 # ── Step 5: verdict ───────────────────────────────────────────────────────────
 if [ -n "${FRESH_FAIL// /}" ]; then
@@ -625,6 +664,12 @@ elif [ -n "${GUARDED// /}" ]; then
   emit NEEDS_GUARDED_RESTART "sensitive hot-path daemon(s) need a guarded restart:${GUARDED}" not_verified
 elif [ -n "${RESTARTED// /}" ]; then
   emit OK "all affected daemons restarted + verified fresh:${RESTARTED}" verified
+elif [ -n "${ALREADY_FRESH// /}" ]; then
+  # ga-j3j6s: sensitive daemon(s) whose live process already started after
+  # DEPLOY_EPOCH via some other restart path (e.g. the rig's own auto-deploy)
+  # — positively confirmed fresh via the identical epoch comparison
+  # verify_fresh() uses, just without THIS script performing the restart.
+  emit OK "affected sensitive daemon(s) already running post-deploy code, no restart needed:${ALREADY_FRESH}" verified
 else
   # ga-vmq1i: AFFECTED was non-empty, but every affected daemon was skipped for
   # having no live PID (a scheduled/one-shot job, per the Step-4 loop above) —
