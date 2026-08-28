@@ -133,19 +133,48 @@ Remove records matching test and system patterns from exported JSONL:
 - System task titles starting with "gc:" or "order:"
 - Auto-convoy rows with issue_type "convoy" and titles starting with "sling-"
 
-**2. Spike detection:**
-Compare current export record counts against previous commit.
+**2. Spike detection (per database) — count OPEN separately from TOTAL (ga-hkf0f):**
+A deliberate retention purge of old CLOSED beads is expected, correct behavior
+— it can legitimately move the TOTAL count by well over {{spike_threshold}}
+with ZERO open work affected (confirmed live: 1435 closed beads purged, 0
+open beads affected, still tripped the old total-only check as a false HIGH).
+The discriminator: does the delta touch OPEN (non-closed) beads, or only
+CLOSED ones?
 
-**3. Evaluate results:**
-- If delta > {{spike_threshold}} (default 20%) for ANY database -> HALT after
-  committing the refreshed export locally so the baseline advances
-- Log anomalies: sudden jumps = pollution, sudden drops = data loss
-- Escalate to Mayor:
+For each database's exported issues file, compute BOTH the total record count
+and the OPEN (status != "closed") record count — for the CURRENT export and
+for the PREVIOUS commit's version of the same file. Exports are dolt's raw
+`-r json` output, a single `{"rows": [...]}` object, NOT one-object-per-line
+despite the .jsonl name — jq accordingly:
+```bash
+CUR_TOTAL=$(jq '.rows | length' <db>/issues.jsonl)
+CUR_OPEN=$(jq '[.rows[] | select(.status != "closed")] | length' <db>/issues.jsonl)
+PREV_TOTAL=$(git -C <git_repo> show HEAD:<db>/issues.jsonl 2>/dev/null | jq '.rows | length' 2>/dev/null || echo "")
+PREV_OPEN=$(git -C <git_repo> show HEAD:<db>/issues.jsonl 2>/dev/null | jq '[.rows[] | select(.status != "closed")] | length' 2>/dev/null || echo "")
+```
+
+**3. Evaluate results — alarm on OPEN drops, not on CLOSED-purge-explained TOTAL drops:**
+- TOTAL_PCT = |CUR_TOTAL - PREV_TOTAL| / PREV_TOTAL. OPEN_PCT = |CUR_OPEN -
+  PREV_OPEN| / PREV_OPEN (a zero baseline with no change on either side is
+  0%, not an error — treat divide-by-zero-with-equal-values as "no drop").
+- A RISE in TOTAL beyond {{spike_threshold}} (pollution direction, e.g. test
+  data injected) still escalates immediately — unchanged from before.
+- A DROP in TOTAL beyond {{spike_threshold}} does NOT by itself escalate.
+  Only escalate on a drop when OPEN_PCT (a drop in the open/non-closed count
+  specifically) ALSO exceeds {{spike_threshold}} — that is the signal real
+  work went missing, since a retention purge only ever removes CLOSED beads
+  by design. A total drop with OPEN_PCT under threshold is fully explained by
+  the purge: log INFO (not an anomaly), commit the refreshed baseline, and
+  continue normally — no escalation, no push-skip.
+- HALT (commit the refreshed export locally so the baseline advances) for
+  either kind of REAL spike (pollution jump OR open-bead drop), exactly as
+  before. Skip push so the spike snapshot stays local until a later
+  successful run.
+- Escalate to Mayor, naming the discriminator — not just raw totals:
   ```bash
   gc mail send mayor/ -s "ESCALATION: JSONL spike detected [HIGH]" \\
-    -m "Database: <db>, delta: <pct>%, threshold: {{spike_threshold}}"
+    -m "Database: <db>, total: <prev_total>-><cur_total> (<total_pct>%), open: <prev_open>-><cur_open> (<open_pct>%), threshold: {{spike_threshold}}, cause: <pollution jump | open-bead drop>"
   ```
-- Skip push so the spike snapshot stays local until a later successful run
 
 **4. First export:**
 Skip verification when no baseline exists (previous commit has no file).
