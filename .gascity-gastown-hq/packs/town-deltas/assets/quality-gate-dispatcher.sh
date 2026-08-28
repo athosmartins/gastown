@@ -7570,9 +7570,35 @@ GATE_PRIORITY_AUTHORS="${GATE_PRIORITY_AUTHORS-oracle}"
 # just this marker. Same guard convention, applied here.
 case "$GATE_MARKER_AGE_PROMOTE_SECONDS" in ''|*[!0-9]*) GATE_MARKER_AGE_PROMOTE_SECONDS=1800 ;; esac
 case "$GATE_MARKER_NOW_EPOCH"           in ''|*[!0-9]*) GATE_MARKER_NOW_EPOCH=$(date -u +%s) ;; esac
+# ga-ddm76 (2026-08-28): HARD-CEILING anti-starvation backstop. The ga-tgo7q
+# aging fix above promises "every healthy marker a hard wait bound", but that
+# bound only ever held WITHIN one priority class: a FRESH priority-tier
+# marker still outranks an AGED non-priority one by design
+# (gate-author-priority.selftest.sh case 2, 2026-07-15 — Athos: "priority
+# tier sits above the age tier", intentional and still correct for a short
+# priority burst). Under SUSTAINED priority submission that leaves
+# non-priority markers with no real ceiling at all — only a soft one that
+# holds as long as the priority author's queue happens to empty out in
+# time. Live-measured: ga-wisp-am67hm (non-oracle) queued 21:59:55, three
+# fresh crew/oracle/* markers (22:20:45 / 22:29:01 / 22:29:03) each drained
+# ahead of it while it already sat well past GATE_MARKER_AGE_PROMOTE_SECONDS,
+# and it did not close until 23:11:43 — 71min wait, not the promised 30min,
+# purely because oracle kept resubmitting. This threshold is the true,
+# priority-BLIND ceiling: sorted oldest-first, sitting ABOVE every tier below
+# (including priority-aged), except rebase-fail — which must never be
+# rescued by age, same ga-q3ig2 invariant the aging fix above already
+# respects. Deliberately set well above GATE_MARKER_AGE_PROMOTE_SECONDS (3x
+# by default) so it never fires for a merely-aged marker still inside the
+# tested priority-outranks-age window (gate-author-priority.selftest.sh case
+# 2 uses a 3600s/60min fixture, comfortably under this 5400s/90min default)
+# — it exists only to bound the untested, unbounded-under-sustained-load
+# case measured above.
+GATE_MARKER_HARD_AGE_SECONDS="${GATE_MARKER_HARD_AGE_SECONDS:-$((GATE_MARKER_AGE_PROMOTE_SECONDS * 3))}"
+case "$GATE_MARKER_HARD_AGE_SECONDS" in ''|*[!0-9]*) GATE_MARKER_HARD_AGE_SECONDS=$((GATE_MARKER_AGE_PROMOTE_SECONDS * 3)) ;; esac
 MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   --argjson now "$GATE_MARKER_NOW_EPOCH" \
   --argjson age_threshold "$GATE_MARKER_AGE_PROMOTE_SECONDS" \
+  --argjson hard_threshold "$GATE_MARKER_HARD_AGE_SECONDS" \
   --arg priority_authors "$GATE_PRIORITY_AUTHORS" '
   # ga-gpcx: matches both the current name (gate:exiled-tier5:N) and the
   # legacy name (gate:rebase-attempt:N, used before 2026-07-17) so a marker
@@ -7581,6 +7607,8 @@ MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   # would reintroduce the ga-q3ig2 outage class). See read_rebase_attempt().
   def has_rebase_fail: ((.labels // []) | map(select(test("^gate:(rebase-attempt|exiled-tier5):[0-9]+$"))) | length) > 0;
   def is_aged: try (($now - (.created_at | fromdateiso8601)) > $age_threshold) catch false;
+  # ga-ddm76: priority-blind emergency ceiling — see the shell comment above.
+  def is_overdue: try (($now - (.created_at | fromdateiso8601)) > $hard_threshold) catch false;
   # crew_of parses the <crew> segment of `branch: crew/<crew>/<bead>` from the
   # marker DESCRIPTION. MUST always yield exactly one value ("" when absent) —
   # `capture`/`scan` yield an EMPTY STREAM on no-match under jq, and `crew_of as
@@ -7591,10 +7619,12 @@ MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   def crew_of: ([ (.description // "") | scan("(?:^|\n)branch:[ ]*crew/([^/ \n]+)/") ] | (.[0] // "") | if type == "array" then (.[0] // "") else . end);
   def prio_list: ($priority_authors | split(" ") | map(select(length>0)));
   def is_priority: (crew_of as $c | ($c != "" and ((prio_list | index($c)) != null))) or ((.labels // []) | any(. == "gate:priority"));
-  # Tier order: priority-healthy (aged→newest), then other-healthy (aged→newest),
+  # Tier order: overdue-emergency (priority-BLIND, oldest-first — ga-ddm76),
+  # then priority-healthy (aged→newest), then other-healthy (aged→newest),
   # then rebase-fail (all authors, back of queue). Mirrors the aged/newest logic
   # inside each priority class so no invariant (aging bound, newest tiebreak) is lost.
-  (map(select(is_priority and (has_rebase_fail | not) and is_aged))                 | sort_by(.created_at))
+  (map(select(is_overdue and (has_rebase_fail | not)))                              | sort_by(.created_at))
+  + (map(select(is_priority and (has_rebase_fail | not) and is_aged))                 | sort_by(.created_at))
   + (map(select(is_priority and (has_rebase_fail | not) and (is_aged | not)))       | sort_by(.created_at) | reverse)
   + (map(select((is_priority | not) and (has_rebase_fail | not) and is_aged))       | sort_by(.created_at))
   + (map(select((is_priority | not) and (has_rebase_fail | not) and (is_aged | not))) | sort_by(.created_at) | reverse)
