@@ -22,11 +22,18 @@
 # Strategy mirrors the sibling gate-*.selftest.sh files exactly: extract the
 # LIVE block via its sentinels (never a hand-copied jq) and run it under the
 # host bash with MARKERS_JSON + the NOW/AGE/HARD_AGE/PRIORITY_AUTHORS test
-# seams set. Case (7) additionally re-extracts the block from the git HEAD
-# revision (pre-fix) and proves the exact same repro scenario LOSES there —
-# a test that only confirms "something got selected" would not catch this
-# class; this one proves the specific starved marker wins post-fix and loses
-# pre-fix.
+# seams set.
+#
+# This file does NOT self-certify "fails pre-fix, passes post-fix" in-process.
+# An earlier revision tried that via `git show HEAD:<path>`, which is only
+# ever true in the author's uncommitted sandbox: at ANY committed state of
+# this branch — including the exact commit under review — HEAD already IS
+# the fix, so the comparison is vacuous by construction and cannot pass in a
+# form any reviewer or rerun can ever observe. That proof is instead done
+# externally and safely by quality-gate-guard.sh's Step 5b-pre2 base-test
+# harness, which materializes this file onto a genuine throwaway base-commit
+# worktree and confirms at least one case fails there (see the marker's
+# `gate-ab-basetest:*` label).
 #
 # Exit 0 iff every assertion holds.
 
@@ -164,43 +171,6 @@ if [ -n "$OVERDUE_LINE" ] && [ -n "$PRIO_AGED_LINE" ] && [ -n "$BROKEN_LINE" ] \
   ok "tier order fixed: overdue-ceiling, then priority-aged/other tiers, then rebase-fail"
 else
   bad "tier order drifted (overdue=$OVERDUE_LINE prio-aged=$PRIO_AGED_LINE broken=$BROKEN_LINE) — re-check concat order"
-fi
-
-echo "── (9) empirical proof against the PRE-FIX revision: case (1)'s scenario LOSES on git HEAD ──"
-# Never assume the bug existed — measure it. Extract the marker-select block
-# from the git HEAD blob of this same file (i.e. the tree before this fix's
-# uncommitted worktree edit) and re-run case (1)'s exact repro against it.
-REPO_ROOT="$(cd "$SELF_DIR/../../.." && git rev-parse --show-toplevel 2>/dev/null)"
-if [ -z "$REPO_ROOT" ]; then
-  bad "could not resolve git repo root from $SELF_DIR — skipping pre-fix comparison (treat as unverified, not passing)"
-else
-  RELPATH="$(git -C "$REPO_ROOT" ls-files --full-name "$DISPATCHER" 2>/dev/null | head -1)"
-  if [ -z "$RELPATH" ]; then
-    bad "could not resolve $DISPATCHER to a path tracked in $REPO_ROOT — skipping pre-fix comparison"
-  else
-    PREFIX_CONTENT="$(git -C "$REPO_ROOT" show "HEAD:$RELPATH" 2>/dev/null)"
-    if [ -z "$PREFIX_CONTENT" ]; then
-      bad "git show HEAD:$RELPATH returned nothing — skipping pre-fix comparison"
-    else
-      TMP_PREFIX="$(mktemp)"
-      printf '%s\n' "$PREFIX_CONTENT" > "$TMP_PREFIX"
-      PRE_BLOCK="$(extract_block "$TMP_PREFIX")"
-      rm -f "$TMP_PREFIX"
-      if [ -z "$PRE_BLOCK" ]; then
-        bad "HEAD revision has no marker-select sentinel block — cannot compare (unexpected: sentinels predate this fix)"
-      else
-        FIX=$(printf '[%s,%s]' \
-          "$(mk starved "$(ago 5500)" mila)" \
-          "$(mk orcnew  "$(ago 60)"   oracle)")
-        PRE_SEL=$(select_marker "$PRE_BLOCK" "$FIX" "$NOW_EPOCH" "$THRESH" "$HARD" "oracle")
-        if [ "$PRE_SEL" = "orcnew" ]; then
-          ok "confirmed RED on pre-fix HEAD: case (1)'s starved marker LOSES there (selected='$PRE_SEL') — this is a real fix, not a no-op"
-        else
-          bad "pre-fix HEAD did not reproduce the bug (selected='$PRE_SEL', expected orcnew) — case (1) may not be testing what this bead reported; investigate before trusting case (1)'s PASS"
-        fi
-      fi
-    fi
-  fi
 fi
 
 echo ""
