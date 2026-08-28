@@ -6064,6 +6064,49 @@ else
   bad "cap guard at-cap log message missing or doesn't identify the bead — hard to diagnose in production"
 fi
 
+# ── Scenario NEW-M: spawn-failure rollback (ga-d20od) ────────────────────────
+# Before this fix: DISPATCH_RESULT was committed to "rig_native_ok" (~L8446)
+# BEFORE the wa-worker/ps-worker spawn attempt even ran, and a spawn
+# timeout/failure only logged a WARN — it never fed back into anything the
+# unconditional story:in-flight + pilot:dispatched marking block (~L8760+)
+# checked. So a spawn timeout left the bead durably tagged "dispatched" with
+# NO live worker: invisible to Pilot's own re-dispatch (its candidate queries
+# exclude pilot:dispatched) until a human manually stripped the labels
+# (measured live twice same day: wa-gxz1z, wa-4kg8y, 2026-08-27). Fix mirrors
+# the three sibling failure paths already in this function (rig_dedup_skip,
+# pool_ownership_refuse, rig_assign_failed): strip pilot:dispatching and
+# return 1 immediately at the failure site, before the marking block runs.
+# gc.routed_to is deliberately left SET so the supervisor's own reconcile/
+# scale_check still sees the pool demand (matches the existing "supervisor
+# reconcile will pick it up" log promise).
+
+echo "Scenario NEW-M1: spawn-failure result code present (ga-d20od, distinct from rig_native_ok)"
+has "$DISPATCHER" 'rig_native_spawn_failed' \
+  "rig-native spawn-failure result code present (distinct from rig_native_ok)"
+
+echo "Scenario NEW-M2: wa-worker spawn failure rolls back pilot:dispatching and aborts BEFORE the unconditional in-flight marking"
+_wa_spawnfail_block="$(awk '/Could not spawn wa-worker/{f=1} f{print} /PILOT_SPAWN_WA_WORKER=0 — skipping/{if(f)exit}' "$DISPATCHER")"
+if printf '%s' "$_wa_spawnfail_block" | grep -q 'label remove "\$STORY_ID" "pilot:dispatching"' \
+   && printf '%s' "$_wa_spawnfail_block" | grep -q 'return 1'; then
+  ok "wa-worker: spawn-failure branch strips pilot:dispatching and returns 1 (ga-d20od fix present)"
+else
+  bad "wa-worker: spawn-failure branch does NOT roll back pilot:dispatching / return 1 — orphan-label regression (ga-d20od)"
+fi
+if printf '%s' "$_wa_spawnfail_block" | grep -q 'unset-metadata "gc.routed_to"'; then
+  bad "wa-worker: spawn-failure branch unsets gc.routed_to — supervisor reconcile would lose the pool demand signal (ga-d20od intent: leave it SET)"
+else
+  ok "wa-worker: spawn-failure branch leaves gc.routed_to SET (supervisor reconcile can still see the pool demand)"
+fi
+
+echo "Scenario NEW-M3: ps-worker mirror — same spawn-failure rollback (ga-d20od)"
+_ps_spawnfail_block="$(awk '/Could not spawn ps-worker/{f=1} f{print} /PILOT_SPAWN_PS_WORKER=0 — skipping/{if(f)exit}' "$DISPATCHER")"
+if printf '%s' "$_ps_spawnfail_block" | grep -q 'label remove "\$STORY_ID" "pilot:dispatching"' \
+   && printf '%s' "$_ps_spawnfail_block" | grep -q 'return 1'; then
+  ok "ps-worker: spawn-failure branch strips pilot:dispatching and returns 1 (ga-d20od fix mirrored)"
+else
+  bad "ps-worker: spawn-failure branch does NOT roll back pilot:dispatching / return 1 — orphan-label regression (ga-d20od)"
+fi
+
 # ── Scenario 16s–16v: phantom-claim guard (FOLLOW-UP #1, ga-9yb5s+) ──────────
 # A live crew member may hold story.assignee but NEVER start the build (phantom).
 # The phantom-claim guard inside _beadid_live_crew_owner must RELEASE (return 1)

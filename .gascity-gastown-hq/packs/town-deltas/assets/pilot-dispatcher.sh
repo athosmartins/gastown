@@ -8485,6 +8485,23 @@ TASK
               log "  ga-mfeip: wa-worker session spawned for $STORY_ID (slot=$BUILDER_TARGET)."
             else
               warn "ga-mfeip: Could not spawn wa-worker for $STORY_ID — gc.routed_to=wa-worker set; supervisor reconcile will pick it up"
+              # ga-d20od: the spawn genuinely failed/timed out — no worker was
+              # dispatched. Release the claim and abort HERE, mirroring the
+              # sibling failure paths above (rig_dedup_skip, pool_ownership_refuse,
+              # rig_assign_failed): all three strip pilot:dispatching and return 1
+              # immediately at their failure site. Before this fix, control fell
+              # through to the unconditional story:in-flight + pilot:dispatched
+              # marking below (~L8760+) regardless of spawn outcome, leaving the
+              # bead durably marked "dispatched" with no live worker — invisible
+              # to Pilot's own re-dispatch (its candidate queries exclude
+              # pilot:dispatched) until a human manually stripped the labels
+              # (measured live: wa-gxz1z, wa-4kg8y, 2026-08-27). gc.routed_to
+              # stays SET (not unset) so the supervisor's own scale_check still
+              # sees the unmet pool demand and can spawn later.
+              bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+              bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+              DISPATCH_RESULT="rig_native_spawn_failed"
+              return 1
             fi
           fi
         else
@@ -8513,6 +8530,14 @@ TASK
               log "  ga-mfeip: ps-worker session spawned for $STORY_ID."
             else
               warn "ga-mfeip: Could not spawn ps-worker for $STORY_ID — gc.routed_to=ps-worker set; supervisor reconcile will pick it up"
+              # ga-d20od: mirrors the wa-worker spawn-failure rollback above —
+              # same defect shape (unconditional story:in-flight + pilot:dispatched
+              # marking below used to run even when no worker was ever spawned).
+              # See that comment for the full rationale.
+              bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+              bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+              DISPATCH_RESULT="rig_native_spawn_failed"
+              return 1
             fi
           fi
         else
