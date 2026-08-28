@@ -5089,9 +5089,38 @@ PYEOF
         # "runtime_dir unresolved → skip this check" branch below, same
         # fail-toward-existing-behavior direction as the rest of this patch.
         DR_RUNTIME_DIR=$(_gl7n3v_runbook_field "$RIG" "runtime_dir" || true)
-        if [ -n "$DR_RUNTIME_DIR" ] && [ "$DR_RUNTIME_DIR" != "$GC_CITY" ] \
-           && [ -f "$GC_CITY/packs/town-deltas/assets/daemon-refresh.sh" ] \
-           && git -C "$DR_RUNTIME_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        # ga-l7n3v GATE-FIX (root-class:error-vs-empty, reviewer-caught): the
+        # first version of this patch collapsed FOUR distinct preconditions
+        # into one AND-ed `if`, with a bare log line in the `else` — so ANY
+        # of the four being false (no runbook mapping, helper missing on
+        # disk, runtime_dir not a git work tree) produced the exact same
+        # silent "close normally, no trace" outcome as the one TRULY inert
+        # case (a gascity/framework self-fix, which genuinely has nothing to
+        # verify). A bead closing because verification was SKIPPED is
+        # indistinguishable from one that closed because verification
+        # POSITIVELY CONFIRMED the daemon is fresh — exactly the collapse
+        # this whole bead exists to prevent, just moved one layer up from
+        # daemon-refresh.sh's own VERDICT/PROOF into this file's own
+        # precondition gate. Split into explicit branches: the ONE
+        # structurally-certain case (gascity self-fix — same condition
+        # story-delivery.sh already uses to skip itself) stays silent
+        # (genuinely not_applicable); the other three couldn't-check cases
+        # each set DAEMON_SOFT_WARN so they're visible on the close reason +
+        # delivery:daemon-unverified, same non-blocking-but-visible
+        # treatment already used for daemon-refresh.sh's own empty-verdict
+        # case below (consistent policy, not a new blast-radius decision).
+        if [ -z "$DR_RUNTIME_DIR" ]; then
+          log "ga-l7n3v: daemon-liveness check SKIPPED for $BEAD_ID — rig '$RIG' has no runtime_dir in delivery-runbooks.toml (cannot determine whether a daemon needs verification)."
+          DAEMON_SOFT_WARN="no runtime_dir mapping for rig $RIG in delivery-runbooks.toml — daemon liveness could not be checked at all"
+        elif [ "$DR_RUNTIME_DIR" = "$GC_CITY" ]; then
+          log "ga-l7n3v: daemon-liveness check not applicable for $BEAD_ID (framework/gascity self-fix, runtime_dir == GC_CITY)."
+        elif [ ! -f "$GC_CITY/packs/town-deltas/assets/daemon-refresh.sh" ]; then
+          warn "ga-l7n3v: daemon-refresh.sh helper is MISSING on disk — daemon liveness could not be checked for $BEAD_ID (rig=$RIG). Infrastructure gap, not a confirmed-clean daemon."
+          DAEMON_SOFT_WARN="daemon-refresh.sh helper missing on disk — daemon liveness could not be checked (infrastructure gap)"
+        elif ! git -C "$DR_RUNTIME_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+          warn "ga-l7n3v: rig $RIG's runtime_dir ($DR_RUNTIME_DIR) is not a git work tree — daemon liveness could not be checked for $BEAD_ID."
+          DAEMON_SOFT_WARN="rig $RIG runtime_dir ($DR_RUNTIME_DIR) is not a git work tree — daemon liveness could not be checked"
+        else
           DR_DEPLOY_CMD=$(_gl7n3v_runbook_field "$RIG" "deploy_cmd" || true)
           DR_SENSITIVE=$(_gl7n3v_runbook_field "$RIG" "sensitive_daemons" | tr '\n' ' ' || true)
           DR_PRE_SHA=$(git -C "$DR_RUNTIME_DIR" rev-parse HEAD 2>/dev/null || echo "")
@@ -5186,8 +5215,6 @@ PYEOF
                 ;;
             esac
           fi
-        else
-          log "ga-l7n3v: daemon-liveness check skipped for $BEAD_ID (rig=$RIG runtime_dir='${DR_RUNTIME_DIR:-<none>}')."
         fi
 
         if [ -n "$DAEMON_HOLD_VERDICT" ]; then
