@@ -31,9 +31,12 @@
 #     is stolen after LOCK_STALE_SEC so a dead refresher can't wedge the shim).
 #
 # Env knobs:
-#   GC_SESSION_CACHE_TTL   seconds a cache entry stays fresh   (default 8)
-#   GC_SESSION_CACHE_DIR   cache location                      (default $GC_CITY/.gc/cache)
-#   GC_SESSION_CACHE_OFF=1 kill switch — always go live, never cache (instant rollback)
+#   GC_SESSION_CACHE_TTL     seconds a cache entry stays fresh     (default 8)
+#   GC_SESSION_CACHE_DIR     cache location                        (default $GC_CITY/.gc/cache)
+#   GC_SESSION_CACHE_OFF=1   kill switch — always go live, never cache (instant rollback)
+#   GC_SESSION_LOCK_WAIT_SEC brief wait for a peer's in-flight refresh before we
+#                            fall back to our own live call — independent of TTL,
+#                            see ga-abrm8                          (default 2)
 #
 # Usage:
 #   gc-session-list-cached.sh            # cached `gc session list --json`
@@ -47,6 +50,12 @@ CACHE_DIR="${GC_SESSION_CACHE_DIR:-$CITY/.gc/cache}"
 CACHE="$CACHE_DIR/session-list.json"
 LOCKDIR="$CACHE_DIR/session-list.refresh.lock.d"
 LOCK_STALE_SEC="${GC_SESSION_LOCK_STALE_SEC:-30}"   # steal a lock older than this (dead refresher)
+# Brief wait for an in-flight peer refresh to publish before we fall back to our
+# own live call (see _wait_for_peer_publish). Deliberately INDEPENDENT of TTL:
+# TTL is a cache-freshness window (how stale is acceptable to serve), not a safe
+# "how long may a caller sit idle" budget — see ga-abrm8 in the function's own
+# comment for why conflating the two was a bug.
+LOCK_WAIT_SEC="${GC_SESSION_LOCK_WAIT_SEC:-2}"
 
 _mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
 _now()   { date +%s; }
@@ -119,6 +128,31 @@ _try_lock() {
 }
 _unlock() { rmdir "$LOCKDIR" 2>/dev/null || true; }
 
+# Another process holds the refresh lock. Wait briefly for its publish (serving
+# the moment a valid cache appears — exits via _serve_cache); if nothing shows up
+# within the wait window, return 1 so the caller falls back to its own live read.
+#
+# ga-abrm8: the wait ceiling is LOCK_WAIT_SEC, not TTL. This loop used to bound
+# itself on `TTL * 4` (reusing the cache-freshness knob as if it were also a safe
+# wait budget). At the default TTL=8s, a caller that raced in here with NO
+# fallback cache to serve — e.g. painel-prod's 120s poll cadence, which almost
+# never has a fresh-enough cache to take the fast path above — spent up to the
+# *entire* TTL doing nothing before even attempting the live call that follows,
+# directly violating this shim's own documented "never worse than no shim"
+# contract. Measured live: TTL-scaled wait + a live call totaled 12.75s against
+# painel-prod's 10s subprocess timeout. LOCK_WAIT_SEC keeps the same intent
+# (give an in-flight peer a moment to finish, since it's presumably close to
+# done) without scaling with TTL — see the "lock-wait bounded by LOCK_WAIT_SEC"
+# selftest case below for the regression proof.
+_wait_for_peer_publish() {
+  local i=0
+  while [ "$i" -lt $(( LOCK_WAIT_SEC * 4 )) ]; do
+    sleep 0.25; i=$(( i + 1 ))
+    [ -f "$CACHE" ] && _serve_cache
+  done
+  return 1
+}
+
 # ── self-test (offline: stubs `gc`, exercises TTL / validate / atomic / fail-open) ──
 if [ "${1:-}" = "--selftest" ]; then
   pass=0; fail=0
@@ -155,6 +189,49 @@ if [ "${1:-}" = "--selftest" ]; then
   ( _serve_cache ) ; [ ! -f "$CACHE" ] && ok "_serve_cache dropped corrupt cache" || bad "corrupt cache not dropped"
   printf '%s' '{"other":1}' > "$CACHE"
   _cache_looks_valid && bad "wrong-shape cache passed sanity" || ok "wrong-shape cache fails sanity"
+
+  # regression (ga-abrm8): the lock-wait ceiling in _wait_for_peer_publish must be
+  # governed by LOCK_WAIT_SEC (a small, independent knob) — NOT by TTL (a cache-
+  # freshness window). Before this fix the wait loop scaled with TTL, so a caller
+  # with no fallback cache to serve could burn nearly the *entire* TTL doing
+  # nothing before even ATTEMPTING a live call: at the default TTL=8s, measured
+  # live (ga-abrm8) to total 12.75s against painel-prod's 10s caller budget —
+  # the shim's own documented "never worse than no shim" contract broken.
+  #
+  # Proven without literally blocking the selftest for TTL seconds: run the wait
+  # in the background with a deliberately huge TTL, and after a short probe
+  # window assert it has ALREADY RETURNED (bound to LOCK_WAIT_SEC) rather than
+  # still sleeping (bound to TTL, the pre-fix bug).
+  rm -f "$CACHE"
+  TTL=100
+  ( _wait_for_peer_publish >/dev/null 2>&1 ) &
+  _wfpp_pid=$!
+  sleep 3
+  if kill -0 "$_wfpp_pid" 2>/dev/null; then
+    bad "lock-wait still running after 3s probe with TTL=100 (wait ceiling scales with TTL, not LOCK_WAIT_SEC)"
+    kill "$_wfpp_pid" 2>/dev/null; wait "$_wfpp_pid" 2>/dev/null
+  else
+    wait "$_wfpp_pid" 2>/dev/null
+    ok "lock-wait returns quickly (bounded by LOCK_WAIT_SEC) even with TTL=100"
+  fi
+
+  # a cache published mid-wait short-circuits immediately rather than riding out
+  # the full wait window (this property must survive the fix unchanged)
+  rm -f "$CACHE"
+  TTL=100
+  ( sleep 1; printf '%s' '{"sessions":[]}' > "$CACHE" ) &
+  _pub_pid=$!
+  t0=$(_now)
+  out="$( _wait_for_peer_publish )"; rc=$?
+  t1=$(_now)
+  wait "$_pub_pid" 2>/dev/null
+  elapsed=$(( t1 - t0 ))
+  if [ "$rc" -eq 0 ] && [ "$elapsed" -le 3 ]; then
+    ok "wait short-circuits the moment a peer publishes (${elapsed}s)"
+  else
+    bad "wait did not short-circuit on publish (rc=$rc, ${elapsed}s)"
+  fi
+  rm -f "$CACHE"
   rm -rf "$TMP"
   echo "gc-session-list-cached selftest: PASS=$pass FAIL=$fail"
   [ "$fail" -eq 0 ]; exit $?
@@ -185,9 +262,6 @@ else
   # another process is refreshing. Serve current cache if we have one (a hair stale is
   # fine + fail-open); else wait briefly for the publish, then serve or go live.
   [ -f "$CACHE" ] && _serve_cache
-  i=0; while [ "$i" -lt $(( TTL * 4 )) ]; do
-    sleep 0.25; i=$(( i + 1 ))
-    [ -f "$CACHE" ] && _serve_cache
-  done
+  _wait_for_peer_publish
   _live                                       # last resort: refresher never produced
 fi
