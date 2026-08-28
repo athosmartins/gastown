@@ -140,11 +140,13 @@ notify_athos() {
 # ═════════════════════════════════════════════════════════════════════════════
 # PURE DECISION FUNCTION — the heart of the janitor; fully unit-testable.
 # janitor_decide <is_epic> <has_open_marker> <sig_commit> <sig_marker> <sig_branch_merged>
-#                <sig_commit_stale> <sig_marker_superseded> <is_delivery_partial>
-# Each arg is 0|1 (sig_commit_stale/sig_marker_superseded/is_delivery_partial default to
-# 0 when omitted — backward-compatible with every pre-ga-2zp4h/pre-ga-f54ui caller/test).
+#                <sig_commit_stale> <sig_marker_superseded> <is_delivery_partial> <is_daemon_hold>
+# Each arg is 0|1 (sig_commit_stale/sig_marker_superseded/is_delivery_partial/is_daemon_hold
+# default to 0 when omitted — backward-compatible with every pre-ga-2zp4h/pre-ga-f54ui/
+# pre-ga-l7n3v caller/test).
 # Echoes "<verdict>:<reason>" where verdict ∈ {keep,close}. Guards are evaluated FIRST (an
-# open marker, epic, or unresolved partial-delivery scope always wins over signals).
+# open marker, epic, unresolved partial-delivery scope, or pending daemon verification
+# always wins over signals).
 #
 # sig_commit_stale (ga-2zp4h, 2026-07-26): Signal A alone only proves "a conventional
 # commit scoped to this bead id landed in origin/main" — not that THIS bead's own
@@ -178,13 +180,32 @@ notify_athos() {
 # re-checked here: if a human/Mayor adds it and the bead is re-gated, the dispatcher's PASS
 # path closes it directly (see quality-gate-dispatcher.sh's IS_PARTIAL branch), so this
 # janitor never needs to independently re-derive that override.
+#
+# is_daemon_hold (ga-l7n3v, 2026-08-28): SAME shape as is_delivery_partial above, one
+# guard-cycle later. quality-gate-dispatcher.sh's BUG/TASK close path now VERIFIES daemon
+# liveness before closing a source bead (ga-l7n3v) — on VERIFY_FAILED/NEEDS_GUARDED_RESTART/
+# DEPLOY_FAILED it holds instead of closing, labels the bead delivery:pending-restart, and
+# leaves it in_progress+unassigned (only the assignee is cleared; status is untouched). But
+# by the time that decision runs, THIS SAME dispatcher invocation has ALREADY closed the gate
+# marker itself as gate-status:passed (line ~4814, unconditionally, before the source-bead
+# hold/close branching) — so the ONLY existing guard here that could have protected a held
+# bead (has_open_marker) never fires: the marker isn't open anymore. Every real merge signal
+# (A: the fix's own commits cite the bead id; B: the now-CLOSED gate-status:passed marker)
+# fires normally on the very next janitor sweep (every 15min), 15 minutes being ample time
+# for a gate PASS to have already happened — reproducing the exact ga-f54ui shape verbatim,
+# just via a different dispatcher-side hold label. Same fix: a dedicated guard, same
+# precedence tier as is_delivery_partial (right after it — both are "the dispatcher already
+# judged this bead's true state is NOT actually done, independent of what merge evidence
+# says").
 # ═════════════════════════════════════════════════════════════════════════════
 janitor_decide() {
   local is_epic="$1" has_open_marker="$2" sig_commit="$3" sig_marker="$4" sig_branch="$5" \
-        sig_commit_stale="${6:-0}" sig_marker_superseded="${7:-0}" is_delivery_partial="${8:-0}"
+        sig_commit_stale="${6:-0}" sig_marker_superseded="${7:-0}" is_delivery_partial="${8:-0}" \
+        is_daemon_hold="${9:-0}"
   if [ "$is_epic" = "1" ]; then            echo "keep:epic-parent-never-autoclosed"; return 0; fi
   if [ "$has_open_marker" = "1" ]; then    echo "keep:active-open-gate-marker"; return 0; fi
   if [ "$is_delivery_partial" = "1" ]; then echo "keep:delivery-partial-unresolved-scope"; return 0; fi
+  if [ "$is_daemon_hold" = "1" ]; then     echo "keep:daemon-verification-pending-restart"; return 0; fi
   if [ "$sig_commit" = "1" ] && [ "$sig_commit_stale" != "1" ]; then
                                             echo "close:commit-in-origin-main"; return 0; fi
   if [ "$sig_marker" = "1" ]; then         echo "close:terminal-gate-marker-passed"; return 0; fi
@@ -978,6 +999,10 @@ while IFS= read -r rig; do
     IS_DELIV_PARTIAL=0
     printf '%s' "$b" | jq -e '(.labels // []) | index("delivery:partial")' >/dev/null 2>&1 \
       && IS_DELIV_PARTIAL=1
+    # ga-l7n3v: same shape as IS_DELIV_PARTIAL above — see janitor_decide's docstring.
+    IS_DAEMON_HOLD=0
+    printf '%s' "$b" | jq -e '(.labels // []) | index("delivery:pending-restart")' >/dev/null 2>&1 \
+      && IS_DAEMON_HOLD=1
 
     # Gate markers (HQ) for this bead → open-marker guard + terminal signal + branch.
     MK=$(markers_for_bead "$BID")
@@ -1054,7 +1079,7 @@ EOF
       done
     fi
 
-    VERDICT_LINE=$(janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SIG_BRANCH" "$SIG_COMMIT_STALE" "$SIG_MK_SUPER" "$IS_DELIV_PARTIAL")
+    VERDICT_LINE=$(janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SIG_BRANCH" "$SIG_COMMIT_STALE" "$SIG_MK_SUPER" "$IS_DELIV_PARTIAL" "$IS_DAEMON_HOLD")
     VERDICT="${VERDICT_LINE%%:*}"; REASON="${VERDICT_LINE#*:}"
 
     if [ "$VERDICT" = "close" ]; then
@@ -1153,6 +1178,10 @@ EOF
     F_DELIV_PARTIAL=0
     printf '%s' "$f" | jq -e '(.labels // []) | index("delivery:partial")' >/dev/null 2>&1 \
       && F_DELIV_PARTIAL=1
+    # ga-l7n3v: same daemon-hold guard as the in_progress sweep above.
+    F_DAEMON_HOLD=0
+    printf '%s' "$f" | jq -e '(.labels // []) | index("delivery:pending-restart")' >/dev/null 2>&1 \
+      && F_DAEMON_HOLD=1
 
     FMK=$(markers_for_bead "$FID")
     F_HASOPEN=0; has_open_marker "$FMK" && F_HASOPEN=1
@@ -1203,7 +1232,7 @@ EOF
       done
     fi
 
-    F_VERDICT_LINE=$(janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE" "$F_SIGMK_SUPER" "$F_DELIV_PARTIAL")
+    F_VERDICT_LINE=$(janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE" "$F_SIGMK_SUPER" "$F_DELIV_PARTIAL" "$F_DAEMON_HOLD")
     F_VERDICT="${F_VERDICT_LINE%%:*}"; F_REASON="${F_VERDICT_LINE#*:}"
 
     # ga-vokwv: sling-bead-name fallback. FID's OWN id carried no merge

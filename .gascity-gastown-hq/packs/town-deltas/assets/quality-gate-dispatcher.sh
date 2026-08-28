@@ -5205,6 +5205,19 @@ PYEOF
           # whose only existing consumer (story-delivery.sh's task
           # reconciler) re-arms story:approved, a STORY-only mechanism this
           # bug/task bead does not carry and should not trigger.
+          #
+          # GATE-FIX (reviewer-caught): this label needs its OWN protection
+          # against merged-bead-janitor.sh, a SEPARATE periodic closer (every
+          # 15min) — by the time this branch runs, the gate MARKER has
+          # ALREADY closed as gate-status:passed (line ~4814, before this
+          # source-bead hold/close decision), so the janitor's existing
+          # has_open_marker guard cannot see this bead as still-in-review and
+          # would otherwise re-close it on the very next sweep via its own
+          # commit/marker merge signals. merged-bead-janitor.sh's
+          # janitor_decide() now has a dedicated is_daemon_hold guard that
+          # checks for exactly this label (same fix shape as its existing
+          # is_delivery_partial guard, ga-f54ui) — the label alone does
+          # nothing without that companion guard.
           IS_DAEMON_HOLD=1
           log "Source bug/task $BEAD_ID merged but daemon verification $DAEMON_HOLD_VERDICT (ga-l7n3v) — holding, NOT closing."
           bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)

@@ -56,6 +56,16 @@ evidence) is never blocked by this — it's an all-or-nothing gate over
 - A bead with **any OPEN gate marker** (queued/ready/dispatching/needs-rebase/
   error/deferred) is actively in the gate → **never closed**. This also keeps an
   errored-but-not-yet-merged bead.
+- A bead labeled **`delivery:partial`** (ga-f54ui) is never closed — the gate's
+  own heuristic already judged its body enumerates multiple deliverables of
+  which only one diff was reviewed; a merge signal here proves nothing about
+  the rest of the scope.
+- A bead labeled **`delivery:pending-restart`** (ga-l7n3v) is never closed —
+  quality-gate-dispatcher.sh's BUG/TASK path stamps this when a merged fix's
+  daemon-liveness verification failed or is still pending; the gate MARKER
+  closes as `gate-status:passed` before that hold decision runs, so the
+  open-marker guard above cannot protect it — this is a dedicated guard for
+  exactly that gap (same shape as the `delivery:partial` guard, one cycle later).
 - No signal → **keep**. A stale **unmerged** branch contributes nothing.
 
 ## Durable prevention — commit convention (fixes the sibling root cause)

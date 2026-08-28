@@ -142,6 +142,43 @@ eq "open-marker beats partial+signals → keep (open-marker reason)" \
 eq "not-partial + marker signal → still closes normally" \
    "$(janitor_decide 0 0 0 1 0 0 0 0)" "close:terminal-gate-marker-passed"
 
+# ── 1a5. janitor_decide is_daemon_hold — pending-restart ≠ delivered (ga-l7n3v) ──
+# quality-gate-dispatcher.sh's BUG/TASK close path closes the GATE MARKER as
+# gate-status:passed (terminal) BEFORE it decides whether to close or hold the
+# SOURCE bead — so by the time a daemon-verification failure holds the source bead
+# (labels it delivery:pending-restart, leaves it in_progress+unassigned), the
+# has_open_marker guard above can no longer protect it: the marker isn't open
+# anymore. Every real merge signal (the fix's own commits citing the bead id;
+# the now-closed gate-status:passed marker) fires normally on the very next
+# 15-minute sweep — reproducing the ga-f54ui shape verbatim via a different
+# dispatcher-side hold label. Same fix, same precedence tier as is_delivery_partial.
+echo "── 1a5. janitor_decide is_daemon_hold (pending-restart ≠ delivered, ga-l7n3v) ──"
+eq "backward-compat: 8 args, no 9th → unaffected (defaults to 0)" \
+   "$(janitor_decide 0 0 0 0 0 0 0 0)" "keep:no-merge-evidence"
+eq "backward-compat: 8 args + marker signal, no 9th → still closes" \
+   "$(janitor_decide 0 0 0 1 0 0 0 0)" "close:terminal-gate-marker-passed"
+eq "daemon-hold + marker signal → KEEP (the ga-l7n3v false-close this fix prevents)" \
+   "$(janitor_decide 0 0 0 1 0 0 0 0 1)" "keep:daemon-verification-pending-restart"
+eq "daemon-hold + commit signal → KEEP (the fix's own commits merging proves nothing about daemon liveness)" \
+   "$(janitor_decide 0 0 1 0 0 0 0 0 1)" "keep:daemon-verification-pending-restart"
+eq "daemon-hold + branch signal → KEEP (branch-ancestor is the same merged-code evidence)" \
+   "$(janitor_decide 0 0 0 0 1 0 0 0 1)" "keep:daemon-verification-pending-restart"
+eq "daemon-hold + every signal at once → KEEP (guard beats all three uniformly)" \
+   "$(janitor_decide 0 0 1 1 1 0 0 0 1 | cut -d: -f1)" "keep"
+# Guard precedence unchanged: epic/open-marker/delivery-partial still beat a
+# daemon-hold bead too (their own reason wins — is_daemon_hold does not need
+# to be checked at all).
+eq "epic beats daemon-hold+signals → keep (epic reason, not daemon-hold reason)" \
+   "$(janitor_decide 1 0 1 1 1 0 0 0 1)" "keep:epic-parent-never-autoclosed"
+eq "open-marker beats daemon-hold+signals → keep (open-marker reason)" \
+   "$(janitor_decide 0 1 1 1 1 0 0 0 1)" "keep:active-open-gate-marker"
+eq "delivery-partial beats daemon-hold+signals → keep (partial reason, checked first)" \
+   "$(janitor_decide 0 0 1 1 1 0 0 1 1)" "keep:delivery-partial-unresolved-scope"
+# Fixture CONTROLE (mirrors ga-f54ui's own control fixture): NOT daemon-hold (0) →
+# every signal closes exactly as before. The fix must not turn every close into a hold.
+eq "not-daemon-hold + marker signal → still closes normally" \
+   "$(janitor_decide 0 0 0 1 0 0 0 0 0)" "close:terminal-gate-marker-passed"
+
 # ── 1b. janitor_story_decide — merged story:approved → story:done (ga-gosfs) ──
 # Args: <is_epic> <has_open_marker> <already_done> <in_flight> <has_builder>
 #       <delivery_active> <sig_commit> <sig_marker> <sig_branch>
@@ -1137,6 +1174,42 @@ if grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$
   ok "story sweep's janitor_story_decide call deliberately untouched (no delivery:partial label ever reaches a story bead)"
 else
   bad "story sweep's janitor_story_decide call signature changed unexpectedly — re-check ga-f54ui's story-sweep-exclusion rationale"
+fi
+
+# ── 16. Drift-guard: ga-l7n3v delivery:pending-restart not a merge signal ────
+# quality-gate-dispatcher.sh's BUG/TASK close path closes the gate MARKER as
+# gate-status:passed (terminal) BEFORE deciding whether to close or hold the
+# SOURCE bead on a daemon-verification failure — so has_open_marker (the guard
+# that already protects a delivery:partial-shaped hold) can never fire for a
+# daemon-hold bead: the marker isn't open by the time the hold label lands.
+# Must be wired into BOTH bug/task-shaped call sites, same as ga-f54ui — the
+# story sweep is deliberately UNTOUCHED: delivery:pending-restart is only ever
+# stamped inside quality-gate-dispatcher.sh's `else` branch, reached only when
+# IS_STORY != 1, so a story bead never receives it in the first place.
+echo "── 16. Drift-guard: ga-l7n3v delivery:pending-restart not a merge signal ──"
+grep -qF 'is_daemon_hold="${9:-0}"' "$JANITOR" \
+  && ok "janitor_decide accepts optional is_daemon_hold (backward-compatible default)" \
+  || bad "janitor_decide missing is_daemon_hold param"
+grep -qF 'keep:daemon-verification-pending-restart' "$JANITOR" \
+  && ok "daemon-hold keep reason is distinguishable from generic no-merge-evidence" \
+  || bad "daemon-verification-pending-restart reason missing"
+grep -qF 'printf '"'"'%s'"'"' "$b" | jq -e '"'"'(.labels // []) | index("delivery:pending-restart")'"'"' >/dev/null 2>&1 \' "$JANITOR" \
+  && ok "in_progress sweep computes IS_DAEMON_HOLD from the bead's own labels" \
+  || bad "in_progress sweep not computing IS_DAEMON_HOLD"
+grep -qF 'printf '"'"'%s'"'"' "$f" | jq -e '"'"'(.labels // []) | index("delivery:pending-restart")'"'"' >/dev/null 2>&1 \' "$JANITOR" \
+  && ok "ga-hcj4 stranded-wrapper sweep computes F_DAEMON_HOLD from the bead's own labels" \
+  || bad "ga-hcj4 sweep not computing F_DAEMON_HOLD"
+grep -qF 'janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SIG_BRANCH" "$SIG_COMMIT_STALE" "$SIG_MK_SUPER" "$IS_DELIV_PARTIAL" "$IS_DAEMON_HOLD"' "$JANITOR" \
+  && ok "in_progress sweep threads is_daemon_hold into janitor_decide" \
+  || bad "in_progress sweep not threading is_daemon_hold"
+grep -qF 'janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE" "$F_SIGMK_SUPER" "$F_DELIV_PARTIAL" "$F_DAEMON_HOLD"' "$JANITOR" \
+  && ok "ga-hcj4 stranded-wrapper sweep threads is_daemon_hold into janitor_decide" \
+  || bad "ga-hcj4 sweep not threading is_daemon_hold"
+if grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER"' "$JANITOR" \
+   && ! grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_' "$JANITOR"; then
+  ok "story sweep's janitor_story_decide call deliberately untouched (no delivery:pending-restart label ever reaches a story bead)"
+else
+  bad "story sweep's janitor_story_decide call signature changed unexpectedly — re-check ga-l7n3v's story-sweep-exclusion rationale"
 fi
 
 echo ""
