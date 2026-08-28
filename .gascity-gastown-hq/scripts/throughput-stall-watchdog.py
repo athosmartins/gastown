@@ -192,6 +192,46 @@ DELIVERY_COOLDOWN_SEC = int(os.environ.get("TSW_DELIVERY_COOLDOWN_SEC", "10800")
 # honor TSW_BD_TIMEOUT, now it honors GATE_QUEUE_BD_TIMEOUT shared with the
 # reconciler), not a side effect.
 
+# ── ga-0f420: ghost-slot knobs ────────────────────────────────────────────────
+# GHOST SLOT: a story:in-flight bead whose assignee does not match a live
+# (reclaim_liveness.session_is_live) builder session — REGARDLESS of how
+# recently its bd updated_at moved. This is the gap delivery_signal() above
+# cannot see: its staleness clock only ever considers a bead once
+# `now - updated_at > DELIVERY_STALL_HOURS`, so a bead touched recently by
+# something unrelated to real progress (an automated relabel, a passerby
+# comment) never enters that check at all, however long its dispatch-lane
+# slot has actually gone unattended. (The two beads that motivated this —
+# wa-t7mti, wa-k65jw — both had a RECENT updated_at and would have sailed
+# past the staleness gate forever while still holding the slot.)
+#
+# Excludes gate-resident beads (a healthy gate-status:queued marker already
+# exists for them): those correctly have no builder session, because the
+# build finished and the session exited — the bead is waiting on the GATE
+# QUEUE, a different resource than the dispatch lane. Mirrors the Pilot's own
+# IN_FLIGHT_GATE_RESIDENT exclusion (pilot-dispatcher.sh) and this file's own
+# delivery_signal() ga-g0v96 "explained" bucket, same reasoning.
+#
+# Deliberately narrower than delivery_signal()'s _real_progress_verdict: no
+# branch-recency fallback, no park/next-action exclusion. The bead's own spec
+# (ga-0f420) is exactly "assignee empty or dead session" — adding more
+# mitigating signals here would blur a lane-occupancy check into a delivery-
+# progress check, which is a different question already answered above. A
+# bead genuinely parked pending a Mayor decision (next-action:mayor) that
+# also goes ghost-eligible is the SAME pre-existing gap delivery_signal()
+# already has for the identical shape — orthogonal to this bug, not
+# introduced by it.
+GHOST_SLOT_MIN_BEADS = int(os.environ.get("TSW_GHOST_SLOT_MIN_BEADS", "1"))
+GHOST_SLOT_CONFIRM_SWEEPS = int(os.environ.get("TSW_GHOST_SLOT_CONFIRM_SWEEPS", "2"))
+GHOST_SLOT_COOLDOWN_SEC = int(os.environ.get("TSW_GHOST_SLOT_COOLDOWN_SEC", "10800"))  # 3h
+# Mirrors pilot-dispatcher.sh's MAX_SMALL/MAX_BIG defaults (5/2) — an
+# INDEPENDENT knob (this daemon has its own launchd job/env, not the Pilot's),
+# used only to frame the escalation's capacity-cost line. Keep in sync with
+# pilot-dispatcher.sh if its default ever changes; drift here only makes the
+# cost annotation approximate — it never affects detection itself (the ghost
+# count/ids come straight from bd + session liveness, not from this cap).
+GHOST_SLOT_MAX_SMALL = int(os.environ.get("TSW_GHOST_SLOT_MAX_SMALL", "5"))
+GHOST_SLOT_MAX_BIG = int(os.environ.get("TSW_GHOST_SLOT_MAX_BIG", "2"))
+
 # ── imp24: heal-action branch knobs ──────────────────────────────────────────
 # When TSW_HEAL_ENABLED=1, before escalating a confirmed throughput or delivery
 # stall the watchdog first attempts auto-heal by invoking funnel-flow-healer.sh.
@@ -1450,6 +1490,304 @@ def _tick_delivery(now, state):
     return True
 
 
+# ── ga-0f420: ghost-slot signal ───────────────────────────────────────────────
+def ghost_slot_signal(now):
+    """Returns (ghost_count, ghost_sample, occupancy) for story:in-flight beads
+    holding a dispatch-lane slot with no live owning session.
+
+    A bead is a GHOST SLOT when it carries story:in-flight, is NOT gate-resident
+    (no healthy gate-status:queued marker — see the knob-block comment above for
+    why), does not have a LIVE separate sling/wrapper bead (pilot.sling_bead —
+    see the ga-9ni9w note inline below for why this check exists and why it is
+    carefully skipped for a SELF-referential sling), and its own assignee does
+    not match a live session per reclaim_liveness.session_is_live (covers both
+    an EMPTY assignee and an assignee naming a dead/absent one — session_is_live
+    already returns False for both, see its own docstring). Unlike
+    delivery_signal(), none of this gates on bd updated_at staleness — a ghost
+    slot can carry an arbitrarily recent updated_at and still be a ghost (that
+    recency is exactly what let the two motivating beads slip past every
+    existing watchdog).
+
+    occupancy = {"lane_total": {"small": N, "big": N}, "lane_ghost": {"small": N, "big": N}}
+    — per-lane counts of non-gate-resident in-flight beads this sweep actually
+    saw, and how many of those are ghosts. Lane is read from the bead's own
+    lane:big/lane:small label (the Pilot tags this at dispatch time, per its own
+    docstring: "Tagged on dispatch ... so in-flight counting works"); a bead
+    carrying neither label is folded into "small", matching the Pilot's own
+    IN_FLIGHT_UNCLASSIFIED-counts-toward-small accounting.
+
+    On any bd-query error, OR when the session probe itself is unreadable
+    (fail-open — "no live sessions found" is NOT the same as "confirmed no
+    live session", see [[error-and-empty-must-not-produce-the-same-value]]),
+    returns (None, [], {}) — never a false alert.
+    Test seam: reuses _bd_delivery(rig_root) (same story:in-flight population
+    delivery_signal() reads — Pilot sets story:in-flight on dispatch, so both
+    dimensions are reading the identical bd label), _active_sessions(),
+    _bd_marker_for_bead (via _queued_marker_state), and _bd_sling_state (via
+    _sling_bead_state) — no new seam needed."""
+    beads_by_id = {}
+    root_by_id = {}
+    at_least_one_success = False
+
+    for root in RIG_ROOTS:
+        root = root.strip()
+        if not root:
+            continue
+        if _bd_delivery is not None:
+            beads = _bd_delivery(root)
+            at_least_one_success = True
+        else:
+            r = _sh([BD_BIN, "-C", root, "list", "-l", "story:in-flight",
+                     "--status", "open", "--json", "-n", "100"],
+                    timeout=BD_TIMEOUT)
+            if r is None or r.returncode != 0:
+                _log("ghost_slot_signal: bd list story:in-flight in %s failed (rc=%s) — skipping" % (
+                     root, r.returncode if r else "err"))
+                continue
+            at_least_one_success = True
+            beads = _parse_bd_json(r.stdout)
+
+        if beads is None:
+            continue
+        for b in beads:
+            if not isinstance(b, dict):
+                continue
+            bid = b.get("id") or b.get("issue_id") or ""
+            if not bid or bid in beads_by_id:
+                continue
+            beads_by_id[bid] = b
+            root_by_id[bid] = root
+
+    if not at_least_one_success:
+        _log("ghost_slot_signal: all bd queries failed — ERROR (fail-open)")
+        return None, [], {}
+
+    if _active_sessions is not None:
+        sessions = _active_sessions()
+    else:
+        try:
+            sessions = reclaim_liveness.list_active_sessions()
+        except Exception as e:
+            _log("ghost_slot_signal: list_active_sessions errored: %s" % e)
+            sessions = None
+
+    if sessions is None:
+        _log("ghost_slot_signal: session probe unreadable — cannot assess liveness "
+             "this tick (fail-open, no false alert)")
+        return None, [], {}
+
+    ghosts = []
+    lane_total = {"small": 0, "big": 0}
+    lane_ghost = {"small": 0, "big": 0}
+    for bid, b in beads_by_id.items():
+        root = root_by_id[bid]
+        raw_labels = b.get("labels") or b.get("label") or []
+        if isinstance(raw_labels, list):
+            labels = {str(l).strip() for l in raw_labels}
+        elif isinstance(raw_labels, str):
+            labels = {x.strip() for x in raw_labels.split(",") if x.strip()}
+        else:
+            labels = set()
+        lane = "big" if "lane:big" in labels else "small"
+
+        # Gate-resident: a healthy queued gate marker means the build already
+        # finished and the builder session correctly exited — this bead is
+        # waiting on the gate queue, a DIFFERENT resource than the dispatch
+        # lane (mirrors the Pilot's own IN_FLIGHT_GATE_RESIDENT exclusion —
+        # gate-resident beads are filtered out before lane accounting).
+        # Never a ghost, never counted toward lane_total either.
+        # "error" (probe failed) falls through to the checks below, same
+        # fail-open direction delivery_signal() already uses for this exact
+        # tri-state — an unreadable probe must never SUPPRESS a real anomaly
+        # just because this diagnostic itself failed.
+        marker_verdict, _marker = _queued_marker_state(root, bid)
+        if marker_verdict == "found":
+            continue
+
+        # A non-gate-resident in-flight bead legitimately occupies a dispatch
+        # slot regardless of what the checks below conclude — count it here,
+        # before either can `continue` past it.
+        lane_total[lane] = lane_total.get(lane, 0) + 1
+
+        # ga-9ni9w-style sling awareness: pilot's HQ-native "fix bug"/"build
+        # story" dispatch shape puts the REAL assignee on a SEPARATE wrapper
+        # bead (pilot.sling_bead), never on this story — delivery_signal()
+        # already had to learn this the hard way (checking only the story's
+        # own signal false-positived every sling-dispatched story). Reuse the
+        # exact same bridge here: a live (open + recently-touched) sling means
+        # real work is plausibly in flight, so skip the story from ghost
+        # consideration — same "live"/"stale"/"absent"/"error" fall-through
+        # delivery_signal() already uses (only "live" skips; the other three
+        # fall through to the assignee check below, unchanged).
+        #
+        # CRITICAL: only for a sling DIFFERENT from this bead's own id.
+        # ga-mfeip's routed-pool pattern (confirmed live 2026-08-28 for every
+        # current whatsapp_automation in-flight bead) stamps
+        # pilot.sling_bead == the story's OWN id — the story IS the dispatched
+        # unit. Applying the sling-liveness check there would look up this
+        # SAME bead's own updated_at, i.e. exactly the clock ga-0f420 exists
+        # to stop trusting (the two motivating ghosts both had a fresh
+        # updated_at) — silently re-opening the bug this fix closes.
+        sling_id = ((b.get("metadata") or {}).get("pilot.sling_bead") or "").strip()
+        if sling_id and sling_id != bid:
+            sling_verdict, _sling_hours = _sling_bead_state(sling_id, now)
+            if sling_verdict == "live":
+                continue
+
+        assignee = b.get("assignee") or ""
+        if not reclaim_liveness.session_is_live(assignee, sessions, now):
+            ghosts.append({"id": bid, "title": (b.get("title") or b.get("name") or "?")[:80],
+                           "assignee": assignee or "(nenhum)", "lane": lane})
+            lane_ghost[lane] = lane_ghost.get(lane, 0) + 1
+
+    occupancy = {"lane_total": lane_total, "lane_ghost": lane_ghost}
+    return len(ghosts), ghosts[:5], occupancy
+
+
+def _escalate_ghost_slot(count, sample, occupancy, now):
+    """Notify + mail Mayor on confirmed ghost slot(s) (ga-0f420).
+
+    DETECTION-ONLY — never touches the bead itself (no label removal, no
+    reclaim). Distinguishing a genuine ghost from a worker that just spawned
+    and hasn't appeared in `gc session list` yet is a real race;
+    GHOST_SLOT_CONFIRM_SWEEPS exists to absorb it — clearing a bead's claim
+    mid-transition would hand its work back to the pool while a live builder
+    still holds it. The Mayor reclaims by hand with the ids below — see
+    CLAUDE.md's manual-reclaim wrapper (packs/town-deltas/assets/
+    pilot-manual-reclaim.sh), never raw `bd reclaim`, which leaves Pilot's own
+    claim markers (pilot:dispatched/dispatching) behind and makes the bead
+    invisible to re-dispatch even after status flips back to open."""
+    lane_total = occupancy.get("lane_total", {})
+    lane_ghost = occupancy.get("lane_ghost", {})
+    caps = {"small": GHOST_SLOT_MAX_SMALL, "big": GHOST_SLOT_MAX_BIG}
+
+    notify_msg = ("GHOST SLOT: %d bead(s) story:in-flight sem sessão viva ocupando a lane — "
+                  "vazão pode estar estrangulada em silêncio. Mayor notificado." % count)
+    subject = "Watchdog: GHOST SLOT — %d bead(s) in-flight sem dono vivo" % count
+
+    lines = [
+        "WATCHDOG DE VAZÃO: slot(s) fantasma — bead in-flight sem sessão viva segurando a lane",
+        "",
+        "Beads story:in-flight cujo assignee NÃO casa uma sessão ativa (amostra — até 5):",
+    ]
+    for b in sample:
+        lines.append("  • %s — %s (lane:%s, assignee=%s)" % (
+            b["id"], b["title"], b["lane"], b["assignee"]))
+    if not sample:
+        lines.append("  (sem amostra — ver contagem acima)")
+
+    lines += ["", "CUSTO MEDIDO (por lane, exclui beads em gate review):"]
+    for lane in ("small", "big"):
+        total = lane_total.get(lane, 0)
+        ghost = lane_ghost.get(lane, 0)
+        if total == 0 and ghost == 0:
+            continue
+        cap = caps.get(lane, 0)
+        occupied_live = max(0, total - ghost)
+        free_now = max(0, cap - total)
+        free_if_reclaimed = max(0, cap - occupied_live)
+        lines.append(
+            "  lane:%s — %d/%d vaga(s) ocupada(s), %d fantasma. "
+            "Capacidade efetiva livre: %d agora -> %d se os fantasmas forem liberados." % (
+                lane, total, cap, ghost, free_now, free_if_reclaimed))
+
+    # Best-effort backlog annotation ("candidatos esperando") — never let a
+    # failure here block the core ghost alert, which is the urgent part.
+    try:
+        backlog_count, _backlog_sample = backlog_signal()
+    except Exception as e:
+        _log("ghost_slot escalate: backlog_signal() errored: %s — omitting candidate count" % e)
+        backlog_count = None
+    if backlog_count is not None:
+        total_backlog = (sum(backlog_count.values())
+                         if isinstance(backlog_count, dict) else backlog_count)
+        lines.append("")
+        lines.append("Candidatos esperando (story:approved/ctx:ready, não-braked): %d" % total_backlog)
+
+    lines += [
+        "",
+        "NÃO É AUTO-REPARADOR — este watchdog só detecta. Pra liberar:",
+        "  packs/town-deltas/assets/pilot-manual-reclaim.sh <bead-id> [rig-path]",
+        "  (nunca `bd reclaim` cru — deixa pilot:dispatched/dispatching presos e",
+        "  o bead some do re-despacho mesmo depois de status voltar a 'open')",
+        "",
+        "Antes de reclamar, confirme que a sessão realmente morreu:",
+        "  gc session list | grep <assignee>",
+        "  bd -C <rig> show <bead-id> --json | jq '.[0] | {assignee, updated_at, labels}'",
+    ]
+    body = "\n".join(lines)
+
+    _tsw_ledger("human-touch", {
+        "ts": _tsw_datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source_daemon": "throughput-stall-watchdog",
+        "stage": "vazao",
+        "kind": "technical",
+        "bead_id": sample[0]["id"] if sample else "",
+        "reason": notify_msg,
+    }, fail_open=True)
+
+    if DRY_RUN:
+        _log("DRY_RUN: would escalate ghost slot: %r" % notify_msg)
+        return
+
+    if _do_notify is not None:
+        _do_notify(notify_msg, 4)
+    else:
+        _sh([NOTIFY_BIN, "-t", "Ghost slot", "-p", "4", notify_msg], timeout=10)
+
+    if _do_mail_mayor is not None:
+        _do_mail_mayor(subject, body)
+    else:
+        _sh([GC_BIN, "mail", "send", MAYOR_ADDR, "-s", subject, "-m", body, "--notify"],
+            timeout=45)
+
+
+def _tick_ghost_slot(now, state):
+    """Handle the ghost-slot dimension (ga-0f420).
+
+    Fires when >= GHOST_SLOT_MIN_BEADS story:in-flight beads have no live
+    owning session, for GHOST_SLOT_CONFIRM_SWEEPS consecutive ticks — the
+    slot-occupancy gap delivery_signal()'s updated_at-staleness clock cannot
+    see (a ghost's bd row can be touched arbitrarily recently by something
+    unrelated to real progress and never trip that check). Runs every tick,
+    independent of the other dimensions.
+
+    DETECTION-ONLY: unlike _tick_delivery, this never calls _attempt_heal —
+    the bug this fixes explicitly asks for detection + escalation, not an
+    auto-reclaim action (see _escalate_ghost_slot's docstring for why)."""
+    state.setdefault("ghost_pending", 0)
+    state.setdefault("ghost_last_escalate", 0.0)
+
+    count, sample, occupancy = ghost_slot_signal(now)
+    if count is None:
+        _log("ghost_slot_signal ERROR → fail-open (no ghost-slot verdict)")
+        state["ghost_pending"] = 0
+        return False
+
+    if count < GHOST_SLOT_MIN_BEADS:
+        if state["ghost_pending"] > 0:
+            _log("ghost_slot: no ghost beads (count=%d) — cleared" % count)
+        state["ghost_pending"] = 0
+        return False
+
+    state["ghost_pending"] += 1
+    _log("ghost_slot: %d in-flight bead(s) with no live owner (pending=%d/%d)" % (
+         count, state["ghost_pending"], GHOST_SLOT_CONFIRM_SWEEPS))
+
+    if state["ghost_pending"] < GHOST_SLOT_CONFIRM_SWEEPS:
+        return False
+
+    if (now - state["ghost_last_escalate"]) <= GHOST_SLOT_COOLDOWN_SEC:
+        _log("ghost_slot: confirmed but within cooldown — suppressing")
+        return False
+
+    _log("GHOST-SLOT ESCALATING: %d in-flight bead(s) with no live owner (confirmed %d sweeps)" % (
+         count, state["ghost_pending"]))
+    _escalate_ghost_slot(count, sample, occupancy, now)
+    state["ghost_last_escalate"] = now
+    return True
+
+
 # ── imp12: quota check ────────────────────────────────────────────────────────
 def _check_quota():
     """Return True if Claude quota is available (not exhausted). imp12.
@@ -1539,6 +1877,9 @@ def _load_state():
                 # imp11 keys (backward-compat: absent in pre-imp11 state files)
                 d.setdefault("heal_attempt_count", 0)
                 d.setdefault("consecutive_escalations", 0)
+                # ga-0f420 keys (backward-compat: absent in pre-ga-0f420 state files)
+                d.setdefault("ghost_pending", 0)
+                d.setdefault("ghost_last_escalate", 0.0)
                 return d
     except Exception:
         pass
@@ -1547,7 +1888,8 @@ def _load_state():
             "dolt_pending": 0, "dolt_last_escalate": 0.0,
             "delivery_pending": 0, "delivery_last_escalate": 0.0,
             "heal_last_attempt": 0.0,
-            "heal_attempt_count": 0, "consecutive_escalations": 0}
+            "heal_attempt_count": 0, "consecutive_escalations": 0,
+            "ghost_pending": 0, "ghost_last_escalate": 0.0}
 
 
 def _save_state(state):
@@ -1705,6 +2047,9 @@ def run_tick(now, state):
 
     # imp23: delivery-stall check (runs every tick, independent of throughput stall)
     _tick_delivery(now, state)
+
+    # ga-0f420: ghost-slot check (runs every tick, independent of the other dimensions)
+    _tick_ghost_slot(now, state)
 
     if is_blind:
         # Blind sweep: skip stall logic entirely (can't make a verdict).
@@ -2021,7 +2366,8 @@ def _selftest():
                 "dolt_pending": 0, "dolt_last_escalate": 0.0,
                 "delivery_pending": 0, "delivery_last_escalate": 0.0,
                 "heal_last_attempt": 0.0,
-                "heal_attempt_count": 0, "consecutive_escalations": 0}
+                "heal_attempt_count": 0, "consecutive_escalations": 0,
+                "ghost_pending": 0, "ghost_last_escalate": 0.0}
 
     def _stub_mail(subject, body):
         mail_calls.append((subject, body))
@@ -3378,6 +3724,211 @@ def _selftest():
         _ok("ga-lda92s-3: ordinary daytime gap still increments pending on first tick (unaffected by this fix)")
     else:
         _bad("ga-lda92s-3", "pending=%d (daytime gap has nothing to discount, should behave exactly as before this fix)" % st2["pending"])
+
+    # ── ga-0f420: ghost-slot scenarios ────────────────────────────────────────
+    # Quiet every OTHER dimension so only ghost-slot activity shows up below —
+    # same idiom imp23 Scenario L uses to isolate its own dimension.
+    _read_pilot_log_lines = lambda: _pilot_lines(0, 3)   # no dispatch
+    _read_gate_log_lines  = lambda: []
+    _git_log_count        = lambda root, since: 0
+    _bd_backlog           = lambda root: []              # no ready work (avoid throughput-stall noise)
+    _do_dolt_probe        = lambda: 0
+    _bd_marker_for_bead   = lambda root, bead_id: ("absent", None)
+    _bd_sling_state       = lambda sling_id: ("absent", None)
+
+    def _ghost_bead(bid, minutes_ago=5, assignee="", sling_bead=None, lane="small"):
+        """A story:in-flight bead with a RECENT updated_at (minutes, not hours) —
+        the exact shape delivery_signal()'s staleness clock can never see."""
+        ts_epoch = NOW - minutes_ago * 60
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts_epoch))
+        b = {"id": bid, "title": "Ghost candidate %s" % bid,
+             "labels": ["story:in-flight", "pilot:dispatched", "lane:%s" % lane],
+             "updated_at": ts, "assignee": assignee}
+        if sling_bead is not None:
+            b["metadata"] = {"pilot.sling_bead": sling_bead}
+        return b
+
+    # ── GS1: the actual bug — RECENT updated_at + no live owner → delivery_signal()
+    # would NEVER catch this (never goes stale), ghost_slot_signal() must. ──────
+    print("\nga-0f420 Scenario GS1: bead with RECENT updated_at + no live session → "
+          "delivery_signal() blind to this (never stale), ghost-slot catches it after "
+          "%d sweeps" % GHOST_SLOT_CONFIRM_SWEEPS)
+    _bd_delivery    = lambda root: [_ghost_bead("wa-t7mti", minutes_ago=5)]
+    _active_sessions = lambda: []   # no live session anywhere
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    ghost_notifies_gs1a = [n for n in notify_calls if "GHOST" in n[0].upper()]
+    if st.get("ghost_pending", 0) == 1 and not ghost_notifies_gs1a:
+        _ok("GS1a: first sweep → ghost_pending=1, no notify yet")
+    else:
+        _bad("GS1a", "ghost_pending=%d notifies=%d" % (st.get("ghost_pending", 0), len(ghost_notifies_gs1a)))
+    run_tick(NOW + 1800, st)
+    ghost_notifies_gs1b = [n for n in notify_calls if "GHOST" in n[0].upper()]
+    ghost_mails_gs1b = [m for m in mail_calls if "GHOST" in m[0].upper()]
+    if ghost_notifies_gs1b and ghost_mails_gs1b and "wa-t7mti" in ghost_mails_gs1b[0][1]:
+        _ok("GS1b: second sweep → ghost-slot escalates, mail names the bead (the actual "
+            "wa-t7mti/wa-k65jw bug this fixes)")
+    else:
+        _bad("GS1b", "notifies=%d mails=%d" % (len(ghost_notifies_gs1b), len(ghost_mails_gs1b)))
+    if st.get("delivery_pending", 0) == 0:
+        _ok("GS1c: delivery_pending stayed 0 throughout — proves this really is a gap "
+            "delivery_signal()'s own staleness clock cannot see, not a duplicate finding")
+    else:
+        _bad("GS1c", "delivery_pending=%d (expected 0 — updated_at never went stale)" % st.get("delivery_pending", 0))
+
+    # ── GS2: bead's assignee matches a LIVE session → never a ghost, no matter
+    # how many sweeps (the bead's own explicit negative-fixture ask). ─────────
+    print("\nga-0f420 Scenario GS2: bead with a LIVE session assignee → never escalates")
+    # ga-nxgxz Scenario 2's own lesson applies here too: session_activity_age()
+    # computes (tick_now - last_active), and each simulated tick below advances
+    # `now` by 1800s — a last_active fixed at NOW alone would read "stale"
+    # (> 30min TTL) by the 2nd tick and defeat the very liveness this scenario
+    # means to test. Anchor it fresh relative to the LAST tick instead.
+    _gs2_last_tick = NOW + 2 * 1800
+    _gs2_fresh_ts = _tsw_datetime.datetime.fromtimestamp(
+        _gs2_last_tick - 60, tz=_tsw_datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _active_sessions = lambda: [
+        {"id": "dog-galive1", "name": "dog-galive1", "session_name": "", "alias": "",
+         "agent_name": "", "state": "active", "last_active": _gs2_fresh_ts},
+    ]
+    _bd_delivery = lambda root: [_ghost_bead("wa-k65jw", minutes_ago=3, assignee="dog-galive1")]
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    for i in range(3):
+        run_tick(NOW + i * 1800, st)
+    ghost_notifies_gs2 = [n for n in notify_calls if "GHOST" in n[0].upper()]
+    if not ghost_notifies_gs2 and st.get("ghost_pending", 0) == 0:
+        _ok("GS2: assignee matches a live session → no ghost-slot alert across 3 sweeps")
+    else:
+        _bad("GS2", "ghost_pending=%d notifies=%d" % (st.get("ghost_pending", 0), len(ghost_notifies_gs2)))
+
+    # ── GS3: gate-resident (healthy queued marker) → excluded entirely, even
+    # with no assignee and no live session (mirrors delivery_signal()'s ga-g0v96
+    # "explained" exclusion — a finished build with an exited session is normal). ─
+    print("\nga-0f420 Scenario GS3: gate-resident bead (healthy queued marker) → "
+          "never a ghost, even with no live session")
+    _active_sessions = lambda: []
+    _bd_delivery = lambda root: [_ghost_bead("wa-gs3", minutes_ago=2)]
+    _bd_marker_for_bead = lambda root, bead_id: ("found", {"id": "ga-wisp-gs3"})
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    for i in range(4):
+        run_tick(NOW + i * 1800, st)
+    ghost_notifies_gs3 = [n for n in notify_calls if "GHOST" in n[0].upper()]
+    if not ghost_notifies_gs3 and st.get("ghost_pending", 0) == 0:
+        _ok("GS3: gate-resident bead never counted as a ghost slot, no matter how long "
+            "it sits with no live session (it's waiting on the gate queue, not the lane)")
+    else:
+        _bad("GS3", "ghost_pending=%d notifies=%d" % (st.get("ghost_pending", 0), len(ghost_notifies_gs3)))
+    _bd_marker_for_bead = lambda root, bead_id: ("absent", None)   # restore default
+
+    # ── GS4: NON-self-referential live sling (HQ-native cross-DB dispatch shape,
+    # ga-9ni9w) → the story's own empty assignee must NOT be flagged; the real
+    # work signal lives on the separate wrapper bead. ─────────────────────────
+    print("\nga-0f420 Scenario GS4: non-self-referential LIVE sling → story not flagged "
+          "even though its own assignee is empty (ga-9ni9w bridge)")
+    _bd_delivery = lambda root: [_ghost_bead("ga-gs4", minutes_ago=4, sling_bead="ga-gs4-sling")]
+    _bd_sling_state = lambda sling_id: ("live", 2 / 60.0) if sling_id == "ga-gs4-sling" else ("absent", None)
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    for i in range(4):
+        run_tick(NOW + i * 1800, st)
+    ghost_notifies_gs4 = [n for n in notify_calls if "GHOST" in n[0].upper()]
+    if not ghost_notifies_gs4 and st.get("ghost_pending", 0) == 0:
+        _ok("GS4: live non-self-referential sling suppresses the ghost check on the "
+            "story bead entirely (mirrors delivery_signal()'s own ga-9ni9w fix)")
+    else:
+        _bad("GS4", "ghost_pending=%d notifies=%d" % (st.get("ghost_pending", 0), len(ghost_notifies_gs4)))
+
+    # ── GS5: CRITICAL regression guard — a SELF-referential sling
+    # (pilot.sling_bead == the bead's own id, the ga-mfeip routed-pool pattern
+    # confirmed live for every current whatsapp_automation in-flight bead,
+    # 2026-08-28) must NOT hit the GS4 escape hatch — that would look up this
+    # SAME bead's own updated_at and silently re-open the exact bug ga-0f420
+    # exists to close (a fresh updated_at masking a true ghost). ─────────────
+    print("\nga-0f420 Scenario GS5: SELF-referential sling (pilot.sling_bead == own id, "
+          "the live routed-pool shape) must still escalate — regression guard against "
+          "the GS4 bridge silently swallowing the exact bug being fixed")
+    _bd_delivery = lambda root: [_ghost_bead("wa-gs5", minutes_ago=3, sling_bead="wa-gs5")]
+    # If GS4's bridge were mistakenly applied here, _bd_sling_state would be
+    # asked about "wa-gs5" (== the bead's own id) and — were it wired to the
+    # bead's own fresh updated_at, as production's real (unstubbed) code path
+    # would do — return "live", suppressing detection. Stubbing it "stale" here
+    # only proves the SKIP condition works when reached; GS5's real assertion is
+    # that the self-referential id must never reach _bd_sling_state at all for
+    # the "live" branch to matter — verified structurally by GS5b below.
+    _bd_sling_state = lambda sling_id: ("stale", GHOST_SLOT_COOLDOWN_SEC / 3600.0)
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    run_tick(NOW + 1800, st)
+    ghost_notifies_gs5 = [n for n in notify_calls if "GHOST" in n[0].upper()]
+    if ghost_notifies_gs5 and st.get("ghost_pending", 0) >= GHOST_SLOT_CONFIRM_SWEEPS:
+        _ok("GS5: self-referential sling still escalates — the routed-pool live shape "
+            "is not silently exempted")
+    else:
+        _bad("GS5", "ghost_pending=%d notifies=%d" % (st.get("ghost_pending", 0), len(ghost_notifies_gs5)))
+
+    print("\nga-0f420 Scenario GS5b: same self-referential bead, but _bd_sling_state "
+          "stubbed to fail the test if ever called with the bead's own id — proves the "
+          "sling bridge is structurally skipped (never reached), not just harmless here")
+    _gs5b_sling_calls = []
+
+    def _bd_sling_state_gs5b(sling_id):
+        _gs5b_sling_calls.append(sling_id)
+        return ("live", 0.01)   # would suppress detection if ever consulted
+    _bd_sling_state = _bd_sling_state_gs5b
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    run_tick(NOW + 1800, st)
+    ghost_notifies_gs5b = [n for n in notify_calls if "GHOST" in n[0].upper()]
+    if not _gs5b_sling_calls and ghost_notifies_gs5b:
+        _ok("GS5b: _bd_sling_state never consulted for a self-referential sling AND "
+            "the ghost still escalated (structural skip, not incidental)")
+    else:
+        _bad("GS5b", "sling_calls=%r notifies=%d" % (_gs5b_sling_calls, len(ghost_notifies_gs5b)))
+    _bd_sling_state = lambda sling_id: ("absent", None)   # restore default
+
+    # ── GS6: session probe itself unreadable → fail-open, never a false alert
+    # (mirrors ga-nxgxz Scenario 4's illegible-signal handling). ──────────────
+    print("\nga-0f420 Scenario GS6: session probe fails (None) → fail-open, no ghost alert")
+    _bd_delivery = lambda root: [_ghost_bead("wa-gs6", minutes_ago=2)]
+    _active_sessions = lambda: None   # probe failure — illegible, not "confirmed absent"
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    run_tick(NOW + 1800, st)
+    ghost_notifies_gs6 = [n for n in notify_calls if "GHOST" in n[0].upper()]
+    if not ghost_notifies_gs6 and st.get("ghost_pending", 0) == 0:
+        _ok("GS6: unreadable session probe → fail-open, no ghost-slot alert")
+    else:
+        _bad("GS6", "ghost_pending=%d notifies=%d" % (st.get("ghost_pending", 0), len(ghost_notifies_gs6)))
+    _active_sessions = lambda: []   # restore default
+
+    # ── GS7: cooldown suppresses re-escalation (mirrors imp23 Scenario L4). ──
+    print("\nga-0f420 Scenario GS7: cooldown suppresses re-escalation after a confirmed ghost")
+    _bd_delivery = lambda root: [_ghost_bead("wa-gs7", minutes_ago=6)]
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    run_tick(NOW + 1800, st)
+    if not [n for n in notify_calls if "GHOST" in n[0].upper()]:
+        _bad("GS7 setup", "expected the confirming escalation to fire before testing cooldown")
+    mail_calls.clear(); notify_calls.clear()
+    run_tick(NOW + 3600, st)
+    ghost_notifies_gs7 = [n for n in notify_calls if "GHOST" in n[0].upper()]
+    if not ghost_notifies_gs7:
+        _ok("GS7: cooldown suppresses re-escalation on ghost-slot")
+    else:
+        _bad("GS7: cooldown should suppress ghost-slot re-escalation", str(notify_calls))
+
+    # restore hermetic defaults so nothing here leaks past this block
+    _bd_delivery = lambda root: []
+    _active_sessions = lambda: []
+    _bd_marker_for_bead = lambda root, bead_id: ("absent", None)
+    _bd_sling_state = lambda sling_id: ("absent", None)
 
     # ── cleanup ───────────────────────────────────────────────────────────────────
     _read_pilot_log_lines = None
