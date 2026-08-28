@@ -134,6 +134,61 @@ overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"
 name = "ps-worker"
 overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"
 
+# ga-kjncp: long-lived roles (mayor, oracle, persistent crews) pay their
+# context cost in TURNS, not once — every turn resends the whole conversation,
+# so cost is average-context-size x turn-count, not final window size. The
+# 26/08 cost spike (ga-w6vbc) measured Oracle's own session at 1,748 turns /
+# 13 compactions (auto-compact only fires reactively, near ~967K tokens for
+# Sonnet 5's 1M window) -> average ~572K tokens/turn. Lowering the threshold
+# to 300K (still inside Claude Code's documented 100K-1M valid range for
+# EVERY model, so this is a safe no-op for any smaller-context model that
+# already compacts earlier out of necessity) drops the same session to an
+# estimated ~225K tokens/turn average -- ~60% less -- for a projected
+# compaction-overhead cost of ~22M extra tokens against ~600M saved (noise
+# by comparison). Pool roles already avoid this by doctrine (short sessions,
+# "find work -> execute -> exit") and are excluded here on purpose: applying
+# a lower threshold to them would be harmless but is not the driver (~72% of
+# measured cache-read volume comes from long-lived roles' in-session growth,
+# not the short-lived pool).
+# Tradeoff (not eliminated by this change, only bounded): Anthropic's docs do
+# not publish a quality/coherence cost for more frequent compaction -- treat
+# this as a monitored change, not a proven-safe one. If a long-lived role
+# starts visibly losing the thread of multi-hour work, that is the signal to
+# raise this number back up, not proof the whole approach is wrong.
+# Mechanism: overlay_dir stages .claude/settings.json's autoCompactWindow key
+# (Anthropic's documented settings.json equivalent of --autocompact) into
+# each session's workdir at spawn time, same JSON-merge path already proven
+# by the pool overlay above (internal/overlay/merge.go). Takes effect on each
+# role's NEXT session launch -- does not force-restart any currently-running
+# mayor/oracle/crew session.
+[[patches.agent]]
+name = "gastown.mayor"
+overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived"
+
+[[patches.agent]]
+name = "oracle-wa"
+overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived"
+
+[[patches.agent]]
+name = "mila-wa"
+overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived"
+
+[[patches.agent]]
+name = "batista-wa"
+overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived"
+
+[[patches.agent]]
+name = "digo-wa"
+overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived"
+
+[[patches.agent]]
+name = "thies-wa"
+overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived"
+
+[[patches.agent]]
+name = "peter-wa"
+overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived"
+
 [daemon]
 # nudge_dispatcher: EXPLICITAMENTE "legacy" — nao remova sem MEDIR (ga-yxuab).
 # O modo runtime (socket wake) e melhor no papel: o poll `gc nudge poll` por sessao
