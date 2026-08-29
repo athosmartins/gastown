@@ -1,0 +1,766 @@
+diff --git a/cmd/gc/cmd_sling.go b/cmd/gc/cmd_sling.go
+index 40d373425..929558c62 100644
+--- a/cmd/gc/cmd_sling.go
++++ b/cmd/gc/cmd_sling.go
+@@ -647,6 +647,9 @@ func printSlingWarnings(result sling.SlingResult, stderr io.Writer) {
+ 	if result.TargetImplicit {
+ 		fmt.Fprintf(stderr, "warning: %q is an implicit provider-derived agent, not an explicitly configured worker for this rig — it has no dedicated sessions and may take a long time (or never) to pick up this work; verify this is the intended target (use --force to suppress)\n", result.Target) //nolint:errcheck
+ 	}
++	if result.CannotReceiveWork {
++		fmt.Fprintf(stderr, "warning: %q has no live session and its provider cannot spawn one unattended\n", result.Target) //nolint:errcheck
++	}
+ 	for _, w := range result.BeadWarnings {
+ 		fmt.Fprintln(stderr, w) //nolint:errcheck
+ 	}
+diff --git a/cmd/gc/cmd_sling_test.go b/cmd/gc/cmd_sling_test.go
+index a80323c2e..32021af61 100644
+--- a/cmd/gc/cmd_sling_test.go
++++ b/cmd/gc/cmd_sling_test.go
+@@ -899,6 +899,76 @@ func TestDoSlingImplicitTargetWarnsAtCLI(t *testing.T) {
+ 	assertStoreRoutedTo(t, deps.Store, "BL-1", "whatsapp_automation/claude-headless")
+ }
+ 
++// TestDoSlingCannotReceiveWorkFailsHardAtCLI is a regression test for
++// ga-66wc/ga-a2w4h: `gc sling <target> <bead>` used to print success and
++// silently no-op when the target had no live session and its provider
++// could never spawn one unattended (e.g. a plain interactive "claude"
++// worker nobody has attached to yet) — the CLI output was indistinguishable
++// from a real success. Unlike TestDoSlingSuspendedAgentWarns/
++// TestDoSlingMultiSessionMaxZeroWarns/TestDoSlingImplicitTargetWarnsAtCLI
++// above (all warn-only, still route, exit 0), this condition must fail
++// hard: exit != 0, and the bead must not end up routed.
++func TestDoSlingCannotReceiveWorkFailsHardAtCLI(t *testing.T) {
++	runner := newFakeRunner()
++	sp := runtime.NewFake()
++	cfg := &config.City{
++		Workspace: config.Workspace{Name: "test-city"},
++		Providers: map[string]config.ProviderSpec{
++			"attached": {
++				Command:                 "attached-cmd",
++				RequiresAttachedSession: boolPtr(true),
++			},
++		},
++	}
++	a := config.Agent{Name: "solo-claude", Provider: "attached", MaxActiveSessions: intPtr(1)}
++
++	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
++	opts := testOpts(a, "BL-1")
++	code := doSling(opts, deps, nil, stdout, stderr)
++
++	if code == 0 {
++		t.Fatalf("doSling returned 0, want non-zero (target has no live session and cannot spawn unattended)")
++	}
++	if !strings.Contains(stderr.String(), "no live session") {
++		t.Errorf("stderr = %q, want a message about no live session", stderr.String())
++	}
++	if len(runner.calls) != 0 {
++		t.Errorf("got %d runner calls, want 0 — must not attempt to route a target that cannot receive work", len(runner.calls))
++	}
++	bead, err := deps.Store.Get("BL-1")
++	if err == nil && bead.Metadata["gc.routed_to"] != "" {
++		t.Errorf("bead should not be routed on hard failure, got gc.routed_to=%q", bead.Metadata["gc.routed_to"])
++	}
++}
++
++// TestDoSlingCannotReceiveWorkAllowsHeadlessProviderAtCLI verifies a
++// provider that CAN spawn unattended (the claude-headless shape) is
++// unaffected by the new check even with no live session yet — the
++// documented ~10s async-spawn path (see ga-66wc) must keep working.
++func TestDoSlingCannotReceiveWorkAllowsHeadlessProviderAtCLI(t *testing.T) {
++	runner := newFakeRunner()
++	sp := runtime.NewFake()
++	cfg := &config.City{
++		Workspace: config.Workspace{Name: "test-city"},
++		Providers: map[string]config.ProviderSpec{
++			"headless": {
++				Command:                 "headless-cmd",
++				RequiresAttachedSession: boolPtr(false),
++			},
++		},
++	}
++	a := config.Agent{Name: "headless-worker", Provider: "headless", MaxActiveSessions: intPtr(1)}
++
++	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
++	opts := testOpts(a, "BL-1")
++	code := doSling(opts, deps, nil, stdout, stderr)
++
++	if code != 0 {
++		t.Fatalf("doSling returned %d, want 0 (headless provider can spawn unattended)", code)
++	}
++	assertStoreRoutedTo(t, deps.Store, "BL-1", "headless-worker")
++}
++
+ func TestDoSlingImplicitTargetForceSuppressesWarningAtCLI(t *testing.T) {
+ 	runner := newFakeRunner()
+ 	sp := runtime.NewFake()
+diff --git a/internal/config/chain.go b/internal/config/chain.go
+index d5b55c7d5..224f0a8bc 100644
+--- a/internal/config/chain.go
++++ b/internal/config/chain.go
+@@ -396,6 +396,7 @@ func recordScalarProvenance(spec ProviderSpec, layer string, into map[string]str
+ 	set("path_check", spec.PathCheck)
+ 	setBool("supports_acp", spec.SupportsACP)
+ 	setBool("supports_hooks", spec.SupportsHooks)
++	setBool("requires_attached_session", spec.RequiresAttachedSession)
+ 	setBool("emits_permission_warning", spec.EmitsPermissionWarning)
+ 	setBool("accept_startup_dialogs", spec.AcceptStartupDialogs)
+ 	set("instructions_file", spec.InstructionsFile)
+diff --git a/internal/config/field_sync_test.go b/internal/config/field_sync_test.go
+index 70cbaabb0..86ac3cf2a 100644
+--- a/internal/config/field_sync_test.go
++++ b/internal/config/field_sync_test.go
+@@ -456,20 +456,21 @@ func TestProviderFieldSync(t *testing.T) {
+ 		// PermissionModes: reference lookup table, not intended for patching
+ 		"PermissionModes": "reference lookup table, not patched",
+ 		// Provider-identity fields that don't belong on a patch
+-		"DisplayName":            "identity/display field, not patched",
+-		"PathCheck":              "internal PATH override, not patched",
+-		"ReadyPromptPrefix":      "internal ready detection, not patched",
+-		"ProcessNames":           "reference list, not currently patched",
+-		"EmitsPermissionWarning": "tri-state *bool; merged via MergeProviderOverBuiltin, not ProviderPatch",
+-		"SupportsACP":            "tri-state *bool; merged via MergeProviderOverBuiltin, not ProviderPatch",
+-		"SupportsHooks":          "tri-state *bool; merged via MergeProviderOverBuiltin, not ProviderPatch",
+-		"InstructionsFile":       "internal config path, not patched",
+-		"ResumeFlag":             "internal resume config, not patched directly (use ResumeCommand)",
+-		"ResumeStyle":            "internal resume config, not patched directly (use ResumeCommand)",
+-		"ResumeCommand":          "already patchable at agent level via AgentPatch.ResumeCommand",
+-		"SessionIDFlag":          "internal session-id config, not patched",
+-		"PrintArgs":              "internal print-mode args, not patched",
+-		"TitleModel":             "internal title-model key, not patched",
++		"DisplayName":             "identity/display field, not patched",
++		"PathCheck":               "internal PATH override, not patched",
++		"ReadyPromptPrefix":       "internal ready detection, not patched",
++		"ProcessNames":            "reference list, not currently patched",
++		"EmitsPermissionWarning":  "tri-state *bool; merged via MergeProviderOverBuiltin, not ProviderPatch",
++		"SupportsACP":             "tri-state *bool; merged via MergeProviderOverBuiltin, not ProviderPatch",
++		"SupportsHooks":           "tri-state *bool; merged via MergeProviderOverBuiltin, not ProviderPatch",
++		"RequiresAttachedSession": "tri-state *bool; merged via MergeProviderOverBuiltin, not ProviderPatch",
++		"InstructionsFile":        "internal config path, not patched",
++		"ResumeFlag":              "internal resume config, not patched directly (use ResumeCommand)",
++		"ResumeStyle":             "internal resume config, not patched directly (use ResumeCommand)",
++		"ResumeCommand":           "already patchable at agent level via AgentPatch.ResumeCommand",
++		"SessionIDFlag":           "internal session-id config, not patched",
++		"PrintArgs":               "internal print-mode args, not patched",
++		"TitleModel":              "internal title-model key, not patched",
+ 	}
+ 
+ 	// Fields on ProviderPatch that don't map 1:1 to ProviderSpec.
+diff --git a/internal/config/provider.go b/internal/config/provider.go
+index be0b9a02b..84f6276ee 100644
+--- a/internal/config/provider.go
++++ b/internal/config/provider.go
+@@ -93,6 +93,13 @@ type ProviderSpec struct {
+ 	// SupportsHooks indicates the provider has an executable hook mechanism
+ 	// (settings.json, plugins, etc.) for lifecycle events.
+ 	SupportsHooks *bool `toml:"supports_hooks,omitempty"`
++	// RequiresAttachedSession is tri-state: nil = inherit/unknown, &true =
++	// the provider only runs inside a session a human has already attached
++	// to and cannot be spawned unattended, &false = the provider can spawn
++	// and run on its own (e.g. a headless preset). Consulted by `gc sling`
++	// to fail loudly instead of silently stranding a bead when the target
++	// has no live session and cannot spawn one itself. See ga-a2w4h.
++	RequiresAttachedSession *bool `toml:"requires_attached_session,omitempty"`
+ 	// InstructionsFile is the filename the provider reads for project instructions
+ 	// (e.g., "CLAUDE.md", "AGENTS.md"). Empty defaults to "AGENTS.md".
+ 	InstructionsFile string `toml:"instructions_file,omitempty"`
+@@ -203,17 +210,22 @@ type ResolvedProvider struct {
+ 	Env                    map[string]string
+ 	SupportsACP            bool
+ 	SupportsHooks          bool
+-	InstructionsFile       string
+-	ResumeFlag             string
+-	ResumeStyle            string
+-	ResumeCommand          string
+-	SessionIDFlag          string
+-	PermissionModes        map[string]string
+-	OptionsSchema          []ProviderOption
+-	PrintArgs              []string
+-	TitleModel             string
+-	ACPCommand             string
+-	ACPArgs                []string
++	// RequiresAttachedSession mirrors ProviderSpec's tri-state field, fully
++	// resolved (defaults to false — "can spawn unattended" — when no layer
++	// in the chain set it explicitly; see derefBool). Consulted by `gc
++	// sling` preflight; see ga-a2w4h.
++	RequiresAttachedSession bool
++	InstructionsFile        string
++	ResumeFlag              string
++	ResumeStyle             string
++	ResumeCommand           string
++	SessionIDFlag           string
++	PermissionModes         map[string]string
++	OptionsSchema           []ProviderOption
++	PrintArgs               []string
++	TitleModel              string
++	ACPCommand              string
++	ACPArgs                 []string
+ 	// EffectiveDefaults is the fully-merged option default map.
+ 	// Computed from: schema Default -> provider OptionDefaults -> agent OptionDefaults.
+ 	// Used by ResolveDefaultArgs() to produce CLI flags and by the API to
+@@ -415,35 +427,36 @@ func BuiltinProviderAlias(name string) ProviderSpec {
+ 
+ func providerSpecFromWorker(spec workerbuiltin.BuiltinProviderSpec) ProviderSpec {
+ 	return ProviderSpec{
+-		Base:                   nil,
+-		ArgsAppend:             nil,
+-		OptionsSchemaMerge:     "",
+-		DisplayName:            spec.DisplayName,
+-		Command:                spec.Command,
+-		Args:                   cloneStrings(spec.Args),
+-		PromptMode:             spec.PromptMode,
+-		PromptFlag:             spec.PromptFlag,
+-		ReadyDelayMs:           spec.ReadyDelayMs,
+-		ReadyPromptPrefix:      spec.ReadyPromptPrefix,
+-		ProcessNames:           cloneStrings(spec.ProcessNames),
+-		EmitsPermissionWarning: boolPtr(spec.EmitsPermissionWarning),
+-		AcceptStartupDialogs:   cloneBoolPtr(spec.AcceptStartupDialogs),
+-		Env:                    cloneStringMap(spec.Env),
+-		PathCheck:              spec.PathCheck,
+-		SupportsACP:            boolPtr(spec.SupportsACP),
+-		SupportsHooks:          boolPtr(spec.SupportsHooks),
+-		InstructionsFile:       spec.InstructionsFile,
+-		ResumeFlag:             spec.ResumeFlag,
+-		ResumeStyle:            spec.ResumeStyle,
+-		ResumeCommand:          spec.ResumeCommand,
+-		SessionIDFlag:          spec.SessionIDFlag,
+-		PermissionModes:        cloneStringMap(spec.PermissionModes),
+-		OptionDefaults:         cloneStringMap(spec.OptionDefaults),
+-		OptionsSchema:          providerOptionsFromWorker(spec.OptionsSchema),
+-		PrintArgs:              cloneStrings(spec.PrintArgs),
+-		TitleModel:             spec.TitleModel,
+-		ACPCommand:             spec.ACPCommand,
+-		ACPArgs:                cloneStrings(spec.ACPArgs),
++		Base:                    nil,
++		ArgsAppend:              nil,
++		OptionsSchemaMerge:      "",
++		DisplayName:             spec.DisplayName,
++		Command:                 spec.Command,
++		Args:                    cloneStrings(spec.Args),
++		PromptMode:              spec.PromptMode,
++		PromptFlag:              spec.PromptFlag,
++		ReadyDelayMs:            spec.ReadyDelayMs,
++		ReadyPromptPrefix:       spec.ReadyPromptPrefix,
++		ProcessNames:            cloneStrings(spec.ProcessNames),
++		EmitsPermissionWarning:  boolPtr(spec.EmitsPermissionWarning),
++		AcceptStartupDialogs:    cloneBoolPtr(spec.AcceptStartupDialogs),
++		Env:                     cloneStringMap(spec.Env),
++		PathCheck:               spec.PathCheck,
++		SupportsACP:             boolPtr(spec.SupportsACP),
++		SupportsHooks:           boolPtr(spec.SupportsHooks),
++		RequiresAttachedSession: cloneBoolPtr(spec.RequiresAttachedSession),
++		InstructionsFile:        spec.InstructionsFile,
++		ResumeFlag:              spec.ResumeFlag,
++		ResumeStyle:             spec.ResumeStyle,
++		ResumeCommand:           spec.ResumeCommand,
++		SessionIDFlag:           spec.SessionIDFlag,
++		PermissionModes:         cloneStringMap(spec.PermissionModes),
++		OptionDefaults:          cloneStringMap(spec.OptionDefaults),
++		OptionsSchema:           providerOptionsFromWorker(spec.OptionsSchema),
++		PrintArgs:               cloneStrings(spec.PrintArgs),
++		TitleModel:              spec.TitleModel,
++		ACPCommand:              spec.ACPCommand,
++		ACPArgs:                 cloneStrings(spec.ACPArgs),
+ 	}
+ }
+ 
+diff --git a/internal/config/resolve.go b/internal/config/resolve.go
+index bab625678..e56f21749 100644
+--- a/internal/config/resolve.go
++++ b/internal/config/resolve.go
+@@ -286,6 +286,9 @@ func MergeProviderOverBuiltin(base, city ProviderSpec) ProviderSpec {
+ 	if city.SupportsHooks != nil {
+ 		result.SupportsHooks = city.SupportsHooks
+ 	}
++	if city.RequiresAttachedSession != nil {
++		result.RequiresAttachedSession = city.RequiresAttachedSession
++	}
+ 	if city.InstructionsFile != "" {
+ 		result.InstructionsFile = city.InstructionsFile
+ 	}
+@@ -567,23 +570,24 @@ func detectProviderName(lookPath LookPathFunc) (string, error) {
+ // specToResolved converts a ProviderSpec to a ResolvedProvider.
+ func specToResolved(name string, spec *ProviderSpec) *ResolvedProvider {
+ 	rp := &ResolvedProvider{
+-		Name:                   name,
+-		Command:                spec.Command,
+-		PromptMode:             spec.PromptMode,
+-		PromptFlag:             spec.PromptFlag,
+-		ReadyDelayMs:           spec.ReadyDelayMs,
+-		ReadyPromptPrefix:      spec.ReadyPromptPrefix,
+-		EmitsPermissionWarning: derefBool(spec.EmitsPermissionWarning),
+-		AcceptStartupDialogs:   cloneBoolPtr(spec.AcceptStartupDialogs),
+-		SupportsACP:            derefBool(spec.SupportsACP),
+-		SupportsHooks:          derefBool(spec.SupportsHooks),
+-		InstructionsFile:       spec.InstructionsFile,
+-		ResumeFlag:             spec.ResumeFlag,
+-		ResumeStyle:            spec.ResumeStyle,
+-		ResumeCommand:          spec.ResumeCommand,
+-		SessionIDFlag:          spec.SessionIDFlag,
+-		TitleModel:             spec.TitleModel,
+-		ACPCommand:             spec.ACPCommand,
++		Name:                    name,
++		Command:                 spec.Command,
++		PromptMode:              spec.PromptMode,
++		PromptFlag:              spec.PromptFlag,
++		ReadyDelayMs:            spec.ReadyDelayMs,
++		ReadyPromptPrefix:       spec.ReadyPromptPrefix,
++		EmitsPermissionWarning:  derefBool(spec.EmitsPermissionWarning),
++		AcceptStartupDialogs:    cloneBoolPtr(spec.AcceptStartupDialogs),
++		SupportsACP:             derefBool(spec.SupportsACP),
++		SupportsHooks:           derefBool(spec.SupportsHooks),
++		RequiresAttachedSession: derefBool(spec.RequiresAttachedSession),
++		InstructionsFile:        spec.InstructionsFile,
++		ResumeFlag:              spec.ResumeFlag,
++		ResumeStyle:             spec.ResumeStyle,
++		ResumeCommand:           spec.ResumeCommand,
++		SessionIDFlag:           spec.SessionIDFlag,
++		TitleModel:              spec.TitleModel,
++		ACPCommand:              spec.ACPCommand,
+ 	}
+ 	// Deep-copy OptionsSchema to avoid aliasing the spec's slice.
+ 	if len(spec.OptionsSchema) > 0 {
+@@ -797,6 +801,10 @@ func resolvedChainToSpec(r ResolvedProvider, leaf ProviderSpec) ProviderSpec {
+ 		v := r.SupportsHooks
+ 		out.SupportsHooks = &v
+ 	}
++	if leaf.RequiresAttachedSession == nil && providerBoolFieldSet(r, "requires_attached_session") {
++		v := r.RequiresAttachedSession
++		out.RequiresAttachedSession = &v
++	}
+ 	if r.InstructionsFile != "" {
+ 		out.InstructionsFile = r.InstructionsFile
+ 	}
+diff --git a/internal/config/resolve_test.go b/internal/config/resolve_test.go
+index ec040c35a..42caed57f 100644
+--- a/internal/config/resolve_test.go
++++ b/internal/config/resolve_test.go
+@@ -2017,35 +2017,36 @@ func TestResolveProviderResumeCommandAgentOverride(t *testing.T) {
+ func TestMergeProviderOverBuiltinFieldSync(t *testing.T) {
+ 	basePtr := "builtin:custom"
+ 	city := ProviderSpec{
+-		Base:                   &basePtr,
+-		ArgsAppend:             []string{"--extra"},
+-		OptionsSchemaMerge:     "by_key",
+-		DisplayName:            "Custom",
+-		Command:                "custom-cmd",
+-		Args:                   []string{"--flag"},
+-		PromptMode:             "flag",
+-		PromptFlag:             "--prompt",
+-		ReadyDelayMs:           5000,
+-		ReadyPromptPrefix:      "$ ",
+-		ProcessNames:           []string{"custom"},
+-		EmitsPermissionWarning: boolPtr(true),
+-		AcceptStartupDialogs:   boolPtr(true),
+-		Env:                    map[string]string{"K": "V"},
+-		PathCheck:              "custom-bin",
+-		SupportsACP:            boolPtr(true),
+-		SupportsHooks:          boolPtr(true),
+-		InstructionsFile:       "CUSTOM.md",
+-		ResumeFlag:             "--resume",
+-		ResumeStyle:            "flag",
+-		ResumeCommand:          "custom-cmd --resume {{.SessionKey}}",
+-		SessionIDFlag:          "--session-id",
+-		PermissionModes:        map[string]string{"yolo": "--yolo"},
+-		OptionDefaults:         map[string]string{"permission_mode": "yolo"},
+-		OptionsSchema:          []ProviderOption{{Key: "model"}},
+-		PrintArgs:              []string{"-p"},
+-		TitleModel:             "haiku",
+-		ACPCommand:             "custom-acp",
+-		ACPArgs:                []string{"acp-mode"},
++		Base:                    &basePtr,
++		ArgsAppend:              []string{"--extra"},
++		OptionsSchemaMerge:      "by_key",
++		DisplayName:             "Custom",
++		Command:                 "custom-cmd",
++		Args:                    []string{"--flag"},
++		PromptMode:              "flag",
++		PromptFlag:              "--prompt",
++		ReadyDelayMs:            5000,
++		ReadyPromptPrefix:       "$ ",
++		ProcessNames:            []string{"custom"},
++		EmitsPermissionWarning:  boolPtr(true),
++		AcceptStartupDialogs:    boolPtr(true),
++		Env:                     map[string]string{"K": "V"},
++		PathCheck:               "custom-bin",
++		SupportsACP:             boolPtr(true),
++		SupportsHooks:           boolPtr(true),
++		RequiresAttachedSession: boolPtr(true),
++		InstructionsFile:        "CUSTOM.md",
++		ResumeFlag:              "--resume",
++		ResumeStyle:             "flag",
++		ResumeCommand:           "custom-cmd --resume {{.SessionKey}}",
++		SessionIDFlag:           "--session-id",
++		PermissionModes:         map[string]string{"yolo": "--yolo"},
++		OptionDefaults:          map[string]string{"permission_mode": "yolo"},
++		OptionsSchema:           []ProviderOption{{Key: "model"}},
++		PrintArgs:               []string{"-p"},
++		TitleModel:              "haiku",
++		ACPCommand:              "custom-acp",
++		ACPArgs:                 []string{"acp-mode"},
+ 	}
+ 
+ 	// Verify every field on city is non-zero (catches new fields not added to test data).
+diff --git a/internal/sling/preflight_cannot_receive_work_test.go b/internal/sling/preflight_cannot_receive_work_test.go
+new file mode 100644
+index 000000000..d0c6f38d8
+--- /dev/null
++++ b/internal/sling/preflight_cannot_receive_work_test.go
+@@ -0,0 +1,198 @@
++package sling
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/gastownhall/gascity/internal/agent"
++	"github.com/gastownhall/gascity/internal/config"
++	"github.com/gastownhall/gascity/internal/runtime"
++)
++
++func boolPtr(v bool) *bool { return &v }
++
++// attachedProviderCity returns a minimal city config with two providers:
++// "attached" (requires_attached_session = true, e.g. an interactive claude
++// worker) and "headless" (requires_attached_session = false, e.g.
++// claude-headless). Neither provider's Command needs to exist on PATH —
++// preflight's capability check resolves providers with a permissive
++// lookPath (see alwaysFoundLookPath) since it only cares what the config
++// declares.
++func attachedProviderCity() *config.City {
++	return &config.City{
++		Workspace: config.Workspace{Name: "test-city"},
++		Providers: map[string]config.ProviderSpec{
++			"attached": {
++				Command:                 "attached-cmd",
++				RequiresAttachedSession: boolPtr(true),
++			},
++			"headless": {
++				Command:                 "headless-cmd",
++				RequiresAttachedSession: boolPtr(false),
++			},
++		},
++	}
++}
++
++// singleSessionCapabilityTestAgent builds a single-session (non-pool) agent targeting the
++// named provider, matching the MaxActiveSessions=1/no-Min/no-ScaleCheck
++// shape the existing suspended/pool-empty/implicit-target tests already use
++// for IsMultiSessionAgent() == false.
++func singleSessionCapabilityTestAgent(name, provider string) config.Agent {
++	return config.Agent{
++		Name:              name,
++		Provider:          provider,
++		MaxActiveSessions: intPtr(1),
++	}
++}
++
++func TestPreflightCannotReceiveWork_HardFailsWhenNoLiveSessionAndRequiresAttached(t *testing.T) {
++	cfg := attachedProviderCity()
++	a := singleSessionCapabilityTestAgent("solo-claude", "attached")
++	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
++	deps.Store = seededStore("BL-1")
++
++	result, err := DoSling(testOpts(a, "BL-1"), deps, nil)
++
++	var wantErr *CannotReceiveWorkError
++	if !errors.As(err, &wantErr) {
++		t.Fatalf("DoSling error = %v, want *CannotReceiveWorkError", err)
++	}
++	if !result.CannotReceiveWork {
++		t.Error("expected result.CannotReceiveWork = true")
++	}
++	if wantErr.Target != a.QualifiedName() {
++		t.Errorf("CannotReceiveWorkError.Target = %q, want %q", wantErr.Target, a.QualifiedName())
++	}
++}
++
++func TestPreflightCannotReceiveWork_SkipsWhenLiveSessionExists(t *testing.T) {
++	cfg := attachedProviderCity()
++	a := singleSessionCapabilityTestAgent("solo-claude", "attached")
++	sp := runtime.NewFake()
++	deps := testDeps(cfg, sp, newFakeRunner().run)
++	deps.Store = seededStore("BL-1")
++
++	sessionName := agent.SessionNameFor(deps.CityName, a.QualifiedName(), cfg.Workspace.SessionTemplate)
++	if err := sp.Start(context.Background(), sessionName, runtime.Config{}); err != nil {
++		t.Fatalf("sp.Start: %v", err)
++	}
++
++	result, err := DoSling(testOpts(a, "BL-1"), deps, nil)
++	if err != nil {
++		t.Fatalf("DoSling error = %v, want nil (live session should skip the hard-fail check)", err)
++	}
++	if result.CannotReceiveWork {
++		t.Error("expected result.CannotReceiveWork = false when a live session exists")
++	}
++}
++
++func TestPreflightCannotReceiveWork_SkipsWhenProviderCanSpawnUnattended(t *testing.T) {
++	cfg := attachedProviderCity()
++	a := singleSessionCapabilityTestAgent("headless-worker", "headless")
++	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
++	deps.Store = seededStore("BL-1")
++
++	result, err := DoSling(testOpts(a, "BL-1"), deps, nil)
++	if err != nil {
++		t.Fatalf("DoSling error = %v, want nil (headless provider can spawn unattended)", err)
++	}
++	if result.CannotReceiveWork {
++		t.Error("expected result.CannotReceiveWork = false for a provider that can spawn unattended")
++	}
++}
++
++func TestPreflightCannotReceiveWork_SkipsForMultiSessionAgent(t *testing.T) {
++	cfg := attachedProviderCity()
++	a := config.Agent{
++		Name:              "claude-pool",
++		Dir:               "whatsapp_automation",
++		Provider:          "attached",
++		MaxActiveSessions: intPtr(3), // pool: SupportsInstanceExpansion() == true
++	}
++	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
++	deps.Store = seededStore("BL-1")
++
++	result, err := DoSling(testOpts(a, "BL-1"), deps, nil)
++	if err != nil {
++		t.Fatalf("DoSling error = %v, want nil (multi-session/pool targets are out of scope for this check)", err)
++	}
++	if result.CannotReceiveWork {
++		t.Error("expected result.CannotReceiveWork = false for a multi-session/pool agent")
++	}
++}
++
++func TestPreflightCannotReceiveWork_SkipsWhenProviderUnresolved(t *testing.T) {
++	// Mirrors the shape of the pre-existing TestDoSlingSuspendedAgentWarns /
++	// TestDoSlingPoolEmptyWarnsOnFailure fixtures: a bare cfg with no
++	// [providers.*] entries at all. Provider resolution fails, so the new
++	// check must stay silent (conservative-by-default) rather than error.
++	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
++	a := singleSessionCapabilityTestAgent("mayor", "")
++	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
++	deps.Store = seededStore("BL-1")
++
++	result, err := DoSling(testOpts(a, "BL-1"), deps, nil)
++	if err != nil {
++		t.Fatalf("DoSling error = %v, want nil (unresolvable provider must not hard-fail)", err)
++	}
++	if result.CannotReceiveWork {
++		t.Error("expected result.CannotReceiveWork = false when the provider cannot be resolved")
++	}
++}
++
++func TestPreflightCannotReceiveWork_ForceBypasses(t *testing.T) {
++	cfg := attachedProviderCity()
++	a := singleSessionCapabilityTestAgent("solo-claude", "attached")
++	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
++	deps.Store = seededStore("BL-1")
++
++	opts := testOpts(a, "BL-1")
++	opts.Force = true
++	result, err := DoSling(opts, deps, nil)
++	if err != nil {
++		t.Fatalf("DoSling error = %v, want nil (--force bypasses the hard-fail check)", err)
++	}
++	if result.CannotReceiveWork {
++		t.Error("expected result.CannotReceiveWork = false under --force")
++	}
++}
++
++// TestPreflightCannotReceiveWork_IdempotentReSlingDoesNotHardFail verifies
++// the check is placed AFTER the idempotency short-circuit in preflight: a
++// bead already routed to this exact target must not start hard-failing
++// merely because the target's session happens to be down right now — that
++// would make routine defensive re-slinging brittle in exactly the case
++// it's meant to be a safe no-op.
++func TestPreflightCannotReceiveWork_IdempotentReSlingDoesNotHardFail(t *testing.T) {
++	cfg := attachedProviderCity()
++	a := singleSessionCapabilityTestAgent("solo-claude", "attached")
++	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
++	deps.Store = seededStore("BL-1")
++	if err := deps.Store.SetMetadata("BL-1", "gc.routed_to", a.QualifiedName()); err != nil {
++		t.Fatalf("seeding gc.routed_to: %v", err)
++	}
++
++	// NoConvoy: true — without it, CheckBeadStateWithOptions treats an
++	// already-routed bead with no live tracking convoy as needing recovery
++	// (needsConvoyRecovery), not as idempotent, and legitimately re-attempts
++	// routing. That's correct existing behavior, not what this test is
++	// about; NoConvoy isolates the idempotency path itself.
++	opts := testOpts(a, "BL-1")
++	opts.NoConvoy = true
++	// The idempotency check needs a non-nil querier to see the seeded
++	// gc.routed_to metadata (DoSling's querier param is separate from
++	// deps.Store — nil short-circuits CheckBeadStateWithOptions to "not
++	// idempotent" regardless of store state).
++	result, err := DoSling(opts, deps, deps.Store)
++	if err != nil {
++		t.Fatalf("DoSling error = %v, want nil (idempotent re-sling must not hard-fail)", err)
++	}
++	if !result.Idempotent {
++		t.Fatal("expected result.Idempotent = true (test setup didn't reach the idempotent path)")
++	}
++	if result.CannotReceiveWork {
++		t.Error("expected result.CannotReceiveWork = false on the idempotent short-circuit path")
++	}
++}
+diff --git a/internal/sling/sling.go b/internal/sling/sling.go
+index 18358713d..fc4260747 100644
+--- a/internal/sling/sling.go
++++ b/internal/sling/sling.go
+@@ -155,6 +155,15 @@ type SlingResult struct {
+ 	MetadataErrors []string // non-fatal metadata write failures
+ 	BeadWarnings   []string // pre-flight bead state warnings
+ 
++	// CannotReceiveWork is true when the target has no live session and its
++	// resolved provider cannot spawn one unattended (ResolvedProvider.
++	// RequiresAttachedSession) — unlike the three warn-only fields above,
++	// this is a hard failure: preflight returns a non-nil *CannotReceiveWorkError
++	// alongside a result with this set, so routing does not silently strand
++	// the bead. Only evaluated for single-session targets with a provider
++	// that resolves and explicitly opts in; see ga-a2w4h and ga-66wc.
++	CannotReceiveWork bool
++
+ 	// Batch fields (populated by DoSlingBatch).
+ 	ContainerType string // "convoy", "epic", etc. (batch only)
+ 	Routed        int
+@@ -771,6 +780,21 @@ func (e *MissingBeadError) Error() string {
+ 	return fmt.Sprintf("bead %q not found in store %s", e.BeadID, e.StoreRef)
+ }
+ 
++// CannotReceiveWorkError reports that a sling target has no live session and
++// its provider cannot spawn one unattended, so routing would silently strand
++// the bead (see ga-66wc). Distinct from the three warn-only preflight
++// conditions (AgentSuspended, PoolEmpty, TargetImplicit): those still route
++// the bead because the target COULD eventually pick it up; this one means it
++// never will without human intervention.
++type CannotReceiveWorkError struct {
++	Target string
++}
++
++// Error returns the cannot-receive-work diagnostic.
++func (e *CannotReceiveWorkError) Error() string {
++	return fmt.Sprintf("target %q has no live session and cannot spawn unattended — attach a session first, or route to a headless-capable target (use --force to route anyway)", e.Target)
++}
++
+ // BeadLookupError reports an operational failure while checking whether a bead
+ // exists in the target store.
+ type BeadLookupError struct {
+diff --git a/internal/sling/sling_core.go b/internal/sling/sling_core.go
+index 7e6b06901..c077df10a 100644
+--- a/internal/sling/sling_core.go
++++ b/internal/sling/sling_core.go
+@@ -128,6 +128,18 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
+ 		}
+ 		result.BeadWarnings = append(result.BeadWarnings, check.Warnings...)
+ 	}
++
++	// Hard-fail (unlike the three warn-only checks above) when the target
++	// has no live session and its provider cannot spawn one unattended —
++	// routing here would silently strand the bead (ga-66wc). Placed after
++	// the idempotency short-circuit above so a harmless re-sling of an
++	// already-routed bead never fails just because its session happens to
++	// be down at this instant.
++	if !opts.Force && cannotReceiveWork(a, deps) {
++		result.CannotReceiveWork = true
++		return result, &CannotReceiveWorkError{Target: a.QualifiedName()}
++	}
++
+ 	if shouldValidateBuiltInRouteStoreReachable(opts, deps) {
+ 		if err := validateBuiltInRouteStoreReachable(deps, opts.BeadOrFormula, a); err != nil {
+ 			return result, fmt.Errorf("%w", err)
+@@ -164,6 +176,42 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
+ 	return result, nil
+ }
+ 
++// alwaysFoundLookPath is a permissive config.LookPathFunc used only to
++// resolve a provider's capability flags (see cannotReceiveWork below) — it
++// never fails a PATH lookup. Whether the provider's binary happens to be
++// installed on this host is an orthogonal, pre-existing failure mode a real
++// launch attempt already surfaces separately; this check only cares what
++// the provider's config declares. Using a real exec.LookPath here would
++// also make the check depend on the host's PATH at test time.
++func alwaysFoundLookPath(string) (string, error) { return "ok", nil }
++
++// cannotReceiveWork reports whether the sling target has no live session
++// and its resolved provider cannot spawn one unattended. Deliberately
++// conservative: any ambiguity (provider doesn't resolve, target is a
++// multi-session/pool agent, no session provider wired) resolves to false so
++// this can never introduce a false hard-failure — it only fires for the
++// documented shape of ga-66wc: a single-session target whose provider
++// explicitly requires an attached session and has none running.
++//
++// Multi-session/pool agents are out of scope here: there is no single
++// deterministic session name to check liveness against, and a pool
++// inherently supports the supervisor spawning a fresh session on demand
++// regardless of what the provider capability flag says.
++func cannotReceiveWork(a config.Agent, deps SlingDeps) bool {
++	if deps.SP == nil || deps.Cfg == nil {
++		return false
++	}
++	if agentutil.IsMultiSessionAgent(&a) {
++		return false
++	}
++	resolved, err := config.ResolveProvider(&a, &deps.Cfg.Workspace, deps.Cfg.Providers, alwaysFoundLookPath)
++	if err != nil || resolved == nil || !resolved.RequiresAttachedSession {
++		return false
++	}
++	name := agentutil.LookupSessionName(deps.Store, deps.CityName, a.QualifiedName(), deps.Cfg.Workspace.SessionTemplate)
++	return !deps.SP.IsRunning(name)
++}
++
+ func shouldValidateExistingBead(opts SlingOpts) bool {
+ 	if opts.IsFormula || (opts.DryRun && opts.InlineText) {
+ 		return false
+diff --git a/internal/worker/builtin/profiles.go b/internal/worker/builtin/profiles.go
+index 3d3a79d74..7e30c256f 100644
+--- a/internal/worker/builtin/profiles.go
++++ b/internal/worker/builtin/profiles.go
+@@ -59,6 +59,13 @@ type BuiltinProviderSpec struct {
+ 	TitleModel             string
+ 	ACPCommand             string
+ 	ACPArgs                []string
++	// RequiresAttachedSession is tri-state: nil = unknown/not yet audited,
++	// &true = the provider only runs inside a session a human has already
++	// attached to (e.g. claude — a bare `gc sling` to an unattended target
++	// silently strands the bead, see gastownhall/gascity#ga-66wc), &false =
++	// the provider can be spawned unattended (e.g. claude-headless). Only
++	// "claude" sets this explicitly today; see ga-a2w4h.
++	RequiresAttachedSession *bool
+ }
+ 
+ func boolPtr(b bool) *bool { return &b }
+@@ -93,19 +100,20 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
+ 			"permission_mode": "unrestricted",
+ 			"effort":          "max",
+ 		},
+-		PromptMode:             "arg",
+-		ReadyDelayMs:           10000,
+-		ReadyPromptPrefix:      "\u276f ",
+-		ProcessNames:           []string{"node", "claude"},
+-		EmitsPermissionWarning: true,
+-		SupportsACP:            true,
+-		SupportsHooks:          true,
+-		InstructionsFile:       "CLAUDE.md",
+-		ResumeFlag:             "--resume",
+-		ResumeStyle:            "flag",
+-		SessionIDFlag:          "--session-id",
+-		PrintArgs:              []string{"-p"},
+-		TitleModel:             "haiku",
++		PromptMode:              "arg",
++		ReadyDelayMs:            10000,
++		ReadyPromptPrefix:       "\u276f ",
++		ProcessNames:            []string{"node", "claude"},
++		EmitsPermissionWarning:  true,
++		SupportsACP:             true,
++		SupportsHooks:           true,
++		RequiresAttachedSession: boolPtr(true),
++		InstructionsFile:        "CLAUDE.md",
++		ResumeFlag:              "--resume",
++		ResumeStyle:             "flag",
++		SessionIDFlag:           "--session-id",
++		PrintArgs:               []string{"-p"},
++		TitleModel:              "haiku",
+ 		PermissionModes: map[string]string{
+ 			"unrestricted": "--dangerously-skip-permissions",
+ 			"plan":         "--permission-mode plan",
