@@ -180,6 +180,40 @@ run_helper() {  # run_helper <changed-relpaths...>  (commits a deploy diff first
   bash "$HELPER" 2>/dev/null
 }
 
+# like run_helper, but merges stderr into the captured output — needed for
+# T19/T20, which assert on the WARN log() emits (stdout-only capture would
+# never see it; every other test's `2>/dev/null` is why this is a separate
+# function rather than a change to run_helper itself).
+run_helper_stderr() {  # run_helper_stderr <changed-relpaths...>
+  ( cd "$RUNTIME"
+    git add -A >/dev/null 2>&1
+    git commit -q -m base --allow-empty
+  )
+  PRE=$(git -C "$RUNTIME" rev-parse HEAD)
+  local f
+  for f in "$@"; do
+    mkdir -p "$RUNTIME/$(dirname "$f")"
+    echo "# changed $(date +%s%N)" >> "$RUNTIME/$f"
+  done
+  ( cd "$RUNTIME"
+    git add -A >/dev/null 2>&1
+    git commit -q -m deploy --allow-empty
+  )
+  POST=$(git -C "$RUNTIME" rev-parse HEAD)
+
+  MOCK_DIR="$MOCK" \
+  RUNTIME_DIR="$RUNTIME" \
+  PRE_DEPLOY_SHA="$PRE" POST_DEPLOY_SHA="$POST" \
+  DEPLOY_EPOCH="$DEPLOY_EPOCH" \
+  SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
+  EXTRA_RUNTIME_ROOTS="${EXTRA_RUNTIME_ROOTS:-}" \
+  LAUNCH_AGENTS_DIR="$AGENTS" \
+  LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" \
+  VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
+  DRY_RUN="${DRY_RUN:-0}" \
+  bash "$HELPER" 2>&1
+}
+
 # ════════════════════════════════════════════════════════════════════════════
 # T1: no daemon code changed → OK, nothing restarted
 # ════════════════════════════════════════════════════════════════════════════
@@ -633,6 +667,77 @@ echo "$(field RESTARTED "$OUT")" | grep -q "com.test.ban-risk-dashboard" && nok 
 echo "$(field WOULD_RESTART "$OUT")" | grep -q "com.test.ban-risk-dashboard" && ok "T18 WOULD_RESTART reports the preview" || nok "T18 would_restart" "$(field WOULD_RESTART "$OUT")"
 [ "$(field PROOF "$OUT")" = "not_applicable" ] && ok "T18 PROOF=not_applicable (never 'verified' when nothing ran)" || nok "T18 proof" "got '$(field PROOF "$OUT")' (pre-fix bug: this was 'verified')"
 [ ! -f "$MOCK/kicks.log" ] && ok "T18 no kickstart called under DRY_RUN=1" || nok "T18 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T19 (ga-otn7u): a plist with a literal "--" inside an XML <!-- --> comment
+# (expat rejects it; Apple's own launchd parser tolerates it — the exact shape
+# of 5 live plists found broken this way, incl. throughput-stall-watchdog.plist
+# itself) used to be silently DROPPED from discovery: plist_args() caught ANY
+# exception and exited 0, indistinguishable from "this plist genuinely has no
+# ProgramArguments". Post-fix, plist_args() exits 1 on a parse failure and the
+# caller logs a WARN naming the plist — and a HEALTHY sibling plist in the same
+# LAUNCH_AGENTS_DIR is still discovered and processed normally (one broken
+# plist must not blind discovery of every other daemon).
+# ════════════════════════════════════════════════════════════════════════════
+new_case t19
+cat > "$RUNTIME/daemons/ban_risk_dashboard.py" <<<'print("dash")'
+make_plist "$AGENTS" com.test.ban-risk-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/ban_risk_dashboard.py"
+seed_running com.test.ban-risk-dashboard 9501 "$STALE_LSTART"
+seed_restart com.test.ban-risk-dashboard 9599 "$FRESH_LSTART"
+cat > "$AGENTS/com.test.broken-comment.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.test.broken-comment</string>
+  <!-- a stray double-hyphen -- inside this comment breaks plistlib's expat
+       parser even though launchd itself loads this file fine -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/true</string>
+  </array>
+</dict>
+</plist>
+EOF
+OUT=$(run_helper_stderr daemons/ban_risk_dashboard.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T19 verdict OK (healthy daemon still processed normally)" || nok "T19 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -eq 0 ] && ok "T19 exit 0" || nok "T19 exit" "rc=$RC"
+echo "$(field RESTARTED "$OUT")" | grep -q "com.test.ban-risk-dashboard" && ok "T19 healthy sibling still restarted+verified" || nok "T19 restarted" "$(field RESTARTED "$OUT")"
+echo "$OUT" | grep -q "com.test.broken-comment.plist could not be parsed" && ok "T19 WARN names the broken plist (pre-fix: no warning existed anywhere)" || nok "T19 warn" "no distinguishing WARN in output: [$OUT]"
+[ "$(field PROOF "$OUT")" = "verified" ] && ok "T19 PROOF=verified (the healthy daemon's own verification is unaffected by its broken sibling)" || nok "T19 proof" "got '$(field PROOF "$OUT")'"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T20 (ga-otn7u): EVERY plist in LAUNCH_AGENTS_DIR is unparseable — pre-fix,
+# this collapsed to the exact same "no rig daemons discovered — OK" as a
+# directory that genuinely has zero rig daemons in it (both produced
+# PROOF=not_applicable, an unearned claim of certainty — the exact
+# error-and-empty-must-not-produce-the-same-value defect class). Post-fix this
+# must read as not_verified: discovery could not confirm the directory is
+# empty of daemons, it only knows it could not read what's there.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t20
+cat > "$RUNTIME/daemons/some_other_thing.py" <<<'print("x")'
+cat > "$AGENTS/com.test.broken-only.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.test.broken-only</string>
+  <!-- another stray double-hyphen -- here -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/true</string>
+  </array>
+</dict>
+</plist>
+EOF
+OUT=$(run_helper_stderr daemons/some_other_thing.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T20 verdict OK" || nok "T20 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -eq 0 ] && ok "T20 exit 0" || nok "T20 exit" "rc=$RC"
+echo "$OUT" | grep -q "com.test.broken-only.plist could not be parsed" && ok "T20 WARN names the broken plist" || nok "T20 warn" "no distinguishing WARN in output: [$OUT]"
+[ "$(field PROOF "$OUT")" = "not_verified" ] && ok "T20 PROOF=not_verified (discovery incomplete, not confirmed-empty — pre-fix bug: this was not_applicable, indistinguishable from a genuinely empty dir)" || nok "T20 proof" "got '$(field PROOF "$OUT")'"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""

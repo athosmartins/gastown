@@ -15,8 +15,9 @@
        unmergeable — the whole phase had to be re-anchored. This sweep
        snapshots a baseline SHA + touched-files list the first time it sees a
        gate:needs-human bead, then on every later run checks for new commits
-       on those files (ga-u4yi's suggested cheap signal: `git log main --
-       <files>`) and escalates — label + comment the bead, mail BOTH the
+       on those files (ga-u4yi's suggested cheap signal: `git log main`
+       scoped to `<files>` via git's path-separator flag) and escalates —
+       label + comment the bead, mail BOTH the
        author and the Mayor (durable), ntfy P4 — while the branch is
        presumably still rebaseable. Runs once per StartInterval and exits (not
        resident). Idempotent; presence-pruned (drops a bead as soon as it

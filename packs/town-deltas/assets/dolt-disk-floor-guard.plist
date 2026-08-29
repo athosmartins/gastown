@@ -7,7 +7,7 @@
   <!-- Last-resort disk-floor guard for Dolt (ga-gpzr, follow-up to the 2026-07-14
        full-disk Dolt-death incident, ga-vs55). Polls avail space on Dolt's data-dir
        filesystem every StartInterval; at/below FLOOR_WARN_GB(8) attempts a safe
-       reclaim (`gc dolt cleanup --force` — orphan-DB SQL DROP, pre-sanctioned safe
+       reclaim (`gc dolt cleanup` forced — orphan-DB SQL DROP, pre-sanctioned safe
        while Dolt is up) + rate-limited notify; at/below FLOOR_CRITICAL_GB(3) always
        notifies (cooldown bypassed) + mails the Mayor durably. Does NOT stop Dolt,
        refuse writes, or touch its data dir/start wrapper — deliberately out of

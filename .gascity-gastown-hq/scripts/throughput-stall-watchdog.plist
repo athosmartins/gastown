@@ -95,13 +95,13 @@
     <string>21600</string>
 
     <!-- ══ Dolt-health probe: transient-resistance (stop false "Dolt UNREACHABLE" pages) ══
-         The imp08 Dolt check calls `gc-dolt-probe.sh --robust`, which RETRIES the health
+         The imp08 Dolt check calls `gc-dolt-probe.sh` in its robust-retry mode, which RETRIES the health
          probe with backoff and, if all attempts fail, does a raw SELECT 1 serve-confirm.
          A slow-but-alive Dolt (CPU burst) answers → reads healthy → never counts. Only a
          SUSTAINED health-fail + SELECT-1-refused across TSW_DOLT_CONFIRM_SWEEPS consecutive
          30-min sweeps (~90 min of continuous confirmed-down) pages. The dedicated
          dolt-hang-watchdog.sh (every 60s) remains the FAST Dolt-outage detector. -->
-    <!-- Inner `gc dolt health --json` timeout (sec) — ~4-6s healthy, up to ~10s under CPU burst. -->
+    <!-- Inner `gc dolt health` (JSON mode) timeout (sec) — ~4-6s healthy, up to ~10s under CPU burst. -->
     <key>GC_DOLT_PROBE_TIMEOUT</key>
     <string>12</string>
     <!-- Health-probe attempts per sweep before falling back to SELECT 1 serve-confirm. -->

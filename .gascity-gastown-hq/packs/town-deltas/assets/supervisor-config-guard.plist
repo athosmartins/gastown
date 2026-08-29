@@ -14,7 +14,7 @@
        notifies Athos loudly with the exact 'rig X sem path' — instead of letting
        the supervisor degrade into an unexplained spawn-outage. It also detects the
        init-failure loop at runtime, runs a diagnostic ladder, and attempts the
-       canonical `gc doctor --fix` for the known config cause. Polls 60s; silence =
+       canonical `gc doctor` auto-fix for the known config cause. Polls 60s; silence =
        healthy. -->
   <key>ProgramArguments</key>
   <array>

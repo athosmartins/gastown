@@ -323,13 +323,18 @@ daemon_pid() {  # daemon_pid <label>
 # For each plist, read ProgramArguments. An arg under RUNTIME_DIR that is a .py
 # file is an entrypoint; a wrapper .sh under RUNTIME_DIR is followed to the .py
 # it execs. A plist with no entrypoint under RUNTIME_DIR is not a rig daemon.
-plist_args() {  # plist_args <plist>
+plist_args() {  # plist_args <plist>; exit 0 (possibly empty output) when the
+                 # plist parses but has no usable ProgramArguments, exit 1 when
+                 # plistlib could not parse the file at all. The caller must be
+                 # able to tell "not a rig daemon" apart from "could not tell"
+                 # (ga-otn7u) — collapsing both into exit 0 is what made 5
+                 # daemons permanently invisible to discovery.
   python3 - "$1" <<'PY' 2>/dev/null
 import sys, plistlib
 try:
     d = plistlib.load(open(sys.argv[1], 'rb'))
 except Exception:
-    sys.exit(0)
+    sys.exit(1)
 for a in (d.get('ProgramArguments') or []):
     print(a)
 PY
@@ -363,11 +368,17 @@ resolve_relpath() {  # resolve_relpath <token>
 DISCO_DIR="$(mktemp -d "${TMPDIR:-/tmp}/daemon-disco.XXXXXX")"
 trap 'rm -rf "$DISCO_DIR"' EXIT
 DAEMON_LABELS=""
+PARSE_ERROR_LABELS=""
 
 shopt -s nullglob
 for plist in "$LAUNCH_AGENTS_DIR"/*.plist; do
   label="$(basename "$plist" .plist)"
   entry=""
+  args_out="$(plist_args "$plist")"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "WARN: $plist could not be parsed by plistlib — its daemon (if any) is invisible to auto-refresh discovery until the XML is fixed (common cause: a literal '--' inside an <!-- --> comment, which Apple's launchd parser tolerates but plistlib does not). Verify with: python3 -c \"import plistlib; plistlib.load(open('$plist','rb'))\""
+    PARSE_ERROR_LABELS="$PARSE_ERROR_LABELS $label"
+  fi
   while IFS= read -r arg; do
     [ -n "$arg" ] || continue
     case "$arg" in
@@ -386,7 +397,7 @@ for plist in "$LAUNCH_AGENTS_DIR"/*.plist; do
         fi
         ;;
     esac
-  done < <(plist_args "$plist")
+  done <<< "$args_out"
   entry="$(echo "$entry" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')"
   [ -n "${entry// /}" ] || continue
   echo "$entry" > "$DISCO_DIR/$label"
@@ -394,7 +405,15 @@ for plist in "$LAUNCH_AGENTS_DIR"/*.plist; do
 done
 shopt -u nullglob
 
+if [ -n "${PARSE_ERROR_LABELS// /}" ]; then
+  log "WARN: $(echo "$PARSE_ERROR_LABELS" | wc -w | tr -d ' ') plist(s) could not be parsed and were skipped during discovery:$PARSE_ERROR_LABELS"
+fi
+
 if [ -z "${DAEMON_LABELS// /}" ]; then
+  if [ -n "${PARSE_ERROR_LABELS// /}" ]; then
+    log "no rig daemons discovered under $LAUNCH_AGENTS_DIR for runtime $RUNTIME_DIR, but discovery could not read every plist — this is incomplete, not a confirmed-empty scan (see WARNs above)."
+    emit OK "no rig daemons discovered but discovery incomplete (unparseable plists — see WARNs)" not_verified
+  fi
   log "no rig daemons discovered under $LAUNCH_AGENTS_DIR for runtime $RUNTIME_DIR — OK (nothing to refresh)."
   emit OK "no rig daemons discovered" not_applicable
 fi

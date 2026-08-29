@@ -4,7 +4,7 @@
 <dict>
   <key>Label</key><string>com.gascity.bd-metrics-off-alarm</string>
 
-  <!-- ga-8g9ki5: tripwire for bd's anonymous telemetry getting re-enabled --
+  <!-- ga-8g9ki5: tripwire for bd's anonymous telemetry getting re-enabled —
        see bd-metrics-disable-env.plist and scripts/bd-metrics-off-alarm.sh for
        the full incident context (ga-cpqxf3: eventsData grew to 16GB unpruned,
        hit the FS's 65535-hardlink ceiling, hung every spawned bd send-metrics
@@ -20,7 +20,7 @@
   <key>WorkingDirectory</key>
   <string>/Users/athos/gt/.gascity-gastown-hq</string>
 
-  <!-- 900 = every 15 min. Not as tight as dolt-disk-floor-guard's 5 min --
+  <!-- 900 = every 15 min. Not as tight as dolt-disk-floor-guard's 5 min —
        unlike active disk depletion, a metrics-state flip is a discrete config
        change, not a fast-worsening measurement, and the alarm is edge-triggered
        (fires once on the transition) so a longer interval just delays first
