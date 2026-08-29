@@ -548,6 +548,32 @@ def _classify(bead):
     # SHAPE (routing to a target state) stays local — painel's _travada_reason
     # and imparavel's classify_bead each have their own, not unified here.
 
+    # 0. delivery-retry-in-flight (ga-kyvpk): gate:passed + delivery:failed,
+    # and no terminal-ish signal (story:done / blocked / needs-human) yet —
+    # story-delivery.sh's own Step 1 re-picks a delivery:failed bead every
+    # cycle on its own (a non-terminal, retry-until-fixed state by design,
+    # per its own commentary — "delivery:failed is re-picked every cycle
+    # until fixed") AS LONG AS story:approved stays on the bead (Step 1's
+    # selection query requires story:approved AND gate:passed together).
+    # This reconciler was stripping story:approved purely because
+    # gate:passed was present, with no compensating label at all, silently
+    # defeating that retry (confirmed live on wa-vl6m8) — the same class of
+    # gap ga-iwv0 already closed for delivery:deploy-pending in
+    # story-delivery.sh itself. Leave the bead untouched here (no route at
+    # all) so Step 1 keeps retrying; fall through to the normal post-build
+    # handling below once something else has actually parked or finished
+    # the bead.
+    if "delivery:failed" in labels and _has_prefix(labels, park_labels.GATE_PASSED_LABEL):
+        already_parked = (
+            "story:done" in labels
+            or any(lab in labels for lab in park_labels.BLOCKED_LABELS)
+            or park_labels.NEEDS_HUMAN_LABEL in labels
+            or park_labels.NEEDS_HUMAN_BARE_LABEL in labels
+            or any(lab.startswith(park_labels.GATE_NEEDS_HUMAN_PREFIX) for lab in labels)
+        )
+        if not already_parked:
+            return None, None
+
     # 1. post-build: gate:passed — the bead already built; delivery owns next state.
     if _has_prefix(labels, park_labels.GATE_PASSED_LABEL):
         for lab in labels:
@@ -2691,6 +2717,13 @@ def _selftest():
       (c)       needs-human label → routed
       (d)       story:blocked label → routed (label-based, not keyword)
       (e)       gate:passed → story:approved removed, no new state label added
+      (ga-kyvpk) gate:passed + delivery:failed, no terminal label → story:approved
+                left in place (story-delivery.sh's own Step 1 retries a
+                delivery:failed bead every cycle on its own; this reconciler
+                must not strip its way out from under that retry)
+      (ga-kyvpk-b) falsification: same as above but story:done ALSO present →
+                normal post-build strip resumes (carve-out doesn't swallow a
+                genuinely-done bead forever)
       (f)       NO signal + in-flight label → no action
       (g)       NO signal + daemon-age>STARVE_MIN + pilot alive → ALARM
       (h)       NO signal + daemon-age>STARVE_MIN + pilot DEAD → no alarm
@@ -5292,6 +5325,39 @@ def _selftest():
     else:
         _bad("(ga-2yyez-lane-h)", "expected an alarm but none fired — "
              "mail_calls=%s" % (mail_calls,))
+
+    print("\nScenario (ga-kyvpk): gate:passed + delivery:failed, no terminal "
+          "label → story:approved left in place (story-delivery.sh's own "
+          "Step 1 retries a delivery:failed bead every cycle on its own; "
+          "this reconciler must not strip story:approved out from under "
+          "that retry just because gate:passed is also present)")
+    _bd_approved = lambda root: [_make_bead(
+        "ga-kyvpk-1", labels=["story:approved", "gate:passed", "delivery:failed"])]
+    st = _reset()
+    run_cycle(NOW, st)
+    if not label_removes and not label_adds and not mail_calls:
+        _ok("(ga-kyvpk): gate:passed+delivery:failed → no label mutation, "
+            "story:approved preserved for Step 1 retry")
+    else:
+        _bad("(ga-kyvpk)", "removes=%s adds=%s mails=%d" % (
+            label_removes, label_adds, len(mail_calls)))
+
+    print("\nScenario (ga-kyvpk-b): falsification — same as above but "
+          "story:done ALSO present (delivery already finished this story) "
+          "→ normal post-build strip resumes; the carve-out must not "
+          "swallow a genuinely-done bead forever")
+    _bd_approved = lambda root: [_make_bead(
+        "ga-kyvpk-2",
+        labels=["story:approved", "gate:passed", "delivery:failed", "story:done"])]
+    st = _reset()
+    run_cycle(NOW, st)
+    removed_kyvpk_b = ("ga-kyvpk-2", "story:approved") in label_removes
+    if removed_kyvpk_b:
+        _ok("(ga-kyvpk-b): story:done present → post-build strip resumes "
+            "(carve-out correctly narrows itself)")
+    else:
+        _bad("(ga-kyvpk-b)", "expected story:approved removed, "
+             "removes=%s" % (label_removes,))
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
