@@ -459,6 +459,53 @@ def emit(msg):
         pass
 
 
+class _TimestampedStream:
+    """Prefix every complete line written to `stream` with a UTC timestamp.
+
+    ga-qq6eu: [INFLIGHT-RECLAIM] log lines carried no per-line timestamp, so
+    ordering "guard stripped label" vs "Pilot re-added it" during the ga-bpay8
+    investigation was only resolvable via a full dolt_diff_labels query
+    instead of a grep. Wrapping stdout/stderr once here timestamps every
+    print()/emit() call site without editing each of the ~80 of them.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._buf = ""
+
+    def write(self, data):
+        if not data:
+            return 0
+        self._buf += data
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line:
+                ts = _irg_datetime.datetime.now(_irg_datetime.timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ")
+                self._stream.write(f"{ts} {line}\n")
+            else:
+                self._stream.write("\n")
+        return len(data)
+
+    def flush(self):
+        self._stream.flush()
+
+    def isatty(self):
+        return self._stream.isatty()
+
+
+def _install_timestamped_streams():
+    """Wrap stdout/stderr so every guard log line carries a UTC timestamp.
+
+    Only called from main() — never at module import — so importing this
+    module (as inflight-reclaim-guard.selftest.sh's harness and _selftest()
+    both do, per the "main loop is guarded by __name__" convention) never
+    touches the process-wide sys.stdout/stderr.
+    """
+    _sys.stdout = _TimestampedStream(_sys.stdout)
+    _sys.stderr = _TimestampedStream(_sys.stderr)
+
+
 def account_is_rate_limited():
     """True only on a CONFIRMED active Claude session-limit (ga-ufr7).
 
@@ -7893,6 +7940,7 @@ def _selftest():
 # ---------------------------------------------------------------------------
 
 def main():
+    _install_timestamped_streams()
     emit(
         f"[INFLIGHT-RECLAIM] [STARTUP] reclaim_ttl={RECLAIM_TTL}s ({RECLAIM_TTL // 60}min) "
         f"max_reclaims={MAX_RECLAIMS} poll={POLL_SEC}s"
