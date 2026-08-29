@@ -95,11 +95,6 @@ if echo "$MSG2" | grep -qE '\(0 patch pendente\)'; then
 else
   bad "T2 expected '(0 patch pendente)', got a possibly-doubled/corrupted value" "$MSG2"
 fi
-if printf '%s' "$MSG2" | grep -qE '0[[:space:]]*$[[:space:]]*0'; then
-  bad "T2 message contains a doubled-zero artifact" "$MSG2"
-else
-  ok "T2 message has no doubled-zero artifact"
-fi
 
 # ── T3: BOTH directories empty — isolates the doubling artifact precisely.
 # ── Pre-fix, grep -c on the (wrong) top-level dir also finds nothing, so
