@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.engine-refusal-strip-watchdog</string>
+
+  <!-- Detection-only safety net for the gap ga-fn35s root-caused (ga-pxtib,
+       2026-08-29): an ad hoc, session-driven "absorbed patch" reconciliation
+       strips needs:engine-window / pool:refused:engine-rebuild-required /
+       framework:engine / pilot:refused-reason:engine-rebuild-required from a
+       bead once its patch is confirmed byte-identical to the live SOURCE
+       tree, WITHOUT closing the bead or blocking dispatch. Recurred >=3x in
+       one day, cost >=6 manual correction passes and one wasted ~84min Pilot
+       builder-dispatch cycle before this watchdog existed — and on its own
+       first live run (2026-08-29) it caught 2 more exposed beads (one
+       ctx:ready+exec:auto ARMED for dispatch) that the manual investigation's
+       own census had missed. Adds pilot:no-auto-dispatch (a manually-cleared
+       veto, never a close) to any open/in_progress bead whose refusal labels
+       were stripped and never restored/protected/superseded by a later
+       comment. Runs once per StartInterval and exits (not resident).
+       Idempotent — a single-instance flock plus a processed-commit-hash
+       state file make re-running safe. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/engine-refusal-strip-watchdog.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <!-- Sweep cadence: every 15 min, matching merged-bead-janitor and
+       pilot-missing-route-watchdog. RunAtLoad fires an immediate pass on
+       (re)load. -->
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><true/>
+
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>5</integer>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/engine-refusal-strip-watchdog-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/engine-refusal-strip-watchdog-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict>
+</plist>
