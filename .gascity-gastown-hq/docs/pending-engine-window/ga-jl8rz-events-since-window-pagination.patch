@@ -1,0 +1,191 @@
+diff --git a/internal/api/handler_events_test.go b/internal/api/handler_events_test.go
+index 7d3e30bde..27d69744d 100644
+--- a/internal/api/handler_events_test.go
++++ b/internal/api/handler_events_test.go
+@@ -549,3 +549,78 @@ func TestEventListLimitWithTypeFilterReturnsTail(t *testing.T) {
+ 		t.Fatalf("subject = %v, want \"woke-new\" (newest matching); tail regressed", got)
+ 	}
+ }
++
++// TestEventListSinceWindowPagesPastLimit is a regression test for ga-jl8rz:
++// `gc events --since=<wide window>` silently capped results at `limit`,
++// returning only the most recent slice of the window with no signal that
++// data was dropped and no way to page back further. Root cause was two
++// compounding bugs in this handler: (1) the ListTail fast path fired for
++// any Cursor=="" request regardless of a Since bound, even though
++// ListTail has no notion of "there were more matches before the tail
++// window" and never sets NextCursor; (2) even the slow/paginated path
++// never populated NextCursor on the first page (only the Cursor!=""
++// branch did), so pagination could never start from a bare `--since`
++// query. A client that pages by following NextCursor until it's empty
++// (as the `gc events` CLI does) must be able to walk every event in the
++// Since window, not just the newest `limit` of them.
++func TestEventListSinceWindowPagesPastLimit(t *testing.T) {
++	state := newFakeState(t)
++	ep := state.eventProv.(*events.Fake)
++	now := time.Now()
++	// Oldest-to-newest, spread an hour apart. "oldest" is exactly what a
++	// tail-of-N read silently drops first — the bug's reported symptom.
++	subjects := []string{"oldest", "second", "third", "fourth", "newest"}
++	for i, subject := range subjects {
++		ep.Record(events.Event{
++			Type:    events.SessionWoke,
++			Actor:   "gc",
++			Subject: subject,
++			Ts:      now.Add(-time.Duration(len(subjects)-i) * time.Hour),
++		})
++	}
++	h := newTestCityHandler(t, state)
++
++	// since=6h covers all 5 events (oldest is ~5h back); limit=2 forces
++	// the full result to span at least 3 pages.
++	seen := map[string]bool{}
++	cursor := ""
++	for page := 1; ; page++ {
++		if page > 10 {
++			t.Fatalf("walked more than 10 pages without an empty next_cursor — probable infinite loop; seen so far: %v", seen)
++		}
++		url := cityURL(state, "/events?since=6h&limit=2")
++		if cursor != "" {
++			url += "&cursor=" + cursor
++		}
++		req := httptest.NewRequest("GET", url, nil)
++		rec := httptest.NewRecorder()
++		h.ServeHTTP(rec, req)
++		if rec.Code != http.StatusOK {
++			t.Fatalf("page %d: status = %d, want %d; body=%s", page, rec.Code, http.StatusOK, rec.Body.String())
++		}
++
++		var resp struct {
++			Items      []map[string]any `json:"items"`
++			Total      int              `json:"total"`
++			NextCursor string           `json:"next_cursor"`
++		}
++		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
++			t.Fatalf("page %d: decode: %v", page, err)
++		}
++		for _, item := range resp.Items {
++			if subject, ok := item["subject"].(string); ok {
++				seen[subject] = true
++			}
++		}
++		if resp.NextCursor == "" {
++			break
++		}
++		cursor = resp.NextCursor
++	}
++
++	for _, subject := range subjects {
++		if !seen[subject] {
++			t.Errorf("subject %q missing after walking all pages; seen=%v (since-window pagination dropped events instead of paging through them)", subject, seen)
++		}
++	}
++}
+diff --git a/internal/api/huma_handlers_events.go b/internal/api/huma_handlers_events.go
+index 50583f816..8e2311138 100644
+--- a/internal/api/huma_handlers_events.go
++++ b/internal/api/huma_handlers_events.go
+@@ -52,12 +52,24 @@ func (s *Server) humaHandleEventList(ctx context.Context, input *EventListInput)
+ 
+ 	index := s.latestIndex()
+ 
+-	// Fast path: no cursor → most clients just want the N newest events.
+-	// Use ListTail when the provider supports it so we don't parse the
+-	// entire events.jsonl (which is O(file size), ~4s on 100 MB) just to
+-	// throw away all but the tail. Same pattern as the supervisor
+-	// handler's optimizedTail branch.
+-	if input.Cursor == "" {
++	// Fast path: no cursor and no Since bound → most such clients just
++	// want the N newest (matching) events, e.g. `gc events`, `gc events
++	// --seq`, or `gc events --type=X --limit=N`. Use ListTail when the
++	// provider supports it so we don't parse the entire events.jsonl
++	// (which is O(file size), ~4s on 100 MB) just to throw away all but
++	// the tail. Same pattern as the supervisor handler's optimizedTail
++	// branch.
++	//
++	// Since must gate this separately from Type/Actor: ListTail returns
++	// the trailing N *matching* events with no notion of "there were
++	// more before the window I was asked to cover", and this branch
++	// never sets NextCursor — so a `--since` request wider than N events
++	// was silently truncated to its most recent slice, with no
++	// truncation signal and no way to page further back (ga-jl8rz). A
++	// bare Type/Actor filter has no such window to violate: "the last N
++	// session events" is exactly what ListTail promises, so that case
++	// keeps the fast path (see TestEventListLimitWithTypeFilterReturnsTail).
++	if input.Cursor == "" && filter.Since.IsZero() {
+ 		if tp, ok := ep.(events.TailProvider); ok {
+ 			evts, err := tp.ListTail(filter, limit)
+ 			if err != nil {
+@@ -65,7 +77,7 @@ func (s *Server) humaHandleEventList(ctx context.Context, input *EventListInput)
+ 			}
+ 			wires := toWireEvents(evts)
+ 			// Total is best-effort here: when the caller narrowed with
+-			// Type/Actor/Since we cannot cheaply compute the full match
++			// Type/Actor we cannot cheaply compute the full match
+ 			// count, so report the returned slice length. When the
+ 			// filter is empty, LatestSeq is authoritative since the log
+ 			// is append-only and gap-free.
+@@ -82,15 +94,18 @@ func (s *Server) humaHandleEventList(ctx context.Context, input *EventListInput)
+ 		}
+ 	}
+ 
+-	// Cursor pagination (or provider without TailProvider): we still
+-	// need the full materialized list to honor offset-based cursors.
+-	// Cap the scan at (offset+limit) matching events so this path is
+-	// bounded by caller pagination depth rather than file size.
+-	scanLimit := limit
+-	if input.Cursor != "" {
+-		scanLimit = decodeCursor(input.Cursor) + limit
+-	}
+-	filter.Limit = scanLimit
++	// Cursor pagination — provider without TailProvider, or a Since
++	// bound took this out of the fast path above. Materialize matches
++	// up to one past this page so paginate() can tell "exactly `limit`
++	// matches" apart from "more than `limit`, walked off the end of
++	// this scan": ep.List stops as soon as filter.Limit matches are
++	// found, so without the +1 probe, a full page always looks
++	// indistinguishable from the last page and NextCursor never fires
++	// (ga-jl8rz). This runs for the FIRST page too (offset 0), not just
++	// once the caller already holds a cursor — otherwise pagination
++	// could never start from a bare `--since` query.
++	offset := decodeCursor(input.Cursor)
++	filter.Limit = offset + limit + 1
+ 
+ 	evts, err := ep.List(filter)
+ 	if err != nil {
+@@ -98,30 +113,14 @@ func (s *Server) humaHandleEventList(ctx context.Context, input *EventListInput)
+ 	}
+ 	wires := toWireEvents(evts)
+ 
+-	if input.Cursor != "" {
+-		pp := pageParams{
+-			Offset: decodeCursor(input.Cursor),
+-			Limit:  limit,
+-		}
+-		page, total, nextCursor := paginate(wires, pp)
+-		if page == nil {
+-			page = []WireEvent{}
+-		}
+-		return &ListOutput[WireEvent]{
+-			Index: index,
+-			Body:  ListBody[WireEvent]{Items: page, Total: total, NextCursor: nextCursor},
+-		}, nil
+-	}
+-
+-	// Capture the full match count BEFORE truncating so clients can tell
+-	// how many items match vs. fit the page.
+-	total := len(wires)
+-	if limit < len(wires) {
+-		wires = wires[:limit]
++	pp := pageParams{Offset: offset, Limit: limit}
++	page, total, nextCursor := paginate(wires, pp)
++	if page == nil {
++		page = []WireEvent{}
+ 	}
+ 	return &ListOutput[WireEvent]{
+ 		Index: index,
+-		Body:  ListBody[WireEvent]{Items: wires, Total: total},
++		Body:  ListBody[WireEvent]{Items: page, Total: total, NextCursor: nextCursor},
+ 	}, nil
+ }
+ 
