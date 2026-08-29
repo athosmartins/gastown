@@ -1,0 +1,151 @@
+diff --git a/cmd/gc/cmd_mail.go b/cmd/gc/cmd_mail.go
+index 0dad66e34..89feac563 100644
+--- a/cmd/gc/cmd_mail.go
++++ b/cmd/gc/cmd_mail.go
+@@ -1667,10 +1667,11 @@ func newMailDeleteCmd(stdout, stderr io.Writer) *cobra.Command {
+ 	var jsonOut bool
+ 	cmd := &cobra.Command{
+ 		Use:   "delete <id>...",
+-		Short: "Delete one or more messages (closes the beads)",
+-		Long: `Delete one or more messages by closing the beads. Same effect as archive
+-but with different user intent. When multiple IDs are passed, they are
+-deleted in a single batch round-trip.`,
++		Short: "Permanently delete one or more messages (irreversible)",
++		Long: `Delete one or more messages by permanently removing the beads — this does
++NOT close them, and cannot be undone. Same effect as archive but with
++different user intent. When multiple IDs are passed, they are deleted in a
++single batch round-trip.`,
+ 		Args: cobra.ArbitraryArgs,
+ 		RunE: func(_ *cobra.Command, args []string) error {
+ 			code := 0
+diff --git a/cmd/gc/cmd_mail_delete_helptext_test.go b/cmd/gc/cmd_mail_delete_helptext_test.go
+new file mode 100644
+index 000000000..997e43cc9
+--- /dev/null
++++ b/cmd/gc/cmd_mail_delete_helptext_test.go
+@@ -0,0 +1,29 @@
++package main
++
++import (
++	"bytes"
++	"strings"
++	"testing"
++)
++
++// TestMailDeleteHelpTextDoesNotClaimClose guards against ga-7olk0: `gc mail
++// delete` performs an immediate, irreversible hard delete (see
++// Provider.Delete/Archive in internal/mail/beadmail), but its help text used
++// to say "closing the beads" — a soft-close claim the code never honored.
++// Fails on the prior text ("Delete one or more messages (closes the beads)" /
++// "...by closing the beads...").
++func TestMailDeleteHelpTextDoesNotClaimClose(t *testing.T) {
++	cmd := newMailDeleteCmd(&bytes.Buffer{}, &bytes.Buffer{})
++
++	for _, text := range []string{cmd.Short, cmd.Long} {
++		lower := strings.ToLower(text)
++		if strings.Contains(lower, "closing the bead") || strings.Contains(lower, "closes the bead") {
++			t.Errorf("help text falsely claims a soft-close: %q", text)
++		}
++	}
++
++	lower := strings.ToLower(cmd.Long)
++	if !strings.Contains(lower, "permanently") && !strings.Contains(lower, "irreversible") && !strings.Contains(lower, "cannot be undone") {
++		t.Errorf("help text should disclose the delete is permanent/irreversible, got: %q", cmd.Long)
++	}
++}
+diff --git a/third_party/beads/internal/storage/dolt/wisp_delete_event_test.go b/third_party/beads/internal/storage/dolt/wisp_delete_event_test.go
+new file mode 100644
+index 000000000..214017362
+--- /dev/null
++++ b/third_party/beads/internal/storage/dolt/wisp_delete_event_test.go
+@@ -0,0 +1,53 @@
++package dolt
++
++import (
++	"testing"
++
++	"github.com/steveyegge/beads/internal/types"
++)
++
++// TestDeleteWispRecordsAWispEvent guards ga-7olk0's audit-trail half: wisps
++// carry no Dolt version-control history (dolt_ignored — see
++// 0021_create_wisp_auxiliary.up.sql), so a "deleted" wisp_events row is the
++// only trace that survives an id being removed. Fails on the prior
++// deleteWisp, which deleted the wisps row and left wisp_events untouched —
++// the same signature the original bug report captured live against a real
++// server (wisp_events showed only created/label_added after an archive,
++// never a terminal event, and the row was unrecoverable).
++func TestDeleteWispRecordsAWispEvent(t *testing.T) {
++	store, cleanup := setupTestStore(t)
++	defer cleanup()
++	ctx, cancel := testContext(t)
++	defer cancel()
++
++	id := "test-wispdel-ev"
++	if err := store.CreateIssue(ctx, &types.Issue{
++		ID: id, Title: id, Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask, Ephemeral: true,
++	}, "seed"); err != nil {
++		t.Fatalf("CreateIssue(wisp): %v", err)
++	}
++
++	if err := store.DeleteIssue(ctx, id); err != nil {
++		t.Fatalf("DeleteIssue: %v", err)
++	}
++
++	var stillPresent int
++	if err := store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM wisps WHERE id = ?", id).Scan(&stillPresent); err != nil {
++		t.Fatalf("query wisps: %v", err)
++	}
++	if stillPresent != 0 {
++		t.Fatalf("wisps row for %s still present after DeleteIssue", id)
++	}
++
++	var eventCount int
++	if err := store.db.QueryRowContext(ctx,
++		"SELECT COUNT(*) FROM wisp_events WHERE issue_id = ? AND event_type = ?",
++		id, string(types.EventDeleted),
++	).Scan(&eventCount); err != nil {
++		t.Fatalf("query wisp_events: %v", err)
++	}
++	if eventCount != 1 {
++		t.Fatalf("wisp_events rows with event_type=%q for %s = %d, want 1 — the delete left no audit trail",
++			types.EventDeleted, id, eventCount)
++	}
++}
+diff --git a/third_party/beads/internal/storage/dolt/wisps.go b/third_party/beads/internal/storage/dolt/wisps.go
+index 475163d38..dd27c1c8d 100644
+--- a/third_party/beads/internal/storage/dolt/wisps.go
++++ b/third_party/beads/internal/storage/dolt/wisps.go
+@@ -308,6 +308,18 @@ func (s *DoltStore) deleteWisp(ctx context.Context, id string) error {
+ 		return fmt.Errorf("wisp not found: %s", id)
+ 	}
+ 
++	// wisps carries no version-control history (dolt_ignored, unlike issues),
++	// so this row is the only surviving trace that id existed and when it was
++	// removed — record it even though the wisp itself is gone. No FK ties
++	// wisp_events to wisps (see 0021_create_wisp_auxiliary.up.sql), so writing
++	// this after the DELETE above is safe. Actor is intentionally not
++	// captured here: DeleteIssue's public signature carries no actor
++	// parameter (unlike UpdateIssue/AddDependency), and widening it touches
++	// every Storage implementer — out of scope for this fix.
++	if err := issueops.RecordEventInTable(ctx, tx, "wisp_events", id, types.EventDeleted, "", ""); err != nil {
++		return fmt.Errorf("failed to record wisp delete event: %w", err)
++	}
++
+ 	if err := issueops.DeleteWispFromDependenciesInTx(ctx, tx, id); err != nil {
+ 		return err
+ 	}
+diff --git a/third_party/beads/internal/types/types.go b/third_party/beads/internal/types/types.go
+index 0fb174fab..f541ed349 100644
+--- a/third_party/beads/internal/types/types.go
++++ b/third_party/beads/internal/types/types.go
+@@ -1527,6 +1527,9 @@ const (
+ 	// EventLeaseReclaimed records that a stale lease was reverted to ready by
+ 	// bd reclaim (dead-worker recovery). old_value is the previous owner.
+ 	EventLeaseReclaimed EventType = "lease_reclaimed"
++	// EventDeleted records that a row was permanently removed (id + when
++	// survive in the events table even though the row itself does not).
++	EventDeleted EventType = "deleted"
+ )
+ 
+ // BlockedIssue extends Issue with blocking information
