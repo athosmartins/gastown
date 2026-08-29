@@ -1,0 +1,242 @@
+diff --git a/examples/dolt/commands/health/run.sh b/examples/dolt/commands/health/run.sh
+index feb09aa3e..58c510588 100755
+--- a/examples/dolt/commands/health/run.sh
++++ b/examples/dolt/commands/health/run.sh
+@@ -12,6 +12,25 @@ set -e
+ PACK_DIR="${GC_PACK_DIR:-$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)}"
+ . "$PACK_DIR/assets/scripts/runtime.sh"
+ 
++# rig_discovery_degraded is set to true by metadata_files() whenever it
++# could not positively confirm the full external rig set (gc missing, the
++# bounded `gc rig list` call failed/timed out, or -- lacking jq to verify
++# the response shape -- an empty parse that can't be told apart from a
++# failure). ga-eu2x: an incomplete scan here used to be silently
++# indistinguishable from "confirmed no other rigs" -- every database not
++# in the resulting (HQ-only) referenced set then got reported by the
++# orphan check below as a CONFIRMED orphan, including live production
++# databases whose only "crime" is living in a rig outside
++# $GC_CITY_PATH/rigs (true for every externally-cloned rig in this city:
++# `gc rig list` timing out under Dolt load -- 8-17s measured against a 5s
++# bound -- silently dropped whatsapp_automation/gastown/dc/lexbh/
++# marketing/property_scrapers to "orphan" in the same report a human or
++# agent might act on with `gc dolt cleanup --force`). Consumers of the
++# orphan report MUST treat a degraded scan as "unknown", never as
++# "confirmed absent" -- see the "erro e vazio não podem produzir o mesmo
++# valor" rule this bug is the canonical example of.
++rig_discovery_degraded=false
++
+ metadata_files() {
+   printf '%s\n' "$GC_CITY_PATH/.beads/metadata.json"
+ 
+@@ -19,22 +38,41 @@ metadata_files() {
+     # Bound the gc rig list call: if gc is itself in a bad state (the
+     # failure mode this patrol is meant to detect) we must not block
+     # here. Degrade to the fallback rig scan below.
+-    rig_paths=$(run_bounded 5 gc rig list --json 2>/dev/null \
+-      | if command -v jq >/dev/null 2>&1; then
+-          jq -r '.rigs[].path' 2>/dev/null
+-        else
+-          grep '"path"' | sed 's/.*"path": *"//;s/".*//'
+-        fi) || true
+-    if [ -n "$rig_paths" ]; then
+-      printf '%s\n' "$rig_paths" | while IFS= read -r p; do
+-        [ -n "$p" ] && printf '%s\n' "$p/.beads/metadata.json"
+-      done
+-      return
++    if rig_list_json=$(run_bounded 5 gc rig list --json 2>/dev/null); then
++      if command -v jq >/dev/null 2>&1; then
++        rig_paths=$(printf '%s' "$rig_list_json" | jq -r '.rigs[].path' 2>/dev/null) || true
++      else
++        rig_paths=$(printf '%s' "$rig_list_json" | grep '"path"' | sed 's/.*"path": *"//;s/".*//') || true
++      fi
++      if [ -n "$rig_paths" ]; then
++        printf '%s\n' "$rig_paths" | while IFS= read -r p; do
++          [ -n "$p" ] && printf '%s\n' "$p/.beads/metadata.json"
++        done
++        return
++      fi
++      # `gc rig list` ran and exited 0 but produced no paths. With jq
++      # available to have confirmed the response actually parsed as
++      # `.rigs`, an empty result here is a genuine positive "zero external
++      # rigs" and is trusted as such (falls through to the harmless local
++      # fallback below with no degraded flag). Without jq we cannot tell
++      # that apart from "the output didn't look like what grep expected" --
++      # degrade only in that case.
++      if ! command -v jq >/dev/null 2>&1; then
++        rig_discovery_degraded=true
++      fi
++    else
++      # run_bounded killed it (timeout) or `gc rig list` itself exited
++      # non-zero. An empty rig_paths derived from this must NEVER be read
++      # as "confirmed zero rigs".
++      rig_discovery_degraded=true
+     fi
++  else
++    rig_discovery_degraded=true
+   fi
+ 
+   # Fallback: scan local rigs/ directory only. Cannot discover external rigs
+-  # when gc is unavailable — acceptable degradation.
++  # when gc is unavailable/degraded — acceptable degradation, but (per the
++  # flag set above) never presented as a complete rig set.
+   find "$GC_CITY_PATH/rigs" -path '*/.beads/metadata.json' 2>/dev/null || true
+ }
+ 
+@@ -376,6 +414,7 @@ JSONEOF
+     "dolt_age_sec": $backup_age_sec,
+     "dolt_stale": $backup_stale
+   },
++  "orphan_check_degraded": $rig_discovery_degraded,
+   "orphans": [
+ JSONEOF
+   first=true
+@@ -429,7 +468,20 @@ else
+   echo "Backups: none found"
+ fi
+ 
+-if [ "$orphan_count" -gt 0 ]; then
++if [ "$rig_discovery_degraded" = true ]; then
++  echo ""
++  echo "Orphans: UNKNOWN — rig discovery degraded (gc rig list failed, timed out, or gc/jq unavailable)."
++  echo "  The external rig set could not be confirmed, so directories not matched"
++  echo "  to a known rig CANNOT be trusted as orphans — some may be live"
++  echo "  production databases. Do not act on this report (e.g. gc dolt cleanup)."
++  if [ "$orphan_count" -gt 0 ]; then
++    echo "  Unverified candidates ($orphan_count):"
++    echo "$orphan_list" | while IFS='|' read -r name size; do
++      [ -z "$name" ] && continue
++      echo "    ? $name ($size)"
++    done
++  fi
++elif [ "$orphan_count" -gt 0 ]; then
+   echo ""
+   echo "Orphans: $orphan_count"
+   echo "$orphan_list" | while IFS='|' read -r name size; do
+diff --git a/examples/dolt/health_orphan_degraded_test.go b/examples/dolt/health_orphan_degraded_test.go
+new file mode 100644
+index 000000000..3f606e737
+--- /dev/null
++++ b/examples/dolt/health_orphan_degraded_test.go
+@@ -0,0 +1,122 @@
++package dolt_test
++
++import (
++	"encoding/json"
++	"net"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"testing"
++)
++
++// TestHealthScriptOrphanCheckDegradesWhenRigDiscoveryFails is the
++// regression guard for ga-eu2x: when `gc rig list --json` fails (the
++// real incident was a 5s bound racing 8-17s of Dolt load, but any
++// failure/timeout is the same signal from the script's point of view),
++// metadata_files() used to silently fall back to an HQ-only scan and the
++// orphan check below then reported EVERY other database directory as a
++// confirmed orphan — including live production databases whose only
++// "crime" was living in a rig outside $GC_CITY_PATH/rigs (true for every
++// externally-cloned rig; verified live against whatsapp_automation,
++// gastown, dc, lexbh, marketing, property_scrapers). The health report
++// must instead flag the scan as degraded, and the human-readable output
++// must not present those directories as confirmed orphans — Mayor's
++// 2026-07-31 comment on ga-eu2x identifies this report as the one
++// remaining live trigger for a human/agent to run the destructive
++// `gc dolt cleanup --force` (space form) by hand.
++func TestHealthScriptOrphanCheckDegradesWhenRigDiscoveryFails(t *testing.T) {
++	cityPath := t.TempDir()
++	fakeBin := t.TempDir()
++	dataDir := t.TempDir()
++
++	if err := os.MkdirAll(filepath.Join(cityPath, ".beads"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "metadata.json"),
++		[]byte(`{"dolt_database":"hq"}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	// Stand-ins for hq (referenced) plus two "production" databases that
++	// are NOT referenced by the only metadata.json this city can see once
++	// rig discovery fails — matching the real incident's shape.
++	for _, name := range []string{"hq", "whatsapp_automation", "gastown"} {
++		if err := os.MkdirAll(filepath.Join(dataDir, name, ".dolt"), 0o755); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	// Fake gc: `gc rig list --json` always fails — reproduces the trigger
++	// (a hard failure and a run_bounded timeout look identical to the
++	// script: both leave rig_list_json unset and the `if rig_list_json=...`
++	// branch false).
++	writeExecutable(t, filepath.Join(fakeBin, "gc"), "#!/bin/sh\nexit 1\n")
++	writeExecutable(t, filepath.Join(fakeBin, "dolt"), "#!/bin/sh\nexit 1\n")
++
++	root := repoRoot(t)
++	baseEnv := append(
++		filteredEnv("GC_CITY_PATH", "GC_PACK_DIR", "GC_DOLT_HOST", "GC_DOLT_PORT",
++			"GC_DOLT_USER", "GC_DOLT_PASSWORD", "GC_HEALTH_SKIP_ZOMBIE_SCAN",
++			"GC_DOLT_DATA_DIR", "PATH"),
++		"GC_CITY_PATH="+cityPath,
++		"GC_PACK_DIR="+root,
++		"GC_DOLT_HOST=127.0.0.1",
++		"GC_DOLT_PORT="+strconv.Itoa(freeTCPPortForTest(t)),
++		"GC_DOLT_USER=root",
++		"GC_DOLT_PASSWORD=",
++		"GC_HEALTH_SKIP_ZOMBIE_SCAN=1",
++		"GC_DOLT_DATA_DIR="+dataDir,
++		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
++	)
++
++	jsonCmd := exec.Command("sh", filepath.Join(root, healthScript), "--json")
++	jsonCmd.Env = baseEnv
++	out, err := jsonCmd.CombinedOutput()
++	if err != nil {
++		t.Fatalf("health.sh --json failed: %v\n%s", err, out)
++	}
++
++	var report struct {
++		OrphanCheckDegraded bool `json:"orphan_check_degraded"`
++		Orphans             []struct {
++			Name string `json:"name"`
++		} `json:"orphans"`
++	}
++	if jsonErr := json.Unmarshal(out, &report); jsonErr != nil {
++		t.Fatalf("health.sh --json returned invalid JSON: %v\n%s", jsonErr, out)
++	}
++
++	if !report.OrphanCheckDegraded {
++		t.Errorf("orphan_check_degraded = false, want true: gc rig list failed, "+
++			"so the orphan list cannot be trusted — got:\n%s", out)
++	}
++
++	// Human-readable mode is the actual live risk vector per Mayor's
++	// analysis (a human/agent reads this and may act on it). It must
++	// never present whatsapp_automation/gastown as confirmed orphans
++	// without an equally prominent degraded warning.
++	humanCmd := exec.Command("sh", filepath.Join(root, healthScript))
++	humanCmd.Env = baseEnv
++	humanOut, _ := humanCmd.CombinedOutput() // non-zero exit expected: server unreachable
++	human := string(humanOut)
++
++	if strings.Contains(human, "whatsapp_automation") && !strings.Contains(strings.ToLower(human), "degraded") {
++		t.Errorf("human-readable output lists whatsapp_automation without a degraded warning:\n%s", human)
++	}
++	if strings.Contains(human, "Orphans: 2") {
++		t.Errorf("human-readable output reports a confirmed orphan count from a degraded scan:\n%s", human)
++	}
++}
++
++func freeTCPPortForTest(t *testing.T) int {
++	t.Helper()
++	l, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("listen: %v", err)
++	}
++	port := l.Addr().(*net.TCPAddr).Port
++	_ = l.Close()
++	return port
++}
