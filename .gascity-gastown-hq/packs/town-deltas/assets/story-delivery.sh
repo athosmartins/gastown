@@ -1508,10 +1508,12 @@ elif [ ! -f "$REFRESH_HELPER" ]; then
   warn "daemon-refresh helper missing at $REFRESH_HELPER — skipping freshness verification (degraded; cannot prove daemons are live)."
 else
   SENSITIVE_DAEMONS=$(get_runbook_field "$RIG" "sensitive_daemons" 2>/dev/null | tr '\n' ' ' || echo "")
-  log "Daemon refresh: pre=$PRE_DEPLOY_SHA post=$POST_DEPLOY_SHA sensitive='$SENSITIVE_DAEMONS' ..."
+  EXTRA_RUNTIME_ROOTS=$(get_runbook_field "$RIG" "extra_runtime_roots" 2>/dev/null | tr '\n' ' ' || echo "")
+  log "Daemon refresh: pre=$PRE_DEPLOY_SHA post=$POST_DEPLOY_SHA sensitive='$SENSITIVE_DAEMONS' extra_roots='$EXTRA_RUNTIME_ROOTS' ..."
   REFRESH_OUT=$(RUNTIME_DIR="$RUNTIME_DIR" \
     PRE_DEPLOY_SHA="$PRE_DEPLOY_SHA" POST_DEPLOY_SHA="$POST_DEPLOY_SHA" \
     DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
+    EXTRA_RUNTIME_ROOTS="$EXTRA_RUNTIME_ROOTS" \
     DRY_RUN="$DRY_RUN" \
     bash "$REFRESH_HELPER" || true)
   REFRESH_VERDICT=$(echo "$REFRESH_OUT" | grep '^VERDICT=' | head -1 | sed 's/^VERDICT=//')

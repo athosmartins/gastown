@@ -102,6 +102,17 @@
 #   POST_DEPLOY_SHA   HEAD after deploy
 #   DEPLOY_EPOCH      unix epoch captured immediately before deploy
 #   SENSITIVE_DAEMONS space/newline-separated launchd-label substrings (hot-path)
+#   EXTRA_RUNTIME_ROOTS (ga-00ptz) space/newline-separated absolute paths of
+#                     OTHER independently-deployed clones of this same rig's
+#                     repo (e.g. painel-prod, a hand-synced second checkout of
+#                     whatsapp_automation kept fresh by its own deploy-sync
+#                     job, not by this pipeline's git-pull). A plist entrypoint
+#                     under one of these is resolved to the relpath it shares
+#                     with RUNTIME_DIR — see resolve_relpath() — so a daemon
+#                     running from a second clone of the SAME source is still
+#                     discovered. Never invents an entrypoint: the relpath must
+#                     also actually exist under RUNTIME_DIR. Empty = none
+#                     (identical to pre-ga-00ptz behavior).
 #   DRY_RUN           1 = report only, no kickstart/verify (default 0)
 #   DRAIN_CMD_<label> optional graceful-drain command for a sensitive daemon
 #                     (<label> sanitized: non-alnum → _)
@@ -119,6 +130,7 @@ PRE_DEPLOY_SHA="${PRE_DEPLOY_SHA:-}"
 POST_DEPLOY_SHA="${POST_DEPLOY_SHA:-}"
 DEPLOY_EPOCH="${DEPLOY_EPOCH:-0}"
 SENSITIVE_DAEMONS="${SENSITIVE_DAEMONS:-}"
+EXTRA_RUNTIME_ROOTS="${EXTRA_RUNTIME_ROOTS:-}"
 DRY_RUN="${DRY_RUN:-0}"
 LAUNCH_AGENTS_DIR="${LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 LAUNCHCTL_BIN="${LAUNCHCTL_BIN:-launchctl}"
@@ -322,11 +334,21 @@ PY
 # Resolve a (possibly $VAR-prefixed or absolute) .py token to a relpath that
 # exists under RUNTIME_DIR; echoes nothing if it cannot be resolved.
 resolve_relpath() {  # resolve_relpath <token>
-  local t="$1" c
+  local t="$1" c root
   # absolute under runtime
   case "$t" in
     "$RUNTIME_DIR"/*) c="${t#"$RUNTIME_DIR"/}"; [ -f "$RUNTIME_DIR/$c" ] && { echo "$c"; return; } ;;
   esac
+  # absolute under a configured EXTRA_RUNTIME_ROOTS entry (ga-00ptz): a second,
+  # independently-deployed clone of this SAME rig's repo (e.g. painel-prod).
+  # The relpath it shares with RUNTIME_DIR must also actually exist there —
+  # this only grants visibility into a file genuinely present in both trees,
+  # never invents an entrypoint out of thin air.
+  for root in $EXTRA_RUNTIME_ROOTS; do
+    case "$t" in
+      "$root"/*) c="${t#"$root"/}"; [ -f "$RUNTIME_DIR/$c" ] && { echo "$c"; return; } ;;
+    esac
+  done
   # strip a leading shell-var segment: $BASEDIR/ ${WA_ROOT}/ etc.
   c="$(echo "$t" | sed -E 's#^.*\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/##')"
   [ -n "$c" ] && [ "$c" != "$t" ] && [ -f "$RUNTIME_DIR/$c" ] && { echo "$c"; return; }

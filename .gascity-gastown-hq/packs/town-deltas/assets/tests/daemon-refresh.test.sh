@@ -27,6 +27,11 @@
 #      push a human toward an unnecessary hot-path restart. A genuinely-stale
 #      SENSITIVE sibling in the SAME deploy still correctly wins the overall
 #      verdict (NEEDS_GUARDED_RESTART is never masked).
+#   9. (ga-00ptz) Discovers a daemon whose plist entrypoint lives under a
+#      SEPARATE, independently-deployed clone of the same repo (e.g. real-world
+#      painel-prod vs. whatsapp_automation) when that clone's root is listed in
+#      EXTRA_RUNTIME_ROOTS — instead of silently dropping it from discovery and
+#      reporting the false "touches no live daemon".
 #
 # All external effects (launchctl, ps) are injected via LAUNCHCTL_BIN / PS_BIN
 # and a mock state dir, so the test touches NO real daemons. The plist scan and
@@ -163,6 +168,7 @@ run_helper() {  # run_helper <changed-relpaths...>  (commits a deploy diff first
   PRE_DEPLOY_SHA="$PRE" POST_DEPLOY_SHA="$POST" \
   DEPLOY_EPOCH="$DEPLOY_EPOCH" \
   SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
+  EXTRA_RUNTIME_ROOTS="${EXTRA_RUNTIME_ROOTS:-}" \
   LAUNCH_AGENTS_DIR="$AGENTS" \
   LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" \
   VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
@@ -567,6 +573,40 @@ echo "$(field GUARDED "$OUT")" | grep -q "com.test.slot-scheduler" && ok "T16 st
 echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" && nok "T16 fresh daemon should NOT be in GUARDED" "$(field GUARDED "$OUT")" || ok "T16 fresh daemon not in GUARDED"
 echo "$(field ALREADY_FRESH "$OUT")" | grep -q "com.test.central-sender" && ok "T16 fresh daemon recorded in ALREADY_FRESH" || nok "T16 already_fresh" "$(field ALREADY_FRESH "$OUT")"
 ! grep -q "com.test.central-sender" "$MOCK/kicks.log" 2>/dev/null && ok "T16 fresh daemon NOT kickstarted" || nok "T16 no-kickstart" "kickstart log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T17 (ga-00ptz): a daemon's plist entrypoint lives under a SEPARATE,
+# independently-deployed clone of the SAME repo (real-world: painel-prod vs.
+# whatsapp_automation — two independent `git clone`s of one upstream, kept in
+# sync by an unrelated deploy-sync mechanism, not by story-delivery.sh's own
+# git-pull). Pre-fix, resolve_relpath() only matched a plist path literal
+# under RUNTIME_DIR (or with a $VAR/ prefix to strip) — an absolute path under
+# this second clone matched neither, so the daemon was silently dropped in
+# Step 2 and never reached Step 3's AFFECTED check, regardless of what
+# changed: VERDICT=OK/PROOF=not_verified/"touches no live daemon" for a
+# daemon that is, in fact, live and running the changed file. Listing the
+# second clone's root in EXTRA_RUNTIME_ROOTS fixes discovery: the SAME
+# relpath must also exist under RUNTIME_DIR (the tree actually being diffed),
+# so this only ever grants visibility into a file genuinely present in both
+# trees — it can never invent an entrypoint out of thin air.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t17
+SECOND_CLONE="$CASE_DIR/second_clone"
+mkdir -p "$SECOND_CLONE/daemons"
+cat > "$SECOND_CLONE/daemons/painel_visibilidade.py" <<<'print("painel")'
+cat > "$RUNTIME/daemons/painel_visibilidade.py" <<<'print("painel")'
+make_plist "$AGENTS" com.test.painel-visibilidade "$SECOND_CLONE/venv/bin/python3" "$SECOND_CLONE/daemons/painel_visibilidade.py"
+seed_running com.test.painel-visibilidade 9301 "$STALE_LSTART"
+seed_restart com.test.painel-visibilidade 9399 "$FRESH_LSTART"
+EXTRA_RUNTIME_ROOTS="$SECOND_CLONE"
+OUT=$(run_helper daemons/painel_visibilidade.py); RC=$?
+unset EXTRA_RUNTIME_ROOTS
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T17 verdict OK" || nok "T17 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -eq 0 ] && ok "T17 exit 0" || nok "T17 exit" "rc=$RC"
+echo "$(field AFFECTED "$OUT")" | grep -q "com.test.painel-visibilidade" && ok "T17 daemon under second clone discovered + affected" || nok "T17 affected" "$(field AFFECTED "$OUT")"
+echo "$(field RESTARTED "$OUT")" | grep -q "com.test.painel-visibilidade" && ok "T17 daemon restarted" || nok "T17 restarted" "$(field RESTARTED "$OUT")"
+[ "$(field PROOF "$OUT")" = "verified" ] && ok "T17 PROOF=verified (no longer a false 'touches no live daemon')" || nok "T17 proof" "got '$(field PROOF "$OUT")'"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""

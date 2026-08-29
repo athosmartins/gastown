@@ -32,6 +32,20 @@
 #                     non-zero on failure. If absent, delivery halts with
 #                     "no prod test — cannot mark done".
 #   min_deploy_gap_minutes — don't redeploy if last deploy was < N minutes ago.
+#   extra_runtime_roots — (ga-00ptz) OTHER absolute paths that are also
+#                     independently-deployed clones of this SAME rig's repo,
+#                     kept live by a mechanism OTHER than this pipeline's own
+#                     deploy_cmd (e.g. painel-prod: a hand-synced second
+#                     checkout of whatsapp_automation, refreshed by its own
+#                     deploy-sync launchd job). daemon-refresh.sh's plist
+#                     discovery only recognizes an entrypoint under
+#                     runtime_dir; without listing a daemon's ACTUAL clone
+#                     here, its plist resolves to nothing and the daemon is
+#                     silently invisible to the ga-l7n3v liveness check —
+#                     "changed code touches no live daemon" even when it does
+#                     (confirmed live: com.urblink.painel-visibilidade, whose
+#                     plist points at painel-prod, not runtime_dir). Empty
+#                     list = none (identical to pre-ga-00ptz behavior).
 #
 # Safety: story-delivery.sh NEVER auto-reverts. On failure it halts + escalates.
 
@@ -85,6 +99,13 @@ daemon_restarts = []   # WA worker managed by gc session; no STATIC launchd rest
 # derive this list FROM restart_policy.yaml instead of hand-copying it, so the
 # two registries can't drift again).
 sensitive_daemons = ["central-sender", "webhook-receiver", "slot-scheduler", "conversation-monitor", "campaign-dashboard", "clientes-dashboard", "map-viewer", "frota-dashboard", "demand-dashboard", "daemon-health-monitor", "classification-dashboard"]
+# ga-00ptz: com.urblink.painel-visibilidade's plist runs it from painel-prod —
+# a separate, hand-synced clone of this same repo, refreshed by its own
+# deploy-sync job (com.gastown.painel-prod-deploy-sync), not by this rig's own
+# deploy_cmd. Without this, its entrypoint never resolves under runtime_dir
+# and daemon-refresh.sh silently drops it from discovery — confirmed live,
+# see ga-00ptz.
+extra_runtime_roots = ["/Users/athos/gt/painel-prod"]
 # ga-857v FIX 2: rig-level smoke harness — asserts painel :8202 (200 + title +
 # SSTI closed) and the admin :8097 registration. WA deliveries now reach
 # story:done with delivery:tested instead of the ga-dqp interim delivery:untested.

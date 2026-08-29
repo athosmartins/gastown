@@ -5081,6 +5081,7 @@ $PARTIAL_EVIDENCE" 2>/dev/null || true
         DR_RUNTIME_DIR=""
         DR_DEPLOY_CMD=""
         DR_SENSITIVE=""
+        DR_EXTRA_ROOTS=""
         DAEMON_HOLD_VERDICT=""
         DAEMON_HOLD_REASON=""
         DAEMON_HOLD_DETAIL=""
@@ -5154,6 +5155,7 @@ PYEOF
         else
           DR_DEPLOY_CMD=$(_gl7n3v_runbook_field "$RIG" "deploy_cmd" || true)
           DR_SENSITIVE=$(_gl7n3v_runbook_field "$RIG" "sensitive_daemons" | tr '\n' ' ' || true)
+          DR_EXTRA_ROOTS=$(_gl7n3v_runbook_field "$RIG" "extra_runtime_roots" | tr '\n' ' ' || true)
           DR_PRE_SHA=$(git -C "$DR_RUNTIME_DIR" rev-parse HEAD 2>/dev/null || echo "")
           DR_EPOCH=$(date +%s)
           DR_DEPLOY_FAILED=0
@@ -5197,7 +5199,8 @@ PYEOF
           else
             DR_POST_SHA=$(git -C "$DR_RUNTIME_DIR" rev-parse HEAD 2>/dev/null || echo "")
             DR_OUT=$(RUNTIME_DIR="$DR_RUNTIME_DIR" PRE_DEPLOY_SHA="$DR_PRE_SHA" POST_DEPLOY_SHA="$DR_POST_SHA" \
-              DEPLOY_EPOCH="$DR_EPOCH" SENSITIVE_DAEMONS="$DR_SENSITIVE" DRY_RUN="$DRY_RUN" \
+              DEPLOY_EPOCH="$DR_EPOCH" SENSITIVE_DAEMONS="$DR_SENSITIVE" \
+              EXTRA_RUNTIME_ROOTS="$DR_EXTRA_ROOTS" DRY_RUN="$DRY_RUN" \
               bash "$GC_CITY/packs/town-deltas/assets/daemon-refresh.sh" 2>&1 || true)
             # ga-l7n3v: `|| true` on all three — under this script's set -euo
             # pipefail, an unmatched grep piped into head/sed still propagates a
