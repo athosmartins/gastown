@@ -1,0 +1,91 @@
+diff --git a/internal/reaper/reaper.go b/internal/reaper/reaper.go
+index 92a5d81b1..f0a40326a 100644
+--- a/internal/reaper/reaper.go
++++ b/internal/reaper/reaper.go
+@@ -584,8 +584,8 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
+ }
+ 
+ // AutoClose closes issues that have been open with no updates past staleAge.
+-// Excludes P0/P1 priority, epics, hooked/pinned issues, standing-order labels,
+-// and issues with active dependencies.
++// Excludes P0/P1 priority, epics, agent/session identity beads, hooked/pinned
++// issues, standing-order labels, and issues with active dependencies.
+ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (*AutoCloseResult, error) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), DefaultQueryTimeout)
+ 	defer cancel()
+@@ -593,11 +593,23 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
+ 	staleCutoff := time.Now().UTC().Add(-staleAge)
+ 	result := &AutoCloseResult{Database: dbName, DryRun: dryRun}
+ 
++	// issue_type IN ('agent','session') beads are persistent identity records
++	// (crew/witness/refinery workspaces, live agent sessions) that legitimately
++	// go months without an update — that's their normal resting state, not
++	// staleness. Reap() already excludes both types (see its whereClause
++	// above, and the gt-rlujz incident where reaping session wisps killed
++	// active+pinned crew); AutoClose lacked the mirror exclusion, so a bare
++	// `gt reaper auto-close`/`run` against hq would close every open
++	// agent-identity bead in the city. Verified live 2026-08-29 (ga-xo035):
++	// 13/13 open agent-type issues in hq (lx-lexbh-crew-thies,
++	// dc-deacon-witness, gt-gastown-crew-furiosa, ps-property_scrapers-*,
++	// etc.) matched every other AutoClose criterion and would have closed.
+ 	whereClause := fmt.Sprintf(`
+ 		i.status IN ('open', 'in_progress')
+ 		AND i.updated_at < ?
+ 		AND i.priority > 1
+ 		AND i.issue_type != 'epic'
++		AND i.issue_type NOT IN ('agent', 'session')
+ 		AND i.id NOT IN (
+ 			SELECT DISTINCT l.issue_id FROM `+"`%s`"+`.labels l
+ 			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig')
+diff --git a/internal/reaper/reaper_test.go b/internal/reaper/reaper_test.go
+index be9365b2d..90c9ece0a 100644
+--- a/internal/reaper/reaper_test.go
++++ b/internal/reaper/reaper_test.go
+@@ -242,8 +242,45 @@ func TestScanExcludesAgentBeads(t *testing.T) {
+ 		t.Fatalf("could not isolate Scan() body in %s", sourcePath)
+ 	}
+ 	scanBody := source[scanStart:reapStart]
+-	if !strings.Contains(scanBody, "w.issue_type != 'agent'") {
+-		t.Fatalf("expected Scan() eligibility to exclude agent beads, scan body was:\n%s", scanBody)
++	// The exclusion predicate widened from a single "!= 'agent'" to
++	// "NOT IN ('agent', 'session')" when session-identity beads got the same
++	// protection (gt-rlujz); this assertion drifted from the real query text
++	// and had been silently red ever since (found while fixing ga-xo035 —
++	// AutoClose's missing mirror of this same guard).
++	if !strings.Contains(scanBody, "w.issue_type NOT IN ('agent', 'session')") {
++		t.Fatalf("expected Scan() eligibility to exclude agent/session beads, scan body was:\n%s", scanBody)
++	}
++}
++
++// TestAutoCloseExcludesAgentAndSessionBeads is a regression test for the
++// sibling of the bug TestReapExcludesAgentBeads documents: AutoClose() never
++// got the mirror "issue_type NOT IN ('agent','session')" guard that Reap()
++// already has. Verified live against hq on 2026-08-29 (ga-xo035): all 13/13
++// open agent-type issues in hq (lx-lexbh-crew-thies, dc-deacon-witness,
++// gt-gastown-crew-furiosa, ps-property_scrapers-*, etc.) matched every other
++// AutoClose criterion (priority>1, not epic, no active deps, updated_at >30d
++// stale — identity beads legitimately go untouched for months) and would
++// have been closed by a bare `gt reaper auto-close`/`run`. Same pattern as
++// TestScanExcludesAgentBeads: read the real source, isolate the function
++// body, assert the exclusion substring — so it fails against the pre-fix
++// source and passes after.
++func TestAutoCloseExcludesAgentAndSessionBeads(t *testing.T) {
++	sourcePath := "reaper.go"
++	data, err := os.ReadFile(sourcePath)
++	if err != nil {
++		t.Fatalf("read %s: %v", sourcePath, err)
++	}
++	source := string(data)
++	acStart := strings.Index(source, "func AutoClose(")
++	if acStart == -1 {
++		t.Fatalf("could not find AutoClose() in %s", sourcePath)
++	}
++	acBody := source[acStart:]
++	if end := strings.Index(acBody, "\nfunc "); end != -1 {
++		acBody = acBody[:end]
++	}
++	if !strings.Contains(acBody, "i.issue_type NOT IN ('agent', 'session')") {
++		t.Fatalf("expected AutoClose() eligibility to exclude agent/session identity beads, body was:\n%s", acBody)
+ 	}
+ }
+ 
