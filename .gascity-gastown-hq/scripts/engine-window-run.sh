@@ -24,10 +24,11 @@
 set -uo pipefail
 
 SRC=/Users/athos/gt/.local-patches/_src-hookfix
-BRANCH=consolidated/engine-window-20260827
-WORKTREE=/Users/athos/gt/.gc-worktrees/engine-window-0827
+BRANCH=consolidated/engine-window-20260829
+WORKTREE=/Users/athos/gt/.gc-worktrees/engine-window-0829
 LIBEXEC="$HOME/.local/libexec"
-LABEL="gc-1.1.1-engwin0827"
+LABEL="gc-1.1.1-engwin0829"
+TAG="engwin-20260829"
 SYMLINK=/opt/homebrew/bin/gc
 PREV_FILE="$HOME/.gastown/run/engine-window-prev-target"
 LOG=/Users/athos/gt/.gascity-gastown-hq/.gc/logs/engine-window-run.log
@@ -89,10 +90,24 @@ phase_check() {
     local swapfree
     swapfree=$(sysctl -n vm.swapusage 2>/dev/null | sed -n 's/.*free = \([0-9.]*\)M.*/\1/p')
     if [ -n "$swapfree" ] && [ "${swapfree%.*}" -lt 3072 ] 2>/dev/null; then
-      log "  ATENCAO: swap livre abaixo de 3GB. So o REBOOT devolve swap."
-      log "  E o ganho do reboot expira rapido (medido 26/08: 1h40) — se for"
-      log "  rebootar, builde IMEDIATAMENTE depois, nao por ultimo."
-      rc=1
+      # Logo apos um boot o swap total do macOS ainda e pequeno (1-2 swapfiles),
+      # entao "free < 3GB" e o estado NORMAL de uma maquina recem-reiniciada —
+      # exatamente o momento em que o post-boot roda. Reprovar por swap ai
+      # mataria a janela toda vez, no unico momento em que o swap esta de fato
+      # saudavel ("So o REBOOT devolve swap" — este proprio aviso). O piso de
+      # 3GB so vale como reprovacao com a maquina de pe ha mais de 30min.
+      local _boot_s _up_min=999
+      _boot_s=$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/^{ *sec *= *\([0-9]*\).*/\1/p')
+      [ -n "$_boot_s" ] && _up_min=$(( ($(date +%s) - _boot_s) / 60 ))
+      if [ "$_up_min" -le 30 ]; then
+        log "  swap livre ${swapfree%.*}MB < 3GB, mas uptime ${_up_min}min (boot recente):"
+        log "  swap recem-zerado pelo reboot — nao reprova."
+      else
+        log "  ATENCAO: swap livre abaixo de 3GB. So o REBOOT devolve swap."
+        log "  E o ganho do reboot expira rapido (medido 26/08: 1h40) — se for"
+        log "  rebootar, builde IMEDIATAMENTE depois, nao por ultimo."
+        rc=1
+      fi
     fi
   else
     log "  preflight .... NAO ENCONTRADO em $PREFLIGHT (nao consegui medir recursos)"
@@ -121,7 +136,7 @@ phase_build() {
   # Tag pra o binario se identificar em 'gc version' (o Makefile deriva VERSION
   # de git describe --tags --exact-match; sem tag ele reporta 'dev', que e
   # indistinguivel de qualquer outro build local).
-  git -C "$WORKTREE" tag -f "engwin-20260827" >/dev/null 2>&1 || true
+  git -C "$WORKTREE" tag -f "$TAG" >/dev/null 2>&1 || true
   mkdir -p "$LIBEXEC"
   local out="$LIBEXEC/$LABEL"
   log "compilando -> $out (pode demorar; GOCACHE quente ajuda)"
