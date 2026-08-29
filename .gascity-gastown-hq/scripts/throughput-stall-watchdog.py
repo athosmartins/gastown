@@ -1012,22 +1012,35 @@ def _gate_statuses_of(b):
 
 
 def _marker_gate_status_active(b):
-    """type:quality-gate-marker ACTIVE check. Exactly one gate-status:
-    (ready|queued|claimed|dispatching|running) -> active (gate is mid-review,
-    not orphaned). No gate-status label at all, or more than one (set_gate_
-    status adds the new label BEFORE removing the old one, so a transition
-    can briefly carry two) -> active — fail-safe, mirrors marker_status_from_
-    labels' ambiguous-collapses-to-empty-collapses-to-active doctrine. Any
-    other single value (passed/failed/superseded/error/needs-rebase/parked-
-    needs-human/deferred) -> NOT active: the gate has stepped back onto an
-    external actor (human/author/rebase), not actively holding this bead — a
-    needs-rebase marker left unattended is exactly what gate-needs-rebase-
-    terminality-reap exists to catch; this function must not silently vouch
-    for it here too."""
+    """type:quality-gate-marker ACTIVE check. Mirrors quality-gate-guard.sh's
+    marker_active_from_labels() EXACTLY (gate-feedback attempt 1, ga-zxcpo):
+    active if ANY present gate-status label is in (ready|queued|claimed|
+    dispatching|running); else, if there is NO gate-status label at all,
+    active — fail-safe, mirrors marker_status_from_labels' ambiguous-
+    collapses-to-empty-collapses-to-active doctrine for the zero-label case
+    only; else (one or more labels present, none of them active) -> NOT
+    active: the gate has stepped back onto an external actor (human/author/
+    rebase), not actively holding this bead — a needs-rebase marker left
+    unattended is exactly what gate-needs-rebase-terminality-reap exists to
+    catch; this function must not silently vouch for it here too.
+
+    A prior version fail-safed on COUNT alone (`len(statuses) != 1 ->
+    active`), which wrongly re-includes the 2+-labels/none-active case as
+    active too — diverging from the bash original, which has no such
+    branch. That case is reachable live: the needs-rebase reaper calls
+    set_gate_status("superseded") on a marker already sitting at
+    needs-rebase, and bd close happens as a later, separate step
+    (quality-gate-dispatcher.sh, ga-88sl7) — so a marker can carry
+    {needs-rebase, superseded}, both terminal, while still bd-status=open.
+    The count-based version read that as active (gate-resident), silently
+    suppressing a real ghost/stall alarm the canonical bash classifier
+    would correctly allow through. See selftest Scenarios M4 (falsifies
+    the count-based version) and M5 (the transition-race case this
+    fail-safe must still protect — one active label among several)."""
     statuses = _gate_statuses_of(b)
-    if len(statuses) != 1:
+    if not statuses:
         return True
-    return statuses[0] in ("ready", "queued", "claimed", "dispatching", "running")
+    return any(s in ("ready", "queued", "claimed", "dispatching", "running") for s in statuses)
 
 
 def _gaterun_gate_status_active(b):
@@ -3334,6 +3347,53 @@ def _selftest():
             "— this fix does not silently widen into masking a stranded marker")
     else:
         _bad("M3", "verdict=%r marker=%r — expected ('absent', None)" % (_v_m3, _m_m3))
+
+    print("\nga-zxcpo Scenario M4 (gate-feedback attempt 1): marker carrying "
+          "TWO terminal gate-status labels (needs-rebase + superseded — "
+          "reachable live: the needs-rebase reaper calls set_gate_status("
+          "\"superseded\") on a marker already sitting at needs-rebase, and "
+          "bd close happens as a later, separate step — quality-gate-"
+          "dispatcher.sh ga-88sl7) -> absent. A count-based fail-safe "
+          "(`len(statuses) != 1 -> active`) wrongly treats this as active "
+          "too, diverging from quality-gate-guard.sh's marker_active_from_"
+          "labels() — which only fail-safes the ZERO-label case, and "
+          "correctly reads 2+ labels where NONE match the active set as "
+          "NOT active.")
+    globals()["_sh"] = _fake_sh_gzx([
+        {"id": "ga-wisp-m4", "labels": ["type:quality-gate-marker", "source-bead:ga-m4",
+                                         "gate-status:needs-rebase", "gate-status:superseded"]},
+    ])
+    _v_m4, _m_m4 = _queued_marker_state("/Users/athos/gt/.gascity-gastown-hq", "ga-m4")
+    if _v_m4 == "absent" and _m_m4 is None:
+        _ok("M4: two-terminal-label marker correctly NOT treated as "
+            "gate-resident — matches marker_active_from_labels() exactly, "
+            "closes the gate-feedback-attempt-1 divergence")
+    else:
+        _bad("M4", "verdict=%r marker=%r — expected ('absent', None); a "
+             "count-based (len != 1 -> active) fail-safe wrongly returns "
+             "'found' here" % (_v_m4, _m_m4))
+
+    print("\nga-zxcpo Scenario M5: marker carrying TWO gate-status labels "
+          "where one IS active (dispatching + failed — the same mid-"
+          "transition race set_gate_status's own comment documents: the new "
+          "label is added BEFORE the old one is removed) -> found. Mirror of "
+          "M4: confirms the fix reads 'ANY active label wins', not 'zero "
+          "or exactly one label only' — a transition race must still "
+          "fail-safe toward gate-resident, matching marker_active_from_"
+          "labels().")
+    globals()["_sh"] = _fake_sh_gzx([
+        {"id": "ga-wisp-m5", "labels": ["type:quality-gate-marker", "source-bead:ga-m5",
+                                         "gate-status:dispatching", "gate-status:failed"]},
+    ])
+    _v_m5, _m_m5 = _queued_marker_state("/Users/athos/gt/.gascity-gastown-hq", "ga-m5")
+    if _v_m5 == "found" and _m_m5 and _m_m5.get("id") == "ga-wisp-m5":
+        _ok("M5: two-label marker with one ACTIVE status still recognized as "
+            "gate-resident — a mid-transition race does not become a false "
+            "ghost/stall just because this fix narrowed the multi-label "
+            "fail-safe")
+    else:
+        _bad("M5", "verdict=%r marker=%r — expected ('found', "
+             "{'id':'ga-wisp-m5'})" % (_v_m5, _m_m5))
 
     print("\nga-zxcpo Scenario R1: NO open marker at all, but a type:quality-"
           "gate-run at gate-status:running -> found (the ACTUAL live "
