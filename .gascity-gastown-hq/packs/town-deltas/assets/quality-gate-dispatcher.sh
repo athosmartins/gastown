@@ -6333,11 +6333,23 @@ fi
 # its own variable (never widening IS_CONTAINER_RIG's meaning) so only the
 # ledger-write gate below changes; every other IS_CONTAINER_RIG call site
 # in this file is untouched.
+#
+# Third state: `git rev-parse --show-toplevel` can fail (RIG_PATH exists but
+# somehow isn't inside any git repo at all -- not expected in practice, since
+# gate_resolve_rig_context already validated RIG_PATH is a real directory
+# earlier, but the block is defensive). "Couldn't determine" is deliberately
+# NOT folded into "confirmed isolated" (both silently -> 0 would hide a real
+# unknown behind the same value as a checked-safe one) -- it maps the same
+# way "confirmed embedded" does. This mechanism is a best-effort safety NET
+# (see the FULLY GUARDED / `|| true` contract below), so erring toward one
+# harmless extra ledger entry costs nothing; erring toward silently skipping
+# a rig that might need protection is the wrong direction to guess in.
 NEEDS_SURVIVAL_LEDGER="$IS_CONTAINER_RIG"
 if [ "$IS_CONTAINER_RIG" = "0" ]; then
   case "$(git -C "$RIG_PATH" rev-parse --show-toplevel 2>/dev/null || printf '')" in
-    "$RIG_PATH"|"") ;;  # own repo root, or undeterminable -- stays isolated (0)
-    *) NEEDS_SURVIVAL_LEDGER=1 ;;  # embedded in a DIFFERENT repo -- shares its remote
+    "") NEEDS_SURVIVAL_LEDGER=1 ;;      # undeterminable -- fail toward protection
+    "$RIG_PATH") ;;                     # confirmed own repo root -- genuinely isolated
+    *) NEEDS_SURVIVAL_LEDGER=1 ;;       # embedded in a DIFFERENT repo -- shares its remote
   esac
 fi
 # SELFTEST-EXTRACT needs-survival-ledger-classify: END

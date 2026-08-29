@@ -176,6 +176,17 @@ else
   mkdir -p "$R/embedded_subrig"
   EMBEDDED_RESOLVED="$(cd "$R/embedded_subrig" && pwd -P)"
   eq "embedded self-repo rig (gascity/deacon shape) -> needs ledger" "$(ns_classify "$EMBEDDED_RESOLVED" 0)" "1"
+
+  # (d) third state: git can't answer at all (a real directory that isn't
+  #     inside any git repo -- not expected in production, since RIG_PATH is
+  #     already validated to exist by gate_resolve_rig_context before this
+  #     point runs, but the classify block is defensive). "Undeterminable"
+  #     must NOT collapse into "confirmed isolated" (0) -- this is a
+  #     best-effort safety net where one extra harmless ledger entry costs
+  #     nothing, so unknown fails toward protection (1), same as embedded.
+  mkdir -p "$T/no_git_at_all"
+  NOGIT_RESOLVED="$(cd "$T/no_git_at_all" && pwd -P)"
+  eq "undeterminable (not a git repo at all) -> fails toward protection" "$(ns_classify "$NOGIT_RESOLVED" 0)" "1"
 fi
 
 # ── 7. drift-guard: plist ───────────────────────────────────────────────────
