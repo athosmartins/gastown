@@ -1,0 +1,1506 @@
+diff --git a/cmd/gc/cmd_runtime_drain.go b/cmd/gc/cmd_runtime_drain.go
+index 006523603..efe58e37e 100644
+--- a/cmd/gc/cmd_runtime_drain.go
++++ b/cmd/gc/cmd_runtime_drain.go
+@@ -5,11 +5,16 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"os"
+ 	"os/signal"
++	"slices"
+ 	"strconv"
++	"strings"
+ 	"syscall"
+ 	"time"
+ 
++	"github.com/gastownhall/gascity/internal/beadmeta"
++	"github.com/gastownhall/gascity/internal/beads"
+ 	"github.com/gastownhall/gascity/internal/config"
+ 	"github.com/gastownhall/gascity/internal/events"
+ 	"github.com/gastownhall/gascity/internal/runtime"
+@@ -428,13 +433,14 @@ func newRuntimeDrainAckCmd(stdout, stderr io.Writer) *cobra.Command {
+ 	var jsonOutput bool
+ 	cmd := &cobra.Command{
+ 		Use:   "drain-ack [name]",
+-		Short: "Acknowledge drain — signal the controller to stop this session",
+-		Long: `Acknowledge a drain signal — tell the controller to stop this session.
+-
+-Sets GC_DRAIN_ACK metadata on the session, then pokes the controller
+-socket so the reconciler stops the session immediately rather than on
+-its next patrol tick. Call this after the session has finished its
+-current work in response to a drain signal.`,
++		Short: "Acknowledge drain — signal the orchestrator to stop this session",
++		Long: `Acknowledge a drain signal — tell the orchestrator to stop this session.
++
++When called from the current session, completes its exact trigger bead first,
++then sets GC_DRAIN_ACK metadata and notifies the orchestrator so the session
++stops immediately rather than on its next patrol tick.
++Call this after the session has finished its current work in response to a
++drain signal.`,
+ 		Args: cobra.MaximumNArgs(1),
+ 		RunE: func(_ *cobra.Command, args []string) error {
+ 			if cmdRuntimeDrainAck(args, jsonOutput, stdout, stderr) != 0 {
+@@ -456,7 +462,7 @@ func cmdRuntimeDrainAck(args []string, jsonOutput bool, stdout, stderr io.Writer
+ 		}
+ 		sp := newSessionProvider()
+ 		dops := newDrainOps(sp)
+-		return doRuntimeDrainAck(dops, target.cityPath, target.display, target.sessionName, jsonOutput, stdout, stderr)
++		return doRuntimeDrainAck(dops, nil, target.cityPath, target.display, target.sessionName, jsonOutput, stdout, stderr)
+ 	}
+ 
+ 	current, err := currentSessionRuntimeTarget()
+@@ -466,7 +472,88 @@ func cmdRuntimeDrainAck(args []string, jsonOutput bool, stdout, stderr io.Writer
+ 	}
+ 	sp := newSessionProvider()
+ 	dops := newDrainOps(sp)
+-	return doRuntimeDrainAck(dops, current.cityPath, current.display, current.sessionName, jsonOutput, stdout, stderr)
++	return doRuntimeDrainAck(dops, func() error {
++		return completeCurrentRuntimeDrainAckTrigger(current)
++	}, current.cityPath, current.display, current.sessionName, jsonOutput, stdout, stderr)
++}
++
++func completeCurrentRuntimeDrainAckTrigger(current sessionRuntimeTarget) error {
++	triggerID := strings.TrimSpace(os.Getenv("GC_BEAD_ID"))
++	if triggerID == "" {
++		triggerID = strings.TrimSpace(os.Getenv("GC_TRIGGER_BEAD_ID"))
++	}
++	if triggerID == "" {
++		return nil
++	}
++	cfg, err := loadCityConfigWithoutBuiltinPackRefresh(current.cityPath, io.Discard)
++	if err != nil {
++		return fmt.Errorf("loading city config: %w", err)
++	}
++	target, err := resolveBdScopeTarget(cfg, current.cityPath, "", []string{"update", triggerID}, false, io.Discard)
++	if err != nil {
++		return fmt.Errorf("resolving store for %s: %w", triggerID, err)
++	}
++	store, err := openStoreAtForCityWithConfig(target.ScopeRoot, current.cityPath, cfg)
++	if err != nil {
++		return fmt.Errorf("opening store for %s: %w", triggerID, err)
++	}
++	defer func() { _ = closeBeadStoreHandle(store) }()
++	identities := hookClaimIdentityCandidates(
++		current.sessionName,
++		current.display,
++		os.Getenv("GC_SESSION_ID"),
++		os.Getenv("GC_ALIAS"),
++		os.Getenv("GC_AGENT"),
++	)
++	return completeRuntimeDrainAckTrigger(store, triggerID, identities)
++}
++
++func completeRuntimeDrainAckTrigger(store beads.Store, triggerID string, sessionIdentities []string) error {
++	triggerID = strings.TrimSpace(triggerID)
++	if store == nil || triggerID == "" {
++		return nil
++	}
++	bead, err := store.Get(triggerID)
++	if err != nil {
++		if errors.Is(err, beads.ErrNotFound) {
++			return nil
++		}
++		return fmt.Errorf("reading trigger bead %s: %w", triggerID, err)
++	}
++	if strings.EqualFold(strings.TrimSpace(bead.Status), "closed") {
++		return nil
++	}
++	kind := strings.TrimSpace(bead.Metadata[beadmeta.KindMetadataKey])
++	if beadmeta.IsControlKind(kind) || slices.Contains(beadmeta.WorkflowTopologyKinds, kind) {
++		return fmt.Errorf("trigger bead %s has non-worker kind %q", triggerID, kind)
++	}
++	owned := hookClaimHasIdentity(bead.Assignee, sessionIdentities)
++	if !owned {
++		return nil
++	}
++	status := "closed"
++	opts := beads.UpdateOpts{
++		Status: &status,
++		Metadata: map[string]string{
++			beadmeta.OutcomeMetadataKey: beadmeta.OutcomePass,
++		},
++	}
++	if writer, ok := beads.ConditionalWriterFor(store); ok {
++		if err := writer.UpdateIfMatch(triggerID, bead.Revision, opts); err != nil {
++			if beads.IsPreconditionFailed(err) {
++				fresh, readErr := store.Get(triggerID)
++				if readErr == nil && strings.EqualFold(strings.TrimSpace(fresh.Status), "closed") {
++					return nil
++				}
++			}
++			return fmt.Errorf("closing trigger bead %s: %w", triggerID, err)
++		}
++		return nil
++	}
++	if err := store.Update(triggerID, opts); err != nil {
++		return fmt.Errorf("closing trigger bead %s: %w", triggerID, err)
++	}
++	return nil
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -642,10 +729,16 @@ func waitForControllerRestart(ctx context.Context, dops drainOps, sn, command st
+ // Tests that swap it MUST NOT call t.Parallel().
+ var drainAckPokeController = pokeController
+ 
+-// doRuntimeDrainAck sets the drain-ack flag on the session, then pokes the
+-// controller so the reconciler observes the drained state immediately instead
+-// of waiting for its next patrol tick.
+-func doRuntimeDrainAck(dops drainOps, cityPath, targetName, sn string, jsonOutput bool, stdout, stderr io.Writer) int {
++// doRuntimeDrainAck completes the current trigger when requested, sets the
++// drain-ack flag, then pokes the controller so the reconciler observes the
++// drained state immediately instead of waiting for its next patrol tick.
++func doRuntimeDrainAck(dops drainOps, completeTrigger func() error, cityPath, targetName, sn string, jsonOutput bool, stdout, stderr io.Writer) int {
++	if completeTrigger != nil {
++		if err := completeTrigger(); err != nil {
++			fmt.Fprintf(stderr, "gc runtime drain-ack: completing trigger bead: %v\n", err) //nolint:errcheck // best-effort stderr
++			return 1
++		}
++	}
+ 	if err := dops.setDrainAck(sn); err != nil {
+ 		fmt.Fprintf(stderr, "gc runtime drain-ack: %v\n", err) //nolint:errcheck // best-effort stderr
+ 		return 1
+diff --git a/cmd/gc/cmd_runtime_drain_test.go b/cmd/gc/cmd_runtime_drain_test.go
+index 55f55a873..0dd35e78f 100644
+--- a/cmd/gc/cmd_runtime_drain_test.go
++++ b/cmd/gc/cmd_runtime_drain_test.go
+@@ -15,8 +15,10 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"github.com/gastownhall/gascity/internal/beadmeta"
+ 	"github.com/gastownhall/gascity/internal/beads"
+ 	"github.com/gastownhall/gascity/internal/config"
++	"github.com/gastownhall/gascity/internal/dispatch"
+ 	"github.com/gastownhall/gascity/internal/events"
+ 	"github.com/gastownhall/gascity/internal/runtime"
+ )
+@@ -450,7 +452,7 @@ func TestDoRuntimeDrainAck(t *testing.T) {
+ 
+ 	dops := newFakeDrainOps()
+ 	var stdout, stderr bytes.Buffer
+-	code := doRuntimeDrainAck(dops, "", "worker", "worker", false, &stdout, &stderr)
++	code := doRuntimeDrainAck(dops, nil, "", "worker", "worker", false, &stdout, &stderr)
+ 	if code != 0 {
+ 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
+ 	}
+@@ -462,11 +464,110 @@ func TestDoRuntimeDrainAck(t *testing.T) {
+ 	}
+ }
+ 
++func TestCompleteRuntimeDrainAckTriggerAdvancesOnlyItsWorkflow(t *testing.T) {
++	store := beads.NewMemStore()
++	const sessionName = "named-worker"
++	oldPoke := drainAckPokeController
++	drainAckPokeController = func(string) error { return nil }
++	t.Cleanup(func() { drainAckPokeController = oldPoke })
++
++	create := func(bead beads.Bead) beads.Bead {
++		t.Helper()
++		created, err := store.Create(bead)
++		if err != nil {
++			t.Fatalf("Create(%q): %v", bead.Title, err)
++		}
++		return created
++	}
++	workflow := create(beads.Bead{Title: "workflow", Type: "task", Metadata: map[string]string{
++		beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
++		beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
++	}})
++	drain := create(beads.Bead{Title: "Signal completion", Type: "task", Status: "open", Assignee: sessionName, Metadata: map[string]string{
++		beadmeta.RootBeadIDMetadataKey: workflow.ID,
++		beadmeta.StepRefMetadataKey:    "lifecycle.drain",
++	}})
++	finalizer := create(beads.Bead{Title: "Finalize workflow", Type: "task", Metadata: map[string]string{
++		beadmeta.KindMetadataKey:       beadmeta.KindWorkflowFinalize,
++		beadmeta.RootBeadIDMetadataKey: workflow.ID,
++	}})
++	if err := store.DepAdd(finalizer.ID, drain.ID, "blocks"); err != nil {
++		t.Fatalf("DepAdd(finalizer, drain): %v", err)
++	}
++	if err := store.DepAdd(workflow.ID, finalizer.ID, "blocks"); err != nil {
++		t.Fatalf("DepAdd(workflow, finalizer): %v", err)
++	}
++
++	unrelatedRoot := create(beads.Bead{Title: "unrelated workflow", Type: "task", Metadata: map[string]string{
++		beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
++		beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
++	}})
++	unrelatedStep := create(beads.Bead{Title: "unrelated active work", Type: "task", Status: "in_progress", Assignee: "other-session", Metadata: map[string]string{
++		beadmeta.RootBeadIDMetadataKey: unrelatedRoot.ID,
++	}})
++	inProgress := "in_progress"
++	if err := store.Update(unrelatedStep.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
++		t.Fatalf("mark unrelated step in progress: %v", err)
++	}
++
++	dops := newFakeDrainOps()
++	var stdout, stderr bytes.Buffer
++	complete := func() error { return completeRuntimeDrainAckTrigger(store, drain.ID, []string{sessionName}) }
++	if code := doRuntimeDrainAck(dops, complete, "", sessionName, sessionName, false, &stdout, &stderr); code != 0 {
++		t.Fatalf("doRuntimeDrainAck(first) = %d; stderr=%s", code, stderr.String())
++	}
++	if !dops.acked[sessionName] {
++		t.Fatal("successful drain-ack did not set the session acknowledgement")
++	}
++	closedDrain, err := store.Get(drain.ID)
++	if err != nil {
++		t.Fatalf("Get(drain): %v", err)
++	}
++	if closedDrain.Status != "closed" || closedDrain.Metadata[beadmeta.OutcomeMetadataKey] != beadmeta.OutcomePass {
++		t.Fatalf("drain after ack = status %q outcome %q, want closed/pass", closedDrain.Status, closedDrain.Metadata[beadmeta.OutcomeMetadataKey])
++	}
++	if has, err := sessionHasOpenAssignedWorkInStoreByIdentifiers(store, []string{sessionName}); err != nil {
++		t.Fatalf("session assigned-work query: %v", err)
++	} else if has {
++		t.Fatal("named-session reconciliation still sees the completed drain step as redispatchable work")
++	}
++
++	result, err := dispatch.ProcessControl(store, mustGetMemBead(t, store, finalizer.ID), dispatch.ProcessOptions{})
++	if err != nil {
++		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
++	}
++	if !result.Processed || result.Action != "workflow-pass" {
++		t.Fatalf("first workflow-finalize result = %+v, want one processed workflow-pass", result)
++	}
++	if got := mustGetMemBead(t, store, workflow.ID).Status; got != "closed" {
++		t.Fatalf("workflow status = %q, want closed", got)
++	}
++
++	stdout.Reset()
++	stderr.Reset()
++	if code := doRuntimeDrainAck(dops, complete, "", sessionName, sessionName, false, &stdout, &stderr); code != 0 {
++		t.Fatalf("doRuntimeDrainAck(retry) = %d; stderr=%s", code, stderr.String())
++	}
++	result, err = dispatch.ProcessControl(store, mustGetMemBead(t, store, finalizer.ID), dispatch.ProcessOptions{})
++	if err != nil {
++		t.Fatalf("ProcessControl(workflow-finalize retry): %v", err)
++	}
++	if result.Processed {
++		t.Fatalf("workflow-finalize retry processed twice: %+v", result)
++	}
++	if got := mustGetMemBead(t, store, unrelatedRoot.ID).Status; got != "open" {
++		t.Fatalf("unrelated workflow status = %q, want open", got)
++	}
++	if got := mustGetMemBead(t, store, unrelatedStep.ID).Status; got != "in_progress" {
++		t.Fatalf("unrelated active step status = %q, want in_progress", got)
++	}
++}
++
+ func TestDoRuntimeDrainAckError(t *testing.T) {
+ 	dops := newFakeDrainOps()
+ 	dops.err = errors.New("tmux borked")
+ 	var stdout, stderr bytes.Buffer
+-	code := doRuntimeDrainAck(dops, "", "worker", "worker", false, &stdout, &stderr)
++	code := doRuntimeDrainAck(dops, nil, "", "worker", "worker", false, &stdout, &stderr)
+ 	if code != 1 {
+ 		t.Fatalf("code = %d, want 1", code)
+ 	}
+@@ -475,6 +576,52 @@ func TestDoRuntimeDrainAckError(t *testing.T) {
+ 	}
+ }
+ 
++func TestDoRuntimeDrainAckCompletionFailureDoesNotAcknowledge(t *testing.T) {
++	dops := newFakeDrainOps()
++	var stdout, stderr bytes.Buffer
++	code := doRuntimeDrainAck(dops, func() error { return errors.New("store unavailable") }, "", "worker", "worker", false, &stdout, &stderr)
++	if code != 1 {
++		t.Fatalf("code = %d, want 1", code)
++	}
++	if dops.acked["worker"] {
++		t.Fatal("drain ack was set even though trigger completion failed")
++	}
++	if got, want := stderr.String(), "gc runtime drain-ack: completing trigger bead: store unavailable\n"; got != want {
++		t.Fatalf("stderr = %q, want %q", got, want)
++	}
++}
++
++func TestCompleteRuntimeDrainAckTriggerIgnoresStaleUnownedTrigger(t *testing.T) {
++	store := beads.NewMemStore()
++	trigger, err := store.Create(beads.Bead{
++		Title:    "other session's work",
++		Assignee: "other-session",
++	})
++	if err != nil {
++		t.Fatalf("Create(trigger): %v", err)
++	}
++	if err := completeRuntimeDrainAckTrigger(store, trigger.ID, []string{"current-session"}); err != nil {
++		t.Fatalf("completeRuntimeDrainAckTrigger: %v", err)
++	}
++	got, err := store.Get(trigger.ID)
++	if err != nil {
++		t.Fatalf("Get(trigger): %v", err)
++	}
++	if got.Status == "closed" {
++		t.Fatal("stale trigger metadata closed work owned by another session")
++	}
++}
++
++func TestJoinDrainAckMutationErrorsMissingSessionBeadIsIdempotent(t *testing.T) {
++	err := joinDrainAckMutationErrors(
++		fmt.Errorf("setting metadata on %q: %w", "gc-missing", beads.ErrNotFound),
++		fmt.Errorf("removing metadata on %q: %w", "gc-missing", beads.ErrNotFound),
++	)
++	if err != nil {
++		t.Fatalf("joinDrainAckMutationErrors(...) = %v, want nil for missing session bead", err)
++	}
++}
++
+ func TestDoRuntimeDrainAckJSON(t *testing.T) {
+ 	old := drainAckPokeController
+ 	drainAckPokeController = func(string) error { return nil }
+@@ -482,7 +629,7 @@ func TestDoRuntimeDrainAckJSON(t *testing.T) {
+ 
+ 	dops := newFakeDrainOps()
+ 	var stdout, stderr bytes.Buffer
+-	code := doRuntimeDrainAck(dops, "", "worker", "worker", true, &stdout, &stderr)
++	code := doRuntimeDrainAck(dops, nil, "", "worker", "worker", true, &stdout, &stderr)
+ 	if code != 0 {
+ 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
+ 	}
+@@ -513,7 +660,7 @@ func TestDoRuntimeDrainAckPokesController(t *testing.T) {
+ 	// of the three adjacent string params in the new signature.
+ 	dops := newFakeDrainOps()
+ 	var stdout, stderr bytes.Buffer
+-	code := doRuntimeDrainAck(dops, "/city/path", "display-name", "session-name", false, &stdout, &stderr)
++	code := doRuntimeDrainAck(dops, nil, "/city/path", "display-name", "session-name", false, &stdout, &stderr)
+ 	if code != 0 {
+ 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
+ 	}
+@@ -540,7 +687,7 @@ func TestDoRuntimeDrainAckErrorDoesNotPoke(t *testing.T) {
+ 	dops := newFakeDrainOps()
+ 	dops.err = errors.New("tmux borked")
+ 	var stdout, stderr bytes.Buffer
+-	code := doRuntimeDrainAck(dops, "/city/path", "worker", "worker", false, &stdout, &stderr)
++	code := doRuntimeDrainAck(dops, nil, "/city/path", "worker", "worker", false, &stdout, &stderr)
+ 	if code != 1 {
+ 		t.Fatalf("code = %d, want 1", code)
+ 	}
+@@ -556,7 +703,7 @@ func TestDoRuntimeDrainAckPokeFailureWarns(t *testing.T) {
+ 
+ 	dops := newFakeDrainOps()
+ 	var stdout, stderr bytes.Buffer
+-	code := doRuntimeDrainAck(dops, "/city/path", "worker", "worker", false, &stdout, &stderr)
++	code := doRuntimeDrainAck(dops, nil, "/city/path", "worker", "worker", false, &stdout, &stderr)
+ 	if code != 0 {
+ 		t.Fatalf("code = %d, want 0 (poke failure is best-effort)", code)
+ 	}
+diff --git a/docs/reference/cli.md b/docs/reference/cli.md
+index 935126989..73eb003f7 100644
+--- a/docs/reference/cli.md
++++ b/docs/reference/cli.md
+@@ -2782,7 +2782,7 @@ gc runtime
+ | Subcommand | Description |
+ |------------|-------------|
+ | [gc runtime drain](#gc-runtime-drain) | Signal a session to drain (wind down gracefully) |
+-| [gc runtime drain-ack](#gc-runtime-drain-ack) | Acknowledge drain — signal the controller to stop this session |
++| [gc runtime drain-ack](#gc-runtime-drain-ack) | Acknowledge drain — signal the orchestrator to stop this session |
+ | [gc runtime drain-check](#gc-runtime-drain-check) | Check if a session is draining (exit 0 = draining) |
+ | [gc runtime request-restart](#gc-runtime-request-restart) | Request controller restart this session (waits to be killed) |
+ | [gc runtime undrain](#gc-runtime-undrain) | Cancel drain on a session |
+@@ -2806,12 +2806,13 @@ gc runtime drain <name> [flags]
+ 
+ ## gc runtime drain-ack
+ 
+-Acknowledge a drain signal — tell the controller to stop this session.
++Acknowledge a drain signal — tell the orchestrator to stop this session.
+ 
+-Sets GC_DRAIN_ACK metadata on the session, then pokes the controller
+-socket so the reconciler stops the session immediately rather than on
+-its next patrol tick. Call this after the session has finished its
+-current work in response to a drain signal.
++When called from the current session, completes its exact trigger bead first,
++then sets GC_DRAIN_ACK metadata and notifies the orchestrator so the session
++stops immediately rather than on its next patrol tick.
++Call this after the session has finished its current work in response to a
++drain signal.
+ 
+ ```
+ gc runtime drain-ack [name] [flags]
+diff --git a/internal/beadmeta/keys.go b/internal/beadmeta/keys.go
+new file mode 100644
+index 000000000..5689a4784
+--- /dev/null
++++ b/internal/beadmeta/keys.go
+@@ -0,0 +1,478 @@
++// Package beadmeta is the single named home for Gas City's engine-owned
++// bead-metadata key vocabulary — the "gc." namespace written into and read
++// from bead.Metadata across the workflow engine, role workers, CLI, and API.
++//
++// Before beadmeta, these keys were ~126 raw string literals scattered across
++// ~70 files with no central declaration: the real interface between modules was
++// folklore. This package makes the seam named and compiler-checked. It imports
++// only the standard library, so every workflow package can import it without
++// risk of an import cycle, mirroring internal/events.
++//
++// Scope: this package owns engine-touched bead-metadata KEY NAMES only. It
++// deliberately excludes (each a separate owner): gc.* event-type names
++// (internal/events.KnownEventTypes), telemetry metric names (internal/telemetry),
++// JSON schema-version contract strings (e.g. gc.dolt.cleanup.v1), and the
++// t3bridge UI thread-metadata namespace (internal/runtime/t3bridge). Pack- and
++// prompt-private keys that no Go file reads stay open-world by design and are
++// intentionally NOT declared here (see KnownMetadataPrefixes for the dynamic
++// gc.var.<name> case).
++//
++// A const block (not a runtime registry) is the right mechanism: bead.Metadata
++// is map[string]string with no runtime decode/codegen consumer, so the
++// events.RegisterPayload reflect-based machinery would add init-ordering cost for
++// no benefit. Drift is enforced statically by the AST guard in guard_test.go.
++//
++// Cross-repo note: bd (the beads backend) stores these keys as opaque JSON in
++// its generic issues.metadata column and never interprets them — the key
++// names are 100% gascity-minted vocabulary, so changing bd's schema does not
++// require touching this package and vice versa. See
++// engdocs/design/beads-dolt-contract-redesign.md for the storage contract.
++package beadmeta
++
++// Namespace is the reserved prefix for every engine-minted bead-metadata key.
++// Runtime guards that reserve the namespace (e.g. rejecting caller-supplied
++// "gc."-prefixed keys) compare against this single source of truth.
++const Namespace = "gc."
++
++// Engine-owned bead-metadata keys. Each constant is the exact string written to
++// or read from bead.Metadata by at least one non-test Go file under internal/ or
++// cmd/. Keep this block sorted by identifier; the Go compiler rejects duplicate
++// identifiers, giving us a free compile-time uniqueness guarantee.
++const (
++	AttemptLogMetadataKey                = "gc.attempt_log"
++	AttemptMetadataKey                   = "gc.attempt"
++	BondMetadataKey                      = "gc.bond"
++	BondVarsMetadataKey                  = "gc.bond_vars"
++	BrainParentSIDMetadataKey            = "gc.brain_parent_sid"
++	CancelRequestedMetadataKey           = "gc.cancel_requested"
++	CheckInfraRetryMetadataKey           = "gc.check_infra_retry"
++	CheckModeMetadataKey                 = "gc.check_mode"
++	CheckPathMetadataKey                 = "gc.check_path"
++	CheckTimeoutMetadataKey              = "gc.check_timeout"
++	CityPathMetadataKey                  = "gc.city_path"
++	ClosedByAttemptMetadataKey           = "gc.closed_by_attempt"
++	ContinuationGroupMetadataKey         = "gc.continuation_group"
++	ControlDispatcherFallbackMetadataKey = "gc.control_dispatcher_fallback"
++	ControlEpochMetadataKey              = "gc.control_epoch"
++	ControlForMetadataKey                = "gc.control_for"
++	ControlQuarantineReasonMetadataKey   = "gc.control_quarantine_reason"
++	ControlQuarantinedAtMetadataKey      = "gc.control_quarantined_at"
++	ControlQuarantinedMetadataKey        = "gc.control_quarantined"
++	ControllerErrorClassMetadataKey      = "gc.controller_error_class"
++	ControllerErrorMetadataKey           = "gc.controller_error"
++	ControllerRetryableMetadataKey       = "gc.controller_retryable"
++	CurrentRunIDMetadataKey              = "gc.current_run_id"
++	CwdMetadataKey                       = "gc.cwd"
++	// AttachFencePendingMetadataKey marks a fenced attach's sub-DAG root
++	// between speculative (deferred, non-runnable) creation and the CAS-last
++	// epoch fence committing. Cleared on activation; a root still carrying it
++	// is a pre-fence candidate that idempotency recovery either activates
++	// (deterministically, when it is the surviving candidate) or neutralizes.
++	AttachFencePendingMetadataKey        = "gc.attach_fence_pending"
++	DeferredAssigneeMetadataKey          = "gc.deferred_assignee"
++	DeferredExecutionRoutedToMetadataKey = "gc.deferred_execution_routed_to"
++	DeferredRoutedToMetadataKey          = "gc.deferred_routed_to"
++	DeferredTypeMetadataKey              = "gc.deferred_type"
++	DetachedMetadataKey                  = "gc.detached"
++	DrainContextMetadataKey              = "gc.drain_context"
++	DrainContinuationGroupMetadataKey    = "gc.drain_continuation_group"
++	DrainControlIDMetadataKey            = "gc.drain_control_id"
++	DrainCountMetadataKey                = "gc.drain_count"
++	DrainFormulaMetadataKey              = "gc.drain_formula"
++	DrainIndexMetadataKey                = "gc.drain_index"
++	DrainItemSingleLaneMetadataKey       = "gc.drain_item_single_lane"
++	DrainManifestMetadataKey             = "gc.drain_manifest.v1"
++	DrainMaxUnitsMetadataKey             = "gc.drain_max_units"
++	DrainMemberAccessMetadataKey         = "gc.drain_member_access"
++	DrainMemberIDMetadataKey             = "gc.drain_member_id"
++	DrainMemberUnresolvedMetadataKey     = "gc.drain_member_unresolved"
++	DrainOnItemFailureMetadataKey        = "gc.drain_on_item_failure"
++	DrainParentConvoyIDMetadataKey       = "gc.drain_parent_convoy_id"
++	DrainStateMetadataKey                = "gc.drain_state"
++	DrainUnitKeyMetadataKey              = "gc.drain_unit_key"
++	DurationMsMetadataKey                = "gc.duration_ms"
++	DynamicFragmentMetadataKey           = "gc.dynamic_fragment"
++	ExclusiveDrainReservationMetadataKey = "gc.exclusive_drain_reservation"
++	ExecutionRigContextMetadataKey       = "gc.execution_rig_context"
++	ExecutionRoutedToMetadataKey         = "gc.execution_routed_to"
++	ExitCodeMetadataKey                  = "gc.exit_code"
++	FailedAttemptMetadataKey             = "gc.failed_attempt"
++	FailureClassMetadataKey              = "gc.failure_class"
++	FailureOwnerMetadataKey              = "gc.failure_owner"
++	FailureReasonMetadataKey             = "gc.failure_reason"
++	FailureSubjectMetadataKey            = "gc.failure_subject"
++	FanoutModeMetadataKey                = "gc.fanout_mode"
++	FanoutStateMetadataKey               = "gc.fanout_state"
++	FinalDispositionMetadataKey          = "gc.final_disposition"
++	ForEachMetadataKey                   = "gc.for_each"
++	FormulaMetadataKey                   = "gc.formula"
++	FormulaContractMetadataKey           = "gc.formula_contract"
++	FormulaHashMetadataKey               = "gc.formula_hash"
++	FormulaNameMetadataKey               = "gc.formula_name"
++	FormulaSourceMetadataKey             = "gc.formula_source"
++	GCExemptMetadataKey                  = "gc.gc_exempt"
++	Graphv2RootKeyMetadataKey            = "gc.graphv2_root_key"
++	IdempotencyKeyMetadataKey            = "gc.idempotency_key"
++	InputConvoyIDMetadataKey             = "gc.input_convoy_id"
++	InstantiatingMetadataKey             = "gc.instantiating"
++	IterationMetadataKey                 = "gc.iteration"
++	ItemRootKeyMetadataKey               = "gc.item_root_key"
++	KindMetadataKey                      = "gc.kind"
++	LastFailureClassMetadataKey          = "gc.last_failure_class"
++	LastFinalizeErrorMetadataKey         = "gc.last_finalize_error"
++	LastHeartbeatAtMetadataKey           = "gc.last_heartbeat_at"
++	LogicalBeadIDMetadataKey             = "gc.logical_bead_id"
++	MaxAttemptsMetadataKey               = "gc.max_attempts"
++	MissingRootBeadIDMetadataKey         = "gc.missing_root_bead_id"
++	ModelMetadataKey                     = "gc.model"
++	NativeStepDependenciesMetadataKey    = "gc.native_step_dependencies.v1"
++	NextAttemptMetadataKey               = "gc.next_attempt"
++	OnExhaustedMetadataKey               = "gc.on_exhausted"
++	OnFailMetadataKey                    = "gc.on_fail"
++	OriginalKindMetadataKey              = "gc.original_kind"
++	OutcomeBeadIDMetadataKey             = "gc.outcome_bead_id"
++	OutcomeMetadataKey                   = "gc.outcome"
++	OutputJSONMetadataKey                = "gc.output_json"
++	OutputJSONRequiredMetadataKey        = "gc.output_json_required"
++	ParentBeadIDMetadataKey              = "gc.parent_bead_id"
++	ParentConvoyIDMetadataKey            = "gc.parent_convoy_id"
++	PartialFragmentMetadataKey           = "gc.partial_fragment"
++	PartialRetryMetadataKey              = "gc.partial_retry"
++	PackMetadataKey                      = "gc.pack"
++	PackRootMetadataKey                  = "gc.pack_root"
++	PackWorkspaceMetadataKey             = "gc.pack_workspace"
++	PerDispatchModelMetadataKey          = "gc.per_dispatch_model"
++	RalphStepIDMetadataKey               = "gc.ralph_step_id"
++	ReasoningMetadataKey                 = "gc.reasoning"
++	RequiredArtifactMetadataKey          = "gc.required_artifact"
++	RequiredArtifactsMetadataKey         = "gc.required_artifacts"
++	RetryCountMetadataKey                = "gc.retry_count"
++	RetryFromMetadataKey                 = "gc.retry_from"
++	RetrySessionRecycledMetadataKey      = "gc.retry_session_recycled"
++	RetryStateMetadataKey                = "gc.retry_state"
++	RigRootMetadataKey                   = "gc.rig_root"
++	RootBeadIDMetadataKey                = "gc.root_bead_id"
++	RootStoreRefMetadataKey              = "gc.root_store_ref"
++	RoutedToMetadataKey                  = "gc.routed_to"
++	RunTargetMetadataKey                 = "gc.run_target"
++	RuntimeVarsMetadataKey               = "gc.graphv2_vars.v1"
++	ScopeKindMetadataKey                 = "gc.scope_kind"
++	ScopeNameMetadataKey                 = "gc.scope_name"
++	ScopeRefMetadataKey                  = "gc.scope_ref"
++	ScopeRoleMetadataKey                 = "gc.scope_role"
++	SessionAffinityMetadataKey           = "gc.session_affinity"
++	SessionIDMetadataKey                 = "gc.session_id"
++	// SessionIDCamelMetadataKey is the camelCase variant some bead writers stamp
++	// alongside the snake_case SessionIDMetadataKey; both are read when resolving a
++	// bead's session link.
++	SessionIDCamelMetadataKey = "gc.sessionId"
++	SessionNameMetadataKey    = "gc.session_name"
++	// SessionNameCamelMetadataKey is the camelCase variant of SessionNameMetadataKey,
++	// mirroring SessionIDCamelMetadataKey.
++	SessionNameCamelMetadataKey    = "gc.sessionName"
++	SourceBeadIDMetadataKey        = "gc.source_bead_id"
++	SourceStepSpecMetadataKey      = "gc.source_step_spec"
++	SourceStoreRefMetadataKey      = "gc.source_store_ref"
++	SpawnedCountMetadataKey        = "gc.spawned_count"
++	SpecForMetadataKey             = "gc.spec_for"
++	SpecForRefMetadataKey          = "gc.spec_for_ref"
++	StderrMetadataKey              = "gc.stderr"
++	StdoutMetadataKey              = "gc.stdout"
++	StepIDMetadataKey              = "gc.step_id"
++	StepRefMetadataKey             = "gc.step_ref"
++	StepTimeoutMetadataKey         = "gc.step_timeout"
++	SyntheticKindMetadataKey       = "gc.synthetic_kind"
++	SyntheticMetadataKey           = "gc.synthetic"
++	TemplateMetadataKey            = "gc.template"
++	TerminalMetadataKey            = "gc.terminal"
++	TriggerBeadIDMetadataKey       = "gc.trigger_bead_id"
++	TriggerBeadStoreRefMetadataKey = "gc.trigger_bead_store_ref"
++	TruncatedMetadataKey           = "gc.truncated"
++	WorkBranchMetadataKey          = "gc.work_branch"
++	WorkCommitMetadataKey          = "gc.work_commit"
++	WorkDirMetadataKey             = "gc.work_dir"
++	WorkOutcomeMetadataKey         = "gc.work_outcome"
++	WorkVerificationMetadataKey    = "gc.work_verification"
++	WorktreeBaseRefMetadataKey     = "gc.worktree_base_ref"
++	WorktreeBaseSHAMetadataKey     = "gc.worktree_base_sha"
++	WorktreeCreatorMetadataKey     = "gc.worktree_creator"
++	WorktreeGenerationMetadataKey  = "gc.worktree_generation"
++	WorktreeLifecycleMetadataKey   = "gc.worktree_lifecycle"
++	WorktreeOwnerMetadataKey       = "gc.worktree_owner"
++	WorktreeRepoMetadataKey        = "gc.worktree_repo"
++	WorktreeRootMetadataKey        = "gc.worktree_root"
++	WorkflowIDMetadataKey          = "gc.workflow_id"
++)
++
++// Work-record metadata keys (ADR-0009). These bind a work bead to its claim
++// and its outcome so observability/eval can answer "what work was done, by
++// whom, with what artifact, to what end":
++//
++//   - WorkBranchMetadataKey ("gc.work_branch") — the git branch the claiming
++//     worker is on; the durable handle from the bead to its work. Stamped at
++//     claim time alongside WorkDirMetadataKey and read by the close gate.
++//   - WorkOutcomeMetadataKey ("gc.work_outcome") — the typed close disposition,
++//     one of "shipped" | "no-op" | "blocked" | "abandoned". Deliberately NOT
++//     OutcomeMetadataKey ("gc.outcome"): that key is the control-plane step
++//     result ("pass"/"fail"/"skipped") read by internal/dispatch, a disjoint
++//     vocabulary that must not be overloaded.
++//   - WorkCommitMetadataKey ("gc.work_commit") — the commit SHA that satisfied
++//     the bead; required when the outcome is "shipped" and validated reachable
++//     on WorkBranchMetadataKey by the close gate. Named in the gc.work_* family
++//     (not a bare "gc.commit") to avoid collision with future commit concepts.
++//   - WorkVerificationMetadataKey ("gc.work_verification") — the verification
++//     record (gate result, "manual", or a link) backing a shipped outcome.
++//
++// The set of valid WorkOutcomeMetadataKey values and the "shipped requires a
++// commit on the branch" rule live with the close gate in cmd/gc.
++
++// FormulaVarPrefix is the dynamic key prefix under which formula-supplied
++// variables are written as gc.var.<name>. The suffix is open-world (a
++// user-authored variable name), so it is declared as a prefix, not enumerated.
++const FormulaVarPrefix = Namespace + "var."
++
++// IdemPrefix is the key prefix for the remote rig-create idempotency record's
++// metadata (gc.idem.kind/city/request_id/digest/state/event_cursor/rig_name,
++// the open-world gc.idem.result.* success fields, and gc.idem.created_dir/dolt_db
++// rollback manifest). This is an internal-to-internal/api namespace whose keys
++// are defined once as local constants next to their reader/writer (rigidem.go),
++// so it is declared as a prefix here rather than re-enumerated in this file.
++const IdemPrefix = Namespace + "idem."
++
++// Directory keys: a deliberate non-"gc."-prefixed sibling family on bead
++// metadata, declared here so the vocabulary has one home. Their read/write
++// fallback semantics (canonical-then-legacy) live with their owner in
++// internal/beads/contract/metadata.go, which aliases these constants. They are
++// not in KnownMetadataKeys because the drift guard's key-shape rule only
++// covers the gc. namespace. Note these are distinct from the gc.-prefixed
++// WorkDirMetadataKey ("gc.work_dir") above.
++const (
++	// WorkerDirMetadataKey records the agent process working directory on
++	// session beads.
++	WorkerDirMetadataKey = "worker_dir"
++
++	// ArtifactDirMetadataKey records the work artifact directory on task and
++	// molecule beads.
++	ArtifactDirMetadataKey = "artifact_dir"
++
++	// LegacyWorkDirMetadataKey is the deprecated key that overloaded both
++	// meanings; reads still fall back to it on session beads.
++	LegacyWorkDirMetadataKey = "work_dir"
++)
++
++// Dispatch metadata keys: a non-"gc."-prefixed family that sling writes onto
++// work and source beads to wire molecules together and record the merge
++// strategy. They predate the gc. namespace convention and their on-store
++// strings are load-bearing (the run-chain resolver in runid.go and the graph
++// dispatch readers key on them), so they are declared here — like the
++// directory keys above — to give the vocabulary one home without changing any
++// wire value. They are intentionally NOT in KnownMetadataKeys, whose drift
++// guard only covers the gc. namespace.
++const (
++	// MoleculeIDMetadataKey links a poured/wisp work bead to its molecule root.
++	MoleculeIDMetadataKey = "molecule_id"
++
++	// MoleculeFailedMetadataKey marks the beads of a partially-instantiated
++	// molecule as failed (value "true"). Written best-effort by
++	// internal/molecule markFailed on instantiation error paths; read by
++	// dispatch/sling/cmd/gc to skip or close failed roots.
++	MoleculeFailedMetadataKey = "molecule_failed"
++
++	// MergeStrategyMetadataKey records the merge strategy chosen for a slung bead.
++	MergeStrategyMetadataKey = "merge_strategy"
++)
++
++// OptionMetadataPrefix is the dynamic non-"gc."-prefixed key prefix under
++// which provider option choices are stored as opt_<OptionsSchema key> (e.g.
++// opt_model, opt_effort) on session and work beads. The suffix is open-world
++// (a pack-authored OptionsSchema key), so it is declared as a prefix, not
++// enumerated — the non-gc sibling of FormulaVarPrefix. Like the directory
++// keys above, it is not in KnownMetadataPrefixes because the drift guard's
++// key-shape rule only covers the gc. namespace.
++const OptionMetadataPrefix = "opt_"
++
++// KnownMetadataKeys lists every engine-owned bead-metadata key this package
++// declares. The guard test asserts every gc.* metadata literal used in non-test
++// Go resolves to a member of this slice (or a KnownMetadataPrefixes entry).
++var KnownMetadataKeys = []string{
++	AttemptLogMetadataKey,
++	AttemptMetadataKey,
++	BondMetadataKey,
++	BondVarsMetadataKey,
++	BrainParentSIDMetadataKey,
++	CancelRequestedMetadataKey,
++	CheckInfraRetryMetadataKey,
++	CheckModeMetadataKey,
++	CheckPathMetadataKey,
++	CheckTimeoutMetadataKey,
++	CityPathMetadataKey,
++	ClosedByAttemptMetadataKey,
++	ContinuationGroupMetadataKey,
++	ControlEpochMetadataKey,
++	ControlForMetadataKey,
++	ControlQuarantineReasonMetadataKey,
++	ControlQuarantinedAtMetadataKey,
++	ControlQuarantinedMetadataKey,
++	ControllerErrorClassMetadataKey,
++	ControllerErrorMetadataKey,
++	ControllerRetryableMetadataKey,
++	CurrentRunIDMetadataKey,
++	CwdMetadataKey,
++	AttachFencePendingMetadataKey,
++	DeferredAssigneeMetadataKey,
++	DeferredExecutionRoutedToMetadataKey,
++	DeferredRoutedToMetadataKey,
++	DeferredTypeMetadataKey,
++	DetachedMetadataKey,
++	DrainContextMetadataKey,
++	DrainContinuationGroupMetadataKey,
++	DrainControlIDMetadataKey,
++	DrainCountMetadataKey,
++	DrainFormulaMetadataKey,
++	DrainIndexMetadataKey,
++	DrainItemSingleLaneMetadataKey,
++	DrainManifestMetadataKey,
++	DrainMaxUnitsMetadataKey,
++	DrainMemberAccessMetadataKey,
++	DrainMemberIDMetadataKey,
++	DrainMemberUnresolvedMetadataKey,
++	DrainOnItemFailureMetadataKey,
++	DrainParentConvoyIDMetadataKey,
++	DrainStateMetadataKey,
++	DrainUnitKeyMetadataKey,
++	DurationMsMetadataKey,
++	DynamicFragmentMetadataKey,
++	ExclusiveDrainReservationMetadataKey,
++	ExecutionRigContextMetadataKey,
++	ExecutionRoutedToMetadataKey,
++	ExitCodeMetadataKey,
++	FailedAttemptMetadataKey,
++	FailureClassMetadataKey,
++	FailureOwnerMetadataKey,
++	FailureReasonMetadataKey,
++	FailureSubjectMetadataKey,
++	FanoutModeMetadataKey,
++	FanoutStateMetadataKey,
++	FinalDispositionMetadataKey,
++	ForEachMetadataKey,
++	FormulaMetadataKey,
++	FormulaContractMetadataKey,
++	FormulaHashMetadataKey,
++	FormulaNameMetadataKey,
++	FormulaSourceMetadataKey,
++	GCExemptMetadataKey,
++	Graphv2RootKeyMetadataKey,
++	IdempotencyKeyMetadataKey,
++	InputConvoyIDMetadataKey,
++	InstantiatingMetadataKey,
++	IterationMetadataKey,
++	ItemRootKeyMetadataKey,
++	KindMetadataKey,
++	LastFailureClassMetadataKey,
++	LastFinalizeErrorMetadataKey,
++	LastHeartbeatAtMetadataKey,
++	LogicalBeadIDMetadataKey,
++	MaxAttemptsMetadataKey,
++	MissingRootBeadIDMetadataKey,
++	ModelMetadataKey,
++	NativeStepDependenciesMetadataKey,
++	NextAttemptMetadataKey,
++	OnExhaustedMetadataKey,
++	OnFailMetadataKey,
++	OriginalKindMetadataKey,
++	OutcomeBeadIDMetadataKey,
++	OutcomeMetadataKey,
++	OutputJSONMetadataKey,
++	OutputJSONRequiredMetadataKey,
++	ParentBeadIDMetadataKey,
++	ParentConvoyIDMetadataKey,
++	PartialFragmentMetadataKey,
++	PartialRetryMetadataKey,
++	PackMetadataKey,
++	PackRootMetadataKey,
++	PackWorkspaceMetadataKey,
++	PerDispatchModelMetadataKey,
++	RalphStepIDMetadataKey,
++	ReasoningMetadataKey,
++	RequiredArtifactMetadataKey,
++	RequiredArtifactsMetadataKey,
++	RetryCountMetadataKey,
++	RetryFromMetadataKey,
++	RetrySessionRecycledMetadataKey,
++	RetryStateMetadataKey,
++	RigRootMetadataKey,
++	RootBeadIDMetadataKey,
++	RootStoreRefMetadataKey,
++	RoutedToMetadataKey,
++	RunTargetMetadataKey,
++	RuntimeVarsMetadataKey,
++	ScopeKindMetadataKey,
++	ScopeNameMetadataKey,
++	ScopeRefMetadataKey,
++	ScopeRoleMetadataKey,
++	SessionAffinityMetadataKey,
++	SessionIDMetadataKey,
++	SessionIDCamelMetadataKey,
++	SessionNameMetadataKey,
++	SessionNameCamelMetadataKey,
++	SourceBeadIDMetadataKey,
++	SourceStepSpecMetadataKey,
++	SourceStoreRefMetadataKey,
++	SpawnedCountMetadataKey,
++	SpecForMetadataKey,
++	SpecForRefMetadataKey,
++	StderrMetadataKey,
++	StdoutMetadataKey,
++	StepIDMetadataKey,
++	StepRefMetadataKey,
++	StepTimeoutMetadataKey,
++	SyntheticKindMetadataKey,
++	SyntheticMetadataKey,
++	TemplateMetadataKey,
++	TerminalMetadataKey,
++	TriggerBeadIDMetadataKey,
++	TriggerBeadStoreRefMetadataKey,
++	TruncatedMetadataKey,
++	WorkBranchMetadataKey,
++	WorkCommitMetadataKey,
++	WorkDirMetadataKey,
++	WorkOutcomeMetadataKey,
++	WorkVerificationMetadataKey,
++	WorktreeBaseRefMetadataKey,
++	WorktreeBaseSHAMetadataKey,
++	WorktreeCreatorMetadataKey,
++	WorktreeGenerationMetadataKey,
++	WorktreeLifecycleMetadataKey,
++	WorktreeOwnerMetadataKey,
++	WorktreeRepoMetadataKey,
++	WorktreeRootMetadataKey,
++	WorkflowIDMetadataKey,
++}
++
++// KnownMetadataPrefixes lists declared open-world key prefixes. A literal that
++// begins with one of these is considered declared even though its full key is
++// not enumerable.
++var KnownMetadataPrefixes = []string{
++	FormulaVarPrefix,
++	IdemPrefix,
++}
++
++// SessionAffinityMetadataKeys are the metadata keys that pin a work bead to a
++// particular live session through continuation-group routing. They must be
++// cleared together whenever work is rerouted off its original session without a
++// preserved assignee (retry-to-pool, reopen-source, orphan/closed/retired-session
++// release); otherwise a later claim re-vacuums the bead onto an unrelated
++// session via the stale group. Both cmd/gc and internal/dispatch consume this
++// single list so a new affinity key cannot silently fix one clear path while
++// leaving another stale.
++//
++// Of these keys, ContinuationGroupMetadataKey is the active routing vector: the
++// hook claim path reads it to vacuum open, unassigned sibling work onto the
++// claiming session. SessionAffinityMetadataKey is currently an advisory marker —
++// it is written (e.g. internal/dispatch/drain.go) but no Go routing path reads
++// it yet, so it is cleared alongside the group for hygiene and future-proofing
++// rather than because it gates routing today.
++var SessionAffinityMetadataKeys = []string{
++	SessionAffinityMetadataKey,
++	ContinuationGroupMetadataKey,
++}
+diff --git a/internal/beadmeta/keys_test.go b/internal/beadmeta/keys_test.go
+new file mode 100644
+index 000000000..e703fcc69
+--- /dev/null
++++ b/internal/beadmeta/keys_test.go
+@@ -0,0 +1,74 @@
++package beadmeta
++
++import (
++	"strings"
++	"testing"
++)
++
++// TestKnownMetadataKeysWellFormed asserts the declared vocabulary is internally
++// consistent: every key is namespaced, non-empty, and unique. Identifier
++// uniqueness is already guaranteed by the compiler (duplicate const names do not
++// build); this covers the value side the compiler cannot see.
++func TestKnownMetadataKeysWellFormed(t *testing.T) {
++	if len(KnownMetadataKeys) == 0 {
++		t.Fatal("KnownMetadataKeys is empty")
++	}
++	seen := make(map[string]struct{}, len(KnownMetadataKeys))
++	for _, k := range KnownMetadataKeys {
++		if k == "" {
++			t.Error("KnownMetadataKeys contains an empty string")
++			continue
++		}
++		if !strings.HasPrefix(k, Namespace) {
++			t.Errorf("key %q does not start with namespace %q", k, Namespace)
++		}
++		if _, dup := seen[k]; dup {
++			t.Errorf("key %q is declared more than once", k)
++		}
++		seen[k] = struct{}{}
++	}
++}
++
++// TestKnownMetadataPrefixesWellFormed asserts every declared open-world prefix is
++// namespaced and is a strict prefix (not a whole declared key).
++func TestKnownMetadataPrefixesWellFormed(t *testing.T) {
++	keys := make(map[string]struct{}, len(KnownMetadataKeys))
++	for _, k := range KnownMetadataKeys {
++		keys[k] = struct{}{}
++	}
++	for _, p := range KnownMetadataPrefixes {
++		if !strings.HasPrefix(p, Namespace) {
++			t.Errorf("prefix %q does not start with namespace %q", p, Namespace)
++		}
++		if _, isKey := keys[p]; isKey {
++			t.Errorf("prefix %q is also declared as a whole key", p)
++		}
++	}
++}
++
++// TestPinnedValues guards the highest-churn keys against accidental value edits.
++// These exact strings are part of the cross-module contract; renaming a value
++// here without migrating call sites would silently break reads/writes, so they
++// are pinned independently of the generator.
++func TestPinnedValues(t *testing.T) {
++	pinned := map[string]string{
++		KindMetadataKey:              "gc.kind",
++		RootBeadIDMetadataKey:        "gc.root_bead_id",
++		StepRefMetadataKey:           "gc.step_ref",
++		OutcomeMetadataKey:           "gc.outcome",
++		RoutedToMetadataKey:          "gc.routed_to",
++		ScopeRefMetadataKey:          "gc.scope_ref",
++		AttemptMetadataKey:           "gc.attempt",
++		ExecutionRoutedToMetadataKey: "gc.execution_routed_to",
++		InstantiatingMetadataKey:     "gc.instantiating",
++		FormulaVarPrefix:             "gc.var.",
++		Namespace:                    "gc.",
++		OptionMetadataPrefix:         "opt_",
++		MoleculeFailedMetadataKey:    "molecule_failed",
++	}
++	for got, want := range pinned {
++		if got != want {
++			t.Errorf("pinned value drift: got %q, want %q", got, want)
++		}
++	}
++}
+diff --git a/internal/beadmeta/kindsets.go b/internal/beadmeta/kindsets.go
+new file mode 100644
+index 000000000..f794a29ed
+--- /dev/null
++++ b/internal/beadmeta/kindsets.go
+@@ -0,0 +1,158 @@
++package beadmeta
++
++import "slices"
++
++// Named subsets of the gc.kind vocabulary. The sets are DATA: which kinds a
++// dispatcher executes, which trigger the graph contract, and what to do per
++// kind remain decisions owned by the dispatch/formula/graphroute packages.
++//
++// The AUTHORITATIVE set is ControlKinds — "kinds the control dispatcher can
++// execute" — whose behavior owner is the ProcessControl switch in
++// internal/dispatch/runtime.go (exactly one case per member; unknown kinds
++// hard-error). Every control-routing predicate is exactly equal to
++// ControlKinds (graphroute.IsControlDispatcherKind and
++// dispatch.isAttemptControlKind both derive from IsControlKind, and each has
++// a lockstep test pinning the equality).
++//
++// Three persisted kind values sit outside every set below: KindWisp (wisp
++// molecule roots), KindClosed (closed-marker beads), and KindTask (written on
++// simple attempt roots by internal/dispatch/control.go). gc.original_kind
++// (OriginalKindMetadataKey) also persists values from this vocabulary with no
++// current Go reader.
++const (
++	// KindTask is written on simple attempt roots that are plain work, not
++	// control infrastructure.
++	KindTask = "task"
++
++	// KindClosed marks beads recording a closed/terminal state.
++	KindClosed = "closed"
++)
++
++// ControlKinds lists the kinds the control dispatcher executes. The
++// ProcessControl switch in internal/dispatch/runtime.go is the behavior owner
++// and has exactly one case per member; TestControlKindsExact and the dispatch
++// package's coverage test keep the two in lockstep.
++var ControlKinds = []string{
++	KindRetry,
++	KindRalph,
++	KindCheck,
++	KindRetryEval,
++	KindFanout,
++	KindDrain,
++	KindScopeCheck,
++	KindWorkflowFinalize,
++}
++
++// IsControlKind reports whether kind is a member of ControlKinds.
++func IsControlKind(kind string) bool {
++	return slices.Contains(ControlKinds, kind)
++}
++
++// ScopeCheckExemptKinds lists the gc.kind values that never receive a paired
++// scope-check control, even when the step carries gc.scope_ref. It is exactly
++// (ControlKinds \ {KindRetry, KindRalph, KindRetryEval}) ∪ {KindScope,
++// KindSpec}; TestScopeCheckExemptKindsComposition pins the composition.
++//
++// Rationale per member: KindScope is the scope latch itself; KindSpec marks
++// frozen step-spec sidecars (bookkeeping, not work); the remaining members are
++// control kinds whose terminal scope reconciliation is owned by the control
++// runtime (fanout reconciles its enclosing scope on close, scope-check IS the
++// reconciler, workflow-finalize runs at root level, and check beads are closed
++// by their owning ralph control, which reconciles). KindRetry and KindRalph
++// stay non-exempt on purpose: their controls pair with scope-checks in
++// addition to their own close-time reconciliation (NDI redundancy), and the
++// scope-check's isRetryAttemptSubject branch depends on that pairing.
++//
++// Consumers (the judgment of WHEN to inject stays at each site):
++//
++//   - formula.needsScopeCheck — compile-path injection (internal/formula/graph.go)
++//   - formula.recipeStepNeedsScopeCheck — dynamic-fragment injection
++//     (internal/formula/fragment.go)
++//   - dispatch.attemptRecipeStepNeedsScopeCheck — attempt-recipe injection
++//     (internal/dispatch/control.go)
++//   - formula.markRalphBodyOutputSinks — ralph body output-sink marking
++//     (internal/formula/ralph.go) additionally exempts KindRalph at its
++//     definition site; control beads are never worker-executed, so none of
++//     these kinds can honor gc.output_json_required.
++//
++// Drain controls reconcile their enclosing scope on terminal close
++// (reconcileClosedDrainScope in internal/dispatch/drain.go), matching the
++// fanout/retry/ralph close-time behavior, so exemption from scope-check
++// pairing never strands a scope latch.
++var ScopeCheckExemptKinds = []string{
++	KindScope,
++	KindScopeCheck,
++	KindWorkflowFinalize,
++	KindFanout,
++	KindCheck,
++	KindDrain,
++	KindSpec,
++}
++
++// IsScopeCheckExemptKind reports whether kind is a member of
++// ScopeCheckExemptKinds.
++func IsScopeCheckExemptKind(kind string) bool {
++	return slices.Contains(ScopeCheckExemptKinds, kind)
++}
++
++// StructuralGraphKinds lists graph-node kinds that structure a compiled
++// workflow but are never dispatched as control beads — the ProcessControl
++// switch hard-errors on them by design. KindRun and KindRetryRun are v1-era
++// attempt kinds kept readable for persisted-bead compatibility (v2 attempt
++// beads keep their original kind and carry gc.attempt instead; see commit
++// c176a999e).
++var StructuralGraphKinds = []string{
++	KindScope,
++	KindCleanup,
++	KindRun,
++	KindRetryRun,
++}
++
++// WorkflowTopologyKinds lists kinds that anchor workflow topology (root
++// workflow, scope latch, formula spec). Routing never lands on these; agents
++// must never claim them. graphroute.IsWorkflowTopologyKind derives from this
++// set.
++var WorkflowTopologyKinds = []string{
++	KindWorkflow,
++	KindScope,
++	KindSpec,
++}
++
++// GraphContractMetadataKinds lists the gc.kind values that, when HAND-WRITTEN
++// in step metadata, imply graph.v2 semantics and therefore trigger the formula
++// compiler requirement (formula.metadataRequiresGraphContract derives from
++// this set). It is exactly StructuralGraphKinds ∪ (ControlKinds \ {fanout}):
++// the fanout exclusion is intentional — that kind is engine-minted from
++// [steps.on_complete], which formula validation catches via struct-field
++// checks (commit 2531b9440), so it is covered by EngineMintedOnlyKinds
++// instead (hand-writing it is a validation error, not a contract trigger).
++// KindDrain appears in both detection paths (struct field and metadata) as
++// belt-and-suspenders from PR #2784. TestKindSetRelationships pins this
++// composition.
++var GraphContractMetadataKinds = []string{
++	KindScope,
++	KindCleanup,
++	KindScopeCheck,
++	KindWorkflowFinalize,
++	KindRetry,
++	KindRetryRun,
++	KindRetryEval,
++	KindRalph,
++	KindRun,
++	KindCheck,
++	KindDrain,
++}
++
++// EngineMintedOnlyKinds lists the gc.kind values that only the formula
++// compiler may mint: fanout control beads are expanded from the
++// [steps.on_complete] authoring surface (formula ApplyGraphControls), and no
++// hand-authoring surface exists for them. Hand-writing these values in step
++// metadata is rejected by formula validation (the behavior owner is
++// Formula.Validate via validateEngineMintedKindMetadata, ga-cjg11s) —
++// otherwise the bead would pass validation and the legacy routing path would
++// stamp it onto a worker instead of the control dispatcher. It is exactly
++// ControlKinds \ GraphContractMetadataKinds; TestKindSetRelationships pins
++// this composition.
++var EngineMintedOnlyKinds = []string{
++	KindFanout,
++}
+diff --git a/internal/beadmeta/kindsets_test.go b/internal/beadmeta/kindsets_test.go
+new file mode 100644
+index 000000000..bde6b52fc
+--- /dev/null
++++ b/internal/beadmeta/kindsets_test.go
+@@ -0,0 +1,165 @@
++package beadmeta
++
++import (
++	"slices"
++	"testing"
++)
++
++// TestControlKindsExact pins the control-kind vocabulary. The behavior owner is
++// the ProcessControl switch in internal/dispatch/runtime.go: adding a kind there
++// without adding it here (or vice versa) must fail this test, so the two are
++// updated together.
++func TestControlKindsExact(t *testing.T) {
++	want := []string{
++		KindRetry, KindRalph, KindCheck, KindRetryEval, KindFanout,
++		KindDrain, KindScopeCheck, KindWorkflowFinalize,
++	}
++	if !slices.Equal(ControlKinds, want) {
++		t.Errorf("ControlKinds = %v, want %v", ControlKinds, want)
++	}
++	for _, k := range want {
++		if !IsControlKind(k) {
++			t.Errorf("IsControlKind(%q) = false, want true", k)
++		}
++	}
++	for _, k := range []string{KindWorkflow, KindScope, KindSpec, KindWisp, KindTask, KindRun, KindRetryRun, KindCleanup, "", "nonsense"} {
++		if IsControlKind(k) {
++			t.Errorf("IsControlKind(%q) = true, want false", k)
++		}
++	}
++}
++
++// TestKindSetRelationships pins the structural relationships between the kind
++// sets so membership drift between predicates becomes a test failure instead of
++// folklore:
++//
++//   - control kinds, structural graph kinds, and topology kinds are disjoint
++//     vocabulary regions (a kind is dispatched, or structures the graph, or
++//     anchors topology — never two of those), except KindScope which is both a
++//     structural node and a topology anchor;
++//   - the graph-contract metadata trigger is exactly the structural kinds plus
++//     the control kinds minus {fanout}. The fanout exclusion is INTENTIONAL
++//     (commit 2531b9440): that kind is engine-minted from the
++//     [steps.on_complete] authoring surface, which formula validation catches
++//     via struct-field checks, so hand-written metadata coverage is not
++//     needed for it;
++//   - the engine-minted-only kinds are exactly the control kinds excluded from
++//     the graph-contract metadata trigger, so together the two sets cover every
++//     control kind: hand-writing a control kind in step metadata either demands
++//     the graph contract or is rejected outright (ga-cjg11s).
++func TestKindSetRelationships(t *testing.T) {
++	if dup := firstDuplicate(ControlKinds); dup != "" {
++		t.Errorf("ControlKinds contains duplicate %q", dup)
++	}
++	if dup := firstDuplicate(StructuralGraphKinds); dup != "" {
++		t.Errorf("StructuralGraphKinds contains duplicate %q", dup)
++	}
++	if dup := firstDuplicate(WorkflowTopologyKinds); dup != "" {
++		t.Errorf("WorkflowTopologyKinds contains duplicate %q", dup)
++	}
++	if dup := firstDuplicate(GraphContractMetadataKinds); dup != "" {
++		t.Errorf("GraphContractMetadataKinds contains duplicate %q", dup)
++	}
++
++	for _, k := range ControlKinds {
++		if slices.Contains(StructuralGraphKinds, k) {
++			t.Errorf("%q is in both ControlKinds and StructuralGraphKinds", k)
++		}
++		if slices.Contains(WorkflowTopologyKinds, k) {
++			t.Errorf("%q is in both ControlKinds and WorkflowTopologyKinds", k)
++		}
++	}
++	for _, k := range StructuralGraphKinds {
++		if slices.Contains(WorkflowTopologyKinds, k) && k != KindScope {
++			t.Errorf("%q is in both StructuralGraphKinds and WorkflowTopologyKinds (only KindScope may be)", k)
++		}
++	}
++
++	var derived []string
++	derived = append(derived, StructuralGraphKinds...)
++	for _, k := range ControlKinds {
++		if k == KindFanout {
++			continue
++		}
++		derived = append(derived, k)
++	}
++	slices.Sort(derived)
++	got := slices.Clone(GraphContractMetadataKinds)
++	slices.Sort(got)
++	if !slices.Equal(got, derived) {
++		t.Errorf("GraphContractMetadataKinds = %v\nwant StructuralGraphKinds ∪ (ControlKinds \\ {fanout}) = %v", got, derived)
++	}
++}
++
++// TestScopeCheckExemptKindsComposition pins ScopeCheckExemptKinds to its
++// declared composition — (ControlKinds \ {retry, ralph, retry-eval}) ∪
++// {scope, spec} — so a new control kind forces an explicit decision about
++// scope-check pairing instead of silently drifting one of the injection
++// predicates (the drift this set was introduced to end; see ga-e154xo).
++func TestScopeCheckExemptKindsComposition(t *testing.T) {
++	if dup := firstDuplicate(ScopeCheckExemptKinds); dup != "" {
++		t.Errorf("ScopeCheckExemptKinds contains duplicate %q", dup)
++	}
++
++	var derived []string
++	for _, k := range ControlKinds {
++		switch k {
++		case KindRetry, KindRalph, KindRetryEval:
++			continue
++		}
++		derived = append(derived, k)
++	}
++	derived = append(derived, KindScope, KindSpec)
++	slices.Sort(derived)
++	got := slices.Clone(ScopeCheckExemptKinds)
++	slices.Sort(got)
++	if !slices.Equal(got, derived) {
++		t.Errorf("ScopeCheckExemptKinds = %v\nwant (ControlKinds \\ {retry, ralph, retry-eval}) ∪ {scope, spec} = %v", got, derived)
++	}
++
++	for _, k := range ScopeCheckExemptKinds {
++		if !IsScopeCheckExemptKind(k) {
++			t.Errorf("IsScopeCheckExemptKind(%q) = false, want true", k)
++		}
++	}
++	for _, k := range []string{KindRetry, KindRalph, KindRetryEval, KindTask, KindCleanup, KindRun, KindRetryRun, KindWorkflow, KindWisp, "", "nonsense"} {
++		if IsScopeCheckExemptKind(k) {
++			t.Errorf("IsScopeCheckExemptKind(%q) = true, want false", k)
++		}
++	}
++
++	if dup := firstDuplicate(EngineMintedOnlyKinds); dup != "" {
++		t.Errorf("EngineMintedOnlyKinds contains duplicate %q", dup)
++	}
++	var mintedOnly []string
++	for _, k := range ControlKinds {
++		if !slices.Contains(GraphContractMetadataKinds, k) {
++			mintedOnly = append(mintedOnly, k)
++		}
++	}
++	slices.Sort(mintedOnly)
++	gotMinted := slices.Clone(EngineMintedOnlyKinds)
++	slices.Sort(gotMinted)
++	if !slices.Equal(gotMinted, mintedOnly) {
++		t.Errorf("EngineMintedOnlyKinds = %v\nwant ControlKinds \\ GraphContractMetadataKinds = %v", gotMinted, mintedOnly)
++	}
++	for _, k := range EngineMintedOnlyKinds {
++		if slices.Contains(StructuralGraphKinds, k) {
++			t.Errorf("%q is in both EngineMintedOnlyKinds and StructuralGraphKinds", k)
++		}
++		if slices.Contains(WorkflowTopologyKinds, k) {
++			t.Errorf("%q is in both EngineMintedOnlyKinds and WorkflowTopologyKinds", k)
++		}
++	}
++}
++
++func firstDuplicate(set []string) string {
++	seen := make(map[string]struct{}, len(set))
++	for _, k := range set {
++		if _, ok := seen[k]; ok {
++			return k
++		}
++		seen[k] = struct{}{}
++	}
++	return ""
++}
+diff --git a/internal/beadmeta/values.go b/internal/beadmeta/values.go
+new file mode 100644
+index 000000000..a5957d4eb
+--- /dev/null
++++ b/internal/beadmeta/values.go
+@@ -0,0 +1,165 @@
++package beadmeta
++
++// Value vocabulary for engine-minted structural metadata keys. These are DATA
++// declarations only: which kinds a dispatcher accepts, which kinds trigger the
++// graph contract, and what an outcome means remain decisions owned by the
++// dispatch/formula/delivery packages. Routing keys (gc.routed_to,
++// gc.run_target, gc.execution_routed_to) deliberately have no value vocabulary
++// here — their values are config-supplied agent identities, and enumerating
++// them would hardcode role names (forbidden by the ZERO-hardcoded-roles rule).
++
++// Values of KindMetadataKey ("gc.kind"). Several predicates over this
++// vocabulary coexist with different membership; the named subsets, their
++// relationships, and the authoritative set are declared in kindsets.go
++// (ControlKinds is authoritative; every routing predicate derives from it).
++const (
++	// Control-bead kinds processed by the control dispatcher.
++	KindRetry            = "retry"
++	KindRalph            = "ralph"
++	KindCheck            = "check"
++	KindRetryEval        = "retry-eval"
++	KindFanout           = "fanout"
++	KindDrain            = "drain"
++	KindScopeCheck       = "scope-check"
++	KindWorkflowFinalize = "workflow-finalize"
++
++	// Structural graph-node kinds: compiled into graphs, never dispatched as
++	// control beads (the dispatch switch hard-errors on them).
++	KindScope    = "scope"
++	KindCleanup  = "cleanup"
++	KindRun      = "run"
++	KindRetryRun = "retry-run"
++
++	// KindWorkflow marks a workflow root bead.
++	KindWorkflow = "workflow"
++
++	// KindWisp marks the root bead of a root-only wisp molecule.
++	KindWisp = "wisp"
++
++	// KindSpec marks a generated step-spec sidecar bead carrying a serialized
++	// step definition rather than executable work.
++	KindSpec = "spec"
++)
++
++// Values of OutcomeMetadataKey ("gc.outcome").
++const (
++	OutcomePass    = "pass"
++	OutcomeFail    = "fail"
++	OutcomeSkipped = "skipped"
++	// OutcomeCanceled records a bead closed because its run was canceled via the
++	// API (POST /runs/{id}/cancel). It is a distinct terminal outcome from fail
++	// and skipped so a client can tell an operator-canceled run apart.
++	OutcomeCanceled = "canceled"
++
++	// OutcomeMissingRoot records a control bead closed because its workflow
++	// root vanished from the store (see closeOrphanedControl in
++	// internal/dispatch/runtime.go).
++	OutcomeMissingRoot = "missing_root"
++)
++
++// Values of WorkOutcomeMetadataKey ("gc.work_outcome"), the typed work-record
++// close disposition (ADR-0009). Deliberately disjoint from the control-plane
++// OutcomeMetadataKey vocabulary above so the two never collide on one key. Only
++// WorkOutcomeShipped carries an artifact (a commit on the work branch); the
++// "shipped requires a reachable commit" rule is owned by the close gate in
++// cmd/gc, not declared here.
++const (
++	WorkOutcomeShipped   = "shipped"
++	WorkOutcomeNoOp      = "no-op"
++	WorkOutcomeBlocked   = "blocked"
++	WorkOutcomeAbandoned = "abandoned"
++)
++
++// Failure-class vocabulary, shared by FailureClassMetadataKey
++// ("gc.failure_class") and its sibling keys LastFailureClassMetadataKey
++// ("gc.last_failure_class") and ControllerErrorClassMetadataKey
++// ("gc.controller_error_class") — all three classify a failure as retryable or
++// not using the same value strings.
++const (
++	FailureClassTransient = "transient"
++	FailureClassHard      = "hard"
++)
++
++// FormulaContractGraphV2 is the value of FormulaContractMetadataKey
++// ("gc.formula_contract") marking a workflow compiled under the graph.v2
++// contract — the single most-branched-on metadata value in the engine.
++const FormulaContractGraphV2 = "graph.v2"
++
++// Values of ScopeRoleMetadataKey ("gc.scope_role"): the role a bead plays
++// inside a scope. The scope reconciler in internal/dispatch/runtime.go branches
++// on exact agreement between writers (dispatch, formula, cmd/gc) and readers.
++const (
++	ScopeRoleBody     = "body"
++	ScopeRoleMember   = "member"
++	ScopeRoleControl  = "control"
++	ScopeRoleTeardown = "teardown"
++)
++
++// Values of DrainStateMetadataKey ("gc.drain_state"): the drain control
++// state machine. The empty string is a valid initial state (treated as
++// pending); do not add validation that rejects "".
++const (
++	DrainStatePending    = "pending"
++	DrainStateExpanding  = "expanding"
++	DrainStateExpanded   = "expanded"
++	DrainStateCompleting = "completing"
++	DrainStateSucceeded  = "succeeded"
++	DrainStateFailed     = "failed"
++)
++
++// Spawn-state vocabulary shared by RetryStateMetadataKey ("gc.retry_state")
++// and FanoutStateMetadataKey ("gc.fanout_state"): both keys run the identical
++// crash-resume state machine. The empty string is a valid initial state.
++const (
++	SpawnStateSpawning = "spawning"
++	SpawnStateSpawned  = "spawned"
++)
++
++// Disposition vocabulary for FinalDispositionMetadataKey
++// ("gc.final_disposition"). DispositionHardFail and DispositionSoftFail are
++// also the legal values of OnExhaustedMetadataKey ("gc.on_exhausted"), which
++// selects the disposition applied when retries are exhausted. DispositionPass
++// shares its string with OutcomePass but is a distinct domain.
++const (
++	DispositionPass              = "pass"
++	DispositionHardFail          = "hard_fail"
++	DispositionSoftFail          = "soft_fail"
++	DispositionControllerError   = "controller_error"
++	DispositionOrphanedWorkflow  = "orphaned_workflow"
++	DispositionControlQuarantine = "control_quarantined"
++)
++
++// Values of FanoutModeMetadataKey ("gc.fanout_mode").
++const (
++	FanoutModeParallel   = "parallel"
++	FanoutModeSequential = "sequential"
++)
++
++// Values of DrainContextMetadataKey ("gc.drain_context").
++const (
++	DrainContextSeparate = "separate"
++	DrainContextShared   = "shared"
++)
++
++// Values of DrainMemberAccessMetadataKey ("gc.drain_member_access").
++const (
++	DrainMemberAccessRead      = "read"
++	DrainMemberAccessExclusive = "exclusive"
++)
++
++// Values of DrainOnItemFailureMetadataKey ("gc.drain_on_item_failure").
++const (
++	DrainOnItemFailureSkipRemaining = "skip_remaining"
++	DrainOnItemFailureContinue      = "continue"
++)
++
++// CheckModeExec is the sole value of CheckModeMetadataKey ("gc.check_mode");
++// formula validation and dispatch enforce it independently, so the constant
++// ties the contract together.
++const CheckModeExec = "exec"
++
++// Values of ScopeKindMetadataKey ("gc.scope_kind").
++const (
++	ScopeKindCity = "city"
++	ScopeKindRig  = "rig"
++)
+diff --git a/internal/bootstrap/packs/core/formulas/mol-do-work.toml b/internal/bootstrap/packs/core/formulas/mol-do-work.toml
+index 58d17bfa0..0fe4b65f5 100644
+--- a/internal/bootstrap/packs/core/formulas/mol-do-work.toml
++++ b/internal/bootstrap/packs/core/formulas/mol-do-work.toml
+@@ -102,8 +102,9 @@ Work is done. Close this drain step, then signal the controller to reclaim this
+ session:
+ 
+ ```bash
+-if [ -n "${GC_BEAD_ID:-}" ]; then
+-  bd update "$GC_BEAD_ID" --set-metadata gc.outcome=pass --status=closed --notes "Drain acknowledged."
++DRAIN_BEAD_ID="${GC_BEAD_ID:-${GC_TRIGGER_BEAD_ID:-}}"
++if [ -n "$DRAIN_BEAD_ID" ]; then
++  bd update "$DRAIN_BEAD_ID" --set-metadata gc.outcome=pass --status=closed --notes "Drain acknowledged."
+ fi
+ gc runtime drain-ack
+ ```
