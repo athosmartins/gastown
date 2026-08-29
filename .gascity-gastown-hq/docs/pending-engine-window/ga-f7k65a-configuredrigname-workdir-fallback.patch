@@ -1,0 +1,124 @@
+diff --git a/internal/workdir/workdir.go b/internal/workdir/workdir.go
+index cf30d24e9..465b3d048 100644
+--- a/internal/workdir/workdir.go
++++ b/internal/workdir/workdir.go
+@@ -43,23 +43,52 @@ func ResolveDirPath(cityPath, dir string) string {
+ }
+ 
+ // ConfiguredRigName returns the rig associated with an agent, preferring the
+-// legacy dir-as-rig convention and falling back to path matching.
++// legacy dir-as-rig convention and falling back to path matching. Dir-less
++// agents (Dir == "" — pool-template agents defined via agents/<name>/agent.toml,
++// e.g. wa-worker, ps-worker, commonly have no dir field at all) fall back to
++// matching WorkDir against each configured rig's root, since WorkDir is the
++// only field carrying a real filesystem location for such agents. Without
++// this fallback, a dir-less rig-scoped agent looks identical to a city-scoped
++// one to every caller keyed off ConfiguredRigName (e.g. the cross-store route
++// guard in internal/sling), which misclassifies it as reaching only the city
++// store and refuses legitimate rig-scoped routes.
+ func ConfiguredRigName(cityPath string, a config.Agent, rigs []config.Rig) string {
+-	if a.Dir == "" {
++	if a.Dir != "" {
++		for _, rig := range rigs {
++			if a.Dir == rig.Name {
++				return rig.Name
++			}
++		}
++		abs := ResolveDirPath(cityPath, a.Dir)
++		for _, rig := range rigs {
++			if samePath(abs, rig.Path) {
++				return rig.Name
++			}
++		}
+ 		return ""
+ 	}
+-	for _, rig := range rigs {
+-		if a.Dir == rig.Name {
+-			return rig.Name
+-		}
++	if a.WorkDir == "" {
++		return ""
+ 	}
+-	abs := ResolveDirPath(cityPath, a.Dir)
++	// WorkDir commonly points at a subdirectory of the rig (e.g.
++	// ".../whatsapp_automation/crew/worker"), not the rig root itself, so
++	// this is a within-tree check, not an exact match — and the most
++	// specific (deepest) containing rig wins if more than one rig's root
++	// contains it (nested rig roots are possible in principle even if not
++	// observed in any city today).
++	abs := ResolveDirPath(cityPath, a.WorkDir)
++	best := ""
++	bestLen := -1
+ 	for _, rig := range rigs {
+-		if samePath(abs, rig.Path) {
+-			return rig.Name
++		if !pathutil.PathWithin(rig.Path, abs) {
++			continue
++		}
++		if l := len(rig.Path); l > bestLen {
++			best = rig.Name
++			bestLen = l
+ 		}
+ 	}
+-	return ""
++	return best
+ }
+ 
+ // RigRootForName returns the configured root path for rigName.
+diff --git a/internal/workdir/workdir_test.go b/internal/workdir/workdir_test.go
+index ea89f1e5b..d1357a11d 100644
+--- a/internal/workdir/workdir_test.go
++++ b/internal/workdir/workdir_test.go
+@@ -235,6 +235,52 @@ func TestConfiguredRigNameMatchesSymlinkAliasPath(t *testing.T) {
+ 	}
+ }
+ 
++func TestConfiguredRigNameFallsBackToWorkDirWhenDirLess(t *testing.T) {
++	cityPath := t.TempDir()
++	rigPath := filepath.Join(cityPath, "whatsapp_automation")
++	if err := os.MkdirAll(rigPath, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	// Pool-template agents (wa-worker, ps-worker) are defined via
++	// agents/<name>/agent.toml with no `dir` field at all -- WorkDir is the
++	// only field carrying a real filesystem location, and it commonly
++	// points at a subdirectory of the rig (crew/worker), not the rig root
++	// itself.
++	got := ConfiguredRigName(cityPath, config.Agent{
++		Name:    "wa-worker",
++		WorkDir: filepath.Join(rigPath, "crew", "worker"),
++	}, []config.Rig{{Name: "whatsapp_automation", Path: rigPath}})
++	if got != "whatsapp_automation" {
++		t.Fatalf("ConfiguredRigName() = %q, want %q", got, "whatsapp_automation")
++	}
++}
++
++func TestConfiguredRigNameWorkDirFallbackPicksMostSpecificRig(t *testing.T) {
++	cityPath := t.TempDir()
++	outerPath := filepath.Join(cityPath, "outer")
++	innerPath := filepath.Join(outerPath, "inner")
++	if err := os.MkdirAll(innerPath, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	got := ConfiguredRigName(cityPath, config.Agent{
++		Name:    "worker",
++		WorkDir: filepath.Join(innerPath, "crew", "worker"),
++	}, []config.Rig{
++		{Name: "outer", Path: outerPath},
++		{Name: "inner", Path: innerPath},
++	})
++	if got != "inner" {
++		t.Fatalf("ConfiguredRigName() = %q, want %q (most specific containing rig)", got, "inner")
++	}
++}
++
++func TestConfiguredRigNameDirLessNoWorkDirStillEmpty(t *testing.T) {
++	got := ConfiguredRigName(t.TempDir(), config.Agent{Name: "city-scoped"}, []config.Rig{{Name: "demo", Path: "/anywhere"}})
++	if got != "" {
++		t.Fatalf("ConfiguredRigName() = %q, want empty for an agent with neither Dir nor WorkDir", got)
++	}
++}
++
+ func TestSamePathUsesSharedPathNormalization(t *testing.T) {
+ 	a := "/private/tmp/gc-home"
+ 	b := "/tmp/gc-home"
