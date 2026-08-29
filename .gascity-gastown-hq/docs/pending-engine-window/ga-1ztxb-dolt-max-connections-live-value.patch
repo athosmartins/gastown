@@ -1,0 +1,169 @@
+diff --git a/internal/doltserver/doltserver.go b/internal/doltserver/doltserver.go
+index 6d7bcf30c..6801a739c 100644
+--- a/internal/doltserver/doltserver.go
++++ b/internal/doltserver/doltserver.go
+@@ -242,8 +242,11 @@ type Config struct {
+ 	PidFile string
+ 
+ 	// MaxConnections is the maximum number of simultaneous connections the server will accept.
+-	// Set to 0 to use the Dolt default (1000). Gas Town defaults to 50 to prevent
+-	// connection storms during mass polecat slings.
++	// Set to 0 to use the Dolt default (1000). This value is written into the
++	// generated config.yaml when starting a NEW server — it does not reflect a
++	// running server's actual live max_connections. Callers that need the real
++	// value for a server that may already be running (health reporting,
++	// capacity checks) should query it live; see getLiveMaxConnections.
+ 	MaxConnections int
+ 
+ 	// ReadTimeoutMs is the server-side read timeout in milliseconds.
+@@ -3906,13 +3909,74 @@ func GetActiveConnectionCount(townRoot string) (int, error) {
+ 	return count, nil
+ }
+ 
++// getLiveMaxConnections queries the running Dolt server for its actual configured
++// max_connections system variable. Uses `dolt sql` (same technique as
++// GetActiveConnectionCount) to avoid a MySQL driver dependency. Returns an error if
++// the server is unreachable or the query fails — callers must fall back to the
++// static Config.MaxConnections default in that case (ga-1ztxb: Config.MaxConnections
++// is a compile-time default that is never updated from the live server, so it silently
++// diverges from reality whenever a town's actual max_connections isn't the Dolt
++// default of 1000 — see the sibling bug ga-ood0l for the same defect class).
++func getLiveMaxConnections(townRoot string) (int, error) {
++	config := DefaultConfig(townRoot)
++
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++
++	fullArgs := []string{
++		"--host", config.EffectiveHost(),
++		"--port", strconv.Itoa(config.Port),
++		"--user", config.User,
++		"--no-tls",
++		"sql",
++		"-r", "csv",
++		"-q", "SELECT @@max_connections AS max_conn",
++	}
++	cmd := exec.CommandContext(ctx, "dolt", fullArgs...)
++	// GH#2537: see GetActiveConnectionCount above — set cmd.Dir to the server's
++	// data directory to prevent dolt from creating stray .doltcfg/privileges.db
++	// files in the caller's CWD, even in TCP client mode.
++	cmd.Dir = config.DataDir
++	cmd.Env = append(os.Environ(), "DOLT_CLI_PASSWORD="+config.Password)
++	setProcessGroup(cmd)
++	output, err := cmd.CombinedOutput()
++	if err != nil {
++		return 0, fmt.Errorf("querying max_connections: %w (output: %s)", err, strings.TrimSpace(string(output)))
++	}
++	return parseMaxConnectionsOutput(output)
++}
++
++// parseMaxConnectionsOutput parses the CSV output of a `SELECT @@max_connections`
++// query (e.g. "max_conn\n256\n") into an integer. Split out from
++// getLiveMaxConnections so the parsing logic is unit-testable without a live Dolt
++// server.
++func parseMaxConnectionsOutput(output []byte) (int, error) {
++	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
++	if len(lines) < 2 {
++		return 0, fmt.Errorf("unexpected output from max_connections query: %s", string(output))
++	}
++	count, err := strconv.Atoi(strings.TrimSpace(lines[len(lines)-1]))
++	if err != nil {
++		return 0, fmt.Errorf("parsing max_connections %q: %w", lines[len(lines)-1], err)
++	}
++	return count, nil
++}
++
+ // HasConnectionCapacity checks whether the Dolt server has capacity for new connections.
+ // Returns true if the active connection count is below the threshold (80% of max_connections).
+ // Returns false with error if the connection count cannot be determined — fail closed
+ // to prevent connection storms that cause read-only mode (gt-lfc0d).
+ func HasConnectionCapacity(townRoot string) (bool, int, error) {
+ 	config := DefaultConfig(townRoot)
+-	maxConn := config.MaxConnections
++	// Prefer the live server's actual max_connections (ga-1ztxb): the static
++	// config default (1000) silently under-throttles this capacity gate whenever
++	// the real limit is lower — e.g. this town runs 256, so a threshold computed
++	// from 1000 would say "capacity available" up to 800 connections, well past
++	// the real ceiling, defeating the fail-closed purpose below.
++	maxConn, err := getLiveMaxConnections(townRoot)
++	if err != nil || maxConn <= 0 {
++		maxConn = config.MaxConnections
++	}
+ 	if maxConn <= 0 {
+ 		maxConn = 1000 // Dolt default
+ 	}
+@@ -3979,11 +4043,18 @@ type HealthMetrics struct {
+ func GetHealthMetrics(townRoot string) *HealthMetrics {
+ 	config := DefaultConfig(townRoot)
+ 	metrics := &HealthMetrics{
+-		Healthy:        true,
+-		MaxConnections: config.MaxConnections,
++		Healthy: true,
+ 	}
+-	if metrics.MaxConnections <= 0 {
+-		metrics.MaxConnections = 1000 // Dolt default
++	// Prefer the live server's actual max_connections over the static config
++	// default (ga-1ztxb): Config.MaxConnections is a compile-time default that
++	// never reflects what the running server was actually configured with.
++	if liveMax, err := getLiveMaxConnections(townRoot); err == nil && liveMax > 0 {
++		metrics.MaxConnections = liveMax
++	} else {
++		metrics.MaxConnections = config.MaxConnections
++		if metrics.MaxConnections <= 0 {
++			metrics.MaxConnections = 1000 // Dolt default
++		}
+ 	}
+ 
+ 	// 1. Query latency: time a SELECT active_branch()
+diff --git a/internal/doltserver/doltserver_test.go b/internal/doltserver/doltserver_test.go
+index af577cad6..f77b2e2e8 100644
+--- a/internal/doltserver/doltserver_test.go
++++ b/internal/doltserver/doltserver_test.go
+@@ -2080,6 +2080,47 @@ func TestHasConnectionCapacity_ZeroMax(t *testing.T) {
+ 	}
+ }
+ 
++// TestParseMaxConnectionsOutput pins the CSV-parsing logic getLiveMaxConnections
++// relies on to read a live `SELECT @@max_connections` result (ga-1ztxb). 256 is
++// this town's actual measured live value at the time the bug was filed — a
++// regression that silently keeps returning the static 1000 default (or any other
++// value that happens to equal DefaultMaxConnections) would not be caught by a
++// test that only ever exercises 1000, so this table deliberately includes a
++// non-1000 value.
++func TestParseMaxConnectionsOutput(t *testing.T) {
++	tests := []struct {
++		name    string
++		output  []byte
++		want    int
++		wantErr bool
++	}{
++		{name: "town's actual live value", output: []byte("max_conn\n256\n"), want: 256},
++		{name: "dolt default value", output: []byte("max_conn\n1000\n"), want: 1000},
++		{name: "trailing whitespace tolerated", output: []byte("max_conn\n256\n\n"), want: 256},
++		{name: "CRLF line endings tolerated", output: []byte("max_conn\r\n256\r\n"), want: 256},
++		{name: "empty output", output: []byte(""), wantErr: true},
++		{name: "header only, no data row", output: []byte("max_conn\n"), wantErr: true},
++		{name: "non-numeric value", output: []byte("max_conn\nnot-a-number\n"), wantErr: true},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got, err := parseMaxConnectionsOutput(tt.output)
++			if tt.wantErr {
++				if err == nil {
++					t.Fatalf("parseMaxConnectionsOutput(%q) = %d, nil; want error", tt.output, got)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("parseMaxConnectionsOutput(%q) unexpected error: %v", tt.output, err)
++			}
++			if got != tt.want {
++				t.Errorf("parseMaxConnectionsOutput(%q) = %d, want %d", tt.output, got, tt.want)
++			}
++		})
++	}
++}
++
+ func TestFindAndMigrateAll_Idempotent(t *testing.T) {
+ 	townRoot := t.TempDir()
+ 
