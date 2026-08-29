@@ -23,7 +23,13 @@ if [ ! -f "$PLIST" ]; then
   exit 0
 fi
 
-PEND=$(ls -1 "$HOME/gt/docs/pending-engine-window/" 2>/dev/null | grep -c '\.patch$' || echo 0)
+# ga-8v5t2: canonical queue is under .gascity-gastown-hq/ -- the top-level
+# docs/pending-engine-window/ this used to read is a misfiled-patch artifact,
+# not an alternate queue (see merged-bead-janitor.sh's own comments on the
+# same two paths). Also: `grep -c` already prints "0" (and exits 1) on zero
+# matches, so `|| echo 0` doubled the output into "0\n0" whenever the queue
+# was empty -- dropped, not replaced, since grep -c never needs a fallback.
+PEND=$(ls -1 "$HOME/gt/.gascity-gastown-hq/docs/pending-engine-window/" 2>/dev/null | grep -c '\.patch$')
 SESS=$(timeout 60 gc session list 2>/dev/null | awk 'NR>1 && $3=="active"' | wc -l | tr -d ' ')
 MSG="Meio-dia: confirma o reboot? A janela do engine esta ARMADA e roda sozinha no boot (${PEND} patch pendente). Agora ha ${SESS} sessoes ativas que serao interrompidas (recuperavel: reclaim-guard preserva e o Pilot redespacha). Responda na sessao do Mayor — nada reinicia sem a sua confirmacao."
 
