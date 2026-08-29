@@ -1,0 +1,139 @@
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 02a2e0614..d1f09e3cb 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -3258,8 +3258,30 @@ func bdReadyPoolDemandShell(limitFlag string, includeEphemeralReady bool) string
+ // pilot:refused-reason:<slug>, gate:needs-human(:<reason>)) is handled in
+ // poolDemandLabelFilterJQ below, for the same reason pool:refused:*/
+ // pilot:held* are: --exclude-label cannot express a prefix match.
++//
++// ga-6bghe: gate:queued and gate:reviewing are appended last — a bead
++// carrying either has already had its fix submitted and is under active
++// quality-gate review; no builder work remains until that review concludes.
++// Neither was previously excluded, so a bead could be open+unassigned+
++// gc.routed_to (the source bead legitimately "stays open until the gate
++// merges" per builder convention) while ALSO mid-review, and this probe
++// could not tell that apart from genuinely fresh work. Confirmed live twice
++// independently (ga-nxgxz 2026-08-06, ga-ovw94t 2026-08-17): a fresh dog
++// claimed a bead whose gate marker was still open/progressing (never
++// stalled), burning ~10-15 tool calls reconstructing "already in flight"
++// from scratch before releasing it. gate:needs-fix is deliberately NOT
++// added here — that label means the gate REJECTED and a builder IS needed
++// again, so it must stay poolable; the two do not steady-state coexist
++// because quality-gate-dispatcher.sh's FAIL path clears gate:queued (and
++// unsets gc.routed_to) in the same edit that sets gate:needs-fix. A third
++// label from this gap's own bug report, "gate:dispatching", is deliberately
++// omitted: verified against every gate:* label actually applied to a bead
++// across packs/town-deltas/assets/*.sh and internal/ — it does not exist.
++// The real marker-side field is gate-status:dispatching, which lives on the
++// separate quality-gate-marker bead, never on the story bead this probe
++// evaluates.
+ func bdReadyPoolDemandExcludeLabelArgs() string {
+-	return ` --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked"`
++	return ` --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing"`
+ }
+ 
+ // poolDemandLabelFilterJQ is the PREFIX half of the routed-pool predicate: the
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index 05df06935..024afe9c3 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -1725,7 +1725,7 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
+ 	if strings.Contains(got, `--include-ephemeral`) {
+ 		t.Errorf("EffectiveWorkQuery() default must be bd 1.0.4-compatible without --include-ephemeral: %q", got)
+ 	}
+-	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json --sort oldest --limit=20`) {
++	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --json --sort oldest --limit=20`) {
+ 		t.Errorf("EffectiveWorkQuery() missing tier 3 pool-demand probe: %q", got)
+ 	}
+ 	if !strings.Contains(got, "-- mayor") {
+@@ -1747,7 +1747,7 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
+ func TestEffectiveWorkQueryBD105CompatibilityOptIn(t *testing.T) {
+ 	a := Agent{Name: "mayor"}
+ 	got := a.EffectiveWorkQueryForBeads(BeadsConfig{BDCompatibility: BeadsBDCompatibility105})
+-	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json --sort oldest --limit=20`) {
++	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --json --sort oldest --limit=20`) {
+ 		t.Errorf("EffectiveWorkQueryForBeads(bd-1.0.5) missing include-ephemeral routed probe: %q", got)
+ 	}
+ 	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=1`) {
+@@ -2046,6 +2046,53 @@ func TestBdReadyPoolDemandExcludeLabelArgsIncludesEngineWindowAndParkLabels(t *t
+ 	}
+ }
+ 
++// TestBdReadyPoolDemandExcludeLabelArgsIncludesActiveGateReviewLabels (ga-6bghe):
++// gate:queued and gate:reviewing mark a bead whose fix a builder ALREADY
++// submitted and which the quality-gate pipeline is actively reviewing right
++// now — no builder work remains until that review concludes. Neither label
++// was in this exclude list, so a bead could carry gate:queued+gate:reviewing
++// (mid-review) while ALSO being open+unassigned+gc.routed_to (the source
++// bead legitimately "stays open until the gate merges" per builder
++// convention), and the routed-pool probe could not tell that state apart
++// from genuinely fresh work.
++//
++// Confirmed live twice independently: ga-nxgxz (2026-08-06, dog-gahd2ut) and
++// ga-ovw94t (2026-08-17, dog-gafq6k1v) — both cases a fresh dog claimed a
++// bead whose gate marker was still open/progressing (never stalled), burning
++// ~10-15 tool calls reconstructing "already in flight" from scratch before
++// releasing it.
++//
++// gate:needs-fix is deliberately NOT added here: that label means the gate
++// REJECTED and a builder IS needed again — it must stay poolable. The two
++// states do not steady-state coexist: quality-gate-dispatcher.sh's FAIL path
++// clears gate:queued (and unsets gc.routed_to) in the same edit that sets
++// gate:needs-fix, so a bead correctly needing rework never carries
++// gate:queued at the same time.
++//
++// The bead's own suggested fix text also named a third label,
++// "gate:dispatching" — verified against every gate:* label actually applied
++// to a bead anywhere in packs/town-deltas/assets/*.sh and internal/: it does
++// not exist. The real marker-side status field is gate-status:dispatching,
++// which lives on the separate quality-gate-marker bead, never on the story
++// bead this probe evaluates — so it is intentionally omitted here.
++func TestBdReadyPoolDemandExcludeLabelArgsIncludesActiveGateReviewLabels(t *testing.T) {
++	got := bdReadyPoolDemandExcludeLabelArgs()
++	for _, want := range []string{
++		`--exclude-label "gate:queued"`,
++		`--exclude-label "gate:reviewing"`,
++	} {
++		if !strings.Contains(got, want) {
++			t.Fatalf("bdReadyPoolDemandExcludeLabelArgs() = %q, missing %q", got, want)
++		}
++	}
++	if strings.Contains(got, `--exclude-label "gate:needs-fix"`) {
++		t.Fatalf("bdReadyPoolDemandExcludeLabelArgs() = %q, must NOT exclude gate:needs-fix — that label means a builder is needed again", got)
++	}
++	if strings.Contains(got, `gate:dispatching`) {
++		t.Fatalf("bdReadyPoolDemandExcludeLabelArgs() = %q, must NOT reference gate:dispatching — that label does not exist on story beads (only gate-status:dispatching on marker beads)", got)
++	}
++}
++
+ // TestPoolDemandLabelFilterJQExcludesParkLabels (ga-5huvs) is the PREFIX half
+ // of the same fix: blocked:<reason>, pilot:refused-reason:<slug>, and
+ // gate:needs-human(:<reason>) cannot be expressed via bd's exact-match
+@@ -2297,7 +2344,7 @@ func TestEffectiveWorkQueryRoutedQueueUsesNativeOldestSortAcrossReadyTiers(t *te
+ 	}, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  "ready --metadata-field gc.routed_to=hello-world/worker --unassigned --exclude-type=epic --exclude-label story:needs-human --exclude-label needs-human --exclude-label ctx:thin --exclude-label story:needs-approval --exclude-label story:epic --exclude-label needs:engine-window --exclude-label pilot:no-auto-dispatch --exclude-label story:blocked --json --sort oldest --limit=20")
++  "ready --metadata-field gc.routed_to=hello-world/worker --unassigned --exclude-type=epic --exclude-label story:needs-human --exclude-label needs-human --exclude-label ctx:thin --exclude-label story:needs-approval --exclude-label story:epic --exclude-label needs:engine-window --exclude-label pilot:no-auto-dispatch --exclude-label story:blocked --exclude-label gate:queued --exclude-label gate:reviewing --json --sort oldest --limit=20")
+     printf '[{"id":"older-no-history","priority":2,"created_at":"2026-05-20T06:09:30Z","no_history":true}]'
+     ;;
+   *)
+@@ -2446,7 +2493,7 @@ func TestEffectiveWorkQueryExcludesEpics(t *testing.T) {
+ 	// resume its own assigned ephemeral epic wisp (the patrol-loop pattern).
+ 	wantPresent := []string{
+ 		// routed/pool tier still excludes epics (gc-udx guard)
+-		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json`,
++		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --json`,
+ 		// assigned tiers carry NO epic exclusion
+ 		`bd list --status in_progress --assignee="$id" --json`,
+ 		`bd ready --assignee="$id" --json`,
+@@ -2472,7 +2519,7 @@ func TestEffectiveWorkQueryExcludesEpicsControlDispatcher(t *testing.T) {
+ 	a := Agent{Name: ControlDispatcherAgentName, Dir: "gascity"}
+ 	got := a.EffectiveWorkQuery()
+ 	wantPresent := []string{
+-		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json`,
++		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --json`,
+ 		`bd list --status in_progress --assignee="$cand" --json`,
+ 		`bd ready --assignee="$cand" --json`,
+ 		`-- gascity/control-dispatcher gascity/workflow-control`,

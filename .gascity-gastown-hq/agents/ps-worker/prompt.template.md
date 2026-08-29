@@ -130,16 +130,17 @@ You are disposable. You do not carry state between runs. When your bead is done,
 #     reading the label.
 # NOTE (residual, not fixed here — flagging rather than silently expanding
 # scope or silently dropping it): park_labels.py also defines
-# BLOCKED_FAMILY_LABELS, GATE_PARK_LABELS, and FLOWING_OR_DONE_LABELS as
-# further "don't offer this bead fresh" signals. Not included in this pass —
-# no LIVE incident confirmed them reaching this probe specifically (unlike the
-# two families above), and bd ready's own status/assignee filtering already
-# excludes most of that territory in the normal reclaim/gate flow (a reclaim
-# clears story:in-flight together with status/assignee; a gate:queued bead
-# stays assigned, not open+unassigned, in the flow this session observed).
-# If one of those labels is ever caught live on an offered candidate, that is
-# real evidence this note's reasoning was wrong for that label — add it then,
-# don't pre-emptively enumerate the whole canonical set against zero incidents.
+# BLOCKED_FAMILY_LABELS and FLOWING_OR_DONE_LABELS as further "don't offer
+# this bead fresh" signals. Not included in this pass — no LIVE incident
+# confirmed them reaching this probe specifically, and bd ready's own
+# status/assignee filtering already excludes most of that territory in the
+# normal reclaim/gate flow (a reclaim clears story:in-flight together with
+# status/assignee). If one of those labels is ever caught live on an offered
+# candidate, that is real evidence this note's reasoning was wrong for that
+# label — add it then, don't pre-emptively enumerate the whole canonical set
+# against zero incidents. (GATE_PARK_LABELS is no longer in this residual
+# set — see ga-6bghe below, which is exactly the live incident this note
+# said to wait for.)
 # ga-s1d5o: also excludes needs:engine-window, pilot:no-auto-dispatch, and
 # story:blocked (exact-match) plus blocked:<reason> and gate:needs-human(:<reason>)
 # (prefix, via jq below). This probe had drifted OUT of sync with
@@ -151,7 +152,28 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # was applied only here and never backported to the Go side (see ga-s1d5o).
 # Bringing both lists to the same superset in one pass so neither direction
 # of drift is left standing.
-bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json --sort oldest --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select((.labels // []) | map(select(startswith("blocked:"))) | length == 0) | select((.labels // []) | map(select(startswith("gate:needs-human"))) | length == 0)] | .[:1]'
+# ga-6bghe: also excludes gate:queued and gate:reviewing (exact-match) — the
+# ABOVE note assumed "a gate:queued bead stays assigned, not open+unassigned,
+# in the flow this session observed," so GATE_PARK_LABELS was left out
+# pending a live counter-example. Two independent live incidents (ga-nxgxz
+# 2026-08-06, ga-ovw94t 2026-08-17) are exactly that counter-example: a
+# builder's fix was submitted to gate (gate:queued/gate:reviewing set) while
+# the SOURCE bead stayed open+unassigned+gc.routed_to (the builder's own
+# "stays open until the gate merges" convention), and this probe — bypassing
+# Pilot's own gate-aware dispatch entirely, same as every other gap above —
+# claimed it as fresh work mid-review, burning ~10-15 tool calls
+# reconstructing "already in flight" from scratch each time.
+# gate:needs-fix is deliberately NOT added: it means the gate REJECTED and a
+# builder IS needed again, so it must stay poolable. The two do not
+# steady-state coexist — quality-gate-dispatcher.sh's FAIL path clears
+# gate:queued (and unsets gc.routed_to) in the same edit that sets
+# gate:needs-fix. A third label named in ga-6bghe's own bug report,
+# "gate:dispatching", is deliberately omitted: verified against every gate:*
+# label actually applied to a bead across packs/town-deltas/assets/*.sh and
+# internal/ — it does not exist. The real marker-side field is
+# gate-status:dispatching, which lives on the separate quality-gate-marker
+# bead, never on the story bead this probe evaluates.
+bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --json --sort oldest --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select((.labels // []) | map(select(startswith("blocked:"))) | length == 0) | select((.labels // []) | map(select(startswith("gate:needs-human"))) | length == 0)] | .[:1]'
 # If it returns a bead (output is NOT []), THAT BEAD IS YOURS. Claim it FIRST:
 #     gc bd update <id> --claim
 # verify the claim set assignee to your session, then go to the Build Protocol and build it.
