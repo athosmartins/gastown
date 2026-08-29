@@ -123,8 +123,28 @@ grep -Eq 'assign "\$BEAD_ID" ""'         "$GATE" && ok "gate clears source assig
 grep -q 'mail send mayor'                "$GATE" && ok "gate escalates to Mayor"             || bad "gate missing Mayor escalation"
 
 echo "── 6. drift-guard: pilot re-dispatches needs-fix, excludes needs-human ──"
-eq "pilot excludes gate:needs-human in every candidate query (15)" \
-   "$(grep -c 'exclude-label "gate:needs-human"' "$PILOT")" "15"
+# ga-yh307: BIJECTION, not a magic count — same failure mode as the ga-huaxo
+# AUTHOR-mail guard (test 8, below, in this same file). The old guard pinned
+# candidate-query call sites to a hardcoded 15; pilot-dispatcher.sh has since
+# grown to 19 legitimate sites (each one a real Tier-1/Tier-2/ctx:ready/rig-scan
+# dispatch candidate query, verified by hand), so the guard FAILED
+# unconditionally on a clean checkout — a magic number lies by default the
+# moment a real query is added, and a chronically-RED guard can no longer
+# distinguish "someone added a legit site" from "someone forgot the exclusion",
+# the exact thing it exists to catch. Structural invariant instead:
+# "gate:needs-human" is excluded alongside "needs:engine-window" at every
+# site — always on the same or the immediately-following line, verified
+# across all 19 current call sites with no exceptions — so assert the two
+# counts match rather than pinning either to a number. A future site that
+# excludes one but forgets the other trips this; a new site that pairs both
+# (the only way anyone writes these blocks today) passes untouched.
+NH_COUNT="$(grep -c 'exclude-label "gate:needs-human"' "$PILOT")"
+EW_COUNT="$(grep -c 'exclude-label "needs:engine-window"' "$PILOT")"
+if [ "$NH_COUNT" -ge 1 ] && [ "$NH_COUNT" = "$EW_COUNT" ]; then
+  ok "pilot excludes gate:needs-human 1:1 with needs:engine-window in every candidate query ($NH_COUNT sites)"
+else
+  bad "pilot gate:needs-human ($NH_COUNT) / needs:engine-window ($EW_COUNT) exclusion counts diverged — a candidate query may be missing one exclusion"
+fi
 grep -q 'gate:needs-fix'   "$PILOT" && ok "pilot detects gate:needs-fix"        || bad "pilot missing gate:needs-fix path"
 grep -q 'GATE-FEEDBACK'    "$PILOT" && ok "pilot reads GATE-FEEDBACK comment"   || bad "pilot missing GATE-FEEDBACK read"
 grep -q 'GATE_FIX_SECTION' "$PILOT" && ok "pilot injects feedback into prompt"  || bad "pilot missing GATE_FIX_SECTION"
