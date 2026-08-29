@@ -1,0 +1,331 @@
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 02a2e0614..b643b5753 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -3333,12 +3333,45 @@ func poolDemandMigrationFilterJQ(limit int) string {
+ 	return shellquote.Join([]string{"jq", filter})
+ }
+ 
+-func bdQueryEphemeralStatusShell(status string) string {
+-	return `bd query --json ` + shellquote.Quote("ephemeral=true AND status="+status) + ` --limit=0`
++// bdQueryEphemeralStatusShell builds the `bd query` ephemeral-wisp fallback
++// used by every work_query tier that `bd list`/`bd ready` can't see wisps
++// through (they only surface via `bd query`).
++//
++// ga-dx5z9: when extraAndClause is non-empty, it is ANDed onto the query
++// expression itself (e.g. `assignee=\"$id\"` or `assignee=none`) so bd's own
++// SQL layer narrows the result set server-side — confirmed by reading bd's
++// vendored query evaluator/sqlbuild source (third_party/beads/internal/query/
++// evaluator.go applyAssigneeFilter, internal/storage/sqlbuild/filter.go: both
++// assignee=X and metadata.<key>=X compile to a real SQL WHERE clause, not an
++// in-memory scan) and by running the equivalent query live against the HQ
++// store. Before this, every caller downloaded EVERY open/in_progress
++// ephemeral wisp in the city (measured: 1,134+ rows, ~2.4MB of JSON, up to
++// 33s under load) and filtered client-side with jq — which is what made `gc
++// hook`'s fixed 30s deadline (hookWorkQueryTimeout, cmd/gc/cmd_hook.go)
++// reliably blow under load and, per ga-dx5z9's own bead history, touch off a
++// city-wide dispatch-throughput collapse (timed-out hook -> ephemeral worker
++// drains empty -> bead stranded pilot:dispatched with no owner -> occupies a
++// dispatch-lane slot -> dispatch cap drops -> throughput falls).
++//
++// extraAndClause must already be shell-safe to splice into a double-quoted
++// argument (i.e. any embedded `"` must be pre-escaped as `\"`, matching the
++// established `--metadata-field "gc.routed_to=$target"` convention already
++// used elsewhere in this file for embedding a runtime shell variable in a
++// bd-facing expression) — callers that only need a static keyword (e.g.
++// "assignee=none") can pass it unescaped since it contains no quote chars.
++func bdQueryEphemeralStatusShell(status, extraAndClause string) string {
++	if extraAndClause == "" {
++		// Unchanged from the pre-ga-dx5z9 shape (single-quoted literal, no
++		// interpolation) for callers that don't push a predicate down —
++		// byte-identical output, zero behavior change.
++		return `bd query --json ` + shellquote.Quote("ephemeral=true AND status="+status) + ` --limit=0`
++	}
++	expr := `ephemeral=true AND status=` + status + ` AND ` + extraAndClause
++	return `bd query --json "` + expr + `" --limit=0`
+ }
+ 
+-func bdQueryEphemeralStatusQuietShell(status string) string {
+-	return bdQueryEphemeralStatusShell(status) + ` 2>/dev/null`
++func bdQueryEphemeralStatusQuietShell(status, extraAndClause string) string {
++	return bdQueryEphemeralStatusShell(status, extraAndClause) + ` 2>/dev/null`
+ }
+ 
+ func legacyEphemeralReadyFilterJQ(selector string, limit int) string {
+@@ -3363,9 +3396,20 @@ func legacyEphemeralPoolDemandShell(limit int, includeEphemeralReady, quiet bool
+ 			` | select(((.metadata["gc.routed_to"] // "") == $target) or (((.metadata["gc.routed_to"] // "") == "") and ((.metadata["gc.run_target"] // "") == $target) and ((.metadata["gc.kind"] // "") == "workflow")))`,
+ 		limit,
+ 	)
+-	query := bdQueryEphemeralStatusShell("open")
++	// ga-dx5z9: "assignee=none" is pushed server-side. It's a strict, always-
++	// safe narrowing — every candidate this legacy tier can ever use requires
++	// an empty assignee (the jq filter's own leading `select((.assignee //
++	// "") == "")` above, unconditionally ANDed with everything after it), so
++	// asking bd to pre-filter on it changes nothing about which beads survive,
++	// only how many rows have to be downloaded and walked by jq to find them.
++	// The routed_to/run_target OR-fallback predicate that follows is left as
++	// client-side jq: it's not a simple AND-chain, so bd's query evaluator
++	// can't compile it straight to SQL (see canUseFilterOnly in bd's vendored
++	// evaluator.go) and forcing it would trade a well-understood, verified-safe
++	// pushdown for a materially more complex one.
++	query := bdQueryEphemeralStatusShell("open", "assignee=none")
+ 	if quiet {
+-		query = bdQueryEphemeralStatusQuietShell("open")
++		query = bdQueryEphemeralStatusQuietShell("open", "assignee=none")
+ 	}
+ 	jqStderr := ""
+ 	if quiet {
+@@ -3570,20 +3614,48 @@ func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) strin
+ // routedReadyTierCommand) — matches on assignee first, then applies the
+ // canonical pool:refused:*/pilot:held* predicate to the matched set before
+ // taking the first row, so a refused ephemeral wisp can't shadow a real one.
++//
++// ga-dx5z9: the assignee match itself is now ALSO pushed into the bd query
++// expression (bdQueryEphemeralStatusQuietShell's extraAndClause), not just
++// applied after the fact by the jq --arg id selector below. This tier runs on
++// EVERY gc hook invocation (once per non-empty id candidate in the caller's
++// `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"` loop), so it was
++// the single largest contributor to the fixed 30s work-query deadline
++// blowing under load — see bdQueryEphemeralStatusShell's doc comment for the
++// measured cost. The jq --arg id selector is kept as a redundant,
++// belt-and-suspenders re-check: harmless now that the candidate set bd
++// returns is at most a handful of rows, and it means correctness here never
++// depends solely on bd's assignee-match semantics matching this jq comparison
++// exactly.
+ func ephemeralAssignedInProgressProbeScript(shellVar string, includeEphemeralReady bool) string {
+ 	_ = includeEphemeralReady
+-	return `r=$(` + bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
++	return `r=$(` + bdQueryEphemeralStatusQuietShell("in_progress", `assignee=\"$`+shellVar+`\"`) + ` | ` +
+ 		`jq --arg id "$` + shellVar + `" '[.[] | select((.assignee // "") == $id)]' 2>/dev/null | ` +
+ 		poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
+ 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
+ }
+ 
++// ga-dx5z9: same server-side assignee push-down as
++// ephemeralAssignedInProgressProbeScript above — see
++// bdQueryEphemeralStatusShell's doc comment. This tier is the Step-1b/"ready"
++// counterpart and runs on every gc hook invocation right behind Step 1a, so it
++// shares the same per-call cost this fix targets.
++//
++// Coordination note: docs/pending-engine-window/ga-ox2yw-assigned-ready-filter.patch
++// (unapplied as of this patch) also touches this function — it widens --limit
++// and adds poolDemandLabelFilterJQ to the jq pipeline below (a pool:refused/
++// pilot:held concern, orthogonal to the server-side-filter concern here) but
++// lands on the same `bdQueryEphemeralStatusQuietShell("open")` call line as
++// unchanged context in its diff. The two changes don't conflict in intent,
++// but the literal lines will conflict when both are applied — Mayor should
++// expect and resolve this at the next engine-window consolidation, not treat
++// it as a sign either patch is wrong.
+ func ephemeralAssignedReadyProbeScript(shellVar string, includeEphemeralReady bool) string {
+ 	if includeEphemeralReady {
+ 		return ""
+ 	}
+ 	filter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 1)
+-	return `r=$(` + bdQueryEphemeralStatusQuietShell("open") + ` | ` +
++	return `r=$(` + bdQueryEphemeralStatusQuietShell("open", `assignee=\"$`+shellVar+`\"`) + ` | ` +
+ 		`jq --arg id "$` + shellVar + `" ` + shellquote.Quote(filter) + ` 2>/dev/null); ` +
+ 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
+ }
+@@ -4014,7 +4086,14 @@ func (a *Agent) effectiveOnDeath(includeEphemeralInProgress bool) string {
+ 		route = a.PoolName
+ 	}
+ 	_ = includeEphemeralInProgress
+-	ephemeralRead := bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
++	// ga-dx5z9: this call site has the same unfiltered-download shape the
++	// work_query tiers had (see bdQueryEphemeralStatusShell's doc comment),
++	// but on_death is out of scope for that fix — it runs once per session
++	// death, not once per gc hook poll, so it isn't the per-invocation cost
++	// that fix targets. Left unfiltered ("") rather than folded in here to
++	// keep that fix's diff scoped to what it was asked to cover; a targeted
++	// follow-up could pass `assignee=\"`+a.QualifiedName()+`\"` the same way.
++	ephemeralRead := bdQueryEphemeralStatusQuietShell("in_progress", "") + ` | ` +
+ 		`jq -r --arg assignee ` + shellquote.Quote(a.QualifiedName()) + ` '.[] | select((.assignee // "") == $assignee) | [.id, (.metadata["gc.run_target"] // ""), (.metadata["gc.routed_to"] // "")] | @tsv' 2>/dev/null; `
+ 	// Reset both assignee and status: clearing assignee alone leaves the bead
+ 	// invisible to every work_query tier (Tier 1 needs assignee match, Tiers
+@@ -4059,7 +4138,10 @@ func (a *Agent) effectiveOnBoot(includeEphemeralInProgress bool) string {
+ 		template = a.PoolName
+ 	}
+ 	_ = includeEphemeralInProgress
+-	ephemeralRead := bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
++	// ga-dx5z9: same out-of-scope note as effectiveOnDeath above — on_boot
++	// runs once per session boot, not once per gc hook poll, so it isn't the
++	// cost that fix targets. Left unfiltered ("") deliberately.
++	ephemeralRead := bdQueryEphemeralStatusQuietShell("in_progress", "") + ` | ` +
+ 		`jq -r --arg template "$template" '.[] | select((.assignee // "") == "") | select(((.metadata["gc.routed_to"] // "") == $template) or (((.metadata["gc.routed_to"] // "") == "") and ((.metadata["gc.run_target"] // "") == $template) and ((.metadata["gc.kind"] // "") == "workflow"))) | .id' 2>/dev/null; `
+ 	return `template=` + shellquote.Quote(template) + `; ` +
+ 		`{ ` +
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index 05df06935..02832d400 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -1870,6 +1870,39 @@ func TestEffectiveAssignedReadyQueryForBeadsBD105Compatibility(t *testing.T) {
+ 	}
+ }
+ 
++// TestEffectiveAssignedReadyQueryPushesAssigneeFilterServerSide is the Step-1b
++// ("ready") counterpart of
++// TestEffectiveAssignedInProgressQueryPushesAssigneeFilterServerSide — same
++// ga-dx5z9 fix, same proof shape, applied to the tier that runs immediately
++// after Step 1a on every gc hook invocation. See that test's doc comment for
++// the full incident/measurement writeup.
++func TestEffectiveAssignedReadyQueryPushesAssigneeFilterServerSide(t *testing.T) {
++	a := Agent{Name: "worker", Dir: "hello-world"}
++	got := a.EffectiveAssignedReadyQuery()
++
++	if !strings.Contains(got, `ephemeral=true AND status=open AND assignee=\"$id\"`) {
++		t.Fatalf("EffectiveAssignedReadyQuery() ephemeral fallback missing server-side assignee filter: %q", got)
++	}
++
++	out := runShellWithFakeBd(t, got, map[string]string{
++		"GC_SESSION_ID": "worker-bead",
++	}, `#!/bin/sh
++set -eu
++case "$*" in
++  "ready --assignee=worker-bead --json --limit=1") printf '[]' ;;
++  "query --json ephemeral=true AND status=open --limit=0") printf '[{"id":"ga-dx5z9-OLD-UNFILTERED-SHAPE","assignee":"worker-bead","issue_type":"task","dependencies":[]}]' ;;
++  'query --json ephemeral=true AND status=open AND assignee="worker-bead" --limit=0') printf '[{"id":"ga-dx5z9-NEW-FILTERED-SHAPE","assignee":"worker-bead","issue_type":"task","dependencies":[]}]' ;;
++  *) printf '[]' ;;
++esac
++`)
++	if !strings.Contains(out, "ga-dx5z9-NEW-FILTERED-SHAPE") {
++		t.Fatalf("EffectiveAssignedReadyQuery() output = %q, want the bead served only to the NEW server-side-filtered query text", out)
++	}
++	if strings.Contains(out, "ga-dx5z9-OLD-UNFILTERED-SHAPE") {
++		t.Fatalf("EffectiveAssignedReadyQuery() output = %q, still sending the OLD unfiltered query text (downloads every ephemeral wisp in the city)", out)
++	}
++}
++
+ func TestEffectiveAssignedInProgressQueryDefault(t *testing.T) {
+ 	a := Agent{Name: "worker", Dir: "hello-world"}
+ 	got := a.EffectiveAssignedInProgressQuery()
+@@ -1925,7 +1958,7 @@ func TestEffectiveAssignedInProgressQuerySkipsPoolRefusedBead(t *testing.T) {
+ set -eu
+ case "$*" in
+   "list --status in_progress --assignee=worker-bead --json --limit=20") printf '[{"id":"ga-9ae7o","labels":["pool:refused:engine-rebuild-required"]}]' ;;
+-  "query --json ephemeral=true AND status=in_progress --limit=0") printf '[]' ;;
++  'query --json ephemeral=true AND status=in_progress AND assignee="worker-bead" --limit=0') printf '[]' ;;
+   *) printf '[]' ;;
+ esac
+ `)
+@@ -1934,6 +1967,62 @@ esac
+ 	}
+ }
+ 
++// TestEffectiveAssignedInProgressQueryPushesAssigneeFilterServerSide is the
++// regression test for ga-dx5z9. Before this fix, the Step-1a ephemeral-wisp
++// fallback asked bd for EVERY open/in_progress ephemeral wisp in the city
++// (`bd query --json 'ephemeral=true AND status=in_progress' --limit=0`, no
++// server-side filter) and matched the assignee afterward with jq. Measured
++// live: ~5.2s per call under normal load, 33s+ under high load (10-core
++// machine at load 31-36, dolt at 94.7% CPU) — a SINGLE call already exceeds
++// gc hook's fixed 30s deadline (hookWorkQueryTimeout, cmd/gc/cmd_hook.go),
++// and this tier runs that call once per non-empty id candidate on every gc
++// hook invocation. Per ga-dx5z9's own bead history this measurably caused a
++// city-wide dispatch-throughput collapse (timed-out hook -> ephemeral worker
++// drains empty -> bead stranded pilot:dispatched with no owner -> occupies a
++// dispatch-lane slot -> dispatch cap drops -> throughput falls).
++//
++// This test proves the SHAPE of the generated query changed — bd is now
++// ASKED for only the matching assignee, not asked for everything and
++// filtered afterward — two ways:
++//  1. A direct assertion that the generated command text contains the new
++//     "AND assignee=..." clause inside the bd query expression itself.
++//  2. An end-to-end run through a fake bd with TWO distinct exact-match case
++//     arms — one for the old (unfiltered) invocation text, one for the new
++//     (filtered) one — that each return a DIFFERENT, but equally
++//     jq-filter-survivable (matching assignee), bead. This isolates which
++//     literal query text the generated script actually sent to bd, so the
++//     result can't be explained away by the pre-existing client-side jq
++//     assignee check (kept as a redundant belt-and-suspenders layer) masking
++//     which shape was really used. Before ga-dx5z9's fix, this sub-check
++//     observes the OLD-shape bead and fails; after, it observes the
++//     NEW-shape bead and passes.
++func TestEffectiveAssignedInProgressQueryPushesAssigneeFilterServerSide(t *testing.T) {
++	a := Agent{Name: "worker", Dir: "hello-world"}
++	got := a.EffectiveAssignedInProgressQuery()
++
++	if !strings.Contains(got, `ephemeral=true AND status=in_progress AND assignee=\"$id\"`) {
++		t.Fatalf("EffectiveAssignedInProgressQuery() ephemeral fallback missing server-side assignee filter: %q", got)
++	}
++
++	out := runShellWithFakeBd(t, got, map[string]string{
++		"GC_SESSION_ID": "worker-bead",
++	}, `#!/bin/sh
++set -eu
++case "$*" in
++  "list --status in_progress --assignee=worker-bead --json --limit=20") printf '[]' ;;
++  "query --json ephemeral=true AND status=in_progress --limit=0") printf '[{"id":"ga-dx5z9-OLD-UNFILTERED-SHAPE","assignee":"worker-bead","ephemeral":true}]' ;;
++  'query --json ephemeral=true AND status=in_progress AND assignee="worker-bead" --limit=0') printf '[{"id":"ga-dx5z9-NEW-FILTERED-SHAPE","assignee":"worker-bead","ephemeral":true}]' ;;
++  *) printf '[]' ;;
++esac
++`)
++	if !strings.Contains(out, "ga-dx5z9-NEW-FILTERED-SHAPE") {
++		t.Fatalf("EffectiveAssignedInProgressQuery() output = %q, want the bead served only to the NEW server-side-filtered query text", out)
++	}
++	if strings.Contains(out, "ga-dx5z9-OLD-UNFILTERED-SHAPE") {
++		t.Fatalf("EffectiveAssignedInProgressQuery() output = %q, still sending the OLD unfiltered query text (downloads every ephemeral wisp in the city)", out)
++	}
++}
++
+ func TestEffectiveAssignedReadyQueryCustomPreservesOverride(t *testing.T) {
+ 	const custom = "custom work query"
+ 	a := Agent{Name: "worker", WorkQuery: custom}
+@@ -3146,6 +3235,58 @@ esac
+ 	}
+ }
+ 
++// TestPoolDemandLegacyEphemeralTierPushesAssigneeNoneFilterServerSide is the
++// Tier-3 (routed pool demand) counterpart of
++// TestEffectiveAssignedInProgressQueryPushesAssigneeFilterServerSide — same
++// ga-dx5z9 fix. This tier's ephemeral fallback (legacyEphemeralPoolDemandShell)
++// only ever wants UNASSIGNED wisps (every candidate it can use requires an
++// empty assignee — see that function's own jq predicate), so the server-side
++// push-down here is "AND assignee=none" rather than a specific id. Proven the
++// same way as the other two tiers: a direct shape assertion on the generated
++// text, plus an end-to-end fake-bd run with distinct case arms for the old
++// (unfiltered) and new (assignee=none-filtered) query text, each returning a
++// different, equally jq-filter-survivable (unassigned, correctly routed)
++// bead, so the result isolates which literal text was actually sent to bd.
++func TestPoolDemandLegacyEphemeralTierPushesAssigneeNoneFilterServerSide(t *testing.T) {
++	if _, err := exec.LookPath("jq"); err != nil {
++		t.Skip("jq not available; legacy tier exercises a jq pipeline")
++	}
++	agent := Agent{Name: "worker", Dir: "hello-world"}
++	target := "hello-world/worker"
++
++	got := agent.EffectiveWorkQuery()
++	if !strings.Contains(got, `ephemeral=true AND status=open AND assignee=none`) {
++		t.Fatalf("EffectiveWorkQuery() routed-pool legacy ephemeral tier missing server-side assignee=none filter: %q", got)
++	}
++
++	bdScript := `#!/bin/sh
++case "$*" in
++  *"--metadata-field gc.routed_to=` + target + `"*)
++    printf '[]'
++    ;;
++  *"--metadata-field gc.run_target=` + target + `"*"--metadata-field gc.kind=workflow"*)
++    printf '[]'
++    ;;
++  *"ephemeral=true AND status=open AND assignee=none"*)
++    printf '[{"id":"ga-dx5z9-NEW-FILTERED-SHAPE","assignee":"","issue_type":"task","metadata":{"gc.routed_to":"` + target + `"},"dependencies":[]}]'
++    ;;
++  *"ephemeral=true AND status=open"*)
++    printf '[{"id":"ga-dx5z9-OLD-UNFILTERED-SHAPE","assignee":"","issue_type":"task","metadata":{"gc.routed_to":"` + target + `"},"dependencies":[]}]'
++    ;;
++  *)
++    printf '[]'
++    ;;
++esac
++`
++	out := strings.TrimSpace(runEffectiveWorkQuery(t, agent, nil, bdScript))
++	if !strings.Contains(out, "ga-dx5z9-NEW-FILTERED-SHAPE") {
++		t.Fatalf("EffectiveWorkQuery() = %q, want the bead served only to the NEW assignee=none-filtered query text", out)
++	}
++	if strings.Contains(out, "ga-dx5z9-OLD-UNFILTERED-SHAPE") {
++		t.Fatalf("EffectiveWorkQuery() = %q, still sending the OLD unfiltered query text (downloads every ephemeral wisp in the city)", out)
++	}
++}
++
+ func TestValidateAgentsCustomQueries(t *testing.T) {
+ 	// Both set: OK
+ 	agents := []Agent{{
