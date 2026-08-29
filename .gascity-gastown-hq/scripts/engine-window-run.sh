@@ -221,6 +221,23 @@ phase_disarm() {
   log "DESARMADO — nada vai rodar no proximo boot."
 }
 
+disarm_file_only() {
+  # So remove o arquivo do plist — NUNCA chame launchctl bootout/unload daqui.
+  # Medido ao vivo (ga-i64v6, 29/08): quando phase_post_boot roda como a
+  # instancia REAL que o launchd carregou via RunAtLoad, um bootout do PROPRIO
+  # label mata este processo na hora — launchd nao distingue "pedido por mim
+  # mesmo" de "pedido por outro processo", e a remocao do servico saiu no log
+  # unificado no MESMO milissegundo do trigger, antes de chegar em "DESARMADO"
+  # ou no build. (O disarm manual via 'engine-window-run.sh disarm' nao tem
+  # este risco — quem chama nao e a instancia rodando sob o job, entao
+  # phase_disarm com bootout continua correto e util la, inclusive como
+  # cancelamento forcado de um post-boot em andamento.) Apagar o arquivo basta
+  # para o efeito que post-boot precisa: RunAtLoad so dispara se o plist
+  # existir no proximo login/boot.
+  rm -f "$PLIST" 2>/dev/null
+  log "DESARMADO (arquivo removido) — nada vai rodar no proximo boot."
+}
+
 phase_post_boot() {
   # Guarda: so rode se a maquina REALMENTE acabou de bootar. Sem isto, um
   # load manual do plist dispara um build pesado no meio do expediente.
@@ -231,18 +248,20 @@ phase_post_boot() {
     up_min=$(( (now_s - boot_s) / 60 ))
     if [ "$up_min" -gt 30 ]; then
       log "POS-BOOT RECUSADO: maquina de pe ha ${up_min}min (>30). Isto nao e um boot recente."
-      phase_disarm
+      disarm_file_only
       return 0
     fi
   else
     log "POS-BOOT RECUSADO: nao consegui ler kern.boottime — sob duvida, nao rodo."
-    phase_disarm; return 0
+    disarm_file_only; return 0
   fi
   log "=== POS-BOOT: janela do engine disparou (uptime ${up_min}min) ==="
   # Desarma PRIMEIRO. Se o build travar, o job nao pode disparar de novo no
   # boot seguinte — um job que se re-arma sozinho e como o guard que virou a
-  # carga que deveria observar.
-  phase_disarm
+  # carga que deveria observar. So o arquivo — nunca phase_disarm (bootout)
+  # aqui: esta funcao roda COMO a instancia que o launchd carregou, e um
+  # bootout do proprio label mata este processo na hora (ver disarm_file_only).
+  disarm_file_only
   # A cidade sobe pelo supervisor; da tempo dela assentar antes de competir por CPU.
   local waited=0
   while [ "$waited" -lt 300 ]; do
