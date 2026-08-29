@@ -41,12 +41,27 @@ BD=(bd)
 # instead of waiting for the automated guard's own TTL.
 "${BD[@]}" reclaim --id "$BEAD_ID" --older-than 0s -q
 
-STATUS=$("${BD[@]}" show "$BEAD_ID" --json 2>/dev/null | jq -r '.[0].status // empty' 2>/dev/null)
+POST_RECLAIM_JSON=$("${BD[@]}" show "$BEAD_ID" --json 2>/dev/null)
+STATUS=$(printf '%s' "$POST_RECLAIM_JSON" | jq -r '.[0].status // empty' 2>/dev/null)
 
 if [ "$STATUS" != "open" ]; then
   echo "pilot-manual-reclaim: $BEAD_ID is not open after reclaim (status=${STATUS:-unknown}) — reclaim did not confirm a state change (lease not stale, bead not found, or read failed). Pilot claim markers left untouched." >&2
   exit 0
 fi
+
+# ga-zkaoe: mirror do_reclaim()'s reclaim-count bump (inflight-reclaim-
+# guard.py step 3 — remove the old pilot:reclaim-count:<N> label, add
+# <N+1>) so a manual reclaim is no longer invisible to the automated
+# guard's MAX_RECLAIMS cap and reloop-cooldown threshold, both of which key
+# off this label. Parsed the same way as the Python's parse_reclaim_count():
+# first label matching the prefix that parses as an int, 0 if none. Reused
+# from the JSON already fetched above — no extra bd call.
+CUR_RECLAIM_COUNT=$(printf '%s' "$POST_RECLAIM_JSON" | jq -r '
+  [(.[0].labels // [])[] | select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | tonumber?]
+  | .[0] // 0
+' 2>/dev/null)
+case "$CUR_RECLAIM_COUNT" in ''|*[!0-9]*) CUR_RECLAIM_COUNT=0 ;; esac
+NEW_RECLAIM_COUNT=$((CUR_RECLAIM_COUNT + 1))
 
 "${BD[@]}" label remove "$BEAD_ID" "pilot:dispatched"  -q 2>/dev/null || true
 "${BD[@]}" label remove "$BEAD_ID" "pilot:dispatching" -q 2>/dev/null || true
@@ -58,6 +73,10 @@ fi
 # though nobody is building the bead anymore. Strip it in the same
 # status==open-gated path as the Pilot markers.
 "${BD[@]}" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
+if [ "$CUR_RECLAIM_COUNT" -gt 0 ]; then
+  "${BD[@]}" label remove "$BEAD_ID" "pilot:reclaim-count:${CUR_RECLAIM_COUNT}" -q 2>/dev/null || true
+fi
+"${BD[@]}" label add "$BEAD_ID" "pilot:reclaim-count:${NEW_RECLAIM_COUNT}" -q 2>/dev/null || true
 
 # Verify the actual post-state rather than trusting the removal commands'
 # exit codes (suppressed above with `|| true` since "label was never set" is
@@ -93,4 +112,16 @@ if [ -n "$REMAINING" ]; then
   exit 1
 fi
 
-echo "pilot-manual-reclaim: $BEAD_ID reclaimed (status=open), Pilot claim markers cleared, and story:in-flight removed — bead no longer occupies a dispatch lane slot and is visible to Pilot re-dispatch again."
+# ga-zkaoe: confirm the reclaim-count bump landed too — this whole fix
+# exists to make that label reliable, so don't claim success without
+# checking it, same "verify, don't trust" gate as the other markers above.
+RECLAIM_COUNT_OK=$(printf '%s' "$VERIFY_JSON" | jq -r --arg want "pilot:reclaim-count:${NEW_RECLAIM_COUNT}" '
+  (.[0].labels // []) | any(. == $want)
+' 2>/dev/null)
+
+if [ "$RECLAIM_COUNT_OK" != "true" ]; then
+  echo "pilot-manual-reclaim: $BEAD_ID reclaimed (status=open); pilot:dispatched/pilot:dispatching/story:in-flight cleared, but could NOT confirm pilot:reclaim-count:${NEW_RECLAIM_COUNT} was set — MAX_RECLAIMS/reloop-cooldown in inflight-reclaim-guard.py may undercount this attempt. Retry manually: bd label remove $BEAD_ID pilot:reclaim-count:${CUR_RECLAIM_COUNT} (if present) && bd label add $BEAD_ID pilot:reclaim-count:${NEW_RECLAIM_COUNT}" >&2
+  exit 1
+fi
+
+echo "pilot-manual-reclaim: $BEAD_ID reclaimed (status=open), Pilot claim markers cleared (pilot:reclaim-count now ${NEW_RECLAIM_COUNT}), and story:in-flight removed — bead no longer occupies a dispatch lane slot and is visible to Pilot re-dispatch again."

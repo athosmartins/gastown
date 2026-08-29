@@ -23,6 +23,18 @@
 #      not-found-shaped error object instead of empty output): same
 #      requirement, exercised via the jq-parse-failure path instead of the
 #      empty-string path.
+#   7. STALE-RECLAIM2 (ga-zkaoe): bead already carries pilot:reclaim-count:2
+#      from prior reclaims — the old label is removed and pilot:reclaim-
+#      count:3 is added, mirroring inflight-reclaim-guard.py's do_reclaim()
+#      step 3 (remove-old/add-new), so a manual reclaim is no longer
+#      invisible to the automated guard's MAX_RECLAIMS cap and reloop-
+#      cooldown threshold.
+#   8. RECLAIM-COUNT-NOT-CONFIRMED (ga-zkaoe): status flips open and
+#      pilot:dispatched/pilot:dispatching/story:in-flight are confirmed
+#      cleared on the post-removal read, but pilot:reclaim-count:1 is
+#      NOT present on that same read (a transient hiccup on just that
+#      mutation) — the script must not claim success on the strength of
+#      the OTHER markers alone.
 #
 # Falsifiable: against a naive "always print success after the removal
 # attempts" script (no post-state verification), scenario 4 would still
@@ -32,6 +44,8 @@
 # the actual pre-fix gt-1kkgu script (verification read piped straight into
 # jq with no read-failure guard), scenarios 5 and 6 both fail — confirmed by
 # running this exact suite against that script before writing the fix.
+# Against the actual pre-fix ga-zkaoe script (no reclaim-count handling at
+# all), scenarios 7 and 8 both fail — confirmed the same way.
 #
 # Run:  bash packs/town-deltas/assets/pilot-manual-reclaim.selftest.sh
 set -u
@@ -66,6 +80,26 @@ case "$sub" in
     echo "$_N" >"$_CF"
     case "${PMR_SCENARIO:-}" in
       stale)
+        if [ "$_N" -eq 1 ]; then
+          echo '[{"id":"'"$1"'","status":"open","labels":["pilot:dispatched","pilot:dispatching","story:in-flight"],"metadata":{"pilot.dispatched_at":"123"}}]'
+        else
+          echo '[{"id":"'"$1"'","status":"open","labels":["pilot:reclaim-count:1"],"metadata":{}}]'
+        fi ;;
+      stale-reclaim2)
+        # ga-zkaoe: bead already reclaimed twice before (pilot:reclaim-count:2
+        # present alongside the usual markers) -> old label removed, new
+        # pilot:reclaim-count:3 added, same remove-old/add-new shape as
+        # do_reclaim() step 3 in inflight-reclaim-guard.py.
+        if [ "$_N" -eq 1 ]; then
+          echo '[{"id":"'"$1"'","status":"open","labels":["pilot:dispatched","pilot:dispatching","story:in-flight","pilot:reclaim-count:2"],"metadata":{"pilot.dispatched_at":"123"}}]'
+        else
+          echo '[{"id":"'"$1"'","status":"open","labels":["pilot:reclaim-count:3"],"metadata":{}}]'
+        fi ;;
+      reclaim-count-not-confirmed)
+        # ga-zkaoe: the OTHER 3 markers confirm cleared on the 2nd read, but
+        # pilot:reclaim-count:1 is silently absent from that same read —
+        # simulates a transient hiccup on just this one mutation. The script
+        # must not fold this into a full success claim.
         if [ "$_N" -eq 1 ]; then
           echo '[{"id":"'"$1"'","status":"open","labels":["pilot:dispatched","pilot:dispatching","story:in-flight"],"metadata":{"pilot.dispatched_at":"123"}}]'
         else
@@ -129,6 +163,8 @@ ck "STALE: exit code 0" 0 "$rc"
 ck "STALE: all 4 markers cleared (incl. story:in-flight, ga-xoa3n)" 1 "$labels_cleared"
 ck "STALE: reports success" 1 "$(grep -qc 'markers cleared' "$WORK/out.log" >/dev/null 2>&1 && echo 1 || echo 0)"
 ck "STALE: reports story:in-flight removed (lane slot freed)" 1 "$(grep -qc 'story:in-flight removed' "$WORK/out.log" >/dev/null 2>&1 && echo 1 || echo 0)"
+ck "STALE: bumps absent reclaim-count 0->1 (ga-zkaoe)" 1 "$(grep -qc 'MUT label add gt-testbead pilot:reclaim-count:1' "$MUT" >/dev/null 2>&1 && echo 1 || echo 0)"
+ck "STALE: does not try to remove a reclaim-count label that was never set" 0 "$(grep -qc 'MUT label remove gt-testbead pilot:reclaim-count:' "$MUT" >/dev/null 2>&1 && echo 1 || echo 0)"
 
 # NOT-STALE: reclaim no-ops (still in_progress) -> NO label/metadata mutation
 : >"$MUT"
@@ -177,6 +213,26 @@ ck "VERIFY-EMPTY: does NOT claim markers cleared" 0 "$(grep -qc 'markers cleared
 rc=$(run_script verify-garbage)
 ck "VERIFY-GARBAGE: exit code 1 (does not silently succeed)" 1 "$rc"
 ck "VERIFY-GARBAGE: does NOT claim markers cleared" 0 "$(grep -qc 'markers cleared' "$WORK/out.log" >/dev/null 2>&1 && echo 1 || echo 0)"
+
+# STALE-RECLAIM2 (ga-zkaoe): a bead already carrying pilot:reclaim-count:2
+# from prior reclaims gets the old label removed and pilot:reclaim-count:3
+# added — the same remove-old/add-new shape do_reclaim() uses.
+: >"$MUT"
+rc=$(run_script stale-reclaim2)
+ck "STALE-RECLAIM2: exit code 0" 0 "$rc"
+ck "STALE-RECLAIM2: removes old pilot:reclaim-count:2" 1 "$(grep -qc 'MUT label remove gt-testbead pilot:reclaim-count:2' "$MUT" >/dev/null 2>&1 && echo 1 || echo 0)"
+ck "STALE-RECLAIM2: adds pilot:reclaim-count:3" 1 "$(grep -qc 'MUT label add gt-testbead pilot:reclaim-count:3' "$MUT" >/dev/null 2>&1 && echo 1 || echo 0)"
+ck "STALE-RECLAIM2: reports success" 1 "$(grep -qc 'markers cleared' "$WORK/out.log" >/dev/null 2>&1 && echo 1 || echo 0)"
+
+# RECLAIM-COUNT-NOT-CONFIRMED (ga-zkaoe): the other 3 markers verify cleared,
+# but pilot:reclaim-count:1 is absent from that same post-removal read — the
+# script must not claim full success on the strength of the other markers
+# alone, since this whole fix exists to make THIS label reliable.
+: >"$MUT"
+rc=$(run_script reclaim-count-not-confirmed)
+ck "RECLAIM-COUNT-NOT-CONFIRMED: exit code 1 (does not silently succeed)" 1 "$rc"
+ck "RECLAIM-COUNT-NOT-CONFIRMED: does NOT claim markers cleared" 0 "$(grep -qc 'markers cleared' "$WORK/out.log" >/dev/null 2>&1 && echo 1 || echo 0)"
+ck "RECLAIM-COUNT-NOT-CONFIRMED: reports the unconfirmed label" 1 "$(grep -qc 'pilot:reclaim-count:1' "$WORK/err.log" >/dev/null 2>&1 && echo 1 || echo 0)"
 
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
