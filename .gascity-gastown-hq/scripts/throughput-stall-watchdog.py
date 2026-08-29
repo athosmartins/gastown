@@ -204,10 +204,12 @@ DELIVERY_COOLDOWN_SEC = int(os.environ.get("TSW_DELIVERY_COOLDOWN_SEC", "10800")
 # wa-t7mti, wa-k65jw — both had a RECENT updated_at and would have sailed
 # past the staleness gate forever while still holding the slot.)
 #
-# Excludes gate-resident beads (a healthy gate-status:queued marker already
-# exists for them): those correctly have no builder session, because the
-# build finished and the session exited — the bead is waiting on the GATE
-# QUEUE, a different resource than the dispatch lane. Mirrors the Pilot's own
+# Excludes gate-resident beads (an ACTIVE gate marker or gate-run already
+# exists for them — see _queued_marker_state/_marker_gate_status_active/
+# _gaterun_gate_status_active for the full gate-status classification,
+# ga-zxcpo): those correctly have no builder session, because the build
+# finished and the session exited — the bead is waiting on the GATE QUEUE,
+# a different resource than the dispatch lane. Mirrors the Pilot's own
 # IN_FLIGHT_GATE_RESIDENT exclusion (pilot-dispatcher.sh) and this file's own
 # delivery_signal() ga-g0v96 "explained" bucket, same reasoning.
 #
@@ -986,10 +988,64 @@ def backlog_signal():
     return len(unique), sample
 
 
-# ── ga-g0v96: healthy-queued-marker check (AC1/AC2) ──────────────────────────
+# ── ga-zxcpo: gate-status ACTIVE classification — mirrors quality-gate-
+# guard.sh's own marker_active_from_labels()/gaterun_status_terminal()
+# line-for-line, not re-derived: that file is the single source of truth for
+# what each gate-status:* value means, since it is the only thing that ever
+# WRITES them (via set_gate_status). Marker classification reuses the exact
+# incident-tested whitelist from marker_active_from_labels (ga-usdm6p: a
+# marker sitting at gate-status:ready was misread as terminal/gone and its
+# live companion gate-run was wrongly superseded). Gate-run classification
+# reuses the exact terminal set gaterun_status_terminal documents as
+# EXHAUSTIVE for type:quality-gate-run beads (verified there against every
+# set_gate_status call site in both gate scripts).
+def _gate_statuses_of(b):
+    """Every gate-status:<value> label on a bead dict, as bare values (no
+    prefix). Handles both list- and comma-string-shaped label fields, same as
+    the inline pattern ghost_slot_signal already uses for its own label read."""
+    raw = b.get("labels") or b.get("label") or []
+    if isinstance(raw, str):
+        raw = [x.strip() for x in raw.split(",") if x.strip()]
+    elif not isinstance(raw, list):
+        raw = []
+    return [str(l).split(":", 1)[1] for l in raw if str(l).startswith("gate-status:")]
+
+
+def _marker_gate_status_active(b):
+    """type:quality-gate-marker ACTIVE check. Exactly one gate-status:
+    (ready|queued|claimed|dispatching|running) -> active (gate is mid-review,
+    not orphaned). No gate-status label at all, or more than one (set_gate_
+    status adds the new label BEFORE removing the old one, so a transition
+    can briefly carry two) -> active — fail-safe, mirrors marker_status_from_
+    labels' ambiguous-collapses-to-empty-collapses-to-active doctrine. Any
+    other single value (passed/failed/superseded/error/needs-rebase/parked-
+    needs-human/deferred) -> NOT active: the gate has stepped back onto an
+    external actor (human/author/rebase), not actively holding this bead — a
+    needs-rebase marker left unattended is exactly what gate-needs-rebase-
+    terminality-reap exists to catch; this function must not silently vouch
+    for it here too."""
+    statuses = _gate_statuses_of(b)
+    if len(statuses) != 1:
+        return True
+    return statuses[0] in ("ready", "queued", "claimed", "dispatching", "running")
+
+
+def _gaterun_gate_status_active(b):
+    """type:quality-gate-run ACTIVE check — mirrors gaterun_status_terminal():
+    superseded/aborted/passed/failed -> terminal (not active); anything else,
+    including no label or an ambiguous multi-label transition race, -> active
+    (fail-safe, same direction as the bash original)."""
+    statuses = _gate_statuses_of(b)
+    if len(statuses) != 1:
+        return True
+    return statuses[0] not in ("superseded", "aborted", "passed", "failed")
+
+
+# ── ga-g0v96: healthy-queued-marker check (AC1/AC2), broadened ga-zxcpo ──────
 def _queued_marker_state(root, bead_id):
-    """Tri-state: is there a HEALTHY (gate-status:queued) type:quality-gate-marker
-    bead with label source-bead:<bead_id> in root's bd store?
+    """Tri-state: is there a bead-status-open, gate-status-ACTIVE
+    type:quality-gate-marker OR type:quality-gate-run bead with label
+    source-bead:<bead_id> in CITY's bd store?
 
     Returns ("found", {"id": marker_id}) | ("absent", None) | ("error", None).
 
@@ -999,6 +1055,21 @@ def _queued_marker_state(root, bead_id):
     direct point-query for the marker, never a paginated/windowed bd list scan
     (ga-g0v96's own reporter fell into exactly that trap once: "not in my
     150-row query" was misread as "does not exist").
+
+    ga-zxcpo: the original query hardcoded an EXACT gate-status:queued label
+    filter — so a marker/run past "queued" (dispatching/running/reviewing/
+    claimed/...) fell out of the filter entirely and read as "absent", even
+    though the gate is MORE actively engaged then than at "queued" (literally
+    "not yet even looked at"). It also queried ONLY type:quality-gate-marker,
+    missing type:quality-gate-run entirely — the live false-positive that
+    motivated this fix (source bead ga-fbycg, 2026-08-29) had its active state
+    on a type:quality-gate-run bead (ga-ccjme, gate-status:running) with no
+    matching OPEN marker at all. Fixed by dropping the exact label filter,
+    fetching all OPEN candidates of both types for this source-bead, and
+    classifying each by its own gate-status label via
+    _marker_gate_status_active/_gaterun_gate_status_active above (mirrors this
+    city's existing, incident-tested classifiers in quality-gate-guard.sh —
+    not re-derived).
 
     error vs absent stay distinguishable here (never collapse — see
     [[error-and-empty-must-not-produce-the-same-value]]) even though the
@@ -1028,19 +1099,44 @@ def _queued_marker_state(root, bead_id):
     # documented above — markers are born --ephemeral (INFRA), hidden from
     # `bd list` by default under bd 1.1.0. Same false-alarm shape as wa-539tp,
     # different root cause.
+    found_id = None
+    any_query_failed = False
+
     r = _sh([BD_BIN, "-C", CITY, "list", "--include-infra",
              "-l", "type:quality-gate-marker",
              "-l", "source-bead:%s" % bead_id,
-             "-l", "gate-status:queued",
-             "--status", "open", "--json", "-n", "5"],
+             "--status", "open", "--json", "-n", "20"],
             timeout=BD_TIMEOUT)
     if r is None or r.returncode != 0:
+        any_query_failed = True
+    else:
+        for m in _parse_bd_json(r.stdout):
+            if isinstance(m, dict) and _marker_gate_status_active(m):
+                found_id = m.get("id") or m.get("issue_id") or "?"
+                break
+
+    # ga-zxcpo: only reached when no ACTIVE marker was found — the live
+    # false-positive's gate-resident evidence lived here (type:quality-gate-run,
+    # no open marker at all), not on the marker path above.
+    if found_id is None:
+        r2 = _sh([BD_BIN, "-C", CITY, "list", "--include-infra",
+                  "-l", "type:quality-gate-run",
+                  "-l", "source-bead:%s" % bead_id,
+                  "--status", "open", "--json", "-n", "20"],
+                 timeout=BD_TIMEOUT)
+        if r2 is None or r2.returncode != 0:
+            any_query_failed = True
+        else:
+            for run in _parse_bd_json(r2.stdout):
+                if isinstance(run, dict) and _gaterun_gate_status_active(run):
+                    found_id = run.get("id") or run.get("issue_id") or "?"
+                    break
+
+    if found_id is not None:
+        return ("found", {"id": found_id})
+    if any_query_failed:
         return ("error", None)
-    markers = _parse_bd_json(r.stdout)
-    if not markers:
-        return ("absent", None)
-    m = markers[0] if isinstance(markers[0], dict) else {}
-    return ("found", {"id": m.get("id") or m.get("issue_id") or "?"})
+    return ("absent", None)
 
 
 # ga-t02io: _gate_queue_depth/_gate_queue_throughput/_gate_queue_suppress_reason/
@@ -1178,8 +1274,9 @@ def delivery_signal(now, gate_depth=None, gate_throughput=None):
     than DELIVERY_STALL_HOURS — the delivery daemon (or the gate itself) has not closed it
     despite the branch presumably being merged (or the crew having abandoned work).
 
-    ga-g0v96 (AC1/AC2): stalled beads explained by a healthy queued gate marker
-    (see _queued_marker_state) are split into `explained` and EXCLUDED from
+    ga-g0v96 (AC1/AC2): stalled beads explained by an ACTIVE gate marker or
+    gate-run (see _queued_marker_state, broadened ga-zxcpo beyond just
+    gate-status:queued) are split into `explained` and EXCLUDED from
     count/sample — they are not an anomaly, so they must never drive escalation
     or get lumped in with genuinely-abandoned beads.
 
@@ -1345,10 +1442,11 @@ def delivery_signal(now, gate_depth=None, gate_throughput=None):
 def _escalate_delivery(count, sample, explained, now):
     """Notify + mail Mayor on a confirmed delivery stall (imp23).
 
-    ga-g0v96 (AC1/AC2): `explained` lists beads that ARE stalled but carry a
-    healthy gate-status:queued marker — appended as its own annotated section,
-    never merged into the anomaly "amostra"/"POSSÍVEIS CAUSAS" framing, and
-    with an explicit "don't touch gate:queued" warning (AC2)."""
+    ga-g0v96 (AC1/AC2): `explained` lists beads that ARE stalled but carry an
+    ACTIVE gate marker or gate-run (ga-zxcpo: any non-terminal gate-status,
+    not just :queued) — appended as its own annotated section, never merged
+    into the anomaly "amostra"/"POSSÍVEIS CAUSAS" framing, and with an
+    explicit "don't touch gate:queued" warning (AC2)."""
     notify_msg = ("DELIVERY STALL: %d bead(s) story:in-flight > %.0fh sem atualização — "
                   "possível merged-but-undeployed. Mayor notificado." % (count, DELIVERY_STALL_HOURS))
     subject = ("Watchdog: DELIVERY STALL — %d bead(s) in-flight > %.0fh sem atualização"
@@ -1390,7 +1488,7 @@ def _escalate_delivery(count, sample, explained, now):
         cpu_str = ("%.0f%%" % cpu) if cpu is not None else "?%"
         lines += [
             "",
-            "OUTROS %d bead(s) com marker gate-status:queued SAUDÁVEL — NÃO é anomalia, NÃO remova "
+            "OUTROS %d bead(s) com marker/gate-run ATIVO no gate — NÃO é anomalia, NÃO remova "
             "gate:queued nestes (auto-refino re-ingere o bead como história crua se você remover):" % len(explained),
         ]
         for e in explained:
@@ -1496,10 +1594,12 @@ def ghost_slot_signal(now):
     holding a dispatch-lane slot with no live owning session.
 
     A bead is a GHOST SLOT when it carries story:in-flight, is NOT gate-resident
-    (no healthy gate-status:queued marker — see the knob-block comment above for
-    why), does not have a LIVE separate sling/wrapper bead (pilot.sling_bead —
-    see the ga-9ni9w note inline below for why this check exists and why it is
-    carefully skipped for a SELF-referential sling), and its own assignee does
+    (no ACTIVE gate marker or gate-run — see the knob-block comment above and
+    _queued_marker_state's own docstring for the full gate-status
+    classification, ga-zxcpo), does not have a LIVE separate sling/wrapper
+    bead (pilot.sling_bead — see the ga-9ni9w note inline below for why this
+    check exists and why it is carefully skipped for a SELF-referential
+    sling), and its own assignee does
     not match a live session per reclaim_liveness.session_is_live (covers both
     an EMPTY assignee and an assignee naming a dead/absent one — session_is_live
     already returns False for both, see its own docstring). Unlike
@@ -1590,7 +1690,8 @@ def ghost_slot_signal(now):
             labels = set()
         lane = "big" if "lane:big" in labels else "small"
 
-        # Gate-resident: a healthy queued gate marker means the build already
+        # Gate-resident: an ACTIVE gate marker or gate-run (ga-zxcpo — any
+        # non-terminal gate-status, not just :queued) means the build already
         # finished and the builder session correctly exited — this bead is
         # waiting on the gate queue, a DIFFERENT resource than the dispatch
         # lane (mirrors the Pilot's own IN_FLIGHT_GATE_RESIDENT exclusion —
@@ -3162,6 +3263,112 @@ def _selftest():
         _bad("T", "verdict=%r marker=%r — expected ('found', {'id':'ga-wisp-t001'}); "
                   "a regression back to `-C root` would silently return 'absent' "
                   "here" % (_t_verdict, _t_marker))
+
+    # ── ga-zxcpo: _queued_marker_state real path recognizes any ACTIVE
+    # gate-status (not just the literal :queued), across BOTH
+    # type:quality-gate-marker and type:quality-gate-run — the live false
+    # positive (source bead ga-fbycg, 2026-08-29): a gate-run sat gate-status:
+    # running and a marker sat gate-status:dispatching; pre-fix code matched
+    # neither (exact gate-status:queued filter, type:quality-gate-marker
+    # only) and the story read as a ghost/stall candidate. ──────────────────
+    import types as _types_gzx
+    _saved_bd_marker_for_bead_gzx = _bd_marker_for_bead
+    _bd_marker_for_bead = None   # force the real _sh-backed implementation
+    _saved_sh_gzx = globals().get("_sh")
+
+    def _fake_sh_gzx(beads):
+        """beads: list of full bead dicts (id + labels). Simulates REAL bd
+        server-side `-l` filtering (AND semantics) against whichever labels
+        the query under test actually sends — so this fake has the same
+        falsifying power as a real server: the pre-fix code's hardcoded
+        `-l gate-status:queued` term really does exclude a dispatching-status
+        bead here, exactly as it would in production (verified directly
+        against the pre-fix function body, see comment below)."""
+        def _f(args, timeout=20, stdin=None):
+            requested = {args[i + 1] for i, a in enumerate(args) if a == "-l" and i + 1 < len(args)}
+            matches = [b for b in beads if requested <= set(b.get("labels") or [])]
+            return _types_gzx.SimpleNamespace(returncode=0, stdout=json.dumps(matches))
+        return _f
+
+    print("\nga-zxcpo Scenario M1: marker at gate-status:dispatching (past "
+          "'queued', gate MORE actively engaged, not less) -> found/gate-resident")
+    globals()["_sh"] = _fake_sh_gzx([
+        {"id": "ga-8motk", "labels": ["type:quality-gate-marker", "source-bead:ga-fbycg",
+                                       "gate-status:dispatching"]},
+    ])
+    _v_m1, _m_m1 = _queued_marker_state("/Users/athos/gt/.gascity-gastown-hq", "ga-fbycg")
+    if _v_m1 == "found" and _m_m1 and _m_m1.get("id") == "ga-8motk":
+        _ok("M1: gate-status:dispatching marker recognized as gate-resident "
+            "(pre-fix: fell out of the exact gate-status:queued filter -> "
+            "'absent' — the live ga-fbycg/ga-8motk false-positive shape; "
+            "falsified against the actual pre-fix query below)")
+    else:
+        _bad("M1", "verdict=%r marker=%r — expected ('found', {'id':'ga-8motk'})"
+             % (_v_m1, _m_m1))
+
+    print("\nga-zxcpo Scenario M2: marker at gate-status:queued still found "
+          "(regression guard — the pre-fix behavior this fix must not break)")
+    globals()["_sh"] = _fake_sh_gzx([
+        {"id": "ga-wisp-m2", "labels": ["type:quality-gate-marker", "source-bead:ga-m2",
+                                         "gate-status:queued"]},
+    ])
+    _v_m2, _m_m2 = _queued_marker_state("/Users/athos/gt/.gascity-gastown-hq", "ga-m2")
+    if _v_m2 == "found" and _m_m2 and _m_m2.get("id") == "ga-wisp-m2":
+        _ok("M2: gate-status:queued marker still recognized (no regression)")
+    else:
+        _bad("M2", "verdict=%r marker=%r — expected ('found', {'id':'ga-wisp-m2'})"
+             % (_v_m2, _m_m2))
+
+    print("\nga-zxcpo Scenario M3: marker at gate-status:needs-rebase (open, "
+          "but the gate has stepped back onto a rebase — not actively held) "
+          "-> absent; must NOT become a silent false-negative masking a "
+          "stranded marker (gate-needs-rebase-terminality-reap's own failure "
+          "mode) just because this fix widened marker recognition")
+    globals()["_sh"] = _fake_sh_gzx([
+        {"id": "ga-wisp-m3", "labels": ["type:quality-gate-marker", "source-bead:ga-m3",
+                                         "gate-status:needs-rebase"]},
+    ])
+    _v_m3, _m_m3 = _queued_marker_state("/Users/athos/gt/.gascity-gastown-hq", "ga-m3")
+    if _v_m3 == "absent" and _m_m3 is None:
+        _ok("M3: needs-rebase marker correctly NOT treated as gate-resident "
+            "— this fix does not silently widen into masking a stranded marker")
+    else:
+        _bad("M3", "verdict=%r marker=%r — expected ('absent', None)" % (_v_m3, _m_m3))
+
+    print("\nga-zxcpo Scenario R1: NO open marker at all, but a type:quality-"
+          "gate-run at gate-status:running -> found (the ACTUAL live "
+          "ga-fbycg/ga-ccjme false-positive: only a gate-run existed, no "
+          "matching marker — the original query never even looked at "
+          "type:quality-gate-run)")
+    globals()["_sh"] = _fake_sh_gzx([
+        {"id": "ga-ccjme", "labels": ["type:quality-gate-run", "source-bead:ga-fbycg",
+                                       "gate-status:running"]},
+    ])
+    _v_r1, _m_r1 = _queued_marker_state("/Users/athos/gt/.gascity-gastown-hq", "ga-fbycg")
+    if _v_r1 == "found" and _m_r1 and _m_r1.get("id") == "ga-ccjme":
+        _ok("R1: gate-status:running gate-run recognized as gate-resident even "
+            "with zero open markers — closes the exact gap that produced the "
+            "live ga-fbycg GHOST SLOT false alarm")
+    else:
+        _bad("R1", "verdict=%r marker=%r — expected ('found', {'id':'ga-ccjme'})"
+             % (_v_r1, _m_r1))
+
+    print("\nga-zxcpo Scenario R2: gate-run at gate-status:superseded "
+          "(terminal) and no open marker -> absent (a terminal run must not "
+          "suppress a real ghost/stall)")
+    globals()["_sh"] = _fake_sh_gzx([
+        {"id": "ga-wisp-r2", "labels": ["type:quality-gate-run", "source-bead:ga-r2",
+                                         "gate-status:superseded"]},
+    ])
+    _v_r2, _m_r2 = _queued_marker_state("/Users/athos/gt/.gascity-gastown-hq", "ga-r2")
+    if _v_r2 == "absent" and _m_r2 is None:
+        _ok("R2: terminal (superseded) gate-run correctly NOT treated as "
+            "gate-resident")
+    else:
+        _bad("R2", "verdict=%r marker=%r — expected ('absent', None)" % (_v_r2, _m_r2))
+
+    globals()["_sh"] = _saved_sh_gzx
+    _bd_marker_for_bead = _saved_bd_marker_for_bead_gzx
 
     # ── ga-u2u8z Scenarios U1-U5: gate-queue backlog context + suppression for
     # the delivery-stall alarm — mirrors approved-state-reconciler.py's
