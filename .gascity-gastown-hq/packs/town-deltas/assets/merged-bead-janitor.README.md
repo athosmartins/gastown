@@ -66,6 +66,13 @@ evidence) is never blocked by this — it's an all-or-nothing gate over
   closes as `gate-status:passed` before that hold decision runs, so the
   open-marker guard above cannot protect it — this is a dedicated guard for
   exactly that gap (same shape as the `delivery:partial` guard, one cycle later).
+- A signal (A) commit whose **only** touched files live under
+  `docs/pending-engine-window/` never closes **alone** (ga-fbycg) —
+  that convention **stages** an engine-rebuild `.patch` file for a later
+  build+swap window; it does not apply the fix. Confirmed false-closes twice
+  (`ga-soxi9`, `ga-9n9z7`): the bead's only trace in `origin/main` was the
+  patch-staging commit. Signals (B)/(C) are unaffected — a real gate marker or
+  merged branch for the same bead still closes it normally.
 - No signal → **keep**. A stale **unmerged** branch contributes nothing.
 
 ## Durable prevention — commit convention (fixes the sibling root cause)

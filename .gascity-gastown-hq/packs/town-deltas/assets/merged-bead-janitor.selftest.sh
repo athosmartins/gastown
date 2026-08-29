@@ -33,7 +33,7 @@ for fn in janitor_decide janitor_story_decide token_bounded scan_commit_for_bead
           branch_label_from_markers rig_gitdir \
           janitor_branch_decide normalize_bead_status branch_is_fresh \
           bead_lookup_one resolve_bead_state \
-          commit_epoch commit_evidence_stale comments_for_bead \
+          commit_epoch commit_evidence_stale comments_for_bead commit_touches_only_pending_patch \
           sling_beads_from_show sling_signals_for_id sling_fallback_eligible_reason; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by janitor"; exit 1; }
 done
@@ -179,6 +179,48 @@ eq "delivery-partial beats daemon-hold+signals → keep (partial reason, checked
 eq "not-daemon-hold + marker signal → still closes normally" \
    "$(janitor_decide 0 0 0 1 0 0 0 0 0)" "close:terminal-gate-marker-passed"
 
+# ── 1a6. janitor_decide sig_commit_docs_only — patch-staged ≠ fix-applied (ga-fbycg) ──
+# The docs/pending-engine-window queue's own convention is a commit like
+# "docs(<id>): pending-engine-window patch ..." that STAGES a *.patch file for a later
+# engine build+swap window — it never applies the fix. Two confirmed false-closes
+# (ga-soxi9, ga-9n9z7) matched Signal A on exactly this shape: the bead's ONLY trace in
+# origin/main was the patch-staging commit. Same precedence tier as sig_commit_stale
+# (both suppress signal A ALONE; signals B/C are bead-specific and stay authoritative).
+echo "── 1a6. janitor_decide sig_commit_docs_only (patch-staged ≠ fix-applied, ga-fbycg) ──"
+eq "backward-compat: 9 args, no 10th → commit still closes" \
+   "$(janitor_decide 0 0 1 0 0 0 0 0 0)" "close:commit-in-origin-main"
+eq "backward-compat: 9 args + marker signal, no 10th → still closes" \
+   "$(janitor_decide 0 0 0 1 0 0 0 0 0)" "close:terminal-gate-marker-passed"
+eq "docs-only commit alone → KEEP (the ga-soxi9/ga-9n9z7 false-close this fix prevents)" \
+   "$(janitor_decide 0 0 1 0 0 0 0 0 0 1)" "keep:commit-evidence-docs-only-patch-staged"
+eq "docs-only + marker also fires → marker still closes (signal B unaffected)" \
+   "$(janitor_decide 0 0 1 1 0 0 0 0 0 1)" "close:terminal-gate-marker-passed"
+eq "docs-only + branch also fires → branch still closes (signal C unaffected)" \
+   "$(janitor_decide 0 0 1 0 1 0 0 0 0 1)" "close:branch-ancestor-of-origin-main"
+eq "docs-only=1 but no commit signal at all → falls through to no-merge-evidence" \
+   "$(janitor_decide 0 0 0 0 0 0 0 0 0 1)" "keep:no-merge-evidence"
+eq "docs-only=0 explicit (not just omitted) → commit still closes" \
+   "$(janitor_decide 0 0 1 0 0 0 0 0 0 0)" "close:commit-in-origin-main"
+# Guard precedence: epic/open-marker/delivery-partial/daemon-hold still beat a
+# docs-only-flagged commit too (their own reason wins, checked before signal A at all).
+eq "epic beats docs-only commit → keep (epic reason, not docs-only reason)" \
+   "$(janitor_decide 1 0 1 0 0 0 0 0 0 1)" "keep:epic-parent-never-autoclosed"
+eq "open-marker beats docs-only commit → keep (open-marker reason)" \
+   "$(janitor_decide 0 1 1 0 0 0 0 0 0 1)" "keep:active-open-gate-marker"
+eq "delivery-partial beats docs-only commit → keep (partial reason, checked first)" \
+   "$(janitor_decide 0 0 1 0 0 0 0 1 0 1)" "keep:delivery-partial-unresolved-scope"
+eq "daemon-hold beats docs-only commit → keep (daemon-hold reason, checked first)" \
+   "$(janitor_decide 0 0 1 0 0 0 0 0 1 1)" "keep:daemon-verification-pending-restart"
+# Interaction with sig_commit_stale: both suppress signal A alone; docs-only is checked
+# first in the fallback chain, so when a commit is BOTH stale and docs-only the reason
+# is the docs-only one (cosmetic only — either way the verdict is keep).
+eq "stale AND docs-only together → docs-only reason wins (both suppress the same close)" \
+   "$(janitor_decide 0 0 1 0 0 1 0 0 0 1)" "keep:commit-evidence-docs-only-patch-staged"
+# Fixture CONTROLE (mirrors ga-f54ui/ga-l7n3v's own control fixtures): NOT docs-only (0)
+# → every signal closes exactly as before. The fix must not turn every close into a keep.
+eq "not-docs-only + marker signal → still closes normally" \
+   "$(janitor_decide 0 0 0 1 0 0 0 0 0 0)" "close:terminal-gate-marker-passed"
+
 # ── 1b. janitor_story_decide — merged story:approved → story:done (ga-gosfs) ──
 # Args: <is_epic> <has_open_marker> <already_done> <in_flight> <has_builder>
 #       <delivery_active> <sig_commit> <sig_marker> <sig_branch>
@@ -248,6 +290,28 @@ eq "already-done beats superseded-only → keep (idempotent, not re-driven by a 
    "$(janitor_story_decide 0 0 1 0 0 0 0 0 0 0 1)" "keep:already-story-done"
 eq "in-flight beats superseded-only → keep (active rework not masked as done)" \
    "$(janitor_story_decide 0 0 0 1 0 0 0 0 0 0 1)" "keep:story-in-flight-active-rework"
+
+# ── 1b4. janitor_story_decide sig_commit_docs_only — patch-staged ≠ fix-applied (ga-fbycg) ──
+# A story can land its ONLY origin/main trace as a docs/pending-engine-window
+# patch-staging commit too — nothing about the phenomenon is bug/task-specific. The
+# suppression mirrors janitor_decide §1a6 exactly (12th arg here vs 10th there, since
+# janitor_story_decide already carries the 6 story-specific guard args up front).
+echo "── 1b4. janitor_story_decide sig_commit_docs_only (patch-staged ≠ fix-applied, ga-fbycg) ──"
+eq "backward-compat: 11 args, no 12th → commit still done" \
+   "$(janitor_story_decide 0 0 0 0 0 0 1 0 0 0 0)" "done:commit-in-origin-main"
+eq "docs-only commit alone → KEEP (not forced to story:done)" \
+   "$(janitor_story_decide 0 0 0 0 0 0 1 0 0 0 0 1)" "keep:commit-evidence-docs-only-patch-staged"
+eq "docs-only + marker also fires → marker still drives done (signal B unaffected)" \
+   "$(janitor_story_decide 0 0 0 0 0 0 1 1 0 0 0 1)" "done:terminal-gate-marker-passed"
+eq "docs-only + branch also fires → branch still drives done (signal C unaffected)" \
+   "$(janitor_story_decide 0 0 0 0 0 0 1 0 1 0 0 1)" "done:branch-ancestor-of-origin-main"
+eq "in-flight guard still beats a docs-only-flagged commit" \
+   "$(janitor_story_decide 0 0 0 1 0 0 1 0 0 0 0 1)" "keep:story-in-flight-active-rework"
+eq "already-done beats docs-only-only → keep (idempotent)" \
+   "$(janitor_story_decide 0 0 1 0 0 0 1 0 0 0 0 1)" "keep:already-story-done"
+# Fixture CONTROLE: NOT docs-only (0) → commit still drives done exactly as before.
+eq "not-docs-only + commit signal → still done normally" \
+   "$(janitor_story_decide 0 0 0 0 0 0 1 0 0 0 0 0)" "done:commit-in-origin-main"
 
 # ── 1c. janitor_branch_decide — crew-branch prune (ga-tijv5 extension) ──────
 # Args: <ahead> <content_in_main> <bead_state> <live_worktree> <is_fresh>. A branch
@@ -448,6 +512,42 @@ eq "commit_epoch matches raw git %ct for a real sha" \
    "$(commit_epoch "$R" 0 "$MIRROR_SHA")" "$WANT_EPOCH"
 rc1 commit_epoch "$R" 0 "0000000000000000000000000000000000000000"   # unresolvable sha
 rc1 commit_epoch "$R" 0 ""                                            # empty sha
+
+# ── 3e. commit_touches_only_pending_patch — patch-staged ≠ fix-applied (ga-fbycg) ──
+# `git show --name-only` always reports paths relative to the REPO ROOT, never the
+# `-C` directory — verified live 2026-08-29 (the exact assumption this function relies
+# on). Two confirmed false-closes (ga-soxi9, ga-9n9z7) both matched Signal A on a commit
+# that ONLY added a docs/pending-engine-window/*.patch file; this proves the guard
+# recognizes BOTH real path forms (canonical nested + historically-misfiled top-level)
+# and rejects any commit that touches so much as one file outside that convention.
+echo "── 3e. commit_touches_only_pending_patch (patch-staged ≠ fix-applied, real repo) ──"
+mkdir -p "$R/.gascity-gastown-hq/docs/pending-engine-window" "$R/docs/pending-engine-window"
+( cd "$R" && printf 'patch content\n' > .gascity-gastown-hq/docs/pending-engine-window/ga-nested.patch && \
+  git add .gascity-gastown-hq/docs/pending-engine-window/ga-nested.patch && \
+  git commit -q -m "docs(tt-nested): pending-engine-window patch -- nested convention" )
+NESTED_SHA=$(git -C "$R" rev-parse HEAD)
+( cd "$R" && printf 'patch content\n' > docs/pending-engine-window/ga-toplevel.patch && \
+  git add docs/pending-engine-window/ga-toplevel.patch && \
+  git commit -q -m "docs(tt-toplevel): pending-engine-window patch -- misfiled top-level form" )
+TOPLEVEL_SHA=$(git -C "$R" rev-parse HEAD)
+( cd "$R" && printf 'fix content\n' > .gascity-gastown-hq/real_fix.sh && \
+  printf 'patch content v2\n' > .gascity-gastown-hq/docs/pending-engine-window/ga-nested.patch && \
+  git add .gascity-gastown-hq/real_fix.sh .gascity-gastown-hq/docs/pending-engine-window/ga-nested.patch && \
+  git commit -q -m "fix(tt-mixed): actually applies the fix" -m "touches both a patch file and the real source" )
+MIXED_SHA=$(git -C "$R" rev-parse HEAD)
+# Positive: a commit whose ONLY changed files are patch files (either valid path form).
+rc0 commit_touches_only_pending_patch "$R" 0 "$NESTED_SHA"     # nested .gascity-gastown-hq/docs/... form
+rc0 commit_touches_only_pending_patch "$R" 0 "$TOPLEVEL_SHA"   # top-level misfiled docs/... form
+# Negative: a commit that touches even ONE file outside the convention must NOT count,
+# even when it ALSO touches a patch file (the mixed case — a real fix landing alongside
+# a patch-queue cleanup must never be suppressed).
+rc1 commit_touches_only_pending_patch "$R" 0 "$MIXED_SHA"
+# Negative: a genuine non-patch commit from §3 (touches b.txt only).
+rc1 commit_touches_only_pending_patch "$R" 0 "$MIRROR_SHA"
+# FAIL-CLOSED edges: never invent "docs-only" from bad input (mirrors commit_evidence_stale's
+# own fail-open-to-preserve-prior-behaviour idiom — here prior behaviour is "not docs-only").
+rc1 commit_touches_only_pending_patch "$R" 0 ""                                            # empty sha
+rc1 commit_touches_only_pending_patch "$R" 0 "0000000000000000000000000000000000000000"   # unresolvable sha
 
 # ── 4. marker JSON helpers — synthetic fixtures ─────────────────────────────
 echo "── 4. marker helpers ──"
@@ -1166,12 +1266,15 @@ grep -qF 'janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SI
 grep -qF 'janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE" "$F_SIGMK_SUPER" "$F_DELIV_PARTIAL"' "$JANITOR" \
   && ok "ga-hcj4 stranded-wrapper sweep threads is_delivery_partial into janitor_decide" \
   || bad "ga-hcj4 sweep not threading is_delivery_partial"
-# Negative check: the story sweep's own janitor_story_decide call must NOT have grown
-# an 8th arg — confirms this fix deliberately left that sweep alone (see header above)
-# rather than silently drifting it out of sync with a copy-paste that half-applies.
-if grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER"' "$JANITOR" \
-   && ! grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_' "$JANITOR"; then
-  ok "story sweep's janitor_story_decide call deliberately untouched (no delivery:partial label ever reaches a story bead)"
+# Negative check: the story sweep's own janitor_story_decide call must end in
+# sig_commit_docs_only (ga-fbycg legitimately extended it, see §17 below) and NOT grow
+# a delivery:partial-shaped arg beyond that — confirms this fix deliberately left THIS
+# label alone (see header above) rather than silently drifting it out of sync with a
+# copy-paste that half-applies. (Was a two-grep AND-NOT before ga-fbycg added a real
+# 12th arg; now a single exact-tail match since the "no further arg at all" invariant
+# no longer holds — only "no delivery-partial/daemon-hold-shaped arg" does.)
+if grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_SIGCOMMIT_DOCS_ONLY")' "$JANITOR"; then
+  ok "story sweep's janitor_story_decide call ends at sig_commit_docs_only (no delivery:partial label ever reaches a story bead)"
 else
   bad "story sweep's janitor_story_decide call signature changed unexpectedly — re-check ga-f54ui's story-sweep-exclusion rationale"
 fi
@@ -1205,12 +1308,67 @@ grep -qF 'janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SI
 grep -qF 'janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE" "$F_SIGMK_SUPER" "$F_DELIV_PARTIAL" "$F_DAEMON_HOLD"' "$JANITOR" \
   && ok "ga-hcj4 stranded-wrapper sweep threads is_daemon_hold into janitor_decide" \
   || bad "ga-hcj4 sweep not threading is_daemon_hold"
-if grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER"' "$JANITOR" \
-   && ! grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_' "$JANITOR"; then
-  ok "story sweep's janitor_story_decide call deliberately untouched (no delivery:pending-restart label ever reaches a story bead)"
+# Same exact-tail check as §15 above (see that comment for why this is no longer a
+# two-grep AND-NOT): ga-fbycg's sig_commit_docs_only is a legitimate 12th arg, but
+# still no daemon-hold-shaped arg beyond it (delivery:pending-restart is stamped only
+# in quality-gate-dispatcher.sh's non-story branch, so a story bead never carries it).
+if grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_SIGCOMMIT_DOCS_ONLY")' "$JANITOR"; then
+  ok "story sweep's janitor_story_decide call ends at sig_commit_docs_only (no delivery:pending-restart label ever reaches a story bead)"
 else
   bad "story sweep's janitor_story_decide call signature changed unexpectedly — re-check ga-l7n3v's story-sweep-exclusion rationale"
 fi
+
+# ── 17. Drift-guard: ga-fbycg docs-only-patch guard (sig_commit_docs_only) ──────
+# The pure-function tests (§1a6/§1b4) and the real-git helper test (§3e) prove the
+# LOGIC is correct in isolation — they say nothing about whether the live sweep
+# actually WIRES it in. This is the exact gap that let ga-soxi9/ga-9n9z7 false-close
+# in the first place: a guard that exists as a function but is never threaded into
+# the call site it's supposed to protect is indistinguishable from no guard at all.
+# Must be wired into ALL THREE call sites that use janitor_decide/janitor_story_decide
+# (in_progress, ga-hcj4 stranded-wrapper, story:approved) — missing even one leaves
+# that bucket vulnerable to the exact same false-close this bead fixes.
+echo "── 17. Drift-guard: ga-fbycg docs-only-patch guard (sig_commit_docs_only) ──"
+grep -qF 'commit_touches_only_pending_patch() {' "$JANITOR" \
+  && ok "defines commit_touches_only_pending_patch" || bad "missing commit_touches_only_pending_patch def"
+grep -qF 'sig_commit_docs_only="${10:-0}"' "$JANITOR" \
+  && ok "janitor_decide accepts optional sig_commit_docs_only (backward-compatible default)" \
+  || bad "janitor_decide missing sig_commit_docs_only param"
+grep -qF 'sig_commit_docs_only="${12:-0}"' "$JANITOR" \
+  && ok "janitor_story_decide accepts optional sig_commit_docs_only (backward-compatible default)" \
+  || bad "janitor_story_decide missing sig_commit_docs_only param"
+grep -qF 'keep:commit-evidence-docs-only-patch-staged' "$JANITOR" \
+  && ok "docs-only-suppression keep reason present" || bad "docs-only-suppression keep reason missing"
+# All THREE call sites must COMPUTE the signal via the real helper (not just default it).
+grep -qF 'commit_touches_only_pending_patch "$MATCH_GITDIR" "$MATCH_CONTAINER" "$sha" && SIG_COMMIT_DOCS_ONLY=1' "$JANITOR" \
+  && ok "in_progress sweep computes SIG_COMMIT_DOCS_ONLY via the real helper" || bad "in_progress sweep not computing SIG_COMMIT_DOCS_ONLY"
+grep -qF 'commit_touches_only_pending_patch "$F_MATCH_GITDIR" "$F_MATCH_CONTAINER" "$sha" && F_SIGCOMMIT_DOCS_ONLY=1' "$JANITOR" \
+  && ok "ga-hcj4 stranded-wrapper sweep computes F_SIGCOMMIT_DOCS_ONLY via the real helper" || bad "ga-hcj4 sweep not computing F_SIGCOMMIT_DOCS_ONLY"
+grep -qF 'commit_touches_only_pending_patch "$S_MATCH_GITDIR" "$S_MATCH_CONTAINER" "$sha" && S_SIGCOMMIT_DOCS_ONLY=1' "$JANITOR" \
+  && ok "story sweep computes S_SIGCOMMIT_DOCS_ONLY via the real helper" || bad "story sweep not computing S_SIGCOMMIT_DOCS_ONLY"
+# All THREE call sites must thread the signal into janitor_decide/janitor_story_decide.
+grep -qF 'janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SIG_BRANCH" "$SIG_COMMIT_STALE" "$SIG_MK_SUPER" "$IS_DELIV_PARTIAL" "$IS_DAEMON_HOLD" "$SIG_COMMIT_DOCS_ONLY"' "$JANITOR" \
+  && ok "in_progress sweep threads sig_commit_docs_only into janitor_decide" || bad "in_progress sweep not threading sig_commit_docs_only"
+grep -qF 'janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE" "$F_SIGMK_SUPER" "$F_DELIV_PARTIAL" "$F_DAEMON_HOLD" "$F_SIGCOMMIT_DOCS_ONLY"' "$JANITOR" \
+  && ok "ga-hcj4 stranded-wrapper sweep threads sig_commit_docs_only into janitor_decide" || bad "ga-hcj4 sweep not threading sig_commit_docs_only"
+grep -qF '"$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_SIGCOMMIT_DOCS_ONLY")' "$JANITOR" \
+  && ok "story sweep threads sig_commit_docs_only into janitor_story_decide" || bad "story sweep not threading sig_commit_docs_only"
+# Signal C must gate on a TRUSTED flag that ALSO requires docs_only!=1 at all three call
+# sites, so a docs-only-flagged signal A never blinds the sweep to an independent,
+# genuinely-merged crew branch for this same bead (same shape as the ga-2zp4h stale gate).
+grep -qF '[ "$SIG_COMMIT" = "1" ] && [ "$SIG_COMMIT_STALE" != "1" ] && [ "$SIG_COMMIT_DOCS_ONLY" != "1" ] && SIG_COMMIT_TRUSTED=1' "$JANITOR" \
+  && ok "in_progress SIG_COMMIT_TRUSTED requires docs_only!=1" || bad "in_progress SIG_COMMIT_TRUSTED not gated on docs_only"
+grep -qF '[ "$F_SIGCOMMIT" = "1" ] && [ "$F_SIGCOMMIT_STALE" != "1" ] && [ "$F_SIGCOMMIT_DOCS_ONLY" != "1" ] && F_SIGCOMMIT_TRUSTED=1' "$JANITOR" \
+  && ok "ga-hcj4 F_SIGCOMMIT_TRUSTED requires docs_only!=1" || bad "ga-hcj4 F_SIGCOMMIT_TRUSTED not gated on docs_only"
+grep -qF '[ "$S_SIGCOMMIT" = "1" ] && [ "$S_SIGCOMMIT_STALE" != "1" ] && [ "$S_SIGCOMMIT_DOCS_ONLY" != "1" ] && S_SIGCOMMIT_TRUSTED=1' "$JANITOR" \
+  && ok "story S_SIGCOMMIT_TRUSTED requires docs_only!=1" || bad "story S_SIGCOMMIT_TRUSTED not gated on docs_only"
+# All three initializers must reset the flag to 0 per-bead (never carry a stale value
+# from the previous loop iteration's bead into this one).
+grep -qF 'SIG_COMMIT=0; COMMIT_EVID=""; SIG_COMMIT_STALE=0; SIG_COMMIT_DOCS_ONLY=0' "$JANITOR" \
+  && ok "in_progress sweep resets SIG_COMMIT_DOCS_ONLY per bead" || bad "in_progress sweep missing SIG_COMMIT_DOCS_ONLY reset"
+grep -qF 'F_SIGCOMMIT=0; F_COMMIT_EVID=""; F_SIGCOMMIT_STALE=0; F_SIGCOMMIT_DOCS_ONLY=0' "$JANITOR" \
+  && ok "ga-hcj4 sweep resets F_SIGCOMMIT_DOCS_ONLY per bead" || bad "ga-hcj4 sweep missing F_SIGCOMMIT_DOCS_ONLY reset"
+grep -qF 'S_SIGCOMMIT=0; S_SIGBRANCH=0; S_COMMIT_EVID=""; S_BRANCH_EVID=""; S_SIGCOMMIT_STALE=0; S_SIGCOMMIT_DOCS_ONLY=0' "$JANITOR" \
+  && ok "story sweep resets S_SIGCOMMIT_DOCS_ONLY per bead" || bad "story sweep missing S_SIGCOMMIT_DOCS_ONLY reset"
 
 echo ""
 echo "──────────────────────────────────────────"

@@ -197,19 +197,35 @@ notify_athos() {
 # precedence tier as is_delivery_partial (right after it — both are "the dispatcher already
 # judged this bead's true state is NOT actually done, independent of what merge evidence
 # says").
+#
+# sig_commit_docs_only (ga-fbycg, 2026-08-29): Signal A (scan_commit_subject_for_bead) only
+# proves a conventional commit SCOPED to this bead id exists in origin/main — not that the
+# commit APPLIED the fix. The docs/pending-engine-window queue's own convention is a commit
+# like "docs(<id>): pending-engine-window patch ..." that STAGES a *.patch file for a later
+# engine build+swap window; it never touches the engine source itself. Two confirmed
+# false-closes (ga-soxi9, ga-9n9z7) matched Signal A on exactly this shape — the bead's ONLY
+# trace in origin/main was the patch-staging commit, and the janitor read that as "delivered."
+# commit_touches_only_pending_patch (called by the sweep before this function) proves EVERY
+# file the matched commit touched lives under docs/pending-engine-window/ — sig_commit_docs_only=1
+# means "signal A's commit is patch-staging, not fix-applying." Same suppression shape as
+# sig_commit_stale: it blinds ONLY signal A's ability to close ALONE — signals B (marker) and
+# C (branch) are bead-specific and authoritative, so a genuine gate-marker or merged branch for
+# the SAME bead still closes normally even when the matched commit is docs-only.
 # ═════════════════════════════════════════════════════════════════════════════
 janitor_decide() {
   local is_epic="$1" has_open_marker="$2" sig_commit="$3" sig_marker="$4" sig_branch="$5" \
         sig_commit_stale="${6:-0}" sig_marker_superseded="${7:-0}" is_delivery_partial="${8:-0}" \
-        is_daemon_hold="${9:-0}"
+        is_daemon_hold="${9:-0}" sig_commit_docs_only="${10:-0}"
   if [ "$is_epic" = "1" ]; then            echo "keep:epic-parent-never-autoclosed"; return 0; fi
   if [ "$has_open_marker" = "1" ]; then    echo "keep:active-open-gate-marker"; return 0; fi
   if [ "$is_delivery_partial" = "1" ]; then echo "keep:delivery-partial-unresolved-scope"; return 0; fi
   if [ "$is_daemon_hold" = "1" ]; then     echo "keep:daemon-verification-pending-restart"; return 0; fi
-  if [ "$sig_commit" = "1" ] && [ "$sig_commit_stale" != "1" ]; then
+  if [ "$sig_commit" = "1" ] && [ "$sig_commit_stale" != "1" ] && [ "$sig_commit_docs_only" != "1" ]; then
                                             echo "close:commit-in-origin-main"; return 0; fi
   if [ "$sig_marker" = "1" ]; then         echo "close:terminal-gate-marker-passed"; return 0; fi
   if [ "$sig_branch" = "1" ]; then         echo "close:branch-ancestor-of-origin-main"; return 0; fi
+  if [ "$sig_commit" = "1" ] && [ "$sig_commit_docs_only" = "1" ]; then
+                                            echo "keep:commit-evidence-docs-only-patch-staged"; return 0; fi
   if [ "$sig_commit" = "1" ]; then         echo "keep:commit-evidence-superseded-by-newer-comment"; return 0; fi
   # ga-v8ui5: superseded reaches here ONLY after every real merge signal missed — say so
   # out loud instead of collapsing into the generic "no-merge-evidence".
@@ -258,11 +274,18 @@ janitor_decide() {
 # must NEVER be force-done). sig_commit_stale (ga-2zp4h): same suppression as
 # janitor_decide — a bead comment postdating Signal A's matched commit means that
 # commit alone should not force story:done; signals B/C are unaffected.
+#
+# sig_commit_docs_only (ga-fbycg, 2026-08-29): same suppression as janitor_decide's own
+# sig_commit_docs_only — a story can land its ONLY origin/main trace as a
+# docs/pending-engine-window patch-staging commit too (nothing about the phenomenon is
+# bug/task-specific); forcing story:done off that commit alone would be the exact same
+# false-positive as ga-soxi9/ga-9n9z7, just for a story bead. Blinds signal A alone;
+# signals B/C are unaffected.
 # ═════════════════════════════════════════════════════════════════════════════
 janitor_story_decide() {
   local is_epic="$1" has_open_marker="$2" already_done="$3" in_flight="$4" \
         has_builder="$5" delivery_active="$6" sig_commit="$7" sig_marker="$8" sig_branch="$9" \
-        sig_commit_stale="${10:-0}" sig_marker_superseded="${11:-0}"
+        sig_commit_stale="${10:-0}" sig_marker_superseded="${11:-0}" sig_commit_docs_only="${12:-0}"
   # — Guards (keep) — first match wins (each returns) —
   # SECURITY (sibling-path parity, ga-v3o6i sweep): ACTIVE-WORK guards MUST precede
   # already_done. A bead can carry a stale story:done label AND be re-opened (open
@@ -276,10 +299,12 @@ janitor_story_decide() {
   if [ "$delivery_active" = "1" ]; then echo "keep:delivery-owns-it"; return 0; fi
   if [ "$already_done" = "1" ];    then echo "keep:already-story-done"; return 0; fi
   # — Merge evidence (done) — same triangulation as janitor_decide —
-  if [ "$sig_commit" = "1" ] && [ "$sig_commit_stale" != "1" ]; then
+  if [ "$sig_commit" = "1" ] && [ "$sig_commit_stale" != "1" ] && [ "$sig_commit_docs_only" != "1" ]; then
                                    echo "done:commit-in-origin-main"; return 0; fi
   if [ "$sig_marker" = "1" ];      then echo "done:terminal-gate-marker-passed"; return 0; fi
   if [ "$sig_branch" = "1" ];      then echo "done:branch-ancestor-of-origin-main"; return 0; fi
+  if [ "$sig_commit" = "1" ] && [ "$sig_commit_docs_only" = "1" ]; then
+                                   echo "keep:commit-evidence-docs-only-patch-staged"; return 0; fi
   if [ "$sig_commit" = "1" ];      then echo "keep:commit-evidence-superseded-by-newer-comment"; return 0; fi
   # ga-v8ui5 — same parity as janitor_decide: a superseded marker never marks a story done.
   if [ "$sig_marker_superseded" = "1" ]; then
@@ -569,6 +594,48 @@ commit_evidence_stale() {
   printf '%s' "$comments_json" | jq -e --argjson ts "$commit_epoch" '
     any(.[]?; (try (.created_at // "" | fromdateiso8601) catch -1) > $ts)
   ' >/dev/null 2>&1
+}
+
+# commit_touches_only_pending_patch <git_dir> <is_container> <sha> — rc0 iff EVERY
+# file touched by <sha> lives under docs/pending-engine-window/, in either of the
+# two path forms a patch legitimately lands under: the canonical nested convention
+# ".gascity-gastown-hq/docs/pending-engine-window/<file>" and the historically
+# misfiled top-level "docs/pending-engine-window/<file>". Both are real, because
+# `git show --name-only` always reports paths relative to the REPO ROOT
+# (/Users/athos/gt), and .gascity-gastown-hq is a TRACKED SUBDIRECTORY of that
+# repo, not a repo of its own — confirmed live 2026-08-29 by the ga-qu0hi/
+# ga-soxi9/ga-cwfpq fixes that had to `git mv` patches from the top-level path
+# into the nested one (same nested-vs-toplevel landmine as packs/town-deltas/
+# assets/, see git-worktree-nested-city-path-prefix-gotcha).
+#
+# Feeds sig_commit_docs_only (ga-fbycg, 2026-08-29): scan_commit_subject_for_bead
+# only proves a conventional commit SCOPED to this bead id exists in origin/main.
+# For the engine-window queue that commit is routinely
+# "docs(<id>): pending-engine-window patch ..." (see docs/pending-engine-window's
+# own convention), which STAGES a patch file — it does NOT apply the fix.
+# Two confirmed false-closes (ga-soxi9, ga-9n9z7) matched Signal A on exactly
+# this shape: the bead's ONLY trace in origin/main was a commit that added the
+# .patch file, never the fix itself.
+#
+# FAIL-CLOSED to rc1 ("not docs-only", i.e. preserve pre-fix Signal-A behaviour)
+# on an empty/unresolvable sha or an empty/unreadable file list — same
+# best-effort idiom as commit_evidence_stale/markers_for_bead: an inability to
+# PROVE docs-only must never grant MORE closing power than today, only less.
+commit_touches_only_pending_patch() {
+  local gdir="$1" container="$2" sha="$3" files f
+  [ -z "$sha" ] && return 1
+  files=$(git_in "$gdir" "$container" show --name-only --format='' "$sha" 2>/dev/null || true)
+  [ -z "$files" ] && return 1
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    case "$f" in
+      docs/pending-engine-window/*|.gascity-gastown-hq/docs/pending-engine-window/*) : ;;
+      *) return 1 ;;
+    esac
+  done <<EOF
+$files
+EOF
+  return 0
 }
 
 # branch_merged <git_dir> <is_container> <branch_ref> <main_ref>
@@ -1025,7 +1092,7 @@ while IFS= read -r rig; do
     # rig's store — an HQ-home ga-*/dc-* bead — the legitimate cross-store case. (HQ-store
     # beads are swept in the HQ rig iteration where RGITDIR==HQ_GITDIR, so they scan HQ as
     # their own repo; this fallback covers a foreign bead that lives in a rig store.)
-    SIG_COMMIT=0; COMMIT_EVID=""; SIG_COMMIT_STALE=0
+    SIG_COMMIT=0; COMMIT_EVID=""; SIG_COMMIT_STALE=0; SIG_COMMIT_DOCS_ONLY=0
     if [ "$IS_EPIC" = "0" ] && [ "$HAS_OPEN" = "0" ]; then
       MATCH_GITDIR=""; MATCH_CONTAINER=""
       if sha=$(scan_commit_subject_for_bead "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$BID"); then
@@ -1043,13 +1110,18 @@ while IFS= read -r rig; do
         CEPOCH=$(commit_epoch "$MATCH_GITDIR" "$MATCH_CONTAINER" "$sha")
         BCOMMENTS=$(comments_for_bead "$RPATH" "$BID")
         commit_evidence_stale "$BCOMMENTS" "$CEPOCH" && SIG_COMMIT_STALE=1
+        # ga-fbycg: matched commit that ONLY stages a docs/pending-engine-window
+        # patch file suppresses signal A ALONE too — see janitor_decide's
+        # sig_commit_docs_only gate (ga-soxi9/ga-9n9z7 false-close guard).
+        commit_touches_only_pending_patch "$MATCH_GITDIR" "$MATCH_CONTAINER" "$sha" && SIG_COMMIT_DOCS_ONLY=1
       fi
     fi
-    # SIG_COMMIT_TRUSTED — signal A only when NOT stale (see above). Signal C below
-    # gates on this, not on raw SIG_COMMIT, so a stale signal A never blinds the
-    # sweep to an independent, genuinely-merged crew branch for this same bead.
+    # SIG_COMMIT_TRUSTED — signal A only when NOT stale and NOT docs-only (see above).
+    # Signal C below gates on this, not on raw SIG_COMMIT, so a suppressed signal A
+    # never blinds the sweep to an independent, genuinely-merged crew branch for this
+    # same bead.
     SIG_COMMIT_TRUSTED=0
-    [ "$SIG_COMMIT" = "1" ] && [ "$SIG_COMMIT_STALE" != "1" ] && SIG_COMMIT_TRUSTED=1
+    [ "$SIG_COMMIT" = "1" ] && [ "$SIG_COMMIT_STALE" != "1" ] && [ "$SIG_COMMIT_DOCS_ONLY" != "1" ] && SIG_COMMIT_TRUSTED=1
 
     # Signal C — branch ancestor of origin/main. Branch from marker labels, else
     # the crew/*/<id> convention discovered on the remote.
@@ -1079,7 +1151,7 @@ EOF
       done
     fi
 
-    VERDICT_LINE=$(janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SIG_BRANCH" "$SIG_COMMIT_STALE" "$SIG_MK_SUPER" "$IS_DELIV_PARTIAL" "$IS_DAEMON_HOLD")
+    VERDICT_LINE=$(janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SIG_BRANCH" "$SIG_COMMIT_STALE" "$SIG_MK_SUPER" "$IS_DELIV_PARTIAL" "$IS_DAEMON_HOLD" "$SIG_COMMIT_DOCS_ONLY")
     VERDICT="${VERDICT_LINE%%:*}"; REASON="${VERDICT_LINE#*:}"
 
     if [ "$VERDICT" = "close" ]; then
@@ -1190,7 +1262,7 @@ EOF
 
     # Signal A — same strict subject-scope commit scan + rig/HQ repo-scoping as
     # the in_progress sweep above.
-    F_SIGCOMMIT=0; F_COMMIT_EVID=""; F_SIGCOMMIT_STALE=0
+    F_SIGCOMMIT=0; F_COMMIT_EVID=""; F_SIGCOMMIT_STALE=0; F_SIGCOMMIT_DOCS_ONLY=0
     if [ "$F_EPIC" = "0" ] && [ "$F_HASOPEN" = "0" ]; then
       F_MATCH_GITDIR=""; F_MATCH_CONTAINER=""
       if sha=$(scan_commit_subject_for_bead "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$FID"); then
@@ -1207,10 +1279,12 @@ EOF
         F_CEPOCH=$(commit_epoch "$F_MATCH_GITDIR" "$F_MATCH_CONTAINER" "$sha")
         F_BCOMMENTS=$(comments_for_bead "$RPATH" "$FID")
         commit_evidence_stale "$F_BCOMMENTS" "$F_CEPOCH" && F_SIGCOMMIT_STALE=1
+        # ga-fbycg: same docs-only-patch suppression as the in_progress sweep above.
+        commit_touches_only_pending_patch "$F_MATCH_GITDIR" "$F_MATCH_CONTAINER" "$sha" && F_SIGCOMMIT_DOCS_ONLY=1
       fi
     fi
     F_SIGCOMMIT_TRUSTED=0
-    [ "$F_SIGCOMMIT" = "1" ] && [ "$F_SIGCOMMIT_STALE" != "1" ] && F_SIGCOMMIT_TRUSTED=1
+    [ "$F_SIGCOMMIT" = "1" ] && [ "$F_SIGCOMMIT_STALE" != "1" ] && [ "$F_SIGCOMMIT_DOCS_ONLY" != "1" ] && F_SIGCOMMIT_TRUSTED=1
 
     # Signal C — branch ancestor of origin/main, same final-path-segment self-guard
     # (must equal this bead id) as the in_progress sweep above.
@@ -1232,7 +1306,7 @@ EOF
       done
     fi
 
-    F_VERDICT_LINE=$(janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE" "$F_SIGMK_SUPER" "$F_DELIV_PARTIAL" "$F_DAEMON_HOLD")
+    F_VERDICT_LINE=$(janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE" "$F_SIGMK_SUPER" "$F_DELIV_PARTIAL" "$F_DAEMON_HOLD" "$F_SIGCOMMIT_DOCS_ONLY")
     F_VERDICT="${F_VERDICT_LINE%%:*}"; F_REASON="${F_VERDICT_LINE#*:}"
 
     # ga-vokwv: sling-bead-name fallback. FID's OWN id carried no merge
@@ -1340,7 +1414,7 @@ EOF
     S_SIGMK_SUPER=0; has_terminal_superseded_marker "$SMK" && S_SIGMK_SUPER=1   # ga-v8ui5
 
     # Only pay for the git scans when no cheap guard already forces keep.
-    S_SIGCOMMIT=0; S_SIGBRANCH=0; S_COMMIT_EVID=""; S_BRANCH_EVID=""; S_SIGCOMMIT_STALE=0
+    S_SIGCOMMIT=0; S_SIGBRANCH=0; S_COMMIT_EVID=""; S_BRANCH_EVID=""; S_SIGCOMMIT_STALE=0; S_SIGCOMMIT_DOCS_ONLY=0
     if [ "$S_EPIC" = "0" ] && [ "$S_DONE" = "0" ] && [ "$S_OPENMK" = "0" ] \
        && [ "$S_INFLIGHT" = "0" ] && [ "$S_BUILDER" = "0" ] && [ "$S_DELIV" = "0" ]; then
       # Signal A — commit whose SUBJECT SCOPE is this story id, in the story's OWN rig repo.
@@ -1365,9 +1439,12 @@ EOF
         S_CEPOCH=$(commit_epoch "$S_MATCH_GITDIR" "$S_MATCH_CONTAINER" "$sha")
         S_BCOMMENTS=$(comments_for_bead "$RPATH" "$SID")
         commit_evidence_stale "$S_BCOMMENTS" "$S_CEPOCH" && S_SIGCOMMIT_STALE=1
+        # ga-fbycg: same docs-only-patch suppression as the in_progress sweep above —
+        # a story's only origin/main trace can be a patch-staging commit too.
+        commit_touches_only_pending_patch "$S_MATCH_GITDIR" "$S_MATCH_CONTAINER" "$sha" && S_SIGCOMMIT_DOCS_ONLY=1
       fi
       S_SIGCOMMIT_TRUSTED=0
-      [ "$S_SIGCOMMIT" = "1" ] && [ "$S_SIGCOMMIT_STALE" != "1" ] && S_SIGCOMMIT_TRUSTED=1
+      [ "$S_SIGCOMMIT" = "1" ] && [ "$S_SIGCOMMIT_STALE" != "1" ] && [ "$S_SIGCOMMIT_DOCS_ONLY" != "1" ] && S_SIGCOMMIT_TRUSTED=1
       # Signal C — branch ancestor of origin/main (marker branch label, else crew/*/<id>).
       if [ "$S_SIGCOMMIT_TRUSTED" = "0" ] && [ "$S_SIGMK" = "0" ]; then
         declare -a SCANDS=()
@@ -1387,7 +1464,7 @@ EOF
     fi
 
     S_VERDICT_LINE=$(janitor_story_decide "$S_EPIC" "$S_OPENMK" "$S_DONE" "$S_INFLIGHT" \
-                       "$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER")
+                       "$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_SIGCOMMIT_DOCS_ONLY")
     S_VERDICT="${S_VERDICT_LINE%%:*}"; S_REASON="${S_VERDICT_LINE#*:}"
 
     if [ "$S_VERDICT" = "done" ]; then
