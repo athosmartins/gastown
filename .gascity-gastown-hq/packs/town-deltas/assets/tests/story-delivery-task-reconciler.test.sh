@@ -301,6 +301,31 @@ run_block "$CLOSE_EXHAUSTED_JSON" 0 ""
   && ok "T12 ALREADY_EXHAUSTED → bd close NOT attempted at all (early skip)" || nok "T12 spurious close attempt on exhausted bead" "$LAST_BD"
 [ "${RUN_TASK_COUNT:-0}" = "1" ] && ok "T12 TASK_COUNT=1 (candidate found, but skipped — not the same as acted)" || nok "T12 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
 
+# ── T13 (ga-wnxeq): delivery:pending-restart → veto, NOT closed even though ──
+# merge verification WOULD succeed (same id/commit as T1) ───────────────────
+# ga-l7n3v's daemon-verification hold (quality-gate-dispatcher.sh) sets
+# delivery:pending-restart and EXPLICITLY withholds closure ("Closure is
+# WITHHELD until this is resolved ... close this bead manually once confirmed
+# live"). This reconciler is a SEPARATE, independent close path (it exists to
+# catch beads the primary dispatcher crashed before closing) and had NO
+# knowledge of delivery:pending-restart at all — so it ran its own merge
+# check, found the content genuinely in origin/main (true — the gate DID
+# merge it, same synthetic commit as T1's "ga-test-task"), and closed anyway,
+# directly overriding the hold. Reproduces wa-q3x98 (DEPLOY_FAILED — the rig's
+# runtime checkout never even pulled the merge, closed regardless) and
+# wa-5wlrd (NEEDS_GUARDED_RESTART on a sensitive daemon, "NOT auto-bounced",
+# closed regardless) — both real beads had a genuinely merged commit, which is
+# exactly what let this reconciler's own content check wave them through.
+PENDING_RESTART_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","status":"in_progress","issue_type":"task","labels":["gate:passed","delivery:pending-restart","lane:small"]}]'
+run_block "$PENDING_RESTART_JSON" 0 ""
+! echo "$LAST_BD" | grep -q "close ga-test-task" \
+  && ok "T13 PENDING_RESTART_VETO → bd close NOT called (daemon-verification hold wins over merge proof)" || nok "T13 spurious-close despite delivery:pending-restart" "$LAST_BD"
+! echo "$LAST_BD" | grep -q 'label remove ga-test-task.*delivery:pending-restart' \
+  && ok "T13 delivery:pending-restart label left untouched (resolution is manual/daemon-refresh, not this reconciler)" || nok "T13 label wrongly removed" "$LAST_BD"
+! echo "$LAST_BD" | grep -q "comment ga-test-task" \
+  && ok "T13 no comment posted (already announced in full by the dispatcher when it set the label — avoids the ga-s1qb2 per-sweep comment-spam anti-pattern)" || nok "T13 spurious comment" "$LAST_BD"
+[ "${RUN_TASK_COUNT:-0}" = "1" ] && ok "T13 TASK_COUNT=1 (candidate found, but kept — not the same as acted)" || nok "T13 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
+
 echo ""
 echo "story-delivery task-reconciler tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

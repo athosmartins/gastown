@@ -619,6 +619,47 @@ if [ -z "$FORCE_STORY_ID" ]; then
         continue
       fi
 
+      # ga-wnxeq: a gate:passed bead that ALSO carries delivery:pending-restart
+      # went through quality-gate-dispatcher.sh's own daemon-verification hold
+      # (ga-l7n3v) — that hold EXPLICITLY withholds closure ("Closure is
+      # WITHHELD until this is resolved ... close this bead manually once
+      # confirmed live", quality-gate-dispatcher.sh ~line 5289) because a
+      # long-lived daemon may still be serving code older than this merge.
+      # This reconciler is a SEPARATE, independent close path (it exists to
+      # catch beads the primary dispatcher crashed before closing) and had NO
+      # knowledge of delivery:pending-restart at all — so it ran its OWN merge
+      # check below, found the content genuinely in origin/$TASK_DEFAULT_BRANCH
+      # (true — the gate DID merge it), and closed anyway, directly overriding
+      # the hold. Reproduced live on wa-q3x98 (DEPLOY_FAILED — the rig's
+      # runtime checkout never even pulled the merge, closed regardless) and
+      # wa-5wlrd (NEEDS_GUARDED_RESTART on a sensitive daemon with no drain
+      # path, "NOT auto-bounced", closed regardless) — both had a genuinely
+      # merged commit, which is exactly what let this reconciler's content
+      # check wave them through.
+      #
+      # NOT the same fix as delivery:deploy-pending (ga-iwv0) above: that
+      # label's only consumer re-arms story:approved to route the bead through
+      # the full STORY delivery pipeline for a daemon-refresh retry loop.
+      # quality-gate-dispatcher.sh deliberately chose delivery:pending-restart
+      # as a DIFFERENT, un-consumed label specifically so it would NEVER
+      # trigger that story-only mechanism on a bug/task bead (see that
+      # script's own comment beside its label-add call) — reusing the
+      # deploy-pending branch here would revive exactly what that comment
+      # says to avoid. So this is veto-only: do not close, do not relabel, do
+      # not comment (the hold was already announced in full — with Mayor mail
+      # and author notification — by the dispatcher at the moment it set the
+      # label; commenting again on every ~5min sweep this bead is re-picked
+      # would reproduce the identical Dolt-commit-spam anti-pattern ga-s1qb2
+      # already fixed once for this same file). Move on to the next
+      # candidate this sweep, same as the already-escalated skip above —
+      # resolution is manual (human closes once confirmed live) or via
+      # whatever future automation clears the label.
+      TASK_PENDING_RESTART=$(echo "$TASK_BEAD" | jq -r 'if ((.labels // []) | contains(["delivery:pending-restart"])) then "1" else "0" end' 2>/dev/null || echo "0")
+      if [ "$TASK_PENDING_RESTART" = "1" ]; then
+        log "Task reconciler: $TASK_BEAD_ID has delivery:pending-restart (daemon verification withheld closure, ga-l7n3v) — NOT closing; checking next candidate this sweep."
+        continue
+      fi
+
       # ga-266z8: NEVER trust the gate:passed label alone before closing — it can
       # be PROPAGATED from a sling/earlier run while the parent's own latest gate
       # run FAILED (confirmed false-closes: ga-opyus, ga-t1ub9, both manually
