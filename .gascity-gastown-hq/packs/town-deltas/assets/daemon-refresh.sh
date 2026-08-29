@@ -532,12 +532,20 @@ for label in $DAEMON_LABELS; do
   done
 
   # import-level: a changed shared module (not this daemon's own entrypoint) is
-  # referenced by name inside one of the entrypoint files.
+  # actually imported (import X / from X import ...) by one of the entrypoint
+  # files — NOT merely mentioned in a comment/docstring/string literal
+  # elsewhere in the file (ga-dn9ye: a bare `\bstem\b` grep over the whole
+  # file matched a filename named in a comment like "consumed by
+  # admin_dashboard.py", producing NEEDS_GUARDED_RESTART for daemons that
+  # never imported the changed module at all). Anchoring on
+  # `^[[:space:]]*(import|from)[[:space:]]+` requires the line to actually be
+  # an import statement; a comment line (starts with `#`) or an in-code
+  # mention never matches.
   if [ "$affected" -eq 0 ]; then
     for stem in $CHANGED_STEMS; do
       case " $own_stems " in *" $stem "*) continue ;; esac   # own entrypoint → handled above
       for e in $entries; do
-        if [ -f "$RUNTIME_DIR/$e" ] && grep -Eq "\\b${stem}\\b" "$RUNTIME_DIR/$e" 2>/dev/null; then
+        if [ -f "$RUNTIME_DIR/$e" ] && grep -Eq "^[[:space:]]*(import|from)[[:space:]]+.*\\b${stem}\\b" "$RUNTIME_DIR/$e" 2>/dev/null; then
           affected=1; break
         fi
       done
