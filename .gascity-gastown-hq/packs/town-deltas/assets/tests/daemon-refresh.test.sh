@@ -32,6 +32,10 @@
 #      painel-prod vs. whatsapp_automation) when that clone's root is listed in
 #      EXTRA_RUNTIME_ROOTS — instead of silently dropping it from discovery and
 #      reporting the false "touches no live daemon".
+#  10. (ga-omfwe) DRY_RUN=1 never kickstarts, never populates RESTARTED, and
+#      never reports PROOF=verified — it reports the preview in WOULD_RESTART
+#      instead, so a dry-run preview can never be textually indistinguishable
+#      from a real, confirmed restart.
 #
 # All external effects (launchctl, ps) are injected via LAUNCHCTL_BIN / PS_BIN
 # and a mock state dir, so the test touches NO real daemons. The plist scan and
@@ -172,7 +176,7 @@ run_helper() {  # run_helper <changed-relpaths...>  (commits a deploy diff first
   LAUNCH_AGENTS_DIR="$AGENTS" \
   LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" \
   VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
-  DRY_RUN=0 \
+  DRY_RUN="${DRY_RUN:-0}" \
   bash "$HELPER" 2>/dev/null
 }
 
@@ -607,6 +611,28 @@ V=$(field VERDICT "$OUT")
 echo "$(field AFFECTED "$OUT")" | grep -q "com.test.painel-visibilidade" && ok "T17 daemon under second clone discovered + affected" || nok "T17 affected" "$(field AFFECTED "$OUT")"
 echo "$(field RESTARTED "$OUT")" | grep -q "com.test.painel-visibilidade" && ok "T17 daemon restarted" || nok "T17 restarted" "$(field RESTARTED "$OUT")"
 [ "$(field PROOF "$OUT")" = "verified" ] && ok "T17 PROOF=verified (no longer a false 'touches no live daemon')" || nok "T17 proof" "got '$(field PROOF "$OUT")'"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T18: (ga-omfwe) DRY_RUN=1 on an affected SAFE dashboard → previews via
+# WOULD_RESTART, never populates RESTARTED, never kickstarts, never claims
+# PROOF=verified. Pre-fix, this case reported RESTARTED and PROOF=verified
+# identically to a real restart (T2) even though nothing ran.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t18
+cat > "$RUNTIME/daemons/ban_risk_dashboard.py" <<<'print("dash")'
+make_plist "$AGENTS" com.test.ban-risk-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/ban_risk_dashboard.py"
+seed_running com.test.ban-risk-dashboard 4001 "$STALE_LSTART"
+seed_restart com.test.ban-risk-dashboard 4099 "$FRESH_LSTART"
+DRY_RUN=1
+OUT=$(run_helper daemons/ban_risk_dashboard.py); RC=$?
+unset DRY_RUN
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T18 verdict OK" || nok "T18 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -eq 0 ] && ok "T18 exit 0" || nok "T18 exit" "rc=$RC"
+echo "$(field RESTARTED "$OUT")" | grep -q "com.test.ban-risk-dashboard" && nok "T18 RESTARTED must stay empty under DRY_RUN=1" "$(field RESTARTED "$OUT")" || ok "T18 RESTARTED empty (pre-fix bug: populated even under DRY_RUN=1)"
+echo "$(field WOULD_RESTART "$OUT")" | grep -q "com.test.ban-risk-dashboard" && ok "T18 WOULD_RESTART reports the preview" || nok "T18 would_restart" "$(field WOULD_RESTART "$OUT")"
+[ "$(field PROOF "$OUT")" = "not_applicable" ] && ok "T18 PROOF=not_applicable (never 'verified' when nothing ran)" || nok "T18 proof" "got '$(field PROOF "$OUT")' (pre-fix bug: this was 'verified')"
+[ ! -f "$MOCK/kicks.log" ] && ok "T18 no kickstart called under DRY_RUN=1" || nok "T18 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""

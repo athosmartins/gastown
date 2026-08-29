@@ -91,6 +91,9 @@
 # all human logging goes to STDERR.
 #   VERDICT=OK|SKIPPED|VERIFY_FAILED|NEEDS_GUARDED_RESTART
 #   AFFECTED=<labels>   RESTARTED=<labels>   FRESH_FAIL=<labels>   GUARDED=<labels>
+#   WOULD_RESTART=<labels>   (ga-omfwe: DRY_RUN=1 only — labels that would be
+#     restarted for real; RESTARTED is always empty under DRY_RUN=1, so the
+#     two never collapse into the same string)
 #   REASON=<text>   PROOF=verified|not_applicable|not_verified
 # Exit 0 when VERDICT is OK/SKIPPED (or DRY_RUN=1); non-zero otherwise.
 #
@@ -258,25 +261,26 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   echo "FRESH_FAIL=${FRESH_FAIL:-}"
   echo "GUARDED=${GUARDED:-}"
   echo "ALREADY_FRESH=${ALREADY_FRESH:-}"
+  echo "WOULD_RESTART=${WOULD_RESTART:-}"
   echo "REASON=$reason"
   echo "PROOF=$proof"
   # Trailing JSON for the caller's bead comment / jsonl log.
-  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" <<'PY' 2>/dev/null || true
+  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" <<'PY' 2>/dev/null || true
 import json, sys
-v, reason, aff, res, ff, gd, proof, afr = sys.argv[1:9]
+v, reason, aff, res, ff, gd, proof, afr, wr = sys.argv[1:10]
 sp = lambda s: [x for x in s.split() if x]
 print("JSON=" + json.dumps({
     "verdict": v, "reason": reason,
     "affected": sp(aff), "restarted": sp(res),
     "fresh_fail": sp(ff), "guarded": sp(gd), "proof": proof,
-    "already_fresh": sp(afr),
+    "already_fresh": sp(afr), "would_restart": sp(wr),
 }))
 PY
   if [ "$DRY_RUN" = "1" ]; then exit 0; fi
   case "$verdict" in OK|SKIPPED) exit 0 ;; *) exit 1 ;; esac
 }
 
-AFFECTED=""; RESTARTED=""; FRESH_FAIL=""; GUARDED=""; ALREADY_FRESH=""
+AFFECTED=""; RESTARTED=""; FRESH_FAIL=""; GUARDED=""; ALREADY_FRESH=""; WOULD_RESTART=""
 
 # ── preconditions ─────────────────────────────────────────────────────────────
 if [ -z "$RUNTIME_DIR" ] || ! git -C "$RUNTIME_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -643,10 +647,12 @@ for label in $AFFECTED; do
         $LAUNCHCTL_BIN kickstart -k "gui/$(id -u)/$label" 2>/dev/null \
           || $LAUNCHCTL_BIN kickstart "$label" 2>/dev/null \
           || log "WARN: kickstart failed for $label"
-      fi
-      RESTARTED="$RESTARTED $label"
-      if [ "$DRY_RUN" != "1" ] && ! verify_fresh "$label"; then
-        FRESH_FAIL="$FRESH_FAIL $label"
+        RESTARTED="$RESTARTED $label"
+        if ! verify_fresh "$label"; then
+          FRESH_FAIL="$FRESH_FAIL $label"
+        fi
+      else
+        WOULD_RESTART="$WOULD_RESTART $label"
       fi
     else
       log "SENSITIVE $label: NO drain path configured — NOT auto-bounced; flagged for guarded restart."
@@ -667,10 +673,12 @@ for label in $AFFECTED; do
     $LAUNCHCTL_BIN kickstart -k "gui/$(id -u)/$label" 2>/dev/null \
       || $LAUNCHCTL_BIN kickstart "$label" 2>/dev/null \
       || log "WARN: kickstart failed for $label (label wrong or not loaded?)"
-  fi
-  RESTARTED="$RESTARTED $label"
-  if [ "$DRY_RUN" != "1" ] && ! verify_fresh "$label"; then
-    FRESH_FAIL="$FRESH_FAIL $label"
+    RESTARTED="$RESTARTED $label"
+    if ! verify_fresh "$label"; then
+      FRESH_FAIL="$FRESH_FAIL $label"
+    fi
+  else
+    WOULD_RESTART="$WOULD_RESTART $label"
   fi
 done
 
@@ -678,6 +686,7 @@ RESTARTED="$(echo "$RESTARTED" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 
 FRESH_FAIL="$(echo "$FRESH_FAIL" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
 GUARDED="$(echo "$GUARDED" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
 ALREADY_FRESH="$(echo "$ALREADY_FRESH" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
+WOULD_RESTART="$(echo "$WOULD_RESTART" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
 
 # ── Step 5: verdict ───────────────────────────────────────────────────────────
 if [ -n "${FRESH_FAIL// /}" ]; then
@@ -686,6 +695,13 @@ elif [ -n "${GUARDED// /}" ]; then
   emit NEEDS_GUARDED_RESTART "sensitive hot-path daemon(s) need a guarded restart:${GUARDED}" not_verified
 elif [ -n "${RESTARTED// /}" ]; then
   emit OK "all affected daemons restarted + verified fresh:${RESTARTED}" verified
+elif [ -n "${WOULD_RESTART// /}" ]; then
+  # ga-omfwe: DRY_RUN=1 skips both the kickstart and verify_fresh calls, so
+  # this run confirmed nothing — RESTARTED must never be populated here (the
+  # pre-fix bug: it was, and this branch was unreachable because RESTARTED
+  # always won first). PROOF=not_applicable, matching the "nothing live to
+  # refresh" branch below: verification wasn't attempted, not that it failed.
+  emit OK "DRY RUN — no action taken; would restart daemon(s):${WOULD_RESTART}" not_applicable
 elif [ -n "${ALREADY_FRESH// /}" ]; then
   # ga-j3j6s: sensitive daemon(s) whose live process already started after
   # DEPLOY_EPOCH via some other restart path (e.g. the rig's own auto-deploy)
