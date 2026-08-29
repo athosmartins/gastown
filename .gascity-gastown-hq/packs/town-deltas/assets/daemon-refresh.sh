@@ -517,6 +517,45 @@ for m in re.findall(r'render_template\(\s*[\'"]([^\'"]+)[\'"]', src):
 PY
 }
 
+# does <file> genuinely IMPORT <stem> — via the file's own AST, not a text
+# grep, so a name merely MENTIONED in a comment/docstring/string literal
+# never counts (ga-dn9ye: a bare `\bstem\b` grep over the whole file matched
+# a filename named in a comment like "consumed by admin_dashboard.py",
+# flagging daemons that never imported it). A single-line anchored regex
+# (`^\s*(import|from)\s+.*\bstem\b`) fixes that but breaks on a parenthesized
+# multi-line `from X import (\n    stem,\n)` — common, and exactly what the
+# first gate review caught as a regression (ga-dn9ye attempt 1) — because the
+# line with the stem doesn't itself start with import/from. Real AST parsing
+# has neither problem: comments/docstrings/strings are never Import nodes,
+# and multi-line/backslash-continued/aliased forms all parse the same as a
+# single-line one. On a genuine parse failure, exits 1 (not affected) — same
+# fail-soft shape as daemon_template_names() above; every entrypoint here is
+# a live, running production daemon, so in practice it always parses.
+daemon_imports_stem() {  # daemon_imports_stem <file> <stem>
+  local f="$1" stem="$2"
+  [ -f "$f" ] || return 1
+  python3 - "$f" "$stem" <<'PY' 2>/dev/null
+import ast, sys
+path, stem = sys.argv[1], sys.argv[2]
+try:
+    tree = ast.parse(open(path, encoding="utf-8", errors="replace").read())
+except Exception:
+    sys.exit(1)
+for node in ast.walk(tree):
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            if stem in alias.name.split('.'):
+                sys.exit(0)
+    elif isinstance(node, ast.ImportFrom):
+        if node.module and stem in node.module.split('.'):
+            sys.exit(0)
+        for alias in node.names:
+            if alias.name == stem:
+                sys.exit(0)
+sys.exit(1)
+PY
+}
+
 # ── Step 3: resolve affected daemons ──────────────────────────────────────────
 for label in $DAEMON_LABELS; do
   entries="$(cat "$DISCO_DIR/$label")"
@@ -531,21 +570,18 @@ for label in $DAEMON_LABELS; do
     if echo "$CHANGED_BASENAMES" | grep -qxF "$eb"; then affected=1; break; fi
   done
 
-  # import-level: a changed shared module (not this daemon's own entrypoint) is
-  # actually imported (import X / from X import ...) by one of the entrypoint
-  # files — NOT merely mentioned in a comment/docstring/string literal
-  # elsewhere in the file (ga-dn9ye: a bare `\bstem\b` grep over the whole
-  # file matched a filename named in a comment like "consumed by
-  # admin_dashboard.py", producing NEEDS_GUARDED_RESTART for daemons that
-  # never imported the changed module at all). Anchoring on
-  # `^[[:space:]]*(import|from)[[:space:]]+` requires the line to actually be
-  # an import statement; a comment line (starts with `#`) or an in-code
-  # mention never matches.
+  # import-level: a changed shared module (not this daemon's own entrypoint)
+  # is actually imported by one of the entrypoint files — see
+  # daemon_imports_stem() above for why this is real AST parsing, not a
+  # grep/regex (ga-dn9ye: a bare text match flagged a comment MENTION as an
+  # import; the first, regex-anchored fix then missed a multi-line
+  # parenthesized import — both classes need real parsing, not text
+  # matching).
   if [ "$affected" -eq 0 ]; then
     for stem in $CHANGED_STEMS; do
       case " $own_stems " in *" $stem "*) continue ;; esac   # own entrypoint → handled above
       for e in $entries; do
-        if [ -f "$RUNTIME_DIR/$e" ] && grep -Eq "^[[:space:]]*(import|from)[[:space:]]+.*\\b${stem}\\b" "$RUNTIME_DIR/$e" 2>/dev/null; then
+        if daemon_imports_stem "$RUNTIME_DIR/$e" "$stem"; then
           affected=1; break
         fi
       done
