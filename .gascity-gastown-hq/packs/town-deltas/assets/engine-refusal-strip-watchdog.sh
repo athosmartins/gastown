@@ -24,8 +24,9 @@
 # 2. Skip any commit hash already in the processed-state file (dedup).
 # 3. For each new commit, resolve affected issue(s) via
 #    dolt_diff_labels WHERE to_commit = '<hash>' (indexed, fast per-commit
-#    lookup — confirmed live during ga-fn35s). Deliberately never scopes
-#    dolt_diff_labels by an open date range instead — see
+#    lookup — confirmed live during ga-fn35s). The lookback window above
+#    scopes dolt_log only; dolt_diff_labels is deliberately never scoped by
+#    an open date range — see
 #    [[dolt-diff-table-audit-trail-for-mutation-attribution]].
 # 4. For each affected bead: if it is CLOSED, or already carries
 #    pilot:no-auto-dispatch / no-auto-dispatch / any of the 4 refusal labels
