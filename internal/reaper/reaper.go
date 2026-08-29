@@ -584,8 +584,8 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
 }
 
 // AutoClose closes issues that have been open with no updates past staleAge.
-// Excludes P0/P1 priority, epics, hooked/pinned issues, standing-order labels,
-// and issues with active dependencies.
+// Excludes P0/P1 priority, epics, agent/session identity beads, hooked/pinned
+// issues, standing-order labels, and issues with active dependencies.
 func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (*AutoCloseResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultQueryTimeout)
 	defer cancel()
@@ -593,11 +593,23 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 	staleCutoff := time.Now().UTC().Add(-staleAge)
 	result := &AutoCloseResult{Database: dbName, DryRun: dryRun}
 
+	// issue_type IN ('agent','session') beads are persistent identity records
+	// (crew/witness/refinery workspaces, live agent sessions) that legitimately
+	// go months without an update — that's their normal resting state, not
+	// staleness. Reap() already excludes both types (see its whereClause
+	// above, and the gt-rlujz incident where reaping session wisps killed
+	// active+pinned crew); AutoClose lacked the mirror exclusion, so a bare
+	// `gt reaper auto-close`/`run` against hq would close every open
+	// agent-identity bead in the city. Verified live 2026-08-29 (ga-xo035):
+	// 13/13 open agent-type issues in hq (lx-lexbh-crew-thies,
+	// dc-deacon-witness, gt-gastown-crew-furiosa, ps-property_scrapers-*,
+	// etc.) matched every other AutoClose criterion and would have closed.
 	whereClause := fmt.Sprintf(`
 		i.status IN ('open', 'in_progress')
 		AND i.updated_at < ?
 		AND i.priority > 1
 		AND i.issue_type != 'epic'
+		AND i.issue_type NOT IN ('agent', 'session')
 		AND i.id NOT IN (
 			SELECT DISTINCT l.issue_id FROM `+"`%s`"+`.labels l
 			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig')

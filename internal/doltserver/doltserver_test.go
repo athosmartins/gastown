@@ -2080,6 +2080,47 @@ func TestHasConnectionCapacity_ZeroMax(t *testing.T) {
 	}
 }
 
+// TestParseMaxConnectionsOutput pins the CSV-parsing logic getLiveMaxConnections
+// relies on to read a live `SELECT @@max_connections` result (ga-1ztxb). 256 is
+// this town's actual measured live value at the time the bug was filed — a
+// regression that silently keeps returning the static 1000 default (or any other
+// value that happens to equal DefaultMaxConnections) would not be caught by a
+// test that only ever exercises 1000, so this table deliberately includes a
+// non-1000 value.
+func TestParseMaxConnectionsOutput(t *testing.T) {
+	tests := []struct {
+		name    string
+		output  []byte
+		want    int
+		wantErr bool
+	}{
+		{name: "town's actual live value", output: []byte("max_conn\n256\n"), want: 256},
+		{name: "dolt default value", output: []byte("max_conn\n1000\n"), want: 1000},
+		{name: "trailing whitespace tolerated", output: []byte("max_conn\n256\n\n"), want: 256},
+		{name: "CRLF line endings tolerated", output: []byte("max_conn\r\n256\r\n"), want: 256},
+		{name: "empty output", output: []byte(""), wantErr: true},
+		{name: "header only, no data row", output: []byte("max_conn\n"), wantErr: true},
+		{name: "non-numeric value", output: []byte("max_conn\nnot-a-number\n"), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseMaxConnectionsOutput(tt.output)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("parseMaxConnectionsOutput(%q) = %d, nil; want error", tt.output, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseMaxConnectionsOutput(%q) unexpected error: %v", tt.output, err)
+			}
+			if got != tt.want {
+				t.Errorf("parseMaxConnectionsOutput(%q) = %d, want %d", tt.output, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestFindAndMigrateAll_Idempotent(t *testing.T) {
 	townRoot := t.TempDir()
 

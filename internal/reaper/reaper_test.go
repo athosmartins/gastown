@@ -242,8 +242,45 @@ func TestScanExcludesAgentBeads(t *testing.T) {
 		t.Fatalf("could not isolate Scan() body in %s", sourcePath)
 	}
 	scanBody := source[scanStart:reapStart]
-	if !strings.Contains(scanBody, "w.issue_type != 'agent'") {
-		t.Fatalf("expected Scan() eligibility to exclude agent beads, scan body was:\n%s", scanBody)
+	// The exclusion predicate widened from a single "!= 'agent'" to
+	// "NOT IN ('agent', 'session')" when session-identity beads got the same
+	// protection (gt-rlujz); this assertion drifted from the real query text
+	// and had been silently red ever since (found while fixing ga-xo035 —
+	// AutoClose's missing mirror of this same guard).
+	if !strings.Contains(scanBody, "w.issue_type NOT IN ('agent', 'session')") {
+		t.Fatalf("expected Scan() eligibility to exclude agent/session beads, scan body was:\n%s", scanBody)
+	}
+}
+
+// TestAutoCloseExcludesAgentAndSessionBeads is a regression test for the
+// sibling of the bug TestReapExcludesAgentBeads documents: AutoClose() never
+// got the mirror "issue_type NOT IN ('agent','session')" guard that Reap()
+// already has. Verified live against hq on 2026-08-29 (ga-xo035): all 13/13
+// open agent-type issues in hq (lx-lexbh-crew-thies, dc-deacon-witness,
+// gt-gastown-crew-furiosa, ps-property_scrapers-*, etc.) matched every other
+// AutoClose criterion (priority>1, not epic, no active deps, updated_at >30d
+// stale — identity beads legitimately go untouched for months) and would
+// have been closed by a bare `gt reaper auto-close`/`run`. Same pattern as
+// TestScanExcludesAgentBeads: read the real source, isolate the function
+// body, assert the exclusion substring — so it fails against the pre-fix
+// source and passes after.
+func TestAutoCloseExcludesAgentAndSessionBeads(t *testing.T) {
+	sourcePath := "reaper.go"
+	data, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", sourcePath, err)
+	}
+	source := string(data)
+	acStart := strings.Index(source, "func AutoClose(")
+	if acStart == -1 {
+		t.Fatalf("could not find AutoClose() in %s", sourcePath)
+	}
+	acBody := source[acStart:]
+	if end := strings.Index(acBody, "\nfunc "); end != -1 {
+		acBody = acBody[:end]
+	}
+	if !strings.Contains(acBody, "i.issue_type NOT IN ('agent', 'session')") {
+		t.Fatalf("expected AutoClose() eligibility to exclude agent/session identity beads, body was:\n%s", acBody)
 	}
 }
 

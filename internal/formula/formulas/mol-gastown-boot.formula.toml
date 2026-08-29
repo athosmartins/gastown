@@ -54,7 +54,7 @@ gt deacon start
 
 ## OnStall
 ```bash
-gt nudge deacon/ \"Start patrol.\"
+gc session nudge gastown.deacon/ \"Start patrol.\"
 sleep 30
 # Re-verify
 ```"""

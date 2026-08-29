@@ -119,8 +119,8 @@ No action needed. Log observation and exit.
 
 **NUDGE**
 ```bash
-# Use --mode=queue to avoid interrupting in-flight tool calls
-gt nudge --mode=queue deacon "Boot check-in: you have pending work"
+# Use --delivery queue to avoid interrupting in-flight tool calls
+gc session nudge gastown.deacon/ "Boot check-in: you have pending work" --delivery queue
 ```
 
 **WAKE**
@@ -132,7 +132,7 @@ tmux send-keys -t hq-deacon Escape
 sleep 1
 
 # Send wake message
-gt nudge deacon "Boot wake: please check your inbox and pending work"
+gc session nudge gastown.deacon/ "Boot wake: please check your inbox and pending work"
 ```
 
 **INTERRUPT**

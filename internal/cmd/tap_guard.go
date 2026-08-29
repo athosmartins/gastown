@@ -107,7 +107,13 @@ func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
 
 // isGasTownAgentContext returns true if we're running as a Gas Town managed agent.
 func isGasTownAgentContext() bool {
-	// Check environment variables set by Gas Town session management
+	// Check environment variables set by Gas Town session management.
+	// GT_* are the legacy per-role flags. GC_AGENT is the newer Gas City
+	// identity var that gc prime injects for every managed agent type
+	// (dog, crew, witness, refinery, mayor, deacon, ...) — cities that
+	// migrated to Gas City set only GC_AGENT and leave all GT_* and
+	// GC_ROLE empty, so without this check every guard built on this
+	// function silently allowed forbidden operations from those agents.
 	envVars := []string{
 		"GT_POLECAT",
 		"GT_CREW",
@@ -115,6 +121,7 @@ func isGasTownAgentContext() bool {
 		"GT_REFINERY",
 		"GT_MAYOR",
 		"GT_DEACON",
+		"GC_AGENT",
 	}
 	for _, env := range envVars {
 		if os.Getenv(env) != "" {
