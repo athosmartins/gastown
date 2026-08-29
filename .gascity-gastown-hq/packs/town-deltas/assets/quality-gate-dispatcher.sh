@@ -4805,14 +4805,19 @@ fi
     # The gastown rig SHARES remote athosmartins/gastown.git with the town main,
     # so a town-main push minutes/hours LATER can still orphan a just-merged
     # gastown SHA on the shared remote — fully async, after the gate is gone.
-    # Record every CONTAINER-rig merge in a durable append-only ledger; the
-    # gate-merge-survival-sweep daemon periodically re-fetches and re-verifies
-    # each recent SHA is still an ancestor of origin/<default_branch>, then
-    # self-heals (FF-only re-push when safe) or escalates (divergent clobber).
-    # Container rigs only — a self-repo rig (wa, gascity) has no shared-remote
-    # clobber vector. FULLY GUARDED: a ledger failure must NEVER affect the gate
-    # outcome (every step `|| true` / non-fatal; runs only on a real merge SHA).
-    if [ "$DRY_RUN" != "1" ] && [ "${IS_CONTAINER_RIG:-0}" = "1" ] \
+    # Record every merge sharing that clobber vector in a durable append-only
+    # ledger; the gate-merge-survival-sweep daemon periodically re-fetches and
+    # re-verifies each recent SHA is still an ancestor of origin/<default_branch>,
+    # then self-heals (FF-only re-push when safe) or escalates (divergent clobber).
+    # ga-wvdl6: gated on NEEDS_SURVIVAL_LEDGER, NOT IS_CONTAINER_RIG — a
+    # self-repo rig embedded in a DIFFERENT repo's working tree (gascity,
+    # deacon: both live inside the shared town-root repo, whose origin IS
+    # the same remote gastown's container rig pushes to) has the exact same
+    # shared-remote clobber vector a container rig does. A truly isolated
+    # self-repo rig (own repo root, own remote) correctly stays unledgered.
+    # FULLY GUARDED: a ledger failure must NEVER affect the gate outcome
+    # (every step `|| true` / non-fatal; runs only on a real merge SHA).
+    if [ "$DRY_RUN" != "1" ] && [ "${NEEDS_SURVIVAL_LEDGER:-0}" = "1" ] \
        && printf '%s' "$MERGE_SHA" | grep -Eq '^[0-9a-f]{7,40}$'; then
       SURVIVAL_LEDGER="$GC_CITY/.gc/merge-survival-ledger.jsonl"
       mkdir -p "$GC_CITY/.gc" 2>/dev/null || true
@@ -6298,8 +6303,11 @@ if [ "$BEAD_CITY" != "${RIG_PATH:-$GC_CITY}" ]; then
 fi
 
 # Determine the canonical git repo location.
-# Container rigs (property_scrapers, lexbh) have a bare .repo.git.
-# Self-repo rigs (gastown, whatsapp_automation, marketing) have .git in root.
+# Container rigs (property_scrapers, lexbh, gastown, whatsapp_automation,
+# marketing -- ga-wvdl6: verified live, all five currently have a bare
+# .repo.git) have a bare .repo.git. Self-repo rigs (gascity, deacon) have
+# no .repo.git of their own -- they are subdirectories of the town-root
+# repo itself.
 if [ -d "$RIG_PATH/.repo.git" ]; then
   GIT_DIR_PATH="$RIG_PATH/.repo.git"
   IS_CONTAINER_RIG=1
@@ -6307,6 +6315,32 @@ else
   GIT_DIR_PATH="$RIG_PATH"
   IS_CONTAINER_RIG=0
 fi
+
+# SELFTEST-EXTRACT needs-survival-ledger-classify: BEGIN
+# ga-wvdl6: IS_CONTAINER_RIG above is deliberately kept a pure
+# "$RIG_PATH/.repo.git exists" structural fact -- it drives GIT_DIR_PATH and
+# other git-mechanics call sites elsewhere in this file, and none of those
+# should change behavior here. The merge-survival ledger's actual risk
+# factor (see ga-lzj2e below) is narrower and different: does this rig's
+# git identity share a remote with a container rig. A container rig always
+# does -- that IS the ga-lzj2e scenario. A self-repo rig normally does NOT,
+# UNLESS it is actually a SUBDIRECTORY of a DIFFERENT repo rather than its
+# own repo root (its own `git rev-parse --show-toplevel` != its own
+# RIG_PATH) -- e.g. gascity/deacon, both living inside the shared
+# town-root repo whose origin IS the same remote the gastown container rig
+# pushes to. That shape shares the exact same async-clobber vector a
+# container rig has, so it needs the same ledger protection. Computed as
+# its own variable (never widening IS_CONTAINER_RIG's meaning) so only the
+# ledger-write gate below changes; every other IS_CONTAINER_RIG call site
+# in this file is untouched.
+NEEDS_SURVIVAL_LEDGER="$IS_CONTAINER_RIG"
+if [ "$IS_CONTAINER_RIG" = "0" ]; then
+  case "$(git -C "$RIG_PATH" rev-parse --show-toplevel 2>/dev/null || printf '')" in
+    "$RIG_PATH"|"") ;;  # own repo root, or undeterminable -- stays isolated (0)
+    *) NEEDS_SURVIVAL_LEDGER=1 ;;  # embedded in a DIFFERENT repo -- shares its remote
+  esac
+fi
+# SELFTEST-EXTRACT needs-survival-ledger-classify: END
 
 # git_rig — wrapper that calls git with the correct rig-specific flags.
 # Usage: git_rig <args...>

@@ -115,12 +115,71 @@ grep -q 'date -u -j -f "%Y-%m-%dT%H:%M:%SZ"' "$SWEEP" && ok "iso_to_epoch uses -
 echo "── 5. drift-guard: dispatcher ledger producer ──"
 grep -q 'merge-survival-ledger.jsonl' "$DISPATCHER"   && ok "dispatcher writes the survival ledger" || bad "dispatcher ledger append missing"
 grep -q 'ga-lzj2e' "$DISPATCHER"                       && ok "dispatcher edit tagged ga-lzj2e"       || bad "dispatcher edit untagged"
-# Producer guards: container-rig-only + real-sha + dry-run-skip.
-grep -q 'IS_CONTAINER_RIG:-0' "$DISPATCHER"            && ok "ledger guarded to container rigs"      || bad "container-rig guard missing"
+# ga-wvdl6: the ledger write is gated on NEEDS_SURVIVAL_LEDGER, not the
+# narrower IS_CONTAINER_RIG -- a self-repo rig embedded in a DIFFERENT
+# repo's working tree (gascity, deacon) shares that outer repo's remote
+# with a container rig and needs the same protection. See section 6 below
+# for the functional proof of the classification itself.
+grep -q 'NEEDS_SURVIVAL_LEDGER:-0' "$DISPATCHER"       && ok "ledger guarded by NEEDS_SURVIVAL_LEDGER (ga-wvdl6)" || bad "survival-ledger gate missing/reverted to IS_CONTAINER_RIG-only"
 grep -Eq 'grep -Eq .\^\[0-9a-f\]\{7,40\}' "$DISPATCHER" && ok "ledger guarded to a real merge SHA"   || bad "sha guard missing"
 
-# ── 6. drift-guard: plist ───────────────────────────────────────────────────
-echo "── 6. drift-guard: plist ──"
+# ── 6. functional: NEEDS_SURVIVAL_LEDGER classification (ga-wvdl6) ─────────
+# PROBLEM: IS_CONTAINER_RIG is a pure ".repo.git exists" structural fact.
+# gascity/deacon are self-repo (no .repo.git) but are actually SUBDIRECTORIES
+# of the shared town-root repo, whose origin IS the same remote a container
+# rig (gastown) pushes to -- so they carry the exact clobber vector this
+# ledger exists to catch, yet were silently excluded. Extract the live
+# classification block VERBATIM (same technique
+# gate-dispatcher-rig-resolve-noabort.selftest.sh uses for its sibling
+# block) and prove it against three REAL git shapes. Pure git+shell, no
+# bd/gc/network dependency.
+echo "── 6. NEEDS_SURVIVAL_LEDGER classification (ga-wvdl6) ──"
+NS_BLOCK="$(sed -n '/# SELFTEST-EXTRACT needs-survival-ledger-classify: BEGIN/,/# SELFTEST-EXTRACT needs-survival-ledger-classify: END/p' "$DISPATCHER" | sed '1d;$d')"
+if [ -z "$NS_BLOCK" ]; then
+  bad "needs-survival-ledger-classify block not found in $DISPATCHER"
+else
+  ok "needs-survival-ledger-classify block extracted"
+  ns_classify() {
+    bash -c '
+      set -uo pipefail
+      RIG_PATH="$1"; IS_CONTAINER_RIG="$2"
+      '"$NS_BLOCK"'
+      printf "%s" "$NEEDS_SURVIVAL_LEDGER"
+    ' _ "$1" "$2"
+  }
+
+  # (a) container rig: passthrough, always 1 regardless of git shape.
+  eq "container rig -> needs ledger (passthrough)" "$(ns_classify "$T/crig" 1)" "1"
+
+  # (b) isolated self-repo: own repo root == own path -> genuinely no
+  #     shared-remote vector, stays 0 (no behavior change for this shape).
+  #     Resolve to the PHYSICAL path (pwd -P) before comparing: macOS
+  #     mktemp -d returns a path under /var/folders/... which is itself a
+  #     symlink to /private/var/folders/..., and `git rev-parse
+  #     --show-toplevel` always returns the resolved physical path -- an
+  #     unresolved RIG_PATH would spuriously mismatch its own toplevel here
+  #     (a tmpdir symlink artifact, not the real-repo scenario this test
+  #     exercises; verified production RIG_PATHs under /Users/athos/gt have
+  #     no such indirection, so production code deliberately does NOT
+  #     realpath-resolve -- only this fixture needs to).
+  mkdir -p "$T/isolated_self_rig"
+  git init -q -b main "$T/isolated_self_rig" >/dev/null 2>&1
+  ISOLATED_RESOLVED="$(cd "$T/isolated_self_rig" && pwd -P)"
+  eq "isolated self-repo rig -> no ledger needed" "$(ns_classify "$ISOLATED_RESOLVED" 0)" "0"
+
+  # (c) embedded self-repo: a subdirectory of a DIFFERENT repo's working
+  #     tree (the gascity/deacon shape -- own git toplevel != own path) ->
+  #     shares that outer repo's remote, same clobber vector as a container
+  #     rig. THIS is the bug: pre-fix, only IS_CONTAINER_RIG gated the
+  #     ledger, and this shape is IS_CONTAINER_RIG=0 -- silently unledgered.
+  #     Same physical-resolution reasoning as (b) above.
+  mkdir -p "$R/embedded_subrig"
+  EMBEDDED_RESOLVED="$(cd "$R/embedded_subrig" && pwd -P)"
+  eq "embedded self-repo rig (gascity/deacon shape) -> needs ledger" "$(ns_classify "$EMBEDDED_RESOLVED" 0)" "1"
+fi
+
+# ── 7. drift-guard: plist ───────────────────────────────────────────────────
+echo "── 7. drift-guard: plist ──"
 grep -q 'com.gascity.gate-merge-survival-sweep' "$PLIST" && ok "plist Label correct"     || bad "plist Label wrong"
 grep -q '<key>StartInterval</key>' "$PLIST"              && ok "plist uses StartInterval" || bad "plist missing StartInterval"
 grep -q '<key>RunAtLoad</key><true/>' "$PLIST"           && ok "plist RunAtLoad=true"     || bad "plist missing RunAtLoad"
