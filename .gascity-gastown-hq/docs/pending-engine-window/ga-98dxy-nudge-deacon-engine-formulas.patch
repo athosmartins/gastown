@@ -1,0 +1,37 @@
+diff --git a/internal/formula/formulas/mol-boot-triage.formula.toml b/internal/formula/formulas/mol-boot-triage.formula.toml
+index db8490aba..7888dc0e2 100644
+--- a/internal/formula/formulas/mol-boot-triage.formula.toml
++++ b/internal/formula/formulas/mol-boot-triage.formula.toml
+@@ -119,8 +119,8 @@ No action needed. Log observation and exit.
+ 
+ **NUDGE**
+ ```bash
+-# Use --mode=queue to avoid interrupting in-flight tool calls
+-gt nudge --mode=queue deacon "Boot check-in: you have pending work"
++# Use --delivery queue to avoid interrupting in-flight tool calls
++gc session nudge gastown.deacon/ "Boot check-in: you have pending work" --delivery queue
+ ```
+ 
+ **WAKE**
+@@ -132,7 +132,7 @@ tmux send-keys -t hq-deacon Escape
+ sleep 1
+ 
+ # Send wake message
+-gt nudge deacon "Boot wake: please check your inbox and pending work"
++gc session nudge gastown.deacon/ "Boot wake: please check your inbox and pending work"
+ ```
+ 
+ **INTERRUPT**
+diff --git a/internal/formula/formulas/mol-gastown-boot.formula.toml b/internal/formula/formulas/mol-gastown-boot.formula.toml
+index 2f5b9771d..51a79e5d7 100644
+--- a/internal/formula/formulas/mol-gastown-boot.formula.toml
++++ b/internal/formula/formulas/mol-gastown-boot.formula.toml
+@@ -54,7 +54,7 @@ gt deacon start
+ 
+ ## OnStall
+ ```bash
+-gt nudge deacon/ \"Start patrol.\"
++gc session nudge gastown.deacon/ \"Start patrol.\"
+ sleep 30
+ # Re-verify
+ ```"""
