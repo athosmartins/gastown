@@ -131,19 +131,47 @@ echo "── 6. drift-guard: pilot re-dispatches needs-fix, excludes needs-human
 # unconditionally on a clean checkout — a magic number lies by default the
 # moment a real query is added, and a chronically-RED guard can no longer
 # distinguish "someone added a legit site" from "someone forgot the exclusion",
-# the exact thing it exists to catch. Structural invariant instead:
-# "gate:needs-human" is excluded alongside "needs:engine-window" at every
-# site — always on the same or the immediately-following line, verified
-# across all 19 current call sites with no exceptions — so assert the two
-# counts match rather than pinning either to a number. A future site that
-# excludes one but forgets the other trips this; a new site that pairs both
-# (the only way anyone writes these blocks today) passes untouched.
-NH_COUNT="$(grep -c 'exclude-label "gate:needs-human"' "$PILOT")"
-EW_COUNT="$(grep -c 'exclude-label "needs:engine-window"' "$PILOT")"
+# the exact thing it exists to catch.
+#
+# ga-yb1hy gate-fix (attempt 2): the first fix here compared file-wide totals
+# (grep -c of each label) and passed on EQUALITY alone — that is NOT a
+# bijection, it only proves the two labels appear the same number of times
+# somewhere in the file. Two independent, unrelated drifts (one site losing
+# its gate:needs-human, a different site anywhere in the file gaining an
+# unrelated needs:engine-window mention) would cancel out in the totals and
+# this guard would stay silently green — exactly the false-confidence shape
+# ga-huaxo's own comment (test 8, below) warns against. Fixed properly this
+# time: extract BOTH label's line numbers, sorted, and verify POSITIONAL
+# pairing — the i-th gate:needs-human line and the i-th needs:engine-window
+# line must be the same line or one apart (verified true for all 19 current
+# sites: they are always written together in the same --exclude-label run,
+# either both on one line or gate:needs-human immediately followed by
+# needs:engine-window on the next). A site that has one label without its
+# adjacent partner breaks the pairing at that index and names its line.
+NH_LINES="$(grep -n 'exclude-label "gate:needs-human"' "$PILOT" | cut -d: -f1)"
+EW_LINES="$(grep -n 'exclude-label "needs:engine-window"' "$PILOT" | cut -d: -f1)"
+NH_COUNT="$(printf '%s\n' "$NH_LINES" | grep -c .)"
+EW_COUNT="$(printf '%s\n' "$EW_LINES" | grep -c .)"
+_nh_ew_bad=""
 if [ "$NH_COUNT" -ge 1 ] && [ "$NH_COUNT" = "$EW_COUNT" ]; then
-  ok "pilot excludes gate:needs-human 1:1 with needs:engine-window in every candidate query ($NH_COUNT sites)"
+  _i=1
+  while [ "$_i" -le "$NH_COUNT" ]; do
+    _nh_line="$(printf '%s\n' "$NH_LINES" | sed -n "${_i}p")"
+    _ew_line="$(printf '%s\n' "$EW_LINES" | sed -n "${_i}p")"
+    _diff=$((_ew_line - _nh_line))
+    if [ "$_diff" -lt 0 ] || [ "$_diff" -gt 1 ]; then
+      _nh_ew_bad="gate:needs-human at line $_nh_line is not adjacently paired with needs:engine-window (nearest is line $_ew_line)"
+      break
+    fi
+    _i=$((_i + 1))
+  done
 else
-  bad "pilot gate:needs-human ($NH_COUNT) / needs:engine-window ($EW_COUNT) exclusion counts diverged — a candidate query may be missing one exclusion"
+  _nh_ew_bad="site counts diverged: gate:needs-human=$NH_COUNT, needs:engine-window=$EW_COUNT"
+fi
+if [ -z "$_nh_ew_bad" ]; then
+  ok "pilot excludes gate:needs-human 1:1 with needs:engine-window in every candidate query ($NH_COUNT sites, positionally verified)"
+else
+  bad "pilot gate:needs-human/needs:engine-window pairing broken — $_nh_ew_bad"
 fi
 grep -q 'gate:needs-fix'   "$PILOT" && ok "pilot detects gate:needs-fix"        || bad "pilot missing gate:needs-fix path"
 grep -q 'GATE-FEEDBACK'    "$PILOT" && ok "pilot reads GATE-FEEDBACK comment"   || bad "pilot missing GATE-FEEDBACK read"
