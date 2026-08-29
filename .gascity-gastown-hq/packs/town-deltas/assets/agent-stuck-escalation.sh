@@ -336,6 +336,72 @@ except Exception:
     return 1
 }
 
+# resolve_live_session_name (ga-mq7hd): a SEGUNDA tentativa, independente, de
+# achar o nome de sessão gawisp-qualificado de $1, usada só quando o scan em
+# lote (`gc session list` no topo do script, $ACTIVE_SESSIONS) já não achou
+# nem match exato nem prefix-match gawisp pra este assignee. Esse snapshot é
+# capturado UMA VEZ, no início da passada, e pode ficar atrás da realidade
+# logo após um respawn/reboot — a sessão qualificada (ex.
+# "mila-wa-gawispc0m7p7") registra momentos depois do scan em lote já ter
+# rodado, então o MESMO prefix-match que a pegaria (linha ~1483) não acha
+# nada. Sem isto, todo fallback mais profundo (transcript_is_advancing,
+# session_exists_via_peek) reconsulta com o alias CRU e falha pelo MESMO
+# motivo — nome não bate, não é sessão morta — então "não-encontrada" fica
+# de pé só com informação velha (ga-mq7hd: 2 falsos AUSENTE ao vivo no mesmo
+# lote, distintos do que ga-v6ols já cobre).
+#
+# É deliberadamente MAIS RESOLUÇÃO, não mais SUPRESSÃO: repete a mesma
+# lógica de `gc session list` + prefix-match usada no topo do script, mas
+# fresca, no momento em que ESTE bead específico está sendo avaliado — sem
+# depender do que o scan em lote inicial perdeu. Uma reconsulta vazia ou que
+# falhe aqui NÃO é evidência de ausência; só significa que esta segunda
+# tentativa foi inconclusiva, então quem chama deve tratar "não achou" desta
+# função exatamente como o caminho pré-existente "não-encontrada" (cai pros
+# fallbacks de alias cru já existentes, inalterados — AC1/AC4 de ga-v6ols),
+# nunca como confirmação mais forte de morte.
+#
+# Ecoa o nome qualificado resolvido no stdout e retorna 0 se um match exato
+# OU prefix fresco for achado; retorna 1 (sem stdout) se não achar OU se a
+# consulta/parse falhar — as duas coisas são deliberadamente não distinguidas
+# aqui, porque o comportamento correto de quem chama é idêntico nos dois
+# casos (seguir pros fallbacks de alias cru, inalterados).
+resolve_live_session_name() {
+    local assignee="$1" raw tmp fresh_sessions base_tmpl match
+    raw="$(timeout 20 "$GC" session list --json 2>/dev/null)"
+    [ -z "$raw" ] && return 1
+    tmp="$(mktemp)"
+    printf '%s' "$raw" > "$tmp"
+    fresh_sessions="$(python3 - "$tmp" <<'PY' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        raw = fh.read()
+    data = json.loads(raw)
+    for s in (data.get("sessions") or []):
+        if s.get("state") == "active":
+            for field in ("session_name", "name", "alias", "id"):
+                v = s.get(field) or ""
+                if v:
+                    print(v)
+except Exception:
+    sys.exit(1)
+PY
+)"
+    rm -f "$tmp"
+    [ -z "$fresh_sessions" ] && return 1
+    if printf '%s\n' "$fresh_sessions" | grep -qx "$assignee"; then
+        printf '%s' "$assignee"
+        return 0
+    fi
+    base_tmpl="${assignee%%-gawisp*}"
+    match="$(printf '%s\n' "$fresh_sessions" | grep "^${base_tmpl}" | head -1)"
+    if [ -n "$match" ]; then
+        printf '%s' "$match"
+        return 0
+    fi
+    return 1
+}
+
 # pane_shows_permission_prompt (ga-iog1v / AC1 de ga-q640n): a MESMA situação
 # de transcript CONGELADO cobre dois casos que session_awaiting_human_input()
 # acima não distingue: (a) turno terminou LIMPO (end_turn sem tool pendente,
@@ -1560,22 +1626,38 @@ while IFS='|' read -r bead_id assignee age_secs title labels active_window; do
         # evidence we now hold. Peek ALSO failing changes nothing: falls
         # through to the unchanged AC1/AC4 escalation, exactly as before
         # this fix.
-        transcript_is_advancing "$assignee"
+        #
+        # ga-mq7hd: before probing with the bare alias, try ONE fresh,
+        # independent re-resolution of the gawisp-qualified name — see
+        # resolve_live_session_name() above. If it resolves, the deeper
+        # probes below use the RESOLVED name instead of the bare alias
+        # (probe_name), giving them a real chance to match a session that
+        # the initial batch snapshot missed because it registered mid-pass.
+        # If it doesn't resolve (query failed, or genuinely no match),
+        # probe_name stays the bare alias — byte-identical to the
+        # pre-ga-mq7hd behavior below.
+        probe_name="$assignee"
+        resolved_name="$(resolve_live_session_name "$assignee")"
+        if [ -n "$resolved_name" ]; then
+            probe_name="$resolved_name"
+            sess_status="$sess_status — reconsulta independente resolveu nome qualificado: $resolved_name (ga-mq7hd)"
+        fi
+        transcript_is_advancing "$probe_name"
         case "$?" in
             0)
                 transcript_state="advancing"
-                live_session_name="$assignee"
-                sess_status="$sess_status — checagem direta (gc session logs $assignee) contradiz: transcript ADVANCING (ga-v6ols)"
+                live_session_name="$probe_name"
+                sess_status="$sess_status — checagem direta (gc session logs $probe_name) contradiz: transcript ADVANCING (ga-v6ols)"
                 ;;
             1)
                 transcript_state="frozen"
-                live_session_name="$assignee"
-                sess_status="$sess_status — checagem direta (gc session logs $assignee): transcript CONGELADO (ga-v6ols)"
+                live_session_name="$probe_name"
+                sess_status="$sess_status — checagem direta (gc session logs $probe_name): transcript CONGELADO (ga-v6ols)"
                 ;;
             *)
-                if session_exists_via_peek "$assignee"; then
+                if session_exists_via_peek "$probe_name"; then
                     transcript_state="unknown"
-                    sess_status="$sess_status — checagem direta (gc session peek $assignee) contradiz: sessão EXISTE (ga-5o2mj6)"
+                    sess_status="$sess_status — checagem direta (gc session peek $probe_name) contradiz: sessão EXISTE (ga-5o2mj6)"
                 fi
                 # else: inconclusive on all three reads — no new evidence;
                 # "não-encontrada" stands, escalation path below unchanged

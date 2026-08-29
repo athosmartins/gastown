@@ -94,6 +94,24 @@ case "$1 $2" in
         # stdout — e.g. Dolt unreachable, gc binary crash, timeout.
         exit 1
     fi
+    # ga-mq7hd: some tests need the top-of-script batch scan and a LATER,
+    # independent re-query (resolve_live_session_name()) to see DIFFERENT
+    # results — models a session registering mid-pass, after the initial
+    # batch snapshot already missed it (post-reboot/respawn registration
+    # lag). Only engaged when a test sets SESSIONS_FIXTURE_LATER; every
+    # pre-existing test leaves it unset and gets byte-identical behavior to
+    # before (falls straight through to the unconditional cat below).
+    if [ -n "${SESSIONS_FIXTURE_LATER:-}" ]; then
+        _cf="${SESSIONS_LIST_CALLCOUNT_FILE:-}"
+        _n=0
+        [ -n "$_cf" ] && [ -f "$_cf" ] && _n="$(cat "$_cf" 2>/dev/null || echo 0)"
+        _n=$((_n + 1))
+        [ -n "$_cf" ] && echo "$_n" > "$_cf"
+        if [ "$_n" -ge 2 ]; then
+            cat "$SESSIONS_FIXTURE_LATER"
+            exit 0
+        fi
+    fi
     cat "${SESSIONS_FIXTURE:-/dev/null}"
     exit 0
     ;;
@@ -208,6 +226,7 @@ chmod +x "$SHIM/tmux"
 # ── helpers ───────────────────────────────────────────────────────────────────
 run_script() {
     : > "$ACTIONS"
+    rm -f "$WORK/.gc_session_list_calls"
     GC_CITY_PATH="$WORK/city" \
     GC="$SHIM/gc" \
     BD="$SHIM/bd" \
@@ -216,6 +235,8 @@ run_script() {
     GIT_BIN="${GIT_BIN_OVERRIDE:-git}" \
     BEADS_FIXTURE="${BEADS_FIXTURE:-}" \
     SESSIONS_FIXTURE="${SESSIONS_FIXTURE:-}" \
+    SESSIONS_FIXTURE_LATER="${SESSIONS_FIXTURE_LATER:-}" \
+    SESSIONS_LIST_CALLCOUNT_FILE="$WORK/.gc_session_list_calls" \
     SESSIONS_QUERY_FAIL="${SESSIONS_QUERY_FAIL:-0}" \
     LOGS_FIXTURE_DIR="${LOGS_FIXTURE_DIR:-}" \
     PEEK_FIXTURE_DIR="${PEEK_FIXTURE_DIR:-}" \
@@ -1748,6 +1769,54 @@ rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-fkc1vx-7" "$WORK/city/.gc/
 STUCK_AGENT_SEC=1800 run_script > /dev/null
 assert_absent "$ACTIONS" "mail:mayor" "T80: neither bead escalates"
 log_contains "T80" "2 bead(s) na fila do humano" "T80: RESUMO line reports the count of suppressed beads, not silence"
+
+# ── T81: batch scan misses assignee entirely (stale/lagged snapshot — ───────
+# post-reboot registration lag), AND the bare-alias direct probes
+# (transcript_is_advancing/session_exists_via_peek) ALSO miss, because the
+# live session is actually registered under a gawisp-QUALIFIED name the bare
+# alias never matches (ga-mq7hd — distinct from T40: there, the bare-alias
+# probe itself succeeds; here it structurally cannot, because `gc session
+# logs`/`gc session peek` require the real name, not a prefix). Before this
+# fix, every fallback below the batch scan re-queries with the same bare
+# alias and fails for the identical reason (name mismatch, not death) —
+# "não-encontrada" stands on stale information alone and escalates a
+# genuinely alive, advancing session. This reproduces the exact live
+# incident (mila-wa / mila-wa-gawispc0m7p7, ga-mq7hd) with a fresh,
+# independent re-query (SESSIONS_FIXTURE_LATER) standing in for "the
+# qualified session has registered by the time this bead is evaluated,
+# even though the pass's initial batch snapshot didn't have it yet".
+echo "T81: batch miss + bare-alias probes also miss, but a FRESH independent re-query resolves the gawisp-qualified name and its transcript is ADVANCING → suppressed, not escalated (ga-mq7hd)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"              # initial batch scan: nothing (stale snapshot)
+SESSIONS_FIXTURE_LATER="$WORK/sessions_later.json"
+echo '{"sessions":[{"session_name":"mila-wa-gawispc0m7p7","state":"active"}]}' > "$SESSIONS_FIXTURE_LATER"
+export SESSIONS_FIXTURE_LATER
+make_transcript_fixture mila-wa-gawispc0m7p7 30           # fresh transcript, keyed ONLY to the qualified name
+printf '[%s]' "$(make_bead ga-mq7hd-a mila-wa 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-mq7hd-a"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-mq7hd-a" "T81: no mail — fresh re-query resolves the qualified name, its transcript proves ADVANCING (ga-mq7hd)"
+assert_absent "$ACTIONS" "notify" "T81: no notify — advancing suppresses"
+# NOTE: must NOT grep for the bare substring "ga-mq7hd" here — the bead id
+# itself (ga-mq7hd-a) contains it, so that would pass trivially via the
+# ordinary per-bead log line even with zero fix code. Assert the specific
+# resolution phrase the fix adds instead.
+log_contains "T81" "reconsulta independente resolveu nome qualificado" "T81: log shows the fresh-resolution note naming the resolved session"
+rm -f "$LOGS_FIXTURE_DIR/mila-wa-gawispc0m7p7.json"
+unset SESSIONS_FIXTURE_LATER
+
+# ── T82: same batch miss + bare-alias-probe miss, but the FRESH re-query ────
+# ALSO finds nothing (genuinely dead assignee, confirmed twice independently)
+# → still escalates (ga-mq7hd non-regression — mirrors T15/T27/T42: this fix
+# is strictly MORE resolution, never more suppression; a real dead assignee
+# must not become silently unreachable just because a second lookup exists).
+echo "T82: batch miss + fresh re-query ALSO finds nothing → still escalates (ga-mq7hd non-regression, no over-suppression)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+printf '[%s]' "$(make_bead ga-mq7hd-b thies-wa 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-mq7hd-b"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-mq7hd-b" "T82: escalation still fires — genuinely dead assignee, no over-suppression from the new fresh-lookup path"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
