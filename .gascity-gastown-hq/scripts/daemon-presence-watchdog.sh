@@ -72,6 +72,27 @@ LOG="${DPW_LOG:-/Users/athos/gt/.gascity-gastown-hq/.gc/logs/daemon-presence-wat
 STATE="${DPW_STATE:-/Users/athos/gt/.gascity-gastown-hq/.gc/daemon-presence-state}"
 UID_NUM="$(id -u)"
 DPW_RELOAD="${DPW_RELOAD:-1}"     # 1 = auto-reload absent critical daemons; 0 = alert only.
+
+# ga-4zyex: um daemon PARADO DE PROPOSITO e um daemon quebrado sao identicos
+# daqui — os dois estao simplesmente "nao carregados". Em 2026-08-30 o Athos
+# parou o Pilot com `launchctl disable` para um upgrade de bd/Dolt (que nao
+# tolera escritor concorrente durante migracao de schema) e este watchdog
+# tentou religa-lo no ciclo seguinte — o log dele diz "RELOADED absent critical
+# daemon". So nao reverteu a manutencao porque `disable` persiste e o bootstrap
+# falhou; foi o SO recusando, nao este script sendo cuidadoso.
+#
+# `disable` e justamente o que um operador usa quando quer que fique parado
+# (bootout sozinho nao segura — o job volta em minutos). Entao: disabled =
+# intencional, nao alarma e NAO religa.
+#
+# FAIL-OPEN de proposito: se a propria sonda falhar (launchctl ausente, timeout)
+# devolvemos "nao intencional" e o alarme dispara. Watchdog que emudece porque
+# a checagem dele quebrou e pior que watchdog barulhento.
+_deliberately_disabled() {
+  local lbl="$1"
+  launchctl print-disabled "gui/$UID_NUM" 2>/dev/null \
+    | grep -qE "\"$lbl\" *=> *disabled"
+}
 # 1 = suppress a heartbeat-WEDGE flag when the machine only just booted/woke (the
 # staleness is then attributable to launchd suspending StartInterval timers during
 # system sleep, NOT to a hung daemon); 0 = legacy behaviour (flag regardless).
@@ -878,7 +899,12 @@ run_sweep() {
       newstate="$newstate$lbl absent"$'\n'
       _fail_count_reset "$lbl"   # reset on absence (will be loaded fresh)
       _cl_heal_reset "$lbl"      # imp17: will be reloaded fresh; reset heal counter
-      if [ -f "$plist" ]; then
+      if _deliberately_disabled "$lbl"; then
+        # ga-4zyex: parada deliberada. Nao entra em $absent (nao alarma) e nao
+        # e religado. Logado alto de proposito: silencio aqui viraria "o
+        # watchdog parou de funcionar" na proxima investigacao.
+        log "SKIP $lbl: launchctl-disabled (parada deliberada) — nao alarmo nem religo"
+      elif [ -f "$plist" ]; then
         absent="$absent $lbl"
         if [ "$DPW_RELOAD" = "1" ] && launchctl bootstrap "gui/$UID_NUM" "$plist" 2>/dev/null; then
           reloaded="$reloaded $lbl"

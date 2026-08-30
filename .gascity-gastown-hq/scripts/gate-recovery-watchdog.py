@@ -307,6 +307,47 @@ def sh(args, timeout=20, stdin=None):
         return None
 
 
+def daemon_deliberately_stopped(label):
+    """True when `label` is intentionally down, not broken (ga-4zyex).
+
+    A maintenance stop and a dead daemon look IDENTICAL from the log alone: the
+    log just goes silent. On 2026-08-30 Athos stopped the Pilot on purpose
+    (`launchctl disable` + dogs suspended in city.toml) to run a bd/Dolt
+    upgrade, which cannot tolerate a concurrent writer. This watchdog read the
+    silence as "Pilot may be dead", filed a repair bead, and the repair path's
+    own suggested action is `launchctl kickstart` — which would have REVERTED
+    the maintenance stop. The `disable` held, so nothing broke; but that was
+    the OS refusing us, not this code being careful.
+
+    Two independent signals, either one is sufficient:
+      1. launchctl print-disabled  -> the operator disabled the job. This is
+         the strong one: `disable` persists across bootstraps, which is exactly
+         why an operator reaches for it instead of a bare `bootout`.
+      2. city.toml carries `suspended = true` near the label's agent name —
+         the Gas City-side equivalent for pool agents.
+
+    FAIL-OPEN on purpose: if the probe itself fails (launchctl missing, timeout,
+    unreadable config) we return False and let the alarm fire. A watchdog that
+    goes quiet because its own check broke is worse than a noisy one — same
+    discipline as pilot_stall_verdict's wake-grace.
+    """
+    r = sh(["launchctl", "print-disabled", "gui/%d" % os.getuid()], timeout=10)
+    if r is not None and r.returncode == 0:
+        for line in (r.stdout or "").splitlines():
+            if label in line and "=> disabled" in line:
+                return True
+    try:
+        with open(os.path.join(CITY, "city.toml")) as f:
+            cfg = f.read()
+    except Exception:
+        return False
+    agent = label.rsplit(".", 1)[-1]
+    for blk in cfg.split("[[patches.agent]]"):
+        if agent in blk and re.search(r"^\s*suspended\s*=\s*true", blk, re.M):
+            return True
+    return False
+
+
 def quota_verdict():
     """Ground-truth Claude-quota line for the Mayor's wake-up (ga-wjlv9).
 
@@ -827,6 +868,11 @@ def pilot_jammed():
       (b) stall: pilot log silent > PILOT_STALL_SEC (Pilot dead / not sweeping), unless
           a machine sleep/wake fully explains the silence (ga-m1o5 — see
           pilot_stall_verdict / secs_since_avail)."""
+    # ga-4zyex: a deliberate maintenance stop is silent in the log exactly like
+    # a dead Pilot. Check that FIRST — before any log reading — so the repair
+    # path (whose own remedy is `launchctl kickstart`) can never undo it.
+    if daemon_deliberately_stopped("com.gascity.pilot"):
+        return (False, "")
     try:
         mtime = os.path.getmtime(PILOT_LOG)
     except Exception:
