@@ -255,7 +255,12 @@ max_wakes_per_tick = 2
 # PARA RELIGAR: apague este bloco inteiro e rode `gc reload --soft`.
 # O com.gascity.pilot também foi parado junto (senão ele despacha para um pool
 # suspenso e cada despacho vira slot fantasma — exatamente o ga-owqsg).
-# Religar o Pilot: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gascity.pilot.plist
+# Religar o Pilot (DOIS passos — `bootout` sozinho NAO segura: algo o
+# re-bootstrapa em minutos, observado 30/08; por isso usei `disable`, que
+# persiste no estado do launchd, fora deste repo):
+#   launchctl enable  gui/$(id -u)/com.gascity.pilot
+#   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gascity.pilot.plist
+# Conferir se segue barrado: launchctl print-disabled gui/$(id -u) | grep com.gascity.pilot
 [[patches.agent]]
 name = "gastown.dog"
 suspended = true
