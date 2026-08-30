@@ -16,11 +16,29 @@
 # auto-unblock pass cleared that (also missing the commit), and Pilot
 # dispatched a fresh builder to "fix" a bug already 24 minutes resolved.
 #
-# This harness (1) proves the underlying git --grep mechanism actually
-# resolves a direct-to-main commit by its subject line, including a negative
-# case proving the ^-anchor rejects a commit that merely CITES the id in its
-# BODY rather than being that bead's own delivery, and (2) drift-guards that
-# the live guard source still carries this fallback check.
+# This harness (1) proves the underlying git-log mechanism actually resolves
+# a direct-to-main commit by its subject line, including negative cases
+# proving it rejects a commit that merely CITES the id in its body rather
+# than being that bead's own delivery, and (2) drift-guards that the live
+# guard source still carries this fallback check.
+#
+# ga-8z7jw gate-fix (2026-08-30): attempt 1's find_direct_commit (and the
+# matching code in quality-gate-guard.sh) used a SINGLE git log --grep -E
+# pass and trusted the ^-anchor to restrict matches to the commit's subject
+# line. That claim is FALSE: git's --grep with -E anchors ^ at the start of
+# EVERY line in the (possibly multi-paragraph) commit message, not just the
+# first line. A reviewer proved this with a realistic trigger: GitHub's
+# default squash-and-merge concatenates every squashed commit's own subject
+# line into the resulting squash commit's BODY, so a squash-merged PR that
+# ever contained a commit like "fix(<id>): wip" would mark that bead
+# "delivered" on the squash commit even if the fix was never actually
+# completed. The original BODY_ONLY_ID case below did NOT exercise this —
+# its body text doesn't begin with the tag pattern at a line start, so it
+# fails to match under EITHER single- or multi-line anchor semantics, which
+# gave false confidence. SQUASH_BODY_ID below is the faithful repro, and
+# find_direct_commit is now a two-pass check: --grep only narrows candidates,
+# then each candidate's own subject (via `git log --format=%s`, which never
+# contains embedded newlines) is re-tested before being trusted.
 
 set -uo pipefail
 
@@ -58,6 +76,7 @@ FAKE_ID="ga-v0gj8fake"
 ALT_ID="ga-v0gj8alt"
 BODY_ONLY_ID="ga-v0gj8body"
 NEVER_ID="ga-v0gj8never"
+SQUASH_BODY_ID="ga-v0gj8squash"
 
 # Positive case 1: direct-to-main commit, parens convention (the dominant
 # one: 365/400 sampled commits on the live repo's real origin/main).
@@ -79,9 +98,45 @@ NEVER_ID="ga-v0gj8never"
 
 See also (${BODY_ONLY_ID}) for background, not this commit's own delivery." )
 
+# Negative case 2 (the ACTUAL ga-8z7jw regression case): a squash-merge-
+# shaped commit whose SUBJECT is unrelated, but whose BODY has a line that
+# itself starts with a fix(<id>): tag — exactly what GitHub's default
+# squash-and-merge produces when one of the squashed commits carried that
+# subject. This id was never this commit's own delivery; it's just still
+# sitting in the body. Unlike BODY_ONLY_ID above, this line DOES begin with
+# the tag pattern at its own line-start, so it actually exercises the
+# multi-line ^-anchor hazard.
+( cd "$SRC" && echo four > f4.txt && git add f4.txt \
+  && git commit --quiet -m "chore: unrelated subject line
+
+fix(${SQUASH_BODY_ID}): this id-shaped line lives in the BODY, not the subject" )
+
 MAIN_REF="$(git -C "$SRC" symbolic-ref --short HEAD)"
 
+# The FIXED implementation: mirrors the two-pass check now in
+# quality-gate-guard.sh. Pass 1 (--grep) is only a cheap candidate filter
+# over full messages; pass 2 re-tests the same pattern against ONLY each
+# candidate's own subject line before trusting it.
 find_direct_commit() {
+  local id="$1"
+  local sha subj
+  for sha in $(git -C "$SRC" log "$MAIN_REF" -E \
+      --grep="^[a-z]+\(${id}\):" \
+      --grep="^fix bug ${id}:" \
+      --format=%H 2>/dev/null); do
+    subj=$(git -C "$SRC" log --format=%s -n 1 "$sha" 2>/dev/null)
+    if printf '%s\n' "$subj" | grep -Eq "^[a-z]+\(${id}\):|^fix bug ${id}:"; then
+      printf '%s\n' "$sha"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The OLD (buggy) single-pass implementation from fix-attempt 1 — kept ONLY
+# to prove the SQUASH_BODY_ID repro is real and that the fix above actually
+# closes it, not as behavior under test.
+find_direct_commit_single_pass_buggy() {
   local id="$1"
   git -C "$SRC" log "$MAIN_REF" -E \
     --grep="^[a-z]+\(${id}\):" \
@@ -113,6 +168,20 @@ else
   bad "matched something for an id that has no commit anywhere (should be impossible)"
 fi
 
+echo "── 1b. regression proof: squash-merge body-only tag (ga-8z7jw) ──"
+
+if [ -n "$(find_direct_commit_single_pass_buggy "$SQUASH_BODY_ID")" ]; then
+  ok "repro confirmed: the OLD single-pass --grep DOES match a body-only line (this is the bug ga-8z7jw reported)"
+else
+  bad "could not reproduce the reported bug with the single-pass implementation — repro may be stale, re-verify against the reviewer's report before trusting the fix below"
+fi
+
+if [ -z "$(find_direct_commit "$SQUASH_BODY_ID")" ]; then
+  ok "the FIXED two-pass find_direct_commit correctly rejects the same body-only line (ga-8z7jw closed)"
+else
+  bad "REGRESSION (ga-8z7jw): fixed find_direct_commit still matches a commit via a body-only line — git --grep's ^ anchors every line in the message, not just the subject"
+fi
+
 echo "── 2. drift-guard: live guard source still carries the fallback check ──"
 
 if grep -Fq 'ga-v0gj8' "$GUARD"; then
@@ -131,6 +200,12 @@ if grep -Fq -e '--grep="^fix bug ${GAP2_TRY_ID}:"' "$GUARD"; then
   ok "guard source still has the 'fix bug <id>:' --grep pattern"
 else
   bad "guard source is MISSING the 'fix bug <id>:' --grep pattern (ga-v0gj8 regression)"
+fi
+
+if grep -Fq 'GAP2_CAND_SUBJ' "$GUARD"; then
+  ok "guard source performs the two-pass subject-only re-check (GAP2_CAND_SUBJ) before trusting a --grep candidate"
+else
+  bad "REGRESSION (ga-8z7jw): guard source no longer re-verifies candidates against their own subject line — may have reverted to the single-pass --grep bug"
 fi
 
 if grep -Fq 'GAP2_MERGE_VERIFIED" != "1"' "$GUARD"; then

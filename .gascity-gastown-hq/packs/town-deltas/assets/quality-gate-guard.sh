@@ -3457,25 +3457,44 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
             # 24 minutes after the fix already shipped.
             #
             # Fallback: search origin/main's own history for a commit whose
-            # SUBJECT LINE (the ^ anchor matters — grep against the full
-            # message would also match a commit that merely CITES this id in
-            # its body, e.g. the "(ga-0ndi)"-style inline tags used all over
-            # this file's own history, which is not the same as being that
-            # bead's delivery) opens with a conventional-commit tag naming
-            # this id. Two patterns cover the conventions actually observed
-            # in this repo's history (sampled 2026-08-30, 400 commits):
+            # SUBJECT LINE opens with a conventional-commit tag naming this
+            # id. Two patterns cover the conventions actually observed in
+            # this repo's history (sampled 2026-08-30, 400 commits):
             # `type(<id>):` (365/400 — fix/docs/feat/chore/test) and the
             # rarer parens-free `fix bug <id>:` (5/400, same template Pilot's
             # own dispatch-wisp titles use). A commit reachable from
             # origin/main IS delivered by definition — it needs no side
             # branch to prove it.
+            #
+            # Two-pass, not a single --grep (ga-8z7jw gate-fix, caught before
+            # merge): git's --grep with -E anchors ^ at the start of EVERY
+            # line in the (possibly multi-paragraph) commit MESSAGE, not just
+            # the subject — so a single --grep pass would also match a commit
+            # whose BODY merely cites this id (e.g. the "(ga-0ndi)"-style
+            # inline tags used all over this file's own history) or, worse,
+            # a squash-merge commit whose body concatenates an earlier
+            # "fix(<id>): wip" SUBJECT line from one of the squashed commits
+            # (GitHub's default squash-and-merge does exactly this) — a false
+            # "delivered" verdict for a bead never actually fixed on that
+            # commit. So pass 1 uses --grep only as a cheap candidate filter
+            # across full messages, and pass 2 re-tests the same pattern
+            # against ONLY each candidate's own subject line (%s has no
+            # embedded newlines, so ^ there unambiguously means "start of
+            # subject") before trusting it.
             if [ "$GAP2_MERGE_VERIFIED" != "1" ]; then
               for GAP2_TRY_ID in "$SC_ID" "$SLING_ID"; do
                 [ -n "$GAP2_TRY_ID" ] || continue
-                GAP2_SUBJ_SHA=$(git -C "$GC_CITY" log origin/main -E \
-                  --grep="^[a-z]+\(${GAP2_TRY_ID}\):" \
-                  --grep="^fix bug ${GAP2_TRY_ID}:" \
-                  --format=%H -n 1 2>/dev/null)
+                GAP2_SUBJ_SHA=""
+                for GAP2_CAND_SHA in $(git -C "$GC_CITY" log origin/main -E \
+                    --grep="^[a-z]+\(${GAP2_TRY_ID}\):" \
+                    --grep="^fix bug ${GAP2_TRY_ID}:" \
+                    --format=%H 2>/dev/null); do
+                  GAP2_CAND_SUBJ=$(git -C "$GC_CITY" log --format=%s -n 1 "$GAP2_CAND_SHA" 2>/dev/null)
+                  if printf '%s\n' "$GAP2_CAND_SUBJ" | grep -Eq "^[a-z]+\(${GAP2_TRY_ID}\):|^fix bug ${GAP2_TRY_ID}:"; then
+                    GAP2_SUBJ_SHA="$GAP2_CAND_SHA"
+                    break
+                  fi
+                done
                 if [ -n "$GAP2_SUBJ_SHA" ]; then
                   log "GAP-2: $SC_ID — no branch matched any pattern, but origin/main has a direct commit $GAP2_SUBJ_SHA whose subject names $GAP2_TRY_ID — treating as delivered (ga-v0gj8)"
                   GAP2_MERGE_VERIFIED=1
