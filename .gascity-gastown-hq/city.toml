@@ -69,6 +69,10 @@ pre_start = ["/Users/athos/gt/.gascity-gastown-hq/scripts/claude-credential-pref
 # headless. Same fix as gastown.dog below (provider = claude-headless) — boot
 # had neither that nor any other RC-off protection.
 provider = "claude-headless"
+# wa-cy6we: provider alone isn't reliably enough — see gastown.dog's overlay_dir
+# a few blocks down for the full rationale (undocumented --settings-flag-order
+# race vs. the documented-to-win .claude/settings.json override path).
+overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"
 
 [[patches.agent]]
 dir = ""
@@ -81,6 +85,9 @@ pre_start = ["/Users/athos/gt/.gascity-gastown-hq/scripts/claude-credential-pref
 # headless too — it had no RC-off protection (confirmed via `gc config show`:
 # no provider field resolved for it, unlike gastown.dog/wa-worker/ps-worker).
 provider = "claude-headless"
+# wa-cy6we: same overlay_dir fix as gastown.boot above — provider's --settings
+# flag alone isn't documented as reliably beating the global default.
+overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"
 
 [[patches.agent]]
 dir = ""
@@ -133,6 +140,18 @@ min_active_sessions = 1
 # Path confirmed to resolve via realizePoolDesiredSessions ->
 # resolveTemplateForSessionBead -> prepareTemplateResolution ->
 # materializeProviderOverlaysBeforeFingerprint (cmd/gc/build_desired_state.go).
+# wa-cy6we (Athos, 2026-08-30): this same overlay file now ALSO carries
+# "remoteControlAtStartup": false. The claude-headless PROVIDER's --settings
+# flag (used by dog/gate-reviewer/wa-worker/ps-worker/etc.) was not reliably
+# beating the global ~/.claude/settings.json remoteControlAtStartup=true — the
+# docs don't specify precedence between two --settings CLI flags racing on the
+# same command line, and Athos confirmed live that RC was still auto-connecting
+# for gate reviewers and dogs despite provider=claude-headless being set. This
+# overlay path IS documented as reliable (settings.md, "Exceptions to managed
+# settings precedence": a false from .claude/settings.json or
+# .claude/settings.local.json wins even over a managed/global true) — every
+# agent using this overlay_dir now gets remoteControlAtStartup:false via the
+# guaranteed path, not just the permission-deny rules.
 [[patches.agent]]
 name = "gastown.dog"
 overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"

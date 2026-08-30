@@ -1,42 +1,17 @@
-# gate-reviewer: dedicated cap-exempt reviewer template for the quality gate.
-#
-# Why a separate template?
-#   gastown.dog has max_active_sessions=3, permanently occupied by the dog pool
-#   (dog-1, dog-2, dog-3). The gate spawns up to 3 independent reviewers per run
-#   (CODE tier), which would exhaust the dog cap and deadlock the gate.
-#   This template has its OWN budget, completely separate from the dog pool,
-#   so reviewer sessions never compete with pool workers for slots.
-#
-# Budget rationale:
-#   max_active_sessions=6 = 3 reviewers × 2 concurrent gate runs.
-#   If more concurrent gates are needed, raise this; the gate will hard-fail
-#   (not silently stall) if the cap is ever hit because we no longer suppress
-#   the spawn stderr (ga-mzc3h fix).
-#
-# min_active_sessions=0: no permanent pool workers. Sessions are spawned
-# on-demand by quality-gate-dispatcher.sh and drain when the review completes.
-
-scope = "city"
-min_active_sessions = 0
-max_active_sessions = 6
 idle_timeout = "1h"
-wake_mode = "fresh"
-
-# Model: Sonnet — explicit pin (mirrors refino-gate-reviewer / context-check-reviewer).
-# Code review of a bounded diff is well within Sonnet; pinning it keeps the gate OFF
-# the scarce weekly-Opus budget (24-40h/week) so reviewer spawns never compete with
-# the Mayor/crews for Opus. If the build doesn't honor a per-template `model` key the
-# reviewer still inherits the city default; this makes the Sonnet intent explicit.
+max_active_sessions = 3
+min_active_sessions = 0
 model = "sonnet"
-
-# Remote Control OFF for ephemeral reviewers (bug wa-9ye2).
-# Gas City spawns every claude session with `--settings .gc/settings.json`, which has
-# no remoteControlAtStartup key, so it inherits the global ~/.claude/settings.json
-# (remoteControlAtStartup=true) and the reviewer auto-connects to the human's mobile
-# Claude Code app as "Connected". Reviewers are headless/ephemeral and must NOT.
-# Fix: route this template through the dedicated `claude-headless` provider (defined
-# in city.toml), which appends a second `--settings '{"remoteControlAtStartup":false}'`.
-# Claude Code deep-merges multiple --settings per-key (later wins), so this overrides
-# only RC while preserving every hook/key from .gc/settings.json (verified empirically).
-# Mayor/crew templates keep the default "claude" provider and stay RC ON.
 provider = "claude-headless"
+# wa-cy6we / Athos 2026-08-30 ("toda hora que eu espalho um gate reviewer...
+# ele ta vindo com o controle remoto ligado"): provider=claude-headless alone
+# was NOT enough — it injects remoteControlAtStartup:false via a SECOND
+# --settings CLI flag, and Claude Code's own docs (settings.md, "Exceptions to
+# managed settings precedence") only guarantee that key wins when it comes
+# from .claude/settings.json or .claude/settings.local.json, not from an
+# arbitrary --settings flag racing another one on the same command line.
+# overlay_dir writes it into THIS session's own project-level
+# .claude/settings.json at spawn time — the documented, guaranteed-to-win path.
+overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"
+scope = "city"
+wake_mode = "fresh"

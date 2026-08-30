@@ -3,6 +3,12 @@ max_active_sessions = 2
 min_active_sessions = 0
 model = "sonnet"
 provider = "claude-headless"
+# wa-cy6we: provider=claude-headless alone wasn't reliably beating the global
+# remoteControlAtStartup=true (undocumented ordering between two --settings CLI
+# flags) — see agents/gate-reviewer/agent.toml for the full rationale. overlay_dir
+# writes the override into this session's own .claude/settings.json instead,
+# which Claude Code's docs explicitly guarantee wins.
+overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"
 scope = "city"
 wake_mode = "fresh"
 # ga-tkd2ll: verify the Claude Code credential is usable before this session

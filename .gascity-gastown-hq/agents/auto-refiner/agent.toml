@@ -36,8 +36,19 @@ model = "sonnet"
 # Remote Control OFF for ephemeral refiners (same rationale as the gate reviewer,
 # bug wa-9ye2): headless/ephemeral sessions must NOT auto-connect to the human's
 # mobile Claude Code app. Route through the dedicated claude-headless provider
-# (defined in city.toml) which forces remoteControlAtStartup=false.
+# (defined in city.toml), which appends a --settings flag forcing
+# remoteControlAtStartup=false.
 provider = "claude-headless"
+# wa-cy6we (Athos, 2026-08-30): the provider's --settings flag above turned out
+# NOT reliable on its own — Claude Code's docs don't specify how two --settings
+# CLI flags on the same command line resolve when they race (this session's base
+# launch also appends its own --settings <path>), so the override could lose.
+# overlay_dir instead writes remoteControlAtStartup:false into THIS session's own
+# project-level .claude/settings.json at spawn time, which the docs (settings.md,
+# "Exceptions to managed settings precedence") explicitly guarantee wins even
+# over a managed/global true. Keeping the provider line too (harmless, possibly
+# redundant-but-not-hurting) rather than ripping out a previously-shipped fix.
+overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"
 
 # ga-tkd2ll: verify the Claude Code credential is usable before this session
 # spawns. Shadow mode by default (detects + alerts, never blocks) — see the

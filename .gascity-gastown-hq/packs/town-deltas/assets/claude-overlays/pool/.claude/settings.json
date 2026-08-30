@@ -1,5 +1,6 @@
 {
   "permissions": {
     "deny": ["Bash(sudo:*)", "Bash(rm -rf:*)"]
-  }
+  },
+  "remoteControlAtStartup": false
 }
