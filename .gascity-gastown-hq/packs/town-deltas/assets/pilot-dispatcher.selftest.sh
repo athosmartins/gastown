@@ -7705,6 +7705,56 @@ else
   bad "ga-gdy2kk: expected 2 sites setting status via 'update ... --status in_progress -q', found $FIXED_STATUS_COUNT — one DISPATCH_TASK template may be missing the fix"
 fi
 
+# ── Scenario ga-ycsl9: beads-repo dispatch brief must instruct the builder to
+# label the story bead story:awaiting-external-merge (+ --external-ref) in
+# the SAME step as commenting the PR URL ────────────────────────────────────
+# Bug ga-ycsl9 (4th recurrence: ga-ahnxx, ga-hqchm, dc-6jaq, ga-9sghx): the
+# beads-repo IS_BEADS_REPO_FIX override (DOCTRINE_BLOCK + DISPATCH_STEP5 —
+# consumed via variable substitution by BOTH the bug-tier and feature-tier
+# DISPATCH_TASK heredocs, same single-definition shape as the ga-nxj7kc/
+# ga-gdy2kk scenarios above) told the builder to comment the PR URL and leave
+# $STORY_ID open, but never to apply story:awaiting-external-merge or set
+# --external-ref — the one marker GAP-3 (quality-gate-guard.sh Step 0c.3,
+# ga-jto05) depends on to recognize "already delivered, awaiting upstream
+# review" instead of re-dispatching it as untouched work. Without it, GAP-2's
+# generic branch-not-found check misdiagnoses the still-open bead, Pilot
+# escalates to gate:needs-human, gate-auto-unblock's R1 rule strips the gate
+# labels as an orphan stall, and pilot-missing-route-watchdog re-arms the
+# bead for dispatch — a fresh builder then re-claims already-finished,
+# already CI-green work.
+#
+# Fixed-string match (not a regex) against the literal command text the
+# builder is told to run — since DOCTRINE_BLOCK and DISPATCH_STEP5 are each
+# assigned exactly once and consumed by both DISPATCH_TASK sites, the fixed
+# instruction text must appear exactly twice in the file (once per variable),
+# not zero (missing) and not four (duplicated into each heredoc site
+# directly, which would defeat the single-definition discipline this file
+# already enforces for $_PILOT_ENGINE_REBUILD_RE and friends).
+echo "Scenario ga-ycsl9: beads-repo dispatch brief applies story:awaiting-external-merge + --external-ref"
+
+LABEL_STEP_LITERAL='bd -C \"$STORY_BEAD_CITY\" update \"$STORY_ID\" --add-label story:awaiting-external-merge --external-ref \"<PR URL>\" -q'
+LABEL_STEP_COUNT=$(grep -cF "$LABEL_STEP_LITERAL" "$DISPATCHER")
+if [ "$LABEL_STEP_COUNT" -eq 2 ]; then
+  ok "ga-ycsl9: beads-repo DOCTRINE_BLOCK and DISPATCH_STEP5 both carry the label+external-ref command exactly once each"
+else
+  bad "ga-ycsl9: REGRESSION — expected the label+external-ref command in exactly 2 places (DOCTRINE_BLOCK + DISPATCH_STEP5), found $LABEL_STEP_COUNT"
+fi
+
+grep -qF 'Comment the PR URL on $STORY_ID, then run: bd -C \"$STORY_BEAD_CITY\" update \"$STORY_ID\" --add-label story:awaiting-external-merge' "$DISPATCHER" \
+  && ok "ga-ycsl9: DISPATCH_STEP5 keeps the PR-URL comment step and chains the label step onto the SAME numbered step (a builder cannot do one without seeing the other)" \
+  || bad "ga-ycsl9: DISPATCH_STEP5's beads-repo branch text changed shape — expected the PR-URL-comment instruction immediately followed by the label instruction in the same step"
+
+# Regression guard: the label instruction must be scoped to the beads-repo
+# branch only — it must NOT leak into the normal (gate-done) DISPATCH_STEP5
+# default assigned just above this override (`DISPATCH_STEP5="5. Commit,
+# push, then run /gate-done."` — a normal rig fix must never be told to
+# hand-label story:awaiting-external-merge, that would starve it of a real
+# gate review).
+NORMAL_STEP5_LITERAL='DISPATCH_STEP5="5. Commit, push, then run /gate-done."'
+grep -qF "$NORMAL_STEP5_LITERAL" "$DISPATCHER" \
+  && ok "ga-ycsl9: the normal (non-beads-repo) DISPATCH_STEP5 default is untouched — label instruction stays scoped to the beads-repo branch" \
+  || bad "ga-ycsl9: REGRESSION — the normal DISPATCH_STEP5 default text changed; verify the label instruction did not leak into the non-beads-repo path"
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

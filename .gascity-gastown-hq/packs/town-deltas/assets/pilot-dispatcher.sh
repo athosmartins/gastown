@@ -8117,13 +8117,27 @@ LIVESEC
     YOUR_JOB_LINE="Build this story from acceptance criteria to /gate-done. Do NOT wait for a human."
   fi
   DISPATCH_STEP5="5. Commit, push, then run /gate-done."
+  # ga-ycsl9: the beads-repo override below now also tells the builder to
+  # label $STORY_ID story:awaiting-external-merge + set --external-ref to the
+  # PR URL in the SAME step as commenting it. Before this fix, the brief said
+  # "comment the PR URL and leave the bead open" but never to apply the
+  # marker GAP-3 (quality-gate-guard.sh Step 0c.3, ga-jto05) depends on to
+  # recognize "already delivered, awaiting upstream review" and leave it
+  # alone. Confirmed 4th recurrence (ga-ahnxx, ga-hqchm, dc-6jaq, ga-9sghx):
+  # without the label, GAP-2's generic "no branch found in a registered rig"
+  # check misdiagnoses the still-open bead as unmerged work, Pilot escalates
+  # to gate:needs-human, gate-auto-unblock's R1 rule reads it as an orphan
+  # stall and strips the gate labels, and pilot-missing-route-watchdog
+  # re-arms it for dispatch — a fresh builder then re-claims already-
+  # finished, already CI-green work. This is the only producer of the label;
+  # nothing upstream of dispatch ever wrote it before.
   if [ -n "$IS_BEADS_REPO_FIX" ]; then
     DOCTRINE_BLOCK="## DOCTRINE — read carefully (beads repo — different from normal doctrine)
 - This work lives in the beads CLI's own repo (/Users/athos/gt/beads) — NOT a registered gc rig. /gate-done CANNOT find or merge a branch there. Do not run it.
 - Real path: commit in /Users/athos/gt/beads, push to the fork remote, then gh pr create against upstream. Read the upstream org from: git -C /Users/athos/gt/beads remote get-url origin — do not hardcode an org name, it has been renamed before.
 - This DOES need human review: the PR awaits upstream-maintainer review/merge. It is NOT autonomous.
-- Leave $STORY_ID OPEN. Comment the PR URL on it once opened. Do NOT close the bead — it closes only after the PR merges."
-    DISPATCH_STEP5="5. Commit, push to the fork remote, then gh pr create against upstream (see doctrine above for the exact remote command). Comment the PR URL on $STORY_ID. Do NOT run /gate-done. Do NOT close $STORY_ID — it closes only after the PR merges."
+- Leave $STORY_ID OPEN. Comment the PR URL on it once opened, then label it: bd -C \"$STORY_BEAD_CITY\" update \"$STORY_ID\" --add-label story:awaiting-external-merge --external-ref \"<PR URL>\" -q — without this, the gate/Pilot pipeline reads the open bead as untouched work and re-dispatches it (ga-ycsl9). Do NOT close the bead — it closes only after the PR merges."
+    DISPATCH_STEP5="5. Commit, push to the fork remote, then gh pr create against upstream (see doctrine above for the exact remote command). Comment the PR URL on $STORY_ID, then run: bd -C \"$STORY_BEAD_CITY\" update \"$STORY_ID\" --add-label story:awaiting-external-merge --external-ref \"<PR URL>\" -q (replace <PR URL> with the real URL). Do NOT run /gate-done. Do NOT close $STORY_ID — it closes only after the PR merges."
     YOUR_JOB_LINE="Fix this completely. This work targets the beads CLI's own repo — see DOCTRINE below for the real path (upstream PR, human review required, NOT /gate-done)."
   fi
 
