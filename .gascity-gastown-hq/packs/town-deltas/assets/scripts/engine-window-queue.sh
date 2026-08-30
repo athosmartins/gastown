@@ -62,6 +62,24 @@ label_mode=0
 
 [ -d "$QUEUE" ] || { echo "fila não existe: $QUEUE" >&2; exit 2; }
 
+# 2026-08-29 (variante nova do ga-uayvv): dois dogs stagearam patches em
+# docs/pending-engine-window/ RELATIVO, e o git resolveu contra o TOPLEVEL
+# (~/gt), não contra a city — a fila fragmentou em dois diretórios e este
+# script só via a metade canônica. Os 3 patches perdidos eram exatamente os
+# fixes dos bugs de motor da noite (ga-815mi, ga-owqsg, gt-4qi2t). Não dá pra
+# impedir o próximo dog de errar o caminho; dá pra garantir que o erro APAREÇA:
+# se o diretório-sombra existir e tiver .patch, denuncie alto — a correção é
+# consolidar (git mv pra fila canônica), nunca processar dali.
+STRAY_QUEUE="${ENGINE_WINDOW_STRAY_QUEUE:-/Users/athos/gt/docs/pending-engine-window}"
+if [ -d "$STRAY_QUEUE" ] && [ "$STRAY_QUEUE" != "$QUEUE" ]; then
+  stray_n=$(ls "$STRAY_QUEUE"/*.patch 2>/dev/null | wc -l | tr -d ' ')
+  if [ "${stray_n:-0}" -gt 0 ]; then
+    echo "🚨 FILA FRAGMENTADA: $stray_n .patch em $STRAY_QUEUE (o TOWN ROOT, fora da fila canônica)." >&2
+    echo "   Dogs que escrevem docs/pending-engine-window/ relativo caem ali (gotcha do git toplevel)." >&2
+    echo "   Consolide com: git mv $STRAY_QUEUE/*.patch $QUEUE/ — este script NÃO processa a sombra." >&2
+  fi
+fi
+
 # classify <patch> -> imprime "<binario> <alvos_presentes>/<alvos_totais>"
 # Um módulo só é dono se reconhece TODOS os alvos. Reconhecer alguns é
 # ambiguidade, não vitória — e ambiguidade tem que aparecer, não ser arredondada.
