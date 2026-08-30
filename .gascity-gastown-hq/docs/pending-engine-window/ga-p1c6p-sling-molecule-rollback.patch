@@ -1,0 +1,186 @@
+diff --git a/internal/sling/sling_core.go b/internal/sling/sling_core.go
+index 7e6b06901..de7db35e8 100644
+--- a/internal/sling/sling_core.go
++++ b/internal/sling/sling_core.go
+@@ -322,7 +322,13 @@ func slingOnFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, beadID
+ 		}
+ 		result.WispRootID = wispRootID
+ 		result.FormulaName = opts.OnFormula
+-		return finalize(opts, deps, beadID, method, result)
++		finalResult, finalErr := finalize(opts, deps, beadID, method, result)
++		if finalErr != nil {
++			if rollbackErr := rollbackOrphanedMoleculeAttachment(deps.Store, beadID, wispRootID); rollbackErr != nil {
++				return finalResult, errors.Join(finalErr, rollbackErr)
++			}
++		}
++		return finalResult, finalErr
+ 	}
+ 	runGraph := func() (pendingSourceWorkflowLaunch, error) {
+ 		mResult, err := InstantiateSlingFormula(context.Background(), opts.OnFormula, SlingFormulaSearchPaths(deps, a), molecule.Options{
+@@ -423,7 +429,13 @@ func slingDefaultFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
+ 		}
+ 		result.WispRootID = wispRootID
+ 		result.FormulaName = defaultFormula
+-		return finalize(opts, deps, beadID, method, result)
++		finalResult, finalErr := finalize(opts, deps, beadID, method, result)
++		if finalErr != nil {
++			if rollbackErr := rollbackOrphanedMoleculeAttachment(deps.Store, beadID, wispRootID); rollbackErr != nil {
++				return finalResult, errors.Join(finalErr, rollbackErr)
++			}
++		}
++		return finalResult, finalErr
+ 	}
+ 	runGraph := func() (pendingSourceWorkflowLaunch, error) {
+ 		mResult, err := InstantiateSlingFormula(context.Background(), defaultFormula, SlingFormulaSearchPaths(deps, a), molecule.Options{
+@@ -554,6 +566,28 @@ func finalize(opts SlingOpts, deps SlingDeps, beadID, method string, result Slin
+ 	return result, nil
+ }
+ 
++// rollbackOrphanedMoleculeAttachment undoes a molecule attachment created by
++// InstantiateSlingFormula when the subsequent finalize call (the step that
++// actually routes the bead) fails. Without this, the just-created molecule
++// stays attached via molecule_id with no route ever recorded --
++// checkNoMoleculeChildren's auto-burn only fires for an unassigned parent, so
++// any assigned bead (or a parent whose assignee predates this attempt) hits
++// "already has attached molecule" on retry for a molecule that never routed
++// anything.
++func rollbackOrphanedMoleculeAttachment(store beads.Store, beadID, wispRootID string) error {
++	if store == nil || strings.TrimSpace(wispRootID) == "" {
++		return nil
++	}
++	var rollbackErr error
++	if _, err := molecule.CloseSubtree(store, wispRootID); err != nil {
++		rollbackErr = errors.Join(rollbackErr, fmt.Errorf("closing orphaned molecule %s: %w", wispRootID, err))
++	}
++	if err := store.SetMetadata(beadID, "molecule_id", ""); err != nil {
++		rollbackErr = errors.Join(rollbackErr, fmt.Errorf("clearing molecule_id on %s: %w", beadID, err))
++	}
++	return rollbackErr
++}
++
+ func validateBuiltInRouteStoreReachable(deps SlingDeps, beadID string, a config.Agent) error {
+ 	if deps.Cfg == nil || IsCustomSlingQuery(a) {
+ 		return nil
+diff --git a/internal/sling/sling_test.go b/internal/sling/sling_test.go
+index 9a6bebcf8..ae82165d0 100644
+--- a/internal/sling/sling_test.go
++++ b/internal/sling/sling_test.go
+@@ -1694,11 +1694,12 @@ func TestSlingLaunchFormula(t *testing.T) {
+ 
+ type fakeBeadRouter struct {
+ 	routed []RouteRequest
++	err    error
+ }
+ 
+ func (r *fakeBeadRouter) Route(_ context.Context, req RouteRequest) error {
+ 	r.routed = append(r.routed, req)
+-	return nil
++	return r.err
+ }
+ 
+ func TestSlingRouteBeadWithTypedRouter(t *testing.T) {
+@@ -1802,6 +1803,104 @@ func TestSlingRouteBeadDefaultFormulaRoutesSourceBeadWithTypedRouter(t *testing.
+ 	}
+ }
+ 
++// ga-p1c6p (item 3, sliced from ga-66wc): a sling attempt that successfully
++// attaches a molecule but then fails to route (finalize error) used to leave
++// the molecule attached forever -- checkNoMoleculeChildren's auto-burn only
++// fires when the parent bead is unassigned, so any assigned parent (or one
++// whose assignee predates this attempt) hit "already has attached molecule"
++// on every retry, for a molecule that never routed anything.
++func TestSlingAttachFormulaRollsBackMoleculeOnRouteFailure(t *testing.T) {
++	router := &fakeBeadRouter{err: fmt.Errorf("route backend unavailable")}
++	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
++	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
++	deps.Router = router
++	b, err := deps.Store.Create(beads.Bead{Title: "work", Type: "task", Assignee: "some-stale-assignee"})
++	if err != nil {
++		t.Fatalf("Create: %v", err)
++	}
++
++	s, err := New(deps)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
++	result, err := s.AttachFormula(context.Background(), "code-review", b.ID, a, FormulaOpts{})
++	if err == nil {
++		t.Fatal("AttachFormula error = nil, want route failure to propagate")
++	}
++	if result.WispRootID == "" {
++		t.Fatal("WispRootID is empty -- test didn't reach the molecule-attach step")
++	}
++
++	got, err := deps.Store.Get(b.ID)
++	if err != nil {
++		t.Fatalf("Get(%s): %v", b.ID, err)
++	}
++	if got.Metadata["molecule_id"] != "" {
++		t.Fatalf("molecule_id metadata = %q after failed sling, want cleared by rollback", got.Metadata["molecule_id"])
++	}
++
++	wisp, err := deps.Store.Get(result.WispRootID)
++	if err != nil {
++		t.Fatalf("Get(wisp %s): %v", result.WispRootID, err)
++	}
++	if wisp.Status != "closed" {
++		t.Fatalf("orphaned molecule %s status = %q, want closed", result.WispRootID, wisp.Status)
++	}
++
++	if label, id := FindBlockingMolecule(deps.Store, b.ID, deps.Store); label != "" {
++		t.Fatalf("FindBlockingMolecule = (%q, %q), want no blocker after rollback", label, id)
++	}
++}
++
++// Same bug, other call site: slingDefaultFormula's run() closure had an
++// identical unrolled-back SetMetadata-then-finalize sequence.
++func TestSlingRouteBeadDefaultFormulaRollsBackMoleculeOnRouteFailure(t *testing.T) {
++	router := &fakeBeadRouter{err: fmt.Errorf("route backend unavailable")}
++	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
++	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
++	deps.Router = router
++	deps.Store = seededStore("BL-42")
++	if err := deps.Store.Update("BL-42", beads.UpdateOpts{Assignee: stringPtr("some-stale-assignee")}); err != nil {
++		t.Fatalf("seeding stale assignee: %v", err)
++	}
++
++	s, err := New(deps)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	a := config.Agent{Name: "mayor", DefaultSlingFormula: stringPtr("code-review"), MaxActiveSessions: intPtr(1)}
++	result, err := s.RouteBead(context.Background(), "BL-42", a, RouteOpts{})
++	if err == nil {
++		t.Fatal("RouteBead error = nil, want route failure to propagate")
++	}
++	if result.WispRootID == "" {
++		t.Fatal("WispRootID is empty -- test didn't reach the molecule-attach step")
++	}
++
++	got, err := deps.Store.Get("BL-42")
++	if err != nil {
++		t.Fatalf("Get(BL-42): %v", err)
++	}
++	if got.Metadata["molecule_id"] != "" {
++		t.Fatalf("molecule_id metadata = %q after failed sling, want cleared by rollback", got.Metadata["molecule_id"])
++	}
++
++	wisp, err := deps.Store.Get(result.WispRootID)
++	if err != nil {
++		t.Fatalf("Get(wisp %s): %v", result.WispRootID, err)
++	}
++	if wisp.Status != "closed" {
++		t.Fatalf("orphaned molecule %s status = %q, want closed", result.WispRootID, wisp.Status)
++	}
++
++	if label, id := FindBlockingMolecule(deps.Store, "BL-42", deps.Store); label != "" {
++		t.Fatalf("FindBlockingMolecule = (%q, %q), want no blocker after rollback", label, id)
++	}
++}
++
+ func crossStoreSlingDeps(t *testing.T) (SlingDeps, *fakeBeadRouter, config.Agent) {
+ 	t.Helper()
+ 	router := &fakeBeadRouter{}
