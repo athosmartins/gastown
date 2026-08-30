@@ -3442,6 +3442,47 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
                 GAP2_MERGE_VERIFIED=1; break
               fi
             done
+
+            # ga-v0gj8: the branch-pattern search above assumes every
+            # delivery goes through a named branch first. A fix committed
+            # DIRECTLY to main — no side branch ever created, e.g. a
+            # human/Mayor commit landed on the bead's behalf — matches none
+            # of the PATs above and reads as "not delivered", even though
+            # origin/main already carries it. Confirmed live: ga-4kxdc's fix
+            # (dd2a1e9a3, subject "fix(ga-4kxdc): boot/deacon get
+            # provider=claude-headless (RC-off)") went straight to main with
+            # no fix/feat/.../crew branch ever created; GAP-2 misread the
+            # empty branch search as non-delivery and re-armed
+            # gate:needs-fix, triggering a second wasted builder dispatch
+            # 24 minutes after the fix already shipped.
+            #
+            # Fallback: search origin/main's own history for a commit whose
+            # SUBJECT LINE (the ^ anchor matters — grep against the full
+            # message would also match a commit that merely CITES this id in
+            # its body, e.g. the "(ga-0ndi)"-style inline tags used all over
+            # this file's own history, which is not the same as being that
+            # bead's delivery) opens with a conventional-commit tag naming
+            # this id. Two patterns cover the conventions actually observed
+            # in this repo's history (sampled 2026-08-30, 400 commits):
+            # `type(<id>):` (365/400 — fix/docs/feat/chore/test) and the
+            # rarer parens-free `fix bug <id>:` (5/400, same template Pilot's
+            # own dispatch-wisp titles use). A commit reachable from
+            # origin/main IS delivered by definition — it needs no side
+            # branch to prove it.
+            if [ "$GAP2_MERGE_VERIFIED" != "1" ]; then
+              for GAP2_TRY_ID in "$SC_ID" "$SLING_ID"; do
+                [ -n "$GAP2_TRY_ID" ] || continue
+                GAP2_SUBJ_SHA=$(git -C "$GC_CITY" log origin/main -E \
+                  --grep="^[a-z]+\(${GAP2_TRY_ID}\):" \
+                  --grep="^fix bug ${GAP2_TRY_ID}:" \
+                  --format=%H -n 1 2>/dev/null)
+                if [ -n "$GAP2_SUBJ_SHA" ]; then
+                  log "GAP-2: $SC_ID — no branch matched any pattern, but origin/main has a direct commit $GAP2_SUBJ_SHA whose subject names $GAP2_TRY_ID — treating as delivered (ga-v0gj8)"
+                  GAP2_MERGE_VERIFIED=1
+                  break
+                fi
+              done
+            fi
           else
             warn "GAP-2: $SC_ID — origin/main SHA unreachable — cannot verify merge; treating as NOT verified (fail-safe)"
           fi
