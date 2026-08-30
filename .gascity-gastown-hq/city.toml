@@ -63,6 +63,12 @@ name = "gastown.boot"
 suspended = true
 # ga-tkd2ll: see gastown.mayor's identical entry above for rationale.
 pre_start = ["/Users/athos/gt/.gascity-gastown-hq/scripts/claude-credential-preflight.sh"]
+# ga-4kxdc: boot is autonomous/non-human-attended (spawned by deacon's patrol
+# cycle), not mayor and not a named crew member, so per Athos's 2026-08-30
+# policy ("so o mayor e crew members deveriam ter" Remote Control) it must be
+# headless. Same fix as gastown.dog below (provider = claude-headless) — boot
+# had neither that nor any other RC-off protection.
+provider = "claude-headless"
 
 [[patches.agent]]
 dir = ""
@@ -70,6 +76,11 @@ name = "gastown.deacon"
 suspended = true
 # ga-tkd2ll: see gastown.mayor's identical entry above for rationale.
 pre_start = ["/Users/athos/gt/.gascity-gastown-hq/scripts/claude-credential-preflight.sh"]
+# ga-4kxdc: deacon is an autonomous heartbeat/patrol singleton, not mayor and
+# not a named crew member, so per Athos's 2026-08-30 policy it must be
+# headless too — it had no RC-off protection (confirmed via `gc config show`:
+# no provider field resolved for it, unlike gastown.dog/wa-worker/ps-worker).
+provider = "claude-headless"
 
 [[patches.agent]]
 dir = ""
