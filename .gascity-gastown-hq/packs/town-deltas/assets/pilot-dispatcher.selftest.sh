@@ -983,7 +983,7 @@ echo "Scenario 3e2: a pilot:held bead is excluded from the candidate pool (durab
 _FC_FN="$(grep '^log()' "$DISPATCHER")
 $(sed -n '/^_log_exclusions() {/,/^}$/p' "$DISPATCHER")
 source \"$SELF_DIR/framework-marker-labels.sh\"
-$(awk '/^_FILTER_PREAPPROVAL_LABELS=/{print} /^_FILTER_FRAMEWORK_MARKER_LABELS=/{print} /^_FILTER_RECLAIM_CAP=/{print} /^_PILOT_ENGINE_REBUILD_RE=/{print} /^_filter_candidates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+$(awk '/^_FILTER_PREAPPROVAL_LABELS=/{print} /^_FILTER_FRAMEWORK_MARKER_LABELS=/{print} /^_FILTER_RECLAIM_CAP=/{print} /^_PILOT_ENGINE_REBUILD_RE=/{print} /^_PILOT_ENGINE_REBUILD_NONREQUEST_RE=/{print} /^_filter_candidates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
 # ga-vmn7kv: the awk extraction above CANNOT capture the real dispatcher's
 # `source "$_GC_FML_SIBLING"` line — that line references a variable, not a
 # literal "framework-marker-labels.sh" filename, so no textual grep/awk
@@ -7209,6 +7209,63 @@ PATTERN_LITERAL_COUNT="$(grep -c 'gascity\.\*rebuild|rebuild\.\*gascity|swap\.\*
 [ "$PATTERN_LITERAL_COUNT" = "1" ] \
   && ok "ga-ffop9 AC1: engine-rebuild veto pattern has exactly ONE literal definition in $DISPATCHER (select and reason block both consume it via \$engine_rebuild_re)" \
   || bad "ga-ffop9 AC1: expected exactly 1 literal definition of the veto pattern, found $PATTERN_LITERAL_COUNT — select/reason copies may have re-diverged (got count: $PATTERN_LITERAL_COUNT)"
+
+# ── Scenario ga-j4i3l: engine-rebuild body-text veto must not fire on a bead
+# that only MENTIONS/defers/prohibits the rebuild+swap operation — only on one
+# that PEDE (requests) it now. Measured live (2026-08-29 12:09 sweep): 8 beads
+# excluded by pilot:text-veto:engine-rebuild-text-pattern; every one,
+# individually audited, was doctrine boilerplate, an explicit prohibition, a
+# citation of this exact doctrine text, or — the sharpest case — a pasted
+# `ps aux` capture of an unrelated sessions entire system prompt quoting the
+# doctrine paragraph this pattern family is built from. bd-doctrine-deploy and
+# bd-pasted-prompt below are representative excerpts of the two originally-
+# reported real beads (ga-7sy6j, ga-b5l0v); bd-realrebuild-ctl is the
+# pre-existing bare/undecorated control (same text Scenario ga-w3vn3 already
+# uses) that MUST remain vetoed, proving the fix does not neuter the veto.
+echo "Scenario ga-j4i3l: doctrine-boilerplate/prohibition/citation mentions of engine rebuild survive _filter_candidates; a genuine bare request is still vetoed"
+GAJ4I3L_NONREQUEST='[
+  {"id":"bd-doctrine-deploy","assignee":null,"labels":[],"description":"The real fix belongs in the engine. Deploy: full rebuild (make build in _src-hookfix) + binary swap (/opt/homebrew/bin/gc) + Mayor-coordinated maintenance window — this bead should route to Mayor-coordinated engine work, not back into a pool worker, which would just have to refuse it per pool:refused:engine-rebuild-required doctrine."},
+  {"id":"bd-pasted-prompt","assignee":null,"labels":[],"description":"Achados durante a queda do banco: pid 46392 rodando outra sessao cujo prompt embutido diz Bead pede rebuild+swap do engine gascity? ESCREVA o patch, mas NAO faca o build+swap — doutrina citada dentro do dump de processo colado como evidencia, nao um pedido desta bead."},
+  {"id":"bd-realrebuild-ctl","assignee":null,"labels":[],"description":"requires a full gascity engine rebuild + binary swap + town bounce before this can ship"}
+]'
+GAJ4I3L_OUT="$(_fc "$GAJ4I3L_NONREQUEST" | jq -c 'sort' 2>/dev/null)"
+GAJ4I3L_EXPECT='["bd-doctrine-deploy","bd-pasted-prompt"]'
+[ "$GAJ4I3L_OUT" = "$GAJ4I3L_EXPECT" ] \
+  && ok "ga-j4i3l: doctrine-deploy and pasted-prompt-citation beads survive as candidates; bare co-occurring request still vetoed (got: $GAJ4I3L_OUT)" \
+  || bad "ga-j4i3l: expected $GAJ4I3L_EXPECT, got '$GAJ4I3L_OUT'"
+
+# Reason-trace side (mirrors ga-ffop9 AC2/AC3 exactly): force exclusion for an
+# UNRELATED reason (non-empty assignee — roster_ok defaults to 0 in this
+# extracted-function harness, so any assignee excludes via the ga-46wq5
+# failsafe branch, same technique Scenario 1 already relies on) so the trace
+# line is guaranteed to exist, then check whether it ALSO spuriously reports
+# engine-rebuild-text-pattern despite the negation cue.
+GAJ4I3L_TRACE_FIXTURE='[
+  {"id":"bd-assigned-nonrequest","assignee":"someone","labels":[],"title":"x","description":"Do NOT attempt to build+swap the deployed bd binary citywide. Leave that to whoever merges the PR."},
+  {"id":"bd-assigned-realrebuild","assignee":"someone","labels":[],"description":"requires a full gascity engine rebuild + binary swap + town bounce before this can ship"}
+]'
+GAJ4I3L_TRACE="$(_fc_reason "$GAJ4I3L_TRACE_FIXTURE")"
+NONREQ_LINE="$(printf '%s\n' "$GAJ4I3L_TRACE" | grep 'EXCLUÍDO bd-assigned-nonrequest ')"
+case "$NONREQ_LINE" in
+  *engine-rebuild-text-pattern*)
+    bad "ga-j4i3l reason-trace: bd-assigned-nonrequest STILL reports engine-rebuild-text-pattern despite the negation cue (got: '$NONREQ_LINE')" ;;
+  *assignee*)
+    ok "ga-j4i3l reason-trace: bd-assigned-nonrequest excluded for assignee only, no spurious engine-rebuild-text-pattern (got: '$NONREQ_LINE')" ;;
+  *)
+    bad "ga-j4i3l reason-trace: unexpected/missing trace line for bd-assigned-nonrequest (got: '$NONREQ_LINE')" ;;
+esac
+REALREBUILD_LINE="$(printf '%s\n' "$GAJ4I3L_TRACE" | grep 'EXCLUÍDO bd-assigned-realrebuild ')"
+case "$REALREBUILD_LINE" in
+  *engine-rebuild-text-pattern*) ok "ga-j4i3l reason-trace control: genuine bare request still logs engine-rebuild-text-pattern (real reason not lost; got: '$REALREBUILD_LINE')" ;;
+  *) bad "ga-j4i3l reason-trace control: genuine bare request NO LONGER logs engine-rebuild-text-pattern — real reason lost (got: '$REALREBUILD_LINE')" ;;
+esac
+
+# ── AC1 (structural), same discipline as ga-ffop9 above but for the NEW
+# negation literal: exactly ONE definition in the whole file.
+NONREQ_LITERAL_COUNT="$(grep -c 'do not|don\.t|n\[ãa\]o fa\[çc\]a' "$DISPATCHER")"
+[ "$NONREQ_LITERAL_COUNT" = "1" ] \
+  && ok "ga-j4i3l AC1: engine-rebuild NONREQUEST pattern has exactly ONE literal definition in $DISPATCHER" \
+  || bad "ga-j4i3l AC1: expected exactly 1 literal definition of the nonrequest pattern, found $NONREQ_LITERAL_COUNT (got count: $NONREQ_LITERAL_COUNT)"
 
 # ── Scenario ga-05604.2: durable lane-label write does not gate claim release ──
 # Companion to Scenario 5 (ga-2azzj durable story:in-flight). Before this fix,

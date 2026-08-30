@@ -2188,6 +2188,63 @@ _pilot_hold_or_escalate() {
 # second inline copy anywhere (including here) fails that check on purpose.
 _PILOT_ENGINE_REBUILD_RE='gascity.*rebuild|rebuild.*gascity|swap.*bin[áa]rio|swap.*binary|binary swap|town bounce'
 
+# ga-j4i3l: co-occurring NEGATION/DEFERRAL signal that CANCELS the veto above
+# — same single-literal-definition discipline as $_PILOT_ENGINE_REBUILD_RE
+# (only the select clause and its reason-trace mirror consume this, via the
+# shared $engine_rebuild_nonrequest_re --arg; never re-declare the literal).
+# $_PILOT_ENGINE_REBUILD_RE alone cannot tell a bead that PEDE the rebuild/
+# swap operation NOW from one that only MENCIONA it. Measured live
+# (2026-08-29 12:09 sweep): 8 beads carried pilot:text-veto:engine-rebuild-
+# text-pattern; every one, individually audited (not just the 2 originally
+# reported), was doctrine boilerplate ("Deploy: full rebuild ... + Mayor-
+# coordinated maintenance window" — ga-7sy6j), an explicit prohibition ("Do
+# NOT attempt to build+swap ... Leave that to whoever merges the PR" —
+# ga-7uoua; "do not run `go build` or swap the binary from this bead" —
+# ga-ikr4dh), a citation of this exact doctrine text complete with its own
+# source path ("packs/town-deltas/template-fragments/town-deltas.template.md
+# ... — ga-vhyd" — ga-mww6n), or — the sharpest case — a pasted `ps aux`
+# capture of an UNRELATED session's entire system prompt, which itself
+# quotes the doctrine paragraph this whole pattern family is built from
+# (ga-b5l0v). None of the 8 were a live "do this now" request. Same failure
+# class ga-w3vn3 already fixed for the standalone needs:engine-window label
+# name (mentioning it is not requesting the operation) — this is that same
+# lesson hitting the compound alternatives that survived that fix, via a
+# different vocabulary. Do NOT remove $_PILOT_ENGINE_REBUILD_RE itself over
+# this (ga-j4i3l is explicit: a bead that genuinely asks for the publish act
+# still cannot go to a pool worker) — this variable only cancels the veto
+# when deferral/negation vocabulary co-occurs with it.
+#
+# Deliberately whole-title+description, not windowed/proximate to the
+# match — same scan shape as every other clause in this function. The
+# asymmetry justifies the coarser check: a false negative here self-heals
+# (the dispatched worker refuses per pool:refused:engine-rebuild-required
+# doctrine and the bead gets relabeled, same recovery this veto's own reason
+# block already assumes elsewhere), a false positive does not (the bead is
+# invisible to every dispatch path — ga-j4i3l measured 0 engine-fix beads
+# shipped in ~6h with idle worker capacity in the same window).
+#
+# Length-guarded exactly like $_PILOT_DIAGNOSTIC_ONLY_RE below: an EMPTY
+# pattern (extraction gap — a selftest harness or future refactor that
+# forgot to source this var) must mean "no negation signal available", never
+# "matches everything" — an empty regex matches every string in
+# jq/Oniguruma test(), which here would silently CANCEL the engine-rebuild
+# veto for every candidate, not just fail open on this one guard (the
+# opposite-direction failure from $_PILOT_DIAGNOSTIC_ONLY_RE's own empty-
+# pattern trap, same discipline, opposite polarity — verify both call sites
+# keep the `($re | length) > 0 and (...)` guard shape, never a bare test()).
+#
+# "engine[ -]window"/"pending-engine-window" below are deliberately the same
+# vocabulary ga-w3vn3's comment (further down this file) warns never to
+# re-add to $_PILOT_ENGINE_REBUILD_RE itself — that warning is about the
+# POSITIVE trigger pattern (re-adding it there reintroduces the bare-
+# label-name false-positive ga-w3vn3 fixed). Here, in the NEGATION pattern,
+# the same text serves the opposite, safe function: a bead that already
+# names the correct deferred-patch path is evidence it is not requesting
+# the operation now. Do not "clean up" this alternative by deleting it as a
+# supposed duplicate of the ga-w3vn3 warning — it is a different variable
+# doing the opposite job.
+_PILOT_ENGINE_REBUILD_NONREQUEST_RE='do not|don.t|n[ãa]o fa[çc]a|n[ãa]o fazer|n[ãa]o constru|refuse|per doctrine|per this codebase|mayor[- ]coordinat|engine[ -]window|pending-engine-window|leave that|stop there'
+
 # ga-4lsu7: THE single literal definition of the diagnostic-only-body veto
 # pattern text — _filter_candidates' inline select clause (below) and
 # _TEXT_VETO_PATTERNS (right below this) both consume this ONE value, same
@@ -2221,8 +2278,9 @@ _PILOT_DIAGNOSTIC_ONLY_RE='s[óo] diagn[óo]stico|n[ãa]o prop[õo]e implementa[
 # matching its own clause. Built via jq --arg (not a static literal) so the
 # engine-rebuild/diagnostic-only entries pull from their shared shell vars
 # rather than duplicating the literal (ga-ffop9 above).
-_TEXT_VETO_PATTERNS=$(jq -n --arg engine_re "$_PILOT_ENGINE_REBUILD_RE" --arg diag_re "$_PILOT_DIAGNOSTIC_ONLY_RE" '[
-  {"slug":"engine-rebuild-text-pattern","re":$engine_re},
+_TEXT_VETO_PATTERNS=$(jq -n --arg engine_re "$_PILOT_ENGINE_REBUILD_RE" --arg diag_re "$_PILOT_DIAGNOSTIC_ONLY_RE" \
+    --arg engine_not_re "${_PILOT_ENGINE_REBUILD_NONREQUEST_RE:-}" '[
+  {"slug":"engine-rebuild-text-pattern","re":$engine_re,"not_re":$engine_not_re},
   {"slug":"decisao-title-text-pattern","re":"^\\s*(DECIS[ÃA]O|DECISION)\\b","field":"title"},
   {"slug":"athos-decide-phrase-text-pattern","re":"s[óo] o athos decide"},
   {"slug":"compliance-marker-text-pattern","re":"🚨"},
@@ -2294,7 +2352,21 @@ _reconcile_text_veto_labels() {
       | ("pilot:text-veto:" + $p.slug) as $lbl
       | (if ($p.field // "") == "title" then ($b.title // "")
          else (($b.title // "") + " " + ($b.description // "")) end) as $text
-      | ($text | test($p.re; "i")) as $matches
+      | ($text | test($p.re; "i")) as $pos_match
+      # ga-j4i3l: mirrors the negation cancellation in _filter_candidates
+      # (see $_PILOT_ENGINE_REBUILD_NONREQUEST_RE) so this diagnostic label
+      # can never claim a match the real gate no longer honors — same
+      # single-source-of-truth discipline ga-qt0mj established for this
+      # whole function. Only the engine-rebuild-text-pattern slug carries a
+      # not_re today (the other 4 entries omit the key, so `// ""` degrades
+      # them to a no-op here, same as before this fix).
+      # NOTE: no literal apostrophes anywhere in this comment block — this
+      # jq program is one bash single-quoted argument (caught live writing
+      # this exact fix: a stray apostrophe here silently desynced bash
+      # quote-parsing for everything after it, until bash -n finally choked
+      # far away, near an unrelated Python heredoc — see ga-j4i3l comment).
+      | (if (($p.not_re // "") | length) > 0 then ($text | test($p.not_re; "i")) else false end) as $neg_match
+      | ($pos_match and ($neg_match | not)) as $matches
       | (($L | index($lbl)) != null) as $has
       | if ($matches and ($has | not)) then [$id, "add", $lbl]
         elif ((($matches | not)) and $has) then [$id, "remove", $lbl]
@@ -2519,6 +2591,13 @@ _filter_candidates() {
   # consumer could share it too; this local is just that global under its
   # historical name. Do not reintroduce a second inline literal anywhere.
   local _cf_engine_rebuild_re="$_PILOT_ENGINE_REBUILD_RE"
+  # ga-j4i3l: same local-copy / empty-degrades-safely shape as
+  # _cf_diagnostic_only_re directly below — see $_PILOT_ENGINE_REBUILD_
+  # NONREQUEST_RE above for the false-positive class this cancels (a bead
+  # that MENTIONS/defers/prohibits the rebuild+swap op, not one that PEDE
+  # it) and why an extraction gap must degrade to "no negation signal"
+  # (length-guarded at both consumers below), never to "matches everything".
+  local _cf_engine_rebuild_nonrequest_re="${_PILOT_ENGINE_REBUILD_NONREQUEST_RE:-}"
   # ga-4lsu7: same local-copy-of-the-shared-literal shape as the line above.
   # ${...:-} (not bare $_PILOT_DIAGNOSTIC_ONLY_RE) so a caller that extracts
   # only this function body (e.g. a selftest harness written before this var
@@ -2544,6 +2623,7 @@ _filter_candidates() {
   _cf_out=$(printf '%s' "$_cf_in" | jq --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
      --argjson now_ts "$_now_ts" --argjson reclaim_cap "$_FILTER_RECLAIM_CAP" \
      --arg engine_rebuild_re "$_cf_engine_rebuild_re" \
+     --arg engine_rebuild_nonrequest_re "$_cf_engine_rebuild_nonrequest_re" \
      --arg diagnostic_only_re "$_cf_diagnostic_only_re" \
      --argjson roster_ok "$_cf_roster_ok" --argjson active_owner_ids "$_cf_active_owner_ids_json" \
      --argjson framework_markers "$_FILTER_FRAMEWORK_MARKER_LABELS" \
@@ -2805,9 +2885,22 @@ _filter_candidates() {
         # NOTE: no literal apostrophes in this comment block — it lives
         # inside one bash single-quoted jq argument (see the NOTE further
         # below in this same function for the same reminder).
-        and (((.title // "") + " " + (.description // ""))
-             | test($engine_rebuild_re; "i")
-             | not)
+        # ga-j4i3l: cancel the veto when a co-occurring deferral/negation cue
+        # is present (see $_PILOT_ENGINE_REBUILD_NONREQUEST_RE above) —
+        # mentioning, deferring, or prohibiting the operation is not the same
+        # as requesting it now (ga-w3vn3 already taught this lesson for the
+        # bare label-name case above; this is the same lesson hitting the
+        # compound alternatives that survived that fix). Length-guarded
+        # exactly like $diagnostic_only_re below: empty means no signal,
+        # never match-everything (see the shell-var comment for the outage
+        # that guard avoids). Same no-literal-apostrophes constraint as the
+        # comment block directly above.
+        and (
+          (((.title // "") + " " + (.description // "")) | test($engine_rebuild_re; "i") | not)
+          or
+          (($engine_rebuild_nonrequest_re | length) > 0
+           and (((.title // "") + " " + (.description // "")) | test($engine_rebuild_nonrequest_re; "i")))
+        )
         # ga-xdukc/ga-hd87d: independent safety net (defense-in-depth), same
         # shape as the engine-rebuild veto directly above. A bead whose TITLE
         # BEGINS WITH DECISAO/DECISION, or whose title+description contains
@@ -2894,6 +2987,7 @@ _filter_candidates() {
   printf '%s' "$_cf_in" | jq -r --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
       --argjson now_ts "$_now_ts" --argjson reclaim_cap "$_FILTER_RECLAIM_CAP" --argjson kept "$_cf_kept" \
       --arg engine_rebuild_re "$_cf_engine_rebuild_re" \
+      --arg engine_rebuild_nonrequest_re "$_cf_engine_rebuild_nonrequest_re" \
       --arg diagnostic_only_re "$_cf_diagnostic_only_re" \
       --argjson roster_ok "$_cf_roster_ok" --argjson active_owner_ids "$_cf_active_owner_ids_json" \
       --argjson framework_markers "$_FILTER_FRAMEWORK_MARKER_LABELS" '
@@ -2960,8 +3054,18 @@ _filter_candidates() {
           # ga-ffop9: consumes the SAME $engine_rebuild_re --arg as the select
           # above (single source — see _cf_engine_rebuild_re) — this reason
           # can never again diverge from what actually got the bead excluded.
+          # ga-j4i3l: ALSO consumes the same $engine_rebuild_nonrequest_re
+          # --arg as the select clause above, same reason — a bead the
+          # select no longer excludes (deferral/negation cue present) must
+          # not still be reported here as if it were, or this trace would
+          # misdirect whoever reads the log next (the exact failure mode
+          # ga-ffop9 itself already fixed once for this pair of blocks).
           (if ( ((($b.title // "") + " " + ($b.description // ""))
-                 | test($engine_rebuild_re; "i")) )
+                 | test($engine_rebuild_re; "i"))
+                and ( ($engine_rebuild_nonrequest_re | length) == 0
+                      or ((($b.title // "") + " " + ($b.description // ""))
+                          | test($engine_rebuild_nonrequest_re; "i") | not) )
+              )
            then "engine-rebuild-text-pattern" else empty end),
           (if (($b.title // "") | test("^\\s*(DECIS[ÃA]O|DECISION)\\b"; "i"))
            then "decisao-title-text-pattern"
