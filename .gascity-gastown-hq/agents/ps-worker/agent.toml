@@ -9,7 +9,14 @@
 # PROVIDER: claude-headless (no mobile RC auto-connect — wa-9ye2 pattern).
 work_dir = "/Users/athos/gt/property_scrapers/crew/worker"
 min_active_sessions = 0
-max_active_sessions = 2
+# max_active_sessions: originally 2. Cut to 1 on 2026-08-26 (Athos, multiple
+# choice, ga-xsd03) as part of a citywide pool-ceiling reduction (wa-worker
+# 4->2, gate-reviewer 6->3, ps-worker 2->1) to flatten a macOS swap-ratchet
+# disk crisis that had already stalled the gate. ga-xsd03 closed confirming
+# the cut is live and disk/swap stabilized — see agents/gate-reviewer/
+# agent.toml's ga-5hdsr comment for the full history and how to raise it
+# back once headroom is confirmed healthy again.
+max_active_sessions = 1
 idle_timeout = "2h"
 wake_mode = "fresh"
 model = "sonnet"

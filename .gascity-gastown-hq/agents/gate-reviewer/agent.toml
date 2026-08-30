@@ -15,3 +15,41 @@ provider = "claude-headless"
 overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"
 scope = "city"
 wake_mode = "fresh"
+
+# ga-5hdsr (2026-08-30): max_active_sessions=3 is DELIBERATE, not a
+# regression. Do NOT "restore" it to 6 without re-checking the reasoning
+# below — that was the mistake this investigation almost made.
+#
+# History: this file originally had max_active_sessions=6, justified as
+# "6 = 3 reviewers x 2 concurrent CODE runs". On 2026-08-26, Athos chose
+# (multiple choice, ga-xsd03) to cut pool ceilings citywide — wa-worker
+# 4->2, gate-reviewer 6->3, ps-worker 2->1 — to flatten a macOS swap-ratchet
+# disk crisis that had ALREADY stalled the gate ("swap_free=510MB,
+# ceiling=0 reviewers, 1 marker queued"). ga-xsd03 closed confirming the
+# caps are live and disk/swap stabilized.
+#
+# The other half of the original formula is separately stale too:
+# quality-gate-dispatcher.sh's dynamic-concurrency admission gate
+# (ga-cw4pm) confirms CODE-tier has required exactly 1 reviewer for its
+# entire logged history (3011 runs, 2026-07-23 through today) —
+# GATE_CODE_REVIEWERS was already dropped 3->1 independently of this file.
+# So max_active_sessions now bounds concurrent CODE-tier RUNS directly (1
+# reviewer each), not reviewer-slots-per-run: 3 means up to 3 concurrent
+# gate runs before a 4th hard-fails to spawn (ga-mzc3h: that failure is a
+# visible hard-fail, not a silent stall).
+#
+# Why this comment vanished the first time: ANY `gc agent suspend`/`resume`
+# on this agent decodes the whole file into a bare map and re-encodes it
+# (BurntSushi/toml — no comment support, alphabetizes keys), UNCONDITIONALLY,
+# even on a logical no-op call. That's a separate, already-diagnosed engine
+# bug (ga-gdjav) with a written+tested+committed fix
+# (docs/pending-engine-window/ga-gdjav-agent-toml-comment-preservation.patch,
+# sha 7b1a26088) waiting on a Mayor-scheduled engine window. Until that
+# ships, treat any future comment loss on this file as EXPECTED plumbing
+# damage, not a signal that the value itself was tampered with — check bd
+# (ga-xsd03, ga-gdjav) before re-deriving a "silently reduced" theory from
+# scratch again.
+#
+# To raise this again: confirm swap/disk headroom is healthy (`gc dolt
+# health`, `df`, swapfile count) and that ga-cw4pm's concurrency math still
+# holds, then bump the number AND this comment together.
