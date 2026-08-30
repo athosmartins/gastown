@@ -102,7 +102,7 @@ pre_start = [
 # story and applies to every reference to oracle-wa, not just this one.
 [[patches.agent]]
 name = "gastown.dog"
-max_active_sessions = 3
+max_active_sessions = 6
 
 [[patches.agent]]
 name = "oracle-wa"
@@ -242,3 +242,20 @@ patrol_interval = "120s"
 # refused by dog doctrine — pool:refused:engine-rebuild-required). Follow-up
 # tracked for that half of the fix.
 max_wakes_per_tick = 2
+
+# ── PARADA MANUAL DE MANUTENÇÃO (Athos, 2026-08-30 01:0x) ───────────────────
+# Pedido explícito: parar os workers e NÃO deixar voltarem sozinhos, para a
+# limpeza do backlog de infra e, depois, os upgrades de bd e Dolt (plano de
+# dados — não pode ter escritor concorrente durante a migração de schema).
+#
+# Bloco SEPARADO de propósito: o eval-window-concurrency-guard reescreve as
+# linhas de valor do seu próprio bloco acima; misturar aqui faria o guard
+# apagar isto sem avisar.
+#
+# PARA RELIGAR: apague este bloco inteiro e rode `gc reload --soft`.
+# O com.gascity.pilot também foi parado junto (senão ele despacha para um pool
+# suspenso e cada despacho vira slot fantasma — exatamente o ga-owqsg).
+# Religar o Pilot: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gascity.pilot.plist
+[[patches.agent]]
+name = "gastown.dog"
+suspended = true
