@@ -1,0 +1,50 @@
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 2a33d4e0c..1deb3db18 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -3367,12 +3367,19 @@ func poolDemandLabelFilterJQ() string {
+ 			`| if length > 0 then (max < $now_ts) else false end)) `+
+ 			`| select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) `+
+ 			// ga-5huvs: the PREFIX half of the same three vetoes. blocked:<reason>
++			// ga-87cgp: blocked-reason:<slug> is a SEPARATE family (hyphen, not
++			// colon — e.g. blocked-reason:decision/feasibility, the Sua-vez park
++			// marker from wa-0wvss). startswith("blocked:") does NOT match it, so
++			// a human-parked bead stayed dispatchable and the Pilot held it 3x
++			// with no successor (ga-lfvs6 escalation). One-character gap; both
++			// forms kept explicit rather than a bare startswith("blocked") — the
++			// ga-jfz9t1 lesson: broad prefixes sweep in unrelated sticky labels.
+ 			// and gate:needs-human are open-ended families (the suffix carries the
+ 			// reason), so an exact --exclude-label cannot enumerate them;
+ 			// pilot:refused-reason:* likewise. Kept here rather than in
+ 			// bdReadyPoolDemandExcludeLabelArgs precisely because bd's
+ 			// --exclude-label is exact-match only.
+-			`| select(((.labels // []) | map(select(startswith("blocked:") or startswith("gate:needs-human") or startswith("pilot:refused-reason:"))) | length) == 0) ]`)
++			`| select(((.labels // []) | map(select(startswith("blocked:") or startswith("blocked-reason:") or startswith("gate:needs-human") or startswith("pilot:refused-reason:"))) | length) == 0) ]`)
+ }
+ 
+ // bdReadyPoolDemandMigrationShell is a temporary raw compatibility probe for
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index 66f303e4b..d9ed03770 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -2146,7 +2146,7 @@ func TestPoolDemandLabelFilterJQExcludesParkLabels(t *testing.T) {
+ 	// so it's filtered by bd's own --exclude-label (bdReadyPoolDemandExcludeLabelArgs,
+ 	// covered by TestBdReadyPoolDemandExcludeLabelArgsIncludesEngineWindowAndParkLabels)
+ 	// before this jq filter ever sees the bead, not by poolDemandLabelFilterJQ itself.
+-	input := `[{"id":"blocked-reason","labels":["blocked:external-quota-motherduck"]},{"id":"refused-reason","labels":["pilot:refused-reason:oracle-named-executor"]},{"id":"gate-bare","labels":["gate:needs-human"]},{"id":"gate-suffixed","labels":["gate:needs-human:technical"]},{"id":"blocked-by-survives","labels":["blocked-by:wa-10srb"]},{"id":"clean-survives","labels":["area:infra","lane:small"]}]`
++	input := `[{"id":"blocked-hyphen-family","labels":["blocked-reason:decision/feasibility"]},{"id":"blocked-reason","labels":["blocked:external-quota-motherduck"]},{"id":"refused-reason","labels":["pilot:refused-reason:oracle-named-executor"]},{"id":"gate-bare","labels":["gate:needs-human"]},{"id":"gate-suffixed","labels":["gate:needs-human:technical"]},{"id":"blocked-by-survives","labels":["blocked-by:wa-10srb"]},{"id":"clean-survives","labels":["area:infra","lane:small"]}]`
+ 
+ 	shellCmd := "printf '%s' '" + input + "' | " + poolDemandLabelFilterJQ()
+ 	cmd := exec.Command("sh", "-c", shellCmd)
+@@ -2156,7 +2156,10 @@ func TestPoolDemandLabelFilterJQExcludesParkLabels(t *testing.T) {
+ 	}
+ 
+ 	got := strings.TrimSpace(string(out))
+-	for _, wantAbsent := range []string{`"blocked-reason"`, `"refused-reason"`, `"gate-bare"`, `"gate-suffixed"`} {
++	// ga-87cgp: blocked-reason:<slug> (HYPHEN family, e.g. the Sua-vez park
++	// marker) is not matched by startswith("blocked:") — one-character gap that
++	// kept a human-parked bead dispatchable. Case guards the widened filter.
++	for _, wantAbsent := range []string{`"blocked-hyphen-family"`, `"blocked-reason"`, `"refused-reason"`, `"gate-bare"`, `"gate-suffixed"`} {
+ 		if strings.Contains(got, wantAbsent) {
+ 			t.Errorf("poolDemandLabelFilterJQ() output = %s, must not contain park-labeled id %s", got, wantAbsent)
+ 		}
