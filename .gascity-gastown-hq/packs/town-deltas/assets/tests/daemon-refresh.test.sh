@@ -861,6 +861,40 @@ V=$(field VERDICT "$OUT")
 grep -q "com.test.map-viewer" "$MOCK/kicks.log" 2>/dev/null && ok "T24 kickstart invoked (template change still triggers real restart)" || nok "T24 kickstart" "log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 [ "$(field PROOF "$OUT")" = "verified" ] && ok "T24 PROOF=verified (real restart, not asset_served_per_request)" || nok "T24 proof" "got '$(field PROOF "$OUT")'"
 
+# ════════════════════════════════════════════════════════════════════════════
+# T25 (ga-y108i gate-fix): the no_restart_paths short-circuit must be
+# CWD-independent. POLICY_NO_RESTART_PATHS holds glob-pattern TEXT (e.g.
+# "daemons/static/**"); a bare `for pat in $POLICY_NO_RESTART_PATHS` performs
+# bash pathname expansion on each split word, so a CWD that merely happens to
+# contain a matching subtree (unrelated to RUNTIME_DIR — e.g. an adjacent
+# worktree checkout, or an agent session that cd'd into a rig directory to
+# debug) silently substitutes real filenames for the pattern string, the
+# short-circuit fails to fire, and the deploy falls through to
+# NEEDS_GUARDED_RESTART even though every changed file matches the declared
+# glob. Same fixture as T22 (a *.py entrypoint under the glob, bypassing the
+# unrelated extension-based early-exit so this assertion depends entirely on
+# the short-circuit), but run from a CWD seeded with a colliding
+# daemons/static/ subtree instead of the test runner's own CWD.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t25
+mkdir -p "$RUNTIME/daemons/static"
+cat > "$RUNTIME/daemons/static/serve_static.py" <<<'print("serve")'
+make_plist "$AGENTS" com.test.demand-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/static/serve_static.py"
+seed_running com.test.demand-dashboard 9702 "$STALE_LSTART"
+cat > "$RUNTIME/daemons/restart_policy.yaml" <<'EOF'
+no_restart_paths:
+  - daemons/static/**
+EOF
+COLLIDE_CWD="$CASE_DIR/unrelated_cwd"
+mkdir -p "$COLLIDE_CWD/daemons/static"
+: > "$COLLIDE_CWD/daemons/static/unrelated_file.py"
+OUT=$(cd "$COLLIDE_CWD" && run_helper daemons/static/serve_static.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T25 verdict OK from a CWD with a colliding daemons/static/ subtree (no_restart_paths glob not corrupted by CWD pathname expansion)" || nok "T25 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -eq 0 ] && ok "T25 exit 0" || nok "T25 exit" "rc=$RC"
+[ "$(field PROOF "$OUT")" = "asset_served_per_request" ] && ok "T25 PROOF=asset_served_per_request" || nok "T25 proof" "got '$(field PROOF "$OUT")'"
+[ ! -f "$MOCK/kicks.log" ] && ok "T25 no kickstart called" || nok "T25 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"

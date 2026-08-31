@@ -339,6 +339,16 @@ CHANGED="$(git -C "$RUNTIME_DIR" diff --name-only "$PRE_DEPLOY_SHA" "$POST_DEPLO
 # cases, matching "path not listed -> current behavior, no change").
 if [ -n "${CHANGED// /}" ] && [ -n "${POLICY_NO_RESTART_PATHS// /}" ]; then
   changed_uncovered=""
+  # POLICY_NO_RESTART_PATHS holds glob-pattern TEXT (e.g. "daemons/static/**")
+  # meant to be split on spaces below — but left unquoted, bash also runs
+  # pathname expansion on each split word against the process's ambient CWD
+  # (never RUNTIME_DIR), so a CWD that happens to contain a matching subtree
+  # silently swaps a real filename in for the pattern string and this
+  # short-circuit fails to fire (gate-review finding on ga-y108i, T25).
+  # `set -f` disables that expansion for the split only; the `case` pattern
+  # match just below is unaffected either way — it is shell pattern matching
+  # against a string, never filesystem globbing.
+  set -f
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     covered=0
@@ -348,6 +358,7 @@ if [ -n "${CHANGED// /}" ] && [ -n "${POLICY_NO_RESTART_PATHS// /}" ]; then
     done
     [ "$covered" -eq 1 ] || changed_uncovered="$changed_uncovered $f"
   done <<< "$CHANGED"
+  set +f
   if [ -z "${changed_uncovered// /}" ]; then
     log "every changed file matches restart_policy.yaml's no_restart_paths — OK (content re-read from disk per request; no live process needs a restart)."
     emit OK "all changed files match declared no_restart_paths" asset_served_per_request
