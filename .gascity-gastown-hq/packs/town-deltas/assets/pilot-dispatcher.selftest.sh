@@ -377,6 +377,13 @@ JSON
     # on the HQ TIER2 path (ga-25-hq-tier2-gates). Default [] keeps every other
     # scenario byte-identical to before this seam existed.
     printf '%s' "${FAKE_TIER2_JSON:-[]}" ;;
+  *"--created-after"*)
+    # ga-6psx5: sling orphan-adoption lookup — "did gc sling already create a
+    # bead matching this exact title, despite reporting an unparseable/empty
+    # bead_id?" FAKE_SLING_ORPHAN_JSON lets a scenario inject that bead so the
+    # retry loop's adoption path can be proven; default [] (no orphan found)
+    # keeps every other scenario byte-identical to before this seam existed.
+    printf '%s' "${FAKE_SLING_ORPHAN_JSON:-[]}" ;;
   *)
     printf '[]' ;;                            # tech-debt, tier-2 features, etc.
 esac
@@ -705,7 +712,10 @@ run_dispatch_remerge_with_feedback() { # $1=label
 # Runs a REAL (non-dry) dispatch exercising the sling RETRY path (ga-eu8vr).
 # Sleeps are zeroed so the retry loop is instant. The fake gc sling fails per the
 # injected seams while ALWAYS emitting the benign version_compat warning on stderr.
-run_sling_retry() { # $1=FAKE_SLING_FAIL_TIMES  $2=FAKE_SLING_ALWAYS_FAIL(0|1)
+#   $3 = FAKE_SLING_ORPHAN_JSON (ga-6psx5) — simulates a bead gc sling already
+#        created despite reporting no bead_id; default "" (no orphan) keeps
+#        Scenarios 13a/13b byte-identical to before this param existed.
+run_sling_retry() { # $1=FAKE_SLING_FAIL_TIMES  $2=FAKE_SLING_ALWAYS_FAIL(0|1)  $3=FAKE_SLING_ORPHAN_JSON
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
@@ -725,6 +735,7 @@ run_sling_retry() { # $1=FAKE_SLING_FAIL_TIMES  $2=FAKE_SLING_ALWAYS_FAIL(0|1)
     FAKE_SUPPRESS_INFLIGHT=0 \
     FAKE_SLING_FAIL_TIMES="${1:-0}" \
     FAKE_SLING_ALWAYS_FAIL="${2:-0}" \
+    FAKE_SLING_ORPHAN_JSON="${3:-}" \
     FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
@@ -2552,6 +2563,51 @@ if grep -q "released tt-flight" "$STATE/releases.log" 2>/dev/null; then
   ok "claim released after persistent failure (re-dispatchable next sweep)"
 else
   bad "claim was not released after persistent sling failure"
+fi
+if echo "$LOG13B" | grep -q "ga-6psx5:.*adopting it instead of minting a duplicate"; then
+  bad "REGRESSION (ga-6psx5): orphan-adoption fired with no orphan bead present (false positive)"
+else
+  ok "ga-6psx5 orphan guard stays silent when no matching bead actually exists (negative control)"
+fi
+
+# ── Scenario 13c: sling orphan-adoption — no duplicate when gc sling silently
+# succeeds (ga-6psx5) ─────────────────────────────────────────────────────────
+# Live incident (dc-4v71, 2026-08-31): 6 duplicate "build story dc-4v71" wisp
+# beads were minted in 11 minutes — 3 per sweep, matching this retry loop's own
+# attempt count. gc sling reported "no bead_id" on every attempt, yet a NEW wisp
+# was present as a candidate by the next sweep: gc sling silently created the
+# task bead server-side while its own stdout failed to parse a bead_id, and the
+# blind retry (no idempotency check) minted ANOTHER bead each pass. Because
+# SLING_BEAD_ID stayed empty, pilot.sling_bead was never stamped on the story,
+# so ga-cnvy1's existing live-wrapper dedup guard (which depends on that exact
+# metadata) had nothing to catch on the next sweep either.
+# This scenario simulates the exact symptom: gc sling ALWAYS reports failure
+# (FAKE_SLING_ALWAYS_FAIL=1, so the OLD code would exhaust all 3 retries — see
+# 13b) while a bead matching this dispatch's exact title already exists
+# (FAKE_SLING_ORPHAN_JSON). The fix must adopt it on the FIRST failed attempt —
+# proving no duplicate is minted, not just that dispatch eventually succeeds.
+echo "Scenario 13c: sling adopts an orphaned bead instead of minting a duplicate (ga-6psx5)"
+LOG13C="$(run_sling_retry 0 1 '[{"id":"tt-orphan-1","title":"fix bug tt-flight: Durable in-flight fixture","status":"open","created_at":"2026-08-31T00:00:00Z"}]')"
+if echo "$LOG13C" | grep -q "ga-6psx5:.*adopting it instead of minting a duplicate"; then
+  ok "orphan-adoption path fired when a matching bead already existed"
+else
+  bad "REGRESSION (ga-6psx5): did not adopt the pre-existing orphan bead"
+fi
+if [ -f "$STATE/tt-flight.inflight" ]; then
+  ok "dispatch reached story:in-flight via the adopted orphan (no false abort)"
+else
+  bad "adopting the orphan did not let dispatch proceed to story:in-flight"
+fi
+_sling_calls="$(cat "$STATE/sling_n" 2>/dev/null || echo "?")"
+if [ "$_sling_calls" = "1" ]; then
+  ok "gc sling was invoked exactly once — orphan adoption prevented a 2nd/3rd duplicate mint"
+else
+  bad "REGRESSION (ga-6psx5): gc sling was invoked $_sling_calls times — expected 1 (duplicate still being minted)"
+fi
+if echo "$LOG13C" | grep -q "no bead_id for tt-flight after"; then
+  bad "REGRESSION: fell through to the legacy persistent-failure path despite an adoptable orphan"
+else
+  ok "did not fall through to the legacy 'failed after N attempts' path"
 fi
 
 # ── Scenarios 14: ga-x3nmz Claude 5h-quota back-off ───────────────────────────

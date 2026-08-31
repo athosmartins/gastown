@@ -8731,6 +8731,47 @@ TASK
     SLING_OUT=""
     SLING_BEAD_ID=""
     _sling_attempt=0
+    # ga-6psx5: a "no bead_id" response does NOT prove gc sling created nothing.
+    # Live incident (dc-4v71, 2026-08-31): 6 duplicate "build story dc-4v71" wisp
+    # beads minted in 11 minutes, 3 per sweep — exactly matching this retry
+    # loop's own attempt count. Log evidence showed each sweep's sling call to
+    # dc-4v71 reporting "no bead_id" on every attempt, yet a NEW wisp bead was
+    # present as a candidate by the next sweep — i.e. gc sling silently created
+    # the task bead server-side while its own stdout failed to parse a bead_id,
+    # so the blind retry (no idempotency check) minted ANOTHER bead each pass.
+    # Because SLING_BEAD_ID stayed empty, pilot.sling_bead was never stamped on
+    # the story (see the write below), so ga-cnvy1's existing live-wrapper dedup
+    # guard — which depends on that exact metadata — had nothing to catch on
+    # the following sweep either. Root cause of the *parse* failure is between
+    # gc sling and its stdout contract (outside this script); this guard closes
+    # the multiplication regardless: before logging a retry, check whether a
+    # bead matching THIS dispatch's exact title already exists (created since
+    # this loop started) and adopt it instead of minting a duplicate. Fail-open
+    # (any query/parse error → empty result → unchanged legacy retry behavior).
+    # Set PILOT_SLING_ORPHAN_GUARD=0 to disable.
+    #
+    # gate-fix (verified live against the real bd binary, not just this file's
+    # shim): `bd list --created-after` is a STRICT `>` at 1-SECOND resolution
+    # — a bead created in the SAME second as the boundary value is EXCLUDED
+    # (confirmed empirically: querying --created-after=<a bead's own exact
+    # created_at> returns zero rows for that bead). gc sling's write typically
+    # completes in well under a second, so capturing the boundary as "now"
+    # would miss the very orphan this guard exists to catch in the common
+    # case — silently reproducing the original bug. Back the boundary up by
+    # PILOT_SLING_ORPHAN_LOOKBACK (default 2s, comfortably over the 1s
+    # resolution) using this file's existing `date -u -r <epoch>` idiom
+    # (already used elsewhere in this file — portable on this stack, not a
+    # new assumption). The exact-title match (SLING_TITLE embeds the
+    # globally-unique $STORY_ID) makes a false-positive match from the wider
+    # window practically impossible — the only realistic way to hit it is a
+    # second dispatch attempt for the SAME story within the lookback window,
+    # which the pilot:dispatching claim guard upstream already prevents, and
+    # even then adopting a genuine sibling wisp is the correct outcome, not a
+    # new failure mode.
+    local _sling_loop_started_iso=""
+    if [ "${PILOT_SLING_ORPHAN_GUARD:-1}" = "1" ]; then
+      _sling_loop_started_iso=$(date -u -r "$(( $(date +%s) - ${PILOT_SLING_ORPHAN_LOOKBACK:-2} ))" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
+    fi
     while [ "$_sling_attempt" -lt "$_sling_max" ]; do
       _sling_attempt=$((_sling_attempt + 1))
       # ga-e2n96 AC3: pass the full dispatch prompt via --stdin (first line =
@@ -8747,6 +8788,20 @@ TASK
         2>"$_sling_err_file" || echo "{}")
       SLING_BEAD_ID=$(echo "$SLING_OUT" | jq -r '.bead_id // .id // empty' 2>/dev/null || echo "")
       [ -n "$SLING_BEAD_ID" ] && break
+      if [ -n "$_sling_loop_started_iso" ]; then
+        local _sling_orphan
+        _sling_orphan=$(bd -C "$GC_CITY" list --status open,in_progress \
+            --created-after "$_sling_loop_started_iso" --title "$SLING_TITLE" \
+            --json --limit 5 2>/dev/null \
+          | jq -r --arg t "$SLING_TITLE" \
+              '[.[] | select(.title == $t)] | sort_by(.created_at) | reverse | .[0].id // empty' \
+            2>/dev/null || echo "")
+        if [ -n "$_sling_orphan" ] && [ "$_sling_orphan" != "null" ]; then
+          SLING_BEAD_ID="$_sling_orphan"
+          log "ga-6psx5: gc sling attempt ${_sling_attempt}/${_sling_max} for $STORY_ID returned no bead_id, but a matching bead ($_sling_orphan) already exists (created this attempt) — adopting it instead of minting a duplicate."
+          break
+        fi
+      fi
       if [ "$_sling_attempt" -lt "$_sling_max" ]; then
         log "  gc sling returned no bead_id for $STORY_ID (attempt ${_sling_attempt}/${_sling_max}) — retrying in ${_sling_sleep}s (version_compat warning is benign)"
         [ "${_sling_sleep:-0}" -gt 0 ] 2>/dev/null && sleep "$_sling_sleep"
