@@ -24,6 +24,11 @@
 #      close_reason this script can produce, regardless of REFRESH_PROOF — the
 #      bug was a hardcoded, unconditional claim; this asserts it is gone for good,
 #      not just correctly conditioned in the cases tested above.
+#   H5 (ga-y108i) REFRESH_PROOF=asset_served_per_request → same happy path as
+#      H1/H2: a rig-declared no_restart_paths glob structurally proved the
+#      change needs no restart (daemon-refresh.sh header point 8), so this
+#      must be treated as confirmed, not as an unverified daemon — NO
+#      delivery:daemon-unverified label, "tested in prod" wording unchanged.
 
 set -uo pipefail
 
@@ -103,10 +108,17 @@ echo "$LAST_BD" | grep -qi "NOT VERIFIED" && ok "H3 close_reason says daemon liv
 echo "$LAST_BD" | grep -q "label add ga-test story:done" && ok "H3 story:done still set (labeling honesty, not a new halt)" || nok "H3 story-done" "$LAST_BD"
 
 # H4: the literal false claim can never resurface, in any scenario this file drives.
-for p in verified not_applicable not_verified; do
+for p in verified not_applicable not_verified asset_served_per_request; do
   run_block "$p"
   ! echo "$LAST_BD" | grep -q "verified in prod" && ok "H4 [$p] 'verified in prod' never appears" || nok "H4 [$p]" "$LAST_BD"
 done
+
+# H5 (ga-y108i): REFRESH_PROOF=asset_served_per_request → same happy path as
+# H1/H2 — a no_restart_paths-proven change is confirmed, not unverified.
+run_block asset_served_per_request
+echo "$LAST_BD" | grep -q "label add ga-test delivery:tested" && ok "H5 delivery:tested added" || nok "H5 tested-label" "$LAST_BD"
+! echo "$LAST_BD" | grep -q "delivery:daemon-unverified" && ok "H5 NO delivery:daemon-unverified label" || nok "H5 daemon-unverified" "$LAST_BD"
+echo "$LAST_BD" | grep -q "close ga-test -r.*tested in prod" && ok "H5 close_reason says tested in prod" || nok "H5 close-reason" "$LAST_BD"
 
 echo ""
 echo "story-delivery daemon-proof-honesty tests: $PASS passed, $FAIL failed"

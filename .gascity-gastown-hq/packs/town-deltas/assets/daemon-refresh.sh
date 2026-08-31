@@ -63,6 +63,29 @@
 #      than the changed file, which would make an mtime check lie; DEPLOY_EPOCH
 #      is a process-clock timestamp tied to the deploy event itself, compared
 #      only against the live PID's own start time (never a file path).
+#   8. (ga-y108i) Complementary to point 7's "is the PROCESS fresh?" question:
+#      "does this CHANGE need a restart AT ALL?" A rig can declare, in its own
+#      restart_policy.yaml, a global no_restart_paths: [glob, ...] list (e.g.
+#      ["daemons/static/**"]) naming paths a daemon re-reads from disk on
+#      EVERY request — a live process serving one is never stale, so its age
+#      is irrelevant (real incident: a commit touching only daemons/static/
+#      demand_previsao.js flagged the SENSITIVE demand-dashboard daemon for a
+#      guarded restart; verified by hand that the live-served md5 already
+#      matched the merged blob under the pre-merge PID — restarting would have
+#      changed nothing). Checked FIRST, against the FULL raw changed-file set
+#      (Step 1, before the *.py/template split below) — when EVERY changed
+#      file matches a declared glob, this emits OK/asset_served_per_request
+#      immediately, before daemon discovery or SENSITIVE/GUARDED classification
+#      ever run. Path-based, deliberately NOT extension- or directory-guessed:
+#      a *.py helper can be just as exemptable as a *.js file if the RIG says
+#      so (e.g. a module that only proxies static bytes), and the reverse
+#      holds too — this same rig's templates/ genuinely DOES need a restart
+#      (Jinja is compiled+cached at import, point 3/ga-jkj0), so a
+#      no_restart_paths glob covering only static/ must never accidentally
+#      swallow templates/. A partially-covered changed set (even one file
+#      outside every declared glob) does NOT exempt anything — falls straight
+#      through to today's classification. An undeclared/absent key is a pure
+#      no-op: identical to pre-ga-y108i behavior.
 #
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
@@ -81,6 +104,14 @@
 #                     (no source changed, no rig daemons exist at all, or the
 #                     only daemon(s) tied to the change have no live PID to
 #                     begin with — e.g. a scheduled job, not a dormant one).
+#   asset_served_per_request (ga-y108i) — a stronger, path-proven refinement
+#                     of not_applicable: every changed file matched a
+#                     rig-declared restart_policy.yaml no_restart_paths glob
+#                     (header point 8), so the content is structurally proven
+#                     safe rather than merely un-flagged by extension. Callers
+#                     must treat it identically to verified/not_applicable
+#                     (never as not_verified) — see story-delivery.sh and
+#                     quality-gate-dispatcher.sh's own PROOF case arms.
 #   not_verified   — everything else: environment prevented checking (not a
 #                     git work tree), or changed code could not be confidently
 #                     tied to any live daemon by this script's (documented,
@@ -94,13 +125,14 @@
 #   WOULD_RESTART=<labels>   (ga-omfwe: DRY_RUN=1 only — labels that would be
 #     restarted for real; RESTARTED is always empty under DRY_RUN=1, so the
 #     two never collapse into the same string)
-#   REASON=<text>   PROOF=verified|not_applicable|not_verified
+#   REASON=<text>   PROOF=verified|not_applicable|asset_served_per_request|not_verified
 # Exit 0 when VERDICT is OK/SKIPPED (or DRY_RUN=1); non-zero otherwise.
 #
 # Inputs (env):
 #   RUNTIME_DIR       deployed git work tree (e.g. /Users/athos/gt/whatsapp_automation)
 #                     (ga-ylr2m) if $RUNTIME_DIR/daemons/restart_policy.yaml
-#                     exists, it is consulted directly — see header point 6.
+#                     exists, it is consulted directly — see header point 6
+#                     (and point 8/ga-y108i for its no_restart_paths key).
 #   PRE_DEPLOY_SHA    HEAD before deploy
 #   POST_DEPLOY_SHA   HEAD after deploy
 #   DEPLOY_EPOCH      unix epoch captured immediately before deploy
@@ -146,7 +178,9 @@ log() { echo "[daemon-refresh] $*" >&2; }
 # ── restart_policy.yaml consultation (ga-ylr2m) ───────────────────────────────
 # See header point 6. Parsed once, up front, into space-separated .py-basename
 # lists (POLICY_AUTO / POLICY_DEPLOY_RESTART / POLICY_NOTIFY_ONLY_LOCKED) plus
-# a "daemon.py=script/relpath" pair list (POLICY_GUARDS). Three distinct states,
+# a "daemon.py=script/relpath" pair list (POLICY_GUARDS) plus a space-separated
+# glob-pattern list (POLICY_NO_RESTART_PATHS — ga-y108i, header point 8).
+# Three distinct states,
 # kept distinct on purpose (self-audit finding — "not found" and "found but
 # unreadable" must NOT collapse to the same value just because both end up with
 # empty POLICY_* lists):
@@ -169,7 +203,7 @@ log() { echo "[daemon-refresh] $*" >&2; }
 #                           again. This can only ADD caution vs. the no-file
 #                           case, never silently fall back to it.
 RESTART_POLICY_YAML="$RUNTIME_DIR/daemons/restart_policy.yaml"
-POLICY_AUTO=""; POLICY_DEPLOY_RESTART=""; POLICY_NOTIFY_ONLY_LOCKED=""; POLICY_GUARDS=""; POLICY_PARSE_OK=""
+POLICY_AUTO=""; POLICY_DEPLOY_RESTART=""; POLICY_NOTIFY_ONLY_LOCKED=""; POLICY_GUARDS=""; POLICY_NO_RESTART_PATHS=""; POLICY_PARSE_OK=""
 if [ -f "$RESTART_POLICY_YAML" ]; then
   eval "$(python3 - "$RESTART_POLICY_YAML" <<'PY' 2>/dev/null
 import re, shlex, sys
@@ -239,6 +273,7 @@ if policy is not None:
     print("POLICY_AUTO=" + shlex.quote(strlist("auto")))
     print("POLICY_DEPLOY_RESTART=" + shlex.quote(strlist("deploy_restart")))
     print("POLICY_NOTIFY_ONLY_LOCKED=" + shlex.quote(strlist("notify_only_locked")))
+    print("POLICY_NO_RESTART_PATHS=" + shlex.quote(strlist("no_restart_paths")))
     guards = policy.get("restart_guard_scripts") or {}
     if isinstance(guards, dict):
         pairs = " ".join(f"{d}={s}" for d, s in guards.items()
@@ -294,6 +329,31 @@ fi
 
 # ── Step 1: changed files in this deploy ──────────────────────────────────────
 CHANGED="$(git -C "$RUNTIME_DIR" diff --name-only "$PRE_DEPLOY_SHA" "$POST_DEPLOY_SHA" 2>/dev/null || true)"
+
+# (ga-y108i, header point 8) no_restart_paths short-circuit — checked against
+# the FULL raw changed set, before the *.py/template split below, so it also
+# covers a *.py (or any other extension) file living under a declared path.
+# Only engages when the rig's restart_policy.yaml declares the key AND
+# parsed successfully (POLICY_NO_RESTART_PATHS stays "" on no file, an
+# unparseable file, or an undeclared key — identical no-op in all three
+# cases, matching "path not listed -> current behavior, no change").
+if [ -n "${CHANGED// /}" ] && [ -n "${POLICY_NO_RESTART_PATHS// /}" ]; then
+  changed_uncovered=""
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    covered=0
+    for pat in $POLICY_NO_RESTART_PATHS; do
+      # shellcheck disable=SC2254  # deliberate glob match, not literal
+      case "$f" in $pat) covered=1; break ;; esac
+    done
+    [ "$covered" -eq 1 ] || changed_uncovered="$changed_uncovered $f"
+  done <<< "$CHANGED"
+  if [ -z "${changed_uncovered// /}" ]; then
+    log "every changed file matches restart_policy.yaml's no_restart_paths — OK (content re-read from disk per request; no live process needs a restart)."
+    emit OK "all changed files match declared no_restart_paths" asset_served_per_request
+  fi
+fi
+
 CHANGED_PY="$(echo "$CHANGED" | grep -E '\.py$' || true)"
 CHANGED_TEMPLATES="$(echo "$CHANGED" | grep -E '\.(html|htm|jinja2?|j2)$' || true)"
 if [ -z "$CHANGED_PY" ] && [ -z "$CHANGED_TEMPLATES" ]; then

@@ -1714,12 +1714,15 @@ else
 
   # ga-vmq1i: was the daemon actually serving this deploy ever confirmed live?
   # Orthogonal to which prod-test path ran below — apply to both branches.
-  # Only "verified" (positive restart+fresh) and "not_applicable" (structurally
-  # nothing live to check) may stay silent; everything else gets an explicit,
-  # queryable label so "delivery:tested" alone can never be read as "daemon
-  # confirmed live" the way the bug's own incident (wa-3dfnw) was misread.
+  # Only "verified" (positive restart+fresh), "not_applicable" (structurally
+  # nothing live to check), and (ga-y108i) "asset_served_per_request" (a
+  # rig-declared no_restart_paths glob structurally proved the change safe —
+  # see daemon-refresh.sh header point 8) may stay silent; everything else
+  # gets an explicit, queryable label so "delivery:tested" alone can never be
+  # read as "daemon confirmed live" the way the bug's own incident (wa-3dfnw)
+  # was misread.
   case "$REFRESH_PROOF" in
-    verified|not_applicable) : ;;
+    verified|not_applicable|asset_served_per_request) : ;;
     *) bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:daemon-unverified" -q 2>/dev/null || true ;;
   esac
 
@@ -1755,9 +1758,11 @@ NOTE: $DONE_NOTE" 2>/dev/null || true
     # "deployed + tested in prod" wrongly implied both. Only override wording
     # when daemon liveness was NOT positively confirmed and there genuinely was
     # something live to check (not_applicable — e.g. no daemon serves this
-    # change at all — keeps the wording above, since nothing false is claimed).
+    # change at all — keeps the wording above, since nothing false is claimed;
+    # ga-y108i's asset_served_per_request is the same shape — a stronger,
+    # policy-proven not_applicable, see daemon-refresh.sh header point 8).
     case "$REFRESH_PROOF" in
-      verified|not_applicable) : ;;
+      verified|not_applicable|asset_served_per_request) : ;;
       *) DONE_PUSH_TAIL="deployed (rig harness passed); DAEMON LIVENESS NOT VERIFIED — merged code may still be dormant, see delivery:daemon-unverified" ;;
     esac
     bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery COMPLETE. story:done (delivery:tested).

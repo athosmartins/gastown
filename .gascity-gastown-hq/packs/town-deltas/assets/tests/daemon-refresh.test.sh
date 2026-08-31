@@ -36,6 +36,16 @@
 #      never reports PROOF=verified — it reports the preview in WOULD_RESTART
 #      instead, so a dry-run preview can never be textually indistinguishable
 #      from a real, confirmed restart.
+#  11. (ga-y108i) A rig-declared restart_policy.yaml no_restart_paths glob
+#      (e.g. daemons/static/**) short-circuits to VERDICT=OK/
+#      PROOF=asset_served_per_request — never NEEDS_GUARDED_RESTART, even for
+#      a SENSITIVE daemon — when EVERY changed file matches, whether the
+#      match is on a *.js asset (T21) or the daemon's own *.py entrypoint
+#      (T22, the stronger proof: bypasses the extension-based early-exit
+#      entirely). A partially-covered mixed diff does NOT exempt (T23), and
+#      an unrelated path (templates/, still genuinely restart-needed per
+#      point 6/ga-jkj0) is never accidentally swallowed by an unrelated glob
+#      (T24).
 #
 # All external effects (launchctl, ps) are injected via LAUNCHCTL_BIN / PS_BIN
 # and a mock state dir, so the test touches NO real daemons. The plist scan and
@@ -738,6 +748,118 @@ V=$(field VERDICT "$OUT")
 [ "$RC" -eq 0 ] && ok "T20 exit 0" || nok "T20 exit" "rc=$RC"
 echo "$OUT" | grep -q "com.test.broken-only.plist could not be parsed" && ok "T20 WARN names the broken plist" || nok "T20 warn" "no distinguishing WARN in output: [$OUT]"
 [ "$(field PROOF "$OUT")" = "not_verified" ] && ok "T20 PROOF=not_verified (discovery incomplete, not confirmed-empty — pre-fix bug: this was not_applicable, indistinguishable from a genuinely empty dir)" || nok "T20 proof" "got '$(field PROOF "$OUT")'"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T21 (ga-y108i): a SENSITIVE hot-path daemon, currently STALE, whose deploy
+# touched ONLY a file under a rig-declared no_restart_paths glob (a static
+# asset a handler re-reads from disk on every request — never needs a
+# restart to serve new bytes). Must emit OK with PROOF=asset_served_per_request
+# instead of flagging NEEDS_GUARDED_RESTART — the real incident this closes:
+# a commit touching only daemons/static/demand_previsao.js flagged the
+# demand-dashboard daemon (policy-unlisted → sensitive) and mailed the Mayor;
+# the restart was proven pointless by hand (live-served md5 already matched
+# the merged blob, pre-merge PID still running). The changed file here is
+# *.js — not *.py/template — so a pre-fix run already reaches VERDICT=OK via
+# the unrelated extension-based early-exit; the assertion that actually
+# distinguishes pre/post-fix is PROOF (not_applicable pre-fix vs. the more
+# specific asset_served_per_request post-fix). T22 below is the stronger
+# proof that does not depend on that early-exit at all.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t21
+cat > "$RUNTIME/daemons/demand_dashboard.py" <<<'print("demand")'
+make_plist "$AGENTS" com.test.demand-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/demand_dashboard.py"
+seed_running com.test.demand-dashboard 9601 "$STALE_LSTART"
+cat > "$RUNTIME/daemons/restart_policy.yaml" <<'EOF'
+no_restart_paths:
+  - daemons/static/**
+EOF
+OUT=$(run_helper daemons/static/demand_previsao.js); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T21 verdict OK (static asset under no_restart_paths)" || nok "T21 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -eq 0 ] && ok "T21 exit 0" || nok "T21 exit" "rc=$RC"
+[ "$(field PROOF "$OUT")" = "asset_served_per_request" ] && ok "T21 PROOF=asset_served_per_request" || nok "T21 proof" "got '$(field PROOF "$OUT")'"
+[ ! -f "$MOCK/kicks.log" ] && ok "T21 no kickstart called" || nok "T21 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T22 (ga-y108i): stronger proof than T21 — the changed file IS the daemon's
+# own *.py entrypoint (so pre-fix this reaches AFFECTED/SENSITIVE/GUARDED via
+# the normal direct-match *.py path, NOT the extension-based early-exit T21
+# also passes through), but that entrypoint lives under a declared
+# no_restart_paths glob (a static-file server that only ever proxies bytes
+# from disk). The declaration is deliberately PATH-based, not
+# extension-based, per the bug's own caution: a *.py helper can be just as
+# exemptable as a *.js file. Must be OK/asset_served_per_request, never
+# NEEDS_GUARDED_RESTART.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t22
+mkdir -p "$RUNTIME/daemons/static"
+cat > "$RUNTIME/daemons/static/serve_static.py" <<<'print("serve")'
+make_plist "$AGENTS" com.test.demand-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/static/serve_static.py"
+seed_running com.test.demand-dashboard 9701 "$STALE_LSTART"
+cat > "$RUNTIME/daemons/restart_policy.yaml" <<'EOF'
+no_restart_paths:
+  - daemons/static/**
+EOF
+OUT=$(run_helper daemons/static/serve_static.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T22 verdict OK (entrypoint *.py under no_restart_paths, not flagged)" || nok "T22 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -eq 0 ] && ok "T22 exit 0" || nok "T22 exit" "rc=$RC"
+[ "$(field PROOF "$OUT")" = "asset_served_per_request" ] && ok "T22 PROOF=asset_served_per_request" || nok "T22 proof" "got '$(field PROOF "$OUT")'"
+[ ! -f "$MOCK/kicks.log" ] && ok "T22 no kickstart called" || nok "T22 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T23 (ga-y108i): partial coverage must NOT exempt — a MIXED deploy where one
+# changed file matches no_restart_paths (a static asset) and a SEPARATE
+# changed file does not (the daemon's own *.py entrypoint, elsewhere in the
+# tree). The whole changed set must be covered, not just one file in it —
+# otherwise an innocuous static-asset tweak riding along in the same commit
+# as a real logic change would wrongly suppress a needed guarded-restart flag.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t23
+mkdir -p "$RUNTIME/daemons/static"
+cat > "$RUNTIME/daemons/frota_dashboard.py" <<<'print("frota")'
+make_plist "$AGENTS" com.test.frota-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/frota_dashboard.py"
+seed_running com.test.frota-dashboard 9801 "$STALE_LSTART"
+cat > "$RUNTIME/daemons/restart_policy.yaml" <<'EOF'
+no_restart_paths:
+  - daemons/static/**
+EOF
+OUT=$(run_helper daemons/static/some_asset.js daemons/frota_dashboard.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T23 verdict NEEDS_GUARDED_RESTART (mixed diff, entrypoint change NOT covered by no_restart_paths)" || nok "T23 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -ne 0 ] && ok "T23 non-zero exit" || nok "T23 exit" "rc=$RC"
+echo "$(field GUARDED "$OUT")" | grep -q "com.test.frota-dashboard" && ok "T23 flagged GUARDED despite one covered file in the same diff" || nok "T23 guarded" "$(field GUARDED "$OUT")"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T24 (ga-y108i): a declared no_restart_paths glob must be PRECISE — it must
+# NOT accidentally cover an unrelated path. This same rig's Jinja templates
+# ARE compiled/cached at import (ga-jkj0) and still genuinely need a restart
+# even though daemons/static/** is separately declared no-restart. A changed
+# template (rendered by an explicitly-SAFE daemon) must still restart
+# normally when it does not match the declared glob.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t24
+cat > "$RUNTIME/daemons/map_viewer_dashboard.py" <<'PYEOF'
+from flask import render_template
+def index():
+    return render_template("map_viewer.html")
+PYEOF
+mkdir -p "$RUNTIME/templates"
+cat > "$RUNTIME/templates/map_viewer.html" <<<'<html>old</html>'
+make_plist "$AGENTS" com.test.map-viewer "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/map_viewer_dashboard.py"
+seed_running com.test.map-viewer 9901 "$STALE_LSTART"
+seed_restart com.test.map-viewer 9999 "$FRESH_LSTART"
+cat > "$RUNTIME/daemons/restart_policy.yaml" <<'EOF'
+auto:
+  - map_viewer_dashboard.py
+no_restart_paths:
+  - daemons/static/**
+EOF
+OUT=$(run_helper templates/map_viewer.html); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T24 verdict OK after real restart (no_restart_paths glob correctly does not cover templates/)" || nok "T24 verdict" "got '$V' out=[$OUT]"
+grep -q "com.test.map-viewer" "$MOCK/kicks.log" 2>/dev/null && ok "T24 kickstart invoked (template change still triggers real restart)" || nok "T24 kickstart" "log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+[ "$(field PROOF "$OUT")" = "verified" ] && ok "T24 PROOF=verified (real restart, not asset_served_per_request)" || nok "T24 proof" "got '$(field PROOF "$OUT")'"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""

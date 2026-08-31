@@ -5221,11 +5221,14 @@ PYEOF
                 # root-class:error-vs-empty (ga-vmq1i's own distinction, reused
                 # here): VERDICT=OK does not by itself mean daemon liveness was
                 # POSITIVELY confirmed — PROOF disambiguates. Only surface the
-                # soft warning when proof is neither "verified" nor
-                # "not_applicable" (never silently claim confidence the helper
-                # itself didn't have); never block the close on this alone.
+                # soft warning when proof is none of "verified", "not_applicable"
+                # or (ga-y108i) "asset_served_per_request" — a rig-declared
+                # no_restart_paths glob structurally proved the change safe,
+                # same evidentiary strength as not_applicable (never silently
+                # claim confidence the helper itself didn't have); never block
+                # the close on this alone.
                 case "$DR_PROOF" in
-                  verified|not_applicable) : ;;
+                  verified|not_applicable|asset_served_per_request) : ;;
                   *) DAEMON_SOFT_WARN="$DR_VERDICT ($DR_REASON, proof=$DR_PROOF)" ;;
                 esac
                 ;;
