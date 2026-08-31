@@ -6,23 +6,46 @@
 #
 # ga-574zr: the only thing that had EVER polled PR #5439 for review activity
 # was an ACCIDENT — a dog's Step 1a resume hook kept re-finding an in_progress
-# bead and re-checking it as a side effect of retrying its own dispatch. When
-# that bead was correctly moved out of in_progress (ga-e5tn8, a real fix for
-# an unrelated false-positive stall alarm), the accidental polling stopped
-# with it. Measured same day: 3 of our own upstream PRs (#5439, #5479, #5470)
-# sitting open with ZERO durable watcher. This script is the deliberate
-# replacement — built on purpose, not a side effect of something else.
+# bead and re-checking it as a side effect of retrying its own dispatch. This
+# script (v1) was the deliberate replacement, built around a hand-maintained
+# PR_BEAD_MAP.
+#
+# ga-se0ly (v2, this rewrite): the v1 map was a NEW instance of the same
+# disease it was built to cure. Measured 2026-08-31: 4 of 6 open PRs had NO
+# entry in PR_BEAD_MAP (never added — "add a line here" was a step nobody
+# remembered), and one entry (#5439 -> wa-msxg5 only) missed that ga-5ksp5
+# ALSO depended on the same PR and so never got its own merge notification —
+# a static map can only ever alert the bead(s) someone remembered to write
+# in, in either direction (new PR opened, or a second bead added later for an
+# already-tracked PR). v2 replaces the map with a live scan, each sweep, of
+# every registered rig (`gc rig list`) for beads labeled `waiting-on:pr-<N>`
+# (the convention already used by ga-9sghx/ga-xcq1ph/etc.) — so a bead
+# becomes a tracker the moment it's labeled, no code edit required, and BOTH
+# directions get a durable watcher:
+#   (a) a tracked PR transitions to MERGED/CLOSED while its bead(s) are still
+#       open — alerts EVERY matching bead across every city, not just one.
+#   (b) an OPEN PR by $GH_AUTHOR has NO bead anywhere carrying its
+#       `waiting-on:pr-<N>` label — alerts the Mayor to open one (or close
+#       the PR) — the direction v1 could never see at all, since it can only
+#       enumerate PRs someone already told it about.
 #
 # What it does:
 #   - One `gh pr list --repo gastownhall/beads --author athosmartins --state
-#     all` call per sweep, diffed against a persisted per-PR state file.
+#     all` call per sweep.
+#   - discover_tracker_beads() scans every city from `gc rig list --json`
+#     (falling back to $BUPW_FALLBACK_CITIES if that fails) for beads with
+#     ANY status (--all — a tracker can legitimately be `deferred`, e.g.
+#     ga-r8haw's self-clearing pool-visibility park, and still be the
+#     correct, current tracker) carrying a `waiting-on:pr-<N>` label.
 #   - Alerts ONLY on a state TRANSITION (previously-recorded state != current
 #     state) — never on a persisting state. An alert that fires every sweep
-#     regardless of change teaches people to ignore it.
-#   - On transition to MERGED or CLOSED (without merging): comments on the
-#     PR's mapped tracker bead (PR_BEAD_MAP below) and mails the Mayor. Merge
-#     means the next step (engine rebuild+swap) needs his coordination; a
-#     close-without-merge means a human should decide whether to resubmit.
+#     regardless of change teaches people to ignore it. Same rule for orphan
+#     alerts: once alerted for a given PR#, no repeat until a bead appears
+#     (resolved) or disappears again (re-alertable).
+#   - On transition to MERGED or CLOSED (without merging): comments on EVERY
+#     mapped tracker bead and mails the Mayor. Merge means the next step
+#     (engine rebuild+swap) needs his coordination; a close-without-merge
+#     means a human should decide whether to resubmit.
 #   - A PR observed for the FIRST time (no prior state) that is ALREADY
 #     merged/closed also alerts immediately — "no prior baseline" must not be
 #     silently folded into "nothing changed"; those are different states (see
@@ -53,21 +76,55 @@ BD_BIN="${BD_BIN:-bd}"
 GC_BIN="${GC_BIN:-gc}"
 LOG="${BUPW_LOG:-$HQ/.gc/logs/beads-upstream-pr-watchdog.log}"
 STATE="${BUPW_STATE:-$HOME/.gastown/state/beads-upstream-pr-watchdog.state.json}"
+# Used ONLY if `gc rig list` itself fails outright (e.g. gc not on PATH or a
+# transient Dolt blip) — not a hardcoded substitute for it; gc rig list is
+# always tried first every sweep. Degrading to "scan what we know about"
+# beats "scan nothing and report a false orphan for every open PR."
+BUPW_FALLBACK_CITIES="${BUPW_FALLBACK_CITIES:-$HQ}"
 
 ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || true; echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
 
-# PR number -> tracker bead + the bead's OWN city. wa-* beads live in the
-# whatsapp_automation rig's own bead DB, not HQ's — `bd show` without the
-# right -C returns "no issue found", not a loud error you'd notice from exit
-# code alone. Add a line here whenever a new upstream PR needs tracking.
-PR_BEAD_MAP='
-[
-  {"pr": 5439, "bead": "wa-msxg5", "city": "/Users/athos/gt/whatsapp_automation"},
-  {"pr": 5479, "bead": "wa-msxg5", "city": "/Users/athos/gt/whatsapp_automation"},
-  {"pr": 5470, "bead": "ga-7uoua", "city": "/Users/athos/gt/.gascity-gastown-hq"}
-]
-'
+# discover_cities -> one bd-DB path per line to scan for tracker beads.
+# Dynamic on purpose: a hardcoded rig list would reproduce the exact bug this
+# rewrite fixes (see PR_BEAD_MAP's history in git blame) — a new rig must be
+# visible here without a code change.
+discover_cities() {
+  local rigs
+  rigs=$("$GC_BIN" rig list --json 2>>"$LOG" | jq -r '.rigs[]?.path // empty' 2>/dev/null)
+  if [ -z "$rigs" ]; then
+    log "WARN: gc rig list returned no cities — falling back to \$BUPW_FALLBACK_CITIES ($BUPW_FALLBACK_CITIES)"
+    printf '%s\n' "$BUPW_FALLBACK_CITIES"
+    return
+  fi
+  printf '%s\n' "$rigs"
+}
+
+# discover_tracker_beads -> TSV: pr_num<TAB>bead_id<TAB>city — one row per
+# (PR, bead) pair found by scanning every city for the `waiting-on:pr-<N>`
+# label convention (precedent: ga-9sghx, ga-xcq1ph). Scans --all statuses
+# deliberately: a tracker bead can legitimately be non-"open" (e.g.
+# `deferred`, see ga-r8haw) while still being the correct, current tracker —
+# filtering to status=open would reproduce this rewrite's own bug. A PR MAY
+# have more than one tracker bead, in one city or across several; all are
+# returned so every one gets alerted (v1's single PR->bead map could only
+# ever notify one — part of what ga-se0ly reported: ga-5ksp5 never heard
+# about PR #5439 merging because only wa-msxg5 was in the map for it).
+discover_tracker_beads() {
+  local city rows
+  while IFS= read -r city; do
+    [ -z "$city" ] && continue
+    rows=$("$BD_BIN" -C "$city" list --all --label-pattern 'waiting-on:pr-*' --json --limit 0 2>>"$LOG")
+    if [ -z "$rows" ] || ! printf '%s' "$rows" | jq -e '.' >/dev/null 2>&1; then
+      continue
+    fi
+    printf '%s' "$rows" | jq -r --arg city "$city" '
+      .[] as $b |
+      (($b.labels // [])[] | select(startswith("waiting-on:pr-"))) as $lbl |
+      [($lbl | ltrimstr("waiting-on:pr-")), $b.id, $city] | @tsv
+    ' 2>>"$LOG"
+  done < <(discover_cities)
+}
 
 # classify_pr_transition <prev_state> <cur_state>
 #   -> first-seen | merged | closed-no-merge | reopened | no-change | unknown
@@ -96,27 +153,48 @@ classify_pr_transition() {
   esac
 }
 
-# Both _alert_* functions return 0 only if EVERY notification channel
-# succeeded, 1 if any failed. The caller (run_sweep) uses this to decide
-# whether the transition is truly "handled" — see the state-advance comment
-# below for why that distinction matters.
+# _alert_merge / _alert_closed_no_merge take a NEWLINE-separated "bead\tcity"
+# list (one PR can have several tracker beads) and comment on every one, plus
+# a single Mayor mail. Both return 0 only if EVERY notification channel
+# succeeded (all bead comments AND the mail), 1 if any failed. The caller
+# (run_sweep) uses this to decide whether the transition is truly "handled"
+# — see the state-advance comment below for why that distinction matters.
 _alert_merge() {
-  local pr_num="$1" url="$2" bead_id="$3" bead_city="$4" msg ok=0
-  msg="beads-upstream-pr-watchdog (ga-574zr): upstream PR $url (gastownhall/beads #$pr_num, author $GH_AUTHOR) is now MERGED. Next step (engine rebuild+swap) needs Mayor coordination — this bead does not close itself."
-  printf '%s' "$msg" | "$BD_BIN" -C "$bead_city" comment "$bead_id" --stdin >>"$LOG" 2>&1 \
-    || { ok=1; log "WARN: bd comment failed for $bead_id (PR #$pr_num)"; }
+  local pr_num="$1" url="$2" pairs="$3" msg ok=0 bead_id bead_city
+  msg="beads-upstream-pr-watchdog (ga-574zr/ga-se0ly): upstream PR $url (gastownhall/beads #$pr_num, author $GH_AUTHOR) is now MERGED. Next step (engine rebuild+swap) needs Mayor coordination — this bead does not close itself."
+  while IFS=$'\t' read -r bead_id bead_city; do
+    [ -z "$bead_id" ] && continue
+    printf '%s' "$msg" | "$BD_BIN" -C "$bead_city" comment "$bead_id" --stdin >>"$LOG" 2>&1 \
+      || { ok=1; log "WARN: bd comment failed for $bead_id (PR #$pr_num)"; }
+  done <<<"$pairs"
   "$GC_BIN" mail send mayor -s "Upstream PR merged: gastownhall/beads #$pr_num" -m "$msg" >>"$LOG" 2>&1 \
     || { ok=1; log "WARN: gc mail send failed for PR #$pr_num"; }
   return "$ok"
 }
 
 _alert_closed_no_merge() {
-  local pr_num="$1" url="$2" bead_id="$3" bead_city="$4" msg ok=0
-  msg="beads-upstream-pr-watchdog (ga-574zr): upstream PR $url (gastownhall/beads #$pr_num, author $GH_AUTHOR) was CLOSED WITHOUT merging. A human should decide whether to resubmit or abandon."
-  printf '%s' "$msg" | "$BD_BIN" -C "$bead_city" comment "$bead_id" --stdin >>"$LOG" 2>&1 \
-    || { ok=1; log "WARN: bd comment failed for $bead_id (PR #$pr_num)"; }
+  local pr_num="$1" url="$2" pairs="$3" msg ok=0 bead_id bead_city
+  msg="beads-upstream-pr-watchdog (ga-574zr/ga-se0ly): upstream PR $url (gastownhall/beads #$pr_num, author $GH_AUTHOR) was CLOSED WITHOUT merging. A human should decide whether to resubmit or abandon."
+  while IFS=$'\t' read -r bead_id bead_city; do
+    [ -z "$bead_id" ] && continue
+    printf '%s' "$msg" | "$BD_BIN" -C "$bead_city" comment "$bead_id" --stdin >>"$LOG" 2>&1 \
+      || { ok=1; log "WARN: bd comment failed for $bead_id (PR #$pr_num)"; }
+  done <<<"$pairs"
   "$GC_BIN" mail send mayor -s "Upstream PR closed without merge: gastownhall/beads #$pr_num" -m "$msg" >>"$LOG" 2>&1 \
     || { ok=1; log "WARN: gc mail send failed for PR #$pr_num"; }
+  return "$ok"
+}
+
+# _alert_orphan: the direction v1 could never detect (see header). Mails the
+# Mayor only — deliberately does NOT auto-create a bead. Fabricating a bead
+# from a PR title with no other context risks a low-quality duplicate if the
+# real tracker exists but uses different wording; a human decision here is
+# cheap and safer (ga-se0ly's own text: "NAO precisa ser sofisticado").
+_alert_orphan() {
+  local pr_num="$1" url="$2" title="$3" msg ok=0
+  msg="beads-upstream-pr-watchdog (ga-se0ly): upstream PR $url (gastownhall/beads #$pr_num: \"$title\", author $GH_AUTHOR) is OPEN with NO tracking bead found in any scanned city. Open one (label story:awaiting-external-merge + waiting-on:pr-$pr_num, external_ref=$url) or close the PR if it is no longer wanted."
+  "$GC_BIN" mail send mayor -s "Upstream PR has no tracking bead: gastownhall/beads #$pr_num" -m "$msg" >>"$LOG" 2>&1 \
+    || { ok=1; log "WARN: gc mail send failed for orphan PR #$pr_num"; }
   return "$ok"
 }
 
@@ -134,41 +212,54 @@ run_sweep() {
     return 0
   fi
 
-  local prev_state
-  prev_state=$(cat "$STATE" 2>/dev/null || echo '{}')
-  printf '%s' "$prev_state" | jq -e '.' >/dev/null 2>&1 || prev_state='{}'
-  local new_state="$prev_state"
+  local raw_state
+  raw_state=$(cat "$STATE" 2>/dev/null || echo '{}')
+  printf '%s' "$raw_state" | jq -e '.' >/dev/null 2>&1 || raw_state='{}'
+  # Schema: {"prs": {"<num>": {state, checked_at}}, "orphans_alerted": {"<num>": {alerted_at}}}.
+  # A pre-ga-se0ly state file (flat "<num>": {...} at the top level, no "prs"
+  # key) migrates transparently: treat the whole object as the prs map and
+  # start orphans_alerted empty.
+  local prev_prs prev_orphans
+  prev_prs=$(printf '%s' "$raw_state" | jq -c 'if has("prs") then .prs else . end')
+  prev_orphans=$(printf '%s' "$raw_state" | jq -c '.orphans_alerted // {}')
+  local new_prs="$prev_prs"
+  local new_orphans="$prev_orphans"
   local tracked_count=0 event_count=0
 
-  local pr_num bead_id bead_city
-  while IFS=$'\t' read -r pr_num bead_id bead_city; do
+  local tracker_rows tracked_pr_nums
+  tracker_rows=$(discover_tracker_beads)
+  tracked_pr_nums=$(printf '%s' "$tracker_rows" | cut -f1 | sort -u)
+
+  local pr_num
+  while IFS= read -r pr_num; do
     [ -z "$pr_num" ] && continue
 
-    local cur cur_state cur_url prev_pr_state action handled
+    local cur cur_state cur_url prev_pr_state action handled pairs
     cur=$(printf '%s' "$all_prs" | jq -c --argjson n "$pr_num" '[.[] | select(.number == $n)][0] // empty')
     if [ -z "$cur" ]; then
-      log "PR #$pr_num (author=$GH_AUTHOR) not found in this sweep's result — safe-skip (may be outside --limit=$GH_LIMIT; widen BUPW_GH_LIMIT if this persists)"
+      log "PR #$pr_num tracked by bead(s) but not found in this sweep's gh result — safe-skip (may be outside --limit=$GH_LIMIT, or authored by someone else; widen BUPW_GH_LIMIT if this persists)"
       continue
     fi
     cur_state=$(printf '%s' "$cur" | jq -r '.state')
     cur_url=$(printf '%s' "$cur" | jq -r '.url')
-    prev_pr_state=$(printf '%s' "$prev_state" | jq -r --arg k "$pr_num" '.[$k].state // "UNKNOWN"')
+    prev_pr_state=$(printf '%s' "$prev_prs" | jq -r --arg k "$pr_num" '.[$k].state // "UNKNOWN"')
+    pairs=$(printf '%s' "$tracker_rows" | awk -F'\t' -v n="$pr_num" '$1==n {print $2"\t"$3}')
 
     tracked_count=$((tracked_count + 1))
     action=$(classify_pr_transition "$prev_pr_state" "$cur_state")
-    # "handled" gates whether new_state advances below. A transition whose
-    # alert only partially succeeded (e.g. bd comment landed but the Mayor
-    # mail failed on a transient Dolt/network blip) must NOT be recorded as
-    # done — advancing the state here would permanently silence the retry,
-    # since transition-only alerting means classify_pr_transition() would see
-    # MERGED->MERGED ("no-change") on every future sweep and never speak
+    # "handled" gates whether new_prs advances below. A transition whose
+    # alert only partially succeeded (e.g. one bd comment landed but the
+    # Mayor mail failed on a transient Dolt/network blip) must NOT be
+    # recorded as done — advancing here would permanently silence the retry,
+    # since transition-only alerting means classify_pr_transition() would
+    # see MERGED->MERGED ("no-change") on every future sweep and never speak
     # again. Leaving prev_pr_state untouched costs one duplicate alert
     # (visible, cheap) in exchange for never silently losing one.
     handled=1
     case "$action" in
       merged)
-        log "TRANSITION: PR #$pr_num $prev_pr_state -> $cur_state (merged) — alerting bead=$bead_id"
-        if _alert_merge "$pr_num" "$cur_url" "$bead_id" "$bead_city"; then
+        log "TRANSITION: PR #$pr_num $prev_pr_state -> $cur_state (merged) — alerting bead(s)=$(printf '%s' "$pairs" | cut -f1 | paste -sd, -)"
+        if _alert_merge "$pr_num" "$cur_url" "$pairs"; then
           event_count=$((event_count + 1))
         else
           handled=0
@@ -176,8 +267,8 @@ run_sweep() {
         fi
         ;;
       closed-no-merge)
-        log "TRANSITION: PR #$pr_num $prev_pr_state -> $cur_state (closed, no merge) — alerting bead=$bead_id"
-        if _alert_closed_no_merge "$pr_num" "$cur_url" "$bead_id" "$bead_city"; then
+        log "TRANSITION: PR #$pr_num $prev_pr_state -> $cur_state (closed, no merge) — alerting bead(s)=$(printf '%s' "$pairs" | cut -f1 | paste -sd, -)"
+        if _alert_closed_no_merge "$pr_num" "$cur_url" "$pairs"; then
           event_count=$((event_count + 1))
         else
           handled=0
@@ -189,7 +280,7 @@ run_sweep() {
         event_count=$((event_count + 1))
         ;;
       first-seen)
-        log "BASELINE: PR #$pr_num first seen at state=$cur_state (bead=$bead_id) — no prior watcher to compare against, recording only"
+        log "BASELINE: PR #$pr_num first seen at state=$cur_state (bead(s)=$(printf '%s' "$pairs" | cut -f1 | paste -sd, -)) — no prior watcher to compare against, recording only"
         ;;
       no-change) ;;
       *)
@@ -199,10 +290,37 @@ run_sweep() {
     esac
 
     if [ "$handled" = "1" ]; then
-      new_state=$(printf '%s' "$new_state" | jq --arg k "$pr_num" --arg s "$cur_state" --arg t "$(ts)" \
+      new_prs=$(printf '%s' "$new_prs" | jq --arg k "$pr_num" --arg s "$cur_state" --arg t "$(ts)" \
         '.[$k] = {state: $s, checked_at: $t}')
     fi
-  done < <(printf '%s' "$PR_BEAD_MAP" | jq -r '.[] | [.pr, .bead, .city] | @tsv')
+  done <<<"$tracked_pr_nums"
+
+  # ── Orphan sweep (case b): an OPEN PR by $GH_AUTHOR with ZERO tracker bead
+  # in ANY scanned city — the direction a hand-maintained map can never see,
+  # since it can only enumerate PRs someone already told it about.
+  local open_pr_nums n o_url o_title
+  open_pr_nums=$(printf '%s' "$all_prs" | jq -r '.[] | select(.state=="OPEN") | .number')
+  while IFS= read -r n; do
+    [ -z "$n" ] && continue
+    if printf '%s\n' "$tracked_pr_nums" | grep -qx "$n"; then
+      # Now has a tracker -> clear any stale orphan-alert record so a FUTURE
+      # re-orphaning (e.g. the tracker bead gets deleted) can alert again.
+      new_orphans=$(printf '%s' "$new_orphans" | jq --arg k "$n" 'del(.[$k])')
+      continue
+    fi
+    if printf '%s' "$prev_orphans" | jq -e --arg k "$n" 'has($k)' >/dev/null 2>&1; then
+      continue
+    fi
+    o_url=$(printf '%s' "$all_prs" | jq -r --argjson n "$n" '[.[] | select(.number==$n)][0].url')
+    o_title=$(printf '%s' "$all_prs" | jq -r --argjson n "$n" '[.[] | select(.number==$n)][0].title')
+    log "ORPHAN: PR #$n is OPEN with no tracker bead in any scanned city — alerting"
+    if _alert_orphan "$n" "$o_url" "$o_title"; then
+      event_count=$((event_count + 1))
+      new_orphans=$(printf '%s' "$new_orphans" | jq --arg k "$n" --arg t "$(ts)" '.[$k] = {alerted_at: $t}')
+    else
+      log "WARN: PR #$n orphan alert failed — will retry next sweep"
+    fi
+  done <<<"$open_pr_nums"
 
   # Unconditional per-sweep line, even when nothing changed: on a log that
   # only ever writes on notable events, a daemon that silently stopped
@@ -212,7 +330,8 @@ run_sweep() {
   log "sweep complete: $tracked_count tracked PR(s), $event_count event(s)"
 
   mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
-  printf '%s' "$new_state" > "$STATE" 2>/dev/null || log "WARN: failed to write state file $STATE"
+  jq -n --argjson prs "$new_prs" --argjson orph "$new_orphans" '{prs: $prs, orphans_alerted: $orph}' \
+    > "$STATE" 2>/dev/null || log "WARN: failed to write state file $STATE"
 }
 
 # ── Single-instance lock ────────────────────────────────────────────────────
