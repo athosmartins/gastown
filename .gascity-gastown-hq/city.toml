@@ -164,6 +164,30 @@ overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"
 name = "ps-worker"
 overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"
 
+# ga-ymrx1 (31/08): valor REVERTIDO para 900000 -- o mesmo que o global do
+# Athos (~/.claude/settings.json). NAO baixe de volta para 300000 lendo o
+# racional do ga-kjncp abaixo: ele esta preservado como historico, nao como
+# estado desejado.
+# O que o ga-kjncp nao mediu: o CONTEXTO BASE de um papel de vida longa desta
+# cidade (system prompt + CLAUDE.md global + CLAUDE.md do projeto + MEMORY.md +
+# skills + hooks) e de ~260K tokens. Com o gatilho em 300K, a sessao NASCE com
+# 87% do orcamento ja gasto: compacta, volta em ~260K, e compacta de novo em 1-2
+# turnos. Nao e "compactar mais vezes", e um LOOP -- a sessao gasta quase todo
+# turno reconstruindo o resumo e quase nenhum trabalhando. Medido ao vivo em
+# 31/08 na sessao do batista-wa: "26.0% (260k/1000k)" com "4% until
+# auto-compact" logo apos uma compactacao (print enviado pelo Athos).
+# A economia projetada do ga-kjncp (~600M tokens) supunha turnos uteis; num loop
+# de compactacao o overhead de ~22M/sessao deixa de ser ruido e o trabalho util
+# tende a zero. O bloco do ga-kjncp abaixo previu exatamente esta condicao de
+# reversao ("If a long-lived role starts visibly losing the thread of multi-hour
+# work, that is the signal to raise this number back up") -- ela foi atingida.
+# Decisao do Athos, 31/08, verbatim da opcao escolhida em AskUserQuestion na
+# sessao do Mayor 7be28417: "900k em todos os 7 -- sua ordem vale igual",
+# tomada COM o custo (~600M tokens) apresentado na propria pergunta.
+# Reabrir so com decisao dele. Se um dia baixar de novo, o piso seguro nao e um
+# palpite: tem que ser >> contexto base medido na hora, nao ~1,15x como ficou.
+#
+# --- HISTORICO (ga-kjncp, supersedido pelo bloco acima) ---
 # ga-kjncp: long-lived roles (mayor, oracle, persistent crews) pay their
 # context cost in TURNS, not once — every turn resends the whole conversation,
 # so cost is average-context-size x turn-count, not final window size. The
