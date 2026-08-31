@@ -428,11 +428,36 @@ fi
 
 # ga-owfll FALLBACK 1: map the source bead's PREFIX to a rig (wa-27jn → wa →
 # whatsapp_automation). The bead id already encodes its owning rig.
+#
+# ga-x7asi: prefer _BEAD_HOME_RIG (computed above during BEAD_ID validation by
+# ACTUALLY QUERYING each registered rig's own store for this exact bead id —
+# see ga-kpu1g) over the blind prefix string-match below. The two normally
+# agree, but a bead-id prefix can coincidentally collide with an UNRELATED
+# rig's registered .prefix with no real ownership relationship: dc-4v71 (a
+# whatsapp_automation-domain story bead that resolves in the gascity/HQ store,
+# confirmed via `bd -C "$GC_CITY_PATH" show dc-4v71`) shares its "dc" prefix
+# with the unrelated "deacon" rig, which also registers prefix=dc — so the
+# string match below resolved rig=deacon, wrong. The string match can't tell
+# a real prefix->rig mapping from this kind of coincidence; _BEAD_HOME_RIG can,
+# because it was derived from a positive existence check against the actual
+# store, not a guess. Only reachable here when BEAD_ID came from the branch
+# name (validated above); the session-assignee SECONDARY fallback further
+# down never sets _BEAD_HOME_RIG, so this falls through to the prefix match
+# unchanged for that path.
 if [ -z "$RIG" ] || [ "$RIG" = "null" ]; then
   _BPFX="${BEAD_ID%%-*}"
+  _RIG_PFX_MATCH=""
   if [ -n "$_BPFX" ] && [ "$_BPFX" != "$BEAD_ID" ]; then
-    RIG=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg p "$_BPFX" \
+    _RIG_PFX_MATCH=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg p "$_BPFX" \
       '.rigs[] | select(.prefix == $p or .name == $p) | .name' 2>/dev/null | head -1 || echo "")
+  fi
+  if [ -n "${_BEAD_HOME_RIG:-}" ]; then
+    if [ -n "$_RIG_PFX_MATCH" ] && [ "$_RIG_PFX_MATCH" != "$_BEAD_HOME_RIG" ]; then
+      echo "Note: bead '$BEAD_ID' prefix coincidentally matches rig '$_RIG_PFX_MATCH', but it was independently confirmed (via direct store query) to live in '$_BEAD_HOME_RIG' instead — using '$_BEAD_HOME_RIG' (ga-x7asi)."
+    fi
+    RIG="$_BEAD_HOME_RIG"
+  else
+    RIG="$_RIG_PFX_MATCH"
   fi
 fi
 

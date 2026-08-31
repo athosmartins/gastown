@@ -217,8 +217,14 @@ case "$BRANCH" in
     # Accept either a '-' (desc follows) or end-of-string (bare id) right
     # after the id token — mirrors how the crew/*/* case above already
     # accepts a bare id via its "$BEAD_ID"|"$BEAD_ID"-* guard.
-    BEAD_ID=$(echo "$BRANCH" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}(-|$)' \
-      | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo "")
+    # ga-stmh8: optional dotted sub-bead suffix (ga-sfj3i.4), mirroring the
+    # crew/*/* arm's ga-pkvfc fix above — the char class alone has no '.',
+    # so on a dotted sub-bead branch the char right after the id run is '.',
+    # which is neither '-' nor end-of-string: the WHOLE match used to fail
+    # here (unlike the crew arm, which truncated at the dot instead), and
+    # BEAD_ID came back empty.
+    BEAD_ID=$(echo "$BRANCH" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}(\.[0-9]+)?(-|$)' \
+      | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}(\.[0-9]+)?' 2>/dev/null || echo "")
     ;;
   *)
     BEAD_ID=""
@@ -422,11 +428,36 @@ fi
 
 # ga-owfll FALLBACK 1: map the source bead's PREFIX to a rig (wa-27jn → wa →
 # whatsapp_automation). The bead id already encodes its owning rig.
+#
+# ga-x7asi: prefer _BEAD_HOME_RIG (computed above during BEAD_ID validation by
+# ACTUALLY QUERYING each registered rig's own store for this exact bead id —
+# see ga-kpu1g) over the blind prefix string-match below. The two normally
+# agree, but a bead-id prefix can coincidentally collide with an UNRELATED
+# rig's registered .prefix with no real ownership relationship: dc-4v71 (a
+# whatsapp_automation-domain story bead that resolves in the gascity/HQ store,
+# confirmed via `bd -C "$GC_CITY_PATH" show dc-4v71`) shares its "dc" prefix
+# with the unrelated "deacon" rig, which also registers prefix=dc — so the
+# string match below resolved rig=deacon, wrong. The string match can't tell
+# a real prefix->rig mapping from this kind of coincidence; _BEAD_HOME_RIG can,
+# because it was derived from a positive existence check against the actual
+# store, not a guess. Only reachable here when BEAD_ID came from the branch
+# name (validated above); the session-assignee SECONDARY fallback further
+# down never sets _BEAD_HOME_RIG, so this falls through to the prefix match
+# unchanged for that path.
 if [ -z "$RIG" ] || [ "$RIG" = "null" ]; then
   _BPFX="${BEAD_ID%%-*}"
+  _RIG_PFX_MATCH=""
   if [ -n "$_BPFX" ] && [ "$_BPFX" != "$BEAD_ID" ]; then
-    RIG=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg p "$_BPFX" \
+    _RIG_PFX_MATCH=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg p "$_BPFX" \
       '.rigs[] | select(.prefix == $p or .name == $p) | .name' 2>/dev/null | head -1 || echo "")
+  fi
+  if [ -n "${_BEAD_HOME_RIG:-}" ]; then
+    if [ -n "$_RIG_PFX_MATCH" ] && [ "$_RIG_PFX_MATCH" != "$_BEAD_HOME_RIG" ]; then
+      echo "Note: bead '$BEAD_ID' prefix coincidentally matches rig '$_RIG_PFX_MATCH', but it was independently confirmed (via direct store query) to live in '$_BEAD_HOME_RIG' instead — using '$_BEAD_HOME_RIG' (ga-x7asi)."
+    fi
+    RIG="$_BEAD_HOME_RIG"
+  else
+    RIG="$_RIG_PFX_MATCH"
   fi
 fi
 
@@ -716,17 +747,42 @@ bd -C "$_BEAD_STORE" label add "$BEAD_ID" "gate:queued" -q 2>/dev/null || true
 # moment after marker creation, not from anything the calling session merely
 # claims about itself.
 _SUBMIT_BEAD_JSON=$(bd -C "$_BEAD_STORE" show "$BEAD_ID" --json 2>/dev/null)
-_SUBMIT_AUTHOR=$(printf '%s' "$_SUBMIT_BEAD_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // empty' 2>/dev/null || echo "")
+# ga-fahqt: for a dog-pool/Pilot sling dispatch, the STORY bead is
+# deliberately left WITHOUT an assignee for its whole gate cycle — only the
+# sling/task wrapper bead (metadata.pilot.sling_bead) gets assigned+
+# in_progress (see the sling-close logic below, which already relies on this
+# same fact). Falling straight through the story bead's own assignee ->
+# created_by -> owner chain always lands on created_by for this whole
+# dispatch class — whoever originally FILED the story (typically the Pilot
+# dispatcher itself), never the session that actually authored the fix.
+# Prefer the SLING bead's own assignee first when one exists and differs
+# from the story bead (same guard the sling-close logic below already uses),
+# falling through to the story bead's own chain unchanged if the sling
+# lookup comes back empty (bead not found, no assignee yet, lookup failed —
+# any of these degrade to the existing behavior, never a wrong value).
+# Slings are always HQ-native for this dispatch shape (gc sling creates the
+# wrapper in $GC_CITY_PATH regardless of which store the story itself lives
+# in — same convention pilot-dispatcher.sh's _mayor_deferred_hold_db uses).
+_SLING_FOR_AUTHOR=$(printf '%s' "$_SUBMIT_BEAD_JSON" | jq -r 'if type=="array" then .[0] else . end | .metadata["pilot.sling_bead"] // empty' 2>/dev/null || echo "")
+_SUBMIT_AUTHOR=""
+if [ -n "$_SLING_FOR_AUTHOR" ] && [ "$_SLING_FOR_AUTHOR" != "$BEAD_ID" ]; then
+  _SUBMIT_AUTHOR=$(bd -C "$GC_CITY_PATH" show "$_SLING_FOR_AUTHOR" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | .assignee // empty' 2>/dev/null || echo "")
+fi
+if [ -z "$_SUBMIT_AUTHOR" ] || [ "$_SUBMIT_AUTHOR" = "null" ]; then
+  _SUBMIT_AUTHOR=$(printf '%s' "$_SUBMIT_BEAD_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // empty' 2>/dev/null || echo "")
+fi
 if [ -z "$_SUBMIT_AUTHOR" ] || [ "$_SUBMIT_AUTHOR" = "null" ]; then
   _SUBMIT_AUTHOR=$(printf '%s' "$_SUBMIT_BEAD_JSON" | jq -r 'if type=="array" then .[0] else . end | .created_by // empty' 2>/dev/null || echo "")
 fi
 if [ -z "$_SUBMIT_AUTHOR" ] || [ "$_SUBMIT_AUTHOR" = "null" ]; then
   _SUBMIT_AUTHOR=$(printf '%s' "$_SUBMIT_BEAD_JSON" | jq -r 'if type=="array" then .[0] else . end | .owner // empty' 2>/dev/null || echo "")
 fi
-# Third state: if none of assignee/created_by/owner resolve, do NOT invent a
-# value — leave gate.submitted_by unset. The guard's own Step 5 derivation
-# (same 3-tier priority, same source) is the existing, unchanged fallback for
-# markers where this freeze could not happen.
+# Third state: if none of sling-assignee/assignee/created_by/owner resolve,
+# do NOT invent a value — leave gate.submitted_by unset. The guard's own
+# Step 5 derivation (same 3-tier priority minus the sling preference, same
+# source) is the existing, unchanged fallback for markers where this freeze
+# could not happen.
 if [ -n "$_SUBMIT_AUTHOR" ] && [ "$_SUBMIT_AUTHOR" != "null" ]; then
   bd -C "$GC_CITY_PATH" update "$MARKER_ID" --set-metadata "gate.submitted_by=$_SUBMIT_AUTHOR" -q 2>/dev/null || true
 fi

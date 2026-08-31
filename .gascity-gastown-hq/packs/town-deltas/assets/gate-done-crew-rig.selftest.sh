@@ -76,9 +76,9 @@ GC_CITY_PATH_STUB="/Users/athos/gt/.gascity-gastown-hq"
 # These MUST mirror the deployed command exactly; section (G) asserts the source
 # still defines the same structure so the test cannot silently diverge.
 
-# derive_rig <cwd> <bead_id> <gc_agent> <gc_city_path>
+# derive_rig <cwd> <bead_id> <gc_agent> <gc_city_path> <bead_home_rig>
 derive_rig() {
-  local cwd="$1" bead_id="$2" gc_agent="$3" gc_city_path="${4:-}" rig="" bpfx asfx
+  local cwd="$1" bead_id="$2" gc_agent="$3" gc_city_path="${4:-}" bead_home_rig="${5:-}" rig="" bpfx asfx pfx_match
   # PRIMARY: rig whose path == cwd OR is an ANCESTOR of cwd (longest match).
   # ga-8a9n: .path bound to $p BEFORE the pipe — see (I) below for why.
   rig=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg cwd "$cwd" '
@@ -94,12 +94,25 @@ derive_rig() {
       "$cwd"|"$cwd"/*) rig="gascity" ;;
     esac
   fi
-  # FALLBACK 1: source-bead prefix → rig.
+  # FALLBACK 1: source-bead prefix → rig, UNLESS bead_home_rig (the caller's
+  # verified "which rig's own store actually contains this bead id" signal —
+  # production's _BEAD_HOME_RIG) is available, in which case it wins. ga-x7asi:
+  # a bead-id prefix can coincidentally collide with an unrelated rig's
+  # registered .prefix (dc-4v71 vs the deacon rig, both "dc") with no real
+  # ownership relationship — the string match can't tell that apart from a
+  # real prefix->rig mapping, bead_home_rig can, because it came from a
+  # positive existence check against the actual store, not a guess.
   if [ -z "$rig" ] || [ "$rig" = "null" ]; then
     bpfx="${bead_id%%-*}"
+    pfx_match=""
     if [ -n "$bpfx" ] && [ "$bpfx" != "$bead_id" ]; then
-      rig=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg p "$bpfx" \
+      pfx_match=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg p "$bpfx" \
         '.rigs[] | select(.prefix == $p or .name == $p) | .name' 2>/dev/null | head -1 || echo "")
+    fi
+    if [ -n "$bead_home_rig" ]; then
+      rig="$bead_home_rig"
+    else
+      rig="$pfx_match"
     fi
   fi
   # FALLBACK 2: agent-name rig SUFFIX → rig (mapped THROUGH rig list, never raw).
@@ -1710,6 +1723,65 @@ if [ -f "$GATE_DONE" ]; then
     || bad "(Z7b) gate-done.md's generic-case regex missing the dotted sub-bead capture group (ga-stmh8 regression)"
 else
   bad "(Z7) gate-done.md not found at $GATE_DONE"
+fi
+
+# ── (AA) ga-x7asi: FALLBACK 1 prefers a verified bead_home_rig over a ────────
+# coincidental prefix collision with an unrelated rig's own .prefix.
+#
+# Repro: dc-4v71 is a whatsapp_automation-domain story bead that resolves in
+# the gascity/HQ Dolt store (confirmed live: `bd -C "$GC_CITY_PATH" show
+# dc-4v71` succeeds; `bd -C /Users/athos/gt/deacon show dc-4v71` does not),
+# but its "dc" prefix ALSO happens to be the unrelated "deacon" rig's own
+# registered bead-prefix — a coincidental collision, not a real ownership
+# relationship. The worktree cwd is not nested under any registered rig path
+# (no PRIMARY match) and is a SIBLING of, not nested under, $GC_CITY_PATH (no
+# ga-6mir5 match either), so FALLBACK 1 is reached and used to mis-resolve
+# rig=deacon.
+
+# (AA1) with bead_home_rig supplied (gascity, matching the live repro), the
+# fallback prefers it over the prefix collision.
+R=$(derive_rig "/Users/athos/gt/.gc-worktrees/dc-4v71-prodtest" "dc-4v71" "gastown.dog-2" "$GC_CITY_PATH_STUB" "gascity")
+[ "$R" = "gascity" ] \
+  && ok "(AA1) dc-4v71 + bead_home_rig=gascity → gascity, not deacon (got: $R)" \
+  || bad "(AA1) expected gascity (bead_home_rig should win over prefix collision), got: $R"
+
+# (AA2) mutation check: WITHOUT bead_home_rig (the pre-fix shape — the
+# derivation never consulted it), the same inputs mis-resolve to deacon via
+# the naive prefix collision, reproducing the ga-x7asi bug exactly.
+R=$(derive_rig "/Users/athos/gt/.gc-worktrees/dc-4v71-prodtest" "dc-4v71" "gastown.dog-2" "$GC_CITY_PATH_STUB" "")
+[ "$R" = "deacon" ] \
+  && ok "(AA2) mutation check: pre-fix (no bead_home_rig) mis-resolves dc-4v71 to deacon, reproducing ga-x7asi" \
+  || bad "(AA2) mutation check failed to reproduce ga-x7asi — pre-fix path now returns '$R', not 'deacon' (test premise stale?)"
+
+# (AA3) control: when bead_home_rig is unavailable (e.g. BEAD_ID came from
+# the SECONDARY session-assignee fallback, which never computes it) and the
+# prefix genuinely matches its owning rig, behavior is unchanged — no
+# regression on the common/happy path this fix must not touch.
+R=$(derive_rig "/tmp/detached-checkout" "wa-27jn" "" "$GC_CITY_PATH_STUB" "")
+[ "$R" = "whatsapp_automation" ] \
+  && ok "(AA3) control: no bead_home_rig, genuine wa-27jn prefix match still → whatsapp_automation (got: $R)" \
+  || bad "(AA3) control regression: expected whatsapp_automation, got: $R"
+
+# (AA4) control: when bead_home_rig AGREES with the prefix match (the common
+# case — a bead's prefix genuinely matches the rig whose own store contains
+# it), the result is identical either way — this fix changes nothing here.
+R=$(derive_rig "/tmp/detached-checkout" "wa-27jn" "" "$GC_CITY_PATH_STUB" "whatsapp_automation")
+[ "$R" = "whatsapp_automation" ] \
+  && ok "(AA4) control: bead_home_rig agrees with prefix match → same result (got: $R)" \
+  || bad "(AA4) control regression: expected whatsapp_automation, got: $R"
+
+# (AA5) source drift-guard: deployed gate-done.md's FALLBACK 1 actually
+# prefers _BEAD_HOME_RIG over the blind prefix match.
+if [ -f "$GATE_DONE" ]; then
+  src=$(cat "$GATE_DONE")
+  printf '%s' "$src" | grep -qF 'ga-x7asi' \
+    && ok "(AA5a) gate-done.md references the ga-x7asi fix" \
+    || bad "(AA5a) gate-done.md missing the ga-x7asi fix marker (regression)"
+  printf '%s' "$src" | grep -qF 'RIG="$_BEAD_HOME_RIG"' \
+    && ok "(AA5b) gate-done.md's FALLBACK 1 assigns RIG from _BEAD_HOME_RIG" \
+    || bad "(AA5b) gate-done.md's FALLBACK 1 no longer assigns RIG from _BEAD_HOME_RIG (ga-x7asi regression)"
+else
+  bad "(AA5) gate-done.md not found at $GATE_DONE"
 fi
 
 echo
