@@ -93,7 +93,15 @@ discover_cities() {
   local rigs
   rigs=$("$GC_BIN" rig list --json 2>>"$LOG" | jq -r '.rigs[]?.path // empty' 2>/dev/null)
   if [ -z "$rigs" ]; then
-    log "WARN: gc rig list returned no cities — falling back to \$BUPW_FALLBACK_CITIES ($BUPW_FALLBACK_CITIES)"
+    log "WARN: gc rig list returned no cities — falling back to \$BUPW_FALLBACK_CITIES ($BUPW_FALLBACK_CITIES); scan is now PARTIAL (unknown cities may be silently missing), suppressing this sweep's orphan check"
+    # Signal the fallback through the SAME channel discover_tracker_beads()
+    # uses for a per-city bd-list failure (BUPW_DISCOVERY_ERRORS, set by our
+    # caller before invoking us — see run_sweep). A gc-rig-list failure is
+    # strictly worse than a single city erroring: we don't even know which
+    # (or how many) cities are missing from $BUPW_FALLBACK_CITIES, so the
+    # orphan sweep must be suppressed the same way, not just when a KNOWN
+    # city fails to answer.
+    [ -n "${BUPW_DISCOVERY_ERRORS:-}" ] && echo "__gc_rig_list_fallback__" >> "$BUPW_DISCOVERY_ERRORS" 2>/dev/null
     printf '%s\n' "$BUPW_FALLBACK_CITIES"
     return
   fi

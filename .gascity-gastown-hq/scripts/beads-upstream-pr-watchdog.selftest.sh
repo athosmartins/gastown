@@ -356,12 +356,23 @@ echo "== gc rig list failure degrades to fallback cities, not silent zero-scan =
 
 rm -f "$GC_RIG_LIST_FIXTURE"   # stub now returns {"rigs": []}
 write_bd_fixture "$CITY_FALLBACK" '[{"id":"fallback-tracker","status":"open","labels":["waiting-on:pr-9999"]}]'
-: > "$GC_CALLS_LOG"
+: > "$GC_CALLS_LOG"; : > "$BUPW_LOG"
 run_sweep
-eq "fallback city's tracker suppresses the 9999 orphan alert" "$(grep -c 'pull/9999' "$GC_CALLS_LOG" || true)" "0"
+eq "no orphan alert for 9999 while the scan is fallback-only (sweep is suppressed, not just coincidentally matched)" "$(grep -c 'pull/9999' "$GC_CALLS_LOG" || true)" "0"
+# The regression this closes: PR #6001's real tracker (ga-6001-tracker) lives
+# in CITY_HQ, which the gc-rig-list failure silently dropped from this scan —
+# CITY_FALLBACK never heard of it. Before the fix, discover_cities()'s
+# fallback wasn't folded into discovery_incomplete, so the orphan sweep ran
+# believing CITY_FALLBACK was the whole world and fired a FALSE "no tracking
+# bead found in any scanned city" alert for 6001 (verified failing against
+# the pre-fix commit — see commit message).
+eq "no FALSE orphan alert for 6001 — its only tracker lives in a city the fallback silently dropped" "$(grep -c 'pull/6001' "$GC_CALLS_LOG" || true)" "0"
 grep -q 'falling back to' "$BUPW_LOG" \
   && ok "fallback path is logged (not silent)" \
   || bad "no fallback log line found in $BUPW_LOG"
+grep -q "SKIPPING orphan sweep" "$BUPW_LOG" \
+  && ok "gc-rig-list fallback marks discovery incomplete and suppresses the orphan sweep entirely" \
+  || bad "gc-rig-list fallback did not suppress the orphan sweep: $(cat "$BUPW_LOG")"
 
 # ── Part 2.8: a city query failure must NOT produce a false orphan alert ──
 # The gap this closes: if WA's `bd list` errors out for one sweep, its
