@@ -120,6 +120,10 @@ fi
 
 if [ "$is_list" = "1" ]; then
   printf 'CALL:%s\n' "$argline" >> "$BD_CALLS_LOG"
+  if [ -n "${BD_CITY_FAIL:-}" ] && [ "$city" = "$BD_CITY_FAIL" ]; then
+    echo "connection refused (simulated)" >&2
+    exit 1
+  fi
   safe="$(printf '%s' "$city" | tr -c 'A-Za-z0-9' '_')"
   fixture="$BD_FIXTURE_DIR/${safe}.json"
   if [ -f "$fixture" ]; then cat "$fixture"; else echo '[]'; fi
@@ -358,6 +362,49 @@ eq "fallback city's tracker suppresses the 9999 orphan alert" "$(grep -c 'pull/9
 grep -q 'falling back to' "$BUPW_LOG" \
   && ok "fallback path is logged (not silent)" \
   || bad "no fallback log line found in $BUPW_LOG"
+
+# ── Part 2.8: a city query failure must NOT produce a false orphan alert ──
+# The gap this closes: if WA's `bd list` errors out for one sweep, its
+# tracker beads contribute zero rows to the discovery scan — indistinguishable
+# BY ROW COUNT ALONE from "queried fine, genuinely tracks nothing." Without
+# the discovery_incomplete guard, PR #7001 (tracked ONLY in WA) would get
+# wrongly mailed to the Mayor as orphaned during WA's outage.
+echo ""
+echo "== city query failure suppresses the orphan sweep, not just that PR =="
+
+# Part 2.7 deleted $GC_RIG_LIST_FIXTURE to exercise the fallback path —
+# restore it so this part scans the normal two cities again, not just the
+# fallback-only one.
+cat > "$GC_RIG_LIST_FIXTURE" <<JSON
+{"rigs": [{"name": "hq", "path": "$CITY_HQ"}, {"name": "wa", "path": "$CITY_WA"}]}
+JSON
+
+write_bd_fixture "$CITY_WA" "$(cat "$BD_FIXTURE_DIR/$(sanitize_path "$CITY_WA").json" | jq -c '. + [{"id":"wa-7001-tracker","status":"open","labels":["waiting-on:pr-7001"]}]')"
+cat > "$TMP/gh" <<'STUB'
+#!/usr/bin/env bash
+{ printf 'CALL:'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; } >> "$GH_CALLS_LOG"
+cat <<JSON
+[
+  {"number": 7001, "state": "OPEN", "mergedAt": null, "url": "https://github.com/gastownhall/beads/pull/7001", "title": "tracked only in WA"}
+]
+JSON
+STUB
+chmod +x "$TMP/gh"
+
+export BD_CITY_FAIL="$CITY_WA"
+: > "$GC_CALLS_LOG"; : > "$BUPW_LOG"
+run_sweep
+eq "no orphan alert for 7001 while WA (its only tracker's city) is failing" \
+  "$(grep -c 'pull/7001' "$GC_CALLS_LOG" || true)" "0"
+grep -q "SKIPPING orphan sweep" "$BUPW_LOG" \
+  && ok "skip is logged, not silent" \
+  || bad "no SKIPPING log line found: $(cat "$BUPW_LOG")"
+
+unset BD_CITY_FAIL
+: > "$GC_CALLS_LOG"
+run_sweep
+eq "once WA recovers, 7001 still correctly shows no orphan alert (it IS tracked)" \
+  "$(grep -c 'pull/7001' "$GC_CALLS_LOG" || true)" "0"
 
 # ── Part 3: single-instance lock (ga-y0g5x pattern) ─────────────────────────
 echo ""

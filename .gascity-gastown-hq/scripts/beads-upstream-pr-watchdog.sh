@@ -110,12 +110,22 @@ discover_cities() {
 # returned so every one gets alerted (v1's single PR->bead map could only
 # ever notify one — part of what ga-se0ly reported: ga-5ksp5 never heard
 # about PR #5439 merging because only wa-msxg5 was in the map for it).
+#
+# If $BUPW_DISCOVERY_ERRORS is set, a city whose `bd list` call fails or
+# returns unparseable output appends its name to that file instead of just
+# being silently skipped. This distinguishes "queried and genuinely has zero
+# trackers" from "could not be queried" — the caller (run_sweep) uses it to
+# suppress the orphan sweep on an incomplete scan, since "this city has no
+# tracker" and "this city errored" must not collapse into the same "not
+# tracked anywhere" verdict that triggers an orphan alert to the Mayor.
 discover_tracker_beads() {
   local city rows
   while IFS= read -r city; do
     [ -z "$city" ] && continue
     rows=$("$BD_BIN" -C "$city" list --all --label-pattern 'waiting-on:pr-*' --json --limit 0 2>>"$LOG")
     if [ -z "$rows" ] || ! printf '%s' "$rows" | jq -e '.' >/dev/null 2>&1; then
+      log "WARN: bd list failed or returned unparseable output for city=$city — its tracker beads are UNKNOWN this sweep, not confirmed-absent"
+      [ -n "${BUPW_DISCOVERY_ERRORS:-}" ] && echo "$city" >> "$BUPW_DISCOVERY_ERRORS" 2>/dev/null
       continue
     fi
     printf '%s' "$rows" | jq -r --arg city "$city" '
@@ -227,7 +237,12 @@ run_sweep() {
   local tracked_count=0 event_count=0
 
   local tracker_rows tracked_pr_nums
-  tracker_rows=$(discover_tracker_beads)
+  local discovery_errors_file discovery_incomplete=0
+  discovery_errors_file=$(mktemp 2>/dev/null || printf '%s/bupw-discovery-errors.%s' "${TMPDIR:-/tmp}" "$$")
+  : > "$discovery_errors_file" 2>/dev/null || true
+  tracker_rows=$(BUPW_DISCOVERY_ERRORS="$discovery_errors_file" discover_tracker_beads)
+  [ -s "$discovery_errors_file" ] && discovery_incomplete=1
+  rm -f "$discovery_errors_file" 2>/dev/null
   tracked_pr_nums=$(printf '%s' "$tracker_rows" | cut -f1 | sort -u)
 
   local pr_num
@@ -298,29 +313,46 @@ run_sweep() {
   # ── Orphan sweep (case b): an OPEN PR by $GH_AUTHOR with ZERO tracker bead
   # in ANY scanned city — the direction a hand-maintained map can never see,
   # since it can only enumerate PRs someone already told it about.
-  local open_pr_nums n o_url o_title
-  open_pr_nums=$(printf '%s' "$all_prs" | jq -r '.[] | select(.state=="OPEN") | .number')
-  while IFS= read -r n; do
-    [ -z "$n" ] && continue
-    if printf '%s\n' "$tracked_pr_nums" | grep -qx "$n"; then
-      # Now has a tracker -> clear any stale orphan-alert record so a FUTURE
-      # re-orphaning (e.g. the tracker bead gets deleted) can alert again.
-      new_orphans=$(printf '%s' "$new_orphans" | jq --arg k "$n" 'del(.[$k])')
-      continue
-    fi
-    if printf '%s' "$prev_orphans" | jq -e --arg k "$n" 'has($k)' >/dev/null 2>&1; then
-      continue
-    fi
-    o_url=$(printf '%s' "$all_prs" | jq -r --argjson n "$n" '[.[] | select(.number==$n)][0].url')
-    o_title=$(printf '%s' "$all_prs" | jq -r --argjson n "$n" '[.[] | select(.number==$n)][0].title')
-    log "ORPHAN: PR #$n is OPEN with no tracker bead in any scanned city — alerting"
-    if _alert_orphan "$n" "$o_url" "$o_title"; then
-      event_count=$((event_count + 1))
-      new_orphans=$(printf '%s' "$new_orphans" | jq --arg k "$n" --arg t "$(ts)" '.[$k] = {alerted_at: $t}')
-    else
-      log "WARN: PR #$n orphan alert failed — will retry next sweep"
-    fi
-  done <<<"$open_pr_nums"
+  #
+  # Skipped entirely when ANY city failed to respond this sweep
+  # ($discovery_incomplete, set above from discover_tracker_beads' error
+  # file). A city that errored contributes ZERO rows to $tracker_rows —
+  # exactly indistinguishable, by row count alone, from a city that was
+  # queried successfully and genuinely tracks nothing. Proceeding anyway
+  # would risk mailing the Mayor a false "no tracking bead anywhere" claim
+  # for a PR whose only tracker lives in the city that failed to answer.
+  # One skipped day is cheap; a false claim costs a human's investigation
+  # time chasing a bead that was never missing. Merge/close-transition
+  # alerting above is unaffected by this — a PR merely not found as tracked
+  # this sweep is silently retried next sweep, never misreported.
+  if [ "$discovery_incomplete" = "1" ]; then
+    log "SKIPPING orphan sweep this sweep: at least one city failed to respond (see WARN lines above) — 'no tracker found' cannot be trusted while the scan is incomplete"
+  else
+    local open_pr_nums n o_url o_title
+    open_pr_nums=$(printf '%s' "$all_prs" | jq -r '.[] | select(.state=="OPEN") | .number')
+    while IFS= read -r n; do
+      [ -z "$n" ] && continue
+      if printf '%s\n' "$tracked_pr_nums" | grep -qx "$n"; then
+        # Now has a tracker -> clear any stale orphan-alert record so a
+        # FUTURE re-orphaning (e.g. the tracker bead gets deleted) can alert
+        # again.
+        new_orphans=$(printf '%s' "$new_orphans" | jq --arg k "$n" 'del(.[$k])')
+        continue
+      fi
+      if printf '%s' "$prev_orphans" | jq -e --arg k "$n" 'has($k)' >/dev/null 2>&1; then
+        continue
+      fi
+      o_url=$(printf '%s' "$all_prs" | jq -r --argjson n "$n" '[.[] | select(.number==$n)][0].url')
+      o_title=$(printf '%s' "$all_prs" | jq -r --argjson n "$n" '[.[] | select(.number==$n)][0].title')
+      log "ORPHAN: PR #$n is OPEN with no tracker bead in any scanned city — alerting"
+      if _alert_orphan "$n" "$o_url" "$o_title"; then
+        event_count=$((event_count + 1))
+        new_orphans=$(printf '%s' "$new_orphans" | jq --arg k "$n" --arg t "$(ts)" '.[$k] = {alerted_at: $t}')
+      else
+        log "WARN: PR #$n orphan alert failed — will retry next sweep"
+      fi
+    done <<<"$open_pr_nums"
+  fi
 
   # Unconditional per-sweep line, even when nothing changed: on a log that
   # only ever writes on notable events, a daemon that silently stopped
