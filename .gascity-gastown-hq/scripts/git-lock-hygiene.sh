@@ -25,6 +25,17 @@
 #     .git/config.lock        — in-progress config write, stale after crash
 #     .git/rebase-merge/      — in-progress rebase (merge strategy), entire dir
 #     .git/rebase-apply/      — in-progress rebase (apply strategy) / git-am, entire dir
+#     .git/index.<word>.<pid>.lock — PID-tagged custom index lock (e.g.
+#                             index.stash.15909.lock), left behind by a script
+#                             that stashes via its own GIT_INDEX_FILE=<path>.$$
+#                             and crashes mid-write. Not git's native name (git
+#                             itself only ever writes index.lock) — this shape
+#                             comes from wrapper tooling. The PID embedded in
+#                             the filename is checked directly (kill -0) rather
+#                             than the repo-wide live-process grep used above:
+#                             a stale lock here is removed even while OTHER git
+#                             activity is ongoing in the same repo, but NEVER
+#                             while its own owning PID is still alive (ga-2xorq).
 #   NOT touched: ORIG_HEAD, FETCH_HEAD, HEAD — valid post-op artifacts.
 #
 # PART 2 — Per-repo git mutation mutex (lib, source with GIT_LOCK_HYGIENE_LIB=1)
@@ -108,6 +119,19 @@ _is_stale() {
   return 0   # stale
 }
 
+# Returns 0 if pid is confirmed dead (kill -0 fails with no-such-process),
+# 1 if alive OR if pid couldn't be validated. Unknown must NOT collapse into
+# "dead" — that would make an unparseable pid removable, the wrong direction
+# for a destructive path. Mirrors _mutex_holder_dead's fail-safe shape below.
+_pid_is_dead() {
+  local pid="$1"
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;   # not a valid pid → treat as alive (don't remove)
+  esac
+  kill -0 "$pid" 2>/dev/null && return 1   # alive
+  return 0                                  # confirmed dead
+}
+
 # Remove a stale lock file (or directory) safely.
 # $1 = path, $2 = repo root, $3 = label for logging.
 # All human-readable output goes to stderr; callers capture nothing from stdout.
@@ -171,6 +195,27 @@ _scan_repo() {
     label="${d_label#*:}"
     if [ -d "$d" ] && _is_stale "$d" "$repo"; then
       _remove_stale_lock "$d" "$repo" "$label"
+      removed=$(( removed + 1 ))
+    fi
+  done
+
+  # PID-tagged custom index locks: index.<word>.<pid>.lock (e.g.
+  # index.stash.15909.lock, and siblings such as index.rebase.<pid>.lock) —
+  # not a git-native name, left behind by wrapper tooling that stashes via
+  # its own GIT_INDEX_FILE=<path>.$$ and crashes mid-write (ga-2xorq). Still
+  # gated on STALE_AGE like every other lock class, but liveness is decided
+  # by the PID embedded in the filename, not the repo-wide grep _is_stale()
+  # uses — that PID is a stronger, per-lock signal, and the file must be kept
+  # while its own owning PID lives even if the repo has no other git activity.
+  local pf pbn pid page
+  for pf in "$git_dir"/index.*.lock; do
+    [ -e "$pf" ] || continue   # glob didn't match anything
+    pbn="$(basename "$pf")"
+    [[ "$pbn" =~ ^index\.[A-Za-z0-9_-]+\.([0-9]+)\.lock$ ]] || continue
+    pid="${BASH_REMATCH[1]}"
+    page=$(_path_age "$pf")
+    if [ "$page" -ge "$STALE_AGE" ] && _pid_is_dead "$pid"; then
+      _remove_stale_lock "$pf" "$repo" "PID lock (owning pid ${pid} dead): ${pbn}"
       removed=$(( removed + 1 ))
     fi
   done
@@ -387,6 +432,50 @@ if [ "${1:-}" = "--selftest" ]; then
   R7="$TMP/notarepo"; mkdir -p "$R7"
   count=$(_scan_repo "$R7")
   [ "$count" = "0" ] && ok "T7: non-repo returns 0" || bad "T7: returned $count (expected 0)"
+
+  # ── PID-tagged custom index lock tests (ga-2xorq) ──────────────────────────
+  DEAD_PID=999999999   # almost certainly no such process (mirrors T12's convention)
+
+  # T15: stale index.stash.<dead-pid>.lock → removed
+  echo "T15: stale index.stash.<dead-pid>.lock → removed"
+  R8="$TMP/repo8"; make_repo "$R8"
+  touch -t 200001010000 "$R8/.git/index.stash.${DEAD_PID}.lock"
+  export GIT_LOCK_STALE_AGE_SEC=300
+  count=$(_scan_repo "$R8")
+  [ ! -f "$R8/.git/index.stash.${DEAD_PID}.lock" ] && ok "T15: dead-pid stash lock removed" \
+    || bad "T15: dead-pid stash lock NOT removed"
+  [ "$count" -ge 1 ] && ok "T15: removed count>=1" || bad "T15: removed count=$count (expected >=1)"
+
+  # T16: stale index.stash.<live-pid>.lock → left alone, even though old
+  # (bead ga-2xorq scope point 2: "NAO remover lock cujo PID dono ainda esta
+  # vivo, mesmo que velho" — age alone must never override a live owning PID)
+  echo "T16: stale index.stash.<live-pid>.lock (old) → left alone (owning PID alive)"
+  R9="$TMP/repo9"; make_repo "$R9"
+  LIVE_PID=$$   # this selftest's own shell — guaranteed alive for the test's duration
+  touch -t 200001010000 "$R9/.git/index.stash.${LIVE_PID}.lock"
+  count=$(_scan_repo "$R9")
+  [ -f "$R9/.git/index.stash.${LIVE_PID}.lock" ] && ok "T16: live-pid stash lock untouched despite old age" \
+    || bad "T16: live-pid stash lock removed (should NOT be — owning PID is alive)"
+  [ "$count" -eq 0 ] && ok "T16: removed count=0" || bad "T16: removed count=$count (expected 0)"
+
+  # T17: sibling pattern (not literally "stash") → also removed — proves the
+  # fix covers the index.<word>.<pid>.lock CLASS, not just the cited instance.
+  echo "T17: stale index.rebase.<dead-pid>.lock (sibling pattern) → removed"
+  R10="$TMP/repo10"; make_repo "$R10"
+  touch -t 200001010000 "$R10/.git/index.rebase.${DEAD_PID}.lock"
+  count=$(_scan_repo "$R10")
+  [ ! -f "$R10/.git/index.rebase.${DEAD_PID}.lock" ] && ok "T17: sibling dead-pid lock removed" \
+    || bad "T17: sibling dead-pid lock NOT removed"
+
+  # T18: FRESH index.stash.<dead-pid>.lock (age<STALE_AGE) → left alone —
+  # the STALE_AGE guard must still apply even when the owning PID is dead
+  # (bead ga-2xorq scope point 1: "reusando a mesma guarda de idade").
+  echo "T18: fresh index.stash.<dead-pid>.lock (<STALE_AGE) → left alone (age gate still applies)"
+  R11="$TMP/repo11"; make_repo "$R11"
+  touch "$R11/.git/index.stash.${DEAD_PID}.lock"   # just created → age ~0s
+  count=$(_scan_repo "$R11")
+  [ -f "$R11/.git/index.stash.${DEAD_PID}.lock" ] && ok "T18: fresh PID-lock untouched (age gate applies even to dead pid)" \
+    || bad "T18: fresh PID-lock removed (age gate should still block this)"
 
   # ── Mutex tests ─────────────────────────────────────────────────────────────
   echo ""
