@@ -1,0 +1,20 @@
+# ga-jwb60: recurring composition/backlog watchdog for
+# docs/pending-engine-window/ — the previous fix (ga-3azujf) was a one-shot
+# manual scan pasted into a bead comment; the backlog reopened the same day
+# (16 patches parked, 4 of them landed on the very date that bead closed).
+# Detection-only (never applies/builds/swaps/kickstarts — build+swap stays
+# Mayor-scope by doctrine); reports full composition every run and only
+# gates the notify on a size-or-age threshold breach, cooldown-deduped.
+# Deliberately a gc order (fresh exec each tick), never a raw plist, so this
+# guard can never itself join the ga-y0g5x class of bug it exists to avoid
+# (it also self-locks via flock -n as a second, independent guard against
+# the same failure mode — see the script's own header).
+# Measured runtime against the live 38-file queue: ~1.2s — 1h interval
+# leaves a ~3000x margin, and the 24h default notify cooldown (see the
+# script's ESCALATE_AFTER_S) only needs to be sampled a couple dozen times
+# between possible re-fires, not chased in real time.
+[order]
+description = "Report docs/pending-engine-window/ composition and alert on size/age threshold breach"
+trigger = "cooldown"
+interval = "1h"
+exec = "$PACK_DIR/assets/scripts/engine-window-backlog-guard.sh"
