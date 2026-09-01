@@ -7601,6 +7601,55 @@ fi
 # broken one is "tratado à parte" (escalated to needs-rebase by its own bounded
 # retry / gate-health-monitor). Star-guide: gate never idles >15min on 1 stale branch.
 #
+# ga-vm428 (2026-09-01): RESERVED FRESH SLOT anti-starvation. ga-tgo7q's aging
+# fix below force-promotes an AGED healthy marker AHEAD of every NOT-yet-aged
+# ("fresh") one within its priority class — correct for a short/healthy queue
+# (nothing aged yet -> the fresh/newest-first tiebreak governs, giving recent
+# submissions fast feedback), but under a SUSTAINED backlog there is almost
+# always at least one aged marker sitting in the aged tier, so the fresh tier
+# is structurally never reached: a brand-new submission gets ZERO fast-lane
+# benefit, then once IT ages past GATE_MARKER_AGE_PROMOTE_SECONDS it joins the
+# BACK of the aged FIFO (oldest-first — it is now that tier's youngest member)
+# — worse than doing nothing, because the queue still drains and nothing
+# alarms (ga-faw5o Defeito 2). Fix: reserve one admission slot every
+# GATE_FRESH_SLOT_WINDOW_SWEEPS sweeps (persisted-across-sweeps counter, same
+# convention as SPAWN_ABORT_COUNT_FILE/ga-piscg above) for the single freshest
+# HEALTHY (non-rebase-fail) marker, regardless of age rank or priority class.
+# This is a NEW tier inserted between the overdue-emergency ceiling (which
+# still always wins — that hard-bound guarantee is strictly stronger and must
+# never be pre-empted by this softer, periodic one) and the existing
+# priority/aged cascade (entirely unchanged below). The counter resets to 0
+# the sweep the reservation is offered (GATE_FRESH_SLOT_DUE=true), whether or
+# not an overdue-emergency marker happens to still win that particular sweep
+# — that preemption is bounded by the strictly-stronger hard-ceiling
+# guarantee already, so occasionally spending an offer on a sweep where tier1
+# outranks it is an acceptable, self-bounding cost. When the reservation is
+# not due, the new tier contributes an empty array and every tier below
+# behaves byte-for-byte as before (see gate-fresh-slot-reserve.selftest.sh).
+GATE_FRESH_SLOT_WINDOW_SWEEPS="${GATE_FRESH_SLOT_WINDOW_SWEEPS:-10}"
+case "$GATE_FRESH_SLOT_WINDOW_SWEEPS" in ''|*[!0-9]*) GATE_FRESH_SLOT_WINDOW_SWEEPS=10 ;; esac
+GATE_FRESH_SLOT_COUNT_FILE="${GATE_FRESH_SLOT_COUNT_FILE:-$GC_CITY/.gc/gate-fresh-slot-sweep-count}"
+# Pure decision (no IO, set -e safe) so the selftest can drift-guard it: echo
+# "reserve" iff we have had window-1 (or more) consecutive non-reserved
+# sweeps — i.e. this is at latest the Nth sweep of the window; else "hold". A
+# window of 0 (or malformed) disables the feature entirely (falls back to
+# "hold" forever, exactly today's behaviour).
+gate_fresh_slot_should_reserve() {
+  local sweeps_since_last="$1" window="$2"
+  case "$sweeps_since_last" in ''|*[!0-9]*) sweeps_since_last=0 ;; esac
+  case "$window" in ''|*[!0-9]*) window=10 ;; esac
+  [ "$window" -le 0 ] && { echo "hold"; return 0; }
+  if [ "$sweeps_since_last" -ge "$((window - 1))" ]; then echo "reserve"; else echo "hold"; fi
+}
+_GATE_FRESH_SLOT_PREV_COUNT=$(cat "$GATE_FRESH_SLOT_COUNT_FILE" 2>/dev/null || echo 0)
+case "$_GATE_FRESH_SLOT_PREV_COUNT" in ''|*[!0-9]*) _GATE_FRESH_SLOT_PREV_COUNT=0 ;; esac
+GATE_FRESH_SLOT_DUE=false
+if [ "$(gate_fresh_slot_should_reserve "$_GATE_FRESH_SLOT_PREV_COUNT" "$GATE_FRESH_SLOT_WINDOW_SWEEPS")" = "reserve" ]; then
+  GATE_FRESH_SLOT_DUE=true
+  printf '0\n' > "$GATE_FRESH_SLOT_COUNT_FILE" 2>/dev/null || true
+else
+  printf '%s\n' "$((_GATE_FRESH_SLOT_PREV_COUNT + 1))" > "$GATE_FRESH_SLOT_COUNT_FILE" 2>/dev/null || true
+fi
 # ga-tgo7q STARVATION-BOUND AGING: the newest-first tiebreak above is Athos's
 # explicit, intended policy — but under continuous submission it can starve an
 # old HEALTHY marker indefinitely (live repro: ga-wisp-7yity6v queued 90+ min
@@ -7648,6 +7697,17 @@ GATE_PRIORITY_AUTHORS="${GATE_PRIORITY_AUTHORS-oracle}"
 # just this marker. Same guard convention, applied here.
 case "$GATE_MARKER_AGE_PROMOTE_SECONDS" in ''|*[!0-9]*) GATE_MARKER_AGE_PROMOTE_SECONDS=1800 ;; esac
 case "$GATE_MARKER_NOW_EPOCH"           in ''|*[!0-9]*) GATE_MARKER_NOW_EPOCH=$(date -u +%s) ;; esac
+# ga-vm428: sanitize the reserve-fresh-slot seam the same way — an unset,
+# empty, or garbage value must never reach jq's --argjson (which requires
+# strict JSON true/false), same failure class the GATE-FEEDBACK comment above
+# already fixed for the two numeric tunables. Two steps, not one: the
+# ${VAR:-default} expansion handles WHOLLY UNSET (this block, extracted
+# standalone by the selftest, runs under a caller-supplied `set -u` where a
+# bare `case "$GATE_FRESH_SLOT_DUE"` on an unset var aborts the sweep before
+# the case statement's own wildcard arm ever runs); the case-guard after it
+# handles SET-BUT-GARBAGE (anything reaching this point is already a string).
+GATE_FRESH_SLOT_DUE="${GATE_FRESH_SLOT_DUE:-false}"
+case "$GATE_FRESH_SLOT_DUE" in true|false) ;; *) GATE_FRESH_SLOT_DUE=false ;; esac
 # ga-ddm76 (2026-08-28): HARD-CEILING anti-starvation backstop. The ga-tgo7q
 # aging fix above promises "every healthy marker a hard wait bound", but that
 # bound only ever held WITHIN one priority class: a FRESH priority-tier
@@ -7677,6 +7737,7 @@ MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   --argjson now "$GATE_MARKER_NOW_EPOCH" \
   --argjson age_threshold "$GATE_MARKER_AGE_PROMOTE_SECONDS" \
   --argjson hard_threshold "$GATE_MARKER_HARD_AGE_SECONDS" \
+  --argjson reserve_fresh "$GATE_FRESH_SLOT_DUE" \
   --arg priority_authors "$GATE_PRIORITY_AUTHORS" '
   # ga-gpcx: matches both the current name (gate:exiled-tier5:N) and the
   # legacy name (gate:rebase-attempt:N, used before 2026-07-17) so a marker
@@ -7698,10 +7759,13 @@ MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   def prio_list: ($priority_authors | split(" ") | map(select(length>0)));
   def is_priority: (crew_of as $c | ($c != "" and ((prio_list | index($c)) != null))) or ((.labels // []) | any(. == "gate:priority"));
   # Tier order: overdue-emergency (priority-BLIND, oldest-first — ga-ddm76),
-  # then priority-healthy (aged→newest), then other-healthy (aged→newest),
-  # then rebase-fail (all authors, back of queue). Mirrors the aged/newest logic
+  # then reserve-fresh-slot (priority-BLIND, single freshest healthy marker,
+  # only when $reserve_fresh — ga-vm428, see the shell comment above), then
+  # priority-healthy (aged→newest), then other-healthy (aged→newest), then
+  # rebase-fail (all authors, back of queue). Mirrors the aged/newest logic
   # inside each priority class so no invariant (aging bound, newest tiebreak) is lost.
   (map(select(is_overdue and (has_rebase_fail | not)))                              | sort_by(.created_at))
+  + (if $reserve_fresh then (map(select(has_rebase_fail | not)) | sort_by(.created_at) | reverse | .[0:1]) else [] end)
   + (map(select(is_priority and (has_rebase_fail | not) and is_aged))                 | sort_by(.created_at))
   + (map(select(is_priority and (has_rebase_fail | not) and (is_aged | not)))       | sort_by(.created_at) | reverse)
   + (map(select((is_priority | not) and (has_rebase_fail | not) and is_aged))       | sort_by(.created_at))
