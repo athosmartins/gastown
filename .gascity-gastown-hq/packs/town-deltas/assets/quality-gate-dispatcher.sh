@@ -5898,6 +5898,26 @@ rig_resolve_commit() {
   git_rig rev-parse --verify -q "$1^{commit}" 2>/dev/null || echo ""
 }
 
+# gate_measure_diff_lines <default_branch> <branch> — ga-r8u92: total changed-line
+# count (insertions + deletions via --numstat, ignoring binary "-" rows), scoped
+# to the CURRENT git_rig context (caller must have already run
+# gate_resolve_rig_context for the rig this branch belongs to). Shared by the
+# post-selection verdict-timeout scaler (ga-ltr3c, below) and the pre-selection
+# size-aware ordering (ga-r8u92, Step 0b-0) so both read the exact same number
+# instead of two independently-maintained copies of this computation.
+# FAIL-SAFE: any git/parse failure returns 0 — a real measurement of "no diff"
+# and "could not measure" are NOT distinguished here; a caller that needs to
+# tell them apart (Step 0b-0's unknown-size sentinel) must check
+# gate_resolve_rig_context's own success separately before calling this.
+gate_measure_diff_lines() {
+  local default_branch="$1" branch="$2" n
+  n=$(git_rig diff --numstat "origin/${default_branch}...origin/${branch}" 2>/dev/null \
+    | awk '{ if ($1 ~ /^[0-9]+$/) s += $1; if ($2 ~ /^[0-9]+$/) s += $2 } END { print s + 0 }' \
+    || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  echo "$n"
+}
+
 # rig_content_merged <main_ref> <branch_ref> — ga-01yq: SHA-ancestry is FALSE BY
 # CONSTRUCTION after a rebase-merge (the gate's own auto-rebase, or any manual
 # rebase, replays commits under NEW shas) — a fully-merged branch never becomes
@@ -7667,6 +7687,64 @@ fi
 # ga-q3ig2 outage class this fix sits next to. GATE_MARKER_NOW_OVERRIDE_EPOCH
 # is a test-only seam (same convention as GATE_DOLT_LATENCY_OVERRIDE_MS) so
 # selftests can control "now" without depending on the wall clock.
+#
+# ── Step 0b-0 (ga-r8u92, ga-faw5o defeito 1): pre-selection diff-size read ────
+# Selection below ordered candidates by age+priority only, never by diff size —
+# a 3,000-line diff and a 20-line diff occupied the same concurrency slot for as
+# long as their review took, so one large review could block many small ones
+# behind it for its entire duration (shortest-job-first minimizes mean wait
+# time — a standard scheduling result, not a judgment call). The line-count
+# data already existed in this file (DIFF_LINE_COUNT below, ga-ltr3c) but was
+# computed AFTER selection, for the ALREADY-claimed marker only, purely to
+# scale timeouts — never before, to influence which marker gets claimed. This
+# step hoists an equivalent read to BEFORE selection, for every QUEUED
+# candidate (not just the eventual winner), so the tier pipeline below can fold
+# it into the fresh-tier sort via each marker's new `.diff_lines` field.
+#
+# Cost: one `git diff --numstat` per queued marker per sweep. Queue depth is
+# normally small (ga-r8u92's own AC note: the live queue was near-empty, 2
+# markers, when this shipped) — if depth ever grows enough to make this
+# material, that is a fresh optimization bead, not a reason to skip annotating
+# a small queue today.
+#
+# GATE_DIFF_SIZE_ORDERING_ENABLED=0 fully reverts to pre-ga-r8u92 behavior: no
+# marker gets a `.diff_lines` field, so the tier pipeline's `// 0` default
+# makes every candidate tie on the new sort's primary key, which collapses to
+# the exact newest-first tiebreak that sort already had (size_key's secondary
+# key, below) — same REVERSIBLE convention as GATE_PRIORITY_AUTHORS="".
+GATE_DIFF_SIZE_ORDERING_ENABLED="${GATE_DIFF_SIZE_ORDERING_ENABLED:-1}"
+GATE_DIFF_SIZE_UNKNOWN_SENTINEL="${GATE_DIFF_SIZE_UNKNOWN_SENTINEL:-999999999}"
+case "$GATE_DIFF_SIZE_ORDERING_ENABLED" in 0) : ;; *) GATE_DIFF_SIZE_ORDERING_ENABLED=1 ;; esac
+case "$GATE_DIFF_SIZE_UNKNOWN_SENTINEL" in ''|*[!0-9]*) GATE_DIFF_SIZE_UNKNOWN_SENTINEL=999999999 ;; esac
+
+if [ "$GATE_DIFF_SIZE_ORDERING_ENABLED" = "1" ]; then
+  _DIFF_SIZE_MAP="{}"
+  for _dsi in $(seq 0 $((COUNT - 1))); do
+    _ds_marker=$(printf '%s\n' "$MARKERS_JSON" | jq -c ".[$_dsi]" 2>/dev/null || echo "{}")
+    _ds_id=$(printf '%s' "$_ds_marker" | jq -r '.id // empty' 2>/dev/null || echo "")
+    [ -z "$_ds_id" ] && continue
+    DESC=$(printf '%s' "$_ds_marker" | jq -r '.description // ""' 2>/dev/null || echo "")
+    _ds_branch=$(extract "branch")
+    _ds_size="$GATE_DIFF_SIZE_UNKNOWN_SENTINEL"
+    if [ -n "$_ds_branch" ]; then
+      RIG=$(extract "rig")
+      BEAD_ID=$(extract "bead_id")
+      BEAD_RIG=$(extract "bead_rig")
+      # Same "resolve THIS candidate's rig context fresh" pattern as Step 0a-4
+      # above — globals are safely overwritten since Step 0b/2/4 below already
+      # re-derive them all fresh from the sweep's OWN (selected) candidate
+      # before use (see Step 0a-4's own comment for the full rationale).
+      if gate_resolve_rig_context; then
+        _ds_size=$(gate_measure_diff_lines "$DEFAULT_BRANCH" "$_ds_branch")
+      else
+        log "  Step 0b-0: cannot resolve rig context for marker $_ds_id (rig=$RIG) — treating diff size as unknown (sentinel)."
+      fi
+    fi
+    _DIFF_SIZE_MAP=$(printf '%s' "$_DIFF_SIZE_MAP" | jq --arg id "$_ds_id" --argjson sz "$_ds_size" '. + {($id): $sz}' 2>/dev/null) || _DIFF_SIZE_MAP="$_DIFF_SIZE_MAP"
+  done
+  MARKERS_JSON=$(printf '%s\n' "$MARKERS_JSON" | jq --argjson sizes "$_DIFF_SIZE_MAP" \
+    'map(. + {diff_lines: ($sizes[.id] // null)})' 2>/dev/null) || true
+fi
 # SELFTEST-EXTRACT marker-select: BEGIN
 GATE_MARKER_AGE_PROMOTE_SECONDS="${GATE_MARKER_AGE_PROMOTE_SECONDS:-1800}"
 GATE_MARKER_NOW_EPOCH="${GATE_MARKER_NOW_OVERRIDE_EPOCH:-$(date -u +%s)}"
@@ -7733,11 +7811,30 @@ case "$GATE_FRESH_SLOT_DUE" in true|false) ;; *) GATE_FRESH_SLOT_DUE=false ;; es
 # case measured above.
 GATE_MARKER_HARD_AGE_SECONDS="${GATE_MARKER_HARD_AGE_SECONDS:-$((GATE_MARKER_AGE_PROMOTE_SECONDS * 3))}"
 case "$GATE_MARKER_HARD_AGE_SECONDS" in ''|*[!0-9]*) GATE_MARKER_HARD_AGE_SECONDS=$((GATE_MARKER_AGE_PROMOTE_SECONDS * 3)) ;; esac
+# ga-r8u92 (ga-faw5o defeito 1): SIZE-AWARE SELECTION, healthy-not-aged tiers only.
+# Step 0b-0 (above, OUTSIDE this sentinel — mirrors how MARKERS_JSON itself is
+# built outside and merely CONSUMED here) annotates each candidate with
+# `.diff_lines` from a real `git diff --numstat`, or GATE_DIFF_SIZE_UNKNOWN_
+# SENTINEL when the branch/rig could not be resolved. Re-resolved here too
+# (same convention as every other GATE_MARKER_* tunable above) so this block
+# stays a fully self-contained, standalone-testable snippet — a selftest can
+# set `.diff_lines` directly on synthetic fixtures without touching git at all.
+# UNKNOWN maps to a LARGE value, not 0: a marker whose size we could not
+# measure must sink to the BACK of its size ranking, never jump the queue by
+# masquerading as tiny (the systematic failure mode a 0-default would create —
+# a just-pushed branch is exactly the branch whose ref is least likely to be
+# fetched yet). GATE_DIFF_SIZE_ORDERING_ENABLED=0 (Step 0b-0) skips the
+# annotation entirely, so every candidate ties on this sentinel and the sort
+# below falls through to its pure newest-first secondary key — the exact
+# pre-ga-r8u92 behaviour, same REVERSIBLE convention as GATE_PRIORITY_AUTHORS="".
+GATE_DIFF_SIZE_UNKNOWN_SENTINEL="${GATE_DIFF_SIZE_UNKNOWN_SENTINEL:-999999999}"
+case "$GATE_DIFF_SIZE_UNKNOWN_SENTINEL" in ''|*[!0-9]*) GATE_DIFF_SIZE_UNKNOWN_SENTINEL=999999999 ;; esac
 MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   --argjson now "$GATE_MARKER_NOW_EPOCH" \
   --argjson age_threshold "$GATE_MARKER_AGE_PROMOTE_SECONDS" \
   --argjson hard_threshold "$GATE_MARKER_HARD_AGE_SECONDS" \
   --argjson reserve_fresh "$GATE_FRESH_SLOT_DUE" \
+  --argjson diff_unknown "$GATE_DIFF_SIZE_UNKNOWN_SENTINEL" \
   --arg priority_authors "$GATE_PRIORITY_AUTHORS" '
   # ga-gpcx: matches both the current name (gate:exiled-tier5:N) and the
   # legacy name (gate:rebase-attempt:N, used before 2026-07-17) so a marker
@@ -7758,18 +7855,31 @@ MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   def crew_of: ([ (.description // "") | scan("(?:^|\n)branch:[ ]*crew/([^/ \n]+)/") ] | (.[0] // "") | if type == "array" then (.[0] // "") else . end);
   def prio_list: ($priority_authors | split(" ") | map(select(length>0)));
   def is_priority: (crew_of as $c | ($c != "" and ((prio_list | index($c)) != null))) or ((.labels // []) | any(. == "gate:priority"));
+  # ga-r8u92: diff_size feeds ONLY the two not-aged sort_by calls below — never
+  # the is_aged/is_overdue tiers, which stay pure age order on purpose (that is
+  # the existing anti-starvation bound; a large diff that ages still promotes
+  # exactly like today, unaffected by its size). created_epoch mirrors the
+  # try/catch-fromdateiso8601 idiom is_aged already uses, so a null/malformed
+  # created_at degrades to 0 (sorts last, never crashes) instead of throwing.
+  def diff_size: (.diff_lines // $diff_unknown);
+  def created_epoch: try (.created_at | fromdateiso8601) catch 0;
   # Tier order: overdue-emergency (priority-BLIND, oldest-first — ga-ddm76),
   # then reserve-fresh-slot (priority-BLIND, single freshest healthy marker,
   # only when $reserve_fresh — ga-vm428, see the shell comment above), then
   # priority-healthy (aged→newest), then other-healthy (aged→newest), then
   # rebase-fail (all authors, back of queue). Mirrors the aged/newest logic
   # inside each priority class so no invariant (aging bound, newest tiebreak) is lost.
+  # ga-r8u92: within EACH not-yet-aged healthy tier, smallest-diff-first is now
+  # the PRIMARY key (shortest-job-first minimizes mean queue wait), newest-first
+  # the secondary tiebreak (4cae0a2c49, Athos: desempate=mais novo — preserved
+  # for equal-size diffs; unknown-size diffs tie at the sentinel and fall
+  # through to it too).
   (map(select(is_overdue and (has_rebase_fail | not)))                              | sort_by(.created_at))
   + (if $reserve_fresh then (map(select(has_rebase_fail | not)) | sort_by(.created_at) | reverse | .[0:1]) else [] end)
   + (map(select(is_priority and (has_rebase_fail | not) and is_aged))                 | sort_by(.created_at))
-  + (map(select(is_priority and (has_rebase_fail | not) and (is_aged | not)))       | sort_by(.created_at) | reverse)
+  + (map(select(is_priority and (has_rebase_fail | not) and (is_aged | not)))       | sort_by([diff_size, -created_epoch]))
   + (map(select((is_priority | not) and (has_rebase_fail | not) and is_aged))       | sort_by(.created_at))
-  + (map(select((is_priority | not) and (has_rebase_fail | not) and (is_aged | not))) | sort_by(.created_at) | reverse)
+  + (map(select((is_priority | not) and (has_rebase_fail | not) and (is_aged | not))) | sort_by([diff_size, -created_epoch]))
   + (map(select(has_rebase_fail))                                                   | sort_by(.created_at) | reverse)
   | .[0]')
 MARKER_ID=$(printf '%s\n' "$MARKER" | jq -r '.id')
@@ -10007,9 +10117,7 @@ fi
 # reviewer can emit a verdict. Fail-safe: any git/parse failure leaves the counts
 # at 0 → the scaler returns the unchanged base timeout (today's behavior).
 DIFF_FILE_COUNT=$(printf '%s\n' "$CHANGED_FILES" | grep -c . 2>/dev/null || echo 0)
-DIFF_LINE_COUNT=$(git_rig diff --numstat "origin/$DEFAULT_BRANCH...origin/$BRANCH" 2>/dev/null \
-  | awk '{ if ($1 ~ /^[0-9]+$/) s += $1; if ($2 ~ /^[0-9]+$/) s += $2 } END { print s + 0 }' \
-  || echo 0)
+DIFF_LINE_COUNT=$(gate_measure_diff_lines "$DEFAULT_BRANCH" "$BRANCH")
 case "$DIFF_FILE_COUNT" in ''|*[!0-9]*) DIFF_FILE_COUNT=0 ;; esac
 case "$DIFF_LINE_COUNT" in ''|*[!0-9]*) DIFF_LINE_COUNT=0 ;; esac
 _VT_BASE="$VERDICT_TIMEOUT_MINUTES"
