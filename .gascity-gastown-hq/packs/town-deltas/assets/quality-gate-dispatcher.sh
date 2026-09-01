@@ -3117,6 +3117,74 @@ read_rebase_attempt() {
   printf '%s' "$n"
 }
 
+# gate_exile_watchdog_sweep <markers_json> <escalate_after_seconds> <now_epoch>
+# ga-faw5o DEFEITO 3 fix — see the Step 0b-0 call site below for the full
+# writeup of the gap this closes. A has_rebase_fail (exiled) marker only ever
+# advances its retry counter when actually RE-SELECTED, but selection only
+# reaches it via the very last tier — reachable exclusively when every
+# healthy tier is empty. In a queue that never fully empties, an exiled
+# marker is never re-selected, so it never reaches MAX_REBASE_ATTEMPTS and
+# the existing attempt-based escalation (Step 4c, mail-Mayor) never fires —
+# it can sit exiled indefinitely while the gate otherwise looks perfectly
+# healthy. This function is the selection-independent backstop: a pure scan
+# of the already-fetched $markers_json (zero extra Dolt I/O for markers that
+# don't need a write), escalating ONCE per marker (gate:exile-escalated
+# dedup) after it has sat exiled for longer than $escalate_after_seconds.
+#
+# Deliberately marker-scoped only — it mails Mayor with the marker id and
+# parks the marker at gate-status:needs-rebase via the same set_gate_status()
+# the attempt-based escalation paths use (so it gets identical dashboard
+# visibility and stops occupying the unreachable tier-6 slot), but does NOT
+# also mirror a label onto the source bead the way Step 4c does — that
+# mirroring needs BEAD_ID/BEAD_CITY resolution which only runs post-claim
+# (Step 2+), and keeping this watchdog independent of claim state is exactly
+# what lets it run for a marker that may never be claimable. Mayor can
+# `bd show <marker_id>` for full branch/bead context.
+# SELFTEST-EXTRACT gate-exile-watchdog: BEGIN
+gate_exile_watchdog_sweep() {
+  local markers_json="$1" escalate_after="${2:-86400}" now="${3:-}"
+  case "$now" in ''|*[!0-9]*) now=$(date -u +%s) ;; esac
+  local ids marker_id since_epoch elapsed
+  ids=$(printf '%s\n' "$markers_json" | jq -r '
+    .[] | select(
+      ((.labels // []) | map(select(test("^gate:(rebase-attempt|exiled-tier5):[0-9]+$"))) | length) > 0
+      and
+      ((.labels // []) | map(select(. == "gate:exile-escalated")) | length) == 0
+    ) | .id' 2>/dev/null || true)
+  [ -z "$ids" ] && return 0
+  while IFS= read -r marker_id; do
+    [ -z "$marker_id" ] && continue
+    since_epoch=$(printf '%s\n' "$markers_json" | jq -r --arg id "$marker_id" '
+      .[] | select(.id == $id) | (.labels // [])[]
+      | select(test("^gate:exiled-since:[0-9]+$"))
+      | sub("^gate:exiled-since:"; "")' 2>/dev/null | sort -rn | head -1 || true)
+    if [ -z "$since_epoch" ]; then
+      # First sweep observing this marker in exile — start the clock instead
+      # of guessing a retroactive time (the exile label only ever carried an
+      # attempt COUNT, ga-gpcx, never a timestamp of its own).
+      bd -C "$GC_CITY" label add "$marker_id" "gate:exiled-since:$now" -q 2>/dev/null || true
+      continue
+    fi
+    case "$since_epoch" in ''|*[!0-9]*) continue ;; esac
+    elapsed=$(( now - since_epoch ))
+    # Strict > (not >=), matching house convention (is_aged, ga-ddm76's
+    # is_overdue) — exactly-at-threshold falls through to next sweep, no flakiness.
+    if [ "$elapsed" -gt "$escalate_after" ]; then
+      warn "Marker $marker_id: exile-watchdog escalating after ${elapsed}s in rebase-fail exile with no re-selection (ga-faw5o defeito 3)."
+      bd -C "$GC_CITY" comment "$marker_id" "Gate WATCHDOG (ga-faw5o defeito 3): this marker has carried a rebase-fail exile label for $((elapsed/3600))h — past the ${escalate_after}s escalation threshold — without its retry counter ever advancing, because the queue never emptied down to tier 6 (the only tier a has_rebase_fail marker is reachable from). Escalating to Mayor now and parking at gate-status:needs-rebase instead of waiting indefinitely on a selection that may never come. Remove the gate:exiled-tier5:N label to force a re-anchor into the healthy queue if the underlying branch is actually fine." 2>/dev/null || true
+      gc --city "$GC_CITY" mail send mayor \
+        -s "Gate: exiled marker $marker_id starved ${elapsed}s behind a non-emptying queue (ga-faw5o)" \
+        -m "Marker $marker_id has carried a rebase-fail exile label for $((elapsed/3600))h without ever being re-selected — the normal attempt-based escalation (Step 4c) never ran because tier 6 is only reached when every healthy tier is empty, which this queue never does. This is DEFEITO 3 from ga-faw5o. Parked at gate-status:needs-rebase. bd show $marker_id for branch/bead details; needs a human look (rebase by hand, or remove the exile label to re-anchor)." 2>/dev/null \
+        || warn "Could not mail Mayor for exile-watchdog escalation on $marker_id"
+      bd -C "$GC_CITY" label add "$marker_id" "gate:exile-escalated" -q 2>/dev/null || true
+      set_gate_status "$marker_id" "needs-rebase"
+    fi
+  done <<EOF_GATE_EXILE_IDS
+$ids
+EOF_GATE_EXILE_IDS
+}
+# SELFTEST-EXTRACT gate-exile-watchdog: END
+
 # is_transient_spawn_error <spawn_err_text> — "1" if the captured stderr from a
 # failed `gc session new` reviewer spawn looks like a TRANSIENT connectivity
 # blip (Dolt/MySQL connection dropped mid-call), "0" otherwise. Pure (no I/O),
@@ -7509,6 +7577,34 @@ if [ "$COUNT" = "0" ]; then
   log "No queued markers. Exiting."
   exit 0
 fi
+
+# ── Step 0b-0 (ga-faw5o defeito 3): rebase-fail exile escalation watchdog ────
+# gate:exiled-tier5 markers only accumulate retry attempts when actually
+# RE-SELECTED (Step 4c below) — but has_rebase_fail sinks a marker to the
+# LAST of 6 tiers (the jq tier selection further down in Step 0b), reachable only when every
+# healthy tier is empty. In a queue that never fully empties, an exiled
+# marker is never re-selected, its attempt counter never reaches
+# MAX_REBASE_ATTEMPTS, and the existing mail-Mayor escalation (Step 4c) never
+# fires — the marker sits exiled indefinitely while the gate otherwise looks
+# perfectly healthy (queue draining, verdicts landing) and neither existing
+# watchdog catches it: gate-health-monitor.py's REAL-JAM only fires on an
+# untouched guard_queued event (every exiled marker already has a LATER
+# dispatcher event by construction — it had to fail at least once to be
+# exiled at all), and its GATE-NOMERGE check is queue-wide, so it never trips
+# while OTHER markers keep completing normally. Measured 2026-08-01: markers
+# stuck in gate-status:needs-rebase for up to 10 days, cleared only by a
+# human rebasing by hand.
+#
+# Deliberately placed BEFORE the quiet-hours/headroom gates below and runs
+# every sweep regardless of their verdict: this watchdog never admits new
+# work (no reviewer spawn, no headroom consumed), it only notices and
+# escalates existing exile state, so neither gate's "pause NEW admission"
+# rationale applies to it. Cheap: pure jq scan of $MARKERS_JSON already
+# fetched above; a write only happens for a marker that actually needs one.
+# See gate_exile_watchdog_sweep() (~line 3120) for the mechanics.
+GATE_EXILE_ESCALATE_AFTER_SECONDS="${GATE_EXILE_ESCALATE_AFTER_SECONDS:-86400}"
+case "$GATE_EXILE_ESCALATE_AFTER_SECONDS" in ''|*[!0-9]*) GATE_EXILE_ESCALATE_AFTER_SECONDS=86400 ;; esac
+gate_exile_watchdog_sweep "$MARKERS_JSON" "$GATE_EXILE_ESCALATE_AFTER_SECONDS" "$(date -u +%s)"
 
 # ── ga-dxyvxr: quiet-hours admission gate — PAUSE new-run admission 00h-08h ────
 # There IS queued work (COUNT>0 above), but Athos's quiet-hours decision
