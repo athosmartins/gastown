@@ -246,23 +246,39 @@ ELAPSED=$((THRESH + 5000))
 SINCE=$((NOW-ELAPSED))
 MARKERS=$(printf '[%s]' "$(mk m13 "gate-status:queued,gate:exiled-tier5:2,gate:exiled-since:$SINCE")")
 gate_exile_watchdog_sweep "$MARKERS" "$THRESH" "$NOW"
+# ga-faw5o gate_run=ga-eki4f (round 2): STATUS_LOG is asserted empty here too,
+# not just LABEL_ADD_LOG. The round-1 fix only gated gate:exile-escalated on
+# mail success but left set_gate_status("needs-rebase") unconditional — this
+# strips gate-status:queued from the marker regardless of mail outcome, and
+# the dispatcher's sole caller (Step 0b-0) scopes $markers_json to
+# gate-status:queued at fetch time with no re-fetch inside a sweep, so an
+# unconditional status flip on a FAILED attempt would remove the marker from
+# the only query that can ever re-select it — permanently dropping the retry
+# through a different door than the one round-1 closed. This exact gap is why
+# round-1's case (13) passed against the still-buggy code: it never looked at
+# STATUS_LOG.
 if echo "$MAIL_LOG" | grep -q "mayor" \
    && [ -z "$LABEL_ADD_LOG" ] \
+   && [ -z "$STATUS_LOG" ] \
    && echo "$WARN_LOG" | grep -qi "could not mail"; then
-  ok "mail attempted and failed -> gate:exile-escalated NOT stamped, failure warned (mail='$MAIL_LOG' labels='$LABEL_ADD_LOG')"
+  ok "mail attempted and failed -> gate:exile-escalated NOT stamped, gate-status left untouched (marker stays gate-status:queued and selectable), failure warned (mail='$MAIL_LOG' labels='$LABEL_ADD_LOG' status='$STATUS_LOG')"
 else
-  bad "expected an attempted-but-failed mail with no dedup label, got mail='$MAIL_LOG' labels='$LABEL_ADD_LOG' warn='$WARN_LOG'"
+  bad "expected an attempted-but-failed mail with no dedup label and no status change, got mail='$MAIL_LOG' labels='$LABEL_ADD_LOG' status='$STATUS_LOG' warn='$WARN_LOG'"
 fi
 # Same marker (since_epoch untouched by the failed attempt, so elapsed only
 # grew) is reconsidered on the NEXT sweep because gate:exile-escalated was
-# never applied. Simulate that sweep with mail now succeeding.
+# never applied AND gate-status:queued was never stripped (both writes now
+# gated on the identical success condition). Simulate that sweep with mail
+# now succeeding.
 MAIL_SHOULD_FAIL=0
 LABEL_ADD_LOG=""; MAIL_LOG=""; WARN_LOG=""; STATUS_LOG=""; COMMENT_LOG=""
 gate_exile_watchdog_sweep "$MARKERS" "$THRESH" "$((NOW+200))"
-if echo "$MAIL_LOG" | grep -q "mayor" && [ "$LABEL_ADD_LOG" = "|m13:gate:exile-escalated" ]; then
-  ok "later sweep (mail now succeeding) retries and escalates for real — the failed attempt was retried, not permanently dropped"
+if echo "$MAIL_LOG" | grep -q "mayor" \
+   && [ "$LABEL_ADD_LOG" = "|m13:gate:exile-escalated" ] \
+   && [ "$STATUS_LOG" = "|m13:needs-rebase" ]; then
+  ok "later sweep (mail now succeeding) retries, escalates for real, and NOW parks at needs-rebase — the failed attempt was retried, not permanently dropped (labels='$LABEL_ADD_LOG' status='$STATUS_LOG')"
 else
-  bad "expected retry sweep to succeed and stamp exile-escalated, got mail='$MAIL_LOG' labels='$LABEL_ADD_LOG'"
+  bad "expected retry sweep to succeed, stamp exile-escalated, and set gate-status, got mail='$MAIL_LOG' labels='$LABEL_ADD_LOG' status='$STATUS_LOG'"
 fi
 
 echo ""; echo "gate-exile-watchdog.selftest: PASS=$PASS FAIL=$FAIL"; [ "$FAIL" -eq 0 ] && exit 0 || exit 1

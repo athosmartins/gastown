@@ -3182,14 +3182,35 @@ gate_exile_watchdog_sweep() {
       # with no later sweep ever retrying. Leaving the label unset on
       # failure means the next sweep re-enters this branch (since_epoch is
       # unchanged, elapsed only grows) and tries the mail again.
+      #
+      # gate-review fix round 2 (ga-faw5o, gate_run=ga-eki4f): set_gate_status
+      # used to run UNCONDITIONALLY here, after this if/else — so it fired
+      # whether or not the mail above succeeded. set_gate_status() strips
+      # EVERY existing gate-status:* label (quality-gate-guard.sh, ga-i0n83
+      # add-then-remove), so a call here removes gate-status:queued from the
+      # marker regardless of mail outcome. The sole caller of this function
+      # (Step 0b-0 below) fetches $MARKERS_JSON exactly once per sweep,
+      # scoped to `-l gate-status:queued`, and never re-fetches inside a
+      # sweep — so once a marker loses that label it can never be seen by
+      # this function's own jq selection again, on any future sweep. Net
+      # effect: a transient mail failure on the exact sweep the threshold is
+      # crossed silently and PERMANENTLY dropped the Mayor notification,
+      # reopening the identical "notified vs never-notified collapse" this
+      # round-1 fix closed through the dedup label — just through the status
+      # write instead. Moving the status transition inside the successful-
+      # mail branch puts both writes (dedup label + status parking) on the
+      # exact same condition: only a confirmed-delivered mail ever takes the
+      # marker out of the gate-status:queued rotation this function depends
+      # on to be reconsidered. On failure, neither write happens, so the
+      # marker stays gate-status:queued and is retried on a later sweep.
       if gc --city "$GC_CITY" mail send mayor \
         -s "Gate: exiled marker $marker_id starved ${elapsed}s behind a non-emptying queue (ga-faw5o)" \
         -m "Marker $marker_id has carried a rebase-fail exile label for $((elapsed/3600))h without ever being re-selected — the normal attempt-based escalation (Step 4c) never ran because tier 6 is only reached when every healthy tier is empty, which this queue never does. This is DEFEITO 3 from ga-faw5o. Parked at gate-status:needs-rebase. bd show $marker_id for branch/bead details; needs a human look (rebase by hand, or remove the exile label to re-anchor)." 2>/dev/null; then
         bd -C "$GC_CITY" label add "$marker_id" "gate:exile-escalated" -q 2>/dev/null || true
+        set_gate_status "$marker_id" "needs-rebase"
       else
-        warn "Could not mail Mayor for exile-watchdog escalation on $marker_id — leaving gate:exile-escalated unset so this marker is retried on a later sweep instead of permanently dropped."
+        warn "Could not mail Mayor for exile-watchdog escalation on $marker_id — leaving gate:exile-escalated unset and gate-status:queued untouched so this marker is retried on a later sweep instead of permanently dropped."
       fi
-      set_gate_status "$marker_id" "needs-rebase"
     fi
   done <<EOF_GATE_EXILE_IDS
 $ids
