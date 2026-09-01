@@ -107,6 +107,17 @@ CONN_MAX="${GC_DOCTOR_CONN_MAX:-}"
 CONN_WARN_PCT="${GC_DOCTOR_CONN_WARN_PCT:-80}"
 BACKUP_STALE_S="${GC_DOCTOR_BACKUP_STALE_S:-108000}"  # 30h: this city's backup runs once/day at 04:00 (dolt-s3-backup.sh), not every 6h — see override comment above (ga-3wdlv)
 BACKUP_ARTIFACT_DIR="${GC_BACKUP_ARTIFACT_DIR:-$GC_CITY_PATH/.dolt-backup}"
+# ga-2uz59: the MEDIUM advisory below used to mail on every single 5-minute
+# cycle the condition held, with no dedup at all — 85 identical "Dolt health
+# advisory [MEDIUM]" mails landed in the Mayor's inbox in ~10h30, burying 8
+# distinct real signals (including a P0) in the noise. Same per-condition
+# cooldown-state-file pattern as gate-orphaned-label-watchdog.sh
+# (GOLW_ALERT_COOLDOWN_S=21600, "re-alerts for an already-flagged bead are
+# suppressed for N seconds") — same 6h default, same $HOME/.gastown/state
+# directory, different filename so the two never collide.
+GC_DOCTOR_STATE_DIR="${GC_DOCTOR_STATE_DIR:-$HOME/.gastown/state}"
+STATE_FILE="${GC_DOCTOR_STATE_FILE:-$GC_DOCTOR_STATE_DIR/mol-dog-doctor.state.json}"
+ADVISORY_COOLDOWN_S="${GC_DOCTOR_ADVISORY_COOLDOWN_S:-21600}"  # 6h — matches the two cited town precedents (ga-2uz59)
 
 dolt_sql() {
     DOLT_CLI_PASSWORD="${GC_DOLT_PASSWORD:-}" \
@@ -230,6 +241,87 @@ conn_should_warn() {
     [ "${count:-0}" -ge "$warn_at" ]
 }
 
+# state_read_field <state_file> <field> — reads one field from the JSON
+# cooldown-state file; empty string if the file or field doesn't exist yet
+# (first-ever run, or a resolved/OK cycle that cleared it). I/O wrapper only,
+# always returns 0 (jq failure falls back to an empty read, never propagates
+# under this script's `set -e`) — the actual alert DECISION lives in the pure
+# advisory_should_alert() below.
+state_read_field() {
+    local state_file="$1" field="$2"
+    [ -f "$state_file" ] || { printf ''; return 0; }
+    jq -r --arg f "$field" '.[$f] // empty' "$state_file" 2>/dev/null || printf ''
+    return 0
+}
+
+# state_write <state_file> <class> <alert_at> <latency_ms> <conn_count> <orphan_count>
+# Atomic (tmp+mv) write of the cooldown-state snapshot. Empty numeric args
+# (used for the OK/recovered cycle, which only wants to record class="OK")
+# collapse to 0 via ${x:-0} — never left blank, which would fail --argjson.
+# Best-effort: a write failure (unwritable state dir, disk full) must not
+# take down the doctor probe itself, so this always returns 0.
+state_write() {
+    local state_file="$1" class="$2" alert_at="$3" latency_ms="$4" conn_count="$5" orphan_count="$6"
+    mkdir -p "$(dirname "$state_file")" 2>/dev/null || true
+    jq -n --arg class "$class" --argjson alert_at "${alert_at:-0}" \
+        --argjson latency_ms "${latency_ms:-0}" --argjson conn_count "${conn_count:-0}" \
+        --argjson orphan_count "${orphan_count:-0}" \
+        '{class: $class, alert_at: $alert_at, latency_ms: $latency_ms, conn_count: $conn_count, orphan_count: $orphan_count}' \
+        > "${state_file}.tmp.$$" 2>/dev/null \
+        && mv -f "${state_file}.tmp.$$" "$state_file" 2>/dev/null \
+        || rm -f "${state_file}.tmp.$$" 2>/dev/null
+    return 0
+}
+
+# advisory_should_alert <prev_class> <elapsed_s> <cooldown_s> \
+#                        <latency_ms> <prev_latency_ms> \
+#                        <conn_count> <prev_conn_count> \
+#                        <orphan_count> <prev_orphan_count>
+# Pure predicate (ga-2uz59) — decides whether the MEDIUM advisory mail should
+# actually go out this cycle, vs. being suppressed as a duplicate of an
+# already-notified condition. Isolated exactly like conn_should_warn() above
+# so a test can drive it directly with real reported numbers. NEVER gates the
+# CRITICAL/unreachable escalation earlier in this script — that path always
+# fires, unconditionally, per this bug's own explicit "não suprimir HIGH/
+# CRITICAL por cooldown" acceptance criterion.
+#
+# Fires (return 0/true) when ANY of:
+#   (a) class changed — prev_class isn't "MEDIUM" (a fresh OK->MEDIUM transition)
+#   (b) cooldown has elapsed since the last actual alert
+#   (c) latency/connections/orphans got WORSE than the last alert's own snapshot
+#
+# Deliberately does NOT take backup-staleness as an input for (c): backup age
+# only ever grows while the condition holds (every 5-minute cycle is "worse"
+# than the last, by construction, until the next daily backup lands) — a
+# naive worse-than-last-time check on that one field would defeat the
+# cooldown entirely for the exact condition (a stale backup sitting for
+# hours) that produced this bug's 85 duplicate mails. Cooldown alone still
+# re-alerts on a persistently stale backup every ADVISORY_COOLDOWN_S.
+advisory_should_alert() {
+    local prev_class="$1" elapsed_s="$2" cooldown_s="$3" \
+          latency_ms="$4" prev_latency_ms="$5" \
+          conn_count="$6" prev_conn_count="$7" \
+          orphan_count="$8" prev_orphan_count="$9"
+
+    [ "$prev_class" != "MEDIUM" ] && return 0
+
+    case "$elapsed_s" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$elapsed_s" -ge "$cooldown_s" ] && return 0
+
+    case "$latency_ms" in ''|*[!0-9]*) latency_ms=0 ;; esac
+    case "$conn_count" in ''|*[!0-9]*) conn_count=0 ;; esac
+    case "$orphan_count" in ''|*[!0-9]*) orphan_count=0 ;; esac
+    case "$prev_latency_ms" in ''|*[!0-9]*) prev_latency_ms=-1 ;; esac
+    case "$prev_conn_count" in ''|*[!0-9]*) prev_conn_count=-1 ;; esac
+    case "$prev_orphan_count" in ''|*[!0-9]*) prev_orphan_count=-1 ;; esac
+
+    [ "$latency_ms" -gt "$prev_latency_ms" ] && return 0
+    [ "$conn_count" -gt "$prev_conn_count" ] && return 0
+    [ "$orphan_count" -gt "$prev_orphan_count" ] && return 0
+
+    return 1
+}
+
 # --- Step 1: Probe connectivity and measure latency ---
 
 PROBE_START_MS=$(now_ms)
@@ -349,14 +441,46 @@ fi
 # --- Step 3: Compose report and escalate if critical ---
 
 WARNINGS="${LATENCY_WARN}${CONN_WARN}${ORPHAN_WARN}${BACKUP_STALE}"
-if [ -n "$WARNINGS" ]; then
-    if ! send_mayor_mail \
-        -s "Dolt health advisory [MEDIUM]" \
-        -m "Latency: ${LATENCY_MS}ms${LATENCY_WARN}
+REPORT_BODY="Latency: ${LATENCY_MS}ms${LATENCY_WARN}
 Connections: ${CONN_COUNT}/${CONN_MAX_DISPLAY}${CONN_WARN}
 Disk: ${DISK_USAGE}
-Orphan DBs: ${ORPHAN_COUNT_DISPLAY}${ORPHAN_WARN}${BACKUP_STALE}"; then
-        :
+Orphan DBs: ${ORPHAN_COUNT_DISPLAY}${ORPHAN_WARN}${BACKUP_STALE}"
+
+if [ -n "$WARNINGS" ]; then
+    # ga-2uz59 AC2: the substantive payload always hits the log every cycle,
+    # mail or not — the cooldown below gates only the MAYOR MAIL, never this
+    # measurement record.
+    echo "doctor: MEDIUM condition this cycle —"
+    printf '%s\n' "$REPORT_BODY"
+
+    DOCTOR_NOW_EPOCH=$(date +%s)
+    PREV_CLASS=$(state_read_field "$STATE_FILE" class)
+    PREV_ALERT_AT=$(state_read_field "$STATE_FILE" alert_at)
+    PREV_LATENCY_MS=$(state_read_field "$STATE_FILE" latency_ms)
+    PREV_CONN_COUNT=$(state_read_field "$STATE_FILE" conn_count)
+    PREV_ORPHAN_COUNT=$(state_read_field "$STATE_FILE" orphan_count)
+    case "$PREV_ALERT_AT" in
+        ''|*[!0-9]*) DOCTOR_ELAPSED_S=999999999 ;;
+        *) DOCTOR_ELAPSED_S=$((DOCTOR_NOW_EPOCH - PREV_ALERT_AT)) ;;
+    esac
+
+    if advisory_should_alert "${PREV_CLASS:-OK}" "$DOCTOR_ELAPSED_S" "$ADVISORY_COOLDOWN_S" \
+        "$LATENCY_MS" "$PREV_LATENCY_MS" \
+        "$CONN_COUNT" "$PREV_CONN_COUNT" \
+        "$ORPHAN_COUNT" "$PREV_ORPHAN_COUNT"; then
+        if send_mayor_mail -s "Dolt health advisory [MEDIUM]" -m "$REPORT_BODY"; then
+            state_write "$STATE_FILE" "MEDIUM" "$DOCTOR_NOW_EPOCH" "$LATENCY_MS" "$CONN_COUNT" "$ORPHAN_COUNT"
+        fi
+    else
+        echo "doctor: MEDIUM advisory suppressed — within ${ADVISORY_COOLDOWN_S}s cooldown and not worsened since last alert (elapsed ${DOCTOR_ELAPSED_S}s)"
+    fi
+else
+    # Recovered (or never triggered) — clear the recorded class to OK so a
+    # FUTURE MEDIUM occurrence is treated as a fresh transition and alerts
+    # immediately, rather than inheriting a stale cooldown from an already-
+    # resolved incident (ga-2uz59 AC1a).
+    if [ -f "$STATE_FILE" ]; then
+        state_write "$STATE_FILE" "OK" "" "" "" ""
     fi
 fi
 

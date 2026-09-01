@@ -451,5 +451,186 @@ else
   bad "report/summary lines may print a blank instead of 'unknown' for an unmeasured cap — check CONN_MAX_DISPLAY usage"
 fi
 
+# ── ga-2uz59: MEDIUM advisory cooldown/dedup — 85 identical "Dolt health ─────
+# ── advisory [MEDIUM]" mails landed in the Mayor's inbox in ~10h30 (no dedup ──
+# ── at all), burying 8 distinct real signals (including a P0). Same style as ──
+# ── the rest of this file: extract the REAL pure function from the shipped ────
+# ── script and drive it with the actual reported numbers, don't hand-copy. ────
+echo "── MEDIUM advisory cooldown/dedup (ga-2uz59) ──"
+
+if grep -qE '^advisory_should_alert\(\)' "$SCRIPT" \
+    && grep -qE '^state_read_field\(\)' "$SCRIPT" \
+    && grep -qE '^state_write\(\)' "$SCRIPT"; then
+  ok "advisory_should_alert()/state_read_field()/state_write() are defined in the shipped script"
+else
+  bad "one or more of advisory_should_alert()/state_read_field()/state_write() missing from the shipped script"
+fi
+
+# ── drift-guard: the MEDIUM send_mayor_mail call site must actually be gated ──
+# ── by the new predicate, not just have it sitting unused nearby ──────────────
+if grep -qF 'if advisory_should_alert "${PREV_CLASS:-OK}"' "$SCRIPT"; then
+  ok "MEDIUM advisory mail is gated by advisory_should_alert()"
+else
+  bad "MEDIUM advisory mail no longer appears gated by advisory_should_alert() — dedup may have been bypassed"
+fi
+
+# ── drift-guard: the CRITICAL/unreachable escalation must NEVER be gated by ───
+# ── the cooldown — explicit ga-2uz59 acceptance criterion ("não suprimir ──────
+# ── HIGH/CRITICAL por cooldown"). Extract the lines between the unreachable ───
+# ── probe and its own exit 0, and confirm advisory_should_alert never ─────────
+# ── appears in that span.
+UNREACHABLE_SPAN=$(awk '/if ! dolt_sql -q "SELECT active_branch\(\)"/{f=1} f{print} f&&/^[[:space:]]*exit 0[[:space:]]*$/{exit}' "$SCRIPT")
+if printf '%s' "$UNREACHABLE_SPAN" | grep -q 'ESCALATION: Dolt server unreachable' \
+    && ! printf '%s' "$UNREACHABLE_SPAN" | grep -q 'advisory_should_alert'; then
+  ok "CRITICAL/unreachable escalation is NOT gated by the new cooldown — always fires, per AC3"
+else
+  bad "could not confirm the CRITICAL/unreachable escalation is ungated — verify by hand it still always fires"
+fi
+
+# ── drift-guard: the full report body must still hit the log every cycle, ─────
+# ── mail or not (ga-2uz59 AC2 — "o corte é no MAIL, não na medição") ──────────
+if grep -qF "printf '%s\\n' \"\$REPORT_BODY\"" "$SCRIPT" \
+    && grep -qF 'if [ -n "$WARNINGS" ]; then' "$SCRIPT"; then
+  ok "full report body is unconditionally logged whenever WARNINGS is non-empty, independent of the mail-cooldown decision"
+else
+  bad "could not confirm the report body is still logged unconditionally — a suppressed alert may now also lose its log record"
+fi
+
+# ── real arithmetic, not hand-copied: extract advisory_should_alert()'s ───────
+# ── ACTUAL source and drive it with the real reported numbers. ────────────────
+ADVISORY_FN_SNIPPET="$(mktemp)"
+sed -n '/^advisory_should_alert()/,/^}/p' "$SCRIPT" > "$ADVISORY_FN_SNIPPET"
+if [ -s "$ADVISORY_FN_SNIPPET" ]; then
+  # shellcheck disable=SC1090
+  source "$ADVISORY_FN_SNIPPET"
+  if command -v advisory_should_alert >/dev/null 2>&1; then
+
+    # Structural guard: this function must NEVER take backup-staleness as an
+    # input. Backup age only ever grows while the condition holds (every
+    # 5-min cycle looks "worse" than the last, by construction, until the
+    # next daily backup lands) — a worse-than-last-time check on that one
+    # field would defeat the cooldown for the EXACT condition that produced
+    # this bug's 85 duplicate mails. Guards against a well-intentioned future
+    # "fix" silently reintroducing the monotonic-creep trap.
+    if grep -qi 'backup' "$ADVISORY_FN_SNIPPET"; then
+      bad "advisory_should_alert() now references backup-staleness — this would defeat the cooldown for a persistently stale backup (backup age is monotonic while stale, so 'worse than last time' is true on every cycle)"
+    else
+      ok "advisory_should_alert() does not take backup-staleness as a worsening signal (monotonic-creep trap avoided)"
+    fi
+
+    # Falsifying check: the EXACT reported bug — same condition, 5 minutes
+    # (300s) apart, values unchanged — must now be SUPPRESSED, not re-mailed.
+    if advisory_should_alert "MEDIUM" 300 21600 84 84 42 42 0 0; then
+      bad "same MEDIUM condition 300s later with unchanged values STILL alerts — the ga-2uz59 duplicate-mail bug is not fixed"
+    else
+      ok "same MEDIUM condition 300s later with unchanged values is suppressed — the ga-2uz59 duplicate-mail bug is fixed"
+    fi
+
+    # Sanity: a FRESH occurrence (prev_class=OK, i.e. no prior state or a
+    # recovered condition) must still alert immediately — confirms this
+    # isn't a vacuous "always suppress" comparison.
+    if advisory_should_alert "OK" 999999999 21600 84 -1 42 -1 0 -1; then
+      ok "sanity: a fresh OK->MEDIUM transition still alerts immediately (not a vacuous always-suppress)"
+    else
+      bad "sanity check failed: a fresh OK->MEDIUM transition does not alert — the predicate is vacuously always-false"
+    fi
+
+    # AC1c: cooldown expiry must still re-alert on a persistently unchanged
+    # condition (the exact stale-backup shape) — otherwise this goes deaf.
+    if advisory_should_alert "MEDIUM" 21600 21600 84 84 42 42 0 0; then
+      ok "cooldown fully elapsed (21600s) re-alerts even with unchanged values — a persistent condition is not silenced forever"
+    else
+      bad "cooldown fully elapsed does NOT re-alert — fix over-corrected into permanent silence for a persistent condition"
+    fi
+    if advisory_should_alert "MEDIUM" 21599 21600 84 84 42 42 0 0; then
+      bad "1s under cooldown (21599s) still alerts — cooldown boundary is off by one"
+    else
+      ok "1s under cooldown (21599s) correctly suppresses"
+    fi
+
+    # AC1b: worsening within the SAME cooldown window must still alert
+    # immediately, using the actual reported ga-2uz59 latency reading
+    # (161ms -> 738ms).
+    if advisory_should_alert "MEDIUM" 300 21600 738 161 42 42 0 0; then
+      ok "latency worsening within cooldown (161ms->738ms, the real ga-2uz59 reading) still alerts immediately"
+    else
+      bad "latency worsening within cooldown does NOT alert — a genuine escalation would be silenced"
+    fi
+    if advisory_should_alert "MEDIUM" 300 21600 84 84 50 42 0 0; then
+      ok "connection-count worsening within cooldown still alerts immediately"
+    else
+      bad "connection-count worsening within cooldown does NOT alert"
+    fi
+    if advisory_should_alert "MEDIUM" 300 21600 84 84 42 42 1 0; then
+      ok "orphan-count worsening within cooldown still alerts immediately"
+    else
+      bad "orphan-count worsening within cooldown does NOT alert"
+    fi
+
+    # Non-regression: values getting BETTER (but still in WARN territory)
+    # within cooldown must NOT alert — only "worse than last alert" fires.
+    if advisory_should_alert "MEDIUM" 300 21600 84 738 42 42 0 0; then
+      bad "latency IMPROVING since the last alert (738ms->84ms) still re-alerts — only worsening should bypass cooldown"
+    else
+      ok "latency improving since the last alert correctly stays suppressed within cooldown"
+    fi
+  else
+    bad "advisory_should_alert() extracted but not callable after sourcing — extraction produced invalid bash"
+  fi
+else
+  bad "could not extract advisory_should_alert() source from $SCRIPT — sed range matched nothing"
+fi
+rm -f "$ADVISORY_FN_SNIPPET"
+
+# ── real I/O, not hand-copied: state_read_field()/state_write() touch only ────
+# ── the filesystem + jq (no GC_CITY_PATH/live-Dolt dependency), safe to run ───
+# ── for real against a throwaway tmp file, same rationale as sourcing ─────────
+# ── latency.sh for real above.
+STATE_FN_SNIPPET="$(mktemp)"
+sed -n '/^state_read_field()/,/^}/p' "$SCRIPT" > "$STATE_FN_SNIPPET"
+sed -n '/^state_write()/,/^}/p' "$SCRIPT" >> "$STATE_FN_SNIPPET"
+if [ -s "$STATE_FN_SNIPPET" ]; then
+  # shellcheck disable=SC1090
+  source "$STATE_FN_SNIPPET"
+  if command -v state_read_field >/dev/null 2>&1 && command -v state_write >/dev/null 2>&1; then
+    STATE_TMPDIR="$(mktemp -d)"
+    STATE_TMPFILE="$STATE_TMPDIR/mol-dog-doctor.state.json"
+
+    if [ -z "$(state_read_field "$STATE_TMPFILE" class)" ]; then
+      ok "state_read_field() on a non-existent state file returns empty, not an error"
+    else
+      bad "state_read_field() on a non-existent state file returned a non-empty value"
+    fi
+
+    state_write "$STATE_TMPFILE" "MEDIUM" 1788234056 84 42 0
+    RT_CLASS=$(state_read_field "$STATE_TMPFILE" class)
+    RT_ALERT_AT=$(state_read_field "$STATE_TMPFILE" alert_at)
+    RT_LATENCY=$(state_read_field "$STATE_TMPFILE" latency_ms)
+    if [ "$RT_CLASS" = "MEDIUM" ] && [ "$RT_ALERT_AT" = "1788234056" ] && [ "$RT_LATENCY" = "84" ]; then
+      ok "state_write()/state_read_field() round-trip preserves class/alert_at/latency_ms exactly"
+    else
+      bad "state round-trip mismatch: class='$RT_CLASS' alert_at='$RT_ALERT_AT' latency_ms='$RT_LATENCY' (expected MEDIUM/1788234056/84)"
+    fi
+
+    # AC1a: a recovered (OK) cycle must clear the class so a future MEDIUM
+    # occurrence is treated as a fresh transition, not gated by a stale
+    # cooldown from an already-resolved incident.
+    state_write "$STATE_TMPFILE" "OK" "" "" "" ""
+    RT_CLASS2=$(state_read_field "$STATE_TMPFILE" class)
+    if [ "$RT_CLASS2" = "OK" ]; then
+      ok "a recovered cycle correctly resets state class to OK"
+    else
+      bad "recovered cycle did not reset state class to OK (got '$RT_CLASS2') — a future re-occurrence would inherit a stale cooldown instead of alerting immediately"
+    fi
+
+    rm -rf "$STATE_TMPDIR"
+  else
+    bad "state_read_field()/state_write() extracted but not callable after sourcing"
+  fi
+else
+  bad "could not extract state_read_field()/state_write() source from $SCRIPT"
+fi
+rm -f "$STATE_FN_SNIPPET"
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
