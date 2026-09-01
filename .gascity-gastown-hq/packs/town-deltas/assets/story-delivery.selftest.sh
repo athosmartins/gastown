@@ -280,6 +280,53 @@ eq "verdict: branch_ref does not resolve → unresolvable" \
    "$(story_merge_verdict "$BARE_GDIR" "$BARE_CONTAINER" "no-such-ref" "$FOUND_SHA")" "unresolvable"
 rc1 story_merge_verdict "$BARE_GDIR" "$BARE_CONTAINER" "no-such-ref" "$FOUND_SHA"
 
+# ── 6b. story_merge_verdict — squash/rebase content-fallback (ga-d5rrr) ─────
+# A gate that reports "merged (sha=X)" where X was rebased/squashed before
+# landing: X itself is never a git ANCESTOR of main (new parent -> new hash)
+# even though the exact same diff IS on main under a DIFFERENT sha. Mirrors
+# merged-bead-janitor.sh's proven content_in_main fixture (its own §3c, the
+# wa-fvxj1 case) applied here to story_merge_verdict instead.
+echo "── 6b. story_merge_verdict squash/rebase content-fallback (ga-d5rrr) ──"
+git -C "$WORK" checkout -q -b squash-topic main
+printf 'squash-feature\n' > "$WORK/squash.txt"
+git -C "$WORK" add squash.txt
+git -C "$WORK" commit -q -m "work(ga-d5rrr-squash): feature on its own branch"
+SQUASH_TOPIC_SHA=$(git -C "$WORK" rev-parse HEAD)
+git -C "$WORK" push -q origin squash-topic
+git -C "$WORK" checkout -q main
+printf 'squash-feature\n' > "$WORK/squash.txt"
+git -C "$WORK" add squash.txt
+git -C "$WORK" commit -q -m "feat(re-land): re-committed same diff onto main (squash-merge shape)"
+git -C "$WORK" push -q origin main
+
+# Fixture sanity, proven independently of story_merge_verdict: the topic-branch
+# sha is genuinely NOT a git ancestor of main — if this ever came back true the
+# rest of this block would prove nothing (the "verified" assertion below could
+# pass for the OLD ancestry-only reason, not the new content-fallback).
+if git -C "$BARE_GDIR" merge-base --is-ancestor "$SQUASH_TOPIC_SHA" main 2>/dev/null; then
+  bad "fixture invalid: squash-topic sha unexpectedly IS a git ancestor of main — this test would not exercise the ga-d5rrr gap"
+else
+  ok "fixture sanity: squash-topic sha is genuinely NOT a git ancestor of main (the exact gap ga-d5rrr targets)"
+fi
+
+eq "verdict: sha not an ancestor (squashed/re-landed elsewhere) but content IS in main → verified" \
+   "$(story_merge_verdict "$BARE_GDIR" "$BARE_CONTAINER" "main" "$SQUASH_TOPIC_SHA")" "verified"
+rc0 story_merge_verdict "$BARE_GDIR" "$BARE_CONTAINER" "main" "$SQUASH_TOPIC_SHA"
+
+# NEGATIVE control: side-branch's sha (§6) carries a genuinely UNIQUE patch
+# (side.txt) not present anywhere in main. Re-assert it's STILL "not-ancestor"
+# after this fix — the content-fallback must never paper over a real
+# not-merged commit, only a same-content-different-sha one.
+eq "verdict: genuinely unmerged sha (unique content) still not-ancestor after the content-fallback fix" \
+   "$(story_merge_verdict "$BARE_GDIR" "$BARE_CONTAINER" "main" "$SIDE_SHA")" "not-ancestor"
+rc1 story_merge_verdict "$BARE_GDIR" "$BARE_CONTAINER" "main" "$SIDE_SHA"
+
+if grep -q 'rev-list --count --cherry-pick --right-only' "$SCRIPT"; then
+  ok "story_merge_verdict falls back to patch-id content check (ga-d5rrr)"
+else
+  bad "content-fallback (rev-list --cherry-pick --right-only) not found in $SCRIPT — did the ga-d5rrr fix get reverted?"
+fi
+
 # ── 7. task_reconciler_failed_sha_resolved — ga-as3p1 (sha-scoped, not bead) ─
 # Reuses this section's own fixtures: $FOUND_SHA is on main (the "slice that
 # passed and merged" role); $SIDE_SHA is a real commit that exists but was

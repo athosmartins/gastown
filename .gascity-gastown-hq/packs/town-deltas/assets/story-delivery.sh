@@ -231,12 +231,12 @@ extract_gate_merge_info() {
 }
 
 # story_merge_verdict <gdir> <container> <branch_ref> <sha> — echoes
-# "verified"|"not-ancestor"|"unresolvable"; rc0 iff "verified". Pure content
-# check: does <branch_ref> (e.g. origin/main, already fetched by the caller)
-# CONTAIN <sha> (the commit the gate said it merged)? Fails closed to
-# "unresolvable" (rc1) if either <sha> or <branch_ref> cannot be resolved in
-# <gdir> at all — unresolvable is not proof of absence, but it is also not
-# proof of merge, so it must never be treated the same as "verified" (ga-mmdm2:
+# "verified"|"not-ancestor"|"unresolvable"; rc0 iff "verified". Content check:
+# does <branch_ref> (e.g. origin/main, already fetched by the caller) CONTAIN
+# <sha> (the commit the gate said it merged)? Fails closed to "unresolvable"
+# (rc1) if either <sha> or <branch_ref> cannot be resolved in <gdir> at all —
+# unresolvable is not proof of absence, but it is also not proof of merge, so
+# it must never be treated the same as "verified" (ga-mmdm2:
 # "não consegui verificar" and "verifiquei e está ok" must not produce the
 # same result).
 #
@@ -245,16 +245,44 @@ extract_gate_merge_info() {
 # runtime tree fresh relative to origin" (ga-rhtu), already assuming origin has
 # the fix. This asks the prior question: did the story's own commit reach
 # origin's main AT ALL (ga-mmdm2). Both gaps are real and different.
+#
+# ga-d5rrr: strict ancestry ALONE false-negatives when <sha>'s own commit was
+# rebased or squashed before landing — the same content reaches <branch_ref>
+# under a DIFFERENT sha (new parent ⇒ new hash even though the diff is
+# identical), so <sha> is never an ancestor even though nothing it carries is
+# actually missing. Per the ga-d5rrr bug report, the Mayor's manual triage hit
+# this exact false reading on 4 beads in one day (2026-09-01:
+# wa-uc0uw/wa-96eth/wa-llxua/wa-shfen) — `git merge-base --is-ancestor` said
+# "not merged" while `git cherry origin/main origin/<branch>` showed zero
+# pending commits (content 100% delivered); this repo's own
+# gate-passed-not-mean-merged-never-verifies incident log independently
+# confirms the SAME false-negative shape already occurred live against THIS
+# function (story_merge_verdict, ga-fgdmol addendum, 2026-08-16 — squash
+# merge, sha mismatch, correct fix identified there as "verify by content").
+# The check below mirrors the SAME patch-id / content-equivalence technique
+# already proven live in merged-bead-janitor.sh's content_in_main()
+# (wa-fvxj1: squash, count 0 → correctly treated as merged) — reimplemented
+# here rather than shared, since the two scripts don't currently cross-source
+# each other's functions. A cherry-pick right-only count of 0 means every
+# commit reachable from <sha> but not <branch_ref> has an equivalent-patch
+# commit ALREADY on <branch_ref> — i.e. nothing <sha> carries is actually
+# missing from it.
 story_merge_verdict() {
   local gdir="$1" container="$2" branch_ref="$3" sha="$4"
   git_in "$gdir" "$container" rev-parse -q --verify "${sha}^{commit}" >/dev/null 2>&1 || { echo "unresolvable"; return 1; }
   git_in "$gdir" "$container" rev-parse -q --verify "$branch_ref" >/dev/null 2>&1 || { echo "unresolvable"; return 1; }
   if git_in "$gdir" "$container" merge-base --is-ancestor "$sha" "$branch_ref" 2>/dev/null; then
     echo "verified"
-  else
-    echo "not-ancestor"
-    return 1
+    return 0
   fi
+  local cherry_count
+  cherry_count=$(git_in "$gdir" "$container" rev-list --count --cherry-pick --right-only "${branch_ref}...${sha}" 2>/dev/null || echo "ERR")
+  if [ "$cherry_count" = "0" ]; then
+    echo "verified"
+    return 0
+  fi
+  echo "not-ancestor"
+  return 1
 }
 
 # gate_delivery_looks_partial() and its helpers (_gate_delivery_header_class,

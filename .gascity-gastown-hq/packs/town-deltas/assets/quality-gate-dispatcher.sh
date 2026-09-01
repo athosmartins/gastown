@@ -3299,6 +3299,16 @@ GATE_SPAWN_RETRY_MAX="${GATE_SPAWN_RETRY_MAX:-3}"                           # in
 GATE_SPAWN_RETRY_BACKOFF_SECS="${GATE_SPAWN_RETRY_BACKOFF_SECS:-3}"         # BASE backoff; doubles per attempt (see spawn-retry-loop)
 GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS="${GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS:-3}" # cross-sweep cap before parking at gate-status:error
 
+# ga-d5rrr: ga-l7n3v daemon-liveness deploy retry knobs — same shape as the
+# GATE_SPAWN_RETRY_* pair above (in-process, doubling backoff), a separate
+# budget/counter so a deploy retry can never shadow or exhaust a reviewer-spawn
+# retry. Declared here, BEFORE the GATE_DISPATCHER_LIB_ONLY cutoff below, for
+# the same reason as the pair above: a lib-only source (selftests) must see a
+# real default, not an unbound variable, when the deploy-retry-loop block is
+# extracted and evaluated directly.
+GATE_DEPLOY_RETRY_MAX="${GATE_DEPLOY_RETRY_MAX:-3}"                   # in-process deploy_cmd retries before declaring DEPLOY_FAILED
+GATE_DEPLOY_RETRY_BACKOFF_SECS="${GATE_DEPLOY_RETRY_BACKOFF_SECS:-3}" # BASE backoff; doubles per attempt (see deploy-retry-loop)
+
 # gate_status_transition <marker_id> <new_status> — replace ALL gate-status:*
 # labels on <marker_id> with a single gate-status:<new_status>, instead of
 # the per-callsite pattern this file otherwise uses (`label remove
@@ -5296,11 +5306,38 @@ PYEOF
               # laundered through that ambiguity — mirrors story-delivery.sh's
               # own DEPLOY_RC idiom exactly (:1317), which halts on deploy
               # failure rather than proceeding to story:done.
-              DR_DEPLOY_OUTPUT=$(eval "$DR_DEPLOY_CMD" 2>&1) && DR_DEPLOY_RC=$? || DR_DEPLOY_RC=$?
-              log "ga-l7n3v: deploy output: $DR_DEPLOY_OUTPUT"
+              #
+              # ga-d5rrr: retry with doubling backoff before declaring
+              # DEPLOY_FAILED — a single-attempt eval treated transient
+              # disk/load contention identically to a genuinely broken
+              # deploy. Measured live 2026-09-01: 3/3 DEPLOY_FAILED holds
+              # that day were confirmed self-healed on an immediate manual
+              # retry (city was at 1-6GB free disk that day, pushes failing
+              # and passing on retry — wa-gbam4). Same in-process
+              # retry/backoff SHAPE as the spawn-retry-loop above
+              # (is_transient_spawn_error / GATE_SPAWN_RETRY_*), but a plain
+              # unconditional retry — unlike a reviewer spawn, a failed `git
+              # pull --ff-only` has no cheap, reliably-classifiable
+              # error-text family to distinguish transient from permanent,
+              # and retrying a genuinely-broken deploy a few extra times
+              # before still correctly reporting DEPLOY_FAILED costs only a
+              # few seconds.
+              # SELFTEST-EXTRACT deploy-retry-loop: BEGIN
+              DR_DEPLOY_ATTEMPT=0
+              while :; do
+                DR_DEPLOY_ATTEMPT=$((DR_DEPLOY_ATTEMPT + 1))
+                DR_DEPLOY_OUTPUT=$(eval "$DR_DEPLOY_CMD" 2>&1) && DR_DEPLOY_RC=$? || DR_DEPLOY_RC=$?
+                [ "$DR_DEPLOY_RC" -eq 0 ] && break
+                [ "$DR_DEPLOY_ATTEMPT" -ge "$GATE_DEPLOY_RETRY_MAX" ] && break
+                DR_DEPLOY_BACKOFF_SECS=$((GATE_DEPLOY_RETRY_BACKOFF_SECS * (1 << (DR_DEPLOY_ATTEMPT - 1))))
+                warn "ga-l7n3v: deploy_cmd for rig $RIG failed (rc=$DR_DEPLOY_RC), attempt $DR_DEPLOY_ATTEMPT/$GATE_DEPLOY_RETRY_MAX — retrying after ${DR_DEPLOY_BACKOFF_SECS}s backoff (ga-d5rrr)."
+                sleep "$DR_DEPLOY_BACKOFF_SECS" 2>/dev/null || true
+              done
+              # SELFTEST-EXTRACT deploy-retry-loop: END
+              log "ga-l7n3v: deploy output (attempt $DR_DEPLOY_ATTEMPT/$GATE_DEPLOY_RETRY_MAX): $DR_DEPLOY_OUTPUT"
               if [ "$DR_DEPLOY_RC" -ne 0 ]; then
                 DR_DEPLOY_FAILED=1
-                warn "ga-l7n3v: deploy_cmd for rig $RIG FAILED (rc=$DR_DEPLOY_RC) — holding; not checking daemon freshness against a tree that never actually deployed."
+                warn "ga-l7n3v: deploy_cmd for rig $RIG FAILED after $DR_DEPLOY_ATTEMPT/$GATE_DEPLOY_RETRY_MAX attempts (rc=$DR_DEPLOY_RC) — holding; not checking daemon freshness against a tree that never actually deployed."
               fi
             fi
           fi
@@ -5311,7 +5348,7 @@ PYEOF
             # gate-fix closes) and hold directly, reusing the SAME hold path
             # as a VERIFY_FAILED/NEEDS_GUARDED_RESTART verdict below.
             DAEMON_HOLD_VERDICT="DEPLOY_FAILED"
-            DAEMON_HOLD_REASON="rig $RIG deploy_cmd failed (rc=$DR_DEPLOY_RC): $DR_DEPLOY_CMD"
+            DAEMON_HOLD_REASON="rig $RIG deploy_cmd failed after ${DR_DEPLOY_ATTEMPT:-1}/$GATE_DEPLOY_RETRY_MAX attempts (rc=$DR_DEPLOY_RC): $DR_DEPLOY_CMD"
             DAEMON_HOLD_DETAIL="$DR_DEPLOY_OUTPUT"
           else
             DR_POST_SHA=$(git -C "$DR_RUNTIME_DIR" rev-parse HEAD 2>/dev/null || echo "")
