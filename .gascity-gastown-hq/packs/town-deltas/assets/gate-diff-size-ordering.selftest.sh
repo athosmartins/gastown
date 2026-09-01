@@ -273,6 +273,98 @@ else
   bad "tier order drifted (overdue=$OVERDUE_LINE prio-aged=$PRIO_AGED_LINE broken=$BROKEN_LINE) — re-check concat order"
 fi
 
+echo "── (12)-(16) Step 0b-0 own annotate/merge logic (gate-feedback gate_run=ga-k5r6r) ──"
+# The tests above (1)-(11) only exercise the SELFTEST-EXTRACT "marker-select"
+# block, which consumes .diff_lines already set directly on synthetic
+# fixtures — by design it never touches Step 0b-0's own annotation/merge
+# logic (the jq calls that BUILD .diff_lines from a measured size). That gap
+# is exactly what let the gate_run=ga-k5r6r defect ship with zero coverage:
+# `VAR=$(jq ...) || VAR="$VAR"` looks like a recovery but re-assigns the
+# already-corrupted (empty) value onto itself, so one malformed record could
+# silently wipe every marker's annotation, or MARKERS_JSON entirely. The fix
+# extracted the two vulnerable steps into gate_diff_size_map_accumulate /
+# gate_diff_size_map_merge (own "diff-size-merge" sentinel, right before
+# Step 0b-0) so they're testable the same sentinel-extraction way, without
+# needing the surrounding loop's real git/rig calls.
+extract_merge_block() {
+  sed -n '/# SELFTEST-EXTRACT diff-size-merge: BEGIN/,/# SELFTEST-EXTRACT diff-size-merge: END/p' "$1"
+}
+MERGE_BLOCK="$(extract_merge_block "$DISPATCHER")"
+if [ -z "$MERGE_BLOCK" ]; then
+  bad "could not extract diff-size-merge helper block (sentinels missing?)"
+else
+  ok "located live diff-size-merge helper block via sentinel extraction"
+fi
+
+# Loads gate_diff_size_map_accumulate/_merge as real functions in THIS shell
+# (not a fresh bash -c per call, unlike select_marker() above) so multiple
+# calls below can chain naturally, mirroring how Step 0b-0's loop calls them
+# repeatedly against the same accumulator. `log` is stubbed to stdout (the
+# real one — line ~3747 — also just echoes) since every real call site
+# redirects it `>&2`; the stub lets test (13) observe that a failure IS
+# logged, not just that the return value survived.
+log() { printf '%s\n' "$*"; }
+eval "$MERGE_BLOCK"
+
+echo "── (12) baseline: normal accumulate+merge round trip is unaffected by the refactor ──"
+MAP1=$(gate_diff_size_map_accumulate "{}" "m1" "10")
+[ "$MAP1" = '{"m1":10}' ] && ok "accumulate: first entry recorded correctly ($MAP1)" \
+  || bad "accumulate: expected {\"m1\":10}, got '$MAP1'"
+MAP2=$(gate_diff_size_map_accumulate "$MAP1" "m2" "20")
+[ "$MAP2" = '{"m1":10,"m2":20}' ] && ok "accumulate: second entry appended without disturbing the first ($MAP2)" \
+  || bad "accumulate: expected {\"m1\":10,\"m2\":20}, got '$MAP2'"
+MARKERS2=$(printf '[{"id":"m1","created_at":"2026-01-01T00:00:00Z"},{"id":"m2","created_at":"2026-01-01T00:00:00Z"}]')
+MERGED2=$(gate_diff_size_map_merge "$MARKERS2" "$MAP2")
+M1_LINES=$(printf '%s' "$MERGED2" | jq -r '.[] | select(.id=="m1") | .diff_lines')
+M2_LINES=$(printf '%s' "$MERGED2" | jq -r '.[] | select(.id=="m2") | .diff_lines')
+[ "$M1_LINES" = "10" ] && [ "$M2_LINES" = "20" ] && ok "merge: both markers correctly annotated in the no-failure path" \
+  || bad "merge: expected m1=10 m2=20, got m1='$M1_LINES' m2='$M2_LINES'"
+
+echo "── (13) gate-feedback repro 1: a failed per-marker accumulate leaves PRIOR entries intact ──"
+# _ds_size="not-a-number" is exactly what a misbehaving gate_measure_diff_lines
+# (or any other unexpected non-numeric _ds_size) would produce — it makes
+# --argjson sz fail. Pre-fix, the buggy idiom silently reset the ENTIRE map
+# (m1's already-recorded entry included) to empty on this single failure.
+BEFORE_FAIL='{"m1":10}'
+AFTER_FAIL=$(gate_diff_size_map_accumulate "$BEFORE_FAIL" "m2" "not-a-number" 2>/dev/null)
+[ "$AFTER_FAIL" = "$BEFORE_FAIL" ] && ok "accumulate: malformed size for m2 leaves m1's prior entry intact, map='$AFTER_FAIL' (pre-fix this collapsed to empty)" \
+  || bad "accumulate: expected unchanged '$BEFORE_FAIL', got '$AFTER_FAIL' — a bad marker corrupted sibling entries"
+LOGGED=$(gate_diff_size_map_accumulate "$BEFORE_FAIL" "m2" "not-a-number" 2>&1 1>/dev/null)
+[ -n "$LOGGED" ] && ok "accumulate: the failure is logged, not silent ('$LOGGED')" \
+  || bad "accumulate: expected a log line on failure, got none"
+
+echo "── (14) gate-feedback repro 2: a corrupted diff-size map does not wipe MARKERS_JSON ──"
+# Mirrors the pre-fix final-merge hard-fail: --argjson sizes "" (or any
+# invalid-JSON map) used to empty MARKERS_JSON for the WHOLE sweep via
+# `|| true`, which swallows the exit code but cannot undo the assignment
+# that already ran.
+MARKERS_BEFORE=$(printf '[{"id":"m1","created_at":"2026-01-01T00:00:00Z"}]')
+MERGED_BAD=$(gate_diff_size_map_merge "$MARKERS_BEFORE" "not-valid-json" 2>/dev/null)
+[ "$MERGED_BAD" = "$MARKERS_BEFORE" ] && ok "merge: invalid diff-size map leaves MARKERS_JSON unchanged (pre-fix this collapsed to empty for the whole sweep)" \
+  || bad "merge: expected unchanged '$MARKERS_BEFORE', got '$MERGED_BAD'"
+
+echo "── (15) gate-feedback repro 3: numeric .id (malformed record) no longer errors the whole batch ──"
+# The reviewer's own repro: one marker's .id as a JSON number breaks
+# $sizes[.id] (jq cannot index an object with a number) unless normalized via
+# tostring. A healthy sibling marker in the SAME batch must still annotate.
+MARKERS_MIXED=$(printf '[{"id":123,"created_at":"2026-01-01T00:00:00Z"},{"id":"healthy","created_at":"2026-01-01T00:00:00Z"}]')
+SIZES_MIXED=$(gate_diff_size_map_accumulate "{}" "healthy" "7")
+MERGED_MIXED=$(gate_diff_size_map_merge "$MARKERS_MIXED" "$SIZES_MIXED" 2>/dev/null)
+HEALTHY_LINES=$(printf '%s' "$MERGED_MIXED" | jq -r '.[] | select(.id=="healthy") | .diff_lines' 2>/dev/null)
+[ -n "$MERGED_MIXED" ] && [ "$HEALTHY_LINES" = "7" ] && ok "merge: numeric .id sibling does not error the whole batch — healthy marker still annotated (diff_lines=7)" \
+  || bad "merge: numeric .id in the batch broke annotation for the healthy sibling (merged='$MERGED_MIXED', healthy_lines='$HEALTHY_LINES')"
+
+echo "── (16) drift-guards: old self-clobbering idiom gone, new helpers wired in ──"
+command grep -qE '_DIFF_SIZE_MAP="\$_DIFF_SIZE_MAP"' "$DISPATCHER" \
+  && bad "old self-clobbering idiom (_DIFF_SIZE_MAP=\$(...) || _DIFF_SIZE_MAP=\"\$_DIFF_SIZE_MAP\") still present" \
+  || ok "old self-clobbering accumulate idiom removed"
+grep -q 'gate_diff_size_map_accumulate' "$DISPATCHER" \
+  && ok "gate_diff_size_map_accumulate helper present" || bad "gate_diff_size_map_accumulate helper missing"
+grep -q 'gate_diff_size_map_merge' "$DISPATCHER" \
+  && ok "gate_diff_size_map_merge helper present" || bad "gate_diff_size_map_merge helper missing"
+grep -q '.id | tostring' "$DISPATCHER" \
+  && ok "final merge normalizes .id via tostring before indexing \$sizes" || bad "tostring normalization missing from final merge"
+
 echo ""
 echo "== gate-diff-size-ordering: PASS=$PASS FAIL=$FAIL =="
 [ "$FAIL" -eq 0 ]

@@ -7719,6 +7719,61 @@ GATE_DIFF_SIZE_UNKNOWN_SENTINEL="${GATE_DIFF_SIZE_UNKNOWN_SENTINEL:-999999999}"
 case "$GATE_DIFF_SIZE_ORDERING_ENABLED" in 0) : ;; *) GATE_DIFF_SIZE_ORDERING_ENABLED=1 ;; esac
 case "$GATE_DIFF_SIZE_UNKNOWN_SENTINEL" in ''|*[!0-9]*) GATE_DIFF_SIZE_UNKNOWN_SENTINEL=999999999 ;; esac
 
+# SELFTEST-EXTRACT diff-size-merge: BEGIN
+# ga-r8u92 gate-feedback (gate_run=ga-k5r6r): the map-accumulate and
+# final-merge steps below used to be inline `VAR=$(jq ...) || VAR="$VAR"`
+# one-liners. That pattern is a no-op "recovery": bash performs the
+# assignment — using the failed jq call's (empty) stdout — BEFORE `||`
+# runs, so the fallback re-assigns the already-corrupted (empty) value onto
+# itself, never the real prior value. One malformed record (e.g. a marker
+# whose `.id` arrives as a JSON number instead of a string, tripping jq's
+# "Cannot index object with number" on the `$sizes[.id]` lookup) could
+# therefore wipe every OTHER marker's annotation too, or empty MARKERS_JSON
+# entirely — indistinguishable downstream from a genuinely empty queue.
+#
+# Both helpers now compute into a throwaway `next` first — reset to empty
+# (not $prior) on failure via `|| next=""`, so success/failure is
+# unambiguous — and only commit it when non-empty; on failure they log and
+# echo the UNCHANGED prior value instead, so one bad marker degrades to
+# "not annotated this sweep" for itself alone (the same degrade path
+# GATE_DIFF_SIZE_ORDERING_ENABLED=0 already provides) instead of
+# corrupting the whole sweep. `next=$(cmd) || next=""` stays safe under
+# this script's `set -euo pipefail`: the `||` always succeeds (a bare
+# assignment never fails), so the compound statement never trips set -e
+# regardless of whether the piped jq call failed.
+gate_diff_size_map_accumulate() {
+  # $1=prior _DIFF_SIZE_MAP  $2=marker id  $3=measured size
+  local prior="$1" id="$2" sz="$3" next
+  next=$(printf '%s' "$prior" | jq -c --arg id "$id" --argjson sz "$sz" '. + {($id): $sz}' 2>/dev/null) || next=""
+  if [ -n "$next" ]; then
+    printf '%s' "$next"
+  else
+    log "  Step 0b-0: failed to record diff size for marker $id (measured value: '$sz') — leaving diff-size map unchanged for this marker." >&2
+    printf '%s' "$prior"
+  fi
+}
+
+gate_diff_size_map_merge() {
+  # $1=MARKERS_JSON  $2=_DIFF_SIZE_MAP
+  # Also normalizes `.id` via tostring before indexing $sizes: $sizes' own
+  # keys are always strings (built via --arg above), but a marker's `.id`
+  # in MARKERS_JSON could arrive as a JSON number for a malformed record —
+  # jq errors indexing an object with a number, which without this guard
+  # aborts the WHOLE map() partway through (every marker, not just the
+  # malformed one) and, pre-fix, silently emptied MARKERS_JSON for the
+  # entire sweep.
+  local markers="$1" sizes="$2" next
+  next=$(printf '%s\n' "$markers" | jq -c --argjson sizes "$sizes" \
+    'map(. + {diff_lines: ($sizes[(.id | tostring)] // null)})' 2>/dev/null) || next=""
+  if [ -n "$next" ]; then
+    printf '%s' "$next"
+  else
+    log "  Step 0b-0: failed to merge diff-size annotations into MARKERS_JSON — degrading to no-annotation this sweep (same as GATE_DIFF_SIZE_ORDERING_ENABLED=0)." >&2
+    printf '%s' "$markers"
+  fi
+}
+# SELFTEST-EXTRACT diff-size-merge: END
+
 if [ "$GATE_DIFF_SIZE_ORDERING_ENABLED" = "1" ]; then
   _DIFF_SIZE_MAP="{}"
   for _dsi in $(seq 0 $((COUNT - 1))); do
@@ -7760,10 +7815,9 @@ if [ "$GATE_DIFF_SIZE_ORDERING_ENABLED" = "1" ]; then
         log "  Step 0b-0: cannot resolve rig context for marker $_ds_id (rig=$RIG) — treating diff size as unknown (sentinel)."
       fi
     fi
-    _DIFF_SIZE_MAP=$(printf '%s' "$_DIFF_SIZE_MAP" | jq --arg id "$_ds_id" --argjson sz "$_ds_size" '. + {($id): $sz}' 2>/dev/null) || _DIFF_SIZE_MAP="$_DIFF_SIZE_MAP"
+    _DIFF_SIZE_MAP=$(gate_diff_size_map_accumulate "$_DIFF_SIZE_MAP" "$_ds_id" "$_ds_size")
   done
-  MARKERS_JSON=$(printf '%s\n' "$MARKERS_JSON" | jq --argjson sizes "$_DIFF_SIZE_MAP" \
-    'map(. + {diff_lines: ($sizes[.id] // null)})' 2>/dev/null) || true
+  MARKERS_JSON=$(gate_diff_size_map_merge "$MARKERS_JSON" "$_DIFF_SIZE_MAP")
 fi
 # SELFTEST-EXTRACT marker-select: BEGIN
 GATE_MARKER_AGE_PROMOTE_SECONDS="${GATE_MARKER_AGE_PROMOTE_SECONDS:-1800}"
