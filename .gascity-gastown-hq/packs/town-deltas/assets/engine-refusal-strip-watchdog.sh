@@ -96,6 +96,21 @@
 # re-protected?, a comment postdating the removal?) mirrors the primary path
 # exactly, and flagged beads share the same dedup state file and fold into
 # the same batched mayor mail — no separate mail path needed.
+#
+# Candidate discovery does NOT reuse the primary path's dolt_log.message
+# pre-filter (verified against the live server, not assumed): the real
+# 09-01 15:50:19 removal on ga-165vq committed as the GENERIC "bd: update
+# ga-165vq" — no "label removed" text at all — because it was one field
+# change inside a broader multi-field update, not a dedicated label-remove
+# call. A message LIKE 'bd: label removed%' filter would silently never
+# match this event class, which is exactly the class this second path
+# exists to catch. dolt_diff_labels carries its own to_commit_date column,
+# so the candidate query reads it directly (diff_type='removed' AND
+# from_label='pilot:no-auto-dispatch' AND to_commit_date > cutoff) instead
+# of going through dolt_log at all. The primary path's own message filter
+# (4 labels above) is unchanged here — whether it has the same latent gap
+# for a future generic-message removal of those labels is a separate,
+# unverified question, out of scope for this fix.
 
 # ── SAFETY VALVES ────────────────────────────────────────────────────────────
 #   - DRY_RUN=1: log decisions, take no action (selftest + supervised first run).
@@ -232,12 +247,20 @@ if ! CANDIDATES_CSV="$(DOLT_SQL "SELECT commit_hash, date FROM dolt_log WHERE me
     exit 0
 fi
 
-# Second query for the marker-removal path (ga-6u8e4). Deliberately does NOT
-# exit 0 on failure the way the primary query does above — a transient
-# failure here should not also suppress the primary detection pass.
+# Second query for the marker-removal path (ga-6u8e4). Reads dolt_diff_labels
+# DIRECTLY rather than pre-filtering on dolt_log.message like the primary
+# query above — see the header doc: a pilot:no-auto-dispatch removal that
+# rides inside a generic multi-field "bd: update <id>" commit (confirmed live
+# for the exact 09-01 15:50:19 ga-165vq event) carries no "label removed" text
+# for a message filter to match, so dolt_log can't be trusted as the source
+# here. dolt_diff_labels has its own to_commit_date column, so no join is
+# needed. DISTINCT collapses the (harmless but redundant) multiple rows a
+# single bulk commit produces when it touches several issues at once.
+# Deliberately does NOT exit 0 on failure the way the primary query does
+# above — a transient failure here should not also suppress the primary pass.
 MARKER_CANDIDATES_CSV=""
-if ! MARKER_CANDIDATES_CSV="$(DOLT_SQL "SELECT commit_hash, date FROM dolt_log WHERE message LIKE 'bd: label removed%' AND message LIKE '%pilot:no-auto-dispatch%' AND date > '$LOOKBACK_CUTOFF' ORDER BY date ASC;")"; then
-    log "WARN: dolt_log marker-candidate query failed (dolt unavailable?) -> skip marker pass this round"
+if ! MARKER_CANDIDATES_CSV="$(DOLT_SQL "SELECT DISTINCT to_commit AS commit_hash, to_commit_date AS date FROM dolt_diff_labels WHERE diff_type = 'removed' AND from_label = 'pilot:no-auto-dispatch' AND to_commit_date > '$LOOKBACK_CUTOFF' ORDER BY date ASC;")"; then
+    log "WARN: dolt_diff_labels marker-candidate query failed (dolt unavailable?) -> skip marker pass this round"
     MARKER_CANDIDATES_CSV=""
 fi
 

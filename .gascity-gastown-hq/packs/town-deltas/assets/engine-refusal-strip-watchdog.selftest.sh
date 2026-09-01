@@ -8,11 +8,15 @@
 # ga-pxtib) and asserts the actions it would take (recorded by the shims).
 # Exits 0 on PASS, non-zero on first failure.
 #
-# `gc dolt sql -q "USE hq; <query>" -r csv` is matched by the distinguishing
-# table name in the query text (dolt_log vs dolt_diff_labels — neither name is
-# a substring of the other, so this is unambiguous). `bd -C <city> show <id>`
-# is served from a per-issue JSON fixture file; `label add` / `comment` /
-# `mail send` are recorded to an actions log for assertion.
+# `gc dolt sql -q "USE hq; <query>" -r csv` is routed first by table name
+# (dolt_log vs dolt_diff_labels — neither name is a substring of the other).
+# Within dolt_diff_labels, a SECOND routing step distinguishes the per-commit
+# specific lookup (has "to_commit = '<hash>'") from the marker-removal
+# candidate-discovery scan (no to_commit clause — see the watchdog's own
+# header doc for why that query can't use dolt_log.message like its primary
+# counterpart does). `bd -C <city> show <id>` is served from a per-issue JSON
+# fixture file; `label add` / `comment` / `mail send` are recorded to an
+# actions log for assertion.
 
 set -uo pipefail
 
@@ -51,26 +55,32 @@ case "\$1 \$2" in
     q="\$4"
     case "\$q" in
       *dolt_diff_labels*)
-        hash="\$(printf '%s' "\$q" | sed -n "s/.*to_commit = '\\([^']*\\)'.*/\\1/p")"
-        if [ -f "$DIFF_DIR/\$hash.FAIL" ]; then exit 1; fi
-        f="$DIFF_DIR/\$hash.csv"
-        if [ -f "\$f" ]; then cat "\$f"; else printf 'from_issue_id,from_label\n'; fi
+        # Two DIFFERENT dolt_diff_labels queries land here: the per-commit
+        # specific lookup (has "to_commit = '<hash>'" -- used by both the
+        # primary AC1 loop and the marker-removal second pass to resolve
+        # issue_ids for one already-known commit) and the marker-removal
+        # CANDIDATE DISCOVERY scan itself (ga-6u8e4 second fix: no to_commit
+        # clause -- filters on from_label = 'pilot:no-auto-dispatch' and a
+        # to_commit_date lower bound instead, because dolt_log.message can't
+        # be trusted for this event class -- see the watchdog's own header
+        # doc). Route on presence of "to_commit = '".
+        case "\$q" in
+          *"to_commit = '"*)
+            hash="\$(printf '%s' "\$q" | sed -n "s/.*to_commit = '\\([^']*\\)'.*/\\1/p")"
+            if [ -f "$DIFF_DIR/\$hash.FAIL" ]; then exit 1; fi
+            f="$DIFF_DIR/\$hash.csv"
+            if [ -f "\$f" ]; then cat "\$f"; else printf 'from_issue_id,from_label\n'; fi
+            ;;
+          *)
+            if [ -f "$WORK/candidates.FAIL" ]; then exit 1; fi
+            if [ -f "$WORK/marker_candidates.csv" ]; then cat "$WORK/marker_candidates.csv"; else printf 'commit_hash,date\n'; fi
+            ;;
+        esac
         exit 0
         ;;
       *dolt_log*)
         if [ -f "$WORK/candidates.FAIL" ]; then exit 1; fi
-        # Two DIFFERENT dolt_log queries both land here (primary 4-label
-        # strip detection, and the marker-removal detection added for
-        # ga-6u8e4) — route on the distinguishing 'pilot:no-auto-dispatch'
-        # substring, which only the marker query's message filter contains.
-        case "\$q" in
-          *pilot:no-auto-dispatch*)
-            if [ -f "$WORK/marker_candidates.csv" ]; then cat "$WORK/marker_candidates.csv"; else printf 'commit_hash,date\n'; fi
-            ;;
-          *)
-            if [ -f "$CANDIDATES_CSV" ]; then cat "$CANDIDATES_CSV"; else printf 'commit_hash,date\n'; fi
-            ;;
-        esac
+        if [ -f "$CANDIDATES_CSV" ]; then cat "$CANDIDATES_CSV"; else printf 'commit_hash,date\n'; fi
         exit 0
         ;;
       *) printf 'x\n1\n'; exit 0 ;;
