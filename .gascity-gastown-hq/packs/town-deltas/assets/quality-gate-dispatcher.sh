@@ -7708,9 +7708,11 @@ fi
 # a small queue today.
 #
 # GATE_DIFF_SIZE_ORDERING_ENABLED=0 fully reverts to pre-ga-r8u92 behavior: no
-# marker gets a `.diff_lines` field, so the tier pipeline's `// 0` default
-# makes every candidate tie on the new sort's primary key, which collapses to
-# the exact newest-first tiebreak that sort already had (size_key's secondary
+# marker gets a `.diff_lines` field, so the tier pipeline's `diff_size` def
+# (below, inside the sentinel) falls back to GATE_DIFF_SIZE_UNKNOWN_SENTINEL
+# for every candidate — same value for all of them, so it makes every
+# candidate tie on the new sort's primary key, which collapses to the exact
+# newest-first tiebreak that sort already had (created_epoch is its secondary
 # key, below) — same REVERSIBLE convention as GATE_PRIORITY_AUTHORS="".
 GATE_DIFF_SIZE_ORDERING_ENABLED="${GATE_DIFF_SIZE_ORDERING_ENABLED:-1}"
 GATE_DIFF_SIZE_UNKNOWN_SENTINEL="${GATE_DIFF_SIZE_UNKNOWN_SENTINEL:-999999999}"
