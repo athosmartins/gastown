@@ -50,6 +50,16 @@ JSON_OUT=0
 
 CITY="${GC_CITY_PATH:-${GC_CITY:-.}}"
 [ -d "$CITY/.beads" ] || { echo "ERRO: '$CITY' não parece a raiz da HQ (sem .beads/). Setei GC_CITY_PATH?" >&2; exit 2; }
+# Absolutiza AGORA, antes de derivar qualquer path a partir de CITY (gate-
+# feedback ga-tae4f): sem isto, CITY fica relativo sempre que GC_CITY_PATH/
+# GC_CITY não estão setados (default "."), e todo $f do loop abaixo herda
+# essa relatividade. O `git -C "$SRC_TREE" apply --check "$f"` mais abaixo faz
+# um chdir REAL para $SRC_TREE antes de resolver $f -- um $f relativo então
+# resolve contra $SRC_TREE, não contra CITY onde o arquivo de fato mora, e o
+# apply falha nos dois sentidos (forward e reverse), classificando todo
+# PENDENTE real como ILEGÍVEL. Resolver aqui, uma única vez, corrige todo uso
+# de $CITY abaixo (PATCH_DIR, STATE_DIR, LOCK_FILE) de uma vez.
+CITY=$(cd "$CITY" && pwd) || { echo "ERRO: não consegui resolver '$CITY' como caminho absoluto." >&2; exit 2; }
 PATCH_DIR="$CITY/docs/pending-engine-window"
 
 # Fonte de verdade do engine gascity -- ver memória
@@ -187,11 +197,15 @@ else
     echo "  JÁ LANDOU:  $LANDED   <- reverse-check limpo, é limpeza de arquivo, não bloqueio"
     echo "  MARCADO:    $MARKED   <- sufixo .APLICADO/.SUPERSEDED, já resolvido"
     echo "  OUTRO:      $OTHER   <- não é .patch nem .patch marcado, fora do censo acima"
-    [ -n "$PENDING_L" ] && { echo; echo "  PENDENTE:"; printf "$PENDING_L\n"; }
-    [ -n "$UNKNOWN_L" ] && { echo; echo "  ILEGÍVEL:"; printf "$UNKNOWN_L\n"; }
-    [ -n "$LANDED_L" ]  && { echo; echo "  JÁ LANDOU:"; printf "$LANDED_L\n"; }
-    [ -n "$MARKED_L" ]  && { echo; echo "  MARCADO:"; printf "$MARKED_L\n"; }
-    [ -n "$OTHER_L" ]   && { echo; echo "  OUTRO:"; printf "$OTHER_L\n"; }
+    # %b (não a var como FORMAT direto -- gate-feedback ga-tae4f secundário):
+    # ainda expande os \n literais acumulados acima em newline real, mas um
+    # '%' num nome de arquivo de patch fica como dado, nunca reinterpretado
+    # como novo especificador de formato.
+    [ -n "$PENDING_L" ] && { echo; echo "  PENDENTE:"; printf '%b\n' "$PENDING_L"; }
+    [ -n "$UNKNOWN_L" ] && { echo; echo "  ILEGÍVEL:"; printf '%b\n' "$UNKNOWN_L"; }
+    [ -n "$LANDED_L" ]  && { echo; echo "  JÁ LANDOU:"; printf '%b\n' "$LANDED_L"; }
+    [ -n "$MARKED_L" ]  && { echo; echo "  MARCADO:"; printf '%b\n' "$MARKED_L"; }
+    [ -n "$OTHER_L" ]   && { echo; echo "  OUTRO:"; printf '%b\n' "$OTHER_L"; }
 fi
 
 if [ "$BREACHED" = "1" ]; then

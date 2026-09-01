@@ -260,6 +260,54 @@ OUT9H=$(env -i PATH="/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin" HOME="$HOME
         bash "$SCRIPT")
 printf '%s' "$OUT9H" | grep -q "ga-p9-notes-RECIPE.md" && ok "non-.patch artifact named in human-readable output" || bad "ga-p9-notes-RECIPE.md missing from human output"
 
+echo "── 13. regression (gate-feedback ga-tae4f): default relative CITY ('.') still classifies correctly ──"
+# The run_guard() helper above always forces GC_CITY_PATH="$CITY" as an
+# ABSOLUTE mktemp -d path -- it never exercises the script's own documented
+# default (GC_CITY_PATH/GC_CITY unset -> CITY="."), which is a real mode: the
+# script's usage line lists no required env vars, and its own .beads-missing
+# error message ("Setei GC_CITY_PATH?") anticipates someone running it bare.
+# Under the bug, a relative CITY makes every $f in the classification loop
+# relative too, and `git -C "$SRC_TREE" apply --check "$f"` resolves that
+# relative $f against SRC_TREE's chdir, not CITY -- so every real patch
+# misclassifies as ILEGÍVEL. Reuse the exact CITY fixture from section 3
+# (known-good composition: pending=2, landed=1, unknown=1, marked=1) but
+# invoke with cwd=$CITY and GC_CITY_PATH/GC_CITY genuinely unset (env -i,
+# neither var set) so CITY resolves to "." for real inside the script --
+# same effective directory, opposite path shape.
+: > "$NOTIFY_LOG"
+OUT10=$(cd "$CITY" && env -i \
+    PATH="/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    ENGINE_WINDOW_GUARD_SRC_TREE="$SRC" \
+    ENGINE_WINDOW_GUARD_SEEN_FILE="$WORK/seen-relcity.json" \
+    ENGINE_WINDOW_GUARD_LOCK="$WORK/relcity.lock" \
+    NOTIFY_BIN="$FAKE_NOTIFY" NOTIFY_LOG="$NOTIFY_LOG" \
+    bash "$SCRIPT" --json)
+echo "  raw: $OUT10"
+PENDING10=$(printf '%s' "$OUT10" | jq -r '.pending' 2>/dev/null || echo "?")
+LANDED10=$(printf '%s' "$OUT10" | jq -r '.landed' 2>/dev/null || echo "?")
+UNKNOWN10=$(printf '%s' "$OUT10" | jq -r '.unknown' 2>/dev/null || echo "?")
+MARKED10=$(printf '%s' "$OUT10" | jq -r '.marked' 2>/dev/null || echo "?")
+[ "$PENDING10" = "2" ] && ok "relative CITY: pending=2 (not misclassified as ILEGÍVEL)" || bad "relative CITY: pending expected 2, got $PENDING10 -- cross-tree apply --check is resolving \$f wrong again"
+[ "$LANDED10" = "1" ] && ok "relative CITY: landed=1" || bad "relative CITY: landed expected 1, got $LANDED10"
+[ "$UNKNOWN10" = "1" ] && ok "relative CITY: unknown=1 (only the genuine conflict, not the whole set)" || bad "relative CITY: unknown expected 1, got $UNKNOWN10"
+[ "$MARKED10" = "1" ] && ok "relative CITY: marked=1" || bad "relative CITY: marked expected 1, got $MARKED10"
+
+echo "── 14. regression (gate-feedback ga-tae4f secondary): a '%' in a patch filename survives the human-readable listing verbatim ──"
+PCT_CITY="$WORK/pct-city"
+mkdir -p "$PCT_CITY/docs/pending-engine-window" "$PCT_CITY/.beads"
+git -C "$PCT_CITY" init -q
+cp "$WORK/pending.patch" "$PCT_CITY/docs/pending-engine-window/ga-p10-100%-done.patch"
+: > "$NOTIFY_LOG"
+OUT11=$(env -i PATH="/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin" HOME="$HOME" \
+        GC_CITY_PATH="$PCT_CITY" \
+        ENGINE_WINDOW_GUARD_SRC_TREE="$SRC" \
+        ENGINE_WINDOW_GUARD_SEEN_FILE="$WORK/seen-pct.json" \
+        ENGINE_WINDOW_GUARD_LOCK="$WORK/pct.lock" \
+        NOTIFY_BIN="$FAKE_NOTIFY" NOTIFY_LOG="$NOTIFY_LOG" \
+        bash "$SCRIPT")
+printf '%s' "$OUT11" | grep -qF "ga-p10-100%-done.patch" && ok "'%' in filename printed verbatim, not consumed as a format directive" || bad "'%' in filename corrupted the listing (got: $OUT11)"
+
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
