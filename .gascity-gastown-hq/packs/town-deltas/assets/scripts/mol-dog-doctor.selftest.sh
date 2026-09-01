@@ -456,7 +456,11 @@ fi
 # ── at all), burying 8 distinct real signals (including a P0). Same style as ──
 # ── the rest of this file: extract the REAL pure function from the shipped ────
 # ── script and drive it with the actual reported numbers, don't hand-copy. ────
-echo "── MEDIUM advisory cooldown/dedup (ga-2uz59) ──"
+# ── ga-wrl5x extends this same section: the ga-2uz59 cooldown was live and ────
+# ── STILL got defeated, because (c) compared raw latency_ms/conn_count with a ─
+# ── bare "greater than" with no floor — see advisory_should_alert()'s docblock
+# ── for the full measured evidence (~4.6-7 advisories/h against a 6h cooldown).
+echo "── MEDIUM advisory cooldown/dedup (ga-2uz59, refined by ga-wrl5x) ──"
 
 if grep -qE '^advisory_should_alert\(\)' "$SCRIPT" \
     && grep -qE '^state_read_field\(\)' "$SCRIPT" \
@@ -472,6 +476,30 @@ if grep -qF 'if advisory_should_alert "${PREV_CLASS:-OK}"' "$SCRIPT"; then
   ok "MEDIUM advisory mail is gated by advisory_should_alert()"
 else
   bad "MEDIUM advisory mail no longer appears gated by advisory_should_alert() — dedup may have been bypassed"
+fi
+
+# ── drift-guard (ga-wrl5x): the caller must actually compute and pass the ─────
+# ── per-metric is_warn flags — without this wiring the function would always ──
+# ── receive an empty/unset 6th/9th/12th arg and (c) would go permanently deaf.
+if grep -qF 'LATENCY_IS_WARN="false"' "$SCRIPT" && grep -qF 'CONN_IS_WARN="false"' "$SCRIPT" \
+    && grep -qF 'ORPHAN_IS_WARN="false"' "$SCRIPT" \
+    && grep -qF '"$LATENCY_MS" "$PREV_LATENCY_MS" "$LATENCY_IS_WARN"' "$SCRIPT" \
+    && grep -qF '"$CONN_COUNT" "$PREV_CONN_COUNT" "$CONN_IS_WARN"' "$SCRIPT" \
+    && grep -qF '"$ORPHAN_COUNT" "$PREV_ORPHAN_COUNT" "$ORPHAN_IS_WARN"' "$SCRIPT"; then
+  ok "caller computes and passes LATENCY_IS_WARN/CONN_IS_WARN/ORPHAN_IS_WARN into advisory_should_alert()"
+else
+  bad "caller no longer wires the is_warn flags into advisory_should_alert() — (c) may be permanently deaf or ungated again"
+fi
+
+# ── drift-guard (ga-wrl5x): each (c) comparison must be gated on that same ────
+# ── metric's OWN is_warn flag — a bare "-gt" with no gate is exactly the class
+# ── of regression this bug fixed (healthy-range noise re-arming the mail).
+if grep -qE '\[ "\$latency_is_warn" = "true" \] && \[ "\$latency_ms" -gt "\$prev_latency_ms" \]' "$SCRIPT" \
+    && grep -qE '\[ "\$conn_is_warn" = "true" \] && \[ "\$conn_count" -gt "\$prev_conn_count" \]' "$SCRIPT" \
+    && grep -qE '\[ "\$orphan_is_warn" = "true" \] && \[ "\$orphan_count" -gt "\$prev_orphan_count" \]' "$SCRIPT"; then
+  ok "each (c) comparison is gated on that metric's own is_warn flag (ga-wrl5x noise-gate)"
+else
+  bad "(c) comparisons no longer appear gated on is_warn — the ga-wrl5x healthy-range-noise bug may have regressed"
 fi
 
 # ── drift-guard: the CRITICAL/unreachable escalation must NEVER be gated by ───
@@ -520,7 +548,8 @@ if [ -s "$ADVISORY_FN_SNIPPET" ]; then
 
     # Falsifying check: the EXACT reported bug — same condition, 5 minutes
     # (300s) apart, values unchanged — must now be SUPPRESSED, not re-mailed.
-    if advisory_should_alert "MEDIUM" 300 21600 84 84 42 42 0 0; then
+    # (all three is_warn flags false: 84ms/42conns/0orphans are healthy)
+    if advisory_should_alert "MEDIUM" 300 21600 84 84 false 42 42 false 0 0 false; then
       bad "same MEDIUM condition 300s later with unchanged values STILL alerts — the ga-2uz59 duplicate-mail bug is not fixed"
     else
       ok "same MEDIUM condition 300s later with unchanged values is suppressed — the ga-2uz59 duplicate-mail bug is fixed"
@@ -529,47 +558,113 @@ if [ -s "$ADVISORY_FN_SNIPPET" ]; then
     # Sanity: a FRESH occurrence (prev_class=OK, i.e. no prior state or a
     # recovered condition) must still alert immediately — confirms this
     # isn't a vacuous "always suppress" comparison.
-    if advisory_should_alert "OK" 999999999 21600 84 -1 42 -1 0 -1; then
+    if advisory_should_alert "OK" 999999999 21600 84 -1 false 42 -1 false 0 -1 false; then
       ok "sanity: a fresh OK->MEDIUM transition still alerts immediately (not a vacuous always-suppress)"
     else
       bad "sanity check failed: a fresh OK->MEDIUM transition does not alert — the predicate is vacuously always-false"
     fi
 
     # AC1c: cooldown expiry must still re-alert on a persistently unchanged
-    # condition (the exact stale-backup shape) — otherwise this goes deaf.
-    if advisory_should_alert "MEDIUM" 21600 21600 84 84 42 42 0 0; then
-      ok "cooldown fully elapsed (21600s) re-alerts even with unchanged values — a persistent condition is not silenced forever"
+    # condition (the exact stale-backup shape, where none of latency/conn/
+    # orphan are ever in warn state) — otherwise this goes deaf and the
+    # Mayor never hears about a stale backup again after the first mail.
+    if advisory_should_alert "MEDIUM" 21600 21600 84 84 false 42 42 false 0 0 false; then
+      ok "cooldown fully elapsed (21600s) re-alerts even with unchanged, never-warn values — a persistent condition is not silenced forever"
     else
       bad "cooldown fully elapsed does NOT re-alert — fix over-corrected into permanent silence for a persistent condition"
     fi
-    if advisory_should_alert "MEDIUM" 21599 21600 84 84 42 42 0 0; then
+    if advisory_should_alert "MEDIUM" 21599 21600 84 84 false 42 42 false 0 0 false; then
       bad "1s under cooldown (21599s) still alerts — cooldown boundary is off by one"
     else
       ok "1s under cooldown (21599s) correctly suppresses"
     fi
 
-    # AC1b: worsening within the SAME cooldown window must still alert
-    # immediately, using the actual reported ga-2uz59 latency reading
-    # (161ms -> 738ms).
-    if advisory_should_alert "MEDIUM" 300 21600 738 161 42 42 0 0; then
-      ok "latency worsening within cooldown (161ms->738ms, the real ga-2uz59 reading) still alerts immediately"
-    else
-      bad "latency worsening within cooldown does NOT alert — a genuine escalation would be silenced"
+    # ── ga-wrl5x falsifying check: the EXACT reported noisy sequences (both ────
+    # ── independent samples) must now be SUPPRESSED — every pair below is a ────
+    # ── real consecutive reading from the bug report, and every one sits ───────
+    # ── comfortably under its own warn threshold (latency < 5000ms default; ────
+    # ── conns < ~204 of a real 256 cap), so latency_is_warn/conn_is_warn are ───
+    # ── false for all of them, exactly as the live caller would compute.
+    echo "  ── ga-wrl5x: healthy-range noise no longer defeats the cooldown ──"
+    NOISE_PAIRS="123:1387 1387:109 109:157 157:1649 1649:1443 1443:176 176:461 461:1491 1491:117 117:273 273:125 125:204 461:464 464:233 233:125 125:143 143:257 257:586"
+    NOISE_FAIL=0
+    for pair in $NOISE_PAIRS; do
+      prev_ms="${pair%%:*}"; now_ms_val="${pair##*:}"
+      if advisory_should_alert "MEDIUM" 300 21600 "$now_ms_val" "$prev_ms" false 42 42 false 0 0 false; then
+        bad "reported healthy-range latency pair (${prev_ms}ms->${now_ms_val}ms) STILL alerts — the ga-wrl5x noise bug is not fixed"
+        NOISE_FAIL=1
+      fi
+    done
+    if [ "$NOISE_FAIL" -eq 0 ]; then
+      ok "all $(printf '%s\n' "$NOISE_PAIRS" | wc -w | tr -d ' ') reported healthy-range latency pairs are suppressed — the ga-wrl5x noise bug is fixed"
     fi
-    if advisory_should_alert "MEDIUM" 300 21600 84 84 50 42 0 0; then
-      ok "connection-count worsening within cooldown still alerts immediately"
+    # Same shape for the second sample's connection-count noise (10-35 against
+    # a real 256-connection cap, never near the 204 warn-at).
+    CONN_NOISE_FAIL=0
+    for pair in "23:24" "24:28" "28:33" "21:23"; do
+      prev_c="${pair%%:*}"; now_c="${pair##*:}"
+      if advisory_should_alert "MEDIUM" 300 21600 84 84 false "$now_c" "$prev_c" false 0 0 false; then
+        bad "reported healthy-range connection pair (${prev_c}->${now_c}) STILL alerts — the ga-wrl5x noise bug is not fixed"
+        CONN_NOISE_FAIL=1
+      fi
+    done
+    [ "$CONN_NOISE_FAIL" -eq 0 ] && ok "reported healthy-range connection-count pairs are suppressed — the ga-wrl5x noise bug is fixed"
+
+    # Sanity: the SAME noisy pair, with is_warn forced true (simulating the
+    # OLD ungated "greater than" check this bug removed), DOES alert — proves
+    # the reproduction above is real and the is_warn gate is what suppresses
+    # it, not some unrelated change.
+    if advisory_should_alert "MEDIUM" 300 21600 1387 123 true 42 42 false 0 0 false; then
+      ok "sanity: the same noisy pair (123ms->1387ms) DOES alert when is_warn is forced true — confirms this reproduces the real ga-wrl5x bug (the gate, not the arithmetic, is what changed)"
     else
-      bad "connection-count worsening within cooldown does NOT alert"
+      bad "sanity check failed: 123ms->1387ms with is_warn=true does not alert — the reproduction itself is wrong"
     fi
-    if advisory_should_alert "MEDIUM" 300 21600 84 84 42 42 1 0; then
-      ok "orphan-count worsening within cooldown still alerts immediately"
+
+    # ── genuine escalation must still bypass cooldown, even mid-incident ───────
+    # AC1b (revised by ga-wrl5x): a metric that actually CROSSES INTO its own
+    # warn territory (not just a raw increase) must still alert immediately.
+    # 6000ms exceeds the 5000ms default LATENCY_WARN_MS threshold.
+    if advisory_should_alert "MEDIUM" 300 21600 6000 84 true 42 42 false 0 0 false; then
+      ok "latency escalating from healthy (84ms) into real warn territory (6000ms >= 5000ms threshold) still alerts immediately within cooldown"
+    else
+      bad "latency escalating into real warn territory does NOT alert — a genuine escalation would be silenced"
+    fi
+    # The ORIGINAL ga-2uz59 fixture (161ms->738ms) is real production data
+    # showing this is NOT a genuine escalation (738ms never nears the 5000ms
+    # threshold) — it must no longer bypass cooldown. This documents the
+    # intentional behavior change from the original ga-2uz59 test.
+    if advisory_should_alert "MEDIUM" 300 21600 738 161 false 42 42 false 0 0 false; then
+      bad "latency worsening within healthy range (161ms->738ms) still bypasses cooldown — the ga-wrl5x noise bug has regressed"
+    else
+      ok "latency worsening within healthy range (161ms->738ms, the original ga-2uz59 fixture) no longer bypasses cooldown — intentional ga-wrl5x behavior change"
+    fi
+    # Same shape for connections: a genuine crossing into warn territory
+    # (assuming a 256 cap at 80% = warn-at 204) still alerts immediately...
+    if advisory_should_alert "MEDIUM" 300 21600 84 84 false 210 180 true 0 0 false; then
+      ok "connection count escalating into real warn territory (210 >= warn-at 204) still alerts immediately within cooldown"
+    else
+      bad "connection count escalating into real warn territory does NOT alert"
+    fi
+    # ...but the ORIGINAL ga-2uz59 fixture (42->50, both far under any
+    # realistic warn-at) no longer bypasses cooldown on its own.
+    if advisory_should_alert "MEDIUM" 300 21600 84 84 false 50 42 false 0 0 false; then
+      bad "connection-count worsening within healthy range (42->50) still bypasses cooldown — the ga-wrl5x noise bug has regressed"
+    else
+      ok "connection-count worsening within healthy range (42->50) no longer bypasses cooldown — intentional ga-wrl5x behavior change"
+    fi
+    # Orphan-count escalation (0->1) is UNCHANGED by ga-wrl5x: an orphan
+    # appearing at all (count>0) is inherently its own warn state, same as
+    # before this fix.
+    if advisory_should_alert "MEDIUM" 300 21600 84 84 false 42 42 false 1 0 true; then
+      ok "orphan-count worsening within cooldown still alerts immediately (non-regression: unchanged by ga-wrl5x)"
     else
       bad "orphan-count worsening within cooldown does NOT alert"
     fi
 
-    # Non-regression: values getting BETTER (but still in WARN territory)
-    # within cooldown must NOT alert — only "worse than last alert" fires.
-    if advisory_should_alert "MEDIUM" 300 21600 84 738 42 42 0 0; then
+    # Non-regression: values getting BETTER within cooldown must NOT alert —
+    # only "worse than last alert" fires (is_warn reflects the CURRENT, now-
+    # healthy reading, so this is doubly guarded: neither "worse" nor "warn").
+    if advisory_should_alert "MEDIUM" 300 21600 84 738 false 42 42 false 0 0 false; then
       bad "latency IMPROVING since the last alert (738ms->84ms) still re-alerts — only worsening should bypass cooldown"
     else
       ok "latency improving since the last alert correctly stays suppressed within cooldown"

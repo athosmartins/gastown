@@ -274,21 +274,40 @@ state_write() {
 }
 
 # advisory_should_alert <prev_class> <elapsed_s> <cooldown_s> \
-#                        <latency_ms> <prev_latency_ms> \
-#                        <conn_count> <prev_conn_count> \
-#                        <orphan_count> <prev_orphan_count>
-# Pure predicate (ga-2uz59) — decides whether the MEDIUM advisory mail should
-# actually go out this cycle, vs. being suppressed as a duplicate of an
-# already-notified condition. Isolated exactly like conn_should_warn() above
-# so a test can drive it directly with real reported numbers. NEVER gates the
-# CRITICAL/unreachable escalation earlier in this script — that path always
-# fires, unconditionally, per this bug's own explicit "não suprimir HIGH/
-# CRITICAL por cooldown" acceptance criterion.
+#                        <latency_ms> <prev_latency_ms> <latency_is_warn> \
+#                        <conn_count> <prev_conn_count> <conn_is_warn> \
+#                        <orphan_count> <prev_orphan_count> <orphan_is_warn>
+# Pure predicate (ga-2uz59, refined by ga-wrl5x) — decides whether the MEDIUM
+# advisory mail should actually go out this cycle, vs. being suppressed as a
+# duplicate of an already-notified condition. Isolated exactly like
+# conn_should_warn() above so a test can drive it directly with real reported
+# numbers. NEVER gates the CRITICAL/unreachable escalation earlier in this
+# script — that path always fires, unconditionally, per this bug's own
+# explicit "não suprimir HIGH/CRITICAL por cooldown" acceptance criterion.
 #
 # Fires (return 0/true) when ANY of:
 #   (a) class changed — prev_class isn't "MEDIUM" (a fresh OK->MEDIUM transition)
 #   (b) cooldown has elapsed since the last actual alert
-#   (c) latency/connections/orphans got WORSE than the last alert's own snapshot
+#   (c) a metric that is ITSELF currently in its own WARN state this cycle
+#       (per latency_should_warn()/conn_should_warn()/orphan_count>0, already
+#       computed by the caller — this function never recomputes thresholds)
+#       got WORSE than the last alert's own snapshot for that same metric
+#
+# ga-wrl5x: (c) used to compare raw latency_ms/conn_count/orphan_count with a
+# bare "greater than", regardless of whether that metric was anywhere near its
+# own warning threshold. Measured live (2 independent samples, same
+# persistently-stale-backup incident, ~2.3h total): latency oscillated
+# 109-1649ms and connections 10-35 — both comfortably inside their healthy
+# range (5000ms / ~204-of-256 warn thresholds) — yet every random uptick
+# against the LAST ALERT's own snapshot re-armed the mail, at ~4.6-7
+# advisories/hour with a 6h cooldown in effect (~27x the intended rate). The
+# backup-staleness exclusion below already anticipated a monotonic field
+# defeating the cooldown; healthy-range noise defeats it the same way, just
+# intermittently instead of monotonically. Gating each comparison on the
+# metric's OWN warn state anchors "worse" to the same severity notion the
+# rest of this script already uses to decide the condition is concerning in
+# the first place — a metric that never leaves its healthy range cannot make
+# the situation "worse" no matter how much it wobbles inside that range.
 #
 # Deliberately does NOT take backup-staleness as an input for (c): backup age
 # only ever grows while the condition holds (every 5-minute cycle is "worse"
@@ -299,9 +318,9 @@ state_write() {
 # re-alerts on a persistently stale backup every ADVISORY_COOLDOWN_S.
 advisory_should_alert() {
     local prev_class="$1" elapsed_s="$2" cooldown_s="$3" \
-          latency_ms="$4" prev_latency_ms="$5" \
-          conn_count="$6" prev_conn_count="$7" \
-          orphan_count="$8" prev_orphan_count="$9"
+          latency_ms="$4" prev_latency_ms="$5" latency_is_warn="$6" \
+          conn_count="$7" prev_conn_count="$8" conn_is_warn="$9" \
+          orphan_count="${10}" prev_orphan_count="${11}" orphan_is_warn="${12}"
 
     [ "$prev_class" != "MEDIUM" ] && return 0
 
@@ -315,9 +334,9 @@ advisory_should_alert() {
     case "$prev_conn_count" in ''|*[!0-9]*) prev_conn_count=-1 ;; esac
     case "$prev_orphan_count" in ''|*[!0-9]*) prev_orphan_count=-1 ;; esac
 
-    [ "$latency_ms" -gt "$prev_latency_ms" ] && return 0
-    [ "$conn_count" -gt "$prev_conn_count" ] && return 0
-    [ "$orphan_count" -gt "$prev_orphan_count" ] && return 0
+    [ "$latency_is_warn" = "true" ] && [ "$latency_ms" -gt "$prev_latency_ms" ] && return 0
+    [ "$conn_is_warn" = "true" ] && [ "$conn_count" -gt "$prev_conn_count" ] && return 0
+    [ "$orphan_is_warn" = "true" ] && [ "$orphan_count" -gt "$prev_orphan_count" ] && return 0
 
     return 1
 }
@@ -464,10 +483,26 @@ if [ -n "$WARNINGS" ]; then
         *) DOCTOR_ELAPSED_S=$((DOCTOR_NOW_EPOCH - PREV_ALERT_AT)) ;;
     esac
 
+    # ga-wrl5x: only a metric that is ITSELF in warn state this cycle (per the
+    # same LATENCY_WARN/CONN_WARN/ORPHAN_WARN strings already computed above)
+    # may count as "worse" below — see advisory_should_alert()'s docblock.
+    LATENCY_IS_WARN="false"
+    if [ -n "$LATENCY_WARN" ]; then
+        LATENCY_IS_WARN="true"
+    fi
+    CONN_IS_WARN="false"
+    if [ -n "$CONN_WARN" ]; then
+        CONN_IS_WARN="true"
+    fi
+    ORPHAN_IS_WARN="false"
+    if [ -n "$ORPHAN_WARN" ]; then
+        ORPHAN_IS_WARN="true"
+    fi
+
     if advisory_should_alert "${PREV_CLASS:-OK}" "$DOCTOR_ELAPSED_S" "$ADVISORY_COOLDOWN_S" \
-        "$LATENCY_MS" "$PREV_LATENCY_MS" \
-        "$CONN_COUNT" "$PREV_CONN_COUNT" \
-        "$ORPHAN_COUNT" "$PREV_ORPHAN_COUNT"; then
+        "$LATENCY_MS" "$PREV_LATENCY_MS" "$LATENCY_IS_WARN" \
+        "$CONN_COUNT" "$PREV_CONN_COUNT" "$CONN_IS_WARN" \
+        "$ORPHAN_COUNT" "$PREV_ORPHAN_COUNT" "$ORPHAN_IS_WARN"; then
         if send_mayor_mail -s "Dolt health advisory [MEDIUM]" -m "$REPORT_BODY"; then
             state_write "$STATE_FILE" "MEDIUM" "$DOCTOR_NOW_EPOCH" "$LATENCY_MS" "$CONN_COUNT" "$ORPHAN_COUNT"
         fi
