@@ -69,6 +69,34 @@
 # Still timeout-wrapped regardless (general Dolt-health defense, unrelated to
 # the attachment-specific bug).
 #
+# ── SECOND DETECTION PATH: THE WATCHDOG'S OWN VETO GETS REMOVED (ga-6u8e4) ──
+# The primary path above catches the 4 engine-refusal labels being stripped
+# directly. It does NOT catch a subtler recurrence of the exact same ad hoc
+# "session reconciliation" pattern: once THIS watchdog has already protected
+# a bead by adding pilot:no-auto-dispatch, a later ad hoc pass can remove
+# THAT veto too, without ever re-verifying the underlying engine-rebuild
+# constraint. Observed live 2026-08-29 through 2026-09-01 on ga-165vq: actor
+# gastown.mayor stripped needs:engine-window + pool:refused:engine-rebuild-
+# required directly (08-29, 08-30 — the primary path's exact target, and this
+# watchdog correctly re-protected it on 08-30 13:35:39 UTC), then on 09-01
+# 15:50:19 UTC removed pilot:no-auto-dispatch ITSELF (the watchdog's own
+# prior protection) and re-armed ctx:ready+exec:auto five seconds later — a
+# third exposure of the same bead, invisible to the primary path because no
+# commit in that window touched any of the original 4 labels.
+#
+# pilot:no-auto-dispatch is also the general-purpose park label for dozens of
+# unrelated reasons (on-device holds, human decisions, etc — see CLAUDE.md
+# town deltas), so treating every removal of it as suspect would trade one
+# false-positive class for a worse one. Instead: a pilot:no-auto-dispatch
+# removal is only in scope here if the bead ALSO carries a comment authored
+# by THIS watchdog (the literal "engine-refusal-strip-watchdog (ga-pxtib)"
+# prefix — WATCHDOG_MARKER below) that PREDATES the removal commit — i.e.
+# only beads this watchdog itself previously protected for an engine-refusal
+# reason are ever candidates. Every other check (closed?, already
+# re-protected?, a comment postdating the removal?) mirrors the primary path
+# exactly, and flagged beads share the same dedup state file and fold into
+# the same batched mayor mail — no separate mail path needed.
+
 # ── SAFETY VALVES ────────────────────────────────────────────────────────────
 #   - DRY_RUN=1: log decisions, take no action (selftest + supervised first run).
 #   - Kill-switch: .gc/state/engine-refusal-strip-watchdog.disabled -> no-op.
@@ -188,6 +216,11 @@ DOLT_SQL() {
 
 LABELS_SQL="'needs:engine-window','pool:refused:engine-rebuild-required','framework:engine','pilot:refused-reason:engine-rebuild-required'"
 
+# Fingerprint this watchdog stamps on every protective comment it writes
+# (both loops below). Used by the second detection path to scope itself to
+# beads THIS watchdog previously protected — see the header doc.
+WATCHDOG_MARKER="engine-refusal-strip-watchdog (ga-pxtib)"
+
 LOOKBACK_CUTOFF="$(date -u -v-"${LOOKBACK_HOURS}"H '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -u -d "-${LOOKBACK_HOURS} hours" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
 if [ -z "$LOOKBACK_CUTOFF" ]; then
     log "ERROR: could not compute lookback cutoff -> skip pass"
@@ -199,7 +232,17 @@ if ! CANDIDATES_CSV="$(DOLT_SQL "SELECT commit_hash, date FROM dolt_log WHERE me
     exit 0
 fi
 
+# Second query for the marker-removal path (ga-6u8e4). Deliberately does NOT
+# exit 0 on failure the way the primary query does above — a transient
+# failure here should not also suppress the primary detection pass.
+MARKER_CANDIDATES_CSV=""
+if ! MARKER_CANDIDATES_CSV="$(DOLT_SQL "SELECT commit_hash, date FROM dolt_log WHERE message LIKE 'bd: label removed%' AND message LIKE '%pilot:no-auto-dispatch%' AND date > '$LOOKBACK_CUTOFF' ORDER BY date ASC;")"; then
+    log "WARN: dolt_log marker-candidate query failed (dolt unavailable?) -> skip marker pass this round"
+    MARKER_CANDIDATES_CSV=""
+fi
+
 n_candidates=0
+n_marker_candidates=0
 n_flagged=0
 FLAGGED_IDS=""
 
@@ -291,7 +334,7 @@ while IFS=, read -r commit_hash commit_date; do
             continue
         fi
         timeout 20 "$BD" -C "$CITY" comment "$issue_id" \
-            "engine-refusal-strip-watchdog (ga-pxtib): this bead's engine-refusal labels were stripped by commit $commit_hash @ ${commit_date} UTC (an absorbed-patch reconciliation confirming source-tree byte-identity — see ga-fn35s), but the bead was never closed and has stayed unprotected since. Added pilot:no-auto-dispatch as a safety-net veto so Pilot cannot re-dispatch it as fresh work. Source-tree match is not proof the fix is live in the deployed binary — clear this veto manually once that is confirmed (or once you've determined the bead is legitimately out of engine-window scope)." \
+            "$WATCHDOG_MARKER: this bead's engine-refusal labels were stripped by commit $commit_hash @ ${commit_date} UTC (an absorbed-patch reconciliation confirming source-tree byte-identity — see ga-fn35s), but the bead was never closed and has stayed unprotected since. Added pilot:no-auto-dispatch as a safety-net veto so Pilot cannot re-dispatch it as fresh work. Source-tree match is not proof the fix is live in the deployed binary — clear this veto manually once that is confirmed (or once you've determined the bead is legitimately out of engine-window scope)." \
             >/dev/null 2>&1 || log "  WARN: comment failed for $issue_id (label add already succeeded)"
     done <<< "$issue_ids"
 
@@ -299,6 +342,103 @@ while IFS=, read -r commit_hash commit_date; do
         echo "$commit_hash" >> "$PROCESSED_FILE"
     fi
 done <<< "$CANDIDATES_CSV"
+
+# ── second pass: the watchdog's own veto being removed (ga-6u8e4) ──────────
+# Mirrors the loop above almost exactly (same helpers, same dedup file, same
+# per-bead checks), with one extra gate before anything else: skip unless a
+# prior WATCHDOG_MARKER comment predates this removal. That gate is what
+# keeps this scoped to beads this watchdog itself protected, instead of
+# reacting to every unrelated pilot:no-auto-dispatch clear in the city.
+while IFS=, read -r commit_hash commit_date; do
+    [ "$commit_hash" = "commit_hash" ] && continue   # header row
+    [ -z "$commit_hash" ] && continue
+    n_marker_candidates=$((n_marker_candidates + 1))
+
+    if grep -qxF "$commit_hash" "$PROCESSED_FILE" 2>/dev/null; then
+        continue   # already fully evaluated this event
+    fi
+
+    if ! DIFF_CSV="$(DOLT_SQL "SELECT from_issue_id, from_label FROM dolt_diff_labels WHERE to_commit = '$commit_hash' AND diff_type = 'removed' AND from_label = 'pilot:no-auto-dispatch';")"; then
+        log "WARN: dolt_diff_labels marker lookup failed for $commit_hash -> retry next pass"
+        continue   # do NOT mark processed — transient failure, not "no issues"
+    fi
+
+    issue_ids="$(printf '%s\n' "$DIFF_CSV" | tail -n +2 | awk -F, '{print $1}' | sort -u)"
+    strip_epoch="$(sql_to_epoch "$commit_date")"
+
+    commit_ok=1
+    while IFS= read -r issue_id; do
+        [ -z "$issue_id" ] && continue
+
+        bead_json="$(timeout 20 "$BD" -C "$CITY" show "$issue_id" --json --include-comments 2>/dev/null)"
+        if ! printf '%s' "$bead_json" | jq -e '.[0].id' >/dev/null 2>&1; then
+            bd_err="$(printf '%s' "$bead_json" | jq -r 'if type == "object" then (.error // empty) else empty end' 2>/dev/null)"
+            if [ -n "$bd_err" ]; then
+                log "$issue_id: bd show reports '$bd_err' (no longer resolves, likely deleted) -> nothing left to protect"
+                continue
+            fi
+            log "WARN: bd show returned no usable issue data for $issue_id (marker commit $commit_hash) -> retry next pass"
+            commit_ok=0
+            continue
+        fi
+
+        status="$(printf '%s' "$bead_json" | jq -r '.[0].status // empty' 2>/dev/null)"
+        if [ "$status" = "closed" ]; then
+            log "$issue_id: closed -> resolved, no action"
+            continue
+        fi
+
+        # The scoping gate: only beads THIS watchdog previously protected.
+        watchdog_comment_iso="$(printf '%s' "$bead_json" | jq -r --arg marker "$WATCHDOG_MARKER" '[(.[0].comments // [])[] | select((.text // "") | startswith($marker)) | .created_at] | max // empty' 2>/dev/null)"
+        if [ -z "$watchdog_comment_iso" ]; then
+            log "$issue_id: pilot:no-auto-dispatch removed but no prior watchdog comment found -> not our protection, no action"
+            continue
+        fi
+        wc_epoch="$(iso_to_epoch "$watchdog_comment_iso")"
+        if [ -z "$wc_epoch" ] || [ -z "$strip_epoch" ] || [ "$wc_epoch" -ge "$strip_epoch" ]; then
+            log "$issue_id: watchdog comment ($watchdog_comment_iso) does not predate this removal (commit $commit_hash @ ${commit_date} UTC) -> not this removal's target, no action"
+            continue
+        fi
+
+        labels_csv="$(printf '%s' "$bead_json" | jq -r '(.[0].labels // []) | join(",")' 2>/dev/null)"
+        case ",$labels_csv," in
+            *,pilot:no-auto-dispatch,*|*,no-auto-dispatch,*|*,needs:engine-window,*|*,pool:refused:engine-rebuild-required,*|*,framework:engine,*|*,pilot:refused-reason:engine-rebuild-required,*)
+                log "$issue_id: already protected again (labels: $labels_csv) -> no action"
+                continue
+                ;;
+        esac
+
+        latest_comment_iso="$(printf '%s' "$bead_json" | jq -r '[(.[0].comments // [])[].created_at] | max // empty' 2>/dev/null)"
+        if [ -n "$latest_comment_iso" ] && [ -n "$strip_epoch" ]; then
+            c_epoch="$(iso_to_epoch "$latest_comment_iso")"
+            if [ -n "$c_epoch" ] && [ "$c_epoch" -gt "$strip_epoch" ]; then
+                log "$issue_id: has a comment postdating this removal ($latest_comment_iso > $commit_date UTC) -> story moved on, no action"
+                continue
+            fi
+        fi
+
+        n_flagged=$((n_flagged + 1))
+        FLAGGED_IDS="$FLAGGED_IDS $issue_id"
+        log "$issue_id: EXPOSED — own veto removed (status=$status, marker-strip commit=$commit_hash @ ${commit_date} UTC) -> re-flag with pilot:no-auto-dispatch"
+        if [ "$DRY_RUN" = "1" ]; then
+            log "  [DRY_RUN] would: label add pilot:no-auto-dispatch, comment $issue_id"
+            commit_ok=0
+            continue
+        fi
+        if ! timeout 20 "$BD" -C "$CITY" label add "$issue_id" pilot:no-auto-dispatch >/dev/null 2>&1; then
+            log "  ERROR: label add failed for $issue_id -> retry next pass"
+            commit_ok=0
+            continue
+        fi
+        timeout 20 "$BD" -C "$CITY" comment "$issue_id" \
+            "$WATCHDOG_MARKER: this bead's pilot:no-auto-dispatch veto -- which this watchdog had previously added after detecting an engine-refusal-label strip (see this bead's earlier watchdog comment) -- was itself removed by commit $commit_hash @ ${commit_date} UTC, without the bead being closed or its engine-refusal labels restored. Re-added pilot:no-auto-dispatch as a safety-net veto so Pilot cannot re-dispatch it as fresh work. Clear this veto manually once you've confirmed the underlying engine-rebuild constraint no longer applies (fix confirmed LIVE in the deployed binary, not just source-tree match -- or the bead's scope changed to no longer need one)." \
+            >/dev/null 2>&1 || log "  WARN: comment failed for $issue_id (label add already succeeded)"
+    done <<< "$issue_ids"
+
+    if [ "$commit_ok" = "1" ]; then
+        echo "$commit_hash" >> "$PROCESSED_FILE"
+    fi
+done <<< "$MARKER_CANDIDATES_CSV"
 
 if [ "$n_flagged" -gt 0 ] && [ "$DRY_RUN" != "1" ]; then
     if timeout 15 "$GC" --city "$CITY" mail send mayor \
@@ -313,5 +453,5 @@ elif [ "$n_flagged" -gt 0 ]; then
     log "[DRY_RUN] would mail mayor about $n_flagged bead(s):$FLAGGED_IDS"
 fi
 
-log "=== pass complete (candidates=$n_candidates, flagged=$n_flagged) ==="
+log "=== pass complete (candidates=$n_candidates, marker_candidates=$n_marker_candidates, flagged=$n_flagged) ==="
 exit 0

@@ -59,7 +59,18 @@ case "\$1 \$2" in
         ;;
       *dolt_log*)
         if [ -f "$WORK/candidates.FAIL" ]; then exit 1; fi
-        if [ -f "$CANDIDATES_CSV" ]; then cat "$CANDIDATES_CSV"; else printf 'commit_hash,date\n'; fi
+        # Two DIFFERENT dolt_log queries both land here (primary 4-label
+        # strip detection, and the marker-removal detection added for
+        # ga-6u8e4) — route on the distinguishing 'pilot:no-auto-dispatch'
+        # substring, which only the marker query's message filter contains.
+        case "\$q" in
+          *pilot:no-auto-dispatch*)
+            if [ -f "$WORK/marker_candidates.csv" ]; then cat "$WORK/marker_candidates.csv"; else printf 'commit_hash,date\n'; fi
+            ;;
+          *)
+            if [ -f "$CANDIDATES_CSV" ]; then cat "$CANDIDATES_CSV"; else printf 'commit_hash,date\n'; fi
+            ;;
+        esac
         exit 0
         ;;
       *) printf 'x\n1\n'; exit 0 ;;
@@ -123,6 +134,18 @@ set_candidates() {
     } > "$CANDIDATES_CSV"
 }
 
+# set_marker_candidates "hash1|date1
+# hash2|date2" — same shape as set_candidates, but feeds the SEPARATE
+# marker-removal (pilot:no-auto-dispatch) detection query.
+set_marker_candidates() {
+    { echo "commit_hash,date"
+      printf '%s\n' "$1" | while IFS='|' read -r h d; do
+          [ -z "$h" ] && continue
+          echo "$h,$d"
+      done
+    } > "$WORK/marker_candidates.csv"
+}
+
 # set_diff <hash> "issue1|label1
 # issue2|label2"
 set_diff() {
@@ -162,7 +185,7 @@ reset_all() {
     rm -rf "$WORK/city" "$DIFF_DIR" "$BEADS_DIR" "$WORK/candidates.FAIL"
     mkdir -p "$WORK/city/.gc/state" "$DIFF_DIR" "$BEADS_DIR"
     : > "$ACTIONS"
-    rm -f "$CANDIDATES_CSV"
+    rm -f "$CANDIDATES_CSV" "$WORK/marker_candidates.csv"
 }
 
 run() {  # run [extra env assignments...]
@@ -360,6 +383,36 @@ if grep -qxF "hashN" "$WORK/city/.gc/state/engine-refusal-strip-watchdog.process
 else
     ok "hashN left unprocessed after ambiguous output (will retry, doesn't assume 'gone')"
 fi
+
+echo "== test 18 (ga-6u8e4): watchdog's OWN veto removed from a bead it previously protected -> re-flagged =="
+reset_all
+set_marker_candidates "hashO|$STRIP_TS"
+set_diff "hashO" "ga-reexposed1|pilot:no-auto-dispatch"
+set_bead "ga-reexposed1" "open" "area:infra" "[{\"created_at\":\"$COMMENT_BEFORE_TS\",\"text\":\"engine-refusal-strip-watchdog (ga-pxtib): this bead's engine-refusal labels were stripped by commit abc123 ...\"}]"
+run
+if grep -q "^label add ga-reexposed1 pilot:no-auto-dispatch$" "$ACTIONS" && grep -q "^comment ga-reexposed1$" "$ACTIONS"; then
+    ok "bead re-flagged after its own watchdog veto was removed"
+else bad "expected re-flag for ga-reexposed1, got: $(cat "$ACTIONS")"; fi
+
+echo "== test 19 (ga-6u8e4): pilot:no-auto-dispatch removed from a bead with NO prior watchdog comment -> NOT flagged (false-positive guard) =="
+reset_all
+set_marker_candidates "hashP|$STRIP_TS"
+set_diff "hashP" "ga-unrelated-veto|pilot:no-auto-dispatch"
+set_bead "ga-unrelated-veto" "open" "area:infra" "[{\"created_at\":\"$COMMENT_BEFORE_TS\",\"text\":\"cleared the on-device hold, phone available again\"}]"
+run
+if [ ! -s "$ACTIONS" ]; then
+    ok "unrelated no-auto-dispatch clear left untouched (no watchdog fingerprint)"
+else bad "false-flagged an unrelated veto removal: $(cat "$ACTIONS")"; fi
+
+echo "== test 20 (ga-6u8e4): watchdog's veto removed, but a comment POSTDATES it -> no action (story moved on) =="
+reset_all
+set_marker_candidates "hashQ|$STRIP_TS"
+set_diff "hashQ" "ga-reexposed-moved-on|pilot:no-auto-dispatch"
+set_bead "ga-reexposed-moved-on" "open" "area:infra" "[{\"created_at\":\"$COMMENT_BEFORE_TS\",\"text\":\"engine-refusal-strip-watchdog (ga-pxtib): this bead's engine-refusal labels were stripped ...\"},{\"created_at\":\"$COMMENT_AFTER_TS\",\"text\":\"confirmed the fix is live in the deployed binary, safe to clear\"}]"
+run
+if [ ! -s "$ACTIONS" ]; then
+    ok "bead with postdating comment on the marker-removal not re-flagged"
+else bad "acted despite postdating comment on marker removal: $(cat "$ACTIONS")"; fi
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
