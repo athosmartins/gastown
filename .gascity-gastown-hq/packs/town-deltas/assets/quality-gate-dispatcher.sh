@@ -4309,6 +4309,11 @@ if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH_SHA" ];
   case "$GATE_FS_VERDICT" in
     regression)
       OVERALL_VERDICT="FAIL"
+      GATE_SHA_FAIL_CLASS="code"  # ga-3wgx8: gate_full_suite_verdict's "regression" fires only when
+      # THIS branch SHA is red and $DEFAULT_BRANCH is provably green (see that function's own header) —
+      # the SHA's own content broke the suite, so resubmitting the same SHA would fail again. That is a
+      # code-content rejection, not an administrative hold (ga-4cy2t taxonomy); explicit so this site
+      # doesn't silently inherit the top-of-function default (ga-3ipxu review class of bug).
       FAIL_REASONS="$GATE_FS_DETAIL"
       _NH_STATUS=$(gate_apply_needs_human "$BEAD_CITY" "$BEAD_ID" "gate:needs-human:full-suite-regression")
       [ "$_NH_STATUS" != "armed" ] && warn "gate:needs-human FAILED TO APPLY on $BEAD_ID after retry (ga-3wgx8) — circuit-breaker NOT armed."

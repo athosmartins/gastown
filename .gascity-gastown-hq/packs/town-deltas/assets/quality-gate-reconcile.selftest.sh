@@ -342,9 +342,28 @@ grep -q 'date -j -f "%Y-%m-%dT%H:%M:%S"'     "$DISPATCHER" && bad "dispatcher ha
 # parse_marker_id: single canonical definition in guard, both scripts converge on it.
 grep -q 'parse_marker_id()'                  "$GUARD" && ok "guard defines parse_marker_id (canonical)"   || bad "guard missing parse_marker_id def"
 grep -q 'parse_marker_id'                    "$GUARD" && ok "guard Step 0b uses parse_marker_id"          || bad "guard Step 0b not using parse_marker_id"
-grep -q 'GATE_GUARD_LIB_ONLY=1.*quality-gate-guard' "$DISPATCHER" \
-  && ok "dispatcher sources guard lib for parse_marker_id" \
-  || bad "dispatcher not sourcing guard lib (DRY violation)"
+# ga-q4sadt: the source call moved off one hardcoded line onto a
+# readability-guarded 2-step (resolve the sibling path into a var, check
+# `[ -r ]`, THEN source the var) so a missing/unreadable guard.sh degrades
+# loudly instead of silently killing the dispatcher's entire top-level init
+# under `set -e` (source is a POSIX special builtin — a trailing `|| true`
+# never guards it). That legitimately split "GATE_GUARD_LIB_ONLY=1 source"
+# and the literal "quality-gate-guard.sh" path across separate lines,
+# breaking a same-line grep for both tokens. Check a window around the
+# source call instead of requiring same-line co-occurrence.
+DISPATCHER_GUARD_SRC_LN=$(grep -n 'GATE_GUARD_LIB_ONLY=1 source' "$DISPATCHER" | head -1 | cut -d: -f1 || true)
+DISPATCHER_GUARD_SRC_LN=${DISPATCHER_GUARD_SRC_LN:-0}
+DISPATCHER_GUARD_SRC_CTX=""
+if [ "$DISPATCHER_GUARD_SRC_LN" -gt 0 ]; then
+  CTX_START=$((DISPATCHER_GUARD_SRC_LN - 5))
+  [ "$CTX_START" -lt 1 ] && CTX_START=1
+  DISPATCHER_GUARD_SRC_CTX=$(sed -n "${CTX_START},${DISPATCHER_GUARD_SRC_LN}p" "$DISPATCHER")
+fi
+if [[ "$DISPATCHER_GUARD_SRC_CTX" == *quality-gate-guard* ]]; then
+  ok "dispatcher sources guard lib for parse_marker_id"
+else
+  bad "dispatcher not sourcing guard lib (DRY violation)"
+fi
 grep -q 'parse_marker_id'                    "$DISPATCHER" && ok "dispatcher supersede_sibling_runs uses parse_marker_id" || bad "dispatcher not using parse_marker_id"
 
 # ── 4. drift-guard: dispatcher proactively supersedes the guard's sibling run ─
