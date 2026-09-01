@@ -372,6 +372,25 @@ if [ -z "$BASE_COMMIT" ]; then
   echo "  Marker NOT created. Re-run /gate-done."
   exit 1
 fi
+
+# ga-us6fc FAIL CLOSED: refuse to create a marker when HEAD is ALREADY an
+# ancestor of this freshly-fetched origin/main — i.e. the diff about to be
+# submitted for review is EMPTY. Live incident: a resumed session's local
+# origin/main ref was stale (last fetched before its own prior incarnation's
+# fix had merged), so its worktree diff check looked non-empty even though
+# the branch had already fully merged. BASE_COMMIT above IS fresh, but
+# nothing before this point compared it against the branch's own HEAD — so
+# a marker got created, and a reviewer would have been spun up to review
+# zero lines of diff.
+if git merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
+  echo "ERROR: branch '$BRANCH' is already fully merged into origin/main"
+  echo "  (HEAD is an ancestor of origin/main after a fresh fetch)."
+  echo "  There is nothing to review — marker NOT created."
+  echo "  If you expected new work here, check you're on the right"
+  echo "  branch/worktree, or that a prior gate cycle for this same"
+  echo "  bead didn't already pass (check the bead's own comments)."
+  exit 1
+fi
 # Rig list (RIG_LIST_JSON) was already fetched above during bead_id validation.
 CWD_TOP=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 
