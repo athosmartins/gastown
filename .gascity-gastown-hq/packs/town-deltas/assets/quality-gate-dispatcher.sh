@@ -7735,7 +7735,25 @@ if [ "$GATE_DIFF_SIZE_ORDERING_ENABLED" = "1" ]; then
       # re-derive them all fresh from the sweep's OWN (selected) candidate
       # before use (see Step 0a-4's own comment for the full rationale).
       if gate_resolve_rig_context; then
-        _ds_size=$(gate_measure_diff_lines "$DEFAULT_BRANCH" "$_ds_branch")
+        # ga-r8u92 gate-feedback: gate_resolve_rig_context succeeding proves the
+        # RIG/REPO resolved — it says nothing about whether THIS branch's ref is
+        # actually present locally yet. `git diff --numstat` on a ref that does
+        # not resolve (not yet fetched — exactly the just-pushed case the
+        # unknown-sentinel exists to protect against) fails SILENTLY: git's
+        # error goes to stderr, the pipe into awk sees empty input, and awk's
+        # END block still prints "0" regardless of the upstream failure — so
+        # gate_measure_diff_lines's own `|| echo 0` fallback never even fires,
+        # and a genuine 0-line diff collides with "could not measure" on the
+        # exact value this whole mechanism exists to keep OUT of the
+        # smallest-wins slot. Verify the ref itself resolves first
+        # (rig_resolve_commit — the same hardened "is this ref real" check
+        # ga-ljbx already uses everywhere else in this file) before trusting
+        # the measurement.
+        if [ -n "$(rig_resolve_commit "origin/$_ds_branch")" ]; then
+          _ds_size=$(gate_measure_diff_lines "$DEFAULT_BRANCH" "$_ds_branch")
+        else
+          log "  Step 0b-0: origin/$_ds_branch does not resolve to a real commit for marker $_ds_id (unfetched or force-pushed away) — treating diff size as unknown (sentinel)."
+        fi
       else
         log "  Step 0b-0: cannot resolve rig context for marker $_ds_id (rig=$RIG) — treating diff size as unknown (sentinel)."
       fi
