@@ -151,16 +151,27 @@ gc rig list
 
 **2. For each rig, collect:**
 
-a) **Issues filed and closed** — bounded on BOTH ends, [SINCE, UNTIL). The
-filed-count query needs `--all`: `bd list` with no `--status`/`--all` flag
-silently excludes anything already closed by query time, so any issue
-created in-window but since closed (common for this rig's own same-day
-chore/session/step/molecule bookkeeping beads) vanishes from the count —
-same reason item 2c below carries `--all`. The closed-count query is
-unaffected; it already passes `--status=closed` explicitly:
+a) **Issues filed and closed** — bounded on BOTH ends, [SINCE, UNTIL), AND
+per-rig scoped like every other sub-item below it (ga-c2tv3l, 2026-09-01): a
+prior version of this query ran bare `gc bd list`, no `-C`, unlike 2b/2c and
+every other "for each rig" sub-item in this step. Bare `gc bd` resolves its
+database by auto-discovery from the CWD — for this formula's own execution
+directory (a dog's home dir under .gascity-gastown-hq) that's HQ/gascity, so
+every non-HQ rig's Filed/Closed columns in the digest's "By Rig" table were
+silently reading HQ's own counts instead of that rig's, every run, since this
+formula existed. Reproduced live 2026-08-28 (see this bead's comments) before
+this fix landed. Same mechanism `ga-2c2daa` already confirmed and fixed for
+2c/3b — this was the one sibling sub-item it missed. The filed-count query
+needs `--all`: `bd list` with no `--status`/`--all` flag silently excludes
+anything already closed by query time, so any issue created in-window but
+since closed (common for this rig's own same-day chore/session/step/molecule
+bookkeeping beads) vanishes from the count — same reason item 2c below
+carries `--all`. The closed-count query is unaffected; it already passes
+`--status=closed` explicitly:
 ```bash
-gc bd list --all --created-after=$SINCE --created-before=$UNTIL --json --limit=0
-gc bd list --status=closed --closed-after=$SINCE --closed-before=$UNTIL --json --limit=0
+RIG_PATH=<rig-path>   # from `gc rig list`, one rig at a time — see 2b's commit loop
+gc bd -C "$RIG_PATH" list --all --created-after=$SINCE --created-before=$UNTIL --json --limit=0
+gc bd -C "$RIG_PATH" list --status=closed --closed-after=$SINCE --closed-before=$UNTIL --json --limit=0
 ```
 
 b) **Commit activity** — also bounded, or today's not-yet-elapsed commits
