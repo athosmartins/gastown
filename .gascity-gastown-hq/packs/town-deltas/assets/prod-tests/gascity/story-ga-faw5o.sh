@@ -68,9 +68,10 @@ log "  ordering OK (watchdog=$WATCHDOG_LINE < quiet-hours=$QUIET_HOURS_LINE) ✓
 # ── 5. The dedicated selftest passes end-to-end against this deployed file ─────
 # This is the real proof, not a restatement — gate-exile-watchdog.selftest.sh
 # extracts the LIVE function via the sentinels above and exercises it with
-# mocked bd/gc/warn/set_gate_status across 13 scenarios (first-seen stamp,
+# mocked bd/gc/warn/set_gate_status across 14 scenarios (first-seen stamp,
 # under/over/at-threshold, dedup, legacy label name, multi-marker sweep,
-# malformed input, default threshold, mutation check, drift guards).
+# malformed input, default threshold, mutation check, drift guards,
+# mail-failure retry).
 log "Running gate-exile-watchdog.selftest.sh against the deployed dispatcher..."
 "$SELFTEST" || fail "gate-exile-watchdog.selftest.sh reported failures"
 log "  selftest PASS ✓"

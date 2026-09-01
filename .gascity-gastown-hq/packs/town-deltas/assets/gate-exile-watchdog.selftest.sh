@@ -58,6 +58,7 @@ COMMENT_LOG=""        # accumulates every `bd comment <id> <text>` call's id
 MAIL_LOG=""           # accumulates every `gc mail send` recipient
 WARN_LOG=""
 STATUS_LOG=""         # accumulates every set_gate_status call as "<id>:<new>"
+MAIL_SHOULD_FAIL=0    # when 1, the gc mail stub logs the attempt but returns failure
 
 bd() {
   # bd -C "$GC_CITY" label add "$id" "$label" -q
@@ -77,6 +78,7 @@ gc() {
   # gc --city "$GC_CITY" mail send mayor -s ... -m ...
   if [ "$1" = "--city" ] && [ "$3" = "mail" ] && [ "$4" = "send" ]; then
     MAIL_LOG="$MAIL_LOG $5"
+    [ "$MAIL_SHOULD_FAIL" = "1" ] && return 1
     return 0
   fi
   return 0
@@ -84,7 +86,7 @@ gc() {
 warn() { WARN_LOG="$WARN_LOG|$*"; }
 set_gate_status() { STATUS_LOG="$STATUS_LOG|$1:$2"; }
 
-reset_stubs() { LABEL_ADD_LOG=""; COMMENT_LOG=""; MAIL_LOG=""; WARN_LOG=""; STATUS_LOG=""; }
+reset_stubs() { LABEL_ADD_LOG=""; COMMENT_LOG=""; MAIL_LOG=""; WARN_LOG=""; STATUS_LOG=""; MAIL_SHOULD_FAIL=0; }
 
 # mk <id> <labels-csv> — a queued marker with the given labels
 mk() {
@@ -235,6 +237,32 @@ if [ -n "$WATCHDOG_CALL_LINE" ] && [ -n "$QUIET_HOURS_LINE" ] && [ "$WATCHDOG_CA
   ok "watchdog call (line $WATCHDOG_CALL_LINE) runs BEFORE the quiet-hours admission pause (line $QUIET_HOURS_LINE) — escalation is not blocked by admission gates"
 else
   bad "watchdog call ordering drifted relative to quiet-hours gate (watchdog=$WATCHDOG_CALL_LINE quiet_hours=$QUIET_HOURS_LINE)"
+fi
+
+echo "── (13) gate-review fix: failed mail does NOT set gate:exile-escalated, so a later sweep retries instead of permanently dropping the escalation ──"
+reset_stubs
+MAIL_SHOULD_FAIL=1
+ELAPSED=$((THRESH + 5000))
+SINCE=$((NOW-ELAPSED))
+MARKERS=$(printf '[%s]' "$(mk m13 "gate-status:queued,gate:exiled-tier5:2,gate:exiled-since:$SINCE")")
+gate_exile_watchdog_sweep "$MARKERS" "$THRESH" "$NOW"
+if echo "$MAIL_LOG" | grep -q "mayor" \
+   && [ -z "$LABEL_ADD_LOG" ] \
+   && echo "$WARN_LOG" | grep -qi "could not mail"; then
+  ok "mail attempted and failed -> gate:exile-escalated NOT stamped, failure warned (mail='$MAIL_LOG' labels='$LABEL_ADD_LOG')"
+else
+  bad "expected an attempted-but-failed mail with no dedup label, got mail='$MAIL_LOG' labels='$LABEL_ADD_LOG' warn='$WARN_LOG'"
+fi
+# Same marker (since_epoch untouched by the failed attempt, so elapsed only
+# grew) is reconsidered on the NEXT sweep because gate:exile-escalated was
+# never applied. Simulate that sweep with mail now succeeding.
+MAIL_SHOULD_FAIL=0
+LABEL_ADD_LOG=""; MAIL_LOG=""; WARN_LOG=""; STATUS_LOG=""; COMMENT_LOG=""
+gate_exile_watchdog_sweep "$MARKERS" "$THRESH" "$((NOW+200))"
+if echo "$MAIL_LOG" | grep -q "mayor" && [ "$LABEL_ADD_LOG" = "|m13:gate:exile-escalated" ]; then
+  ok "later sweep (mail now succeeding) retries and escalates for real — the failed attempt was retried, not permanently dropped"
+else
+  bad "expected retry sweep to succeed and stamp exile-escalated, got mail='$MAIL_LOG' labels='$LABEL_ADD_LOG'"
 fi
 
 echo ""; echo "gate-exile-watchdog.selftest: PASS=$PASS FAIL=$FAIL"; [ "$FAIL" -eq 0 ] && exit 0 || exit 1

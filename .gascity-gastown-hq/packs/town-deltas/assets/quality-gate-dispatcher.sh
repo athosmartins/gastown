@@ -3172,11 +3172,23 @@ gate_exile_watchdog_sweep() {
     if [ "$elapsed" -gt "$escalate_after" ]; then
       warn "Marker $marker_id: exile-watchdog escalating after ${elapsed}s in rebase-fail exile with no re-selection (ga-faw5o defeito 3)."
       bd -C "$GC_CITY" comment "$marker_id" "Gate WATCHDOG (ga-faw5o defeito 3): this marker has carried a rebase-fail exile label for $((elapsed/3600))h — past the ${escalate_after}s escalation threshold — without its retry counter ever advancing, because the queue never emptied down to tier 6 (the only tier a has_rebase_fail marker is reachable from). Escalating to Mayor now and parking at gate-status:needs-rebase instead of waiting indefinitely on a selection that may never come. Remove the gate:exiled-tier5:N label to force a re-anchor into the healthy queue if the underlying branch is actually fine." 2>/dev/null || true
-      gc --city "$GC_CITY" mail send mayor \
+      # gate-review fix (ga-faw5o, gate_run=ga-o67b7): gate:exile-escalated is
+      # the dedup label the selection filter above uses to permanently
+      # exclude a marker from this watchdog. It must only be set once the
+      # mail to Mayor has actually gone out — otherwise a single transient
+      # Dolt/mail hiccup on the exact sweep the threshold is crossed
+      # collapses "notified" and "not notified" into the same downstream
+      # state (dedup label set either way) and Mayor is silently never told,
+      # with no later sweep ever retrying. Leaving the label unset on
+      # failure means the next sweep re-enters this branch (since_epoch is
+      # unchanged, elapsed only grows) and tries the mail again.
+      if gc --city "$GC_CITY" mail send mayor \
         -s "Gate: exiled marker $marker_id starved ${elapsed}s behind a non-emptying queue (ga-faw5o)" \
-        -m "Marker $marker_id has carried a rebase-fail exile label for $((elapsed/3600))h without ever being re-selected — the normal attempt-based escalation (Step 4c) never ran because tier 6 is only reached when every healthy tier is empty, which this queue never does. This is DEFEITO 3 from ga-faw5o. Parked at gate-status:needs-rebase. bd show $marker_id for branch/bead details; needs a human look (rebase by hand, or remove the exile label to re-anchor)." 2>/dev/null \
-        || warn "Could not mail Mayor for exile-watchdog escalation on $marker_id"
-      bd -C "$GC_CITY" label add "$marker_id" "gate:exile-escalated" -q 2>/dev/null || true
+        -m "Marker $marker_id has carried a rebase-fail exile label for $((elapsed/3600))h without ever being re-selected — the normal attempt-based escalation (Step 4c) never ran because tier 6 is only reached when every healthy tier is empty, which this queue never does. This is DEFEITO 3 from ga-faw5o. Parked at gate-status:needs-rebase. bd show $marker_id for branch/bead details; needs a human look (rebase by hand, or remove the exile label to re-anchor)." 2>/dev/null; then
+        bd -C "$GC_CITY" label add "$marker_id" "gate:exile-escalated" -q 2>/dev/null || true
+      else
+        warn "Could not mail Mayor for exile-watchdog escalation on $marker_id — leaving gate:exile-escalated unset so this marker is retried on a later sweep instead of permanently dropped."
+      fi
       set_gate_status "$marker_id" "needs-rebase"
     fi
   done <<EOF_GATE_EXILE_IDS
