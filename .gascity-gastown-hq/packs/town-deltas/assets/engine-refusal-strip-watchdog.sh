@@ -145,6 +145,15 @@ LOG="$LOG_DIR/engine-refusal-strip-watchdog.log"
 STATE_DIR="$CITY/.gc/state"
 RUNTIME_DIR="$CITY/.gc/runtime"
 PROCESSED_FILE="$STATE_DIR/engine-refusal-strip-watchdog.processed"
+# Deliberately a SEPARATE file from PROCESSED_FILE, not a shared one: the
+# primary loop and the marker loop below sometimes share a commit_hash (one
+# commit can strip a refusal label from one issue — primary loop's
+# candidate — and pilot:no-auto-dispatch from a DIFFERENT issue — marker
+# loop's candidate — at the same time). A single shared dedup file let
+# whichever loop ran first mark the whole commit_hash processed and
+# permanently starve the other loop's own, unrelated issue in that same
+# commit, with no retry (ga-tb8mt gate review, blocking issue 1).
+MARKER_PROCESSED_FILE="$STATE_DIR/engine-refusal-strip-watchdog.marker-processed"
 LOCK_FILE="${ENGINE_REFUSAL_STRIP_WATCHDOG_LOCK:-$RUNTIME_DIR/engine-refusal-strip-watchdog.lock}"
 
 DRY_RUN="${DRY_RUN:-0}"
@@ -152,7 +161,7 @@ LOOKBACK_HOURS="${LOOKBACK_HOURS:-72}"
 DOLT_DB="${DOLT_DB:-hq}"
 
 mkdir -p "$LOG_DIR" "$STATE_DIR" "$RUNTIME_DIR"
-touch "$PROCESSED_FILE"
+touch "$PROCESSED_FILE" "$MARKER_PROCESSED_FILE"
 
 # Export unconditionally (not just read as a local default) so every gc/bd
 # child process resolves the SAME city this script is using, whether
@@ -242,9 +251,17 @@ if [ -z "$LOOKBACK_CUTOFF" ]; then
     exit 0
 fi
 
+# Deliberately does NOT exit 0 on failure (it used to — ga-tb8mt gate
+# review, blocking issue 2: exiting here ran before the marker query below
+# was ever reached, so a transient failure in THIS query also silently
+# skipped the independent marker-removal pass for the whole cycle, even
+# though that pass's own query might have succeeded). Mirrors the marker
+# query's failure handling right below for the same reason: one query's
+# hiccup must never suppress the other, unrelated pass.
+CANDIDATES_CSV=""
 if ! CANDIDATES_CSV="$(DOLT_SQL "SELECT commit_hash, date FROM dolt_log WHERE message LIKE 'bd: label removed%' AND (message LIKE '%needs:engine-window%' OR message LIKE '%pool:refused:engine-rebuild-required%' OR message LIKE '%framework:engine%' OR message LIKE '%pilot:refused-reason:engine-rebuild-required%') AND date > '$LOOKBACK_CUTOFF' ORDER BY date ASC;")"; then
-    log "WARN: dolt_log candidate query failed (dolt unavailable?) -> skip pass"
-    exit 0
+    log "WARN: dolt_log candidate query failed (dolt unavailable?) -> skip primary pass this round"
+    CANDIDATES_CSV=""
 fi
 
 # Second query for the marker-removal path (ga-6u8e4). Reads dolt_diff_labels
@@ -256,8 +273,9 @@ fi
 # here. dolt_diff_labels has its own to_commit_date column, so no join is
 # needed. DISTINCT collapses the (harmless but redundant) multiple rows a
 # single bulk commit produces when it touches several issues at once.
-# Deliberately does NOT exit 0 on failure the way the primary query does
-# above — a transient failure here should not also suppress the primary pass.
+# Like the primary query above, does NOT exit 0 on failure — a transient
+# failure in either query must never suppress the other, independent pass
+# (ga-tb8mt gate review, blocking issue 2).
 MARKER_CANDIDATES_CSV=""
 if ! MARKER_CANDIDATES_CSV="$(DOLT_SQL "SELECT DISTINCT to_commit AS commit_hash, to_commit_date AS date FROM dolt_diff_labels WHERE diff_type = 'removed' AND from_label = 'pilot:no-auto-dispatch' AND to_commit_date > '$LOOKBACK_CUTOFF' ORDER BY date ASC;")"; then
     log "WARN: dolt_diff_labels marker-candidate query failed (dolt unavailable?) -> skip marker pass this round"
@@ -367,17 +385,22 @@ while IFS=, read -r commit_hash commit_date; do
 done <<< "$CANDIDATES_CSV"
 
 # ── second pass: the watchdog's own veto being removed (ga-6u8e4) ──────────
-# Mirrors the loop above almost exactly (same helpers, same dedup file, same
-# per-bead checks), with one extra gate before anything else: skip unless a
-# prior WATCHDOG_MARKER comment predates this removal. That gate is what
-# keeps this scoped to beads this watchdog itself protected, instead of
-# reacting to every unrelated pilot:no-auto-dispatch clear in the city.
+# Mirrors the loop above almost exactly (same helpers, same per-bead checks),
+# with two differences. (1) An extra gate before anything else: skip unless a
+# prior WATCHDOG_MARKER comment predates this removal — that's what keeps
+# this scoped to beads this watchdog itself protected, instead of reacting to
+# every unrelated pilot:no-auto-dispatch clear in the city. (2) Its OWN dedup
+# file (MARKER_PROCESSED_FILE, not PROCESSED_FILE) — the two loops can share
+# a commit_hash (one commit stripping a refusal label from one issue and
+# pilot:no-auto-dispatch from a different issue at once), and a single shared
+# file let the loop that ran first starve the other loop's own issue in that
+# commit forever (ga-tb8mt gate review, blocking issue 1).
 while IFS=, read -r commit_hash commit_date; do
     [ "$commit_hash" = "commit_hash" ] && continue   # header row
     [ -z "$commit_hash" ] && continue
     n_marker_candidates=$((n_marker_candidates + 1))
 
-    if grep -qxF "$commit_hash" "$PROCESSED_FILE" 2>/dev/null; then
+    if grep -qxF "$commit_hash" "$MARKER_PROCESSED_FILE" 2>/dev/null; then
         continue   # already fully evaluated this event
     fi
 
@@ -459,7 +482,7 @@ while IFS=, read -r commit_hash commit_date; do
     done <<< "$issue_ids"
 
     if [ "$commit_ok" = "1" ]; then
-        echo "$commit_hash" >> "$PROCESSED_FILE"
+        echo "$commit_hash" >> "$MARKER_PROCESSED_FILE"
     fi
 done <<< "$MARKER_CANDIDATES_CSV"
 

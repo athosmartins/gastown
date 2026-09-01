@@ -69,10 +69,29 @@ case "\$1 \$2" in
             hash="\$(printf '%s' "\$q" | sed -n "s/.*to_commit = '\\([^']*\\)'.*/\\1/p")"
             if [ -f "$DIFF_DIR/\$hash.FAIL" ]; then exit 1; fi
             f="$DIFF_DIR/\$hash.csv"
-            if [ -f "\$f" ]; then cat "\$f"; else printf 'from_issue_id,from_label\n'; fi
+            if [ ! -f "\$f" ]; then printf 'from_issue_id,from_label\n'; exit 0; fi
+            # The two per-commit callers filter by DIFFERENT from_label
+            # conditions in the real query (primary: IN the 4 refusal
+            # labels; marker: = pilot:no-auto-dispatch exactly) — replicate
+            # that filtering here so a fixture row meant for one loop is
+            # never handed to the other. Needed to test a commit_hash shared
+            # across both loops (ga-tb8mt gate review, blocking issue 1).
+            case "\$q" in
+              *"from_label = 'pilot:no-auto-dispatch'"*)
+                { head -1 "\$f"; tail -n +2 "\$f" | awk -F, '\$2=="pilot:no-auto-dispatch"'; }
+                ;;
+              *"from_label IN ("*)
+                { head -1 "\$f"; tail -n +2 "\$f" | awk -F, '\$2=="needs:engine-window" || \$2=="pool:refused:engine-rebuild-required" || \$2=="framework:engine" || \$2=="pilot:refused-reason:engine-rebuild-required"'; }
+                ;;
+              *) cat "\$f" ;;
+            esac
             ;;
           *)
-            if [ -f "$WORK/candidates.FAIL" ]; then exit 1; fi
+            # Separate failure flag from the dolt_log (primary) query below
+            # on purpose: they must be independently failable to test that
+            # one query's failure never suppresses the other's pass
+            # (ga-tb8mt gate review, blocking issue 2).
+            if [ -f "$WORK/marker_candidates.FAIL" ]; then exit 1; fi
             if [ -f "$WORK/marker_candidates.csv" ]; then cat "$WORK/marker_candidates.csv"; else printf 'commit_hash,date\n'; fi
             ;;
         esac
@@ -192,7 +211,7 @@ set_bead_raw() {
 }
 
 reset_all() {
-    rm -rf "$WORK/city" "$DIFF_DIR" "$BEADS_DIR" "$WORK/candidates.FAIL"
+    rm -rf "$WORK/city" "$DIFF_DIR" "$BEADS_DIR" "$WORK/candidates.FAIL" "$WORK/marker_candidates.FAIL"
     mkdir -p "$WORK/city/.gc/state" "$DIFF_DIR" "$BEADS_DIR"
     : > "$ACTIONS"
     rm -f "$CANDIDATES_CSV" "$WORK/marker_candidates.csv"
@@ -423,6 +442,43 @@ run
 if [ ! -s "$ACTIONS" ]; then
     ok "bead with postdating comment on the marker-removal not re-flagged"
 else bad "acted despite postdating comment on marker removal: $(cat "$ACTIONS")"; fi
+
+echo "== test 21 (ga-tb8mt gate review, blocking issue 1): one commit_hash is a candidate for BOTH loops at once (issue A's refusal label AND issue B's pilot:no-auto-dispatch stripped in the SAME commit) — the marker loop must still evaluate issue B even after the primary loop has processed that commit_hash =="
+reset_all
+set_candidates "hashR|$STRIP_TS"
+set_marker_candidates "hashR|$STRIP_TS"
+set_diff "hashR" "ga-shared-a|needs:engine-window
+ga-shared-b|pilot:no-auto-dispatch"
+set_bead "ga-shared-a" "open" "area:infra" ""
+set_bead "ga-shared-b" "open" "area:infra" "[{\"created_at\":\"$COMMENT_BEFORE_TS\",\"text\":\"engine-refusal-strip-watchdog (ga-pxtib): this bead's engine-refusal labels were stripped by commit abc123 ...\"}]"
+run
+if grep -q "^label add ga-shared-a pilot:no-auto-dispatch$" "$ACTIONS" && grep -q "^label add ga-shared-b pilot:no-auto-dispatch$" "$ACTIONS"; then
+    ok "both the primary-path sibling and the marker-path sibling were flagged despite sharing one commit_hash"
+else bad "shared commit_hash across both loops: expected both ga-shared-a and ga-shared-b flagged, got: $(cat "$ACTIONS")"; fi
+
+echo "== test 22 (ga-tb8mt gate review, blocking issue 2): primary dolt_log candidate query fails — the independent marker-removal pass must still run, not be silently skipped too =="
+reset_all
+touch "$WORK/candidates.FAIL"
+set_marker_candidates "hashS|$STRIP_TS"
+set_diff "hashS" "ga-marker-only|pilot:no-auto-dispatch"
+set_bead "ga-marker-only" "open" "area:infra" "[{\"created_at\":\"$COMMENT_BEFORE_TS\",\"text\":\"engine-refusal-strip-watchdog (ga-pxtib): this bead's engine-refusal labels were stripped by commit abc123 ...\"}]"
+run
+rc=$?
+if [ "$rc" -eq 0 ] && grep -q "^label add ga-marker-only pilot:no-auto-dispatch$" "$ACTIONS"; then
+    ok "primary query failure didn't suppress the independent marker-removal pass"
+else bad "expected marker pass to still flag ga-marker-only despite primary query failure, got rc=$rc actions=$(cat "$ACTIONS" 2>/dev/null)"; fi
+
+echo "== test 23 (ga-tb8mt gate review, blocking issue 2 symmetry): marker-discovery query fails — the primary pass must still run and flag its own candidate =="
+reset_all
+set_candidates "hashT|$STRIP_TS"
+set_diff "hashT" "ga-primary-only|needs:engine-window"
+set_bead "ga-primary-only" "open" "area:infra" ""
+touch "$WORK/marker_candidates.FAIL"
+run
+rc=$?
+if [ "$rc" -eq 0 ] && grep -q "^label add ga-primary-only pilot:no-auto-dispatch$" "$ACTIONS"; then
+    ok "marker-discovery query failure didn't suppress the independent primary pass"
+else bad "expected primary pass to still flag ga-primary-only despite marker-discovery failure, got rc=$rc actions=$(cat "$ACTIONS" 2>/dev/null)"; fi
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
