@@ -1,6 +1,20 @@
 #!/bin/bash
 # city-night-window.sh — janela noturna da cidade (Athos, 2026-08-16).
 #
+# ⚠️ ESTADO ATUAL — leia isto antes do resto do cabecalho: o mecanismo esta
+# DESLIGADO hoje, de forma permanente, a pedido do proprio Athos. Linha do
+# tempo: 16/08 o Athos LIGOU (paragrafo abaixo descreve essa decisao, ainda
+# valida como INTENCAO DE DESIGN); 20/08 o Athos DESLIGOU de novo
+# (`launchctl bootout` de com.gascity.city-night-window, commit 38ebc51ed) e
+# nao foi reativado desde entao. Sem este job carregado no launchd, este
+# script simplesmente NAO RODA — nem suspende a cidade, nem escreve
+# ~/.gastown/run/city-quiet-hours.level (ver
+# packs/town-deltas/assets/quiet-hours-check.sh, lado leitor, para o efeito
+# disso nos despachantes). Se o mecanismo for reativado, ESTE paragrafo e o
+# que precisa ser atualizado — nao deixe essa informacao existir so num
+# commit message ou numa bead fechada (ga-311q7: exatamente esse gap no
+# arquivo irmao ja gerou um falso achado de bug, ga-ka2c2).
+#
 # DECISAO DO ATHOS (escolha guiada, 16/08): de 00h00 as 07h59 "todo mundo dorme"
 # — a cidade inteira para; das 08h00 as 23h59 opera normal. O ponto e nao queimar
 # token de madrugada. Medido antes da decisao (transcripts tocados entre 01h e

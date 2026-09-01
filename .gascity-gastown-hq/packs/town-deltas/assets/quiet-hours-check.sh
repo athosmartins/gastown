@@ -1,5 +1,22 @@
 # quiet-hours-check.sh — shared "is the city in quiet hours" READ-side helper
-# (ga-dxyvxr). Athos, 2026-08-16: 00h-08h "todo mundo dorme" — the city pauses
+# (ga-dxyvxr).
+#
+# ⚠️ CURRENT STATE — read this before anything else in this file: the
+# night-window mechanism is OFF today, permanently, by Athos's own request.
+# Timeline: 2026-08-16 Athos turned it ON (next paragraph describes that
+# decision, still accurate as DESIGN INTENT); 2026-08-20 Athos turned it back
+# OFF (`launchctl bootout` of com.gascity.city-night-window, commit
+# 38ebc51ed) and it has not been re-enabled since. With no writer running,
+# QUIET_HOURS_LEVEL_FILE never gets (re)written, every function below
+# fail-opens (never blocks dispatch), and this file's only live effect today
+# is staying SILENT about that absence instead of logging spurious
+# "UNREADABLE" noise every sweep forever (ga-w8kbf — see
+# _quiet_hours_unreadable below). If the mechanism is ever re-enabled, THIS
+# paragraph is what needs updating — don't rely on a reader making it 50
+# lines down to _quiet_hours_unreadable's comment to learn the current state
+# (ga-311q7: that gap already produced one false bug report, ga-ka2c2).
+#
+# Athos, 2026-08-16: 00h-08h "todo mundo dorme" — the city pauses
 # ADMISSION of new work to stop burning token overnight, without killing
 # anything already in flight. "gc suspend" (scripts/city-night-window.sh)
 # already covers the reconciler (pool dogs, min_active_sessions, wake-reason
