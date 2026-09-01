@@ -146,6 +146,14 @@ PSEOF
   DEPLOY_EPOCH=$(( $(date +%s) - 600 ))   # deploy happened 10 min ago
   STALE_LSTART="$(lstart_of $(( DEPLOY_EPOCH - 3600 )) )"   # before deploy
   FRESH_LSTART="$(lstart_of $(( DEPLOY_EPOCH + 60 )) )"     # after deploy
+  # ga-puq8z: the "deploy" commit run_helper creates below is, by default,
+  # dated at DEPLOY_EPOCH (not wall-clock "now") — matching this fixture's
+  # existing implicit assumption (used by every pre-ga-puq8z test) that the
+  # commit and the deploy happen at the same moment. T26/T27 override this to
+  # put the commit BEFORE DEPLOY_EPOCH, modeling a gate-queue/backoff delay
+  # between when code was actually committed and when this check got around
+  # to running.
+  POST_COMMIT_EPOCH="$DEPLOY_EPOCH"
 }
 
 # seed a daemon that is currently running a STALE process (pre-deploy start)
@@ -173,7 +181,8 @@ run_helper() {  # run_helper <changed-relpaths...>  (commits a deploy diff first
   done
   ( cd "$RUNTIME"
     git add -A >/dev/null 2>&1
-    git commit -q -m deploy --allow-empty
+    GIT_AUTHOR_DATE="@$POST_COMMIT_EPOCH" GIT_COMMITTER_DATE="@$POST_COMMIT_EPOCH" \
+      git commit -q -m deploy --allow-empty
   )
   POST=$(git -C "$RUNTIME" rev-parse HEAD)
 
@@ -207,7 +216,8 @@ run_helper_stderr() {  # run_helper_stderr <changed-relpaths...>
   done
   ( cd "$RUNTIME"
     git add -A >/dev/null 2>&1
-    git commit -q -m deploy --allow-empty
+    GIT_AUTHOR_DATE="@$POST_COMMIT_EPOCH" GIT_COMMITTER_DATE="@$POST_COMMIT_EPOCH" \
+      git commit -q -m deploy --allow-empty
   )
   POST=$(git -C "$RUNTIME" rev-parse HEAD)
 
@@ -894,6 +904,58 @@ V=$(field VERDICT "$OUT")
 [ "$RC" -eq 0 ] && ok "T25 exit 0" || nok "T25 exit" "rc=$RC"
 [ "$(field PROOF "$OUT")" = "asset_served_per_request" ] && ok "T25 PROOF=asset_served_per_request" || nok "T25 proof" "got '$(field PROOF "$OUT")'"
 [ ! -f "$MOCK/kicks.log" ] && ok "T25 no kickstart called" || nok "T25 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T26 (ga-puq8z): a SENSITIVE daemon whose live process restarted (some OTHER
+# path — e.g. a sibling bead's own guarded restart) AFTER the commit under
+# review was made, but BEFORE DEPLOY_EPOCH (this check's own start time), must
+# NOT be flagged NEEDS_GUARDED_RESTART. Pre-fix, already_fresh() compared the
+# pid's start time against DEPLOY_EPOCH alone — captured by the CALLER right
+# before ITS OWN deploy step, which can be minutes-to-hours after the commit
+# itself (gate-queue wait, deploy retry/backoff, a slow sweep cycle). A daemon
+# already refreshed in that gap has a pid-start strictly AFTER the commit but
+# strictly BEFORE DEPLOY_EPOCH — genuinely fresh, but the old DEPLOY_EPOCH-only
+# comparison called it stale and flagged an unnecessary hot-path restart.
+# Real incident (measured 2026-09-01): com.whatsapp.demand-dashboard flagged
+# twice within 15 minutes, both times already running code newer than the
+# commit each check was verifying — this is that exact shape, reproduced
+# deterministically via POST_COMMIT_EPOCH (see new_case()/run_helper()).
+# ════════════════════════════════════════════════════════════════════════════
+SENSITIVE_DAEMONS="central-sender conversation-monitor slot-scheduler webhook demand-dashboard"
+new_case t26
+POST_COMMIT_EPOCH=$(( DEPLOY_EPOCH - 3000 ))            # commit made 50 min before this check started
+ALREADY_FRESH_MID_LSTART="$(lstart_of $(( DEPLOY_EPOCH - 300 )) )"  # daemon restarted 5 min before this check — AFTER the commit, BEFORE DEPLOY_EPOCH
+cat > "$RUNTIME/daemons/demand_dashboard.py" <<<'print("demand")'
+make_plist "$AGENTS" com.test.demand-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/demand_dashboard.py"
+seed_running com.test.demand-dashboard 9301 "$ALREADY_FRESH_MID_LSTART"
+OUT=$(run_helper daemons/demand_dashboard.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T26 verdict OK (daemon already fresher than the commit under review, despite predating DEPLOY_EPOCH)" || nok "T26 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -eq 0 ] && ok "T26 exit 0" || nok "T26 exit" "rc=$RC"
+echo "$(field GUARDED "$OUT")" | grep -q "com.test.demand-dashboard" && nok "T26 should NOT be GUARDED" "$(field GUARDED "$OUT")" || ok "T26 not flagged GUARDED"
+echo "$(field ALREADY_FRESH "$OUT")" | grep -q "com.test.demand-dashboard" && ok "T26 recorded in ALREADY_FRESH" || nok "T26 already_fresh" "$(field ALREADY_FRESH "$OUT")"
+! grep -q "com.test.demand-dashboard" "$MOCK/kicks.log" 2>/dev/null && ok "T26 NOT kickstarted" || nok "T26 no-kickstart" "kickstart was called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T27 (ga-puq8z): companion to T26 — a SENSITIVE daemon whose live process
+# predates the COMMIT itself (genuinely stale, not merely "before
+# DEPLOY_EPOCH") must still be flagged NEEDS_GUARDED_RESTART. Proves the
+# COMMIT_EPOCH-based comparison introduced for T26 does not widen the
+# already-fresh window enough to swallow a real stale daemon — the class of
+# regression T16 already guards for DEPLOY_EPOCH, mirrored here for
+# COMMIT_EPOCH.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t27
+POST_COMMIT_EPOCH=$(( DEPLOY_EPOCH - 3000 ))            # commit made 50 min before this check started
+STILL_STALE_LSTART="$(lstart_of $(( DEPLOY_EPOCH - 4000 )) )"  # daemon started BEFORE the commit itself
+cat > "$RUNTIME/daemons/demand_dashboard.py" <<<'print("demand")'
+make_plist "$AGENTS" com.test.demand-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/demand_dashboard.py"
+seed_running com.test.demand-dashboard 9401 "$STILL_STALE_LSTART"
+OUT=$(run_helper daemons/demand_dashboard.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T27 verdict NEEDS_GUARDED_RESTART (process predates the commit itself — genuinely stale)" || nok "T27 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -ne 0 ] && ok "T27 non-zero exit" || nok "T27 exit" "rc=$RC"
+echo "$(field GUARDED "$OUT")" | grep -q "com.test.demand-dashboard" && ok "T27 flagged GUARDED" || nok "T27 guarded" "$(field GUARDED "$OUT")"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""

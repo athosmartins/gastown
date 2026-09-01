@@ -50,19 +50,34 @@
 #      WA's own three (deploy_daemons.sh's two loops + auto_restart_daemons.py's
 #      deploy_restart branch), closing the classification_dashboard
 #      send-in-flight gap for this trigger too.
-#   7. (ga-j3j6s) Before flagging a SENSITIVE daemon at all (drain path or
-#      not), check whether its CURRENT live process already started after
-#      DEPLOY_EPOCH — the same pid-start-epoch comparison verify_fresh() uses
-#      to confirm a restart THIS script performed. If it's already fresh, some
-#      OTHER mechanism (e.g. the rig's own auto-deploy) already restarted it;
-#      flagging NEEDS_GUARDED_RESTART here is a false positive that pushes a
-#      human toward an unnecessary, non-zero-risk hot-path restart (real
-#      incident: com.whatsapp.map-viewer flagged ~1m45s after auto-deploy had
-#      already restarted it and was serving the new template). Deliberately
-#      NOT a file-mtime comparison — a daemon can serve from a different tree
-#      than the changed file, which would make an mtime check lie; DEPLOY_EPOCH
-#      is a process-clock timestamp tied to the deploy event itself, compared
-#      only against the live PID's own start time (never a file path).
+#   7. (ga-j3j6s; refined ga-puq8z) Before flagging a SENSITIVE daemon at all
+#      (drain path or not), check whether its CURRENT live process already
+#      started after the code was COMMITTED (COMMIT_EPOCH — the committer date
+#      of POST_DEPLOY_SHA, computed near Step 1 below) — the same pid-start
+#      primitives verify_fresh() uses to confirm a restart THIS script
+#      performed, just compared against a different reference point. If it's
+#      already fresh, some OTHER mechanism (e.g. the rig's own auto-deploy, or
+#      a sibling bead's own guarded restart on the same shared daemon) already
+#      restarted it; flagging NEEDS_GUARDED_RESTART here is a false positive
+#      that pushes a human toward an unnecessary, non-zero-risk hot-path
+#      restart (real incident: com.whatsapp.map-viewer flagged ~1m45s after
+#      auto-deploy had already restarted it and was serving the new template).
+#      Deliberately NOT a file-mtime comparison — a daemon can serve from a
+#      different tree than the changed file, which would make an mtime check
+#      lie; a pid-start-epoch is a process-clock timestamp, compared only
+#      against the live PID's own start time (never a file path).
+#      ga-puq8z GATE-FIX: the ga-j3j6s original compared against DEPLOY_EPOCH
+#      (this check's OWN "now", captured by the CALLER right before its
+#      deploy step) rather than COMMIT_EPOCH. DEPLOY_EPOCH can be minutes-to-
+#      hours after the commit itself (gate-queue wait, deploy retry/backoff —
+#      ga-d5rrr — or just a slow sweep cycle), and any restart that already
+#      happened via another path is, by construction, always BEFORE "now" —
+#      so the DEPLOY_EPOCH-only comparison was nearly impossible to satisfy
+#      and under-caught exactly the case point 7 exists to catch (measured
+#      2026-09-01: com.whatsapp.demand-dashboard flagged twice in 15 minutes,
+#      both times already running code newer than the commit each check was
+#      verifying). COMMIT_EPOCH <= DEPLOY_EPOCH always holds, so this only
+#      ever ADDS true-fresh detections — never masks a real stale daemon.
 #   8. (ga-y108i) Complementary to point 7's "is the PROCESS fresh?" question:
 #      "does this CHANGE need a restart AT ALL?" A rig can declare, in its own
 #      restart_policy.yaml, a global no_restart_paths: [glob, ...] list (e.g.
@@ -326,6 +341,28 @@ if [ -z "$PRE_DEPLOY_SHA" ] || [ -z "$POST_DEPLOY_SHA" ] || [ "$PRE_DEPLOY_SHA" 
   log "no SHA delta ($PRE_DEPLOY_SHA .. $POST_DEPLOY_SHA) — deploy changed nothing — skip."
   emit SKIPPED "no source change in deploy" not_applicable
 fi
+
+# ── commit-epoch (ga-puq8z) ─────────────────────────────────────────────────────
+# The committer date of POST_DEPLOY_SHA — used below by already_fresh() as the
+# freshness reference INSTEAD OF DEPLOY_EPOCH alone. DEPLOY_EPOCH is captured
+# by the CALLER right before ITS OWN deploy step for THIS specific bead/story's
+# check — which can be minutes-to-hours after the commit itself (gate-queue
+# wait, deploy retry/backoff — ga-d5rrr, or simply a slow sweep cycle). A
+# daemon already refreshed by some OTHER path in that gap has a pid-start
+# strictly AFTER the commit but strictly BEFORE DEPLOY_EPOCH: genuinely
+# fresh, but the DEPLOY_EPOCH-only comparison called that stale and flagged an
+# unnecessary hot-path restart (measured 2026-09-01:
+# com.whatsapp.demand-dashboard flagged twice within 15 minutes, both times
+# already running code newer than the commit under review — ga-puq8z).
+# COMMIT_EPOCH <= DEPLOY_EPOCH always holds (code cannot deploy before it is
+# committed), so using it as the already_fresh() threshold only ever ADDS
+# true-fresh detections — it never masks a real stale daemon the old
+# DEPLOY_EPOCH-only check would have caught (see T27 in the test suite).
+# Falls back to DEPLOY_EPOCH (the old, more conservative reference) if `git
+# show` cannot produce a value — fail toward existing behavior, not toward a
+# wider window, when the commit date is unverifiable.
+COMMIT_EPOCH="$(git -C "$RUNTIME_DIR" show -s --format=%ct "$POST_DEPLOY_SHA" 2>/dev/null || true)"
+case "$COMMIT_EPOCH" in ''|*[!0-9]*) COMMIT_EPOCH="$DEPLOY_EPOCH" ;; esac
 
 # ── Step 1: changed files in this deploy ──────────────────────────────────────
 CHANGED="$(git -C "$RUNTIME_DIR" diff --name-only "$PRE_DEPLOY_SHA" "$POST_DEPLOY_SHA" 2>/dev/null || true)"
@@ -734,19 +771,25 @@ verify_fresh() {  # verify_fresh <label> -> 0 if a process started after DEPLOY_
   return 1
 }
 
-# already_fresh <label> (ga-j3j6s) -> 0 if the CURRENTLY-live process already
-# started after DEPLOY_EPOCH — a ONE-SHOT snapshot check (no wait/retry loop,
+# already_fresh <label> (ga-j3j6s; refined ga-puq8z) -> 0 if the CURRENTLY-live
+# process already started after the code was COMMITTED (COMMIT_EPOCH, computed
+# above from POST_DEPLOY_SHA) — a ONE-SHOT snapshot check (no wait/retry loop,
 # unlike verify_fresh()): we are not waiting for a restart WE are about to
 # perform, we are asking whether one already happened via some other path.
-# Same primitives as verify_fresh() (daemon_pid + pid_start_epoch), so this
-# carries the identical evidentiary weight — see header point 7 for why a
-# file-mtime comparison would be the wrong (and misleading) alternative.
+# Deliberately COMMIT_EPOCH, not DEPLOY_EPOCH: DEPLOY_EPOCH is "now" from THIS
+# check's own point of view, so a restart that already happened via another
+# path is — by construction — always BEFORE it; comparing against DEPLOY_EPOCH
+# alone made this check nearly impossible to satisfy and produced exactly the
+# false positives ga-puq8z measured (see the COMMIT_EPOCH comment above). Same
+# primitives as verify_fresh() (daemon_pid + pid_start_epoch), so this carries
+# the identical evidentiary weight — see header point 7 for why a file-mtime
+# comparison would be the wrong (and misleading) alternative.
 already_fresh() {  # already_fresh <label>
   local label="$1" pid se
   pid="$(daemon_pid "$label")"
   [ -n "$pid" ] || return 1
   se="$(pid_start_epoch "$pid" || echo 0)"
-  [ -n "$se" ] && [ "$se" -gt "$DEPLOY_EPOCH" ] 2>/dev/null
+  [ -n "$se" ] && [ "$se" -gt "$COMMIT_EPOCH" ] 2>/dev/null
 }
 
 for label in $AFFECTED; do
@@ -826,7 +869,12 @@ WOULD_RESTART="$(echo "$WOULD_RESTART" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' 
 if [ -n "${FRESH_FAIL// /}" ]; then
   emit VERIFY_FAILED "restarted daemon(s) did not come up fresh:${FRESH_FAIL}" not_verified
 elif [ -n "${GUARDED// /}" ]; then
-  emit NEEDS_GUARDED_RESTART "sensitive hot-path daemon(s) need a guarded restart:${GUARDED}" not_verified
+  # ga-puq8z ACEITE 2: affected-daemon detection above (Step 3) is single-hop
+  # import/template-closure matching, not a proof that the daemon's live code
+  # path actually reaches the changed symbols — say so here rather than
+  # asserting staleness outright, so a human evaluating this hold knows it can
+  # be a false positive and checks pid-start vs. commit time before acting.
+  emit NEEDS_GUARDED_RESTART "sensitive hot-path daemon(s) need a guarded restart (import/template-closure match, not proven reachable to the changed symbols — may be a false positive):${GUARDED}" not_verified
 elif [ -n "${RESTARTED// /}" ]; then
   emit OK "all affected daemons restarted + verified fresh:${RESTARTED}" verified
 elif [ -n "${WOULD_RESTART// /}" ]; then

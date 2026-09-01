@@ -1570,7 +1570,14 @@ else
     *)
       err "Daemon refresh did NOT pass (verdict=$REFRESH_VERDICT): $REFRESH_REASON"
       if [ "$REFRESH_VERDICT" = "NEEDS_GUARDED_RESTART" ]; then
-        REFRESH_ACTION="ACTION: perform a guarded/graceful restart of the flagged hot-path daemon(s) ($REFRESH_GUARDED) — drain in-flight messages/webhooks first — then re-run delivery. (Configure a DRAIN_CMD_<label> for daemon-refresh.sh to automate this.)"
+        # ga-puq8z ACEITE 2: this verdict is single-hop import/template-closure
+        # detection (daemon-refresh.sh Step 3), not proof the daemon's live
+        # code path reaches the changed symbols — say so explicitly rather
+        # than asserting staleness outright. daemon-refresh.sh's own
+        # already-fresh check (COMMIT_EPOCH-based, ga-puq8z) already ran and
+        # did NOT clear this daemon, but a human deciding whether to bounce a
+        # hot-path daemon on this alone should know the detection basis.
+        REFRESH_ACTION="ACTION: perform a guarded/graceful restart of the flagged hot-path daemon(s) ($REFRESH_GUARDED) — drain in-flight messages/webhooks first — then re-run delivery. (Configure a DRAIN_CMD_<label> for daemon-refresh.sh to automate this.) CAVEAT (ga-puq8z): flagged by import/template-closure matching, not proven reachable to the changed symbols — if in doubt, compare \`ps -o lstart= -p <pid>\` against commit $POST_DEPLOY_SHA before restarting."
       else
         REFRESH_ACTION="ACTION: investigate why the restarted daemon(s) ($REFRESH_FRESHFAIL) did not come up fresh (crash on boot? wrong launchd label? port in use?), fix forward, then re-run delivery."
       fi

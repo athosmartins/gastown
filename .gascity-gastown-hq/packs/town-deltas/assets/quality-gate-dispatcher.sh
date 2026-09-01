@@ -5443,7 +5443,13 @@ PYEOF
           DAEMON_HOLD_ACTION="investigate why the affected daemon(s) did not come up fresh (crash on boot? port in use? — see ga-l7n3v ACHADO 2 for a known launchctl kickstart -k port-bind race), fix forward, then close this bead manually once confirmed live."
           case "$DAEMON_HOLD_VERDICT" in
             NEEDS_GUARDED_RESTART)
-              DAEMON_HOLD_ACTION="perform a guarded/graceful restart of the flagged hot-path daemon(s) — drain in-flight work first — then close this bead manually once confirmed live."
+              # ga-puq8z ACEITE 2: this verdict is single-hop import/template-
+              # closure detection (daemon-refresh.sh Step 3), not proof the
+              # daemon's live code path reaches the changed symbols — say so
+              # explicitly instead of asserting staleness, and point at the
+              # cheap pid-start-vs-commit check before anyone actually bounces
+              # a hot-path daemon on a possible false positive.
+              DAEMON_HOLD_ACTION="perform a guarded/graceful restart of the flagged hot-path daemon(s) — drain in-flight work first — then close this bead manually once confirmed live. CAVEAT (ga-puq8z): this daemon was flagged by import/template-closure matching, not by proof it reaches the changed symbols, and daemon-refresh.sh's own already-fresh check (COMMIT_EPOCH-based) already ran and did NOT clear it — but if this daemon serves multiple rigs/checkouts outside this script's view, confirm with \`ps -o lstart= -p <pid>\` vs. the commit date ($MERGE_SHA) before restarting; it may already be running newer code."
               ;;
             DEPLOY_FAILED)
               DAEMON_HOLD_ACTION="investigate why the rig deploy_cmd itself failed (see Refresh detail below for its output) — the merged code was never even pulled onto the runtime checkout, so no daemon could possibly be serving it yet. Fix the deploy (conflict? auth? network?), re-run it manually, confirm the runtime is on sha=$MERGE_SHA, then close this bead manually once confirmed live."
