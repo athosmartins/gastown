@@ -364,6 +364,25 @@ if [[ "$DISPATCHER_GUARD_SRC_CTX" == *quality-gate-guard* ]]; then
 else
   bad "dispatcher not sourcing guard lib (DRY violation)"
 fi
+# Mutation-lock (same principle as the G4M18 check above): prove the
+# window-based check isn't vacuous by running it against a scratch copy of
+# the dispatcher with the sourcing line removed entirely — it must go red.
+MUT_GUARD_SRC="$(mktemp)"
+grep -v 'GATE_GUARD_LIB_ONLY=1 source' "$DISPATCHER" > "$MUT_GUARD_SRC"
+MUT_GUARD_SRC_LN=$(grep -n 'GATE_GUARD_LIB_ONLY=1 source' "$MUT_GUARD_SRC" | head -1 | cut -d: -f1 || true)
+MUT_GUARD_SRC_LN=${MUT_GUARD_SRC_LN:-0}
+MUT_GUARD_SRC_CTX=""
+if [ "$MUT_GUARD_SRC_LN" -gt 0 ]; then
+  MUT_CTX_START=$((MUT_GUARD_SRC_LN - 5))
+  [ "$MUT_CTX_START" -lt 1 ] && MUT_CTX_START=1
+  MUT_GUARD_SRC_CTX=$(sed -n "${MUT_CTX_START},${MUT_GUARD_SRC_LN}p" "$MUT_GUARD_SRC")
+fi
+if [[ "$MUT_GUARD_SRC_CTX" == *quality-gate-guard* ]]; then
+  bad "mutation-test: stripping the sourcing line did not make the DRY check go red — it may be vacuous"
+else
+  ok "mutation-test: stripping the sourcing line correctly flips the DRY check red — it is not vacuous"
+fi
+rm -f "$MUT_GUARD_SRC"
 grep -q 'parse_marker_id'                    "$DISPATCHER" && ok "dispatcher supersede_sibling_runs uses parse_marker_id" || bad "dispatcher not using parse_marker_id"
 
 # ── 4. drift-guard: dispatcher proactively supersedes the guard's sibling run ─
