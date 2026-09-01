@@ -257,28 +257,39 @@ gate_exile_watchdog_sweep "$MARKERS" "$THRESH" "$NOW"
 # through a different door than the one round-1 closed. This exact gap is why
 # round-1's case (13) passed against the still-buggy code: it never looked at
 # STATUS_LOG.
+#
+# ga-faw5o gate_run=ga-wyejo (round 3): COMMENT_LOG is now asserted empty
+# here too. Rounds 1-2 gated the dedup label and the status transition on
+# mail success, but the bd comment call — which unconditionally asserted
+# "Escalating to Mayor now and parking at gate-status:needs-rebase" as
+# accomplished fact — still ran BEFORE the mail if/else, so it fired on
+# every failed sweep too, writing a false completed-action claim to the
+# bead's audit trail. This exact gap is why round-2's case (13) passed
+# against the still-buggy code: it never looked at COMMENT_LOG either.
 if echo "$MAIL_LOG" | grep -q "mayor" \
    && [ -z "$LABEL_ADD_LOG" ] \
    && [ -z "$STATUS_LOG" ] \
+   && [ -z "$COMMENT_LOG" ] \
    && echo "$WARN_LOG" | grep -qi "could not mail"; then
-  ok "mail attempted and failed -> gate:exile-escalated NOT stamped, gate-status left untouched (marker stays gate-status:queued and selectable), failure warned (mail='$MAIL_LOG' labels='$LABEL_ADD_LOG' status='$STATUS_LOG')"
+  ok "mail attempted and failed -> gate:exile-escalated NOT stamped, gate-status left untouched, NO bead comment posted (marker stays gate-status:queued and selectable), failure warned (mail='$MAIL_LOG' labels='$LABEL_ADD_LOG' status='$STATUS_LOG' comment='$COMMENT_LOG')"
 else
-  bad "expected an attempted-but-failed mail with no dedup label and no status change, got mail='$MAIL_LOG' labels='$LABEL_ADD_LOG' status='$STATUS_LOG' warn='$WARN_LOG'"
+  bad "expected an attempted-but-failed mail with no dedup label, no status change, and no comment, got mail='$MAIL_LOG' labels='$LABEL_ADD_LOG' status='$STATUS_LOG' comment='$COMMENT_LOG' warn='$WARN_LOG'"
 fi
 # Same marker (since_epoch untouched by the failed attempt, so elapsed only
 # grew) is reconsidered on the NEXT sweep because gate:exile-escalated was
-# never applied AND gate-status:queued was never stripped (both writes now
-# gated on the identical success condition). Simulate that sweep with mail
-# now succeeding.
+# never applied AND gate-status:queued was never stripped (all three writes
+# now gated on the identical success condition). Simulate that sweep with
+# mail now succeeding.
 MAIL_SHOULD_FAIL=0
 LABEL_ADD_LOG=""; MAIL_LOG=""; WARN_LOG=""; STATUS_LOG=""; COMMENT_LOG=""
 gate_exile_watchdog_sweep "$MARKERS" "$THRESH" "$((NOW+200))"
 if echo "$MAIL_LOG" | grep -q "mayor" \
    && [ "$LABEL_ADD_LOG" = "|m13:gate:exile-escalated" ] \
-   && [ "$STATUS_LOG" = "|m13:needs-rebase" ]; then
-  ok "later sweep (mail now succeeding) retries, escalates for real, and NOW parks at needs-rebase — the failed attempt was retried, not permanently dropped (labels='$LABEL_ADD_LOG' status='$STATUS_LOG')"
+   && [ "$STATUS_LOG" = "|m13:needs-rebase" ] \
+   && [ "$COMMENT_LOG" = "|m13" ]; then
+  ok "later sweep (mail now succeeding) retries, escalates for real, NOW parks at needs-rebase, AND posts the bead comment describing that real action — the failed attempt was retried, not permanently dropped, and no false comment was left behind from the failed sweep (labels='$LABEL_ADD_LOG' status='$STATUS_LOG' comment='$COMMENT_LOG')"
 else
-  bad "expected retry sweep to succeed, stamp exile-escalated, and set gate-status, got mail='$MAIL_LOG' labels='$LABEL_ADD_LOG' status='$STATUS_LOG'"
+  bad "expected retry sweep to succeed, stamp exile-escalated, set gate-status, and post the comment, got mail='$MAIL_LOG' labels='$LABEL_ADD_LOG' status='$STATUS_LOG' comment='$COMMENT_LOG'"
 fi
 
 echo ""; echo "gate-exile-watchdog.selftest: PASS=$PASS FAIL=$FAIL"; [ "$FAIL" -eq 0 ] && exit 0 || exit 1

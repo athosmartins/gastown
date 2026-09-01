@@ -3171,7 +3171,6 @@ gate_exile_watchdog_sweep() {
     # is_overdue) — exactly-at-threshold falls through to next sweep, no flakiness.
     if [ "$elapsed" -gt "$escalate_after" ]; then
       warn "Marker $marker_id: exile-watchdog escalating after ${elapsed}s in rebase-fail exile with no re-selection (ga-faw5o defeito 3)."
-      bd -C "$GC_CITY" comment "$marker_id" "Gate WATCHDOG (ga-faw5o defeito 3): this marker has carried a rebase-fail exile label for $((elapsed/3600))h — past the ${escalate_after}s escalation threshold — without its retry counter ever advancing, because the queue never emptied down to tier 6 (the only tier a has_rebase_fail marker is reachable from). Escalating to Mayor now and parking at gate-status:needs-rebase instead of waiting indefinitely on a selection that may never come. Remove the gate:exiled-tier5:N label to force a re-anchor into the healthy queue if the underlying branch is actually fine." 2>/dev/null || true
       # gate-review fix (ga-faw5o, gate_run=ga-o67b7): gate:exile-escalated is
       # the dedup label the selection filter above uses to permanently
       # exclude a marker from this watchdog. It must only be set once the
@@ -3203,9 +3202,21 @@ gate_exile_watchdog_sweep() {
       # marker out of the gate-status:queued rotation this function depends
       # on to be reconsidered. On failure, neither write happens, so the
       # marker stays gate-status:queued and is retried on a later sweep.
+      #
+      # gate-review fix round 3 (ga-faw5o, gate_run=ga-wyejo): the bd comment
+      # call below used to run UNCONDITIONALLY here too, before this if/else
+      # — same defect as round 2, just a third door into it. The comment text
+      # asserts "Escalating to Mayor now and parking at gate-status:needs-
+      # rebase" as accomplished fact, but on a failed attempt neither thing
+      # happens (rounds 1-2 already made sure of that). So every comment
+      # posted during a mail outage was a false statement of completed action
+      # persisted to the bead's human-facing audit trail. Moving it inside
+      # the successful-mail branch, alongside the two writes it describes,
+      # puts all three writes on the identical success condition.
       if gc --city "$GC_CITY" mail send mayor \
         -s "Gate: exiled marker $marker_id starved ${elapsed}s behind a non-emptying queue (ga-faw5o)" \
         -m "Marker $marker_id has carried a rebase-fail exile label for $((elapsed/3600))h without ever being re-selected — the normal attempt-based escalation (Step 4c) never ran because tier 6 is only reached when every healthy tier is empty, which this queue never does. This is DEFEITO 3 from ga-faw5o. Parked at gate-status:needs-rebase. bd show $marker_id for branch/bead details; needs a human look (rebase by hand, or remove the exile label to re-anchor)." 2>/dev/null; then
+        bd -C "$GC_CITY" comment "$marker_id" "Gate WATCHDOG (ga-faw5o defeito 3): this marker has carried a rebase-fail exile label for $((elapsed/3600))h — past the ${escalate_after}s escalation threshold — without its retry counter ever advancing, because the queue never emptied down to tier 6 (the only tier a has_rebase_fail marker is reachable from). Escalating to Mayor now and parking at gate-status:needs-rebase instead of waiting indefinitely on a selection that may never come. Remove the gate:exiled-tier5:N label to force a re-anchor into the healthy queue if the underlying branch is actually fine." 2>/dev/null || true
         bd -C "$GC_CITY" label add "$marker_id" "gate:exile-escalated" -q 2>/dev/null || true
         set_gate_status "$marker_id" "needs-rebase"
       else
