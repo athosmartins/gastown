@@ -13,6 +13,9 @@
 #   4. real-copy drift   — a real (non-symlink) consumer copy differs    -> drift>=1
 #   5. dangling symlink  — consumer symlink target removed               -> drift>=1
 #   6. redirected symlink— consumer symlink points somewhere else        -> drift>=1
+#   8. gate-merged change— canonical changed by a git-committed fix (manifest
+#                          stale, no skill-deploy.sh run)               -> offpath=0
+#   9. uncommitted edit  — same, but change is NOT committed             -> offpath>=1
 #
 # Exit 0 iff every scenario behaves as expected.
 
@@ -205,6 +208,57 @@ note "json: $OUT"
 [[ "$(json_field "$OUT" offpath_count)" == "0" ]] && ok "offpath_count=0 after official deploy" || bad "expected offpath=0 post-deploy"
 [[ "$(json_field "$OUT" drift_count)" == "0" ]]   && ok "drift_count=0 (vendor copy matches canonical)" || bad "expected drift=0 post-deploy"
 [[ "$RC" == "0" ]] && ok "audit exit 0 (green)" || bad "expected exit 0, got $RC"
+rm -rf "$ROOT"
+
+# ══ 8. gate-merged change (git-committed, manifest stale) — accepted ═══════════
+# Reproduces ga-aes6z: a skill fix lands via a normal git commit (simulating a
+# gate-merged PR) that touches the canonical dir WITHOUT ever running
+# skill-deploy.sh. The manifest digest goes stale, but the change is fully
+# committed at HEAD — that is a second legitimate publish path the auditor must
+# also recognize, or every gate-merged skill fix becomes a permanent false
+# OFFPATH (manifest=<v1 digest> live=<v2 digest> forever, since nothing ever
+# re-runs skill-deploy.sh for a code-review-only change).
+scenario "gate-merged change (git-committed, manifest stale) -> accepted, not offpath"
+ROOT="$(mktemp -d)"
+make_fixture "$ROOT"
+write_manifest "$ROOT/city"
+git -C "$ROOT/city" init -q -b main
+git -C "$ROOT/city" config user.email "selftest@example.com"
+git -C "$ROOT/city" config user.name "selftest"
+git -C "$ROOT/city" add -A
+git -C "$ROOT/city" commit -q -m "v1: initial canonical + manifest baseline"
+# simulate a gate-merged fix: edit canonical AND commit it, like a reviewed PR —
+# deliberately do NOT touch the manifest (nothing re-runs skill-deploy.sh here).
+printf 'gate-merged fix content\n' >> "$ROOT/city/skills/demo/SKILL.md"
+git -C "$ROOT/city" add -A
+git -C "$ROOT/city" commit -q -m "fix(ga-demo): gate-merged change to demo skill"
+OUT="$(run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
+RC=$?
+note "json: $OUT"
+[[ "$(json_field "$OUT" offpath_count)" == "0" ]] && ok "offpath_count=0 (git-committed change accepted as official path)" || bad "expected offpath_count=0, canonical is fully committed at HEAD"
+[[ "$(json_field "$OUT" drift_count)" == "0" ]]  && ok "drift_count=0 (consumers still symlinked)" || bad "expected drift_count=0"
+[[ "$RC" == "0" ]] && ok "exit 0" || bad "expected exit 0, got $RC"
+rm -rf "$ROOT"
+
+# ══ 9. uncommitted edit inside a git-backed city — still flagged ═══════════════
+# Guards against scenario 8's exemption becoming a loophole: a canonical change
+# that is NOT committed (a genuine direct SKILL.md write) must still be flagged
+# off-path even when the city happens to be a git repo. Being inside a git repo
+# is not itself a pass — only being CLEAN (matching HEAD) is.
+scenario "uncommitted edit in a git-backed city -> still offpath"
+ROOT="$(mktemp -d)"
+make_fixture "$ROOT"
+write_manifest "$ROOT/city"
+git -C "$ROOT/city" init -q -b main
+git -C "$ROOT/city" config user.email "selftest@example.com"
+git -C "$ROOT/city" config user.name "selftest"
+git -C "$ROOT/city" add -A
+git -C "$ROOT/city" commit -q -m "v1: initial canonical + manifest baseline"
+# direct off-path edit, left UNCOMMITTED — this is the real bug the auditor exists to catch
+printf 'sneaky uncommitted off-path edit\n' >> "$ROOT/city/skills/demo/SKILL.md"
+OUT="$(run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
+note "json: $OUT"
+[[ "$(json_field "$OUT" offpath_count)" -ge 1 ]] && ok "offpath flagged (uncommitted edit, not git-clean)" || bad "expected offpath>=1 — the fix must not swallow real off-path edits"
 rm -rf "$ROOT"
 
 # ── Summary ───────────────────────────────────────────────────────────────────

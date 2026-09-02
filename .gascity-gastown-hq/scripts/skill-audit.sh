@@ -12,12 +12,19 @@
 #        drift.
 #
 #   2. OFF-PATH (criterion #3, "publishing outside the official path is flagged"):
-#      Was the canonical skill changed WITHOUT going through skill-deploy.sh?
+#      Was the canonical skill changed WITHOUT going through an official path?
 #      skill-deploy.sh records a manifest (sha256 per canonical file) on every
-#      official deploy. If the live canonical hashes differ from the manifest,
-#      the canonical was edited off-path (a direct SKILL.md write) — flag it.
-#      A skill with no manifest entry at all is "unmanaged" (never published
-#      through the official path) and is also flagged.
+#      official deploy — that is the FIRST official path. The SECOND is a
+#      normal reviewed git commit (e.g. a gate-merged PR touching
+#      skills/<name>/): skill-deploy.sh is never re-run for those, so the
+#      manifest goes stale immediately, but the change is still fully
+#      committed at HEAD — not a direct filesystem write. A live canonical
+#      whose hashes differ from the manifest (or that has no manifest entry
+#      at all, "unmanaged") is flagged UNLESS it is git-clean at HEAD (see
+#      canon_clean_at_head below), in which case it is accepted as having
+#      gone through the second official path. Only a canonical with
+#      uncommitted local changes — a direct SKILL.md write that bypassed git
+#      entirely — is flagged as truly off-path (ga-aes6z).
 #
 # This is a READ-ONLY auditor. It never writes to any skill sink, city.toml,
 # pack.toml, or runs gc reload — so it is drain-safe and cannot interrupt crew.
@@ -87,6 +94,36 @@ realpath_of() {
         # macOS fallback
         python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$p" 2>/dev/null
     fi
+}
+
+# canon_clean_at_head <dir> — true iff <dir> sits inside a git working tree AND
+# has zero uncommitted/staged/untracked changes relative to HEAD (i.e. the live
+# content IS exactly what's committed). skill-deploy.sh's manifest is the
+# ORIGINAL official-publish record, but it is not the only legitimate one: a
+# skill fix that lands via a normal reviewed git commit (a gate-merged PR
+# touching skills/<name>/) never runs skill-deploy.sh — there is no reason to,
+# the gate already merges code — so the manifest goes stale immediately and
+# every such change would otherwise be flagged as off-path forever (ga-aes6z).
+# A canonical dir that is fully committed at HEAD went through SOME reviewed
+# path even when skill-deploy.sh's manifest was never (re)run, so this is
+# accepted as an alternate official path alongside the manifest. A canonical
+# dir with uncommitted local changes — a direct SKILL.md write that bypassed
+# git entirely — still fails this check and falls through to the manifest-only
+# off-path flag below.
+canon_clean_at_head() {
+    local dir="$1"
+    git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
+    local toplevel
+    toplevel="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || return 1
+    # Capture output and exit status separately: `git status` failing (corrupt
+    # index, permission error, ...) must NOT be treated as "clean" just because
+    # a failed call also prints nothing — that would silently exempt a real
+    # off-path edit whenever the git check itself is broken. A failed status
+    # call returns false here (falls through to the manifest-only flag below),
+    # the same conservative default as "not a git repo at all".
+    local status_out
+    status_out="$(git -C "$toplevel" status --porcelain -- "$dir" 2>/dev/null)" || return 1
+    [[ -z "$status_out" ]]
 }
 
 # ── JSON emit helpers (no jq dependency) ──────────────────────────────────────
@@ -208,9 +245,17 @@ audit_skill() {
     local mdigest
     mdigest="$(manifest_digest "$name")"
     if [[ -z "$mdigest" ]]; then
-        add_offpath "$name" "no manifest entry — skill never published through skill-deploy.sh (unmanaged)"
+        if canon_clean_at_head "$canon"; then
+            info "  (no manifest entry, but canonical is fully committed at HEAD — accepted as official path)"
+        else
+            add_offpath "$name" "no manifest entry — skill never published through skill-deploy.sh (unmanaged)"
+        fi
     elif [[ "$mdigest" != "$canon_digest" ]]; then
-        add_offpath "$name" "canonical changed since last official deploy (manifest=$mdigest live=$canon_digest)"
+        if canon_clean_at_head "$canon"; then
+            info "  (canonical differs from manifest, but is fully committed at HEAD — accepted as gate-merged official path)"
+        else
+            add_offpath "$name" "canonical changed since last official deploy (manifest=$mdigest live=$canon_digest)"
+        fi
     fi
 
     # --- drift check across consumer sinks ---
