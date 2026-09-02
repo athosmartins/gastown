@@ -136,6 +136,23 @@
 #      template regression). Checked first in Step 1, same all-or-nothing
 #      shape as point 8 (a mixed lib/+tests/ commit is NOT exempted — falls
 #      through to full evaluation on its lib/ file, unchanged).
+#  10. (ga-tdzsh) A plist that fails to parse (point 2's plist_args() exit 1
+#      path) used to log the identical WARN regardless of whether that label
+#      is a live, loaded daemon (real coverage gap: its code can go stale
+#      with nobody warned — this hid com.gastown.dolt-server, the CITY'S
+#      OWN DATA PLANE, until 2026-09-02/ga-dgrzf) or nothing loaded at all
+#      (dead symlink, stale file — harmless). The harmless case is common
+#      and noisy enough that it buried the real one. Now split by
+#      daemon_is_loaded() (launchd LOAD status — NOT daemon_pid()/live-PID
+#      presence, which is empty for both "not loaded" and "loaded but
+#      idle" and so can't tell them apart): a loaded label gets an
+#      ERROR-level log line naming it and lands in the new PARSE_ERROR_LOADED
+#      output field/JSON key; an unloaded one gets a low-priority note and
+#      lands in PARSE_ERROR_UNLOADED instead. Neither list feeds VERDICT —
+#      an unrelated daemon's broken plist must never block THIS rig's
+#      deploy gate — they exist purely so a consumer (a human, or a future
+#      watchdog) can grep the structured output for a real gap without
+#      reparsing log text.
 #
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
@@ -181,6 +198,10 @@
 #   WOULD_RESTART=<labels>   (ga-omfwe: DRY_RUN=1 only — labels that would be
 #     restarted for real; RESTARTED is always empty under DRY_RUN=1, so the
 #     two never collapse into the same string)
+#   PARSE_ERROR_LOADED=<labels>   PARSE_ERROR_UNLOADED=<labels>   (ga-tdzsh:
+#     always present, even empty — launchd-loaded vs. not, for any plist
+#     that failed to parse; see header point 10. Informational only, never
+#     feeds VERDICT.)
 #   REASON=<text>   PROOF=verified|not_applicable|asset_served_per_request|not_verified
 # Exit 0 when VERDICT is OK/SKIPPED (or DRY_RUN=1); non-zero otherwise.
 #
@@ -353,18 +374,25 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   echo "GUARDED=${GUARDED:-}"
   echo "ALREADY_FRESH=${ALREADY_FRESH:-}"
   echo "WOULD_RESTART=${WOULD_RESTART:-}"
+  # ga-tdzsh: always present (even on the early-precondition emits above,
+  # before plist discovery ever ran, where these are simply empty) so a
+  # consumer can diff this field across runs without reparsing log text —
+  # see daemon_is_loaded()/the discovery-loop split above for what feeds it.
+  echo "PARSE_ERROR_LOADED=${PARSE_ERROR_LOADED:-}"
+  echo "PARSE_ERROR_UNLOADED=${PARSE_ERROR_UNLOADED:-}"
   echo "REASON=$reason"
   echo "PROOF=$proof"
   # Trailing JSON for the caller's bead comment / jsonl log.
-  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" <<'PY' 2>/dev/null || true
+  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" <<'PY' 2>/dev/null || true
 import json, sys
-v, reason, aff, res, ff, gd, proof, afr, wr = sys.argv[1:10]
+v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu = sys.argv[1:12]
 sp = lambda s: [x for x in s.split() if x]
 print("JSON=" + json.dumps({
     "verdict": v, "reason": reason,
     "affected": sp(aff), "restarted": sp(res),
     "fresh_fail": sp(ff), "guarded": sp(gd), "proof": proof,
     "already_fresh": sp(afr), "would_restart": sp(wr),
+    "parse_error_loaded": sp(pel), "parse_error_unloaded": sp(peu),
 }))
 PY
   if [ "$DRY_RUN" = "1" ]; then exit 0; fi
@@ -537,6 +565,21 @@ daemon_pid() {  # daemon_pid <label>
     | awk -F'=' '/"PID"/ {gsub(/[^0-9]/,"",$2); print $2; exit}'
 }
 
+# helper: is a launchd label currently LOADED (registered with launchd)? (ga-tdzsh)
+# Deliberately NOT daemon_pid()-based: a job can be loaded but between runs
+# (e.g. KeepAlive=false, or simply idle) and still report an empty PID —
+# indistinguishable, by PID alone, from a label launchd has never heard of.
+# `launchctl list <label>` itself is the discriminator: it exits 0 the moment
+# the label is registered (live PID or not), non-zero ("Could not find
+# service ... in domain") when nothing is loaded under it at all. This is the
+# exact ambiguity ga-tdzsh is about: a plist that fails to parse could belong
+# to a LIVE, loaded daemon (real coverage gap — its code can go stale with
+# nobody warned, e.g. com.gastown.dolt-server) or to nothing loaded at all
+# (dead symlink, stale file — harmless noise that buried the real case).
+daemon_is_loaded() {  # daemon_is_loaded <label>
+  $LAUNCHCTL_BIN list "$1" >/dev/null 2>&1
+}
+
 # ── Step 2: discover the rig's daemons + their entrypoint files ───────────────
 # For each plist, read ProgramArguments. An arg under RUNTIME_DIR that is a .py
 # file is an entrypoint; a wrapper .sh under RUNTIME_DIR is followed to the .py
@@ -587,6 +630,14 @@ DISCO_DIR="$(mktemp -d "${TMPDIR:-/tmp}/daemon-disco.XXXXXX")"
 trap 'rm -rf "$DISCO_DIR"' EXIT
 DAEMON_LABELS=""
 PARSE_ERROR_LABELS=""
+# ga-tdzsh: the two buckets a parse-error label actually splits into — see
+# daemon_is_loaded() above. Kept alongside (not instead of) PARSE_ERROR_LABELS,
+# which still drives the pre-existing "was the whole scan even complete?"
+# not_verified/not_applicable choice below (line ~636) unchanged — that
+# question ("did discovery see everything?") is orthogonal to this one
+# ("of what it couldn't read, was any of it actually live?").
+PARSE_ERROR_LOADED=""
+PARSE_ERROR_UNLOADED=""
 
 shopt -s nullglob
 for plist in "$LAUNCH_AGENTS_DIR"/*.plist; do
@@ -594,8 +645,21 @@ for plist in "$LAUNCH_AGENTS_DIR"/*.plist; do
   entry=""
   args_out="$(plist_args "$plist")"; rc=$?
   if [ "$rc" -ne 0 ]; then
-    log "WARN: $plist could not be parsed by plistlib — its daemon (if any) is invisible to auto-refresh discovery until the XML is fixed (common cause: a literal '--' inside an <!-- --> comment, which Apple's launchd parser tolerates but plistlib does not). Verify with: python3 -c \"import plistlib; plistlib.load(open('$plist','rb'))\""
     PARSE_ERROR_LABELS="$PARSE_ERROR_LABELS $label"
+    # ga-tdzsh: this WARN used to read identically regardless of whether
+    # $label is a live, loaded daemon (real coverage gap) or nothing loaded
+    # at all (dead symlink, stale file) — the harmless case's noise is what
+    # buried com.gastown.dolt-server's real one (ga-dgrzf). Split by load
+    # status: only a LOADED label is worth an escalatable ERROR line; an
+    # unloaded one gets a low-priority note, still naming the plist for
+    # anyone who wants to clean it up, but never confused for a live gap.
+    if daemon_is_loaded "$label"; then
+      PARSE_ERROR_LOADED="$PARSE_ERROR_LOADED $label"
+      log "ERROR: $plist could not be parsed by plistlib, and launchd HAS $label loaded — this daemon is invisible to auto-refresh discovery until the XML is fixed (common cause: a literal '--' inside an <!-- --> comment, which Apple's launchd parser tolerates but plistlib does not). Verify with: python3 -c \"import plistlib; plistlib.load(open('$plist','rb'))\""
+    else
+      PARSE_ERROR_UNLOADED="$PARSE_ERROR_UNLOADED $label"
+      log "note: $plist could not be parsed by plistlib, but launchd does not have $label loaded — nothing live is invisible here (likely a dead symlink or stale file). Verify with: python3 -c \"import plistlib; plistlib.load(open('$plist','rb'))\""
+    fi
   fi
   while IFS= read -r arg; do
     [ -n "$arg" ] || continue
@@ -623,8 +687,18 @@ for plist in "$LAUNCH_AGENTS_DIR"/*.plist; do
 done
 shopt -u nullglob
 
-if [ -n "${PARSE_ERROR_LABELS// /}" ]; then
-  log "WARN: $(echo "$PARSE_ERROR_LABELS" | wc -w | tr -d ' ') plist(s) could not be parsed and were skipped during discovery:$PARSE_ERROR_LABELS"
+# ga-tdzsh: normalize like every other accumulator in this file (AFFECTED,
+# RESTARTED, ... — see Step 4/5 below) before either the log lines or emit()
+# read them, so the leading space `"$X $label"` accumulation leaves behind
+# never reaches a caller doing an exact-match comparison on a single label.
+PARSE_ERROR_LOADED="$(echo "$PARSE_ERROR_LOADED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+PARSE_ERROR_UNLOADED="$(echo "$PARSE_ERROR_UNLOADED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+
+if [ -n "${PARSE_ERROR_LOADED// /}" ]; then
+  log "ERROR: $(echo "$PARSE_ERROR_LOADED" | wc -w | tr -d ' ') LOADED daemon plist(s) could not be parsed — real discovery coverage gap:$PARSE_ERROR_LOADED"
+fi
+if [ -n "${PARSE_ERROR_UNLOADED// /}" ]; then
+  log "note: $(echo "$PARSE_ERROR_UNLOADED" | wc -w | tr -d ' ') unloaded plist(s) could not be parsed and were skipped during discovery (harmless — nothing loaded under them):$PARSE_ERROR_UNLOADED"
 fi
 
 if [ -z "${DAEMON_LABELS// /}" ]; then

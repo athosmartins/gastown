@@ -59,6 +59,16 @@
 #      point 3/ga-jkj0). A co-changed real module in the SAME deploy as a
 #      tests/ file is never swallowed by this (T30) — same all-or-nothing
 #      shape as point 11.
+#  13. (ga-tdzsh) A plist that fails to parse is escalated (ERROR-level log
+#      line + the new PARSE_ERROR_LOADED field/JSON key) only when launchd
+#      actually has that label loaded (T31) — never when nothing is loaded
+#      under it at all (T32, the current real state of the two known-broken
+#      plists on the live machine: com.athos.ckan_pbh, com.urblink.inbound-
+#      review-3d — a run today must produce zero escalation). The load check
+#      is launchd LOAD status, not live-PID presence: a label loaded but
+#      currently idle (no PID) still escalates (T33) — daemon_pid() alone
+#      cannot tell "not loaded" and "loaded but idle" apart, the exact
+#      ambiguity that let com.gastown.dolt-server's broken plist hide.
 #
 # All external effects (launchctl, ps) are injected via LAUNCHCTL_BIN / PS_BIN
 # and a mock state dir, so the test touches NO real daemons. The plist scan and
@@ -121,15 +131,25 @@ new_case() {
   git -C "$RUNTIME" config user.name t
   mkdir -p "$RUNTIME/daemons" "$RUNTIME/routes" "$RUNTIME/launchd"
 
-  # mock launchctl: `list <label>` prints the current PID; `kickstart ... label`
-  # logs the call and, if a post-restart pid/lstart is seeded, swaps them in.
+  # mock launchctl: `list <label>` prints the current PID (when one is seeded)
+  # and, per ga-tdzsh, exits 0 iff the label is known to the mock at all
+  # (seed_running OR seed_loaded was called for it — real launchd's own
+  # "loaded regardless of live-PID" contract) or 1 ("Could not find service")
+  # when it is not — this is what daemon_is_loaded() in the helper under test
+  # actually checks. `kickstart ... label` logs the call and, if a
+  # post-restart pid/lstart is seeded, swaps them in.
   cat > "$BIN/launchctl" <<'LCEOF'
 #!/usr/bin/env bash
 S="$MOCK_DIR"; cmd="${1:-}"; shift || true
 case "$cmd" in
   list)
     label="${1:-}"
-    [ -n "$label" ] && [ -f "$S/pid.$label" ] && printf '\t"PID" = %s;\n' "$(cat "$S/pid.$label")"
+    if [ -n "$label" ] && { [ -f "$S/pid.$label" ] || [ -f "$S/loaded.$label" ]; }; then
+      [ -f "$S/pid.$label" ] && printf '\t"PID" = %s;\n' "$(cat "$S/pid.$label")"
+      exit 0
+    fi
+    echo "Could not find service \"$label\" in domain for port" >&2
+    exit 1
     ;;
   kickstart)
     last=""; for a in "$@"; do last="$a"; done
@@ -178,6 +198,14 @@ seed_running() {  # seed_running <label> <pid> <lstart>
 seed_restart() {  # seed_restart <label> <newpid> <lstart>
   echo "$2" > "$MOCK/restart_pid.$1"
   echo "$3" > "$MOCK/restart_lstart.$1"
+}
+# seed a daemon that is LOADED in launchd but has NO live PID right now (e.g.
+# a KeepAlive=false job between runs) — distinct from seed_running, which
+# implies both loaded AND a live PID. Used to prove daemon_is_loaded() (ga-tdzsh)
+# checks LOAD status, not PID presence — daemon_pid() alone is empty for both
+# this case and "not loaded at all", the exact ambiguity the bug is about.
+seed_loaded() {  # seed_loaded <label>
+  : > "$MOCK/loaded.$1"
 }
 
 run_helper() {  # run_helper <changed-relpaths...>  (commits a deploy diff first)
@@ -1064,6 +1092,112 @@ V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T30 verdict NEEDS_GUARDED_RESTART (mixed lib/+tests/ deploy still flags the real lib/ change)" || nok "T30 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -ne 0 ] && ok "T30 non-zero exit" || nok "T30 exit" "rc=$RC"
 echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" && ok "T30 sensitive daemon flagged GUARDED despite co-changed tests/ file" || nok "T30 guarded" "$(field GUARDED "$OUT")"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T31 (ga-tdzsh): a plist that fails to parse, but launchd DOES have that
+# label loaded (with a live PID) — the real coverage gap this bug is about: a
+# live daemon invisible to discovery because its own plist is unparseable
+# (real incident: com.gastown.dolt-server, the city's data plane, hidden this
+# way until 2026-09-02/ga-dgrzf). Must escalate distinctly from a merely
+# unparseable-and-UNLOADED plist (T19/T20 above, unchanged): an ERROR-level
+# log line naming the daemon, and the label present in the new
+# PARSE_ERROR_LOADED structured field. A healthy sibling daemon in the same
+# scan is still processed normally either way (same point T19 already proves).
+# ════════════════════════════════════════════════════════════════════════════
+new_case t31
+cat > "$RUNTIME/daemons/ban_risk_dashboard.py" <<<'print("dash")'
+make_plist "$AGENTS" com.test.ban-risk-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/ban_risk_dashboard.py"
+seed_running com.test.ban-risk-dashboard 9901 "$STALE_LSTART"
+seed_restart com.test.ban-risk-dashboard 9999 "$FRESH_LSTART"
+cat > "$AGENTS/com.test.broken-loaded.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.test.broken-loaded</string>
+  <!-- a stray double-hyphen -- inside this comment breaks plistlib's expat
+       parser even though launchd itself loads this file fine -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/true</string>
+  </array>
+</dict>
+</plist>
+EOF
+seed_running com.test.broken-loaded 9911 "$STALE_LSTART"   # loaded + live PID; the plist itself still never parses
+OUT=$(run_helper_stderr daemons/ban_risk_dashboard.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T31 verdict OK (healthy sibling daemon still processed normally)" || nok "T31 verdict" "got '$V' out=[$OUT]"
+echo "$OUT" | grep -q "ERROR:.*com.test.broken-loaded.plist could not be parsed" && ok "T31 ERROR-level line names the LOADED broken daemon (pre-fix: this line did not exist — only an unescalated WARN)" || nok "T31 error-line" "no escalated ERROR line in output: [$OUT]"
+echo "$(field PARSE_ERROR_LOADED "$OUT")" | grep -qx "com.test.broken-loaded" && ok "T31 PARSE_ERROR_LOADED carries the loaded label (pre-fix: field did not exist at all)" || nok "T31 parse_error_loaded" "got '$(field PARSE_ERROR_LOADED "$OUT")'"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T32 (ga-tdzsh): a plist that fails to parse, and launchd has NO record of
+# that label at all (dead symlink / stale file — the current, real state of
+# com.athos.ckan_pbh and com.urblink.inbound-review-3d on the live machine,
+# per ga-dgrzf). Must NOT escalate — this is the ACEITE bar: a run today, with
+# both known-broken plists unloaded, must not produce an escalatable alarm.
+# No ERROR-level line, PARSE_ERROR_LOADED stays empty. The plist is still
+# named in PARSE_ERROR_UNLOADED and a low-priority note — visible for cleanup,
+# just never confused for a live gap.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t32
+cat > "$RUNTIME/daemons/ban_risk_dashboard.py" <<<'print("dash")'
+make_plist "$AGENTS" com.test.ban-risk-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/ban_risk_dashboard.py"
+seed_running com.test.ban-risk-dashboard 9921 "$STALE_LSTART"
+seed_restart com.test.ban-risk-dashboard 9929 "$FRESH_LSTART"
+cat > "$AGENTS/com.test.broken-unloaded.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.test.broken-unloaded</string>
+  <!-- a stray double-hyphen -- here, and nothing loaded under this label -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/true</string>
+  </array>
+</dict>
+</plist>
+EOF
+# deliberately NOT seeded as running or loaded — mirrors a dead symlink/stale file
+OUT=$(run_helper_stderr daemons/ban_risk_dashboard.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T32 verdict OK" || nok "T32 verdict" "got '$V' out=[$OUT]"
+! echo "$OUT" | grep -q "ERROR:.*com.test.broken-unloaded" && ok "T32 no ERROR-level line for an unloaded broken plist (THE ACEITE bar)" || nok "T32 no-error" "escalated when it should not have: [$OUT]"
+[ -z "$(field PARSE_ERROR_LOADED "$OUT")" ] && ok "T32 PARSE_ERROR_LOADED stays empty" || nok "T32 parse_error_loaded" "got '$(field PARSE_ERROR_LOADED "$OUT")'"
+echo "$(field PARSE_ERROR_UNLOADED "$OUT")" | grep -qx "com.test.broken-unloaded" && ok "T32 PARSE_ERROR_UNLOADED still records it (visible, just not escalated)" || nok "T32 parse_error_unloaded" "got '$(field PARSE_ERROR_UNLOADED "$OUT")'"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T33 (ga-tdzsh): the escalation check is launchd LOAD status, not live-PID
+# presence — a label loaded but with NO current PID (e.g. a KeepAlive=false
+# job between runs) must still escalate. Proves daemon_is_loaded() cannot be
+# satisfied by reusing daemon_pid(), which is empty for BOTH "not loaded" and
+# "loaded but idle" — the exact ambiguity ga-tdzsh is about.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t33
+cat > "$RUNTIME/daemons/ban_risk_dashboard.py" <<<'print("dash")'
+make_plist "$AGENTS" com.test.ban-risk-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/ban_risk_dashboard.py"
+seed_running com.test.ban-risk-dashboard 9941 "$STALE_LSTART"
+seed_restart com.test.ban-risk-dashboard 9949 "$FRESH_LSTART"
+cat > "$AGENTS/com.test.broken-idle.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.test.broken-idle</string>
+  <!-- a stray double-hyphen -- here; loaded but between runs, no live PID -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/true</string>
+  </array>
+</dict>
+</plist>
+EOF
+seed_loaded com.test.broken-idle   # loaded, but NO live PID
+OUT=$(run_helper_stderr daemons/ban_risk_dashboard.py); RC=$?
+echo "$OUT" | grep -q "ERROR:.*com.test.broken-idle.plist could not be parsed" && ok "T33 ERROR line fires for a loaded-but-idle daemon (load status, not PID presence)" || nok "T33 error-line" "no escalated ERROR line: [$OUT]"
+echo "$(field PARSE_ERROR_LOADED "$OUT")" | grep -qx "com.test.broken-idle" && ok "T33 PARSE_ERROR_LOADED carries the idle-but-loaded label" || nok "T33 parse_error_loaded" "got '$(field PARSE_ERROR_LOADED "$OUT")'"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
