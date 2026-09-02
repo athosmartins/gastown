@@ -2102,6 +2102,52 @@ _pilot_defer_extend() {
   return 0
 }
 
+# ga-i58em: a pool-routed sling bead created for an ALREADY-LIVE reused
+# session (_DISPATCH_REUSE=1, dispatch_one() REUSE branch) is an audit-trail
+# wrapper, not real pool demand — delivery already went out-of-band via
+# `gc session submit --intent follow_up`, which queues on the target
+# session's OWN inbox rather than routing through the sling bead's claim
+# mechanism. Left unassigned+gc.routed_to, that sling bead is indistinguishable
+# from legitimate unclaimed pool work to a SECOND idle worker's own
+# routed-pool startup probe (dog Step 1c, wa-worker/ps-worker's hand-
+# duplicated Step 1b3) — none of which know the target story is already
+# spoken for, since the target's own assignee/status update is done by the
+# RECEIVING worker per its own "claim your work" prompt step, not by this
+# script, and nothing tells a second prober to go check first.
+#
+# Live incident (ga-i58em): ga-0ehtp double-dispatched to gastown.dog-1 (the
+# reused session, via submit) AND gastown.dog-3 (which claimed this exact
+# sling, ga-x4rca) inside the SAME Pilot transaction — caught only because
+# dog-3 manually cross-checked ga-0ehtp's live assignee before acting (see
+# duplicate-bug-dispatch-check-before-rebuild), not by any structural guard.
+#
+# A full fix (every routed-pool probe resolving pilot.sling_for and checking
+# the target's live status) would touch the Go-engine-owned RoutedPoolQuery
+# for the dog pool — out of reach for a shell-asset patch (see
+# gascity-engine-locally-buildable-src-hookfix / pending-engine-window
+# process). This closes the same class the cheap way, reusing the exact
+# lesson already baked into _pilot_defer_extend's own history (ga-z297h: a
+# bare pilot:held/pilot:held-until label alone did NOT reliably stop a
+# bd-ready-based self-serve probe from claiming a held bead — only
+# defer_until does, "the one field every such probe already respects").
+# Defer the SLING bead itself (never the story bead — that still has to
+# reach the receiving session's own claim step) a BOUNDED window into the
+# future, not indefinitely: if the reused session genuinely never gets to
+# the follow_up, the sling bead should recover visibility rather than
+# orphan forever — the existing duplicate-dispatch check-before-acting
+# practice remains the backstop for that residual case, unchanged from
+# today.
+_pilot_suppress_reused_sling() {
+  local _prs_city="$1" _prs_sling_id="$2"
+  if [ -z "$_prs_sling_id" ]; then
+    return 0
+  fi
+  local _prs_secs="${PILOT_REUSE_SLING_DEFER_SECONDS:-300}"
+  local _prs_iso
+  _prs_iso=$(date -u -r "$(($(date +%s) + _prs_secs))" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null) || return 0
+  _pilot_defer_extend "$_prs_city" "$_prs_sling_id" "$_prs_iso"
+}
+
 _pilot_hold_or_escalate() {
   local _phe_db="$1" _phe_id="$2" _phe_slug="$3" _phe_reason="$4" _phe_unblock="$5"
   local _phe_labels="${6:-[]}" _phe_cap="${7:-$PILOT_HOLD_ESCALATE_CAP}"
@@ -8891,6 +8937,13 @@ TASK
     # backstop) is the documented defense-in-depth for that residual —
     # deliberately not implemented here; see the ga-nimyz fix notes for why.
     bd -C "$GC_CITY" update "$SLING_BEAD_ID" --set-metadata "pilot.sling_for=$STORY_ID" -q 2>/dev/null || true
+
+    # ga-i58em: REUSE delivers out-of-band (session submit, below) — this
+    # sling bead must not look like unclaimed pool demand to a second idle
+    # worker's own routed-pool probe. See _pilot_suppress_reused_sling.
+    if [ "$_DISPATCH_REUSE" = "1" ]; then
+      _pilot_suppress_reused_sling "$GC_CITY" "$SLING_BEAD_ID"
+    fi
 
     # ga-2azzj fix 3: record the slung builder task so TTL recovery can tell a
     # genuinely-stuck claim (sling task closed/gone) from an active long build
