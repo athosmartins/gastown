@@ -1,0 +1,569 @@
+diff --git a/cmd/gc/cmd_hook.go b/cmd/gc/cmd_hook.go
+index c0600779b..00c3ae88a 100644
+--- a/cmd/gc/cmd_hook.go
++++ b/cmd/gc/cmd_hook.go
+@@ -204,6 +204,12 @@ func cmdHookWithFormat(args []string, inject bool, hookFormat string, stdout, st
+ 		}
+ 		return out, err
+ 	}
++	// Skip the work_query (and every bd subprocess it fires) entirely when
++	// a recent check for this exact agent/session/dir already came back
++	// empty — the dominant Dolt CPU cost is poll frequency times the
++	// per-bd-invocation connection floor, not query cost (ga-i3rx). Never
++	// delays a positive result: see wrapWorkQueryRunnerWithNoWorkCache.
++	runner = wrapWorkQueryRunnerWithNoWorkCache(cityPath, agentForQuery, sessionForQuery, workDir, runner)
+ 	return doHook(workQuery, workDir, inject, runner, stdout, stderr)
+ }
+ 
+diff --git a/cmd/gc/cmd_hook_test.go b/cmd/gc/cmd_hook_test.go
+index 7ad24932d..2b6976a5e 100644
+--- a/cmd/gc/cmd_hook_test.go
++++ b/cmd/gc/cmd_hook_test.go
+@@ -1297,3 +1297,76 @@ func TestDoHookNormalizesSingleObjectOutputToArray(t *testing.T) {
+ 		t.Fatalf("stdout = %q, want normalized JSON array", got)
+ 	}
+ }
++
++// TestCmdHookNoWorkCacheSkipsRepeatedSubprocessInvocation is the ga-i3rx
++// regression test at the actual process boundary: before this change,
++// every gc hook invocation re-ran the configured work_query (and every bd
++// subprocess inside it) from scratch, even when an identical check for the
++// exact same agent/session had come back empty moments earlier. This is
++// the dominant Dolt CPU cost (poll FREQUENCY times the ~70ms per-bd
++// connection floor, not query cost — see memory
++// dolt-cpu-root-poll-freq-not-ftmci-layer). This test FAILS against the
++// pre-fix code: the fake-bd invocation log would show 2 runs after 2
++// calls, not 1.
++func TestCmdHookNoWorkCacheSkipsRepeatedSubprocessInvocation(t *testing.T) {
++	clearGCEnv(t)
++	disableManagedDoltRecoveryForTest(t)
++	cityDir := t.TempDir()
++	fakeBin := t.TempDir()
++	logPath := filepath.Join(t.TempDir(), "bd.log")
++	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	cityToml := `[workspace]
++name = "test-city"
++
++[[agent]]
++name = "worker"
++work_query = "bd ready"
++`
++	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	fakeBD := filepath.Join(fakeBin, "bd")
++	script := fmt.Sprintf("#!/bin/sh\nprintf 'run\\n' >> %q\nprintf '[]'\n", logPath)
++	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
++		t.Fatal(err)
++	}
++
++	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
++	t.Setenv("GC_CITY", cityDir)
++	t.Setenv("GC_TEMPLATE", "worker")
++	t.Setenv("GC_SESSION_ID", "sess-cache-1")
++	t.Setenv("GC_SESSION_NAME", "worker-cache-1")
++
++	oldTTL := hookNoWorkCacheTTL
++	hookNoWorkCacheTTL = time.Minute
++	t.Cleanup(func() { hookNoWorkCacheTTL = oldTTL })
++
++	countRuns := func() int {
++		data, err := os.ReadFile(logPath)
++		if err != nil {
++			if os.IsNotExist(err) {
++				return 0
++			}
++			t.Fatalf("reading bd log: %v", err)
++		}
++		return strings.Count(string(data), "run\n")
++	}
++
++	var stdout1, stderr1 bytes.Buffer
++	if code := cmdHookWithFormat(nil, false, "", &stdout1, &stderr1); code != 1 {
++		t.Fatalf("first cmdHookWithFormat() = %d, want 1 (no work); stderr=%s", code, stderr1.String())
++	}
++	if got := countRuns(); got != 1 {
++		t.Fatalf("bd invocations after first call = %d, want 1", got)
++	}
++
++	var stdout2, stderr2 bytes.Buffer
++	if code := cmdHookWithFormat(nil, false, "", &stdout2, &stderr2); code != 1 {
++		t.Fatalf("second cmdHookWithFormat() = %d, want 1 (still no work); stderr=%s", code, stderr2.String())
++	}
++	if got := countRuns(); got != 1 {
++		t.Fatalf("bd invocations after second call = %d, want still 1 (cache hit must skip the subprocess entirely)", got)
++	}
++}
+diff --git a/cmd/gc/hook_no_work_cache.go b/cmd/gc/hook_no_work_cache.go
+new file mode 100644
+index 000000000..8db5acbf2
+--- /dev/null
++++ b/cmd/gc/hook_no_work_cache.go
+@@ -0,0 +1,190 @@
++package main
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"log"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/gastownhall/gascity/internal/citylayout"
++)
++
++// defaultHookNoWorkCacheTTL bounds how long a "no ready work" gc hook
++// result may be reused without re-running the work_query. gc hook runs as
++// a fresh subprocess on every check — the controller's own spawn-decision
++// polling and a live session's Stop-hook both re-invoke it repeatedly, and
++// there is no long-lived process to hold an in-memory cache across those
++// invocations (see internal/runtime/tmux/state_cache.go for the in-process
++// equivalent, which does NOT help here for that reason).
++//
++// A single work_query can fire many bd subprocesses — one per candidate
++// tier, one per federated rig store for cross-store-eligible agents — each
++// opening its own fresh Dolt connection with a ~70ms CPU floor. The
++// dominant Dolt CPU cost is poll FREQUENCY times that per-connection
++// floor, not query cost (ga-i3rx, memory dolt-cpu-root-poll-freq-not-
++// ftmci-layer). A cache hit skips the work_query, and every bd invocation
++// inside it, entirely — while never delaying a positive result (see
++// wrapWorkQueryRunnerWithNoWorkCache).
++//
++// Kept short relative to this city's existing daemon intervals (30s+):
++// a few seconds of extra latency on a "no work" answer is far below what
++// agents already tolerate elsewhere, and the propulsion-principle "no
++// waiting" contract is about acting instantly on work that IS found, not
++// about the polling cadence used to look for it.
++const defaultHookNoWorkCacheTTL = 3 * time.Second
++
++// hookNoWorkCacheTTL is a package-level var (not a const use-site) so tests
++// can override it directly, matching the hookWorkQueryTimeout pattern
++// already used in cmd_hook.go.
++var hookNoWorkCacheTTL = hookNoWorkCacheTTLFromEnv()
++
++// hookNoWorkCacheTTLFromEnv reads GC_HOOK_NO_WORK_CACHE_TTL and parses it
++// as a duration, mirroring internal/runtime/tmux/state_cache.go's
++// cacheTTLFromEnv so this cache is tunable (including disabled via "0" or
++// a negative value) without a rebuild. Returns defaultHookNoWorkCacheTTL
++// if the env var is unset, empty, or cannot be parsed.
++func hookNoWorkCacheTTLFromEnv() time.Duration {
++	v := os.Getenv("GC_HOOK_NO_WORK_CACHE_TTL")
++	if v == "" {
++		return defaultHookNoWorkCacheTTL
++	}
++	if d, err := time.ParseDuration(v); err == nil {
++		return d
++	}
++	if strings.TrimSpace(v) == v {
++		if ms, err := strconv.Atoi(v); err == nil {
++			return time.Duration(ms) * time.Millisecond
++		}
++	}
++	log.Printf("gc hook: invalid GC_HOOK_NO_WORK_CACHE_TTL=%q, using default %v", v, defaultHookNoWorkCacheTTL)
++	return defaultHookNoWorkCacheTTL
++}
++
++// hookNoWorkCacheEntry is the on-disk shape of one cache entry.
++type hookNoWorkCacheEntry struct {
++	CheckedAt time.Time `json:"checked_at"`
++}
++
++// hookNoWorkCacheKey derives a stable, filesystem-safe cache key from the
++// resolved agent/session/dir identity a hook check ran against.
++//
++// Session identity is required, not just the work_query text: multiple
++// sessions of the same pool template (e.g. gastown.dog-2, gastown.dog-3)
++// share an identical work_query string but resolve different actual
++// results because the query reads $GC_SESSION_NAME/$GC_SESSION_ID/$GC_ALIAS
++// at runtime. Keying on the query text alone would let one session's
++// cached "no work" answer stand in for another session entirely — a
++// correctness bug (missed dispatch), not just a staleness one. Returns ""
++// when there isn't enough identity to key on safely; callers must treat
++// that as "skip caching" rather than risk a collision.
++func hookNoWorkCacheKey(agent, session, dir string) string {
++	agent = strings.TrimSpace(agent)
++	session = strings.TrimSpace(session)
++	dir = strings.TrimSpace(dir)
++	if agent == "" && session == "" {
++		return ""
++	}
++	sum := sha256.Sum256([]byte(agent + "\x1f" + session + "\x1f" + dir))
++	return hex.EncodeToString(sum[:16])
++}
++
++// hookNoWorkCachePath returns the on-disk path for one cache entry, nested
++// under the canonical per-city runtime root (citylayout.RuntimeDataDir) —
++// the same root used by every other piece of mutable runtime state in this
++// codebase (dolt-state.json, control-dispatcher traces, etc.).
++func hookNoWorkCachePath(cityPath, key string) string {
++	return filepath.Join(citylayout.RuntimeDataDir(cityPath), "hook-cache", key+".json")
++}
++
++// hookNoWorkCacheFresh reports whether a cached "no work" entry exists and
++// is still within TTL. Any read or parse failure is treated as a cache
++// miss — this cache is a pure optimization and must never become a
++// correctness dependency (a corrupt or unreadable file just means the next
++// check runs for real, same as a cold cache).
++func hookNoWorkCacheFresh(path string) bool {
++	if hookNoWorkCacheTTL <= 0 {
++		return false
++	}
++	data, err := os.ReadFile(path)
++	if err != nil {
++		return false
++	}
++	var entry hookNoWorkCacheEntry
++	if err := json.Unmarshal(data, &entry); err != nil {
++		return false
++	}
++	return time.Since(entry.CheckedAt) < hookNoWorkCacheTTL
++}
++
++// writeHookNoWorkCache records that this key was just checked and had no
++// ready work. Best-effort and silent on failure (including a disabled TTL)
++// — a cache write must never turn into a hook failure.
++func writeHookNoWorkCache(path string) {
++	if hookNoWorkCacheTTL <= 0 {
++		return
++	}
++	data, err := json.Marshal(hookNoWorkCacheEntry{CheckedAt: time.Now()})
++	if err != nil {
++		return
++	}
++	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
++		return
++	}
++	// Write-to-temp-then-rename keeps a concurrent reader from ever
++	// observing a partially-written cache file (rename is atomic on the
++	// same filesystem, which filepath.Dir(path) guarantees here).
++	tmp := path + ".tmp"
++	if err := os.WriteFile(tmp, data, 0o644); err != nil {
++		return
++	}
++	_ = os.Rename(tmp, path)
++}
++
++// clearHookNoWorkCache removes a cached "no work" entry. Called whenever a
++// real check finds work or errors, so a stale negative can never outlive a
++// positive: the next check of any kind runs for real rather than trusting
++// an answer that is now known to be wrong.
++func clearHookNoWorkCache(path string) {
++	_ = os.Remove(path)
++}
++
++// wrapWorkQueryRunnerWithNoWorkCache wraps runner with the file-based
++// no-work cache described above. A cache hit returns ("", nil) without
++// invoking runner at all — doHook already treats an empty runner result as
++// "no ready work" (see TestHookNoWork) — so none of the work_query's bd
++// subprocesses run on a hit.
++//
++// Only a negative (no ready work) result is ever cached. Any positive
++// result or error clears the entry immediately: a session that actually
++// has work, or just hit a real error, is never told "no work" from a
++// stale cache, and neither is ever itself deferred by this cache — only
++// repeated NEGATIVE answers are ever short-circuited.
++func wrapWorkQueryRunnerWithNoWorkCache(cityPath, agent, session, dir string, runner WorkQueryRunner) WorkQueryRunner {
++	key := hookNoWorkCacheKey(agent, session, dir)
++	if key == "" {
++		return runner
++	}
++	path := hookNoWorkCachePath(cityPath, key)
++	return func(command, runDir string) (string, error) {
++		if hookNoWorkCacheFresh(path) {
++			return "", nil
++		}
++		out, err := runner(command, runDir)
++		if err != nil {
++			clearHookNoWorkCache(path)
++			return out, err
++		}
++		ready := filterUnreadyHookCandidates(normalizeWorkQueryOutput(strings.TrimSpace(out)), time.Now())
++		if workQueryHasReadyWork(ready) {
++			clearHookNoWorkCache(path)
++		} else {
++			writeHookNoWorkCache(path)
++		}
++		return out, nil
++	}
++}
+diff --git a/cmd/gc/hook_no_work_cache_test.go b/cmd/gc/hook_no_work_cache_test.go
+new file mode 100644
+index 000000000..957df1e29
+--- /dev/null
++++ b/cmd/gc/hook_no_work_cache_test.go
+@@ -0,0 +1,269 @@
++package main
++
++import (
++	"fmt"
++	"testing"
++	"time"
++)
++
++func TestHookNoWorkCacheKeyEmptyWhenNoIdentity(t *testing.T) {
++	if got := hookNoWorkCacheKey("", "", "/some/dir"); got != "" {
++		t.Fatalf("hookNoWorkCacheKey(no agent/session) = %q, want empty (caching must be skipped, not collide)", got)
++	}
++}
++
++func TestHookNoWorkCacheKeyNonEmptyWithAgentOnly(t *testing.T) {
++	if got := hookNoWorkCacheKey("gastown.dog", "", ""); got == "" {
++		t.Fatal("hookNoWorkCacheKey(agent only) = empty, want non-empty key")
++	}
++}
++
++// TestHookNoWorkCacheKeyDiffersPerSession guards the critical safety
++// property: two sessions of the same pool template (e.g. gastown.dog-2,
++// gastown.dog-3) share an identical work_query string and agent identity
++// but must never share a cache entry, because each resolves a different
++// actual answer from its own $GC_SESSION_NAME. A collision here would let
++// one session's "no work" answer for another session — a missed-dispatch
++// bug, not just staleness.
++func TestHookNoWorkCacheKeyDiffersPerSession(t *testing.T) {
++	k1 := hookNoWorkCacheKey("gastown.dog", "gastown.dog-2", "/work")
++	k2 := hookNoWorkCacheKey("gastown.dog", "gastown.dog-3", "/work")
++	if k1 == "" || k2 == "" {
++		t.Fatalf("expected non-empty keys, got %q and %q", k1, k2)
++	}
++	if k1 == k2 {
++		t.Fatalf("hookNoWorkCacheKey collided across sessions of the same agent template: %q == %q", k1, k2)
++	}
++}
++
++func TestHookNoWorkCacheKeyDiffersPerDir(t *testing.T) {
++	k1 := hookNoWorkCacheKey("worker", "worker-1", "/rig/a")
++	k2 := hookNoWorkCacheKey("worker", "worker-1", "/rig/b")
++	if k1 == k2 {
++		t.Fatalf("hookNoWorkCacheKey collided across different work dirs: %q == %q", k1, k2)
++	}
++}
++
++func TestHookNoWorkCacheKeyStableForSameInputs(t *testing.T) {
++	k1 := hookNoWorkCacheKey("worker", "worker-1", "/rig/a")
++	k2 := hookNoWorkCacheKey("worker", "worker-1", "/rig/a")
++	if k1 != k2 {
++		t.Fatalf("hookNoWorkCacheKey not deterministic: %q != %q", k1, k2)
++	}
++}
++
++// TestWrapWorkQueryRunnerWithNoWorkCacheSkipsRepeatedNegative is the
++// ga-i3rx regression test: before this change, every gc hook invocation
++// re-ran the full work_query (and every bd subprocess inside it)
++// regardless of how recently the same agent/session/dir had already come
++// back empty. This fails against the pre-fix code because the bare
++// runner has no memory between calls — calls is 2 after two invocations,
++// not 1.
++func TestWrapWorkQueryRunnerWithNoWorkCacheSkipsRepeatedNegative(t *testing.T) {
++	oldTTL := hookNoWorkCacheTTL
++	hookNoWorkCacheTTL = time.Minute
++	t.Cleanup(func() { hookNoWorkCacheTTL = oldTTL })
++
++	cityPath := t.TempDir()
++	calls := 0
++	base := WorkQueryRunner(func(string, string) (string, error) {
++		calls++
++		return "", nil // no work
++	})
++	wrapped := wrapWorkQueryRunnerWithNoWorkCache(cityPath, "worker", "worker-1", "/work", base)
++
++	out1, err1 := wrapped("bd ready", "/work")
++	if err1 != nil || out1 != "" {
++		t.Fatalf("first call = (%q, %v), want (\"\", nil)", out1, err1)
++	}
++	if calls != 1 {
++		t.Fatalf("calls after first invocation = %d, want 1", calls)
++	}
++
++	out2, err2 := wrapped("bd ready", "/work")
++	if err2 != nil || out2 != "" {
++		t.Fatalf("second call = (%q, %v), want (\"\", nil)", out2, err2)
++	}
++	if calls != 1 {
++		t.Fatalf("calls after second invocation = %d, want 1 (cache hit must not invoke the underlying runner)", calls)
++	}
++}
++
++// TestWrapWorkQueryRunnerWithNoWorkCacheExpiresAfterTTL guards against the
++// cache becoming a correctness hazard: once the TTL elapses, the next
++// check must run for real again rather than trusting a negative forever.
++func TestWrapWorkQueryRunnerWithNoWorkCacheExpiresAfterTTL(t *testing.T) {
++	oldTTL := hookNoWorkCacheTTL
++	hookNoWorkCacheTTL = 20 * time.Millisecond
++	t.Cleanup(func() { hookNoWorkCacheTTL = oldTTL })
++
++	cityPath := t.TempDir()
++	calls := 0
++	base := WorkQueryRunner(func(string, string) (string, error) {
++		calls++
++		return "", nil
++	})
++	wrapped := wrapWorkQueryRunnerWithNoWorkCache(cityPath, "worker", "worker-1", "/work", base)
++
++	if _, err := wrapped("bd ready", "/work"); err != nil {
++		t.Fatalf("first call error = %v", err)
++	}
++	if calls != 1 {
++		t.Fatalf("calls after first invocation = %d, want 1", calls)
++	}
++
++	time.Sleep(60 * time.Millisecond)
++
++	if _, err := wrapped("bd ready", "/work"); err != nil {
++		t.Fatalf("post-TTL call error = %v", err)
++	}
++	if calls != 2 {
++		t.Fatalf("calls after TTL expiry = %d, want 2 (stale cache must not be trusted)", calls)
++	}
++}
++
++// TestWrapWorkQueryRunnerWithNoWorkCacheNeverDelaysPositiveResult is the
++// core safety property: a session that actually has ready work must never
++// be told "no work" by this cache, even if an earlier check (moments ago,
++// well within TTL) also found work. Only negative results are ever cached.
++func TestWrapWorkQueryRunnerWithNoWorkCacheNeverDelaysPositiveResult(t *testing.T) {
++	oldTTL := hookNoWorkCacheTTL
++	hookNoWorkCacheTTL = time.Minute
++	t.Cleanup(func() { hookNoWorkCacheTTL = oldTTL })
++
++	cityPath := t.TempDir()
++	calls := 0
++	base := WorkQueryRunner(func(string, string) (string, error) {
++		calls++
++		return `[{"id":"hw-1"}]`, nil
++	})
++	wrapped := wrapWorkQueryRunnerWithNoWorkCache(cityPath, "worker", "worker-1", "/work", base)
++
++	for i := 1; i <= 3; i++ {
++		out, err := wrapped("bd ready", "/work")
++		if err != nil {
++			t.Fatalf("call %d error = %v", i, err)
++		}
++		if out != `[{"id":"hw-1"}]` {
++			t.Fatalf("call %d output = %q, want real work every time", i, out)
++		}
++	}
++	if calls != 3 {
++		t.Fatalf("calls = %d, want 3 (a positive result must never be served from cache)", calls)
++	}
++}
++
++// TestWrapWorkQueryRunnerWithNoWorkCacheNeverCachesError guards the same
++// property for errors: a transient failure must never be memoized as "no
++// work" (or as anything cacheable at all), so every call re-checks.
++func TestWrapWorkQueryRunnerWithNoWorkCacheNeverCachesError(t *testing.T) {
++	oldTTL := hookNoWorkCacheTTL
++	hookNoWorkCacheTTL = time.Minute
++	t.Cleanup(func() { hookNoWorkCacheTTL = oldTTL })
++
++	cityPath := t.TempDir()
++	calls := 0
++	base := WorkQueryRunner(func(string, string) (string, error) {
++		calls++
++		return "", fmt.Errorf("transient store error")
++	})
++	wrapped := wrapWorkQueryRunnerWithNoWorkCache(cityPath, "worker", "worker-1", "/work", base)
++
++	for i := 1; i <= 2; i++ {
++		if _, err := wrapped("bd ready", "/work"); err == nil {
++			t.Fatalf("call %d error = nil, want transient store error", i)
++		}
++	}
++	if calls != 2 {
++		t.Fatalf("calls = %d, want 2 (an error must never be cached)", calls)
++	}
++}
++
++// TestWrapWorkQueryRunnerWithNoWorkCacheRecoversAfterErrorThenWork checks
++// the transition sequence a real session can hit: error, then a real
++// negative, then a real positive — each must be reflected immediately, and
++// only the negative may ever be skipped on a repeat.
++func TestWrapWorkQueryRunnerWithNoWorkCacheRecoversAfterErrorThenWork(t *testing.T) {
++	oldTTL := hookNoWorkCacheTTL
++	hookNoWorkCacheTTL = time.Minute
++	t.Cleanup(func() { hookNoWorkCacheTTL = oldTTL })
++
++	cityPath := t.TempDir()
++	step := 0
++	base := WorkQueryRunner(func(string, string) (string, error) {
++		step++
++		switch step {
++		case 1:
++			return "", fmt.Errorf("transient")
++		case 2, 3:
++			return "", nil // negative, then a cache-eligible repeat
++		default:
++			return `[{"id":"hw-1"}]`, nil // now real work must never be hidden
++		}
++	})
++	wrapped := wrapWorkQueryRunnerWithNoWorkCache(cityPath, "worker", "worker-1", "/work", base)
++
++	if _, err := wrapped("bd ready", "/work"); err == nil {
++		t.Fatal("step 1: want error surfaced")
++	}
++	if step != 1 {
++		t.Fatalf("step after call 1 = %d, want 1", step)
++	}
++
++	if out, err := wrapped("bd ready", "/work"); err != nil || out != "" {
++		t.Fatalf("step 2: got (%q, %v), want (\"\", nil)", out, err)
++	}
++	if step != 2 {
++		t.Fatalf("step after call 2 = %d, want 2", step)
++	}
++
++	// Repeat within TTL: must be served from cache, underlying runner not called.
++	if out, err := wrapped("bd ready", "/work"); err != nil || out != "" {
++		t.Fatalf("step 3 (cache hit): got (%q, %v), want (\"\", nil)", out, err)
++	}
++	if step != 2 {
++		t.Fatalf("step after cache-hit call = %d, want still 2 (underlying runner must not have been invoked)", step)
++	}
++}
++
++func TestWrapWorkQueryRunnerWithNoWorkCacheNoIdentityAlwaysDelegates(t *testing.T) {
++	cityPath := t.TempDir()
++	calls := 0
++	base := WorkQueryRunner(func(string, string) (string, error) {
++		calls++
++		return "", nil
++	})
++	wrapped := wrapWorkQueryRunnerWithNoWorkCache(cityPath, "", "", "/work", base)
++
++	for i := 0; i < 2; i++ {
++		if _, err := wrapped("bd ready", "/work"); err != nil {
++			t.Fatalf("call %d error = %v", i, err)
++		}
++	}
++	if calls != 2 {
++		t.Fatalf("calls = %d, want 2 (no agent/session identity means caching must be skipped entirely)", calls)
++	}
++}
++
++func TestHookNoWorkCacheDisabledByNonPositiveTTL(t *testing.T) {
++	oldTTL := hookNoWorkCacheTTL
++	hookNoWorkCacheTTL = 0
++	t.Cleanup(func() { hookNoWorkCacheTTL = oldTTL })
++
++	cityPath := t.TempDir()
++	calls := 0
++	base := WorkQueryRunner(func(string, string) (string, error) {
++		calls++
++		return "", nil
++	})
++	wrapped := wrapWorkQueryRunnerWithNoWorkCache(cityPath, "worker", "worker-1", "/work", base)
++
++	for i := 0; i < 2; i++ {
++		if _, err := wrapped("bd ready", "/work"); err != nil {
++			t.Fatalf("call %d error = %v", i, err)
++		}
++	}
++	if calls != 2 {
++		t.Fatalf("calls = %d, want 2 (TTL<=0 must disable caching, e.g. as an emergency kill switch)", calls)
++	}
++}
