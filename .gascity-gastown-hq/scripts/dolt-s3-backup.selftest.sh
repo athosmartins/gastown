@@ -63,5 +63,47 @@ else
   bad "bounded-retry-once wiring missing"
 fi
 
+# ── is_connection_timeout_error() — ga-gdsq5 transient-timeout retry mitigation ──
+echo "── is_connection_timeout_error() (ga-gdsq5) ──"
+
+type is_connection_timeout_error >/dev/null 2>&1 \
+  && ok "is_connection_timeout_error defined by lib-mode source" \
+  || { bad "is_connection_timeout_error NOT defined — lib mode broken"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="; exit 1; }
+
+# ── real captured failure (ga-gdsq5, 2026-09-02 04:00:45 hq run) → MUST match ────
+REAL_TIMEOUT_ERR="error on line 1 for query CALL DOLT_BACKUP('sync', 'hq-backup'): Error 1105 (HY000): connection was closed"
+is_connection_timeout_error "$REAL_TIMEOUT_ERR" && ok "real captured error → detected" || bad "real captured error NOT detected"
+
+# ── unrelated failures, INCLUDING the sibling detector's own case → must NOT match ─
+is_connection_timeout_error "connection refused" && bad "unrelated 'connection refused' should NOT match" || ok "unrelated 'connection refused' → not detected"
+is_connection_timeout_error "context deadline exceeded" && bad "unrelated timeout should NOT match" || ok "unrelated timeout → not detected"
+is_connection_timeout_error "" && bad "empty string should NOT match" || ok "empty string → not detected"
+is_connection_timeout_error "$REAL_ERR" && bad "stale-manifest error should NOT match connection-timeout detector" || ok "stale-manifest error → not detected by connection-timeout detector"
+is_stale_manifest_error "$REAL_TIMEOUT_ERR" && bad "connection-timeout error should NOT match stale-manifest detector" || ok "connection-timeout error → not detected by stale-manifest detector"
+
+# ── substring anywhere in a multi-line blob still matches (log captures full output) ─
+MULTI_TIMEOUT="line one
+line two: Error 1105 (HY000): connection was closed
+line three"
+is_connection_timeout_error "$MULTI_TIMEOUT" && ok "substring mid-multiline blob → detected" || bad "multiline blob NOT detected"
+
+# ── drift-guard: live script must actually wire the retry into the sync step ─────
+echo "── drift-guard: connection-timeout retry wiring present in live script ──"
+if grep -qF 'is_connection_timeout_error "$(cat "$SYNC_OUT")"' "$SCRIPT"; then
+  ok "sync step calls is_connection_timeout_error on the captured sync output"
+else
+  bad "sync step does NOT call is_connection_timeout_error — detection is dead code"
+fi
+if grep -qF 'after connection-timeout retry' "$SCRIPT"; then
+  ok "retry is bounded (single retry, distinct log marker for frequency tracking)"
+else
+  bad "bounded connection-timeout-retry wiring missing"
+fi
+if grep -qF 'RETRY_WAIT_SEC' "$SCRIPT"; then
+  ok "retry waits before retrying (gives a different load window a chance)"
+else
+  bad "retry-wait wiring missing"
+fi
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

@@ -39,6 +39,7 @@ LOCK_STALE_MIN=180                        # reclaim a lock older than this (cras
 SYNC_TIMEOUT=600                          # per-db native DOLT_BACKUP sync
 S3_TIMEOUT=1200                           # per-db aws s3 sync
 PREFLIGHT_TIMEOUT=30                       # server reachability probe
+RETRY_WAIT_SEC=20                         # ga-gdsq5: pause before a connection-timeout retry
 
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
@@ -54,6 +55,23 @@ notify_fail() { "$NOTIFY" -t "Dolt S3 backup" -p 4 "🚨 $*" 2>/dev/null || true
 is_stale_manifest_error() {
   case "$1" in
     *"table file not found"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ga-gdsq5: the managed server's listener.read_timeout_millis (30s, deliberately
+# short — reaps abandoned per-call connections; see dolt-config.yaml's own
+# comment) can also cut a legitimate CALL DOLT_BACKUP('sync', ...) that runs
+# long under load against a large store (hq, 5.7GB+). This is TRANSIENT and
+# load-dependent — the same backup succeeded the day before at the same db
+# size — unlike is_stale_manifest_error above, no staging corruption is
+# involved, so a bare retry (no reinit) can genuinely land in a different load
+# window. Root cause (server-side read_timeout_millis) tracked separately in
+# ga-gdsq5 — raising it requires a shared Dolt server restart, out of scope
+# for this client-side mitigation.
+is_connection_timeout_error() {
+  case "$1" in
+    *"connection was closed"*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -137,6 +155,17 @@ for db in $DBS; do
         log "$db: DOLT_BACKUP sync FAILED (after auto-recover retry)"; failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"; continue
       fi
       log "$db: auto-recover OK after staging reinit"
+    elif is_connection_timeout_error "$(cat "$SYNC_OUT")"; then
+      # Transient/load-dependent (ga-gdsq5) — staging itself is fine, only the
+      # connection was cut mid-sync, so retry the same sync once with no
+      # reinit, after a short wait to give a possibly-different load window.
+      log "$db: connection-timeout on sync — retrying once after ${RETRY_WAIT_SEC}s"
+      sleep "$RETRY_WAIT_SEC"
+      if ! DOLT_CLI_PASSWORD='' timeout "$SYNC_TIMEOUT" "$DOLT" --host "$HOST" --port "$PORT" \
+            --user root --no-tls sql -q "USE \`$db\`; CALL DOLT_BACKUP('sync', '${db}-backup');" >> "$LOG" 2>&1; then
+        log "$db: DOLT_BACKUP sync FAILED (after connection-timeout retry)"; failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"; continue
+      fi
+      log "$db: sync OK after connection-timeout retry"
     else
       log "$db: DOLT_BACKUP sync FAILED"; failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"; continue
     fi
