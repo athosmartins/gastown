@@ -28,7 +28,9 @@
 #   detecting FPExtra hash change. gc reload --soft updates the stored hash and cancels
 #   any already-queued drains, so the second tick sees no drift and fires no restart.
 #   Window: ~60 seconds between poke (file change detected) and tick-2 (actual restart).
-#   gc reload --soft completes in < 5s, so this is safe under normal load.
+#   gc reload --soft completes in < 5s under normal load, but the reload lock can be
+#   held far longer under contention (measured 76s, ga-twax4) — step 4 retries with
+#   backoff for up to ~120s before telling the operator to run it by hand.
 
 set -euo pipefail
 
@@ -115,14 +117,34 @@ rsync -a --delete "$SOURCE_DIR/" "$CITY_VENDOR_SINK/"
 
 echo "skill-deploy: Files written. Running gc reload --soft to suppress config-drift restarts..."
 
-# --- Immediate soft reload ---
+# --- Immediate soft reload (retried with backoff) ---
 # This cancels any queued config-drift drain caused by the FPExtra hash change above.
-# Must run before the second reconciler tick fires (~30-60s after the file change poke).
+# A single attempt undershoots real lock contention (measured 76s vs. the <5s the
+# header assumes) — retry before telling the operator to do it by hand within a
+# window ("~60s") that can already have expired by the time they read it.
+# Overridable so the selftest doesn't need real ~120s sleeps.
+RELOAD_RETRY_WAIT="${SKILL_DEPLOY_RELOAD_RETRY_WAIT:-10}"       # seconds between retries
+RELOAD_MAX_RETRIES="${SKILL_DEPLOY_RELOAD_MAX_RETRIES:-12}"     # retries after the first attempt (~120s total)
+
 if command -v "$GC" >/dev/null 2>&1; then
-    if "$GC" reload --soft --city "$CITY_DIR" 2>&1; then
-        echo "skill-deploy: gc reload --soft completed — no session restarts will be triggered."
+    RELOAD_TOTAL_ATTEMPTS=$((RELOAD_MAX_RETRIES + 1))
+    reload_ok=""
+    attempt=1
+    while (( attempt <= RELOAD_TOTAL_ATTEMPTS )); do
+        if "$GC" reload --soft --city "$CITY_DIR" 2>&1; then
+            reload_ok=1
+            break
+        fi
+        if (( attempt < RELOAD_TOTAL_ATTEMPTS )); then
+            echo "skill-deploy: gc reload --soft failed (attempt $attempt/$RELOAD_TOTAL_ATTEMPTS) — retrying in ${RELOAD_RETRY_WAIT}s..."
+            sleep "$RELOAD_RETRY_WAIT"
+        fi
+        attempt=$((attempt + 1))
+    done
+    if [[ -n "$reload_ok" ]]; then
+        echo "skill-deploy: gc reload --soft completed (attempt $attempt/$RELOAD_TOTAL_ATTEMPTS) — no session restarts will be triggered."
     else
-        echo >&2 "skill-deploy: WARNING — gc reload --soft failed. Sessions may be restarted by the reconciler."
+        echo >&2 "skill-deploy: WARNING — gc reload --soft failed after $RELOAD_TOTAL_ATTEMPTS attempts (~$((RELOAD_MAX_RETRIES * RELOAD_RETRY_WAIT))s). Sessions may be restarted by the reconciler."
         echo >&2 "skill-deploy: Run 'gc reload --soft' manually within ~60s to prevent restarts."
     fi
 else
