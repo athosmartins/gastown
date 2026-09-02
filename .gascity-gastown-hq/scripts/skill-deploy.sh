@@ -31,6 +31,9 @@
 #   gc reload --soft completes in < 5s under normal load, but the reload lock can be
 #   held far longer under contention (measured 76s, ga-twax4) — step 4 retries at a
 #   fixed interval for up to ~120s before telling the operator to run it by hand.
+#   That retry budget can legitimately outlast the ~60s deadline above (76s already
+#   does), so step 4's success/failure messages are time-aware: past the deadline
+#   they say so instead of claiming the restart was, or still can be, prevented.
 
 set -euo pipefail
 
@@ -115,6 +118,10 @@ echo "skill-deploy: Writing $SKILL_NAME to city vendor sink (.claude/skills/)...
 mkdir -p "$CITY_VENDOR_SINK"
 rsync -a --delete "$SOURCE_DIR/" "$CITY_VENDOR_SINK/"
 
+# Reference point for the ~60s reconciler deadline (line 30): files are on disk
+# now, so this is when "file change detected" effectively starts the clock.
+POKE_TS="$(date +%s)"
+
 echo "skill-deploy: Files written. Running gc reload --soft to suppress config-drift restarts..."
 
 # --- Immediate soft reload (retried at a fixed interval) ---
@@ -125,6 +132,12 @@ echo "skill-deploy: Files written. Running gc reload --soft to suppress config-d
 # Overridable so the selftest doesn't need real ~120s sleeps.
 RELOAD_RETRY_WAIT="${SKILL_DEPLOY_RELOAD_RETRY_WAIT:-10}"       # seconds between retries
 RELOAD_MAX_RETRIES="${SKILL_DEPLOY_RELOAD_MAX_RETRIES:-12}"     # retries after the first attempt (~120s total)
+# The real reconciler deadline (line 30): a restart fires at tick-2 if the hash
+# isn't updated within this many seconds of the poke. The retry budget above can
+# legitimately outlast it (ga-twax4 measured 76s > 60s), so the messages below
+# check elapsed-since-poke instead of treating an eventual exit-0 as proof the
+# restart was prevented. Overridable so the selftest doesn't need real sleeps.
+RELOAD_DEADLINE_SECONDS="${SKILL_DEPLOY_RELOAD_DEADLINE_SECONDS:-60}"
 
 if command -v "$GC" >/dev/null 2>&1; then
     RELOAD_TOTAL_ATTEMPTS=$((RELOAD_MAX_RETRIES + 1))
@@ -141,15 +154,25 @@ if command -v "$GC" >/dev/null 2>&1; then
         fi
         attempt=$((attempt + 1))
     done
+    RELOAD_ELAPSED=$(( $(date +%s) - POKE_TS ))
     if [[ -n "$reload_ok" ]]; then
-        echo "skill-deploy: gc reload --soft completed (attempt $attempt/$RELOAD_TOTAL_ATTEMPTS) — no session restarts will be triggered."
+        if (( RELOAD_ELAPSED <= RELOAD_DEADLINE_SECONDS )); then
+            echo "skill-deploy: gc reload --soft completed (attempt $attempt/$RELOAD_TOTAL_ATTEMPTS, ${RELOAD_ELAPSED}s since deploy) — no session restarts will be triggered."
+        else
+            echo "skill-deploy: gc reload --soft completed late (attempt $attempt/$RELOAD_TOTAL_ATTEMPTS, ${RELOAD_ELAPSED}s since deploy — past the ~${RELOAD_DEADLINE_SECONDS}s reconciler window)."
+            echo "skill-deploy: a restart may already have fired at tick-2 before this succeeded — verify session state (gc session list) instead of assuming it was prevented."
+        fi
     else
-        echo >&2 "skill-deploy: WARNING — gc reload --soft failed after $RELOAD_TOTAL_ATTEMPTS attempts (~$((RELOAD_MAX_RETRIES * RELOAD_RETRY_WAIT))s). Sessions may be restarted by the reconciler."
-        echo >&2 "skill-deploy: Run 'gc reload --soft' manually within ~60s to prevent restarts."
+        echo >&2 "skill-deploy: WARNING — gc reload --soft failed after $RELOAD_TOTAL_ATTEMPTS attempts (${RELOAD_ELAPSED}s). Sessions may be restarted by the reconciler."
+        if (( RELOAD_ELAPSED < RELOAD_DEADLINE_SECONDS )); then
+            echo >&2 "skill-deploy: Run 'gc reload --soft' manually within ~$((RELOAD_DEADLINE_SECONDS - RELOAD_ELAPSED))s to prevent restarts."
+        else
+            echo >&2 "skill-deploy: The ~${RELOAD_DEADLINE_SECONDS}s window has already passed — a restart may already have fired. Verify session state (gc session list); run 'gc reload --soft' manually to catch up config drift."
+        fi
     fi
 else
     echo >&2 "skill-deploy: WARNING — 'gc' not found in PATH. Cannot run gc reload --soft."
-    echo >&2 "skill-deploy: Run 'gc reload --soft --city $CITY_DIR' manually within ~60s to prevent restarts."
+    echo >&2 "skill-deploy: Run 'gc reload --soft --city $CITY_DIR' manually within ~${RELOAD_DEADLINE_SECONDS}s to prevent restarts."
 fi
 
 # --- Record the official-deploy manifest entry ---

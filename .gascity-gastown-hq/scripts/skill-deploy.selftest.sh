@@ -74,5 +74,38 @@ grep -q "WARNING — gc reload --soft failed after 3 attempts" "$OUT2" && ok "2:
 [ "$(cat "$COUNTER2" 2>/dev/null)" = "3" ] && ok "2: stopped at 3 attempts (1 + SKILL_DEPLOY_RELOAD_MAX_RETRIES=2), not an infinite loop" || bad "2: expected 3 recorded attempts, got $(cat "$COUNTER2" 2>/dev/null || echo '<none>')"
 
 echo ""
+echo "── Scenario 3: reload succeeds but only AFTER the real deadline has passed ──"
+# ga-twax4 gate-feedback: a late success must not be reported the same as an
+# on-time one — the restart may already have fired at tick-2. Force elapsed >
+# deadline without a real ~76s wait: deadline=0 plus one real 1s retry sleep
+# guarantees RELOAD_ELAPSED (whole seconds since POKE_TS) is > 0.
+CITY3="$TMP/city3"; mkdir -p "$CITY3"
+COUNTER3="$TMP/counter3"
+OUT3="$TMP/out3.log"
+SKILL_DEPLOY_CITY="$CITY3" GC="$FAKE_GC" SKILL_DEPLOY_RELOAD_RETRY_WAIT=1 SKILL_DEPLOY_RELOAD_DEADLINE_SECONDS=0 \
+    FAKE_GC_COUNTER_FILE="$COUNTER3" FAKE_GC_RELOAD_FAIL_COUNT=1 \
+    bash "$J" fixture-skill "$SRC_SKILL" >"$OUT3" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && ok "3: script exits 0" || bad "3: expected exit 0, got $rc"
+grep -q "gc reload --soft completed late" "$OUT3" && ok "3: late-success message printed" || bad "3: missing late-success message, got: $(grep 'skill-deploy:.*reload' "$OUT3")"
+grep -q "no session restarts will be triggered" "$OUT3" && bad "3: unconditional prevention claim printed even though the deadline had passed" || ok "3: unconditional prevention claim NOT printed"
+grep -q "verify session state" "$OUT3" && ok "3: operator told to verify session state instead of assuming prevention" || bad "3: missing verify-session-state guidance"
+
+echo ""
+echo "── Scenario 4: retries exhaust AFTER the real deadline has already passed ──"
+# ga-twax4 gate-feedback: the exhaustion warning must not tell the operator to
+# act "within ~Ns" once that window has already closed.
+CITY4="$TMP/city4"; mkdir -p "$CITY4"
+COUNTER4="$TMP/counter4"
+OUT4="$TMP/out4.log"
+SKILL_DEPLOY_CITY="$CITY4" GC="$FAKE_GC" SKILL_DEPLOY_RELOAD_RETRY_WAIT=1 SKILL_DEPLOY_RELOAD_MAX_RETRIES=1 SKILL_DEPLOY_RELOAD_DEADLINE_SECONDS=0 \
+    FAKE_GC_COUNTER_FILE="$COUNTER4" FAKE_GC_RELOAD_FAIL_COUNT=999 \
+    bash "$J" fixture-skill "$SRC_SKILL" >"$OUT4" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && ok "4: script still exits 0" || bad "4: expected exit 0, got $rc"
+grep -q "window has already passed" "$OUT4" && ok "4: warning states the deadline already passed" || bad "4: missing already-passed guidance, got: $(grep 'skill-deploy:.*reload\|skill-deploy:.*window' "$OUT4")"
+grep -q "manually within ~" "$OUT4" && bad "4: told operator to act within a window that had already closed" || ok "4: did NOT give a stale 'within ~Ns' instruction"
+
+echo ""
 echo "skill-deploy selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1
