@@ -46,6 +46,19 @@
 #      an unrelated path (templates/, still genuinely restart-needed per
 #      point 6/ga-jkj0) is never accidentally swallowed by an unrelated glob
 #      (T24).
+#  12. (ga-dk7fw) UNCONDITIONALLY (no restart_policy.yaml needed), tests/**,
+#      docs/**, and *.md resolve to PROOF=not_applicable — not the weaker
+#      not_verified an isolated, unimported change fell back to pre-fix (T28,
+#      T29). The delta matters past daemon-refresh.sh's own output: story-
+#      delivery.sh labels a story delivery:daemon-unverified and rewrites its
+#      done-notification to "DAEMON LIVENESS NOT VERIFIED" for any PROOF tier
+#      other than verified/not_applicable/asset_served_per_request — so a
+#      not_verified tier on a tests-only change was live, actionable-looking
+#      noise on a bead with zero daemon relevance. Deliberately NOT extended
+#      to static/**/templates/** (still point-8/opt-in-only, unchanged — see
+#      point 3/ga-jkj0). A co-changed real module in the SAME deploy as a
+#      tests/ file is never swallowed by this (T30) — same all-or-nothing
+#      shape as point 11.
 #
 # All external effects (launchctl, ps) are injected via LAUNCHCTL_BIN / PS_BIN
 # and a mock state dir, so the test touches NO real daemons. The plist scan and
@@ -966,6 +979,91 @@ V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T27 verdict NEEDS_GUARDED_RESTART (process predates the commit itself — genuinely stale)" || nok "T27 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -ne 0 ] && ok "T27 non-zero exit" || nok "T27 exit" "rc=$RC"
 echo "$(field GUARDED "$OUT")" | grep -q "com.test.demand-dashboard" && ok "T27 flagged GUARDED" || nok "T27 guarded" "$(field GUARDED "$OUT")"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T28 (ga-dk7fw, header point 9): an ISOLATED tests/*.py change — a single
+# test file, entrypoints unrelated to it — must resolve with the CLEAN,
+# structurally-certain PROOF=not_applicable, not the weaker not_verified.
+#
+# IMPORTANT (measured directly against the pre-fix script before writing this
+# test, so this assertion is not guesswork): VERDICT was already OK for this
+# exact fixture pre-fix too — Step 3's "changed code touches no live daemon"
+# fallback already resolves an isolated, unimported test file to OK, via
+# PROOF=not_verified. So the observable delta here is NOT the verdict/exit
+# code (both are OK) — it is PROOF/REASON. That distinction is NOT cosmetic:
+# story-delivery.sh (Delivery COMPLETE branch) special-cases PROOF via a
+# `case "$REFRESH_PROOF" in verified|not_applicable|asset_served_per_request)
+# : ;; *) ...esac` — anything OTHER than those three tiers (not_verified
+# included) adds a delivery:daemon-unverified label to the STORY bead and
+# rewrites its done-notification to "DAEMON LIVENESS NOT VERIFIED — merged
+# code may still be dormant". Pre-fix, a story whose branch touched ONLY a
+# test file got that exact label and scary wording despite zero daemon
+# relevance — the real, evidenced noise class this fix removes, one hop
+# downstream of daemon-refresh.sh itself (see the wa-zmmyd citation on
+# ga-dk7fw for the full incident this traces back to — the ACTUAL alert
+# there was legitimate, driven by real production files in the same deploy;
+# T30 below reproduces that mixed-commit shape and proves it still flags).
+# ════════════════════════════════════════════════════════════════════════════
+SENSITIVE_DAEMONS="campaign central-sender"
+new_case t28
+cat > "$RUNTIME/daemons/campaign_scheduler.py" <<<'def run(): pass'
+cat > "$RUNTIME/daemons/central_sender.py" <<<'def send(): pass'
+make_plist "$AGENTS" com.test.campaign-scheduler "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/campaign_scheduler.py"
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+seed_running com.test.campaign-scheduler 9801 "$STALE_LSTART"
+seed_running com.test.central-sender 9802 "$STALE_LSTART"
+# deploy changed ONLY an isolated test file — the exact wa-zmmyd shape
+OUT=$(run_helper tests/test_campaign_alltime_dedup_wa_zmmyd.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T28 verdict OK (tests/-only change)" || nok "T28 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -eq 0 ] && ok "T28 exit 0" || nok "T28 exit" "rc=$RC"
+[ -z "$(field AFFECTED "$OUT")" ] && ok "T28 no daemon marked AFFECTED" || nok "T28 affected" "$(field AFFECTED "$OUT")"
+[ ! -f "$MOCK/kicks.log" ] && ok "T28 no kickstart called" || nok "T28 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+[ "$(field PROOF "$OUT")" = "not_applicable" ] && ok "T28 PROOF=not_applicable (structurally certain, not merely undetected — the delta from pre-fix not_verified that clears story-delivery.sh's delivery:daemon-unverified case)" || nok "T28 proof" "got '$(field PROOF "$OUT")', want not_applicable"
+echo "$(field REASON "$OUT")" | grep -qi "structurally inert" && ok "T28 REASON names the structurally-inert path class" || nok "T28 reason" "$(field REASON "$OUT")"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T29 (ga-dk7fw): docs/**, *.md-only changes — the other two path classes
+# ACEITE item 1 names — resolve the same way as T28 (same mechanism, both
+# default patterns exercised together: a nested docs/ file and a root *.md
+# file NOT under docs/, matching the "*.md" pattern independently of "docs/**").
+# ════════════════════════════════════════════════════════════════════════════
+SENSITIVE_DAEMONS="campaign central-sender"
+new_case t29
+cat > "$RUNTIME/daemons/campaign_scheduler.py" <<<'def run(): pass'
+make_plist "$AGENTS" com.test.campaign-scheduler "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/campaign_scheduler.py"
+seed_running com.test.campaign-scheduler 9803 "$STALE_LSTART"
+OUT=$(run_helper docs/architecture/campaign_scheduler.md CONTRIBUTING.md); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T29 verdict OK (docs/ + root *.md change)" || nok "T29 verdict" "got '$V' out=[$OUT]"
+[ -z "$(field AFFECTED "$OUT")" ] && ok "T29 no daemon marked AFFECTED" || nok "T29 affected" "$(field AFFECTED "$OUT")"
+[ "$(field PROOF "$OUT")" = "not_applicable" ] && ok "T29 PROOF=not_applicable" || nok "T29 proof" "got '$(field PROOF "$OUT")'"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T30 (ga-dk7fw ACEITE item 2 — no escape hatch): a MIXED deploy where a
+# changed shared module IS genuinely imported by a daemon, alongside an
+# unrelated tests/*.py file in the SAME deploy, must still flag normally —
+# the tests/ file must never exempt real, co-changed production code. This is
+# the actual shape of the wa-zmmyd incident (verified against its own posted
+# daemon-refresh log: the real CHANGED set was 4 production .py files plus 2
+# tests/*.py files, all in one deploy — the alert was correct because of the
+# 4 real files, not caused by the 2 test files).
+# ════════════════════════════════════════════════════════════════════════════
+SENSITIVE_DAEMONS="campaign central-sender"
+new_case t30
+mkdir -p "$RUNTIME/lib"
+cat > "$RUNTIME/lib/dedup_check.py" <<<'def is_duplicate(): pass'
+cat > "$RUNTIME/daemons/central_sender.py" <<'PYEOF'
+from lib.dedup_check import is_duplicate
+is_duplicate()
+PYEOF
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+seed_running com.test.central-sender 9804 "$STALE_LSTART"
+OUT=$(run_helper lib/dedup_check.py tests/test_dedup_check_wa_zmmyd.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T30 verdict NEEDS_GUARDED_RESTART (mixed lib/+tests/ deploy still flags the real lib/ change)" || nok "T30 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -ne 0 ] && ok "T30 non-zero exit" || nok "T30 exit" "rc=$RC"
+echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" && ok "T30 sensitive daemon flagged GUARDED despite co-changed tests/ file" || nok "T30 guarded" "$(field GUARDED "$OUT")"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""

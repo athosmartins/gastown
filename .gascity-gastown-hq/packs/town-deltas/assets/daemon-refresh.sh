@@ -120,6 +120,22 @@
 #      outside every declared glob) does NOT exempt anything — falls straight
 #      through to today's classification. An undeclared/absent key is a pure
 #      no-op: identical to pre-ga-y108i behavior.
+#   9. (ga-dk7fw) Point 8's no_restart_paths is opt-in per rig — real, but it
+#      means a rig that never declared restart_policy.yaml (or forgot to list
+#      a path there) gets ZERO benefit even for path classes that are
+#      universally, unconditionally daemon-irrelevant on EVERY rig: a test
+#      file (tests/**) or a doc file (docs/**, *.md) is never imported by any
+#      daemon's runtime code, full stop — no rig-specific judgment call is
+#      needed to know that, unlike static/ (point 8's own "a *.py helper can
+#      be just as exemptable... if the RIG says so"). So this is a SECOND,
+#      unconditional short-circuit, framework-default rather than rig-
+#      declared, covering exactly {tests/**, docs/**, *.md} — deliberately NOT
+#      static/** or templates/**, which stay point-8-only (rig opt-in) because
+#      they are NOT universally safe (templates/ especially: blanket-exempting
+#      it here would silently reintroduce the point-3/ga-jkj0 stale-Jinja-
+#      template regression). Checked first in Step 1, same all-or-nothing
+#      shape as point 8 (a mixed lib/+tests/ commit is NOT exempted — falls
+#      through to full evaluation on its lib/ file, unchanged).
 #
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
@@ -409,6 +425,57 @@ case "$COMMIT_EPOCH" in ''|*[!0-9]*) COMMIT_EPOCH="$DEPLOY_EPOCH" ;; esac
 
 # ── Step 1: changed files in this deploy ──────────────────────────────────────
 CHANGED="$(git -C "$RUNTIME_DIR" diff --name-only "$PRE_DEPLOY_SHA" "$POST_DEPLOY_SHA" 2>/dev/null || true)"
+
+# (ga-dk7fw, header point 9) framework-default "structurally inert" path
+# classes — checked against the FULL raw changed set, unconditionally, with
+# NO restart_policy.yaml opt-in required (contrast with POLICY_NO_RESTART_PATHS
+# below, which IS rig-declared). tests/**, docs/**, and *.md are never part of
+# ANY daemon's runtime import graph on ANY rig — this is a universal claim,
+# not a rig-specific one, so it belongs here rather than in a config file every
+# rig would otherwise have to repeat. Deliberately NOT extended to static/** or
+# templates/**: those stay rig-declared-only (point 8) because they are NOT
+# universally safe — a *.py "helper" can live under a rig's static/ dir (point
+# 8's own docstring), and Jinja templates are compiled+cached at import (point
+# 3/ga-jkj0), so a blanket templates/** exemption here would silently
+# reintroduce that exact regression. Checked BEFORE the *.py/template split
+# below so a *.py file under tests/ is caught too, matching the path shape
+# ga-dk7fw's bug report cites (wa-zmmyd: a tests/*.py file present in a
+# NEEDS_GUARDED_RESTART deploy). CAVEAT verified while fixing this (see
+# daemon-refresh.test.sh T28's comment for the full trace): an ISOLATED
+# tests/*.py change already resolved to VERDICT=OK pre-fix too (Step 3's
+# "touches no live daemon" fallback) — the wa-zmmyd alert itself was driven
+# by 4 real production .py files in the SAME deploy (confirmed against the
+# daemon-refresh log actually posted on that bead), not by its 2 co-changed
+# test files. What this point concretely fixes is PROOF/REASON precision
+# (not_applicable vs. the weaker not_verified) on a tests/docs/md-only
+# change — which matters downstream: story-delivery.sh labels
+# delivery:daemon-unverified and warns "may still be dormant" for any PROOF
+# other than verified/not_applicable/asset_served_per_request, so a
+# tests-only story used to get that live, misleading label for zero reason.
+# Same all-or-nothing short-circuit shape as point 8 just below (a partially-
+# covered changed set falls straight through to full evaluation unchanged) —
+# this is what lets a mixed lib/+tests/ commit still evaluate its lib/ file
+# normally instead of becoming an escape hatch (ga-dk7fw ACEITE item 2; T30
+# reproduces the actual wa-zmmyd mixed shape and confirms it still flags).
+DEFAULT_NO_RESTART_PATTERNS="tests/** docs/** *.md"
+if [ -n "${CHANGED// /}" ]; then
+  changed_uncovered_default=""
+  set -f
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    covered=0
+    for pat in $DEFAULT_NO_RESTART_PATTERNS; do
+      # shellcheck disable=SC2254  # deliberate glob match, not literal
+      case "$f" in $pat) covered=1; break ;; esac
+    done
+    [ "$covered" -eq 1 ] || changed_uncovered_default="$changed_uncovered_default $f"
+  done <<< "$CHANGED"
+  set +f
+  if [ -z "${changed_uncovered_default// /}" ]; then
+    log "every changed file matches a default structurally-inert path (tests/**, docs/**, *.md) — OK (no daemon anywhere imports a test or doc file)."
+    emit OK "all changed files are tests/docs/md-only (structurally inert — no daemon could load them)" not_applicable
+  fi
+fi
 
 # (ga-y108i, header point 8) no_restart_paths short-circuit — checked against
 # the FULL raw changed set, before the *.py/template split below, so it also
