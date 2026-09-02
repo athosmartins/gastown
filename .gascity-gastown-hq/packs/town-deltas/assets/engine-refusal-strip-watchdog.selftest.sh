@@ -148,9 +148,26 @@ chmod +x "$SHIM_DIR/bd"
 # ── fixture builders ─────────────────────────────────────────────────────────
 
 # Recent, fixed reference timestamps (well within the default 72h lookback).
-STRIP_TS="$(date -u -v-4H '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -u -d '-4 hours' '+%Y-%m-%d %H:%M:%S')"
-COMMENT_BEFORE_TS="$(date -u -v-5H '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '-5 hours' '+%Y-%m-%dT%H:%M:%SZ')"
-COMMENT_AFTER_TS="$(date -u -v-3H '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '-3 hours' '+%Y-%m-%dT%H:%M:%SZ')"
+# Derived from ONE epoch (STRIP_EPOCH) via pure arithmetic rather than N
+# independent `date -v-NH` calls, so every offset is EXACT relative to the
+# strip instant. Needed below for the sub-minute deltas (ga-iybm6) — a few
+# milliseconds of drift between independent `date` invocations wouldn't
+# matter at 1h granularity but would matter at 30s granularity.
+STRIP_EPOCH="$(date -u -v-4H '+%s' 2>/dev/null || date -u -d '-4 hours' '+%s')"
+fmt_epoch_sql() { date -u -r "$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -u -d "@$1" '+%Y-%m-%d %H:%M:%S'; }
+fmt_epoch_iso() { date -u -r "$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "@$1" '+%Y-%m-%dT%H:%M:%SZ'; }
+STRIP_TS="$(fmt_epoch_sql "$STRIP_EPOCH")"
+COMMENT_BEFORE_TS="$(fmt_epoch_iso "$((STRIP_EPOCH - 3600))")"    # 1h before strip (stale/unrelated)
+COMMENT_AFTER_TS="$(fmt_epoch_iso "$((STRIP_EPOCH + 3600))")"     # 1h after strip (story moved on)
+# ga-iybm6: the Mayor's real incident — a justification comment written ~0.5s
+# BEFORE the label-strip commit (his loop: bd comment -> bd label remove,
+# same deliberate act, sub-second apart). 30s sits comfortably inside the
+# fix's default 120s window and comfortably outside "instant", so it
+# exercises the window math rather than just the t=0 edge.
+COMMENT_NEAR_BEFORE_TS="$(fmt_epoch_iso "$((STRIP_EPOCH - 30))")"
+COMMENT_NEAR_AFTER_TS="$(fmt_epoch_iso "$((STRIP_EPOCH + 30))")"
+# 150s > the fix's default 120s window — must NOT be treated as the same act.
+COMMENT_OUTSIDE_WINDOW_TS="$(fmt_epoch_iso "$((STRIP_EPOCH - 150))")"
 
 # set_candidates "hash1|date1
 # hash2|date2"
@@ -274,6 +291,32 @@ run
 if grep -q "^label add ga-oldcomment1 pilot:no-auto-dispatch$" "$ACTIONS"; then
     ok "bead with only a predating comment still flagged"
 else bad "expected flag despite stale comment, got: $(cat "$ACTIONS")"; fi
+
+echo "== test 5c (ga-iybm6): comment predates the strip by 30s, WITHIN the window -> NOT flagged (comment-then-strip is one deliberate act; order must not matter) =="
+reset_all
+set_candidates "hashE3|$STRIP_TS"
+set_diff "hashE3" "ga-nearbefore1|needs:engine-window"
+set_bead "ga-nearbefore1" "open" "area:infra" "[{\"created_at\":\"$COMMENT_NEAR_BEFORE_TS\"}]"
+run
+if [ ! -s "$ACTIONS" ]; then ok "near-before comment (30s, within window) averts the flag"; else bad "flagged despite a near-before deliberate-unblock comment: $(cat "$ACTIONS")"; fi
+
+echo "== test 5d (ga-iybm6): comment predates the strip by 150s, OUTSIDE the window -> still flagged (a stale/unrelated comment must not launder a silent strip) =="
+reset_all
+set_candidates "hashE4|$STRIP_TS"
+set_diff "hashE4" "ga-outsidewindow1|needs:engine-window"
+set_bead "ga-outsidewindow1" "open" "area:infra" "[{\"created_at\":\"$COMMENT_OUTSIDE_WINDOW_TS\"}]"
+run
+if grep -q "^label add ga-outsidewindow1 pilot:no-auto-dispatch$" "$ACTIONS"; then
+    ok "comment just outside the window still flagged"
+else bad "expected flag for a comment outside the window, got: $(cat "$ACTIONS")"; fi
+
+echo "== test 5e (ga-iybm6): comment postdates the strip by 30s -> NOT flagged (regression guard: postdate-by-any-amount must keep working unchanged) =="
+reset_all
+set_candidates "hashE5|$STRIP_TS"
+set_diff "hashE5" "ga-nearafter1|needs:engine-window"
+set_bead "ga-nearafter1" "open" "area:infra" "[{\"created_at\":\"$COMMENT_NEAR_AFTER_TS\"}]"
+run
+if [ ! -s "$ACTIONS" ]; then ok "near-after comment (30s later) averts the flag"; else bad "flagged despite a near-after comment: $(cat "$ACTIONS")"; fi
 
 echo "== test 6: in_progress (not closed) unprotected bead -> flagged too =="
 reset_all
@@ -442,6 +485,16 @@ run
 if [ ! -s "$ACTIONS" ]; then
     ok "bead with postdating comment on the marker-removal not re-flagged"
 else bad "acted despite postdating comment on marker removal: $(cat "$ACTIONS")"; fi
+
+echo "== test 20b (ga-iybm6): watchdog's own veto removed, but the deliberate-unblock comment predates the removal by 30s (order: comment-then-strip -- the exact live Mayor incident trace) -> NOT re-flagged =="
+reset_all
+set_marker_candidates "hashQ2|$STRIP_TS"
+set_diff "hashQ2" "ga-reexposed-ordering|pilot:no-auto-dispatch"
+set_bead "ga-reexposed-ordering" "open" "area:infra" "[{\"created_at\":\"$COMMENT_BEFORE_TS\",\"text\":\"engine-refusal-strip-watchdog (ga-pxtib): this bead's engine-refusal labels were stripped ...\"},{\"created_at\":\"$COMMENT_NEAR_BEFORE_TS\",\"text\":\"Unblocking deliberately: patch already staged in docs/pending-engine-window/, see ga-iybm6.\"}]"
+run
+if [ ! -s "$ACTIONS" ]; then
+    ok "deliberate-unblock comment 30s before the removal averts re-flag"
+else bad "re-flagged despite a near-before deliberate-unblock comment: $(cat "$ACTIONS")"; fi
 
 echo "== test 21 (ga-tb8mt gate review, blocking issue 1): one commit_hash is a candidate for BOTH loops at once (issue A's refusal label AND issue B's pilot:no-auto-dispatch stripped in the SAME commit) — the marker loop must still evaluate issue B even after the primary loop has processed that commit_hash =="
 reset_all

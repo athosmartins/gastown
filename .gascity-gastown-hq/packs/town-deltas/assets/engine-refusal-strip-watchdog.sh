@@ -30,10 +30,12 @@
 #    [[dolt-diff-table-audit-trail-for-mutation-attribution]].
 # 4. For each affected bead: if it is CLOSED, or already carries
 #    pilot:no-auto-dispatch / no-auto-dispatch / any of the 4 refusal labels
-#    again, or has a comment postdating the strip commit -> already safe, no
-#    action (a bead legitimately un-scoped from engine-window post-review
-#    should NOT be permanently vetoed). Otherwise (open OR in_progress,
-#    unprotected, silent since the strip) -> FLAG: add pilot:no-auto-dispatch
+#    again, or has a comment that COVERS the strip commit (postdates it by any
+#    amount, or predates it by at most COMMENT_WINDOW_SECONDS — see ga-iybm6
+#    below) -> already safe, no action (a bead legitimately un-scoped from
+#    engine-window post-review should NOT be permanently vetoed). Otherwise
+#    (open OR in_progress, unprotected, silent since the strip) -> FLAG: add
+#    pilot:no-auto-dispatch
 #    (hardened, already respected by pilot-dispatcher.sh with no engine window
 #    required), comment citing the strip commit hash + timestamp.
 # 5. Mark the commit hash processed once every affected issue for it was
@@ -112,6 +114,27 @@
 # for a future generic-message removal of those labels is a separate,
 # unverified question, out of scope for this fix.
 
+# ── COMMENT WINDOW, NOT STRICT POSTDATE (ga-iybm6) ──────────────────────────
+# Both loops above (and the header doc, step 4) originally required a
+# protective comment to strictly POSTDATE the strip/removal commit to count
+# as "already safe". Measured live 2026-09-02: the Mayor deliberately
+# unblocked 4 engine beads with a documented loop of `bd comment -> bd label
+# remove -> bd label add`, landing the justification comment ~0.5s BEFORE the
+# strip commit. That predate — sub-second, same act — failed the strict
+# postdate check exactly like a silent, undocumented strip would, and the
+# marker loop (this file's second detection path above) re-vetoed a bead
+# 9 minutes later despite the written justification sitting right there.
+#
+# Fix: comment_covers_event() (see the timestamp helpers above) still accepts
+# ANY postdating comment (unchanged — "story moved on" doesn't get more true
+# the sooner it's said), but now ALSO accepts a comment predating the event by
+# up to COMMENT_WINDOW_SECONDS (default 120s). A comment landing seconds
+# before the strip is the same deliberate act as one landing seconds after;
+# only the ordering differs, and ordering must not change the verdict. A
+# comment predating by MORE than the window (an old, unrelated note sitting
+# on the bead) is unchanged: still does not count, so a genuinely silent
+# strip is still caught — that's the whole point of this watchdog.
+#
 # ── SAFETY VALVES ────────────────────────────────────────────────────────────
 #   - DRY_RUN=1: log decisions, take no action (selftest + supervised first run).
 #   - Kill-switch: .gc/state/engine-refusal-strip-watchdog.disabled -> no-op.
@@ -159,6 +182,8 @@ LOCK_FILE="${ENGINE_REFUSAL_STRIP_WATCHDOG_LOCK:-$RUNTIME_DIR/engine-refusal-str
 DRY_RUN="${DRY_RUN:-0}"
 LOOKBACK_HOURS="${LOOKBACK_HOURS:-72}"
 DOLT_DB="${DOLT_DB:-hq}"
+# ga-iybm6: see the "COMMENT WINDOW, NOT STRICT POSTDATE" header section below.
+COMMENT_WINDOW_SECONDS="${COMMENT_WINDOW_SECONDS:-120}"
 
 mkdir -p "$LOG_DIR" "$STATE_DIR" "$RUNTIME_DIR"
 touch "$PROCESSED_FILE" "$MARKER_PROCESSED_FILE"
@@ -209,6 +234,37 @@ iso_to_epoch() {  # bd JSON timestamp, e.g. 2026-08-29T19:11:28Z
 sql_to_epoch() {  # dolt SQL datetime, e.g. 2026-08-29 15:06:46.316000
     local base="${1%%.*}"
     date -u -j -f '%Y-%m-%d %H:%M:%S' "$base" '+%s' 2>/dev/null || date -u -d "$base" '+%s' 2>/dev/null
+}
+
+# comment_covers_event <latest_comment_iso> <event_epoch> — true (rc 0) iff a
+# comment on the bead should be read as "someone already looked at this
+# event", false (rc 1) otherwise. Two cases count (ga-iybm6):
+#   - the comment POSTDATES the event, by any amount: an agent came back
+#     later and left a note, so the strip is not silent, however much later.
+#   - the comment PREDATES the event by at most COMMENT_WINDOW_SECONDS: the
+#     comment and the strip are the SAME deliberate act, just sub-second
+#     ordered (a "bd comment -> bd label remove" loop, as the Mayor's real
+#     incident traced — a 0.5s predate is not distinguishable from the strip
+#     itself). A comment predating by MORE than the window is stale/unrelated
+#     and must NOT launder a silent strip — that's what test 5b/5d guard.
+# Any empty/unparseable input (no comment at all, or a timestamp that fails
+# to parse) is treated as "does not cover" — identical to the pre-ga-iybm6
+# behavior for these same cases — so it falls through to flagging rather
+# than silently skipping. That's the correct direction here: flagging only
+# adds a manually-cleared veto label, not a destructive action (see WHY
+# DETECTION-ONLY above), so "don't know" must resolve toward more scrutiny,
+# not less.
+comment_covers_event() {
+    local latest_comment_iso="$1" event_epoch="$2" c_epoch delta
+    [ -z "$latest_comment_iso" ] && return 1
+    [ -z "$event_epoch" ] && return 1
+    c_epoch="$(iso_to_epoch "$latest_comment_iso")"
+    [ -z "$c_epoch" ] && return 1
+    if [ "$c_epoch" -gt "$event_epoch" ]; then
+        return 0
+    fi
+    delta=$((event_epoch - c_epoch))
+    [ "$delta" -le "$COMMENT_WINDOW_SECONDS" ]
 }
 
 # DOLT_SQL <query> — CSV (header + rows, rows may legitimately be zero) on
@@ -350,12 +406,9 @@ while IFS=, read -r commit_hash commit_date; do
         esac
 
         latest_comment_iso="$(printf '%s' "$bead_json" | jq -r '[(.[0].comments // [])[].created_at] | max // empty' 2>/dev/null)"
-        if [ -n "$latest_comment_iso" ] && [ -n "$strip_epoch" ]; then
-            c_epoch="$(iso_to_epoch "$latest_comment_iso")"
-            if [ -n "$c_epoch" ] && [ "$c_epoch" -gt "$strip_epoch" ]; then
-                log "$issue_id: has a comment postdating the strip ($latest_comment_iso > $commit_date UTC) -> story moved on, no action"
-                continue
-            fi
+        if comment_covers_event "$latest_comment_iso" "$strip_epoch"; then
+            log "$issue_id: has a comment covering the strip ($latest_comment_iso vs $commit_date UTC, window ${COMMENT_WINDOW_SECONDS}s) -> story moved on, no action"
+            continue
         fi
 
         # Exposed: open or in_progress, unprotected, silent since the strip.
@@ -455,12 +508,9 @@ while IFS=, read -r commit_hash commit_date; do
         esac
 
         latest_comment_iso="$(printf '%s' "$bead_json" | jq -r '[(.[0].comments // [])[].created_at] | max // empty' 2>/dev/null)"
-        if [ -n "$latest_comment_iso" ] && [ -n "$strip_epoch" ]; then
-            c_epoch="$(iso_to_epoch "$latest_comment_iso")"
-            if [ -n "$c_epoch" ] && [ "$c_epoch" -gt "$strip_epoch" ]; then
-                log "$issue_id: has a comment postdating this removal ($latest_comment_iso > $commit_date UTC) -> story moved on, no action"
-                continue
-            fi
+        if comment_covers_event "$latest_comment_iso" "$strip_epoch"; then
+            log "$issue_id: has a comment covering this removal ($latest_comment_iso vs $commit_date UTC, window ${COMMENT_WINDOW_SECONDS}s) -> story moved on, no action"
+            continue
         fi
 
         n_flagged=$((n_flagged + 1))
