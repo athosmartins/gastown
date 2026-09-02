@@ -1199,6 +1199,103 @@ OUT=$(run_helper_stderr daemons/ban_risk_dashboard.py); RC=$?
 echo "$OUT" | grep -q "ERROR:.*com.test.broken-idle.plist could not be parsed" && ok "T33 ERROR line fires for a loaded-but-idle daemon (load status, not PID presence)" || nok "T33 error-line" "no escalated ERROR line: [$OUT]"
 echo "$(field PARSE_ERROR_LOADED "$OUT")" | grep -qx "com.test.broken-idle" && ok "T33 PARSE_ERROR_LOADED carries the idle-but-loaded label" || nok "T33 parse_error_loaded" "got '$(field PARSE_ERROR_LOADED "$OUT")'"
 
+# ════════════════════════════════════════════════════════════════════════════
+# T34 (ga-q617u): route-blueprint hop — a changed lib/*.py module whose ONLY
+# caller is a daemons/routes/*.py blueprint file (never imported directly by
+# the entrypoint that mounts it) must still mark that entrypoint's daemon
+# affected. Real incident: lib/assertiva_cache.py's read_pessoas_ref_items
+# changed; its only caller was daemons/routes/pregao.py, mounted by
+# classification_dashboard.py via `from routes import ..., pregao, ...` —
+# classification_dashboard.py itself never imports assertiva_cache, so the
+# single-hop entrypoint-only scan (pre-fix) never flagged it, while two
+# UNRELATED daemons that import assertiva_cache directly (for a different
+# function) got flagged instead — a false negative on the one daemon that
+# actually mattered, hidden behind two false positives on daemons that
+# didn't. THIS test proves the false-negative half: the routes-mounted
+# daemon must appear in AFFECTED (fails pre-fix: AFFECTED is empty and
+# VERDICT/PROOF land on the ga-vmq1i "touches no live daemon"/not_verified
+# branch instead of restarting + verifying fresh).
+# ════════════════════════════════════════════════════════════════════════════
+new_case t34
+mkdir -p "$RUNTIME/daemons/routes" "$RUNTIME/lib"
+cat > "$RUNTIME/lib/assertiva_cache.py" <<<'def read_pessoas_ref_items(cpf): return []'
+cat > "$RUNTIME/daemons/routes/pregao.py" <<'PYEOF'
+from lib import assertiva_cache as _ac
+
+def handler():
+    return _ac.read_pessoas_ref_items("00000000000")
+PYEOF
+cat > "$RUNTIME/daemons/classification_dashboard.py" <<'PYEOF'
+from routes import pregao
+
+def index():
+    return pregao.handler()
+PYEOF
+make_plist "$AGENTS" com.test.classification-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/classification_dashboard.py"
+seed_running com.test.classification-dashboard 9501 "$STALE_LSTART"
+seed_restart com.test.classification-dashboard 9599 "$FRESH_LSTART"
+# deploy changes ONLY the shared lib module — not the routes file, not the entrypoint
+OUT=$(run_helper lib/assertiva_cache.py); RC=$?
+V=$(field VERDICT "$OUT")
+echo "$(field AFFECTED "$OUT")" | grep -q "com.test.classification-dashboard" && ok "T34 route-mounted dashboard marked affected via routes/*.py hop" || nok "T34 affected" "$(field AFFECTED "$OUT")"
+[ "$V" = "OK" ] && ok "T34 verdict OK after fresh restart" || nok "T34 verdict" "got '$V' out=[$OUT]"
+grep -q "com.test.classification-dashboard" "$MOCK/kicks.log" 2>/dev/null && ok "T34 kickstart invoked" || nok "T34 kickstart" "log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+[ "$(field PROOF "$OUT")" = "verified" ] && ok "T34 PROOF=verified" || nok "T34 proof" "got '$(field PROOF "$OUT")'"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T35 (ga-q617u): precision guard — a daemon with a routes/ sibling directory
+# must NOT be marked affected via an UNRELATED routes/*.py file it never
+# mounts (no cross-dashboard cascade: daemons/routes/ is shared by multiple
+# dashboards in the real rig, and each one only mounts a subset of it). Proves
+# daemon_imports_stem_via_routes()'s own-mount gate is load-bearing, not just
+# "does a routes/ dir exist next to me".
+# ════════════════════════════════════════════════════════════════════════════
+new_case t35
+mkdir -p "$RUNTIME/daemons/routes" "$RUNTIME/lib"
+cat > "$RUNTIME/lib/assertiva_cache.py" <<<'def read_pessoas_ref_items(cpf): return []'
+cat > "$RUNTIME/daemons/routes/pregao.py" <<'PYEOF'
+from lib import assertiva_cache as _ac
+
+def handler():
+    return _ac.read_pessoas_ref_items("00000000000")
+PYEOF
+cat > "$RUNTIME/daemons/routes/cls_shared.py" <<<'def other(): pass'
+# demand_dashboard mounts ONLY cls_shared — never pregao
+cat > "$RUNTIME/daemons/demand_dashboard.py" <<'PYEOF'
+from routes import cls_shared
+
+def index():
+    return cls_shared.other()
+PYEOF
+make_plist "$AGENTS" com.test.demand-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/demand_dashboard.py"
+seed_running com.test.demand-dashboard 9601 "$STALE_LSTART"
+OUT=$(run_helper lib/assertiva_cache.py); RC=$?
+V=$(field VERDICT "$OUT")
+echo "$(field AFFECTED "$OUT")" | grep -q "com.test.demand-dashboard" && nok "T35 should not be affected (never mounts pregao)" "$(field AFFECTED "$OUT")" || ok "T35 demand-dashboard not marked affected (no cross-dashboard cascade)"
+[ "$V" = "OK" ] && ok "T35 verdict OK" || nok "T35 verdict" "got '$V' out=[$OUT]"
+[ ! -f "$MOCK/kicks.log" ] && ok "T35 no kickstart called" || nok "T35 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T36 (ga-q617u): the NEEDS_GUARDED_RESTART REASON text must warn the GUARDED
+# list itself can be INCOMPLETE (a daemon reached only through a deeper import
+# chain than this scan follows can be silently missing), not just that a
+# LISTED daemon might be a false positive — pre-fix the message covered only
+# the false-positive half ("may be a false positive"), which is what let a
+# real incident's daemon list be read as complete when it was not (ga-q617u:
+# "o aviso do detector ate diz 'may be a false positive' — mas ele nao avisa
+# que pode ter um falso NEGATIVO").
+# ════════════════════════════════════════════════════════════════════════════
+new_case t36
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+seed_running com.test.central-sender 9701 "$STALE_LSTART"
+OUT=$(run_helper daemons/central_sender.py); RC=$?
+V=$(field VERDICT "$OUT")
+REASON="$(field REASON "$OUT")"
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T36 verdict NEEDS_GUARDED_RESTART" || nok "T36 verdict" "got '$V' out=[$OUT]"
+echo "$REASON" | grep -qi "false positive" && ok "T36 REASON still warns a listed daemon may be a false positive" || nok "T36 false-positive wording" "$REASON"
+echo "$REASON" | grep -qiE "incomplete|missing|false negative" && ok "T36 REASON now warns the list itself may be INCOMPLETE (false negative)" || nok "T36 incompleteness wording" "$REASON"
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"

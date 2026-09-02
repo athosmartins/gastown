@@ -153,6 +153,28 @@
 #      deploy gate — they exist purely so a consumer (a human, or a future
 #      watchdog) can grep the structured output for a real gap without
 #      reparsing log text.
+#  11. (ga-q617u) Point 3's import-level match is single-hop: it only inspects
+#      each entrypoint's OWN file for an import of the changed module. A
+#      module imported ONLY by a daemons/routes/*.py blueprint file — never
+#      by the entrypoint that mounts it — was invisible (real incident:
+#      lib/assertiva_cache.py's read_pessoas_ref_items changed; its only
+#      caller was daemons/routes/pregao.py, mounted by
+#      classification_dashboard.py via `from routes import ..., pregao,
+#      ...`; classification_dashboard.py itself never imports
+#      assertiva_cache, so it was never flagged, while two UNRELATED
+#      daemons that import assertiva_cache directly — for a DIFFERENT
+#      function — were flagged instead: a false negative on the one daemon
+#      that mattered, hidden behind two false positives on daemons that
+#      didn't). daemon_imports_stem_via_routes() adds exactly one more hop,
+#      scoped to <entrypoint-dir>/routes/*.py (mirrors the .sh-wrapper-follow
+#      pattern in Step 2): a routes file only counts when the entrypoint
+#      itself actually mounts it (imports its stem) — otherwise every
+#      dashboard sharing one daemons/routes/ directory would inherit every
+#      OTHER dashboard's route changes. Still not a full transitive closure
+#      (a THIRD hop stays invisible), so the NEEDS_GUARDED_RESTART REASON
+#      text now says the affected/guarded list itself can be INCOMPLETE (a
+#      false negative), not only that a listed daemon can be a false
+#      positive — pre-fix the message warned about just the latter.
 #
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
@@ -867,6 +889,33 @@ sys.exit(1)
 PY
 }
 
+# does <entrypoint-relpath> reach <stem> through a daemons/routes/*.py
+# blueprint it mounts? (ga-q617u — header point 11.) One extra, TARGETED hop
+# beyond daemon_imports_stem()'s own single-hop scan: real Flask dashboards in
+# this codebase wire blueprints as `from routes import ..., pregao, ...` in
+# the entrypoint, with the blueprint module doing its own separate imports
+# (e.g. pregao.py's `from lib import assertiva_cache as _ac`) that the
+# entrypoint's own AST never mentions. Gated on BOTH hops so this can only
+# ever ADD a true finding, never cascade across unrelated dashboards: a
+# routes/*.py file counts only when (a) the entrypoint itself imports that
+# file's own stem (i.e. actually mounts it — not just shares the directory)
+# AND (b) that routes file imports the changed stem. Deliberately scoped to
+# <entrypoint-dir>/routes/*.py (non-recursive), not a full transitive
+# closure — matches this codebase's actual blueprint layout and keeps the
+# scan bounded to a handful of files instead of walking the whole tree.
+daemon_imports_stem_via_routes() {  # daemon_imports_stem_via_routes <entrypoint-relpath> <stem>
+  local entry="$1" stem="$2" routes_dir rfile rstem
+  routes_dir="$RUNTIME_DIR/$(dirname "$entry")/routes"
+  [ -d "$routes_dir" ] || return 1
+  for rfile in "$routes_dir"/*.py; do
+    [ -f "$rfile" ] || continue
+    rstem="$(basename "$rfile" .py)"
+    daemon_imports_stem "$RUNTIME_DIR/$entry" "$rstem" || continue
+    daemon_imports_stem "$rfile" "$stem" && return 0
+  done
+  return 1
+}
+
 # ── Step 3: resolve affected daemons ──────────────────────────────────────────
 for label in $DAEMON_LABELS; do
   entries="$(cat "$DISCO_DIR/$label")"
@@ -900,6 +949,22 @@ for label in $DAEMON_LABELS; do
     done
   fi
 
+  # route-blueprint hop (ga-q617u, header point 11): the changed module is
+  # not imported by the entrypoint directly, but IS imported by a
+  # daemons/routes/*.py blueprint file the entrypoint mounts — see
+  # daemon_imports_stem_via_routes() above.
+  if [ "$affected" -eq 0 ]; then
+    for stem in $CHANGED_STEMS; do
+      case " $own_stems " in *" $stem "*) continue ;; esac   # own entrypoint → handled above
+      for e in $entries; do
+        if daemon_imports_stem_via_routes "$e" "$stem"; then
+          affected=1; break
+        fi
+      done
+      [ "$affected" -eq 1 ] && break
+    done
+  fi
+
   # template: a changed template this daemon's own entrypoint renders via
   # render_template(...) (ga-jkj0 — Jinja templates are cached in-process and
   # a disk-only change is otherwise invisible to this script).
@@ -924,11 +989,13 @@ done
 
 AFFECTED="$(echo "$AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
 if [ -z "${AFFECTED// /}" ]; then
-  # ga-vmq1i: py/template files DID change but detection (single-hop entrypoint
-  # scan — see the import-level/template-level comments above) tied them to no
-  # live daemon. That is NOT the same certainty as "nothing daemon-relevant
-  # changed" (the earlier not_applicable emits) — it may be a real non-issue,
-  # or it may be exactly the blind spot the detection comments already flag.
+  # ga-vmq1i: py/template files DID change but detection (a bounded entrypoint
+  # + routes-hop scan — see the import-level/route-hop/template-level comments
+  # above — ga-q617u added the routes hop, still not a full transitive
+  # closure) tied them to no live daemon. That is NOT the same certainty as
+  # "nothing daemon-relevant changed" (the earlier not_applicable emits) — it
+  # may be a real non-issue, or it may be exactly the blind spot the
+  # detection comments already flag.
   # Report not_verified so the caller never claims this was confirmed live.
   log "no running daemon is affected by the changed code — OK."
   emit OK "changed code touches no live daemon" not_verified
@@ -1075,12 +1142,21 @@ WOULD_RESTART="$(echo "$WOULD_RESTART" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' 
 if [ -n "${FRESH_FAIL// /}" ]; then
   emit VERIFY_FAILED "restarted daemon(s) did not come up fresh:${FRESH_FAIL}" not_verified
 elif [ -n "${GUARDED// /}" ]; then
-  # ga-puq8z ACEITE 2: affected-daemon detection above (Step 3) is single-hop
-  # import/template-closure matching, not a proof that the daemon's live code
-  # path actually reaches the changed symbols — say so here rather than
-  # asserting staleness outright, so a human evaluating this hold knows it can
-  # be a false positive and checks pid-start vs. commit time before acting.
-  emit NEEDS_GUARDED_RESTART "sensitive hot-path daemon(s) need a guarded restart (import/template-closure match, not proven reachable to the changed symbols — may be a false positive):${GUARDED}" not_verified
+  # ga-puq8z ACEITE 2: affected-daemon detection above (Step 3) is a bounded
+  # (entrypoint + routes-hop, ga-q617u) import/template-closure match, not a
+  # proof that the daemon's live code path actually reaches the changed
+  # symbols — say so here rather than asserting staleness outright, so a
+  # human evaluating this hold knows a LISTED daemon can be a false positive
+  # and checks pid-start vs. commit time before acting.
+  # ga-q617u: the message used to stop there, warning only about the
+  # false-positive half. It said nothing about the other direction — the
+  # list itself can be INCOMPLETE, because this is still not a full
+  # transitive closure (only entrypoint-direct + one routes/*.py hop). Real
+  # incident: the one daemon that actually reached the changed symbol two
+  # hops away was silently absent from a GUARDED list that named two
+  # unrelated daemons instead, and the message gave no hint anything might
+  # be missing — a reader had no reason to doubt the list was complete.
+  emit NEEDS_GUARDED_RESTART "sensitive hot-path daemon(s) need a guarded restart (import/template-closure match, not proven reachable to the changed symbols — a listed daemon may be a false positive; this is also NOT a full transitive closure — a daemon reached only through a deeper import chain can be missing from this list entirely, a false negative — verify by hand before treating this list as complete):${GUARDED}" not_verified
 elif [ -n "${RESTARTED// /}" ]; then
   emit OK "all affected daemons restarted + verified fresh:${RESTARTED}" verified
 elif [ -n "${WOULD_RESTART// /}" ]; then
