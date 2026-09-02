@@ -13,9 +13,11 @@
 #   4. real-copy drift   — a real (non-symlink) consumer copy differs    -> drift>=1
 #   5. dangling symlink  — consumer symlink target removed               -> drift>=1
 #   6. redirected symlink— consumer symlink points somewhere else        -> drift>=1
-#   8. gate-merged change— canonical changed by a git-committed fix (manifest
-#                          stale, no skill-deploy.sh run)               -> offpath=0
-#   9. uncommitted edit  — same, but change is NOT committed             -> offpath>=1
+#   8. gate-merged change— canonical changed by a fix that landed on origin/main
+#                          (manifest stale, no skill-deploy.sh run)     -> offpath=0
+#   9. uncommitted edit  — same city, but change is NOT committed        -> offpath>=1
+#  10. local-only commit — change IS committed, but never merged to origin/main
+#                          (ga-4rl78 gate finding)                      -> offpath>=1
 #
 # Exit 0 iff every scenario behaves as expected.
 
@@ -210,32 +212,45 @@ note "json: $OUT"
 [[ "$RC" == "0" ]] && ok "audit exit 0 (green)" || bad "expected exit 0, got $RC"
 rm -rf "$ROOT"
 
-# ══ 8. gate-merged change (git-committed, manifest stale) — accepted ═══════════
-# Reproduces ga-aes6z: a skill fix lands via a normal git commit (simulating a
-# gate-merged PR) that touches the canonical dir WITHOUT ever running
-# skill-deploy.sh. The manifest digest goes stale, but the change is fully
-# committed at HEAD — that is a second legitimate publish path the auditor must
-# also recognize, or every gate-merged skill fix becomes a permanent false
-# OFFPATH (manifest=<v1 digest> live=<v2 digest> forever, since nothing ever
-# re-runs skill-deploy.sh for a code-review-only change).
-scenario "gate-merged change (git-committed, manifest stale) -> accepted, not offpath"
+# git_fixture_with_origin <root> — build a git-backed fixture city, commit v1
+# (canonical + manifest baseline), and fabricate a origin/main remote-tracking
+# ref pointing at that same commit via `git update-ref` — no real remote/push
+# needed, just the ref the auditor's merge-base check reads. Mirrors a live
+# city, which always has an origin/main ref reflecting the last landed state.
+git_fixture_with_origin() {
+    local root="$1"
+    make_fixture "$root"
+    write_manifest "$root/city"
+    git -C "$root/city" init -q -b main
+    git -C "$root/city" config user.email "selftest@example.com"
+    git -C "$root/city" config user.name "selftest"
+    git -C "$root/city" add -A
+    git -C "$root/city" commit -q -m "v1: initial canonical + manifest baseline"
+    git -C "$root/city" update-ref refs/remotes/origin/main "$(git -C "$root/city" rev-parse HEAD)"
+}
+
+# ══ 8. gate-merged change (pushed to origin/main, manifest stale) — accepted ═══
+# Reproduces ga-aes6z: a skill fix lands via a git commit that actually landed
+# on origin/main (simulating a gate-merged, pushed PR) touching the canonical
+# dir WITHOUT ever running skill-deploy.sh. The manifest digest goes stale,
+# but the change is on origin/main — that is a second legitimate publish path
+# the auditor must also recognize, or every gate-merged skill fix becomes a
+# permanent false OFFPATH (manifest=<v1 digest> live=<v2 digest> forever,
+# since nothing ever re-runs skill-deploy.sh for a code-review-only change).
+scenario "gate-merged change (on origin/main, manifest stale) -> accepted, not offpath"
 ROOT="$(mktemp -d)"
-make_fixture "$ROOT"
-write_manifest "$ROOT/city"
-git -C "$ROOT/city" init -q -b main
-git -C "$ROOT/city" config user.email "selftest@example.com"
-git -C "$ROOT/city" config user.name "selftest"
-git -C "$ROOT/city" add -A
-git -C "$ROOT/city" commit -q -m "v1: initial canonical + manifest baseline"
-# simulate a gate-merged fix: edit canonical AND commit it, like a reviewed PR —
-# deliberately do NOT touch the manifest (nothing re-runs skill-deploy.sh here).
+git_fixture_with_origin "$ROOT"
+# simulate a gate-merged, PUSHED fix: edit canonical, commit, and advance
+# origin/main to that same commit — deliberately do NOT touch the manifest
+# (nothing re-runs skill-deploy.sh here).
 printf 'gate-merged fix content\n' >> "$ROOT/city/skills/demo/SKILL.md"
 git -C "$ROOT/city" add -A
 git -C "$ROOT/city" commit -q -m "fix(ga-demo): gate-merged change to demo skill"
+git -C "$ROOT/city" update-ref refs/remotes/origin/main "$(git -C "$ROOT/city" rev-parse HEAD)"
 OUT="$(run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
 RC=$?
 note "json: $OUT"
-[[ "$(json_field "$OUT" offpath_count)" == "0" ]] && ok "offpath_count=0 (git-committed change accepted as official path)" || bad "expected offpath_count=0, canonical is fully committed at HEAD"
+[[ "$(json_field "$OUT" offpath_count)" == "0" ]] && ok "offpath_count=0 (change merged to origin/main accepted as official path)" || bad "expected offpath_count=0, canonical is merged to origin/main"
 [[ "$(json_field "$OUT" drift_count)" == "0" ]]  && ok "drift_count=0 (consumers still symlinked)" || bad "expected drift_count=0"
 [[ "$RC" == "0" ]] && ok "exit 0" || bad "expected exit 0, got $RC"
 rm -rf "$ROOT"
@@ -243,22 +258,35 @@ rm -rf "$ROOT"
 # ══ 9. uncommitted edit inside a git-backed city — still flagged ═══════════════
 # Guards against scenario 8's exemption becoming a loophole: a canonical change
 # that is NOT committed (a genuine direct SKILL.md write) must still be flagged
-# off-path even when the city happens to be a git repo. Being inside a git repo
-# is not itself a pass — only being CLEAN (matching HEAD) is.
+# off-path even when the city happens to be a git repo with an origin/main ref.
+# Being inside a git repo is not itself a pass — only being CLEAN AND MERGED is.
 scenario "uncommitted edit in a git-backed city -> still offpath"
 ROOT="$(mktemp -d)"
-make_fixture "$ROOT"
-write_manifest "$ROOT/city"
-git -C "$ROOT/city" init -q -b main
-git -C "$ROOT/city" config user.email "selftest@example.com"
-git -C "$ROOT/city" config user.name "selftest"
-git -C "$ROOT/city" add -A
-git -C "$ROOT/city" commit -q -m "v1: initial canonical + manifest baseline"
+git_fixture_with_origin "$ROOT"
 # direct off-path edit, left UNCOMMITTED — this is the real bug the auditor exists to catch
 printf 'sneaky uncommitted off-path edit\n' >> "$ROOT/city/skills/demo/SKILL.md"
 OUT="$(run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
 note "json: $OUT"
 [[ "$(json_field "$OUT" offpath_count)" -ge 1 ]] && ok "offpath flagged (uncommitted edit, not git-clean)" || bad "expected offpath>=1 — the fix must not swallow real off-path edits"
+rm -rf "$ROOT"
+
+# ══ 10. committed locally but NEVER merged to origin/main — still flagged ═════
+# The exact bypass a gate reviewer found in an earlier version of this fix
+# (ga-aes6z, gate run ga-4rl78): a direct, unreviewed edit to a canonical
+# skill dir followed by a plain LOCAL `git commit` — no push, no PR, no gate
+# review at all — used to read as "clean at HEAD" and silently pass. Being
+# committed is necessary but not sufficient; it must also have actually
+# landed on origin/main (pushed + merged), or it never went through review.
+scenario "committed locally but not on origin/main -> still offpath"
+ROOT="$(mktemp -d)"
+git_fixture_with_origin "$ROOT"
+# direct off-path edit, committed LOCALLY ONLY — origin/main never advances
+printf 'sneaky edit, committed locally, never pushed\n' >> "$ROOT/city/skills/demo/SKILL.md"
+git -C "$ROOT/city" add -A
+git -C "$ROOT/city" commit -q -m "looks legit but never left my laptop"
+OUT="$(run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
+note "json: $OUT"
+[[ "$(json_field "$OUT" offpath_count)" -ge 1 ]] && ok "offpath flagged (committed but never merged to origin/main)" || bad "expected offpath>=1 -- a local-only commit must not be accepted as reviewed (ga-4rl78)"
 rm -rf "$ROOT"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
