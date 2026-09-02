@@ -308,6 +308,61 @@ OUT11=$(env -i PATH="/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin" HOME="$HOME
         bash "$SCRIPT")
 printf '%s' "$OUT11" | grep -qF "ga-p10-100%-done.patch" && ok "'%' in filename printed verbatim, not consumed as a format directive" || bad "'%' in filename corrupted the listing (got: $OUT11)"
 
+echo "── 15. static invariant (ga-0ehtp): wrong-location scan never rm/mv's anything ──"
+# Detection-only extends to the new check too: it must only ever read
+# WRONG_PATCH_DIR, never clear it -- mirroring section 2's mechanical
+# enforcement of the same principle for the existing --check invariant.
+BAD_MUTATION_LINES=$(grep -nE '\b(rm|mv|rmdir)\b' "$SCRIPT" | grep -vE '^[0-9]+:[[:space:]]*#' || true)
+if [ -z "$BAD_MUTATION_LINES" ]; then
+    ok "no rm/mv/rmdir anywhere in the script's code (wrong-location scan is read-only)"
+else
+    bad "found rm/mv/rmdir call(s) (would violate detection-only):"
+    printf '%s\n' "$BAD_MUTATION_LINES"
+fi
+
+echo "── 16. functional (ga-0ehtp): stray .patch ONE LEVEL ABOVE CITY -- invisible to the window, must fire a dedicated alarm ──"
+# Reproduces the exact 5x-measured incident: an agent whose doctrine-relative
+# cwd resolves docs/pending-engine-window/ one level too high stages a patch
+# there. WRONG_PATCH_DIR is derived as "one level above CITY" (mirrors
+# PATCH_DIR's own derivation), so a dedicated fixture root -- NOT the shared
+# $WORK used by sections 3-14 -- keeps this from leaking a stray file into
+# every other section's "one level above" (which is $WORK itself).
+WRONGLOC_ROOT="$WORK/wrongloc-root"
+mkdir -p "$WRONGLOC_ROOT/city/.beads" "$WRONGLOC_ROOT/docs/pending-engine-window"
+git -C "$WRONGLOC_ROOT/city" init -q
+echo "diff --git a/x.go b/x.go" > "$WRONGLOC_ROOT/docs/pending-engine-window/ga-stray-example.patch"
+: > "$NOTIFY_LOG"
+OUT12=$(TEST_SEEN_FILE="$WORK/seen-wrongloc.json" \
+    env -i PATH="/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin" HOME="$HOME" \
+        GC_CITY_PATH="$WRONGLOC_ROOT/city" \
+        ENGINE_WINDOW_GUARD_SRC_TREE="$SRC" \
+        ENGINE_WINDOW_GUARD_SEEN_FILE="$WORK/seen-wrongloc.json" \
+        ENGINE_WINDOW_GUARD_LOCK="$WORK/wrongloc.lock" \
+        NOTIFY_BIN="$FAKE_NOTIFY" NOTIFY_LOG="$NOTIFY_LOG" \
+        bash "$SCRIPT" --json)
+echo "  raw: $OUT12"
+WL12=$(printf '%s' "$OUT12" | jq -r '.wrong_location_count' 2>/dev/null || echo "?")
+[ "$WL12" = "1" ] && ok "wrong_location_count=1 when a stray .patch sits one level above CITY" || bad "expected wrong_location_count=1, got $WL12 ($OUT12)"
+NC12=$(wc -l < "$NOTIFY_LOG" | tr -d ' ')
+[ "$NC12" -ge "1" ] 2>/dev/null && ok "stray patch in wrong location fires at least 1 notify ($NC12)" || bad "expected >=1 notify call for wrong-location patch, got $NC12"
+grep -q "ga-stray-example.patch" "$NOTIFY_LOG" 2>/dev/null && ok "notify body names the stray file" || bad "notify body does not name the stray file (log: $(cat "$NOTIFY_LOG" 2>/dev/null))"
+
+echo "── 17. functional (ga-0ehtp): wrong-location alarm is dedup'd like the others (immediate re-run adds zero new notifies) ──"
+OUT13=$(TEST_SEEN_FILE="$WORK/seen-wrongloc.json" \
+    env -i PATH="/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin" HOME="$HOME" \
+        GC_CITY_PATH="$WRONGLOC_ROOT/city" \
+        ENGINE_WINDOW_GUARD_SRC_TREE="$SRC" \
+        ENGINE_WINDOW_GUARD_SEEN_FILE="$WORK/seen-wrongloc.json" \
+        ENGINE_WINDOW_GUARD_LOCK="$WORK/wrongloc.lock" \
+        NOTIFY_BIN="$FAKE_NOTIFY" NOTIFY_LOG="$NOTIFY_LOG" \
+        bash "$SCRIPT" --json)
+NC13=$(wc -l < "$NOTIFY_LOG" | tr -d ' ')
+[ "$NC13" = "$NC12" ] && ok "second run within escalate window added zero new wrong-location notifies ($NC13 total)" || bad "expected $NC12, got $NC13 -- wrong-location dedup not honored"
+
+echo "── 18. functional (ga-0ehtp): no false positive -- baseline fixture (section 3, nothing staged above it) reports wrong_location_count=0 ──"
+WL14=$(printf '%s' "$OUT1" | jq -r '.wrong_location_count' 2>/dev/null || echo "?")
+[ "$WL14" = "0" ] && ok "wrong_location_count=0 for the baseline fixture (nothing staged above CITY)" || bad "expected wrong_location_count=0, got $WL14 ($OUT1)"
+
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

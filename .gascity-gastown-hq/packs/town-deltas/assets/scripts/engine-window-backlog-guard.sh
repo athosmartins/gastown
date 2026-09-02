@@ -42,6 +42,16 @@
 # cooldown-gated -- "o corte é no aviso, não na medição" (mesmo princípio do
 # fix ga-2uz59 no mol-dog-doctor.sh).
 #
+# ga-0ehtp: também censa a pasta ERRADA -- UM NÍVEL ACIMA de CITY (ex.:
+# ~/gt/docs/pending-engine-window/ quando CITY é ~/gt/.gascity-gastown-hq).
+# 5 ocorrências medidas: a doutrina em town-deltas.template.md manda commitar
+# o patch num caminho RELATIVO, que resolve pra cima ou pro lugar certo
+# dependendo do cwd de quem commita -- os dois "seguem a instrução" (ver
+# memória engine-patch-town-root-invisible-to-window). Isto é só detecção:
+# nunca move o arquivo (mover sem saber distinguir "stageado errado" de
+# "deliberadamente fora da fila" quebra coisa boa) -- alarma e deixa o Mayor
+# decidir.
+#
 # Uso: bash engine-window-backlog-guard.sh [--json]
 set -uo pipefail
 
@@ -61,6 +71,15 @@ CITY="${GC_CITY_PATH:-${GC_CITY:-.}}"
 # de $CITY abaixo (PATCH_DIR, STATE_DIR, LOCK_FILE) de uma vez.
 CITY=$(cd "$CITY" && pwd) || { echo "ERRO: não consegui resolver '$CITY' como caminho absoluto." >&2; exit 2; }
 PATCH_DIR="$CITY/docs/pending-engine-window"
+
+# ga-0ehtp: um patch stageado UM NÍVEL ACIMA de CITY é invisível a esta
+# própria janela -- 5 ocorrências medidas, a última duas vezes no mesmo
+# minuto por dogs diferentes (ver memória
+# engine-patch-town-root-invisible-to-window). Derivado como "um nível acima
+# de $CITY" (não hardcoded pra ~/gt) para nunca poder divergir da definição
+# de PATCH_DIR -- os dois vêm da mesma variável, então um agente cujo
+# GC_CITY_PATH aponte pra outro clone/town ainda tem o par correto.
+WRONG_PATCH_DIR="$(dirname "$CITY")/docs/pending-engine-window"
 
 # Fonte de verdade do engine gascity -- ver memória
 # gascity-engine-locally-buildable-src-hookfix: NÃO é ~/gt/gastown (projeto
@@ -176,6 +195,23 @@ for f in "$PATCH_DIR"/*; do
 done
 shopt -u nullglob
 
+# ga-0ehtp: censo da pasta ERRADA (só *.patch cru -- um patch fresco
+# stageado no lugar certo por engano, nunca um .patch.APLICADO-*/.SUPERSEDED-*
+# já resolvido, que não faz sentido aparecer ali por este mecanismo). Leitura
+# apenas -- nunca rm/mv (ver selftest #15, que garante isto na fonte).
+WRONG_LOC=0
+WRONG_LOC_L=""
+WRONG_LOC_FIRST=""
+shopt -s nullglob
+for f in "$WRONG_PATCH_DIR"/*.patch; do
+    [ -f "$f" ] || continue
+    wb=$(basename "$f")
+    WRONG_LOC=$((WRONG_LOC+1))
+    WRONG_LOC_L="$WRONG_LOC_L\n    $wb"
+    [ -n "$WRONG_LOC_FIRST" ] || WRONG_LOC_FIRST="$wb"
+done
+shopt -u nullglob
+
 # "Fila" para efeito de limiar = PENDENTE + ILEGÍVEL -- os dois ainda exigem
 # ação (uma janela de engine, ou um humano olhando o conflito). JÁ-LANDOU é
 # limpeza de arquivo, não bloqueio, e não empurra o alerta.
@@ -186,9 +222,10 @@ if [ "$BACKLOG" -gt "$SIZE_THRESHOLD" ] || [ "$OLDEST_BACKLOG_AGE" -gt "$AGE_THR
 fi
 
 if [ "$JSON_OUT" = "1" ]; then
-    printf '{"total":%d,"pending":%d,"landed":%d,"unknown":%d,"marked":%d,"other":%d,"backlog":%d,"oldest_backlog_age_s":%d,"threshold_breached":%s}\n' \
+    printf '{"total":%d,"pending":%d,"landed":%d,"unknown":%d,"marked":%d,"other":%d,"backlog":%d,"oldest_backlog_age_s":%d,"threshold_breached":%s,"wrong_location_count":%d}\n' \
         "$TOTAL" "$PENDING" "$LANDED" "$UNKNOWN" "$MARKED" "$OTHER" "$BACKLOG" "$OLDEST_BACKLOG_AGE" \
-        "$([ "$BREACHED" = "1" ] && echo true || echo false)"
+        "$([ "$BREACHED" = "1" ] && echo true || echo false)" \
+        "$WRONG_LOC"
 else
     echo "═══ COMPOSIÇÃO docs/pending-engine-window ═══"
     echo "  total de arquivos (patch):  $TOTAL"
@@ -206,6 +243,7 @@ else
     [ -n "$LANDED_L" ]  && { echo; echo "  JÁ LANDOU:"; printf '%b\n' "$LANDED_L"; }
     [ -n "$MARKED_L" ]  && { echo; echo "  MARCADO:"; printf '%b\n' "$MARKED_L"; }
     [ -n "$OTHER_L" ]   && { echo; echo "  OUTRO:"; printf '%b\n' "$OTHER_L"; }
+    [ "$WRONG_LOC" -gt 0 ] && { echo; echo "  🚨 LOCALIZAÇÃO ERRADA ($WRONG_PATCH_DIR): $WRONG_LOC   <- INVISÍVEL à janela, mova para $PATCH_DIR"; printf '%b\n' "$WRONG_LOC_L"; }
 fi
 
 if [ "$BREACHED" = "1" ]; then
@@ -213,6 +251,17 @@ if [ "$BREACHED" = "1" ]; then
     age_threshold_d=$(( AGE_THRESHOLD_S / 86400 ))
     notify_once "engine-window-backlog" "Fila de engine window passou do limiar" \
         "docs/pending-engine-window: $BACKLOG pendente(s)/ilegível(is) (limiar $SIZE_THRESHOLD), mais antigo ($OLDEST_BACKLOG_ID) há ${oldest_d}d (limiar ${age_threshold_d}d)." \
+        >/dev/null || true
+fi
+
+# ga-0ehtp: independente do limiar de tamanho/idade -- UM patch já na pasta
+# errada já é o bug inteiro (é invisível a QUALQUER janela, não só a uma
+# fila grande). Chave de dedup própria, mesmo notify_once/cooldown das
+# outras (ESCALATE_AFTER_S) -- sem parâmetro novo, sem risco pro
+# comportamento já testado dos outros dois alarmes.
+if [ "$WRONG_LOC" -gt 0 ]; then
+    notify_once "engine-window-wrong-location" "Patch de engine na pasta ERRADA" \
+        "$WRONG_PATCH_DIR tem $WRONG_LOC patch(es) INVISÍVEL(EIS) à janela -- mova para $PATCH_DIR. Ex.: $WRONG_LOC_FIRST" \
         >/dev/null || true
 fi
 

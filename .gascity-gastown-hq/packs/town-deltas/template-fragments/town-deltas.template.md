@@ -334,18 +334,32 @@ ga-gye3f, ga-f6igb, ga-vu718. Escrever o patch NÃO tem blast radius nenhum —
 quem tem é o build+swap. Congelar o conserto junto com o deploy é guarda
 larga demais, e o custo é backlog parado indefinidamente.
 
-**O caminho certo, que já é padrão provado nesta cidade** (7 patches vivos em
-`docs/pending-engine-window/`, dos quais 2 entraram na janela de 2026-08-13):
+**O caminho certo, que já é padrão provado nesta cidade** (patches vivos em
+`$GC_CITY_PATH/docs/pending-engine-window/`):
 1. **Escreva o fix** no source do engine e **valide** (teste que REPROVA no
    HEAD anterior — não basta passar depois).
-2. **Gere o patch e commite ele** em `docs/pending-engine-window/<bead>-<slug>.patch`
+2. **Gere o patch e commite ele** em
+   `$GC_CITY_PATH/docs/pending-engine-window/<bead>-<slug>.patch`
    (`git -C <src> diff > …`). O patch é versionado; a árvore do engine carrega
    mudança não-commitada por desenho, então patch fora dela é o que sobrevive.
+   **Caminho ANCORADO, nunca relativo** — nunca `docs/pending-engine-window/...`
+   sozinho: `$GC_CITY_PATH` resolve sempre pra `~/gt/.gascity-gastown-hq`,
+   qualquer que seja o cwd de quem commita; um caminho relativo, ao contrário,
+   resolve DIFERENTE conforme o cwd de cada agente — pra dentro da city
+   (certo) ou um nível acima, em `~/gt/docs/pending-engine-window/` (ERRADO,
+   ninguém lê). **5 ocorrências medidas** desse erro exato, 2 delas no mesmo
+   minuto por dogs diferentes que "seguiram a instrução" ao pé da letra (ver
+   memória engine-patch-town-root-invisible-to-window, bead ga-0ehtp). Um
+   patch stageado errado é commitado, parece entregue, e a janela nunca o
+   enxerga.
 3. **Verifique que aplica limpo**: `git -C <src> apply --check <patch>`. Se já
    estiver na árvore, `--check --reverse` passa — diga isso no comentário.
 4. **NÃO** rode `go build`, **NÃO** troque symlink, **NÃO** faça kickstart do
    supervisor. Aí sim aplique o label e devolva pro Mayor agendar a janela.
 5. No comentário do bead, diga o caminho do patch e o que ele entrega.
+6. Se stageou no lugar errado por engano: `engine-window-backlog-guard.sh`
+   (ga-0ehtp) alarma sozinho dentro de 1h (`gc order`, cooldown) — mas não
+   move o arquivo por você; mova-o manualmente pro caminho ancorado acima.
 
 Só use o refuse SEM patch quando o bead pedir literalmente o ato de deploy
 (ex.: "rodar a janela", "trocar o binário") e não haja conserto a escrever.

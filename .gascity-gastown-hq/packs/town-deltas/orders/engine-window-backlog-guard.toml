@@ -13,8 +13,15 @@
 # leaves a ~3000x margin, and the 24h default notify cooldown (see the
 # script's ESCALATE_AFTER_S) only needs to be sampled a couple dozen times
 # between possible re-fires, not chased in real time.
+#
+# ga-0ehtp: same tick also censes the WRONG directory (one level above
+# CITY — e.g. ~/gt/docs/pending-engine-window/) and alarms immediately if
+# any raw .patch landed there, independent of the size/age threshold. 5
+# measured occurrences of patches staged invisibly there; see the script's
+# own header for the root cause (a relative path in doctrine resolving
+# differently depending on the committing agent's cwd).
 [order]
-description = "Report docs/pending-engine-window/ composition and alert on size/age threshold breach"
+description = "Report docs/pending-engine-window/ composition, alert on size/age threshold breach, and alarm on any patch staged in the wrong (one-level-up) directory"
 trigger = "cooldown"
 interval = "1h"
 exec = "$PACK_DIR/assets/scripts/engine-window-backlog-guard.sh"
