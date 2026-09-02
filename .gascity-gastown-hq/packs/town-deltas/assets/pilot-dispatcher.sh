@@ -2144,7 +2144,11 @@ _pilot_suppress_reused_sling() {
   fi
   local _prs_secs="${PILOT_REUSE_SLING_DEFER_SECONDS:-300}"
   local _prs_iso
-  _prs_iso=$(date -u -r "$(($(date +%s) + _prs_secs))" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null) || return 0
+  _prs_iso=$(date -u -r "$(($(date +%s) + _prs_secs))" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)
+  if [ -z "$_prs_iso" ]; then
+    log "ga-i58em: could not compute a defer target for sling $_prs_sling_id (date failed) — skipping suppression, sling stays pool-visible (fail-open, matches pre-fix behavior, not silent)"
+    return 0
+  fi
   _pilot_defer_extend "$_prs_city" "$_prs_sling_id" "$_prs_iso"
 }
 
