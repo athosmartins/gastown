@@ -1,0 +1,82 @@
+diff --git a/cmd/gc/cmd_hook_test.go b/cmd/gc/cmd_hook_test.go
+index 7ad24932d..5dda0d410 100644
+--- a/cmd/gc/cmd_hook_test.go
++++ b/cmd/gc/cmd_hook_test.go
+@@ -782,7 +782,13 @@ dir = "myrig"
+ 	}
+ 
+ 	fakeBD := filepath.Join(fakeBin, "bd")
+-	script := "#!/bin/sh\nprintf 'beads_dir=%s\\nrig_root=%s\\nrig=%s\\n' \"$BEADS_DIR\" \"$GC_RIG_ROOT\" \"$GC_RIG\"\n"
++	// Emits a valid single-element JSON array (not the bare "beads_dir=..."
++	// text a real bd would never produce) so the default work-query script's
++	// jq filter chain (added after this test was written) doesn't silently
++	// swallow the diagnostic payload and fall through to its no-work "[]"
++	// sentinel — see ga-r908y. The diagnostic key=value substrings this
++	// test's assertions look for are embedded as JSON string VALUES.
++	script := "#!/bin/sh\nprintf '[{\"id\":\"stub\",\"beads_dir\":\"beads_dir=%s\",\"rig_root\":\"rig_root=%s\",\"rig\":\"rig=%s\"}]' \"$BEADS_DIR\" \"$GC_RIG_ROOT\" \"$GC_RIG\"\n"
+ 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -855,7 +861,13 @@ dir = "myrig"
+ 	}
+ 
+ 	fakeBD := filepath.Join(fakeBin, "bd")
+-	script := "#!/bin/sh\nprintf 'beads_dir=%s\\nrig_root=%s\\nrig=%s\\n' \"$BEADS_DIR\" \"$GC_RIG_ROOT\" \"$GC_RIG\"\n"
++	// Emits a valid single-element JSON array (not the bare "beads_dir=..."
++	// text a real bd would never produce) so the default work-query script's
++	// jq filter chain (added after this test was written) doesn't silently
++	// swallow the diagnostic payload and fall through to its no-work "[]"
++	// sentinel — see ga-r908y. The diagnostic key=value substrings this
++	// test's assertions look for are embedded as JSON string VALUES.
++	script := "#!/bin/sh\nprintf '[{\"id\":\"stub\",\"beads_dir\":\"beads_dir=%s\",\"rig_root\":\"rig_root=%s\",\"rig\":\"rig=%s\"}]' \"$BEADS_DIR\" \"$GC_RIG_ROOT\" \"$GC_RIG\"\n"
+ 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -963,7 +975,10 @@ dir = "workdir"
+ 	}
+ 
+ 	fakeBD := filepath.Join(fakeBin, "bd")
+-	script := "#!/bin/sh\nprintf 'beads_dir=%s\\nrig_root=%s\\n' \"$BEADS_DIR\" \"$GC_RIG_ROOT\"\n"
++	// See the comment on the analogous script in
++	// TestCmdHookOverridesInheritedCityBeadsDir above: must emit valid JSON
++	// or the default work-query script's jq filter chain drops it silently.
++	script := "#!/bin/sh\nprintf '[{\"id\":\"stub\",\"beads_dir\":\"beads_dir=%s\",\"rig_root\":\"rig_root=%s\"}]' \"$BEADS_DIR\" \"$GC_RIG_ROOT\"\n"
+ 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -982,9 +997,12 @@ dir = "workdir"
+ 	if !strings.Contains(out, "beads_dir="+wantBeads) {
+ 		t.Fatalf("stdout = %q, want BEADS_DIR=%s (city store), non-rig agent must not be pointed at <dir>/.beads", out, wantBeads)
+ 	}
+-	// Non-rig agents must not receive GC_RIG_ROOT. doHook strips trailing
+-	// whitespace, so the empty value lands at the very end of the output.
+-	if !strings.HasSuffix(out, "rig_root=") {
++	// Non-rig agents must not receive GC_RIG_ROOT. The fake bd embeds the
++	// diagnostic value as a JSON string ("rig_root":"rig_root=<value>"), so
++	// an empty GC_RIG_ROOT means the "rig_root=" text is immediately closed
++	// by the JSON string's own closing quote with nothing in between — a
++	// non-empty value would break this exact substring match.
++	if !strings.Contains(out, `"rig_root":"rig_root="`) {
+ 		t.Fatalf("stdout = %q, want empty GC_RIG_ROOT for non-rig agent", out)
+ 	}
+ }
+diff --git a/cmd/gc/session_model_phase0_hook_spec_test.go b/cmd/gc/session_model_phase0_hook_spec_test.go
+index be750e59e..fd079ca48 100644
+--- a/cmd/gc/session_model_phase0_hook_spec_test.go
++++ b/cmd/gc/session_model_phase0_hook_spec_test.go
+@@ -156,7 +156,14 @@ start_command = "true"
+ 	}
+ 
+ 	fakeBD := filepath.Join(fakeBin, "bd")
+-	script := "#!/bin/sh\nprintf 'id=%s\\nname=%s\\nalias=%s\\nagent=%s\\norigin=%s\\ntemplate=%s\\nargs=%s\\n' \"$GC_SESSION_ID\" \"$GC_SESSION_NAME\" \"$GC_ALIAS\" \"$GC_AGENT\" \"$GC_SESSION_ORIGIN\" \"$GC_TEMPLATE\" \"$*\"\n"
++	// Must emit valid JSON, not bare "id=...\nname=..." text: the default
++	// work-query script pipes bd's stdout through several jq filter stages
++	// (added after this test was written), and jq silently drops anything
++	// that isn't valid JSON, cascading through every tier to the script's
++	// own no-work "[]" sentinel — see ga-r908y. The diagnostic key=value
++	// substrings this test's assertions look for are embedded as JSON
++	// string VALUES so they still appear verbatim in cmdHook's stdout.
++	script := "#!/bin/sh\nprintf '[{\"id\":\"stub\",\"x_id\":\"id=%s\",\"x_name\":\"name=%s\",\"x_alias\":\"alias=%s\",\"x_agent\":\"agent=%s\",\"x_origin\":\"origin=%s\",\"x_template\":\"template=%s\",\"x_args\":\"args=%s\"}]' \"$GC_SESSION_ID\" \"$GC_SESSION_NAME\" \"$GC_ALIAS\" \"$GC_AGENT\" \"$GC_SESSION_ORIGIN\" \"$GC_TEMPLATE\" \"$*\"\n"
+ 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
+ 		t.Fatal(err)
+ 	}
