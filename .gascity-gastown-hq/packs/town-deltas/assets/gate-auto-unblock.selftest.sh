@@ -319,6 +319,64 @@ else
     "OUT1=$OUT1 OUT2=$OUT2 R5_COMMENTS3=$R5_COMMENTS3 COMMENTS=$(cat "$TMP/fx.ga-r5notefail/comments.log" 2>/dev/null)"
 fi
 
+# ── ga-dv2gk: R4 sem memória de estado reescalona indefinidamente (mesma
+# classe de ga-9e0j8, agora em R4, não só R5) ───────────────────────────
+# Caso real: wa-klhib, 6 ciclos de strip+comentário em 8h, ZERO commit
+# novo — o portão reaplicava gate:needs-human entre varreduras e R4
+# (fails só CRESCE, nunca prova trabalho novo) reagia de novo a cada
+# 20min sobre o MESMO estado. Mede por ARQUIVO, não por texto de OUT: o
+# harness varre a MESMA fixture 3x por chamada de run() (GC_CITY_PATH/
+# WA_RIG/PS_RIG apontam pro mesmo $TMP — mesmo aviso do teste de
+# recontagem do R5 acima), então mesmo a 1ª chamada de run() já mistura
+# 1 ação real + 2 supressões no próprio OUT — só a contagem em arquivo
+# separa "agiu 1x" de "agiu a cada passada". Sem veredito FAIL na
+# fixture, de propósito: mantém R2/R3 fora do caminho, isolando só o
+# comportamento de R4.
+setup ga-dv2gkloop '["gate:needs-human","gate-sha-failed:a:code","gate-sha-failed:b:code","gate-sha-failed:c:code"]' \
+  'origin/fix/ga-dv2gkloop' '+ cafefeed' '1700000000'
+run >/dev/null 2>&1   # 1ª varredura: 3 passes internos, só o 1º deveria agir de verdade
+run >/dev/null 2>&1   # 2ª varredura: MESMO tip — as 3 passes deveriam suprimir
+R4_COMMENTS="$(grep -c 'AUTO-DESTRAVE R4' "$TMP/fx.ga-dv2gkloop/comments.log" 2>/dev/null || echo 0)"
+R4_REMOVED="$(wc -l < "$TMP/fx.ga-dv2gkloop/removed.log" 2>/dev/null | tr -d ' ')"
+if [ "$R4_COMMENTS" -eq 1 ] && [ "${R4_REMOVED:-0}" -eq 1 ]; then
+  ok "ga-dv2gk: R4 age 1x só por estado de branch — 2 varreduras (6 passes internos) produzem 1 strip + 1 comentário, não 6 (era o bug real: wa-klhib, 6 ciclos em 8h sem avanço)"
+else
+  bad "ga-dv2gk: R4 deveria agir 1x por tip de branch, não repetir strip+comentário a cada varredura sem commit novo" \
+    "R4_COMMENTS=$R4_COMMENTS R4_REMOVED=$R4_REMOVED REMOVED=$(cat "$TMP/fx.ga-dv2gkloop/removed.log" 2>/dev/null) COMMENTS=$(cat "$TMP/fx.ga-dv2gkloop/comments.log" 2>/dev/null)"
+fi
+
+# ── ga-dv2gk: commit novo (tip muda) reabilita R4 — suprimir não pode
+# virar "nunca mais" ─────────────────────────────────────────────────
+printf '1700000999\n' > "$TMP/fx.ga-dv2gkloop/tip_epoch.txt"
+run >/dev/null 2>&1
+R4_COMMENTS2="$(grep -c 'AUTO-DESTRAVE R4' "$TMP/fx.ga-dv2gkloop/comments.log" 2>/dev/null || echo 0)"
+if [ "$R4_COMMENTS2" -eq 2 ]; then
+  ok "ga-dv2gk: branch com commit novo reabilita R4 (2º estado distinto → 2ª ação real, supressão não é permanente)"
+else
+  bad "ga-dv2gk: depois de um commit novo (tip mudou), R4 deveria poder agir de novo" \
+    "R4_COMMENTS2=$R4_COMMENTS2 COMMENTS=$(cat "$TMP/fx.ga-dv2gkloop/comments.log" 2>/dev/null)"
+fi
+
+# ── ga-dv2gk: note() falhando NÃO pode marcar R4 como já-agido (mesmo
+# idioma do blocking issue 1 do R5 acima, ga-woesw, agora para R4) ──────
+# Se mark_r4_acted gravasse o stamp incondicionalmente (ou strip_lock
+# sozinho bastasse), uma falha real de bd comment deixaria o bead
+# permanentemente "escalado" no registro deste script sem nunca ter
+# postado nada nele — silêncio disfarçado de sucesso.
+setup ga-dv2gknotefail '["gate:needs-human","gate-sha-failed:a:code","gate-sha-failed:b:code","gate-sha-failed:c:code"]' \
+  'origin/fix/ga-dv2gknotefail' '+ deadbee0' '1700000000'
+touch "$TMP/fx.ga-dv2gknotefail/comment_fail"
+run >/dev/null 2>&1
+rm -f "$TMP/fx.ga-dv2gknotefail/comment_fail"
+run >/dev/null 2>&1
+R4_COMMENTS3="$(grep -c 'AUTO-DESTRAVE R4' "$TMP/fx.ga-dv2gknotefail/comments.log" 2>/dev/null || echo 0)"
+if [ "$R4_COMMENTS3" -eq 1 ]; then
+  ok "ga-dv2gk: note() falhando não marca R4 como já-agido — próxima varredura retenta e escala de verdade (mesmo idioma do ga-woesw)"
+else
+  bad "ga-dv2gk: quando bd comment falha, mark_r4_acted não pode ter gravado o stamp — a próxima varredura tem que RETENTAR, não suprimir achando que já agiu" \
+    "R4_COMMENTS3=$R4_COMMENTS3 COMMENTS=$(cat "$TMP/fx.ga-dv2gknotefail/comments.log" 2>/dev/null)"
+fi
+
 # ── self-audit pré-gate: git cherry FALHA ≠ git cherry acha nada ───────
 # Achado varrendo o diff inteiro antes de submeter (não um caso citado por
 # revisor). has_own_work colapsava "comando não rodou" (lock, rig

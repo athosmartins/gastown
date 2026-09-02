@@ -41,6 +41,21 @@
 #       (caso wa-n46ay: produziu o melhor resultado do dia — um teste
 #        que trava a FORMA do código e impede a 5ª rodada)
 #
+#       ⚠️ (ga-dv2gk, 2026-09-02): fails (gate-sha-failed:* contado sobre
+#       $labels) só CRESCE — nunca prova por si só que há trabalho novo
+#       desde a última vez que R4 agiu. Sem memória de "já escalei isto",
+#       R4 reagia a CADA varredura enquanto fails ficasse ≥3, e algo FORA
+#       deste script (o próprio portão) reaplicava gate:needs-human entre
+#       varreduras — então um bead com ZERO commit novo era destravado e
+#       recomentado a cada 20min, indefinidamente (medido: wa-klhib, 6
+#       ciclos em 8h, nenhum avanço real — família "alerta que só
+#       cresce", mesma classe que ga-9e0j8 já resolveu para R5, só que R5
+#       usa cooldown de TEMPO e aqui o discriminador certo é ESTADO: um
+#       commit novo que falhe de novo ainda tem que poder reescalar, o
+#       que um cooldown de tempo atrasaria sem motivo). Agora R4 só age
+#       de novo quando o tip da branch MUDOU desde a última vez que agiu
+#       nesta bead — ver r4_already_acted()/mark_r4_acted() abaixo.
+#
 #   R5  Nada decidiu → escala, dizendo por que R1–R4 não bastaram.
 #       Exceção rara. Sem o "por quê", vira a trava velha de novo.
 #
@@ -141,6 +156,11 @@ LOCK_FILE="${GATE_AUTO_UNBLOCK_LOCK:-$CITY/.gc/runtime/gate-auto-unblock.lock}"
 # stamp file per bead, cooldown gates re-alerts.
 R5_ALERT_DIR="${GATE_AUTO_UNBLOCK_R5_ALERT_DIR:-$CITY/.gc/runtime/gate-auto-unblock-r5-alerted}"
 R5_ALERT_COOLDOWN="${GATE_AUTO_UNBLOCK_R5_COOLDOWN:-21600}"  # 6h, matches gate-merge-survival-sweep.sh
+
+# R4 idempotency guard (ga-dv2gk) — see the R4 rule comment above for why
+# this exists. Keyed by branch tip epoch, not by time: fire again only
+# when the branch actually moved since the last R4 action on this bead.
+R4_STATE_DIR="${GATE_AUTO_UNBLOCK_R4_STATE_DIR:-$CITY/.gc/runtime/gate-auto-unblock-r4-acted}"
 
 log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG" 2>/dev/null || true; }
 say() { printf '%s\n' "$*"; log "$*"; }
@@ -393,6 +413,36 @@ mark_r5_alerted() {
   printf '%s %s' "$(date -u +%s)" "$count" > "$stamp" 2>/dev/null
 }
 
+# r4_already_acted <bead_id> <tip_epoch> → rc0 iff R4 already stripped
+# the lock for this bead at this EXACT branch tip (ga-dv2gk). READ-ONLY —
+# mirrors r5_alert_eligible's split from its own mark function (ga-9e0j8):
+# eligibility is checked separately from committing the stamp, so a
+# failed apply_and_report (below) never gets recorded as if it succeeded.
+# <tip_epoch> empty (branch_tip_epoch couldn't determine it) always
+# returns "not acted" — "não sei" never collapses into "já fiz", same
+# discipline as has_own_work's "unknown" state elsewhere in this file.
+r4_already_acted() {
+  local id="$1" tip="$2"
+  local stamp="$R4_STATE_DIR/$id" last_tip
+  [ -n "$tip" ] || return 1
+  [ -f "$stamp" ] || return 1
+  read -r last_tip < "$stamp" 2>/dev/null
+  [ -n "${last_tip:-}" ] && [ "$last_tip" = "$tip" ]
+}
+
+# mark_r4_acted <bead_id> <tip_epoch> — persist the R4 state stamp (one
+# file per bead, content is just the branch tip epoch R4 acted on). Call
+# ONLY after apply_and_report has confirmed strip_lock+note both really
+# succeeded — same reasoning as mark_r5_alerted: a failed attempt must
+# stay unstamped, or the next sweep would wrongly suppress a retry that
+# never actually happened.
+mark_r4_acted() {
+  local id="$1" tip="$2"
+  [ "$DRY_RUN" = "1" ] && return 0
+  mkdir -p "$R4_STATE_DIR" 2>/dev/null
+  printf '%s' "$tip" > "$R4_STATE_DIR/$id" 2>/dev/null
+}
+
 # ── as regras ──────────────────────────────────────────────────────────
 # decide <rig> <bead> <labels-multilinha> → imprime "Rn|explicação". Não
 # muta. <labels-multilinha> é a mesma lista já buscada por main() (ver
@@ -606,7 +656,18 @@ main() {
             say "FALHA R3 $id — bd label remove ou bd comment falhou (label pode ainda estar presente); verificar manualmente — $why"
           fi ;;
         R4)
-          if apply_and_report "$rig" "$id" "$labels" "R4" "$why" "⚠️ NÃO faça o 5º conserto pontual — o padrão de repetição É o achado. Exigir teste ESTRUTURAL, que trave a forma do código."; then
+          # ga-dv2gk: idempotência por estado de branch — ver comentário
+          # da regra R4 no topo do arquivo e r4_already_acted() acima.
+          # Recalcula br/tip aqui (decide() não expõe: contrato "rule|why"
+          # continua puro para R1/R2/R3/R5) — chamadas locais de git,
+          # baratas, só neste ramo.
+          local r4_br r4_tip
+          r4_br="$(branch_for "$rig" "$id")"
+          r4_tip="$(branch_tip_epoch "$rig" "$r4_br")"
+          if r4_already_acted "$id" "$r4_tip"; then
+            say "R4 $id — escalação suprimida (mesmo tip de branch já escalado, sem commit novo desde então) — $why"
+          elif apply_and_report "$rig" "$id" "$labels" "R4" "$why" "⚠️ NÃO faça o 5º conserto pontual — o padrão de repetição É o achado. Exigir teste ESTRUTURAL, que trave a forma do código."; then
+            [ -n "$r4_tip" ] && mark_r4_acted "$id" "$r4_tip"
             say "R4 $id — $why"; acted=$((acted+1))
           else
             say "FALHA R4 $id — bd label remove ou bd comment falhou (label pode ainda estar presente); verificar manualmente — $why"
