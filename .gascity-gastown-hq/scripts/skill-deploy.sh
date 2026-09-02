@@ -29,8 +29,8 @@
 #   any already-queued drains, so the second tick sees no drift and fires no restart.
 #   Window: ~60 seconds between poke (file change detected) and tick-2 (actual restart).
 #   gc reload --soft completes in < 5s under normal load, but the reload lock can be
-#   held far longer under contention (measured 76s, ga-twax4) — step 4 retries with
-#   backoff for up to ~120s before telling the operator to run it by hand.
+#   held far longer under contention (measured 76s, ga-twax4) — step 4 retries at a
+#   fixed interval for up to ~120s before telling the operator to run it by hand.
 
 set -euo pipefail
 
@@ -117,7 +117,7 @@ rsync -a --delete "$SOURCE_DIR/" "$CITY_VENDOR_SINK/"
 
 echo "skill-deploy: Files written. Running gc reload --soft to suppress config-drift restarts..."
 
-# --- Immediate soft reload (retried with backoff) ---
+# --- Immediate soft reload (retried at a fixed interval) ---
 # This cancels any queued config-drift drain caused by the FPExtra hash change above.
 # A single attempt undershoots real lock contention (measured 76s vs. the <5s the
 # header assumes) — retry before telling the operator to do it by hand within a

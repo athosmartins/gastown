@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Selftest for skill-deploy.sh — proves the "gc reload --soft" step retries
-# with backoff under lock contention instead of warning after a single
-# attempt (ga-twax4: measured lock hold of ~76s vs. the script's own <5s
-# assumption and the "~60s" manual-retry window it used to print).
+# at a fixed interval under lock contention instead of warning after a
+# single attempt (ga-twax4: measured lock hold of ~76s vs. the script's own
+# <5s assumption and the "~60s" manual-retry window it used to print).
 set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 J="$SELF_DIR/skill-deploy.sh"
