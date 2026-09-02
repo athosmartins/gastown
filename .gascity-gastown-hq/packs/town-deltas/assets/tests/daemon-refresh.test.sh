@@ -920,6 +920,15 @@ V=$(field VERDICT "$OUT")
 # twice within 15 minutes, both times already running code newer than the
 # commit each check was verifying — this is that exact shape, reproduced
 # deterministically via POST_COMMIT_EPOCH (see new_case()/run_helper()).
+# gate-fix-2 (gate_run=ga-9a45d, Reviewer-1 FAIL): the first gate-fix reported
+# this case as PROOF=verified — the same confidence tag verify_fresh() earns
+# by confirming a restart THIS script itself performed. That overclaims: a
+# launchd KeepAlive respawn of a crashed SENSITIVE daemon landing between the
+# commit and DEPLOY_EPOCH would pass the identical pid-start-vs-COMMIT_EPOCH
+# test while still running pre-deploy code. This is a correlation, not proof
+# — VERDICT stays OK (still no unneeded guarded restart) but PROOF must be
+# not_verified, matching every other case in this script that cannot
+# positively confirm live freshness.
 # ════════════════════════════════════════════════════════════════════════════
 SENSITIVE_DAEMONS="central-sender conversation-monitor slot-scheduler webhook demand-dashboard"
 new_case t26
@@ -935,6 +944,7 @@ V=$(field VERDICT "$OUT")
 echo "$(field GUARDED "$OUT")" | grep -q "com.test.demand-dashboard" && nok "T26 should NOT be GUARDED" "$(field GUARDED "$OUT")" || ok "T26 not flagged GUARDED"
 echo "$(field ALREADY_FRESH "$OUT")" | grep -q "com.test.demand-dashboard" && ok "T26 recorded in ALREADY_FRESH" || nok "T26 already_fresh" "$(field ALREADY_FRESH "$OUT")"
 ! grep -q "com.test.demand-dashboard" "$MOCK/kicks.log" 2>/dev/null && ok "T26 NOT kickstarted" || nok "T26 no-kickstart" "kickstart was called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+[ "$(field PROOF "$OUT")" = "not_verified" ] && ok "T26 PROOF=not_verified (pid-start-vs-commit is a plausibility check, not proof — gate-fix-2)" || nok "T26 proof" "got '$(field PROOF "$OUT")', want not_verified"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T27 (ga-puq8z): companion to T26 — a SENSITIVE daemon whose live process

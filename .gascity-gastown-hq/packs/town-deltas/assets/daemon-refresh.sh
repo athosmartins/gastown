@@ -76,8 +76,27 @@
 #      and under-caught exactly the case point 7 exists to catch (measured
 #      2026-09-01: com.whatsapp.demand-dashboard flagged twice in 15 minutes,
 #      both times already running code newer than the commit each check was
-#      verifying). COMMIT_EPOCH <= DEPLOY_EPOCH always holds, so this only
-#      ever ADDS true-fresh detections — never masks a real stale daemon.
+#      verifying).
+#      ga-puq8z GATE-FIX-2 (gate_run=ga-9a45d, Reviewer-1 FAIL): the first
+#      gate-fix's own safety claim here — "COMMIT_EPOCH <= DEPLOY_EPOCH always
+#      holds, so this only ever ADDS true-fresh detections, never masks a real
+#      stale daemon" — does not hold. The named SENSITIVE daemons run under
+#      launchd KeepAlive=true; an unrelated crash/jetsam-OOM respawn landing
+#      in the (COMMIT_EPOCH, DEPLOY_EPOCH) gap restarts the process from
+#      whatever is STILL on disk — pre-commit code, since THIS deploy's own
+#      checkout update (DEPLOY_EPOCH) has not happened yet — giving a
+#      pid-start > COMMIT_EPOCH for a daemon that is in fact still stale. A
+#      pid-start after COMMIT_EPOCH but NOT after DEPLOY_EPOCH is therefore a
+#      real, useful CORRELATION (it rules out the common false-positive this
+#      point exists to catch) but not a PROOF the live code matches — a
+#      pid-start that ALSO clears DEPLOY_EPOCH is the identical bar
+#      verify_fresh() uses and stays a genuine positive confirmation.
+#      already_fresh() below skips the guarded-restart flag either way —
+#      reverting to DEPLOY_EPOCH-only would just reintroduce the original
+#      over-flagging bug — but reports PROOF=not_verified (never verified)
+#      for the commit-only tier: the same disambiguation this script already
+#      applies to every other case it cannot positively confirm (see the
+#      PROOF block above).
 #   8. (ga-y108i) Complementary to point 7's "is the PROCESS fresh?" question:
 #      "does this CHANGE need a restart AT ALL?" A rig can declare, in its own
 #      restart_policy.yaml, a global no_restart_paths: [glob, ...] list (e.g.
@@ -112,9 +131,15 @@
 # which is a false claim for the second case. PROOF disambiguates:
 #   verified       — a live daemon was confirmed running code from after
 #                     DEPLOY_EPOCH: either restarted by THIS script and then
-#                     confirmed fresh, or (ga-j3j6s) already running fresh via
-#                     some OTHER restart path (e.g. the rig's own auto-deploy)
-#                     — same positive pid-start-epoch confirmation either way.
+#                     confirmed fresh, or (ga-j3j6s) found ALREADY fresh via
+#                     some OTHER restart path whose pid-start ALSO clears
+#                     DEPLOY_EPOCH — same bar, same confidence, either way.
+#                     (gate-fix-2, gate_run=ga-9a45d: an already-fresh match
+#                     whose pid-start clears ONLY COMMIT_EPOCH — not also
+#                     DEPLOY_EPOCH — is a commit-vs-check-time correlation, not
+#                     this same positive confirmation; see already_fresh()'s
+#                     AFR_TIER. Reported not_verified, even though the
+#                     verdict still skips an unneeded guarded restart.)
 #   not_applicable — structurally certain there was nothing live to verify
 #                     (no source changed, no rig daemons exist at all, or the
 #                     only daemon(s) tied to the change have no live PID to
@@ -331,6 +356,13 @@ PY
 }
 
 AFFECTED=""; RESTARTED=""; FRESH_FAIL=""; GUARDED=""; ALREADY_FRESH=""; WOULD_RESTART=""
+# gate-fix-2 (ga-puq8z, gate_run=ga-9a45d): weakest confidence tier across all
+# ALREADY_FRESH daemons this run — starts optimistic, downgraded to
+# not_verified the moment any already-fresh match is only a COMMIT_EPOCH
+# correlation rather than a genuine past-DEPLOY_EPOCH confirmation (see
+# already_fresh()/AFR_TIER below). A batch summary can only be as trustworthy
+# as its weakest member.
+ALREADY_FRESH_PROOF="verified"
 
 # ── preconditions ─────────────────────────────────────────────────────────────
 if [ -z "$RUNTIME_DIR" ] || ! git -C "$RUNTIME_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -356,8 +388,19 @@ fi
 # already running code newer than the commit under review — ga-puq8z).
 # COMMIT_EPOCH <= DEPLOY_EPOCH always holds (code cannot deploy before it is
 # committed), so using it as the already_fresh() threshold only ever ADDS
-# true-fresh detections — it never masks a real stale daemon the old
-# DEPLOY_EPOCH-only check would have caught (see T27 in the test suite).
+# true-fresh detections relative to the old DEPLOY_EPOCH-only check (see T27
+# in the test suite for the regression guard: a process predating the commit
+# itself is still correctly flagged).
+# gate-fix-2 (gate_run=ga-9a45d): it does NOT follow that this "never masks a
+# real stale daemon" outright — a SENSITIVE daemon under launchd
+# KeepAlive=true can crash and respawn from whatever is still on disk at any
+# point in the (COMMIT_EPOCH, DEPLOY_EPOCH) gap, before THIS deploy's own
+# checkout update has happened, producing a pid-start > COMMIT_EPOCH (but NOT
+# > DEPLOY_EPOCH) while still running pre-commit code. So a match in that gap
+# is a correlation that avoids the common false-positive, not a proof of live
+# freshness — already_fresh() (below) reports that tier as PROOF=not_verified,
+# never verified; a pid-start that ALSO clears DEPLOY_EPOCH is the identical
+# bar verify_fresh() uses and stays a genuine verified confirmation.
 # Falls back to DEPLOY_EPOCH (the old, more conservative reference) if `git
 # show` cannot produce a value — fail toward existing behavior, not toward a
 # wider window, when the commit date is unverifiable.
@@ -771,25 +814,42 @@ verify_fresh() {  # verify_fresh <label> -> 0 if a process started after DEPLOY_
   return 1
 }
 
-# already_fresh <label> (ga-j3j6s; refined ga-puq8z) -> 0 if the CURRENTLY-live
-# process already started after the code was COMMITTED (COMMIT_EPOCH, computed
-# above from POST_DEPLOY_SHA) — a ONE-SHOT snapshot check (no wait/retry loop,
-# unlike verify_fresh()): we are not waiting for a restart WE are about to
-# perform, we are asking whether one already happened via some other path.
-# Deliberately COMMIT_EPOCH, not DEPLOY_EPOCH: DEPLOY_EPOCH is "now" from THIS
-# check's own point of view, so a restart that already happened via another
-# path is — by construction — always BEFORE it; comparing against DEPLOY_EPOCH
-# alone made this check nearly impossible to satisfy and produced exactly the
-# false positives ga-puq8z measured (see the COMMIT_EPOCH comment above). Same
-# primitives as verify_fresh() (daemon_pid + pid_start_epoch), so this carries
-# the identical evidentiary weight — see header point 7 for why a file-mtime
-# comparison would be the wrong (and misleading) alternative.
-already_fresh() {  # already_fresh <label>
+# already_fresh <label> (ga-j3j6s; refined ga-puq8z, tiered gate-fix-2) -> 0
+# if the CURRENTLY-live process already started after the code was COMMITTED
+# (COMMIT_EPOCH, computed above from POST_DEPLOY_SHA) — a ONE-SHOT snapshot
+# check (no wait/retry loop, unlike verify_fresh()): we are not waiting for a
+# restart WE are about to perform, we are asking whether one already happened
+# via some other path. Deliberately COMMIT_EPOCH, not DEPLOY_EPOCH alone:
+# DEPLOY_EPOCH is "now" from THIS check's own point of view, so a restart that
+# already happened via another path is — by construction — always BEFORE it;
+# requiring pid-start > DEPLOY_EPOCH made this check nearly impossible to
+# satisfy and produced exactly the false positives ga-puq8z measured (see the
+# COMMIT_EPOCH comment above).
+# gate-fix-2 (gate_run=ga-9a45d, Reviewer-1 FAIL): a pid-start in
+# (COMMIT_EPOCH, DEPLOY_EPOCH] is NOT the same evidentiary weight as one past
+# DEPLOY_EPOCH. verify_fresh() confirms a restart THIS script itself just
+# performed, so DEPLOY_EPOCH is a hard floor for it; already_fresh() infers a
+# restart that happened somewhere else, and a launchd KeepAlive respawn of a
+# crashed daemon can land in that gap while the checkout is still pre-commit
+# code — a real correlation, not proof. So this sets the global AFR_TIER on a
+# match: "verified" when pid-start is ALSO past DEPLOY_EPOCH (the identical
+# bar verify_fresh() clears — a genuine positive confirmation), else
+# "not_verified" (a commit-vs-check-time correlation only). Callers fold
+# AFR_TIER into the emitted PROOF — see ALREADY_FRESH_PROOF above — never
+# assume verified outright. See header point 7 for why a file-mtime
+# comparison would be a different (and misleading) alternative.
+already_fresh() {  # already_fresh <label> -> 0/1; sets AFR_TIER on a 0 return
   local label="$1" pid se
   pid="$(daemon_pid "$label")"
   [ -n "$pid" ] || return 1
   se="$(pid_start_epoch "$pid" || echo 0)"
-  [ -n "$se" ] && [ "$se" -gt "$COMMIT_EPOCH" ] 2>/dev/null
+  [ -n "$se" ] && [ "$se" -gt "$COMMIT_EPOCH" ] 2>/dev/null || return 1
+  if [ "$se" -gt "$DEPLOY_EPOCH" ] 2>/dev/null; then
+    AFR_TIER="verified"
+  else
+    AFR_TIER="not_verified"
+  fi
+  return 0
 }
 
 for label in $AFFECTED; do
@@ -805,7 +865,12 @@ for label in $AFFECTED; do
   fi
   if is_sensitive "$label" || policy_says_sensitive "$label"; then
     if already_fresh "$label"; then
-      log "SENSITIVE $label: current process already started after deploy (DEPLOY_EPOCH=$DEPLOY_EPOCH) — already running the new code via some other restart path; not flagging for guarded restart (ga-j3j6s)."
+      if [ "$AFR_TIER" = "verified" ]; then
+        log "SENSITIVE $label: current process started after DEPLOY_EPOCH ($DEPLOY_EPOCH) via some other restart path — same bar verify_fresh() uses; positively confirmed fresh, not flagging for guarded restart (ga-j3j6s)."
+      else
+        log "SENSITIVE $label: current process started after this code was committed (COMMIT_EPOCH=$COMMIT_EPOCH) but not after DEPLOY_EPOCH ($DEPLOY_EPOCH) — plausibly already running the new code via some other restart path; not flagging for guarded restart, but this is a correlation, not proof (PROOF=not_verified — ga-j3j6s, confidence corrected gate-fix-2)."
+        ALREADY_FRESH_PROOF="not_verified"
+      fi
       ALREADY_FRESH="$ALREADY_FRESH $label"
       continue
     fi
@@ -885,11 +950,19 @@ elif [ -n "${WOULD_RESTART// /}" ]; then
   # refresh" branch below: verification wasn't attempted, not that it failed.
   emit OK "DRY RUN — no action taken; would restart daemon(s):${WOULD_RESTART}" not_applicable
 elif [ -n "${ALREADY_FRESH// /}" ]; then
-  # ga-j3j6s: sensitive daemon(s) whose live process already started after
-  # DEPLOY_EPOCH via some other restart path (e.g. the rig's own auto-deploy)
-  # — positively confirmed fresh via the identical epoch comparison
-  # verify_fresh() uses, just without THIS script performing the restart.
-  emit OK "affected sensitive daemon(s) already running post-deploy code, no restart needed:${ALREADY_FRESH}" verified
+  # ga-j3j6s (confidence corrected gate-fix-2, gate_run=ga-9a45d): sensitive
+  # daemon(s) whose live process started after COMMIT_EPOCH via some other
+  # restart path (e.g. a sibling bead's own guarded restart, or the rig's own
+  # auto-deploy). Still skip the guarded restart either way (reverting to
+  # DEPLOY_EPOCH-only would just reintroduce the original over-flagging bug),
+  # but ALREADY_FRESH_PROOF (set per-daemon by already_fresh()'s AFR_TIER, at
+  # the call site above) tells us whether that pid-start ALSO cleared
+  # DEPLOY_EPOCH — the identical bar verify_fresh() uses, a genuine positive
+  # confirmation — or only COMMIT_EPOCH, a commit-vs-check-time correlation a
+  # launchd KeepAlive respawn from an unrelated crash could satisfy while
+  # still running pre-deploy code. A batch is only as trustworthy as its
+  # weakest member, so one weak match downgrades the whole emitted PROOF.
+  emit OK "sensitive daemon(s) already running post-deploy code via some other restart path, no restart needed:${ALREADY_FRESH}" "$ALREADY_FRESH_PROOF"
 else
   # ga-vmq1i: AFFECTED was non-empty, but every affected daemon was skipped for
   # having no live PID (a scheduled/one-shot job, per the Step-4 loop above) —
