@@ -2370,6 +2370,19 @@ _TEXT_VETO_PATTERNS=$(jq -n --arg engine_re "$_PILOT_ENGINE_REBUILD_RE" --arg di
 # correctly-but-blindly, that it "matched NONE of this reconciler's known
 # non-buildable signals". This function makes the reason visible ON THE BEAD.
 #
+# ga-i00xl ADDENDUM: "visible on the bead" via label alone still wasn't
+# visible enough — ga-dv2gk/ga-42mlf each sat 7+ days stuck in Aprovadas
+# with nothing but this label to explain why (nobody reads a bead's label
+# list proactively). On an ADD transition this function now ALSO posts a
+# one-time bd comment plus a `gc mail send` to the bead's creator (falling
+# back to the Mayor when unresolvable), mirroring the notify step
+# _reconcile_empty_description_signal (ga-iu3xc5) directly below already
+# uses for the identical "silent diagnostic label" problem. This does NOT
+# change anything below: the label itself is still added/removed exactly as
+# before, still diagnostic-only, still the ONLY writer/remover — the
+# addendum is purely an additional side effect on the ADD half of that same
+# transition, gated on the label write succeeding (see the function body).
+#
 # DESIGN TRAP AVOIDED (read before ever touching this): the obvious label name
 # pilot:refused-reason:<pattern> is ALREADY a PERMANENT blocking label
 # (_filter_candidates ~L1886/L2105 — pilot-refused-reason-promoted-by-
@@ -2436,21 +2449,78 @@ _reconcile_text_veto_labels() {
       | (if (($p.not_re // "") | length) > 0 then ($text | test($p.not_re; "i")) else false end) as $neg_match
       | ($pos_match and ($neg_match | not)) as $matches
       | (($L | index($lbl)) != null) as $has
-      | if ($matches and ($has | not)) then [$id, "add", $lbl]
-        elif ((($matches | not)) and $has) then [$id, "remove", $lbl]
+      # ga-i00xl: carry created_by through on "add" only (empty on "remove",
+      # where it is never used) so the notify step below can route mail to
+      # whoever wrote the bead, without a second query per action.
+      | if ($matches and ($has | not)) then [$id, "add", $lbl, ($b.created_by // "")]
+        elif ((($matches | not)) and $has) then [$id, "remove", $lbl, ""]
         else empty end
       | @tsv
     ' 2>/dev/null)
   [ -z "$_rtv_actions" ] && return 0
 
-  printf '%s\n' "$_rtv_actions" | while IFS=$'\t' read -r _rtv_id _rtv_verb _rtv_lbl; do
+  local _rtv_agents_json
+  printf '%s\n' "$_rtv_actions" | while IFS=$'\t' read -r _rtv_id _rtv_verb _rtv_lbl _rtv_creator; do
     [ -z "$_rtv_id" ] && continue
     if [ "$DRY_RUN" = "1" ]; then
       log "[pilot-text-veto] WOULD $_rtv_verb $_rtv_lbl on $_rtv_id" >&2
       continue
     fi
-    bd -C "$_rtv_db" label "$_rtv_verb" "$_rtv_id" "$_rtv_lbl" -q >/dev/null 2>&1 || true
-    log "[pilot-text-veto] $_rtv_verb $_rtv_lbl on $_rtv_id" >&2
+    # ga-i00xl: gate the one-time comment/mail below on the label write
+    # actually succeeding, not just attempted — same discipline ga-iu3xc5
+    # established for the sibling _reconcile_empty_description_signal
+    # directly below this function. Swallowing this exit code would let a
+    # bd hiccup send the notification while $has stays false, so the NEXT
+    # sweep sees an unlabeled-but-already-notified bead and fires a second
+    # notice for the same occurrence.
+    if bd -C "$_rtv_db" label "$_rtv_verb" "$_rtv_id" "$_rtv_lbl" -q >/dev/null 2>&1; then
+      log "[pilot-text-veto] $_rtv_verb $_rtv_lbl on $_rtv_id" >&2
+    else
+      log "[pilot-text-veto] FAILED to $_rtv_verb $_rtv_lbl on $_rtv_id (bd label error) — skipping notification, will retry next sweep" >&2
+      continue
+    fi
+
+    # ga-i00xl: make the veto actually VISIBLE — until now the label above
+    # was the ONLY signal, deliberately diagnostic-only (see the design-trap
+    # comment above this function) but that also meant nothing surfaced it
+    # to a human. Measured: ga-dv2gk/ga-42mlf sat 7+ days silently stuck in
+    # Aprovadas with no visible reason. Fires once per ADD transition only
+    # (REMOVE is a silent self-clear, not a new problem) — mirrors
+    # _reconcile_empty_description_signal immediately below (ga-iu3xc5):
+    # same one-time-notice discipline, same creator-first-then-Mayor-
+    # fallback routing, cached agent roster (fetched at most once per sweep).
+    if [ "$_rtv_verb" = "add" ]; then
+      bd -C "$_rtv_db" comment "$_rtv_id" \
+        "pilot-dispatcher (ga-i00xl): esta bead foi excluída do despacho por veto de TEXTO ($_rtv_lbl) — o título/descrição casou com um padrão que o Pilot trata como não-buildável. Isto ficava invisível até agora (só aparecia no log do Pilot). Se o texto apenas CITA ou MENCIONA o padrão (ex.: exemplo, explicação do próprio mecanismo, citação de outro bead/commit) em vez de carregá-lo de verdade, reescreva o trecho para não repetir a frase/marcador literal — o label some sozinho no próximo sweep. Se é uma ocorrência real, resolva o que o padrão sinaliza." \
+        2>/dev/null || true
+
+      if [ -z "${_rtv_agents_json:-}" ]; then
+        _rtv_agents_json=$(gc agent list --json 2>/dev/null \
+          | jq -c '[.agents[].name] | unique' 2>/dev/null) || true
+        [ -z "$_rtv_agents_json" ] && _rtv_agents_json="[]"
+      fi
+      _rtv_target=""
+      if [ -n "$_rtv_creator" ] && [ "$_rtv_creator" != "null" ]; then
+        _rtv_target=$(printf '%s' "$_rtv_agents_json" | jq -r --arg c "$_rtv_creator" '
+            [ .[] | . as $agent | select(($c == $agent) or ($c | startswith($agent + "-"))) ]
+            | sort_by(length) | last // empty
+          ' 2>/dev/null) || true
+      fi
+
+      if [ -n "$_rtv_target" ]; then
+        gc --city "$GC_CITY" mail send "$_rtv_target" \
+          -s "Sua bead vetada por texto (invisível até agora): $_rtv_id" \
+          -m "$(printf 'Sua bead %s foi excluída do despacho por veto de TEXTO (%s) — o Pilot trata o título/descrição como não-buildável. Isso ficava só no log do Pilot; agora o label + um comentário na bead tornam visível.\n\nSe o texto apenas CITA/MENCIONA o padrão (exemplo, explicação do mecanismo, citação de outro bead) em vez de carregá-lo de verdade, reescreva o trecho pra não repetir a frase/marcador literal — o label some sozinho no próximo sweep. Se é ocorrência real, resolva o que o padrão sinaliza.' \
+            "$_rtv_id" "$_rtv_lbl")" \
+          2>/dev/null || true
+      else
+        gc --city "$GC_CITY" mail send mayor \
+          -s "Bead vetada por texto (invisível até agora): $_rtv_id" \
+          -m "$(printf '%s foi excluída do despacho por veto de TEXTO (%s) — só aparecia no log do Pilot até agora (ga-i00xl).\n\n  criada por: %s (não resolvida a um agente configurado — notificação direta ao criador não foi possível)\n\nLabel + comentário já aplicados na bead. Se é MENÇÃO (citação/exemplo), reescreva pra não repetir a frase literal. Se é ocorrência real, resolva o que o padrão sinaliza.' \
+            "$_rtv_id" "$_rtv_lbl" "${_rtv_creator:-desconhecido}")" \
+          2>/dev/null || true
+      fi
+    fi
   done
   return 0
 }

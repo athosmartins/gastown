@@ -48,6 +48,31 @@
 #        always composed correctly in isolation regardless of which order
 #        production actually wired them in.
 #
+# ga-i00xl: the label above was the ONLY signal a text veto ever produced —
+# diagnostic-only ON PURPOSE (see the design-trap comment directly above
+# _reconcile_text_veto_labels in the shipped file), never surfaced to a
+# human. Measured cost: ga-dv2gk/ga-42mlf sat 7+ days in Aprovadas with
+# nothing visible but this label. AC12-AC17 prove the fix — mirroring
+# _reconcile_empty_description_signal (ga-iu3xc5), this function's own
+# sibling directly below it in the shipped file, which already solved this
+# exact "label alone is invisible" problem the same way.
+#   AC12. An ADD transition (new occurrence) posts a bd comment on the bead
+#        explaining which pattern matched — the veto becomes visible ON THE
+#        BEAD, not only in the Pilot's log.
+#   AC13. A REMOVE transition (self-clear) stays silent — no comment, no
+#        mail. Self-clearing is not a new problem; nothing to notice.
+#   AC14. Already-correct steady state (AC3's shape) produces ZERO new
+#        comment/mail calls — no repeat noise on a healthy sweep.
+#   AC15. DRY_RUN=1 produces zero comment/mail calls, same as it produces
+#        zero label calls (AC4) — a dry run must never have side effects.
+#   AC16. Mail routes to the CREATOR when resolvable against the configured
+#        agent roster (prefix match, same discipline as ga-iu3xc5), and
+#        falls back to the Mayor when it is not — never both.
+#   AC17. A bd label-write FAILURE skips comment+mail entirely — notifying
+#        without the label actually landing would let the NEXT sweep see an
+#        unlabeled-but-already-notified bead and fire a second notice for
+#        the same occurrence (identical safeguard to ga-iu3xc5's).
+#
 # Runs entirely against extracted function bodies (same awk/sed-extraction
 # idiom as pilot-dispatcher.exclusion-trace.selftest.sh) with a PATH-shimmed
 # fake `bd` that records calls to a file instead of touching any real store.
@@ -101,28 +126,80 @@ fi
 
 SHIMBIN="$WORK/bin"; mkdir -p "$SHIMBIN"
 CALLLOG="$WORK/bd-calls.tsv"
+COMMENTLOG="$WORK/bd-comments.tsv"
+MAILLOG="$WORK/gc-mail.tsv"
 : > "$CALLLOG"
-cat > "$SHIMBIN/bd" <<SHIM
+: > "$COMMENTLOG"
+: > "$MAILLOG"
+
+# ga-i00xl: factored into a function (not a one-shot heredoc) because
+# Scenario 17 below needs to temporarily swap in a failing `bd` and then
+# restore this exact shim afterward — a single source of truth avoids the
+# two copies drifting apart the way ga-w3vn3/ga-ffop9 warn about elsewhere
+# in this file for the real pattern literals.
+install_bd_shim() {
+  cat > "$SHIMBIN/bd" <<SHIM
 #!/usr/bin/env bash
-# Records every 'bd -C <db> label <verb> <id> <label> ...' call instead of
-# touching any real store. Anything else returns an empty JSON array.
+# Records every 'bd -C <db> label <verb> <id> <label> ...' call and every
+# 'bd -C <db> comment <id> <text>' call instead of touching any real store.
+# Anything else returns an empty JSON array.
 if [ "\$1" = "-C" ]; then
   db="\$2"
   if [ "\$3" = "label" ]; then
     printf '%s\t%s\t%s\t%s\n' "\$db" "\$4" "\$5" "\$6" >> "$CALLLOG"
     exit 0
   fi
+  if [ "\$3" = "comment" ]; then
+    printf '%s\t%s\t%s\n' "\$db" "\$4" "\$5" >> "$COMMENTLOG"
+    exit 0
+  fi
 fi
 echo '[]'
 SHIM
-chmod +x "$SHIMBIN/bd"
+  chmod +x "$SHIMBIN/bd"
+}
+install_bd_shim
+
+# ga-i00xl: fake `gc` — records 'gc agent list --json' (answered from a
+# fixed roster fixture) and 'gc --city <city> mail send <target> -s <subj>
+# -m <body>' calls, matching _reconcile_empty_description_signal's exact
+# call shape (ga-iu3xc5) so both functions stay comparable under test.
+AGENTS_JSON="$WORK/agents.json"
+cat > "$AGENTS_JSON" <<'ROSTER'
+{"agents":[{"name":"gastown.mayor"},{"name":"digo-wa"},{"name":"gastown.dog-3"}]}
+ROSTER
+cat > "$SHIMBIN/gc" <<SHIM
+#!/usr/bin/env bash
+if [ "\$1" = "agent" ] && [ "\$2" = "list" ]; then
+  cat "$AGENTS_JSON"
+  exit 0
+fi
+if [ "\$1" = "--city" ] && [ "\$3" = "mail" ] && [ "\$4" = "send" ]; then
+  target="\$5"; shift 5
+  subj=""; body=""
+  while [ \$# -gt 0 ]; do
+    case "\$1" in
+      -s) subj="\$2"; shift 2 ;;
+      -m) body="\$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  printf '%s\t%s\t%s\n' "\$target" "\$subj" "\$body" >> "$MAILLOG"
+  exit 0
+fi
+echo '[]'
+SHIM
+chmod +x "$SHIMBIN/gc"
 
 run_rtv() {
   # run_rtv <db> <input-json> [extra-env-line]
   local db="$1" input="$2" extra="${3:-}"
   : > "$CALLLOG"
+  : > "$COMMENTLOG"
+  : > "$MAILLOG"
   cat > "$WORK/run.sh" <<EOF
 export PATH="$SHIMBIN:\$PATH"
+export GC_CITY="/fake/city"
 $LOG_FN
 $TVP
 $RTV_FN
@@ -325,6 +402,85 @@ NEW_ORDER_SITES="$(grep -c '_reconcile_text_veto_labels "[^"]*" | _filter_candid
 [ "$NEW_ORDER_SITES" = "19" ] \
   && ok "AC11: exactly 19 call sites confirmed wired in the fixed order (none lost, none duplicated)" \
   || bad "AC11: expected exactly 19 call sites in the fixed order, found $NEW_ORDER_SITES"
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "Scenario 12: AC12 — ga-i00xl: an ADD transition now posts a bd comment making the veto VISIBLE"
+OUT12="$(run_rtv /fake/db "$IN1")"
+[ "$OUT12" = "$IN1" ] && ok "AC6: stdout byte-identical to stdin" || bad "AC6: pass-through altered input"
+[ -s "$COMMENTLOG" ] \
+  && ok "AC12: ADD transition posts a bd comment (was silent before ga-i00xl)" \
+  || bad "AC12: expected a bd comment call, COMMENTLOG is empty"
+grep -qF "ga-add1" "$COMMENTLOG" \
+  && ok "AC12: the comment targets the right bead id" \
+  || bad "AC12: comment id mismatch (commentlog: $(cat "$COMMENTLOG"))"
+grep -qF "pilot:text-veto:engine-rebuild-text-pattern" "$COMMENTLOG" \
+  && ok "AC12: the comment names the matched pattern's label" \
+  || bad "AC12: comment does not mention the matched label (commentlog: $(cat "$COMMENTLOG"))"
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "Scenario 13: AC13 — REMOVE (self-clear) stays silent: no comment, no mail — only ADD is a new occurrence"
+run_rtv /fake/db "$IN2" > /dev/null
+[ ! -s "$COMMENTLOG" ] \
+  && ok "AC13: self-clearing REMOVE posts no comment (not a new problem, nothing to notice)" \
+  || bad "AC13: unexpected comment on a REMOVE transition (commentlog: $(cat "$COMMENTLOG"))"
+[ ! -s "$MAILLOG" ] \
+  && ok "AC13: self-clearing REMOVE sends no mail" \
+  || bad "AC13: unexpected mail on a REMOVE transition (maillog: $(cat "$MAILLOG"))"
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "Scenario 14: AC14 — already-correct steady state produces ZERO comment/mail calls (extends AC3, no repeat noise)"
+run_rtv /fake/db "$IN3" > /dev/null
+[ ! -s "$COMMENTLOG" ] && [ ! -s "$MAILLOG" ] \
+  && ok "AC14: healthy/already-reconciled beads produce zero comment/mail calls" \
+  || bad "AC14: expected zero comment/mail, got commentlog=[$(cat "$COMMENTLOG")] maillog=[$(cat "$MAILLOG")]"
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "Scenario 15: AC15 — DRY_RUN=1 produces zero comment/mail calls too (extends AC4)"
+run_rtv /fake/db "$IN1" "export DRY_RUN=1" >/dev/null 2>/dev/null
+[ ! -s "$COMMENTLOG" ] && [ ! -s "$MAILLOG" ] \
+  && ok "AC15: DRY_RUN=1 makes zero comment/mail calls" \
+  || bad "AC15: DRY_RUN=1 still notified — commentlog=[$(cat "$COMMENTLOG")] maillog=[$(cat "$MAILLOG")]"
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "Scenario 16: AC16 — mail routes to the CREATOR when resolvable, else falls back to the Mayor"
+IN16A='[{"id":"ga-creator-known","labels":[],"title":"x","description":"needs a gascity engine rebuild","created_by":"digo-wa-gawisp7iqcpw"}]'
+run_rtv /fake/db "$IN16A" > /dev/null
+grep -qF "$(printf 'digo-wa\t')" "$MAILLOG" \
+  && ok "AC16: creator resolvable (prefix match) → mail routes to the creator, not the Mayor" \
+  || bad "AC16: expected mail to digo-wa (maillog: $(cat "$MAILLOG"))"
+grep -qF "gastown.mayor" "$MAILLOG" \
+  && bad "AC16: mail should NOT also go to the Mayor when the creator resolved" \
+  || ok "AC16: no duplicate Mayor mail when the creator resolved"
+
+IN16B='[{"id":"ga-creator-unknown","labels":[],"title":"x","description":"needs a gascity engine rebuild","created_by":"someone-not-in-the-roster"}]'
+run_rtv /fake/db "$IN16B" > /dev/null
+# Fallback target is the literal recipient alias "mayor" (matches
+# _reconcile_empty_description_signal's own `mail send mayor` call exactly
+# — this path is a hardcoded alias, NOT resolved against the agent roster
+# the way a matched creator is).
+grep -qF "$(printf 'mayor\t')" "$MAILLOG" \
+  && ok "AC16: unresolvable creator → mail falls back to the Mayor" \
+  || bad "AC16: expected fallback mail to mayor (maillog: $(cat "$MAILLOG"))"
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "Scenario 17: AC17 — a bd label FAILURE skips notification entirely (mirrors ga-iu3xc5's exact safeguard:"
+echo "  never notify without the label actually landing, or the next sweep double-notifies the same occurrence)"
+cat > "$SHIMBIN/bd" <<'SHIM2'
+#!/usr/bin/env bash
+exit 1
+SHIM2
+chmod +x "$SHIMBIN/bd"
+run_rtv /fake/db "$IN1" >/dev/null 2>/dev/null
+[ ! -s "$COMMENTLOG" ] && [ ! -s "$MAILLOG" ] \
+  && ok "AC17: label write failure skips comment+mail (no notify-without-label)" \
+  || bad "AC17: notified despite label failure — commentlog=[$(cat "$COMMENTLOG")] maillog=[$(cat "$MAILLOG")]"
+install_bd_shim   # restore the real shim for anything that runs after this scenario
 
 # ════════════════════════════════════════════════════════════════════════════
 echo ""
