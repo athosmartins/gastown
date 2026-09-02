@@ -2267,7 +2267,25 @@ _PILOT_ENGINE_REBUILD_NONREQUEST_RE='do not|don.t|n[ãa]o fa[çc]a|n[ãa]o fazer
 # AC (see _filter_dispatch_gates' own spec-floor gate for that different,
 # narrower problem) and gating dispatch on bare AC-absence would block a
 # large share of legitimate bug work, not just diagnostic-only stories.
-_PILOT_DIAGNOSTIC_ONLY_RE='s[óo] diagn[óo]stico|n[ãa]o prop[õo]e implementa[çc][ãa]o|decis[ãa]o de arquitetura'
+# ga-dv2gk: a alternativa "só diagnóstico" precisa de FRONTEIRA A ESQUERDA.
+# Sem ela, "so diagnostico" casa DENTRO de "fal|so diagnostico" — e o veto
+# dispara justamente na frase que significa o OPOSTO: um autor avisando que
+# quase registrou um diagnostico FALSO. Medido: ga-dv2gk ficou 7 DIAS parada
+# em Aprovadas por isso, com story:approved+ctx:ready+exec:auto e nenhum
+# motivo visivel — o unico sinal era o proprio label de veto.
+#
+# POR QUE (^|[^...]) E NAO \b NEM (?<!...):
+#   \b entre 'l' e 's' NAO e fronteira (ambos sao letras), entao nao resolve.
+#   (?<![0-9A-Za-zÀ-ÿ]) e REJEITADO pelo jq: "Regex failure: invalid pattern
+#   in look-behind" — o Oniguruma exige lookbehind de largura FIXA e À-ÿ e
+#   multi-byte em UTF-8. Testado ao vivo antes de escolher esta forma.
+#   (^|[^0-9A-Za-zÀ-ÿ]) consome um caractere, o que e inofensivo aqui porque
+#   os TRES consumidores usam test() (booleano, sem captura): L2366,
+#   L2974 e L3095. Bonus: funciona igual em grep -E, entao sobrevive se um
+#   consumidor futuro trocar de motor — ao contrario do lookbehind.
+# So a 1a alternativa precisa disso: as outras duas comecam em 'n'/'d' de
+# frases inteiras que nao sao sufixo de palavra comum.
+_PILOT_DIAGNOSTIC_ONLY_RE='(^|[^0-9A-Za-zÀ-ÿ])s[óo] diagn[óo]stico|n[ãa]o prop[õo]e implementa[çc][ãa]o|decis[ãa]o de arquitetura'
 
 # ga-qt0mj: single source of truth for _filter_candidates' 5 TEXT-only vetoes
 # (engine-rebuild / DECISAO-title / "só o Athos decide" / 🚨 compliance-marker /
