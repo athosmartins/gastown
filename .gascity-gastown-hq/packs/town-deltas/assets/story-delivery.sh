@@ -230,6 +230,42 @@ extract_gate_merge_info() {
   printf '%s\t%s' "$rig_branch" "$sha"
 }
 
+# derive_rig_from_comments <bd_comments_text> — echoes just the <rig> segment
+# of the MOST RECENT authoritative gate-dispatcher merge comment, by
+# delegating entirely to extract_gate_merge_info() above (one source of
+# truth for "what does a real gate-merge comment look like", not two). rc1 +
+# no output when no such comment exists, exactly mirroring
+# extract_gate_merge_info's own contract.
+#
+# ga-aqqj0: this REPLACES a second, looser, independently-drifted regex that
+# used to live inline at this file's Step 2 (rig resolution) —
+#   grep -oE "merged to [a-z_]+/main" | head -1
+# — matched against ALL of a story's comment text concatenated together, with
+# two compounding defects:
+#   1. No "(sha=...)" anchor, so it also matched incidental HUMAN PROSE that
+#      merely QUOTES a gate comment while narrating something else — e.g. a
+#      Mayor comment retelling '...citando "code merged to origin/main —
+#      commit-in-origin-main [a43d1a267]"' while explaining what a DIFFERENT
+#      bot (merged-bead-janitor) had written. "origin" there is the git
+#      REMOTE name (see that janitor's own boilerplate phrasing), never a
+#      rig — but the regex cannot tell prose-about-a-comment from the
+#      dispatcher's own comment.
+#   2. `head -1` (first match across the WHOLE history) instead of `tail -1`
+#      (most recent) — so that early, incidental false match could shadow a
+#      later, real, well-formed "merged to gascity/main (sha=...)" comment
+#      from the actual gate dispatcher.
+# Live proof: ga-dv2gk resolved RIG="origin" this way, and no runbook entry
+# for "origin" will ever exist — Step 3 (deploy_cmd lookup) HALTED on a
+# 5-minute retry loop, 18 identical "no deploy_cmd for rig 'origin'" comments
+# in 1 hour, even though the story's real fix was already merged to gascity's
+# actual main. See story-delivery.selftest.sh section 5b for the regression
+# test against this exact comment shape.
+derive_rig_from_comments() {
+  local text="$1" info
+  info=$(extract_gate_merge_info "$text") || return 1
+  printf '%s' "${info%%/*}"
+}
+
 # story_merge_verdict <gdir> <container> <branch_ref> <sha> — echoes
 # "verified"|"not-ancestor"|"unresolvable"; rc0 iff "verified". Content check:
 # does <branch_ref> (e.g. origin/main, already fetched by the caller) CONTAIN
@@ -579,6 +615,15 @@ TASK_COUNT=0
 # "Closed by delivery sweep" comment (never true) and retry forever, one Dolt
 # commit per sweep (~5min cadence; wa-l30yr: 8+ in under 3 hours).
 TASK_CLOSE_MAX_RETRIES=3
+# ga-aqqj0: same cap idiom as TASK_CLOSE_MAX_RETRIES above, applied to a
+# DIFFERENT loop/step — Step 3 of the STORY delivery loop below (rig runbook
+# lookup), not the task reconciler. A rig value that can never have a runbook
+# entry (e.g. 'origin', a git remote name wrongly resolved as a rig by Step 2
+# — see derive_rig_from_comments) used to HALT every ~5min sweep forever: 18
+# identical "no deploy_cmd for rig 'origin'" comments in 1h on ga-dv2gk,
+# before this was noticed. See the delivery:no-deploy-cmd-retry:N /
+# delivery:no-deploy-cmd-exhausted labels at Step 3.
+DELIVERY_NO_DEPLOY_CMD_MAX_RETRIES=3
 if [ -z "$FORCE_STORY_ID" ]; then
   # Fan-out over ALL stores (ga-mt03s): task beads in ps-/wa-/etc. rigs live in
   # their own stores, not HQ. Inject _store so mutations target the right store.
@@ -1010,6 +1055,17 @@ if echo "$STORY_LABELS" | grep -q "delivery:running"; then
   continue
 fi
 
+# ga-aqqj0: skip if the no-deploy-cmd retry cap already escalated this story
+# (Step 3 below). A human has been notified via bead comment + Mayor mail;
+# do not keep re-halting/re-commenting every ~5min sweep while waiting for
+# that human to fix the rig value or the runbook (that unbounded-comment loop
+# — 18 identical halts in 1h on ga-dv2gk — is exactly what the retry cap
+# exists to stop). Removing the label lets the sweep retry automatically.
+if echo "$STORY_LABELS" | grep -q "delivery:no-deploy-cmd-exhausted"; then
+  log "Story $STORY_ID already escalated (delivery:no-deploy-cmd-exhausted, ga-aqqj0) — no deploy_cmd halt already reported to a human. Skipping."
+  continue
+fi
+
 # ga-0m6tgc: cross-rig/multi-marker awareness. quality-gate-dispatcher.sh
 # adds gate:passed to the shared source bead unconditionally, per-marker,
 # with no check for a SIBLING marker still pending on the SAME story. A
@@ -1105,11 +1161,20 @@ if [ -z "$RIG" ]; then
   _SD_COMMENTS=$(bd -C "$STORY_STORE" show "$STORY_ID" --json --include-comments 2>/dev/null \
     | jq -r '(if type=="array" then .[0] else . end).comments[]?.text // empty' 2>/dev/null || echo "")
   [ -z "$_SD_COMMENTS" ] && _SD_COMMENTS=$(bd -C "$STORY_STORE" comments "$STORY_ID" 2>/dev/null || echo "")
-  GATE_COMMENT=$(printf '%s\n' "$_SD_COMMENTS" \
-    | grep -oE "merged to [a-z_]+/main" | head -1 || echo "")
-  if [ -n "$GATE_COMMENT" ]; then
-    RIG=$(echo "$GATE_COMMENT" | sed 's/merged to //' | sed 's|/main||')
+  # ga-aqqj0: delegate to derive_rig_from_comments (which delegates to
+  # extract_gate_merge_info, defined above) instead of a second, looser,
+  # ad hoc regex. That old regex — "merged to [a-z_]+/main" with `head -1`
+  # over ALL comment text, no "(sha=...)" anchor — matched incidental HUMAN
+  # PROSE quoting a gate comment (e.g. "...citando 'code merged to
+  # origin/main...'") and let that earlier, incidental match shadow a later,
+  # real, well-formed dispatcher comment. "origin" (a git REMOTE name, never
+  # a rig) then sailed through as RIG and no runbook entry for it will ever
+  # exist — see ga-dv2gk: 18 identical "no deploy_cmd for rig 'origin'" halts
+  # in 1h on a story whose real fix was already merged to gascity's main.
+  if RIG=$(derive_rig_from_comments "$_SD_COMMENTS"); then
     log "Rig derived from gate comment: $RIG"
+  else
+    RIG=""
   fi
 fi
 
@@ -1138,7 +1203,33 @@ if [ -z "$DEPLOY_CMD" ]; then
   if [ "$DRY_RUN" != "1" ]; then
     bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
     bd -C "$STORY_STORE" label add    "$STORY_ID" "delivery:failed" -q 2>/dev/null || true
-    bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED: no deploy_cmd for rig '$RIG'. Codify the deploy runbook before retrying." 2>/dev/null || true
+    # ga-aqqj0: cap consecutive halts for this story instead of commenting
+    # forever — same shape, same file, same mail convention as the
+    # ga-s1qb2 delivery:close-retry(-exhausted) circuit breaker the task
+    # reconciler already uses above for its own "reconciler stuck, needs a
+    # human" case. Before this, a rig value that can never have a runbook
+    # entry (e.g. 'origin', a git remote name wrongly resolved as a rig)
+    # HALTED every sweep forever: 18 identical comments in 1h on ga-dv2gk.
+    RIG_HALT_RETRY=$(echo "$STORY" | jq -r '
+      (.labels // []) | map(select(startswith("delivery:no-deploy-cmd-retry:"))) | .[0] // ""
+      | if . == "" then "0" else ltrimstr("delivery:no-deploy-cmd-retry:") end
+    ' 2>/dev/null || echo "0")
+    case "$RIG_HALT_RETRY" in ''|*[!0-9]*) RIG_HALT_RETRY=0 ;; esac
+    RIG_HALT_RETRY_NEXT=$((RIG_HALT_RETRY + 1))
+    [ "$RIG_HALT_RETRY" -gt 0 ] && bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:no-deploy-cmd-retry:$RIG_HALT_RETRY" -q 2>/dev/null || true
+    if [ "$RIG_HALT_RETRY_NEXT" -ge "$DELIVERY_NO_DEPLOY_CMD_MAX_RETRIES" ]; then
+      bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:no-deploy-cmd-exhausted" -q 2>/dev/null || true
+      bd -C "$STORY_STORE" label add "$STORY_ID" "gate:needs-human" -q 2>/dev/null || true
+      bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED $RIG_HALT_RETRY_NEXT/$DELIVERY_NO_DEPLOY_CMD_MAX_RETRIES times: no deploy_cmd for rig '$RIG' in runbook (ga-aqqj0 retry cap) — NOT retrying further to avoid an unbounded loop of identical comments. Either '$RIG' is not a real rig (check Step 2's rig resolution: label rig:<name>, metadata story.rig, or the gate's own merge comment) or delivery-runbooks.toml genuinely needs a deploy_cmd entry for it. A human must fix the rig value or the runbook, then remove label delivery:no-deploy-cmd-exhausted to let this retry automatically." 2>/dev/null || true
+      gc --city "$GC_CITY" mail send mayor \
+        -s "Delivery: no deploy_cmd for rig '$RIG' exhausted retries ($STORY_ID)" \
+        -m "$(printf 'Story %s halted %s times with "no deploy_cmd for rig %s" (ga-aqqj0 retry cap) — this cannot converge on its own.\n\nStore: %s\n\nCheck whether %s is a real rig with a runbook entry in delivery-runbooks.toml, or a rig-resolution bug (Step 2 of story-delivery.sh, derive_rig_from_comments). This story will no longer be auto-retried — fix the rig value or the runbook, then remove label delivery:no-deploy-cmd-exhausted to let delivery try again automatically.' \
+          "$STORY_ID" "$RIG_HALT_RETRY_NEXT" "$RIG" "$STORY_STORE" "$RIG")" \
+        2>/dev/null || warn "Could not mail Mayor no-deploy-cmd-exhausted escalation for $STORY_ID (ga-aqqj0)"
+    else
+      bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:no-deploy-cmd-retry:$RIG_HALT_RETRY_NEXT" -q 2>/dev/null || true
+      bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED: no deploy_cmd for rig '$RIG'. Codify the deploy runbook before retrying. (attempt $RIG_HALT_RETRY_NEXT/$DELIVERY_NO_DEPLOY_CMD_MAX_RETRIES before this escalates and stops auto-retrying — ga-aqqj0)" 2>/dev/null || true
+    fi
   fi
   # wa-uthi: non-terminal (config gap, retries every cycle once codified) — no push. Logged + bead comment only.
   warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID — no deploy_cmd for rig $RIG."

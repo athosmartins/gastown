@@ -44,7 +44,7 @@ STORY_DELIVERY_LIB_ONLY=1 source "$SCRIPT" \
 for fn in rig_gitdir git_in token_bounded subject_impl_scopes_bead \
           scan_commit_subject_for_bead task_reconciler_verdict \
           task_reconciler_failed_sha_resolved \
-          extract_gate_merge_info story_merge_verdict \
+          extract_gate_merge_info derive_rig_from_comments story_merge_verdict \
           gate_delivery_looks_partial task_reconciler_is_partial \
           refino_criteria_status_line; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by story-delivery.sh"; exit 1; }
@@ -250,6 +250,79 @@ fi
 # must not false-positive — e.g. a comment discussing gate-sha-failed (the sha
 # that FAILED, not what merged) in prose near an unrelated "merged to" phrase.
 rc1 extract_gate_merge_info "The bug ga-sb11i.2 has gate-sha-failed:8b612cf5eb42875c8080b65778d98c6ac64c5180 on a branch that never merged to gascity/main; sha=8b612cf5e is what FAILED, not what merged."
+
+# ── 5b. derive_rig_from_comments — rig-from-remote-name regression (ga-aqqj0) ─
+# Step 2 of the STORY delivery loop used to derive RIG from a SECOND, looser,
+# independently-drifted regex ("merged to [a-z_]+/main" + `head -1` over ALL
+# comment text) instead of delegating to extract_gate_merge_info above. That
+# regex had no "(sha=...)" anchor, so it also matched incidental HUMAN PROSE
+# that merely quoted a gate comment — and `head -1` (first match anywhere in
+# the story's history) let that earlier, incidental match shadow a later,
+# real, well-formed dispatcher comment naming the actual rig.
+#
+# Live shape (ga-dv2gk): a Mayor comment narrating what a DIFFERENT bot
+# (merged-bead-janitor) had written quoted 'code merged to origin/main —
+# commit-in-origin-main [...]' — "origin" is the git REMOTE name, never a
+# rig — and that quote arrived chronologically BEFORE the real gate-
+# dispatcher's "merged to gascity/main (sha=...)" comment. Under the old
+# regex+head-1, RIG resolved to "origin"; no runbook entry for it will ever
+# exist, so delivery HALTED every ~5min sweep forever (18 identical "no
+# deploy_cmd for rig 'origin'" comments in 1h, even though the story's real
+# fix was already merged to gascity's actual main).
+#
+# Verified empirically before this fix (not just reasoned about): feeding
+# REALISTIC_HISTORY below through the OLD inline logic
+# (`grep -oE "merged to [a-z_]+/main" | head -1`, verbatim from the pre-fix
+# script) resolves RIG to "origin" — the exact bug. This section pins the
+# FIXED behavior so that regression can never silently return.
+echo "── 5b. derive_rig_from_comments (rig-from-remote-name regression, ga-aqqj0) ──"
+
+# The false-positive shape alone: prose QUOTING a gate comment, with no
+# "(sha=...)" immediately after "origin/main". extract_gate_merge_info's own
+# sha anchor already refuses this — derive_rig_from_comments must inherit
+# that refusal (it delegates entirely, not a parallel regex).
+FALSE_POSITIVE_PROSE='REABERTA — o fechamento foi FALSO. O que aconteceu: as 20:06 o merged-bead-janitor fechou esta bead citando "code merged to origin/main — commit-in-origin-main [a43d1a267]".'
+rc1 derive_rig_from_comments "$FALSE_POSITIVE_PROSE"
+
+# The real-world sequence: false-positive-shaped prose FIRST (chronologically
+# earlier), a REAL well-formed gate-dispatcher comment SECOND — reproducing
+# ga-dv2gk's own comment order. The old head-1 regex picks the FIRST match
+# (the quoted "origin", proven above); the fix must pick the rig from the
+# LAST (real, authoritative, sha-anchored) match instead.
+REALISTIC_HISTORY="$FALSE_POSITIVE_PROSE
+Quality gate PASSED. Branch fix/ga-dv2gk-r4-loop merged to gascity/main (sha=69f30ad796c47067d580b525b09d99e96b6e2004) via autonomous dispatcher (gate_run=ga-oghk2)."
+eq "ga-dv2gk shape: derives the REAL rig, never the quoted remote name" \
+   "$(derive_rig_from_comments "$REALISTIC_HISTORY")" "gascity"
+
+# Sanity: a clean single well-formed comment still resolves correctly (no
+# regression on the common, non-adversarial case).
+eq "clean gate comment: derives rig" \
+   "$(derive_rig_from_comments "$REAL_COMMENT")" "gascity"
+
+# No merge comment at all → rc1, same fail-closed contract as
+# extract_gate_merge_info (never guess a rig from nothing).
+rc1 derive_rig_from_comments ""
+rc1 derive_rig_from_comments "Quality gate PASSED. Branch fix/x could not determine rig automatically."
+
+# DRIFT-GUARDS: guard the CALL SITE too, not just the function — this is the
+# exact class of regression this bug fixed (a correct helper existed
+# already, extract_gate_merge_info, but Step 2 didn't call it). A future edit
+# could silently reintroduce the old, looser parser inline even if this
+# function keeps working correctly in isolation.
+if grep -qE 'RIG=\$\(derive_rig_from_comments "\$_SD_COMMENTS"\)' "$SCRIPT" 2>/dev/null; then
+  ok "Step 2 rig-from-comment fallback calls derive_rig_from_comments (ga-aqqj0)"
+else
+  bad "Step 2 no longer calls derive_rig_from_comments — the ga-aqqj0 rig-from-remote-name bug may have regressed"
+fi
+# Strip comment-only lines first — this very section's own explanatory
+# comments quote the old pattern verbatim (so a reader can see what changed),
+# which would otherwise make this guard permanently fail against itself.
+# Only EXECUTABLE code containing the old pattern is a real regression.
+if grep -vE '^\s*#' "$SCRIPT" 2>/dev/null | grep -qE 'grep -oE "merged to \[a-z_\]\+/main"'; then
+  bad "the old ad hoc \"merged to [a-z_]+/main\" (no sha anchor, head -1) regex is back as LIVE CODE in story-delivery.sh — this IS the ga-aqqj0 bug"
+else
+  ok "the old ad hoc rig-from-comment regex is gone from live code"
+fi
 
 # ── 6. story_merge_verdict — real-git ancestor check (ga-mmdm2) ─────────────
 echo "── 6. story_merge_verdict (real-git ancestor check) ──"
