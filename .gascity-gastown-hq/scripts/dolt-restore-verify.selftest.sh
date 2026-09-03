@@ -84,16 +84,34 @@ echo "=== dolt-restore-verify.selftest.sh ==="
 # ════════════════════════════════════════════════════════════════════════════
 # 0. Environment export (ga-ymsl0 regression)
 # ════════════════════════════════════════════════════════════════════════════
-echo "── GC_CITY_PATH is exported so a child 'gc dolt sql' can discover the city ──"
+echo "── GC_CITY_PATH is exported (not just a local var) so a child 'gc dolt sql' inherits it ──"
 # Root cause (live, 2026-09-03): the hq one-shot verify runs under launchd
 # with no WorkingDirectory set, so CWD-based city auto-discovery fails and
 # gc's "dolt" pack-subcommand never registers — "gc dolt sql -q ..." then
 # fails in under a second, live_count comes back empty, and the run reports
-# SKIP(sem-baseline) even though Dolt itself is healthy. Exporting
-# GC_CITY_PATH (not just setting the local CITY var) fixes it regardless of
-# the caller's CWD. This is a hermetic sourcing-time check — FAKE_GC_BIN
-# doesn't care about env vars either way, so it can't mask a regression here.
-[ "$GC_CITY_PATH" = "$CITY" ] && ok "GC_CITY_PATH exported to match CITY, so child 'gc' invocations can discover the city with no CWD dependency" || bad "expected GC_CITY_PATH='$CITY', got '${GC_CITY_PATH:-<unset>}'"
+# SKIP(sem-baseline) even though Dolt itself is healthy.
+#
+# Testing this needs care: this dog agent's OWN shell (and therefore this
+# selftest's shell) already has GC_CITY_PATH exported globally via `gc
+# prime`. A same-shell check like `[ "$GC_CITY_PATH" = "$CITY" ]` would pass
+# even against the UNFIXED script, because CITY is merely READ from an
+# already-exported GC_CITY_PATH — the assignment on its own proves nothing
+# about whether the script re-exports it for a CHILD process. Only a real
+# process boundary distinguishes "exported" from "local var with the same
+# value" — which is exactly the boundary the real "gc dolt sql" call
+# crosses. So: start a subshell with GC_CITY_PATH genuinely UNSET (env -u,
+# not just unset — inheritance from a launchd-style clean environment, not
+# from this shell), source the script there, and inspect the export
+# attribute directly via `declare -p`. Against the unfixed script,
+# GC_CITY_PATH is never touched at all in that subshell, so `declare -p`
+# fails to find it (empty output) and the assertion below correctly fails —
+# proving this test does exercise the fix, not just its own shell's
+# inherited state.
+EXPORT_CHECK="$(env -u GC_CITY_PATH RESTORE_VERIFY_LIB=1 bash -c ". '$SCRIPT'; declare -p GC_CITY_PATH 2>/dev/null")"
+case "$EXPORT_CHECK" in
+  "declare -x GC_CITY_PATH="*) ok "GC_CITY_PATH is exported after sourcing, even starting from a subshell where it was completely unset ($EXPORT_CHECK)" ;;
+  *) bad "expected 'declare -x GC_CITY_PATH=...' (exported) from a clean subshell, got '${EXPORT_CHECK:-<empty - not set at all>}'" ;;
+esac
 
 # ════════════════════════════════════════════════════════════════════════════
 # 1. Pure functions
