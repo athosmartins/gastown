@@ -350,6 +350,22 @@ if [ -f "$RESOLVED_LATENCY" ] && [ -n "$NEW_LATENCY_THRESHOLD_S" ]; then
   else
     bad "a real ~200ms probe read back as ${MEASURED_MS}ms — outside the sane 100-3000ms band, something else is wrong"
   fi
+
+  # ── static drift-guard (ga-3bqak — 3rd occurrence of ga-ouqtg) ───────────────
+  # ── The runtime probe above only proves now_ms() has ms resolution on ────────
+  # ── THIS box, right now. On a GNU/Linux runner (native `date +%s%3N` works) ──
+  # ── it would keep passing even if the gdate/python3 fallback branches were ───
+  # ── silently stripped back to native-date-only, because they'd never be ──────
+  # ── exercised there — exactly how this regressed twice before without the ────
+  # ── selftest that ran on THAT box ever turning red. A text check on the ──────
+  # ── actual fallback chain catches the regression on every platform, ──────────
+  # ── regardless of which now_ms() branch the box running this selftest takes.
+  if grep -qF 'gdate +%s%3N' "$RESOLVED_LATENCY" \
+      && grep -qF "python3 -c 'import time; print(int(time.time()*1000))'" "$RESOLVED_LATENCY"; then
+    ok "now_ms() still has the gdate/python3 fallback chain, not just native date — see ga-3bqak"
+  else
+    bad "now_ms() is missing the gdate and/or python3 fallback — regressed to native-date-only (ga-ouqtg/ga-3bqak class); a BSD-date box without coreutils will silently degrade to whole-second resolution again"
+  fi
 else
   bad "skipping latency.sh arithmetic checks — resolved path missing or LATENCY_WARN_S extraction failed (see checks above)"
 fi
