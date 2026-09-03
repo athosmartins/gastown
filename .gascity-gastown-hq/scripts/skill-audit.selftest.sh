@@ -18,6 +18,10 @@
 #   9. uncommitted edit  — same city, but change is NOT committed        -> offpath>=1
 #  10. local-only commit — change IS committed, but never merged to origin/main
 #                          (ga-4rl78 gate finding)                      -> offpath>=1
+#  11. corrupted manifest— manifest file exists but fails to parse, even when
+#                          canonical is clean+merged (ga-aes6z gate #1) -> offpath>=1
+#  12. gitignored file   — uncommitted file matching .gitignore dropped into a
+#                          clean+merged canonical dir (ga-aes6z gate #2) -> offpath>=1
 #
 # Exit 0 iff every scenario behaves as expected.
 
@@ -287,6 +291,53 @@ git -C "$ROOT/city" commit -q -m "looks legit but never left my laptop"
 OUT="$(run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
 note "json: $OUT"
 [[ "$(json_field "$OUT" offpath_count)" -ge 1 ]] && ok "offpath flagged (committed but never merged to origin/main)" || bad "expected offpath>=1 -- a local-only commit must not be accepted as reviewed (ga-4rl78)"
+rm -rf "$ROOT"
+
+# ══ 11. corrupted manifest — must flag offpath even when clean+merged ═════════
+# Gate finding #1 (ga-aes6z, gate_run=ga-rx3mh): manifest_digest()'s blanket
+# `except Exception: print("")` made a corrupted/unparseable manifest.json
+# produce the SAME "" signal as "no entry at all". Pre-fix, canon being clean
+# + merged to origin/main (the normal steady state for most already-synced
+# skills) then silently accepted that ambiguous "" instead of flagging it —
+# a broken manifest file made off-path detection go silently green city-wide.
+# manifest_digest must print the distinct sentinel "ERROR" here, and the
+# caller must flag it unconditionally, never deferring to the git-merged path.
+scenario "corrupted manifest file -> always offpath, even when canonical is clean+merged"
+ROOT="$(mktemp -d)"
+git_fixture_with_origin "$ROOT"
+# Corrupt the manifest AFTER establishing a clean, merged baseline.
+printf '{not valid json...\n' > "$ROOT/city/.gc/state/skill-manifest.json"
+OUT="$(run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
+RC=$?
+note "json: $OUT"
+[[ "$(json_field "$OUT" offpath_count)" -ge 1 ]] && ok "offpath flagged (corrupted manifest, even though canonical is clean+merged)" || bad "expected offpath>=1 -- a corrupted manifest must not be silently accepted just because git says clean+merged"
+[[ "$RC" == "1" ]] && ok "exit 1" || bad "expected exit 1, got $RC"
+rm -rf "$ROOT"
+
+# ══ 12. uncommitted GITIGNORED file in canonical dir -> still offpath ═════════
+# Gate finding #2 (ga-aes6z, gate_run=ga-rx3mh): `git status --porcelain` is
+# gitignore-aware and never reports a file matching a .gitignore pattern, but
+# skilllib_tree_digest hashes every regular file under the dir via a raw
+# `find` with NO gitignore awareness. A direct, uncommitted, gitignored file
+# addition to the canonical dir therefore left `git status` reporting clean
+# while the live digest silently diverged from the manifest baseline — a
+# literal off-path, never-committed edit that the git-merged exemption used
+# to wave through. `git clean -ndx -d` (unlike status) reports ignored
+# untracked content too, so this must still fall through to offpath.
+scenario "uncommitted GITIGNORED file in canonical dir -> still offpath (git-status blind spot)"
+ROOT="$(mktemp -d)"
+git_fixture_with_origin "$ROOT"
+# Add + commit + push a .gitignore AFTER the clean+merged baseline so the
+# git-merged exemption is genuinely in play, then drop an uncommitted file
+# matching it straight into the canonical dir — never `git add`, ever.
+printf '*.local\n' > "$ROOT/city/.gitignore"
+git -C "$ROOT/city" add .gitignore
+git -C "$ROOT/city" commit -q -m "add gitignore"
+git -C "$ROOT/city" update-ref refs/remotes/origin/main "$(git -C "$ROOT/city" rev-parse HEAD)"
+printf 'off-path, never committed, matches .gitignore\n' > "$ROOT/city/skills/demo/sneaky.local"
+OUT="$(run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
+note "json: $OUT"
+[[ "$(json_field "$OUT" offpath_count)" -ge 1 ]] && ok "offpath flagged (gitignored uncommitted file in canonical dir)" || bad "expected offpath>=1 -- git status --porcelain is gitignore-aware but the tree digest is not; the gap must not be silently accepted as clean+merged"
 rm -rf "$ROOT"
 
 # ── Summary ───────────────────────────────────────────────────────────────────

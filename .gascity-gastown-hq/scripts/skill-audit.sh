@@ -139,6 +139,23 @@ canon_merged_to_origin_main() {
     local status_out
     status_out="$(git -C "$toplevel" status --porcelain -- "$dir" 2>/dev/null)" || return 1
     [[ -z "$status_out" ]] || return 1
+    # `git status --porcelain` is gitignore-aware: it never reports a file
+    # that matches a .gitignore pattern, even when that file is uncommitted
+    # and sitting directly in $dir. skilllib_tree_digest (what canon_digest
+    # is built from) has no such awareness — it hashes every regular file
+    # under $dir via a raw `find`, ignored or not. Those two facts combine
+    # into a real bypass (ga-aes6z gate review): drop an uncommitted,
+    # gitignored file straight into the canonical dir and `git status` still
+    # reports clean while the live digest silently diverges from the
+    # manifest baseline. `git clean -ndx -d` closes the gap — unlike status,
+    # it reports ALL untracked content including ignored files/dirs, so any
+    # such addition fails this check and falls through to the manifest-only
+    # off-path flag below, same as any other unreviewed edit. Same
+    # fail-closed contract as the status call above: a failed clean call
+    # returns false rather than being mistaken for "nothing to report".
+    local clean_out
+    clean_out="$(git -C "$toplevel" clean -ndx -d -- "$dir" 2>/dev/null)" || return 1
+    [[ -z "$clean_out" ]] || return 1
     # HEAD must already be part of origin/main's history — actually pushed and
     # merged, not just committed to a local/unpushed branch. Any failure here
     # (no origin/main ref at all, detached weirdness, HEAD not an ancestor)
@@ -211,7 +228,16 @@ PY
 }
 
 # ── Manifest lookup (off-path baseline) ───────────────────────────────────────
-# manifest_digest <skill> — prints the recorded tree digest for a skill, or empty.
+# manifest_digest <skill> — prints the recorded tree digest for a skill.
+# Prints "" when the manifest (or this skill's entry in it) genuinely doesn't
+# exist — "never went through skill-deploy.sh", which the git-merged
+# exemption in audit_skill is allowed to override. Prints the literal string
+# "ERROR" when the manifest FILE exists but couldn't be read/parsed (corrupt
+# JSON, I/O error, permission denied, ...): that case must never collapse
+# into the same "" bucket, because a corrupted manifest tells us nothing
+# about this skill's real deploy history and can't be used as grounds to
+# skip the off-path flag no matter what git says (ga-aes6z gate review — a
+# broken manifest file used to make off-path detection go silently green).
 manifest_digest() {
     [[ -f "$MANIFEST" ]] || { echo ""; return; }
     MANIFEST="$MANIFEST" python3 - "$1" <<'PY'
@@ -221,7 +247,7 @@ try:
     with open(os.environ["MANIFEST"]) as f:
         m = json.load(f)
 except Exception:
-    print("")
+    print("ERROR")
     sys.exit(0)
 entry = (m.get("skills") or {}).get(skill) or {}
 print(entry.get("tree_digest", ""))
@@ -264,7 +290,11 @@ audit_skill() {
     # --- off-path check vs manifest ---
     local mdigest
     mdigest="$(manifest_digest "$name")"
-    if [[ -z "$mdigest" ]]; then
+    if [[ "$mdigest" == "ERROR" ]]; then
+        # Ambiguous by construction (see manifest_digest) — never let the
+        # git-merged exemption paper over a manifest we can't even read.
+        add_offpath "$name" "manifest at $MANIFEST is unreadable/corrupted — cannot verify off-path status"
+    elif [[ -z "$mdigest" ]]; then
         if canon_merged_to_origin_main "$canon"; then
             info "  (no manifest entry, but canonical is merged to origin/main — accepted as official path)"
         else
