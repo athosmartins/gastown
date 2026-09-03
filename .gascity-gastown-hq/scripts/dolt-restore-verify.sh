@@ -25,6 +25,19 @@
 set -uo pipefail
 
 CITY="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
+# Export (not just a local var): "$GC_BIN dolt sql" below needs GC_CITY_PATH
+# in ITS OWN environment to discover the city. Without this, gc falls back to
+# CWD-based auto-discovery — fine interactively, but this script also runs
+# under launchd (ga-jz7gg's hq-restore-verify-once.sh, 03:17 one-shot), where
+# a plist with no WorkingDirectory leaves CWD at launchd's default (not under
+# the city tree). With no city discoverable, gc's "dolt" pack-subcommand
+# never registers at all, so "gc dolt sql -q ..." fails in under a second
+# with a root-command usage error on stderr — swallowed by the 2>/dev/null
+# below — and live_count comes back empty, indistinguishable from a genuine
+# Dolt outage. Root-caused live 2026-09-03 (ga-ymsl0): hq's one-shot run
+# reported SKIP(sem-baseline) even though Dolt itself was healthy throughout;
+# reproduced by running this exact query with GC_CITY_PATH unset and CWD=/.
+export GC_CITY_PATH="$CITY"
 BACKUP_ROOT="${GC_BACKUP_ARTIFACT_DIR:-$CITY/.dolt-backup}"
 DOLTDIR="$CITY/.beads/dolt"
 LOG="${RESTORE_VERIFY_LOG:-$CITY/.gc/logs/dolt-restore-verify.log}"

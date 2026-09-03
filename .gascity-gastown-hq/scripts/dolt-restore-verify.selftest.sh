@@ -82,6 +82,20 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
 echo "=== dolt-restore-verify.selftest.sh ==="
 
 # ════════════════════════════════════════════════════════════════════════════
+# 0. Environment export (ga-ymsl0 regression)
+# ════════════════════════════════════════════════════════════════════════════
+echo "── GC_CITY_PATH is exported so a child 'gc dolt sql' can discover the city ──"
+# Root cause (live, 2026-09-03): the hq one-shot verify runs under launchd
+# with no WorkingDirectory set, so CWD-based city auto-discovery fails and
+# gc's "dolt" pack-subcommand never registers — "gc dolt sql -q ..." then
+# fails in under a second, live_count comes back empty, and the run reports
+# SKIP(sem-baseline) even though Dolt itself is healthy. Exporting
+# GC_CITY_PATH (not just setting the local CITY var) fixes it regardless of
+# the caller's CWD. This is a hermetic sourcing-time check — FAKE_GC_BIN
+# doesn't care about env vars either way, so it can't mask a regression here.
+[ "$GC_CITY_PATH" = "$CITY" ] && ok "GC_CITY_PATH exported to match CITY, so child 'gc' invocations can discover the city with no CWD dependency" || bad "expected GC_CITY_PATH='$CITY', got '${GC_CITY_PATH:-<unset>}'"
+
+# ════════════════════════════════════════════════════════════════════════════
 # 1. Pure functions
 # ════════════════════════════════════════════════════════════════════════════
 echo "── _avail_gb (real filesystem — /System/Volumes/Data must exist on macOS CI) ──"
