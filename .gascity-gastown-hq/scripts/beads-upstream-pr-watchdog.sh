@@ -43,9 +43,14 @@
 #     alerts: once alerted for a given PR#, no repeat until a bead appears
 #     (resolved) or disappears again (re-alertable).
 #   - On transition to MERGED or CLOSED (without merging): comments on EVERY
-#     mapped tracker bead and mails the Mayor. Merge means the next step
-#     (engine rebuild+swap) needs his coordination; a close-without-merge
-#     means a human should decide whether to resubmit.
+#     mapped tracker bead and mails the Mayor. A close-without-merge means a
+#     human should decide whether to resubmit. A merge means engine
+#     rebuild+swap MAY be needed — ga-6ur6h: the alert now checks (via `gh pr
+#     diff --name-only`) whether the PR actually touches compiled Go source
+#     (*.go/go.mod/go.sum) before claiming Mayor coordination is required; a
+#     PR that only touches scripts/docs/test-infra says so instead. A failed
+#     check (network/auth/etc.) defaults to the stronger claim — see
+#     _pr_touches_compiled_go.
 #   - A PR observed for the FIRST time (no prior state) that is ALREADY
 #     merged/closed also alerts immediately — "no prior baseline" must not be
 #     silently folded into "nothing changed"; those are different states (see
@@ -171,6 +176,38 @@ classify_pr_transition() {
   esac
 }
 
+# _pr_touches_compiled_go <pr_num> -> 0 (touches, or undetermined — fail
+#                                        safe/escalate) | 1 (diff fetched
+#                                        successfully and touches no
+#                                        compiled Go source)
+# ga-6ur6h: the watchdog used to claim "Next step (engine rebuild+swap)
+# needs Mayor coordination" for EVERY merged upstream PR, unconditionally —
+# including one that only touched scripts/migration-test/ + lib/*.sh (test
+# infra, ported to darwin/arm64, zero cmd/gc or cmd/bd change). Checked by
+# file extension/name (*.go, go.mod, go.sum) rather than a directory
+# whitelist (cmd/, internal/, ...): gastownhall/beads' compiled runtime
+# spans many top-level packages (backend/, beadserrors/, format/,
+# issueops/, journalops/, memoryops/, plugins/, query_interfaces*,
+# root-level *.go files) beyond just cmd/+internal/, and a directory
+# whitelist would need to track that set as the upstream repo evolves — an
+# extension check doesn't, and can't silently go stale the way a whitelist
+# would. Any command failure (network, auth, gh missing at sweep time, repo
+# access) is treated as "touches" — silently downgrading a real engine
+# change to "nothing to do" is a worse failure than one extra alert.
+_pr_touches_compiled_go() {
+  local pr_num="$1" files rc
+  files=$(gh pr diff "$pr_num" --repo "$GH_REPO" --name-only 2>>"$LOG")
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "WARN: gh pr diff --name-only failed for PR #$pr_num (rc=$rc) — cannot determine whether it touches compiled Go sources; defaulting to touches=yes (fail safe)"
+    return 0
+  fi
+  if printf '%s\n' "$files" | grep -qE '(^|/)go\.(mod|sum)$|\.go$'; then
+    return 0
+  fi
+  return 1
+}
+
 # _alert_merge / _alert_closed_no_merge take a NEWLINE-separated "bead\tcity"
 # list (one PR can have several tracker beads) and comment on every one, plus
 # a single Mayor mail. Both return 0 only if EVERY notification channel
@@ -179,7 +216,11 @@ classify_pr_transition() {
 # — see the state-advance comment below for why that distinction matters.
 _alert_merge() {
   local pr_num="$1" url="$2" pairs="$3" msg ok=0 bead_id bead_city
-  msg="beads-upstream-pr-watchdog (ga-574zr/ga-se0ly): upstream PR $url (gastownhall/beads #$pr_num, author $GH_AUTHOR) is now MERGED. Next step (engine rebuild+swap) needs Mayor coordination — this bead does not close itself."
+  if _pr_touches_compiled_go "$pr_num"; then
+    msg="beads-upstream-pr-watchdog (ga-574zr/ga-se0ly): upstream PR $url (gastownhall/beads #$pr_num, author $GH_AUTHOR) is now MERGED. Next step (engine rebuild+swap) needs Mayor coordination — this bead does not close itself."
+  else
+    msg="beads-upstream-pr-watchdog (ga-574zr/ga-se0ly/ga-6ur6h): upstream PR $url (gastownhall/beads #$pr_num, author $GH_AUTHOR) is now MERGED, but its diff touches no compiled Go source (no *.go/go.mod/go.sum files) — looks like test/docs/script infra only, no engine work expected. This bead does not close itself; confirm and close if there is nothing further to do."
+  fi
   while IFS=$'\t' read -r bead_id bead_city; do
     [ -z "$bead_id" ] && continue
     printf '%s' "$msg" | "$BD_BIN" -C "$bead_city" comment "$bead_id" --stdin >>"$LOG" 2>&1 \

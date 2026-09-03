@@ -74,6 +74,19 @@ echo "OPEN" > "$GH_FIXTURE_STATE"
 cat > "$TMP/gh" <<'STUB'
 #!/usr/bin/env bash
 { printf 'CALL:'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; } >> "$GH_CALLS_LOG"
+
+# `gh pr diff <n> --repo ... --name-only` (ga-6ur6h): default to a file that
+# touches compiled Go source, so every PR fixture in THIS stub keeps today's
+# "touches" classification unless a test explicitly overrides it via
+# GH_DIFF_FIXTURE_DIR (see Part 2.9) — none of the PRs defined below exist to
+# test this check specifically, so their behavior must not change.
+if [ "$1" = "pr" ] && [ "$2" = "diff" ]; then
+  pr_num="$3"
+  fixture="${GH_DIFF_FIXTURE_DIR:-/nonexistent}/$pr_num.txt"
+  if [ -f "$fixture" ]; then cat "$fixture"; else echo "cmd/bd/main.go"; fi
+  exit 0
+fi
+
 state="$(cat "$GH_FIXTURE_STATE" 2>/dev/null || echo OPEN)"
 merged_at="null"
 [ "$state" = "MERGED" ] && merged_at='"2026-08-09T20:00:00Z"'
@@ -416,6 +429,90 @@ unset BD_CITY_FAIL
 run_sweep
 eq "once WA recovers, 7001 still correctly shows no orphan alert (it IS tracked)" \
   "$(grep -c 'pull/7001' "$GC_CALLS_LOG" || true)" "0"
+
+# ── Part 2.9: merge alert differentiates by whether the PR touches compiled
+# Go source (ga-6ur6h). Before this fix, EVERY merged PR got the same "Next
+# step (engine rebuild+swap) needs Mayor coordination" claim regardless of
+# what it actually changed — a real incident: a PR that only touched
+# scripts/migration-test/ + lib/*.sh (test infra) got the same urgent
+# wording as a real cmd/bd change. Proves three cases: a non-Go diff must
+# NOT claim an engine rebuild is needed; a real .go diff must keep the
+# original (stronger) wording; and an UNDETERMINED diff (gh pr diff itself
+# fails) must fail SAFE to the stronger wording, not silently suppress.
+echo ""
+echo "== merge alert differentiates by whether the PR touches compiled Go source =="
+
+export GH_DIFF_FIXTURE_DIR="$TMP/gh-diff-fixtures"
+mkdir -p "$GH_DIFF_FIXTURE_DIR"
+printf 'scripts/migration-test/corpus/v1.sql\ndocs/README.md\nlib/versions.sh\n' > "$GH_DIFF_FIXTURE_DIR/8001.txt"
+printf 'cmd/bd/main.go\ndocs/README.md\n' > "$GH_DIFF_FIXTURE_DIR/8002.txt"
+# 8003 deliberately gets NO fixture file — combined with the stub below
+# always failing pr-diff calls for it, this simulates `gh pr diff` itself
+# erroring (network/auth/rate-limit), not a real empty diff.
+export GH_DIFF_FAIL_PRS="8003"
+export GH_DIFF_STATE="$TMP/gh-diff-state"
+echo "OPEN" > "$GH_DIFF_STATE"
+
+cat > "$TMP/gh" <<'STUB'
+#!/usr/bin/env bash
+{ printf 'CALL:'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; } >> "$GH_CALLS_LOG"
+
+if [ "$1" = "pr" ] && [ "$2" = "diff" ]; then
+  pr_num="$3"
+  if printf '%s\n' "${GH_DIFF_FAIL_PRS:-}" | grep -qx "$pr_num"; then
+    echo "gh: pull request diff failed (simulated)" >&2
+    exit 1
+  fi
+  fixture="${GH_DIFF_FIXTURE_DIR:-/nonexistent}/$pr_num.txt"
+  [ -f "$fixture" ] && cat "$fixture"
+  exit 0
+fi
+
+state="$(cat "$GH_DIFF_STATE" 2>/dev/null || echo OPEN)"
+merged_at="null"
+[ "$state" = "MERGED" ] && merged_at='"2026-08-09T20:00:00Z"'
+cat <<JSON
+[
+  {"number": 8001, "state": "$state", "mergedAt": $merged_at, "url": "https://github.com/gastownhall/beads/pull/8001", "title": "test infra only"},
+  {"number": 8002, "state": "$state", "mergedAt": $merged_at, "url": "https://github.com/gastownhall/beads/pull/8002", "title": "real engine change"},
+  {"number": 8003, "state": "$state", "mergedAt": $merged_at, "url": "https://github.com/gastownhall/beads/pull/8003", "title": "diff lookup fails"}
+]
+JSON
+STUB
+chmod +x "$TMP/gh"
+
+write_bd_fixture "$CITY_HQ" "$(cat "$BD_FIXTURE_DIR/$(sanitize_path "$CITY_HQ").json" | jq -c '. + [{"id":"ga-8001-tracker","status":"open","labels":["waiting-on:pr-8001"]},{"id":"ga-8002-tracker","status":"open","labels":["waiting-on:pr-8002"]},{"id":"ga-8003-tracker","status":"open","labels":["waiting-on:pr-8003"]}]')"
+
+: > "$BD_CALLS_LOG"; : > "$GC_CALLS_LOG"; : > "$BUPW_LOG"
+run_sweep   # baseline: all three OPEN, first-seen -> no alert yet, just recorded
+
+echo "MERGED" > "$GH_DIFF_STATE"
+: > "$BD_CALLS_LOG"; : > "$GC_CALLS_LOG"
+run_sweep
+
+body_8001="$(grep 'ga-8001-tracker' "$BD_CALLS_LOG" | sed -n 's/.*STDIN=\[\(.*\)\]$/\1/p')"
+body_8002="$(grep 'ga-8002-tracker' "$BD_CALLS_LOG" | sed -n 's/.*STDIN=\[\(.*\)\]$/\1/p')"
+body_8003="$(grep 'ga-8003-tracker' "$BD_CALLS_LOG" | sed -n 's/.*STDIN=\[\(.*\)\]$/\1/p')"
+
+case "$body_8001" in
+  *"engine rebuild+swap"*) bad "8001 (non-Go diff: scripts/docs/lib only) must NOT claim engine rebuild+swap is needed: $body_8001" ;;
+  *"no engine work expected"*) ok "8001 (non-Go diff) correctly signals no engine work expected" ;;
+  *) bad "8001 message missing expected 'no engine work expected' phrasing: $body_8001" ;;
+esac
+
+case "$body_8002" in
+  *"engine rebuild+swap"*"needs Mayor coordination"*) ok "8002 (touches cmd/bd/main.go) correctly keeps the engine rebuild+swap / needs Mayor coordination wording" ;;
+  *) bad "8002 (real .go change) should still claim engine rebuild+swap needed: $body_8002" ;;
+esac
+
+case "$body_8003" in
+  *"engine rebuild+swap"*"needs Mayor coordination"*) ok "8003 (gh pr diff failed — undetermined) fails SAFE to the engine rebuild+swap wording" ;;
+  *) bad "8003 (undetermined diff) should fail safe to engine rebuild+swap wording, not silently suppress: $body_8003" ;;
+esac
+
+grep -q "gh pr diff --name-only failed for PR #8003" "$BUPW_LOG" \
+  && ok "8003's gh-diff lookup failure is logged, not silent" \
+  || bad "no WARN log line for 8003's gh pr diff failure: $(cat "$BUPW_LOG")"
 
 # ── Part 3: single-instance lock (ga-y0g5x pattern) ─────────────────────────
 echo ""
