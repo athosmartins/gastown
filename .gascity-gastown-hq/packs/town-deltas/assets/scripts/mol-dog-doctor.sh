@@ -161,6 +161,50 @@ newest_backup_mtime_for_db() {
     printf '%s\n' "$newest_mtime"
 }
 
+# db_last_commit_epoch <db_name> — live query, epoch seconds of the db's newest
+# dolt_log commit (integer; CAST ... AS SIGNED drops the sub-second fraction
+# UNIX_TIMESTAMP() returns for Dolt's ms-precision `date` column, which bash's
+# integer `-le`/`-gt` tests below cannot parse). Empty output on any failure
+# (unreachable server, missing db) — dolt_sql() is already bounded, and stderr
+# is discarded same as every other dolt_sql call in this script.
+db_last_commit_epoch() {
+    db_name="$1"
+    dolt_sql -r csv -q "SELECT CAST(UNIX_TIMESTAMP(date) AS SIGNED) FROM \`$db_name\`.dolt_log ORDER BY date DESC LIMIT 1" 2>/dev/null | tail -1
+}
+
+# backup_should_warn <backup_mtime> <now_s> <stale_s> <db_last_commit_epoch>
+# Pure predicate (ga-ddwyw) — unit-tested by mol-dog-doctor.selftest.sh.
+#
+# CALL DOLT_BACKUP('sync') is INCREMENTAL: with no new commit since the last
+# sync there is nothing to push, so it reports OK and writes zero bytes — the
+# backup artifact's mtime never advances. An idle db (no writes for days) was
+# therefore ALARMING FOREVER, every cycle, forever unresolvable by construction
+# — the age-vs-now check answered "when did we last write the backup file",
+# never "is the backup caught up with the source", the only question that
+# actually matters. Measured live: 7 of 12 city databases stale by this
+# definition in one report, each idle (not broken) — see ga-ddwyw.
+#
+# Fix: a backup with no db commit newer than itself is fully current NO MATTER
+# HOW OLD its mtime is — skip straight to "not stale" (return 1). Only once
+# there IS a newer commit does elapsed time matter at all, and then the
+# age-vs-now-vs-threshold check is exactly what ran before this fix.
+#
+# db_last_commit_epoch empty/non-numeric (the live query failed — transient
+# Dolt hiccup, not "definitely no newer commit") falls through to the
+# age-only check instead of silently clearing the warning: an unmeasured
+# commit-recency must never LOOK LIKE a measured all-clear (same "erro e
+# vazio nao podem produzir o mesmo valor" discipline as CONN_MAX/ORPHAN_COUNT
+# elsewhere in this script) — only a positively measured "no newer commit"
+# may suppress the alarm.
+backup_should_warn() {
+    local backup_mtime="$1" now_s="$2" stale_s="$3" db_last_commit_epoch="$4"
+    case "$db_last_commit_epoch" in
+        ''|*[!0-9]*) ;;  # unmeasured — fall through to the age-only check
+        *) [ "$db_last_commit_epoch" -le "$backup_mtime" ] && return 1 ;;
+    esac
+    [ $((now_s - backup_mtime)) -gt "$stale_s" ]
+}
+
 append_backup_stale() {
     backup_stale_item="$1"
     if [ -n "$BACKUP_STALE_ITEMS" ]; then
@@ -446,8 +490,9 @@ if [ -n "$BACKUP_ELIGIBLE_DBS" ]; then
                 append_backup_stale "$db backup missing"
                 continue
             fi
-            BACKUP_AGE=$((NOW_S - NEWEST_BACKUP_MTIME))
-            if [ "$BACKUP_AGE" -gt "$BACKUP_STALE_S" ]; then
+            DB_LAST_COMMIT_EPOCH=$(db_last_commit_epoch "$db")
+            if backup_should_warn "$NEWEST_BACKUP_MTIME" "$NOW_S" "$BACKUP_STALE_S" "$DB_LAST_COMMIT_EPOCH"; then
+                BACKUP_AGE=$((NOW_S - NEWEST_BACKUP_MTIME))
                 append_backup_stale "$db backup is $((BACKUP_AGE / 3600))h old"
             fi
         done

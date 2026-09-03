@@ -121,6 +121,122 @@ else
   bad "new threshold (${NEW_THRESHOLD}s) does not even clear 24h — will still false-positive near the daily boundary"
 fi
 
+# ── ga-ddwyw: backup_should_warn() — the age-vs-now check above answers "when
+# ── did we last WRITE the backup file", never "is the backup CAUGHT UP with
+# ── the source" — the only question that matters. CALL DOLT_BACKUP('sync') is
+# ── incremental and writes NOTHING when there is no new commit to push, so an
+# ── idle db's backup mtime freezes forever even though the backup already has
+# ── everything: 7 of 12 real city databases were reported stale by this
+# ── definition in one report, every one idle, none actually behind. Same
+# ── style as the rest of this file: extract the REAL pure function from the
+# ── shipped script and drive it with the actual reported shape, don't
+# ── hand-copy the arithmetic.
+echo "── backup freshness: commit-recency gate (ga-ddwyw) ──"
+
+if grep -qE '^db_last_commit_epoch\(\)' "$SCRIPT" && grep -qE '^backup_should_warn\(\)' "$SCRIPT"; then
+  ok "db_last_commit_epoch()/backup_should_warn() are defined in the shipped script"
+else
+  bad "db_last_commit_epoch()/backup_should_warn() missing from the shipped script"
+fi
+
+# ── drift-guard: the backup-freshness loop must actually call both new ───────
+# ── functions and gate the alarm on backup_should_warn(), not the bare ───────
+# ── age-vs-threshold comparison this replaces.
+if grep -qF 'DB_LAST_COMMIT_EPOCH=$(db_last_commit_epoch "$db")' "$SCRIPT" \
+    && grep -qF 'if backup_should_warn "$NEWEST_BACKUP_MTIME" "$NOW_S" "$BACKUP_STALE_S" "$DB_LAST_COMMIT_EPOCH"; then' "$SCRIPT"; then
+  ok "backup-freshness loop is gated by backup_should_warn(), fed by db_last_commit_epoch()"
+else
+  bad "backup-freshness loop no longer appears gated by backup_should_warn() — the commit-recency fix may have been bypassed"
+fi
+if grep -qF 'BACKUP_AGE=$((NOW_S - NEWEST_BACKUP_MTIME))' "$SCRIPT"; then
+  ok "reported age (for the alarm text) is still computed from NEWEST_BACKUP_MTIME, unchanged by the gate"
+else
+  bad "could not confirm BACKUP_AGE is still computed the same way — check the alarm text by hand"
+fi
+
+BACKUP_FN_SNIPPET="$(mktemp)"
+sed -n '/^backup_should_warn()/,/^}/p' "$SCRIPT" > "$BACKUP_FN_SNIPPET"
+if [ -s "$BACKUP_FN_SNIPPET" ]; then
+  # shellcheck disable=SC1090
+  source "$BACKUP_FN_SNIPPET"
+  if command -v backup_should_warn >/dev/null 2>&1; then
+    # Fixed reference "now" for reproducible fixtures (no live clock).
+    T_NOW=1788400000
+    T_BACKUP_83H=$((T_NOW - 83 * 3600))                        # the exact ga-ddwyw reported age
+    T_COMMIT_18D_BEFORE_BACKUP=$((T_BACKUP_83H - 18 * 86400))  # idle db: last commit long BEFORE the backup captured it
+
+    # Falsifying check: the EXACT reported false positive — an idle db (no
+    # commit since long before the backup last ran) at the EXACT reported
+    # age (83h) — must NOT warn now, no matter how old the mtime is.
+    if backup_should_warn "$T_BACKUP_83H" "$T_NOW" "$NEW_THRESHOLD" "$T_COMMIT_18D_BEFORE_BACKUP"; then
+      bad "idle db, 83h backup age, commit 18d before the backup STILL warns — the ga-ddwyw bug is not fixed"
+    else
+      ok "idle db, 83h backup age, commit 18d before the backup does not warn — the ga-ddwyw bug is fixed"
+    fi
+
+    # Sanity: the age-only fallback (commit-recency unmeasured — empty arg)
+    # DOES warn for this exact scenario. This is the literal old behavior
+    # (age vs. threshold, nothing else) — confirms (a) the reproduction above
+    # is real, not a vacuous always-false, and (b) an unmeasured commit-
+    # recency never silently suppresses a real alarm.
+    if backup_should_warn "$T_BACKUP_83H" "$T_NOW" "$NEW_THRESHOLD" ""; then
+      ok "sanity: same 83h age with UNMEASURED commit-recency (empty) still warns — confirms the reproduction is real and unmeasured never suppresses"
+    else
+      bad "sanity check failed: 83h age with unmeasured commit-recency does not warn — either the reproduction is wrong or unmeasured is silently suppressing"
+    fi
+    # Same sanity for a non-numeric (garbage query output) commit-recency.
+    if backup_should_warn "$T_BACKUP_83H" "$T_NOW" "$NEW_THRESHOLD" "notanumber"; then
+      ok "non-numeric commit-recency (garbage/failed query) still warns at 83h — invalid input falls back to age-only, never silently suppresses"
+    else
+      bad "non-numeric commit-recency suppressed the 83h alarm — invalid input must fall back to age-only, not silently clear"
+    fi
+
+    # ACEITE (cheaper-alternative acceptance criterion, per the bead): a db
+    # WITH a commit newer than what the backup captured, and stale by age,
+    # MUST still warn.
+    T_COMMIT_AFTER_BACKUP=$((T_BACKUP_83H + 3600))  # landed 1h after the backup ran — genuinely uncaptured
+    if backup_should_warn "$T_BACKUP_83H" "$T_NOW" "$NEW_THRESHOLD" "$T_COMMIT_AFTER_BACKUP"; then
+      ok "db WITH a newer uncaptured commit, 83h backup age, still warns — genuine staleness is still caught"
+    else
+      bad "db WITH a newer uncaptured commit, 83h backup age, does NOT warn — fix over-corrected into silence (ACEITE violated)"
+    fi
+
+    # Boundary: commit epoch exactly equal to the backup mtime — the backup
+    # captured exactly that commit, must count as "no newer commit" (<=, not <).
+    if backup_should_warn "$T_BACKUP_83H" "$T_NOW" "$NEW_THRESHOLD" "$T_BACKUP_83H"; then
+      bad "commit epoch exactly equal to backup mtime still warns — boundary should count as 'no newer commit'"
+    else
+      ok "commit epoch exactly equal to backup mtime does not warn — equal counts as captured, not newer"
+    fi
+
+    # Non-regression: a healthy, recent backup (2h old, well under threshold)
+    # with a newer commit must still not warn — age is what gates the alarm
+    # once there IS a newer commit, unchanged from before this fix.
+    T_BACKUP_2H=$((T_NOW - 2 * 3600))
+    if backup_should_warn "$T_BACKUP_2H" "$T_NOW" "$NEW_THRESHOLD" "$T_NOW"; then
+      bad "a healthy 2h-old backup with a just-landed newer commit warns — age threshold non-regression broken"
+    else
+      ok "a healthy 2h-old backup with a just-landed newer commit does not warn — non-regression holds"
+    fi
+
+    # Non-regression: the genuinely-stale 40h fixture used elsewhere in this
+    # file, now WITH a newer uncaptured commit, must still warn (same shape
+    # as the real hq/whatsapp_automation incident cited in ga-ddwyw, where the
+    # backup was actually behind, not just idle).
+    T_BACKUP_40H=$((T_NOW - GENUINELY_STALE_AGE_S))
+    if backup_should_warn "$T_BACKUP_40H" "$T_NOW" "$NEW_THRESHOLD" "$T_NOW"; then
+      ok "genuinely stale backup (40h) WITH a newer uncaptured commit still warns — a truly broken/behind backup is still caught"
+    else
+      bad "genuinely stale backup (40h) WITH a newer uncaptured commit does NOT warn — real staleness would go silent"
+    fi
+  else
+    bad "backup_should_warn() extracted but not callable after sourcing — extraction produced invalid bash"
+  fi
+else
+  bad "could not extract backup_should_warn() source from $SCRIPT — sed range matched nothing"
+fi
+rm -f "$BACKUP_FN_SNIPPET"
+
 # ── order override: exec/interval unchanged from the embedded order — this ───
 # ── fix is scoped to the threshold + sourcing only, not the check cadence ────
 if [ -f "$ORDER_TOML" ] && grep -qF 'exec = "$PACK_DIR/assets/scripts/mol-dog-doctor.sh"' "$ORDER_TOML" \
