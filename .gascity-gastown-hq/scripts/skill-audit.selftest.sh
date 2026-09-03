@@ -22,6 +22,9 @@
 #                          canonical is clean+merged (ga-aes6z gate #1) -> offpath>=1
 #  12. gitignored file   — uncommitted file matching .gitignore dropped into a
 #                          clean+merged canonical dir (ga-aes6z gate #2) -> offpath>=1
+#  13. wrong-shape manifest — manifest parses as valid JSON but isn't an
+#                          object ([], null, {"skills":"oops"}), even when
+#                          clean+merged (ga-aes6z gate re-review, attempt 3) -> offpath>=1
 #
 # Exit 0 iff every scenario behaves as expected.
 
@@ -339,6 +342,34 @@ OUT="$(run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.js
 note "json: $OUT"
 [[ "$(json_field "$OUT" offpath_count)" -ge 1 ]] && ok "offpath flagged (gitignored uncommitted file in canonical dir)" || bad "expected offpath>=1 -- git status --porcelain is gitignore-aware but the tree digest is not; the gap must not be silently accepted as clean+merged"
 rm -rf "$ROOT"
+
+# ══ 13. valid-JSON-but-wrong-shape manifest -> ERROR sentinel, still offpath ══
+# Gate re-review (ga-aes6z, fix attempt 3): scenario 11 proves syntactically
+# INVALID JSON (`{not valid json...`) is caught. But the old manifest_digest
+# only wrapped the file-open + json.load in try/except — the lookup
+# `(m.get("skills") or {}).get(skill)` sat OUTSIDE it. A manifest that parses
+# as valid JSON but isn't shaped as an object at the top level (clobbered to
+# `[]` or `null`) or has a non-dict "skills" value (`{"skills": "oops"}`)
+# raised an uncaught AttributeError in the python3 subprocess, which exited
+# non-zero having printed NOTHING to stdout — bash then read mdigest="",
+# indistinguishable from "no manifest entry", the legitimate case the
+# git-merged exemption is allowed to wave through. Every already-synced,
+# clean+merged skill then silently read as offpath_count=0 even though its
+# manifest could not be traversed at all: the exact incident class ga-aes6z
+# exists to prevent, just a shape one step to the side of what scenario 11
+# exercises (a same-class corruption that must not slip through this time).
+for BAD_MANIFEST in '[]' 'null' '{"skills": "oops"}'; do
+    scenario "manifest is valid JSON but wrong shape ($BAD_MANIFEST) -> ERROR sentinel, still offpath"
+    ROOT="$(mktemp -d)"
+    git_fixture_with_origin "$ROOT"
+    printf '%s' "$BAD_MANIFEST" > "$ROOT/city/.gc/state/skill-manifest.json"
+    OUT="$(run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
+    RC=$?
+    note "json: $OUT"
+    [[ "$(json_field "$OUT" offpath_count)" -ge 1 ]] && ok "offpath flagged (manifest=$BAD_MANIFEST, even though canonical is clean+merged)" || bad "expected offpath>=1 -- valid-JSON-wrong-shape manifest ($BAD_MANIFEST) must not be silently accepted just because git says clean+merged"
+    [[ "$RC" == "1" ]] && ok "exit 1 (manifest=$BAD_MANIFEST)" || bad "expected exit 1, got $RC (manifest=$BAD_MANIFEST)"
+    rm -rf "$ROOT"
+done
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo

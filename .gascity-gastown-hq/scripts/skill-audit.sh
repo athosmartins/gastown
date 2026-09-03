@@ -232,12 +232,16 @@ PY
 # Prints "" when the manifest (or this skill's entry in it) genuinely doesn't
 # exist — "never went through skill-deploy.sh", which the git-merged
 # exemption in audit_skill is allowed to override. Prints the literal string
-# "ERROR" when the manifest FILE exists but couldn't be read/parsed (corrupt
-# JSON, I/O error, permission denied, ...): that case must never collapse
-# into the same "" bucket, because a corrupted manifest tells us nothing
-# about this skill's real deploy history and can't be used as grounds to
-# skip the off-path flag no matter what git says (ga-aes6z gate review — a
-# broken manifest file used to make off-path detection go silently green).
+# "ERROR" when the manifest FILE exists but couldn't be read/parsed OR
+# couldn't be traversed as the expected {"skills": {<name>: {...}}} shape —
+# corrupt JSON, I/O error, permission denied, or valid JSON clobbered to the
+# wrong top-level type ([], null, or a non-dict "skills"/entry value, e.g.
+# {"skills": "oops"}): all of that must never collapse into the same ""
+# bucket, because a manifest we can't read or can't shape-match tells us
+# nothing about this skill's real deploy history and can't be used as
+# grounds to skip the off-path flag no matter what git says (ga-aes6z gate
+# review, fix attempts 1 and 3 — a broken or wrong-shaped manifest file used
+# to make off-path detection go silently green city-wide either way).
 manifest_digest() {
     [[ -f "$MANIFEST" ]] || { echo ""; return; }
     MANIFEST="$MANIFEST" python3 - "$1" <<'PY'
@@ -246,11 +250,12 @@ skill = sys.argv[1]
 try:
     with open(os.environ["MANIFEST"]) as f:
         m = json.load(f)
+    entry = (m.get("skills") or {}).get(skill) or {}
+    digest = entry.get("tree_digest", "")
 except Exception:
     print("ERROR")
     sys.exit(0)
-entry = (m.get("skills") or {}).get(skill) or {}
-print(entry.get("tree_digest", ""))
+print(digest)
 PY
 }
 
