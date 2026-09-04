@@ -225,6 +225,22 @@ DELIVERY_COOLDOWN_SEC = int(os.environ.get("TSW_DELIVERY_COOLDOWN_SEC", "10800")
 GHOST_SLOT_MIN_BEADS = int(os.environ.get("TSW_GHOST_SLOT_MIN_BEADS", "1"))
 GHOST_SLOT_CONFIRM_SWEEPS = int(os.environ.get("TSW_GHOST_SLOT_CONFIRM_SWEEPS", "2"))
 GHOST_SLOT_COOLDOWN_SEC = int(os.environ.get("TSW_GHOST_SLOT_COOLDOWN_SEC", "10800"))  # 3h
+# ga-k18kh: inflight-reclaim-guard.py already auto-heals this EXACT condition
+# (story:in-flight, no live session) on its own RECLAIM_TTL (25min) hysteresis
+# — but before this knob, ghost-slot could confirm and page the Mayor as
+# early as ~30min after a bead went ghost (GHOST_SLOT_CONFIRM_SWEEPS=2 x
+# POLL_SEC=1800s), a window close enough to the guard's own TTL that the
+# Mayor was repeatedly paged and hand-reclaimed beads the guard was about to
+# fix on its own (measured 2026-09-04: wa-370w1, wa-w51ja, wa-xa1xb all
+# self-healed minutes after a manual reclaim). See ghost_slot_signal()'s own
+# ga-k18kh comment block for how this margin is applied (per-bead, reading
+# the guard's OWN stranded-clock — never a blind uniform delay, since a bead
+# shape the guard never reclaims must keep alerting on the old fast schedule).
+# 600s (10min) puts the combined threshold at 35min — the upper end of the
+# bead's own suggested 30-35min range — giving the guard's ~5min poll
+# cadence room to act after crossing its TTL before this watchdog treats the
+# auto-heal as having failed.
+GHOST_SLOT_HEAL_MARGIN_SEC = int(os.environ.get("TSW_GHOST_SLOT_HEAL_MARGIN_SEC", "600"))
 # Mirrors pilot-dispatcher.sh's MAX_SMALL/MAX_BIG defaults (5/2) — an
 # INDEPENDENT knob (this daemon has its own launchd job/env, not the Pilot's),
 # used only to frame the escalation's capacity-cost line. Keep in sync with
@@ -368,6 +384,7 @@ _bd_marker_for_bead = None     # (root, bead_id) -> ("found"|"absent"|"error", m
 _bd_sling_state = None         # (sling_id) -> ("live"|"stale"|"absent"|"error", stall_hours|None); None = run bd (ga-ebm7c)
 _branch_recent = None          # (bead_id) -> bool; None-seam = run reclaim_liveness.get_branch_recent (ga-nxgxz)
 _active_sessions = None        # () -> list[dict]|None (None=probe failed); None-seam = run reclaim_liveness.list_active_sessions (ga-nxgxz)
+_read_reclaim_guard_state = None  # () -> dict|None; None-seam = read RECLAIM_GUARD_STATE_FILE (ga-k18kh)
 _do_dolt_cpu = None            # () -> float pct or None; None = run ps (ga-g0v96 headroom annotation)
 _do_notify = None              # (msg, prio) -> None; None = run notify binary
 _do_mail_mayor = None          # (subject, body) -> bool; None = run gc mail
@@ -1601,6 +1618,56 @@ def _tick_delivery(now, state):
     return True
 
 
+# ga-k18kh: path to inflight-reclaim-guard.py's own per-bead stranded-clock
+# state (its STATE_FILE, resolved the same way — relative to CITY — since
+# both daemons' plists set WorkingDirectory to CITY). Read-only from here;
+# TSW never writes it.
+RECLAIM_GUARD_STATE_FILE = os.path.join(CITY, ".gc/state/inflight-reclaim-guard.json")
+
+
+def _load_reclaim_guard_state():
+    """Read inflight-reclaim-guard.py's persisted per-bead stranded-clock
+    state (ga-k18kh). Returns {} on any read/parse error or missing file —
+    fail-open, so a bad read never makes a bead look like the guard is
+    healing it (that would create a NEW blind spot; see ghost_slot_signal's
+    ga-k18kh comment block for the direction this must fail in)."""
+    if _read_reclaim_guard_state is not None:
+        state = _read_reclaim_guard_state()
+    else:
+        try:
+            with open(RECLAIM_GUARD_STATE_FILE) as f:
+                state = json.load(f)
+        except Exception:
+            state = None
+    return state if isinstance(state, dict) else {}
+
+
+def _guard_stranded_secs(entry, now):
+    """Seconds represented by one inflight-reclaim-guard.py state `entry`
+    (a dict keyed by bead id, or anything falsy/absent), or None if the
+    guard has no active stranded-clock for it.
+
+    ga-k18kh: the guard only sets/keeps `first_seen_stranded` on an entry
+    while ITS OWN is_currently_stranded is True — i.e. NOT gate:needs-human,
+    NOT gate-resident (dispatching marker), NOT a deliberately-suspended
+    owner, and NOT backed by a recent branch commit (see that file's
+    is_currently_stranded computation, just above its "Update stranded
+    timestamp" comment). So an entry's presence is exactly "the guard is
+    actively counting this bead toward its own RECLAIM_TTL reclaim", and its
+    absence is exactly "the guard will not auto-heal this on its own, for a
+    reason this watchdog does not need to re-derive". None is the fail-open
+    value for every caller — no entry, an entry without
+    `first_seen_stranded`, or a non-numeric value must all read as "the
+    guard cannot heal this by itself", never the reverse: a false None only
+    makes ghost-slot MORE eager to alert, never blind to a real ghost."""
+    if not isinstance(entry, dict):
+        return None
+    started = entry.get("first_seen_stranded")
+    if not isinstance(started, (int, float)) or isinstance(started, bool):
+        return None
+    return max(0.0, now - started)
+
+
 # ── ga-0f420: ghost-slot signal ───────────────────────────────────────────────
 def ghost_slot_signal(now):
     """Returns (ghost_count, ghost_sample, occupancy) for story:in-flight beads
@@ -1633,11 +1700,22 @@ def ghost_slot_signal(now):
     (fail-open — "no live sessions found" is NOT the same as "confirmed no
     live session", see [[error-and-empty-must-not-produce-the-same-value]]),
     returns (None, [], {}) — never a false alert.
+
+    ga-k18kh: a bead that would otherwise be a ghost is EXCLUDED from the
+    count (and logged, not silently dropped) while inflight-reclaim-guard.py
+    is still within its own RECLAIM_TTL + GHOST_SLOT_HEAL_MARGIN_SEC window
+    for it — see _guard_stranded_secs' docstring for exactly how that's
+    read from the guard's own state file. A bead the guard is NOT tracking
+    (no entry — including every "permanent hold" shape the guard itself
+    exempts: needs-human, dispatching marker, suspended owner, recent
+    branch) falls straight through to this function's pre-fix behavior, so
+    no ghost shape newly goes blind because of this margin.
     Test seam: reuses _bd_delivery(rig_root) (same story:in-flight population
     delivery_signal() reads — Pilot sets story:in-flight on dispatch, so both
     dimensions are reading the identical bd label), _active_sessions(),
-    _bd_marker_for_bead (via _queued_marker_state), and _bd_sling_state (via
-    _sling_bead_state) — no new seam needed."""
+    _bd_marker_for_bead (via _queued_marker_state), _bd_sling_state (via
+    _sling_bead_state), and _read_reclaim_guard_state (via
+    _load_reclaim_guard_state, ga-k18kh)."""
     beads_by_id = {}
     root_by_id = {}
     at_least_one_success = False
@@ -1692,6 +1770,11 @@ def ghost_slot_signal(now):
     ghosts = []
     lane_total = {"small": 0, "big": 0}
     lane_ghost = {"small": 0, "big": 0}
+    # ga-k18kh: read once per sweep (the guard's state file is small and this
+    # loop may see several ghost candidates) rather than per-bead.
+    guard_state = _load_reclaim_guard_state()
+    heal_threshold = reclaim_liveness.RECLAIM_TTL + GHOST_SLOT_HEAL_MARGIN_SEC
+    healing_skipped = []
     for bid, b in beads_by_id.items():
         root = root_by_id[bid]
         raw_labels = b.get("labels") or b.get("label") or []
@@ -1750,9 +1833,21 @@ def ghost_slot_signal(now):
 
         assignee = b.get("assignee") or ""
         if not reclaim_liveness.session_is_live(assignee, sessions, now):
+            # ga-k18kh: give the reclaim-guard's own TTL+margin a chance
+            # before counting this as an escalation-worthy ghost — see
+            # _guard_stranded_secs' docstring for the fail-open contract.
+            guard_secs = _guard_stranded_secs(guard_state.get(bid), now)
+            if guard_secs is not None and guard_secs < heal_threshold:
+                healing_skipped.append(bid)
+                continue
             ghosts.append({"id": bid, "title": (b.get("title") or b.get("name") or "?")[:80],
                            "assignee": assignee or "(nenhum)", "lane": lane})
             lane_ghost[lane] = lane_ghost.get(lane, 0) + 1
+
+    if healing_skipped:
+        _log("ghost_slot_signal: %d bead(s) excluded — still within the "
+             "reclaim-guard's own TTL+margin (%ds): %s" % (
+                 len(healing_skipped), heal_threshold, ", ".join(healing_skipped)))
 
     occupancy = {"lane_total": lane_total, "lane_ghost": lane_ghost}
     return len(ghosts), ghosts[:5], occupancy
@@ -2410,7 +2505,7 @@ def _selftest():
     global _read_pilot_log_lines, _read_gate_log_lines, _git_log_count
     global _bd_backlog, _bd_delivery, _do_mail_mayor, _do_notify, _do_dolt_probe
     global _suspended_rigs, _bd_marker_for_bead, _do_dolt_cpu, _bd_sling_state
-    global _branch_recent, _active_sessions
+    global _branch_recent, _active_sessions, _read_reclaim_guard_state
 
     ok_count = [0]
     fail_count = [0]
@@ -2525,6 +2620,11 @@ def _selftest():
     # scenarios below override these explicitly to exercise "live"/"unknown".
     _branch_recent = lambda bead_id: False
     _active_sessions = lambda: []
+    # ga-k18kh: hermetic default — the guard has no active stranded-clock for
+    # any bead, so every existing GS scenario below (which predate this knob)
+    # resolves exactly as before: _guard_stranded_secs always sees None and
+    # never suppresses. Overridden explicitly in the ga-k18kh GS8/GS9 scenarios.
+    _read_reclaim_guard_state = lambda: {}
     # imp24: heal disabled by default so existing scenarios are not affected.
     _do_heal_throughput = None   # overridden in P/Q scenarios
     # imp12: quota check stubbed as available by default
@@ -4191,6 +4291,68 @@ def _selftest():
     else:
         _bad("GS7: cooldown should suppress ghost-slot re-escalation", str(notify_calls))
 
+    # ── GS8: ga-k18kh — a ghost the reclaim-guard is ACTIVELY counting down
+    # (its state file carries a recent first_seen_stranded for this bead)
+    # must NOT escalate before RECLAIM_TTL + GHOST_SLOT_HEAL_MARGIN_SEC have
+    # elapsed on the GUARD's own clock — even across multiple TSW sweeps that
+    # would otherwise have confirmed it — and must resume normal escalation
+    # once genuinely past that window (the guard failed to heal it). ────────
+    print("\nga-k18kh Scenario GS8: guard's own stranded-clock still within "
+          "TTL+margin → suppressed for 2 sweeps, then escalates once overdue")
+    _bd_delivery = lambda root: [_ghost_bead("wa-gs8", minutes_ago=5)]
+    _active_sessions = lambda: []
+    _read_reclaim_guard_state = lambda: {"wa-gs8": {"first_seen_stranded": NOW - 60}}
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)             # guard-elapsed=60s — well within 2100s threshold
+    run_tick(NOW + 1800, st)      # guard-elapsed=1860s — still within threshold
+    if st.get("ghost_pending", 0) == 0 and not notify_calls:
+        _ok("GS8a: 2 sweeps while still within the guard's TTL+margin → not "
+            "counted at all (ghost_pending stays 0, no notify)")
+    else:
+        _bad("GS8a", "ghost_pending=%d notifies=%d" % (st.get("ghost_pending", 0), len(notify_calls)))
+    run_tick(NOW + 3600, st)      # guard-elapsed=3660s — now past the 2100s threshold
+    if st.get("ghost_pending", 0) == 1 and not notify_calls:
+        _ok("GS8b: first sweep past the guard's TTL+margin → counted (pending=1), "
+            "no escalation yet (GHOST_SLOT_CONFIRM_SWEEPS still needs a 2nd)")
+    else:
+        _bad("GS8b", "ghost_pending=%d notifies=%d" % (st.get("ghost_pending", 0), len(notify_calls)))
+    run_tick(NOW + 5400, st)      # 2nd consecutive sweep past threshold
+    ghost_notifies_gs8 = [n for n in notify_calls if "GHOST" in n[0].upper()]
+    ghost_mails_gs8 = [m for m in mail_calls if "GHOST" in m[0].upper()]
+    if ghost_notifies_gs8 and ghost_mails_gs8 and "wa-gs8" in ghost_mails_gs8[0][1]:
+        _ok("GS8c: escalates once genuinely past the guard's own TTL+margin — "
+            "the auto-heal window really did run out")
+    else:
+        _bad("GS8c", "notifies=%d mails=%d" % (len(ghost_notifies_gs8), len(ghost_mails_gs8)))
+
+    # ── GS9: ga-k18kh — a guard state ENTRY exists for the bead but carries no
+    # first_seen_stranded (the guard's own shape for "holding this bead for a
+    # reason unrelated to plain TTL wait" — needs-human / suspended owner /
+    # dispatching marker / recent branch, see is_currently_stranded). This
+    # must NOT be treated as "still healing" — the guard will never fix it on
+    # its own, so ghost-slot keeps alerting on the pre-fix fast schedule.
+    # Proves the margin never introduces a blind spot for a ghost shape the
+    # guard doesn't cover. ────────────────────────────────────────────────
+    print("\nga-k18kh Scenario GS9: guard entry present but NOT on the "
+          "stranded-clock (e.g. needs-human/suspended/recent-branch on the "
+          "guard's side) → no blind spot, escalates on the old fast schedule")
+    _bd_delivery = lambda root: [_ghost_bead("wa-gs9", minutes_ago=5)]
+    _read_reclaim_guard_state = lambda: {"wa-gs9": {"last_assignee": "someone"}}
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    run_tick(NOW + 1800, st)
+    ghost_notifies_gs9 = [n for n in notify_calls if "GHOST" in n[0].upper()]
+    ghost_mails_gs9 = [m for m in mail_calls if "GHOST" in m[0].upper()]
+    if ghost_notifies_gs9 and ghost_mails_gs9 and "wa-gs9" in ghost_mails_gs9[0][1]:
+        _ok("GS9: a guard entry without first_seen_stranded is treated exactly "
+            "like no entry at all — escalates within the normal 2-sweep window, "
+            "no new blind spot introduced by the ga-k18kh margin")
+    else:
+        _bad("GS9", "notifies=%d mails=%d" % (len(ghost_notifies_gs9), len(ghost_mails_gs9)))
+    _read_reclaim_guard_state = lambda: {}   # restore default
+
     # restore hermetic defaults so nothing here leaks past this block
     _bd_delivery = lambda root: []
     _active_sessions = lambda: []
@@ -4208,6 +4370,7 @@ def _selftest():
     _do_dolt_probe        = None
     _do_heal_throughput   = None
     _suspended_rigs       = None
+    _read_reclaim_guard_state = None
     gate_queue_backlog._bd_gate_queue_markers = None
     gate_queue_backlog._read_gate_log_lines = None
     globals()["_do_check_quota"] = None
