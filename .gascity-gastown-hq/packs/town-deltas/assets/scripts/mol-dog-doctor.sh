@@ -163,13 +163,27 @@ newest_backup_mtime_for_db() {
 
 # db_last_commit_epoch <db_name> — live query, epoch seconds of the db's newest
 # dolt_log commit (integer; CAST ... AS SIGNED drops the sub-second fraction
-# UNIX_TIMESTAMP() returns for Dolt's ms-precision `date` column, which bash's
-# integer `-le`/`-gt` tests below cannot parse). Empty output on any failure
-# (unreachable server, missing db) — dolt_sql() is already bounded, and stderr
-# is discarded same as every other dolt_sql call in this script.
+# a ms-precision `date` column carries, which bash's integer `-le`/`-gt`
+# tests below cannot parse). Empty output on any failure (unreachable
+# server, missing db) — dolt_sql() is already bounded, and stderr is
+# discarded same as every other dolt_sql call in this script.
+#
+# ga-gh8mb: uses TIMESTAMPDIFF(SECOND, epoch, date), NOT UNIX_TIMESTAMP(date).
+# dolt_log.date is already UTC, but UNIX_TIMESTAMP() interprets a naive
+# datetime string as being in the SESSION's time zone (@@time_zone=SYSTEM,
+# which on this city's server resolves to @@system_time_zone=-03) and
+# converts it to epoch from there — double-converting an already-UTC value
+# and adding a spurious +10800s (3h). That inflated "last commit epoch" past
+# an already-current backup's mtime, making backup_should_warn() think an
+# ALREADY-CAPTURED commit was newer than the backup (proven false by
+# `dolt backup restore` on the live staging dir showing the identical HEAD),
+# which fell through into the age-only branch and grew a "backup is Nh old"
+# alarm forever for a backup that was never behind. TIMESTAMPDIFF computes a
+# pure calendar difference against a literal UTC epoch with no session-tz
+# reinterpretation, so it is correct regardless of @@system_time_zone.
 db_last_commit_epoch() {
     db_name="$1"
-    dolt_sql -r csv -q "SELECT CAST(UNIX_TIMESTAMP(date) AS SIGNED) FROM \`$db_name\`.dolt_log ORDER BY date DESC LIMIT 1" 2>/dev/null | tail -1
+    dolt_sql -r csv -q "SELECT CAST(TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', date) AS SIGNED) FROM \`$db_name\`.dolt_log ORDER BY date DESC LIMIT 1" 2>/dev/null | tail -1
 }
 
 # backup_should_warn <backup_mtime> <now_s> <stale_s> <db_last_commit_epoch>

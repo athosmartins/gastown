@@ -139,6 +139,108 @@ else
   bad "db_last_commit_epoch()/backup_should_warn() missing from the shipped script"
 fi
 
+# ── ga-gh8mb: db_last_commit_epoch() must be timezone-agnostic. Dolt's
+# ── dolt_log.date column is UTC already, but this server's @@time_zone=SYSTEM
+# ── resolves to @@system_time_zone=-03 (this city's real value) — under that
+# ── session tz, MySQL/Dolt's UNIX_TIMESTAMP(date) interprets the naive UTC
+# ── string AS IF it were already -03 local and converts it AGAIN, adding a
+# ── spurious +10800s (3h). Measured live on the real bug (gastown,
+# ── 2026-09-04): UNIX_TIMESTAMP() returned 1788318993 for a commit `dolt log`
+# ── itself displays (tz-aware, "-0300") as epoch 1788308193 — exactly
+# ── +10800s off. That pushed a commit the backup had ALREADY captured
+# ── (verified via `dolt backup restore` on the live staging dir — same HEAD
+# ── commit hash present) to appear newer than the backup's mtime, tripping
+# ── backup_should_warn()'s age-check branch and growing the "Nh old" alarm
+# ── forever. Independently reproduced on lexbh (also named in ga-gh8mb):
+# ── same +10800s exactly. Fix: TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00',
+# ── date) computes a pure calendar difference with no timezone
+# ── reinterpretation — verified live to match `dolt log`'s own tz-aware
+# ── output exactly, on both affected DBs.
+echo "── db_last_commit_epoch() timezone correctness (ga-gh8mb) ──"
+
+DB_COMMIT_FN_TEXT=$(sed -n '/^db_last_commit_epoch()/,/^}/p' "$SCRIPT")
+if printf '%s' "$DB_COMMIT_FN_TEXT" | grep -qF "TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', date)"; then
+  ok "db_last_commit_epoch() uses TIMESTAMPDIFF (timezone-agnostic), not session-tz-sensitive UNIX_TIMESTAMP"
+else
+  bad "db_last_commit_epoch() does not use TIMESTAMPDIFF — the ga-gh8mb timezone double-conversion bug may have regressed"
+fi
+if printf '%s' "$DB_COMMIT_FN_TEXT" | grep -qF 'UNIX_TIMESTAMP(date)'; then
+  bad "db_last_commit_epoch() still contains a bare UNIX_TIMESTAMP(date) call — the ga-gh8mb bug has regressed"
+else
+  ok "db_last_commit_epoch() no longer calls bare UNIX_TIMESTAMP(date)"
+fi
+
+# ── pure-bash reproduction of the exact bug arithmetic (hermetic — no live
+# ── Dolt needed). This is the SAME misinterpretation a MySQL-family engine
+# ── performs: parsing an already-UTC naive datetime string as if it were in
+# ── the session's local timezone. Driven by the EXACT live-measured fixture
+# ── (gastown's real commit, 2026-09-04) instead of a synthetic one, so this
+# ── falsifies against the real incident, not a made-up shape.
+parse_epoch_in_tz() {
+  # BSD/macOS date -j first, GNU date -d fallback (portable across platforms
+  # — same dual-form precaution as now_ms()'s gdate/python3 chain elsewhere
+  # in this file).
+  local tz="$1" naive="$2"
+  TZ="$tz" date -j -f "%Y-%m-%d %H:%M:%S" "$naive" +%s 2>/dev/null \
+    || TZ="$tz" date -d "$naive" +%s 2>/dev/null
+}
+FIXTURE_UTC_NAIVE="2026-09-02 00:16:33"     # dolt_log.date's raw string (already UTC)
+EXPECTED_CORRECT_EPOCH=1788308193            # matches `dolt log` CLI's own tz-aware "-0300" display
+BUGGY_EPOCH=$(parse_epoch_in_tz "America/Sao_Paulo" "$FIXTURE_UTC_NAIVE")
+CORRECT_EPOCH=$(parse_epoch_in_tz "UTC" "$FIXTURE_UTC_NAIVE")
+
+if [ -n "$BUGGY_EPOCH" ] && [ -n "$CORRECT_EPOCH" ]; then
+  if [ "$BUGGY_EPOCH" -eq $((EXPECTED_CORRECT_EPOCH + 10800)) ]; then
+    ok "sanity: reproducing UNIX_TIMESTAMP()'s SYSTEM-tz misinterpretation on the real fixture yields exactly +10800s over the correct epoch — confirms this reproduces the real ga-gh8mb bug"
+  else
+    bad "sanity check failed: buggy-interpretation reproduction ($BUGGY_EPOCH) is not exactly +10800s over the expected correct epoch ($EXPECTED_CORRECT_EPOCH) — the reproduction itself may be wrong"
+  fi
+  if [ "$CORRECT_EPOCH" -eq "$EXPECTED_CORRECT_EPOCH" ]; then
+    ok "TIMESTAMPDIFF-equivalent (UTC-naive) interpretation of the real fixture matches dolt log's own tz-aware output ($EXPECTED_CORRECT_EPOCH)"
+  else
+    bad "UTC-naive interpretation ($CORRECT_EPOCH) does not match the expected correct epoch ($EXPECTED_CORRECT_EPOCH) — fixture or platform date behavior mismatch"
+  fi
+else
+  bad "could not reproduce the timezone arithmetic on this platform (BSD 'date -j' and GNU 'date -d' both unavailable?) — skipping ga-gh8mb arithmetic sanity"
+fi
+
+# ── best-effort LIVE verification against the real Dolt server, if reachable
+# ── right now. Uses fixed literal constants (never real dolt_log data, so
+# ── this stays stable regardless of what commits exist in any given city) —
+# ── the strongest possible proof, but non-fatal so the suite stays runnable
+# ── without a live Dolt (same "best-effort, never required" spirit as this
+# ── file's other live-server touches, e.g. nudge_deacon_done's `|| true`).
+LIVE_DOLT_PORT="$(awk '/^listener:/{f=1} f&&/port:/{print $2; exit}' "${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}/.gc/runtime/packs/dolt/dolt-config.yaml" 2>/dev/null)"
+case "${LIVE_DOLT_PORT:-}" in ''|*[!0-9]*) LIVE_DOLT_PORT="" ;; esac
+if [ -n "$LIVE_DOLT_PORT" ] && DOLT_CLI_PASSWORD='' timeout 5 dolt --host 127.0.0.1 --port "$LIVE_DOLT_PORT" --user root --no-tls sql -q "SELECT 1" >/dev/null 2>&1; then
+  LIVE_UNIX_TS=$(DOLT_CLI_PASSWORD='' timeout 5 dolt --host 127.0.0.1 --port "$LIVE_DOLT_PORT" --user root --no-tls sql -r csv -q "SELECT CAST(UNIX_TIMESTAMP('$FIXTURE_UTC_NAIVE') AS SIGNED)" 2>/dev/null | tail -1)
+  LIVE_TS_DIFF=$(DOLT_CLI_PASSWORD='' timeout 5 dolt --host 127.0.0.1 --port "$LIVE_DOLT_PORT" --user root --no-tls sql -r csv -q "SELECT CAST(TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', '$FIXTURE_UTC_NAIVE') AS SIGNED)" 2>/dev/null | tail -1)
+  case "${LIVE_TS_DIFF:-}" in
+    "$EXPECTED_CORRECT_EPOCH")
+      ok "LIVE: server's TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', ...) on the real fixture matches the expected correct epoch ($EXPECTED_CORRECT_EPOCH)"
+      ;;
+    *[0-9]*)
+      bad "LIVE: server's TIMESTAMPDIFF result ($LIVE_TS_DIFF) does not match the expected correct epoch ($EXPECTED_CORRECT_EPOCH)"
+      ;;
+    *)
+      echo "  SKIP: live TIMESTAMPDIFF query returned no usable result — skipping live verification"
+      ;;
+  esac
+  case "${LIVE_UNIX_TS:-}" in
+    "$EXPECTED_CORRECT_EPOCH")
+      echo "  INFO: this server's UNIX_TIMESTAMP() is timezone-clean (matches correct epoch directly) — the ga-gh8mb double-conversion may not reproduce on this box's tz config, but the fix is tz-agnostic either way"
+      ;;
+    *[0-9]*)
+      ok "LIVE: server's bare UNIX_TIMESTAMP() on the real fixture reproduces the double-conversion (got $LIVE_UNIX_TS, expected $EXPECTED_CORRECT_EPOCH) — confirms db_last_commit_epoch() must avoid it, exactly as this fix does"
+      ;;
+    *)
+      echo "  SKIP: live UNIX_TIMESTAMP query returned no usable result"
+      ;;
+  esac
+else
+  echo "  SKIP: no live Dolt server reachable — skipping live ga-gh8mb verification (static + arithmetic checks above still apply)"
+fi
+
 # ── drift-guard: the backup-freshness loop must actually call both new ───────
 # ── functions and gate the alarm on backup_should_warn(), not the bare ───────
 # ── age-vs-threshold comparison this replaces.
