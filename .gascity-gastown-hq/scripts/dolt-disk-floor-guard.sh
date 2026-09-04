@@ -640,7 +640,26 @@ main() {
     fi
 
     log "class=${class} was_critical=${was_critical}: avail=${avail}GB (warn=${FLOOR_WARN_GB}GB crit=${FLOOR_CRITICAL_GB}GB) — notifying"
-    "$NOTIFY" -t "Dolt disk-floor guard" -p "$prio" "🚨 [${class}] Dolt data-dir avail=${avail}GB, vm_swap=${vm_gb:-unknown}GB — ${diagnosis}. See ga-gpzr." 2>/dev/null || true
+    # ga-ff6t9: notify's own content classifier (classify_route_detail(), in
+    # whatsapp_automation/scripts/notify) decides push-vs-digest from MESSAGE
+    # WORDING, not from -p/priority — this exact CRITICAL message ("avail=2GB
+    # ... Dolt data-dir ...") was measured (2026-09-04 disk-full incident, and
+    # reproduced via NOTIFY_ROUTE_TEST=1) to match none of its push rules and
+    # fall to the muted hourly digest despite -p 5, silencing the guard at the
+    # one moment (Dolt about to die of ENOSPC) it must reach the phone
+    # regardless of Dolt's own health. NOTIFY_FORCE_PUSH=1 is notify's
+    # documented, Dolt-independent escape hatch for a caller that already
+    # knows the message must page — the same mechanism escalate_emergency.py
+    # uses for its 3 sanctioned classes. Scoped to was_critical (not the
+    # recomputed `class`, which a reclaim can already move back to WARN — see
+    # the CRITICAL->WARN scenario in the selftest): only the guaranteed-page
+    # tier forces delivery; ordinary WARN keeps using notify's normal
+    # cooldown/content-routing path.
+    if [ "$was_critical" = "1" ]; then
+      NOTIFY_FORCE_PUSH=1 "$NOTIFY" -t "Dolt disk-floor guard" -p "$prio" "🚨 [${class}] Dolt data-dir avail=${avail}GB, vm_swap=${vm_gb:-unknown}GB — ${diagnosis}. See ga-gpzr." 2>/dev/null || true
+    else
+      "$NOTIFY" -t "Dolt disk-floor guard" -p "$prio" "🚨 [${class}] Dolt data-dir avail=${avail}GB, vm_swap=${vm_gb:-unknown}GB — ${diagnosis}. See ga-gpzr." 2>/dev/null || true
+    fi
     if [ "$was_critical" = "1" ]; then
       # ga-q4cqr sustain-guard: require CRITICAL_MAIL_SUSTAIN consecutive
       # CRITICAL cycles before mailing the Mayor — debounces a single

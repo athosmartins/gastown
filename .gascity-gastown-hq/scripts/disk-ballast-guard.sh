@@ -115,7 +115,16 @@ _notify_critical() {
 Top ofensores (ultima hora):
 $offenders"
   fi
-  "$(_notify_bin)" -k disk-warn -p 5 "$msg" 2>/dev/null
+  # ga-ff6t9: same content-based-routing bug as dolt-disk-floor-guard.sh (see
+  # its notify call for the full writeup) — measured live via NOTIFY_ROUTE_TEST=1:
+  # this guard's own "LASTRO QUEIMADO" message matches none of notify's push
+  # allowlist rules and silently falls to the muted digest despite -p 5, even
+  # though this function is BY DESIGN this guard's final alarm before real
+  # ENOSPC (only ever called from the CRITICAL case in main() — never for
+  # UNKNOWN/MID/HEALTHY). NOTIFY_FORCE_PUSH=1 is notify's documented,
+  # Dolt-independent escape hatch; unconditional here is correct because this
+  # whole function exists only for that one guaranteed-page case.
+  NOTIFY_FORCE_PUSH=1 "$(_notify_bin)" -k disk-warn -p 5 "$msg" 2>/dev/null
 }
 
 # _top_offenders <roots (space-separated)> <n> <timeout_secs> → up to <n> lines

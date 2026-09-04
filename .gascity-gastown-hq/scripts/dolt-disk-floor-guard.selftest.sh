@@ -482,9 +482,16 @@ _reap_dead_transcripts() { REAP_TRANSCRIPT_CALLS=$((REAP_TRANSCRIPT_CALLS+1)); }
 REAP_LOGS_CALLS=0
 _reap_growing_logs() { REAP_LOGS_CALLS=$((REAP_LOGS_CALLS+1)); }
 
-NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""
+NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""
 record_notify() {
   NOTIFY_CALLS=$((NOTIFY_CALLS+1))
+  # ga-ff6t9: capture whether THIS call was force-pushed (env var set only
+  # for the duration of this function call by the SUT's own
+  # `NOTIFY_FORCE_PUSH=1 "$NOTIFY" ...` prefix — verified empirically that a
+  # bash env-var prefix on a function call IS visible inside it and reverts
+  # after). Read fresh every call so a later non-forced call doesn't inherit
+  # a stale "1" from an earlier one.
+  NOTIFY_LAST_FORCE_PUSH="${NOTIFY_FORCE_PUSH:-}"
   while [ $# -gt 0 ]; do
     case "$1" in
       -p) NOTIFY_LAST_PRIO="$2"; shift 2 ;;
@@ -517,7 +524,7 @@ record_gc() {
 # shellcheck disable=SC2034  # read by main() in the sourced script
 GC=record_gc
 
-reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; }
+reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; }
 seed_state() {
   if [ -n "$1" ]; then echo "$1" > "$STATE_EPOCH_FILE"; else rm -f "$STATE_EPOCH_FILE"; fi
   if [ -n "$2" ]; then echo "$2" > "$STATE_AVAIL_FILE"; else rm -f "$STATE_AVAIL_FILE"; fi
@@ -541,10 +548,10 @@ read_critical_sustain_state() { [ -f "$STATE_CRITICAL_SUSTAIN_FILE" ] && cat "$S
 reset_capture; seed_state "" ""; seed_critical_sustain ""
 queue_avail 2 20
 main
-if [ "$NOTIFY_CALLS" = "1" ] && [ "$NOTIFY_LAST_PRIO" = "5" ] && [ "$GC_MAIL_CALLS" = "0" ] && [ "$(read_critical_sustain_state)" = "1" ]; then
-  ok "main(): CRITICAL avail fully recovered by reclaim still notifies (prio 5); mail debounced (pending 1/2)"
+if [ "$NOTIFY_CALLS" = "1" ] && [ "$NOTIFY_LAST_PRIO" = "5" ] && [ "$GC_MAIL_CALLS" = "0" ] && [ "$(read_critical_sustain_state)" = "1" ] && [ "$NOTIFY_LAST_FORCE_PUSH" = "1" ]; then
+  ok "main(): CRITICAL avail fully recovered by reclaim still notifies (prio 5, force-push); mail debounced (pending 1/2)"
 else
-  bad "main(): CRITICAL->NONE recovery — notify/debounce wrong (notify_calls=$NOTIFY_CALLS prio=$NOTIFY_LAST_PRIO mail_calls=$GC_MAIL_CALLS pending=$(read_critical_sustain_state))"
+  bad "main(): CRITICAL->NONE recovery — notify/debounce/force-push wrong (notify_calls=$NOTIFY_CALLS prio=$NOTIFY_LAST_PRIO mail_calls=$GC_MAIL_CALLS pending=$(read_critical_sustain_state) force_push='$NOTIFY_LAST_FORCE_PUSH')"
 fi
 if grep -q "vm_swap_gb=7" "$LOG" 2>/dev/null; then
   ok "main(): logs vm_swap_gb as its own metric line every cycle, not just on breach (ga-sfj3i.2)"
@@ -602,10 +609,10 @@ seed_state "$past_epoch" 8
 seed_critical_sustain 1
 queue_avail 2 8
 main
-if [ "$NOTIFY_CALLS" = "1" ] && [ "$NOTIFY_LAST_PRIO" = "5" ] && [ "$GC_MAIL_CALLS" = "1" ]; then
-  ok "main(): CRITICAL avail partially recovered into WARN tier still bypasses cooldown + mails Mayor (sustain already confirmed)"
+if [ "$NOTIFY_CALLS" = "1" ] && [ "$NOTIFY_LAST_PRIO" = "5" ] && [ "$GC_MAIL_CALLS" = "1" ] && [ "$NOTIFY_LAST_FORCE_PUSH" = "1" ]; then
+  ok "main(): CRITICAL avail partially recovered into WARN tier still bypasses cooldown + mails Mayor + force-pushes (sustain already confirmed) — proves the force-push gate keys off was_critical, not the recomputed post-reclaim class"
 else
-  bad "main(): CRITICAL->WARN partial recovery lost the always-notify/mail-Mayor guarantee (notify_calls=$NOTIFY_CALLS prio=$NOTIFY_LAST_PRIO mail_calls=$GC_MAIL_CALLS)"
+  bad "main(): CRITICAL->WARN partial recovery lost the always-notify/mail-Mayor/force-push guarantee (notify_calls=$NOTIFY_CALLS prio=$NOTIFY_LAST_PRIO mail_calls=$GC_MAIL_CALLS force_push='$NOTIFY_LAST_FORCE_PUSH')"
 fi
 
 # Scenario C — non-regression: a cycle that is NEVER critical (WARN both
@@ -720,6 +727,26 @@ case "$NOTIFY_LAST_MSG" in
   *"unmeasured"*) ok "main(): unmeasurable post-reclaim reading honestly says so, not a fabricated cause" ;;
   *) bad "main(): unmeasurable-reclaim notify message missing the honest-unmeasured framing — got: $NOTIFY_LAST_MSG" ;;
 esac
+
+# Scenario K (ga-ff6t9): a FRESH WARN-tier cycle (no prior state -> cooldown
+# fail-open fires notify unconditionally on the first read) must NOT
+# force-push. Mutation check on the fix above: force-push is reserved for the
+# guaranteed-page CRITICAL tier (was_critical=1); a routine WARN notify is
+# meant to keep going through notify's normal content-based routing (the
+# established low-blast-radius pattern this codebase already uses for
+# routine, non-emergency alerts). Without this negative control, a fix that
+# accidentally force-pushed EVERY notify call (not just CRITICAL) would pass
+# every other scenario in this file (none of them assert force-push is
+# ABSENT) — same discipline as escalate_emergency.py's own T2 "unsanctioned
+# class rejected" test.
+reset_capture; seed_state "" ""; seed_critical_sustain ""
+queue_avail 6 6
+main
+if [ "$NOTIFY_CALLS" = "1" ] && [ "$NOTIFY_LAST_PRIO" = "3" ] && [ -z "$NOTIFY_LAST_FORCE_PUSH" ]; then
+  ok "main(): fresh WARN-tier notify (prio 3) does NOT force-push (scoped correctly to CRITICAL only)"
+else
+  bad "main(): WARN-tier force-push scoping regressed (notify_calls=$NOTIFY_CALLS prio=$NOTIFY_LAST_PRIO force_push='$NOTIFY_LAST_FORCE_PUSH')"
+fi
 
 echo ""
 echo "=== main(): scratchpad + transcript reap integration (ga-02pnu, ga-t1ub9) ==="

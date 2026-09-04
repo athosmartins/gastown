@@ -113,6 +113,10 @@ NOTIFY_MARKER="$SCRATCH/notify-called.txt"
 cat > "$SCRATCH/fake-notify" <<'STUB'
 #!/bin/bash
 printf '%s\n' "$@" > "${NOTIFY_MARKER_PATH}"
+# ga-ff6t9: also record whether the caller set the force-push escape hatch,
+# so the selftest can prove _notify_critical actually sets it (not just that
+# notify was invoked with the right argv).
+printf 'FORCE_PUSH=%s\n' "${NOTIFY_FORCE_PUSH:-unset}" >> "${NOTIFY_MARKER_PATH}"
 STUB
 chmod +x "$SCRATCH/fake-notify"
 export NOTIFY_MARKER_PATH="$NOTIFY_MARKER"
@@ -125,6 +129,7 @@ if [ -f "$NOTIFY_MARKER" ]; then
   grep -q "LASTRO QUEIMADO" "$NOTIFY_MARKER" && ok "_notify_critical: message contains 'LASTRO QUEIMADO'" || bad "_notify_critical: message missing 'LASTRO QUEIMADO' text"
   grep -q "^5$" "$NOTIFY_MARKER" && ok "_notify_critical: priority 5 (no-cooldown final alarm) was passed" || bad "_notify_critical: priority 5 not found in argv"
   grep -q "offender/file.bin" "$NOTIFY_MARKER" && ok "_notify_critical: offenders text included in message" || bad "_notify_critical: offenders text missing from message"
+  grep -q "^FORCE_PUSH=1$" "$NOTIFY_MARKER" && ok "_notify_critical: NOTIFY_FORCE_PUSH=1 set (bypasses notify's content classifier, ga-ff6t9)" || bad "_notify_critical: NOTIFY_FORCE_PUSH not set — this alert can silently fall to the muted digest"
 fi
 
 # ── _top_offenders: bounded, best-effort, TCC/CloudStorage-safe recent-file
@@ -192,6 +197,7 @@ delta=$(( avail_after - avail_before ))
 [ "$delta" -ge 18000 ] && ok "main(): CRITICAL — real avail grew (delta=${delta}KB), space genuinely returned" || bad "main(): CRITICAL — avail did not grow (delta=${delta}KB)"
 [ -f "$NOTIFY_MARKER" ] && ok "main(): CRITICAL — notify fired WITH gc/bd broken (Dolt-down simulated)" || bad "main(): CRITICAL — notify never fired"
 [ -f "$NOTIFY_MARKER" ] && grep -q "LASTRO QUEIMADO" "$NOTIFY_MARKER" && ok "main(): CRITICAL — notify message correct" || bad "main(): CRITICAL — notify message wrong/missing"
+[ -f "$NOTIFY_MARKER" ] && grep -q "^FORCE_PUSH=1$" "$NOTIFY_MARKER" && ok "main(): CRITICAL — force-push set end-to-end through main() (ga-ff6t9)" || bad "main(): CRITICAL — force-push missing end-to-end"
 
 echo "--- criterion 2: disk healthy ---"
 _create_ballast "$MAIN_BALLAST" 20
