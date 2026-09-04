@@ -622,14 +622,37 @@ context_check_effective_text() {
 context_check_exec_class() {
   local t
   t=$(printf '%s\n%s' "${1:-}" "${2:-}" | tr 'A-Z' 'a-z')
-  # 1. PHYSICAL device / hardware / physical proxy — an agent has no hands.
-  #    "phone-as-Claro-mobile-proxy" (physical phone), SIM swaps, hardware proxies.
+  # 1a. PHYSICAL device / hardware / physical proxy — unambiguous standalone.
+  #    "phone-as-Claro-mobile-proxy" (physical phone), SIM swaps, hardware proxies,
+  #    explicit "human must touch it" phrasing. ga-s16ob: bare device NOUNS
+  #    ("aparelho"/"celular"/"chip"/"dispositivo"/"smartphone"/"físic[o]"/
+  #    "hardware") used to live in THIS block — removed, because in the
+  #    whatsapp_automation rig those words ARE the ordinary vocabulary (every
+  #    bead about phones/chips) so a bare match over-tagged pure-Python fixes
+  #    exec:manual (wa-5ct4l, wa-4032l) and froze P0 work behind a human who had
+  #    nothing to do (Pilot Gate 5 skips exec:manual). They now require a paired
+  #    action verb — see 1b below.
   case "$t" in
-    *" sim "*|*" sim-"*|*"-sim "*|*" sim/"*|*"chip "*|\
-*"physical"*|*"físic"*|*"fisic"*|*"hardware"*|*"dispositivo"*|\
-*"plug in"*|*"plug-in"*|*"plugar"*|*"conectar manualmente"*|*"ligar o aparelho"*|\
-*"aparelho"*|*"celular"*|*"smartphone"*|*"phone-as"*|*"phone as"*|\
-*"proxy físic"*|*"proxy fisic"*|*"hardware proxy"*|*"dongle"*|*"roteador físic"*)
+    *" sim "*|*" sim-"*|*"-sim "*|*" sim/"*|\
+*"plug in"*|*"plug-in"*|*"plugar"*|*"rootear"*|*"conectar manualmente"*|*"ligar o aparelho"*|\
+*"phone-as"*|*"phone as"*|\
+*"toque humano"*|*"toque físico"*|*"toque fisico"*|*"mão humana"*|*"mao humana"*|\
+*"acesso físico"*|*"acesso fisico"*|*"presença física"*|*"presenca fisica"*|\
+*"proxy físic"*|*"proxy fisic"*|*"hardware proxy"*|*"dongle"*|*"roteador físic"*|*"roteador fisic"*)
+      echo "exec:manual"; return ;;
+  esac
+  # 1b. Device/component NOUN + ACTION VERB pairing (ga-s16ob, oracle-wa 04/09):
+  #     the pairing, not the bare noun, is what makes it unambiguous. Literal
+  #     phrases, matching this function's established style — §3 below pairs
+  #     "provisionar" with credential/account/channel nouns the same way. Add a
+  #     new device+verb combination here rather than reintroducing a bare noun.
+  case "$t" in
+    *"trocar o chip"*|*"trocar o sim"*|*"trocar de chip"*|*"trocar de celular"*|*"trocar de aparelho"*|\
+*"conectar o aparelho"*|*"conectar o celular"*|\
+*"desconectar o aparelho"*|*"desconectar o celular"*|\
+*"reiniciar o aparelho"*|*"reiniciar o celular"*|*"reiniciar o dispositivo"*|*"reiniciar o smartphone"*|\
+*"reboot do aparelho"*|*"reboot no aparelho"*|\
+*"pegar o aparelho"*|*"pegar o celular"*|*"pegar o smartphone"*)
       echo "exec:manual"; return ;;
   esac
   # 2. GOV / 3rd-party PORTAL gated by HUMAN identity (CPF + CAPTCHA, e-SIC/LAI,

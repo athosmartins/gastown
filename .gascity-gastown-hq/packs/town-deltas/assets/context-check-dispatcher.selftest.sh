@@ -355,6 +355,22 @@ fi
   && ok "SIM/chip swap on physical device → exec:manual" || bad "SIM swap → expected exec:manual"
 [ "$(context_check_exec_class "configurar hardware proxy" "ligar o dongle e conectar manualmente")" = "exec:manual" ] \
   && ok "hardware/dongle + conectar manualmente → exec:manual" || bad "hardware proxy → expected exec:manual"
+# 10a2 — ga-s16ob: BARE device nouns (no paired action verb) must NOT tip
+#        exec:manual — whatsapp_automation's ordinary vocabulary is phones/
+#        chips/devices, and a bare match over-tagged pure-Python bug fixes.
+[ "$(context_check_exec_class "Vigia de contact-sync pode condenar aparelho SAO" "pick_fresh_wa_test_number escolhe o alvo entre os chips da frota; excluir chip DESCARTADO e o numero do proprio aparelho na selecao do teste")" = "exec:auto" ] \
+  && ok "ga-s16ob: bare 'aparelho'/'chip' in a pure-Python bug fix → exec:auto (wa-5ct4l pattern)" || bad "ga-s16ob REGRESSION: bare aparelho/chip over-tagged exec:manual (wa-5ct4l pattern)"
+[ "$(context_check_exec_class "Envio de outreach nao deve esperar o espelho de contato" "abrir a conversa pelo NUMERO (wa.me) em vez de depender do aparelho fisicamente sincronizado; a mudanca e so em central_sender.py")" = "exec:auto" ] \
+  && ok "ga-s16ob: bare 'aparelho'/'fisicamente' in a code-path change → exec:auto (wa-4032l pattern)" || bad "ga-s16ob REGRESSION: bare aparelho/fisicamente over-tagged exec:manual (wa-4032l pattern)"
+[ "$(context_check_exec_class "corrigir classificador de dispositivo" "o smartphone e o celular do usuario aparecem duplicados na tabela; ajustar a query em classification_database.py")" = "exec:auto" ] \
+  && ok "ga-s16ob: bare 'dispositivo'/'smartphone'/'celular' in a SQL fix → exec:auto" || bad "ga-s16ob REGRESSION: bare dispositivo/smartphone/celular over-tagged exec:manual"
+# 10a3 — ga-s16ob: an ACTION VERB paired with the device noun still tips exec:manual.
+[ "$(context_check_exec_class "canal travado" "reiniciar o aparelho e trocar o chip antes de repetir o teste")" = "exec:manual" ] \
+  && ok "ga-s16ob: verb+noun ('reiniciar o aparelho'/'trocar o chip') → exec:manual" || bad "ga-s16ob: verb+noun physical action → expected exec:manual"
+# 10a4 — ga-s16ob: a bead that genuinely requires touching/experimenting on the
+#        device (wa-y9nh0 pattern) stays exec:manual.
+[ "$(context_check_exec_class "Destravar canal com espelho de contatos travado" "experimentos por aparelho; NUNCA rootear nenhum aparelho; descobrir se da pra fazer por adb sem toque humano")" = "exec:manual" ] \
+  && ok "ga-s16ob: wa-y9nh0 pattern (toque humano / rootear aparelho) → exec:manual" || bad "ga-s16ob: wa-y9nh0 pattern → expected exec:manual, under-tagged auto"
 # 10b — GOV / 3rd-party PORTAL gated by human identity (CPF+CAPTCHA, e-SIC/LAI, cartório).
 [ "$(context_check_exec_class "pedido e-SIC/LAI Planta Genérica" "abrir pedido no portal e-SIC (LAI) para a Planta Genérica de Valores")" = "exec:manual" ] \
   && ok "e-SIC/LAI gov portal → exec:manual" || bad "e-SIC/LAI → expected exec:manual"
