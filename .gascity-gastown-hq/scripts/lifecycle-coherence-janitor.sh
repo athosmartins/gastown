@@ -1001,6 +1001,35 @@ run_sweep() {
         log "R8 park-arm-invariant (ga-ipm4): $id ($(basename "$store")) — parked bead carried exec:auto/ctx:ready, stripped both"; n=$((n+1))
       done
     done
+
+    # R9 (ga-hqvel): pilot:dispatched / pilot:dispatching + status=closed → strip the claim
+    # label(s). R1 already strips pilot:dispatched off closed beads that carry story:in-flight
+    # or story:approved — but the Pilot stamps pilot:dispatched/pilot:dispatching the MOMENT it
+    # claims a candidate, before the bead ever reaches story:in-flight, and a bead can close
+    # (delivery-task reconciler, gate-dispatcher direct-close) without ever crossing that
+    # threshold. R1's `-l story:in-flight`/`-l story:approved` queries never see that shape, so
+    # the claim label lived forever — same leak class as R5's ctx:ready gap, one label family
+    # over. MEASURED live (ga-hqvel, 2026-09-04): 209 whatsapp_automation + 26 hq +
+    # 9 property_scrapers closed beads stuck this way (244 total; repro case wa-po5iq — closed,
+    # gate:passed, merge-verified by the delivery-task reconciler's own close_reason, still
+    # carrying pilot:dispatched with no story:in-flight/story:approved ever set).
+    # Unlike R1/R5, no story:done/story:cancelled stamp is needed here: pilot:dispatched/
+    # pilot:dispatching are pure Pilot-internal claim bookkeeping, not a lifecycle-stage label
+    # the painel's column bucketing keys off — _closed_bead_belongs_in_done (painel_visibilidade.py)
+    # decides Done-column membership from close_reason alone, never from this label. Confirmed by
+    # reading the LIVE deployed painel (painel-prod, not just the source tree — the three trees
+    # can diverge): every raw_board fetch path for the in-flight/approved/triagem columns already
+    # filters --status to exclude closed, so a closed bead cannot re-enter any of those columns
+    # via label alone; this rule is pure hygiene (stop the label count from growing + clear the
+    # existing backlog), not a rendering fix for a currently-reachable code path.
+    for _dlbl in pilot:dispatched pilot:dispatching; do
+      for id in $("$BD" -C "$store" list -l "$_dlbl" --status closed --json -n 0 2>/dev/null | jq -r '.[].id' 2>/dev/null); do
+        [ -n "$id" ] || continue
+        _bead_locked "$id" && { log "R9 skip-locked: $id — advisory lock active"; continue; }
+        _strip "$store" "$id" "$_dlbl"
+        log "R9 closed-dispatched-vestigial (ga-hqvel): $id ($(basename "$store")) — stripped $_dlbl"; n=$((n+1))
+      done
+    done
   done
   # CRITICAL: Dolt auto-commit is OFF (dolt.auto-commit=off). A `bd label remove`/`update` writes
   # to the WORKING SET but does NOT commit — so OTHER processes that read committed HEAD (the
@@ -1189,6 +1218,13 @@ case "\$a" in
     echo '[{"id":"r8-parked-auto","labels":["exec:auto","pool:refused:engine-rebuild-required"]},{"id":"r8-parked-auto2","labels":["exec:auto","pool:refused:some-other-reason"]},{"id":"r8-parked-both","labels":["exec:auto","ctx:ready","story:blocked"]},{"id":"r8-clean-auto","labels":["exec:auto","lane:small"]},{"id":"r8-parked-canon-exact","labels":["exec:auto","framework:engine"]},{"id":"r8-parked-canon-prefix","labels":["exec:auto","pilot:refused-reason:engine-rebuild-required"]}]' ;;
   *"list -l ctx:ready --json"*)
     echo '[{"id":"r8-parked-ready","labels":["ctx:ready","needs-human"]},{"id":"r8-parked-both","labels":["exec:auto","ctx:ready","story:blocked"]},{"id":"r8-locked","labels":["ctx:ready","needs-human"]},{"id":"r8-clean-ready","labels":["ctx:ready","lane:small"]},{"id":"r8-parked-canon-blockedon","labels":["ctx:ready","blocked-on:wa-d9a0j"]}]' ;;
+  # R9 (ga-hqvel): closed+pilot:dispatched / closed+pilot:dispatching → strip. r9pd-closed
+  # and r9pding-closed prove each label family independently; r9pd-locked (advisory-locked,
+  # see lock-planting below) proves R9 honors the same lock convention as R3-R8.
+  *"list -l pilot:dispatched --status closed"*)
+    echo '[{"id":"r9pd-closed","labels":["pilot:dispatched"]},{"id":"r9pd-locked","labels":["pilot:dispatched"]}]' ;;
+  *"list -l pilot:dispatching --status closed"*)
+    echo '[{"id":"r9pding-closed","labels":["pilot:dispatching"]}]' ;;
   *"label remove"*|*"label add"*|*"update"*|*"dolt commit"*|*"undefer"*) echo "\$a" >> "$ACT" ;;
   *) echo '[]' ;;
 esac
@@ -1277,6 +1313,8 @@ GITSHIM
   echo "$$:$(date +%s)" > "$LIFECYCLE_LOCK_DIR/r5-locked"
   # ga-ipm4: same, for r8-locked (R8 park+arm invariant must also honor the advisory lock)
   echo "$$:$(date +%s)" > "$LIFECYCLE_LOCK_DIR/r8-locked"
+  # ga-hqvel: same, for r9pd-locked (R9 closed-dispatched-vestigial must also honor it)
+  echo "$$:$(date +%s)" > "$LIFECYCLE_LOCK_DIR/r9pd-locked"
   run_sweep
   echo "Scenario: janitor normalizes R1-R5 incoherences, respects locks (imp10), never touches coherent beads"
   grep -q 'label remove cl-1 story:in-flight' "$ACT" && ok "R1: closed+story:in-flight → stripped"            || bad "R1 not stripped"
@@ -1431,6 +1469,13 @@ GITSHIM
   grep -q 'label remove r8-parked-canon-exact exec:auto' "$ACT" && ok "R8 (ga-8lrud): exec:auto + framework:engine (canonical PARK_EXACT, not in the old 3-signal list) → stripped exec:auto" || bad "R8 (ga-8lrud): did not strip exec:auto on r8-parked-canon-exact — canonical PARK_EXACT widening broken"
   grep -q 'label remove r8-parked-canon-prefix exec:auto' "$ACT" && ok "R8 (ga-8lrud): exec:auto + pilot:refused-reason:* (canonical 'pilot:refused' PREFIX — the ACTUAL label pool workers write, distinct from the old check's pool:refused:* only) → stripped exec:auto" || bad "R8 (ga-8lrud): did not strip exec:auto on r8-parked-canon-prefix — canonical PARK_PREFIXES widening broken"
   grep -q 'label remove r8-parked-canon-blockedon ctx:ready' "$ACT" && ok "R8 (ga-8lrud): ctx:ready + blocked-on:<id> (canonical PARK_PREFIXES, not in the old 3-signal list) → stripped ctx:ready" || bad "R8 (ga-8lrud): did not strip ctx:ready on r8-parked-canon-blockedon — canonical PARK_PREFIXES widening broken"
+
+  # R9 (ga-hqvel): closed beads carrying the Pilot's own claim label, past the point R1's
+  # story:in-flight/story:approved queries would ever see them (wa-po5iq's live shape).
+  grep -q 'label remove r9pd-closed pilot:dispatched' "$ACT" && ok "R9: closed+pilot:dispatched (no story:in-flight/approved) → stripped" || bad "R9 did not strip pilot:dispatched on r9pd-closed"
+  grep -q 'label remove r9pding-closed pilot:dispatching' "$ACT" && ok "R9: closed+pilot:dispatching → stripped" || bad "R9 did not strip pilot:dispatching on r9pding-closed"
+  grep -q 'r9pd-locked' "$ACT" && bad "R9: touched an advisory-locked closed+pilot:dispatched bead (must be skipped, matches R3-R8 convention)" || ok "R9: skipped the advisory-locked bead (r9pd-locked)"
+  grep -q 'label add r9pd-closed' "$ACT" && bad "R9: stamped a lifecycle label (story:done/cancelled) — pilot:dispatched is claim bookkeeping, not a lifecycle-stage label; R9 must be strip-only" || ok "R9: strip-only, no lifecycle label stamped"
 
   # Gate-active protection (ga-ibz0/wa-bkjy7, 2026-07-11): quality-gate-guard.sh silently
   # detaches a bead's assignee for the FULL gate duration (no bd comment); R3/R7 must never
