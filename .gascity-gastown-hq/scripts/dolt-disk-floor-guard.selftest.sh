@@ -337,6 +337,117 @@ LOG="$REAL_LOG"
 rm -rf "$FAKE_CITY_T"
 
 echo ""
+echo "=== _reap_hf_cache: production sentinel wiring (wa-9eh0v) ==="
+# Same hermetic fake-CITY/capture-file technique as the other levers above:
+# CITY reassigned to a disposable tmp dir containing a FAKE
+# .gc/recall-venv/bin/python3 that only records the env it received — never
+# touches the real recall-venv, no real huggingface_hub import, no real
+# cache deletion. _reap_hf_cache is the REAL caller hf_cache_reap.py's own
+# header names as the one allowed to set HF_CACHE_REAP_PROD=1 — this proves
+# it actually does, when the cycle was CRITICAL (was_critical=1).
+FAKE_CITY_H="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city.XXXXXX)"
+mkdir -p "$FAKE_CITY_H/scripts" "$FAKE_CITY_H/.gc/recall-venv/bin"
+touch "$FAKE_CITY_H/scripts/hf_cache_reap.py"
+CAPTURE_FILE="$FAKE_CITY_H/capture.txt"
+cat > "$FAKE_CITY_H/.gc/recall-venv/bin/python3" <<EOF
+#!/bin/bash
+echo "PROD=\${HF_CACHE_REAP_PROD:-unset} ARG1=\${1:-none}" > "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY_H/.gc/recall-venv/bin/python3"
+
+REAL_CITY="$CITY"
+CITY="$FAKE_CITY_H"
+_reap_hf_cache 1
+CITY="$REAL_CITY"
+
+if [ -f "$CAPTURE_FILE" ] && grep -q "^PROD=1 " "$CAPTURE_FILE"; then
+  ok "_reap_hf_cache(was_critical=1): sets HF_CACHE_REAP_PROD=1 when invoking the real reaper (production opt-in wired)"
+else
+  bad "_reap_hf_cache(was_critical=1): did NOT set HF_CACHE_REAP_PROD=1 — real launchd path would silently dry-run forever (got: $([ -f "$CAPTURE_FILE" ] && cat "$CAPTURE_FILE" || echo 'capture file missing'))"
+fi
+if [ -f "$CAPTURE_FILE" ] && grep -q "ARG1=$FAKE_CITY_H/scripts/hf_cache_reap.py" "$CAPTURE_FILE"; then
+  ok "_reap_hf_cache(was_critical=1): invokes the venv python3 with the script's own path as argv[1]"
+else
+  bad "_reap_hf_cache(was_critical=1): did not pass the expected script path (got: $([ -f "$CAPTURE_FILE" ] && cat "$CAPTURE_FILE" || echo 'capture file missing'))"
+fi
+rm -rf "$FAKE_CITY_H"
+
+echo ""
+echo "=== _reap_hf_cache: CRITICAL-only gating (wa-9eh0v) ==="
+# UNLIKE _reap_dead_scratch/_reap_dead_transcripts/_reap_growing_logs (which
+# all run at WARN too), this lever has a real recurring cost (next `recall`
+# call pays a re-download) and must be a strict no-op below CRITICAL — the
+# capture file must never even be created.
+FAKE_CITY_H="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city.XXXXXX)"
+mkdir -p "$FAKE_CITY_H/scripts" "$FAKE_CITY_H/.gc/recall-venv/bin"
+touch "$FAKE_CITY_H/scripts/hf_cache_reap.py"
+CAPTURE_FILE="$FAKE_CITY_H/capture.txt"
+cat > "$FAKE_CITY_H/.gc/recall-venv/bin/python3" <<EOF
+#!/bin/bash
+echo "CALLED" > "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY_H/.gc/recall-venv/bin/python3"
+
+REAL_CITY="$CITY"
+CITY="$FAKE_CITY_H"
+_reap_hf_cache 0
+if [ ! -f "$CAPTURE_FILE" ]; then
+  ok "_reap_hf_cache(was_critical=0): never invokes the venv (WARN-tier is a strict no-op — cost is CRITICAL-only)"
+else
+  bad "_reap_hf_cache(was_critical=0): invoked the venv when it should have skipped (got: $(cat "$CAPTURE_FILE")"
+fi
+
+_reap_hf_cache   # no arg at all — must default the same as explicit 0
+if [ ! -f "$CAPTURE_FILE" ]; then
+  ok "_reap_hf_cache(no arg): defaults was_critical to non-critical (backward-compatible no-op)"
+else
+  bad "_reap_hf_cache(no arg): should default to skip, invoked the venv instead (got: $(cat "$CAPTURE_FILE")"
+fi
+CITY="$REAL_CITY"
+rm -rf "$FAKE_CITY_H"
+
+echo ""
+echo "=== _reap_hf_cache: guard-level ENABLED kill switch (wa-9eh0v) ==="
+FAKE_CITY_H="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city.XXXXXX)"
+mkdir -p "$FAKE_CITY_H/scripts" "$FAKE_CITY_H/.gc/recall-venv/bin"
+touch "$FAKE_CITY_H/scripts/hf_cache_reap.py"
+CAPTURE_FILE="$FAKE_CITY_H/capture.txt"
+cat > "$FAKE_CITY_H/.gc/recall-venv/bin/python3" <<EOF
+#!/bin/bash
+echo "CALLED" > "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY_H/.gc/recall-venv/bin/python3"
+
+REAL_CITY="$CITY"; CITY="$FAKE_CITY_H"
+REAL_ENABLED="$ENABLED"; ENABLED=0
+_reap_hf_cache 1
+ENABLED="$REAL_ENABLED"; CITY="$REAL_CITY"
+if [ ! -f "$CAPTURE_FILE" ]; then
+  ok "_reap_hf_cache: ENABLED=0 skips this lever too (not just the other four)"
+else
+  bad "_reap_hf_cache: ENABLED=0 did not prevent invocation (got: $(cat "$CAPTURE_FILE")"
+fi
+rm -rf "$FAKE_CITY_H"
+
+echo ""
+echo "=== _reap_hf_cache: missing script/venv degrades to SKIP, never errors (wa-9eh0v) ==="
+# A fresh checkout without the recall-venv built yet (or a future refactor
+# that moves hf_cache_reap.py) must never crash the guard cycle — same
+# defensive contract as _reap_dead_scratch's [ ! -f "$reaper" ] check.
+FAKE_CITY_H="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city.XXXXXX)"
+REAL_CITY="$CITY"; CITY="$FAKE_CITY_H"
+if _reap_hf_cache 1; then
+  ok "_reap_hf_cache: missing script AND missing venv — returns cleanly (no crash)"
+else
+  bad "_reap_hf_cache: missing script/venv should still return 0, got nonzero"
+fi
+CITY="$REAL_CITY"
+rm -rf "$FAKE_CITY_H"
+
+echo ""
 echo "=== _reap_growing_logs: production sentinel wiring (ga-dnc2m) ==="
 # Same proof as _reap_dead_scratch/_reap_dead_transcripts above, for the 4th
 # lever: log-reaper.sh's own header names _reap_growing_logs as the ONLY
@@ -482,6 +593,17 @@ _reap_dead_transcripts() { REAP_TRANSCRIPT_CALLS=$((REAP_TRANSCRIPT_CALLS+1)); }
 REAP_LOGS_CALLS=0
 _reap_growing_logs() { REAP_LOGS_CALLS=$((REAP_LOGS_CALLS+1)); }
 
+# _reap_hf_cache is new (wa-9eh0v), same reasoning as the other reap stubs:
+# EXECUTION code (shells out to hf_cache_reap.py via the recall-venv, which
+# has its own dedicated wiring tests earlier in this file) stubbed as a
+# no-op here so main()'s WIRING is what gets proven. REAP_HF_LAST_ARG mirrors
+# REAP_LAST_ARG above — this lever also receives was_critical as $1, and
+# Scenario E/E2 below prove it must be CALLED at all only when CRITICAL
+# (unlike the other three, which run at WARN too).
+REAP_HF_CALLS=0
+REAP_HF_LAST_ARG=""
+_reap_hf_cache() { REAP_HF_CALLS=$((REAP_HF_CALLS+1)); REAP_HF_LAST_ARG="${1:-}"; }
+
 NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""
 record_notify() {
   NOTIFY_CALLS=$((NOTIFY_CALLS+1))
@@ -524,7 +646,7 @@ record_gc() {
 # shellcheck disable=SC2034  # read by main() in the sourced script
 GC=record_gc
 
-reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; }
+reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; }
 seed_state() {
   if [ -n "$1" ]; then echo "$1" > "$STATE_EPOCH_FILE"; else rm -f "$STATE_EPOCH_FILE"; fi
   if [ -n "$2" ]; then echo "$2" > "$STATE_AVAIL_FILE"; else rm -f "$STATE_AVAIL_FILE"; fi
@@ -758,15 +880,20 @@ echo "=== main(): scratchpad + transcript reap integration (ga-02pnu, ga-t1ub9) 
 reset_capture; seed_state "" ""
 queue_avail 2 20
 main
-if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ] && [ "$REAP_LOGS_CALLS" = "1" ]; then
-  ok "main(): _reap_dead_scratch, _reap_dead_transcripts, AND _reap_growing_logs each invoked exactly once alongside _safe_reclaim"
+if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ] && [ "$REAP_LOGS_CALLS" = "1" ] && [ "$REAP_HF_CALLS" = "1" ]; then
+  ok "main(): _reap_dead_scratch, _reap_dead_transcripts, _reap_growing_logs, AND _reap_hf_cache each invoked exactly once alongside _safe_reclaim"
 else
-  bad "main(): expected all three reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_LOGS_CALLS=$REAP_LOGS_CALLS"
+  bad "main(): expected all four reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_LOGS_CALLS=$REAP_LOGS_CALLS REAP_HF_CALLS=$REAP_HF_CALLS"
 fi
 if [ "$REAP_LAST_ARG" = "1" ]; then
   ok "main(): CRITICAL cycle (even after reclaim recovers it to NONE) passes was_critical=1 to _reap_dead_scratch (ga-rjhfz pressure plumbing)"
 else
   bad "main(): expected _reap_dead_scratch to receive was_critical=1 on a CRITICAL cycle, got REAP_LAST_ARG='$REAP_LAST_ARG'"
+fi
+if [ "$REAP_HF_LAST_ARG" = "1" ]; then
+  ok "main(): CRITICAL cycle also passes was_critical=1 to _reap_hf_cache (wa-9eh0v)"
+else
+  bad "main(): expected _reap_hf_cache to receive was_critical=1 on a CRITICAL cycle, got REAP_HF_LAST_ARG='$REAP_HF_LAST_ARG'"
 fi
 
 # Scenario E2 (ga-rjhfz) — a cycle that is WARN, never CRITICAL, must pass
@@ -782,19 +909,24 @@ if [ "$REAP_LAST_ARG" = "0" ]; then
 else
   bad "main(): expected _reap_dead_scratch to receive was_critical=0 on a WARN-only cycle, got REAP_LAST_ARG='$REAP_LAST_ARG'"
 fi
+if [ "$REAP_HF_CALLS" = "1" ] && [ "$REAP_HF_LAST_ARG" = "0" ]; then
+  ok "main(): non-critical WARN cycle still calls _reap_hf_cache but with was_critical=0 (the CRITICAL-only gate lives INSIDE the real function, not in main()'s wiring — wa-9eh0v)"
+else
+  bad "main(): expected _reap_hf_cache called once with was_critical=0 on a WARN-only cycle, got REAP_HF_CALLS=$REAP_HF_CALLS REAP_HF_LAST_ARG='$REAP_HF_LAST_ARG'"
+fi
 
 # Scenario F — a cycle that never reaches the floor at all (avail comfortably
 # above warn on the FIRST read) must take the top early-return and never touch
-# the scratch/transcript dead-session reapers — proves neither reap call got
-# hoisted above the floor check.
+# the scratch/transcript/hf-cache reapers — proves none of those reap calls
+# got hoisted above the floor check.
 VM_LOG_PRE_COUNT=$(grep -c "vm_swap_gb=" "$LOG" 2>/dev/null || echo 0)
 reset_capture; seed_state "" ""
 queue_avail 20
 main
-if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ]; then
-  ok "main(): avail above floor on first read never invokes either dead-session reaper"
+if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ] && [ "$REAP_HF_CALLS" = "0" ]; then
+  ok "main(): avail above floor on first read never invokes the scratch/transcript/hf-cache reapers"
 else
-  bad "main(): expected zero dead-session reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS"
+  bad "main(): expected zero scratch/transcript/hf-cache reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_HF_CALLS=$REAP_HF_CALLS"
 fi
 # ga-sfj3i.2: the exact case this acceptance criterion exists for — a cycle
 # that never breaches ANY floor is precisely where the pre-fix guard logged

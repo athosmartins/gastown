@@ -18,7 +18,7 @@
 #
 #   WARN_GB (default 8)     — attempt the pre-sanctioned-safe reclaim
 #                             (`gc dolt-cleanup --force` — orphan test-DB SQL DROP,
-#                             documented safe while Dolt is up), PLUS three more
+#                             documented safe while Dolt is up), PLUS four more
 #                             levers — reaping dead-session scratchpads under
 #                             /private/tmp (see _reap_dead_scratch, ga-hjcxy/
 #                             ga-02pnu: a single dead session's 1GB scratchpad
@@ -28,25 +28,38 @@
 #                             ~/.claude/projects (see _reap_dead_transcripts,
 #                             ga-t1ub9: 1.4GB/1232 files accumulated with no
 #                             reaper at all — a disjoint leak class from
-#                             scratch), and capping known unrotated app logs
+#                             scratch), capping known unrotated app logs
 #                             under /private/tmp and ~/shared/logs (see
 #                             _reap_growing_logs, ga-dnc2m: ~4G across six
 #                             never-rotated logs on the SAME APFS container as
 #                             Dolt's own data-dir competed directly for this
-#                             guard's floor, and none of the other three
-#                             levers touch that file class — the guard used to
+#                             guard's floor, and none of the other levers
+#                             touch that file class — the guard used to
 #                             log "reclaim OK — avail 6GB -> 6GB" through an
 #                             entire log-driven CRITICAL dip, a reported
-#                             success over a complete non-effect) — then
-#                             rate-limited notify. Cooldown is bypassed if
-#                             avail is WORSENING since the last notify (mirrors
-#                             the exact fix ga-vs55 furo #2 added to
-#                             disk-pressure-monitor.sh's dpm_should_notify — a
-#                             cooldown blind to trend is what let the city monitor
-#                             stay silent 28min before Dolt died; must not regress
-#                             that lesson onto this guard).
+#                             success over a complete non-effect), and — CRITICAL
+#                             tier only — clearing the `recall` CLI's
+#                             huggingface_hub model cache (see _reap_hf_cache,
+#                             wa-9eh0v: the 2026-09-04 double outage showed the
+#                             OTHER FOUR levers can all report "0GB reclaimed"
+#                             in the same cycle — they'd already run their
+#                             course; the lever that actually recovered the
+#                             disk both times was a human manually clearing
+#                             ~/.cache/huggingface, already Athos-authorized
+#                             for this cache since the 2026-07-14 ga-vs55
+#                             incident, and safe to automate because
+#                             recall_lib.py's own bootstrap already treats a
+#                             wiped cache as a self-healing cache-miss, not a
+#                             failure) — then rate-limited notify. Cooldown is
+#                             bypassed if avail is WORSENING since the last
+#                             notify (mirrors the exact fix ga-vs55 furo #2
+#                             added to disk-pressure-monitor.sh's
+#                             dpm_should_notify — a cooldown blind to trend is
+#                             what let the city monitor stay silent 28min
+#                             before Dolt died; must not regress that lesson
+#                             onto this guard).
 #
-#                             UNLIKE the other three levers, _reap_growing_logs
+#                             UNLIKE the other four levers, _reap_growing_logs
 #                             runs on EVERY cycle regardless of floor class
 #                             (see its call at the top of main(), before the
 #                             avail/class computation) — ga-dnc2m's own
@@ -58,6 +71,16 @@
 #                             copytruncate only when a file is actually over
 #                             its threshold) costs nothing on the common no-op
 #                             cycle.
+#
+#                             UNLIKE the other floor-triggered levers,
+#                             _reap_hf_cache only fires at CRITICAL, never at
+#                             plain WARN (see its own header comment) — unlike
+#                             dolt-cleanup/scratch-reap/transcript-reap/
+#                             log-reap, it has a real recurring cost each time
+#                             it fires (the next `recall` call pays a bounded
+#                             re-download), so it is reserved for the severity
+#                             this bead's own incident actually reached
+#                             (avail as low as 1GB), not every routine WARN dip.
 #
 #   CRITICAL_GB (default 3) — same reclaim attempts + notify ALWAYS (cooldown
 #                             bypassed unconditionally — this is the last rung
@@ -88,9 +111,9 @@
 # sign-off rather than being silently bundled into a no-human-review small-lane
 # merge. Filed as a separate follow-up bead (see this commit's gate-done note).
 #
-# Kill switch: DOLT_DISK_FLOOR_GUARD_ENABLED=0 → skip ALL FOUR reclaim actions
-# (dolt-cleanup, the scratchpad reaper, the transcript reaper, AND the log
-# reaper) only. Notification is NEVER gated by this switch (imp07 CALL
+# Kill switch: DOLT_DISK_FLOOR_GUARD_ENABLED=0 → skip ALL FIVE reclaim actions
+# (dolt-cleanup, the scratchpad reaper, the transcript reaper, the log
+# reaper, AND the hf-cache reaper) only. Notification is NEVER gated by this switch (imp07 CALL
 # INVARIANT: alerting is the lowest-blast-radius action here and the one furo
 # #2 just fixed for being wrongly suppressible — don't reintroduce that
 # failure mode one guard over).
@@ -473,11 +496,69 @@ _reap_dead_transcripts() {
   fi
 }
 
-# _reap_growing_logs — fourth reclaim lever, alongside _safe_reclaim,
-# _reap_dead_scratch, and _reap_dead_transcripts (ga-dnc2m): known app logs
-# under /private/tmp and ~/shared/logs that nothing ever rotated — a distinct
-# leak class from the other three (none of them look at app-log files at
-# all). Delegates to the standalone, independently-selftested log-reaper.sh
+# _reap_hf_cache — fourth reclaim lever, alongside _safe_reclaim,
+# _reap_dead_scratch and _reap_dead_transcripts (wa-9eh0v, 2026-09-04 double
+# outage 12h apart): the three levers above can ALL report "0GB reclaimed"
+# in the same cycle — live evidence in this guard's own log that day,
+# 07:31:23: "reclaimed=0GB avail_before=2GB". They'd already run their
+# course. The lever that actually recovered the disk both times was a human
+# manually clearing ~/.cache/huggingface (the `recall` CLI's
+# sentence-transformers model cache — see scripts/recall_lib.py) via
+# huggingface_hub's own scan_cache_dir()/delete_revisions() API, already
+# authorized by Athos for this specific cache in the prior (2026-07-14,
+# ga-vs55) incident. This automates that exact, already-proven action.
+# Delegates to the standalone hf_cache_reap.py (run through the `recall`
+# CLI's own venv — huggingface_hub is NOT on the guard's plain launchd
+# PATH's system python3, verified live) so the huggingface_hub call is
+# independently testable/runnable in isolation, same pattern as the
+# scratch/transcript levers above delegating to their own scripts.
+#
+# CRITICAL-only (unlike the three levers above, which run at WARN too): this
+# one has a real cost each time it fires — recall_lib.py's own bootstrap
+# (wa-h9dc1) already treats a wiped cache as expected/self-healing (one
+# ~180s-bounded re-download on next use), but paying that on every ordinary
+# WARN dip would degrade `recall` for everyone far more often than the
+# emergency it exists for. Reserved for the tier this bead's own incident
+# actually hit (avail as low as 1GB).
+#
+# HF_CACHE_REAP_PROD=1: same production-sentinel pattern as
+# SCRATCHPAD_REAPER_PROD/TRANSCRIPT_REAPER_PROD above (ga-h565g/ga-lfj05) —
+# only this function, the real launchd-driven caller, should ever set it.
+# Without it, hf_cache_reap.py dry-runs (scans + reports, deletes nothing) —
+# which is also what keeps this safe to invoke from the selftest below.
+_reap_hf_cache() {
+  local was_critical="${1:-0}"
+  if [ "$ENABLED" != "1" ]; then
+    log "hf-cache-reap SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"
+    return
+  fi
+  if [ "$was_critical" != "1" ]; then
+    log "hf-cache-reap SKIP — not CRITICAL this cycle (emergency-only lever)"
+    return
+  fi
+  local script="$CITY/scripts/hf_cache_reap.py"
+  local venv_py="$CITY/.gc/recall-venv/bin/python3"
+  if [ ! -f "$script" ]; then
+    log "hf-cache-reap SKIP — $script not found"
+    return
+  fi
+  if [ ! -x "$venv_py" ]; then
+    log "hf-cache-reap SKIP — $venv_py not found/executable"
+    return
+  fi
+  log "hf-cache-reap: CRITICAL — reclaiming recall's huggingface model cache …"
+  if HF_CACHE_REAP_PROD=1 timeout 30 "$venv_py" "$script" >> "$LOG" 2>&1; then
+    log "hf-cache-reap OK"
+  else
+    log "hf-cache-reap FAILED or aborted (nonzero exit) — see log lines above"
+  fi
+}
+
+# _reap_growing_logs — fifth reclaim lever, alongside _safe_reclaim,
+# _reap_dead_scratch, _reap_dead_transcripts, and _reap_hf_cache (ga-dnc2m):
+# known app logs under /private/tmp and ~/shared/logs that nothing ever
+# rotated — a distinct leak class from the others (none of them look at
+# app-log files at all). Delegates to the standalone, independently-selftested log-reaper.sh
 # so its size-cap logic is unit-tested in isolation rather than inlined here
 # — same pattern as the scratch/transcript levers. Cheap and bounded by
 # timeout so it can safely run on every cycle (see the UNLIKE note in this
@@ -559,6 +640,7 @@ main() {
   _safe_reclaim "$avail"
   _reap_dead_scratch "$was_critical"
   _reap_dead_transcripts
+  _reap_hf_cache "$was_critical"
 
   # re-read avail — reclaim may have freed space; `class` becomes the CURRENT
   # (post-reclaim) reading, used for logging/messaging. was_critical also
