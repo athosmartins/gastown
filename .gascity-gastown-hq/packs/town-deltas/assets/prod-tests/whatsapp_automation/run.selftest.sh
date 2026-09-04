@@ -17,6 +17,13 @@
 #      fact — only ever as an explicitly-labeled, unverified possible cause.
 #   5. Smoke test: admin ok on the first attempt -> ALL PASS, no retry noise
 #      (proves the fix didn't slow down or alter the common case).
+#   6. REGRESSION ga-cjj3u (static): the SIGPIPE-vulnerable
+#      `printf '%s' "$ADMIN_BODY" | grep -q "..."` pipe (under `set -uo
+#      pipefail`, grep -q exiting at the first match SIGPIPEs printf mid-
+#      write, and pipefail turns that into a false "string missing" — see
+#      mail ga-wisp-3ws8wc8, oracle-wa) is gone from both call sites, the
+#      file-based replacement is in place, and the file isn't deleted
+#      before both checks read it.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -168,6 +175,75 @@ run_admin_case "ok"
 [ "$LAST_RC" -eq 0 ] && ok "exit 0" || bad "expected exit 0, got $LAST_RC: $LAST_OUT"
 echo "$LAST_OUT" | grep -q "ALL PASS" && ok "reaches ALL PASS" || bad "did not reach ALL PASS: $LAST_OUT"
 echo "$LAST_OUT" | grep -qi "retry" && bad "spurious retry-mention on a first-attempt success: $LAST_OUT" || ok "no spurious retry-mention when the first attempt already succeeds"
+
+# ═════════════════════════════════════════════════════════════════════════
+# 6. REGRESSION ga-cjj3u: SIGPIPE + pipefail false negative — static proof
+#    against the shipped source, not the race itself. (A large-body dynamic
+#    repro of the actual race was tried while writing this test: it
+#    reproduced 20/20 in isolation but became timing-dependent enough to
+#    HANG once exercised through the real run.sh + fake-curl harness under
+#    load on this shared box. Shipping a race as a permanent gate check
+#    would make the guard exactly as unreliable as the bug it guards
+#    against, so this proves the fix structurally instead.)
+#
+#    Pre-fix, Check 4 and its WARN sibling ran
+#        printf '%s' "$ADMIN_BODY" | grep -q "<pattern>"
+#    under `set -uo pipefail` (run.sh line 18): grep -q exits at the first
+#    match and closes the pipe; printf, still writing the remaining bytes,
+#    dies of SIGPIPE, and pipefail promotes that into the pipeline's exit
+#    status — `if ! pipeline; then` reads "string missing" from a pipeline
+#    that failed because it found the string. Measured by oracle-wa (mail
+#    ga-wisp-3ws8wc8): ~104KB body/~40KB offset, 19/20 reps wrong under
+#    pipefail, 0/20 under a no-pipefail control.
+# ═════════════════════════════════════════════════════════════════════════
+echo "── Regression ga-cjj3u: SIGPIPE-vulnerable pipe gone, file-based grep in place ──"
+if grep -Fq -- "printf '%s' \"\$ADMIN_BODY\" | grep" "$RUN_SH"; then
+  bad "run.sh still pipes \$ADMIN_BODY through printf | grep — the SIGPIPE/pipefail race is still live"
+else
+  ok "no printf \"\$ADMIN_BODY\" | grep pipeline in run.sh"
+fi
+if grep -Fq -- "grep -q \"Kanban de histórias\" \"\$ADMIN_BODY_FILE\"" "$RUN_SH"; then
+  ok "Check 4 FATAL greps \$ADMIN_BODY_FILE directly (no pipe, no SIGPIPE possible)"
+else
+  bad "Check 4 FATAL does not grep \$ADMIN_BODY_FILE directly"
+fi
+if grep -Fq -- "grep -q \"\${PAINEL_PORT}\" \"\$ADMIN_BODY_FILE\"" "$RUN_SH"; then
+  ok "WARN sibling greps \$ADMIN_BODY_FILE directly (no pipe, no SIGPIPE possible)"
+else
+  bad "WARN sibling does not grep \$ADMIN_BODY_FILE directly"
+fi
+# The file must survive until the WARN sibling reads it — a fix that deletes
+# it right after the curl+size step (like the pre-fix code did) would trade
+# the SIGPIPE bug for an equally-wrong "grep: No such file" false negative.
+curl_line=$(grep -n -F -- '-o "$ADMIN_BODY_FILE"' "$RUN_SH" | head -1 | cut -d: -f1) || true
+warn_line=$(grep -n -F -- "grep -q \"\${PAINEL_PORT}\" \"\$ADMIN_BODY_FILE\"" "$RUN_SH" | head -1 | cut -d: -f1) || true
+if [ -n "${curl_line:-}" ] && [ -n "${warn_line:-}" ]; then
+  # A bare textual match would also flag the FATAL path's own
+  # `rm -f "$ADMIN_BODY_FILE"` (immediately before `fail "$admin_detail"`)
+  # as unsafe — but fail() is `{ echo ...; exit 1; }` above, so that branch
+  # can never fall through to the WARN check in the same run. Only an rm
+  # NOT paired with an immediately-following fail call is actually unsafe.
+  unsafe_rm_line=$(awk -v lo="$curl_line" -v hi="$warn_line" '
+    NR>lo && NR<hi {
+      if (index($0, "rm -f \"$ADMIN_BODY_FILE\"") > 0) {
+        if ($0 ~ /fail[ \t]/) { next }
+        pending = NR
+        next
+      }
+      if (pending) {
+        if ($0 ~ /fail[ \t]/) { pending = 0 } else { print pending; exit }
+      }
+    }
+    END { if (pending) print pending }
+  ' "$RUN_SH")
+  if [ -z "${unsafe_rm_line:-}" ]; then
+    ok "\$ADMIN_BODY_FILE is not deleted before the WARN check (line $warn_line) can read it"
+  else
+    bad "\$ADMIN_BODY_FILE is deleted at line $unsafe_rm_line without an immediately-paired fail call — the WARN check (line $warn_line) could read a missing file"
+  fi
+else
+  bad "could not locate both the curl fetch and the WARN grep to check \$ADMIN_BODY_FILE's lifetime (call sites moved?)"
+fi
 
 echo ""
 echo "Results: $P passed, $F failed"

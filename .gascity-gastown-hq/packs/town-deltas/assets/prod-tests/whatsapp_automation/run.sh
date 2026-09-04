@@ -84,12 +84,9 @@ while [ "$admin_attempt" -lt "$ADMIN_RETRIES" ]; do
   ADMIN_CODE=$(curl -s --max-time 10 -o "$ADMIN_BODY_FILE" -w "%{http_code}" \
     "http://127.0.0.1:${ADMIN_PORT}/" 2>/dev/null)
   ADMIN_CURL_EXIT=$?
-  ADMIN_BODY=""
   ADMIN_BODY_SIZE=0
   if [ -f "$ADMIN_BODY_FILE" ]; then
     ADMIN_BODY_SIZE=$(wc -c < "$ADMIN_BODY_FILE" | tr -d '[:space:]')
-    ADMIN_BODY=$(cat "$ADMIN_BODY_FILE")
-    rm -f "$ADMIN_BODY_FILE"
   fi
 
   if [ "$ADMIN_CURL_EXIT" -ne 0 ]; then
@@ -98,7 +95,7 @@ while [ "$admin_attempt" -lt "$ADMIN_RETRIES" ]; do
   elif [ "$ADMIN_BODY_SIZE" -eq 0 ]; then
     admin_state="empty_body"
     admin_detail="admin :${ADMIN_PORT} check failed — HTTP ${ADMIN_CODE}, empty response body (0 bytes) after ${admin_attempt} attempt(s). MEASURED: empty body only. Possible causes (not verified by this check): daemon returned an empty response, upstream aggregation error."
-  elif ! printf '%s' "$ADMIN_BODY" | grep -q "Kanban de histórias"; then
+  elif ! grep -q "Kanban de histórias" "$ADMIN_BODY_FILE"; then
     admin_state="string_missing"
     admin_detail="admin :${ADMIN_PORT} check failed — HTTP ${ADMIN_CODE}, body ${ADMIN_BODY_SIZE} bytes, does not contain 'Kanban de histórias' after ${admin_attempt} attempt(s). MEASURED: string absent from a non-empty body only. Possible causes (not verified by this check): registration missing, admin daemon not restarted after ga-52ib rename, or a transient aggregation render issue."
   else
@@ -113,6 +110,7 @@ while [ "$admin_attempt" -lt "$ADMIN_RETRIES" ]; do
 done
 
 if [ "$admin_state" != "ok" ]; then
+  rm -f "$ADMIN_BODY_FILE"
   fail "$admin_detail"
 fi
 if [ "$admin_attempt" -gt 1 ]; then
@@ -120,9 +118,10 @@ if [ "$admin_attempt" -gt 1 ]; then
 else
   log "admin registration present OK"
 fi
-if ! printf '%s' "$ADMIN_BODY" | grep -q "${PAINEL_PORT}"; then
+if ! grep -q "${PAINEL_PORT}" "$ADMIN_BODY_FILE"; then
   log "WARN: admin console lists the painel but not port ${PAINEL_PORT} explicitly (non-fatal)."
 fi
+rm -f "$ADMIN_BODY_FILE"
 
 # ── Optional story-specific test ──────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
