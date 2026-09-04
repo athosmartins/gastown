@@ -2,16 +2,20 @@
 # nightly-reboot.sh — recurring nightly reboot to reclaim the macOS swap
 # ratchet that never releases on its own (ga-i9q44).
 #
-# ⚠️ STATUS AS OF WRITING (2026-09-03): NOT INSTALLED, NOT ARMED. This script
-# and its LaunchDaemon plist (docs/runbooks/nightly-reboot-PENDING-INSTALL.md)
-# are prepared but not deployed — the install needs `sudo`, which a dog
-# session cannot run (sandboxed out), and — independent of that — arming a
-# PERMANENT, RECURRING, UNATTENDED reboot of the shared production machine is
-# a bigger decision than either precedent on this box: com.athos.reboot-once-
-# 0700 (2026-08-07) and the manual 2026-08-29 reboot
-# (docs/runbooks/reboot-20260829-pre.txt) were both ONE-SHOT and individually
-# human-authorized in the moment ("Athos autorizou 29/08 00:53"). See the
-# PENDING-INSTALL doc for the open question this is parked on.
+# ⚠️ STATUS (updated 2026-09-04, ga-g5bzf): INSTALLED AND ARMED. Stale claim
+# corrected — this comment previously said "NOT INSTALLED, NOT ARMED", which
+# was true when written (2026-09-03 morning) but not anymore: Athos ran the
+# sudo install himself the same day at 11:35 -03, choosing via AskUserQuestion
+# to go straight to unattended (no supervised first fire). Citable trail +
+# Mayor's live-artifact verification: ga-i9q44 comments 2026-09-03 10:27/14:35.
+# This IS now a PERMANENT, RECURRING, UNATTENDED reboot of the shared
+# production machine, firing nightly 01:00-01:19 via
+# /Library/LaunchDaemons/com.gascity.nightly-reboot.plist. First real fire
+# (2026-09-04 01:00:01) correctly SKIPPED — fail-closed — on a transient
+# gate-queue-composition.sh hiccup; that single-shot-costs-the-whole-night gap
+# is exactly what ga-g5bzf/this commit's Guard 2 retry fixes below.
+# ga-i9q44 itself stays open pending two consecutive clean nights of log
+# evidence before it accepts — do not close it from this bug alone.
 #
 # WHY A REAL-TIME PRE-CHECK, NOT JUST A QUIET TIMER SLOT: city-night-window
 # (the mechanism that would guarantee the whole city is quiet 00:00-08:00) is
@@ -37,12 +41,20 @@
 
 set -uo pipefail
 
-CITY="/Users/athos/gt/.gascity-gastown-hq"
+CITY="${CITY:-/Users/athos/gt/.gascity-gastown-hq}"
 GC="${GC_BIN:-/opt/homebrew/bin/gc}"
 BD="${BD_BIN:-/opt/homebrew/bin/bd}"
 LOG="${CITY}/.gc/logs/nightly-reboot.log"
-NOTIFY_AS_USER="athos"
-NOTIFY_BIN="/Users/athos/.local/bin/notify"
+NOTIFY_AS_USER="${NOTIFY_AS_USER:-athos}"
+NOTIFY_BIN="${NOTIFY_BIN:-/Users/athos/.local/bin/notify}"
+# Unique per-invocation temp files (not fixed /tmp names): a fixed name
+# reused night after night ends up owned by whichever user first created it
+# (root, in production) — a later run under a different user (e.g. testing
+# this script by hand) then gets a silent "Permission denied" on the stderr
+# redirect instead of the diagnostic it's there to capture.
+GATE_ERR="$(mktemp -t nightly-reboot-gate-err)"
+HQ_ERR="$(mktemp -t nightly-reboot-hq-err)"
+trap 'rm -f "${GATE_ERR}" "${HQ_ERR}"' EXIT
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "${LOG}" 2>/dev/null; }
 notify_athos() {
@@ -68,11 +80,28 @@ if [ "${HOUR}" -ne 1 ] || [ "${MINUTE}" -ge 20 ]; then
 fi
 
 # --- Guard 2: gate markers in flight must be zero -----------------------
-GATE_JSON=$("${CITY}/scripts/gate-queue-composition.sh" --json 2>/tmp/nightly-reboot-gate-err.log)
-GATE_RC=$?
+# 1 retry with a short backoff before giving up on the whole night (ga-g5bzf):
+# the 2026-09-04 first real run hit a single transient hiccup at 01:00:00
+# under load average 13-17 (bd/Dolt were confirmed healthy — the same script
+# ran fine 9min later in 10.4s) and burned the entire night, since the next
+# chance is tomorrow. Fail-closed on the LAST attempt is unchanged — this
+# only protects against a one-shot blip, never trades away the
+# "unknown → don't reboot" guarantee.
+GATE_RETRIES="${NIGHTLY_REBOOT_GATE_RETRIES:-2}"
+GATE_RETRY_SLEEP="${NIGHTLY_REBOOT_GATE_RETRY_SLEEP:-10}"
+GATE_ATTEMPT=1
+while true; do
+    GATE_JSON=$("${CITY}/scripts/gate-queue-composition.sh" --json 2>"${GATE_ERR}")
+    GATE_RC=$?
+    [ "${GATE_RC}" -eq 0 ] && [ -n "${GATE_JSON}" ] && break
+    [ "${GATE_ATTEMPT}" -ge "${GATE_RETRIES}" ] && break
+    log "gate-queue-composition.sh attempt ${GATE_ATTEMPT}/${GATE_RETRIES} failed (rc=${GATE_RC}: $(cat "${GATE_ERR}" 2>/dev/null)) — retrying in ${GATE_RETRY_SLEEP}s before giving up on the night."
+    sleep "${GATE_RETRY_SLEEP}"
+    GATE_ATTEMPT=$((GATE_ATTEMPT+1))
+done
 if [ "${GATE_RC}" -ne 0 ] || [ -z "${GATE_JSON}" ]; then
-    log "SKIP: gate-queue-composition.sh failed (rc=${GATE_RC}: $(cat /tmp/nightly-reboot-gate-err.log 2>/dev/null)) — unknown gate state treated as NOT safe. Not rebooting."
-    notify_athos "Reboot noturno pulado" "gate-queue-composition.sh falhou às $(date '+%H:%M') — não consegui confirmar fila do gate vazia. Ver ${LOG}."
+    log "SKIP: gate-queue-composition.sh failed after ${GATE_ATTEMPT}/${GATE_RETRIES} attempts (rc=${GATE_RC}: $(cat "${GATE_ERR}" 2>/dev/null)) — unknown gate state treated as NOT safe. Not rebooting."
+    notify_athos "Reboot noturno pulado" "gate-queue-composition.sh falhou (${GATE_ATTEMPT}/${GATE_RETRIES} tentativas) às $(date '+%H:%M') — não consegui confirmar fila do gate vazia. Ver ${LOG}."
     exit 0
 fi
 GATE_REAL=$(printf '%s' "${GATE_JSON}" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin).get("real","?"))' 2>/dev/null)
@@ -81,13 +110,13 @@ if [ "${GATE_REAL}" != "0" ]; then
     notify_athos "Reboot noturno pulado" "${GATE_REAL} marker(s) reais na fila do gate às $(date '+%H:%M') — reboot adiado pra próxima janela. Ver ${LOG}."
     exit 0
 fi
-log "gate check OK: 0 real markers in flight (raw: ${GATE_JSON})"
+log "gate check OK: 0 real markers in flight (raw: ${GATE_JSON}, attempt ${GATE_ATTEMPT}/${GATE_RETRIES})"
 
 # --- Guard 3: hq beads in_progress must be zero --------------------------
-HQ_INPROGRESS_JSON=$("${BD}" -C "${CITY}" list --status in_progress --json --limit 0 2>/tmp/nightly-reboot-hq-err.log)
+HQ_INPROGRESS_JSON=$("${BD}" -C "${CITY}" list --status in_progress --json --limit 0 2>"${HQ_ERR}")
 HQ_RC=$?
 if [ "${HQ_RC}" -ne 0 ] || ! printf '%s' "${HQ_INPROGRESS_JSON}" | /usr/bin/python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1; then
-    log "SKIP: bd list --status in_progress (hq) failed (rc=${HQ_RC}: $(cat /tmp/nightly-reboot-hq-err.log 2>/dev/null)) — unknown state treated as NOT safe. Not rebooting."
+    log "SKIP: bd list --status in_progress (hq) failed (rc=${HQ_RC}: $(cat "${HQ_ERR}" 2>/dev/null)) — unknown state treated as NOT safe. Not rebooting."
     notify_athos "Reboot noturno pulado" "não consegui ler beads in_progress do hq às $(date '+%H:%M'). Ver ${LOG}."
     exit 0
 fi

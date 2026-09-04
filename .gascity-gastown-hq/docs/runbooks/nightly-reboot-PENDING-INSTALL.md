@@ -1,9 +1,15 @@
-# Nightly reboot — PREPARED, NOT INSTALLED (ga-i9q44)
+# Nightly reboot — INSTALLED AND ARMED (ga-i9q44)
 
-Status: 2026-09-03, gastown.dog-1. Script written and syntax-checked
-(`scripts/nightly-reboot.sh`), plist drafted below and `plutil -lint` clean.
-**Not copied to `/Library/LaunchDaemons`, not `launchctl load`ed.** Nothing
-in this doc runs on its own.
+Status (updated 2026-09-04, ga-g5bzf): **installed and live**, not just
+prepared. This doc's title/status said "PREPARED, NOT INSTALLED" as written
+2026-09-03 morning by gastown.dog-1 — true then, stale since the same
+afternoon: Athos ran the `sudo` install himself at 11:35 -03, choosing via
+AskUserQuestion to go straight to unattended (no supervised first fire). See
+`scripts/nightly-reboot.sh`'s own header for the citable trail (ga-i9q44
+comments 2026-09-03 10:27/14:35) and current guard behavior. The plist below
+is now byte-identical (modulo markdown indentation) to the live
+`/Library/LaunchDaemons/com.gascity.nightly-reboot.plist`, verified by Mayor
+at install time.
 
 ## Why this exists
 
