@@ -68,6 +68,13 @@ def main(argv: list[str]) -> int:
         print(f"HF_CACHE_REAP: ERROR scan_cache_dir failed ({exc})", file=sys.stderr)
         return 1
 
+    # A partial/degraded scan (e.g. one corrupt repo dir among many) does not
+    # raise — it surfaces as non-empty info.warnings while info.repos still
+    # reports whatever it COULD read. Log it rather than silently proceeding
+    # as if the scan were clean; this never blocks the reclaim itself.
+    for warning in info.warnings:
+        print(f"HF_CACHE_REAP: WARNING during scan: {warning}", file=sys.stderr)
+
     revisions = [rev.commit_hash for repo in info.repos for rev in repo.revisions]
     if not revisions:
         print(f"HF_CACHE_REAP: nothing to reclaim (repos=0 size_on_disk={info.size_on_disk})")
