@@ -1637,7 +1637,11 @@ def _load_reclaim_guard_state():
         try:
             with open(RECLAIM_GUARD_STATE_FILE) as f:
                 state = json.load(f)
-        except Exception:
+        except FileNotFoundError:
+            state = None   # normal on a fresh city / before the guard's first save — not an error
+        except Exception as e:
+            _log("ghost_slot_signal: could not read reclaim-guard state (%s) — "
+                 "treating every ghost as not-yet-tracked (fail-open, ga-k18kh)" % e)
             state = None
     return state if isinstance(state, dict) else {}
 
