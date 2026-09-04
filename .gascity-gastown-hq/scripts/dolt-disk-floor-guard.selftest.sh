@@ -575,6 +575,42 @@ else
   bad "_resurrect_dolt: expected a 2nd escalator call once cooldown elapsed, got $CALLS_AFTER_3"
 fi
 
+# INCONCLUSIVE post-restart probe (rc=2, e.g. a fresh process still settling
+# under a CPU burst the robust probe couldn't rule out in time) must be
+# treated as a FAILURE, not silently as success — never treat "don't know"
+# as the safe-looking outcome. Verify via the LOG content specifically
+# (distinct wording from the confirmed-down rc=1 case), not just the
+# escalator call count already proven above for rc=1. $LOG accumulates
+# across this whole suite (same as every other log-content check in this
+# file), so compare COUNTS before/after this one call rather than truncating
+# the shared file — truncating mid-suite would be safe here (this section
+# runs before any later scenario's own log-count baseline is taken) but the
+# delta approach avoids depending on that ordering fact at all.
+# ga-p5q3 note on the helper itself: `grep -c PAT FILE || echo 0` is a trap
+# when the real count is zero — grep -c still prints "0" to stdout on a
+# no-match, but EXITS 1 (its "no lines matched" convention), so the `||`
+# fires too and the substitution doubles to "0\n0", breaking arithmetic use
+# downstream. Capture grep's stdout directly (always a clean integer, "0"
+# included) and default only the genuinely-empty case (grep couldn't run at
+# all, e.g. missing file) via parameter expansion instead.
+_count() { local c; c=$(grep -c "$1" "$2" 2>/dev/null); printf '%s' "${c:-0}"; }
+INCONCLUSIVE_PRE=$(_count "INCONCLUSIVE" "$LOG")
+FAILED_UNREACHABLE_PRE=$(_count "FAILED — Dolt still unreachable" "$LOG")
+echo "$(( $(date +%s) - RESURRECT_ESCALATE_COOLDOWN_SECS - 1 ))" > "$STATE_RESURRECT_ESCALATE_FILE"
+gc_dolt_probe_robust() { return 2; }
+_resurrect_dolt 5 NONE >/dev/null 2>&1
+gc_dolt_probe_robust() { return 1; }   # restore for any test added after this point
+CALLS_AFTER_INCONCLUSIVE=$(_count CALLED "$ESCALATOR_CAPTURE")
+INCONCLUSIVE_POST=$(_count "INCONCLUSIVE" "$LOG")
+FAILED_UNREACHABLE_POST=$(_count "FAILED — Dolt still unreachable" "$LOG")
+if [ "$CALLS_AFTER_INCONCLUSIVE" = "3" ] \
+   && [ "$INCONCLUSIVE_POST" -eq $(( INCONCLUSIVE_PRE + 1 )) ] \
+   && [ "$FAILED_UNREACHABLE_POST" -eq "$FAILED_UNREACHABLE_PRE" ]; then
+  ok "_resurrect_dolt: inconclusive post-restart probe (rc=2) is treated as failure (escalates) and logged distinctly from a confirmed-down (rc=1) failure"
+else
+  bad "_resurrect_dolt: inconclusive-probe handling wrong (escalator_calls=$CALLS_AFTER_INCONCLUSIVE, INCONCLUSIVE lines pre/post=$INCONCLUSIVE_PRE/$INCONCLUSIVE_POST, FAILED-unreachable lines pre/post=$FAILED_UNREACHABLE_PRE/$FAILED_UNREACHABLE_POST)"
+fi
+
 # Success path: probe flips to healthy (rc=0) after the start attempt — must
 # notify (not escalate) and must NOT touch the escalator at all.
 NOTIFY_SUCCESS_CALLS=0

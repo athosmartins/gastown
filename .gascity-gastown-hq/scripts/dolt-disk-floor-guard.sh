@@ -734,13 +734,27 @@ _resurrect_dolt() {
   ( cd "$CITY" && GC_CITY="$CITY" timeout "$RESURRECT_TIMEOUT_SECS" "$GC" dolt start >> "$LOG" 2>&1 )
   local start_rc=$?
   sleep 5
-  if gc_dolt_probe_robust; then
+  gc_dolt_probe_robust
+  local recheck_rc=$?
+  if [ "$recheck_rc" -eq 0 ]; then
     log "resurrect OK — Dolt serving again after 'gc dolt start' (rc=${start_rc})"
     "$NOTIFY" -t "Dolt disk-floor guard" -p 4 "🔁 Dolt was confirmed down — auto-restarted via 'gc dolt start' (disk avail=${avail}GB, class=${class}). Verify the city is healthy. See ga-f4l2z." 2>/dev/null || true
     return 0
   fi
 
-  log "resurrect FAILED — Dolt still unreachable after 'gc dolt start' (rc=${start_rc})"
+  # recheck_rc=1 (confirmed still down) and recheck_rc=2 (inconclusive — e.g.
+  # a fresh process still settling under a CPU burst the robust probe
+  # couldn't rule out in time) are DELIBERATELY handled identically here: an
+  # inconclusive post-restart read must never be treated as success (that
+  # would risk silently leaving a real outage unescalated), so both fall
+  # through to the same FAILED/escalate path — the safe direction to collapse
+  # toward when uncertain. Logged distinctly so a human reading this later
+  # knows which one actually happened.
+  if [ "$recheck_rc" -eq 2 ]; then
+    log "resurrect INCONCLUSIVE — could not confirm Dolt is healthy after 'gc dolt start' (rc=${start_rc}); treating as failure (never treat unknown as success)"
+  else
+    log "resurrect FAILED — Dolt still unreachable after 'gc dolt start' (rc=${start_rc})"
+  fi
   local now_epoch last_escalate
   now_epoch=$(date +%s)
   last_escalate=""
