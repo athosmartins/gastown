@@ -100,6 +100,23 @@ _sustain_confirmed "" 2  && bad "sustain_confirmed: empty pending should fail CL
 _sustain_confirmed abc 2 && bad "sustain_confirmed: non-numeric pending should fail CLOSED"              || ok "sustain_confirmed: non-numeric pending → fails closed"
 _sustain_confirmed 1 1   && ok "sustain_confirmed: threshold=1 (sustain disabled/immediate) → confirmed on 1st sample" || bad "sustain_confirmed: 1>=1 should confirm"
 
+# ── _should_resurrect (ga-f4l2z): gate on CONFIRMED-down (probe_rc=1, the
+#    gc_dolt_probe_robust "unreachable, confirmed" code) AND disk headroom
+#    safe (class NONE/WARN only — NEVER CRITICAL: the crash-loop risk this
+#    bead exists to avoid; NEVER UNKNOWN: an unmeasurable floor is never
+#    "safe"). probe_rc=0 (healthy) and probe_rc=2 (unknown/transient, e.g. a
+#    CPU burst) must both refuse just as hard as a bad class — resurrection
+#    is only for a CONFIRMED outage, never a guess. ────────────────────────
+_should_resurrect 1 NONE     && ok "should_resurrect: confirmed-down + class=NONE → true"                                       || bad "should_resurrect 1/NONE should be true"
+_should_resurrect 1 WARN     && ok "should_resurrect: confirmed-down + class=WARN → true"                                        || bad "should_resurrect 1/WARN should be true"
+_should_resurrect 1 CRITICAL && bad "should_resurrect: confirmed-down + class=CRITICAL must NEVER resurrect (crash-loop risk)"   || ok "should_resurrect: CRITICAL disk → false (crash-loop guard)"
+_should_resurrect 1 UNKNOWN  && bad "should_resurrect: confirmed-down + class=UNKNOWN must NEVER resurrect (unmeasurable floor)" || ok "should_resurrect: UNKNOWN disk → false (unmeasurable-floor guard)"
+_should_resurrect 0 NONE     && bad "should_resurrect: probe_rc=0 (healthy) must NEVER resurrect — nothing to fix"               || ok "should_resurrect: healthy probe → false (nothing to fix)"
+_should_resurrect 0 WARN     && bad "should_resurrect: probe_rc=0 (healthy) must NEVER resurrect, even under disk WARN"          || ok "should_resurrect: healthy probe + WARN disk → false"
+_should_resurrect 2 NONE     && bad "should_resurrect: probe_rc=2 (unknown/transient) must NEVER be conflated with confirmed-down" || ok "should_resurrect: unknown/transient probe → false (never conflate with a confirmed outage)"
+_should_resurrect "" NONE    && bad "should_resurrect: empty probe_rc must NEVER resurrect"                                      || ok "should_resurrect: empty probe_rc → false"
+_should_resurrect abc NONE   && bad "should_resurrect: non-numeric probe_rc must NEVER resurrect"                                || ok "should_resurrect: non-numeric probe_rc → false"
+
 # ── _top_rss_processes: real ps/sort parsing (NOT stubbed — proves the
 #    pid,rss,comm/-k2 sort matches this machine's actual `ps` output format,
 #    same rationale as the _avail_gb(/tmp) and _vm_swap_gb() real tests
@@ -502,6 +519,83 @@ CITY="$REAL_CITY"
 rm -rf "$FAKE_CITY"
 
 echo ""
+echo "=== _resurrect_dolt: escalation cooldown (ga-f4l2z, mirrors ga-q4cqr) ==="
+# Tests the REAL _resurrect_dolt (still the function sourced from the
+# library at this point — the main()-scenario section further below is what
+# eventually stubs it out for pure wiring tests; this section MUST run
+# before that happens). gc_dolt_probe_robust, GC, and escalate_emergency.py
+# are all replaced with hermetic fakes for the duration of this section only
+# — no real 'gc dolt start', no real notify, no real page, no real Dolt data
+# touched. Uses its own disposable tmp dir throughout, independent of
+# STATE_TMP (which main()'s own scenarios set up later).
+RESURRECT_TEST_DIR="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-resurrect.XXXXXX)"
+STATE_RESURRECT_ESCALATE_FILE="$RESURRECT_TEST_DIR/.last-resurrect-escalate"
+
+# Fake escalator script that just records it was called (never the real
+# escalate_emergency.py — no real page, no real ledger write, no real mail).
+ESCALATOR_CAPTURE="$RESURRECT_TEST_DIR/calls.txt"
+: > "$ESCALATOR_CAPTURE"
+mkdir -p "$RESURRECT_TEST_DIR/scripts"
+cat > "$RESURRECT_TEST_DIR/scripts/escalate_emergency.py" <<EOF
+#!/usr/bin/env python3
+with open("$ESCALATOR_CAPTURE", "a") as f:
+    f.write("CALLED\n")
+EOF
+
+REAL_CITY_FOR_RESURRECT="$CITY"
+REAL_GC_FOR_RESURRECT="$GC"
+CITY="$RESURRECT_TEST_DIR"   # _resurrect_dolt resolves the escalator via "$CITY/scripts/..."
+GC=true                      # harmless no-op standing in for `gc dolt start`
+gc_dolt_probe_robust() { return 1; }   # post-attempt probe: "still down" — every call below exercises the FAILURE branch (the one with the cooldown)
+
+_resurrect_dolt 5 NONE >/dev/null 2>&1
+CALLS_AFTER_1=$(grep -c CALLED "$ESCALATOR_CAPTURE" 2>/dev/null || echo 0)
+if [ "$CALLS_AFTER_1" = "1" ]; then
+  ok "_resurrect_dolt: first failure escalates immediately (no wait-and-see for a confirmed outage)"
+else
+  bad "_resurrect_dolt: expected 1 escalator call after first failure, got $CALLS_AFTER_1"
+fi
+
+_resurrect_dolt 5 NONE >/dev/null 2>&1
+CALLS_AFTER_2=$(grep -c CALLED "$ESCALATOR_CAPTURE" 2>/dev/null || echo 0)
+if [ "$CALLS_AFTER_2" = "1" ]; then
+  ok "_resurrect_dolt: second consecutive failure within cooldown is SUPPRESSED (ga-q4cqr precedent: no page-every-cycle)"
+else
+  bad "_resurrect_dolt: expected escalator call count to stay at 1 (suppressed), got $CALLS_AFTER_2"
+fi
+
+# Cooldown elapsed (simulate by backdating the state file past the window) —
+# a THIRD failure must escalate again.
+echo "$(( $(date +%s) - RESURRECT_ESCALATE_COOLDOWN_SECS - 1 ))" > "$STATE_RESURRECT_ESCALATE_FILE"
+_resurrect_dolt 5 NONE >/dev/null 2>&1
+CALLS_AFTER_3=$(grep -c CALLED "$ESCALATOR_CAPTURE" 2>/dev/null || echo 0)
+if [ "$CALLS_AFTER_3" = "2" ]; then
+  ok "_resurrect_dolt: failure after cooldown elapsed escalates again (persistent outage keeps paging, just not every cycle)"
+else
+  bad "_resurrect_dolt: expected a 2nd escalator call once cooldown elapsed, got $CALLS_AFTER_3"
+fi
+
+# Success path: probe flips to healthy (rc=0) after the start attempt — must
+# notify (not escalate) and must NOT touch the escalator at all.
+NOTIFY_SUCCESS_CALLS=0
+NOTIFY=record_notify_resurrect_success
+record_notify_resurrect_success() { NOTIFY_SUCCESS_CALLS=$((NOTIFY_SUCCESS_CALLS+1)); }
+gc_dolt_probe_robust() { return 0; }
+CALLS_BEFORE_SUCCESS=$(grep -c CALLED "$ESCALATOR_CAPTURE" 2>/dev/null || echo 0)
+_resurrect_dolt 12 WARN >/dev/null 2>&1
+CALLS_AFTER_SUCCESS=$(grep -c CALLED "$ESCALATOR_CAPTURE" 2>/dev/null || echo 0)
+if [ "$NOTIFY_SUCCESS_CALLS" = "1" ] && [ "$CALLS_AFTER_SUCCESS" = "$CALLS_BEFORE_SUCCESS" ]; then
+  ok "_resurrect_dolt: successful restart (probe healthy after start) notifies once and never escalates"
+else
+  bad "_resurrect_dolt: success path wrong (notify_calls=$NOTIFY_SUCCESS_CALLS escalator_calls_before=$CALLS_BEFORE_SUCCESS after=$CALLS_AFTER_SUCCESS)"
+fi
+
+rm -rf "$RESURRECT_TEST_DIR"
+CITY="$REAL_CITY_FOR_RESURRECT"
+GC="$REAL_GC_FOR_RESURRECT"
+unset -f gc_dolt_probe_robust record_notify_resurrect_success 2>/dev/null || true
+
+echo ""
 echo "=== main(): CRITICAL-latch across reclaim reclassification (gate-fix-1: GATE-FEEDBACK gate_run=ga-wisp-9b4hnh) ==="
 # The pure-function tests above prove _should_notify is correct in ISOLATION.
 # They do NOT exercise main() itself, which is where the actual bug lived:
@@ -565,6 +659,19 @@ _top_rss_processes() { printf '%s\n' "51664 1925776 dolt" "11357 253072 claude";
 # EXECUTION code out of scope for this file (see section banner above) —
 # stubbed as a no-op here too, same as every other main()-only side effect.
 _safe_reclaim() { :; }
+
+# gc_dolt_probe_robust / _resurrect_dolt (ga-f4l2z): EXECUTION code out of
+# scope for this file — shells out to a real `gc dolt start` restart and a
+# real escalate_emergency.py page. Stubbed so main()'s WIRING to
+# _should_resurrect is what gets proven, never a real Dolt restart, real
+# notify, or real page. RESURRECT_PROBE_RC drives gc_dolt_probe_robust's
+# return code per-scenario (0/1/2, matching its real contract); RESURRECT_
+# CALLS/LAST_AVAIL/LAST_CLASS capture whether+how main() invoked
+# _resurrect_dolt, without ever running the real one.
+RESURRECT_PROBE_RC=0
+gc_dolt_probe_robust() { return "$RESURRECT_PROBE_RC"; }
+RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""
+_resurrect_dolt() { RESURRECT_CALLS=$((RESURRECT_CALLS+1)); RESURRECT_LAST_AVAIL="$1"; RESURRECT_LAST_CLASS="$2"; }
 
 # _reap_dead_scratch is new (ga-02pnu): stubbed as a no-op for the SAME reason
 # _safe_reclaim is — it's EXECUTION code (shells out to scratchpad-reaper.sh,
@@ -646,7 +753,7 @@ record_gc() {
 # shellcheck disable=SC2034  # read by main() in the sourced script
 GC=record_gc
 
-reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; }
+reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; }
 seed_state() {
   if [ -n "$1" ]; then echo "$1" > "$STATE_EPOCH_FILE"; else rm -f "$STATE_EPOCH_FILE"; fi
   if [ -n "$2" ]; then echo "$2" > "$STATE_AVAIL_FILE"; else rm -f "$STATE_AVAIL_FILE"; fi
@@ -954,6 +1061,94 @@ if [ "$REAP_LOGS_CALLS" = "1" ]; then
 else
   bad "main(): _reap_growing_logs should run unconditionally every cycle, got REAP_LOGS_CALLS=$REAP_LOGS_CALLS"
 fi
+
+echo ""
+echo "=== main(): Dolt resurrection wiring (ga-f4l2z) ==="
+# _should_resurrect's own boundaries are proven in isolation above (pure-
+# function tests). These scenarios prove main() actually WIRES to it
+# correctly — the real bug shape (disk already fine, Dolt just never came
+# back) plus the three cases that must NEVER trigger a restart attempt.
+
+# Scenario L — the common real-world shape: Dolt confirmed down (probe_rc=1)
+# + disk comfortably NONE on the FIRST read (20GB, no reclaim needed at all).
+# Must call _resurrect_dolt with the correct avail/class args, from the same
+# fast path that used to return silently before ga-f4l2z.
+reset_capture; seed_state "" ""
+RESURRECT_PROBE_RC=1
+queue_avail 20
+main
+if [ "$RESURRECT_CALLS" = "1" ] && [ "$RESURRECT_LAST_AVAIL" = "20" ] && [ "$RESURRECT_LAST_CLASS" = "NONE" ]; then
+  ok "main(): confirmed-down + class=NONE (common case: disk already fine) calls _resurrect_dolt(avail=20, class=NONE)"
+else
+  bad "main(): expected _resurrect_dolt(20, NONE) once, got CALLS=$RESURRECT_CALLS avail=$RESURRECT_LAST_AVAIL class=$RESURRECT_LAST_CLASS"
+fi
+
+# Scenario M — Dolt confirmed down + disk WARN (6GB both readings) — WARN is
+# explicitly permitted by _should_resurrect, not just NONE.
+reset_capture
+past_epoch=$(( $(date +%s) - 100 ))
+seed_state "$past_epoch" 6
+RESURRECT_PROBE_RC=1
+queue_avail 6 6
+main
+if [ "$RESURRECT_CALLS" = "1" ] && [ "$RESURRECT_LAST_CLASS" = "WARN" ]; then
+  ok "main(): confirmed-down + class=WARN calls _resurrect_dolt"
+else
+  bad "main(): expected _resurrect_dolt once with class=WARN, got CALLS=$RESURRECT_CALLS class=$RESURRECT_LAST_CLASS"
+fi
+
+# Scenario N — Dolt confirmed down + disk CRITICAL (2GB pre-reclaim) — must
+# NEVER resurrect, the exact crash-loop risk ga-f4l2z exists to avoid, even
+# though Dolt is confirmed down. Uses Scenario A's readings (2 -> 20) to also
+# prove the check keys off the PRE-reclaim class, not a same-cycle recovery.
+reset_capture; seed_critical_sustain ""
+RESURRECT_PROBE_RC=1
+queue_avail 2 20
+main
+if [ "$RESURRECT_CALLS" = "0" ]; then
+  ok "main(): confirmed-down + class=CRITICAL (even if reclaim recovers it same-cycle) never resurrects (crash-loop guard)"
+else
+  bad "main(): CRITICAL disk should never trigger resurrection, got RESURRECT_CALLS=$RESURRECT_CALLS"
+fi
+
+# Scenario O — Dolt healthy (probe_rc=0) — never resurrects, regardless of
+# disk class (nothing to fix).
+reset_capture
+RESURRECT_PROBE_RC=0
+queue_avail 20
+main
+if [ "$RESURRECT_CALLS" = "0" ]; then
+  ok "main(): healthy Dolt (probe_rc=0) never resurrects"
+else
+  bad "main(): healthy Dolt should never trigger resurrection, got RESURRECT_CALLS=$RESURRECT_CALLS"
+fi
+
+# Scenario P — probe inconclusive (probe_rc=2, unknown/transient e.g. a CPU
+# burst) — must NEVER resurrect; only a CONFIRMED outage may trigger a
+# restart attempt.
+reset_capture
+RESURRECT_PROBE_RC=2
+queue_avail 20
+main
+if [ "$RESURRECT_CALLS" = "0" ]; then
+  ok "main(): inconclusive probe (rc=2) never resurrects (not a confirmed outage)"
+else
+  bad "main(): inconclusive probe should never trigger resurrection, got RESURRECT_CALLS=$RESURRECT_CALLS"
+fi
+
+# Scenario Q — disk UNKNOWN (df unreadable) — must NEVER resurrect, even if
+# somehow confirmed-down; an unmeasurable floor is never "safe" to restart
+# into (ga-p5q3 discipline, same as _should_resurrect's own UNKNOWN branch).
+reset_capture
+RESURRECT_PROBE_RC=1
+queue_avail ""
+main
+if [ "$RESURRECT_CALLS" = "0" ]; then
+  ok "main(): disk class=UNKNOWN never resurrects, even with a confirmed-down probe (unmeasurable-floor guard)"
+else
+  bad "main(): UNKNOWN disk class should never trigger resurrection, got RESURRECT_CALLS=$RESURRECT_CALLS"
+fi
+RESURRECT_PROBE_RC=0   # restore safe default for any scenario added after this point
 
 rm -rf "$STATE_TMP"
 

@@ -103,6 +103,78 @@
 # Dolt-specific backstop underneath the general city-wide monitor, not a
 # replacement for it.
 #
+#   RESURRECT (ga-f4l2z) — when Dolt is CONFIRMED unreachable
+#                             (gc_dolt_probe_robust: retry + SELECT-1
+#                             serve-confirm, the SAME module imp08/imp24 use —
+#                             never the single-shot probe, which would
+#                             false-positive "down" on a mere CPU burst) AND
+#                             disk headroom is safe (class NONE or WARN —
+#                             NEVER CRITICAL: restarting into a still-full
+#                             disk can hit the identical ENOSPC within
+#                             seconds, the crash-loop risk this bead exists to
+#                             avoid; NEVER UNKNOWN either — an unmeasurable
+#                             floor is never "safe", same ga-p5q3 discipline
+#                             as every other decision in this file), attempts
+#                             `gc dolt start`. NOT `launchctl kickstart`, and
+#                             notably NOT relying on the plist's own
+#                             KeepAlive: the live com.gastown.dolt-server
+#                             .plist DOES already set KeepAlive
+#                             (Crashed=true), but its ProgramArguments is
+#                             `gc dolt start` itself — a LAUNCHER that forks
+#                             the real `dolt sql-server` process and then
+#                             exits 0 (success) once it confirms the spawn.
+#                             launchd only ever supervises that launcher, and
+#                             the launcher's own exit is a SuccessfulExit
+#                             (KeepAlive.SuccessfulExit=false, deliberately —
+#                             see the plist's own comment), so a LATER crash
+#                             of the real, independent dolt sql-server process
+#                             is structurally invisible to launchd: there is
+#                             no second "Crashed" event to catch, because the
+#                             process launchd is watching already exited
+#                             cleanly, long before. That is the actual
+#                             mechanism behind "presente, ultimo status 0, SEM
+#                             PID" (thies-wa's own words on ga-f4l2z) — an
+#                             external, disk-aware POLLER is the fix, not a
+#                             plist tweak. `gc dolt start` is confirmed
+#                             (Mayor's comment on ga-f4l2z) to have its own
+#                             port-resolution fallback that brings the process
+#                             up from a fully-dead state — unlike
+#                             `launchctl kickstart -k`, which re-invokes that
+#                             same launcher directly and hits the OTHER known
+#                             gap: the shared port_resolve.sh helper other
+#                             Dolt-adjacent scripts source has no such
+#                             fallback and exits EX_CONFIG (78) cold when
+#                             nothing is already up. `gc dolt start` is also
+#                             documented idempotent ("start the Dolt server if
+#                             not already running") so a probe race can never
+#                             cause this guard to disrupt an actually-healthy
+#                             Dolt. Checked on EVERY cycle, before the
+#                             disk-floor early-returns below, using the
+#                             PRE-reclaim class — the common real-world shape
+#                             (disk already recovered on its own hours ago;
+#                             only Dolt itself never came back) is exactly the
+#                             class=NONE fast path this guard used to return
+#                             from silently. Mirrors dolt-hang-watchdog.sh's
+#                             own proven restart -> reverify -> escalate
+#                             shape (same probe module) rather than inventing
+#                             a new one — but unlike that watchdog, gates the
+#                             restart on disk being safe FIRST: dolt-hang-
+#                             watchdog.sh has no disk check of its own and
+#                             would blindly retry `gc dolt restart` against a
+#                             still-full disk, hitting the identical ENOSPC
+#                             again — this guard is the one with both the
+#                             disk visibility AND the reclaim levers above, so
+#                             it is the correct place to sequence "reclaim,
+#                             THEN resurrect" rather than "restart and hope".
+#                             Failure to recover escalates via the canonical
+#                             escalate_emergency.py --class town-halted (same
+#                             path dolt-hang-watchdog.sh's own failure branch
+#                             uses) — cooldown-debounced (RESURRECT_ESCALATE
+#                             _COOLDOWN_SECS) so a persistent failure pages
+#                             once, not every single 5min cycle; see ga-q4cqr
+#                             for why an un-debounced repeat page is itself a
+#                             documented incident class in this exact file.
+#
 # OUT OF SCOPE (deliberately — see ga-gpzr's own description: "needs design...
 # this is NOT a lane:small fix"): this guard does NOT stop Dolt, does NOT refuse
 # writes, and does NOT touch Dolt's data directory. An automated system unilaterally
@@ -110,6 +182,12 @@
 # alerting + pre-sanctioned-safe cleanup, and deserves explicit Mayor/operator
 # sign-off rather than being silently bundled into a no-human-review small-lane
 # merge. Filed as a separate follow-up bead (see this commit's gate-done note).
+# (ga-f4l2z, added AFTER this paragraph was first written: this guard now DOES
+# attempt to START a CONFIRMED-dead Dolt back up — see RESURRECT above. That
+# is a materially different, much lower-risk action than the STOP/halt this
+# paragraph rules out: bringing up an already-dead process cannot itself take
+# a healthy Dolt down, `gc dolt start` is a no-op when Dolt is already
+# running, and the action is gated to disk-safe classes only.)
 #
 # Kill switch: DOLT_DISK_FLOOR_GUARD_ENABLED=0 → skip ALL FIVE reclaim actions
 # (dolt-cleanup, the scratchpad reaper, the transcript reaper, the log
@@ -163,6 +241,28 @@ STATE_AVAIL_FILE="$STATE_DIR/.dolt-disk-floor-guard.last-notify-avail-gb"
 # confirmation window — mirrors ram-pressure-monitor.sh's RPM_EMERGENCY_SUSTAIN.
 CRITICAL_MAIL_SUSTAIN="${DOLT_DISK_FLOOR_CRITICAL_MAIL_SUSTAIN:-2}"
 STATE_CRITICAL_SUSTAIN_FILE="$STATE_DIR/.dolt-disk-floor-guard.critical-sustain-count"
+
+# ga-f4l2z: bound on `gc dolt start` when resurrecting a CONFIRMED-down Dolt
+# (see _resurrect_dolt). Not yet measured for a cold start specifically after
+# an ENOSPC crash (unlike _reap_dead_transcripts's 300s, which has real
+# production timing data behind it) — picked conservatively above
+# _safe_reclaim's 60s bound for a comparable `gc dolt ___` subcommand, since a
+# cold start may replay/recover the noms journal and do more I/O than a
+# cleanup DROP. Revisit with real numbers if this ever times out in the log.
+RESURRECT_TIMEOUT_SECS="${DOLT_DISK_FLOOR_RESURRECT_TIMEOUT_SECS:-90}"
+
+# ga-f4l2z: once a resurrection attempt FAILS (Dolt still unreachable after
+# `gc dolt start`), re-escalate (page Athos again via escalate_emergency.py)
+# at most once per this window while the condition persists — mirrors
+# ga-q4cqr's CRITICAL_MAIL_SUSTAIN debounce (added to THIS file for the exact
+# same reason: a repeat-failure page firing every single 5min StartInterval
+# cycle is itself a documented incident class here, not a hypothetical one).
+# A cooldown (not a consecutive-cycle sustain counter like ga-q4cqr's) is the
+# right shape here: escalation should fire on the FIRST failure immediately
+# (there is no "wait and see if it self-recovers" case for a confirmed outage
+# the way there was for a transient disk dip), then rate-limit repeats.
+RESURRECT_ESCALATE_COOLDOWN_SECS="${DOLT_DISK_FLOOR_RESURRECT_ESCALATE_COOLDOWN_SECS:-3600}"
+STATE_RESURRECT_ESCALATE_FILE="$STATE_DIR/.dolt-disk-floor-guard.last-resurrect-escalate"
 
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
@@ -300,6 +400,27 @@ _sustain_confirmed() {
   local pending="$1" threshold="$2"
   case "$pending" in ''|*[!0-9]*) return 1 ;; esac
   [ "$pending" -ge "$threshold" ]
+}
+
+# _should_resurrect <probe_rc> <class> → 0 (true) only when Dolt is CONFIRMED
+# down (probe_rc=1 — gc_dolt_probe_robust's documented "unreachable, confirmed"
+# code, NEVER 0=healthy or 2=unknown/transient) AND disk headroom is safely
+# above the critical floor (class NONE or WARN — never CRITICAL, the exact
+# crash-loop risk ga-f4l2z warns about: restarting into a still-full disk can
+# hit the same ENOSPC within seconds; and never UNKNOWN, which means df itself
+# failed and headroom cannot be confirmed either way — an unmeasurable floor
+# must never be treated as safe, same ga-p5q3 discipline as _floor_class's own
+# UNKNOWN handling above). probe_rc=2 (unknown/transient, e.g. a CPU burst the
+# robust probe could not rule out) must never be conflated with a confirmed
+# outage — same never-treat-indeterminate-as-a-specific-value discipline this
+# whole file already applies to disk reads.
+_should_resurrect() {
+  local probe_rc="$1" class="$2"
+  [ "$probe_rc" = "1" ] || return 1
+  case "$class" in
+    NONE|WARN) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -586,6 +707,63 @@ _reap_growing_logs() {
   fi
 }
 
+# _resurrect_dolt <avail_gb> <class> — last-resort auto-respawn for a Dolt
+# sql-server CONFIRMED down while disk headroom is safe. Caller (main) has
+# already run _should_resurrect's gate; this function does the actual work.
+# See this file's own header ("RESURRECT") for the full reasoning on why
+# `gc dolt start` (not kickstart, not relying on the plist's KeepAlive) is
+# the correct action, and why dolt-hang-watchdog.sh's own restart path isn't
+# a substitute (no disk check of its own).
+#
+# Bounded by RESURRECT_TIMEOUT_SECS so a wedged start attempt can't hang this
+# guard's own cycle. Best-effort: on failure, the condition is picked up
+# again next cycle (5min StartInterval) rather than retried in a tight loop —
+# same "bounded, not looped" discipline as every other reclaim lever in this
+# file. Re-probes after a brief settle sleep to confirm the start actually
+# worked (mirrors dolt-hang-watchdog.sh's own restart->sleep->reverify shape)
+# rather than trusting `gc dolt start`'s exit code alone — a launcher that
+# exits 0 having merely INITIATED a start that then itself fails slightly
+# later (e.g. disk fills again mid-recovery) must not be logged as success.
+_resurrect_dolt() {
+  local avail="$1" class="$2"
+  if [ "$ENABLED" != "1" ]; then
+    log "resurrect SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"
+    return 1
+  fi
+  log "resurrect: Dolt CONFIRMED unreachable (gc_dolt_probe_robust) with disk safe (class=${class} avail=${avail}GB) — attempting 'gc dolt start' …"
+  ( cd "$CITY" && GC_CITY="$CITY" timeout "$RESURRECT_TIMEOUT_SECS" "$GC" dolt start >> "$LOG" 2>&1 )
+  local start_rc=$?
+  sleep 5
+  if gc_dolt_probe_robust; then
+    log "resurrect OK — Dolt serving again after 'gc dolt start' (rc=${start_rc})"
+    "$NOTIFY" -t "Dolt disk-floor guard" -p 4 "🔁 Dolt was confirmed down — auto-restarted via 'gc dolt start' (disk avail=${avail}GB, class=${class}). Verify the city is healthy. See ga-f4l2z." 2>/dev/null || true
+    return 0
+  fi
+
+  log "resurrect FAILED — Dolt still unreachable after 'gc dolt start' (rc=${start_rc})"
+  local now_epoch last_escalate
+  now_epoch=$(date +%s)
+  last_escalate=""
+  [ -f "$STATE_RESURRECT_ESCALATE_FILE" ] && last_escalate="$(cat "$STATE_RESURRECT_ESCALATE_FILE" 2>/dev/null)"
+  if ! _cooldown_elapsed "$last_escalate" "$now_epoch" "$RESURRECT_ESCALATE_COOLDOWN_SECS"; then
+    log "resurrect escalation SUPPRESSED — already escalated within the last ${RESURRECT_ESCALATE_COOLDOWN_SECS}s (avoids paging every 5min cycle while unresolved, ga-q4cqr precedent)"
+    return 1
+  fi
+
+  local escalator="$CITY/scripts/escalate_emergency.py"
+  if [ ! -f "$escalator" ]; then
+    log "resurrect escalation SKIP — $escalator not found"
+    return 1
+  fi
+  python3 "$escalator" --class town-halted \
+    --title "dolt-disk-floor-guard: auto-restart did not recover Dolt" \
+    "Dolt was confirmed down (gc_dolt_probe_robust) with disk safe (avail=${avail}GB, class=${class}) but 'gc dolt start' (rc=${start_rc}) did not bring it back. NEEDS HUMAN: run 'gc dolt start' by hand and investigate. See ga-f4l2z for background — the Mayor's comment there also notes 'gc start --dry-run' failed once with 'gc-fatal: gc start failed', which may be the same root cause." \
+    >> "$LOG" 2>&1 || log "WARN: escalate_emergency.py call failed (non-fatal)"
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  echo "$now_epoch" > "$STATE_RESURRECT_ESCALATE_FILE" 2>/dev/null || true
+  return 1
+}
+
 main() {
   local avail class now
 
@@ -606,6 +784,29 @@ main() {
   # levers below — it is non-recoverable without a reboot.
   local vm_gb; vm_gb="$(_vm_swap_gb)"
   log "vm_swap_gb=${vm_gb:-unknown} (macOS virtual memory, /System/Volumes/VM — same APFS container as \$DOLTDIR, non-recoverable without reboot; ga-sfj3i.2)"
+
+  # ga-f4l2z: resurrection check runs BEFORE the disk-floor early-returns
+  # below (including the class=NONE fast path) and uses the PRE-reclaim
+  # class — the common real-world shape is disk already comfortably NONE
+  # (recovered on its own hours ago) with Dolt simply never having come back
+  # on its own; that case must not wait for a WARN/CRITICAL breach to even be
+  # considered. _should_resurrect's own gate (never CRITICAL, never UNKNOWN)
+  # is what actually restricts when this can act — see this file's own
+  # header ("RESURRECT") for the full reasoning. Skipped entirely if the
+  # probe module failed to source (fail-open, same guard _safe_reclaim
+  # already uses for gc_dolt_probe) — never treat "can't probe" as "must
+  # resurrect". Deliberately NOT re-evaluated against the post-reclaim class
+  # later in this function: a cycle that reads CRITICAL here defers
+  # resurrection to the NEXT cycle even if reclaim happens to recover it
+  # same-cycle — a one-cycle (5min) delay is the safe tradeoff against ever
+  # trusting a same-cycle recovery enough to restart into it.
+  if [ "$class" != "UNKNOWN" ] && declare -f gc_dolt_probe_robust >/dev/null 2>&1; then
+    gc_dolt_probe_robust
+    local probe_rc=$?
+    if _should_resurrect "$probe_rc" "$class"; then
+      _resurrect_dolt "$avail" "$class"
+    fi
+  fi
 
   if [ "$class" = "UNKNOWN" ]; then
     log "WARN: could not read avail space for $DOLTDIR (df failed/unparseable) — cannot verify Dolt's disk floor this cycle"
