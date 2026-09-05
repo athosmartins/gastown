@@ -1,0 +1,101 @@
+#!/bin/bash
+# crew-pushguard-check.sh — detecta clone de crew cujo pre-push NÃO RODA
+# (wa-a4np9). Detection-only: NÃO conserta, só grita.
+#
+# POR QUE ISTO EXISTE
+# Em 04/09 descobrimos que 4 clones de crew estavam há ~8 SEMANAS sem o guard
+# que bloqueia push direto na main — e ninguém percebeu, porque a falha é
+# silenciosa por construção: `core.hooksPath` aponta pra um diretório cujo
+# `pre-push` é symlink morto, o git substitui `.git/hooks` por esse caminho,
+# não acha o hook e NÃO RODA NADA, sem erro. Um crew pousou commit em main sem
+# revisão por causa disso.
+#
+# A ARMADILHA QUE ESTE CHECK EXISTE PRA EVITAR (batista-wa, 04/09)
+# Havia DOIS formatos de quebra, e um conserto/checagem genérico só pega um:
+#   - hooksPath aponta pra FORA (alvo inexistente)      -> `unset` resolve
+#   - hooksPath aponta pro lugar CERTO e o ARQUIVO lá é que está morto
+#     (symlink pra worktree apagada)                    -> `unset` NÃO resolve
+# Por isso este check NUNCA olha o VALOR da config. Ele resolve o diretório
+# efetivo de hooks e testa se o ARQUIVO pre-push existe seguindo symlink
+# (`test -e`), que é a única pergunta que corresponde ao que o git faz.
+# Verificar config e concluir "está tudo certo" foi exatamente o modo de falha
+# que deixou a mila quebrada parecendo consertada.
+#
+# E NÃO PODE DEPENDER DO HOOK PRA DENUNCIAR QUE O HOOK NÃO RODA — seria
+# circular. Por isso isto é um sweep externo, periódico, por clone.
+
+set -uo pipefail
+
+WA_ROOT="${WA_ROOT:-/Users/athos/gt/whatsapp_automation}"
+CREW_DIR="${WA_ROOT}/crew"
+HOOK_NAME="pre-push"
+
+BROKEN=""
+CHECKED=0
+
+[ -d "$CREW_DIR" ] || { echo "crew-pushguard-check: sem $CREW_DIR — nada a checar"; exit 0; }
+
+for clone in "$CREW_DIR"/*/; do
+    [ -d "${clone}.git" ] || continue          # não é clone git — pula
+    name=$(basename "$clone")
+
+    # Diretório EFETIVO de hooks, exatamente como o git resolve:
+    # core.hooksPath quando setado (relativo ao clone se não for absoluto),
+    # senão .git/hooks.
+    hp=$(git -C "$clone" config --get core.hooksPath 2>/dev/null || true)
+    if [ -z "$hp" ]; then
+        hooks_dir="${clone}.git/hooks"
+    elif [ "${hp#/}" != "$hp" ]; then
+        hooks_dir="$hp"                         # absoluto
+    else
+        hooks_dir="${clone}${hp}"               # relativo ao clone
+    fi
+
+    CHECKED=$((CHECKED + 1))
+
+    # A ÚNICA pergunta que importa: o arquivo que o git vai executar EXISTE?
+    # -e segue symlink de propósito — symlink morto tem que reprovar.
+    if [ ! -e "${hooks_dir}/${HOOK_NAME}" ]; then
+        BROKEN="${BROKEN}${BROKEN:+, }${name} (hooks_dir=${hooks_dir})"
+        continue
+    fi
+    # Existe mas não é executável = também não roda.
+    if [ ! -x "${hooks_dir}/${HOOK_NAME}" ]; then
+        BROKEN="${BROKEN}${BROKEN:+, }${name} (não-executável: ${hooks_dir}/${HOOK_NAME})"
+    fi
+done
+
+if [ -z "$BROKEN" ]; then
+    echo "crew-pushguard-check: OK — ${CHECKED} clone(s), todos com ${HOOK_NAME} resolvendo"
+    exit 0
+fi
+
+echo "crew-pushguard-check: GUARD AUSENTE em ${BROKEN}"
+
+# Alerta por mail (canal que não depende do hook nem do git local).
+if command -v gc >/dev/null 2>&1; then
+    gc mail send mayor/ --from controller \
+        -s "Guard de push ausente em clone de crew (wa-a4np9)" \
+        -m "Clone(s) de crew SEM pre-push que resolva — push direto na main passa batido nesses clones:
+
+${BROKEN}
+
+Checado: ${CHECKED} clone(s) em ${CREW_DIR}.
+
+Como este check decide (e por que não olha a config): ele resolve o diretório
+efetivo de hooks (core.hooksPath, ou .git/hooks) e testa se o ARQUIVO pre-push
+existe SEGUINDO symlink. Config apontando pro lugar certo com arquivo morto
+dentro é justamente o caso que passa numa conferência de config e reprova aqui.
+
+Conserto depende do formato da quebra:
+  - hooksPath aponta pra fora / alvo inexistente -> git -C <clone> config --unset core.hooksPath
+  - arquivo dentro do hooks_dir é symlink morto  -> recriar o symlink pro
+    scripts/hooks/pre-push do PRÓPRIO clone
+Depois, PROVE comportamentalmente (não pela config):
+  echo 'refs/heads/main a refs/heads/main b' | (cd <clone> && ./.git/hooks/pre-push origin <url>)
+deve imprimir 'BLOQUEADO'. Atenção: 'git push --dry-run' NÃO serve de prova
+quando o branch está atrás — o remoto rejeita antes do hook rodar e o teste dá
+falso-inconclusivo (medido 04/09 no clone do digo)." >/dev/null 2>&1 || true
+fi
+
+exit 1
