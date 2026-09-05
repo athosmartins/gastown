@@ -577,7 +577,19 @@ PY
   SJ_MISSING="$(echo "$SJ_MISSING" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
   SJ_UNLOADED="$(echo "$SJ_UNLOADED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
   if [ -n "${SJ_MISSING// /}" ] || [ -n "${SJ_UNLOADED// /}" ]; then
-    AFFECTED="$SJ_CHECKED"
+    # gate_run=ga-3khhu (Reviewer-1 FAIL): this used to be AFFECTED="$SJ_CHECKED"
+    # — the FULL set of plists this deploy touched, fine ones included, not
+    # just the broken ones. Step 4's kickstart loop below walks every AFFECTED
+    # label, so a deploy that ALSO made a cosmetic edit to an already-
+    # installed+loaded+live SAFE daemon's plist swept that fine daemon in too
+    # and it got kickstarted for zero reason — a live process with no code
+    # change and no installation problem, reproduced by combining a T4-shaped
+    # fine-but-touched plist with a T37-shaped never-installed one in one
+    # deploy (see T42). AFFECTED must carry only the labels that are actually
+    # missing/unloaded. SJ_MISSING and SJ_UNLOADED are disjoint by construction
+    # (the if/elif above sets exactly one or neither per label), so no extra
+    # dedup is needed here — line ~1105's existing normalize pass covers it.
+    AFFECTED="$SJ_MISSING $SJ_UNLOADED"
     SJ_REASON="scheduled-job plist(s) changed by this deploy are not actually installed for launchd to run them"
     [ -n "${SJ_MISSING// /}" ] && SJ_REASON="$SJ_REASON — missing from $LAUNCH_AGENTS_DIR: $SJ_MISSING"
     [ -n "${SJ_UNLOADED// /}" ] && SJ_REASON="$SJ_REASON — present but not loaded (launchctl list): $SJ_UNLOADED"
@@ -586,8 +598,16 @@ PY
     # Step 2 nunca rodaria. Registra e segue; emit combina no fim.
     SJ_PENDING_REASON="$SJ_REASON"
   fi
-  if [ -n "${SJ_CHECKED// /}" ]; then
-    log "Step 1b: scheduled-job plist(s) changed by this deploy are installed+loaded:$SJ_CHECKED (not proof they have run successfully — see JOB_NOT_INSTALLED's own ACTION text at the caller for that follow-up check)."
+  # gate_run=ga-3khhu: the log line below used to name the FULL $SJ_CHECKED,
+  # which could (and did, in the reviewer's repro) name a label the block
+  # above had just reported MISSING one line earlier — self-contradictory.
+  # Exclude anything already counted as missing/unloaded.
+  SJ_FINE="$(comm -23 \
+    <(echo "$SJ_CHECKED" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+    <(printf '%s\n%s\n' "$SJ_MISSING" "$SJ_UNLOADED" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+    | tr '\n' ' ' | sed 's/ $//')"
+  if [ -n "${SJ_FINE// /}" ]; then
+    log "Step 1b: scheduled-job plist(s) changed by this deploy are installed+loaded:$SJ_FINE (not proof they have run successfully — see JOB_NOT_INSTALLED's own ACTION text at the caller for that follow-up check)."
   fi
 fi
 

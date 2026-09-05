@@ -1489,6 +1489,67 @@ echo "$R41" | grep -qi "NEEDS_GUARDED_RESTART" && ok "T41 REASON tambem nomeia o
 ! grep -q "com.test.central-sender" "$MOCK/kicks.log" 2>/dev/null && ok "T41 daemon sensivel NAO foi bouncado" || nok "T41 no-bounce" "kickstart: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 [ "$(field PROOF "$OUT")" = "not_verified" ] && ok "T41 PROOF=not_verified (nada foi verificado)" || nok "T41 proof" "got '$(field PROOF "$OUT")'"
 
+# ════════════════════════════════════════════════════════════════════════════
+# T42 (gate ga-3khhu): a deploy that (a) makes a purely cosmetic edit to an
+#     already-installed+loaded+LIVE SAFE daemon's plist (its .py never
+#     changes), (b) separately ships a genuinely-broken never-installed
+#     scheduled-job plist, and (c) touches an unrelated .py file (so the "no
+#     python/template changed" short-circuit above doesn't pre-empt Step 2-4,
+#     the same reason T41 needed one).
+#
+#     Pre-fix, AFFECTED="$SJ_CHECKED" swept EVERY plist label this deploy
+#     touched into AFFECTED — fine ones included — and Step 4's kickstart loop
+#     walks every AFFECTED label. Reproduced live against 40b5e9b7: the FINE,
+#     unrelated, live daemon (com.test.safeexisting) got swept in and actually
+#     kickstarted — a real unwanted production restart of a daemon with zero
+#     code change and zero installation problem, exactly the side effect the
+#     SENSITIVE_DAEMONS/guard/drain machinery exists to prevent, reachable
+#     through a different door. Same root cause also self-contradicted the
+#     log: "installed+loaded:$SJ_CHECKED" could (and did) name a label the
+#     line directly above it had just reported MISSING.
+#
+#     This test FAILS against the pre-fix code (com.test.safeexisting shows up
+#     in kicks.log) and passes after.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t42
+# (a) SAFE daemon, already correctly delivered: plist exists in $AGENTS,
+# loaded+live, and its OWN .py never changes this deploy.
+cat > "$RUNTIME/daemons/safeexisting.py" <<<'print("nothing changed here")'
+make_plist "$RUNTIME/launchd" com.test.safeexisting "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/safeexisting.py"
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && git commit -q -m base --allow-empty )
+PRE=$(git -C "$RUNTIME" rev-parse HEAD)
+make_plist "$AGENTS" com.test.safeexisting "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/safeexisting.py"
+seed_running com.test.safeexisting 4201 "$STALE_LSTART"
+# ONE deploy commit does all three things at once:
+# (a) cosmetic edit to safeexisting's plist — Label/entrypoint unchanged
+make_plist "$RUNTIME/launchd" com.test.safeexisting "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/safeexisting.py" --cosmetic-flag
+# (b) a genuinely never-installed scheduled job
+make_plist "$RUNTIME/launchd" com.test.newjob "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/newjob.py"
+# (c) unrelated .py, mapping to no daemon, just to clear the short-circuit
+cat > "$RUNTIME/daemons/unrelated_util.py" <<<'print("unrelated")'
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && \
+  GIT_AUTHOR_DATE="@$POST_COMMIT_EPOCH" GIT_COMMITTER_DATE="@$POST_COMMIT_EPOCH" \
+  git commit -q -m deploy )
+POST=$(git -C "$RUNTIME" rev-parse HEAD)
+# (b) de proposito NAO copiamos com.test.newjob.plist pra $AGENTS
+OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" PRE_DEPLOY_SHA="$PRE" POST_DEPLOY_SHA="$POST" \
+  DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
+  EXTRA_RUNTIME_ROOTS="${EXTRA_RUNTIME_ROOTS:-}" LAUNCH_AGENTS_DIR="$AGENTS" \
+  LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
+  DRY_RUN=0 bash "$HELPER" 2>"$MOCK/stderr.log"); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "JOB_NOT_INSTALLED" ] && ok "T42 verdict JOB_NOT_INSTALLED (job nao instalado continua sendo o veredito)" || nok "T42 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -ne 0 ] && ok "T42 non-zero exit" || nok "T42 exit" "rc=$RC"
+# O CORACAO DESTE TESTE: o daemon fino (zero mudanca de codigo, zero problema
+# de instalacao) nunca foi kickstartado.
+! grep -q "com.test.safeexisting" "$MOCK/kicks.log" 2>/dev/null && ok "T42 daemon SAFE ja-fino NAO foi kickstartado" || nok "T42 kickstart indevido" "kickstart: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+! echo "$(field AFFECTED "$OUT")" | grep -q "com.test.safeexisting" && ok "T42 AFFECTED exclui o daemon fino" || nok "T42 AFFECTED nao deveria conter o daemon fino" "AFFECTED=$(field AFFECTED "$OUT")"
+R42="$(field REASON "$OUT")"
+echo "$R42" | grep -q "com.test.newjob" && ok "T42 REASON nomeia o job nao instalado" || nok "T42 reason job" "$R42"
+# O log nao pode se autocontradizer: newjob (MISSING) nao pode aparecer na
+# linha "installed+loaded".
+! grep "installed+loaded" "$MOCK/stderr.log" 2>/dev/null | grep -q "com.test.newjob" && ok "T42 log nao se autocontradiz sobre newjob" || nok "T42 log autocontraditorio: newjob aparece como installed+loaded" "$(grep 'installed+loaded' "$MOCK/stderr.log" 2>/dev/null)"
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"
