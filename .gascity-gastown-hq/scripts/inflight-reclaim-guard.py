@@ -251,6 +251,26 @@ and this file's fix already satisfies the measured acceptance criterion (a
 double-booked bead reclaims within RECLAIM_TTL, not 344min) as a compensating
 control regardless of whether the double-dispatch itself is ever prevented.
 See the ga-zbrbt bead for the follow-up filed to root-cause the dispatch side.
+
+gate-fix-3 round 2 (gate_run=ga-1f8fm): the fix above closed the DIRECT-
+assignee shape (compute_multi_assigned_assignees() over list_inflight_beads())
+but missed Pilot's SLING-wrapper dispatch shape (ga-qfo3) entirely —
+list_live_sling_source_beads() computed its own protected-bead set from a
+DIFFERENT bead list (in_progress sling wrappers, not story beads) via the
+same session_is_live() call, with session_multi_assigned always omitted. A
+session double-booked across two sling wrappers therefore still got an
+unconditional pass, and run_cycle's Pass 1 ORs that pass in AFTER its own
+correctly-gated direct check, undoing it. Fixed by having
+list_live_sling_source_beads() compute a second, sling-scoped multi-
+assignment set from the same sling beads it already fetches (mirroring
+compute_multi_assigned_assignees(), keyed by sling bead id) and threading
+it into its own session_is_live() call. Also closed the related, lower-
+severity instance the same review flagged: heal_orphan_sweep_false_resets()
+now takes the already-computed multi_assigned_assignees set (default empty
+— no behavior change for existing callers) so it never RE-assigns a
+wrongfully-reset bead onto a session that is already the live builder of a
+DIFFERENT in-flight bead, which would otherwise manufacture a fresh
+double-booking instead of merely missing one.
 """
 import json
 import os
@@ -1919,6 +1939,21 @@ def list_live_sling_source_beads(sessions, now):
     Fail-safe: returns None on HQ query error (caller skips the cycle,
     matching the existing contract for the other list_* functions in this
     file). Rig-store fan-out is fail-open per store (ga-mfeip pattern).
+
+    gate-fix-3 (ga-zbrbt, round 2, gate_run=ga-1f8fm reviewer finding): a
+    session double-booked across TWO sling wrappers (each wrapping a
+    DIFFERENT original story bead) was invisible to run_cycle's
+    compute_multi_assigned_assignees() — that function only scans
+    list_inflight_beads()-shaped beads (Pilot-marked stories with a truthy
+    assignee), but a sling-dispatched target bead's OWN assignee is blank
+    by design (ga-qfo3, see above), so neither the target bead nor the
+    sling bead itself was ever counted there. This function now computes
+    its OWN multi-assignment set from the sling beads it already fetches
+    (keyed by sling bead id, mirroring compute_multi_assigned_assignees'
+    logic) and threads it into session_is_live() as session_multi_assigned
+    — a session holding 2+ distinct in_progress sling beads at once needs
+    per-bead evidence (bead_update_age) before either is treated as
+    protected, exactly like the direct-assignee case.
     """
     try:
         result = subprocess.run(
@@ -1932,24 +1967,7 @@ def list_live_sling_source_beads(sessions, now):
     except Exception:
         return None
 
-    def _collect(candidate_beads, into):
-        for b in candidate_beads:
-            title = b.get("title") or ""
-            match = _SLING_TITLE_RE.match(title)
-            if not match:
-                continue
-            assignee = b.get("assignee") or ""
-            if not assignee:
-                continue
-            bead_update_epoch = parse_iso_epoch(b.get("updated_at", ""))
-            bead_update_age = (
-                (now - bead_update_epoch) if bead_update_epoch is not None else None
-            )
-            if session_is_live(assignee, sessions, now, bead_update_age):
-                into.add(match.group(1))
-
-    protected = set()
-    _collect(data, protected)
+    all_slings = list(data)
 
     # Rig stores — fail-open per store (ga-mfeip cross-store consistency).
     # ga-u8fly: _list_rig_stores() can now return None (enumeration failure,
@@ -1977,9 +1995,48 @@ def list_live_sling_source_beads(sessions, now):
             rig_data = json.loads(r.stdout)
             if not isinstance(rig_data, list):
                 continue
-            _collect(rig_data, protected)
+            all_slings.extend(rig_data)
         except Exception:
             continue  # fail-open: skip this rig
+
+    # gate-fix-3 round 2: sling-level double-booking, computed over the same
+    # all_slings list gathered above. Coordinator/bare-pool-template
+    # exclusions mirror compute_multi_assigned_assignees for the same
+    # reasons (session_is_live() already short-circuits coordinators
+    # regardless of this flag; a bare template assignee never matches a
+    # concrete session's identifiers, so it would never be protected
+    # either way) — kept for consistency, not because either changes this
+    # function's output. No epic exclusion needed: Pilot always creates
+    # sling beads as issue_type=task (e.g. ga-28sti, this very fix's own
+    # dispatch wrapper), so an epic can never match _SLING_TITLE_RE's
+    # "fix bug <id>:" / "build story <id>:" title shape.
+    _sling_counts = {}
+    for b in all_slings:
+        title = b.get("title") or ""
+        if not _SLING_TITLE_RE.match(title):
+            continue
+        a = b.get("assignee") or ""
+        bid = b.get("id", "")
+        if a and bid and not is_coordinator(a) and a not in EPHEMERAL_POOL_ASSIGNEES:
+            _sling_counts.setdefault(a, set()).add(bid)
+    sling_multi_assigned = {a for a, ids in _sling_counts.items() if len(ids) > 1}
+
+    protected = set()
+    for b in all_slings:
+        title = b.get("title") or ""
+        match = _SLING_TITLE_RE.match(title)
+        if not match:
+            continue
+        assignee = b.get("assignee") or ""
+        if not assignee:
+            continue
+        bead_update_epoch = parse_iso_epoch(b.get("updated_at", ""))
+        bead_update_age = (
+            (now - bead_update_epoch) if bead_update_epoch is not None else None
+        )
+        if session_is_live(assignee, sessions, now, bead_update_age,
+                            session_multi_assigned=assignee in sling_multi_assigned):
+            protected.add(match.group(1))
 
     return frozenset(protected)
 
@@ -3351,9 +3408,20 @@ def _has_orphan_sweep_reset_marker(labels):
     return "orphan-sweep:reset" in labels
 
 
-def heal_orphan_sweep_false_resets(sessions, now):
+def heal_orphan_sweep_false_resets(sessions, now, multi_assigned_assignees=frozenset()):
     """Restore beads whose claim was wrongfully reset by order:orphan-sweep
     (ga-seuh4/ga-a8t68) while the claiming session was still genuinely alive.
+
+    gate-fix-3 (ga-zbrbt, round 2 reviewer finding, related lower-severity
+    instance): `multi_assigned_assignees` — run_cycle's already-computed
+    compute_multi_assigned_assignees() result, default empty so every
+    existing caller (including this file's own SH-* selftests) keeps prior
+    behavior unchanged — is threaded into the liveness check below. A
+    session already the live assignee of ANOTHER real in-flight bead has
+    the same ambiguous last_active this whole bug is about; healing (i.e.
+    RE-assigning) this candidate back onto that same session without
+    per-bead evidence would not just miss a detection, it would manufacture
+    a brand-new double-booking on the spot.
 
     See the module docstring's "ga-seuh4 / ga-a8t68" section for the full
     root-cause writeup. In short: orphan-sweep.sh's own is_known_agent() check
@@ -3488,8 +3556,10 @@ def heal_orphan_sweep_false_resets(sessions, now):
         bead_update_epoch = parse_iso_epoch(b.get("updated_at", ""))
         if bead_update_epoch is None or (now - bead_update_epoch) > RECLAIM_TTL:
             continue
-        if not concrete_adhoc_session_is_live(stale_assignee, sessions, now):
-            continue  # genuinely dead — leave for normal re-dispatch
+        if not concrete_adhoc_session_is_live(
+                stale_assignee, sessions, now,
+                session_multi_assigned=stale_assignee in multi_assigned_assignees):
+            continue  # genuinely dead, or double-booked without per-bead evidence — leave for normal re-dispatch
         if not has_orphan_sweep_marker:
             # ga-f6igb round 2 (GATE-FEEDBACK blocking issue 1): no positive
             # attribution to orphan-sweep — this reset could equally be an
@@ -3890,7 +3960,7 @@ def run_cycle(state, escalated_alerted):
     # even if a later query in this cycle fails, since a stranded false-reset
     # left unhealed only gets harder to recover the longer it waits.
     try:
-        heal_orphan_sweep_false_resets(sessions, now)
+        heal_orphan_sweep_false_resets(sessions, now, multi_assigned_assignees)
     except Exception as exc:
         print(f"[INFLIGHT-RECLAIM] warn: self-heal pass failed: {exc}", flush=True)
 
@@ -5270,6 +5340,49 @@ def _selftest():
         )
         check("SL-8c: reclaim_decision — noop instead of the false 'reclaim' seen in the incident",
               _sl8_decision == "noop", f"got={_sl8_decision!r}")
+
+        # --- SL-9/10 (gate-fix-3 round 2, gate_run=ga-1f8fm reviewer finding):
+        # a session double-booked across TWO sling wrappers — invisible to
+        # compute_multi_assigned_assignees() because a sling-dispatched
+        # target bead's own assignee is blank by design (ga-qfo3), so
+        # neither original bead was ever counted there. ---
+        subprocess.run = _stub_inprogress([
+            {"id": "ga-slingA", "title": "fix bug ga-storyA: something", "assignee": "dog-ga5e06",
+             "updated_at": ""},
+            {"id": "ga-slingB", "title": "fix bug ga-storyB: something else", "assignee": "dog-ga5e06",
+             "updated_at": ""},
+        ])
+        _sl9 = list_live_sling_source_beads(_sl_live_sessions, T_pz)
+        check("SL-9: SAME assignee double-booked across TWO in_progress sling wrappers, "
+              "NEITHER sling has its own fresh bead_update_age → NEITHER original story bead "
+              "is protected (the exact gap this round closes: fresh session-level activity "
+              "alone no longer vouches for either sling)",
+              _sl9 == frozenset(), f"got={_sl9!r}")
+
+        subprocess.run = _stub_inprogress([
+            {"id": "ga-slingC", "title": "fix bug ga-storyC: something", "assignee": "dog-ga5e06",
+             "updated_at": _sl_fresh_ts},
+            {"id": "ga-slingD", "title": "fix bug ga-storyD: something else", "assignee": "dog-ga5e06",
+             "updated_at": ""},
+        ])
+        _sl10 = list_live_sling_source_beads(_sl_live_sessions, T_pz)
+        check("SL-10: same double-booked assignee, but ga-slingC carries its OWN fresh "
+              "bd-update (per-sling evidence) while ga-slingD does not → only ga-storyC "
+              "(behind the sling with fresh evidence) is protected; ga-storyD is correctly "
+              "left reclaimable",
+              _sl10 == frozenset({"ga-storyC"}), f"got={_sl10!r}")
+
+        # --- SL-11 (no-regression guard): a SINGLE sling wrapper per assignee
+        # (the ordinary, non-double-booked shape every other SL-* case above
+        # exercises) is completely unaffected by this round's change ---
+        subprocess.run = _stub_inprogress([
+            {"id": "ga-vw39", "title": "fix bug ga-z6uo: chronic Dolt handle bug",
+             "assignee": "dog-ga5e06", "updated_at": ""},
+        ])
+        _sl11 = list_live_sling_source_beads(_sl_live_sessions, T_pz)
+        check("SL-11 (no-regression guard): single sling wrapper, no double-booking → "
+              "still protected exactly as SL-1",
+              _sl11 == frozenset({"ga-z6uo"}), f"got={_sl11!r}")
     finally:
         subprocess.run = _orig_run_sl
 
@@ -7583,6 +7696,79 @@ def _selftest():
               any(c[:2] == ["bd", "label"] and c[2:5] == ["remove", "ga-shtest13", "orphan-sweep:reset"]
                   for c in _sh13_label_calls),
               f"label calls={_sh13_label_calls!r}")
+    finally:
+        subprocess.run = _orig_run_sh
+
+    # SH-14/14b (gate-fix-3 round 2, related lower-severity reviewer finding):
+    # multi_assigned_assignees threading. Same positive-heal shape as SH-12
+    # (orphan-sweep:reset marker present, live session) but the stale
+    # assignee needs its OWN fresh last_active (not the ambient
+    # _sh_live_sessions' missing-field/conservative-True path SH-1..13 rely
+    # on) so the activity_age branch is actually exercised — otherwise
+    # session_owner_is_healthy's "activity_age is None -> True" short-circuit
+    # would return True before session_multi_assigned is ever consulted,
+    # and this test would pass for the wrong reason.
+    _sh14_live_sessions = [
+        {"id": "sid-live1", "name": "gastown.dog-1", "session_name": "dog-galive1",
+         "alias": "gastown.dog-1", "agent_name": "gastown.dog-1", "state": "active",
+         "last_active": _sh_ts(30)},
+    ]
+    _sh14_update_calls = []
+
+    def _stub_sh14(cmd, **kw):
+        if cmd[:2] == ["bd", "list"]:
+            return _FakeGitResult(0, json.dumps(
+                [_sh_bead("ga-shtest14", "dog-galive1", labels=["orphan-sweep:reset"])]))
+        if cmd[:2] == ["bd", "update"]:
+            _sh14_update_calls.append(list(cmd))
+            return _FakeGitResult(0, "")
+        if cmd[:2] == ["bd", "label"]:
+            return _FakeGitResult(0, "")
+        if cmd[:2] == ["bd", "show"]:
+            return _FakeGitResult(0, json.dumps({"id": "ga-shtest14", "labels": []}))
+        if cmd[:2] == ["bd", "comment"]:
+            return _FakeGitResult(0, "")
+        return _FakeGitResult(0, "")
+
+    subprocess.run = _stub_sh14
+    try:
+        _healed14 = heal_orphan_sweep_false_resets(
+            _sh14_live_sessions, T_sh, multi_assigned_assignees={"dog-galive1"})
+        check("SH-14 (gate-fix-3 round 2): candidate would otherwise heal (marker present, "
+              "live+fresh session, same shape as SH-12) but stale_assignee is ALSO in "
+              "multi_assigned_assignees (busy on a DIFFERENT real in-flight bead this cycle) "
+              "-> NOT healed without per-bead evidence — restoring this claim would "
+              "manufacture a fresh double-booking instead of merely missing one",
+              _healed14 == 0 and _sh14_update_calls == [],
+              f"healed={_healed14} calls={_sh14_update_calls!r}")
+    finally:
+        subprocess.run = _orig_run_sh
+
+    _sh14b_update_calls = []
+
+    def _stub_sh14b(cmd, **kw):
+        if cmd[:2] == ["bd", "list"]:
+            return _FakeGitResult(0, json.dumps(
+                [_sh_bead("ga-shtest14b", "dog-galive1", labels=["orphan-sweep:reset"])]))
+        if cmd[:2] == ["bd", "update"]:
+            _sh14b_update_calls.append(list(cmd))
+            return _FakeGitResult(0, "")
+        if cmd[:2] == ["bd", "label"]:
+            return _FakeGitResult(0, "")
+        if cmd[:2] == ["bd", "show"]:
+            return _FakeGitResult(0, json.dumps({"id": "ga-shtest14b", "labels": []}))
+        if cmd[:2] == ["bd", "comment"]:
+            return _FakeGitResult(0, "")
+        return _FakeGitResult(0, "")
+
+    subprocess.run = _stub_sh14b
+    try:
+        _healed14b = heal_orphan_sweep_false_resets(_sh14_live_sessions, T_sh)
+        check("SH-14b (no-regression guard): identical shape, multi_assigned_assignees "
+              "OMITTED (default empty, every pre-existing caller/selftest above) -> "
+              "healed exactly as SH-12",
+              _healed14b == 1 and len(_sh14b_update_calls) == 1,
+              f"healed={_healed14b} calls={_sh14b_update_calls!r}")
     finally:
         subprocess.run = _orig_run_sh
 
