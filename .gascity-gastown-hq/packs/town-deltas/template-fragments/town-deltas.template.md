@@ -334,10 +334,42 @@ ga-gye3f, ga-f6igb, ga-vu718. Escrever o patch NÃO tem blast radius nenhum —
 quem tem é o build+swap. Congelar o conserto junto com o deploy é guarda
 larga demais, e o custo é backlog parado indefinidamente.
 
+**Antes do passo 1 — confirme que você está no repo CERTO. "gascity" nomeia 3
+coisas diferentes nesta cidade, e confundi-las já produziu o MESMO falso alarme
+duas vezes, em direções opostas (ga-sn68o, ga-c2w3k; doc gap ga-7jscz):**
+
+1. O `gc rig` chamado "gascity" → `git_repo` é `/Users/athos/gt`, cujos
+   remotes se chamam "gastown" (`athosmartins/gastown` / `gastownhall/gastown`).
+   Este é o repo do FRAMEWORK/orquestração — CLAUDE.md, docs/, packs/ (este
+   arquivo incluso). **NÃO** é o source do binário `gc`.
+2. `.gascity-gastown-hq/gascity/` → diretório puro, sem `.git` próprio.
+   `git` executado "dentro" dele resolve **silenciosamente** pro repo #1
+   acima (`rev-parse --show-toplevel` → `/Users/athos/gt`) — parece um
+   checkout dedicado do engine (tem commits visíveis, nome certo) mas é o
+   #1 disfarçado.
+3. O engine `gc` DE VERDADE → módulo `github.com/gastownhall/gascity`
+   (`cmd/gc`, `internal/config/config.go`, etc.), repo GitHub SEPARADO
+   (`athosmartins/gascity` / `gastownhall/gascity`) — nunca fica checked
+   out dentro de `.gascity-gastown-hq/`. Só existe em `.gc-worktrees/*`
+   (worktree por bead) ou na árvore compartilhada
+   `.local-patches/_src-hookfix` (⚠️ scratch compartilhado, rotineiramente
+   stale/WIP — sempre refetch + confira contra `origin/main` antes de
+   confiar nela, nunca trate a working tree de lá como já-atual).
+
+Teste de 10 segundos, em QUALQUER caminho que você esteja prestes a tratar
+como "o repo do engine":
+```bash
+git -C <path> rev-parse --show-toplevel   # não resolve pra <path>? árvore ERRADA
+git -C <path> remote -v                   # module github.com/gastownhall/gascity? senão é o #1
+```
+E o teste mais forte pra "essa fix X já está no ar?" bate no ARTEFATO, nunca
+no repo: `strings $(readlink -f $(which gc)) | grep '<símbolo>'` — sidesteps
+toda confusão de repo/tree checando o binário que roda de verdade.
+
 **O caminho certo, que já é padrão provado nesta cidade** (patches vivos em
 `$GC_CITY_PATH/docs/pending-engine-window/`):
-1. **Escreva o fix** no source do engine e **valide** (teste que REPROVA no
-   HEAD anterior — não basta passar depois).
+1. **Escreva o fix** no source do engine (repo #3 acima) e **valide** (teste
+   que REPROVA no HEAD anterior — não basta passar depois).
 2. **Gere o patch e commite ele** em
    `$GC_CITY_PATH/docs/pending-engine-window/<bead>-<slug>.patch`
    (`git -C <src> diff > …`). O patch é versionado; a árvore do engine carrega
