@@ -223,6 +223,34 @@ marker from one incident can never be replayed as false evidence for a
 LATER, unrelated release of the same bead id (the same additive-residue
 trap documented against gate-sha-failed-style permanent labels elsewhere in
 this city's doctrine).
+
+ga-zbrbt (duplo-despacho: a live session validates the WRONG bead): the Pilot
+dispatched a second bead to a session already carrying one in-flight, and this
+guard's own liveness check made it worse instead of catching it. session_is_
+live() / concrete_adhoc_session_is_live() treat "session has fresh last_active"
+as proof of a healthy owner — true when a session owns exactly one bead, but
+when it owns two, that freshness is proof of life for EITHER, and the branch
+short-circuited True before bead_update_age (the actual per-bead signal) was
+ever consulted. Measured: a session genuinely alive on bead A held bead B (same
+assignee) story:in-flight for 344min against a 25min RECLAIM_TTL — 34 cycles of
+the guard concluding "healthy owner", never wrong about liveness, wrong about
+WHICH bead. The fix: compute_multi_assigned_assignees() gives run_cycle's Pass
+1 the set of assignees currently holding 2+ in-flight beads at once (one cheap
+pass over the already-fetched bead list, no extra I/O); membership flows into
+session_owner_is_healthy() as session_multi_assigned, which then requires the
+per-bead signal (bead_update_age fresh, or awaiting_human_input) instead of
+letting session-level activity alone vouch for a bead it may not be touching.
+Default-False on every changed signature, so no caller that hasn't computed
+this set changes behavior. The set is also logged whenever non-empty — cheap
+detection (this bug's proposed remedy #3) that surfaces a double-dispatch at
+minute zero instead of at the stranding mark. OUT OF SCOPE here, deliberately:
+preventing the double-dispatch at the Pilot's OWN assignment decision (remedy
+#1, in packs/town-deltas/assets/pilot-dispatcher.sh) — the bug's own author
+left that mechanism explicitly unproven for the ephemeral-adhoc dispatch path,
+and this file's fix already satisfies the measured acceptance criterion (a
+double-booked bead reclaims within RECLAIM_TTL, not 344min) as a compensating
+control regardless of whether the double-dispatch itself is ever prevented.
+See the ga-zbrbt bead for the follow-up filed to root-cause the dispatch side.
 """
 import json
 import os
@@ -1653,7 +1681,8 @@ def session_awaiting_human_input(session_ref, lines=40):
         return False
 
 
-def session_is_live(assignee, sessions, now=None, bead_update_age=None):
+def session_is_live(assignee, sessions, now=None, bead_update_age=None,
+                     session_multi_assigned=False):
     """Return True if assignee matches a live (active/awake) BUILDER session.
 
     Checks session.id, .name, .session_name, .alias, .agent_name because
@@ -1674,6 +1703,17 @@ def session_is_live(assignee, sessions, now=None, bead_update_age=None):
     confirms a fresh progress signal (recent last_active, OR a recent bd update
     on the bead — passed via bead_update_age). `now` defaults to time.time();
     callers in tests inject a fixed reference.
+
+    ga-zbrbt (duplo-despacho): session_multi_assigned=True tells this function
+    the CALLER already determined the assignee is currently the assignee of
+    2+ in-flight beads at once (see run_cycle's multi_assigned_assignees). A
+    session's last_active is fresh proof of life but NOT proof of which bead
+    it's working — measured case: a session genuinely alive on bead A kept
+    bead B (same assignee) hostage for 344min against a 25min reclaim TTL,
+    because activity_age alone satisfied session_owner_is_healthy before
+    bead_update_age (the actual per-bead signal) was ever consulted. Threaded
+    straight through to session_owner_is_healthy; default False so a caller
+    that hasn't computed the multi-assignment set keeps prior behavior.
 
     CORRECTNESS-CRITICAL: this is the primary guard against reclaiming
     a bead that a live builder actually owns.
@@ -1706,14 +1746,16 @@ def session_is_live(assignee, sessions, now=None, bead_update_age=None):
             # it isn't a frozen/credit-limited zombie. Gate on activity freshness
             # (+ recent bead progress as a secondary signal).
             activity_age = session_activity_age(s, now)
-            if session_owner_is_healthy(True, activity_age, bead_update_age):
+            if session_owner_is_healthy(True, activity_age, bead_update_age,
+                                         session_multi_assigned=session_multi_assigned):
                 return True
             # ga-nlaa: stale on both cheap signals — before writing this off as
             # a frozen zombie, peek its pane for an independent-of-commit-
             # cadence signal (paused on an interactive human prompt).
             return session_owner_is_healthy(
                 True, activity_age, bead_update_age,
-                awaiting_human_input=session_awaiting_human_input(assignee))
+                awaiting_human_input=session_awaiting_human_input(assignee),
+                session_multi_assigned=session_multi_assigned)
     return False
 
 
@@ -1765,7 +1807,8 @@ def pool_has_live_worker(pool_template, sessions, now=None, bead_update_age=None
     return False
 
 
-def concrete_adhoc_session_is_live(assignee, sessions, now=None, bead_update_age=None):
+def concrete_adhoc_session_is_live(assignee, sessions, now=None, bead_update_age=None,
+                                    session_multi_assigned=False):
     """Per-session liveness for concrete ephemeral-adhoc workers (e.g. 'wa-worker-adhoc-<hex>').
 
     Unlike pool_has_live_worker() (pool-wide: any live pool worker blocks ALL reclaims),
@@ -1782,6 +1825,12 @@ def concrete_adhoc_session_is_live(assignee, sessions, now=None, bead_update_age
     - Duplicate identifier: dead first, live later → live wins (scan-all hardening)
 
     Coordinator exclusion (ga-7m191): assignee naming mayor/deacon → False.
+
+    ga-zbrbt (duplo-despacho): session_multi_assigned=True — see session_is_live()'s
+    docstring for the mechanism. This is the function that actually matched the
+    measured incident's assignees (concrete 'wa-worker-adhoc-<hex>' names), so it
+    carries the same fix: threaded straight through to session_owner_is_healthy,
+    default False preserves every existing caller's behavior.
 
     CORRECTNESS-CRITICAL: this is the primary guard against false-reclaiming a bead
     whose concrete adhoc builder session is still alive.
@@ -1814,12 +1863,14 @@ def concrete_adhoc_session_is_live(assignee, sessions, now=None, bead_update_age
         if state in LIVE_STATES:
             # Apply ga-64usm staleness check: alive != working
             activity_age = session_activity_age(s, now)
-            if session_owner_is_healthy(True, activity_age, bead_update_age):
+            if session_owner_is_healthy(True, activity_age, bead_update_age,
+                                         session_multi_assigned=session_multi_assigned):
                 return True
             # ga-nlaa: stale on both cheap signals — peek before concluding zombie.
             return session_owner_is_healthy(
                 True, activity_age, bead_update_age,
-                awaiting_human_input=session_awaiting_human_input(assignee))
+                awaiting_human_input=session_awaiting_human_input(assignee),
+                session_multi_assigned=session_multi_assigned)
         # Unknown/unrecognized state — conservative: treat as alive (NOOP).
         # NEVER reclaim on ambiguous session state.
         return True
@@ -3712,6 +3763,36 @@ def reclaim_dead_dog_claims(exclude_session_ids=None, sessions=None,
     return reclaimed
 
 
+def compute_multi_assigned_assignees(beads):
+    """Return the set of assignee strings that own 2+ DISTINCT in-flight bead
+    ids at once, from an already-fetched `beads` list (ga-zbrbt).
+
+    A session that is the CONCRETE assignee of two or more in-flight beads at
+    the same time has an AMBIGUOUS last_active for both — its fresh activity
+    could belong to either sibling, and the measured incident showed this can
+    hold a bead hostage for 344min against a 25min reclaim TTL when the
+    session is genuinely alive on the OTHER bead. run_cycle's Pass 1 passes
+    membership in this set into session_is_live() / concrete_adhoc_session_
+    is_live() as session_multi_assigned, which then requires per-bead
+    evidence (bead_update_age) instead of trusting session-level freshness
+    alone — see session_owner_is_healthy()'s docstring for the mechanism.
+
+    Pure, cheap (one pass over already-fetched dicts, no I/O) — this doubles
+    as ga-zbrbt's proposed remedy #3 ("detecção barata... o sinal é barato de
+    calcular"): run_cycle logs a warning whenever this returns non-empty, so
+    a double-dispatch is visible at minute zero instead of at the stranding
+    mark. Blank/missing assignees are never counted (an unclaimed bead is not
+    a double-dispatch victim of anything).
+    """
+    counts = {}
+    for b in beads:
+        a = b.get("assignee") or ""
+        bid = b.get("id", "")
+        if a and bid:
+            counts.setdefault(a, set()).add(bid)
+    return {a for a, ids in counts.items() if len(ids) > 1}
+
+
 # ---------------------------------------------------------------------------
 # Main poll cycle
 # ---------------------------------------------------------------------------
@@ -3745,6 +3826,17 @@ def run_cycle(state, escalated_alerted):
         if bid:
             merged[bid] = b
     beads = list(merged.values())
+
+    # ga-zbrbt (duplo-despacho): cheap alarm (remedy #3) + the set Pass 1 uses
+    # below to require per-bead evidence when a session is double-booked.
+    multi_assigned_assignees = compute_multi_assigned_assignees(beads)
+    if multi_assigned_assignees:
+        for _a in sorted(multi_assigned_assignees):
+            _ids = sorted(b.get("id", "") for b in beads if (b.get("assignee") or "") == _a)
+            print(f"[INFLIGHT-RECLAIM] ga-zbrbt WARN: assignee={_a!r} is assigned to "
+                  f"{len(_ids)} in-flight beads at once: {_ids} — session liveness alone "
+                  f"can no longer vouch for any of them this cycle; each needs its own "
+                  f"bead_update_age evidence.", flush=True)
 
     # --- Query live sessions (fail-safe: skip cycle on error) ---
     sessions = list_active_sessions()
@@ -3880,13 +3972,22 @@ def run_cycle(state, escalated_alerted):
             and _is_ephemeral_pool_assignee(assignee)
         )
         is_pool_zombie_bead = is_bare_pool_zombie or is_adhoc_pool_zombie
+        # ga-zbrbt: only meaningful for a CONCRETE per-session match (adhoc or
+        # named) — a bare pool template (assignee == the template string
+        # itself, handled by pool_has_live_worker below) has no single session
+        # identity to disambiguate against, so it keeps its existing coarser
+        # pool-wide semantics unchanged.
+        session_multi_assigned = assignee in multi_assigned_assignees
         if is_bare_pool_zombie:
             has_live_session = pool_has_live_worker(assignee, sessions, now, bead_update_age)
         elif is_adhoc_pool_zombie:
             has_live_session = concrete_adhoc_session_is_live(
-                assignee, sessions, now, bead_update_age)
+                assignee, sessions, now, bead_update_age,
+                session_multi_assigned=session_multi_assigned)
         else:
-            has_live_session = session_is_live(assignee, sessions, now, bead_update_age)
+            has_live_session = session_is_live(
+                assignee, sessions, now, bead_update_age,
+                session_multi_assigned=session_multi_assigned)
 
         # ga-qfo3: this bead's OWN assignee may be empty because Pilot assigned
         # the live builder session to its SLING wrapper bead instead (see
@@ -6771,6 +6872,79 @@ def _selftest():
                   "wa-worker-adhoc-deadbeef", _ah_adhoc_session, now=T_ah) is True)
     finally:
         subprocess.run = _orig_run_ah
+
+    # -----------------------------------------------------------------------
+    # Section ZBRBT (ga-zbrbt) — duplo-despacho: a session's FRESH last_active
+    # is proof of life, not proof of WHICH of its 2+ in-flight beads it's
+    # working. Measured: wa-jts45 held hostage 344min (RECLAIM_TTL=25min)
+    # because session_is_live()/concrete_adhoc_session_is_live() let fresh
+    # session-level activity alone vouch for a bead the session was NOT
+    # touching. compute_multi_assigned_assignees() + session_multi_assigned
+    # close it: a double-booked session needs PER-BEAD evidence
+    # (bead_update_age), not just its own pulse. No real bd/gc calls needed —
+    # these are pure-data checks (no subprocess.run stub required).
+    # -----------------------------------------------------------------------
+
+    # --- ZB-1..3: compute_multi_assigned_assignees() — pure set computation ---
+    check("ZB-1: compute_multi_assigned_assignees: 2 distinct beads, same assignee → flagged",
+          compute_multi_assigned_assignees([
+              {"id": "wa-aaaaa", "assignee": "wa-worker-adhoc-dbl"},
+              {"id": "wa-bbbbb", "assignee": "wa-worker-adhoc-dbl"},
+          ]) == {"wa-worker-adhoc-dbl"})
+    check("ZB-2: compute_multi_assigned_assignees: 1 bead per assignee → nobody flagged",
+          compute_multi_assigned_assignees([
+              {"id": "wa-aaaaa", "assignee": "wa-worker-adhoc-x"},
+              {"id": "wa-bbbbb", "assignee": "wa-worker-adhoc-y"},
+              {"id": "wa-ccccc", "assignee": ""},
+              {"id": "", "assignee": "wa-worker-adhoc-z"},
+          ]) == set())
+    check("ZB-3: compute_multi_assigned_assignees: SAME bead id repeated (dedup-before-count "
+          "guard, ga-processlist-inflation family) → counts as 1 distinct id, not flagged",
+          compute_multi_assigned_assignees([
+              {"id": "wa-aaaaa", "assignee": "wa-worker-adhoc-dbl"},
+              {"id": "wa-aaaaa", "assignee": "wa-worker-adhoc-dbl"},
+          ]) == set())
+
+    # --- ZB-4..7: session_is_live() / concrete_adhoc_session_is_live() wiring ---
+    _zb_live_fresh = [
+        {"id": "sid-zb1", "name": "thies-wa", "session_name": "thies",
+         "alias": "thies", "agent_name": "thies-wa",
+         "state": "active", "last_active": _ah_fresh_ts},
+    ]
+    check("ZB-4: session_is_live: FRESH activity but session_multi_assigned=True, no "
+          "bead_update_age → False (THE bug: fresh session pulse no longer vouches alone "
+          "for a bead it may not be the one being worked)",
+          session_is_live("thies", _zb_live_fresh, now=T_ah,
+                           session_multi_assigned=True) is False)
+    check("ZB-5: session_is_live: identical double-booked session, but THIS bead has its "
+          "own fresh bd-update (bead_update_age=60) → True (per-bead evidence rescues it)",
+          session_is_live("thies", _zb_live_fresh, now=T_ah, bead_update_age=60,
+                           session_multi_assigned=True) is True)
+    check("ZB-6 (no-regression guard): identical fresh-activity scenario with "
+          "session_multi_assigned OMITTED (default False, every pre-existing caller) → "
+          "still True — this fix changes nothing for a caller that hasn't computed the "
+          "multi-assignment set",
+          session_is_live("thies", _zb_live_fresh, now=T_ah) is True)
+
+    _zb_adhoc_fresh = [
+        {"id": "sid-zb2", "name": "wa-worker-adhoc-1", "session_name": "wa-worker-adhoc-dbl",
+         "alias": "", "agent_name": "wa-worker-adhoc-dbl",
+         "state": "active", "last_active": _ah_fresh_ts},
+    ]
+    check("ZB-7: concrete_adhoc_session_is_live (the function the measured incident actually "
+          "matched — assignee was a concrete wa-worker-adhoc-<hex>): FRESH activity + "
+          "session_multi_assigned=True, no bead_update_age → False",
+          concrete_adhoc_session_is_live(
+              "wa-worker-adhoc-dbl", _zb_adhoc_fresh, now=T_ah,
+              session_multi_assigned=True) is False)
+    check("ZB-8: concrete_adhoc_session_is_live: same double-booked session, this bead's own "
+          "bead_update_age=60 → True",
+          concrete_adhoc_session_is_live(
+              "wa-worker-adhoc-dbl", _zb_adhoc_fresh, now=T_ah, bead_update_age=60,
+              session_multi_assigned=True) is True)
+    check("ZB-9 (no-regression guard): concrete_adhoc_session_is_live, same fresh-activity "
+          "session, session_multi_assigned OMITTED → still True",
+          concrete_adhoc_session_is_live("wa-worker-adhoc-dbl", _zb_adhoc_fresh, now=T_ah) is True)
 
     # -----------------------------------------------------------------------
     # Section SH: heal_orphan_sweep_false_resets() / list_orphan_sweep_false_resets()

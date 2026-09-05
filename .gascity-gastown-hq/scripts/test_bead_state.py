@@ -671,6 +671,34 @@ def test_healthy_isencao_por_espera_humana():
     assert session_owner_is_healthy(True, 9999, 9999, awaiting_human_input=True) is True
 
 
+# ── session_owner_is_healthy: session_multi_assigned (ga-zbrbt) ─────────────
+# Duplo-despacho medido: uma sessão VIVA e genuinamente produzindo, mas
+# trabalhando uma bead IRMÃ, validava QUALQUER bead da qual fosse assignee —
+# o last_active fresco da sessão não prova que o trabalho é PARA ESTA bead.
+# Medido: wa-jts45 ficou refém 344min (TTL de reclaim é 25) porque o guard via
+# "sessão viva" e nunca chegava a checar evidência por-bead. Ver bead ga-zbrbt.
+
+def test_healthy_multi_assigned_sem_evidencia_por_bead_nao_e_mais_saudavel():
+    """Sessão viva+fresca, mas dona de 2+ beads in-flight ao mesmo tempo: a
+    atividade fresca pode pertencer à bead IRMÃ, não a esta. Sem bd-update
+    recente NESTA bead, session-level activity sozinho não basta mais."""
+    assert session_owner_is_healthy(True, 60, None, session_multi_assigned=True) is False
+
+
+def test_healthy_multi_assigned_mas_bead_update_recente_resgata():
+    """Mesmo cenário de duplo-despacho, mas ESTA bead tem evidência própria
+    (bd update recente) — a exigência por-bead está satisfeita, segue saudável."""
+    assert session_owner_is_healthy(True, 60, 60, session_multi_assigned=True) is True
+
+
+def test_healthy_multi_assigned_default_preserva_comportamento_anterior():
+    """Default (session_multi_assigned=False) não muda nenhum caller
+    pré-existente — nenhum dos 4 consumidores de session_owner_is_healthy
+    passa este parâmetro ainda, e todos devem continuar exatamente como antes."""
+    assert session_owner_is_healthy(True, 60, None) is True
+    assert session_owner_is_healthy(True, 9999, 9999) is False
+
+
 def test_ephemeral_pool_templates_conhece_gastown_dog_e_wa_worker():
     assert "gastown.dog" in EPHEMERAL_POOL_TEMPLATES
     assert "wa-worker" in EPHEMERAL_POOL_TEMPLATES

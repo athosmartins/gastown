@@ -389,7 +389,8 @@ def session_activity_age(session, now):
 
 
 def session_owner_is_healthy(matched_live, activity_age, bead_update_age,
-                              awaiting_human_input=False) -> bool:
+                              awaiting_human_input=False,
+                              session_multi_assigned=False) -> bool:
     """Dado que o assignee já casou com uma sessão em estado VIVO, decide se
     isso é um dono SAUDÁVEL (bloqueia reclaim) ou um zumbi congelado/sem-quota
     (libera reclaim) — ga-64usm: ALIVE != WORKING.
@@ -400,12 +401,26 @@ def session_owner_is_healthy(matched_live, activity_age, bead_update_age,
     humana (AskUserQuestion) produz a MESMA telemetria de um zumbi congelado —
     se o CALLER já confirmou isso via peek (I/O, não pode viver aqui, função
     pura), conta como saudável também.
+
+    ga-zbrbt (duplo-despacho): session_multi_assigned=True sinaliza que o
+    CALLER já determinou que esta sessão é assignee de 2+ beads in-flight AO
+    MESMO TEMPO. Nesse caso o last_active da sessão deixa de ser evidência —
+    ele prova que a sessão está viva e produzindo, mas não PARA QUAL das N
+    beads. Medido: uma sessão trabalhando genuinamente a bead irmã manteve
+    activity_age sempre fresco, e a bead refém nunca chegou a ser avaliada
+    pelo segundo sinal (bead_update_age) porque o primeiro ramo do OR já
+    retornava True sozinho — 344min refém contra um RECLAIM_TTL de 25.
+    Com o flag ligado, activity_age fresco por si só NÃO basta mais; só
+    bead_update_age fresco (evidência POR BEAD: um bd-update recente nesta
+    bead específica) ou awaiting_human_input resgatam. Default False preserva
+    o comportamento de todo caller existente — só inflight-reclaim-guard.py
+    calcula e passa este sinal (ver session_is_live / concrete_adhoc_session_is_live).
     """
     if not matched_live:
         return False
     if activity_age is None:
         return True
-    if activity_age <= STALE_ACTIVITY_TTL:
+    if activity_age <= STALE_ACTIVITY_TTL and not session_multi_assigned:
         return True
     if bead_update_age is not None and bead_update_age <= STALE_ACTIVITY_TTL:
         return True
