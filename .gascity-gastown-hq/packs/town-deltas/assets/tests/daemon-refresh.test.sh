@@ -1439,6 +1439,56 @@ V=$(field VERDICT "$OUT")
 [ "$V" = "OK" ] && ok "T40 verdict OK (Disabled=true job never flagged)" || nok "T40 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -eq 0 ] && ok "T40 exit 0" || nok "T40 exit" "rc=$RC"
 
+# ════════════════════════════════════════════════════════════════════════════
+# T41 (gate ga-ax0t9): UM deploy que carrega os DOIS problemas ao mesmo tempo —
+#     (a) um plist de job agendado que nunca foi instalado, e (b) um daemon
+#     SENSITIVE existente cujo entrypoint mudou e que segue rodando codigo velho.
+#
+#     Antes do conserto, o Step 1b chamava emit direto, e emit ENCERRA o script:
+#     o Step 2 nunca rodava. O resultado era VERDICT=JOB_NOT_INSTALLED com
+#     GUARDED VAZIO — indistinguivel de "nao havia outro problema" —, e o
+#     kicks.log do launchctl fake nem chegava a ser criado, prova de que a
+#     checagem de obsolescencia nao aconteceu. Regressao real contra o
+#     comportamento anterior: o Step 2 pegava esse caso sozinho (ver T4).
+#
+#     Este teste FALHA contra o codigo pre-conserto (GUARDED vem vazio) e passa
+#     depois. Sem ele, nada fica vermelho se alguem voltar a encerrar no 1b.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t41
+# (b) daemon SENSITIVE ja instalado e rodando com start ANTIGO
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send v1")'
+cat > "$RUNTIME/launchd/central-sender-wrapper.sh" <<EOF
+#!/usr/bin/env bash
+exec "\$BASEDIR/venv/bin/python3" "\$BASEDIR/daemons/central_sender.py"
+EOF
+make_plist "$AGENTS" com.test.central-sender /bin/bash "$RUNTIME/launchd/central-sender-wrapper.sh"
+seed_running com.test.central-sender 4101 "$STALE_LSTART"
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && git commit -q -m base --allow-empty )
+PRE=$(git -C "$RUNTIME" rev-parse HEAD)
+# UM unico commit de deploy faz as duas coisas
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send v2")'
+make_plist "$RUNTIME/launchd" com.test.newjob "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/newjob.py"
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && \
+  GIT_AUTHOR_DATE="@$POST_COMMIT_EPOCH" GIT_COMMITTER_DATE="@$POST_COMMIT_EPOCH" \
+  git commit -q -m deploy )
+POST=$(git -C "$RUNTIME" rev-parse HEAD)
+# (a) de proposito NAO copiamos com.test.newjob.plist pra $AGENTS
+OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" PRE_DEPLOY_SHA="$PRE" POST_DEPLOY_SHA="$POST" \
+  DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
+  EXTRA_RUNTIME_ROOTS="${EXTRA_RUNTIME_ROOTS:-}" LAUNCH_AGENTS_DIR="$AGENTS" \
+  LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
+  DRY_RUN=0 bash "$HELPER" 2>/dev/null); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "JOB_NOT_INSTALLED" ] && ok "T41 verdict JOB_NOT_INSTALLED (job nao instalado continua sendo o veredito)" || nok "T41 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -ne 0 ] && ok "T41 non-zero exit" || nok "T41 exit" "rc=$RC"
+# O CORACAO DESTE TESTE: o Step 2 rodou, e o daemon obsoleto aparece.
+echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" && ok "T41 daemon SENSITIVE obsoleto aparece em GUARDED (Step 2 rodou)" || nok "T41 guarded VAZIO — Step 2 nao rodou" "GUARDED='$(field GUARDED "$OUT")' out=[$OUT]"
+R41="$(field REASON "$OUT")"
+echo "$R41" | grep -q "com.test.newjob" && ok "T41 REASON nomeia o job nao instalado" || nok "T41 reason job" "$R41"
+echo "$R41" | grep -qi "NEEDS_GUARDED_RESTART" && ok "T41 REASON tambem nomeia o achado do Step 2" || nok "T41 reason step2" "$R41"
+! grep -q "com.test.central-sender" "$MOCK/kicks.log" 2>/dev/null && ok "T41 daemon sensivel NAO foi bouncado" || nok "T41 no-bounce" "kickstart: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+[ "$(field PROOF "$OUT")" = "not_verified" ] && ok "T41 PROOF=not_verified (nada foi verificado)" || nok "T41 proof" "got '$(field PROOF "$OUT")'"
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"
