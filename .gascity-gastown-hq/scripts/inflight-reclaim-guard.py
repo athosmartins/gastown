@@ -3783,12 +3783,32 @@ def compute_multi_assigned_assignees(beads):
     a double-dispatch is visible at minute zero instead of at the stranding
     mark. Blank/missing assignees are never counted (an unclaimed bead is not
     a double-dispatch victim of anything).
+
+    Coordinator assignees (mayor/deacon) are ALSO excluded — caught in the
+    gate-done self-audit, not by a test I happened to write. A coordinator
+    routinely holds many in-flight beads at once as normal PARKED state (see
+    this city's next-action:mayor convention); that is not this bug's shape.
+    session_is_live() already short-circuits to False for any coordinator
+    assignee before it would ever consult session_multi_assigned, so the
+    exclusion changes no reclaim decision — but without it, this function's
+    own alarm (above) would fire every cycle on ordinary Mayor-parked beads,
+    a false-positive noisy enough to teach operators to ignore it.
+
+    Bare ephemeral-pool-template assignees (e.g. the literal string
+    'wa-worker' or 'gastown.dog', as opposed to a concrete instance like
+    'wa-worker-adhoc-<hex>') are excluded for the same reason: they route
+    through pool_has_live_worker(), which never consults session_multi_
+    assigned (it has no single session identity to disambiguate against —
+    that coarseness is a separate, already-accepted tradeoff, not this bug's
+    shape) — so, same as coordinators, flagging them changes no decision and
+    only risks a misleading alarm if several beads legitimately share the
+    bare template while awaiting pool pickup.
     """
     counts = {}
     for b in beads:
         a = b.get("assignee") or ""
         bid = b.get("id", "")
-        if a and bid:
+        if a and bid and not is_coordinator(a) and a not in EPHEMERAL_POOL_ASSIGNEES:
             counts.setdefault(a, set()).add(bid)
     return {a for a, ids in counts.items() if len(ids) > 1}
 
@@ -6903,6 +6923,25 @@ def _selftest():
           compute_multi_assigned_assignees([
               {"id": "wa-aaaaa", "assignee": "wa-worker-adhoc-dbl"},
               {"id": "wa-aaaaa", "assignee": "wa-worker-adhoc-dbl"},
+          ]) == set())
+    check("ZB-3b (gate-done self-audit catch, not a pre-written test): a COORDINATOR "
+          "holding 5 in-flight beads at once (ordinary next-action:mayor parked state, "
+          "NOT this bug's shape) is never flagged — session_is_live() already "
+          "short-circuits coordinators before session_multi_assigned would matter, so "
+          "flagging them would only produce a noisy false-positive alarm on routine "
+          "Mayor-parked beads every single cycle",
+          compute_multi_assigned_assignees([
+              {"id": "ga-p1", "assignee": "mayor"},
+              {"id": "ga-p2", "assignee": "mayor"},
+              {"id": "ga-p3", "assignee": "mayor"},
+          ]) == set())
+    check("ZB-3c (same self-audit catch): a BARE pool-template assignee (literal "
+          "'wa-worker', not a concrete 'wa-worker-adhoc-<hex>') holding 2+ beads while "
+          "awaiting pool pickup is never flagged either — it routes through "
+          "pool_has_live_worker(), which never consults session_multi_assigned",
+          compute_multi_assigned_assignees([
+              {"id": "wa-p1", "assignee": "wa-worker"},
+              {"id": "wa-p2", "assignee": "wa-worker"},
           ]) == set())
 
     # --- ZB-4..7: session_is_live() / concrete_adhoc_session_is_live() wiring ---
