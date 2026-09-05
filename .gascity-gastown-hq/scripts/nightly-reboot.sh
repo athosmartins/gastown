@@ -108,6 +108,18 @@ notify_athos() {
 # the swap ratchet does not care WHY the reboot didn't happen) and escalates
 # louder + durably once that streak is long enough to matter, instead of
 # relying on a push notification that can go unread forever.
+#
+# nightly-reboot.selftest.sh:STREAK-FUNCTIONS-START — sentinel for the
+# selftest, which extracts exactly this block (via sed, to this file's
+# matching END sentinel below) to unit-test the streak logic in total
+# isolation from Guards 1-3 and the reboot call. Deliberate: those guards
+# and the final /sbin/shutdown invocation must NEVER execute during a test
+# (see the selftest's own header for why — the short version is that the
+# quality gate replays this exact test file, unmodified, against the
+# PRE-FIX commit of this script as part of an automated check, and that
+# older script has no override hook for the reboot call at all). Keep this
+# block self-contained (no reference to CITY/GC/BD/etc. beyond what's
+# already visible above it) if you touch it, so the extraction keeps working.
 ALARM_THRESHOLD="${NIGHTLY_REBOOT_ALARM_THRESHOLD:-2}"
 read_streak() {
   local n
@@ -130,6 +142,7 @@ record_skip() {
       >/dev/null 2>&1 || true
   fi
 }
+# nightly-reboot.selftest.sh:STREAK-FUNCTIONS-END
 
 log "=== fired (uptime: $(uptime | sed 's/.*up //; s/,.*users.*//') ) ==="
 
