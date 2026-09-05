@@ -7024,6 +7024,66 @@ def _selftest():
           "session, session_multi_assigned OMITTED → still True",
           concrete_adhoc_session_is_live("wa-worker-adhoc-dbl", _zb_adhoc_fresh, now=T_ah) is True)
 
+    # --- ZB-10..15 (gate ga-y9zw2 reviewer finding): awaiting_human_input has the
+    # SAME multi-assigned ambiguity as activity_age — session_awaiting_human_input()
+    # peeks the SESSION's pane, with no notion of which bead the pending question
+    # is about. Stale activity forces both wrapper functions past the cheap rail
+    # into the peek-dependent branch. Unlike ZB-4..9, subprocess.run IS stubbed
+    # here (via the _stub_peek/_orig_run_ah helpers from the AH-* section above)
+    # so the peek outcome is deterministic instead of shelling out to a real
+    # `gc session peek`.
+    _zb_live_stale = [
+        {"id": "sid-zb10", "name": "thies-wa", "session_name": "thies",
+         "alias": "thies", "agent_name": "thies-wa",
+         "state": "active", "last_active": _ah_stale_ts},
+    ]
+    try:
+        subprocess.run = _stub_peek(output_text="⏺ AskUserQuestion(proceed?)", expect_ref="thies")
+        check("ZB-10 (gate ga-y9zw2 reviewer finding): session_is_live: STALE activity, "
+              "session_multi_assigned=True, paused on AskUserQuestion, no bead_update_age → "
+              "False — awaiting_human_input no longer rescues a double-booked session, closing "
+              "the same disambiguation gap this bug already closed for activity_age",
+              session_is_live("thies", _zb_live_stale, now=T_ah,
+                               session_multi_assigned=True) is False)
+        check("ZB-11: session_is_live: identical double-booked+paused session, but THIS bead "
+              "has its own fresh bd-update (bead_update_age=60) → True (per-bead evidence "
+              "still rescues, same as the activity_age branch)",
+              session_is_live("thies", _zb_live_stale, now=T_ah, bead_update_age=60,
+                               session_multi_assigned=True) is True)
+        check("ZB-12 (no-regression guard, ga-nlaa): identical stale+paused session with "
+              "session_multi_assigned OMITTED (default False, every pre-existing caller) → "
+              "still True — this fix changes nothing for a single-bead session genuinely "
+              "paused on a human question",
+              session_is_live("thies", _zb_live_stale, now=T_ah) is True)
+    finally:
+        subprocess.run = _orig_run_ah
+
+    _zb_adhoc_stale = [
+        {"id": "sid-zb13", "name": "wa-worker-adhoc-1", "session_name": "wa-worker-adhoc-dbl",
+         "alias": "", "agent_name": "wa-worker-adhoc-dbl",
+         "state": "active", "last_active": _ah_stale_ts},
+    ]
+    try:
+        subprocess.run = _stub_peek(output_text="⏺ AskUserQuestion(proceed?)",
+                                     expect_ref="wa-worker-adhoc-dbl")
+        check("ZB-13: concrete_adhoc_session_is_live mirror of ZB-10 (the function the "
+              "measured incident actually matched): STALE activity, session_multi_assigned=True, "
+              "paused on AskUserQuestion, no bead_update_age → False",
+              concrete_adhoc_session_is_live(
+                  "wa-worker-adhoc-dbl", _zb_adhoc_stale, now=T_ah,
+                  session_multi_assigned=True) is False)
+        check("ZB-14: concrete_adhoc_session_is_live mirror of ZB-11: same double-booked+paused "
+              "session, this bead's own bead_update_age=60 → True",
+              concrete_adhoc_session_is_live(
+                  "wa-worker-adhoc-dbl", _zb_adhoc_stale, now=T_ah, bead_update_age=60,
+                  session_multi_assigned=True) is True)
+        check("ZB-15 (no-regression guard): concrete_adhoc_session_is_live mirror of ZB-12, "
+              "session_multi_assigned OMITTED → still True",
+              concrete_adhoc_session_is_live(
+                  "wa-worker-adhoc-dbl", _zb_adhoc_stale, now=T_ah) is True)
+    finally:
+        subprocess.run = _orig_run_ah
+
     # -----------------------------------------------------------------------
     # Section SH: heal_orphan_sweep_false_resets() / list_orphan_sweep_false_resets()
     # ga-seuh4/ga-a8t68: order:orphan-sweep (packs/town-deltas/assets/scripts/

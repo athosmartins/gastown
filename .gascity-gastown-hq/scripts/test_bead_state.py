@@ -699,6 +699,38 @@ def test_healthy_multi_assigned_default_preserva_comportamento_anterior():
     assert session_owner_is_healthy(True, 9999, 9999) is False
 
 
+# ── session_owner_is_healthy: awaiting_human_input × session_multi_assigned
+# (ga-zbrbt gate-fix-3, reviewer finding on gate_run=ga-y9zw2) ───────────────
+# O primeiro fix só travou o ramo activity_age com session_multi_assigned;
+# o ramo awaiting_human_input (linha seguinte) ficou destravado, e tem o
+# MESMO problema — session_awaiting_human_input() faz peek no PANE da sessão,
+# sem saber a qual bead a pergunta pendente se refere. Sessão pausada numa
+# AskUserQuestion sobre a bead IRMÃ não prova nada sobre ESTA bead.
+
+def test_healthy_multi_assigned_awaiting_human_input_sem_evidencia_nao_resgata():
+    """Sessão dupla-despachada, pausada em AskUserQuestion (pode ser sobre a
+    bead irmã), sem bd-update recente NESTA bead: não é mais dono saudável —
+    o mesmo gap que activity_age tinha, agora fechado no ramo irmão."""
+    assert session_owner_is_healthy(
+        True, 9999, None, awaiting_human_input=True, session_multi_assigned=True
+    ) is False
+
+
+def test_healthy_multi_assigned_awaiting_human_input_mas_bead_update_recente_resgata():
+    """Mesmo cenário (dupla-atribuição + espera humana), mas com evidência
+    própria (bd update recente nesta bead específica) — ainda saudável."""
+    assert session_owner_is_healthy(
+        True, 9999, 60, awaiting_human_input=True, session_multi_assigned=True
+    ) is True
+
+
+def test_healthy_awaiting_human_input_sem_multi_assigned_continua_resgatando():
+    """No-regression (ga-nlaa): awaiting_human_input sozinho — sessão NÃO
+    dupla-despachada (session_multi_assigned default False) — continua
+    resgatando, caso comum de uma sessão/uma bead intocado por este fix."""
+    assert session_owner_is_healthy(True, 9999, 9999, awaiting_human_input=True) is True
+
+
 def test_ephemeral_pool_templates_conhece_gastown_dog_e_wa_worker():
     assert "gastown.dog" in EPHEMERAL_POOL_TEMPLATES
     assert "wa-worker" in EPHEMERAL_POOL_TEMPLATES

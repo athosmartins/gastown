@@ -409,12 +409,21 @@ def session_owner_is_healthy(matched_live, activity_age, bead_update_age,
     beads. Medido: uma sessão trabalhando genuinamente a bead irmã manteve
     activity_age sempre fresco, e a bead refém nunca chegou a ser avaliada
     pelo segundo sinal (bead_update_age) porque o primeiro ramo do OR já
-    retornava True sozinho — 344min refém contra um RECLAIM_TTL de 25.
-    Com o flag ligado, activity_age fresco por si só NÃO basta mais; só
-    bead_update_age fresco (evidência POR BEAD: um bd-update recente nesta
-    bead específica) ou awaiting_human_input resgatam. Default False preserva
-    o comportamento de todo caller existente — só inflight-reclaim-guard.py
-    calcula e passa este sinal (ver session_is_live / concrete_adhoc_session_is_live).
+    retornava True sozinho — 344min refém contra um RECLAIM_TTL de 25. Com o
+    flag ligado, só bead_update_age fresco (evidência POR BEAD: um bd-update
+    recente nesta bead específica) resgata — nem activity_age fresco, nem
+    awaiting_human_input, bastam mais sozinhos.
+
+    gate-fix-3 (mesma bead, segunda rodada): awaiting_human_input tem
+    EXATAMENTE o mesmo problema de desambiguação que activity_age — ele vem
+    de um peek no pane da SESSÃO (session_awaiting_human_input), sem noção de
+    qual bead a pergunta pendente diz respeito. Uma sessão pausada num
+    AskUserQuestion sobre a bead IRMÃ não é evidência de que ESTA bead está
+    sendo cuidada. Por isso awaiting_human_input só resgata quando
+    session_multi_assigned é False — exatamente a mesma condição que já guarda
+    o ramo de activity_age acima. Default False preserva o comportamento de
+    todo caller existente — só inflight-reclaim-guard.py calcula e passa este
+    sinal (ver session_is_live / concrete_adhoc_session_is_live).
     """
     if not matched_live:
         return False
@@ -424,7 +433,7 @@ def session_owner_is_healthy(matched_live, activity_age, bead_update_age,
         return True
     if bead_update_age is not None and bead_update_age <= STALE_ACTIVITY_TTL:
         return True
-    if awaiting_human_input:
+    if awaiting_human_input and not session_multi_assigned:
         return True
     return False
 
