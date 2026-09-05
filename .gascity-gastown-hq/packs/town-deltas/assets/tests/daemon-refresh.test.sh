@@ -69,6 +69,25 @@
 #      currently idle (no PID) still escalates (T33) — daemon_pid() alone
 #      cannot tell "not loaded" and "loaded but idle" apart, the exact
 #      ambiguity that let com.gastown.dolt-server's broken plist hide.
+#  14. (wa-jts45) A *.plist this deploy commits for a brand-new SCHEDULED job
+#      has no live PID for points 1-13 to compare staleness against — every
+#      check above them answers "is a daemon's live PROCESS stale?", a
+#      question that is structurally silent about a process that was never
+#      installed at all. VERDICT=JOB_NOT_INSTALLED now fires, BEFORE any
+#      other check runs, when a *.plist changed by this deploy is missing
+#      from LAUNCH_AGENTS_DIR (T37) or present but not `launchctl list`-loaded
+#      (T38) — the exact wa-sas9j incident: merged + gate:passed + "daemon
+#      fresh" were all simultaneously true while the job never existed on
+#      disk for a month. A plist that IS installed+loaded is untouched by
+#      this check and falls through to existing behavior (T39). A plist
+#      declaring native `<key>Disabled</key><true/>` is intentionally manual
+#      and never flagged (T40). Deliberately does NOT also require "has it
+#      produced a successful run yet": a job installed by THIS deploy may
+#      legitimately not have reached its next scheduled window yet, so that
+#      bar would false-positive on every ordinary nightly-job delivery — left
+#      to a human follow-up once installed+loaded is confirmed (see the
+#      JOB_NOT_INSTALLED ACTION text at the call sites in
+#      quality-gate-dispatcher.sh).
 #
 # All external effects (launchctl, ps) are injected via LAUNCHCTL_BIN / PS_BIN
 # and a mock state dir, so the test touches NO real daemons. The plist scan and
@@ -1295,6 +1314,130 @@ REASON="$(field REASON "$OUT")"
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T36 verdict NEEDS_GUARDED_RESTART" || nok "T36 verdict" "got '$V' out=[$OUT]"
 echo "$REASON" | grep -qi "false positive" && ok "T36 REASON still warns a listed daemon may be a false positive" || nok "T36 false-positive wording" "$REASON"
 echo "$REASON" | grep -qiE "incomplete|missing|false negative" && ok "T36 REASON now warns the list itself may be INCOMPLETE (false negative)" || nok "T36 incompleteness wording" "$REASON"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T37 (wa-jts45): a brand-new scheduled-job *.plist committed by this deploy,
+#     never installed under LAUNCH_AGENTS_DIR at all → VERDICT=JOB_NOT_INSTALLED,
+#     non-zero exit, BEFORE Step 1's own "no .py/template changed" short-circuit
+#     ever gets a chance to emit OK (this deploy touches ZERO *.py/template
+#     files — if Step 1b did not run first, pre-fix behavior would emit
+#     VERDICT=OK here). This is the exact wa-sas9j incident: merged +
+#     gate:passed + "daemon fresh" were all simultaneously true while the job
+#     never existed on disk for a month.
+#
+# Deliberately does NOT use run_helper() here: that helper's per-file loop
+# APPENDS a "# changed ..." marker line to each listed path, which is fine for
+# a .py/.html fixture but would corrupt a *.plist's XML (trailing garbage
+# after </plist>) and end up testing the "unparseable plist" skip path
+# instead of a well-formed one that simply isn't installed.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t37
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && git commit -q -m base --allow-empty )
+PRE=$(git -C "$RUNTIME" rev-parse HEAD)
+make_plist "$RUNTIME/launchd" com.test.newjob "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/newjob.py"
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && \
+  GIT_AUTHOR_DATE="@$POST_COMMIT_EPOCH" GIT_COMMITTER_DATE="@$POST_COMMIT_EPOCH" \
+  git commit -q -m deploy )
+POST=$(git -C "$RUNTIME" rev-parse HEAD)
+# deliberately do NOT copy the plist into $AGENTS (LAUNCH_AGENTS_DIR) — that
+# omission IS the bug this test proves gets caught.
+OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" PRE_DEPLOY_SHA="$PRE" POST_DEPLOY_SHA="$POST" \
+  DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
+  EXTRA_RUNTIME_ROOTS="${EXTRA_RUNTIME_ROOTS:-}" LAUNCH_AGENTS_DIR="$AGENTS" \
+  LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
+  DRY_RUN=0 bash "$HELPER" 2>/dev/null); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "JOB_NOT_INSTALLED" ] && ok "T37 verdict JOB_NOT_INSTALLED (plist committed, never installed)" || nok "T37 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -ne 0 ] && ok "T37 non-zero exit" || nok "T37 exit" "rc=$RC"
+echo "$(field REASON "$OUT")" | grep -q "com.test.newjob" && ok "T37 REASON names the missing label" || nok "T37 reason" "$(field REASON "$OUT")"
+[ "$(field PROOF "$OUT")" = "not_verified" ] && ok "T37 PROOF=not_verified" || nok "T37 proof" "got '$(field PROOF "$OUT")'"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T38 (wa-jts45): the plist IS present under LAUNCH_AGENTS_DIR (someone copied
+#     the file) but launchd never loaded it (no `launchctl load`/bootstrap run)
+#     → VERDICT=JOB_NOT_INSTALLED — file-presence alone is not proof the job
+#     will ever fire; launchd has to know about the label too.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t38
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && git commit -q -m base --allow-empty )
+PRE=$(git -C "$RUNTIME" rev-parse HEAD)
+make_plist "$RUNTIME/launchd" com.test.copiedonly "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/copiedonly.py"
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && \
+  GIT_AUTHOR_DATE="@$POST_COMMIT_EPOCH" GIT_COMMITTER_DATE="@$POST_COMMIT_EPOCH" \
+  git commit -q -m deploy )
+POST=$(git -C "$RUNTIME" rev-parse HEAD)
+make_plist "$AGENTS" com.test.copiedonly "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/copiedonly.py"
+# deliberately do NOT seed_loaded/seed_running → the mock launchctl's `list`
+# reports "not found", matching a real machine where the file was copied by
+# hand but never loaded.
+OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" PRE_DEPLOY_SHA="$PRE" POST_DEPLOY_SHA="$POST" \
+  DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
+  EXTRA_RUNTIME_ROOTS="${EXTRA_RUNTIME_ROOTS:-}" LAUNCH_AGENTS_DIR="$AGENTS" \
+  LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
+  DRY_RUN=0 bash "$HELPER" 2>/dev/null); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "JOB_NOT_INSTALLED" ] && ok "T38 verdict JOB_NOT_INSTALLED (plist present, not loaded)" || nok "T38 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -ne 0 ] && ok "T38 non-zero exit" || nok "T38 exit" "rc=$RC"
+echo "$(field REASON "$OUT")" | grep -q "com.test.copiedonly" && ok "T38 REASON names the unloaded label" || nok "T38 reason" "$(field REASON "$OUT")"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T39 (wa-jts45): the plist IS installed AND loaded — Step 1b must NOT flag it,
+#     and must let the deploy fall through to whatever Step 1+ would otherwise
+#     conclude (here: no *.py/template changed → OK/not_applicable, proving
+#     Step 1b adds no false positive on a correctly-delivered scheduled job).
+# ════════════════════════════════════════════════════════════════════════════
+new_case t39
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && git commit -q -m base --allow-empty )
+PRE=$(git -C "$RUNTIME" rev-parse HEAD)
+make_plist "$RUNTIME/launchd" com.test.goodjob "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/goodjob.py"
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && \
+  GIT_AUTHOR_DATE="@$POST_COMMIT_EPOCH" GIT_COMMITTER_DATE="@$POST_COMMIT_EPOCH" \
+  git commit -q -m deploy )
+POST=$(git -C "$RUNTIME" rev-parse HEAD)
+make_plist "$AGENTS" com.test.goodjob "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/goodjob.py"
+seed_loaded com.test.goodjob
+OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" PRE_DEPLOY_SHA="$PRE" POST_DEPLOY_SHA="$POST" \
+  DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
+  EXTRA_RUNTIME_ROOTS="${EXTRA_RUNTIME_ROOTS:-}" LAUNCH_AGENTS_DIR="$AGENTS" \
+  LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
+  DRY_RUN=0 bash "$HELPER" 2>/dev/null); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T39 verdict OK (installed+loaded scheduled job is not flagged)" || nok "T39 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -eq 0 ] && ok "T39 exit 0" || nok "T39 exit" "rc=$RC"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T40 (wa-jts45): a plist declaring native <key>Disabled</key><true/> is
+#     intentionally manual — changing it must never be flagged even though it
+#     is neither installed nor loaded (that is the point of Disabled=true).
+# ════════════════════════════════════════════════════════════════════════════
+new_case t40
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && git commit -q -m base --allow-empty )
+PRE=$(git -C "$RUNTIME" rev-parse HEAD)
+mkdir -p "$RUNTIME/launchd"
+cat > "$RUNTIME/launchd/com.test.manualjob.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.test.manualjob</string>
+  <key>ProgramArguments</key><array><string>/usr/bin/true</string></array>
+  <key>Disabled</key><true/>
+</dict>
+</plist>
+PLIST
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && \
+  GIT_AUTHOR_DATE="@$POST_COMMIT_EPOCH" GIT_COMMITTER_DATE="@$POST_COMMIT_EPOCH" \
+  git commit -q -m deploy )
+POST=$(git -C "$RUNTIME" rev-parse HEAD)
+# deliberately NOT installed anywhere — Disabled=true must skip it regardless.
+OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" PRE_DEPLOY_SHA="$PRE" POST_DEPLOY_SHA="$POST" \
+  DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
+  EXTRA_RUNTIME_ROOTS="${EXTRA_RUNTIME_ROOTS:-}" LAUNCH_AGENTS_DIR="$AGENTS" \
+  LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
+  DRY_RUN=0 bash "$HELPER" 2>/dev/null); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T40 verdict OK (Disabled=true job never flagged)" || nok "T40 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -eq 0 ] && ok "T40 exit 0" || nok "T40 exit" "rc=$RC"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""

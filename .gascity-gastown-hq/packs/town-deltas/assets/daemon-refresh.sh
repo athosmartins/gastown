@@ -175,6 +175,27 @@
 #      text now says the affected/guarded list itself can be INCOMPLETE (a
 #      false negative), not only that a listed daemon can be a false
 #      positive — pre-fix the message warned about just the latter.
+#  12. (wa-jts45) Points 1-11 all answer "is a DAEMON's live PROCESS running
+#      fresh code?" — a question that structurally cannot see a *.plist this
+#      deploy adds/edits for a brand-new SCHEDULED job: it has no live PID to
+#      compare staleness against (nothing to flag), and if the deploy touched
+#      no .py/template file at all (e.g. scheduling an already-existing,
+#      unchanged script for the first time), Step 1's own "no python source
+#      or template changed" short-circuit emits OK/not_applicable without
+#      ever looking at the new plist. Measured live (wa-sas9j): a merged,
+#      gate:passed bead whose new launchd/*.plist was never copied into
+#      LAUNCH_AGENTS_DIR at all — "no old process to flag" and "no process,
+#      period" collapsed into the identical green signal for a month. Step 1b
+#      (right after Step 1's CHANGED, before any early-exit) closes this: any
+#      *.plist this deploy changed is checked for (a) present under
+#      LAUNCH_AGENTS_DIR and (b) `launchctl list` sees its label — a new
+#      VERDICT=JOB_NOT_INSTALLED when either fails. Deliberately NOT also
+#      requiring "has it produced a successful run yet" — a job installed by
+#      THIS deploy may legitimately not have reached its next scheduled
+#      window (a daily 04:35 job checked at 23:00 has nothing to show), so
+#      that would false-positive on every ordinary nightly-job delivery
+#      instead of catching a real gap; left to the human follow-up named in
+#      JOB_NOT_INSTALLED's own ACTION text.
 #
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
@@ -215,7 +236,7 @@
 #
 # Output: machine-readable key=value lines + a trailing JSON object on STDOUT;
 # all human logging goes to STDERR.
-#   VERDICT=OK|SKIPPED|VERIFY_FAILED|NEEDS_GUARDED_RESTART
+#   VERDICT=OK|SKIPPED|VERIFY_FAILED|NEEDS_GUARDED_RESTART|JOB_NOT_INSTALLED
 #   AFFECTED=<labels>   RESTARTED=<labels>   FRESH_FAIL=<labels>   GUARDED=<labels>
 #   WOULD_RESTART=<labels>   (ga-omfwe: DRY_RUN=1 only — labels that would be
 #     restarted for real; RESTARTED is always empty under DRY_RUN=1, so the
@@ -475,6 +496,72 @@ case "$COMMIT_EPOCH" in ''|*[!0-9]*) COMMIT_EPOCH="$DEPLOY_EPOCH" ;; esac
 
 # ── Step 1: changed files in this deploy ──────────────────────────────────────
 CHANGED="$(git -C "$RUNTIME_DIR" diff --name-only "$PRE_DEPLOY_SHA" "$POST_DEPLOY_SHA" 2>/dev/null || true)"
+
+# ── Step 1b: scheduled-job plist delivery (wa-jts45, header point 12) ─────────
+# Runs BEFORE every early-exit below (including Step 1's own "no .py/template
+# changed" short-circuit further down) — see header point 12 for the full
+# rationale. Only asks: did this deploy touch a *.plist, and if so, is the
+# job it declares actually installed+loaded on this machine? NOT "has it run
+# yet" — see point 12 for why that bar would false-positive on an ordinary
+# nightly job checked hours before its next scheduled window.
+#
+# Inlines the launchctl-list check rather than calling daemon_is_loaded()
+# (defined later, in Step 2's helper block) — that function is not yet
+# defined at this point in the script's top-to-bottom execution, and moving
+# it earlier would touch code this bead has no other reason to move.
+SJ_CHANGED_PLISTS="$(echo "$CHANGED" | grep -E '\.plist$' || true)"
+if [ -n "${SJ_CHANGED_PLISTS// /}" ]; then
+  SJ_MISSING=""
+  SJ_UNLOADED=""
+  SJ_CHECKED=""
+  while IFS= read -r sj_rel; do
+    [ -n "$sj_rel" ] || continue
+    sj_path="$RUNTIME_DIR/$sj_rel"
+    [ -f "$sj_path" ] || continue   # deleted by this deploy — nothing to verify installed
+    sj_parsed="$(python3 - "$sj_path" <<'PY' 2>/dev/null
+import sys, plistlib
+try:
+    d = plistlib.load(open(sys.argv[1], 'rb'))
+except Exception:
+    sys.exit(1)
+label = d.get('Label')
+if not label:
+    sys.exit(1)
+print(label)
+print('1' if d.get('Disabled') else '0')
+PY
+)"
+    if [ -z "$sj_parsed" ]; then
+      log "Step 1b: could not parse $sj_rel (or no Label key) — scheduled-job delivery could not be checked for this file (not counted as missing, not counted as installed)."
+      continue
+    fi
+    sj_label="$(echo "$sj_parsed" | sed -n '1p')"
+    sj_disabled="$(echo "$sj_parsed" | sed -n '2p')"
+    if [ "$sj_disabled" = "1" ]; then
+      log "Step 1b: $sj_label ($sj_rel) is Disabled=true (intentionally manual) — skipping."
+      continue
+    fi
+    SJ_CHECKED="$SJ_CHECKED $sj_label"
+    if [ ! -f "$LAUNCH_AGENTS_DIR/$sj_label.plist" ]; then
+      SJ_MISSING="$SJ_MISSING $sj_label"
+    elif ! $LAUNCHCTL_BIN list "$sj_label" >/dev/null 2>&1; then
+      SJ_UNLOADED="$SJ_UNLOADED $sj_label"
+    fi
+  done <<< "$SJ_CHANGED_PLISTS"
+  SJ_MISSING="$(echo "$SJ_MISSING" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+  SJ_UNLOADED="$(echo "$SJ_UNLOADED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+  if [ -n "${SJ_MISSING// /}" ] || [ -n "${SJ_UNLOADED// /}" ]; then
+    AFFECTED="$SJ_CHECKED"
+    SJ_REASON="scheduled-job plist(s) changed by this deploy are not actually installed for launchd to run them"
+    [ -n "${SJ_MISSING// /}" ] && SJ_REASON="$SJ_REASON — missing from $LAUNCH_AGENTS_DIR: $SJ_MISSING"
+    [ -n "${SJ_UNLOADED// /}" ] && SJ_REASON="$SJ_REASON — present but not loaded (launchctl list): $SJ_UNLOADED"
+    log "Step 1b: JOB_NOT_INSTALLED — $SJ_REASON"
+    emit JOB_NOT_INSTALLED "$SJ_REASON" not_verified
+  fi
+  if [ -n "${SJ_CHECKED// /}" ]; then
+    log "Step 1b: scheduled-job plist(s) changed by this deploy are installed+loaded:$SJ_CHECKED (not proof they have run successfully — see JOB_NOT_INSTALLED's own ACTION text at the caller for that follow-up check)."
+  fi
+fi
 
 # (ga-dk7fw, header point 9) framework-default "structurally inert" path
 # classes — checked against the FULL raw changed set, unconditionally, with
