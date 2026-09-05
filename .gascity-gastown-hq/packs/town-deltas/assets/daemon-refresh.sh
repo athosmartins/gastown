@@ -410,6 +410,30 @@ fi
 # ── emit result + exit ────────────────────────────────────────────────────────
 emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified — fail closed)
   local verdict="$1" reason="$2" proof="${3:-not_verified}"
+  # gate ga-ax0t9: Step 1b USED TO call emit directly, and emit exits (see the
+  # bottom of this function). That foreclosed Step 2 entirely: a deploy that both
+  # shipped an uninstalled scheduled-job plist AND changed a SENSITIVE daemon
+  # running stale code reported ONLY the plist, with GUARDED empty — which reads
+  # exactly like "there was no other problem". Proven by the reviewer against this
+  # very SHA: combining fixtures T4 + T37 in one deploy produced
+  # VERDICT=JOB_NOT_INSTALLED, GUARDED= (empty), and the mock launchctl kicks.log
+  # was never even created — the staleness check had not run at all.
+  #
+  # Now Step 1b only RECORDS its finding and lets Step 2 run. Whichever emit
+  # finally fires carries both: the verdict stays JOB_NOT_INSTALLED (an
+  # uninstalled job is at least as actionable as anything Step 2 finds, and
+  # consumers already branch on it), while AFFECTED/GUARDED/RESTARTED — filled in
+  # by Step 2 by the time we get here — stop being silently empty. The two are
+  # not alternatives; they can both be true, and the report has to say so.
+  if [ -n "${SJ_PENDING_REASON:-}" ] && [ "$verdict" != "JOB_NOT_INSTALLED" ]; then
+    reason="$SJ_PENDING_REASON — AND ALSO ($verdict): $reason"
+    verdict="JOB_NOT_INSTALLED"
+    # O proof tem de vir junto. Step 1b nunca verificou o job (ele nem esta
+    # instalado pra rodar), entao herdar o proof do Step 2 — que pode ser
+    # "not_applicable" — afirmaria algo que ninguem checou. Fail closed, igual
+    # ao default do proprio emit.
+    proof="not_verified"
+  fi
   echo "VERDICT=$verdict"
   echo "AFFECTED=${AFFECTED:-}"
   echo "RESTARTED=${RESTARTED:-}"
@@ -443,6 +467,8 @@ PY
 }
 
 AFFECTED=""; RESTARTED=""; FRESH_FAIL=""; GUARDED=""; ALREADY_FRESH=""; WOULD_RESTART=""
+# ga-ax0t9: achado do Step 1b que espera o Step 2 rodar antes de virar veredito.
+SJ_PENDING_REASON=""
 # gate-fix-2 (ga-puq8z, gate_run=ga-9a45d): weakest confidence tier across all
 # ALREADY_FRESH daemons this run — starts optimistic, downgraded to
 # not_verified the moment any already-fresh match is only a COMMIT_EPOCH
@@ -555,8 +581,10 @@ PY
     SJ_REASON="scheduled-job plist(s) changed by this deploy are not actually installed for launchd to run them"
     [ -n "${SJ_MISSING// /}" ] && SJ_REASON="$SJ_REASON — missing from $LAUNCH_AGENTS_DIR: $SJ_MISSING"
     [ -n "${SJ_UNLOADED// /}" ] && SJ_REASON="$SJ_REASON — present but not loaded (launchctl list): $SJ_UNLOADED"
-    log "Step 1b: JOB_NOT_INSTALLED — $SJ_REASON"
-    emit JOB_NOT_INSTALLED "$SJ_REASON" not_verified
+    log "Step 1b: JOB_NOT_INSTALLED — $SJ_REASON (recorded; Step 2 still runs)"
+    # NAO chamar emit aqui: emit encerra o script (ver o case no fim dele) e o
+    # Step 2 nunca rodaria. Registra e segue; emit combina no fim.
+    SJ_PENDING_REASON="$SJ_REASON"
   fi
   if [ -n "${SJ_CHECKED// /}" ]; then
     log "Step 1b: scheduled-job plist(s) changed by this deploy are installed+loaded:$SJ_CHECKED (not proof they have run successfully — see JOB_NOT_INSTALLED's own ACTION text at the caller for that follow-up check)."
