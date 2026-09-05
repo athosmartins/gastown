@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
-# Selftest for nightly-reboot.sh — proves Guard 2's retry survives a single
-# transient gate-queue-composition.sh blip (ga-g5bzf) instead of burning the
-# whole night, while fail-closed still holds if BOTH attempts fail.
+# Selftest for nightly-reboot.sh — proves the merged Guard-2+3 retry loop
+# (ga-nnp5b) survives a transient blip in EITHER guard without burning the
+# whole night, still fail-closes if the block never clears, re-checks BOTH
+# guards on every attempt (no staleness gap), and drives the
+# consecutive-skip streak/alarm (ga-nnp5b item 4) correctly. Supersedes the
+# narrower ga-g5bzf selftest, which only exercised Guard 2 and relied on
+# Guard 3 being permanently (and un-testably) blocked.
 #
-# SAFETY: bd is faked to ALWAYS report 1 in-progress bead, so Guard 3
-# unconditionally SKIPs in every scenario below — the real
-# `/sbin/shutdown -r now` line is architecturally unreachable from this test
-# regardless of how Guard 2 behaves. assert_never_rebooted() is a second,
-# independent proof of the same thing (greps the run log for the line that
-# only appears immediately before the shutdown call). Nothing here touches
-# the real CITY, the real bd/notify binaries, or sudo.
+# SAFETY: /sbin/shutdown is never invoked for real. The script's own
+# SHUTDOWN_BIN override (added alongside GC_BIN/BD_BIN/NOTIFY_BIN for this
+# fix) points it at a fake that only logs its args — this is what makes it
+# safe to exercise the actual "reboot" success path here, unlike the
+# ga-g5bzf test which avoided that path entirely by keeping Guard 3
+# permanently blocked. assert_never_rebooted() double-checks: it looks at
+# the fake shutdown's own call log, not just script log text, so a scenario
+# that's SUPPOSED to stay blocked really never reached that call. Nothing
+# here touches the real CITY, the real bd/gc/notify binaries, or sudo.
 set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$SELF_DIR/nightly-reboot.sh"
@@ -19,8 +25,9 @@ bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 
-# --- fake PATH: only `date` and `sudo` need shadowing — CITY, BD_BIN,
-# NOTIFY_BIN and NOTIFY_AS_USER already have real env-var overrides. -------
+# --- fake PATH: only `date`, `sudo` and `sync` need shadowing — CITY,
+# BD_BIN, GC_BIN, NOTIFY_BIN, SHUTDOWN_BIN and NOTIFY_AS_USER already have
+# real env-var overrides. ---------------------------------------------------
 FAKEBIN="$TMP/bin"; mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/date" <<'EOF'
 #!/usr/bin/env bash
@@ -46,30 +53,18 @@ exec "$@"
 EOF
 chmod +x "$FAKEBIN/sudo"
 
-# --- fake bd: ALWAYS reports 1 in-progress bead, so Guard 3 blocks no
-# matter what Guard 2 decided. This is what makes it safe to exercise Guard
-# 2's failure path below without any risk of reaching the reboot line. -----
-FAKE_BD="$TMP/bd"
-cat > "$FAKE_BD" <<'EOF'
+cat > "$FAKEBIN/sync" <<'EOF'
 #!/usr/bin/env bash
-echo '[{"id":"fake-inprogress-1"}]'
+exit 0
 EOF
-chmod +x "$FAKE_BD"
+chmod +x "$FAKEBIN/sync"
 
-# --- fake notify: captures calls instead of paging Athos's phone. ---------
-NOTIFY_LOG="$TMP/notify.log"
-FAKE_NOTIFY="$TMP/notify"
-cat > "$FAKE_NOTIFY" <<EOF
-#!/usr/bin/env bash
-echo "\$*" >> "$NOTIFY_LOG"
-EOF
-chmod +x "$FAKE_NOTIFY"
-
-# --- fake CITY: isolated sandbox, never touches the real one. -------------
+# --- fake gate-queue-composition.sh: N-th call onward reports clear -------
 FAKE_CITY="$TMP/city"
 mkdir -p "$FAKE_CITY/.gc/logs" "$FAKE_CITY/scripts"
 FAKE_GATE="$FAKE_CITY/scripts/gate-queue-composition.sh"
 FAKE_LOG="$FAKE_CITY/.gc/logs/nightly-reboot.log"
+STREAK_FILE="$FAKE_CITY/.gc/logs/nightly-reboot.streak"
 GATE_COUNTER="$TMP/gate-calls"
 
 # $1 = attempt number (1-based) at which the fake gate script starts
@@ -90,59 +85,179 @@ EOF
   chmod +x "$FAKE_GATE"
 }
 
+# --- fake bd: N-th call onward reports 0 in-progress; 0 = never clears. ---
+FAKE_BD="$TMP/bd"
+BD_COUNTER="$TMP/bd-calls"
+write_fake_bd() {
+  local succeed_at="${1:-0}"
+  cat > "$FAKE_BD" <<EOF
+#!/usr/bin/env bash
+n=\$(( \$(cat "$BD_COUNTER" 2>/dev/null || echo 0) + 1 ))
+echo "\$n" > "$BD_COUNTER"
+if [ "$succeed_at" != "0" ] && [ "\$n" -ge "$succeed_at" ]; then
+  echo '[]'
+else
+  echo '[{"id":"fake-inprogress-1"}]'
+fi
+EOF
+  chmod +x "$FAKE_BD"
+}
+
+# --- fake gc: only used for record_skip's mail escalation. Logs its args
+# instead of touching the real gc binary or a real city. ------------------
+FAKE_GC="$TMP/gc"
+GC_MAIL_LOG="$TMP/gc-mail.log"
+cat > "$FAKE_GC" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$GC_MAIL_LOG"
+EOF
+chmod +x "$FAKE_GC"
+
+# --- fake shutdown: this is what makes it SAFE to let a scenario reach the
+# "all clear, reboot now" path. Logs its args; never actually reboots. -----
+FAKE_SHUTDOWN="$TMP/shutdown"
+SHUTDOWN_CALL_LOG="$TMP/shutdown-calls.log"
+cat > "$FAKE_SHUTDOWN" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$SHUTDOWN_CALL_LOG"
+exit 0
+EOF
+chmod +x "$FAKE_SHUTDOWN"
+
+# --- fake notify: captures calls instead of paging Athos's phone. ---------
+NOTIFY_LOG="$TMP/notify.log"
+FAKE_NOTIFY="$TMP/notify"
+cat > "$FAKE_NOTIFY" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$NOTIFY_LOG"
+EOF
+chmod +x "$FAKE_NOTIFY"
+
+# fresh_state: wipes per-run counters/logs but PRESERVES the streak file —
+# use between nights within the SAME consecutive-skip scenario group.
+# reset_all also clears the streak — use at the start of an independent
+# group that must start from "0 consecutive skips".
+fresh_state() {
+  rm -f "$GATE_COUNTER" "$BD_COUNTER"
+  : > "$NOTIFY_LOG"; : > "$FAKE_LOG"; : > "$GC_MAIL_LOG"; : > "$SHUTDOWN_CALL_LOG"
+}
+reset_all() { fresh_state; rm -f "$STREAK_FILE"; }
+
 run_nightly_reboot() {
-  rm -f "$GATE_COUNTER"; : > "$NOTIFY_LOG"; : > "$FAKE_LOG"
   PATH="$FAKEBIN:$PATH" \
     CITY="$FAKE_CITY" \
     BD_BIN="$FAKE_BD" \
+    GC_BIN="$FAKE_GC" \
     NOTIFY_BIN="$FAKE_NOTIFY" \
     NOTIFY_AS_USER="nobody" \
-    NIGHTLY_REBOOT_GATE_RETRY_SLEEP=1 \
+    SHUTDOWN_BIN="$FAKE_SHUTDOWN" \
+    NIGHTLY_REBOOT_RETRY_INTERVAL=1 \
+    NIGHTLY_REBOOT_RETRY_MAX_ATTEMPTS=3 \
+    NIGHTLY_REBOOT_ALARM_THRESHOLD=2 \
     timeout 30 bash "$SCRIPT" >"$TMP/stdout.log" 2>"$TMP/stderr.log"
   echo $?
 }
 
 assert_never_rebooted() {
   local scenario="$1"
-  if grep -q "rebooting now" "$FAKE_LOG" 2>/dev/null; then
-    bad "$scenario: SAFETY VIOLATION — log shows 'rebooting now', /sbin/shutdown may have been reached"
+  if [ -s "$SHUTDOWN_CALL_LOG" ] || grep -q "rebooting now" "$FAKE_LOG" 2>/dev/null; then
+    bad "$scenario: SAFETY VIOLATION — shutdown was invoked or log shows 'rebooting now'"
   else
-    ok "$scenario: never reached the reboot line (Guard 3 fake-bd block held)"
+    ok "$scenario: never reached the reboot line"
   fi
 }
 
-echo "── Scenario 1: gate-queue-composition succeeds on the FIRST try (no retry needed) ──"
-write_fake_gate 1
+echo "── Scenario 1: gate + hq both healthy on the FIRST attempt ──"
+reset_all
+write_fake_gate 1; write_fake_bd 1
 rc=$(run_nightly_reboot)
-calls=$(cat "$GATE_COUNTER" 2>/dev/null || echo 0)
-[ "$rc" -eq 0 ] && ok "1: exits 0" || bad "1: expected exit 0, got $rc"
-[ "$calls" = "1" ] && ok "1: gate-queue-composition.sh called exactly once (no spurious retry)" || bad "1: expected 1 call, got $calls"
-grep -q "gate check OK" "$FAKE_LOG" && ok "1: log shows gate check OK" || bad "1: log missing 'gate check OK'"
-assert_never_rebooted "1"
+gcalls=$(cat "$GATE_COUNTER" 2>/dev/null || echo 0)
+bcalls=$(cat "$BD_COUNTER" 2>/dev/null || echo 0)
+# exit 1 here is the CORRECT observed outcome, not a bug: in production,
+# reaching the post-shutdown "ERROR: shutdown returned" line at all means
+# /sbin/shutdown returned control instead of the machine actually
+# rebooting — the fake can only ever "return" (it has no way to truly
+# reboot the test host), so it deterministically exercises that same
+# fall-through path. The real evidence of success is the fake shutdown
+# call + the guards-OK log line, not the exit code.
+[ "$rc" -eq 1 ] && ok "1: exits 1 (fake shutdown returned instead of truly rebooting — expected)" || bad "1: expected exit 1, got $rc"
+[ "$gcalls" = "1" ] && ok "1: gate checked exactly once (no spurious retry)" || bad "1: expected 1 gate call, got $gcalls"
+[ "$bcalls" = "1" ] && ok "1: hq checked exactly once" || bad "1: expected 1 bd call, got $bcalls"
+grep -q "guards OK on attempt 1/3" "$FAKE_LOG" && ok "1: log shows guards OK on attempt 1" || bad "1: log missing guards-OK line"
+if [ -s "$SHUTDOWN_CALL_LOG" ] && grep -q -- "-r now" "$SHUTDOWN_CALL_LOG"; then
+  ok "1: fake shutdown -r now was invoked"
+else
+  bad "1: shutdown was never invoked"
+fi
+grep -q "ERROR: shutdown returned 0" "$FAKE_LOG" && ok "1: log shows the post-shutdown fall-through, as expected from a mock" || bad "1: missing the expected post-shutdown ERROR line"
+[ "$(cat "$STREAK_FILE" 2>/dev/null || echo x)" = "0" ] && ok "1: streak stays 0 on a clean night" || bad "1: streak not reset/zero after success"
 
 echo ""
-echo "── Scenario 2: fails once, succeeds on retry — THE ga-g5bzf regression ──"
-write_fake_gate 2
+echo "── Scenario 2: gate blips once then clears, hq healthy — the ga-g5bzf case, now inside the merged retry ──"
+reset_all
+write_fake_gate 2; write_fake_bd 1
 rc=$(run_nightly_reboot)
-calls=$(cat "$GATE_COUNTER" 2>/dev/null || echo 0)
-[ "$rc" -eq 0 ] && ok "2: exits 0" || bad "2: expected exit 0, got $rc"
-[ "$calls" = "2" ] && ok "2: gate-queue-composition.sh retried exactly once after the transient failure" || bad "2: expected 2 calls, got $calls"
-grep -q "attempt 1/2 failed" "$FAKE_LOG" && ok "2: log shows the first-attempt failure" || bad "2: log missing the attempt-1 failure line"
-grep -q "gate check OK" "$FAKE_LOG" && ok "2: log shows the retry recovered (gate check OK) — this is the fix" || bad "2: retry did NOT recover — ga-g5bzf regression"
-assert_never_rebooted "2"
+gcalls=$(cat "$GATE_COUNTER" 2>/dev/null || echo 0)
+bcalls=$(cat "$BD_COUNTER" 2>/dev/null || echo 0)
+# See scenario 1's comment: exit 1 is the expected outcome with a fake
+# shutdown that returns instead of truly rebooting.
+[ "$rc" -eq 1 ] && ok "2: exits 1 (fake shutdown returned instead of truly rebooting — expected)" || bad "2: expected exit 1, got $rc"
+[ "$gcalls" = "2" ] && ok "2: gate retried exactly once after the transient failure" || bad "2: expected 2 gate calls, got $gcalls"
+[ "$bcalls" = "1" ] && ok "2: hq checked once, only after gate cleared" || bad "2: expected 1 bd call, got $bcalls"
+grep -q "attempt 1/3 blocked" "$FAKE_LOG" && ok "2: log shows the first-attempt block" || bad "2: log missing the attempt-1 block line"
+grep -q "guards OK on attempt 2/3" "$FAKE_LOG" && ok "2: log shows recovery on attempt 2 — this is the fix" || bad "2: retry did NOT recover"
+[ -s "$SHUTDOWN_CALL_LOG" ] && ok "2: fake shutdown was invoked" || bad "2: shutdown was never invoked"
 
 echo ""
-echo "── Scenario 3: fails on BOTH attempts — fail-closed must still hold ──"
-write_fake_gate 0
+echo "── Scenario 3: gate never clears — fail-closed must still hold, hq never even checked ──"
+reset_all
+write_fake_gate 0; write_fake_bd 1
 rc=$(run_nightly_reboot)
-calls=$(cat "$GATE_COUNTER" 2>/dev/null || echo 0)
+gcalls=$(cat "$GATE_COUNTER" 2>/dev/null || echo 0)
+bcalls=$(cat "$BD_COUNTER" 2>/dev/null || echo 0)
 [ "$rc" -eq 0 ] && ok "3: exits 0 (SKIP, not a crash)" || bad "3: expected exit 0, got $rc"
-[ "$calls" = "2" ] && ok "3: gave up after exactly 2 attempts (bounded — no retry storm)" || bad "3: expected 2 calls, got $calls"
-grep -q "SKIP: gate-queue-composition.sh failed after 2/2 attempts" "$FAKE_LOG" \
+[ "$gcalls" = "3" ] && ok "3: gave up after exactly 3 attempts (bounded — no retry storm)" || bad "3: expected 3 gate calls, got $gcalls"
+[ "$bcalls" = "0" ] && ok "3: hq never checked — gate short-circuits first" || bad "3: expected 0 bd calls, got $bcalls"
+grep -q "SKIP: guards still blocked after 3/3 attempts" "$FAKE_LOG" \
   && ok "3: log shows fail-closed SKIP after exhausting retries" || bad "3: log missing the fail-closed SKIP line"
-grep -q "gate-queue-composition.sh falhou (2/2 tentativas)" "$NOTIFY_LOG" \
+grep -q "bloqueado após 3/3 tentativas" "$NOTIFY_LOG" \
   && ok "3: notify_athos fired with the attempt count" || bad "3: notify_athos did not fire (or wrong message)"
 assert_never_rebooted "3"
+[ "$(cat "$STREAK_FILE" 2>/dev/null)" = "1" ] && ok "3: skip streak now 1" || bad "3: expected streak=1, got $(cat "$STREAK_FILE" 2>/dev/null || echo '<missing>')"
+[ ! -s "$GC_MAIL_LOG" ] && ok "3: no mayor-mail yet (threshold is 2, streak is 1)" || bad "3: mayor-mail fired before threshold"
+
+echo ""
+echo "── Scenario 4: gate always healthy, hq never clears — proves Guard 3 is still enforced ──"
+reset_all
+write_fake_gate 1; write_fake_bd 0
+rc=$(run_nightly_reboot)
+gcalls=$(cat "$GATE_COUNTER" 2>/dev/null || echo 0)
+bcalls=$(cat "$BD_COUNTER" 2>/dev/null || echo 0)
+[ "$rc" -eq 0 ] && ok "4: exits 0 (SKIP, not a crash)" || bad "4: expected exit 0, got $rc"
+[ "$gcalls" = "3" ] && ok "4: gate re-checked on every attempt (no staleness gap)" || bad "4: expected 3 gate calls, got $gcalls"
+[ "$bcalls" = "3" ] && ok "4: hq re-checked on every attempt too" || bad "4: expected 3 bd calls, got $bcalls"
+grep -q "hq beads in_progress = 1" "$FAKE_LOG" && ok "4: log attributes the block to hq, not gate" || bad "4: log doesn't show the hq-specific reason"
+assert_never_rebooted "4"
+
+echo ""
+echo "── Scenario 5: consecutive-skip streak reaches the alarm threshold, then a clean night resets it ──"
+reset_all
+write_fake_gate 0; write_fake_bd 1
+rc1=$(run_nightly_reboot)
+[ "$rc1" -eq 0 ] && ok "5a: a skip night still exits 0 (SKIP, not a crash)" || bad "5a: expected exit 0, got $rc1"
+[ "$(cat "$STREAK_FILE" 2>/dev/null)" = "1" ] && ok "5a: first bad night -> streak=1" || bad "5a: expected streak=1"
+[ ! -s "$GC_MAIL_LOG" ] && ok "5a: no alarm yet (below threshold)" || bad "5a: alarm fired too early"
+fresh_state   # new night, SAME streak file — do NOT reset_all here
+write_fake_gate 0; write_fake_bd 1
+rc2=$(run_nightly_reboot)
+[ "$rc2" -eq 0 ] && ok "5b: a skip night still exits 0 (SKIP, not a crash)" || bad "5b: expected exit 0, got $rc2"
+[ "$(cat "$STREAK_FILE" 2>/dev/null)" = "2" ] && ok "5b: second consecutive bad night -> streak=2" || bad "5b: expected streak=2"
+grep -q "nightly-reboot: 2 noites seguidas" "$GC_MAIL_LOG" && ok "5b: mayor-mail escalation fired at threshold" || bad "5b: mayor-mail did not fire at streak=2"
+grep -q "🚨" "$NOTIFY_LOG" && ok "5b: high-priority push fired alongside the mail" || bad "5b: escalation push missing"
+fresh_state   # new night, SAME streak file
+write_fake_gate 1; write_fake_bd 1
+rc3=$(run_nightly_reboot)
+[ "$(cat "$STREAK_FILE" 2>/dev/null)" = "0" ] && ok "5c: a clean night resets the streak to 0" || bad "5c: expected streak reset to 0, got $(cat "$STREAK_FILE" 2>/dev/null)"
 
 echo ""
 echo "nightly-reboot selftest: PASS=$PASS FAIL=$FAIL"
