@@ -5454,6 +5454,15 @@ PYEOF
             DEPLOY_FAILED)
               DAEMON_HOLD_ACTION="investigate why the rig deploy_cmd itself failed (see Refresh detail below for its output) — the merged code was never even pulled onto the runtime checkout, so no daemon could possibly be serving it yet. Fix the deploy (conflict? auth? network?), re-run it manually, confirm the runtime is on sha=$MERGE_SHA, then close this bead manually once confirmed live."
               ;;
+            JOB_NOT_INSTALLED)
+              # wa-jts45: daemon-refresh.sh's Step 1b — a *.plist this deploy
+              # changed for a scheduled job is missing from LAUNCH_AGENTS_DIR
+              # or present but not `launchctl list`-loaded. The generic
+              # daemon-crash-oriented default message above ("crash on boot?
+              # port in use?") does not fit this case at all — nothing ever
+              # ran, so say so.
+              DAEMON_HOLD_ACTION="install the missing scheduled job(s) named in the Refresh detail below: copy the plist(s) into ~/Library/LaunchAgents and \`launchctl load\` (or \`launchctl bootstrap\`) them, then confirm \`launchctl list <label>\` succeeds. This verdict only proves the job is installed+loaded — NOT that a run has actually completed successfully (a job installed today may not reach its next scheduled window for hours) — so also wait for, or manually trigger via \`launchctl kickstart -k\`, one run and confirm a readable result lands in its log before closing this bead manually."
+              ;;
           esac
           bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED and branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA) — but NOT closing (ga-l7n3v): daemon verification $DAEMON_HOLD_VERDICT — $DAEMON_HOLD_REASON
 
