@@ -3803,11 +3803,29 @@ def compute_multi_assigned_assignees(beads):
     shape) — so, same as coordinators, flagging them changes no decision and
     only risks a misleading alarm if several beads legitimately share the
     bare template while awaiting pool pickup.
+
+    Epics are ALSO excluded (gate ga-suhxf, review of this function's own
+    first version): `beads` here comes straight from list_inflight_beads()
+    (label/marker-based query, no issue_type filter), and this file's other
+    per-bead loops (e.g. list_stranded_inprogress_beads() at ~L3671) already
+    skip epics for the documented reason that a container epic can be the
+    nominal assignee of a real, healthy session ALONGSIDE that session's one
+    actual actionable bead. Without the same skip here, that combination
+    wrongly placed the session in this function's returned set purely
+    because it "owned" 2 in-flight ids — the epic plus its one real bead —
+    flipping session_multi_assigned=True for the real bead and forcing it
+    through the stricter bead_update_age check in session_owner_is_healthy()
+    instead of the activity_age check a genuinely single-tasked session
+    should get. That is the exact false-unhealthy/false-reclaimable shape
+    this whole file exists to prevent — recreating the double-dispatch risk
+    on a session that was never actually double-booked.
     """
     counts = {}
     for b in beads:
         a = b.get("assignee") or ""
         bid = b.get("id", "")
+        if (b.get("issue_type") or b.get("type") or "") == "epic":
+            continue
         if a and bid and not is_coordinator(a) and a not in EPHEMERAL_POOL_ASSIGNEES:
             counts.setdefault(a, set()).add(bid)
     return {a for a, ids in counts.items() if len(ids) > 1}
@@ -6943,6 +6961,27 @@ def _selftest():
               {"id": "wa-p1", "assignee": "wa-worker"},
               {"id": "wa-p2", "assignee": "wa-worker"},
           ]) == set())
+    check("ZB-3d (gate ga-suhxf reviewer finding): a session that is nominal "
+          "assignee of ONE container EPIC (in-flight-labeled, per this file's own "
+          "documented recurring shape — list_inflight_beads() has no issue_type "
+          "filter) PLUS exactly one REAL actionable bead is never flagged — before "
+          "this fix the epic counted as a second distinct in-flight id, wrongly "
+          "flipping session_multi_assigned=True for the one real bead and forcing "
+          "it through the stricter bead_update_age check even though the session "
+          "was never actually double-booked",
+          compute_multi_assigned_assignees([
+              {"id": "ga-epic1", "assignee": "thies-wa", "issue_type": "epic"},
+              {"id": "wa-real1", "assignee": "thies-wa", "issue_type": "task"},
+          ]) == set())
+    check("ZB-3e (negative control for ZB-3d): the SAME assignee holding TWO real "
+          "(non-epic) beads alongside its epic is still flagged — the epic "
+          "exclusion must skip only the epic id, never swallow a genuine "
+          "double-dispatch among the remaining real beads",
+          compute_multi_assigned_assignees([
+              {"id": "ga-epic1", "assignee": "thies-wa", "issue_type": "epic"},
+              {"id": "wa-real1", "assignee": "thies-wa", "issue_type": "task"},
+              {"id": "wa-real2", "assignee": "thies-wa", "issue_type": "bug"},
+          ]) == {"thies-wa"})
 
     # --- ZB-4..7: session_is_live() / concrete_adhoc_session_is_live() wiring ---
     _zb_live_fresh = [
