@@ -72,7 +72,24 @@ fi
 
 echo "crew-pushguard-check: GUARD AUSENTE em ${BROKEN}"
 
-# Alerta por mail (canal que não depende do hook nem do git local).
+# PUSH pro Athos — NÃO só mail. Um guard ausente é falha de produção, e mail
+# depende de existir sessão do Mayor viva pra ler; se os clones quebrarem às 3h
+# da manhã o alerta espera até alguém acordar (a mesma dependência de atenção
+# humana que deixou 4 clones quebrados por 8 semanas — batista-wa, 04/09).
+#
+# ⚠️ A FRASE "job falhou" É CARGA, NÃO ENFEITE. `scripts/notify` decide push vs
+# digest por ALLOWLIST DE VOCABULÁRIO, não por prioridade: `-p 5` sozinho cai no
+# digest EM SILÊNCIO. Medido aqui antes de confiar (NOTIFY_ROUTE_TEST=1):
+#   com "job falhou"  -> push
+#   sem a frase       -> digest
+# Se editar esta mensagem, RE-MEÇA. Não presuma que continua roteando.
+if command -v notify >/dev/null 2>&1; then
+    notify -t "crew-pushguard-check" -p 5 \
+        "job falhou: guard de push ausente em clone de crew (${BROKEN}) — push direto na main passa batido nesses clones. Ver wa-a4np9." \
+        >/dev/null 2>&1 || true
+fi
+
+# Alerta por mail também (trilha durável pro Mayor, complementar ao push).
 if command -v gc >/dev/null 2>&1; then
     gc mail send mayor/ --from controller \
         -s "Guard de push ausente em clone de crew (wa-a4np9)" \

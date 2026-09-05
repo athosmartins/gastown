@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      crew-pushguard-check (wa-a4np9) — varre os clones de crew procurando
+      pre-push que NAO RESOLVE (guard de push ausente).
+
+      POR QUE ESTE PLIST EXISTE, e nao so o script: o cabecalho do script diz
+      "sweep externo, periodico" — sem agendamento isso e falso. Um detector
+      que so roda quando alguem lembra depende da MESMA atencao humana que
+      deixou 4 clones quebrados por 8 semanas; seria trocar um ponto cego por
+      outro (batista-wa, 04/09). Detector sem plist e doc que promete o que o
+      codigo ao lado nao faz — exatamente a classe de defeito que este dia
+      inteiro foi gasto cacando.
+
+      A cada 6h: a quebra e rara e nao urgente ao minuto (o dano e um push que
+      passa batido, nao um servico fora do ar), entao 4x/dia pega em horas, nao
+      em semanas, sem virar ruido. Minuto 17 pra nao cair junto com a rajada de
+      jobs de hora cheia.
+    -->
+    <key>Label</key>
+    <string>com.gascity.crew-pushguard-check</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/crew-pushguard-check.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>2</integer><key>Minute</key><integer>17</integer></dict>
+        <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>17</integer></dict>
+        <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>17</integer></dict>
+        <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>17</integer></dict>
+    </array>
+
+    <!-- Roda no load tambem: instalar e ja saber o estado atual, em vez de
+         esperar ate 6h pra descobrir que um clone esta desprotegido agora. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/crew-pushguard-check.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/crew-pushguard-check.err</string>
+</dict>
+</plist>
