@@ -92,7 +92,14 @@ NOW = time.time()
 
 def _sh(args, timeout=20):
     try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        # ga-30xi3: errors="replace" — `gc session list`'s table form truncates
+        # titles to fit column width, and a cut mid multi-byte UTF-8 char makes
+        # stdout invalid UTF-8. text=True decodes INSIDE subprocess.run, so a
+        # strict (default) decode raises UnicodeDecodeError there — caught below
+        # exactly like a real command failure, collapsing "one line had a bad
+        # byte" into the same None a dead command produces. A diagnostic read
+        # must never fail closed into "tudo quieto".
+        return subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=timeout)
     except Exception:
         return None
 

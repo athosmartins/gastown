@@ -302,7 +302,13 @@ RIG_KV_RE = re.compile(r'^\s*([A-Za-z0-9_]+)\s*=\s*"([^"]*)"')
 
 def sh(args, timeout=20, stdin=None):
     try:
-        return subprocess.run(args, input=stdin, capture_output=True, text=True, timeout=timeout)
+        # ga-30xi3: errors="replace" — a session title truncated mid multi-byte
+        # UTF-8 char makes `gc session list`'s table output invalid UTF-8; a
+        # strict (default) decode raises UnicodeDecodeError here, which
+        # snapshot() renders as the same "(failed)" a genuinely dead command
+        # produces — exactly backwards for a diagnostic read after an alarm.
+        return subprocess.run(args, input=stdin, capture_output=True, text=True,
+                              errors="replace", timeout=timeout)
     except Exception:
         return None
 

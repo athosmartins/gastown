@@ -59,7 +59,13 @@ SAMPLE_EPOCH = int(os.environ.get("UTIL_SAMPLE_EPOCH", str(int(time.time()))))
 
 def sh(args, timeout=20):
     try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        # ga-30xi3: errors="replace" — a session title truncated mid multi-byte
+        # UTF-8 char makes `gc session list`'s table output invalid UTF-8; a
+        # strict (default) decode raises UnicodeDecodeError here, collapsing
+        # into the same "" a clean-but-empty read produces (active_sessions()
+        # would then report EVERY template as zero-active, not just the one
+        # corrupted line).
+        r = subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=timeout)
         return r.stdout
     except Exception:
         return ""

@@ -20,6 +20,14 @@ m = importlib.util.module_from_spec(spec)
 sys.argv = ["imp"]                      # __name__ != "__main__" → main() never runs
 spec.loader.exec_module(m)
 
+# ga-30xi3: captured BEFORE any test below gets a chance to replace m._sh with a
+# fake (many do, via _fake_sh_factory, and never restore the true original — only
+# their OWN fake round-trips). The ga-30xi3 block further down needs the REAL,
+# unmodified _sh() (the one that actually calls subprocess.run) to prove its fix;
+# grabbing "whatever m._sh currently is" at that point would silently test a fake
+# instead and pass vacuously.
+_TRUE_ORIGINAL_SH_30xi3 = m._sh
+
 PASS = FAIL = 0
 def eq(name, got, exp):
     global PASS, FAIL
@@ -340,6 +348,78 @@ eq("reviewer dead + 475min-old marker: reviewer_alive detected False", _g_dead["
 eq("reviewer dead + 475min-old marker: stalled must STILL be True (real stall preserved)", _g_dead["stalled"], True)
 
 m._bd_json, m._age_min, m._sh = _orig_bd_json, _orig_age_min, _orig_sh_gate
+
+print("── ga-30xi3: _sh() must not collapse a text-decode failure into the same None "
+      "a genuine command failure produces (truncated-multibyte session title) ──")
+# `gc session list`'s table form truncates titles to fit the column width; when the
+# cut lands mid multi-byte UTF-8 char (e.g. an ellipsis U+2026 = bytes e2 80 a6, cut
+# after 2 bytes), the process's stdout is not valid UTF-8. subprocess.run(...,
+# text=True) decodes INSIDE the call, so THAT decode is what raises
+# UnicodeDecodeError — not anything _sh() does — and _sh()'s existing
+# `except Exception: return None` swallows it exactly like a real command failure.
+# reviewer_alive then collapses "I couldn't read this" into the same False a truly
+# dead reviewer produces (error-empty-must-not-produce-same-value class).
+#
+# The fakes below reproduce that failure mode precisely: they raise unless the
+# caller passed errors="replace" (the fix) — mirroring how Python's text-mode
+# decode only tolerates bad bytes with that flag, strict (the default) otherwise.
+#
+# NOTE: m._sh may currently be a leftover fake from an earlier block (several
+# reassign it via _fake_sh_factory and never restore it) — that fake never calls
+# subprocess.run at all, so testing against "whatever m._sh is right now" would
+# pass vacuously regardless of the fix. Pin it to the TRUE original for this
+# block, restore the ambient value afterward so later blocks are undisturbed.
+_ambient_sh_30xi3 = m._sh
+m._sh = _TRUE_ORIGINAL_SH_30xi3
+_orig_run_30xi3 = m.subprocess.run
+
+def _fake_run_strict_decode_30xi3(args, **kwargs):
+    if kwargs.get("errors") != "replace":
+        raise UnicodeDecodeError("utf-8", b"\xe2\x80", 0, 2, "invalid continuation byte")
+    return types.SimpleNamespace(returncode=0, stdout="ok\n")
+
+m.subprocess.run = _fake_run_strict_decode_30xi3
+eq("_sh() survives a decode failure (passes errors='replace') instead of returning None",
+   m._sh(["whatever"]) is not None, True)
+m.subprocess.run = _orig_run_30xi3
+
+# End-to-end, faithful to the measured incident: ONE queued marker, old enough
+# (475min, mirroring ga-lwi4b's own fixture) to trip stalled_by_age UNLESS
+# reviewer_alive is correctly detected — exercised through check_gate()'s real,
+# unmodified calls to _sh(["tail", ...]) and _sh([GC, "session", "list"]).
+import datetime as _dt30xi3
+_ts_3min_ago_30xi3 = _dt30xi3.datetime.fromtimestamp(m.NOW - 180).strftime("%Y-%m-%d %H:%M:%S")
+
+def _fake_run_gate_e2e_30xi3(args, **kwargs):
+    if kwargs.get("errors") != "replace":
+        raise UnicodeDecodeError("utf-8", b"\xe2\x80", 0, 2, "invalid continuation byte")
+    if args and args[0] == "tail":
+        return types.SimpleNamespace(
+            returncode=0, stdout="[%s] Gate PASSED: fix/x merged\n" % _ts_3min_ago_30xi3)
+    # `gc session list` table: one line truncated mid multi-byte char (the measured
+    # shape — wa-mgnkf's title cut after "\xe2\x80"), one clean live gate-reviewer.
+    return types.SimpleNamespace(
+        returncode=0,
+        stdout=("ga-wisp-oxvuvra  wa-worker      active  wa-mgnkf: Broken capture �\n"
+                "ga-wisp-gnh6j4n  gate-reviewer  active  10m  1s ago\n"))
+
+_orig_bd_json_30xi3, _orig_age_min_30xi3 = m._bd_json, m._age_min
+m._bd_json = lambda root, label, status="open", include_infra=False: (
+    [{"id": "mk-Q30xi3", "updated_at": "2020-01-01T00:00:00Z", "labels": ["gate-status:queued"]}],
+    True)
+m._age_min = lambda iso: 475.0   # old marker, mirrors ga-lwi4b's exact fixture
+m.subprocess.run = _fake_run_gate_e2e_30xi3
+
+_g30xi3 = m.check_gate()
+eq("ga-30xi3: truncated-multibyte session title does not blind reviewer_alive (was: False)",
+   _g30xi3["reviewer_alive"], True)
+eq("ga-30xi3: last_pass_min still reads the real merge, not '—' (was: None)",
+   2.5 <= (_g30xi3["last_pass_min"] or -1) <= 3.5, True)
+eq("ga-30xi3: 475min-old marker + reviewer alive → NOT falsely declared 'GATE travado'",
+   _g30xi3["stalled"], False)
+
+m._bd_json, m._age_min, m.subprocess.run = _orig_bd_json_30xi3, _orig_age_min_30xi3, _orig_run_30xi3
+m._sh = _ambient_sh_30xi3
 
 print("── ga-zkxdw DEFEITO 1: _pilot_candidates() parses 'Candidates split' log line ──")
 m._sh = _fake_sh_factory(

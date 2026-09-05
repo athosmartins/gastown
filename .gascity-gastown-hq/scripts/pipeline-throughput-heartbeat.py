@@ -149,8 +149,13 @@ EPHEMERAL_WORKER_TEMPLATES = ("gate-reviewer", "gastown.dog")
 
 def sh(args, timeout=20, stdin=None):
     try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=timeout,
-                              input=stdin)
+        # ga-30xi3: errors="replace" — a session title truncated mid multi-byte
+        # UTF-8 char makes `gc session list`'s table output invalid UTF-8; a
+        # strict (default) decode raises UnicodeDecodeError here, which
+        # snapshot() renders as the same "(failed)" a genuinely dead command
+        # produces — exactly backwards for a diagnostic read after an alert.
+        return subprocess.run(args, capture_output=True, text=True, errors="replace",
+                              timeout=timeout, input=stdin)
     except Exception:
         return None
 

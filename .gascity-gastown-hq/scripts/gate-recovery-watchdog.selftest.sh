@@ -966,6 +966,40 @@ if _qh_rs.escalate_once("qh:d", _qh_at("08:05:00"), window=m.NEEDS_REBASE_ALERT_
 else:
     bad("REGRESSION: quiet_adjust default changed behavior for callers that don't pass it")
 
+print("Scenario ga-30xi3: snapshot()'s sessions dump must not collapse a text-decode "
+      "failure into the same '(failed)' a genuine command failure produces")
+# gc session list's table form truncates titles to fit column width; a cut mid
+# multi-byte UTF-8 char makes stdout invalid UTF-8. text=True decodes INSIDE
+# subprocess.run, so a strict (default) decode raises UnicodeDecodeError there —
+# caught by sh()'s existing `except Exception: return None`, which snapshot()
+# renders as the SAME "(failed)" a genuinely dead command produces. That is
+# exactly backwards for a diagnostic: it is read by a human AFTER an alarm, as
+# proof of state, right when a corrupted-but-still-live session most needs to
+# show up.
+import types as _types_30xi3
+
+def _fake_run_grw_30xi3(args, **kwargs):
+    if kwargs.get("errors") != "replace":
+        raise UnicodeDecodeError("utf-8", b"\xe2\x80", 0, 2, "invalid continuation byte")
+    if len(args) >= 3 and args[0] == "gc" and args[1] == "session" and args[2] == "list":
+        return _types_30xi3.SimpleNamespace(
+            returncode=0,
+            stdout="s1  gate-reviewer  active  wa-mgnkf: Broken capture �\n")
+    return _types_30xi3.SimpleNamespace(returncode=0, stdout="")
+
+_orig_run_30xi3 = m.subprocess.run
+m.subprocess.run = _fake_run_grw_30xi3
+_snap_path_30xi3 = m.snapshot("ga-30xi3 selftest", 0)
+m.subprocess.run = _orig_run_30xi3
+with open(_snap_path_30xi3) as _f30xi3:
+    _snap_content_30xi3 = _f30xi3.read()
+os.unlink(_snap_path_30xi3)
+
+if "gate-reviewer" in _snap_content_30xi3 and "(failed)" not in _snap_content_30xi3:
+    ok("ga-30xi3: sessions section shows the real (corrupted-but-live) session, no '(failed)' anywhere in the dump")
+else:
+    bad("ga-30xi3: a decode failure hid the sessions dump behind '(failed)' (content: %r)" % (_snap_content_30xi3,))
+
 print("")
 print("Results: %d passed, %d failed" % (PASS, FAIL))
 if FAIL == 0:
