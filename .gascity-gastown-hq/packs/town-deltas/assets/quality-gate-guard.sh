@@ -820,7 +820,7 @@ _gap1_ensure_lifecycle_backstop() {
   fi
 }
 
-# classify_parent_gap2 <has_pilot_dispatched> <has_live_assignee> <sling_found> <sling_needs_fix> <sling_closed> [sling_refused]
+# classify_parent_gap2 <has_pilot_dispatched> <has_live_assignee> <sling_found> <sling_needs_fix> <sling_closed> [sling_refused] [sling_no_changes]
 # Pure decision for ga-pa36 GAP-2: parent story/bug retains story:in-flight after
 # the gate ran on a sling/work bead (Pilot-dispatched path) and that bead is terminal.
 # sling_needs_fix: 1 if sling bead has gate:needs-fix or gate:needs-human (gate FAILED).
@@ -839,15 +839,36 @@ _gap1_ensure_lifecycle_backstop() {
 #   is left to inflight-reclaim-guard.py (list_refused_sling_source_beads /
 #   _promote_refusal_labels), which already owns that in-flight window; GAP-2
 #   only cleans up once the sling has terminated.
-# Returns: free:fail-stranded | free:refused-stranded | free:pass-stranded | skip:not-dispatched | skip:live-assignee | skip:no-sling | skip:active-sling
+# sling_no_changes (ga-hr44j, optional, defaults to 0 — old 6-arg callers
+#   unchanged): 1 if the sling's close_reason matches a no-delivery phrasing
+#   (see gap2_no_changes_token) — "no-changes: nothing to build", "no action",
+#   etc. Distinct from sling_refused/pool:refused: a refusal permanently
+#   excludes the parent from future dispatch (pilot-dispatcher.sh's
+#   _filter_candidates, ga-y8qh); a no-changes close does not (the parent may
+#   legitimately need re-checking later, e.g. a defer_until window), so this
+#   must never route into free:refused-stranded or stamp pool:refused. The OLD
+#   bug: a sling closing without delivering was read as indistinguishable from
+#   a sling closing WITH a gate-passed delivery (both are merely "closed, no
+#   needs-fix"), so it fell through to free:pass-stranded and could close the
+#   parent off a done-SIGNAL that explicitly said "nothing was done" (measured
+#   live: ga-i9q44 closed via sling ga-zxfvh's "no-changes: nada pra construir"
+#   close_reason, 2026-09-05). Checked only once sling_refused is ruled out
+#   (an explicit pool:refused token, if somehow also present, is the more
+#   specific/authoritative signal) and only once the sling has actually
+#   closed. Verdict is a bare "skip" (labels left untouched, inert) rather than
+#   a "free" — per the bug's own acceptance criterion, "na duvida, NAO FECHAR":
+#   the safest default when a done-signal cannot be trusted is to touch
+#   nothing at all, not to guess which labels to clear.
+# Returns: free:fail-stranded | free:refused-stranded | free:pass-stranded | skip:not-dispatched | skip:live-assignee | skip:no-sling | skip:active-sling | skip:no-changes-stranded
 classify_parent_gap2() {
-  local has_pilot_dispatched="$1" has_live_assignee="$2" sling_found="$3" sling_needs_fix="$4" sling_closed="$5" sling_refused="${6:-0}"
+  local has_pilot_dispatched="$1" has_live_assignee="$2" sling_found="$3" sling_needs_fix="$4" sling_closed="$5" sling_refused="${6:-0}" sling_no_changes="${7:-0}"
   [ "$has_pilot_dispatched" != "1" ] && { echo "skip:not-dispatched"; return; }
   [ "$has_live_assignee" = "1" ]     && { echo "skip:live-assignee"; return; }
   [ "$sling_found" != "1" ]          && { echo "skip:no-sling"; return; }
   [ "$sling_needs_fix" = "1" ]       && { echo "free:fail-stranded"; return; }
   [ "$sling_closed" != "1" ]         && { echo "skip:active-sling"; return; }
   [ "$sling_refused" = "1" ]         && { echo "free:refused-stranded"; return; }
+  [ "$sling_no_changes" = "1" ]      && { echo "skip:no-changes-stranded"; return; }
   echo "free:pass-stranded"
 }
 
@@ -1028,6 +1049,46 @@ gap2_refused_token() {
   [ -z "$tok" ] && tok=$(printf '%s' "$parent_labels" | grep -oE 'pool:refused(:[A-Za-z0-9_-]+)?' | head -1 || echo "")
   [ -z "$tok" ] && tok=$(printf '%s' "$sling_close_reason" | grep -oE 'pool:refused(:[A-Za-z0-9_-]+)?' | head -1 || echo "")
   printf '%s' "$tok"
+}
+
+# gap2_no_changes_token <sling_close_reason> — pure text scan (ga-hr44j). A
+# sling closing is a TERMINAL-STATE signal, not a delivery signal: "closed +
+# no gate:needs-fix" is exactly as true for "nothing to build, so nothing to
+# review" as it is for "reviewed and passed" — the two are indistinguishable
+# to gap2_refused_token (which only recognizes an explicit pool:refused
+# token) and therefore also fell through, unrecognized, into
+# free:pass-stranded. Measured live 2026-09-05 22:51Z: sling ga-zxfvh closed
+# with close_reason "no-changes: nada pra construir — ... aceite de ga-i9q44
+# e evidencia de 2 noites limpas ainda nao geradas" and sling ga-mip3j closed
+# with "No action — ga-i9q44 is an evidence-gate bug ... waiting on 2
+# consecutive clean nightly-reboot log nights" — neither carries a
+# pool:refused token anywhere, so gap2_refused_token correctly (per its own
+# contract) returned empty for both, and the parent (ga-i9q44) was closed as
+# "work is done" while its actual acceptance criterion (two clean overnight
+# log nights) had not even begun.
+# Matches (case-insensitive, anywhere in the close_reason text): "no-changes",
+# "no action"/"no-action", "nada pra construir", "sem acao"/"sem ação". Not an
+# exhaustive taxonomy of every way a worker might phrase "nothing to build" —
+# a minimal, already-observed set per the bug's own acceptance criterion
+# ("discriminador minimo, ja disponivel no dado"). Extending this list is
+# cheap and safe (widening it can only ever prevent MORE false-closes, never
+# cause one — the only failure mode of a false negative here is falling
+# through to the existing, already-verified merge-ancestry check, not an
+# incorrect close). Echoes the matched token, or "" if none.
+gap2_no_changes_token() {
+  local sling_close_reason="$1"
+  # ga-hr44j gate-feedback: a [cç]/[aã]-style bracket char-class silently
+  # fails to match its accented member under the C/POSIX locale — confirmed
+  # live on this deployment (LC_ALL=C is set here despite LANG=en_US.UTF-8;
+  # LC_ALL wins), and quality-gate-guard.sh runs under launchd, whose
+  # minimal environment cannot be assumed to carry a UTF-8 locale either. A
+  # bracket class asks the engine to treat a 2-byte UTF-8 sequence as ONE
+  # single-position alternative, which only a locale-aware multibyte
+  # collation can do; under C locale grep falls back to raw bytes, and the
+  # position desyncs. Full literal-word alternation (no bracket classes for
+  # the accented forms) matches complete byte sequences regardless of
+  # locale — verified directly against both LC_ALL=C and a UTF-8 locale.
+  printf '%s' "$sling_close_reason" | grep -ioE 'no-changes|no[- ]action|nada pra construir|sem acao|sem ação|sem açao|sem acão' | head -1
 }
 
 # gap2_free_refused_stranded <bead_id> <sling_id> <refused_token> — ga-eu75w:
@@ -3297,6 +3358,8 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
     SLING_CLOSED=0
     SLING_REFUSED=0
     SLING_REFUSED_TOKEN=""
+    SLING_NO_CHANGES=0
+    SLING_NO_CHANGES_TOKEN=""
 
     if [ -n "$SLING_ID" ] && [ "$SLING_ID" != "null" ]; then
       SLING_FOUND=1
@@ -3316,9 +3379,20 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
       # close_reason text — gap2_refused_token checks all three.
       SLING_REFUSED_TOKEN=$(gap2_refused_token "$SLING_LABELS" "$SC_LABELS" "$SLING_CLOSE_REASON" || echo "")
       [ -n "$SLING_REFUSED_TOKEN" ] && SLING_REFUSED=1 || true
+
+      # ga-hr44j: a sling closing without delivering ("no-changes: nothing to
+      # build") is just as terminal-but-not-a-pass as an explicit refusal, but
+      # is a DIFFERENT signal (see gap2_no_changes_token's doc-comment for why
+      # it must never route into free:refused-stranded/pool:refused). Checked
+      # only when not already refused — an explicit pool:refused token, if
+      # somehow also present, is the more specific/authoritative signal.
+      if [ "$SLING_REFUSED" != "1" ]; then
+        SLING_NO_CHANGES_TOKEN=$(gap2_no_changes_token "$SLING_CLOSE_REASON" || echo "")
+        [ -n "$SLING_NO_CHANGES_TOKEN" ] && SLING_NO_CHANGES=1 || true
+      fi
     fi
 
-    ACTION=$(classify_parent_gap2 "1" "$HAS_SC_ASSIGNEE" "$SLING_FOUND" "$SLING_NEEDS_FIX" "$SLING_CLOSED" "$SLING_REFUSED")
+    ACTION=$(classify_parent_gap2 "1" "$HAS_SC_ASSIGNEE" "$SLING_FOUND" "$SLING_NEEDS_FIX" "$SLING_CLOSED" "$SLING_REFUSED" "$SLING_NO_CHANGES")
 
     case "$ACTION" in
       free:fail-stranded)
@@ -3344,6 +3418,17 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
       free:refused-stranded)
         warn "GAP-2: $SC_ID stranded (sling $SLING_ID closed via refusal: $SLING_REFUSED_TOKEN) — clearing false gate labels, freeing lane"
         gap2_free_refused_stranded "$SC_ID" "$SLING_ID" "$SLING_REFUSED_TOKEN"
+        ;;
+      skip:no-changes-stranded)
+        # ga-hr44j: sling closed WITHOUT delivering ("no-changes"/"no action").
+        # This is the opposite of a done-signal — do NOT close, do NOT free
+        # the lane, do NOT touch any label. Per the bug's own acceptance
+        # criterion: "na duvida, NAO FECHAR (estado inerte)" — leaving state
+        # untouched is the only action that can never be wrong here; some
+        # other mechanism (defer_until, pilot:no-auto-dispatch, a human) owns
+        # deciding when this parent becomes eligible for re-dispatch.
+        warn "GAP-2: $SC_ID sling $SLING_ID closed via no-changes/no-action (\"$SLING_NO_CHANGES_TOKEN\") — NOT a delivery signal; leaving parent untouched (inert)"
+        bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler (ga-hr44j): sling bead $SLING_ID closed with a no-delivery close_reason (matched \"$SLING_NO_CHANGES_TOKEN\") — a sling closing this way means the worker found nothing to build, which is the opposite of a completed review, not a variant of one. Leaving story:in-flight/pilot:dispatched/all labels untouched rather than closing or re-arming (na duvida, nao fechar); will re-check next sweep in case a later sling terminates differently." 2>/dev/null || true
         ;;
       free:pass-stranded)
         warn "GAP-2: $SC_ID stranded (sling $SLING_ID closed/passed) — freeing lane"

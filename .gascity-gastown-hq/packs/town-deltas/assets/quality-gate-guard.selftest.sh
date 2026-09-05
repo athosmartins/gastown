@@ -169,6 +169,57 @@ r=$(gap2_refused_token "pool:refused" "" ""); [ "$r" = "pool:refused" ] && ok "b
 r=$(gap2_refused_token "pool:refused:sling-reason" "pool:refused:parent-reason" ""); [ "$r" = "pool:refused:sling-reason" ] && ok "sling label wins over parent label when both present (documented source takes priority)" || bad "priority-order got '$r'"
 r=$(gap2_refused_token "gate:needs-fix" "story:in-flight pilot:dispatched" "gate-failed, see review comments"); [ "$r" = "" ] && ok "no pool:refused anywhere → empty (this is the pass/fail-stranded case, not refused)" || bad "no-match got '$r'"
 r=$(gap2_refused_token "" "" ""); [ "$r" = "" ] && ok "all-empty inputs → empty, no crash" || bad "all-empty got '$r'"
+# ga-hr44j REGRESSION PROOF (root cause): the real ga-zxfvh close_reason that
+# actually false-closed ga-i9q44 (2026-09-05 22:51Z) carries no pool:refused
+# token anywhere — gap2_refused_token correctly (per its own contract) finds
+# nothing, confirming its scope never covered this signal in the first place.
+r=$(gap2_refused_token "" "" "no-changes: nada pra construir — ga-nnp5b (fix) já vivo em main, aceite de ga-i9q44 é evidência de 2 noites limpas ainda não geradas"); [ "$r" = "" ] && ok "ga-hr44j root cause: real ga-zxfvh no-changes close_reason has no pool:refused token — gap2_refused_token alone was never going to catch this" || bad "REGRESSION: unexpectedly found a refused token '$r' in a no-changes close_reason"
+
+# ── gap2_no_changes_token <sling_close_reason> — ga-hr44j ────────────────────
+# THE BUG (measured live, 2026-09-05 22:51Z, ga-i9q44): a sling closing is a
+# TERMINAL-state signal, not a delivery signal — "closed + no gate:needs-fix"
+# was exactly as true for "nothing to build" as for "reviewed and passed", and
+# gap2_refused_token (the only close_reason-content scanner GAP-2 had) only
+# recognizes an explicit pool:refused token, so a "no-changes"/"no action"
+# close fell through, unrecognized, straight into free:pass-stranded — see
+# the classify_parent_gap2 block below for the full chain. Fixtures here are
+# the VERBATIM close_reason strings from the real incident's two sling beads
+# (ga-zxfvh, ga-mip3j), each individual keyword variant, and — as negative
+# fixtures — real PASS-shaped close_reasons from this same bug's own
+# dependency (ga-nnp5b) and from GAP-2's own close-message template: a
+# no-changes detector that ALSO fires on genuine deliveries would leave real
+# passes stuck open forever, which is its own (milder, but real) failure mode.
+echo "gap2_no_changes_token: no-delivery close_reason phrasing (ga-hr44j)"
+r=$(gap2_no_changes_token "no-changes: nada pra construir — ga-nnp5b (fix) já vivo em main, aceite de ga-i9q44 é evidência de 2 noites limpas ainda não geradas"); [ "$r" = "no-changes" ] && ok "real ga-zxfvh close_reason (verbatim, 2026-09-05 incident) → matched 'no-changes'" || bad "ga-zxfvh close_reason got '$r'"
+r=$(gap2_no_changes_token "No action — ga-i9q44 is an evidence-gate bug (fix already merged via ga-nnp5b), waiting on 2 consecutive clean nightly-reboot log nights"); [ "$r" = "No action" ] && ok "real ga-mip3j close_reason (verbatim, 2026-09-05 incident) → matched 'No action'" || bad "ga-mip3j close_reason got '$r'"
+r=$(gap2_no_changes_token "nada pra construir aqui, ja existe"); [ "$r" = "nada pra construir" ] && ok "'nada pra construir' variant → matched" || bad "nada-pra-construir got '$r'"
+r=$(gap2_no_changes_token "Fechado sem ação, nada a fazer"); [ "$r" = "sem ação" ] && ok "'sem ação' (accented) variant → matched" || bad "sem-acao-accented got '$r'"
+r=$(gap2_no_changes_token "fechado sem acao, nada a fazer"); [ "$r" = "sem acao" ] && ok "'sem acao' (unaccented) variant → matched" || bad "sem-acao-plain got '$r'"
+r=$(gap2_no_changes_token "NO-CHANGES: uppercase variant"); [ "$r" = "NO-CHANGES" ] && ok "case-insensitive match, uppercase phrasing → matched" || bad "uppercase got '$r'"
+r=$(gap2_no_changes_token "Quality gate PASSED — branch fix/ga-nnp5b-nightly-reboot-retry-window merged to gascity/main (sha=a0b8335a2da382de12975adfa18052d5e14c3c00, gate_run=ga-jwo5r). Closed by autonomous dispatcher (ga-esbg)."); [ "$r" = "" ] && ok "real PASS close_reason (verbatim, ga-nnp5b) → empty, no false-positive on a genuine delivery" || bad "REGRESSION: false-positive on a real pass got '$r'"
+r=$(gap2_no_changes_token "ga-pa36 GAP-2 reconciler: sling bead ga-zxfvh gate-passed and closed, and parent's own fix verified merged into origin/main (ga-6ync4) — work is done; closing parent."); [ "$r" = "" ] && ok "real close:merge-verified message shape → empty, no false-positive" || bad "close-message got '$r'"
+r=$(gap2_no_changes_token ""); [ "$r" = "" ] && ok "empty input → empty, no crash" || bad "empty input got '$r'"
+
+# ── classify_parent_gap2 sling_no_changes (ga-hr44j) ──────────────────────────
+# THE REGRESSION, end to end: sling ga-zxfvh closed with a no-changes
+# close_reason; gap2_refused_token correctly found no pool:refused token in it
+# (proven above); the OLD 6-arg classify_parent_gap2 (sling_no_changes not yet
+# a concept) therefore fell straight through to free:pass-stranded —
+# indistinguishable from a genuine gate-pass — and the parent (ga-i9q44) was
+# closed as "work is done" though its actual acceptance (two clean overnight
+# log nights) had not even begun. `c2`/`c3` below ARE that old behavior,
+# still reachable and still correct for an ACTUAL pass (a caller must be able
+# to omit the new arg or pass 0 and get the unchanged routing) — `c1` is the
+# fix: the exact same inputs, but with the new signal set, route to a
+# "skip" (labels untouched, inert) instead of a "free" (would relabel/close).
+echo "classify_parent_gap2: sling_no_changes must not be read as gate-passed"
+r=$(classify_parent_gap2 1 0 1 0 1 0 1); [ "$r" = "skip:no-changes-stranded" ] && ok "ga-hr44j FIX: sling closed via no-changes → skip:no-changes-stranded, NOT free:pass-stranded (parent stays open, inert)" || bad "no-changes-fix got '$r'"
+r=$(classify_parent_gap2 1 0 1 0 1 0 0); [ "$r" = "free:pass-stranded" ] && ok "explicitly NOT no-changes (sling_no_changes=0) → free:pass-stranded unchanged (genuine passes still close normally)" || bad "explicit-not-no-changes got '$r'"
+r=$(classify_parent_gap2 1 0 1 0 1 0);   [ "$r" = "free:pass-stranded" ] && ok "OLD-CODE SHAPE: 6-arg call (sling_no_changes omitted/unknown) → still free:pass-stranded — this IS what closed ga-i9q44 (proves the bug existed, and that old callers stay backward-compatible)" || bad "old-code-shape got '$r'"
+r=$(classify_parent_gap2 1 0 1 1 1 0 1); [ "$r" = "free:fail-stranded" ] && ok "a genuine gate-FAIL beats a coincidental no-changes signal — never swallow a real rejection" || bad "fail-beats-no-changes got '$r'"
+r=$(classify_parent_gap2 1 0 1 0 1 1 1); [ "$r" = "free:refused-stranded" ] && ok "explicit pool:refused beats no-changes when both somehow present (refused is the more specific/authoritative signal)" || bad "refused-beats-no-changes got '$r'"
+r=$(classify_parent_gap2 1 0 1 0 0 0 1); [ "$r" = "skip:active-sling" ] && ok "no-changes but sling still OPEN (not closed) → skip:active-sling (nothing to reconcile yet)" || bad "no-changes-but-open got '$r'"
+r=$(classify_parent_gap2 1 1 1 0 1 0 1); [ "$r" = "skip:live-assignee" ] && ok "live assignee still short-circuits even with a no-changes sling" || bad "live-assignee-with-no-changes got '$r'"
 
 # ── classify_gap2_bugtask_verdict <merge_verified> <has_untracked_marker> — ga-6ync4: sling-passed ≠ parent-fix-merged ─
 echo "classify_gap2_bugtask_verdict: a passed+closed sling must NOT alone close the parent"
