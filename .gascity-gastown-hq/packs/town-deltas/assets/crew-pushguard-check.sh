@@ -26,9 +26,21 @@
 
 set -uo pipefail
 
-WA_ROOT="${WA_ROOT:-/Users/athos/gt/whatsapp_automation}"
+WA_REAL_ROOT="/Users/athos/gt/whatsapp_automation"
+WA_ROOT="${WA_ROOT:-$WA_REAL_ROOT}"
 CREW_DIR="${WA_ROOT}/crew"
 HOOK_NAME="pre-push"
+
+# ALERTA SÓ QUANDO ESTÁ OLHANDO O RIG DE VERDADE (achado 05/09, batista-wa).
+# Validar este script contra fixture é o comportamento CERTO — e na primeira
+# validação independente ele mandou 2 mails reais pro Mayor sobre clones falsos
+# ("caso_batista", "caso_mila") que só existiam num scratchpad. Um detector que
+# suja o canal de alerta quando alguém o testa treina todo mundo a ignorar o
+# canal, e — pior, agora que ele manda PUSH — poderia acordar o Athos às 3h da
+# manhã por causa de um teste. Fixture reprova no stdout e no exit code, que é
+# o que um teste precisa; mail e push ficam para o rig real.
+ALERT_ENABLED=1
+[ "$WA_ROOT" = "$WA_REAL_ROOT" ] || ALERT_ENABLED=0
 
 BROKEN=""
 CHECKED=0
@@ -83,14 +95,14 @@ echo "crew-pushguard-check: GUARD AUSENTE em ${BROKEN}"
 #   com "job falhou"  -> push
 #   sem a frase       -> digest
 # Se editar esta mensagem, RE-MEÇA. Não presuma que continua roteando.
-if command -v notify >/dev/null 2>&1; then
+if [ "$ALERT_ENABLED" = "1" ] && command -v notify >/dev/null 2>&1; then
     notify -t "crew-pushguard-check" -p 5 \
         "job falhou: guard de push ausente em clone de crew (${BROKEN}) — push direto na main passa batido nesses clones. Ver wa-a4np9." \
         >/dev/null 2>&1 || true
 fi
 
 # Alerta por mail também (trilha durável pro Mayor, complementar ao push).
-if command -v gc >/dev/null 2>&1; then
+if [ "$ALERT_ENABLED" = "1" ] && command -v gc >/dev/null 2>&1; then
     gc mail send mayor/ --from controller \
         -s "Guard de push ausente em clone de crew (wa-a4np9)" \
         -m "Clone(s) de crew SEM pre-push que resolva — push direto na main passa batido nesses clones:
