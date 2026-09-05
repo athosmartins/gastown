@@ -702,4 +702,34 @@ deixar consultável) para quando uma bead nova ganha `next-action:mayor`.
 Rede de segurança pra quem esquecer o passo 1 — deliberadamente deferida pra
 `ga-njj5zk`, mesmo padrão de split que `ga-te41ft` usou pra `ga-eiaidn`
 (convenção e detector não vão na mesma entrega).
+
+**Criou um bead pro trabalho que você JÁ ESTÁ construindo agora? Sete o
+assignee no MESMO ato — bead sem dono É, por definição, disponível pra
+despacho (ga-1xnfx).** MEDIDO 05/09 (wa-vktvx, reportado pelo próprio
+digo-wa): 19:05 ele cria o bead pro bug que o Athos acabara de reportar e
+começa a construir no mesmo minuto, no próprio clone, sem setar assignee;
+19:17 o Pilot despacha um worker pro MESMO bead — e faz a coisa certa,
+porque bead sem dono é a definição de disponível nesta cidade; 19:33 digo-wa
+já tinha commitado, empurrado a branch e submetido ao gate, mas o worker
+despachado só descobriu às 19:38, depois de ~25min escrevendo teste pro
+mesmo bug em paralelo com algo que já estava no gate. O bead nem tinha
+`story:approved` — bastou não ter dono. Sem estrago permanente (uma só
+branch remota sobreviveu, gate.submitted_by foi corrigido de volta, bead
+fechou `gate:passed`), mas o custo real foi ~25min de sessão de worker +
+tempo do crew apagando incêndio.
+
+**A regra, ESCOPADA — isto NÃO muda `bd create`:**
+- **Vai construir AGORA** → `bd create ...` seguido, no MESMO ato, de
+  `bd update <id> --assignee <você>` (ou `--claim`, se o fluxo do rig usar
+  claim em vez de assignee direto).
+- **Está arquivando pra pool** → cria SEM assignee, DE PROPÓSITO — é assim
+  que o scale_check/Mayor enxergam demanda o dia inteiro; um bead sem dono
+  não é um esquecimento, é o sinal que o pool inteiro depende pra funcionar.
+
+Por isso a saída não é fazer `bd create` assumir o criador como assignee por
+padrão — isso trocaria este bug por um maior, apagando o sinal de demanda que
+o pool inteiro lê. A correção é no HÁBITO de quem cria bead pro próprio
+trabalho já em andamento, não na ferramenta. A razão precisa vir junto: bead
+sem dono = disponível pra despacho. Sem ela, esta regra vira decorativa e
+ninguém aplica.
 {{ end }}
