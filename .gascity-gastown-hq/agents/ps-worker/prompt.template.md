@@ -173,7 +173,26 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # internal/ — it does not exist. The real marker-side field is
 # gate-status:dispatching, which lives on the separate quality-gate-marker
 # bead, never on the story bead this probe evaluates.
-bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --json --sort oldest --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select((.labels // []) | map(select(startswith("blocked:"))) | length == 0) | select((.labels // []) | map(select(startswith("gate:needs-human"))) | length == 0)] | .[:1]'
+# ga-3ife8: also excludes pilot:text-veto:<slug> by FAMILY PREFIX (not an
+# enumerated slug list). This is the label _reconcile_text_veto_labels
+# (pilot-dispatcher.sh) stamps on a bead the Pilot vetoed by TEXT content
+# (engine-rebuild mention, a DECISAO title, an "only Athos decides" phrase, a
+# compliance marker, a diagnostic-only body). ga-42mlf's close reason claims
+# the Go-rendered Step 1b2 above already excludes this family
+# (poolDemandLabelFilterJQ) — NOT independently confirmed here: that symbol
+# and the commit SHA the close reason cites are both absent from the current
+# origin/main tree (see ga-c2w3k, filed alongside this fix, for the
+# verification trail). This file's Step 1b3 fix does not depend on Step 1b2's
+# real state either way — it is plain text, not Go-rendered, so it inherits
+# nothing automatically regardless. Live incident: wa-worker's identical copy
+# offered wa-es2v1 (pilot:text-veto:compliance-marker-text-pattern) as
+# candidate #1 on 2026-09-04 — same defect, same file shape, here in
+# ps-worker's copy too. Matching by prefix rather than the 5 known slugs
+# means a future 6th slug needs NO prompt edit here. This is the 10th time
+# this exact copy has drifted behind pilot-dispatcher.sh (ga-y8qh, ga-nf4x5,
+# ga-en2s, ga-uvfs6, ga-3lsy1, ga-7ha7g, ga-znlvl, ga-s1d5o, ga-6bghe, now
+# this). Regression coverage: pool-probe-text-veto-family.selftest.sh.
+bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --json --sort oldest --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select((.labels // []) | map(select(startswith("blocked:"))) | length == 0) | select((.labels // []) | map(select(startswith("gate:needs-human"))) | length == 0) | select((.labels // []) | map(select(startswith("pilot:text-veto"))) | length == 0)] | .[:1]'
 # If it returns a bead (output is NOT []), THAT BEAD IS YOURS. Claim it FIRST:
 #     gc bd update <id> --claim
 # verify the claim set assignee to your session, then go to the Build Protocol and build it.
