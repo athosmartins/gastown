@@ -493,6 +493,47 @@ _EXTRA_ALARM_SUPPRESS_PREFIXES = (
     # this signal tracks the CURRENT text, not a permanent audit trail. _has_prefix
     # matches the whole pilot:text-veto:* family from this one entry.
     ("pilot:text-veto", "pilot:text-veto:* (Pilot's prose-only dispatch veto currently matches this bead's title/description — see the label suffix for which pattern, ga-qt0mj)"),
+    # ga-ulg9j (6th recurrence of this exact bug class — see ga-eu2x, ga-1mqdz/
+    # ga-rfpm9, ga-it3e8, ga-qt0mj, wa-4uh2w above): this table is a HAND-mirror
+    # of pilot-dispatcher.sh's static exact-match label vetoes in
+    # _filter_candidates (~L2870-3002), and the two had drifted again — 5 of
+    # the Pilot's vetoes were entirely absent here, so a bead carrying ONLY
+    # one of them + story:approved matched none of this reconciler's known
+    # non-buildable signals and alarmed "dispatch failing" forever, blaming
+    # the Pilot for correctly declining to dispatch it (measured live:
+    # framework:engine on ga-o99jf/ga-8j89i/ga-6rawu). See
+    # _pilot_static_exact_veto_labels()/the "(ga-ulg9j)" selftest scenario
+    # below for the guard that now catches the NEXT drift in --selftest
+    # instead of waiting weeks for a real bead to false-alarm in production.
+    ("engine-window:pending", "engine-window:pending (Phase-1 code fix done, Phase-2 deploy deliberately batched with sibling bugs, ga-2lqv)"),
+    ("framework:engine", "framework:engine (manual human/dog-applied marker: needs a gascity engine rebuild, Mayor/operator-coordinated — no pool worker builds it, ga-vhyd)"),
+    ("story:awaiting-external-merge", "story:awaiting-external-merge (fix already exists as an open PR against an external, non-rig repo awaiting human/upstream merge, ga-spux4)"),
+    ("pinned", "pinned (permanent-reference/preservation note, never ordinary dispatchable work, ga-gzv7g)"),
+    ("gt:message", "gt:message (self-continuity handoff/patrol note an agent leaves for itself across session cycling, ga-4yii8z)"),
+    # ga-nf4x5: story:needs-approval is the Athos MERIT/legal sign-off gate —
+    # semantically distinct from story:needs-human (an info-gap) but, like it,
+    # a human decision gate no autonomous gate-fix/review loop can ever clear.
+    # The bug that surfaced this table's other 5 gaps (ga-ulg9j) flagged this
+    # one too but noted _classify() might already route it as a ROUTE (the
+    # way it does story:blocked) — confirmed NOT the case (zero occurrences
+    # of "needs-approval" anywhere in _classify()), so it needs the same
+    # explicit suppression as the others or it false-alarms identically.
+    ("story:needs-approval", "story:needs-approval (Athos MERIT/legal sign-off gate — human decision, not a code-quality gate, ga-nf4x5)"),
+    # ga-ulg9j (found LIVE by the class-level guard this same fix adds, not
+    # hand-derived from the bug report like the entries above it — proof the
+    # guard earns its keep on day one): pilot-dispatcher.sh's static veto
+    # block treats bare "on-device" as its OWN exact-match label, independent
+    # of story:needs-device (two separate `or . == "..."` clauses,
+    # ~L2941-2942). This reconciler's _classify() deliberately routes ONLY
+    # story:needs-device — see this file's own header docstring: "needs-
+    # device: label story:needs-device ONLY" — so bare "on-device" as a LABEL
+    # (not the title/body keyword _keyword_flags() separately scans for,
+    # which only emits a low-priority flag and never suppresses the alarm)
+    # fell through every check and false-alarmed identically to the other
+    # entries here. Suppressed here rather than added to _classify()'s route
+    # table, since routing it would contradict the "ONLY story:needs-device"
+    # contract this reconciler documents elsewhere as authoritative.
+    ("on-device", "on-device (Pilot's static veto, bare-label form — distinct from the story:needs-device ROUTE this reconciler documents as the only routing trigger, ga-ulg9j)"),
 )
 
 
@@ -503,6 +544,83 @@ def _extra_alarm_suppress_reason(labels):
         if _has_prefix(labels, prefix):
             return reason
     return None
+
+
+def _pilot_dispatcher_sh_path():
+    """Live path to pilot-dispatcher.sh. Prefers asking launchd what
+    com.gascity.pilot actually execs — never trust a path written in a doc or
+    comment; stale copies exist under ~/gt/packs/ and inside per-bead
+    worktrees (see the town CLAUDE.md 'three things named gascity' warning).
+    Falls back to the $GC_CITY_PATH-anchored path (same CITY constant this
+    file already trusts for PILOT_LOG etc.) if launchd is unreachable — e.g.
+    this selftest running outside the city's own launchd session. There is no
+    compiled artifact here to drift from the source: bash reads this exact
+    file directly on every sweep, so the fallback is not a lie, just a second
+    way to name the same file.
+    """
+    try:
+        out = subprocess.run(
+            ["launchctl", "print", "gui/%d/com.gascity.pilot" % os.getuid()],
+            capture_output=True, text=True, timeout=5)
+        if out.returncode == 0:
+            m = re.search(r"^\s*(\S*/pilot-dispatcher\.sh)\s*$", out.stdout, re.MULTILINE)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return os.path.join(CITY, "packs/town-deltas/assets/pilot-dispatcher.sh")
+
+
+def _pilot_static_exact_veto_labels():
+    """Parse Pilot's static EXACT-MATCH label vetoes straight out of the live
+    pilot-dispatcher.sh instead of hand-copying a second list — this table's
+    own history is 6 rounds of exactly that hand-copy drifting silently (see
+    the ga-ulg9j comment block above _EXTRA_ALARM_SUPPRESS_PREFIXES's last
+    entries). Anchored on the unique block that actually gates dispatch in
+    _filter_candidates (~L2870-3002 as of ga-ulg9j): 'and ((.labels // []) |
+    map(select(' ... ')) | length) == 0' — NOT the cosmetic 'blocking-label:'
+    trace mirror further down in that file, which its own comments already
+    flag as separately, manually kept in sync (same-class risk, out of scope
+    here).
+
+    Returns (labels_set, None) on success, or (None, reason) if the anchor
+    can't be found/read. Deliberately NEVER returns (empty_set, None): a
+    block that moved or got reworded must fail LOUD, not silently validate
+    every bead against zero known vetoes — the exact "error and empty must
+    not collapse to the same result" failure mode this whole bug is an
+    instance of, just one level up (a guard that can silently see nothing is
+    the same defect as a table that silently knows nothing).
+
+    Excludes the startswith(...) prefix clauses in the same block
+    (gate:needs-human*, needs-human*, pool:refused*, pilot:refused-reason:*)
+    on purpose — those are prefix FAMILIES already covered by
+    _EXTRA_ALARM_SUPPRESS_PREFIXES/_classify()'s own prefix-based checks, and
+    a straight label-set membership test cannot validate a startswith rule
+    anyway.
+    """
+    path = _pilot_dispatcher_sh_path()
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        return None, "cannot read pilot-dispatcher.sh at %s: %s" % (path, exc)
+    m = re.search(
+        r"and \(\(\.labels // \[\]\) \| map\(select\((.*?)\)\) \| length\) == 0",
+        text, re.DOTALL)
+    if not m:
+        return None, (
+            "anchor 'and ((.labels // []) | map(select( ... )) | length) == "
+            "0' not found in %s — _filter_candidates' veto block moved or "
+            "was reworded; update _pilot_static_exact_veto_labels()'s regex "
+            "to match its new shape" % path)
+    exact = set(re.findall(r'\. == "([^"]+)"', m.group(1)))
+    if len(exact) < 12:
+        return None, (
+            "only matched %d label(s) (%r) inside the anchored block — "
+            "expected >=12 (12 known as of ga-ulg9j); the regex likely "
+            "stopped at the wrong ')) | length) == 0' occurrence" % (
+                len(exact), sorted(exact)))
+    return exact, None
 
 
 def _bead_text(bead):
@@ -5358,6 +5476,42 @@ def _selftest():
     else:
         _bad("(ga-kyvpk-b)", "expected story:approved removed, "
              "removes=%s" % (label_removes,))
+
+    print("\nScenario (ga-ulg9j): CLASS guard — every static EXACT-MATCH "
+          "label veto in the LIVE pilot-dispatcher.sh's _filter_candidates "
+          "block must be mirrored somewhere in this reconciler (a _classify() "
+          "route, or _EXTRA_ALARM_SUPPRESS_PREFIXES), or a bead carrying "
+          "ONLY that label + story:approved false-alarms 'dispatch failing' "
+          "forever — this exact gap has now shipped 6 times (ga-eu2x, "
+          "ga-1mqdz/ga-rfpm9, ga-it3e8, ga-qt0mj, wa-4uh2w, ga-ulg9j itself). "
+          "Parses the veto label straight out of pilot-dispatcher.sh instead "
+          "of trusting a second hand-copied list, so the NEXT Pilot veto "
+          "fails HERE in --selftest instead of waiting weeks for a real bead "
+          "to alarm in production.")
+    veto_labels, veto_parse_err = _pilot_static_exact_veto_labels()
+    if veto_parse_err is not None:
+        _bad("(ga-ulg9j-parse)", veto_parse_err)
+    else:
+        _ok("(ga-ulg9j-parse): extracted %d static exact-match veto label(s) "
+            "from %s" % (len(veto_labels), _pilot_dispatcher_sh_path()))
+        _read_pilot_log_lines = lambda: _pilot_recent()
+        for _veto_lbl in sorted(veto_labels):
+            _veto_bid = "ga-ulg9j-%s" % re.sub(
+                r"[^a-z0-9]+", "-", _veto_lbl.lower()).strip("-")
+            _bd_approved = lambda root, _lbl=_veto_lbl, _bid=_veto_bid: [
+                _make_bead(_bid, labels=["story:approved", _lbl])]
+            st = _reset()
+            st["first_seen_approved"][_veto_bid] = NOW - (_STARVE + 5) * 60
+            run_cycle(NOW, st)
+            veto_alarmed = any(_veto_bid in subj for subj, _ in mail_calls)
+            if veto_alarmed:
+                _bad("(ga-ulg9j: %s)" % _veto_lbl,
+                     "Pilot statically vetoes this label but the reconciler "
+                     "still alarmed 'dispatch failing' on %s — add it to "
+                     "_classify() or _EXTRA_ALARM_SUPPRESS_PREFIXES" % (
+                         _veto_bid,))
+            else:
+                _ok("(ga-ulg9j: %s): no false alarm" % _veto_lbl)
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
