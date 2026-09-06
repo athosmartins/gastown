@@ -46,8 +46,28 @@
 #      c. A "Gate PASSED" line within the window → progress; not a stall.
 #      d. An active gate-reviewer session running (gc session list shows a live
 #         session named gate-reviewer*) → reviewer in-flight; not a stall.
+#      e. (ga-p62tl) The OLDEST active marker is younger than
+#         GTSW_SWEEP_GRACE_MULTIPLIER x the dispatcher's REAL measured sweep
+#         cadence (from consecutive "Dispatcher sweep start" gaps in the log
+#         tail, NOT the launchd-configured StartInterval — launchd skips ticks
+#         while a sweep is still running, so real cadence runs minutes longer
+#         than the configured 60s) → the dispatcher hasn't had a fair chance
+#         yet; not a stall. Measured incident: watchdog sampled 7s before the
+#         dispatcher's own sweep claimed the same marker.
+#      f. (ga-p62tl) A type:quality-gate-run bead is gate-status:running and
+#         still within its OWN persisted verdict_timeout_minutes+margin →
+#         run genuinely in flight; not a stall. Mirrors
+#         daemon-presence-watchdog.sh's proven `_gate_run_in_flight` (ga-2vf9b)
+#         — more robust than guard D's `gc session list` grep, which can miss
+#         a live reviewer (measured: a session with 1s-old activity did not
+#         suppress).
+#      g. (ga-p62tl) Right before escalating, cross-check with
+#         gate-queue-composition.sh (REAL/PHANTOM/UNKNOWN git-level analysis)
+#         — if it reports zero REAL work, don't escalate on a raw label count.
 #   4. STALL = active queue non-empty AND 0 Gate PASSED in window AND not
-#      quota-limited AND no active reviewer.
+#      quota-limited AND no active reviewer AND no in-flight gate-run AND the
+#      oldest active marker has had a fair sweep chance AND deeper queue
+#      composition confirms real work.
 #   5. On stall: notify -p 4 + gc mail send mayor.
 #      If GTSW_AUTORECOVER=1 (default): kickstart -k supervisor AND
 #      quality-gate-dispatcher to unstick the gate.
@@ -64,7 +84,10 @@
 #   Scenarios: stall→alert, empty-queue→no-alert, quota-limited→no-alert,
 #   recent-progress→no-alert, active-reviewer→no-alert, autorecover-path,
 #   weekly-quota-limited→no-alert/no-kickstart, unreadable-quota-check→UNKNOWN
-#   fail-open, weekly-not-active→stall-still-fires (ga-sdkqs).
+#   fail-open, weekly-not-active→stall-still-fires (ga-sdkqs), young-marker→
+#   sweep-cadence-grace, old-marker-still-alerts, gate-run-in-flight→no-alert
+#   (ga-p62tl), gate-run-past-budget→still-alerts, queue-composition-real0→
+#   no-alert, queue-composition-real1→still-alerts.
 set -uo pipefail
 
 # ── config (all env-overridable) ──────────────────────────────────────────────
@@ -122,6 +145,53 @@ unset _GTSW_QHC_SIB
 # ── helpers ───────────────────────────────────────────────────────────────────
 ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || true; echo "[$(ts)] [gtsw] $*" >> "$LOG" 2>/dev/null || true; }
+
+# ── ga-p62tl: sweep-cadence + in-flight-run config ────────────────────────────
+# GTSW_DEFAULT_SWEEP_CADENCE_SEC is a FALLBACK ONLY, used when fewer than 2
+# "Dispatcher sweep start" lines are in the log tail to measure from. Do NOT
+# read this from the dispatcher's launchd StartInterval (60s, confirmed live in
+# ~/Library/LaunchAgents/com.gascity.quality-gate-dispatcher.plist) — launchd
+# skips a tick while the previous sweep is still running, and a real sweep
+# (claim+rebase+spawn under live Dolt latency) takes minutes, so the REAL
+# cadence lands far above the configured interval
+# (gate-throughput-model-sweep-serialization: sweep ~210s, StartInterval
+# rounds up to the next multiple ⇒ ~6min real-world). 360s reflects that
+# measured reality, not the configured knob.
+GTSW_DEFAULT_SWEEP_CADENCE_SEC="${GTSW_DEFAULT_SWEEP_CADENCE_SEC:-360}"
+GTSW_SWEEP_GRACE_MULTIPLIER="${GTSW_SWEEP_GRACE_MULTIPLIER:-2}"
+GTSW_GATE_RUN_DEFAULT_TIMEOUT_MIN="${GTSW_GATE_RUN_DEFAULT_TIMEOUT_MIN:-50}"  # mirrors dispatcher's VERDICT_TIMEOUT_MAX_MINUTES default
+GTSW_GATE_RUN_MARGIN_MIN="${GTSW_GATE_RUN_MARGIN_MIN:-10}"                    # mirrors daemon-presence-watchdog.sh's DPW_GATE_RUN_MARGIN_MIN
+GTSW_QUEUE_COMPOSITION="${GTSW_QUEUE_COMPOSITION:-}"                          # resolved lazily against $HQ inside run_sweep (HQ can be test-overridden)
+GTSW_QUEUE_COMPOSITION_TIMEOUT_SEC="${GTSW_QUEUE_COMPOSITION_TIMEOUT_SEC:-60}"
+
+# Echoes the measured dispatcher sweep cadence in seconds: the LARGEST gap
+# between consecutive "Dispatcher sweep start" timestamps found in the given
+# log text. Largest, not most-recent/average — under-measuring the cadence is
+# exactly what re-creates the ga-p62tl false positive (a too-short grace window
+# is no grace at all). Echoes nothing (caller falls back to the default) when
+# fewer than 2 such lines are present or every parse attempt fails — same
+# fail-open direction as every other signal-read in this file: an
+# unmeasurable cadence must never collapse to "0s" (which would make the grace
+# window 0 and every young marker "old").
+_gtsw_measure_sweep_cadence_sec() {
+  local lines="$1"
+  local prev="" best=0 line ts_str ep gap
+  while IFS= read -r line; do
+    case "$line" in *"Dispatcher sweep start"*) ;; *) continue ;; esac
+    ts_str="$(printf '%s' "$line" | grep -oE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\]' | tr -d '[]')"
+    [ -z "$ts_str" ] && continue
+    ep="$(date -j -f "%Y-%m-%d %H:%M:%S" "$ts_str" +%s 2>/dev/null)" || continue
+    if [ -n "$prev" ]; then
+      gap=$(( ep - prev ))
+      if [ "$gap" -gt "$best" ] 2>/dev/null; then
+        best="$gap"
+      fi
+    fi
+    prev="$ep"
+  done <<< "$lines"
+  [ "$best" -gt 0 ] 2>/dev/null && printf '%s' "$best"
+  return 0
+}
 
 # ── main sweep function (pure-ish; all I/O goes through overrideable vars) ───
 # Test seams: override these vars to inject fake data without touching disk/net.
@@ -400,6 +470,103 @@ run_sweep() {
     return 0
   fi
 
+  # ── FALSE-POSITIVE GUARD E (ga-p62tl): sweep-cadence grace ────────────────
+  # The oldest ACTIVE marker (reusing markers_json from Guard A — no extra
+  # query) may simply not have had a fair dispatcher cycle yet. Only engages
+  # when a usable timestamp exists (real `bd` JSON always has updated_at; test
+  # fixtures that don't set one are unaffected, by construction of the jq
+  # filter below).
+  local oldest_active_epoch=""
+  if [ -n "$markers_json" ]; then
+    oldest_active_epoch="$(printf '%s' "$markers_json" | jq -r \
+      '[.[] | select(.labels[]? | test("^gate-status:(queued|dispatching|ready|claimed|running)$")) | (.updated_at // .created_at // empty)]
+       | map(select(. != "")) | sort | .[0] // empty' 2>/dev/null)"
+  fi
+  if [ -n "$oldest_active_epoch" ]; then
+    local oae_ep=""
+    # -u is required: bd's timestamp already carries a literal "Z" (UTC), but
+    # -f's format spec matches "Z" as a literal character, not a timezone
+    # indicator — without -u, -j parses the numeric fields as LOCAL time and
+    # silently shifts the epoch by the system's UTC offset (confirmed live:
+    # 3h off on this box, which made every marker's age come out negative and
+    # this guard never engage). Guard C's own timestamp parsing a few lines
+    # up never hit this because dispatcher log lines have no "Z" — they are
+    # already local-format strings by construction.
+    oae_ep="$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$oldest_active_epoch" +%s 2>/dev/null)" || oae_ep=""
+    if [ -n "$oae_ep" ] && [ "$oae_ep" -gt 0 ] 2>/dev/null; then
+      local oldest_active_age_sec=$(( now - oae_ep ))
+      if [ "$oldest_active_age_sec" -ge 0 ] 2>/dev/null; then
+        local measured_cadence cadence_sec grace_sec
+        measured_cadence="$(_gtsw_measure_sweep_cadence_sec "$log_lines")"
+        if [ -n "$measured_cadence" ] && [ "$measured_cadence" -gt 0 ] 2>/dev/null; then
+          cadence_sec="$measured_cadence"
+        else
+          cadence_sec="$GTSW_DEFAULT_SWEEP_CADENCE_SEC"
+        fi
+        grace_sec=$(( cadence_sec * GTSW_SWEEP_GRACE_MULTIPLIER ))
+        if [ "$oldest_active_age_sec" -lt "$grace_sec" ] 2>/dev/null; then
+          log "OK: oldest active marker is ${oldest_active_age_sec}s old, within sweep-cadence grace (cadence=${cadence_sec}s x${GTSW_SWEEP_GRACE_MULTIPLIER}=${grace_sec}s) — dispatcher hasn't had a fair chance yet, not a stall (ga-p62tl)"
+          return 0
+        fi
+      fi
+    fi
+  fi
+
+  # ── FALSE-POSITIVE GUARD F (ga-p62tl): gate-run in flight within its own
+  # persisted verdict budget ────────────────────────────────────────────────
+  # Guard D's `gc session list` grep can miss a genuinely live reviewer
+  # (measured: a session with 1s-old activity did not suppress). Mirrors
+  # daemon-presence-watchdog.sh's proven `_gate_run_in_flight` (ga-2vf9b):
+  # read the run's OWN persisted verdict_timeout_minutes from its bead
+  # description rather than a shared constant, so this stays correct if the
+  # dispatcher's timeout scaling changes independently of this file.
+  local gate_run_json=""
+  if [ -n "${GTSW_TEST_GATE_RUN_JSON+x}" ]; then
+    gate_run_json="${GTSW_TEST_GATE_RUN_JSON}"
+  elif command -v "$BD_BIN" >/dev/null 2>&1; then
+    gate_run_json="$(bash "$BD_LIST_CACHED" -C "$HQ" list --json --include-infra -l type:quality-gate-run -l gate-status:running 2>/dev/null)" || gate_run_json=""
+  fi
+  if [ -n "$gate_run_json" ]; then
+    if printf '%s' "$gate_run_json" | jq -e \
+        --argjson now "$now" \
+        --argjson marginmin "$GTSW_GATE_RUN_MARGIN_MIN" \
+        --argjson defaultmin "$GTSW_GATE_RUN_DEFAULT_TIMEOUT_MIN" \
+        'any(.[]?;
+          (((.created_at // "") | fromdateiso8601?) // 0) as $created
+          | ($created > 0) and
+            ((((.description // "") | capture("(?m)^verdict_timeout_minutes: *(?<m>[0-9]+)"; "").m) // ($defaultmin | tostring) | tonumber) as $vtm
+              | ($now - $created) < (($vtm + $marginmin) * 60))
+        )' >/dev/null 2>&1; then
+      log "OK: a quality-gate-run bead is gate-status:running and within its own verdict-timeout+margin window — run in flight, not a stall (ga-p62tl, mirrors ga-2vf9b)"
+      return 0
+    fi
+  fi
+
+  # ── FALSE-POSITIVE GUARD G (ga-p62tl): queue-composition cross-check ─────
+  # Right before actually declaring a stall, cross-check against
+  # gate-queue-composition.sh's git-level REAL/PHANTOM/UNKNOWN analysis.
+  # Guard A's label filter already excludes needs-rebase/parked states, but
+  # cannot see phantom that only shows up at the git level (branch already
+  # merged, duplicate branch, closed source bead). Deliberately run LAST
+  # (git fetches are the most expensive check in this file) so the common
+  # healthy path never pays for it.
+  local _gtsw_qc_bin="$GTSW_QUEUE_COMPOSITION"
+  [ -n "$_gtsw_qc_bin" ] || _gtsw_qc_bin="$HQ/scripts/gate-queue-composition.sh"
+  local composition_json="" composition_real=""
+  if [ -n "${GTSW_TEST_QUEUE_COMPOSITION_JSON+x}" ]; then
+    composition_json="${GTSW_TEST_QUEUE_COMPOSITION_JSON}"
+  elif [ -x "$_gtsw_qc_bin" ]; then
+    composition_json="$(timeout "$GTSW_QUEUE_COMPOSITION_TIMEOUT_SEC" bash "$_gtsw_qc_bin" --json 2>/dev/null)" || composition_json=""
+  fi
+  if [ -n "$composition_json" ]; then
+    composition_real="$(printf '%s' "$composition_json" | jq -r '.real // empty' 2>/dev/null)"
+    case "$composition_real" in ''|*[!0-9]*) composition_real="" ;; esac
+  fi
+  if [ -n "$composition_real" ] && [ "$composition_real" -eq 0 ] 2>/dev/null; then
+    log "OK: gate-queue-composition.sh reports real=0 (active markers are phantom/unknown under git-level analysis) — not escalating on a raw label count (ga-p62tl)"
+    return 0
+  fi
+
   # ── STALL CONFIRMED ───────────────────────────────────────────────────────
   local last_passed_desc
   if [ "$last_passed_epoch" -gt 0 ] 2>/dev/null; then
@@ -581,6 +748,19 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   # this machine's actual Claude quota state happens to be right now. Scenarios that
   # specifically exercise B3 (14/15/16) override this locally.
   GTSW_TEST_QUOTA_JSON='{"weekly":{"active":false}}'
+  # ga-p62tl: same reasoning as the quota default above, for the two NEW guards
+  # (F, G) — without a seam default, every EXISTING scenario below (none of
+  # which sets GTSW_TEST_GATE_RUN_JSON/GTSW_TEST_QUEUE_COMPOSITION_JSON) would
+  # fall through to the LIVE bd query / LIVE gate-queue-composition.sh (git
+  # fetches against real rigs) using this machine's actual $HQ, making the
+  # selftest depend on live production state instead of the fixtures it
+  # declares. Defaults are chosen to be NEUTRAL w.r.t. every existing
+  # "stall confirmed" scenario: "no gate-run in flight" (doesn't suppress) and
+  # "composition confirms real work" (doesn't suppress) — i.e. guards F/G stay
+  # silent no-ops unless a scenario explicitly overrides them to exercise the
+  # new suppression path.
+  GTSW_TEST_GATE_RUN_JSON='[]'
+  GTSW_TEST_QUEUE_COMPOSITION_JSON='{"total":1,"real":1,"phantom":0,"unknown":0}'
   GATE_STALL_COOLDOWN_S=7200
 
   # Stub notify and gc so they record calls but have no side effects
@@ -1082,10 +1262,158 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true
   unset GTSW_TEST_NOW
 
+  # ── Scenario 18 (ga-p62tl, disparo 2): YOUNG marker within sweep-cadence
+  # grace → NOT a stall ─────────────────────────────────────────────────────
+  # The exact reported fixture: one marker queued 5s ago, a healthy dispatcher
+  # logging normal sweep-start lines ~200s apart (well within a single cycle),
+  # 0 Gate PASSED in the window, no active reviewer. Pre-fix this alarms.
+  echo "Scenario 18 (ga-p62tl): marker queued 5s ago, healthy dispatcher cadence ~200s → sweep-cadence grace, NOT a stall"
+  rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true
+  make_markers_ts() {
+    # Like make_markers, but each bead also carries updated_at at now-<age_sec>.
+    # Usage: make_markers_ts age_sec status [status...]
+    local age="$1"; shift
+    local now; now="$(date +%s)"
+    local upd; upd="$(date -u -r $((now - age)) '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "@$((now - age))" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"
+    local out="[" first=1 st i=0
+    for st in "$@"; do
+      if [ "$first" -eq 1 ]; then first=0; else out="${out},"; fi
+      i=$((i+1))
+      out="${out}{\"id\":\"m${i}\",\"status\":\"open\",\"updated_at\":\"${upd}\",\"labels\":[\"type:quality-gate-marker\",\"gate-status:${st}\"]}"
+    done
+    out="${out}]"
+    printf '%s' "$out"
+  }
+  make_dispatcher_log_cadence() {
+    # N "Dispatcher sweep start" lines, gap_sec apart, most recent ending "now".
+    local gap_sec="${1:-200}" n="${2:-5}" now; now="$(date +%s)"
+    local i t
+    for i in $(seq "$n" -1 0); do
+      t="$(date -u -r $((now - i * gap_sec)) '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -u -d "@$((now - i * gap_sec))" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
+      echo "[${t}] [quality-gate-dispatcher] === Dispatcher sweep start (DRY_RUN=0) ==="
+    done
+  }
+  NOTIF18="$TMP/notif18"; : > "$NOTIF18"
+  MAIL18="$TMP/mail18"; : > "$MAIL18"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers_ts 5 queued)"
+  GTSW_TEST_LOG_LINES="$(make_dispatcher_log_cadence 200 5)"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_KICKSTARTS="$TMP/kicks18"; : > "$TMP/kicks18"
+  GTSW_TEST_NOTIFIED="$NOTIF18"
+  GTSW_TEST_MAILED="$MAIL18"
+  run_sweep && ok "scenario 18: young marker (5s) within sweep-cadence grace returns 0 (no alert)" || bad "scenario 18: young marker falsely alerted (the exact ga-p62tl disparo-2 bug)"
+  [ ! -s "$MAIL18" ] && ok "scenario 18: Mayor NOT mailed (grace, not a stall)" || bad "scenario 18: Mayor mailed despite sweep-cadence grace"
+  grep -q "sweep-cadence grace" "$LOG" 2>/dev/null && ok "scenario 18: suppression logged distinctly (sweep-cadence grace)" || bad "scenario 18: grace suppression not logged distinctly"
+
+  # ── Scenario 19 (ga-p62tl): OLD marker past grace → stall STILL fires ────
+  # Proves guard E is not a blanket mute: a marker stuck for far longer than
+  # 2x the measured cadence, on the same healthy-looking dispatcher log, must
+  # still alert normally.
+  echo "Scenario 19 (ga-p62tl): marker queued 40min ago (>> 2x measured ~200s cadence) → stall still fires"
+  rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true
+  NOTIF19="$TMP/notif19"; : > "$NOTIF19"
+  MAIL19="$TMP/mail19"; : > "$MAIL19"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers_ts 2400 queued)"
+  GTSW_TEST_LOG_LINES="$(make_dispatcher_log_cadence 200 5)"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_KICKSTARTS="$TMP/kicks19"; : > "$TMP/kicks19"
+  GTSW_TEST_NOTIFIED="$NOTIF19"
+  GTSW_TEST_MAILED="$MAIL19"
+  run_sweep && bad "scenario 19: old marker (40min) should still return 1" || ok "scenario 19: old marker past sweep-cadence grace still detected (return 1)"
+  grep -q "mail:" "$MAIL19" 2>/dev/null && ok "scenario 19: Mayor mailed (real stall, grace does not mask a genuinely stuck marker)" || bad "scenario 19: Mayor NOT mailed for a genuinely stuck old marker"
+
+  # ── Scenario 20 (ga-p62tl, disparo 1): gate-run bead in flight within its
+  # own budget → NOT a stall, even with NO active session in `gc session
+  # list` (the exact disparo-1 shape: a live reviewer that guard D's session
+  # grep did not see) ───────────────────────────────────────────────────────
+  echo "Scenario 20 (ga-p62tl): quality-gate-run bead running+in-budget, session list empty → guard F catches it, NOT a stall"
+  rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true
+  NOTIF20="$TMP/notif20"; : > "$NOTIF20"
+  MAIL20="$TMP/mail20"; : > "$MAIL20"
+  _sc20_created="$(date -u -r $(( $(date +%s) - 337 )) '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "@$(( $(date +%s) - 337 ))" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers queued)"
+  GTSW_TEST_LOG_LINES="$(make_log)"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS=""    # empty on purpose — reproduces guard D missing a live reviewer
+  GTSW_TEST_GATE_RUN_JSON="[{\"id\":\"ga-py9am\",\"created_at\":\"${_sc20_created}\",\"description\":\"verdict_timeout_minutes: 50\\nbranch: fix/ga-test\"}]"
+  GTSW_TEST_KICKSTARTS="$TMP/kicks20"; : > "$TMP/kicks20"
+  GTSW_TEST_NOTIFIED="$NOTIF20"
+  GTSW_TEST_MAILED="$MAIL20"
+  run_sweep && ok "scenario 20: in-flight gate-run (within budget) returns 0 (no alert) despite empty session list" || bad "scenario 20: in-flight gate-run did NOT suppress (the exact ga-p62tl disparo-1 bug)"
+  [ ! -s "$MAIL20" ] && ok "scenario 20: Mayor NOT mailed (run genuinely in flight)" || bad "scenario 20: Mayor mailed despite in-flight run"
+  grep -q "run in flight, not a stall" "$LOG" 2>/dev/null && ok "scenario 20: suppression logged distinctly (gate-run in flight)" || bad "scenario 20: gate-run-in-flight suppression not logged distinctly"
+  # RESET (not unset!) — an unset here would fall through downstream scenarios
+  # to the LIVE bd query against this machine's real $HQ (guard F's own
+  # elif branch), making them depend on whatever gate-run happens to be
+  # running in production right now. Confirmed live: this exact gap made
+  # scenario 22/23 flaky against real production state before this fix.
+  GTSW_TEST_GATE_RUN_JSON='[]'
+
+  # ── Scenario 21 (ga-p62tl): gate-run bead PAST its own budget → stall
+  # still fires (guard F is not a blanket mute either) ─────────────────────
+  echo "Scenario 21 (ga-p62tl): quality-gate-run bead exists but is PAST its own verdict-timeout+margin → stall still fires"
+  rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true
+  NOTIF21="$TMP/notif21"; : > "$NOTIF21"
+  MAIL21="$TMP/mail21"; : > "$MAIL21"
+  _sc21_created="$(date -u -r $(( $(date +%s) - 4200 )) '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "@$(( $(date +%s) - 4200 ))" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"  # 70min ago
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers queued)"
+  GTSW_TEST_LOG_LINES="$(make_log)"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_GATE_RUN_JSON="[{\"id\":\"ga-zombie\",\"created_at\":\"${_sc21_created}\",\"description\":\"verdict_timeout_minutes: 50\\nbranch: fix/ga-test\"}]"  # 50+10min budget < 70min age
+  GTSW_TEST_KICKSTARTS="$TMP/kicks21"; : > "$TMP/kicks21"
+  GTSW_TEST_NOTIFIED="$NOTIF21"
+  GTSW_TEST_MAILED="$MAIL21"
+  run_sweep && bad "scenario 21: past-budget gate-run should still return 1" || ok "scenario 21: gate-run past its own budget does not mask the stall (return 1)"
+  grep -q "mail:" "$MAIL21" 2>/dev/null && ok "scenario 21: Mayor mailed (zombie run does not count as in-flight progress)" || bad "scenario 21: Mayor NOT mailed despite a past-budget gate-run"
+  GTSW_TEST_GATE_RUN_JSON='[]'   # reset, not unset — see scenario 20's comment on why
+
+  # ── Scenario 22 (ga-p62tl): queue-composition says real=0 → NOT a stall ──
+  # Guard A's label filter thinks the queue is active, but deeper git-level
+  # analysis (gate-queue-composition.sh) says every one of those markers is
+  # phantom (e.g. branch already merged) — must not escalate on the raw count.
+  echo "Scenario 22 (ga-p62tl): gate-queue-composition.sh reports real=0 → NOT a stall despite label-active markers"
+  rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true
+  NOTIF22="$TMP/notif22"; : > "$NOTIF22"
+  MAIL22="$TMP/mail22"; : > "$MAIL22"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers queued queued)"
+  GTSW_TEST_LOG_LINES="$(make_log)"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_QUEUE_COMPOSITION_JSON='{"total":2,"real":0,"phantom":2,"unknown":0}'
+  GTSW_TEST_KICKSTARTS="$TMP/kicks22"; : > "$TMP/kicks22"
+  GTSW_TEST_NOTIFIED="$NOTIF22"
+  GTSW_TEST_MAILED="$MAIL22"
+  run_sweep && ok "scenario 22: composition real=0 returns 0 (no alert)" || bad "scenario 22: composition real=0 did NOT suppress (escalated on phantom-only queue)"
+  [ ! -s "$MAIL22" ] && ok "scenario 22: Mayor NOT mailed (all-phantom queue per deep analysis)" || bad "scenario 22: Mayor mailed despite composition real=0"
+  grep -q "gate-queue-composition.sh reports real=0" "$LOG" 2>/dev/null && ok "scenario 22: suppression logged distinctly (queue composition)" || bad "scenario 22: composition suppression not logged distinctly"
+
+  # ── Scenario 23 (ga-p62tl): queue-composition says real>=1 → stall fires ──
+  # Guard G is a cross-check, not a blanket mute: confirmed real work must
+  # still alert exactly as before this fix.
+  echo "Scenario 23 (ga-p62tl): gate-queue-composition.sh reports real=1 → stall still fires normally"
+  rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true
+  NOTIF23="$TMP/notif23"; : > "$NOTIF23"
+  MAIL23="$TMP/mail23"; : > "$MAIL23"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers queued)"
+  GTSW_TEST_LOG_LINES="$(make_log)"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_QUEUE_COMPOSITION_JSON='{"total":1,"real":1,"phantom":0,"unknown":0}'
+  GTSW_TEST_KICKSTARTS="$TMP/kicks23"; : > "$TMP/kicks23"
+  GTSW_TEST_NOTIFIED="$NOTIF23"
+  GTSW_TEST_MAILED="$MAIL23"
+  run_sweep && bad "scenario 23: composition real=1 should still return 1" || ok "scenario 23: composition-confirmed real work still alerts (return 1)"
+  grep -q "mail:" "$MAIL23" 2>/dev/null && ok "scenario 23: Mayor mailed (confirmed real backlog, guard G is not a blanket mute)" || bad "scenario 23: Mayor NOT mailed despite composition-confirmed real work"
+  rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true
+
   # ── CLEANUP / SUMMARY ─────────────────────────────────────────────────────
   # Unset test seams so no state leaks
   unset GTSW_TEST_ACTIVE_MARKERS_JSON GTSW_TEST_LOG_LINES GTSW_TEST_QUOTA_RC GTSW_TEST_QUOTA_JSON GTSW_TEST_SESSIONS
   unset GTSW_TEST_KICKSTARTS GTSW_TEST_NOTIFIED GTSW_TEST_MAILED GTSW_TEST_NOW QUIET_HOURS_OVERRIDE
+  unset GTSW_TEST_GATE_RUN_JSON GTSW_TEST_QUEUE_COMPOSITION_JSON
 
   echo ""
   echo "gate-throughput-stall-watchdog selftest: PASS=$PASS FAIL=$FAIL"
