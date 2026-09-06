@@ -144,6 +144,63 @@ record_skip() {
 }
 # nightly-reboot.selftest.sh:STREAK-FUNCTIONS-END
 
+# --- macOS update install-before-reboot (ga-l5m50) -------------------------
+# ga-i9q44 reboots nightly to reclaim swap; separately, AutomaticDownload=1
+# means macOS downloads recommended updates in the background on its own
+# (AutomaticallyInstallMacOSUpdates stays 0 — deliberately: Athos chose to
+# install in OUR nightly window, not delegate the policy to macOS). Without
+# this, a fully-downloaded update sits on disk forever (measured: ~2.7GB,
+# macOS Tahoe 26.6.2) because nothing ever tells it to install. This installs
+# it right before the existing reboot, reusing that reboot rather than
+# triggering a second one.
+#
+# nightly-reboot.selftest.sh:MACOS-UPDATE-FUNCTIONS-START — sentinel for the
+# selftest, which extracts exactly this block (via sed) to unit-test this
+# logic in total isolation from Guards 1-3 and the reboot call — same reason
+# as the streak block above (see its own comment): the quality gate replays
+# this selftest, unmodified, against the pre-fix commit, which has no
+# override hook for a real `softwareupdate --install` call either. Keep this
+# block self-contained (log()/notify_athos() already defined above,
+# SOFTWAREUPDATE_BIN overridable) if you touch it.
+SOFTWAREUPDATE_BIN="${SOFTWAREUPDATE_BIN:-/usr/sbin/softwareupdate}"
+macos_update_ready() {
+  # --no-scan: report from the catalog the AutomaticDownload daemon already
+  # scanned in the background — never triggers a fresh scan/download of our
+  # own at 01:00. Only a label whose Action includes "restart" counts as
+  # ready: that is the distinction this bead asks for between "an update
+  # exists" (could be a Safari/config-data-only entry that needs no reboot,
+  # or one still downloading) and "ready to install".
+  SU_LIST_OUT=$("${SOFTWAREUPDATE_BIN}" --list --no-scan 2>/dev/null)
+  SU_LIST_RC=$?
+  if [ "${SU_LIST_RC}" -ne 0 ]; then
+    MACOS_UPDATE_REASON="softwareupdate --list --no-scan failed (rc=${SU_LIST_RC})"
+    return 1
+  fi
+  if ! printf '%s' "${SU_LIST_OUT}" | grep -q "Action: restart"; then
+    MACOS_UPDATE_REASON="no update with Action: restart pending"
+    return 1
+  fi
+  return 0
+}
+macos_update_install_if_ready() {
+  if ! macos_update_ready; then
+    log "macOS update: ${MACOS_UPDATE_REASON} — reboot normal (sem instalar)"
+    return 0
+  fi
+  log "macOS update pendente (Action: restart) — instalando antes do reboot; pode demorar mais que o normal (ga-l5m50)"
+  notify_athos "Reboot noturno" "Instalando atualização de macOS antes de reiniciar — pode levar mais tempo que o normal." 3
+  "${SOFTWAREUPDATE_BIN}" --install --all --no-scan --agree-to-license >>"${LOG}" 2>&1
+  local su_rc=$?
+  if [ "${su_rc}" -eq 0 ]; then
+    log "macOS update instalado com sucesso"
+  else
+    log "ERROR: macOS update falhou ao instalar (rc=${su_rc}) — prosseguindo com o reboot mesmo assim"
+    notify_athos "Reboot noturno: update falhou" "softwareupdate retornou ${su_rc} — reiniciando sem instalar. Ver ${LOG}." 4
+  fi
+  return 0
+}
+# nightly-reboot.selftest.sh:MACOS-UPDATE-FUNCTIONS-END
+
 log "=== fired (uptime: $(uptime | sed 's/.*up //; s/,.*users.*//') ) ==="
 
 # --- Guard 1: window sanity ---------------------------------------------
@@ -236,6 +293,9 @@ except Exception:
     print("?")' 2>/dev/null)
     log "info: ${RIG_NAME} in_progress = ${CNT} (non-blocking, logged only)"
 done
+
+# --- macOS update: install before reboot if one is ready (ga-l5m50) -------
+macos_update_install_if_ready
 
 # --- All clear: record pre-reboot state, then reboot ----------------------
 reset_streak
