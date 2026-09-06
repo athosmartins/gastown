@@ -2714,6 +2714,18 @@ _filter_candidates() {
   # The janitor R6 removes expired labels on its next sweep; this filter lets the
   # Pilot bypass the hold without waiting for the janitor when the expiry is clear.
   local _now_ts; _now_ts=$(date +%s)
+  # ga-w8btn: defer_until is a bd-native field (_pilot_defer_extend writes it
+  # so bd-ready-based self-serve pool probes respect a hold) but until now no
+  # _filter_* stage in this file, and no raw `bd list` query, ever READ it —
+  # this function is the single chokepoint every candidate source (HQ bugs/
+  # debt/chore/task, features, ctx:ready, every rig path) already funnels
+  # through, so one check here closes the gap everywhere at once instead of
+  # duplicating it into each narrower per-tier filter. Fixed-width ISO8601 UTC
+  # ("2026-08-25T22:00:00Z") sorts lexically in chronological order — same
+  # plain-string-compare convention _pilot_defer_extend already relies on for
+  # comparing two defer_until values; here we compare against "now" once per
+  # sweep instead of re-deriving it per bead.
+  local _now_iso; _now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
   local _cf_in; _cf_in=$(cat)
   local _cf_out _cf_kept
   # ga-ffop9: SINGLE source of truth for the body-text engine-rebuild veto
@@ -2759,7 +2771,7 @@ _filter_candidates() {
   local _cf_roster_ok="${_ROSTER_OK_FOR_FILTER:-0}"
   local _cf_active_owner_ids_json="${_ACTIVE_OWNER_IDS_JSON:-[]}"
   _cf_out=$(printf '%s' "$_cf_in" | jq --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
-     --argjson now_ts "$_now_ts" --argjson reclaim_cap "$_FILTER_RECLAIM_CAP" \
+     --argjson now_ts "$_now_ts" --argjson reclaim_cap "$_FILTER_RECLAIM_CAP" --arg now_iso "$_now_iso" \
      --arg engine_rebuild_re "$_cf_engine_rebuild_re" \
      --arg engine_rebuild_nonrequest_re "$_cf_engine_rebuild_nonrequest_re" \
      --arg diagnostic_only_re "$_cf_diagnostic_only_re" \
@@ -3100,6 +3112,21 @@ _filter_candidates() {
              or (((.title // "") + " " + (.description // ""))
                  | test($diagnostic_only_re; "i")
                  | not))
+        # ga-w8btn: defer_until in the future is a hold, regardless of what
+        # the beads own `status` string says. status can be reset to "open"
+        # by something unrelated to the hold itself (e.g. inflight-reclaim-
+        # guard.py do_reclaim() unconditionally runs `bd update --status
+        # open` so a reclaimed bead is re-dispatchable — ga-vw26y — without
+        # ever touching defer_until) while defer_until survives untouched,
+        # so a status-string-only check (_filter_terminal_status /
+        # _filter_dispatch_gates, both check only for the literal string
+        # "deferred") stops seeing the hold. Checking the raw timestamp here
+        # is immune to whatever else reset status. A lapsed (past) defer_until
+        # must NOT permanently strand the bead — only "still in the future"
+        # excludes.
+        # NOTE: no literal apostrophes anywhere in this comment block —
+        # same reason as the DECISAO comment above (single-quoted jq arg).
+        and (((.defer_until) // "") as $defer_until | ($defer_until == "" or $defer_until <= $now_iso))
      )]' \
     2>/dev/null)
   [ -z "$_cf_out" ] && _cf_out="[]"
@@ -3124,6 +3151,7 @@ _filter_candidates() {
   # can only under-report a reason, never change what actually gets dispatched.
   printf '%s' "$_cf_in" | jq -r --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
       --argjson now_ts "$_now_ts" --argjson reclaim_cap "$_FILTER_RECLAIM_CAP" --argjson kept "$_cf_kept" \
+      --arg now_iso "$_now_iso" \
       --arg engine_rebuild_re "$_cf_engine_rebuild_re" \
       --arg engine_rebuild_nonrequest_re "$_cf_engine_rebuild_nonrequest_re" \
       --arg diagnostic_only_re "$_cf_diagnostic_only_re" \
@@ -3220,7 +3248,12 @@ _filter_candidates() {
           # false "matched" reason for every excluded bead).
           (if ( ($diagnostic_only_re | length) > 0
                 and ((($b.title // "") + " " + ($b.description // "")) | test($diagnostic_only_re; "i")) )
-           then "diagnostic-only-text-pattern" else empty end)
+           then "diagnostic-only-text-pattern" else empty end),
+          # ga-w8btn: mirrors the defer_until select-clause veto directly
+          # above — keep these two in sync, same lesson ga-ffop9/ga-nimyz/
+          # ga-vmn7kv already taught this function repeatedly.
+          (if ((($b.defer_until) // "") as $d | ($d != "" and $d > $now_iso))
+           then "defer_until:\($b.defer_until)(future)" else empty end)
         ] as $reasons
       | select(($reasons | length) > 0)
       | [$id, ($reasons | join(";"))] | @tsv
@@ -6500,7 +6533,7 @@ BUGS_JSON=$(bd -C "$GC_CITY" list --json \
 # status=blocked/closed/deferred candidate — see _filter_terminal_status's own
 # comment (above _filter_dispatch_gates) for why a narrow filter, not the full
 # _filter_dispatch_gates gate bundle, is used here.
-BUGS_JSON=$(echo "$BUGS_JSON" | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_terminal_status)
+BUGS_JSON=$(echo "$BUGS_JSON" | _filter_exec_manual | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_terminal_status)
 
 DEBT_JSON=$(bd -C "$GC_CITY" list --json \
   -l "tech-debt" \
@@ -6514,7 +6547,7 @@ DEBT_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-type epic \
   -n 0 \
   2>/dev/null || echo "[]")
-DEBT_JSON=$(echo "$DEBT_JSON" | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_terminal_status)
+DEBT_JSON=$(echo "$DEBT_JSON" | _filter_exec_manual | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_terminal_status)
 
 # ga-ciyypt: chore/task never got the unconditional Tier-1 treatment BUGS_JSON/
 # DEBT_JSON give bug/tech-debt above — they ONLY flowed through CTXREADY_JSON
@@ -6548,7 +6581,7 @@ CHORE_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-type epic \
   -n 0 \
   2>/dev/null || echo "[]")
-CHORE_JSON=$(echo "$CHORE_JSON" | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_terminal_status)
+CHORE_JSON=$(echo "$CHORE_JSON" | _filter_exec_manual | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_terminal_status)
 
 TASK_JSON=$(bd -C "$GC_CITY" list --json \
   -t task \
@@ -6566,7 +6599,7 @@ TASK_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-type epic \
   -n 0 \
   2>/dev/null || echo "[]")
-TASK_JSON=$(echo "$TASK_JSON" | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_terminal_status)
+TASK_JSON=$(echo "$TASK_JSON" | _filter_exec_manual | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_terminal_status)
 
 # Merge bugs + debt + chore + task, deduplicate by id
 TIER1_JSON=$(echo "$BUGS_JSON $DEBT_JSON $CHORE_JSON $TASK_JSON" \
