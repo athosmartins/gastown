@@ -63,12 +63,45 @@ rig_path() {
 # Sem a flag, este script imprimia "total de markers: 0" com 7 markers na fila e
 # o gate parado — e ele é o script que a doutrina manda rodar ANTES de teorizar.
 # Um medidor cego não é neutro: ele é uma teoria errada com cara de medição.
-MARKERS=$(bd -C "$HQ" list --limit 0 --include-infra -l type:quality-gate-marker --json 2>/dev/null)
-if [ -z "$MARKERS" ] || ! printf '%s' "$MARKERS" | jq -e 'type=="array"' >/dev/null 2>&1; then
-  echo "ERRO: não consegui ler os markers (bd falhou ou devolveu envelope de erro)." >&2
+# PATH ROBUSTO — este script não roda só no terminal do Athos. O
+# nightly-reboot.sh o invoca como LaunchDaemon (root), cujo PATH herdado NÃO
+# tem /Users/athos/.local/bin (onde mora o bd) nem /opt/homebrew/bin (jq, gc).
+# Sem isto, `bd` dá "command not found", o 2>/dev/null abaixo engolia a
+# mensagem, e o script devolvia rc=2 "UNKNOWN" — que o nightly-reboot lê,
+# corretamente, como "estado do gate desconhecido, NÃO é seguro rebootar".
+# Efeito medido: o reboot noturno foi bloqueado 3 noites seguidas (04, 05 e
+# 06/09), sempre pelo mesmo motivo, e o log não dizia qual era. Isolado com um
+# 2x2: PATH mínimo reprova com HOME=/var/root E com HOME=/Users/athos; PATH
+# completo passa nos dois. É PATH, não HOME.
+for _d in /Users/athos/.local/bin /opt/homebrew/bin /usr/local/bin; do
+  case ":$PATH:" in *":$_d:"*) ;; *) [ -d "$_d" ] && PATH="$_d:$PATH" ;; esac
+done
+export PATH
+unset _d
+
+# TERCEIRO ESTADO: "bd não existe no PATH" e "bd rodou e devolveu erro" são
+# causas DIFERENTES com remédios diferentes, e antes produziam a mesma linha.
+# Foi exatamente isso que tornou as 3 noites bloqueadas indiagnosticáveis pelo
+# log. Cada uma agora se identifica.
+if ! command -v bd >/dev/null 2>&1; then
+  echo "ERRO: 'bd' não está no PATH — não é possível ler os markers." >&2
+  echo "      PATH=$PATH" >&2
   echo "      Isto é UNKNOWN, não 'fila vazia' — não conclua nada a partir daqui." >&2
   exit 2
 fi
+
+BD_ERR=$(mktemp -t gqc-bd-err)
+MARKERS=$(bd -C "$HQ" list --limit 0 --include-infra -l type:quality-gate-marker --json 2>"$BD_ERR")
+if [ -z "$MARKERS" ] || ! printf '%s' "$MARKERS" | jq -e 'type=="array"' >/dev/null 2>&1; then
+  echo "ERRO: não consegui ler os markers (bd falhou ou devolveu envelope de erro)." >&2
+  # Repassa o que o bd disse: sem isto o diagnóstico depende de reproduzir o
+  # ambiente do daemon à mão, que foi o que custou 3 noites.
+  [ -s "$BD_ERR" ] && sed 's/^/      bd: /' "$BD_ERR" >&2
+  echo "      Isto é UNKNOWN, não 'fila vazia' — não conclua nada a partir daqui." >&2
+  rm -f "$BD_ERR"
+  exit 2
+fi
+rm -f "$BD_ERR"
 
 TOTAL=$(printf '%s' "$MARKERS" | jq 'length')
 REAL=0; PHANTOM=0; UNKNOWN=0
