@@ -3569,6 +3569,77 @@ branch_tip_commit_author() {
 #            couldn't resolve), or bead is empty.
 #     yes  — bead_id appears somewhere in messages_blob (normal case).
 #     no   — count > 0 but bead_id appears nowhere — ga-y9a1d's signature.
+# SELFTEST-EXTRACT gate-rebase-content-verdict: BEGIN
+# ── ga-m07gc: o rebase preservou o CONTEUDO, nao so o commit? ─────────────────
+# branch_bead_commit_verdict (ga-y9a1d) responde "o COMMIT sobreviveu?" — conta
+# commits no range e casa o id da bead na mensagem. Isso NAO ve perda de ARQUIVO
+# DENTRO de um commit que sobreviveu inteiro, com a mensagem certa. Medido ao
+# vivo (wa-09wg5): commit do builder com 5 arquivos, merge em main com 4 — a
+# entrada do docs/data_dictionary.md sumiu, sem conflito, sem log, e o guard
+# respondeu "yes" com toda razao. Ponto cego de GRANULARIDADE, nao de logica.
+#
+# O invariante usado aqui: um rebase SEM CONFLITO e um merge SEM CONFLITO do
+# mesmo par produzem a MESMA ARVORE (historia diferente, conteudo identico). O
+# gate ja calcula essa arvore com `merge-tree --write-tree` no pre-check, entao
+# a verificacao custa uma chamada e nenhuma heuristica.
+#
+# Reproduzido deterministicamente no caminho de container rig (worktree do
+# .repo.git): merge-tree devolve a arvore COM o arquivo, o rebase devolve outra
+# SEM ele. No clone comum os dois concordam. A causa git exata desse desvio nao
+# foi determinada — e exatamente por isso o gate nao deve confiar no rebase sem
+# conferir: o guard trava o SINTOMA (conteudo perdido), que e o que importa,
+# independente do mecanismo.
+#
+# rebase_content_verdict <worktree> <main_ref> <orig_tip> <new_tip>
+#   yes     — a arvore do rebase bate com a do merge 3-way: nada se perdeu
+#   no      — DIFEREM: o rebase perdeu ou alterou conteudo; NAO empurrar
+#   unknown — nao deu pra comparar (merge-tree conflitou/falhou). Terceiro
+#             estado explicito: quem chama trata como "nao verificado", nunca
+#             como "verificado ok".
+rebase_content_verdict() {
+  local wt="$1" main_ref="$2" orig_tip="$3" new_tip="$4"
+  if [ -z "$wt" ] || [ -z "$main_ref" ] || [ -z "$orig_tip" ] || [ -z "$new_tip" ]; then
+    echo "unknown"; return 0
+  fi
+  local out rc expected actual
+  out=$(git -C "$wt" merge-tree --write-tree "$main_ref" "$orig_tip" 2>/dev/null); rc=$?
+  # rc!=0 = conflito (merge-tree AINDA imprime uma arvore na linha 1, entao o
+  # rc e a unica leitura honesta). Sem base de comparacao -> unknown.
+  if [ "$rc" -ne 0 ]; then echo "unknown"; return 0; fi
+  expected=$(printf '%s\n' "$out" | head -1)
+  case "$expected" in
+    *[!0-9a-f]*|"") echo "unknown"; return 0 ;;
+  esac
+  if [ "${#expected}" -ne 40 ]; then echo "unknown"; return 0; fi
+  actual=$(git -C "$wt" rev-parse "${new_tip}^{tree}" 2>/dev/null || echo "")
+  # `git rev-parse <ref-invalida>` FALHA e ainda assim ecoa a string recebida no
+  # stdout — o `|| echo ""` nao salva, e um new_tip inexistente viraria um SHA
+  # falso comparado contra o esperado, devolvendo "no" (um VEREDITO) onde a
+  # verdade e "nao consegui saber". Terceiro estado colapsado em veredito, a
+  # mesma familia de bug que este guard existe pra pegar — achado pelo Teste 3
+  # do proprio selftest. Exigir 40 hex e o que separa os dois.
+  case "$actual" in
+    *[!0-9a-f]*|"") echo "unknown"; return 0 ;;
+  esac
+  if [ "${#actual}" -ne 40 ]; then echo "unknown"; return 0; fi
+  if [ "$expected" = "$actual" ]; then echo "yes"; else echo "no"; fi
+}
+
+# rebase_content_lost_paths <worktree> <main_ref> <orig_tip> <new_tip> — lista
+# os paths em que as duas arvores divergem, so pra mensagem de erro ser
+# acionavel ("perdeu docs/data_dictionary.md") em vez de generica.
+rebase_content_lost_paths() {
+  local wt="$1" main_ref="$2" orig_tip="$3" new_tip="$4"
+  local out rc expected actual
+  out=$(git -C "$wt" merge-tree --write-tree "$main_ref" "$orig_tip" 2>/dev/null); rc=$?
+  [ "$rc" -ne 0 ] && return 0
+  expected=$(printf '%s\n' "$out" | head -1)
+  actual=$(git -C "$wt" rev-parse "${new_tip}^{tree}" 2>/dev/null || echo "")
+  [ -z "$expected" ] || [ -z "$actual" ] && return 0
+  git -C "$wt" diff --name-only "$actual" "$expected" 2>/dev/null | head -20
+}
+# SELFTEST-EXTRACT gate-rebase-content-verdict: END
+
 branch_bead_commit_verdict() {
   local count="$1" messages="$2" bead="$3"
   case "$count" in ''|*[!0-9]*|0) printf 'skip'; return 0 ;; esac
@@ -4505,11 +4576,19 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
               # all), so "skip" here is never legitimate the way it can be
               # at the Step-10 gate (which has no such prior and treats
               # "skip" as "nothing to check, someone else's job").
-              if [ -n "$NEW_TIP_MR" ] && [ "$NEW_TIP_MR_VERDICT" = "yes" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>/dev/null; then
+              # ga-m07gc: o commit sobreviveu (verdict acima) — mas e o CONTEUDO dele?
+              # Um rebase/merge pode perder um ARQUIVO INTEIRO dentro de um commit que
+              # sobrevive com a mensagem certa, e aquele verdict diz "yes" com razao.
+              local NEW_TIP_MR_CONTENT
+              NEW_TIP_MR_CONTENT=$(rebase_content_verdict "$TMP_MR_WT" "$CUR_MAIN" "origin/$BRANCH" "$NEW_TIP_MR")
+              if [ -n "$NEW_TIP_MR" ] && [ "$NEW_TIP_MR_VERDICT" = "yes" ] && [ "$NEW_TIP_MR_CONTENT" = "yes" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>/dev/null; then
                 MR_OK=1
                 log "  Merge-time rebase: pushed $BRANCH → $NEW_TIP_MR"
               else
                 [ "$NEW_TIP_MR_VERDICT" != "yes" ] && err "  Merge-time rebase (ga-y9a1d): rebase onto $CUR_MAIN did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$NEW_TIP_MR_VERDICT) — refusing to push a branch that might silently lose this bead's fix."
+                if [ "$NEW_TIP_MR_CONTENT" != "yes" ]; then
+                  err "  ga-m07gc: $BRANCH rebased/merged onto $CUR_MAIN produced a tree that does NOT match the 3-way merge result (content verdict=$NEW_TIP_MR_CONTENT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $(rebase_content_lost_paths "$TMP_MR_WT" "$CUR_MAIN" "origin/$BRANCH" "$NEW_TIP_MR" | tr '\n' ' ')"
+                fi
                 git -C "$TMP_MR_WT" rebase --abort 2>/dev/null || true
               fi
             else
@@ -4539,11 +4618,19 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
                   "$(git -C "$TMP_MR_WT" rev-list --count "${CUR_MAIN}..${NEW_TIP_MRM}" 2>/dev/null || echo "")" \
                   "$(git -C "$TMP_MR_WT" log --format='%B' "${CUR_MAIN}..${NEW_TIP_MRM}" 2>/dev/null || echo "")" \
                   "$BEAD_ID")
-                if [ -n "$NEW_TIP_MRM" ] && [ "$NEW_TIP_MRM_VERDICT" = "yes" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" 2>/dev/null; then
+                # ga-m07gc: o commit sobreviveu (verdict acima) — mas e o CONTEUDO dele?
+                # Um rebase/merge pode perder um ARQUIVO INTEIRO dentro de um commit que
+                # sobrevive com a mensagem certa, e aquele verdict diz "yes" com razao.
+                local NEW_TIP_MRM_CONTENT
+                NEW_TIP_MRM_CONTENT=$(rebase_content_verdict "$TMP_MR_WT" "$CUR_MAIN" "origin/$BRANCH" "$NEW_TIP_MRM")
+                if [ -n "$NEW_TIP_MRM" ] && [ "$NEW_TIP_MRM_VERDICT" = "yes" ] && [ "$NEW_TIP_MRM_CONTENT" = "yes" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" 2>/dev/null; then
                   MR_OK=1
                   log "  Merge-time merge fallback (ga-qukyp): rebase-replay failed but merge-tree pre-check showed zero conflict — merged instead, pushed $BRANCH → $NEW_TIP_MRM"
                 else
                   [ "$NEW_TIP_MRM_VERDICT" != "yes" ] && err "  Merge-time merge fallback (ga-qukyp): merge onto $CUR_MAIN did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$NEW_TIP_MRM_VERDICT) — refusing to push."
+                  if [ "$NEW_TIP_MRM_CONTENT" != "yes" ]; then
+                    err "  ga-m07gc: $BRANCH rebased/merged onto $CUR_MAIN produced a tree that does NOT match the 3-way merge result (content verdict=$NEW_TIP_MRM_CONTENT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $(rebase_content_lost_paths "$TMP_MR_WT" "$CUR_MAIN" "origin/$BRANCH" "$NEW_TIP_MRM" | tr '\n' ' ')"
+                  fi
                   git -C "$TMP_MR_WT" merge --abort 2>/dev/null || true
                 fi
               fi
@@ -4567,11 +4654,19 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
               # above for the full rationale — require an explicit "yes",
               # not merely "not no" (a complete collapse yields "skip", an
               # empty range, which "!= no" alone would miss).
-              if [ -n "$NEW_TIP_MR_SR" ] && [ "$NEW_TIP_MR_SR_VERDICT" = "yes" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>/dev/null; then
+              # ga-m07gc: o commit sobreviveu (verdict acima) — mas e o CONTEUDO dele?
+              # Um rebase/merge pode perder um ARQUIVO INTEIRO dentro de um commit que
+              # sobrevive com a mensagem certa, e aquele verdict diz "yes" com razao.
+              local NEW_TIP_MR_SR_CONTENT
+              NEW_TIP_MR_SR_CONTENT=$(rebase_content_verdict "$TMP_MR_WT" "$CUR_MAIN" "origin/$BRANCH" "$NEW_TIP_MR_SR")
+              if [ -n "$NEW_TIP_MR_SR" ] && [ "$NEW_TIP_MR_SR_VERDICT" = "yes" ] && [ "$NEW_TIP_MR_SR_CONTENT" = "yes" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>/dev/null; then
                 MR_OK=1
                 log "  Merge-time rebase (self-repo): pushed $BRANCH → $NEW_TIP_MR_SR"
               else
                 [ "$NEW_TIP_MR_SR_VERDICT" != "yes" ] && err "  Merge-time rebase (self-repo, ga-y9a1d): rebase onto $CUR_MAIN did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$NEW_TIP_MR_SR_VERDICT) — refusing to push a branch that might silently lose this bead's fix."
+                if [ "$NEW_TIP_MR_SR_CONTENT" != "yes" ]; then
+                  err "  ga-m07gc: $BRANCH rebased/merged onto $CUR_MAIN produced a tree that does NOT match the 3-way merge result (content verdict=$NEW_TIP_MR_SR_CONTENT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $(rebase_content_lost_paths "$TMP_MR_WT" "$CUR_MAIN" "origin/$BRANCH" "$NEW_TIP_MR_SR" | tr '\n' ' ')"
+                fi
                 git -C "$TMP_MR_WT" rebase --abort 2>/dev/null || true
               fi
             else
@@ -4587,11 +4682,19 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
                   "$(git -C "$TMP_MR_WT" rev-list --count "${CUR_MAIN}..${NEW_TIP_MRM_SR}" 2>/dev/null || echo "")" \
                   "$(git -C "$TMP_MR_WT" log --format='%B' "${CUR_MAIN}..${NEW_TIP_MRM_SR}" 2>/dev/null || echo "")" \
                   "$BEAD_ID")
-                if [ -n "$NEW_TIP_MRM_SR" ] && [ "$NEW_TIP_MRM_SR_VERDICT" = "yes" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" 2>/dev/null; then
+                # ga-m07gc: o commit sobreviveu (verdict acima) — mas e o CONTEUDO dele?
+                # Um rebase/merge pode perder um ARQUIVO INTEIRO dentro de um commit que
+                # sobrevive com a mensagem certa, e aquele verdict diz "yes" com razao.
+                local NEW_TIP_MRM_SR_CONTENT
+                NEW_TIP_MRM_SR_CONTENT=$(rebase_content_verdict "$TMP_MR_WT" "$CUR_MAIN" "origin/$BRANCH" "$NEW_TIP_MRM_SR")
+                if [ -n "$NEW_TIP_MRM_SR" ] && [ "$NEW_TIP_MRM_SR_VERDICT" = "yes" ] && [ "$NEW_TIP_MRM_SR_CONTENT" = "yes" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" 2>/dev/null; then
                   MR_OK=1
                   log "  Merge-time merge fallback (self-repo, ga-qukyp): rebase-replay failed but merge-tree pre-check showed zero conflict — merged instead, pushed $BRANCH → $NEW_TIP_MRM_SR"
                 else
                   [ "$NEW_TIP_MRM_SR_VERDICT" != "yes" ] && err "  Merge-time merge fallback (self-repo, ga-qukyp): merge onto $CUR_MAIN did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$NEW_TIP_MRM_SR_VERDICT) — refusing to push."
+                  if [ "$NEW_TIP_MRM_SR_CONTENT" != "yes" ]; then
+                    err "  ga-m07gc: $BRANCH rebased/merged onto $CUR_MAIN produced a tree that does NOT match the 3-way merge result (content verdict=$NEW_TIP_MRM_SR_CONTENT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $(rebase_content_lost_paths "$TMP_MR_WT" "$CUR_MAIN" "origin/$BRANCH" "$NEW_TIP_MRM_SR" | tr '\n' ' ')"
+                  fi
                   git -C "$TMP_MR_WT" merge --abort 2>/dev/null || true
                 fi
               fi
