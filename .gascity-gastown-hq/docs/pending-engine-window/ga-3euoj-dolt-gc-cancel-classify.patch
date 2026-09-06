@@ -1,0 +1,201 @@
+diff --git a/examples/dolt/assets/scripts/compact-gc-cancel-classify.sh b/examples/dolt/assets/scripts/compact-gc-cancel-classify.sh
+new file mode 100755
+index 000000000..da9c1fe57
+--- /dev/null
++++ b/examples/dolt/assets/scripts/compact-gc-cancel-classify.sh
+@@ -0,0 +1,74 @@
++#!/bin/sh
++# compact-gc-cancel-classify.sh — discriminate WHY a `CALL DOLT_GC('--full')`
++# (or similar long-running admin call) failed (gastownhall/gascity, ga-3euoj).
++#
++# Before this, run_full_gc()'s failure path logged the same shape
++# ("DOLT_GC failed rc=%s duration=%ss" + raw stderr) whether the CLIENT-SIDE
++# run_bounded wrapper killed the `dolt` CLI after call_timeout elapsed (never
++# got a server response at all), or the `dolt` CLI exited cleanly with a real
++# SQL error the SERVER sent back. Those are different failures with different
++# fixes, and collapsing them into one line is exactly the trap this codebase's
++# own history warns about (comments/logs that don't distinguish "didn't
++# happen" from "happened and failed" from "failed for a different reason").
++#
++# Concretely (ga-3euoj): hq's nightly compact retried `CALL DOLT_GC('--full')`,
++# got back rc=1 with "Error in SaveHashes call: SaveHashes, error calling
++# getManyCompressed: context canceled" after 112s — well under both
++# call_timeout (300s+) and the outer routine timeout (3600s), so neither
++# wrapper-level timeout fired. "context canceled" is Go's ctx.Err() wording
++# surfacing through the SQL error text — the cancellation happened INSIDE the
++# Dolt SQL server's own query execution, most likely its listener's
++# read_timeout_millis/net_read_timeout (confirmed present in this deployment's
++# dolt-config.yaml and `SHOW VARIABLES`) firing on a call long enough to
++# exceed it — not a client/wrapper timeout, and not (by this evidence) a
++# disk-space error, which would carry a different message (no I/O or
++# no-space wording here). See the bead for why raising that timeout globally
++# is explicitly NOT this fix: it existed at 30s specifically to reap dead
++# per-call sockets (200-460 idle Sleep connections observed before), and a
++# blind global bump would reopen that. A per-call `SET SESSION
++# net_read_timeout=<n>` ahead of just the long admin call is the scoped
++# alternative to evaluate next — this lib only classifies, it does not change
++# the timeout.
++#
++# Depends on nothing from run.sh — takes rc and a stderr-capture file path as
++# plain arguments so it is testable without a live Dolt server.
++
++# classify_gc_cancel_cause <rc> <stderr_file> — echoes one of:
++#   OK               — rc=0. Defensive: callers should only invoke this in
++#                      the failure branch, but a 0 must never read as a
++#                      failure of any kind if it is passed in anyway.
++#   CLIENT_TIMEOUT   — rc is coreutils `timeout`'s own convention for "the
++#                      command was killed because it ran past the bound":
++#                      124 (SIGTERM) or 137 (128+9, run_bounded's
++#                      --kill-after=2 escalation to SIGKILL). The `dolt` CLI
++#                      never got to read a server response — the CLIENT/
++#                      wrapper is what ended the call.
++#   SERVER_CANCELLED — a real (non-timeout) rc AND stderr carries a
++#                      cancellation signature ("context canceled", case-
++#                      insensitive — Go's ctx.Err() wording). The `dolt` CLI
++#                      exited because the SERVER sent back an error, and that
++#                      error says the server's own query context was
++#                      cancelled — a listener-level read/net timeout on the
++#                      connection is the leading candidate, not the
++#                      call_timeout wrapper (which would show as
++#                      CLIENT_TIMEOUT above, not a clean SQL error).
++#   SERVER_ERROR     — a real (non-timeout) rc with no cancellation
++#                      signature in stderr. Fail closed: an unreadable/
++#                      missing/empty stderr file is evidence of NOTHING, so
++#                      it must not be guessed as SERVER_CANCELLED — the
++#                      signature has to actually be present.
++classify_gc_cancel_cause() {
++  _gcc_rc="$1"
++  _gcc_stderr_file="$2"
++  case "$_gcc_rc" in
++    0) printf 'OK'; return 0 ;;
++    124|137) printf 'CLIENT_TIMEOUT'; return 0 ;;
++  esac
++  if [ -s "$_gcc_stderr_file" ] 2>/dev/null && \
++     grep -qi 'context canceled' "$_gcc_stderr_file" 2>/dev/null; then
++    printf 'SERVER_CANCELLED'
++    return 0
++  fi
++  printf 'SERVER_ERROR'
++  return 0
++}
+diff --git a/examples/dolt/commands/compact/run.sh b/examples/dolt/commands/compact/run.sh
+index 9380c70b0..4482f0798 100755
+--- a/examples/dolt/commands/compact/run.sh
++++ b/examples/dolt/commands/compact/run.sh
+@@ -164,6 +164,8 @@ PACK_DIR="${GC_PACK_DIR:-$(unset CDPATH; cd -- "$(dirname "$0")/.." && pwd)}"
+ . "$PACK_DIR/assets/scripts/runtime.sh"
+ # shellcheck disable=SC1091
+ . "$PACK_DIR/assets/scripts/compact-gain-drift-proof.sh"
++# shellcheck disable=SC1091
++. "$PACK_DIR/assets/scripts/compact-gc-cancel-classify.sh"
+ 
+ if [ "${GC_DOLT_MANAGED_LOCAL:-}" = "1" ]; then
+   managed_port=$(managed_runtime_port "$DOLT_STATE_FILE" "$DOLT_DATA_DIR" || true)
+@@ -1298,8 +1300,19 @@ run_full_gc() {
+ 
+   elapsed=$(( $(date +%s) - start ))
+   if [ "$gc_rc" -ne 0 ]; then
+-    printf 'compact: db=%s %s DOLT_GC failed rc=%s duration=%ss\n' \
+-      "$db" "$failure_prefix" "$gc_rc" "$elapsed" >&2
++    gc_cause=$(classify_gc_cancel_cause "$gc_rc" "$gc_err_tmp")
++    printf 'compact: db=%s %s DOLT_GC failed rc=%s duration=%ss cause=%s\n' \
++      "$db" "$failure_prefix" "$gc_rc" "$elapsed" "$gc_cause" >&2
++    case "$gc_cause" in
++      CLIENT_TIMEOUT)
++        printf 'compact: db=%s cause=CLIENT_TIMEOUT — run_bounded killed the dolt CLI after call_timeout=%ss; no server response was read. Raise GC_DOLT_COMPACT_CALL_TIMEOUT_SECS if this db legitimately needs longer, not the server listener timeout.\n' \
++          "$db" "$call_timeout" >&2
++        ;;
++      SERVER_CANCELLED)
++        printf 'compact: db=%s cause=SERVER_CANCELLED — the query ran past call_timeout=%ss with no client/wrapper kill (rc is a real SQL error, not a timeout exit code): the SERVER cancelled its own query context mid-call. The listener'"'"'s read_timeout_millis/net_read_timeout is the leading candidate for a long admin call like this — do not raise it globally (it exists to reap dead per-call sockets); a per-call SET SESSION net_read_timeout ahead of just this CALL is the scoped alternative to evaluate.\n' \
++          "$db" "$call_timeout" >&2
++        ;;
++    esac
+     emit_error_file "$db" "$gc_err_tmp"
+     rm -f "$gc_err_tmp"
+     return 1
+diff --git a/test/dolt/compact_gc_cancel_classify_test.sh b/test/dolt/compact_gc_cancel_classify_test.sh
+new file mode 100755
+index 000000000..f9a83cb8d
+--- /dev/null
++++ b/test/dolt/compact_gc_cancel_classify_test.sh
+@@ -0,0 +1,80 @@
++#!/bin/sh
++# Unit test for classify_gc_cancel_cause (ga-3euoj).
++# Lib under test: examples/dolt/assets/scripts/compact-gc-cancel-classify.sh
++#
++# Covers the discriminator the bead asks for: a failed `CALL DOLT_GC('--full')`
++# must not collapse "the wrapper's own run_bounded timeout fired" (client-side,
++# rc=124/137, no server response was ever read), "the server cancelled the
++# query's own context" (a real, non-timeout rc with a cancellation signature in
++# stderr — e.g. read_timeout_millis/net_read_timeout firing mid-query on a
++# long admin call), and "some other real server/query error" (a real,
++# non-timeout rc with no cancellation signature) into one undifferentiated
++# log line. No live Dolt/server needed — pure function over rc + a stderr file.
++set -u
++
++HERE=$(unset CDPATH; cd -- "$(dirname "$0")" && pwd)
++LIB="$HERE/../../examples/dolt/assets/scripts/compact-gc-cancel-classify.sh"
++[ -f "$LIB" ] || { echo "FAIL: lib not found at $LIB"; exit 1; }
++
++# shellcheck disable=SC1090  # $LIB path is computed from the test's own location
++. "$LIB"
++
++# --- harness ----------------------------------------------------------------
++pass=0
++fail=0
++ok() { pass=$((pass + 1)); printf 'ok   - %s\n' "$1"; }
++no() { fail=$((fail + 1)); printf 'FAIL - %s\n' "$1"; }
++
++_mk() { # _mk <content> -> echoes path to a tmp file holding it (no trailing newline surprises)
++  _mk_f=$(mktemp)
++  printf '%s' "$1" > "$_mk_f"
++  printf '%s' "$_mk_f"
++}
++
++# 1. rc=0 -> OK (defensive; callers should not invoke on success, but must
++#    never misclassify success as any failure bucket if they do)
++empty_f=$(_mk "")
++got=$(classify_gc_cancel_cause 0 "$empty_f")
++if [ "$got" = "OK" ]; then ok "rc=0 -> OK"; else no "rc=0 -> OK (got: $got)"; fi
++
++# 2. rc=124 (coreutils `timeout` default kill signal) -> CLIENT_TIMEOUT,
++#    regardless of stderr content (the process was killed before it could
++#    read/print any real server response).
++got=$(classify_gc_cancel_cause 124 "$empty_f")
++if [ "$got" = "CLIENT_TIMEOUT" ]; then ok "rc=124 -> CLIENT_TIMEOUT"; else no "rc=124 -> CLIENT_TIMEOUT (got: $got)"; fi
++
++# 3. rc=137 (128+SIGKILL, run_bounded's --kill-after escalation) -> CLIENT_TIMEOUT
++got=$(classify_gc_cancel_cause 137 "$empty_f")
++if [ "$got" = "CLIENT_TIMEOUT" ]; then ok "rc=137 -> CLIENT_TIMEOUT"; else no "rc=137 -> CLIENT_TIMEOUT (got: $got)"; fi
++
++# 4. real ga-3euoj signature: rc=1, stderr shows the server cancelled its own
++#    query context (SaveHashes/getManyCompressed) -> SERVER_CANCELLED, not
++#    conflated with either a client timeout or a generic server error.
++sig_f=$(_mk "compact: db=hq error on line 1 for query CALL DOLT_GC('--full'): Error 1105 (HY000): Error in SaveHashes call: SaveHashes, error calling getManyCompressed: context canceled")
++got=$(classify_gc_cancel_cause 1 "$sig_f")
++if [ "$got" = "SERVER_CANCELLED" ]; then ok "rc=1 + 'context canceled' -> SERVER_CANCELLED"; else no "rc=1 + 'context canceled' -> SERVER_CANCELLED (got: $got)"; fi
++
++# 5. case-insensitive match ("Context Canceled", different Go call site casing)
++sig_f2=$(_mk "Error: Context Canceled while flushing")
++got=$(classify_gc_cancel_cause 2 "$sig_f2")
++if [ "$got" = "SERVER_CANCELLED" ]; then ok "case-insensitive 'Context Canceled' -> SERVER_CANCELLED"; else no "case-insensitive match (got: $got)"; fi
++
++# 6. real, non-timeout rc with NO cancellation signature -> SERVER_ERROR (a
++#    genuine different failure; must not be mislabeled as a cancellation).
++other_f=$(_mk "compact: db=hq error on line 1 for query CALL DOLT_GC('--full'): Error 1105 (HY000): some unrelated storage error")
++got=$(classify_gc_cancel_cause 1 "$other_f")
++if [ "$got" = "SERVER_ERROR" ]; then ok "rc=1 + unrelated stderr -> SERVER_ERROR"; else no "rc=1 + unrelated stderr -> SERVER_ERROR (got: $got)"; fi
++
++# 7. real, non-timeout rc with EMPTY stderr -> SERVER_ERROR (fail closed: no
++#    signature to prove cancellation, must not guess SERVER_CANCELLED).
++got=$(classify_gc_cancel_cause 1 "$empty_f")
++if [ "$got" = "SERVER_ERROR" ]; then ok "rc=1 + empty stderr -> SERVER_ERROR (fail closed, no signature)"; else no "rc=1 + empty stderr -> SERVER_ERROR (got: $got)"; fi
++
++# 8. missing/unreadable stderr file -> SERVER_ERROR (fail closed, never crash)
++got=$(classify_gc_cancel_cause 1 "/nonexistent/path/$$")
++if [ "$got" = "SERVER_ERROR" ]; then ok "rc=1 + missing stderr file -> SERVER_ERROR (fail closed)"; else no "rc=1 + missing stderr file -> SERVER_ERROR (got: $got)"; fi
++
++rm -f "$empty_f" "$sig_f" "$sig_f2" "$other_f"
++
++printf '\n%d passed, %d failed\n' "$pass" "$fail"
++[ "$fail" -eq 0 ]
