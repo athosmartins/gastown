@@ -3309,6 +3309,91 @@ GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS="${GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS:-3}" # cr
 GATE_DEPLOY_RETRY_MAX="${GATE_DEPLOY_RETRY_MAX:-3}"                   # in-process deploy_cmd retries before declaring DEPLOY_FAILED
 GATE_DEPLOY_RETRY_BACKOFF_SECS="${GATE_DEPLOY_RETRY_BACKOFF_SECS:-3}" # BASE backoff; doubles per attempt (see deploy-retry-loop)
 
+# ── ga-jezvn: RAM-pressure reader (mirrors pilot-dispatcher.sh's
+# _pilot_ram_pressure_* functions) + the GLOBAL variable-session cap counter,
+# shared (by definition, not by sourcing) with pilot-dispatcher.sh ───────────
+# Declared here, BEFORE the GATE_DISPATCHER_LIB_ONLY cutoff below, same
+# reasoning as the two knob pairs just above: a lib-only source (selftests)
+# must see real functions/defaults, not "command not found"/an unbound
+# variable, when called directly. The actual admission-gate INVOCATION (the
+# `if ... log ...; exit 0; fi` blocks that call these) lives much later,
+# right before Step 0b-1's headroom gate — see that site for the full
+# rationale on gate ordering, why RAM-pressure has no `notify` here (unlike
+# pilot-dispatcher.sh's copy), and the accepted multi-admit-per-round overshoot
+# gap on the session cap.
+#
+# RAM-pressure reader: same 2-line level-file format (level word, then unix
+# timestamp) as pilot-dispatcher.sh's _pilot_ram_pressure_* — duplicated
+# rather than shared-sourced (this reader already has one other independent
+# copy, in crew-capacity-containment.sh; matching that existing
+# duplicate-not-share convention here is a smaller, lower-risk change than
+# retrofitting 3 unrelated live scripts onto a brand-new shared lib for this
+# one bead).
+GATE_RAM_LEVEL_FILE="${GATE_RAM_LEVEL_FILE:-${HOME}/.gastown/run/ram-pressure-monitor.level}"
+GATE_RAM_MAX_AGE_SECS="${GATE_RAM_MAX_AGE_SECS:-1800}"
+GATE_RAM_PRESSURE_OVERRIDE="${GATE_RAM_PRESSURE_OVERRIDE:-}"
+
+_gate_ram_pressure_blocks() {
+  if [ -n "$GATE_RAM_PRESSURE_OVERRIDE" ]; then
+    case "$GATE_RAM_PRESSURE_OVERRIDE" in
+      WARN|EMERGENCY) printf '1'; return 0 ;;
+      *) printf '0'; return 0 ;;
+    esac
+  fi
+  [ -f "$GATE_RAM_LEVEL_FILE" ] || { printf '0'; return 0; }
+  local _level _ts _now
+  _level=$(sed -n '1p' "$GATE_RAM_LEVEL_FILE" 2>/dev/null | tr -d '[:space:]')
+  _ts=$(sed -n '2p' "$GATE_RAM_LEVEL_FILE" 2>/dev/null | tr -d '[:space:]')
+  case "$_ts" in ''|*[!0-9]*) printf '0'; return 0 ;; esac
+  _now=$(date +%s)
+  [ $(( _now - _ts )) -gt "$GATE_RAM_MAX_AGE_SECS" ] && { printf '0'; return 0; }
+  case "$_level" in
+    WARN|EMERGENCY) printf '1'; return 0 ;;
+    *) printf '0'; return 0 ;;
+  esac
+}
+
+_gate_ram_pressure_level() {
+  [ -n "$GATE_RAM_PRESSURE_OVERRIDE" ] && { printf '%s' "$GATE_RAM_PRESSURE_OVERRIDE"; return 0; }
+  [ -f "$GATE_RAM_LEVEL_FILE" ] || { printf ''; return 0; }
+  sed -n '1p' "$GATE_RAM_LEVEL_FILE" 2>/dev/null | tr -d '[:space:]'
+}
+
+_gate_ram_pressure_unreadable() {
+  [ -n "$GATE_RAM_PRESSURE_OVERRIDE" ] && { printf '0'; return 0; }
+  [ -f "$GATE_RAM_LEVEL_FILE" ] || { printf '0'; return 0; }
+  local _ts _now
+  _ts=$(sed -n '2p' "$GATE_RAM_LEVEL_FILE" 2>/dev/null | tr -d '[:space:]')
+  case "$_ts" in ''|*[!0-9]*) printf '1'; return 0 ;; esac
+  _now=$(date +%s)
+  if [ $(( _now - _ts )) -gt "$GATE_RAM_MAX_AGE_SECS" ]; then printf '1'; return 0; fi
+  printf '0'
+}
+
+# Global variable-session cap — see pilot-dispatcher.sh's identically-named
+# GC_VARIABLE_SESSION_MAX/gc_variable_session_count for the full rationale
+# (Athos-decided ceiling, why these 3 template names, why dogs are excluded).
+GC_VARIABLE_SESSION_MAX="${GC_VARIABLE_SESSION_MAX:-6}"
+case "$GC_VARIABLE_SESSION_MAX" in ''|*[!0-9]*) GC_VARIABLE_SESSION_MAX=6 ;; esac
+# TEST-ONLY seam (mirrors GATE_DOLT_LATENCY_OVERRIDE_MS): overrides the live
+# combined wa-worker+ps-worker+gate-reviewer count. Never set in prod.
+GC_VARIABLE_SESSION_COUNT_OVERRIDE="${GC_VARIABLE_SESSION_COUNT_OVERRIDE:-}"
+
+# gc_variable_session_count — defined identically (same name, same body) in
+# pilot-dispatcher.sh. Deliberately a fresh `gc session list` query every
+# call, never a reused earlier-in-sweep snapshot — kept self-contained so
+# both scripts' copies are byte-for-byte identical and trivially diffable
+# against each other.
+gc_variable_session_count() {
+  if [ -n "${GC_VARIABLE_SESSION_COUNT_OVERRIDE:-}" ]; then
+    printf '%s' "$GC_VARIABLE_SESSION_COUNT_OVERRIDE"
+    return 0
+  fi
+  timeout 10 gc --city "$GC_CITY" session list --json 2>/dev/null \
+    | jq '[.sessions[]? | select((.template=="wa-worker" or .template=="ps-worker" or .template=="gate-reviewer") and (.state=="active" or .state=="creating"))] | length' 2>/dev/null \
+    || echo "0"
+}
+
 # gate_status_transition <marker_id> <new_status> — replace ALL gate-status:*
 # labels on <marker_id> with a single gate-status:<new_status>, instead of
 # the per-callsite pattern this file otherwise uses (`label remove
@@ -7824,6 +7909,65 @@ if [ "$(_quiet_hours_blocks)" = "1" ]; then
   exit 0
 elif [ "$(_quiet_hours_unreadable)" = "1" ]; then
   log "Quiet-hours signal UNREADABLE (stale/corrupt ${QUIET_HOURS_LEVEL_FILE:-unset}) — fail-open, admission proceeding normally this sweep (ga-dxyvxr)."
+fi
+
+# ── ga-jezvn: RAM-pressure admission gate (mirrors pilot-dispatcher.sh's
+# ga-m2gqb gate) — PAUSE new-run admission when the mini is under signaled
+# RAM pressure ────────────────────────────────────────────────────────────────
+# The mini's RAM-pressure monitor (ram-pressure-monitor.sh, ~/.gastown/scripts/,
+# a separate no-gate repo) already backs off Pilot's own dispatch (ga-m2gqb)
+# when it signals WARN/EMERGENCY, but this gate never checked it at all
+# (confirmed: zero hits for "ram.pressure" in this file before this bead) — so
+# Gate could keep spawning gate-reviewer sessions at full ceiling while Pilot
+# sat fully paused for the identical pressure. Reader functions
+# (_gate_ram_pressure_*) are defined earlier, BEFORE the
+# GATE_DISPATCHER_LIB_ONLY cutoff (near GATE_DEPLOY_RETRY_*), so selftests can
+# call them directly — see that definition's header comment for the full
+# rationale. Log-only (no `notify`), matching THIS script's own
+# admission-pause convention (quiet-hours/headroom below never page either)
+# rather than pilot-dispatcher.sh's notify-on-pause convention — Gate's ~2min
+# sweep cadence would make a paging notify far noisier here than on Pilot's
+# much slower cadence.
+if [ "$(_gate_ram_pressure_blocks)" = "1" ]; then
+  _gate_ram_level="$(_gate_ram_pressure_level)"
+  log "RAM pressure ${_gate_ram_level} (ram-pressure-monitor.sh, ~/.gastown/run/ram-pressure-monitor.level) — PAUSING new-run admission this sweep (mirrors Pilot's ga-m2gqb gate), leaving $COUNT marker(s) queued (ga-jezvn)."
+  exit 0
+elif [ "$(_gate_ram_pressure_unreadable)" = "1" ]; then
+  log "RAM-pressure signal UNREADABLE (stale/corrupt ${GATE_RAM_LEVEL_FILE}) — fail-open, admission proceeding normally this sweep (ga-jezvn)."
+fi
+
+# ── ga-jezvn: GLOBAL variable-session cap, shared with pilot-dispatcher.sh ────
+# Athos-decided ceiling (AskUserQuestion via Mayor, 2026-09-06): the ephemeral
+# "variable" session types this city spawns on demand — wa-worker + ps-worker
+# (pilot-dispatcher.sh) and gate-reviewer (this script) — must never exceed
+# this many LIVE sessions COMBINED. gc_variable_session_count() and
+# GC_VARIABLE_SESSION_MAX are defined earlier, BEFORE the
+# GATE_DISPATCHER_LIB_ONLY cutoff — see that definition's header comment for
+# the full rationale (why these 3 template names, why dogs are excluded, why
+# a probe error fails open).
+#
+# On cap hit: log distinctly (never the same line as quiet-hours/headroom, so a
+# stuck queue stays diagnosable) and exit 0 WITHOUT touching any marker — same
+# "leave the FIFO queue untouched, retry next sweep" shape as quiet-hours/
+# headroom immediately around this block. Every re-exec round (Step 7's
+# multi-admit loop, GATE_MAX_ADMITS_PER_SWEEP/GATE_MAX_ROUNDS_PER_SWEEP) re-runs
+# this from scratch, so a round that pushes the combined count TO the cap is
+# caught by the very next round's check.
+#
+# Known accepted gap: a single round can admit up to GATE_REVIEWERS_PER_RUN
+# reviewers at once (Step 0b-1 below already limits ITS OWN admission via
+# inflight+perrun<=ceiling, but that ceiling doesn't know about Pilot's
+# wa-worker/ps-worker count) — so one round could overshoot the combined cap by
+# up to (GATE_REVIEWERS_PER_RUN - 1) before the NEXT round's check catches it.
+# Accepted rather than folding this count into gate_headroom_decision's own
+# ceiling math: this cap is a guard against peak swap, not a hard safety
+# invariant (Mayor's own bead comment: "o teto e' GUARDA, nao cura"), and a
+# self-correcting one-round overshoot is a much smaller risk than changing an
+# already-complex, well-tested function's input semantics for this bead.
+_gc_variable_count="$(gc_variable_session_count)"
+if [ "${_gc_variable_count:-0}" -ge "$GC_VARIABLE_SESSION_MAX" ] 2>/dev/null; then
+  log "GLOBAL variable-session cap hit ($_gc_variable_count/$GC_VARIABLE_SESSION_MAX: wa-worker+ps-worker+gate-reviewer combined) — QUEUED, leaving $COUNT marker(s) queued, retried next sweep (ga-jezvn)."
+  exit 0
 fi
 
 # ── Step 0b-1 (ga-cw4pm): dynamic-concurrency headroom gate ───────────────────

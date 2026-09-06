@@ -110,6 +110,36 @@ PILOT_PS_WORKER_MAX="${PILOT_PS_WORKER_MAX:-2}"
 # TEST-ONLY seam: override live gc session list count for ps-worker pool.
 PILOT_TEST_PS_WORKER_LIVE_COUNT="${PILOT_TEST_PS_WORKER_LIVE_COUNT:-}"
 
+# ── ga-jezvn: GLOBAL variable-session cap, shared with quality-gate-dispatcher.sh
+# Athos-decided ceiling (AskUserQuestion via Mayor, 2026-09-06): the ephemeral
+# "variable" session types this city spawns on demand — wa-worker + ps-worker
+# (this script) and gate-reviewer (quality-gate-dispatcher.sh) — must never
+# exceed this many LIVE sessions COMBINED. Each dispatcher already enforces its
+# own per-type cap (PILOT_WA_WORKER_MAX, PILOT_PS_WORKER_MAX, GATE_MAX_REVIEWERS)
+# but nothing summed them, so the worst case was all three maxed out
+# simultaneously (measured 2026-09-06: 270MB/session all-in, ~1.1GB saved at
+# peak by this cap). The 9 structural sessions (7 named crews + gastown.mayor +
+# control-dispatcher) are excluded by construction — none of them use these 3
+# template names. gastown.dog (a 4th elastic-pool type, per crew-idle-check.sh's
+# own "Layer 2" taxonomy) is deliberately OUT of scope here: it already has its
+# own independent cap, and ga-jezvn's own final scope names only "pool builders
+# (this script) + gate reviewers (quality-gate-dispatcher.sh)" — not dogs.
+#
+# On cap hit: release the claim and return, exactly like a spawn failure
+# (ga-d20od) — NOT like the per-pool caps just below (which hand off to the
+# supervisor reconciler via gc.routed_to + story:in-flight and rely on it to
+# spawn once ITS OWN per-template cap allows). The supervisor does not know
+# about this cross-script COMBINED cap — handing off here would just let it
+# spawn the instant the per-template cap alone is satisfied, silently
+# bypassing this check. Only leaving the bead a plain story:approved candidate
+# (no in-flight marking) guarantees THIS script's own next sweep re-checks the
+# combined count fresh — that is what actually enforces it.
+GC_VARIABLE_SESSION_MAX="${GC_VARIABLE_SESSION_MAX:-6}"
+case "$GC_VARIABLE_SESSION_MAX" in ''|*[!0-9]*) GC_VARIABLE_SESSION_MAX=6 ;; esac
+# TEST-ONLY seam (mirrors PILOT_TEST_WA_WORKER_LIVE_COUNT): overrides the live
+# combined wa-worker+ps-worker+gate-reviewer count. Never set in prod.
+GC_VARIABLE_SESSION_COUNT_OVERRIDE="${GC_VARIABLE_SESSION_COUNT_OVERRIDE:-}"
+
 # Acceptance-criteria count threshold for auto-classifying a story as BIG.
 BIG_CRITERIA_THRESHOLD="${BIG_CRITERIA_THRESHOLD:-5}"
 
@@ -1724,6 +1754,39 @@ _pilot_ram_pressure_unreadable() {
   _now=$(date +%s)
   if [ $(( _now - _ts )) -gt "$PILOT_RAM_MAX_AGE_SECS" ]; then printf '1'; return 0; fi
   printf '0'
+}
+
+# gc_variable_session_count — LIVE count of the elastic-pool session types the
+# ga-jezvn GLOBAL cap governs: wa-worker + ps-worker (spawned by this script)
+# and gate-reviewer (spawned by the sibling quality-gate-dispatcher.sh). See
+# the GC_VARIABLE_SESSION_MAX header above for why these three specifically.
+# Counts active AND creating (mirrors PILOT_WA_WORKER_MAX's own per-pool count
+# just below, so a session mid-spawn from a moment ago is not invisible to a
+# second, near-simultaneous check within the same sweep). Honors
+# GC_VARIABLE_SESSION_COUNT_OVERRIDE (test seam). Fail-open (echoes 0) on any
+# probe error, matching every other live-count seam in this file — this cap is
+# a peak-swap guard, not a safety invariant, so a probe hiccup must never
+# itself block dispatch.
+#
+# Deliberately a FRESH query every call, never the sweep-level $_SESSIONS_JSON
+# snapshot (fetched once, early, at "gc session list" below) — dispatch_one()
+# runs once per candidate within a single sweep, and a session spawned for an
+# earlier candidate in THIS sweep must be visible to the next candidate's
+# check. This exactly mirrors why PILOT_WA_WORKER_MAX/PILOT_PS_WORKER_MAX
+# (just below) already re-query fresh instead of reusing that snapshot too.
+# Defined identically (same name, same body) in quality-gate-dispatcher.sh —
+# duplicated rather than extracted into a shared sibling lib, matching this
+# file's own established convention (gc_json_or_unknown, the RAM-pressure
+# readers, etc. are all independently duplicated, never cross-sourced between
+# these two scripts for a single-bead change).
+gc_variable_session_count() {
+  if [ -n "${GC_VARIABLE_SESSION_COUNT_OVERRIDE:-}" ]; then
+    printf '%s' "$GC_VARIABLE_SESSION_COUNT_OVERRIDE"
+    return 0
+  fi
+  timeout 10 gc --city "$GC_CITY" session list --json 2>/dev/null \
+    | jq '[.sessions[]? | select((.template=="wa-worker" or .template=="ps-worker" or .template=="gate-reviewer") and (.state=="active" or .state=="creating"))] | length' 2>/dev/null \
+    || echo "0"
 }
 
 # _dolt_probe — populate DOLT_PID + DOLT_LATENCY_MS once. Honors the test seams.
@@ -8748,6 +8811,18 @@ TASK
         # scale_check counts it as pool demand (capped at max_active_sessions=4).
         bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --set-metadata "gc.routed_to=wa-worker" -q 2>/dev/null || true
         if [ "${PILOT_SPAWN_WA_WORKER:-1}" = "1" ]; then
+          # ── ga-jezvn: GLOBAL variable-session cap — checked BEFORE the
+          # per-pool cap below. See the GC_VARIABLE_SESSION_MAX header (top of
+          # file) for why this releases the claim instead of falling through
+          # to the supervisor hand-off the per-pool cap uses.
+          _gc_variable_count=$(gc_variable_session_count)
+          if [ "${_gc_variable_count:-0}" -ge "$GC_VARIABLE_SESSION_MAX" ] 2>/dev/null; then
+            log "  ga-jezvn: GLOBAL variable-session cap hit ($_gc_variable_count/$GC_VARIABLE_SESSION_MAX: wa-worker+ps-worker+gate-reviewer combined) — QUEUED for $STORY_ID (claim released, story:approved retained; this script's own next sweep re-checks fresh)."
+            bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+            bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+            DISPATCH_RESULT="rig_native_global_session_cap_queued"
+            return 1
+          fi
           # ── ga-v3o6i: max-cap guard — count live sessions before spawning ──────
           # Each sweep dispatches a bead then spawns a session. Without a cap check,
           # rapid re-sweeps (or slow session startup) spawn N sessions for M beads
@@ -8802,6 +8877,16 @@ TASK
         # scale_check counts it as pool demand (capped at max_active_sessions=2).
         bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --set-metadata "gc.routed_to=ps-worker" -q 2>/dev/null || true
         if [ "${PILOT_SPAWN_PS_WORKER:-1}" = "1" ]; then
+          # ── ga-jezvn: GLOBAL variable-session cap — mirrors the wa-worker
+          # branch above; see the GC_VARIABLE_SESSION_MAX header (top of file).
+          _gc_variable_count=$(gc_variable_session_count)
+          if [ "${_gc_variable_count:-0}" -ge "$GC_VARIABLE_SESSION_MAX" ] 2>/dev/null; then
+            log "  ga-jezvn: GLOBAL variable-session cap hit ($_gc_variable_count/$GC_VARIABLE_SESSION_MAX: wa-worker+ps-worker+gate-reviewer combined) — QUEUED for $STORY_ID (claim released, story:approved retained; this script's own next sweep re-checks fresh)."
+            bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+            bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+            DISPATCH_RESULT="rig_native_global_session_cap_queued"
+            return 1
+          fi
           if [ -n "${PILOT_TEST_PS_WORKER_LIVE_COUNT:-}" ]; then
             _live_ps_count="$PILOT_TEST_PS_WORKER_LIVE_COUNT"
           else
