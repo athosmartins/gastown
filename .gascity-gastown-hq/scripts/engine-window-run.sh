@@ -24,11 +24,23 @@
 set -uo pipefail
 
 SRC=/Users/athos/gt/.local-patches/_src-hookfix
-BRANCH=consolidated/engine-window-20260829
-WORKTREE=/Users/athos/gt/.gc-worktrees/engine-window-0829
+
+# A JANELA E PARAMETRIZAVEL DE PROPOSITO (Mayor, 05/09). Antes estes quatro
+# valores eram fixos e apontavam para a janela de 29/08. Em 05/09 eu fui rodar
+# a janela e o check passou: a branch existia, a base continha o commit do
+# binario vivo, o preflight rodou. Nada acusou nada — mas buildar aquilo teria
+# reconstruido o que JA estava no ar, sem NENHUM dos 9 patches pendentes, e o
+# unico sinal disso era o "20260829" no meio do script, que ninguem le.
+# Script que precisa ser EDITADO a cada uso envelhece calado; com override por
+# env, a janela nova e um argumento, nao um commit.
+#   ENGINE_WINDOW=20260906 engine-window-run.sh build
+# O default aponta para a janela CORRENTE — atualize-o ao consolidar uma nova.
+ENGINE_WINDOW="${ENGINE_WINDOW:-20260906}"
+BRANCH="${ENGINE_WINDOW_BRANCH:-consolidated/engine-window-$ENGINE_WINDOW}"
+WORKTREE="${ENGINE_WINDOW_WORKTREE:-/Users/athos/gt/.gc-worktrees/engine-window-${ENGINE_WINDOW#2026}}"
 LIBEXEC="$HOME/.local/libexec"
-LABEL="gc-1.1.1-engwin0829"
-TAG="engwin-20260829"
+LABEL="${ENGINE_WINDOW_LABEL:-gc-1.1.1-engwin${ENGINE_WINDOW#2026}}"
+TAG="${ENGINE_WINDOW_TAG:-engwin-$ENGINE_WINDOW}"
 SYMLINK=/opt/homebrew/bin/gc
 PREV_FILE="$HOME/.gastown/run/engine-window-prev-target"
 LOG=/Users/athos/gt/.gascity-gastown-hq/.gc/logs/engine-window-run.log
