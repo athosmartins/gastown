@@ -1,0 +1,1587 @@
+diff --git a/cmd/gc/cmd_events.go b/cmd/gc/cmd_events.go
+index 4e96e19db..a7f3d4533 100644
+--- a/cmd/gc/cmd_events.go
++++ b/cmd/gc/cmd_events.go
+@@ -10,6 +10,7 @@ import (
+ 	"net/http"
+ 	"net/url"
+ 	"path/filepath"
++	"sort"
+ 	"strconv"
+ 	"strings"
+ 	"time"
+@@ -950,44 +951,43 @@ func probeCityEventsReachable(ctx context.Context, client *genclient.ClientWithR
+ 	return eventsListError(resp.StatusCode(), resp.ApplicationproblemJSONDefault)
+ }
+ 
++// fetchCityEvents fetches the newest page of city events (up to 500). It
++// deliberately does NOT follow next_cursor: gc events means "recent
++// activity", and a full descending drain of a large city's event history
++// (100 MB+ logs) would blow the command timeout for no user benefit. The
++// API serves the page seq-DESC (newest first); gc events prints
++// chronologically, so the page is re-sorted ascending.
+ func fetchCityEvents(ctx context.Context, client *genclient.ClientWithResponses, cityName, typeFilter, sinceFlag string) ([]cliWireEvent, error) {
+ 	limit := int64(500)
+-	var all []cliWireEvent
+-	var cursor *string
+-
+-	for {
+-		params := &genclient.GetV0CityByCityNameEventsParams{
+-			Cursor: cursor,
+-			Limit:  &limit,
+-		}
+-		if strings.TrimSpace(typeFilter) != "" {
+-			params.Type = &typeFilter
+-		}
+-		if strings.TrimSpace(sinceFlag) != "" {
+-			params.Since = &sinceFlag
+-		}
+-		resp, err := client.GetV0CityByCityNameEventsWithResponse(ctx, cityName, params)
++	params := &genclient.GetV0CityByCityNameEventsParams{
++		Limit: &limit,
++	}
++	if strings.TrimSpace(typeFilter) != "" {
++		params.Type = &typeFilter
++	}
++	if strings.TrimSpace(sinceFlag) != "" {
++		params.Since = &sinceFlag
++	}
++	resp, err := client.GetV0CityByCityNameEventsWithResponse(ctx, cityName, params)
++	if err != nil {
++		return nil, &eventsAPITransportError{err: err}
++	}
++	if err := eventsListError(resp.StatusCode(), resp.ApplicationproblemJSONDefault); err != nil {
++		return nil, err
++	}
++	if resp.JSON200 == nil || resp.JSON200.Items == nil {
++		return nil, nil
++	}
++	all := make([]cliWireEvent, 0, len(*resp.JSON200.Items))
++	for _, item := range *resp.JSON200.Items {
++		wire, err := cityWireEventFromTyped(item)
+ 		if err != nil {
+-			return nil, &eventsAPITransportError{err: err}
+-		}
+-		if err := eventsListError(resp.StatusCode(), resp.ApplicationproblemJSONDefault); err != nil {
+-			return nil, err
+-		}
+-		if resp.JSON200 == nil || resp.JSON200.Items == nil {
+-			return all, nil
+-		}
+-		for _, item := range *resp.JSON200.Items {
+-			wire, err := cityWireEventFromTyped(item)
+-			if err != nil {
+-				return nil, fmt.Errorf("decoding city event list item: %w", err)
+-			}
+-			all = append(all, wire)
+-		}
+-		if resp.JSON200.NextCursor == nil || strings.TrimSpace(*resp.JSON200.NextCursor) == "" {
+-			return all, nil
++			return nil, fmt.Errorf("decoding city event list item: %w", err)
+ 		}
+-		cursor = resp.JSON200.NextCursor
++		all = append(all, wire)
+ 	}
++	sort.Slice(all, func(i, j int) bool { return all[i].Seq < all[j].Seq })
++	return all, nil
+ }
+ 
+ func fetchCityHeadIndex(ctx context.Context, client *genclient.ClientWithResponses, cityName string) (string, error) {
+diff --git a/cmd/gc/cmd_events_test.go b/cmd/gc/cmd_events_test.go
+index 14ec5b4f5..d1196545e 100644
+--- a/cmd/gc/cmd_events_test.go
++++ b/cmd/gc/cmd_events_test.go
+@@ -1332,3 +1332,48 @@ func newTestProvider(t *testing.T, dir string) *events.FileRecorder {
+ 	t.Cleanup(func() { _ = rec.Close() })
+ 	return rec
+ }
++
++// TestFetchCityEventsSinglePageChronological pins the S3 keyset contract on
++// the CLI: the server serves seq-DESC pages (newest first) with v1 sq
++// cursors; gc events fetches ONE page (recent activity, pre-S3 parity — a
++// full drain of a 100MB+ event history would blow the command timeout) and
++// prints it chronologically (ascending seq), never following next_cursor.
++func TestFetchCityEventsSinglePageChronological(t *testing.T) {
++	page1 := []cliWireEvent{
++		{Actor: "gc", Seq: 6, Type: "e.t", Ts: time.Unix(1700000060, 0).UTC()},
++		{Actor: "gc", Seq: 5, Type: "e.t", Ts: time.Unix(1700000050, 0).UTC()},
++		{Actor: "gc", Seq: 4, Type: "e.t", Ts: time.Unix(1700000040, 0).UTC()},
++	}
++	server := newEventsTestServer(t, testEventRoutes{
++		cityEvents: func(w http.ResponseWriter, r *http.Request) {
++			if c := r.URL.Query().Get("cursor"); c != "" {
++				t.Errorf("gc events must not follow cursors, requested cursor %q", c)
++				w.WriteHeader(http.StatusBadRequest)
++				return
++			}
++			w.Header().Set("X-GC-Index", "6")
++			body := cityEventsListResponse(t, page1)
++			next := "v1:eyJrIjoic3EiLCJzIjo0fQ"
++			body.NextCursor = &next
++			writeJSONResponse(t, w, body)
++		},
++	})
++	defer server.Close()
++
++	client, err := genclient.NewClientWithResponses(server.URL)
++	if err != nil {
++		t.Fatalf("client: %v", err)
++	}
++	got, err := fetchCityEvents(context.Background(), client, "mc-city", "", "")
++	if err != nil {
++		t.Fatalf("fetchCityEvents: %v", err)
++	}
++	if len(got) != 3 {
++		t.Fatalf("got %d events, want 3 (one page, cursor not followed)", len(got))
++	}
++	for i, item := range got {
++		if item.Seq != int64(i+4) {
++			t.Fatalf("event[%d].Seq = %d, want %d (chronological ascending)", i, item.Seq, i+4)
++		}
++	}
++}
+diff --git a/internal/api/apierr/apierr.go b/internal/api/apierr/apierr.go
+new file mode 100644
+index 000000000..4b888e76c
+--- /dev/null
++++ b/internal/api/apierr/apierr.go
+@@ -0,0 +1,104 @@
++// Package apierr is the registry of machine-readable problem types for the Gas
++// City HTTP API. Every error the API can return has a stable code registered
++// here; the code is surfaced on the RFC 9457 problem+json body as the canonical
++// `type` URN (urn:gascity:error:<code>) plus a convenience `code` member, so an
++// autonomous consumer branches on a stable identifier instead of parsing the
++// human-readable detail prose.
++//
++// It mirrors the typed-events registry (internal/events.RegisterPayload): a
++// central catalog plus a CI guard that fails the build if the API emits a URN
++// that is not registered. Registration happens at package-init time via the
++// catalog vars, so Registered() is complete before any route is served.
++package apierr
++
++import (
++	"fmt"
++	"regexp"
++	"sort"
++	"sync"
++)
++
++// URNPrefix is the namespace for every Gas City error type URN. The canonical
++// machine code is the segment that follows it: type == URNPrefix + code.
++const URNPrefix = "urn:gascity:error:"
++
++// codePattern constrains a machine code to lowercase kebab-case so URNs stay
++// stable, greppable, and safe as a wire identifier. A subsystem prefix
++// (e.g. "sling-") is encouraged where the code is specific to one surface.
++var codePattern = regexp.MustCompile(`^[a-z][a-z0-9]*(-[a-z0-9]+)*$`)
++
++// ProblemType is a registered error kind: a stable machine code, the default
++// HTTP status it maps to, a short static Title (RFC 9457), and an optional Doc
++// URI for human documentation.
++type ProblemType struct {
++	Code   string
++	Status int
++	Title  string
++	Doc    string
++}
++
++// URN returns the canonical type URN for this problem, urn:gascity:error:<code>.
++func (pt ProblemType) URN() string { return URNPrefix + pt.Code }
++
++var (
++	mu       sync.RWMutex
++	byCode   = map[string]ProblemType{}
++	registry []ProblemType
++)
++
++// Register records a problem type and returns it, so a catalog entry can be a
++// package-level var: `var BeadNotFound = apierr.Register(...)`. It panics on a
++// malformed code, a missing status/title, or a conflicting duplicate (a
++// programming error surfaced at init). Re-registering an identical entry is a
++// no-op, which keeps catalog reloads and test re-imports safe.
++func Register(pt ProblemType) ProblemType {
++	if !codePattern.MatchString(pt.Code) {
++		panic(fmt.Sprintf("apierr: invalid code %q (want lowercase kebab-case)", pt.Code))
++	}
++	if pt.Status < 400 || pt.Status > 599 {
++		panic(fmt.Sprintf("apierr: code %q has non-4xx/5xx status %d", pt.Code, pt.Status))
++	}
++	if pt.Title == "" {
++		panic(fmt.Sprintf("apierr: code %q has empty Title", pt.Code))
++	}
++	mu.Lock()
++	defer mu.Unlock()
++	if existing, ok := byCode[pt.Code]; ok {
++		if existing != pt {
++			panic(fmt.Sprintf("apierr: conflicting re-register of code %q: %+v vs %+v", pt.Code, existing, pt))
++		}
++		return pt
++	}
++	byCode[pt.Code] = pt
++	registry = append(registry, pt)
++	return pt
++}
++
++// Lookup returns the problem type for a bare machine code.
++func Lookup(code string) (ProblemType, bool) {
++	mu.RLock()
++	defer mu.RUnlock()
++	pt, ok := byCode[code]
++	return pt, ok
++}
++
++// LookupURN returns the problem type for a full type URN
++// (urn:gascity:error:<code>), or false if the string is not such a URN or the
++// code is unregistered.
++func LookupURN(urn string) (ProblemType, bool) {
++	if len(urn) <= len(URNPrefix) || urn[:len(URNPrefix)] != URNPrefix {
++		return ProblemType{}, false
++	}
++	return Lookup(urn[len(URNPrefix):])
++}
++
++// Registered returns every registered problem type, sorted by code so callers
++// (and the generated spec) get deterministic output.
++func Registered() []ProblemType {
++	mu.RLock()
++	out := make([]ProblemType, len(registry))
++	copy(out, registry)
++	mu.RUnlock()
++	sort.Slice(out, func(i, j int) bool { return out[i].Code < out[j].Code })
++	return out
++}
+diff --git a/internal/api/apierr/apierr_test.go b/internal/api/apierr/apierr_test.go
+new file mode 100644
+index 000000000..e00e6f727
+--- /dev/null
++++ b/internal/api/apierr/apierr_test.go
+@@ -0,0 +1,164 @@
++package apierr
++
++import (
++	"encoding/json"
++	"net/http"
++	"testing"
++
++	"github.com/danielgtaylor/huma/v2"
++)
++
++// ErrorModel must satisfy huma.StatusError so it can be returned from handlers
++// and thrown by the huma.NewError override.
++var _ huma.StatusError = (*ErrorModel)(nil)
++
++func TestRegister_RejectsMalformedCode(t *testing.T) {
++	for _, bad := range []string{"", "Bad", "has_underscore", "-leading", "trailing-", "double--dash", "UPPER"} {
++		t.Run(bad, func(t *testing.T) {
++			defer func() {
++				if recover() == nil {
++					t.Fatalf("Register(%q) should panic on malformed code", bad)
++				}
++			}()
++			Register(ProblemType{Code: bad, Status: 400, Title: "x"})
++		})
++	}
++}
++
++func TestRegister_RejectsBadStatusOrTitle(t *testing.T) {
++	cases := []ProblemType{
++		{Code: "code-a", Status: 200, Title: "ok"}, // non-4xx/5xx
++		{Code: "code-b", Status: 400, Title: ""},   // empty title
++	}
++	for _, pt := range cases {
++		func() {
++			defer func() {
++				if recover() == nil {
++					t.Fatalf("Register(%+v) should panic", pt)
++				}
++			}()
++			Register(pt)
++		}()
++	}
++}
++
++func TestRegister_IdempotentVsConflict(t *testing.T) {
++	pt := ProblemType{Code: "dup-test-code", Status: 409, Title: "Dup"}
++	Register(pt)
++	Register(pt) // identical re-register: no-op, must not panic
++
++	defer func() {
++		if recover() == nil {
++			t.Fatal("conflicting re-register must panic")
++		}
++	}()
++	Register(ProblemType{Code: "dup-test-code", Status: 400, Title: "Different"})
++}
++
++func TestLookupAndURN(t *testing.T) {
++	pt, ok := Lookup("bead-not-found")
++	if !ok || pt.Status != http.StatusNotFound {
++		t.Fatalf("Lookup(bead-not-found) = %+v,%v", pt, ok)
++	}
++	if pt.URN() != "urn:gascity:error:bead-not-found" {
++		t.Fatalf("URN = %q", pt.URN())
++	}
++	got, ok := LookupURN("urn:gascity:error:bead-not-found")
++	if !ok || got != pt {
++		t.Fatalf("LookupURN = %+v,%v", got, ok)
++	}
++	if _, ok := LookupURN("urn:gascity:error:nope"); ok {
++		t.Fatal("LookupURN of unregistered code should be false")
++	}
++	if _, ok := LookupURN("bead-not-found"); ok {
++		t.Fatal("LookupURN of a bare code (no prefix) should be false")
++	}
++}
++
++// The three original sling URNs must stay byte-identical — they are already
++// public in the OpenAPI spec via x-gascity-problem-types.
++func TestFrozenSlingURNs(t *testing.T) {
++	for _, want := range []string{
++		"urn:gascity:error:sling-missing-bead",
++		"urn:gascity:error:sling-cross-rig",
++		"urn:gascity:error:sling-cross-store-route",
++	} {
++		if _, ok := LookupURN(want); !ok {
++			t.Fatalf("frozen URN %q missing from the registry", want)
++		}
++	}
++}
++
++func TestRegisteredIsSorted(t *testing.T) {
++	reg := Registered()
++	for i := 1; i < len(reg); i++ {
++		if reg[i-1].Code >= reg[i].Code {
++			t.Fatalf("Registered() not sorted by code at %d: %q >= %q", i, reg[i-1].Code, reg[i].Code)
++		}
++	}
++}
++
++func TestConstructorsStampTypeCodeStatusTitle(t *testing.T) {
++	e := BeadNotFound.Msg("bead bd-1 not found")
++	if e.Type != "urn:gascity:error:bead-not-found" || e.Code != "bead-not-found" {
++		t.Fatalf("Msg type/code = %q/%q", e.Type, e.Code)
++	}
++	if e.Status != http.StatusNotFound || e.Title != "Bead Not Found" || e.Detail != "bead bd-1 not found" {
++		t.Fatalf("Msg status/title/detail = %d/%q/%q", e.Status, e.Title, e.Detail)
++	}
++	if e.GetStatus() != http.StatusNotFound {
++		t.Fatalf("GetStatus = %d (StatusError not satisfied via embedding)", e.GetStatus())
++	}
++
++	if got := InvalidRequest.Msgf("field %q required", "name").Detail; got != `field "name" required` {
++		t.Fatalf("Msgf detail = %q", got)
++	}
++
++	withList := ConflictWrongState.With("conflict", &huma.ErrorDetail{Message: "d1"})
++	if len(withList.Errors) != 1 || withList.Errors[0].Message != "d1" {
++		t.Fatalf("With errors = %+v", withList.Errors)
++	}
++
++	ws := StoreUnavailable.WithStatus(http.StatusInternalServerError, "boom")
++	if ws.Status != http.StatusInternalServerError || ws.Code != "store-unavailable" {
++		t.Fatalf("WithStatus status/code = %d/%q", ws.Status, ws.Code)
++	}
++}
++
++// The wire shape must flatten the embedded huma.ErrorModel and add `code`.
++func TestErrorModelJSONShape(t *testing.T) {
++	b, err := json.Marshal(BeadNotFound.Msg("nope"))
++	if err != nil {
++		t.Fatalf("marshal: %v", err)
++	}
++	var m map[string]any
++	if err := json.Unmarshal(b, &m); err != nil {
++		t.Fatalf("unmarshal: %v", err)
++	}
++	for k, want := range map[string]any{
++		"type":   "urn:gascity:error:bead-not-found",
++		"code":   "bead-not-found",
++		"title":  "Bead Not Found",
++		"detail": "nope",
++		"status": float64(http.StatusNotFound),
++	} {
++		if m[k] != want {
++			t.Fatalf("json[%q] = %v (%T), want %v", k, m[k], m[k], want)
++		}
++	}
++	// code is omitempty: an empty-code model omits it (defends the wire compat
++	// claim for legacy paths that don't stamp a code).
++	b2, _ := json.Marshal(&ErrorModel{})
++	if json.Valid(b2) && contains(string(b2), `"code"`) {
++		t.Fatalf("empty ErrorModel must omit code, got %s", b2)
++	}
++}
++
++func contains(s, sub string) bool {
++	for i := 0; i+len(sub) <= len(s); i++ {
++		if s[i:i+len(sub)] == sub {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/internal/api/apierr/catalog.go b/internal/api/apierr/catalog.go
+new file mode 100644
+index 000000000..c31f7f372
+--- /dev/null
++++ b/internal/api/apierr/catalog.go
+@@ -0,0 +1,103 @@
++package apierr
++
++import "net/http"
++
++// The catalog: every machine-readable problem type the API emits, registered at
++// package init. Keep this the single reviewable taxonomy file. Codes are
++// generic by default (bead-not-found, not bead-N-not-found) and refined only
++// where a client must branch differently (two distinct 409 conflicts). Adding a
++// code is additive; removing or renaming one is a breaking change.
++//
++// The three sling-* URNs are frozen: they are already public in the OpenAPI spec
++// via x-gascity-problem-types and must stay byte-identical.
++var (
++	// Resource resolution. Codes are per-resource (city-not-found, not a generic
++	// not-found) so a client branches on which resource was missing; rig-not-found
++	// is shared across the domains that resolve a rig.
++	CityNotFound        = Register(ProblemType{Code: "city-not-found", Status: http.StatusNotFound, Title: "City Not Found"})
++	BeadNotFound        = Register(ProblemType{Code: "bead-not-found", Status: http.StatusNotFound, Title: "Bead Not Found"})
++	MailNotFound        = Register(ProblemType{Code: "mail-not-found", Status: http.StatusNotFound, Title: "Mail Message Not Found"})
++	RigNotFound         = Register(ProblemType{Code: "rig-not-found", Status: http.StatusNotFound, Title: "Rig Not Found"})
++	SessionNotFound     = Register(ProblemType{Code: "session-not-found", Status: http.StatusNotFound, Title: "Session Not Found"})
++	WaitNotFound        = Register(ProblemType{Code: "wait-not-found", Status: http.StatusNotFound, Title: "Wait Not Found"})
++	AgentNotFound       = Register(ProblemType{Code: "agent-not-found", Status: http.StatusNotFound, Title: "Agent Not Found"})
++	ProviderNotFound    = Register(ProblemType{Code: "provider-not-found", Status: http.StatusNotFound, Title: "Provider Not Found"})
++	ConvoyNotFound      = Register(ProblemType{Code: "convoy-not-found", Status: http.StatusNotFound, Title: "Convoy Not Found"})
++	WorkflowNotFound    = Register(ProblemType{Code: "workflow-not-found", Status: http.StatusNotFound, Title: "Workflow Not Found"})
++	RunNotFound         = Register(ProblemType{Code: "run-not-found", Status: http.StatusNotFound, Title: "Run Not Found"})
++	FormulaNotFound     = Register(ProblemType{Code: "formula-not-found", Status: http.StatusNotFound, Title: "Formula Not Found"})
++	OrderNotFound       = Register(ProblemType{Code: "order-not-found", Status: http.StatusNotFound, Title: "Order Not Found"})
++	ExtmsgGroupNotFound = Register(ProblemType{Code: "extmsg-group-not-found", Status: http.StatusNotFound, Title: "External-Message Group Not Found"})
++	// ScopeNotFound is a city-or-rig scope reference that does not resolve (the
++	// detail names which kind); it is distinct from the resource the scope was
++	// being resolved for (e.g. a formula).
++	ScopeNotFound   = Register(ProblemType{Code: "scope-not-found", Status: http.StatusNotFound, Title: "Scope Not Found"})
++	ServiceNotFound = Register(ProblemType{Code: "service-not-found", Status: http.StatusNotFound, Title: "Service Not Found"})
++	PatchNotFound   = Register(ProblemType{Code: "patch-not-found", Status: http.StatusNotFound, Title: "Patch Not Found"})
++	PackNotFound    = Register(ProblemType{Code: "pack-not-found", Status: http.StatusNotFound, Title: "Pack Not Found"})
++
++	// Request validation.
++	InvalidRequest   = Register(ProblemType{Code: "invalid-request", Status: http.StatusBadRequest, Title: "Invalid Request"})
++	ValidationFailed = Register(ProblemType{Code: "validation-failed", Status: http.StatusUnprocessableEntity, Title: "Validation Failed"})
++	// InvalidCursor is a pagination token the server cannot parse (garbage,
++	// a legacy offset cursor, or the wrong kind for the endpoint). Clients
++	// recover by re-fetching the first page.
++	InvalidCursor = Register(ProblemType{Code: "invalid-cursor", Status: http.StatusBadRequest, Title: "Invalid Cursor"})
++	// WebhookRejected is a well-formed webhook request the receiver declined to
++	// dispatch (unknown/unwired sink, policy) — distinct from validation-failed,
++	// which is huma's schema-validation auto-stamp.
++	WebhookRejected = Register(ProblemType{Code: "webhook-rejected", Status: http.StatusUnprocessableEntity, Title: "Webhook Rejected"})
++
++	// Concurrency / state conflicts. concurrent-delete/concurrent-modify are
++	// retryable lost-update races (the target changed under the write); wrong-state
++	// is a terminal precondition failure (the target is in a state the request
++	// cannot proceed from).
++	ConflictConcurrentDelete = Register(ProblemType{Code: "conflict-concurrent-delete", Status: http.StatusConflict, Title: "Concurrent Delete Conflict"})
++	ConflictConcurrentModify = Register(ProblemType{Code: "conflict-concurrent-modify", Status: http.StatusConflict, Title: "Concurrent Modify Conflict"})
++	ConflictWrongState       = Register(ProblemType{Code: "conflict-wrong-state", Status: http.StatusConflict, Title: "Wrong State Conflict"})
++	// SessionConflict is the one code for the session 409s. Many carry a
++	// differentiating detail prefix the CLI already branches on
++	// (ambiguous:/pending_interaction:/no_pending:/invalid_interaction:/
++	// illegal_transition:), mirroring sling-source-workflow-conflict; the rest
++	// share a generic "conflict:" (or no) prefix. A later slice may split the
++	// create-time name/alias-uniqueness conflicts into their own code, since a
++	// client cannot today distinguish "pick a different name" from "resume/stop
++	// first" by code or prefix.
++	SessionConflict = Register(ProblemType{Code: "session-conflict", Status: http.StatusConflict, Title: "Session State Conflict"})
++
++	// AmbiguousReference is a name/reference that matched more than one resource;
++	// the client should re-address with a scoped/qualified name, not retry or wait.
++	AmbiguousReference = Register(ProblemType{Code: "ambiguous-reference", Status: http.StatusConflict, Title: "Ambiguous Reference"})
++	// OperationInProgress is a transient 409 — another operation on the same target
++	// is running; the client may retry — distinct from a terminal "already exists"
++	// wrong-state conflict.
++	OperationInProgress = Register(ProblemType{Code: "operation-in-progress", Status: http.StatusConflict, Title: "Operation In Progress"})
++
++	// Authorization / capability.
++	Forbidden      = Register(ProblemType{Code: "forbidden", Status: http.StatusForbidden, Title: "Forbidden"})
++	NotImplemented = Register(ProblemType{Code: "not-implemented", Status: http.StatusNotImplemented, Title: "Not Implemented"})
++
++	// Idempotency (two-phase reserve/complete).
++	IdempotencyInFlight = Register(ProblemType{Code: "idempotency-in-flight", Status: http.StatusConflict, Title: "Idempotency Key In Flight"})
++	IdempotencyMismatch = Register(ProblemType{Code: "idempotency-mismatch", Status: http.StatusUnprocessableEntity, Title: "Idempotency Key Body Mismatch"})
++
++	// Backend availability. store-unavailable is the bead-store-not-live 503 emitted
++	// by the shared cacheLiveOr503 helper; service-unavailable is the generic 503
++	// that every other converted plain 503 uses — its title matches http.StatusText
++	// so the wire title is preserved.
++	StoreUnavailable   = Register(ProblemType{Code: "store-unavailable", Status: http.StatusServiceUnavailable, Title: "Store Unavailable"})
++	ServiceUnavailable = Register(ProblemType{Code: "service-unavailable", Status: http.StatusServiceUnavailable, Title: "Service Unavailable"})
++	Internal           = Register(ProblemType{Code: "internal", Status: http.StatusInternalServerError, Title: "Internal Server Error"})
++
++	// Generic transport statuses. Titles match http.StatusText so converting a
++	// plain error of these statuses preserves the wire title.
++	MethodNotAllowed = Register(ProblemType{Code: "method-not-allowed", Status: http.StatusMethodNotAllowed, Title: "Method Not Allowed"})
++	BadGateway       = Register(ProblemType{Code: "bad-gateway", Status: http.StatusBadGateway, Title: "Bad Gateway"})
++	GatewayTimeout   = Register(ProblemType{Code: "gateway-timeout", Status: http.StatusGatewayTimeout, Title: "Gateway Timeout"})
++
++	// Sling. The first three are frozen (already public in the spec).
++	SlingMissingBead            = Register(ProblemType{Code: "sling-missing-bead", Status: http.StatusBadRequest, Title: "Sling Missing Bead"})
++	SlingCrossRig               = Register(ProblemType{Code: "sling-cross-rig", Status: http.StatusBadRequest, Title: "Sling Cross-Rig"})
++	SlingCrossStoreRoute        = Register(ProblemType{Code: "sling-cross-store-route", Status: http.StatusBadRequest, Title: "Sling Cross-Store Route"})
++	SlingSourceWorkflowConflict = Register(ProblemType{Code: "sling-source-workflow-conflict", Status: http.StatusConflict, Title: "Sling Source Workflow Conflict"})
++)
+diff --git a/internal/api/apierr/model.go b/internal/api/apierr/model.go
+new file mode 100644
+index 000000000..ba25d04b8
+--- /dev/null
++++ b/internal/api/apierr/model.go
+@@ -0,0 +1,59 @@
++package apierr
++
++import (
++	"fmt"
++
++	"github.com/danielgtaylor/huma/v2"
++)
++
++// ErrorModel is the Gas City problem+json body. It embeds huma.ErrorModel (so it
++// inherits the RFC 9457 shape — type/title/status/detail/instance/errors — plus
++// the StatusError behavior and the application/problem+json content type) and
++// adds a first-class machine-readable `code`. The Go type is named ErrorModel so
++// Huma's DefaultSchemaNamer keeps the OpenAPI schema name "ErrorModel"; `code` is
++// an additive, omitempty member, so the wire shape stays backward compatible.
++//
++// The canonical machine identifier is the `type` URN (urn:gascity:error:<code>);
++// `code` is a convenience projection of the URN's final segment for consumers
++// that switch on short slugs. The registry entry is the single source of truth.
++type ErrorModel struct {
++	huma.ErrorModel
++	Code string `json:"code,omitempty" doc:"Stable machine-readable error code (the final segment of the type URN)."`
++}
++
++// new builds an ErrorModel stamped with this problem type's URN, code, title, and
++// status, at the given occurrence-specific detail and status.
++func (pt ProblemType) new(status int, detail string, details []*huma.ErrorDetail) *ErrorModel {
++	return &ErrorModel{
++		ErrorModel: huma.ErrorModel{
++			Type:   pt.URN(),
++			Title:  pt.Title,
++			Status: status,
++			Detail: detail,
++			Errors: details,
++		},
++		Code: pt.Code,
++	}
++}
++
++// Msg builds an error of this problem type at its default status with a
++// human-readable detail. This is the primary constructor — the one way to mint a
++// gascity API error so the registered code/URN is always stamped.
++func (pt ProblemType) Msg(detail string) *ErrorModel { return pt.new(pt.Status, detail, nil) }
++
++// Msgf is Msg with a printf-style detail.
++func (pt ProblemType) Msgf(format string, a ...any) *ErrorModel {
++	return pt.new(pt.Status, fmt.Sprintf(format, a...), nil)
++}
++
++// With builds an error carrying an errors[] list of individual detail entries
++// (RFC 9457 "errors" member) in addition to the top-level detail.
++func (pt ProblemType) With(detail string, details ...*huma.ErrorDetail) *ErrorModel {
++	return pt.new(pt.Status, detail, details)
++}
++
++// WithStatus overrides the default status for the rare case where one problem
++// type maps to more than one status. The code/URN/title are unchanged.
++func (pt ProblemType) WithStatus(status int, detail string) *ErrorModel {
++	return pt.new(status, detail, nil)
++}
+diff --git a/internal/api/apierr/testenv_import_test.go b/internal/api/apierr/testenv_import_test.go
+new file mode 100644
+index 000000000..35a2b1b0a
+--- /dev/null
++++ b/internal/api/apierr/testenv_import_test.go
+@@ -0,0 +1,5 @@
++// Code generated by go run scripts/add-testenv-import.go; DO NOT EDIT.
++
++package apierr
++
++import _ "github.com/gastownhall/gascity/internal/testenv"
+diff --git a/internal/api/cursor_token.go b/internal/api/cursor_token.go
+new file mode 100644
+index 000000000..cf8dc940e
+--- /dev/null
++++ b/internal/api/cursor_token.go
+@@ -0,0 +1,87 @@
++package api
++
++import (
++	"encoding/base64"
++	"encoding/json"
++	"errors"
++	"strings"
++	"time"
++)
++
++// Keyset cursor tokens: versioned, opaque pagination cursors that encode the
++// sort-key boundary of the last row served instead of an integer offset.
++// Offsets skip or duplicate rows whenever a concurrent write shifts the
++// result set — a guarantee on a live work ledger — while a keyset boundary
++// stays stable: the next page is "rows strictly after this boundary in the
++// collection's total order" regardless of inserts above it.
++//
++// Wire format: "v1:" + base64url(JSON keysetCursor). The prefix versions the
++// token so a future format change (or yesterday's bare-offset cursors) is a
++// typed 400 invalid-cursor, never a silent misread.
++
++const cursorVersionPrefix = "v1:"
++
++// Cursor kinds. Each paginated collection accepts exactly one kind; a valid
++// token of the wrong kind is rejected by the handler as an invalid cursor.
++const (
++	// cursorKindCreatedID marks a (created_at, id) boundary — the total order
++	// of bead-backed collections (#3208).
++	cursorKindCreatedID = "cb"
++	// cursorKindSeq marks an event-log sequence boundary.
++	cursorKindSeq = "sq"
++)
++
++// keysetCursor is the decoded form of a v1 pagination token.
++type keysetCursor struct {
++	Kind      string    `json:"k"`
++	CreatedAt time.Time `json:"ca,omitzero"`
++	ID        string    `json:"id,omitempty"`
++	Seq       uint64    `json:"s,omitempty"`
++}
++
++var errInvalidCursor = errors.New("invalid pagination cursor")
++
++// encodeKeysetCursor serializes a boundary as an opaque v1 token.
++func encodeKeysetCursor(c keysetCursor) string {
++	data, err := json.Marshal(c)
++	if err != nil {
++		// keysetCursor contains only marshalable fields; unreachable.
++		return ""
++	}
++	return cursorVersionPrefix + base64.RawURLEncoding.EncodeToString(data)
++}
++
++// decodeKeysetCursor parses a v1 token, rejecting anything else — including
++// the legacy base64-offset cursors — with an error the handler maps to a 400
++// problem+json invalid-cursor response.
++func decodeKeysetCursor(token string) (keysetCursor, error) {
++	var zero keysetCursor
++	rest, ok := strings.CutPrefix(token, cursorVersionPrefix)
++	if !ok {
++		return zero, errInvalidCursor
++	}
++	data, err := base64.RawURLEncoding.DecodeString(rest)
++	if err != nil {
++		return zero, errInvalidCursor
++	}
++	var c keysetCursor
++	if err := json.Unmarshal(data, &c); err != nil {
++		return zero, errInvalidCursor
++	}
++	switch c.Kind {
++	case cursorKindCreatedID:
++		// A zero CreatedAt is a legal boundary: degraded rows (NULL or
++		// unparseable created_at from a drifted store) carry zero timestamps,
++		// sort to the created-DESC tail, and the server mints boundaries from
++		// them — the decoder must accept every token the server mints or a
++		// walk wedges in a 400 loop at the tail. Only the ID is required.
++		if c.ID == "" {
++			return zero, errInvalidCursor
++		}
++	case cursorKindSeq:
++		// Seq 0 is a legal boundary (before the first event).
++	default:
++		return zero, errInvalidCursor
++	}
++	return c, nil
++}
+diff --git a/internal/api/cursor_token_test.go b/internal/api/cursor_token_test.go
+new file mode 100644
+index 000000000..b4e4c1a6c
+--- /dev/null
++++ b/internal/api/cursor_token_test.go
+@@ -0,0 +1,86 @@
++package api
++
++import (
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestKeysetCursorRoundTrip(t *testing.T) {
++	ts := time.Date(2026, 7, 11, 12, 30, 45, 123456789, time.UTC)
++	in := keysetCursor{Kind: cursorKindCreatedID, CreatedAt: ts, ID: "gc-42"}
++	tok := encodeKeysetCursor(in)
++	if !strings.HasPrefix(tok, "v1:") {
++		t.Fatalf("token %q lacks the v1: version prefix", tok)
++	}
++	out, err := decodeKeysetCursor(tok)
++	if err != nil {
++		t.Fatalf("decode: %v", err)
++	}
++	if out.Kind != cursorKindCreatedID || out.ID != "gc-42" || !out.CreatedAt.Equal(ts) {
++		t.Fatalf("round trip = %+v, want %+v", out, in)
++	}
++}
++
++func TestKeysetCursorSeqRoundTrip(t *testing.T) {
++	in := keysetCursor{Kind: cursorKindSeq, Seq: 98765}
++	out, err := decodeKeysetCursor(encodeKeysetCursor(in))
++	if err != nil {
++		t.Fatalf("decode: %v", err)
++	}
++	if out.Kind != cursorKindSeq || out.Seq != 98765 {
++		t.Fatalf("round trip = %+v, want %+v", out, in)
++	}
++}
++
++func TestKeysetCursorRejectsGarbage(t *testing.T) {
++	for _, tc := range []struct {
++		name  string
++		token string
++	}{
++		{"empty", ""},
++		{"legacy offset cursor", "NTA"},          // base64("50") — the old format
++		{"no prefix", "eyJrIjoiY2IifQ"},          // valid b64 JSON, missing v1:
++		{"unknown version", "v9:eyJrIjoiY2IifQ"}, //
++		{"bad base64", "v1:!!!not-base64!!!"},    //
++		{"bad json", "v1:bm90LWpzb24"},           // base64("not-json")
++		{"unknown kind", "v1:eyJrIjoienoifQ"},    // {"k":"zz"}
++		{"cb missing id", "v1:eyJrIjoiY2IifQ"},   // {"k":"cb"} — no id
++		{"whitespace", "  "},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			if _, err := decodeKeysetCursor(tc.token); err == nil {
++				t.Fatalf("decodeKeysetCursor(%q) = nil error, want rejection", tc.token)
++			}
++		})
++	}
++}
++
++// TestKeysetCursorZeroCreatedAtRoundTrips pins the accept-what-you-mint
++// invariant: degraded rows (NULL/unparseable created_at from a drifted store)
++// carry zero timestamps, sort to the created-DESC tail, and the server mints
++// boundaries from them. The decoder must accept those tokens or a walk wedges
++// in a 400 loop at the tail.
++func TestKeysetCursorZeroCreatedAtRoundTrips(t *testing.T) {
++	tok := encodeKeysetCursor(keysetCursor{Kind: cursorKindCreatedID, ID: "gc-7"})
++	out, err := decodeKeysetCursor(tok)
++	if err != nil {
++		t.Fatalf("decode of a server-minted zero-CreatedAt token failed: %v", err)
++	}
++	if out.Kind != cursorKindCreatedID || out.ID != "gc-7" || !out.CreatedAt.IsZero() {
++		t.Fatalf("round trip = %+v, want zero-CreatedAt cb boundary for gc-7", out)
++	}
++}
++
++func TestKeysetCursorKindMismatchDetectable(t *testing.T) {
++	// A seq cursor decoded where a cb cursor is expected: the decode succeeds
++	// (it is a valid token) — the caller checks Kind. Pin that Kind survives.
++	tok := encodeKeysetCursor(keysetCursor{Kind: cursorKindSeq, Seq: 7})
++	out, err := decodeKeysetCursor(tok)
++	if err != nil {
++		t.Fatalf("decode: %v", err)
++	}
++	if out.Kind == cursorKindCreatedID {
++		t.Fatal("seq cursor decoded as cb kind")
++	}
++}
+diff --git a/internal/api/handler_events_keyset_helpers_test.go b/internal/api/handler_events_keyset_helpers_test.go
+new file mode 100644
+index 000000000..5455ba0b6
+--- /dev/null
++++ b/internal/api/handler_events_keyset_helpers_test.go
+@@ -0,0 +1,21 @@
++package api
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++)
++
++// getList is extracted from upstream's internal/api/handler_lists_keyset_test.go
++// (S2 of the keyset-cursor track: convoys/mail/sessions), which is not ported
++// here — out of scope for the S3 events-only fix (ga-punx6/ga-jfl96) and its
++// other cases (TestConvoyList*, TestMailList*, TestSessionList*) exercise
++// endpoints this cherry-pick does not touch. handler_events_keyset_test.go
++// (S3) uses only this one shared helper.
++func getList(t *testing.T, h http.Handler, url string) *httptest.ResponseRecorder {
++	t.Helper()
++	req := httptest.NewRequest("GET", url, nil)
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, req)
++	return rec
++}
+diff --git a/internal/api/handler_events_keyset_test.go b/internal/api/handler_events_keyset_test.go
+new file mode 100644
+index 000000000..2e7d862b4
+--- /dev/null
++++ b/internal/api/handler_events_keyset_test.go
+@@ -0,0 +1,389 @@
++package api
++
++import (
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/gastownhall/gascity/internal/events"
++)
++
++// S3 of the keyset-cursor track: the city event list speaks one order —
++// seq DESC (newest first) on BOTH the cursor-less and cursor paths — with
++// sq-kind keyset tokens. The old contract had a window flip: no cursor
++// returned the newest-N while any cursor walked oldest-first from the head,
++// so walking history coherently was impossible.
++
++func seedEvents(t *testing.T, state *fakeState, n int) {
++	t.Helper()
++	for i := 0; i < n; i++ {
++		state.eventProv.Record(events.Event{Type: "e.t", Actor: "a", Subject: fmt.Sprintf("s-%02d", i)})
++	}
++}
++
++func decodeEventList(t *testing.T, rec *httptest.ResponseRecorder) (items []WireEvent, total int, next string) {
++	t.Helper()
++	var body struct {
++		Items      []WireEvent `json:"items"`
++		Total      int         `json:"total"`
++		NextCursor string      `json:"next_cursor"`
++	}
++	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
++		t.Fatalf("decode: %v", err)
++	}
++	return body.Items, body.Total, body.NextCursor
++}
++
++// TestEventListSeqDescBothPaths pins the window-flip fix: page 1 (no cursor)
++// is the NEWEST events in seq DESC order, and following the cursor continues
++// DESC into strictly older events — one coherent order end to end.
++func TestEventListSeqDescBothPaths(t *testing.T) {
++	state := newFakeState(t)
++	h := newTestCityHandler(t, state)
++	seedEvents(t, state, 10)
++
++	rec := getList(t, h, cityURL(state, "/events?limit=4"))
++	items, _, next := decodeEventList(t, rec)
++	if len(items) != 4 {
++		t.Fatalf("page1 len = %d, want 4", len(items))
++	}
++	for i := 1; i < len(items); i++ {
++		if items[i].Seq >= items[i-1].Seq {
++			t.Fatalf("page1 not seq DESC: %d then %d", items[i-1].Seq, items[i].Seq)
++		}
++	}
++	if items[0].Seq != 10 {
++		t.Fatalf("page1 must start at the newest event (seq 10), got %d", items[0].Seq)
++	}
++	if !strings.HasPrefix(next, "v1:") {
++		t.Fatalf("truncated page1 must mint a v1 cursor, got %q", next)
++	}
++
++	rec2 := getList(t, h, cityURL(state, "/events?limit=4&cursor=")+next)
++	items2, _, _ := decodeEventList(t, rec2)
++	if len(items2) != 4 {
++		t.Fatalf("page2 len = %d, want 4", len(items2))
++	}
++	if items2[0].Seq != items[len(items)-1].Seq-1 {
++		t.Fatalf("page2 must continue strictly below the boundary: got seq %d after boundary %d",
++			items2[0].Seq, items[len(items)-1].Seq)
++	}
++	for i := 1; i < len(items2); i++ {
++		if items2[i].Seq >= items2[i-1].Seq {
++			t.Fatalf("page2 not seq DESC: %d then %d", items2[i-1].Seq, items2[i].Seq)
++		}
++	}
++}
++
++// TestEventListKeysetWalkNoSkipNoDup drives a full walk with concurrent
++// appends between pages: every pre-walk event is seen exactly once, and the
++// mid-walk appends (newer seqs, above the boundary) never shift the walk.
++func TestEventListKeysetWalkNoSkipNoDup(t *testing.T) {
++	state := newFakeState(t)
++	h := newTestCityHandler(t, state)
++	const n = 11
++	seedEvents(t, state, n)
++
++	seen := map[uint64]int{}
++	cursor := ""
++	pages := 0
++	for {
++		url := cityURL(state, "/events?limit=4")
++		if cursor != "" {
++			url += "&cursor=" + cursor
++		}
++		rec := getList(t, h, url)
++		if rec.Code != http.StatusOK {
++			t.Fatalf("page %d: status %d body %s", pages, rec.Code, rec.Body.String())
++		}
++		items, _, next := decodeEventList(t, rec)
++		for _, e := range items {
++			seen[e.Seq]++
++		}
++		if pages++; pages > 10 {
++			t.Fatal("walk did not terminate")
++		}
++		if next == "" {
++			break
++		}
++		cursor = next
++		// Concurrent append mid-walk: newer seq, sorts above the boundary.
++		state.eventProv.Record(events.Event{Type: "e.t", Actor: "a", Subject: "mid"})
++	}
++
++	for seq := uint64(1); seq <= n; seq++ {
++		if seen[seq] != 1 {
++			t.Errorf("pre-walk event seq %d seen %d times, want exactly 1", seq, seen[seq])
++		}
++	}
++	for seq, c := range seen {
++		if c > 1 {
++			t.Errorf("event seq %d duplicated (%d times)", seq, c)
++		}
++	}
++}
++
++func TestEventListInvalidCursorReturns400(t *testing.T) {
++	state := newFakeState(t)
++	h := newTestCityHandler(t, state)
++	for _, cursor := range []string{
++		"NTA", // legacy offset token
++		encodeKeysetCursor(keysetCursor{Kind: cursorKindCreatedID, ID: "x"}), // wrong kind (cb)
++		// Crafted sq token with seq 0: the server never mints it (seqs start
++		// at 1), and beforeSeq==0 means "first page" internally — accepting it
++		// would hand a cursor-following client the first page again, forever.
++		encodeKeysetCursor(keysetCursor{Kind: cursorKindSeq, Seq: 0}),
++	} {
++		rec := getList(t, h, cityURL(state, "/events?cursor=")+cursor)
++		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid-cursor") {
++			t.Fatalf("cursor %q: status = %d body = %s, want 400 invalid-cursor", cursor, rec.Code, rec.Body.String())
++		}
++	}
++}
++
++// TestEventListFilteredKeysetWalk: type/actor filters compose with the seq
++// boundary — the walk sees exactly the matching pre-walk events once each.
++func TestEventListFilteredKeysetWalk(t *testing.T) {
++	state := newFakeState(t)
++	h := newTestCityHandler(t, state)
++	for i := 0; i < 12; i++ {
++		typ := "keep.me"
++		if i%3 == 0 {
++			typ = "drop.me"
++		}
++		state.eventProv.Record(events.Event{Type: typ, Actor: "a"})
++	}
++
++	seen := map[uint64]int{}
++	cursor := ""
++	pages := 0
++	for {
++		url := cityURL(state, "/events?limit=3&type=keep.me")
++		if cursor != "" {
++			url += "&cursor=" + cursor
++		}
++		rec := getList(t, h, url)
++		items, _, next := decodeEventList(t, rec)
++		for _, e := range items {
++			if e.Type != "keep.me" {
++				t.Fatalf("filter leaked event type %q", e.Type)
++			}
++			seen[e.Seq]++
++		}
++		if pages++; pages > 10 {
++			t.Fatal("walk did not terminate")
++		}
++		if next == "" {
++			break
++		}
++		cursor = next
++	}
++	if len(seen) != 8 { // 12 events, every 3rd is drop.me -> 8 keep.me
++		t.Fatalf("walk saw %d matching events, want 8", len(seen))
++	}
++	for seq, c := range seen {
++		if c != 1 {
++			t.Errorf("seq %d seen %d times", seq, c)
++		}
++	}
++}
++
++// TestEventListLastPageOmitsCursor: exhausting the log ends the walk cleanly.
++func TestEventListLastPageOmitsCursor(t *testing.T) {
++	state := newFakeState(t)
++	h := newTestCityHandler(t, state)
++	seedEvents(t, state, 3)
++
++	rec := getList(t, h, cityURL(state, "/events?limit=10"))
++	items, _, next := decodeEventList(t, rec)
++	if len(items) != 3 || next != "" {
++		t.Fatalf("items=%d next=%q, want 3/empty", len(items), next)
++	}
++}
++
++// archiveBlindTailProvider simulates the production FileRecorder split:
++// ListTail is a backward scan of the active events.jsonl only (Seq >=
++// activeFloor here), while List reads full history (archives + active).
++type archiveBlindTailProvider struct {
++	*events.Fake
++	activeFloor uint64
++}
++
++func (p *archiveBlindTailProvider) ListTail(filter events.Filter, limit int) ([]events.Event, error) {
++	all, err := p.List(filter)
++	if err != nil {
++		return nil, err
++	}
++	var active []events.Event
++	for _, e := range all {
++		if e.Seq >= p.activeFloor {
++			active = append(active, e)
++		}
++	}
++	if limit > 0 && len(active) > limit {
++		active = active[len(active)-limit:]
++	}
++	return active, nil
++}
++
++// TestEventListWalkCrossesArchiveBoundary pins the red-team major: the
++// ListTail fast path reads only the active log, so its result may be trusted
++// only when it fills the whole limit+1 probe. A short active file (the
++// normal state right after any rotation) must fall through to the
++// archive-aware scan — otherwise the first page under-fills, mints no
++// cursor, and the entire archived history is silently unreachable.
++func TestEventListWalkCrossesArchiveBoundary(t *testing.T) {
++	state := newFakeState(t)
++	fake := events.NewFake()
++	state.eventProv = &archiveBlindTailProvider{Fake: fake, activeFloor: 13}
++	h := newTestCityHandler(t, state)
++	for i := 0; i < 15; i++ { // seqs 1..15; 1..12 "archived", 13..15 "active"
++		fake.Record(events.Event{Type: "e.t", Actor: "a"})
++	}
++
++	rec := getList(t, h, cityURL(state, "/events?limit=10"))
++	items, total, next := decodeEventList(t, rec)
++	if len(items) != 10 {
++		t.Fatalf("page1 len = %d, want 10 (must cross the active/archive boundary, not stop at 3 active rows)", len(items))
++	}
++	if items[0].Seq != 15 || items[9].Seq != 6 {
++		t.Fatalf("page1 range = [%d..%d], want [15..6]", items[0].Seq, items[9].Seq)
++	}
++	if total != 15 {
++		t.Fatalf("total = %d, want 15 (LatestSeq)", total)
++	}
++	if !strings.HasPrefix(next, "v1:") {
++		t.Fatalf("truncated page1 must mint a cursor, got %q", next)
++	}
++
++	// The rest of the walk drains the archived history exactly once.
++	seen := map[uint64]int{}
++	for _, e := range items {
++		seen[e.Seq]++
++	}
++	cursor := next
++	for pages := 0; cursor != ""; pages++ {
++		if pages > 5 {
++			t.Fatal("walk did not terminate")
++		}
++		rec := getList(t, h, cityURL(state, "/events?limit=10&cursor=")+cursor)
++		items, _, nxt := decodeEventList(t, rec)
++		for _, e := range items {
++			seen[e.Seq]++
++		}
++		cursor = nxt
++	}
++	for seq := uint64(1); seq <= 15; seq++ {
++		if seen[seq] != 1 {
++			t.Errorf("seq %d seen %d times, want exactly 1", seq, seen[seq])
++		}
++	}
++}
++
++// rotationBlindProvider models the production FileRecorder during a rotation's
++// asynchronous compression window. Three seq bands live on disk at once:
++// ListTail scans only the ACTIVE file (Seq >= activeFloor); plain List reads
++// canonical .gz archives + active but CANNOT see the in-flight .rotating-*
++// segment [rotatingLow, activeFloor) (that is exactly what ReadFiltered
++// misses); ListInFlight folds that segment back in (ReadFilteredWithInFlight).
++// A descending keyset walk that fell through to List would serve rows above the
++// segment, then jump below it, silently skipping the whole band — the fast path
++// can't see it either — so the handler must use the in-flight-aware read.
++type rotationBlindProvider struct {
++	*events.Fake
++	activeFloor uint64 // Seq >= activeFloor lives in the active file
++	rotatingLow uint64 // [rotatingLow, activeFloor) lives ONLY in the in-flight file
++}
++
++// List models ReadFiltered: canonical archives + active, MISSING the in-flight
++// rotating segment.
++func (p *rotationBlindProvider) List(filter events.Filter) ([]events.Event, error) {
++	all, err := p.Fake.List(filter)
++	if err != nil {
++		return nil, err
++	}
++	var visible []events.Event
++	for _, e := range all {
++		if e.Seq >= p.rotatingLow && e.Seq < p.activeFloor {
++			continue // stranded in the .rotating-* file ReadFiltered can't read
++		}
++		visible = append(visible, e)
++	}
++	return visible, nil
++}
++
++// ListInFlight models ReadFilteredWithInFlight: the complete history including
++// the in-flight rotating segment.
++func (p *rotationBlindProvider) ListInFlight(filter events.Filter) ([]events.Event, error) {
++	return p.Fake.List(filter)
++}
++
++// ListTail models the active-file-only backward scan.
++func (p *rotationBlindProvider) ListTail(filter events.Filter, limit int) ([]events.Event, error) {
++	all, err := p.Fake.List(filter)
++	if err != nil {
++		return nil, err
++	}
++	var active []events.Event
++	for _, e := range all {
++		if e.Seq >= p.activeFloor {
++			active = append(active, e)
++		}
++	}
++	if limit > 0 && len(active) > limit {
++		active = active[len(active)-limit:]
++	}
++	return active, nil
++}
++
++// TestEventListWalkCrossesInFlightRotation pins the in-flight rotation gap that
++// the archive-boundary test misses: during a rotation's compression window the
++// just-rotated segment lives ONLY in the .rotating-* file, which neither the
++// active-file tail fast path nor the plain archive-aware scan can see. A keyset
++// walk that fell through to the plain scan would jump straight from the active
++// band to the archived band, silently skipping the in-flight segment. The
++// handler must route the fallback through the in-flight-aware read so the walk
++// covers every seq exactly once.
++func TestEventListWalkCrossesInFlightRotation(t *testing.T) {
++	state := newFakeState(t)
++	fake := events.NewFake()
++	// seqs 1..15: 1..6 archived (.gz), 7..12 in-flight (.rotating-*), 13..15 active.
++	state.eventProv = &rotationBlindProvider{Fake: fake, activeFloor: 13, rotatingLow: 7}
++	h := newTestCityHandler(t, state)
++	for i := 0; i < 15; i++ {
++		fake.Record(events.Event{Type: "e.t", Actor: "a"})
++	}
++
++	seen := map[uint64]int{}
++	cursor := ""
++	for pages := 0; ; pages++ {
++		if pages > 5 {
++			t.Fatal("walk did not terminate")
++		}
++		url := cityURL(state, "/events?limit=10")
++		if cursor != "" {
++			url += "&cursor=" + cursor
++		}
++		rec := getList(t, h, url)
++		if rec.Code != http.StatusOK {
++			t.Fatalf("page %d: status %d body %s", pages, rec.Code, rec.Body.String())
++		}
++		items, _, next := decodeEventList(t, rec)
++		for _, e := range items {
++			seen[e.Seq]++
++		}
++		if next == "" {
++			break
++		}
++		cursor = next
++	}
++
++	for seq := uint64(1); seq <= 15; seq++ {
++		if seen[seq] != 1 {
++			t.Errorf("seq %d seen %d times, want exactly 1 (in-flight rotation band 7..12 must not be skipped)", seq, seen[seq])
++		}
++	}
++}
+diff --git a/internal/api/huma_handlers_events.go b/internal/api/huma_handlers_events.go
+index 8e2311138..03b093566 100644
+--- a/internal/api/huma_handlers_events.go
++++ b/internal/api/huma_handlers_events.go
+@@ -4,17 +4,21 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"log"
++	"math"
+ 	"strings"
+ 	"time"
+ 
+ 	"github.com/danielgtaylor/huma/v2"
+ 	"github.com/danielgtaylor/huma/v2/sse"
++	"github.com/gastownhall/gascity/internal/api/apierr"
+ 	"github.com/gastownhall/gascity/internal/events"
+ )
+ 
+ const eventRotateWaitTimeout = 30 * time.Second
+ 
+-// humaHandleEventList is the Huma-typed handler for GET /v0/events.
++// humaHandleEventList is the Huma-typed handler for
++// GET /v0/city/{cityName}/events (the supervisor /v0/events list is a
++// separate handler on SupervisorMux).
+ func (s *Server) humaHandleEventList(ctx context.Context, input *EventListInput) (*ListOutput[WireEvent], error) {
+ 	bp := input.toBlockingParams()
+ 	if bp.isBlocking() {
+@@ -39,9 +43,6 @@ func (s *Server) humaHandleEventList(ctx context.Context, input *EventListInput)
+ 		filter.Since = time.Now().Add(-d)
+ 	}
+ 
+-	// Resolve the effective limit first so we can decide between the
+-	// bounded tail path (fast) and the full-scan pagination path (slow
+-	// but needed when the caller walks offsets with cursors).
+ 	limit := 100
+ 	if input.Limit > 0 {
+ 		limit = input.Limit
+@@ -50,90 +51,149 @@ func (s *Server) humaHandleEventList(ctx context.Context, input *EventListInput)
+ 		limit = maxPaginationLimit
+ 	}
+ 
++	// One order, both paths: seq DESC (newest first). The cursor is a v1
++	// sq-kind keyset token carrying the seq of the last row served; the next
++	// page is the events strictly below that boundary. The old contract had a
++	// window flip — no cursor returned the newest-N while any cursor walked
++	// oldest-first from the head — which made walking history coherently
++	// impossible. Anything other than a valid sq token is a typed 400.
++	beforeSeq, err := parseEventBeforeSeq(input.Cursor)
++	if err != nil {
++		return nil, err
++	}
++
+ 	index := s.latestIndex()
+ 
+-	// Fast path: no cursor and no Since bound → most such clients just
+-	// want the N newest (matching) events, e.g. `gc events`, `gc events
+-	// --seq`, or `gc events --type=X --limit=N`. Use ListTail when the
+-	// provider supports it so we don't parse the entire events.jsonl
+-	// (which is O(file size), ~4s on 100 MB) just to throw away all but
+-	// the tail. Same pattern as the supervisor handler's optimizedTail
+-	// branch.
+-	//
+-	// Since must gate this separately from Type/Actor: ListTail returns
+-	// the trailing N *matching* events with no notion of "there were
+-	// more before the window I was asked to cover", and this branch
+-	// never sets NextCursor — so a `--since` request wider than N events
+-	// was silently truncated to its most recent slice, with no
+-	// truncation signal and no way to page further back (ga-jl8rz). A
+-	// bare Type/Actor filter has no such window to violate: "the last N
+-	// session events" is exactly what ListTail promises, so that case
+-	// keeps the fast path (see TestEventListLimitWithTypeFilterReturnsTail).
+-	if input.Cursor == "" && filter.Since.IsZero() {
+-		if tp, ok := ep.(events.TailProvider); ok {
+-			evts, err := tp.ListTail(filter, limit)
+-			if err != nil {
+-				return nil, huma.Error500InternalServerError(err.Error())
+-			}
+-			wires := toWireEvents(evts)
+-			// Total is best-effort here: when the caller narrowed with
+-			// Type/Actor we cannot cheaply compute the full match
+-			// count, so report the returned slice length. When the
+-			// filter is empty, LatestSeq is authoritative since the log
+-			// is append-only and gap-free.
+-			total := len(wires)
+-			if filterIsEmpty(filter) {
+-				if seq, seqErr := ep.LatestSeq(); seqErr == nil {
+-					total = int(seq)
+-				}
+-			}
+-			return &ListOutput[WireEvent]{
+-				Index: index,
+-				Body:  ListBody[WireEvent]{Items: wires, Total: total},
+-			}, nil
++	// Fetch limit+1 matching events at (first page) or strictly below (cursor
++	// page) the boundary, ascending; the extra row is the has-more signal.
++	scanFilter := filter
++	scanFilter.BeforeSeq = beforeSeq
++	evts, scanned, err := fetchEventPageAscending(ep, scanFilter, limit)
++	if err != nil {
++		return nil, huma.Error500InternalServerError(err.Error())
++	}
++
++	// evts is ascending; the overfetched row (the oldest) signals more below.
++	hasMore := false
++	if len(evts) > limit {
++		hasMore = true
++		evts = evts[len(evts)-limit:]
++	}
++
++	// Reverse into seq DESC while projecting to the wire shape.
++	wires := make([]WireEvent, 0, len(evts))
++	for i := len(evts) - 1; i >= 0; i-- {
++		w, ok := toWireEvent(evts[i])
++		if !ok {
++			continue
+ 		}
++		wires = append(wires, w)
+ 	}
+ 
+-	// Cursor pagination — provider without TailProvider, or a Since
+-	// bound took this out of the fast path above. Materialize matches
+-	// up to one past this page so paginate() can tell "exactly `limit`
+-	// matches" apart from "more than `limit`, walked off the end of
+-	// this scan": ep.List stops as soon as filter.Limit matches are
+-	// found, so without the +1 probe, a full page always looks
+-	// indistinguishable from the last page and NextCursor never fires
+-	// (ga-jl8rz). This runs for the FIRST page too (offset 0), not just
+-	// once the caller already holds a cursor — otherwise pagination
+-	// could never start from a bare `--since` query.
+-	offset := decodeCursor(input.Cursor)
+-	filter.Limit = offset + limit + 1
+-
+-	evts, err := ep.List(filter)
+-	if err != nil {
+-		return nil, huma.Error500InternalServerError(err.Error())
++	// Total: authoritative for unfiltered reads (the log is append-only and
++	// gap-free, so LatestSeq counts every event and stays constant across a
++	// walk). Filtered reads report a best-effort count — the matching rows
++	// this request's scan could see.
++	total := scanned
++	if filterIsEmpty(filter) {
++		if seq, seqErr := ep.LatestSeq(); seqErr == nil {
++			// LatestSeq is a uint64 counter; bound it before the int narrowing so
++			// a value past the platform int range can't wrap to a negative or
++			// truncated total (CodeQL go/incorrect-integer-conversion).
++			if seq > uint64(math.MaxInt) {
++				total = math.MaxInt
++			} else {
++				total = int(seq)
++			}
++		}
+ 	}
+-	wires := toWireEvents(evts)
+ 
+-	pp := pageParams{Offset: offset, Limit: limit}
+-	page, total, nextCursor := paginate(wires, pp)
+-	if page == nil {
+-		page = []WireEvent{}
++	// Mint the boundary from the page's oldest fetched EVENT, not the last
++	// wire row: toWireEvent drops corrupt-payload rows (logged above), and a
++	// page whose whole window is corrupt would otherwise return no cursor and
++	// silently strand the rest of the walk. Anchoring on evts guarantees
++	// exactly `limit` seqs of progress per page regardless of projection
++	// failures — corrupt rows are skipped, never re-fetched, never wedge.
++	var nextCursor string
++	if hasMore {
++		nextCursor = encodeKeysetCursor(keysetCursor{
++			Kind: cursorKindSeq,
++			Seq:  evts[0].Seq,
++		})
+ 	}
+ 	return &ListOutput[WireEvent]{
+ 		Index: index,
+-		Body:  ListBody[WireEvent]{Items: page, Total: total, NextCursor: nextCursor},
++		Body:  ListBody[WireEvent]{Items: wires, Total: total, NextCursor: nextCursor},
+ 	}, nil
+ }
+ 
+-func toWireEvents(evts []events.Event) []WireEvent {
+-	wires := make([]WireEvent, 0, len(evts))
+-	for _, e := range evts {
+-		w, ok := toWireEvent(e)
+-		if !ok {
+-			continue
++// parseEventBeforeSeq decodes the pagination cursor into a keyset seq boundary.
++// An empty cursor is the first page (boundary 0 = "no boundary"). Anything that
++// is not a valid sq-kind token with a non-zero seq rejects with a typed 400:
++// legacy offset tokens, wrong-kind (cb) tokens, and a crafted s:0. Seq 0 is
++// never minted (seqs start at 1) and 0 means "first page" here, so echoing an
++// s:0 token back would serve a cursor-following client the first page forever.
++func parseEventBeforeSeq(cursor string) (uint64, error) {
++	if cursor == "" {
++		return 0, nil
++	}
++	c, err := decodeKeysetCursor(cursor)
++	if err != nil || c.Kind != cursorKindSeq || c.Seq == 0 {
++		return 0, apierr.InvalidCursor.Msg("cursor is not a valid pagination token; re-fetch the first page")
++	}
++	return c.Seq, nil
++}
++
++// fetchEventPageAscending fetches up to limit+1 matching events at or below the
++// filter's BeforeSeq boundary in ascending seq order; the extra row is the
++// has-more signal. It returns the fetched events and scanned — the best-effort
++// count of matching rows the read could see, used as the filtered Total.
++//
++// ListTail is the fast path: a backward scan of the ACTIVE events.jsonl only,
++// never the .gz archives, so its result is trusted ONLY when it yields a full
++// limit+1 rows. The active file holds the newest events, so a full tail page
++// there IS the newest page below the boundary. Anything short cannot
++// distinguish "log exhausted" from "active file exhausted, older matches in
++// archives/rotation" and MUST fall through to the full scan — otherwise a
++// rotation (or a selective filter) strands the older history behind an unminted
++// cursor. The scan uses the in-flight-aware read when the provider offers one
++// (listWithInFlight) so a just-rotated segment living only in a .rotating-* file
++// is not skipped; the BeforeSeq predicate keeps rotation/archive handling inside
++// the one battle-tested sequential reader instead of a bespoke reverse reader.
++func fetchEventPageAscending(ep events.Provider, filter events.Filter, limit int) ([]events.Event, int, error) {
++	fetch := limit + 1
++	if tp, ok := ep.(events.TailProvider); ok {
++		tail, err := tp.ListTail(filter, fetch)
++		if err != nil {
++			return nil, 0, err
+ 		}
+-		wires = append(wires, w)
++		if len(tail) == fetch {
++			return tail, limit, nil
++		}
++	}
++	all, err := listWithInFlight(ep, filter)
++	if err != nil {
++		return nil, 0, err
++	}
++	scanned := len(all)
++	if len(all) > fetch {
++		all = all[len(all)-fetch:]
++	}
++	return all, scanned, nil
++}
++
++// listWithInFlight returns all events matching filter, folding in events still
++// stranded in an in-flight rotation file when the provider is an
++// [events.InFlightProvider]. Plain List reads archives + the active file, so
++// during a rotation's compression window it misses the just-rotated .rotating-*
++// segment; the in-flight-aware read closes that gap so a descending keyset walk
++// cannot skip a whole seq range. Providers with no in-flight window fall back to
++// List unchanged.
++func listWithInFlight(ep events.Provider, filter events.Filter) ([]events.Event, error) {
++	if ip, ok := ep.(events.InFlightProvider); ok {
++		return ip.ListInFlight(filter)
+ 	}
+-	return wires
++	return ep.List(filter)
+ }
+ 
+ func filterIsEmpty(f events.Filter) bool {
+diff --git a/internal/events/events.go b/internal/events/events.go
+index 65078c709..86ad5fdba 100644
+--- a/internal/events/events.go
++++ b/internal/events/events.go
+@@ -243,6 +243,19 @@ type TailProvider interface {
+ 	ListTail(filter Filter, limit int) ([]Event, error)
+ }
+ 
++// InFlightProvider is an optional extension for providers whose plain List can
++// momentarily miss events stranded in an in-flight rotation file. When a
++// file-backed provider rotates, the just-rotated segment lives only in the
++// events.jsonl.rotating-* file until a background goroutine gzips it into the
++// canonical .gz archive; List reads archives + the active file, so during that
++// window it cannot see the segment. ListInFlight folds those events back in,
++// preserving seq order and de-duplicating by seq, so a keyset walk cannot skip
++// a whole seq range mid-rotation. Providers with no such window (in-memory
++// fakes, exec scripts) need not implement it.
++type InFlightProvider interface {
++	ListInFlight(filter Filter) ([]Event, error)
++}
++
+ // Watcher yields events one at a time. Created by [Provider.Watch].
+ // Callers must call Close() when done watching.
+ type Watcher interface {
+diff --git a/internal/events/reader.go b/internal/events/reader.go
+index 45df041e6..d3ede8be9 100644
+--- a/internal/events/reader.go
++++ b/internal/events/reader.go
+@@ -22,7 +22,12 @@ type Filter struct {
+ 	Since    time.Time // match events at or after this time
+ 	Until    time.Time // match events at or before this time
+ 	AfterSeq uint64    // match events with Seq > AfterSeq (0 = no filter)
+-	Limit    int       // cap results at this count (0 or negative = unlimited)
++	// BeforeSeq matches events with Seq < BeforeSeq (0 = no filter). The
++	// keyset page boundary for descending event walks: the log is
++	// append-only and seq-ordered, so "strictly before this seq" is a
++	// stable resume point regardless of concurrent appends.
++	BeforeSeq uint64
++	Limit     int // cap results at this count (0 or negative = unlimited)
+ }
+ 
+ // TypeMatches reports whether eventType satisfies filter, where filter is
+@@ -56,6 +61,9 @@ func matchesFilter(e Event, f Filter) bool {
+ 	if f.AfterSeq > 0 && e.Seq <= f.AfterSeq {
+ 		return false
+ 	}
++	if f.BeforeSeq > 0 && e.Seq >= f.BeforeSeq {
++		return false
++	}
+ 	if f.Type != "" && !TypeMatches(e.Type, f.Type) {
+ 		return false
+ 	}
+diff --git a/internal/events/reader_beforeseq_test.go b/internal/events/reader_beforeseq_test.go
+new file mode 100644
+index 000000000..05f277e60
+--- /dev/null
++++ b/internal/events/reader_beforeseq_test.go
+@@ -0,0 +1,22 @@
++package events
++
++import "testing"
++
++// TestFilterBeforeSeq pins the keyset page boundary for descending event
++// walks: BeforeSeq matches strictly-below rows, composes with AfterSeq, and
++// zero means no filter.
++func TestFilterBeforeSeq(t *testing.T) {
++	evts := []Event{{Seq: 1}, {Seq: 2}, {Seq: 3}, {Seq: 4}}
++
++	got := ApplyFilter(evts, Filter{BeforeSeq: 3})
++	if len(got) != 2 || got[0].Seq != 1 || got[1].Seq != 2 {
++		t.Fatalf("BeforeSeq=3 -> %v, want seqs [1 2]", got)
++	}
++	if got := ApplyFilter(evts, Filter{BeforeSeq: 0}); len(got) != 4 {
++		t.Fatalf("BeforeSeq=0 must be no-filter, got %d rows", len(got))
++	}
++	got = ApplyFilter(evts, Filter{AfterSeq: 1, BeforeSeq: 4})
++	if len(got) != 2 || got[0].Seq != 2 || got[1].Seq != 3 {
++		t.Fatalf("AfterSeq=1+BeforeSeq=4 -> %v, want seqs [2 3]", got)
++	}
++}
+diff --git a/internal/events/rotation_archive.go b/internal/events/rotation_archive.go
+index 7d4ea856a..73ca316de 100644
+--- a/internal/events/rotation_archive.go
++++ b/internal/events/rotation_archive.go
+@@ -126,11 +126,14 @@ func parseLegacyArchiveBasename(name string) (time.Time, error) {
+ // archiveOverlapsFilter reports whether the archive's seq range can
+ // possibly contain events that satisfy filter. The skip-fast read path
+ // uses this to avoid gunzipping archives whose entire window has
+-// already been excluded by the caller's AfterSeq or Since predicate.
++// already been excluded by the caller's AfterSeq, BeforeSeq, or Since predicate.
+ func archiveOverlapsFilter(info archiveInfo, filter Filter) bool {
+ 	if filter.AfterSeq > 0 && info.LastSeq <= filter.AfterSeq {
+ 		return false
+ 	}
++	if filter.BeforeSeq > 0 && info.FirstSeq >= filter.BeforeSeq {
++		return false
++	}
+ 	// Every event in an archive was appended to the live log before that
+ 	// log was rotated at true instant T, so event.Time <= T. But
+ 	// info.Timestamp is T truncated to whole seconds (archiveTimestampLayout
+diff --git a/internal/events/rotation_archive_test.go b/internal/events/rotation_archive_test.go
+index 9adb1d389..7f5bf8c1c 100644
+--- a/internal/events/rotation_archive_test.go
++++ b/internal/events/rotation_archive_test.go
+@@ -121,6 +121,12 @@ func TestArchiveOverlapsFilter(t *testing.T) {
+ 		{"AfterSeq inside archive range", Filter{AfterSeq: 150}, true},
+ 		{"AfterSeq at archive last seq", Filter{AfterSeq: 200}, false},
+ 		{"AfterSeq above archive range", Filter{AfterSeq: 250}, false},
++		{"BeforeSeq above archive range", Filter{BeforeSeq: 250}, true},
++		{"BeforeSeq inside archive range", Filter{BeforeSeq: 150}, true},
++		{"BeforeSeq just above archive first seq", Filter{BeforeSeq: 101}, true},
++		{"BeforeSeq at archive first seq", Filter{BeforeSeq: 100}, false},
++		{"BeforeSeq below archive range", Filter{BeforeSeq: 50}, false},
++		{"AfterSeq and BeforeSeq window inside range", Filter{AfterSeq: 120, BeforeSeq: 180}, true},
+ 	}
+ 	for _, tc := range tests {
+ 		t.Run(tc.name, func(t *testing.T) {
