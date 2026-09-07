@@ -164,9 +164,13 @@ outer-repo work; the deployed tree agents actually run from is
       # only checks the CURRENT WORKING TREE (not the pushed SHA in
       # isolation) -- correct for the common case of pushing your own
       # checkout, same tradeoff every local pre-commit/pre-push codegen
-      # check makes. Fail OPEN if python3 itself is unavailable (environment
-      # problem, not a confirmed divergence) but fail CLOSED -- block the
-      # push -- on any actually-detected mismatch, matching this bead's
+      # check makes. Fails OPEN (silently skips the check, same as "not
+      # touched") if the `git diff` probe itself errors -- same documented
+      # tradeoff check_orphan_path above already makes, and for the same
+      # reason: a bug in a brand-new guard must not be able to block every
+      # push in the city -- or if python3 is unavailable (environment
+      # problem, not a confirmed divergence). Fails CLOSED -- blocks the
+      # push -- on any ACTUALLY-DETECTED mismatch, matching this bead's
       # "FAILS LOUDLY on divergence" acceptance criterion.
       park_labels_touch=$(git diff --name-only --diff-filter=ACM "$orphan_range" -- \
         '.gascity-gastown-hq/scripts/park_labels.json' \
