@@ -971,6 +971,79 @@ def should_fetch_branch_for_reclaim(has_live_session, has_needs_human,
     return would_cross_refusal_threshold or would_bypass_on_refusal_age
 
 
+def should_apply_provably_dead_fast_path(is_bare_pool_zombie, is_adhoc_pool_zombie,
+                                          has_suspended_owner, claimant_dead,
+                                          seconds_stranded, adhoc_min_secs=None):
+    """Whether run_cycle() should pass provably_dead=True into reclaim_decision()
+    this cycle. Extracted from run_cycle() (previously inline, ga-cz8p4) for the
+    same reason should_fetch_branch_for_reclaim() above was: run_cycle() itself
+    is never invoked by _selftest() (only its def and main() reference it), so a
+    bug in exactly this wiring can hide behind an all-green selftest suite
+    indefinitely — see that function's docstring for the precedent incident.
+
+    gt-fppb0 established the fast path for BARE pool-template zombies (assignee
+    IS the template string itself, e.g. 'gastown.dog' / 'wa-worker'): reclaim at
+    seconds_stranded~0 the instant the claimant is provably absent from `gc
+    session list`. Safe because a bare template assignee never changes identity
+    across re-dispatch, so "absent" can never be the wa-og36j born-stale race (a
+    FRESH concrete claim whose new session isn't visible yet).
+
+    ga-cz8p4: that race DOES threaten a concrete adhoc assignee
+    (wa-worker-adhoc-<hex>) in the first moments after dispatch, which is why
+    adhoc zombies were excluded from the fast path entirely pre-fix — falling
+    back to the full POOL_ZOMBIE_TTL (2h) hysteresis even once provably dead
+    (AZ-3 asserts that as the then-current, deliberately-tested behavior; it
+    still passes unchanged — this function does not touch the bare-zombie
+    floor of 0, it only adds a floor for the adhoc case). Measured live
+    (wa-tqiis, wa-gasx1): two adhoc claims sat provably-dead — assignee's
+    session entirely absent from `gc session list`, branch 3h-stale — for
+    ~2h before a human manually reclaimed them, minutes ahead of where the
+    guard would have fired on its own (started-stranded-clock timestamps put
+    the natural POOL_ZOMBIE_TTL deadline within single-digit minutes of the
+    manual reclaim). The propagation-lag race this exclusion protects
+    against resolves in seconds to low minutes, not two hours, so once an
+    adhoc claim has been CONTINUOUSLY, provably stranded for at least
+    RECLAIM_TTL (25min — already an order of magnitude past the race window,
+    and the same duration a non-pool bead waits out as its FULL hysteresis),
+    the remaining ~1h35m wait adds no protection. The fast path now applies
+    to the adhoc case too, floored at RECLAIM_TTL instead of 0.
+
+    Args:
+        is_bare_pool_zombie:   assignee IS an EPHEMERAL_POOL_ASSIGNEES template
+                               (e.g. 'wa-worker', 'gastown.dog').
+        is_adhoc_pool_zombie:  assignee is a concrete per-dispatch form of a
+                               pool template (e.g. 'wa-worker-adhoc-<hex>',
+                               'dog-<suffix>') — mutually exclusive with
+                               is_bare_pool_zombie by construction upstream.
+        has_suspended_owner:   a deliberately-suspended owner HOLDs
+                               unconditionally (mirrors reclaim_decision's own
+                               top-tier guard) — never eligible for the fast
+                               path regardless of claimant_dead or
+                               seconds_stranded.
+        claimant_dead:         claimant_provably_dead(assignee, sessions) for
+                               THIS bead's assignee, computed by the caller —
+                               kept out of this function so it stays pure/
+                               I/O-free, same pattern as every other helper
+                               here.
+        seconds_stranded:      this bead's current strand-clock reading
+                               (update_strand_clock's return value).
+        adhoc_min_secs:        floor for the adhoc case; defaults to
+                               RECLAIM_TTL. Exposed for tests only — no
+                               production caller overrides it.
+
+    Returns:
+        bool — pass straight through as reclaim_decision(provably_dead=...).
+    """
+    if has_suspended_owner or not claimant_dead:
+        return False
+    if is_bare_pool_zombie:
+        return True
+    if is_adhoc_pool_zombie:
+        floor = RECLAIM_TTL if adhoc_min_secs is None else adhoc_min_secs
+        return seconds_stranded >= floor
+    return False
+
+
 def update_strand_clock(bead_state, is_currently_stranded, assignee, now):
     """Update a bead's per-cycle strand clock in bead_state; return
     (seconds_stranded, event).  Mutates only the passed bead_state dict — no
@@ -4184,21 +4257,23 @@ def run_cycle(state, escalated_alerted):
         # false reclaims on slow-starting builds.
         min_stranding_secs = POOL_ZOMBIE_TTL if is_pool_zombie_bead else RECLAIM_TTL
 
-        # gt-fppb0: grant the provably-dead fast-path (reclaim at TTL~0) ONLY to
-        # BARE pool-template zombies (assignee ∈ EPHEMERAL_POOL_ASSIGNEES, e.g.
-        # 'gastown.dog' / 'wa-worker'). Their assignee is a STABLE pool name that
-        # does not change on re-dispatch, so "claimant absent from gc session
-        # list" can never be the wa-og36j born-stale race (a fresh CONCRETE claim
-        # whose new session isn't visible yet) — that race only afflicts concrete
-        # per-dispatch assignees, which are excluded here and keep the full
-        # POOL_ZOMBIE_TTL wait. A deliberately-SUSPENDED owner is also excluded:
-        # its bead HOLDS for resume and must never be reclaimed even when its
-        # session is (expectedly) gone. All other reclaim guards live inside
-        # reclaim_decision and still veto the fast-path before it can fire.
-        provably_dead = (
-            is_bare_pool_zombie
-            and not has_suspended_owner
-            and claimant_provably_dead(assignee, sessions)
+        # gt-fppb0 / ga-cz8p4: grant the provably-dead fast-path to a BARE
+        # pool-template zombie at seconds_stranded~0, and to a concrete ADHOC
+        # pool zombie once it has been stranded at least RECLAIM_TTL — see
+        # should_apply_provably_dead_fast_path()'s docstring for the full
+        # incident/rationale (wa-tqiis, wa-gasx1 sat provably-dead ~2h before
+        # a human manually reclaimed them, minutes ahead of the guard's own
+        # POOL_ZOMBIE_TTL deadline). A deliberately-SUSPENDED owner is
+        # excluded unconditionally: its bead HOLDS for resume and must never
+        # be reclaimed even when its session is (expectedly) gone. All other
+        # reclaim guards live inside reclaim_decision and still veto the
+        # fast-path before it can fire.
+        provably_dead = should_apply_provably_dead_fast_path(
+            is_bare_pool_zombie=is_bare_pool_zombie,
+            is_adhoc_pool_zombie=is_adhoc_pool_zombie,
+            has_suspended_owner=has_suspended_owner,
+            claimant_dead=claimant_provably_dead(assignee, sessions),
+            seconds_stranded=seconds_stranded,
         )
 
         # --- Pure decision ---
@@ -5567,6 +5642,91 @@ def _selftest():
               seconds_stranded=0.0, reclaim_count=0,
               has_needs_human=False, has_dispatching_marker=False,
               min_stranding_secs=POOL_ZOMBIE_TTL) == "noop")
+
+    # -----------------------------------------------------------------------
+    # Section 9a: ga-cz8p4 — should_apply_provably_dead_fast_path() (PDFP-*).
+    # run_cycle() wiring that decides which assignee shapes get provably_dead
+    # fed into reclaim_decision() (Section 9 above tests what provably_dead
+    # itself DOES, not who is allowed to set it). Pure, no I/O — extracted
+    # from run_cycle() specifically so this wiring is unit-testable; see the
+    # function's own docstring for the wa-tqiis/wa-gasx1 incident.
+    # -----------------------------------------------------------------------
+    check("PDFP-1: bare zombie + claimant_dead + stranded=0 → True (gt-fppb0 floor-0 fast path unchanged)",
+          should_apply_provably_dead_fast_path(
+              is_bare_pool_zombie=True, is_adhoc_pool_zombie=False,
+              has_suspended_owner=False, claimant_dead=True,
+              seconds_stranded=0.0) is True)
+    check("PDFP-2: bare zombie + NOT claimant_dead → False (no proof of death, any duration)",
+          should_apply_provably_dead_fast_path(
+              is_bare_pool_zombie=True, is_adhoc_pool_zombie=False,
+              has_suspended_owner=False, claimant_dead=False,
+              seconds_stranded=POOL_ZOMBIE_TTL * 10) is False)
+    check("PDFP-3: adhoc zombie + claimant_dead + stranded just BELOW RECLAIM_TTL → False "
+          "(wa-og36j born-stale race still protected)",
+          should_apply_provably_dead_fast_path(
+              is_bare_pool_zombie=False, is_adhoc_pool_zombie=True,
+              has_suspended_owner=False, claimant_dead=True,
+              seconds_stranded=RECLAIM_TTL - 1) is False)
+    check("PDFP-4 (ga-cz8p4 regression — FAILS pre-fix): adhoc zombie + claimant_dead + "
+          "stranded >= RECLAIM_TTL → True (was stuck waiting the full POOL_ZOMBIE_TTL 2h)",
+          should_apply_provably_dead_fast_path(
+              is_bare_pool_zombie=False, is_adhoc_pool_zombie=True,
+              has_suspended_owner=False, claimant_dead=True,
+              seconds_stranded=RECLAIM_TTL) is True)
+    check("PDFP-5: adhoc zombie + claimant_dead + stranded=0 (fresh claim) → False "
+          "(the exact race this floor exists to protect)",
+          should_apply_provably_dead_fast_path(
+              is_bare_pool_zombie=False, is_adhoc_pool_zombie=True,
+              has_suspended_owner=False, claimant_dead=True,
+              seconds_stranded=0.0) is False)
+    check("PDFP-6: adhoc zombie + NOT claimant_dead, even stranded past POOL_ZOMBIE_TTL → False "
+          "(merely-quiet still relies on reclaim_decision's own hysteresis, not this fast path)",
+          should_apply_provably_dead_fast_path(
+              is_bare_pool_zombie=False, is_adhoc_pool_zombie=True,
+              has_suspended_owner=False, claimant_dead=False,
+              seconds_stranded=POOL_ZOMBIE_TTL + 1) is False)
+    check("PDFP-7: has_suspended_owner wins over bare+dead+long-stranded → False",
+          should_apply_provably_dead_fast_path(
+              is_bare_pool_zombie=True, is_adhoc_pool_zombie=False,
+              has_suspended_owner=True, claimant_dead=True,
+              seconds_stranded=POOL_ZOMBIE_TTL * 10) is False)
+    check("PDFP-8: has_suspended_owner wins over adhoc+dead+long-stranded → False",
+          should_apply_provably_dead_fast_path(
+              is_bare_pool_zombie=False, is_adhoc_pool_zombie=True,
+              has_suspended_owner=True, claimant_dead=True,
+              seconds_stranded=POOL_ZOMBIE_TTL * 10) is False)
+    check("PDFP-9: neither bare nor adhoc (named crew assignee) → False regardless of "
+          "claimant_dead/duration (scope stays pool-zombie-only)",
+          should_apply_provably_dead_fast_path(
+              is_bare_pool_zombie=False, is_adhoc_pool_zombie=False,
+              has_suspended_owner=False, claimant_dead=True,
+              seconds_stranded=POOL_ZOMBIE_TTL * 10) is False)
+    check("PDFP-10 (ga-cz8p4 full pipeline, mirrors AZ-3's style): adhoc zombie, claimant "
+          "provably dead, no recent branch, stranded==RECLAIM_TTL → reclaim_decision == "
+          "'reclaim' (bead's own acceptance test: assignee peek 'not found' + 3h-stale "
+          "branch + stranding>25min must reclaim, not wait out the full 2h)",
+          reclaim_decision(
+              has_live_session=False, has_recent_branch=False,
+              seconds_stranded=RECLAIM_TTL, reclaim_count=0,
+              has_needs_human=False, has_dispatching_marker=False,
+              min_stranding_secs=POOL_ZOMBIE_TTL,
+              provably_dead=should_apply_provably_dead_fast_path(
+                  is_bare_pool_zombie=False, is_adhoc_pool_zombie=True,
+                  has_suspended_owner=False, claimant_dead=True,
+                  seconds_stranded=RECLAIM_TTL),
+          ) == "reclaim")
+    check("PDFP-11: same adhoc-fast-path-eligible bead, but branch IS recent → noop "
+          "(branch rail still outranks the fast path, mirrors AZ-5)",
+          reclaim_decision(
+              has_live_session=False, has_recent_branch=True,
+              seconds_stranded=RECLAIM_TTL, reclaim_count=0,
+              has_needs_human=False, has_dispatching_marker=False,
+              min_stranding_secs=POOL_ZOMBIE_TTL,
+              provably_dead=should_apply_provably_dead_fast_path(
+                  is_bare_pool_zombie=False, is_adhoc_pool_zombie=True,
+                  has_suspended_owner=False, claimant_dead=True,
+                  seconds_stranded=RECLAIM_TTL),
+          ) == "noop")
 
     # -----------------------------------------------------------------------
     # Section 9b: ga-be4x — explicit refusal signal (RF-*).
