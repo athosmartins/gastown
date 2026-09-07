@@ -1,5 +1,28 @@
+# DISABLED 2026-09-07 (Mayor). Decision this order exists to produce is FINAL —
+# re-enabling it will only re-ask a question already answered.
+#
+# ga-ub8yq (the P0 bead this order's mail hardcodes as "where to register the
+# reading") no longer resolves via `bd show`/SQL — closed as story:done and
+# since purged from the live `hq` database. It is NOT reachable to comment on.
+# recall still has its history: verdict was already recorded there —
+# "o gate de TAMANHO não se justifica com dado nosso. Passo 2 cai" — on a
+# LARGER sample (n=664 runs pareados) than any single weekly window this order
+# produces (this week: n=146). Today's fresh reading reconfirms the same
+# direction: FAIL rate RISES with diff size (8%→30%→32%→35%→40% across the
+# five buckets), never falls — so per the order's own decision rule ("FAIL
+# rate ESTÁVEL ou SUBINDO -> a revisão aguenta o tamanho; o limiar de 400 NÃO
+# se aplica a nós"), step 2 (a diff-size gate) stays discarded.
+#
+# So this order has been firing weekly for a settled question, against a bead
+# ID that no longer exists to receive the answer. Left as historical record;
+# re-enable only if the gate's review behavior changes materially and the
+# size/FAIL correlation is worth re-litigating — and if so, first fix
+# gate-review-size-report-mail.sh to stop hardcoding a specific bead ID in its
+# mail template (point it at whatever bead is live at run time, or drop the
+# bead reference and let the reader decide where a fresh reading belongs).
 [order]
 description = "Semanal: correlaciona tamanho do diff x veredito do gate e manda ao Mayor decidir o passo 2 do ga-ub8yq"
 trigger = "cooldown"
 interval = "168h"
 exec = "bash /Users/athos/gt/.gascity-gastown-hq/scripts/gate-review-size-report-mail.sh"
+enabled = false
