@@ -1,0 +1,120 @@
+{
+  "_readme": "SOURCE OF TRUTH for the park/hold/veto label vocabulary (ga-r150x9). To add or remove a label: edit a group's \"members\" list here, then run `python3 scripts/generate_park_labels.py --write` to regenerate park_labels.py and park_labels.sh, and commit all three files together. Do NOT hand-edit park_labels.py or park_labels.sh directly -- `generate_park_labels.py --check` (see scripts/test_generate_park_labels.py) fails loudly if they drift from what this file generates. This file is itself a valid jq-consumable fragment: `jq '.groups[].members[].label' scripts/park_labels.json` lists every vocabulary label; `jq '.groups[] | select(.in_park_labels) | .members[].label'` lists just the PARK_LABELS union.",
+  "default_reclaim_cap": 3,
+  "park_labels_composition": {
+    "_comment": "Which group py_consts union together to form park_labels.py's PARK_LABELS constant, in rendering order. Deliberately excludes gate_park and flowing_or_done (see their group comments) -- park_label_bases in the shell fragment is NOT filtered this way; it always includes every group.",
+    "order": ["needs_human", "manual_exec", "blocked_family", "not_ready", "pilot_held"],
+    "line_breaks": [3, 2]
+  },
+  "groups": [
+    {
+      "id": "needs_human",
+      "py_const": "NEEDS_HUMAN_LABELS",
+      "sh_comment": "human-in-the-loop",
+      "py_style": "exploded",
+      "in_park_labels": true,
+      "py_line_breaks": [4],
+      "sh_line_breaks": [4],
+      "members": [
+        {"label": "gate:needs-human", "py_token": "GATE_NEEDS_HUMAN_PREFIX"},
+        {"label": "story:needs-human", "py_token": "NEEDS_HUMAN_LABEL"},
+        {"label": "needs-human"},
+        {"label": "needs-label-review"}
+      ]
+    },
+    {
+      "id": "manual_exec",
+      "py_const": "MANUAL_EXEC_LABELS",
+      "sh_comment": "manual/device execution",
+      "py_style": "exploded",
+      "in_park_labels": true,
+      "py_line_breaks": [4],
+      "sh_line_breaks": [4],
+      "members": [
+        {"label": "exec:manual", "py_token": "EXEC_MANUAL_LABEL"},
+        {"label": "on-device"},
+        {"label": "story:needs-device", "py_token": "NEEDS_DEVICE_LABEL"},
+        {"label": "phone-proxy"}
+      ]
+    },
+    {
+      "id": "blocked_family",
+      "py_const": "BLOCKED_FAMILY_LABELS",
+      "sh_comment": "explicitly blocked",
+      "py_style": "exploded",
+      "in_park_labels": true,
+      "py_line_breaks": [5, 2],
+      "sh_line_breaks": [5, 2],
+      "members": [
+        {"label": "blocked"},
+        {"label": "story:blocked"},
+        {"label": "blocked-on"},
+        {"label": "blocked-reason"},
+        {"label": "waiting-on"},
+        {"label": "next-action"},
+        {"label": "needs:rehome"}
+      ]
+    },
+    {
+      "id": "not_ready",
+      "py_const": "NOT_READY_LABELS",
+      "sh_comment": "not ready / not current",
+      "py_style": "exploded",
+      "in_park_labels": true,
+      "py_line_breaks": [3, 3],
+      "sh_line_breaks": [3, 3],
+      "members": [
+        {"label": "story:refinement-in-progress"},
+        {"label": "ctx:thin", "py_token": "CTX_THIN_LABEL"},
+        {"label": "story:cancelled"},
+        {"label": "framework:engine"},
+        {"label": "story:awaiting-external-merge"},
+        {"label": "pool:refused"}
+      ]
+    },
+    {
+      "id": "pilot_held",
+      "py_const": "PILOT_HELD_LABELS",
+      "sh_comment": "pilot deliberately withheld dispatch",
+      "py_style": "compact",
+      "in_park_labels": true,
+      "py_line_breaks": [2],
+      "sh_line_breaks": [2],
+      "members": [
+        {"label": "pilot:held", "py_token": "PILOT_HELD_LABEL"},
+        {"label": "pilot:no-auto-dispatch"}
+      ]
+    },
+    {
+      "id": "gate_park",
+      "py_const": "GATE_PARK_LABELS",
+      "sh_comment": "gate-fix retry loop / already in the gate pipeline",
+      "py_style": "exploded",
+      "in_park_labels": false,
+      "py_line_breaks": [3, 2],
+      "sh_line_breaks": [5],
+      "members": [
+        {"label": "gate:needs-fix", "py_token": "GATE_NEEDS_FIX_LABEL"},
+        {"label": "gate:failed", "py_token": "GATE_FAILED_LABEL"},
+        {"label": "gate:needs-rebase"},
+        {"label": "gate:queued"},
+        {"label": "gate:reviewing"}
+      ]
+    },
+    {
+      "id": "flowing_or_done",
+      "py_const": "FLOWING_OR_DONE_LABELS",
+      "sh_comment": "already dispatched/building, or finished",
+      "py_style": "exploded",
+      "in_park_labels": false,
+      "py_line_breaks": [4],
+      "sh_line_breaks": [4],
+      "members": [
+        {"label": "story:in-flight"},
+        {"label": "pilot:dispatched"},
+        {"label": "pilot:dispatching"},
+        {"label": "story:done"}
+      ]
+    }
+  ]
+}

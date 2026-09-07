@@ -154,6 +154,34 @@ outer tree instead. Every commit that touched this outer path in the 30
 days before this guard shipped was exactly this accident, not legitimate
 outer-repo work; the deployed tree agents actually run from is
 .gascity-gastown-hq/scripts/." || exit 1
+
+      # park_labels generator freshness guard (ga-r150x9): park_labels.py and
+      # park_labels.sh are GENERATED from park_labels.json (see
+      # .gascity-gastown-hq/scripts/generate_park_labels.py) -- a push that
+      # touches any of the three without regenerating would silently
+      # reintroduce the exact hand-kept-in-sync drift this bead exists to
+      # kill. Only runs when the push touches one of the three files, and
+      # only checks the CURRENT WORKING TREE (not the pushed SHA in
+      # isolation) -- correct for the common case of pushing your own
+      # checkout, same tradeoff every local pre-commit/pre-push codegen
+      # check makes. Fail OPEN if python3 itself is unavailable (environment
+      # problem, not a confirmed divergence) but fail CLOSED -- block the
+      # push -- on any actually-detected mismatch, matching this bead's
+      # "FAILS LOUDLY on divergence" acceptance criterion.
+      park_labels_touch=$(git diff --name-only --diff-filter=ACM "$orphan_range" -- \
+        '.gascity-gastown-hq/scripts/park_labels.json' \
+        '.gascity-gastown-hq/scripts/park_labels.py' \
+        '.gascity-gastown-hq/scripts/park_labels.sh' 2>/dev/null)
+      if [[ -n "$park_labels_touch" ]] && command -v python3 &>/dev/null; then
+        if ! python3 .gascity-gastown-hq/scripts/generate_park_labels.py --check; then
+          echo ""
+          echo "BLOCKED: park_labels.py / park_labels.sh are stale relative to"
+          echo "park_labels.json (see the diff above). Run:"
+          echo "  python3 .gascity-gastown-hq/scripts/generate_park_labels.py --write"
+          echo "and commit the regenerated files together with your source change."
+          exit 1
+        fi
+      fi
     fi
   fi
 
