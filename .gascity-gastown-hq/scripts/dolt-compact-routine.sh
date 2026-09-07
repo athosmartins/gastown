@@ -303,7 +303,28 @@ _backup_today_ok() {
     *) echo "latest backup run is not from today ($today): $start_line"; return 1 ;;
   esac
   if ! printf '%s' "$block" | grep -qE '=== run complete: ok=[0-9]+ failed=0 total=[0-9]+ ==='; then
-    echo "latest backup run did not close failed=0: $(printf '%s' "$block" | grep -m1 'run complete')"
+    local complete_line
+    complete_line="$(printf '%s' "$block" | grep -m1 '=== run complete')"
+    if [ -z "$complete_line" ]; then
+      # ga-abrbt: the run never reached "=== run complete ===" at all — e.g.
+      # dolt-s3-backup.sh's own FATAL early-exit when Dolt was unreachable at
+      # its preflight check (the live 2026-09-05/07 shape). This is a
+      # DIFFERENT failure mode than "ran and closed with failed>0" below, but
+      # `grep -m1 'run complete'` finds nothing to append for it, so both
+      # collapsed into the same empty-tailed "did not close failed=0: "
+      # message — error and empty produced the identical value. Name the
+      # absence explicitly and surface whatever diagnostic line the aborted
+      # run DID manage to log (its FATAL: line, if any) instead of guessing.
+      local fatal_line
+      fatal_line="$(printf '%s' "$block" | grep -m1 'FATAL:')"
+      if [ -n "$fatal_line" ]; then
+        echo "latest backup run today never reached 'run complete' — it aborted early: ${fatal_line#*] }"
+      else
+        echo "latest backup run today never reached 'run complete' — no run-complete line found in today's log block (run may still be in progress or was killed)"
+      fi
+      return 1
+    fi
+    echo "latest backup run did not close failed=0: $complete_line"
     return 1
   fi
   while IFS= read -r db; do

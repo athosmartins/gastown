@@ -204,6 +204,51 @@ EOF
 r="$(_backup_today_ok "$BL" "$TODAY" "$(printf 'beads\n')")" && bad "failed=1 in the run should refuse even if MY eligible db was OK" || ok "run closed with failed=1 (a DIFFERENT db failed) → refuse anyway ($r)"
 
 r="$(_backup_today_ok "$SCRATCH/does-not-exist.log" "$TODAY" "$(printf 'beads\n')")" && bad "missing log should refuse" || ok "no backup log at all → refuse, fail-closed ($r)"
+
+# ga-abrbt: today's run started but ABORTED before ever reaching "run
+# complete" (dolt-s3-backup.sh's own FATAL early-exit when Dolt is
+# unreachable at the preflight check — the exact live shape from
+# 2026-09-05/07). Distinct failure mode from "ran and closed with
+# failed>0" above: `grep -m1 'run complete'` finds NOTHING to append, so
+# the pre-fix message collapsed to the empty-tailed
+# "latest backup run did not close failed=0: " (verified live, byte-for-
+# byte the reported symptom) — indistinguishable from a genuine parse
+# hiccup and useless for triage. The fixed message must name the absence
+# explicitly and, when available, surface the FATAL reason instead.
+cat > "$BL" <<EOF
+[$TODAY 04:00:02] === run start (port=52756 bucket=x) ===
+[$TODAY 04:00:02] FATAL: Dolt server unreachable on 127.0.0.1:52756 — skipping (NOT restarting)
+EOF
+r="$(_backup_today_ok "$BL" "$TODAY" "$(printf 'beads\n')")" && bad "aborted run (no run-complete line) should refuse" || ok "today's run aborted before 'run complete' (FATAL) → refuse ($r)"
+case "$r" in
+  "latest backup run did not close failed=0: ")
+    bad "REGRESSION (ga-abrbt): 'never ran' collapses into the same empty-tailed 'did not close failed=0: ' text as a real ran-and-failed run — got: '$r'" ;;
+  *"did not close failed=0: ")
+    bad "REGRESSION (ga-abrbt): message still ends in the empty-tailed 'did not close failed=0: ' pattern — got: '$r'" ;;
+  *) ok "message does not collapse into the empty-tailed 'did not close failed=0: ' pattern" ;;
+esac
+case "$r" in
+  *"never reached"*"run complete"*|*"did not complete"*|*"no run-complete"*) ok "message explicitly names that today's run never reached completion" ;;
+  *) bad "message should explicitly say the run never completed, not just imply it via an empty tail — got: '$r'" ;;
+esac
+case "$r" in
+  *"FATAL"*"unreachable"*) ok "message surfaces the actual FATAL reason found in the log ($r)" ;;
+  *) bad "message should quote the FATAL line that explains WHY the run aborted — got: '$r'" ;;
+esac
+
+# Same aborted-run shape but with NO diagnostic line at all (e.g. the run
+# was killed before even logging FATAL) — message must still name the
+# absence honestly rather than guess or fall back to the empty tail.
+cat > "$BL" <<EOF
+[$TODAY 04:00:02] === run start (port=52756 bucket=x) ===
+EOF
+r="$(_backup_today_ok "$BL" "$TODAY" "$(printf 'beads\n')")" && bad "aborted run with no diagnostic line should refuse" || ok "today's run aborted with no FATAL line either → refuse ($r)"
+case "$r" in
+  *"did not close failed=0: ") bad "REGRESSION (ga-abrbt): empty-tailed message even with zero diagnostic content — got: '$r'" ;;
+  *"never reached"*"run complete"*|*"did not complete"*|*"no run-complete"*) ok "message still names the absence explicitly when no FATAL line exists ($r)" ;;
+  *) bad "message should explicitly name the absence even without a FATAL line — got: '$r'" ;;
+esac
+
 rm -f "$BL"
 
 # ════════════════════════════════════════════════════════════════════════════

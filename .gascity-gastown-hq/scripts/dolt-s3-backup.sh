@@ -19,8 +19,10 @@
 #        point-in-time recovery without a full copy per day).
 #
 # SAFETY: READ + export only. Never stops/restarts Dolt, never touches a live .dolt or
-# noms/LOCK. If the server is unreachable it SKIPS (never restarts). Silent on success
-# (Athos preference); notifies via `notify` only on failure. Bounded by per-db timeouts
+# noms/LOCK. If the server is unreachable at the preflight check it retries a few times
+# with spaced waits (ga-abrbt: a transient blip used to cost the whole day), then SKIPS
+# if still unreachable (never restarts, at any point). Silent on success (Athos
+# preference); notifies via `notify` only on failure. Bounded by per-db timeouts
 # and a single-instance lock. Restore procedure: see RESTORE section at the bottom.
 set -uo pipefail
 
@@ -112,11 +114,40 @@ dsql() { DOLT_CLI_PASSWORD='' "$DOLT" --host "$HOST" --port "$PORT" --user root 
 log "=== run start (port=$PORT bucket=$BUCKET) ==="
 
 # --- pre-flight: server must be reachable; NEVER touch a hung server ---
-if ! DOLT_CLI_PASSWORD='' timeout "$PREFLIGHT_TIMEOUT" "$DOLT" --host "$HOST" --port "$PORT" \
-      --user root --no-tls sql -q "SELECT 1" --result-format csv >/dev/null 2>&1; then
-  log "FATAL: Dolt server unreachable on $HOST:$PORT — skipping (NOT restarting)"
-  notify_fail "backup off-box: Dolt inacessível em $HOST:$PORT — pulado (sem restart)"
-  exit 0
+# ga-abrbt: a transient blip in reachability at exactly 04:00 (verified live
+# 2026-09-05 and 2026-09-07: "FATAL: Dolt server unreachable" with no other
+# symptom) used to cost the WHOLE day — no off-box backup at all, which in
+# turn kills dolt-compact-routine.sh's 04:30 "backup fresh today"
+# precondition for every hour after. Give a handful of short, spaced retries
+# before giving up: this NEVER restarts Dolt (unchanged safety property —
+# only re-probes the same read-only reachability check), and the worst-case
+# total wait (10+20+40=70min) stays well inside this script's own 180min
+# stale-lock window and the plist's 24h schedule gap, so a retrying run can
+# never collide with tomorrow's scheduled fire.
+PREFLIGHT_RETRY_WAITS_MIN="10 20 40"
+
+_dolt_reachable() {
+  DOLT_CLI_PASSWORD='' timeout "$PREFLIGHT_TIMEOUT" "$DOLT" --host "$HOST" --port "$PORT" \
+    --user root --no-tls sql -q "SELECT 1" --result-format csv >/dev/null 2>&1
+}
+
+if ! _dolt_reachable; then
+  log "WARN: Dolt server unreachable on $HOST:$PORT at first probe — retrying (waits: ${PREFLIGHT_RETRY_WAITS_MIN} min) before giving up for today (NOT restarting)"
+  reachable=0
+  for wait_min in $PREFLIGHT_RETRY_WAITS_MIN; do
+    sleep "$(( wait_min * 60 ))"
+    if _dolt_reachable; then
+      log "Dolt server reachable again after a ${wait_min}min wait — resuming backup run"
+      reachable=1
+      break
+    fi
+    log "WARN: Dolt still unreachable after a ${wait_min}min wait"
+  done
+  if [ "$reachable" -ne 1 ]; then
+    log "FATAL: Dolt server unreachable on $HOST:$PORT after retries (${PREFLIGHT_RETRY_WAITS_MIN} min) — skipping (NOT restarting)"
+    notify_fail "backup off-box: Dolt inacessível em $HOST:$PORT mesmo após retries — pulado (sem restart)"
+    exit 0
+  fi
 fi
 
 # --- discover all real databases (exclude system schemas) ---

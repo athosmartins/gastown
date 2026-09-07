@@ -105,5 +105,60 @@ else
   bad "retry-wait wiring missing"
 fi
 
+# ── preflight-unreachable retry (ga-abrbt) — a transient blip in reachability
+# at 04:00 used to cost the whole day (no retry at all: FATAL + exit 0 on the
+# very first probe). Not independently unit-testable without a real Dolt
+# connection (unlike the two pure detectors above), so — same convention as
+# the drift-guards below — assert the live script actually wires the retry
+# in, rather than skip coverage entirely.
+echo "── drift-guard: preflight-unreachable retry wiring present in live script (ga-abrbt) ──"
+if grep -qF '_dolt_reachable' "$SCRIPT"; then
+  ok "reachability probe factored into a named function (reused by first check + each retry, not copy-pasted)"
+else
+  bad "_dolt_reachable helper missing — reachability check should be a single reused function"
+fi
+if grep -qF 'PREFLIGHT_RETRY_WAITS_MIN' "$SCRIPT" && grep -qE 'sleep "\$\(\( *wait_min \* 60 *\)\)"' "$SCRIPT"; then
+  ok "retry loop actually sleeps using the configured wait-minutes list"
+else
+  bad "preflight retry does not wire PREFLIGHT_RETRY_WAITS_MIN into a real sleep"
+fi
+if grep -qF 'for wait_min in $PREFLIGHT_RETRY_WAITS_MIN' "$SCRIPT"; then
+  ok "retry iterates the configured waits (not a single hardcoded attempt)"
+else
+  bad "retry loop over PREFLIGHT_RETRY_WAITS_MIN missing"
+fi
+# The ONLY two `_dolt_reachable` call sites must remain: the first probe and
+# the retry-loop re-probe. A 3rd call site would mean the check drifted back
+# into an inline duplicate somewhere (exactly the copy-paste this refactor
+# exists to prevent).
+callsites="$(grep -cF '_dolt_reachable' "$SCRIPT")"
+[ "$callsites" -eq 3 ] \
+  && ok "exactly 3 occurrences of _dolt_reachable (1 definition + 2 call sites: first probe, retry re-probe)" \
+  || bad "expected exactly 3 occurrences of _dolt_reachable (def + 2 calls), got $callsites — check for a reintroduced duplicate inline probe"
+# Safety invariant, unchanged by this fix: still NEVER attempts to start/
+# restart Dolt anywhere in this script, retry included. Strip comments first
+# (sed 's/#.*$//') — the script legitimately MENTIONS "dolt sql-server" twice
+# in prose (a fallback-port comment, and the RESTORE section's own
+# description), neither of which is an invocation; a plain grep over the
+# whole file would false-positive on those two pre-existing comments.
+if sed -E 's/#.*$//' "$SCRIPT" | grep -qiE '\bdolt (start|restart)\b|\bsql-server\b'; then
+  bad "found a Dolt start/restart/sql-server invocation (outside comments) — this script must remain READ + export only, retry must never escalate to a restart"
+else
+  ok "no Dolt start/restart/sql-server invocation anywhere in the script (mentions in comments don't count) — retry only re-probes, never restarts"
+fi
+# The exhausted-retries message must still read as FATAL+unreachable so
+# dolt-compact-routine.sh's _backup_today_ok() (ga-abrbt fix) can surface it
+# verbatim as the reason a run never reached "run complete".
+if grep -qE 'FATAL: Dolt server unreachable on \$HOST:\$PORT after retries' "$SCRIPT"; then
+  ok "final give-up message still says FATAL + unreachable (so the compact routine's precondition message can quote it)"
+else
+  bad "final give-up message no longer identifiable as FATAL+unreachable — downstream _backup_today_ok parsing would degrade"
+fi
+if grep -qF 'notify_fail "backup off-box: Dolt inacessível' "$SCRIPT" && grep -cF 'exit 0' "$SCRIPT" | grep -qE '^[1-9][0-9]*$'; then
+  ok "give-up path still notifies and exits 0 (never restarts, never a nonzero exit that could trip an external supervisor into restarting Dolt)"
+else
+  bad "give-up path's notify/exit-0 wiring looks different than expected"
+fi
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
