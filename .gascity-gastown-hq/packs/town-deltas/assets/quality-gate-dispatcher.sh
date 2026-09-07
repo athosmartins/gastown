@@ -737,11 +737,23 @@ respawn_reviewer_slot() {
   # NOT the session id — extract it from the same spawn JSON the id came from.
   _new_sname=$(echo "$_json" | jq -r '.session_name // empty' 2>/dev/null || echo "")
   if [ -n "$_new_sname" ]; then
-    assign_verdict_bead_verified "${VERDICT_BEAD_IDS[$_idx]}" "$_new_sname" "re-convene slot ${_idx}" || true
+    # ga-590nx: branch on the real verify outcome instead of `|| true`-then-
+    # unconditional-log — see the matching comment at the initial-spawn call
+    # site (~Step 7/8) for the full incident. Same fix, same reasoning, applied
+    # here so a lost re-point is just as loud as a lost initial assign.
+    if assign_verdict_bead_verified "${VERDICT_BEAD_IDS[$_idx]}" "$_new_sname" "re-convene slot ${_idx}"; then
+      _vb_reassign_verified=1
+    else
+      _vb_reassign_verified=0
+    fi
     # Re-embed the stored review task as a comment too (mirrors initial spawn:
     # the durable pull reads the task from the bead, independent of the nudge).
     bd -C "$GC_CITY" comment "${VERDICT_BEAD_IDS[$_idx]}" "${REVIEW_TASKS[$_idx]}" 2>/dev/null || true
-    log "  Re-convene: verdict bead ${VERDICT_BEAD_IDS[$_idx]} re-assigned to NEW session name ${_new_sname} (durable pull re-pointed, ga-vdurb)."
+    if [ "$_vb_reassign_verified" = "1" ]; then
+      log "  Re-convene: verdict bead ${VERDICT_BEAD_IDS[$_idx]} re-assigned to NEW session name ${_new_sname} (durable pull re-pointed, ga-vdurb)."
+    else
+      warn "  Re-convene: verdict bead ${VERDICT_BEAD_IDS[$_idx]} re-assignment to ${_new_sname} DID NOT VERIFY after retries — comment embedded as a last-resort channel, but neither --assignee nor metadata.gc.session_name confirmed (bead labeled verdict:assignee-degraded, ga-mo7q/ga-qqtoo). Re-convened reviewer may not find this via its poll; outer timeout is the backstop (ga-590nx)."
+    fi
   else
     warn "  Re-convene: spawn JSON had no session_name for slot ${_idx} — durable channel NOT re-pointed (verdict-poll + outer timeout backstop)."
   fi
@@ -11136,9 +11148,32 @@ TASK
     # even for the FIRST cohort — silently killing the durable pull from the start.
     # Use the verified-assign helper (assign + read-back + 1 retry + WARN-on-fail);
     # still NON-fatal, but a lost assignment is now visible in the log, not silent.
-    assign_verdict_bead_verified "$VERDICT_BEAD_ID" "$SESSION_NAME" "initial slot $i" || true
+    #
+    # ga-590nx: that "visible in the log" promise held for the HELPER's own
+    # internal log/warn lines, but this call site still threw the helper's
+    # verified/not-verified result away with `|| true` and logged "assigned...+
+    # task embedded" UNCONDITIONALLY right after — so a genuine failure (WARN
+    # fired inside the helper, bead labeled verdict:assignee-degraded) was
+    # immediately followed by a line claiming success anyway. Measured live
+    # 2026-09-06: two verdict beads, one with a persisted assignee and one
+    # without, produced the IDENTICAL "assigned to X" summary line — no way to
+    # tell them apart without re-querying the bead by hand. Branch on the real
+    # exit code instead; the comment-embed stays unconditional (it is an
+    # independent last-resort channel, not part of the assignee/metadata
+    # verification), and assign_verdict_bead_verified() itself is untouched —
+    # still 4 retries + metadata fallback + degraded-label on exhaustion
+    # (ga-mo7q/ga-qqtoo) — only this caller's blind final log line changes.
+    if assign_verdict_bead_verified "$VERDICT_BEAD_ID" "$SESSION_NAME" "initial slot $i"; then
+      _vb_assign_verified=1
+    else
+      _vb_assign_verified=0
+    fi
     bd -C "$GC_CITY" comment "$VERDICT_BEAD_ID" "$REVIEW_TASK" 2>/dev/null || true
-    log "  Verdict bead $VERDICT_BEAD_ID assigned to $SESSION_NAME + task embedded (durable pull, ga-67hae)"
+    if [ "$_vb_assign_verified" = "1" ]; then
+      log "  Verdict bead $VERDICT_BEAD_ID assigned to $SESSION_NAME + task embedded (durable pull, ga-67hae)"
+    else
+      warn "  Verdict bead $VERDICT_BEAD_ID durable-pull assignment to $SESSION_NAME DID NOT VERIFY after retries — task comment embedded as a last-resort channel, but neither --assignee nor metadata.gc.session_name confirmed (bead labeled verdict:assignee-degraded, ga-mo7q/ga-qqtoo). Reviewer may not find this via its poll; outer timeout is the backstop (ga-590nx)."
+    fi
   else
     warn "  Initial slot $i: spawn JSON had no session_name — durable pull channel NOT wired (verdict-poll + outer timeout backstop)."
   fi
