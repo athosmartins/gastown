@@ -1391,6 +1391,31 @@ GT_MESSAGE_NOTE='[{"id":"bd-handoff-note","assignee":null,"labels":["gt:message"
 [ "$(_fc "$GT_MESSAGE_NOTE")" = '["bd-free9"]' ] && ok "ga-4yii8z: gt:message bead excluded; free story:approved kept (handoff note honored)" || bad "ga-4yii8z: gt:message not excluded (got: $(_fc "$GT_MESSAGE_NOTE"))"
 grep -qE '"gt:message"' "$DISPATCHER" && ok "_filter_candidates carries the gt:message clause" || bad "gt:message clause missing from _filter_candidates"
 
+# ── Scenario 3e2n (gt-62hv3, ga-y6gjv): story:blocked must NOT veto a bead that
+# ALSO carries gate:needs-fix / gate:fix-attempt:<N> ─────────────────────────
+# Mayor-confirmed root cause (gt-62hv3): story:blocked is a static painel-
+# display marker (Kanban-column signal only) that used to be an UNCONDITIONAL
+# member of _filter_candidates' blocklist directly above (same family as
+# pinned/gt:message). A bead carrying BOTH story:blocked (stamped for painel
+# display) AND gate:needs-fix (stamped later when a gate review requested
+# fixes) was dropped by the static story:blocked veto BEFORE it could ever
+# reach _filter_built's OWN "except gate:needs-fix OR gate:fix-attempt:N"
+# carve-out (this same file, ~L3987) — permanently stranding it, since that
+# carve-out never got a chance to run. Real victim: ga-y6gjv, 4 reviewer-
+# requested gate fixes since 2026-09-03, zero re-dispatch. Fix: story:blocked
+# moved out of the blocklist into its own not-present-OR-exempted clause
+# (same shape as the pilot:held clause, Scenario 3e2 above) using the EXACT
+# same exemption predicate _filter_built already uses, so the two can never
+# drift apart.
+echo "Scenario 3e2n (gt-62hv3/ga-y6gjv): story:blocked+gate:needs-fix survives _filter_candidates; story:blocked ALONE still excluded"
+BLOCKED_ONLY='[{"id":"bd-blocked-only","assignee":null,"labels":["story:approved","story:blocked"],"description":"x"},{"id":"bd-free10","assignee":null,"labels":["story:approved"],"description":"x"}]'
+[ "$(_fc "$BLOCKED_ONLY")" = '["bd-free10"]' ] && ok "gt-62hv3: story:blocked ALONE (no gate:needs-fix) still excluded — no regression" || bad "gt-62hv3: story:blocked-only exclusion regressed (got: $(_fc "$BLOCKED_ONLY"))"
+BLOCKED_NEEDSFIX='[{"id":"bd-blocked-needsfix","assignee":null,"labels":["story:approved","story:blocked","gate:needs-fix"],"description":"x"},{"id":"bd-free11","assignee":null,"labels":["story:approved"],"description":"x"}]'
+[ "$(_fc "$BLOCKED_NEEDSFIX")" = '["bd-blocked-needsfix","bd-free11"]' ] && ok "gt-62hv3: story:blocked+gate:needs-fix now SURVIVES _filter_candidates (ga-y6gjv unstuck)" || bad "gt-62hv3: story:blocked+gate:needs-fix still wrongly excluded (got: $(_fc "$BLOCKED_NEEDSFIX"))"
+BLOCKED_FIXATTEMPT='[{"id":"bd-blocked-fixattempt","assignee":null,"labels":["story:approved","story:blocked","gate:fix-attempt:2"],"description":"x"},{"id":"bd-free12","assignee":null,"labels":["story:approved"],"description":"x"}]'
+[ "$(_fc "$BLOCKED_FIXATTEMPT")" = '["bd-blocked-fixattempt","bd-free12"]' ] && ok "gt-62hv3: story:blocked+gate:fix-attempt:N also survives (same exemption predicate as _filter_built)" || bad "gt-62hv3: story:blocked+gate:fix-attempt:N still wrongly excluded (got: $(_fc "$BLOCKED_FIXATTEMPT"))"
+grep -qE 'index\("story:blocked"\)' "$DISPATCHER" && ok "_filter_candidates carries the story:blocked not-present-OR-exempted clause" || bad "story:blocked clause missing from _filter_candidates"
+
 # ── Scenario 3e2k (ga-xdukc/ga-hd87d): DECISAO-titled / Athos-decide-phrased beads
 # excluded via body-text veto, independent of labels ────────────────────────────
 # wa-5ch02 ("DECISAO (Athos): classificacao deve pagar conexoes (R$0,32/CPF) ou

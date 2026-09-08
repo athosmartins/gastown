@@ -3003,7 +3003,9 @@ _filter_candidates() {
           or . == "no-auto-dispatch"
           or . == "story:needs-device"
           or . == "on-device"
-          or . == "story:blocked"
+          # gt-62hv3: story:blocked used to be a plain member of this blocklist
+          # (bare `or . == "story:blocked"` right here) — moved out into its own
+          # not-present-OR-exempted clause below (see the comment there for why).
           # ga-2lqv: engine-window:pending means Phase-1 (code fix) is DONE and
           # Phase-2 (deploy) is deliberately batched with sibling bugs (see
           # docs/runbooks/ga-ftmci-dolt-cpu-engine-window.md) — it is NOT "not
@@ -3063,6 +3065,28 @@ _filter_candidates() {
           # same static way as pinned.
           or . == "gt:message"
         )) | length) == 0
+        # gt-62hv3 (Mayor-confirmed root cause, ga-y6gjv): story:blocked is a
+        # STATIC painel-display marker (stamped purely so the Kanban shows a
+        # card as blocked) that used to be an unconditional member of the
+        # blocklist map/select directly above — so a bead that ALSO carries
+        # gate:needs-fix (or gate:fix-attempt:<N>), the exact marker the
+        # _filter_built carve-out (~L3987 below, "except gate:needs-fix OR
+        # gate:fix-attempt:N") is designed to let back into the pool, was
+        # dropped HERE first and never reached that carve-out at all —
+        # permanently stranding it (ga-y6gjv: 4 reviewer-requested gate fixes
+        # since 2026-09-03, zero re-dispatch). Pulled out of the blocklist into
+        # its own not-present-OR-exempted clause, same shape as the pilot:held
+        # clause above: a bead with ONLY story:blocked is still excluded
+        # (a painel-display-only bead with no active re-fix loop stays held —
+        # this must NOT become a veto-zero); a bead carrying BOTH labels now
+        # survives this filter and is subject to whatever
+        # _filter_dispatch_gates/_filter_built decide next, same as any other
+        # gate:needs-fix candidate. Exemption predicate copied verbatim from
+        # the _filter_built carve-out (~L3987) so the two never drift apart.
+        and (
+          (((.labels // []) | index("story:blocked")) | not)
+          or ((.labels // []) | any(. == "gate:needs-fix" or startswith("gate:fix-attempt:")))
+        )
         and ((.description // "") | test("\\S"))
         # ga-vhyd: needs:engine-window (excluded above via --exclude-label at
         # every bd list call site) only protects a bead AFTER something labels
@@ -3271,7 +3295,6 @@ _filter_candidates() {
               or . == "story:needs-approval"
               or . == "story:needs-device"
               or . == "on-device"
-              or . == "story:blocked"
               or . == "engine-window:pending"
               or . == "framework:engine"
               or . == "story:awaiting-external-merge"
@@ -3279,6 +3302,17 @@ _filter_candidates() {
               or . == "gt:message"
             ))) as $bl
             | if ($bl | length) > 0 then "blocking-label:\($bl | join(","))" else empty end ),
+          # gt-62hv3: mirrors the story:blocked not-present-OR-exempted select
+          # clause above (~L3086) — keep these two in sync, same lesson
+          # ga-3lsy1/ga-nimyz/ga-vmn7kv/ga-w8btn already taught this function
+          # repeatedly. Only fires when story:blocked is STILL the active
+          # reason (no gate:needs-fix/gate:fix-attempt:* exemption present) —
+          # a bead admitted by the exemption is already in $kept and never
+          # reaches this reason computation at all, so this cannot report a
+          # stale reason for a bead the fixed select actually let through.
+          (if ( ($L | index("story:blocked"))
+                and (($L | any(. == "gate:needs-fix" or startswith("gate:fix-attempt:"))) | not) )
+           then "story:blocked(no-gate:needs-fix-exemption)" else empty end),
           (if ((($b.description // "") | test("\\S")) | not) then "empty-description" else empty end),
           # ga-ffop9: consumes the SAME $engine_rebuild_re --arg as the select
           # above (single source — see _cf_engine_rebuild_re) — this reason

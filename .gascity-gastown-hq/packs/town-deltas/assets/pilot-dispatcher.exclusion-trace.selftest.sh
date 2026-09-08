@@ -195,6 +195,98 @@ fi
 
 # ════════════════════════════════════════════════════════════════════════════
 echo ""
+echo "Scenario 1c (gt-62hv3, ga-y6gjv): story:blocked does not veto a bead that ALSO carries gate:needs-fix/gate:fix-attempt:N"
+# gt-62hv3 (Mayor-confirmed root cause): story:blocked used to be an
+# UNCONDITIONAL member of _filter_candidates' blocklist, so a bead carrying
+# BOTH story:blocked (painel-display marker) AND gate:needs-fix (a gate
+# review requested fixes) was dropped HERE before it could ever reach
+# _filter_built's OWN "except gate:needs-fix OR gate:fix-attempt:N" carve-out
+# (Scenario 4b below) — permanently stranding it (ga-y6gjv: 4 reviewer-
+# requested gate fixes since 2026-09-03, zero re-dispatch). Reuses Scenario
+# 1's already-extracted FC_FN/PRE/CAP/TVP/FMS/FML.
+cat > "$WORK/s1c.sh" <<EOF
+$LOG_FN
+$LE_FN
+$PRE
+$FMS
+$FML
+$CAP
+$TVP
+$FC_FN
+SELF_BEAD_ID=""
+INPUT='[
+  {"id":"ga-pass1","assignee":null,"labels":[],"description":"a real task with content"},
+  {"id":"ga-blocked-only","assignee":null,"labels":["story:blocked"],"description":"x"},
+  {"id":"ga-blocked-needsfix","assignee":null,"labels":["story:blocked","gate:needs-fix"],"description":"x"},
+  {"id":"ga-blocked-fixattempt","assignee":null,"labels":["story:blocked","gate:fix-attempt:2"],"description":"x"}
+]'
+printf '%s' "\$INPUT" | _filter_candidates
+EOF
+S1C_OUT="$(bash "$WORK/s1c.sh" 2>"$WORK/s1c.stderr")"
+S1C_IDS="$(printf '%s' "$S1C_OUT" | jq -c '[.[].id] | sort' 2>/dev/null)"
+[ "$S1C_IDS" = '["ga-blocked-fixattempt","ga-blocked-needsfix","ga-pass1"]' ] \
+  && ok "_filter_candidates keeps story:blocked+gate:needs-fix/fix-attempt beads, still drops story:blocked-only" \
+  || bad "_filter_candidates output wrong (got: '$S1C_IDS') — expected ga-pass1 + both gate:needs-fix/fix-attempt beads to survive, ga-blocked-only excluded"
+grep -qF '[pilot] EXCLUÍDO ga-blocked-only por _filter_candidates: story:blocked(no-gate:needs-fix-exemption)' "$WORK/s1c.stderr" \
+  && ok "AC1: ga-blocked-only exclusion logged with the specific story:blocked reason" \
+  || bad "AC1: ga-blocked-only exclusion line missing/wrong (got: $(cat "$WORK/s1c.stderr" 2>/dev/null))"
+grep -qF 'ga-blocked-needsfix' "$WORK/s1c.stderr" \
+  && bad "AC4/gt-62hv3: ga-blocked-needsfix (exempted) must NOT appear in the exclusion trace at all" \
+  || ok "AC4/gt-62hv3: ga-blocked-needsfix survives with no exclusion line (ga-y6gjv unstuck)"
+grep -qF 'ga-blocked-fixattempt' "$WORK/s1c.stderr" \
+  && bad "AC4/gt-62hv3: ga-blocked-fixattempt (exempted via gate:fix-attempt:N) must NOT appear in the exclusion trace at all" \
+  || ok "AC4/gt-62hv3: ga-blocked-fixattempt survives with no exclusion line (gate:fix-attempt:N alone also exempts)"
+
+if [ -n "$ORIG_DISPATCHER" ] && [ -f "$ORIG_DISPATCHER" ]; then
+  # Differential proof of the reported bug: the SAME story:blocked+gate:needs-fix
+  # bead, run through the UNPATCHED _filter_candidates, must come back EXCLUDED
+  # (the reported bug) — self-contained extraction, mirroring Scenario 1b's
+  # differential shape. ALSO inject FMS/FML (framework markers) on this orig
+  # side: unlike Scenario 1b's TRUE pre-ga-vmn7kv historical baseline (which
+  # genuinely never referenced $framework_markers), $ORIG_DISPATCHER here is
+  # typically "current HEAD minus this fix" — i.e. ga-vmn7kv is ALREADY present,
+  # so the extracted O1C_FC_FN DOES reference $framework_markers. Omitting the
+  # injection would leave it unset, jq would error on invalid --argjson, and
+  # _filter_candidates' own fail-open would return "[]" for EVERY input
+  # regardless of story:blocked — a vacuous pass for the wrong reason (silently
+  # indistinguishable from "the old code genuinely excluded it"). A plain
+  # ga-plain-control fixture alongside the real target catches exactly that
+  # failure mode: if the harness is broken, control excludes too and the
+  # assertion below fails loudly instead of passing vacuously.
+  O1C_LE_FN="$(sed -n '/^_log_exclusions() {/,/^}$/p' "$ORIG_DISPATCHER")"
+  O1C_PRE="$(grep '^_FILTER_PREAPPROVAL_LABELS=' "$ORIG_DISPATCHER")"
+  O1C_CAP="$(grep '^_FILTER_RECLAIM_CAP=' "$ORIG_DISPATCHER")"
+  O1C_TVP="$(grep '^_PILOT_ENGINE_REBUILD_RE=' "$ORIG_DISPATCHER")"
+  O1C_FMS="source \"$SELF_DIR/framework-marker-labels.sh\""
+  O1C_FML="$(grep '^_FILTER_FRAMEWORK_MARKER_LABELS=' "$ORIG_DISPATCHER")"
+  O1C_FC_FN="$(sed -n '/^_filter_candidates() {/,/^}$/p' "$ORIG_DISPATCHER")"
+  cat > "$WORK/s1c_orig.sh" <<EOF
+$LOG_FN
+$O1C_LE_FN
+$O1C_PRE
+$O1C_FMS
+$O1C_FML
+$O1C_CAP
+$O1C_TVP
+$O1C_FC_FN
+SELF_BEAD_ID=""
+INPUT='[
+  {"id":"ga-plain-control","assignee":null,"labels":[],"description":"a real task with content"},
+  {"id":"ga-blocked-needsfix","assignee":null,"labels":["story:blocked","gate:needs-fix"],"description":"x"}
+]'
+printf '%s' "\$INPUT" | _filter_candidates
+EOF
+  S1C_ORIG_OUT="$(bash "$WORK/s1c_orig.sh" 2>/dev/null)"
+  S1C_ORIG_IDS="$(printf '%s' "$S1C_ORIG_OUT" | jq -c '[.[].id]' 2>/dev/null)"
+  [ "$S1C_ORIG_IDS" = '["ga-plain-control"]' ] \
+    && ok "gt-62hv3: pre-patch _filter_candidates WRONGLY excluded story:blocked+gate:needs-fix while correctly keeping the plain control bead (reproves the reported bug on the pre-fix dispatcher, extraction harness itself proven healthy)" \
+    || bad "gt-62hv3: pre-patch baseline did not reproduce the reported bug as expected (got: '$S1C_ORIG_IDS', expected exactly '[\"ga-plain-control\"]') — either the bug did not reproduce, or the extraction harness itself is broken (vacuous result)"
+else
+  echo "  (skipped pre-patch differential — set ORIG_DISPATCHER to also prove this reproves-on-HEAD^)"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
 echo "Scenario 2: _filter_exec_manual (AC1 + AC4)"
 EM_FN="$(extract_fn _filter_exec_manual)"
 cat > "$WORK/s2.sh" <<EOF
