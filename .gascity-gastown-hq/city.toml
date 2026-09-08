@@ -21,6 +21,19 @@ source = "packs/town-deltas"
 name = "property_scrapers"
 prefix = "ps"
 
+# gt-kfr7m: pilot fix — rigs[].imports (V2 map field, NOT the bare `pack=`
+# name the gastown pack.toml's own header comment suggests) is what actually
+# wires a rig into a city-level pack. Without it, HasPackRigs(cfg.Rigs)
+# stays false, expandPacks() for rig packs never runs, and NO rig-scoped
+# agent (witness/refinery/polecat) can resolve for ANY rig — confirmed via
+# internal/config/config.go's Rig.Imports/pack.go's HasPackRigs gate, the
+# `gc doctor` rig-pack-coverage check, and live `gc prime --strict` repro.
+# Piloted here first (smallest blast radius); property_scrapers/gastown.witness
+# (ga-wisp-3ap8tam) was already alive and running before this edit and is not
+# expected to need any restart for this to take effect on future spawns.
+[rigs.imports.gastown]
+source = ".gc/system/packs/gastown"
+
 [[rigs]]
 name = "marketing"
 prefix = "ma"
@@ -36,10 +49,22 @@ suspended = true
 name = "gastown"
 prefix = "gt"
 
+# gt-kfr7m: same fix as property_scrapers above (see that block's comment for
+# the full rationale) — piloted there first and verified clean before rolling
+# out to this rig.
+[rigs.imports.gastown]
+source = ".gc/system/packs/gastown"
+
 [[rigs]]
 name = "whatsapp_automation"
 prefix = "wa"
 default_branch = "main"
+
+# gt-kfr7m: same fix as property_scrapers above (see that block's comment for
+# the full rationale) — piloted there first and verified clean before rolling
+# out to this rig.
+[rigs.imports.gastown]
+source = ".gc/system/packs/gastown"
 
 [[rigs]]
 name = "deacon"
