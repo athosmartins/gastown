@@ -40,10 +40,20 @@ prefix = "ma"
 default_branch = "main"
 suspended = true
 
+# gt-kfr7m: same fix as property_scrapers above (see that block's comment for
+# the full rationale) — remaining scope for the 3 suspended rigs, added by
+# the Mayor to close out the bead and stop it re-attracting Pilot dispatch.
+[rigs.imports.gastown]
+source = ".gc/system/packs/gastown"
+
 [[rigs]]
 name = "lexbh"
 prefix = "lx"
 suspended = true
+
+# gt-kfr7m: same fix, same rationale as marketing above.
+[rigs.imports.gastown]
+source = ".gc/system/packs/gastown"
 
 [[rigs]]
 name = "gastown"
@@ -70,6 +80,11 @@ source = ".gc/system/packs/gastown"
 name = "deacon"
 prefix = "dc"
 suspended = true
+
+# gt-kfr7m: same fix, same rationale as marketing/lexbh above — last of the
+# 3 suspended rigs, closes out the bead's remaining scope.
+[rigs.imports.gastown]
+source = ".gc/system/packs/gastown"
 
 [patches]
 
