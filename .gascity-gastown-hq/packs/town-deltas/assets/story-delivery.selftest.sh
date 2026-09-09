@@ -46,7 +46,8 @@ for fn in rig_gitdir git_in token_bounded subject_impl_scopes_bead \
           task_reconciler_failed_sha_resolved \
           extract_gate_merge_info derive_rig_from_comments story_merge_verdict \
           gate_delivery_looks_partial task_reconciler_is_partial \
-          refino_criteria_status_line; do
+          refino_criteria_status_line task_reconciler_gate_passed_too_fresh \
+          age_minutes_of; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by story-delivery.sh"; exit 1; }
 done
 
@@ -529,6 +530,74 @@ case "$MISSING_LINE" in
     ok "fields missing -> INCOMPLETE line naming the missing fields, no false 'verified' claim" ;;
   *) bad "missing case produced neither expected shape: got [$MISSING_LINE]" ;;
 esac
+
+# ── 10. task_reconciler_gate_passed_too_fresh (wa-n27z0: gate:passed vs ──────
+#         delivery:pending-restart race window) ─────────────────────────────
+# The real bug (measured live 2026-09-09 on wa-olqmv, wa-a5c4g, wa-8oe0t,
+# wa-0161a, wa-f1anj): quality-gate-dispatcher.sh sets gate:passed EARLY, then
+# finishes its daemon-liveness check and (conditionally) adds
+# delivery:pending-restart 391-604s (6.5-10min) LATER in the SAME run — well
+# past this reconciler's own ~5min sweep interval. The pre-existing
+# TASK_PENDING_RESTART veto (ga-wnxeq, still correct and unchanged) only
+# fires once that label exists; it cannot help during the gap. These cases
+# use wa-olqmv's REAL measured timestamps (gate:passed 2026-09-09T05:06:43Z,
+# reconciler scan ~4min later at 05:11:33Z, delivery:pending-restart landing
+# ~7min later at 05:13:44Z) to prove THIS EXACT incident is now prevented —
+# not just a synthetic boundary case.
+echo "── 10. task_reconciler_gate_passed_too_fresh (wa-n27z0 race window) ──"
+
+# Fixed reference instant, derived forward (ISO -> epoch), never guessed
+# backward — a wrong hand-computed epoch would silently miscalibrate every
+# assertion below in the same direction.
+REF_ISO="2026-09-09T05:06:43Z"
+REF_EPOCH=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "${REF_ISO%%Z*}" +%s 2>/dev/null || date -u -d "$REF_ISO" +%s)
+ROUNDTRIP=$(date -u -r "$REF_EPOCH" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d "@$REF_EPOCH" +"%Y-%m-%dT%H:%M:%SZ")
+eq "fixture sanity: REF_EPOCH round-trips back to REF_ISO" "$ROUNDTRIP" "$REF_ISO"
+
+# The actual incident: reconciler scans ~290s (4.83min) after gate:passed,
+# well before pending-restart lands at ~421s (7.02min) — old code raced and
+# closed all 5 beads at exactly this shape. Default threshold is 20min.
+rc0 task_reconciler_gate_passed_too_fresh "$REF_ISO" "$((REF_EPOCH+290))" 20
+ok "wa-n27z0 incident reconstruction: bead scanned 4min after gate:passed (before delivery:pending-restart ever landed) is deferred, not closed"
+
+# Even at the moment delivery:pending-restart actually landed (~7min), a
+# 20min-threshold reconciler still correctly waits — proving it does not
+# merely get lucky at the specific 4min mark, it holds for the whole window.
+rc0 task_reconciler_gate_passed_too_fresh "$REF_ISO" "$((REF_EPOCH+421))" 20
+ok "still deferred at the 7min mark (when pending-restart actually landed) — margin, not a coincidence"
+
+# Boundary: just under vs. at vs. comfortably over the threshold.
+rc0 task_reconciler_gate_passed_too_fresh "$REF_ISO" "$((REF_EPOCH+1199))" 20
+ok "19min old, 20min threshold -> still too fresh (just under boundary)"
+rc1 task_reconciler_gate_passed_too_fresh "$REF_ISO" "$((REF_EPOCH+1200))" 20
+ok "exactly 20min old, 20min threshold -> old enough to proceed (inclusive boundary)"
+rc1 task_reconciler_gate_passed_too_fresh "$REF_ISO" "$((REF_EPOCH+1800))" 20
+ok "30min old, 20min threshold -> comfortably old enough to proceed"
+
+# At the exact instant gate:passed lands (age=0) -> maximally fresh, always
+# deferred regardless of threshold.
+rc0 task_reconciler_gate_passed_too_fresh "$REF_ISO" "$REF_EPOCH" 20
+ok "age=0 (scanned at the same instant gate:passed landed) -> deferred"
+
+# Empty/unparseable updated_at must fail toward "too fresh" (defer) — never
+# guess a bead is old enough to close when the timestamp is unusable. This is
+# NOT simply inherited from age_minutes_of: that helper only fails safe (age
+# 0) for an EMPTY ts; a non-empty GARBLED ts instead falls through to its own
+# epoch-0 (1970) fallback internally, which reads as billions of seconds old
+# — the UNSAFE direction. The shape check inside
+# task_reconciler_gate_passed_too_fresh exists specifically to intercept that
+# case before it ever reaches age_minutes_of.
+rc0 task_reconciler_gate_passed_too_fresh "" "$((REF_EPOCH+9999))" 20
+ok "empty updated_at -> fails toward deferred (never guesses 'old enough')"
+rc0 task_reconciler_gate_passed_too_fresh "not-a-timestamp" "$((REF_EPOCH+9999))" 20
+ok "garbled (non-empty) updated_at -> ALSO fails toward deferred, not the age_minutes_of epoch-0 trap"
+
+# The threshold is a real parameter, not a hardcoded 20 baked into the
+# function — exercise a different value to prove that.
+rc1 task_reconciler_gate_passed_too_fresh "$REF_ISO" "$((REF_EPOCH+601))" 10
+ok "custom threshold=10min: 10min old -> old enough (parameterized, not hardcoded)"
+rc0 task_reconciler_gate_passed_too_fresh "$REF_ISO" "$((REF_EPOCH+599))" 10
+ok "custom threshold=10min: 9min old -> still too fresh (parameterized, not hardcoded)"
 
 echo ""
 echo "═══════════════════════════════════════"

@@ -406,6 +406,69 @@ refino_criteria_status_line() {
   fi
 }
 
+# task_reconciler_gate_passed_too_fresh <updated_at_iso> <now_epoch> <min_age_minutes>
+#   wa-n27z0: pure decision — rc0 (true) iff the bead's last update is younger
+#   than min_age_minutes. The task reconciler (Step 1b below) must not act on a
+#   gate:passed non-story bead until enough wall-clock time has passed for the
+#   SAME (still-running, NOT crashed) quality-gate-dispatcher.sh invocation
+#   that set gate:passed to also finish its own daemon-liveness check and land
+#   delivery:pending-restart if a hold applies (ga-l7n3v) — the
+#   TASK_PENDING_RESTART veto right below this function's call site only helps
+#   once that label actually exists.
+#
+#   Measured live 2026-09-09 on 5 beads in one morning (wa-olqmv, wa-a5c4g,
+#   wa-8oe0t, wa-0161a, wa-f1anj — see wa-n27z0): gate:passed and
+#   delivery:pending-restart are set by the SAME dispatcher run, but 391-604s
+#   (6.5-10min) apart — quality-gate-dispatcher.sh sets gate:passed EARLY
+#   (ga-esbg, so the Pilot stops re-dispatching and story-delivery can pick the
+#   bead up), then runs its daemon-liveness check afterward, which can take
+#   several minutes. That gap is comfortably longer than this reconciler's own
+#   ~5min sweep interval (launchd StartInterval=309s), so the very NEXT sweep
+#   after gate:passed reliably raced ahead of the verdict and closed all 5
+#   beads before the hold label ever appeared — silently erasing the "daemon
+#   still stale" signal the hold exists to preserve (sibling bead wa-omfug:
+#   the daemons really were stale, unnoticed for hours as a result).
+#
+#   updated_at is used as the age anchor rather than a dedicated
+#   gate:passed-label-add-timestamp lookup: in every observed case the
+#   dispatcher's post-merge bookkeeping (label hygiene, comments,
+#   scope:advisory, etc.) lands within the same few-second burst as
+#   gate:passed itself, so updated_at is an accurate proxy — and erring toward
+#   "looks newer than it really is" only makes this MORE conservative (skips
+#   longer), never less safe.
+#
+#   Delegates the actual arithmetic to age_minutes_of (quality-gate-guard.sh,
+#   sourced above this point) — but does NOT trust its fallback for an
+#   unparseable timestamp uniformly: age_minutes_of only returns age=0 (safe,
+#   "very fresh") for an EMPTY ts via its own early-return; a non-empty but
+#   GARBLED ts instead falls through to epoch 0 (1970) internally, which this
+#   caller's arithmetic would then read as billions of seconds old — i.e. the
+#   UNSAFE direction (treated as ancient, allowed to proceed to close). Caught
+#   by this function's own selftest (section 10, story-delivery.selftest.sh)
+#   before it ever shipped: a bare shape check below on the exact
+#   "YYYY-MM-DDTHH:MM:SSZ" form bd always emits for updated_at intercepts any
+#   empty/malformed/unrecognized input and returns "too fresh" (defer)
+#   directly, so a garbled timestamp can never reach age_minutes_of's unsafe
+#   fallback path at all.
+#
+#   Cost of this check: this reconciler is a crash-recovery fallback (the
+#   dispatcher's own direct-close, ga-esbg, is the primary path) that acts on
+#   at most one bead per ~5min sweep — a bounded extra delay here is not
+#   time-critical. Same asymmetric-cost reasoning ga-266z8 already uses
+#   elsewhere in this file: waiting longer costs a few extra sweeps; closing
+#   too early destroys a safety signal that is hard to reconstruct after the
+#   fact.
+task_reconciler_gate_passed_too_fresh() {
+  local updated_at="$1" now_epoch="$2" min_age_minutes="$3"
+  case "$updated_at" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) : ;;
+    *) return 0 ;;  # empty, malformed, or unrecognized shape -> too fresh (defer)
+  esac
+  local age_min
+  age_min=$(age_minutes_of "$updated_at" "$now_epoch")
+  [ "$age_min" -lt "$min_age_minutes" ]
+}
+
 # Lib-only mode: `STORY_DELIVERY_LIB_ONLY=1 source story-delivery.sh` defines the
 # helpers above without running the live sweep, so the selftest exercises the
 # real functions (one source of truth, no copy-drift). Mirrors merged-bead-janitor.sh.
@@ -615,6 +678,12 @@ TASK_COUNT=0
 # "Closed by delivery sweep" comment (never true) and retry forever, one Dolt
 # commit per sweep (~5min cadence; wa-l30yr: 8+ in under 3 hours).
 TASK_CLOSE_MAX_RETRIES=3
+# wa-n27z0: minimum age (by updated_at) a gate:passed non-story bead must have
+# before the task reconciler will act on it at all — see
+# task_reconciler_gate_passed_too_fresh's header for the full race-condition
+# rationale and the measured 391-604s (6.5-10min) gap this guards against.
+# Overridable via env for tests/tuning, same idiom as the two constants above.
+TASK_GATE_PASSED_MIN_AGE_MINUTES="${TASK_GATE_PASSED_MIN_AGE_MINUTES:-20}"
 # ga-aqqj0: same cap idiom as TASK_CLOSE_MAX_RETRIES above, applied to a
 # DIFFERENT loop/step — Step 3 of the STORY delivery loop below (rig runbook
 # lookup), not the task reconciler. A rig value that can never have a runbook
@@ -730,6 +799,22 @@ if [ -z "$FORCE_STORY_ID" ]; then
       TASK_PENDING_RESTART=$(echo "$TASK_BEAD" | jq -r 'if ((.labels // []) | contains(["delivery:pending-restart"])) then "1" else "0" end' 2>/dev/null || echo "0")
       if [ "$TASK_PENDING_RESTART" = "1" ]; then
         log "Task reconciler: $TASK_BEAD_ID has delivery:pending-restart (daemon verification withheld closure, ga-l7n3v) — NOT closing; checking next candidate this sweep."
+        continue
+      fi
+
+      # wa-n27z0: the TASK_PENDING_RESTART veto just above only helps once
+      # delivery:pending-restart actually exists on the bead — but that label
+      # is set by a LATER step of the SAME (still-running, not crashed)
+      # quality-gate-dispatcher.sh invocation that set gate:passed, and the two
+      # writes are 391-604s (6.5-10min) apart in every incident measured live
+      # (wa-n27z0). A bead scanned before the hold verdict lands looks
+      # identical to one the dispatcher already cleared — this reconciler
+      # cannot tell "hold is coming" from "no hold needed" without waiting.
+      # See task_reconciler_gate_passed_too_fresh's header for the full
+      # incident and the asymmetric-cost reasoning for erring toward "wait".
+      TASK_UPDATED_AT=$(echo "$TASK_BEAD" | jq -r '.updated_at // ""' 2>/dev/null || echo "")
+      if task_reconciler_gate_passed_too_fresh "$TASK_UPDATED_AT" "$(date +%s)" "$TASK_GATE_PASSED_MIN_AGE_MINUTES"; then
+        log "Task reconciler: $TASK_BEAD_ID gate:passed still fresh (updated_at=$TASK_UPDATED_AT, <${TASK_GATE_PASSED_MIN_AGE_MINUTES}min old) — the dispatcher invocation that merged this may still be mid-flight on its own daemon-liveness check and has not had time to land delivery:pending-restart if a hold applies (wa-n27z0). NOT closing yet; checking next candidate this sweep."
         continue
       fi
 
