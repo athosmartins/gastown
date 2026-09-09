@@ -464,8 +464,28 @@ task_reconciler_gate_passed_too_fresh() {
     [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) : ;;
     *) return 0 ;;  # empty, malformed, or unrecognized shape -> too fresh (defer)
   esac
+  # ga-fapnl (gate-feedback on this bead's own first attempt): age_minutes_of
+  # is sourced CONDITIONALLY above ("if [ -r "$_STORY_DELIVERY_GUARD_SIB" ]")
+  # — a transiently unreadable/missing guard.sh sibling (the exact
+  # partial-deploy class this file's init comment already documents) leaves
+  # the symbol undefined. Calling it anyway from inside this function's own
+  # if-condition call site does NOT trip `set -e` (bash exempts if/while/&&/||
+  # conditions, recursively into the callee) — the resulting error read as
+  # "not too fresh" and proceeded, reproducing the exact race this function
+  # exists to close, via a different path than the garbled-timestamp case
+  # above. Fail closed the same way: can't verify freshness -> defer.
+  type age_minutes_of >/dev/null 2>&1 || return 0
   local age_min
   age_min=$(age_minutes_of "$updated_at" "$now_epoch")
+  # Same third-state family as the guard above, one level further in: even
+  # with age_minutes_of callable, don't trust its output blind before using
+  # it as a `-lt` operand — a non-numeric result (future internal change,
+  # unexpected input) must also fail toward "too fresh", not throw an
+  # "integer expression expected" that (per the same if-condition exemption
+  # above) reads as non-zero -> proceed.
+  case "$age_min" in
+    ''|*[!0-9]*) return 0 ;;  # non-numeric -> can't compare -> too fresh (defer)
+  esac
   [ "$age_min" -lt "$min_age_minutes" ]
 }
 

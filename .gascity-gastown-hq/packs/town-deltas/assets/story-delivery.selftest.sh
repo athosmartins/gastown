@@ -599,6 +599,61 @@ ok "custom threshold=10min: 10min old -> old enough (parameterized, not hardcode
 rc0 task_reconciler_gate_passed_too_fresh "$REF_ISO" "$((REF_EPOCH+599))" 10
 ok "custom threshold=10min: 9min old -> still too fresh (parameterized, not hardcoded)"
 
+# ga-fapnl gate-feedback on this bead's own first attempt: age_minutes_of is
+# sourced CONDITIONALLY (quality-gate-guard.sh, only "if [ -r ... ]") at this
+# file's top-level init — a transiently unreadable/missing sibling leaves the
+# symbol undefined, not merely returning a bad value.
+#
+# MUST reproduce this if-wrapped, exactly like the real call site
+# (story-delivery.sh:836 `if task_reconciler_gate_passed_too_fresh ...;
+# then`) — bash suspends `set -e` for anything tested by if/while/&&/||,
+# recursively into called functions, so a bare top-level call (no if) is a
+# DIFFERENT execution context and does not reproduce the bug: it either
+# aborts the whole script outright (inherited -e from sourcing this
+# set -euo pipefail file) or otherwise misrepresents which branch the real
+# call site would take. Each rep runs in its own `bash` subprocess (own
+# script file, not inline -c string) so `unset -f`/the fake override can't
+# disturb any other test in this file, and the OUTER process's own exit
+# code — 0 from the script's own `exit 0` in the if-branch, 1 from the
+# else-branch — is what we assert on, never a value echoed from inside.
+cat > /tmp/story-delivery-selftest-ifwrap-undef.$$.sh <<REPRO
+STORY_DELIVERY_LIB_ONLY=1 source "$SCRIPT" >/dev/null 2>&1
+unset -f age_minutes_of
+if task_reconciler_gate_passed_too_fresh "$REF_ISO" "\$((REF_EPOCH+9999))" 20; then
+  exit 0
+else
+  exit 1
+fi
+REPRO
+if REF_EPOCH="$REF_EPOCH" bash /tmp/story-delivery-selftest-ifwrap-undef.$$.sh >/dev/null 2>&1; then
+  ok "age_minutes_of undefined (guard.sh sibling unreadable), if-wrapped like the real call site -> fails toward deferred, not proceed"
+else
+  bad "age_minutes_of undefined (guard.sh sibling unreadable), if-wrapped like the real call site -> expected deferred (rc0), proceeded instead"
+fi
+rm -f /tmp/story-delivery-selftest-ifwrap-undef.$$.sh
+
+# Same third-state family, one level further in: age_minutes_of callable but
+# its result isn't usable as a -lt operand (future internal change, or any
+# other unexpected output) must ALSO fail toward deferred, not throw an
+# "integer expression expected" that (same if-condition set -e exemption)
+# would otherwise read as non-zero -> proceed. Same if-wrapped-subprocess
+# reasoning as immediately above.
+cat > /tmp/story-delivery-selftest-ifwrap-nonnum.$$.sh <<REPRO
+STORY_DELIVERY_LIB_ONLY=1 source "$SCRIPT" >/dev/null 2>&1
+age_minutes_of() { echo "not-a-number"; }
+if task_reconciler_gate_passed_too_fresh "$REF_ISO" "\$((REF_EPOCH+9999))" 20; then
+  exit 0
+else
+  exit 1
+fi
+REPRO
+if REF_EPOCH="$REF_EPOCH" bash /tmp/story-delivery-selftest-ifwrap-nonnum.$$.sh >/dev/null 2>&1; then
+  ok "age_minutes_of returns non-numeric, if-wrapped like the real call site -> fails toward deferred, not proceed"
+else
+  bad "age_minutes_of returns non-numeric, if-wrapped like the real call site -> expected deferred (rc0), proceeded instead"
+fi
+rm -f /tmp/story-delivery-selftest-ifwrap-nonnum.$$.sh
+
 echo ""
 echo "═══════════════════════════════════════"
 echo "PASS=$PASS FAIL=$FAIL"
