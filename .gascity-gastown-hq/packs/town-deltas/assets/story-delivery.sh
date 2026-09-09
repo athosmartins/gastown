@@ -489,6 +489,97 @@ task_reconciler_gate_passed_too_fresh() {
   [ "$age_min" -lt "$min_age_minutes" ]
 }
 
+# task_gate_passed_age_anchor <updated_at_iso_or_empty> <last_event_at_iso_or_empty>
+#   wa-x6ggx: PURE picker — returns whichever of the two ISO-8601 timestamps is
+#   MORE RECENT. Exists because `bd label add`/`bd label remove` NEVER bump a
+#   bead's `updated_at` field (confirmed empirically 2026-09-09 against a live
+#   claimed bead: added a label, updated_at was byte-for-byte unchanged) — and
+#   gate:passed is ALWAYS applied via `bd label add` (quality-gate-
+#   dispatcher.sh:5193), a label-only mutation. So updated_at ALONE can read as
+#   arbitrarily OLDER than when gate:passed actually landed, whenever no OTHER
+#   genuine (non-label) mutation happens to coincide with it — silently
+#   defeating task_reconciler_gate_passed_too_fresh in the UNSAFE direction
+#   (looks older than it really is -> proceeds to close before delivery:
+#   pending-restart has had time to land, reproducing the exact wa-n27z0 race
+#   this whole mechanism exists to close, just via a different anchor bug than
+#   either guard that function already hardens against). Live repro: wa-1psgk
+#   (2026-09-09 14:38:41-47 BRT) — gate:passed added, the reconciler closed it
+#   6 SECONDS later; updated_at read the timestamp of an earlier, unrelated
+#   content update because the intervening label additions (gate:queued,
+#   gate:reviewing, gate:passed) never touched it.
+#
+#   Comparison is plain string ">" — safe ONLY because both inputs, once
+#   shape-validated, are the fixed-width "YYYY-MM-DDTHH:MM:SSZ" form bd always
+#   emits, for which lexicographic order equals chronological order (same
+#   assumption task_reconciler_gate_passed_too_fresh's own header already
+#   relies on for its shape-check). Repeats that function's tiny case-guard
+#   inline rather than factor out a shared helper — this file's established
+#   idiom for a 3-line check, see that function itself. An invalid/empty
+#   candidate is simply never preferred; if BOTH are invalid/empty, returns
+#   the first argument (possibly empty/malformed) unchanged and lets
+#   task_reconciler_gate_passed_too_fresh's own shape-check — unchanged —
+#   fail closed exactly as it already does today. This function only ever
+#   improves the INPUT to that check; it adds no second decision point.
+task_gate_passed_age_anchor() {
+  local a="$1" b="$2"
+  local a_ok=0 b_ok=0
+  case "$a" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) a_ok=1 ;;
+  esac
+  case "$b" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) b_ok=1 ;;
+  esac
+  if [ "$a_ok" = "1" ] && [ "$b_ok" = "1" ]; then
+    if [ "$b" \> "$a" ]; then echo "$b"; else echo "$a"; fi
+  elif [ "$b_ok" = "1" ]; then
+    echo "$b"
+  else
+    echo "$a"
+  fi
+}
+
+# task_bead_last_event_at <store> <bead_id>
+#   wa-x6ggx: thin LIVE-data fetch, deliberately kept separate from the pure
+#   picker above so it can be overridden/faked in the selftest (same
+#   dependency-injection pattern this file already uses for age_minutes_of,
+#   see selftest section 10) — this selftest suite runs with NO live Dolt/gc/
+#   launchd (see this file's own header), so this function is never
+#   unit-tested directly, only via override.
+#
+#   Queries the standard `events` audit table (NOT the opt-in
+#   bd_events_journal, which requires explicit enablement per `bd events
+#   --help` and is not guaranteed on for every rig) for this bead's most
+#   recent mutation of ANY kind — not narrowed to the specific "Added label:
+#   gate:passed" comment text, both because that exact text is not a stable
+#   contract to match against and because any recent touch (a further label
+#   after gate:passed, say) is at least as good a "still potentially
+#   mid-flight" signal.
+#
+#   Bead id is shape-validated before interpolation into the SQL string
+#   (defense in depth — ids are always bd-generated, never user input, but
+#   this file's own established style never trusts that alone; see e.g. the
+#   updated_at shape-checks throughout). The guard REJECTS anything containing
+#   a character outside [a-zA-Z0-9_-] (this is a character-class exclusion,
+#   not a "must contain a hyphen" positive match — a naive `[a-zA-Z]*-*`
+#   glob looks like it requires a hyphen but does NOT: `-*` matches zero
+#   occurrences too, so it would silently accept a hyphen-free string;
+#   caught in this bead's own selftest before shipping). Also rejects empty.
+#   Fails closed: any failure (malformed id, bd sql unavailable/erroring/
+#   timing out, empty result, unparseable JSON) returns an EMPTY string,
+#   which task_gate_passed_age_anchor above treats as "no better information"
+#   and task_reconciler_gate_passed_too_fresh's own shape-check treats as
+#   "too fresh, defer" if it ends up the sole anchor — never LESS
+#   conservative than today's updated_at-only behavior, only ever more.
+task_bead_last_event_at() {
+  local store="$1" bead_id="$2"
+  case "$bead_id" in
+    ""|*[!a-zA-Z0-9_-]*) echo ""; return ;;
+  esac
+  timeout 10 bd -C "$store" sql --json \
+    "SELECT created_at FROM events WHERE issue_id='$bead_id' ORDER BY created_at DESC LIMIT 1" \
+    2>/dev/null | jq -r '.[0].created_at // ""' 2>/dev/null || echo ""
+}
+
 # Lib-only mode: `STORY_DELIVERY_LIB_ONLY=1 source story-delivery.sh` defines the
 # helpers above without running the live sweep, so the selftest exercises the
 # real functions (one source of truth, no copy-drift). Mirrors merged-bead-janitor.sh.
@@ -835,6 +926,23 @@ if [ -z "$FORCE_STORY_ID" ]; then
       TASK_UPDATED_AT=$(echo "$TASK_BEAD" | jq -r '.updated_at // ""' 2>/dev/null || echo "")
       if task_reconciler_gate_passed_too_fresh "$TASK_UPDATED_AT" "$(date +%s)" "$TASK_GATE_PASSED_MIN_AGE_MINUTES"; then
         log "Task reconciler: $TASK_BEAD_ID gate:passed still fresh (updated_at=$TASK_UPDATED_AT, <${TASK_GATE_PASSED_MIN_AGE_MINUTES}min old) — the dispatcher invocation that merged this may still be mid-flight on its own daemon-liveness check and has not had time to land delivery:pending-restart if a hold applies (wa-n27z0). NOT closing yet; checking next candidate this sweep."
+        continue
+      fi
+      # wa-x6ggx: updated_at ALONE just said "old enough" — but bd label
+      # add/remove never bumps updated_at (confirmed empirically), and
+      # gate:passed is ALWAYS applied via a label-only mutation, so updated_at
+      # can be stale by exactly the amount that matters here. Double-check
+      # against the bead's true last-touched time (events table, includes
+      # label mutations) before trusting the "proceed" verdict — live repro
+      # wa-1psgk (2026-09-09): updated_at reflected an unrelated earlier
+      # update at the instant gate:passed landed 6sec before the sweep closed
+      # it. Only paid on THIS path (updated_at already said "proceed") — the
+      # common case where updated_at alone already says "too fresh" above is
+      # unaffected and unslowed by the extra query.
+      TASK_LAST_EVENT_AT=$(task_bead_last_event_at "$TASK_STORE" "$TASK_BEAD_ID")
+      TASK_EFFECTIVE_UPDATED_AT=$(task_gate_passed_age_anchor "$TASK_UPDATED_AT" "$TASK_LAST_EVENT_AT")
+      if task_reconciler_gate_passed_too_fresh "$TASK_EFFECTIVE_UPDATED_AT" "$(date +%s)" "$TASK_GATE_PASSED_MIN_AGE_MINUTES"; then
+        log "Task reconciler: $TASK_BEAD_ID gate:passed still fresh once label-only mutations are accounted for (effective anchor=$TASK_EFFECTIVE_UPDATED_AT, updated_at alone read $TASK_UPDATED_AT, <${TASK_GATE_PASSED_MIN_AGE_MINUTES}min old, wa-x6ggx) — NOT closing yet; checking next candidate this sweep."
         continue
       fi
 

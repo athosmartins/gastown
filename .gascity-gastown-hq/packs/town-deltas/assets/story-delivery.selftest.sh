@@ -47,7 +47,7 @@ for fn in rig_gitdir git_in token_bounded subject_impl_scopes_bead \
           extract_gate_merge_info derive_rig_from_comments story_merge_verdict \
           gate_delivery_looks_partial task_reconciler_is_partial \
           refino_criteria_status_line task_reconciler_gate_passed_too_fresh \
-          age_minutes_of; do
+          age_minutes_of task_gate_passed_age_anchor task_bead_last_event_at; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by story-delivery.sh"; exit 1; }
 done
 
@@ -653,6 +653,70 @@ else
   bad "age_minutes_of returns non-numeric, if-wrapped like the real call site -> expected deferred (rc0), proceeded instead"
 fi
 rm -f /tmp/story-delivery-selftest-ifwrap-nonnum.$$.sh
+
+# ── 11. task_gate_passed_age_anchor (wa-x6ggx: updated_at ignores label-only ─
+#          mutations, including gate:passed itself) ──────────────────────────
+# bd label add/remove does NOT bump a bead's updated_at (confirmed empirically
+# against a live claimed bead, 2026-09-09: added a label, updated_at was
+# byte-for-byte unchanged) — and gate:passed is ALWAYS applied via a
+# label-only mutation (quality-gate-dispatcher.sh:5193). So updated_at ALONE
+# can read as much older than gate:passed's real landing time, defeating
+# task_reconciler_gate_passed_too_fresh in the UNSAFE direction (looks old
+# enough -> proceeds early, before delivery:pending-restart has had time to
+# land). Live repro: wa-1psgk (2026-09-09 14:38:41-47 BRT) — gate:passed
+# added, the reconciler closed it 6 SECONDS later. This section proves the
+# fix: task_gate_passed_age_anchor picks the more recent of updated_at and
+# the events-table's true last-touched time, so the call site
+# (story-delivery.sh ~840) feeds task_reconciler_gate_passed_too_fresh a
+# trustworthy anchor instead.
+echo "── 11. task_gate_passed_age_anchor (wa-x6ggx: updated_at ignores labels) ──"
+
+ANCHOR_OLD_ISO="2026-09-09T05:06:43Z"
+ANCHOR_NEW_ISO="2026-09-09T05:30:00Z"
+
+eq "both valid, b more recent -> picks b" \
+   "$(task_gate_passed_age_anchor "$ANCHOR_OLD_ISO" "$ANCHOR_NEW_ISO")" "$ANCHOR_NEW_ISO"
+eq "both valid, a more recent -> picks a" \
+   "$(task_gate_passed_age_anchor "$ANCHOR_NEW_ISO" "$ANCHOR_OLD_ISO")" "$ANCHOR_NEW_ISO"
+eq "both valid, equal -> picks that value" \
+   "$(task_gate_passed_age_anchor "$ANCHOR_OLD_ISO" "$ANCHOR_OLD_ISO")" "$ANCHOR_OLD_ISO"
+eq "only a valid (b empty) -> picks a" \
+   "$(task_gate_passed_age_anchor "$ANCHOR_OLD_ISO" "")" "$ANCHOR_OLD_ISO"
+eq "only b valid (a empty) -> picks b" \
+   "$(task_gate_passed_age_anchor "" "$ANCHOR_NEW_ISO")" "$ANCHOR_NEW_ISO"
+eq "both empty -> returns empty (defers to task_reconciler_gate_passed_too_fresh's own shape-check)" \
+   "$(task_gate_passed_age_anchor "" "")" ""
+eq "a garbled, b empty -> returns garbled a unchanged (same reasoning)" \
+   "$(task_gate_passed_age_anchor "not-a-timestamp" "")" "not-a-timestamp"
+eq "a garbled, b valid -> picks valid b over garbled a" \
+   "$(task_gate_passed_age_anchor "not-a-timestamp" "$ANCHOR_NEW_ISO")" "$ANCHOR_NEW_ISO"
+
+# task_bead_last_event_at's shape-guard (fails closed to "" without ever
+# calling out to bd sql — no live DB, no network, matches this file's own
+# header promise). A naive `[a-zA-Z]*-*` glob LOOKS like it requires a
+# hyphen but does not (`-*` matches zero occurrences too) — this was caught
+# and fixed before shipping; pin both directions so it can't regress silently.
+eq "task_bead_last_event_at: empty bead id -> empty, no live bd sql attempted" \
+   "$(task_bead_last_event_at "/irrelevant" "")" ""
+eq "task_bead_last_event_at: bead id with a disallowed char (SQL-relevant quote) -> empty, fails closed" \
+   "$(task_bead_last_event_at "/irrelevant" "wa-abc' OR '1'='1")" ""
+
+# The actual wa-1psgk shape, end to end, composing the two REAL (already
+# individually proven) functions — no new decision logic to trust beyond
+# what sections 10 and 11 above already cover in isolation. updated_at reads
+# OLD (a genuine earlier content update), but gate:passed itself (a
+# label-only mutation) landed FRESH per the events table 6 seconds before
+# the sweep scanned it — wa-1psgk's actual measured gap.
+ANCHOR_OLD_EPOCH=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "${ANCHOR_OLD_ISO%%Z*}" +%s 2>/dev/null || date -u -d "$ANCHOR_OLD_ISO" +%s)
+ANCHOR_NEW_EPOCH=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "${ANCHOR_NEW_ISO%%Z*}" +%s 2>/dev/null || date -u -d "$ANCHOR_NEW_ISO" +%s)
+ANCHOR_NOW=$((ANCHOR_NEW_EPOCH + 6))
+
+rc1 task_reconciler_gate_passed_too_fresh "$ANCHOR_OLD_ISO" "$ANCHOR_NOW" 20
+ok "PRE-FIX SHAPE PINNED: updated_at alone (23min+ old, an unrelated earlier content update) says 'old enough' at the exact instant gate:passed actually landed 6s ago — this IS the wa-1psgk bug, reproduced at the updated_at-only layer"
+
+ANCHOR_EFFECTIVE=$(task_gate_passed_age_anchor "$ANCHOR_OLD_ISO" "$ANCHOR_NEW_ISO")
+rc0 task_reconciler_gate_passed_too_fresh "$ANCHOR_EFFECTIVE" "$ANCHOR_NOW" 20
+ok "FIX PROVEN: feeding the combined anchor (picks the fresh gate:passed-adjacent timestamp) into the SAME unchanged freshness check now correctly defers on the exact wa-1psgk shape"
 
 echo ""
 echo "═══════════════════════════════════════"
