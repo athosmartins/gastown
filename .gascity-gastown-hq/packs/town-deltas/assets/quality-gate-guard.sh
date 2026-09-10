@@ -952,6 +952,89 @@ classify_external_pr_gap3() {
   esac
 }
 
+# derive_review_decision_from_reviews <reviews_json> — ga-6ea90
+# gastownhall/beads has no required-review branch protection, so GitHub never
+# computes .reviewDecision even when a maintainer formally rejected a PR via a
+# real review object — confirmed live on PR #6390 (ga-bq3w5): reviewDecision
+# came back "" while reviews[0].state was "CHANGES_REQUESTED". GAP-3's own
+# classify_external_pr_gap3 above only ever sees whatever review_decision the
+# caller hands it, so on this repo class it was structurally blind: 5 beads
+# (ga-y6gjv, ga-bq3w5, ga-wpdum, ga-r8haw, ga-7uoua) sat "awaiting external
+# merge" for 7-35+ days with an unaddressed maintainer ask nobody surfaced.
+# This derives the same per-reviewer-latest-wins verdict GitHub itself
+# computes when branch protection IS configured: each reviewer's most recent
+# ACTIONABLE review (APPROVED or CHANGES_REQUESTED — COMMENTED carries no
+# vote, same as GitHub's own reviewDecision algorithm) is their vote; any
+# reviewer's latest vote being CHANGES_REQUESTED makes the derived decision
+# CHANGES_REQUESTED. Deliberately does NOT also filter by headRefOid/commit
+# staleness — the caller's EXISTING EXT_CR_COMMIT/changes_addressed machinery
+# already answers "was this specific CHANGES_REQUESTED review since addressed
+# by a later push" from this same raw reviews[] array (see
+# classify_external_pr_gap3's changes_addressed docstring above);
+# reimplementing that here would just be a second chance to get it wrong.
+# reviews_json: the raw `.reviews` array from `gh pr view --json reviews`
+#   (each element: {"author":{"login":...},"state":...,"submittedAt":...}).
+# Returns: CHANGES_REQUESTED | APPROVED | "" (no actionable review yet, empty
+#   input, or unparseable input — fail-safe empty in all three cases, same
+#   convention as every other jq call in this file: never guess a verdict
+#   from data we can't read).
+derive_review_decision_from_reviews() {
+  local reviews_json="${1:-}"
+  [ -z "$reviews_json" ] && { echo ""; return; }
+  echo "$reviews_json" | jq -r '
+    (. // [])
+    | map(select(.state == "APPROVED" or .state == "CHANGES_REQUESTED"))
+    | group_by(.author.login // "")
+    | map(sort_by(.submittedAt // "") | last)
+    | if (map(select(.state == "CHANGES_REQUESTED")) | length) > 0 then
+        "CHANGES_REQUESTED"
+      elif (map(select(.state == "APPROVED")) | length) > 0 then
+        "APPROVED"
+      else
+        ""
+      end
+  ' 2>/dev/null || echo ""
+}
+
+# derive_comment_verdict_signal <comments_json> — ga-6ea90
+# Some maintainer verdicts on gastownhall/beads never become a formal review
+# at all — they land as a plain PR-conversation comment, so
+# derive_review_decision_from_reviews above can't see them. Confirmed live on
+# two of the same 5 stuck beads: PR #5470 (ga-7uoua) has reviews==[] but two
+# comments containing "VERDICT: REQUEST-CHANGES"; PR #5384 (ga-r8haw) has
+# reviews==[] but a comment containing "Review verdict: MERGE AFTER FIXES
+# (small ones)". This scans comment bodies for the verdict phrases this
+# city's maintainers actually use and returns the most-recent-by-createdAt
+# match (in case an earlier verdict was superseded by a later one).
+# Deliberately does NOT filter by push-date recency: gastownhall/beads commit
+# dates shift under rebase with no code change (confirmed live on #5384 — its
+# head commit is dated a full month after an untouched "MERGE AFTER FIXES"
+# verdict, yet the Mayor's own ground-truth triage on 2026-09-10 confirmed
+# that bead was still genuinely stuck), so a push-date filter would have
+# hidden a real positive. A false "still pending" here costs one dispatch
+# cycle where a builder reads the live PR and finds it already addressed; a
+# false "all clear" costs the bead rotting silently again — the exact
+# asymmetry this bead exists to fix.
+# comments_json: the raw `.comments` array from `gh pr view --json comments`
+#   (each element: {"author":{"login":...},"createdAt":...,"body":...}).
+# Returns: the matching comment's author+timestamp+body (body truncated to
+#   200 chars) as one string, or "" (no verdict comment, empty input, or
+#   unparseable input — fail-safe empty, same convention as everywhere else
+#   in this file).
+derive_comment_verdict_signal() {
+  local comments_json="${1:-}"
+  [ -z "$comments_json" ] && { echo ""; return; }
+  echo "$comments_json" | jq -r '
+    (. // [])
+    | map(select(((.body // "") | test("VERDICT:\\s*REQUEST[- ]CHANGES|MERGE[- ]AFTER[- ]FIXES|CHANGES[- ]REQUESTED"; "i"))))
+    | sort_by(.createdAt // "")
+    | last
+    | if . == null then ""
+      else ((.author.login // "unknown") + " @ " + (.createdAt // "?") + ": " + ((.body // "")[0:200]))
+      end
+  ' 2>/dev/null || echo ""
+}
+
 # gap2_query_active_markers — ga-4tgga: I/O helper (not pure, like set_gate_status
 # above) fetching every type:quality-gate-marker whose gate-status is still ACTIVE
 # (ready/queued/claimed/dispatching/running — anything short of terminal). Defined
@@ -3720,8 +3803,10 @@ else
     # ga-rmtzrg: reviews,headRefOid added to the field set so classify_external_pr_gap3
     # can tell "CHANGES_REQUESTED, never addressed" apart from "CHANGES_REQUESTED,
     # already fixed by a later push, awaiting re-review" — see that function's
-    # docstring for the full rationale.
-    EXT_PR_JSON=$(gh pr view "$EXT_NUM" --repo "$EXT_REPO" --json state,reviewDecision,mergedAt,mergeCommit,url,reviews,headRefOid 2>/dev/null || echo "")
+    # docstring for the full rationale. ga-6ea90: comments added so
+    # derive_comment_verdict_signal can see maintainer verdicts that never
+    # became a formal review at all (see that function's docstring).
+    EXT_PR_JSON=$(gh pr view "$EXT_NUM" --repo "$EXT_REPO" --json state,reviewDecision,mergedAt,mergeCommit,url,reviews,headRefOid,comments 2>/dev/null || echo "")
 
     if [ -z "$EXT_PR_JSON" ]; then
       log "GAP-3: $EXT_ID — gh pr view $EXT_NUM --repo $EXT_REPO failed (network/auth/not-found) — safe-skip"
@@ -3733,6 +3818,36 @@ else
     EXT_MERGE_SHA=$(echo "$EXT_PR_JSON" | jq -r '.mergeCommit.oid // ""' 2>/dev/null || echo "")
     EXT_URL=$(echo "$EXT_PR_JSON" | jq -r '.url // ""' 2>/dev/null || echo "")
     [ -z "$EXT_URL" ] && EXT_URL="https://github.com/$EXT_REPO/pull/$EXT_NUM"
+
+    # ga-6ea90: GitHub's own reviewDecision comes back "" on repos without
+    # required-review branch protection (confirmed live: gastownhall/beads)
+    # even when a maintainer explicitly rejected the PR — see
+    # derive_review_decision_from_reviews's docstring for the full incident.
+    # Only consulted when GH's own field is blank, so a real reviewDecision
+    # always wins unchanged (no behavior change on repos where GitHub DOES
+    # compute it).
+    EXT_VERDICT_SOURCE=""
+    if [ -z "$EXT_REVIEW" ]; then
+      EXT_REVIEWS_JSON=$(echo "$EXT_PR_JSON" | jq -c '.reviews // []' 2>/dev/null || echo "[]")
+      EXT_REVIEW=$(derive_review_decision_from_reviews "$EXT_REVIEWS_JSON")
+      if [ "$EXT_REVIEW" = "CHANGES_REQUESTED" ]; then
+        EXT_VERDICT_SOURCE="derived from .reviews[] (GitHub's own reviewDecision is blank — no required-review branch protection on $EXT_REPO)"
+      fi
+    fi
+
+    # Some maintainer verdicts never become a formal review at all — they
+    # land as a plain PR-conversation comment (ga-6ea90: #5470/ga-7uoua,
+    # #5384/ga-r8haw both have reviews==[] entirely). Only consulted when the
+    # two sources above produced no CHANGES_REQUESTED, so a real review
+    # always takes precedence over a comment.
+    if [ "$EXT_REVIEW" != "CHANGES_REQUESTED" ]; then
+      EXT_COMMENTS_JSON=$(echo "$EXT_PR_JSON" | jq -c '.comments // []' 2>/dev/null || echo "[]")
+      EXT_COMMENT_VERDICT=$(derive_comment_verdict_signal "$EXT_COMMENTS_JSON")
+      if [ -n "$EXT_COMMENT_VERDICT" ]; then
+        EXT_REVIEW="CHANGES_REQUESTED"
+        EXT_VERDICT_SOURCE="derived from a maintainer PR comment, no formal review at all: $EXT_COMMENT_VERDICT"
+      fi
+    fi
 
     # ga-rmtzrg: changes_addressed is "1" ONLY on positive confirmation — both
     # SHAs present AND different. Any jq/field-missing failure leaves either
@@ -3773,10 +3888,16 @@ else
         warn "GAP-3: $EXT_ID — PR $EXT_URL has CHANGES_REQUESTED — surfacing real gate:needs-fix"
         bd -C "$GC_CITY" label remove "$EXT_ID" "story:awaiting-external-merge" -q 2>/dev/null || true
         bd -C "$GC_CITY" label add    "$EXT_ID" "gate:needs-fix"                -q 2>/dev/null || true
-        bd -C "$GC_CITY" comment "$EXT_ID" "ga-jto05 GAP-3 reconciler: external PR $EXT_URL is OPEN with reviewDecision=CHANGES_REQUESTED — an upstream reviewer requested changes. story:awaiting-external-merge cleared; gate:needs-fix set so Pilot dispatches a builder with the real review feedback as brief (fetch via gh pr view $EXT_NUM --repo $EXT_REPO --json reviews,comments — this is the case ga-e2n96 says gate:needs-fix should actually mean: a reviewer really did reject the code)." 2>/dev/null || true
+        EXT_FLAG_MSG="ga-jto05 GAP-3 reconciler: external PR $EXT_URL is OPEN with a pending change request — an upstream reviewer requested changes. story:awaiting-external-merge cleared; gate:needs-fix set so Pilot dispatches a builder with the real review feedback as brief (fetch via gh pr view $EXT_NUM --repo $EXT_REPO --json reviews,comments — this is the case ga-e2n96 says gate:needs-fix should actually mean: a reviewer really did reject the code)."
+        if [ -n "$EXT_VERDICT_SOURCE" ]; then
+          EXT_FLAG_MSG="$EXT_FLAG_MSG
+
+ga-6ea90: GitHub's own reviewDecision field is blank for this PR — $EXT_VERDICT_SOURCE"
+        fi
+        bd -C "$GC_CITY" comment "$EXT_ID" "$EXT_FLAG_MSG" 2>/dev/null || true
         ;;
       wait:pending)
-        log "GAP-3: $EXT_ID — PR $EXT_URL is OPEN, reviewDecision=${EXT_REVIEW:-none} — still genuinely pending, no action"
+        log "GAP-3: $EXT_ID — PR $EXT_URL is OPEN, review-decision signal=${EXT_REVIEW:-none} — still genuinely pending, no action"
         ;;
       wait:awaiting-rereview)
         log "GAP-3: $EXT_ID — PR $EXT_URL has CHANGES_REQUESTED but head ($EXT_HEAD_SHA) has moved past the reviewed commit ($EXT_CR_COMMIT) — a fix was already pushed, awaiting re-review. Leaving story:awaiting-external-merge alone (ga-rmtzrg: do NOT re-flip to gate:needs-fix on an already-addressed review), no action"

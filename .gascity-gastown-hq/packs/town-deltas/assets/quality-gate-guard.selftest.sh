@@ -273,6 +273,125 @@ r=$(classify_external_pr_gap3 CLOSED '' 1); [ "$r" = "flag:closed-not-merged" ] 
 r=$(classify_external_pr_gap3 OPEN '' 1); [ "$r" = "wait:pending" ] && ok "3rd arg irrelevant when review_decision isn't CHANGES_REQUESTED" || bad "OPEN-no-review+3rd-arg got '$r'"
 r=$(classify_external_pr_gap3 OPEN APPROVED 1); [ "$r" = "wait:pending" ] && ok "3rd arg irrelevant when review_decision=APPROVED" || bad "OPEN-approved+3rd-arg got '$r'"
 
+# ── derive_review_decision_from_reviews <reviews_json> — ga-6ea90 ────────────
+# gastownhall/beads has no required-review branch protection, so GitHub never
+# computes .reviewDecision even when a maintainer formally rejected a PR via a
+# real review object — confirmed live on PR #6390 (ga-bq3w5): reviewDecision=""
+# but reviews[0].state=="CHANGES_REQUESTED". This derives the same
+# per-reviewer-latest-wins verdict GitHub itself computes when branch
+# protection IS on: each reviewer's most recent ACTIONABLE review (APPROVED or
+# CHANGES_REQUESTED — COMMENTED carries no vote) is their vote; any reviewer's
+# latest vote being CHANGES_REQUESTED makes the derived decision
+# CHANGES_REQUESTED. Fixtures below are trimmed real shapes from `gh pr view
+# --json reviews` against gastownhall/beads, not invented data.
+echo "derive_review_decision_from_reviews: reviewDecision-blank repos (gastownhall/beads)"
+r=$(derive_review_decision_from_reviews ''); [ "$r" = "" ] && ok "empty input → '' (fail-safe, no guess)" || bad "empty input got '$r'"
+r=$(derive_review_decision_from_reviews '[]'); [ "$r" = "" ] && ok "no reviews yet → ''" || bad "empty array got '$r'"
+r=$(derive_review_decision_from_reviews 'not json'); [ "$r" = "" ] && ok "unparseable input → '' (fail-safe)" || bad "garbage input got '$r'"
+# Real shape: PR #6390 (ga-bq3w5) — one reviewer, one CHANGES_REQUESTED review, reviewDecision="".
+r=$(derive_review_decision_from_reviews '[{"author":{"login":"bee-ghosttrack"},"state":"CHANGES_REQUESTED","submittedAt":"2026-09-08T02:30:17Z","commit":{"oid":"3fc956d1"}}]')
+[ "$r" = "CHANGES_REQUESTED" ] && ok "ga-6ea90 ACCEPTANCE (PR #6390 shape): single CHANGES_REQUESTED review → CHANGES_REQUESTED" || bad "PR#6390 shape got '$r'"
+r=$(derive_review_decision_from_reviews '[{"author":{"login":"bee"},"state":"APPROVED","submittedAt":"2026-09-01T00:00:00Z"}]')
+[ "$r" = "APPROVED" ] && ok "single APPROVED review → APPROVED" || bad "single-approved got '$r'"
+r=$(derive_review_decision_from_reviews '[{"author":{"login":"bee"},"state":"COMMENTED","submittedAt":"2026-09-01T00:00:00Z"}]')
+[ "$r" = "" ] && ok "COMMENTED-only (no vote cast) → '' — a comment on a review is not a verdict" || bad "commented-only got '$r'"
+# Real shape: PR #5989 (ga-xcq1ph) — bee-ghosttrack voted CHANGES_REQUESTED,
+# then COMMENTED, then APPROVED (their own latest wins) — the genuine-wait
+# case that must NOT be mistaken for a still-pending rejection.
+r=$(derive_review_decision_from_reviews '[
+  {"author":{"login":"bee-ghosttrack"},"state":"CHANGES_REQUESTED","submittedAt":"2026-09-03T01:12:53Z"},
+  {"author":{"login":"bee-ghosttrack"},"state":"COMMENTED","submittedAt":"2026-09-07T03:45:32Z"},
+  {"author":{"login":"bee-ghosttrack"},"state":"APPROVED","submittedAt":"2026-09-07T03:45:51Z"}
+]')
+[ "$r" = "APPROVED" ] && ok "ga-6ea90 NEGATIVE ACCEPTANCE (PR #5989 shape): same reviewer CHANGES_REQUESTED→COMMENTED→APPROVED, latest wins → APPROVED, not a false flag" || bad "PR#5989 shape got '$r'"
+# Two reviewers: one's latest is APPROVED, the other's latest is CHANGES_REQUESTED — any blocker wins.
+r=$(derive_review_decision_from_reviews '[
+  {"author":{"login":"a"},"state":"APPROVED","submittedAt":"2026-09-01T00:00:00Z"},
+  {"author":{"login":"b"},"state":"CHANGES_REQUESTED","submittedAt":"2026-09-02T00:00:00Z"}
+]')
+[ "$r" = "CHANGES_REQUESTED" ] && ok "two reviewers, one still blocking → CHANGES_REQUESTED (any outstanding blocker wins, mirrors GitHub's own rollup)" || bad "two-reviewer-mixed got '$r'"
+
+# ── derive_comment_verdict_signal <comments_json> — ga-6ea90 ─────────────────
+# Some maintainer verdicts on gastownhall/beads never become a formal review
+# at all — they land as a plain PR-conversation comment, so
+# derive_review_decision_from_reviews above can't see them (.reviews==[] on
+# both real cases below). Fixtures are trimmed real bodies from `gh pr view
+# --json comments` on #5470 (ga-7uoua) and #5384 (ga-r8haw) — both sat as
+# "awaiting external merge" for weeks despite an explicit maintainer verdict,
+# because nothing ever read PR comments.
+echo "derive_comment_verdict_signal: verdict posted as a plain PR comment, not a review"
+r=$(derive_comment_verdict_signal ''); [ "$r" = "" ] && ok "empty input → '' (fail-safe)" || bad "empty input got '$r'"
+r=$(derive_comment_verdict_signal '[]'); [ "$r" = "" ] && ok "no comments → ''" || bad "empty array got '$r'"
+r=$(derive_comment_verdict_signal 'not json'); [ "$r" = "" ] && ok "unparseable input → '' (fail-safe)" || bad "garbage input got '$r'"
+r=$(derive_comment_verdict_signal '[{"author":{"login":"bee-ghosttrack"},"createdAt":"2026-08-09T15:10:31Z","body":"CI triage: the conformance reds are pre-existing, unrelated to this PR."}]')
+[ "$r" = "" ] && ok "ordinary comment, no verdict phrase → '' — must not fire on every maintainer comment" || bad "no-verdict-phrase got '$r'"
+# Real shape: PR #5470 (ga-7uoua) — "VERDICT: REQUEST-CHANGES" (hyphenated).
+r=$(derive_comment_verdict_signal '[{"author":{"login":"steveyegge"},"createdAt":"2026-08-09T08:42:18Z","body":"**Fable adversarial review (bee, beads-lane steward) — VERDICT: REQUEST-CHANGES**\n\ndetails..."}]')
+case "$r" in *"REQUEST-CHANGES"*) ok "ga-6ea90 ACCEPTANCE (PR #5470 shape): 'VERDICT: REQUEST-CHANGES' comment → non-empty, carries the verdict text" ;; *) bad "PR#5470 shape got '$r'" ;; esac
+# Real shape: PR #5384 (ga-r8haw) — "Review verdict: MERGE AFTER FIXES (small ones)" (space-separated, no hyphen).
+r=$(derive_comment_verdict_signal '[{"author":{"login":"steveyegge"},"createdAt":"2026-08-08T23:09:16Z","body":"## Review verdict: MERGE AFTER FIXES (small ones)\n\nAdversarially reviewed..."}]')
+case "$r" in *"MERGE AFTER FIXES"*) ok "ga-6ea90 ACCEPTANCE (PR #5384 shape): 'MERGE AFTER FIXES' comment → non-empty, carries the verdict text" ;; *) bad "PR#5384 shape got '$r'" ;; esac
+# Real shape: PR #5393 (ga-wpdum) — "VERDICT: MERGE-AFTER-FIXES" (HYPHENATED,
+# not space-separated like #5384's phrasing above). Caught live: a smoke test
+# against the real PR during this fix showed ga-wpdum NOT flagged because the
+# first regex draft only allowed whitespace between MERGE/AFTER/FIXES.
+r=$(derive_comment_verdict_signal '[{"author":{"login":"steveyegge"},"createdAt":"2026-08-07T12:50:06Z","body":"**Fable adversarial paired review (bee, beads-lane steward; reviewed together with #5369) — VERDICT: MERGE-AFTER-FIXES, rework on top of #5369**"}]')
+case "$r" in *"MERGE-AFTER-FIXES"*) ok "ga-6ea90 ACCEPTANCE (PR #5393 shape): hyphenated 'MERGE-AFTER-FIXES' → non-empty (live regression: this exact phrasing was missed by a whitespace-only regex)" ;; *) bad "PR#5393 hyphenated shape got '$r'" ;; esac
+# Space-separated "CHANGES REQUESTED" (the bead's 3rd named phrase, distinct from the hyphenated CHANGES_REQUESTED review-state enum).
+r=$(derive_comment_verdict_signal '[{"author":{"login":"bee"},"createdAt":"2026-09-01T00:00:00Z","body":"Verdict: CHANGES REQUESTED — see inline notes."}]')
+case "$r" in *"CHANGES REQUESTED"*) ok "space-separated 'CHANGES REQUESTED' phrase → matched" ;; *) bad "space-separated phrase got '$r'" ;; esac
+# Case-insensitivity.
+r=$(derive_comment_verdict_signal '[{"author":{"login":"bee"},"createdAt":"2026-09-01T00:00:00Z","body":"merge after fixes, small nit only"}]')
+case "$r" in *"merge after fixes"*) ok "case-insensitive match (lowercase body)" ;; *) bad "lowercase got '$r'" ;; esac
+# Multiple verdict comments: most-recent-by-createdAt wins.
+r=$(derive_comment_verdict_signal '[
+  {"author":{"login":"steveyegge"},"createdAt":"2026-08-09T08:42:18Z","body":"VERDICT: REQUEST-CHANGES (round 1)"},
+  {"author":{"login":"steveyegge"},"createdAt":"2026-08-09T15:10:31Z","body":"VERDICT: REQUEST-CHANGES (round 2, still blocking)"}
+]')
+case "$r" in *"round 2"*) ok "two verdict comments → most recent (round 2) wins, not the first match" ;; *) bad "multi-comment ordering got '$r'" ;; esac
+
+# ── ga-6ea90 end-to-end: reviewDecision-empty fallback chain → classify_external_pr_gap3 ──
+# Proves the actual fallback chain the Step 0c.3 loop uses (GH reviewDecision,
+# else reviews[]-derived, else comment-derived) feeds classify_external_pr_gap3
+# correctly for the real PRs this bead was filed over. Not a substitute for the
+# pure-function tests above — this guards the WIRING, not just the two
+# derive_* functions individually.
+echo "ga-6ea90 end-to-end: reviewDecision-empty fallback chain → classify_external_pr_gap3"
+compose_ext_review() {
+  # Mirrors the Step 0c.3 loop's own fallback order exactly.
+  local gh_review_decision="$1" reviews_json="$2" comments_json="$3"
+  local review="$gh_review_decision"
+  if [ -z "$review" ]; then
+    review=$(derive_review_decision_from_reviews "$reviews_json")
+  fi
+  if [ "$review" != "CHANGES_REQUESTED" ]; then
+    local comment_verdict
+    comment_verdict=$(derive_comment_verdict_signal "$comments_json")
+    [ -n "$comment_verdict" ] && review="CHANGES_REQUESTED"
+  fi
+  echo "$review"
+}
+# PR #6390 (ga-bq3w5): reviewDecision="", reviews[] carries CHANGES_REQUESTED.
+review=$(compose_ext_review '' '[{"author":{"login":"bee-ghosttrack"},"state":"CHANGES_REQUESTED","submittedAt":"2026-09-08T02:30:17Z","commit":{"oid":"3fc956d1"}}]' '[]')
+r=$(classify_external_pr_gap3 OPEN "$review" 0)
+[ "$r" = "flag:changes-requested" ] && ok "PR #6390 end-to-end → flag:changes-requested (was silently wait:pending pre-fix)" || bad "PR#6390 end-to-end got '$r' (review derived='$review')"
+# PR #5470 (ga-7uoua): reviewDecision="", reviews[]=[], comment carries VERDICT: REQUEST-CHANGES.
+review=$(compose_ext_review '' '[]' '[{"author":{"login":"steveyegge"},"createdAt":"2026-08-09T15:10:31Z","body":"VERDICT: REQUEST-CHANGES"}]')
+r=$(classify_external_pr_gap3 OPEN "$review" 0)
+[ "$r" = "flag:changes-requested" ] && ok "PR #5470 end-to-end → flag:changes-requested (comment-only verdict, no formal review at all)" || bad "PR#5470 end-to-end got '$r' (review derived='$review')"
+# PR #5384 (ga-r8haw): same shape, "MERGE AFTER FIXES" comment.
+review=$(compose_ext_review '' '[]' '[{"author":{"login":"steveyegge"},"createdAt":"2026-08-08T23:09:16Z","body":"## Review verdict: MERGE AFTER FIXES (small ones)"}]')
+r=$(classify_external_pr_gap3 OPEN "$review" 0)
+[ "$r" = "flag:changes-requested" ] && ok "PR #5384 end-to-end → flag:changes-requested" || bad "PR#5384 end-to-end got '$r' (review derived='$review')"
+# PR #5989 (ga-xcq1ph) — the GENUINE wait, must stay wait:pending, not be swept up by the fix.
+review=$(compose_ext_review '' '[
+  {"author":{"login":"bee-ghosttrack"},"state":"CHANGES_REQUESTED","submittedAt":"2026-09-03T01:12:53Z"},
+  {"author":{"login":"bee-ghosttrack"},"state":"COMMENTED","submittedAt":"2026-09-07T03:45:32Z"},
+  {"author":{"login":"bee-ghosttrack"},"state":"APPROVED","submittedAt":"2026-09-07T03:45:51Z"}
+]' '[{"author":{"login":"athosmartins"},"createdAt":"2026-09-06T03:24:19Z","body":"Addressed both points from the review"}]')
+r=$(classify_external_pr_gap3 OPEN "$review" 0)
+[ "$r" = "wait:pending" ] && ok "ga-6ea90 NEGATIVE ACCEPTANCE: PR #5989 end-to-end → wait:pending (genuine wait, must NOT be false-flagged)" || bad "PR#5989 end-to-end got '$r' (review derived='$review')"
+
 # ── reconcile_dead_reviewer_verdict_action <age> <grace> <reviewer_alive> <parent_terminal> ─
 # ga-u07fn: verdict-scoped sibling of reconcile_gaterun_action — releases ONE
 # stuck verdict for re-convocation (parent run still alive) or closes it
