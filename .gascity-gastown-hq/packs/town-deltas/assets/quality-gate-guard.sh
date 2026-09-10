@@ -3883,10 +3883,40 @@ else
 
     EXT_ACTION=$(classify_external_pr_gap3 "$EXT_STATE" "$EXT_REVIEW" "$EXT_CHANGES_ADDRESSED")
 
+    # ga-w8mvq: waiting-on:pr-<N> is a manual re-parking label some
+    # agents/the Mayor add alongside story:awaiting-external-merge when a
+    # builder pushes a fix and hands the bead back for external re-review
+    # (see the "AO RE-ESTACIONAR" contract on ga-wpdum's comment thread).
+    # pilot-dispatcher.sh's _filter_dispatch_gates treats ANY waiting-on:*
+    # label as an unconditional dispatch veto ("waiting-on:* always means
+    # blocked on X"). None of the three terminal actions below ever cleared
+    # it, so a changes-requested transition into gate:needs-fix — the exact
+    # signal meant to make Pilot dispatch a builder right now — left the
+    # bead permanently un-dispatchable behind its own stale label
+    # (ga-wpdum/#5393, ga-7uoua/#5470, ga-r8haw/#5384 all sat ~2h40 with
+    # zero dispatch attempts until a human removed it by hand). Computed
+    # once here (pure jq read against the $EXT_SHOW already fetched above —
+    # no side effect) so every terminal arm can clear whatever
+    # waiting-on:pr-* labels are actually present, not hardcoded to
+    # $EXT_NUM alone, in case an earlier abandoned PR left a stale one under
+    # a different number. Nothing is lost by clearing it: the PR reference
+    # already lives durably in the bead's own `external_ref` field (set at
+    # initial dispatch, ga-ycsl9) and is re-derived fresh from comments
+    # every sweep regardless (EXT_PR_REF above) — this label is a display
+    # convenience, not GAP-3's own source of truth. Deliberately NOT
+    # touching pilot:no-auto-dispatch here: that label is documented
+    # elsewhere (pilot-dispatcher.sh, ga-1mqdz AC1) as a direct Mayor/human
+    # "stop dispatching this" signal that must hold until a human clears it
+    # — a different class of label than this one.
+    EXT_WAITING_LABELS=$(echo "$EXT_SHOW" | jq -r '(.labels // []) | map(select(test("^waiting-on:pr-"))) | join(",")' 2>/dev/null || echo "")
+
     case "$EXT_ACTION" in
       close:merged)
         warn "GAP-3: $EXT_ID — PR $EXT_URL is MERGED${EXT_MERGE_SHA:+ ($EXT_MERGE_SHA)} — closing"
         bd -C "$GC_CITY" label remove "$EXT_ID" "story:awaiting-external-merge" -q 2>/dev/null || true
+        if [ -n "$EXT_WAITING_LABELS" ]; then
+          bd -C "$GC_CITY" label remove "$EXT_ID" "$EXT_WAITING_LABELS" -q 2>/dev/null || true
+        fi
         bd -C "$GC_CITY" close "$EXT_ID" \
           -r "ga-jto05 GAP-3 reconciler: external PR $EXT_URL merged${EXT_MERGE_SHA:+ (commit $EXT_MERGE_SHA)} — work is done; closing." \
           2>/dev/null || warn "GAP-3: could not close $EXT_ID after external-PR-merged detection"
@@ -3894,18 +3924,29 @@ else
       flag:closed-not-merged)
         warn "GAP-3: $EXT_ID — PR $EXT_URL is CLOSED without merging — flagging needs-human"
         bd -C "$GC_CITY" label remove "$EXT_ID" "story:awaiting-external-merge" -q 2>/dev/null || true
+        if [ -n "$EXT_WAITING_LABELS" ]; then
+          bd -C "$GC_CITY" label remove "$EXT_ID" "$EXT_WAITING_LABELS" -q 2>/dev/null || true
+        fi
         bd -C "$GC_CITY" label add    "$EXT_ID" "gate:needs-human"              -q 2>/dev/null || true
         bd -C "$GC_CITY" comment "$EXT_ID" "ga-jto05 GAP-3 reconciler: external PR $EXT_URL was closed WITHOUT merging (rejected/abandoned upstream). story:awaiting-external-merge cleared; gate:needs-human set — a human should decide whether to open a new PR or abandon this bead." 2>/dev/null || true
         ;;
       flag:changes-requested)
         warn "GAP-3: $EXT_ID — PR $EXT_URL has CHANGES_REQUESTED — surfacing real gate:needs-fix"
         bd -C "$GC_CITY" label remove "$EXT_ID" "story:awaiting-external-merge" -q 2>/dev/null || true
+        if [ -n "$EXT_WAITING_LABELS" ]; then
+          bd -C "$GC_CITY" label remove "$EXT_ID" "$EXT_WAITING_LABELS" -q 2>/dev/null || true
+        fi
         bd -C "$GC_CITY" label add    "$EXT_ID" "gate:needs-fix"                -q 2>/dev/null || true
         EXT_FLAG_MSG="ga-jto05 GAP-3 reconciler: external PR $EXT_URL is OPEN with a pending change request — an upstream reviewer requested changes. story:awaiting-external-merge cleared; gate:needs-fix set so Pilot dispatches a builder with the real review feedback as brief (fetch via gh pr view $EXT_NUM --repo $EXT_REPO --json reviews,comments — this is the case ga-e2n96 says gate:needs-fix should actually mean: a reviewer really did reject the code)."
         if [ -n "$EXT_VERDICT_SOURCE" ]; then
           EXT_FLAG_MSG="$EXT_FLAG_MSG
 
 ga-6ea90: GitHub's own reviewDecision field is blank for this PR — $EXT_VERDICT_SOURCE"
+        fi
+        if [ -n "$EXT_WAITING_LABELS" ]; then
+          EXT_FLAG_MSG="$EXT_FLAG_MSG
+
+ga-w8mvq: also cleared blocking label(s) $EXT_WAITING_LABELS — left alone, _filter_dispatch_gates vetoes this bead even after gate:needs-fix, so it would never actually get dispatched."
         fi
         bd -C "$GC_CITY" comment "$EXT_ID" "$EXT_FLAG_MSG" 2>/dev/null || true
         ;;
