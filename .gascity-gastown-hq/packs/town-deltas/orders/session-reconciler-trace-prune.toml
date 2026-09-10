@@ -1,0 +1,14 @@
+# ga-op9f7: session-reconciler-trace/segments/YYYY/MM/DD grew ~270MB/day with
+# no order or script in the city referencing the directory, on a Mac mini
+# that was sitting at 96-98% disk that same day. The engine writer already
+# caps total bytes at 1GiB / max age 7d (session_reconciler_trace_store.go,
+# confirmed present in the live gc binary via `strings`), but that's still a
+# lot of headroom to give a diagnostic trace when the disk itself is nearly
+# full, and it never removes the empty YYYY/MM/DD dirs it leaves behind after
+# pruning individual .jsonl files. This order adds a tighter, city-tunable
+# calendar-day retention (default 3 days) on top, daily.
+[order]
+description = "Prune session-reconciler-trace segment day-dirs older than the retention window (default 3d); sweep empty YYYY/MM skeletons"
+trigger = "cooldown"
+interval = "24h"
+exec = "$PACK_DIR/assets/scripts/session-reconciler-trace-prune.sh"
