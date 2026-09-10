@@ -3838,9 +3838,51 @@ GATE_NEEDS_HUMAN_VERIFY_BACKOFF_SECS="${GATE_NEEDS_HUMAN_VERIFY_BACKOFF_SECS:-1}
 case "$GATE_NEEDS_HUMAN_VERIFY_BACKOFF_SECS" in ''|*[!0-9]*) GATE_NEEDS_HUMAN_VERIFY_BACKOFF_SECS=1 ;; esac
 gate_apply_needs_human() {
   local city="$1" bead_id="$2" sub="${3:-}" try labels read_rc verified_absent=0
+  local write_rc write_err write_diag="" stderr_file
+  # ga-ywpg6: the diagnostic side-channel for a WRITE failure. Can't use a
+  # plain variable — every call site invokes this function as
+  # `_NH_STATUS=$(gate_apply_needs_human ...)`, a command substitution that
+  # runs the whole function in a SUBSHELL, so any variable this function sets
+  # is gone the instant it returns; only the echoed stdout (the status word)
+  # and real filesystem writes survive. gate_needs_human_clause() below reads
+  # this same file to enrich its message — both run in the same top-level
+  # script/PID, just in different subshells, so the file is a valid channel
+  # where a variable is not. `$$` is stable across those subshells (a bash
+  # quirk: `$$` is fixed at shell startup and inherited by subshells, unlike
+  # $BASHPID) so it scopes the file to this dispatcher process without
+  # colliding with a concurrent dispatcher run on a different marker.
+  local diag_file="${LOG_DIR:-/tmp}/.gate-needs-human-write-diag.$$"
+  rm -f "$diag_file" 2>/dev/null || true
   for try in 1 2; do
     [ "$try" -gt 1 ] && { sleep "$GATE_NEEDS_HUMAN_VERIFY_BACKOFF_SECS" 2>/dev/null || true; }
-    bd -C "$city" label add "$bead_id" "gate:needs-human" -q 2>/dev/null || true
+    # ga-ywpg6: capture the WRITE's own rc + stderr instead of discarding
+    # them via a bare `|| true` — two real incidents (wa-hcefm, wa-zyfoe,
+    # ~7h apart) reported "FAILED to apply after retry" with zero clue why
+    # (suspected Dolt contention). Redirect stderr to a FILE (`2>"$stderr_file"`)
+    # rather than capturing it with `$(...)` around the whole `bd` call — a
+    # command substitution forks a SUBSHELL, and this exact call site is
+    # exercised by gate-fix-attempt-cap-needs-human-verify.selftest.sh against
+    # a stubbed `bd` shell FUNCTION that tracks call count via a plain shell
+    # variable; wrapping the call in `$(...)` was tried first and silently
+    # broke that stub (the decrement happened in a subshell and never reached
+    # the parent — caught by that selftest's own "retry actually works" case,
+    # not by inspection). A plain redirect has no such side effect: `bd`
+    # itself (real binary or stub function) still runs in THIS shell, exactly
+    # like the original `-q 2>/dev/null || true` did.
+    # `|| write_rc=$?` is load-bearing, not decoration: under this file's
+    # `set -e`, a bare simple command that fails with no guard aborts the
+    # WHOLE dispatcher right there — that is exactly ga-h48cm defect 3 a few
+    # lines below (there for the `$(...)`-assignment shape; a bare failing
+    # command is the same hazard one level simpler).
+    write_rc=0
+    stderr_file="${LOG_DIR:-/tmp}/.gate-needs-human-write-stderr.$$"
+    bd -C "$city" label add "$bead_id" "gate:needs-human" -q 2>"$stderr_file" || write_rc=$?
+    if [ "$write_rc" -ne 0 ]; then
+      write_err=$(cat "$stderr_file" 2>/dev/null)
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] WARN: gate_apply_needs_human($bead_id) try $try: label add FAILED rc=$write_rc stderr=${write_err:-(empty)}" >&2
+      write_diag="${write_diag}try $try: rc=$write_rc stderr=${write_err:-(empty)}"$'\n'
+    fi
+    rm -f "$stderr_file" 2>/dev/null || true
     [ -n "$sub" ] && { bd -C "$city" label add "$bead_id" "$sub" -q 2>/dev/null || true; }
     sleep "$GATE_NEEDS_HUMAN_VERIFY_BACKOFF_SECS" 2>/dev/null || true
     # ga-h48cm gate-feedback: reset every iteration, not just once before the
@@ -3860,6 +3902,15 @@ gate_apply_needs_human() {
       verified_absent=1
     fi
   done
+  # ga-ywpg6: only worth a human's time when the breaker did NOT verify
+  # armed. Dropped where gate_needs_human_clause() (the single chokepoint
+  # feeding every gate:needs-human bd-comment AND mail body, per its own
+  # header just below) can pick it up — this function's OWN echoed contract
+  # (exactly "armed"/"failed"/"unverified", nothing more) does not change; 9
+  # call sites match that string exactly and must keep working unmodified.
+  if [ -n "$write_diag" ]; then
+    printf '%s' "$write_diag" > "$diag_file" 2>/dev/null || true
+  fi
   if [ "$verified_absent" -eq 1 ]; then
     echo "failed"
   else
@@ -3881,15 +3932,24 @@ gate_apply_needs_human() {
 # for a message that exists to prompt human action on a possibly-unprotected
 # bead, defaulting to loud is the safe failure mode.
 gate_needs_human_clause() {
+  # ga-ywpg6: pick up gate_apply_needs_human()'s write-failure diagnostic
+  # (rc + stderr), if it left one for THIS process. Same $$-scoped file both
+  # functions agree on; see that function's own comment for why a file and
+  # not a variable. No diagnostic exists on the (overwhelmingly common) path
+  # where the write just worked, so `diag` is empty and every message below
+  # is byte-for-byte what it was before this fix.
+  local diag_file="${LOG_DIR:-/tmp}/.gate-needs-human-write-diag.$$"
+  local diag=""
+  [ -r "$diag_file" ] && diag=$(cat "$diag_file" 2>/dev/null)
   case "$1" in
     armed)
       echo "Auto-retry is now DISABLED (label gate:needs-human, verified applied); the Pilot will not re-dispatch it."
       ;;
     unverified)
-      echo "COULD NOT VERIFY THE CIRCUIT-BREAKER: gate:needs-human was written, but every read-back attempt errored (bd/jq failure) before it could be confirmed — whether it actually landed is UNKNOWN, this is NOT a confirmed failure. A human should check the bead's labels directly and apply gate:needs-human by hand if it turns out to be missing."
+      echo "COULD NOT VERIFY THE CIRCUIT-BREAKER: gate:needs-human was written, but every read-back attempt errored (bd/jq failure) before it could be confirmed — whether it actually landed is UNKNOWN, this is NOT a confirmed failure. A human should check the bead's labels directly and apply gate:needs-human by hand if it turns out to be missing.${diag:+ Write-attempt diagnostic (ga-ywpg6): $diag}"
       ;;
     *)
-      echo "COULD NOT ARM THE CIRCUIT-BREAKER: gate:needs-human FAILED to apply after retry and is NOT present on the bead. This bead remains re-dispatchable with NO protection — a human must apply the label by hand immediately and investigate why the write failed."
+      echo "COULD NOT ARM THE CIRCUIT-BREAKER: gate:needs-human FAILED to apply after retry and is NOT present on the bead. This bead remains re-dispatchable with NO protection — a human must apply the label by hand immediately and investigate why the write failed.${diag:+ Write-attempt diagnostic (ga-ywpg6): $diag}"
       ;;
   esac
 }

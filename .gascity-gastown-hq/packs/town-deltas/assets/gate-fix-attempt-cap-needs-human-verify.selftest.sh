@@ -43,6 +43,14 @@ T="$(mktemp -d 2>/dev/null || mktemp -d -t ga55syh)"
 trap 'rm -rf "$T" 2>/dev/null || true' EXIT
 FAKE_LABELS_FILE="$T/labels.txt"
 FAKE_LABEL_ADD_FAIL_COUNT=0
+# ga-ywpg6: distinct from FAKE_LABEL_ADD_FAIL_COUNT above — that one models a
+# SILENT no-op (bd claims rc=0, label just never lands, ga-55syh's original
+# shape). This one models bd REPORTING an actual error (non-zero rc + stderr
+# text) on the write itself — the ga-ywpg6 bug: two real incidents where
+# `label add` genuinely failed and `-q 2>/dev/null || true` threw away both
+# the rc and the stderr, leaving no clue why. 0 disables it (default).
+FAKE_LABEL_ADD_ERROR_COUNT=0
+FAKE_LABEL_ADD_ERROR_MSG="dolt: rpc error: context deadline exceeded"
 FAKE_SHOW_FAIL=0
 # ga-h48cm gate-feedback: FAKE_SHOW_FAIL is all-or-nothing for the whole call
 # and can't express "try 1's read succeeds, try 2's read errors" — the exact
@@ -68,7 +76,11 @@ bd() {
   case "$3" in
     label)
       if [ "$4" = "add" ]; then
-        if [ "$FAKE_LABEL_ADD_FAIL_COUNT" -gt 0 ]; then
+        if [ "$FAKE_LABEL_ADD_ERROR_COUNT" -gt 0 ]; then
+          FAKE_LABEL_ADD_ERROR_COUNT=$((FAKE_LABEL_ADD_ERROR_COUNT - 1))
+          echo "$FAKE_LABEL_ADD_ERROR_MSG" >&2
+          return 7
+        elif [ "$FAKE_LABEL_ADD_FAIL_COUNT" -gt 0 ]; then
           FAKE_LABEL_ADD_FAIL_COUNT=$((FAKE_LABEL_ADD_FAIL_COUNT - 1))
         else
           echo "$6" >> "$FAKE_LABELS_FILE"
@@ -239,6 +251,56 @@ rm -f "$FAKE_SHOW_CALL_FILE"; FAKE_SHOW_FAIL_AT_CALL=2
 eq "try-1 confirmed-absent must not survive try-2's read error" \
    "$(gate_apply_needs_human "$T" "fake-bead" "")" "unverified"
 FAKE_SHOW_FAIL_AT_CALL=0
+
+# ── 12. ga-ywpg6: a REAL write error (non-zero rc + stderr) is no longer ───
+#        swallowed — it must (a) leave the "failed"/"unverified" contract
+#        exactly as before, (b) surface on stderr/log with rc + the actual
+#        error text, and (c) reach gate_needs_human_clause()'s output, since
+#        that is the single chokepoint every bd-comment and mail body reads
+#        (all 9 call sites). wa-hcefm/wa-zyfoe (~7h apart) are the real
+#        incidents: "FAILED to apply after retry" with zero clue why.
+echo "── 12. ga-ywpg6: write REPORTS an error (rc!=0 + stderr) → diagnostic surfaces, contract unchanged ──"
+: > "$FAKE_LABELS_FILE"; FAKE_LABEL_ADD_FAIL_COUNT=0; FAKE_LABEL_ADD_ERROR_COUNT=99; FAKE_SHOW_FAIL=0
+_STDERR_CAP="$T/stderr_capture_12"
+_STATUS=$(gate_apply_needs_human "$T" "fake-bead" "" 2>"$_STDERR_CAP")
+_STDERR_TEXT=$(cat "$_STDERR_CAP" 2>/dev/null)
+FAKE_LABEL_ADD_ERROR_COUNT=0
+eq       "persistent write ERROR (not silent no-op) → failed, same contract as scenario 3" \
+   "$_STATUS" "failed"
+contains "write error is logged (stderr/log) with the rc"           "$_STDERR_TEXT" "rc=7"
+contains "write error is logged (stderr/log) with the actual stderr text" "$_STDERR_TEXT" "$FAKE_LABEL_ADD_ERROR_MSG"
+CLAUSE_AFTER_WRITE_ERROR="$(gate_needs_human_clause "failed")"
+contains "gate_needs_human_clause(\"failed\") now includes the write diagnostic (reaches bd-comment + mail)" \
+   "$CLAUSE_AFTER_WRITE_ERROR" "$FAKE_LABEL_ADD_ERROR_MSG"
+contains "gate_needs_human_clause(\"failed\") diagnostic still says COULD NOT ARM (core sentence untouched)" \
+   "$CLAUSE_AFTER_WRITE_ERROR" "COULD NOT ARM THE CIRCUIT-BREAKER"
+
+# ── 13. ga-ywpg6: same write error, but the READ also errors on every try ──
+#        → final verdict must be "unverified" (assertion 7's contract), and
+#        that branch's message must ALSO carry the write diagnostic — proves
+#        the fix isn't wired into only one of the two non-armed branches.
+echo "── 13. ga-ywpg6: write ERROR + read ERROR → unverified, diagnostic still reaches that branch too ──"
+: > "$FAKE_LABELS_FILE"; FAKE_LABEL_ADD_FAIL_COUNT=0; FAKE_LABEL_ADD_ERROR_COUNT=99; FAKE_SHOW_FAIL=1
+eq "write error + read error → unverified (not failed)" \
+   "$(gate_apply_needs_human "$T" "fake-bead" "")" "unverified"
+FAKE_LABEL_ADD_ERROR_COUNT=0; FAKE_SHOW_FAIL=0
+CLAUSE_AFTER_UNVERIFIED="$(gate_needs_human_clause "unverified")"
+contains "gate_needs_human_clause(\"unverified\") also includes the write diagnostic" \
+   "$CLAUSE_AFTER_UNVERIFIED" "$FAKE_LABEL_ADD_ERROR_MSG"
+contains "gate_needs_human_clause(\"unverified\") still says COULD NOT VERIFY (core sentence untouched)" \
+   "$CLAUSE_AFTER_UNVERIFIED" "COULD NOT VERIFY"
+
+# ── 14. control: a CLEAN run (no write error) must leave no diagnostic ─────
+#        behind — proves the enrichment is conditional, not always-on noise,
+#        and that gate_apply_needs_human's own reset (`rm -f "$diag_file"`
+#        at the top of the function) actually clears any diagnostic left by
+#        test 12/13 above before this run starts.
+echo "── 14. control: a clean write leaves NO diagnostic (no false-positive noise) ──"
+: > "$FAKE_LABELS_FILE"; FAKE_LABEL_ADD_FAIL_COUNT=0; FAKE_LABEL_ADD_ERROR_COUNT=0; FAKE_SHOW_FAIL=0
+eq "clean write → armed" "$(gate_apply_needs_human "$T" "fake-bead" "")" "armed"
+CLAUSE_AFTER_CLEAN="$(gate_needs_human_clause "failed")"
+not_contains "no stale diagnostic leaks into a later clause call after a clean run" \
+   "$CLAUSE_AFTER_CLEAN" "Write-attempt diagnostic"
 
 echo ""
 echo "──────────────────────────────────────────"
