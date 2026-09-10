@@ -187,7 +187,15 @@ else
   bad "expected gate-time merge fallback at exactly 2 call sites, found $FALLBACK_COUNT"
 fi
 
-FALLBACK_BLOCK=$(grep -A20 'gate auto-merge fallback — rebase-replay failed despite zero merge-tree conflict, ga-byfbd/ga-qukyp' "$GATE" 2>/dev/null)
+# ga-itkbt: widened from -A20 to -A40. The content-preservation guard added
+# by ga-itkbt (branch_bead_commit_verdict/rebase_content_verdict, gated
+# before this exact push) inserts ~12 lines between the marker and the push
+# at the container-rig site, pushing that site's distance to 25 — past the
+# old -A20 window, which silently dropped it from PLAIN_PUSH_COUNT below
+# (self-repo's shorter distance still matched, masking the miss as "1 of 2"
+# rather than an obvious "0 of 2"). -A40 gives real headroom rather than
+# just clearing today's distance by a few lines.
+FALLBACK_BLOCK=$(grep -A40 'gate auto-merge fallback — rebase-replay failed despite zero merge-tree conflict, ga-byfbd/ga-qukyp' "$GATE" 2>/dev/null)
 PLAIN_PUSH_COUNT=$(printf '%s\n' "$FALLBACK_BLOCK" | grep -c 'push origin "HEAD:refs/heads/\$BRANCH" 2>"\$_PUSH_ERR_FILE"; then')
 FORCE_LEAK=$(printf '%s\n' "$FALLBACK_BLOCK" | grep -c -- '--force-with-lease')
 if [ "$PLAIN_PUSH_COUNT" -eq 2 ] && [ "$FORCE_LEAK" -eq 0 ]; then

@@ -9520,8 +9520,21 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               warn "  Auto-merge: rev-parse HEAD after merge returned empty for $BRANCH — treating as push failure"
               AUTO_REBASE_PUSH_ERR="rev-parse HEAD after merge returned empty (merge produced no commit?)"
             else
+              # ga-itkbt: mirror the merge-time content-preservation guard
+              # (ga-y9a1d/ga-m07gc, see branch_bead_commit_verdict() /
+              # rebase_content_verdict() above) — pre-review had NEITHER
+              # check, so an auto-merge that silently collapsed this bead's
+              # commit, or dropped a file's content inside a commit that
+              # otherwise survives, sailed straight to the reviewer with no
+              # trace. origin/$BRANCH is still the pre-merge tip here: no
+              # fetch/push has happened yet.
+              PR_COMMIT_VERDICT=$(branch_bead_commit_verdict \
+                "$(git -C "$TMP_REBASE_WT" rev-list --count "${MAIN_HEAD_SHA}..${NEW_TIP}" 2>/dev/null || echo "")" \
+                "$(git -C "$TMP_REBASE_WT" log --format='%B' "${MAIN_HEAD_SHA}..${NEW_TIP}" 2>/dev/null || echo "")" \
+                "$BEAD_ID")
+              PR_CONTENT_VERDICT=$(rebase_content_verdict "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP")
               _PUSH_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gc-gate-autorebase-push.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-autorebase-push.$$")
-              if git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>"$_PUSH_ERR_FILE"; then
+              if [ "$PR_COMMIT_VERDICT" = "yes" ] && [ "$PR_CONTENT_VERDICT" = "yes" ] && git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>"$_PUSH_ERR_FILE"; then
                 AUTO_REBASE_OK=1
                 BRANCH_SHA="$NEW_TIP"
                 log "  Auto-merge success: $BRANCH pushed to $NEW_TIP (merged $DEFAULT_BRANCH in — ${_MERGE_NOT_REBASE_WHY})"
@@ -9537,7 +9550,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               else
                 AUTO_REBASE_PUSH_RC=$?
                 AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
+                [ "$PR_COMMIT_VERDICT" != "yes" ] && warn "  ga-itkbt/ga-y9a1d: pre-review auto-merge onto $MAIN_HEAD_SHA did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$PR_COMMIT_VERDICT) — refusing to push."
+                if [ "$PR_CONTENT_VERDICT" != "yes" ]; then
+                  warn "  ga-itkbt/ga-m07gc: $BRANCH auto-merged onto $MAIN_HEAD_SHA produced a tree that does NOT match the 3-way merge result (content verdict=$PR_CONTENT_VERDICT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')"
+                fi
                 warn "  Auto-merge push failed for $BRANCH (exit=$AUTO_REBASE_PUSH_RC): ${AUTO_REBASE_PUSH_ERR:-<no stderr captured>}"
+                git -C "$TMP_REBASE_WT" merge --abort 2>/dev/null || true
               fi
               rm -f "$_PUSH_ERR_FILE" 2>/dev/null || true
             fi
@@ -9558,8 +9576,19 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
             # ga-g0v96 (AC3): capture stderr + exit code instead of discarding both —
             # "Auto-rebase push failed" with zero diagnostics was the exact
             # error==empty defect this bead exists to fix.
+            # ga-itkbt: mirror the merge-time content-preservation guard
+            # (ga-y9a1d/ga-m07gc) — pre-review had NEITHER check, so a
+            # rebase that silently collapsed this bead's commit, or dropped
+            # a file's content inside a commit that otherwise survives,
+            # sailed straight to the reviewer with no trace. origin/$BRANCH
+            # is still the pre-rebase tip here: no fetch/push has happened.
+            PR_COMMIT_VERDICT=$(branch_bead_commit_verdict \
+              "$(git -C "$TMP_REBASE_WT" rev-list --count "${MAIN_HEAD_SHA}..${NEW_TIP}" 2>/dev/null || echo "")" \
+              "$(git -C "$TMP_REBASE_WT" log --format='%B' "${MAIN_HEAD_SHA}..${NEW_TIP}" 2>/dev/null || echo "")" \
+              "$BEAD_ID")
+            PR_CONTENT_VERDICT=$(rebase_content_verdict "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP")
             _PUSH_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gc-gate-autorebase-push.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-autorebase-push.$$")
-            if git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>"$_PUSH_ERR_FILE"; then
+            if [ "$PR_COMMIT_VERDICT" = "yes" ] && [ "$PR_CONTENT_VERDICT" = "yes" ] && git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>"$_PUSH_ERR_FILE"; then
               AUTO_REBASE_OK=1
               BRANCH_SHA="$NEW_TIP"
               log "  Auto-rebase success: $BRANCH pushed to $NEW_TIP (rebased onto $MAIN_HEAD_SHA)"
@@ -9576,7 +9605,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
             else
               AUTO_REBASE_PUSH_RC=$?
               AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
+              [ "$PR_COMMIT_VERDICT" != "yes" ] && warn "  ga-itkbt/ga-y9a1d: pre-review auto-rebase onto $MAIN_HEAD_SHA did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$PR_COMMIT_VERDICT) — refusing to push."
+              if [ "$PR_CONTENT_VERDICT" != "yes" ]; then
+                warn "  ga-itkbt/ga-m07gc: $BRANCH rebased onto $MAIN_HEAD_SHA produced a tree that does NOT match the 3-way merge result (content verdict=$PR_CONTENT_VERDICT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')"
+              fi
               warn "  Auto-rebase push failed for $BRANCH (exit=$AUTO_REBASE_PUSH_RC): ${AUTO_REBASE_PUSH_ERR:-<no stderr captured>}"
+              git -C "$TMP_REBASE_WT" rebase --abort 2>/dev/null || true
             fi
             rm -f "$_PUSH_ERR_FILE" 2>/dev/null || true
           fi
@@ -9614,13 +9648,25 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               warn "  Auto-merge fallback: rev-parse HEAD after merge returned empty for $BRANCH — treating as push failure"
               AUTO_REBASE_PUSH_ERR="rev-parse HEAD after merge fallback returned empty (merge produced no commit?)"
             else
+              # ga-itkbt: mirror the merge-time content-preservation guard
+              # (ga-y9a1d/ga-m07gc) — pre-review had NEITHER check, so this
+              # merge fallback could silently collapse this bead's commit,
+              # or drop a file's content inside a commit that otherwise
+              # survives, and sail straight to the reviewer with no trace.
+              # origin/$BRANCH is still the pre-merge tip here: no
+              # fetch/push has happened yet.
+              PR_COMMIT_VERDICT=$(branch_bead_commit_verdict \
+                "$(git -C "$TMP_REBASE_WT" rev-list --count "${MAIN_HEAD_SHA}..${NEW_TIP}" 2>/dev/null || echo "")" \
+                "$(git -C "$TMP_REBASE_WT" log --format='%B' "${MAIN_HEAD_SHA}..${NEW_TIP}" 2>/dev/null || echo "")" \
+                "$BEAD_ID")
+              PR_CONTENT_VERDICT=$(rebase_content_verdict "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP")
               _PUSH_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gc-gate-autorebase-push.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-autorebase-push.$$")
               # Plain push, safe to send WITHOUT force: unlike rebase, merge
               # never rewrites the branch's existing commits — it only adds
               # one new commit whose first parent is the current tip, so
               # pushing it is a genuine fast-forward (same reasoning as
               # do_merge_ff's ga-qukyp fallback above).
-              if git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" 2>"$_PUSH_ERR_FILE"; then
+              if [ "$PR_COMMIT_VERDICT" = "yes" ] && [ "$PR_CONTENT_VERDICT" = "yes" ] && git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" 2>"$_PUSH_ERR_FILE"; then
                 AUTO_REBASE_OK=1
                 BRANCH_SHA="$NEW_TIP"
                 log "  Auto-merge fallback success: $BRANCH pushed to $NEW_TIP (rebase-replay failed, merge-tree pre-check showed zero conflict — merged instead, ga-byfbd/ga-qukyp)"
@@ -9636,7 +9682,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               else
                 AUTO_REBASE_PUSH_RC=$?
                 AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
+                [ "$PR_COMMIT_VERDICT" != "yes" ] && warn "  ga-itkbt/ga-y9a1d: pre-review auto-merge fallback onto $MAIN_HEAD_SHA did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$PR_COMMIT_VERDICT) — refusing to push."
+                if [ "$PR_CONTENT_VERDICT" != "yes" ]; then
+                  warn "  ga-itkbt/ga-m07gc: $BRANCH auto-merge-fallback onto $MAIN_HEAD_SHA produced a tree that does NOT match the 3-way merge result (content verdict=$PR_CONTENT_VERDICT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')"
+                fi
                 warn "  Auto-merge fallback push failed for $BRANCH (exit=$AUTO_REBASE_PUSH_RC): ${AUTO_REBASE_PUSH_ERR:-<no stderr captured>}"
+                git -C "$TMP_REBASE_WT" merge --abort 2>/dev/null || true
               fi
               rm -f "$_PUSH_ERR_FILE" 2>/dev/null || true
             fi
@@ -9679,8 +9730,16 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               warn "  Auto-merge (self-repo): rev-parse HEAD after merge returned empty for $BRANCH — treating as push failure"
               AUTO_REBASE_PUSH_ERR="rev-parse HEAD after merge returned empty (merge produced no commit?)"
             else
+              # ga-itkbt: mirror the merge-time content-preservation guard
+              # (ga-y9a1d/ga-m07gc) — see the container-rig branch above for
+              # the full rationale, same fix, self-repo git access.
+              PR_COMMIT_VERDICT=$(branch_bead_commit_verdict \
+                "$(git -C "$TMP_REBASE_WT" rev-list --count "${MAIN_HEAD_SHA}..${NEW_TIP}" 2>/dev/null || echo "")" \
+                "$(git -C "$TMP_REBASE_WT" log --format='%B' "${MAIN_HEAD_SHA}..${NEW_TIP}" 2>/dev/null || echo "")" \
+                "$BEAD_ID")
+              PR_CONTENT_VERDICT=$(rebase_content_verdict "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP")
               _PUSH_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gc-gate-autorebase-push.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-autorebase-push.$$")
-              if git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>"$_PUSH_ERR_FILE"; then
+              if [ "$PR_COMMIT_VERDICT" = "yes" ] && [ "$PR_CONTENT_VERDICT" = "yes" ] && git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>"$_PUSH_ERR_FILE"; then
                 AUTO_REBASE_OK=1
                 BRANCH_SHA="$NEW_TIP"
                 log "  Auto-merge success (self-repo): $BRANCH pushed to $NEW_TIP (${_MERGE_NOT_REBASE_WHY})"
@@ -9696,7 +9755,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               else
                 AUTO_REBASE_PUSH_RC=$?
                 AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
+                [ "$PR_COMMIT_VERDICT" != "yes" ] && warn "  ga-itkbt/ga-y9a1d: pre-review auto-merge (self-repo) onto $MAIN_HEAD_SHA did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$PR_COMMIT_VERDICT) — refusing to push."
+                if [ "$PR_CONTENT_VERDICT" != "yes" ]; then
+                  warn "  ga-itkbt/ga-m07gc: $BRANCH auto-merged (self-repo) onto $MAIN_HEAD_SHA produced a tree that does NOT match the 3-way merge result (content verdict=$PR_CONTENT_VERDICT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')"
+                fi
                 warn "  Auto-merge push failed (self-repo) for $BRANCH (exit=$AUTO_REBASE_PUSH_RC): ${AUTO_REBASE_PUSH_ERR:-<no stderr captured>}"
+                git -C "$TMP_REBASE_WT" merge --abort 2>/dev/null || true
               fi
               rm -f "$_PUSH_ERR_FILE" 2>/dev/null || true
             fi
@@ -9713,8 +9777,16 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
             AUTO_REBASE_PUSH_ERR="rev-parse HEAD after rebase returned empty (rebase produced no commit?)"
           else
             # ga-g0v96 (AC3): capture stderr + exit code instead of discarding both.
+            # ga-itkbt: mirror the merge-time content-preservation guard
+            # (ga-y9a1d/ga-m07gc) — see the container-rig branch above for
+            # the full rationale, same fix, self-repo git access.
+            PR_COMMIT_VERDICT=$(branch_bead_commit_verdict \
+              "$(git -C "$TMP_REBASE_WT" rev-list --count "${MAIN_HEAD_SHA}..${NEW_TIP}" 2>/dev/null || echo "")" \
+              "$(git -C "$TMP_REBASE_WT" log --format='%B' "${MAIN_HEAD_SHA}..${NEW_TIP}" 2>/dev/null || echo "")" \
+              "$BEAD_ID")
+            PR_CONTENT_VERDICT=$(rebase_content_verdict "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP")
             _PUSH_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gc-gate-autorebase-push.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-autorebase-push.$$")
-            if git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>"$_PUSH_ERR_FILE"; then
+            if [ "$PR_COMMIT_VERDICT" = "yes" ] && [ "$PR_CONTENT_VERDICT" = "yes" ] && git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>"$_PUSH_ERR_FILE"; then
               AUTO_REBASE_OK=1
               BRANCH_SHA="$NEW_TIP"
               log "  Auto-rebase success (self-repo): $BRANCH pushed to $NEW_TIP"
@@ -9730,7 +9802,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
             else
               AUTO_REBASE_PUSH_RC=$?
               AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
+              [ "$PR_COMMIT_VERDICT" != "yes" ] && warn "  ga-itkbt/ga-y9a1d: pre-review auto-rebase (self-repo) onto $MAIN_HEAD_SHA did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$PR_COMMIT_VERDICT) — refusing to push."
+              if [ "$PR_CONTENT_VERDICT" != "yes" ]; then
+                warn "  ga-itkbt/ga-m07gc: $BRANCH rebased (self-repo) onto $MAIN_HEAD_SHA produced a tree that does NOT match the 3-way merge result (content verdict=$PR_CONTENT_VERDICT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')"
+              fi
               warn "  Auto-rebase push failed (self-repo) for $BRANCH (exit=$AUTO_REBASE_PUSH_RC): ${AUTO_REBASE_PUSH_ERR:-<no stderr captured>}"
+              git -C "$TMP_REBASE_WT" rebase --abort 2>/dev/null || true
             fi
             rm -f "$_PUSH_ERR_FILE" 2>/dev/null || true
           fi
@@ -9750,11 +9827,19 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               warn "  Auto-merge fallback (self-repo): rev-parse HEAD after merge returned empty for $BRANCH — treating as push failure"
               AUTO_REBASE_PUSH_ERR="rev-parse HEAD after merge fallback returned empty (merge produced no commit?)"
             else
+              # ga-itkbt: mirror the merge-time content-preservation guard
+              # (ga-y9a1d/ga-m07gc) — see the container-rig branch above for
+              # the full rationale, same fix, self-repo git access.
+              PR_COMMIT_VERDICT=$(branch_bead_commit_verdict \
+                "$(git -C "$TMP_REBASE_WT" rev-list --count "${MAIN_HEAD_SHA}..${NEW_TIP}" 2>/dev/null || echo "")" \
+                "$(git -C "$TMP_REBASE_WT" log --format='%B' "${MAIN_HEAD_SHA}..${NEW_TIP}" 2>/dev/null || echo "")" \
+                "$BEAD_ID")
+              PR_CONTENT_VERDICT=$(rebase_content_verdict "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP")
               _PUSH_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gc-gate-autorebase-push.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-autorebase-push.$$")
               # Plain push, safe to send WITHOUT force — see the
               # container-rig branch above for why (merge never rewrites
               # existing commits).
-              if git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" 2>"$_PUSH_ERR_FILE"; then
+              if [ "$PR_COMMIT_VERDICT" = "yes" ] && [ "$PR_CONTENT_VERDICT" = "yes" ] && git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" 2>"$_PUSH_ERR_FILE"; then
                 AUTO_REBASE_OK=1
                 BRANCH_SHA="$NEW_TIP"
                 log "  Auto-merge fallback success (self-repo): $BRANCH pushed to $NEW_TIP (rebase-replay failed, merge-tree pre-check showed zero conflict — merged instead, ga-byfbd/ga-qukyp)"
@@ -9770,7 +9855,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               else
                 AUTO_REBASE_PUSH_RC=$?
                 AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
+                [ "$PR_COMMIT_VERDICT" != "yes" ] && warn "  ga-itkbt/ga-y9a1d: pre-review auto-merge fallback (self-repo) onto $MAIN_HEAD_SHA did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$PR_COMMIT_VERDICT) — refusing to push."
+                if [ "$PR_CONTENT_VERDICT" != "yes" ]; then
+                  warn "  ga-itkbt/ga-m07gc: $BRANCH auto-merge-fallback (self-repo) onto $MAIN_HEAD_SHA produced a tree that does NOT match the 3-way merge result (content verdict=$PR_CONTENT_VERDICT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')"
+                fi
                 warn "  Auto-merge fallback push failed (self-repo) for $BRANCH (exit=$AUTO_REBASE_PUSH_RC): ${AUTO_REBASE_PUSH_ERR:-<no stderr captured>}"
+                git -C "$TMP_REBASE_WT" merge --abort 2>/dev/null || true
               fi
               rm -f "$_PUSH_ERR_FILE" 2>/dev/null || true
             fi
