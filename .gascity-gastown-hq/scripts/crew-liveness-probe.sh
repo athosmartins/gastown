@@ -18,6 +18,8 @@
 #   3. Suspend the crew agent via `gc agent suspend` → Pilot skips it next dispatch cycle
 #      (Pilot reads gc agent list | awk '$2=="suspended"' in _pilot_suspended_crews(),
 #       checked at pick_pool_builder() lines 750+760 in pilot-dispatcher.sh)
+#      On success, records a CLP_STATE_DIR marker (crew/bead/store/session-identity)
+#      so run_resume_scan() can auto-resume ONLY what this script itself suspended.
 #
 # SAFETY (2-confirmation):
 #   State files are written per-bead to CLP_STATE_DIR on first detection.
@@ -25,13 +27,55 @@
 #   a prior-sweep state file exists (≥ CLP_CONFIRM_MIN minutes old).
 #   A slow-but-alive crew is NOT healed — it must appear stale across TWO sweeps.
 #
+# RESUME (ga-ld0ch, CLP_HEAL_ENABLED=1 — same knob, it's the other half of heal):
+#   A crew this script suspends is otherwise a one-way ratchet: nothing ever
+#   calls `gc agent resume` again, so the crew stays locked out of nudge+dispatch
+#   even after a human restarts its session (which IS the actual cure — restart
+#   fixes the wedge, but the suspend flag survives a restart untouched). Each
+#   cycle, run_resume_scan() re-checks every crew THIS script suspended (tracked
+#   via the CLP_STATE_DIR marker _heal() wrote): if its live session identity
+#   has changed since the marker was recorded (new session, or the old one is
+#   simply gone) — proof something happened since the wedge — auto-resume it.
+#   Never touches a crew without a marker THIS script wrote: a deliberate,
+#   committed suspension (e.g. batista-ps, thies-ps in property_scrapers) is
+#   never at risk of being auto-resumed by this probe.
+#
+# WATCHDOG (ga-ld0ch): run_suspend_watchdog() is independent of whether THIS
+# script did the suspending — it just flags any agent with suspended=true AND
+# a currently-live session and no CLP_STATE_DIR marker. That combination is
+# exactly the blind spot from the 2026-09-10 incident (peter-wa/thies-wa/
+# mila-wa suspended via some other, uncommitted path — never proven to be this
+# script; see ga-ld0ch) that went unnoticed for hours because nothing surfaced
+# it. Fires regardless of root cause; dedup so it pages once per crew per hour,
+# not every StartInterval. Never flags a DELIBERATE suspension: batista-ps and
+# thies-ps (property_scrapers) are suspended on purpose, with that suspended=
+# true committed to git — _is_committed_suspend() checks exactly that (HEAD's
+# agent.toml, via `git show`, never `git checkout`) and skips them. The
+# 2026-09-10 incident's own signature was the opposite of that — suspended=
+# true with NO commit at all — which is precisely what this still lets through.
+#
+# ROOT CAUSE NOTE (ga-ld0ch): `_live_sessions()` used to do `jq -r '.[].name'`
+# against `gc session list --json`. The CLI's real output is an envelope object
+# ({"filters":{},"ok":true,"schema_version":"1","sessions":[...]}), not a bare
+# array — `.[].name` walks EVERY top-level value (including the `ok` boolean)
+# and jq fatals the moment it hits one that isn't indexable by `.name`, so the
+# function's actual return value was the literal string "null", which never
+# matches any real assignee. Net effect: since whenever `session list --json`
+# gained this envelope, EVERY bead has read as "not a live session" and this
+# probe's detect+nudge+heal path has been a complete, silent no-op — verified
+# against the live log (crew-liveness-probe.log), which shows zero heals and
+# zero nudges across its entire retained history. The selftest's own `gc` shim
+# had been mocking the OLD bare-array shape (matching the code's assumption,
+# not the real CLI), so it passed while production silently did nothing —
+# fixed here by making the shim emit the real envelope shape too.
+#
 # Knobs:
-#   CLP_ENABLED=1              — enable detect+nudge (default 0)
-#   CLP_HEAL_ENABLED=1         — enable heal actions (default 0; canary after review)
+#   CLP_ENABLED=1              — enable detect+nudge+watchdog (default 0)
+#   CLP_HEAL_ENABLED=1         — enable heal + auto-resume actions (default 0; canary after review)
 #   CLP_PROBE_STALE_MIN=15     — stale threshold in minutes (< reclaim 25min)
 #   CLP_CONFIRM_MIN=8          — min minutes between first-nudge and heal (default 8)
 #   CLP_STORES                 — space-separated rig store paths
-#   CLP_DRY_RUN=1              — report only, no nudge/heal
+#   CLP_DRY_RUN=1              — report only, no nudge/heal/resume
 #   CLP_BD=bd                  — bd binary override (test seam)
 #   CLP_GC=gc                  — gc binary override (test seam)
 #   CLP_STATE_DIR              — directory for per-bead confirmation state files
@@ -50,21 +94,59 @@ GC="${CLP_GC:-gc}"
 LOG="${CLP_LOG:-/Users/athos/gt/.gascity-gastown-hq/.gc/logs/crew-liveness-probe.log}"
 CLP_STATE_DIR="${CLP_STATE_DIR:-/Users/athos/gt/.gascity-gastown-hq/.gc/clp-state}"
 CLP_NOTIFY="${CLP_NOTIFY:-/Users/athos/.local/bin/notify}"
+CLP_CITY="${CLP_CITY:-/Users/athos/gt/.gascity-gastown-hq}"
+CLP_FRAMEWORK_REPO="${CLP_FRAMEWORK_REPO:-/Users/athos/gt}"
+
+# Cache for `gc session list --json`, loaded once per top-level call via
+# _load_sessions_json() and read by _live_sessions() / _session_identity().
+_sessions_json_cache=""
 
 ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || true; echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
 notify_fail() { "$CLP_NOTIFY" -t "Crew Liveness Probe" -p 4 "🚨 $*" 2>/dev/null || true; }
+# notify_info — same channel as notify_fail but default priority: for routine,
+# non-urgent visibility (a successful heal, an auto-resume) rather than an
+# alarm. This is the concrete fix for "ninguem ve" — a heal used to leave no
+# trace anyone would proactively see; now it pushes.
+notify_info() { "$CLP_NOTIFY" -t "Crew Liveness Probe" "$*" 2>/dev/null || true; }
 
 _nudge() {  # crew-id bead-id
   [ "$CLP_DRY_RUN" = "1" ] && { log "  DRY: would nudge $1 about bead $2"; return 0; }
   "$GC" nudge "$1" "liveness probe: bead $2 has been in-flight for ${CLP_PROBE_STALE_MIN}+ min with no recent commit — please send a status note or commit progress" 2>/dev/null || true
 }
 
-# _heal crew-id bead-id store-path
+# _comment_bead store bead-id text — best-effort durable trail on the bead.
+# Always --file (never -m: this bd build silently no-ops on -m and prints
+# nothing, so a caller has no signal the comment never landed).
+_comment_bead() {
+  local store="$1" bead="$2" text="$3" tf
+  tf=$(mktemp 2>/dev/null) || return 0
+  printf '%s\n' "$text" > "$tf" 2>/dev/null
+  "$BD" -C "$store" comment "$bead" --file "$tf" 2>/dev/null \
+    || log "  WARN: failed to write bd comment on $bead"
+  rm -f "$tf" 2>/dev/null || true
+}
+
+# _heal_marker_file crew-id — path to the "this script suspended it" marker.
+# Deliberately NEVER cleaned up by time (unlike *.nudged below) — it must
+# survive until run_resume_scan() actively resolves it (resume, or discovers
+# someone else already did), however long that takes. A time-based expiry
+# here would make this probe "forget" its own suspension and have the new
+# watchdog wrongly flag it as unexplained.
+_heal_marker_file() { echo "${CLP_STATE_DIR}/${1}.suspended-by-probe"; }
+
+# _record_heal_marker crew bead store ident — written on a SUCCESSFUL suspend.
+_record_heal_marker() {
+  local crew="$1" bead="$2" store="$3" ident="$4"
+  mkdir -p "$CLP_STATE_DIR" 2>/dev/null || true
+  printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$bead" "$store" "$ident" > "$(_heal_marker_file "$crew")" 2>/dev/null || true
+}
+
+# _heal crew-id bead-id store-path session-identity
 # Strips in-flight labels, clears assignee, suspends the crew agent.
 # Called ONLY after 2-confirmation; SAFETY-critical.
 _heal() {
-  local crew="$1" bead="$2" store="$3"
+  local crew="$1" bead="$2" store="$3" ident="${4:-}"
   log "  HEAL: releasing bead $bead from crew $crew (store=$store)"
 
   if [ "$CLP_DRY_RUN" = "1" ]; then
@@ -92,14 +174,40 @@ _heal() {
   # RISK: if the crew is still alive and working on ANOTHER bead, suspending it
   # prevents new dispatches to it. Mitigation: we only reach here after 2-sweep
   # confirmation that THIS bead is still stale on this crew, which strongly implies
-  # the crew is wedged. The crew can be resumed manually via `gc agent resume <name>`.
-  "$GC" -C /Users/athos/gt/.gascity-gastown-hq agent suspend "$crew" 2>/dev/null \
-    && log "  HEAL: suspended crew agent $crew" \
-    || { log "  HEAL WARN: failed to suspend crew agent $crew (may not be a city agent)"; notify_fail "crew-liveness-probe: falha ao suspender crew $crew apos heal do bead $bead — crew wedged pode ser re-despachado"; }
+  # the crew is wedged. run_resume_scan() auto-resumes it once its session
+  # identity changes (proof of restart — the actual cure, per ga-ld0ch); `gc
+  # agent resume <name>` also works manually at any time.
+  if "$GC" -C "$CLP_CITY" agent suspend "$crew" 2>/dev/null; then
+    log "  HEAL: suspended crew agent $crew"
+    _record_heal_marker "$crew" "$bead" "$store" "$ident"
+    _comment_bead "$store" "$bead" "crew-liveness-probe: suspended crew agent '$crew' after 2 confirmed sweeps with no commit activity on this bead (>= ${CLP_PROBE_STALE_MIN}min stale, reconfirmed >= ${CLP_CONFIRM_MIN}min later). Bead unassigned and reopened for dispatch. '$crew' auto-resumes once its session restarts (new session identity detected), or resume manually: gc agent resume $crew"
+    notify_info "crew-liveness-probe: suspendi $crew (bead $bead confirmado travado 2x) — auto-retoma quando a sessao reiniciar, ou: gc agent resume $crew"
+  else
+    log "  HEAL WARN: failed to suspend crew agent $crew (may not be a city agent)"
+    notify_fail "crew-liveness-probe: falha ao suspender crew $crew apos heal do bead $bead — crew wedged pode ser re-despachado"
+  fi
+}
+
+# _load_sessions_json — cache `gc session list --json` once per call site.
+# The CLI wraps sessions in an envelope: {"filters":{},"ok":true,
+# "schema_version":"1","sessions":[...]}. NOT a bare array — see the ROOT
+# CAUSE NOTE in the file header for what assuming otherwise did to this probe.
+_load_sessions_json() {
+  _sessions_json_cache=$("$GC" session list --json 2>/dev/null) || _sessions_json_cache=""
 }
 
 _live_sessions() {
-  "$GC" session list --json 2>/dev/null | jq -r '.[].name' 2>/dev/null || true
+  printf '%s' "$_sessions_json_cache" | jq -r '.sessions[]?.name // empty' 2>/dev/null || true
+}
+
+# _session_identity crew-name — "<id>|<created_at>" for its current live
+# session, or empty if not currently live. Used to detect a restart (the
+# actual cure for a wedged crew) without betting on which single field is
+# the "real" identity — id and created_at both change together on a fresh
+# session, so either changing is equally good evidence.
+_session_identity() {
+  printf '%s' "$_sessions_json_cache" | jq -r --arg n "$1" \
+    '.sessions[]? | select(.name == $n) | "\(.id)|\(.created_at)"' 2>/dev/null | head -1
 }
 
 # _state_file bead-id crew-id — returns path to confirmation state file
@@ -132,6 +240,39 @@ _clear_state() {
   rm -f "$sf" 2>/dev/null || true
 }
 
+# _watchdog_notify_file crew-id — dedup marker so run_suspend_watchdog() pages
+# at most once per crew per hour instead of every StartInterval (600s).
+_watchdog_notify_file() { echo "${CLP_STATE_DIR}/${1}.watchdog-notified"; }
+
+_should_watchdog_notify() {
+  local wf; wf=$(_watchdog_notify_file "$1")
+  [ -f "$wf" ] || return 0
+  local file_ts; file_ts=$(cat "$wf" 2>/dev/null) || return 0
+  [ -n "$file_ts" ] || return 0
+  local age=$(( $(date +%s) - file_ts ))
+  [ "$age" -ge 3600 ] && return 0 || return 1
+}
+
+_record_watchdog_notify() {
+  mkdir -p "$CLP_STATE_DIR" 2>/dev/null || true
+  date +%s > "$(_watchdog_notify_file "$1")" 2>/dev/null || true
+}
+
+# _is_committed_suspend crew-name — true if the crew's LAST COMMITTED
+# agent.toml (HEAD, via `git show` — a read, never `git checkout`, so this
+# cannot mutate the shared working tree) already has `suspended = true`.
+# That is a deliberate, reviewed suspension (batista-ps/thies-ps in
+# property_scrapers: committed, intentional, old) and must never be flagged.
+# The 2026-09-10 incident's signature was the opposite: three crews' TOML
+# went to suspended=true with NO commit at all — this is exactly the check
+# that tells the two apart (see crew-liveness-probe-suspends-never-resumes
+# memory). `git show` on a path that was never committed, or doesn't exist,
+# just fails closed to "not committed" (empty grep, function returns false).
+_is_committed_suspend() {
+  git -C "$CLP_FRAMEWORK_REPO" show "HEAD:.gascity-gastown-hq/agents/${1}/agent.toml" 2>/dev/null \
+    | grep -qF 'suspended = true'
+}
+
 run_probe() {
   if [ "$CLP_ENABLED" != "1" ]; then log "disabled (CLP_ENABLED!=1)"; return 0; fi
   local store id assignee updated_at stale_sec probed=0 healed=0 live_sessions
@@ -139,11 +280,14 @@ run_probe() {
   local stale_threshold=$(( CLP_PROBE_STALE_MIN * 60 ))
 
   # Cache live sessions once per probe run (gc session list is expensive)
+  _load_sessions_json
   live_sessions=$(_live_sessions)
 
-  # Clean up state files for beads that have cleared (stale/expired files ≥ 2h old)
+  # Clean up state files for beads that have cleared (stale/expired files ≥ 2h old).
+  # *.suspended-by-probe is deliberately NOT included — see _heal_marker_file().
   if [ -d "$CLP_STATE_DIR" ]; then
     find "$CLP_STATE_DIR" -name "*.nudged" -mmin +120 -delete 2>/dev/null || true
+    find "$CLP_STATE_DIR" -name "*.watchdog-notified" -mmin +1440 -delete 2>/dev/null || true
   fi
 
   for store in $CLP_STORES; do
@@ -179,7 +323,7 @@ run_probe() {
         # CONFIRMED: crew was nudged ≥ CLP_CONFIRM_MIN ago and is STILL stale+alive
         log "probe CONFIRMED-WEDGED: $id assignee=$assignee stale=${stale_sec}s — crew is confirmed wedged (2-sweep)"
         if [ "$CLP_HEAL_ENABLED" = "1" ]; then
-          _heal "$assignee" "$id" "$store"
+          _heal "$assignee" "$id" "$store" "$(_session_identity "$assignee")"
           _clear_state "$id" "$assignee"
           healed=$(( healed + 1 ))
         else
@@ -201,6 +345,92 @@ run_probe() {
   log "probe complete: nudged $probed crew(s), healed $healed$([ "$CLP_DRY_RUN" = "1" ] && echo ' (DRY)')"
 }
 
+# run_resume_scan — the other half of imp21's heal (ga-ld0ch): auto-resume a
+# crew THIS script suspended once it looks healthy again. "Healthy again" =
+# its live session identity differs from what it was at suspend time — either
+# a genuinely new session (restarted, the real cure per ga-ld0ch's own
+# incident writeup) or no session at all (the old wedged one exited; resuming
+# just lets the reconciler start a clean one instead of leaving the crew
+# stuck suspended forever with nothing running). Never acts on a crew without
+# a marker THIS function's sibling _heal() wrote, so a deliberate/committed
+# suspension is never touched.
+run_resume_scan() {
+  [ "$CLP_HEAL_ENABLED" = "1" ] || { log "resume-scan skipped (CLP_HEAL_ENABLED!=1)"; return 0; }
+  [ -d "$CLP_STATE_DIR" ] || return 0
+  _load_sessions_json
+  local mf crew suspended_at bead store ident_then ident_now now_suspended resumed=0
+  for mf in "$CLP_STATE_DIR"/*.suspended-by-probe; do
+    [ -e "$mf" ] || continue
+    crew=$(basename "$mf" .suspended-by-probe)
+    [ -n "$crew" ] || continue
+    IFS=$'\t' read -r suspended_at bead store ident_then < "$mf" 2>/dev/null || continue
+    [ -n "$store" ] || store="$CLP_CITY"
+
+    # Someone else may have already resumed it (or it was never really
+    # suspended, e.g. a marker survived a crash before suspend completed).
+    # Either way, if it's not suspended anymore there's nothing to do —
+    # clear the now-stale marker so the watchdog doesn't misread it later.
+    now_suspended=$("$GC" -C "$CLP_CITY" agent list --json 2>/dev/null \
+      | jq -r --arg n "$crew" '.agents[]? | select(.name == $n) | .suspended' 2>/dev/null)
+    if [ "$now_suspended" != "true" ]; then
+      log "resume-scan: $crew no longer suspended (resumed by someone else, or never took) — clearing stale marker"
+      rm -f "$mf" 2>/dev/null || true
+      continue
+    fi
+
+    ident_now=$(_session_identity "$crew")
+    if [ "$ident_now" != "$ident_then" ]; then
+      log "resume-scan: $crew session identity changed ('$ident_then' -> '$ident_now') — treating as restarted, auto-resuming"
+      if [ "$CLP_DRY_RUN" = "1" ]; then
+        log "  DRY: would resume $crew"
+      elif "$GC" -C "$CLP_CITY" agent resume "$crew" 2>/dev/null; then
+        log "  RESUME: resumed crew agent $crew (was suspended for bead $bead)"
+        _comment_bead "$store" "$bead" "crew-liveness-probe: auto-resumed '$crew' — its session identity changed since the suspend ($ident_then -> $ident_now), consistent with a restart."
+        notify_info "crew-liveness-probe: retomei $crew (sessao mudou desde a suspensao — parece reiniciada)"
+        resumed=$(( resumed + 1 ))
+      else
+        log "  RESUME WARN: gc agent resume failed for $crew"
+        notify_fail "crew-liveness-probe: falha ao dessuspender crew $crew apos detectar sessao nova"
+      fi
+      rm -f "$mf" 2>/dev/null || true
+    else
+      local age_min=$(( ( $(date +%s) - suspended_at ) / 60 ))
+      log "resume-scan: $crew still suspended (${age_min}min), same session ('$ident_now') — not auto-resuming yet"
+    fi
+  done
+  [ "$resumed" -gt 0 ] && log "resume-scan complete: resumed $resumed crew(s)"
+  return 0
+}
+
+# run_suspend_watchdog — independent anomaly detector (ga-ld0ch): any agent
+# with suspended=true AND a currently-live session, that carries no
+# CLP_STATE_DIR marker from this script's own _heal(), is unexplained from
+# this probe's point of view — exactly the shape of the 2026-09-10 incident,
+# regardless of what actually caused it. Read-only + notify, gated on
+# CLP_ENABLED alone (no heal knob needed — it never mutates agent state).
+run_suspend_watchdog() {
+  [ "$CLP_ENABLED" = "1" ] || return 0
+  local agents_json alive_names name flagged=0
+  agents_json=$("$GC" -C "$CLP_CITY" agent list --json 2>/dev/null)
+  [ -n "$agents_json" ] || return 0
+  _load_sessions_json
+  alive_names=$(_live_sessions)
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    [ -f "$(_heal_marker_file "$name")" ] && continue   # already accounted for by resume-scan
+    echo "$alive_names" | grep -qF "$name" 2>/dev/null || continue   # not live — a different problem
+    _is_committed_suspend "$name" && continue   # deliberate, reviewed suspension — not an anomaly
+    if _should_watchdog_notify "$name"; then
+      log "WATCHDOG: $name is suspended=true with a LIVE session and no probe marker — unexplained suspension, invisible unless someone looks (ga-ld0ch shape)"
+      notify_fail "crew-liveness-probe watchdog: $name suspenso com sessao viva, sem marca do probe — suspensao manual/desconhecida. Revisar: gc agent list | grep $name ; se for engano: gc agent resume $name"
+      _record_watchdog_notify "$name"
+      flagged=$(( flagged + 1 ))
+    fi
+  done < <(printf '%s' "$agents_json" | jq -r '.agents[]? | select(.suspended == true) | .name' 2>/dev/null)
+  [ "$flagged" -gt 0 ] && log "watchdog: flagged $flagged suspended-but-live agent(s) with no probe marker"
+  return 0
+}
+
 # ── selftest ─────────────────────────────────────────────────────────────────
 if [ "${1:-}" = "--selftest" ]; then
   PASS=0; FAIL=0; ok(){ PASS=$((PASS+1)); echo "  ✓ $1"; }; bad(){ FAIL=$((FAIL+1)); echo "  ✗ $1"; }
@@ -210,7 +440,9 @@ if [ "${1:-}" = "--selftest" ]; then
   HEAL_LOG="$TMP/heals"
   SUSPEND_LOG="$TMP/suspends"
   NOTIFY_LOG="$TMP/notifies"
-  : > "$NUDGE_LOG"; : > "$HEAL_LOG"; : > "$SUSPEND_LOG"; : > "$NOTIFY_LOG"
+  RESUME_LOG="$TMP/resumes"
+  COMMENT_LOG="$TMP/comments"
+  : > "$NUDGE_LOG"; : > "$HEAL_LOG"; : > "$SUSPEND_LOG"; : > "$NOTIFY_LOG"; : > "$RESUME_LOG"; : > "$COMMENT_LOG"
 
   cat > "$TMP/notify" <<NOTIFYSHIM
 #!/usr/bin/env bash
@@ -232,24 +464,53 @@ case "\$*" in
     echo '[{"id":"wa-stale","assignee":"mila-wa","updated_at":"'"$STALE_TS"'"},{"id":"wa-fresh","assignee":"mila-wa","updated_at":"'"$FRESH_TS"'"},{"id":"wa-dead","assignee":"dead-crew","updated_at":"'"$STALE_TS"'"}]' ;;
   *"label remove"*) echo "\$*" >> "${HEAL_LOG}" ;;
   *"assign"*) echo "\$*" >> "${HEAL_LOG}" ;;
+  *"comment"*) echo "\$*" >> "${COMMENT_LOG}" ;;
   *) echo '[]' ;;
 esac
 BDSHIM
   chmod +x "$TMP/bd"
 
+  # GC shim: session list --json emits the REAL envelope shape (object with a
+  # .sessions[] key), not the bare array this file's own tests used to mock —
+  # see the ROOT CAUSE NOTE at the top of this file for why that distinction
+  # is the whole bug. Session id is read from $TMP/session_id so a scenario
+  # can simulate a restart just by rewriting that file. agent suspend/resume/
+  # list --json are backed by a tiny stateful mock ($TMP/suspended_state) so
+  # resume-scan and the watchdog can be tested against a self-consistent
+  # simulated world, the same way $TMP/fail_suspend already toggles scenario 8.
   cat > "$TMP/gc" <<GCSHIM
 #!/usr/bin/env bash
+SID=\$(cat "${TMP}/session_id" 2>/dev/null || echo "sess-A")
 case "\$*" in
-  *"session list --json"*) echo '[{"name":"mila-wa"}]' ;;
+  *"session list --json"*)
+    echo '{"filters":{},"ok":true,"schema_version":"1","sessions":[{"name":"mila-wa","id":"'"\$SID"'","created_at":"2026-01-01T00:00:00Z"}]}' ;;
   *"nudge"*) echo "\$*" >> "${NUDGE_LOG}" ;;
-  *"agent suspend"*) [ -f "${TMP}/fail_suspend" ] && exit 1; echo "\$*" >> "${SUSPEND_LOG}" ;;
+  *"agent suspend"*)
+    [ -f "${TMP}/fail_suspend" ] && exit 1
+    echo "\$*" >> "${SUSPEND_LOG}"
+    NAME="\${@: -1}"
+    grep -qxF "\$NAME" "${TMP}/suspended_state" 2>/dev/null || echo "\$NAME" >> "${TMP}/suspended_state"
+    ;;
+  *"agent resume"*)
+    echo "\$*" >> "${RESUME_LOG}"
+    NAME="\${@: -1}"
+    grep -vxF "\$NAME" "${TMP}/suspended_state" 2>/dev/null > "${TMP}/suspended_state.tmp"
+    mv "${TMP}/suspended_state.tmp" "${TMP}/suspended_state" 2>/dev/null || true
+    ;;
+  *"agent list --json"*)
+    if grep -qxF "mila-wa" "${TMP}/suspended_state" 2>/dev/null; then SUS=true; else SUS=false; fi
+    echo '{"agents":[{"name":"mila-wa","suspended":'"\$SUS"'}]}'
+    ;;
   *) true ;;
 esac
 GCSHIM
   chmod +x "$TMP/gc"
+  : > "$TMP/suspended_state"
+  echo "sess-A" > "$TMP/session_id"
 
   BD="$TMP/bd"; GC="$TMP/gc"
   CLP_STORES="$TMP"
+  CLP_CITY="$TMP"
   LOG="$TMP/log"
   CLP_STATE_DIR="$TMP/state"
   CLP_NOTIFY="$TMP/notify"
@@ -337,8 +598,103 @@ GCSHIM
   rm -f "$TMP/fail_suspend"
 
   echo ""
+  echo "=== Scenario 9: real session-list envelope shape (object, not bare array) parses correctly (ga-ld0ch root cause) ==="
+  _load_sessions_json
+  echo "$(_live_sessions)" | grep -qF "mila-wa" && ok "9: _live_sessions() found mila-wa in the REAL {sessions:[...]} envelope" || bad "9: _live_sessions() failed against the real envelope shape"
+  IDENT9=$(_session_identity "mila-wa")
+  { [ -n "$IDENT9" ] && echo "$IDENT9" | grep -qF "sess-A"; } && ok "9: _session_identity() resolved mila-wa's session id" || bad "9: _session_identity() did not resolve mila-wa"
+
+  echo ""
+  echo "=== Scenario 10: _heal() records a resume marker + durable bd comment + notify on successful suspend ==="
+  : > "$SUSPEND_LOG"; : > "$COMMENT_LOG"; : > "$NOTIFY_LOG"; : > "$TMP/suspended_state"
+  MARKER="$CLP_STATE_DIR/mila-wa.suspended-by-probe"
+  rm -f "$MARKER" 2>/dev/null
+  CLP_DRY_RUN=0
+  _load_sessions_json
+  _heal "mila-wa" "wa-stale" "$TMP" "$(_session_identity mila-wa)"
+  [ -f "$MARKER" ] && ok "10: heal wrote a suspended-by-probe marker for mila-wa" || bad "10: expected marker file after heal"
+  grep -q "wa-stale" "$MARKER" 2>/dev/null && ok "10: marker records the bead id" || bad "10: marker missing bead id"
+  grep -q "wa-stale" "$COMMENT_LOG" && ok "10: heal left a durable bd comment on the bead" || bad "10: expected a bd comment on heal"
+  grep -q "mila-wa" "$NOTIFY_LOG" && ok "10: heal pushed an informational notify (visibility fix for 'ninguem ve')" || bad "10: expected an informational notify on successful heal"
+
+  echo ""
+  echo "=== Scenario 11: resume-scan auto-resumes once session identity changes (proof of restart) ==="
+  : > "$RESUME_LOG"; : > "$COMMENT_LOG"
+  echo "sess-B" > "$TMP/session_id"   # simulate the crew's session having restarted
+  CLP_HEAL_ENABLED=1
+  run_resume_scan
+  grep -q "agent resume.*mila-wa" "$RESUME_LOG" && ok "11: resume-scan resumed mila-wa after its session identity changed" || bad "11: expected gc agent resume mila-wa"
+  [ -f "$MARKER" ] && bad "11: marker not cleared after resume" || ok "11: marker cleared after resume"
+  grep -qxF "mila-wa" "$TMP/suspended_state" && bad "11: mock still shows mila-wa suspended after resume" || ok "11: mock suspended_state cleared for mila-wa"
+
+  echo ""
+  echo "=== Scenario 12: resume-scan does NOT resume when session identity is unchanged ==="
+  : > "$RESUME_LOG"
+  _load_sessions_json
+  _heal "mila-wa" "wa-stale" "$TMP" "$(_session_identity mila-wa)"   # re-suspend; marker back, ident=sess-B
+  run_resume_scan   # session_id still sess-B — no change
+  [ -s "$RESUME_LOG" ] && bad "12: resumed a crew whose session never changed" || ok "12: no resume while session identity is unchanged"
+  [ -f "$MARKER" ] && ok "12: marker preserved (still waiting for a real restart)" || bad "12: marker should not be cleared yet"
+
+  echo ""
+  echo "=== Scenario 13: resume-scan clears a stale marker when someone else already resumed the crew ==="
+  : > "$RESUME_LOG"
+  printf '' > "$TMP/suspended_state"   # simulate: crew was resumed via some OTHER path, not by us
+  run_resume_scan
+  [ -s "$RESUME_LOG" ] && bad "13: called gc agent resume on an already-resumed crew" || ok "13: no redundant resume call"
+  [ -f "$MARKER" ] && bad "13: stale marker not cleared" || ok "13: stale marker cleared once crew was found not-suspended"
+
+  echo ""
+  echo "=== Scenario 14: watchdog fires on suspended+live+NO marker (the actual ga-ld0ch incident shape) ==="
+  : > "$NOTIFY_LOG"
+  rm -f "$CLP_STATE_DIR"/mila-wa.suspended-by-probe "$CLP_STATE_DIR"/mila-wa.watchdog-notified 2>/dev/null
+  echo "mila-wa" > "$TMP/suspended_state"   # suspended by some OTHER unmodeled path — no marker
+  run_suspend_watchdog
+  grep -qi "mila-wa" "$NOTIFY_LOG" && ok "14: watchdog notified on an unexplained suspended+live crew" || bad "14: expected a watchdog notify for mila-wa"
+
+  echo ""
+  echo "=== Scenario 15: watchdog does NOT flag a crew already tracked by a probe marker ==="
+  : > "$NOTIFY_LOG"
+  rm -f "$CLP_STATE_DIR"/mila-wa.watchdog-notified 2>/dev/null
+  _record_heal_marker "mila-wa" "wa-stale" "$TMP" "sess-B"
+  run_suspend_watchdog
+  [ -s "$NOTIFY_LOG" ] && bad "15: watchdog flagged a crew already tracked by resume-scan" || ok "15: watchdog correctly skipped a crew with a probe marker"
+  rm -f "$CLP_STATE_DIR"/mila-wa.suspended-by-probe 2>/dev/null
+
+  echo ""
+  echo "=== Scenario 16: watchdog does not re-notify the same crew within the dedup window ==="
+  : > "$NOTIFY_LOG"
+  rm -f "$CLP_STATE_DIR"/mila-wa.watchdog-notified 2>/dev/null
+  run_suspend_watchdog
+  FIRST_COUNT=$(wc -l < "$NOTIFY_LOG" | tr -d ' ')
+  run_suspend_watchdog
+  SECOND_COUNT=$(wc -l < "$NOTIFY_LOG" | tr -d ' ')
+  { [ "$FIRST_COUNT" -ge 1 ] && [ "$SECOND_COUNT" -eq "$FIRST_COUNT" ]; } && ok "16: watchdog did not re-notify within the dedup window" || bad "16: expected exactly one notify across two immediate sweeps (got $FIRST_COUNT then $SECOND_COUNT)"
+
+  echo ""
+  echo "=== Scenario 17: _is_committed_suspend distinguishes deliberate (committed) from ga-ld0ch-shaped (uncommitted) suspension ==="
+  FIXTURE_REPO="$TMP/fixture-repo"
+  mkdir -p "$FIXTURE_REPO/.gascity-gastown-hq/agents/committed-crew" "$FIXTURE_REPO/.gascity-gastown-hq/agents/uncommitted-crew"
+  git -C "$FIXTURE_REPO" init -q 2>/dev/null
+  printf 'name = "committed-crew"\nsuspended = true\n' > "$FIXTURE_REPO/.gascity-gastown-hq/agents/committed-crew/agent.toml"
+  printf 'name = "uncommitted-crew"\nsuspended = false\n' > "$FIXTURE_REPO/.gascity-gastown-hq/agents/uncommitted-crew/agent.toml"
+  git -C "$FIXTURE_REPO" add -A 2>/dev/null
+  git -C "$FIXTURE_REPO" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "initial: committed-crew is deliberately suspended" 2>/dev/null
+  # Simulate the ga-ld0ch shape: flip uncommitted-crew's suspended flag in the
+  # WORKING TREE only, exactly like the real incident's diff that never landed a commit.
+  printf 'name = "uncommitted-crew"\nsuspended = true\n' > "$FIXTURE_REPO/.gascity-gastown-hq/agents/uncommitted-crew/agent.toml"
+
+  CLP_FRAMEWORK_REPO="$FIXTURE_REPO"
+  _is_committed_suspend "committed-crew" && ok "17: committed-crew's suspend is committed — correctly recognized as deliberate" || bad "17: expected committed-crew to be recognized as a committed suspension"
+  _is_committed_suspend "uncommitted-crew" && bad "17: uncommitted-crew's UNCOMMITTED suspend was wrongly treated as deliberate (this is the ga-ld0ch shape — must stay flaggable)" || ok "17: uncommitted-crew correctly identified as NOT committed"
+  _is_committed_suspend "no-such-crew" && bad "17: a nonexistent agent.toml was wrongly treated as committed-suspended" || ok "17: missing agent.toml fails closed to 'not committed'"
+  CLP_FRAMEWORK_REPO="$TMP"
+
+  echo ""
   echo "crew-liveness-probe selftest: PASS=$PASS FAIL=$FAIL"
   [ "$FAIL" -eq 0 ] && exit 0 || exit 1
 fi
 
 run_probe
+run_resume_scan
+run_suspend_watchdog
