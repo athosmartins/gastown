@@ -18,7 +18,7 @@
 #
 #   WARN_GB (default 8)     — attempt the pre-sanctioned-safe reclaim
 #                             (`gc dolt-cleanup --force` — orphan test-DB SQL DROP,
-#                             documented safe while Dolt is up), PLUS four more
+#                             documented safe while Dolt is up), PLUS five more
 #                             levers — reaping dead-session scratchpads under
 #                             /private/tmp (see _reap_dead_scratch, ga-hjcxy/
 #                             ga-02pnu: a single dead session's 1GB scratchpad
@@ -50,7 +50,22 @@
 #                             incident, and safe to automate because
 #                             recall_lib.py's own bootstrap already treats a
 #                             wiped cache as a self-healing cache-miss, not a
-#                             failure) — then rate-limited notify. Cooldown is
+#                             failure), and trimming the Go build cache
+#                             (GOCACHE) once it has grown large enough to
+#                             matter (see _reap_gocache, ga-yi68q: MEASURED
+#                             2026-09-10 — GOCACHE went from ~0 to 4.8GB in
+#                             ~1h of `bd` builds/tests (bd embeds the whole
+#                             Dolt engine, so each build/test run generates
+#                             GBs of compiled artifact), pushing this guard's
+#                             own floor down to 1.2GB avail; `go clean
+#                             -cache` recovered 5.5GB instantly. Skipped at
+#                             WARN while a go/compile/link process is
+#                             actively running — an interrupted build just
+#                             recompiles on retry, avoidable churn at that
+#                             tier — forced at CRITICAL regardless, since
+#                             Dolt hitting ENOSPC mid-journal-write (ga-vs55)
+#                             is not similarly recoverable) — then
+#                             rate-limited notify. Cooldown is
 #                             bypassed if avail is WORSENING since the last
 #                             notify (mirrors the exact fix ga-vs55 furo #2
 #                             added to disk-pressure-monitor.sh's
@@ -59,7 +74,7 @@
 #                             before Dolt died; must not regress that lesson
 #                             onto this guard).
 #
-#                             UNLIKE the other four levers, _reap_growing_logs
+#                             UNLIKE the other five levers, _reap_growing_logs
 #                             runs on EVERY cycle regardless of floor class
 #                             (see its call at the top of main(), before the
 #                             avail/class computation) — ga-dnc2m's own
@@ -76,7 +91,7 @@
 #                             _reap_hf_cache only fires at CRITICAL, never at
 #                             plain WARN (see its own header comment) — unlike
 #                             dolt-cleanup/scratch-reap/transcript-reap/
-#                             log-reap, it has a real recurring cost each time
+#                             log-reap/gocache-reap, it has a real recurring cost each time
 #                             it fires (the next `recall` call pays a bounded
 #                             re-download), so it is reserved for the severity
 #                             this bead's own incident actually reached
@@ -189,9 +204,9 @@
 # a healthy Dolt down, `gc dolt start` is a no-op when Dolt is already
 # running, and the action is gated to disk-safe classes only.)
 #
-# Kill switch: DOLT_DISK_FLOOR_GUARD_ENABLED=0 → skip ALL FIVE reclaim actions
+# Kill switch: DOLT_DISK_FLOOR_GUARD_ENABLED=0 → skip ALL SIX reclaim actions
 # (dolt-cleanup, the scratchpad reaper, the transcript reaper, the log
-# reaper, AND the hf-cache reaper) only. Notification is NEVER gated by this switch (imp07 CALL
+# reaper, the hf-cache reaper, AND the gocache reaper) only. Notification is NEVER gated by this switch (imp07 CALL
 # INVARIANT: alerting is the lowest-blast-radius action here and the one furo
 # #2 just fixed for being wrongly suppressible — don't reintroduce that
 # failure mode one guard over).
@@ -221,6 +236,16 @@ FLOOR_CRITICAL_GB="${DOLT_DISK_FLOOR_CRITICAL_GB:-3}"
 # from the bead's own "varios GB" framing (more than a rounding blip), not
 # yet tuned against production history.
 VM_SIGNIFICANT_GB="${DOLT_DISK_FLOOR_VM_SIGNIFICANT_GB:-2}"
+
+# ga-yi68q: GB the Go build cache (GOCACHE) must reach before _reap_gocache
+# considers it worth trimming. Independent axis from the two floors above and
+# from VM_SIGNIFICANT_GB: those gate on Dolt's own remaining headroom (or on
+# how much of the SAME container is VM); this gates on how large GOCACHE
+# itself has grown, regardless of avail — a small cache isn't worth the
+# recompile cost of wiping it even while Dolt's floor is breached by
+# something else. Default of 3 matches the bead's own "~3 GB" framing
+# (MEASURED 2026-09-10: grew to 4.8GB in ~1h of `bd` builds/tests).
+GOCACHE_REAP_THRESHOLD_GB="${DOLT_DISK_FLOOR_GOCACHE_REAP_THRESHOLD_GB:-3}"
 
 NOTIFY_COOLDOWN_SECS="${DOLT_DISK_FLOOR_NOTIFY_COOLDOWN_SECS:-3600}"   # 1h — tighter
                         # than disk-pressure-monitor's 6h; this is Dolt-specific
@@ -421,6 +446,63 @@ _should_resurrect() {
     NONE|WARN) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# _gocache_dir → the Go build cache directory (GOCACHE). Prefers `go env
+# GOCACHE` (respects any GOENV/env override on this host) and falls back to
+# the well-known macOS default if `go` isn't on PATH — same
+# never-crash-on-a-missing-external-binary shape as the optional $_PROBE
+# source above (ga-yi68q).
+_gocache_dir() {
+  local d
+  d="$(command -v go >/dev/null 2>&1 && go env GOCACHE 2>/dev/null)"
+  [ -n "$d" ] && { echo "$d"; return; }
+  echo "$HOME/Library/Caches/go-build"
+}
+
+# _gocache_size_gb [dir] → integer GB used by the Go build cache (default
+# _gocache_dir), or "" if du fails/parses oddly (e.g. dir doesn't exist) —
+# same never-silently-assume-0 contract as _avail_gb/_vm_swap_gb above
+# (ga-yi68q).
+_gocache_size_gb() {
+  local dir="${1:-$(_gocache_dir)}" kb
+  kb="$(du -sk "$dir" 2>/dev/null | awk '{print $1}')"
+  case "$kb" in ''|*[!0-9]*) echo ""; return ;; esac
+  echo $(( kb / 1024 / 1024 ))
+}
+
+# _go_toolchain_active → 0 (true, exit code) if a `go build`/`go test`/`go
+# install`/`go run` invocation or one of the toolchain's own internal
+# subprocesses (compile/link) is currently running. Best-effort, like
+# _top_rss_processes: pgrep absence/failure reads as "not active" (1/false)
+# — the safe direction, since _should_reap_gocache's CRITICAL branch forces
+# the reap regardless of this reading; a false negative here only costs one
+# WARN-tier cycle (5min), never blocks the CRITICAL guarantee (ga-yi68q).
+_go_toolchain_active() {
+  pgrep -x compile >/dev/null 2>&1 && return 0
+  pgrep -x link >/dev/null 2>&1 && return 0
+  pgrep -f '(^|/)go (build|test|install|run)' >/dev/null 2>&1
+}
+
+# _should_reap_gocache <cache_gb> <threshold_gb> <go_active> <was_critical> →
+# 0 (true) when the cache is large enough to be worth reaping (cache_gb >=
+# threshold_gb) AND EITHER no go/compile/link process is active OR this
+# cycle is CRITICAL (ga-yi68q's own two-tier policy: prefer not to disrupt
+# an in-flight build at WARN — a build that fails from a vanished cache
+# entry just recompiles on retry, recoverable — but CRITICAL overrides,
+# since Dolt hitting ENOSPC mid-journal-write is not). cache_gb
+# empty/non-numeric (du failed) fails CLOSED — never guess a size to
+# justify wiping the cache (ga-p5q3 discipline, same asymmetry
+# _sustain_confirmed's own comment already documents for this file's
+# corrupt-state case).
+_should_reap_gocache() {
+  local cache_gb="$1" threshold_gb="$2" go_active="$3" was_critical="$4"
+  case "$cache_gb" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$cache_gb" -ge "$threshold_gb" ] || return 1
+  if [ "$go_active" = "1" ] && [ "$was_critical" != "1" ]; then
+    return 1
+  fi
+  return 0
 }
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -707,6 +789,61 @@ _reap_growing_logs() {
   fi
 }
 
+# _reap_gocache — sixth reclaim lever, alongside _safe_reclaim,
+# _reap_dead_scratch, _reap_dead_transcripts, _reap_hf_cache and
+# _reap_growing_logs (ga-yi68q): the Go build cache (GOCACHE, normally
+# ~/Library/Caches/go-build) is not touched by any of the other five —
+# MEASURED 2026-09-10 (Mayor): it grew from ~0 to 4.8GB in ~1h of `bd`
+# builds/tests (bd embeds the whole Dolt engine — each build/test run
+# generates GBs of compiled artifact), pushing this guard's own data-dir
+# floor down to 1.2GB avail. `go clean -cache` recovered 5.5GB instantly
+# (1210 -> 6729 MB). Inlined here (no delegate script/PROD-sentinel, unlike
+# the four scratch/transcript/hf-cache/log levers above) because — like
+# _safe_reclaim's `gc dolt-cleanup --force` — this is a single, blunt,
+# idempotent-ish external command with no per-item staleness/liveness
+# decision of its own to test in isolation; Go's own cache invalidation
+# already decides what's safe to lose.
+#
+# Two-tier by design (_should_reap_gocache): at WARN, skip while a go
+# build/test is actively running (killing/racing a live build's inputs out
+# from under it is avoidable churn); at CRITICAL, reap regardless. `go
+# clean -cache` may print "unlinkat ... directory not empty" when a
+# concurrent build is still writing into the cache — harmless per this
+# bead's own investigation, but NOT specially parsed out of the exit code
+# here (this file never trusts message content over exit status elsewhere,
+# e.g. the TIMEOUT-vs-FAILED split above) — a nonzero exit still logs
+# FAILED, with this comment as the pointer for whoever reads that line.
+_reap_gocache() {
+  local was_critical="${1:-0}"
+  if [ "$ENABLED" != "1" ]; then
+    log "gocache-reap SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"
+    return
+  fi
+  if ! command -v go >/dev/null 2>&1; then
+    log "gocache-reap SKIP — go binary not found on PATH"
+    return
+  fi
+  local dir; dir="$(_gocache_dir)"
+  if [ ! -d "$dir" ]; then
+    log "gocache-reap SKIP — $dir not found"
+    return
+  fi
+  local cache_gb go_active=0
+  cache_gb="$(_gocache_size_gb "$dir")"
+  _go_toolchain_active && go_active=1
+  if ! _should_reap_gocache "$cache_gb" "$GOCACHE_REAP_THRESHOLD_GB" "$go_active" "$was_critical"; then
+    log "gocache-reap SKIP — cache=${cache_gb:-unmeasured}GB threshold=${GOCACHE_REAP_THRESHOLD_GB}GB go_active=${go_active} was_critical=${was_critical}"
+    return
+  fi
+  log "gocache-reap: cache=${cache_gb}GB >= ${GOCACHE_REAP_THRESHOLD_GB}GB (go_active=${go_active} was_critical=${was_critical}) — running 'go clean -cache' …"
+  if timeout 60 go clean -cache >> "$LOG" 2>&1; then
+    local after_gb; after_gb="$(_gocache_size_gb "$dir")"
+    log "gocache-reap OK — cache ${cache_gb}GB -> ${after_gb:-?}GB"
+  else
+    log "gocache-reap FAILED (nonzero exit; may be the harmless 'directory not empty' race noted above — see log lines just above for the real message)"
+  fi
+}
+
 # _resurrect_dolt <avail_gb> <class> — last-resort auto-respawn for a Dolt
 # sql-server CONFIRMED down while disk headroom is safe. Caller (main) has
 # already run _should_resurrect's gate; this function does the actual work.
@@ -856,6 +993,7 @@ main() {
   _reap_dead_scratch "$was_critical"
   _reap_dead_transcripts
   _reap_hf_cache "$was_critical"
+  _reap_gocache "$was_critical"
 
   # re-read avail — reclaim may have freed space; `class` becomes the CURRENT
   # (post-reclaim) reading, used for logging/messaging. was_critical also

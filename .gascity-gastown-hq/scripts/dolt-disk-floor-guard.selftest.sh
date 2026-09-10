@@ -180,6 +180,50 @@ _vm_bound_pressure 0 1 2   && bad "vm_bound: vm=1 below threshold=2 should NOT b
 _vm_bound_pressure 0 "" 2  && bad "vm_bound: unmeasurable vm should NEVER confirm VM-bound"        || ok "vm_bound: empty vm → not VM-bound (unmeasurable, not false-negative-as-fine)"
 _vm_bound_pressure 0 abc 2 && bad "vm_bound: non-numeric vm should NEVER confirm VM-bound"         || ok "vm_bound: non-numeric vm → not VM-bound"
 
+# ── _gocache_size_gb: real du parsing (NOT stubbed on an explicit path — same
+#    rationale as the _avail_gb(/tmp)/_vm_swap_gb() real tests above; ga-yi68q) ──
+g="$(_gocache_size_gb /tmp)"
+case "$g" in
+  ''|*[!0-9]*) bad "_gocache_size_gb(/tmp) did not return an integer (got: '$g')" ;;
+  *) [ "$g" -ge 0 ] && ok "_gocache_size_gb(/tmp) returns a non-negative integer GB ($g)" || bad "_gocache_size_gb(/tmp) returned negative: $g" ;;
+esac
+
+# ── _gocache_size_gb: nonexistent path → "" (surfaces as unmeasured, never a
+#    silent 0 — ga-p5q3 discipline, same as _avail_gb's own nonexistent-path test) ──
+g="$(_gocache_size_gb "/nonexistent/path/$$/does-not-exist")"
+[ "$g" = "" ] && ok "_gocache_size_gb(nonexistent path) → '' (du failure surfaces, not masked)" || bad "_gocache_size_gb(nonexistent) got: '$g' (expected empty)"
+
+# ── _gocache_size_gb: default-arg path resolves via the real _gocache_dir
+#    (go env GOCACHE, or the macOS-default fallback) end to end on this host ──
+g="$(_gocache_size_gb)"
+case "$g" in
+  ''|*[!0-9]*) bad "_gocache_size_gb() (default dir) did not return an integer (got: '$g')" ;;
+  *) [ "$g" -ge 0 ] && ok "_gocache_size_gb() (default dir, real _gocache_dir resolution) returns a non-negative integer GB ($g)" || bad "_gocache_size_gb() returned negative: $g" ;;
+esac
+
+# ── _go_toolchain_active: live process-table read (NOT controllable
+#    hermetically) — only proves it returns a valid boolean exit code without
+#    crashing or hanging, same minimalism as this file's other live-state
+#    reads (_top_rss_processes) where the real value can't be pinned ────────
+_go_toolchain_active; _gta_rc=$?
+if [ "$_gta_rc" -eq 0 ] || [ "$_gta_rc" -eq 1 ]; then
+  ok "_go_toolchain_active: returns a valid boolean exit code ($_gta_rc) without crashing"
+else
+  bad "_go_toolchain_active: unexpected exit code $_gta_rc (expected 0 or 1)"
+fi
+
+# ── _should_reap_gocache (ga-yi68q): reap only when the cache is large enough
+#    to matter AND (no go process active OR this cycle is CRITICAL) — mirrors
+#    _should_resurrect's boundary-style coverage above ──────────────────────
+_should_reap_gocache 5 3 0 0 && ok "should_reap_gocache: cache(5)>=threshold(3), go NOT active → true (WARN-tier ok)" || bad "should_reap_gocache 5/3/0/0 should be true"
+_should_reap_gocache 3 3 0 0 && ok "should_reap_gocache: cache==threshold → true (boundary inclusive)" || bad "should_reap_gocache 3/3/0/0 should be true (inclusive boundary)"
+_should_reap_gocache 2 3 0 0 && bad "should_reap_gocache: cache(2)<threshold(3) should NOT reap" || ok "should_reap_gocache: cache below threshold → false"
+_should_reap_gocache 5 3 1 0 && bad "should_reap_gocache: go ACTIVE + was_critical=0 should NOT reap (avoid disrupting a live build at WARN)" || ok "should_reap_gocache: go active, non-critical → false (WARN-tier skip)"
+_should_reap_gocache 5 3 1 1 && ok "should_reap_gocache: go ACTIVE but was_critical=1 → true (CRITICAL overrides — Dolt ENOSPC is worse than a failed build)" || bad "should_reap_gocache 5/3/1/1 should be true (CRITICAL override)"
+_should_reap_gocache 5 3 0 1 && ok "should_reap_gocache: go not active + was_critical=1 → true" || bad "should_reap_gocache 5/3/0/1 should be true"
+_should_reap_gocache "" 3 0 0  && bad "should_reap_gocache: empty cache_gb (du failed) should fail CLOSED, never guess" || ok "should_reap_gocache: empty cache_gb → fails closed (never reap on an unmeasured size)"
+_should_reap_gocache abc 3 0 0 && bad "should_reap_gocache: non-numeric cache_gb should fail CLOSED" || ok "should_reap_gocache: non-numeric cache_gb → fails closed"
+
 echo ""
 echo "=== _reap_dead_scratch: production sentinel wiring (ga-h565g) ==="
 # _reap_dead_scratch is the REAL caller scratchpad-reaper.sh's own header
@@ -747,6 +791,21 @@ REAP_HF_CALLS=0
 REAP_HF_LAST_ARG=""
 _reap_hf_cache() { REAP_HF_CALLS=$((REAP_HF_CALLS+1)); REAP_HF_LAST_ARG="${1:-}"; }
 
+# _reap_gocache is new (ga-yi68q), same reasoning as the other reap stubs:
+# EXECUTION code (shells out to `go clean -cache` directly, no delegate
+# script — see that function's own header for why) stubbed as a no-op here
+# so main()'s WIRING is what gets proven, not the real cache wipe. Grouped
+# with scratch/transcript/logs (called on EVERY cycle that reaches the
+# reclaim step, was_critical passed as $1, decision logic lives INSIDE the
+# real function via _should_reap_gocache) — NOT with hf_cache, which main()
+# itself never gates differently; hf_cache's CRITICAL-only behavior also
+# lives inside its own function, but this comment exists on both because a
+# future reader must not assume "reaches main() unconditionally" implies
+# "always actually reaps" for either lever.
+REAP_GOCACHE_CALLS=0
+REAP_GOCACHE_LAST_ARG=""
+_reap_gocache() { REAP_GOCACHE_CALLS=$((REAP_GOCACHE_CALLS+1)); REAP_GOCACHE_LAST_ARG="${1:-}"; }
+
 NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""
 record_notify() {
   NOTIFY_CALLS=$((NOTIFY_CALLS+1))
@@ -789,7 +848,7 @@ record_gc() {
 # shellcheck disable=SC2034  # read by main() in the sourced script
 GC=record_gc
 
-reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; }
+reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; }
 seed_state() {
   if [ -n "$1" ]; then echo "$1" > "$STATE_EPOCH_FILE"; else rm -f "$STATE_EPOCH_FILE"; fi
   if [ -n "$2" ]; then echo "$2" > "$STATE_AVAIL_FILE"; else rm -f "$STATE_AVAIL_FILE"; fi
@@ -1023,10 +1082,10 @@ echo "=== main(): scratchpad + transcript reap integration (ga-02pnu, ga-t1ub9) 
 reset_capture; seed_state "" ""
 queue_avail 2 20
 main
-if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ] && [ "$REAP_LOGS_CALLS" = "1" ] && [ "$REAP_HF_CALLS" = "1" ]; then
-  ok "main(): _reap_dead_scratch, _reap_dead_transcripts, _reap_growing_logs, AND _reap_hf_cache each invoked exactly once alongside _safe_reclaim"
+if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ] && [ "$REAP_LOGS_CALLS" = "1" ] && [ "$REAP_HF_CALLS" = "1" ] && [ "$REAP_GOCACHE_CALLS" = "1" ]; then
+  ok "main(): _reap_dead_scratch, _reap_dead_transcripts, _reap_growing_logs, _reap_hf_cache, AND _reap_gocache each invoked exactly once alongside _safe_reclaim"
 else
-  bad "main(): expected all four reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_LOGS_CALLS=$REAP_LOGS_CALLS REAP_HF_CALLS=$REAP_HF_CALLS"
+  bad "main(): expected all five reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_LOGS_CALLS=$REAP_LOGS_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS"
 fi
 if [ "$REAP_LAST_ARG" = "1" ]; then
   ok "main(): CRITICAL cycle (even after reclaim recovers it to NONE) passes was_critical=1 to _reap_dead_scratch (ga-rjhfz pressure plumbing)"
@@ -1037,6 +1096,11 @@ if [ "$REAP_HF_LAST_ARG" = "1" ]; then
   ok "main(): CRITICAL cycle also passes was_critical=1 to _reap_hf_cache (wa-9eh0v)"
 else
   bad "main(): expected _reap_hf_cache to receive was_critical=1 on a CRITICAL cycle, got REAP_HF_LAST_ARG='$REAP_HF_LAST_ARG'"
+fi
+if [ "$REAP_GOCACHE_LAST_ARG" = "1" ]; then
+  ok "main(): CRITICAL cycle also passes was_critical=1 to _reap_gocache (ga-yi68q)"
+else
+  bad "main(): expected _reap_gocache to receive was_critical=1 on a CRITICAL cycle, got REAP_GOCACHE_LAST_ARG='$REAP_GOCACHE_LAST_ARG'"
 fi
 
 # Scenario E2 (ga-rjhfz) — a cycle that is WARN, never CRITICAL, must pass
@@ -1057,6 +1121,11 @@ if [ "$REAP_HF_CALLS" = "1" ] && [ "$REAP_HF_LAST_ARG" = "0" ]; then
 else
   bad "main(): expected _reap_hf_cache called once with was_critical=0 on a WARN-only cycle, got REAP_HF_CALLS=$REAP_HF_CALLS REAP_HF_LAST_ARG='$REAP_HF_LAST_ARG'"
 fi
+if [ "$REAP_GOCACHE_CALLS" = "1" ] && [ "$REAP_GOCACHE_LAST_ARG" = "0" ]; then
+  ok "main(): non-critical WARN cycle calls _reap_gocache with was_critical=0 (the WARN-vs-CRITICAL reap decision lives INSIDE the real function via _should_reap_gocache, not in main()'s wiring — ga-yi68q)"
+else
+  bad "main(): expected _reap_gocache called once with was_critical=0 on a WARN-only cycle, got REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GOCACHE_LAST_ARG='$REAP_GOCACHE_LAST_ARG'"
+fi
 
 # Scenario F — a cycle that never reaches the floor at all (avail comfortably
 # above warn on the FIRST read) must take the top early-return and never touch
@@ -1066,10 +1135,10 @@ VM_LOG_PRE_COUNT=$(grep -c "vm_swap_gb=" "$LOG" 2>/dev/null || echo 0)
 reset_capture; seed_state "" ""
 queue_avail 20
 main
-if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ] && [ "$REAP_HF_CALLS" = "0" ]; then
-  ok "main(): avail above floor on first read never invokes the scratch/transcript/hf-cache reapers"
+if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ] && [ "$REAP_HF_CALLS" = "0" ] && [ "$REAP_GOCACHE_CALLS" = "0" ]; then
+  ok "main(): avail above floor on first read never invokes the scratch/transcript/hf-cache/gocache reapers"
 else
-  bad "main(): expected zero scratch/transcript/hf-cache reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_HF_CALLS=$REAP_HF_CALLS"
+  bad "main(): expected zero scratch/transcript/hf-cache/gocache reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS"
 fi
 # ga-sfj3i.2: the exact case this acceptance criterion exists for — a cycle
 # that never breaches ANY floor is precisely where the pre-fix guard logged
