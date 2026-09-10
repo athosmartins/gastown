@@ -196,6 +196,24 @@
 #      that would false-positive on every ordinary nightly-job delivery
 #      instead of catching a real gap; left to the human follow-up named in
 #      JOB_NOT_INSTALLED's own ACTION text.
+#  13. (ga-pntex) Step 3's import-level/routes-hop matching (daemon_imports_
+#      stem(), below) checks each daemon against each changed-file "stem" —
+#      for N daemons x M changed .py files, up to N*M checks. Pre-fix, each
+#      check re-invoked a fresh python3 ast.parse of the SAME entrypoint file
+#      regardless of which stem it was being checked against — measured
+#      live: a 33min citywide quality-gate stall (the serial dispatcher calls
+#      this synchronously in its critical path), ~1-2 daemons/min processed,
+#      ~1% CPU throughout (the cost was process-SPAWN overhead, not
+#      computation). Fixed two ways: (a) each file's import-stem set is now
+#      computed ONCE and cached (daemon_all_import_stems()), so a subsequent
+#      check against the SAME file for a DIFFERENT stem is an in-memory
+#      lookup, zero extra python3 spawns; (b) a changed tests/**/docs/** file
+#      never contributes its own basename as a candidate stem in the first
+#      place (CHANGED_STEMS, precomputed above) — same universal claim point
+#      9/ga-dk7fw already established for the whole-changeset short-circuit,
+#      applied per-file. (b) is not just a perf nit: pre-fix, a changed test
+#      file whose basename happened to collide with a real module name some
+#      daemon genuinely imports produced a false-positive AFFECTED.
 #
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
@@ -869,7 +887,38 @@ fi
 
 # precompute changed basenames + stems for matching
 CHANGED_BASENAMES="$(echo "$CHANGED_PY" | while read -r f; do [ -n "$f" ] && basename "$f"; done)"
-CHANGED_STEMS="$(echo "$CHANGED_BASENAMES" | sed 's/\.py$//' | grep -v '^$' || true)"
+# (ga-pntex) CHANGED_STEMS feeds the import-level/routes-hop checks in Step 3
+# below — a tests/**/docs/** file must never contribute its own basename as a
+# candidate "stem" there, same universal claim DEFAULT_NO_RESTART_PATTERNS
+# already established above for the whole-changeset short-circuit (point
+# 9/ga-dk7fw: "no daemon on any rig imports a test or doc file"), applied
+# per-file instead of all-or-nothing. A real lib/*.py file changed in the
+# SAME deploy is unaffected by this (its own basename still flows through
+# normally) — only individual tests/**/docs/** entries are dropped from the
+# candidate pool. Does NOT touch CHANGED_BASENAMES just above (used only for
+# the direct entrypoint-basename match in Step 3) — a daemon's own entrypoint
+# is never itself a tests/**/docs/** file. Pre-fix, a changed test file whose
+# basename happened to COLLIDE with a real module name some daemon genuinely
+# imports (e.g. tests/shared_helper.py vs. a daemon's own `from lib import
+# shared_helper`) produced a false-positive AFFECTED — flagging (and for a
+# SENSITIVE daemon, HOLDING THE GATE on) a daemon nothing about this deploy
+# actually touched.
+CHANGED_PY_FOR_STEMS=""
+set -f
+while IFS= read -r pyf; do
+  [ -n "$pyf" ] || continue
+  py_covered=0
+  for pat in $DEFAULT_NO_RESTART_PATTERNS; do
+    # shellcheck disable=SC2254  # deliberate glob match, not literal
+    case "$pyf" in $pat) py_covered=1; break ;; esac
+  done
+  if [ "$py_covered" -eq 0 ]; then
+    CHANGED_PY_FOR_STEMS="$CHANGED_PY_FOR_STEMS
+$pyf"
+  fi
+done <<< "$CHANGED_PY"
+set +f
+CHANGED_STEMS="$(echo "$CHANGED_PY_FOR_STEMS" | while read -r f; do [ -n "$f" ] && basename "$f"; done | sed 's/\.py$//' | grep -v '^$' || true)"
 CHANGED_TEMPLATE_BASENAMES="$(echo "$CHANGED_TEMPLATES" | while read -r f; do [ -n "$f" ] && basename "$f"; done)"
 
 # is_sensitive <label>
@@ -999,29 +1048,62 @@ PY
 # single-line one. On a genuine parse failure, exits 1 (not affected) — same
 # fail-soft shape as daemon_template_names() above; every entrypoint here is
 # a live, running production daemon, so in practice it always parses.
-daemon_imports_stem() {  # daemon_imports_stem <file> <stem>
-  local f="$1" stem="$2"
-  [ -f "$f" ] || return 1
-  python3 - "$f" "$stem" <<'PY' 2>/dev/null
+#
+# ga-pntex: Step 3 below (and daemon_imports_stem_via_routes() further down,
+# which also calls this) checks this per (daemon, changed-stem) pair — for N
+# daemons x M changed .py files that is up to N*M calls. Pre-fix this
+# re-invoked a fresh python3 ast.parse of the SAME <file> on every one of
+# those calls, even though <file>'s import set does not change across the M
+# different stems it gets checked against — measured live: a 33min citywide
+# gate stall, ~1-2 daemons/min processed, ~1% CPU throughout (the cost was
+# process-SPAWN overhead, not computation). Now backed by a cache (below):
+# the AST is parsed ONCE per unique file, and every subsequent stem check
+# against that SAME file is an in-memory `grep -qxF` — zero additional
+# python3 spawns. Mirrors daemon_template_names() above (extract once,
+# membership-check in bash) instead of a fresh subprocess per candidate. The
+# function's own signature/contract (call with <file> <stem>, get exit 0/1)
+# is unchanged, so every call site benefits without modification.
+IMPORTS_CACHE_DIR="$DISCO_DIR/.imports-cache"
+mkdir -p "$IMPORTS_CACHE_DIR"
+
+# extract EVERY stem <file> imports (one python3 ast.parse, all matches) —
+# same single-hop precision as daemon_imports_stem() below, computed once per
+# file instead of once per (file, candidate-stem) pair.
+daemon_all_import_stems() {  # daemon_all_import_stems <file> -> one stem/line
+  local f="$1"
+  [ -f "$f" ] || return 0
+  python3 - "$f" <<'PY' 2>/dev/null
 import ast, sys
-path, stem = sys.argv[1], sys.argv[2]
+path = sys.argv[1]
 try:
     tree = ast.parse(open(path, encoding="utf-8", errors="replace").read())
 except Exception:
-    sys.exit(1)
+    sys.exit(0)
+stems = set()
 for node in ast.walk(tree):
     if isinstance(node, ast.Import):
         for alias in node.names:
-            if stem in alias.name.split('.'):
-                sys.exit(0)
+            stems.update(alias.name.split('.'))
     elif isinstance(node, ast.ImportFrom):
-        if node.module and stem in node.module.split('.'):
-            sys.exit(0)
+        if node.module:
+            stems.update(node.module.split('.'))
         for alias in node.names:
-            if alias.name == stem:
-                sys.exit(0)
-sys.exit(1)
+            stems.add(alias.name)
+for s in sorted(stems):
+    print(s)
 PY
+}
+
+daemon_imports_stem() {  # daemon_imports_stem <file> <stem>
+  local f="$1" stem="$2" key cache_file
+  [ -f "$f" ] || return 1
+  key="$(echo "$f" | tr '/' '#')"
+  cache_file="$IMPORTS_CACHE_DIR/$key"
+  if [ ! -f "$cache_file" ]; then
+    daemon_all_import_stems "$f" > "$cache_file.tmp" 2>/dev/null
+    mv "$cache_file.tmp" "$cache_file"
+  fi
+  grep -qxF "$stem" "$cache_file"
 }
 
 # does <entrypoint-relpath> reach <stem> through a daemons/routes/*.py
