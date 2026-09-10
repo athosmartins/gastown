@@ -178,6 +178,28 @@
 # — see _golw_resolve_tracked_state, the single choke point both branches of
 # run_sweep funnel through.
 #
+# PARKED-AFTER-TRACKED IS A THIRD CASE, NOT "PRESENT" (ga-8qb3u): the
+# RESOLVED-PRUNING fix above correctly treats "still carries the label" as
+# NOT resolved — but a bead that was tracked while genuinely orphan-suspect
+# and LATER gains an intentional park signal (blocked:*, gate:needs-human*,
+# pilot:no-auto-dispatch, design-first) also fell into that "present" bucket
+# forever, because _bead_recheck_status never checked for park at all.
+# Measured live: wa-kty2h (frozen by Athos, blocked:congelado-pelo-athos-0209)
+# logged "UNVERIFIED ... kept in state" on every ~15min sweep for 3.5+ days
+# (347 lines) with zero prospect of ever resolving naturally — unlike
+# ga-eiaidn's active-live case, a human park has no self-clearing mechanism to
+# wait out. Unlike the ga-tqe4j/ga-eiaidn concern (never trust a volatile,
+# separately-fetched signal as grounds for "resolved"), is_park is read off
+# the SAME already-fetched labels/status this function already uses for the
+# label check itself — no separate query, no time-of-check/time-of-use gap —
+# so pruning on it carries none of that risk. Fix: _bead_recheck_status
+# gained a third verdict ("parked", sharing the exact _GOLW_IS_PARK_JQ
+# predicate run_sweep's own candidate loop uses, to avoid adding this file's
+# 6th instance of park-vocabulary drift); _golw_resolve_tracked_state prunes
+# it into its own parked_ids bucket, logged PARKED — never RESOLVED, since
+# the label itself never cleared, and never surfaced in the mail's RESOLVED
+# section (silent bookkeeping, exactly like any other park exclusion).
+#
 # KILL-SWITCH: GOLW_ENABLED=0 → no-op.
 # DRY-RUN: GOLW_DRY_RUN=1 → log findings, skip comment/notify/mail/state-write.
 #
@@ -278,6 +300,28 @@ ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || true; echo "[$(ts)] [golw] $*" >> "$LOG" 2>/dev/null || true; }
 
 _store_name() { basename "$1"; }
+
+# _GOLW_IS_PARK_JQ — single source of truth for "is this bead an intentional
+# park, not an orphan-suspect" (gate:needs-human*/blocked-by:*/blocked:*/
+# status=blocked/design-first/pilot:no-auto-dispatch or bare no-auto-dispatch).
+# A jq boolean expression operating on `$b` (one bead object) and `$L` (its
+# `.labels // []`, pre-bound by the caller) — bash-interpolated (single quotes
+# only, no `$`/backtick expansion inside) into every jq program that needs the
+# park verdict: (1) the main sweep's per-candidate classification in
+# run_sweep (ids_labels, below) and (2) _bead_recheck_status's "parked"
+# verdict (ga-8qb3u). One string, edited once, used everywhere — this file
+# has already paid for the alternative (two hand-maintained copies drifting
+# apart) 5 times: blocked-by:*-only missed blocked:* (ga-te41ft), then missed
+# design-first/pilot:no-auto-dispatch (ga-52zhb), etc. — see the header
+# comment's numbered history.
+_GOLW_IS_PARK_JQ='(
+    ($L | any(startswith("gate:needs-human")))
+    or ($L | any(startswith("blocked-by:")))
+    or ($L | any(startswith("blocked:")))
+    or (($b.status // "") == "blocked")
+    or ($L | any(. == "pilot:no-auto-dispatch" or . == "no-auto-dispatch"))
+    or ( ((($b.title) // "") + " " + (($b.description) // "")) | ascii_downcase | test("design[ -]?first") )
+  )'
 
 # _gate_artifact_probe <bead_id>
 # Prints "<active:0|1|error>\t<last_artifact_gate_status_or_none|unknown>\t<open_artifact_count>"
@@ -426,12 +470,22 @@ _golw_session_alive() {
 #             treated as resolved.
 #   closed  — bead exists, status=closed: no longer "stuck in gate limbo" by
 #             definition, treated as resolved regardless of label residue.
+#   parked  — bead exists, open, STILL carries a non-excluded gate:* label,
+#             but now also matches _GOLW_IS_PARK_JQ (ga-8qb3u). Safe to prune
+#             from state even though the label itself is still there: unlike
+#             the ga-eiaidn active-live check (a SEPARATE, volatile `gc
+#             session list` query), is_park is read off the SAME
+#             already-fetched labels/status this function already reads, at
+#             the same instant — no time-of-check/time-of-use gap. Never
+#             logged/counted as RESOLVED — see the caller's distinct
+#             "PARKED:" log line and parked_ids bucket.
 #   absent  — bead exists, open, carries NO non-excluded gate:* label: the
 #             label genuinely cleared — the exact case the bug asks to
 #             confirm before declaring RESOLVED.
-#   present — bead exists, open, STILL carries a non-excluded gate:* label:
-#             it dropped out of this sweep for some OTHER reason (transient
-#             probe failure, reclassified as park, etc.) — NOT resolved.
+#   present — bead exists, open, STILL carries a non-excluded gate:* label
+#             and is NOT parked: it dropped out of this sweep for some OTHER
+#             reason (transient probe failure, a live-assignee reclassify per
+#             ga-eiaidn, etc.) — NOT resolved.
 _bead_recheck_status() {
   local _id="$1" _store="$2" _excl="$3" _out _rc
   _out=$("$BD_BIN" -C "$_store" list --id "$_id" --all --json 2>/dev/null \
@@ -443,8 +497,10 @@ _bead_recheck_status() {
   fi
   printf '%s' "$_out" | jq -r --arg id "$_id" --argjson excl "$_excl" '
       ([ .[] | select(.id == $id) ] | .[0]) as $b
+      | ($b.labels // []) as $L
       | if $b == null then "gone"
         elif ($b.status // "") == "closed" then "closed"
+        elif '"$_GOLW_IS_PARK_JQ"' then "parked"
         else ( (($b.labels // []) | map(select(startswith("gate:")))) as $gl
                | if ($gl | length) == 0 then "absent"
                  elif ($gl | all(. as $x | $excl | any(. as $p | $x | startswith($p)))) then "absent"
@@ -469,19 +525,30 @@ _state_load() {
 # NOT in <flagged_ids_json> (i.e. a resolution candidate — including the
 # degenerate case where <flagged_ids_json> is "[]" because the whole sweep
 # came back empty), individually re-verifies it via _bead_recheck_status
-# before deciding. Only a positively-confirmed clear (absent/closed/gone)
-# gets pruned; anything else (query error, unknown store, or the label is
-# genuinely still there) stays in state untouched, first_seen intact, and is
-# logged UNVERIFIED rather than RESOLVED — see the RESOLVED-PRUNING header
-# comment for why this must never collapse into one verdict.
+# before deciding. A positively-confirmed clear (absent/closed/gone) gets
+# pruned and logged RESOLVED; a positively-confirmed park (ga-8qb3u — read
+# off the SAME durable labels/status _bead_recheck_status already uses, not a
+# separate volatile signal) ALSO gets pruned, but logged PARKED and returned
+# in a SEPARATE parked_ids bucket — never counted as resolved_ids/RESOLVED,
+# since the gate:* label itself never actually cleared. Anything else (query
+# error, unknown store, or the label is genuinely still present with no park
+# signal) stays in state untouched, first_seen intact, and is logged
+# UNVERIFIED rather than RESOLVED — see the RESOLVED-PRUNING header comment
+# for why "genuinely cleared" and "just didn't get re-observed" must never
+# collapse into one verdict; a parked bead is a THIRD, distinct case from
+# both (positively confirmed, just not label-cleared), hence its own bucket.
 # Prints ONE json object on stdout: {"state": <pruned-state>, "resolved_ids":
-# [<ids individually confirmed resolved this call>]}. Every keep/prune
-# decision is also written to $LOG via `log`.
+# [<ids individually confirmed label-cleared/closed/gone this call>],
+# "parked_ids": [<ids individually confirmed newly-parked this call — kept
+# out of run_sweep's mail/resolved_count reporting by design, same as any
+# other park (ga-cjk1j/ga-te41ft/ga-52zhb) — the per-bead PARKED log line is
+# the durable audit trail>]}. Every keep/prune decision is also written to
+# $LOG via `log`.
 _golw_resolve_tracked_state() {
   local _state="$1" _keep="$2" _excl="$3"
   local _candidates
   _candidates="$(printf '%s' "$_state" | jq -r --argjson keep "$_keep" 'keys - $keep | .[]' 2>/dev/null)"
-  local _resolved="" _rid _rstore _rstatus _unverified_count=0
+  local _resolved="" _parked="" _rid _rstore _rstatus _unverified_count=0
   if [ -n "${_candidates:-}" ]; then
     while IFS= read -r _rid; do
       [ -z "$_rid" ] && continue
@@ -496,6 +563,10 @@ _golw_resolve_tracked_state() {
         absent|closed|gone)
           log "RESOLVED: $_rid re-checked individually (${_rstatus}) — no longer carries an orphaned gate:* label — cleared from state"
           _resolved="${_resolved}${_rid}"$'\n'
+          ;;
+        parked)
+          log "PARKED: $_rid re-checked individually — now matches an intentional park signal (gate:needs-human*/blocked-by:*/blocked:*/status=blocked/design-first/pilot:no-auto-dispatch, ga-8qb3u) — label is still present, but a human/Mayor decision stood this bead down, so it is cleared from orphan-tracking state like any other park; not logged RESOLVED since the label itself never cleared"
+          _parked="${_parked}${_rid}"$'\n'
           ;;
         present)
           log "UNVERIFIED: $_rid re-checked and STILL carries a gate:* label (dropped from this sweep for another reason) — keeping in state, NOT resolved"
@@ -514,10 +585,13 @@ _golw_resolve_tracked_state() {
   local _resolved_json
   _resolved_json="$(printf '%s' "$_resolved" | jq -R -s -c 'split("\n") | map(select(length>0))' 2>/dev/null)"
   [ -z "${_resolved_json:-}" ] && _resolved_json="[]"
+  local _parked_json
+  _parked_json="$(printf '%s' "$_parked" | jq -R -s -c 'split("\n") | map(select(length>0))' 2>/dev/null)"
+  [ -z "${_parked_json:-}" ] && _parked_json="[]"
   local _new_state
-  _new_state="$(printf '%s' "$_state" | jq -c --argjson gone "$_resolved_json" 'with_entries(select(.key as $k | ($gone | index($k)) == null))' 2>/dev/null)"
+  _new_state="$(printf '%s' "$_state" | jq -c --argjson gone "$_resolved_json" --argjson parked "$_parked_json" 'with_entries(select(.key as $k | (($gone + $parked) | index($k)) == null))' 2>/dev/null)"
   [ -z "${_new_state:-}" ] && _new_state="$_state"
-  jq -nc --argjson st "$_new_state" --argjson rid "$_resolved_json" '{state: $st, resolved_ids: $rid}' 2>/dev/null
+  jq -nc --argjson st "$_new_state" --argjson rid "$_resolved_json" --argjson pid "$_parked_json" '{state: $st, resolved_ids: $rid, parked_ids: $pid}' 2>/dev/null
 }
 
 run_sweep() {
@@ -649,13 +723,7 @@ run_sweep() {
         | [ $b.id,
             ([$L[] | select(startswith("gate:"))] | join(",")),
             ($b.updated_at // $b.created_at // ""),
-            ( if ( ($L | any(startswith("gate:needs-human")))
-                   or ($L | any(startswith("blocked-by:")))
-                   or ($L | any(startswith("blocked:")))
-                   or (($b.status // "") == "blocked")
-                   or ($L | any(. == "pilot:no-auto-dispatch" or . == "no-auto-dispatch"))
-                   or ( ((($b.title) // "") + " " + (($b.description) // "")) | ascii_downcase | test("design[ -]?first") ) )
-              then "1" else "0" end ),
+            ( if '"$_GOLW_IS_PARK_JQ"' then "1" else "0" end ),
             ($b.status // ""),
             ($b.assignee // "")
           ] | @tsv
@@ -2053,6 +2121,44 @@ GCSTUB
   [ "$rc" -eq 0 ] && ok "scenario 40: bare no-auto-dispatch bead does not enter NEW/DUE (return 0)" || bad "scenario 40: a bare no-auto-dispatch bead was treated as an orphan-suspect, got $rc"
   [ ! -s "$COMM40" ] && ok "scenario 40: no comment posted on the bare no-auto-dispatch bead" || bad "scenario 40: comment posted on a bead carrying bare no-auto-dispatch (should be excluded per bead_state.py PARK_EXACT precedent)"
   rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 41 (ga-8qb3u — REPROVES on HEAD before this fix): a bead
+  # tracked as a genuine orphan-suspect (real alert, no park signal) LATER
+  # gains an intentional park label while its gate:* label is UNCHANGED —
+  # the live incident this fix targets (wa-kty2h, frozen by Athos, cycled
+  # "UNVERIFIED ... kept in state" every ~15min for 3.5+ days / 347 sweeps).
+  # Must be logged PARKED (never RESOLVED — the label itself never cleared)
+  # and pruned from state, with no mail/comment fired for the transition
+  # itself (silent bookkeeping, matching any other park exclusion). ────────
+  echo "Scenario 41 (ga-8qb3u): bead transitions orphan-suspect -> parked across sweeps → logged PARKED, pruned from state, never RESOLVED, no re-alert loop"
+  rm -f "$STATE_FILE" 2>/dev/null
+  printf '[%s]' "$(mk_candidate cand-park-transition "$TMP/wa" "gate:needs-fix" "$OLD_TS")" > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-park-transition.json"
+  : > "$LOG"
+  GOLW_TEST_NOTIFIED="$TMP/notif41a" GOLW_TEST_MAILED="$TMP/mail41a" GOLW_TEST_COMMENTS_LOG="$TMP/comm41a" run_sweep >/dev/null
+  [ -s "$STATE_FILE" ] && ok "scenario 41: state file written after 1st sweep (real orphan-suspect, real alert)" || bad "scenario 41: state file missing after 1st sweep"
+  grep -q '"cand-park-transition"' "$STATE_FILE" 2>/dev/null && ok "scenario 41: cand-park-transition tracked after 1st sweep" || bad "scenario 41: cand-park-transition not tracked after 1st sweep"
+  grep -q "cand-park-transition" "$TMP/comm41a" 2>/dev/null && ok "scenario 41: 1st sweep posts the real orphan-suspect alert" || bad "scenario 41: 1st sweep did not alert on a genuine orphan-suspect"
+  # Sweep 2: same bead, same gate:* label — but now ALSO carries a deliberate
+  # park signal (blocked:sem-prioridade), exactly like wa-kty2h's real shape.
+  printf '[%s]' "$(mk_candidate cand-park-transition "$TMP/wa" "gate:needs-fix,blocked:sem-prioridade" "$OLD_TS")" > "$TMP/fixtures/candidates-wa.json"
+  printf '[%s]' "$(mk_candidate cand-park-transition "$TMP/wa" "gate:needs-fix,blocked:sem-prioridade" "$OLD_TS")" > "$TMP/fixtures/recheck-cand-park-transition.json"
+  : > "$LOG"
+  GOLW_TEST_NOTIFIED="$TMP/notif41b" GOLW_TEST_MAILED="$TMP/mail41b" GOLW_TEST_COMMENTS_LOG="$TMP/comm41b" run_sweep >/dev/null
+  grep -q '"cand-park-transition"' "$STATE_FILE" 2>/dev/null && bad "scenario 41 (regression — the exact bug): cand-park-transition still stuck in state after becoming parked" || ok "scenario 41: cand-park-transition pruned from state after becoming parked"
+  grep -q "PARKED: cand-park-transition" "$LOG" 2>/dev/null && ok "scenario 41: 2nd sweep logs PARKED for cand-park-transition" || bad "scenario 41: 2nd sweep did not log PARKED for cand-park-transition"
+  grep -q "RESOLVED: cand-park-transition" "$LOG" 2>/dev/null && bad "scenario 41 regression: cand-park-transition logged RESOLVED despite the label never clearing" || ok "scenario 41: cand-park-transition never logged as RESOLVED"
+  grep -q "UNVERIFIED.*cand-park-transition\|cand-park-transition.*UNVERIFIED" "$LOG" 2>/dev/null && bad "scenario 41 (the exact bug): cand-park-transition still cycling UNVERIFIED after becoming parked" || ok "scenario 41: cand-park-transition no longer cycling UNVERIFIED"
+  [ ! -s "$TMP/mail41b" ] && ok "scenario 41: no mail fired for the park-only transition sweep (silent bookkeeping)" || bad "scenario 41: mail fired merely because a bead transitioned to parked"
+  [ ! -s "$TMP/comm41b" ] && ok "scenario 41: no comment posted on the 2nd sweep" || bad "scenario 41: a comment was posted despite the bead now being parked"
+  grep -q "PARK: 1 bead" "$LOG" 2>/dev/null && ok "scenario 41: 2nd sweep also counts it under the ordinary per-sweep PARK bucket" || bad "scenario 41: 2nd sweep missing the ordinary PARK count line"
+  # 3rd sweep: nothing changes — the pruned entry must not resurrect/re-alert.
+  : > "$LOG"
+  GOLW_TEST_NOTIFIED="$TMP/notif41c" GOLW_TEST_MAILED="$TMP/mail41c" GOLW_TEST_COMMENTS_LOG="$TMP/comm41c" run_sweep >/dev/null
+  [ ! -s "$TMP/comm41c" ] && ok "scenario 41: 3rd sweep still posts no comment (parked bead stays quiet)" || bad "scenario 41: 3rd sweep posted a comment on a still-parked bead"
+  [ ! -s "$TMP/mail41c" ] && ok "scenario 41: 3rd sweep still sends no mail (parked bead stays quiet)" || bad "scenario 41: 3rd sweep sent mail on a still-parked bead"
+  rm -f "$TMP/fixtures/recheck-cand-park-transition.json" "$STATE_FILE" 2>/dev/null
 
   echo ""
   echo "gate-orphaned-label-watchdog selftest: PASS=$PASS FAIL=$FAIL"
