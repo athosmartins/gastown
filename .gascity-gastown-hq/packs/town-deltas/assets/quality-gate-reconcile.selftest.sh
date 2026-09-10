@@ -42,6 +42,16 @@ ok()  { echo "  ✓ $*"; PASS=$((PASS+1)); }
 bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 eq()  { if [ "$2" = "$3" ]; then ok "$1 (=$2)"; else bad "$1: expected [$3], got [$2]"; fi; }
 
+# ga-dkym6 (Part 7f): mirrors gate-verdict-status-unreadable.selftest.sh's own
+# extract_block() — pulls a function VERBATIM out of the real production file
+# via SELFTEST-EXTRACT markers, for functions defined below the
+# GATE_GUARD_LIB_ONLY cutoff (so the top-level `source` above never sees them).
+extract_block() {
+  local file="$1" name="$2"
+  sed -n "/# SELFTEST-EXTRACT ${name}: BEGIN/,/# SELFTEST-EXTRACT ${name}: END/p" "$file" \
+    | sed '1d;$d'
+}
+
 # ── Load the REAL pure functions from the guard (lib-only mode = no live sweep) ──
 GATE_GUARD_LIB_ONLY=1 source "$GUARD" \
   || { echo "FATAL: could not source guard in lib-only mode"; exit 1; }
@@ -1116,6 +1126,69 @@ grep -q 'reviewer_session_alive "\$a" "\$SESS_SNAP_JSON"' "$GUARD" \
 grep -q 'reviewer_session_alive "\$PC_SID" "\$PC_SESS_JSON"' "$DISPATCHER" \
   && ok "dispatcher's Phase C classify loop delegates to reviewer_session_alive" \
   || bad "dispatcher's Phase C classify loop does not delegate to reviewer_session_alive — drift risk (the original ga-dkym6 bug shape)"
+
+echo ""
+# ── 7f. reviewers_alive_for_run: REVIEWERS_ALIVE_RESULT/_MATCH reach the
+#       caller (ga-dkym6 GATE-FEEDBACK, attempt 1 FAIL) ─────────────────────
+# GATE-FEEDBACK (gate_run=ga-9fcu3): attempt 1's reviewers_alive_for_run()
+# echoed its boolean and set REVIEWERS_ALIVE_MATCH as a side-channel, relying
+# on the caller capturing it via $(...) — but $(...) always forks a subshell,
+# so a subshell's variable assignments never reach the parent. This exercises
+# the REAL extracted function (not a synthetic analog) two ways: the buggy
+# $(...) call convention (must leave the caller's globals untouched — proves
+# the bug is real, not just plausible) and the fixed direct-call convention
+# (must set both globals) — against a fixture shaped like the real ga-az6o6
+# incident (session_name-only assignee, no .session_id).
+echo "── 7f. reviewers_alive_for_run: result/match propagate to the caller (ga-dkym6 GATE-FEEDBACK) ──"
+
+FN_RAFR="$(extract_block "$GUARD" "reviewers-alive-for-run-fn")"
+FN_REVALIVE_7F="$(extract_block "$GUARD" "reviewer-session-alive-fn")"
+if [ -z "$FN_RAFR" ] || [ -z "$FN_REVALIVE_7F" ]; then
+  bad "could not extract reviewers-alive-for-run-fn or reviewer-session-alive-fn — aborting Part 7f"
+else
+  RAFR_CITY="$(mktemp -d)"
+  mkdir -p "$RAFR_CITY/scripts"
+  cat > "$RAFR_CITY/scripts/bd-list-cached.sh" <<'STUB'
+#!/usr/bin/env bash
+# Fixture: one still-open verdict bead assigned to a session_name-shaped
+# reviewer — mirrors the real ga-az6o6 incident's assignee shape (no .id/
+# .session_id match possible, only .session_name).
+echo '[{"id":"pc-vb-1","status":"open","assignee":"gate-reviewer-adhoc-f402ca436c"}]'
+STUB
+  chmod +x "$RAFR_CITY/scripts/bd-list-cached.sh"
+
+  OUT7F="$(
+    GC_CITY="$RAFR_CITY" \
+    SESS_SNAP_JSON='{"sessions":[{"id":"ga-dz506","session_name":"gate-reviewer-adhoc-f402ca436c","closed":false}]}' \
+    bash -c '
+      set -euo pipefail
+      '"$FN_REVALIVE_7F"'
+      '"$FN_RAFR"'
+      # Buggy call convention attempt 1 shipped: capture via $(...) — forks a
+      # subshell, so REVIEWERS_ALIVE_RESULT/_MATCH set inside never reach here.
+      REVIEWERS_ALIVE_RESULT="SENTINEL"
+      REVIEWERS_ALIVE_MATCH="SENTINEL"
+      _junk=$(reviewers_alive_for_run "gr-test")
+      printf "OLD|RESULT_VAR=%s|MATCH_VAR=%s\n" "$REVIEWERS_ALIVE_RESULT" "$REVIEWERS_ALIVE_MATCH"
+
+      # Fixed call convention: call directly, then read the globals.
+      reviewers_alive_for_run "gr-test"
+      printf "NEW|RESULT_VAR=%s|MATCH_VAR=%s\n" "$REVIEWERS_ALIVE_RESULT" "$REVIEWERS_ALIVE_MATCH"
+    ' 2>&1
+  )"
+  rm -rf "$RAFR_CITY"
+
+  OLD_LINE="$(printf '%s\n' "$OUT7F" | grep '^OLD|' || true)"
+  NEW_LINE="$(printf '%s\n' "$OUT7F" | grep '^NEW|' || true)"
+
+  [ "$OLD_LINE" = "OLD|RESULT_VAR=SENTINEL|MATCH_VAR=SENTINEL" ] \
+    && ok "mutation-lock: \$(...) capture (the ORIGINAL bug) leaves REVIEWERS_ALIVE_RESULT/_MATCH untouched in the caller — proves the bug shape is real" \
+    || bad "mutation-lock did not reproduce the original \$(...) subshell bug — suite may be vacuous: got [$OLD_LINE] from: $OUT7F"
+
+  [ "$NEW_LINE" = "NEW|RESULT_VAR=1|MATCH_VAR=gate-reviewer-adhoc-f402ca436c" ] \
+    && ok "fix: direct call sets REVIEWERS_ALIVE_RESULT=1 and REVIEWERS_ALIVE_MATCH to the sustaining session in the caller's scope" \
+    || bad "fix did not propagate REVIEWERS_ALIVE_RESULT/_MATCH to the caller: got [$NEW_LINE] from: $OUT7F"
+fi
 
 echo ""
 # ── 8. ga-jhyu: terminal gate beads are CLOSED (not just relabeled), and

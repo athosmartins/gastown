@@ -2584,19 +2584,30 @@ fi
 log "Step 0b: Vector B reconcile — orphan gate-run beads, running+claimed (TTL=${GATE_RUN_TTL_MINUTES}m, zombie-age=${GATE_ZOMBIE_AGE_MINUTES}m=verdict-timeout+margin)..."
 
 # reviewers_alive_for_run <gate_run_id> — I/O helper (ga-o57gn).
-# Echo 1 iff at least one of this gate-run's still-OPEN verdict beads is assigned
-# to a reviewer session that is present (alive) in SESS_SNAP_JSON, else 0. A
-# gate-run still running past verdict-timeout with zero live reviewers is a
-# zombie whose dispatcher died. (Live section only — uses bd/gc; never called in
-# lib-only mode, so it is intentionally NOT one of the drift-guarded pure fns.)
+# Sets REVIEWERS_ALIVE_RESULT (1 iff at least one of this gate-run's still-OPEN
+# verdict beads is assigned to a reviewer session that is present (alive) in
+# SESS_SNAP_JSON, else 0) and REVIEWERS_ALIVE_MATCH (which session sustained a
+# 1, or "" for a 0). A gate-run still running past verdict-timeout with zero
+# live reviewers is a zombie whose dispatcher died. (Live section only — uses
+# bd/gc; never called in lib-only mode, so it is intentionally NOT one of the
+# drift-guarded pure fns.)
+#
+# ga-dkym6 GATE-FEEDBACK (attempt 1): this used to `echo 0`/`echo 1` with the
+# caller capturing via $(...), plus a REVIEWERS_ALIVE_MATCH side-channel set
+# right before each echo/return. $(...) always forks a subshell, and a
+# subshell's variable assignments never reach the parent once it exits — so
+# the side-channel was dead code (confirmed empirically: a minimal repro of
+# this exact pattern reproduces the swallow every time). Fix: no more echo,
+# no more $(...). The caller MUST call this function directly (never via
+# $(...)) and read both REVIEWERS_ALIVE_RESULT and REVIEWERS_ALIVE_MATCH
+# afterward — see the 7f selftest for a live mutation-lock proving the old
+# $(...) call convention really does swallow both globals.
+# SELFTEST-EXTRACT reviewers-alive-for-run-fn: BEGIN
 reviewers_alive_for_run() {
   local gr_id="$1" vbs assignees a
-  # ga-dkym6 #3: side-channel for the caller to log WHICH session sustained
-  # an alive=1 verdict. This function's own return value is stdout-captured
-  # via $(...), so it cannot log directly without corrupting that value —
-  # reset on every call so a stale match never leaks into a later 0 result.
+  REVIEWERS_ALIVE_RESULT=0
   REVIEWERS_ALIVE_MATCH=""
-  [ -z "$gr_id" ] && { echo 0; return; }
+  [ -z "$gr_id" ] && return
   # ga-48xcv: routed through the read-cache shim — verdict_bead_count_for_run
   # below issues this identical query for the same gr_id earlier in the same
   # loop iteration; the shim collapses the pair into one live Dolt round-trip.
@@ -2606,7 +2617,7 @@ reviewers_alive_for_run() {
   assignees=$(printf '%s\n' "$vbs" \
     | jq -r '.[]? | select((.status // "") != "closed") | .assignee // empty' \
     2>/dev/null || true)
-  [ -z "$assignees" ] && { echo 0; return; }
+  [ -z "$assignees" ] && return
   for a in $assignees; do
     [ -z "$a" ] && continue
     # ga-dkym6: delegates to the shared reviewer_session_alive() predicate
@@ -2614,13 +2625,13 @@ reviewers_alive_for_run() {
     # inline match — see that function's docstring for why the two used to
     # disagree with quality-gate-dispatcher.sh's Phase C classifier.
     if [ "$(reviewer_session_alive "$a" "$SESS_SNAP_JSON")" = "1" ]; then
+      REVIEWERS_ALIVE_RESULT=1
       REVIEWERS_ALIVE_MATCH="$a"
-      echo 1
       return
     fi
   done
-  echo 0
 }
+# SELFTEST-EXTRACT reviewers-alive-for-run-fn: END
 
 # close_dead_reviewer_verdicts <gate_run_id> — I/O helper (ga-g4m18).
 # Cascades Vector B's dead-reviewer supersede onto sibling verdict beads.
@@ -2911,7 +2922,11 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
     # handled and `continue`d past the 0-verdict-bead case.)
     REVIEWERS_ALIVE=1
     if [ "$MARKER_ACTIVE" = "1" ] && [ "$GR_AGE" -gt "$GATE_ZOMBIE_AGE_MINUTES" ]; then
-      REVIEWERS_ALIVE=$(reviewers_alive_for_run "$GR_ID")
+      # ga-dkym6 GATE-FEEDBACK (attempt 1): called directly, NEVER via $(...)
+      # — see reviewers_alive_for_run's own docstring for why a command
+      # substitution here would silently swallow both result globals.
+      reviewers_alive_for_run "$GR_ID"
+      REVIEWERS_ALIVE="$REVIEWERS_ALIVE_RESULT"
       # ga-dkym6 #3: a 53-minute guard/dispatcher standoff on this exact run
       # class left no record of WHICH session the guard was reading as alive
       # — only the boolean. Log it whenever it's the reason this sweep skips.
