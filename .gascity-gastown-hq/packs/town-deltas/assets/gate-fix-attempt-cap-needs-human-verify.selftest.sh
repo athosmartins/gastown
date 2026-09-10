@@ -84,6 +84,15 @@ bd() {
           FAKE_LABEL_ADD_FAIL_COUNT=$((FAKE_LABEL_ADD_FAIL_COUNT - 1))
         else
           echo "$6" >> "$FAKE_LABELS_FILE"
+          # ga-wtux1: the REAL bd binary prints this to STDOUT even with -q —
+          # mirror that here so a regression (the dispatcher forgetting to
+          # redirect this call's stdout) actually corrupts the $(...)-captured
+          # status word in THIS harness, exactly like it corrupted _NH_STATUS
+          # in production (ga-ld0ch: the mail body showed "Added label
+          # 'gate:needs-human' to ga-ld0ch ... armed" — the label WAS applied,
+          # but the exact-match `eq` checks below would have failed on the
+          # multi-line value if this stub had stayed silent).
+          echo "Added label '$6' to $5"
         fi
       fi
       return 0

@@ -3876,14 +3876,24 @@ gate_apply_needs_human() {
     # command is the same hazard one level simpler).
     write_rc=0
     stderr_file="${LOG_DIR:-/tmp}/.gate-needs-human-write-stderr.$$"
-    bd -C "$city" label add "$bead_id" "gate:needs-human" -q 2>"$stderr_file" || write_rc=$?
+    # ga-wtux1: redirect STDOUT too (`>/dev/null`), not just stderr — the live
+    # `bd` binary prints "Added label '<label>' to <id>" on stdout even with
+    # `-q`. Every one of this function's 9 call sites consumes it as
+    # `_NH_STATUS=$(gate_apply_needs_human ...)`, so that stray stdout line
+    # was joining the final "armed"/"failed"/"unverified" echo inside the same
+    # capture, breaking the exact-match checks call sites do and making a
+    # label that WAS applied get reported as "COULD NOT ARM" (ga-ld0ch). Plain
+    # redirect, not `$(...)` — see the comment above for why `$(...)` here
+    # breaks this selftest's stub.
+    bd -C "$city" label add "$bead_id" "gate:needs-human" -q >/dev/null 2>"$stderr_file" || write_rc=$?
     if [ "$write_rc" -ne 0 ]; then
       write_err=$(cat "$stderr_file" 2>/dev/null)
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] WARN: gate_apply_needs_human($bead_id) try $try: label add FAILED rc=$write_rc stderr=${write_err:-(empty)}" >&2
       write_diag="${write_diag}try $try: rc=$write_rc stderr=${write_err:-(empty)}"$'\n'
     fi
     rm -f "$stderr_file" 2>/dev/null || true
-    [ -n "$sub" ] && { bd -C "$city" label add "$bead_id" "$sub" -q 2>/dev/null || true; }
+    # ga-wtux1: same stdout leak, same fix — see comment above.
+    [ -n "$sub" ] && { bd -C "$city" label add "$bead_id" "$sub" -q >/dev/null 2>/dev/null || true; }
     sleep "$GATE_NEEDS_HUMAN_VERIFY_BACKOFF_SECS" 2>/dev/null || true
     # ga-h48cm gate-feedback: reset every iteration, not just once before the
     # loop — otherwise a try-1 confirmed-absent survives a try-2 READ ERROR
