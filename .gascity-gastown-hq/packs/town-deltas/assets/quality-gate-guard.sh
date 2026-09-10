@@ -3837,10 +3837,23 @@ else
 
     # Some maintainer verdicts never become a formal review at all — they
     # land as a plain PR-conversation comment (ga-6ea90: #5470/ga-7uoua,
-    # #5384/ga-r8haw both have reviews==[] entirely). Only consulted when the
-    # two sources above produced no CHANGES_REQUESTED, so a real review
-    # always takes precedence over a comment.
-    if [ "$EXT_REVIEW" != "CHANGES_REQUESTED" ]; then
+    # #5384/ga-r8haw both have reviews==[] entirely). GATE-FIX (reviewer-
+    # caught, gate_run=ga-nwnbr): this used to be `!= CHANGES_REQUESTED`,
+    # which only protects the trivial case (overriding CHANGES_REQUESTED
+    # with CHANGES_REQUESTED). An APPROVED verdict — from GitHub's own
+    # reviewDecision OR the derive_review_decision_from_reviews fallback
+    # above — was NOT protected, so any comment anywhere in the thread
+    # matching derive_comment_verdict_signal's loose "changes requested"
+    # phrase (e.g. ordinary past-tense language like "the changes requested
+    # are all addressed") could flip an already-APPROVED PR back to
+    # CHANGES_REQUESTED. Comments are a fallback for NO review signal AT ALL
+    # (empty), not merely "not yet CHANGES_REQUESTED" — matching the two real
+    # motivating cases (#5470/#5384), both of which have reviews==[]
+    # entirely. Gating on emptiness means a real review (APPROVED or
+    # CHANGES_REQUESTED, from either source) always takes precedence over a
+    # comment, as the old comment here already claimed but the code didn't
+    # enforce.
+    if [ -z "$EXT_REVIEW" ]; then
       EXT_COMMENTS_JSON=$(echo "$EXT_PR_JSON" | jq -c '.comments // []' 2>/dev/null || echo "[]")
       EXT_COMMENT_VERDICT=$(derive_comment_verdict_signal "$EXT_COMMENTS_JSON")
       if [ -n "$EXT_COMMENT_VERDICT" ]; then

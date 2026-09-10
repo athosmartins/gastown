@@ -358,13 +358,18 @@ case "$r" in *"round 2"*) ok "two verdict comments → most recent (round 2) win
 # derive_* functions individually.
 echo "ga-6ea90 end-to-end: reviewDecision-empty fallback chain → classify_external_pr_gap3"
 compose_ext_review() {
-  # Mirrors the Step 0c.3 loop's own fallback order exactly.
+  # Mirrors the Step 0c.3 loop's own fallback order exactly. GATE-FIX
+  # (reviewer-caught, gate_run=ga-nwnbr): was `!= CHANGES_REQUESTED`, which
+  # only protects the trivial case — an APPROVED review (direct or derived)
+  # was not protected from being overridden by a matching comment. Comments
+  # are a fallback for NO review signal at all (empty), not "not yet
+  # CHANGES_REQUESTED".
   local gh_review_decision="$1" reviews_json="$2" comments_json="$3"
   local review="$gh_review_decision"
   if [ -z "$review" ]; then
     review=$(derive_review_decision_from_reviews "$reviews_json")
   fi
-  if [ "$review" != "CHANGES_REQUESTED" ]; then
+  if [ -z "$review" ]; then
     local comment_verdict
     comment_verdict=$(derive_comment_verdict_signal "$comments_json")
     [ -n "$comment_verdict" ] && review="CHANGES_REQUESTED"
@@ -391,6 +396,21 @@ review=$(compose_ext_review '' '[
 ]' '[{"author":{"login":"athosmartins"},"createdAt":"2026-09-06T03:24:19Z","body":"Addressed both points from the review"}]')
 r=$(classify_external_pr_gap3 OPEN "$review" 0)
 [ "$r" = "wait:pending" ] && ok "ga-6ea90 NEGATIVE ACCEPTANCE: PR #5989 end-to-end → wait:pending (genuine wait, must NOT be false-flagged)" || bad "PR#5989 end-to-end got '$r' (review derived='$review')"
+# GATE-FIX regression (reviewer-caught, gate_run=ga-nwnbr): unlike #5989 above,
+# this fixture's comment is deliberately phrased to MATCH
+# derive_comment_verdict_signal's loose "changes requested" alternative
+# ("thanks, the changes requested are all addressed" contains the literal
+# substring), while the review itself is a plain single APPROVED (no prior
+# CHANGES_REQUESTED round at all — the simplest possible approved case). Under
+# the pre-fix `!= CHANGES_REQUESTED` guard this comment overrode the approval
+# and flipped the verdict back to CHANGES_REQUESTED; #5989's fixture never
+# caught this because its own comment happens not to contain the trigger
+# substring. This fixture is the one the gate reviewer said was missing.
+review=$(compose_ext_review '' '[
+  {"author":{"login":"bee-ghosttrack"},"state":"APPROVED","submittedAt":"2026-09-07T03:45:51Z"}
+]' '[{"author":{"login":"athosmartins"},"createdAt":"2026-09-06T03:24:19Z","body":"thanks, the changes requested are all addressed"}]')
+r=$(classify_external_pr_gap3 OPEN "$review" 0)
+[ "$r" = "wait:pending" ] && ok "ga-6ea90 GATE-FIX regression: APPROVED review + comment phrased to MATCH the loose regex → still wait:pending (a real review takes precedence over a comment, enforced not just claimed in a code comment)" || bad "APPROVED+matching-comment got '$r' (review derived='$review')"
 
 # ── reconcile_dead_reviewer_verdict_action <age> <grace> <reviewer_alive> <parent_terminal> ─
 # ga-u07fn: verdict-scoped sibling of reconcile_gaterun_action — releases ONE
