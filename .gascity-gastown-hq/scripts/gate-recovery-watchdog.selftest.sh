@@ -1048,6 +1048,18 @@ else:
                 "(rc=%s stderr=%r) — is bash/jq available?"
                 % (_extract_54n6v.returncode, _extract_54n6v.stderr[:300]))
 
+if _patterns_54n6v is not None and len(_patterns_54n6v) == 0:
+    # Distinct from the extraction-FAILED case above (_patterns_54n6v is None,
+    # already bad()'d at the point of failure): this is a SUCCESSFUL parse that
+    # came back empty. Silently skipping the checks below (the old bare
+    # `if _patterns_54n6v:` truthiness check treated [] the same as None) would
+    # be exactly the "don't know" collapsing into a quiet non-verdict this
+    # self-audit exists to catch — not a real "no vetoes exist" fact.
+    bad("ga-54n6v: _TEXT_VETO_PATTERNS parsed successfully but is an EMPTY list — "
+        "either pilot-dispatcher.sh really lost all 5 patterns (real regression) "
+        "or the extraction anchors captured the wrong slice (harness bug); either "
+        "way this must not pass silently")
+
 if _patterns_54n6v:
     ok("extracted %d live _TEXT_VETO_PATTERNS from pilot-dispatcher.sh (%s)"
        % (len(_patterns_54n6v), ", ".join(p["slug"] for p in _patterns_54n6v)))
