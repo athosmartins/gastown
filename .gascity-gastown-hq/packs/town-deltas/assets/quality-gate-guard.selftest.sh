@@ -412,6 +412,120 @@ review=$(compose_ext_review '' '[
 r=$(classify_external_pr_gap3 OPEN "$review" 0)
 [ "$r" = "wait:pending" ] && ok "ga-6ea90 GATE-FIX regression: APPROVED review + comment phrased to MATCH the loose regex → still wait:pending (a real review takes precedence over a comment, enforced not just claimed in a code comment)" || bad "APPROVED+matching-comment got '$r' (review derived='$review')"
 
+# ── derive_comment_verdict_date / gap3_latest_authored_date / gap3_comment_verdict_superseded — ga-d4avf ──
+# ga-6ea90's comment-fallback path above (tested exhaustively) had NO notion
+# of push recency: once a comment matched the verdict regex, GAP-3 flagged
+# gate:needs-fix forever, even after a real fix landed, because a comment
+# carries no commit to SHA-anchor against (unlike a formal review's
+# .commit.oid, which ga-rmtzrg's changes_addressed already handles above).
+# Real incident: PR #5384 (ga-r8haw) — steveyegge's 2026-08-08 "MERGE AFTER
+# FIXES" comment kept re-flagging gate:needs-fix for hours after commit
+# 39fd21caed (a real fix) landed 2026-09-10T11:40:12Z.
+# The two `gap3_comment_verdict_superseded` fixtures below are the SAME PR at
+# two real, verified moments (timestamps from a live `gh pr view 5384 --repo
+# gastownhall/beads`, not invented) and are the crux of the fix: a naive
+# committedDate comparison gets the FIRST one wrong — that commit
+# (9f39bdb5df) shows committedDate 2026-09-07 purely from a rebase onto
+# updated main with ZERO code change, a full month after the comment — while
+# authoredDate (2026-08-07, genuinely before the comment) gets it right.
+echo "derive_comment_verdict_date: raw timestamp extraction (same selection as derive_comment_verdict_signal)"
+r=$(derive_comment_verdict_date ''); [ "$r" = "" ] && ok "empty input → '' (fail-safe)" || bad "empty input got '$r'"
+r=$(derive_comment_verdict_date '[]'); [ "$r" = "" ] && ok "no comments → ''" || bad "empty array got '$r'"
+r=$(derive_comment_verdict_date 'not json'); [ "$r" = "" ] && ok "unparseable input → '' (fail-safe)" || bad "garbage got '$r'"
+r=$(derive_comment_verdict_date '[{"author":{"login":"bee-ghosttrack"},"createdAt":"2026-08-09T15:10:31Z","body":"CI triage, no verdict phrase here."}]')
+[ "$r" = "" ] && ok "ordinary comment, no verdict phrase → ''" || bad "no-verdict-phrase got '$r'"
+r=$(derive_comment_verdict_date '[{"author":{"login":"steveyegge"},"createdAt":"2026-08-08T23:09:16Z","body":"## Review verdict: MERGE AFTER FIXES (small ones)"}]')
+[ "$r" = "2026-08-08T23:09:16Z" ] && ok "PR #5384 real shape: verdict comment date extracted correctly" || bad "PR#5384 date extraction got '$r'"
+r=$(derive_comment_verdict_date '[
+  {"author":{"login":"steveyegge"},"createdAt":"2026-08-09T08:42:18Z","body":"VERDICT: REQUEST-CHANGES (round 1)"},
+  {"author":{"login":"steveyegge"},"createdAt":"2026-08-09T15:10:31Z","body":"VERDICT: REQUEST-CHANGES (round 2, still blocking)"}
+]')
+[ "$r" = "2026-08-09T15:10:31Z" ] && ok "multiple verdict comments → date of most-recent (round 2), same tie-break as derive_comment_verdict_signal" || bad "multi-comment date got '$r'"
+
+echo "gap3_latest_authored_date: max authoredDate across a PR's commits"
+r=$(gap3_latest_authored_date ''); [ "$r" = "" ] && ok "empty input → '' (fail-safe)" || bad "empty input got '$r'"
+r=$(gap3_latest_authored_date '[]'); [ "$r" = "" ] && ok "no commits → ''" || bad "empty array got '$r'"
+r=$(gap3_latest_authored_date 'not json'); [ "$r" = "" ] && ok "unparseable input → '' (fail-safe)" || bad "garbage got '$r'"
+# Real shape: PR #5384 BEFORE the fix — one commit, rebased (committedDate
+# moved, authoredDate didn't).
+r=$(gap3_latest_authored_date '[{"oid":"9f39bdb5df","authoredDate":"2026-08-07T00:25:54Z","committedDate":"2026-09-07T19:05:55Z"}]')
+[ "$r" = "2026-08-07T00:25:54Z" ] && ok "single commit → its authoredDate (committedDate ignored)" || bad "single-commit got '$r'"
+# Real shape: PR #5384 AFTER the fix — two commits; out-of-order in the
+# array on purpose to prove this takes the MAX, not just the last element.
+r=$(gap3_latest_authored_date '[
+  {"oid":"39fd21caed","authoredDate":"2026-09-10T11:40:12Z","committedDate":"2026-09-10T11:40:12Z"},
+  {"oid":"9f39bdb5df","authoredDate":"2026-08-07T00:25:54Z","committedDate":"2026-09-07T19:05:55Z"}
+]')
+[ "$r" = "2026-09-10T11:40:12Z" ] && ok "two commits, newest listed FIRST → still picks the max authoredDate, not array order" || bad "out-of-order commits got '$r'"
+r=$(gap3_latest_authored_date '[{"oid":"abc","committedDate":"2026-09-07T19:05:55Z"}]')
+[ "$r" = "" ] && ok "commit missing authoredDate entirely → '' (fail-safe, never fall back to committedDate)" || bad "missing-authoredDate got '$r'"
+
+echo "gap3_comment_verdict_superseded: authoredDate anchor, never committedDate"
+r=$(gap3_comment_verdict_superseded "" ""); [ "$r" = "0" ] && ok "both empty → 0 (fail-safe)" || bad "both-empty got '$r'"
+r=$(gap3_comment_verdict_superseded "2026-08-08T23:09:16Z" ""); [ "$r" = "0" ] && ok "no commit data at all → 0 (fail-safe: never guess superseded from a missing read, same convention as classify_external_pr_gap3's own changes_addressed)" || bad "no-commit-data got '$r'"
+r=$(gap3_comment_verdict_superseded "" "2026-09-10T11:40:12Z"); [ "$r" = "0" ] && ok "no verdict date → 0" || bad "no-verdict-date got '$r'"
+r=$(gap3_comment_verdict_superseded "2026-08-08T23:09:16Z" "2026-08-08T23:09:16Z")
+[ "$r" = "0" ] && ok "identical timestamps → 0 (strictly-after required, not >=)" || bad "identical-timestamps got '$r'"
+# ga-d4avf ACCEPTANCE, negative: PR #5384 BEFORE the real fix — only commit
+# on the branch at that point authored 2026-08-07, predating the verdict,
+# even though ITS OWN committedDate had already shifted to 2026-09-07 (a
+# routine rebase, zero code change). A committedDate-based check would
+# wrongly say "superseded" here — this must not.
+r=$(gap3_comment_verdict_superseded "2026-08-08T23:09:16Z" "2026-08-07T00:25:54Z")
+[ "$r" = "0" ] && ok "ga-d4avf ACCEPTANCE (PR #5384 pre-fix real shape): comment newer than the only authored commit → 0, NOT superseded (still genuinely unaddressed at that point)" || bad "PR#5384 pre-fix got '$r'"
+# ga-d4avf ACCEPTANCE, positive: PR #5384 AFTER the real fix commit 39fd21caed.
+r=$(gap3_comment_verdict_superseded "2026-08-08T23:09:16Z" "2026-09-10T11:40:12Z")
+[ "$r" = "1" ] && ok "ga-d4avf ACCEPTANCE (PR #5384 post-fix real shape): comment predates the real fix commit → 1, superseded (awaiting re-review, not a fresh rejection)" || bad "PR#5384 post-fix got '$r'"
+
+echo "ga-d4avf end-to-end: comment-fallback changes_addressed wired into classify_external_pr_gap3"
+compose_ext_changes_addressed() {
+  # Mirrors the Step 0c.3 loop's own EXT_CHANGES_ADDRESSED computation
+  # exactly: the ga-rmtzrg SHA-based check (formal review) first, falling
+  # back to the ga-d4avf comment-date check only when the SHA check didn't
+  # fire AND a comment verdict date is present. All four derive/compare
+  # calls are the REAL functions, not hand-computed values.
+  local head_sha="$1" cr_commit="$2" comments_json="$3" commits_json="$4"
+  local changes_addressed="0"
+  if [ -n "$head_sha" ] && [ -n "$cr_commit" ] && [ "$head_sha" != "$cr_commit" ]; then
+    changes_addressed="1"
+  else
+    local comment_verdict_date
+    comment_verdict_date=$(derive_comment_verdict_date "$comments_json")
+    if [ -n "$comment_verdict_date" ]; then
+      local latest_authored_date
+      latest_authored_date=$(gap3_latest_authored_date "$commits_json")
+      changes_addressed=$(gap3_comment_verdict_superseded "$comment_verdict_date" "$latest_authored_date")
+    fi
+  fi
+  echo "$changes_addressed"
+}
+# PR #5384 pre-fix: comment verdict, no formal review, only the rebase-shifted commit exists yet.
+ca=$(compose_ext_changes_addressed "" "" \
+  '[{"author":{"login":"steveyegge"},"createdAt":"2026-08-08T23:09:16Z","body":"## Review verdict: MERGE AFTER FIXES (small ones)"}]' \
+  '[{"oid":"9f39bdb5df","authoredDate":"2026-08-07T00:25:54Z","committedDate":"2026-09-07T19:05:55Z"}]')
+r=$(classify_external_pr_gap3 OPEN CHANGES_REQUESTED "$ca")
+[ "$r" = "flag:changes-requested" ] && ok "PR #5384 pre-fix end-to-end → flag:changes-requested (genuinely still unaddressed at that point)" || bad "PR#5384 pre-fix end-to-end got '$r' (changes_addressed=$ca)"
+# PR #5384 post-fix: same comment verdict, but the real fix commit has since landed.
+ca=$(compose_ext_changes_addressed "" "" \
+  '[{"author":{"login":"steveyegge"},"createdAt":"2026-08-08T23:09:16Z","body":"## Review verdict: MERGE AFTER FIXES (small ones)"}]' \
+  '[{"oid":"9f39bdb5df","authoredDate":"2026-08-07T00:25:54Z","committedDate":"2026-09-07T19:05:55Z"},
+    {"oid":"39fd21caed","authoredDate":"2026-09-10T11:40:12Z","committedDate":"2026-09-10T11:40:12Z"}]')
+r=$(classify_external_pr_gap3 OPEN CHANGES_REQUESTED "$ca")
+[ "$r" = "wait:awaiting-rereview" ] && ok "ga-d4avf ACCEPTANCE: PR #5384 post-fix end-to-end → wait:awaiting-rereview, NOT flag:changes-requested (the exact false re-flip this bead exists to fix)" || bad "PR#5384 post-fix end-to-end got '$r' (changes_addressed=$ca)"
+# Genuinely still-pending comment case (no push at all since the verdict) —
+# must stay flagged, so the fix doesn't over-correct into silence.
+ca=$(compose_ext_changes_addressed "" "" \
+  '[{"author":{"login":"bee"},"createdAt":"2026-09-08T00:00:00Z","body":"VERDICT: REQUEST-CHANGES"}]' \
+  '[{"oid":"aaa","authoredDate":"2026-09-05T00:00:00Z","committedDate":"2026-09-05T00:00:00Z"}]')
+r=$(classify_external_pr_gap3 OPEN CHANGES_REQUESTED "$ca")
+[ "$r" = "flag:changes-requested" ] && ok "ga-d4avf NEGATIVE ACCEPTANCE: comment verdict newer than every commit (no push since) → still flag:changes-requested" || bad "genuinely-pending got '$r' (changes_addressed=$ca)"
+# Formal-review path (ga-rmtzrg) must stay byte-for-byte unchanged: a real
+# CHANGES_REQUESTED review's own SHA-based check wins outright, never even
+# reaching the comment-date branch.
+ca=$(compose_ext_changes_addressed "39fd21c" "9f39bdb" '[]' '[]')
+r=$(classify_external_pr_gap3 OPEN CHANGES_REQUESTED "$ca")
+[ "$r" = "wait:awaiting-rereview" ] && ok "ga-rmtzrg regression guard: SHA-based path (formal review) unaffected by this bead's changes" || bad "SHA-based path got '$r' (changes_addressed=$ca)"
+
 # ── reconcile_dead_reviewer_verdict_action <age> <grace> <reviewer_alive> <parent_terminal> ─
 # ga-u07fn: verdict-scoped sibling of reconcile_gaterun_action — releases ONE
 # stuck verdict for re-convocation (parent run still alive) or closes it

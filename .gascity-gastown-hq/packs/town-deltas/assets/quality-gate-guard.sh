@@ -1035,6 +1035,101 @@ derive_comment_verdict_signal() {
   ' 2>/dev/null || echo ""
 }
 
+# derive_comment_verdict_date <comments_json> — ga-d4avf
+# Sibling of derive_comment_verdict_signal above: identical verdict-phrase
+# match + most-recent-wins selection, but returns the raw createdAt instead
+# of the formatted text — kept as a separate function rather than a shared
+# refactor so derive_comment_verdict_signal's own already-fixture-tested
+# output can never be perturbed by this change.
+# Exists because a comment-derived verdict carries no commit reference the
+# way a formal review object does (a review's .commit.oid is what lets
+# classify_external_pr_gap3's changes_addressed parameter detect "head moved
+# past the reviewed commit, awaiting re-review" — see that function's
+# docstring). A plain PR comment has nothing analogous to anchor to, so the
+# comment-fallback path had NO way to notice a later push at all: confirmed
+# live on PR #5384 (ga-r8haw) — a real fix landed 2026-09-10T11:40:12Z, but
+# the guard kept reading steveyegge's stale 2026-08-08 "MERGE AFTER FIXES"
+# comment as the current verdict and re-flagged gate:needs-fix on every
+# sweep for hours afterward (ga-d4avf). This date is what lets
+# gap3_comment_verdict_superseded (below) close that gap.
+# comments_json: same shape as derive_comment_verdict_signal's argument.
+# Returns: the matching verdict comment's createdAt (ISO8601 UTC), or "" (no
+# verdict comment found, empty input, or unparseable input — fail-safe
+# empty, mirroring derive_comment_verdict_signal exactly so the two can
+# never disagree about WHICH comment is "the" verdict).
+derive_comment_verdict_date() {
+  local comments_json="${1:-}"
+  [ -z "$comments_json" ] && { echo ""; return; }
+  echo "$comments_json" | jq -r '
+    (. // [])
+    | map(select(((.body // "") | test("VERDICT:\\s*REQUEST[- ]CHANGES|MERGE[- ]AFTER[- ]FIXES|CHANGES[- ]REQUESTED"; "i"))))
+    | sort_by(.createdAt // "")
+    | last
+    | if . == null then "" else (.createdAt // "") end
+  ' 2>/dev/null || echo ""
+}
+
+# gap3_latest_authored_date <commits_json> — ga-d4avf
+# Pure extraction: the latest (max) authoredDate across a PR's commits — the
+# anchor gap3_comment_verdict_superseded (below) compares a comment verdict
+# against. Takes the MAX across the whole array rather than just the last
+# element: `gh pr view --json commits` returns commits in the order GitHub
+# reports them, which this deliberately does not trust to already be
+# chronological by authoredDate (a rebase or force-push can reorder without
+# this function needing to know or care).
+# commits_json: the raw `.commits` array from `gh pr view --json commits`
+#   (each element: {"oid":...,"authoredDate":...,"committedDate":...}).
+# Returns: the max authoredDate (ISO8601 UTC), or "" (empty/missing array,
+#   no commits carry an authoredDate, or unparseable input — fail-safe
+#   empty, same convention as every other jq call in this file).
+gap3_latest_authored_date() {
+  local commits_json="${1:-}"
+  [ -z "$commits_json" ] && { echo ""; return; }
+  echo "$commits_json" | jq -r '[(. // [])[]?.authoredDate // empty] | sort | last // ""' 2>/dev/null || echo ""
+}
+
+# gap3_comment_verdict_superseded <verdict_created_at> <latest_authored_at> — ga-d4avf
+# Pure timestamp comparison: has a genuinely new commit been AUTHORED since a
+# comment-derived verdict, i.e. should GAP-3 treat this like
+# classify_external_pr_gap3's changes_addressed=1 (wait:awaiting-rereview)
+# instead of flag:changes-requested? This is the comment-fallback path's only
+# analogue to that function's SHA-based changes_addressed check for formal
+# reviews (comment verdicts carry no commit to compare SHAs against — see
+# derive_comment_verdict_date's docstring).
+# Deliberately anchors on the commit's AUTHORED date, never its COMMITTED
+# date. gastownhall/beads commit committedDate shifts under an ordinary
+# rebase even with ZERO code change — confirmed live on PR #5384's original
+# commit 9f39bdb5df: authoredDate 2026-08-07T00:25:54Z, but committedDate
+# 2026-09-07T19:05:55Z (a routine rebase onto updated main, same diff) a
+# full month AFTER steveyegge's 2026-08-08 "MERGE AFTER FIXES" verdict.
+# Anchoring on committedDate there would have read the rebase alone as "our
+# fix landed" — exactly the false "all clear" derive_comment_verdict_signal's
+# own docstring warns costs a bead rotting silently again, since nothing else
+# would re-flag it. authoredDate survives a plain rebase untouched (git
+# preserves the original author identity+date; only the committer date and
+# parents change), so it only moves when code is genuinely (re-)authored.
+# Confirmed on the SAME PR's real fix, commit 39fd21caed: authoredDate ==
+# committedDate == 2026-09-10T11:40:12Z (a brand-new commit, not a replay) —
+# correctly after the verdict on either field. The two anchors diverge only
+# on the no-op-rebase commit, which is exactly the case that must NOT read as
+# "addressed" (ga-d4avf's whole scope).
+# Both inputs are ISO8601 UTC ("...Z") strings from the GitHub API — fixed-
+# width throughout, so plain string comparison (same idiom as this file's own
+# marker-tie-break at ~L572) orders them correctly with no date parsing.
+# Returns: "1" (a commit was authored after the verdict comment — treat as
+# awaiting re-review, not a fresh rejection) | "0" (verdict is newer than
+# every commit, no commit data available, or either input is empty — fail-
+# safe: never guess "superseded" from incomplete data, same convention as
+# classify_external_pr_gap3's own changes_addressed parameter).
+gap3_comment_verdict_superseded() {
+  local verdict_created_at="${1:-}" latest_authored_at="${2:-}"
+  if [ -n "$verdict_created_at" ] && [ -n "$latest_authored_at" ] && [[ "$latest_authored_at" > "$verdict_created_at" ]]; then
+    echo "1"
+  else
+    echo "0"
+  fi
+}
+
 # gap2_query_active_markers — ga-4tgga: I/O helper (not pure, like set_gate_status
 # above) fetching every type:quality-gate-marker whose gate-status is still ACTIVE
 # (ready/queued/claimed/dispatching/running — anything short of terminal). Defined
@@ -3805,8 +3900,11 @@ else
     # already fixed by a later push, awaiting re-review" — see that function's
     # docstring for the full rationale. ga-6ea90: comments added so
     # derive_comment_verdict_signal can see maintainer verdicts that never
-    # became a formal review at all (see that function's docstring).
-    EXT_PR_JSON=$(gh pr view "$EXT_NUM" --repo "$EXT_REPO" --json state,reviewDecision,mergedAt,mergeCommit,url,reviews,headRefOid,comments 2>/dev/null || echo "")
+    # became a formal review at all (see that function's docstring). ga-d4avf:
+    # commits added so a comment-derived verdict (which carries no commit to
+    # SHA-compare, unlike a formal review) can still be checked against a
+    # later authored push — see gap3_comment_verdict_superseded's docstring.
+    EXT_PR_JSON=$(gh pr view "$EXT_NUM" --repo "$EXT_REPO" --json state,reviewDecision,mergedAt,mergeCommit,url,reviews,headRefOid,comments,commits 2>/dev/null || echo "")
 
     if [ -z "$EXT_PR_JSON" ]; then
       log "GAP-3: $EXT_ID — gh pr view $EXT_NUM --repo $EXT_REPO failed (network/auth/not-found) — safe-skip"
@@ -3827,6 +3925,7 @@ else
     # always wins unchanged (no behavior change on repos where GitHub DOES
     # compute it).
     EXT_VERDICT_SOURCE=""
+    EXT_COMMENT_VERDICT_DATE=""
     if [ -z "$EXT_REVIEW" ]; then
       EXT_REVIEWS_JSON=$(echo "$EXT_PR_JSON" | jq -c '.reviews // []' 2>/dev/null || echo "[]")
       EXT_REVIEW=$(derive_review_decision_from_reviews "$EXT_REVIEWS_JSON")
@@ -3859,6 +3958,11 @@ else
       if [ -n "$EXT_COMMENT_VERDICT" ]; then
         EXT_REVIEW="CHANGES_REQUESTED"
         EXT_VERDICT_SOURCE="derived from a maintainer PR comment, no formal review at all: $EXT_COMMENT_VERDICT"
+        # ga-d4avf: a comment verdict carries no commit to SHA-anchor (unlike
+        # a formal review's .commit.oid below) — capture its date so the
+        # changes_addressed computation can still check it against a later
+        # authored push, via gap3_comment_verdict_superseded.
+        EXT_COMMENT_VERDICT_DATE=$(derive_comment_verdict_date "$EXT_COMMENTS_JSON")
       fi
     fi
 
@@ -3879,6 +3983,17 @@ else
     EXT_CHANGES_ADDRESSED="0"
     if [ -n "$EXT_HEAD_SHA" ] && [ -n "$EXT_CR_COMMIT" ] && [ "$EXT_HEAD_SHA" != "$EXT_CR_COMMIT" ]; then
       EXT_CHANGES_ADDRESSED="1"
+    elif [ -n "$EXT_COMMENT_VERDICT_DATE" ]; then
+      # ga-d4avf: the SHA-based check above only ever fires for a formal
+      # review (it needs .commit.oid); a comment-derived verdict has no SHA
+      # to compare, so without this branch EXT_CHANGES_ADDRESSED can never
+      # leave "0" for that path no matter how long ago the verdict predates
+      # our latest push. Anchor is authoredDate, NOT committedDate — see
+      # gap3_comment_verdict_superseded's docstring for why (committedDate
+      # shifts under a no-op rebase on this repo; authoredDate doesn't).
+      EXT_COMMITS_JSON=$(echo "$EXT_PR_JSON" | jq -c '.commits // []' 2>/dev/null || echo "[]")
+      EXT_LATEST_AUTHORED_DATE=$(gap3_latest_authored_date "$EXT_COMMITS_JSON")
+      EXT_CHANGES_ADDRESSED=$(gap3_comment_verdict_superseded "$EXT_COMMENT_VERDICT_DATE" "$EXT_LATEST_AUTHORED_DATE")
     fi
 
     EXT_ACTION=$(classify_external_pr_gap3 "$EXT_STATE" "$EXT_REVIEW" "$EXT_CHANGES_ADDRESSED")
@@ -3954,7 +4069,11 @@ ga-w8mvq: also cleared blocking label(s) $EXT_WAITING_LABELS — left alone, _fi
         log "GAP-3: $EXT_ID — PR $EXT_URL is OPEN, review-decision signal=${EXT_REVIEW:-none} — still genuinely pending, no action"
         ;;
       wait:awaiting-rereview)
-        log "GAP-3: $EXT_ID — PR $EXT_URL has CHANGES_REQUESTED but head ($EXT_HEAD_SHA) has moved past the reviewed commit ($EXT_CR_COMMIT) — a fix was already pushed, awaiting re-review. Leaving story:awaiting-external-merge alone (ga-rmtzrg: do NOT re-flip to gate:needs-fix on an already-addressed review), no action"
+        if [ -n "$EXT_CR_COMMIT" ]; then
+          log "GAP-3: $EXT_ID — PR $EXT_URL has CHANGES_REQUESTED but head ($EXT_HEAD_SHA) has moved past the reviewed commit ($EXT_CR_COMMIT) — a fix was already pushed, awaiting re-review. Leaving story:awaiting-external-merge alone (ga-rmtzrg: do NOT re-flip to gate:needs-fix on an already-addressed review), no action"
+        else
+          log "GAP-3: $EXT_ID — PR $EXT_URL has a comment-derived verdict ($EXT_COMMENT_VERDICT_DATE) predating a later authored commit — a fix was already pushed since, awaiting re-review. Leaving story:awaiting-external-merge alone (ga-d4avf: do NOT flag gate:needs-fix on a stale comment verdict once a real push supersedes it), no action"
+        fi
         ;;
       skip:indeterminate)
         log "GAP-3: $EXT_ID — PR state indeterminate (state='$EXT_STATE') — safe-skip"
