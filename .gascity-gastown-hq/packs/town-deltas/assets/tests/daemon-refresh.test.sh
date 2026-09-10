@@ -1550,6 +1550,125 @@ echo "$R42" | grep -q "com.test.newjob" && ok "T42 REASON nomeia o job nao insta
 # linha "installed+loaded".
 ! grep "installed+loaded" "$MOCK/stderr.log" 2>/dev/null | grep -q "com.test.newjob" && ok "T42 log nao se autocontradiz sobre newjob" || nok "T42 log autocontraditorio: newjob aparece como installed+loaded" "$(grep 'installed+loaded' "$MOCK/stderr.log" 2>/dev/null)"
 
+# ════════════════════════════════════════════════════════════════════════════
+# T43 (ga-pntex): daemon_imports_stem()'s python3 call count must not scale
+#     with N (daemons) x M (changed .py stems). Pre-fix, Step 3 re-invokes a
+#     fresh python3 ast.parse of the SAME entrypoint file once per candidate
+#     stem — for N daemons whose entrypoints import nothing relevant, M
+#     changed files cost N*M spawns. Measured live: a 33min citywide gate
+#     stall, ~1-2 daemons/min, ~1% CPU throughout — the cost is process-spawn
+#     overhead, not computation (ga-pntex).
+#
+#     Proof shape: run the SAME 3-daemon fixture twice — once with 2 changed
+#     stems, once with 10 — via a python3 call-counting shim on PATH (records
+#     one line per invocation, then execs the real interpreter, so the
+#     helper's actual behavior/output is untouched). Post-fix, cost depends
+#     only on the number of UNIQUE files needing an import-stem extraction
+#     (3 entrypoints, cached), never on how many stems each gets checked
+#     against — so the two counts must be EXACTLY equal. Pre-fix they are not
+#     (3+3*2=9 vs. 3+3*10=33 calls): this test FAILS against the pre-fix code
+#     and PASSES after.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t43
+for d in dA dB dC; do
+  cat > "$RUNTIME/daemons/${d}.py" <<PY
+print("$d daemon — imports nothing relevant to this test")
+PY
+  make_plist "$RUNTIME/launchd" "com.test.$d" "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/${d}.py"
+done
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && git commit -q -m base --allow-empty )
+for d in dA dB dC; do
+  make_plist "$AGENTS" "com.test.$d" "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/${d}.py"
+done
+
+# python3 call-counting shim: append one line per invocation to $PY_CALL_LOG,
+# then exec the real interpreter — daemon-refresh.sh's behavior/output is
+# completely unaffected, only the CALL COUNT is observed.
+REAL_PYTHON3="$(command -v python3)"
+mkdir -p "$BIN/countpy"
+cat > "$BIN/countpy/python3" <<COUNTEOF
+#!/usr/bin/env bash
+echo x >> "\$PY_CALL_LOG"
+exec "$REAL_PYTHON3" "\$@"
+COUNTEOF
+chmod +x "$BIN/countpy/python3"
+
+count_py_calls() {  # count_py_calls <changed-relpaths...> -> prints call count
+  : > "$MOCK/py_calls.log"
+  ( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && git commit -q -m base --allow-empty )
+  local pre post f
+  pre=$(git -C "$RUNTIME" rev-parse HEAD)
+  for f in "$@"; do
+    mkdir -p "$RUNTIME/$(dirname "$f")"
+    echo "# changed $(date +%s%N)" >> "$RUNTIME/$f"
+  done
+  ( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && \
+    GIT_AUTHOR_DATE="@$POST_COMMIT_EPOCH" GIT_COMMITTER_DATE="@$POST_COMMIT_EPOCH" \
+    git commit -q -m deploy --allow-empty )
+  post=$(git -C "$RUNTIME" rev-parse HEAD)
+  PATH="$BIN/countpy:$PATH" \
+  PY_CALL_LOG="$MOCK/py_calls.log" \
+  MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" PRE_DEPLOY_SHA="$pre" POST_DEPLOY_SHA="$post" \
+  DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
+  EXTRA_RUNTIME_ROOTS="${EXTRA_RUNTIME_ROOTS:-}" LAUNCH_AGENTS_DIR="$AGENTS" \
+  LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
+  DRY_RUN=0 bash "$HELPER" >/dev/null 2>&1
+  wc -l < "$MOCK/py_calls.log" | tr -d ' '
+}
+
+COUNT_SMALL=$(count_py_calls lib/aux01.py lib/aux02.py)
+COUNT_LARGE=$(count_py_calls lib/aux03.py lib/aux04.py lib/aux05.py lib/aux06.py lib/aux07.py lib/aux08.py lib/aux09.py lib/aux10.py lib/aux11.py lib/aux12.py)
+[ "$COUNT_SMALL" -eq "$COUNT_LARGE" ] && ok "T43 python3 call count does not grow with the number of changed stems (2 changed: $COUNT_SMALL calls, 10 changed: $COUNT_LARGE calls)" || nok "T43 python3 call count scales with changed-file count (N*M spawn storm, ga-pntex)" "2 changed files -> $COUNT_SMALL python3 calls; 10 changed files -> $COUNT_LARGE calls (must be equal — cost must depend on unique files touched, not on how many stems each is checked against)"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T44 (ga-pntex): a changed tests/**/docs/** file must never contribute its
+#     own basename as a candidate "stem" for the import-level check — same
+#     universal claim DEFAULT_NO_RESTART_PATTERNS already established above
+#     for the whole-changeset short-circuit (point 9/ga-dk7fw: "no daemon on
+#     any rig imports a test or doc file"), applied per-file here.
+#
+#     This is not just a perf nit: pre-fix, a changed tests/*.py file whose
+#     BASENAME happens to collide with a real module name some daemon
+#     genuinely imports produces a false-positive AFFECTED — flagging (and
+#     for a SENSITIVE daemon, holding the gate on) a daemon nothing about
+#     this deploy actually touched. Fixture: com.test.dashboard's entrypoint
+#     imports a real lib/shared_helper.py. This deploy changes ONLY
+#     tests/shared_helper.py (unrelated content, same basename) —
+#     lib/shared_helper.py itself never changes. com.test.dashboard must NOT
+#     be flagged AFFECTED.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t44
+mkdir -p "$RUNTIME/lib" "$RUNTIME/lib2" "$RUNTIME/tests"
+cat > "$RUNTIME/lib/shared_helper.py" <<<'X = 1'
+cat > "$RUNTIME/daemons/dashboard.py" <<'PY'
+from lib import shared_helper
+PY
+make_plist "$RUNTIME/launchd" com.test.dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/dashboard.py"
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && git commit -q -m base --allow-empty )
+PRE=$(git -C "$RUNTIME" rev-parse HEAD)
+make_plist "$AGENTS" com.test.dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/dashboard.py"
+# a same-named TEST file changes (lib/shared_helper.py itself is untouched)
+# PLUS an unrelated real file, so this is a MIXED changeset — an all-tests
+# changeset would exit early via the whole-changeset short-circuit above for
+# an unrelated reason and would prove nothing about the per-file check below
+# (same reason T30/T42 needed a mixed changeset too).
+echo "# unrelated test edit" >> "$RUNTIME/tests/shared_helper.py"
+cat > "$RUNTIME/lib2/unrelated_util.py" <<<'print("unrelated")'
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && \
+  GIT_AUTHOR_DATE="@$POST_COMMIT_EPOCH" GIT_COMMITTER_DATE="@$POST_COMMIT_EPOCH" \
+  git commit -q -m deploy )
+POST=$(git -C "$RUNTIME" rev-parse HEAD)
+OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" PRE_DEPLOY_SHA="$PRE" POST_DEPLOY_SHA="$POST" \
+  DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
+  EXTRA_RUNTIME_ROOTS="${EXTRA_RUNTIME_ROOTS:-}" LAUNCH_AGENTS_DIR="$AGENTS" \
+  LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
+  DRY_RUN=0 bash "$HELPER" 2>/dev/null); RC=$?
+AFF44=$(field AFFECTED "$OUT")
+case " $AFF44 " in
+  *" com.test.dashboard "*) nok "T44 tests/-path basename collision must not flag an unrelated daemon" "AFFECTED=[$AFF44] — changed tests/shared_helper.py (lib/shared_helper.py itself never changed) must never make daemon-refresh.sh treat com.test.dashboard as affected" ;;
+  *) ok "T44 changed tests/-path file's basename never becomes a checkable stem (com.test.dashboard correctly NOT flagged)" ;;
+esac
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"
