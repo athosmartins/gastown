@@ -32,8 +32,11 @@
 #      IRREVERSIBLE (destroys all Dolt commit history / time-travel) — DEFAULT OFF,
 #      backup-gated, at most once per ISO-week inside a quiet local-hour window.
 #      ga-sfj3i.4: the size-gated dolt_gc() call is now ALSO gated on disk headroom
-#      (GC_MIN_FREE_PCT, default 250% of hq's own on-disk size — see _gc_headroom_ok
-#      below for the measured basis). Before this fix it had ZERO disk-space
+#      (GC_MIN_FREE_PCT, 200-280% of hq's own on-disk size depending on
+#      PRUNE_ENABLED — see GC_MIN_FREE_PCT_BASE/_WITH_PRUNE and
+#      _gc_headroom_ok/_gc_floor_ok below for the measured basis; ga-3euoj
+#      re-calibrated the flat 250% default after hq's growth made it permanently
+#      unreachable). Before this fix it had ZERO disk-space
 #      awareness and ran unconditionally every 2h whenever hq>=THRESHOLD_G (i.e.
 #      continuously, since hq is essentially always over that floor) — a
 #      disk-exhausted dolt_gc mid-store-rewrite can panic the WHOLE Dolt server
@@ -70,9 +73,31 @@ DB="hq"
 PORT="52756"
 THRESHOLD_G="1"            # online gc when hq store >= 1 GB (ga-ftmci: re-bloats fast;
                            # a bigger store slows the per-rig reconcile full-table scan).
-GC_MIN_FREE_PCT="${GC_MIN_FREE_PCT:-250}"  # ga-sfj3i.4: required free space on the
-                           # data-dir volume before running dolt_gc(), as a percentage
-                           # of hq's own on-disk size. See _gc_headroom_ok below.
+# ga-3euoj: GC_MIN_FREE_PCT's default depends on PRUNE_ENABLED — resolved in main()
+# via _resolve_gc_min_free_pct, once PRUNE_ENABLED/the conf file below are final. An
+# explicit pin here (env or the operator conf file) still wins outright either way.
+GC_MIN_FREE_PCT_BASE="${GC_MIN_FREE_PCT_BASE:-200}"  # ga-3euoj: measured — of 665 real
+                           # online dolt_gc() runs on hq with no prune batch in the same
+                           # cycle (2026-06-08..09-05, hq 483MB..10GB, under normal
+                           # concurrent city write load), the worst post/pre ratio EVER
+                           # observed was exactly 1.000 (store never grew) — matching
+                           # _gc_headroom_ok's documented 2x/"nothing collected"
+                           # worst-case bound with zero real violations.
+GC_MIN_FREE_PCT_WITH_PRUNE="${GC_MIN_FREE_PCT_WITH_PRUNE:-280}"  # ga-3euoj: of 235 runs
+                           # where a prune BATCH ran in the same invocation right before
+                           # dolt_gc() (deletes are new commits; nothing collects their
+                           # garbage yet), the store grew PAST its pre-gc size twice —
+                           # worst ratio 1.7358 (2026-07-25, 2026-08-16) = 273.6%
+                           # implied peak, breaking the "post<=pre" assumption the base
+                           # bound above relies on. 280 covers that with a small margin;
+                           # applies only while PRUNE_ENABLED=1 can produce that burst.
+GC_MIN_FREE_ABS_MB="${GC_MIN_FREE_ABS_MB:-3072}"  # ga-3euoj: absolute floor alongside
+                           # the percentage gate — never let dolt_gc()'s worst-case
+                           # extra disk use (up to size_mb) push avail below Dolt's
+                           # CRITICAL level (3GB: a disk-exhausted GC mid-rewrite can
+                           # panic the WHOLE server, not just hq — ga-vs55). The
+                           # percentage alone only guarantees this by coincidence while
+                           # hq is big; see _gc_floor_ok below.
 LOG="${DOLT_GC_MAINT_LOG:-$CITY/.gc/logs/dolt-gc-maintenance.log}"
 NOTIFY="/Users/athos/.local/bin/notify"
 DOLTDIR="$CITY/.beads/dolt/$DB"
@@ -165,14 +190,46 @@ _avail_mb() {
 # live-after-gc=3180KB; 35228+3180=38408, matches within sampling noise).
 # Live data can never exceed the pre-gc size, so that additive relationship
 # bounds the worst case (a db with nothing to collect as garbage) at 2x
-# pre-gc size. 250 (the GC_MIN_FREE_PCT default) adds margin on top of that
-# proven bound for filesystem overhead and concurrent writers.
+# pre-gc size. ga-3euoj: GC_MIN_FREE_PCT is no longer a flat 250 — see
+# GC_MIN_FREE_PCT_BASE / _WITH_PRUNE above and _resolve_gc_min_free_pct below
+# for the measured, prune-conditional replacement.
 _gc_headroom_ok() {
   local avail="$1" size="$2" pct="$3"
   case "$avail" in ''|*[!0-9]*) return 1 ;; esac
   case "$size" in ''|*[!0-9]*) return 1 ;; esac
   case "$pct" in ''|*[!0-9]*) return 1 ;; esac
   [ "$avail" -ge $(( size * pct / 100 )) ]
+}
+
+# _gc_floor_ok <avail_mb> <size_mb> <abs_floor_mb> → 0 = the CRITICAL floor (ga-vs55:
+# a disk-exhausted dolt_gc() mid-rewrite can panic the WHOLE Dolt server) survives even
+# in _gc_headroom_ok's own worst case (post_gc_size == size_mb, i.e. nothing collected).
+# ga-3euoj: makes that floor an explicit, always-enforced invariant instead of an
+# accident of hq's current (large) size — GC_MIN_FREE_PCT_BASE alone only guarantees it
+# while size_mb is already well above abs_floor_mb (true today at ~6-7GB vs 3GB, false
+# once hq is small, e.g. right after a real GC succeeds). ANDed with _gc_headroom_ok in
+# main() — neither check alone is sufficient.
+_gc_floor_ok() {
+  local avail="$1" size="$2" floor="$3"
+  case "$avail" in ''|*[!0-9]*) return 1 ;; esac
+  case "$size" in ''|*[!0-9]*) return 1 ;; esac
+  case "$floor" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$avail" -ge $(( size + floor )) ]
+}
+
+# _resolve_gc_min_free_pct <pinned> <prune_enabled> <base> <with_prune> → echoes the
+# GC_MIN_FREE_PCT to use. <pinned> is whatever GC_MIN_FREE_PCT held BEFORE this
+# resolution runs (env var or the operator conf file — either wins outright, matching
+# this script's documented "file > env > default" precedence); empty means neither set
+# it. ga-3euoj: kept separate from _gc_headroom_ok's own worst-case-bound rationale
+# because the two measured defaults (base/with_prune, declared near GC_MIN_FREE_PCT
+# above) come from DIFFERENT empirical cohorts — a prune batch running in the same
+# maintenance-cycle invocation is what actually broke the "post<=pre" assumption in
+# real logs, not hq's size or age.
+_resolve_gc_min_free_pct() {
+  local pinned="$1" prune_enabled="$2" base="$3" with_prune="$4"
+  if [ -n "$pinned" ]; then echo "$pinned"; return; fi
+  if [ "$prune_enabled" = "1" ]; then echo "$with_prune"; else echo "$base"; fi
 }
 
 # _backup_fresh <staging_dir> <db> <max_age_h> → 0 if <staging_dir>/<db> was written
@@ -300,6 +357,13 @@ _run_flatten() {
 
 # ── main flow ────────────────────────────────────────────────────────────────────
 main() {
+  # ga-3euoj: resolve GC_MIN_FREE_PCT now that PRUNE_ENABLED + any operator pin (env
+  # or the conf file sourced above) are final. Kept inside main() (not top-level) so
+  # the selftest — which sources this file as a library and never calls main() — can
+  # exercise _resolve_gc_min_free_pct directly with whatever inputs each test wants,
+  # rather than being stuck with one value baked in at source-time.
+  GC_MIN_FREE_PCT="$(_resolve_gc_min_free_pct "${GC_MIN_FREE_PCT:-}" "$PRUNE_ENABLED" "$GC_MIN_FREE_PCT_BASE" "$GC_MIN_FREE_PCT_WITH_PRUNE")"
+
   # 1) EPHEMERAL PURGE (always) — unchanged behavior.
   if [ -x "$BD" ]; then
     local purged
@@ -332,14 +396,21 @@ main() {
     log "hq=${size_g}G < ${THRESHOLD_G}G threshold — skip gc"; return 0
   fi
 
-  # ga-sfj3i.4: disk headroom gate — see _gc_headroom_ok for the measured
-  # basis. Always logs the three numbers when both measurements succeed,
+  # ga-sfj3i.4 / ga-3euoj: disk headroom gate — TWO independent checks, both must
+  # pass: _gc_headroom_ok (percentage of size, prune-conditional — see
+  # GC_MIN_FREE_PCT_BASE/_WITH_PRUNE above) and _gc_floor_ok (absolute Dolt-CRITICAL
+  # floor — see GC_MIN_FREE_ABS_MB above). Always logs the numbers when size measures,
   # including on runs that proceed, so headroom stays visible in the log.
   local avail_mb; avail_mb="$(_avail_mb "$DOLTDIR")"
-  local required_mb=""
-  [ -n "$size_mb" ] && required_mb=$(( size_mb * GC_MIN_FREE_PCT / 100 ))
-  log "hq disk headroom check: size=${size_mb:-<unmeasured>}MB avail=${avail_mb:-<unmeasured>}MB required=${required_mb:-<unmeasured>}MB (${GC_MIN_FREE_PCT}% of size)"
-  if ! _gc_headroom_ok "$avail_mb" "$size_mb" "$GC_MIN_FREE_PCT"; then
+  local required_pct_mb="" required_floor_mb="" required_mb=""
+  if [ -n "$size_mb" ]; then
+    required_pct_mb=$(( size_mb * GC_MIN_FREE_PCT / 100 ))
+    required_floor_mb=$(( size_mb + GC_MIN_FREE_ABS_MB ))
+    required_mb=$required_pct_mb
+    [ "$required_floor_mb" -gt "$required_mb" ] && required_mb=$required_floor_mb
+  fi
+  log "hq disk headroom check: size=${size_mb:-<unmeasured>}MB avail=${avail_mb:-<unmeasured>}MB required=${required_mb:-<unmeasured>}MB (max of ${GC_MIN_FREE_PCT}% size=${required_pct_mb:-<unmeasured>}MB, size+${GC_MIN_FREE_ABS_MB}MB floor=${required_floor_mb:-<unmeasured>}MB)"
+  if ! _gc_headroom_ok "$avail_mb" "$size_mb" "$GC_MIN_FREE_PCT" || ! _gc_floor_ok "$avail_mb" "$size_mb" "$GC_MIN_FREE_ABS_MB"; then
     log "hq size=${size_mb:-<unmeasured>}MB avail=${avail_mb:-<unmeasured>}MB required=${required_mb:-<unmeasured>}MB — insufficient free space (or unmeasurable) for dolt_gc — skip this cycle, will retry in 2h"
     return 0
   fi

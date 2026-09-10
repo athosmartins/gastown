@@ -72,6 +72,30 @@ _gc_headroom_ok 500   ""  250 && bad "headroom: empty size should fail-closed" |
 _gc_headroom_ok 500   200 ""  && bad "headroom: empty pct should fail-closed" || ok "headroom: unmeasurable pct (empty) → fail-closed, not proceed"
 _gc_headroom_ok "abc" 200 250 && bad "headroom: non-numeric avail should fail-closed" || ok "headroom: non-numeric avail → fail-closed"
 
+# ── _gc_floor_ok: absolute Dolt-CRITICAL floor, independent of the pct gate (ga-3euoj) ──
+_gc_floor_ok 9300 6228 3072 && ok "floor: avail=9300 size=6228 floor=3072 → boundary ok (>=)" || bad "floor: 9300>=9300 should pass"
+_gc_floor_ok 9299 6228 3072 && bad "floor: avail=9299 < required=9300 should fail" || ok "floor: avail=9299 < required=9300 → not enough room"
+_gc_floor_ok 20000 6228 3072 && ok "floor: plenty of room → ok" || bad "floor: 20000 avail should pass"
+_gc_floor_ok ""    6228 3072 && bad "floor: empty avail should fail-closed" || ok "floor: unmeasurable avail (empty) → fail-closed, not proceed"
+_gc_floor_ok 9300  ""   3072 && bad "floor: empty size should fail-closed" || ok "floor: unmeasurable size (empty) → fail-closed, not proceed"
+_gc_floor_ok 9300  6228 ""   && bad "floor: empty floor should fail-closed" || ok "floor: unmeasurable floor (empty) → fail-closed, not proceed"
+_gc_floor_ok "abc" 6228 3072 && bad "floor: non-numeric avail should fail-closed" || ok "floor: non-numeric avail → fail-closed"
+# the small-hq case this check exists for: at size=1000MB, the pct gate alone (200%)
+# only demands avail>=2000MB, leaving just 1000MB of margin — under the 3GB floor.
+_gc_floor_ok 2000 1000 3072 && bad "floor: small-hq case must still enforce the 3GB floor" || ok "floor: small hq (1000MB) still needs avail>=4072MB, not just the pct gate's 2000MB"
+
+# ── _resolve_gc_min_free_pct: prune-conditional default, explicit pin always wins (ga-3euoj) ──
+r="$(_resolve_gc_min_free_pct "" 0 200 280)"; [ "$r" = "200" ] && ok "resolve: prune disabled → base (200)" || bad "resolve prune-off got: '$r'"
+r="$(_resolve_gc_min_free_pct "" 1 200 280)"; [ "$r" = "280" ] && ok "resolve: prune enabled → with-prune (280)" || bad "resolve prune-on got: '$r'"
+r="$(_resolve_gc_min_free_pct "999" 0 200 280)"; [ "$r" = "999" ] && ok "resolve: explicit pin wins over prune-disabled base" || bad "resolve pin (prune off) got: '$r'"
+r="$(_resolve_gc_min_free_pct "999" 1 200 280)"; [ "$r" = "999" ] && ok "resolve: explicit pin wins over prune-enabled with-prune" || bad "resolve pin (prune on) got: '$r'"
+
+# ── measured constants — pin them down so a future edit can't silently drift the
+#    calibration without updating its justifying comment (ga-3euoj) ──────────────
+[ "$GC_MIN_FREE_PCT_BASE" = "200" ] && ok "constant: GC_MIN_FREE_PCT_BASE=200 (665 real runs, worst ratio 1.000)" || bad "GC_MIN_FREE_PCT_BASE drifted: '$GC_MIN_FREE_PCT_BASE'"
+[ "$GC_MIN_FREE_PCT_WITH_PRUNE" = "280" ] && ok "constant: GC_MIN_FREE_PCT_WITH_PRUNE=280 (235 real runs, worst ratio 1.7358)" || bad "GC_MIN_FREE_PCT_WITH_PRUNE drifted: '$GC_MIN_FREE_PCT_WITH_PRUNE'"
+[ "$GC_MIN_FREE_ABS_MB" = "3072" ] && ok "constant: GC_MIN_FREE_ABS_MB=3072 (Dolt CRITICAL floor, ga-vs55)" || bad "GC_MIN_FREE_ABS_MB drifted: '$GC_MIN_FREE_ABS_MB'"
+
 # ── _avail_mb: free-space read against the real filesystem ──────────────────────
 # No mock — matches this file's own _backup_fresh tests below, which also exercise
 # real filesystem paths rather than stubbing find/stat.
