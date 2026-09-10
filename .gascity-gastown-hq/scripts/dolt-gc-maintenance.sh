@@ -1,8 +1,9 @@
 #!/bin/bash
 # dolt-gc-maintenance.sh — keeps the city's hq beads store lean automatically.
 #
-# THREE independently-gated layers of upkeep. All SILENT on success (Athos
-# preference — only FAILURE notifies). Run by launchd every 2h.
+# THREE independently-gated layers of upkeep. Mostly SILENT on success (Athos
+# preference) — FAILURE always notifies, and (ga-azzfw) a sustained headroom-skip
+# streak or a no-effect gc run also notify. Run by launchd every 2h.
 #
 #   1. EPHEMERAL PURGE  (ALWAYS ON)  — `bd purge` removes CLOSED *ephemeral* beads
 #      (ephemeral=1: gate-reviewer sessions, terminal gate markers). Cheap. The >2h
@@ -45,6 +46,16 @@
 #      post-FLATTEN integrity verification that a bare dolt_gc() — no flatten
 #      involved — does not share; deliberately left alone here, out of scope for
 #      this fix).
+#
+#      ga-azzfw: the headroom skip above is now ALSO tracked as a consecutive-cycle
+#      streak (GC_SKIP_STREAK_STATE) — 3 in a row (~6h @ 2h cadence) notifies + mails
+#      the Mayor ONCE per streak, so a stuck skip can't go unnoticed for days the way
+#      it did in ga-3euoj (found only by manual investigation, after disk had already
+#      touched Dolt's CRITICAL floor twice). The streak clears the moment dolt_gc() is
+#      next ATTEMPTED (success or failure — a SQL failure is a separate, already-
+#      alerted condition). A dolt_gc() that runs to completion but reclaims no space
+#      (post>=pre) is also flagged, once per occurrence — see _handle_gc_skip_streak
+#      and _gc_no_effect below.
 #
 # Size-triggered gc (not pure time) self-adjusts to the bloat rate and never gc's a
 # store that's already small. See memory: gate-reviewer-spawn-failure-playbook,
@@ -98,10 +109,22 @@ GC_MIN_FREE_ABS_MB="${GC_MIN_FREE_ABS_MB:-3072}"  # ga-3euoj: absolute floor alo
                            # panic the WHOLE server, not just hq — ga-vs55). The
                            # percentage alone only guarantees this by coincidence while
                            # hq is big; see _gc_floor_ok below.
+GC_SKIP_ALERT_THRESHOLD="${GC_SKIP_ALERT_THRESHOLD:-3}"  # ga-azzfw: consecutive
+                           # headroom-skip CYCLES (2h launchd cadence, so 3 = ~6h)
+                           # before alerting the Mayor. The ga-3euoj incident skipped
+                           # silently for DAYS because the skip line only reaches a log
+                           # nobody reads — this makes that "if it skips again, reopen"
+                           # criterion automatic instead of depending on a human read.
+                           # One alert per STREAK, not one per cycle past the
+                           # threshold — see _skip_streak_next.
+GC_SKIP_STREAK_STATE="${GC_SKIP_STREAK_STATE:-$CITY/.gc/runtime/packs/maintenance/dolt-gc-skip-streak.state}"
 LOG="${DOLT_GC_MAINT_LOG:-$CITY/.gc/logs/dolt-gc-maintenance.log}"
 NOTIFY="/Users/athos/.local/bin/notify"
 DOLTDIR="$CITY/.beads/dolt/$DB"
 BD="$(command -v bd 2>/dev/null || echo /Users/athos/.local/bin/bd)"
+GC="${GC_BIN:-gc}"  # ga-azzfw: mirrors dolt-disk-floor-guard.sh / dolt-compact-routine.sh —
+                    # used only for `gc mail send mayor` (skip-streak + no-effect alerts
+                    # below); this script had no mail dependency before.
 
 # ── non-ephemeral PRUNE knobs (all default-safe; operator file overrides below) ──
 PRUNE_ENABLED="${PRUNE_ENABLED:-0}"                 # 0 = STAGED OFF (the Mayor enables)
@@ -232,6 +255,48 @@ _resolve_gc_min_free_pct() {
   if [ "$prune_enabled" = "1" ]; then echo "$with_prune"; else echo "$base"; fi
 }
 
+# _skip_streak_parse <line> → echoes "COUNT ALERTED", defaulting to "0 0" for a missing
+# or corrupt state line. Fail-SAFE, not fail-closed like _avail_mb/_gc_headroom_ok:
+# this counter only ever drives a notify, never a destructive action, so misreading
+# corrupt state as "no streak yet" costs one delayed alert at worst — never data loss.
+_skip_streak_parse() {
+  local line="${1:-}" count alerted
+  count="${line%% *}"
+  alerted="${line##* }"
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+  case "$alerted" in 0|1) ;; *) alerted=0 ;; esac
+  echo "$count $alerted"
+}
+
+# _skip_streak_next <prev_count> <prev_alerted> <threshold> → echoes "NEW_COUNT
+# NEW_ALERTED SHOULD_ALERT" for one more consecutive headroom-skip cycle. SHOULD_ALERT
+# is 1 only the FIRST cycle the streak reaches <threshold> (prev_alerted still 0) —
+# never again while the SAME streak continues, so a stuck skip doesn't re-notify every
+# 2h (ga-azzfw: "um alerta por sequência, sem repetir a cada ciclo").
+_skip_streak_next() {
+  local prev_count="$1" prev_alerted="$2" thr="$3" new_count should new_alerted
+  case "$prev_count" in ''|*[!0-9]*) prev_count=0 ;; esac
+  new_count=$(( prev_count + 1 ))
+  should=0
+  new_alerted="$prev_alerted"
+  if [ "$new_count" -ge "$thr" ] && [ "$prev_alerted" != "1" ]; then
+    should=1
+    new_alerted=1
+  fi
+  echo "$new_count $new_alerted $should"
+}
+
+# _gc_no_effect <pre_mb> <post_mb> → 0 (true) when a dolt_gc() call that ran to
+# completion reclaimed NO space (post >= pre) — ga-azzfw requirement 4 ("GC roda mas o
+# hq não encolhe"). Fail-OPEN (never flag) on unmeasurable input: this is a notify-only
+# signal, not a safety gate, and a `du` misread shouldn't cry wolf.
+_gc_no_effect() {
+  local pre="$1" post="$2"
+  case "$pre" in ''|*[!0-9]*) return 1 ;; esac
+  case "$post" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$post" -ge "$pre" ]
+}
+
 # _backup_fresh <staging_dir> <db> <max_age_h> → 0 if <staging_dir>/<db> was written
 # within max_age_h. Belt: a bad prune is recoverable from this S3-staged backup (plus
 # the jsonl-archive prune writes on every delete).
@@ -355,6 +420,77 @@ _run_flatten() {
   [ "$did" = "1" ]
 }
 
+# ── skip-streak state I/O + alert helpers (ga-azzfw) ────────────────────────────────
+_read_skip_streak() {
+  local f="$1" line=""
+  [ -f "$f" ] && line="$(cat "$f" 2>/dev/null)"
+  _skip_streak_parse "$line"
+}
+
+_write_skip_streak() {
+  local f="$1" count="$2" alerted="$3"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  printf '%s %s\n' "$count" "$alerted" > "$f" 2>/dev/null || true
+}
+
+# _dolt_gc_notify <title> <priority> <message> — thin $NOTIFY wrapper so the selftest
+# can redefine it instead of a real push firing (same idiom this file already uses for
+# _prune_dryrun_count; see memory mutation-check-notify-code-neutralize).
+_dolt_gc_notify() {
+  "$NOTIFY" -t "$1" -p "$2" "$3" 2>/dev/null || true
+}
+
+# _dolt_gc_mail_mayor <subject> <body> — thin `gc mail send mayor` wrapper, same
+# redefine-in-selftest idiom as _dolt_gc_notify.
+_dolt_gc_mail_mayor() {
+  ( cd "$CITY" && GC_CITY="$CITY" "$GC" mail send mayor -s "$1" -m "$2" >/dev/null 2>&1 ) || true
+}
+
+# _clear_skip_streak <state_file> <log_context> — resets the skip-streak counter to
+# "0 0", logging only when it actually had something to clear (silent on the common
+# already-zero path). Called from every NON-headroom-skip exit of the size-gc flow so a
+# stale streak from days ago can't resurface after an unrelated cycle in between
+# (ga-azzfw requirement 3, read as "whenever this cycle is not itself a headroom skip").
+_clear_skip_streak() {
+  local f="$1" ctx="$2" prev prev_count
+  prev="$(_read_skip_streak "$f")"
+  prev_count="${prev%% *}"
+  [ "$prev_count" != "0" ] && log "dolt_gc skip streak cleared (was ${prev_count}) — ${ctx}"
+  _write_skip_streak "$f" 0 0
+}
+
+# _handle_gc_skip_streak <size_mb> <avail_mb> <required_mb> — increments the persisted
+# consecutive-headroom-skip counter, alerts (notify + mail mayor) the FIRST cycle it
+# reaches GC_SKIP_ALERT_THRESHOLD, and always logs the running count. Called only from
+# the headroom-skip branch of main() (ga-azzfw requirements 1+2).
+_handle_gc_skip_streak() {
+  local size_mb="$1" avail_mb="$2" required_mb="$3"
+  local prev prev_count prev_alerted
+  prev="$(_read_skip_streak "$GC_SKIP_STREAK_STATE")"
+  prev_count="${prev%% *}"
+  prev_alerted="$(echo "$prev" | awk '{print $2}')"
+  local next new_count new_alerted should_alert
+  next="$(_skip_streak_next "$prev_count" "$prev_alerted" "$GC_SKIP_ALERT_THRESHOLD")"
+  new_count="${next%% *}"
+  new_alerted="$(echo "$next" | awk '{print $2}')"
+  should_alert="$(echo "$next" | awk '{print $3}')"
+  _write_skip_streak "$GC_SKIP_STREAK_STATE" "$new_count" "$new_alerted"
+  local hrs=$(( new_count * 2 ))
+  log "dolt_gc skip streak: ${new_count} consecutive headroom-skip cycle(s) (~${hrs}h @ 2h cadence)"
+  [ "$should_alert" != "1" ] && return 0
+  local mail_body="dolt-gc-maintenance: hq's online dolt_gc() has been skipped for insufficient headroom ${new_count} consecutive cycles in a row (~${hrs}h at the 2h launchd cadence).
+
+Latest reading: size=${size_mb:-<unmeasured>}MB avail=${avail_mb:-<unmeasured>}MB required=${required_mb:-<unmeasured>}MB.
+
+This is the exact silent-stall shape behind ga-3euoj: the skip line only reached the
+log file, which nobody reads, and the gate stayed unreachable for days while disk
+approached Dolt's CRITICAL floor (ga-vs55) twice. One alert per streak — this will not
+repeat until the streak clears (an attempted dolt_gc) and later re-crosses the threshold."
+  _dolt_gc_notify "Dolt GC" 4 "🚨 dolt_gc pulando por falta de espaço há ${new_count} ciclos seguidos (~${hrs}h) — hq=${size_mb:-?}MB avail=${avail_mb:-?}MB required=${required_mb:-?}MB"
+  _dolt_gc_mail_mayor "Dolt GC: ${new_count} skips consecutivos por headroom" "$mail_body"
+  log "ALERT: dolt_gc skip streak reached ${GC_SKIP_ALERT_THRESHOLD}+ — notified mayor (notify + mail)"
+}
+
 # ── main flow ────────────────────────────────────────────────────────────────────
 main() {
   # ga-3euoj: resolve GC_MIN_FREE_PCT now that PRUNE_ENABLED + any operator pin (env
@@ -381,7 +517,11 @@ main() {
   # 3) weekly FLATTEN (opt-in, deep reclaim) — does its own gc; skip the size-gc if it ran.
   local flattened=1
   if [ "$FLATTEN_ENABLED" = "1" ] && [ -x "$BD" ]; then _run_flatten; flattened=$?; fi
-  if [ "$flattened" -eq 0 ]; then log "size-gc skipped — flatten already reclaimed this run"; return 0; fi
+  if [ "$flattened" -eq 0 ]; then
+    log "size-gc skipped — flatten already reclaimed this run"
+    _clear_skip_streak "$GC_SKIP_STREAK_STATE" "flatten already reclaimed this run"
+    return 0
+  fi
 
   # 4) ONLINE size-gated dolt_gc (always). size_mb replaces the old bare
   # `du -sg` read (same truncated-whole-GB value via integer division, so
@@ -393,7 +533,9 @@ main() {
   case "$size_mb" in ''|*[!0-9]*) size_mb="" ;; esac
   local size_g=$(( ${size_mb:-0} / 1024 ))
   if [ "$size_g" -lt "$THRESHOLD_G" ]; then
-    log "hq=${size_g}G < ${THRESHOLD_G}G threshold — skip gc"; return 0
+    log "hq=${size_g}G < ${THRESHOLD_G}G threshold — skip gc"
+    _clear_skip_streak "$GC_SKIP_STREAK_STATE" "hq below ${THRESHOLD_G}G threshold"
+    return 0
   fi
 
   # ga-sfj3i.4 / ga-3euoj: disk headroom gate — TWO independent checks, both must
@@ -412,15 +554,36 @@ main() {
   log "hq disk headroom check: size=${size_mb:-<unmeasured>}MB avail=${avail_mb:-<unmeasured>}MB required=${required_mb:-<unmeasured>}MB (max of ${GC_MIN_FREE_PCT}% size=${required_pct_mb:-<unmeasured>}MB, size+${GC_MIN_FREE_ABS_MB}MB floor=${required_floor_mb:-<unmeasured>}MB)"
   if ! _gc_headroom_ok "$avail_mb" "$size_mb" "$GC_MIN_FREE_PCT" || ! _gc_floor_ok "$avail_mb" "$size_mb" "$GC_MIN_FREE_ABS_MB"; then
     log "hq size=${size_mb:-<unmeasured>}MB avail=${avail_mb:-<unmeasured>}MB required=${required_mb:-<unmeasured>}MB — insufficient free space (or unmeasurable) for dolt_gc — skip this cycle, will retry in 2h"
+    _handle_gc_skip_streak "$size_mb" "$avail_mb" "$required_mb"
     return 0
   fi
 
   local pre; pre="$(du -sh "$DOLTDIR" 2>/dev/null | awk '{print $1}')"
   log "hq=${pre} >= ${THRESHOLD_G}G, headroom ok — running online dolt_gc ..."
+  # ga-azzfw requirement 3: the headroom problem this cycle is resolved the moment we
+  # reach an actual attempt, independent of whether the SQL call below then succeeds —
+  # a transient dolt_gc() failure is a DIFFERENT, already-alerted condition (below) and
+  # must not keep the (unrelated) skip-streak counter artificially elevated.
+  _clear_skip_streak "$GC_SKIP_STREAK_STATE" "dolt_gc attempted"
   if DOLT_CLI_PASSWORD='' timeout 300 dolt --host 127.0.0.1 --port "$PORT" --user root --no-tls \
        sql -q "USE \`$DB\`; CALL dolt_gc();" >> "$LOG" 2>&1; then
-    local post; post="$(du -sh "$DOLTDIR" 2>/dev/null | awk '{print $1}')"
+    local post post_mb; post="$(du -sh "$DOLTDIR" 2>/dev/null | awk '{print $1}')"
+    post_mb="$(du -sm "$DOLTDIR" 2>/dev/null | awk '{print $1}')"
+    case "$post_mb" in ''|*[!0-9]*) post_mb="" ;; esac
     log "dolt_gc OK — hq ${pre} -> ${post}"
+    # ga-azzfw requirement 4: dolt_gc() succeeded (rc=0) but reclaimed nothing. size_mb
+    # is reused as "pre" here — it's the exact same pre-gc measurement the headroom
+    # decision above was based on, not a fresh re-read that could drift from it.
+    if _gc_no_effect "$size_mb" "$post_mb"; then
+      log "dolt_gc had NO EFFECT — hq ${size_mb:-<unmeasured>}MB -> ${post_mb:-<unmeasured>}MB (not smaller)"
+      _dolt_gc_notify "Dolt GC" 4 "⚠️ dolt_gc rodou mas hq não encolheu — ${size_mb:-?}MB -> ${post_mb:-?}MB"
+      _dolt_gc_mail_mayor "Dolt GC: rodou sem efeito (hq ${size_mb:-?}MB -> ${post_mb:-?}MB)" "dolt-gc-maintenance: dolt_gc() ran to completion (rc=0) but hq's on-disk size did not shrink — ${size_mb:-<unmeasured>}MB before, ${post_mb:-<unmeasured>}MB after (ga-azzfw requirement 4).
+
+Either there was nothing eligible to collect this cycle, or something is preventing
+reclaim. Not necessarily an emergency by itself — but worth a look if it keeps
+recurring, since the headroom gate above assumes a normal dolt_gc() brings the store
+back down toward its live-data floor."
+    fi
   else
     local rc=$?
     log "dolt_gc FAILED (rc=$rc)"

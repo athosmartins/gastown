@@ -14,6 +14,9 @@ SCRIPT="$HERE/dolt-gc-maintenance.sh"
 export DOLT_GC_MAINT_LIB=1
 export DOLT_MAINT_CONF="/tmp/dolt-gc-maint-noconf-$$.env"   # nonexistent → no real toggle read
 export DOLT_GC_MAINT_LOG="/tmp/dolt-gc-maint-selftest-$$.log"
+export GC_SKIP_STREAK_STATE="/tmp/dolt-gc-maint-selftest-streak-$$.state"  # ga-azzfw:
+  # throwaway — the real default lives under $CITY/.gc/runtime and must NEVER be
+  # touched by a test run.
 # shellcheck disable=SC1090
 . "$SCRIPT"
 
@@ -124,6 +127,60 @@ echo "2026-27" > "$SENT"
 _flatten_due "$SENT" 1 3 7 5  2026-27 && bad "flatten already ran this week should not run" || ok "flatten: same-week sentinel → not due (>=1/week)"
 _flatten_due "$SENT" 1 3 7 5  2026-28 && ok "flatten: next ISO-week → due again" || bad "flatten: new week should be due"
 rm -f "$SENT"
+
+# ── _skip_streak_parse / _skip_streak_next: pure consecutive-skip counter (ga-azzfw) ──
+p="$(_skip_streak_parse "")"; [ "$p" = "0 0" ] && ok "streak parse: empty/missing state → '0 0'" || bad "streak parse empty got: '$p'"
+p="$(_skip_streak_parse "2 0")"; [ "$p" = "2 0" ] && ok "streak parse: well-formed state round-trips" || bad "streak parse got: '$p'"
+p="$(_skip_streak_parse "garbage")"; [ "$p" = "0 0" ] && ok "streak parse: corrupt state fails SAFE to '0 0' (worst case: one delayed alert, never a lost one)" || bad "streak parse corrupt got: '$p'"
+
+n="$(_skip_streak_next 0 0 3)"; [ "$n" = "1 0 0" ] && ok "streak next: 1st skip → count=1, no alert" || bad "streak next 1st got: '$n'"
+n="$(_skip_streak_next 1 0 3)"; [ "$n" = "2 0 0" ] && ok "streak next: 2nd skip → count=2, no alert" || bad "streak next 2nd got: '$n'"
+n="$(_skip_streak_next 2 0 3)"; [ "$n" = "3 1 1" ] && ok "streak next: 3rd skip → count=3, ALERTS, marks alerted" || bad "streak next 3rd got: '$n'"
+n="$(_skip_streak_next 3 1 3)"; [ "$n" = "4 1 0" ] && ok "streak next: 4th skip (same streak) → count=4, no RE-alert" || bad "streak next 4th got: '$n'"
+
+# ── _gc_no_effect: dolt_gc() ran but hq didn't shrink (ga-azzfw requirement 4) ────────
+_gc_no_effect 1000 800  && bad "no-effect: 800<1000 (shrank) should NOT flag" || ok "no-effect: store shrank → not flagged"
+_gc_no_effect 1000 1000 && ok "no-effect: post==pre (zero shrinkage) → flagged" || bad "no-effect: 1000==1000 should flag"
+_gc_no_effect 1000 1200 && ok "no-effect: post>pre (grew) → flagged" || bad "no-effect: 1200>1000 should flag"
+_gc_no_effect ""   800  && bad "no-effect: unmeasurable pre should fail-open (never flag)" || ok "no-effect: unmeasurable pre → fail-open, not flagged"
+_gc_no_effect 1000 ""   && bad "no-effect: unmeasurable post should fail-open (never flag)" || ok "no-effect: unmeasurable post → fail-open, not flagged"
+
+# ── _handle_gc_skip_streak / _clear_skip_streak: end-to-end streak + one-alert-per-
+#    streak behavior (ga-azzfw's own stated test: "3 skips geram 1 alerta, skip-skip-
+#    run zera o contador sem alertar"). Redefine the two side-effecting wrappers so no
+#    real notify/mail ever fires — same idiom this file already uses to stub
+#    _prune_dryrun_count (see memory mutation-check-notify-code-neutralize: the stub
+#    must intercept the wrapper CALLED by the code under test, which it does here).
+ALERT_NOTIFY_CALLS=0; ALERT_MAIL_CALLS=0
+_dolt_gc_notify() { ALERT_NOTIFY_CALLS=$((ALERT_NOTIFY_CALLS+1)); }
+_dolt_gc_mail_mayor() { ALERT_MAIL_CALLS=$((ALERT_MAIL_CALLS+1)); }
+
+rm -f "$GC_SKIP_STREAK_STATE"
+_handle_gc_skip_streak 6000 1000 12000   # skip 1
+_handle_gc_skip_streak 6000 1000 12000   # skip 2
+[ "$ALERT_NOTIFY_CALLS" -eq 0 ] && [ "$ALERT_MAIL_CALLS" -eq 0 ] && ok "skip-streak: no alert yet after 2 consecutive skips" || bad "skip-streak: alert fired too early (notify=$ALERT_NOTIFY_CALLS mail=$ALERT_MAIL_CALLS)"
+_handle_gc_skip_streak 6000 1000 12000   # skip 3 → should alert exactly once
+[ "$ALERT_NOTIFY_CALLS" -eq 1 ] && [ "$ALERT_MAIL_CALLS" -eq 1 ] && ok "skip-streak: 3 consecutive skips → exactly 1 alert (notify+mail)" || bad "skip-streak: expected 1+1, got notify=$ALERT_NOTIFY_CALLS mail=$ALERT_MAIL_CALLS"
+_handle_gc_skip_streak 6000 1000 12000   # skip 4, same streak → must NOT re-alert
+[ "$ALERT_NOTIFY_CALLS" -eq 1 ] && [ "$ALERT_MAIL_CALLS" -eq 1 ] && ok "skip-streak: 4th consecutive skip does not re-alert (one alert per streak)" || bad "skip-streak: re-alerted on 4th skip (notify=$ALERT_NOTIFY_CALLS mail=$ALERT_MAIL_CALLS)"
+s="$(_read_skip_streak "$GC_SKIP_STREAK_STATE")"; [ "$s" = "4 1" ] && ok "skip-streak: state file reads back '4 1' after 4 skips" || bad "skip-streak: state got '$s'"
+
+# skip-skip-run: 2 skips then a clear (simulating dolt_gc finally being attempted) →
+# counter resets to 0 and NEVER alerts (never reached the threshold).
+rm -f "$GC_SKIP_STREAK_STATE"
+ALERT_NOTIFY_CALLS=0; ALERT_MAIL_CALLS=0
+_handle_gc_skip_streak 6000 1000 12000   # skip 1
+_handle_gc_skip_streak 6000 1000 12000   # skip 2
+_clear_skip_streak "$GC_SKIP_STREAK_STATE" "selftest: simulated dolt_gc attempt"
+s="$(_read_skip_streak "$GC_SKIP_STREAK_STATE")"; [ "$s" = "0 0" ] && ok "skip-skip-run: counter resets to '0 0' on clear" || bad "skip-skip-run: state got '$s'"
+[ "$ALERT_NOTIFY_CALLS" -eq 0 ] && [ "$ALERT_MAIL_CALLS" -eq 0 ] && ok "skip-skip-run: never alerted (streak cleared before reaching threshold)" || bad "skip-skip-run: unexpectedly alerted (notify=$ALERT_NOTIFY_CALLS mail=$ALERT_MAIL_CALLS)"
+# a NEW streak after the clear can alert again — one alert per streak, not one ever.
+_handle_gc_skip_streak 6000 1000 12000
+_handle_gc_skip_streak 6000 1000 12000
+_handle_gc_skip_streak 6000 1000 12000
+[ "$ALERT_NOTIFY_CALLS" -eq 1 ] && [ "$ALERT_MAIL_CALLS" -eq 1 ] && ok "skip-streak: a NEW streak after a clear alerts again at the 3rd skip" || bad "skip-streak: new streak got notify=$ALERT_NOTIFY_CALLS mail=$ALERT_MAIL_CALLS"
+rm -f "$GC_SKIP_STREAK_STATE"
+unset -f _dolt_gc_notify _dolt_gc_mail_mayor
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
