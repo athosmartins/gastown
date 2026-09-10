@@ -76,6 +76,25 @@ default_branch = "main"
 [rigs.imports.gastown]
 source = ".gc/system/packs/gastown"
 
+# ga-skuoh: refinery patrol's test_command needs WA's actual pytest venv, not
+# the Go-project default. mol-refinery-patrol's [vars.test_command] default is
+# intentionally empty in the canonical formula — this rig-scoped agent patch
+# is how WA supplies its own value AT POUR TIME instead of forking the whole
+# formula file (which is what caused it to drift 12 steps behind canonical;
+# see the bead for the full incident). Verified end-to-end via
+# `gc prime whatsapp_automation/gastown.refinery` before landing: the
+# rendered `gc bd mol wisp mol-refinery-patrol --var ...` line carries this
+# exact value as a literal --var flag, which wins over the formula's own
+# empty default. Requires the matching prompt.template.md var-plumbing
+# (agents/refinery/prompt.template.md, `--var test_command={{ .test_command }}`
+# on all 4 pour lines) — applied live to this city's on-disk pack copy
+# (gitignored, not tracked here) and staged for durability in
+# docs/pending-engine-window/ga-skuoh-refinery-test-command-var.patch so a
+# future pack re-materialization doesn't silently drop it.
+[[rigs.patches]]
+agent = "refinery"
+env = { test_command = "/Users/athos/gt/whatsapp_automation/venv/bin/python3 -m pytest tests/ -q" }
+
 [[rigs]]
 name = "deacon"
 prefix = "dc"
