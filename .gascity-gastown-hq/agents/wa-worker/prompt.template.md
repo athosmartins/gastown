@@ -185,7 +185,55 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # has drifted behind pilot-dispatcher.sh (ga-y8qh, ga-nf4x5, ga-en2s,
 # ga-uvfs6, ga-3lsy1, ga-7ha7g, ga-znlvl, ga-s1d5o, ga-6bghe, now this).
 # Regression coverage: pool-probe-text-veto-family.selftest.sh.
-bd ready --metadata-field "gc.routed_to=wa-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --json --sort oldest --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select((.labels // []) | map(select(startswith("blocked:"))) | length == 0) | select((.labels // []) | map(select(startswith("gate:needs-human"))) | length == 0) | select((.labels // []) | map(select(startswith("pilot:text-veto"))) | length == 0)] | .[:1]'
+#
+# ga-x80j1: --sort oldest (below) starved higher-priority routed beads. Step
+# 1b2 (.RoutedPoolQuery) is Go-rendered and GATED on GC_SESSION_ORIGIN=ephemeral
+# (ga-dbibq) — a Pilot-spawned worker (`gc session new`) gets a NON-ephemeral
+# origin, so Step 1b2 never runs for it and this Step 1b3 copy is the ONLY
+# query such a worker ever executes. `bd ready --help` documents --sort's
+# values as "priority (default), hybrid, oldest" — this line explicitly
+# overrode the sane default to raw creation-time FIFO, so any older
+# lower-priority routed bead beat a fresh P0 to the front of the line.
+# Verified live 2026-09-10 against the real WA routed-pool backlog:
+# --sort oldest put a priority=2 bead (wa-j4bzx, created 17:35) ahead of
+# five priority=1 beads created later. Matches the exact pattern reported
+# for wa-q947y (P0): dispatched twice, both times the spawned session
+# claimed a different, older, lower-priority routed bead instead
+# (wa-p2ozw, wa-nb4ie, wa-sq97b — see memory
+# wa-worker-title-stub-transcript-not-work-session for the transcript
+# trail). pilot-dispatcher.sh's own header already states the doctrine
+# this now matches: "PRIORITY DIRECTIVE (wa-tm2a): PRIORITY DOMINATES;
+# type is only a tiebreak."
+#
+# NOT a plain `--sort priority` swap: the engine's OWN routedReadyTierCommand
+# (internal/config/config.go, renders the gated Step 1b2 this file mirrors)
+# deliberately uses --sort oldest + a trailing `sort_by(.updated_at //
+# .created_at)` instead of priority — ga-w4k2z's comment there explains why:
+# a repeatedly-reclaimed bead's created_at never changes, so a pure static
+# sort (whether by age OR by priority) lets that ONE poisoned bead re-occupy
+# position 0 forever and starve every sibling behind it; sorting survivors by
+# updated_at (which every reclaim bumps) instead sends a just-reclaimed bead
+# to the BACK of the line each time. That fix is deliberate and evidence-based
+# (13 candidates over ~36h, only the head ever served) — copying it here
+# verbatim would just reinstate the ga-x80j1 bug (no priority-awareness at
+# all). So this line does BOTH: --sort priority bounds the fetched 20-candidate
+# window by priority (so a large low-priority backlog can never push a fresh
+# P0 out of the window before the jq filters even see it), and the jq tail's
+# `sort_by([.priority, (.updated_at // .created_at // "")])` re-sorts the
+# survivors with priority as the dominant key and ga-w4k2z's own LRU-by-
+# updated_at as the tiebreak WITHIN each priority tier — so a poisoned bead
+# still cedes its slot to same-priority siblings on repeat reclaims, and a
+# fresh high-priority bead is never buried behind an older low-priority one.
+# residual (not fixed here — flagging, not expanding scope): the engine's
+# routedReadyTierCommand itself has no priority-awareness at all, so a
+# genuinely-ephemeral-origin worker session (one that actually hits the
+# Go-rendered Step 1b2, unlike a Pilot-spawned one) still gets pure LRU
+# ordering with no priority signal. Bringing it in line with this same
+# compound approach is an engine-side change (out of pack-level reach, and
+# a real design tradeoff — see ga-w4k2z — that deserves human/Mayor review
+# rather than a dog unilaterally patching it) — flagged in the ga-x80j1 bead,
+# not fixed here. Regression coverage: pool-probe-priority-sort.selftest.sh.
+bd ready --metadata-field "gc.routed_to=wa-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --json --sort priority --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select((.labels // []) | map(select(startswith("blocked:"))) | length == 0) | select((.labels // []) | map(select(startswith("gate:needs-human"))) | length == 0) | select((.labels // []) | map(select(startswith("pilot:text-veto"))) | length == 0)] | sort_by([.priority, (.updated_at // .created_at // "")]) | .[:1]'
 # If it returns a bead (output is NOT []), THAT BEAD IS YOURS. Claim it FIRST:
 #     gc bd update <id> --claim
 # verify the claim set assignee to your session, then go to the Build Protocol and build it.
