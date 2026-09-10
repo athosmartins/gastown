@@ -192,8 +192,27 @@ _heal() {
 # The CLI wraps sessions in an envelope: {"filters":{},"ok":true,
 # "schema_version":"1","sessions":[...]}. NOT a bare array — see the ROOT
 # CAUSE NOTE in the file header for what assuming otherwise did to this probe.
+#
+# Also tracks _sessions_json_ok (1 = parsed successfully, 0 = the call
+# failed or returned something that isn't valid JSON) — third-state
+# discipline: an empty _sessions_json_cache from a FAILED call must never
+# read the same as "call succeeded, crew genuinely has no live session".
+# _live_sessions()/_session_identity() collapse both to "empty" either way
+# (safe for run_probe's existing skip-on-not-live path), but a caller that
+# would otherwise ACT on "identity changed" (run_resume_scan) must check
+# _sessions_json_ok first and skip instead of treating a transient `gc`
+# hiccup as proof of a restart.
+_sessions_json_ok=0
 _load_sessions_json() {
-  _sessions_json_cache=$("$GC" session list --json 2>/dev/null) || _sessions_json_cache=""
+  local raw
+  if raw=$("$GC" session list --json 2>/dev/null) && [ -n "$raw" ] \
+      && printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
+    _sessions_json_cache="$raw"
+    _sessions_json_ok=1
+  else
+    _sessions_json_cache=""
+    _sessions_json_ok=0
+  fi
 }
 
 _live_sessions() {
@@ -358,7 +377,23 @@ run_resume_scan() {
   [ "$CLP_HEAL_ENABLED" = "1" ] || { log "resume-scan skipped (CLP_HEAL_ENABLED!=1)"; return 0; }
   [ -d "$CLP_STATE_DIR" ] || return 0
   _load_sessions_json
-  local mf crew suspended_at bead store ident_then ident_now now_suspended resumed=0
+  # Third state: a FAILED/unparseable `gc session list --json` must not read
+  # the same as "call succeeded, crew has no live session" — the latter
+  # would fall through to _session_identity() returning empty, which
+  # compares as "changed" against a non-empty ident_then and would auto-
+  # resume a crew that, for all we actually know, is still exactly as
+  # wedged as when it was suspended. Skip the whole cycle instead; every
+  # marker is untouched and gets a fair look again in ~10 minutes.
+  if [ "$_sessions_json_ok" != "1" ]; then
+    log "resume-scan: gc session list --json failed/unparseable this cycle — skipping (inconclusive, not treating as 'crew restarted')"
+    return 0
+  fi
+  local mf crew suspended_at bead store ident_then ident_now now_suspended agent_list_json resumed=0
+  agent_list_json=$("$GC" -C "$CLP_CITY" agent list --json 2>/dev/null)
+  if [ -z "$agent_list_json" ] || ! printf '%s' "$agent_list_json" | jq -e . >/dev/null 2>&1; then
+    log "resume-scan: gc agent list --json failed/unparseable this cycle — skipping (inconclusive, markers left untouched)"
+    return 0
+  fi
   for mf in "$CLP_STATE_DIR"/*.suspended-by-probe; do
     [ -e "$mf" ] || continue
     crew=$(basename "$mf" .suspended-by-probe)
@@ -370,8 +405,10 @@ run_resume_scan() {
     # suspended, e.g. a marker survived a crash before suspend completed).
     # Either way, if it's not suspended anymore there's nothing to do —
     # clear the now-stale marker so the watchdog doesn't misread it later.
-    now_suspended=$("$GC" -C "$CLP_CITY" agent list --json 2>/dev/null \
-      | jq -r --arg n "$crew" '.agents[]? | select(.name == $n) | .suspended' 2>/dev/null)
+    # (The query itself was already validated above, once, for all crews —
+    # a per-crew "not found in the list" still means confirmed-not-suspended
+    # here, not inconclusive; only a failed/unparseable CALL is inconclusive.)
+    now_suspended=$(printf '%s' "$agent_list_json" | jq -r --arg n "$crew" '.agents[]? | select(.name == $n) | .suspended' 2>/dev/null)
     if [ "$now_suspended" != "true" ]; then
       log "resume-scan: $crew no longer suspended (resumed by someone else, or never took) — clearing stale marker"
       rm -f "$mf" 2>/dev/null || true
@@ -412,8 +449,15 @@ run_suspend_watchdog() {
   [ "$CLP_ENABLED" = "1" ] || return 0
   local agents_json alive_names name flagged=0
   agents_json=$("$GC" -C "$CLP_CITY" agent list --json 2>/dev/null)
-  [ -n "$agents_json" ] || return 0
+  if [ -z "$agents_json" ] || ! printf '%s' "$agents_json" | jq -e . >/dev/null 2>&1; then
+    log "watchdog: gc agent list --json failed/unparseable this cycle — skipping (inconclusive)"
+    return 0
+  fi
   _load_sessions_json
+  if [ "$_sessions_json_ok" != "1" ]; then
+    log "watchdog: gc session list --json failed/unparseable this cycle — skipping (inconclusive, cannot confirm liveness)"
+    return 0
+  fi
   alive_names=$(_live_sessions)
   while IFS= read -r name; do
     [ -n "$name" ] || continue
@@ -483,6 +527,10 @@ BDSHIM
 SID=\$(cat "${TMP}/session_id" 2>/dev/null || echo "sess-A")
 case "\$*" in
   *"session list --json"*)
+    # \$TMP/fail_session_list toggles a simulated transient CLI failure —
+    # third-state regression coverage (Scenario 18): must never read the
+    # same as "call succeeded, nobody's live".
+    [ -f "${TMP}/fail_session_list" ] && exit 1
     echo '{"filters":{},"ok":true,"schema_version":"1","sessions":[{"name":"mila-wa","id":"'"\$SID"'","created_at":"2026-01-01T00:00:00Z"}]}' ;;
   *"nudge"*) echo "\$*" >> "${NUDGE_LOG}" ;;
   *"agent suspend"*)
@@ -498,6 +546,8 @@ case "\$*" in
     mv "${TMP}/suspended_state.tmp" "${TMP}/suspended_state" 2>/dev/null || true
     ;;
   *"agent list --json"*)
+    # \$TMP/fail_agent_list — same idea, for Scenario 19.
+    [ -f "${TMP}/fail_agent_list" ] && exit 1
     if grep -qxF "mila-wa" "${TMP}/suspended_state" 2>/dev/null; then SUS=true; else SUS=false; fi
     echo '{"agents":[{"name":"mila-wa","suspended":'"\$SUS"'}]}'
     ;;
@@ -689,6 +739,37 @@ GCSHIM
   _is_committed_suspend "uncommitted-crew" && bad "17: uncommitted-crew's UNCOMMITTED suspend was wrongly treated as deliberate (this is the ga-ld0ch shape — must stay flaggable)" || ok "17: uncommitted-crew correctly identified as NOT committed"
   _is_committed_suspend "no-such-crew" && bad "17: a nonexistent agent.toml was wrongly treated as committed-suspended" || ok "17: missing agent.toml fails closed to 'not committed'"
   CLP_FRAMEWORK_REPO="$TMP"
+
+  echo ""
+  echo "=== Scenario 18: resume-scan skips (does NOT resume, does NOT touch the marker) when gc session list --json fails ==="
+  : > "$RESUME_LOG"
+  _record_heal_marker "mila-wa" "wa-stale" "$TMP" "sess-B"   # a marker resume-scan would normally act on
+  touch "$TMP/fail_session_list"
+  run_resume_scan
+  rm -f "$TMP/fail_session_list"
+  [ -s "$RESUME_LOG" ] && bad "18: resumed a crew despite gc session list --json having failed (acted on inconclusive data)" || ok "18: no resume attempted while session data was inconclusive"
+  [ -f "$MARKER" ] && ok "18: marker left untouched (not discarded) on inconclusive session data" || bad "18: marker was wrongly cleared despite the query having failed, not confirmed"
+
+  echo ""
+  echo "=== Scenario 19: resume-scan skips (does NOT clear the marker) when gc agent list --json fails ==="
+  : > "$RESUME_LOG"
+  # marker from Scenario 18 is still there (untouched, as just proven); leave it
+  touch "$TMP/fail_agent_list"
+  run_resume_scan
+  rm -f "$TMP/fail_agent_list"
+  [ -s "$RESUME_LOG" ] && bad "19: resumed a crew despite gc agent list --json having failed" || ok "19: no resume attempted while agent-list data was inconclusive"
+  [ -f "$MARKER" ] && ok "19: marker left untouched — a failed query was NOT read as 'confirmed not suspended anymore'" || bad "19: marker was wrongly cleared on a failed (not confirmed-negative) agent list query"
+  rm -f "$MARKER" 2>/dev/null
+
+  echo ""
+  echo "=== Scenario 20: watchdog does not fire (and does not falsely clear anything) when session data is inconclusive ==="
+  : > "$NOTIFY_LOG"
+  rm -f "$CLP_STATE_DIR"/mila-wa.suspended-by-probe "$CLP_STATE_DIR"/mila-wa.watchdog-notified 2>/dev/null
+  echo "mila-wa" > "$TMP/suspended_state"   # suspended+no-marker — would normally fire (Scenario 14's shape)
+  touch "$TMP/fail_session_list"
+  run_suspend_watchdog
+  rm -f "$TMP/fail_session_list"
+  [ -s "$NOTIFY_LOG" ] && bad "20: watchdog notified despite being unable to confirm liveness (acted on inconclusive data)" || ok "20: watchdog stayed silent while session data was inconclusive, rather than guessing"
 
   echo ""
   echo "crew-liveness-probe selftest: PASS=$PASS FAIL=$FAIL"
