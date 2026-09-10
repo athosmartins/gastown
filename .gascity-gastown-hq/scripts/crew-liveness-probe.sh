@@ -100,6 +100,9 @@ CLP_FRAMEWORK_REPO="${CLP_FRAMEWORK_REPO:-/Users/athos/gt}"
 # Cache for `gc session list --json`, loaded once per top-level call via
 # _load_sessions_json() and read by _live_sessions() / _session_identity().
 _sessions_json_cache=""
+# Cache for `gc agent list --json`, loaded once per top-level call via
+# _load_agent_list_json() and read by run_resume_scan() / run_suspend_watchdog().
+_agent_list_json_cache=""
 
 ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || true; echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
@@ -177,7 +180,7 @@ _heal() {
   # the crew is wedged. run_resume_scan() auto-resumes it once its session
   # identity changes (proof of restart — the actual cure, per ga-ld0ch); `gc
   # agent resume <name>` also works manually at any time.
-  if "$GC" -C "$CLP_CITY" agent suspend "$crew" 2>/dev/null; then
+  if "$GC" --city "$CLP_CITY" agent suspend "$crew" 2>/dev/null; then
     log "  HEAL: suspended crew agent $crew"
     _record_heal_marker "$crew" "$bead" "$store" "$ident"
     _comment_bead "$store" "$bead" "crew-liveness-probe: suspended crew agent '$crew' after 2 confirmed sweeps with no commit activity on this bead (>= ${CLP_PROBE_STALE_MIN}min stale, reconfirmed >= ${CLP_CONFIRM_MIN}min later). Bead unassigned and reopened for dispatch. '$crew' auto-resumes once its session restarts (new session identity detected), or resume manually: gc agent resume $crew"
@@ -212,6 +215,37 @@ _load_sessions_json() {
   else
     _sessions_json_cache=""
     _sessions_json_ok=0
+  fi
+}
+
+# _load_agent_list_json — cache `gc agent list --json` once per call site.
+# The CLI wraps agents in an envelope: {"agents":[...]}. Gate-fix (ga-ld0ch
+# review, attempt 2): with stderr suppressed, a FAILED call can still print
+# a well-formed, non-empty JSON object to stdout —
+# {"schema_version":"1","ok":false,"error":{"code":"command_failed",...}} —
+# so "non-empty and valid JSON" does NOT prove the call succeeded. Verified
+# live against this exact binary: `gc -C <city> agent list --json` exits 1
+# and prints exactly that envelope (no .agents key); `gc --city <city> agent
+# list --json` is the invocation that actually works. Checking the command's
+# own exit status (like _load_sessions_json above already does) AND
+# requiring the expected .agents key closes both the wrong-flag bug and the
+# general "valid JSON, wrong shape" false-negative it exposed in the two
+# callers below — the prior guard there only checked emptiness/parseability.
+#
+# Also tracks _agent_list_json_ok (1 = parsed successfully AND has the
+# expected .agents key, 0 = the call failed, returned unparseable output, or
+# returned a differently-shaped envelope) — same third-state discipline as
+# _sessions_json_ok above.
+_agent_list_json_ok=0
+_load_agent_list_json() {
+  local raw
+  if raw=$("$GC" --city "$CLP_CITY" agent list --json 2>/dev/null) && [ -n "$raw" ] \
+      && printf '%s' "$raw" | jq -e 'type == "object" and has("agents") and (has("error") | not)' >/dev/null 2>&1; then
+    _agent_list_json_cache="$raw"
+    _agent_list_json_ok=1
+  else
+    _agent_list_json_cache=""
+    _agent_list_json_ok=0
   fi
 }
 
@@ -388,9 +422,9 @@ run_resume_scan() {
     log "resume-scan: gc session list --json failed/unparseable this cycle — skipping (inconclusive, not treating as 'crew restarted')"
     return 0
   fi
-  local mf crew suspended_at bead store ident_then ident_now now_suspended agent_list_json resumed=0
-  agent_list_json=$("$GC" -C "$CLP_CITY" agent list --json 2>/dev/null)
-  if [ -z "$agent_list_json" ] || ! printf '%s' "$agent_list_json" | jq -e . >/dev/null 2>&1; then
+  local mf crew suspended_at bead store ident_then ident_now now_suspended resumed=0
+  _load_agent_list_json
+  if [ "$_agent_list_json_ok" != "1" ]; then
     log "resume-scan: gc agent list --json failed/unparseable this cycle — skipping (inconclusive, markers left untouched)"
     return 0
   fi
@@ -408,7 +442,7 @@ run_resume_scan() {
     # (The query itself was already validated above, once, for all crews —
     # a per-crew "not found in the list" still means confirmed-not-suspended
     # here, not inconclusive; only a failed/unparseable CALL is inconclusive.)
-    now_suspended=$(printf '%s' "$agent_list_json" | jq -r --arg n "$crew" '.agents[]? | select(.name == $n) | .suspended' 2>/dev/null)
+    now_suspended=$(printf '%s' "$_agent_list_json_cache" | jq -r --arg n "$crew" '.agents[]? | select(.name == $n) | .suspended' 2>/dev/null)
     if [ "$now_suspended" != "true" ]; then
       log "resume-scan: $crew no longer suspended (resumed by someone else, or never took) — clearing stale marker"
       rm -f "$mf" 2>/dev/null || true
@@ -420,7 +454,7 @@ run_resume_scan() {
       log "resume-scan: $crew session identity changed ('$ident_then' -> '$ident_now') — treating as restarted, auto-resuming"
       if [ "$CLP_DRY_RUN" = "1" ]; then
         log "  DRY: would resume $crew"
-      elif "$GC" -C "$CLP_CITY" agent resume "$crew" 2>/dev/null; then
+      elif "$GC" --city "$CLP_CITY" agent resume "$crew" 2>/dev/null; then
         log "  RESUME: resumed crew agent $crew (was suspended for bead $bead)"
         _comment_bead "$store" "$bead" "crew-liveness-probe: auto-resumed '$crew' — its session identity changed since the suspend ($ident_then -> $ident_now), consistent with a restart."
         notify_info "crew-liveness-probe: retomei $crew (sessao mudou desde a suspensao — parece reiniciada)"
@@ -447,9 +481,9 @@ run_resume_scan() {
 # CLP_ENABLED alone (no heal knob needed — it never mutates agent state).
 run_suspend_watchdog() {
   [ "$CLP_ENABLED" = "1" ] || return 0
-  local agents_json alive_names name flagged=0
-  agents_json=$("$GC" -C "$CLP_CITY" agent list --json 2>/dev/null)
-  if [ -z "$agents_json" ] || ! printf '%s' "$agents_json" | jq -e . >/dev/null 2>&1; then
+  local alive_names name flagged=0
+  _load_agent_list_json
+  if [ "$_agent_list_json_ok" != "1" ]; then
     log "watchdog: gc agent list --json failed/unparseable this cycle — skipping (inconclusive)"
     return 0
   fi
@@ -474,7 +508,7 @@ run_suspend_watchdog() {
       _record_watchdog_notify "$name"
       flagged=$(( flagged + 1 ))
     fi
-  done < <(printf '%s' "$agents_json" | jq -r '.agents[]? | select(.suspended == true) | .name' 2>/dev/null)
+  done < <(printf '%s' "$_agent_list_json_cache" | jq -r '.agents[]? | select(.suspended == true) | .name' 2>/dev/null)
   [ "$flagged" -gt 0 ] && log "watchdog: flagged $flagged suspended-but-live agent(s) with no probe marker"
   return 0
 }
@@ -539,6 +573,21 @@ case "\$*" in
     [ -f "${TMP}/extra_session_name" ] && EXTRA_SESSION=',{"name":"'"\$(cat "${TMP}/extra_session_name")"'","id":"sess-extra","created_at":"2026-01-01T00:00:00Z"}'
     echo '{"filters":{},"ok":true,"schema_version":"1","sessions":[{"name":"mila-wa","id":"'"\$SID"'","created_at":"2026-01-01T00:00:00Z"}'"\$EXTRA_SESSION"']}' ;;
   *"nudge"*) echo "\$*" >> "${NUDGE_LOG}" ;;
+  *"-C "*"agent suspend"*|*"-C "*"agent resume"*|*"-C "*"agent list --json"*)
+    # Gate-fix (ga-ld0ch review, attempt 2): the real gc binary rejects the
+    # -C shorthand outright ("unknown shorthand flag: 'C' in -C") — verified
+    # live against this exact binary, --city is the only flag that works.
+    # agent list --json additionally prints a well-formed JSON error
+    # envelope to stdout despite exiting 1; that exact shape (valid JSON,
+    # non-empty, but no .agents key) is what slipped past the pre-fix guard.
+    # Mirroring both here means a regression back to -C fails scenarios
+    # instead of silently continuing to "pass" against a stale mock.
+    case "\$*" in
+      *"agent list --json"*)
+        echo '{"schema_version":"1","ok":false,"error":{"code":"command_failed","message":"command failed; see stderr for diagnostics","exit_code":1}}' ;;
+    esac
+    exit 1
+    ;;
   *"agent suspend"*)
     [ -f "${TMP}/fail_suspend" ] && exit 1
     echo "\$*" >> "${SUSPEND_LOG}"
@@ -552,8 +601,18 @@ case "\$*" in
     mv "${TMP}/suspended_state.tmp" "${TMP}/suspended_state" 2>/dev/null || true
     ;;
   *"agent list --json"*)
-    # \$TMP/fail_agent_list — same idea, for Scenario 19.
+    # \$TMP/fail_agent_list — same idea, for Scenario 19: a totally empty
+    # response (the OLD guard's only recognized failure shape).
     [ -f "${TMP}/fail_agent_list" ] && exit 1
+    # \$TMP/agent_list_bad_shape — Scenario 22/23: a well-formed, non-empty
+    # JSON error envelope (the shape a wrong flag actually produces — see
+    # above). Exercises the NEW guard's shape check independent of the flag
+    # fix, since a future gc change could reintroduce this failure mode
+    # through a different flag or transient backend error.
+    if [ -f "${TMP}/agent_list_bad_shape" ]; then
+      echo '{"schema_version":"1","ok":false,"error":{"code":"command_failed","message":"command failed; see stderr for diagnostics","exit_code":1}}'
+      exit 1
+    fi
     if grep -qxF "mila-wa" "${TMP}/suspended_state" 2>/dev/null; then SUS=true; else SUS=false; fi
     EXTRA_AGENT=""
     [ -f "${TMP}/extra_agent_name" ] && EXTRA_AGENT=',{"name":"'"\$(cat "${TMP}/extra_agent_name")"'","suspended":true}'
@@ -788,6 +847,27 @@ GCSHIM
   run_suspend_watchdog
   grep -qi "gate-reviewer" "$NOTIFY_LOG" && bad "21: watchdog false-fired for gate-reviewer via substring match against gate-reviewer-adhoc-9f3a1c2 (unanchored grep -qF regression)" || ok "21: watchdog correctly required an exact name match, not a substring"
   rm -f "$TMP/extra_agent_name" "$TMP/extra_session_name"
+
+  echo ""
+  echo "=== Scenario 22: resume-scan skips (does NOT clear the marker) when gc agent list --json returns a well-formed error envelope, not just when it's empty (ga-ld0ch gate-fix 2: -C exits 1 with valid non-empty JSON, no .agents key — that shape previously slipped past the emptiness-only guard) ==="
+  : > "$RESUME_LOG"
+  _record_heal_marker "mila-wa" "wa-stale" "$TMP" "sess-B"
+  touch "$TMP/agent_list_bad_shape"
+  run_resume_scan
+  rm -f "$TMP/agent_list_bad_shape"
+  [ -s "$RESUME_LOG" ] && bad "22: resumed a crew despite gc agent list --json returning a well-formed error envelope" || ok "22: no resume attempted on a well-formed-but-wrong-shape agent-list response"
+  [ -f "$MARKER" ] && ok "22: marker left untouched — a non-empty valid-JSON error envelope was NOT read as 'confirmed not suspended anymore'" || bad "22: marker was wrongly cleared on an error envelope (valid JSON but no .agents key)"
+  rm -f "$MARKER" 2>/dev/null
+
+  echo ""
+  echo "=== Scenario 23: watchdog does not fire (and does not misread a well-formed error envelope as 'nobody suspended') when gc agent list --json returns that shape (ga-ld0ch gate-fix 2) ==="
+  : > "$NOTIFY_LOG"
+  rm -f "$CLP_STATE_DIR"/mila-wa.suspended-by-probe "$CLP_STATE_DIR"/mila-wa.watchdog-notified 2>/dev/null
+  echo "mila-wa" > "$TMP/suspended_state"   # would normally fire (Scenario 14's shape)
+  touch "$TMP/agent_list_bad_shape"
+  run_suspend_watchdog
+  rm -f "$TMP/agent_list_bad_shape"
+  [ -s "$NOTIFY_LOG" ] && bad "23: watchdog notified despite gc agent list --json returning a well-formed error envelope (acted on inconclusive data)" || ok "23: watchdog stayed silent on a well-formed-but-wrong-shape agent-list response, rather than guessing"
 
   echo ""
   echo "crew-liveness-probe selftest: PASS=$PASS FAIL=$FAIL"
