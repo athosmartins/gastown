@@ -208,14 +208,54 @@ _heal() {
   fi
 }
 
-# _load_sessions_json — cache `gc session list --json` once per call site.
-# The CLI wraps sessions in an envelope: {"filters":{},"ok":true,
-# "schema_version":"1","sessions":[...]}. NOT a bare array — see the ROOT
-# CAUSE NOTE in the file header for what assuming otherwise did to this probe.
+# _load_gc_json key cmd... — the ONE function every `gc ... --json` response
+# in this script is read through. Runs the given command and, only if ALL of
+# the following hold, prints its raw stdout and returns 0: exit status 0,
+# non-empty output, valid JSON, top-level object, `.ok` is not explicitly
+# false, no `.error` key, and the caller's required top-level key ($1) is
+# present. Otherwise prints nothing and returns 1 — fail CLOSED, so a caller
+# can never mistake "inconclusive" for "confirmed empty/negative".
 #
-# Also tracks _sessions_json_ok (1 = parsed successfully, 0 = the call
-# failed or returned something that isn't valid JSON) — third-state
-# discipline: an empty _sessions_json_cache from a FAILED call must never
+# Gate-fix (ga-ld0ch, Mayor class-fix 2026-09-10T21:49Z): the same "valid
+# JSON, wrong/error shape read as success" gap was found and patched at the
+# INSTANCE level twice — attempt 2 hardened what is now _load_agent_list_json
+# below (the -C flag's well-formed-but-.agents-less error envelope); attempt
+# 4 found the identical gap in its sibling, what is now _load_sessions_json
+# (which attempt 2's fix never touched, since it only checked `jq -e .` —
+# valid-JSON-of-any-shape). Patching that 5th instance the same narrow way
+# would just repeat the pattern one more time. Every gc-JSON read in this
+# file now goes through this one function instead, so a future loader cannot
+# be born with the older, narrower check — enforced structurally by the
+# selftest's STRUCTURAL scenario below, not by convention alone.
+#
+# Real failure shapes this must reject (each modeled by a dedicated selftest
+# fixture, per loader — see Scenarios 27-34):
+#   1. exit != 0, empty stdout                    (e.g. a hard CLI crash)
+#   2. exit != 0, well-formed JSON error envelope  (e.g. the -C flag bug:
+#      {"ok":false,"error":{...}}, no payload key — valid JSON, wrong shape)
+#   3. exit 0, but `.ok == false`                  (a soft failure, no crash)
+#   4. exit 0, `.ok` true/absent, payload key simply missing
+_load_gc_json() {
+  local key="$1"; shift
+  local raw
+  raw=$("$@" 2>/dev/null) || return 1
+  [ -n "$raw" ] || return 1
+  printf '%s' "$raw" | jq -e --arg k "$key" \
+    'type == "object"
+     and ((has("ok") | not) or (.ok != false))
+     and (has("error") | not)
+     and has($k)' >/dev/null 2>&1 || return 1
+  printf '%s' "$raw"
+}
+
+# _load_sessions_json — cache `gc session list --json` once per call site,
+# via _load_gc_json above (required key: "sessions"). The CLI wraps sessions
+# in an envelope: {"filters":{},"ok":true,"schema_version":"1","sessions":
+# [...]}. NOT a bare array — see the ROOT CAUSE NOTE in the file header for
+# what assuming otherwise did to this probe.
+#
+# _sessions_json_ok tracks the same third-state discipline _load_gc_json
+# documents: an empty _sessions_json_cache from a FAILED call must never
 # read the same as "call succeeded, crew genuinely has no live session".
 # _live_sessions()/_session_identity() collapse both to "empty" either way
 # (safe for run_probe's existing skip-on-not-live path), but a caller that
@@ -225,8 +265,7 @@ _heal() {
 _sessions_json_ok=0
 _load_sessions_json() {
   local raw
-  if raw=$("$GC" session list --json 2>/dev/null) && [ -n "$raw" ] \
-      && printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
+  if raw=$(_load_gc_json sessions "$GC" session list --json); then
     _sessions_json_cache="$raw"
     _sessions_json_ok=1
   else
@@ -235,29 +274,19 @@ _load_sessions_json() {
   fi
 }
 
-# _load_agent_list_json — cache `gc agent list --json` once per call site.
-# The CLI wraps agents in an envelope: {"agents":[...]}. Gate-fix (ga-ld0ch
-# review, attempt 2): with stderr suppressed, a FAILED call can still print
-# a well-formed, non-empty JSON object to stdout —
-# {"schema_version":"1","ok":false,"error":{"code":"command_failed",...}} —
-# so "non-empty and valid JSON" does NOT prove the call succeeded. Verified
-# live against this exact binary: `gc -C <city> agent list --json` exits 1
-# and prints exactly that envelope (no .agents key); `gc --city <city> agent
-# list --json` is the invocation that actually works. Checking the command's
-# own exit status (like _load_sessions_json above already does) AND
-# requiring the expected .agents key closes both the wrong-flag bug and the
-# general "valid JSON, wrong shape" false-negative it exposed in the two
-# callers below — the prior guard there only checked emptiness/parseability.
+# _load_agent_list_json — cache `gc agent list --json` once per call site,
+# via _load_gc_json above (required key: "agents"). Gate-fix (ga-ld0ch
+# review, attempt 2): verified live that `gc -C <city> agent list --json`
+# exits 1 printing a well-formed error envelope (no .agents key), while
+# `gc --city <city> agent list --json` is the invocation that actually
+# works — hence the explicit --city below.
 #
-# Also tracks _agent_list_json_ok (1 = parsed successfully AND has the
-# expected .agents key, 0 = the call failed, returned unparseable output, or
-# returned a differently-shaped envelope) — same third-state discipline as
-# _sessions_json_ok above.
+# _agent_list_json_ok tracks the same third-state discipline as
+# _sessions_json_ok above (1 = parsed AND has .agents, 0 = anything else).
 _agent_list_json_ok=0
 _load_agent_list_json() {
   local raw
-  if raw=$("$GC" --city "$CLP_CITY" agent list --json 2>/dev/null) && [ -n "$raw" ] \
-      && printf '%s' "$raw" | jq -e 'type == "object" and has("agents") and (has("error") | not)' >/dev/null 2>&1; then
+  if raw=$(_load_gc_json agents "$GC" --city "$CLP_CITY" agent list --json); then
     _agent_list_json_cache="$raw"
     _agent_list_json_ok=1
   else
@@ -597,6 +626,22 @@ case "\$*" in
     # third-state regression coverage (Scenario 18): must never read the
     # same as "call succeeded, nobody's live".
     [ -f "${TMP}/fail_session_list" ] && exit 1
+    # \$TMP/session_list_bad_shape — shape 2 (ga-ld0ch Mayor class-fix,
+    # Scenario 27): exit 1 with a well-formed JSON error envelope, mirroring
+    # agent_list_bad_shape below. _load_gc_json is now the single path both
+    # loaders share, so it must fail closed on this shape for EITHER caller,
+    # not just the one (agent list, via the -C bug) that happened to
+    # produce it live first.
+    if [ -f "${TMP}/session_list_bad_shape" ]; then
+      echo '{"schema_version":"1","ok":false,"error":{"code":"command_failed","message":"command failed; see stderr for diagnostics","exit_code":1}}'
+      exit 1
+    fi
+    # \$TMP/session_list_ok_false — shape 3 (Scenario 28): exit 0, but
+    # ok:false — a soft failure with no crash at all.
+    [ -f "${TMP}/session_list_ok_false" ] && { echo '{"filters":{},"ok":false,"schema_version":"1","sessions":[]}'; exit 0; }
+    # \$TMP/session_list_missing_key — shape 4 (Scenario 29): exit 0, valid
+    # JSON object, ok:true, but the required "sessions" key is simply absent.
+    [ -f "${TMP}/session_list_missing_key" ] && { echo '{"filters":{},"ok":true,"schema_version":"1"}'; exit 0; }
     EXTRA_SESSION=""
     [ -f "${TMP}/extra_session_name" ] && EXTRA_SESSION=',{"name":"'"\$(cat "${TMP}/extra_session_name")"'","id":"sess-extra","created_at":"2026-01-01T00:00:00Z"}'
     echo '{"filters":{},"ok":true,"schema_version":"1","sessions":[{"name":"mila-wa","id":"'"\$SID"'","created_at":"2026-01-01T00:00:00Z"}'"\$EXTRA_SESSION"']}' ;;
@@ -647,6 +692,12 @@ case "\$*" in
       echo '{"schema_version":"1","ok":false,"error":{"code":"command_failed","message":"command failed; see stderr for diagnostics","exit_code":1}}'
       exit 1
     fi
+    # \$TMP/agent_list_ok_false — shape 3 (Scenario 32): exit 0, but
+    # ok:false — no .error key, a softer failure than agent_list_bad_shape.
+    [ -f "${TMP}/agent_list_ok_false" ] && { echo '{"schema_version":"1","ok":false,"agents":[]}'; exit 0; }
+    # \$TMP/agent_list_missing_key — shape 4 (Scenario 33): exit 0, valid
+    # JSON object, but no "agents" key at all.
+    [ -f "${TMP}/agent_list_missing_key" ] && { echo '{"schema_version":"1","ok":true}'; exit 0; }
     if grep -qxF "mila-wa" "${TMP}/suspended_state" 2>/dev/null; then SUS=true; else SUS=false; fi
     EXTRA_AGENT=""
     [ -f "${TMP}/extra_agent_name" ] && EXTRA_AGENT=',{"name":"'"\$(cat "${TMP}/extra_agent_name")"'","suspended":true}'
@@ -933,6 +984,107 @@ GCSHIM
   [ -f "$MARKER25" ] && ok "25: marker preserved after a failed resume (next cycle can retry)" || bad "25: marker wrongly cleared despite gc agent resume failing"
   grep -qi "mila-wa" "$NOTIFY_LOG" && ok "25: failed resume triggered a notify_fail (silence-is-not-success)" || bad "25: expected a notify_fail when gc agent resume fails"
   rm -f "$MARKER25" 2>/dev/null
+
+  echo ""
+  echo "=== Scenario 26: _load_sessions_json fails closed — shape 1 (exit 1, empty output) ==="
+  touch "$TMP/fail_session_list"
+  _load_sessions_json
+  rm -f "$TMP/fail_session_list"
+  { [ "$_sessions_json_ok" = "0" ] && [ -z "$_sessions_json_cache" ]; } \
+    && ok "26: sessions loader failed closed on exit1+empty output" \
+    || bad "26: sessions loader did not fail closed on exit1+empty output (ok=$_sessions_json_ok)"
+
+  echo ""
+  echo "=== Scenario 27: _load_sessions_json fails closed — shape 2 (exit 1, well-formed error envelope) ==="
+  touch "$TMP/session_list_bad_shape"
+  _load_sessions_json
+  rm -f "$TMP/session_list_bad_shape"
+  { [ "$_sessions_json_ok" = "0" ] && [ -z "$_sessions_json_cache" ]; } \
+    && ok "27: sessions loader failed closed on exit1+error envelope" \
+    || bad "27: sessions loader did not fail closed on exit1+error envelope (ok=$_sessions_json_ok)"
+
+  echo ""
+  echo "=== Scenario 28: _load_sessions_json fails closed — shape 3 (exit 0, ok:false) ==="
+  touch "$TMP/session_list_ok_false"
+  _load_sessions_json
+  rm -f "$TMP/session_list_ok_false"
+  { [ "$_sessions_json_ok" = "0" ] && [ -z "$_sessions_json_cache" ]; } \
+    && ok "28: sessions loader failed closed on exit0+ok:false" \
+    || bad "28: sessions loader did not fail closed on exit0+ok:false (ok=$_sessions_json_ok)"
+
+  echo ""
+  echo "=== Scenario 29: _load_sessions_json fails closed — shape 4 (exit 0, valid object, missing .sessions key) ==="
+  touch "$TMP/session_list_missing_key"
+  _load_sessions_json
+  rm -f "$TMP/session_list_missing_key"
+  { [ "$_sessions_json_ok" = "0" ] && [ -z "$_sessions_json_cache" ]; } \
+    && ok "29: sessions loader failed closed on exit0+missing .sessions key" \
+    || bad "29: sessions loader did not fail closed on exit0+missing key (ok=$_sessions_json_ok)"
+
+  echo ""
+  echo "=== Scenario 30: _load_agent_list_json fails closed — shape 1 (exit 1, empty output) ==="
+  touch "$TMP/fail_agent_list"
+  _load_agent_list_json
+  rm -f "$TMP/fail_agent_list"
+  { [ "$_agent_list_json_ok" = "0" ] && [ -z "$_agent_list_json_cache" ]; } \
+    && ok "30: agent-list loader failed closed on exit1+empty output" \
+    || bad "30: agent-list loader did not fail closed on exit1+empty output (ok=$_agent_list_json_ok)"
+
+  echo ""
+  echo "=== Scenario 31: _load_agent_list_json fails closed — shape 2 (exit 1, well-formed error envelope) ==="
+  touch "$TMP/agent_list_bad_shape"
+  _load_agent_list_json
+  rm -f "$TMP/agent_list_bad_shape"
+  { [ "$_agent_list_json_ok" = "0" ] && [ -z "$_agent_list_json_cache" ]; } \
+    && ok "31: agent-list loader failed closed on exit1+error envelope" \
+    || bad "31: agent-list loader did not fail closed on exit1+error envelope (ok=$_agent_list_json_ok)"
+
+  echo ""
+  echo "=== Scenario 32: _load_agent_list_json fails closed — shape 3 (exit 0, ok:false) ==="
+  touch "$TMP/agent_list_ok_false"
+  _load_agent_list_json
+  rm -f "$TMP/agent_list_ok_false"
+  { [ "$_agent_list_json_ok" = "0" ] && [ -z "$_agent_list_json_cache" ]; } \
+    && ok "32: agent-list loader failed closed on exit0+ok:false" \
+    || bad "32: agent-list loader did not fail closed on exit0+ok:false (ok=$_agent_list_json_ok)"
+
+  echo ""
+  echo "=== Scenario 33: _load_agent_list_json fails closed — shape 4 (exit 0, valid object, missing .agents key) ==="
+  touch "$TMP/agent_list_missing_key"
+  _load_agent_list_json
+  rm -f "$TMP/agent_list_missing_key"
+  { [ "$_agent_list_json_ok" = "0" ] && [ -z "$_agent_list_json_cache" ]; } \
+    && ok "33: agent-list loader failed closed on exit0+missing .agents key" \
+    || bad "33: agent-list loader did not fail closed on exit0+missing key (ok=$_agent_list_json_ok)"
+
+  echo ""
+  echo "=== Scenario 34: _load_agent_list_json succeeds on the real success envelope (positive-path sanity, symmetric with Scenario 9's sessions-loader check — proves shapes 26-33 aren't passing by rejecting everything) ==="
+  : > "$TMP/suspended_state"
+  _load_agent_list_json
+  { [ "$_agent_list_json_ok" = "1" ] && printf '%s' "$_agent_list_json_cache" | jq -e 'has("agents")' >/dev/null 2>&1; } \
+    && ok "34: _load_agent_list_json() parsed the real {agents:[...]} envelope" \
+    || bad "34: _load_agent_list_json() failed against the real success envelope"
+
+  echo ""
+  echo "=== Scenario 35 (STRUCTURAL): every \"\$GC ... --json\" call in the script is routed through _load_gc_json (ga-ld0ch Mayor class-fix, 2026-09-10T21:49Z: locks the FORM so a future loader can't reintroduce the per-instance gap patched twice already — see _load_gc_json's own header) ==="
+  SELF_SRC="${BASH_SOURCE[0]}"
+  PROD_LINES=$(awk '/^# ── selftest/{exit} {print}' "$SELF_SRC")
+  JSON_GC_CALLS=$(printf '%s\n' "$PROD_LINES" | grep -F '$GC' | grep -F -- '--json')
+  UNROUTED=$(printf '%s\n' "$JSON_GC_CALLS" | grep -v '_load_gc_json')
+  if [ -n "$JSON_GC_CALLS" ] && [ -z "$UNROUTED" ]; then
+    ok "35: every \$GC ...--json call site in the script is routed through _load_gc_json"
+  else
+    bad "35: found a \$GC --json call NOT routed through _load_gc_json: ${UNROUTED:-(no call sites matched at all — detector may be broken, see 35b)}"
+  fi
+
+  # Mutation check — prove the detector above has teeth: a synthetic
+  # unrouted call must actually be flagged, not silently pass. Without this,
+  # Scenario 35 could pass vacuously (e.g. if the grep pattern itself broke).
+  MUTANT='  x=$("$GC" fake-command --json 2>/dev/null)'
+  MUTANT_HIT=$(printf '%s\n' "$MUTANT" | grep -F '$GC' | grep -F -- '--json' | grep -v '_load_gc_json')
+  [ -n "$MUTANT_HIT" ] \
+    && ok "35b: structural detector has teeth (flags a synthetic unrouted \$GC --json call)" \
+    || bad "35b: structural detector did NOT flag a synthetic unrouted call — Scenario 35 could pass vacuously"
 
   echo ""
   echo "crew-liveness-probe selftest: PASS=$PASS FAIL=$FAIL"
