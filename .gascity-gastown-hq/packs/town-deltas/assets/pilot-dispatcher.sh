@@ -6065,6 +6065,58 @@ _ownership_guard_should_refuse() {
   return 1
 }
 
+# _pilot_routed_to_pool_guard <story_id> <story_bead_city> <sling_target> —
+# ga-c9qj8: a bead that already carries gc.routed_to=<pool-identity> was
+# ALREADY promised to the pool by a PRIOR sweep. This sweep's own
+# BUILDER_TARGET selection (pick_pool_builder / ga-uvfs6's persistent-owner
+# override / the big-crew-owner path, all several bd/gc calls above the
+# call site) has no memory of that prior decision and can freely land on a
+# named crew instead — $_SLING_TARGET then falls into dispatch_one()'s crew
+# `*)` arm while the bead is still pool-committed. A crew session never runs
+# RoutedPoolQuery/pool-hook self-serve, so the bead is assigned+in_progress
+# to an agent that will never act on it: wa-vm94r carried
+# gc.routed_to=wa-worker, then a later sweep dispatched it to the live crew
+# batista-wa via this exact path, and it sat stuck ~3h until a human noticed
+# (ga-c9qj8, 2026-09-10). Neither ga-htjni nor ga-sndpm (the other dispatch_
+# one() ownership guards) catch this: both answer "does someone ELSE already
+# own this dispatch attempt", not "was this bead already promised to the
+# pool" — an orthogonal question this bead never gets asked before landing
+# on a crew.
+#
+# Only called from the crew `*)` arm — a $_SLING_TARGET that already matches
+# the pool pattern is self-consistent by construction and never reaches this
+# guard, so it takes no pool/crew classification of its own.
+#
+# Contract mirrors _ownership_guard_should_refuse: prints "routed_to:<value>"
+# and exits 0 when the caller should refuse; prints nothing and exits 1 when
+# dispatch may proceed. Re-reads FRESH via `bd show` (not the possibly
+# tens-of-seconds-stale $STORY captured before BUILDER_TARGET selection) —
+# same "never stale at the write" discipline as the ga-sndpm guard. Fail-
+# open: an unreadable/empty metadata field ⇒ no pool commitment found ⇒
+# proceed exactly as before this fix.
+_pilot_routed_to_pool_guard() {
+  local _bid="${1:-}" _city="${2:-}" _sling_target="${3:-}"
+  [ -n "$_bid" ] && [ -n "$_city" ] || return 1
+  # Self-contained: a target that IS already a pool identity is self-
+  # consistent by construction — never refuse it, regardless of caller.
+  # Keeps this function safe to call unconditionally rather than relying on
+  # "only ever invoked from the crew arm" as an implicit precondition.
+  case "$_sling_target" in
+    wa-worker*|ps-worker*|gastown.dog|gastown.dog-*) return 1 ;;
+  esac
+  local _routed_to
+  _routed_to=$(bd -C "$_city" show "$_bid" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | (.metadata["gc.routed_to"] // "")' \
+    2>/dev/null || echo "")
+  case "$_routed_to" in
+    wa-worker|ps-worker|gastown.dog)
+      printf 'routed_to:%s' "$_routed_to"
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 # _ns_label_blocks_release <labels_csv> — exit 0 (BLOCK release / KEEP) iff any
 # gate:* label OTHER than the story-level history markers gate:needs-fix /
 # gate:fix-attempt:N is present in the comma-joined label list. gate:needs-fix
@@ -6459,6 +6511,97 @@ STALE_INFLIGHT=$(( IN_FLIGHT_RAW_TOTAL - IN_FLIGHT_TOTAL ))
 if [ "$STALE_AGE" -gt 0 ] 2>/dev/null; then
   warn "Stale in-flight: ${STALE_AGE} bead(s) untouched > ${PILOT_STUCK_INFLIGHT_HOURS}h (hung builder?) — NOT counted as live occupants, freeing their slot(s) for pending work (ga-rk5va constraint c). Stale ids: $(echo "$IN_FLIGHT_RAW_JSON" | jq -r --argjson cutoff "$_STUCK_CUTOFF" '[.[] | ((.updated_at // "") | if . == "" then null else (try fromdateiso8601 catch null) end) as $e | select($e != null and $e <= $cutoff) | .id] | join(",")' 2>/dev/null || echo "?")"
 fi
+
+# ── Stage 1.5 — ga-c9qj8: crew-assignee stale reclaim ────────────────────────
+# Stage 1 above only frees the LANE-CAPACITY COUNT for an age-stale bead — by
+# design (see its comment): the stale bead "is NOT re-dispatched here ... so
+# freeing its slot only lets OTHER pending work flow". That is the right call
+# when the assignee is a POOL WORKER (wa-worker*/ps-worker*/gastown.dog*):
+# Stage 2 below has its own dead-session check for that case, and an
+# ephemeral pool identity self-heals via a fresh claim regardless. It is NOT
+# enough when the assignee is a NAMED CREW: crew sessions never run
+# RoutedPoolQuery/pool-hook self-serve, so a crew that simply never engaged
+# with a rig-natively-assigned bead stays wedged until a human notices —
+# Stage 1's count-only fix never touches the bead itself. Measured incident:
+# wa-vm94r sat ~3h assigned to batista-wa — a LIVE session the whole time, so
+# _neverstarted_recover_db's OWN live-crew-owner check (a DIFFERENT, correct
+# invariant for ITS use case: "an active crew builder owns it, don't touch")
+# left it alone too. Both existing mechanisms are individually correct for
+# what they check and still leave this bead stuck (ga-c9qj8, 2026-09-10).
+#
+# Reclaim ONLY when _beadid_branch_signal finds NO branch evidence at all
+# (empty output — "no crew/fix branch anywhere in the known repos", the same
+# discriminator ga-htjni/ga-sndpm already trust elsewhere in this file). A
+# live/unmerged branch (class "block") or a flagged-but-ambiguous one (class
+# "orphan", already surfaced for triage by _ownership_guard_flag_orphan_branch)
+# means SOME work artifact exists — leave it rather than risk unassigning a
+# crew that is genuinely mid-build with no bd activity. Deliberately narrower
+# than "any stale+crew-assigned bead": it only fires on the exact
+# never-engaged shape of the measured incident. Release recipe mirrors
+# _neverstarted_recover_db's proven one verbatim (same labels + metadata
+# cleared) so the bead is not just unassigned but actually re-dispatchable —
+# leaving pilot:dispatched behind would trip the ga-zzrts(c) duplicate guard
+# on the very next sweep and strand it a second way.
+#
+# _pilot_crew_stale_reclaim <in_flight_raw_json> <cutoff_epoch> — MUTATES bd
+# state for every bead it reclaims (side-effecting, same shape as the
+# sibling _neverstarted_recover_db/_mayor_deferred_hold_db scan functions).
+# Kill switch: PILOT_CREW_STALE_RECLAIM=0.
+_pilot_crew_stale_reclaim() {
+  local _in_flight_json="${1:-[]}" _cutoff="${2:-0}"
+  [ "${PILOT_CREW_STALE_RECLAIM:-1}" = "1" ] || return 0
+
+  # ga-c9qj8 (gate-done third-state self-audit): verify the branch-probe
+  # infrastructure itself is healthy BEFORE trusting any "no branch found"
+  # result below. An empty _beadid_branch_signal is ambiguous on its own —
+  # "genuinely no branch anywhere" and "the repo scan itself failed" (no
+  # git, gc rig list down) both surface as the same empty/exit-1 result to
+  # the caller. Reclaiming on the latter would unassign a bead a crew might
+  # genuinely be mid-build on — exactly the double-dispatch risk this whole
+  # function exists to avoid, and the DIRECT INVERSE of the direction that's
+  # actually safe here: _filter_built's own header comment calls its "keep
+  # on unresolved probe" default "the opposite of the reclaim-side
+  # fail-open" — this function IS that reclaim side. Skip the entire sweep
+  # this cycle rather than risk one bad reclaim; _ownership_guard_repos
+  # already exposes exactly this success/failure distinction via its own
+  # exit code, so reuse it instead of re-deriving it. Retries automatically
+  # next sweep once the probe infra recovers.
+  if ! _ownership_guard_repos >/dev/null; then
+    warn "ga-c9qj8: SKIPPING crew-stale reclaim sweep — branch-probe infrastructure unavailable (gc rig list failed), cannot distinguish 'no branch anywhere' from 'could not check'. Retrying next sweep."
+    return 0
+  fi
+
+  local _cs_stale_json
+  _cs_stale_json=$(echo "$_in_flight_json" | jq --argjson cutoff "$_cutoff" '
+    [ .[]
+      | ( ((.updated_at // "") | if . == "" then null else (try fromdateiso8601 catch null) end) ) as $e
+      | select($e != null and $e <= $cutoff)
+      | select((.assignee // "") != "") ]' 2>/dev/null || echo "[]")
+  local _cs_row _cs_id _cs_city _cs_assignee _cs_bs
+  while IFS= read -r _cs_row; do
+    [ -z "$_cs_row" ] && continue
+    _cs_id=$(printf '%s' "$_cs_row" | jq -r '.id // ""' 2>/dev/null)
+    _cs_city=$(printf '%s' "$_cs_row" | jq -r '._rig_db // ""' 2>/dev/null)
+    _cs_assignee=$(printf '%s' "$_cs_row" | jq -r '.assignee // ""' 2>/dev/null)
+    [ -z "$_cs_id" ] || [ -z "$_cs_city" ] && continue
+    # Pool-worker assignees are OUT OF SCOPE for this reclaim (Stage 2 owns them).
+    case "$_cs_assignee" in
+      gastown.dog|gastown.dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*) continue ;;
+    esac
+    _cs_bs="$(_beadid_branch_signal "$_cs_id" "$_cs_row")"
+    if [ -z "$_cs_bs" ]; then
+      warn "ga-c9qj8: reclaiming stale in-flight $_cs_id — crew assignee '$_cs_assignee' untouched > ${PILOT_STUCK_INFLIGHT_HOURS}h with NO crew/fix branch found anywhere (never engaged). Unassigning + clearing story:in-flight so it returns to the pool instead of staying wedged (set PILOT_CREW_STALE_RECLAIM=0 to disable)."
+      bd -C "$_cs_city" label  remove "$_cs_id" "story:in-flight"   -q 2>/dev/null || true
+      bd -C "$_cs_city" label  remove "$_cs_id" "pilot:dispatched"  -q 2>/dev/null || true
+      bd -C "$_cs_city" label  remove "$_cs_id" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$_cs_city" assign "$_cs_id" "" -q 2>/dev/null || true
+      bd -C "$_cs_city" update "$_cs_id" --unset-metadata "pilot.dispatched_at"  -q 2>/dev/null || true
+      bd -C "$_cs_city" update "$_cs_id" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+      bd -C "$_cs_city" update "$_cs_id" --unset-metadata "pilot.sling_bead"     -q 2>/dev/null || true
+    fi
+  done < <(printf '%s' "$_cs_stale_json" | jq -c '.[]' 2>/dev/null)
+}
+_pilot_crew_stale_reclaim "$IN_FLIGHT_RAW_JSON" "$_STUCK_CUTOFF"
 
 if [ "$DEAD_WORKER" -gt 0 ] 2>/dev/null; then
   warn "Dead-worker in-flight: ${DEAD_WORKER} bead(s) whose builder session is gone — NOT counted as live occupants, freeing their slot(s) for pending work (ga-e5yw2). Dead ids: $(jq -rn --argjson a "$IN_FLIGHT_AGE_JSON" --argjson b "$IN_FLIGHT_JSON" '(($a|map(.id)) - ($b|map(.id))) | join(",")' 2>/dev/null || echo "?")"
@@ -8871,6 +9014,23 @@ TASK
         : # pool: leave UNASSIGNED + open so RoutedPoolQuery finds it (claim happens worker-side)
         ;;
       *)
+        # ── ga-c9qj8: a POOL-COMMITTED bead may only ever target a pool worker
+        # slot — never a named crew agent. See _pilot_routed_to_pool_guard's
+        # own header comment for the full incident (wa-vm94r, ~3h stuck in
+        # batista-wa) and why neither ga-htjni nor ga-sndpm above catch it
+        # (both scoped to "does someone ELSE already own this dispatch
+        # attempt", not "was this bead already promised to the pool").
+        if [ "${PILOT_ROUTED_TO_GUARD:-1}" = "1" ]; then
+          local _RT_REASON
+          _RT_REASON=$(_pilot_routed_to_pool_guard "$STORY_ID" "$STORY_BEAD_CITY" "$_SLING_TARGET" || echo "")
+          if [ -n "$_RT_REASON" ]; then
+            warn "ga-c9qj8: REFUSING crew dispatch of $STORY_ID to $_SLING_TARGET — bead already carries gc.$_RT_REASON from a prior sweep (pool-committed). A pool-routed bead may only target a pool worker slot, never a crew agent. Releasing claim so it stays pool-visible via RoutedPoolQuery instead of stranding on a crew that never self-serves (set PILOT_ROUTED_TO_GUARD=0 to disable)."
+            bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+            bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+            DISPATCH_RESULT="rig_native_pool_target_only"
+            return 1
+          fi
+        fi
         if ! timeout 15 bd -C "$STORY_BEAD_CITY" update "$STORY_ID" \
             --assignee "$_SLING_TARGET" --status in_progress -q 2>/dev/null; then
           warn "ga-mfeip: bd update --assignee failed for $STORY_ID → $_SLING_TARGET. Releasing claim."
