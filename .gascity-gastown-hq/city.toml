@@ -8,7 +8,15 @@ base = "builtin:claude"
 ready_delay_ms = 0
 [providers.claude-headless]
 base = "builtin:claude"
-args_append = ["--settings", "{\"remoteControlAtStartup\":false}", "--model", "sonnet"]
+# ga-rpejh: every claude-headless session otherwise inherits the full user-level
+# ~/.claude.json MCP roster (sqlite/playwright/puppeteer/sequential-thinking/etc.)
+# plus enabled plugins, unconditionally — ~30 extra child processes per session
+# that pool/ephemeral roles (dog, wa-worker, gate-reviewer, ps-worker, boot,
+# deacon, auto-refiner) almost never use. --strict-mcp-config with no
+# --mcp-config drops all of that, leaving zero MCP servers for this provider.
+# Scoped to claude-headless only: Mayor and human-attached crews stay on the
+# plain "claude" provider above and keep their full MCP surface untouched.
+args_append = ["--settings", "{\"remoteControlAtStartup\":false}", "--model", "sonnet", "--strict-mcp-config"]
 ready_delay_ms = 0
 
 [imports]
