@@ -462,7 +462,11 @@ run_suspend_watchdog() {
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     [ -f "$(_heal_marker_file "$name")" ] && continue   # already accounted for by resume-scan
-    echo "$alive_names" | grep -qF "$name" 2>/dev/null || continue   # not live — a different problem
+    # Exact match required: grep -F alone is an unanchored substring test, so a
+    # live session merely CONTAINING $name (e.g. "gate-reviewer-adhoc-<hash>"
+    # vs suspended agent "gate-reviewer") would false-positive as "live" —
+    # gate-fix for ga-ld0ch review, see Scenario 21.
+    printf '%s\n' "$alive_names" | grep -qxF "$name" 2>/dev/null || continue   # not live — a different problem
     _is_committed_suspend "$name" && continue   # deliberate, reviewed suspension — not an anomaly
     if _should_watchdog_notify "$name"; then
       log "WATCHDOG: $name is suspended=true with a LIVE session and no probe marker — unexplained suspension, invisible unless someone looks (ga-ld0ch shape)"
@@ -531,7 +535,9 @@ case "\$*" in
     # third-state regression coverage (Scenario 18): must never read the
     # same as "call succeeded, nobody's live".
     [ -f "${TMP}/fail_session_list" ] && exit 1
-    echo '{"filters":{},"ok":true,"schema_version":"1","sessions":[{"name":"mila-wa","id":"'"\$SID"'","created_at":"2026-01-01T00:00:00Z"}]}' ;;
+    EXTRA_SESSION=""
+    [ -f "${TMP}/extra_session_name" ] && EXTRA_SESSION=',{"name":"'"\$(cat "${TMP}/extra_session_name")"'","id":"sess-extra","created_at":"2026-01-01T00:00:00Z"}'
+    echo '{"filters":{},"ok":true,"schema_version":"1","sessions":[{"name":"mila-wa","id":"'"\$SID"'","created_at":"2026-01-01T00:00:00Z"}'"\$EXTRA_SESSION"']}' ;;
   *"nudge"*) echo "\$*" >> "${NUDGE_LOG}" ;;
   *"agent suspend"*)
     [ -f "${TMP}/fail_suspend" ] && exit 1
@@ -549,7 +555,9 @@ case "\$*" in
     # \$TMP/fail_agent_list — same idea, for Scenario 19.
     [ -f "${TMP}/fail_agent_list" ] && exit 1
     if grep -qxF "mila-wa" "${TMP}/suspended_state" 2>/dev/null; then SUS=true; else SUS=false; fi
-    echo '{"agents":[{"name":"mila-wa","suspended":'"\$SUS"'}]}'
+    EXTRA_AGENT=""
+    [ -f "${TMP}/extra_agent_name" ] && EXTRA_AGENT=',{"name":"'"\$(cat "${TMP}/extra_agent_name")"'","suspended":true}'
+    echo '{"agents":[{"name":"mila-wa","suspended":'"\$SUS"'}'"\$EXTRA_AGENT"']}'
     ;;
   *) true ;;
 esac
@@ -770,6 +778,16 @@ GCSHIM
   run_suspend_watchdog
   rm -f "$TMP/fail_session_list"
   [ -s "$NOTIFY_LOG" ] && bad "20: watchdog notified despite being unable to confirm liveness (acted on inconclusive data)" || ok "20: watchdog stayed silent while session data was inconclusive, rather than guessing"
+
+  echo ""
+  echo "=== Scenario 21: watchdog must not false-fire when a LIVE session's name merely CONTAINS a suspended agent's name as a substring (ga-ld0ch gate-fix: grep -qF was unanchored) ==="
+  : > "$NOTIFY_LOG"
+  rm -f "$CLP_STATE_DIR"/gate-reviewer.suspended-by-probe "$CLP_STATE_DIR"/gate-reviewer.watchdog-notified 2>/dev/null
+  echo "gate-reviewer" > "$TMP/extra_agent_name"                   # suspended=true, no live session of its own...
+  echo "gate-reviewer-adhoc-9f3a1c2" > "$TMP/extra_session_name"   # ...but a DIFFERENT live session containing its name as a substring
+  run_suspend_watchdog
+  grep -qi "gate-reviewer" "$NOTIFY_LOG" && bad "21: watchdog false-fired for gate-reviewer via substring match against gate-reviewer-adhoc-9f3a1c2 (unanchored grep -qF regression)" || ok "21: watchdog correctly required an exact name match, not a substring"
+  rm -f "$TMP/extra_agent_name" "$TMP/extra_session_name"
 
   echo ""
   echo "crew-liveness-probe selftest: PASS=$PASS FAIL=$FAIL"
