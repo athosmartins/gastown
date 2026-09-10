@@ -31,6 +31,19 @@ Idempotent: do_escalate() adds gate:needs-human, which removes the bead from
 this script's own candidate query on the next sweep — running this
 repeatedly on an already-escalated bead is a safe no-op.
 
+ga-wpdlg: a capped bead can carry a LIVE owner — e.g. wa-k9czz (P0,
+reclaim_count=3) was in_progress with assignee digo-wa, a live pinned
+session actively working the fix, when this sweep's dry-run would have
+marked it WOULD-ESCALATE. Applying gate:needs-human mid-fix-loop can hold
+up the owner's own resubmission. Before escalating, this script now skips
+any candidate whose assignee resolves to a live/active session — the SAME
+liveness notion inflight-reclaim-guard.py's run_cycle() uses to avoid
+reclaiming a live owner's bead, reached the same way this script already
+reaches do_escalate(): by calling the REAL functions (session_is_live /
+pool_has_live_worker / concrete_adhoc_session_is_live), never
+reimplementing the liveness check. A skipped bead is simply re-evaluated
+on the next sweep — if the owner is gone by then, it escalates normally.
+
 USO: python3 reclaim_cap_escalation_sweep.py [--dry-run]
      python3 reclaim_cap_escalation_sweep.py --selftest
 """
@@ -39,6 +52,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -48,6 +62,33 @@ if _spec is None or _spec.loader is None:  # pragma: no cover - defensive
     raise ImportError(f"cannot load guard module from {_SCRIPTS_DIR!r}")
 irg = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(irg)
+
+
+def _bead_has_live_owner(bead, sessions, now):
+    """Return True if `bead`'s assignee resolves to a live/active session.
+
+    ga-wpdlg: mirrors the exact routing inflight-reclaim-guard.py's
+    run_cycle() uses (bare pool template -> pool_has_live_worker; concrete
+    adhoc pool session -> concrete_adhoc_session_is_live; anything else ->
+    session_is_live) — calling those REAL functions rather than
+    reimplementing liveness, same design law this script already follows
+    for do_escalate().
+
+    sessions=None means `gc session list` failed this sweep — liveness is
+    UNKNOWN, not "no one's home". Fail-safe: treat as live so this sweep
+    never escalates over an owner it couldn't verify. A transient failure
+    just defers to the next sweep, same as any other skipped candidate.
+    """
+    if sessions is None:
+        return True
+    assignee = bead.get("assignee") or ""
+    if not assignee:
+        return False
+    if assignee in irg.EPHEMERAL_POOL_ASSIGNEES:
+        return irg.pool_has_live_worker(assignee, sessions, now)
+    if irg._is_ephemeral_pool_assignee(assignee):
+        return irg.concrete_adhoc_session_is_live(assignee, sessions, now)
+    return irg.session_is_live(assignee, sessions, now)
 
 
 def find_capped_beads_missing_needs_human():
@@ -63,6 +104,11 @@ def find_capped_beads_missing_needs_human():
     store's discovery query failed this sweep — fail-VISIBLE (the caller
     reports a non-zero exit / warning), never a silent partial scan
     misreported as complete.
+
+    ga-wpdlg: a bead that otherwise qualifies is still excluded if its
+    assignee resolves to a live/active session (see _bead_has_live_owner) —
+    escalating gate:needs-human onto a bead its live owner is actively
+    working can hold up that owner's own fix-and-resubmit loop.
     """
     candidates = []
     ok = True
@@ -74,6 +120,15 @@ def find_capped_beads_missing_needs_human():
         ok = False
     else:
         stores += list(_rig_stores)
+
+    sessions = irg.list_active_sessions()
+    if sessions is None:
+        print("WARN: gc session list failed — cannot verify live ownership "
+              "this sweep; skipping escalation for every candidate found "
+              "(fail-safe: never escalate over an owner of unknown liveness)",
+              file=sys.stderr, flush=True)
+        ok = False
+    now = time.time()
 
     for rig_name, rig_path in stores:
         cmd = ["bd"] + (["-C", rig_path] if rig_path else []) + [
@@ -110,6 +165,8 @@ def find_capped_beads_missing_needs_human():
             if count < irg.MAX_RECLAIMS:
                 continue
             if irg._has_needs_human_label(labels):
+                continue
+            if _bead_has_live_owner(b, sessions, now):
                 continue
             b = dict(b)
             b["rig_root"] = rig_path
@@ -161,6 +218,7 @@ def _selftest():
     _orig_do_escalate = irg.do_escalate
     _orig_find = find_capped_beads_missing_needs_human
     _orig_list_rig_stores = irg._list_rig_stores
+    _orig_list_active_sessions = irg.list_active_sessions
 
     _MAX = irg.MAX_RECLAIMS
 
@@ -181,6 +239,11 @@ def _selftest():
     _b6 = _bead("wa-cap6", [f"pilot:reclaim-count:{_MAX}"], rig_root="/fake/rig/whatsapp_automation")
 
     irg._list_rig_stores = lambda: [("whatsapp_automation", "/fake/rig/whatsapp_automation")]
+    # No live owners in play for SWEEP-1..7/CAND-1..6 — none of those fixtures
+    # carry an assignee, but stub this to a confirmed-empty (not None) session
+    # list anyway so this block never depends on the "sessions fetch failed"
+    # fail-safe path, which is tested explicitly further below (LIVE-4).
+    irg.list_active_sessions = lambda: []
 
     def _stub_run(cmd, **kw):
         class _R:
@@ -216,6 +279,7 @@ def _selftest():
     finally:
         subprocess.run = _orig_subprocess_run
         irg._list_rig_stores = _orig_list_rig_stores
+        irg.list_active_sessions = _orig_list_active_sessions
 
     # SWEEP-8 (self-audit finding): `bd list` can exit 0 with valid-but-wrong-
     # shaped JSON (e.g. an object instead of an array) on a malformed/changed
@@ -241,6 +305,92 @@ def _selftest():
     finally:
         subprocess.run = _orig_subprocess_run
         irg._list_rig_stores = _orig_list_rig_stores
+        irg.list_active_sessions = _orig_list_active_sessions
+
+    # --- LIVE: ga-wpdlg — a capped bead with a LIVE owner must NOT escalate ---
+    # Reproduces the measured incident shape: wa-k9czz (P0, reclaim_count=3,
+    # status=in_progress, assignee=digo-wa) had a live, pinned session
+    # actively fixing it when the pre-fix sweep's dry-run marked it
+    # WOULD-ESCALATE. These tests fail on pre-ga-wpdlg code (no liveness
+    # check existed at all — every capped/unlabeled bead was a candidate
+    # regardless of assignee) and pass after it.
+    import datetime as _dt
+    _now_live = time.time()
+    _fresh_ts = _dt.datetime.fromtimestamp(
+        _now_live - 60, tz=_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _run_live_case(bead, sessions):
+        """Run find_capped_beads_missing_needs_human() against exactly one
+        HQ candidate bead and a given (possibly None) session list."""
+        def _stub(cmd, **kw):
+            class _R:
+                def __init__(self, rc=0, out="[]"):
+                    self.returncode = rc
+                    self.stdout = out
+                    self.stderr = ""
+            if isinstance(cmd, (list, tuple)) and cmd[:2] == ["bd", "list"]:
+                return _R(0, json.dumps([bead]))
+            return _R(0, "[]")
+        irg._list_rig_stores = lambda: []
+        irg.list_active_sessions = lambda: sessions
+        subprocess.run = _stub
+        try:
+            candidates, ok = find_capped_beads_missing_needs_human()
+            return sorted(c.get("id", "") for c in candidates), ok
+        finally:
+            subprocess.run = _orig_subprocess_run
+            irg._list_rig_stores = _orig_list_rig_stores
+            irg.list_active_sessions = _orig_list_active_sessions
+
+    # LIVE-1: assignee is a concrete named session that IS live
+    # (state=active, fresh last_active) -> excluded.
+    _b7 = _bead("wa-live7", [f"pilot:reclaim-count:{_MAX}"])
+    _b7["assignee"] = "digo-wa"
+    _live_session_digo = [
+        {"id": "sess-digo-1", "name": "digo-wa", "session_name": "digo-wa",
+         "alias": "", "agent_name": "digo-wa", "state": "active",
+         "last_active": _fresh_ts},
+    ]
+    _cand_ids, _ok = _run_live_case(_b7, _live_session_digo)
+    check("LIVE-1: capped bead whose assignee resolves to a LIVE session is excluded",
+          "wa-live7" not in _cand_ids, f"cand_ids={_cand_ids!r}")
+
+    # LIVE-2: same assignee string, but no session in the list matches it
+    # (dead/absent owner) -> still a candidate, escalates normally.
+    _b8 = _bead("wa-live8", [f"pilot:reclaim-count:{_MAX}"])
+    _b8["assignee"] = "digo-wa"
+    _cand_ids, _ok = _run_live_case(_b8, [])
+    check("LIVE-2: capped bead whose assignee matches NO live session still escalates",
+          "wa-live8" in _cand_ids, f"cand_ids={_cand_ids!r}")
+
+    # LIVE-3: bare EPHEMERAL_POOL_ASSIGNEES template assignee (e.g.
+    # 'gastown.dog') with a live pool worker of that template -> excluded via
+    # pool_has_live_worker, NOT session_is_live (which would never match a
+    # bare template string against a concrete session identifier, and so
+    # would wrongly fail to protect it without the dedicated pool routing).
+    _pool_template = sorted(irg.EPHEMERAL_POOL_ASSIGNEES)[0]
+    _b9 = _bead("ga-live9", [f"pilot:reclaim-count:{_MAX}"])
+    _b9["assignee"] = _pool_template
+    _live_pool_session = [
+        {"template": _pool_template, "session_name": "dog-livehash",
+         "agent_name": "dog-livehash", "state": "active",
+         "id": "sid-pool1", "name": "gastown.dog-9", "alias": "",
+         "last_active": _fresh_ts},
+    ]
+    _cand_ids, _ok = _run_live_case(_b9, _live_pool_session)
+    check("LIVE-3: bare pool-template assignee with a live pool worker is excluded "
+          "(routed through pool_has_live_worker, not session_is_live)",
+          "ga-live9" not in _cand_ids, f"cand_ids={_cand_ids!r}")
+
+    # LIVE-4/5: `gc session list` itself fails (list_active_sessions() ->
+    # None) -> liveness is UNKNOWN, not "dead" -> fail-safe: nothing
+    # escalates this sweep, even an otherwise-clean candidate, and ok=False
+    # (visible, not silently reported as a clean empty scan).
+    _cand_ids, _ok = _run_live_case(_b1, None)
+    check("LIVE-4: gc session list failure -> nothing escalates (unknown liveness, fail-safe)",
+          _cand_ids == [], f"cand_ids={_cand_ids!r}")
+    check("LIVE-5: gc session list failure -> ok=False (visible, not silently clean)",
+          _ok is False, f"ok={_ok!r}")
 
     # ESCALATE-1: main() calls the REAL do_escalate() (not a reimplementation)
     # for each candidate, passing through reclaim_count and rig_root.
