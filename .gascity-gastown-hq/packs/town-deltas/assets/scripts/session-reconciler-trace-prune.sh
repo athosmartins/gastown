@@ -113,17 +113,25 @@ while IFS= read -r -d '' daydir; do
         *) log "SKIP (escapes segments root): $daydir -> $real_daydir"; SKIPPED=$((SKIPPED+1)); continue ;;
     esac
 
+    # "du failed" and "du confirmed 0 bytes" are different facts — only the
+    # second may feed the freed-space total; the first is reported as
+    # unknown rather than silently costed as zero.
     size_kb=$("$DU_BIN" -sk "$real_daydir" 2>/dev/null | awk '{print $1}')
-    case "$size_kb" in ''|*[!0-9]*) size_kb=0 ;; esac
+    size_known=1
+    case "$size_kb" in ''|*[!0-9]*) size_known=0 ;; esac
 
     if rm -rf "$real_daydir"; then
-        FREED_BYTES=$((FREED_BYTES + size_kb * 1024))
         REMOVED_DIRS=$((REMOVED_DIRS + 1))
-        log "removed $datestr ($daydir), ${size_kb}KB, age=${age_days}d"
+        if [ "$size_known" -eq 1 ]; then
+            FREED_BYTES=$((FREED_BYTES + size_kb * 1024))
+            log "removed $datestr ($daydir), ${size_kb}KB, age=${age_days}d"
+        else
+            log "removed $datestr ($daydir), size=unknown (du failed), age=${age_days}d"
+        fi
     else
         log "ERROR: failed to remove $real_daydir"
     fi
-done < <(find "$SEGMENTS_DIR" -mindepth 3 -maxdepth 3 -type d -print0 2>/dev/null)
+done < <(find "$SEGMENTS_DIR" -mindepth 3 -maxdepth 3 -type d -print0)
 
 # Sweep now-empty MM then YYYY skeletons. rmdir only succeeds on an empty
 # directory, so a month/year that still holds a live day is left untouched.
