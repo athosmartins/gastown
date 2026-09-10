@@ -1,0 +1,61 @@
+diff --git a/cmd/gc/dolt_cleanup_reaper.go b/cmd/gc/dolt_cleanup_reaper.go
+index 118a094..4a05218 100644
+--- a/cmd/gc/dolt_cleanup_reaper.go
++++ b/cmd/gc/dolt_cleanup_reaper.go
+@@ -202,6 +202,20 @@ func testConfigPathPrefixes() []string {
+ 		"gc-rename-",
+ 		"gcit-",
+ 		"gc-int-env-",
++		// cmd/bd test roots (third_party/beads, a separate Go module vendored
++		// into this one — its own test suite, not cmd/gc's). Prefixes mirror
++		// third_party/beads/scripts/clean-test-tmp.sh's canonical pattern list
++		// verbatim so the two allowlists can't drift apart again. Before this,
++		// a `dolt sql-server` orphaned by a SIGKILLed `go test
++		// -tags=integration ./cmd/bd/...` run fell through every branch above
++		// to "not on test-config-path allowlist" and was protected instead of
++		// reaped (ga-fqj42: confirmed live, 25-minute orphan holding 785MB).
++		"beads-bd-tests-",
++		"beads-shared-server-bd-",
++		"bd-testbin-",
++		"bd-init-test-",
++		"bd-init-permissions-test-",
++		"bd-embedded-init-test-",
+ 	}
+ }
+ 
+diff --git a/cmd/gc/dolt_cleanup_reaper_test.go b/cmd/gc/dolt_cleanup_reaper_test.go
+index 0d74d67..5f25a2b 100644
+--- a/cmd/gc/dolt_cleanup_reaper_test.go
++++ b/cmd/gc/dolt_cleanup_reaper_test.go
+@@ -97,6 +97,31 @@ func TestIsTestConfigPath_KnownGCTestPrefix(t *testing.T) {
+ 	}
+ }
+ 
++// TestIsTestConfigPath_BeadsModuleTestPrefixes — ga-fqj42: the cmd/bd test
++// suite (vendored under third_party/beads, a separate Go module) creates its
++// own dolt sql-server test fixtures directly under os.TempDir(), using the
++// prefixes documented in third_party/beads/scripts/clean-test-tmp.sh. Those
++// prefixes were never added here, so a orphaned test server surviving a
++// SIGKILLed `go test -tags=integration ./cmd/bd/...` run reads as "config
++// not on test-config-path allowlist" and gets protected instead of reaped
++// (measured live: 25-minute orphan, pid held 785MB, gc dolt-cleanup --force
++// refused it). Mirrors TestIsTestConfigPath_IntegrationTempPrefixes's shape.
++func TestIsTestConfigPath_BeadsModuleTestPrefixes(t *testing.T) {
++	cases := []string{
++		"/data/tmp/beads-bd-tests-1234567/.beads/dolt-config.yaml",
++		"/data/tmp/beads-shared-server-bd-9876543/.beads/dolt-config.yaml",
++		"/data/tmp/bd-testbin-42/.beads/dolt-config.yaml",
++		"/data/tmp/bd-init-test-42/.beads/dolt-config.yaml",
++		"/data/tmp/bd-init-permissions-test-42/.beads/dolt-config.yaml",
++		"/data/tmp/bd-embedded-init-test-42/.beads/dolt-config.yaml",
++	}
++	for _, p := range cases {
++		if !isTestConfigPath(p, "/home/u", "/data/tmp") {
++			t.Errorf("isTestConfigPath(%q) = false, want true (beads module test prefix)", p)
++		}
++	}
++}
++
+ func TestIsTestConfigPath_IntegrationTempPrefixes(t *testing.T) {
+ 	cases := []string{
+ 		"/tmp/gcit-123/cities/x/.gc/runtime/packs/dolt/dolt-config.yaml",
