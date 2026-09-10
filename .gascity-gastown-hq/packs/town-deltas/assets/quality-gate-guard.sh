@@ -1601,6 +1601,67 @@ session_matches_author() {
   fi
 }
 
+# reviewer_session_alive <assignee> <sessions_json>
+# Pure predicate — canonical liveness check for a GATE REVIEWER slot, sibling
+# of session_matches_author immediately above but with reviewer-appropriate
+# semantics. Echoes 1 iff <assignee> matches the session_name, name, alias,
+# id, or agent_name of some session in <sessions_json> that is both
+# non-closed and NOT in a reviewer-dead state; 0 otherwise (empty assignee,
+# no match, dead state, or unparseable JSON).
+#
+# ga-dkym6: quality-gate-guard.sh's reviewers_alive_for_run() (below) and
+# quality-gate-dispatcher.sh's Phase C dead-reviewer classifier each used to
+# implement their OWN reviewer-liveness check, and silently disagreed.
+# Dispatcher's matched the assignee against only `.id`/`.session_id` — but
+# `gc session list --json` never populates `.session_id` (confirmed empty on
+# every live row, measured 2026-09-10) and a reviewer's bd assignee is the
+# session_name-shaped value ga-bnu1 already documented for authors (e.g.
+# "gate-reviewer-adhoc-<hash>"), so dispatcher's check could never find a
+# name-identified reviewer present. Guard's own check DID match session_name
+# and correctly read the SAME reviewer alive across 18 consecutive sweeps /
+# 53 real minutes (quality-gate-guard.log, 2026-09-10 11:46-12:38) — not a
+# caching race (the session-list cache TTL is 8s, freshly re-fetched almost
+# every sweep), a genuine disagreement between two never-reconciled
+# predicates reading the identical session-list data. This function is now
+# the single source of truth; both files defer to it (reviewers_alive_for_run
+# below, and quality-gate-dispatcher.sh's Phase C classify loop via the
+# existing GATE_GUARD_LIB_ONLY sourcing that already wires up author_is_alive).
+#
+# Dead-states deliberately differ from session_matches_author's (that one is
+# for branch AUTHORS): "asleep" stays ALIVE here — quality-gate-dispatcher.sh's
+# session_is_dead already documents why, at length, with its own incident
+# history (a reviewer resting between turns getting reaped mid-review is a
+# previously-fixed false-FAIL this predicate must not reopen). "drained" (a
+# session whose process actually ended but the record lingers non-closed)
+# DOES count as dead for a reviewer, same as for an author.
+#
+# NOT the same function as session_alive_for_assignee (above, ga-u07fn) —
+# that one is a deliberately-separate, narrower helper for the unrelated
+# dead-verdict reaper a few hundred lines below (its own docstring explains
+# why it wasn't unified with reviewers_alive_for_run's inner loop either: one
+# change at a time, no bundled refactor of working code). It shares this
+# function's blind spot (no .state check at all, so a drained-but-listed
+# reviewer still reads alive there) but fixing that is a separate concern
+# from THIS bead's guard/dispatcher disagreement — left untouched here.
+# SELFTEST-EXTRACT reviewer-session-alive-fn: BEGIN
+reviewer_session_alive() {
+  local assignee="${1:-}" sessions_json="${2:-}"
+  [ -z "$assignee" ] && { echo 0; return 0; }
+  if printf '%s' "$sessions_json" | jq -e --arg a "$assignee" \
+       'def reviewer_dead_states: ["drained","closed","archived","quarantined","failed-create"];
+        [(if type=="array" then . else (.sessions // []) end)[]
+         | select(.closed != true)
+         | select((.state // "") as $s | ($s == "" or (reviewer_dead_states | index($s)) == null))
+         | (.session_name, .name, .alias, .id, .agent_name)]
+        | map(select(. != null and . != ""))
+        | index($a) != null' >/dev/null 2>&1; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+# SELFTEST-EXTRACT reviewer-session-alive-fn: END
+
 # _gate_delivery_header_class <line> — ga-1yxyt: classifies a single candidate
 # section-header line as "scope" (a SCOPE/WORK header: FIX PEDIDO,
 # ENTREGAVEIS, ESCOPO, CRITERIO DE ACEITE, O QUE FAZER), "diagnostic" (a
@@ -2529,7 +2590,12 @@ log "Step 0b: Vector B reconcile — orphan gate-run beads, running+claimed (TTL
 # zombie whose dispatcher died. (Live section only — uses bd/gc; never called in
 # lib-only mode, so it is intentionally NOT one of the drift-guarded pure fns.)
 reviewers_alive_for_run() {
-  local gr_id="$1" vbs assignees a present
+  local gr_id="$1" vbs assignees a
+  # ga-dkym6 #3: side-channel for the caller to log WHICH session sustained
+  # an alive=1 verdict. This function's own return value is stdout-captured
+  # via $(...), so it cannot log directly without corrupting that value —
+  # reset on every call so a stale match never leaks into a later 0 result.
+  REVIEWERS_ALIVE_MATCH=""
   [ -z "$gr_id" ] && { echo 0; return; }
   # ga-48xcv: routed through the read-cache shim — verdict_bead_count_for_run
   # below issues this identical query for the same gr_id earlier in the same
@@ -2543,13 +2609,15 @@ reviewers_alive_for_run() {
   [ -z "$assignees" ] && { echo 0; return; }
   for a in $assignees; do
     [ -z "$a" ] && continue
-    present=$(printf '%s\n' "$SESS_SNAP_JSON" \
-      | jq -r --arg s "$a" 'if type=="array" then . else (.sessions // []) end
-          | map(select((.id==$s) or (.session_name==$s) or (.session_id==$s))
-                | select((.closed // false) != true)) | length' \
-      2>/dev/null || echo 0)
-    case "$present" in ''|*[!0-9]*) present=0 ;; esac
-    [ "$present" -ge 1 ] && { echo 1; return; }
+    # ga-dkym6: delegates to the shared reviewer_session_alive() predicate
+    # (above the GATE_GUARD_LIB_ONLY cutoff) instead of this function's own
+    # inline match — see that function's docstring for why the two used to
+    # disagree with quality-gate-dispatcher.sh's Phase C classifier.
+    if [ "$(reviewer_session_alive "$a" "$SESS_SNAP_JSON")" = "1" ]; then
+      REVIEWERS_ALIVE_MATCH="$a"
+      echo 1
+      return
+    fi
   done
   echo 0
 }
@@ -2844,6 +2912,12 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
     REVIEWERS_ALIVE=1
     if [ "$MARKER_ACTIVE" = "1" ] && [ "$GR_AGE" -gt "$GATE_ZOMBIE_AGE_MINUTES" ]; then
       REVIEWERS_ALIVE=$(reviewers_alive_for_run "$GR_ID")
+      # ga-dkym6 #3: a 53-minute guard/dispatcher standoff on this exact run
+      # class left no record of WHICH session the guard was reading as alive
+      # — only the boolean. Log it whenever it's the reason this sweep skips.
+      if [ "$REVIEWERS_ALIVE" = "1" ] && [ -n "${REVIEWERS_ALIVE_MATCH:-}" ]; then
+        log "    reviewers_alive_for_run($GR_ID): alive via reviewer session '$REVIEWERS_ALIVE_MATCH'."
+      fi
     fi
 
     ACTION=$(reconcile_gaterun_action "$GR_AGE" "$GATE_RUN_TTL_MINUTES" "$MARKER_ACTIVE" "$GATE_ZOMBIE_AGE_MINUTES" "$REVIEWERS_ALIVE")

@@ -50,6 +50,15 @@ set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCHER="$SELF_DIR/quality-gate-dispatcher.sh"
+# ga-dkym6: phase-c-dead-reviewer-classify-fn now delegates to guard.sh's
+# reviewer_session_alive() (the real dispatcher sources it live via
+# GATE_GUARD_LIB_ONLY) instead of computing session_is_dead's inputs inline —
+# Part 4/7 below must inject it into their extracted-block harness too, or
+# the classify-fn text they eval calls an undefined command that silently
+# reads as empty/not-"1" (the exact root-class:error-vs-empty this whole
+# selftest file exists to catch) and happens to still match those parts'
+# all-dead fixtures for the wrong reason.
+GUARD="$SELF_DIR/quality-gate-guard.sh"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ✓ $1"; }
@@ -172,8 +181,9 @@ fi
 echo "── 4. phase-c-dead-reviewer-classify-fn: unreadable VB blocks the all-dead verdict ──"
 FN_CLASSIFY="$(extract_block "$DISPATCHER" "phase-c-dead-reviewer-classify-fn")"
 FN_SID2="$(extract_block "$DISPATCHER" "session-is-dead-fn")"
-if [ -z "$FN_CLASSIFY" ] || [ -z "$FN_SID2" ]; then
-  bad "could not extract phase-c-dead-reviewer-classify-fn or session-is-dead-fn — aborting Part 4"
+FN_REVALIVE_P4="$(extract_block "$GUARD" "reviewer-session-alive-fn")"
+if [ -z "$FN_CLASSIFY" ] || [ -z "$FN_SID2" ] || [ -z "$FN_REVALIVE_P4" ]; then
+  bad "could not extract phase-c-dead-reviewer-classify-fn, session-is-dead-fn, or reviewer-session-alive-fn — aborting Part 4"
 else
   run_classify() {
     local vb1_ok="$1"  # "ok" or "fail" — controls whether bd show for pc-vb-1 succeeds
@@ -198,6 +208,7 @@ else
       }
       warn() { echo "WARN: $*" >&2; }
       '"$FN_SID2"'
+      '"$FN_REVALIVE_P4"'
       '"$FN_CLASSIFY"'
       printf "RESULT|PC_ANY_PENDING=%s|PC_ALL_PENDING_DEAD=%s\n" "$PC_ANY_PENDING" "$PC_ALL_PENDING_DEAD"
     ' _ "$vb1_ok"
@@ -443,8 +454,9 @@ echo "── 7. phase-c-verdict-rehydrate capture + classify: unreadable assigne
 FN_REHYDRATE="$(extract_block "$DISPATCHER" "phase-c-verdict-rehydrate")"
 FN_CLASSIFY2="$(extract_block "$DISPATCHER" "phase-c-dead-reviewer-classify-fn")"
 FN_SID3="$(extract_block "$DISPATCHER" "session-is-dead-fn")"
-if [ -z "$FN_REHYDRATE" ] || [ -z "$FN_CLASSIFY2" ] || [ -z "$FN_SID3" ]; then
-  bad "could not extract phase-c-verdict-rehydrate, phase-c-dead-reviewer-classify-fn, or session-is-dead-fn — aborting Part 7"
+FN_REVALIVE_P7="$(extract_block "$GUARD" "reviewer-session-alive-fn")"
+if [ -z "$FN_REHYDRATE" ] || [ -z "$FN_CLASSIFY2" ] || [ -z "$FN_SID3" ] || [ -z "$FN_REVALIVE_P7" ]; then
+  bad "could not extract phase-c-verdict-rehydrate, phase-c-dead-reviewer-classify-fn, session-is-dead-fn, or reviewer-session-alive-fn — aborting Part 7"
 else
   run_rehydrate_classify() {
     local scenario="$1"  # "all_readable" or "assignee_unreadable"
@@ -485,6 +497,7 @@ else
       log()  { echo "LOG: $*" >&2; }
       warn() { echo "WARN: $*" >&2; }
       '"$FN_SID3"'
+      '"$FN_REVALIVE_P7"'
       PC_SESS_JSON="[]"
       PC_ANY_PENDING=0
       PC_ALL_PENDING_DEAD=1

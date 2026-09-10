@@ -1046,6 +1046,78 @@ else
 fi
 
 echo ""
+# ── 7d. reviewer_session_alive (ga-dkym6: guard/dispatcher reviewer-liveness
+#       predicates unified) ──────────────────────────────────────────────────
+# Bug ga-dkym6: quality-gate-guard.sh's reviewers_alive_for_run() and
+# quality-gate-dispatcher.sh's Phase C dead-reviewer classifier each ran
+# their OWN reviewer-liveness check and silently disagreed for 53 real
+# minutes on the SAME gate-run (quality-gate-guard.log, 2026-09-10
+# 11:46-12:38, 18 consecutive sweeps): dispatcher matched the assignee
+# against only `.id`/`.session_id`, but `gc session list --json` never
+# populates `.session_id` (confirmed empty on every live row) and a
+# reviewer's bd assignee is the session_name-shaped value (e.g.
+# "gate-reviewer-adhoc-f402ca436c") — so dispatcher's match could never find
+# a live, name-identified reviewer present, while guard's own (correct)
+# match did. Fixture mirrors that real incident's assignee shape.
+echo "── 7d. reviewer_session_alive (ga-dkym6: guard/dispatcher reviewer-liveness unify) ──"
+
+REV_SESS_FIXTURE='{"sessions":[
+  {"id":"ga-dz506","session_name":"gate-reviewer-adhoc-f402ca436c","closed":false},
+  {"id":"ga-9zzz1","session_name":"gate-reviewer-adhoc-drained1","closed":false,"state":"drained"},
+  {"id":"ga-8yyy2","session_name":"gate-reviewer-adhoc-asleep1","closed":false,"state":"asleep"},
+  {"id":"ga-7xxx3","session_name":"gate-reviewer-adhoc-closed1","closed":true}
+]}'
+
+eq "session_name-only match (THE ga-dkym6 bug: .session_id is never populated by gc session list)" \
+   "$(reviewer_session_alive "gate-reviewer-adhoc-f402ca436c" "$REV_SESS_FIXTURE")" "1"
+eq "state=drained, closed=false -> dead (bead's ask #2)" \
+   "$(reviewer_session_alive "gate-reviewer-adhoc-drained1" "$REV_SESS_FIXTURE")" "0"
+eq "state=asleep, closed=false -> STAYS alive (must not regress dispatcher's documented reviewer policy)" \
+   "$(reviewer_session_alive "gate-reviewer-adhoc-asleep1" "$REV_SESS_FIXTURE")" "1"
+eq "closed=true -> dead" \
+   "$(reviewer_session_alive "gate-reviewer-adhoc-closed1" "$REV_SESS_FIXTURE")" "0"
+eq "no matching session at all -> dead" \
+   "$(reviewer_session_alive "no-such-reviewer" "$REV_SESS_FIXTURE")" "0"
+eq "empty assignee -> dead, no crash" \
+   "$(reviewer_session_alive "" "$REV_SESS_FIXTURE")" "0"
+eq "unparseable snapshot -> fail-safe dead" \
+   "$(reviewer_session_alive "gate-reviewer-adhoc-f402ca436c" 'not json')" "0"
+
+# Mutation-lock #1: the OLD dispatcher-side id/session_id-only predicate must
+# NOT find the session_name-only reviewer — proves this suite actually
+# exercises the fixed match, not a tautology (mirrors 7b's own mutation-lock
+# for the analogous author-liveness bug).
+OLD_DISPATCHER_MATCH=$(printf '%s' "$REV_SESS_FIXTURE" | jq -r --arg s "gate-reviewer-adhoc-f402ca436c" \
+  'if ([.sessions[] | select(.id==$s or .session_id==$s)] | length) >= 1 then "found" else "absent" end' 2>/dev/null || echo "uncertain")
+eq "mutation-lock: the OLD id/session_id-only predicate does NOT find the session_name-identified reviewer (this IS the bug)" \
+   "$OLD_DISPATCHER_MATCH" "absent"
+
+# Mutation-lock #2: if "asleep" were (wrongly) folded into reviewer_dead_states
+# the way session_matches_author folds it for AUTHORS, the asleep case above
+# would flip to dead — proves the asleep-stays-alive policy is genuinely
+# exercised by this suite, not accidentally true because nothing excludes it.
+ASLEEP_AS_DEAD_MUTANT=$(printf '%s' "$REV_SESS_FIXTURE" | jq -e --arg a "gate-reviewer-adhoc-asleep1" \
+  'def reviewer_dead_states_mutant: ["asleep","drained","closed","archived","quarantined","failed-create"];
+   [(.sessions // [])[]
+    | select(.closed != true)
+    | select((.state // "") as $s | ($s == "" or (reviewer_dead_states_mutant | index($s)) == null))
+    | (.session_name, .name, .alias, .id, .agent_name)]
+   | map(select(. != null and . != ""))
+   | index($a) != null' >/dev/null 2>&1 && echo 1 || echo 0)
+eq "mutation-lock: folding asleep into dead_states WOULD flip the asleep reviewer to dead (proves the policy is load-bearing here)" \
+   "$ASLEEP_AS_DEAD_MUTANT" "0"
+
+echo ""
+echo "── 7e. drift-guard: guard and dispatcher both call reviewer_session_alive (ga-dkym6) ──"
+grep -q 'reviewer_session_alive()' "$GUARD" && ok "guard defines reviewer_session_alive" || bad "guard missing reviewer_session_alive def"
+grep -q 'reviewer_session_alive "\$a" "\$SESS_SNAP_JSON"' "$GUARD" \
+  && ok "guard's reviewers_alive_for_run delegates to reviewer_session_alive" \
+  || bad "reviewers_alive_for_run does not delegate to reviewer_session_alive — drift risk (the original ga-dkym6 bug shape)"
+grep -q 'reviewer_session_alive "\$PC_SID" "\$PC_SESS_JSON"' "$DISPATCHER" \
+  && ok "dispatcher's Phase C classify loop delegates to reviewer_session_alive" \
+  || bad "dispatcher's Phase C classify loop does not delegate to reviewer_session_alive — drift risk (the original ga-dkym6 bug shape)"
+
+echo ""
 # ── 8. ga-jhyu: terminal gate beads are CLOSED (not just relabeled), and
 #       set_gate_status leaves EXACTLY ONE gate-status:* label ────────────────
 # Bug ga-jhyu: terminal transitions relabeled markers/gate-runs (passed/failed/

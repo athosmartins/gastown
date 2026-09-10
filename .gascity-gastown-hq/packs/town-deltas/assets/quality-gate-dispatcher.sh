@@ -7408,17 +7408,21 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
             PC_ALL_PENDING_DEAD=0
             break
           fi
-          PC_PRESENT_N=$(printf '%s' "$PC_SESS_JSON" \
-            | jq -r --arg s "$PC_SID" 'if type=="array" then . else .sessions end | map(select(.id==$s or .session_id==$s)) | length' 2>/dev/null || echo 1)
-          case "$PC_PRESENT_N" in ''|*[!0-9]*) PC_PRESENT_N=1 ;; esac
-          PC_PRESENT_FLAG=0
-          PC_CLOSED_FLAG=false
-          if [ "$PC_PRESENT_N" -ge 1 ]; then
-            PC_PRESENT_FLAG=1
-            PC_CLOSED_FLAG=$(printf '%s' "$PC_SESS_JSON" \
-              | jq -r --arg s "$PC_SID" 'if type=="array" then . else .sessions end | map(select(.id==$s or .session_id==$s)) | .[0].closed // false' 2>/dev/null || echo false)
-          fi
-          if [ "$(session_is_dead "$PC_PRESENT_FLAG" "$PC_CLOSED_FLAG")" != "1" ]; then
+          # ga-dkym6: delegates to reviewer_session_alive() (quality-gate-
+          # guard.sh, in scope here via this file's own GATE_GUARD_LIB_ONLY
+          # source above) instead of this loop's own id/session_id-only
+          # match. `gc session list --json` never populates `.session_id`
+          # (confirmed empty on every live row), and a reviewer's assignee
+          # is the session_name-shaped value (e.g.
+          # "gate-reviewer-adhoc-<hash>") — so the old match here could never
+          # find a name-identified reviewer present, unconditionally
+          # misreading it dead the one time Phase C evaluates it (at the
+          # run's own outer timeout), independent of whether it was actually
+          # alive. See reviewer_session_alive's own docstring for the
+          # measured incident this fixes (quality-gate-guard.log, 2026-09-10:
+          # 18 sweeps / 53 minutes of guard/dispatcher disagreement over the
+          # identical session).
+          if [ "$(reviewer_session_alive "$PC_SID" "$PC_SESS_JSON")" = "1" ]; then
             PC_ALL_PENDING_DEAD=0
             break
           fi
@@ -11499,8 +11503,15 @@ for _ack_attempt in $(seq 1 "$ACK_MAX_RETRIES"); do
       # through to re-queue too — never skip on uncertain evidence.
       _ack_state_flag=""
       if [ "$ACK_LIST_OK" = "1" ]; then
+        # ga-dkym6: add .session_name to the match — `gc session list --json`
+        # never populates `.session_id` and a reviewer's assignee is the
+        # session_name-shaped value (see reviewer_session_alive's docstring
+        # in quality-gate-guard.sh), so the old id/session_id-only match here
+        # could never find a name-identified reviewer's state, always
+        # reading _ack_booting as 0 instead of the "still booting" signal
+        # ga-xwdl's fix exists to detect for exactly these sessions.
         _ack_state_flag=$(echo "$ACK_SESS_JSON" \
-          | jq -r --arg s "$_sid" 'if type=="array" then . else .sessions end | map(select(.id==$s or .session_id==$s)) | .[0].state // ""' 2>/dev/null || echo "")
+          | jq -r --arg s "$_sid" 'if type=="array" then . else .sessions end | map(select(.id==$s or .session_id==$s or .session_name==$s)) | .[0].state // ""' 2>/dev/null || echo "")
       fi
       _ack_booting=$(session_is_booting "$_ack_state_flag")
       _ack_spawn_age=$(( _ack_now - ${SLOT_SPAWN_EPOCH[$k]:-$_ack_now} ))
