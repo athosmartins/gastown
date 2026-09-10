@@ -3115,6 +3115,37 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
         # sling-task-janitor backstop (60min min-age, 15min sweep) to catch.
         _sling_closed = _close_orphaned_sling(_bd, sling_bead_id, bead_id, _reloop_hold)
 
+    # 3c. ga-yfpab: the CROSSING reclaim — the one that just bumped
+    #     reclaim-count TO the cap (new_count >= MAX_RECLAIMS) — must escalate
+    #     in THIS SAME call. reclaim_decision() (the caller that chose
+    #     action="reclaim" and got us here) checks reclaim_count >=
+    #     MAX_RECLAIMS using the PRE-increment count, so the call that crosses
+    #     the cap is always dispatched as "reclaim", never "escalate". And
+    #     step 1 above just stripped story:in-flight/pilot:dispatched while
+    #     step 2 flipped status to open — which removes this bead from BOTH
+    #     candidate queries run_cycle() uses on any LATER pass
+    #     (list_inflight_beads() requires story:in-flight;
+    #     list_stranded_inprogress_beads() requires status=in_progress). So a
+    #     "later pass that reaches escalate" can structurally never happen —
+    #     do_escalate() must fire HERE or never. Confirmed live: gt-7bt1l and
+    #     gt-5tr74 both reached pilot:reclaim-count:3 + status=open +
+    #     pilot:held with gate:needs-human never applied; gt-7bt1l needed a
+    #     manual Mayor re-admit 33h+ later (see this bead's own report).
+    #
+    #     Scoped to the non-refusal path only: has_explicit_refusal reclaims
+    #     already went through step 1b above, which CONSUMED the fresh
+    #     pool:refused:<reason> marker via real bd calls — but the `labels`
+    #     snapshot here is the ORIGINAL, in-memory argument, unaware of that
+    #     mutation. Calling do_escalate(has_explicit_refusal=True) would re-run
+    #     _promote_refusal_labels() against that stale snapshot and risk
+    #     double-counting pilot:refusal-count. That combination (a refusal
+    #     reclaim that ALSO happens to cross the independent reclaim-count cap
+    #     in the same cycle) is rare, and is still covered by the standalone
+    #     reclaim_cap_escalation_sweep.py detector, which re-reads live labels
+    #     fresh from bd rather than a stale in-memory snapshot.
+    if new_count >= MAX_RECLAIMS and not has_explicit_refusal:
+        do_escalate(bead_id, bead_title, new_count, idle_min, labels, rig_root=rig_root)
+
     # 4. Audit comment
     cleared = " + ".join(l for l in ("story:in-flight", "pilot:dispatched")
                          if l in labels) or "(no in-flight label)"
@@ -6210,6 +6241,89 @@ def _selftest():
               "attempt reclaims (attempt 1 of a NEW budget) instead of instantly re-escalating on the "
               "stale cap — this is the exact wa-uknuq resurrection this fix closes",
               _second_strand_decision == "reclaim", f"decision={_second_strand_decision!r}")
+    finally:
+        subprocess.run = _orig_run_rf
+
+    # --- RF-15 (ga-yfpab): the CROSSING reclaim — the one that bumps
+    #     reclaim-count TO the cap — must escalate in the SAME do_reclaim()
+    #     call, not wait for a later pass. reclaim_decision() (line ~912)
+    #     checks reclaim_count >= MAX_RECLAIMS using the PRE-increment count,
+    #     so this exact call is always dispatched as "reclaim", never
+    #     "escalate" — and do_reclaim() unconditionally strips story:in-flight
+    #     (step 1) and flips status to open (step 2), removing the bead from
+    #     BOTH candidate queries run_cycle() uses on any LATER pass
+    #     (list_inflight_beads() requires story:in-flight;
+    #     list_stranded_inprogress_beads() requires status=in_progress). So a
+    #     bead that crosses the cap via a reclaim could never be re-evaluated,
+    #     and do_escalate() could never fire for it — exactly what happened to
+    #     gt-7bt1l and gt-5tr74 (both ended status=open + pilot:held +
+    #     pilot:reclaim-count:3, gate:needs-human never applied; gt-7bt1l
+    #     needed a manual Mayor re-admit 33h+ later). This test reproduces the
+    #     exact "open+held" shape the bug report asks for. ---
+    _rf_mutations.clear()
+    subprocess.run = _stub_run_rf
+    try:
+        do_reclaim(
+            "ga-crosstest1", "some bead", reclaim_count=MAX_RECLAIMS - 1, idle_min=30.0,
+            labels=["story:in-flight", "pilot:dispatched",
+                    f"pilot:reclaim-count:{MAX_RECLAIMS - 1}"],
+        )
+        check("RF-15a: the crossing reclaim still performs the normal open+held mechanics "
+              "(reproduces the exact gt-7bt1l/gt-5tr74 shape)",
+              ["bd", "update", "ga-crosstest1", "--status", "open"] in _rf_mutations
+              and ["bd", "label", "add", "ga-crosstest1", "pilot:held", "-q"] in _rf_mutations,
+              f"mutations={_rf_mutations!r}")
+        check("RF-15b (ga-yfpab regression anchor): the SAME call that crosses the cap "
+              "also applies gate:needs-human — do_reclaim() must not defer escalation to a "
+              "later pass that can structurally never happen",
+              ["bd", "label", "add", "ga-crosstest1", "gate:needs-human", "-q"] in _rf_mutations,
+              f"mutations={_rf_mutations!r}")
+        check("RF-15c: gate:needs-human:technical also lands (quorum-convergence-watchdog "
+              "safety net), same as any other do_escalate() call",
+              ["bd", "label", "add", "ga-crosstest1", "gate:needs-human:technical", "-q"] in _rf_mutations,
+              f"mutations={_rf_mutations!r}")
+        # Falsifiable end-to-end: derive the REAL post-call label set from the
+        # recorded mutations (never hand-typed — mirrors RF-14g's own pattern)
+        # and prove the bead is left in a state a human/queue actually sees.
+        _post_labels = {"story:in-flight", "pilot:dispatched", f"pilot:reclaim-count:{MAX_RECLAIMS - 1}"}
+        for _m in _rf_mutations:
+            if len(_m) == 6 and _m[0] == "bd" and _m[1] == "label" and _m[3] == "ga-crosstest1":
+                if _m[2] == "add":
+                    _post_labels.add(_m[4])
+                elif _m[2] == "remove":
+                    _post_labels.discard(_m[4])
+        check("RF-15d (ga-yfpab FALSIFIABLE): the real post-call label set carries "
+              "gate:needs-human — a bead re-read after this call is visibly needing a "
+              "human, not a silently-capped ghost invisible to every future sweep",
+              "gate:needs-human" in _post_labels, f"labels={_post_labels!r}")
+    finally:
+        subprocess.run = _orig_run_rf
+
+    # --- RF-15e (ga-yfpab scope guard): a refusal-triggered crossing is
+    #     deliberately LEFT to the standalone reclaim-cap-escalation-sweep
+    #     detector rather than handled inline here — do_escalate()'s refusal
+    #     branch re-reads the `labels` snapshot to promote pool:refused:<reason>
+    #     markers, but do_reclaim()'s OWN step 1b has already consumed that
+    #     marker via bd (real state), while `labels` (the in-memory param) is
+    #     untouched — calling do_escalate(has_explicit_refusal=True) here would
+    #     re-run _promote_refusal_labels() against a stale snapshot and risk
+    #     double-counting pilot:refusal-count. This anchors that the inline
+    #     escalation is scoped OFF for this case (never silently regresses to
+    #     firing it), not that the bead is left permanently unprotected — the
+    #     detector's generic "capped + missing gate:needs-human" scan covers it. ---
+    _rf_mutations.clear()
+    subprocess.run = _stub_run_rf
+    try:
+        do_reclaim(
+            "ga-crosstest2", "some refused bead", reclaim_count=MAX_RECLAIMS - 1, idle_min=30.0,
+            labels=["story:in-flight", "pilot:dispatched",
+                    f"pilot:reclaim-count:{MAX_RECLAIMS - 1}", "pool:refused:some-reason"],
+            has_explicit_refusal=True, refusal_count=0,
+        )
+        check("RF-15e: a refusal-triggered crossing does NOT add gate:needs-human inline "
+              "(left to the standalone detector — see its own selftest for that coverage)",
+              ["bd", "label", "add", "ga-crosstest2", "gate:needs-human", "-q"] not in _rf_mutations,
+              f"mutations={_rf_mutations!r}")
     finally:
         subprocess.run = _orig_run_rf
 

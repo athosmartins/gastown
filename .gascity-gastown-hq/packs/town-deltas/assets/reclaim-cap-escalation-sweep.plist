@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.reclaim-cap-escalation-sweep</string>
+
+  <!-- Reclaim-cap escalation sweep (ga-yfpab, 2026-09-10). Defense-in-depth
+       backstop for a gap in inflight-reclaim-guard.py: reclaim_decision()
+       checks reclaim_count >= MAX_RECLAIMS using the PRE-increment count, so
+       the reclaim call that bumps a bead's count TO the cap is always
+       dispatched as "reclaim", never "escalate" — and that same call strips
+       story:in-flight/pilot:dispatched and flips status to open, removing
+       the bead from every candidate query the guard uses on a later pass.
+       do_escalate() (which applies gate:needs-human) could structurally
+       never fire for it. gt-7bt1l and gt-5tr74 both reached
+       pilot:reclaim-count:3 + status=open + pilot:held with gate:needs-human
+       never applied; gt-7bt1l needed a manual Mayor re-admit 33h+ later.
+       The primary fix makes do_reclaim() escalate inline for the common
+       case; this sweep is the safety net — it scans HQ + every rig store for
+       ANY bead left at cap without gate:needs-human, regardless of how it
+       got there, and escalates it by calling the guard's own real
+       do_escalate() (never reimplementing its label logic). Runs once per
+       StartInterval and exits (not resident). Idempotent — an escalated bead
+       carries gate:needs-human, which removes it from this sweep's own
+       candidate query on the next run. Silence = healthy; only prints when
+       it finds something. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/reclaim_cap_escalation_sweep.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <!-- Sweep cadence: every 30 min, matching the sibling
+       gate-needs-human-divergence-sweep.plist — this is a backstop for an
+       edge case the primary fix already handles inline, not a race against a
+       fast-moving clock, so a cheap periodic scan is ample. RunAtLoad fires
+       an immediate sweep on load, catching anything already stranded. -->
+  <key>StartInterval</key><integer>1800</integer>
+  <key>RunAtLoad</key><true/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/reclaim-cap-escalation-sweep-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/reclaim-cap-escalation-sweep-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>BD_ACTOR</key>
+    <string>automation</string>
+  </dict>
+</dict>
+</plist>
