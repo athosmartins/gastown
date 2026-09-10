@@ -180,6 +180,23 @@ _heal() {
   # the crew is wedged. run_resume_scan() auto-resumes it once its session
   # identity changes (proof of restart — the actual cure, per ga-ld0ch); `gc
   # agent resume <name>` also works manually at any time.
+  #
+  # ⚠️ OUTSTANDING (Mayor, ga-ld0ch bead comment, 2026-09-10T16:26Z): before
+  # CLP_HEAL_ENABLED=1 is ever set in production, this suspend step still
+  # needs ONE of (a) removal (Mayor's stated preference — "suspender não
+  # destrava sessão nenhuma"), or (b) a guard that NEVER suspends a crew with
+  # a live/attached session, proven by a test. The -C→--city fix in this same
+  # diff makes this call actually WORK for the first time (it was previously
+  # silent dead code), so leaving it as-is is what would newly activate the
+  # exact risk class Mayor flagged — a wedged-but-alive crew a human is
+  # actively attached to getting suspended out from under them, same shape as
+  # the 2026-09-10 incident this bead exists to guard against. Deliberately
+  # NOT resolved in this fix: it is a design/product call for Mayor to make
+  # (remove vs. build "attached" detection — a real feature, not a small
+  # patch), not something to decide unilaterally while a gate-fix cap is
+  # ticking. CLP_HEAL_ENABLED defaults to 0 (line ~87), so this is inert
+  # until someone deliberately opts in — flagged here, and in a bead comment,
+  # so that decision point isn't silently missed.
   if "$GC" --city "$CLP_CITY" agent suspend "$crew" 2>/dev/null; then
     log "  HEAL: suspended crew agent $crew"
     _record_heal_marker "$crew" "$bead" "$store" "$ident"
@@ -459,11 +476,22 @@ run_resume_scan() {
         _comment_bead "$store" "$bead" "crew-liveness-probe: auto-resumed '$crew' — its session identity changed since the suspend ($ident_then -> $ident_now), consistent with a restart."
         notify_info "crew-liveness-probe: retomei $crew (sessao mudou desde a suspensao — parece reiniciada)"
         resumed=$(( resumed + 1 ))
+        # Gate-fix (ga-ld0ch review, attempt 3): only clear the marker on a
+        # CONFIRMED successful resume. The old code ran this unconditionally
+        # after the if/elif/else above, so it also fired on CLP_DRY_RUN=1
+        # (destroying real tracking state while "resuming" nothing) and on a
+        # failed `gc agent resume` (discarding the only record of a probe-
+        # caused suspension — the next watchdog cycle would then see
+        # suspended=true + live + no marker and falsely page "unexplained
+        # suspension" for a fully explained one). Leaving the marker in place
+        # on those two branches lets the next cycle retry, matching this same
+        # function's existing "leave state untouched under uncertainty"
+        # discipline for JSON-fetch failures above.
+        rm -f "$mf" 2>/dev/null || true
       else
         log "  RESUME WARN: gc agent resume failed for $crew"
         notify_fail "crew-liveness-probe: falha ao dessuspender crew $crew apos detectar sessao nova"
       fi
-      rm -f "$mf" 2>/dev/null || true
     else
       local age_min=$(( ( $(date +%s) - suspended_at ) / 60 ))
       log "resume-scan: $crew still suspended (${age_min}min), same session ('$ident_now') — not auto-resuming yet"
@@ -595,6 +623,12 @@ case "\$*" in
     grep -qxF "\$NAME" "${TMP}/suspended_state" 2>/dev/null || echo "\$NAME" >> "${TMP}/suspended_state"
     ;;
   *"agent resume"*)
+    # \$TMP/fail_resume — gate-fix (ga-ld0ch review, attempt 3): simulates a
+    # failed \`gc agent resume\` call, mirroring \$TMP/fail_suspend above.
+    # Needed to exercise the "resume attempted but failed" branch of
+    # run_resume_scan (Scenario 25) — previously untestable, since this case
+    # had no failure knob at all.
+    [ -f "${TMP}/fail_resume" ] && exit 1
     echo "\$*" >> "${RESUME_LOG}"
     NAME="\${@: -1}"
     grep -vxF "\$NAME" "${TMP}/suspended_state" 2>/dev/null > "${TMP}/suspended_state.tmp"
@@ -868,6 +902,37 @@ GCSHIM
   run_suspend_watchdog
   rm -f "$TMP/agent_list_bad_shape"
   [ -s "$NOTIFY_LOG" ] && bad "23: watchdog notified despite gc agent list --json returning a well-formed error envelope (acted on inconclusive data)" || ok "23: watchdog stayed silent on a well-formed-but-wrong-shape agent-list response, rather than guessing"
+
+  echo ""
+  echo "=== Scenario 24: resume-scan under CLP_DRY_RUN=1 must NOT call gc agent resume for real and must NOT clear the marker (ga-ld0ch gate-fix attempt 3: the old rm -f \"\$mf\" sat AFTER the if/elif/else, so it fired unconditionally — including under dry-run, destroying real tracking state during exactly the canary-testing workflow CLP_DRY_RUN exists for) ==="
+  : > "$RESUME_LOG"
+  echo "sess-dry1" > "$TMP/session_id"
+  _load_sessions_json
+  _record_heal_marker "mila-wa" "wa-stale" "$TMP" "$(_session_identity mila-wa)"
+  MARKER24="$CLP_STATE_DIR/mila-wa.suspended-by-probe"
+  echo "sess-dry2" > "$TMP/session_id"   # simulate a restart while DRY_RUN is on
+  CLP_DRY_RUN=1
+  run_resume_scan
+  CLP_DRY_RUN=0
+  [ -s "$RESUME_LOG" ] && bad "24: DRY_RUN actually called gc agent resume" || ok "24: DRY_RUN did not call gc agent resume for real"
+  [ -f "$MARKER24" ] && ok "24: DRY_RUN left the marker untouched" || bad "24: DRY_RUN wrongly cleared the marker (would silently destroy real tracking state)"
+  rm -f "$MARKER24" 2>/dev/null
+
+  echo ""
+  echo "=== Scenario 25: resume-scan leaves the marker in place when gc agent resume FAILS (ga-ld0ch gate-fix attempt 3: the old rm -f \"\$mf\" also fired on a failed resume, discarding the only record of a probe-caused suspension — the next watchdog cycle would then falsely page 'suspensao manual/desconhecida' for a fully explained one) ==="
+  : > "$RESUME_LOG"; : > "$NOTIFY_LOG"
+  echo "sess-fail1" > "$TMP/session_id"
+  _load_sessions_json
+  _record_heal_marker "mila-wa" "wa-stale" "$TMP" "$(_session_identity mila-wa)"
+  MARKER25="$CLP_STATE_DIR/mila-wa.suspended-by-probe"
+  echo "sess-fail2" > "$TMP/session_id"   # simulate a restart
+  touch "$TMP/fail_resume"
+  run_resume_scan
+  rm -f "$TMP/fail_resume"
+  [ -s "$RESUME_LOG" ] && bad "25: gc agent resume recorded a successful call despite the mock being set to fail" || ok "25: gc agent resume was attempted and failed, as simulated"
+  [ -f "$MARKER25" ] && ok "25: marker preserved after a failed resume (next cycle can retry)" || bad "25: marker wrongly cleared despite gc agent resume failing"
+  grep -qi "mila-wa" "$NOTIFY_LOG" && ok "25: failed resume triggered a notify_fail (silence-is-not-success)" || bad "25: expected a notify_fail when gc agent resume fails"
+  rm -f "$MARKER25" 2>/dev/null
 
   echo ""
   echo "crew-liveness-probe selftest: PASS=$PASS FAIL=$FAIL"
