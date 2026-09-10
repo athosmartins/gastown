@@ -430,6 +430,13 @@ _read_skip_streak() {
 _write_skip_streak() {
   local f="$1" count="$2" alerted="$3"
   mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  # Third-state note: a write failure here (disk full, permissions) is
+  # swallowed, same as every other external write in this file (log(),
+  # notify, mail — all `2>/dev/null || true`). Worst case it silently stalls
+  # THIS counter at its last-written value, so it never reaches the alert
+  # threshold — but it is not this feature's only safety net: the underlying
+  # disk condition is independently covered by dolt-disk-floor-guard.sh's own
+  # CRITICAL-floor alerting, which does not depend on this state file at all.
   printf '%s %s\n' "$count" "$alerted" > "$f" 2>/dev/null || true
 }
 
