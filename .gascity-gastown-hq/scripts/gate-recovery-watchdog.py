@@ -948,7 +948,7 @@ REPAIR_HEADER = (
     "Sequência: (1) colete o diagnóstico (já há um snapshot no caminho citado abaixo; "
     "aprofunde com os greps do runbook), (2) rode o runbook, (3) se RESOLVER, avise via "
     "`notify -p 3 'gate recuperado'`, (4) se NÃO conseguir, escale pro humano com "
-    "`notify 🚨 -p 5` E mande mail pro Mayor com o diagnóstico. Ao terminar (resolvido OU "
+    "`notify -p 5` E mande mail pro Mayor com o diagnóstico. Ao terminar (resolvido OU "
     "escalado), feche este bead (`gc bd close <id> --reason ...`) e saia "
     "(`gc runtime drain-ack && exit`).\n\n"
     "========== RUNBOOK ==========\n"
@@ -970,7 +970,7 @@ def repair_runbook(reason, diag_path, dolt_hits, kind="gate"):
             "2. Se for charset: bd -C . update <bead-culpado> --title '<versão SEM acento/travessão>' (de-acentue).\n"
             "3. Se o log estiver silencioso (Pilot morto): launchctl kickstart -k gui/$(id -u)/com.gascity.pilot.\n"
             "4. Dispare: launchctl kickstart gui/$(id -u)/com.gascity.pilot ; confirme 'dispatched=N' (N>0) na próxima varredura.\n\n"
-            "Se destravar, avise (notify -p 3). Só acione o Athos (notify 🚨 -p 5) se NÃO conseguir destravar."
+            "Se destravar, avise (notify -p 3). Só acione o Athos (notify -p 5) se NÃO conseguir destravar."
         ) % (reason, diag_path)
     if kind == "gate-loop":
         return (
@@ -989,7 +989,7 @@ def repair_runbook(reason, diag_path, dolt_hits, kind="gate"):
             "3. O objetivo imediato é TIRAR o branch quebrado da cabeça da fila pra os markers saudáveis atrás dele drenarem JÁ.\n"
             "4. Confirme: nos próximos sweeps aparecem 'Gate PASSED' / outros branches avançando (não só QUEUED-retry no mesmo branch).\n\n"
             "Diagnóstico salvo em: %s\n"
-            "Se destravar, avise (notify -p 4). Só acione o Athos (notify 🚨 -p 5) se NÃO conseguir.\n"
+            "Se destravar, avise (notify -p 4). Só acione o Athos (notify -p 5) se NÃO conseguir.\n"
             "(Fix permanente do auto-skip no dispatcher = ga-q3ig2 — este reparo é a ponte de detecção+recuperação até ele aterrissar. "
             "Cuidado: o contador gate:rebase-attempt reseta a 0 todo sweep, então o escape de 3-strikes do dispatcher nunca dispara — por isso loopa pra sempre.)"
         ) % (reason, reason, diag_path)
@@ -1041,7 +1041,7 @@ def repair_runbook(reason, diag_path, dolt_hits, kind="gate"):
             "3. O objetivo é tirar o marker órfão do limbo: ou ele roda (re-queue) ou some (supersede+close) — "
             "em ambos os casos o bead de origem deixa de ficar preso in_progress.\n\n"
             "Diagnóstico salvo em: %s\n"
-            "Se resolver, avise (notify -p 3). Só acione o Athos (notify 🚨 -p 5) se NÃO conseguir.\n"
+            "Se resolver, avise (notify -p 3). Só acione o Athos (notify -p 5) se NÃO conseguir.\n"
             "(Fix permanente seria o dispatcher detectar markers sem gate_run e re-criar o run — esta detecção+reparo "
             "é a ponte até lá.)"
         ) % (reason, dolt_hits, dolt_hits, reason, dolt_hits, dolt_hits, dolt_hits, diag_path)
@@ -1066,7 +1066,7 @@ def repair_runbook(reason, diag_path, dolt_hits, kind="gate"):
         "gc dolt restart (da pasta da cidade) — preserva dados, bd volta na hora — depois kickstart do supervisor de novo, e re-verifique um run.\n"
         "5. Confirme com um run REAL passando ponta-a-ponta (3/3 vereditos → PASS). "
         "Sondas ad-hoc (gc session new sem tarefa) saem sozinhas, não servem de teste.\n\n"
-        "Se recuperar, avise (notify -p 3). Só acione o Athos (notify 🚨 -p 5) se NÃO conseguir recuperar."
+        "Se recuperar, avise (notify -p 3). Só acione o Athos (notify -p 5) se NÃO conseguir recuperar."
     ) % (reason, dolt_hits, diag_path)
 
 

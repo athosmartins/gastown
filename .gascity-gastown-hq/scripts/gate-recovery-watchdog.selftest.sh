@@ -1001,6 +1001,112 @@ else:
     bad("ga-30xi3: a decode failure hid the sessions dump behind '(failed)' (content: %r)" % (_snap_content_30xi3,))
 
 print("")
+print("Scenario ga-54n6v: generated repair-runbook text (REPAIR_HEADER + repair_runbook(),"
+      " every kind) must not trip any live _TEXT_VETO_PATTERNS from pilot-dispatcher.sh")
+import re as _re_54n6v, json as _json_54n6v, subprocess as _subprocess_54n6v
+
+# Extract the SAME _TEXT_VETO_PATTERNS pilot-dispatcher.sh defines, live, instead of
+# hand-copying the regex list here — a hand-copied list drifts silently the moment the
+# real patterns change (ga-qt0mj's own single-source-of-truth discipline for that
+# array). Anchor-based, not a fixed line range: line numbers drift as the file grows,
+# and a stale numeric range would silently extract the wrong slice and pass vacuously.
+_scripts_dir_54n6v = os.path.dirname(os.path.abspath(wd_path))
+_pd_path_54n6v = os.path.normpath(os.path.join(
+    _scripts_dir_54n6v, "..", "packs", "town-deltas", "assets", "pilot-dispatcher.sh"))
+_patterns_54n6v = None
+if not os.path.isfile(_pd_path_54n6v):
+    bad("ga-54n6v: pilot-dispatcher.sh not found at %r — path moved? update this "
+        "selftest's extraction path" % (_pd_path_54n6v,))
+else:
+    with open(_pd_path_54n6v, "r", encoding="utf-8") as _f_54n6v:
+        _pd_lines_54n6v = _f_54n6v.readlines()
+    _start_54n6v = next((i for i, l in enumerate(_pd_lines_54n6v)
+                          if l.startswith("_PILOT_ENGINE_REBUILD_RE=")), None)
+    _end_54n6v = None
+    if _start_54n6v is None:
+        bad("ga-54n6v: extraction start-anchor '_PILOT_ENGINE_REBUILD_RE=' not found in "
+            "pilot-dispatcher.sh — the anchor moved; update this selftest's extraction range")
+    else:
+        _end_54n6v = next((j for j in range(_start_54n6v, len(_pd_lines_54n6v))
+                            if _pd_lines_54n6v[j].rstrip("\n") == "]')"), None)
+        if _end_54n6v is None:
+            bad("ga-54n6v: extraction end-anchor \"]')\" not found after "
+                "_PILOT_ENGINE_REBUILD_RE= — update this selftest's extraction range")
+    if _end_54n6v is not None:
+        _snippet_54n6v = "".join(_pd_lines_54n6v[_start_54n6v:_end_54n6v + 1])
+        _extract_54n6v = _subprocess_54n6v.run(
+            ["bash", "-c", _snippet_54n6v + "\nprintf '%s' \"$_TEXT_VETO_PATTERNS\""],
+            capture_output=True, text=True, timeout=15)
+        if _extract_54n6v.returncode == 0 and _extract_54n6v.stdout.strip():
+            try:
+                _patterns_54n6v = _json_54n6v.loads(_extract_54n6v.stdout)
+            except Exception as _e_54n6v:
+                bad("ga-54n6v: extracted _TEXT_VETO_PATTERNS is not valid JSON: %r (stdout=%r)"
+                    % (_e_54n6v, _extract_54n6v.stdout[:300]))
+        else:
+            bad("ga-54n6v: extracting _TEXT_VETO_PATTERNS from pilot-dispatcher.sh failed "
+                "(rc=%s stderr=%r) — is bash/jq available?"
+                % (_extract_54n6v.returncode, _extract_54n6v.stderr[:300]))
+
+if _patterns_54n6v:
+    ok("extracted %d live _TEXT_VETO_PATTERNS from pilot-dispatcher.sh (%s)"
+       % (len(_patterns_54n6v), ", ".join(p["slug"] for p in _patterns_54n6v)))
+
+    def _matches_pattern_54n6v(title, description, p):
+        """Mirror _reconcile_text_veto_labels' exact jq semantics (case-insensitive
+        test(), title-only scan for field=="title", not_re CANCELS a positive match)
+        so this can only fail the same way the real Pilot fails — never stricter,
+        never looser."""
+        text = title if p.get("field") == "title" else (title + " " + description)
+        pos = _re_54n6v.search(p["re"], text, _re_54n6v.IGNORECASE) is not None
+        not_re = p.get("not_re") or ""
+        neg = bool(not_re) and _re_54n6v.search(not_re, text, _re_54n6v.IGNORECASE) is not None
+        return pos and not neg
+
+    # Positive control FIRST: prove the harness can actually catch a violation before
+    # trusting it to report a clean bill of health below. A silently-empty pattern
+    # list, or a broken _matches_pattern_54n6v, would otherwise make every kind
+    # "pass" vacuously — same trap as a test that can never fail.
+    _control_hit_54n6v = [p["slug"] for p in _patterns_54n6v
+                           if _matches_pattern_54n6v("REPAIR test", "escale com notify \U0001F6A8 -p 5", p)]
+    if _control_hit_54n6v == ["compliance-marker-text-pattern"]:
+        ok("positive control: a synthetic siren-emoji description IS caught by the "
+           "harness (compliance-marker-text-pattern) — the checks below are not vacuous")
+    else:
+        bad("positive control FAILED: expected the synthetic siren-emoji string to trip "
+            "exactly ['compliance-marker-text-pattern'], got %r — the checks below "
+            "cannot be trusted until this is fixed" % (_control_hit_54n6v,))
+
+    # Real generated text, per kind — built from the ACTUAL REPAIR_HEADER constant and
+    # repair_runbook() function (not a hand-copied approximation), assembled the same
+    # way spawn_repair_agent() assembles a repair bead's body (REPAIR_HEADER +
+    # repair_runbook(...)) so this exercises the real production strings, not a
+    # paraphrase of them. Covers every kind repair_runbook() branches on, including
+    # the "gate" default fallback — not just the 3 lines the bead cited (line numbers
+    # drift; the two beads that actually got vetoed, ga-wjk8l/ga-5755t, were both
+    # "gate-orphan" repairs, a kind the bead's own citation missed).
+    _kind_args_54n6v = {
+        "pilot":       dict(reason="dolt instability detected", diag_path="/tmp/diag-pilot.txt", dolt_hits=0),
+        "gate-loop":   dict(reason="crew/wa/wa-9x8y7", diag_path="/tmp/diag-gate-loop.txt", dolt_hits=0),
+        "supervisor":  dict(reason="rig missing path", diag_path="/tmp/diag-supervisor.txt", dolt_hits="/Users/athos/gt/some-rig/.gc/site.toml"),
+        "gate-orphan": dict(reason="crew/wa/wa-1234", diag_path="/tmp/diag-gate-orphan.txt", dolt_hits="ga-marker123"),
+        "gate":        dict(reason="dolt connection reset", diag_path="/tmp/diag-gate.txt", dolt_hits=7),
+    }
+    for _kind_54n6v, _kw_54n6v in _kind_args_54n6v.items():
+        _title_54n6v = "REPAIR gate-watchdog (%s): %s" % (_kind_54n6v, _kw_54n6v["reason"])
+        _desc_54n6v = m.REPAIR_HEADER + m.repair_runbook(
+            _kw_54n6v["reason"], _kw_54n6v["diag_path"], _kw_54n6v["dolt_hits"], _kind_54n6v)
+        _hits_54n6v = [p["slug"] for p in _patterns_54n6v
+                       if _matches_pattern_54n6v(_title_54n6v, _desc_54n6v, p)]
+        if not _hits_54n6v:
+            ok("kind=%r: generated repair bead text (title+description) trips none of "
+               "the %d live veto patterns" % (_kind_54n6v, len(_patterns_54n6v)))
+        else:
+            bad("kind=%r: generated repair bead text trips %r — this repair bead would "
+                "be born invisible to the Pilot, exactly like ga-wjk8l/ga-5755t"
+                % (_kind_54n6v, _hits_54n6v))
+
+print("")
 print("Results: %d passed, %d failed" % (PASS, FAIL))
 if FAIL == 0:
     print("SELFTEST PASS"); sys.exit(0)
