@@ -2215,6 +2215,61 @@ _pilot_suppress_reused_sling() {
   _pilot_defer_extend "$_prs_city" "$_prs_sling_id" "$_prs_iso"
 }
 
+# ga-hpc1x: EPHEMERAL-POOL sibling of the ga-i58em REUSE check above. gt-4st3n's
+# _skip_reuse (~L8524) forces _DISPATCH_REUSE=0 for gastown.dog/wa-worker*/
+# ps-worker* — correct for the REUSE-vs-SPAWN *delivery-mechanism* choice
+# (there can be MULTIPLE instances of a pool template, so picking one
+# specific "existing session" to reuse is meaningless) — but that exclusion
+# also means dispatch_one() never once asks whether the plain `gc session
+# nudge $_SLING_TARGET` it uses instead (case default, well below) might
+# ITSELF land directly on an already-live instance of that pool, exactly
+# like `gc session submit` does for a REUSE dispatch.
+#
+# When it does, the live instance acts on the nudge's embedded "Claim your
+# work" block immediately (Propulsion Principle: a hook is the assignment) —
+# and that block only ever names STORY_ID, never the sling's own id, since
+# the sling did not exist yet when DISPATCH_TASK was templated (~L8412-8500,
+# well before the `gc sling` call that mints SLING_BEAD_ID). The live
+# instance therefore never separately runs its own Step-1c self-serve probe
+# for THIS dispatch, so the sling sits open+routed+unassigned for the
+# instance's entire work duration — indistinguishable from real unclaimed
+# pool demand to a SECOND, genuinely-idle instance's own Step-1c.
+#
+# Confirmed live (2026-09-10, ga-hpc1x): gastown.dog-1 (already active)
+# claimed the wrapped bug via the embedded block but never the sling;
+# ~4 minutes later gastown.dog-2's normal Step-1c found the still-open
+# sling and claimed it as fresh work, while dog-1 was still mid-flight —
+# caught only because dog-2 happened to cross-check liveness before doing
+# any fix work, the exact same non-structural catch ga-i58em's own incident
+# (ga-0ehtp) describes for the REUSE path this mirrors.
+#
+# Deliberately gated on a LIVE-RIGHT-NOW check, not applied unconditionally:
+# a genuinely idle pool (no instance up yet, or the controller's own
+# reconciler about to spawn one) has NO live instance to receive the nudge
+# directly, and the sling MUST stay bd-ready-visible for THAT instance's own
+# fresh Step-1c — the pool's real, guaranteed discovery path, wholly
+# independent of this nudge. Suppressing unconditionally would starve that
+# path outright, not just close the race (the reason pool targets were
+# excluded from the REUSE branch above in the first place — right call for
+# that decision, just incomplete for this narrower one). Fail-open on a
+# liveness-probe error or a non-pool target: return false (do not suppress)
+# so a transient `gc session list` failure, or a named-crew identity that
+# was never a template to begin with, never suppresses a bead the primary
+# self-serve path may need to find.
+_pilot_pool_target_has_live_session() {
+  local _plts_target="$1" _plts_count
+  case "$_plts_target" in
+    gastown.dog|gastown.dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*) : ;;
+    *) return 1 ;;
+  esac
+  _plts_count=$(timeout 10 gc --city "$GC_CITY" session list --json 2>/dev/null \
+    | jq --arg t "$_plts_target" \
+        '[.sessions[]? | select((.template // "") == $t and (.state=="active" or .state=="creating"))] | length' \
+        2>/dev/null)
+  case "$_plts_count" in ''|*[!0-9]*) _plts_count=0 ;; esac
+  [ "$_plts_count" -gt 0 ]
+}
+
 _pilot_hold_or_escalate() {
   local _phe_db="$1" _phe_id="$2" _phe_slug="$3" _phe_reason="$4" _phe_unblock="$5"
   local _phe_labels="${6:-[]}" _phe_cap="${7:-$PILOT_HOLD_ESCALATE_CAP}"
@@ -9168,6 +9223,21 @@ TASK
     # sling bead must not look like unclaimed pool demand to a second idle
     # worker's own routed-pool probe. See _pilot_suppress_reused_sling.
     if [ "$_DISPATCH_REUSE" = "1" ]; then
+      _pilot_suppress_reused_sling "$GC_CITY" "$SLING_BEAD_ID"
+    fi
+
+    # ga-hpc1x: sibling gap for EPHEMERAL POOL targets (gastown.dog,
+    # wa-worker*, ps-worker*) — _DISPATCH_REUSE is force-0 for these (see
+    # gt-4st3n _skip_reuse, ~L8524), so the REUSE block right above never
+    # ran for them, even though their own delivery a few lines below (plain
+    # `gc session nudge`, the non-REUSE `else` case) can ALSO land directly
+    # on an already-live instance of the pool. See
+    # _pilot_pool_target_has_live_session's own header comment for the full
+    # incident (ga-hpc1x) this closes. Independent of the branch above —
+    # both call the same idempotent helper, so the two are safe even if a
+    # future change ever made them co-occur.
+    if _pilot_pool_target_has_live_session "$_SLING_TARGET"; then
+      log "  ga-hpc1x: $_SLING_TARGET has a live instance — suppressing sling $SLING_BEAD_ID's pool-visibility (bounded defer) in case the nudge below lands on it directly, same protection ga-i58em gives REUSE dispatch."
       _pilot_suppress_reused_sling "$GC_CITY" "$SLING_BEAD_ID"
     fi
 
