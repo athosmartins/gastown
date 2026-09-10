@@ -194,10 +194,19 @@ g="$(_gocache_size_gb "/nonexistent/path/$$/does-not-exist")"
 [ "$g" = "" ] && ok "_gocache_size_gb(nonexistent path) → '' (du failure surfaces, not masked)" || bad "_gocache_size_gb(nonexistent) got: '$g' (expected empty)"
 
 # ── _gocache_size_gb: default-arg path resolves via the real _gocache_dir
-#    (go env GOCACHE, or the macOS-default fallback) end to end on this host ──
+#    (go env GOCACHE, or the macOS-default fallback) end to end on this host.
+#    Accepts EITHER a non-negative integer (dir present) OR '' (dir absent —
+#    e.g. right after _reap_gocache's own `go clean -cache`, or before any
+#    `go build` ever ran): both are _gocache_size_gb's documented, valid
+#    outcomes — same ga-p5q3 discipline as the nonexistent-path case just
+#    above, now applied to whatever this host's real dir happens to be right
+#    now instead of a manufactured path. Attempt-1 gate feedback (ga-cwm2m)
+#    caught this collapsing '' into a FAIL, live-reproduced on a host where
+#    GOCACHE didn't exist at that instant ──────────────────────────────────
 g="$(_gocache_size_gb)"
 case "$g" in
-  ''|*[!0-9]*) bad "_gocache_size_gb() (default dir) did not return an integer (got: '$g')" ;;
+  '') ok "_gocache_size_gb() (default dir) → '' — GOCACHE not present on this host right now (contractually valid, same as the nonexistent-path case above)" ;;
+  *[!0-9]*) bad "_gocache_size_gb() (default dir) returned a non-empty, non-integer value (got: '$g')" ;;
   *) [ "$g" -ge 0 ] && ok "_gocache_size_gb() (default dir, real _gocache_dir resolution) returns a non-negative integer GB ($g)" || bad "_gocache_size_gb() returned negative: $g" ;;
 esac
 
