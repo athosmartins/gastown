@@ -1268,6 +1268,136 @@ m._pilot_slots, m._pilot_candidates, m._sweep_in_flight = _g1_slots, _g1_cand, _
 m._read_pilot_log_tail = _g1_read_tail
 m.subprocess.run = _g1_run
 
+print("── ga-n47qo: _root_for_bead() must use .beads/routes.jsonl for the id-prefix "
+      "fallback, and must NEVER silently guess HQ for an unrouted prefix ──")
+_rfb_orig_routes = m._ROUTES
+
+m._ROUTES = {}
+eq("store=whatsapp_automation unaffected", m._root_for_bead("x-1", "whatsapp_automation"),
+   ("/Users/athos/gt/whatsapp_automation", "WA"))
+eq("store=property_scrapers unaffected", m._root_for_bead("x-1", "property_scrapers"),
+   ("/Users/athos/gt/property_scrapers", "PS"))
+eq("store=hq unaffected", m._root_for_bead("x-1", "hq"), (m.CITY, "HQ"))
+
+print("── ga-n47qo: routes.jsonl-derived prefixes (the actual bug — lx-/gt- previously "
+      "fell through to a wrongly-guessed HQ) ──")
+m._ROUTES = {"lx": "/Users/athos/gt/lexbh", "gt": "/Users/athos/gt/gastown",
+             "ga": m.CITY, "wa": "/Users/athos/gt/whatsapp_automation",
+             "ps": "/Users/athos/gt/property_scrapers", "ma": "/Users/athos/gt/marketing",
+             "dc": "/Users/athos/gt/deacon"}
+eq("lx-dnw (the exact bead from the bug report) resolves to the lexbh store, not HQ",
+   m._root_for_bead("lx-dnw"), ("/Users/athos/gt/lexbh", "LX"))
+eq("gt-4i3ei (the other exact bead from the bug report) resolves to the gastown store, not HQ",
+   m._root_for_bead("gt-4i3ei"), ("/Users/athos/gt/gastown", "GT"))
+eq("ma-xxxx (marketing, never hardcoded before) resolves via routes.jsonl",
+   m._root_for_bead("ma-xxxx"), ("/Users/athos/gt/marketing", "MA"))
+eq("dc-xxxx (deacon, never hardcoded before) resolves via routes.jsonl",
+   m._root_for_bead("dc-xxxx"), ("/Users/athos/gt/deacon", "DC"))
+eq("ga-xxxx via routes.jsonl still reports rig name HQ (not 'GA') — CITY-rooted stays HQ",
+   m._root_for_bead("ga-xxxx"), (m.CITY, "HQ"))
+eq("wa-xxxx via routes.jsonl still reports WA (unchanged from the old hardcoded path)",
+   m._root_for_bead("wa-xxxx"), ("/Users/athos/gt/whatsapp_automation", "WA"))
+
+print("── ga-n47qo: a prefix with NO route anywhere (not in routes.jsonl, not in the "
+      "hardcoded wa-/ps-/ga- fallback) must return (None, None) — NEVER a guessed HQ ──")
+eq("totally unknown prefix → (None, None), not (CITY, 'HQ')",
+   m._root_for_bead("zz-1234"), (None, None))
+eq("empty bead_id → (None, None), not a crash", m._root_for_bead(""), (None, None))
+
+print("── ga-n47qo: when routes.jsonl is unavailable (_ROUTES empty), the OLD hardcoded "
+      "wa-/ps-/ga- behavior is preserved as a fallback — but an unknown prefix STILL "
+      "must not guess HQ (this is the actual regression: it used to) ──")
+m._ROUTES = {}
+eq("fallback: wa- still hardcoded to WA", m._root_for_bead("wa-x"), ("/Users/athos/gt/whatsapp_automation", "WA"))
+eq("fallback: ps- still hardcoded to PS", m._root_for_bead("ps-x"), ("/Users/athos/gt/property_scrapers", "PS"))
+eq("fallback: ga- still hardcoded to HQ (HQ's own prefix, not \"unknown\")", m._root_for_bead("ga-x"), (m.CITY, "HQ"))
+eq("THE BUG ITSELF: lx- with no routes.jsonl → (None, None), not the old silent (CITY, 'HQ') guess",
+   m._root_for_bead("lx-dnw"), (None, None))
+eq("gt- with no routes.jsonl → (None, None), not the old silent (CITY, 'HQ') guess",
+   m._root_for_bead("gt-4i3ei"), (None, None))
+
+m._ROUTES = _rfb_orig_routes
+
+print("── ga-n47qo: _load_routes() actually parses .beads/routes.jsonl from disk ──")
+import tempfile as _tf_n47qo, os as _os_n47qo, shutil as _shutil_n47qo
+_tmpdir_n47qo = _tf_n47qo.mkdtemp()
+_os_n47qo.makedirs(_os_n47qo.path.join(_tmpdir_n47qo, ".beads"), exist_ok=True)
+with open(_os_n47qo.path.join(_tmpdir_n47qo, ".beads", "routes.jsonl"), "w") as _f_n47qo:
+    _f_n47qo.write('{"prefix":"lx","path":"../lexbh"}\n')
+    _f_n47qo.write('{"prefix":"ga","path":"."}\n')
+    _f_n47qo.write('not even json\n')          # malformed line must not break the good ones
+    _f_n47qo.write('{"prefix":"gt","path":"../gastown"}\n')
+_loaded_n47qo = m._load_routes(city=_tmpdir_n47qo)
+eq("_load_routes resolves 'lx' relative to city", _loaded_n47qo.get("lx"),
+   _os_n47qo.path.normpath(_os_n47qo.path.join(_tmpdir_n47qo, "../lexbh")))
+eq("_load_routes resolves 'ga' (path '.') to city itself", _loaded_n47qo.get("ga"), _tmpdir_n47qo)
+eq("_load_routes resolves 'gt' (after the malformed line) — one bad line doesn't lose the rest",
+   _loaded_n47qo.get("gt"), _os_n47qo.path.normpath(_os_n47qo.path.join(_tmpdir_n47qo, "../gastown")))
+eq("_load_routes: malformed line produces no extra key", len(_loaded_n47qo), 3)
+eq("_load_routes: missing routes.jsonl entirely → {} (fail-open, never a crash)",
+   m._load_routes(city=_tf_n47qo.mkdtemp()), {})
+_shutil_n47qo.rmtree(_tmpdir_n47qo, ignore_errors=True)
+
+print("── ga-n47qo: check_approved() end-to-end — an unrouted-prefix bead lands in a "
+      "distinct no_route bucket, and bd show is NEVER attempted for it ──")
+_ca_orig_routes = m._ROUTES
+m._ROUTES = {"wa": "/Users/athos/gt/whatsapp_automation"}   # lx/gt intentionally absent
+snap3 = {"generated_at": "2999-01-01T00:00:00Z", "ttl_seconds": 600, "count": 2,
+         "items": [{"id": "lx-dnw", "store": "", "title": "no known route"},
+                   {"id": "wa-OK", "store": "whatsapp_automation", "title": "routed fine"}]}
+_fd3, _p3 = tempfile.mkstemp(suffix=".json"); os.write(_fd3, json.dumps(snap3).encode()); os.close(_fd3)
+m.DISPATCHABLE_JSON = _p3
+m._gate_source_beads = lambda: set()
+_bd_show_calls_n47qo = []
+def _bd_show_spy_n47qo(root, bid):
+    _bd_show_calls_n47qo.append(bid)
+    return ["ctx:ready", "exec:auto"]
+m._bd_show_labels_text = _bd_show_spy_n47qo
+_a3 = m.check_approved()
+os.unlink(_p3)
+eq("lx-dnw lands in no_route, not read_err", _a3.get("no_route"), ["lx-dnw"])
+eq("lx-dnw does NOT appear in read_err (distinct failure mode — no read was even attempted)",
+   "lx-dnw" in _a3["read_err"], False)
+eq("bd show was called ONLY for the routable bead (wa-OK) — never for the unrouted one",
+   _bd_show_calls_n47qo, ["wa-OK"])
+eq("the routable bead still classifies normally (stuck)", [s["id"] for s in _a3["stuck"]], ["wa-OK"])
+m._ROUTES = _ca_orig_routes
+
+print("── ga-n47qo: main() end-to-end — a no_route bead still yields an honest INCERTO "
+      "(never a false ✅, never a crash), with a message naming 'rota' distinctly from "
+      "the generic 'bd show falhou' read-error message ──")
+_nr_ca, _nr_cg, _nr_cp, _nr_cd, _nr_rigs = m.check_approved, m.check_gate, m.check_pilot, m.check_dolt, m.RIGS
+_nr_read_tail = m._read_pilot_log_tail
+m.check_approved = lambda: {
+    "total": 1, "parked_count": 0, "in_gate_count": 0, "buildable_count": 0,
+    "flowing_count": 0, "held_count": 0, "stuck": [],
+    "read_err": [], "no_route": ["lx-dnw", "gt-4i3ei"], "warns": [],
+    "from_dispatchable": True, "snap_age_min": 1.0,
+}
+m.check_gate = lambda: {"active": [], "parked": [], "last_pass_min": 1.0,
+                         "reviewer_alive": True, "oldest_active_min": None,
+                         "stalled": False, "stall_reason": ""}
+m.check_pilot = lambda: {"alive": True, "last_sweep_min": 0.5}
+m.check_dolt = lambda: {"responsive": True, "latency_ms": 10}
+m.RIGS = []
+m._read_pilot_log_tail = lambda: None
+_bufNR = io.StringIO()
+_exitNR = None
+try:
+    with contextlib.redirect_stdout(_bufNR):
+        m.main()
+except SystemExit as e:
+    _exitNR = e.code
+_outNR = _bufNR.getvalue()
+eq("no_route beads alone → exit 2 (INCERTO), never ❌ NÃO IMPARÁVEL nor a crash", _exitNR, 2)
+eq("report names both unrouted ids", ("lx-dnw" in _outNR) and ("gt-4i3ei" in _outNR), True)
+eq("report says 'rota' (distinct from the generic bd-show-failed wording)", "rota" in _outNR, True)
+eq("report does NOT claim 'bd show falhou' for these (that would misattribute the cause)",
+   "bd show falhou" in _outNR, False)
+
+m.check_approved, m.check_gate, m.check_pilot, m.check_dolt, m.RIGS = _nr_ca, _nr_cg, _nr_cp, _nr_cd, _nr_rigs
+m._read_pilot_log_tail = _nr_read_tail
+
 print()
 print("RESULT: %d passed, %d failed" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

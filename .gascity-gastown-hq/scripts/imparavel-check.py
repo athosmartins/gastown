@@ -144,20 +144,69 @@ def _labels(b):
     return l if isinstance(l, list) else []
 
 
+def _load_routes(city=None):
+    """Parse the canonical prefix->path map from .beads/routes.jsonl (paths in
+    that file are relative to CITY — e.g. {"prefix":"lx","path":"../lexbh"} —
+    not to .beads/ itself). Returns {prefix: abs_path}; {} on ANY read/parse
+    error, including a missing file (fail-open: _root_for_bead then falls back
+    to its hardcoded wa-/ps-/ga- list below, never crashes the whole check).
+    A single malformed line is skipped, not fatal to the rest of the file."""
+    city = city or CITY
+    routes = {}
+    try:
+        with open(os.path.join(city, ".beads", "routes.jsonl")) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    prefix, rel = entry.get("prefix"), entry.get("path")
+                    if prefix and rel:
+                        routes[prefix] = os.path.normpath(os.path.join(city, rel))
+                except Exception:
+                    continue
+    except Exception:
+        return {}
+    return routes
+
+
+# Loaded once at import — routes.jsonl is runtime-maintained state, not source,
+# same "read once, treat as static config" convention PARKING_LABELS uses above.
+_ROUTES = _load_routes()
+
+
 def _root_for_bead(bead_id, store=None):
-    """Return (root_path, rig_name) for a bead, by store field or id prefix."""
+    """Return (root_path, rig_name) for a bead: by store field, then by id
+    prefix via the canonical .beads/routes.jsonl map (_ROUTES), then by the
+    fixed wa-/ps-/ga- list as a last-resort fallback (routes.jsonl missing or
+    unreadable).
+
+    Returns (None, None) — NEVER a guessed HQ — when the prefix matches none
+    of the above. Before ga-n47qo, any unrecognized prefix (lx-, gt-, ma-,
+    dc-, ...) silently fell through to `return CITY, "HQ"`; the subsequent
+    `bd -C <HQ> show <id>` then failed (the bead lives in a different store)
+    and got misreported as an indistinguishable generic read error — see the
+    dedicated no_route bucket in check_approved()/main(), which reports this
+    case with its own honest message instead."""
     if store == "whatsapp_automation":
         return "/Users/athos/gt/whatsapp_automation", "WA"
     if store == "property_scrapers":
         return "/Users/athos/gt/property_scrapers", "PS"
     if store == "hq":
         return CITY, "HQ"
-    # Fallback by id prefix
+    prefix = (bead_id or "").split("-", 1)[0]
+    if prefix in _ROUTES:
+        root = _ROUTES[prefix]
+        return root, ("HQ" if root == CITY else prefix.upper())
+    # Fallback (routes.jsonl missing/unreadable): the previously-hardcoded set.
     if bead_id.startswith("wa-"):
         return "/Users/athos/gt/whatsapp_automation", "WA"
     if bead_id.startswith("ps-"):
         return "/Users/athos/gt/property_scrapers", "PS"
-    return CITY, "HQ"
+    if bead_id.startswith("ga-"):
+        return CITY, "HQ"
+    return None, None
 
 
 def _bd_show_labels_text(root, bead_id):
@@ -326,12 +375,17 @@ def check_approved():
     parked, buildable, stuck = [], [], []
     flowing_count, held_count, in_gate_count = 0, 0, 0
     read_err = []
+    no_route = []
 
     for item in items[:MAX_CLASSIFY]:
         bead_id = item.get("id", "")
         store = item.get("store", "")
         title = (item.get("title") or "")[:55]
         root, rig = _root_for_bead(bead_id, store)
+
+        if root is None:
+            no_route.append(bead_id)
+            continue
 
         labels = _bd_show_labels_text(root, bead_id)
         if labels is None:
@@ -372,6 +426,7 @@ def check_approved():
         "held_count": held_count,
         "stuck": stuck,
         "read_err": read_err,
+        "no_route": no_route,
         "warns": warns,
         "from_dispatchable": True,
         "snap_age_min": snap_age_min,
@@ -969,6 +1024,11 @@ def main():
     if a["read_err"]:
         warns.append("não consegui classificar %d bead(s) (bd show falhou): %s"
                      % (len(a["read_err"]), ", ".join(str(x) for x in a["read_err"][:8])))
+    if a.get("no_route"):
+        warns.append(
+            "%d bead(s) com prefixo sem rota conhecida (fora de .beads/routes.jsonl e do "
+            "fallback fixo wa-/ps-/ga-): %s"
+            % (len(a["no_route"]), ", ".join(str(x) for x in a["no_route"][:8])))
 
     # ga-wmrr/ga-zkxdw: a construível queued behind a pool saturated FOR ITS OWN
     # LANE has nowhere to go regardless of what the OTHER lane has free — that is
