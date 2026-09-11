@@ -265,7 +265,26 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # shared runtime state; if _FILTER_RECLAIM_CAP ever changes, this literal
 # must be updated too. Regression coverage: pool-probe-priority-sort
 # .selftest.sh's reclaim-cap-exclusion case (not caught automatically).
-bd ready --metadata-field "gc.routed_to=wa-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --json --sort priority --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select((.labels // []) | map(select(startswith("blocked:"))) | length == 0) | select((.labels // []) | map(select(startswith("gate:needs-human"))) | length == 0) | select((.labels // []) | map(select(startswith("pilot:text-veto"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | if length > 0 then (max < 3) else true end)] | sort_by([.priority, (.updated_at // .created_at // "")]) | .[:1]'
+# ga-q65d8: also excludes delivery:pending-restart (exact-match). That label
+# is the canonical, deliberate hold stamped by the daemon-verification
+# mechanism (ga-l7n3v/ga-puq8z) once a bead's fix has already passed the
+# quality gate and merged, but a long-lived hot-path daemon may still be
+# running the old code — "done as far as any builder is concerned," the only
+# remaining step being an operational guarded restart (sometimes gated on a
+# domain-specialist's production-timing judgment call), never a code change.
+# This probe bypasses Pilot's dispatch path entirely, same as every gap
+# above, so it had no awareness of the hold. Live incident: wa-k2j6n
+# (labels ctx:ready, delivery:pending-restart, exec:auto, gate:passed,
+# lane:small, pilot:reclaim-count:1, scope:advisory; unassigned) cost 3
+# separate worker sessions a full from-scratch re-investigation each — the
+# gate has already passed, so no branch-progress liveness signal is ever
+# possible again, and the bead had already been explicitly routed by the
+# Mayor to a named domain owner (oracle-wa) for a timing decision a generic
+# ephemeral worker has no basis to make safely. Without this exclusion it
+# will keep re-surfacing roughly every reclaim-guard TTL window until that
+# owner acts, regardless of how many times it is re-parked by hand.
+# Regression coverage: pool-probe-delivery-pending-restart.selftest.sh.
+bd ready --metadata-field "gc.routed_to=wa-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --exclude-label "delivery:pending-restart" --json --sort priority --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select((.labels // []) | map(select(startswith("blocked:"))) | length == 0) | select((.labels // []) | map(select(startswith("gate:needs-human"))) | length == 0) | select((.labels // []) | map(select(startswith("pilot:text-veto"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | if length > 0 then (max < 3) else true end)] | sort_by([.priority, (.updated_at // .created_at // "")]) | .[:1]'
 # If it returns a bead (output is NOT []), THAT BEAD IS YOURS. Claim it FIRST:
 #     gc bd update <id> --claim
 # verify the claim set assignee to your session, then go to the Build Protocol and build it.
@@ -305,7 +324,16 @@ bd ready --metadata-field "gc.routed_to=wa-worker" --unassigned --exclude-type=e
 # >=3 threshold, same hardcoded-literal caveat (this template and
 # pilot-dispatcher.sh share no runtime state). Regression coverage:
 # pool-probe-priority-sort.selftest.sh's fallback-inherits-reclaim-cap case.
-{{ .RoutedPoolQuery }} | jq -c '[.[] | select(((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | if length > 0 then (max < 3) else true end)]'
+#
+# ga-q65d8: the delivery:pending-restart exclusion added to Step 1b2 above is
+# mirrored into this fallback's post-filter too, same "post-filter on the
+# OUTPUT" technique as the reclaim-cap clause immediately above (the
+# Go-rendered query itself stays off-limits per the same Mayor decision).
+# This file's own documented drift history (ga-s1d5o, ga-42mlf/ga-c2w3k)
+# means an exclusion landing on Step 1b2 is never assumed to reach this
+# fallback automatically — it does not, until added here explicitly.
+# Regression coverage: pool-probe-delivery-pending-restart.selftest.sh.
+{{ .RoutedPoolQuery }} | jq -c '[.[] | select((.labels // []) | map(select(. == "delivery:pending-restart")) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | if length > 0 then (max < 3) else true end)]'
 
 # Step 1c: ONLY if Steps 1a / 1b / 1b2 / 1b3 are ALL empty — no work — drain and exit.
 gc runtime drain-ack && exit
