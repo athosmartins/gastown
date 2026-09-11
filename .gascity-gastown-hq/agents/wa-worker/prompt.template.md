@@ -22,14 +22,24 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # Step 1b: If none, check for assigned ready work (claimed by the sling, verify+start)
 {{ .AssignedReadyQuery }}
 
-# Step 1b2: If none, check for ROUTED pool demand (gc.routed_to=wa-worker metadata)
-{{ .RoutedPoolQuery }}
-
-# Step 1b3 (ga-dbibq — CRITICAL, do NOT skip): the rendered RoutedPoolQuery above is
-# GATED on GC_SESSION_ORIGIN=ephemeral. A pilot-spawned worker (gc session new) gets a
-# NON-ephemeral origin, so that gated probe is silently SKIPPED and you would wrongly drain
-# while real pool work waits unclaimed. You ARE a dedicated wa-worker — ALWAYS run this
-# UN-GATED routed-pool probe directly:
+# Step 1b2 (ga-dbibq, ga-x80j1, ga-0pg2o — CRITICAL, do NOT skip, run FIRST):
+# the un-gated, priority-aware routed-pool probe below. Renumbered from
+# "Step 1b3" by ga-0pg2o (Mayor decision, 2026-09-10), which swapped this
+# probe to run BEFORE the Go-rendered query (moved to Step 1b3 below) for
+# EVERY session regardless of origin. Why: that Go-rendered query is GATED
+# on GC_SESSION_ORIGIN=ephemeral (ga-dbibq) — a Pilot-spawned worker
+# (`gc session new`) gets a NON-ephemeral origin, so it silently renders to
+# a no-op for such a worker, and this probe was already the only one such a
+# worker ever got real results from. The gap ga-0pg2o closed: a genuinely
+# ephemeral-origin session still hit that Go-rendered query FIRST, and it is
+# LRU-only with no priority awareness (routedReadyTierCommand,
+# internal/config/config.go) — so ga-x80j1's priority-sort fix below never
+# reached an ephemeral-origin session, which could still claim an older,
+# lower-priority routed bead ahead of a freshly-dispatched P0/P1.
+# {{ .RoutedPoolQuery }} appears in no template but this one and ps-worker's
+# (verified: grep across agents/ and packs/), so the fix belongs here, not
+# in the engine. You ARE a dedicated wa-worker — ALWAYS run this UN-GATED
+# routed-pool probe directly, first:
 # ga-y8qh: excludes pool:refused:*/story:needs-human/ctx:thin — nothing clears
 # gc.routed_to after a refusal, so without this filter every fresh worker
 # re-fetches and re-confirms the SAME already-parked bead, burning a full
@@ -139,9 +149,9 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # story:blocked (exact-match) plus blocked:<reason> and gate:needs-human(:<reason>)
 # (prefix, via jq below). This probe had drifted OUT of sync with
 # bdReadyPoolDemandExcludeLabelArgs()/poolDemandLabelFilterJQ() — the Go
-# functions that render Step 1b2/.RoutedPoolQuery above — which already
-# carried these three park labels (ga-5huvs) that this hardcoded Step 1b3
-# copy never picked up. Found while fixing the INVERSE gap: Step 1b2 was
+# functions that render Step 1b3/.RoutedPoolQuery below — which already
+# carried these three park labels (ga-5huvs) that this hardcoded Step 1b2
+# copy never picked up. Found while fixing the INVERSE gap: Step 1b3 was
 # missing exec:manual/refino-stage, i.e. THIS file's own ga-znlvl fix, which
 # was applied only here and never backported to the Go side (see ga-s1d5o).
 # Bringing both lists to the same superset in one pass so neither direction
@@ -172,11 +182,11 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # (pilot-dispatcher.sh) stamps on a bead the Pilot vetoed by TEXT content
 # (engine-rebuild mention, a DECISAO title, an "only Athos decides" phrase, a
 # compliance marker, a diagnostic-only body). ga-42mlf's close reason claims
-# the Go-rendered Step 1b2 above already excludes this family
+# the Go-rendered Step 1b3 below already excludes this family
 # (poolDemandLabelFilterJQ) — NOT independently confirmed here: that symbol
 # and the commit SHA the close reason cites are both absent from the current
 # origin/main tree (see ga-c2w3k, filed alongside this fix, for the
-# verification trail). This file's Step 1b3 fix does not depend on Step 1b2's
+# verification trail). This file's Step 1b2 fix does not depend on Step 1b3's
 # real state either way — it is plain text, not Go-rendered, so it inherits
 # nothing automatically regardless. Live incident: this copy offered wa-es2v1
 # (pilot:text-veto:compliance-marker-text-pattern) as candidate #1 on
@@ -187,10 +197,12 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # Regression coverage: pool-probe-text-veto-family.selftest.sh.
 #
 # ga-x80j1: --sort oldest (below) starved higher-priority routed beads. Step
-# 1b2 (.RoutedPoolQuery) is Go-rendered and GATED on GC_SESSION_ORIGIN=ephemeral
+# 1b3 (.RoutedPoolQuery) is Go-rendered and GATED on GC_SESSION_ORIGIN=ephemeral
 # (ga-dbibq) — a Pilot-spawned worker (`gc session new`) gets a NON-ephemeral
-# origin, so Step 1b2 never runs for it and this Step 1b3 copy is the ONLY
-# query such a worker ever executes. `bd ready --help` documents --sort's
+# origin, so Step 1b3 renders to a no-op for it (ga-0pg2o: consulted below as
+# a fallback, but never returns anything for such a worker) and this Step 1b2
+# copy is the ONLY query such a worker ever gets real results from.
+# `bd ready --help` documents --sort's
 # values as "priority (default), hybrid, oldest" — this line explicitly
 # overrode the sane default to raw creation-time FIFO, so any older
 # lower-priority routed bead beat a fresh P0 to the front of the line.
@@ -206,7 +218,7 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # type is only a tiebreak."
 #
 # NOT a plain `--sort priority` swap: the engine's OWN routedReadyTierCommand
-# (internal/config/config.go, renders the gated Step 1b2 this file mirrors)
+# (internal/config/config.go, renders the gated Step 1b3 this file mirrors)
 # deliberately uses --sort oldest + a trailing `sort_by(.updated_at //
 # .created_at)` instead of priority — ga-w4k2z's comment there explains why:
 # a repeatedly-reclaimed bead's created_at never changes, so a pure static
@@ -224,20 +236,55 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # updated_at as the tiebreak WITHIN each priority tier — so a poisoned bead
 # still cedes its slot to same-priority siblings on repeat reclaims, and a
 # fresh high-priority bead is never buried behind an older low-priority one.
-# residual (not fixed here — flagging, not expanding scope): the engine's
-# routedReadyTierCommand itself has no priority-awareness at all, so a
-# genuinely-ephemeral-origin worker session (one that actually hits the
-# Go-rendered Step 1b2, unlike a Pilot-spawned one) still gets pure LRU
-# ordering with no priority signal. Bringing it in line with this same
-# compound approach is an engine-side change (out of pack-level reach, and
-# a real design tradeoff — see ga-w4k2z — that deserves human/Mayor review
-# rather than a dog unilaterally patching it) — flagged in the ga-x80j1 bead,
-# not fixed here. Regression coverage: pool-probe-priority-sort.selftest.sh.
-bd ready --metadata-field "gc.routed_to=wa-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --json --sort priority --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select((.labels // []) | map(select(startswith("blocked:"))) | length == 0) | select((.labels // []) | map(select(startswith("gate:needs-human"))) | length == 0) | select((.labels // []) | map(select(startswith("pilot:text-veto"))) | length == 0)] | sort_by([.priority, (.updated_at // .created_at // "")]) | .[:1]'
+# residual (still not fixed here — flagging, not expanding scope): the
+# engine's routedReadyTierCommand itself still has no priority-awareness at
+# all. ga-0pg2o (2026-09-10) closed the main consequence of this: a
+# genuinely-ephemeral-origin session now hits this priority-aware probe
+# FIRST, same as every other origin, because the Go-rendered query was
+# demoted to a Step 1b3 fallback consulted only if this one found nothing.
+# The remaining gap is narrower — within that fallback-only path, an
+# ephemeral-origin session whose Step 1b2 comes back empty still gets pure
+# LRU ordering with no priority signal from Step 1b3. Bringing the engine
+# itself in line with this same compound approach is still an engine-side
+# change (out of pack-level reach, and a real design tradeoff — see
+# ga-w4k2z — that deserves human/Mayor review rather than a dog unilaterally
+# patching it) — flagged in the ga-x80j1 bead, not fixed here or in
+# ga-0pg2o. Regression coverage: pool-probe-priority-sort.selftest.sh.
+#
+# ga-0pg2o: also excludes a bead at Pilot's reclaim-count cap. Mirrors
+# pilot-dispatcher.sh's own OPERATIVE exclusion exactly (_FILTER_RECLAIM_CAP=3
+# at ~line 1988; applied ~lines 2964-2967): a bead's labels are scanned for
+# pilot:reclaim-count:<n>, and if the MAX such n is >= 3 the bead is
+# excluded. Without this, putting priority sort first (above) lets a single
+# always-failing P0/P1 bead with no same-priority sibling monopolize
+# position 0 for every new session forever — the compound sort's updated_at
+# tiebreak (ga-w4k2z, above) only protects a bead from a same-priority
+# sibling, not from being the sole occupant of its own priority tier. The
+# threshold (3) is a hardcoded literal, not read from a shared variable —
+# pilot-dispatcher.sh and this template are separate processes with no
+# shared runtime state; if _FILTER_RECLAIM_CAP ever changes, this literal
+# must be updated too. Regression coverage: pool-probe-priority-sort
+# .selftest.sh's reclaim-cap-exclusion case (not caught automatically).
+bd ready --metadata-field "gc.routed_to=wa-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --json --sort priority --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select((.labels // []) | map(select(startswith("blocked:"))) | length == 0) | select((.labels // []) | map(select(startswith("gate:needs-human"))) | length == 0) | select((.labels // []) | map(select(startswith("pilot:text-veto"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | if length > 0 then (max < 3) else true end)] | sort_by([.priority, (.updated_at // .created_at // "")]) | .[:1]'
 # If it returns a bead (output is NOT []), THAT BEAD IS YOURS. Claim it FIRST:
 #     gc bd update <id> --claim
 # verify the claim set assignee to your session, then go to the Build Protocol and build it.
 # Do NOT drain while this probe returns a bead.
+
+# Step 1b3 (fallback ONLY — ga-0pg2o, 2026-09-10): Step 1b2 above already
+# covers every session origin, so only consult this if it returned []. This
+# is the original Go-rendered query, GATED on GC_SESSION_ORIGIN=ephemeral
+# (ga-dbibq) and LRU-only by design (routedReadyTierCommand,
+# internal/config/config.go — no priority awareness, deliberately: see
+# ga-w4k2z above; the Mayor's ga-0pg2o decision was to leave the engine
+# as-is). For a Pilot-spawned (non-ephemeral) session this still renders to
+# a no-op, same as always. For a genuinely ephemeral-origin session it is
+# now a second look after Step 1b2, kept as a safety net rather than
+# deleted outright — parity between this Go path's poolDemandLabelFilterJQ()
+# and Step 1b2's hardcoded exclude list was never fully audited (ga-42mlf's
+# parity claim was left unconfirmed by ga-c2w3k), so removing this outright
+# could silently drop a protection Step 1b2 hasn't mirrored yet:
+{{ .RoutedPoolQuery }}
 
 # Step 1c: ONLY if Steps 1a / 1b / 1b2 / 1b3 are ALL empty — no work — drain and exit.
 gc runtime drain-ack && exit
