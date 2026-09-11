@@ -472,10 +472,19 @@ def rotting_sessions(now=None, self_name=None, sessions=None):
 
 
 # ── repair-agent handoff (ga-afytf mechanism), rate-limited ───────────────────
+# ga-4s4t6: this text becomes the repair bead's DESCRIPTION (via
+# build_repair_payload → `gc sling --stdin`). It must never contain a literal
+# 🚨 — the Pilot's compliance-marker-text-pattern veto (pilot-dispatcher.sh,
+# _TEXT_VETO_PATTERNS) matches that exact glyph in title+description and
+# excludes the bead from dispatch entirely, so the autonomous repair this
+# mechanism exists for would never run. The `notify` CLI call an executing
+# repair dog actually makes is free to use the emoji (see notify() below and
+# the 🚨-paging call in run_tick) — only the TEMPLATE TEXT that becomes bead
+# content is constrained.
 REPAIR_HEADER = (
     "Você é um agente de REPARO autônomo despachado pelo pipeline-throughput-heartbeat. "
     "Rode o runbook abaixo SOZINHO (colete diag, conserte, verifique). Só acione o humano "
-    "(notify 🚨 -p 5) se NÃO conseguir resolver. Quando terminar, feche seu bead e saia.\n\n")
+    "(notify -p 5) se NÃO conseguir resolver. Quando terminar, feche seu bead e saia.\n\n")
 
 
 def repair_runbook(kind, reason):
@@ -551,6 +560,18 @@ def _parse_spawned_id(r):
     return None
 
 
+def build_repair_payload(kind, reason, diag_path):
+    """Pure render of the repair bead's title+body — no subprocess calls. This is the
+    EXACT text spawn_repair_agent hands to `gc sling --stdin` (title = first line,
+    REPAIR_HEADER + runbook + diag path = the rest). Split out so a selftest can render
+    it and check it against the Pilot's own text-veto patterns without touching gc/bd
+    (ga-4s4t6)."""
+    title = "🔧 REPARO AUTÔNOMO heartbeat (%s): %s" % (kind, reason[:80])
+    payload = (title + "\n\n" + REPAIR_HEADER + repair_runbook(kind, reason)
+               + "\nDiagnóstico salvo em: %s\n" % diag_path)
+    return title, payload
+
+
 def spawn_repair_agent(kind, reason, diag_path):
     """PRIMARY recovery (ga-afytf mechanism): route the runbook to the gastown.dog pool
     AND spawn a dog directly so recovery doesn't depend on the demand reconciler the
@@ -560,9 +581,7 @@ def spawn_repair_agent(kind, reason, diag_path):
     as a live sibling (ga-vym2m), the literal string "routed" if the bead routed but the
     spawned id could not be parsed (still a success — the title signature will catch the
     dog), or None if routing itself failed."""
-    title = "🔧 REPARO AUTÔNOMO heartbeat (%s): %s" % (kind, reason[:80])
-    payload = (title + "\n\n" + REPAIR_HEADER + repair_runbook(kind, reason)
-               + "\nDiagnóstico salvo em: %s\n" % diag_path)
+    title, payload = build_repair_payload(kind, reason, diag_path)
     r = sh(["gc", "sling", DOG_TEMPLATE, "--stdin", "--json"], stdin=payload, timeout=45)
     routed = r is not None and r.returncode == 0
     if not routed:
