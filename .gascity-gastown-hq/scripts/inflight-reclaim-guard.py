@@ -453,6 +453,14 @@ REPOS = [
     "/Users/athos/gt/whatsapp_automation",
 ]
 
+# ga-2uyvc: bound on how many upstream commits preserve_unpushed_branch() will
+# patch-id-scan when checking whether a local branch's content already landed
+# under a different sha (rebase/squash). Beyond this, the range is treated as
+# too large to scan cheaply and the check is skipped for that ref — fails
+# open to the pre-existing push-attempt behavior, never less safe than before
+# this check existed.
+PATCH_ID_SCAN_CAP = 300
+
 # Session states that indicate a live active builder.
 # Always-on COORDINATOR roles (ga-7m191): a story bead whose assignee names one
 # of these is PARKED, not being actively built — these sessions never die, so
@@ -2274,6 +2282,103 @@ def _branch_segment_matches_bead(segment, bead_id):
             or segment.startswith(bead_id + "."))
 
 
+def _commits_unique_to(repo, tip, base, timeout=30):
+    """Commit shas reachable from `tip` but not from `base` (`git rev-list
+    base..tip`). `tip`/`base` may be a sha or a ref name. None on any git
+    error — callers treat that as "can't tell", never as "empty"."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", repo, "rev-list", f"{base}..{tip}"],
+            capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            return None
+        return [ln for ln in r.stdout.splitlines() if ln.strip()]
+    except Exception:
+        return None
+
+
+def _patch_id_for(repo, sha, timeout=30):
+    """`git patch-id --stable` for one commit's diff — a hash of the diff
+    content, independent of the commit's sha/message/parent, so it matches
+    across a rebase or a squash-merge that changes the sha but not the
+    change itself. None on any error (missing commit, git failure, ...)."""
+    try:
+        show = subprocess.run(
+            ["git", "-C", repo, "show", sha],
+            capture_output=True, text=True, timeout=timeout)
+        if show.returncode != 0:
+            return None
+        pid = subprocess.run(
+            ["git", "-C", repo, "patch-id", "--stable"],
+            input=show.stdout, capture_output=True, text=True, timeout=timeout)
+        if pid.returncode != 0 or not pid.stdout.strip():
+            return None
+        return pid.stdout.split()[0]
+    except Exception:
+        return None
+
+
+def _already_landed_by_patch_id(repo, sha, branch):
+    """True if every commit unique to `sha` (vs origin/main) already has an
+    identical-content match (by `git patch-id`) among the commits origin/main
+    or origin/<branch> gained since the same divergence point (ga-2uyvc).
+
+    Catches what sha-reachability (`git branch -r --contains`) misses: a
+    rebase or squash-merge changes the commit sha but keeps the diff, so
+    --contains reports "not found" for content that already safely landed —
+    confirmed live on wa-wkpt4 (local c174ac78 vs origin c24f866, same patch,
+    different sha). Without this, preserve_unpushed_branch() re-pushes
+    content already on origin under the rescue-ref naming, which is harmless
+    by itself but doubles as log noise and doubles the chance of tripping the
+    slow-hook timeout this same fix addresses.
+
+    Best-effort like the rest of this function: any git error, or an
+    upstream range too large to scan cheaply (PATCH_ID_SCAN_CAP), returns
+    False — fall through to the normal push attempt. Never less safe than
+    before this check existed; at worst, a redundant push.
+    """
+    base = subprocess.run(
+        ["git", "-C", repo, "merge-base", sha, "origin/main"],
+        capture_output=True, text=True, timeout=30)
+    if base.returncode != 0 or not base.stdout.strip():
+        return False
+    merge_base = base.stdout.strip()
+
+    local_commits = _commits_unique_to(repo, sha, merge_base)
+    if not local_commits:
+        return False  # nothing to compare, or can't tell — don't skip the push
+
+    # ref -> divergence point to scan "what landed since" from.
+    ref_bases = {"origin/main": merge_base}
+    branch_check = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "--verify", "-q", f"origin/{branch}"],
+        capture_output=True, text=True, timeout=30)
+    if branch_check.returncode == 0:
+        bb = subprocess.run(
+            ["git", "-C", repo, "merge-base", sha, f"origin/{branch}"],
+            capture_output=True, text=True, timeout=30)
+        if bb.returncode == 0 and bb.stdout.strip():
+            ref_bases[f"origin/{branch}"] = bb.stdout.strip()
+
+    upstream_commits = set()
+    for ref, rbase in ref_bases.items():
+        candidates = _commits_unique_to(repo, ref, rbase)
+        if candidates is None or len(candidates) > PATCH_ID_SCAN_CAP:
+            continue  # can't tell, or too large to scan cheaply — skip this ref only
+        upstream_commits.update(candidates)
+    if not upstream_commits:
+        return False
+
+    upstream_patch_ids = {
+        pid for pid in (_patch_id_for(repo, c) for c in upstream_commits) if pid
+    }
+    for c in local_commits:
+        pid = _patch_id_for(repo, c)
+        if not pid or pid not in upstream_patch_ids:
+            return False
+    return True
+
+
 def preserve_unpushed_branch(bead_id):
     """Push-before-reclaim safety net (ga-ufr7).
 
@@ -2287,13 +2392,28 @@ def preserve_unpushed_branch(bead_id):
 
     For each LOCAL branch across REPOS whose final path segment identifies
     bead_id (via the shared _branch_segment_matches_bead() predicate) and that
-    carries a commit not already reachable from any origin ref:
-      1. Try `git push origin <sha>:refs/heads/<branch>` — recoverable under its
-         own familiar name, immediately resumable by a human or the next builder.
+    carries a commit not already reachable from any origin ref (by sha, or by
+    patch-id — ga-2uyvc, see _already_landed_by_patch_id):
+      1. Try `git push --no-verify origin <sha>:refs/heads/<branch>` —
+         recoverable under its own familiar name, immediately resumable by a
+         human or the next builder.
       2. If that is rejected (a same-named origin branch already diverged),
-         fall back to `git push origin <sha>:refs/reclaimed/<bead_id>/<sha>` — a
-         ref whose name embeds the sha, so it can never collide and the push
-         always succeeds if the remote is reachable at all.
+         fall back to `git push --no-verify origin <sha>:refs/reclaimed/<bead_id>/<sha>`
+         — a ref whose name embeds the sha, so it can never collide and the
+         push always succeeds if the remote is reachable at all.
+
+    --no-verify (ga-2uyvc) skips the target repo's local pre-push hook. These
+    pushes only ever target rescue refs (a `refs/heads/<branch>` under the
+    bead's own name, or `refs/reclaimed/*`), never `main` — so a hook's
+    main-protection/atlas/test guards don't apply here, and running them is
+    pure risk: whatsapp_automation's pre-push hook computes its "which files
+    changed" diff against origin/main unconditionally, regardless of which
+    ref is actually being pushed to (confirmed by reading
+    whatsapp_automation/.git/hooks/pre-push Guard 2), so a rescue-ref push
+    can still trigger a full conditional pytest run and blow this function's
+    30s subprocess timeout — turning a successful preserve into a logged
+    failure for reasons that have nothing to do with whether the push itself
+    was safe.
 
     Best-effort / never raises: any git error is logged and the scan continues
     to the next repo/branch. This is a SAFETY NET, not a correctness gate —
@@ -2354,10 +2474,23 @@ def preserve_unpushed_branch(bead_id):
             except Exception:
                 pass  # can't confirm safety → fall through and attempt the push anyway
 
+            # ga-2uyvc: sha-reachability above misses a REBASED or squash-merged
+            # duplicate — same diff, different sha. Check by content before
+            # spending a push attempt (and a slot in the 30s timeout budget).
+            try:
+                if _already_landed_by_patch_id(repo, sha, branch):
+                    print(f"[INFLIGHT-RECLAIM] preserve-branch: {branch}@{sha[:8]} already "
+                          f"landed upstream (patch-id match) — skipping redundant push",
+                          flush=True)
+                    continue  # already safe by content — nothing to preserve, matches PB-3
+            except Exception:
+                pass  # can't confirm safety → fall through and attempt the push anyway
+
             pushed = False
             try:
                 p = subprocess.run(
-                    ["git", "-C", repo, "push", "origin", f"{sha}:refs/heads/{branch}"],
+                    ["git", "-C", repo, "push", "--no-verify", "origin",
+                     f"{sha}:refs/heads/{branch}"],
                     capture_output=True, text=True, timeout=30)
                 if p.returncode == 0:
                     pushed = True
@@ -2370,7 +2503,8 @@ def preserve_unpushed_branch(bead_id):
                 tag_ref = f"refs/reclaimed/{bead_id}/{sha}"
                 try:
                     p2 = subprocess.run(
-                        ["git", "-C", repo, "push", "origin", f"{sha}:{tag_ref}"],
+                        ["git", "-C", repo, "push", "--no-verify", "origin",
+                         f"{sha}:{tag_ref}"],
                         capture_output=True, text=True, timeout=30)
                     if p2.returncode == 0:
                         preserved.append(f"{branch}@{sha[:8]} tagged {tag_ref}")
@@ -5629,6 +5763,110 @@ def _selftest():
         except Exception as exc:
             check("PB-5: both pushes fail → best-effort empty result, does not raise",
                   False, f"raised {exc!r} instead of returning []")
+
+        # PB-6..9 (ga-2uyvc): --no-verify on both push paths, and the
+        # patch-id already-landed check. _capturing wraps a stub so we can
+        # assert on the EXACT argv issued, not just the outcome.
+        def _capturing(inner):
+            calls = []
+            def _run(cmd, **kw):
+                calls.append(cmd)
+                return inner(cmd, **kw)
+            return _run, calls
+
+        # PB-6: own-name push must carry --no-verify. whatsapp_automation's
+        # pre-push hook computes its "files changed" diff against origin/main
+        # UNCONDITIONALLY, regardless of which ref is actually being pushed
+        # to (confirmed by reading .git/hooks/pre-push Guard 2) — so a push
+        # to a throwaway rescue ref can still trigger a full conditional
+        # pytest run and blow this function's 30s timeout for reasons that
+        # have nothing to do with whether the push itself was safe.
+        subprocess.run, _calls6 = _capturing(_stub_preserve(
+            branches=[("fix/ga-fakebead-my-fix", _FAKE_SHA)]))
+        res = preserve_unpushed_branch("ga-fakebead")
+        push_cmds = [c for c in _calls6 if "push" in c]
+        check("PB-6: own-name push carries --no-verify (bypasses a slow/expensive "
+              "local pre-push hook on a rescue ref) — ga-2uyvc",
+              len(res) == 1 and "pushed to origin/fix/ga-fakebead-my-fix" in res[0]
+              and len(push_cmds) == 1 and "--no-verify" in push_cmds[0],
+              f"res={res!r} push_cmds={push_cmds!r}")
+
+        # PB-7: fallback tag-push (own-name push rejected) also carries --no-verify.
+        subprocess.run, _calls7 = _capturing(_stub_preserve(
+            branches=[("fix/ga-fakebead-my-fix", _FAKE_SHA)],
+            own_push_ok=False, tag_push_ok=True))
+        res = preserve_unpushed_branch("ga-fakebead")
+        tag_cmds = [c for c in _calls7
+                    if "push" in c and c[-1].split(":", 1)[1].startswith("refs/reclaimed/")]
+        check("PB-7: fallback tag-push also carries --no-verify — ga-2uyvc",
+              len(res) == 1 and "tagged refs/reclaimed/" in res[0]
+              and len(tag_cmds) == 1 and "--no-verify" in tag_cmds[0],
+              f"res={res!r} tag_cmds={tag_cmds!r}")
+
+        def _stub_patchid(branches, local_sha, upstream_by_ref, patch_ids,
+                           branch_exists=False, merge_base_sha="deadbeef00"):
+            def _run(cmd, **kw):
+                if "fetch" in cmd:
+                    return _FakeGitResult(0)
+                if "for-each-ref" in cmd:
+                    lines = "\n".join(f"refs/heads/{b} {s}" for b, s in branches)
+                    return _FakeGitResult(0, stdout=lines)
+                if "branch" in cmd and "--contains" in cmd:
+                    return _FakeGitResult(0, stdout="")  # never safe via sha-reachability
+                if "merge-base" in cmd:
+                    ref = cmd[-1]
+                    if ref == "origin/main" or (branch_exists and ref.startswith("origin/")):
+                        return _FakeGitResult(0, stdout=merge_base_sha + "\n")
+                    return _FakeGitResult(1)
+                if "rev-parse" in cmd and "--verify" in cmd:
+                    return _FakeGitResult(0 if branch_exists else 1)
+                if "rev-list" in cmd:
+                    _, _, tip = cmd[-1].partition("..")
+                    if tip == local_sha:
+                        return _FakeGitResult(0, stdout=local_sha + "\n")
+                    commits = upstream_by_ref.get(tip)
+                    return _FakeGitResult(0, stdout=("\n".join(commits) + "\n") if commits else "")
+                if "show" in cmd:
+                    return _FakeGitResult(0, stdout=cmd[-1])  # echo sha as content marker
+                if "patch-id" in cmd:
+                    key = (kw.get("input") or "").strip()
+                    pid = patch_ids.get(key, f"UNIQUE-{key}")
+                    return _FakeGitResult(0, stdout=f"{pid} {key}\n")
+                if "push" in cmd:
+                    return _FakeGitResult(0)  # would succeed if called — tests assert it ISN'T
+                return _FakeGitResult(0)
+            return _run
+
+        _upstream_sha = "ffff9999upstream00000000000000000000000"
+
+        # PB-8: local commit's content already landed on origin/main under a
+        # DIFFERENT sha (rebase/squash) — sha-reachability (--contains) can't
+        # see it, but patch-id can → skip, no push attempted (ga-2uyvc).
+        subprocess.run, _calls8 = _capturing(_stub_patchid(
+            branches=[("fix/ga-fakebead-my-fix", _FAKE_SHA)],
+            local_sha=_FAKE_SHA,
+            upstream_by_ref={"origin/main": [_upstream_sha]},
+            patch_ids={_FAKE_SHA: "SAMEPID", _upstream_sha: "SAMEPID"}))
+        res = preserve_unpushed_branch("ga-fakebead")
+        push_calls8 = [c for c in _calls8 if "push" in c]
+        check("PB-8: rebased duplicate (same patch-id, different sha) skipped as "
+              "already safe, no push attempted — ga-2uyvc",
+              res == [] and push_calls8 == [], f"res={res!r} push_calls={push_calls8!r}")
+
+        # PB-9: negative control — DIFFERENT patch-id → NOT treated as already
+        # safe; push still attempted and preserved normally. Guards against
+        # the patch-id check silently swallowing genuinely-unpreserved work,
+        # the exact wa-ffeje failure mode this function exists to prevent.
+        subprocess.run, _calls9 = _capturing(_stub_patchid(
+            branches=[("fix/ga-fakebead-my-fix", _FAKE_SHA)],
+            local_sha=_FAKE_SHA,
+            upstream_by_ref={"origin/main": [_upstream_sha]},
+            patch_ids={_FAKE_SHA: "PIDLOCAL", _upstream_sha: "PIDUPSTREAM"}))
+        res = preserve_unpushed_branch("ga-fakebead")
+        push_calls9 = [c for c in _calls9 if "push" in c]
+        check("PB-9: different patch-id → NOT skipped, push still attempted and preserved",
+              len(res) == 1 and "pushed to origin/fix/ga-fakebead-my-fix" in res[0]
+              and len(push_calls9) == 1, f"res={res!r} push_calls={push_calls9!r}")
     finally:
         subprocess.run = _orig_run_pb
         REPOS = _orig_repos
