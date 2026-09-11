@@ -142,6 +142,7 @@ export DOLT_STUB_COUNT_FILE
 _run_retry_scenario() {
   # <fail_until_call> <label>
   local fail_until="$1" label="$2"
+  echo "  -- scenario: $label --"
   echo 0 > "$DOLT_STUB_COUNT_FILE"
   : > "$SLEEP_CALLS"
   : > "$TEST_LOG"
