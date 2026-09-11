@@ -60,6 +60,7 @@ type reconcile_marker_action  >/dev/null 2>&1 || { echo "FATAL: reconcile_marker
 type reconcile_gaterun_action >/dev/null 2>&1 || { echo "FATAL: reconcile_gaterun_action not defined by guard"; exit 1; }
 type dedup_gaterun_action     >/dev/null 2>&1 || { echo "FATAL: dedup_gaterun_action not defined by guard"; exit 1; }
 type companion_liveness_from_query >/dev/null 2>&1 || { echo "FATAL: companion_liveness_from_query not defined by guard (ga-qj1xh)"; exit 1; }
+type companion_run_id_for_marker >/dev/null 2>&1 || { echo "FATAL: companion_run_id_for_marker not defined by guard (ga-oz37o)"; exit 1; }
 type age_minutes_of           >/dev/null 2>&1 || { echo "FATAL: age_minutes_of not defined by guard"; exit 1; }
 type parse_marker_id          >/dev/null 2>&1 || { echo "FATAL: parse_marker_id not defined by guard"; exit 1; }
 type classify_inflight_gap1   >/dev/null 2>&1 || { echo "FATAL: classify_inflight_gap1 not defined by guard"; exit 1; }
@@ -166,6 +167,56 @@ else
   bad "REGRESSION: query failure produced has_live_companion_run='$FAILED_QUERY_RESULT' — the ga-qj1xh bug is back (a failed query would fire false reclaim/error against a possibly-live marker)"
 fi
 
+# ── 1d. companion_run_id_for_marker (ga-oz37o: cite the real companion, not a
+#        citation-id) ────────────────────────────────────────────────────────
+# Bug ga-oz37o: the skip-log line cited "(ga-cgynn)" — the bead that INTRODUCED
+# the companion-liveness check — as if it were the id of the live companion
+# gate-run itself. It resolves nowhere in any of the 7 stores (153 occurrences,
+# 3 different markers, always the same constant on 2026-09-10) — "not stuck" is
+# asserted with evidence that cannot be checked, the exact "unverified read as
+# safe" class this file's own header worries about elsewhere. Signature:
+# <gate_runs_json> <marker_id> → the real gate-run's .id, or "" if none matches.
+echo "── 1d. companion_run_id_for_marker (ga-oz37o: cite the real companion, not a citation-id) ──"
+
+GA_OZ37O_RUNS='[
+  {"id":"ga-run-live1","description":"marker_id: ga-target1\nbranch: crew/foo"},
+  {"id":"ga-run-live2","description":"marker_id: ga-other\nbranch: crew/bar"}
+]'
+eq "marker referenced by one run → that run's real id" \
+   "$(companion_run_id_for_marker "$GA_OZ37O_RUNS" "ga-target1")" "ga-run-live1"
+eq "marker referenced by a different run → that other id (not the first)" \
+   "$(companion_run_id_for_marker "$GA_OZ37O_RUNS" "ga-other")" "ga-run-live2"
+eq "marker not referenced by any run → empty (caller renders 'não identificado')" \
+   "$(companion_run_id_for_marker "$GA_OZ37O_RUNS" "ga-nowhere")" ""
+eq "empty gate-runs snapshot → empty" \
+   "$(companion_run_id_for_marker '[]' "ga-target1")" ""
+eq "empty marker_id arg → empty (defensive)" \
+   "$(companion_run_id_for_marker "$GA_OZ37O_RUNS" "")" ""
+
+# ga-f1ngu: a guard claim-receipt (gate-status:claimed) and the dispatcher's own
+# real run (gate-status:running) can transiently share one marker_id. Either is
+# a genuine, bd-show-able companion — assert the lookup still resolves to a
+# REAL id (not empty, not a guess) rather than picking a "wrong" one.
+GA_OZ37O_DUP_RUNS='[
+  {"id":"ga-run-claim","description":"marker_id: ga-target2\nbranch: crew/baz"},
+  {"id":"ga-run-running","description":"marker_id: ga-target2\nbranch: crew/baz"}
+]'
+GA_OZ37O_DUP_RESULT=$(companion_run_id_for_marker "$GA_OZ37O_DUP_RUNS" "ga-target2")
+case "$GA_OZ37O_DUP_RESULT" in
+  ga-run-claim|ga-run-running) ok "two live runs share the marker (claim+running, ga-f1ngu) → resolves to a real companion id ($GA_OZ37O_DUP_RESULT)" ;;
+  *) bad "two live runs share the marker → expected ga-run-claim or ga-run-running, got '$GA_OZ37O_DUP_RESULT'" ;;
+esac
+
+# THE regression this guards: the old log line hardcoded the bead-citation id
+# regardless of any real match. Assert the fixed function never echoes that
+# citation id as if it were a live companion's identity.
+GA_OZ37O_NOMATCH_RESULT=$(companion_run_id_for_marker "$GA_OZ37O_RUNS" "ga-nowhere")
+if [ "$GA_OZ37O_NOMATCH_RESULT" = "ga-cgynn" ]; then
+  bad "REGRESSION: companion_run_id_for_marker returned the bead-citation id 'ga-cgynn' as if it were a live companion — the ga-oz37o bug is back"
+else
+  ok "REGRESSION GUARD: no-match never falls back to the 'ga-cgynn' citation id"
+fi
+
 # ── 2. Vector B — gate-run reconcile decision ────────────────────────────────
 # Signature: reconcile_gaterun_action <age_min> <ttl_min> <marker_active 0|1> \
 #                                     [verdict_timeout_min] [reviewers_alive 0|1]
@@ -258,6 +309,17 @@ grep -q 'companion_liveness_from_query "\$GATE_RUNS_QUERY_OK" "\$_T_MARKER_FOUND
 grep -q 'reconcile_marker_action "\$T_STATUS" "\$T_AGE" "\$CLAIM_TTL_MINUTES" "\$T_COUNT" "\$MAX_RECLAIMS" "\$HAS_LIVE_COMPANION"' "$GUARD" \
   && ok "guard wires HAS_LIVE_COMPANION into the reconcile_marker_action call (ga-cgynn)" \
   || bad "guard not passing has_live_companion_run into reconcile_marker_action"
+# ga-oz37o: the skip-log line must cite a REAL, verifiable companion id — never
+# the bare "(ga-cgynn)" bead-citation that started this bug (see 1d above for
+# the pure-function unit tests; these drift-guards assert the LIVE wiring).
+grep -q 'companion_run_id_for_marker()'      "$GUARD" && ok "guard defines companion_run_id_for_marker (ga-oz37o)" || bad "guard missing companion_run_id_for_marker def"
+grep -q 'companion_run_id_for_marker "\$GATE_RUNS_JSON" "\$T_ID"' "$GUARD" \
+  && ok "guard's skip branch looks up the real companion id via companion_run_id_for_marker (ga-oz37o)" \
+  || bad "guard skip branch not calling companion_run_id_for_marker — may have reverted to the unverifiable ga-cgynn citation"
+grep -q 'não identificado'                   "$GUARD" && ok "guard's skip log falls back to an honest 'não identificado' when no companion id resolves (ga-oz37o)" || bad "guard missing the 'não identificado' fallback"
+grep -qE 'has a live companion gate-run — legitimate yield-bounce, not stuck \(ga-cgynn\)\. Skipping\.' "$GUARD" \
+  && bad "REGRESSION: guard's skip-log line still hardcodes the unverifiable '(ga-cgynn)' citation as if it were a live companion id — the ga-oz37o bug is back" \
+  || ok "REGRESSION GUARD: skip-log line no longer hardcodes the bare '(ga-cgynn)' citation"
 [ "$(grep -c 'GATE_RUNS_JSON=\$(bd' "$GUARD")" -eq 1 ] \
   && ok "GATE_RUNS_JSON fetched exactly once (hoisted shared prelude, no duplicate bd round-trip)" \
   || bad "GATE_RUNS_JSON fetch count != 1 (duplicate-fetch regression, or the ga-cgynn hoist was reverted)"

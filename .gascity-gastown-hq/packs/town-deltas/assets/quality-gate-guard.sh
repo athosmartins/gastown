@@ -522,6 +522,41 @@ companion_liveness_from_query() {
   echo 0
 }
 
+# companion_run_id_for_marker <gate_runs_json> <marker_id>
+# Pure lookup (ga-oz37o): given the GATE_RUNS_JSON shared-prelude snapshot (same
+# data has_live_companion_run/RUNNING_GATERUN_MARKER_IDS are built from) and a
+# marker id, return the .id of the live gate-run bead whose marker_id: back-
+# reference matches — i.e. the ACTUAL companion run that justifies a "legitimate
+# yield-bounce, not stuck" skip. Echoes "" if none matches.
+#
+# Exists because the skip-log line used to cite "(ga-cgynn)" — the bead that
+# INTRODUCED the companion-liveness check, not an id of anything live — as if it
+# were the companion run's identity. Read at face value it looks like verifiable
+# evidence ("here's the run holding this marker, go check it") but ga-cgynn
+# resolves nowhere in any store: 153 occurrences across 3 different markers on
+# 2026-09-10 alone, always the same constant, costing ~10min to confirm a P0
+# wasn't actually stuck. The caller MUST render an empty result as "companion
+# não identificado", never fall back to a bead-citation id — that is the same
+# class of unverifiable-looks-like-evidence mistake this function exists to fix.
+companion_run_id_for_marker() {
+  local gate_runs_json="$1" marker_id="$2"
+  [ -z "$marker_id" ] && { echo ""; return; }
+  local count
+  count=$(printf '%s\n' "$gate_runs_json" | jq 'length' 2>/dev/null || echo "0")
+  case "$count" in ''|*[!0-9]*) echo ""; return ;; esac
+  [ "$count" -le 0 ] && { echo ""; return; }
+  local i desc mid rid
+  for i in $(seq 0 $((count - 1))); do
+    desc=$(printf '%s\n' "$gate_runs_json" | jq -r ".[$i].description // \"\"")
+    mid=$(parse_marker_id "$desc")
+    if [ "$mid" = "$marker_id" ]; then
+      rid=$(printf '%s\n' "$gate_runs_json" | jq -r ".[$i].id // \"\"")
+      [ -n "$rid" ] && { echo "$rid"; return; }
+    fi
+  done
+  echo ""
+}
+
 # dedup_gaterun_action <group_count> <is_newest: 0|1>
 # Pure decision: enforce ≤1 running gate-run per source-bead/marker (ga-o57gn (c)).
 # The guard creates a tracking gate-run at claim time (gate-status:claimed as of
@@ -2547,7 +2582,15 @@ if [ "$TRANSIENT_COUNT" -gt 0 ]; then
         if [ "$GATE_RUNS_QUERY_OK" != "1" ]; then
           log "  Marker $T_ID in $T_STATUS — shared gate-runs query failed this sweep, cannot verify companion liveness; fail-safe skip (ga-qj1xh)."
         elif [ "$HAS_LIVE_COMPANION" = "1" ]; then
-          log "  Marker $T_ID in $T_STATUS has a live companion gate-run — legitimate yield-bounce, not stuck (ga-cgynn). Skipping."
+          # ga-oz37o: cite the REAL companion run's id (verifiable via `bd show`),
+          # never the bead that introduced this check — see
+          # companion_run_id_for_marker's header for why that was misleading.
+          _T_COMPANION_RUN_ID=$(companion_run_id_for_marker "$GATE_RUNS_JSON" "$T_ID")
+          if [ -n "$_T_COMPANION_RUN_ID" ]; then
+            log "  Marker $T_ID in $T_STATUS has a live companion gate-run ($_T_COMPANION_RUN_ID) — legitimate yield-bounce, not stuck. Skipping."
+          else
+            log "  Marker $T_ID in $T_STATUS has a live companion gate-run (companion não identificado) — legitimate yield-bounce, not stuck. Skipping."
+          fi
         else
           log "  Marker $T_ID in $T_STATUS for ${T_AGE}m — within TTL, skipping."
         fi
