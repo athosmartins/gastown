@@ -5,3 +5,5 @@ work_dir = "/Users/athos/gt/marketing/crew/mila"
 # spawns. Shadow mode by default (detects + alerts, never blocks) — see the
 # script's own header for the staged-rollout rationale.
 pre_start = ["/Users/athos/gt/.gascity-gastown-hq/scripts/claude-credential-preflight.sh"]
+
+option_defaults = { effort = "high" }
