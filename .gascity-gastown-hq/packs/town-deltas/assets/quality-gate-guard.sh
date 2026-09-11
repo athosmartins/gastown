@@ -2369,14 +2369,20 @@ gate_bead_sibling_status_lines() {
 #
 # Returns 0 if the bead ends up unassigned (it already was, or this call
 # cleared it); 13 if a different actor holds it now (the compare-and-swap
-# lost a race — expected, not a bug); 1 on any other bd failure.
-# Duplicated identically in quality-gate-dispatcher.sh (no shared-lib
-# chokepoint between the two files — same tradeoff default_pool_route_for_rig
-# already documents there).
+# lost a race — expected, not a bug); 2 if the CURRENT state could not even
+# be read (distinct from "read succeeded, already unassigned" — collapsing
+# those two into the same return value would be exactly the error-vs-empty
+# class this codebase's own gate-done self-audit exists to catch); 1 on any
+# other bd failure. Duplicated identically in quality-gate-dispatcher.sh (no
+# shared-lib chokepoint between the two files — same tradeoff
+# default_pool_route_for_rig already documents there).
 gate_clear_assignee_if_holder() {
   local _bead_id="$1" _city="$2"
-  local _cur_json _cur_assignee _rc
-  _cur_json=$(bd -C "$_city" show "$_bead_id" --json 2>/dev/null || echo "")
+  local _cur_json _cur_assignee _read_ok _rc
+  _read_ok=1
+  _cur_json=$(bd -C "$_city" show "$_bead_id" --json 2>/dev/null) || _read_ok=0
+  [ -n "$_cur_json" ] || _read_ok=0
+  [ "$_read_ok" = "0" ] && return 2
   _cur_assignee=$(printf '%s' "$_cur_json" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
   [ -z "$_cur_assignee" ] && return 0
   _rc=0

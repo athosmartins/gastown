@@ -60,10 +60,12 @@ for f in "$GUARD" "$DISPATCHER"; do
   [ -f "$f" ] || { echo "FATAL: not found: $f" >&2; exit 2; }
 done
 
-# ── 1. gate_clear_assignee_if_holder: both files' copies, all 4 outcomes ────
+# ── 1. gate_clear_assignee_if_holder: both files' copies, all 5 outcomes ────
 run_scenario() {
-  # $1 = "guard"|"dispatcher"  $2 = held_by ("" = already unassigned)
-  # $3 = update_outcome (ok|race|error, ignored when $2 is empty)  $4 = logfile
+  # $1 = "guard"|"dispatcher"  $2 = held_by ("" = already unassigned,
+  # "__SHOW_FAILS__" = the show/read itself fails)
+  # $3 = update_outcome (ok|race|error, ignored when $2 is empty or the
+  # show-fails sentinel)  $4 = logfile
   local which="$1" held_by="$2" update_outcome="$3" log="$4"
   local src lib_var
   if [ "$which" = "guard" ]; then src="$GUARD"; lib_var="GATE_GUARD_LIB_ONLY"
@@ -75,6 +77,7 @@ run_scenario() {
       echo "$*" >> "$BD_LOG"
       case " $* " in
         *" show "*)
+          if [ "$HELD_BY" = "__SHOW_FAILS__" ]; then return 1; fi
           if [ -n "$HELD_BY" ]; then printf "{\"assignee\":\"%s\"}\n" "$HELD_BY"
           else printf "{\"assignee\":\"\"}\n"; fi
           return 0 ;;
@@ -137,6 +140,21 @@ for WHICH in guard dispatcher; do
   [ "$RC4" -eq 1 ] && ok "($WHICH) genuine bd failure -> returns 1 (distinct from the race code 13)" \
     || bad "($WHICH) genuine failure -> expected 1, got $RC4 — log: $(cat "$LOG4")"
   rm -f "$LOG4"
+
+  # ga-yd8t6 self-audit finding: the current-state READ failing must be its
+  # own distinguishable outcome, never silently folded into "confirmed
+  # already unassigned" (both would otherwise return 0 — the exact
+  # error-vs-empty collapse this codebase's gate-done self-audit exists to
+  # catch, and the same class the surrounding _GFAIL_ROUTE_VERIFY_READ_OK
+  # logic right next to this fix already defends against for a sibling read).
+  LOG5="$(mktemp)"
+  run_scenario "$WHICH" "__SHOW_FAILS__" "ok" "$LOG5"; RC5=$?
+  [ "$RC5" -eq 2 ] && ok "($WHICH) current-state read fails -> returns 2 (distinct from 0/13/1, never silently treated as already-unassigned)" \
+    || bad "($WHICH) read-failure -> expected 2, got $RC5 — log: $(cat "$LOG5")"
+  grep -q ' update ' "$LOG5" \
+    && bad "($WHICH) read-failure -> attempted a write despite not knowing the current holder — log: $(cat "$LOG5")" \
+    || ok "($WHICH) read-failure -> no write attempted (never guesses at an unknown holder)"
+  rm -f "$LOG5"
 done
 
 # ── 2. Repro: the OLD bare 'bd assign "" ' call is refused cross-actor ──────
