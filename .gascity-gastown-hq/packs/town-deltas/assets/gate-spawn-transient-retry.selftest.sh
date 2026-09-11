@@ -448,7 +448,18 @@ ok "located live spawn-retry-loop block via sentinel extraction"
 # the SAME process). warn/sleep are deliberately NOT exported — each embedded
 # script below shadows them locally as no-ops instead, so this section stays
 # about retry mechanics only (section 3 already covers muteness).
+#
+# ga-9e8nf: the extracted spawn-retry-loop block also calls
+# capture_spawn_err_tail() on every attempt now (real call site, not part of
+# this test's embedded gc() mocks) — export it too, or the child bash sees
+# "command not found", _spawn_err silently collapses to empty, and
+# is_transient_spawn_error("") reads NOT transient — the loop then exits
+# after exactly 1 attempt instead of retrying, independent of what the
+# mocked gc() actually does. Confirmed live while wiring ga-9e8nf: sections
+# 4/4b below failed with GC_CALLS=1 (loop never reached its 2nd/3rd attempt)
+# until this export was added.
 export -f is_transient_spawn_error
+export -f capture_spawn_err_tail
 
 # (a) first attempt failed transiently; the mocked `gc session new` succeeds
 # on its SECOND call (the in-process retry) — the loop must recover without

@@ -3281,6 +3281,39 @@ is_transient_spawn_error() {
   esac
 }
 
+# capture_spawn_err_tail <stderr_file> — extract the actionable tail of a
+# captured `gc session new` stderr file for reviewer-spawn diagnostics
+# (ga-9e8nf). Every `gc` invocation prints a "warning: builtin pack ... on
+# disk differs from the copy embedded in this gc binary" pack-drift line to
+# stderr FIRST whenever the on-disk town-deltas pack differs from the copy
+# baked into the binary — the routine, expected state in this city (see
+# town-deltas-override-not-engine-rebuild), not a spawn failure. That single
+# line alone runs 600+ bytes measured live against the real `gc` binary, so
+# capturing only the first 300 bytes of stderr (the pre-fix behavior) caught
+# NOTHING BUT the warning on every failed spawn this sweep saw 5 times in one
+# day (13:46/13:58/14:15/14:30/20:35) — the actual error text, and the
+# substrings is_transient_spawn_error() above matches ("invalid connection",
+# "dial tcp", etc.), never survived the cut. Those substrings also sit at the
+# END of Go's wrapped error chain (see the live incident string in that
+# function's own doc comment) — a second, independent reason to keep the
+# TAIL of what remains, not the head, once the warning noise is filtered.
+# NOTE: this script runs under `set -euo pipefail` (line 30). `grep -v`
+# exits 1 when EVERY line is filtered out (e.g. a successful spawn whose
+# stderr is nothing but the pack-drift warning — the common case) — under
+# pipefail that would make the pipeline's status 1 and, at the real call
+# site `_spawn_err=$(capture_spawn_err_tail ...)`, abort the whole
+# dispatcher via errexit on the very first successful spawn. Confirmed live
+# in-shell while writing this fix (`set -euo pipefail; x=$(grep -v ... |
+# tail ...)` never reaches the line after it). The trailing `|| true`
+# mirrors the old code's own `2>/dev/null || echo ""` safety net — this
+# function only ever hands back a STRING for the caller to pattern-match;
+# it must never fail the pipeline it's substituted into.
+capture_spawn_err_tail() {
+  local _file="${1:-}"
+  [ -f "$_file" ] || { printf ''; return 0; }
+  grep -v '^warning:' "$_file" 2>/dev/null | tail -c 2000 || true
+}
+
 # read_spawn_fail_count <marker_id> — fetch the current highest
 # gate:spawn-fail-count:N value recorded on the marker (0 if none present).
 # ga-2u38b: mirrors read_rebase_attempt's label-counter convention above, but
@@ -11169,7 +11202,7 @@ TASK
     --title "gate-reviewer-$i: $BRANCH" \
     --json \
     2>"$_spawn_err_file" || echo "{}")
-  _spawn_err=$(head -c 300 "$_spawn_err_file" 2>/dev/null || echo "")
+  _spawn_err=$(capture_spawn_err_tail "$_spawn_err_file")
   rm -f "$_spawn_err_file"
 
   SESSION_ID=$(echo "$SESSION_JSON" | jq -r '.session_id // empty')
@@ -11208,7 +11241,7 @@ TASK
       --title "gate-reviewer-$i: $BRANCH" \
       --json \
       2>"$_spawn_err_file" || echo "{}")
-    _spawn_err=$(head -c 300 "$_spawn_err_file" 2>/dev/null || echo "")
+    _spawn_err=$(capture_spawn_err_tail "$_spawn_err_file")
     rm -f "$_spawn_err_file"
     SESSION_ID=$(echo "$SESSION_JSON" | jq -r '.session_id // empty')
   done
