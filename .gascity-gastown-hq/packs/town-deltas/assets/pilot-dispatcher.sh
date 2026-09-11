@@ -7471,6 +7471,91 @@ fi
 
 ALL_CANDIDATES_COUNT=$(echo "$ALL_CANDIDATES_JSON" | jq 'length' 2>/dev/null || echo "0")
 
+# ── Step 2d: ga-93yxc pool top-up ─────────────────────────────────────────────
+# The wa-worker/ps-worker cap-skip a few hundred lines down (ga-mfeip,
+# ga-v3o6i) sets gc.routed_to=<pool> and used to log "supervisor picks it up
+# when slot frees" — but no such mechanism exists. Both pools have
+# min_active_sessions=0 and wake_mode=fresh (no running session, no hook cycle
+# to "see it next time"), and the wa-worker agent.toml itself documents "we do
+# NOT rely on supervisor auto-spawn". So a routed-but-uncapacitated bead sat
+# unassigned with no worker until the inflight-reclaim-guard's TTL (25min+)
+# reclaimed it, got re-picked by the NEXT sweep, hit the same cap, and
+# repeated — measured live: wa-0i9zj dispatched 4x (02:04-05:17) and never
+# built once; at one point 29 wa-workers asleep, 0 active, 3 beads "in flight"
+# with nobody on them, gate stalled 97min because nothing finished (ga-93yxc).
+#
+# Fix: every sweep, independent of whether THIS sweep found any fresh
+# candidate, re-check live count vs max for each ephemeral pool and spawn a
+# worker for any already-routed-but-unassigned bead while capacity remains —
+# so a freed slot is filled on its VERY NEXT sweep (launchd re-execs this
+# script every 300s), not after a TTL wait. Respects the same GLOBAL
+# variable-session cap (ga-jezvn) a fresh dispatch would, and DRY_RUN (no real
+# spawn — logs what WOULD happen, mirrors every other mutation in this file).
+#
+# MUST run BEFORE the ALL_CANDIDATES_COUNT==0 early-exit right below: a quiet
+# sweep with nothing NEW to dispatch is exactly when an old routed-but-stuck
+# bead most needs a retry, and that early exit used to skip every later step
+# (including the original placement of this fix, right before Step 5 —
+# dead code on precisely the sweep shape this bug is about; caught by
+# Scenario TOPUP-1/4 failing red even after the fix was written, because the
+# harness's minimal fixture has zero fresh candidates by design).
+_pilot_pool_topup() {
+  local _pool="$1" _max="$2"
+  local _live _global _pending
+
+  if [ "$_pool" = "wa-worker" ] && [ -n "${PILOT_TEST_WA_WORKER_LIVE_COUNT:-}" ]; then
+    _live="$PILOT_TEST_WA_WORKER_LIVE_COUNT"
+  elif [ "$_pool" = "ps-worker" ] && [ -n "${PILOT_TEST_PS_WORKER_LIVE_COUNT:-}" ]; then
+    _live="$PILOT_TEST_PS_WORKER_LIVE_COUNT"
+  else
+    # `|| echo "0"` mirrors every sibling live-count probe in this file (e.g.
+    # gc_variable_session_count, the ga-mfeip cap-check above): without it, a
+    # missing `timeout` binary (127, "command not found" — genuinely absent
+    # from PATH in some harnesses/environments, not merely a bd/gc failure)
+    # leaves the substitution both EMPTY and non-zero-exit with nothing to
+    # consume that status, which — confirmed by direct bisection, bash
+    # 5.3.15 — aborts the whole script despite `set -e` being OFF. The
+    # trailing `case` below is defense in depth (handles a non-numeric but
+    # non-empty result), not a substitute for this.
+    _live=$(timeout 10 gc --city "$GC_CITY" session list --json 2>/dev/null \
+      | jq --arg t "$_pool" '[.sessions[]? | select(.template==$t and (.state=="active" or .state=="creating"))] | length' 2>/dev/null || echo "0")
+  fi
+  case "$_live" in ''|*[!0-9]*) _live=0 ;; esac
+  _global=$(gc_variable_session_count)
+  case "$_global" in ''|*[!0-9]*) _global=0 ;; esac
+
+  while [ "$_live" -lt "$_max" ] && [ "$_global" -lt "$GC_VARIABLE_SESSION_MAX" ]; do
+    # Test seam mirrors PILOT_TEST_WA_WORKER_LIVE_COUNT above: set to (even an
+    # empty string) to bypass the live bd probe entirely for hermetic tests.
+    if [ "$_pool" = "wa-worker" ] && [ -n "${PILOT_TEST_WA_WORKER_TOPUP_PENDING+x}" ]; then
+      _pending="$PILOT_TEST_WA_WORKER_TOPUP_PENDING"
+    elif [ "$_pool" = "ps-worker" ] && [ -n "${PILOT_TEST_PS_WORKER_TOPUP_PENDING+x}" ]; then
+      _pending="$PILOT_TEST_PS_WORKER_TOPUP_PENDING"
+    else
+      # Same `|| echo` reasoning as the _live probe above.
+      _pending=$(timeout 15 bd -C "$GC_CITY" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
+        --exclude-type=epic --json --limit=1 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null || echo "")
+    fi
+    [ -z "$_pending" ] && break
+    if [ "$DRY_RUN" = "1" ]; then
+      log "  ga-93yxc: DRY_RUN=1 — WOULD: pool top-up spawn $_pool for $_pending (live=$_live < $_max, global=$_global < $GC_VARIABLE_SESSION_MAX, no worker from a prior sweep's dispatch)"
+      break
+    fi
+    log "  ga-93yxc: pool top-up — $_pool has free capacity (live=$_live < $_max) and $_pending is routed+unassigned with no worker from a prior sweep — spawning."
+    if timeout "${PILOT_SPAWN_TIMEOUT_SECS:-60}" gc --city "$GC_CITY" session new "$_pool" --no-attach \
+        --title-hint "pool top-up: $_pending" >/dev/null 2>&1; then
+      log "  ga-93yxc: pool top-up — $_pool session spawned for $_pending."
+      _live=$((_live + 1))
+      _global=$((_global + 1))
+    else
+      warn "ga-93yxc: pool top-up spawn failed for $_pool ($_pending) — will retry next sweep."
+      break
+    fi
+  done
+}
+_pilot_pool_topup "wa-worker" "${PILOT_WA_WORKER_MAX:-4}"
+_pilot_pool_topup "ps-worker" "${PILOT_PS_WORKER_MAX:-2}"
+
 if [ "$ALL_CANDIDATES_COUNT" = "0" ]; then
   log "No dispatchable candidates (Tier 1 or Tier 2). Exiting."
   exit 0
@@ -9077,7 +9162,11 @@ TASK
           # rapid re-sweeps (or slow session startup) spawn N sessions for M beads
           # where N >> M (the prior 39-session runaway). Count active + creating
           # sessions; skip the spawn if at cap (gc.routed_to=wa-worker set —
-          # the supervisor picks it up on its next scale_check tick). Fail-open on probe error.
+          # ga-93yxc: this script's OWN pool top-up step, Step 2d earlier in
+          # this sweep (before the fresh-candidates scan), retries on a later
+          # sweep once a slot frees — NOT the supervisor scale_check, which
+          # does not auto-spawn wa-worker (agent.toml opts out; measured live,
+          # see Step 2d's header comment). Fail-open on probe error.
           if [ -n "${PILOT_TEST_WA_WORKER_LIVE_COUNT:-}" ]; then
             _live_wa_count="$PILOT_TEST_WA_WORKER_LIVE_COUNT"
           else
@@ -9086,7 +9175,7 @@ TASK
           fi
           _live_wa_count="${_live_wa_count:-0}"
           if [ "${_live_wa_count:-0}" -ge "${PILOT_WA_WORKER_MAX:-4}" ] 2>/dev/null; then
-            log "  ga-mfeip: wa-worker pool at session cap ($_live_wa_count active/creating >= ${PILOT_WA_WORKER_MAX:-4} max) — skip spawn for $STORY_ID (gc.routed_to=wa-worker set; supervisor picks it up when slot frees)"
+            log "  ga-mfeip: wa-worker pool at session cap ($_live_wa_count active/creating >= ${PILOT_WA_WORKER_MAX:-4} max) — skip spawn for $STORY_ID (gc.routed_to=wa-worker set; ga-93yxc pool top-up retries on a later sweep once a slot frees)"
           else
             log "  ga-mfeip: spawning wa-worker for $STORY_ID (slot=$BUILDER_TARGET, live=$_live_wa_count < ${PILOT_WA_WORKER_MAX:-4})."
             # spawn timeout raised 30→60 (env PILOT_SPAWN_TIMEOUT_SECS): under a HOT Dolt
@@ -9097,7 +9186,7 @@ TASK
                 >/dev/null 2>&1; then
               log "  ga-mfeip: wa-worker session spawned for $STORY_ID (slot=$BUILDER_TARGET)."
             else
-              warn "ga-mfeip: Could not spawn wa-worker for $STORY_ID — gc.routed_to=wa-worker set; supervisor reconcile will pick it up"
+              warn "ga-mfeip: Could not spawn wa-worker for $STORY_ID — gc.routed_to=wa-worker set; ga-93yxc pool top-up retries on a later sweep"
               # ga-d20od: the spawn genuinely failed/timed out — no worker was
               # dispatched. Release the claim and abort HERE, mirroring the
               # sibling failure paths above (rig_dedup_skip, pool_ownership_refuse,
@@ -9144,7 +9233,7 @@ TASK
           fi
           _live_ps_count="${_live_ps_count:-0}"
           if [ "${_live_ps_count:-0}" -ge "${PILOT_PS_WORKER_MAX:-2}" ] 2>/dev/null; then
-            log "  ga-mfeip: ps-worker pool at session cap ($_live_ps_count active/creating >= ${PILOT_PS_WORKER_MAX:-2} max) — skip spawn for $STORY_ID (gc.routed_to=ps-worker set; supervisor picks it up when slot frees)"
+            log "  ga-mfeip: ps-worker pool at session cap ($_live_ps_count active/creating >= ${PILOT_PS_WORKER_MAX:-2} max) — skip spawn for $STORY_ID (gc.routed_to=ps-worker set; ga-93yxc pool top-up retries on a later sweep once a slot frees)"
           else
             log "  ga-mfeip: spawning ps-worker for $STORY_ID (live=$_live_ps_count < ${PILOT_PS_WORKER_MAX:-2})."
             if timeout "${PILOT_SPAWN_TIMEOUT_SECS:-60}" gc --city "$GC_CITY" session new ps-worker --no-attach \
@@ -9152,7 +9241,7 @@ TASK
                 >/dev/null 2>&1; then
               log "  ga-mfeip: ps-worker session spawned for $STORY_ID."
             else
-              warn "ga-mfeip: Could not spawn ps-worker for $STORY_ID — gc.routed_to=ps-worker set; supervisor reconcile will pick it up"
+              warn "ga-mfeip: Could not spawn ps-worker for $STORY_ID — gc.routed_to=ps-worker set; ga-93yxc pool top-up retries on a later sweep"
               # ga-d20od: mirrors the wa-worker spawn-failure rollback above —
               # same defect shape (unconditional story:in-flight + pilot:dispatched
               # marking below used to run even when no worker was ever spawned).

@@ -6188,6 +6188,137 @@ else
   bad "ps-worker: spawn-failure branch does NOT roll back pilot:dispatching / return 1 — orphan-label regression (ga-d20od)"
 fi
 
+# ── Scenario TOPUP: pool top-up (ga-93yxc) ────────────────────────────────────
+# The cap-skip above (ga-mfeip, ga-v3o6i) sets gc.routed_to=<pool> and gives up
+# on THIS sweep once at cap — no mechanism used to retry once a slot freed
+# (measured live: wa-0i9zj dispatched 4x, never built). Step 2d fixes this: it
+# runs UNCONDITIONALLY once per sweep, independent of dispatch_one()/DRY_RUN
+# branching (it lives at the top level of the script, not inside dispatch_one,
+# so — unlike the cap-skip logic itself, which is unreachable in DRY_RUN=1
+# tests because dispatch_one() takes an entirely different early-return branch
+# when DRY_RUN=1, see the "WOULD DISPATCH" block ~L8881 — _pilot_pool_topup's
+# OWN internal DRY_RUN check genuinely executes both ways here, making this a
+# real functional test, not just a structural grep). It also runs BEFORE the
+# ALL_CANDIDATES_COUNT==0 early exit (~L7474 originally) — first-pass placement
+# right before Step 5 made it unreachable dead code on exactly the quiet-sweep
+# shape this bug is about, caught by TOPUP-1/4 failing red even after the fix
+# was written (see git history on this file if curious — worth knowing the
+# placement itself was once wrong, not just untested).
+#
+# The pending-bead query (`bd ready --metadata-field gc.routed_to=...`) has
+# its OWN test seam (PILOT_TEST_WA_WORKER_TOPUP_PENDING /
+# PILOT_TEST_PS_WORKER_TOPUP_PENDING, set-even-to-empty bypasses the live
+# probe) rather than reusing the bd PATH-shim: this harness's env -i PATH
+# (mirrors every other scenario in this file) has no /opt/homebrew/bin, so
+# `timeout` — wrapping nearly every live bd/gc call in this script, including
+# the pending-bead query — resolves to nothing and silently 127s. Most
+# existing code tolerates that (fail-open patterns, or a test seam bypassing
+# the live call entirely, exactly like PILOT_TEST_WA_WORKER_LIVE_COUNT does
+# for the session-list probe below). The pending-bead value is NOT tolerant
+# of a silent 127 — it directly decides whether to spawn — so it gets the
+# same seam treatment.
+#
+# run_topup_scenario: no fresh HQ candidates (FAKE_BUGS_JSON/FAKE_TIER2_JSON
+# both "[]"), so Steps 1-4 are no-ops going into Step 2d — isolating the
+# top-up decision as the only thing under test.
+#   $1=PILOT_TEST_WA_WORKER_LIVE_COUNT  $2=PILOT_TEST_WA_WORKER_TOPUP_PENDING (bead id, or "" for none)
+#   $3=DRY_RUN (default 1)              $4=GC_VARIABLE_SESSION_COUNT_OVERRIDE (default $1)
+run_topup_scenario() {
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DRY_RUN="${3:-1}" \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
+    FAKE_BLOCKED_IDS="" \
+    FAKE_BUGS_JSON="[]" \
+    FAKE_TIER2_JSON="[]" \
+    PILOT_TEST_WA_WORKER_LIVE_COUNT="${1:-0}" \
+    GC_VARIABLE_SESSION_COUNT_OVERRIDE="${4:-${1:-0}}" \
+    PILOT_TEST_WA_WORKER_TOPUP_PENDING="${2:-}" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+echo "Scenario TOPUP-1: below cap + a pending routed-unassigned bead → spawns"
+# live=3 (not 0/1): the test seam returns the SAME bead id every iteration (a
+# static var, unlike the real bd query which would naturally drain), so this
+# pins the loop to exactly one pass (live 3→4 hits max and stops) — otherwise
+# a DRY_RUN=0 run would "spawn" wa-pending1 repeatedly until cap, which is
+# harmless here but not what this scenario means to prove.
+# Asserts on the pre-spawn decision log line, not the post-spawn confirmation:
+# the actual `timeout ... gc session new` call (unchanged prior-existing code,
+# already covered structurally by Scenario NEW-G) needs a live `timeout`
+# binary to even attempt the fake gc shim, which this harness's PATH (no
+# /opt/homebrew/bin, matches every other scenario here) can't guarantee — no
+# EXISTING scenario in this file exercises that non-DRY_RUN spawn call for the
+# same reason (see NEW-L's own comment). What's NEW and under test here is the
+# DECISION to spawn, which fires before that call.
+LOG_TU1="$(run_topup_scenario "3" "wa-pending1" "0")"
+if echo "$LOG_TU1" | grep -q "ga-93yxc: pool top-up — wa-worker has free capacity (live=3 < 4) and wa-pending1 is routed+unassigned with no worker from a prior sweep — spawning."; then
+  ok "topup: decides to spawn wa-worker for a pending routed-unassigned bead when live < max (ga-93yxc fix present)"
+else
+  bad "topup: did NOT decide to spawn for wa-pending1 despite free capacity — ga-93yxc regression (a routed bead would starve until TTL reclaim, same as the live incident)"
+fi
+
+echo "Scenario TOPUP-2: AT cap + a pending bead → does NOT spawn (cap respected)"
+LOG_TU2="$(run_topup_scenario "4" "wa-pending2" "0")"
+if echo "$LOG_TU2" | grep -q "wa-pending2"; then
+  bad "topup: spawned (or queried) despite live=4 >= max=4 — cap NOT respected (runaway risk, ga-v3o6i class)"
+else
+  ok "topup: correctly skips when the pool is already at cap"
+fi
+
+echo "Scenario TOPUP-3: below cap but NO pending bead → does NOT spawn (nothing to do)"
+LOG_TU3="$(run_topup_scenario "1" "" "0")"
+if echo "$LOG_TU3" | grep -q "ga-93yxc: pool top-up"; then
+  bad "topup: attempted a spawn with no pending routed bead — should be a silent no-op"
+else
+  ok "topup: correctly no-ops when no routed-unassigned bead is pending"
+fi
+
+echo "Scenario TOPUP-4: DRY_RUN=1 logs the decision but does not claim a real spawn happened"
+LOG_TU4="$(run_topup_scenario "1" "wa-pending4" "1")"
+if echo "$LOG_TU4" | grep -q "DRY_RUN=1 — WOULD: pool top-up spawn wa-worker for wa-pending4"; then
+  ok "topup: DRY_RUN=1 emits a WOULD-log for the pending bead (decision logic runs even in dry-run)"
+else
+  bad "topup: DRY_RUN=1 did NOT log the top-up decision — dry-run path broken or unreachable"
+fi
+if echo "$LOG_TU4" | grep -q "pool top-up — wa-worker session spawned for wa-pending4"; then
+  bad "topup: DRY_RUN=1 claims a real spawn happened — DRY_RUN not respected (would make live changes in dry-run mode)"
+else
+  ok "topup: DRY_RUN=1 makes no real-spawn claim (mirrors every other mutation in this file)"
+fi
+
+echo "Scenario TOPUP-5: GLOBAL variable-session cap (ga-jezvn) blocks top-up even with per-pool room"
+LOG_TU5="$(run_topup_scenario "1" "wa-pending5" "0" "6")"
+if echo "$LOG_TU5" | grep -q "wa-pending5"; then
+  bad "topup: spawned despite the GLOBAL variable-session cap being saturated (wa-worker+ps-worker+gate-reviewer combined) — ga-jezvn not respected by top-up"
+else
+  ok "topup: respects the GLOBAL variable-session cap, not just the per-pool one"
+fi
+
+echo "Scenario TOPUP-6: structural — top-up runs UNCONDITIONALLY and BEFORE the zero-candidates early exit"
+has "$DISPATCHER" '^_pilot_pool_topup "wa-worker"' \
+  "wa-worker top-up call site is top-level/unindented — runs every sweep regardless of DISPATCHED count (not gated behind an if)"
+has "$DISPATCHER" '^_pilot_pool_topup "ps-worker"' \
+  "ps-worker top-up call site is top-level/unindented — mirrors the wa-worker call"
+has "$DISPATCHER" '_live" -lt "\$_max" \] && \[ "\$_global" -lt "\$GC_VARIABLE_SESSION_MAX"' \
+  "top-up while-loop checks both the per-pool cap AND the global variable-session cap"
+_topup_vs_exit_block="$(awk '/_pilot_pool_topup "wa-worker"/{f=1} f{print} /No dispatchable candidates \(Tier 1 or Tier 2\)\. Exiting\./{if(f)exit}' "$DISPATCHER")"
+if printf '%s' "$_topup_vs_exit_block" | grep -q "No dispatchable candidates"; then
+  ok "topup call sites appear BEFORE the zero-candidates early exit — runs even on a quiet sweep with nothing new to dispatch"
+else
+  bad "REGRESSION: topup call sites do NOT precede the zero-candidates early exit — a quiet sweep would skip top-up entirely (the exact bug this fix targets)"
+fi
+has "$DISPATCHER" 'bd -C "\$GC_CITY" ready --metadata-field "gc\.routed_to=\$_pool" --unassigned' \
+  "real (non-test-seam) pending-bead query targets RoutedPoolQuery's own shape: gc.routed_to=<pool> + unassigned"
+
 # ── Scenario 16s–16v: phantom-claim guard (FOLLOW-UP #1, ga-9yb5s+) ──────────
 # A live crew member may hold story.assignee but NEVER start the build (phantom).
 # The phantom-claim guard inside _beadid_live_crew_owner must RELEASE (return 1)
