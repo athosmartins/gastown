@@ -70,6 +70,15 @@
 #      priority=0 bead carrying pilot:reclaim-count:2 must still win over a
 #      priority=1 bead — proves the exclusion threshold is exactly ">=3",
 #      not an overbroad "any reclaim-count label at all".
+#   7. (ga-0pg2o gate-fix round 2, 2026-09-11) Step 1b3's fallback inherits
+#      the SAME reclaim-cap exclusion, not just Step 1b2: round 1 excluded a
+#      capped bead from Step 1b2 only, so when that bead is the sole
+#      occupant of its priority tier, Step 1b2 correctly returns [] and the
+#      Go-rendered fallback — which has zero reclaim-count awareness — used
+#      to re-surface that SAME bead. Tested as a standalone post-filter (see
+#      assert_fallback_result) rather than end-to-end, for the same reason
+#      the structural check below is text-based: the Go-rendered query
+#      itself is opaque to a pack-level selftest.
 #
 # A separate, non-jq structural check (test b from the ga-0pg2o bead: "a
 # session of ephemeral origin chooses by priority") verifies the ORDERING
@@ -123,6 +132,35 @@ extract_priority_probe_jq() {
   printf '%s' "$prog"
 }
 
+# extract_fallback_postfilter_jq <template-file> — pulls the jq PROGRAM out
+# of the Step 1b3 post-filter added by ga-0pg2o's gate-fix round 2: the
+# `{{ .RoutedPoolQuery }} | jq -c '...'` line that re-applies the
+# reclaim-cap exclusion to the Go-rendered fallback's own output. Same
+# extraction technique as extract_priority_probe_jq above (key off the exact
+# line shape, fail loudly if it changes) — deliberately a SEPARATE function
+# rather than a shared helper, since the two lines have different anchors
+# and mirroring extract_priority_probe_jq's own "duplicated, not shared"
+# choice (see its comment) keeps each guard independently diagnosable.
+extract_fallback_postfilter_jq() {
+  local tpl="$1"
+  local line
+  line="$(grep -F '{{ .RoutedPoolQuery }} | jq -c ' "$tpl" | head -1)"
+  if [ -z "$line" ]; then
+    return 1
+  fi
+  local marker
+  marker='{{ .RoutedPoolQuery }} | jq -c '"'"
+  local after="${line#*$marker}"
+  if [ "$after" = "$line" ]; then
+    return 1
+  fi
+  local prog="${after%\'}"
+  if [ -z "$prog" ] || [ "$prog" = "$after" ]; then
+    return 1
+  fi
+  printf '%s' "$prog"
+}
+
 # assert_winner <label> <jq-program> <fixture-array-json> <expected-id>
 # Feeds the WHOLE fixture array through the real probe's filter+sort chain
 # (which itself ends in .[:1]) and checks the single survivor's id.
@@ -140,6 +178,31 @@ assert_winner() {
     ok "$label: winner is $expected as expected"
   else
     bad "$label: expected winner $expected, got $got_id (full output: $out)"
+  fi
+}
+
+# assert_fallback_result <label> <jq-program> <fixture-array-json> <expected-array-json>
+# Unlike assert_winner (which picks a single winner out of several
+# candidates), the Step 1b3 post-filter preserves array shape straight
+# through — it receives the Go-rendered query's own already-.[0:1]-sliced
+# output (0 or 1 items) and either keeps or drops that one item. So this
+# compares the WHOLE compacted array rather than pulling out a single .id;
+# no --argjson now_ts is passed since this post-filter clause (copied
+# verbatim from Step 1b2) references no $now_ts.
+assert_fallback_result() {
+  local label="$1" prog="$2" fixture="$3" expected="$4"
+  local out rc exp_norm
+  out="$(printf '%s' "$fixture" | jq -c "$prog" 2>&1)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    bad "$label: jq program failed: $out"
+    return
+  fi
+  exp_norm="$(printf '%s' "$expected" | jq -c '.' 2>/dev/null)"
+  if [ "$out" = "$exp_norm" ]; then
+    ok "$label: output matches expected ($exp_norm)"
+  else
+    bad "$label: expected $exp_norm, got $out"
   fi
 }
 
@@ -223,6 +286,35 @@ run_case() {
   assert_winner "$label reclaim-count-below-cap-still-wins" "$prog" \
     '[{"id":"reclaimed-p0-below-cap","priority":0,"updated_at":"2026-01-01T00:00:00Z","labels":["pilot:reclaim-count:2"]},{"id":"clean-p1","priority":1,"updated_at":"2026-09-10T22:00:00Z","labels":[]}]' \
     "reclaimed-p0-below-cap"
+
+  # 7-9. (ga-0pg2o gate-fix round 2) Step 1b3's fallback post-filter must
+  # apply the SAME reclaim-cap exclusion as Step 1b2 — GATE-FEEDBACK on
+  # round 1 named the reopened gap: a capped bead that is the sole occupant
+  # of its priority tier makes Step 1b2 correctly return [], and the
+  # Go-rendered fallback (zero reclaim-count awareness on its own) used to
+  # hand that SAME bead back unfiltered.
+  local fallback_prog
+  if ! fallback_prog="$(extract_fallback_postfilter_jq "$tpl")"; then
+    bad "$label: could not extract Step 1b3 post-filter jq program from $tpl (line shape changed?)"
+  else
+    # 7. simulates the Go-rendered query handing back its one real result
+    # (routedReadyTierCommand's own contract: 0 or 1 items) when that result
+    # is at the cap — the post-filter must drop it to [].
+    assert_fallback_result "$label fallback-drops-capped-bead" "$fallback_prog" \
+      '[{"id":"poisoned-p0-at-cap","labels":["pilot:reclaim-count:3"]}]' \
+      '[]'
+
+    # 8. below-cap passthrough — same ">=3" threshold as Step 1b2's own case
+    # 6; the post-filter must not eat a legitimate fallback result.
+    assert_fallback_result "$label fallback-keeps-clean-bead" "$fallback_prog" \
+      '[{"id":"clean-fallback-bead","labels":["pilot:reclaim-count:2"]}]' \
+      '[{"id":"clean-fallback-bead","labels":["pilot:reclaim-count:2"]}]'
+
+    # 9. a genuinely empty fallback result ([]) must stay [] without erroring.
+    assert_fallback_result "$label fallback-empty-stays-empty" "$fallback_prog" \
+      '[]' \
+      '[]'
+  fi
 
   # (ga-0pg2o, reported test b) structural: the priority probe must precede
   # the Go-rendered fallback in file order — see assert_probe_before_fallback

@@ -287,8 +287,30 @@ bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=e
 # deleted outright — parity between this Go path's poolDemandLabelFilterJQ()
 # and Step 1b2's hardcoded exclude list was never fully audited (ga-42mlf's
 # parity claim was left unconfirmed by ga-c2w3k), so removing this outright
-# could silently drop a protection Step 1b2 hasn't mirrored yet:
-{{ .RoutedPoolQuery }}
+# could silently drop a protection Step 1b2 hasn't mirrored yet.
+#
+# ga-0pg2o gate-fix round 2 (2026-09-11, same defect and same fix as
+# wa-worker's identical copy): round 1 added the reclaim-count-cap exclusion
+# (Step 1b2 above) but only there. GATE-FEEDBACK on that round named the
+# exact gap this reopens: when a capped P0/P1 bead is the SOLE occupant of
+# its priority tier, Step 1b2 correctly excludes it and returns [], and this
+# fallback then re-surfaces that SAME bead — verified against origin/main's
+# poolDemandLabelFilterJQ() (internal/config/config.go): zero references to
+# pilot:reclaim-count anywhere in that file, so the Go-rendered query has no
+# reclaim-cap awareness at all and the template's own "THAT BEAD IS YOURS"
+# instruction below sends the agent to claim/build the excluded bead anyway.
+# The Go-rendered query stays off-limits per the Mayor's ga-0pg2o decision
+# above, so this is a post-filter on the OUTPUT instead: {{ .RoutedPoolQuery }}
+# always resolves to one `sh -c ... -- <target>` invocation whose stdout is
+# a single JSON array of 0 or 1 items (routedReadyTierCommand's own trailing
+# `jq -c '... | .[0:1]'`), so wrapping that output in one more
+# array-preserving `select` keeps the same [] / [bead] contract every caller
+# below already expects. Clause copied verbatim from Step 1b2 above — same
+# pilot:reclaim-count:<n> scan, same >=3 threshold, same hardcoded-literal
+# caveat (this template and pilot-dispatcher.sh share no runtime state).
+# Regression coverage: pool-probe-priority-sort.selftest.sh's
+# fallback-inherits-reclaim-cap case.
+{{ .RoutedPoolQuery }} | jq -c '[.[] | select(((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | if length > 0 then (max < 3) else true end)]'
 
 # Step 1c: ONLY if Steps 1a / 1b / 1b2 / 1b3 are ALL empty — no work — drain and exit.
 gc runtime drain-ack && exit
