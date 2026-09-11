@@ -10,22 +10,26 @@
 		<string>/Users/athos/gt/.gascity-gastown-hq</string>
 		<key>HOME</key>
 		<string>/Users/athos</string>
+		<key>MAX_BIG</key>
+		<string>1</string>
+		<key>MAX_SMALL</key>
+		<string>3</string>
 		<key>PATH</key>
 		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
-		<key>PILOT_CTX_READY_RIG_QUERIES</key>
-		<string>1</string>
 		<key>PILOT_CTX_READY_RIGS</key>
 		<string>whatsapp_automation property_scrapers</string>
-		<key>PILOT_SPAWN_PS_WORKER</key>
+		<key>PILOT_CTX_READY_RIG_QUERIES</key>
 		<string>1</string>
 		<key>PILOT_PS_WORKER_MAX</key>
-		<string>2</string>
+		<string>1</string>
+		<key>PILOT_SPAWN_PS_WORKER</key>
+		<string>1</string>
 		<key>PILOT_SPAWN_WA_WORKER</key>
 		<string>1</string>
 		<key>PILOT_SUSPENDED_CREWS_OVERRIDE</key>
 		<string>batista-ps</string>
 		<key>PILOT_WA_WORKER_MAX</key>
-		<string>4</string>
+		<string>3</string>
 	</dict>
 	<key>Label</key>
 	<string>com.gascity.pilot</string>
