@@ -151,6 +151,33 @@
 # mutation added; this stays detection-only, per ga-52zhb's own suggested-fix
 # scope.
 #
+# PILOT:HELD TIMED-HOLD PARK SIGNAL (ga-sgp6j — the SIXTH instance of this
+# file's own recurring class): the Pilot's own timed hold (pilot-dispatcher.sh
+# imp19, _filter_candidates ~L2830) stamps pilot:held-until:<epoch> THEN
+# pilot:held on a bead it is deliberately holding (e.g. disk-pressure backoff,
+# a domain-route defer) — a hold that self-expires, after which the Pilot
+# redispatches on its own. This watchdog had zero awareness of that
+# vocabulary (grep for "pilot:held" in this file, pre-fix: no hits) and
+# flagged a bead the Mayor had deliberately held (ga-wpdum, held for disk
+# pressure until 11/09 07:00 -03) as a stranded orphan mid-hold. Semantics
+# mirror the Pilot's own EXACTLY (same $now_ts-aware is_park computation feeds
+# both run_sweep and _bead_recheck_status, so there is only one copy to keep
+# in sync with pilot-dispatcher.sh, not two):
+#   - pilot:held with pilot:held-until:<epoch> in the FUTURE -> park.
+#   - pilot:held with NO pilot:held-until label at all -> park (an indefinite
+#     hold — the Pilot itself never stamps this shape without a held-until,
+#     but this watchdog treats it the same as an unexpired hold, mirroring
+#     _filter_candidates' own "else false" fallback for the identical case).
+#   - pilot:held-until:<epoch> already EXPIRED -> NOT park. The Pilot
+#     redispatches gate:needs-fix on its own once the hold expires; if the
+#     bead is still stranded ${GOLW_STALE_MINUTES}min after that, the
+#     redispatch itself failed and this is a genuine orphan — keep alerting.
+# Like every other park signal, this feeds the SAME is_park computation,
+# counted in the "PARK:" log line and the mail summary, never entering the
+# age-based alert/cooldown/comment pipeline. No label/status/assignee
+# mutation added; detection-only, matching this file's own scope for every
+# prior instance of this class.
+#
 # NOTIFY PRIORITY: low (-p 2), not the -p 4 used by throughput-stall-watchdog.
 # That watchdog pages Athos only when auto-recovery of a SYSTEMIC stall fails
 # (Athos, 2026-06-30: "só me notifique quando a máquina precisar de mim"). A
@@ -303,17 +330,19 @@ _store_name() { basename "$1"; }
 
 # _GOLW_IS_PARK_JQ — single source of truth for "is this bead an intentional
 # park, not an orphan-suspect" (gate:needs-human*/blocked-by:*/blocked:*/
-# status=blocked/design-first/pilot:no-auto-dispatch or bare no-auto-dispatch).
-# A jq boolean expression operating on `$b` (one bead object) and `$L` (its
-# `.labels // []`, pre-bound by the caller) — bash-interpolated (single quotes
+# status=blocked/design-first/pilot:no-auto-dispatch or bare no-auto-dispatch/
+# pilot:held timed hold — ga-sgp6j).
+# A jq boolean expression operating on `$b` (one bead object), `$L` (its
+# `.labels // []`, pre-bound by the caller), and `$now_ts` (epoch seconds,
+# pre-bound by the caller via --argjson) — bash-interpolated (single quotes
 # only, no `$`/backtick expansion inside) into every jq program that needs the
 # park verdict: (1) the main sweep's per-candidate classification in
 # run_sweep (ids_labels, below) and (2) _bead_recheck_status's "parked"
 # verdict (ga-8qb3u). One string, edited once, used everywhere — this file
 # has already paid for the alternative (two hand-maintained copies drifting
-# apart) 5 times: blocked-by:*-only missed blocked:* (ga-te41ft), then missed
-# design-first/pilot:no-auto-dispatch (ga-52zhb), etc. — see the header
-# comment's numbered history.
+# apart) 6 times: blocked-by:*-only missed blocked:* (ga-te41ft), then missed
+# design-first/pilot:no-auto-dispatch (ga-52zhb), then missed the Pilot's own
+# timed hold (ga-sgp6j), etc. — see the header comment's numbered history.
 _GOLW_IS_PARK_JQ='(
     ($L | any(startswith("gate:needs-human")))
     or ($L | any(startswith("blocked-by:")))
@@ -321,6 +350,13 @@ _GOLW_IS_PARK_JQ='(
     or (($b.status // "") == "blocked")
     or ($L | any(. == "pilot:no-auto-dispatch" or . == "no-auto-dispatch"))
     or ( ((($b.title) // "") + " " + (($b.description) // "")) | ascii_downcase | test("design[ -]?first") )
+    or (
+      ($L | any(. == "pilot:held"))
+      and
+      ( ($L | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | select(test("^[0-9]+\\z")) | tonumber))
+        | if length > 0 then (max >= $now_ts) else true end
+      )
+    )
   )'
 
 # _gate_artifact_probe <bead_id>
@@ -455,7 +491,11 @@ _golw_session_alive() {
   esac
 }
 
-# _bead_recheck_status <bead_id> <store> <exclude_prefixes_json>
+# _bead_recheck_status <bead_id> <store> <exclude_prefixes_json> <now_epoch>
+# <now_epoch> (epoch seconds) feeds _GOLW_IS_PARK_JQ's pilot:held timed-hold
+# check (ga-sgp6j) so the "parked" verdict below can tell an unexpired hold
+# from an expired one — the same value run_sweep's own ids_labels computation
+# already uses for its own is_park check.
 # Individually re-verifies ONE bead's current orphan-suspect status directly
 # against its store — the ga-tqe4j fix. Used ONLY when a bead already tracked
 # in state did not appear in this sweep's flagged set, to decide whether that
@@ -487,7 +527,7 @@ _golw_session_alive() {
 #             reason (transient probe failure, a live-assignee reclassify per
 #             ga-eiaidn, etc.) — NOT resolved.
 _bead_recheck_status() {
-  local _id="$1" _store="$2" _excl="$3" _out _rc
+  local _id="$1" _store="$2" _excl="$3" _now="$4" _out _rc
   _out=$("$BD_BIN" -C "$_store" list --id "$_id" --all --json 2>/dev/null \
     | jq -c 'if type=="array" then . else [.] end' 2>/dev/null)
   _rc=$?
@@ -495,7 +535,7 @@ _bead_recheck_status() {
     printf 'error\n'
     return 1
   fi
-  printf '%s' "$_out" | jq -r --arg id "$_id" --argjson excl "$_excl" '
+  printf '%s' "$_out" | jq -r --arg id "$_id" --argjson excl "$_excl" --argjson now_ts "$_now" '
       ([ .[] | select(.id == $id) ] | .[0]) as $b
       | ($b.labels // []) as $L
       | if $b == null then "gone"
@@ -519,7 +559,9 @@ _state_load() {
   fi
 }
 
-# _golw_resolve_tracked_state <state_json> <flagged_ids_json> <exclude_prefixes_json>
+# _golw_resolve_tracked_state <state_json> <flagged_ids_json> <exclude_prefixes_json> <now_epoch>
+# <now_epoch> is threaded straight through to _bead_recheck_status (ga-sgp6j)
+# — see that function's own docstring for why it needs "now".
 # ga-tqe4j: the single choke point BOTH branches of run_sweep funnel through
 # before pruning anything from state. For every bead in <state_json> that is
 # NOT in <flagged_ids_json> (i.e. a resolution candidate — including the
@@ -545,7 +587,7 @@ _state_load() {
 # the durable audit trail>]}. Every keep/prune decision is also written to
 # $LOG via `log`.
 _golw_resolve_tracked_state() {
-  local _state="$1" _keep="$2" _excl="$3"
+  local _state="$1" _keep="$2" _excl="$3" _now="$4"
   local _candidates
   _candidates="$(printf '%s' "$_state" | jq -r --argjson keep "$_keep" 'keys - $keep | .[]' 2>/dev/null)"
   local _resolved="" _parked="" _rid _rstore _rstatus _unverified_count=0
@@ -558,14 +600,14 @@ _golw_resolve_tracked_state() {
         _unverified_count=$((_unverified_count + 1))
         continue
       fi
-      _rstatus="$(_bead_recheck_status "$_rid" "$_rstore" "$_excl")"
+      _rstatus="$(_bead_recheck_status "$_rid" "$_rstore" "$_excl" "$_now")"
       case "$_rstatus" in
         absent|closed|gone)
           log "RESOLVED: $_rid re-checked individually (${_rstatus}) — no longer carries an orphaned gate:* label — cleared from state"
           _resolved="${_resolved}${_rid}"$'\n'
           ;;
         parked)
-          log "PARKED: $_rid re-checked individually — now matches an intentional park signal (gate:needs-human*/blocked-by:*/blocked:*/status=blocked/design-first/pilot:no-auto-dispatch, ga-8qb3u) — label is still present, but a human/Mayor decision stood this bead down, so it is cleared from orphan-tracking state like any other park; not logged RESOLVED since the label itself never cleared"
+          log "PARKED: $_rid re-checked individually — now matches an intentional park signal (gate:needs-human*/blocked-by:*/blocked:*/status=blocked/design-first/pilot:no-auto-dispatch/pilot:held, ga-8qb3u) — label is still present, but a human/Mayor decision stood this bead down, so it is cleared from orphan-tracking state like any other park; not logged RESOLVED since the label itself never cleared"
           _parked="${_parked}${_rid}"$'\n'
           ;;
         present)
@@ -711,13 +753,20 @@ run_sweep() {
     # regex using the identical jq test pilot-dispatcher.sh's
     # _filter_dispatch_gates already applies, so the two can never silently
     # disagree on what counts as "design-first."
+    # pilot:held (ga-sgp6j, see header comment): the SIXTH sibling — the
+    # Pilot's own timed hold (pilot-dispatcher.sh imp19). $now_ts (bound via
+    # --argjson above, the SAME "now" already computed for the age cutoff)
+    # lets _GOLW_IS_PARK_JQ tell an unexpired hold (pilot:held-until in the
+    # future, or no held-until at all) from an expired one — an expired hold
+    # is NOT park, since the Pilot should already have redispatched it and a
+    # bead still stranded past that point is a genuine orphan.
     # bstatus/bassignee (ga-eiaidn): carried through unchanged from $b so the
     # while-loop below can decide, per candidate, whether a session-liveness
     # check even applies (status=in_progress with a non-empty assignee) —
     # see _golw_session_alive. Plain passthrough fields, not a park-style
     # boolean, because "in_progress with a live assignee" is a DIFFERENT
     # bucket from is_park (counted separately — see the ACTIVE split below).
-    ids_labels=$(printf '%s' "$aged_json" | jq -r '
+    ids_labels=$(printf '%s' "$aged_json" | jq -r --argjson now_ts "$now" '
         .[] | . as $b
         | ($b.labels // []) as $L
         | [ $b.id,
@@ -806,7 +855,7 @@ run_sweep() {
   flagged_tsv="$orphan_tsv"
 
   if [ "$park_count" -gt 0 ]; then
-    log "PARK: ${park_count} bead(s) parado(s) de proposito (gate:needs-human*/blocked-by:*/blocked:*/status=blocked/design-first/pilot:no-auto-dispatch) — nao contam para o alerta de orfao"
+    log "PARK: ${park_count} bead(s) parado(s) de proposito (gate:needs-human*/blocked-by:*/blocked:*/status=blocked/design-first/pilot:no-auto-dispatch/pilot:held) — nao contam para o alerta de orfao"
     printf '%b' "$park_tsv" | while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount; do
       [ -z "${bid:-}" ] && continue
       log "  - PARK $bid ($(_store_name "$store2")) age=${age_min}min labels=[${labels}]"
@@ -842,7 +891,7 @@ run_sweep() {
     # normal path below before touching anything. The recheck itself is
     # read-only, so (matching how the rest of this file treats DRY_RUN) it
     # still runs and still logs — only the STATE FILE WRITE is skipped.
-    local _envelope0; _envelope0="$(_golw_resolve_tracked_state "$state" "[]" "$exclude_prefixes_json")"
+    local _envelope0; _envelope0="$(_golw_resolve_tracked_state "$state" "[]" "$exclude_prefixes_json" "$now")"
     state="$(printf '%s' "$_envelope0" | jq -c '.state' 2>/dev/null)"
     [ -z "${state:-}" ] && state="{}"
     if [ "${GOLW_DRY_RUN:-0}" != "1" ]; then
@@ -889,7 +938,7 @@ run_sweep() {
   # routed through the same individually-verified choke point as the
   # empty-sweep branch above, not a blind keys-subtraction (see the
   # RESOLVED-PRUNING header comment and _golw_resolve_tracked_state).
-  local _envelope; _envelope="$(_golw_resolve_tracked_state "$state" "$flagged_ids" "$exclude_prefixes_json")"
+  local _envelope; _envelope="$(_golw_resolve_tracked_state "$state" "$flagged_ids" "$exclude_prefixes_json" "$now")"
   state="$(printf '%s' "$_envelope" | jq -c '.state' 2>/dev/null)"
   [ -z "${state:-}" ] && state="{}"
   local resolved_ids
@@ -930,7 +979,7 @@ run_sweep() {
   local msg
   while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount; do
     [ -z "${bid:-}" ] && continue
-    msg="gate-orphaned-label-watchdog (ga-l8yh6): this bead carries gate:* label(s) [${labels}] with no ACTIVE quality-gate-marker/-run for >= ${GOLW_STALE_MINUTES}min (age: ${age_min}min). Last known gate artifact: ${lstatus} (${lcount} open artifact(s) referencing this bead; 0 = none ever found in the HQ store). Detection-only report — no label/status/assignee was touched. Common causes seen historically (ga-d3eg2): stale label after a manual fix, branch conflicts needing re-anchor, or already-merged-but-never-closed (an intentional park via gate:needs-human*/blocked-by:*/blocked:*/status=blocked/design-first/pilot:no-auto-dispatch is excluded from this alert entirely — see ga-cjk1j/ga-te41ft/ga-52zhb) — a human/Mayor should triage."
+    msg="gate-orphaned-label-watchdog (ga-l8yh6): this bead carries gate:* label(s) [${labels}] with no ACTIVE quality-gate-marker/-run for >= ${GOLW_STALE_MINUTES}min (age: ${age_min}min). Last known gate artifact: ${lstatus} (${lcount} open artifact(s) referencing this bead; 0 = none ever found in the HQ store). Detection-only report — no label/status/assignee was touched. Common causes seen historically (ga-d3eg2): stale label after a manual fix, branch conflicts needing re-anchor, or already-merged-but-never-closed (an intentional park via gate:needs-human*/blocked-by:*/blocked:*/status=blocked/design-first/pilot:no-auto-dispatch/pilot:held is excluded from this alert entirely — see ga-cjk1j/ga-te41ft/ga-52zhb/ga-sgp6j) — a human/Mayor should triage."
     if [ -n "${GOLW_TEST_COMMENTS_LOG:-}" ]; then
       echo "comment:${store2}:${bid}:${msg}" >> "$GOLW_TEST_COMMENTS_LOG" 2>/dev/null || true
     else
@@ -943,7 +992,7 @@ run_sweep() {
   local unchanged_count=$(( total_flagged - new_count ))
   local summary="GATE ORPHANED LABEL: ${new_count} new/due, ${resolved_count} resolved, ${unchanged_count} unchanged-already-reported — ${total_flagged} total currently flagged (>=${GOLW_STALE_MINUTES}min)."
   if [ "$park_count" -gt 0 ]; then
-    summary="${summary} +${park_count} parado(s) por decisao humana (gate:needs-human*/blocked-by:*/blocked:*/status=blocked/design-first/pilot:no-auto-dispatch) — nao contam para o alerta acima."
+    summary="${summary} +${park_count} parado(s) por decisao humana (gate:needs-human*/blocked-by:*/blocked:*/status=blocked/design-first/pilot:no-auto-dispatch/pilot:held) — nao contam para o alerta acima."
   fi
   if [ "$active_count" -gt 0 ]; then
     summary="${summary} +${active_count} em andamento com sessao viva (status=in_progress, assignee confirmado ativo via gc session list, ga-eiaidn) — nao contam para o alerta acima."
@@ -2159,6 +2208,66 @@ GCSTUB
   [ ! -s "$TMP/comm41c" ] && ok "scenario 41: 3rd sweep still posts no comment (parked bead stays quiet)" || bad "scenario 41: 3rd sweep posted a comment on a still-parked bead"
   [ ! -s "$TMP/mail41c" ] && ok "scenario 41: 3rd sweep still sends no mail (parked bead stays quiet)" || bad "scenario 41: 3rd sweep sent mail on a still-parked bead"
   rm -f "$TMP/fixtures/recheck-cand-park-transition.json" "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 42 (ga-sgp6j FIXTURE — REPROVES on HEAD before this fix): a
+  # bead carrying pilot:held + pilot:held-until:<FUTURE epoch>, matching the
+  # exact ga-wpdum shape (area:infra, gate:needs-fix, lane:small,
+  # story:approved), stale (>180min) → must NOT enter NEW/DUE; counted as
+  # PARK only. This is the live incident: the Mayor held ga-wpdum on purpose
+  # (disk pressure) and the pre-fix watchdog alerted it as orphaned anyway. ──
+  echo "Scenario 42 (ga-sgp6j fixture): pilot:held + pilot:held-until:<future> (ga-wpdum shape), stale → NOT flagged as orphan, counted as PARK only"
+  FUTURE_HELD_UNTIL=$(( $(date +%s) + 3600 ))
+  printf '[%s]' "$(mk_candidate cand-held1 "$TMP/hq" "area:infra,gate:needs-fix,lane:small,story:approved,pilot:held,pilot:held-until:${FUTURE_HELD_UNTIL}" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-held1.json"
+  NOTIF42="$TMP/notif42"; MAIL42="$TMP/mail42"; COMM42="$TMP/comm42"
+  : > "$NOTIF42"; : > "$MAIL42"; : > "$COMM42"; : > "$LOG"
+  GOLW_TEST_NOTIFIED="$NOTIF42" GOLW_TEST_MAILED="$MAIL42" GOLW_TEST_COMMENTS_LOG="$COMM42" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 42: pilot:held (future hold) bead does not enter NEW/DUE (return 0)" || bad "scenario 42 (ga-sgp6j regression — the exact bug): a pilot:held bead with an unexpired hold was treated as an orphan-suspect, got $rc"
+  [ ! -s "$COMM42" ] && ok "scenario 42: no comment posted on the held bead" || bad "scenario 42 (ga-sgp6j regression): comment posted on a bead carrying an unexpired pilot:held (should be excluded, ga-wpdum class)"
+  [ ! -s "$NOTIF42" ] && ok "scenario 42: no notify fired for a held-only sweep" || bad "scenario 42: notify fired despite only a held bead being present"
+  grep -q "PARK: 1 bead" "$LOG" 2>/dev/null && ok "scenario 42: log records the park count for the held bead" || bad "scenario 42: log missing the PARK count line for an unexpired pilot:held"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 43 (ga-sgp6j, SEM held-until — indefinite hold): pilot:held
+  # with NO pilot:held-until label at all must still park, mirroring
+  # _filter_candidates' own "else false" fallback for the identical shape
+  # (the Pilot itself never stamps this, but this watchdog must not assume a
+  # bare pilot:held is stale). ──────────────────────────────────────────────
+  echo "Scenario 43 (ga-sgp6j, no held-until): bare pilot:held with NO held-until label, stale → NOT flagged, counted as PARK only (indefinite hold)"
+  printf '[%s]' "$(mk_candidate cand-held2 "$TMP/hq" "gate:fix-attempt:1,pilot:held" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-held2.json"
+  NOTIF43="$TMP/notif43"; MAIL43="$TMP/mail43"; COMM43="$TMP/comm43"
+  : > "$NOTIF43"; : > "$MAIL43"; : > "$COMM43"; : > "$LOG"
+  GOLW_TEST_NOTIFIED="$NOTIF43" GOLW_TEST_MAILED="$MAIL43" GOLW_TEST_COMMENTS_LOG="$COMM43" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 43: bare pilot:held (no held-until) does not enter NEW/DUE (return 0)" || bad "scenario 43: a bare pilot:held bead (indefinite hold, no held-until) was treated as an orphan-suspect, got $rc"
+  [ ! -s "$COMM43" ] && ok "scenario 43: no comment posted on the bare pilot:held bead" || bad "scenario 43: comment posted on a bead carrying bare pilot:held with no held-until (should still park)"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 44 (ga-sgp6j CONTROL — the real alert must not disappear): a
+  # bead carrying pilot:held + pilot:held-until:<EXPIRED epoch> must NOT be
+  # treated as parked — the Pilot should already have redispatched it, and a
+  # bead still stranded past that point is a genuine orphan. If this fails,
+  # the fix over-widened is_park and blinded the watchdog to a real strand
+  # (the Pilot's own redispatch failing silently), which is worse than the
+  # bug this fix targets. ────────────────────────────────────────────────────
+  echo "Scenario 44 (ga-sgp6j control): pilot:held + pilot:held-until:<expired> → still flags as a real orphan (Pilot should have redispatched)"
+  PAST_HELD_UNTIL=$(( $(date +%s) - 3600 ))
+  printf '[%s]' "$(mk_candidate cand-held-expired "$TMP/hq" "gate:needs-fix,pilot:held,pilot:held-until:${PAST_HELD_UNTIL}" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-held-expired.json"
+  NOTIF44="$TMP/notif44"; MAIL44="$TMP/mail44"; COMM44="$TMP/comm44"
+  : > "$NOTIF44"; : > "$MAIL44"; : > "$COMM44"; : > "$LOG"
+  GOLW_TEST_NOTIFIED="$NOTIF44" GOLW_TEST_MAILED="$MAIL44" GOLW_TEST_COMMENTS_LOG="$COMM44" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 44: expired pilot:held still flags as a real orphan (return 1)" || bad "scenario 44 (ga-sgp6j regression): an EXPIRED pilot:held-until must not suppress a real orphan alert, got $rc"
+  grep -q "cand-held-expired" "$COMM44" 2>/dev/null && ok "scenario 44: comment posted on the expired-hold orphan" || bad "scenario 44 (ga-sgp6j regression): no comment on cand-held-expired — the fix over-widened is_park and silenced a real alert"
+  [ -s "$NOTIF44" ] && ok "scenario 44: notify still fires for an expired-hold orphan" || bad "scenario 44: notify did not fire for an expired-hold orphan"
+  [ -s "$MAIL44" ] && ok "scenario 44: mail still fires for an expired-hold orphan" || bad "scenario 44: mail did not fire for an expired-hold orphan"
+  rm -f "$STATE_FILE" 2>/dev/null
 
   echo ""
   echo "gate-orphaned-label-watchdog selftest: PASS=$PASS FAIL=$FAIL"
