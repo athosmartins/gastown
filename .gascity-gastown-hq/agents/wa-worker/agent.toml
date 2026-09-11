@@ -31,6 +31,12 @@
 # disk/swap stabilized — see agents/gate-reviewer/agent.toml's ga-5hdsr
 # comment for the full history and how to raise it back once headroom is
 # confirmed healthy again.
+# Raised 2 -> 3 on 2026-09-11 (Athos, multiple choice in the Mayor's session,
+# ~09:00Z). Why: the pool was the bottleneck. 35 small beads were queued, the
+# Pilot small lane opens 3 slots, and the gate sat 97 min with nothing to
+# review. The disk crisis that night came from the ficha360 nightly job
+# (disabled; fix in wa-ao1pl), not from workers. Revert to 2 if
+# dolt-disk-floor-guard goes CRITICAL again.
 #
 # MODEL: Sonnet. Build work is well within Sonnet's capabilities. Keeps wa-worker
 # off the scarce weekly Opus budget (which is reserved for Mayor / named crew).
@@ -40,7 +46,7 @@
 
 work_dir = "/Users/athos/gt/whatsapp_automation/crew/worker"
 min_active_sessions = 0
-max_active_sessions = 2
+max_active_sessions = 3
 idle_timeout = "2h"
 wake_mode = "fresh"
 model = "sonnet"
