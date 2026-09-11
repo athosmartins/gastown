@@ -91,6 +91,24 @@ MIN_PILOT_SWEEPS = 2           # need >=2 all-zero completes before calling a pi
 REVIEW_FRESH_SEC = 2700        # a gate review with elapsed < this is "legitimately running"
                                # → suppresses the gate-merge stall (a single 45min review
                                # must NOT fire; the gate's own TIMEOUT handles longer)
+# ga-z0xx1: the assumption above ("the gate's own TIMEOUT handles longer") doesn't hold —
+# the dispatcher scales that timeout by diff size up to a 50min cap (ga-ltr3c), which is
+# ABOVE this fixed 45min constant. REVIEW_SCAN_HORIZON_SEC is how far back we'll trust a
+# PHASE_C_INFLIGHT_RE "still in flight" line (below) as evidence for a run near that cap.
+# A first version of this fix widened only the outer scan-loop cutoff and left the
+# PHASE_C_INFLIGHT_RE branch's own freshness check at a tight POLL_SEC*2 (10min) — which
+# made the widening a no-op, since nothing inside the loop actually used the wider bound
+# (caught by adversarial review, not by the selftest, before merge). The actual fix is
+# that a stale-but-in-horizon line's elapsed is PROJECTED forward by the gap since it was
+# logged (see _fresh_review_in_progress) rather than compared raw — so a line up to
+# REVIEW_SCAN_HORIZON_SEC old stays USABLE without becoming inaccurate, and this constant
+# does real work. The +600s beyond REVIEW_FRESH_SEC is slack for a slow Phase-C sweep
+# cadence under Dolt load. Not proof of a specific observed gap in THIS check, but
+# quality-gate-dispatcher.sh's own ga-dupnv note documents a real adjacent incident (a
+# 12min reviewer-nudge hang that let launchd's ~2min StartInterval overlap fresh sweeps)
+# — evidence this pipeline's sweep cadence is not perfectly metronomic, which is the
+# scenario this slack is for. Not a second timeout budget in itself.
+REVIEW_SCAN_HORIZON_SEC = REVIEW_FRESH_SEC + 600
 LOG_FRESH_SEC = 600            # ignore a stage whose log is staler than this — a dead
                                # engine is ENGINE-STALL's job, not throughput's
 DURABLE_FAIL_WINDOW_SEC = 1800 # look-back for the durable-landing-FAIL signature
@@ -126,7 +144,20 @@ PILOT_NO_DEMAND = "No dispatchable candidates"
 GATE_PASS = "Gate PASSED"
 GATE_QUEUED_RE = re.compile(r"Found (\d+) queued marker\(s\)")
 # "  Verdicts: G/N received (elapsed: Ys)"
+# ga-z0xx1: verified against the live dispatcher log (19.8k lines, 2026-09-11) — this
+# pattern currently matches NOTHING. The dispatcher's real in-flight-poll line is
+# PHASE_C_INFLIGHT_RE below; kept as-is (harmless no-op) rather than removed, since
+# resurrecting/removing it is a separate concern from this bead's fix — tracked at
+# ga-ohz0x, not folded into this diff.
 VERDICTS_RE = re.compile(r"Verdicts:\s*(\d+)/(\d+)\s*received\s*\(elapsed:\s*(\d+)s\)")
+# "Phase C: gate-run <id> (branch=<b>) still in flight (G/N verdicts, ELAPSEDs/TIMEOUTs) —
+# leaving for a future sweep." (quality-gate-dispatcher.sh, gate_run "still in flight" log
+# line). TIMEOUT here is the run's OWN already diff-scaled verdict timeout in seconds
+# (ga-ltr3c scales it up to a 50min cap by default) — self-contained per-run signal, no
+# separate pairing with the "scaled verdict timeout" announcement line needed. ga-z0xx1:
+# this is the fix for the fixed-REVIEW_FRESH_SEC-vs-escalated-cap false positive — compare
+# a run's elapsed against ITS OWN reported timeout instead of a global 45min constant.
+PHASE_C_INFLIGHT_RE = re.compile(r"still in flight \(\d+/\d+ verdicts, (\d+)s/(\d+)s\)")
 GATE_MERGING = "proceeding to merge branch"
 # ga-cw4pm headroom decision (gate's own throttle self-assessment, one per sweep):
 #   "Headroom DEFER: gate em N runs (...) — dolt-hot; ceiling=0 reviewers, leaving M
@@ -267,10 +298,28 @@ def pilot_dispatch_stall(now=None):
 
 # ── CHECK B: Gate not merging under demand (with live-review guard) ───────────
 def _fresh_review_in_progress(lines, now):
-    """True if the gate is legitimately mid-flight: a Verdicts poll younger than
+    """True if the gate is legitimately mid-flight: a Phase-C "still in flight" poll whose
+    own elapsed is under ITS OWN reported timeout, a Verdicts poll younger than
     REVIEW_FRESH_SEC, a 'proceeding to merge' line, or a partial verdict (G>0) appears
     recently. This is the guard that keeps a single honest long review — or a slow run
     that is still making progress under Dolt load — from tripping the alarm.
+
+    ga-z0xx1: PHASE_C_INFLIGHT_RE is checked against the run's OWN self-reported timeout
+    (already diff-scaled, up to the dispatcher's 50min cap — ga-ltr3c) instead of the fixed
+    REVIEW_FRESH_SEC constant, which under-covers a large diff scaled past 45min. This is
+    today's real in-flight signal — VERDICTS_RE below no longer matches the live dispatcher
+    log format (verified against 19.8k live lines, 2026-09-11) and is kept only as an inert
+    fallback (see the ga-z0xx1 note at VERDICTS_RE's definition).
+
+    ga-z0xx1 (adversarial-review correction): a PHASE_C_INFLIGHT_RE line's own `elapsed`
+    field is only accurate as of when it was LOGGED, not as of `now` — a first version of
+    this fix compared it raw and gated on a tight POLL_SEC*2 recency window, which made the
+    wider REVIEW_SCAN_HORIZON_SEC scan bound a no-op (nothing inside the loop actually used
+    it). Fixed by PROJECTING elapsed forward by the gap since the line was logged
+    (`pc_elapsed + (now - e)`) before comparing to that run's own timeout — accurate
+    regardless of how stale the line is within the scan horizon, and it naturally stops
+    suppressing once enough real time has passed that the run's own budget would be spent
+    even if it hasn't logged again since.
 
     ga-vym2m: scan by TIMESTAMP, not a fixed 40-line tail. Under Dolt CPU saturation the
     dispatcher logs many headroom-defer / retry lines per sweep, so the in-flight review's
@@ -280,10 +329,25 @@ def _fresh_review_in_progress(lines, now):
     received are themselves proof the run is progressing (verdicts rising X/3, not stuck)."""
     for l in reversed(lines):
         e = log_ts_epoch(l)
-        # Stop once we walk past the freshness horizon — lines are chronological, so
-        # anything older cannot make the review "fresh" and bounds the scan.
-        if e is not None and now - e > REVIEW_FRESH_SEC:
+        # Stop once we walk past the scan horizon — lines are chronological, so anything
+        # older cannot make the review "fresh" and bounds the scan. Widened past the base
+        # REVIEW_FRESH_SEC (ga-z0xx1) so a run legitimately scaled near the dispatcher's cap
+        # isn't cut off before its own PHASE_C_INFLIGHT_RE evidence is reached.
+        if e is not None and now - e > REVIEW_SCAN_HORIZON_SEC:
             break
+        pc = PHASE_C_INFLIGHT_RE.search(l)
+        if pc is not None and e is not None:
+            pc_elapsed, pc_timeout = int(pc.group(1)), int(pc.group(2))
+            # ga-z0xx1: project elapsed forward to `now` — this line's own elapsed is only
+            # accurate as of `e`. A fresh line (e near now) behaves as a near-direct
+            # comparison; a stale-but-in-horizon line is corrected for the gap instead of
+            # trusted raw or discarded outright. Compares against THIS run's own scaled
+            # timeout (already in the line), not the fixed REVIEW_FRESH_SEC — fixes the
+            # false-positive class where a diff-scaled run legitimately runs past 45min but
+            # under its own <=50min cap.
+            projected_elapsed = pc_elapsed + (now - e)
+            if projected_elapsed < pc_timeout:
+                return True
         if GATE_MERGING in l:
             if e and now - e < REVIEW_FRESH_SEC:
                 return True
