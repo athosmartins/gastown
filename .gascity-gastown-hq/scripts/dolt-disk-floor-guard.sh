@@ -328,18 +328,89 @@ _vm_swap_gb() {
   echo $(( kb / 1024 / 1024 ))
 }
 
-# _top_rss_processes [n] → top N processes on this host by resident set size
-# (RSS, KB), one "PID RSS_KB COMMAND" line per process, highest first —
-# ga-sfj3i.3 item 4: "top 5 RSS so the kill decision is informed, not a
-# guess." This guard still never kills anything itself (see OUT OF SCOPE
-# above) — purely informational, for whoever reads the alert. Best-effort:
-# empty output (not a crash) if `ps` is missing or produces no rows; callers
-# must treat empty as "unmeasured", same contract as _avail_gb/_vm_swap_gb,
-# never as "no processes running". Not gated by ENABLED — this is a read,
-# not a reclaim action, same precedent as _vm_swap_gb above.
-_top_rss_processes() {
+# _top_mem_processes [n] → top N processes on this host by TOTAL physical-
+# memory footprint (top's own "mem" stat key — `man top`: "Physical memory
+# footprint of the process" — resident AND compressed pages combined, the
+# same metric Activity Monitor's "Memory" column and the `footprint` tool
+# report), one "PID PPID MEM CMPRS LAUNCHD_LABEL FULL_COMMAND" line per
+# process, highest footprint first. REPLACES _top_rss_processes (ga-xz5re):
+# `ps`'s RSS only counts resident, UNCOMPRESSED pages, so a process whose
+# memory is mostly swapped/compressed is invisible to it. Confirmed live
+# 2026-09-11: a 22GB python search-index build (PID 89690) had RSS small
+# enough to rank behind ordinary dolt/claude processes in the OLD `ps -Ao
+# pid,rss,comm` listing, and only surfaced when the Mayor ran `top -l 1 -o
+# mem -stats pid,ppid,command,mem,cmprs` by hand — this guard's own alert
+# never mentioned it. MEM reads equal to CMPRS (22G/22G) for a process
+# that's entirely compressed precisely because "mem" already folds CMPRS in
+# — sorting by it, not by RSS, is what surfaces that shape.
+#
+# FULL_COMMAND resolves via `ps -o command=` per PID — top's own COMMAND
+# column is name-only and truncated (e.g. every python process shows as
+# "Python"), which is exactly how PID 89690 would have stayed anonymous
+# even in a mem-sorted listing; full args are what let a human tell
+# build_ficha360_search_index.py apart from any other python process.
+# LAUNCHD_LABEL resolves via one shared `launchctl list` call (a PID→label
+# map built once, not N calls) and reads "-" for the common case of a
+# process that isn't itself a directly launchd-managed job.
+#
+# This guard still never kills anything itself (see OUT OF SCOPE above) —
+# purely informational, for whoever reads the alert. Best-effort throughout,
+# same "empty means unmeasured, never zero processes" contract as every
+# other read in this file (ga-p5q3): `top`/`ps`/`launchctl` failing, an
+# unparseable/reordered top banner, or a process exiting between the `top`
+# snapshot and the per-PID `ps`/`launchctl` lookups (expected — this guard
+# polls a live, changing process table every 5min) all surface as
+# fewer/emptier fields, never a crash and never a fabricated row. Not gated
+# by ENABLED — this is a read, not a reclaim action, same precedent as
+# _vm_swap_gb above.
+_top_mem_processes() {
   local n="${1:-5}"
-  ps -Ao pid,rss,comm 2>/dev/null | tail -n +2 | sort -rn -k2 | head -n "$n"
+  local top_out
+  top_out="$(top -l 1 -o mem -stats pid,ppid,command,mem,cmprs -n "$n" 2>/dev/null)"
+  [ -z "$top_out" ] && { echo ""; return; }
+
+  # top's banner (process/CPU/mem/VM/network/disk summary, ~10 lines)
+  # precedes a blank line then the column header — skip everything through
+  # the header line itself (matched by leading-whitespace + "PID", not a
+  # fixed line count, so a reordered/added banner line can't silently shift
+  # which rows get treated as data).
+  local rows
+  rows="$(printf '%s\n' "$top_out" | awk '
+    started { if (NF > 0) print; next }
+    /^[[:space:]]*PID/ { started=1; next }
+  ')"
+  [ -z "$rows" ] && { echo ""; return; }
+
+  local launchd_map=""
+  if command -v launchctl >/dev/null 2>&1; then
+    launchd_map="$(launchctl list 2>/dev/null | awk 'NR>1 && $1 ~ /^[0-9]+$/ {print $1, $3}')"
+  fi
+
+  # PID/PPID are grabbed from the FRONT and MEM/CMPRS from the BACK ($(NF-1)/
+  # $NF) rather than by fixed field index — top's own COMMAND field can in
+  # principle contain whitespace, and this stays correct regardless of how
+  # many "middle" fields that expands to.
+  printf '%s\n' "$rows" | head -n "$n" | while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    local pid ppid mem cmprs cmd label found
+    pid="$(printf '%s' "$line" | awk '{print $1}')"
+    ppid="$(printf '%s' "$line" | awk '{print $2}')"
+    mem="$(printf '%s' "$line" | awk '{print $(NF-1)}')"
+    cmprs="$(printf '%s' "$line" | awk '{print $NF}')"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    case "$ppid" in ''|*[!0-9]*) continue ;; esac
+
+    cmd="$(ps -o command= -p "$pid" 2>/dev/null)"
+    [ -z "$cmd" ] && cmd="(unavailable — process may have exited)"
+
+    label="-"
+    if [ -n "$launchd_map" ]; then
+      found="$(printf '%s\n' "$launchd_map" | awk -v p="$pid" '$1==p {print $2; exit}')"
+      [ -n "$found" ] && label="$found"
+    fi
+
+    printf '%s %s %s %s %s %s\n' "$pid" "$ppid" "$mem" "$cmprs" "$label" "$cmd"
+  done
 }
 
 # _floor_class <avail_gb> <warn_gb> <crit_gb> → NONE|WARN|CRITICAL|UNKNOWN.
@@ -474,7 +545,7 @@ _gocache_size_gb() {
 # _go_toolchain_active → 0 (true, exit code) if a `go build`/`go test`/`go
 # install`/`go run` invocation or one of the toolchain's own internal
 # subprocesses (compile/link) is currently running. Best-effort, like
-# _top_rss_processes: pgrep absence/failure reads as "not active" (1/false)
+# _top_mem_processes: pgrep absence/failure reads as "not active" (1/false)
 # — the safe direction, since _should_reap_gocache's CRITICAL branch forces
 # the reap regardless of this reading; a false negative here only costs one
 # WARN-tier cycle (5min), never blocks the CRITICAL guarantee (ga-yi68q).
@@ -1061,17 +1132,19 @@ main() {
     fi
     log "diagnosis: ${diagnosis} (reclaimed=${reclaimed_gb:-unmeasured}GB avail_before=${avail_before}GB vm_swap=${vm_gb:-unknown}GB vm_threshold=${VM_SIGNIFICANT_GB}GB)"
 
-    # ga-sfj3i.3 item 4: top RSS consumers, so a kill decision (made by a
-    # human/Mayor — this guard still never kills anything itself) is
-    # informed rather than a guess. Logged only when actually alerting, not
-    # every cycle — unlike vm_swap_gb, this isn't needed for historical
-    # mining, only for the moment someone has to act.
-    local top_rss; top_rss="$(_top_rss_processes 5)"
-    if [ -n "$top_rss" ]; then
-      log "top RSS processes (PID RSS_KB COMMAND):"
-      printf '%s\n' "$top_rss" | while IFS= read -r _rss_line; do log "  $_rss_line"; done
+    # ga-sfj3i.3 item 4 (superseded by ga-xz5re — see _top_mem_processes'
+    # own header for why RSS was replaced with physical-memory footprint):
+    # top memory consumers, so a kill decision (made by a human/Mayor — this
+    # guard still never kills anything itself) is informed rather than a
+    # guess. Logged only when actually alerting, not every cycle — unlike
+    # vm_swap_gb, this isn't needed for historical mining, only for the
+    # moment someone has to act.
+    local top_mem; top_mem="$(_top_mem_processes 5)"
+    if [ -n "$top_mem" ]; then
+      log "top memory-footprint processes (PID PPID MEM CMPRS LAUNCHD_LABEL COMMAND):"
+      printf '%s\n' "$top_mem" | while IFS= read -r _mem_line; do log "  $_mem_line"; done
     else
-      log "top RSS processes: unmeasured (ps produced no rows)"
+      log "top memory-footprint processes: unmeasured (top produced no rows)"
     fi
 
     log "class=${class} was_critical=${was_critical}: avail=${avail}GB (warn=${FLOOR_WARN_GB}GB crit=${FLOOR_CRITICAL_GB}GB) — notifying"
@@ -1148,9 +1221,10 @@ recovered.
 
 DIAGNOSIS (ga-sfj3i.3): ${diagnosis}. ${diagnosis_detail}
 
-Top 5 processes by resident memory (PID  RSS_KB  COMMAND), for an informed decision on what to
-bring down if RAM pressure is the lever (this guard never kills anything itself):
-${top_rss:-  (unmeasured — ps produced no rows)}
+Top 5 processes by physical memory footprint (PID  PPID  MEM  CMPRS  LAUNCHD_LABEL  COMMAND),
+for an informed decision on what to bring down if RAM pressure is the lever (this guard never
+kills anything itself):
+${top_mem:-  (unmeasured — top produced no rows)}
 
 (ga-sfj3i.2 measured the vm_swap<->disk correlation and the Mayor's own follow-up falsified a
 broader causal claim against 40 days of this guard's history — see that bead for the raw numbers.)"
