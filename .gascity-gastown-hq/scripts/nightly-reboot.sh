@@ -144,7 +144,7 @@ record_skip() {
 }
 # nightly-reboot.selftest.sh:STREAK-FUNCTIONS-END
 
-# --- macOS update install-before-reboot (ga-l5m50) -------------------------
+# --- macOS update install-before-reboot (ga-l5m50, hardened by ga-i8n6s) ---
 # ga-i9q44 reboots nightly to reclaim swap; separately, AutomaticDownload=1
 # means macOS downloads recommended updates in the background on its own
 # (AutomaticallyInstallMacOSUpdates stays 0 — deliberately: Athos chose to
@@ -154,6 +154,17 @@ record_skip() {
 # it right before the existing reboot, reusing that reboot rather than
 # triggering a second one.
 #
+# ga-i8n6s: rc=0 from `--install` is NOT proof the update installed. Measured
+# live 2026-09-11: softwareupdate printed "Not enough free disk space: a
+# total of 17.13 GB is required." and still exited 0 — the original code
+# below trusted that rc and logged "instalado com sucesso", so the Tahoe
+# 26.6.2 update sat pending in silence night after night. Fix asks the same
+# --list --no-scan question again AFTER the install attempt (three states:
+# clear/pending/unknown — never collapse "couldn't tell" into "succeeded",
+# see [[error-empty-must-not-produce-same-value]]), and — as a cheap,
+# approximate optimization only, NOT a substitute for that re-check — skips
+# the attempt entirely on a night that is obviously hopeless on free space.
+#
 # nightly-reboot.selftest.sh:MACOS-UPDATE-FUNCTIONS-START — sentinel for the
 # selftest, which extracts exactly this block (via sed) to unit-test this
 # logic in total isolation from Guards 1-3 and the reboot call — same reason
@@ -161,9 +172,17 @@ record_skip() {
 # this selftest, unmodified, against the pre-fix commit, which has no
 # override hook for a real `softwareupdate --install` call either. Keep this
 # block self-contained (log()/notify_athos() already defined above,
-# SOFTWAREUPDATE_BIN overridable) if you touch it.
+# SOFTWAREUPDATE_BIN/MACOS_UPDATE_MIN_FREE_GB overridable) if you touch it.
 SOFTWAREUPDATE_BIN="${SOFTWAREUPDATE_BIN:-/usr/sbin/softwareupdate}"
-macos_update_ready() {
+MACOS_UPDATE_MIN_FREE_GB="${MACOS_UPDATE_MIN_FREE_GB:-10}"
+
+# Sets MACOS_UPDATE_STATE to "pending" | "clear" | "unknown" and
+# MACOS_UPDATE_REASON to a human string, by asking --list --no-scan the same
+# question every time: is anything with Action: restart still pending? Used
+# both to decide whether to attempt an install (state != "pending" -> nothing
+# to do) and, after attempting one, to verify it actually took effect (state
+# != "pending" anymore) instead of trusting softwareupdate's own exit code.
+macos_update_check_state() {
   # --no-scan: report from the catalog the AutomaticDownload daemon already
   # scanned in the background — never triggers a fresh scan/download of our
   # own at 01:00. Only a label whose Action includes "restart" counts as
@@ -173,30 +192,82 @@ macos_update_ready() {
   SU_LIST_OUT=$("${SOFTWAREUPDATE_BIN}" --list --no-scan 2>/dev/null)
   SU_LIST_RC=$?
   if [ "${SU_LIST_RC}" -ne 0 ]; then
+    MACOS_UPDATE_STATE="unknown"
     MACOS_UPDATE_REASON="softwareupdate --list --no-scan failed (rc=${SU_LIST_RC})"
-    return 1
+    return 0
   fi
-  if ! printf '%s' "${SU_LIST_OUT}" | grep -q "Action: restart"; then
+  if printf '%s' "${SU_LIST_OUT}" | grep -q "Action: restart"; then
+    MACOS_UPDATE_STATE="pending"
+    MACOS_UPDATE_REASON="update with Action: restart pending"
+  else
+    MACOS_UPDATE_STATE="clear"
     MACOS_UPDATE_REASON="no update with Action: restart pending"
-    return 1
   fi
   return 0
 }
+macos_update_ready() {
+  macos_update_check_state
+  [ "${MACOS_UPDATE_STATE}" = "pending" ]
+}
+
+# Cheap, approximate pre-check only — NOT a substitute for the post-install
+# re-check in macos_update_install_if_ready below. There is no way to know in
+# advance exactly how much space a given update needs (the 17.13GB figure in
+# ga-i8n6s came from softwareupdate itself, mid-attempt); this only catches a
+# night that is obviously hopeless on space, to skip wasting the attempt.
+macos_update_free_gb() {
+  local avail_kb
+  avail_kb=$(df -k /System/Volumes/Data 2>/dev/null | tail -1 | awk '{print $4}')
+  case "${avail_kb}" in (''|*[!0-9]*) return 1 ;; esac
+  printf '%s' $(( avail_kb / 1024 / 1024 ))
+  return 0
+}
+
 macos_update_install_if_ready() {
   if ! macos_update_ready; then
     log "macOS update: ${MACOS_UPDATE_REASON} — reboot normal (sem instalar)"
     return 0
   fi
+
+  local free_gb
+  free_gb=$(macos_update_free_gb)
+  if [ -n "${free_gb}" ] && [ "${free_gb}" -lt "${MACOS_UPDATE_MIN_FREE_GB}" ]; then
+    log "macOS update pendente, mas só ${free_gb}GB livres (mínimo ${MACOS_UPDATE_MIN_FREE_GB}GB) — pulando a instalação pra não gastar tempo à toa; reboot normal"
+    notify_athos "Reboot noturno: update de macOS pulado" "Só ${free_gb}GB livres (mínimo ${MACOS_UPDATE_MIN_FREE_GB}GB) — não tentei instalar. Ver ${LOG}." 3
+    return 0
+  fi
+
   log "macOS update pendente (Action: restart) — instalando antes do reboot; pode demorar mais que o normal (ga-l5m50)"
   notify_athos "Reboot noturno" "Instalando atualização de macOS antes de reiniciar — pode levar mais tempo que o normal." 3
-  "${SOFTWAREUPDATE_BIN}" --install --all --no-scan --agree-to-license >>"${LOG}" 2>&1
+  SU_INSTALL_OUT=$("${SOFTWAREUPDATE_BIN}" --install --all --no-scan --agree-to-license 2>&1)
   local su_rc=$?
-  if [ "${su_rc}" -eq 0 ]; then
-    log "macOS update instalado com sucesso"
-  else
-    log "ERROR: macOS update falhou ao instalar (rc=${su_rc}) — prosseguindo com o reboot mesmo assim"
-    notify_athos "Reboot noturno: update falhou" "softwareupdate retornou ${su_rc} — reiniciando sem instalar. Ver ${LOG}." 4
+  printf '%s\n' "${SU_INSTALL_OUT}" >>"${LOG}"
+
+  # rc alone is not trustworthy (ga-i8n6s: rc=0 measured with nothing
+  # actually installed) — ask the same pending/clear/unknown question again
+  # to see what really happened.
+  macos_update_check_state
+  if [ "${MACOS_UPDATE_STATE}" = "clear" ]; then
+    log "macOS update instalado com sucesso (rc=${su_rc})"
+    return 0
   fi
+
+  if printf '%s' "${SU_INSTALL_OUT}" | grep -qi "not enough free disk space"; then
+    local disk_msg
+    disk_msg=$(printf '%s' "${SU_INSTALL_OUT}" | grep -i "not enough free disk space" | head -1)
+    log "ERROR: macOS update falhou por falta de espaço em disco (rc=${su_rc}): ${disk_msg} — update continua pendente; prosseguindo com o reboot mesmo assim"
+    notify_athos "Reboot noturno: update falhou (disco cheio)" "${disk_msg} — reiniciando sem instalar. Ver ${LOG}." 4
+    return 0
+  fi
+
+  if [ "${MACOS_UPDATE_STATE}" = "unknown" ]; then
+    log "ERROR: macOS update — não consegui confirmar se instalou (rc=${su_rc}; ${MACOS_UPDATE_REASON}) — prosseguindo com o reboot mesmo assim"
+    notify_athos "Reboot noturno: update indeterminado" "Não consegui confirmar se o update instalou (rc=${su_rc}) — ver ${LOG}." 4
+    return 0
+  fi
+
+  log "ERROR: macOS update falhou ao instalar (rc=${su_rc}) — update continua pendente; prosseguindo com o reboot mesmo assim"
+  notify_athos "Reboot noturno: update falhou" "softwareupdate retornou ${su_rc} e o update continua pendente — reiniciando sem instalar. Ver ${LOG}." 4
   return 0
 }
 # nightly-reboot.selftest.sh:MACOS-UPDATE-FUNCTIONS-END

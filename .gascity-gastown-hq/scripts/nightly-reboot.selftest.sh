@@ -246,33 +246,53 @@ EOF
 fi
 
 echo ""
-echo "── Scenario 5: macOS update install-before-reboot (ga-l5m50), tested in isolation from Guards 1-3 ──"
+echo "── Scenario 5: macOS update install-before-reboot (ga-l5m50 / ga-i8n6s), tested in isolation from Guards 1-3 ──"
 # Extracted from nightly-reboot.sh between its own sentinel markers — same
 # isolation technique and same reason as Scenario 4's streak-functions
 # extraction (see this file's header): a full-script run must never let both
 # guards clear, so the install-before-reboot logic is exercised via sentinel
-# extraction + a faked `softwareupdate` in PATH, never via a full run of the
-# real script. On the pre-fix script this extraction comes back empty — the
-# correct, expected result for arm B (see Scenario 4's own comment).
+# extraction + a faked `softwareupdate`/`df` in-process, never via a full run
+# of the real script. On the pre-fix script this extraction comes back empty
+# — the correct, expected result for arm B (see Scenario 4's own comment).
 MACOS_SNIPPET="$TMP/macos-update-functions.sh"
 sed -n '/MACOS-UPDATE-FUNCTIONS-START/,/MACOS-UPDATE-FUNCTIONS-END/p' "$SCRIPT" > "$MACOS_SNIPPET"
 if [ ! -s "$MACOS_SNIPPET" ]; then
   bad "5: sentinel extraction found nothing in $SCRIPT — cannot test macOS-update logic (expected on the pre-fix script; see file header)"
 else
   SU_CALLS_LOG="$TMP/su-calls.log"
-  SU_LIST_FILE="$TMP/su-list-output.txt"
+  SU_LIST_BEFORE_FILE="$TMP/su-list-before.txt"
+  SU_LIST_AFTER_FILE="$TMP/su-list-after.txt"
+  SU_INSTALL_OUTPUT_FILE="$TMP/su-install-output.txt"
+  INSTALL_MARKER="$TMP/su-install-called"
   FAKE_SU="$TMP/softwareupdate"
 
-  # $1 = --list output body, $2 = exit code for --install (default 0)
+  # $1 = --list output BEFORE --install runs
+  # $2 = exit code for --install (default 0)
+  # $3 = stdout/stderr text --install should print (default empty)
+  # $4 = --list output AFTER --install runs (default: same as $1, i.e.
+  #      "nothing actually changed" — the correct fake for every failure
+  #      scenario, including the rc=0-but-lying live bug; a genuine-success
+  #      scenario passes a listing with no Action:restart entry here, to
+  #      simulate the update really clearing).
   write_fake_su() {
-    printf '%s\n' "$1" > "$SU_LIST_FILE"
+    printf '%s\n' "$1" > "$SU_LIST_BEFORE_FILE"
     local install_rc="${2:-0}"
+    printf '%s' "${3:-}" > "$SU_INSTALL_OUTPUT_FILE"
+    printf '%s\n' "${4:-$1}" > "$SU_LIST_AFTER_FILE"
+    rm -f "$INSTALL_MARKER"
     cat > "$FAKE_SU" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$SU_CALLS_LOG"
 case "\$1" in
-  --list) cat "$SU_LIST_FILE"; exit 0 ;;
-  --install) exit $install_rc ;;
+  --list)
+    if [ -f "$INSTALL_MARKER" ]; then cat "$SU_LIST_AFTER_FILE"; else cat "$SU_LIST_BEFORE_FILE"; fi
+    exit 0
+    ;;
+  --install)
+    touch "$INSTALL_MARKER"
+    cat "$SU_INSTALL_OUTPUT_FILE"
+    exit $install_rc
+    ;;
 esac
 EOF
     chmod +x "$FAKE_SU"
@@ -288,6 +308,10 @@ Software Update found the following new or updated software:
 
 No new software available.'
 
+  # The exact failure mode measured live in ga-i8n6s: --install exits 0 but
+  # prints this, and nothing is actually installed.
+  DISK_FAIL_OUTPUT='Not enough free disk space: a total of 17.13 GB is required.'
+
   ISO5_LOG="$TMP/iso5.log"
   ISO5_NOTIFY_LOG="$TMP/iso5-notify.log"
   : > "$ISO5_LOG"; : > "$ISO5_NOTIFY_LOG"
@@ -297,35 +321,72 @@ No new software available.'
   LOG="$ISO5_LOG"
   SOFTWAREUPDATE_BIN="$FAKE_SU"
 
+  # `df` override: fixed HIGH free space by default so 5a/5b/5c/5d never
+  # depend on how much space this test machine actually has free (it
+  # fluctuates 5-15GB in production per this very bug's own report) — only
+  # 5e below deliberately lowers it to exercise the pre-check.
+  FAKE_DF_AVAIL_KB=$((50 * 1024 * 1024))  # 50GB
+  df() {
+    echo "Filesystem 1024-blocks Used Available Capacity iused ifree %iused Mounted"
+    echo "/dev/disk3s5 999999999 999999999 ${FAKE_DF_AVAIL_KB} 50% 1 1 1% /System/Volumes/Data"
+  }
+
   # shellcheck source=/dev/null
   source "$MACOS_SNIPPET"
 
-  echo "  -- 5a: update ready (Action: restart), install succeeds --"
+  echo "  -- 5a: update ready (Action: restart), install succeeds and takes effect --"
   : > "$SU_CALLS_LOG"; : > "$ISO5_LOG"; : > "$ISO5_NOTIFY_LOG"
-  write_fake_su "$RESTART_LISTING" 0
+  write_fake_su "$RESTART_LISTING" 0 "" "$NO_UPDATE_LISTING"
   macos_update_install_if_ready
   RC5A=$?
   [ "$RC5A" -eq 0 ] && ok "5a: returns 0 (never blocks the caller's reboot)" || bad "5a: expected return 0, got $RC5A"
-  [ "$(grep -c '^--list --no-scan$' "$SU_CALLS_LOG" 2>/dev/null)" = "1" ] && ok "5a: checked --list --no-scan exactly once" || bad "5a: expected exactly 1 --list call"
+  [ "$(grep -c '^--list --no-scan$' "$SU_CALLS_LOG" 2>/dev/null)" = "2" ] && ok "5a: verified with --list --no-scan before AND after install — this is the fix" || bad "5a: expected exactly 2 --list calls, got $(grep -c '^--list --no-scan$' "$SU_CALLS_LOG" 2>/dev/null)"
   grep -q '^--install --all --no-scan --agree-to-license$' "$SU_CALLS_LOG" && ok "5a: attempted install with the right flags" || bad "5a: install was not attempted with expected flags"
   grep -qi "instalando" "$ISO5_LOG" && ok "5a: logged the install attempt before running it" || bad "5a: missing pre-install log line"
   grep -qi "sucesso" "$ISO5_LOG" && ok "5a: logged install success" || bad "5a: missing success log line"
+  grep -qi "ERROR" "$ISO5_LOG" && bad "5a: logged an ERROR on a genuine, verified success" || ok "5a: no false ERROR on genuine success"
 
-  echo "  -- 5b: update ready, install FAILS — must not abort (caller still proceeds to reboot) --"
+  echo "  -- 5b: update ready, install FAILS outright (rc=1, nothing changes) — must not abort --"
   : > "$SU_CALLS_LOG"; : > "$ISO5_LOG"; : > "$ISO5_NOTIFY_LOG"
-  write_fake_su "$RESTART_LISTING" 1
+  write_fake_su "$RESTART_LISTING" 1 "some generic failure" "$RESTART_LISTING"
   macos_update_install_if_ready
   RC5B=$?
   [ "$RC5B" -eq 0 ] && ok "5b: function returns 0 even when install failed (never blocks the reboot)" || bad "5b: function returned $RC5B — this would abort the caller's reboot"
   grep -qi "ERROR" "$ISO5_LOG" && ok "5b: logged the install failure" || bad "5b: missing failure log line"
+  grep -qi "sucesso" "$ISO5_LOG" && bad "5b: falsely logged success" || ok "5b: did not claim success"
   [ -s "$ISO5_NOTIFY_LOG" ] && ok "5b: alarmed athos about the install failure" || bad "5b: no notify on install failure"
 
   echo "  -- 5c: no update pending — install must NEVER be attempted --"
   : > "$SU_CALLS_LOG"; : > "$ISO5_LOG"; : > "$ISO5_NOTIFY_LOG"
-  write_fake_su "$NO_UPDATE_LISTING" 0
+  write_fake_su "$NO_UPDATE_LISTING" 0 "" "$NO_UPDATE_LISTING"
   macos_update_install_if_ready
   grep -q '^--install' "$SU_CALLS_LOG" && bad "5c: install was attempted with nothing pending" || ok "5c: install correctly skipped — nothing with Action: restart pending"
   grep -qi "reboot normal" "$ISO5_LOG" && ok "5c: logged the skip reason" || bad "5c: missing skip-reason log line"
+
+  echo "  -- 5d: THE LIVE BUG (ga-i8n6s) — install exits rc=0 but 'Not enough free disk space', installs nothing --"
+  : > "$SU_CALLS_LOG"; : > "$ISO5_LOG"; : > "$ISO5_NOTIFY_LOG"
+  write_fake_su "$RESTART_LISTING" 0 "$DISK_FAIL_OUTPUT" "$RESTART_LISTING"
+  macos_update_install_if_ready
+  RC5D=$?
+  [ "$RC5D" -eq 0 ] && ok "5d: function returns 0 even on this silent failure (never blocks the reboot)" || bad "5d: function returned $RC5D"
+  grep -qi "sucesso" "$ISO5_LOG" && bad "5d: THE BUG — logged 'sucesso' even though softwareupdate never actually installed anything (rc=0 lied)" || ok "5d: correctly did NOT log success"
+  grep -qi "ERROR" "$ISO5_LOG" && ok "5d: logged ERROR despite rc=0" || bad "5d: missing ERROR log line — rc=0 was trusted blindly"
+  grep -qi "disco" "$ISO5_LOG" && ok "5d: log names disk space as the cause" || bad "5d: log doesn't call out disk space as the reason"
+  grep -q "17.13" "$ISO5_LOG" && ok "5d: log captures the exact shortfall softwareupdate reported" || bad "5d: log doesn't capture how much disk was needed"
+  grep -q "17.13" "$ISO5_NOTIFY_LOG" && ok "5d: alarmed athos with a disk-specific message (not just the generic pre-install heads-up)" || bad "5d: notify never mentioned the disk shortfall — old code's generic pre-install notify alone isn't enough"
+
+  echo "  -- 5e: obviously-insufficient free disk BEFORE attempting — skip the install outright --"
+  : > "$SU_CALLS_LOG"; : > "$ISO5_LOG"; : > "$ISO5_NOTIFY_LOG"
+  write_fake_su "$RESTART_LISTING" 0 "" "$RESTART_LISTING"
+  FAKE_DF_AVAIL_KB=$((3 * 1024 * 1024))  # 3GB free — obviously hopeless
+  macos_update_install_if_ready
+  RC5E=$?
+  FAKE_DF_AVAIL_KB=$((50 * 1024 * 1024))  # restore default for any scenario added after this one
+  [ "$RC5E" -eq 0 ] && ok "5e: returns 0 (never blocks the reboot)" || bad "5e: expected return 0, got $RC5E"
+  grep -q '^--install' "$SU_CALLS_LOG" && bad "5e: install was attempted despite obviously-insufficient free space" || ok "5e: install correctly skipped before ever attempting — didn't waste the time"
+  [ "$(grep -c '^--list --no-scan$' "$SU_CALLS_LOG" 2>/dev/null)" = "1" ] && ok "5e: only the initial ready-check ran (no wasted second --list)" || bad "5e: unexpected --list call count"
+  grep -qi "3GB" "$ISO5_LOG" && ok "5e: log names the actual free space measured" || bad "5e: log doesn't show the measured free space"
+  [ -s "$ISO5_NOTIFY_LOG" ] && ok "5e: notified athos the install was skipped for disk space" || bad "5e: no notify on precheck skip"
 fi
 
 echo ""
