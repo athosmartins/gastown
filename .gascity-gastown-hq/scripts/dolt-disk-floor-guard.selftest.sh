@@ -117,57 +117,137 @@ _should_resurrect 2 NONE     && bad "should_resurrect: probe_rc=2 (unknown/trans
 _should_resurrect "" NONE    && bad "should_resurrect: empty probe_rc must NEVER resurrect"                                      || ok "should_resurrect: empty probe_rc → false"
 _should_resurrect abc NONE   && bad "should_resurrect: non-numeric probe_rc must NEVER resurrect"                                || ok "should_resurrect: non-numeric probe_rc → false"
 
-# ── _top_rss_processes: real ps/sort parsing (NOT stubbed — proves the
-#    pid,rss,comm/-k2 sort matches this machine's actual `ps` output format,
-#    same rationale as the _avail_gb(/tmp) and _vm_swap_gb() real tests
-#    above; ga-sfj3i.3 item 4) ────────────────────────────────────────────
-g="$(_top_rss_processes 5)"
+# ── _top_mem_processes: real top/ps/launchctl parsing (NOT stubbed — proves
+#    the pid,ppid,mem,cmprs `-stats` field order and the per-PID full-command
+#    + launchd-label lookups match this machine's actual `top`/`ps`/
+#    `launchctl` output shapes, same rationale as the _avail_gb(/tmp) and
+#    _vm_swap_gb() real tests above; ga-xz5re) ─────────────────────────────
+g="$(_top_mem_processes 5)"
 line_count="$(printf '%s\n' "$g" | grep -c .)"
-[ "$line_count" -eq 5 ] && ok "_top_rss_processes(5) returns exactly 5 lines" || bad "_top_rss_processes(5) returned $line_count lines (expected 5): $g"
-g2="$(_top_rss_processes 2)"
+[ "$line_count" -eq 5 ] && ok "_top_mem_processes(5) returns exactly 5 lines" || bad "_top_mem_processes(5) returned $line_count lines (expected 5): $g"
+g2="$(_top_mem_processes 2)"
 line_count2="$(printf '%s\n' "$g2" | grep -c .)"
-[ "$line_count2" -eq 2 ] && ok "_top_rss_processes(2) respects the N argument" || bad "_top_rss_processes(2) returned $line_count2 lines (expected 2)"
-# each line: PID RSS_KB COMMAND — first two whitespace fields must be numeric.
-# Guard explicitly on empty output first — a `while read` over an empty
-# variable still iterates once with an empty line, which would otherwise
-# leave bad_line/order_bad at their innocent defaults and PASS vacuously
-# (ga-p5q3: empty must never grade the same as "checked and fine").
+[ "$line_count2" -eq 2 ] && ok "_top_mem_processes(2) respects the N argument" || bad "_top_mem_processes(2) returned $line_count2 lines (expected 2)"
+# each line: PID PPID MEM CMPRS COMMAND[ [launchd:LABEL]] — PID/PPID numeric,
+# MEM/CMPRS shaped like a top memory value (digits + a trailing unit letter,
+# e.g. "2550M"/"6320K"/"0B" — never bare digits, which would mean the awk
+# field split grabbed the wrong column), COMMAND non-empty. Guard explicitly
+# on empty output first — a `while read` over an empty variable still
+# iterates once with an empty line, which would otherwise leave bad_line at
+# its innocent default and PASS vacuously (ga-p5q3: empty must never grade
+# the same as "checked and fine").
 if [ -z "$g" ]; then
   bad_line="(no output — cannot check shape)"
 else
   bad_line=""
   while IFS= read -r ln; do
     pid_f="$(printf '%s' "$ln" | awk '{print $1}')"
-    rss_f="$(printf '%s' "$ln" | awk '{print $2}')"
+    ppid_f="$(printf '%s' "$ln" | awk '{print $2}')"
+    mem_f="$(printf '%s' "$ln" | awk '{print $3}')"
+    cmprs_f="$(printf '%s' "$ln" | awk '{print $4}')"
+    cmd_f="$(printf '%s' "$ln" | awk '{print $5}')"
     case "$pid_f" in ''|*[!0-9]*) bad_line="$ln" ;; esac
-    case "$rss_f" in ''|*[!0-9]*) bad_line="$ln" ;; esac
-  done <<RSS_SHAPE
+    case "$ppid_f" in ''|*[!0-9]*) bad_line="$ln" ;; esac
+    case "$mem_f" in [0-9]*[A-Za-z]) : ;; *) bad_line="$ln" ;; esac
+    case "$cmprs_f" in [0-9]*[A-Za-z]) : ;; *) bad_line="$ln" ;; esac
+    [ -z "$cmd_f" ] && bad_line="$ln"
+  done <<MEM_SHAPE
 $g
-RSS_SHAPE
+MEM_SHAPE
 fi
-[ -z "$bad_line" ] && ok "_top_rss_processes: every line has numeric PID + RSS_KB as its first two fields" || bad "_top_rss_processes: non-numeric PID/RSS or no output: '$bad_line'"
-# descending order: field 2 (RSS) must be non-increasing line-to-line
-if [ -z "$g" ]; then
-  order_bad=1
-else
-  prev_rss=""
-  order_bad=0
-  while IFS= read -r ln; do
-    rss_f="$(printf '%s' "$ln" | awk '{print $2}')"
-    if [ -n "$prev_rss" ] && [ "$rss_f" -gt "$prev_rss" ]; then order_bad=1; fi
-    prev_rss="$rss_f"
-  done <<RSS_ORDER
-$g
-RSS_ORDER
-fi
-[ "$order_bad" -eq 0 ] && ok "_top_rss_processes: rows sorted by RSS descending" || bad "_top_rss_processes: rows NOT sorted descending by RSS (or no output)"
+[ -z "$bad_line" ] && ok "_top_mem_processes: every line has numeric PID+PPID, unit-suffixed MEM/CMPRS, and a non-empty command" || bad "_top_mem_processes: malformed line: '$bad_line'"
 
-# ── _top_rss_processes: ps failure → "" (surfaces as unmeasured, never a
+# ── _top_mem_processes: top failure → "" (surfaces as unmeasured, never a
 #    silent empty-looking-like-zero-processes — same ga-p5q3 discipline) ────
-ps() { echo "not process output"; }
-g="$(_top_rss_processes 5 | grep -c .)"
-unset -f ps
-[ "$g" -eq 0 ] && ok "_top_rss_processes: unparseable ps output → no rows (failure surfaces as empty, not fabricated rows)" || bad "_top_rss_processes(ps failure) got $g rows (expected 0)"
+top() { echo "not top output"; }
+g="$(_top_mem_processes 5 | grep -c .)"
+unset -f top
+[ "$g" -eq 0 ] && ok "_top_mem_processes: unparseable top output → no rows (failure surfaces as empty, not fabricated rows)" || bad "_top_mem_processes(top failure) got $g rows (expected 0)"
+
+# ── _top_mem_processes: the ga-xz5re regression — a process whose memory is
+#    almost entirely COMPRESSED (low RSS, high MEM/CMPRS) must rank FIRST
+#    with its full command and launchd label, not be invisible the way it
+#    was under the old RSS-based ranking ───────────────────────────────────
+echo ""
+echo "=== _top_mem_processes: ga-xz5re regression (compressed-memory process) ==="
+
+# Step 1 — prove the bug was real: replicate the OLD (now-deleted)
+# _top_rss_processes pipeline verbatim (`sort -rn -k2 | head -n 5`) against a
+# fixture shaped exactly like the incident this bead reports — dolt at
+# ~584MB resident, three claude processes at ~220-260MB resident, one
+# unrelated process with MORE resident memory than the culprit (needed so
+# there are a full 5 higher-RSS rows to push the culprit out of a top-5
+# cut — a filler entry smaller than the culprit wouldn't exclude anything),
+# and the culprit (build_ficha360_search_index.py) with a LOW RSS because
+# almost all of its 22G footprint is compressed/swapped, not resident. This
+# documents the reported bug; it is not a reason to keep the dead ps-rss
+# code path alive in the production script.
+old_ps_rss_ranking() {
+  printf '%s\n' \
+    "  584  598016 dolt" \
+    "  601  260000 claude" \
+    "  602  240000 claude" \
+    "  603  220000 claude" \
+    " 1001   45000 other_process" \
+    "89690   38000 build_ficha360_search_index.py" \
+    | sort -rn -k2 | head -n 5
+}
+g="$(old_ps_rss_ranking)"
+case "$g" in
+  *89690*) bad "fixture sanity: expected the OLD ps-rss ranking to MISS pid 89690 (that was the reported bug) but it appeared — fixture no longer represents the incident: $g" ;;
+  *) ok "fixture sanity: OLD ps-rss ranking (dead code, not shipped — shown for documentation) misses the compressed 22G process, exactly the reported bug" ;;
+esac
+
+# Step 2 — prove the fix: same process, real `top -o mem -stats
+# pid,ppid,command,mem,cmprs` shape (MEM/CMPRS both 22G — top's MEM stat
+# isn't RSS-based at all, so the compression that hid it from `ps` doesn't
+# hide it here) must appear, and appear FIRST, with its full command
+# (top's own COMMAND field is truncated to "build_ficha360_s" — the ps
+# fallback below supplies the untruncated path) and its launchd label.
+top() {
+  cat <<'TOPFIXTURE'
+Processes: 500 total, 2 running, 498 sleeping, 2000 threads
+2026/09/11 02:25:43
+Load Avg: 1.00, 1.00, 1.00
+CPU usage: 1.0% user, 1.0% sys, 98.0% idle
+SharedLibs: 1M resident, 1M data, 1M linkedit.
+MemRegions: 1 total, 1M resident, 1M private, 1M shared.
+PhysMem: 30G used (1M wired, 20G compressor), 1M unused.
+VM: 1T vsize, 1M framework vsize, 0(0) swapins, 0(0) swapouts.
+Networks: packets: 1/1M in, 1/1M out.
+Disks: 1/1M read, 1/1M written.
+
+PID    PPID  COMMAND          MEM   CMPRS
+89690  1     build_ficha360_s 22G   22G
+584    1     dolt             584M  0B
+601    1     claude           260M  10M
+602    1     claude           240M  8M
+603    1     claude           220M  6M
+TOPFIXTURE
+}
+ps() {
+  case "$2" in
+    89690) echo "/opt/homebrew/bin/python3 /Users/athos/gt/whatsapp_automation/scripts/build_ficha360_search_index.py" ;;
+    584) echo "dolt sql-server --config dolt-config.yaml" ;;
+    *) echo "claude" ;;
+  esac
+}
+launchctl() { printf '%s\n' "PID	Status	Label" "89690	0	com.example.ficha360indexer"; }
+g="$(_top_mem_processes 5)"
+unset -f top ps launchctl
+first_line="$(printf '%s\n' "$g" | head -n1)"
+case "$first_line" in
+  "89690 1 22G 22G "*"build_ficha360_search_index.py"*"[launchd:com.example.ficha360indexer]")
+    ok "_top_mem_processes: the compressed 22G process ranks FIRST, with full command + launchd label (ga-xz5re fixed)" ;;
+  *)
+    bad "_top_mem_processes: expected the 22G process first with full command + launchd label — got: $first_line" ;;
+esac
+line_count="$(printf '%s\n' "$g" | grep -c .)"
+[ "$line_count" -eq 5 ] && ok "_top_mem_processes(5): returns exactly 5 lines for this fixture" || bad "_top_mem_processes(5) returned $line_count lines (expected 5) for this fixture"
+case "$g" in
+  *"584 1 584M 0B dolt"*) ok "_top_mem_processes: a process with no launchd match omits the [launchd:...] suffix" ;;
+  *) bad "_top_mem_processes: dolt row malformed or unexpectedly tagged with a launchd label — got: $g" ;;
+esac
 
 # ── _vm_bound_pressure: reclaimed<=0 AND vm>=threshold → VM-bound (the exact
 #    ga-sfj3i incident shape: "reclaim OK — avail X -> X" while GB are stuck
@@ -213,7 +293,7 @@ esac
 # ── _go_toolchain_active: live process-table read (NOT controllable
 #    hermetically) — only proves it returns a valid boolean exit code without
 #    crashing or hanging, same minimalism as this file's other live-state
-#    reads (_top_rss_processes) where the real value can't be pinned ────────
+#    reads (_top_mem_processes) where the real value can't be pinned ────────
 _go_toolchain_active; _gta_rc=$?
 if [ "$_gta_rc" -eq 0 ] || [ "$_gta_rc" -eq 1 ]; then
   ok "_go_toolchain_active: returns a valid boolean exit code ($_gta_rc) without crashing"
@@ -737,12 +817,12 @@ _avail_gb() {
 # a fixed, known value lets the log-line assertion below (Scenario A) check
 # the EXACT logged number instead of merely "some number" (ga-sfj3i.2).
 _vm_swap_gb() { echo "7"; }
-# _top_rss_processes is real, hermetic (ps -Ao pid,rss,comm, read-only,
-# already proven correct in isolation above) but STUBBED here anyway so
-# main()-scenario assertions on log/mail content don't depend on this
-# host's actual process table at test time — same rationale as the
-# _vm_swap_gb stub immediately above (ga-sfj3i.3).
-_top_rss_processes() { printf '%s\n' "51664 1925776 dolt" "11357 253072 claude"; }
+# _top_mem_processes is real, hermetic (top -l 1 + per-PID ps/launchctl
+# lookups, all read-only, already proven correct in isolation above) but
+# STUBBED here anyway so main()-scenario assertions on log/mail content
+# don't depend on this host's actual process table at test time — same
+# rationale as the _vm_swap_gb stub immediately above (ga-sfj3i.3/ga-xz5re).
+_top_mem_processes() { printf '%s\n' "51664 1 1880M 1925M dolt sql-server" "11357 1 247M 253M claude"; }
 
 # _safe_reclaim's own mechanics (gc dolt-cleanup --force, health probe) are
 # EXECUTION code out of scope for this file (see section banner above) —
@@ -1000,10 +1080,10 @@ case "$NOTIFY_LAST_MSG" in
 esac
 if [ "$GC_MAIL_CALLS" = "1" ]; then
   case "$GC_MAIL_LAST_BODY" in
-    *"will NOT resolve"*"reducing RAM pressure"*"51664 1925776 dolt"*)
-      ok "main(): VM-bound mail body states the RAM-pressure-only remedy AND includes the top-RSS listing" ;;
+    *"will NOT resolve"*"reducing RAM pressure"*"51664 1 1880M 1925M dolt sql-server"*)
+      ok "main(): VM-bound mail body states the RAM-pressure-only remedy AND includes the top-memory-footprint listing" ;;
     *)
-      bad "main(): VM-bound mail body missing diagnosis and/or RSS listing — got: $(printf '%s' "$GC_MAIL_LAST_BODY" | tr '\n' ';' | cut -c1-400)" ;;
+      bad "main(): VM-bound mail body missing diagnosis and/or memory-footprint listing — got: $(printf '%s' "$GC_MAIL_LAST_BODY" | tr '\n' ';' | cut -c1-400)" ;;
   esac
 else
   bad "main(): expected VM-bound CRITICAL (sustain already 1) to confirm and mail this cycle, GC_MAIL_CALLS=$GC_MAIL_CALLS"

@@ -328,18 +328,67 @@ _vm_swap_gb() {
   echo $(( kb / 1024 / 1024 ))
 }
 
-# _top_rss_processes [n] → top N processes on this host by resident set size
-# (RSS, KB), one "PID RSS_KB COMMAND" line per process, highest first —
-# ga-sfj3i.3 item 4: "top 5 RSS so the kill decision is informed, not a
-# guess." This guard still never kills anything itself (see OUT OF SCOPE
-# above) — purely informational, for whoever reads the alert. Best-effort:
-# empty output (not a crash) if `ps` is missing or produces no rows; callers
-# must treat empty as "unmeasured", same contract as _avail_gb/_vm_swap_gb,
-# never as "no processes running". Not gated by ENABLED — this is a read,
-# not a reclaim action, same precedent as _vm_swap_gb above.
-_top_rss_processes() {
+# _top_mem_processes [n] → top N processes on this host by TOTAL memory
+# footprint, one "PID PPID MEM CMPRS COMMAND[ [launchd:LABEL]]" line per
+# process, highest first — ga-xz5re: this REPLACES the earlier RSS-based
+# ranking (_top_rss_processes, ga-sfj3i.3 item 4), which missed the actual
+# culprit in a real CRITICAL incident. build_ficha360_search_index.py (PID
+# 89690) held a 22G memory footprint almost entirely COMPRESSED into swap
+# (MEM 22G / CMPRS 22G in `top`) — `ps`'s rss column only counts pages
+# actually resident, so its RSS was small and it never appeared in a
+# ps-rss-sorted top-5 next to dolt (584MB resident) and three claude
+# processes (~220-260MB resident each). The Mayor found it manually with
+# `top -l 1 -o mem -stats pid,ppid,command,mem,cmprs`; killing it freed the
+# disk instantly (swap 19.7GB -> 9.2GB). `top -o mem` sorts by this same
+# MEM stat already, so no re-sort is needed here — unlike the old ps|sort
+# pipeline. `top`'s own COMMAND stat is truncated to a short name (observed
+# truncating to e.g. "gc-1.1.1-engwin0", "com.apple.WebKit" on this host),
+# which fails the bead's "mostrar o comando completo" requirement, so each
+# of the N rows gets one extra `ps -p <pid> -o command=` lookup for the
+# full, untruncated command line (verified on this host: unlike `comm`,
+# `command` returns the full argv even when captured non-interactively,
+# not just the terminal-width-truncated view). A trailing
+# " [launchd:<label>]" is appended when the PID is a live launchd job
+# (cross-referenced via one `launchctl list` call, not one per PID) —
+# omitted otherwise, per "quando houver". This guard still never kills
+# anything itself (see OUT OF SCOPE above) — purely informational, for
+# whoever reads the alert. Best-effort: empty output (not a crash) if `top`
+# is missing/unsupported or produces no parseable rows; callers must treat
+# empty as "unmeasured", same contract as _avail_gb/_vm_swap_gb, never as
+# "no processes running". A PID that exits between the `top` snapshot and
+# its `ps` follow-up reads as command "(process exited)" rather than
+# silently vanishing from the list (the MEM/CMPRS figures are still the
+# real, already-captured snapshot values). Not gated by ENABLED — this is a
+# read, not a reclaim action, same precedent as _vm_swap_gb above.
+_top_mem_processes() {
   local n="${1:-5}"
-  ps -Ao pid,rss,comm 2>/dev/null | tail -n +2 | sort -rn -k2 | head -n "$n"
+  local rows
+  rows="$(top -l 1 -o mem -stats pid,ppid,command,mem,cmprs 2>/dev/null | awk -v n="$n" '
+    $1 == "PID" { seen=1; next }
+    seen && NF >= 4 && $1 ~ /^[0-9]+$/ {
+      print $1, $2, $(NF-1), $NF
+      count++
+    }
+    count >= n { exit }
+  ')"
+  [ -z "$rows" ] && { echo ""; return; }
+
+  local launchd_list; launchd_list="$(launchctl list 2>/dev/null)"
+  local pid ppid mem cmprs cmd label out=""
+  while IFS=' ' read -r pid ppid mem cmprs; do
+    [ -z "$pid" ] && continue
+    cmd="$(ps -p "$pid" -o command= 2>/dev/null)"
+    [ -z "$cmd" ] && cmd="(process exited)"
+    label="$(printf '%s\n' "$launchd_list" | awk -v p="$pid" '$1==p{print $3; exit}')"
+    if [ -n "$label" ]; then
+      out="${out}${pid} ${ppid} ${mem} ${cmprs} ${cmd} [launchd:${label}]
+"
+    else
+      out="${out}${pid} ${ppid} ${mem} ${cmprs} ${cmd}
+"
+    fi
+  done <<<"$rows"
+  printf '%s' "$out"
 }
 
 # _floor_class <avail_gb> <warn_gb> <crit_gb> → NONE|WARN|CRITICAL|UNKNOWN.
@@ -474,7 +523,7 @@ _gocache_size_gb() {
 # _go_toolchain_active → 0 (true, exit code) if a `go build`/`go test`/`go
 # install`/`go run` invocation or one of the toolchain's own internal
 # subprocesses (compile/link) is currently running. Best-effort, like
-# _top_rss_processes: pgrep absence/failure reads as "not active" (1/false)
+# _top_mem_processes: pgrep absence/failure reads as "not active" (1/false)
 # — the safe direction, since _should_reap_gocache's CRITICAL branch forces
 # the reap regardless of this reading; a false negative here only costs one
 # WARN-tier cycle (5min), never blocks the CRITICAL guarantee (ga-yi68q).
@@ -1061,17 +1110,20 @@ main() {
     fi
     log "diagnosis: ${diagnosis} (reclaimed=${reclaimed_gb:-unmeasured}GB avail_before=${avail_before}GB vm_swap=${vm_gb:-unknown}GB vm_threshold=${VM_SIGNIFICANT_GB}GB)"
 
-    # ga-sfj3i.3 item 4: top RSS consumers, so a kill decision (made by a
-    # human/Mayor — this guard still never kills anything itself) is
-    # informed rather than a guess. Logged only when actually alerting, not
-    # every cycle — unlike vm_swap_gb, this isn't needed for historical
-    # mining, only for the moment someone has to act.
-    local top_rss; top_rss="$(_top_rss_processes 5)"
-    if [ -n "$top_rss" ]; then
-      log "top RSS processes (PID RSS_KB COMMAND):"
-      printf '%s\n' "$top_rss" | while IFS= read -r _rss_line; do log "  $_rss_line"; done
+    # ga-sfj3i.3 item 4 / ga-xz5re: top memory-footprint consumers (by TOTAL
+    # memory, including compressed/swapped pages — not just resident set
+    # size; see _top_mem_processes for why RSS alone misses the actual
+    # culprit), so a kill decision (made by a human/Mayor — this guard
+    # still never kills anything itself) is informed rather than a guess.
+    # Logged only when actually alerting, not every cycle — unlike
+    # vm_swap_gb, this isn't needed for historical mining, only for the
+    # moment someone has to act.
+    local top_mem; top_mem="$(_top_mem_processes 5)"
+    if [ -n "$top_mem" ]; then
+      log "top memory-footprint processes (PID PPID MEM CMPRS COMMAND [launchd:LABEL if any]):"
+      printf '%s\n' "$top_mem" | while IFS= read -r _mem_line; do log "  $_mem_line"; done
     else
-      log "top RSS processes: unmeasured (ps produced no rows)"
+      log "top memory-footprint processes: unmeasured (top produced no rows)"
     fi
 
     log "class=${class} was_critical=${was_critical}: avail=${avail}GB (warn=${FLOOR_WARN_GB}GB crit=${FLOOR_CRITICAL_GB}GB) — notifying"
@@ -1148,9 +1200,11 @@ recovered.
 
 DIAGNOSIS (ga-sfj3i.3): ${diagnosis}. ${diagnosis_detail}
 
-Top 5 processes by resident memory (PID  RSS_KB  COMMAND), for an informed decision on what to
-bring down if RAM pressure is the lever (this guard never kills anything itself):
-${top_rss:-  (unmeasured — ps produced no rows)}
+Top 5 processes by TOTAL memory footprint, including compressed/swapped pages (PID  PPID  MEM
+CMPRS  COMMAND, with a trailing [launchd:LABEL] when the process is a launchd job), for an
+informed decision on what to bring down if RAM pressure is the lever (this guard never kills
+anything itself):
+${top_mem:-  (unmeasured — top produced no rows)}
 
 (ga-sfj3i.2 measured the vm_swap<->disk correlation and the Mayor's own follow-up falsified a
 broader causal claim against 40 days of this guard's history — see that bead for the raw numbers.)"
