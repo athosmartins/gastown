@@ -329,7 +329,8 @@ def daemon_deliberately_stopped(label):
       1. launchctl print-disabled  -> the operator disabled the job. This is
          the strong one: `disable` persists across bootstraps, which is exactly
          why an operator reaches for it instead of a bare `bootout`.
-      2. city.toml carries `suspended = true` near the label's agent name —
+      2. city.toml carries `suspended = true` inside THAT agent's own
+         `[[patches.agent]]` table (matched by its `name = "..."` field) —
          the Gas City-side equivalent for pool agents.
 
     FAIL-OPEN on purpose: if the probe itself fails (launchctl missing, timeout,
@@ -348,8 +349,20 @@ def daemon_deliberately_stopped(label):
     except Exception:
         return False
     agent = label.rsplit(".", 1)[-1]
-    for blk in cfg.split("[[patches.agent]]"):
-        if agent in blk and re.search(r"^\s*suspended\s*=\s*true", blk, re.M):
+    # ga-me98r: cfg.split(...)[0] is everything BEFORE the first [[patches.agent]]
+    # marker — [workspace]/[providers]/[imports]/[[rigs]] preamble, never a real
+    # agent-patch block — so it must never be scanned as one. And within a real
+    # block, `agent in blk` is a bare substring search with no anchor to the
+    # block's actual identity: it matched on an unrelated rig's comment that
+    # merely contained the word "pilot", paired with a DIFFERENT unrelated rig's
+    # `suspended = true` landing in that same oversized preamble chunk — a false
+    # positive that silently neutered pilot_jammed() in production (this label's
+    # only caller). Require the block's own `name = "..."` field to match instead.
+    for blk in cfg.split("[[patches.agent]]")[1:]:
+        name_m = re.search(r'^\s*name\s*=\s*"([^"]+)"', blk, re.M)
+        if not name_m or name_m.group(1).rsplit(".", 1)[-1] != agent:
+            continue
+        if re.search(r"^\s*suspended\s*=\s*true", blk, re.M):
             return True
     return False
 

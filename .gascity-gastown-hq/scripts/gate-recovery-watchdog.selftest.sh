@@ -638,6 +638,60 @@ finally:
     m.sh = _real_sh
     os.unlink(_tmp_log.name)
 
+# ── Scenario ga-me98r: daemon_deliberately_stopped() must scope its city.toml ──
+# match to the target agent's OWN [[patches.agent]] block, not a bare substring
+# search across the whole file. Root cause of the Scenario 18 regression above:
+# cfg.split("[[patches.agent]]")[0] is the [workspace]/[providers]/[imports]/
+# [[rigs]] preamble — never a real per-agent block — and the old code scanned it
+# too, unscoped. On the live city.toml an unrelated rig's comment mentioning
+# "pilot fix" and a DIFFERENT unrelated rig's real `suspended = true`, both
+# merely landing inside that one oversized first chunk, combined into a false
+# "pilot is deliberately stopped" verdict that silently neutered pilot_jammed()
+# in production (this label's only caller) — replayed here with a synthetic
+# file so the regression is pinned independent of live disk state.
+print("Scenario ga-me98r: daemon_deliberately_stopped() name-scoped city.toml matching")
+_tmp_city_dir = tempfile.mkdtemp()
+_fake_city_toml = os.path.join(_tmp_city_dir, "city.toml")
+with open(_fake_city_toml, "w") as f:
+    f.write(
+        '# comment mentioning pilot fix for an unrelated rig, not a real agent block\n'
+        '[[rigs]]\n'
+        'name = "property_scrapers"\n'
+        'suspended = true\n'
+        '\n'
+        '[[patches.agent]]\n'
+        'name = "gastown.mayor"\n'
+        'suspended = false\n'
+        '\n'
+        '[[patches.agent]]\n'
+        'name = "gastown.boot"\n'
+        'suspended = true\n'
+    )
+_real_city = m.CITY
+m.CITY = _tmp_city_dir
+_real_sh_dds = m.sh
+m.sh = _fake_sh({})  # launchctl print-disabled unavailable -> falls through to city.toml
+try:
+    if m.daemon_deliberately_stopped("com.gascity.pilot") is False:
+        ok("unrelated 'pilot' comment + unrelated rig's suspended=true (both in the preamble chunk) no longer false-positive (ga-me98r)")
+    else:
+        bad("REGRESSION ga-me98r: daemon_deliberately_stopped() false-positived on preamble text unrelated to the target agent")
+
+    if m.daemon_deliberately_stopped("com.gascity.boot") is True:
+        ok("a genuinely suspended agent's own [[patches.agent]] block (name-matched) is still detected")
+    else:
+        bad("expected a real suspended=true in gastown.boot's own block to be detected")
+
+    if m.daemon_deliberately_stopped("com.gascity.mayor") is False:
+        ok("an agent whose own block explicitly sets suspended=false is not reported stopped")
+    else:
+        bad("REGRESSION: gastown.mayor (suspended=false) reported as deliberately stopped")
+finally:
+    m.CITY = _real_city
+    m.sh = _real_sh_dds
+    os.unlink(_fake_city_toml)
+    os.rmdir(_tmp_city_dir)
+
 # ═══ ga-42nfj: reap_frozen_reviewers() must not kill a session blocked on a REAL ═══
 # ═══ permission-prompt dialog (same bug class as ga-lxk26, different mechanism) ═══
 # FIX 3 kills any gate-reviewer session that reads state=active but has been silent
