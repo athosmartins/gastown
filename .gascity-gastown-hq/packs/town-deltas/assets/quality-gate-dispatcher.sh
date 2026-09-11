@@ -2281,6 +2281,53 @@ default_pool_route_for_rig() {
   esac
 }
 
+# gate_clear_assignee_if_holder <bead_id> <city>
+# ga-yd8t6: holder-aware assignee clear. Since bd-98s5c, a plain
+# `bd assign <id> ""` is REFUSED whenever the bead is still a DIFFERENT
+# actor's live in_progress claim — the ordinary case at every call site
+# below (this dispatcher runs as its own actor, never as the builder
+# holding the claim). Reads the CURRENT raw assignee fresh and clears it
+# ONLY while it is still held by that exact value, via bd's own atomic
+# compare-and-swap (`bd update <id> --if-assignee <holder> -a ""` — the
+# alternative `bd assign --help` itself recommends over --force).
+#
+# Deliberately does NOT accept a caller-supplied holder (e.g. $AUTHOR):
+# that value can go through adhoc-suffix normalization
+# ("foo-adhoc-<hash>" -> "foo") or a gate.submitted_by freeze taken
+# earlier in the run, either of which can legitimately differ from the
+# literal string bd's assignee field holds right now — which would make
+# the compare-and-swap spuriously mismatch the common, correct-to-clear
+# case (measured: this exact silent-refusal shape at quality-gate-guard.sh's
+# sibling call site, 77x/day in quality-gate-guard.log). A fresh read
+# immediately before the write keeps the race window to the minimum
+# possible (this read-then-write pair), rather than trusting a value
+# computed earlier in a long run.
+#
+# Never escalates to --force: unlike gate_release_stale_assignee elsewhere
+# in this file (the PASS-path sibling), no call site here has independently
+# verified the work is done — this runs on a FAILED review, not a
+# confirmed-merged PASS — so a still-live claim held by a genuinely
+# different actor must be left alone, not overridden.
+#
+# Returns 0 if the bead ends up unassigned (it already was, or this call
+# cleared it); 13 if a different actor holds it now (the compare-and-swap
+# lost a race — expected, not a bug); 1 on any other bd failure.
+# Duplicated identically in quality-gate-guard.sh (no shared-lib chokepoint
+# between the two files — same tradeoff this function's own neighbor
+# default_pool_route_for_rig already documents above).
+gate_clear_assignee_if_holder() {
+  local _bead_id="$1" _city="$2"
+  local _cur_json _cur_assignee _rc
+  _cur_json=$(bd -C "$_city" show "$_bead_id" --json 2>/dev/null || echo "")
+  _cur_assignee=$(printf '%s' "$_cur_json" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
+  [ -z "$_cur_assignee" ] && return 0
+  _rc=0
+  bd -C "$_city" update "$_bead_id" --if-assignee "$_cur_assignee" -a "" -q 2>/dev/null || _rc=$?
+  [ "$_rc" = "0" ] && return 0
+  [ "$_rc" = "13" ] && return 13
+  return 1
+}
+
 # rebase_author_is_pool <author> — pure; selftest-sourceable. ga-tz0op.
 # True (echoes 1) iff <author> matches the pool/ephemeral identity class
 # gate_fail_assignee_action() above already special-cases for the FAIL path —
@@ -6214,7 +6261,16 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         # The Pilot's _filter_candidates drops ASSIGNED beads (both Tier-1 bugs and
         # Tier-2 features), so a stale builder assignee makes a failed bead invisible.
         # Clear it so the next sweep can re-pick this bead.
-        bd -C "$BEAD_CITY" assign "$BEAD_ID" "" 2>/dev/null || true
+        # ga-yd8t6: holder-aware clear (gate_clear_assignee_if_holder above) — a
+        # plain `bd assign "$BEAD_ID" ""` was REFUSED here on essentially every
+        # ordinary FAIL (bd-98s5c: this dispatcher is a different actor than the
+        # builder holding the live in_progress claim), yet the comment below used
+        # to assert "builder assignee cleared" regardless of whether it was
+        # (measured: wa-wkpt4 and 6 more same-shape beads, ga-yd8t6 evidence).
+        # $_GFAIL_CLEAR_RC feeds the OBSERVED (not asserted) wording below, same
+        # ga-p5q3 discipline the gc.routed_to restore already gets.
+        _GFAIL_CLEAR_RC=0
+        gate_clear_assignee_if_holder "$BEAD_ID" "$BEAD_CITY" || _GFAIL_CLEAR_RC=$?
         # ga-f54ui: this branch used to say "the Pilot will re-dispatch a builder"
         # without making that true. quality-gate-guard.sh Step 5b (ga-e7zk7) strips
         # gc.routed_to from the source bead unconditionally at gate-CLAIM time —
@@ -6234,12 +6290,15 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         # Verify the write actually stuck (ga-p5q3 error-vs-empty discipline) — a
         # post-write READ failure must never be reported as "restore failed"; it is
         # its own third state, distinct from both success and a confirmed failure.
+        # ga-yd8t6: the SAME post-write read also settles the assignee-clear outcome
+        # below — one bd show, two facts about the same moment.
         _GFAIL_ROUTE_VERIFY_JSON=""
         _GFAIL_ROUTE_VERIFY_READ_OK=1
         _GFAIL_ROUTE_VERIFY_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _GFAIL_ROUTE_VERIFY_READ_OK=0
         [ -n "$_GFAIL_ROUTE_VERIFY_JSON" ] || _GFAIL_ROUTE_VERIFY_READ_OK=0
         if [ "$_GFAIL_ROUTE_VERIFY_READ_OK" = "0" ]; then
           _GFAIL_ROUTE_OBS="gc.routed_to=UNVERIFIED (post-write read failed — state unknown, NOT a claim the restore failed)"
+          _GFAIL_ASSIGNEE_OBS="assignee=UNVERIFIED (post-write read failed — state unknown, NOT a claim the clear failed)"
         else
           _GFAIL_ROUTE_OBSERVED=$(printf '%s' "$_GFAIL_ROUTE_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .metadata["gc.routed_to"] // ""' 2>/dev/null || echo "")
           if [ "$_GFAIL_ROUTE_OBSERVED" = "$_GFAIL_ROUTE" ]; then
@@ -6247,8 +6306,16 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
           else
             _GFAIL_ROUTE_OBS="gc.routed_to='${_GFAIL_ROUTE_OBSERVED}' NOT $_GFAIL_ROUTE — restore did not stick, needs investigation"
           fi
+          _GFAIL_ASSIGNEE_OBSERVED=$(printf '%s' "$_GFAIL_ROUTE_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
+          if [ -z "$_GFAIL_ASSIGNEE_OBSERVED" ]; then
+            _GFAIL_ASSIGNEE_OBS="assignee=cleared"
+          elif [ "$_GFAIL_CLEAR_RC" = "13" ]; then
+            _GFAIL_ASSIGNEE_OBS="assignee='${_GFAIL_ASSIGNEE_OBSERVED}' NOT cleared — a different actor claimed it before the clear could apply (expected race, ga-yd8t6)"
+          else
+            _GFAIL_ASSIGNEE_OBS="assignee='${_GFAIL_ASSIGNEE_OBSERVED}' NOT cleared — needs investigation (ga-yd8t6, rc=$_GFAIL_CLEAR_RC)"
+          fi
         fi
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) and builder assignee cleared. gc.routed_to restored to $_GFAIL_ROUTE so pool workers can self-serve this bead (ga-f54ui) — verified post-write, not assumed: $_GFAIL_ROUTE_OBS. The Pilot will also re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) cleared. gc.routed_to restored to $_GFAIL_ROUTE so pool workers can self-serve this bead (ga-f54ui) — verified post-write, not assumed: $_GFAIL_ROUTE_OBS; $_GFAIL_ASSIGNEE_OBS. The Pilot will also re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
       fi
     fi
   fi

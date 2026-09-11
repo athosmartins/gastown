@@ -2340,6 +2340,52 @@ gate_bead_sibling_status_lines() {
   printf '%s' "$lines"
 }
 
+# gate_clear_assignee_if_holder <bead_id> <city>
+# ga-yd8t6: holder-aware assignee clear. Since bd-98s5c, a plain
+# `bd assign <id> ""` is REFUSED whenever the bead is still a DIFFERENT
+# actor's live in_progress claim — the ordinary case at every call site
+# below (this guard runs as its own actor, never as the builder holding
+# the claim). Reads the CURRENT raw assignee fresh and clears it ONLY
+# while it is still held by that exact value, via bd's own atomic
+# compare-and-swap (`bd update <id> --if-assignee <holder> -a ""` — the
+# alternative `bd assign --help` itself recommends over --force).
+#
+# Deliberately does NOT accept a caller-supplied holder (e.g. $AUTHOR):
+# that value can go through adhoc-suffix normalization
+# ("foo-adhoc-<hash>" -> "foo") or a gate.submitted_by freeze taken
+# earlier in the run, either of which can legitimately differ from the
+# literal string bd's assignee field holds right now — which would make
+# the compare-and-swap spuriously mismatch the common, correct-to-clear
+# case (measured: this exact silent-refusal shape, 77x/day in
+# quality-gate-guard.log). A fresh read immediately before the write
+# keeps the race window to the minimum possible (this read-then-write
+# pair), rather than trusting a value computed earlier in a long run.
+#
+# Never escalates to --force: unlike gate_release_stale_assignee (this
+# guard's dispatcher-side PASS-path sibling), no call site here has
+# independently verified the work is done — this runs mid-review, not a
+# confirmed-merged PASS — so a still-live claim held by a genuinely
+# different actor must be left alone, not overridden.
+#
+# Returns 0 if the bead ends up unassigned (it already was, or this call
+# cleared it); 13 if a different actor holds it now (the compare-and-swap
+# lost a race — expected, not a bug); 1 on any other bd failure.
+# Duplicated identically in quality-gate-dispatcher.sh (no shared-lib
+# chokepoint between the two files — same tradeoff default_pool_route_for_rig
+# already documents there).
+gate_clear_assignee_if_holder() {
+  local _bead_id="$1" _city="$2"
+  local _cur_json _cur_assignee _rc
+  _cur_json=$(bd -C "$_city" show "$_bead_id" --json 2>/dev/null || echo "")
+  _cur_assignee=$(printf '%s' "$_cur_json" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
+  [ -z "$_cur_assignee" ] && return 0
+  _rc=0
+  bd -C "$_city" update "$_bead_id" --if-assignee "$_cur_assignee" -a "" -q 2>/dev/null || _rc=$?
+  [ "$_rc" = "0" ] && return 0
+  [ "$_rc" = "13" ] && return 13
+  return 1
+}
+
 # ── Lib-only mode: source with GATE_GUARD_LIB_ONLY=1 to load pure functions ──
 # without running the live guard sweep. Used by tests and by the dispatcher.
 if [ -n "${GATE_GUARD_LIB_ONLY:-}" ]; then
@@ -5009,10 +5055,20 @@ fi
 if [ -n "$BEAD_ID" ]; then
   # gt-gwng6: target $BEAD_CITY (the bead's OWNING store), not $GC_CITY (HQ).
   # On a rig-native bead these are different stores; HQ-targeted writes no-op.
-  if bd -C "$BEAD_CITY" assign "$BEAD_ID" "" 2>/dev/null; then
-    log "  detached source bead $BEAD_ID from dog pool (cleared assignee in $BEAD_CITY — ga-e7zk7/gt-gwng6)"
+  # ga-yd8t6: holder-aware clear (gate_clear_assignee_if_holder, defined above
+  # the GATE_GUARD_LIB_ONLY cutoff) — a plain `bd assign "$BEAD_ID" ""` was
+  # REFUSED here on essentially every ordinary claim (bd-98s5c: this guard is
+  # a different actor than the builder holding the live in_progress claim),
+  # silently logged as a non-fatal WARN, 77x/day in quality-gate-guard.log.
+  if gate_clear_assignee_if_holder "$BEAD_ID" "$BEAD_CITY"; then
+    log "  detached source bead $BEAD_ID from dog pool (cleared assignee in $BEAD_CITY — ga-e7zk7/gt-gwng6, ga-yd8t6)"
   else
-    log "  WARN: could not clear assignee on source bead $BEAD_ID in $BEAD_CITY (non-fatal — ga-e7zk7)"
+    _S5B_DETACH_RC=$?
+    if [ "$_S5B_DETACH_RC" = "13" ]; then
+      log "  source bead $BEAD_ID in $BEAD_CITY: a different actor claimed it before the detach could apply — left alone (expected race, ga-yd8t6)"
+    else
+      log "  WARN: could not clear assignee on source bead $BEAD_ID in $BEAD_CITY (non-fatal — ga-e7zk7, ga-yd8t6)"
+    fi
   fi
   # Strip the metadata-keyed pool route (no-op in the current sling-bead model,
   # where the source bead carries no gc.routed_to; covers the legacy direct-route

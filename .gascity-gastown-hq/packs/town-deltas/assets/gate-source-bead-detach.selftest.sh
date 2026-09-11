@@ -59,8 +59,12 @@ else
 fi
 
 # 2. Vector 1a kill: the detach clears the source bead's assignee.
-if grep -Eq 'bd -C "\$BEAD_CITY" assign "\$BEAD_ID" ""' "$GUARD"; then
-  ok "clears source-bead assignee (Vector 1a) via bd assign \"\$BEAD_ID\" \"\""
+# ga-yd8t6: a plain `bd assign "$BEAD_ID" ""` was REFUSED (bd-98s5c) on
+# essentially every ordinary claim, since this guard runs as a different
+# actor than the builder holding the live in_progress claim — replaced
+# with a holder-aware compare-and-swap (gate_clear_assignee_if_holder).
+if grep -Fq 'gate_clear_assignee_if_holder "$BEAD_ID" "$BEAD_CITY"' "$GUARD"; then
+  ok "clears source-bead assignee (Vector 1a) via the holder-aware gate_clear_assignee_if_holder (ga-yd8t6)"
 else
   bad "missing assignee clear on \$BEAD_ID (Vector 1a not killed)"
 fi
@@ -82,7 +86,7 @@ fi
 
 # 5. Guarded by a non-empty bead-id check (never detach with an empty id).
 #    The detach assign line must live inside an 'if [ -n "$BEAD_ID" ]' block.
-detach_line=$(grep -nE 'bd -C "\$BEAD_CITY" assign "\$BEAD_ID" ""' "$GUARD" | head -1 | cut -d: -f1)
+detach_line=$(grep -nF 'gate_clear_assignee_if_holder "$BEAD_ID" "$BEAD_CITY"' "$GUARD" | head -1 | cut -d: -f1)
 guard_line=$(awk '/if \[ -n "\$BEAD_ID" \]; then/ { print NR }' "$GUARD" | awk -v d="${detach_line:-0}" '$1 < d' | tail -1)
 if [ -n "${detach_line:-}" ] && [ -n "${guard_line:-}" ]; then
   ok "detach is guarded by 'if [ -n \"\$BEAD_ID\" ]'"

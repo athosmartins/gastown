@@ -163,10 +163,10 @@ if grep -qF 'bd -C "$BEAD_CITY" assign "$BEAD_ID" "$AUTHOR" 2>/dev/null || true'
 else
   bad "needs-fix 'keep' arm missing the re-assign-to-\$AUTHOR call"
 fi
-if grep -qF 'story:in-flight + gate:reviewing (wa-qq33j) and builder assignee cleared.' "$DISPATCHER"; then
-  ok "needs-fix 'clear' arm preserves the original clear-path wording prefix"
+if grep -qF 'story:in-flight + gate:reviewing (wa-qq33j) cleared. gc.routed_to restored to $_GFAIL_ROUTE so pool workers can self-serve this bead (ga-f54ui) — verified post-write, not assumed: $_GFAIL_ROUTE_OBS; $_GFAIL_ASSIGNEE_OBS.' "$DISPATCHER"; then
+  ok "needs-fix 'clear' arm reports the OBSERVED assignee-clear state (ga-yd8t6) instead of an unconditional 'assignee cleared' assertion"
 else
-  bad "needs-fix 'clear' arm's original clear-path wording prefix is missing/changed"
+  bad "needs-fix 'clear' arm no longer reports the observed post-write assignee state — ga-yd8t6 regression"
 fi
 # needs-human (cap-exhausted) branch drift guard: confirm it is UNTOUCHED —
 # its own unique comment (ga-5w0hr) must still exist, unconditionally clearing

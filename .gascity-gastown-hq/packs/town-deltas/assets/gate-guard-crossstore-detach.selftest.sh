@@ -142,8 +142,8 @@ if [ -f "$GUARD_SRC" ]; then
   else
     ok "guard: Step 5b detach no longer targets \$GC_CITY (uses \$BEAD_CITY)"
   fi
-  grep -q 'bd -C "\$BEAD_CITY" assign "\$BEAD_ID" ""' "$GUARD_SRC" \
-    && ok "guard: assign-clear targets \$BEAD_CITY" \
+  grep -Fq 'gate_clear_assignee_if_holder "$BEAD_ID" "$BEAD_CITY"' "$GUARD_SRC" \
+    && ok "guard: assign-clear (via gate_clear_assignee_if_holder, ga-yd8t6) targets \$BEAD_CITY" \
     || bad "guard: assign-clear does not target \$BEAD_CITY"
   grep -q 'bd -C "\$BEAD_CITY" update "\$BEAD_ID" --unset-metadata gc.routed_to' "$GUARD_SRC" \
     && ok "guard: routed_to-unset targets \$BEAD_CITY" \
