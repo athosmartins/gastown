@@ -41,7 +41,7 @@ LOCK_STALE_MIN=180                        # reclaim a lock older than this (cras
 SYNC_TIMEOUT=600                          # per-db native DOLT_BACKUP sync
 S3_TIMEOUT=1200                           # per-db aws s3 sync
 PREFLIGHT_TIMEOUT=30                       # server reachability probe
-RETRY_WAIT_SEC=20                         # ga-gdsq5: pause before a connection-timeout retry
+RETRY_WAITS_SEC="20 60 120"               # ga-gdsq5: escalating pauses, one connection-timeout retry per wait
 
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
@@ -78,8 +78,41 @@ is_connection_timeout_error() {
   esac
 }
 
+# _sync_once <db> — one CALL DOLT_BACKUP('sync', ...) attempt for <db>; raw
+# dolt output goes wherever the caller redirects, dolt's own exit code is
+# returned. Factored out so the retry loop below and the selftest's
+# simulated-failure stub share the exact same call shape.
+_sync_once() {
+  local db="$1"
+  DOLT_CLI_PASSWORD='' timeout "$SYNC_TIMEOUT" "$DOLT" --host "$HOST" --port "$PORT" \
+    --user root --no-tls sql -q "USE \`$db\`; CALL DOLT_BACKUP('sync', '${db}-backup');"
+}
+
+# _sync_with_connection_timeout_retry <db> — called after an initial sync
+# attempt already failed with is_connection_timeout_error. Retries
+# _sync_once with escalating waits (RETRY_WAITS_SEC: 20s, 60s, 120s),
+# logging every attempt for frequency tracking. Returns 0 on the first
+# success; returns 1, having logged the "DOLT_BACKUP sync FAILED" line
+# dolt-compact-routine.sh's backup precondition greps for, once every wait
+# has been used. ga-gdsq5: the original single 20s retry sometimes wasn't
+# enough against hq under load (measured 2026-09-11 04:01: sync failed
+# again after that one retry) — this is the escalation that replaces it.
+_sync_with_connection_timeout_retry() {
+  local db="$1" wait_sec
+  for wait_sec in $RETRY_WAITS_SEC; do
+    log "$db: connection-timeout on sync — retrying after ${wait_sec}s"
+    sleep "$wait_sec"
+    if _sync_once "$db" >> "$LOG" 2>&1; then
+      log "$db: sync OK after connection-timeout retry"
+      return 0
+    fi
+  done
+  log "$db: DOLT_BACKUP sync FAILED (after connection-timeout retries)"
+  return 1
+}
+
 # Library mode: `DOLT_S3_BACKUP_LIB=1 source dolt-s3-backup.sh` defines the pure
-# function above without running the live backup flow (lock/PORT/DOLT_BACKUP/S3).
+# functions above without running the live backup flow (lock/PORT/DOLT_BACKUP/S3).
 if [ "${DOLT_S3_BACKUP_LIB:-0}" = "1" ]; then
   return 0 2>/dev/null || exit 0
 fi
@@ -188,15 +221,12 @@ for db in $DBS; do
       log "$db: auto-recover OK after staging reinit"
     elif is_connection_timeout_error "$(cat "$SYNC_OUT")"; then
       # Transient/load-dependent (ga-gdsq5) — staging itself is fine, only the
-      # connection was cut mid-sync, so retry the same sync once with no
-      # reinit, after a short wait to give a possibly-different load window.
-      log "$db: connection-timeout on sync — retrying once after ${RETRY_WAIT_SEC}s"
-      sleep "$RETRY_WAIT_SEC"
-      if ! DOLT_CLI_PASSWORD='' timeout "$SYNC_TIMEOUT" "$DOLT" --host "$HOST" --port "$PORT" \
-            --user root --no-tls sql -q "USE \`$db\`; CALL DOLT_BACKUP('sync', '${db}-backup');" >> "$LOG" 2>&1; then
-        log "$db: DOLT_BACKUP sync FAILED (after connection-timeout retry)"; failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"; continue
+      # connection was cut mid-sync, so retry the same sync with no reinit,
+      # via escalating waits (RETRY_WAITS_SEC) to give a possibly-different
+      # load window a few chances instead of just one.
+      if ! _sync_with_connection_timeout_retry "$db"; then
+        failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"; continue
       fi
-      log "$db: sync OK after connection-timeout retry"
     else
       log "$db: DOLT_BACKUP sync FAILED"; failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"; continue
     fi

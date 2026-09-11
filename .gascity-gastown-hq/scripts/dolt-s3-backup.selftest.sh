@@ -94,16 +94,108 @@ if grep -qF 'is_connection_timeout_error "$(cat "$SYNC_OUT")"' "$SCRIPT"; then
 else
   bad "sync step does NOT call is_connection_timeout_error — detection is dead code"
 fi
-if grep -qF 'after connection-timeout retry' "$SCRIPT"; then
-  ok "retry is bounded (single retry, distinct log marker for frequency tracking)"
+if grep -qF '_sync_with_connection_timeout_retry "$db"' "$SCRIPT"; then
+  ok "sync step calls _sync_with_connection_timeout_retry on connection-timeout"
 else
-  bad "bounded connection-timeout-retry wiring missing"
+  bad "sync step does NOT call _sync_with_connection_timeout_retry — retry escalation is dead code"
 fi
-if grep -qF 'RETRY_WAIT_SEC' "$SCRIPT"; then
-  ok "retry waits before retrying (gives a different load window a chance)"
+if grep -qF 'RETRY_WAITS_SEC="20 60 120"' "$SCRIPT"; then
+  ok "escalating retry waits configured as 20s/60s/120s (Mayor decision, ga-gdsq5, 2026-09-11)"
 else
-  bad "retry-wait wiring missing"
+  bad "RETRY_WAITS_SEC no longer set to the decided 20/60/120 escalation"
 fi
+
+# ── _sync_with_connection_timeout_retry() — ga-gdsq5 escalating retry, exercised
+# live with a simulated-failure stub (not just a drift-guard grep): the OLD
+# single-retry code physically could not pass the "succeeds on 2nd retry"
+# case below (it only ever tried once) — this proves the escalation is real,
+# not just declared. Real dolt/network are NEVER called: $DOLT is pointed at
+# a fake stub binary, and `sleep` is shadowed to record its argument instead
+# of actually waiting (200s of real sleep across 3 waits would make this
+# selftest suite unusably slow).
+echo "── _sync_with_connection_timeout_retry() (ga-gdsq5) — simulated-failure test ──"
+
+type _sync_with_connection_timeout_retry >/dev/null 2>&1 \
+  && ok "_sync_with_connection_timeout_retry defined by lib-mode source" \
+  || { bad "_sync_with_connection_timeout_retry NOT defined — lib mode broken"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="; exit 1; }
+
+DOLT_STUB_DIR="$(mktemp -d)"
+DOLT_STUB_COUNT_FILE="$(mktemp)"
+TEST_LOG="$(mktemp)"
+SLEEP_CALLS="$(mktemp)"
+cat > "$DOLT_STUB_DIR/dolt" <<'STUB'
+#!/bin/bash
+# Fake `dolt`: fails with the ga-gdsq5 connection-timeout signature for the
+# first DOLT_STUB_FAIL_UNTIL_CALL invocations, then succeeds.
+n=$(( $(cat "$DOLT_STUB_COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$DOLT_STUB_COUNT_FILE"
+if [ "$n" -le "${DOLT_STUB_FAIL_UNTIL_CALL:-0}" ]; then
+  echo "error on line 1 for query CALL DOLT_BACKUP('sync', 'testdb-backup'): Error 1105 (HY000): connection was closed"
+  exit 1
+fi
+echo "ok"
+STUB
+chmod +x "$DOLT_STUB_DIR/dolt"
+sleep() { printf '%s\n' "$1" >> "$SLEEP_CALLS"; }
+export DOLT_STUB_COUNT_FILE
+
+_run_retry_scenario() {
+  # <fail_until_call> <label>
+  local fail_until="$1" label="$2"
+  echo 0 > "$DOLT_STUB_COUNT_FILE"
+  : > "$SLEEP_CALLS"
+  : > "$TEST_LOG"
+  DOLT="$DOLT_STUB_DIR/dolt" HOST=127.0.0.1 PORT=0 LOG="$TEST_LOG" \
+    DOLT_STUB_FAIL_UNTIL_CALL="$fail_until" \
+    _sync_with_connection_timeout_retry "testdb"
+}
+
+# Scenario A: succeeds on the FIRST retry (0 prior failures within this call).
+if _run_retry_scenario 0 "first retry succeeds"; then
+  ok "scenario A (succeeds on 1st retry): returns success"
+else
+  bad "scenario A (succeeds on 1st retry): should have returned success"
+fi
+[ "$(cat "$SLEEP_CALLS")" = "20" ] \
+  && ok "scenario A: slept exactly once, 20s, before the single needed attempt" \
+  || bad "scenario A: expected one sleep call of 20 — got: $(cat "$SLEEP_CALLS" | tr '\n' ',')"
+
+# Scenario B: fails once, succeeds on the SECOND retry. The old single-retry
+# code could never reach this — it had no second attempt to succeed on.
+if _run_retry_scenario 1 "second retry succeeds"; then
+  ok "scenario B (succeeds on 2nd retry): returns success — proves escalation beyond a single retry"
+else
+  bad "scenario B (succeeds on 2nd retry): should have returned success"
+fi
+[ "$(cat "$SLEEP_CALLS" | tr '\n' ',')" = "20,60," ] \
+  && ok "scenario B: slept 20s then 60s (one failed attempt, one successful attempt)" \
+  || bad "scenario B: expected sleeps 20,60 — got: $(cat "$SLEEP_CALLS" | tr '\n' ',')"
+grep -qF "sync OK after connection-timeout retry" "$TEST_LOG" \
+  && ok "scenario B: logged the success line" \
+  || bad "scenario B: missing the success log line"
+grep -qF "DOLT_BACKUP sync FAILED" "$TEST_LOG" \
+  && bad "scenario B: must NOT log a FAILED line — it eventually succeeded" \
+  || ok "scenario B: no FAILED tripwire logged on eventual success"
+
+# Scenario C: every attempt fails — all 3 waits exhausted, then gives up.
+if _run_retry_scenario 999 "all retries exhausted"; then
+  bad "scenario C (all retries exhausted): should have returned failure"
+else
+  ok "scenario C (all retries exhausted): returns failure after exhausting retries"
+fi
+[ "$(cat "$SLEEP_CALLS" | tr '\n' ',')" = "20,60,120," ] \
+  && ok "scenario C: slept 20s, 60s, then 120s — all three configured waits used, none skipped" \
+  || bad "scenario C: expected sleeps 20,60,120 — got: $(cat "$SLEEP_CALLS" | tr '\n' ',')"
+grep -qF "DOLT_BACKUP sync FAILED (after connection-timeout retries)" "$TEST_LOG" \
+  && ok "scenario C: logged the FAILED tripwire dolt-compact-routine.sh's precondition greps for" \
+  || bad "scenario C: missing the FAILED tripwire line — compact's backup precondition would misread this as a pass"
+[ "$(grep -cF 'sync OK' "$TEST_LOG")" -eq 0 ] \
+  && ok "scenario C: no false 'sync OK' line when every attempt failed" \
+  || bad "scenario C: logged a success line despite every attempt failing"
+
+unset -f sleep
+rm -rf "$DOLT_STUB_DIR" 2>/dev/null || true
+rm -f "$DOLT_STUB_COUNT_FILE" "$TEST_LOG" "$SLEEP_CALLS" 2>/dev/null || true
 
 # ── preflight-unreachable retry (ga-abrbt) — a transient blip in reachability
 # at 04:00 used to cost the whole day (no retry at all: FATAL + exit 0 on the
