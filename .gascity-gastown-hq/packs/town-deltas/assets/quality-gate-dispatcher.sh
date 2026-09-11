@@ -3774,19 +3774,64 @@ branch_tip_commit_author() {
 # conferir: o guard trava o SINTOMA (conteudo perdido), que e o que importa,
 # independente do mecanismo.
 #
+# rebase_wt_git_dir <worktree> — echoes the SHARED/common git-dir backing
+# <worktree> (the bare repo for a container rig, or the main repo's .git for
+# a self-repo), resolved to an absolute path, or "" if it can't be
+# determined.
+#
+# ga-slrz7: `git merge-tree --write-tree` invoked via `-C <linked-worktree>`
+# can silently return a DIFFERENT tree than the exact same call made against
+# that worktree's own shared git-dir directly — for the SAME two immutable
+# commit SHAs. Confirmed live (incident wa-zpgjl / marker ga-hivi2, container
+# rig whatsapp_automation, 2026-09-11): computed against the bare
+# `.repo.git` directly, `merge-tree --write-tree <main> <orig_tip>` returned
+# the tree WITH the author's docs/data_dictionary.md addition; computed via
+# `-C` against the exact temp worktree the dispatcher's own auto-rebase used
+# for that same pair of SHAs, it returned a DIFFERENT tree, missing that
+# addition — byte-identical to the tree the actual (content-losing) rebase
+# produced. `rebase_content_verdict` used to compute its "expected" ground
+# truth from that same worktree, so both sides of its comparison inherited
+# the identical wrong answer and the guard reported "yes" (content
+# preserved) for a push that had actually dropped a whole commit's content.
+# The exact git-internal reason for the worktree-vs-bare divergence was not
+# determined (no `.gitattributes` merge driver on the file, no
+# core.autocrlf difference between the two contexts) — consistent with the
+# same class of previously-undetermined container-rig discrepancy this
+# guard was already built to route around (ga-m07gc); this fix routes
+# around THIS instance of it too, at the same "verify the symptom, not the
+# mechanism" level. Resolving through the shared git-dir (confirmed
+# empirically to give the CORRECT tree on the real incident's SHAs, in both
+# a fresh reproduction worktree and the bare repo) removes it.
+rebase_wt_git_dir() {
+  local wt="$1" cd_out
+  [ -z "$wt" ] && { printf ''; return 0; }
+  cd_out=$(git -C "$wt" rev-parse --git-common-dir 2>/dev/null) || { printf ''; return 0; }
+  [ -z "$cd_out" ] && { printf ''; return 0; }
+  case "$cd_out" in
+    /*) printf '%s' "$cd_out" ;;
+    *)  printf '%s/%s' "$wt" "$cd_out" ;;
+  esac
+}
+
 # rebase_content_verdict <worktree> <main_ref> <orig_tip> <new_tip>
 #   yes     — a arvore do rebase bate com a do merge 3-way: nada se perdeu
 #   no      — DIFEREM: o rebase perdeu ou alterou conteudo; NAO empurrar
-#   unknown — nao deu pra comparar (merge-tree conflitou/falhou). Terceiro
-#             estado explicito: quem chama trata como "nao verificado", nunca
-#             como "verificado ok".
+#   unknown — nao deu pra comparar (merge-tree conflitou/falhou, ou o
+#             git-dir compartilhado de <worktree> nao pode ser resolvido).
+#             Terceiro estado explicito: quem chama trata como "nao
+#             verificado", nunca como "verificado ok".
 rebase_content_verdict() {
   local wt="$1" main_ref="$2" orig_tip="$3" new_tip="$4"
   if [ -z "$wt" ] || [ -z "$main_ref" ] || [ -z "$orig_tip" ] || [ -z "$new_tip" ]; then
     echo "unknown"; return 0
   fi
+  # ga-slrz7: resolve the shared git-dir once and use it for BOTH sides of
+  # the comparison — see rebase_wt_git_dir() above for why `-C "$wt"` alone
+  # is not trustworthy here.
+  local gd; gd=$(rebase_wt_git_dir "$wt")
+  if [ -z "$gd" ]; then echo "unknown"; return 0; fi
   local out rc expected actual
-  out=$(git -C "$wt" merge-tree --write-tree "$main_ref" "$orig_tip" 2>/dev/null); rc=$?
+  out=$(git --git-dir="$gd" merge-tree --write-tree "$main_ref" "$orig_tip" 2>/dev/null); rc=$?
   # rc!=0 = conflito (merge-tree AINDA imprime uma arvore na linha 1, entao o
   # rc e a unica leitura honesta). Sem base de comparacao -> unknown.
   if [ "$rc" -ne 0 ]; then echo "unknown"; return 0; fi
@@ -3795,7 +3840,7 @@ rebase_content_verdict() {
     *[!0-9a-f]*|"") echo "unknown"; return 0 ;;
   esac
   if [ "${#expected}" -ne 40 ]; then echo "unknown"; return 0; fi
-  actual=$(git -C "$wt" rev-parse "${new_tip}^{tree}" 2>/dev/null || echo "")
+  actual=$(git --git-dir="$gd" rev-parse "${new_tip}^{tree}" 2>/dev/null || echo "")
   # `git rev-parse <ref-invalida>` FALHA e ainda assim ecoa a string recebida no
   # stdout — o `|| echo ""` nao salva, e um new_tip inexistente viraria um SHA
   # falso comparado contra o esperado, devolvendo "no" (um VEREDITO) onde a
@@ -3814,13 +3859,15 @@ rebase_content_verdict() {
 # acionavel ("perdeu docs/data_dictionary.md") em vez de generica.
 rebase_content_lost_paths() {
   local wt="$1" main_ref="$2" orig_tip="$3" new_tip="$4"
+  local gd; gd=$(rebase_wt_git_dir "$wt")
+  [ -z "$gd" ] && return 0
   local out rc expected actual
-  out=$(git -C "$wt" merge-tree --write-tree "$main_ref" "$orig_tip" 2>/dev/null); rc=$?
+  out=$(git --git-dir="$gd" merge-tree --write-tree "$main_ref" "$orig_tip" 2>/dev/null); rc=$?
   [ "$rc" -ne 0 ] && return 0
   expected=$(printf '%s\n' "$out" | head -1)
-  actual=$(git -C "$wt" rev-parse "${new_tip}^{tree}" 2>/dev/null || echo "")
+  actual=$(git --git-dir="$gd" rev-parse "${new_tip}^{tree}" 2>/dev/null || echo "")
   [ -z "$expected" ] || [ -z "$actual" ] && return 0
-  git -C "$wt" diff --name-only "$actual" "$expected" 2>/dev/null | head -20
+  git --git-dir="$gd" diff --name-only "$actual" "$expected" 2>/dev/null | head -20
 }
 # SELFTEST-EXTRACT gate-rebase-content-verdict: END
 
@@ -9733,7 +9780,13 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
                 AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
                 [ "$PR_COMMIT_VERDICT" != "yes" ] && warn "  ga-itkbt/ga-y9a1d: pre-review auto-merge onto $MAIN_HEAD_SHA did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$PR_COMMIT_VERDICT) — refusing to push."
                 if [ "$PR_CONTENT_VERDICT" != "yes" ]; then
-                  warn "  ga-itkbt/ga-m07gc: $BRANCH auto-merged onto $MAIN_HEAD_SHA produced a tree that does NOT match the 3-way merge result (content verdict=$PR_CONTENT_VERDICT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')"
+                  _LOST_PATHS=$(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')
+                  warn "  ga-itkbt/ga-m07gc: $BRANCH auto-merged onto $MAIN_HEAD_SHA produced a tree that does NOT match the 3-way merge result (content verdict=$PR_CONTENT_VERDICT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $_LOST_PATHS"
+                  # ga-slrz7: legible trace on the MARKER, not only the log
+                  # file — "PASS nunca e emitido para um merge cujo conteudo
+                  # e menor... sem que isso esteja dito" needs to be readable
+                  # from the bead, not only .gc/logs/quality-gate-dispatcher.log.
+                  bd -C "$GC_CITY" comment "$MARKER_ID" "Gate dispatcher REFUSED to push $BRANCH: auto-merge onto $MAIN_HEAD_SHA would have silently dropped content (the commit survived, but its tree does not match a real 3-way merge). Lost/changed paths: ${_LOST_PATHS:-<none captured>}. Will retry via the normal rebase/bounce envelope." 2>/dev/null || true
                 fi
                 warn "  Auto-merge push failed for $BRANCH (exit=$AUTO_REBASE_PUSH_RC): ${AUTO_REBASE_PUSH_ERR:-<no stderr captured>}"
                 git -C "$TMP_REBASE_WT" merge --abort 2>/dev/null || true
@@ -9788,7 +9841,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
               [ "$PR_COMMIT_VERDICT" != "yes" ] && warn "  ga-itkbt/ga-y9a1d: pre-review auto-rebase onto $MAIN_HEAD_SHA did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$PR_COMMIT_VERDICT) — refusing to push."
               if [ "$PR_CONTENT_VERDICT" != "yes" ]; then
-                warn "  ga-itkbt/ga-m07gc: $BRANCH rebased onto $MAIN_HEAD_SHA produced a tree that does NOT match the 3-way merge result (content verdict=$PR_CONTENT_VERDICT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')"
+                _LOST_PATHS=$(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')
+                warn "  ga-itkbt/ga-m07gc: $BRANCH rebased onto $MAIN_HEAD_SHA produced a tree that does NOT match the 3-way merge result (content verdict=$PR_CONTENT_VERDICT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $_LOST_PATHS"
+                # ga-slrz7: legible trace on the MARKER, not only the log
+                # file — see the auto-merge branch above for the full
+                # rationale (same acceptance criterion, same fix).
+                bd -C "$GC_CITY" comment "$MARKER_ID" "Gate dispatcher REFUSED to push $BRANCH: auto-rebase onto $MAIN_HEAD_SHA would have silently dropped content (the commit survived, but its tree does not match a real 3-way merge). Lost/changed paths: ${_LOST_PATHS:-<none captured>}. Will retry via the normal rebase/bounce envelope." 2>/dev/null || true
               fi
               warn "  Auto-rebase push failed for $BRANCH (exit=$AUTO_REBASE_PUSH_RC): ${AUTO_REBASE_PUSH_ERR:-<no stderr captured>}"
               git -C "$TMP_REBASE_WT" rebase --abort 2>/dev/null || true
@@ -9865,7 +9923,11 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
                 AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
                 [ "$PR_COMMIT_VERDICT" != "yes" ] && warn "  ga-itkbt/ga-y9a1d: pre-review auto-merge fallback onto $MAIN_HEAD_SHA did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$PR_COMMIT_VERDICT) — refusing to push."
                 if [ "$PR_CONTENT_VERDICT" != "yes" ]; then
-                  warn "  ga-itkbt/ga-m07gc: $BRANCH auto-merge-fallback onto $MAIN_HEAD_SHA produced a tree that does NOT match the 3-way merge result (content verdict=$PR_CONTENT_VERDICT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')"
+                  _LOST_PATHS=$(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')
+                  warn "  ga-itkbt/ga-m07gc: $BRANCH auto-merge-fallback onto $MAIN_HEAD_SHA produced a tree that does NOT match the 3-way merge result (content verdict=$PR_CONTENT_VERDICT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $_LOST_PATHS"
+                  # ga-slrz7: legible trace on the MARKER — see the
+                  # container-rig auto-merge branch above for full rationale.
+                  bd -C "$GC_CITY" comment "$MARKER_ID" "Gate dispatcher REFUSED to push $BRANCH: auto-merge-fallback onto $MAIN_HEAD_SHA would have silently dropped content (the commit survived, but its tree does not match a real 3-way merge). Lost/changed paths: ${_LOST_PATHS:-<none captured>}. Will retry via the normal rebase/bounce envelope." 2>/dev/null || true
                 fi
                 warn "  Auto-merge fallback push failed for $BRANCH (exit=$AUTO_REBASE_PUSH_RC): ${AUTO_REBASE_PUSH_ERR:-<no stderr captured>}"
                 git -C "$TMP_REBASE_WT" merge --abort 2>/dev/null || true
@@ -9938,7 +10000,11 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
                 AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
                 [ "$PR_COMMIT_VERDICT" != "yes" ] && warn "  ga-itkbt/ga-y9a1d: pre-review auto-merge (self-repo) onto $MAIN_HEAD_SHA did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$PR_COMMIT_VERDICT) — refusing to push."
                 if [ "$PR_CONTENT_VERDICT" != "yes" ]; then
-                  warn "  ga-itkbt/ga-m07gc: $BRANCH auto-merged (self-repo) onto $MAIN_HEAD_SHA produced a tree that does NOT match the 3-way merge result (content verdict=$PR_CONTENT_VERDICT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')"
+                  _LOST_PATHS=$(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')
+                  warn "  ga-itkbt/ga-m07gc: $BRANCH auto-merged (self-repo) onto $MAIN_HEAD_SHA produced a tree that does NOT match the 3-way merge result (content verdict=$PR_CONTENT_VERDICT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $_LOST_PATHS"
+                  # ga-slrz7: legible trace on the MARKER — see the
+                  # container-rig auto-merge branch above for full rationale.
+                  bd -C "$GC_CITY" comment "$MARKER_ID" "Gate dispatcher REFUSED to push $BRANCH: auto-merge (self-repo) onto $MAIN_HEAD_SHA would have silently dropped content (the commit survived, but its tree does not match a real 3-way merge). Lost/changed paths: ${_LOST_PATHS:-<none captured>}. Will retry via the normal rebase/bounce envelope." 2>/dev/null || true
                 fi
                 warn "  Auto-merge push failed (self-repo) for $BRANCH (exit=$AUTO_REBASE_PUSH_RC): ${AUTO_REBASE_PUSH_ERR:-<no stderr captured>}"
                 git -C "$TMP_REBASE_WT" merge --abort 2>/dev/null || true
@@ -9985,7 +10051,11 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
               [ "$PR_COMMIT_VERDICT" != "yes" ] && warn "  ga-itkbt/ga-y9a1d: pre-review auto-rebase (self-repo) onto $MAIN_HEAD_SHA did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$PR_COMMIT_VERDICT) — refusing to push."
               if [ "$PR_CONTENT_VERDICT" != "yes" ]; then
-                warn "  ga-itkbt/ga-m07gc: $BRANCH rebased (self-repo) onto $MAIN_HEAD_SHA produced a tree that does NOT match the 3-way merge result (content verdict=$PR_CONTENT_VERDICT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')"
+                _LOST_PATHS=$(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')
+                warn "  ga-itkbt/ga-m07gc: $BRANCH rebased (self-repo) onto $MAIN_HEAD_SHA produced a tree that does NOT match the 3-way merge result (content verdict=$PR_CONTENT_VERDICT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $_LOST_PATHS"
+                # ga-slrz7: legible trace on the MARKER — see the
+                # container-rig auto-merge branch above for full rationale.
+                bd -C "$GC_CITY" comment "$MARKER_ID" "Gate dispatcher REFUSED to push $BRANCH: auto-rebase (self-repo) onto $MAIN_HEAD_SHA would have silently dropped content (the commit survived, but its tree does not match a real 3-way merge). Lost/changed paths: ${_LOST_PATHS:-<none captured>}. Will retry via the normal rebase/bounce envelope." 2>/dev/null || true
               fi
               warn "  Auto-rebase push failed (self-repo) for $BRANCH (exit=$AUTO_REBASE_PUSH_RC): ${AUTO_REBASE_PUSH_ERR:-<no stderr captured>}"
               git -C "$TMP_REBASE_WT" rebase --abort 2>/dev/null || true
@@ -10038,7 +10108,11 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
                 AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
                 [ "$PR_COMMIT_VERDICT" != "yes" ] && warn "  ga-itkbt/ga-y9a1d: pre-review auto-merge fallback (self-repo) onto $MAIN_HEAD_SHA did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$PR_COMMIT_VERDICT) — refusing to push."
                 if [ "$PR_CONTENT_VERDICT" != "yes" ]; then
-                  warn "  ga-itkbt/ga-m07gc: $BRANCH auto-merge-fallback (self-repo) onto $MAIN_HEAD_SHA produced a tree that does NOT match the 3-way merge result (content verdict=$PR_CONTENT_VERDICT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')"
+                  _LOST_PATHS=$(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')
+                  warn "  ga-itkbt/ga-m07gc: $BRANCH auto-merge-fallback (self-repo) onto $MAIN_HEAD_SHA produced a tree that does NOT match the 3-way merge result (content verdict=$PR_CONTENT_VERDICT) — the commit survived but its CONTENT did not. Refusing to push. Diverging paths: $_LOST_PATHS"
+                  # ga-slrz7: legible trace on the MARKER — see the
+                  # container-rig auto-merge branch above for full rationale.
+                  bd -C "$GC_CITY" comment "$MARKER_ID" "Gate dispatcher REFUSED to push $BRANCH: auto-merge-fallback (self-repo) onto $MAIN_HEAD_SHA would have silently dropped content (the commit survived, but its tree does not match a real 3-way merge). Lost/changed paths: ${_LOST_PATHS:-<none captured>}. Will retry via the normal rebase/bounce envelope." 2>/dev/null || true
                 fi
                 warn "  Auto-merge fallback push failed (self-repo) for $BRANCH (exit=$AUTO_REBASE_PUSH_RC): ${AUTO_REBASE_PUSH_ERR:-<no stderr captured>}"
                 git -C "$TMP_REBASE_WT" merge --abort 2>/dev/null || true

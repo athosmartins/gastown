@@ -27,6 +27,20 @@
 # copia a mao) e exercita contra repos git de verdade. O Teste 4 e MUTACAO:
 # neutralizar a comparacao tem de deixar o Teste 2 vermelho — senao este
 # arquivo nao esta provando nada.
+#
+# 2º INCIDENTE (wa-zpgjl / marker ga-hivi2 / bug ga-slrz7, 2026-09-11): o
+# MESMO guard, ja com o fix acima aplicado (ga-m07gc), ainda deixou passar —
+# porque o guard computava sua propria arvore "esperada" (`merge-tree
+# --write-tree`) rodando `-C` DENTRO do mesmo worktree temporario onde o
+# rebase/merge sob teste tinha acabado de rodar. Confirmado ao vivo, reprodu-
+# zivel: `merge-tree --write-tree <main> <orig_tip>` roda contra o repo bare
+# devolve a arvore CORRETA (com a mudanca do autor); a MESMA chamada rodada
+# via `-C <worktree-temporario>` devolve outra arvore, SEM a mudanca —
+# byte-identica a arvore que o rebase de verdade produziu. Os dois lados da
+# comparacao herdavam a MESMA corrupcao, entao batiam. O Teste 6 abaixo prova
+# contra os SHAs reais do incidente, via um worktree de reproducao de
+# verdade (nao um repo sintetico) — precisa continuar reprovando se alguem
+# reverter rebase_wt_git_dir() para usar `-C "$wt"` direto.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -121,6 +135,36 @@ fi
 SITES=$(grep -c '_CONTENT" = "yes" \] && git -C "\$TMP_MR_WT" push' "$DISPATCHER" 2>/dev/null || echo 0)
 [ "$SITES" -ge 4 ] && ok "os 4 caminhos de push conferem o content verdict (achei $SITES)" \
                    || bad "esperava >=4 pushes guardados pelo content verdict, achei $SITES"
+
+# Teste 6 — INCIDENTE REAL (wa-zpgjl / ga-hivi2 / ga-slrz7, 2026-09-11), contra
+# o repositorio de verdade, nao um repo sintetico: prova que o guard agora
+# pega o caso que passou pelo mecanismo reproduzido ao vivo — merge-tree via
+# `-C <worktree>` divergindo da MESMA chamada contra o git-dir compartilhado,
+# pro MESMO par de SHAs imutaveis. So roda quando o repo e os commits reais
+# estao disponiveis neste ambiente; pula (nao conta como FAIL) caso
+# contrario, para nao quebrar em outro ambiente/cidade.
+WA_REPO_GITDIR="/Users/athos/gt/whatsapp_automation/.repo.git"
+WA_MAIN=a3b44a9bc922b2f97757a9e1a0c8a7073323b638
+WA_ORIG_TIP=39a21213353d2fc29ccc2a3d79d8f836c1619d16
+WA_NEW_TIP=40eebf04d08d2778cdb25f4058f189e623842dd1
+if [ -d "$WA_REPO_GITDIR" ] \
+   && git --git-dir="$WA_REPO_GITDIR" cat-file -e "$WA_MAIN" 2>/dev/null \
+   && git --git-dir="$WA_REPO_GITDIR" cat-file -e "$WA_ORIG_TIP" 2>/dev/null \
+   && git --git-dir="$WA_REPO_GITDIR" cat-file -e "$WA_NEW_TIP" 2>/dev/null; then
+  WAWT="$TMP/wa-repro-wt"
+  if git --git-dir="$WA_REPO_GITDIR" worktree add --detach "$WAWT" "$WA_ORIG_TIP" >/dev/null 2>&1; then
+    V6=$( . "$TMP/block.sh"; rebase_content_verdict "$WAWT" "$WA_MAIN" "$WA_ORIG_TIP" "$WA_NEW_TIP" )
+    [ "$V6" = "no" ] && ok "incidente real wa-zpgjl: verdict a partir de um worktree de verdade => no" \
+                     || bad "incidente real wa-zpgjl deveria dar 'no' a partir do worktree real, deu '$V6'"
+    # sempre desregistra o worktree de reproducao, passe ou falhe o assert
+    # acima — nunca deixa um worktree fantasma no repo de PRODUCAO do rig.
+    git --git-dir="$WA_REPO_GITDIR" worktree remove --force "$WAWT" >/dev/null 2>&1 || true
+  else
+    echo "  skip — nao consegui criar worktree de reproducao contra o repo real (nao conta como FAIL)"
+  fi
+else
+  echo "  skip — repo/commits do incidente real (wa-zpgjl) nao disponiveis neste ambiente (nao conta como FAIL)"
+fi
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
