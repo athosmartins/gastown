@@ -1706,6 +1706,149 @@ V=$(field VERDICT "$OUT")
 [ ! -f "$MOCK/kicks.log" ] && ok "T45 no kickstart called" || nok "T45 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 [ "$(field PROOF "$OUT")" = "not_applicable" ] && ok "T45 PROOF=not_applicable (the actual fix — was not_verified pre-fix, which trips delivery:daemon-unverified downstream)" || nok "T45 proof" "got '$(field PROOF "$OUT")', want not_applicable"
 echo "$(field REASON "$OUT")" | grep -qi "excluding tests/docs/md" && ok "T45 REASON names the excluded structurally-inert python" || nok "T45 reason" "$(field REASON "$OUT")"
+# ════════════════════════════════════════════════════════════════════════════
+# T46 (ga-9lsuq0, header point 14): a bare-name stem COLLISION between two
+# UNRELATED real modules that share a basename in different directories must
+# NOT flag a daemon that imports only ONE of them, when deploy_deps.json
+# covers its entrypoint — the exact false-positive class daemon_imports_stem()
+# cannot see (it extracts bare identifiers with no path resolution: `from lib
+# import helpers` makes "helpers" a checkable stem regardless of which file
+# on disk that name actually resolves to). Fixture: dashboard.py imports
+# ONLY lib/helpers.py; this deploy changes ONLY the unrelated, same-named
+# daemons/routes/helpers.py — lib/helpers.py itself never changes.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t46
+mkdir -p "$RUNTIME/lib" "$RUNTIME/daemons/routes"
+cat > "$RUNTIME/lib/helpers.py" <<<'def real(): return 1'
+cat > "$RUNTIME/daemons/routes/helpers.py" <<<'def unrelated(): return 2'
+cat > "$RUNTIME/daemons/dashboard.py" <<'PYEOF'
+from lib import helpers
+def index():
+    return helpers.real()
+PYEOF
+cat > "$RUNTIME/daemons/deploy_deps.json" <<'JSONEOF'
+{
+  "_generated_by": "scripts/gen_daemon_deps.py",
+  "daemons": {
+    "daemons/dashboard.py": {
+      "label": "com.test.dashboard",
+      "closure": ["daemons/dashboard.py", "lib/helpers.py"]
+    }
+  }
+}
+JSONEOF
+make_plist "$AGENTS" com.test.dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/dashboard.py"
+seed_running com.test.dashboard 10001 "$STALE_LSTART"
+OUT=$(run_helper daemons/routes/helpers.py); RC=$?
+V=$(field VERDICT "$OUT")
+echo "$(field AFFECTED "$OUT")" | grep -q "com.test.dashboard" && nok "T46 bare-name collision must not flag when deploy_deps.json's real closure clears it" "AFFECTED=[$(field AFFECTED "$OUT")] — dashboard.py's closure names lib/helpers.py only, never daemons/routes/helpers.py" || ok "T46 deploy_deps.json closure correctly rejects the unrelated same-named file"
+[ "$V" = "OK" ] && ok "T46 verdict OK (no false-positive restart)" || nok "T46 verdict" "got '$V' out=[$OUT]"
+[ ! -f "$MOCK/kicks.log" ] && ok "T46 no kickstart called" || nok "T46 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T47 (ga-9lsuq0, header point 14): a real dependency reached through a lib-
+# to-lib import chain (entrypoint → lib/a.py → lib/b.py) is invisible to the
+# ad-hoc scan — daemon_imports_stem_via_routes()'s one extra hop is scoped
+# ONLY to <entrypoint-dir>/routes/*.py (ga-q617u), so a plain lib/*.py chain
+# gets none of it: a genuine false negative, structurally identical to the
+# ga-q617u incident this fix generalizes past its one routes-shaped hop.
+# deploy_deps.json's real recursive closure (gen_daemon_deps.py's closure())
+# catches it directly.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t47
+mkdir -p "$RUNTIME/lib"
+cat > "$RUNTIME/lib/b.py" <<<'def deep(): return 3'
+cat > "$RUNTIME/lib/a.py" <<'PYEOF'
+from lib import b
+def mid():
+    return b.deep()
+PYEOF
+cat > "$RUNTIME/daemons/dashboard2.py" <<'PYEOF'
+from lib import a
+def index():
+    return a.mid()
+PYEOF
+cat > "$RUNTIME/daemons/deploy_deps.json" <<'JSONEOF'
+{
+  "_generated_by": "scripts/gen_daemon_deps.py",
+  "daemons": {
+    "daemons/dashboard2.py": {
+      "label": "com.test.dashboard2",
+      "closure": ["daemons/dashboard2.py", "lib/a.py", "lib/b.py"]
+    }
+  }
+}
+JSONEOF
+make_plist "$AGENTS" com.test.dashboard2 "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/dashboard2.py"
+seed_running com.test.dashboard2 10101 "$STALE_LSTART"
+seed_restart com.test.dashboard2 10199 "$FRESH_LSTART"
+# deploy changes ONLY lib/b.py — 2 hops from the entrypoint through a plain
+# lib/*.py chain (not a routes/*.py hop) — invisible without deploy_deps.json
+OUT=$(run_helper lib/b.py); RC=$?
+V=$(field VERDICT "$OUT")
+echo "$(field AFFECTED "$OUT")" | grep -q "com.test.dashboard2" && ok "T47 deep lib-to-lib dependency caught via deploy_deps.json's real recursive closure" || nok "T47 affected" "$(field AFFECTED "$OUT")"
+[ "$V" = "OK" ] && ok "T47 verdict OK after fresh restart" || nok "T47 verdict" "got '$V' out=[$OUT]"
+grep -q "com.test.dashboard2" "$MOCK/kicks.log" 2>/dev/null && ok "T47 kickstart invoked" || nok "T47 kickstart" "log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+[ "$(field PROOF "$OUT")" = "verified" ] && ok "T47 PROOF=verified" || nok "T47 proof" "got '$(field PROOF "$OUT")'"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T48 (ga-9lsuq0, header point 14): deploy_deps.json EXISTS but is not valid
+# JSON → WARN logged, every entrypoint falls back to the existing ad-hoc scan
+# for this run — fail-SOFT, never a hard script failure, and never silently
+# treated as "nothing to restart" either. Reuses T46's exact collision
+# fixture: proves the fallback is REAL (still produces T46's pre-fix false
+# positive here), not merely a no-op that happens to also pass.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t48
+mkdir -p "$RUNTIME/lib" "$RUNTIME/daemons/routes"
+cat > "$RUNTIME/lib/helpers.py" <<<'def real(): return 1'
+cat > "$RUNTIME/daemons/routes/helpers.py" <<<'def unrelated(): return 2'
+cat > "$RUNTIME/daemons/dashboard.py" <<'PYEOF'
+from lib import helpers
+def index():
+    return helpers.real()
+PYEOF
+echo '{not valid json' > "$RUNTIME/daemons/deploy_deps.json"
+make_plist "$AGENTS" com.test.dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/dashboard.py"
+seed_running com.test.dashboard 10201 "$STALE_LSTART"
+OUT=$(run_helper_stderr daemons/routes/helpers.py); RC=$?
+echo "$OUT" | grep -qi "could not be read" && ok "T48 WARN logged for unparseable deploy_deps.json" || nok "T48 warn" "$OUT"
+echo "$(field AFFECTED "$OUT")" | grep -q "com.test.dashboard" && ok "T48 falls back to the ad-hoc scan (same collision as T46, now unprotected — proves fail-SOFT, not a silent no-op)" || nok "T48 affected" "$(field AFFECTED "$OUT")"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T49 (ga-9lsuq0, header point 14): a daemon whose entrypoint deploy_deps.json
+# does NOT mention (e.g. added after the last gen_daemon_deps.py run) must
+# still get the FULL ad-hoc scan — deploy_deps.json's presence is per-
+# entrypoint opt-in, never a blanket switch that starves an uncovered
+# daemon of the only check it had. Reuses T5's exact routes-import fixture,
+# with an unrelated, non-covering deploy_deps.json present alongside it.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t49
+cat > "$RUNTIME/routes/channel_admin_api.py" <<<'def register(app): pass'
+cat > "$RUNTIME/daemons/ban_risk_dashboard.py" <<'PYEOF'
+from routes.channel_admin_api import register
+register(None)
+PYEOF
+cat > "$RUNTIME/daemons/deploy_deps.json" <<'JSONEOF'
+{
+  "_generated_by": "scripts/gen_daemon_deps.py",
+  "daemons": {
+    "daemons/some_other_dashboard.py": {
+      "label": "com.test.some-other",
+      "closure": ["daemons/some_other_dashboard.py"]
+    }
+  }
+}
+JSONEOF
+make_plist "$AGENTS" com.test.ban-risk-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/ban_risk_dashboard.py"
+seed_running com.test.ban-risk-dashboard 10301 "$STALE_LSTART"
+seed_restart com.test.ban-risk-dashboard 10399 "$FRESH_LSTART"
+OUT=$(run_helper routes/channel_admin_api.py); RC=$?
+V=$(field VERDICT "$OUT")
+echo "$(field AFFECTED "$OUT")" | grep -q "com.test.ban-risk-dashboard" && ok "T49 uncovered daemon still caught by the existing ad-hoc scan (deploy_deps.json presence never starves an entrypoint it doesn't mention)" || nok "T49 affected" "$(field AFFECTED "$OUT")"
+[ "$V" = "OK" ] && ok "T49 verdict OK after fresh restart" || nok "T49 verdict" "got '$V' out=[$OUT]"
+[ "$(field PROOF "$OUT")" = "verified" ] && ok "T49 PROOF=verified" || nok "T49 proof" "got '$(field PROOF "$OUT")'"
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"

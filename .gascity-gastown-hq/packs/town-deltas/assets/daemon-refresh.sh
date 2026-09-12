@@ -214,6 +214,45 @@
 #      applied per-file. (b) is not just a perf nit: pre-fix, a changed test
 #      file whose basename happened to collide with a real module name some
 #      daemon genuinely imports produced a false-positive AFFECTED.
+#  14. (ga-9lsuq0) Points 11/13 still leave Step 3's .py-side matching a BARE-
+#      NAME stem comparison (daemon_imports_stem(): every dot-separated
+#      import component or "from X import Y" alias, with NO path resolution)
+#      at most TWO hops deep (entrypoint + one routes/*.py hop, ga-q617u) —
+#      unsound in BOTH directions: two unrelated real modules that happen to
+#      share a basename (e.g. lib/x.py vs. daemons/routes/x.py) are
+#      indistinguishable to a bare-name check (false positive: importing one
+#      flags the daemon when the OTHER is what actually changed), and a real
+#      dependency reached only through a THIRD hop or deeper is invisible
+#      (false negative). Measured live (2 production deliveries cited on
+#      ga-9lsuq0): reproducing the reported changed-file shapes against this
+#      script's unmodified matching, in the investigating session's own
+#      repro, did NOT reproduce the reported false-positive COUNTS (likely a
+#      wider PRE/POST range than the isolated per-story diff used to repro,
+#      or a measurement error in the original report — never isolated; see
+#      the bead's resolution comment) — but the STRUCTURAL claim holds by
+#      inspection regardless of that discrepancy: bare-name matching IS
+#      collision-prone, and 2-hop IS not transitive. Separately,
+#      whatsapp_automation already computes and SHIPS the correct answer:
+#      daemons/deploy_deps.json (scripts/gen_daemon_deps.py) is a real,
+#      path-resolved, fully RECURSIVE import closure per daemon entrypoint —
+#      the SAME file scripts/compute_deploy_restarts.py already trusts for
+#      its own (more consequential — unconditional auto-kickstart) restart
+#      decision. Consulted here when present (opt-in by file presence,
+#      mirroring restart_policy.yaml's own pattern — point 6): for any
+#      entrypoint the file has a "closure" entry for, that closure ALONE
+#      (intersected against this deploy's changed files) decides whether
+#      THAT entrypoint counts as changed — REPLACING, not supplementing, the
+#      ad-hoc direct/import-level/routes-hop checks for it (supplementing
+#      via union would still let a bare-name false positive leak through).
+#      An entrypoint the file does NOT mention (never generated for this
+#      rig, or added after the last gen_daemon_deps.py run) still gets the
+#      existing ad-hoc scan, UNCHANGED — coverage is only ever gained per
+#      entrypoint, never lost, and a rig with no deploy_deps.json at all
+#      (every rig but whatsapp_automation, today) is byte-for-byte
+#      unaffected. Scoped to "closure" (the .py import graph) only —
+#      template/asset matching (point 3/ga-jkj0) is untouched, a
+#      structurally separate question the file tracks under a different key
+#      ("assets") this fix does not consume.
 #
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
@@ -1175,6 +1214,60 @@ daemon_imports_stem_via_routes() {  # daemon_imports_stem_via_routes <entrypoint
   return 1
 }
 
+# ── deploy_deps.json consultation (ga-9lsuq0, header point 14) ───────────────
+# See header point 14 for the full rationale. Computed ONCE here (not inside
+# Step 3's per-daemon loop below) — same "compute once, reuse via bash
+# membership checks" shape as ga-pntex's daemon_all_import_stems() cache
+# above, so this adds exactly one python3 spawn total for the whole run, not
+# one per daemon. Two space-separated relpath sets result:
+#   JSON_KNOWN_ENTRYPOINTS    every entrypoint this file has a "closure" for
+#   JSON_AFFECTED_ENTRYPOINTS the subset whose closure intersects $CHANGED
+# Matched against the FULL raw $CHANGED (not the tests/docs/md-filtered
+# CHANGED_PY_FOR_STEMS) — gen_daemon_deps.py's closure() only ever walks REAL
+# import edges starting from a real entrypoint, so a tests/**/docs/**/*.md
+# path can never be a member of any closure regardless of this choice;
+# filtering here would be a no-op at best, and one more place for the two
+# filters to silently drift apart at worst.
+DEPLOY_DEPS_JSON="$RUNTIME_DIR/daemons/deploy_deps.json"
+JSON_KNOWN_ENTRYPOINTS=""
+JSON_AFFECTED_ENTRYPOINTS=""
+if [ -f "$DEPLOY_DEPS_JSON" ]; then
+  DDJ_LINES="$(CHANGED_FOR_DDJ="$CHANGED" python3 - "$DEPLOY_DEPS_JSON" <<'PY' 2>/dev/null
+import json, os, sys
+try:
+    daemons = json.load(open(sys.argv[1], encoding="utf-8"))["daemons"]
+    if not isinstance(daemons, dict):
+        raise ValueError("'daemons' is not an object")
+except Exception:
+    sys.exit(1)
+changed = {ln for ln in os.environ.get("CHANGED_FOR_DDJ", "").splitlines() if ln}
+for path, info in sorted(daemons.items()):
+    if not isinstance(path, str) or not isinstance(info, dict):
+        continue
+    print("K:" + path)
+    closure = {x for x in (info.get("closure") or []) if isinstance(x, str)}
+    if changed & closure:
+        print("A:" + path)
+PY
+)"
+  if [ $? -eq 0 ]; then
+    JSON_KNOWN_ENTRYPOINTS="$(echo "$DDJ_LINES" | sed -n 's/^K://p' | tr '\n' ' ')"
+    JSON_AFFECTED_ENTRYPOINTS="$(echo "$DDJ_LINES" | sed -n 's/^A://p' | tr '\n' ' ')"
+  else
+    log "WARN: $DEPLOY_DEPS_JSON exists but could not be read as the expected {\"daemons\": {\"<relpath>\": {\"closure\": [...]}}} shape — every entrypoint falls back to this script's own import-stem matching for this run (fail-soft, not fail-closed: unlike restart_policy.yaml's sensitivity default above, discovery/matching already has a working — if less precise — path to fall back to, so there is no reason to treat every daemon as maximally suspect over an unparseable companion file)."
+  fi
+fi
+
+# does deploy_deps.json have a closure entry for <entrypoint-relpath> at all?
+json_covers_entry() {  # json_covers_entry <entrypoint-relpath>
+  case " $JSON_KNOWN_ENTRYPOINTS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+# is <entrypoint-relpath>'s (deploy_deps.json) closure known to intersect
+# this deploy's changed files?
+json_entry_affected() {  # json_entry_affected <entrypoint-relpath>
+  case " $JSON_AFFECTED_ENTRYPOINTS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+
 # ── Step 3: resolve affected daemons ──────────────────────────────────────────
 for label in $DAEMON_LABELS; do
   entries="$(cat "$DISCO_DIR/$label")"
@@ -1182,12 +1275,34 @@ for label in $DAEMON_LABELS; do
   own_stems=""
   for e in $entries; do own_stems="$own_stems $(basename "$e" .py)"; done
 
-  # direct: an entrypoint relpath or basename is in the changed set
+  # (ga-9lsuq0, header point 14) split entries into ones deploy_deps.json
+  # already has a real closure for — trust it EXCLUSIVELY for those, since
+  # supplementing (union) would still let a bare-name false positive leak
+  # through from the ad-hoc side below — and ones it doesn't, which still get
+  # the full ad-hoc scan, unchanged. An entrypoint's own file is trivially a
+  # member of its own closure (gen_daemon_deps.py's closure() seeds the walk
+  # with the start file itself), so json_entry_affected already subsumes the
+  # "direct" self-changed case below for a covered entry — no separate check
+  # needed for it.
+  ad_hoc_entries=""
   for e in $entries; do
-    if echo "$CHANGED_PY" | grep -qxF "$e"; then affected=1; break; fi
-    eb="$(basename "$e")"
-    if echo "$CHANGED_BASENAMES" | grep -qxF "$eb"; then affected=1; break; fi
+    if json_covers_entry "$e"; then
+      json_entry_affected "$e" && affected=1
+    else
+      ad_hoc_entries="$ad_hoc_entries $e"
+    fi
   done
+
+  # direct: an entrypoint relpath or basename is in the changed set
+  # (ad_hoc_entries only, ga-9lsuq0 — a deploy_deps.json-covered entry's own
+  # file is already handled via its own closure above)
+  if [ "$affected" -eq 0 ]; then
+    for e in $ad_hoc_entries; do
+      if echo "$CHANGED_PY" | grep -qxF "$e"; then affected=1; break; fi
+      eb="$(basename "$e")"
+      if echo "$CHANGED_BASENAMES" | grep -qxF "$eb"; then affected=1; break; fi
+    done
+  fi
 
   # import-level: a changed shared module (not this daemon's own entrypoint)
   # is actually imported by one of the entrypoint files — see
@@ -1195,11 +1310,11 @@ for label in $DAEMON_LABELS; do
   # grep/regex (ga-dn9ye: a bare text match flagged a comment MENTION as an
   # import; the first, regex-anchored fix then missed a multi-line
   # parenthesized import — both classes need real parsing, not text
-  # matching).
+  # matching). ad_hoc_entries only (ga-9lsuq0) — see the split above.
   if [ "$affected" -eq 0 ]; then
     for stem in $CHANGED_STEMS; do
       case " $own_stems " in *" $stem "*) continue ;; esac   # own entrypoint → handled above
-      for e in $entries; do
+      for e in $ad_hoc_entries; do
         if daemon_imports_stem "$RUNTIME_DIR/$e" "$stem"; then
           affected=1; break
         fi
@@ -1211,11 +1326,11 @@ for label in $DAEMON_LABELS; do
   # route-blueprint hop (ga-q617u, header point 11): the changed module is
   # not imported by the entrypoint directly, but IS imported by a
   # daemons/routes/*.py blueprint file the entrypoint mounts — see
-  # daemon_imports_stem_via_routes() above.
+  # daemon_imports_stem_via_routes() above. ad_hoc_entries only (ga-9lsuq0).
   if [ "$affected" -eq 0 ]; then
     for stem in $CHANGED_STEMS; do
       case " $own_stems " in *" $stem "*) continue ;; esac   # own entrypoint → handled above
-      for e in $entries; do
+      for e in $ad_hoc_entries; do
         if daemon_imports_stem_via_routes "$e" "$stem"; then
           affected=1; break
         fi
@@ -1226,7 +1341,10 @@ for label in $DAEMON_LABELS; do
 
   # template: a changed template this daemon's own entrypoint renders via
   # render_template(...) (ga-jkj0 — Jinja templates are cached in-process and
-  # a disk-only change is otherwise invisible to this script).
+  # a disk-only change is otherwise invisible to this script). Uses the FULL
+  # $entries, not $ad_hoc_entries: deploy_deps.json's "closure" key is
+  # import-only (ga-9lsuq0) — template coverage stays on this mechanism
+  # regardless of closure coverage (see the header point 14 "assets" note).
   if [ "$affected" -eq 0 ] && [ -n "${CHANGED_TEMPLATE_BASENAMES// /}" ]; then
     for e in $entries; do
       [ -f "$RUNTIME_DIR/$e" ] || continue
