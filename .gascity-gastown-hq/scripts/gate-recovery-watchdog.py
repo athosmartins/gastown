@@ -148,6 +148,27 @@ ERROR_REQUEUE_MAX_ATTEMPTS = int(os.environ.get("GRW_ERROR_REQUEUE_MAX_ATTEMPTS"
 GRW_REAP_FROZEN_ENABLED = os.environ.get("GRW_REAP_FROZEN_ENABLED", "1") != "0"
 FROZEN_KILL_SECS = int(os.environ.get("GRW_FROZEN_KILL_SECS", "900"))            # 15min of last_active silence on a STILL-active reviewer = definitively wedged (past the dispatcher's own detect+respawn cycle); SUSTAINED-confirmed on a resample before any kill
 FROZEN_KILL_MAX_PER_SWEEP = int(os.environ.get("GRW_FROZEN_KILL_MAX_PER_SWEEP", "2"))  # blast-radius cap: if MANY reviewers are silent at once (systemic Dolt/quota outage) killing them only churns — cap it and let the infra detectors + Mayor escalation handle a mass outage
+# ga-krfgc: FROZEN_KILL_SECS above was a FLAT 15min, unaware that quality-gate-
+# dispatcher.sh's own verdict_timeout_minutes for the SPECIFIC run a reviewer is
+# working (ga-ltr3c: base 22min, diff-scaled up to a 50min cap) can legitimately be
+# much larger — and once a reviewer ACKs, nothing in the dispatcher re-checks its
+# progress again short of that full outer timeout (gate_scaled_reviewer_stale's
+# window governs only the pre-ACK wait). Measured 2026-09-12: 6 gate-runs
+# (2026-08-30..09-11) were fully superseded by a frozen-reviewer kill at a flat
+# ~19-25min elapsed REGARDLESS of their own verdict_timeout_minutes ranging
+# 26-36min (a 10min spread with NO corresponding spread in close time) — 3 of the
+# 4 fully-traced sessions had explicitly ACKed ("producing output") before going
+# silent, i.e. were confirmed alive, not crashed. GRW_FROZEN_KILL_SCALE_ENABLED
+# scales the kill threshold to FROZEN_KILL_SCALE_FRACTION of the run's OWN
+# verdict_timeout_minutes (best-effort lookup, only for sessions that already
+# crossed the flat floor below — never adds Dolt load per live session), floored
+# at FROZEN_KILL_SECS (zero behavior change for the base/default-diff case, which
+# is the majority) and capped at FROZEN_KILL_MAX_SECS so this stays a FAST
+# backstop, never as patient as the dispatcher's own outer timeout — ga-pp5vh's
+# whole point was to beat that timeout, not match it. See scaled_frozen_kill_secs().
+GRW_FROZEN_KILL_SCALE_ENABLED = os.environ.get("GRW_FROZEN_KILL_SCALE_ENABLED", "1") != "0"
+FROZEN_KILL_SCALE_FRACTION = float(os.environ.get("GRW_FROZEN_KILL_SCALE_FRACTION", "0.6"))
+FROZEN_KILL_MAX_SECS = int(os.environ.get("GRW_FROZEN_KILL_MAX_SECS", "1800"))   # 30min ceiling — half of the dispatcher's own 50min worst-case cap
 GRW_FROZEN_REQUEUE_ENABLED = os.environ.get("GRW_FROZEN_REQUEUE_ENABLED", "1") != "0"  # ga-pp5vh: after FIX 3 kills a confirmed-frozen reviewer, ALSO supersede+requeue its now-orphaned run if that reviewer was the run's sole pending one — closing the ~15min(kill)->~29min(dispatcher Phase C timeout) gap that zeroed gate throughput 2026-07-22. Independent toggle from GRW_REAP_FROZEN_ENABLED so the requeue extension can be killed without disabling the frozen-reviewer kill itself.
 GRW_FROZEN_PERMISSION_CHECK_ENABLED = os.environ.get("GRW_FROZEN_PERMISSION_CHECK_ENABLED", "1") != "0"  # ga-42nfj: before a SUSTAINED-confirmed frozen reviewer is killed, check whether its pane shows an OPEN PERMISSION-PROMPT DIALOG (same class of bug as ga-lxk26, different mechanism — reap_hung_runs (FIX 1)/agent-stuck-escalation.sh never see this path at all) and skip the kill + escalate instead of destroying a session that is one human keypress from resolving. Independent toggle from GRW_REAP_FROZEN_ENABLED, same precedent as GRW_FROZEN_REQUEUE_ENABLED, so the permission check can be killed without disabling the frozen-reviewer reap itself.
 GRW_SUPERSEDE_RECLAIM_VERDICTS_ENABLED = os.environ.get("GRW_SUPERSEDE_RECLAIM_VERDICTS_ENABLED", "1") != "0"  # ga-9as9h: neither FIX 1 (reap_hung_runs) nor FIX 3's requeue extension (_requeue_run_after_frozen_kill) ever touched the superseded run's own STILL-OPEN verdict bead(s) — only the run bead got closed. A reviewer session that outlives the kill (or gets revived under the same name later) has its OWN startup/poll check ONLY its assigned in_progress work; finding the stale verdict bead still open+assigned, it resumes reviewing a run that can never land a verdict again, while the run that actually needs it sits at zero reviewers. Measured live 2026-08-10: two reviewer sessions each burned a full review on a dead run's verdict bead in a row (3 supersedes on one source-bead chain) before a human manually repointed one by hand. Independent toggle from GRW_REAP_FROZEN_ENABLED/GRW_FROZEN_REQUEUE_ENABLED, same precedent as GRW_FROZEN_PERMISSION_CHECK_ENABLED, so this reclaim step can be killed without disabling the supersede/requeue it rides along with.
@@ -601,6 +622,36 @@ def frozen_reviewer_verdict(state, silence_sec, threshold_sec):
     if silence_sec is None or silence_sec < 0:
         return "keep"
     return "kill" if silence_sec >= threshold_sec else "keep"
+
+
+def scaled_frozen_kill_secs(verdict_timeout_minutes, base_secs=None, max_secs=None, fraction=None):
+    """PURE decision (no I/O, unit-tested) — ga-krfgc: the diff-size-aware sibling
+    of FROZEN_KILL_SECS. Scales the frozen-reviewer silence tolerance to `fraction`
+    (default FROZEN_KILL_SCALE_FRACTION) of the run's OWN diff-scaled
+    verdict_timeout_minutes (ga-ltr3c), floored at `base_secs` (default
+    FROZEN_KILL_SECS — so a run at the dispatcher's base 22min timeout is
+    UNCHANGED from today, zero regression for the common/default-diff case) and
+    capped at `max_secs` (default FROZEN_KILL_MAX_SECS — so this remains a FAST
+    backstop, never as patient as the dispatcher's own outer timeout even for a
+    maximally-scaled 50min-budget run).
+
+    Fail-safe: None/non-numeric/non-positive verdict_timeout_minutes returns
+    `base_secs` unchanged — an unresolvable run/verdict-timeout never makes the
+    watchdog MORE aggressive than today, and never disables it either (mirrors
+    this file's pervasive fail-safe-toward-the-safe-default ethos, e.g.
+    frozen_reviewer_verdict's own handling of unparseable silence)."""
+    base = FROZEN_KILL_SECS if base_secs is None else base_secs
+    cap = FROZEN_KILL_MAX_SECS if max_secs is None else max_secs
+    frac = FROZEN_KILL_SCALE_FRACTION if fraction is None else fraction
+    try:
+        vtm = float(verdict_timeout_minutes)
+    except (TypeError, ValueError):
+        return base
+    if vtm <= 0:
+        return base
+    scaled = vtm * 60.0 * frac
+    eff = max(base, min(cap, scaled))
+    return int(eff)
 
 
 def frozen_reviewer_run_verdict(pending_names, killed_identities):
@@ -1448,6 +1499,58 @@ def _parse_run_field(desc, field):
         if line.startswith(field + ":"):
             return line[len(field) + 1:].strip()
     return ""
+
+
+def _verdict_timeout_minutes_for_session(sid):
+    """ga-krfgc: best-effort diff-scaled verdict_timeout_minutes (ga-ltr3c) of the
+    gate-run a reviewer SESSION is currently working, or None if it can't be
+    resolved. Two-hop (verdict bead assigned to `sid` → its gate_run field → that
+    run bead's verdict_timeout_minutes field), each hop via the read-cache shim,
+    consistent with this file's other bd-list-cached.sh call sites. Bounded to
+    genuine kill-candidates only (reap_frozen_reviewers calls this AFTER the flat
+    FROZEN_KILL_SECS floor already matched, not per session per sweep) so this
+    never adds Dolt load proportional to the live-session count.
+
+    Fail-safe: ANY failure (no assigned verdict bead, bd/Dolt error, unparseable
+    field) returns None — scaled_frozen_kill_secs() treats None as 'use the flat
+    constant', so a lookup failure never makes the watchdog more aggressive NOR
+    disables it (same fail-safe-to-the-safe-default shape as every other lookup
+    in this file, e.g. _session_list_json's None-on-query-failure)."""
+    if not sid:
+        return None
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "--include-infra",
+            "--assignee", str(sid), "--limit", "5", "--json"], timeout=15)
+    if not r or r.returncode != 0:
+        return None
+    try:
+        rows = json.loads(r.stdout) or []
+    except Exception:
+        return None
+    run_id = ""
+    for row in rows:
+        if row.get("status") == "closed":
+            continue  # a delivered/moot verdict bead is not this session's LIVE run
+        run_id = _parse_run_field(row.get("description") or "", "gate_run")
+        if run_id:
+            break
+    if not run_id:
+        return None
+    r2 = sh(["bash", BD_LIST_CACHED, "-C", CITY, "show", run_id, "--json"], timeout=15)
+    if not r2 or r2.returncode != 0:
+        return None
+    try:
+        run_rows = json.loads(r2.stdout) or []
+    except Exception:
+        return None
+    if not run_rows or not isinstance(run_rows, list):
+        return None
+    vtm_str = _parse_run_field(run_rows[0].get("description") or "", "verdict_timeout_minutes")
+    if not vtm_str:
+        return None
+    try:
+        return float(vtm_str)
+    except (TypeError, ValueError):
+        return None
 
 
 def _label_value(bead, prefix):
@@ -2603,12 +2706,31 @@ def reap_frozen_reviewers(sessions, now, rstate, open_running_runs):
         if la is None:
             continue
         silence = int(now - la)
-        if frozen_reviewer_verdict(s.get("state"), silence, FROZEN_KILL_SECS) == "kill":
-            # ga-pp5vh: keep the FULL session dict (was: id/last_active/silence scalars
-            # only) — the post-kill run/marker recovery needs every identity field a
-            # verdict-bead assignee could carry (session_name/alias/agent_name), not
-            # just id, to correlate the killed session against a run's pending reviewers.
-            cand.append((s, silence))
+        if frozen_reviewer_verdict(s.get("state"), silence, FROZEN_KILL_SECS) != "kill":
+            continue
+        # ga-krfgc: the flat floor above already matched, but a run scaled well
+        # above the dispatcher's base (ga-ltr3c) can still legitimately have a
+        # reviewer mid-work here. Only NOW (already past the cheap flat check, so
+        # this stays rare — never per session per sweep) resolve this run's OWN
+        # verdict_timeout_minutes and re-check against the scaled threshold before
+        # treating it as a real candidate. Resolution failure fails safe to the
+        # flat FROZEN_KILL_SECS (scaled_frozen_kill_secs' own fail-safe), so this
+        # can only ever make a kill MORE conservative, never less.
+        threshold = FROZEN_KILL_SECS
+        vtm = None
+        if GRW_FROZEN_KILL_SCALE_ENABLED:
+            vtm = _verdict_timeout_minutes_for_session(s.get("id"))
+            if vtm is not None:
+                threshold = scaled_frozen_kill_secs(vtm)
+        if frozen_reviewer_verdict(s.get("state"), silence, threshold) != "kill":
+            print("[watchdog] frozen-reviewer %s silent %ds but under its run's diff-scaled threshold (%ds, verdict_timeout_minutes=%s) — NOT a candidate (ga-krfgc)"
+                  % (s.get("id"), silence, threshold, vtm), flush=True)
+            continue
+        # ga-pp5vh: keep the FULL session dict (was: id/last_active/silence scalars
+        # only) — the post-kill run/marker recovery needs every identity field a
+        # verdict-bead assignee could carry (session_name/alias/agent_name), not
+        # just id, to correlate the killed session against a run's pending reviewers.
+        cand.append((s, silence, threshold))
     if not cand:
         return
     # SUSTAINED confirm: re-sample after a gap. A reviewer whose last_active ADVANCED
@@ -2617,7 +2739,7 @@ def reap_frozen_reviewers(sessions, now, rstate, open_running_runs):
     s2 = _session_list_json()
     idx2 = {str(s.get("id")): s for s in s2} if s2 else None
     killed = 0
-    for s0, silence in cand:
+    for s0, silence, threshold in cand:
         if killed >= FROZEN_KILL_MAX_PER_SWEEP:
             break
         sid = s0.get("id")
@@ -2633,7 +2755,7 @@ def reap_frozen_reviewers(sessions, now, rstate, open_running_runs):
             now2 = time.time()
             if frozen_reviewer_verdict(s.get("state"),
                                        (int(now2 - la2) if la2 is not None else None),
-                                       FROZEN_KILL_SECS) != "kill":
+                                       threshold) != "kill":
                 print("[watchdog] frozen-reviewer %s RESUMED/changed on resample — NOT killing (fail-safe)" % sid, flush=True)
                 continue
             s_fresh = s
@@ -2653,32 +2775,32 @@ def reap_frozen_reviewers(sessions, now, rstate, open_running_runs):
                        % (sid, silence // 60, sid), 5)
             continue
         if GRW_DRY_RUN:
-            print("[watchdog] FROZEN DRY-RUN would kill reviewer %s (last_active=%s, silent %dm) → reconciler revives fresh"
-                  % (sid, la_iso, silence // 60), flush=True)
+            print("[watchdog] FROZEN DRY-RUN would kill reviewer %s (last_active=%s, silent %dm, threshold=%dm) → reconciler revives fresh"
+                  % (sid, la_iso, silence // 60, threshold // 60), flush=True)
             _recovery_ledger("would_kill_frozen_reviewer",
-                             {"session": sid, "last_active": la_iso, "silent_min": silence // 60, "dry_run": True})
+                             {"session": sid, "last_active": la_iso, "silent_min": silence // 60, "threshold_min": threshold // 60, "dry_run": True})
         else:
             sh(["gc", "session", "kill", sid], timeout=20)
             _recovery_ledger("kill_frozen_reviewer",
-                             {"session": sid, "last_active": la_iso, "silent_min": silence // 60})
+                             {"session": sid, "last_active": la_iso, "silent_min": silence // 60, "threshold_min": threshold // 60})
             notify("Gate self-heal: revisor CONGELADO morto (%s, %dmin sem atividade, active-mas-mudo) — reconciler sobe fresco. Você não precisa agir."
                    % (sid, silence // 60), 3)
-            print("[watchdog] KILLED frozen reviewer %s (last_active=%s, silent %dm) — reconciler revives fresh (grw FIX3 frozen-reviewer self-heal)"
-                  % (sid, la_iso, silence // 60), flush=True)
+            print("[watchdog] KILLED frozen reviewer %s (last_active=%s, silent %dm, threshold=%dm) — reconciler revives fresh (grw FIX3 frozen-reviewer self-heal)"
+                  % (sid, la_iso, silence // 60, threshold // 60), flush=True)
         killed += 1
         # ga-pp5vh: run in BOTH branches — GRW_DRY_RUN is a global flag, so a dry-run
         # sweep hits this function's OWN internal dry-run guard (read-only preview,
         # never mutates) instead of skipping the extension outright. Without this a
         # dry run would never preview the cascading supersede+requeue effect.
         try:
-            _requeue_run_after_frozen_kill(s_fresh, sid, now, rstate, open_running_runs)
+            _requeue_run_after_frozen_kill(s_fresh, sid, now, rstate, open_running_runs, threshold_secs=threshold)
         except Exception as e:
             print("[watchdog] FIX3-requeue error for killed reviewer %s (continuing): %r" % (sid, e), flush=True)
     if killed:
         print("[watchdog] frozen-reviewer sweep: %d killed%s" % (killed, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
 
 
-def _requeue_run_after_frozen_kill(killed_session, sid, now, rstate, open_running_runs):
+def _requeue_run_after_frozen_kill(killed_session, sid, now, rstate, open_running_runs, threshold_secs=None):
     """FIX 3 extension (ga-pp5vh): after reap_frozen_reviewers kills a confirmed-frozen
     reviewer, close the gap between that kill (~FROZEN_KILL_SECS) and the dispatcher's
     own Phase C run-timeout (~29min) that used to be the only thing re-queuing the
@@ -2692,11 +2814,16 @@ def _requeue_run_after_frozen_kill(killed_session, sid, now, rstate, open_runnin
     1/timeout — one dead reviewer must never terminate a run others are still working.
     Boot-grace is inherited for free: this only ever runs on a session
     reap_frozen_reviewers already SUSTAINED-confirmed frozen (state=active, silent
-    >=FROZEN_KILL_SECS), which a booting reviewer (state=creating) can never be.
+    >=FROZEN_KILL_SECS, or its ga-krfgc diff-scaled threshold when one applied).
+    `threshold_secs` is the ACTUAL threshold the caller used for this kill (may
+    exceed the flat FROZEN_KILL_SECS — ga-krfgc); defaults to FROZEN_KILL_SECS for
+    callers that don't have a scaled value (e.g. direct/legacy invocations) so the
+    comment text below never regresses to reporting an unresolved value.
     Best-effort; never raises on its own (the caller also wraps it, since a bug here
     must not turn a successful kill into an unhandled sweep exception)."""
     if not GRW_ENABLED or not GRW_FROZEN_REQUEUE_ENABLED:
         return
+    kill_threshold_secs = FROZEN_KILL_SECS if threshold_secs is None else threshold_secs
     if open_running_runs is None:
         return  # run query unavailable this sweep → fail-safe skip (no blind supersede)
     identities = set(_session_index([killed_session]).keys()) if killed_session else {str(sid)}
@@ -2742,7 +2869,7 @@ def _requeue_run_after_frozen_kill(killed_session, sid, now, rstate, open_runnin
         _close_pending_verdicts_for_run(
             rid,
             "its sole pending reviewer session %s was frozen (active but last_active silent >=%dm) and killed by FIX 3"
-            % (sid, FROZEN_KILL_SECS // 60),
+            % (sid, kill_threshold_secs // 60),
             "FIX3")
         # 2) hand the marker to the shared FIX6 requeue-or-escalate mechanism.
         marker_action = "no-marker"
@@ -2758,7 +2885,7 @@ def _requeue_run_after_frozen_kill(killed_session, sid, now, rstate, open_runnin
                 action, attempts_shown, cleared_reviewing = _requeue_or_escalate_review_marker(
                     marker_id, m, status,
                     "its sole pending reviewer session %s froze (active but last_active silent >=%dm) and was killed by FIX 3; the run was superseded since no one else could ever deliver a verdict"
-                    % (sid, FROZEN_KILL_SECS // 60),
+                    % (sid, kill_threshold_secs // 60),
                     now, rstate, "FIX3")
                 marker_action = action
                 if action == "requeued":
@@ -3981,6 +4108,21 @@ def _selftest():
     ok(frozen_reviewer_verdict("active", None, 900) == "keep", "unparseable silence → keep (fail-safe)")
     ok(frozen_reviewer_verdict("active", -10, 900) == "keep", "future last_active (negative silence) → keep (fail-safe)")
     ok(frozen_reviewer_verdict("", 5000, 900) == "keep", "empty state → keep")
+    # scaled_frozen_kill_secs — ga-krfgc diff-size-aware frozen-kill threshold.
+    # Defaults exercised here are the module's own (FROZEN_KILL_SECS=900,
+    # FROZEN_KILL_SCALE_FRACTION=0.6, FROZEN_KILL_MAX_SECS=1800).
+    ok(scaled_frozen_kill_secs(22) == 900, "base/default-diff run (22min, the dispatcher's own base) → UNCHANGED at the flat 900s (zero regression for the common case)")
+    ok(scaled_frozen_kill_secs(26) == 936, "26min verdict_timeout (measured: ga-97nf6/ga-wk8mw) → scaled above the flat floor")
+    ok(scaled_frozen_kill_secs(34) == 1224, "34min verdict_timeout (measured: ga-572rm) → scaled")
+    ok(scaled_frozen_kill_secs(35) == 1260, "35min verdict_timeout (measured: ga-koqne/ga-h8x4v) → scaled")
+    ok(scaled_frozen_kill_secs(36) == 1296, "36min verdict_timeout (measured: ga-2dri9) → scaled")
+    ok(scaled_frozen_kill_secs(50) == 1800, "50min verdict_timeout (the dispatcher's own worst-case cap, ga-ltr3c) → hits FROZEN_KILL_MAX_SECS exactly")
+    ok(scaled_frozen_kill_secs(200) == 1800, "verdict_timeout far beyond any real cap → still clamped at FROZEN_KILL_MAX_SECS (30min), never as patient as the outer timeout")
+    ok(scaled_frozen_kill_secs(None) == 900, "unresolvable verdict_timeout (None, e.g. lookup failure) → fail-safe to the flat constant")
+    ok(scaled_frozen_kill_secs("garbage") == 900, "unparseable verdict_timeout → fail-safe to the flat constant")
+    ok(scaled_frozen_kill_secs(0) == 900, "zero verdict_timeout (parse succeeded but nonsensical) → fail-safe to the flat constant")
+    ok(scaled_frozen_kill_secs(-5) == 900, "negative verdict_timeout → fail-safe to the flat constant")
+    ok(scaled_frozen_kill_secs(50, base_secs=100, max_secs=200, fraction=0.5) == 200, "explicit base/max/fraction override the module defaults and still clamp correctly")
     # _last_active_epoch — must parse the tz-OFFSET form (session JSON), not just UTC-Z
     ok(_last_active_epoch("2026-07-02T16:06:29-03:00") is not None, "tz-offset last_active parses (the session-JSON form)")
     ok(_last_active_epoch("2026-07-02T19:06:29Z") is not None, "UTC-Z last_active parses too")
