@@ -717,9 +717,59 @@ fi
 
 CHANGED_PY="$(echo "$CHANGED" | grep -E '\.py$' || true)"
 CHANGED_TEMPLATES="$(echo "$CHANGED" | grep -E '\.(html|htm|jinja2?|j2)$' || true)"
-if [ -z "$CHANGED_PY" ] && [ -z "$CHANGED_TEMPLATES" ]; then
-  log "deploy changed no *.py or template files — no daemon code affected — OK."
-  emit OK "no python source or template changed" not_applicable
+
+# (ga-9ps272) CHANGED_PY_FOR_STEMS — CHANGED_PY with every tests/**, docs/**,
+# *.md-covered entry removed (the SAME universal claim DEFAULT_NO_RESTART_PATTERNS
+# already established above: no daemon anywhere imports a test or doc file).
+# Hoisted here, BEFORE this gate's own emptiness check, from its previous
+# position further below (where it fed CHANGED_STEMS only) — moving it earlier
+# changes nothing about that later use (it has no dependency on anything Step
+# 2 discovers in between; same input $CHANGED_PY, same $DEFAULT_NO_RESTART_PATTERNS,
+# same output), but it now ALSO lets this gate see the right thing.
+#
+# Pre-fix, this gate checked the RAW $CHANGED_PY: a deploy whose ONLY changed
+# .py file is a tests/*.py, but which ALSO touches some non-.py/non-template
+# file this gate's sibling above (DEFAULT_NO_RESTART_PATTERNS) does not list —
+# e.g. a brand-new standalone scripts/*.sh, which cannot be part of ANY
+# daemon's Python import graph either, but was never added to that pattern
+# list — fell through both early gates with zero daemon-relevant code changed,
+# landing on the weaker not_verified PROOF via Step 3's own "changed code
+# touches no live daemon" fallback further below, instead of this gate's own
+# not_applicable. VERDICT was already OK either way (Step 3 finds no daemon
+# actually importing a filtered-out tests/*.py stem) — the delta is
+# PROOF/REASON precision, identical in kind to header point 9/ga-dk7fw's own
+# fix for the ISOLATED tests/docs/md-only case (T28/T29): downstream,
+# story-delivery.sh/quality-gate-dispatcher.sh add a delivery:daemon-unverified
+# label and rewrite the done-notification to "DAEMON LIVENESS NOT VERIFIED"
+# for any PROOF other than verified/not_applicable/asset_served_per_request —
+# so this exact shape (measured live, wa-p7g7g: CLAUDE.md + docs + a new
+# scripts/*.sh + a new tests/*.py, zero real lib/daemons code) got that
+# scary, actionable-looking label for a delivery with zero daemon relevance.
+# Deliberately does NOT also extend DEFAULT_NO_RESTART_PATTERNS itself (e.g.
+# with scripts/**/*.sh): that would only help changesets containing NO .py
+# file at all, which this same gate already resolves correctly today (CHANGED_PY
+# is already empty in that case, filtered or not) — enumerating every
+# non-importable extension there is unbounded and unnecessary. Filtering the
+# .py side once, here, covers any companion file of any extension.
+CHANGED_PY_FOR_STEMS=""
+set -f
+while IFS= read -r pyf; do
+  [ -n "$pyf" ] || continue
+  py_covered=0
+  for pat in $DEFAULT_NO_RESTART_PATTERNS; do
+    # shellcheck disable=SC2254  # deliberate glob match, not literal
+    case "$pyf" in $pat) py_covered=1; break ;; esac
+  done
+  if [ "$py_covered" -eq 0 ]; then
+    CHANGED_PY_FOR_STEMS="$CHANGED_PY_FOR_STEMS
+$pyf"
+  fi
+done <<< "$CHANGED_PY"
+set +f
+
+if [ -z "$CHANGED_PY_FOR_STEMS" ] && [ -z "$CHANGED_TEMPLATES" ]; then
+  log "deploy changed no daemon-relevant *.py (tests/**, docs/**, *.md-covered python excluded — see CHANGED_PY_FOR_STEMS above) and no template files — no daemon code affected — OK."
+  emit OK "no python source (excluding tests/docs/md) or template changed" not_applicable
 fi
 log "changed python files:"; echo "$CHANGED_PY" | sed 's/^/[daemon-refresh]   /' >&2
 log "changed template files:"; echo "$CHANGED_TEMPLATES" | sed 's/^/[daemon-refresh]   /' >&2
@@ -903,21 +953,13 @@ CHANGED_BASENAMES="$(echo "$CHANGED_PY" | while read -r f; do [ -n "$f" ] && bas
 # shared_helper`) produced a false-positive AFFECTED — flagging (and for a
 # SENSITIVE daemon, HOLDING THE GATE on) a daemon nothing about this deploy
 # actually touched.
-CHANGED_PY_FOR_STEMS=""
-set -f
-while IFS= read -r pyf; do
-  [ -n "$pyf" ] || continue
-  py_covered=0
-  for pat in $DEFAULT_NO_RESTART_PATTERNS; do
-    # shellcheck disable=SC2254  # deliberate glob match, not literal
-    case "$pyf" in $pat) py_covered=1; break ;; esac
-  done
-  if [ "$py_covered" -eq 0 ]; then
-    CHANGED_PY_FOR_STEMS="$CHANGED_PY_FOR_STEMS
-$pyf"
-  fi
-done <<< "$CHANGED_PY"
-set +f
+#
+# (ga-9ps272) CHANGED_PY_FOR_STEMS itself now computed earlier, right after
+# CHANGED_PY/CHANGED_TEMPLATES above — this gate's own no-python/template-
+# changed early-exit needed the SAME filtered set, so the computation was
+# hoisted rather than duplicated. Nothing here depends on anything Step 2
+# discovers, so the earlier computation is identical to what this line used
+# to produce itself.
 CHANGED_STEMS="$(echo "$CHANGED_PY_FOR_STEMS" | while read -r f; do [ -n "$f" ] && basename "$f"; done | sed 's/\.py$//' | grep -v '^$' || true)"
 CHANGED_TEMPLATE_BASENAMES="$(echo "$CHANGED_TEMPLATES" | while read -r f; do [ -n "$f" ] && basename "$f"; done)"
 

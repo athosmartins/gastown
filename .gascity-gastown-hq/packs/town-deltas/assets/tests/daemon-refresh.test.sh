@@ -1669,6 +1669,43 @@ case " $AFF44 " in
   *) ok "T44 changed tests/-path file's basename never becomes a checkable stem (com.test.dashboard correctly NOT flagged)" ;;
 esac
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# T45 (ga-9ps272, wa-p7g7g): the exact reported production shape — CLAUDE.md +
+# 2 docs/*.md (all three covered by DEFAULT_NO_RESTART_PATTERNS) PLUS a NEW
+# standalone scripts/*.sh (uncovered — not tests/**, docs/**, nor *.md, and
+# not a .py/template either) PLUS a NEW tests/*.py, zero real lib/daemons
+# code touched. Pre-fix this measured VERDICT=OK/PROOF=not_verified (Step 3's
+# generic "touches no live daemon" fallback, NOT a false AFFECTED/GUARDED —
+# confirmed directly against the pre-fix script before writing this test, same
+# discipline as T28's own comment). The observable delta is PROOF/REASON, but
+# it is not cosmetic: story-delivery.sh/quality-gate-dispatcher.sh treat any
+# PROOF other than verified/not_applicable/asset_served_per_request as
+# "daemon liveness not verified" and label the delivery delivery:daemon-
+# unverified — live, actionable-looking noise on a delivery with zero daemon
+# relevance, the uncovered .sh companion being the only reason gate 1
+# (point 9/ga-dk7fw, T28/T29) didn't already resolve this the same way.
+# ════════════════════════════════════════════════════════════════════════════
+SENSITIVE_DAEMONS="campaign central-sender webhook"
+new_case t45
+cat > "$RUNTIME/daemons/campaign_scheduler.py" <<<'def run(): pass'
+cat > "$RUNTIME/daemons/central_sender.py" <<<'def send(): pass'
+cat > "$RUNTIME/daemons/webhook_listener.py" <<<'def listen(): pass'
+make_plist "$AGENTS" com.test.campaign-scheduler "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/campaign_scheduler.py"
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+make_plist "$AGENTS" com.test.webhook-listener "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/webhook_listener.py"
+seed_running com.test.campaign-scheduler 9901 "$STALE_LSTART"
+seed_running com.test.central-sender 9902 "$STALE_LSTART"
+seed_running com.test.webhook-listener 9903 "$STALE_LSTART"
+OUT=$(run_helper CLAUDE.md docs/a.md docs/b.md scripts/restart_demand_dashboard_guarded.sh tests/test_restart_demand_dashboard_guarded.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T45 verdict OK" || nok "T45 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -eq 0 ] && ok "T45 exit 0" || nok "T45 exit" "rc=$RC"
+[ -z "$(field AFFECTED "$OUT")" ] && ok "T45 no daemon marked AFFECTED" || nok "T45 affected" "$(field AFFECTED "$OUT")"
+[ -z "$(field GUARDED "$OUT")" ] && ok "T45 no daemon GUARDED" || nok "T45 guarded" "$(field GUARDED "$OUT")"
+[ ! -f "$MOCK/kicks.log" ] && ok "T45 no kickstart called" || nok "T45 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+[ "$(field PROOF "$OUT")" = "not_applicable" ] && ok "T45 PROOF=not_applicable (the actual fix — was not_verified pre-fix, which trips delivery:daemon-unverified downstream)" || nok "T45 proof" "got '$(field PROOF "$OUT")', want not_applicable"
+echo "$(field REASON "$OUT")" | grep -qi "excluding tests/docs/md" && ok "T45 REASON names the excluded structurally-inert python" || nok "T45 reason" "$(field REASON "$OUT")"
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"
