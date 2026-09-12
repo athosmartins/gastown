@@ -121,7 +121,15 @@ worktree_is_live() {
     /^n/ { path=substr($0,2); if (path==p || index(path, p "/")==1) { found=1; exit } }
     END { exit !found }
   ' && return 0
-  ps -Ao command= 2>/dev/null | grep -F -- "$wt" | grep -qv '^grep ' && return 0
+  # If lsof found nothing, fall back to a command-line scan via ps. But an
+  # EMPTY ps listing is not the same fact as "ps looked and found nothing
+  # relevant" — a live system always has processes, so zero output means the
+  # check itself couldn't run (ps missing/broken), not that nothing is live.
+  # Collapsing that into "not live" would let a genuinely-unknown state
+  # silently authorize deletion; treat it as live instead (the safe default).
+  ps_out="$(ps -Ao command= 2>/dev/null)"
+  [ -z "$ps_out" ] && return 0
+  printf '%s\n' "$ps_out" | grep -F -- "$wt" | grep -qv '^grep ' && return 0
   return 1
 }
 
