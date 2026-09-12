@@ -145,7 +145,44 @@ run_block() {
 }
 
 # ── Stub JSON helpers ──────────────────────────────────────────────────────────
-TASK_BEAD_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","status":"in_progress","issue_type":"task","labels":["gate:passed","lane:small"]}]'
+# ga-7x7g2: every fixture below that is meant to reach the close/label-
+# mutation logic MUST carry a well-formed, sufficiently-OLD `updated_at` —
+# wa-n27z0 added a freshness guard (task_reconciler_gate_passed_too_fresh,
+# story-delivery.sh ~line 927) that runs BEFORE any of that logic, and its
+# case-shape check treats an EMPTY or malformed updated_at as "unrecognized
+# shape -> too fresh -> defer" (story-delivery.sh:463-465) regardless of
+# TASK_GATE_PASSED_MIN_AGE_MINUTES. None of these fixtures originally carried
+# `updated_at` at all — the guard landed 2026-09-09, eleven days after this
+# fixture block was last touched (ga-wnxeq, 2026-08-29) — so every one of
+# them silently tripped the guard's fail-closed default and the loop
+# `continue`d before ever reaching the close/label-mutation calls the
+# assertions below check for. That is the entire explanation for "only one
+# bd invocation (the initial list) ever appears in the log" on every
+# previously-failing case (T1/T7/T10/T11) — and it ALSO meant T8/T9 were
+# passing for the WRONG reason: their real logic (never-guess-on-unverified-
+# contradiction, ga-tuk26; sha-scoped override, ga-as3p1) never ran either —
+# the same early `continue` produced their "no close, no label change"
+# outcome by accident, giving zero regression coverage for either guarantee
+# despite the green checkmark. Fix: a fixed, clearly-ancient `updated_at`
+# ("2020-01-01T00:00:00Z" — shape-valid, and always far past the 20min
+# default no matter when this suite runs, so it can never itself go stale).
+#
+# The wa-x6ggx second guard (task_bead_last_event_at, ~line 942) needs no
+# fixture change or extra stubbing: it shells its `bd sql` call out through
+# `timeout`, which bypasses this file's bash-function `bd` stub entirely
+# (confirmed: a function is invisible to timeout's execvp lookup) and hits
+# the REAL `bd` binary — confirmed empirically to fail fast ("no beads
+# project found", <0.1s, no live-store contact) against the synthetic non-bd
+# git tmpdir every run_block invocation builds, so TASK_LAST_EVENT_AT is
+# always "" here and task_gate_passed_age_anchor falls back to the
+# (now old-enough) updated_at unchanged.
+#
+# CLOSE_EXHAUSTED_JSON (T12) and PENDING_RESTART_JSON (T13) below do NOT get
+# this treatment: both hit their own real early-exit checks
+# (delivery:close-retry-exhausted, delivery:pending-restart) BEFORE
+# story-delivery.sh ever reads updated_at at all — adding it there would
+# change nothing.
+TASK_BEAD_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","status":"in_progress","issue_type":"task","updated_at":"2020-01-01T00:00:00Z","labels":["gate:passed","lane:small"]}]'
 STORY_WITH_GATE_JSON='[{"id":"ga-test-story","title":"Add feature X","status":"open","issue_type":null,"labels":["gate:passed","story:approved"]}]'
 DONE_WITH_GATE_JSON='[{"id":"ga-test-done","title":"Old fix","status":"in_progress","issue_type":"task","labels":["gate:passed","story:done"]}]'
 EMPTY_JSON='[]'
@@ -153,11 +190,11 @@ EMPTY_JSON='[]'
 # git repo (below) commits with subject scoped to exactly this id, so this
 # fixture IS independently verifiable. Reproduces wa-iochp's real label set
 # (gate:passed + gate:failed + gate:needs-fix + gate:fix-attempt:1).
-CONTRADICTED_VERIFIED_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","status":"in_progress","issue_type":"task","labels":["gate:passed","gate:failed","gate:needs-fix","gate:fix-attempt:1","lane:small"]}]'
+CONTRADICTED_VERIFIED_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","status":"in_progress","issue_type":"task","updated_at":"2020-01-01T00:00:00Z","labels":["gate:passed","gate:failed","gate:needs-fix","gate:fix-attempt:1","lane:small"]}]'
 # ga-tuk26: a DIFFERENT id ("ga-test-task-nocommit") that run_block's synthetic
 # repo has no commit for — the fail-safe control. Same contradictory labels,
 # but nothing anywhere proves the fail-cycle residue is stale.
-CONTRADICTED_UNVERIFIED_JSON='[{"id":"ga-test-task-nocommit","title":"unrelated task, never merged","status":"in_progress","issue_type":"task","labels":["gate:passed","gate:failed","gate:needs-fix","lane:small"]}]'
+CONTRADICTED_UNVERIFIED_JSON='[{"id":"ga-test-task-nocommit","title":"unrelated task, never merged","status":"in_progress","issue_type":"task","updated_at":"2020-01-01T00:00:00Z","labels":["gate:passed","gate:failed","gate:needs-fix","lane:small"]}]'
 # ga-as3p1: SAME id as TASK_BEAD_JSON/CONTRADICTED_VERIFIED_JSON ("ga-test-task")
 # — the bead-scoped scan finds run_block's synthetic commit for it, exactly
 # like T7. The difference is the extra gate-sha-failed stamp naming a sha that
@@ -165,7 +202,7 @@ CONTRADICTED_UNVERIFIED_JSON='[{"id":"ga-test-task-nocommit","title":"unrelated 
 # df90c973 — a real, different, never-merged slice). A bead-scoped-only check
 # would wrongly treat T7's proof as covering this bead too; the sha-scoped
 # check must catch that the NAMED rejected sha specifically never resolved.
-CONTRADICTED_SHA_SCOPED_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","status":"in_progress","issue_type":"task","labels":["gate:passed","gate:failed","gate:needs-fix","gate-sha-failed:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef:code","lane:small"]}]'
+CONTRADICTED_SHA_SCOPED_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","status":"in_progress","issue_type":"task","updated_at":"2020-01-01T00:00:00Z","labels":["gate:passed","gate:failed","gate:needs-fix","gate-sha-failed:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef:code","lane:small"]}]'
 
 # ── T1: Task bead with gate:passed → close called ─────────────────────────────
 run_block "$TASK_BEAD_JSON" 0 ""
@@ -258,12 +295,18 @@ run_block "$CONTRADICTED_SHA_SCOPED_JSON" 0 ""
 # /dev/null, and (c) retries stop at TASK_CLOSE_MAX_RETRIES with an
 # escalation instead of continuing forever.
 CLOSE_FAIL_STDERR='cannot close ga-test-task: assignee is "role-x", actor is "role-x-session1"; reclaim or use --force to override'
-CLOSE_FIRST_ATTEMPT_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","status":"in_progress","issue_type":"task","labels":["gate:passed","lane:small"]}]'
+# ga-7x7g2: updated_at must be old (see the fixture-block comment above
+# TASK_BEAD_JSON) or the freshness guard `continue`s before ever attempting
+# the close this test exists to exercise.
+CLOSE_FIRST_ATTEMPT_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","status":"in_progress","issue_type":"task","updated_at":"2020-01-01T00:00:00Z","labels":["gate:passed","lane:small"]}]'
 # Same bead, but already carries delivery:close-retry:2 — this failure is the
 # 3rd (TASK_CLOSE_MAX_RETRIES=3), the one that must trip the cap.
-CLOSE_LAST_ATTEMPT_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","status":"in_progress","issue_type":"task","labels":["gate:passed","lane:small","delivery:close-retry:2"]}]'
+CLOSE_LAST_ATTEMPT_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","status":"in_progress","issue_type":"task","updated_at":"2020-01-01T00:00:00Z","labels":["gate:passed","lane:small","delivery:close-retry:2"]}]'
 # Already escalated on a PRIOR sweep — the early skip-check must fire before
-# ever attempting another close.
+# ever attempting another close (delivery:close-retry-exhausted is checked
+# BEFORE story-delivery.sh ever reads updated_at, ga-7x7g2 — no updated_at
+# needed here; see the fixture-block comment above TASK_BEAD_JSON for why
+# the other CLOSE_* fixtures above do need one).
 CLOSE_EXHAUSTED_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","status":"in_progress","issue_type":"task","labels":["gate:passed","lane:small","delivery:close-retry-exhausted"]}]'
 
 # ── T10: first close failure → no false-success comment, retry-count bumped,
