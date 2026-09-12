@@ -17,12 +17,21 @@
 #     6. confirmed stall but a title-signature repair dog is alive → NO spawn (restart-safe)
 #     7. live_repair_dogs ignores closed / non-dog / normal-pool dogs
 #     8. spawned id is tracked → next confirmed tick suppressed by the live sibling
-#   WIDENED REVIEW GUARD (root false-positive reduction):
-#     9. fresh Verdicts poll beyond a 40-line tail still suppresses gate_merge_stall
-#    10. partial verdict (G>0) recently received counts as "progressing" (fresh)
 #   REGRESSION:
-#    11. spawn-route failure → no tracking, no cycle increment (retry next tick)
-#    12. detect() still returns the four kinds unchanged (pure, side-effect free)
+#     9. spawn-route failure → no tracking, no cycle increment (retry next tick)
+#    10. detect() still returns the four kinds unchanged (pure, side-effect free)
+#
+# ga-ohz0x: the former "WIDENED REVIEW GUARD" cases here (a fresh Verdicts poll beyond a
+# 40-line tail; a partial verdict with large elapsed) exercised ONLY the VERDICTS_RE branch
+# of _fresh_review_in_progress(), which matched a dispatcher log format no live code path
+# emits anymore (dead since before ga-z0xx1, confirmed against 19.8k live log lines,
+# 2026-09-11) and has now been deleted as dead code. The behavior those cases cared about —
+# a legitimately in-flight review (even one scanned past a short tail, even one with a large
+# elapsed still inside its own budget) must suppress gate_merge_stall — is exercised against
+# the CURRENT live signal (PHASE_C_INFLIGHT_RE) far more thoroughly by the dedicated
+# scripts/pipeline-throughput-heartbeat.gate-merge-scaled-timeout.selftest.sh (ga-z0xx1,
+# 6 scenarios including the scan-horizon boundary). Removed rather than rewritten here to
+# avoid duplicating that coverage in two places.
 #
 # Exit: 0 = all pass, 1 = any failure.
 set -euo pipefail
@@ -228,53 +237,7 @@ print('OK_TRACKED_SUPPRESS')
 " "OK_TRACKED_SUPPRESS"
 
 # ---------------------------------------------------------------------------
-# 9. fresh Verdicts poll beyond a 40-line tail still suppresses gate_merge_stall
-# ---------------------------------------------------------------------------
-run_test "widened review guard: fresh verdict beyond 40-line tail suppresses stall" "
-$HARNESS
-import time
-now = 1_000_000.0
-def ts(epoch):
-    return time.strftime('[%Y-%m-%d %H:%M:%S]', time.localtime(epoch))
-# Build a log: a recent in-flight Verdicts poll, then 60 noisy headroom-defer lines after
-# it (so the poll is >40 lines from the end), then the latest queued-marker line.
-lines = []
-lines.append(ts(now-120)+' Verdicts: 1/3 received (elapsed: 300s)\n')   # fresh, partial
-for i in range(60):
-    lines.append(ts(now-110+i)+' Headroom: deferring run (Dolt hot)\n')
-lines.append(ts(now-5)+' Found 6 queued marker(s)\n')
-m.tail_lines = lambda path, n: lines[-n:]
-m.file_fresh = lambda path, max_age=None, now=None: True
-r = m.gate_merge_stall(now)
-print('STALL=%r' % r)
-assert r is None, 'a fresh in-flight review beyond the 40-line tail must suppress the stall'
-print('OK_WIDE_SCAN')
-" "OK_WIDE_SCAN"
-
-# ---------------------------------------------------------------------------
-# 10. partial verdict (G>0) with large elapsed still counts as progressing (fresh)
-# ---------------------------------------------------------------------------
-run_test "partial verdict G>0 with large elapsed = progressing (not stall)" "
-$HARNESS
-import time
-now = 1_000_000.0
-def ts(epoch):
-    return time.strftime('[%Y-%m-%d %H:%M:%S]', time.localtime(epoch))
-# elapsed 4000s > REVIEW_FRESH_SEC(2700) but 2/3 verdicts already in → run is draining.
-lines = [
-  ts(now-120)+' Verdicts: 2/3 received (elapsed: 4000s)\n',
-  ts(now-5)+' Found 3 queued marker(s)\n',
-]
-m.tail_lines = lambda path, n: lines[-n:]
-m.file_fresh = lambda path, max_age=None, now=None: True
-r = m.gate_merge_stall(now)
-print('STALL=%r' % r)
-assert r is None, 'partial verdicts received → progressing, not a stall'
-print('OK_PARTIAL_PROGRESS')
-" "OK_PARTIAL_PROGRESS"
-
-# ---------------------------------------------------------------------------
-# 11. spawn-route failure → no tracking, no cycle increment (retry next tick)
+# 9. spawn-route failure → no tracking, no cycle increment (retry next tick)
 # ---------------------------------------------------------------------------
 run_test "spawn route failure → not tracked, cycles not incremented" "
 $HARNESS
@@ -291,7 +254,7 @@ print('OK_SPAWN_FAIL')
 " "OK_SPAWN_FAIL"
 
 # ---------------------------------------------------------------------------
-# 12. detect() still returns the four kinds, pure / side-effect free (regression)
+# 10. detect() still returns the four kinds, pure / side-effect free (regression)
 # ---------------------------------------------------------------------------
 run_test "detect() pure, returns the four kinds when each check fires" "
 $HARNESS
@@ -307,7 +270,7 @@ print('OK_DETECT_PURE')
 " "OK_DETECT_PURE"
 
 # ---------------------------------------------------------------------------
-# 13. HEADROOM-DEFER suppression (ga-r1u20): a fresh 'Headroom DEFER' as the gate's most
+# 11. HEADROOM-DEFER suppression (ga-r1u20): a fresh 'Headroom DEFER' as the gate's most
 #     recent decision means it is DELIBERATELY throttling reviews (ga-cw4pm) to protect
 #     Dolt — no Verdicts polls is EXPECTED, not a stall. gate_merge_stall must return None.
 # ---------------------------------------------------------------------------
@@ -332,7 +295,7 @@ print('OK_DEFER_SUPPRESS')
 " "OK_DEFER_SUPPRESS"
 
 # ---------------------------------------------------------------------------
-# 14. NEGATIVE CONTROL (ga-r1u20): after the gate RECOVERS to 'Headroom OK' (resumed
+# 12. NEGATIVE CONTROL (ga-r1u20): after the gate RECOVERS to 'Headroom OK' (resumed
 #     admitting runs) a continuing no-merge IS a real stall — the DEFER suppression must
 #     not mask it. The most recent decision is OK, so gate_merge_stall must still fire.
 # ---------------------------------------------------------------------------

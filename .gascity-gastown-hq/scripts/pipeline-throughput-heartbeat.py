@@ -143,13 +143,12 @@ PILOT_NO_DEMAND = "No dispatchable candidates"
 # "Gate PASSED:" and "Gate PASSED (origin=Pilot):" both contain this substring.
 GATE_PASS = "Gate PASSED"
 GATE_QUEUED_RE = re.compile(r"Found (\d+) queued marker\(s\)")
-# "  Verdicts: G/N received (elapsed: Ys)"
-# ga-z0xx1: verified against the live dispatcher log (19.8k lines, 2026-09-11) — this
-# pattern currently matches NOTHING. The dispatcher's real in-flight-poll line is
-# PHASE_C_INFLIGHT_RE below; kept as-is (harmless no-op) rather than removed, since
-# resurrecting/removing it is a separate concern from this bead's fix — tracked at
-# ga-ohz0x, not folded into this diff.
-VERDICTS_RE = re.compile(r"Verdicts:\s*(\d+)/(\d+)\s*received\s*\(elapsed:\s*(\d+)s\)")
+# ga-ohz0x: VERDICTS_RE ("  Verdicts: G/N received (elapsed: Ys)") used to live here as the
+# in-flight-poll signal. Removed — ga-z0xx1 verified against the live dispatcher log (19.8k
+# lines, 2026-09-11) that no code path emits that format anymore (confirmed again here: zero
+# `echo`/`printf` sites for it anywhere in quality-gate-dispatcher.sh, only a comment
+# describing a past incident). The dispatcher's real in-flight-poll line is
+# PHASE_C_INFLIGHT_RE below, which is what _fresh_review_in_progress() now relies on alone.
 # "Phase C: gate-run <id> (branch=<b>) still in flight (G/N verdicts, ELAPSEDs/TIMEOUTs) —
 # leaving for a future sweep." (quality-gate-dispatcher.sh, gate_run "still in flight" log
 # line). TIMEOUT here is the run's OWN already diff-scaled verdict timeout in seconds
@@ -299,17 +298,16 @@ def pilot_dispatch_stall(now=None):
 # ── CHECK B: Gate not merging under demand (with live-review guard) ───────────
 def _fresh_review_in_progress(lines, now):
     """True if the gate is legitimately mid-flight: a Phase-C "still in flight" poll whose
-    own elapsed is under ITS OWN reported timeout, a Verdicts poll younger than
-    REVIEW_FRESH_SEC, a 'proceeding to merge' line, or a partial verdict (G>0) appears
+    own elapsed is under ITS OWN reported timeout, or a 'proceeding to merge' line, appears
     recently. This is the guard that keeps a single honest long review — or a slow run
     that is still making progress under Dolt load — from tripping the alarm.
 
     ga-z0xx1: PHASE_C_INFLIGHT_RE is checked against the run's OWN self-reported timeout
     (already diff-scaled, up to the dispatcher's 50min cap — ga-ltr3c) instead of the fixed
     REVIEW_FRESH_SEC constant, which under-covers a large diff scaled past 45min. This is
-    today's real in-flight signal — VERDICTS_RE below no longer matches the live dispatcher
-    log format (verified against 19.8k live lines, 2026-09-11) and is kept only as an inert
-    fallback (see the ga-z0xx1 note at VERDICTS_RE's definition).
+    today's ONLY in-flight signal — ga-ohz0x removed the old VERDICTS_RE fallback as dead
+    code: it matched a "Verdicts: G/N received (elapsed: Ys)" log line no live dispatcher
+    code path emits anymore, and nothing in this function depended on it ever firing.
 
     ga-z0xx1 (adversarial-review correction): a PHASE_C_INFLIGHT_RE line's own `elapsed`
     field is only accurate as of when it was LOGGED, not as of `now` — a first version of
@@ -323,10 +321,9 @@ def _fresh_review_in_progress(lines, now):
 
     ga-vym2m: scan by TIMESTAMP, not a fixed 40-line tail. Under Dolt CPU saturation the
     dispatcher logs many headroom-defer / retry lines per sweep, so the in-flight review's
-    last Verdicts poll routinely scrolls past a 40-line window — which made the guard miss
-    a live review and the check false-fire. Walk the recent tail and consider every line
-    whose own timestamp is within the freshness horizon; partial verdicts (G>0) recently
-    received are themselves proof the run is progressing (verdicts rising X/3, not stuck)."""
+    last Phase-C poll routinely scrolls past a short fixed-line window — which made the
+    guard miss a live review and the check false-fire. Walk the recent tail and consider
+    every line whose own timestamp is within the freshness horizon."""
     for l in reversed(lines):
         e = log_ts_epoch(l)
         # Stop once we walk past the scan horizon — lines are chronological, so anything
@@ -351,15 +348,6 @@ def _fresh_review_in_progress(lines, now):
         if GATE_MERGING in l:
             if e and now - e < REVIEW_FRESH_SEC:
                 return True
-        vm = VERDICTS_RE.search(l)
-        if vm:
-            got = int(vm.group(1))
-            elapsed = int(vm.group(3))
-            # A recent poll under its own timeout → review legitimately running. A recent
-            # poll that has already received >=1 verdict → run is progressing (draining),
-            # not stalled, even if its elapsed is large under Dolt-hot slowness.
-            if e and now - e < POLL_SEC * 2 and (elapsed < REVIEW_FRESH_SEC or got > 0):
-                return True
     return False
 
 
@@ -368,9 +356,9 @@ def _headroom_deferring(lines, now):
     it is DELIBERATELY throttling reviews to protect Dolt (ga-cw4pm), not stalled (ga-r1u20).
 
     When Dolt is hot the dispatcher defers every review (ceiling=0 / cap-reached), so it
-    emits no Verdicts polls and _fresh_review_in_progress() sees nothing in flight — which
-    made gate_merge_stall() mistake a healthy intentional throttle for a stall and spawn
-    repair dogs (observed live 2026-06-12 17:00-17:09 under Dolt CPU 102-297%).
+    emits no in-flight-review polls and _fresh_review_in_progress() sees nothing in flight —
+    which made gate_merge_stall() mistake a healthy intentional throttle for a stall and
+    spawn repair dogs (observed live 2026-06-12 17:00-17:09 under Dolt CPU 102-297%).
 
     The latest OK/DEFER line is the gate's current self-assessment: a fresh DEFER means 'I
     chose not to admit a run'. A subsequent OK (gate resumed admitting) does NOT suppress —
