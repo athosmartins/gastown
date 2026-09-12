@@ -1943,6 +1943,22 @@ def _session_index(sessions):
     return idx
 
 
+def _reviewer_assignee_identifier(s):
+    """The identifier a verdict bead's --assignee actually carries for a single
+    reviewer session dict `s` — same precedence as _session_index() above
+    (session_name/name/alias/agent_name, verified equal live), falling back to
+    the session's internal `id` only when none of those name fields are present
+    (never worse than passing id outright). gate-feedback ga-8rx980 (this bead,
+    ga-krfgc): reap_frozen_reviewers used to pass s.get("id") directly into
+    _verdict_timeout_minutes_for_session, which is NEVER what a verdict bead is
+    actually assigned to for a real gate-reviewer session — the lookup silently
+    returned zero rows every time. Factored out (rather than left inline at the
+    call site) so this precedence is unit-tested on its own, independent of the
+    two-hop bd lookup it feeds."""
+    return (s.get("session_name") or s.get("name") or s.get("alias")
+            or s.get("agent_name") or s.get("id"))
+
+
 def _any_reviewer_active(sessions, names):
     """True if ANY of a run's reviewer sessions (by verdict-bead assignee name) is
     state=='active' (the authoritative session-manager liveness signal — NOT a
@@ -2719,7 +2735,15 @@ def reap_frozen_reviewers(sessions, now, rstate, open_running_runs):
         threshold = FROZEN_KILL_SECS
         vtm = None
         if GRW_FROZEN_KILL_SCALE_ENABLED:
-            vtm = _verdict_timeout_minutes_for_session(s.get("id"))
+            # gate-feedback ga-8rx980: a verdict bead is assigned to the session's
+            # NAME (session_name/alias/agent_name), never to its internal `id`
+            # field — two different strings for the same session (the class in
+            # session-id-not-derivable-assignee-string). Passing s.get("id") here
+            # made bd's --assignee lookup return zero rows for every real
+            # gate-reviewer session, so vtm was always None and this whole path
+            # silently no-op'd back to the flat FROZEN_KILL_SECS — defeating the
+            # fix's entire purpose without ever surfacing an error.
+            vtm = _verdict_timeout_minutes_for_session(_reviewer_assignee_identifier(s))
             if vtm is not None:
                 threshold = scaled_frozen_kill_secs(vtm)
         if frozen_reviewer_verdict(s.get("state"), silence, threshold) != "kill":
@@ -4123,6 +4147,41 @@ def _selftest():
     ok(scaled_frozen_kill_secs(0) == 900, "zero verdict_timeout (parse succeeded but nonsensical) → fail-safe to the flat constant")
     ok(scaled_frozen_kill_secs(-5) == 900, "negative verdict_timeout → fail-safe to the flat constant")
     ok(scaled_frozen_kill_secs(50, base_secs=100, max_secs=200, fraction=0.5) == 200, "explicit base/max/fraction override the module defaults and still clamp correctly")
+    # _reviewer_assignee_identifier / _verdict_timeout_minutes_for_session —
+    # gate-feedback ga-8rx980 on this same bead: the 12 checks above only ever
+    # exercised scaled_frozen_kill_secs() directly with numeric/None inputs,
+    # never the --assignee identifier this whole path is keyed on, against
+    # realistic session/bead data — which is exactly how the reap_frozen_reviewers
+    # call site's bug (passing the session's internal `id`, e.g. "ga-wisp-1n9gxe",
+    # when a verdict bead is actually assigned to the session's name/alias, e.g.
+    # "gate-reviewer-adhoc-a6280474de") went undetected: every check passed while
+    # the fix silently never engaged.
+    ok(_reviewer_assignee_identifier({"id": "ga-wisp-1n9gxe", "session_name": "gate-reviewer-adhoc-a6280474de"}) == "gate-reviewer-adhoc-a6280474de",
+       "session_name preferred over id when both present — the exact dict shape a live gate-reviewer session carries")
+    ok(_reviewer_assignee_identifier({"id": "ga-wisp-1n9gxe", "alias": "gate-reviewer-adhoc-a6280474de"}) == "gate-reviewer-adhoc-a6280474de",
+       "alias also preferred over id")
+    ok(_reviewer_assignee_identifier({"id": "ga-wisp-1n9gxe"}) == "ga-wisp-1n9gxe",
+       "id is still the fail-safe fallback when no name/alias field exists at all — never worse than the pre-fix behavior")
+    def _fake_sh_vtms(args, timeout=20, stdin=None):
+        if len(args) > 4 and args[4] == "list":
+            assignee = args[8] if len(args) > 8 else None
+            if assignee == "gate-reviewer-adhoc-a6280474de":
+                return subprocess.CompletedProcess(args=args, returncode=0,
+                    stdout='[{"status":"in_progress","description":"gate_run: ga-fake-run-1\\n"}]')
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="[]")
+        if len(args) > 4 and args[4] == "show":
+            return subprocess.CompletedProcess(args=args, returncode=0,
+                stdout='[{"description":"verdict_timeout_minutes: 34\\n"}]')
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="")
+    _real_sh_vtms = globals()["sh"]
+    try:
+        globals()["sh"] = _fake_sh_vtms
+        ok(_verdict_timeout_minutes_for_session("ga-wisp-1n9gxe") is None,
+           "session's internal id form → --assignee lookup matches nothing → None (reproduces the live bug: this is what the pre-fix call site passed)")
+        ok(_verdict_timeout_minutes_for_session("gate-reviewer-adhoc-a6280474de") == 34.0,
+           "the SAME session's name/alias form (what a verdict bead is actually assigned to) resolves the two-hop lookup correctly — this is what the fixed call site must pass")
+    finally:
+        globals()["sh"] = _real_sh_vtms
     # _last_active_epoch — must parse the tz-OFFSET form (session JSON), not just UTC-Z
     ok(_last_active_epoch("2026-07-02T16:06:29-03:00") is not None, "tz-offset last_active parses (the session-JSON form)")
     ok(_last_active_epoch("2026-07-02T19:06:29Z") is not None, "UTC-Z last_active parses too")
