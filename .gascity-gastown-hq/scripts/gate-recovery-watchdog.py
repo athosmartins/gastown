@@ -472,14 +472,40 @@ def last_pass_epoch():
     return 0
 
 
+# ga-iodjh7: the OLD in-flight signal here matched "Verdicts: G/N received (elapsed: Ys)"
+# — the SAME historical dispatcher-log format ga-z0xx1/ga-ohz0x already proved dead in the
+# sibling pipeline-throughput-heartbeat.py (identical DISPATCH_LOG, zero emitting sites in
+# quality-gate-dispatcher.sh). Since that regex never matched here either, stuck_dispatching()
+# always fell through to `return False` — the "marker stuck dispatching w/ no reviewers" arm
+# of the gate-down check in main() was permanently, silently disabled. The dispatcher's
+# current in-flight-poll line is "Phase C: gate-run <id> (branch=<b>) still in flight (G/N
+# verdicts, ELAPSEDs/TIMEOUTs) — leaving for a future sweep." (quality-gate-dispatcher.sh:
+# ~7671). Unlike the sibling's PHASE_C_INFLIGHT_RE (which only needs ELAPSED/TIMEOUT), this
+# detector's "got == 0" check needs the verdict-received count too, so it gets its own
+# pattern rather than reusing that one.
+STUCK_INFLIGHT_RE = re.compile(r"still in flight \((\d+)/\d+ verdicts, (\d+)s/\d+s\)")
+
+
 def stuck_dispatching():
     """True only if the dispatcher is ACTIVELY polling a run that is stuck: the most
-    recent dispatcher-log line is a 'Verdicts: 0/N (elapsed: Y)' with Y past threshold,
-    the log is fresh (dispatcher still polling, not moved on / between runs), AND no
-    gate-reviewer session is active. Keying on the LIVE poll (not a marker label) means a
-    stranded 'gate-status:dispatching' marker — e.g. left by a killed dispatcher during
-    maintenance — does NOT false-fire. A slow-but-working run (reviewers still active) is
-    also not flagged here; the consecutive-TIMEOUT signal covers alive-but-not-delivering."""
+    recent dispatcher-log line is a Phase C 'still in flight (0/N verdicts, Ys/Ts)' with
+    Y past DISPATCH_STUCK_SEC, the log is fresh (dispatcher still polling, not moved on /
+    between runs), AND no gate-reviewer session is active. Keying on the LIVE poll (not a
+    marker label) means a stranded 'gate-status:dispatching' marker — e.g. left by a killed
+    dispatcher during maintenance — does NOT false-fire. A slow-but-working run (reviewers
+    still active) is also not flagged here; the consecutive-TIMEOUT signal covers
+    alive-but-not-delivering.
+
+    ga-iodjh7: deliberately NOT porting the sibling's ga-z0xx1 fix of comparing elapsed
+    against the run's OWN diff-scaled timeout instead of a fixed constant. That fix targeted
+    a different failure — gate_merge_stall() has no corroboration of its own, and its fixed
+    REVIEW_FRESH_SEC (2700s) was simply too small for a run legitimately scaled near the
+    dispatcher's 50min/3000s cap. Here DISPATCH_STUCK_SEC (720s) is deliberately much
+    SHORTER than any run's own timeout (1200-3000s) BY DESIGN — its own comment calls it a
+    "marker dispatching >12min w/ no active reviewers = spawn fail" grace period, not a
+    stand-in for the full per-run budget — and this function already has independent
+    corroboration the sibling lacks (no active gate-reviewer session, below), which already
+    protects a legitimately slow-but-active run without needing a wider elapsed threshold."""
     try:
         if time.time() - os.path.getmtime(DISPATCH_LOG) > 120:
             return False  # dispatcher not actively writing → between runs (ENGINE-STALL covers dead)
@@ -491,13 +517,13 @@ def stuck_dispatching():
     for l in reversed(lines):
         if "sweep complete" in l:   # the most recent run already concluded → not stuck
             return False
-        mm = re.search(r"Verdicts:\s*(\d+)/(\d+)\s*received\s*\(elapsed:\s*(\d+)s\)", l)
+        mm = STUCK_INFLIGHT_RE.search(l)
         if mm:
             vm = mm
             break
     if not vm:
         return False
-    got, elapsed = int(vm.group(1)), int(vm.group(3))
+    got, elapsed = int(vm.group(1)), int(vm.group(2))
     if not (got == 0 and elapsed > DISPATCH_STUCK_SEC):
         return False
     # corroborate: reviewers spawned for this run are NOT active (dead/start-pending)
