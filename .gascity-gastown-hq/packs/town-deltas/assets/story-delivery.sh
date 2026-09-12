@@ -1841,9 +1841,47 @@ elif [ ! -f "$REFRESH_HELPER" ]; then
 else
   SENSITIVE_DAEMONS=$(get_runbook_field "$RIG" "sensitive_daemons" 2>/dev/null | tr '\n' ' ' || echo "")
   EXTRA_RUNTIME_ROOTS=$(get_runbook_field "$RIG" "extra_runtime_roots" 2>/dev/null | tr '\n' ' ' || echo "")
-  log "Daemon refresh: pre=$PRE_DEPLOY_SHA post=$POST_DEPLOY_SHA sensitive='$SENSITIVE_DAEMONS' extra_roots='$EXTRA_RUNTIME_ROOTS' ..."
+  # ga-gokm6: for a self-repo rig (runtime_dir == git_repo, e.g.
+  # whatsapp_automation), something OTHER than this loop iteration — a crew
+  # session's own post-merge fast-forward, or a sibling story's delivery
+  # earlier in the same sweep — can advance RUNTIME_DIR's HEAD past this
+  # story's merge commit before PRE_DEPLOY_SHA was captured above, so the
+  # pull just ran is a true no-op ("Already up to date") and
+  # PRE_DEPLOY_SHA==POST_DEPLOY_SHA. That is a real fact about THIS pull, but
+  # it is NOT the same claim as "every live daemon has been checked against
+  # everything that landed" — daemon-refresh.sh's Step 1 cannot tell the two
+  # apart and short-circuits to VERDICT=SKIPPED/PROOF=not_applicable without
+  # ever running discovery, silently skipping the exact protection this step
+  # exists to provide. Confirmed live in story-delivery.log: wa-gqdtk
+  # (2026-09-11T18:05:55Z) and wa-fuveb (2026-09-11T15:47:35Z) both logged
+  # "no SHA delta (X .. X) — deploy changed nothing — skip" while
+  # com.whatsapp.pipedrive-sync (not in this rig's sensitive_daemons list,
+  # but caught by restart_policy.yaml's own "unlisted = manual" default, per
+  # policy_says_sensitive() in daemon-refresh.sh) ran ~2h of pre-merge code
+  # unflagged, requiring a manual restart. Feed the helper the delta since
+  # the last sha it actually got a chance to examine (see
+  # daemon_refresh_baseline_file() above and the marker write below) instead
+  # of since this iteration's own possibly-already-caught-up pre-pull HEAD.
+  # A missing/unreadable marker, or one that is not an ancestor of
+  # POST_DEPLOY_SHA (first run for this rig, or a rebase/reset), falls back
+  # to today's PRE_DEPLOY_SHA unchanged — pure no-op in both cases.
+  # (Inlined rather than a helper function: this whole Step 5b block is
+  # extracted verbatim and eval'd standalone by
+  # tests/story-delivery-step5b.test.sh — a function defined elsewhere in
+  # this file would not exist in that context.)
+  DAEMON_REFRESH_PRE_SHA="$PRE_DEPLOY_SHA"
+  DAEMON_REFRESH_BASELINE_DIR="$GC_CITY/.gc/runtime/daemon-refresh-baseline"
+  mkdir -p "$DAEMON_REFRESH_BASELINE_DIR" 2>/dev/null || true
+  DAEMON_REFRESH_BASELINE_FILE="$DAEMON_REFRESH_BASELINE_DIR/$RIG.sha"
+  DAEMON_REFRESH_BASELINE_SHA="$(cat "$DAEMON_REFRESH_BASELINE_FILE" 2>/dev/null || echo "")"
+  if [ -n "$DAEMON_REFRESH_BASELINE_SHA" ] \
+     && git -C "$RUNTIME_DIR" cat-file -e "${DAEMON_REFRESH_BASELINE_SHA}^{commit}" 2>/dev/null \
+     && git -C "$RUNTIME_DIR" merge-base --is-ancestor "$DAEMON_REFRESH_BASELINE_SHA" "$POST_DEPLOY_SHA" 2>/dev/null; then
+    DAEMON_REFRESH_PRE_SHA="$DAEMON_REFRESH_BASELINE_SHA"
+  fi
+  log "Daemon refresh: pre=$DAEMON_REFRESH_PRE_SHA post=$POST_DEPLOY_SHA (this-pull-pre=$PRE_DEPLOY_SHA) sensitive='$SENSITIVE_DAEMONS' extra_roots='$EXTRA_RUNTIME_ROOTS' ..."
   REFRESH_OUT=$(RUNTIME_DIR="$RUNTIME_DIR" \
-    PRE_DEPLOY_SHA="$PRE_DEPLOY_SHA" POST_DEPLOY_SHA="$POST_DEPLOY_SHA" \
+    PRE_DEPLOY_SHA="$DAEMON_REFRESH_PRE_SHA" POST_DEPLOY_SHA="$POST_DEPLOY_SHA" \
     DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
     EXTRA_RUNTIME_ROOTS="$EXTRA_RUNTIME_ROOTS" \
     DRY_RUN="$DRY_RUN" \
@@ -1869,6 +1907,17 @@ else
     OK|SKIPPED)
       if [ -n "${REFRESH_RESTARTED// /}" ]; then
         log "Refreshed + verified live: $REFRESH_RESTARTED"
+      fi
+      # ga-gokm6: this deploy's code is now confirmed examined (checked-and-
+      # clean, or genuinely nothing changed since the LAST marker — never
+      # "this iteration's own pull happened to be a no-op"). Advance the
+      # per-rig marker so the NEXT sweep's baseline starts here, not at
+      # whatever this iteration's own pre-pull HEAD was. Skip on DRY_RUN
+      # (no side effects) and when POST_DEPLOY_SHA is unknown (non-git
+      # runtime — nothing to persist).
+      if [ "$DRY_RUN" != "1" ] && [ -n "$POST_DEPLOY_SHA" ]; then
+        printf '%s\n' "$POST_DEPLOY_SHA" > "$DAEMON_REFRESH_BASELINE_FILE" 2>/dev/null \
+          || warn "could not persist daemon-refresh baseline for rig $RIG at $DAEMON_REFRESH_BASELINE_FILE (non-fatal; next sweep falls back to its own pre-pull HEAD)"
       fi
       ;;
     *)
