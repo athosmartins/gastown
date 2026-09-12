@@ -672,6 +672,47 @@ else
   bad "flock: com o lock já detido por outro processo, o script deveria sair imediatamente sem mutar nada" "$OUT"
 fi
 
+# ── ga-18uhg0 (Mayor triage, Opção B): pilot:reclaim-count:escalated-at-*
+# pula R1-R4 incondicionalmente, mesmo no caso mais óbvio de R1 (sem
+# branch, sem commit) ───────────────────────────────────────────────────
+# R1 e a escalação de reclaim-cap leem a MESMA evidência ("sem branch,
+# sem commit") de jeitos OPOSTOS: R1 vê trava órfã e solta; a escalação
+# viu isso como o motivo de chamar um humano. Sem a checagem, R1
+# desfazia a escalação bem no bead em que ela mais importa. Caso real
+# medido: wa-v6k32 (12/09, ~02:13–07:36) — 4x despachado, 0 commits,
+# reclaim-cap esgotado às 06:09, R1 destravou às 06:21 sem nenhum humano
+# olhar, Pilot reabriu o ciclo às 07:36.
+setup wa-v6k32 '["gate:needs-human","pilot:reclaim-count:escalated-at-3"]' '' '' ''
+OUT="$(run)"
+if printf '%s' "$OUT" | grep -q "R5 wa-v6k32" \
+   && ! printf '%s' "$OUT" | grep -qE "R[1-4] wa-v6k32" \
+   && [ ! -s "$TMP/fx.wa-v6k32/removed.log" ]; then
+  ok "ga-18uhg0: reclaim-cap esgotado + sem branch/commit → força R5 (chamar humano), não R1 (trava órfã) — wa-v6k32 ao vivo"
+else
+  bad "ga-18uhg0: um bead com reclaim-cap esgotado e sem branch deveria escalar (R5), não ser lido como trava órfã e destravado (R1) — reabre o ciclo despacho↔reclaim↔escalação" \
+    "OUT=$OUT REMOVED=$(cat "$TMP/fx.wa-v6k32/removed.log" 2>/dev/null)"
+fi
+
+# ── ga-18uhg0: o mesmo guard vence mesmo quando decide() teria dado R3
+# (trabalho delimitado) — prova que é "R1-R4 incondicionalmente", não só
+# um desvio do caso R1 sem-branch ───────────────────────────────────────
+# Mesma fixture do teste R3 (wa-uknuq) acima — branch com trabalho único
+# real + veredito nomeando um arquivo — mas com o label de reclaim-cap
+# escalado também presente. Sem o guard, decide() chegaria em R3 (não
+# R1); com o guard, nem R3 pode decidir por este bead.
+setup wa-reclaimr3 '["gate:needs-human","pilot:reclaim-count:escalated-at-2","gate-sha-failed:a:code"]' \
+  'origin/crew/mila/wa-reclaimr3-r3' '+ eaf78abb' '1700000000' \
+  '[{"created_at":"2026-08-15T10:00:00Z","text":"VERDICT: FAIL tests/test_pregao.py precisa da chave nova"}]'
+OUT="$(run)"
+if printf '%s' "$OUT" | grep -q "R5 wa-reclaimr3" \
+   && ! printf '%s' "$OUT" | grep -qE "R[1-4] wa-reclaimr3" \
+   && [ ! -s "$TMP/fx.wa-reclaimr3/removed.log" ]; then
+  ok "ga-18uhg0: reclaim-cap escalado vence mesmo quando branch+veredito dariam R3 — nenhuma de R1-R4 decide por este bead"
+else
+  bad "ga-18uhg0: mesmo com branch e veredito nomeando arquivo (que normalmente dá R3), um bead com reclaim-cap escalado deveria forçar R5, não R3" \
+    "OUT=$OUT REMOVED=$(cat "$TMP/fx.wa-reclaimr3/removed.log" 2>/dev/null)"
+fi
+
 # ── kill switch ────────────────────────────────────────────────────────
 setup ga-off '["gate:needs-human"]' '' '' ''
 OUT="$(GATE_AUTO_UNBLOCK_ENABLED=0 GC_CITY_PATH="$TMP" WA_RIG="$TMP" PS_RIG="$TMP" \

@@ -98,6 +98,32 @@
 # :product, decidir no lugar do Athos).
 #
 # ────────────────────────────────────────────────────────────────────
+# ⚠️ UM OITAVO ESTADO, ORTOGONAL às sete variantes acima (ga-18uhg0,
+# 2026-09-12): pilot:reclaim-count:escalated-at-N (ga-egd5av) NÃO é uma
+# variante de gate:needs-human — é um label PILOT separado que pode
+# coexistir com o genérico. R1 ("sem branch e sem commit ⇒ trava órfã,
+# solta") e a escalação de reclaim-cap tiram conclusões OPOSTAS da
+# MESMA evidência: pra R1, "nada construído" prova que não há o que
+# revisar; pra quem escalou, "N despachos e nada construído" é
+# EXATAMENTE o motivo de chamar um humano. Sem saber disso, R1 desfazia
+# a escalação nos beads em que ela mais importa — medido ao vivo em
+# wa-v6k32 (12/09): reclaim-cap esgotado às 06:09, AUTO-DESTRAVE limpou
+# gate:needs-human às 06:21 achando "trava órfã", e o Pilot reabriu o
+# ciclo despacho→reclaim→escalação→auto-limpeza (4 beads pegos na
+# mesma forma: wa-v6k32, wa-xj2bt, wa-kvvmw, wa-refty).
+#
+# Decisão do Mayor (triagem ga-18uhg0): Opção B, patch aditivo — ver
+# has_reclaim_escalation() abaixo. Nenhum label existente muda (nem o
+# que inflight-reclaim-guard.py escreve, nem UNBLOCKABLE_VARIANTS); só
+# ensina este script a reconhecer a forma e SEMPRE cair em R5 (chamar
+# humano), que é exatamente o que ga-stu930 já queria como exceção
+# rara. Rejeitada a alternativa de trocar a string do label
+# (gate:needs-human:reclaim-exhausted): mudar o LITERAL arrisca tornar
+# beads escalados invisíveis a qualquer consumidor que já filtre
+# gate:needs-human por igualdade exata — silêncio é o modo de falha
+# pior que um loop de despacho ruidoso.
+#
+# ────────────────────────────────────────────────────────────────────
 # ARMADILHAS MEDIDAS que este script evita POR CONSTRUÇÃO. Todas me
 # pegaram em 2026-08-15; cada uma tem cenário no selftest:
 #
@@ -322,6 +348,23 @@ has_protected_variant() {
     [ -n "$v" ] || continue
     case "$v" in gate:needs-human*) : ;; *) continue ;; esac
     is_unblockable "$v" || return 0
+  done <<< "$1"
+  return 1
+}
+
+# has_reclaim_escalation <labels-multilinha> → 0 se QUALQUER label
+# presente casa o prefixo pilot:reclaim-count:escalated-at- (ga-egd5av).
+# Ortogonal a has_protected_variant() acima: não olha a família
+# gate:needs-human*, olha um label PILOT que pode coexistir com o
+# gate:needs-human genérico. Ver bloco "UM OITAVO ESTADO" no topo do
+# arquivo pro porquê (ga-18uhg0, triagem do Mayor, Opção B) — main()
+# usa isto pra pular decide() (e portanto R1-R4) incondicionalmente
+# para este bead, forçando sempre R5.
+has_reclaim_escalation() {
+  local v
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    case "$v" in pilot:reclaim-count:escalated-at-*) return 0 ;; esac
   done <<< "$1"
   return 1
 }
@@ -635,7 +678,18 @@ main() {
         say "SKIP $id — carrega variante protegida (NAO TOCA) entre as labels gate:needs-human* presentes (pode coexistir com uma unblockable, ex. '$variant' — armadilha E); nenhuma label é tocada"
         continue
       fi
-      IFS='|' read -r rule why <<< "$(decide "$rig" "$id" "$labels")"
+      if has_reclaim_escalation "$labels"; then
+        # ga-18uhg0 (triagem do Mayor, Opção B): pula decide() de propósito —
+        # R1-R4 tirariam conclusão OPOSTA da MESMA evidência "sem branch/
+        # commit" que já escalou este bead (ga-egd5av). Nenhuma das quatro
+        # pode decidir por ele; força sempre R5 (chamar humano), reusando o
+        # MESMO cooldown/dedup do bloco R5 abaixo — isto não é uma escalação
+        # nova, é a mesma trava, então também não deve virar spam.
+        rule="R5"
+        why="bead carrega pilot:reclaim-count:escalated-at-* (reclaim-cap esgotado, ga-egd5av) — R1-R4 pulados incondicionalmente: a mesma evidência 'sem branch/commit' que R1-R4 leriam já é o motivo pelo qual isto foi escalado, não uma trava órfã (triagem ga-18uhg0)"
+      else
+        IFS='|' read -r rule why <<< "$(decide "$rig" "$id" "$labels")"
+      fi
       case "$rule" in
         R1)
           if apply_and_report "$rig" "$id" "$labels" "R1" "trava órfã — $why" "Labels de gate removidos; bead volta à fila. Nenhum humano precisou olhar."; then
