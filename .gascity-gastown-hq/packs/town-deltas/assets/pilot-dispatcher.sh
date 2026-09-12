@@ -6588,7 +6588,21 @@ _pilot_crew_stale_reclaim() {
     case "$_cs_assignee" in
       gastown.dog|gastown.dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*) continue ;;
     esac
-    _cs_bs="$(_beadid_branch_signal "$_cs_id" "$_cs_row")"
+    # ga-5skqtm: _beadid_branch_signal's OWN contract (its doc comment,
+    # ~L5449-5451) documents exit 1 + empty stdout as the INTENTIONAL "no
+    # branch found anywhere" signal — exactly the case this reclaim exists to
+    # act on. Without `|| true`, that legitimate non-zero exit hits this
+    # bare assignment under this file's `set -euo pipefail` (L74) and aborts
+    # the WHOLE sweep right here, before the `if [ -z "$_cs_bs" ]` below ever
+    # runs — city-wide dispatch outage every time a stale, never-branched
+    # crew bead exists (measured live 2026-09-12, wa-90omi: 3/3 sweeps died).
+    # Same bug class as ga-8w22n's fix a few hundred lines up in this same
+    # file (`_match=$(grep ...) || true`) — that one was missed here because
+    # this call site (Stage 1.5) was added later (ga-c9qj8, 2026-09-10).
+    # `|| true` only neutralizes the exit code; $_cs_bs is unaffected either
+    # way (empty on "no branch", exit 1 or not) — see
+    # pilot-dispatcher.crew-stale-reclaim-no-branch.selftest.sh AC1/AC2.
+    _cs_bs="$(_beadid_branch_signal "$_cs_id" "$_cs_row")" || true
     if [ -z "$_cs_bs" ]; then
       warn "ga-c9qj8: reclaiming stale in-flight $_cs_id — crew assignee '$_cs_assignee' untouched > ${PILOT_STUCK_INFLIGHT_HOURS}h with NO crew/fix branch found anywhere (never engaged). Unassigning + clearing story:in-flight so it returns to the pool instead of staying wedged (set PILOT_CREW_STALE_RECLAIM=0 to disable)."
       bd -C "$_cs_city" label  remove "$_cs_id" "story:in-flight"   -q 2>/dev/null || true
