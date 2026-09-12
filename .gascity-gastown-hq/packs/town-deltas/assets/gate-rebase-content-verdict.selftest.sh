@@ -110,13 +110,46 @@ case "$LOST" in
   *) bad "rebase_content_lost_paths nao nomeou novo.txt (deu: '$LOST')" ;;
 esac
 
-# Teste 3 — TERCEIRO ESTADO: sem base de comparacao NAO pode virar "yes".
+# Teste 3 — TERCEIRO ESTADO: sem base de comparacao NAO pode virar "yes". A
+# partir de ga-pgxs78 cada "unknown" carrega QUAL das 5 condicoes disparou —
+# ver o header do proprio rebase_content_verdict() para a lista completa.
 V3=$( . "$TMP/block.sh"; rebase_content_verdict "$R" "$MAIN" "$FEAT" "" )
-[ "$V3" = "unknown" ] && ok "new_tip vazio => unknown (nunca yes)" \
-                      || bad "faltando new_tip deveria dar unknown, deu '$V3'"
+[ "$V3" = "unknown:empty-arg" ] && ok "new_tip vazio => unknown:empty-arg (nunca yes)" \
+                      || bad "faltando new_tip deveria dar unknown:empty-arg, deu '$V3'"
 V3b=$( . "$TMP/block.sh"; rebase_content_verdict "$R" "$MAIN" "$FEAT" "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" )
-[ "$V3b" = "unknown" ] && ok "new_tip inexistente => unknown (nunca yes)" \
-                       || bad "new_tip invalido deveria dar unknown, deu '$V3b'"
+[ "$V3b" = "unknown:bad-actual-sha" ] && ok "new_tip inexistente => unknown:bad-actual-sha (nunca yes)" \
+                       || bad "new_tip invalido deveria dar unknown:bad-actual-sha, deu '$V3b'"
+
+# Teste 3c (ga-pgxs78) — <worktree> inexistente: rebase_wt_git_dir() nao
+# resolve o git-dir compartilhado => unknown:no-gitdir. Este e o suspeito
+# PRINCIPAL apontado pelo incidente real (ga-is6hxl/ga-3y7rxw) — uma
+# bisecao textual das 5 condicoes so vale alguma coisa se cada uma tiver
+# um teste que realmente a alcanca, nao so as 2 que ja tinham cobertura.
+V3c=$( . "$TMP/block.sh"; rebase_content_verdict "$TMP/nao-existe-mesmo" "$MAIN" "$FEAT" "$FEAT" )
+[ "$V3c" = "unknown:no-gitdir" ] && ok "worktree inexistente => unknown:no-gitdir (suspeito principal do incidente real)" \
+                                 || bad "worktree inexistente deveria dar unknown:no-gitdir, deu '$V3c'"
+
+# Teste 3d (ga-pgxs78) — merge-tree(main_ref, orig_tip) CONFLITA de verdade
+# (rc!=0) => unknown:merge-tree-conflict. Repo separado: main e orig_tip
+# editam a MESMA linha do MESMO arquivo a partir da mesma base — um
+# conflito genuino, nao o shape sintetico do incidente (que o autor do bug
+# ja mediu NAO ser a causa aqui, mas o guard ainda precisa acertar quando
+# for).
+RC="$TMP/repo-conflict"; mkdir -p "$RC"; git -C "$RC" init -q
+git -C "$RC" config user.email t@t; git -C "$RC" config user.name T
+echo base > "$RC/x.txt"
+git -C "$RC" add -A; git -C "$RC" commit -qm base
+git -C "$RC" branch -M cmain
+git -C "$RC" checkout -q -b cbranch
+echo branch-version > "$RC/x.txt"
+git -C "$RC" add -A; git -C "$RC" commit -qm "branch: conflicting edit"
+git -C "$RC" checkout -q cmain
+echo main-version > "$RC/x.txt"
+git -C "$RC" add -A; git -C "$RC" commit -qm "main: conflicting edit"
+CMAIN=$(git -C "$RC" rev-parse cmain); CBRANCH=$(git -C "$RC" rev-parse cbranch)
+V3d=$( . "$TMP/block.sh"; rebase_content_verdict "$RC" "$CMAIN" "$CBRANCH" "$CBRANCH" )
+[ "$V3d" = "unknown:merge-tree-conflict" ] && ok "merge-tree(main,orig_tip) conflita de verdade => unknown:merge-tree-conflict" \
+                                            || bad "conflito real deveria dar unknown:merge-tree-conflict, deu '$V3d'"
 
 # Teste 4 — MUTACAO: se a comparacao nao comparar, o Teste 2 tem de ficar
 # vermelho. Sem isto, os testes acima poderiam passar por acidente.

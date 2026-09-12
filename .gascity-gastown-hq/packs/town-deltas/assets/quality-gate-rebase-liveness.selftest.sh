@@ -807,9 +807,9 @@ echo "── 13c. drift-guard: the pool intercept is wired in AND positioned bef
 grep -qF 'REBASE_AUTHOR_IS_POOL=$(rebase_author_is_pool "$REBASE_AUTHOR")' "$DISPATCHER" \
   && ok "REBASE_AUTHOR_IS_POOL is actually computed at the call site (fix wired in, not just defined)" \
   || bad "REBASE_AUTHOR_IS_POOL computation missing — rebase_author_is_pool() defined but never called"
-grep -qF 'if [ "$REBASE_AUTHOR_IS_POOL" = "1" ]; then' "$DISPATCHER" \
-  && ok "dispatcher branches on REBASE_AUTHOR_IS_POOL" \
-  || bad "REBASE_AUTHOR_IS_POOL branch missing"
+grep -qF 'if [ "$REBASE_AUTHOR_IS_POOL" = "1" ] && [ "$CONFLICT_KIND" != "transient" ]; then' "$DISPATCHER" \
+  && ok "dispatcher branches on REBASE_AUTHOR_IS_POOL (narrowed by ga-pgxs78 to exclude CONFLICT_KIND=transient — see 13f below)" \
+  || bad "REBASE_AUTHOR_IS_POOL branch missing or narrowed differently than expected"
 
 _POOL_INTERCEPT_LN=$(grep -n 'REBASE_AUTHOR_IS_POOL=\$(rebase_author_is_pool "\$REBASE_AUTHOR")' "$DISPATCHER" | head -1 | cut -d: -f1)
 _AHEAD_DEAD_LN=$(grep -n '_ACB_AHEAD=\$(gate_circuit_break_check "ahead_dead"' "$DISPATCHER" | head -1 | cut -d: -f1)
@@ -863,6 +863,66 @@ eq "a real crew author ('oracle-wa') is not pool — REBASE_AUTHOR_ALIVE still d
 eq "gate_behind_envelope_action is UNCHANGED for a genuinely dead named author (rebase_author_is_pool only adds an earlier intercept, never edits this pure function)" \
   "$(gate_behind_envelope_action "1" "0")" \
   "circuit_break"
+
+echo "── 13f. ga-pgxs78: the pool intercept must NOT swallow a TRANSIENT failure — that population already has a faster, tested retry/circuit-break path a few hundred lines below (queued retry -> retry_dead circuit-break) ──"
+# ga-pgxs78 (2026-09-12): two real markers (ga-is6hxl, ga-3y7rxw) hit
+# rebase_content_verdict()="unknown" (an explicit could-not-verify third
+# state, NEVER a confirmed "no") on branches later proven perfectly healthy.
+# Because this check used to fire on authorship ALONE, and every
+# whatsapp_automation branch author is pool/ephemeral, the failure being
+# TRANSIENT (not a genuine conflict) made no difference — both got bounced
+# straight to gate-status:needs-rebase (TERMINAL, Step 0b never re-selects
+# it, per test 13c above). Both real incidents needed a HUMAN (Mayor) to
+# manually re-anchor. Fix: exclude CONFLICT_KIND="transient" from this
+# intercept so that population falls through to the existing dead-author
+# transient-retry machinery instead — which already exists precisely BECAUSE
+# rebase_author_is_pool()'s own population can never satisfy
+# author_is_alive() (13b/AC1 above).
+#
+# Extract the REAL if-line from the dispatcher (never hand-copy it — a
+# hand-copied string could silently drift from the actual guarded code) and
+# eval it under controlled env vars, same discipline as 13c/13d above.
+_TZ0OP_IF_LINE=$(grep -oE 'if \[ "\$REBASE_AUTHOR_IS_POOL" = "1" \].*then' "$DISPATCHER" | head -1)
+if [ -z "$_TZ0OP_IF_LINE" ]; then
+  bad "ga-pgxs78: could not extract the pool-intercept if-line for dynamic verification (pattern renamed?)"
+else
+  _CK_MERGE=$(REBASE_AUTHOR_IS_POOL=1 CONFLICT_KIND=merge sh -c "$_TZ0OP_IF_LINE echo intercepted; else echo fell_through; fi")
+  eq "ga-pgxs78: pool author + GENUINE conflict (CONFLICT_KIND=merge) still takes the pool-return path — the narrowing is one-sided, not a blanket disable" \
+    "$_CK_MERGE" \
+    "intercepted"
+  _CK_TRANSIENT=$(REBASE_AUTHOR_IS_POOL=1 CONFLICT_KIND=transient sh -c "$_TZ0OP_IF_LINE echo intercepted; else echo fell_through; fi")
+  eq "ga-pgxs78: pool author + TRANSIENT failure (CONFLICT_KIND=transient) now falls through instead of bouncing to needs-rebase" \
+    "$_CK_TRANSIENT" \
+    "fell_through"
+  _CK_LEGACY=$(REBASE_AUTHOR_IS_POOL=1 CONFLICT_KIND= sh -c "$_TZ0OP_IF_LINE echo intercepted; else echo fell_through; fi")
+  eq "ga-pgxs78: pool author + legacy/unset CONFLICT_KIND (empty string) is UNAFFECTED by the narrowing — only the transient case was ever misrouted" \
+    "$_CK_LEGACY" \
+    "intercepted"
+  _CK_NOTPOOL=$(REBASE_AUTHOR_IS_POOL=0 CONFLICT_KIND=transient sh -c "$_TZ0OP_IF_LINE echo intercepted; else echo fell_through; fi")
+  eq "ga-pgxs78: a non-pool author + transient was ALREADY falling through before this fix (never reached this intercept) — unaffected" \
+    "$_CK_NOTPOOL" \
+    "fell_through"
+fi
+
+# The fallthrough destination must actually exist, be BELOW this intercept,
+# and be the specific dead-author transient-retry branch (not some other
+# unrelated path) — a drift-guard against the fix's real payoff silently
+# disappearing in a future refactor.
+_TZ0OP_LN=$(grep -n 'if \[ "\$REBASE_AUTHOR_IS_POOL" = "1" \] && \[ "\$CONFLICT_KIND" != "transient" \]; then' "$DISPATCHER" | head -1 | cut -d: -f1)
+_DEAD_TRANSIENT_LN=$(grep -n 'Dead/empty author + TRANSIENT auto-rebase failure' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$_TZ0OP_LN" ] && [ -n "$_DEAD_TRANSIENT_LN" ] && [ "$_TZ0OP_LN" -lt "$_DEAD_TRANSIENT_LN" ]; then
+  ok "ga-pgxs78: the narrowed pool intercept (line $_TZ0OP_LN) sits BEFORE the dead-author transient-retry branch (line $_DEAD_TRANSIENT_LN) it falls through to"
+else
+  bad "ga-pgxs78: fallthrough destination missing or out of order (intercept=$_TZ0OP_LN dead-transient-retry=$_DEAD_TRANSIENT_LN) — excluding transient here would strand it instead of routing it somewhere better"
+fi
+if [ -n "$_DEAD_TRANSIENT_LN" ]; then
+  _FALLTHROUGH_EXCERPT=$(sed -n "${_DEAD_TRANSIENT_LN},$((_DEAD_TRANSIENT_LN + 40))p" "$DISPATCHER")
+  if printf '%s\n' "$_FALLTHROUGH_EXCERPT" | grep -qF 'set_gate_status "$MARKER_ID" "queued"'; then
+    ok "ga-pgxs78: the fallthrough destination retries via gate-status:queued (the dispatcher's OWN fast Step 0b selection), not a slower cross-daemon path"
+  else
+    bad "ga-pgxs78: expected gate-status:queued retry wiring not found within 40 lines of the fallthrough destination — the payoff (faster retry) may have moved or disappeared"
+  fi
+fi
 
 # ── 14. ga-ivzbuz: behind-envelope circuit-break has an unreachable ceiling on
 #    a high-velocity rig, and treats a normally-exited ad-hoc worker's dead

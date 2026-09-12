@@ -3814,32 +3814,53 @@ rebase_wt_git_dir() {
 }
 
 # rebase_content_verdict <worktree> <main_ref> <orig_tip> <new_tip>
-#   yes     — a arvore do rebase bate com a do merge 3-way: nada se perdeu
-#   no      — DIFEREM: o rebase perdeu ou alterou conteudo; NAO empurrar
-#   unknown — nao deu pra comparar (merge-tree conflitou/falhou, ou o
-#             git-dir compartilhado de <worktree> nao pode ser resolvido).
-#             Terceiro estado explicito: quem chama trata como "nao
-#             verificado", nunca como "verificado ok".
+#   yes           — a arvore do rebase bate com a do merge 3-way: nada se perdeu
+#   no            — DIFEREM: o rebase perdeu ou alterou conteudo; NAO empurrar
+#   unknown:*     — nao deu pra comparar. Terceiro estado explicito: quem chama
+#                   trata como "nao verificado", nunca como "verificado ok"
+#                   (todo comparador no dispatcher testa "= yes"/"!= yes",
+#                   nunca a string exata "unknown" — o sufixo e livre de
+#                   quebrar callers, ver ga-pgxs78). Sufixos possiveis, na
+#                   ordem em que sao checados:
+#                     :empty-arg           — algum argumento posicional vazio
+#                     :no-gitdir           — rebase_wt_git_dir(<worktree>) nao
+#                                             resolveu o git-dir compartilhado
+#                     :merge-tree-conflict — merge-tree(main_ref, orig_tip)
+#                                             conflitou ou falhou (rc!=0)
+#                     :bad-expected-sha    — merge-tree nao devolveu 40 hex
+#                     :bad-actual-sha      — new_tip nao resolveu pra um
+#                                             objeto arvore de 40 hex valido
 rebase_content_verdict() {
   local wt="$1" main_ref="$2" orig_tip="$3" new_tip="$4"
+  # ga-pgxs78: every "unknown" now carries WHICH of the 5 could-not-verify
+  # conditions fired (":empty-arg" / ":no-gitdir" / ":merge-tree-conflict" /
+  # ":bad-expected-sha" / ":bad-actual-sha"). Every caller only ever compares
+  # against the literal "yes" (`[ "$X" = "yes" ]` / `!= "yes"`), so this is
+  # purely additive — costs nothing to any existing check (verified: grepped
+  # every consumer of *_CONTENT/*_VERDICT in this file, all compare against
+  # "yes", none against a bare "unknown"). Motivating incident: two live
+  # markers (ga-is6hxl, ga-3y7rxw, 2026-09-12) hit "unknown" with an EMPTY
+  # Diverging-paths list on branches later proven perfectly healthy, and
+  # bisecting which of the 5 conditions fired cost a from-scratch
+  # investigation because nothing recorded it. Next time, it will.
   if [ -z "$wt" ] || [ -z "$main_ref" ] || [ -z "$orig_tip" ] || [ -z "$new_tip" ]; then
-    echo "unknown"; return 0
+    echo "unknown:empty-arg"; return 0
   fi
   # ga-slrz7: resolve the shared git-dir once and use it for BOTH sides of
   # the comparison — see rebase_wt_git_dir() above for why `-C "$wt"` alone
   # is not trustworthy here.
   local gd; gd=$(rebase_wt_git_dir "$wt")
-  if [ -z "$gd" ]; then echo "unknown"; return 0; fi
+  if [ -z "$gd" ]; then echo "unknown:no-gitdir"; return 0; fi
   local out rc expected actual
   out=$(git --git-dir="$gd" merge-tree --write-tree "$main_ref" "$orig_tip" 2>/dev/null); rc=$?
   # rc!=0 = conflito (merge-tree AINDA imprime uma arvore na linha 1, entao o
   # rc e a unica leitura honesta). Sem base de comparacao -> unknown.
-  if [ "$rc" -ne 0 ]; then echo "unknown"; return 0; fi
+  if [ "$rc" -ne 0 ]; then echo "unknown:merge-tree-conflict"; return 0; fi
   expected=$(printf '%s\n' "$out" | head -1)
   case "$expected" in
-    *[!0-9a-f]*|"") echo "unknown"; return 0 ;;
+    *[!0-9a-f]*|"") echo "unknown:bad-expected-sha"; return 0 ;;
   esac
-  if [ "${#expected}" -ne 40 ]; then echo "unknown"; return 0; fi
+  if [ "${#expected}" -ne 40 ]; then echo "unknown:bad-expected-sha"; return 0; fi
   actual=$(git --git-dir="$gd" rev-parse "${new_tip}^{tree}" 2>/dev/null || echo "")
   # `git rev-parse <ref-invalida>` FALHA e ainda assim ecoa a string recebida no
   # stdout — o `|| echo ""` nao salva, e um new_tip inexistente viraria um SHA
@@ -3848,25 +3869,34 @@ rebase_content_verdict() {
   # mesma familia de bug que este guard existe pra pegar — achado pelo Teste 3
   # do proprio selftest. Exigir 40 hex e o que separa os dois.
   case "$actual" in
-    *[!0-9a-f]*|"") echo "unknown"; return 0 ;;
+    *[!0-9a-f]*|"") echo "unknown:bad-actual-sha"; return 0 ;;
   esac
-  if [ "${#actual}" -ne 40 ]; then echo "unknown"; return 0; fi
+  if [ "${#actual}" -ne 40 ]; then echo "unknown:bad-actual-sha"; return 0; fi
   if [ "$expected" = "$actual" ]; then echo "yes"; else echo "no"; fi
 }
 
 # rebase_content_lost_paths <worktree> <main_ref> <orig_tip> <new_tip> — lista
 # os paths em que as duas arvores divergem, so pra mensagem de erro ser
 # acionavel ("perdeu docs/data_dictionary.md") em vez de generica.
+#
+# ga-pgxs78: on each of the same could-not-compute conditions
+# rebase_content_verdict() tags above, this now echoes a bracketed reason
+# instead of pure silence. Measured incident: "unknown" + an EMPTY paths list
+# read as "computed, zero paths differ" when it actually meant "could not
+# compute at all" — the two were indistinguishable at the call site's
+# "Diverging paths: <none captured>" fallback. Every one of the 10 call sites
+# only ever interpolates this output into a free-text log/comment string
+# (never an exact-match), so this is additive, not a contract change.
 rebase_content_lost_paths() {
   local wt="$1" main_ref="$2" orig_tip="$3" new_tip="$4"
   local gd; gd=$(rebase_wt_git_dir "$wt")
-  [ -z "$gd" ] && return 0
+  [ -z "$gd" ] && { echo "<could not compute: no-gitdir>"; return 0; }
   local out rc expected actual
   out=$(git --git-dir="$gd" merge-tree --write-tree "$main_ref" "$orig_tip" 2>/dev/null); rc=$?
-  [ "$rc" -ne 0 ] && return 0
+  [ "$rc" -ne 0 ] && { echo "<could not compute: merge-tree-conflict>"; return 0; }
   expected=$(printf '%s\n' "$out" | head -1)
   actual=$(git --git-dir="$gd" rev-parse "${new_tip}^{tree}" 2>/dev/null || echo "")
-  [ -z "$expected" ] || [ -z "$actual" ] && return 0
+  { [ -z "$expected" ] || [ -z "$actual" ]; } && { echo "<could not compute: bad-sha>"; return 0; }
   git --git-dir="$gd" diff --name-only "$actual" "$expected" 2>/dev/null | head -20
 }
 # SELFTEST-EXTRACT gate-rebase-content-verdict: END
@@ -10326,7 +10356,37 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     # transient plumbing) triggered this rebase-liveness sweep — they all
     # share the same root mistake for a pool-origin author.
     REBASE_AUTHOR_IS_POOL=$(rebase_author_is_pool "$REBASE_AUTHOR")
-    if [ "$REBASE_AUTHOR_IS_POOL" = "1" ]; then
+    # ga-pgxs78 (2026-09-12): narrowed from unconditional. Two real markers
+    # (ga-is6hxl, ga-3y7rxw) hit rebase_content_verdict()="unknown" — an
+    # explicit could-not-verify third state, NEVER a confirmed "no" (see
+    # rebase_content_verdict() above) — on branches later proven perfectly
+    # healthy. Because this check used to fire on authorship ALONE, and every
+    # whatsapp_automation branch author is pool/ephemeral (wa-worker-adhoc-*,
+    # ALWAYS reads as pool per rebase_author_is_pool()'s header — see line
+    # ~2683 above), a plain TRANSIENT plumbing hiccup (content/commit-verdict
+    # guard, captured push error, envelope skip, held mutex — every
+    # CONFLICT_KIND="transient" site above) was indistinguishable from a
+    # genuine conflict: both got bounced straight to gate-status:needs-rebase
+    # — TERMINAL, excluded from Step 0b's selection, nothing ever re-checks
+    # it. Both real incidents needed a HUMAN (Mayor) to manually re-anchor
+    # because the pool-return path could not win the race against main
+    # continuing to advance on its own.
+    #
+    # Excluding CONFLICT_KIND="transient" here does NOT strand these
+    # branches: rebase_author_is_pool()'s own population can never satisfy
+    # author_is_alive() (see line ~2683), so excluded here they fall straight
+    # through to the EXISTING "Dead/empty author + TRANSIENT auto-rebase
+    # failure" branch a few hundred lines below — already shipping bounded
+    # gate-status:queued retries (MAX_REBASE_ATTEMPTS, tier5 exile) on the
+    # dispatcher's own ~3min sweep cadence, then a proper retry_dead
+    # circuit-break (gate:needs-human armed, bead assignee/story:in-flight/
+    # pilot:dispatched cleared, Mayor mailed) on exhaustion — reusing tested,
+    # already-passing machinery instead of inventing a slower parallel path.
+    # CONFLICT_KIND="merge" (a genuine, deterministic conflict) still takes
+    # THIS block unchanged — ga-tz0op's original "return the whole bead to
+    # pool for a fresh worker" design is correct there; only the transient
+    # case was ever misrouted.
+    if [ "$REBASE_AUTHOR_IS_POOL" = "1" ] && [ "$CONFLICT_KIND" != "transient" ]; then
       warn "Branch $BRANCH: rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity (ga-tz0op) — no fixed instance to wait for or nudge. Returning source bead to the ${RIG:-unknown} pool for a fresh worker instead of circuit-breaking or bouncing to a dead identity."
       set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
       bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED (ga-tz0op): branch $BRANCH needs a rebase, but its resolved rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity (virtual slot label, bare template, or a recycled pool instance) — structurally never a fixed session to wait for or notify (NOT the same as a dead named author; NOT the same as a live one to bounce to). Source bead $BEAD_ID returned to the ${RIG:-unknown} pool for a fresh worker to rebase and resubmit." 2>/dev/null || true
