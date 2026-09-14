@@ -768,6 +768,7 @@ run_capacity() {
     PILOT_MISSING_FILE_GUARD="${PILOT_MISSING_FILE_GUARD:-}" \
     PILOT_HQ_PATH_EXISTS_GUARD="${PILOT_HQ_PATH_EXISTS_GUARD:-}" \
     PILOT_TEST_RIG_HAS_FILE="${PILOT_TEST_RIG_HAS_FILE:-}" \
+    PILOT_SUSPENDED_CREWS_OVERRIDE="${PILOT_SUSPENDED_CREWS_OVERRIDE:-}" \
     PILOT_DOLT_LATENCY_OVERRIDE_MS="$([ "${1:-10}" -gt 200 ] 2>/dev/null && echo 3000 || echo 100)" \
     PILOT_DOLT_CPU_OVERRIDE="${1:-10}" \
     FAKE_INFLIGHT_JSON="${2:-[]}" \
@@ -4457,6 +4458,79 @@ echo "Scenario 18al: drift-guard — the ga-hn3kh basename functions are wired i
 has "$DISPATCHER" 'bead_cited_basenames\(\)'    "bead_cited_basenames() is defined (drift-guard)"
 has "$DISPATCHER" '_rig_has_any_basename\(\)'   "_rig_has_any_basename() is defined (drift-guard)"
 has "$DISPATCHER" 'ga-hn3kh'                    "ga-hn3kh guard comment is wired"
+
+# ── Scenario 18am (ga-gbzxos): suspended _DOM_DEFAULT must hold, never dispatch ──
+# ROOT: ITEM 6 (explicit-assignee path) already excludes a SUSPENDED crew, but
+# branch (2) of the ga-lfvs6 block — the rig-wide DEFAULT builder resolved via
+# rig_domain_default_builder — was only ever checked against BUSY/USED, never
+# against _crew_is_suspended. lx-dnw (a lexbh-store bug with no explicit
+# story.rig) contains "terreno" in its description, so bead_content_rig
+# misclassifies it as property_scrapers (a pre-existing, separate keyword-
+# inference imprecision — see prior-art on ga-gbzxos for that broader
+# discussion); with batista-ps SUSPENDED, the bead looped assigned-but-unbuilt
+# for 8 days (490 dispatch/reclaim cycles) because nothing ever excluded the
+# suspended default. Fixture mirrors the real lx-dnw shape exactly: lx- prefix
+# (so STORY_RIG infers "lexbh" from the prefix, but STORY_RIG_EXPLICIT stays 0
+# since no metadata["story.rig"] is set — the precise precondition that lets
+# content-keyword inference override the bead's own native rig).
+echo "Scenario 18am-1 (ga-gbzxos AC1): lx- bead with 'terreno', batista-ps suspended → HELD, not batista-ps"
+LX_TERRENO='[{"id":"lx-dnwtest","title":"Recorte de data errado no chat sobre quota de terreno por UH","priority":2,"issue_type":"bug","description":"fixture body — quota de terreno por UH conforme lei de uso do solo","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-09-06T12:47:00Z","metadata":{}}]'
+LOG18AM1="$(PILOT_SUSPENDED_CREWS_OVERRIDE="batista-ps" run_capacity 10 "[]" 1 "$LX_TERRENO")"
+B18AM1="$(dispatched_builder "$LOG18AM1")"
+if [ "$B18AM1" = "batista-ps" ]; then
+  bad "REGRESSION (ga-gbzxos): lx- bead dispatched to SUSPENDED batista-ps — the lx-dnw infinite-loop bug"
+elif echo "$B18AM1" | grep -qE '^gastown\.dog'; then
+  bad "lx- bead fell to the dog pool instead of holding (a dog cannot build a lexbh domain task either)"
+elif [ -n "$B18AM1" ]; then
+  bad "lx- bead routed unexpectedly while owning crew suspended (got: '$B18AM1')"
+else
+  ok "lx- bead with suspended domain-default crew HELD (no dispatch to any crew or the dog)"
+fi
+if echo "$LOG18AM1" | grep -qi "SUSPENDED"; then
+  ok "hold was attributed to the crew being suspended (log names the real cause, not a generic unmapped-rig hold)"
+else
+  bad "hold log does not mention SUSPENDED — can't distinguish this from an unrelated unmapped-rig hold"
+fi
+
+echo "Scenario 18am-2 (ga-gbzxos AC2): genuine property_scrapers domain build, batista-ps suspended → HELD, not batista-ps"
+# AC2 in the bead reads "bead ps- com 'terreno'" but a LITERALLY ps-prefixed bead
+# never reaches this code at all: rig_to_builders(property_scrapers)="ps-worker",
+# so a ps- bead's BUILDER_TARGET is ps-worker from the EARLY pool assignment,
+# never gastown.dog — the `case "$BUILDER_TARGET" in gastown.dog|gastown.dog-*)`
+# guard this fix lives in never fires for it (confirmed empirically: a ps-dnwtest
+# fixture dispatched straight to ps-worker, an ephemeral pool identity that is
+# never "suspended" — that would have been a permanently-red, meaningless test).
+# The scenario AC2 actually intends — a genuine property_scrapers DOMAIN build
+# with no idle persistent-crew owner — is exactly Scenario 18a's PS_DOMAIN_SMALL
+# fixture (ga- HQ bead, correctly content-classified as property_scrapers, and
+# already proven above to route to batista-ps when it is NOT suspended). Reusing
+# it here isolates suspension as the ONLY variable between "routes to batista-ps"
+# (18a) and "must NOT route to batista-ps" (here).
+LOG18AM2="$(PILOT_SUSPENDED_CREWS_OVERRIDE="batista-ps" run_capacity 10 "[]" 1 "$PS_DOMAIN_SMALL")"
+B18AM2="$(dispatched_builder "$LOG18AM2")"
+if [ "$B18AM2" = "batista-ps" ]; then
+  bad "REGRESSION (ga-gbzxos): genuine property_scrapers domain build dispatched to SUSPENDED batista-ps"
+elif [ -n "$B18AM2" ]; then
+  bad "property_scrapers domain build routed unexpectedly while owning crew suspended (got: '$B18AM2')"
+else
+  ok "property_scrapers domain build with suspended domain-default crew HELD (no dispatch), matching AC2 (same-rig case, not just cross-rig)"
+fi
+
+echo "Scenario 18am-3 (control): SAME lx- fixture with batista-ps ACTIVE still dispatches normally (no over-correction)"
+LOG18AM3="$(run_capacity 10 "[]" 1 "$LX_TERRENO")"
+B18AM3="$(dispatched_builder "$LOG18AM3")"
+if [ "$B18AM3" = "batista-ps" ]; then
+  ok "batista-ps ACTIVE (not suspended) still receives the domain build — the suspended-check doesn't over-fire"
+else
+  bad "REGRESSION: active (non-suspended) batista-ps no longer receives the domain build (got: '${B18AM3:-none}')"
+fi
+
+echo "Scenario 18am-4: drift-guard — suspended-check is wired into the ga-lfvs6 _DOM_DEFAULT branch"
+if awk '/_DOM_DEFAULT=\$\(rig_domain_default_builder/{f=1} f{print} f&&/_DOM_BUSY=0/{exit}' "$DISPATCHER" | grep -q '_crew_is_suspended "\$_DOM_DEFAULT"'; then
+  ok "_crew_is_suspended is checked against _DOM_DEFAULT before the busy/idle decision"
+else
+  bad "_DOM_DEFAULT suspended-check MISSING — ITEM 6 parity not wired for the rig-wide default builder"
+fi
 
 # ── Scenario 19 (wa-u5r1): dispatchable-queue emit for the painel ─────────────
 echo "Scenario 19a: emit writes valid JSON with the contract shape + count + items"

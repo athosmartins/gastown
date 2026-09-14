@@ -8589,6 +8589,24 @@ LIVESEC
               _DOM_DEFAULT=$(_pilot_infer_crew_from_owner "$(echo "$STORY" | jq -r '(.created_by // "")' 2>/dev/null || echo "")")
               [ -n "$_DOM_DEFAULT" ] && log "ga-7ti1t: $STORY_ID has no rig-default crew for $_DOMAIN_RIG — inferred owner $_DOM_DEFAULT from creator (created_by). Disable with PILOT_OWNER_INFER_GUARD=0."
             fi
+            # ga-gbzxos (ITEM 6 parity): a suspended crew must never be treated as
+            # the domain's available default builder — dispatching to it leaves the
+            # bead assigned-but-unbuilt forever (the lx-dnw→batista-ps loop: 490
+            # dispatch/reclaim cycles across 8 days, ga-lfvs6's own hold/escalate
+            # safety net never engaging because this branch always saw a "mapped and
+            # not busy" default). ITEM 6 (a few lines above, in branch (1)) already
+            # closes this exact trap for an EXPLICIT assignee; it was never mirrored
+            # here for the rig-wide DEFAULT builder. Clearing to "" makes the
+            # idle/busy check below see no available default, so routing falls
+            # through to branch (3) hold/escalate — the same path an unmapped rig
+            # already takes today (ga-2n7xw's named-successor escalation still
+            # applies unchanged). Fail-open: _crew_is_suspended is already fail-open
+            # (empty roster ⇒ never suspended), so a probe hiccup never manufactures
+            # a hold that wasn't there before this fix.
+            if [ -n "$_DOM_DEFAULT" ] && _crew_is_suspended "$_DOM_DEFAULT"; then
+              log "ga-gbzxos: $STORY_ID domain default builder $_DOM_DEFAULT (rig=$_DOMAIN_RIG) is SUSPENDED — clearing so routing falls to hold/escalate instead of a crew that cannot build."
+              _DOM_DEFAULT=""
+            fi
             local _DOM_BUSY=0
             if [ -n "$_DOM_DEFAULT" ]; then
               case " $PILOT_BUSY_BUILDERS " in *" $_DOM_DEFAULT "*) _DOM_BUSY=1 ;; esac
