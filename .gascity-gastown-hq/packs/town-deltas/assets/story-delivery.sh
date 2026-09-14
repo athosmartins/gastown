@@ -1879,7 +1879,59 @@ else
      && git -C "$RUNTIME_DIR" merge-base --is-ancestor "$DAEMON_REFRESH_BASELINE_SHA" "$POST_DEPLOY_SHA" 2>/dev/null; then
     DAEMON_REFRESH_PRE_SHA="$DAEMON_REFRESH_BASELINE_SHA"
   fi
-  log "Daemon refresh: pre=$DAEMON_REFRESH_PRE_SHA post=$POST_DEPLOY_SHA (this-pull-pre=$PRE_DEPLOY_SHA) sensitive='$SENSITIVE_DAEMONS' extra_roots='$EXTRA_RUNTIME_ROOTS' ..."
+  # ga-3bdttu: DAEMON_REFRESH_PRE_SHA above can be far older than this story's
+  # own pull — frozen at whatever it was when an earlier, still-unresolved
+  # sensitive-daemon restart last blocked the marker from advancing (the
+  # write-back below only fires on OK/SKIPPED). daemon-refresh.sh's CHANGED
+  # set is computed over that WIDE range, which is correct for "is any daemon
+  # stale", but a non-OK verdict from it does NOT mean THIS story's own merge
+  # is the cause — a sweep delivers many stories, and the whole verdict used
+  # to get pinned on whichever one happened to close the window (confirmed
+  # live, story-delivery.log 2026-09-12: wa-u09s4 11:04 and wa-m6v3d 11:17,
+  # each a single tests/*.py-only merge, both held with delivery:failed for a
+  # demand-dashboard staleness neither introduced). Compute THIS story's own
+  # contribution separately — its real PRE_DEPLOY_SHA..POST_DEPLOY_SHA, never
+  # the widened DAEMON_REFRESH_PRE_SHA — and, only when that delta is itself
+  # tests/**+docs/**+*.md-only, exempt the BLAME/HOLD decision below (never
+  # the underlying restart requirement, which stays real and unresolved for
+  # whichever earlier commit actually caused it — see the case statement).
+  # Left unset (not "0") when PRE_DEPLOY_SHA==POST_DEPLOY_SHA: that is a true
+  # this-iteration no-op (ga-gokm6's own scenario — a sibling story's
+  # delivery already advanced HEAD past this story's own commit before
+  # PRE_DEPLOY_SHA was captured), so this range cannot show this story's own
+  # files at all and guessing here would be worse than the existing fallback.
+  THIS_PULL_STRUCTURALLY_INERT=""
+  if [ -n "$PRE_DEPLOY_SHA" ] && [ "$PRE_DEPLOY_SHA" != "$POST_DEPLOY_SHA" ]; then
+    THIS_PULL_CHANGED="$(git -C "$RUNTIME_DIR" diff --name-only "$PRE_DEPLOY_SHA" "$POST_DEPLOY_SHA" 2>/dev/null || true)"
+    if [ -n "${THIS_PULL_CHANGED// /}" ]; then
+      # Same universal claim as daemon-refresh.sh's own DEFAULT_NO_RESTART_PATTERNS
+      # (ga-dk7fw): tests/**, docs/**, *.md are never part of any daemon's
+      # import graph on any rig. Deliberately duplicated as a literal here
+      # (not sourced from daemon-refresh.sh) — this whole Step 5b block is
+      # extracted verbatim by tests/story-delivery-step5b.test.sh, so a cross-
+      # file reference would not resolve in that context. Keep the pattern
+      # list in sync if daemon-refresh.sh's ever changes.
+      this_pull_no_restart_patterns="tests/** docs/** *.md"
+      this_pull_uncovered=""
+      set -f
+      while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        covered=0
+        for pat in $this_pull_no_restart_patterns; do
+          # shellcheck disable=SC2254  # deliberate glob match, not literal
+          case "$f" in $pat) covered=1; break ;; esac
+        done
+        [ "$covered" -eq 1 ] || this_pull_uncovered="$this_pull_uncovered $f"
+      done <<< "$THIS_PULL_CHANGED"
+      set +f
+      if [ -z "${this_pull_uncovered// /}" ]; then
+        THIS_PULL_STRUCTURALLY_INERT=1
+      else
+        THIS_PULL_STRUCTURALLY_INERT=0
+      fi
+    fi
+  fi
+  log "Daemon refresh: pre=$DAEMON_REFRESH_PRE_SHA post=$POST_DEPLOY_SHA (this-pull-pre=$PRE_DEPLOY_SHA) this-pull-structurally-inert=${THIS_PULL_STRUCTURALLY_INERT:-unknown} sensitive='$SENSITIVE_DAEMONS' extra_roots='$EXTRA_RUNTIME_ROOTS' ..."
   REFRESH_OUT=$(RUNTIME_DIR="$RUNTIME_DIR" \
     PRE_DEPLOY_SHA="$DAEMON_REFRESH_PRE_SHA" POST_DEPLOY_SHA="$POST_DEPLOY_SHA" \
     DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
@@ -1921,46 +1973,63 @@ else
       fi
       ;;
     *)
-      err "Daemon refresh did NOT pass (verdict=$REFRESH_VERDICT): $REFRESH_REASON"
-      if [ "$REFRESH_VERDICT" = "NEEDS_GUARDED_RESTART" ]; then
-        # ga-puq8z ACEITE 2: this verdict is single-hop import/template-closure
-        # detection (daemon-refresh.sh Step 3), not proof the daemon's live
-        # code path reaches the changed symbols — say so explicitly rather
-        # than asserting staleness outright. daemon-refresh.sh's own
-        # already-fresh check (COMMIT_EPOCH-based, ga-puq8z) already ran and
-        # did NOT clear this daemon, but a human deciding whether to bounce a
-        # hot-path daemon on this alone should know the detection basis.
-        REFRESH_ACTION="ACTION: perform a guarded/graceful restart of the flagged hot-path daemon(s) ($REFRESH_GUARDED) — drain in-flight messages/webhooks first — then re-run delivery. (Configure a DRAIN_CMD_<label> for daemon-refresh.sh to automate this.) CAVEAT (ga-puq8z): flagged by import/template-closure matching, not proven reachable to the changed symbols — if in doubt, compare \`ps -o lstart= -p <pid>\` against commit $POST_DEPLOY_SHA before restarting."
+      if [ "$THIS_PULL_STRUCTURALLY_INERT" = "1" ]; then
+        # ga-3bdttu: verdict is real (some daemon IS stale) but this story's
+        # own merge did not cause it (its own delta is tests/docs/md-only) —
+        # do not blame/hold/withhold story:done for it. Fall through to Step 6
+        # as if this step passed. Deliberately do NOT advance the baseline
+        # marker above (that only happens in the OK|SKIPPED case): the
+        # underlying staleness is real and still unresolved for whichever
+        # earlier commit actually caused it, and advancing the marker here
+        # would hide it from every future sweep too, not just this story.
+        log "Daemon refresh verdict=$REFRESH_VERDICT ($REFRESH_REASON) predates $STORY_ID's own merge (its own delta is tests/docs/md-only) — not holding this delivery for it."
+        if [ "$DRY_RUN" != "1" ]; then
+          gc --city "$GC_CITY" session nudge mayor \
+            "Daemon refresh $REFRESH_VERDICT persists for rig $RIG ($REFRESH_REASON) — NOT caused by $STORY_ID, whose own merge is tests/docs/md-only; an earlier commit still needs a guarded restart." \
+            2>/dev/null || true
+        fi
       else
-        REFRESH_ACTION="ACTION: investigate why the restarted daemon(s) ($REFRESH_FRESHFAIL) did not come up fresh (crash on boot? wrong launchd label? port in use?), fix forward, then re-run delivery."
-      fi
-      if [ "$DRY_RUN" != "1" ]; then
-        bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
-        bd -C "$STORY_STORE" label add    "$STORY_ID" "delivery:failed"  -q 2>/dev/null || true
-        # ga-iwv0: mark the DEPLOY-PENDING cause distinctly (code merged but NOT live — a
-        # daemon needs a guarded restart / did not come up fresh). The task reconciler keys on
-        # THIS label to re-arm story:approved (retry to real deploy), vs. a prod-test
-        # delivery:failed which must NOT auto-retry (e.g. a flaky test → infinite loop).
-        bd -C "$STORY_STORE" label add    "$STORY_ID" "delivery:deploy-pending" -q 2>/dev/null || true
-        bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED (ga-iwv0 daemon refresh): $REFRESH_VERDICT — $REFRESH_REASON
+        err "Daemon refresh did NOT pass (verdict=$REFRESH_VERDICT): $REFRESH_REASON"
+        if [ "$REFRESH_VERDICT" = "NEEDS_GUARDED_RESTART" ]; then
+          # ga-puq8z ACEITE 2: this verdict is single-hop import/template-closure
+          # detection (daemon-refresh.sh Step 3), not proof the daemon's live
+          # code path reaches the changed symbols — say so explicitly rather
+          # than asserting staleness outright. daemon-refresh.sh's own
+          # already-fresh check (COMMIT_EPOCH-based, ga-puq8z) already ran and
+          # did NOT clear this daemon, but a human deciding whether to bounce a
+          # hot-path daemon on this alone should know the detection basis.
+          REFRESH_ACTION="ACTION: perform a guarded/graceful restart of the flagged hot-path daemon(s) ($REFRESH_GUARDED) — drain in-flight messages/webhooks first — then re-run delivery. (Configure a DRAIN_CMD_<label> for daemon-refresh.sh to automate this.) CAVEAT (ga-puq8z): flagged by import/template-closure matching, not proven reachable to the changed symbols — if in doubt, compare \`ps -o lstart= -p <pid>\` against commit $POST_DEPLOY_SHA before restarting."
+        else
+          REFRESH_ACTION="ACTION: investigate why the restarted daemon(s) ($REFRESH_FRESHFAIL) did not come up fresh (crash on boot? wrong launchd label? port in use?), fix forward, then re-run delivery."
+        fi
+        if [ "$DRY_RUN" != "1" ]; then
+          bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
+          bd -C "$STORY_STORE" label add    "$STORY_ID" "delivery:failed"  -q 2>/dev/null || true
+          # ga-iwv0: mark the DEPLOY-PENDING cause distinctly (code merged but NOT live — a
+          # daemon needs a guarded restart / did not come up fresh). The task reconciler keys on
+          # THIS label to re-arm story:approved (retry to real deploy), vs. a prod-test
+          # delivery:failed which must NOT auto-retry (e.g. a flaky test → infinite loop).
+          bd -C "$STORY_STORE" label add    "$STORY_ID" "delivery:deploy-pending" -q 2>/dev/null || true
+          bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED (ga-iwv0 daemon refresh): $REFRESH_VERDICT — $REFRESH_REASON
 A long-lived daemon serving rig '$RIG' is running code OLDER than this deploy and could not be safely refreshed/verified, so the merged feature would be DORMANT in production. story:done is WITHHELD (a dormant deploy must never be marked done).
 $REFRESH_ACTION
 Refresh detail:
 $REFRESH_OUT" 2>/dev/null || true
-        AUTHOR=$(echo "$STORY" | jq -r '.assignee // .created_by // ""' 2>/dev/null || echo "")
-        if [ -n "$AUTHOR" ] && [ "$AUTHOR" != "null" ]; then
-          gc --city "$GC_CITY" session nudge "$AUTHOR" \
-            "DELIVERY HALTED for $STORY_ID (ga-iwv0): $REFRESH_VERDICT — a daemon serving the merge is dormant/unverified. See bead; do NOT mark done." \
-            --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR"
+          AUTHOR=$(echo "$STORY" | jq -r '.assignee // .created_by // ""' 2>/dev/null || echo "")
+          if [ -n "$AUTHOR" ] && [ "$AUTHOR" != "null" ]; then
+            gc --city "$GC_CITY" session nudge "$AUTHOR" \
+              "DELIVERY HALTED for $STORY_ID (ga-iwv0): $REFRESH_VERDICT — a daemon serving the merge is dormant/unverified. See bead; do NOT mark done." \
+              --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR"
+          fi
+          gc --city "$GC_CITY" session nudge mayor \
+            "DELIVERY HALTED ($STORY_ID, rig $RIG): daemon refresh $REFRESH_VERDICT — $REFRESH_REASON. story:done withheld." \
+            2>/dev/null || true
         fi
-        gc --city "$GC_CITY" session nudge mayor \
-          "DELIVERY HALTED ($STORY_ID, rig $RIG): daemon refresh $REFRESH_VERDICT — $REFRESH_REASON. story:done withheld." \
-          2>/dev/null || true
+        # wa-uthi: non-terminal (delivery:failed re-picked every cycle once the
+        # daemon is refreshed) — no Athos push. Author + Mayor nudged above.
+        warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID daemon refresh $REFRESH_VERDICT."
+        continue
       fi
-      # wa-uthi: non-terminal (delivery:failed re-picked every cycle once the
-      # daemon is refreshed) — no Athos push. Author + Mayor nudged above.
-      warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID daemon refresh $REFRESH_VERDICT."
-      continue
       ;;
   esac
 fi
