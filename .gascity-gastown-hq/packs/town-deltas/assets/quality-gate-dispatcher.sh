@@ -6169,11 +6169,24 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
   # mayor escalation) instead of a bare nudge that silently fails for any
   # persistent named crew member (NOTIFY_AUTHOR is often a bare branch
   # segment like "batista"; live sessions are rig-qualified like "batista-lx").
+  # ga-o2caab gate-FAIL attempt 1 review: nudge_author_with_fallback() returns
+  # 1 when EVERY candidate fails (mayor-escalation branch — routine under this
+  # ephemeral-session architecture, not a rare corner case). Called bare here
+  # under this script's `set -euo pipefail` (L30), inside gate_finalize_run()
+  # which is itself invoked as a BARE statement from Phase C's sweep loop, a
+  # return 1 would abort the WHOLE dispatcher — silently killing finalization
+  # of every OTHER gate run pending in the same sweep, not just this one. The
+  # function already does complete internal error handling on that path (mail
+  # mayor + durable bd comment, per its own doc comment) — `|| true` here only
+  # neutralizes the return code for script control flow, it changes no
+  # notification behavior. See SELFTEST-EXTRACT nudge-call-site-1 below.
+  # SELFTEST-EXTRACT nudge-call-site-1: BEGIN
   if [ -n "$NOTIFY_AUTHOR" ]; then
     nudge_author_with_fallback "$BEAD_ID" "$NOTIFY_AUTHOR" "$AUTHOR" \
       "QUALITY GATE FAILED for branch $BRANCH. Blocking reasons: $(echo -e "$FAIL_REASONS" | head -3). Gate run: $GATE_RUN_ID. Fix the issues and re-run /gate-done when ready." \
-      "Gate FAIL nudge for $BEAD_ID (branch $BRANCH, gate_run $GATE_RUN_ID)"
+      "Gate FAIL nudge for $BEAD_ID (branch $BRANCH, gate_run $GATE_RUN_ID)" || true
   fi
+  # SELFTEST-EXTRACT nudge-call-site-1: END
 
   # ── ga-jb4l: SELF-HEALING FAIL LOOP ────────────────────────────────────────
   # A gate FAIL must not strand the source story forever. The legacy FAIL path
@@ -6389,9 +6402,17 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         # nudge_author_with_fallback — this is the exact incident shape
         # (live-crew author, bare branch segment) that stalled lx-dnw 7+
         # minutes with zero FAIL feedback until a witness relayed it by hand.
+        # ga-o2caab gate-FAIL attempt 1 review: same errexit hazard as the
+        # call site above (this is also inside gate_finalize_run(), invoked
+        # bare from Phase C's sweep loop) — `|| true` neutralizes the return
+        # code only; the function's own internal error handling (mail mayor +
+        # durable bd comment) is unchanged. See SELFTEST-EXTRACT
+        # nudge-call-site-2 below.
+        # SELFTEST-EXTRACT nudge-call-site-2: BEGIN
         nudge_author_with_fallback "$BEAD_ID" "$NOTIFY_AUTHOR" "$AUTHOR" \
           "Gate FAILED for $BEAD_ID (branch $BRANCH, attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — see GATE-FEEDBACK on the bead. Your assignee was kept (ga-jyox); fix and re-run /gate-done." \
-          "Gate FAIL live-crew nudge for $BEAD_ID (branch $BRANCH, attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP})"
+          "Gate FAIL live-crew nudge for $BEAD_ID (branch $BRANCH, attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP})" || true
+        # SELFTEST-EXTRACT nudge-call-site-2: END
         # ga-7rvyt: gc hook / routed-pool surfacing has no live-in-flight-owner
         # guard (unlike Pilot's _filter_candidates), so a bead kept in-flight
         # here for a live crew author was still re-offered to generic pool

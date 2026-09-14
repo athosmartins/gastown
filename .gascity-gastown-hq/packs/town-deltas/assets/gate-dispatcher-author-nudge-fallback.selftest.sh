@@ -201,4 +201,77 @@ else
   bad "near-miss suffix handling broke — got '$NUDGE_LOG'"
 fi
 
+# ── ERREXIT-SAFETY regression (gate-FAIL attempt 1 review) ──────────────────
+# The scenarios above prove nudge_author_with_fallback()'s own logic, by
+# eval'ing it into THIS file's shell — which runs under `set -uo pipefail`
+# (no -e, line 32). They cannot catch a caller-side bug: the dispatcher
+# itself runs under `set -euo pipefail` (its L30), and both call sites live
+# inside gate_finalize_run(), itself invoked as a BARE statement from Phase
+# C's sweep loop. A gate reviewer caught exactly this on the first fix
+# attempt: both call sites had been written as bare statements (no `|| true`
+# / `|| warn` guard), so a total nudge failure (return 1 — the routine
+# mayor-escalation branch, not a rare corner case under this ephemeral-
+# session architecture) would abort the WHOLE dispatcher, silently killing
+# finalization of every OTHER gate run pending in the same sweep. Below:
+# extract the ACTUAL call-site source (never a hand-copied duplicate, same
+# principle as the function extraction above) and run it in a REAL nested
+# `bash -euo pipefail` — matching the dispatcher's own errexit setting — with
+# nudge_author_with_fallback stubbed to always fail, proving the fix holds.
+CALL_SITE_1="$(extract_block "$DISPATCHER" "nudge-call-site-1")"
+CALL_SITE_2="$(extract_block "$DISPATCHER" "nudge-call-site-2")"
+[ -n "$CALL_SITE_1" ] || { echo "FATAL: SELFTEST-EXTRACT nudge-call-site-1 block not found in $DISPATCHER" >&2; exit 2; }
+[ -n "$CALL_SITE_2" ] || { echo "FATAL: SELFTEST-EXTRACT nudge-call-site-2 block not found in $DISPATCHER" >&2; exit 2; }
+
+# Runs $1 (a snippet of dispatcher source, verbatim) in its own `bash -euo
+# pipefail` process — piped in via stdin, never interpolated into a quoted
+# -c string, so nothing in the snippet (quotes, $(...), etc.) needs escaping
+# — with the vars the call sites reference pre-set and
+# nudge_author_with_fallback stubbed to always return 1 (total failure, the
+# scenario the reviewer named). Prints a marker after the snippet so success
+# is "ran to completion", not just "process exited 0" (a snippet that exits
+# early via an unrelated path would still exit 0 and must not read as safe).
+errexit_survives() {
+  local snippet="$1" out rc
+  out="$(printf '%s\n' \
+    'nudge_author_with_fallback() { return 1; }' \
+    'NOTIFY_AUTHOR="batista"; BEAD_ID="lx-dnw"; AUTHOR="some-author"' \
+    'BRANCH="crew/batista/lx-dnw"; FAIL_REASONS="reason"; GATE_RUN_ID="gr1"' \
+    'NEW_ATTEMPT=1; GATE_FIX_CAP=3' \
+    "$snippet" \
+    'echo MARKER_REACHED' \
+    | bash -euo pipefail 2>&1)"
+  rc=$?
+  [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -q "MARKER_REACHED"
+}
+
+echo "S11: call-site-1 (general author notify) survives total nudge failure under set -e"
+if errexit_survives "$CALL_SITE_1"; then
+  ok "call-site-1 ran to completion under set -e with every nudge candidate failing — the || true fix holds"
+else
+  bad "call-site-1 ABORTED under set -e on total nudge failure — the exact defect the gate reviewer found on attempt 1"
+fi
+
+echo "S12: call-site-2 (ga-jyox live-crew author notify) survives total nudge failure under set -e"
+if errexit_survives "$CALL_SITE_2"; then
+  ok "call-site-2 ran to completion under set -e with every nudge candidate failing — the || true fix holds"
+else
+  bad "call-site-2 ABORTED under set -e on total nudge failure — the exact defect the gate reviewer found on attempt 1"
+fi
+
+echo "S13 (mutation): stripping the trailing '|| true' from call-site-1 must abort under set -e — proves S11 actually discriminates, not vacuous"
+CALL_SITE_1_UNGUARDED="$(printf '%s\n' "$CALL_SITE_1" | sed 's/ || true[[:space:]]*$//')"
+if errexit_survives "$CALL_SITE_1_UNGUARDED"; then
+  bad "call-site-1 with '|| true' stripped should have ABORTED under set -e but survived — S11 would not catch a regression here"
+else
+  ok "call-site-1 with '|| true' stripped correctly aborts under set -e — S11 is sensitive to this exact defect class"
+fi
+
+echo "S14 (mutation): stripping the trailing '|| true' from call-site-2 must abort under set -e — proves S12 actually discriminates, not vacuous"
+CALL_SITE_2_UNGUARDED="$(printf '%s\n' "$CALL_SITE_2" | sed 's/ || true[[:space:]]*$//')"
+if errexit_survives "$CALL_SITE_2_UNGUARDED"; then
+  bad "call-site-2 with '|| true' stripped should have ABORTED under set -e but survived — S12 would not catch a regression here"
+else
+  ok "call-site-2 with '|| true' stripped correctly aborts under set -e — S12 is sensitive to this exact defect class"
+fi
+
 echo ""; echo "gate-dispatcher-author-nudge-fallback.selftest: PASS=$PASS FAIL=$FAIL"; [ "$FAIL" -eq 0 ] && exit 0 || exit 1
