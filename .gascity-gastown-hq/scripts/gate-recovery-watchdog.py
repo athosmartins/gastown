@@ -302,7 +302,21 @@ REPAIR_DOG_TITLE_RE = re.compile(
     r"head[- ]of[- ]line|branch stale|branch travado|pilot trav|pilot .*jam|supervisor init|"
     r"init[- ]failure|init failure|gate stall|gate heartbeat|zero merges|sem revisores",
     re.IGNORECASE)
-DOLT_SIG = re.compile(r"connection reset|bead store closed|unexpected EOF|invalid connection|provider-health registry unavailable")
+DOLT_SIG = re.compile(r"connection reset|bead store closed|unexpected EOF|invalid connection")
+# ga-rwpwz8: supervisor.log's own session-reconciler line ("provider-health
+# registry unavailable for ...; treating as green") used to match DOLT_SIG too
+# — it is benign and EVERY-CYCLE (measured live 2026-09-14: 87/87 "instability"
+# matches that day were this line, zero real signals), not a Dolt symptom. Below,
+# dolt_instability() also restricts matches to a recent TIME window instead of
+# just the last 200KB of bytes, which can span hours and mix a stale incident
+# with right-now.
+DOLT_INSTABILITY_WINDOW_SEC = int(os.environ.get("GRW_DOLT_INSTABILITY_WINDOW_SEC", "1800"))  # 30min
+DOLT_INSTABILITY_MIN_HITS = int(os.environ.get("GRW_DOLT_INSTABILITY_MIN_HITS", "2"))  # mirrors recent_timeouts()'s n_to>=2 "not a blip" bar
+# supervisor.log's own line prefix (Go stdlib `log` package default flags), e.g.
+# "2026/09/14 13:55:39 beads cache: reconciled ...". A different shape from
+# TS_RE below (bracketed) — that one is the dispatcher log's own format, a
+# different process/file.
+SUP_TS_RE = re.compile(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})")
 TS_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
 # "=== Dispatcher sweep complete: branch=<X> verdict=QUEUED (retry N/M, dead author) ==="
 SWEEP_QUEUED_RETRY_RE = re.compile(r"Dispatcher sweep complete: branch=(\S+) verdict=QUEUED \(retry")
@@ -833,8 +847,29 @@ def orphaned_queued_marker():
     return orphans[0]
 
 
+def _sup_log_ts_epoch(line):
+    """Epoch for a supervisor.log line's own leading timestamp, or None if the
+    line doesn't start with one (many lines in this log are printed raw, without
+    the Go `log` package's date/time prefix — see SUP_TS_RE)."""
+    m = SUP_TS_RE.match(line)
+    if not m:
+        return None
+    try:
+        return time.mktime(time.strptime(m.group(1), "%Y/%m/%d %H:%M:%S"))
+    except Exception:
+        return None
+
+
 def dolt_instability():
-    """count of Dolt-instability signature lines in the tail of the supervisor log."""
+    """count of REAL Dolt-instability signature lines in the tail of the
+    supervisor log, restricted to the last DOLT_INSTABILITY_WINDOW_SEC (ga-rwpwz8:
+    a raw byte-tail alone can span hours, mixing a stale incident with right now).
+    A line without its own parseable timestamp inherits the closest one seen
+    above it (this log interleaves timestamped and raw lines); a match before ANY
+    timestamp has been seen yet in the tail counts as in-window — fail toward
+    counting/alarming rather than silently dropping it, matching this file's
+    existing fail-open precedent (daemon_deliberately_stopped(), the session-list
+    failure path in stuck_dispatching())."""
     try:
         with open(SUPERVISOR_LOG) as f:
             try:
@@ -846,7 +881,18 @@ def dolt_instability():
             tail = f.read()
     except Exception:
         return 0
-    return len(DOLT_SIG.findall(tail))
+    cutoff = time.time() - DOLT_INSTABILITY_WINDOW_SEC
+    hits = 0
+    last_ts = None
+    for line in tail.splitlines():
+        ts = _sup_log_ts_epoch(line)
+        if ts is not None:
+            last_ts = ts
+        if last_ts is not None and last_ts < cutoff:
+            continue
+        if DOLT_SIG.search(line):
+            hits += 1
+    return hits
 
 
 def _rig_paths_invalid():
@@ -1135,29 +1181,77 @@ def repair_runbook(reason, diag_path, dolt_hits, kind="gate"):
             "(Fix permanente seria o dispatcher detectar markers sem gate_run e re-criar o run — esta detecção+reparo "
             "é a ponte até lá.)"
         ) % (reason, dolt_hits, dolt_hits, reason, dolt_hits, dolt_hits, dolt_hits, diag_path)
+    if dolt_hits >= DOLT_INSTABILITY_MIN_HITS:
+        return (
+            "O gate parou de produzir vereditos. Motivo detectado: %s. "
+            "Linhas de instabilidade do Dolt no supervisor.log (reais, últimos %dmin): %d.\n"
+            "Diagnóstico já coletado em: %s\n\n"
+            "Causa-raiz mais provável (lição de 2026-06-07): instabilidade de conexão do Dolt da cidade (:52756) "
+            "→ supervisor não computa a demanda de gate-reviewer → revisores nascem e morrem (start-pending) → "
+            "todo run dá TIMEOUT. Rode o diagnostic ladder COMPLETO da memória [[gate-reviewer-spawn-failure-playbook]].\n\n"
+            "CONSERTO (na ordem, verificando entre os passos):\n"
+            "0. COTA PRIMEIRO (lição de 2026-06-10, ga-wjlv9): rode `scripts/claude-quota-check.sh --line` (ou --json). "
+            "Se disser LIMITED, É cota — espere o reset, NÃO persiga infra (a noite de 2026-06-10 foi perdida diagnosticando "
+            "um stall como cota sem poder confirmar — e NÃO era cota). Se 'not limited', NÃO é cota → siga pros passos de infra abaixo.\n"
+            "1. Colete diagnóstico: grep -E 'connection reset|bead store closed|invalid connection' ~/.gc/supervisor.log | tail\n"
+            "2. Reviewer congelado/boot-wedged? `gc session list | grep gate-reviewer` — se algum está start-pending/asleep "
+            "segurando o slot, mate-o (`gc session kill <id>`) e deixe o dispatcher re-convocá-lo; veja [[ga-mepb0]] (re-convene + stagger spawns).\n"
+            "3. Menos invasivo: launchctl kickstart -k gui/$(id -u)/com.gascity.supervisor ; espere 30s ; "
+            "dispare um gate run (launchctl kickstart gui/$(id -u)/com.gascity.quality-gate-dispatcher) e veja se os "
+            "revisores ficam 'active' e os vereditos sobem.\n"
+            "4. Ainda quebrado? Cheque rig-path/hooks/binário (passos 1-3 do ladder da memória acima) e então "
+            "gc dolt restart (da pasta da cidade) — preserva dados, bd volta na hora — depois kickstart do supervisor de novo, e re-verifique um run.\n"
+            "5. Confirme com um run REAL passando ponta-a-ponta (3/3 vereditos → PASS). "
+            "Sondas ad-hoc (gc session new sem tarefa) saem sozinhas, não servem de teste.\n\n"
+            "Se recuperar, avise (notify -p 3). Só acione o Athos (notify -p 5) se NÃO conseguir recuperar."
+        ) % (reason, DOLT_INSTABILITY_WINDOW_SEC // 60, dolt_hits, diag_path)
     return (
         "O gate parou de produzir vereditos. Motivo detectado: %s. "
-        "Linhas de instabilidade do Dolt no supervisor.log: %d.\n"
+        "Linhas REAIS de instabilidade do Dolt no supervisor.log, últimos %dmin: %d (abaixo do limiar de %d — "
+        "NÃO presuma Dolt como causa desta vez).\n"
         "Diagnóstico já coletado em: %s\n\n"
-        "Causa-raiz mais provável (lição de 2026-06-07): instabilidade de conexão do Dolt da cidade (:52756) "
-        "→ supervisor não computa a demanda de gate-reviewer → revisores nascem e morrem (start-pending) → "
-        "todo run dá TIMEOUT. Rode o diagnostic ladder COMPLETO da memória [[gate-reviewer-spawn-failure-playbook]].\n\n"
-        "CONSERTO (na ordem, verificando entre os passos):\n"
-        "0. COTA PRIMEIRO (lição de 2026-06-10, ga-wjlv9): rode `scripts/claude-quota-check.sh --line` (ou --json). "
-        "Se disser LIMITED, É cota — espere o reset, NÃO persiga infra (a noite de 2026-06-10 foi perdida diagnosticando "
-        "um stall como cota sem poder confirmar — e NÃO era cota). Se 'not limited', NÃO é cota → siga pros passos de infra abaixo.\n"
-        "1. Colete diagnóstico: grep -E 'connection reset|bead store closed|invalid connection' ~/.gc/supervisor.log | tail\n"
-        "2. Reviewer congelado/boot-wedged? `gc session list | grep gate-reviewer` — se algum está start-pending/asleep "
-        "segurando o slot, mate-o (`gc session kill <id>`) e deixe o dispatcher re-convocá-lo; veja [[ga-mepb0]] (re-convene + stagger spawns).\n"
-        "3. Menos invasivo: launchctl kickstart -k gui/$(id -u)/com.gascity.supervisor ; espere 30s ; "
-        "dispare um gate run (launchctl kickstart gui/$(id -u)/com.gascity.quality-gate-dispatcher) e veja se os "
-        "revisores ficam 'active' e os vereditos sobem.\n"
-        "4. Ainda quebrado? Cheque rig-path/hooks/binário (passos 1-3 do ladder da memória acima) e então "
-        "gc dolt restart (da pasta da cidade) — preserva dados, bd volta na hora — depois kickstart do supervisor de novo, e re-verifique um run.\n"
-        "5. Confirme com um run REAL passando ponta-a-ponta (3/3 vereditos → PASS). "
-        "Sondas ad-hoc (gc session new sem tarefa) saem sozinhas, não servem de teste.\n\n"
-        "Se recuperar, avise (notify -p 3). Só acione o Athos (notify -p 5) se NÃO conseguir recuperar."
-    ) % (reason, dolt_hits, diag_path)
+        "SEM evidência de instabilidade do Dolt (lição ga-rwpwz8, 2026-09-14): um alarme idêntico a este mediu "
+        "87 linhas de 'instabilidade' no dia — todas eram a linha benigna e rotineira do reconciler de sessão "
+        "('provider-health registry unavailable ... treating as green', emitida a CADA ciclo), zero sinal real. "
+        "Reiniciar o Dolt não teria consertado nada — só derrubado o plano de dados da cidade inteira. As causas "
+        "reais daquele dia foram um spawn de reviewer abortado e um reviewer vivo morto num pico de load, nenhuma "
+        "delas relacionada ao Dolt.\n\n"
+        "NÃO reinicie o Dolt nem dê kickstart no supervisor como primeiro passo. Investigue antes:\n"
+        "0. COTA PRIMEIRO: rode `scripts/claude-quota-check.sh --line`. Se disser LIMITED, é cota — espere o reset.\n"
+        "1. Leia o log do dispatcher pelas causas mais comuns de gate travado SEM Dolt: "
+        "grep -E 'spawn_err|YIELDED|still in flight' %s | tail -40\n"
+        "2. Reviewer congelado/boot-wedged? `gc session list | grep gate-reviewer` — mate quem estiver "
+        "start-pending/asleep segurando o slot e deixe o dispatcher re-convocar.\n"
+        "3. SÓ SE, depois disso, você encontrar evidência real de conexão ao Dolt (connection reset / bead store "
+        "closed / unexpected EOF / invalid connection no supervisor.log), consulte a memória "
+        "[[gate-reviewer-spawn-failure-playbook]] para o ladder completo (passos de infra progressivamente mais "
+        "invasivos, na ordem certa).\n\n"
+        "Este alerta foi direto pra você (Mayor), não para um dog autônomo: sem sinal real do Dolt, o passo "
+        "destrutivo não vai para um agente sem supervisão (ga-rwpwz8)."
+    ) % (reason, DOLT_INSTABILITY_WINDOW_SEC // 60, dolt_hits, DOLT_INSTABILITY_MIN_HITS, diag_path, DISPATCH_LOG)
+
+
+def _create_unrouted_audit_bead(title, reason, diag_path, dolt_hits, kind):
+    """ga-rwpwz8: durable audit record for a gate-down alarm with NO positive Dolt
+    evidence. Created WITHOUT --assignee (so it never carries gc.routed_to) and
+    labeled pilot:no-auto-dispatch, so neither a pool dog's routed-work probe nor
+    the Pilot can pick it up — only the Mayor, woken separately, is meant to act
+    on it. Best-effort and guarded like every other bd call in this file: returns
+    the new bead id, or None if creation failed (the Mayor wake still fires
+    either way, it just won't have a bead id to point at)."""
+    body = REPAIR_HEADER + repair_runbook(reason, diag_path, dolt_hits, kind)
+    cr = sh(["bd", "-C", CITY, "create", title, "-t", "task", "--stdin", "--json"],
+            stdin=body, timeout=45)
+    if not cr or cr.returncode != 0:
+        return None
+    try:
+        cj = json.loads(cr.stdout)
+        bead_id = (cj[0] if isinstance(cj, list) and cj else cj).get("id")
+    except Exception:
+        return None
+    if bead_id:
+        sh(["bd", "-C", CITY, "label", "add", bead_id, "pilot:no-auto-dispatch", "-q"], timeout=20)
+    return bead_id
 
 
 def spawn_repair_agent(reason, diag_path, dolt_hits, kind="gate"):
@@ -1193,6 +1287,28 @@ def spawn_repair_agent(reason, diag_path, dolt_hits, kind="gate"):
     safe_reason = reason.encode("ascii", "replace").decode("ascii")
     title = "REPAIR gate-watchdog (%s): %s" % (kind, safe_reason)
     payload = title + "\n\n" + REPAIR_HEADER + repair_runbook(reason, diag_path, dolt_hits, kind)
+
+    # ga-rwpwz8: for the Dolt-instability narrative (kind=="gate") specifically,
+    # never hand an autonomous dog a runbook whose destructive step is a Dolt/
+    # supervisor restart without real evidence Dolt is the cause — dolt_hits here
+    # is the REAL, time-windowed, noise-excluded signal count from
+    # dolt_instability(). Below the threshold: no direct spawn, no pool routing —
+    # just a durable audit bead (unrouted, pilot:no-auto-dispatch) and a Mayor
+    # wake, so a human judgment call replaces a reflexive Dolt restart. Other
+    # kinds (pilot/gate-loop/supervisor/gate-orphan) have unrelated root causes
+    # and are untouched by this gate.
+    if kind == "gate" and dolt_hits < DOLT_INSTABILITY_MIN_HITS:
+        audit_id = _create_unrouted_audit_bead(title, reason, diag_path, dolt_hits, kind)
+        no_dispatch_reason = ("%d linha(s) real de instabilidade do Dolt nos últimos %dmin (< limiar %d)"
+                              % (dolt_hits, DOLT_INSTABILITY_WINDOW_SEC // 60, DOLT_INSTABILITY_MIN_HITS))
+        if audit_id:
+            no_dispatch_reason += "; bead de auditoria %s (sem gc.routed_to, pilot:no-auto-dispatch)" % audit_id
+        woke = wake_mayor(reason, diag_path, dolt_hits, kind, no_dispatch_reason=no_dispatch_reason)
+        if woke:
+            return ("sem evidência de Dolt — Mayor acordado, dog autônomo NÃO despachado"
+                    + (" (bead %s)" % audit_id if audit_id else ""), None)
+        return ("FALHA: sem evidência de Dolt e Mayor ausente"
+                + (" — bead %s aberta p/ triagem humana" % audit_id if audit_id else " (bead não criada)"), None)
 
     def _sling():
         r = sh(["gc", "sling", DOG_TEMPLATE, "--stdin", "--json"], stdin=payload, timeout=45)
@@ -1282,18 +1398,30 @@ def spawn_repair_agent(reason, diag_path, dolt_hits, kind="gate"):
     return ("reparo so enfileirado — sem worker, Mayor ausente" if routed else "FALHA: sem worker e sem Mayor", None)
 
 
-def wake_mayor(reason, diag_path, dolt_hits, kind="gate"):
-    """FALLBACK only: used when a dedicated repair agent could NOT be spawned. Wakes
-    the Mayor (if awake) and hands off the same runbook for manual recovery."""
+def wake_mayor(reason, diag_path, dolt_hits, kind="gate", no_dispatch_reason=None):
+    """FALLBACK: used when a dedicated repair agent could NOT be spawned, OR (ga-
+    rwpwz8, no_dispatch_reason set) when one was deliberately NOT attempted for
+    lack of positive evidence. Wakes the Mayor (if awake) and hands off the
+    runbook for manual recovery."""
     mid = mayor_session()
     if not mid:
         return False
-    task = (
-        quota_verdict()  # lead the wake with the real quota verdict (ga-wjlv9): rule quota in/out FIRST
-        + "🔧 ALERTA AUTOMÁTICO DO WATCHDOG — não consegui spawnar um agente de reparo, "
-        "então te acordei como FALLBACK. Conserta agora, não escale pro Athos a menos que falhe.\n\n"
-        + repair_runbook(reason, diag_path, dolt_hits, kind)
-    )
+    if no_dispatch_reason:
+        # ga-rwpwz8: distinct framing from the generic fallback below — this is a
+        # deliberate policy choice (no evidence → no autonomous destructive step),
+        # not a failure to spawn, and saying otherwise would mislead the Mayor.
+        preamble = (
+            "🔧 ALERTA DO WATCHDOG — o gate parou, mas NÃO despachei um dog autônomo desta vez: %s. "
+            "O runbook padrão pode incluir reiniciar o Dolt, e isso não vai para um agente sem "
+            "supervisão sem evidência real. Avalie o diagnóstico abaixo e decida.\n\n" % no_dispatch_reason
+        )
+    else:
+        preamble = (
+            quota_verdict()  # lead the wake with the real quota verdict (ga-wjlv9): rule quota in/out FIRST
+            + "🔧 ALERTA AUTOMÁTICO DO WATCHDOG — não consegui spawnar um agente de reparo, "
+            "então te acordei como FALLBACK. Conserta agora, não escale pro Athos a menos que falhe.\n\n"
+        )
+    task = preamble + repair_runbook(reason, diag_path, dolt_hits, kind)
     sh(["gc", "session", "wake", mid], timeout=20)
     r = sh(["gc", "session", "nudge", mid, task], timeout=25)
     return r is not None and r.returncode == 0
