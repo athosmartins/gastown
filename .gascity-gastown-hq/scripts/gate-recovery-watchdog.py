@@ -864,12 +864,19 @@ def dolt_instability():
     """count of REAL Dolt-instability signature lines in the tail of the
     supervisor log, restricted to the last DOLT_INSTABILITY_WINDOW_SEC (ga-rwpwz8:
     a raw byte-tail alone can span hours, mixing a stale incident with right now).
-    A line without its own parseable timestamp inherits the closest one seen
-    above it (this log interleaves timestamped and raw lines); a match before ANY
-    timestamp has been seen yet in the tail counts as in-window — fail toward
-    counting/alarming rather than silently dropping it, matching this file's
-    existing fail-open precedent (daemon_deliberately_stopped(), the session-list
-    failure path in stuck_dispatching())."""
+    A line without its own parseable timestamp (this log interleaves timestamped
+    and raw lines) is bounded by the NEXT timestamp seen AFTER it in the file, or
+    "now" if none follows — never by the last one seen before it. Bounding
+    forward instead of backward is what keeps this fail-open the way the
+    docstring promises: an untimestamped line's true time is unknown, so we
+    judge it by the most-recent reading consistent with the log, and only treat
+    it as stale when even that generous reading is still outside the window.
+    (gate feedback on this function's first cut, ga-rwpwz8: bounding backward
+    let one old timestamp 'poison' every untimestamped line after it — including
+    a genuinely current one during a live outage, where fresh Dolt-dependent
+    timestamped lines are exactly what stops appearing — silently
+    under-counting real signal. Same error-vs-empty collapse this function
+    exists to eliminate, just inverted.)"""
     try:
         with open(SUPERVISOR_LOG) as f:
             try:
@@ -883,12 +890,13 @@ def dolt_instability():
         return 0
     cutoff = time.time() - DOLT_INSTABILITY_WINDOW_SEC
     hits = 0
-    last_ts = None
-    for line in tail.splitlines():
+    next_ts = time.time()  # nothing later seen yet → bound trailing lines by "now"
+    for line in reversed(tail.splitlines()):
         ts = _sup_log_ts_epoch(line)
         if ts is not None:
-            last_ts = ts
-        if last_ts is not None and last_ts < cutoff:
+            next_ts = ts
+        effective_ts = ts if ts is not None else next_ts
+        if effective_ts < cutoff:
             continue
         if DOLT_SIG.search(line):
             hits += 1

@@ -144,6 +144,36 @@ if hits == 0:
 else:
     bad("stale real signal outside the time window still counted: %r" % (hits,))
 
+# ── Scenario G2: untimestamped REAL signal after a stale timestamp must still count ────
+#    — the exact gap named in GATE-FEEDBACK (gate_run=ga-eucmoy): a stale last_ts must
+#    not poison a later, currently-happening untimestamped line. Neither noise_line()
+#    nor real_line()'s timestamped=False path was exercised by any scenario above.
+old_secs = m.DOLT_INSTABILITY_WINDOW_SEC + 3660  # ~91min for the 30min default — well outside
+lines = [noise_line(secs_ago=old_secs),                                   # stale, but timestamped
+         real_line("invalid connection", secs_ago=0, timestamped=False)]  # untimestamped ≈ "now"
+hits = dolt_hits_for(lines)
+if hits == 1:
+    ok("gate-feedback repro: a stale (91min-ago) timestamped line followed by an "
+       "untimestamped real-signal line still counts that line (1), not 0 — a stale "
+       "earlier timestamp no longer poisons a later untimestamped line")
+else:
+    bad("gate-feedback REGRESSION: stale timestamp poisoned a later untimestamped real "
+        "line, got hits=%r (expected 1)" % (hits,))
+
+# ── Scenario G3: mirror of G2 — an untimestamped line bounded on BOTH sides by STALE ───
+#    timestamps (nothing recent follows it) must still be excluded, proving the fix is
+#    bounded rather than a blanket "count every untimestamped line" escape hatch ────────
+lines = [real_line("connection reset", secs_ago=old_secs + 120, timestamped=True),
+         real_line("connection reset", secs_ago=old_secs, timestamped=False),
+         real_line("connection reset", secs_ago=old_secs - 60, timestamped=True)]
+hits = dolt_hits_for(lines)
+if hits == 0:
+    ok("an untimestamped real-signal line bounded on both sides by stale (>91min-old) "
+       "timestamps is still excluded (0) — the fix bounds forward to the NEXT timestamp, "
+       "it doesn't just count every untimestamped line")
+else:
+    bad("untimestamped line bounded by two stale timestamps was wrongly counted: %r" % (hits,))
+
 # ── Scenario D: repair_runbook() text branches on the threshold ────────────────────────
 below = m.repair_runbook("2 timeouts em 20min", "/tmp/diag-fake.txt", 0, "gate")
 if "gc dolt restart" not in below and "Causa-raiz mais provável" not in below:
