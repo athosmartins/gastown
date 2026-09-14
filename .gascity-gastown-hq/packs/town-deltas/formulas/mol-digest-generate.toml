@@ -162,23 +162,54 @@ durable state instead, so the window is correct no matter how late this
 step runs:
 
 ```bash
-LATEST_JSON=$(gc bd list --label="digest,{{period}}" --include-infra --all --json --limit=0 2>/dev/null)
-LAST=$(printf '%s' "$LATEST_JSON" | jq -c 'sort_by(.created_at) | reverse | .[0] // empty')
+# No 2>/dev/null on this call (unlike its siblings below) — a real failure
+# here must be visible, not silenced, so it can't be mistaken for the
+# legitimate "no prior digest exists" case checked for next.
+LATEST_JSON=$(gc bd list --label="digest,{{period}}" --include-infra --all --json --limit=0)
+LIST_STATUS=$?
+LOOKUP_OK=false
+if [ "$LIST_STATUS" -eq 0 ] && printf '%s' "$LATEST_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+  LOOKUP_OK=true
+fi
+LAST=""
 LAST_UNTIL=""
-if [ -n "$LAST" ]; then
-  LAST_UNTIL=$(printf '%s' "$LAST" | jq -r '.metadata["digest.until"] // empty')
-  if [ -z "$LAST_UNTIL" ]; then
-    # Pre-fix digest — no digest.since/digest.until metadata yet. Recover
-    # the same value from its title ("Digest: YYYY-MM-DD" is the day it
-    # covered; UNTIL is that day + PERIOD_DAYS — same math as step 3).
-    LAST_DATE=$(printf '%s' "$LAST" | jq -r '.title // empty' | sed -E 's/^Digest: //')
-    if [ -n "$LAST_DATE" ]; then
-      LAST_UNTIL=$(date -u -d "$LAST_DATE + $PERIOD_DAYS day" +%Y-%m-%dT00:00:00Z 2>/dev/null || \
-                   date -u -j -v+${PERIOD_DAYS}d -f '%Y-%m-%d' "$LAST_DATE" +%Y-%m-%dT00:00:00Z)
+if [ "$LOOKUP_OK" = true ]; then
+  LAST=$(printf '%s' "$LATEST_JSON" | jq -c 'sort_by(.created_at) | reverse | .[0] // empty')
+  if [ -n "$LAST" ]; then
+    LAST_UNTIL=$(printf '%s' "$LAST" | jq -r '.metadata["digest.until"] // empty')
+    if [ -z "$LAST_UNTIL" ]; then
+      # Pre-fix digest — no digest.since/digest.until metadata yet. Recover
+      # the same value from its title ("Digest: YYYY-MM-DD" is the day it
+      # covered; UNTIL is that day + PERIOD_DAYS — same math as step 3).
+      LAST_DATE=$(printf '%s' "$LAST" | jq -r '.title // empty' | sed -E 's/^Digest: //')
+      if [ -n "$LAST_DATE" ]; then
+        LAST_UNTIL=$(date -u -d "$LAST_DATE + $PERIOD_DAYS day" +%Y-%m-%dT00:00:00Z 2>/dev/null || \
+                     date -u -j -v+${PERIOD_DAYS}d -f '%Y-%m-%d' "$LAST_DATE" +%Y-%m-%dT00:00:00Z)
+      fi
     fi
   fi
 fi
 ```
+
+**If `$LOOKUP_OK` is not `true`:** the lookup failed (non-zero exit — see
+the error printed above) or returned something that isn't a confirmed
+JSON array. That is a different case from a confirmed-empty history
+(`[]`, a legitimate cold start, handled in step 3 below) — collapsing the
+two was exactly the gate feedback on this fix's first attempt (ga-c6yys3):
+falling through to cold-start on a query failure would silently reset
+SINCE to "yesterday" and skip any real, older history with no error,
+count, or signal, the exact failure class this fix exists to eliminate,
+just triggered by a failed query instead of wall-clock drift. Do not
+proceed to step 3. Instead:
+
+```bash
+gc bd comment <this-step-bead-id> "determine-period: prior-digest lookup ('gc bd list --label=digest,{{period}} ...') failed or returned a non-array result (exit=$LIST_STATUS) — cannot distinguish 'no prior digest exists' from 'query failed.' Not closing this step; leaving in_progress for retry."
+gc runtime drain-ack && exit
+```
+
+Leaving the step open (not closed) lets the existing reclaim/redispatch
+cycle retry it fresh instead of this step guessing a window it can't
+confirm.
 
 **3. Compute SINCE/UNTIL/DATE:**
 
