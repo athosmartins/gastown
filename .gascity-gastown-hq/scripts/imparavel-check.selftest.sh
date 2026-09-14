@@ -55,6 +55,15 @@ eq("pilot:held-until repeated 7x (held-loop) still parks", C("b", ["ctx:ready"]
 
 print("── ga-hzt8s: PARKING_LABELS now sourced from canonical park_labels.py — "
       "labels this file didn't previously recognize also park ──")
+# ga-58bnot: kept intentionally as-is. This file only ever READS classify_bead's
+# verdict to decide whether to alarm "stuck" — it never adds/removes a label, so
+# treating needs-label-review as "parked" here is harmless (suppresses a false
+# stall alarm while a human hasn't confirmed the reconciler's keyword flag yet).
+# bead_state.py's PARK_EXACT (a DIFFERENT vocabulary, consulted by consumers that
+# DO mutate labels — lifecycle-coherence-janitor.sh's R4/R8) dropped
+# needs-label-review for the opposite reason: there, it was silently disarming
+# approved+armed beads (wa-ycawt). The two vocabularies now diverge on this one
+# label ON PURPOSE — see bead_state.py's PARK_EXACT comment for the full story.
 eq("needs-label-review", C("b", ["needs-label-review"], NONE)[0], "parked")
 eq("phone-proxy", C("b", ["ctx:ready", "phone-proxy"], NONE)[0], "parked")
 eq("story:refinement-in-progress", C("b", ["ctx:ready", "story:refinement-in-progress"], NONE)[0], "parked")

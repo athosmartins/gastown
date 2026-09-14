@@ -1100,6 +1100,8 @@ if [ "${1:-}" = "--selftest" ]; then
   # story:blocked — dedup guard: must be processed exactly once, not once per arm-label pass),
   # r8-locked (ctx:ready+needs-human, advisory-locked — must be SKIPPED like R4-R7),
   # r8-clean-auto/r8-clean-ready (arm label, no park label — must be left alone).
+  # r8-flag-only (ga-58bnot: BOTH arm labels+needs-label-review — a heuristic keyword
+  # flag, not a confirmed park reason — must be left alone, same as r8-clean-*).
   # R7 fixtures (list --all): 3 historical recurrences (wa-o4kuh epic+molecule, wa-06yog
   # needs-approval+sling, wa-8yw4i.1 in-progress escalated-refino+molecule+step+sling — id has a
   # literal dot to regression-test regex-escaping) + one bead per remaining exclusion label
@@ -1214,10 +1216,14 @@ case "\$a" in
   # needs-human), r8-parked-both (BOTH arm labels + story:blocked — one bead, one pass,
   # dedup guard), r8-locked (ctx:ready + needs-human, advisory-locked — must be skipped),
   # r8-clean-auto/r8-clean-ready (arm label, no park label — must be left alone).
+  # r8-flag-only (ga-58bnot, wa-ycawt): BOTH arm labels + needs-label-review — the
+  # approved-state-reconciler.py keyword-flag label, NOT a confirmed park reason
+  # (bead_state.py's PARK_EXACT no longer includes it, see its own comment) — must be
+  # left alone exactly like r8-clean-auto/r8-clean-ready, never stripped.
   *"list -l exec:auto --json"*)
-    echo '[{"id":"r8-parked-auto","labels":["exec:auto","pool:refused:engine-rebuild-required"]},{"id":"r8-parked-auto2","labels":["exec:auto","pool:refused:some-other-reason"]},{"id":"r8-parked-both","labels":["exec:auto","ctx:ready","story:blocked"]},{"id":"r8-clean-auto","labels":["exec:auto","lane:small"]},{"id":"r8-parked-canon-exact","labels":["exec:auto","framework:engine"]},{"id":"r8-parked-canon-prefix","labels":["exec:auto","pilot:refused-reason:engine-rebuild-required"]}]' ;;
+    echo '[{"id":"r8-parked-auto","labels":["exec:auto","pool:refused:engine-rebuild-required"]},{"id":"r8-parked-auto2","labels":["exec:auto","pool:refused:some-other-reason"]},{"id":"r8-parked-both","labels":["exec:auto","ctx:ready","story:blocked"]},{"id":"r8-clean-auto","labels":["exec:auto","lane:small"]},{"id":"r8-parked-canon-exact","labels":["exec:auto","framework:engine"]},{"id":"r8-parked-canon-prefix","labels":["exec:auto","pilot:refused-reason:engine-rebuild-required"]},{"id":"r8-flag-only","labels":["exec:auto","ctx:ready","story:approved","needs-label-review"]}]' ;;
   *"list -l ctx:ready --json"*)
-    echo '[{"id":"r8-parked-ready","labels":["ctx:ready","needs-human"]},{"id":"r8-parked-both","labels":["exec:auto","ctx:ready","story:blocked"]},{"id":"r8-locked","labels":["ctx:ready","needs-human"]},{"id":"r8-clean-ready","labels":["ctx:ready","lane:small"]},{"id":"r8-parked-canon-blockedon","labels":["ctx:ready","blocked-on:wa-d9a0j"]}]' ;;
+    echo '[{"id":"r8-parked-ready","labels":["ctx:ready","needs-human"]},{"id":"r8-parked-both","labels":["exec:auto","ctx:ready","story:blocked"]},{"id":"r8-locked","labels":["ctx:ready","needs-human"]},{"id":"r8-clean-ready","labels":["ctx:ready","lane:small"]},{"id":"r8-parked-canon-blockedon","labels":["ctx:ready","blocked-on:wa-d9a0j"]},{"id":"r8-flag-only","labels":["exec:auto","ctx:ready","story:approved","needs-label-review"]}]' ;;
   # R9 (ga-hqvel): closed+pilot:dispatched / closed+pilot:dispatching → strip. r9pd-closed
   # and r9pding-closed prove each label family independently; r9pd-locked (advisory-locked,
   # see lock-planting below) proves R9 honors the same lock convention as R3-R8.
@@ -1459,6 +1465,7 @@ GITSHIM
   grep -q 'r8-locked' "$ACT" && bad "R8: touched an advisory-locked parked+armed bead (must be skipped, matches R4-R7 convention)" || ok "R8: skipped the advisory-locked bead (r8-locked)"
   grep -q 'r8-clean-auto' "$ACT" && bad "R8: touched an exec:auto bead with NO park label (false positive)" || ok "R8: left a clean exec:auto bead alone (no park label)"
   grep -q 'r8-clean-ready' "$ACT" && bad "R8: touched a ctx:ready bead with NO park label (false positive)" || ok "R8: left a clean ctx:ready bead alone (no park label)"
+  grep -q 'r8-flag-only' "$ACT" && bad "R8 (ga-58bnot): stripped exec:auto/ctx:ready from a bead carrying only needs-label-review (approved-state-reconciler.py's heuristic keyword flag, not a confirmed park reason — reproduces the wa-ycawt incident)" || ok "R8 (ga-58bnot): left a needs-label-review-flagged armed bead alone (ctx:ready+exec:auto intact, wa-ycawt regression)"
 
   # R8 canonical-park widening (ga-8lrud): labels the OLD 3-signal check could
   # never catch (framework:engine is PARK_EXACT; pilot:refused-reason:*/

@@ -146,13 +146,32 @@ PARK_EXACT = frozenset({
     "engine-window:pending",  # distinto de needs:engine-window (Fase 2 batched
                                # deliberadamente, não bloqueada — nomes quase iguais,
                                # significados opostos)
-    # ga-98inr: absorvido de park_labels.py — 10 ocorrências medidas na
-    # população viva (09/08), sem forma sufixada observada. "story:needs-human"
-    # NÃO é nova aqui (não-blocking, achado pelo reviewer no gate_run=ga-wdl56):
-    # já estava presente linha ~100 desde antes desta fatia (commit cfc0da0882)
-    # — frozenset dedup tornava a duplicata inofensiva, mas o comentário
-    # anterior implicava 2 absorções novas quando só "needs-label-review" é.
-    "needs-label-review",
+    # ga-98inr absorveu "needs-label-review" de park_labels.py aqui (10
+    # ocorrências medidas na população viva, 09/08) — REVERTIDO por ga-58bnot
+    # (2026-09-14, caso wa-ycawt). "needs-label-review" não é um park de
+    # verdade: é o FLAG_REVIEW_LABEL que approved-state-reconciler.py's
+    # _keyword_flags() estampa quando um KEYWORD heurístico bate no título/body
+    # sem nenhum label de rota explícito — e o próprio reconciler garante, no
+    # código (§4 HARD RAIL) e no comentário que posta, que isso NUNCA muda o
+    # estado operacional do bead ("bead permanece story:approved"). Com
+    # "needs-label-review" em PARK_EXACT, esse contrato quebrava por um
+    # caminho que o reconciler não controla: R8 (park-arm-invariant, abaixo em
+    # lifecycle-coherence-janitor.sh) trata QUALQUER membro de PARK_EXACT como
+    # "parked de verdade" e tira ctx:ready/exec:auto — e a regra 4 deste
+    # derive() faz o mesmo para o estado "parked" do painel. wa-ycawt (task
+    # aprovada, armada, com "aguardando <status de lei>" no título) foi
+    # flagada por um falso-positivo de keyword, R8 desarmou ctx:ready+exec:auto
+    # na sweep seguinte, e a bead ficou aberta/desarmada/sem alarme por horas.
+    # A exclusão de backlog-stall em park_labels.py's PARK_LABELS (consumida só
+    # por imparavel-check.py e throughput-stall-watchdog.py, ambos read-only —
+    # nunca removem/adicionam label) continua incluindo "needs-label-review":
+    # suprimir um alarme de "por que não está fluindo" enquanto um humano não
+    # confirmou o flag é seguro, porque não desarma nada. O que não é seguro é
+    # um consumidor que MUTA labels (R4/R8) tratar um palpite heurístico como
+    # bloqueio confirmado. As duas fontes agora divergem DE PROPÓSITO — ver
+    # o comentário em park_labels.json/needs_human sobre NEEDS_HUMAN_BARE_LABEL
+    # (ga-m0ksy), que já tinha antecipado esse mesmo cuidado num consumidor
+    # irmão.
 })
 # ga-98inr: pilot:reclaim-count:N é um LIMIAR NUMÉRICO, não um label a listar —
 # a mesma lição que park_labels.py já pagou uma vez (ga-hzt8s comment: uma versão

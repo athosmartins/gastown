@@ -891,10 +891,47 @@ def test_gate_active_true_conta_mesmo_sem_o_label_sincronizado():
 # "canônico" que bead_state.py não conhecia. Cada caso abaixo corresponde a um
 # label medido na população viva (candidatos story:approved/ctx:ready, 09/08)
 # que ficava sem classificação de park neste módulo.
+#
+# ga-58bnot (2026-09-14): a absorção de "needs-label-review" foi REVERTIDA (só
+# essa entrada — as outras seguem válidas). Ver PARK_EXACT acima e os 3 testes
+# logo abaixo para o porquê e o repro completo (wa-ycawt).
 
-def test_needs_label_review_e_parked():
-    """10 ocorrências na população viva (ex.: wa-5b6yw, sem outro label de freio)."""
-    assert derive(b(labels=["ctx:ready", "needs-label-review"]), None, CREWS)["state"] == "parked"
+def test_needs_label_review_sozinho_nao_e_parked():
+    """ga-58bnot (2026-09-14, caso wa-ycawt) REVERTE a expectativa original desta
+    função (ga-98inr: "10 ocorrências na população viva, sem outro label de
+    freio" -> "parked"). "needs-label-review" é o FLAG_REVIEW_LABEL que
+    approved-state-reconciler.py estampa quando um KEYWORD heurístico bate,
+    sem nenhum label de rota explícito -- e o próprio reconciler garante que
+    isso nunca muda o estado operacional do bead ("bead permanece
+    story:approved"). Tratá-lo como PARK_EXACT quebrava esse contrato: uma
+    bead aprovada+armada (story:approved+ctx:ready+exec:auto) flagada por um
+    falso-positivo de keyword ("aguardando <status de lei>" no título) virava
+    "parked" e R8 (park-arm-invariant) tirava ctx:ready/exec:auto na sweep
+    seguinte -- sem o flag ter confirmado bloqueio nenhum. Sem NENHUM outro
+    label de freio, esta bead agora cai no heurístico normal (backlog, já que
+    não tem story:approved/ctx:ready+exec:auto juntos aqui) -- ver
+    test_needs_label_review_nao_desarma_bead_aprovada_e_armada abaixo para o
+    caso real (wa-ycawt) com o shape completo."""
+    assert derive(b(labels=["ctx:ready", "needs-label-review"]), None, CREWS)["state"] == "backlog"
+
+
+def test_needs_label_review_nao_desarma_bead_aprovada_e_armada():
+    """Repro direto de wa-ycawt/ga-58bnot: bead já aprovada E armada (ctx:ready+
+    exec:auto+gc.routed_to) que leva o flag heurístico continua 'ready' --
+    nunca 'parked'. Antes do fix, PARK_EXACT continha "needs-label-review" e
+    esta mesma entrada virava "parked" (regra 4 vence a regra 11/ARMED)."""
+    st = derive(b(labels=["story:approved", "ctx:ready", "exec:auto", "needs-label-review"],
+                  metadata={"gc.routed_to": "wa-worker"}), None, CREWS)
+    assert st["state"] == "ready"
+
+
+def test_needs_label_review_nao_mascara_park_real():
+    """O flag heurístico não pode ESCONDER um park de verdade quando os dois
+    labels coexistem -- a correção é sobre needs-label-review NÃO bastar
+    sozinho, não sobre ele suprimir outros sinais."""
+    st = derive(b(labels=["story:approved", "ctx:ready", "exec:auto",
+                           "needs-label-review", "story:blocked"]), None, CREWS)
+    assert st["state"] == "parked"
 
 
 def test_story_needs_human_e_parked():

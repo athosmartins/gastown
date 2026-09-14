@@ -3888,6 +3888,12 @@ def _selftest():
     print("\nScenario ga-hzt8s-1: _bead_is_braked — newly-added park labels (deliverable 2, "
           "sourced from the canonical park_labels.py) now excluded from backlog")
     _ghz_cases = [
+        # ga-58bnot: this legacy (park_labels.py-based) check still says True for
+        # needs-label-review, and that's fine to leave as-is — it's harmless here
+        # (this function never mutates labels, only suppresses an alarm). But it no
+        # longer reflects this file's ACTUAL runtime verdict: _canonical_is_braked is
+        # checked FIRST (see ga-98inr-1 below) and now disagrees on purpose. See the
+        # ga-98inr-1 case for needs-label-review for the real behavior + why.
         (["story:approved", "needs-label-review"], True, "needs-label-review"),
         (["ctx:ready", "waiting-on:wa-9999"], True, "waiting-on:* (standalone, previously "
          "only blocked-on:*/blocked-reason:* were covered)"),
@@ -3941,6 +3947,18 @@ def _selftest():
          "story:needs-human (bead_state.py-only gap)"),
         ({"status": "open", "labels": ["story:approved", "ctx:ready"]}, False,
          "no park label — genuinely backlog (canonical model agrees with the old check)"),
+        ({"status": "open", "labels": ["needs-label-review"]}, False,
+         "ga-58bnot: needs-label-review alone — INTENTIONAL divergence from the legacy "
+         "check (ga-hzt8s-1 above still says braked=True for this same label). "
+         "needs-label-review is approved-state-reconciler.py's heuristic keyword-flag "
+         "label, not a confirmed park reason — bead_state.py's PARK_EXACT dropped it "
+         "(wa-ycawt incident: it was silently disarming approved+armed beads via R8 in "
+         "lifecycle-coherence-janitor.sh). Since _canonical_is_braked is checked FIRST "
+         "and returns a definite verdict here (not None), this file's REAL runtime "
+         "behavior for a needs-label-review-only bead is now 'counted as backlog, not "
+         "excluded' — the legacy park_labels-based exclusion never actually fires for "
+         "it anymore. This is deliberate: a heuristic flag pending human review should "
+         "not silently suppress a genuine 'why isn't this moving' stall signal either."),
     ]
     for _g98_bead, _g98_expect, _g98_desc in _g98_cases:
         _g98_got = _canonical_is_braked(_g98_bead)
