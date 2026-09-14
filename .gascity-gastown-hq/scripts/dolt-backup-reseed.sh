@@ -38,6 +38,9 @@
 # diferentes; só a segunda autoriza remover a anterior.
 set -uo pipefail
 
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dolt-offline-backup-sync.sh"
+
 DB="${1:-}"
 CITY="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
 BACKUP_ROOT="${GC_BACKUP_ARTIFACT_DIR:-$CITY/.dolt-backup}"
@@ -59,6 +62,17 @@ LOG="${RESEED_LOG:-$CITY/.gc/logs/dolt-backup-reseed.log}"
 DISK_MARGIN_PCT="${RESEED_DISK_MARGIN_PCT:-250}"
 DOLT_BIN="${DOLT_BIN:-dolt}"
 GC_BIN="${GC_BIN:-gc}"
+# ga-o3nqy2: wiring for the shared server-free sync (dolt-offline-backup-sync.sh).
+# Read only by that sourced file's functions, not visibly within this one —
+# the static analyzer can't see across the dynamic source path below.
+# shellcheck disable=SC2034
+OFFLINE_SYNC_DOLT_CFG="$CITY/.gc/runtime/packs/dolt/dolt-config.yaml"
+# shellcheck disable=SC2034
+OFFLINE_SYNC_DOLT_BIN="$DOLT_BIN"
+# shellcheck disable=SC2034
+OFFLINE_SYNC_LOG="$LOG"
+# shellcheck disable=SC2034
+OFFLINE_SYNC_TIMEOUT=1800                 # same budget the old server-mediated sync step used
 
 mkdir -p "$(dirname "$LOG")" 2>/dev/null
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [reseed] $*" | tee -a "$LOG"; }
@@ -69,7 +83,6 @@ die() { log "ABORTADO: $*"; exit 1; }
 BACKUP_DIR="$BACKUP_ROOT/$DB"
 NEW_DIR="$BACKUP_DIR.new"
 OLD_DIR="$BACKUP_DIR.old"
-REMOTE="reseed-$DB"
 
 log "=== re-seed de '$DB' ==="
 
@@ -101,20 +114,15 @@ fi
 [ -e "$NEW_DIR" ] && die "$NEW_DIR já existe — resíduo de uma execução anterior. Investigue antes; não vou sobrescrever backup."
 [ -e "$OLD_DIR" ] && die "$OLD_DIR já existe — resíduo de uma execução anterior. Investigue antes."
 
-cleanup_remote() {
-  timeout 30 "$GC_BIN" dolt sql -q "USE \`$DB\`; CALL DOLT_BACKUP('remove','$REMOTE')" >/dev/null 2>&1
-}
-trap cleanup_remote EXIT
-
 # ── Passo 1: backup novo, em local novo ───────────────────────────────────────
+# ga-o3nqy2: server-free (dolt-offline-backup-sync.sh) — sem isso, o mesmo
+# CALL DOLT_BACKUP via servidor que falha no hq desde 11/09 (corte de conexão
+# em 30s, listener.read_timeout_millis) falharia aqui igual, e para hq
+# (6,8GB+) um sync completo estoura esse timeout com folga.
 mkdir -p "$NEW_DIR" || die "não consegui criar $NEW_DIR"
-log "registrando remote temporário '$REMOTE' -> $NEW_DIR"
-timeout 60 "$GC_BIN" dolt sql -q "USE \`$DB\`; CALL DOLT_BACKUP('add','$REMOTE','file://$NEW_DIR')" >/dev/null 2>&1 \
-  || die "falhou ao registrar o remote temporário"
-
-log "sincronizando (backup completo do estado ATUAL)..."
-timeout 1800 "$GC_BIN" dolt sql -q "USE \`$DB\`; CALL DOLT_BACKUP('sync','$REMOTE')" >/dev/null 2>&1 \
-  || { rm -rf "$NEW_DIR"; die "sync falhou. Nada foi trocado; o backup antigo segue intacto."; }
+log "sincronizando via caminho offline (sem servidor, sem timeout de conexão)..."
+_offline_backup_sync "$DB" "$NEW_DIR" \
+  || { rm -rf "$NEW_DIR"; die "sync offline falhou. Nada foi trocado; o backup antigo segue intacto."; }
 
 NEW_FILES=$(find "$NEW_DIR" -name "*.darc" 2>/dev/null | wc -l | tr -d ' ')
 OLD_FILES=$(find "$BACKUP_DIR" -name "*.darc" 2>/dev/null | wc -l | tr -d ' ')
@@ -124,8 +132,8 @@ log "backup novo: $NEW_FILES arquivo(s) | antigo: $OLD_FILES arquivo(s)"
 # Este passo é o motivo do script existir. Sem ele estaríamos trocando um backup
 # provado por um desconhecido -- exatamente o risco que a regra proíbe.
 VERIFY_DIR=$(mktemp -d "/tmp/reseed-verify-$DB.XXXXXX") || die "não consegui criar diretório de verificação"
-cleanup_all() { cleanup_remote; rm -rf "$VERIFY_DIR" 2>/dev/null; }
-trap cleanup_all EXIT
+cleanup_verify_dir() { rm -rf "$VERIFY_DIR" 2>/dev/null; }
+trap cleanup_verify_dir EXIT
 
 log "restaurando o backup novo para conferência..."
 if ! ( cd "$VERIFY_DIR" && timeout 1800 "$DOLT_BIN" backup restore "file://$NEW_DIR" "${DB}_verify" >/dev/null 2>&1 ); then
@@ -144,7 +152,6 @@ fi
 # (que acontece durante a restauração), mas encurta a janela em que ele
 # persiste — antes ficava ocupado até o fim do script, atravessando a troca.
 rm -rf "$VERIFY_DIR" 2>/dev/null
-trap cleanup_remote EXIT
 
 log "conferência: restaurado=$RESTORED_COUNT vs vivo=$LIVE_COUNT"
 # A origem pode ter crescido durante o sync (a cidade escreve o tempo todo), por

@@ -26,6 +26,9 @@
 # and a single-instance lock. Restore procedure: see RESTORE section at the bottom.
 set -uo pipefail
 
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dolt-offline-backup-sync.sh"
+
 CITY="/Users/athos/gt/.gascity-gastown-hq"
 DOLT_CFG="$CITY/.gc/runtime/packs/dolt/dolt-config.yaml"
 BACKUP_ROOT="$CITY/.dolt-backup"          # local staging (incremental; gc-doctor expects it)
@@ -48,6 +51,17 @@ SYNC_TIMEOUT=600                          # per-db native DOLT_BACKUP sync
 S3_TIMEOUT=1200                           # per-db aws s3 sync
 PREFLIGHT_TIMEOUT=30                       # server reachability probe
 RETRY_WAITS_SEC="20 60 120"               # ga-gdsq5: escalating pauses, one connection-timeout retry per wait
+# ga-o3nqy2: wiring for the shared server-free fallback (dolt-offline-backup-sync.sh).
+# Read only by that sourced file's functions, not visibly within this one —
+# the static analyzer can't see across the dynamic source path below.
+# shellcheck disable=SC2034
+OFFLINE_SYNC_DOLT_CFG="$DOLT_CFG"
+# shellcheck disable=SC2034
+OFFLINE_SYNC_DOLT_BIN="$DOLT"
+# shellcheck disable=SC2034
+OFFLINE_SYNC_LOG="$LOG"
+# shellcheck disable=SC2034
+OFFLINE_SYNC_TIMEOUT="$SYNC_TIMEOUT"      # same per-db budget as the server-mediated sync it falls back from
 
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
@@ -192,12 +206,9 @@ cleanup() { rmdir "$LOCKDIR" 2>/dev/null || true; rm -f "$META" "$RAW" "$SYNC_OU
 trap cleanup EXIT INT TERM
 
 # --- read the Dolt port from the authoritative config each run (NEVER hardcode) ---
-PORT="$(awk '/^listener:/{f=1} f&&/port:/{print $2; exit}' "$DOLT_CFG" 2>/dev/null)"
-case "${PORT:-}" in ''|*[!0-9]*) PORT="" ;; esac
-if [ -z "$PORT" ]; then   # fallback: LISTEN port of the running dolt sql-server
-  PORT="$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk '/dolt/{n=split($9,a,":"); print a[n]; exit}')"
-fi
-case "${PORT:-}" in ''|*[!0-9]*) PORT="" ;; esac
+# Shared with dolt-offline-backup-sync.sh's own port check (ga-o3nqy2) so
+# there is exactly one place that knows how to find the live port.
+PORT="$(_offline_sync_live_port)"
 if [ -z "$PORT" ]; then log "FATAL: could not determine Dolt port"; notify_fail "backup off-box abortado: porta do Dolt desconhecida"; exit 0; fi
 
 dsql() { DOLT_CLI_PASSWORD='' "$DOLT" --host "$HOST" --port "$PORT" --user root --no-tls sql "$@"; }
@@ -283,7 +294,16 @@ for db in $DBS; do
       # via escalating waits (RETRY_WAITS_SEC) to give a possibly-different
       # load window a few chances instead of just one.
       if ! _sync_with_connection_timeout_retry "$db"; then
-        failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"; continue
+        # ga-o3nqy2: retries exhausted — the bottleneck is the SERVER
+        # CONNECTION (30s listener.read_timeout_millis), not the data, so no
+        # amount of retrying the same server-mediated call would help (this
+        # is why hq has failed every night since 2026-09-11). Fall back to
+        # the server-free path before giving up on this db.
+        log "$db: connection-timeout retries exhausted — falling back to offline sync (no server involved)"
+        if ! _offline_backup_sync "$db" "$dest"; then
+          failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"; continue
+        fi
+        log "$db: offline-sync fallback OK"
       fi
     else
       log "$db: DOLT_BACKUP sync FAILED"; failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"; continue
