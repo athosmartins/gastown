@@ -85,6 +85,28 @@
 # the molecule — as a no-op instead of re-sending. Wall-clock is now used
 # only for that upper cap, never as the anchor, so an arbitrarily late
 # execution can no longer produce the wrong window, only a later one.
+#
+# Follow-up (ga-c6yys3, gate-fix-attempt 2, 2026-09-14): the paragraph
+# above claimed capping UNTIL at TODAY_FLOOR only ever produces "a later"
+# window, never a wrong one — false for any {{period}} longer than a
+# single day. Gate feedback (gate_run=ga-7bi03j): once SINCE lands within
+# PERIOD_DAYS of today, the cap silently shortens UNTIL below a full
+# period instead of waiting for one to elapse, and that short UNTIL then
+# becomes the next run's SINCE — so a weekly digest dispatched more often
+# than every 7 days (routine during catch-up after a stall, which step 3's
+# own comment already treats as expected) degrades permanently into daily
+# windows mislabeled "weekly," every run, forever, the same silent-drift
+# failure class this fix exists to eliminate. PERIOD_DAYS=1 never showed
+# this because its capped candidate lands exactly on TODAY_FLOOR, which by
+# then already equals SINCE — step 4's nothing-new guard caught that case
+# by coincidence, not by design. Fix: a capped (not-yet-elapsed) candidate
+# now sets UNTIL=SINCE instead of UNTIL=TODAY_FLOOR, so step 4's existing
+# guard closes the run as a no-op instead of sending a partial period, and
+# $SINCE (never archived) is unchanged for the next run to re-evaluate.
+# Cold start's SINCE is now anchored PERIOD_DAYS back (was hardcoded one
+# day back regardless of period) — required by the same change: an
+# unanchored weekly cold start would otherwise always compute a
+# not-yet-elapsed candidate, always defer, and never send a first digest.
 description = """
 Generate activity digest for the mayor.
 
@@ -228,19 +250,45 @@ else
   # True cold start only — no prior digest bead found at all (the label
   # filter above matched nothing, e.g. a brand-new city). Every later run
   # anchors on $LAST_UNTIL above instead; this branch should fire at most
-  # once ever, per city. Same exact-midnight idiom as TODAY_FLOOR above,
-  # for the same reason (date -d/-j 'yesterday 00:00' drifts a few
-  # seconds past :00 on this install's BSD date).
-  SINCE="$(date -u -v-1d +%Y-%m-%d 2>/dev/null || date -u -d yesterday +%Y-%m-%d)T00:00:00Z"
+  # once ever, per city. Anchored $PERIOD_DAYS back, not a hardcoded one
+  # day (gate-fix-attempt 2, ga-c6yys3): a fixed "-1d" made UNTIL_CANDIDATE
+  # below land 6 days past TODAY_FLOOR on every weekly cold start, which
+  # after this same fix's capping change (step 3 below) always defers —
+  # and since nothing gets archived on a deferred run, the next run
+  # recomputes the identical one-day-back SINCE relative to its own later
+  # "now," never converging. Anchoring PERIOD_DAYS back instead makes
+  # UNTIL_CANDIDATE land exactly on TODAY_FLOOR — a full period, sent
+  # immediately, same as before this change for the daily case
+  # (PERIOD_DAYS=1 reproduces the old "-1d" exactly). Same exact-midnight
+  # idiom as TODAY_FLOOR above, for the same reason (date -d/-j 'N days
+  # ago 00:00' drifts a few seconds past :00 on this install's BSD date).
+  SINCE="$(date -u -v-${PERIOD_DAYS}d +%Y-%m-%d 2>/dev/null || date -u -d "${PERIOD_DAYS} days ago" +%Y-%m-%d)T00:00:00Z"
 fi
 UNTIL_CANDIDATE=$(date -u -d "$SINCE + $PERIOD_DAYS day" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
   date -u -j -v+${PERIOD_DAYS}d -f '%Y-%m-%dT%H:%M:%SZ' "$SINCE" +%Y-%m-%dT%H:%M:%SZ)
-# Never cover a day that hasn't fully elapsed yet, however far behind
-# $SINCE is — one period per run, same bound as before this fix. If
-# there's a multi-day backlog, later runs (next dispatch cycles) keep
-# advancing by one period each, until caught up.
+# A run must cover a FULL $PERIOD_DAYS window or none at all — never a
+# short one (gate-fix-attempt 2, ga-c6yys3). Capping a not-yet-elapsed
+# candidate down to TODAY_FLOOR (the prior version of this fix) silently
+# produces a shorter-than-$PERIOD_DAYS window whenever this step runs more
+# than once per $PERIOD_DAYS while catching up — routine for a weekly
+# digest dispatched off a shorter cooldown, per step 3's own comment
+# above. Once SINCE lands within $PERIOD_DAYS of today, every subsequent
+# catch-up run would re-anchor SINCE close to today and get capped again,
+# permanently degrading "weekly" into daily digests under a weekly label.
+# $PERIOD_DAYS=1 never showed this: its capped candidate lands exactly on
+# TODAY_FLOOR, which by then already equals SINCE, so step 4's guard below
+# already caught it — coincidence, not design. Generalize that same
+# protection to any $PERIOD_DAYS: when a full period hasn't elapsed yet,
+# set UNTIL=SINCE (not TODAY_FLOOR) so step 4 closes this run as a no-op
+# instead of sending a partial period. $SINCE is never archived in that
+# branch, so the next run (once enough wall-clock time has actually
+# passed) re-anchors to the same $LAST_UNTIL and re-evaluates, rather than
+# drifting forward on a window that was never really sent. When a full
+# period HAS elapsed, this still advances by exactly one period per run,
+# same as before — a multi-day/week backlog still catches up one period
+# per later run, until caught up.
 if [[ "$UNTIL_CANDIDATE" > "$TODAY_FLOOR" ]]; then
-  UNTIL="$TODAY_FLOOR"
+  UNTIL="$SINCE"
 else
   UNTIL="$UNTIL_CANDIDATE"
 fi
@@ -252,14 +300,18 @@ as the same session continues (the normal case). If you're resuming a
 stalled molecule in a fresh session instead, re-run this step's bash
 before trusting any of the three.
 
-**4. Nothing-new guard.** If `$SINCE` is not strictly before `$UNTIL`, the
-last digest already covers everything there is to cover right now — this
-run is redundant (the exact near-miss described above). Do not collect
-data or send mail:
+**4. Nothing-new guard.** If `$SINCE` is not strictly before `$UNTIL`, there
+is nothing to send this run — either the last digest already covers
+everything there is to cover right now (the exact near-miss described
+above), or step 3 set `UNTIL=$SINCE` because a full `{{period}}` period
+hasn't elapsed since `$SINCE` yet (gate-fix-attempt 2, ga-c6yys3). Do not
+collect data or send mail either way — a caller diagnosing a "why hasn't
+this digest fired" report should check `$LAST_UNTIL` vs `$TODAY_FLOOR`
+above to tell the two cases apart, not assume it's always the former:
 
 ```bash
 if [[ "$SINCE" > "$UNTIL" || "$SINCE" == "$UNTIL" ]]; then
-  gc bd close <this-step-bead-id> --reason "Nothing new to cover — last digest already through $SINCE (ga-c6yys3). Skipping rest of this molecule as no-ops."
+  gc bd close <this-step-bead-id> --reason "Nothing new to cover — last digest through $SINCE, and either that's still current or a full {{period}} period hasn't elapsed since (ga-c6yys3). Skipping rest of this molecule as no-ops."
 fi
 ```
 
