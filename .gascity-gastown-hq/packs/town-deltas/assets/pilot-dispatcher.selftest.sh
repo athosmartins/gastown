@@ -3961,6 +3961,93 @@ fi
 echo "Scenario 18q2c: drift-guard — condition (f) is wired into framework-dog-exempt"
 has "$DISPATCHER" 'infra-keyword-shadowed' "condition (f) (infra-keyword-shadowed) is wired"
 
+# ── Scenario ga-pmkoar-a/d: framework-dog-exempt reason (g) — gt-prefix framework store ──
+# Mayor ruling (ga-pmkoar): a bead from the framework's OWN beads store (id prefix "gt-")
+# is framework work by construction, unlike a bare "ga-" (HQ) prefix which stays
+# deliberately unresolved (Scenario 18k2/18ak's tie-break conflict). Real shape:
+# gt-4zk4b/gt-ymqjj/gt-69j2v/gt-xu3c5/gt-ar8by, all Mayor- or dog-adhoc-authored (so
+# owner-authoritative/ga-nlh79 never applies), whose text only NAMES whatsapp_automation
+# as the incident's LOCATION (crew/peter, crew/batista worktrees inside that rig).
+echo "Scenario ga-pmkoar-a: gt-prefixed bead naming whatsapp_automation as incident location → dog pool, NOT refused/held"
+GT_PREFIX_BEAD='[{"id":"gt-fwtest","title":"Config de merge driver diverge entre .git e .repo.git no whatsapp_automation","priority":2,"issue_type":"bug","description":"O rig whatsapp_automation tem dois git dirs (.git e .repo.git) com configuracoes de merge driver diferentes entre eles - um dos dois nao tem o driver semantico configurado, entao o resultado do merge diverge conforme o caminho usado.","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"gastown.mayor","created_at":"2026-09-11T00:00:01Z","metadata":{}}]'
+GT_PREFIX_OBJ="$(echo "$GT_PREFIX_BEAD" | jq -c '.[0]')"
+[ "$(_bcr "$GT_PREFIX_OBJ")" = whatsapp_automation ] && ok "precondition: bead_content_rig mis-infers whatsapp_automation (bare 'whatsapp_automation' mention)" || bad "precondition changed: bead_content_rig='$(_bcr "$GT_PREFIX_OBJ")'"
+[ "$(_dom "$GT_PREFIX_OBJ")" != infra ] && ok "precondition: bead_domain is NOT infra (conditions a/f alone would miss this — no dolt/dispatcher/framework/etc keyword)" || bad "precondition changed: bead_domain unexpectedly infra"
+LOG_GTPFX="$(run_capacity 10 "[]" 1 "$GT_PREFIX_BEAD")"
+B_GTPFX="$(dispatched_builder "$LOG_GTPFX")"
+if echo "$B_GTPFX" | grep -qE '^gastown\.dog'; then
+  ok "gt-prefixed bead DISPATCHED to the dog pool ($B_GTPFX) — condition (g) catches what (a)-(f) missed"
+elif [ -z "$B_GTPFX" ] && echo "$LOG_GTPFX" | grep -q "REFUSING"; then
+  bad "REGRESSION (ga-pmkoar): gt-prefixed bead REFUSED to the dog pool + held (the 7th framework-dog-exempt stall shape)"
+else
+  bad "gt-prefixed bead routed unexpectedly (got: '${B_GTPFX:-none}')"
+fi
+echo "$LOG_GTPFX" | grep -q "framework-dog-exempt: gt-fwtest" && ok "exemption logged for the gt-prefix shape" || bad "framework-dog-exempt not logged for the gt-prefix shape"
+echo "$LOG_GTPFX" | grep -q "gt-prefix-framework-store" && ok "exemption reason correctly attributes condition (g)" || bad "exemption did not log the expected condition-(g) reason (gt-prefix-framework-store)"
+echo "$LOG_GTPFX" | grep -q "REFUSING to dispatch whatsapp_automation domain build gt-fwtest" && bad "gt-prefix shape still refused (ga-pmkoar not fixed)" || ok "gt-prefix shape NOT refused (no pilot:held loop)"
+
+echo "Scenario ga-pmkoar-b (control): the SAME content on a ga- (HQ) id does NOT gt-prefix-exempt (Scenario 18k2/18ak's tie-break stays untouched)"
+GA_CONTROL_BEAD='[{"id":"ga-fwctltest","title":"Config de merge driver diverge entre .git e .repo.git no whatsapp_automation","priority":2,"issue_type":"bug","description":"O rig whatsapp_automation tem dois git dirs (.git e .repo.git) com configuracoes de merge driver diferentes entre eles - um dos dois nao tem o driver semantico configurado, entao o resultado do merge diverge conforme o caminho usado.","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"gastown.mayor","created_at":"2026-09-11T00:00:01Z","metadata":{}}]'
+LOG_GACTL="$(run_capacity 10 "[]" 1 "$GA_CONTROL_BEAD")"
+if echo "$LOG_GACTL" | grep -q "gt-prefix-framework-store"; then
+  bad "condition (g) wrongly fired on a ga- (non-gt) id — prefix exemption must stay scoped to gt- only"
+elif echo "$LOG_GACTL" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-fwctltest"; then
+  ok "condition (g) correctly silent on a ga- id — bead stays refused/held exactly as before this fix (unchanged tie-break)"
+else
+  bad "ga- control bead routed unexpectedly (got log: '$(dispatched_builder "$LOG_GACTL")')"
+fi
+
+echo "Scenario ga-pmkoar-c (guard control): PILOT_FRAMEWORK_DOG_EXEMPT=0 reproduces the REFUSE+hold bug for the gt-prefix shape too"
+LOG_GTPFX0="$(PILOT_FRAMEWORK_DOG_EXEMPT=0 run_capacity 10 "[]" 1 "$GT_PREFIX_BEAD")"
+B_GTPFX0="$(dispatched_builder "$LOG_GTPFX0")"
+if [ -z "$B_GTPFX0" ] && echo "$LOG_GTPFX0" | grep -q "REFUSING to dispatch whatsapp_automation domain build gt-fwtest"; then
+  ok "with exemption OFF the gt-prefix bead is REFUSED+held (proves condition (g) is exactly what flips the behaviour)"
+else
+  bad "toggle-off did not reproduce the refuse (knob not wired to condition (g)?) got builder='${B_GTPFX0:-none}'"
+fi
+
+echo "Scenario ga-pmkoar-d: drift-guard — condition (g) is wired into framework-dog-exempt"
+has "$DISPATCHER" 'gt-prefix-framework-store' "condition (g) (gt-prefix-framework-store) is wired"
+
+# ── Scenario ga-pmkoar-e/g: framework-dog-exempt reason (h) — ga-zzqza existence test
+# now ALSO applies in the plain bead_content_rig branch, not just owner-authoritative ──
+# Mayor ruling (ga-pmkoar, part 2): a bead citing a path/basename that resolves to a real
+# file under HQ and under NO product rig is unambiguous framework work, regardless of
+# which branch inferred the mis-routed product rig. Real shape: ga-3bdttu (created_by=
+# gastown.mayor, so owner-authoritative never applies) names "daemon-refresh.sh" (bare
+# filename, no directory) and "painel" (WA symptom mention) in the same bead.
+echo "Scenario ga-pmkoar-e: Mayor-owned bead citing an HQ-only bare filename + WA symptom mention → dog pool"
+HQFILE_CONTENT_BEAD='[{"id":"ga-hqfiletest","title":"daemon-refresh.sh atribui o halt a bead errada quando varias entregas caem na mesma janela","priority":2,"issue_type":"bug","description":"Quando o painel esta rodando ha muito tempo e varias entregas caem na mesma janela de commits, o veredito do daemon-refresh.sh fica pendurado na bead que fechou a janela, nao na que realmente mudou codigo de producao - o daemon nao liga cada arquivo mudado a bead que o produziu.","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"gastown.mayor","created_at":"2026-09-12T00:00:01Z","metadata":{}}]'
+HQFILE_OBJ="$(echo "$HQFILE_CONTENT_BEAD" | jq -c '.[0]')"
+[ "$(_bcr "$HQFILE_OBJ")" = whatsapp_automation ] && ok "precondition: bead_content_rig mis-infers whatsapp_automation (bare 'painel' mention)" || bad "precondition changed: bead_content_rig='$(_bcr "$HQFILE_OBJ")'"
+[ "$(_dom "$HQFILE_OBJ")" != infra ] && ok "precondition: bead_domain is NOT infra (no dolt/dispatcher/framework/etc keyword — conditions a/f alone would miss this)" || bad "precondition changed: bead_domain unexpectedly infra"
+_BCB_FN_PMK="$(awk '/^bead_cited_basenames\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_HAY_FN_PMK="$(awk '/^_bead_path_haystack\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_bcb_pmk() { ( eval "$_HAY_FN_PMK"; eval "$_BCB_FN_PMK"; bead_cited_basenames "$1" ); }
+[ "$(_bcb_pmk "$HQFILE_OBJ")" = "daemon-refresh.sh" ] && ok "precondition: fixture cites bare filename daemon-refresh.sh" || bad "precondition changed: bead_cited_basenames='$(_bcb_pmk "$HQFILE_OBJ")'"
+LOG_HQFILE="$(PILOT_TEST_RIG_HAS_FILE=gascity run_capacity 10 "[]" 1 "$HQFILE_CONTENT_BEAD")"
+B_HQFILE="$(dispatched_builder "$LOG_HQFILE")"
+if echo "$B_HQFILE" | grep -qE '^gastown\.dog'; then
+  ok "HQ-only-basename bead DISPATCHED to the dog pool ($B_HQFILE) — condition (h) catches the bead_content_rig-fallback shape the owner-branch ga-zzqza check could not see"
+elif [ -z "$B_HQFILE" ] && echo "$LOG_HQFILE" | grep -q "REFUSING"; then
+  bad "REGRESSION (ga-pmkoar): HQ-only-basename bead (bead_content_rig-fallback shape) REFUSED to the dog pool + held"
+else
+  bad "HQ-only-basename bead routed unexpectedly (got: '${B_HQFILE:-none}')"
+fi
+echo "$LOG_HQFILE" | grep -q "framework-dog-exempt: ga-hqfiletest" && ok "exemption logged for the bead_content_rig-fallback existence-test shape" || bad "framework-dog-exempt not logged for the bead_content_rig-fallback existence-test shape"
+echo "$LOG_HQFILE" | grep -q "hq-only-basename-exists" && ok "exemption reason correctly attributes condition (h)" || bad "exemption did not log the expected condition-(h) reason (hq-only-basename-exists)"
+
+echo "Scenario ga-pmkoar-f (guard control): PILOT_HQ_PATH_EXISTS_GUARD=0 disables condition (h) too (one knob, both branches)"
+LOG_HQFILE0="$(PILOT_HQ_PATH_EXISTS_GUARD=0 PILOT_TEST_RIG_HAS_FILE=gascity run_capacity 10 "[]" 1 "$HQFILE_CONTENT_BEAD")"
+if echo "$LOG_HQFILE0" | grep -q "hq-only-basename-exists"; then
+  bad "condition (h) fired despite PILOT_HQ_PATH_EXISTS_GUARD=0 (kill-switch not honored)"
+else
+  ok "condition (h) silent when PILOT_HQ_PATH_EXISTS_GUARD=0 (single knob disables both the owner-branch and fallback-branch existence tests)"
+fi
+
+echo "Scenario ga-pmkoar-g: drift-guard — condition (h) is wired into framework-dog-exempt"
+has "$DISPATCHER" 'hq-only-basename-exists' "condition (h) (hq-only-basename-exists) is wired"
+
 # ── Scenario 18r–18w2 (ga-xzfl): PATH-authoritative rig inference ──────────────
 # ROOT: rig inference used KEYWORDS (bead_content_rig/bead_domain) not code PATHS, so a
 # bead ABOUT the router (cites packs/…/pilot-dispatcher.sh + scripts/auto-rehome-janitor.py,

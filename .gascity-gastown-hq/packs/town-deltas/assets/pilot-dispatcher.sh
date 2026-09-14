@@ -8429,6 +8429,79 @@ LIVESEC
             ' 2>/dev/null | grep -iqE '\bdolt\b|gate dispatcher|\breviewer\b|\bdispatcher\b|\bframework\b|headroom|\brefinery\b'; then
             _FW_EXEMPT=1; _FW_REASON="infra-keyword-shadowed(bead_domain=$_FW_DOMAIN)"
           fi
+          # (g) ga-pmkoar: a bead from the FRAMEWORK's own beads store (id prefix "gt-")
+          #     is framework work BY CONSTRUCTION. Unlike a bare "ga-" (HQ) prefix —
+          #     deliberately NOT used as a tie-breaker above (see the NOTE before the
+          #     ga-zzqza existence check): Scenario 18k2's mila-wa-owned "code-mode MCP
+          #     servers" bead is ga-* with zero other signal and must still route to WA
+          #     — "gt-" has no such conflicting scenario. The gt- store never holds a
+          #     product-rig-owned bead, so no existing routing decision depends on
+          #     treating a gt- id as anything but framework; this is a Mayor ruling
+          #     scoped explicitly to "gt-", not a general prefix tie-break.
+          #     Six real beads hit this exact stall, escalated to the Mayor 12/09 (gt-4zk4b, gt-ymqjj,
+          #     gt-69j2v, gt-xu3c5, gt-ar8by, +HQ-side ga-3bdttu — five authored by
+          #     gastown.mayor, one by dog-adhoc, so owner-authoritative (ga-nlh79) never
+          #     applied): their text only NAMES whatsapp_automation/painel/wa-worker as
+          #     the incident's symptom or location, which bead_content_rig's
+          #     WA-INTEGRATION PRECEDENCE misreads as the bead's SUBJECT. Plain case-match
+          #     on STORY_ID (already a bare string); fail-open: any other prefix falls
+          #     through to condition (h).
+          if [ "$_FW_EXEMPT" = "0" ]; then
+            case "$STORY_ID" in
+              gt-*) _FW_EXEMPT=1; _FW_REASON="gt-prefix-framework-store" ;;
+            esac
+          fi
+          # (h) ga-pmkoar: the ga-zzqza/ga-hn3kh HQ-only existence test (above, in the
+          #     owner-authoritative branch) only runs when created_by/assignee is a
+          #     *-wa/*-ps/wa-worker*/ps-worker* owner — it never sees a bead whose
+          #     _DOMAIN_RIG came from the plain bead_content_rig fallback a few lines up
+          #     (the branch the six beads above actually took, since none carries a
+          #     product-crew owner). Mayor ruling (ga-pmkoar, part 2): the SAME existence
+          #     test applies here too — a bead citing a BARE FILENAME (no directory) that
+          #     resolves to a real file under HQ and under NO product rig is unambiguous
+          #     framework work regardless of which branch inferred the product rig.
+          #     Concrete case: ga-3bdttu names "daemon-refresh.sh" (bare filename — counts
+          #     per ga-hn3kh) which exists ONLY at packs/town-deltas/assets/daemon-
+          #     refresh.sh, in neither product rig.
+          #     BASENAMES ONLY, and ONLY when the bead cites NO slash-joined path at all
+          #     — deliberately. A slash-joined path citation is already covered for ANY
+          #     _DOMAIN_RIG (regardless of which branch set it) by the FIX 3 missing-file
+          #     guard a few lines below, which runs unconditionally after this whole block
+          #     and uses bead_cited_paths. bead_cited_basenames' word-boundary regex ALSO
+          #     matches the trailing filename component of a slash-joined path (a "/" is a
+          #     non-word char, so \b fires right after it too) — e.g. "packs/town-deltas/
+          #     assets/gate-marker-rehome-janitor.sh" yields "gate-marker-rehome-janitor.sh"
+          #     as a basename candidate too, NOT just a bare "daemon-refresh.sh" mention.
+          #     Without the bead_cited_paths=="" guard, this condition would fire FIRST on
+          #     every slash-path citation FIX 3 is meant to own — same correct dispatch
+          #     outcome, but under this condition's generic reason instead of FIX 3's own
+          #     specific "ga-xzfl missing-file guard" log line that Scenario 18w asserts on
+          #     (confirmed live: removing bead_cited_paths from the hit-computation alone,
+          #     while still evaluating basenames unconditionally, was NOT enough — Scenario
+          #     18w's fixture has no created_by, so it takes this very fallback branch, and
+          #     its one cited path's trailing component still matched as a "bare" basename).
+          #     Reuses bead_cited_paths/bead_cited_basenames/_rig_has_any_basename and the
+          #     same PILOT_HQ_PATH_EXISTS_GUARD knob as the owner-authoritative check (one
+          #     toggle disables both) — duplicated rather than factored into a shared
+          #     helper to keep this fix's diff (and its blast radius) scoped to the
+          #     fallback branch alone, matching condition (f)'s own precedent for the same
+          #     tradeoff a few lines above.
+          #     Fail-open: no cited basename, any cited path (defers to FIX 3), or the
+          #     probe can't confirm HQ-only ⇒ no exemption from this condition.
+          if [ "$_FW_EXEMPT" = "0" ] && [ "${PILOT_HQ_PATH_EXISTS_GUARD:-1}" = "1" ] \
+             && [ -z "$(bead_cited_paths "$STORY" 2>/dev/null || echo "")" ]; then
+            local _FW_CITED_NAMES=""
+            _FW_CITED_NAMES=$(bead_cited_basenames "$STORY" 2>/dev/null || echo "")
+            if [ -n "$_FW_CITED_NAMES" ]; then
+              local _FWZ_HQ_HIT=0 _FWZ_WA_HIT=0 _FWZ_PS_HIT=0
+              _rig_has_any_basename "gascity" "$_FW_CITED_NAMES" && _FWZ_HQ_HIT=1
+              _rig_has_any_basename "whatsapp_automation" "$_FW_CITED_NAMES" && _FWZ_WA_HIT=1
+              _rig_has_any_basename "property_scrapers" "$_FW_CITED_NAMES" && _FWZ_PS_HIT=1
+              if [ "$_FWZ_HQ_HIT" = "1" ] && [ "$_FWZ_WA_HIT" = "0" ] && [ "$_FWZ_PS_HIT" = "0" ]; then
+                _FW_EXEMPT=1; _FW_REASON="hq-only-basename-exists"
+              fi
+            fi
+          fi
           if [ "$_FW_EXEMPT" = "1" ]; then
             log "framework-dog-exempt: $STORY_ID is gascity-framework work ($_FW_REASON) but bead_content_rig mis-inferred rig=$_DOMAIN_RIG from an incidental keyword — the dog pool ($BUILDER_TARGET) IS its correct builder (HQ checkout, git-diff, gate access). Clearing product-rig inference so the domain-route guard FAILS OPEN (dispatch, not REFUSE+1h-hold). Disable with PILOT_FRAMEWORK_DOG_EXEMPT=0."
             _DOMAIN_RIG=""
