@@ -125,11 +125,22 @@ min_deploy_gap_minutes = 10
 # ─── lexbh ───────────────────────────────────────────────────────────────────
 [[rig]]
 name            = "lexbh"
-runtime_dir     = ""   # no active production runtime identified
+# ga-apcolz: the earlier "no active production runtime identified" comment was
+# stale — the runtime IS ~/.lexbh, served by launchd job br.urblink.lexbh
+# (Flask :7842, dashboard + chat + acervo). An empty deploy_cmd meant every
+# lexbh story halted delivery on "no deploy_cmd for rig 'lexbh'" (ga-aqqj0
+# retry cap; hit on lx-dnw, closed by hand 3 times).
+runtime_dir     = "/Users/athos/.lexbh"
 git_repo        = "/Users/athos/gt/lexbh/.repo.git"
-deploy_cmd      = ""
-daemon_restarts = []
-prod_test_script = ""
+# Fetch + fast-forward-only merge, not `pull --ff-only`: explicit fetch+merge
+# doesn't depend on the runtime clone's tracked upstream actually being
+# origin/main (same rationale as the gascity entry below, ga-rhtu). Fails
+# closed — refuses with no mutation on any local divergence or untracked-file
+# conflict — matching the manual deploy batista-lx already validated live in
+# production (merge --ff-only after a clean fetch; never reset, never clean).
+deploy_cmd      = "git -C /Users/athos/.lexbh fetch origin && git -C /Users/athos/.lexbh merge --ff-only origin/main"
+daemon_restarts = ["br.urblink.lexbh"]
+prod_test_script = "/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/prod-tests/lexbh/run.sh"
 min_deploy_gap_minutes = 5
 
 # ─── gascity (HQ framework itself) ────────────────────────────────────────────
