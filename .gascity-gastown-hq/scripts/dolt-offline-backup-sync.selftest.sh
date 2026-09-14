@@ -176,6 +176,35 @@ else
   ok "scenario E (source db missing): refuses"
 fi
 
+# Scenario G (self-audit finding, gate-done pass): `cp -c -R` can exit nonzero
+# (e.g. one unreadable file mid-tree) while STILL leaving a partial $clone
+# directory behind — confirmed directly: an unreadable file inside the source
+# makes `cp` exit 1 but the destination directory exists with the OTHER files
+# copied. Checking directory-existence alone would treat that partial clone
+# as a clean success and sync it onward. Reproduce the exact mechanism against
+# a real dolt repo: chmod a table file unreadable, confirm the sync refuses
+# rather than proceeding on a partial copy.
+mkdir -p "$DATA_DIR/testdb4" && ( cd "$DATA_DIR/testdb4" && dolt init >/dev/null 2>&1 )
+UNREADABLE_FILE="$(find "$DATA_DIR/testdb4/.dolt/noms" -type f 2>/dev/null | head -1)"
+DEST_G="$WORK/dest-g"
+if [ -n "$UNREADABLE_FILE" ]; then
+  chmod 000 "$UNREADABLE_FILE"
+  if _offline_backup_sync "testdb4" "$DEST_G"; then
+    bad "scenario G (cp exits nonzero on an unreadable file): should have refused, not synced a partial clone"
+  else
+    ok "scenario G (cp exits nonzero on an unreadable file): refuses"
+  fi
+  chmod 644 "$UNREADABLE_FILE"
+  [ ! -e "$DEST_G" ] \
+    && ok "scenario G: dest was never created — a partial clone was never synced onward" \
+    || bad "scenario G: dest '$DEST_G' exists despite the partial-copy refusal"
+  grep -qF "testdb4: offline-sync: clonefile FAILED (rc=" "$OFFLINE_SYNC_LOG" \
+    && ok "scenario G: logged the clonefile-failed line with the nonzero exit code" \
+    || bad "scenario G: missing the rc-aware clonefile-failed log line"
+else
+  bad "scenario G: could not find a noms file under testdb4 to make unreadable — fixture setup broken"
+fi
+
 # ── _offline_sync_same_volume() — the ga-o3nqy2 gate-fix: `man cp` on -c says
 # a cross-volume cp -c does NOT error, it silently falls back to a slow full
 # copy. Reliably reproducing an actual second volume isn't portable across
