@@ -29,6 +29,12 @@ set -uo pipefail
 CITY="/Users/athos/gt/.gascity-gastown-hq"
 DOLT_CFG="$CITY/.gc/runtime/packs/dolt/dolt-config.yaml"
 BACKUP_ROOT="$CITY/.dolt-backup"          # local staging (incremental; gc-doctor expects it)
+# ga-7gfd34: mol-dog-jsonl's archive — a LOCAL-only git repo (no push remote
+# configured; see the bead's prior-art) holding the only fresh copy of every
+# store's bead history as JSONL. Mirrored to S3 below, independent of the
+# per-db DOLT_BACKUP loop.
+JSONL_ARCHIVE_DIR="$CITY/.gc/runtime/packs/maintenance/jsonl-archive"
+JSONL_ARCHIVE_VERIFY_FILE="hq.jsonl"      # post-sync verify target
 BUCKET="urblink-dolt-backups"
 S3="s3://$BUCKET"
 LOG="$CITY/.gc/logs/dolt-s3-backup.log"
@@ -109,6 +115,58 @@ _sync_with_connection_timeout_retry() {
   done
   log "$db: DOLT_BACKUP sync FAILED (after connection-timeout retries)"
   return 1
+}
+
+# jsonl_sizes_match <local_size> <s3_size> — pure comparison shared by the live
+# verify step and the selftest. Empty/non-numeric on EITHER side must NEVER
+# compare equal: an unreadable remote size is the "don't know" case, which
+# has to fail closed (verify FAILED), not silently pass as "no news is good
+# news" (ga-7gfd34).
+jsonl_sizes_match() {
+  local local_size="$1" s3_size="$2"
+  case "$local_size" in ''|*[!0-9]*) return 1 ;; esac
+  case "$s3_size" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$local_size" -eq "$s3_size" ]
+}
+
+# jsonl_offsite_sync — ga-7gfd34: mirror JSONL_ARCHIVE_DIR (mol-dog-jsonl's
+# LOCAL-only git archive; no push remote configured) to S3, excluding .git
+# (~1.1GB of history no restore needs), then verify what actually landed by
+# comparing the size of JSONL_ARCHIVE_VERIFY_FILE locally against the object
+# S3 now reports. Called unconditionally after the per-db loop below,
+# independent of that loop's own ok/failed outcome — a stuck hq DOLT_BACKUP
+# must never skip this.
+#
+# Returns: 0 ok (synced + verified) | 1 failed (sync or verify) | 2 skipped
+# (refused — see the pre-sync guard below).
+#
+# SAFETY: the sync uses --delete to prune S3 objects removed locally, exactly
+# like the per-db syncs above. That makes an unexpectedly-empty/not-yet-
+# populated source directory dangerous — it would read as "everything was
+# removed" and WIPE the offsite copy instead of updating it. Refuse to sync
+# at all unless JSONL_ARCHIVE_VERIFY_FILE is present first, checked BEFORE
+# the destructive call, not after.
+jsonl_offsite_sync() {
+  if [ ! -f "$JSONL_ARCHIVE_DIR/$JSONL_ARCHIVE_VERIFY_FILE" ]; then
+    log "jsonl-offsite: SKIP — $JSONL_ARCHIVE_VERIFY_FILE not present locally (archive looks empty/not yet populated); refusing a --delete sync against it"
+    return 2
+  fi
+  if ! timeout "$S3_TIMEOUT" "$AWS" s3 sync "$JSONL_ARCHIVE_DIR/" "$S3/jsonl-archive/" \
+        --exclude ".git/*" --delete --only-show-errors >> "$LOG" 2>&1; then
+    log "jsonl-offsite: aws s3 sync FAILED"
+    return 1
+  fi
+  local local_size s3_size
+  local_size="$(wc -c < "$JSONL_ARCHIVE_DIR/$JSONL_ARCHIVE_VERIFY_FILE" 2>/dev/null | tr -d ' ')"
+  s3_size="$("$AWS" s3api head-object --bucket "$BUCKET" \
+        --key "jsonl-archive/$JSONL_ARCHIVE_VERIFY_FILE" \
+        --query ContentLength --output text 2>>"$LOG")"
+  if ! jsonl_sizes_match "$local_size" "$s3_size"; then
+    log "jsonl-offsite: verify FAILED — local size=${local_size:-?} s3 size=${s3_size:-?} for $JSONL_ARCHIVE_VERIFY_FILE"
+    return 1
+  fi
+  log "jsonl-offsite: verify OK — $JSONL_ARCHIVE_VERIFY_FILE size=$local_size matches S3"
+  return 0
 }
 
 # Library mode: `DOLT_S3_BACKUP_LIB=1 source dolt-s3-backup.sh` defines the pure
@@ -249,6 +307,21 @@ for db in $DBS; do
   ok=$((ok+1))
 done
 
+# --- JSONL archive offsite mirror (ga-7gfd34) --------------------------------
+# Independent of the per-db loop above — runs unconditionally regardless of
+# $failed, so a stuck/failing db backup (e.g. hq) never skips this.
+JSONL_OFFSITE_STATUS="skipped"
+if [ -d "$JSONL_ARCHIVE_DIR" ]; then
+  jsonl_offsite_sync
+  case "$?" in
+    0) JSONL_OFFSITE_STATUS="ok" ;;
+    2) JSONL_OFFSITE_STATUS="skipped" ;;
+    *) JSONL_OFFSITE_STATUS="failed" ;;
+  esac
+else
+  log "jsonl-offsite: SKIP — archive dir not found at $JSONL_ARCHIVE_DIR"
+fi
+
 # --- publish a run fingerprint to S3 (small; latest + dated) ---
 RUN_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 if "$AWS" --version >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
@@ -272,9 +345,12 @@ PY
   "$AWS" s3 cp "$META" "$S3/_meta/$(date -u +%Y%m%d-%H%M%S).json" --only-show-errors >> "$LOG" 2>&1 || true
 fi
 
-log "=== run complete: ok=$ok failed=$failed total=$total ==="
+log "=== run complete: ok=$ok failed=$failed total=$total jsonl_offsite=$JSONL_OFFSITE_STATUS ==="
 if [ "$failed" -gt 0 ]; then
   notify_fail "backup off-box: $failed/$total store(s) FALHARAM:${FAILED_DBS}"
+fi
+if [ "$JSONL_OFFSITE_STATUS" = "failed" ]; then
+  notify_fail "backup off-box: cópia offsite do JSONL não subiu (ver $LOG)"
 fi
 exit 0
 

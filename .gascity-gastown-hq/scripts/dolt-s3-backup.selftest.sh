@@ -253,5 +253,173 @@ else
   bad "give-up path's notify/exit-0 wiring looks different than expected"
 fi
 
+echo ""
+echo "── jsonl_sizes_match() (ga-7gfd34) ──"
+
+type jsonl_sizes_match >/dev/null 2>&1 \
+  && ok "jsonl_sizes_match defined by lib-mode source" \
+  || { bad "jsonl_sizes_match NOT defined — lib mode broken"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="; exit 1; }
+
+jsonl_sizes_match "100" "100" && ok "equal sizes → match" || bad "equal sizes should match"
+jsonl_sizes_match "100" "99" && bad "different sizes should NOT match" || ok "different sizes → no match"
+jsonl_sizes_match "" "100" && bad "empty local size should NOT match" || ok "empty local size → no match"
+jsonl_sizes_match "100" "" && bad "empty s3 size should NOT match" || ok "empty s3 size → no match"
+jsonl_sizes_match "" "" && bad "two empty sizes should NOT match" || ok "two empty sizes → no match"
+jsonl_sizes_match "abc" "100" && bad "non-numeric local size should NOT match" || ok "non-numeric local size → no match"
+jsonl_sizes_match "100" "None" && bad "non-numeric s3 size (e.g. aws CLI 'None') should NOT match" || ok "non-numeric s3 size → no match"
+jsonl_sizes_match "0" "0" && ok "zero equals zero → match" || bad "zero should equal zero"
+
+echo ""
+echo "── jsonl_offsite_sync() (ga-7gfd34) — simulated aws stub, real bucket NEVER touched ──"
+
+type jsonl_offsite_sync >/dev/null 2>&1 \
+  && ok "jsonl_offsite_sync defined by lib-mode source" \
+  || { bad "jsonl_offsite_sync NOT defined — lib mode broken"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="; exit 1; }
+
+AWS_STUB_DIR="$(mktemp -d)"
+AWS_STUB_CALLS="$(mktemp)"
+export AWS_STUB_CALLS
+cat > "$AWS_STUB_DIR/aws" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$*" >> "$AWS_STUB_CALLS"
+case "$1 $2" in
+  "s3 sync")
+    exit "${AWS_STUB_SYNC_EXIT:-0}"
+    ;;
+  "s3api head-object")
+    if [ "${AWS_STUB_HEAD_EXIT:-0}" != "0" ]; then
+      exit "$AWS_STUB_HEAD_EXIT"
+    fi
+    printf '%s\n' "${AWS_STUB_S3_SIZE:-0}"
+    exit 0
+    ;;
+  *)
+    echo "unhandled aws stub invocation: $*" >&2
+    exit 1
+    ;;
+esac
+STUB
+chmod +x "$AWS_STUB_DIR/aws"
+
+JSONL_TEST_DIR="$(mktemp -d)"
+printf 'x%.0s' $(seq 1 100) > "$JSONL_TEST_DIR/hq.jsonl"   # exactly 100 bytes
+JSONL_TEST_LOG="$(mktemp)"
+
+# Scenario A: sync succeeds, sizes match → overall success.
+: > "$AWS_STUB_CALLS"; : > "$JSONL_TEST_LOG"
+if AWS="$AWS_STUB_DIR/aws" JSONL_ARCHIVE_DIR="$JSONL_TEST_DIR" JSONL_ARCHIVE_VERIFY_FILE="hq.jsonl" \
+    BUCKET=testbucket S3=s3://testbucket LOG="$JSONL_TEST_LOG" S3_TIMEOUT=5 \
+    AWS_STUB_SYNC_EXIT=0 AWS_STUB_S3_SIZE=100 \
+    jsonl_offsite_sync; then
+  ok "scenario A (sync ok, sizes match): returns success"
+else
+  bad "scenario A (sync ok, sizes match): should have returned success"
+fi
+grep -qF "verify OK" "$JSONL_TEST_LOG" && ok "scenario A: logged verify OK" || bad "scenario A: missing verify OK log line"
+grep -qF -- '--exclude .git/*' "$AWS_STUB_CALLS" && ok "scenario A: sync call excluded .git" || bad "scenario A: sync call did NOT pass --exclude .git/*"
+grep -qF -- '--delete' "$AWS_STUB_CALLS" && ok "scenario A: sync call prunes orphans (--delete), matching the per-db pattern" || bad "scenario A: sync call missing --delete"
+
+# Scenario B: sync succeeds, sizes MISMATCH → failure, third-state-safe (never a silent pass).
+: > "$AWS_STUB_CALLS"; : > "$JSONL_TEST_LOG"
+if AWS="$AWS_STUB_DIR/aws" JSONL_ARCHIVE_DIR="$JSONL_TEST_DIR" JSONL_ARCHIVE_VERIFY_FILE="hq.jsonl" \
+    BUCKET=testbucket S3=s3://testbucket LOG="$JSONL_TEST_LOG" S3_TIMEOUT=5 \
+    AWS_STUB_SYNC_EXIT=0 AWS_STUB_S3_SIZE=999 \
+    jsonl_offsite_sync; then
+  bad "scenario B (sizes mismatch): should have returned failure"
+else
+  ok "scenario B (sizes mismatch): returns failure"
+fi
+grep -qF "verify FAILED" "$JSONL_TEST_LOG" && ok "scenario B: logged verify FAILED" || bad "scenario B: missing verify FAILED log line"
+
+# Scenario C: aws s3 sync itself fails → failure, verify (head-object) never attempted.
+: > "$AWS_STUB_CALLS"; : > "$JSONL_TEST_LOG"
+if AWS="$AWS_STUB_DIR/aws" JSONL_ARCHIVE_DIR="$JSONL_TEST_DIR" JSONL_ARCHIVE_VERIFY_FILE="hq.jsonl" \
+    BUCKET=testbucket S3=s3://testbucket LOG="$JSONL_TEST_LOG" S3_TIMEOUT=5 \
+    AWS_STUB_SYNC_EXIT=1 \
+    jsonl_offsite_sync; then
+  bad "scenario C (sync fails): should have returned failure"
+else
+  ok "scenario C (sync fails): returns failure"
+fi
+grep -qF "aws s3 sync FAILED" "$JSONL_TEST_LOG" && ok "scenario C: logged aws s3 sync FAILED" || bad "scenario C: missing sync-failed log line"
+grep -qF "head-object" "$AWS_STUB_CALLS" && bad "scenario C: verify (head-object) should NOT run when sync itself failed" || ok "scenario C: verify correctly skipped after sync failure"
+
+# Scenario D: verify file absent locally (source looks empty/unpopulated) →
+# the destructive --delete sync must be REFUSED entirely (return 2/skip), not
+# attempted — an empty source with --delete would wipe the offsite copy.
+: > "$AWS_STUB_CALLS"; : > "$JSONL_TEST_LOG"
+EMPTY_JSONL_DIR="$(mktemp -d)"
+AWS="$AWS_STUB_DIR/aws" JSONL_ARCHIVE_DIR="$EMPTY_JSONL_DIR" JSONL_ARCHIVE_VERIFY_FILE="hq.jsonl" \
+    BUCKET=testbucket S3=s3://testbucket LOG="$JSONL_TEST_LOG" S3_TIMEOUT=5 \
+    AWS_STUB_SYNC_EXIT=0 \
+    jsonl_offsite_sync
+JSONL_SCENARIO_D_RC=$?
+[ "$JSONL_SCENARIO_D_RC" -eq 2 ] \
+  && ok "scenario D (verify file absent): returns skip(2) — refuses a --delete sync against an unpopulated source" \
+  || bad "scenario D (verify file absent): expected return code 2 (skip), got $JSONL_SCENARIO_D_RC"
+grep -qF "SKIP" "$JSONL_TEST_LOG" && ok "scenario D: logged a SKIP line" || bad "scenario D: missing SKIP log line"
+grep -qF "sync" "$AWS_STUB_CALLS" \
+  && bad "scenario D: aws s3 sync should NEVER be invoked against an unpopulated source (--delete would wipe the offsite copy)" \
+  || ok "scenario D: aws was never invoked — destructive sync correctly refused before running"
+rm -rf "$EMPTY_JSONL_DIR" 2>/dev/null || true
+
+# Scenario E: head-object itself errors (permissions/network) → treated as a
+# verify FAILURE, never a silent pass — the "can't tell" case must fail closed.
+: > "$AWS_STUB_CALLS"; : > "$JSONL_TEST_LOG"
+if AWS="$AWS_STUB_DIR/aws" JSONL_ARCHIVE_DIR="$JSONL_TEST_DIR" JSONL_ARCHIVE_VERIFY_FILE="hq.jsonl" \
+    BUCKET=testbucket S3=s3://testbucket LOG="$JSONL_TEST_LOG" S3_TIMEOUT=5 \
+    AWS_STUB_SYNC_EXIT=0 AWS_STUB_HEAD_EXIT=1 \
+    jsonl_offsite_sync; then
+  bad "scenario E (head-object errors): should have returned failure, not a silent pass"
+else
+  ok "scenario E (head-object errors): returns failure — 'can't verify' fails closed"
+fi
+grep -qF "verify FAILED" "$JSONL_TEST_LOG" && ok "scenario E: logged verify FAILED" || bad "scenario E: missing verify FAILED log line"
+
+rm -rf "$AWS_STUB_DIR" "$JSONL_TEST_DIR" 2>/dev/null || true
+rm -f "$AWS_STUB_CALLS" "$JSONL_TEST_LOG" 2>/dev/null || true
+unset AWS_STUB_CALLS
+
+echo ""
+echo "── drift-guard: jsonl offsite step wiring present in live script (ga-7gfd34) ──"
+LOOP_DONE_LINE=$(grep -nF 'ok=$((ok+1))' "$SCRIPT" | head -1 | cut -d: -f1)
+JSONL_CALL_LINE=$(grep -nF 'JSONL archive offsite mirror (ga-7gfd34)' "$SCRIPT" | head -1 | cut -d: -f1)
+if [ -n "$LOOP_DONE_LINE" ] && [ -n "$JSONL_CALL_LINE" ] && [ "$JSONL_CALL_LINE" -gt "$LOOP_DONE_LINE" ]; then
+  ok "jsonl offsite step is wired in AFTER the per-db loop ends (never inside it)"
+else
+  bad "jsonl offsite step position relative to the per-db loop looks wrong (or missing)"
+fi
+JSONL_WIRING_REGION="$(sed -n '/JSONL archive offsite mirror (ga-7gfd34)/,/publish a run fingerprint/p' "$SCRIPT")"
+if printf '%s' "$JSONL_WIRING_REGION" | grep -qF 'jsonl_offsite_sync'; then
+  ok "jsonl_offsite_sync is actually called in the live flow, not just defined"
+else
+  bad "jsonl_offsite_sync is defined but never called — dead code"
+fi
+if printf '%s' "$JSONL_WIRING_REGION" | grep -qF 'if [ "$failed" -eq 0 ]'; then
+  bad "jsonl offsite step is gated on the per-db loop's success — must run even when a db backup FAILED"
+else
+  ok "jsonl offsite step is unconditional — runs even when a db backup above FAILED"
+fi
+if grep -qF 'jsonl_offsite=$JSONL_OFFSITE_STATUS' "$SCRIPT"; then
+  ok "final run-complete summary counts jsonl offsite status separately from ok/failed/total"
+else
+  bad "final summary line does not report jsonl offsite status separately"
+fi
+if grep -qF 'notify_fail "backup off-box: cópia offsite do JSONL não subiu' "$SCRIPT"; then
+  ok "jsonl offsite failure alerts via the SAME notify_fail channel, with the required message"
+else
+  bad "jsonl offsite failure does not notify with the expected message"
+fi
+if grep -qF 'if [ "$JSONL_OFFSITE_STATUS" = "failed" ]; then' "$SCRIPT"; then
+  ok "jsonl offsite notify fires only on failed status (never on ok/skipped)"
+else
+  bad "jsonl offsite notify gating missing or changed shape"
+fi
+if grep -qF -- '--exclude ".git/*"' "$SCRIPT"; then
+  ok "live script's jsonl sync excludes .git (~1.1GB of history no restore needs)"
+else
+  bad "live script's jsonl sync does not exclude .git"
+fi
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
