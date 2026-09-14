@@ -65,6 +65,26 @@
 # with its own verify-and-self-correct in the same style — same "don't
 # claim success you didn't check" discipline as the mail-send and
 # type/status sub-actions.
+#
+# Follow-up (ga-c6yys3, 2026-09-14): determine-period computed SINCE/UNTIL
+# from wall-clock "now" at the moment the step *executed*, not from
+# anything tied to the day it was actually meant to cover. When execution
+# lagged the order-run's creation by hours (44h in the incident that filed
+# this bug), the window silently drifted: one calendar day was never
+# digested (2026-09-12), and the very next on-schedule run then computed
+# the IDENTICAL window the late one had just sent (since=2026-09-13/
+# until=2026-09-14, both times) — a duplicate digest to the mayor within
+# minutes, caught and suppressed by hand that one time (see ga-c6yys3's
+# comments), not by the recipe. Fix: anchor SINCE to the UNTIL of the last
+# digest actually archived (new digest.since/digest.until metadata on the
+# archived bead, step 3 below; falls back to parsing an older digest's
+# "Digest: YYYY-MM-DD" title for beads archived before this fix), never to
+# wall-clock time at execution. UNTIL is still capped at "today 00:00 UTC"
+# so a run never claims a day that hasn't finished yet, and a run that
+# finds nothing new past the last digest closes itself — and the rest of
+# the molecule — as a no-op instead of re-sending. Wall-clock is now used
+# only for that upper cap, never as the anchor, so an arbitrarily late
+# execution can no longer produce the wrong window, only a later one.
 description = """
 Generate activity digest for the mayor.
 
@@ -116,26 +136,114 @@ description = """
 Establish the time range for this digest.
 
 **1. Determine period type:**
-Use {{period}} (from formula vars, defaults to "daily").
-
-**2. Calculate time range:**
-
-| Period | Since | Until |
-|--------|-------|-------|
-| daily | Yesterday 00:00 UTC | Today 00:00 UTC |
-| weekly | Last Monday 00:00 UTC | This Monday 00:00 UTC |
-
+Use {{period}} (from formula vars, defaults to "daily"). Derive the
+period length in days, used throughout this step:
 ```bash
-# For daily:
-SINCE=$(date -u -d 'yesterday 00:00' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
-        date -u -v-1d -j -f '%H:%M' '00:00' +%Y-%m-%dT%H:%M:%SZ)
-UNTIL=$(date -u -d 'today 00:00' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
-        date -u -j -f '%H:%M' '00:00' +%Y-%m-%dT%H:%M:%SZ)
+case "{{period}}" in
+  weekly) PERIOD_DAYS=7 ;;
+  *)      PERIOD_DAYS=1 ;;
+esac
 ```
 
-Note the timestamps for the digest header.
+**2. Anchor SINCE to the last digest actually archived — never to
+wall-clock "now" at step-execution time (ga-c6yys3, 2026-09-14).**
 
-Close this step when the time range is established."""
+The old recipe computed SINCE/UNTIL as "yesterday/today relative to right
+now." That silently breaks whenever this step runs late relative to the
+day it was meant to cover: a stalled molecule (44h late in the incident
+that filed ga-c6yys3) computes a window relative to its OWN delayed
+execution time. Two failures from that one cause, observed live in a
+single incident: one calendar day silently never digested (2026-09-12),
+and, minutes after the stalled chain finally sent late, the very next
+on-schedule run computing the IDENTICAL window again (both:
+since=2026-09-13, until=2026-09-14) — a duplicate digest to the mayor,
+caught and suppressed by hand that one time, not by the recipe. Anchor to
+durable state instead, so the window is correct no matter how late this
+step runs:
+
+```bash
+LATEST_JSON=$(gc bd list --label="digest,{{period}}" --include-infra --all --json --limit=0 2>/dev/null)
+LAST=$(printf '%s' "$LATEST_JSON" | jq -c 'sort_by(.created_at) | reverse | .[0] // empty')
+LAST_UNTIL=""
+if [ -n "$LAST" ]; then
+  LAST_UNTIL=$(printf '%s' "$LAST" | jq -r '.metadata["digest.until"] // empty')
+  if [ -z "$LAST_UNTIL" ]; then
+    # Pre-fix digest — no digest.since/digest.until metadata yet. Recover
+    # the same value from its title ("Digest: YYYY-MM-DD" is the day it
+    # covered; UNTIL is that day + PERIOD_DAYS — same math as step 3).
+    LAST_DATE=$(printf '%s' "$LAST" | jq -r '.title // empty' | sed -E 's/^Digest: //')
+    if [ -n "$LAST_DATE" ]; then
+      LAST_UNTIL=$(date -u -d "$LAST_DATE + $PERIOD_DAYS day" +%Y-%m-%dT00:00:00Z 2>/dev/null || \
+                   date -u -j -v+${PERIOD_DAYS}d -f '%Y-%m-%d' "$LAST_DATE" +%Y-%m-%dT00:00:00Z)
+    fi
+  fi
+fi
+```
+
+**3. Compute SINCE/UNTIL/DATE:**
+
+```bash
+# Exact midnight, not "today 00:00" parsed through date -d/-j (that idiom
+# leaves seconds unset on this install's BSD date, drifting ~20-30s past
+# :00 — harmless for the old UNTIL-only use, but this value is now also
+# compared for exact equality in step 4 below, where that drift would
+# leak a spurious few-second "new" window instead of correctly detecting
+# none). Formatting today's date and appending fixed T00:00:00Z sidesteps
+# the parse entirely and needs no GNU/BSD fallback.
+TODAY_FLOOR="$(date -u +%Y-%m-%d)T00:00:00Z"
+if [ -n "$LAST_UNTIL" ]; then
+  SINCE="$LAST_UNTIL"
+else
+  # True cold start only — no prior digest bead found at all (the label
+  # filter above matched nothing, e.g. a brand-new city). Every later run
+  # anchors on $LAST_UNTIL above instead; this branch should fire at most
+  # once ever, per city. Same exact-midnight idiom as TODAY_FLOOR above,
+  # for the same reason (date -d/-j 'yesterday 00:00' drifts a few
+  # seconds past :00 on this install's BSD date).
+  SINCE="$(date -u -v-1d +%Y-%m-%d 2>/dev/null || date -u -d yesterday +%Y-%m-%d)T00:00:00Z"
+fi
+UNTIL_CANDIDATE=$(date -u -d "$SINCE + $PERIOD_DAYS day" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
+  date -u -j -v+${PERIOD_DAYS}d -f '%Y-%m-%dT%H:%M:%SZ' "$SINCE" +%Y-%m-%dT%H:%M:%SZ)
+# Never cover a day that hasn't fully elapsed yet, however far behind
+# $SINCE is — one period per run, same bound as before this fix. If
+# there's a multi-day backlog, later runs (next dispatch cycles) keep
+# advancing by one period each, until caught up.
+if [[ "$UNTIL_CANDIDATE" > "$TODAY_FLOOR" ]]; then
+  UNTIL="$TODAY_FLOOR"
+else
+  UNTIL="$UNTIL_CANDIDATE"
+fi
+DATE=${SINCE%%T*}
+```
+
+`$SINCE`/`$UNTIL`/`$DATE` stay valid for the rest of this molecule as long
+as the same session continues (the normal case). If you're resuming a
+stalled molecule in a fresh session instead, re-run this step's bash
+before trusting any of the three.
+
+**4. Nothing-new guard.** If `$SINCE` is not strictly before `$UNTIL`, the
+last digest already covers everything there is to cover right now — this
+run is redundant (the exact near-miss described above). Do not collect
+data or send mail:
+
+```bash
+if [[ "$SINCE" > "$UNTIL" || "$SINCE" == "$UNTIL" ]]; then
+  gc bd close <this-step-bead-id> --reason "Nothing new to cover — last digest already through $SINCE (ga-c6yys3). Skipping rest of this molecule as no-ops."
+fi
+```
+
+If you hit that branch: do not proceed to collect-data. Look up your root
+bead (`gc bd show <this-step-bead-id> --json | jq -r '.[0].metadata["gc.root_bead_id"]'`),
+then `gc bd mol current <root-bead-id>` and close every step it reports as
+`[ready]`, one at a time (closing one unblocks the next), with the same
+reason, until none remain — collect-data and generate-and-send must NOT
+collect data or send mail in this branch. Then `gc runtime drain-ack &&
+exit`.
+
+Otherwise, note the timestamps for the digest header and close this step
+when the time range is established — state the computed values in the
+close reason, e.g. "Time range established: {{period}} digest,
+since=$SINCE until=$UNTIL"."""
 
 [[steps]]
 id = "collect-data"
@@ -561,10 +669,18 @@ remain fully findable via `bd show`/`bd list --all --include-infra`
 confirmed live 2026-08-13, ga-4tt37: 774 open message-type beads invisible
 without `--include-infra`).
 
+Stamp the covered window as metadata, not just in the title (ga-c6yys3,
+2026-09-14) — determine-period's next run reads `digest.until` back from
+whichever digest bead this query finds most recent, to anchor the next
+SINCE without ever touching wall-clock time. Without this, a future
+change to the title format would silently break that lookup with no
+error, just a quiet fall-back to the old skip/duplicate-prone behavior.
+
 ```bash
 DIGEST_ID=$(gc bd create --type=message \
   --title="Digest: $DATE" \
   --label=digest,{{period}} \
+  --metadata "{\"digest.since\":\"$SINCE\",\"digest.until\":\"$UNTIL\"}" \
   --silent)
 gc bd close "$DIGEST_ID" --reason "Daily digest archived — informational artifact, no action pending"
 ```
