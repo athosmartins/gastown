@@ -134,10 +134,14 @@ _offline_backup_sync() {
     || { _offline_sync_log "$db: offline-sync: mktemp failed under $tmp_root"; return 1; }
   local clone="$clone_parent/$db"
 
-  local cp_err
-  cp_err="$(timeout "$clone_timeout" cp -c -R "$src" "$clone_parent" 2>&1)"
-  if [ ! -d "$clone" ]; then
-    _offline_sync_log "$db: offline-sync: clonefile FAILED ($src -> $clone) — refusing to fall back to a slow full copy: $cp_err"
+  local cp_err cp_rc
+  cp_err="$(timeout "$clone_timeout" cp -c -R "$src" "$clone_parent" 2>&1)"; cp_rc=$?
+  # Check the exit code AND the directory's existence — not just one. A
+  # nonzero exit (e.g. one unreadable file mid-tree) can still leave a
+  # PARTIAL $clone directory behind; trusting existence alone would treat
+  # that the same as a clean full copy.
+  if [ "$cp_rc" -ne 0 ] || [ ! -d "$clone" ]; then
+    _offline_sync_log "$db: offline-sync: clonefile FAILED (rc=$cp_rc) ($src -> $clone) — refusing to fall back to a slow full copy: $cp_err"
     rm -rf "${clone_parent:?}" 2>/dev/null
     return 1
   fi
