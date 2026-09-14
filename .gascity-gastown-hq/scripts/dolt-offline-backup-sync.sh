@@ -31,14 +31,20 @@
 #     (6.8GB+ live) that would silently trade the "instant, ~0 extra disk"
 #     premise this whole mechanism depends on for a slow copy that eats real
 #     disk — worse than a loud failure, because nothing would say so.
-#   - refuses if the clone carries a `.dolt/sql-server.info` marker: `dolt
-#     sql --help` documents that a data-dir claimed by a live server gets its
-#     queries silently routed THROUGH that server instead of running
-#     embedded — exactly the network path this function exists to avoid.
-#   - confirms the CLI actually ran embedded by checking the clone's `SELECT
-#     @@port` differs from the live server's port (proven live 2026-09-14:
-#     embedded default is 3306, this city's live port is 52756 — never
-#     hardcode either side, both are derived fresh each call).
+#   - confirms the CLI actually ran embedded, not routed through a live
+#     server, by checking the clone's `SELECT @@port` differs from the live
+#     server's port (proven live 2026-09-14: embedded default is 3306, this
+#     city's live port is 52756 — never hardcode either side, both are
+#     derived fresh each call). This is the ONLY guard against `dolt sql
+#     --help`'s documented hazard of a data-dir claimed by a live server
+#     silently routing queries through it — there is deliberately no
+#     file-marker check for this: a per-db clone (`$data_dir/$db` ->
+#     `$clone_parent/$db`) can never carry its own `.dolt/sql-server.info`,
+#     because in this city's multi-db deployment that marker lives once, at
+#     the shared `$data_dir/.dolt/` root, never inside a per-db subdirectory
+#     (verified live against all 7 running databases, ga-o3nqy2 gate-fix). A
+#     marker check scoped to the clone would be structurally dead code; @@port
+#     is what actually fires.
 #   - the clone is removed on every exit path (success, failure, refusal).
 #   - both the clone and the sync-url step are timeout-bounded (the two
 #     server-mediated calls this replaces were: SYNC_TIMEOUT in
@@ -142,12 +148,6 @@ _offline_backup_sync() {
   # that the same as a clean full copy.
   if [ "$cp_rc" -ne 0 ] || [ ! -d "$clone" ]; then
     _offline_sync_log "$db: offline-sync: clonefile FAILED (rc=$cp_rc) ($src -> $clone) — refusing to fall back to a slow full copy: $cp_err"
-    rm -rf "${clone_parent:?}" 2>/dev/null
-    return 1
-  fi
-
-  if [ -e "$clone/.dolt/sql-server.info" ]; then
-    _offline_sync_log "$db: offline-sync: REFUSING — cloned sql-server.info present; the CLI would route through a live server instead of running embedded"
     rm -rf "${clone_parent:?}" 2>/dev/null
     return 1
   fi

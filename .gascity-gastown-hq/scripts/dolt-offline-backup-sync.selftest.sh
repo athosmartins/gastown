@@ -119,22 +119,17 @@ grep -qF "testdb: offline-sync: OK" "$OFFLINE_SYNC_LOG" \
   && ok "scenario A: logged the OK line" \
   || bad "scenario A: missing the OK log line"
 
-# Scenario B: source directory carries a (cloned) sql-server.info marker ->
-# must refuse before ever touching dolt, and must never create the dest.
-mkdir -p "$DATA_DIR/testdb2/.dolt"
-: > "$DATA_DIR/testdb2/.dolt/sql-server.info"   # existence is all the guard checks
-DEST_B="$WORK/dest-b"
-if _offline_backup_sync "testdb2" "$DEST_B"; then
-  bad "scenario B (sql-server.info present): should have refused"
-else
-  ok "scenario B (sql-server.info present): refuses"
-fi
-[ ! -e "$DEST_B" ] \
-  && ok "scenario B: dest was never created — refusal happened before any sync attempt" \
-  || bad "scenario B: dest '$DEST_B' exists despite the refusal — sync ran when it should not have"
-grep -qF "testdb2: offline-sync: REFUSING — cloned sql-server.info present" "$OFFLINE_SYNC_LOG" \
-  && ok "scenario B: logged the specific refusal reason" \
-  || bad "scenario B: missing the sql-server.info refusal log line"
+# Scenario B (removed, ga-o3nqy2 gate-fix): used to assert that a `.dolt/
+# sql-server.info` marker inside the clone made _offline_backup_sync refuse.
+# That check was dead code in the library — a per-db clone (`$data_dir/$db`
+# -> `$clone_parent/$db`) can never carry that marker; it lives once, at the
+# shared `$data_dir/.dolt/` root (verified live against all 7 running
+# databases). This test manufactured the marker AT THE PATH THE CODE CHECKED
+# instead of the real path Dolt writes it to, so it passed without ever
+# proving the hazard it claimed to cover — a test that could not catch its
+# own regression. The check and its file-header claim were removed from the
+# library; Scenario C below already proves the actual threat (a clone that
+# runs through a live server) via the real, working @@port comparison.
 
 # Scenario C: embedded @@port collides with the (fake) live port — the
 # not-actually-isolated case. Real dolt's embedded default is always 3306, so
