@@ -372,6 +372,64 @@ notify_author_with_fallback() {
 }
 # SELFTEST-EXTRACT notify-author-with-fallback: END
 
+# nudge_author_with_fallback <bead_id> <notify_author> <author> <message> <fail_context>
+# ga-o2caab: sibling of notify_author_with_fallback (above) for the gate-FAIL
+# `session nudge` call sites. NOTIFY_AUTHOR is often a bare crew-branch segment
+# (e.g. "batista" from crew/batista/lx-dnw), but live session mailboxes are
+# rig-qualified (e.g. "batista-lx") — gc session nudge resolves by exact
+# session identity, no fuzzy fallback, so the bare segment silently fails for
+# any persistent named crew member and the FAIL feedback never reaches them.
+# Same candidate cascade as the mail version (bare -> rig-qualified ->
+# $AUTHOR) and the same total-failure guarantee (mail the mayor + comment on
+# the bead, per ga-fe5at's rule that "not notified" must never look the same
+# as "notified"). Kept as a SEPARATE function rather than folded into
+# notify_author_with_fallback: the nudge call takes one message, not
+# subject+body, and the mail version already has 6 live call sites relying on
+# its exact signature — touching it here would be an unrelated-risk bundle.
+#
+# Returns 0 if any candidate received the nudge; 1 if every candidate failed
+# OR notify_author was empty (matches this call's pre-existing behavior —
+# there was never anyone to notify, not a new failure to escalate). On a 1
+# from a non-empty notify_author, the mayor escalation + bd comment have
+# ALREADY been sent — the caller needs no further fallback of its own.
+# SELFTEST-EXTRACT nudge-author-with-fallback: BEGIN
+nudge_author_with_fallback() {
+  local _bead_id="$1" _notify_author="$2" _author="$3" _message="$4" _fail_context="$5"
+  [ -z "$_notify_author" ] && return 1
+  local _candidates="$_notify_author"
+  if [ -n "$_bead_id" ]; then
+    local _bid_prefix="${_bead_id%%-*}"
+    case "$_bid_prefix" in
+      ga|"") ;;  # HQ/gascity beads: no verified rig-suffix convention to guess
+      *)
+        case "$_notify_author" in
+          *"-$_bid_prefix") ;;  # already qualified (e.g. crew segment was "oracle-wa")
+          *) _candidates="$_candidates ${_notify_author}-${_bid_prefix}" ;;
+        esac
+        ;;
+    esac
+  fi
+  if [ -n "$_author" ] && [ "$_author" != "$_notify_author" ]; then
+    _candidates="$_candidates $_author"
+  fi
+  local _notified="" _candidate
+  for _candidate in $_candidates; do
+    gc --city "$GC_CITY" session nudge "$_candidate" "$_message" --delivery wait-idle 2>/dev/null \
+      && { _notified="$_candidate"; break; }
+  done
+  [ -n "$_notified" ] && return 0
+  warn "Could not nudge any author candidate ($_candidates) for $_fail_context — escalating to mayor"
+  gc --city "$GC_CITY" mail send mayor \
+    -s "Gate: author unreachable for $_bead_id" \
+    -m "$_fail_context — could not nudge ANY author candidate ($_candidates); the author was never notified. Please relay." \
+    2>/dev/null || true
+  bd -C "$GC_CITY" comment "$_bead_id" \
+    "Author-nudge FAILED for every candidate ($_candidates) for: $_fail_context — escalated to mayor by mail instead so this failure stays visible (ga-o2caab)." \
+    2>/dev/null || true
+  return 1
+}
+# SELFTEST-EXTRACT nudge-author-with-fallback: END
+
 # ── ga-dupnv (bug 1): one branch = one authoritative gate-run. SIBLING_RUN_STALE
 # is the age (minutes) past which a still-running gate-run for a branch is judged
 # ABANDONED (its dispatcher died mid-run and never drove it terminal) and may be
@@ -6106,11 +6164,15 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
 
   # Notify the author (not the Mayor) via nudge. ga-409f4: NOTIFY_AUTHOR
   # (branch-author-aware), not the bead-derived $AUTHOR — see this
-  # function's header comment.
+  # function's header comment. ga-o2caab: cascade through
+  # nudge_author_with_fallback (bare segment -> rig-qualified -> $AUTHOR ->
+  # mayor escalation) instead of a bare nudge that silently fails for any
+  # persistent named crew member (NOTIFY_AUTHOR is often a bare branch
+  # segment like "batista"; live sessions are rig-qualified like "batista-lx").
   if [ -n "$NOTIFY_AUTHOR" ]; then
-    gc --city "$GC_CITY" session nudge "$NOTIFY_AUTHOR" \
+    nudge_author_with_fallback "$BEAD_ID" "$NOTIFY_AUTHOR" "$AUTHOR" \
       "QUALITY GATE FAILED for branch $BRANCH. Blocking reasons: $(echo -e "$FAIL_REASONS" | head -3). Gate run: $GATE_RUN_ID. Fix the issues and re-run /gate-done when ready." \
-      --delivery wait-idle 2>/dev/null || warn "Could not nudge author $NOTIFY_AUTHOR (session may not exist)"
+      "Gate FAIL nudge for $BEAD_ID (branch $BRANCH, gate_run $GATE_RUN_ID)"
   fi
 
   # ── ga-jb4l: SELF-HEALING FAIL LOOP ────────────────────────────────────────
@@ -6323,10 +6385,13 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         # ga-409f4: the NUDGE target is NOTIFY_AUTHOR (branch-author-aware) —
         # the assignee-keep decision above stays on $AUTHOR (bead ownership
         # is a separate concern from who wrote the code; see this
-        # function's header comment).
-        gc --city "$GC_CITY" session nudge "$NOTIFY_AUTHOR" \
+        # function's header comment). ga-o2caab: cascade through
+        # nudge_author_with_fallback — this is the exact incident shape
+        # (live-crew author, bare branch segment) that stalled lx-dnw 7+
+        # minutes with zero FAIL feedback until a witness relayed it by hand.
+        nudge_author_with_fallback "$BEAD_ID" "$NOTIFY_AUTHOR" "$AUTHOR" \
           "Gate FAILED for $BEAD_ID (branch $BRANCH, attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — see GATE-FEEDBACK on the bead. Your assignee was kept (ga-jyox); fix and re-run /gate-done." \
-          --delivery wait-idle 2>/dev/null || warn "Could not nudge live-crew author $NOTIFY_AUTHOR for gate FAIL feedback"
+          "Gate FAIL live-crew nudge for $BEAD_ID (branch $BRANCH, attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP})"
         # ga-7rvyt: gc hook / routed-pool surfacing has no live-in-flight-owner
         # guard (unlike Pilot's _filter_candidates), so a bead kept in-flight
         # here for a live crew author was still re-offered to generic pool
