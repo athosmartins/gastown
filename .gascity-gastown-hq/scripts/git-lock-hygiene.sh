@@ -117,19 +117,56 @@ if [ "$_GIT_LOCK_ROOTS_CALLER_SET" != "1" ] && [ "${1:-}" != "--selftest" ]; the
       # Resolving each candidate through git itself (rather than assuming
       # rig-path==repo-root, the exact mistake that memory warns against) fixes
       # this: `rev-parse --show-toplevel` walks up to the real root, returns the
-      # path unchanged if it's already one, or fails harmlessly (2s-bounded,
-      # skipped below) for a rig with no git reachable at all (deacon).
+      # path unchanged if it's already one, or fails (2s-bounded) for a path
+      # with no work tree. "No work tree" covers two different shapes, handled
+      # differently below: a rig with no git reachable at all (deacon has none
+      # of its own — nothing to scan there), and a rig whose own .git is a
+      # gitlink into a BARE container repo (property_scrapers/lexbh's ".git"
+      # -> ".repo.git", both core.bare=true — verified live 2026-09-15,
+      # ga-92iqox). The latter is a real, scannable git-dir; show-toplevel
+      # fails on it only because a bare repo has no work tree, not because
+      # there's nothing there. Confirmed live: before this fix, property_scrapers
+      # and lexbh were silently absent from the resolved root list every sweep
+      # — the janitor's stale-lock coverage for both had been a no-op since
+      # they were added.
       # Deduplicated: gascity/gastown/deacon all resolve to the same
       # /Users/athos/gt when none has its own .git — scanning it 3x would be
       # wasted (not wrong; _scan_repo is idempotent), never scanned twice here.
+      #
+      # ga-92iqox OUTAGE (2026-09-15 06:09-06:34, revert 8e5b87763): an
+      # earlier version of this exact fix dropped the `|| continue` guard
+      # below for a bare `_glh_top=$(...)` assignment + separate `[ -z ]`
+      # check. quality-gate-dispatcher.sh sources this file under its own
+      # `set -euo pipefail` — a bare assignment whose command substitution
+      # fails is a live errexit trigger there and killed the dispatcher
+      # before it logged a single line (regression test: T23-T25 below,
+      # plus the Mayor's own live trace on the ga-92iqox bead). The
+      # `|| _glh_top=""` immediately below is NOT cosmetic — it is what
+      # keeps this assignment inside bash's unconditional "part of an ||
+      # list" exemption from -e, independent of whatever shell options or
+      # environment the caller happens to source this file under.
+      # SELFTEST-EXTRACT root-resolve-loop: BEGIN
+      # (kept extractable+runnable standalone by T23-T25 below, deliberately
+      # size-independent of the rest of this file — see those tests' own
+      # header comment for why sourcing the WHOLE file is not a reliable way
+      # to regression-test this specific errexit behavior.)
       _glh_resolved=""
       for _glh_p in $_glh_rig_paths; do
-        _glh_top=$(timeout 2 git -C "$_glh_p" rev-parse --show-toplevel 2>/dev/null) || continue
+        _glh_top=$(timeout 2 git -C "$_glh_p" rev-parse --show-toplevel 2>/dev/null) || _glh_top=""
+        if [ -z "$_glh_top" ]; then
+          # No work-tree toplevel. If this exact path carries its own .git
+          # (file or dir), it's the bare-container-gitlink shape above — keep
+          # the path itself as the scan root; _scan_repo resolves the gitlink
+          # to the real git-dir. Otherwise there's truly no git here — skip.
+          [ -e "${_glh_p}/.git" ] || continue
+          _glh_top="$_glh_p"
+        fi
         case " $_glh_resolved " in
           *" $_glh_top "*) ;;  # already have this root
           *) _glh_resolved="${_glh_resolved:+$_glh_resolved }$_glh_top" ;;
         esac
       done
+      # SELFTEST-EXTRACT root-resolve-loop: END
       if [ -n "$_glh_resolved" ]; then
         GIT_LOCK_RIG_ROOTS="$(printf '%s' "$_glh_resolved" | tr ' ' ':')"
       else
@@ -219,8 +256,20 @@ _remove_stale_lock() {
 # Scan one git repo root for stale lock files.
 # Returns the count of files removed/would-remove.
 _scan_repo() {
-  local repo="$1" git_dir removed=0
+  local repo="$1" git_dir removed=0 git_link
   git_dir="${repo}/.git"
+  if [ -f "$git_dir" ]; then
+    # Gitlink file, not a directory — worktree/submodule/bare-container
+    # redirect (e.g. property_scrapers/lexbh's ".git" -> ".repo.git",
+    # ga-92iqox). Resolve the real git-dir from the "gitdir: <path>" line
+    # instead of assuming $repo/.git is itself the scannable directory.
+    git_link=$(sed -n 's/^gitdir: *//p' "$git_dir" 2>/dev/null | head -1)
+    case "$git_link" in
+      /*) git_dir="$git_link" ;;             # absolute — git's usual form
+      "") echo 0; return 0 ;;                # unreadable/malformed -> not a git repo
+      *)  git_dir="${repo}/${git_link}" ;;    # relative -> resolve against $repo
+    esac
+  fi
   if [ ! -d "$git_dir" ]; then echo 0; return 0; fi   # not a git repo
 
   # Single-file lock candidates
@@ -405,6 +454,12 @@ if [ "${1:-}" = "--selftest" ]; then
   TMP="$(mktemp -d "${TMPDIR:-/tmp}/git-lock-hygiene-selftest.XXXXXX")"
   trap 'rm -rf "$TMP"' EXIT
 
+  # Absolute path to this script itself — needed by T23-T25 below, which
+  # extract the SELFTEST-EXTRACT root-resolve-loop block from this exact
+  # file (see those tests' own header comment for why they extract rather
+  # than source the whole file).
+  _GLH_SELF="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"
+
   # Test helper: create a fake git repo with a given lock file.
   # make_repo <dir>  →  creates <dir>/.git/
   make_repo() {
@@ -413,6 +468,26 @@ if [ "${1:-}" = "--selftest" ]; then
     printf 'ref: refs/heads/main\n' > "$1/.git/HEAD"
     mkdir -p "$1/.git/refs/heads"
     touch "$1/.git/COMMIT_EDITMSG"
+  }
+
+  # Test helper: reproduce the gitlink-redirect shape property_scrapers/lexbh
+  # actually have on disk (ga-92iqox): <dir>/.git is a regular FILE containing
+  # "gitdir: <path>", and the real scannable git-dir lives at <dir>/.repo.git
+  # instead of <dir>/.git itself.
+  # make_gitlink_repo <dir> [abs|rel]  →  creates <dir>/.repo.git (real git
+  #   dir) + <dir>/.git (gitlink file). form defaults to abs, matching what's
+  #   observed live; "rel" writes a gitdir: line relative to <dir>.
+  make_gitlink_repo() {
+    local dir="$1" form="${2:-abs}" real="$1/.repo.git"
+    mkdir -p "$dir" "$real"
+    printf 'ref: refs/heads/main\n' > "$real/HEAD"
+    mkdir -p "$real/refs/heads"
+    touch "$real/COMMIT_EDITMSG"
+    if [ "$form" = "rel" ]; then
+      printf 'gitdir: .repo.git\n' > "$dir/.git"
+    else
+      printf 'gitdir: %s\n' "$real" > "$dir/.git"
+    fi
   }
 
   # Stub: no live git process (always says dead).
@@ -533,6 +608,145 @@ if [ "${1:-}" = "--selftest" ]; then
   count=$(_scan_repo "$R11")
   [ -f "$R11/.git/index.stash.${DEAD_PID}.lock" ] && ok "T18: fresh PID-lock untouched (age gate applies even to dead pid)" \
     || bad "T18: fresh PID-lock removed (age gate should still block this)"
+
+  # ── Gitlink (.git as a regular FILE) tests — ga-92iqox ──────────────────────
+  # Reproduces property_scrapers/lexbh's actual on-disk shape: ".git" is a
+  # plain file containing "gitdir: <path>", not a directory. Before this fix,
+  # _scan_repo's own `[ ! -d "$git_dir" ]` check treated every such repo as
+  # "not a git repo" and skipped it unconditionally — silent zero coverage,
+  # regardless of what locks sat inside the real git-dir.
+  export GIT_LOCK_PROCESS_CHECK_FN="_no_git_process"
+  export GIT_LOCK_STALE_AGE_SEC=300
+
+  # T19: stale index.lock behind an ABSOLUTE gitlink → removed
+  echo "T19: stale index.lock behind an absolute gitlink (.git -> .repo.git) → removed"
+  R12="$TMP/repo12"; make_gitlink_repo "$R12" abs
+  touch -t 200001010000 "$R12/.repo.git/index.lock"
+  count=$(_scan_repo "$R12")
+  [ ! -f "$R12/.repo.git/index.lock" ] && ok "T19: stale lock behind gitlink removed" \
+    || bad "T19: stale lock behind gitlink NOT removed"
+  [ "$count" -ge 1 ] && ok "T19: removed count>=1" || bad "T19: removed count=$count (expected >=1)"
+
+  # T20: FRESH index.lock behind the same gitlink → left alone — the
+  # STALE_AGE gate must still apply after resolving through the redirect,
+  # not just for the direct-directory .git case.
+  echo "T20: fresh index.lock behind a gitlink (<STALE_AGE) → left alone"
+  R13="$TMP/repo13"; make_gitlink_repo "$R13" abs
+  touch "$R13/.repo.git/index.lock"   # just created → age ~0s
+  count=$(_scan_repo "$R13")
+  [ -f "$R13/.repo.git/index.lock" ] && ok "T20: fresh lock behind gitlink untouched" \
+    || bad "T20: fresh lock behind gitlink removed (age gate should still block this)"
+  [ "$count" -eq 0 ] && ok "T20: removed count=0" || bad "T20: removed count=$count (expected 0)"
+
+  # T21: stale index.lock behind a RELATIVE gitlink ("gitdir: .repo.git") →
+  # removed. git supports both absolute and relative gitdir: lines; only the
+  # absolute form is observed live today, but the resolution code branches on
+  # it, so both paths need coverage.
+  echo "T21: stale index.lock behind a relative gitlink (gitdir: .repo.git) → removed"
+  R14="$TMP/repo14"; make_gitlink_repo "$R14" rel
+  touch -t 200001010000 "$R14/.repo.git/index.lock"
+  count=$(_scan_repo "$R14")
+  [ ! -f "$R14/.repo.git/index.lock" ] && ok "T21: stale lock behind relative gitlink removed" \
+    || bad "T21: stale lock behind relative gitlink NOT removed"
+
+  # T22: .git file with no parseable "gitdir:" line → treated as "not a git
+  # repo" (count=0), never an error — mirrors the non-repo no-op in T7.
+  echo "T22: malformed .git file (no gitdir: line) → scan is a no-op, no error"
+  R15="$TMP/repo15"; mkdir -p "$R15"
+  printf 'not a real gitlink\n' > "$R15/.git"
+  count=$(_scan_repo "$R15")
+  [ "$count" = "0" ] && ok "T22: malformed gitlink returns 0" || bad "T22: returned $count (expected 0)"
+
+  # ── Lib-mode load survival under set -e — ga-92iqox OUTAGE regression ──────
+  # 2026-09-15 06:09-06:34: an earlier fix for T19-22 above (a2575edb5) also
+  # dropped the `|| continue` guard on the root-resolution loop's
+  # `_glh_top=$(... rev-parse ...)` assignment. quality-gate-dispatcher.sh
+  # sources this file with GIT_LOCK_HYGIENE_LIB=1 under its own
+  # `set -euo pipefail`, cwd=/ (the plist sets no WorkingDirectory) — a BARE
+  # assignment whose command substitution fails (exactly what happens for
+  # property_scrapers: a bare-via-gitlink repo has no worktree, so `git
+  # rev-parse --show-toplevel` exits 128) is a live errexit trigger there,
+  # confirmed to kill the dispatcher before it logged a single line under the
+  # plist's actual environment. Revert: 8e5b87763. Root-cause + required
+  # tests: Mayor comment on ga-92iqox, 2026-09-15 09:35.
+  #
+  # WHY THIS EXTRACTS THE LOOP INSTEAD OF SOURCING THIS WHOLE FILE: measured
+  # empirically while writing this test — whether the UNGUARDED (a2575edb5)
+  # shape of this exact code actually crashes under `set -euo pipefail`
+  # depends on the TOTAL SIZE of the file it's sourced from. It crashes
+  # reliably sourced from a ~725-800 line file (confirmed against the real
+  # a2575edb5 commit content), but stops crashing once the surrounding file
+  # grows past that (this file already exceeds it, and only grows as more
+  # tests are added here — the exact mechanism wasn't fully root-caused, but
+  # the size-dependence itself was verified directly, repeatedly). A test
+  # that sources this whole file would therefore silently stop discriminating
+  # fixed-from-broken over time, passing either way. Extracting just the
+  # vulnerable block via the SELFTEST-EXTRACT sentinels above and running it
+  # in a minimal ~20-line harness is size-independent of the rest of this
+  # file and stays a real test no matter how large this file grows.
+  extract_block() {
+    local file="$1" name="$2"
+    sed -n "/# SELFTEST-EXTRACT ${name}: BEGIN/,/# SELFTEST-EXTRACT ${name}: END/p" "$file" \
+      | sed '1d;$d'
+  }
+  T23_BLOCK="$TMP/root-resolve-loop-block.sh"
+  extract_block "$_GLH_SELF" "root-resolve-loop" > "$T23_BLOCK"
+  T23_HARNESS="$TMP/root-resolve-loop-harness.sh"
+  cat > "$T23_HARNESS" <<'HARNESSEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+_glh_rig_paths="$1"
+. "$2"
+printf 'RESOLVED=%s' "$_glh_resolved"
+HARNESSEOF
+
+  echo "T23: extracted root-resolve loop survives set -euo pipefail with a bare/gitlink rig"
+  R16="$TMP/repo16-gitlink-rig"; make_gitlink_repo "$R16" abs
+  _t23_out=$(env -i HOME="$HOME" PATH="$PATH" bash "$T23_HARNESS" "$R16" "$T23_BLOCK" 2>&1)
+  _t23_rc=$?
+  case "$_t23_out" in
+    RESOLVED=*) ok "T23: root-resolve loop survived a bare/gitlink rig under set -e" ;;
+    *) bad "T23: root-resolve loop DIED on a bare/gitlink rig under set -e (rc=$_t23_rc) — output: $_t23_out" ;;
+  esac
+
+  # T24: the survival in T23 isn't just "skip and move on" — the gitlink rig
+  # must actually resolve to itself (same fixture). A fix that merely
+  # swallowed the failure without resolving the gitlink path would pass T23
+  # but silently reintroduce the ORIGINAL ga-92iqox bug (property_scrapers/
+  # lexbh never scanned) — this closes that gap.
+  echo "T24: root-resolve loop actually resolves the gitlink rig, not just survives"
+  case "$_t23_out" in
+    "RESOLVED=$R16") ok "T24: gitlink rig resolved correctly" ;;
+    *) bad "T24: gitlink rig NOT correctly resolved — got: $_t23_out" ;;
+  esac
+
+  # T25: MUTATION-TEST — proves T23 is not vacuous. Strip the `|| _glh_top=""`
+  # guard from the SAME extracted block (reproducing the exact a2575edb5
+  # shape: a bare, unguarded assignment) and confirm it DOES crash under the
+  # same conditions T23 just proved survive. If this ever stops crashing,
+  # T23 has stopped testing anything.
+  echo "T25: mutation-test — the unguarded-assignment shape (a2575edb5) DOES crash the extracted loop"
+  T25_BLOCK_MUT="$TMP/root-resolve-loop-block-mutated.sh"
+  _t25_needle=' || _glh_top=""'
+  _t25_hits=$(python3 -c '
+import sys
+path, needle, outpath = sys.argv[1:4]
+src = open(path).read()
+n = src.count(needle)
+open(outpath, "w").write(src.replace(needle, "", 1))
+print(n)
+' "$T23_BLOCK" "$_t25_needle" "$T25_BLOCK_MUT")
+  if [ "$_t25_hits" != "1" ]; then
+    bad "T25: mutation needle matched $_t25_hits times in the extracted block (expected exactly 1) — pattern drifted, fix the needle string"
+  else
+    _t25_out=$(env -i HOME="$HOME" PATH="$PATH" bash "$T23_HARNESS" "$R16" "$T25_BLOCK_MUT" 2>&1)
+    _t25_rc=$?
+    if [ "$_t25_rc" -eq 0 ]; then
+      bad "T25: mutated (unguarded, a2575edb5-shaped) block survived (rc=0) — mutation test is vacuous"
+    else
+      ok "T25: mutated (unguarded, a2575edb5-shaped) block crashes as expected (rc=$_t25_rc) — proves T23 is not vacuous"
+    fi
+  fi
 
   # ── Mutex tests ─────────────────────────────────────────────────────────────
   echo ""
