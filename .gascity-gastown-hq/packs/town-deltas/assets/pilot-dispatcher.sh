@@ -2209,19 +2209,47 @@ _pilot_defer_extend() {
 # future, not indefinitely: if the reused session genuinely never gets to
 # the follow_up, the sling bead should recover visibility rather than
 # orphan forever — the existing duplicate-dispatch check-before-acting
-# practice remains the backstop for that residual case, unchanged from
-# today.
+# practice remains the backstop for that residual case.
+#
+# ga-brnlfa: that "should recover visibility" claim was aspirational, not
+# true, until this fix. This helper set ONLY the bd-native defer_until
+# field, never a pilot:held/pilot:held-until label — deliberately, per the
+# ga-z297h lesson cited above. But lifecycle-coherence-janitor's R6 rule
+# (ga-sfj3i.1) — the ONLY thing in the city that ever calls `bd undefer` on
+# an expired hold — discovers its candidates via `bd list -l pilot:held`
+# first, THEN checks the held-until epoch. A defer with no pilot:held label
+# is invisible to that query, so once defer_until passed, the sling's bd
+# status stayed "deferred" forever: not visible to `bd ready`, not visible
+# to any pool probe, and never undeferred by anything (confirmed live,
+# ga-t8aay1: bounded defer 05:15Z→05:20Z, stayed status=deferred until a
+# human ran `bd undefer` by hand at 05:49Z). Fix: stamp the SAME
+# pilot:held-until:<epoch> + pilot:held pair every other _pilot_defer_extend
+# caller already stamps before calling it (ga-4zqwm ~L6442,
+# ga-lfvs6/imp20 ~L8679) — this was the one call site that skipped it. R6
+# runs every 10min (StartInterval); the sling now self-clears on R6's next
+# sweep after expiry instead of never. Safe to add unconditionally: probes
+# already tolerate (and some already check) pilot:held/held-until, and a
+# freshly-minted sling never carries a prior stamp, so no purge-loop is
+# needed here (unlike the story-bead call sites, which accumulate stamps
+# across many sweeps).
 _pilot_suppress_reused_sling() {
   local _prs_city="$1" _prs_sling_id="$2"
   if [ -z "$_prs_sling_id" ]; then
     return 0
   fi
   local _prs_secs="${PILOT_REUSE_SLING_DEFER_SECONDS:-300}"
+  local _prs_until_epoch=$(( $(date +%s) + _prs_secs ))
   local _prs_iso
-  _prs_iso=$(date -u -r "$(($(date +%s) + _prs_secs))" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)
+  _prs_iso=$(date -u -r "$_prs_until_epoch" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)
   if [ -z "$_prs_iso" ]; then
     log "ga-i58em: could not compute a defer target for sling $_prs_sling_id (date failed) — skipping suppression, sling stays pool-visible (fail-open, matches pre-fix behavior, not silent)"
     return 0
+  fi
+  if [ "$DRY_RUN" = "1" ]; then
+    log "ga-brnlfa: WOULD stamp pilot:held-until:${_prs_until_epoch} + pilot:held on sling $_prs_sling_id (so R6 can undefer it on expiry)"
+  else
+    bd -C "$_prs_city" label add "$_prs_sling_id" "pilot:held-until:${_prs_until_epoch}" -q 2>/dev/null || true
+    bd -C "$_prs_city" label add "$_prs_sling_id" "pilot:held" -q 2>/dev/null || true
   fi
   _pilot_defer_extend "$_prs_city" "$_prs_sling_id" "$_prs_iso"
 }
@@ -6303,10 +6331,24 @@ _neverstarted_recover_db() {
         # then mints a SIBLING sling for the same story, and both can be claimed
         # independently (the ga-kuuk double-dispatch: ga-k4uh got 5 sling beads in
         # ~3h, two of which were claimed by two different dogs within 46s).
+        #
+        # ga-brnlfa: "deferred" was missing from this case entirely — a sling
+        # temporarily hidden by _pilot_suppress_reused_sling's bounded defer
+        # (ga-i58em/ga-hpc1x) matched neither this branch (no continue, no
+        # close) nor anything below, so NEVERSTARTED fell straight through
+        # to releasing the PARENT bead while the deferred sling sat
+        # untouched — two independently-claimable paths to the same story at
+        # once (live incident, ga-t8aay1 → ga-3xfndz: Mayor had to close the
+        # orphaned sling by hand after both had already diverged). A
+        # deferred-but-fresh sling is exactly as "queued, not abandoned" as
+        # an open/in_progress one — _sling_is_live doesn't inspect status at
+        # all, only updated_at + branch — so treat all three alike: KEEP
+        # (and let the paired R6 fix above clear the defer on its own
+        # schedule) unless it's actually gone stale.
         local _sling_status
         _sling_status=$(echo "$_sling_json" | jq -r '(.status // "")' 2>/dev/null || echo "")
         case "$_sling_status" in
-          open|in_progress)
+          open|in_progress|deferred)
             if _sling_is_live "$_sling" "$_sling_db" "$_bid"; then
               continue   # still queued and not stale — pool hasn't served it yet.
             fi

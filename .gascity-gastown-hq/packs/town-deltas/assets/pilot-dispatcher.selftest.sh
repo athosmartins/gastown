@@ -498,6 +498,7 @@ run_step0() { # FAKE_STALE_JSON
 #   $7 = PILOT_TEST_PHANTOM_STALE_BEADS (space-list of ids treated as stale >45min — phantom guard seam)
 #   $8 = FAKE_SLING_LABELS              (sling→extra-label map — ga-d2jil sling gate-marker guard seam)
 #   $9 = PILOT_TEST_DEAD_SLINGS         (space-list of sling ids treated as STALE by _sling_is_live — ga-l7pp)
+#   $10 = FAKE_SLING_STATUS             (bd-native status the shim reports for any *sling* id; default "open" — ga-brnlfa)
 run_neverstarted() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   reset_state
@@ -513,6 +514,7 @@ run_neverstarted() {
     FAKE_NEVERSTARTED_JSON="${1:-[]}" \
     PILOT_TEST_BRANCH_BEADS="${2:-}" \
     FAKE_SESSIONS_JSON="${3:-}" \
+    FAKE_SLING_STATUS="${10:-}" \
     FAKE_SLING_ASSIGNEES="${4:-}" \
     PILOT_TEST_CREW_PROGRESSED="${5:-}" \
     PILOT_TEST_CREW_BRANCH_BEADS="${6:-}" \
@@ -3195,6 +3197,52 @@ if echo "$LOG16R3" | grep -q "releasing never-started in-flight bead tt-ns-queue
   bad "REGRESSION (ga-l7pp): released an unclaimed-sling bead while the roster was untrustworthy"
 else
   ok "unclaimed-but-fresh sling kept even when roster is untrustworthy (fail-open by default)"
+fi
+
+# 16r4 (ga-brnlfa): REPROVA ON PRE-FIX HEAD. A sling suppressed by
+# _pilot_suppress_reused_sling (ga-i58em/ga-hpc1x bounded defer) sits at bd
+# status="deferred", not open/in_progress — the ONE status the ga-l7pp case
+# statement above never matched. Before this fix that meant neither branch
+# fired: no `continue` (so it did not get the open/in_progress "still
+# queued, KEEP" treatment) and no close (so it did not get the "stale,
+# orphaned" treatment either) — execution fell straight through to
+# releasing the PARENT bead while the deferred sling sat completely
+# untouched. Live incident: ga-t8aay1's sling took the ga-hpc1x bounded
+# defer at 05:15Z; the parent (ga-3xfndz) was released as never-started at
+# 05:40Z while the sling was STILL deferred, giving the same story two
+# independently-claimable paths at once (Mayor had to manually `bd undefer`
+# + close the orphan by hand). Fresh+deferred must be treated exactly like
+# fresh+open/in_progress: KEEP the parent, let R6 clear the defer on its
+# own schedule (paired fix, same bead, in _pilot_suppress_reused_sling).
+echo "Scenario 16r4 (ga-brnlfa): an unclaimed-but-fresh DEFERRED sling is KEPT, not released"
+NS_DEFERRED='[{"id":"tt-ns-deferred","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-deferred"}}]'
+LOG16R4="$(run_neverstarted "$NS_DEFERRED" "" "$NS_SESS" "" "" "" "" "" "" "deferred")"
+if echo "$LOG16R4" | grep -q "releasing never-started in-flight bead tt-ns-deferred"; then
+  bad "REGRESSION (ga-brnlfa): released a story whose sling is deferred but still fresh — the exact ga-t8aay1 double-path incident"
+else
+  ok "unclaimed-but-fresh DEFERRED sling is kept (same treatment as open/in_progress, R6 will clear the defer)"
+fi
+
+# 16r5 (ga-brnlfa): a DEFERRED sling that is ALSO genuinely stale (per the
+# SAME PILOT_TEST_DEAD_SLINGS/_sling_is_live staleness check 16r2 already
+# proves for status=open) must get the SAME orphan treatment as a stale
+# open/in_progress sling: close it, then release the parent. Proves the
+# case-statement fix is a real union (open|in_progress|deferred all share
+# one code path), not just a "deferred always keeps" special-case that
+# would silently reintroduce ga-kuuk-style sibling-sling growth for a
+# defer that truly never resolves.
+echo "Scenario 16r5 (ga-brnlfa): an unclaimed-and-stale DEFERRED sling releases the story AND closes the orphan"
+NS_DEFERRED_STALE='[{"id":"tt-ns-deferred-stale","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-deferred-stale"}}]'
+LOG16R5="$(run_neverstarted "$NS_DEFERRED_STALE" "" "$NS_SESS" "" "" "" "" "" "tt-sling-deferred-stale" "deferred")"
+if echo "$LOG16R5" | grep -q "releasing never-started in-flight bead tt-ns-deferred-stale"; then
+  ok "unclaimed-and-stale DEFERRED sling is released (genuine orphan, defer never resolved)"
+else
+  bad "REGRESSION (ga-brnlfa): did NOT release a genuinely stale deferred-sling never-started bead"
+fi
+if echo "$LOG16R5" | grep -q "tt-sling-deferred-stale is unclaimed AND stale"; then
+  ok "orphaned stale DEFERRED sling is closed before the story releases (no lingering claimable duplicate)"
+else
+  bad "REGRESSION (ga-brnlfa): released the story but did NOT close the orphaned stale DEFERRED sling bead"
 fi
 
 # 16i: PILOT_NEVERSTARTED_MINUTES=0 fully disables the detector.
