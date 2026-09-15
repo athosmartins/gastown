@@ -1310,8 +1310,23 @@ _reap_code_sign_clone_orphans() {
   snap_out_file="$(mktemp "${TMPDIR:-/tmp}/dolt-disk-floor-guard-lsof-snapshot.XXXXXX" 2>/dev/null)" || { rm -f "$snap_err"; log "code-sign-clone-reap SKIP — could not create temp file for lsof snapshot"; return; }
   timeout 10 lsof -Fn >"$snap_out_file" 2>"$snap_err"
   snap_rc=$?
-  if [ "$snap_rc" -eq 124 ] || { [ ! -s "$snap_out_file" ] && [ -s "$snap_err" ]; }; then
-    log "code-sign-clone-reap SKIP — lsof -Fn snapshot failed or timed out this cycle (never guess liveness without it)"
+  # ga-hxki9f: unlike the per-directory `lsof +D <dir>` check (where empty
+  # output legitimately means "nothing open in this one dir"), a SYSTEM-WIDE
+  # `lsof -Fn` snapshot coming back completely empty is never a plausible
+  # "confirmed nothing open on this host" result — there is always at least
+  # lsof's own process, the calling shell, and every other running daemon.
+  # Gate on empty stdout REGARDLESS of stderr content, not only when stderr is
+  # ALSO non-empty: a quietly-broken or PATH-shadowed lsof that exits 0 with
+  # no output on either stream must still read as unknown, never as
+  # "confirmed nothing in use" — the old stderr-gated check let exactly that
+  # shape through, and because every candidate this cycle shares the ONE
+  # snapshot, a single quiet lsof failure misread that way would mark EVERY
+  # candidate orphaned in one shot (mass-delete, including genuinely in-use
+  # dirs) rather than just missing one (ga-p5q3: error and empty must not
+  # collapse to the same value — verified live via a fake exit-0/no-output
+  # lsof; see this bead's selftest addition).
+  if [ "$snap_rc" -eq 124 ] || [ ! -s "$snap_out_file" ]; then
+    log "code-sign-clone-reap SKIP — lsof -Fn snapshot failed, timed out, or returned empty this cycle (never guess liveness without it)"
     rm -f "$snap_err" "$snap_out_file" 2>/dev/null
     return
   fi

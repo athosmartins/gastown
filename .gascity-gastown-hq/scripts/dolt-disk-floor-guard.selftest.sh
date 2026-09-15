@@ -570,6 +570,74 @@ else
 fi
 rm -rf "$CSC_ROOT2" "$CSC_FAKE_LSOF_DIR"
 
+echo ""
+echo "=== _reap_code_sign_clone_orphans (ga-hxki9f): empty-but-'successful' lsof snapshot → nothing deleted ==="
+# A whole-system `lsof -Fn` that exits 0 with COMPLETELY EMPTY stdout AND
+# stderr is never a legitimate "nothing open on this host" result (unlike a
+# per-directory `lsof +D <dir>` check, where empty genuinely means "nothing
+# found here"). Prior to ga-hxki9f's fix, the snapshot skip-gate only caught
+# timeout or empty-stdout-WITH-stderr, so this exact shape (a quietly-broken
+# or PATH-shadowed lsof) slipped through and every candidate read as
+# "confirmed orphaned" off one bad snapshot. Prove it with a REAL held-open
+# fd on an OLD dir: if the gate is broken, this in-use dir gets deleted.
+CSC_ROOT3="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-csc3.XXXXXX)"
+CSC_OLD_INUSE3="$CSC_ROOT3/code_sign_clone.EEEEEE"
+mkdir -p "$CSC_OLD_INUSE3"
+exec 8>"$CSC_OLD_INUSE3/held-open"   # real open fd
+touch -t "$OLD_TS" "$CSC_OLD_INUSE3"   # mtime set AFTER the fd's file is created — creating a file inside a dir bumps the dir's OWN mtime back to "now"
+
+CSC_FAKE_LSOF_DIR3="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-lsof3.XXXXXX)"
+cat > "$CSC_FAKE_LSOF_DIR3/lsof" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+chmod +x "$CSC_FAKE_LSOF_DIR3/lsof"
+
+REAL_PATH="$PATH"
+PATH="$CSC_FAKE_LSOF_DIR3:$PATH"
+# shellcheck disable=SC2034  # read by _reap_code_sign_clone_orphans in the sourced script
+CODE_SIGN_CLONE_ORPHAN_GRACE_SECS=1800
+_reap_code_sign_clone_orphans "$CSC_ROOT3"
+PATH="$REAL_PATH"
+exec 8>&-
+
+if [ -d "$CSC_OLD_INUSE3" ]; then
+  ok "_reap_code_sign_clone_orphans: empty-but-successful lsof snapshot (rc=0, no stdout, no stderr) → in-use dir SPARED, never guessed as orphaned"
+else
+  bad "_reap_code_sign_clone_orphans: empty-but-successful lsof snapshot deleted a dir with a REAL open fd — a quiet lsof failure was trusted as 'confirmed nothing in use'"
+fi
+rm -rf "$CSC_ROOT3" "$CSC_FAKE_LSOF_DIR3"
+
+echo ""
+echo "=== _reap_code_sign_clone_orphans (ga-hxki9f): sibling dir whose name is a PREFIX must not cross-match ==="
+# code_sign_clone.AB vs code_sign_clone.ABC: an open file inside ABC must
+# never make AB read as in-use (the exact false-cross-match this bead's
+# review named). Exercises the real _code_sign_clone_dir_in_use grep-prefix
+# guard end-to-end, not just the boundary-value unit tests above.
+CSC_ROOT4="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-csc4.XXXXXX)"
+CSC_PREFIX_SHORT="$CSC_ROOT4/code_sign_clone.AB"
+CSC_PREFIX_LONG="$CSC_ROOT4/code_sign_clone.ABC"
+mkdir -p "$CSC_PREFIX_SHORT" "$CSC_PREFIX_LONG"
+exec 8>"$CSC_PREFIX_LONG/held-open"   # real open fd, ONLY inside the longer sibling
+touch -t "$OLD_TS" "$CSC_PREFIX_SHORT" "$CSC_PREFIX_LONG"   # both old enough to reap if (mis)read as orphaned
+
+# shellcheck disable=SC2034  # read by _reap_code_sign_clone_orphans in the sourced script
+CODE_SIGN_CLONE_ORPHAN_GRACE_SECS=1800
+_reap_code_sign_clone_orphans "$CSC_ROOT4"
+exec 8>&-
+
+if [ ! -d "$CSC_PREFIX_SHORT" ]; then
+  ok "_reap_code_sign_clone_orphans: code_sign_clone.AB (genuinely orphaned) DELETED despite sharing a prefix with an in-use sibling"
+else
+  bad "_reap_code_sign_clone_orphans: code_sign_clone.AB should have been deleted (genuinely orphaned) — spared instead"
+fi
+if [ -d "$CSC_PREFIX_LONG" ]; then
+  ok "_reap_code_sign_clone_orphans: code_sign_clone.ABC (real open fd) SPARED — its shorter-name sibling's grep pattern did not cross-match it"
+else
+  bad "_reap_code_sign_clone_orphans: code_sign_clone.ABC has a REAL open fd but was deleted — a shorter sibling's prefix pattern cross-matched it (missing prefix boundary)"
+fi
+rm -rf "$CSC_ROOT4"
+
 # ── _reap_code_sign_clone_orphans: nonexistent root → SKIP cleanly ──────────
 _reap_code_sign_clone_orphans "/nonexistent/path/$$/code-sign-clone-does-not-exist"
 ok "_reap_code_sign_clone_orphans: nonexistent root skips cleanly (no crash — this line only runs if it didn't)"
