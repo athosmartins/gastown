@@ -1,0 +1,23 @@
+# ga-grg42n: recurring scan for merge.<builtin-name>.driver config entries
+# (text/binary/union) that hijack git's own built-in merge algorithm --
+# child of gt-ymqjj (closed incident: merge.union.driver=true silently
+# discarded merge content across ~2h/20 gate refusals before the root
+# cause was found). Detection-only (alarms via escalation-router.sh, topic
+# infra -> mayor; never writes git config -- touching merge driver config
+# is what caused the original incident). Distinct from gt-4zk4b/ga-dqfw10's
+# whatsapp_automation-scoped .git-vs-.repo.git DIVERGENCE check: this one
+# flags a single git-dir defining a driver for a name git already builds
+# in, even when both sides of a rig agree.
+# Deliberately a gc order (fresh exec each tick), never a raw plist, so
+# this guard can never itself join the ga-y0g5x class of bug (self-locks
+# via flock as a second, independent guard against the same failure mode
+# -- see the script's own header). Cheap scan (a handful of `git config
+# --get-regexp` calls across the city's ~8 distinct git-dirs); 1h cadence
+# matches engine-window-backlog-guard.sh's precedent for a structural,
+# not-urgent config-sanity check -- this is prevention of recurrence, not
+# an active fire (last manual sweep, 2026-09-11, found nothing broken).
+[order]
+description = "Scan git config across the city for merge.<builtin>.driver entries (text/binary/union) that hijack git's own built-in merge algorithm"
+trigger = "cooldown"
+interval = "1h"
+exec = "$PACK_DIR/assets/scripts/merge-builtin-driver-hijack-guard.sh"
