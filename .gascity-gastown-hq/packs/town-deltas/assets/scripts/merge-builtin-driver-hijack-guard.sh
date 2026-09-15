@@ -220,7 +220,7 @@ mbdhg_get_rig_roots() {
 # (no-op, not an error) when the key is still within cooldown.
 mbdhg_alarm_once_standalone() {
   local key="$1" subject="$2" body="$3"
-  local seen_file router_bin escalate_after now last seen_json rc
+  local seen_file router_bin escalate_after now last seen_json rc deliver_rc
 
   seen_file="${MBDHG_SEEN_FILE:-$STATE_DIR/merge-builtin-driver-hijack-guard-seen.json}"
   router_bin="${MBDHG_ROUTER:-$CITY/packs/town-deltas/assets/escalation-router.sh}"
@@ -240,8 +240,24 @@ mbdhg_alarm_once_standalone() {
 
   if [ -x "$router_bin" ]; then
     "$router_bin" -s "$subject" -m "$body" --topic infra >/dev/null 2>&1
+    deliver_rc=$?
   else
-    "$GC_BIN" mail send mayor -s "$subject" -m "$body" >/dev/null 2>&1 || true
+    "$GC_BIN" mail send mayor -s "$subject" -m "$body" >/dev/null 2>&1
+    deliver_rc=$?
+  fi
+
+  if [ "$deliver_rc" -ne 0 ]; then
+    # DELIVERY FAILED -- a third, distinct state from "delivered" (rc=0) and
+    # "still in cooldown" (rc=1). Never conflate an attempted send with a
+    # confirmed one: persisting the cooldown timestamp here would silence
+    # this alarm for the full escalate_after window (default 24h) even
+    # though the guard re-detects the identical finding on every tick.
+    # This is exactly the "erro == vazio" collapse this guard's own header
+    # names -- an unconfirmed delivery must not be recorded as if it
+    # succeeded. Logged distinctly (not silent) and left unpersisted so the
+    # next run retries instead of going quiet.
+    echo "merge-builtin-driver-hijack-guard: ALARM DELIVERY FAILED (rc=$deliver_rc) for key='$key' -- NOT recording as seen, will retry next run" >&2
+    return 2
   fi
 
   seen_json=$(printf '%s' "$seen_json" | jq --arg k "$key" --argjson n "$now" '.[$k] = $n' 2>/dev/null)
@@ -337,13 +353,16 @@ else
   fi
 fi
 
+ALARM_DELIVERY_FAILED_COUNT=0
+
 if [ "$FINDING_COUNT" -gt 0 ]; then
   while IFS=$'\t' read -r gd fname fval; do
     [ -n "$gd" ] || continue
     key="${gd}|merge.${fname}.driver"
     subject="config:broken-merge-driver -- merge.${fname}.driver espúrio em ${gd}"
     body="Detectado merge.${fname}.driver=${fval} em ${gd}. '${fname}' é estratégia de merge EMBUTIDA do git (text/binary/union) -- não deveria ter driver custom registrado (mesmo mecanismo de gt-ymqjj: apagou conteúdo em silêncio, sem conflito, sem log). NÃO corrigido automaticamente por este guard -- mexer em merge driver foi o que causou aquele incidente; a correção é decisão de quem tiver contexto (ga-grg42n)."
-    mbdhg_alarm_once_standalone "$key" "$subject" "$body" || true
+    mbdhg_alarm_once_standalone "$key" "$subject" "$body"
+    [ $? -eq 2 ] && ALARM_DELIVERY_FAILED_COUNT=$((ALARM_DELIVERY_FAILED_COUNT+1))
   done < <(printf '%s' "$FINDINGS_TSV" | awk -F'\t' 'NF>=3')
 fi
 
@@ -353,8 +372,13 @@ if [ "$UNREADABLE_COUNT" -gt 0 ]; then
     key="${gd}|unreadable"
     subject="config:unreadable-merge-config -- não consegui ler git config em ${gd}"
     body="merge-builtin-driver-hijack-guard não conseguiu ler o git config de ${gd} (git config --get-regexp falhou com erro, não com 'sem match'). Não dá pra saber se há um merge.<builtin>.driver espúrio aí -- isto é ILEGÍVEL, não 'limpo'. Investigue o config desse git-dir (ga-grg42n)."
-    mbdhg_alarm_once_standalone "$key" "$subject" "$body" || true
+    mbdhg_alarm_once_standalone "$key" "$subject" "$body"
+    [ $? -eq 2 ] && ALARM_DELIVERY_FAILED_COUNT=$((ALARM_DELIVERY_FAILED_COUNT+1))
   done <<< "$UNREADABLE_TSV"
+fi
+
+if [ "$ALARM_DELIVERY_FAILED_COUNT" -gt 0 ]; then
+  echo "merge-builtin-driver-hijack-guard: AVISO -- $ALARM_DELIVERY_FAILED_COUNT alarme(s) NÃO entregue(s) nesta execução (router/mail falhou). Cooldown não foi persistido para eles; serão re-tentados na próxima execução." >&2
 fi
 
 exit 0

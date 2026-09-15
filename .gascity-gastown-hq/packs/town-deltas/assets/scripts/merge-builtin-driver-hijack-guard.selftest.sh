@@ -216,6 +216,70 @@ CALLS_AFTER_EXPIRY=$(grep -c . "$CALL_LOG" 2>/dev/null || echo 0)
 [ "$CALLS_AFTER_EXPIRY" = "2" ] && ok "alarm_once re-fires once the cooldown window has passed" \
   || bad "expected 2 total calls after cooldown expiry, got $CALLS_AFTER_EXPIRY"
 
+# ── 9b. alarm DELIVERY FAILURE must be a distinct state, never folded into
+#    "seen" -- ga-grg42n gate finding (fix-attempt 1): the exit status of
+#    the router/mail delivery call was discarded and the cooldown timestamp
+#    was persisted UNCONDITIONALLY, so a failed send looked identical to a
+#    successful one and silently suppressed re-alerting for the full
+#    escalate_after window (default 24h) even though the guard re-detects
+#    the identical finding on every ~hourly tick. Stub a router that always
+#    FAILS and prove: (a) a distinct return code, (b) a distinct log
+#    message, (c) the cooldown is NOT persisted, (d) the next tick retries
+#    instead of going silent, (e) once delivery recovers, the happy path
+#    (persist + suppress) still works.
+FAIL_CALL_LOG="$WORK/fail-calls.log"
+: > "$FAIL_CALL_LOG"
+FAIL_ROUTER="$WORK/fail-router.sh"
+cat > "$FAIL_ROUTER" <<EOF
+#!/usr/bin/env bash
+echo "called" >> "$FAIL_CALL_LOG"
+exit 1
+EOF
+chmod +x "$FAIL_ROUTER"
+FAIL_SEEN_FILE="$WORK/fail-seen.json"
+echo '{}' > "$FAIL_SEEN_FILE"
+
+(
+  MBDHG_SEEN_FILE="$FAIL_SEEN_FILE" MBDHG_ROUTER="$FAIL_ROUTER" MBDHG_ESCALATE_AFTER_S=3600 \
+    bash -c '. "'"$GUARD"'" --lib; mbdhg_alarm_once_standalone "failkey" "subj" "body"'
+) >/dev/null 2>"$WORK/fail1.err"
+FAIL_RC1=$?
+[ "$FAIL_RC1" = "2" ] && ok "alarm_once returns a distinct rc=2 when delivery fails (0=delivered, 1=cooldown, 2=delivery failed)" \
+  || bad "expected rc=2 on delivery failure, got rc=$FAIL_RC1"
+grep -q 'ALARM DELIVERY FAILED' "$WORK/fail1.err" 2>/dev/null && ok "delivery failure is logged distinctly on stderr (visible, not silent)" \
+  || bad "expected a distinct 'ALARM DELIVERY FAILED' message on stderr, got: $(cat "$WORK/fail1.err" 2>/dev/null)"
+
+PERSISTED_AFTER_FAIL=$(jq -r '.failkey // "absent"' "$FAIL_SEEN_FILE" 2>/dev/null)
+[ "$PERSISTED_AFTER_FAIL" = "absent" ] && ok "failed delivery does NOT persist a cooldown timestamp (erro != vazio: unconfirmed send is not recorded as sent)" \
+  || bad "failed delivery incorrectly persisted a cooldown timestamp: $PERSISTED_AFTER_FAIL"
+
+(
+  MBDHG_SEEN_FILE="$FAIL_SEEN_FILE" MBDHG_ROUTER="$FAIL_ROUTER" MBDHG_ESCALATE_AFTER_S=3600 \
+    bash -c '. "'"$GUARD"'" --lib; mbdhg_alarm_once_standalone "failkey" "subj" "body"'
+) >/dev/null 2>>"$WORK/fail1.err"
+FAIL_CALLS=$(grep -c . "$FAIL_CALL_LOG" 2>/dev/null || echo 0)
+[ "$FAIL_CALLS" = "2" ] && ok "a second attempt after a failed delivery retries immediately (no bogus cooldown suppression)" \
+  || bad "expected 2 router invocations after 2 failed attempts (retry, not suppressed), got $FAIL_CALLS"
+
+RECOVER_ROUTER="$WORK/recover-router.sh"
+cat > "$RECOVER_ROUTER" <<EOF
+#!/usr/bin/env bash
+echo "called" >> "$FAIL_CALL_LOG"
+exit 0
+EOF
+chmod +x "$RECOVER_ROUTER"
+(
+  MBDHG_SEEN_FILE="$FAIL_SEEN_FILE" MBDHG_ROUTER="$RECOVER_ROUTER" MBDHG_ESCALATE_AFTER_S=3600 \
+    bash -c '. "'"$GUARD"'" --lib; mbdhg_alarm_once_standalone "failkey" "subj" "body"'
+) >/dev/null 2>&1
+RECOVER_RC=$?
+PERSISTED_AFTER_RECOVER=$(jq -r '.failkey // "absent"' "$FAIL_SEEN_FILE" 2>/dev/null)
+if [ "$RECOVER_RC" = "0" ] && [ "$PERSISTED_AFTER_RECOVER" != "absent" ]; then
+  ok "once delivery recovers, rc=0 and the cooldown timestamp IS persisted (happy path unaffected by the fix)"
+else
+  bad "expected rc=0 and a persisted timestamp once delivery recovers, got rc=$RECOVER_RC persisted=$PERSISTED_AFTER_RECOVER"
+fi
+
 # ── 10. erro != vazio -- if rig discovery itself is broken (GC_BIN fails),
 #    mbdhg_get_rig_roots (the function the CLI's error/exit-2 path is
 #    wired to, verified below by the CLI-wiring assertion) must return a
@@ -331,6 +395,8 @@ if grep -qE 'RIG_ROOTS_RC=\$\?' "$GUARD" && grep -qE 'if \[ "\$RIG_ROOTS_RC" -ne
 else
   bad "CLI no longer appears to check RIG_ROOTS_RC / exit 2 -- the erro-!=-vazio contract test #10 verifies may not be wired into main() anymore"
 fi
+grep -q 'deliver_rc' "$GUARD" && ok "guard captures the alarm delivery exit status (deliver_rc) instead of discarding it" \
+  || bad "guard no longer appears to capture the alarm delivery exit status -- the fix-attempt-1 gate finding may have regressed"
 
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"
