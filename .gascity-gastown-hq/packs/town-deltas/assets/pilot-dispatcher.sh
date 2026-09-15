@@ -1662,7 +1662,7 @@ _pilot_unsuppress_sling() {
   if ! printf '%s\n' "$_pus_lbls" | grep -q '^pilot:held$'; then
     return 0   # nothing to undo — never suppressed, or already cleared
   fi
-  _pus_expiry_lbl=$(printf '%s\n' "$_pus_lbls" | grep -E '^pilot:held-until:[0-9]+$' | head -1)
+  _pus_expiry_lbl=$(printf '%s\n' "$_pus_lbls" | grep -E '^pilot:held-until:[0-9]+$' | head -1) || true
   if [ "$DRY_RUN" = "1" ]; then
     log "ga-h6trx3: WOULD strip pilot:held${_pus_expiry_lbl:+ + $_pus_expiry_lbl} and undefer $_pus_id"
     return 0
@@ -1704,7 +1704,7 @@ _pilot_selfheal_expired_slings() {
     [ -n "$_pse_bead" ] || continue
     _pse_sling_for=$(printf '%s' "$_pse_bead" | jq -r 'if type=="array" then .[0] else . end | (.metadata["pilot.sling_for"] // "")' 2>/dev/null)
     [ -n "$_pse_sling_for" ] || continue
-    _pse_expiry_lbl=$(printf '%s' "$_pse_bead" | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null | grep -E '^pilot:held-until:[0-9]+$' | head -1)
+    _pse_expiry_lbl=$(printf '%s' "$_pse_bead" | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null | grep -E '^pilot:held-until:[0-9]+$' | head -1) || true
     [ -n "$_pse_expiry_lbl" ] || continue
     _pse_expiry_ep="${_pse_expiry_lbl#pilot:held-until:}"
     [ "$(( _pse_expiry_ep + 0 ))" -lt "$_pse_now" ] 2>/dev/null || continue

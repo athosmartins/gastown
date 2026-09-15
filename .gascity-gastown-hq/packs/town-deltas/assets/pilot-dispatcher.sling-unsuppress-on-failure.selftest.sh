@@ -121,6 +121,63 @@ run_selfheal() {
   )
 }
 
+# run_unsuppress_strict / run_selfheal_strict — same as run_unsuppress /
+# run_selfheal above, except the subshell runs under `set -euo pipefail`,
+# matching pilot-dispatcher.sh's own top-of-file pragma (line 74) exactly.
+# run_unsuppress/run_selfheal only set -uo pipefail (no -e), so they cannot
+# observe a set -e-triggered abort inside the extracted function body —
+# gate_run ga-b9h503 (fix-attempt 2, SHA 690dcb6e) found exactly this: a
+# bare `x=$(... | grep ... | head -1)` with no match exits non-zero under
+# pipefail, and set -e then killed the WHOLE Pilot process before the very
+# next line's `[ -n "$x" ]` graceful check — which exists specifically to
+# handle a no-match — ever ran. These wrappers reproduce the real pragma so
+# that class of bug cannot hide behind a laxer harness a second time. On
+# success the subshell's last action appends the literal marker line
+# "SURVIVED" to $CALLS; a pre-marker set -e abort means the caller never
+# sees it — that absence IS the crash signal, checked via has_call.
+run_unsuppress_strict() {
+  : > "$CALLS"
+  local _rus_city="$1" _rus_id="$2" _rus_bead_json="$3" _rus_dry="${4:-0}"
+  (
+    set -euo pipefail
+    DRY_RUN="$_rus_dry"
+    bd() {
+      printf 'bd\t%s\n' "$*" >> "$CALLS"
+      case "$*" in
+        *"show $_rus_id --json"*) printf '%s' "$_rus_bead_json" ;;
+      esac
+    }
+    log()  { printf 'log\t%s\n'  "$*" >> "$CALLS"; }
+    eval "$UNSUPPRESS_FN"
+    _pilot_unsuppress_sling "$_rus_city" "$_rus_id"
+    echo "SURVIVED" >> "$CALLS"
+  )
+}
+
+run_selfheal_strict() {
+  : > "$CALLS"
+  local _rss_city="$1" _rss_ids_json="$2" _rss_dry="${3:-0}"
+  (
+    set -euo pipefail
+    DRY_RUN="$_rss_dry"
+    bd() {
+      printf 'bd\t%s\n' "$*" >> "$CALLS"
+      case "$*" in
+        *"list -l pilot:held --json -n 0"*) printf '%s' "$_rss_ids_json" ;;
+        *"show "*" --json"*)
+          local _id; _id=$(printf '%s' "$*" | awk '{for(i=1;i<=NF;i++) if($i=="show"){print $(i+1); exit}}')
+          _bead_for "$_id"
+          ;;
+      esac
+    }
+    log()  { printf 'log\t%s\n'  "$*" >> "$CALLS"; }
+    eval "$UNSUPPRESS_FN"
+    eval "$SELFHEAL_FN"
+    _pilot_selfheal_expired_slings "$_rss_city"
+    echo "SURVIVED" >> "$CALLS"
+  )
+}
+
 has_call() { grep -qF -- "$1" "$CALLS" 2>/dev/null; }
 count_call() { grep -cF -- "$1" "$CALLS" 2>/dev/null; }
 
@@ -250,6 +307,57 @@ else
   bad "mixed batch — expected exactly 1 undefer (mix-sling-expired), got $_undefers (dump: $(cat "$CALLS" | tr '\n' '|'))"
 fi
 
+# ── Scenario L: _pilot_unsuppress_sling under the REAL set -e pragma —
+#    pilot:held with NO matching pilot:held-until label must not crash ─────
+#    (gate_run ga-b9h503, SHA 690dcb6e: the unguarded `grep -E '...' | head
+#    -1` assignment exits non-zero under pipefail when no held-until label
+#    matches; set -e then aborted the WHOLE Pilot process before the very
+#    next `[ -n "$_pus_expiry_lbl" ]` graceful check ever ran — worse than
+#    the bug this fix set out to close. Not contrived: legacy pre-ga-brnlfa
+#    slings lack held-until entirely, and the unmodified
+#    _pilot_suppress_reused_sling stamps held-until and held via two
+#    independent `bd label add ... || true` calls with no atomicity, so a
+#    transient failure of just the first produces this shape freshly too.
+#    Scenarios A-E above cannot see this: they run the extracted function
+#    under `set -uo pipefail` only (no -e), so the pre-fix code silently
+#    "worked" inside that harness even while it would abort the real file.)
+echo "Scenario L: _pilot_unsuppress_sling, real set -e pragma — pilot:held with NO held-until label does not crash"
+BEAD_L='[{"labels":["pilot:dispatched","pilot:held"]}]'
+run_unsuppress_strict "hq" "sling-l" "$BEAD_L" 0
+if ! has_call "SURVIVED"; then
+  bad "CRASHED under set -e (the exact ga-b9h503 finding) — dump: $(cat "$CALLS" | tr '\n' '|')"
+else
+  if has_call "bd	-C hq label remove sling-l pilot:held -q" && has_call "bd	-C hq undefer sling-l"; then
+    ok "held-but-no-until sling — survives set -e, still strips pilot:held and undefers"
+  else
+    bad "survived but did not complete the expected strip+undefer (dump: $(cat "$CALLS" | tr '\n' '|'))"
+  fi
+  if grep -qE '^bd\t-C hq label remove sling-l pilot:held-until' "$CALLS"; then
+    bad "REGRESSION: attempted to remove a held-until label that was never present"
+  else
+    ok "no held-until label existed — none was attempted for removal"
+  fi
+fi
+
+# ── Scenario M: _pilot_selfheal_expired_slings under the REAL set -e
+#    pragma — a sling with pilot:held and NO held-until label must not
+#    crash the sweep, and is correctly left for R6 (no epoch to judge
+#    expiry by, per this function's own documented scope) ─────────────────
+echo "Scenario M: self-heal, real set -e pragma — sling pilot:held with NO held-until label does not crash the sweep"
+_bead_for() {
+  case "$1" in
+    sling-no-until) printf '[{"metadata":{"pilot.sling_for":"story-5"},"labels":["pilot:held"]}]' ;;
+  esac
+}
+run_selfheal_strict "hq" '[{"id":"sling-no-until"}]' 0
+if ! has_call "SURVIVED"; then
+  bad "CRASHED under set -e (the exact ga-b9h503 finding, sweep-start path) — dump: $(cat "$CALLS" | tr '\n' '|')"
+elif grep -qE '^bd\t-C hq (label remove|undefer)' "$CALLS"; then
+  bad "REGRESSION: self-heal acted on a hold with no epoch to judge expiry by"
+else
+  ok "held-but-no-until sling — sweep survives set -e, correctly left untouched (R6 remains the backstop)"
+fi
+
 # ── Scenario J: drift-guards — helpers defined + wired at both call sites ──
 echo "Scenario J: drift-guard — helpers defined and wired into dispatch_one()'s two delivery branches + sweep start"
 has() { local pat="$1" desc="$2"; if grep -Eq "$pat" "$DISPATCHER"; then ok "$desc"; else bad "$desc — pattern not found: $pat"; fi; }
@@ -336,6 +444,80 @@ else
   else
     bad "REGRESSION: _pilot_unsuppress_sling defined at line $UNSUPPRESS_DEF_LINE, at or after selfheal's top-level call at line $SELFHEAL_CALL_LINE — selfheal would crash calling it"
   fi
+fi
+
+# ── Scenario N: drift-guard — both held-until grep|head lookups stay
+#    guarded against pipefail's no-match exit ──────────────────────────────
+#    Gate run ga-b9h503 (fix-attempt 2, SHA 690dcb6e) FAILED exactly here:
+#    `_pus_expiry_lbl=$(... | grep -E '^pilot:held-until:[0-9]+$' | head
+#    -1)` and the analogous _pilot_selfheal_expired_slings assignment had no
+#    `|| true`/fallback, so grep's exit 1 on "pilot:held present, no
+#    matching held-until label" propagated through pipefail and aborted the
+#    entire Pilot process under set -euo pipefail (line 74). Scenarios L/M
+#    above catch this behaviorally via the strict, real-pragma harness; this
+#    scenario guards the same regression structurally — the same
+#    belt-and-suspenders relationship Scenario K has to A-J — so a future
+#    edit that innocently strips the trailing `|| true` as "dead code" is
+#    still caught even if the strict scenarios are later weakened or removed.
+echo "Scenario N: drift-guard — both held-until grep|head lookups keep their pipefail guard"
+_HELD_UNTIL_GUARD_MARKER="grep -E '^pilot:held-until:[0-9]+\$' | head -1) || true"
+_guarded_count=$(grep -cF -- "$_HELD_UNTIL_GUARD_MARKER" "$DISPATCHER")
+if [ "$_guarded_count" -eq 2 ]; then
+  ok "both held-until grep|head lookups (_pilot_unsuppress_sling + _pilot_selfheal_expired_slings) keep their || true pipefail guard"
+else
+  bad "REGRESSION: expected 2 guarded held-until grep|head lookups, found $_guarded_count — one may have lost its || true (the exact ga-b9h503 crash could be back)"
+fi
+
+# ── Scenario O: self-heal, real set -e pragma — empty pilot:held list is a
+#    clean no-op (Mayor's ga-h6trx3 attempt-3 review, item 2) ──────────────
+echo "Scenario O: self-heal, real set -e pragma — empty pilot:held list is a clean no-op"
+run_selfheal_strict "hq" '[]' 0
+if ! has_call "SURVIVED"; then
+  bad "CRASHED under set -e on an empty pilot:held list — dump: $(cat "$CALLS" | tr '\n' '|')"
+elif grep -qE '^bd\t-C hq (label remove|undefer|show)' "$CALLS"; then
+  bad "REGRESSION: empty pilot:held list should never touch a single bead"
+else
+  ok "empty pilot:held list — sweep survives set -e, zero beads touched (nothing to self-heal)"
+fi
+
+# ── Scenario P: self-heal, real set -e pragma — bd show fails for a listed
+#    id, skips gracefully via the PRE-EXISTING `|| continue` guard at line
+#    ~1703 (that guard predates this fix and was never gate-flagged; this
+#    proves it still holds under the real pragma, not just under -uo
+#    pipefail) ────────────────────────────────────────────────────────────
+echo "Scenario P: self-heal, real set -e pragma — bd show fails for a listed id, skips gracefully"
+_bead_for() {
+  case "$1" in
+    sling-show-fails) return 1 ;;
+  esac
+}
+run_selfheal_strict "hq" '[{"id":"sling-show-fails"}]' 0
+if ! has_call "SURVIVED"; then
+  bad "CRASHED under set -e when bd show fails for a listed id — dump: $(cat "$CALLS" | tr '\n' '|')"
+elif grep -qE '^bd\t-C hq (label remove|undefer)' "$CALLS"; then
+  bad "REGRESSION: acted on a bead whose bd show call failed"
+else
+  ok "bd show failure for a listed id — sweep survives set -e, that id is skipped (pre-existing || continue guard holds)"
+fi
+
+# ── Scenario Q: self-heal, real set -e pragma — bead carries NO labels at
+#    all (empty array), not merely a missing held-until among others — a
+#    distinct root cause hitting the same grep|head line (jq emits zero
+#    label lines instead of one non-matching line; either way grep's
+#    no-match exit is what the || true on line ~1707 now absorbs) ─────────
+echo "Scenario Q: self-heal, real set -e pragma — bead has NO labels at all, does not crash"
+_bead_for() {
+  case "$1" in
+    sling-no-labels) printf '[{"metadata":{"pilot.sling_for":"story-6"},"labels":[]}]' ;;
+  esac
+}
+run_selfheal_strict "hq" '[{"id":"sling-no-labels"}]' 0
+if ! has_call "SURVIVED"; then
+  bad "CRASHED under set -e on a labelless-but-listed bead — dump: $(cat "$CALLS" | tr '\n' '|')"
+elif grep -qE '^bd\t-C hq (label remove|undefer)' "$CALLS"; then
+  bad "REGRESSION: acted on a bead with no labels to judge expiry by"
+else
+  ok "labelless sling bead — sweep survives set -e, correctly left untouched"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
