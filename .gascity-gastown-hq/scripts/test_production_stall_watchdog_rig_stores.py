@@ -69,12 +69,27 @@ class TestDynamicRigRoots(unittest.TestCase):
 
         self._saved_env = os.environ.pop("PROD_STALL_RIG_ROOTS", None)
 
+        # test_gc_failure_keeps_static_default_and_logs_degraded drives
+        # _resolve_dynamic_rig_roots() down its failure branch, which shells
+        # out to the real NOTIFY binary unconditionally (sh([NOTIFY, ...]) —
+        # no injectable seam here, unlike gate-marker-rehome-janitor.py/
+        # sling-task-janitor.py's _do_notify_fn). notify's own guard
+        # (PYTEST_CURRENT_TEST/NOTIFY_DISABLE, see ~/.local/bin/notify) is
+        # what actually suppresses the push; set it for every test in this
+        # class so a real ntfy.sh notification never fires from this suite.
+        self._saved_notify_disable = os.environ.get("NOTIFY_DISABLE")
+        os.environ["NOTIFY_DISABLE"] = "1"
+
     def tearDown(self):
         self._tmpdir.cleanup()
         if self._saved_env is not None:
             os.environ["PROD_STALL_RIG_ROOTS"] = self._saved_env
         else:
             os.environ.pop("PROD_STALL_RIG_ROOTS", None)
+        if self._saved_notify_disable is not None:
+            os.environ["NOTIFY_DISABLE"] = self._saved_notify_disable
+        else:
+            os.environ.pop("NOTIFY_DISABLE", None)
 
     def test_import_alone_never_calls_gc(self):
         """Loading the module for introspection alone (as
