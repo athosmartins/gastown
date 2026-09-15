@@ -80,6 +80,14 @@
 set -uo pipefail
 
 CITY="/Users/athos/gt/.gascity-gastown-hq"
+
+# ga-0bjqix: canonical PID resolution (dolt.pid + basename+LISTEN verification,
+# never a bare process-table sort). Sourced directly (not only transitively via
+# the optional gc-dolt-probe.sh below) so the fallback branch of _dolt_cpu_pct
+# is covered too. See dolt-pid-lib.sh.
+# shellcheck source=dolt-pid-lib.sh
+source "$(dirname "${BASH_SOURCE[0]:-$0}")/dolt-pid-lib.sh"
+
 DB="hq"
 PORT="52756"
 THRESHOLD_G="1"            # online gc when hq store >= 1 GB (ga-ftmci: re-bloats fast;
@@ -170,7 +178,7 @@ _dolt_cpu_pct() {
   if declare -f _gc_dolt_cpu_pct >/dev/null 2>&1; then
     c="$(_gc_dolt_cpu_pct)"
   else
-    local pid; pid="$(pgrep -f 'dolt sql-server' 2>/dev/null | head -1 || true)"
+    local pid; pid="$(dolt_server_pid || true)"
     [ -z "$pid" ] && { echo ""; return; }
     c="$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ')"
   fi

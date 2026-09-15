@@ -54,6 +54,19 @@ unset _GLH_SCRIPT
 _QHC_SCRIPT="${GC_CITY}/packs/town-deltas/assets/quiet-hours-check.sh"
 [ -r "$_QHC_SCRIPT" ] && { source "$_QHC_SCRIPT" 2>/dev/null; } || true
 unset _QHC_SCRIPT
+
+# ga-0bjqix: canonical Dolt-server PID resolution (dolt.pid + basename+LISTEN
+# verification, never a bare process-table sort) for the ambient-CPU headroom
+# check below. Same source-fail-soft convention as the sibling libs above —
+# verified empirically (2026-09-15) that this specific lib is safe to source
+# under this file's `set -euo pipefail`: it defines only functions, no
+# top-level command that could fail and silently kill the dispatcher the way
+# git-lock-hygiene.sh's top-level `git rev-parse` once did (see memory
+# gate-dispatcher-sourced-lib-set-e-silent-exit-128). [ -r ] covers both
+# missing and unreadable, same as the two libs above.
+_DPL_SCRIPT="${GC_CITY}/scripts/dolt-pid-lib.sh"
+[ -r "$_DPL_SCRIPT" ] && { source "$_DPL_SCRIPT" 2>/dev/null; } || true
+unset _DPL_SCRIPT
 # ga-dxyvxr third-state hardening: if sourcing failed (missing/unreadable
 # sibling file), QUIET_HOURS_LEVEL_FILE never gets set (quiet-hours-check.sh
 # always sets it via its own ${VAR:-default}, so its absence here proves the
@@ -7624,12 +7637,13 @@ log "=== Dispatcher sweep start (DRY_RUN=${DRY_RUN}) ==="
 # The Step 0b-1 headroom gate must judge the data plane by its AMBIENT load, not
 # the spike this dispatcher's own Step 0a/0a-2/0a-3 janitors add. Sample the live
 # dolt-server %cpu HERE, before any janitor runs. This is a pure `ps` read (no
-# Dolt query, no added load) resolved via pgrep; empty on miss → the headroom
-# gate falls back to its legacy post-janitor reading (no regression). Honors the
+# Dolt query, no added load) resolved via dolt_server_pid() (ga-0bjqix; never a
+# bare process-table sort); empty on miss → the headroom gate falls back to its
+# legacy post-janitor reading (no regression). Honors the
 # GATE_DOLT_CPU_OVERRIDE selftest seam through gate_dolt_cpu.
 GATE_AMBIENT_DOLT_CPU=""
 if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
-  GATE_AMBIENT_DOLT_PID=$(pgrep -f 'dolt sql-server' 2>/dev/null | head -1 || true)
+  GATE_AMBIENT_DOLT_PID=$(dolt_server_pid || true)
   GATE_AMBIENT_DOLT_CPU=$(gate_dolt_cpu "${GATE_AMBIENT_DOLT_PID:-}")
 fi
 

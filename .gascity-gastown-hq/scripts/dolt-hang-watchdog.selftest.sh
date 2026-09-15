@@ -278,9 +278,10 @@ fi
 # a silent, wording-dependent fragility). Static check, not dynamic: reaching
 # this branch by actually running the script means surviving the SAME
 # kill -QUIT + restart machinery the gate-FAIL 2/3 blocks above work so hard to
-# avoid — and here `pgrep -f 'dolt sql-server'` would find THIS HOST'S REAL
-# PRODUCTION Dolt process, not a scratch fixture (no STRIKES/veto-file-style
-# override exists for "which PID looks like Dolt" at the kill site). There is
+# avoid — and here dolt_server_pid() (ga-0bjqix) would correctly find THIS
+# HOST'S REAL PRODUCTION Dolt process, not a scratch fixture (no
+# STRIKES/veto-file-style override exists for PID resolution at the kill
+# site). There is
 # no safe way to dynamically exercise this specific branch. The function being
 # called (escalate_emergency.py) has its own independent --selftest (17/0 as of
 # this fix) — this file's job is only to prove the RIGHT call, with the RIGHT

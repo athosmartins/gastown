@@ -32,6 +32,11 @@
 set -uo pipefail
 
 CITY="/Users/athos/gt/.gascity-gastown-hq"
+
+# ga-0bjqix: canonical PID resolution (dolt.pid + basename+LISTEN verification,
+# never a bare process-table sort). See dolt-pid-lib.sh.
+# shellcheck source=dolt-pid-lib.sh
+source "$(dirname "${BASH_SOURCE[0]:-$0}")/dolt-pid-lib.sh"
 LOG="$CITY/.gc/logs/gate-pilot-soak-monitor.log"
 METRICS="$CITY/.gc/logs/gate-pilot-soak-metrics.log"
 DISP_LOG="$CITY/.gc/logs/quality-gate-dispatcher.log"
@@ -201,7 +206,7 @@ MANUAL_VIOLATION=0
 if [ -f "$MANUAL_SENTINEL" ]; then MANUAL_VIOLATION=1; fi
 
 # (5) Dolt load sample --------------------------------------------------------
-DOLT_PID=$(pgrep -f 'dolt sql-server' 2>/dev/null | head -1 || true)
+DOLT_PID=$(dolt_server_pid || true)
 if [ -n "$DOLT_PID" ]; then
   DOLT_CPU=$(ps -o %cpu= -p "$DOLT_PID" 2>/dev/null | tr -d ' '); DOLT_CPU=${DOLT_CPU:-0}
 else

@@ -51,6 +51,11 @@
 #   gc-dolt-probe.sh --selftest
 set -uo pipefail
 
+# ga-0bjqix: canonical PID resolution (dolt.pid + basename+LISTEN verification,
+# never a bare process-table sort). See dolt-pid-lib.sh.
+# shellcheck source=dolt-pid-lib.sh
+source "$(dirname "${BASH_SOURCE[0]:-$0}")/dolt-pid-lib.sh"
+
 # ── config ────────────────────────────────────────────────────────────────────
 # Timeout for `gc dolt health --json`. In practice the command takes ~4-6s on a healthy
 # Dolt (process startup overhead) and MORE under a CPU burst — measured ~10s during a
@@ -87,7 +92,7 @@ _gc_dolt_ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # NEVER hangs: ps is local-only.
 _gc_dolt_cpu_pct() {
   local pid
-  pid="$(pgrep -f 'dolt sql-server' 2>/dev/null | head -1 || true)"
+  pid="$(dolt_server_pid || true)"
   [ -z "$pid" ] && { echo "?"; return; }
   ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ' || echo "?"
 }
@@ -275,7 +280,7 @@ gc_dolt_probe_goroutine_dump() {
   fi
 
   local pid
-  pid="$(pgrep -f 'dolt sql-server' 2>/dev/null | head -1 || true)"
+  pid="$(dolt_server_pid || true)"
 
   if [ -z "$pid" ]; then
     # Dolt process not found — already dead; nothing to dump

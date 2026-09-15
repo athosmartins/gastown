@@ -8,6 +8,11 @@
 set -uo pipefail
 
 CITY="/Users/athos/gt/.gascity-gastown-hq"
+
+# ga-0bjqix: canonical PID resolution (dolt.pid + basename+LISTEN verification,
+# never a bare process-table sort). See dolt-pid-lib.sh.
+# shellcheck source=dolt-pid-lib.sh
+source "$(dirname "${BASH_SOURCE[0]:-$0}")/dolt-pid-lib.sh"
 LOG="$CITY/.gc/logs/soak-spd2n.jsonl"
 START_F="$CITY/.gc/soak-spd2n.start"           # epoch of soak start
 STRIKES_F="/tmp/soak-spd2n.strikes"            # consecutive wedge checks
@@ -30,7 +35,7 @@ fresh() { local f="$1"; [ -f "$f" ] || { echo 0; return; }; local m=$(( (now - $
 gate_alive=$(fresh "$GATE_LOG")
 pilot_alive=$(fresh "$PILOT_LOG")
 dolt_ok=$(timeout 8 python3 -c "import pymysql;pymysql.connect(host='127.0.0.1',port=$DOLT_PORT,user='root',connect_timeout=6).cursor().execute('SELECT 1');print(1)" 2>/dev/null || echo 0)
-dolt_cpu=$(ps -p "$(pgrep -f 'dolt sql-server' | head -1)" -o %cpu= 2>/dev/null | tr -d ' ' || echo "?")
+dolt_cpu=$(ps -p "$(dolt_server_pid)" -o %cpu= 2>/dev/null | tr -d ' ' || echo "?")
 refino_ok=$(launchctl list 2>/dev/null | grep -qE 'com.gascity.(auto-refino|refino-gate)-dispatcher' && echo 1 || echo 0)
 # progress: merges in the whole soak window (monotonic non-decreasing health signal)
 # ga-879wu gate-feedback: grep -c always prints a number on stdout (even "0" with

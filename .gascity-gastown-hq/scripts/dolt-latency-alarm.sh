@@ -75,6 +75,11 @@
 set -uo pipefail
 
 CITY="/Users/athos/gt/.gascity-gastown-hq"
+
+# ga-0bjqix: canonical PID resolution (dolt.pid + basename+LISTEN verification,
+# never a bare process-table sort). See dolt-pid-lib.sh.
+# shellcheck source=dolt-pid-lib.sh
+source "$(dirname "${BASH_SOURCE[0]:-$0}")/dolt-pid-lib.sh"
 LOG="$CITY/.gc/logs/dolt-latency-alarm.log"
 DOLT_PORT_DEFAULT="${BEADS_DOLT_PORT:-52756}"
 
@@ -154,7 +159,7 @@ live_dolt_port() {
   # a guard blind to its own trigger condition: error and empty must never
   # produce the same observable result.
   local pid port=""
-  pid=$(pgrep -f 'dolt sql-server' 2>/dev/null | head -1)
+  pid=$(dolt_server_pid)
   if [ -n "$pid" ]; then
     port=$(lsof -nP -p "$pid" 2>/dev/null | grep LISTEN | grep -oE ':[0-9]+ \(LISTEN\)' | head -1 | grep -oE '[0-9]+')
   fi

@@ -27,7 +27,20 @@ ok()   { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 nope() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; }
 
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+
+# ga-0bjqix: live_dolt_port() now resolves its PID via the shared dolt_server_pid()
+# (dolt-pid-lib.sh), which liveness-checks its candidate with a REAL `kill -0` —
+# a fictional PID literal (the old "555") would just fail that check silently.
+# Spawn one real, harmless, long-lived process to stand in for "the dolt process
+# pgrep found"; its comm/listen-socket identity is still faked via the ps/lsof
+# stubs below, keyed off this real PID. (No GC_CITY scratch override needed for
+# dolt_server_pid()'s pidfile step: the ps/lsof stubs arbitrate purely by
+# exact-PID-match against DLA_PGREP_PID, so a real dolt.pid -- if the host
+# running this test happens to have one -- is harmless; its PID just never
+# matches and that candidate is correctly rejected.)
+sleep 300 & DLA_REAL_PID=$!
+
+trap 'kill "$DLA_REAL_PID" 2>/dev/null; rm -rf "$WORK"' EXIT
 
 REAL_PYTHON3="$(command -v python3)"
 
@@ -88,8 +101,34 @@ cat > "$STUBS/pgrep" <<'STUB'
 exit 1
 STUB
 
+# ga-0bjqix: dolt_server_pid()'s _dolt_pid_is_server checks `ps -o comm= -p PID`
+# before trusting a pgrep candidate -- only DLA_PGREP_PID reports comm=dolt.
+cat > "$STUBS/ps" <<'STUB'
+#!/usr/bin/env bash
+pid=""
+for a in "$@"; do case "$a" in [0-9]*) pid="$a" ;; esac; done
+case " $* " in
+  *"%cpu"*) echo "0.0" ;;
+  *) if [ -n "${DLA_PGREP_PID:-}" ] && [ "$pid" = "${DLA_PGREP_PID:-}" ]; then echo "dolt"; else echo "?"; fi ;;
+esac
+exit 0
+STUB
+
 cat > "$STUBS/lsof" <<'STUB'
 #!/usr/bin/env bash
+case " $* " in
+  *" -iTCP -sTCP:LISTEN"*)
+    # dolt_server_pid()'s own is-this-really-the-server check (exit code only,
+    # no output parsed) -- distinct from live_dolt_port()'s own port-scrape
+    # lsof call below (same lsof, different invocation shape).
+    pid="" prev=""
+    for a in "$@"; do
+      [ "$prev" = "-p" ] && pid="$a"
+      prev="$a"
+    done
+    if [ -n "${DLA_LISTEN_PORT:-}" ] && [ "$pid" = "${DLA_PGREP_PID:-}" ]; then exit 0; else exit 1; fi
+    ;;
+esac
 args="$*"
 case "$args" in
   *"-p "*)
@@ -138,19 +177,25 @@ echo "\${DLA_PY_LATENCY_MS:-100}"
 exit 0
 STUB
 
-chmod +x "$STUBS"/pgrep "$STUBS"/lsof "$STUBS"/gc "$STUBS"/python3
+chmod +x "$STUBS"/pgrep "$STUBS"/ps "$STUBS"/lsof "$STUBS"/gc "$STUBS"/python3
 
 # 2a. live_dolt_port / conn_count via direct function calls (SOURCE_ONLY + stub PATH)
 STATE2="$WORK/state-unit2"; mkdir -p "$STATE2"
 (
   export DOLT_LATENCY_ALARM_SOURCE_ONLY=1 DOLT_LATENCY_ALARM_STATE_DIR="$STATE2"
   export PATH="$STUBS:$PATH"
+  # NOTE: no GC_CITY override here -- the ps/lsof stubs below arbitrate purely
+  # by exact-PID-match against DLA_PGREP_PID, so a real dolt.pid on the host
+  # running this test is harmless either way (its PID just never matches).
+  # gc-dolt-probe.sh separately needs GC_CITY for its own `cd "$CITY"` before
+  # calling `gc dolt health` -- overriding it here breaks THAT, unrelated to
+  # PID resolution (see the 2b block below, which learned this the hard way).
   # shellcheck disable=SC1090
   source "$SCRIPT"
 
-  DLA_PGREP_PID=555 DLA_LISTEN_PORT=52756 echo "port_found=$(DLA_PGREP_PID=555 DLA_LISTEN_PORT=52756 live_dolt_port)"
+  echo "port_found=$(DLA_PGREP_PID=$DLA_REAL_PID DLA_LISTEN_PORT=52756 live_dolt_port)"
   echo "port_fallback=$(live_dolt_port)"   # no pgrep hit → DOLT_PORT_DEFAULT
-  echo "conns=$(DLA_PGREP_PID=555 DLA_LISTEN_PORT=52756 DLA_CONN_COUNT=7 conn_count)"
+  echo "conns=$(DLA_PGREP_PID=$DLA_REAL_PID DLA_LISTEN_PORT=52756 DLA_CONN_COUNT=7 conn_count)"
 ) > "$WORK/probe.out" 2>&1
 
 grep -q "^port_found=52756$"    "$WORK/probe.out" && ok "live_dolt_port: derives port from live pgrep+lsof, not config default" || nope "live_dolt_port found mismatch: $(cat "$WORK/probe.out")"
@@ -199,7 +244,7 @@ run_tick() {  # run_tick — one script invocation with the stub PATH + isolated
     DOLT_LATENCY_ALARM_ENABLED="${TICK_ENABLED:-1}" \
     NOTIFY_CALLS="$NOTIFY_CALLS" \
     GC_CALLS="$GC_CALLS" \
-    DLA_PGREP_PID=555 DLA_LISTEN_PORT=52756 \
+    DLA_PGREP_PID="$DLA_REAL_PID" DLA_LISTEN_PORT=52756 \
     DLA_GC_LATENCY_MS="${DLA_GC_LATENCY_MS:-150}" \
     DLA_CONN_COUNT="${DLA_CONN_COUNT:-2}" \
     bash "$SCRIPT" >/dev/null 2>&1

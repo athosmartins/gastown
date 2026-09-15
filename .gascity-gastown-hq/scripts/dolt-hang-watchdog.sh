@@ -17,6 +17,12 @@
 set -uo pipefail
 
 CITY="/Users/athos/gt/.gascity-gastown-hq"
+
+# ga-0bjqix: canonical PID resolution (dolt.pid + basename+LISTEN verification,
+# never a bare process-table sort). See dolt-pid-lib.sh.
+_DHW_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# shellcheck source=dolt-pid-lib.sh
+source "$_DHW_SCRIPT_DIR/dolt-pid-lib.sh"
 # ga-153cq: LOG/STRIKES overridable so a dry run can use scratch state. They were
 # hardcoded, which made even a DRY RUN unsafe: the strike counter is incremented
 # BEFORE the restart decision, so exercising this script against the live counter
@@ -46,13 +52,13 @@ CPU_VETO_MAX="${DOLT_WATCHDOG_CPU_VETO_MAX:-5}"
 CPU_VETO_FILE="${DOLT_WATCHDOG_CPU_VETO_FILE:-/tmp/dolt-hang-watchdog.cpuveto}"
 # ga-153cq (gate attempt 3 FAIL, reviewer right a third time in this same file):
 # the CPU reading itself was the one remaining unmockable input. dolt_cpu_pct()
-# did a raw, unscoped `pgrep -f 'dolt sql-server'` with no override — so the
+# did a raw, unscoped process-table PID lookup with no override — so the
 # selftest's veto-branch assertion only passed when the REVIEW HOST happened to
 # have a live Dolt process, and would silently fail to even exercise the veto
 # branch (not "fail loud" — just never reach it) on a host without one: a bare
 # CI box, or mid-outage when Dolt is actually down, exactly when this script
 # matters most. Test-only seam, same shape as every other override above: unset
-# in production (real pgrep lookup, unchanged), set by the selftest to a
+# in production (real dolt_server_pid() lookup, unchanged), set by the selftest to a
 # controlled, always-alive PID (its own $$) so the assertion is hermetic instead
 # of host-state-contingent.
 CPU_PID_OVERRIDE="${DOLT_WATCHDOG_CPU_PID:-}"
@@ -119,7 +125,7 @@ PY
 dolt_cpu_pct() {
   local _pid _cpu
   _pid="$CPU_PID_OVERRIDE"
-  [ -z "$_pid" ] && _pid=$(pgrep -f 'dolt sql-server' 2>/dev/null | head -1)
+  [ -z "$_pid" ] && _pid=$(dolt_server_pid)
   [ -z "$_pid" ] && { printf ''; return; }
   _cpu=$(ps -p "$_pid" -o %cpu= 2>/dev/null | tr -d ' ')
   [ -z "$_cpu" ] && { printf ''; return; }
@@ -149,7 +155,7 @@ fi
 # Saturation guard: probe failed, but is Dolt actually serving? If a raw SELECT 1
 # succeeds, it's busy/slow (saturation), NOT hung — don't strike, don't restart.
 if dolt_actually_serving; then
-  _cpu=$(ps -p "$(pgrep -f 'dolt sql-server' | head -1)" -o %cpu= 2>/dev/null | tr -d ' ')
+  _cpu="$(dolt_cpu_pct)"
   log "Health-probe failed but Dolt SERVES a raw SELECT 1 (cpu=${_cpu:-?}%) — saturation, NOT a hang. Skipping strike/restart."
   # ga-153cq (gate attempt 2): same class as the probe_ok branch above — proven
   # serving means "clean slate" for real, but only when we're not simulating.
@@ -251,7 +257,7 @@ if is_dry_run; then
   if [ -n "$_cpu_now" ] && [ "$_cpu_now" -ge "$CPU_ALIVE_PCT" ] && [ "$_vetoes" -lt "$CPU_VETO_MAX" ]; then
     log "DRY-RUN: would VETO the restart — Dolt at ${_cpu_now}% CPU (>=${CPU_ALIVE_PCT}%), veto would become $(( _vetoes + 1 ))/${CPU_VETO_MAX}. No counter written, no notify sent."
   else
-    _pid_dr="$(pgrep -f 'dolt sql-server' 2>/dev/null | head -1 || true)"
+    _pid_dr="$(dolt_server_pid || true)"
     log "DRY-RUN: would kill -QUIT pid=${_pid_dr:-<none>} and run 'gc dolt restart' (strikes=${n}, cpu=${_cpu_now:-?}%, vetoes=${_vetoes}/${CPU_VETO_MAX}). Nothing signalled; strikes and veto counter left intact."
   fi
   exit 0
@@ -273,7 +279,7 @@ fi
 rm -f "$CPU_VETO_FILE" 2>/dev/null || true
 
 log "CONFIRMED Dolt hang (${n} consecutive strikes, cpu=${_cpu_now:-?}%) — capturing goroutine dump + restarting."
-PID="$(pgrep -f 'dolt sql-server' 2>/dev/null | head -1 || true)"
+PID="$(dolt_server_pid || true)"
 
 # ga-153cq: the DRY_RUN interception lives ABOVE the veto section now (see the note
 # there). It must stay there: any dry-run gate placed at this point is already past
