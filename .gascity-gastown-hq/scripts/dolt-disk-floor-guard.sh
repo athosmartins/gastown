@@ -697,29 +697,80 @@ _go_build_dir_in_use() {
   return 1
 }
 
-# _code_sign_clone_dir_in_use <dir> → same tristate lsof liveness check as
-# _go_build_dir_in_use (ga-nkqook), duplicated rather than shared: this file's
-# existing levers each own their liveness check rather than factoring a
-# generic one out (compare _should_reap_gocache's whole-cache go_active flag,
-# a completely different liveness signal) — keeping this one small and
-# separate avoids coupling two unrelated reclaim levers to a shared function
-# neither fully owns. See _go_build_dir_in_use's own header for the full
-# rationale on the tristate contract and the content-based (not exit-code)
-# lsof parsing.
+# _code_sign_clone_dir_in_use <dir> → tristate liveness check, SAME
+# 0=in-use/1=confirmed-orphaned/2=unknown contract as _go_build_dir_in_use,
+# but deliberately NOT implemented as `lsof +D <dir>` the way that one is —
+# doing so was tried first and shipped, then found live to be a permanent
+# false-positive (ga-nkqook): every code_sign_clone.<token> generation's
+# "Google Chrome" binary shares the IDENTICAL device+inode (confirmed via
+# `stat -f %i` on two different, independently-timestamped clone dirs — both
+# returned inode 1051924544 on this host), because macOS pins the SAME
+# validated bytes across launches rather than copying them (this is also why
+# `du` overcounts these dirs so badly — see this bead). `lsof +D` resolves
+# matches by (device, inode), so it reports EVERY historical clone as
+# "in use" for as long as ANY Chrome process anywhere is alive — which, under
+# a KeepAlive LaunchAgent, is always. Shipped-and-measured: with +D, a live
+# run against 62 real clones (some hours old, all from long-dead processes)
+# spared all 62 (freed=0MB) — a silent, permanent no-op in exactly the
+# crash-loop scenario this lever exists for.
+#
+# Fix: never trust lsof's own directory-argument resolution for this file
+# family. Dump every process's real open-file NAME strings with no directory
+# filter (lsof -Fn) and do the prefix match ourselves in bash — the NAME
+# field itself is the literal path a process opened (confirmed live: a
+# per-PID `lsof -p <pid> -Fn` for the one truly-live Chrome showed exactly
+# one code_sign_clone path, the current one), so string-matching it sidesteps
+# whatever inode-collapsing shortcut +D takes internally. Same content-based
+# (not exit-code-based) rc=124/stderr/stdout handling as _go_build_dir_in_use
+# — see its header for that part of the rationale.
+#
+# [snapshot] (optional): path to an lsof-Fn capture ALREADY TAKEN by the
+# caller. When given, this function trusts it completely and does no lsof
+# call of its own — required for _reap_code_sign_clone_orphans below, which
+# must judge every candidate against the SAME instant (see that function's
+# header: with 60+ candidates and each fresh `lsof -Fn` costing real wall
+# time, checking each one separately raced the crash loop itself — measured
+# live, a 62-candidate loop with a fresh lsof per dir took ~19s, long enough
+# for the truly-live dir's OWN process to crash and be replaced mid-scan,
+# reading the live dir as orphaned. Never actually unsafe here, since a dir
+# that fresh is always well under the grace window regardless — but wrong
+# in the log and needlessly slow). Omitted (the selftest's standalone calls):
+# runs lsof itself, same as before.
 _code_sign_clone_dir_in_use() {
-  local dir="$1" out err rc errfile
-  if ! command -v lsof >/dev/null 2>&1; then
-    return 2
+  local dir="$1" snapshot="${2:-}" out rc errfile outfile owns_outfile=0
+  # Always defined before the final [ -n "$err" ] check below — the
+  # snapshot-provided branch never touches it (there's no fresh stderr to
+  # read, the caller already validated the capture), so leaving it purely
+  # bare-declared would read as an unbound variable on that path under this
+  # script's `set -u` (caught live while wiring this in: the go-build sibling
+  # this was copied from never hits its own final err-check without first
+  # unconditionally assigning err="", since it only has the one code path).
+  local err=""
+  if [ -n "$snapshot" ]; then
+    [ -f "$snapshot" ] || return 2
+    outfile="$snapshot"
+  else
+    if ! command -v lsof >/dev/null 2>&1; then
+      return 2
+    fi
+    errfile="$(mktemp "${TMPDIR:-/tmp}/dolt-disk-floor-guard-lsof-err.XXXXXX" 2>/dev/null)" || return 2
+    outfile="$(mktemp "${TMPDIR:-/tmp}/dolt-disk-floor-guard-lsof-out.XXXXXX" 2>/dev/null)" || { rm -f "$errfile"; return 2; }
+    owns_outfile=1
+    timeout 10 lsof -Fn >"$outfile" 2>"$errfile"
+    rc=$?
+    [ -s "$errfile" ] && err="$(cat "$errfile" 2>/dev/null)"
+    rm -f "$errfile" 2>/dev/null
+    if [ "$rc" -eq 124 ]; then
+      rm -f "$outfile" 2>/dev/null
+      return 2
+    fi
   fi
-  errfile="$(mktemp "${TMPDIR:-/tmp}/dolt-disk-floor-guard-lsof-err.XXXXXX" 2>/dev/null)" || return 2
-  out="$(timeout 10 lsof +D "$dir" 2>"$errfile")"
-  rc=$?
-  err=""
-  [ -s "$errfile" ] && err="$(cat "$errfile" 2>/dev/null)"
-  rm -f "$errfile" 2>/dev/null
-  if [ "$rc" -eq 124 ]; then
-    return 2
-  fi
+  # -F's NAME lines are prefixed "n"; grep the literal (-F) directory prefix
+  # with a trailing slash so a dir whose random suffix happens to prefix
+  # another dir's name (e.g. code_sign_clone.AB vs code_sign_clone.ABC)
+  # can never cross-match.
+  out="$(grep -F -- "${dir}/" "$outfile" 2>/dev/null)"
+  [ "$owns_outfile" = "1" ] && rm -f "$outfile" 2>/dev/null
   if [ -n "$out" ]; then
     return 0
   fi
@@ -1242,6 +1293,30 @@ _reap_code_sign_clone_orphans() {
     return
   fi
 
+  # One shared lsof -Fn snapshot for every candidate this cycle, not one call
+  # per candidate. Measured live: a fresh `lsof -Fn` per dir across ~62
+  # candidates took ~19s wall-clock — long enough for the crash loop itself
+  # (relaunches as fast as every ~10s in a burst) to replace the truly-live
+  # process mid-scan, so a per-dir check could read the CURRENTLY live clone
+  # as orphaned depending on where in the loop it landed (the grace window
+  # still made this safe — a dir that fresh is never past 1800s regardless —
+  # but the log line was wrong and 62 sequential lsof calls is wasteful). A
+  # single snapshot judges every candidate against the identical instant and
+  # costs ~0.3s instead of ~19s. A failed/timed-out capture skips the WHOLE
+  # lever this cycle (never guess per-dir liveness from a snapshot that
+  # doesn't exist).
+  local snap_err snap_out_file snap_rc
+  snap_err="$(mktemp "${TMPDIR:-/tmp}/dolt-disk-floor-guard-lsof-err.XXXXXX" 2>/dev/null)" || { log "code-sign-clone-reap SKIP — could not create temp file for lsof snapshot"; return; }
+  snap_out_file="$(mktemp "${TMPDIR:-/tmp}/dolt-disk-floor-guard-lsof-snapshot.XXXXXX" 2>/dev/null)" || { rm -f "$snap_err"; log "code-sign-clone-reap SKIP — could not create temp file for lsof snapshot"; return; }
+  timeout 10 lsof -Fn >"$snap_out_file" 2>"$snap_err"
+  snap_rc=$?
+  if [ "$snap_rc" -eq 124 ] || { [ ! -s "$snap_out_file" ] && [ -s "$snap_err" ]; }; then
+    log "code-sign-clone-reap SKIP — lsof -Fn snapshot failed or timed out this cycle (never guess liveness without it)"
+    rm -f "$snap_err" "$snap_out_file" 2>/dev/null
+    return
+  fi
+  rm -f "$snap_err" 2>/dev/null
+
   local now; now=$(date +%s)
   local dir base mb mtime age in_use_rc reason considered=0 freed_mb=0 unmeasured_deleted=0
 
@@ -1257,7 +1332,7 @@ _reap_code_sign_clone_orphans() {
     fi
     age=$(( now - mtime ))
 
-    _code_sign_clone_dir_in_use "$dir"; in_use_rc=$?
+    _code_sign_clone_dir_in_use "$dir" "$snap_out_file"; in_use_rc=$?
     if [ "$in_use_rc" -eq 2 ]; then
       log "code-sign-clone-reap: ${base} (${mb:-unmeasured}MB, age=${age}s) — SPARED (lsof could not confirm liveness this cycle; never treat unknown as safe)"
       continue
@@ -1283,6 +1358,8 @@ _reap_code_sign_clone_orphans() {
       log "code-sign-clone-reap: ${base} (${mb:-unmeasured}MB, age=${age}s) — SPARED (${reason})"
     fi
   done
+
+  rm -f "$snap_out_file" 2>/dev/null
 
   if [ "$considered" -eq 0 ]; then
     log "code-sign-clone-reap: no code_sign_clone.* dirs under ${root}"
