@@ -230,6 +230,41 @@ extract_gate_merge_info() {
   printf '%s\t%s' "$rig_branch" "$sha"
 }
 
+# extract_gate_merge_pre_main <bd_comments_text> — echoes the pre-merge main
+# sha from the LAST "... merged to <rig>/<branch> (sha=<sha>)
+# (pre_merge_main=<sha>)" gate-dispatcher comment (quality-gate-dispatcher.sh,
+# ga-6zkhci fix-attempt-3). A SEPARATE function from extract_gate_merge_info
+# above rather than a 3rd return field on it — that function's "<rig>/
+# <branch>\t<sha>" contract is depended on verbatim by two callers (this
+# file's own Step 3 and derive_rig_from_comments), and re-splitting a 3-tuple
+# at the call sites risked corrupting the already-twice-hardened MERGE_SHA
+# parse (ga-fic5d, ga-mmdm2) for zero benefit — a new field is safer as a new
+# function over the same raw text.
+#
+# rc1 + no output when the most recent merge comment carries no
+# pre_merge_main field at all — an older-format comment (predating this
+# fix) or a merge whose own MAIN_HEAD_SHA capture was empty. The caller MUST
+# treat that as UNKNOWN, never as "no base needed": Mayor decision (ga-6zkhci,
+# 2026-09-15) explicitly rules out guessing a substitute (e.g. MERGE_SHA^,
+# fix-attempt-2's bug) when the real pre-merge baseline was never recorded.
+#
+# The regex requires sha= and pre_merge_main= adjacent on the SAME matched
+# line as extract_gate_merge_info's own pattern (not a bare global grep for
+# "pre_merge_main=" anywhere in the comment text) — this guarantees whatever
+# is returned came from the exact same merge event as the sha
+# extract_gate_merge_info returns, never a different, stale comment that
+# happens to mention the string.
+extract_gate_merge_pre_main() {
+  local text="$1" line sha
+  line=$(printf '%s\n' "$text" \
+    | grep -oE 'merged to [a-z_]+/[A-Za-z0-9_.-]+ \(sha=[0-9a-f]{7,40}\) \(pre_merge_main=[0-9a-f]{7,40}\)' \
+    | tail -1)
+  [ -n "$line" ] || return 1
+  sha=$(printf '%s' "$line" | sed -E 's#.*\(pre_merge_main=([0-9a-f]{7,40})\).*#\1#')
+  [ -n "$sha" ] || return 1
+  printf '%s' "$sha"
+}
+
 # derive_rig_from_comments <bd_comments_text> — echoes just the <rig> segment
 # of the MOST RECENT authoritative gate-dispatcher merge comment, by
 # delegating entirely to extract_gate_merge_info() above (one source of
@@ -1584,6 +1619,7 @@ fi
 # construction, not by remembering to add a check on every exit.
 MERGE_VERDICT="unresolvable"
 MERGE_SHA=""
+MERGE_PRE_MAIN=""
 MERGE_REF=""
 MERGE_FAIL_MSG=""
 if [ -z "$RUNTIME_DIR" ] || ! git -C "$RUNTIME_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -1626,6 +1662,13 @@ else
     MERGE_SHA="${MERGE_INFO#*$'\t'}"
     MERGE_BRANCH="${MERGE_RIG_BRANCH#*/}"
     MERGE_REF="origin/$MERGE_BRANCH"
+    # ga-6zkhci fix-attempt-3: independent extraction over the same raw text
+    # (see extract_gate_merge_pre_main's own header for why this is a
+    # separate function rather than a 3rd field here). rc1/empty (older-
+    # format comment, or the dispatcher's own MAIN_HEAD_SHA capture was
+    # empty) leaves MERGE_PRE_MAIN at its "" default from above — Step 5b
+    # below treats that as UNKNOWN, never as license to guess a substitute.
+    MERGE_PRE_MAIN="$(extract_gate_merge_pre_main "$STORY_COMMENTS_TEXT" || true)"
     timeout 30 git -C "$RUNTIME_DIR" fetch origin "$MERGE_BRANCH" --quiet 2>/dev/null \
       || warn "Merge-verify: 'git fetch origin $MERGE_BRANCH' failed/timed out for $RIG — verifying against last-known $MERGE_REF."
     MERGE_GITDIR_PAIR=$(rig_gitdir "$RUNTIME_DIR")
@@ -1931,28 +1974,54 @@ else
       fi
     fi
   elif [ -n "$MERGE_SHA" ] \
-       && MERGE_SHA_PARENT="$(git -C "$RUNTIME_DIR" rev-parse --verify -q "${MERGE_SHA}^" 2>/dev/null)" \
-       && [ -n "$MERGE_SHA_PARENT" ]; then
+       && [ -n "$MERGE_PRE_MAIN" ] \
+       && MERGE_OWN_BASE_SHA="$(git -C "$RUNTIME_DIR" rev-parse --verify -q "$MERGE_PRE_MAIN" 2>/dev/null)" \
+       && [ -n "$MERGE_OWN_BASE_SHA" ] \
+       && git -C "$RUNTIME_DIR" merge-base --is-ancestor "$MERGE_OWN_BASE_SHA" "$MERGE_SHA" 2>/dev/null; then
     # ga-6zkhci: PRE_DEPLOY_SHA==POST_DEPLOY_SHA means THIS iteration's pull was
     # a true no-op (ga-gokm6's scenario: something else — a sibling story's
     # delivery earlier in the same sweep, or a crew's own post-merge fast-
     # forward — already advanced RUNTIME_DIR's HEAD past this story's merge
     # before PRE_DEPLOY_SHA was captured above). That range genuinely carries
     # no information about this story's own files, so the pattern check above
-    # never runs — but MERGE_SHA (the gate-verified commit; already proven
-    # above to be an ancestor of MERGE_REF in RUNTIME_DIR, so its object and
-    # its parent ARE present) has a real, known diff regardless of what the
-    # pull did. Confirmed live (story-delivery.log 2026-09-14): wa-ibaqq
+    # never runs — but this story's own delta has a real, known diff
+    # regardless of what the pull did, IF we know the right base to diff
+    # from. Confirmed live (story-delivery.log 2026-09-14): wa-ibaqq
     # (docs/mockups/*.html only) and wa-mjpjs (scripts/lib files no daemon
     # imports) were both held on exactly this gap — THIS_PULL_STRUCTURALLY_INERT
     # stayed unset, so the case statement below fell to blame/hold for
     # staleness neither one caused.
     #
+    # fix-attempt-2 (gate_run ga-u0gc14) used MERGE_SHA^ (the parent commit)
+    # as that base and got it wrong: quality-gate-dispatcher.sh's direct_ff
+    # merge always fast-forward-pushes the WHOLE branch, never squashes, so
+    # MERGE_SHA^ is only the true pre-story baseline on a single-commit
+    # branch — and every gate fix-attempt adds a commit, making multi-commit
+    # branches the common case, not the exception. On this very branch,
+    # MERGE_SHA^ resolved to fix-attempt-2's OWN commit, completely missing
+    # fix-attempt-1's 323-line diff — the actual bulk of this feature.
+    #
+    # Mayor decision (ga-6zkhci, 2026-09-15): the correct base is
+    # MERGE_PRE_MAIN — main's real tip immediately before the push that
+    # landed this merge, persisted by quality-gate-dispatcher.sh into its own
+    # PASSED comment (MAIN_HEAD_SHA at push time) and parsed above by
+    # extract_gate_merge_pre_main. Never trust it blindly: verify it both
+    # resolves to a real object in RUNTIME_DIR AND is an actual ancestor of
+    # MERGE_SHA before using it as a diff base (an unresolvable or
+    # non-ancestor value — corrupted comment, force-pushed history, a merge
+    # from before this field existed — is the THIRD STATE: this whole elif's
+    # condition then evaluates false, THIS_PULL_STRUCTURALLY_INERT stays
+    # unset, and the existing blame/hold behavior below applies exactly as it
+    # did before this fix. Never fall back to guessing MERGE_SHA^ or any
+    # other substitute — an unrecorded base means UNKNOWN, not "assume single
+    # commit".
+    #
     # Ask daemon-refresh.sh itself — DRY_RUN=1 hardcoded (never the outer
     # $DRY_RUN): this is a pure classification probe on a delta that has
     # nothing to do with what the caller's own deploy is doing, so it must
     # never kickstart or drain anything for real — whether THIS story's own
-    # delta alone (MERGE_SHA's parent..MERGE_SHA) reaches any live daemon.
+    # delta alone (MERGE_PRE_MAIN..MERGE_SHA, i.e. every commit this story's
+    # branch actually added, however many there are) reaches any live daemon.
     # This reuses the exact same import/template-closure discovery Step 3
     # (below) already trusts for the wide window, instead of re-deriving a
     # second, weaker heuristic here: the tests/docs/md pattern above is
@@ -1982,14 +2051,14 @@ else
     # own delta at all (the only claim this probe needs to make); non-empty
     # means it is, regardless of how a real restart of it would have gone.
     MERGE_OWN_OUT=$(RUNTIME_DIR="$RUNTIME_DIR" \
-      PRE_DEPLOY_SHA="$MERGE_SHA_PARENT" POST_DEPLOY_SHA="$MERGE_SHA" \
+      PRE_DEPLOY_SHA="$MERGE_OWN_BASE_SHA" POST_DEPLOY_SHA="$MERGE_SHA" \
       DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
       EXTRA_RUNTIME_ROOTS="$EXTRA_RUNTIME_ROOTS" \
       DRY_RUN=1 \
       timeout 180 bash "$REFRESH_HELPER" 2>/dev/null || true)
     MERGE_OWN_VERDICT_LINE=$(echo "$MERGE_OWN_OUT" | grep '^VERDICT=' | head -1 || true)
     MERGE_OWN_AFFECTED=$(echo "$MERGE_OWN_OUT" | grep '^AFFECTED=' | head -1 | sed 's/^AFFECTED=//' || true)
-    log "This-iteration pull was a true no-op (PRE_DEPLOY_SHA==POST_DEPLOY_SHA=$POST_DEPLOY_SHA) — asked daemon-refresh.sh (DRY_RUN=1, no real kickstart/drain) whether $STORY_ID's own merge $MERGE_SHA alone (vs parent $MERGE_SHA_PARENT) reaches any live daemon: ${MERGE_OWN_VERDICT_LINE:-<unparseable output>} affected=[$MERGE_OWN_AFFECTED]."
+    log "This-iteration pull was a true no-op (PRE_DEPLOY_SHA==POST_DEPLOY_SHA=$POST_DEPLOY_SHA) — asked daemon-refresh.sh (DRY_RUN=1, no real kickstart/drain) whether $STORY_ID's own merge $MERGE_SHA alone (vs pre-merge-main base $MERGE_OWN_BASE_SHA) reaches any live daemon: ${MERGE_OWN_VERDICT_LINE:-<unparseable output>} affected=[$MERGE_OWN_AFFECTED]."
     if [ -z "$MERGE_OWN_VERDICT_LINE" ]; then
       : # unparseable helper output (crash/timeout) — stays unknown, existing blame fallback applies
     elif [ -z "${MERGE_OWN_AFFECTED// /}" ]; then

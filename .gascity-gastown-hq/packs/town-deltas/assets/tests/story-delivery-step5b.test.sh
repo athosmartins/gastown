@@ -61,6 +61,11 @@ EOF
   # runs under `set -u` here and an undeclared reference would be a latent
   # trap for the next person who touches this shared block.
   local MERGE_SHA=""
+  # ga-6zkhci fix-attempt-3: same reasoning as MERGE_SHA above — the
+  # fallback's guard chain now also references $MERGE_PRE_MAIN, but only
+  # after the (already-false) `[ -n "$MERGE_SHA" ]` check short-circuits, so
+  # declaring it is defensive-not-load-bearing here too.
+  local MERGE_PRE_MAIN=""
   get_runbook_field() { echo "central-sender"; }
 
   # Run the real block in a subshell; capture its exit code. Wrapped in a

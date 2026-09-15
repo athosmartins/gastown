@@ -131,6 +131,10 @@ EOF
   # all → stays unknown → existing blame behavior. (Declared, not left
   # unset, because the block runs under `set -u` in this harness.)
   local MERGE_SHA=""
+  # ga-6zkhci fix-attempt-3: same reasoning as MERGE_SHA above — declared so
+  # the shared block's `set -u` never trips on it, though the (already-false)
+  # `[ -n "$MERGE_SHA" ]` check short-circuits before it would be read.
+  local MERGE_PRE_MAIN=""
   get_runbook_field() { echo "central-sender"; }
 
   rm -f "$T/reached.marker"

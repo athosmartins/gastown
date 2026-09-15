@@ -4897,6 +4897,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
     # If FF fails (diverged history), we abort and report failure.
 
     MERGE_SHA=""
+    MERGE_PRE_MAIN_SHA=""
     MERGE_RESULT="failed"
 
     # ── ga-3b8: Merge-time rebase+retry (starvation fix) ──────────────────────
@@ -4912,7 +4913,13 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
 
     do_merge_ff() {
       # Arguments: IS_CONTAINER_RIG, BRANCH, DEFAULT_BRANCH — all from outer scope.
-      # Returns: sets MERGE_SHA and MERGE_RESULT in outer scope.
+      # Returns: sets MERGE_SHA, MERGE_PRE_MAIN_SHA, and MERGE_RESULT in outer
+      # scope. MERGE_PRE_MAIN_SHA (ga-6zkhci, Mayor decision 2026-09-15) is
+      # main's real tip immediately before this push lands — the correct
+      # baseline for "what did THIS merge alone change", as opposed to
+      # MERGE_SHA's parent commit, which is only that on a single-commit
+      # branch (every gate fix-attempt adds a commit, so multi-commit
+      # branches are the common case, not the exception).
       # Strategy per attempt:
       #   0. Re-verify full history (ga-0eh7o — see below)
       #   1. git fetch (get current remote state)
@@ -5225,6 +5232,18 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
         POST_MAIN=$(rig_resolve_commit "origin/$DEFAULT_BRANCH")
         if [ -n "$POST_MAIN" ] && git_rig merge-base --is-ancestor "$CUR_BRANCH" "$POST_MAIN" 2>/dev/null; then
           MERGE_SHA="$CUR_BRANCH"
+          # ga-6zkhci (Mayor decision, 2026-09-15): MAIN_HEAD_SHA was refreshed
+          # at line ~5195 to the just-fetched origin/$DEFAULT_BRANCH tip,
+          # immediately before this push — persist it as the true pre-merge
+          # baseline so story-delivery.sh can compute this story's OWN delta
+          # as MERGE_PRE_MAIN_SHA..MERGE_SHA, never MERGE_SHA^ (ga-6zkhci
+          # fix-attempt-2's gate finding: MERGE_SHA^ only reaches the
+          # second-to-last commit on a multi-commit branch, silently missing
+          # earlier commits' daemon-relevant changes). If MAIN_HEAD_SHA is
+          # ever empty here, this is left empty too — the comment below then
+          # omits the field entirely and story-delivery.sh's parser correctly
+          # reads that as "unknown", never guessing.
+          MERGE_PRE_MAIN_SHA="$MAIN_HEAD_SHA"
           MERGE_RESULT="direct_ff"
           log "FF merge + landing verified (attempt $((MERGE_ATTEMPT+1))): $BRANCH → $DEFAULT_BRANCH (sha=$MERGE_SHA, main=$POST_MAIN)"
 
@@ -5566,7 +5585,7 @@ fi
       # ga-divv8: clear stale gate:fix-attempt:* residue and surface (not
       # block) a terminal-FAILED sibling branch — see the function header.
       gate_finalize_pass_label_hygiene "$BEAD_CITY" "$BEAD_ID" "$BRANCH"
-      bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED. Branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA) via autonomous dispatcher (gate_run=$GATE_RUN_ID)." 2>/dev/null || true
+      bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED. Branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA)${MERGE_PRE_MAIN_SHA:+ (pre_merge_main=$MERGE_PRE_MAIN_SHA)} via autonomous dispatcher (gate_run=$GATE_RUN_ID)." 2>/dev/null || true
 
       # Read the source bead state authoritatively (labels + live assignee).
       # ga-h199q: routed through the read-cache shim — the initial read of this
@@ -5719,7 +5738,7 @@ fi
         # unrelated manual git-log check caught a genuinely unmerged commit
         # fixing a real risk. Always requested from here on.
         SCOPE_HOLD_ALWAYS_CHECK="Before deciding, ALWAYS also run: git log --oneline --all --grep=$BEAD_ID — and compare the result against origin/$DEFAULT_BRANCH. A bead commit that exists but never reached that branch is what actually discriminates gate passed from ready, independent of this list signal."
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED and branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA) — but NOT closing (ga-k2wjn/ga-zhfk8): $SCOPE_HOLD_WEAK_SIGNAL_NOTE The gate only reviewed this one diff, which is not the same claim as the full scope of the BEAD being done. $SCOPE_HOLD_ALWAYS_CHECK Labeled delivery:partial + scope:needs-review; Pilot will not re-dispatch it. If this diff genuinely covers every enumerated item, add label scope_covered:all and re-run the gate (or close manually).
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED and branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA)${MERGE_PRE_MAIN_SHA:+ (pre_merge_main=$MERGE_PRE_MAIN_SHA)} — but NOT closing (ga-k2wjn/ga-zhfk8): $SCOPE_HOLD_WEAK_SIGNAL_NOTE The gate only reviewed this one diff, which is not the same claim as the full scope of the BEAD being done. $SCOPE_HOLD_ALWAYS_CHECK Labeled delivery:partial + scope:needs-review; Pilot will not re-dispatch it. If this diff genuinely covers every enumerated item, add label scope_covered:all and re-run the gate (or close manually).
 
 $PARTIAL_EVIDENCE" 2>/dev/null || true
         gc --city "$GC_CITY" mail send mayor \
@@ -6024,7 +6043,7 @@ PYEOF
               DAEMON_HOLD_ACTION="install the missing scheduled job(s) named in the Refresh detail below: copy the plist(s) into ~/Library/LaunchAgents and \`launchctl load\` (or \`launchctl bootstrap\`) them, then confirm \`launchctl list <label>\` succeeds. This verdict only proves the job is installed+loaded — NOT that a run has actually completed successfully (a job installed today may not reach its next scheduled window for hours) — so also wait for, or manually trigger via \`launchctl kickstart -k\`, one run and confirm a readable result lands in its log before closing this bead manually."
               ;;
           esac
-          bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED and branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA) — but NOT closing (ga-l7n3v): daemon verification $DAEMON_HOLD_VERDICT — $DAEMON_HOLD_REASON
+          bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED and branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA)${MERGE_PRE_MAIN_SHA:+ (pre_merge_main=$MERGE_PRE_MAIN_SHA)} — but NOT closing (ga-l7n3v): daemon verification $DAEMON_HOLD_VERDICT — $DAEMON_HOLD_REASON
 
 A long-lived daemon serving rig '$RIG' may still be running code older than this merge. Closure is WITHHELD until this is resolved — a dormant merge must never be marked done (ga-l7n3v). Labeled delivery:pending-restart; gate:passed (already set) keeps the Pilot from re-dispatching this bead.
 ACTION: $DAEMON_HOLD_ACTION
