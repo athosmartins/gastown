@@ -292,6 +292,52 @@ else
   bad "ga-mfeip crew-nudge call site text changed — verify this wasn't an accidental scope creep from this fix"
 fi
 
+# ── Scenario K: runtime reachability — definitions must textually PRECEDE
+#    the top-level sweep-start call. Gate run ga-vtzbza (fix-attempt 1,
+#    commit 58c82dc2b) FAILED exactly here: both functions were defined at
+#    lines 2345/2390, 750+ lines AFTER the top-level call at line 1640. Bash
+#    has no function hoisting, and a top-level (non-function-body) call to a
+#    not-yet-defined function is command-not-found (exit 127) under this
+#    script's `set -euo pipefail` (line 74) — crashing every single Pilot
+#    sweep at startup, before any dispatch logic runs. This is a DIFFERENT
+#    failure shape than Scenarios A-J can see: those eval BOTH function
+#    bodies verbatim in an isolated subshell (line ~60-69, 92-93, 118-120),
+#    so they always define-then-call regardless of the real file's order,
+#    and Scenario J's wiring check only greps textual proximity to the
+#    sweep-start log line — which the broken code already satisfied. Only a
+#    check against the REAL file's line order catches this class of bug.
+#    (Function calls made from WITHIN another function's body — e.g.
+#    _pilot_selfheal_expired_slings calling _pilot_unsuppress_sling, or
+#    dispatch_one's two calls to _pilot_unsuppress_sling at L~9822/9826 —
+#    are exempt from this ordering requirement: bash resolves those at the
+#    outer function's CALL time, not at the outer function's definition
+#    time, so the callee only needs to be defined before the outer function
+#    is itself invoked. Only a bare top-level call is hoisting-sensitive,
+#    which is why this scenario checks line order, not "is it defined
+#    anywhere before EOF".)
+echo "Scenario K: runtime reachability — helper definitions precede the top-level sweep-start call (bash has no hoisting)"
+UNSUPPRESS_DEF_LINE=$(grep -n '^_pilot_unsuppress_sling() {' "$DISPATCHER" | head -1 | cut -d: -f1)
+SELFHEAL_DEF_LINE=$(grep -n '^_pilot_selfheal_expired_slings() {' "$DISPATCHER" | head -1 | cut -d: -f1)
+SWEEP_START_LINE=$(grep -n '=== Pilot sweep start' "$DISPATCHER" | head -1 | cut -d: -f1)
+SELFHEAL_CALL_LINE=""
+if [ -n "$SWEEP_START_LINE" ]; then
+  SELFHEAL_CALL_LINE=$(awk -v start="$SWEEP_START_LINE" 'NR>=start && NR<=start+20 && /^_pilot_selfheal_expired_slings "\$GC_CITY"$/ {print NR; exit}' "$DISPATCHER")
+fi
+if [ -z "$UNSUPPRESS_DEF_LINE" ] || [ -z "$SELFHEAL_DEF_LINE" ] || [ -z "$SELFHEAL_CALL_LINE" ]; then
+  bad "could not locate one of: unsuppress def ($UNSUPPRESS_DEF_LINE), selfheal def ($SELFHEAL_DEF_LINE), sweep-start call ($SELFHEAL_CALL_LINE) — cannot verify reachability"
+else
+  if [ "$SELFHEAL_DEF_LINE" -lt "$SELFHEAL_CALL_LINE" ]; then
+    ok "_pilot_selfheal_expired_slings defined at line $SELFHEAL_DEF_LINE, before its top-level call at line $SELFHEAL_CALL_LINE"
+  else
+    bad "REGRESSION: _pilot_selfheal_expired_slings defined at line $SELFHEAL_DEF_LINE, AFTER its top-level call at line $SELFHEAL_CALL_LINE — this is the exact gate_run ga-vtzbza crash (command-not-found under set -e, every sweep, citywide dispatch halt)"
+  fi
+  if [ "$UNSUPPRESS_DEF_LINE" -lt "$SELFHEAL_CALL_LINE" ]; then
+    ok "_pilot_unsuppress_sling defined at line $UNSUPPRESS_DEF_LINE, before selfheal's top-level call at line $SELFHEAL_CALL_LINE (selfheal calls it internally, so it must already be defined by call time)"
+  else
+    bad "REGRESSION: _pilot_unsuppress_sling defined at line $UNSUPPRESS_DEF_LINE, at or after selfheal's top-level call at line $SELFHEAL_CALL_LINE — selfheal would crash calling it"
+  fi
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "pilot-dispatcher.sling-unsuppress-on-failure.selftest: $PASS passed, $FAIL failed"

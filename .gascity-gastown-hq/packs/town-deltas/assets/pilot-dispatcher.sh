@@ -1623,6 +1623,100 @@ _acquire_pilot_lock() {
   return 1   # lost the recovery race to a peer, or a fresh sweep beat us.
 }
 
+# ga-h6trx3: reverses _pilot_suppress_reused_sling in the SAME dispatch_one()
+# execution when the delivery it was gambling on (gc session submit/nudge
+# landing directly on the live instance) fails outright. Before this, a
+# failed delivery left the sling held+deferred with nothing to undo it
+# except lifecycle-coherence-janitor's R6 rule — whose MEASURED sweep-to-
+# sweep cadence (11-17min runtime + a fixed ~10min gap after each exit =
+# 21-27min between visits to a given city, not the 10min StartInterval its
+# own comment names) can outlast inflight-reclaim-guard's 25min
+# RECLAIM_TTL. Confirmed live 2026-09-15: ga-00ghg5's sling stayed hidden
+# ~27min (08:15-08:42), crossing RECLAIM_TTL before any dog ever saw it;
+# ga-0bjqix was re-dispatched 5x in one morning this way, reaching
+# reclaim-count 2/3. Root cause the failure was silent: the pool branch's
+# nudge target is $_SLING_TARGET, a POOL TEMPLATE (e.g. "gastown.dog"), not
+# a session id/alias — `gc session nudge` always fails against a template,
+# so this fires on effectively every ga-hpc1x suppression.
+#
+# Mirrors R6's own strip+undefer sequence (lifecycle-coherence-janitor.sh's
+# R6 rule, ~L730-736) exactly, so an expired-or-absent hold is a safe no-op
+# here for the identical reason it is there: `bd undefer` on a bead that was
+# never deferred is a documented no-op (ga-ua2ve). Discovers the held-until
+# label from the bead's OWN current labels rather than threading the epoch
+# through from the suppress call, so the same helper serves both the same-
+# execution undo below AND the sweep-start self-heal
+# (_pilot_selfheal_expired_slings) further down, without duplicating state.
+# Safe to call unconditionally on ANY delivery failure (REUSE submit or pool
+# nudge) — a bead that was never suppressed has no pilot:held label, so this
+# returns immediately without touching bd.
+_pilot_unsuppress_sling() {
+  local _pus_city="$1" _pus_id="$2"
+  if [ -z "$_pus_id" ]; then
+    return 0
+  fi
+  local _pus_lbls _pus_expiry_lbl
+  _pus_lbls=$(bd -C "$_pus_city" show "$_pus_id" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null) || return 0
+  [ -z "$_pus_lbls" ] && return 0
+  if ! printf '%s\n' "$_pus_lbls" | grep -q '^pilot:held$'; then
+    return 0   # nothing to undo — never suppressed, or already cleared
+  fi
+  _pus_expiry_lbl=$(printf '%s\n' "$_pus_lbls" | grep -E '^pilot:held-until:[0-9]+$' | head -1)
+  if [ "$DRY_RUN" = "1" ]; then
+    log "ga-h6trx3: WOULD strip pilot:held${_pus_expiry_lbl:+ + $_pus_expiry_lbl} and undefer $_pus_id"
+    return 0
+  fi
+  bd -C "$_pus_city" label remove "$_pus_id" "pilot:held" -q 2>/dev/null || true
+  if [ -n "$_pus_expiry_lbl" ]; then
+    bd -C "$_pus_city" label remove "$_pus_id" "$_pus_expiry_lbl" -q 2>/dev/null || true
+  fi
+  bd -C "$_pus_city" undefer "$_pus_id" 2>/dev/null || true
+  log "ga-h6trx3: $_pus_id un-suppressed (pilot:held stripped, undeferred) — pool-visible again"
+}
+
+# ga-h6trx3 item 2: bounds the pilot:held window to Pilot's OWN sweep
+# cadence (~12-16min start-to-start — measured from pilot-dispatcher.log:
+# sweep runtime 2-6min + a fixed 10min StartInterval gap after each exit)
+# instead of lifecycle-coherence-janitor's slower R6 rule (~21-27min
+# start-to-start — see _pilot_unsuppress_sling's own comment). Does NOT
+# replace R6 (still the backstop for any hold this city-scoped scan misses,
+# and for holds predating the held-until stamp ga-brnlfa/f53513e19 added),
+# it just gives the same undo a second, faster, independent clock — mostly
+# a defense-in-depth for the residual case _pilot_unsuppress_sling's same-
+# execution call does NOT cover: a nudge/submit that reports SUCCESS but
+# whose target session never actually acts on it.
+#
+# Deliberately scoped to SLING beads only (metadata.pilot.sling_for
+# non-empty) — NOT every pilot:held bead in $GC_CITY. The same
+# pilot:held/pilot:held-until label pair is also stamped on STORY beads by
+# the unrelated ga-4zqwm/ga-lfvs6 mayor-deferred-hold mechanism, which is a
+# deliberate, sometimes much longer (per its own comments, up to 48h),
+# human/Mayor-initiated pause — undoing THAT early the moment its epoch
+# passes is that mechanism's own documented job (it purges/re-stamps on its
+# own re-entry), not something this dispatch-visibility fix should race.
+_pilot_selfheal_expired_slings() {
+  local _pse_city="$1" _pse_now _pse_id _pse_bead _pse_sling_for _pse_expiry_lbl _pse_expiry_ep _pse_n=0
+  _pse_now=$(date +%s)
+  for _pse_id in $(bd -C "$_pse_city" list -l pilot:held --json -n 0 2>/dev/null | jq -r '.[].id' 2>/dev/null); do
+    [ -n "$_pse_id" ] || continue
+    _pse_bead=$(bd -C "$_pse_city" show "$_pse_id" --json 2>/dev/null) || continue
+    [ -n "$_pse_bead" ] || continue
+    _pse_sling_for=$(printf '%s' "$_pse_bead" | jq -r 'if type=="array" then .[0] else . end | (.metadata["pilot.sling_for"] // "")' 2>/dev/null)
+    [ -n "$_pse_sling_for" ] || continue
+    _pse_expiry_lbl=$(printf '%s' "$_pse_bead" | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null | grep -E '^pilot:held-until:[0-9]+$' | head -1)
+    [ -n "$_pse_expiry_lbl" ] || continue
+    _pse_expiry_ep="${_pse_expiry_lbl#pilot:held-until:}"
+    [ "$(( _pse_expiry_ep + 0 ))" -lt "$_pse_now" ] 2>/dev/null || continue
+    _pilot_unsuppress_sling "$_pse_city" "$_pse_id"
+    _pse_n=$((_pse_n + 1))
+  done
+  if [ "$_pse_n" -gt 0 ]; then
+    log "ga-h6trx3: sweep-start self-heal un-suppressed $_pse_n sling(s) with expired pilot:held (own ~12-16min cadence, independent of R6's ~21-27min)"
+  fi
+  return 0
+}
+
 if _acquire_pilot_lock; then
   trap '_release_pilot_lock' EXIT
 else
@@ -2313,100 +2407,6 @@ _pilot_pool_target_has_live_session() {
         2>/dev/null)
   case "$_plts_count" in ''|*[!0-9]*) _plts_count=0 ;; esac
   [ "$_plts_count" -gt 0 ]
-}
-
-# ga-h6trx3: reverses _pilot_suppress_reused_sling in the SAME dispatch_one()
-# execution when the delivery it was gambling on (gc session submit/nudge
-# landing directly on the live instance) fails outright. Before this, a
-# failed delivery left the sling held+deferred with nothing to undo it
-# except lifecycle-coherence-janitor's R6 rule — whose MEASURED sweep-to-
-# sweep cadence (11-17min runtime + a fixed ~10min gap after each exit =
-# 21-27min between visits to a given city, not the 10min StartInterval its
-# own comment names) can outlast inflight-reclaim-guard's 25min
-# RECLAIM_TTL. Confirmed live 2026-09-15: ga-00ghg5's sling stayed hidden
-# ~27min (08:15-08:42), crossing RECLAIM_TTL before any dog ever saw it;
-# ga-0bjqix was re-dispatched 5x in one morning this way, reaching
-# reclaim-count 2/3. Root cause the failure was silent: the pool branch's
-# nudge target is $_SLING_TARGET, a POOL TEMPLATE (e.g. "gastown.dog"), not
-# a session id/alias — `gc session nudge` always fails against a template,
-# so this fires on effectively every ga-hpc1x suppression.
-#
-# Mirrors R6's own strip+undefer sequence (lifecycle-coherence-janitor.sh's
-# R6 rule, ~L730-736) exactly, so an expired-or-absent hold is a safe no-op
-# here for the identical reason it is there: `bd undefer` on a bead that was
-# never deferred is a documented no-op (ga-ua2ve). Discovers the held-until
-# label from the bead's OWN current labels rather than threading the epoch
-# through from the suppress call, so the same helper serves both the same-
-# execution undo below AND the sweep-start self-heal
-# (_pilot_selfheal_expired_slings) further down, without duplicating state.
-# Safe to call unconditionally on ANY delivery failure (REUSE submit or pool
-# nudge) — a bead that was never suppressed has no pilot:held label, so this
-# returns immediately without touching bd.
-_pilot_unsuppress_sling() {
-  local _pus_city="$1" _pus_id="$2"
-  if [ -z "$_pus_id" ]; then
-    return 0
-  fi
-  local _pus_lbls _pus_expiry_lbl
-  _pus_lbls=$(bd -C "$_pus_city" show "$_pus_id" --json 2>/dev/null \
-    | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null) || return 0
-  [ -z "$_pus_lbls" ] && return 0
-  if ! printf '%s\n' "$_pus_lbls" | grep -q '^pilot:held$'; then
-    return 0   # nothing to undo — never suppressed, or already cleared
-  fi
-  _pus_expiry_lbl=$(printf '%s\n' "$_pus_lbls" | grep -E '^pilot:held-until:[0-9]+$' | head -1)
-  if [ "$DRY_RUN" = "1" ]; then
-    log "ga-h6trx3: WOULD strip pilot:held${_pus_expiry_lbl:+ + $_pus_expiry_lbl} and undefer $_pus_id"
-    return 0
-  fi
-  bd -C "$_pus_city" label remove "$_pus_id" "pilot:held" -q 2>/dev/null || true
-  if [ -n "$_pus_expiry_lbl" ]; then
-    bd -C "$_pus_city" label remove "$_pus_id" "$_pus_expiry_lbl" -q 2>/dev/null || true
-  fi
-  bd -C "$_pus_city" undefer "$_pus_id" 2>/dev/null || true
-  log "ga-h6trx3: $_pus_id un-suppressed (pilot:held stripped, undeferred) — pool-visible again"
-}
-
-# ga-h6trx3 item 2: bounds the pilot:held window to Pilot's OWN sweep
-# cadence (~12-16min start-to-start — measured from pilot-dispatcher.log:
-# sweep runtime 2-6min + a fixed 10min StartInterval gap after each exit)
-# instead of lifecycle-coherence-janitor's slower R6 rule (~21-27min
-# start-to-start — see _pilot_unsuppress_sling's own comment). Does NOT
-# replace R6 (still the backstop for any hold this city-scoped scan misses,
-# and for holds predating the held-until stamp ga-brnlfa/f53513e19 added),
-# it just gives the same undo a second, faster, independent clock — mostly
-# a defense-in-depth for the residual case _pilot_unsuppress_sling's same-
-# execution call does NOT cover: a nudge/submit that reports SUCCESS but
-# whose target session never actually acts on it.
-#
-# Deliberately scoped to SLING beads only (metadata.pilot.sling_for
-# non-empty) — NOT every pilot:held bead in $GC_CITY. The same
-# pilot:held/pilot:held-until label pair is also stamped on STORY beads by
-# the unrelated ga-4zqwm/ga-lfvs6 mayor-deferred-hold mechanism, which is a
-# deliberate, sometimes much longer (per its own comments, up to 48h),
-# human/Mayor-initiated pause — undoing THAT early the moment its epoch
-# passes is that mechanism's own documented job (it purges/re-stamps on its
-# own re-entry), not something this dispatch-visibility fix should race.
-_pilot_selfheal_expired_slings() {
-  local _pse_city="$1" _pse_now _pse_id _pse_bead _pse_sling_for _pse_expiry_lbl _pse_expiry_ep _pse_n=0
-  _pse_now=$(date +%s)
-  for _pse_id in $(bd -C "$_pse_city" list -l pilot:held --json -n 0 2>/dev/null | jq -r '.[].id' 2>/dev/null); do
-    [ -n "$_pse_id" ] || continue
-    _pse_bead=$(bd -C "$_pse_city" show "$_pse_id" --json 2>/dev/null) || continue
-    [ -n "$_pse_bead" ] || continue
-    _pse_sling_for=$(printf '%s' "$_pse_bead" | jq -r 'if type=="array" then .[0] else . end | (.metadata["pilot.sling_for"] // "")' 2>/dev/null)
-    [ -n "$_pse_sling_for" ] || continue
-    _pse_expiry_lbl=$(printf '%s' "$_pse_bead" | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null | grep -E '^pilot:held-until:[0-9]+$' | head -1)
-    [ -n "$_pse_expiry_lbl" ] || continue
-    _pse_expiry_ep="${_pse_expiry_lbl#pilot:held-until:}"
-    [ "$(( _pse_expiry_ep + 0 ))" -lt "$_pse_now" ] 2>/dev/null || continue
-    _pilot_unsuppress_sling "$_pse_city" "$_pse_id"
-    _pse_n=$((_pse_n + 1))
-  done
-  if [ "$_pse_n" -gt 0 ]; then
-    log "ga-h6trx3: sweep-start self-heal un-suppressed $_pse_n sling(s) with expired pilot:held (own ~12-16min cadence, independent of R6's ~21-27min)"
-  fi
-  return 0
 }
 
 _pilot_hold_or_escalate() {
