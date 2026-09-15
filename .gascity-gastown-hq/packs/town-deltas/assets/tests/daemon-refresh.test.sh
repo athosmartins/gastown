@@ -252,6 +252,7 @@ run_helper() {  # run_helper <changed-relpaths...>  (commits a deploy diff first
   DEPLOY_EPOCH="$DEPLOY_EPOCH" \
   SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
   EXTRA_RUNTIME_ROOTS="${EXTRA_RUNTIME_ROOTS:-}" \
+  FORCE_RESTART_LABELS="${FORCE_RESTART_LABELS:-}" \
   LAUNCH_AGENTS_DIR="$AGENTS" \
   LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" \
   VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
@@ -287,6 +288,7 @@ run_helper_stderr() {  # run_helper_stderr <changed-relpaths...>
   DEPLOY_EPOCH="$DEPLOY_EPOCH" \
   SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
   EXTRA_RUNTIME_ROOTS="${EXTRA_RUNTIME_ROOTS:-}" \
+  FORCE_RESTART_LABELS="${FORCE_RESTART_LABELS:-}" \
   LAUNCH_AGENTS_DIR="$AGENTS" \
   LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" \
   VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
@@ -1848,6 +1850,59 @@ V=$(field VERDICT "$OUT")
 echo "$(field AFFECTED "$OUT")" | grep -q "com.test.ban-risk-dashboard" && ok "T49 uncovered daemon still caught by the existing ad-hoc scan (deploy_deps.json presence never starves an entrypoint it doesn't mention)" || nok "T49 affected" "$(field AFFECTED "$OUT")"
 [ "$V" = "OK" ] && ok "T49 verdict OK after fresh restart" || nok "T49 verdict" "got '$V' out=[$OUT]"
 [ "$(field PROOF "$OUT")" = "verified" ] && ok "T49 PROOF=verified" || nok "T49 proof" "got '$(field PROOF "$OUT")'"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T50 (ga-fzfqsu): a daemon launched via `python -m <module>` (no .py anywhere
+# in ProgramArguments — e.g. `flask run`, which resolves its app via FLASK_APP/
+# an env var, not an argv token) is invisible to Step 2 discovery pre-fix: no
+# arg ends in .py or .sh, so DAEMON_LABELS never includes it and the whole scan
+# short-circuits to "no rig daemons discovered" before Step 3/4 ever run —
+# exactly the real br.urblink.lexbh incident (`python -m flask run --port
+# 7842`, dashboard/app.py changed, the live process never refreshed by the
+# automated bug/task gate-PASS deploy path). Proves two things together,
+# matching how quality-gate-dispatcher.sh actually drives this post-fix: (a) a
+# plist whose WorkingDirectory falls under RUNTIME_DIR is discovered as a rig
+# daemon even with zero resolvable .py entrypoint, and (b) FORCE_RESTART_LABELS
+# (the daemon_restarts static-override list from delivery-runbooks.toml,
+# threaded through by the caller) forces it into AFFECTED regardless of
+# whether ad-hoc entrypoint matching could ever have found it — so it is both
+# restarted AND its freshness is genuinely verified (PROOF=verified), not just
+# blindly kicked and forgotten.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t50
+mkdir -p "$RUNTIME/dashboard"
+cat > "$RUNTIME/dashboard/app.py" <<<'print("lexbh dashboard")'
+cat > "$AGENTS/com.test.lexbh-dashboard.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.test.lexbh-dashboard</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$RUNTIME/.venv/bin/python</string>
+    <string>-m</string>
+    <string>flask</string>
+    <string>run</string>
+    <string>--port</string>
+    <string>7842</string>
+  </array>
+  <key>WorkingDirectory</key><string>$RUNTIME</string>
+</dict>
+</plist>
+EOF
+seed_running com.test.lexbh-dashboard 20001 "$STALE_LSTART"
+seed_restart com.test.lexbh-dashboard 20099 "$FRESH_LSTART"
+FORCE_RESTART_LABELS="com.test.lexbh-dashboard"
+OUT=$(run_helper dashboard/app.py); RC=$?
+FORCE_RESTART_LABELS=""
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T50 verdict OK" || nok "T50 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -eq 0 ] && ok "T50 exit 0" || nok "T50 exit" "rc=$RC"
+echo "$(field AFFECTED "$OUT")" | grep -q "com.test.lexbh-dashboard" && ok "T50 python-m daemon forced into AFFECTED via daemon_restarts override" || nok "T50 affected" "$(field AFFECTED "$OUT")"
+echo "$(field RESTARTED "$OUT")" | grep -q "com.test.lexbh-dashboard" && ok "T50 python-m daemon restarted" || nok "T50 restarted" "$(field RESTARTED "$OUT")"
+grep -q "com.test.lexbh-dashboard" "$MOCK/kicks.log" 2>/dev/null && ok "T50 kickstart invoked" || nok "T50 kickstart" "log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+[ "$(field PROOF "$OUT")" = "verified" ] && ok "T50 PROOF=verified (real restart+fresh confirmed, not a blind fire-and-forget kick)" || nok "T50 proof" "got '$(field PROOF "$OUT")'"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
