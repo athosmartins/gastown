@@ -275,6 +275,16 @@ GOCACHE_REAP_THRESHOLD_GB="${DOLT_DISK_FLOOR_GOCACHE_REAP_THRESHOLD_GB:-3}"
 # Default of 1800 (30min) is the bead's own stated grace period.
 GO_BUILD_ORPHAN_GRACE_SECS="${DOLT_DISK_FLOOR_GO_BUILD_ORPHAN_GRACE_SECS:-1800}"
 
+# ga-nkqook: same grace-window rationale as GO_BUILD_ORPHAN_GRACE_SECS above,
+# applied to macOS's own com.google.Chrome.code_sign_clone dirs (one created
+# per Chrome (re)launch under /private/var/folders/.../X — confirmed via a
+# live crash loop: com.athos.chrome-cdp SIGSEGVs and relaunches roughly every
+# 12-16min, 57 clones ~1:1 with 56 successive crashes since boot, 78GB in du
+# though CoW makes the real growth much smaller — see that bead for the full
+# measurement). An orphan here is never reused once its owning Chrome exits,
+# same as a go-build dir, so the same age-only (not size-based) grace applies.
+CODE_SIGN_CLONE_ORPHAN_GRACE_SECS="${DOLT_DISK_FLOOR_CODE_SIGN_CLONE_ORPHAN_GRACE_SECS:-1800}"
+
 NOTIFY_COOLDOWN_SECS="${DOLT_DISK_FLOOR_NOTIFY_COOLDOWN_SECS:-3600}"   # 1h — tighter
                         # than disk-pressure-monitor's 6h; this is Dolt-specific
                         # last-resort protection, not general city monitoring.
@@ -617,6 +627,25 @@ _go_build_tmp_root() {
   echo "${d%/}"
 }
 
+# _code_sign_clone_root → the per-user "X" scratch dir macOS clones code-signed
+# app binaries into (sibling of DARWIN_USER_TEMP_DIR's "T" and
+# DARWIN_USER_CACHE_DIR's "C" under the same /var/folders/<xx>/<yyyy...>/
+# per-user root), plus the fixed com.google.Chrome.code_sign_clone leaf
+# observed live (ga-nkqook: .../X/com.google.Chrome.code_sign_clone held 57
+# code_sign_clone.* subdirs, 78GB du, after a multi-hour crash loop). There is
+# no getconf key for "X" itself, so this derives it from the one macOS DOES
+# expose (DARWIN_USER_TEMP_DIR) by stripping the trailing "T" segment — same
+# never-hardcode-an-unverified-path discipline as _go_build_tmp_root: an
+# unresolved TEMP dir (non-macOS host, getconf failure) must skip the lever
+# entirely, never guess "/var/folders/.../X" from nothing.
+_code_sign_clone_root() {
+  local t parent
+  t="$(_go_build_tmp_root)"
+  [ -z "$t" ] && { echo ""; return; }
+  parent="$(dirname "$t")"
+  echo "$parent/X/com.google.Chrome.code_sign_clone"
+}
+
 # _dir_size_mb <dir> → integer MB used by <dir>, or "" if du fails/parses
 # oddly (e.g. dir doesn't exist) — MB granularity (not GB, unlike
 # _gocache_size_gb) because individual go-build<N> dirs commonly run well
@@ -668,6 +697,38 @@ _go_build_dir_in_use() {
   return 1
 }
 
+# _code_sign_clone_dir_in_use <dir> → same tristate lsof liveness check as
+# _go_build_dir_in_use (ga-nkqook), duplicated rather than shared: this file's
+# existing levers each own their liveness check rather than factoring a
+# generic one out (compare _should_reap_gocache's whole-cache go_active flag,
+# a completely different liveness signal) — keeping this one small and
+# separate avoids coupling two unrelated reclaim levers to a shared function
+# neither fully owns. See _go_build_dir_in_use's own header for the full
+# rationale on the tristate contract and the content-based (not exit-code)
+# lsof parsing.
+_code_sign_clone_dir_in_use() {
+  local dir="$1" out err rc errfile
+  if ! command -v lsof >/dev/null 2>&1; then
+    return 2
+  fi
+  errfile="$(mktemp "${TMPDIR:-/tmp}/dolt-disk-floor-guard-lsof-err.XXXXXX" 2>/dev/null)" || return 2
+  out="$(timeout 10 lsof +D "$dir" 2>"$errfile")"
+  rc=$?
+  err=""
+  [ -s "$errfile" ] && err="$(cat "$errfile" 2>/dev/null)"
+  rm -f "$errfile" 2>/dev/null
+  if [ "$rc" -eq 124 ]; then
+    return 2
+  fi
+  if [ -n "$out" ]; then
+    return 0
+  fi
+  if [ -n "$err" ]; then
+    return 2
+  fi
+  return 1
+}
+
 # _should_reap_go_build_dir <in_use_rc> <age_secs> <grace_secs> → 0 (true)
 # only when in_use_rc=1 (CONFIRMED orphaned by _go_build_dir_in_use — rc=0
 # in-use and rc=2 unknown must NEVER reap) AND age_secs >= grace_secs
@@ -676,6 +737,18 @@ _go_build_dir_in_use() {
 # justify deleting, same asymmetry _should_reap_gocache's own empty-cache_gb
 # handling already documents for this file.
 _should_reap_go_build_dir() {
+  local in_use_rc="$1" age_secs="$2" grace_secs="$3"
+  [ "$in_use_rc" -eq 1 ] || return 1
+  case "$age_secs" in ''|*[!0-9]*) return 1 ;; esac
+  case "$grace_secs" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$age_secs" -ge "$grace_secs" ]
+}
+
+# _should_reap_code_sign_clone_dir <in_use_rc> <age_secs> <grace_secs> →
+# identical contract to _should_reap_go_build_dir (ga-nkqook): reap ONLY when
+# CONFIRMED orphaned (rc=1) AND past the mtime grace window; rc=0 (in use) and
+# rc=2 (unknown) never reap, non-numeric/empty age or grace fails CLOSED.
+_should_reap_code_sign_clone_dir() {
   local in_use_rc="$1" age_secs="$2" grace_secs="$3"
   [ "$in_use_rc" -eq 1 ] || return 1
   case "$age_secs" in ''|*[!0-9]*) return 1 ;; esac
@@ -1131,6 +1204,95 @@ _reap_go_build_orphans() {
   fi
 }
 
+# _reap_code_sign_clone_orphans [root] — eighth reclaim lever (ga-nkqook),
+# same shape as _reap_go_build_orphans immediately above (mirror its header
+# for the full safety rationale): per-candidate lsof liveness via
+# _code_sign_clone_dir_in_use (rc=2 unknown NEVER reaps) plus the
+# CODE_SIGN_CLONE_ORPHAN_GRACE_SECS mtime grace, both evaluated by the pure
+# _should_reap_code_sign_clone_dir — this function only does the real walk +
+# real lsof/stat/du + real rm.
+#
+# Root cause this lever cleans up after (see ga-nkqook for the full
+# measurement): com.athos.chrome-cdp crashes (SIGSEGV, EXC_BAD_ACCESS) and
+# relaunches roughly every 12-16 minutes — confirmed live via chrome-cdp.log
+# timestamps to be Chrome's OWN internal per-launch update self-check
+# (chrome/updater/ipc/update_service_internal_proxy_mojo.cc's "Run", firing
+# shortly after each (re)start) racing the still-starting new instance, NOT
+# the independent hourly com.google.GoogleUpdater.wake LaunchAgent the bead
+# originally suspected. Each crash-relaunch leaves exactly one
+# code_sign_clone.* dir behind (57 clones ~= 56 successive crashes since
+# boot). Fixing the crash loop itself is out of scope for this lever — it
+# only reclaims what the loop leaves behind, same "detector/janitor, not the
+# writer" split as every other lever in this file.
+#
+# [root] overrides the resolved _code_sign_clone_root for the selftest's
+# hermetic fixture; production always calls this with no argument.
+_reap_code_sign_clone_orphans() {
+  local root="${1:-$(_code_sign_clone_root)}"
+  if [ "$ENABLED" != "1" ]; then
+    log "code-sign-clone-reap SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"
+    return
+  fi
+  if [ -z "$root" ] || [ ! -d "$root" ]; then
+    log "code-sign-clone-reap SKIP — code_sign_clone dir unresolved or missing (root='${root:-empty}')"
+    return
+  fi
+  if ! command -v lsof >/dev/null 2>&1; then
+    log "code-sign-clone-reap SKIP — lsof not found on PATH (cannot confirm liveness; never guess)"
+    return
+  fi
+
+  local now; now=$(date +%s)
+  local dir base mb mtime age in_use_rc reason considered=0 freed_mb=0 unmeasured_deleted=0
+
+  for dir in "$root"/code_sign_clone.*; do
+    [ -d "$dir" ] || continue
+    considered=$((considered+1))
+    base="$(basename "$dir")"
+    mb="$(_dir_size_mb "$dir")"
+    mtime="$(stat -f %m "$dir" 2>/dev/null)"
+    if [ -z "$mtime" ]; then
+      log "code-sign-clone-reap: ${base} (${mb:-unmeasured}MB) — SPARED (could not stat mtime; never guess age)"
+      continue
+    fi
+    age=$(( now - mtime ))
+
+    _code_sign_clone_dir_in_use "$dir"; in_use_rc=$?
+    if [ "$in_use_rc" -eq 2 ]; then
+      log "code-sign-clone-reap: ${base} (${mb:-unmeasured}MB, age=${age}s) — SPARED (lsof could not confirm liveness this cycle; never treat unknown as safe)"
+      continue
+    fi
+
+    if _should_reap_code_sign_clone_dir "$in_use_rc" "$age" "$CODE_SIGN_CLONE_ORPHAN_GRACE_SECS"; then
+      if rm -rf "$dir" 2>>"$LOG"; then
+        if [ -n "$mb" ]; then
+          freed_mb=$(( freed_mb + mb ))
+        else
+          unmeasured_deleted=$((unmeasured_deleted+1))
+        fi
+        log "code-sign-clone-reap: ${base} (${mb:-unmeasured}MB, age=${age}s) — DELETED (orphaned, no open refs, past ${CODE_SIGN_CLONE_ORPHAN_GRACE_SECS}s grace)"
+      else
+        log "code-sign-clone-reap: ${base} (${mb:-unmeasured}MB, age=${age}s) — DELETE FAILED (rm nonzero exit)"
+      fi
+    else
+      if [ "$in_use_rc" -eq 0 ]; then
+        reason="in use (open file/cwd inside)"
+      else
+        reason="too young (age=${age}s < grace=${CODE_SIGN_CLONE_ORPHAN_GRACE_SECS}s)"
+      fi
+      log "code-sign-clone-reap: ${base} (${mb:-unmeasured}MB, age=${age}s) — SPARED (${reason})"
+    fi
+  done
+
+  if [ "$considered" -eq 0 ]; then
+    log "code-sign-clone-reap: no code_sign_clone.* dirs under ${root}"
+  elif [ "$unmeasured_deleted" -gt 0 ]; then
+    log "code-sign-clone-reap: considered=${considered} freed=${freed_mb}MB+ (${unmeasured_deleted} deleted dir(s) had unmeasured size, not counted in freed total) under ${root}"
+  else
+    log "code-sign-clone-reap: considered=${considered} freed=${freed_mb}MB under ${root}"
+  fi
+}
+
 # _resurrect_dolt <avail_gb> <class> — last-resort auto-respawn for a Dolt
 # sql-server CONFIRMED down while disk headroom is safe. Caller (main) has
 # already run _should_resurrect's gate; this function does the actual work.
@@ -1282,6 +1444,7 @@ main() {
   _reap_hf_cache "$was_critical"
   _reap_gocache "$was_critical"
   _reap_go_build_orphans
+  _reap_code_sign_clone_orphans
 
   # re-read avail — reclaim may have freed space; `class` becomes the CURRENT
   # (post-reclaim) reading, used for logging/messaging. was_critical also

@@ -450,6 +450,131 @@ _reap_go_build_orphans "/nonexistent/path/$$/go-build-tmp-does-not-exist"
 ok "_reap_go_build_orphans: nonexistent root skips cleanly (no crash — this line only runs if it didn't)"
 
 echo ""
+echo "=== _code_sign_clone_root / _code_sign_clone_dir_in_use / _should_reap_code_sign_clone_dir (ga-nkqook) ==="
+# ── _code_sign_clone_root: real getconf-derived path — NOT stubbed, same
+#    rationale as _go_build_tmp_root above. Only asserts it resolves to a
+#    non-empty path under the real DARWIN_USER_TEMP_DIR's parent — the actual
+#    "X/com.google.Chrome.code_sign_clone" leaf need not exist on every host
+#    (it only appears after macOS has actually cloned a running Chrome), so
+#    this does NOT require -d like _go_build_tmp_root's check does ──────────
+r="$(_code_sign_clone_root)"
+case "$r" in
+  */X/com.google.Chrome.code_sign_clone) ok "_code_sign_clone_root(): resolved to the expected .../X/com.google.Chrome.code_sign_clone shape ($r)" ;;
+  *) bad "_code_sign_clone_root(): expected a path ending in /X/com.google.Chrome.code_sign_clone, got '$r'" ;;
+esac
+
+# ── _code_sign_clone_dir_in_use: real lsof tristate — identical contract to
+#    _go_build_dir_in_use, proven independently here since it's a separate
+#    (deliberately duplicated, see its own header) function ────────────────
+CSCIU_EMPTY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-csciu-empty.XXXXXX)"
+_code_sign_clone_dir_in_use "$CSCIU_EMPTY"; csciu_rc=$?
+if [ "$csciu_rc" -eq 1 ]; then
+  ok "_code_sign_clone_dir_in_use(empty real dir): confirmed NOT in use (rc=1)"
+else
+  bad "_code_sign_clone_dir_in_use(empty dir) expected rc=1 (confirmed clear), got rc=$csciu_rc"
+fi
+rm -rf "$CSCIU_EMPTY"
+
+CSCIU_BUSY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-csciu-busy.XXXXXX)"
+exec 8>"$CSCIU_BUSY/held-open"
+_code_sign_clone_dir_in_use "$CSCIU_BUSY"; csciu_rc=$?
+exec 8>&-
+if [ "$csciu_rc" -eq 0 ]; then
+  ok "_code_sign_clone_dir_in_use(dir with a real open fd): confirmed IN USE (rc=0)"
+else
+  bad "_code_sign_clone_dir_in_use(busy dir) expected rc=0 (in use), got rc=$csciu_rc"
+fi
+rm -rf "$CSCIU_BUSY"
+
+# ── _should_reap_code_sign_clone_dir: identical boundary coverage to
+#    _should_reap_go_build_dir above ────────────────────────────────────────
+_should_reap_code_sign_clone_dir 1 3600 1800 && ok "should_reap_code_sign_clone_dir: confirmed orphaned, age(3600)>=grace(1800) → true" || bad "should_reap_code_sign_clone_dir 1/3600/1800 should be true"
+_should_reap_code_sign_clone_dir 1 1800 1800 && ok "should_reap_code_sign_clone_dir: age==grace → true (boundary inclusive)" || bad "should_reap_code_sign_clone_dir 1/1800/1800 should be true (inclusive boundary)"
+_should_reap_code_sign_clone_dir 1 1799 1800 && bad "should_reap_code_sign_clone_dir: age(1799)<grace(1800) should NOT reap" || ok "should_reap_code_sign_clone_dir: age below grace → false (too young)"
+_should_reap_code_sign_clone_dir 0 3600 1800 && bad "should_reap_code_sign_clone_dir: in_use_rc=0 (IN USE) should NEVER reap" || ok "should_reap_code_sign_clone_dir: in-use → false"
+_should_reap_code_sign_clone_dir 2 3600 1800 && bad "should_reap_code_sign_clone_dir: in_use_rc=2 (UNKNOWN) should NEVER reap" || ok "should_reap_code_sign_clone_dir: unknown liveness → false (never treat unknown as safe)"
+_should_reap_code_sign_clone_dir 1 "" 1800   && bad "should_reap_code_sign_clone_dir: empty age should fail CLOSED" || ok "should_reap_code_sign_clone_dir: empty age → fails closed"
+_should_reap_code_sign_clone_dir 1 3600 ""   && bad "should_reap_code_sign_clone_dir: empty grace should fail CLOSED" || ok "should_reap_code_sign_clone_dir: empty grace → fails closed"
+_should_reap_code_sign_clone_dir 1 abc 1800  && bad "should_reap_code_sign_clone_dir: non-numeric age should fail CLOSED" || ok "should_reap_code_sign_clone_dir: non-numeric age → fails closed"
+
+echo ""
+echo "=== _reap_code_sign_clone_orphans (ga-nkqook): real directory walk, hermetic fixture ==="
+# Same three-candidate shape as _reap_go_build_orphans's fixture above: an
+# old+unowned dir (must delete), an old+in-use dir (real open fd, real lsof —
+# must spare), and a new+unowned dir still inside the grace window (must
+# spare). Naming mirrors the real code_sign_clone.<6-char-token> shape.
+CSC_ROOT="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-csc.XXXXXX)"
+
+CSC_OLD_ORPHAN="$CSC_ROOT/code_sign_clone.AAAAAA"
+mkdir -p "$CSC_OLD_ORPHAN"
+echo "orphan payload" > "$CSC_OLD_ORPHAN/payload"
+touch -t "$OLD_TS" "$CSC_OLD_ORPHAN"
+
+CSC_OLD_INUSE="$CSC_ROOT/code_sign_clone.BBBBBB"
+mkdir -p "$CSC_OLD_INUSE"
+touch -t "$OLD_TS" "$CSC_OLD_INUSE"
+exec 8>"$CSC_OLD_INUSE/held-open"   # real open fd — real lsof will see this
+
+CSC_NEW_ORPHAN="$CSC_ROOT/code_sign_clone.CCCCCC"
+mkdir -p "$CSC_NEW_ORPHAN"
+echo "fresh" > "$CSC_NEW_ORPHAN/payload"   # mtime defaults to now — inside grace
+
+# shellcheck disable=SC2034  # read by _reap_code_sign_clone_orphans in the sourced script
+CODE_SIGN_CLONE_ORPHAN_GRACE_SECS=1800
+_reap_code_sign_clone_orphans "$CSC_ROOT"
+exec 8>&-   # release the held-open fd now that the reap already ran
+
+if [ ! -d "$CSC_OLD_ORPHAN" ]; then
+  ok "_reap_code_sign_clone_orphans: old + unowned dir DELETED"
+else
+  bad "_reap_code_sign_clone_orphans: old + unowned dir should have been DELETED, still present"
+fi
+if [ -d "$CSC_OLD_INUSE" ]; then
+  ok "_reap_code_sign_clone_orphans: old + IN-USE dir (real open fd, real lsof) SPARED"
+else
+  bad "_reap_code_sign_clone_orphans: old + in-use dir should NEVER be deleted, was removed"
+fi
+if [ -d "$CSC_NEW_ORPHAN" ]; then
+  ok "_reap_code_sign_clone_orphans: new + unowned dir (within grace window) SPARED"
+else
+  bad "_reap_code_sign_clone_orphans: new + unowned dir should be spared by the grace period, was removed"
+fi
+rm -rf "$CSC_ROOT"
+
+echo ""
+echo "=== _reap_code_sign_clone_orphans (ga-nkqook): lsof failure → nothing deleted ==="
+CSC_ROOT2="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-csc2.XXXXXX)"
+CSC_OLD_ORPHAN2="$CSC_ROOT2/code_sign_clone.DDDDDD"
+mkdir -p "$CSC_OLD_ORPHAN2"
+touch -t "$OLD_TS" "$CSC_OLD_ORPHAN2"
+
+CSC_FAKE_LSOF_DIR="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-lsof2.XXXXXX)"
+cat > "$CSC_FAKE_LSOF_DIR/lsof" <<'EOF'
+#!/bin/bash
+echo "lsof: simulated failure (selftest)" >&2
+exit 1
+EOF
+chmod +x "$CSC_FAKE_LSOF_DIR/lsof"
+
+REAL_PATH="$PATH"
+PATH="$CSC_FAKE_LSOF_DIR:$PATH"
+# shellcheck disable=SC2034  # read by _reap_code_sign_clone_orphans in the sourced script
+CODE_SIGN_CLONE_ORPHAN_GRACE_SECS=1800
+_reap_code_sign_clone_orphans "$CSC_ROOT2"
+PATH="$REAL_PATH"
+
+if [ -d "$CSC_OLD_ORPHAN2" ]; then
+  ok "_reap_code_sign_clone_orphans: lsof failure (nonzero exit + stderr) → dir SPARED, never guessed as orphaned"
+else
+  bad "_reap_code_sign_clone_orphans: lsof failure should have spared the dir — it was deleted anyway (unknown treated as safe)"
+fi
+rm -rf "$CSC_ROOT2" "$CSC_FAKE_LSOF_DIR"
+
+# ── _reap_code_sign_clone_orphans: nonexistent root → SKIP cleanly ──────────
+_reap_code_sign_clone_orphans "/nonexistent/path/$$/code-sign-clone-does-not-exist"
+ok "_reap_code_sign_clone_orphans: nonexistent root skips cleanly (no crash — this line only runs if it didn't)"
+
+echo ""
 echo "=== _reap_dead_scratch: production sentinel wiring (ga-h565g) ==="
 # _reap_dead_scratch is the REAL caller scratchpad-reaper.sh's own header
 # names as the one allowed to set SCRATCHPAD_REAPER_PROD=1 (ga-h565g) — this
@@ -1042,6 +1167,17 @@ _reap_gocache() { REAP_GOCACHE_CALLS=$((REAP_GOCACHE_CALLS+1)); REAP_GOCACHE_LAS
 REAP_GO_BUILD_CALLS=0
 _reap_go_build_orphans() { REAP_GO_BUILD_CALLS=$((REAP_GO_BUILD_CALLS+1)); }
 
+# _reap_code_sign_clone_orphans is new (ga-nkqook), same reasoning as
+# _reap_go_build_orphans's stub immediately above: EXECUTION code (real
+# directory walk + real lsof + real rm, already proven in isolation with a
+# hermetic fixture earlier in this file) stubbed as a no-op here so main()'s
+# WIRING is what gets proven — never a real scan of this host's actual
+# code_sign_clone dir. Takes no was_critical arg, same reasoning as
+# _reap_go_build_orphans (per-directory lsof liveness, not a global two-tier
+# gate).
+REAP_CODE_SIGN_CLONE_CALLS=0
+_reap_code_sign_clone_orphans() { REAP_CODE_SIGN_CLONE_CALLS=$((REAP_CODE_SIGN_CLONE_CALLS+1)); }
+
 NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""
 record_notify() {
   NOTIFY_CALLS=$((NOTIFY_CALLS+1))
@@ -1084,7 +1220,7 @@ record_gc() {
 # shellcheck disable=SC2034  # read by main() in the sourced script
 GC=record_gc
 
-reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; REAP_GO_BUILD_CALLS=0; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; }
+reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; REAP_GO_BUILD_CALLS=0; REAP_CODE_SIGN_CLONE_CALLS=0; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; }
 seed_state() {
   if [ -n "$1" ]; then echo "$1" > "$STATE_EPOCH_FILE"; else rm -f "$STATE_EPOCH_FILE"; fi
   if [ -n "$2" ]; then echo "$2" > "$STATE_AVAIL_FILE"; else rm -f "$STATE_AVAIL_FILE"; fi
@@ -1318,10 +1454,10 @@ echo "=== main(): scratchpad + transcript reap integration (ga-02pnu, ga-t1ub9) 
 reset_capture; seed_state "" ""
 queue_avail 2 20
 main
-if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ] && [ "$REAP_LOGS_CALLS" = "1" ] && [ "$REAP_HF_CALLS" = "1" ] && [ "$REAP_GOCACHE_CALLS" = "1" ] && [ "$REAP_GO_BUILD_CALLS" = "1" ]; then
-  ok "main(): _reap_dead_scratch, _reap_dead_transcripts, _reap_growing_logs, _reap_hf_cache, _reap_gocache, AND _reap_go_build_orphans each invoked exactly once alongside _safe_reclaim"
+if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ] && [ "$REAP_LOGS_CALLS" = "1" ] && [ "$REAP_HF_CALLS" = "1" ] && [ "$REAP_GOCACHE_CALLS" = "1" ] && [ "$REAP_GO_BUILD_CALLS" = "1" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "1" ]; then
+  ok "main(): _reap_dead_scratch, _reap_dead_transcripts, _reap_growing_logs, _reap_hf_cache, _reap_gocache, _reap_go_build_orphans, AND _reap_code_sign_clone_orphans each invoked exactly once alongside _safe_reclaim"
 else
-  bad "main(): expected all six reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_LOGS_CALLS=$REAP_LOGS_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS"
+  bad "main(): expected all seven reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_LOGS_CALLS=$REAP_LOGS_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS"
 fi
 if [ "$REAP_LAST_ARG" = "1" ]; then
   ok "main(): CRITICAL cycle (even after reclaim recovers it to NONE) passes was_critical=1 to _reap_dead_scratch (ga-rjhfz pressure plumbing)"
@@ -1371,10 +1507,10 @@ VM_LOG_PRE_COUNT=$(grep -c "vm_swap_gb=" "$LOG" 2>/dev/null || echo 0)
 reset_capture; seed_state "" ""
 queue_avail 20
 main
-if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ] && [ "$REAP_HF_CALLS" = "0" ] && [ "$REAP_GOCACHE_CALLS" = "0" ] && [ "$REAP_GO_BUILD_CALLS" = "0" ]; then
-  ok "main(): avail above floor on first read never invokes the scratch/transcript/hf-cache/gocache/go-build reapers"
+if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ] && [ "$REAP_HF_CALLS" = "0" ] && [ "$REAP_GOCACHE_CALLS" = "0" ] && [ "$REAP_GO_BUILD_CALLS" = "0" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "0" ]; then
+  ok "main(): avail above floor on first read never invokes the scratch/transcript/hf-cache/gocache/go-build/code-sign-clone reapers"
 else
-  bad "main(): expected zero scratch/transcript/hf-cache/gocache/go-build reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS"
+  bad "main(): expected zero scratch/transcript/hf-cache/gocache/go-build/code-sign-clone reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS"
 fi
 # ga-sfj3i.2: the exact case this acceptance criterion exists for — a cycle
 # that never breaches ANY floor is precisely where the pre-fix guard logged
