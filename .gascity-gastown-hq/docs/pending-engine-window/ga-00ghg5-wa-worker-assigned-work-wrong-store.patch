@@ -1,0 +1,266 @@
+diff --git a/cmd/gc/assigned_work_scope.go b/cmd/gc/assigned_work_scope.go
+index 1cde646d4..abffde837 100644
+--- a/cmd/gc/assigned_work_scope.go
++++ b/cmd/gc/assigned_work_scope.go
+@@ -6,6 +6,7 @@ import (
+ 	"github.com/gastownhall/gascity/internal/agentutil"
+ 	"github.com/gastownhall/gascity/internal/beads"
+ 	"github.com/gastownhall/gascity/internal/config"
++	workdirutil "github.com/gastownhall/gascity/internal/workdir"
+ )
+ 
+ func assignedWorkStoreRefForAgent(cityPath string, cfg *config.City, agentCfg *config.Agent) string {
+@@ -15,6 +16,26 @@ func assignedWorkStoreRefForAgent(cityPath string, cfg *config.City, agentCfg *c
+ 	return configuredRigName(cityPath, agentCfg, cfg.Rigs)
+ }
+ 
++// assignedWorkRoutingStoreRefForAgent resolves the store a concrete SESSION's
++// real, live assigned work lives in. It differs from assignedWorkStoreRefForAgent
++// (which intentionally treats a dir-less agent as city-scoped for template
++// resolution / pool-demand / desired-state — a work_dir fallback added there
++// caused an 88x create/drain loop city-wide, incident ga-f7k65a, see
++// workdirutil.ConfiguredRigName): a dir-less POOL-TEMPLATE agent (wa-worker,
++// ps-worker — agents/<name>/agent.toml with no `dir`, only `work_dir` inside
++// the rig) still claims and works beads in its own rig's store. Callers that
++// need to find where a concrete session's own live work actually is — config-
++// drift drain deferral, gate-reviewer verdict correlation, stranded-work
++// collection, pool-session-name store indexing — must resolve through this,
++// not assignedWorkStoreRefForAgent, or a dir-less session with real open work
++// in its rig's store reads as having none (gt-69j2v).
++func assignedWorkRoutingStoreRefForAgent(cityPath string, cfg *config.City, agentCfg *config.Agent) string {
++	if cfg == nil || agentCfg == nil {
++		return ""
++	}
++	return workdirutil.RoutingRigName(cityPath, *agentCfg, cfg.Rigs)
++}
++
+ // agentIsCrossStoreEligible reports whether an agent may discover and serve work
+ // in ANY store, not just its configured rig. City-scoped agents are cross-store
+ // eligible: a city-wide singleton legitimately serves per-rig routed work
+diff --git a/cmd/gc/assigned_work_scope_test.go b/cmd/gc/assigned_work_scope_test.go
+index f34893dcb..96fae2841 100644
+--- a/cmd/gc/assigned_work_scope_test.go
++++ b/cmd/gc/assigned_work_scope_test.go
+@@ -1,6 +1,7 @@
+ package main
+ 
+ import (
++	"os"
+ 	"path/filepath"
+ 	"testing"
+ 
+@@ -224,6 +225,63 @@ func TestSessionHasOpenAssignedWorkUsesOnlyReachableStore(t *testing.T) {
+ 	}
+ }
+ 
++// TestSessionHasOpenAssignedWorkRoutesDirlessWorkDirAgentToItsRigStore pins
++// the gt-69j2v fix: a dir-less pool-template agent (wa-worker, ps-worker —
++// agents/<name>/agent.toml with no `dir` field, only `work_dir` inside the
++// rig) still does its real bd work in its own rig's store. Before this fix,
++// sessionHasOpenAssignedWorkForReachableStore resolved such a session's store
++// via assignedWorkStoreRefForAgent -> configuredRigName, which returns "" for
++// a dir-less agent (city-scoped, by design — see
++// TestConfiguredRigNameDirLessAgentWithRigWorkDirStaysCityScoped in
++// internal/workdir) and so checked ONLY the city store. A session with real,
++// open work sitting in its rig's store was reported as having no assigned
++// work, so the config-drift-drain deferral at session_reconciler.go
++// ("Skipping config-drift drain ... live assigned work found") never
++// triggered for it, and an editorial change anywhere under $CITY/scripts
++// could drain the session mid-task (gt-69j2v: wa-x0ppe lost committed-but-
++// unpushed work this way twice on 2026-09-11).
++func TestSessionHasOpenAssignedWorkRoutesDirlessWorkDirAgentToItsRigStore(t *testing.T) {
++	cityPath := t.TempDir()
++	rigPath := filepath.Join(cityPath, "whatsapp_automation")
++	if err := os.MkdirAll(filepath.Join(rigPath, "crew", "worker"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	cfg := &config.City{
++		Rigs: []config.Rig{{Name: "whatsapp_automation", Path: rigPath}},
++		Agents: []config.Agent{{
++			Name:    "wa-worker",
++			WorkDir: filepath.Join(rigPath, "crew", "worker"),
++		}},
++	}
++	cityStore := beads.NewMemStore()
++	rigStore := beads.NewMemStore()
++	session := beads.Bead{
++		ID:     "session-1",
++		Type:   sessionBeadType,
++		Status: "open",
++		Metadata: map[string]string{
++			"template":     "wa-worker",
++			"session_name": "wa-worker-1",
++		},
++	}
++	if _, err := rigStore.Create(beads.Bead{
++		ID:       "wa-x0ppe",
++		Type:     "task",
++		Status:   "in_progress",
++		Assignee: session.ID,
++	}); err != nil {
++		t.Fatalf("Create rig work: %v", err)
++	}
++
++	has, err := sessionHasOpenAssignedWorkForReachableStore(cityPath, cfg, cityStore, map[string]beads.Store{"whatsapp_automation": rigStore}, session)
++	if err != nil {
++		t.Fatalf("sessionHasOpenAssignedWorkForReachableStore: %v", err)
++	}
++	if !has {
++		t.Fatal("a dir-less agent's WorkDir-resolved rig-store assigned work must count, or config-drift drain will kill a session mid-task (gt-69j2v)")
++	}
++}
++
+ func TestSessionHasOpenAssignedWorkMatchesConfiguredNamedSessionRuntimeFallback(t *testing.T) {
+ 	cfg := &config.City{
+ 		Workspace: config.Workspace{Name: "test-city"},
+diff --git a/cmd/gc/session_reconciler.go b/cmd/gc/session_reconciler.go
+index 328dd959b..34990f34d 100644
+--- a/cmd/gc/session_reconciler.go
++++ b/cmd/gc/session_reconciler.go
+@@ -2806,7 +2806,12 @@ func assignedWorkStoreRefForSession(cityPath string, cfg *config.City, session b
+ 	if agentCfg == nil {
+ 		return "", false
+ 	}
+-	return assignedWorkStoreRefForAgent(cityPath, cfg, agentCfg), true
++	// Use the routing (WorkDir-fallback-aware) resolution, not
++	// assignedWorkStoreRefForAgent: this function answers "where does THIS
++	// session's real live work actually live", which for a dir-less
++	// pool-template agent (wa-worker, ps-worker) is its rig's store, not the
++	// city store (gt-69j2v).
++	return assignedWorkRoutingStoreRefForAgent(cityPath, cfg, agentCfg), true
+ }
+ 
+ // firstOpenAssignedWorkBeadForReachableStore returns the first open or
+diff --git a/cmd/gc/session_reconciler_scripts_drift_test.go b/cmd/gc/session_reconciler_scripts_drift_test.go
+index b7f278e31..5bfb73522 100644
+--- a/cmd/gc/session_reconciler_scripts_drift_test.go
++++ b/cmd/gc/session_reconciler_scripts_drift_test.go
+@@ -3,6 +3,8 @@ package main
+ import (
+ 	"context"
+ 	"encoding/json"
++	"os"
++	"path/filepath"
+ 	"testing"
+ 	"time"
+ 
+@@ -263,3 +265,119 @@ func TestReconcileSessionBeads_ScriptsOnlyDriftStillDrainsResumeWakeCreating(t *
+ 		t.Errorf("drain reason = %q, want config-drift", ds.reason)
+ 	}
+ }
++
++// TestReconcileSessionBeads_ScriptsDriftDoesNotDrainAwakeWorkerWithAssignedWork
++// closes the gap the ga-n9bw tests above leave open (see file header): they
++// only drive a STALE-CREATING session, so only Exemptions 1/2 are exercised.
++// A wa-worker past its creating window — awake, actively doing a task — has
++// no exemption 1/2 protection at all (those are gated to wasCreating) and
++// relies entirely on the plain "live assigned work" defer at
++// session_reconciler.go (sessionHasOpenAssignedWorkForReachableStore,
++// "Skipping config-drift drain ...: live assigned work found").
++//
++// Before gt-69j2v's fix, that check resolved a dir-less wa-worker's store via
++// assignedWorkStoreRefForSession -> assignedWorkStoreRefForAgent ->
++// configuredRigName, which returns "" (city-scoped) for a dir-less agent BY
++// DESIGN (see TestConfiguredRigNameDirLessAgentWithRigWorkDirStaysCityScoped
++// in internal/workdir — that contract must NOT change, ga-f7k65a). So the
++// check looked in the CITY store instead of the whatsapp_automation rig store
++// where wa-worker's real claimed bead lives, found nothing, and the session
++// drained mid-task. This is the exact shape of the wa-x0ppe incident (P1 bug
++// lost committed-but-unpushed work twice on 2026-09-11): the reconciler's own
++// "live assigned work" protection existed and was completely inert for every
++// dir-less pool worker. The fix routes this ONE lookup through
++// assignedWorkRoutingStoreRefForAgent (workdirutil.RoutingRigName) instead,
++// leaving ConfiguredRigName/assignedWorkStoreRefForAgent's other callers
++// (pool-demand, session-wake, desired-state) untouched.
++func TestReconcileSessionBeads_ScriptsDriftDoesNotDrainAwakeWorkerWithAssignedWork(t *testing.T) {
++	name := "wa-worker-1"
++	cityPath := t.TempDir()
++	rigPath := filepath.Join(cityPath, "whatsapp_automation")
++	if err := os.MkdirAll(filepath.Join(rigPath, "crew", "worker"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++
++	env := newReconcilerTestEnv()
++	env.cfg = &config.City{
++		Rigs: []config.Rig{{Name: "whatsapp_automation", Path: rigPath}},
++		Agents: []config.Agent{{
++			Name:     scriptsDriftWorkerTemplate,
++			WakeMode: "fresh",
++			WorkDir:  filepath.Join(rigPath, "crew", "worker"),
++		}},
++	}
++	tp := TemplateParams{
++		Command:      "steady-cmd",
++		SessionName:  name,
++		TemplateName: scriptsDriftWorkerTemplate,
++		Hints: agent.StartupHints{CopyFiles: []runtime.CopyEntry{
++			scriptsCopyEntry("scripts-hash-NEW"),
++		}},
++	}
++	env.desiredState[name] = tp
++	_ = env.sp.Start(context.Background(), name, runtime.Config{Command: tp.Command})
++	session := env.createSessionBead(name, scriptsDriftWorkerTemplate)
++	env.markSessionActive(&session) // awake and working, NOT creating -- the untested branch.
++
++	currentCfg := sessionCoreConfigForHash(tp, session)
++	oldCfg := currentCfg
++	oldCfg.CopyFiles = []runtime.CopyEntry{scriptsCopyEntry("scripts-hash-OLD")}
++	started := runtime.CoreFingerprint(oldCfg)
++	if started == runtime.CoreFingerprint(currentCfg) {
++		t.Fatalf("test setup: stored (old) and live (current) core hashes must differ")
++	}
++	breakdownJSON, err := json.Marshal(runtime.CoreFingerprintBreakdown(oldCfg))
++	if err != nil {
++		t.Fatalf("marshaling stored breakdown: %v", err)
++	}
++	env.setSessionMetadata(&session, map[string]string{
++		"started_config_hash": started,
++		"core_hash_breakdown": string(breakdownJSON),
++	})
++
++	// The session's real, live work -- claimed in its own rig's store, exactly
++	// like a real wa-worker's `bd` context, not the city store.
++	rigStore := beads.NewMemStore()
++	if _, err := rigStore.Create(beads.Bead{
++		ID:       "wa-x0ppe",
++		Title:    "in-flight P1 fix",
++		Type:     "task",
++		Status:   "in_progress",
++		Assignee: session.ID,
++	}); err != nil {
++		t.Fatalf("Create rig work: %v", err)
++	}
++	rigStores := map[string]beads.Store{"whatsapp_automation": rigStore}
++
++	reconcileSessionBeadsAtPath(
++		context.Background(),
++		cityPath,
++		[]beads.Bead{session},
++		env.desiredState,
++		map[string]bool{scriptsDriftWorkerTemplate: true},
++		env.cfg,
++		env.sp,
++		env.store,
++		newFakeDrainOps(),
++		nil,
++		rigStores,
++		nil,
++		env.dt,
++		nil,
++		false,
++		nil,
++		"",
++		nil,
++		env.clk,
++		env.rec,
++		0,
++		0,
++		&env.stdout,
++		&env.stderr,
++	)
++
++	if ds := env.dt.get(session.ID); ds != nil {
++		t.Fatalf("gt-69j2v: awake wa-worker with real in_progress work in its rig store must NOT be drained on config-drift; got drain=%+v stdout=%s stderr=%s",
++			ds, env.stdout.String(), env.stderr.String())
++	}
++}
