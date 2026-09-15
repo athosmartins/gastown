@@ -18,7 +18,7 @@
 #
 #   WARN_GB (default 8)     — attempt the pre-sanctioned-safe reclaim
 #                             (`gc dolt-cleanup --force` — orphan test-DB SQL DROP,
-#                             documented safe while Dolt is up), PLUS five more
+#                             documented safe while Dolt is up), PLUS six more
 #                             levers — reaping dead-session scratchpads under
 #                             /private/tmp (see _reap_dead_scratch, ga-hjcxy/
 #                             ga-02pnu: a single dead session's 1GB scratchpad
@@ -64,7 +64,22 @@
 #                             recompiles on retry, avoidable churn at that
 #                             tier — forced at CRITICAL regardless, since
 #                             Dolt hitting ENOSPC mid-journal-write (ga-vs55)
-#                             is not similarly recoverable) — then
+#                             is not similarly recoverable), and reaping
+#                             orphaned go-build<N> work dirs under
+#                             DARWIN_USER_TEMP_DIR left behind by an
+#                             interrupted `go build`/`go test` (see
+#                             _reap_go_build_orphans, ga-ilmjgo: MEASURED —
+#                             4th occurrence by 2026-09-15, 0.5-2.5GB each,
+#                             including a plain SIGINT that still orphaned
+#                             its dir — same APFS container as Dolt's
+#                             data-dir, never reused once orphaned, only a
+#                             human ever cleared it before this. Reaps at
+#                             WARN same as CRITICAL — an orphan is never
+#                             useful again — gated PER DIRECTORY on a real
+#                             `lsof` liveness check (no open file/cwd inside
+#                             it) plus a 30min mtime grace period, never on
+#                             a global go-active flag the way gocache is) —
+#                             then
 #                             rate-limited notify. Cooldown is
 #                             bypassed if avail is WORSENING since the last
 #                             notify (mirrors the exact fix ga-vs55 furo #2
@@ -74,7 +89,7 @@
 #                             before Dolt died; must not regress that lesson
 #                             onto this guard).
 #
-#                             UNLIKE the other five levers, _reap_growing_logs
+#                             UNLIKE the other six levers, _reap_growing_logs
 #                             runs on EVERY cycle regardless of floor class
 #                             (see its call at the top of main(), before the
 #                             avail/class computation) — ga-dnc2m's own
@@ -204,9 +219,10 @@
 # a healthy Dolt down, `gc dolt start` is a no-op when Dolt is already
 # running, and the action is gated to disk-safe classes only.)
 #
-# Kill switch: DOLT_DISK_FLOOR_GUARD_ENABLED=0 → skip ALL SIX reclaim actions
+# Kill switch: DOLT_DISK_FLOOR_GUARD_ENABLED=0 → skip ALL SEVEN reclaim actions
 # (dolt-cleanup, the scratchpad reaper, the transcript reaper, the log
-# reaper, the hf-cache reaper, AND the gocache reaper) only. Notification is NEVER gated by this switch (imp07 CALL
+# reaper, the hf-cache reaper, the gocache reaper, AND the go-build-orphan
+# reaper) only. Notification is NEVER gated by this switch (imp07 CALL
 # INVARIANT: alerting is the lowest-blast-radius action here and the one furo
 # #2 just fixed for being wrongly suppressible — don't reintroduce that
 # failure mode one guard over).
@@ -246,6 +262,18 @@ VM_SIGNIFICANT_GB="${DOLT_DISK_FLOOR_VM_SIGNIFICANT_GB:-2}"
 # something else. Default of 3 matches the bead's own "~3 GB" framing
 # (MEASURED 2026-09-10: grew to 4.8GB in ~1h of `bd` builds/tests).
 GOCACHE_REAP_THRESHOLD_GB="${DOLT_DISK_FLOOR_GOCACHE_REAP_THRESHOLD_GB:-3}"
+
+# ga-ilmjgo: seconds an orphaned go-build<N> work dir under
+# DARWIN_USER_TEMP_DIR must sit untouched (mtime age) before
+# _reap_go_build_orphans will delete it — grace window for a build that JUST
+# created the dir (matches the bead's own "carência para build que acabou de
+# criar o dir" framing). Independent axis from GOCACHE_REAP_THRESHOLD_GB:
+# that gates on GOCACHE's total size; this gates on a SINGLE orphan dir's
+# age, regardless of size — an orphan is never reused once its owning
+# process exits (unlike GOCACHE, which Go keeps reusing), so size never
+# factors into whether it's worth reaping (see this file's own header).
+# Default of 1800 (30min) is the bead's own stated grace period.
+GO_BUILD_ORPHAN_GRACE_SECS="${DOLT_DISK_FLOOR_GO_BUILD_ORPHAN_GRACE_SECS:-1800}"
 
 NOTIFY_COOLDOWN_SECS="${DOLT_DISK_FLOOR_NOTIFY_COOLDOWN_SECS:-3600}"   # 1h — tighter
                         # than disk-pressure-monitor's 6h; this is Dolt-specific
@@ -574,6 +602,85 @@ _should_reap_gocache() {
     return 1
   fi
   return 0
+}
+
+# _go_build_tmp_root → DARWIN_USER_TEMP_DIR (macOS per-user scratch root,
+# trailing slash stripped), or "" if getconf fails/unsupported (non-macOS
+# host). Same never-silently-assume-a-default contract as _gocache_dir's `go
+# env GOCACHE` call above — an unresolved root must skip the lever entirely
+# (see _reap_go_build_orphans), never silently fall back to a guessed path
+# this guard doesn't actually control (ga-ilmjgo).
+_go_build_tmp_root() {
+  local d
+  d="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null)"
+  [ -z "$d" ] && { echo ""; return; }
+  echo "${d%/}"
+}
+
+# _dir_size_mb <dir> → integer MB used by <dir>, or "" if du fails/parses
+# oddly (e.g. dir doesn't exist) — MB granularity (not GB, unlike
+# _gocache_size_gb) because individual go-build<N> dirs commonly run well
+# under 1GB. Same never-silently-assume-0 contract as every other size read
+# in this file (ga-p5q3, ga-ilmjgo).
+_dir_size_mb() {
+  local dir="$1" kb
+  kb="$(du -sk "$dir" 2>/dev/null | awk '{print $1}')"
+  case "$kb" in ''|*[!0-9]*) echo ""; return ;; esac
+  echo $(( kb / 1024 ))
+}
+
+# _go_build_dir_in_use <dir> → tristate exit code, mirrors the
+# 0=confirmed-healthy/1=confirmed-down/2=unknown convention
+# gc_dolt_probe_robust already uses elsewhere in this file (see
+# _should_resurrect): 0 = lsof found an open file or cwd anywhere inside
+# <dir> (IN USE — never reap), 1 = lsof ran clean and found NOTHING
+# (CONFIRMED orphaned), 2 = could not determine (lsof missing from PATH,
+# timed out, or reported a real error) — rc=2 must NEVER be treated as rc=1
+# (ga-p5q3: "couldn't see" must never collapse into "nothing is alive",
+# ga-ilmjgo item 3).
+#
+# Content-based, not exit-code-based: lsof's own exit code conflates "no
+# matches found" and "a real error occurred" (both commonly surface as a
+# nonzero exit with nothing on stdout), so this trusts stdout CONTENT for
+# the positive case (anything printed means a match) and stderr CONTENT to
+# distinguish a genuine error from a clean empty result, rather than
+# trusting lsof's raw exit code the way a simpler check might.
+_go_build_dir_in_use() {
+  local dir="$1" out err rc errfile
+  if ! command -v lsof >/dev/null 2>&1; then
+    return 2
+  fi
+  errfile="$(mktemp "${TMPDIR:-/tmp}/dolt-disk-floor-guard-lsof-err.XXXXXX" 2>/dev/null)" || return 2
+  out="$(timeout 10 lsof +D "$dir" 2>"$errfile")"
+  rc=$?
+  err=""
+  [ -s "$errfile" ] && err="$(cat "$errfile" 2>/dev/null)"
+  rm -f "$errfile" 2>/dev/null
+  if [ "$rc" -eq 124 ]; then
+    return 2
+  fi
+  if [ -n "$out" ]; then
+    return 0
+  fi
+  if [ -n "$err" ]; then
+    return 2
+  fi
+  return 1
+}
+
+# _should_reap_go_build_dir <in_use_rc> <age_secs> <grace_secs> → 0 (true)
+# only when in_use_rc=1 (CONFIRMED orphaned by _go_build_dir_in_use — rc=0
+# in-use and rc=2 unknown must NEVER reap) AND age_secs >= grace_secs
+# (ga-ilmjgo item 2: grace window for a build that just created the dir).
+# Non-numeric/empty age or grace fails CLOSED — never guess an age to
+# justify deleting, same asymmetry _should_reap_gocache's own empty-cache_gb
+# handling already documents for this file.
+_should_reap_go_build_dir() {
+  local in_use_rc="$1" age_secs="$2" grace_secs="$3"
+  [ "$in_use_rc" -eq 1 ] || return 1
+  case "$age_secs" in ''|*[!0-9]*) return 1 ;; esac
+  case "$grace_secs" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$age_secs" -ge "$grace_secs" ]
 }
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -915,6 +1022,115 @@ _reap_gocache() {
   fi
 }
 
+# _reap_go_build_orphans [root] — seventh reclaim lever, alongside
+# _safe_reclaim, _reap_dead_scratch, _reap_dead_transcripts, _reap_hf_cache,
+# _reap_growing_logs and _reap_gocache (ga-ilmjgo): an interrupted `go
+# build`/`go test` (Bash-tool timeout, SIGKILL, and — MEASURED 2026-09-15
+# 03:06 — plain SIGINT too: `go test` exited in 0.0s and still left its work
+# dir behind) leaves its work dir at
+# $(getconf DARWIN_USER_TEMP_DIR)/go-build<N>, 0.5-2.5GB each, sitting in the
+# same APFS container as Dolt's data-dir until a human clears it by hand
+# (4th occurrence by 2026-09-15, 2.15GB the latest — see this file's own
+# header). Independent leak class from _reap_gocache: GOCACHE is Go's
+# persistent, REUSABLE build-artifact cache (wiping it just costs a
+# recompile); a go-build<N> dir is a ONE-SHOT scratch workspace for a
+# SPECIFIC invocation that already ended — once its owning process exits,
+# nothing ever reuses that directory again, orphan or not. That is also why
+# this lever has no gocache-style "skip while a build is active" WARN-tier
+# trade-off of its own: a build's own IN-PROGRESS dir is excluded by the
+# per-directory lsof liveness check below, not by a global go-active gate —
+# so it runs at WARN same as CRITICAL (an orphan is never useful again, per
+# this file's own header).
+#
+# Safety, per candidate directory (ga-ilmjgo items 2-3), both evaluated by
+# the pure, unit-tested _should_reap_go_build_dir — this function only does
+# the real directory walk, real `lsof`/`stat`/`du` calls, and the real `rm`:
+#   1. _go_build_dir_in_use: lsof-confirmed no open file/cwd inside it. Its
+#      rc=2 (unknown — lsof missing/timed out/errored) NEVER reaps that
+#      directory this cycle (ga-p5q3: "couldn't see" != "nothing alive").
+#   2. mtime age >= GO_BUILD_ORPHAN_GRACE_SECS (default 1800s/30min) — a
+#      build that just created its dir gets a grace window.
+# No global ENABLED-style ordering issue with a live build elsewhere: two
+# concurrent `go build` invocations never share a go-build<N> dir (each gets
+# its own mktemp'd name), so reaping one orphan can never disturb another,
+# still-running build.
+#
+# Logs one line per candidate (name, MB, age, kept-or-deleted-and-why) —
+# ga-ilmjgo item 4 — even when nothing qualifies, so a human reading the log
+# can see what this lever considered, not just what it did. [root] overrides
+# the resolved DARWIN_USER_TEMP_DIR for the selftest's hermetic fixture;
+# production always calls this with no argument.
+_reap_go_build_orphans() {
+  local root="${1:-$(_go_build_tmp_root)}"
+  if [ "$ENABLED" != "1" ]; then
+    log "go-build-reap SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"
+    return
+  fi
+  if [ -z "$root" ] || [ ! -d "$root" ]; then
+    log "go-build-reap SKIP — DARWIN_USER_TEMP_DIR unresolved or missing (root='${root:-empty}')"
+    return
+  fi
+  if ! command -v lsof >/dev/null 2>&1; then
+    log "go-build-reap SKIP — lsof not found on PATH (cannot confirm liveness; never guess)"
+    return
+  fi
+
+  local now; now=$(date +%s)
+  local dir base mb mtime age in_use_rc reason considered=0 freed_mb=0 unmeasured_deleted=0
+
+  for dir in "$root"/go-build*; do
+    [ -d "$dir" ] || continue
+    considered=$((considered+1))
+    base="$(basename "$dir")"
+    mb="$(_dir_size_mb "$dir")"
+    mtime="$(stat -f %m "$dir" 2>/dev/null)"
+    if [ -z "$mtime" ]; then
+      log "go-build-reap: ${base} (${mb:-unmeasured}MB) — SPARED (could not stat mtime; never guess age)"
+      continue
+    fi
+    age=$(( now - mtime ))
+
+    _go_build_dir_in_use "$dir"; in_use_rc=$?
+    if [ "$in_use_rc" -eq 2 ]; then
+      log "go-build-reap: ${base} (${mb:-unmeasured}MB, age=${age}s) — SPARED (lsof could not confirm liveness this cycle; never treat unknown as safe)"
+      continue
+    fi
+
+    if _should_reap_go_build_dir "$in_use_rc" "$age" "$GO_BUILD_ORPHAN_GRACE_SECS"; then
+      if rm -rf "$dir" 2>>"$LOG"; then
+        # ga-p5q3: an unmeasured size (mb="") must never silently add as 0 to
+        # the running total — that would report a confident-looking freed_mb
+        # that's actually a KNOWN undercount as if it were exact. Track the
+        # gap explicitly instead (see the summary line below) — same
+        # discipline this file's own main() already applies to reclaimed_gb.
+        if [ -n "$mb" ]; then
+          freed_mb=$(( freed_mb + mb ))
+        else
+          unmeasured_deleted=$((unmeasured_deleted+1))
+        fi
+        log "go-build-reap: ${base} (${mb:-unmeasured}MB, age=${age}s) — DELETED (orphaned, no open refs, past ${GO_BUILD_ORPHAN_GRACE_SECS}s grace)"
+      else
+        log "go-build-reap: ${base} (${mb:-unmeasured}MB, age=${age}s) — DELETE FAILED (rm nonzero exit)"
+      fi
+    else
+      if [ "$in_use_rc" -eq 0 ]; then
+        reason="in use (open file/cwd inside)"
+      else
+        reason="too young (age=${age}s < grace=${GO_BUILD_ORPHAN_GRACE_SECS}s)"
+      fi
+      log "go-build-reap: ${base} (${mb:-unmeasured}MB, age=${age}s) — SPARED (${reason})"
+    fi
+  done
+
+  if [ "$considered" -eq 0 ]; then
+    log "go-build-reap: no go-build* dirs under ${root}"
+  elif [ "$unmeasured_deleted" -gt 0 ]; then
+    log "go-build-reap: considered=${considered} freed=${freed_mb}MB+ (${unmeasured_deleted} deleted dir(s) had unmeasured size, not counted in freed total) under ${root}"
+  else
+    log "go-build-reap: considered=${considered} freed=${freed_mb}MB under ${root}"
+  fi
+}
+
 # _resurrect_dolt <avail_gb> <class> — last-resort auto-respawn for a Dolt
 # sql-server CONFIRMED down while disk headroom is safe. Caller (main) has
 # already run _should_resurrect's gate; this function does the actual work.
@@ -1065,6 +1281,7 @@ main() {
   _reap_dead_transcripts
   _reap_hf_cache "$was_critical"
   _reap_gocache "$was_critical"
+  _reap_go_build_orphans
 
   # re-read avail — reclaim may have freed space; `class` becomes the CURRENT
   # (post-reclaim) reading, used for logging/messaging. was_critical also

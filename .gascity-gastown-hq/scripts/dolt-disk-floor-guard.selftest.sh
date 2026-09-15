@@ -314,6 +314,141 @@ _should_reap_gocache 5 3 0 1 && ok "should_reap_gocache: go not active + was_cri
 _should_reap_gocache "" 3 0 0  && bad "should_reap_gocache: empty cache_gb (du failed) should fail CLOSED, never guess" || ok "should_reap_gocache: empty cache_gb → fails closed (never reap on an unmeasured size)"
 _should_reap_gocache abc 3 0 0 && bad "should_reap_gocache: non-numeric cache_gb should fail CLOSED" || ok "should_reap_gocache: non-numeric cache_gb → fails closed"
 
+# ── _go_build_tmp_root (ga-ilmjgo): real getconf call — NOT stubbed, same
+#    rationale as this file's other real-state reads (_avail_gb(/tmp) etc.) ──
+r="$(_go_build_tmp_root)"
+if [ -n "$r" ] && [ -d "$r" ]; then
+  ok "_go_build_tmp_root(): resolved a real, existing DARWIN_USER_TEMP_DIR ($r)"
+else
+  bad "_go_build_tmp_root(): expected a real existing dir on this macOS host, got '$r'"
+fi
+
+# ── _go_build_dir_in_use (ga-ilmjgo): real lsof tristate — NOT stubbed, same
+#    rationale as _avail_gb(/tmp)/_gocache_size_gb(/tmp) above: proves the
+#    real lsof invocation + content-based parsing against this host's real
+#    lsof, not a mocked one ───────────────────────────────────────────────
+GBIU_EMPTY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-gbiu-empty.XXXXXX)"
+_go_build_dir_in_use "$GBIU_EMPTY"; gbiu_rc=$?
+if [ "$gbiu_rc" -eq 1 ]; then
+  ok "_go_build_dir_in_use(empty real dir): confirmed NOT in use (rc=1)"
+else
+  bad "_go_build_dir_in_use(empty dir) expected rc=1 (confirmed clear), got rc=$gbiu_rc"
+fi
+rm -rf "$GBIU_EMPTY"
+
+GBIU_BUSY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-gbiu-busy.XXXXXX)"
+exec 8>"$GBIU_BUSY/held-open"
+_go_build_dir_in_use "$GBIU_BUSY"; gbiu_rc=$?
+exec 8>&-
+if [ "$gbiu_rc" -eq 0 ]; then
+  ok "_go_build_dir_in_use(dir with a real open fd): confirmed IN USE (rc=0)"
+else
+  bad "_go_build_dir_in_use(busy dir) expected rc=0 (in use), got rc=$gbiu_rc"
+fi
+rm -rf "$GBIU_BUSY"
+
+# ── _should_reap_go_build_dir (ga-ilmjgo): reap ONLY when confirmed orphaned
+#    (rc=1) AND past the mtime grace period — mirrors _should_reap_gocache's
+#    boundary-style coverage above ─────────────────────────────────────────
+_should_reap_go_build_dir 1 3600 1800 && ok "should_reap_go_build_dir: confirmed orphaned, age(3600)>=grace(1800) → true" || bad "should_reap_go_build_dir 1/3600/1800 should be true"
+_should_reap_go_build_dir 1 1800 1800 && ok "should_reap_go_build_dir: age==grace → true (boundary inclusive)" || bad "should_reap_go_build_dir 1/1800/1800 should be true (inclusive boundary)"
+_should_reap_go_build_dir 1 1799 1800 && bad "should_reap_go_build_dir: age(1799)<grace(1800) should NOT reap" || ok "should_reap_go_build_dir: age below grace → false (too young)"
+_should_reap_go_build_dir 0 3600 1800 && bad "should_reap_go_build_dir: in_use_rc=0 (IN USE) should NEVER reap" || ok "should_reap_go_build_dir: in-use → false"
+_should_reap_go_build_dir 2 3600 1800 && bad "should_reap_go_build_dir: in_use_rc=2 (UNKNOWN) should NEVER reap" || ok "should_reap_go_build_dir: unknown liveness → false (never treat unknown as safe)"
+_should_reap_go_build_dir 1 "" 1800   && bad "should_reap_go_build_dir: empty age should fail CLOSED" || ok "should_reap_go_build_dir: empty age → fails closed"
+_should_reap_go_build_dir 1 3600 ""   && bad "should_reap_go_build_dir: empty grace should fail CLOSED" || ok "should_reap_go_build_dir: empty grace → fails closed"
+_should_reap_go_build_dir 1 abc 1800  && bad "should_reap_go_build_dir: non-numeric age should fail CLOSED" || ok "should_reap_go_build_dir: non-numeric age → fails closed"
+
+# ── _dir_size_mb (ga-ilmjgo): real du parsing — NOT stubbed, same rationale
+#    as _gocache_size_gb(/tmp) above ───────────────────────────────────────
+d="$(_dir_size_mb /tmp)"
+case "$d" in
+  ''|*[!0-9]*) bad "_dir_size_mb(/tmp) did not return an integer (got: '$d')" ;;
+  *) [ "$d" -ge 0 ] && ok "_dir_size_mb(/tmp) returns a non-negative integer MB ($d)" || bad "_dir_size_mb(/tmp) returned negative: $d" ;;
+esac
+d="$(_dir_size_mb "/nonexistent/path/$$/does-not-exist")"
+[ "$d" = "" ] && ok "_dir_size_mb(nonexistent path) → '' (du failure surfaces, not masked)" || bad "_dir_size_mb(nonexistent) got: '$d' (expected empty)"
+
+echo ""
+echo "=== _reap_go_build_orphans (ga-ilmjgo): real directory walk, hermetic fixture ==="
+# Fake TMPDIR root — NEVER the real DARWIN_USER_TEMP_DIR. Three candidates,
+# matching this bead's own acceptance-test spec verbatim: an old+unowned dir
+# (must delete), an old+in-use dir (real open fd, real lsof — must spare),
+# and a new+unowned dir still inside the grace window (must spare).
+GBT_ROOT="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-gbt.XXXXXX)"
+OLD_TS="$(date -v-1H '+%Y%m%d%H%M.%S' 2>/dev/null || date -d '-1 hour' '+%Y%m%d%H%M.%S')"
+
+OLD_ORPHAN="$GBT_ROOT/go-build111111"
+mkdir -p "$OLD_ORPHAN"
+echo "orphan payload" > "$OLD_ORPHAN/payload"
+touch -t "$OLD_TS" "$OLD_ORPHAN"
+
+OLD_INUSE="$GBT_ROOT/go-build222222"
+mkdir -p "$OLD_INUSE"
+touch -t "$OLD_TS" "$OLD_INUSE"
+exec 8>"$OLD_INUSE/held-open"   # real open fd — real lsof will see this
+
+NEW_ORPHAN="$GBT_ROOT/go-build333333"
+mkdir -p "$NEW_ORPHAN"
+echo "fresh" > "$NEW_ORPHAN/payload"   # mtime defaults to now — inside grace
+
+# shellcheck disable=SC2034  # read by _reap_go_build_orphans in the sourced script
+GO_BUILD_ORPHAN_GRACE_SECS=1800
+_reap_go_build_orphans "$GBT_ROOT"
+exec 8>&-   # release the held-open fd now that the reap already ran
+
+if [ ! -d "$OLD_ORPHAN" ]; then
+  ok "_reap_go_build_orphans: old + unowned dir DELETED"
+else
+  bad "_reap_go_build_orphans: old + unowned dir should have been DELETED, still present"
+fi
+if [ -d "$OLD_INUSE" ]; then
+  ok "_reap_go_build_orphans: old + IN-USE dir (real open fd, real lsof) SPARED"
+else
+  bad "_reap_go_build_orphans: old + in-use dir should NEVER be deleted, was removed"
+fi
+if [ -d "$NEW_ORPHAN" ]; then
+  ok "_reap_go_build_orphans: new + unowned dir (within grace window) SPARED"
+else
+  bad "_reap_go_build_orphans: new + unowned dir should be spared by the grace period, was removed"
+fi
+rm -rf "$GBT_ROOT"
+
+echo ""
+echo "=== _reap_go_build_orphans (ga-ilmjgo): lsof failure → nothing deleted ==="
+# ga-ilmjgo item 3: "erro não é vazio" — a failing lsof must NEVER be read as
+# a confirmed-clear directory. Shadow lsof on PATH with a fake that fails.
+GBT_ROOT2="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-gbt2.XXXXXX)"
+OLD_ORPHAN2="$GBT_ROOT2/go-build444444"
+mkdir -p "$OLD_ORPHAN2"
+touch -t "$OLD_TS" "$OLD_ORPHAN2"
+
+FAKE_LSOF_DIR="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-lsof.XXXXXX)"
+cat > "$FAKE_LSOF_DIR/lsof" <<'EOF'
+#!/bin/bash
+echo "lsof: simulated failure (selftest)" >&2
+exit 1
+EOF
+chmod +x "$FAKE_LSOF_DIR/lsof"
+
+REAL_PATH="$PATH"
+PATH="$FAKE_LSOF_DIR:$PATH"
+# shellcheck disable=SC2034  # read by _reap_go_build_orphans in the sourced script
+GO_BUILD_ORPHAN_GRACE_SECS=1800
+_reap_go_build_orphans "$GBT_ROOT2"
+PATH="$REAL_PATH"
+
+if [ -d "$OLD_ORPHAN2" ]; then
+  ok "_reap_go_build_orphans: lsof failure (nonzero exit + stderr) → dir SPARED, never guessed as orphaned"
+else
+  bad "_reap_go_build_orphans: lsof failure should have spared the dir — it was deleted anyway (unknown treated as safe, the exact ga-p5q3 regression this bead exists to prevent)"
+fi
+rm -rf "$GBT_ROOT2" "$FAKE_LSOF_DIR"
+
+# ── _reap_go_build_orphans: nonexistent root → SKIP cleanly, never crash ───
+_reap_go_build_orphans "/nonexistent/path/$$/go-build-tmp-does-not-exist"
+ok "_reap_go_build_orphans: nonexistent root skips cleanly (no crash — this line only runs if it didn't)"
+
 echo ""
 echo "=== _reap_dead_scratch: production sentinel wiring (ga-h565g) ==="
 # _reap_dead_scratch is the REAL caller scratchpad-reaper.sh's own header
@@ -896,6 +1031,17 @@ REAP_GOCACHE_CALLS=0
 REAP_GOCACHE_LAST_ARG=""
 _reap_gocache() { REAP_GOCACHE_CALLS=$((REAP_GOCACHE_CALLS+1)); REAP_GOCACHE_LAST_ARG="${1:-}"; }
 
+# _reap_go_build_orphans is new (ga-ilmjgo), same reasoning as the other reap
+# stubs: EXECUTION code (real directory walk + real lsof + real rm, already
+# proven in isolation with a hermetic fixture earlier in this file) stubbed
+# as a no-op here so main()'s WIRING is what gets proven — never a real scan
+# of this host's actual DARWIN_USER_TEMP_DIR. Takes no was_critical arg
+# (unlike scratch/hf-cache/gocache) — this lever's WARN-vs-CRITICAL decision
+# is per-directory (the lsof liveness check), not a global two-tier gate, so
+# there is nothing for main() itself to pass.
+REAP_GO_BUILD_CALLS=0
+_reap_go_build_orphans() { REAP_GO_BUILD_CALLS=$((REAP_GO_BUILD_CALLS+1)); }
+
 NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""
 record_notify() {
   NOTIFY_CALLS=$((NOTIFY_CALLS+1))
@@ -938,7 +1084,7 @@ record_gc() {
 # shellcheck disable=SC2034  # read by main() in the sourced script
 GC=record_gc
 
-reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; }
+reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; REAP_GO_BUILD_CALLS=0; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; }
 seed_state() {
   if [ -n "$1" ]; then echo "$1" > "$STATE_EPOCH_FILE"; else rm -f "$STATE_EPOCH_FILE"; fi
   if [ -n "$2" ]; then echo "$2" > "$STATE_AVAIL_FILE"; else rm -f "$STATE_AVAIL_FILE"; fi
@@ -1172,10 +1318,10 @@ echo "=== main(): scratchpad + transcript reap integration (ga-02pnu, ga-t1ub9) 
 reset_capture; seed_state "" ""
 queue_avail 2 20
 main
-if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ] && [ "$REAP_LOGS_CALLS" = "1" ] && [ "$REAP_HF_CALLS" = "1" ] && [ "$REAP_GOCACHE_CALLS" = "1" ]; then
-  ok "main(): _reap_dead_scratch, _reap_dead_transcripts, _reap_growing_logs, _reap_hf_cache, AND _reap_gocache each invoked exactly once alongside _safe_reclaim"
+if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ] && [ "$REAP_LOGS_CALLS" = "1" ] && [ "$REAP_HF_CALLS" = "1" ] && [ "$REAP_GOCACHE_CALLS" = "1" ] && [ "$REAP_GO_BUILD_CALLS" = "1" ]; then
+  ok "main(): _reap_dead_scratch, _reap_dead_transcripts, _reap_growing_logs, _reap_hf_cache, _reap_gocache, AND _reap_go_build_orphans each invoked exactly once alongside _safe_reclaim"
 else
-  bad "main(): expected all five reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_LOGS_CALLS=$REAP_LOGS_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS"
+  bad "main(): expected all six reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_LOGS_CALLS=$REAP_LOGS_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS"
 fi
 if [ "$REAP_LAST_ARG" = "1" ]; then
   ok "main(): CRITICAL cycle (even after reclaim recovers it to NONE) passes was_critical=1 to _reap_dead_scratch (ga-rjhfz pressure plumbing)"
@@ -1225,10 +1371,10 @@ VM_LOG_PRE_COUNT=$(grep -c "vm_swap_gb=" "$LOG" 2>/dev/null || echo 0)
 reset_capture; seed_state "" ""
 queue_avail 20
 main
-if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ] && [ "$REAP_HF_CALLS" = "0" ] && [ "$REAP_GOCACHE_CALLS" = "0" ]; then
-  ok "main(): avail above floor on first read never invokes the scratch/transcript/hf-cache/gocache reapers"
+if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ] && [ "$REAP_HF_CALLS" = "0" ] && [ "$REAP_GOCACHE_CALLS" = "0" ] && [ "$REAP_GO_BUILD_CALLS" = "0" ]; then
+  ok "main(): avail above floor on first read never invokes the scratch/transcript/hf-cache/gocache/go-build reapers"
 else
-  bad "main(): expected zero scratch/transcript/hf-cache/gocache reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS"
+  bad "main(): expected zero scratch/transcript/hf-cache/gocache/go-build reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS"
 fi
 # ga-sfj3i.2: the exact case this acceptance criterion exists for — a cycle
 # that never breaches ANY floor is precisely where the pre-fix guard logged
