@@ -121,6 +121,16 @@ EOF
   local STORY_ID="ga-test"
   local STORY='{"assignee":"crew/tester","created_by":"tester"}'
   local STORY_STORE="$GC_CITY"
+  # ga-6zkhci: Step 5b now falls back to a MERGE_SHA-derived delta when
+  # PRE_DEPLOY_SHA==POST_DEPLOY_SHA (see
+  # story-delivery-daemon-refresh-noop-attribution.test.sh for that path,
+  # including T3 = this file's own "no merge sha info at all" case reproduced
+  # with a resolvable MERGE_SHA instead). MERGE_SHA stays empty here so the
+  # fallback's `[ -n "$MERGE_SHA" ]` guard evaluates false and T3 keeps
+  # testing exactly what it always did: no attribution signal available at
+  # all → stays unknown → existing blame behavior. (Declared, not left
+  # unset, because the block runs under `set -u` in this harness.)
+  local MERGE_SHA=""
   get_runbook_field() { echo "central-sender"; }
 
   rm -f "$T/reached.marker"

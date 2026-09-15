@@ -124,6 +124,15 @@ EOF
   local STORY_ID="ga-test"
   local STORY='{"assignee":"crew/tester","created_by":"tester"}'
   local STORY_STORE="$GC_CITY"
+  # ga-6zkhci: Step 5b now falls back to a MERGE_SHA-derived delta when
+  # PRE_DEPLOY_SHA==POST_DEPLOY_SHA (see
+  # story-delivery-daemon-refresh-noop-attribution.test.sh for that path).
+  # This test is specifically about the baseline-widening race (ga-gokm6),
+  # not that fallback, so MERGE_SHA stays empty — the fallback's own `[ -n
+  # "$MERGE_SHA" ]` guard then evaluates false and behavior here is
+  # unchanged. (Declared, not left unset, because the block runs under
+  # `set -u` in this harness.)
+  local MERGE_SHA=""
   get_runbook_field() { echo "central-sender"; }
 
   ( for _t in _once; do eval "$BLOCK"; done ) >/dev/null 2>&1

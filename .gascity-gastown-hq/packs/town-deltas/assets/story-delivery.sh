@@ -1930,6 +1930,73 @@ else
         THIS_PULL_STRUCTURALLY_INERT=0
       fi
     fi
+  elif [ -n "$MERGE_SHA" ] \
+       && MERGE_SHA_PARENT="$(git -C "$RUNTIME_DIR" rev-parse --verify -q "${MERGE_SHA}^" 2>/dev/null)" \
+       && [ -n "$MERGE_SHA_PARENT" ]; then
+    # ga-6zkhci: PRE_DEPLOY_SHA==POST_DEPLOY_SHA means THIS iteration's pull was
+    # a true no-op (ga-gokm6's scenario: something else — a sibling story's
+    # delivery earlier in the same sweep, or a crew's own post-merge fast-
+    # forward — already advanced RUNTIME_DIR's HEAD past this story's merge
+    # before PRE_DEPLOY_SHA was captured above). That range genuinely carries
+    # no information about this story's own files, so the pattern check above
+    # never runs — but MERGE_SHA (the gate-verified commit; already proven
+    # above to be an ancestor of MERGE_REF in RUNTIME_DIR, so its object and
+    # its parent ARE present) has a real, known diff regardless of what the
+    # pull did. Confirmed live (story-delivery.log 2026-09-14): wa-ibaqq
+    # (docs/mockups/*.html only) and wa-mjpjs (scripts/lib files no daemon
+    # imports) were both held on exactly this gap — THIS_PULL_STRUCTURALLY_INERT
+    # stayed unset, so the case statement below fell to blame/hold for
+    # staleness neither one caused.
+    #
+    # Ask daemon-refresh.sh itself — DRY_RUN=1 hardcoded (never the outer
+    # $DRY_RUN): this is a pure classification probe on a delta that has
+    # nothing to do with what the caller's own deploy is doing, so it must
+    # never kickstart or drain anything for real — whether THIS story's own
+    # delta alone (MERGE_SHA's parent..MERGE_SHA) reaches any live daemon.
+    # This reuses the exact same import/template-closure discovery Step 3
+    # (below) already trusts for the wide window, instead of re-deriving a
+    # second, weaker heuristic here: the tests/docs/md pattern above is
+    # deliberately NOT extended to cover cases like wa-mjpjs's scripts/*.py —
+    # daemon-refresh.sh's own header point 9 explains why a static pattern
+    # can't safely cover arbitrary .py files, since whether one is reachable
+    # from any daemon depends on the rig's actual import graph, not its path.
+    #
+    # Bounded with `timeout 180`: measured live against this rig's real
+    # daemon roster (ga-6zkhci), a call that can't short-circuit on a
+    # tests/docs/md-only delta (i.e. one that reaches Step 2/3's live
+    # launchctl/ps discovery across every declared daemon) took ~98s
+    # wall-clock. A single slow-or-hung probe here must not stall every OTHER
+    # story queued behind this one in the same sweep; a timeout is treated
+    # the same as any other unparseable result below — fails closed to the
+    # existing blame behavior, never guesses an exemption.
+    #
+    # Read AFFECTED, never VERDICT, to decide inert-ness. Under DRY_RUN=1,
+    # daemon-refresh.sh reports VERDICT=OK for a daemon it WOULD have
+    # restarted (WOULD_RESTART branch) exactly as readily as for one that
+    # reaches nothing at all — it never actually kickstarts or verify_fresh()s
+    # under dry-run, so "OK" here cannot distinguish "this story's files touch
+    # no live daemon" from "this story's files touch a live daemon that a REAL
+    # run might fail to bring back fresh". AFFECTED is populated by Step 3's
+    # import/template-closure discovery alone, before any restart is
+    # attempted — empty means no live daemon is reachable from this story's
+    # own delta at all (the only claim this probe needs to make); non-empty
+    # means it is, regardless of how a real restart of it would have gone.
+    MERGE_OWN_OUT=$(RUNTIME_DIR="$RUNTIME_DIR" \
+      PRE_DEPLOY_SHA="$MERGE_SHA_PARENT" POST_DEPLOY_SHA="$MERGE_SHA" \
+      DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
+      EXTRA_RUNTIME_ROOTS="$EXTRA_RUNTIME_ROOTS" \
+      DRY_RUN=1 \
+      timeout 180 bash "$REFRESH_HELPER" 2>/dev/null || true)
+    MERGE_OWN_VERDICT_LINE=$(echo "$MERGE_OWN_OUT" | grep '^VERDICT=' | head -1)
+    MERGE_OWN_AFFECTED=$(echo "$MERGE_OWN_OUT" | grep '^AFFECTED=' | head -1 | sed 's/^AFFECTED=//')
+    log "This-iteration pull was a true no-op (PRE_DEPLOY_SHA==POST_DEPLOY_SHA=$POST_DEPLOY_SHA) — asked daemon-refresh.sh (DRY_RUN=1, no real kickstart/drain) whether $STORY_ID's own merge $MERGE_SHA alone (vs parent $MERGE_SHA_PARENT) reaches any live daemon: ${MERGE_OWN_VERDICT_LINE:-<unparseable output>} affected=[$MERGE_OWN_AFFECTED]."
+    if [ -z "$MERGE_OWN_VERDICT_LINE" ]; then
+      : # unparseable helper output (crash/timeout) — stays unknown, existing blame fallback applies
+    elif [ -z "${MERGE_OWN_AFFECTED// /}" ]; then
+      THIS_PULL_STRUCTURALLY_INERT=1
+    else
+      THIS_PULL_STRUCTURALLY_INERT=0
+    fi
   fi
   log "Daemon refresh: pre=$DAEMON_REFRESH_PRE_SHA post=$POST_DEPLOY_SHA (this-pull-pre=$PRE_DEPLOY_SHA) this-pull-structurally-inert=${THIS_PULL_STRUCTURALLY_INERT:-unknown} sensitive='$SENSITIVE_DAEMONS' extra_roots='$EXTRA_RUNTIME_ROOTS' ..."
   REFRESH_OUT=$(RUNTIME_DIR="$RUNTIME_DIR" \

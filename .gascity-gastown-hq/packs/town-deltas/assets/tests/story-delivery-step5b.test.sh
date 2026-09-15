@@ -55,6 +55,12 @@ EOF
   # $GC_CITY when absent (story-delivery.sh:~487) — STORY has no _store here,
   # so mirror that same fallback rather than inventing a fixture value.
   local STORY_STORE="$GC_CITY"
+  # ga-6zkhci: PRE_DEPLOY_SHA!=POST_DEPLOY_SHA above means Step 5b's
+  # MERGE_SHA-fallback branch never evaluates its own $MERGE_SHA reference in
+  # this file's C1/C2 cases — but declare it anyway (empty) since the block
+  # runs under `set -u` here and an undeclared reference would be a latent
+  # trap for the next person who touches this shared block.
+  local MERGE_SHA=""
   get_runbook_field() { echo "central-sender"; }
 
   # Run the real block in a subshell; capture its exit code. Wrapped in a
