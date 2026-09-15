@@ -75,7 +75,7 @@ MARKER_REL=".gc/runtime/daemon-refresh-baseline/whatsapp_automation.sha"
 # DIFFERENT, shape-dependent answer — exactly like a real per-daemon
 # reachability check would.
 run_block() {
-  local own_file_shape="$1" no_parent="${2:-0}"
+  local own_file_shape="$1" no_parent="${2:-0}" merge_probe_crash="${3:-0}" strict="${4:-0}"
   local T; T="$(mktemp -d)"
   GC_CITY="$T/city"
   mkdir -p "$GC_CITY/packs/town-deltas/assets"
@@ -103,6 +103,15 @@ run_block() {
   printf '%s\n' "$SHA_C0" > "$GC_CITY/$MARKER_REL"
 
   cat > "$GC_CITY/packs/town-deltas/assets/daemon-refresh.sh" <<'EOF'
+if [ "$DRY_RUN" = "1" ] && [ "${SIMULATE_MERGE_PROBE_CRASH:-0}" = "1" ]; then
+  # ga-6zkhci gate-fix (T5): simulate the narrow merge-own probe (always
+  # DRY_RUN=1) timing out or crashing before printing anything parseable —
+  # what `timeout 180 ...` returns when the timeout fires. The WIDE-window
+  # call (DRY_RUN unset/0, Step 5b's non-probe invocation) is untouched by
+  # this guard, so T5 isolates the narrow probe's failure from the rest of
+  # Step 5b.
+  exit 124
+fi
 CHANGED="$(git -C "$RUNTIME_DIR" diff --name-only "$PRE_DEPLOY_SHA" "$POST_DEPLOY_SHA" 2>/dev/null)"
 case "$CHANGED" in
   *sensitive*)
@@ -133,6 +142,8 @@ EOF
   warn() { echo "WARN: $*" >> "$LOG_FILE"; }
   err()  { echo "ERR: $*" >> "$LOG_FILE"; }
   export -f bd gc log warn err 2>/dev/null || true
+  SIMULATE_MERGE_PROBE_CRASH="$merge_probe_crash"
+  export SIMULATE_MERGE_PROBE_CRASH
 
   local RIG="whatsapp_automation"
   local RUNTIME_DIR="$REPO"
@@ -158,7 +169,19 @@ EOF
   get_runbook_field() { echo "central-sender"; }
 
   rm -f "$T/reached.marker"
-  ( for _t in _once; do eval "$BLOCK"; touch "$T/reached.marker"; done ) >/dev/null 2>&1
+  if [ "$strict" = "1" ]; then
+    # ga-6zkhci gate-fix (T5): production runs this whole file under
+    # `set -euo pipefail` (story-delivery.sh line 32). The default subshell
+    # below deliberately does NOT enable `-e` (T1-T4 rely on that to observe
+    # BD_CALLS/GC_CALLS state after a continue-based halt rather than a hard
+    # stop), which is exactly why gate-fix-attempt 1's missing `|| true` on
+    # lines 1990-1991 slipped through T1-T4 unnoticed — this harness could
+    # not have observed that crash. Opt in to real errexit semantics here so
+    # this test actually reproduces it.
+    ( set -euo pipefail; for _t in _once; do eval "$BLOCK"; touch "$T/reached.marker"; done ) >/dev/null 2>&1
+  else
+    ( for _t in _once; do eval "$BLOCK"; touch "$T/reached.marker"; done ) >/dev/null 2>&1
+  fi
   RUN_RC=$?
   LOG_OUT="$(cat "$LOG_FILE" 2>/dev/null || true)"
   BD_CALLS="$(cat "$BD_LOG" 2>/dev/null || true)"
@@ -225,6 +248,28 @@ echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=unknown" \
 echo "$BD_CALLS" | grep -q "label add ga-test delivery:failed" \
   && ok "T4 delivery:failed added — unknown attribution defaults to blame, not exemption" \
   || nok "T4 failed-label" "$BD_CALLS"
+
+# ── T5: merge-own DRY_RUN=1 probe times out/crashes (no VERDICT= line at
+#        all, e.g. `timeout 180` firing) → must fall back to unknown, same
+#        as T4 (existing blame behavior), and — this is the actual gate FAIL
+#        this test regresses — must NOT crash the whole delivery sweep.
+#        fix-attempt 1 (gate_run ga-oaid6p) added lines 1990-1991 without the
+#        `|| true` guard the adjacent REFRESH_PROOF line already has; under
+#        `set -euo pipefail` a no-match grep piped into head/sed kills the
+#        whole script, not just this story. Runs strict (real errexit)
+#        because the default harness mode used by T1-T4 cannot observe this
+#        crash at all (see run_block's strict branch above) ───────────────
+run_block docs 0 1 1
+[ "$RUN_RC" -eq 0 ] && ok "T5 block runs clean despite merge-own probe crash/timeout (rc=0)" \
+  || nok "T5 rc — merge-own probe crash killed the whole block instead of falling back" "rc=$RUN_RC"
+echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=unknown" \
+  && ok "T5 unparseable probe output → inert stays unknown (never guessed)" \
+  || nok "T5 inert classification" "$LOG_OUT"
+[ "$REACHED" -eq 0 ] && ok "T5 block halts via continue (falls back to existing blame behavior, does not crash)" \
+  || nok "T5 halted" "REACHED=$REACHED"
+echo "$BD_CALLS" | grep -q "label add ga-test delivery:failed" \
+  && ok "T5 delivery:failed added — unknown attribution defaults to blame, not exemption" \
+  || nok "T5 failed-label" "$BD_CALLS"
 
 echo ""
 echo "story-delivery daemon-refresh no-op attribution tests: $PASS passed, $FAIL failed"

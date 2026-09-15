@@ -1987,8 +1987,8 @@ else
       EXTRA_RUNTIME_ROOTS="$EXTRA_RUNTIME_ROOTS" \
       DRY_RUN=1 \
       timeout 180 bash "$REFRESH_HELPER" 2>/dev/null || true)
-    MERGE_OWN_VERDICT_LINE=$(echo "$MERGE_OWN_OUT" | grep '^VERDICT=' | head -1)
-    MERGE_OWN_AFFECTED=$(echo "$MERGE_OWN_OUT" | grep '^AFFECTED=' | head -1 | sed 's/^AFFECTED=//')
+    MERGE_OWN_VERDICT_LINE=$(echo "$MERGE_OWN_OUT" | grep '^VERDICT=' | head -1 || true)
+    MERGE_OWN_AFFECTED=$(echo "$MERGE_OWN_OUT" | grep '^AFFECTED=' | head -1 | sed 's/^AFFECTED=//' || true)
     log "This-iteration pull was a true no-op (PRE_DEPLOY_SHA==POST_DEPLOY_SHA=$POST_DEPLOY_SHA) — asked daemon-refresh.sh (DRY_RUN=1, no real kickstart/drain) whether $STORY_ID's own merge $MERGE_SHA alone (vs parent $MERGE_SHA_PARENT) reaches any live daemon: ${MERGE_OWN_VERDICT_LINE:-<unparseable output>} affected=[$MERGE_OWN_AFFECTED]."
     if [ -z "$MERGE_OWN_VERDICT_LINE" ]; then
       : # unparseable helper output (crash/timeout) — stays unknown, existing blame fallback applies
