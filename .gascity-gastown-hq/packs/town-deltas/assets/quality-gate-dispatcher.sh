@@ -9657,6 +9657,22 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
   # "transient" = auto-rebase worktree/push plumbing failure (main may settle →
   # bounded retry still makes sense).
   CONFLICT_KIND=""
+  # ga-y5c29l: true iff THIS sweep's merge-tree pre-check (MT_VERDICT, just
+  # below) already proved the branch merges into main with ZERO conflicts —
+  # set in the implicit "clean" else-branch of the MT_VERDICT if/elif right
+  # below. Distinct from REBASE_AHEAD_CAP_ONLY (ga-agtqm): that flag is 1
+  # only in the narrow case where the ahead-commit-count cap is the SOLE
+  # reason a clean branch is out of envelope, and stays 0 for the far more
+  # common case of an in-envelope, provably-clean branch whose actual
+  # rebase/push attempt fails for operational reasons (worktree busy, disk
+  # full, transient push race — CONFLICT_KIND="transient" below). Feeding
+  # THIS flag into gate_circuit_break_check()'s retry_dead condition lets a
+  # provably clean-merging branch survive repeated plumbing failures instead
+  # of being circuit-broken as if it were unmergeable (measured: wa-llq1a/
+  # wa-4zmm1, 2026-09-11 — Mayor had to manually clear rebase-fail-count/
+  # exiled-tier5/exiled-since to un-stick two branches that were never
+  # actually in conflict).
+  REBASE_MERGE_TREE_PROVEN_CLEAN=0
   MERGE_BASE_SHA=$(git_rig merge-base "origin/$BRANCH" "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
   MT_VERDICT=$(rig_merge_has_conflict "origin/$DEFAULT_BRANCH" "origin/$BRANCH")
   # ga-kyxih: computed once per sweep, independent of MT_VERDICT (a structural
@@ -9693,6 +9709,14 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     CONFLICT_FILES=$(git_rig merge-tree --write-tree --name-only "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null \
       | tail -n +2 | head -5 | tr '\n' ' ' | cut -c1-300 || true)
     [ -z "$CONFLICT_FILES" ] && CONFLICT_FILES="merge conflict (files unavailable)"
+  else
+    # ga-y5c29l: MT_VERDICT is neither "err" (exited above) nor "1" (handled
+    # above) — the only remaining value is "0", i.e. merge-tree proved this
+    # branch merges into main with zero conflicts. Any HAS_CONFLICT=1 set
+    # LATER in this sweep (auto-rebase/push plumbing failures below) is
+    # therefore known-transient, never a real conflict — see
+    # REBASE_MERGE_TREE_PROVEN_CLEAN's own comment above.
+    REBASE_MERGE_TREE_PROVEN_CLEAN=1
   fi
 
   # imp22: Constrain auto-rebase to the FF-only / behind-only / clean-tree envelope.
@@ -11058,7 +11082,15 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
         # own reclaim path could re-ready it if the marker somehow regained claimed/
         # dispatching. Promote to gate:needs-human on the SOURCE BEAD so Pilot knows
         # not to re-dispatch, and park the marker permanently at gate-status:error.
-        _ACB_RETRY=$(gate_circuit_break_check "retry_dead" "" "$REBASE_AUTHOR_ALIVE" "$NEXT_ATTEMPT" "$MAX_REBASE_ATTEMPTS" "$GATE_REBASE_AHEAD_MAX" "$REBASE_AHEAD_CAP_ONLY")
+        # ga-y5c29l: was "$REBASE_AHEAD_CAP_ONLY" — a flag scoped to the
+        # narrow ahead_dead condition (ga-agtqm), almost always 0 by the
+        # time this transient/operational-failure path is reached, so the
+        # retry_dead merge_clean exemption below it silently never applied
+        # to the actual common case (worktree/push failures on an
+        # already-proven-clean branch). REBASE_MERGE_TREE_PROVEN_CLEAN is
+        # the correct signal here — see its own comment above.
+        # SELFTEST-EXTRACT ga-y5c29l-retry-dead-decision: BEGIN
+        _ACB_RETRY=$(gate_circuit_break_check "retry_dead" "" "$REBASE_AUTHOR_ALIVE" "$NEXT_ATTEMPT" "$MAX_REBASE_ATTEMPTS" "$GATE_REBASE_AHEAD_MAX" "$REBASE_MERGE_TREE_PROVEN_CLEAN")
         if [ "$_ACB_RETRY" != "ok" ]; then
           err "Branch $BRANCH: retries exhausted ($NEXT_ATTEMPT >= $MAX_REBASE_ATTEMPTS) + dead author — ga-acb circuit-break (${_ACB_RETRY})."
           set_gate_status "$MARKER_ID" "error"  # ga-7fwt1
@@ -11089,6 +11121,27 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
           fi
           REBASE_EVENT="dispatcher_circuit_break_retry_dead"
           REBASE_VERDICT="CIRCUIT-BREAK (retry_dead: ${MAX_REBASE_ATTEMPTS} attempts exhausted, dead author, needs-human armed=$_NH_STATUS)"
+        elif [ "$REBASE_MERGE_TREE_PROVEN_CLEAN" = "1" ]; then
+          # ga-y5c29l: merge-tree already proved this branch merges into main
+          # with ZERO conflicts this sweep — gate_circuit_break_check()'s own
+          # ga-agtqm exemption is why _ACB_RETRY="ok" above. Retries being
+          # exhausted here is evidence of a REPEATED operational/environment
+          # failure (disk, worktree, push race), never evidence the branch is
+          # unmergeable — terminally escalating it would repeat the
+          # wa-llq1a/wa-4zmm1 incident (2026-09-11): both branches were
+          # provably clean, yet got parked at a terminal status that took a
+          # human manually clearing 3 labels (rebase-fail-count, exiled-
+          # tier5, exiled-since) to undo. Stay in the retry queue (already
+          # exiled to tier5 above, so this does not block healthy markers)
+          # instead of escalating — gate_exile_watchdog_sweep (ga-faw5o) is
+          # the appropriate backstop if this genuinely never recovers, on a
+          # timescale (default 24h) that fits an environment issue instead of
+          # the $MAX_REBASE_ATTEMPTS-sweep window that forced the manual fix.
+          warn "Branch $BRANCH: transient auto-rebase failure persists after $MAX_REBASE_ATTEMPTS attempts, dead author, but merge-tree already proved $BRANCH merges clean (ga-y5c29l) — staying in the retry queue instead of circuit-breaking."
+          set_gate_status "$MARKER_ID" "queued"  # ga-7fwt1
+          bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry (ga-y5c29l): branch $BRANCH hit $NEXT_ATTEMPT transient auto-rebase failures (${CONFLICT_FILES:-plumbing}) and the author session is gone, but merge-tree already proved this branch merges into $DEFAULT_BRANCH with zero conflicts — not evidence of an unmergeable branch, so NOT circuit-broken. Remains queued (exiled behind the healthy tier). If this persists for hours, gate_exile_watchdog_sweep (ga-faw5o) will escalate to Mayor on its own." 2>/dev/null || true
+          REBASE_EVENT="dispatcher_autorebase_retry_clean_exhausted"
+          REBASE_VERDICT="QUEUED (merge-tree proven clean, transient failures repeat, staying in bounded retry — ga-y5c29l)"
         else
           # GATE_AUTO_CIRCUIT_BREAK=0: fall through to legacy needs-rebase escalation.
           err "Branch $BRANCH: transient auto-rebase failure persists after $MAX_REBASE_ATTEMPTS server-side attempts, author dead/empty — escalating to Mayor."
@@ -11104,6 +11157,7 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
           REBASE_EVENT="dispatcher_needs_rebase_escalated"
           REBASE_VERDICT="NEEDS_REBASE (escalated to Mayor after $MAX_REBASE_ATTEMPTS attempts)"
         fi
+        # SELFTEST-EXTRACT ga-y5c29l-retry-dead-decision: END
       fi
     fi
 
