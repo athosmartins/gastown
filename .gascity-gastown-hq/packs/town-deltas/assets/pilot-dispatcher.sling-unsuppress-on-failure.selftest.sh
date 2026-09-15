@@ -520,6 +520,44 @@ else
   ok "labelless sling bead — sweep survives set -e, correctly left untouched"
 fi
 
+# ── Scenario R: self-heal, real set -e pragma — bd show SUCCEEDS but returns
+#    non-JSON output for a listed id, exercising the _pse_sling_for extraction
+#    itself (gate_run ga-0u5xml, fix-attempt 3, SHA 3a62ea662) — distinct from
+#    Scenario P (bd show FAILS outright, exit 1 — already guarded by the
+#    pre-existing `|| continue` on line ~1703). Here `bd show` exits 0 but
+#    stdout is not parseable JSON (a stray warning line, a truncated
+#    response — CLI-misbehavior classes this codebase has hit before), so the
+#    pipe `printf ... | jq -r ...` itself fails under pipefail. The
+#    `_pse_sling_for=...` assignment had NO `|| continue` guard (unlike its
+#    sibling `_pse_bead=...` one line above it), so set -e killed the entire
+#    Pilot sweep on this input — worse than the bug ga-h6trx3 set out to fix,
+#    and for every OTHER pilot:held bead due in the same sweep, not just this
+#    one id. ─────────────────────────────────────────────────────────────────
+echo "Scenario R: self-heal, real set -e pragma — bd show succeeds but returns non-JSON, does not crash the sweep"
+_bead_for() {
+  case "$1" in
+    sling-malformed-json) printf 'not-json-at-all { truncated' ;;
+  esac
+}
+run_selfheal_strict "hq" '[{"id":"sling-malformed-json"}]' 0
+if ! has_call "SURVIVED"; then
+  bad "CRASHED under set -e when bd show succeeds but returns non-JSON for a listed id — dump: $(cat "$CALLS" | tr '\n' '|')"
+elif grep -qE '^bd\t-C hq (label remove|undefer)' "$CALLS"; then
+  bad "REGRESSION: acted on a bead whose JSON could not be parsed"
+else
+  ok "bd show returns non-JSON for a listed id — sweep survives set -e, that id is skipped"
+fi
+
+# ── Scenario S: drift-guard — the _pse_sling_for extraction stays guarded
+#    against pipefail, structurally (belt-and-suspenders to Scenario R, the
+#    same relationship Scenario N already has to L/M) ─────────────────────
+echo "Scenario S: drift-guard — _pse_sling_for extraction keeps its || continue pipefail guard"
+if grep -F '_pse_sling_for=$(printf' "$DISPATCHER" | grep -qF -- '|| continue'; then
+  ok "_pse_sling_for extraction keeps its || continue pipefail guard"
+else
+  bad "REGRESSION: _pse_sling_for extraction lost its || continue guard (the exact ga-0u5xml crash could be back)"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "pilot-dispatcher.sling-unsuppress-on-failure.selftest: $PASS passed, $FAIL failed"

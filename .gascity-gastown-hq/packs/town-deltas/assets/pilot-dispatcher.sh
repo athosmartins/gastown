@@ -1702,7 +1702,7 @@ _pilot_selfheal_expired_slings() {
     [ -n "$_pse_id" ] || continue
     _pse_bead=$(bd -C "$_pse_city" show "$_pse_id" --json 2>/dev/null) || continue
     [ -n "$_pse_bead" ] || continue
-    _pse_sling_for=$(printf '%s' "$_pse_bead" | jq -r 'if type=="array" then .[0] else . end | (.metadata["pilot.sling_for"] // "")' 2>/dev/null)
+    _pse_sling_for=$(printf '%s' "$_pse_bead" | jq -r 'if type=="array" then .[0] else . end | (.metadata["pilot.sling_for"] // "")' 2>/dev/null) || continue
     [ -n "$_pse_sling_for" ] || continue
     _pse_expiry_lbl=$(printf '%s' "$_pse_bead" | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null | grep -E '^pilot:held-until:[0-9]+$' | head -1) || true
     [ -n "$_pse_expiry_lbl" ] || continue
