@@ -92,23 +92,41 @@ def _parse_json(raw):
             return []
 
 
+# ga-vjybz8: static fallback for run_cycle() when _rig_stores() returns None
+# (gc rig list unavailable) — the pre-ga-wz03iq baseline non-HQ rigs, same
+# convention as the shell family's static fallback.
+_STATIC_FALLBACK_RIG_STORES = [
+    ("whatsapp_automation", "/Users/athos/gt/whatsapp_automation"),
+    ("property_scrapers", "/Users/athos/gt/property_scrapers"),
+]
+
+
 def _rig_stores():
     """Non-HQ rig store paths (name, path). The gate's HQ store is excluded — a marker
-    already in HQ is found by the gate, not orphaned."""
+    already in HQ is found by the gate, not orphaned. Returns None if the live rig
+    list could not be derived (gc missing/non-zero/timed out/unparseable) — the
+    caller decides the fallback. ga-vjybz8: this used to swallow any such failure
+    and silently return [] (indistinguishable from a `gc rig list` that ran fine
+    and genuinely found zero non-HQ rigs); the caller now gets an explicit "don't
+    know" signal instead."""
     if _rig_stores_fn is not None:
         return _rig_stores_fn()
     r = _sh([GC_BIN, "--city", CITY, "rig", "list", "--json"], timeout=BD_TIMEOUT)
+    if r is None or r.returncode != 0:
+        _log("WARN: gc rig list failed/timed out — cannot derive rig store list")
+        return None
+    try:
+        rigs = json.loads(r.stdout).get("rigs") or []
+    except Exception as e:
+        _log("WARN: gc rig list parse: %r" % e)
+        return None
     out = []
-    if r and r.returncode == 0:
-        try:
-            for rig in (json.loads(r.stdout).get("rigs") or []):
-                if rig.get("hq") is True:
-                    continue
-                p = rig.get("path")
-                if p and p != CITY and os.path.isdir(p):
-                    out.append((rig.get("name") or os.path.basename(p), p))
-        except Exception as e:
-            _log("WARN: gc rig list parse: %r" % e)
+    for rig in rigs:
+        if not isinstance(rig, dict) or rig.get("hq") is True:
+            continue
+        p = rig.get("path")
+        if p and p != CITY and os.path.isdir(p):
+            out.append((rig.get("name") or os.path.basename(p), p))
     return out
 
 
@@ -226,7 +244,13 @@ def _rehome_one(store, m):
 
 def run_cycle():
     done = 0
-    for name, store in _rig_stores():
+    stores = _rig_stores()
+    if stores is None:
+        _log("DEGRADED gate-marker-rehome-stores: gc rig list failed/timed out/unparseable "
+             "— using static fallback (%s)" % ", ".join(n for n, _ in _STATIC_FALLBACK_RIG_STORES))
+        _notify("gc rig list falhou/vazio — usando lista estatica de fallback", 4)
+        stores = _STATIC_FALLBACK_RIG_STORES
+    for name, store in stores:
         markers = _list_orphan_markers(store)
         if markers is None:
             _log("WARN: bd list markers failed in %s — skipping store" % name)
@@ -255,7 +279,7 @@ def main():
 
 # ── selftest ────────────────────────────────────────────────────────────────────
 def _selftest():
-    global _rig_stores_fn, _list_markers_fn, _create_hq_fn, _verify_hq_fn, _stamp_fn, _close_fn, _do_notify_fn, MAX_PER_SWEEP
+    global _rig_stores_fn, _list_markers_fn, _create_hq_fn, _verify_hq_fn, _stamp_fn, _close_fn, _do_notify_fn, MAX_PER_SWEEP, GC_BIN
     ok = [0]; bad = [0]
     def _ok(m): ok[0] += 1; print("  ok   " + m)
     def _bad(m, d=""): bad[0] += 1; print("  BAD  " + m + ((" :: " + d) if d else ""))
@@ -310,6 +334,30 @@ def _selftest():
     closed.clear(); created.clear()
     n = run_cycle()
     _ok("C: cap honored (1 re-homed, rest deferred)") if n == 1 else _bad("C", "n=%d" % n)
+
+    print("Scenario D (ga-vjybz8): _rig_stores() returns None on gc failure — never a "
+          "silently-empty [] — and run_cycle degrades to the static WA+PS fallback WITH "
+          "an explicit notify, instead of silently scanning zero rigs")
+    _rig_stores_fn = None  # exercise the REAL _rig_stores() body, not the test seam
+    _saved_gc_bin = GC_BIN
+    GC_BIN = "/this/binary/does/not/exist/ga-vjybz8"
+    if _rig_stores() is None:
+        _ok("D1: _rig_stores() returns None when gc rig list fails (never an empty list)")
+    else:
+        _bad("D1: _rig_stores() must return None on gc failure", str(_rig_stores()))
+    notified = []
+    _do_notify_fn = lambda m, p: notified.append((m, p))
+    _list_markers_fn = lambda store: []
+    MAX_PER_SWEEP = 5
+    n = run_cycle()
+    if n == 0 and notified and "estatica" in notified[-1][0] and notified[-1][1] == 4:
+        _ok("D2: run_cycle degrades to the static WA+PS fallback with an explicit "
+            "priority-4 notify (never crashes, never silently scans zero rigs)")
+    else:
+        _bad("D2: run_cycle did not notify the degraded-stores fallback",
+             "n=%d notified=%s" % (n, notified))
+    GC_BIN = _saved_gc_bin
+    _rig_stores_fn = lambda: [("whatsapp_automation", "/WA")]
 
     print("\n[gate-marker-rehome selftest] %d passed, %d failed" % (ok[0], bad[0]))
     sys.exit(1 if bad[0] else 0)

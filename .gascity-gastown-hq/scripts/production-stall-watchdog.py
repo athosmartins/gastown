@@ -67,6 +67,7 @@ _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 from gc_ledger import gc_ledger_append as _ledger
 import datetime as _datetime
 import quiet_hours
+from lib import rig_stores as rig_stores_lib
 
 # ga-qhca1: scripts/bead_state.py is the city's single canonical park
 # vocabulary (10 consumers used to each keep their own copy; every state bug
@@ -130,6 +131,36 @@ def sh(args, timeout=20):
         return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     except Exception:
         return None
+
+
+def _resolve_dynamic_rig_roots():
+    """ga-vjybz8: replace the static RIG_ROOTS default with the live rig list —
+    same bug class as ga-wz03iq's shell family: a rig added to `gc rig list`
+    since the static default was written (lexbh, marketing, gastown, deacon)
+    was silently never checked for deploy-block/merge-stall/stuck-exec here.
+
+    Called ONCE from main(), before the sweep loop — deliberately NOT at import
+    time, so test_production_stall_watchdog.py's importlib-based module loading
+    (which never sets PROD_STALL_RIG_ROOTS and never calls main()) never
+    triggers a live `gc rig list` call; it only ever sees the static default,
+    then overrides RIG_ROOTS itself per-test exactly as it already does. No-op
+    if PROD_STALL_RIG_ROOTS was set explicitly — RIG_ROOTS already honors that
+    operator override from its module-level assignment above, and an explicit
+    override always wins over derivation."""
+    global RIG_ROOTS
+    if "PROD_STALL_RIG_ROOTS" in os.environ:
+        return
+    roots = rig_stores_lib.rig_store_paths(GC)
+    if roots:
+        RIG_ROOTS = roots
+        print("[prod-stall] resolved %d live rig root(s) via gc rig list: %s" % (
+              len(RIG_ROOTS), ", ".join(RIG_ROOTS)), flush=True)
+    else:
+        print("[prod-stall] DEGRADED production-stall-watchdog-roots: gc rig list "
+              "failed/timed out/empty — using static fallback (%s)" % ":".join(RIG_ROOTS),
+              flush=True)
+        sh([NOTIFY, "-t", "Production watchdog", "-p", "4",
+            "gc rig list falhou/vazio — usando lista estatica de fallback"], timeout=10)
 
 
 def log_ts_epoch(line):
@@ -542,6 +573,7 @@ def main():
     if os.environ.get("PROD_STALL_WATCHDOG_ENABLED", "1") == "0":
         print("[prod-stall] disabled via PROD_STALL_WATCHDOG_ENABLED=0 — no-op", flush=True)
         return
+    _resolve_dynamic_rig_roots()
     state = new_state()
     print("[prod-stall] production-stall watchdog started — deploy-block + merge-stall + "
           "stuck-exec; anti-flap hysteresis + per-dim cooldown; escalates to MAYOR "

@@ -127,19 +127,30 @@ def _parse_bd_json(raw):
 
 
 def _stores():
-    """All bead stores: HQ + every rig path (gc rig list)."""
+    """All bead stores: HQ + every rig path (gc rig list). Returns None if the
+    live rig list could not be derived (gc missing/non-zero/timed out/
+    unparseable) — the caller decides the fallback. ga-vjybz8: this used to
+    swallow any such failure and silently return [CITY] only, indistinguishable
+    from a `gc rig list` that ran fine and genuinely found zero rigs beyond HQ
+    — callers had no way to tell "no other rigs exist" from "couldn't ask".
+    Mirrors lib/rig-stores.sh's fail-closed contract (success = data, failure =
+    None, never both meaning the same thing)."""
     if _rigs_fn is not None:
         return _rigs_fn()
-    out = [CITY]
     r = _sh([GC_BIN, "--city", CITY, "rig", "list", "--json"], timeout=BD_TIMEOUT)
-    if r and r.returncode == 0:
-        try:
-            for rig in (json.loads(r.stdout).get("rigs") or []):
-                p = rig.get("path")
-                if p and p not in out and os.path.isdir(p):
-                    out.append(p)
-        except Exception as e:
-            _log("WARN: gc rig list parse: %r" % e)
+    if r is None or r.returncode != 0:
+        _log("WARN: gc rig list failed/timed out — cannot derive store list")
+        return None
+    try:
+        rigs = json.loads(r.stdout).get("rigs") or []
+    except Exception as e:
+        _log("WARN: gc rig list parse: %r" % e)
+        return None
+    out = [CITY]
+    for rig in rigs:
+        p = rig.get("path") if isinstance(rig, dict) else None
+        if p and p not in out and os.path.isdir(p):
+            out.append(p)
     return out
 
 
@@ -573,6 +584,11 @@ def _try_close(store, bid, why, reason, closed):
 def run_cycle(now):
     """One sweep across all stores. Returns count closed."""
     stores = _stores()
+    if stores is None:
+        _log("DEGRADED sling-janitor-stores: gc rig list failed/timed out/unparseable "
+             "— using static fallback (HQ only)")
+        _notify("gc rig list falhou/vazio — usando lista estatica de fallback (somente HQ)", 4)
+        stores = [CITY]
     live = _live_sessions()
     gated = _gated_bead_ids()  # bead-ids whose fix is in flight at the gate — never orphan
     # Build the set of bead ids that are story:in-flight across ALL stores (parents).
@@ -837,7 +853,7 @@ def main():
 # ── selftest ────────────────────────────────────────────────────────────────────
 def _selftest():
     global _bd_list_open_fn, _bd_close_fn, _sessions_fn, _rigs_fn, _do_notify_fn, MAX_PER_SWEEP
-    global _target_status_fn, _rig_name_map_fn, BD_BIN
+    global _target_status_fn, _rig_name_map_fn, BD_BIN, GC_BIN
     ok = [0]
     bad = [0]
     def _ok(m): ok[0] += 1; print("  ok  " + m)
@@ -1332,6 +1348,28 @@ print(json.dumps(found))
     _ok("BI: fecha os dois, na ordem (%s)" % tried2) if tried2 == ["sg1", "sg2"] else \
         _bad("BI: encadeamento quebrou", "tried=%s" % tried2)
     _target_status_fn = None
+
+    print("Scenario BJ (ga-vjybz8): _stores() returns None on gc failure — never a "
+          "silently-smaller [CITY]-only list — and run_cycle degrades to the static "
+          "HQ-only fallback WITH an explicit notify, instead of silently under-scanning")
+    _rigs_fn = None  # exercise the REAL _stores() body, not the test seam
+    _saved_gc_bin = GC_BIN
+    GC_BIN = "/this/binary/does/not/exist/ga-vjybz8"
+    notified = []
+    _do_notify_fn = lambda m, p: notified.append((m, p))
+    _bd_list_open_fn = lambda store: []
+    if _stores() is None:
+        _ok("BJ1: _stores() returns None when gc rig list fails (never a smaller list)")
+    else:
+        _bad("BJ1: _stores() must return None on gc failure", str(_stores()))
+    run_cycle(NOW)
+    if notified and "estatica" in notified[-1][0] and notified[-1][1] == 4:
+        _ok("BJ2: run_cycle degrades to the static HQ-only fallback with an explicit "
+            "priority-4 notify (never crashes, never silently scans fewer stores)")
+    else:
+        _bad("BJ2: run_cycle did not notify the degraded-stores fallback", str(notified))
+    GC_BIN = _saved_gc_bin
+    _rigs_fn = lambda: ["HQ"]
 
     print("\n[sling-janitor selftest] %d passed, %d failed" % (ok[0], bad[0]))
     sys.exit(1 if bad[0] else 0)

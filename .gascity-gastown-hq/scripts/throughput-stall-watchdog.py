@@ -76,6 +76,7 @@ from gate_queue_backlog import (
     _gate_queue_depth, _gate_queue_throughput, _gate_queue_suppress_reason,
     _gate_queue_body_line, GATE_QUEUE_WINDOW_MIN,
 )
+from lib import rig_stores as rig_stores_lib
 
 # ga-98inr: scripts/bead_state.py is the city's single canonical state model
 # (10 consumers used to each keep their own park-label copy — this file's own
@@ -431,9 +432,22 @@ def _log(msg):
     print("[tsw] %s" % msg, flush=True)
 
 
+# ga-vjybz8: cache of gc-rig-list-derived {prefix,path,name} dicts, populated by
+# _resolve_dynamic_rig_roots() below (called once from main(), never at import
+# time — see that function's docstring for why). None until then, or if
+# derivation was skipped/failed — _rig_name() falls back to its old substring
+# heuristic in either case, so --selftest (which never calls main()) exercises
+# the exact same _rig_name() behavior it always has.
+_TSW_LIVE_RIGS = None
+
+
 def _rig_name(root):
     """Map a rig root path to a canonical rig name for per-rig keying."""
     root = root.rstrip("/")
+    if _TSW_LIVE_RIGS:
+        name = rig_stores_lib.rig_name_for_path(root, _TSW_LIVE_RIGS)
+        if name:
+            return name
     if "whatsapp" in root:
         return "whatsapp_automation"
     if "property_scrapers" in root:
@@ -444,6 +458,40 @@ def _rig_name(root):
         return "gascity"
     _log("_rig_name: unrecognized root %r — falling back to 'gascity'" % root)
     return "gascity"
+
+
+def _resolve_dynamic_rig_roots():
+    """ga-vjybz8: replace the static RIG_ROOTS default with the live rig list,
+    same bug class as ga-wz03iq's shell family — a rig added to `gc rig list`
+    since the static default was written (lexbh, marketing, gastown, deacon)
+    was silently never covered here. Also populates _TSW_LIVE_RIGS so
+    _rig_name() can resolve a rig's canonical name by EXACT path instead of its
+    substring heuristic (which only ever recognized whatsapp/property_scrapers/
+    gascity — any of the 4 newer rigs would otherwise be miscounted under the
+    'gascity' fallback once RIG_ROOTS started including them).
+
+    Called ONCE from main(), before the sweep loop — deliberately NOT at import
+    time, so a test harness that merely imports/execs this file for
+    introspection (this file's own --selftest, which never calls main(); or an
+    external test loading it via importlib the way
+    test_production_stall_watchdog.py loads its sibling) never triggers a live
+    `gc rig list` call. No-op if TSW_RIG_ROOTS was set explicitly — RIG_ROOTS
+    already honors that operator override from its module-level assignment
+    above, and an explicit override always wins over derivation."""
+    global RIG_ROOTS, _TSW_LIVE_RIGS
+    if "TSW_RIG_ROOTS" in os.environ:
+        return
+    rigs = rig_stores_lib.rig_stores(GC_BIN)
+    if rigs:
+        _TSW_LIVE_RIGS = rigs
+        RIG_ROOTS = [r["path"] for r in rigs]
+        _log("resolved %d live rig store(s) via gc rig list: %s" % (
+             len(RIG_ROOTS), ", ".join(RIG_ROOTS)))
+    else:
+        _log("DEGRADED throughput-stall-watchdog-roots: gc rig list failed/timed out/empty "
+             "— using static fallback (%s)" % ":".join(RIG_ROOTS))
+        _sh([NOTIFY_BIN, "-t", "Throughput watchdog", "-p", "4",
+             "gc rig list falhou/vazio — usando lista estatica de fallback"], timeout=10)
 
 
 def _query_suspended_rigs_via_gc():
@@ -2476,6 +2524,8 @@ def main():
     if not ENABLED:
         _log("disabled via TSW_ENABLED=0 — no-op")
         return
+
+    _resolve_dynamic_rig_roots()
 
     _log("throughput-stall watchdog started — backlog cross-check vs dispatch+merge "
          "(window=%.0fh, confirm=%d sweeps, backlog_min=%d, poll=%ds, cooldown=%ds)" % (
