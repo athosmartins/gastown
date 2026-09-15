@@ -35,10 +35,31 @@ CITY_DEFAULT="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
 # Same store list as agent-stuck-escalation.sh's ESCALATION_STORES (kept as
 # an independent env var so tuning one guard's scan scope never silently
 # retunes the other's).
+_NEXT_ACTION_ALERT_STORES_CALLER_SET=0
+[ -n "${NEXT_ACTION_ALERT_STORES:-}" ] && _NEXT_ACTION_ALERT_STORES_CALLER_SET=1
 STORES="${NEXT_ACTION_ALERT_STORES:-/Users/athos/gt/.gascity-gastown-hq /Users/athos/gt/whatsapp_automation /Users/athos/gt/property_scrapers}"
 BD_BIN="${BD_BIN:-bd}"
 GC_BIN="${GC_BIN:-gc}"
 NOTIFY_BIN="${NOTIFY_BIN:-notify}"
+
+# ga-wz03iq: derive STORES from the live rig list instead of the static 3
+# above — same bug class as ga-3xfndz: a rig added to `gc rig list` since
+# this default was written (lexbh, marketing, gastown, deacon) was never
+# scanned for an unaddressed next-action:<coordinator>. The sibling
+# tests/next-action-coordinator-alert.selftest.sh sets GC_BIN to its own
+# fake-gc shim before invoking this script, so this call is hermetic there.
+if [ "$_NEXT_ACTION_ALERT_STORES_CALLER_SET" != "1" ]; then
+  _naa_rig_stores_lib="${CITY_DEFAULT}/scripts/lib/rig-stores.sh"
+  if [ -r "$_naa_rig_stores_lib" ]; then
+    . "$_naa_rig_stores_lib"
+    if _naa_dyn=$(rig_stores_paths "$GC_BIN"); then
+      STORES="$_naa_dyn"
+    else
+      echo "next-action-coordinator-alert: DEGRADED — gc rig list failed/timed out/returned nothing parseable, using static fallback ($STORES)"
+      "$NOTIFY_BIN" -t "Next-action coordinator alert" -p 4 "🚨 gc rig list falhou/vazio — usando lista estatica de fallback, cobertura pode estar incompleta" 2>/dev/null || true
+    fi
+  fi
+fi
 STATE_DIR="${GC_PACK_STATE_DIR:-${GC_CITY_RUNTIME_DIR:-$CITY_DEFAULT/.gc/runtime}/packs/maintenance}"
 SEEN_FILE="${NEXT_ACTION_ALERT_SEEN_FILE:-$STATE_DIR/next-action-coordinator-alert-seen.json}"
 COOLDOWN_SEC="${NEXT_ACTION_ALERT_COOLDOWN_S:-14400}"   # 4h re-fire while still unaddressed

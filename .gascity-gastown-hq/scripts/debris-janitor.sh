@@ -39,9 +39,47 @@ SCAN_DIRS=(
 
 # Git roots to worktree-prune. HQ lives under the town root /Users/athos/gt (the actual .git);
 # the CITY dir (/Users/athos/gt/.gascity-gastown-hq) is a subdirectory, not a repo root.
+_DEBRIS_ROOTS_CALLER_SET=0
+[ -n "${DEBRIS_JANITOR_ROOTS:-}" ] && _DEBRIS_ROOTS_CALLER_SET=1
 IFS=':' read -ra PRUNE_ROOTS <<< "${DEBRIS_JANITOR_ROOTS:-/Users/athos/gt:/Users/athos/gt/whatsapp_automation:/Users/athos/gt/property_scrapers}"
+DEBRIS_JANITOR_GC="${DEBRIS_JANITOR_GC:-gc}"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [debris-janitor] $*"; }
+
+# ga-wz03iq: derive PRUNE_ROOTS from the live rig list instead of the static 3
+# above — same bug class as ga-3xfndz (a rig added to `gc rig list` since this
+# default was written — lexbh, marketing, gastown, deacon — was never pruned).
+# Resolved through `git rev-parse --show-toplevel` per candidate rather than
+# used raw, for the same reason the comment above already called out for HQ
+# specifically: a bd-store path is not necessarily a git repo root. Deduped:
+# rigs with no .git of their own (gastown, deacon) resolve to the same
+# /Users/athos/gt as HQ and would otherwise be pruned redundantly. Skipped
+# under --selftest so the hermetic scenarios above never shell out to a real
+# `gc rig list`.
+if [ "$_DEBRIS_ROOTS_CALLER_SET" != "1" ] && [ "${1:-}" != "--selftest" ]; then
+  _debris_rig_stores_lib="${CITY}/scripts/lib/rig-stores.sh"
+  if [ -r "$_debris_rig_stores_lib" ]; then
+    . "$_debris_rig_stores_lib"
+    if _dj_rig_paths=$(rig_stores_paths "$DEBRIS_JANITOR_GC" 20 " "); then
+      _dj_resolved=""
+      for _dj_p in $_dj_rig_paths; do
+        _dj_top=$(timeout 2 git -C "$_dj_p" rev-parse --show-toplevel 2>/dev/null) || continue
+        case " $_dj_resolved " in
+          *" $_dj_top "*) ;;  # already have this root
+          *) _dj_resolved="${_dj_resolved:+$_dj_resolved }$_dj_top" ;;
+        esac
+      done
+      if [ -n "$_dj_resolved" ]; then
+        IFS=' ' read -ra PRUNE_ROOTS <<< "$_dj_resolved"
+      else
+        log "DEGRADED debris-janitor-roots: gc rig list ok but no rig resolved to a git toplevel — using static fallback (${PRUNE_ROOTS[*]})"
+      fi
+    else
+      log "DEGRADED debris-janitor-roots: gc rig list failed/timed out/empty — using static fallback (${PRUNE_ROOTS[*]})"
+      [ -x "$NOTIFY_BIN" ] && "$NOTIFY_BIN" -t "Debris janitor" -p 4 "🚨 gc rig list falhou/vazio — usando lista estatica de fallback" 2>/dev/null || true
+    fi
+  fi
+fi
 
 # ── selftest ───────────────────────────────────────────────────────────────────
 if [ "${1:-}" = "--selftest" ]; then

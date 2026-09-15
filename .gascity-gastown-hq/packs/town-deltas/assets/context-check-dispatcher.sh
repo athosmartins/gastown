@@ -860,7 +860,30 @@ fi
 # labeling pass is store-scoped (bd_ honors $CC_STORE). Only the optional Sonnet
 # reviewer spawn is city-coupled (uses $GC_CITY = the HQ city) — it stays on HQ.
 # Per-sweep caps are GLOBAL across stores (one shared Dolt-load budget).
+_CONTEXT_CHECK_STORES_CALLER_SET=0
+[ -n "${CONTEXT_CHECK_STORES:-}" ] && _CONTEXT_CHECK_STORES_CALLER_SET=1
 CONTEXT_CHECK_STORES="${CONTEXT_CHECK_STORES:-$GC_CITY /Users/athos/gt/whatsapp_automation /Users/athos/gt/property_scrapers}"
+CONTEXT_CHECK_GC="${CONTEXT_CHECK_GC:-gc}"
+
+# ga-wz03iq: derive CONTEXT_CHECK_STORES from the live rig list instead of the
+# static HQ+WA+PS default above — same bug class as ga-3xfndz: a rig added to
+# `gc rig list` since this default was written (lexbh, marketing, gastown,
+# deacon) was never scanned for context-check candidates. This file has no
+# inline --selftest CLI flag — its sibling context-check-dispatcher.selftest.sh
+# instead runs the real script as a subprocess with its own gc/bd shims
+# already set in the environment.
+if [ "$_CONTEXT_CHECK_STORES_CALLER_SET" != "1" ]; then
+  _cc_rig_stores_lib="${GC_CITY}/scripts/lib/rig-stores.sh"
+  if [ -r "$_cc_rig_stores_lib" ]; then
+    . "$_cc_rig_stores_lib"
+    if _cc_dyn=$(rig_stores_paths "$CONTEXT_CHECK_GC"); then
+      CONTEXT_CHECK_STORES="$_cc_dyn"
+    else
+      log "DEGRADED context-check-stores: gc rig list failed/timed out/returned nothing parseable — using static fallback ($CONTEXT_CHECK_STORES)."
+      notify -t "Context-check dispatcher" -p 4 "🚨 gc rig list falhou/vazio — usando lista estatica de fallback, cobertura pode estar incompleta" 2>/dev/null || true
+    fi
+  fi
+fi
 
 _fetch_type() {
   bd_ list --type "$1" --status open \

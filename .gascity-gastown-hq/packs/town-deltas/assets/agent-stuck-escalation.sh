@@ -148,6 +148,8 @@ IDLE_CPU_SAMPLE_SEC="${IDLE_CPU_SAMPLE_SEC:-5}"  # ga-nrkh92: intervalo entre as
 MAYOR_ADDR="${MAYOR_ADDR:-mayor}"
 DRY_RUN="${DRY_RUN:-0}"
 # Bead stores to scan (space-separated paths; HQ must be .gascity-gastown-hq, NOT the gt root)
+_ESCALATION_STORES_CALLER_SET=0
+[ -n "${ESCALATION_STORES:-}" ] && _ESCALATION_STORES_CALLER_SET=1
 ESCALATION_STORES="${ESCALATION_STORES:-/Users/athos/gt/.gascity-gastown-hq /Users/athos/gt/whatsapp_automation /Users/athos/gt/property_scrapers}"
 
 # ── Escalation router (Layer 1, ga-qw3p.1) ───────────────────────────────────
@@ -170,6 +172,26 @@ if [ "$DRY_RUN" != "1" ]; then
 fi
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [agent-stuck] $*"; }
+
+# ga-wz03iq: derive ESCALATION_STORES from the live rig list instead of the
+# static 3 above — same bug class as ga-3xfndz: a rig added to `gc rig list`
+# since this default was written (lexbh, marketing, gastown, deacon) was never
+# scanned for stuck agents. This file has no inline --selftest CLI flag — its
+# sibling agent-stuck-escalation.selftest.sh instead runs the real script as a
+# subprocess with GC="$SHIM/gc" already set in the environment, so this call
+# is hermetic by construction there (routes through the shim, not production).
+if [ "$_ESCALATION_STORES_CALLER_SET" != "1" ]; then
+  _esc_rig_stores_lib="${CITY}/scripts/lib/rig-stores.sh"
+  if [ -r "$_esc_rig_stores_lib" ]; then
+    . "$_esc_rig_stores_lib"
+    if _esc_dyn=$(rig_stores_paths "$GC"); then
+      ESCALATION_STORES="$_esc_dyn"
+    else
+      log "DEGRADED escalation-stores: gc rig list failed/timed out/returned nothing parseable — using static fallback ($ESCALATION_STORES)."
+      "$NOTIFY" -t "Agent Stuck Escalation" -p 4 "🚨 gc rig list falhou/vazio — usando lista estatica de fallback, cobertura pode estar incompleta" 2>/dev/null || true
+    fi
+  fi
+fi
 
 # transcript_is_advancing (ga-hehi; tri-state hardened by ga-4tmc): a live
 # session is NOT proof of progress — `gc session list` shows "active"

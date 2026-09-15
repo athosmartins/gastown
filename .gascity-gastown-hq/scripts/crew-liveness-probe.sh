@@ -87,6 +87,8 @@ CLP_ENABLED="${CLP_ENABLED:-0}"
 CLP_HEAL_ENABLED="${CLP_HEAL_ENABLED:-0}"
 CLP_PROBE_STALE_MIN="${CLP_PROBE_STALE_MIN:-15}"
 CLP_CONFIRM_MIN="${CLP_CONFIRM_MIN:-8}"
+_CLP_STORES_CALLER_SET=0
+[ -n "${CLP_STORES:-}" ] && _CLP_STORES_CALLER_SET=1
 CLP_STORES="${CLP_STORES:-/Users/athos/gt/.gascity-gastown-hq /Users/athos/gt/whatsapp_automation /Users/athos/gt/property_scrapers}"
 CLP_DRY_RUN="${CLP_DRY_RUN:-0}"
 BD="${CLP_BD:-bd}"
@@ -112,6 +114,32 @@ notify_fail() { "$CLP_NOTIFY" -t "Crew Liveness Probe" -p 4 "🚨 $*" 2>/dev/nul
 # alarm. This is the concrete fix for "ninguem ve" — a heal used to leave no
 # trace anyone would proactively see; now it pushes.
 notify_info() { "$CLP_NOTIFY" -t "Crew Liveness Probe" "$*" 2>/dev/null || true; }
+
+# ga-wz03iq: derive CLP_STORES from the live rig list instead of the static 3
+# above — same bug class as ga-3xfndz (lifecycle-coherence-janitor.sh): a rig
+# added to `gc rig list` since this default was written (lexbh, marketing,
+# gastown, deacon) was never probed for stuck crews. Skipped under --selftest
+# for the same reason as ga-3xfndz — this file's own --selftest exercises the
+# detect/nudge/heal logic in-process and must not shell out to a real `gc rig
+# list` on every hermetic run.
+# NOTE for Scenario 35's structural detector: this "$GC ... --json" call lives
+# in the sourced lib/rig-stores.sh, not inline here, so it's outside that
+# scenario's grep — deliberately: rig_stores_tsv has its own equivalent guard
+# (timeout-bounded, parse-or-fail, never a truncated "success"), independently
+# selftested in lib/rig-stores.sh itself, so routing it through this script's
+# own _load_gc_json would duplicate rather than close a gap.
+if [ "$_CLP_STORES_CALLER_SET" != "1" ] && [ "${1:-}" != "--selftest" ]; then
+  _clp_rig_stores_lib="${CLP_CITY}/scripts/lib/rig-stores.sh"
+  if [ -r "$_clp_rig_stores_lib" ]; then
+    . "$_clp_rig_stores_lib"
+    if _clp_dyn=$(rig_stores_paths "$GC"); then
+      CLP_STORES="$_clp_dyn"
+    else
+      log "DEGRADED clp-stores: gc rig list failed/timed out/returned nothing parseable — using static fallback ($CLP_STORES)."
+      notify_fail "crew-liveness-probe: gc rig list falhou/vazio nesta execucao — usando lista estatica de fallback, cobertura pode estar incompleta"
+    fi
+  fi
+fi
 
 _nudge() {  # crew-id bead-id
   [ "$CLP_DRY_RUN" = "1" ] && { log "  DRY: would nudge $1 about bead $2"; return 0; }

@@ -74,7 +74,30 @@ SOURCE="wisp-reaper"
 # the gate/session machinery; the rig stores are swept too for completeness (a
 # store with no nudge ephemerals simply yields 0 — cheap).
 DEFAULT_STORES="/Users/athos/gt/.gascity-gastown-hq /Users/athos/gt/whatsapp_automation /Users/athos/gt/property_scrapers"
+_WISP_REAPER_STORES_CALLER_SET=0
+[ -n "${WISP_REAPER_STORES:-}" ] && _WISP_REAPER_STORES_CALLER_SET=1
 STORES="${WISP_REAPER_STORES:-$DEFAULT_STORES}"
+WISP_REAPER_GC="${WISP_REAPER_GC:-gc}"
+
+# ga-wz03iq: derive STORES from the live rig list instead of the static 3
+# above — same bug class as ga-3xfndz: a rig added to `gc rig list` since this
+# default was written (lexbh, marketing, gastown, deacon) was never swept for
+# stale wisps. Skipped in lib-only mode (WISP_REAPER_LIB_ONLY=1, this file's
+# own hermetic-selftest seam, see the header comment above) — sourcing this
+# file for its pure decision helpers must not shell out to a real `gc rig
+# list`.
+if [ "$_WISP_REAPER_STORES_CALLER_SET" != "1" ] && [ "${WISP_REAPER_LIB_ONLY:-0}" != "1" ]; then
+  _wisp_reaper_rig_stores_lib="$GC_CITY/scripts/lib/rig-stores.sh"
+  if [ -r "$_wisp_reaper_rig_stores_lib" ]; then
+    . "$_wisp_reaper_rig_stores_lib"
+    if _wr_dyn=$(rig_stores_paths "$WISP_REAPER_GC"); then
+      STORES="$_wr_dyn"
+    else
+      mkdir -p "$LOG_DIR" 2>/dev/null || true
+      echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"source\":\"$SOURCE\",\"event\":\"degraded\",\"reason\":\"gc rig list failed/timed out/empty - using static store fallback\",\"fallback\":\"$STORES\"}" >> "$LOG" 2>/dev/null || true
+    fi
+  fi
+fi
 
 ENABLED="${WISP_REAPER_ENABLED:-1}"           # 0 = report-only (would_close), do not mutate
 DRY_RUN="${WISP_REAPER_DRY_RUN:-0}"           # 1 = report-only (alias of ENABLED=0 semantics)

@@ -27,9 +27,31 @@ HQ="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
 LOG="$HQ/.gc/logs/routed-to-eraser-capture.log"
 PREV="/tmp/routed-to-eraser-capture.prev"
 INTERVAL="${CAPTURE_INTERVAL:-120}"
+CAPTURE_GC="${CAPTURE_GC:-gc}"
 
 mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] capture iniciado (intervalo ${INTERVAL}s, read-only)" >> "$LOG"
+
+# ga-wz03iq: same class of bug as ga-3xfndz — the 3 hardcoded stores below
+# (never even env-overridable before this fix) never grew past HQ/WA/PS, so
+# the exact phenomenon this script hunts (gc.routed_to disappearing) was
+# invisible if it ever happened in lexbh/marketing/gastown/deacon. Derived
+# ONCE here, not per-cycle inside the while loop below: this script's own
+# header warns against adding cost to that 120s loop (ga-y0g5x: an
+# over-frequent watchdog once took down the city's bd). A rig-list change
+# mid-run just waits for the next process restart to be picked up — fine for
+# a forensic capture tool. Falls back to the static 3 (unchanged behavior) on
+# any derivation failure, logged (never silent).
+CAPTURE_STORES="$HQ /Users/athos/gt/whatsapp_automation /Users/athos/gt/property_scrapers"
+_capture_rig_stores_lib="$HQ/scripts/lib/rig-stores.sh"
+if [ -r "$_capture_rig_stores_lib" ]; then
+  . "$_capture_rig_stores_lib"
+  if _cap_dyn=$(rig_stores_paths "$CAPTURE_GC"); then
+    CAPTURE_STORES="$_cap_dyn"
+  else
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] DEGRADED: gc rig list falhou/vazio — usando lista estatica de fallback ($CAPTURE_STORES)" >> "$LOG"
+  fi
+fi
 
 while true; do
   # --limit 0 obrigatorio: bd list trunca em 50 sem sinal no JSON (ga-21kmp).
@@ -42,7 +64,7 @@ while true; do
   # do fenomeno. O id ja carrega o prefixo do rig, entao o flagrante continua
   # identificavel sem marcar a loja separadamente.
   SNAP=""
-  for _STORE in "$HQ" /Users/athos/gt/whatsapp_automation /Users/athos/gt/property_scrapers; do
+  for _STORE in $CAPTURE_STORES; do
     [ -d "$_STORE" ] || continue
     _PART=$(bd -C "$_STORE" list --all --limit 0 --json 2>/dev/null \
       | jq -rc '.[] | select(.status=="open")

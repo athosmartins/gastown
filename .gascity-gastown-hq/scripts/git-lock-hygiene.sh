@@ -76,7 +76,13 @@ GIT_REPO_MUTEX_BASE="${GIT_REPO_MUTEX_BASE:-/tmp/gc-git-repo-mutex}"
 
 # Rig roots — colon-separated list of git repo roots to scan.
 # The town root /Users/athos/gt covers HQ (.gascity-gastown-hq) and gastown subrepo.
+# Captured BEFORE the default-fill: the only point that can tell "caller passed
+# GIT_LOCK_RIG_ROOTS" apart from "using the built-in default" (ga-wz03iq test seam,
+# same pattern as lifecycle-coherence-janitor.sh/ga-3xfndz).
+_GIT_LOCK_ROOTS_CALLER_SET=0
+[ -n "${GIT_LOCK_RIG_ROOTS:-}" ] && _GIT_LOCK_ROOTS_CALLER_SET=1
 GIT_LOCK_RIG_ROOTS="${GIT_LOCK_RIG_ROOTS:-/Users/athos/gt:/Users/athos/gt/whatsapp_automation:/Users/athos/gt/property_scrapers}"
+GIT_LOCK_GC="${GIT_LOCK_GC:-gc}"
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -84,6 +90,57 @@ _log_json() {
   # emit a JSON event to LOG; always succeeds (LOG write failures are non-fatal)
   printf '%s\n' "$*" >> "$LOG" 2>/dev/null || true
 }
+
+# ── GIT_LOCK_RIG_ROOTS: derived from the live rig list, not hardcoded (ga-wz03iq) ──
+# Same bug CLASS as ga-3xfndz (lifecycle-coherence-janitor.sh): the static 3-root
+# default above never followed `gc rig list` past its original HQ/WA/PS shape, so
+# a rig added since (lexbh, marketing, gastown, deacon) was silently never scanned
+# for stale locks. Widening this is safe even for a rig whose git repo isn't at
+# the bare rig-root path — lexbh/gastown are Family-A container rigs
+# (rig-repo-topology memory) whose real .git lives in a nested crew/refinery
+# clone, not at this root — because _scan_repo()'s own `[ -d "$git_dir" ]` check
+# (git_dir="$repo/.git") already no-ops harmlessly when a root isn't a git repo
+# directly: an inapplicable rig root costs one skipped iteration, never a false
+# action. `marketing` (a genuine self-repo rig, Family B) is real new coverage.
+# Skipped under --selftest for the same reason as ga-3xfndz: this script's own
+# --selftest exercises _scan_repo()/_is_stale() in-process and must not shell
+# out to a real `gc rig list` on every hermetic run.
+if [ "$_GIT_LOCK_ROOTS_CALLER_SET" != "1" ] && [ "${1:-}" != "--selftest" ]; then
+  _git_lock_rig_stores_lib="${CITY}/scripts/lib/rig-stores.sh"
+  if [ -r "$_git_lock_rig_stores_lib" ]; then
+    . "$_git_lock_rig_stores_lib"
+    if _glh_rig_paths=$(rig_stores_paths "$GIT_LOCK_GC" 20 " "); then
+      # rig_stores_paths gives bd-STORE paths, which are NOT the same as git repo
+      # roots: HQ's store (.gascity-gastown-hq) has no .git of its own — the real
+      # repo root is its parent /Users/athos/gt — and lexbh/gastown are Family-A
+      # container rigs (rig-repo-topology memory) with the same kind of gap.
+      # Resolving each candidate through git itself (rather than assuming
+      # rig-path==repo-root, the exact mistake that memory warns against) fixes
+      # this: `rev-parse --show-toplevel` walks up to the real root, returns the
+      # path unchanged if it's already one, or fails harmlessly (2s-bounded,
+      # skipped below) for a rig with no git reachable at all (deacon).
+      # Deduplicated: gascity/gastown/deacon all resolve to the same
+      # /Users/athos/gt when none has its own .git — scanning it 3x would be
+      # wasted (not wrong; _scan_repo is idempotent), never scanned twice here.
+      _glh_resolved=""
+      for _glh_p in $_glh_rig_paths; do
+        _glh_top=$(timeout 2 git -C "$_glh_p" rev-parse --show-toplevel 2>/dev/null) || continue
+        case " $_glh_resolved " in
+          *" $_glh_top "*) ;;  # already have this root
+          *) _glh_resolved="${_glh_resolved:+$_glh_resolved }$_glh_top" ;;
+        esac
+      done
+      if [ -n "$_glh_resolved" ]; then
+        GIT_LOCK_RIG_ROOTS="$(printf '%s' "$_glh_resolved" | tr ' ' ':')"
+      else
+        _log_json "{\"ts\":\"$(ts)\",\"event\":\"degraded\",\"reason\":\"gc rig list ok but no rig resolved to a git toplevel - using static rig-root fallback\",\"fallback\":\"$GIT_LOCK_RIG_ROOTS\"}"
+      fi
+    else
+      _log_json "{\"ts\":\"$(ts)\",\"event\":\"degraded\",\"reason\":\"gc rig list failed/timed out/empty - using static rig-root fallback\",\"fallback\":\"$GIT_LOCK_RIG_ROOTS\"}"
+      [ -x "$NOTIFY_BIN" ] && "$NOTIFY_BIN" -t "Git-lock hygiene" -p 4 "🚨 gc rig list falhou/vazio — usando lista estatica de fallback, cobertura pode estar incompleta" 2>/dev/null || true
+    fi
+  fi
+fi
 
 # Age (s) of a path's mtime; 999999999 if missing.
 _path_age() {

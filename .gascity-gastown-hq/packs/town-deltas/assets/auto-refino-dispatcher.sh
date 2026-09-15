@@ -101,7 +101,10 @@ unset _AUTO_REFINO_QHC_SIB
 # rest (a later sweep moves to the next store). Critically, query AND write-back
 # (claim, refiner task heredoc, outcome) all target the bead's OWN store — a WA
 # story's labels/comments/metadata land in the WA store, never in HQ.
+_AUTO_REFINO_STORES_CALLER_SET=0
+[ -n "${AUTO_REFINO_STORES:-}" ] && _AUTO_REFINO_STORES_CALLER_SET=1
 AUTO_REFINO_STORES="${AUTO_REFINO_STORES:-$GC_CITY /Users/athos/gt/whatsapp_automation /Users/athos/gt/property_scrapers}"
+AUTO_REFINO_GC="${AUTO_REFINO_GC:-gc}"
 
 LOG_DIR="$GC_CITY/.gc/logs"
 LOG="$LOG_DIR/auto-refino-dispatcher.log"
@@ -212,6 +215,27 @@ ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log()  { echo "[$(ts)] $*" | tee -a "$LOG" >/dev/null 2>&1 || echo "[$(ts)] $*"; }
 warn() { echo "[$(ts)] WARN: $*" | tee -a "$LOG" >/dev/null 2>&1 || echo "[$(ts)] WARN: $*"; }
 err()  { echo "[$(ts)] ERROR: $*" | tee -a "$LOG" >/dev/null 2>&1 || echo "[$(ts)] ERROR: $*"; }
+
+# ga-wz03iq: derive AUTO_REFINO_STORES from the live rig list instead of the
+# static HQ+WA+PS default above — same bug class this file's own header
+# comment already documents for the pre-multi-store bug (a story outside the
+# queried set is invisible to the funnel forever): a rig added to `gc rig
+# list` since this default was written (lexbh, marketing, gastown, deacon)
+# is silently never refined. This file has no inline --selftest CLI flag —
+# its sibling auto-refino-dispatcher.selftest.sh instead runs the real script
+# as a subprocess with its own gc/bd shims already set in the environment.
+if [ "$_AUTO_REFINO_STORES_CALLER_SET" != "1" ]; then
+  _ar_rig_stores_lib="${GC_CITY}/scripts/lib/rig-stores.sh"
+  if [ -r "$_ar_rig_stores_lib" ]; then
+    . "$_ar_rig_stores_lib"
+    if _ar_dyn=$(rig_stores_paths "$AUTO_REFINO_GC"); then
+      AUTO_REFINO_STORES="$_ar_dyn"
+    else
+      warn "DEGRADED auto-refino-stores: gc rig list failed/timed out/returned nothing parseable — using static fallback ($AUTO_REFINO_STORES)."
+      "${NOTIFY_BIN:-notify}" -t "Auto-refino dispatcher" -p 4 "🚨 gc rig list falhou/vazio — usando lista estatica de fallback, cobertura pode estar incompleta" 2>/dev/null || true
+    fi
+  fi
+fi
 
 DRY_RUN="${DRY_RUN:-0}"
 

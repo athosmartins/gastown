@@ -377,10 +377,46 @@ fi
 # dispatched = 0 throughput). bd_ targets the store of the story currently being
 # processed (REFINO_GATE_STORE), set per-story after selection (and per stuck bead
 # in the TTL loop). Default = HQ.
+_REFINO_GATE_STORES_CALLER_SET=0
+[ -n "${REFINO_GATE_STORES:-}" ] && _REFINO_GATE_STORES_CALLER_SET=1
 REFINO_GATE_STORES="${REFINO_GATE_STORES:-$GC_CITY /Users/athos/gt/whatsapp_automation /Users/athos/gt/property_scrapers}"
 REFINO_GATE_STORE="${REFINO_GATE_STORE:-$GC_CITY}"
+REFINO_GATE_GC="${REFINO_GATE_GC:-gc}"
+
+# ga-wz03iq: derive REFINO_GATE_STORES AND the prefix->store map from ONE live
+# rig-list call — same bug class as ga-3xfndz: a rig added to `gc rig list`
+# since these defaults were written (lexbh, marketing, gastown, deacon) was
+# never queued for refino-gate review, and any of its stories that DID get
+# discovered by some other path would still misresolve to $GC_CITY below (the
+# exact "hardwired bd -C HQ left 13 WA features stuck" bug this file's own
+# header already fixed once for wa/ps specifically). _REFINO_GATE_TSV is
+# empty when derivation is unavailable (caller override or gc rig list
+# failure) — _refino_store_for()'s static case below is the fallback either
+# way, unchanged from before this fix.
+_REFINO_GATE_TSV=""
+if [ "$_REFINO_GATE_STORES_CALLER_SET" != "1" ]; then
+  _refino_rig_stores_lib="${GC_CITY}/scripts/lib/rig-stores.sh"
+  if [ -r "$_refino_rig_stores_lib" ]; then
+    . "$_refino_rig_stores_lib"
+    if _REFINO_GATE_TSV=$(rig_stores_tsv "$REFINO_GATE_GC"); then
+      REFINO_GATE_STORES=$(printf '%s\n' "$_REFINO_GATE_TSV" | cut -f2 | paste -sd ' ' -)
+    else
+      _REFINO_GATE_TSV=""
+      log "DEGRADED refino-gate-stores: gc rig list failed/timed out/returned nothing parseable — using static fallback ($REFINO_GATE_STORES)."
+      notify -t "Refino-gate dispatcher" -p 4 "🚨 gc rig list falhou/vazio — usando lista estatica de fallback, cobertura pode estar incompleta" 2>/dev/null || true
+    fi
+  fi
+fi
 _refino_store_for() {  # resolve a bead's store from its id prefix
-  case "${1%%-*}" in
+  local prefix="${1%%-*}" hit
+  if [ -n "$_REFINO_GATE_TSV" ]; then
+    hit=$(rig_store_for_prefix "$prefix" "$_REFINO_GATE_TSV" 2>/dev/null) || hit=""
+    [ -n "$hit" ] && { echo "$hit"; return; }
+  fi
+  # Static fallback — reached when derivation is unavailable (caller set
+  # REFINO_GATE_STORES explicitly, gc rig list failed) or the prefix isn't a
+  # live rig (unrecognized ids default to HQ, same as before this fix).
+  case "$prefix" in
     wa) echo "/Users/athos/gt/whatsapp_automation" ;;
     ps) echo "/Users/athos/gt/property_scrapers" ;;
     *)  echo "$GC_CITY" ;;
