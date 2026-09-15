@@ -104,11 +104,12 @@ _STATIC_FALLBACK_RIG_STORES = [
 def _rig_stores():
     """Non-HQ rig store paths (name, path). The gate's HQ store is excluded — a marker
     already in HQ is found by the gate, not orphaned. Returns None if the live rig
-    list could not be derived (gc missing/non-zero/timed out/unparseable) — the
-    caller decides the fallback. ga-vjybz8: this used to swallow any such failure
-    and silently return [] (indistinguishable from a `gc rig list` that ran fine
-    and genuinely found zero non-HQ rigs); the caller now gets an explicit "don't
-    know" signal instead."""
+    list could not be derived: gc missing/non-zero/timed out/unparseable, OR gc
+    succeeded but yielded zero usable rigs (empty JSON, or every entry filtered out
+    by the hq/path/isdir checks) — the caller decides the fallback. ga-vjybz8: this
+    used to swallow any such case and silently return [] (indistinguishable from a
+    `gc rig list` that ran fine and genuinely found zero non-HQ rigs); the caller
+    now gets an explicit "don't know" signal instead, in both failure shapes."""
     if _rig_stores_fn is not None:
         return _rig_stores_fn()
     r = _sh([GC_BIN, "--city", CITY, "rig", "list", "--json"], timeout=BD_TIMEOUT)
@@ -127,6 +128,8 @@ def _rig_stores():
         p = rig.get("path")
         if p and p != CITY and os.path.isdir(p):
             out.append((rig.get("name") or os.path.basename(p), p))
+    if not out:
+        return None
     return out
 
 
@@ -357,6 +360,31 @@ def _selftest():
         _bad("D2: run_cycle did not notify the degraded-stores fallback",
              "n=%d notified=%s" % (n, notified))
     GC_BIN = _saved_gc_bin
+    _rig_stores_fn = lambda: [("whatsapp_automation", "/WA")]
+
+    print("Scenario D3 (ga-vjybz8 gate attempt 3): _rig_stores() must return None even "
+          "when gc rig list SUCCEEDS but yields zero usable rigs (empty JSON, or every "
+          "entry filtered out by the hq/path/isdir checks) — distinct from D1's 'gc call "
+          "failed outright'. run_cycle()'s only guard is `if stores is None`, so an "
+          "unguarded [] here reads as 'confirmed nothing to scan': zero rigs get swept, "
+          "no DEGRADED log, no notify — the exact ga-p5q3 third-state collapse this bead "
+          "exists to close, reproduced via valid-but-empty gc output instead of a failed "
+          "gc call.")
+    _rig_stores_fn = None  # exercise the REAL _rig_stores() body, not the test seam
+    _saved_gc_bin2 = GC_BIN
+    _saved_run = subprocess.run
+    GC_BIN = "gc"  # never actually invoked — subprocess.run is stubbed below
+    subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a, 0, '{"rigs": []}', "")
+    try:
+        r = _rig_stores()
+    finally:
+        subprocess.run = _saved_run
+        GC_BIN = _saved_gc_bin2
+    if r is None:
+        _ok("D3: _rig_stores() returns None when gc succeeds with zero usable rigs "
+            "(never conflated with a real zero-rigs success)")
+    else:
+        _bad("D3: _rig_stores() must return None on empty-but-successful gc output", str(r))
     _rig_stores_fn = lambda: [("whatsapp_automation", "/WA")]
 
     print("\n[gate-marker-rehome selftest] %d passed, %d failed" % (ok[0], bad[0]))
