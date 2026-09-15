@@ -573,7 +573,11 @@ def main():
     if os.environ.get("PROD_STALL_WATCHDOG_ENABLED", "1") == "0":
         print("[prod-stall] disabled via PROD_STALL_WATCHDOG_ENABLED=0 — no-op", flush=True)
         return
-    _resolve_dynamic_rig_roots()
+    try:
+        _resolve_dynamic_rig_roots()
+    except Exception as e:
+        print("[prod-stall] _resolve_dynamic_rig_roots failed unexpectedly (%r) — "
+              "keeping static RIG_ROOTS" % e, flush=True)
     state = new_state()
     print("[prod-stall] production-stall watchdog started — deploy-block + merge-stall + "
           "stuck-exec; anti-flap hysteresis + per-dim cooldown; escalates to MAYOR "

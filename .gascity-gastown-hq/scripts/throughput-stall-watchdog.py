@@ -2525,7 +2525,10 @@ def main():
         _log("disabled via TSW_ENABLED=0 — no-op")
         return
 
-    _resolve_dynamic_rig_roots()
+    try:
+        _resolve_dynamic_rig_roots()
+    except Exception as e:
+        _log("_resolve_dynamic_rig_roots failed unexpectedly (%r) — keeping static RIG_ROOTS" % e)
 
     _log("throughput-stall watchdog started — backlog cross-check vs dispatch+merge "
          "(window=%.0fh, confirm=%d sweeps, backlog_min=%d, poll=%ds, cooldown=%ds)" % (
