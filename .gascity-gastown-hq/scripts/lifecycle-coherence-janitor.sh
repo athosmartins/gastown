@@ -59,6 +59,15 @@
 # when queued-dispatch becomes load-bearing.
 set -uo pipefail
 
+# ga-3xfndz: captured BEFORE the default-fill below, since after that line
+# LCJ_STORES is never empty again — this is the ONLY point in the script
+# that can tell "caller passed LCJ_STORES" apart from "using the built-in
+# default", which the derivation block further down needs (test seam: an
+# explicit LCJ_STORES, from a real env var OR the --selftest block's own
+# later reassignment, must always win over dynamic derivation).
+_LCJ_STORES_CALLER_SET=0
+[ -n "${LCJ_STORES:-}" ] && _LCJ_STORES_CALLER_SET=1
+
 LCJ_STORES="${LCJ_STORES:-/Users/athos/gt/.gascity-gastown-hq /Users/athos/gt/whatsapp_automation /Users/athos/gt/property_scrapers}"
 LCJ_DRY_RUN="${LCJ_DRY_RUN:-0}"
 LCJ_ENABLED="${LCJ_ENABLED:-1}"
@@ -95,6 +104,79 @@ _bead_locked() {  # bead-id → return 0 if locked (fresh advisory lock exists),
 ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || true; echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
 notify_fail() { "$LCJ_NOTIFY" -t "Lifecycle Coherence Janitor" -p 4 "🚨 $*" 2>/dev/null || true; }
+
+# ── LCJ_STORES: derived from the live rig list, not hardcoded (ga-3xfndz) ────
+# Born 2026-06-22 with 3 stores (HQ/whatsapp_automation/property_scrapers)
+# hardcoded and never revisited. `gc rig list` grew to 7 rigs since (lexbh,
+# marketing, gastown, deacon added) and this file's default never followed —
+# R6's pilot:held-expiry undefer (and R1-R5/R7/R8) silently never reached
+# those 4 stores. Confirmed live: lx-fdl sat past its own pilot:held-until
+# for 19 days, invisible to `bd ready`, because R6 never walked lexbh.
+#
+# UNLIKE root-class-count.sh's derivation (which hard-FATALs when `gc rig
+# list` fails — correct THERE because a one-shot count silently sampling a
+# partial store list is itself the exact bug class that script measures),
+# this is a long-running sweep on a 10min timer: aborting because `gc rig
+# list` hiccuped would make the janitor LESS reliable, not more. So failure
+# here falls back to the static list above (already the value LCJ_STORES
+# holds at this point) and logs DEGRADED loudly instead — never fewer
+# stores AND silent, never zero, never a hard stop.
+#
+# `gc rig list` alone can take 8-17s under load (ga-eu2x) — bounded so a
+# slow city never blocks a sweep indefinitely.
+#
+# Test seam (requirement, ga-3xfndz): an LCJ_STORES the caller explicitly
+# set — a real env var, OR the --selftest block's own later `LCJ_STORES="$TMP"`
+# reassignment — always wins; derivation never runs in that case. Skipped
+# entirely under --selftest for a second, independent reason: at the point
+# this code runs, GC is still the REAL `gc` binary (the --selftest block
+# only swaps GC to its hermetic shim after this point, at run_sweep() call
+# time), so running derivation there would shell out to production `gc rig
+# list` on every hermetic test run — slow, flaky-if-gc-unavailable, and a
+# pointless call since --selftest overrides LCJ_STORES again immediately
+# after anyway. See memory hermetic-selftest-cannot-test-the-bootstrap-it-
+# stubs: because --selftest skips this block, IT PROVIDES ZERO COVERAGE of
+# the derivation logic itself — that gap is closed separately by
+# --print-stores below plus the two real-subprocess bootstrap checks inside
+# --selftest's own script (search "print-stores" in this file), not by
+# adding assertions inside this block.
+_lcj_derive_stores() {
+  timeout 20 "$GC" rig list --json 2>/dev/null | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+rigs = d if isinstance(d, list) else (d.get("rigs") or [])
+out = []
+for r in rigs:
+    if not isinstance(r, dict):
+        continue
+    p = (r.get("path") or r.get("work_dir") or "").strip()
+    if p and p not in out:
+        out.append(p)
+if not out:
+    sys.exit(1)
+print(" ".join(out))
+' 2>/dev/null
+}
+if [ "$_LCJ_STORES_CALLER_SET" != "1" ] && [ "${1:-}" != "--selftest" ]; then
+  _lcj_dyn=$(_lcj_derive_stores)
+  if [ -n "$_lcj_dyn" ]; then
+    LCJ_STORES="$_lcj_dyn"
+  else
+    log "DEGRADED lcj-stores: 'gc rig list' failed/timed out/returned nothing parseable — using static fallback ($LCJ_STORES). Coverage may be INCOMPLETE (any rig not in this static list, e.g. one added since) until the next successful derivation."
+    notify_fail "lifecycle-coherence-janitor: gc rig list falhou/vazio nesta execucao — usando lista estatica de fallback, cobertura pode estar incompleta"
+  fi
+fi
+# Cheap introspection seam for the bootstrap-coverage tests noted above:
+# print the REAL, fully-resolved LCJ_STORES and exit — no store is touched,
+# no bead is read. Lets a test invoke this script as a genuine subprocess
+# (not sourced/stubbed) and assert on the derived list itself.
+if [ "${1:-}" = "--print-stores" ]; then
+  printf '%s\n' "$LCJ_STORES"
+  exit 0
+fi
 
 _strip() {  # store id label
   [ "$LCJ_DRY_RUN" = "1" ] && { log "  DRY: would strip $3 from $2"; return 0; }
@@ -489,6 +571,11 @@ run_sweep() {
   # imp10: sweep-level mutual exclusion — only one janitor sweep at a time.
   mkdir -p "$LIFECYCLE_LOCK_DIR" 2>/dev/null || true
   exec 9>"$LIFECYCLE_SWEEP_LOCK" && flock -n 9 2>/dev/null || { log "sweep: concurrent sweep in progress (flock) — skipping"; return 0; }
+  # ga-3xfndz req#4: log the effective store list every sweep, regardless of
+  # whether it came from an explicit override, live derivation, or the
+  # static DEGRADED fallback — so "which rigs did R1-R8 actually walk this
+  # run" is always answerable from the log alone.
+  log "lcj-stores efetivos: $LCJ_STORES"
   local store id n=0 lbl
   # ga-ibz0: computed ONCE per sweep (same marker set regardless of which
   # store's beads R3/R7 are currently walking) — see _gate_active_beads above.
@@ -1505,6 +1592,86 @@ GITSHIM
   # DRY-RUN makes no changes
   : > "$ACT"; LCJ_DRY_RUN=1; run_sweep
   [ ! -s "$ACT" ] && ok "DRY_RUN performs zero mutations" || bad "DRY_RUN mutated beads"
+
+  # ── Bootstrap coverage for the LCJ_STORES derivation (ga-3xfndz) ───────────
+  # Every assertion above ran run_sweep() in-process with GC/BD/LCJ_NOTIFY
+  # already swapped to hermetic shims — but the derivation block explicitly
+  # skips itself whenever "${1:-}" = "--selftest" (see that block's own
+  # comment, right after notify_fail() near the top of this file), precisely
+  # so those ~200 assertions never shell out to the real `gc` binary. That
+  # means NONE of them exercise the derivation code at all. Per memory
+  # hermetic-selftest-cannot-test-the-bootstrap-it-stubs: a selftest that
+  # early-returns/skips past a bootstrap section proves nothing about that
+  # section, no matter how much runs on the other side of the skip — the
+  # fix there was a real mol-dog-backup script that passed 20/20 while a
+  # line past its own lib-mode early-return would have killed every Dolt
+  # backup city-wide. Close that gap the same way: invoke the REAL script
+  # file as a genuine subprocess (bash "$0" --print-stores) — never
+  # sourced, never stubbed — so the derivation lines actually execute.
+  # LCJ_LOG/LCJ_NOTIFY are always overridden to $TMP paths (reusing the
+  # existing notify shim) so these calls never touch the real janitor log
+  # or fire a real push notification.
+  BOOT_LOG="$TMP/boot.log"
+
+  # 1. Test seam (requirement #3): explicit LCJ_STORES wins over derivation
+  #    even with a broken GC — this is also what every assertion ABOVE this
+  #    point implicitly relies on (LCJ_STORES="$TMP" at selftest setup).
+  _boot_override=$(LCJ_STORES="fixture-a fixture-b" LCJ_GC="$TMP/does-not-exist" LCJ_LOG="$BOOT_LOG" LCJ_NOTIFY="$TMP/notify" bash "$0" --print-stores 2>/dev/null)
+  [ "$_boot_override" = "fixture-a fixture-b" ] \
+    && ok "bootstrap (ga-3xfndz): explicit LCJ_STORES wins over derivation even with a broken GC" \
+    || bad "bootstrap (ga-3xfndz): explicit LCJ_STORES was not honored verbatim (got: '$_boot_override')"
+
+  # 2. Derivation FAILS (gc exits non-zero) → falls back to the ORIGINAL
+  #    static 3-store default — this file's entire behavior before
+  #    ga-3xfndz — never empty, never a crash, and logs+notifies DEGRADED
+  #    rather than failing silently.
+  cat > "$TMP/gc-broken" <<'BROKENSHIM'
+#!/usr/bin/env bash
+exit 1
+BROKENSHIM
+  chmod +x "$TMP/gc-broken"
+  : > "$BOOT_LOG"; : > "$NOTIFY_LOG"
+  _boot_fallback=$(LCJ_GC="$TMP/gc-broken" LCJ_LOG="$BOOT_LOG" LCJ_NOTIFY="$TMP/notify" bash "$0" --print-stores 2>/dev/null)
+  [ "$_boot_fallback" = "/Users/athos/gt/.gascity-gastown-hq /Users/athos/gt/whatsapp_automation /Users/athos/gt/property_scrapers" ] \
+    && ok "bootstrap (ga-3xfndz): gc rig list failure falls back to the static 3-store default" \
+    || bad "bootstrap (ga-3xfndz): fallback did not match the static default (got: '$_boot_fallback')"
+  grep -q 'DEGRADED lcj-stores' "$BOOT_LOG" 2>/dev/null \
+    && ok "bootstrap (ga-3xfndz): gc rig list failure logs DEGRADED (not silent)" \
+    || bad "bootstrap (ga-3xfndz): gc rig list failure did NOT log DEGRADED"
+  grep -q 'lifecycle-coherence-janitor' "$NOTIFY_LOG" 2>/dev/null \
+    && ok "bootstrap (ga-3xfndz): gc rig list failure fires a push notification (degradation is not silent)" \
+    || bad "bootstrap (ga-3xfndz): gc rig list failure did NOT notify"
+
+  # 3. Derivation SUCCEEDS with rigs beyond the static 3 — the actual bug
+  #    (lexbh/marketing/gastown/deacon were unreachable before this fix,
+  #    solely because they were never in the hardcoded list; lx-fdl sat
+  #    past its own pilot:held-until for 19 days as a result). REPROVA
+  #    against the pre-fix script — before ga-3xfndz, LCJ_STORES was
+  #    ALWAYS the static 3 regardless of what `gc rig list` returned, so
+  #    these 4 extra fixture rigs could never have appeared — and PASSES
+  #    after this fix.
+  mkdir -p "$TMP/rig-hq" "$TMP/rig-wa" "$TMP/rig-ps" "$TMP/rig-lexbh" "$TMP/rig-marketing" "$TMP/rig-gastown" "$TMP/rig-deacon"
+  cat > "$TMP/gc-multirig" <<GCMULTISHIM
+#!/usr/bin/env bash
+case "\$*" in
+  *"rig list --json"*) cat <<'JSON'
+{"rigs":[{"name":"gascity","path":"$TMP/rig-hq"},{"name":"whatsapp_automation","path":"$TMP/rig-wa"},{"name":"property_scrapers","path":"$TMP/rig-ps"},{"name":"lexbh","path":"$TMP/rig-lexbh"},{"name":"marketing","path":"$TMP/rig-marketing"},{"name":"gastown","path":"$TMP/rig-gastown"},{"name":"deacon","path":"$TMP/rig-deacon"}]}
+JSON
+    ;;
+  *) echo '{}' ;;
+esac
+GCMULTISHIM
+  chmod +x "$TMP/gc-multirig"
+  _boot_derived=$(LCJ_GC="$TMP/gc-multirig" LCJ_LOG="$BOOT_LOG" LCJ_NOTIFY="$TMP/notify" bash "$0" --print-stores 2>/dev/null)
+  case "$_boot_derived" in
+    *"rig-lexbh"*) ok "bootstrap (ga-3xfndz): derived LCJ_STORES includes a rig outside the old static 3 (lexbh) — the exact gap lx-fdl fell through" ;;
+    *) bad "bootstrap (ga-3xfndz): derived LCJ_STORES did NOT include lexbh (got: '$_boot_derived')" ;;
+  esac
+  _boot_derived_count=$(printf '%s\n' "$_boot_derived" | tr ' ' '\n' | grep -c .)
+  [ "$_boot_derived_count" -eq 7 ] \
+    && ok "bootstrap (ga-3xfndz): derived LCJ_STORES carries all 7 live rigs, none dropped" \
+    || bad "bootstrap (ga-3xfndz): expected 7 derived stores, got $_boot_derived_count ('$_boot_derived')"
+
   echo ""; echo "lifecycle-coherence-janitor selftest: PASS=$PASS FAIL=$FAIL"; [ "$FAIL" -eq 0 ] && exit 0 || exit 1
 fi
 
