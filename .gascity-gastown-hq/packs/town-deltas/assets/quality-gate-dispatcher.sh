@@ -1410,7 +1410,22 @@ gate_bead_live_merge_block() {
     printf 'closed'
     return 0
   fi
-  labels=$(printf '%s' "$raw" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || echo "")
+  # ga-360a7l: same guarded-assignment idiom as the raw/status reads above —
+  # and the same one gate_marker_label_snapshot() already uses a bit further
+  # down this file (gate-fix-3) for this identical jq expression. Without
+  # this guard, a raw payload that parses fine for `.status` but has a
+  # malformed `.labels` field (e.g. present as a non-array, which makes
+  # `join(" ")` itself error) would fall through the old `|| echo ""` idiom
+  # to labels="", and check_source_bead_park("") unconditionally returns
+  # "ok" — silently re-introducing this exact function's own bug for a
+  # narrower trigger (a labels-shape error instead of a whole-payload
+  # failure). "unknown" here folds into the same fail-safe callers both call
+  # sites already implement for the raw/status guards above.
+  if ! labels=$(printf '%s' "$raw" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null); then
+    GATE_LXZ5W_LIVE_RESULT="unknown"
+    printf 'unknown'
+    return 0
+  fi
   GATE_LXZ5W_LIVE_LABELS="$labels"
   GATE_LXZ5W_LIVE_RESULT="$(check_source_bead_park "$labels")"
   printf '%s' "$GATE_LXZ5W_LIVE_RESULT"

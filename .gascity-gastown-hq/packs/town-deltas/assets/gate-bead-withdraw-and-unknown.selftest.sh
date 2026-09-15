@@ -155,6 +155,27 @@ MOCK_SHOW_JSON='not valid json {{{'
 eq "bd show returns unparseable payload → unknown (not ok)" \
   "$(gate_bead_live_merge_block city 'ga-x')" "unknown"
 
+# ga-360a7l follow-up: raw parses fine and `.status` extracts cleanly (open,
+# not closed), but `.labels` is present with a non-array shape — `join(" ")`
+# errors on it. This is the narrower sibling of AC4(b): the SAME function's
+# labels-extraction line originally kept the file's old `|| echo ""` idiom
+# (unlike the raw/status reads a few lines above it, already guarded), so a
+# labels-shape error alone — with a perfectly good status read — used to
+# fall through to labels="" and check_source_bead_park("") => "ok". Mirrors
+# gate_marker_label_snapshot()'s existing guard for this identical jq
+# expression (gate-fix-3) — this function should never have been the odd
+# one out. MUST FAIL without that guard.
+MOCK_SHOW_JSON='[{"id":"ga-x","status":"open","labels":"not-an-array"}]'
+eq "bd show ok + status ok, but labels field is malformed (non-array) → unknown, not ok" \
+  "$(gate_bead_live_merge_block city 'ga-x')" "unknown"
+gate_bead_live_merge_block city 'ga-x' >/dev/null
+eq "  ...bare call agrees: GATE_LXZ5W_LIVE_RESULT=unknown" \
+  "$GATE_LXZ5W_LIVE_RESULT" "unknown"
+eq "  ...GATE_LXZ5W_LIVE_STATUS still reflects the status read that DID succeed (open)" \
+  "$GATE_LXZ5W_LIVE_STATUS" "open"
+eq "  ...and GATE_LXZ5W_LIVE_LABELS was never populated (the failing line never assigned it)" \
+  "$GATE_LXZ5W_LIVE_LABELS" ""
+
 # Unaffected regression guard: empty bead_id is still legitimately "ok" —
 # there is no bead to fail to read.
 eq "empty bead_id → ok (unaffected; never calls bd)" \

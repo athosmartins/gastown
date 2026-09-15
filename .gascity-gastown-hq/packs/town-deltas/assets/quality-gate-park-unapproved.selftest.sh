@@ -198,12 +198,13 @@ printf '%s\n' "$STEP5A_BLOCK" | grep -Eq 'mail send "\$_park_candidate"' \
 printf '%s\n' "$STEP5A_BLOCK" | grep -qF 'PARK_NOTIFY_CANDIDATES="$NOTIFY_AUTHOR"' \
   && ok "Step 5a candidate list is seeded from NOTIFY_AUTHOR (still author-derived, not an arbitrary target)" \
   || bad "Step 5a candidate list no longer seeded from NOTIFY_AUTHOR — may notify the wrong identity"
-# Both park reasons (needs-approval, needs-human) plus the fail-open default
-# each compute their own unblock hint — exactly 3 assignments, mirroring
-# ga-u4yi's "exactly N sites" counting style.
-eq "Step 5a covers all 3 park-action branches with a tailored unblock hint" \
+# Each park reason (needs-approval, withdraw [ga-360a7l], needs-human) plus
+# the fail-open default computes its own unblock hint — exactly 4
+# assignments, mirroring ga-u4yi's "exactly N sites" counting style. Was 3
+# before ga-360a7l added the park:withdraw arm.
+eq "Step 5a covers all 4 park-action branches with a tailored unblock hint" \
   "$(printf '%s\n' "$STEP5A_BLOCK" | grep -c 'UNBLOCK_HINT=')" \
-  "3"
+  "4"
 printf '%s\n' "$STEP5A_BLOCK" | grep -qi 'not queued' \
   && ok "Step 5a mail explicitly distinguishes 'parked' from 'queued, reviewers incoming'" \
   || bad "Step 5a mail does not distinguish park from queued — the ga-oo66 root-cause silence survives"
