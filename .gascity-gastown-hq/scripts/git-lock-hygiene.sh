@@ -117,32 +117,14 @@ if [ "$_GIT_LOCK_ROOTS_CALLER_SET" != "1" ] && [ "${1:-}" != "--selftest" ]; the
       # Resolving each candidate through git itself (rather than assuming
       # rig-path==repo-root, the exact mistake that memory warns against) fixes
       # this: `rev-parse --show-toplevel` walks up to the real root, returns the
-      # path unchanged if it's already one, or fails (2s-bounded) for a path
-      # with no work tree. "No work tree" covers two different shapes, handled
-      # differently below: a rig with no git reachable at all (deacon has none
-      # of its own — nothing to scan there), and a rig whose own .git is a
-      # gitlink into a BARE container repo (property_scrapers/lexbh's ".git"
-      # -> ".repo.git", both core.bare=true — verified live 2026-09-15,
-      # ga-92iqox). The latter is a real, scannable git-dir; show-toplevel
-      # fails on it only because a bare repo has no work tree, not because
-      # there's nothing there. Confirmed live: before this fix, property_scrapers
-      # and lexbh were silently absent from the resolved root list every sweep
-      # — the janitor's stale-lock coverage for both had been a no-op since
-      # they were added.
+      # path unchanged if it's already one, or fails harmlessly (2s-bounded,
+      # skipped below) for a rig with no git reachable at all (deacon).
       # Deduplicated: gascity/gastown/deacon all resolve to the same
       # /Users/athos/gt when none has its own .git — scanning it 3x would be
       # wasted (not wrong; _scan_repo is idempotent), never scanned twice here.
       _glh_resolved=""
       for _glh_p in $_glh_rig_paths; do
-        _glh_top=$(timeout 2 git -C "$_glh_p" rev-parse --show-toplevel 2>/dev/null)
-        if [ -z "$_glh_top" ]; then
-          # No work-tree toplevel. If this exact path carries its own .git
-          # (file or dir), it's the bare-container-gitlink shape above — keep
-          # the path itself as the scan root; _scan_repo resolves the gitlink
-          # to the real git-dir. Otherwise there's truly no git here — skip.
-          [ -e "${_glh_p}/.git" ] || continue
-          _glh_top="$_glh_p"
-        fi
+        _glh_top=$(timeout 2 git -C "$_glh_p" rev-parse --show-toplevel 2>/dev/null) || continue
         case " $_glh_resolved " in
           *" $_glh_top "*) ;;  # already have this root
           *) _glh_resolved="${_glh_resolved:+$_glh_resolved }$_glh_top" ;;
@@ -237,20 +219,8 @@ _remove_stale_lock() {
 # Scan one git repo root for stale lock files.
 # Returns the count of files removed/would-remove.
 _scan_repo() {
-  local repo="$1" git_dir removed=0 git_link
+  local repo="$1" git_dir removed=0
   git_dir="${repo}/.git"
-  if [ -f "$git_dir" ]; then
-    # Gitlink file, not a directory — worktree/submodule/bare-container
-    # redirect (e.g. property_scrapers/lexbh's ".git" -> ".repo.git",
-    # ga-92iqox). Resolve the real git-dir from the "gitdir: <path>" line
-    # instead of assuming $repo/.git is itself the scannable directory.
-    git_link=$(sed -n 's/^gitdir: *//p' "$git_dir" 2>/dev/null | head -1)
-    case "$git_link" in
-      /*) git_dir="$git_link" ;;             # absolute — git's usual form
-      "") echo 0; return 0 ;;                # unreadable/malformed -> not a git repo
-      *)  git_dir="${repo}/${git_link}" ;;    # relative -> resolve against $repo
-    esac
-  fi
   if [ ! -d "$git_dir" ]; then echo 0; return 0; fi   # not a git repo
 
   # Single-file lock candidates
@@ -445,26 +415,6 @@ if [ "${1:-}" = "--selftest" ]; then
     touch "$1/.git/COMMIT_EDITMSG"
   }
 
-  # Test helper: reproduce the gitlink-redirect shape property_scrapers/lexbh
-  # actually have on disk (ga-92iqox): <dir>/.git is a regular FILE containing
-  # "gitdir: <path>", and the real scannable git-dir lives at <dir>/.repo.git
-  # instead of <dir>/.git itself.
-  # make_gitlink_repo <dir> [abs|rel]  →  creates <dir>/.repo.git (real git
-  #   dir) + <dir>/.git (gitlink file). form defaults to abs, matching what's
-  #   observed live; "rel" writes a gitdir: line relative to <dir>.
-  make_gitlink_repo() {
-    local dir="$1" form="${2:-abs}" real="$1/.repo.git"
-    mkdir -p "$dir" "$real"
-    printf 'ref: refs/heads/main\n' > "$real/HEAD"
-    mkdir -p "$real/refs/heads"
-    touch "$real/COMMIT_EDITMSG"
-    if [ "$form" = "rel" ]; then
-      printf 'gitdir: .repo.git\n' > "$dir/.git"
-    else
-      printf 'gitdir: %s\n' "$real" > "$dir/.git"
-    fi
-  }
-
   # Stub: no live git process (always says dead).
   _no_git_process() { return 1; }
   # Stub: live git process (always says alive).
@@ -583,54 +533,6 @@ if [ "${1:-}" = "--selftest" ]; then
   count=$(_scan_repo "$R11")
   [ -f "$R11/.git/index.stash.${DEAD_PID}.lock" ] && ok "T18: fresh PID-lock untouched (age gate applies even to dead pid)" \
     || bad "T18: fresh PID-lock removed (age gate should still block this)"
-
-  # ── Gitlink (.git as a regular FILE) tests — ga-92iqox ──────────────────────
-  # Reproduces property_scrapers/lexbh's actual on-disk shape: ".git" is a
-  # plain file containing "gitdir: <path>", not a directory. Before this fix,
-  # _scan_repo's own `[ ! -d "$git_dir" ]` check treated every such repo as
-  # "not a git repo" and skipped it unconditionally — silent zero coverage,
-  # regardless of what locks sat inside the real git-dir.
-  export GIT_LOCK_PROCESS_CHECK_FN="_no_git_process"
-  export GIT_LOCK_STALE_AGE_SEC=300
-
-  # T19: stale index.lock behind an ABSOLUTE gitlink → removed
-  echo "T19: stale index.lock behind an absolute gitlink (.git -> .repo.git) → removed"
-  R12="$TMP/repo12"; make_gitlink_repo "$R12" abs
-  touch -t 200001010000 "$R12/.repo.git/index.lock"
-  count=$(_scan_repo "$R12")
-  [ ! -f "$R12/.repo.git/index.lock" ] && ok "T19: stale lock behind gitlink removed" \
-    || bad "T19: stale lock behind gitlink NOT removed"
-  [ "$count" -ge 1 ] && ok "T19: removed count>=1" || bad "T19: removed count=$count (expected >=1)"
-
-  # T20: FRESH index.lock behind the same gitlink → left alone — the
-  # STALE_AGE gate must still apply after resolving through the redirect,
-  # not just for the direct-directory .git case.
-  echo "T20: fresh index.lock behind a gitlink (<STALE_AGE) → left alone"
-  R13="$TMP/repo13"; make_gitlink_repo "$R13" abs
-  touch "$R13/.repo.git/index.lock"   # just created → age ~0s
-  count=$(_scan_repo "$R13")
-  [ -f "$R13/.repo.git/index.lock" ] && ok "T20: fresh lock behind gitlink untouched" \
-    || bad "T20: fresh lock behind gitlink removed (age gate should still block this)"
-  [ "$count" -eq 0 ] && ok "T20: removed count=0" || bad "T20: removed count=$count (expected 0)"
-
-  # T21: stale index.lock behind a RELATIVE gitlink ("gitdir: .repo.git") →
-  # removed. git supports both absolute and relative gitdir: lines; only the
-  # absolute form is observed live today, but the resolution code branches on
-  # it, so both paths need coverage.
-  echo "T21: stale index.lock behind a relative gitlink (gitdir: .repo.git) → removed"
-  R14="$TMP/repo14"; make_gitlink_repo "$R14" rel
-  touch -t 200001010000 "$R14/.repo.git/index.lock"
-  count=$(_scan_repo "$R14")
-  [ ! -f "$R14/.repo.git/index.lock" ] && ok "T21: stale lock behind relative gitlink removed" \
-    || bad "T21: stale lock behind relative gitlink NOT removed"
-
-  # T22: .git file with no parseable "gitdir:" line → treated as "not a git
-  # repo" (count=0), never an error — mirrors the non-repo no-op in T7.
-  echo "T22: malformed .git file (no gitdir: line) → scan is a no-op, no error"
-  R15="$TMP/repo15"; mkdir -p "$R15"
-  printf 'not a real gitlink\n' > "$R15/.git"
-  count=$(_scan_repo "$R15")
-  [ "$count" = "0" ] && ok "T22: malformed gitlink returns 0" || bad "T22: returned $count (expected 0)"
 
   # ── Mutex tests ─────────────────────────────────────────────────────────────
   echo ""
