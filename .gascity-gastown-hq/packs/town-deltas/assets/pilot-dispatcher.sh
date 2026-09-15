@@ -6128,6 +6128,37 @@ _pilot_routed_to_pool_guard() {
   return 1
 }
 
+# _pilot_dog_store_blind_guard <sling_target> <is_rig_native> — ga-cszxcf:
+# the crew `*)` arm below assigns $_SLING_TARGET directly via `bd update
+# --assignee ... --status in_progress` for any target that isn't
+# wa-worker*/ps-worker* (those self-serve via the earlier arm instead) —
+# which includes every gastown.dog/gastown.dog-N target. But
+# _IS_RIG_NATIVE=1 means, by its own definition above
+# (`[ "$STORY_BEAD_CITY" != "$GC_CITY" ] && _IS_RIG_NATIVE=1`), that
+# STORY_BEAD_CITY is NOT the HQ store. gastown.dog's own startup/pool
+# probes carry no BEADS_DIR/GC_RIG and always resolve against the ambient
+# default store, which for a dog's cwd (.gc/agents/dogs/<name>) is HQ — so
+# a direct assign here strands the bead exactly like the wa-vm94r/ga-c9qj8
+# shape (assigned+in_progress to an agent that can never find it). Measured
+# 2026-09-15: 16 of 17 gt- (gastown rig) dispatches to gastown.dog since
+# 09-12 got no builder; inflight-reclaim-guard released every one, 4 reached
+# gate:needs-human.
+#
+# Self-contained per the ga-c9qj8 convention above (re-checks both inputs
+# rather than trusting the call site): returns 0 (REFUSE) only for a
+# gastown.dog*/rig-native=1 combination; 1 (PROCEED) otherwise — including
+# gastown.dog at HQ (_is_rig_native=0, unaffected: dogs read HQ fine) and
+# any non-dog target (named crews keep dispatching exactly as before).
+_pilot_dog_store_blind_guard() {
+  local _sling_target="${1:-}" _is_rig_native="${2:-}"
+  case "$_sling_target" in
+    gastown.dog|gastown.dog-*)
+      [ "$_is_rig_native" = "1" ] && return 0
+      ;;
+  esac
+  return 1
+}
+
 # _ns_label_blocks_release <labels_csv> — exit 0 (BLOCK release / KEEP) iff any
 # gate:* label OTHER than the story-level history markers gate:needs-fix /
 # gate:fix-attempt:N is present in the comma-joined label list. gate:needs-fix
@@ -9215,6 +9246,28 @@ TASK
         : # pool: leave UNASSIGNED + open so RoutedPoolQuery finds it (claim happens worker-side)
         ;;
       *)
+        # ── ga-cszxcf: gastown.dog's own pool probes have no BEADS_DIR/
+        # GC_RIG and only ever resolve the HQ store — a rig-native (non-HQ)
+        # assignment to gastown.dog would be invisible to it forever. See
+        # _pilot_dog_store_blind_guard's own header comment for the full
+        # incident (16 of 17 gt- dispatches since 09-12 got no builder).
+        # Park visibly instead of stranding an unreadable assignment: the
+        # bead stays exactly as it was pre-dispatch (still story:approved/
+        # bug, not story:in-flight — the dispatch is refused before the
+        # caller marks it in-flight), plus pilot:no-auto-dispatch (stops
+        # Pilot re-selecting it every sweep) + next-action:mayor (surfaces
+        # on the Mayor's own queue per bead_state.py PARK_PREFIXES) + a
+        # comment naming both remedies.
+        if [ "${PILOT_DOG_STORE_GUARD:-1}" = "1" ] && _pilot_dog_store_blind_guard "$_SLING_TARGET" "$_IS_RIG_NATIVE"; then
+          warn "ga-cszxcf: REFUSING rig-native dispatch of $STORY_ID to $_SLING_TARGET — $STORY_BEAD_CITY is not \$GC_CITY (HQ) and gastown.dog's pool probes only ever read HQ (no BEADS_DIR/GC_RIG set). Parking with pilot:no-auto-dispatch + next-action:mayor instead of stranding an assignment the dog can never see (set PILOT_DOG_STORE_GUARD=0 to disable)."
+          bd -C "$STORY_BEAD_CITY" label add "$STORY_ID" "pilot:no-auto-dispatch" -q 2>/dev/null || true
+          bd -C "$STORY_BEAD_CITY" label add "$STORY_ID" "next-action:mayor" -q 2>/dev/null || true
+          bd -C "$STORY_BEAD_CITY" comment "$STORY_ID" "Pergunta (ga-cszxcf): este bead vive em '$STORY_BEAD_CITY', fora do HQ, e foi roteado para $_SLING_TARGET — mas o probe de pool do gastown.dog nao tem BEADS_DIR/GC_RIG e so le o store HQ, entao nunca vai encontrar este bead. Mova a bead para o HQ, ou de a este store um builder cujo probe o leia." 2>/dev/null || true
+          bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+          bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+          DISPATCH_RESULT="rig_native_dog_store_blind"
+          return 1
+        fi
         # ── ga-c9qj8: a POOL-COMMITTED bead may only ever target a pool worker
         # slot — never a named crew agent. See _pilot_routed_to_pool_guard's
         # own header comment for the full incident (wa-vm94r, ~3h stuck in
