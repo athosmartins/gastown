@@ -229,10 +229,17 @@ MOCK_SHOW_JSON='[{"id":"wa-fnibd","status":"open","labels":["gate:needs-fix"]}]'
 eq "(f) gate:needs-fix ALONE is the normal iterate path, not a park reason → ok" \
   "$(gate_bead_live_merge_block city 'wa-fnibd')" "ok"
 
+# ga-360a7l: SUPERSEDES the old expectation here ("ok", i.e. fail-open on a
+# transient bd show failure). That was the bug: error and "no park-worthy
+# label" collapsed to the same value, so a live-read hiccup during merge
+# silently granted permission to push. Fixed contract: a failed/empty/
+# unparseable read returns "unknown", never "ok" — see gate_bead_live_
+# merge_block's own header comment for the full rationale and what each
+# call site now does with "unknown".
 MOCK_SHOW_JSON='[]'
 MOCK_SHOW_FAIL=1
-eq "(g) bd show fails (transient) → ok (fail-open, mirrors guard.sh Step 5a)" \
-  "$(gate_bead_live_merge_block city 'wa-fnibd')" "ok"
+eq "(g) ga-360a7l: bd show fails (transient) → unknown, NOT ok (error is not empty)" \
+  "$(gate_bead_live_merge_block city 'wa-fnibd')" "unknown"
 MOCK_SHOW_FAIL=0
 
 # ── 5. DRIFT GUARD: helpers defined before the lib-only cutoff ───────────────

@@ -1451,6 +1451,13 @@ gap2_apply_pass_verdict() {
 # state that must not enter the review cycle?
 #   story:needs-approval — bead was never product-approved; the gate would spawn
 #     reviewers who reject it, the crew re-submits, and the cycle repeats forever.
+#   gate:withdraw / gate:withdraw:* — ga-360a7l: EXPLICIT withdrawal. A human
+#     decided this exact change must not merge (distinct from gate:needs-human,
+#     which means "something needs a human's judgment" — withdraw means the
+#     judgment already happened and the answer was no). Unconditional, same
+#     tier as story:needs-approval — no partial-delivery-style exemption
+#     exists for it, because there is no legitimate in-flight state that
+#     should override an explicit "do not merge this."
 #   gate:needs-human / gate:needs-human:* (EXCEPT :partial-delivery, see below)
 #     — bead is circuit-broken and requires human intervention; the same
 #     re-submit loop applies.
@@ -1472,15 +1479,23 @@ gap2_apply_pass_verdict() {
 #     whether the bead is allowed to close.
 #   gate:needs-fix ALONE is NOT a park reason — it is the normal fix-iterate path
 #     (crew fixed, re-submitted; gate should review it).
+#   next-action:* and pilot:no-auto-dispatch do NOT park — ga-360a7l
+#     (ga-nkqook incident, 2026-09-15): both were applied to a source bead
+#     ahead of gate:needs-human:technical, in the belief they would also hold
+#     the merge; neither label is examined by this function at all, so they
+#     were never a working substitute for an explicit park label. To stop an
+#     in-flight PASS from merging, the only labels this function honors are
+#     gate:withdraw(:*), gate:needs-human(:*), and story:needs-approval.
 # The check is FAIL-OPEN: if labels are empty/unrecognized, returns "ok" so a
 # network hiccup never blocks a legitimate story:approved submission.
-# Returns: ok | park:needs-approval | park:needs-human
+# Returns: ok | park:needs-approval | park:withdraw | park:needs-human
 check_source_bead_park() {
   local labels="$1" lbl
   local saw_bare=0 saw_partial_delivery=0 saw_other_reason=0
   for lbl in $labels; do
     case "$lbl" in
       story:needs-approval) echo "park:needs-approval"; return ;;
+      gate:withdraw|gate:withdraw:*) echo "park:withdraw"; return ;;
     esac
   done
   for lbl in $labels; do
@@ -4652,6 +4667,9 @@ if [ -n "$BEAD_RAW" ]; then
       park:needs-approval)
         MATCHED_VETO_LABELS=$(matching_veto_labels "$SRC_LABELS_PARK" "story:needs-approval")
         PARK_REASON="source bead $BEAD_ID carries ${MATCHED_VETO_LABELS:-story:needs-approval} (not yet product-approved)" ;;
+      park:withdraw)
+        MATCHED_VETO_LABELS=$(matching_veto_labels "$SRC_LABELS_PARK" "gate:withdraw")
+        PARK_REASON="source bead $BEAD_ID carries ${MATCHED_VETO_LABELS:-gate:withdraw} (explicitly withdrawn — ga-360a7l)" ;;
       park:needs-human)
         MATCHED_VETO_LABELS=$(matching_veto_labels "$SRC_LABELS_PARK" "gate:needs-human")
         PARK_REASON="source bead $BEAD_ID carries ${MATCHED_VETO_LABELS:-gate:needs-human} (circuit-broken — human intervention required)" ;;
@@ -4680,6 +4698,7 @@ To re-enter the gate: resolve the blocking condition on $BEAD_ID (get it approve
     # AUTHOR mail at the dispatcher's gate:needs-human transition sites.
     case "$PARK_ACTION" in
       park:needs-approval) UNBLOCK_HINT="Get $BEAD_ID product-approved (clear ${MATCHED_VETO_LABELS:-story:needs-approval})" ;;
+      park:withdraw)       UNBLOCK_HINT="Confirm with whoever withdrew $BEAD_ID that it's safe to proceed, then clear ${MATCHED_VETO_LABELS:-gate:withdraw} and re-submit" ;;
       park:needs-human)    UNBLOCK_HINT="Get a human/Mayor to resolve the gate:needs-human circuit-break on $BEAD_ID — clear ALL of: ${MATCHED_VETO_LABELS:-gate:needs-human} (bd label remove only takes exact names, so removing just the bare label can leave a sibling variant live and parking silently; scripts/gate-unhold.sh $BEAD_ID gate:needs-human clears every variant in one verified operation — ga-6qbgy)" ;;
       *)                   UNBLOCK_HINT="Resolve the blocking condition on $BEAD_ID" ;;
     esac

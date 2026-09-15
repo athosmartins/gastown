@@ -1346,28 +1346,74 @@ gate_finalize_pass_label_hygiene() {
 # race), never re-blocked an already in-flight PASS. Reuses
 # check_source_bead_park so the two check sites can never drift on what
 # counts as a park-worthy label.
-# Returns: ok | closed | park:needs-approval | park:needs-human
-# FAIL-OPEN ("ok") on any bd/jq error or missing bead — identical rationale as
-# guard.sh's own Step 5a: a lookup failure must never permanently block a
-# legitimate PASS.
+# Returns: ok | closed | park:needs-approval | park:withdraw | park:needs-human | unknown
+# ga-360a7l: "unknown" (a failed/empty `bd show`, or a payload that doesn't
+# parse as the expected JSON shape) is NOT the same value as "ok" — it used
+# to be, and that conflation is the bug this fix closes. "ok" means "read the
+# bead live, it carries no park-worthy signal, safe to proceed"; "unknown"
+# means "could not read the bead live, so this call has NO OPINION" — the
+# caller decides what that means for it (a merge in flight must never treat
+# unknown as permission to proceed; see the two call sites, Step 10 and the
+# do_merge_ff pre-push check, both updated to never merge on unknown). An
+# empty bead_id is the one case that legitimately still means "ok" — there is
+# no bead to fail to read.
+# Also sets (outer scope) GATE_LXZ5W_LIVE_RESULT / GATE_LXZ5W_LIVE_STATUS /
+# GATE_LXZ5W_LIVE_LABELS — the result plus the raw status/labels this call
+# actually saw ("" on unknown or empty bead_id). ga-360a7l: a caller that
+# needs the status/labels actually seen (for logging, AC3) MUST call this
+# WITHOUT wrapping it in `$(...)` — e.g. `gate_bead_live_merge_block "$city"
+# "$id" >/dev/null; use "$GATE_LXZ5W_LIVE_RESULT"`. Command substitution
+# forks a SUBSHELL, and a subshell's variable assignments never reach the
+# caller no matter how they're made inside — that includes these three
+# globals, which is why they exist alongside (not instead of) the original
+# printf/return-code contract below. A caller that only wants the bare
+# result token can and should keep using `X="$(gate_bead_live_merge_block
+# ...)"` exactly as before (every existing caller and selftest assertion
+# does, and still works unchanged) — GATE_LXZ5W_LIVE_RESULT is for the two
+# call sites that also need to log what was seen.
 gate_bead_live_merge_block() {
   local bead_city="$1" bead_id="$2" raw status labels
+  GATE_LXZ5W_LIVE_STATUS=""
+  GATE_LXZ5W_LIVE_LABELS=""
+  GATE_LXZ5W_LIVE_RESULT="ok"
   if [ -z "$bead_id" ]; then
     printf 'ok'
     return 0
   fi
-  raw=$(bd -C "$bead_city" show "$bead_id" --json 2>/dev/null || echo "")
-  if [ -z "$raw" ]; then
-    printf 'ok'
+  # ga-360a7l: guard the assignment explicitly (`if ! raw=$(...)`) instead of
+  # this file's usual `VAR=$(cmd) || echo ""` idiom — that idiom SILENCES the
+  # failure into an empty string, which is exactly the "error reads the same
+  # as empty" bug this fix removes. `if ! VAR=$(cmd)` keeps `bd show`'s own
+  # failure visible while staying `set -e`-safe: the assignment is the tested
+  # condition of an `if`, so a failure here does not abort the whole
+  # dispatcher (see the ga-y9a1d fix-attempt-1 scar tissue further down this
+  # file on why an unguarded `VAR=$(cmd)` under this file's `set -euo
+  # pipefail` is a live hazard, not a hypothetical one).
+  if ! raw=$(bd -C "$bead_city" show "$bead_id" --json 2>/dev/null); then
+    GATE_LXZ5W_LIVE_RESULT="unknown"
+    printf 'unknown'
     return 0
   fi
-  status=$(printf '%s' "$raw" | jq -r 'if type=="array" then .[0] else . end | .status // ""' 2>/dev/null || echo "")
+  if [ -z "$raw" ]; then
+    GATE_LXZ5W_LIVE_RESULT="unknown"
+    printf 'unknown'
+    return 0
+  fi
+  if ! status=$(printf '%s' "$raw" | jq -r 'if type=="array" then .[0] else . end | .status // ""' 2>/dev/null); then
+    GATE_LXZ5W_LIVE_RESULT="unknown"
+    printf 'unknown'
+    return 0
+  fi
+  GATE_LXZ5W_LIVE_STATUS="$status"
   if [ "$status" = "closed" ]; then
+    GATE_LXZ5W_LIVE_RESULT="closed"
     printf 'closed'
     return 0
   fi
   labels=$(printf '%s' "$raw" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || echo "")
-  check_source_bead_park "$labels"
+  GATE_LXZ5W_LIVE_LABELS="$labels"
+  GATE_LXZ5W_LIVE_RESULT="$(check_source_bead_park "$labels")"
+  printf '%s' "$GATE_LXZ5W_LIVE_RESULT"
 }
 
 # ── ga-cw4pm: dynamic-concurrency headroom helpers ────────────────────────────
@@ -4710,20 +4756,44 @@ fi
 # BEFORE the sibling-branch scan below: if this catches it, the bead already
 # carries the signal (closed, or an explicit hold) and there is nothing left
 # for the sibling check to usefully add.
+# ga-360a7l: this is the EARLY of two live re-checks — advisory here, not
+# authoritative. "unknown" (bd show failed/empty/unparseable) does NOT fail
+# the run at this point: do_merge_ff() runs its OWN live re-check immediately
+# before the actual push (as late as this file gets before origin/main
+# actually moves), on every retry attempt, and THAT one is what actually
+# gates whether the push happens — failing the whole run here on a transient
+# read blip would burn a legitimate PASS the late check might let through
+# cleanly moments later. Every branch below logs unconditionally (AC3: block
+# or release, always logged, with the labels seen and a timestamp) — the
+# pre-fix code was silent on the release path, which is exactly the kind of
+# gap that makes a live race unprovable after the fact (this bead's own
+# ga-nkqook incident: no log exists proving when the live re-check released).
 if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ]; then
-  GATE_LXZ5W_BLOCK="$(gate_bead_live_merge_block "$BEAD_CITY" "$BEAD_ID")"
+  # ga-360a7l: called BARE (no `$(...)`) so GATE_LXZ5W_LIVE_STATUS/LABELS set
+  # inside the function survive into this scope for the logging below — a
+  # `$(...)` capture would fork a subshell and lose them regardless of how
+  # they're assigned inside. See the function's own header comment.
+  gate_bead_live_merge_block "$BEAD_CITY" "$BEAD_ID" >/dev/null
+  GATE_LXZ5W_BLOCK="$GATE_LXZ5W_LIVE_RESULT"
+  GATE_LXZ5W_NOW="$(date -u +%FT%TZ)"
   case "$GATE_LXZ5W_BLOCK" in
     closed)
       OVERALL_VERDICT="FAIL"
       GATE_SHA_FAIL_CLASS="hold"  # ga-4cy2t: administrative (resolved elsewhere), not a code rejection
       FAIL_REASONS="Source bead $BEAD_ID is already closed — a different branch/process resolved it after this gate-run began (ga-lxz5w: 2-branch race, sequential variant). Not merging $BRANCH onto an already-terminal bead; a human should confirm whether these changes are still needed as a follow-up."
-      warn "ga-lxz5w: bead $BEAD_ID already closed (resolved elsewhere) — downgrading $BRANCH's in-flight PASS to FAIL before merge."
+      warn "ga-lxz5w: bead $BEAD_ID already closed (resolved elsewhere) at $GATE_LXZ5W_NOW — downgrading $BRANCH's in-flight PASS to FAIL before merge. labels=[$GATE_LXZ5W_LIVE_LABELS]"
       ;;
     park:*)
       OVERALL_VERDICT="FAIL"
       GATE_SHA_FAIL_CLASS="hold"  # ga-4cy2t: hold/needs-human, not a code rejection — see gate_sha_fail_label
       FAIL_REASONS="Source bead $BEAD_ID now carries a park-worthy label ($GATE_LXZ5W_BLOCK) applied after this gate-run began — re-checked live immediately before merge (ga-lxz5w). Not merging $BRANCH; clear the hold, then re-submit."
-      warn "ga-lxz5w: live re-check — bead $BEAD_ID now parks ($GATE_LXZ5W_BLOCK) — downgrading $BRANCH's in-flight PASS to FAIL before merge."
+      warn "ga-lxz5w: live re-check — bead $BEAD_ID now parks ($GATE_LXZ5W_BLOCK) at $GATE_LXZ5W_NOW — downgrading $BRANCH's in-flight PASS to FAIL before merge. labels=[$GATE_LXZ5W_LIVE_LABELS]"
+      ;;
+    unknown)
+      warn "ga-360a7l: early live re-check on $BEAD_ID could not read the bead at $GATE_LXZ5W_NOW (bd show failed/empty/unparseable) — NOT failing the run here; the authoritative live re-check immediately before push (do_merge_ff, ga-360a7l) will retry and is what actually blocks the merge if this persists."
+      ;;
+    *)
+      log "ga-360a7l: early live re-check on $BEAD_ID at $GATE_LXZ5W_NOW — status=${GATE_LXZ5W_LIVE_STATUS:-open} labels=[$GATE_LXZ5W_LIVE_LABELS] — no park/withdraw/closed signal, proceeding toward merge."
       ;;
   esac
 fi
@@ -4899,6 +4969,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
     MERGE_SHA=""
     MERGE_PRE_MAIN_SHA=""
     MERGE_RESULT="failed"
+    GATE_360A7L_LATE_REASON=""  # ga-360a7l: set only when the late pre-push re-check itself blocks
 
     # ── ga-3b8: Merge-time rebase+retry (starvation fix) ──────────────────────
     # The review→merge window is the starvation attack surface: another rig merge
@@ -5225,6 +5296,54 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
         return 1
       fi
 
+      # ── ga-360a7l: LIVE re-check #2 — AUTHORITATIVE, immediately before the
+      # actual push. The early ga-lxz5w(b) check (Step 10, near the top of
+      # this file) can be minutes stale by the time execution reaches here —
+      # do_merge_ff() runs a rebase, several git round-trips, and (for a
+      # container rig) a worktree dance, any one of which is exactly the kind
+      # of gap a human racing to withdraw an already-PASSED change needs
+      # closed (ga-nkqook: gate:needs-human:technical landed on the source
+      # bead at 07:05:13; the merge went out at 07:06:19 anyway — the likeliest
+      # explanation is that the only live re-check running at the time fired
+      # before 07:05:13 and nothing re-checked again before the push). This
+      # re-reads the bead FRESH on every retry attempt (self-healing the same
+      # way the ga-0eh7o shallow-repo check above does), so a label or closure
+      # that lands mid-retry is still caught.
+      local GATE_360A7L_NOW GATE_360A7L_LATE
+      GATE_360A7L_NOW="$(date -u +%FT%TZ)"
+      # ga-360a7l: called BARE (no `$(...)`) — same reasoning as the early
+      # Step 10 call site above: only a bare call lets GATE_LXZ5W_LIVE_STATUS/
+      # LABELS survive into this scope for the logging below.
+      gate_bead_live_merge_block "$BEAD_CITY" "$BEAD_ID" >/dev/null
+      GATE_360A7L_LATE="$GATE_LXZ5W_LIVE_RESULT"
+      case "$GATE_360A7L_LATE" in
+        ok)
+          log "  ga-360a7l: late live re-check on $BEAD_ID at $GATE_360A7L_NOW (attempt $((MERGE_ATTEMPT+1))) — status=${GATE_LXZ5W_LIVE_STATUS:-open} labels=[$GATE_LXZ5W_LIVE_LABELS] — no park/withdraw/closed signal, proceeding to push."
+          ;;
+        unknown)
+          # Retryable on purpose: a transient Dolt hiccup should not be read
+          # as a withdrawal, but it must never be read as permission to push
+          # either (AC1: error is not empty). Leaving this OFF the
+          # non-retryable list below lets the existing ga-3b8 retry loop
+          # re-attempt this exact read up to MAX_MERGE_RETRIES times before
+          # the run is finally held for a human — reusing that proven
+          # mechanism instead of inventing a second one.
+          err "  ga-360a7l: late live re-check on $BEAD_ID at $GATE_360A7L_NOW (attempt $((MERGE_ATTEMPT+1))) could not read the bead (bd show failed/empty/unparseable) — refusing to push on an unreadable bead."
+          GATE_360A7L_LATE_REASON="the live re-check immediately before push could not read source bead $BEAD_ID (bd show failed, returned empty, or did not parse) at $GATE_360A7L_NOW — refusing to push blind rather than treating a read failure as permission to merge (ga-360a7l)"
+          MERGE_RESULT="failed_bead_unknown"
+          return 1
+          ;;
+        *)
+          # closed, or any park:* (including the new park:withdraw) — a
+          # definitive, non-retryable block: retrying the git push changes
+          # neither a human decision nor a bead's terminal state.
+          err "  ga-360a7l: late live re-check on $BEAD_ID at $GATE_360A7L_NOW (attempt $((MERGE_ATTEMPT+1))) blocks the push: $GATE_360A7L_LATE. labels=[$GATE_LXZ5W_LIVE_LABELS]"
+          GATE_360A7L_LATE_REASON="source bead $BEAD_ID now reads '$GATE_360A7L_LATE' on the live re-check immediately before push, at $GATE_360A7L_NOW (labels=[$GATE_LXZ5W_LIVE_LABELS]) — this landed after every earlier check in this run, including the Step 10 ga-lxz5w(b) re-check; not pushing (ga-360a7l)"
+          MERGE_RESULT="failed_bead_blocked_late"
+          return 1
+          ;;
+      esac
+
       # FF push
       if git_rig push origin "${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH" 2>/dev/null; then
         git_rig fetch origin 2>/dev/null || warn "Post-FF-push fetch failed"
@@ -5335,10 +5454,16 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
         break
       fi
       # Only retry on push-race or stale-after-rebase; give up on conflict/worktree failure
+      # ga-360a7l: failed_bead_blocked_late (closed/park at the pre-push
+      # re-check) joins this list — a human decision or terminal bead state,
+      # not a git race; retrying the push changes nothing. failed_bead_unknown
+      # (transient read failure) deliberately does NOT join this list, so it
+      # retries through the loop below like any other transient failure.
       if [ "$MERGE_RESULT" = "failed_merge_time_conflict" ] || \
          [ "$MERGE_RESULT" = "failed_merge_time_rebase" ] || \
          [ "$MERGE_RESULT" = "failed_sha_resolution" ] || \
-         [ "$MERGE_RESULT" = "failed_branch_content_mismatch" ]; then
+         [ "$MERGE_RESULT" = "failed_branch_content_mismatch" ] || \
+         [ "$MERGE_RESULT" = "failed_bead_blocked_late" ]; then
         log "  Non-retryable failure ($MERGE_RESULT). Stopping retry loop."
         break
       fi
@@ -5364,6 +5489,11 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
         # FAIL_REASONS in this file already uses (labels/mails downstream,
         # keyed off OVERALL_VERDICT+FAIL_REASONS generically).
         FAIL_REASONS="Branch $BRANCH's own commits do not reference source bead $BEAD_ID, caught at the actual FF-push point (ga-pfgnv: do_merge_ff's direct-FF/post-rebase-fallthrough path — the branch-content-coherence gap Step 10's own check, keyed on a potentially-stale \$BRANCH_SHA, does not cover). This is the same branch-reused-by-unrelated-work signature ga-y9a1d describes. Not merging $BRANCH. A human must verify: is this bead's real fix still on some other ref (check \`git log --all -S '<known marker text>'\`), or does $BEAD_ID need a fresh submission?"
+      elif [ "$MERGE_RESULT" = "failed_bead_blocked_late" ] || [ "$MERGE_RESULT" = "failed_bead_unknown" ]; then
+        # ga-360a7l: the live re-check immediately before push (do_merge_ff)
+        # is what actually fired — GATE_360A7L_LATE_REASON already names the
+        # bead, what was seen, and when.
+        FAIL_REASONS="${GATE_360A7L_LATE_REASON:-Live re-check immediately before push blocked $BRANCH for source bead $BEAD_ID (ga-360a7l).}"
       else
         FAIL_REASONS="Merge failed after all-PASS verdict. Merge result: $MERGE_RESULT. Check git state of rig $RIG."
       fi
