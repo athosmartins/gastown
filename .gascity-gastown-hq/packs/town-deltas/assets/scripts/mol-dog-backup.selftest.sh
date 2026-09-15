@@ -115,10 +115,14 @@ if grep -qF 'dolt backup sync "${db}-backup" 2>&1' "$SCRIPT"; then
 else
   bad "the sync line does not capture output — cannot classify failures"
 fi
-if grep -qF 'classify_sync_failure "$db" "$sync_rc" "$sync_bound" "$sync_output"' "$SCRIPT"; then
-  ok "the main loop calls classify_sync_failure with the captured exit code and output"
+# ga-bz7war: classify_sync_failure moved from an inline main-loop call to
+# inside sync_db_with_fallback (called there as "$bound", its own parameter
+# name — not the loop's "$sync_bound" the caller passes in). Check the
+# current, real call site rather than the pre-refactor literal.
+if grep -qF 'classify_sync_failure "$db" "$sync_rc" "$bound" "$sync_output"' "$SCRIPT"; then
+  ok "sync_db_with_fallback calls classify_sync_failure with the captured exit code and output"
 else
-  bad "classify_sync_failure is defined but never called from the main loop — dead code"
+  bad "classify_sync_failure is defined but never called — dead code"
 fi
 if grep -qF 'sync_bound=$(bound_for_size_kb' "$SCRIPT"; then
   ok "the main loop calls bound_for_size_kb to size the per-db timeout"
@@ -246,6 +250,241 @@ if [ "${CALL_SITE_COUNT:-0}" -ge 2 ]; then
   ok "found $CALL_SITE_COUNT call sites routed through nudge_deacon_done() (expect >=2: dolt-too-old early exit, normal summary)"
 else
   bad "expected >=2 call sites routed through nudge_deacon_done(), found $CALL_SITE_COUNT — a DOG_DONE nudge may still call gc session nudge directly"
+fi
+
+# ── is_fallback_eligible_failure: the NEW pure classifier (ga-bz7war) ────────────
+# ga-bz7war: mol-dog-backup.sh already told a timeout apart from a real
+# failure (ga-gquc1 above), but hq still failed EVERY round because the
+# SERVER CONNECTION itself (not any per-db timeout budget) was the
+# bottleneck. is_fallback_eligible_failure() is the single place that
+# decides whether a failure is that specific, retriable-via-a-different-path
+# class, vs. a genuine failure that a fallback would just misreport.
+echo "── is_fallback_eligible_failure (ga-bz7war) ──"
+
+if lib_call type is_fallback_eligible_failure >/dev/null 2>&1; then
+  ok "is_fallback_eligible_failure defined by lib-mode source"
+else
+  bad "is_fallback_eligible_failure NOT defined — lib mode broken or function missing"
+fi
+
+# Falsifying check: the EXACT reported production symptom (ga-bz7war,
+# hq failed 2026-09-14 23:15) must be recognized as fallback-eligible.
+if lib_call is_fallback_eligible_failure 1 "error on line 1 for query CALL DOLT_BACKUP('sync', 'hq-backup'): Error 1105 (HY000): context canceled"; then
+  ok "'context canceled' (the exact ga-bz7war production symptom) is fallback-eligible"
+else
+  bad "'context canceled' is NOT fallback-eligible — the exact reported bug is not fixed"
+fi
+
+if lib_call is_fallback_eligible_failure 124 ""; then
+  ok "rc=124 (run_bounded timeout) is fallback-eligible"
+else
+  bad "rc=124 (timeout) is NOT fallback-eligible"
+fi
+
+if lib_call is_fallback_eligible_failure 1 "mysql: connection was closed"; then
+  ok "'connection was closed' (dolt-s3-backup.sh's own signature for the same root cause) is fallback-eligible"
+else
+  bad "'connection was closed' is NOT fallback-eligible"
+fi
+
+# AC non-regression: a GENUINE failure must NOT fall back — falling back
+# would just reproduce the same failure over a slower path and misreport a
+# real problem as transient. Reuses REAL_ERR (defined above): a real
+# ga-b5h83-shaped captured error, not a timeout/connection symptom.
+if lib_call is_fallback_eligible_failure 1 "$REAL_ERR"; then
+  bad "a genuine sync failure (table file not found) is treated as fallback-eligible — would mask a real problem"
+else
+  ok "a genuine sync failure (table file not found) is correctly NOT fallback-eligible"
+fi
+
+if lib_call is_fallback_eligible_failure 1 ""; then
+  bad "a bare nonzero exit with no output is treated as fallback-eligible — should require rc=124 or a specific signature"
+else
+  ok "a bare nonzero exit with no matching signature is correctly NOT fallback-eligible"
+fi
+
+# ── drift-guard: sync_db_with_fallback defined AND wired into the main loop ──────
+echo "── drift-guard: fallback wiring present in live script (ga-bz7war) ──"
+
+if lib_call type sync_db_with_fallback >/dev/null 2>&1; then
+  ok "sync_db_with_fallback defined by lib-mode source"
+else
+  bad "sync_db_with_fallback NOT defined — lib mode broken or function missing"
+fi
+
+if grep -qF 'result=$(sync_db_with_fallback "$db" "$db_dir" "$sync_bound")' "$SCRIPT"; then
+  ok "the main loop calls sync_db_with_fallback with db/db_dir/sync_bound"
+else
+  bad "sync_db_with_fallback is defined but never called from the main loop with the expected args — dead code"
+fi
+
+if grep -qF 'is_fallback_eligible_failure "$sync_rc" "$sync_output"' "$SCRIPT"; then
+  ok "sync_db_with_fallback calls is_fallback_eligible_failure to decide the fallback trigger"
+else
+  bad "sync_db_with_fallback never calls is_fallback_eligible_failure — dead code"
+fi
+
+if grep -qF '_offline_backup_sync "$db" "$dest"' "$SCRIPT"; then
+  ok "sync_db_with_fallback calls the shared _offline_backup_sync (ga-o3nqy2)"
+else
+  bad "sync_db_with_fallback never calls _offline_backup_sync — no actual fallback happens"
+fi
+
+if grep -qF '_floor_class "$avail" "$FLOOR_WARN_GB" "$FLOOR_CRITICAL_GB"' "$SCRIPT"; then
+  ok "sync_db_with_fallback checks disk floor via _floor_class before falling back (AC3)"
+else
+  bad "sync_db_with_fallback never checks disk floor — AC3 (disk-floor guard) not wired"
+fi
+
+if grep -qF '. "$GC_CITY_PATH/scripts/dolt-offline-backup-sync.sh"' "$SCRIPT"; then
+  ok "dolt-offline-backup-sync.sh is sourced from its real, GC_CITY_PATH-anchored location"
+else
+  bad "dolt-offline-backup-sync.sh sourcing missing or no longer GC_CITY_PATH-anchored"
+fi
+if grep -qF 'DOLT_DISK_FLOOR_GUARD_LIB=1 . "$GC_CITY_PATH/scripts/dolt-disk-floor-guard.sh"' "$SCRIPT"; then
+  ok "dolt-disk-floor-guard.sh is sourced in library mode from its real, GC_CITY_PATH-anchored location"
+else
+  bad "dolt-disk-floor-guard.sh library-mode sourcing missing or no longer GC_CITY_PATH-anchored"
+fi
+
+# ── drift-guard: three states (OK/SKIP/FAILED) never collapse (AC4) ──────────────
+if grep -qF 'SKIP) append_skipped_db "$detail" ;;' "$SCRIPT"; then
+  ok "the main loop routes a SKIP result to append_skipped_db, not append_failed_db"
+else
+  bad "a SKIP result is not routed to append_skipped_db — may be miscounted as OK or FAILED"
+fi
+
+# Mail must key on $FAILED_COUNT (=$FAILED) ONLY — a SKIP must never be
+# mail-worthy ("So FAILED gera mail", AC4).
+if grep -qF 'if [ "$FAILED_COUNT" -gt 0 ]; then' "$SCRIPT"; then
+  ok "mail is still gated on \$FAILED_COUNT (unchanged)"
+else
+  bad "the mail-trigger condition changed shape — verify SKIP was not folded into it"
+fi
+if grep -qE 'FAILED_COUNT=.*SKIPPED' "$SCRIPT"; then
+  bad "FAILED_COUNT appears derived from SKIPPED — a SKIP would now incorrectly trigger mail"
+else
+  ok "FAILED_COUNT is never derived from SKIPPED — a SKIP cannot trigger mail"
+fi
+
+# ── sync_db_with_fallback(): real end-to-end (ga-bz7war) ─────────────────────────
+# Simulates the SPECIFIC production failure (server-mediated `dolt backup
+# sync <name>` cut with "context canceled") via a thin `dolt` wrapper on
+# PATH that intercepts ONLY that exact invocation shape and passes every
+# other dolt call straight through to the REAL binary — so the fallback
+# itself (_offline_backup_sync, the disk-floor check) runs for real against
+# a tiny throwaway `dolt init` repo, the same hermetic-integration approach
+# dolt-offline-backup-sync.selftest.sh's own Scenario A already uses. This
+# is the test that must FAIL on HEAD (sync_db_with_fallback does not exist
+# there — the bare "dolt backup sync" call has no fallback path at all) and
+# PASS after the fix (the simulated failure recovers via a real fallback).
+#
+# The genuine-failure non-regression (a real error must NOT fall back) is
+# already covered by the pure-function REAL_ERR check above — not repeated
+# here as a second, redundant integration scenario.
+echo "── sync_db_with_fallback() — real end-to-end (ga-bz7war) ──"
+
+: "${GC_CITY_PATH:=/Users/athos/gt/.gascity-gastown-hq}"
+OFFLINE_LIB="$GC_CITY_PATH/scripts/dolt-offline-backup-sync.sh"
+FLOOR_LIB="$GC_CITY_PATH/scripts/dolt-disk-floor-guard.sh"
+
+if [ ! -f "$OFFLINE_LIB" ] || [ ! -f "$FLOOR_LIB" ]; then
+  bad "cannot locate dolt-offline-backup-sync.sh / dolt-disk-floor-guard.sh under \$GC_CITY_PATH — skipping real end-to-end scenarios"
+else
+  FB_WORK="$(mktemp -d "${TMPDIR:-/tmp}/mol-dog-backup-fallback-selftest.XXXXXX")"
+  FB_DATA_DIR="$FB_WORK/data-dir"
+  mkdir -p "$FB_DATA_DIR"
+  ( mkdir -p "$FB_DATA_DIR/testdb" && cd "$FB_DATA_DIR/testdb" && dolt init >/dev/null 2>&1 )
+
+  FB_FAKE_LIVE_PORT=54021   # arbitrary, != the embedded CLI's default (3306)
+  FB_CFG="$FB_WORK/dolt-config.yaml"
+  cat > "$FB_CFG" <<EOF2
+data_dir: "$FB_DATA_DIR"
+listener:
+  port: $FB_FAKE_LIVE_PORT
+EOF2
+
+  # Register a real file:// backup remote for testdb, matching what
+  # mol-dog-backup.sh's own discovery loop expects to find via `dolt backup -v`.
+  FB_BACKUP_DIR="$FB_WORK/backup/testdb"
+  ( cd "$FB_DATA_DIR/testdb" && dolt backup add testdb-backup "file://$FB_BACKUP_DIR" >/dev/null 2>&1 )
+
+  # A thin `dolt` wrapper: intercept ONLY the bare 3-arg server-mediated
+  # form (`dolt backup sync <name>`, no --data-dir/--host) and simulate the
+  # exact ga-bz7war production error; pass everything else (backup -v,
+  # --data-dir ... sql / backup sync-url, used internally by
+  # _offline_backup_sync) straight through to the REAL dolt binary.
+  REAL_DOLT="$(command -v dolt)"
+  FB_BIN="$FB_WORK/bin"
+  mkdir -p "$FB_BIN"
+  cat > "$FB_BIN/dolt" <<EOF2
+#!/bin/bash
+if [ "\$1" = "backup" ] && [ "\$2" = "sync" ] && [ "\$#" -eq 3 ]; then
+  echo "error on line 1 for query CALL DOLT_BACKUP('sync', '\$3'): Error 1105 (HY000): context canceled" >&2
+  exit 1
+fi
+exec "$REAL_DOLT" "\$@"
+EOF2
+  chmod +x "$FB_BIN/dolt"
+
+  # fallback_call: like lib_call, but also sources the two real dependency
+  # libraries and stubs run_bounded (a runtime.sh helper never sourced in
+  # library mode) as a bare passthrough — the fake dolt above supplies the
+  # actual failure behavior, so run_bounded's own timeout semantics are not
+  # what this test exercises.
+  fallback_call() {
+    (
+      export MOL_DOG_BACKUP_LIB=1
+      . "$SCRIPT" >/dev/null 2>&1
+      . "$OFFLINE_LIB"
+      export DOLT_DISK_FLOOR_GUARD_LIB=1
+      . "$FLOOR_LIB"
+      run_bounded() { shift; "$@"; }
+      "$@"
+    )
+  }
+
+  # Scenario 1: simulated "context canceled" + healthy disk headroom (forced
+  # via DOLT_DISK_FLOOR_WARN_GB=0/..._CRITICAL_GB=0 — the ACTUAL override
+  # env vars dolt-disk-floor-guard.sh reads into its own FLOOR_WARN_GB/
+  # FLOOR_CRITICAL_GB at source time; setting those internal names directly
+  # is a no-op, since sourcing unconditionally overwrites them from the
+  # DOLT_DISK_FLOOR_* vars — so the scenario is deterministic regardless of
+  # this host's actual free space) → falls back → real OK.
+  FB1_OUT=$(PATH="$FB_BIN:$PATH" \
+    OFFLINE_SYNC_DOLT_CFG="$FB_CFG" OFFLINE_SYNC_TMP_ROOT="$FB_WORK" \
+    DOLT_DATA_DIR="$FB_DATA_DIR" DOLT_DISK_FLOOR_WARN_GB=0 DOLT_DISK_FLOOR_CRITICAL_GB=0 \
+    fallback_call sync_db_with_fallback testdb "$FB_DATA_DIR/testdb" 120 2>"$FB_WORK/scenario1.stderr")
+  FB1_RC=$?
+  if [ "$FB1_RC" -eq 0 ] && [ "$FB1_OUT" = "OK testdb" ]; then
+    ok "simulated 'context canceled' + healthy disk → real offline fallback → OK (the ga-bz7war fix, end to end)"
+  else
+    bad "simulated 'context canceled' did not recover via fallback — got rc=$FB1_RC output='$FB1_OUT' (stderr: $(cat "$FB_WORK/scenario1.stderr" 2>/dev/null))"
+  fi
+  # Confirm the fallback that ran was the REAL one, not a no-op: the synced
+  # backup directory must actually exist with content.
+  if [ -d "$FB_BACKUP_DIR" ] && [ -n "$(find "$FB_BACKUP_DIR" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+    ok "the offline fallback wrote real content to the backup destination — not a mocked success"
+  else
+    bad "OK was reported but the backup destination ($FB_BACKUP_DIR) is empty/missing — success was not real"
+  fi
+
+  # Scenario 2: same simulated failure, but disk floor forced breached
+  # (DOLT_DISK_FLOOR_WARN_GB set absurdly high — see Scenario 1's note on
+  # why this is the var that actually has effect) → must SKIP, never OK and
+  # never silently counted as FAILED.
+  FB2_OUT=$(PATH="$FB_BIN:$PATH" \
+    OFFLINE_SYNC_DOLT_CFG="$FB_CFG" OFFLINE_SYNC_TMP_ROOT="$FB_WORK" \
+    DOLT_DATA_DIR="$FB_DATA_DIR" DOLT_DISK_FLOOR_WARN_GB=999999 DOLT_DISK_FLOOR_CRITICAL_GB=999999 \
+    fallback_call sync_db_with_fallback testdb "$FB_DATA_DIR/testdb" 120 2>/dev/null)
+  FB2_STATUS="${FB2_OUT%% *}"
+  if [ "$FB2_STATUS" = "SKIP" ]; then
+    ok "simulated failure + breached disk floor → SKIP with a reason (AC3+AC4): $FB2_OUT"
+  else
+    bad "simulated failure + breached disk floor did not SKIP — got: '$FB2_OUT' (expected a 'SKIP testdb(...)' line)"
+  fi
+
+  rm -rf "$FB_WORK" 2>/dev/null
 fi
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="

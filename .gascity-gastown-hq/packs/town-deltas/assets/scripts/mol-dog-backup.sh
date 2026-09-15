@@ -20,6 +20,14 @@
 # live from the dolt pack's engine-materialized copy via GC_CITY_PATH instead
 # (gate fix-attempt 2: a self-relative $PACK_DIR here resolves under
 # town-deltas once vendored, and no runtime.sh was ever copied there).
+#
+# ga-bz7war: the ga-gquc1 fix above correctly told a timeout apart from a
+# real failure, but hq still failed EVERY round — the server connection
+# itself (listener.read_timeout_millis) is the bottleneck under load, so no
+# per-db timeout budget fixes it. A timeout or connection-closed failure now
+# falls back to the same server-free sync (ga-o3nqy2) the 04:00 off-box job
+# uses, gated on disk headroom (dolt-disk-floor-guard's own WARN floor) —
+# see sync_db_with_fallback below.
 set -euo pipefail
 
 SMALL_DB_BOUND_SECS=120
@@ -60,6 +68,32 @@ classify_sync_failure() {
     fi
 }
 
+# is_fallback_eligible_failure <rc> <output> — PURE. True (0) only for the
+# SPECIFIC failure class ga-bz7war targets: a run_bounded timeout (rc=124) or
+# the managed server's listener.read_timeout_millis cutting the connection
+# mid-sync (ga-o3nqy2: hq has failed every night since 2026-09-11 this way —
+# the server connection is the bottleneck, not the data, so retrying the same
+# server-mediated call never helps). "context canceled" is the literal
+# signature the bare `dolt backup sync <name>` CLI form emits for that cut
+# (confirmed live 2026-09-14 23:15: "Error 1105 (HY000): context canceled",
+# ga-bz7war); "connection was closed" is kept for parity with
+# dolt-s3-backup.sh's is_connection_timeout_error, which hits the SAME root
+# cause through its explicit --host/--port form. A GENUINE sync failure (bad
+# remote, corrupt staging, a real disk error) must return 1 here — falling
+# back would just reproduce the same failure over a slower path and
+# misreport a real problem as transient.
+is_fallback_eligible_failure() {
+    local rc="$1" output="$2"
+    if [ "$rc" -eq 124 ]; then
+        return 0
+    fi
+    case "$output" in
+        *"context canceled"*) return 0 ;;
+        *"connection was closed"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # deacon_nudge_allowed <suspended_flag> — PURE. Nudging a suspended agent
 # queues forever: the recipient never wakes to consume it, and every
 # `gc nudge poll` iteration reloads the ENTIRE queue state regardless of
@@ -78,6 +112,86 @@ deacon_nudge_allowed() {
     [ "$suspended_flag" = "false" ]
 }
 
+# sync_db_with_fallback <db> <db_dir> <bound> — attempt the server-mediated
+# `dolt backup sync <db>-backup`; on a fallback-eligible failure (timeout or
+# connection-closed — is_fallback_eligible_failure above), fall back to the
+# shared server-free _offline_backup_sync (ga-o3nqy2,
+# scripts/dolt-offline-backup-sync.sh), the same mechanism and semantics as
+# the 04:00 off-box job (dolt-s3-backup.sh). Before attempting the fallback,
+# checks disk headroom against dolt-disk-floor-guard's own WARN floor via its
+# _floor_class — an offline sync clones the live db directory (cp -c), and a
+# floor breach means "do not start a disk operation right now", not silence.
+#
+# Depends on (defined by sourcing, never redefined here): run_bounded
+# (runtime.sh), _avail_gb/_floor_class (dolt-disk-floor-guard.sh, library
+# mode), _offline_backup_sync (dolt-offline-backup-sync.sh), and the globals
+# DOLT_DATA_DIR/FLOOR_WARN_GB/FLOOR_CRITICAL_GB. Defined ahead of the
+# MOL_DOG_BACKUP_LIB gate below (like the pure functions above) so a selftest
+# can exercise it directly once it sources those same dependencies itself —
+# see mol-dog-backup.selftest.sh.
+#
+# Echoes exactly one line, one of:
+#   OK <db>
+#   SKIP <db>(<reason>)
+#   FAILED <db>(<reason>)
+# — mutually exclusive by construction (one printf per branch), so a database
+# is never counted into more than one of the three states.
+sync_db_with_fallback() {
+    local db="$1" db_dir="$2" bound="$3"
+    local sync_rc=0 sync_output
+
+    sync_output=$(cd "$db_dir" && run_bounded "$bound" dolt backup sync "${db}-backup" 2>&1) || sync_rc=$?
+
+    if [ "$sync_rc" -eq 0 ]; then
+        printf 'OK %s\n' "$db"
+        return
+    fi
+
+    if ! is_fallback_eligible_failure "$sync_rc" "$sync_output"; then
+        printf 'FAILED %s\n' "$(classify_sync_failure "$db" "$sync_rc" "$bound" "$sync_output")"
+        return
+    fi
+
+    local avail avail_class
+    avail="$(_avail_gb "$DOLT_DATA_DIR")"
+    avail_class="$(_floor_class "$avail" "$FLOOR_WARN_GB" "$FLOOR_CRITICAL_GB")"
+    if [ "$avail_class" != "NONE" ]; then
+        printf 'SKIP %s(disk floor %s: avail=%sGB warn=%sGB)\n' \
+            "$db" "$avail_class" "${avail:-?}" "$FLOOR_WARN_GB"
+        return
+    fi
+
+    local backup_url dest
+    # Guarded with `|| backup_url=""`: under pipefail, `dolt backup -v`
+    # itself failing (rare — a local, read-only listing) would otherwise
+    # abort the whole script via set -e even though awk succeeds. An empty
+    # backup_url falls through to the non-file `*)` branch below, which
+    # reports the original failure — the correct, safe behavior when the
+    # URL can't be determined at all.
+    backup_url=$(cd "$db_dir" && dolt backup -v 2>/dev/null | awk -v n="${db}-backup" '$1==n {print $2; exit}') \
+        || backup_url=""
+    case "$backup_url" in
+        file://*)
+            dest="${backup_url#file://}"
+            if OFFLINE_SYNC_TIMEOUT="$bound" _offline_backup_sync "$db" "$dest"; then
+                printf 'OK %s\n' "$db"
+            elif [ "$sync_rc" -eq 124 ]; then
+                printf 'FAILED %s(offline fallback also failed — server sync timeout after %ss)\n' "$db" "$bound"
+            else
+                printf 'FAILED %s(offline fallback also failed — server connection closed mid-sync)\n' "$db"
+            fi
+            ;;
+        *)
+            # Offline fallback only ever applies to a file:// backup target
+            # (it clones the live db dir and syncs the clone straight to a
+            # local path — see dolt-offline-backup-sync.sh's header). A
+            # non-file remote (S3, a future scheme) can't use it; report the
+            # original failure unchanged.
+            printf 'FAILED %s\n' "$(classify_sync_failure "$db" "$sync_rc" "$bound" "$sync_output")"
+            ;;
+    esac
+}
+
 # Library mode: `MOL_DOG_BACKUP_LIB=1 source mol-dog-backup.sh` defines the pure
 # functions above without resolving a live Dolt runtime or running the backup
 # flow (port resolution, real syncs, mail/nudge).
@@ -91,6 +205,19 @@ fi
 # override it to dolt's own pack dir for this source, or the dog dies on boot.
 GC_PACK_DIR="${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt" \
     . "${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt/assets/scripts/runtime.sh"
+
+# ga-bz7war: server-free fallback (ga-o3nqy2) + disk-floor guard (ga-gpzr),
+# both library-mode sourced from their real, GC_CITY_PATH-anchored location —
+# same anchoring discipline as runtime.sh above, for the same reason (a
+# self-relative path here would resolve under town-deltas once vendored, and
+# neither file is vendored into this pack). OFFLINE_SYNC_DOLT_CFG is read
+# only by _offline_backup_sync's own internal data_dir/port derivation, kept
+# independent of this script's own DOLT_DATA_DIR/GC_DOLT_PORT (from
+# runtime.sh) by that shared function's own contract.
+. "$GC_CITY_PATH/scripts/dolt-offline-backup-sync.sh"
+# shellcheck disable=SC2034
+OFFLINE_SYNC_DOLT_CFG="$GC_CITY_PATH/.gc/runtime/packs/dolt/dolt-config.yaml"
+DOLT_DISK_FLOOR_GUARD_LIB=1 . "$GC_CITY_PATH/scripts/dolt-disk-floor-guard.sh"
 
 PORT="$GC_DOLT_PORT"
 HOST="${GC_DOLT_HOST:-127.0.0.1}"
@@ -149,6 +276,21 @@ append_failed_db() {
         FAILED_DBS="$FAILED_DBS, $db_failure"
     else
         FAILED_DBS="$db_failure"
+    fi
+}
+
+# append_skipped_db <reason> — a THIRD state, distinct from both OK and
+# FAILED (ga-bz7war AC4): a disk-floor breach means "did not attempt this
+# db this round", never "it synced" and never "it failed to sync". Kept as
+# its own counter/list so Step 4 can never fold it into $FAILED and mail on
+# it — only a genuine FAILED is mail-worthy.
+append_skipped_db() {
+    db_skip="$1"
+    SKIPPED=$((SKIPPED + 1))
+    if [ -n "$SKIPPED_DBS" ]; then
+        SKIPPED_DBS="$SKIPPED_DBS, $db_skip"
+    else
+        SKIPPED_DBS="$db_skip"
     fi
 }
 
@@ -221,7 +363,9 @@ fi
 TOTAL=$(printf '%s\n' "$DATABASES" | awk 'NF {count++} END {print count + 0}')
 SYNCED=0
 FAILED=0
+SKIPPED=0
 FAILED_DBS=""
+SKIPPED_DBS=""
 
 for db in $DATABASES; do
     db_dir="$DOLT_DATA_DIR/$db"
@@ -233,14 +377,15 @@ for db in $DATABASES; do
     db_size_kb=$(du -sk "$db_dir" 2>/dev/null | awk '{print $1}' || true)
     sync_bound=$(bound_for_size_kb "$db_size_kb")
 
-    sync_rc=0
-    sync_output=$(cd "$db_dir" && run_bounded "$sync_bound" dolt backup sync "${db}-backup" 2>&1) || sync_rc=$?
-
-    if [ "$sync_rc" -eq 0 ]; then
-        SYNCED=$((SYNCED + 1))
-    else
-        append_failed_db "$(classify_sync_failure "$db" "$sync_rc" "$sync_bound" "$sync_output")"
-    fi
+    result=$(sync_db_with_fallback "$db" "$db_dir" "$sync_bound")
+    status="${result%% *}"
+    detail="${result#* }"
+    case "$status" in
+        OK) SYNCED=$((SYNCED + 1)) ;;
+        SKIP) append_skipped_db "$detail" ;;
+        FAILED) append_failed_db "$detail" ;;
+        *) append_failed_db "$db(sync_db_with_fallback: unexpected output '$result')" ;;
+    esac
 done
 
 FAILED_COUNT=$FAILED
@@ -269,6 +414,10 @@ if [ "$FAILED_COUNT" -gt 0 ]; then
         2>/dev/null || true
 fi
 
-SUMMARY="backup — synced: $SYNCED/$TOTAL, offsite: $OFFSITE_STATUS"
+if [ "$SKIPPED" -gt 0 ]; then
+    echo "backup: skipped databases:$SKIPPED_DBS"
+fi
+
+SUMMARY="backup — synced: $SYNCED/$TOTAL, skipped: $SKIPPED, offsite: $OFFSITE_STATUS"
 nudge_deacon_done "DOG_DONE: $SUMMARY"
 echo "backup: $SUMMARY"
