@@ -9745,12 +9745,14 @@ PR awaits HUMAN REVIEW (upstream maintainer). Bead stays OPEN until the PR merge
       DISPATCH_COMMENT="Pilot dispatched builder '$BUILDER_TARGET' at $NOW (tier=bug/tech-debt, lane=$LANE, rig=$STORY_RIG).
 Sling task bead: $SLING_BEAD_ID
 Builder doctrine: fix bug → /gate-done → autonomous gate+delivery → bead closed.
-No human review required. SYSTEM QUALITY FIRST."
+No human review required. SYSTEM QUALITY FIRST.
+No-diff deliverable (mockup, report, data-op, verified-live/no-changes finding)? Never exit with the bead in_progress: acceptance already met by the artifact itself → bd close --reason citing it. Missing an Athos decision → park it (next-action:athos-decide label + athos.acao metadata) and release the claim."
     else
       DISPATCH_COMMENT="Pilot dispatched builder '$BUILDER_TARGET' at $NOW (tier=feature, lane=$LANE, rig=$STORY_RIG).
 Sling task bead: $SLING_BEAD_ID
 Builder doctrine: implement → /gate-done → autonomous gate+delivery → story:done.
-No human review required."
+No human review required.
+No-diff deliverable (mockup, report, data-op, verified-live/no-changes finding)? Never exit with the bead in_progress: acceptance already met by the artifact itself → bd close --reason citing it. Missing an Athos decision → park it (next-action:athos-decide label + athos.acao metadata) and release the claim."
     fi
 
     bd -C "$STORY_BEAD_CITY" comment "$STORY_ID" "$DISPATCH_COMMENT" \
