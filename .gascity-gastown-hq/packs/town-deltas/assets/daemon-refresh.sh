@@ -343,6 +343,12 @@ POST_DEPLOY_SHA="${POST_DEPLOY_SHA:-}"
 DEPLOY_EPOCH="${DEPLOY_EPOCH:-0}"
 SENSITIVE_DAEMONS="${SENSITIVE_DAEMONS:-}"
 EXTRA_RUNTIME_ROOTS="${EXTRA_RUNTIME_ROOTS:-}"
+# ga-fzfqsu: launchd labels the caller wants ALWAYS restarted+verified
+# regardless of whether Step 2/3 below can discover or entrypoint-match them
+# (delivery-runbooks.toml's daemon_restarts — a static, unconditional list;
+# see the Step 3 boundary below for how this merges into AFFECTED). Space-
+# separated. Empty (the default) changes nothing about existing behavior.
+FORCE_RESTART_LABELS="${FORCE_RESTART_LABELS:-}"
 DRY_RUN="${DRY_RUN:-0}"
 LAUNCH_AGENTS_DIR="${LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 LAUNCHCTL_BIN="${LAUNCHCTL_BIN:-launchctl}"
@@ -889,6 +895,41 @@ resolve_relpath() {  # resolve_relpath <token>
   return 1
 }
 
+# WorkingDirectory of a plist, or empty if absent/unparseable. (ga-fzfqsu)
+plist_working_directory() {  # plist_working_directory <plist>
+  python3 - "$1" <<'PY' 2>/dev/null
+import sys, plistlib
+try:
+    d = plistlib.load(open(sys.argv[1], 'rb'))
+except Exception:
+    sys.exit(0)
+wd = d.get('WorkingDirectory')
+if wd:
+    print(wd)
+PY
+}
+
+# Is <dir> RUNTIME_DIR itself, or under RUNTIME_DIR or an EXTRA_RUNTIME_ROOTS
+# entry? (ga-fzfqsu) Same roots resolve_relpath() already trusts for a file
+# token, applied instead to a plist's WorkingDirectory — the signal a
+# `python -m <module>` launch (e.g. lexbh's `python -m flask run`, which names
+# no .py file anywhere in argv; the real app module lives behind FLASK_APP or
+# an equivalent env var this script deliberately does not special-case)
+# leaves behind when no entrypoint file can be resolved at all.
+working_directory_under_runtime() {  # working_directory_under_runtime <dir>
+  local wd="$1" root
+  [ -n "$wd" ] || return 1
+  case "$wd" in
+    "$RUNTIME_DIR"|"$RUNTIME_DIR"/*) return 0 ;;
+  esac
+  for root in $EXTRA_RUNTIME_ROOTS; do
+    case "$wd" in
+      "$root"|"$root"/*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 # label -> space-separated entrypoint relpaths (parallel arrays via temp files)
 DISCO_DIR="$(mktemp -d "${TMPDIR:-/tmp}/daemon-disco.XXXXXX")"
 trap 'rm -rf "$DISCO_DIR"' EXIT
@@ -907,6 +948,7 @@ shopt -s nullglob
 for plist in "$LAUNCH_AGENTS_DIR"/*.plist; do
   label="$(basename "$plist" .plist)"
   entry=""
+  prev_arg=""
   args_out="$(plist_args "$plist")"; rc=$?
   if [ "$rc" -ne 0 ]; then
     PARSE_ERROR_LABELS="$PARSE_ERROR_LABELS $label"
@@ -943,9 +985,39 @@ for plist in "$LAUNCH_AGENTS_DIR"/*.plist; do
         fi
         ;;
     esac
+    # ga-fzfqsu: `-m <dotted.module>` (python's own module-execution flag) may
+    # name a real in-repo module with no .py suffix anywhere in argv — resolve
+    # it the same way an import statement would (dots -> path separators, a
+    # trailing .py) via the same roots resolve_relpath() already trusts. A
+    # module that isn't actually under RUNTIME_DIR (e.g. `-m flask`, `-m
+    # gunicorn` — a globally-installed package, lexbh's real case) fails to
+    # resolve here exactly like any other unmatched token, falling through to
+    # the WorkingDirectory fallback below.
+    if [ "$prev_arg" = "-m" ]; then
+      mrel="$(resolve_relpath "$(echo "$arg" | tr '.' '/').py" || true)"
+      [ -n "$mrel" ] && entry="$entry $mrel"
+    fi
+    prev_arg="$arg"
   done <<< "$args_out"
   entry="$(echo "$entry" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')"
-  [ -n "${entry// /}" ] || continue
+  if [ -z "${entry// /}" ]; then
+    # ga-fzfqsu: no .py/.sh/-m entrypoint resolved. Before dropping this plist
+    # entirely (the pre-fix behavior — invisible to discovery, and if it's the
+    # rig's ONLY daemon, the whole scan short-circuits to "no rig daemons
+    # discovered" before Step 3/4 ever run), check whether its WorkingDirectory
+    # itself is under a runtime root. If so, still register it as a rig daemon
+    # with an empty entry set: Step 3's ad-hoc/import/template matching can
+    # never mark an empty-entry daemon AFFECTED on its own (nothing to match
+    # against), but it becomes visible to is_sensitive/policy_says_sensitive/
+    # guard_allows_restart and reachable by FORCE_RESTART_LABELS below —
+    # instead of vanishing from discovery entirely.
+    wd="$(plist_working_directory "$plist")"
+    if working_directory_under_runtime "$wd"; then
+      log "$label: no .py/.sh/-m entrypoint resolved, but WorkingDirectory ($wd) is under this rig's runtime — registering as a rig daemon with no known entrypoint (reachable via FORCE_RESTART_LABELS / daemon_restarts, not ad-hoc scanning)."
+    else
+      continue
+    fi
+  fi
   echo "$entry" > "$DISCO_DIR/$label"
   DAEMON_LABELS="$DAEMON_LABELS $label"
 done
@@ -1365,6 +1437,31 @@ for label in $DAEMON_LABELS; do
 done
 
 AFFECTED="$(echo "$AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+
+# ga-fzfqsu: FORCE_RESTART_LABELS (delivery-runbooks.toml's daemon_restarts,
+# threaded through by the caller) forces its labels into AFFECTED
+# unconditionally — regardless of whether Step 2 discovered an entrypoint for
+# them, or the ad-hoc/import-level/route-hop/template matching above would
+# ever have concluded they're affected. This is the static, "ALWAYS restart"
+# override delivery-runbooks.toml documents, and the only mechanism that
+# reaches a daemon whose real entrypoint isn't resolvable from argv at all
+# (e.g. `python -m flask` — see the WorkingDirectory fallback in Step 2). A
+# label here that Step 2 never discovered still flows cleanly through Step 4
+# below: daemon_pid()/is_sensitive()/policy_says_sensitive() are all launchd-
+# label-keyed, not entry-keyed, and degrade safely (not sensitive, no policy
+# opinion) when $DISCO_DIR/$label doesn't exist.
+for fr_label in $FORCE_RESTART_LABELS; do
+  [ -n "$fr_label" ] || continue
+  case " $AFFECTED " in
+    *" $fr_label "*) ;;
+    *)
+      log "FORCE_RESTART_LABELS: $fr_label forced into AFFECTED (daemon_restarts static override, not entrypoint-matched)."
+      AFFECTED="$AFFECTED $fr_label"
+      ;;
+  esac
+done
+AFFECTED="$(echo "$AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+
 if [ -z "${AFFECTED// /}" ]; then
   # ga-vmq1i: py/template files DID change but detection (a bounded entrypoint
   # + routes-hop scan — see the import-level/route-hop/template-level comments

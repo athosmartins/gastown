@@ -6007,6 +6007,16 @@ PYEOF
           DR_DEPLOY_CMD=$(_gl7n3v_runbook_field "$RIG" "deploy_cmd" || true)
           DR_SENSITIVE=$(_gl7n3v_runbook_field "$RIG" "sensitive_daemons" | tr '\n' ' ' || true)
           DR_EXTRA_ROOTS=$(_gl7n3v_runbook_field "$RIG" "extra_runtime_roots" | tr '\n' ' ' || true)
+          # ga-fzfqsu: the bug/task PASS path used to read runtime_dir/
+          # deploy_cmd/sensitive_daemons/extra_runtime_roots but NOT
+          # daemon_restarts — the static "ALWAYS kickstart" override
+          # story-delivery.sh's own Step 5 already honors for story
+          # deliveries. A bug/task deploy to a rig like lexbh (daemon_restarts
+          # = ["br.urblink.lexbh"]) silently skipped it entirely. Threaded
+          # through as FORCE_RESTART_LABELS below so daemon-refresh.sh's
+          # Step 4 restarts AND verifies freshness for it, the same as any
+          # other AFFECTED daemon — not just a fire-and-forget kick.
+          DR_FORCE_RESTART=$(_gl7n3v_runbook_field "$RIG" "daemon_restarts" | tr '\n' ' ' || true)
           DR_PRE_SHA=$(git -C "$DR_RUNTIME_DIR" rev-parse HEAD 2>/dev/null || echo "")
           DR_EPOCH=$(date +%s)
           DR_DEPLOY_FAILED=0
@@ -6078,7 +6088,8 @@ PYEOF
             DR_POST_SHA=$(git -C "$DR_RUNTIME_DIR" rev-parse HEAD 2>/dev/null || echo "")
             DR_OUT=$(RUNTIME_DIR="$DR_RUNTIME_DIR" PRE_DEPLOY_SHA="$DR_PRE_SHA" POST_DEPLOY_SHA="$DR_POST_SHA" \
               DEPLOY_EPOCH="$DR_EPOCH" SENSITIVE_DAEMONS="$DR_SENSITIVE" \
-              EXTRA_RUNTIME_ROOTS="$DR_EXTRA_ROOTS" DRY_RUN="$DRY_RUN" \
+              EXTRA_RUNTIME_ROOTS="$DR_EXTRA_ROOTS" FORCE_RESTART_LABELS="$DR_FORCE_RESTART" \
+              DRY_RUN="$DRY_RUN" \
               bash "$GC_CITY/packs/town-deltas/assets/daemon-refresh.sh" 2>&1 || true)
             # ga-l7n3v: `|| true` on all three — under this script's set -euo
             # pipefail, an unmatched grep piped into head/sed still propagates a
