@@ -151,6 +151,37 @@ V3d=$( . "$TMP/block.sh"; rebase_content_verdict "$RC" "$CMAIN" "$CBRANCH" "$CBR
 [ "$V3d" = "unknown:merge-tree-conflict" ] && ok "merge-tree(main,orig_tip) conflita de verdade => unknown:merge-tree-conflict" \
                                             || bad "conflito real deveria dar unknown:merge-tree-conflict, deu '$V3d'"
 
+# Teste 3e (ga-19rqcf) — merge-tree FALHA (rc=1, o MESMO codigo do Teste 3d
+# acima) mas SEM produzir arvore nenhuma: orig_tip e um SHA que nao existe
+# no repo ("bad revision"), nao um conflito de conteudo. Antes desta bead os
+# dois casos eram INDISTINGUIVEIS — ambos caiam em unknown:merge-tree-
+# conflict — que e exatamente o formato do falso-positivo medido ao vivo 3x
+# (ga-pgxs78's ga-is6hxl/ga-3y7rxw; este bead's wa-kohtl/ga-licuhj). Prova
+# que agora tem rotulo proprio, sem tocar no Teste 3d acima.
+BADSHA="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+V3e=$( . "$TMP/block.sh"; rebase_content_verdict "$R" "$MAIN" "$BADSHA" "$FEAT" )
+[ "$V3e" = "unknown:merge-tree-error" ] && ok "merge-tree falha sem produzir arvore (orig_tip invalido) => unknown:merge-tree-error, NAO merge-tree-conflict" \
+                                          || bad "orig_tip invalido deveria dar unknown:merge-tree-error (nunca merge-tree-conflict, nunca yes), deu '$V3e'"
+
+# Teste 3f (ga-19rqcf) — o mesmo cenario tem que carregar o stderr REAL do
+# git na mensagem de rebase_content_lost_paths() — nao mais um placeholder
+# mudo indistinguivel de um conflito genuino.
+LOST_ERR=$( . "$TMP/block.sh"; rebase_content_lost_paths "$R" "$MAIN" "$BADSHA" "$FEAT" )
+case "$LOST_ERR" in
+  *"merge-tree-error"*"not something we can merge"*) ok "rebase_content_lost_paths carrega o stderr real do git (nao mais mudo)" ;;
+  *) bad "rebase_content_lost_paths deveria citar o stderr real do git para o caso nao-conflito, deu: '$LOST_ERR'" ;;
+esac
+
+# Teste 3g (ga-19rqcf) — o conflito genuino do Teste 3d NAO ganha o rotulo
+# novo, e sua mensagem de lost_paths continua sem stderr (confirmado
+# empiricamente: merge-tree nunca escreve em stderr num conflito real —
+# tudo vai pro stdout). Se isto vazar "merge-tree-error" pra um conflito de
+# verdade, o Teste 3d ja teria pegado (compara string exata) — este e o
+# reforco do lado lost_paths().
+LOST_CONFLICT=$( . "$TMP/block.sh"; rebase_content_lost_paths "$RC" "$CMAIN" "$CBRANCH" "$CBRANCH" )
+[ "$LOST_CONFLICT" = "<could not compute: merge-tree-conflict>" ] && ok "conflito genuino mantem a mensagem original em lost_paths (sem stderr, pois nao ha)" \
+                                          || bad "conflito genuino nao deveria mudar de mensagem em lost_paths, deu: '$LOST_CONFLICT'"
+
 # Teste 4 — MUTACAO: se a comparacao nao comparar, o Teste 2 tem de ficar
 # vermelho. Sem isto, os testes acima poderiam passar por acidente.
 sed 's/if \[ "\$expected" = "\$actual" \]; then echo "yes"; else echo "no"; fi/echo "yes"/' \

@@ -3884,23 +3884,50 @@ rebase_wt_git_dir() {
 #                     :no-gitdir           — rebase_wt_git_dir(<worktree>) nao
 #                                             resolveu o git-dir compartilhado
 #                     :merge-tree-conflict — merge-tree(main_ref, orig_tip)
-#                                             conflitou ou falhou (rc!=0)
+#                                             conflitou DE VERDADE: rc!=0 E
+#                                             escreveu uma arvore/CONFLICT no
+#                                             stdout (--write-tree SEMPRE
+#                                             imprime a arvore quando chega a
+#                                             comparar as duas arvores, mesmo
+#                                             em conflito — confirmado
+#                                             empiricamente, ga-19rqcf).
+#                     :merge-tree-error    — merge-tree(main_ref, orig_tip)
+#                                             falhou (rc!=0) SEM produzir
+#                                             arvore nenhuma no stdout. NAO e
+#                                             um conflito de conteudo — e
+#                                             falha do proprio git (SHA/ref
+#                                             que o git-dir compartilhado nao
+#                                             resolveu, erro fatal, etc).
+#                                             ga-19rqcf: medido ao vivo que
+#                                             rc=1 sozinho NAO distingue os
+#                                             dois — "bad revision" tambem
+#                                             devolve rc=1 com stdout vazio,
+#                                             identico ao rc de um conflito
+#                                             real. Ate esta separacao, as 3+
+#                                             ocorrencias que sempre se
+#                                             revelaram falso-positivo
+#                                             (ga-pgxs78, este bead) caiam
+#                                             todas sob o MESMO rotulo que um
+#                                             conflito genuino — cada uma
+#                                             exigindo forense do zero so pra
+#                                             descobrir se era isto.
 #                     :bad-expected-sha    — merge-tree nao devolveu 40 hex
 #                     :bad-actual-sha      — new_tip nao resolveu pra um
 #                                             objeto arvore de 40 hex valido
 rebase_content_verdict() {
   local wt="$1" main_ref="$2" orig_tip="$3" new_tip="$4"
-  # ga-pgxs78: every "unknown" now carries WHICH of the 5 could-not-verify
+  # ga-pgxs78: every "unknown" now carries WHICH of the could-not-verify
   # conditions fired (":empty-arg" / ":no-gitdir" / ":merge-tree-conflict" /
-  # ":bad-expected-sha" / ":bad-actual-sha"). Every caller only ever compares
-  # against the literal "yes" (`[ "$X" = "yes" ]` / `!= "yes"`), so this is
-  # purely additive — costs nothing to any existing check (verified: grepped
-  # every consumer of *_CONTENT/*_VERDICT in this file, all compare against
-  # "yes", none against a bare "unknown"). Motivating incident: two live
-  # markers (ga-is6hxl, ga-3y7rxw, 2026-09-12) hit "unknown" with an EMPTY
-  # Diverging-paths list on branches later proven perfectly healthy, and
-  # bisecting which of the 5 conditions fired cost a from-scratch
-  # investigation because nothing recorded it. Next time, it will.
+  # ":merge-tree-error" / ":bad-expected-sha" / ":bad-actual-sha"). Every
+  # caller only ever compares against the literal "yes" (`[ "$X" = "yes" ]` /
+  # `!= "yes"`), so this is purely additive — costs nothing to any existing
+  # check (verified: grepped every consumer of *_CONTENT/*_VERDICT in this
+  # file, all compare against "yes", none against a bare "unknown").
+  # Motivating incident: two live markers (ga-is6hxl, ga-3y7rxw, 2026-09-12)
+  # hit "unknown" with an EMPTY Diverging-paths list on branches later proven
+  # perfectly healthy, and bisecting which condition fired cost a
+  # from-scratch investigation because nothing recorded it. Next time, it
+  # will.
   if [ -z "$wt" ] || [ -z "$main_ref" ] || [ -z "$orig_tip" ] || [ -z "$new_tip" ]; then
     echo "unknown:empty-arg"; return 0
   fi
@@ -3911,9 +3938,21 @@ rebase_content_verdict() {
   if [ -z "$gd" ]; then echo "unknown:no-gitdir"; return 0; fi
   local out rc expected actual
   out=$(git --git-dir="$gd" merge-tree --write-tree "$main_ref" "$orig_tip" 2>/dev/null); rc=$?
-  # rc!=0 = conflito (merge-tree AINDA imprime uma arvore na linha 1, entao o
-  # rc e a unica leitura honesta). Sem base de comparacao -> unknown.
-  if [ "$rc" -ne 0 ]; then echo "unknown:merge-tree-conflict"; return 0; fi
+  # ga-19rqcf: rc!=0 ALONE does not mean a real content conflict — measured
+  # live that a merge-tree call failing for an entirely different reason
+  # (e.g. a ref/SHA the shared git-dir cannot currently resolve) ALSO exits
+  # rc=1, the exact same code a genuine conflict uses ("merge-tree: <sha> -
+  # not something we can merge" is rc=1 too). The reliable signal is stdout:
+  # `--write-tree` unconditionally prints the resulting tree (plus a CONFLICT
+  # line) whenever it actually got far enough to compare two trees,
+  # conflicted or not; a call that never got that far (bad revision, fatal
+  # git error) prints nothing to stdout at all. Confirmed empirically against
+  # both shapes before shipping this split — see rebase_content_lost_paths()
+  # below for where the stderr this discards is instead captured.
+  if [ "$rc" -ne 0 ]; then
+    if [ -n "$out" ]; then echo "unknown:merge-tree-conflict"; else echo "unknown:merge-tree-error"; fi
+    return 0
+  fi
   expected=$(printf '%s\n' "$out" | head -1)
   case "$expected" in
     *[!0-9a-f]*|"") echo "unknown:bad-expected-sha"; return 0 ;;
@@ -3945,13 +3984,42 @@ rebase_content_verdict() {
 # "Diverging paths: <none captured>" fallback. Every one of the 10 call sites
 # only ever interpolates this output into a free-text log/comment string
 # (never an exact-match), so this is additive, not a contract change.
+#
+# ga-19rqcf: the merge-tree failure branch now also captures merge-tree's own
+# stderr instead of discarding it (`2>/dev/null`) — every real occurrence so
+# far (ga-pgxs78's ga-is6hxl/ga-3y7rxw; this bead's wa-kohtl/ga-licuhj, TWICE
+# in one incident) needed a full from-scratch investigation just to
+# reconstruct what git itself said, because nothing recorded it. This is a
+# SEPARATE merge-tree invocation from rebase_content_verdict()'s own (same
+# args, called microseconds later in the same shell, no other git op runs in
+# between) — if whatever made that first call fail is a transient condition
+# on the shared git-dir it will often still be true here too; whatever this
+# capture gets beats the nothing callers get today. Mirrors the
+# rebase_content_verdict() split above: a real conflict (stdout non-empty) is
+# left exactly as before (no stderr to show — confirmed empirically a real
+# conflict never writes to stderr); a merge-tree call that never produced a
+# tree gets its stderr attached instead, since that shape is exactly what was
+# being mislabeled as a "conflict" with no way to tell the two apart.
 rebase_content_lost_paths() {
   local wt="$1" main_ref="$2" orig_tip="$3" new_tip="$4"
   local gd; gd=$(rebase_wt_git_dir "$wt")
   [ -z "$gd" ] && { echo "<could not compute: no-gitdir>"; return 0; }
   local out rc expected actual
-  out=$(git --git-dir="$gd" merge-tree --write-tree "$main_ref" "$orig_tip" 2>/dev/null); rc=$?
-  [ "$rc" -ne 0 ] && { echo "<could not compute: merge-tree-conflict>"; return 0; }
+  local _rclp_err_file
+  _rclp_err_file=$(mktemp "${TMPDIR:-/tmp}/gc-gate-rclp-mergetree-err.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-rclp-mergetree-err.$$")
+  out=$(git --git-dir="$gd" merge-tree --write-tree "$main_ref" "$orig_tip" 2>"$_rclp_err_file"); rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if [ -n "$out" ]; then
+      rm -f "$_rclp_err_file" 2>/dev/null || true
+      echo "<could not compute: merge-tree-conflict>"
+    else
+      local _rclp_stderr; _rclp_stderr=$(tr '\n' ' ' < "$_rclp_err_file" 2>/dev/null | cut -c1-500)
+      rm -f "$_rclp_err_file" 2>/dev/null || true
+      echo "<could not compute: merge-tree-error — not a real conflict (rc=$rc, no tree produced); git said: ${_rclp_stderr:-<stderr empty too>}>"
+    fi
+    return 0
+  fi
+  rm -f "$_rclp_err_file" 2>/dev/null || true
   expected=$(printf '%s\n' "$out" | head -1)
   actual=$(git --git-dir="$gd" rev-parse "${new_tip}^{tree}" 2>/dev/null || echo "")
   { [ -z "$expected" ] || [ -z "$actual" ]; } && { echo "<could not compute: bad-sha>"; return 0; }
