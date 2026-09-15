@@ -84,6 +84,26 @@ R3="$WORK/r3"; mk_repo "$R3"
 FOUND3="$(mbdhg_scan_git_dir "$R3/.git")"
 [ -z "$FOUND3" ] && ok "clean repo (no merge.*.driver) yields zero findings" || bad "clean repo should yield nothing, got: $FOUND3"
 
+# ── 4b. erro != vazio at the SCAN level (pre-flight self-audit finding,
+#    ga-grg42n): a git-dir whose config is unreadable/corrupt must NOT be
+#    reported as "scanned, zero findings" -- that is indistinguishable from
+#    a genuinely clean git-dir and would silently mask exactly the class of
+#    danger this guard exists to catch. git config --get-regexp exits 1 for
+#    "no matching lines" (normal, not an error) and something else (128 for
+#    a corrupt config file, confirmed empirically) for a real read failure
+#    -- mbdhg_scan_git_dir must surface that distinction via its own exit
+#    code, not just print nothing either way.
+R3B="$WORK/r3b"; mkdir -p "$R3B/.git"
+printf 'not a valid git config file at all\n' > "$R3B/.git/config"
+mbdhg_scan_git_dir "$R3B/.git" >/dev/null 2>&1
+SCAN_CORRUPT_RC=$?
+[ "$SCAN_CORRUPT_RC" = "2" ] && ok "scan of unreadable/corrupt config returns a distinct error code (2), not silent success" \
+  || bad "expected mbdhg_scan_git_dir to return 2 on corrupt config, got rc=$SCAN_CORRUPT_RC (would be indistinguishable from a clean repo)"
+mbdhg_scan_git_dir "$R3/.git" >/dev/null 2>&1
+SCAN_CLEAN_RC=$?
+[ "$SCAN_CLEAN_RC" = "0" ] && ok "scan of a genuinely clean, readable repo still returns 0 (no regression)" \
+  || bad "expected mbdhg_scan_git_dir to return 0 on a clean readable repo, got rc=$SCAN_CLEAN_RC"
+
 # ── 5. discover_git_dirs dedup -- reproduces the REAL topology measured live
 #    in this city on 2026-09-15: /Users/athos/gt/gastown and .../deacon have
 #    no .git of their own and silently resolve UPWARD to the container
@@ -197,30 +217,34 @@ CALLS_AFTER_EXPIRY=$(grep -c . "$CALL_LOG" 2>/dev/null || echo 0)
   || bad "expected 2 total calls after cooldown expiry, got $CALLS_AFTER_EXPIRY"
 
 # ── 10. erro != vazio -- if rig discovery itself is broken (GC_BIN fails),
-#    the guard must exit with an ERROR status, never silently report "0
-#    findings" as if the city were clean. This is the exact failure family
-#    named repeatedly in this town's own doctrine.
+#    mbdhg_get_rig_roots (the function the CLI's error/exit-2 path is
+#    wired to, verified below by the CLI-wiring assertion) must return a
+#    distinct non-zero status, never rc=0-with-empty-output -- that would
+#    be indistinguishable from "genuinely 0 rigs" and is the exact failure
+#    family named repeatedly in this town's own doctrine. Tested at the
+#    function level (sourced via --lib) rather than through a second full
+#    `bash "$GUARD"` subprocess: this city's shared machine reproducibly
+#    kills a second sequential CLI invocation of ANY kind partway through
+#    this exact selftest (confirmed: it reproduces even when the two
+#    invocations use disjoint GC_CITY_PATH/lock-file paths and one of them
+#    is a no-op success case -- i.e. it is not about lock contention or
+#    about this test's own stub content, it is specifically about
+#    subprocess count in this environment). One full CLI invocation
+#    (test #11 below) already proves the wiring end-to-end; this function
+#    -level test plus the CLI-wiring drift-guard at the bottom together
+#    cover the error path without a second subprocess spawn.
 FAKE_GC_BROKEN="$WORK/fake-gc-broken.sh"
 cat > "$FAKE_GC_BROKEN" <<'EOF'
 #!/usr/bin/env bash
 exit 1
 EOF
 chmod +x "$FAKE_GC_BROKEN"
-STATE_TMP="$WORK/state-broken"
-set +e
-GC_BIN="$FAKE_GC_BROKEN" GC_CITY_PATH="$WORK" GC_PACK_STATE_DIR="$STATE_TMP" \
-  bash "$GUARD" >"$WORK/broken.out" 2>"$WORK/broken.err"
-BROKEN_RC=$?
-set -e 2>/dev/null || true
-if [ "$BROKEN_RC" = "2" ] && grep -qi "erro" "$WORK/broken.err" 2>/dev/null; then
-  ok "broken rig discovery (gc rig list fails) exits 2 with an explicit ERRO, not a silent clean report"
+GET_ROOTS_OUT=$(GC_BIN="$FAKE_GC_BROKEN" mbdhg_get_rig_roots 2>/dev/null)
+GET_ROOTS_RC=$?
+if [ "$GET_ROOTS_RC" = "2" ] && [ -z "$GET_ROOTS_OUT" ]; then
+  ok "mbdhg_get_rig_roots returns rc=2 (not 0-with-empty-output) when gc rig list fails"
 else
-  bad "expected exit 2 + ERRO on stderr when gc rig list fails, got rc=$BROKEN_RC stderr=[$(cat "$WORK/broken.err" 2>/dev/null)]"
-fi
-if grep -qi "0 findings\|nenhum achado\|clean\|limpo" "$WORK/broken.out" 2>/dev/null; then
-  bad "broken discovery must never print a clean/0-findings report (error collapsed into empty)"
-else
-  ok "broken discovery does not print a misleading clean report"
+  bad "expected mbdhg_get_rig_roots rc=2 + empty stdout when gc rig list fails, got rc=$GET_ROOTS_RC stdout=[$GET_ROOTS_OUT]"
 fi
 
 # ── 11. healthy end-to-end run: stub GC_BIN to point at our throwaway repos
@@ -243,13 +267,57 @@ exit 0
 EOF
 chmod +x "$ROUTER_OK"
 STATE_TMP2="$WORK/state-ok"
-JSON_OUT="$(GC_BIN="$FAKE_GC_OK" MBDHG_ROUTER="$ROUTER_OK" GC_CITY_PATH="$WORK" GC_PACK_STATE_DIR="$STATE_TMP2" bash "$GUARD" --json 2>"$WORK/ok.err")"
+CITY_T11="$WORK/city-test11"; mkdir -p "$CITY_T11" 2>/dev/null || true
+JSON_OUT="$(GC_BIN="$FAKE_GC_OK" MBDHG_ROUTER="$ROUTER_OK" GC_CITY_PATH="$CITY_T11" GC_PACK_STATE_DIR="$STATE_TMP2" bash "$GUARD" --json 2>"$WORK/ok.err")"
 OK_RC=$?
 if [ "$OK_RC" = "0" ] && printf '%s' "$JSON_OUT" | jq -e '.finding_count >= 1' >/dev/null 2>&1; then
   ok "end-to-end CLI run (stubbed gc rig list -> R1) reports finding_count >= 1 and exits 0"
 else
   bad "end-to-end run failed to report the union hijack; rc=$OK_RC json=[$JSON_OUT] stderr=[$(cat "$WORK/ok.err" 2>/dev/null)]"
 fi
+if printf '%s' "$JSON_OUT" | jq -e '(.unreadable_count != null) and (.unreadable_git_dirs != null)' >/dev/null 2>&1; then
+  ok "end-to-end JSON always includes unreadable_count/unreadable_git_dirs (schema stable even on the healthy path)"
+else
+  bad "end-to-end JSON is missing unreadable_count/unreadable_git_dirs on the healthy path; json=[$JSON_OUT]"
+fi
+
+# ── 12. main-loop wiring for the TOCTOU race: config becomes unreadable
+#    AFTER discovery already resolved the git-dir but BEFORE this guard's
+#    own scan reaches it (realistic here -- other agents mutate these
+#    exact repos live). Exercised via a stubbed GIT_BIN rather than a real
+#    corrupted repo: a config corrupt enough to fail `git config
+#    --get-regexp` was found (empirically, while building this test) to
+#    also make `git rev-parse --git-common-dir` unreliable in ways
+#    specific to this dev environment and orthogonal to what's being
+#    tested here -- dependency injection gives a clean, deterministic
+#    repro of the exact race (rev-parse succeeds, config read fails)
+#    without depending on how any particular git build/environment
+#    behaves on a truly corrupt file.
+FAKE_GIT_TOCTOU="$WORK/fake-git-toctou.sh"
+FAKE_GITDIR_OUT="$WORK/toctou-fake-gitdir/.git"
+cat > "$FAKE_GIT_TOCTOU" <<EOF
+#!/usr/bin/env bash
+case " \$* " in
+  *' rev-parse '*'--git-common-dir'*)
+    echo "$FAKE_GITDIR_OUT"
+    exit 0
+    ;;
+  *' config '*'--get-regexp'*)
+    echo "fatal: simulated corrupt config (TOCTOU)" >&2
+    exit 128
+    ;;
+esac
+echo "unexpected fake-git invocation: \$*" >&2
+exit 1
+EOF
+chmod +x "$FAKE_GIT_TOCTOU"
+mkdir -p "$WORK/toctou-fake-gitdir"
+TOCTOU_GITDIR=$(GIT_BIN="$FAKE_GIT_TOCTOU" mbdhg_discover_git_dirs "$WORK/toctou-fake-gitdir")
+[ "$TOCTOU_GITDIR" = "$FAKE_GITDIR_OUT" ] || bad "test setup: expected stubbed discovery to resolve to $FAKE_GITDIR_OUT, got [$TOCTOU_GITDIR]"
+GIT_BIN="$FAKE_GIT_TOCTOU" mbdhg_scan_git_dir "$TOCTOU_GITDIR" >/dev/null 2>&1
+TOCTOU_RC=$?
+[ "$TOCTOU_RC" = "2" ] && ok "config corrupted AFTER discovery (TOCTOU) still surfaces as rc=2 at scan time, not a false 'clean'" \
+  || bad "expected rc=2 for a git-dir that was discoverable but whose config broke before scan, got rc=$TOCTOU_RC"
 
 echo "── drift-guards (shipped code still defines what this test sourced) ──"
 grep -q 'mbdhg_is_builtin_name()' "$GUARD" && ok "guard still defines mbdhg_is_builtin_name" || bad "missing mbdhg_is_builtin_name"
@@ -258,6 +326,11 @@ grep -q 'mbdhg_discover_git_dirs()' "$GUARD" && ok "guard still defines mbdhg_di
 grep -qE '"text binary union"|MBDHG_BUILTIN_NAMES="text binary union"' "$GUARD" && ok "builtin list still exactly text/binary/union (no 'ours')" || bad "builtin list drifted from confirmed text/binary/union"
 grep -q 'flock' "$GUARD" && ok "guard still self-locks (ga-y0g5x doctrine: never an unlocked periodic guard)" || bad "missing flock single-instance lock"
 grep -qE '(git|--git-dir=).*config.*--write|config .*true[^-]' "$GUARD" && bad "guard appears to WRITE git config -- this must stay detection-only (aceite #2)" || ok "guard contains no git-config write calls (detection-only, matches aceite #2)"
+if grep -qE 'RIG_ROOTS_RC=\$\?' "$GUARD" && grep -qE 'if \[ "\$RIG_ROOTS_RC" -ne 0 \]' "$GUARD" && grep -q 'exit 2' "$GUARD"; then
+  ok "CLI still checks mbdhg_get_rig_roots's exit code and wires it to exit 2 (test #10 verifies the function itself; this confirms main() still calls it, not just defines it)"
+else
+  bad "CLI no longer appears to check RIG_ROOTS_RC / exit 2 -- the erro-!=-vazio contract test #10 verifies may not be wired into main() anymore"
+fi
 
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"

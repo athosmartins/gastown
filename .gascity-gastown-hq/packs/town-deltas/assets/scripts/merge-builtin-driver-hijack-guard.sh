@@ -115,16 +115,35 @@ mbdhg_is_builtin_name() {
 # Prints "<name>\t<value>" for every merge.<builtin-name>.driver entry
 # found in that git-dir's config. Read-only: `git config --get-regexp`
 # never mutates anything.
+#
+# Returns 0 on a successful read (whether or not anything matched) and 2
+# if the read itself failed (corrupt/unreadable config -- confirmed
+# empirically: `git config --get-regexp` exits 1 for "no matching lines",
+# its normal/expected empty-result signal per git-config(1), and something
+# else, e.g. 128, for a genuine failure like a corrupt config file). The
+# caller must NOT treat rc=2 the same as "scanned, found nothing" -- that
+# collapse (erro == vazio) is exactly the defect class this bead's own
+# self-audit flagged in this function on first draft. Deliberately doesn't
+# pipe git's stdout directly into the parsing loop: piping would let
+# `set -o pipefail` smuggle git's raw exit code out through the loop's own
+# status, making the rc=0/1/other distinction below unreliable.
 mbdhg_scan_git_dir() {
-  local gitdir="$1" key val name
-  "$GIT_BIN" --git-dir="$gitdir" config --get-regexp '^merge\..*\.driver$' 2>/dev/null | \
-  while IFS=' ' read -r key val; do
-    [ -n "$key" ] || continue
-    name="${key#merge.}"; name="${name%.driver}"
-    if mbdhg_is_builtin_name "$name"; then
-      printf '%s\t%s\n' "$name" "$val"
-    fi
-  done
+  local gitdir="$1" key val name out rc
+  out=$("$GIT_BIN" --git-dir="$gitdir" config --get-regexp '^merge\..*\.driver$' 2>/dev/null)
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
+    return 2
+  fi
+  if [ -n "$out" ]; then
+    while IFS=' ' read -r key val; do
+      [ -n "$key" ] || continue
+      name="${key#merge.}"; name="${name%.driver}"
+      if mbdhg_is_builtin_name "$name"; then
+        printf '%s\t%s\n' "$name" "$val"
+      fi
+    done <<< "$out"
+  fi
+  return 0
 }
 
 # mbdhg_discover_git_dirs <rig-root-path> [<rig-root-path> ...]
@@ -132,6 +151,22 @@ mbdhg_scan_git_dir() {
 # gitlinks and upward resolution transparently) AND, if a sibling
 # .repo.git exists, that git-dir's common-dir too. Prints each distinct
 # ABSOLUTE common-dir at most once, first-seen order.
+#
+# NOTE on scope: a root whose git-dir cannot be resolved at all (rc!=0
+# here) is silently skipped, same as a root that legitimately isn't a git
+# repo. Verified empirically (not assumed) that this is the right
+# boundary: a config file corrupt enough to break `git config
+# --get-regexp` (mbdhg_scan_git_dir's rc=2 case) ALSO breaks `git
+# rev-parse --git-common-dir` in this git version -- they read the same
+# file -- so such a rig never reaches the scan step regardless. That
+# failure mode is not a narrow guard-only blind spot: every other git
+# operation against that rig (Pilot dispatch, the gate, any crew work)
+# would fail identically and loudly within minutes, so this guard does
+# not separately alarm on it. mbdhg_scan_git_dir's rc=2 still matters for
+# the real in-scope case: config becoming unreadable in the TOCTOU window
+# AFTER discovery already resolved the git-dir but BEFORE this guard's own
+# scan reaches it -- realistic here since other agents mutate these exact
+# repos concurrently.
 mbdhg_discover_git_dirs() {
   local root cd1 cd2 seen=""
   for root in "$@"; do
@@ -249,31 +284,56 @@ mapfile -t GIT_DIRS < <(mbdhg_discover_git_dirs "${RIG_ROOT_ARR[@]}")
 TOTAL_DIRS=0
 FINDINGS_TSV=""
 FINDING_COUNT=0
+UNREADABLE_COUNT=0
+UNREADABLE_TSV=""
 
 for gd in "${GIT_DIRS[@]}"; do
   [ -n "$gd" ] || continue
   TOTAL_DIRS=$((TOTAL_DIRS+1))
+  scan_out=$(mbdhg_scan_git_dir "$gd")
+  scan_rc=$?
+  if [ "$scan_rc" -eq 2 ]; then
+    # erro != vazio (pre-flight self-audit finding): an unreadable git-dir
+    # is counted here, NEVER silently absorbed into "0 findings" for it --
+    # see mbdhg_scan_git_dir's own header for why rc=2 is distinct from a
+    # legitimately clean read.
+    UNREADABLE_COUNT=$((UNREADABLE_COUNT+1))
+    UNREADABLE_TSV="${UNREADABLE_TSV}${gd}
+"
+    continue
+  fi
   while IFS=$'\t' read -r fname fval; do
     [ -n "$fname" ] || continue
     FINDING_COUNT=$((FINDING_COUNT+1))
     FINDINGS_TSV="${FINDINGS_TSV}${gd}	${fname}	${fval}
 "
-  done < <(mbdhg_scan_git_dir "$gd")
+  done <<< "$scan_out"
 done
 
 if [ "$JSON_OUT" = "1" ]; then
-  printf '%s' "$FINDINGS_TSV" | jq -R -s -c --argjson n "$TOTAL_DIRS" '
+  FINDINGS_JSON=$(printf '%s' "$FINDINGS_TSV" | jq -R -s -c '
     split("\n") | map(select(length>0)) | map(split("\t")) |
-    map({git_dir: .[0], name: .[1], value: (.[2:] | join("\t"))}) as $f |
-    {git_dirs_scanned: $n, finding_count: ($f|length), findings: $f}
+    map({git_dir: .[0], name: .[1], value: (.[2:] | join("\t"))})
+  ')
+  UNREADABLE_JSON=$(printf '%s' "$UNREADABLE_TSV" | jq -R -s -c 'split("\n") | map(select(length>0))')
+  jq -n -c --argjson n "$TOTAL_DIRS" --argjson f "$FINDINGS_JSON" \
+    --argjson u_count "$UNREADABLE_COUNT" --argjson u "$UNREADABLE_JSON" '
+    {git_dirs_scanned: $n, finding_count: ($f|length), findings: $f,
+     unreadable_count: $u_count, unreadable_git_dirs: $u}
   '
 else
   echo "═══ merge-builtin-driver-hijack-guard ═══"
   echo "  git-dirs distintos varridos: $TOTAL_DIRS"
   echo "  achados (merge.<builtin>.driver espúrio): $FINDING_COUNT"
+  echo "  ilegíveis (config não leu -- NÃO é 'limpo'): $UNREADABLE_COUNT"
   if [ "$FINDING_COUNT" -gt 0 ]; then
     echo
     printf '%s' "$FINDINGS_TSV" | awk -F'\t' 'NF>=3 {printf "    %s -- merge.%s.driver=%s\n", $1, $2, $3}'
+  fi
+  if [ "$UNREADABLE_COUNT" -gt 0 ]; then
+    echo
+    echo "  ILEGÍVEL:"
+    printf '%s' "$UNREADABLE_TSV" | awk 'NF>0 {printf "    %s\n", $0}'
   fi
 fi
 
@@ -285,6 +345,16 @@ if [ "$FINDING_COUNT" -gt 0 ]; then
     body="Detectado merge.${fname}.driver=${fval} em ${gd}. '${fname}' é estratégia de merge EMBUTIDA do git (text/binary/union) -- não deveria ter driver custom registrado (mesmo mecanismo de gt-ymqjj: apagou conteúdo em silêncio, sem conflito, sem log). NÃO corrigido automaticamente por este guard -- mexer em merge driver foi o que causou aquele incidente; a correção é decisão de quem tiver contexto (ga-grg42n)."
     mbdhg_alarm_once_standalone "$key" "$subject" "$body" || true
   done < <(printf '%s' "$FINDINGS_TSV" | awk -F'\t' 'NF>=3')
+fi
+
+if [ "$UNREADABLE_COUNT" -gt 0 ]; then
+  while IFS= read -r gd; do
+    [ -n "$gd" ] || continue
+    key="${gd}|unreadable"
+    subject="config:unreadable-merge-config -- não consegui ler git config em ${gd}"
+    body="merge-builtin-driver-hijack-guard não conseguiu ler o git config de ${gd} (git config --get-regexp falhou com erro, não com 'sem match'). Não dá pra saber se há um merge.<builtin>.driver espúrio aí -- isto é ILEGÍVEL, não 'limpo'. Investigue o config desse git-dir (ga-grg42n)."
+    mbdhg_alarm_once_standalone "$key" "$subject" "$body" || true
+  done <<< "$UNREADABLE_TSV"
 fi
 
 exit 0
