@@ -1396,7 +1396,18 @@ _crew_at_inflight_cap() {
 # sets above; the caller records the winner via mark_pool_builder so the next
 # pick in the same sweep advances to a different crew.
 #   prefer  — a domain owner to take FIRST if idle (rig_domain_owner). Ignored if
-#             busy/used, falling through to normal rotation.
+#             busy/used, falling through to normal rotation. GOTCHA (ga-ax6m1b):
+#             step 1 below only matches `prefer` against rig_to_builders(rig)'s
+#             own output — for a pooled rig (WA: wa-worker-1..4) NO named
+#             single-identity crew is ever in that list, so passing one here is
+#             a silent no-op UNLESS dispatch_one already routed it straight to
+#             that owner via rig_domain_requires_persistent_owner's bypass
+#             BEFORE calling this function (see BUILDER_TARGET selection). A
+#             rig_domain_owner mapped for a domain NOT in that allowlist
+#             (e.g. real-estate/data/frontend) is deliberately advisory only —
+#             pilot-rewire intends those domains to stay pool-routed, not
+#             pinned (Scenario 17h). Re-verify against rig_domain_requires_
+#             persistent_owner before "fixing" this as dead code again.
 #   exclude — space-list of crew to DROP for this bead (rig_domain_exclude). An
 #             excluded crew is never picked — even when it's the only idle one —
 #             so the bead DEFERS rather than re-enter the wrong-domain loop.
