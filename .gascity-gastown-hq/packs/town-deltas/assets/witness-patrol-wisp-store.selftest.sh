@@ -127,7 +127,7 @@ echo "Scenario 4: fallback-block replacement code is actually correct"
 # this only inspects the bash the witness will run — not the prose above it
 # that legitimately quotes the old broken --type=wisp pattern while
 # explaining the bug (a whole-section grep false-positives on that prose).
-FALLBACK_CODE="$(sed -n "/^BD_C=(); \[ -n '{{ \.RigRoot }}' \]/,/^gc hook\$/p" "$TEMPLATE")"
+FALLBACK_CODE="$(sed -n '/^BD_C=()$/,/^gc hook$/p' "$TEMPLATE")"
 
 if [ -z "$FALLBACK_CODE" ]; then
   bad "could not isolate the fallback-block code (anchors not found — did the block change shape?)"
@@ -161,13 +161,18 @@ else
   fi
 fi
 
-# ── Scenario 5: the -C pin degrades gracefully instead of hard-failing ───────
+# ── Scenario 5: the -C pin degrades gracefully AND visibly, never silently ──
 echo ""
-echo "Scenario 5: BD_C is built defensively (empty RigRoot -> no -C, not a crash)"
-if printf '%s\n' "$NEW_SECTION" | grep -q "BD_C=(); \[ -n '{{ \.RigRoot }}' \] && BD_C=(-C '{{ \.RigRoot }}')"; then
+echo "Scenario 5: BD_C is built defensively (empty RigRoot -> no -C, not a crash) and visibly (not silently)"
+if printf '%s\n' "$NEW_SECTION" | grep -q "BD_C=(-C '{{ \.RigRoot }}')"; then
   ok "BD_C falls back to no -C when {{ .RigRoot }} is empty, instead of passing -C ''"
 else
   bad "BD_C construction MISSING or changed shape — verify the empty-RigRoot fallback still holds"
+fi
+if printf '%s\n' "$NEW_SECTION" | grep -q 'WARNING:.*RigRoot.*is empty'; then
+  ok "empty-RigRoot fallback is VISIBLE (warns to stderr) rather than silent"
+else
+  bad "empty-RigRoot fallback is SILENT — third-state violation (degrading without any signal)"
 fi
 
 # ── Verdict ───────────────────────────────────────────────────────────────────

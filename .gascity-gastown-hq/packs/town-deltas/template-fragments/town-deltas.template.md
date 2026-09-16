@@ -787,7 +787,12 @@ vez: `--type=molecule --include-infra` em vez do `--type=wisp` inválido, e
 `-C` pinando o banco certo — com fallback gracioso pro cwd antigo só no caso
 extremo de um rig sem `RigRoot`, para não travar onde não há repo dedicado):
 ```bash
-BD_C=(); [ -n '{{ .RigRoot }}' ] && BD_C=(-C '{{ .RigRoot }}')
+BD_C=()
+if [ -n '{{ .RigRoot }}' ]; then
+  BD_C=(-C '{{ .RigRoot }}')
+else
+  echo "WARNING: {{ .RigRoot }} is empty -- falling back to cwd-based bd resolution here (the ga-3v2n4 wrong-store leak can still occur in this one fallback path)." >&2
+fi
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
   CURRENT_WISP=$(gc bd "${BD_C[@]}" list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
