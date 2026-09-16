@@ -5146,6 +5146,35 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       IS_ANC=$(git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null && echo "yes" || echo "no")
 
       if [ "$IS_ANC" != "yes" ]; then
+        # ga-dpnpu5: before assuming "main moved, this branch needs a
+        # rebase", check whether the branch's own tip is ALREADY an
+        # ancestor of the just-fetched CUR_MAIN. This happens when an
+        # EARLIER attempt in this same run (or a concurrent process)
+        # already fast-forwarded this exact branch, and main has since
+        # moved further ahead on OTHER, unrelated commits — IS_ANC is then
+        # correctly "no" (this branch's ref is stale and doesn't contain
+        # those later commits) but there is nothing left to rebase or
+        # push: the content is already live in main. Attempting the
+        # rebase anyway makes every replayed commit collapse to an empty
+        # patch (its content is already upstream), and ga-y9a1d's own
+        # collapse guard a few lines below then misreads that empty range
+        # as "the rebase silently dropped this branch's commits", refusing
+        # to push and degrading an all-PASS review to FAIL on work that
+        # had already landed. Confirmed live, same day, 2 occurrences:
+        # wa-epazz (FF-merged at 15:00:02, re-reviewed after a guard
+        # re-enqueue, then re-merge-attempted at 15:14 once main had moved
+        # again — false FAIL) and ga-mxcnwm. Reuses the exact predicate
+        # Step 4b already uses to ask this same question before review
+        # (gate_branch_already_merged, ga-88sl7) — not a new detection
+        # method, and FAIL-CLOSED the same way: on any doubt it echoes "0"
+        # and this falls through to the rebase attempt exactly as before.
+        if [ "$(gate_branch_already_merged "$BRANCH" "$DEFAULT_BRANCH")" = "1" ]; then
+          log "  Merge-time rebase: main moved to $CUR_MAIN, but $BRANCH is already merged into it (ga-dpnpu5) — nothing to push. Not a failure; skipping the rebase attempt and the post-push diff-integrity check below (both are meaningless here — this content did not change during this run)."
+          MERGE_SHA="$CUR_BRANCH"
+          MERGE_RESULT="already_merged"
+          return 0
+        fi
+
         # Main moved during review — attempt inline rebase before push
         log "  Merge-time rebase: main moved to $CUR_MAIN after review; rebasing $BRANCH ..."
         local TMP_MR_WT="/tmp/gc-gate-mr-retry-$$-${MERGE_ATTEMPT}"
@@ -5626,7 +5655,17 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
     # branch still has a non-empty diff vs what was in main BEFORE the merge.
     # If any changed file regressed back to its pre-branch state, the merge
     # silently dropped changes — revert and bounce to author.
-    if [[ ! "$MERGE_RESULT" = failed* ]] && [ "$MERGE_RESULT" != "dry_run" ]; then
+    #
+    # ga-dpnpu5: also excludes MERGE_RESULT=already_merged. Nothing was
+    # pushed this run (do_merge_ff's already-merged short-circuit above
+    # returns before any push), so there is no fresh diff to verify — and
+    # this check's MAIN_HEAD_SHA baseline can be stale by minutes-to-hours
+    # (last refreshed whenever this marker was originally claimed, not
+    # refreshed for an already-merged short-circuit the way a real rebase
+    # attempt refreshes it). Running it anyway risks a FALSE integrity-fail
+    # that force-reverts main for content that never actually moved in
+    # this run — a much worse outcome than the false FAIL this bead fixes.
+    if [[ ! "$MERGE_RESULT" = failed* ]] && [ "$MERGE_RESULT" != "dry_run" ] && [ "$MERGE_RESULT" != "already_merged" ]; then
       log "Post-merge diff-integrity check (Bug 1b belt-and-suspenders) ..."
       git_rig fetch origin 2>/dev/null || warn "Post-merge fetch failed; integrity check may use stale refs"
 
