@@ -3853,12 +3853,7 @@ _filter_dispatch_gates() {
       (((.status) // "open") as $s | ($s != "blocked" and $s != "closed" and $s != "deferred"))
       and ( (((.metadata["story.criterios"]) // "") | test("\\S"))
         or (((.description) // "") | length) >= $floor )
-      and (((.labels // []) | map(select(test("^(blocked-on|blocked|depends-on):"))) | length) == 0)
       and ((((.title) // "") + " " + ((.description) // "")) | ascii_downcase | test("design[ -]?first") | not)
-      and (((.labels // []) | map(select(
-            test("^waiting-on:")
-            or (test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not))
-          )) | length) == 0)
     )]'
   local _dg_input _dg_out _dg_reasons
   _dg_input=$(cat)
@@ -3873,20 +3868,16 @@ _filter_dispatch_gates() {
   # individually. Read-only — never influences $_dg_out above. Always computed
   # (not gated) so a delta produces a trace unconditionally; PILOT_DISPATCH_GATES_DEBUG=1
   # additionally emits the older verbose single-line-per-bead form for anything
-  # already parsing that exact format.
+  # already parsing that exact format. ga-eirlk5: gates (c)/(d) (precondition-label,
+  # blocking-label) moved to _filter_label_vetoes below — their reasons are logged
+  # there now, not here; a bead already excluded by (a)/(b)/design-first never
+  # reaches _filter_label_vetoes so it is not double-logged.
   _dg_reasons=$(printf '%s' "$_dg_input" | jq --argjson floor "$floor" -r '
       .[] | . as $b
       | [
           (if ((($b.status) // "open") as $s | ($s == "blocked" or $s == "closed" or $s == "deferred")) then "status:\($b.status // "open")" else empty end),
           (if ( ((($b.metadata["story.criterios"]) // "") | test("\\S")) or ((($b.description) // "") | length) >= $floor ) then empty else "no-spec(empty-criterios,desc<\($floor)chars)" end),
-          ( ((($b.labels) // []) | map(select(test("^(blocked-on|blocked|depends-on):")))) as $pl
-            | if ($pl | length) == 0 then empty else "precondition-label:\($pl | join(","))" end ),
-          (if (((($b.title) // "") + " " + (($b.description) // "")) | ascii_downcase | test("design[ -]?first")) then "design-first" else empty end),
-          ( ((($b.labels) // []) | map(select(
-                test("^waiting-on:")
-                or (test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not))
-              ))) as $wl
-            | if ($wl | length) == 0 then empty else "blocking-label:\($wl | join(","))" end )
+          (if (((($b.title) // "") + " " + (($b.description) // "")) | ascii_downcase | test("design[ -]?first")) then "design-first" else empty end)
         ] as $reasons
       | select(($reasons | length) > 0)
       | [$b.id, ($reasons | join(";"))] | @tsv
@@ -3899,28 +3890,89 @@ _filter_dispatch_gates() {
     done
   fi
 
-  printf '%s' "$_dg_out"
+  printf '%s' "$_dg_out" | _filter_label_vetoes
+}
+
+# _filter_label_vetoes — ga-eirlk5: gates (c)+(d) of _filter_dispatch_gates
+# (precondition-label, blocking-label), extracted to their own function so
+# EVERY pool applies the exact same next-action:/waiting-on:/blocked(-on)/
+# depends-on predicate from ONE place: the full _filter_dispatch_gates bundle
+# (TIER2_JSON, CTXREADY_JSON, every rig pool) calls it via the pipe above, AND
+# the HQ Tier-1 pool (BUGS_JSON/DEBT_JSON/CHORE_JSON/TASK_JSON) calls it
+# directly, chained after _filter_terminal_status below. Before this fix,
+# Tier-1 HQ ran _filter_terminal_status only — never this predicate — so a
+# next-action:mayor task (or waiting-on:/blocked-on:/depends-on: bead) was
+# dispatched straight to a builder with "no human review required"
+# (ga-eirlk5 incident: ga-1exon4, next-action:mayor since creation, dispatched
+# to gastown.dog anyway). One shared function means the two paths cannot
+# silently diverge like that again.
+# Deliberately excludes gate (a) [terminal status — _filter_terminal_status
+# covers Tier-1 HQ, the inline status check above covers everyone else], gate
+# (b) [the 20-char spec floor — ga-mdpe4c found it drops real
+# short-description bugs and Tier-1 HQ must stay exempt from it], and the
+# unlettered design-first text-veto (out of scope for ga-eirlk5, which only
+# asked for the label vetoes named in its title).
+_filter_label_vetoes() {
+  local _lv_filter='[ .[] | select(
+      (((.labels // []) | map(select(test("^(blocked-on|blocked|depends-on):"))) | length) == 0)
+      and (((.labels // []) | map(select(
+            test("^waiting-on:")
+            or (test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not))
+          )) | length) == 0)
+    )]'
+  local _lv_input _lv_out _lv_reasons
+  _lv_input=$(cat)
+  _lv_out=$(printf '%s' "$_lv_input" | jq "$_lv_filter" 2>/dev/null)
+  if [ -z "$_lv_out" ]; then
+    printf '%s' "$_lv_input"
+    return
+  fi
+
+  _lv_reasons=$(printf '%s' "$_lv_input" | jq -r '
+      .[] | . as $b
+      | [
+          ( ((($b.labels) // []) | map(select(test("^(blocked-on|blocked|depends-on):")))) as $pl
+            | if ($pl | length) == 0 then empty else "precondition-label:\($pl | join(","))" end ),
+          ( ((($b.labels) // []) | map(select(
+                test("^waiting-on:")
+                or (test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not))
+              ))) as $wl
+            | if ($wl | length) == 0 then empty else "blocking-label:\($wl | join(","))" end )
+        ] as $reasons
+      | select(($reasons | length) > 0)
+      | [$b.id, ($reasons | join(";"))] | @tsv
+    ' 2>/dev/null)
+  printf '%s\n' "$_lv_reasons" | _log_exclusions "_filter_label_vetoes"
+  if [ "${PILOT_DISPATCH_GATES_DEBUG:-0}" = "1" ]; then
+    printf '%s\n' "$_lv_reasons" | while IFS=$'\t' read -r _vid _vreasons; do
+      [ -z "$_vid" ] && continue
+      log "_filter_label_vetoes veto id=$_vid reasons=$_vreasons" >&2
+    done
+  fi
+
+  printf '%s' "$_lv_out"
 }
 
 # _filter_terminal_status — ga-mdpe4c: drop status=blocked/closed/deferred
 # candidates, same as gate (a) of _filter_dispatch_gates above, but WITHOUT
-# gates (b)/(c)/(d) (spec-floor, precondition-label, waiting-on). Exists
-# because the HQ Tier-1 queries below (BUGS_JSON/DEBT_JSON/CHORE_JSON/
-# TASK_JSON) never ran _filter_dispatch_gates at all — unlike TIER2_JSON,
-# CTXREADY_JSON, and every rig-side pool, which all do — so a status=deferred
-# bug/debt/chore/task bead (dc-4v71: status=deferred, priority=3, zero labels)
-# kept re-entering the pool every sweep, getting logged as "Selected" and
-# refused downstream by the ownership guard, instead of being excluded at the
-# source the way `bd ready` already excludes deferred by definition.
+# gate (b) (spec-floor). Exists because the HQ Tier-1 queries below
+# (BUGS_JSON/DEBT_JSON/CHORE_JSON/TASK_JSON) never ran _filter_dispatch_gates
+# at all — unlike TIER2_JSON, CTXREADY_JSON, and every rig-side pool, which
+# all do — so a status=deferred bug/debt/chore/task bead (dc-4v71:
+# status=deferred, priority=3, zero labels) kept re-entering the pool every
+# sweep, getting logged as "Selected" and refused downstream by the ownership
+# guard, instead of being excluded at the source the way `bd ready` already
+# excludes deferred by definition.
 # Deliberately NOT reusing _filter_dispatch_gates wholesale here: doing so
-# would ALSO newly apply gate (b)'s 20-char spec floor and gates (c)/(d)'s
-# label checks to every HQ Tier-1 bug/debt/chore/task for the first time — a
-# materially larger behavior change than this bug asks for, and one with a
-# real blast radius (confirmed empirically: it silently dropped a real
-# fixture bug whose only "defect" was an intentionally short, unrelated-test
-# description — see pilot-dispatcher.selftest.sh Scenario 7/8, tt-depblk).
-# Tier 1 bugs/debt/chore/task are still gated on spec/precondition/waiting-on
-# by nothing (same as before this fix) — only the status leak is closed here.
+# would ALSO newly apply gate (b)'s 20-char spec floor to every HQ Tier-1
+# bug/debt/chore/task for the first time — a materially larger behavior
+# change than this bug asked for, and one with a real blast radius (confirmed
+# empirically: it silently dropped a real fixture bug whose only "defect" was
+# an intentionally short, unrelated-test description — see
+# pilot-dispatcher.selftest.sh Scenario 7/8, tt-depblk).
+# ga-eirlk5: gates (c)+(d) (precondition-label, blocking-label) DO now apply
+# to Tier-1 HQ, via _filter_label_vetoes chained after this function at each
+# of the 4 call sites below — only gate (b)'s spec floor stays HQ-Tier-1-exempt.
 _filter_terminal_status() {
   local _fts_in _fts_out
   _fts_in=$(cat)
@@ -7025,8 +7077,10 @@ BUGS_JSON=$(bd -C "$GC_CITY" list --json \
 # ga-mdpe4c: BUGS_JSON/DEBT_JSON/CHORE_JSON/TASK_JSON below never excluded a
 # status=blocked/closed/deferred candidate — see _filter_terminal_status's own
 # comment (above _filter_dispatch_gates) for why a narrow filter, not the full
-# _filter_dispatch_gates gate bundle, is used here.
-BUGS_JSON=$(echo "$BUGS_JSON" | _filter_exec_manual | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_terminal_status)
+# _filter_dispatch_gates gate bundle, is used here. ga-eirlk5: gates (c)+(d)
+# (next-action:/waiting-on:/blocked(-on)/depends-on) are now applied too, via
+# _filter_label_vetoes — only gate (b)'s spec floor stays HQ-Tier-1-exempt.
+BUGS_JSON=$(echo "$BUGS_JSON" | _filter_exec_manual | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_terminal_status | _filter_label_vetoes)
 
 DEBT_JSON=$(bd -C "$GC_CITY" list --json \
   -l "tech-debt" \
@@ -7040,7 +7094,7 @@ DEBT_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-type epic \
   -n 0 \
   2>/dev/null || echo "[]")
-DEBT_JSON=$(echo "$DEBT_JSON" | _filter_exec_manual | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_terminal_status)
+DEBT_JSON=$(echo "$DEBT_JSON" | _filter_exec_manual | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_terminal_status | _filter_label_vetoes)
 
 # ga-ciyypt: chore/task never got the unconditional Tier-1 treatment BUGS_JSON/
 # DEBT_JSON give bug/tech-debt above — they ONLY flowed through CTXREADY_JSON
@@ -7074,7 +7128,7 @@ CHORE_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-type epic \
   -n 0 \
   2>/dev/null || echo "[]")
-CHORE_JSON=$(echo "$CHORE_JSON" | _filter_exec_manual | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_terminal_status)
+CHORE_JSON=$(echo "$CHORE_JSON" | _filter_exec_manual | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_terminal_status | _filter_label_vetoes)
 
 TASK_JSON=$(bd -C "$GC_CITY" list --json \
   -t task \
@@ -7092,7 +7146,7 @@ TASK_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-type epic \
   -n 0 \
   2>/dev/null || echo "[]")
-TASK_JSON=$(echo "$TASK_JSON" | _filter_exec_manual | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_terminal_status)
+TASK_JSON=$(echo "$TASK_JSON" | _filter_exec_manual | _reconcile_empty_description_signal "$GC_CITY" | _reconcile_text_veto_labels "$GC_CITY" | _filter_candidates | _filter_terminal_status | _filter_label_vetoes)
 
 # Merge bugs + debt + chore + task, deduplicate by id
 TIER1_JSON=$(echo "$BUGS_JSON $DEBT_JSON $CHORE_JSON $TASK_JSON" \

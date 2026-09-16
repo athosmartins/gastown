@@ -4634,6 +4634,7 @@ has "$DISPATCHER" '_filter_exec_manual | _filter_candidates | _filter_dispatch_g
 # see the dedicated "Scenario ga-f7bek" block below for full AC coverage).
 _FDG="$(grep '^log()' "$DISPATCHER")
 $(sed -n '/^_log_exclusions() {/,/^}$/p' "$DISPATCHER")
+$(sed -n '/^_filter_label_vetoes() {/,/^}$/p' "$DISPATCHER")
 $(awk '/^_filter_dispatch_gates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
 FDG_OUT="$(eval "$_FDG"; printf '%s' '[
   {"id":"fdg-clean","status":"open","description":"a ready bead with a full description over the floor length","labels":["lane:small"]},
@@ -5076,14 +5077,17 @@ if echo "$LOG22I" | grep -q "Lane picks — small: tt-open-keep"; then
 else
   bad "the open bug was NOT dispatched — gate (a) over-filtered the HQ Tier-1 pool"
 fi
-has "$DISPATCHER" 'BUGS_JSON=\$\(echo "\$BUGS_JSON" .* _filter_candidates \| _filter_terminal_status\)' \
-  "structural: BUGS_JSON pipes through _filter_terminal_status (ga-mdpe4c)"
-has "$DISPATCHER" 'DEBT_JSON=\$\(echo "\$DEBT_JSON" .* _filter_candidates \| _filter_terminal_status\)' \
-  "structural: DEBT_JSON pipes through _filter_terminal_status (ga-mdpe4c)"
-has "$DISPATCHER" 'CHORE_JSON=\$\(echo "\$CHORE_JSON" .* _filter_candidates \| _filter_terminal_status\)' \
-  "structural: CHORE_JSON pipes through _filter_terminal_status (ga-mdpe4c)"
-has "$DISPATCHER" 'TASK_JSON=\$\(echo "\$TASK_JSON" .* _filter_candidates \| _filter_terminal_status\)' \
-  "structural: TASK_JSON pipes through _filter_terminal_status (ga-mdpe4c)"
+# ga-eirlk5: all 4 now also pipe through _filter_label_vetoes (gates (c)+(d) —
+# next-action:/waiting-on:/blocked(-on)/depends-on) after _filter_terminal_status;
+# gate (b)'s spec floor still deliberately excluded (see Scenario 22j below).
+has "$DISPATCHER" 'BUGS_JSON=\$\(echo "\$BUGS_JSON" .* _filter_candidates \| _filter_terminal_status \| _filter_label_vetoes\)' \
+  "structural: BUGS_JSON pipes through _filter_terminal_status + _filter_label_vetoes (ga-mdpe4c + ga-eirlk5)"
+has "$DISPATCHER" 'DEBT_JSON=\$\(echo "\$DEBT_JSON" .* _filter_candidates \| _filter_terminal_status \| _filter_label_vetoes\)' \
+  "structural: DEBT_JSON pipes through _filter_terminal_status + _filter_label_vetoes (ga-mdpe4c + ga-eirlk5)"
+has "$DISPATCHER" 'CHORE_JSON=\$\(echo "\$CHORE_JSON" .* _filter_candidates \| _filter_terminal_status \| _filter_label_vetoes\)' \
+  "structural: CHORE_JSON pipes through _filter_terminal_status + _filter_label_vetoes (ga-mdpe4c + ga-eirlk5)"
+has "$DISPATCHER" 'TASK_JSON=\$\(echo "\$TASK_JSON" .* _filter_candidates \| _filter_terminal_status \| _filter_label_vetoes\)' \
+  "structural: TASK_JSON pipes through _filter_terminal_status + _filter_label_vetoes (ga-mdpe4c + ga-eirlk5)"
 
 echo "Scenario 22j: gate (a)-only boundary — a short-description (<20 char) HQ Tier-1 bug still dispatches (gate (b) NOT applied, ga-mdpe4c)"
 FAKE_TIER1_SHORTDESC='[
@@ -7005,6 +7009,7 @@ echo "Scenario ga-f7bek: _filter_dispatch_gates next-action crew-routing vs wait
 # per-bead signal to shortcut the ~2h it took to root-cause the first time).
 _FDG_F7BEK="$(grep '^log()' "$DISPATCHER")
 $(sed -n '/^_log_exclusions() {/,/^}$/p' "$DISPATCHER")
+$(sed -n '/^_filter_label_vetoes() {/,/^}$/p' "$DISPATCHER")
 $(awk '/^_filter_dispatch_gates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
 
 # (a) AC2+AC3, real label shapes from ga-f7bek's own investigation (wa-pltmi/91agg/
@@ -7059,6 +7064,7 @@ echo "Scenario ga-yavyq: _filter_dispatch_gates recognizes bare blocked:* precon
 # _EXTRA_ALARM_SUPPRESS_PREFIXES (same bug, same namespace gap, two daemons).
 _FDG_YAVYQ="$(grep '^log()' "$DISPATCHER")
 $(sed -n '/^_log_exclusions() {/,/^}$/p' "$DISPATCHER")
+$(sed -n '/^_filter_label_vetoes() {/,/^}$/p' "$DISPATCHER")
 $(awk '/^_filter_dispatch_gates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
 
 YAVYQ_FIXTURE='[

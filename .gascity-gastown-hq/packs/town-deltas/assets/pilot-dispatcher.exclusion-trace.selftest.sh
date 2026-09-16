@@ -316,9 +316,20 @@ echo "Scenario 3: _filter_dispatch_gates — ga-f7bek concrete regression (AC1 +
 # and MUST veto. This scenario proves the new trace fires on the real blocker and
 # stays silent on the routing label — exactly the distinction ga-f7bek needed.
 DG_FN="$(extract_fn _filter_dispatch_gates)"
+# ga-eirlk5: _filter_dispatch_gates now delegates gates (c)+(d) (precondition-label,
+# blocking-label) to _filter_label_vetoes instead of inlining them — extract and
+# source it too, or the pipe at the end of _filter_dispatch_gates hits "command not
+# found", silently swallowing its own stdout (set -uo pipefail is NOT in effect
+# inside these generated harness scripts, so this fails quiet, not loud).
+FLV_FN="$(extract_fn _filter_label_vetoes)"
+if [ -z "$FLV_FN" ]; then
+  echo "FATAL: _filter_label_vetoes() not found in $DISPATCHER — has ga-eirlk5 landed?" >&2
+  exit 2
+fi
 cat > "$WORK/s3.sh" <<EOF
 $LOG_FN
 $LE_FN
+$FLV_FN
 $DG_FN
 INPUT='[
   {"id":"ga-still-blocked","status":"open","description":"a real task with enough spec text here","labels":["next-action:mayor"]},
@@ -332,17 +343,53 @@ S3_IDS="$(printf '%s' "$S3_OUT" | jq -c '[.[].id] | sort' 2>/dev/null)"
 [ "$S3_IDS" = '["wa-lxe76"]' ] \
   && ok "_filter_dispatch_gates: bare next-action vetoes, crew-routing next-action:*-constroi passes (ga-f7bek fix intact)" \
   || bad "_filter_dispatch_gates output wrong (got: '$S3_IDS')"
-grep -qF '[pilot] EXCLUÍDO ga-still-blocked por _filter_dispatch_gates:' "$WORK/s3.stderr" \
+# ga-eirlk5: gates (c)/(d) ("blocking-label" reasons included) are now logged by
+# _filter_label_vetoes, the function that actually applies them — not by
+# _filter_dispatch_gates, which only delegates to it. More precise attribution,
+# not a regression: _filter_dispatch_gates' OWN reasons (status/no-spec/design-first)
+# still log under its own name (see Scenario 3b below).
+grep -qF '[pilot] EXCLUÍDO ga-still-blocked por _filter_label_vetoes:' "$WORK/s3.stderr" \
   && grep -qF 'blocking-label:next-action:mayor' "$WORK/s3.stderr" \
   && ok "AC1 (ga-f7bek regression): bare next-action:mayor veto now names the exact label" \
   || bad "AC1: ga-still-blocked exclusion line missing/imprecise"
-grep -qF '[pilot] EXCLUÍDO ga-waiting por _filter_dispatch_gates:' "$WORK/s3.stderr" \
+grep -qF '[pilot] EXCLUÍDO ga-waiting por _filter_label_vetoes:' "$WORK/s3.stderr" \
   && grep -qF 'blocking-label:waiting-on:athos' "$WORK/s3.stderr" \
   && ok "AC1: waiting-on:athos veto names the exact label" \
   || bad "AC1: ga-waiting exclusion line missing/imprecise"
 grep -qF 'wa-lxe76' "$WORK/s3.stderr" \
   && bad "AC4: wa-lxe76 (crew-routing label, NOT a real veto) must not appear in the exclusion trace" \
   || ok "AC4: routing-label bead wa-lxe76 produces no exclusion line (ga-f7bek fix not regressed)"
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "Scenario 3b (ga-eirlk5 refactor guard): _filter_dispatch_gates' OWN reasons"
+echo "  (status/no-spec/design-first) still log under ITS OWN name post-refactor —"
+echo "  only gates (c)/(d) moved to _filter_label_vetoes, not (a)/(b)/design-first."
+cat > "$WORK/s3b.sh" <<EOF
+$LOG_FN
+$LE_FN
+$FLV_FN
+$DG_FN
+INPUT='[
+  {"id":"ga-still-open-normal","status":"open","description":"a real task with enough spec text here","labels":[]},
+  {"id":"ga-was-blocked","status":"blocked","description":"a real task with enough spec text here","labels":[]},
+  {"id":"ga-nospec","status":"open","description":"short","labels":[]}
+]'
+printf '%s' "\$INPUT" | _filter_dispatch_gates
+EOF
+S3B_OUT="$(bash "$WORK/s3b.sh" 2>"$WORK/s3b.stderr")"
+S3B_IDS="$(printf '%s' "$S3B_OUT" | jq -c '[.[].id] | sort' 2>/dev/null)"
+[ "$S3B_IDS" = '["ga-still-open-normal"]' ] \
+  && ok "_filter_dispatch_gates still drops status=blocked and under-spec beads (gates (a)/(b) intact)" \
+  || bad "_filter_dispatch_gates output wrong (got: '$S3B_IDS')"
+grep -qF '[pilot] EXCLUÍDO ga-was-blocked por _filter_dispatch_gates:' "$WORK/s3b.stderr" \
+  && grep -qF 'status:blocked' "$WORK/s3b.stderr" \
+  && ok "gate (a) [status] still logs under _filter_dispatch_gates' own name (not moved)" \
+  || bad "gate (a) exclusion line missing/imprecise/misattributed"
+grep -qF '[pilot] EXCLUÍDO ga-nospec por _filter_dispatch_gates:' "$WORK/s3b.stderr" \
+  && grep -qF 'no-spec' "$WORK/s3b.stderr" \
+  && ok "gate (b) [no-spec] still logs under _filter_dispatch_gates' own name (not moved)" \
+  || bad "gate (b) exclusion line missing/imprecise/misattributed"
 
 # ════════════════════════════════════════════════════════════════════════════
 echo ""
@@ -555,6 +602,7 @@ $CAP
 $TVP
 $FC_FN
 $EM_FN
+$FLV_FN
 $DG_FN
 $FB_FN
 $UB_FN
@@ -663,6 +711,7 @@ printf '%s' '$FIXTURES' | $fname" 2>/dev/null | jq -S . 2>/dev/null)
   ]'
   new_out=$(bash -c "$LOG_FN
 $LE_FN
+$FLV_FN
 $DG_FN
 printf '%s' '$DG_FIXTURES' | _filter_dispatch_gates" 2>/dev/null | jq -S . 2>/dev/null)
   old_out=$(bash -c "$LOG_FN
