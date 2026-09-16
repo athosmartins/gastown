@@ -34,6 +34,7 @@ for fn in janitor_decide janitor_story_decide token_bounded scan_commit_for_bead
           janitor_branch_decide normalize_bead_status branch_is_fresh \
           bead_lookup_one resolve_bead_state \
           commit_epoch commit_evidence_stale comments_for_bead commit_touches_only_pending_patch \
+          terminal_passed_marker_epoch marker_evidence_stale \
           sling_beads_from_show sling_signals_for_id sling_fallback_eligible_reason; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by janitor"; exit 1; }
 done
@@ -221,6 +222,38 @@ eq "stale AND docs-only together → docs-only reason wins (both suppress the sa
 eq "not-docs-only + marker signal → still closes normally" \
    "$(janitor_decide 0 0 0 1 0 0 0 0 0 0)" "close:terminal-gate-marker-passed"
 
+# ── 1a7. janitor_decide sig_marker_stale — reverted-merge stale-marker guard (ga-tysvjp) ──
+# ga-nkqook shape: the Mayor reopened the bead with fresh, narrow, still-open scope; 18
+# minutes later the ga-hcj4 stranded-wrapper sweep found the bead's OLD terminal-passed
+# marker (whose underlying merge had since been reverted, wa-h2kp5 — nothing relabeled it
+# to gate-status:superseded) and closed the bead anyway. sig_marker_stale=1 means a bead
+# comment postdates the marker's own closed_at — it suppresses signal B ALONE; signals A/C
+# are bead-specific and authoritative, so they still close normally even when stale=1.
+echo "── 1a7. janitor_decide sig_marker_stale (reverted-merge stale-marker guard, ga-tysvjp) ──"
+eq "backward-compat: 10 args, no 11th → marker still closes" \
+   "$(janitor_decide 0 0 0 1 0 0 0 0 0 0)" "close:terminal-gate-marker-passed"
+eq "stale marker alone → KEEP (the ga-nkqook false-close this fix prevents)" \
+   "$(janitor_decide 0 0 0 1 0 0 0 0 0 0 1)" "keep:marker-evidence-superseded-by-newer-comment"
+eq "stale marker + commit also fires → commit still closes (signal A unaffected)" \
+   "$(janitor_decide 0 0 1 1 0 0 0 0 0 0 1)" "close:commit-in-origin-main"
+eq "stale marker + branch also fires → branch still closes (signal C unaffected)" \
+   "$(janitor_decide 0 0 0 1 1 0 0 0 0 0 1)" "close:branch-ancestor-of-origin-main"
+eq "stale=1 but no marker signal at all → falls through to no-merge-evidence" \
+   "$(janitor_decide 0 0 0 0 0 0 0 0 0 0 1)" "keep:no-merge-evidence"
+eq "stale=0 explicit (not just omitted) → marker still closes" \
+   "$(janitor_decide 0 0 0 1 0 0 0 0 0 0 0)" "close:terminal-gate-marker-passed"
+# Guard precedence unchanged: epic/open-marker still beat a stale-flagged marker too.
+eq "epic beats stale marker → keep (epic reason, not marker-stale reason)" \
+   "$(janitor_decide 1 0 0 1 0 0 0 0 0 0 1)" "keep:epic-parent-never-autoclosed"
+eq "open-marker beats stale marker → keep (open-marker reason)" \
+   "$(janitor_decide 0 1 0 1 0 0 0 0 0 0 1)" "keep:active-open-gate-marker"
+# Interaction with ga-v8ui5's sig_marker_superseded: the stale-marker fallback reason wins
+# (same precedence as sig_commit_stale's own fallback over sig_marker_superseded above) —
+# these are independent booleans (a bead can carry one stale-passed marker and a SEPARATE
+# superseded marker at once), and the stale-passed marker is the more specific finding.
+eq "stale marker + a separate superseded marker → stale-marker reason wins" \
+   "$(janitor_decide 0 0 0 1 0 0 1 0 0 0 1)" "keep:marker-evidence-superseded-by-newer-comment"
+
 # ── 1b. janitor_story_decide — merged story:approved → story:done (ga-gosfs) ──
 # Args: <is_epic> <has_open_marker> <already_done> <in_flight> <has_builder>
 #       <delivery_active> <sig_commit> <sig_marker> <sig_branch>
@@ -312,6 +345,29 @@ eq "already-done beats docs-only-only → keep (idempotent)" \
 # Fixture CONTROLE: NOT docs-only (0) → commit still drives done exactly as before.
 eq "not-docs-only + commit signal → still done normally" \
    "$(janitor_story_decide 0 0 0 0 0 0 1 0 0 0 0 0)" "done:commit-in-origin-main"
+
+# ── 1b5. janitor_story_decide sig_marker_stale — reverted-merge stale-marker guard (ga-tysvjp) ──
+# Same parity as janitor_decide §1a7: a story's terminal gate-status:passed marker can be
+# just as stale as a bug/task bead's (a revert after PASS that never relabeled the marker
+# to gate-status:superseded). The suppression mirrors janitor_decide §1a7 exactly (13th arg
+# here vs 11th there, since janitor_story_decide already carries the 6 story-specific guard
+# args up front).
+echo "── 1b5. janitor_story_decide sig_marker_stale (reverted-merge stale-marker guard, ga-tysvjp) ──"
+eq "backward-compat: 12 args, no 13th → marker still done" \
+   "$(janitor_story_decide 0 0 0 0 0 0 0 1 0 0 0 0)" "done:terminal-gate-marker-passed"
+eq "stale marker alone → KEEP (not forced to story:done)" \
+   "$(janitor_story_decide 0 0 0 0 0 0 0 1 0 0 0 0 1)" "keep:marker-evidence-superseded-by-newer-comment"
+eq "stale marker + commit also fires → commit still drives done (signal A unaffected)" \
+   "$(janitor_story_decide 0 0 0 0 0 0 1 1 0 0 0 0 1)" "done:commit-in-origin-main"
+eq "stale marker + branch also fires → branch still drives done (signal C unaffected)" \
+   "$(janitor_story_decide 0 0 0 0 0 0 0 1 1 0 0 0 1)" "done:branch-ancestor-of-origin-main"
+eq "in-flight guard still beats a stale-flagged marker" \
+   "$(janitor_story_decide 0 0 0 1 0 0 0 1 0 0 0 0 1)" "keep:story-in-flight-active-rework"
+eq "already-done beats stale-marker-only → keep (idempotent)" \
+   "$(janitor_story_decide 0 0 1 0 0 0 0 1 0 0 0 0 1)" "keep:already-story-done"
+# Fixture CONTROLE: NOT stale (0) → marker still drives done exactly as before.
+eq "not-stale + marker signal → still done normally" \
+   "$(janitor_story_decide 0 0 0 0 0 0 0 1 0 0 0 0 0)" "done:terminal-gate-marker-passed"
 
 # ── 1c. janitor_branch_decide — crew-branch prune (ga-tijv5 extension) ──────
 # Args: <ahead> <content_in_main> <bead_state> <live_worktree> <is_fresh>. A branch
@@ -595,6 +651,33 @@ rc1 commit_evidence_stale "$CWA" ""                                    # empty c
 rc1 commit_evidence_stale "$CWA" "not-a-number"                        # non-numeric commit_epoch
 rc1 commit_evidence_stale "not json" 1784942993                        # unparseable comments blob
 rc1 commit_evidence_stale '[{"created_at":"not-a-date"}]' 1784942993   # unparseable created_at
+
+# ── 4c. terminal_passed_marker_epoch + marker_evidence_stale — synthetic fixtures (ga-tysvjp) ──
+# marker_evidence_stale is a thin wrapper around commit_evidence_stale (already
+# exhaustively fixture-tested in §4b for the comment-parsing side) — these tests cover
+# the NEW selection logic: closed_at vs updated_at fallback, filtering by
+# status=closed+gate-status:passed, and picking the MAX epoch across multiple markers.
+echo "── 4c. terminal_passed_marker_epoch + marker_evidence_stale (ga-tysvjp) ──"
+MP_CLOSED_AT='[{"status":"closed","labels":["gate-status:passed"],"closed_at":"2026-01-01T00:00:00Z","updated_at":"2026-02-01T00:00:00Z"}]'
+eq "prefers closed_at over updated_at when both present" \
+   "$(terminal_passed_marker_epoch "$MP_CLOSED_AT")" "1767225600"
+MP_UPDATED_ONLY='[{"status":"closed","labels":["gate-status:passed"],"updated_at":"2026-02-01T00:00:00Z"}]'
+eq "falls back to updated_at when closed_at absent" \
+   "$(terminal_passed_marker_epoch "$MP_UPDATED_ONLY")" "1769904000"
+MP_TWO='[{"status":"closed","labels":["gate-status:passed"],"closed_at":"2026-01-01T00:00:00Z"},{"status":"closed","labels":["gate-status:passed"],"closed_at":"2026-03-01T00:00:00Z"}]'
+eq "picks the MAX epoch across multiple matching markers" \
+   "$(terminal_passed_marker_epoch "$MP_TWO")" "1772323200"
+MP_IGNORES_OTHERS='[{"status":"open","labels":["gate-status:passed"],"closed_at":"2026-03-01T00:00:00Z"},{"status":"closed","labels":["gate-status:superseded"],"closed_at":"2026-03-01T00:00:00Z"},{"status":"closed","labels":["gate-status:passed"],"closed_at":"2026-01-01T00:00:00Z"}]'
+eq "ignores open markers and non-passed labels, uses only the matching one" \
+   "$(terminal_passed_marker_epoch "$MP_IGNORES_OTHERS")" "1767225600"
+eq "no matching marker at all → -1 (fail-open sentinel, non-numeric-safe)" \
+   "$(terminal_passed_marker_epoch "$M_EMPTY")" "-1"
+eq "unparseable closed_at → -1 (fail-open, not a crash)" \
+   "$(terminal_passed_marker_epoch '[{"status":"closed","labels":["gate-status:passed"],"closed_at":"not-a-date"}]')" "-1"
+# marker_evidence_stale — delegates to commit_evidence_stale. Reusing the exact same
+# $CWA fixture + epochs as §4b proves the delegation is exact, not just "similar".
+rc0 marker_evidence_stale "$CWA" 1784942993          # same fixture/epoch as §4b's stale case
+rc1 marker_evidence_stale "$CWA" 1785200000          # same fixture/epoch as §4b's not-stale case
 
 # ── 5. rig_gitdir — container (.repo.git) vs self-repo selection ────────────
 echo "── 5. rig_gitdir ──"
@@ -1267,14 +1350,16 @@ grep -qF 'janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$
   && ok "ga-hcj4 stranded-wrapper sweep threads is_delivery_partial into janitor_decide" \
   || bad "ga-hcj4 sweep not threading is_delivery_partial"
 # Negative check: the story sweep's own janitor_story_decide call must end in
-# sig_commit_docs_only (ga-fbycg legitimately extended it, see §17 below) and NOT grow
-# a delivery:partial-shaped arg beyond that — confirms this fix deliberately left THIS
-# label alone (see header above) rather than silently drifting it out of sync with a
-# copy-paste that half-applies. (Was a two-grep AND-NOT before ga-fbycg added a real
-# 12th arg; now a single exact-tail match since the "no further arg at all" invariant
-# no longer holds — only "no delivery-partial/daemon-hold-shaped arg" does.)
-if grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_SIGCOMMIT_DOCS_ONLY")' "$JANITOR"; then
-  ok "story sweep's janitor_story_decide call ends at sig_commit_docs_only (no delivery:partial label ever reaches a story bead)"
+# sig_marker_stale (ga-tysvjp legitimately extended it, see §18 below — sig_commit_docs_only,
+# ga-fbycg, is no longer the tail) and NOT grow a delivery:partial-shaped arg beyond that —
+# confirms this fix deliberately left THIS label alone (see header above) rather than
+# silently drifting it out of sync with a copy-paste that half-applies. (Was a two-grep
+# AND-NOT before ga-fbycg added a real 12th arg, then an exact-tail match ending at
+# sig_commit_docs_only before ga-tysvjp added a real 13th arg; only "no
+# delivery-partial/daemon-hold-shaped arg" holds across all of these, never "no further
+# arg at all".)
+if grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_SIGCOMMIT_DOCS_ONLY" "$S_SIGMK_STALE")' "$JANITOR"; then
+  ok "story sweep's janitor_story_decide call ends at sig_marker_stale (no delivery:partial label ever reaches a story bead)"
 else
   bad "story sweep's janitor_story_decide call signature changed unexpectedly — re-check ga-f54ui's story-sweep-exclusion rationale"
 fi
@@ -1309,11 +1394,12 @@ grep -qF 'janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$
   && ok "ga-hcj4 stranded-wrapper sweep threads is_daemon_hold into janitor_decide" \
   || bad "ga-hcj4 sweep not threading is_daemon_hold"
 # Same exact-tail check as §15 above (see that comment for why this is no longer a
-# two-grep AND-NOT): ga-fbycg's sig_commit_docs_only is a legitimate 12th arg, but
-# still no daemon-hold-shaped arg beyond it (delivery:pending-restart is stamped only
-# in quality-gate-dispatcher.sh's non-story branch, so a story bead never carries it).
-if grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_SIGCOMMIT_DOCS_ONLY")' "$JANITOR"; then
-  ok "story sweep's janitor_story_decide call ends at sig_commit_docs_only (no delivery:pending-restart label ever reaches a story bead)"
+# two-grep AND-NOT): ga-fbycg's sig_commit_docs_only and ga-tysvjp's sig_marker_stale are
+# legitimate 12th/13th args, but still no daemon-hold-shaped arg beyond them
+# (delivery:pending-restart is stamped only in quality-gate-dispatcher.sh's non-story
+# branch, so a story bead never carries it).
+if grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_SIGCOMMIT_DOCS_ONLY" "$S_SIGMK_STALE")' "$JANITOR"; then
+  ok "story sweep's janitor_story_decide call ends at sig_marker_stale (no delivery:pending-restart label ever reaches a story bead)"
 else
   bad "story sweep's janitor_story_decide call signature changed unexpectedly — re-check ga-l7n3v's story-sweep-exclusion rationale"
 fi
@@ -1350,7 +1436,7 @@ grep -qF 'janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SI
   && ok "in_progress sweep threads sig_commit_docs_only into janitor_decide" || bad "in_progress sweep not threading sig_commit_docs_only"
 grep -qF 'janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE" "$F_SIGMK_SUPER" "$F_DELIV_PARTIAL" "$F_DAEMON_HOLD" "$F_SIGCOMMIT_DOCS_ONLY"' "$JANITOR" \
   && ok "ga-hcj4 stranded-wrapper sweep threads sig_commit_docs_only into janitor_decide" || bad "ga-hcj4 sweep not threading sig_commit_docs_only"
-grep -qF '"$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_SIGCOMMIT_DOCS_ONLY")' "$JANITOR" \
+grep -qF '"$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_SIGCOMMIT_DOCS_ONLY" "$S_SIGMK_STALE")' "$JANITOR" \
   && ok "story sweep threads sig_commit_docs_only into janitor_story_decide" || bad "story sweep not threading sig_commit_docs_only"
 # Signal C must gate on a TRUSTED flag that ALSO requires docs_only!=1 at all three call
 # sites, so a docs-only-flagged signal A never blinds the sweep to an independent,

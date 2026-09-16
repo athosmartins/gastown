@@ -141,9 +141,10 @@ notify_athos() {
 # PURE DECISION FUNCTION — the heart of the janitor; fully unit-testable.
 # janitor_decide <is_epic> <has_open_marker> <sig_commit> <sig_marker> <sig_branch_merged>
 #                <sig_commit_stale> <sig_marker_superseded> <is_delivery_partial> <is_daemon_hold>
-# Each arg is 0|1 (sig_commit_stale/sig_marker_superseded/is_delivery_partial/is_daemon_hold
-# default to 0 when omitted — backward-compatible with every pre-ga-2zp4h/pre-ga-f54ui/
-# pre-ga-l7n3v caller/test).
+#                <sig_commit_docs_only> <sig_marker_stale>
+# Each arg is 0|1 (sig_commit_stale/sig_marker_superseded/is_delivery_partial/is_daemon_hold/
+# sig_commit_docs_only/sig_marker_stale default to 0 when omitted — backward-compatible with
+# every pre-ga-2zp4h/pre-ga-f54ui/pre-ga-l7n3v/pre-ga-fbycg/pre-ga-tysvjp caller/test).
 # Echoes "<verdict>:<reason>" where verdict ∈ {keep,close}. Guards are evaluated FIRST (an
 # open marker, epic, unresolved partial-delivery scope, or pending daemon verification
 # always wins over signals).
@@ -211,22 +212,40 @@ notify_athos() {
 # sig_commit_stale: it blinds ONLY signal A's ability to close ALONE — signals B (marker) and
 # C (branch) are bead-specific and authoritative, so a genuine gate-marker or merged branch for
 # the SAME bead still closes normally even when the matched commit is docs-only.
+#
+# sig_marker_stale (ga-tysvjp, 2026-09-16): Signal B (has_terminal_passed_marker) only proves a
+# marker reached gate-status:passed+closed at SOME point in the past — not that THIS bead's own
+# story didn't continue since. ga-nkqook: the Mayor reopened the bead with a fresh, narrow,
+# still-open investigation scope; 18 minutes later the ga-hcj4 stranded-wrapper sweep found the
+# bead's OLD terminal-passed marker (whose underlying merge had since been reverted, wa-h2kp5)
+# and closed the bead anyway — nothing in the revert flow had relabeled the marker to
+# gate-status:superseded (that relabel already has full protection via
+# has_terminal_superseded_marker/sig_marker_superseded above; the gap here is that nobody
+# performed it), so the marker just sat "passed" until the bead re-entered open+story:in-flight
+# and got swept. sig_marker_stale=1 means a bead comment postdates the marker's OWN closed_at
+# (see marker_evidence_stale/terminal_passed_marker_epoch) — the same proxy sig_commit_stale
+# already uses for signal A, applied to signal B instead. It suppresses ONLY signal B's ability
+# to close ALONE — signals A (commit) and C (branch) are bead-specific and authoritative, so a
+# genuine commit or merged branch for the SAME bead still closes normally even when the marker
+# is stale.
 # ═════════════════════════════════════════════════════════════════════════════
 janitor_decide() {
   local is_epic="$1" has_open_marker="$2" sig_commit="$3" sig_marker="$4" sig_branch="$5" \
         sig_commit_stale="${6:-0}" sig_marker_superseded="${7:-0}" is_delivery_partial="${8:-0}" \
-        is_daemon_hold="${9:-0}" sig_commit_docs_only="${10:-0}"
+        is_daemon_hold="${9:-0}" sig_commit_docs_only="${10:-0}" sig_marker_stale="${11:-0}"
   if [ "$is_epic" = "1" ]; then            echo "keep:epic-parent-never-autoclosed"; return 0; fi
   if [ "$has_open_marker" = "1" ]; then    echo "keep:active-open-gate-marker"; return 0; fi
   if [ "$is_delivery_partial" = "1" ]; then echo "keep:delivery-partial-unresolved-scope"; return 0; fi
   if [ "$is_daemon_hold" = "1" ]; then     echo "keep:daemon-verification-pending-restart"; return 0; fi
   if [ "$sig_commit" = "1" ] && [ "$sig_commit_stale" != "1" ] && [ "$sig_commit_docs_only" != "1" ]; then
                                             echo "close:commit-in-origin-main"; return 0; fi
-  if [ "$sig_marker" = "1" ]; then         echo "close:terminal-gate-marker-passed"; return 0; fi
+  if [ "$sig_marker" = "1" ] && [ "$sig_marker_stale" != "1" ]; then
+                                            echo "close:terminal-gate-marker-passed"; return 0; fi
   if [ "$sig_branch" = "1" ]; then         echo "close:branch-ancestor-of-origin-main"; return 0; fi
   if [ "$sig_commit" = "1" ] && [ "$sig_commit_docs_only" = "1" ]; then
                                             echo "keep:commit-evidence-docs-only-patch-staged"; return 0; fi
   if [ "$sig_commit" = "1" ]; then         echo "keep:commit-evidence-superseded-by-newer-comment"; return 0; fi
+  if [ "$sig_marker" = "1" ]; then         echo "keep:marker-evidence-superseded-by-newer-comment"; return 0; fi
   # ga-v8ui5: superseded reaches here ONLY after every real merge signal missed — say so
   # out loud instead of collapsing into the generic "no-merge-evidence".
   if [ "$sig_marker_superseded" = "1" ]; then
@@ -267,7 +286,9 @@ janitor_decide() {
 # janitor_story_decide <is_epic> <has_open_marker> <already_done> <in_flight>
 #                      <has_builder> <delivery_active>
 #                      <sig_commit> <sig_marker> <sig_branch> <sig_commit_stale>
-# Each arg is 0|1 (sig_commit_stale defaults to 0 when omitted — backward-compatible).
+#                      <sig_marker_superseded> <sig_commit_docs_only> <sig_marker_stale>
+# Each arg is 0|1 (sig_commit_stale/sig_marker_superseded/sig_commit_docs_only/
+# sig_marker_stale default to 0 when omitted — backward-compatible).
 # Echoes "<verdict>:<reason>", verdict ∈ {done,keep}. Guards are evaluated FIRST and in
 # a fixed precedence — ANY active-rework or not-a-merged-story condition wins over the
 # merge signals (zero false-positive is paramount: a genuinely-pending approved story
@@ -281,11 +302,19 @@ janitor_decide() {
 # bug/task-specific); forcing story:done off that commit alone would be the exact same
 # false-positive as ga-soxi9/ga-9n9z7, just for a story bead. Blinds signal A alone;
 # signals B/C are unaffected.
+#
+# sig_marker_stale (ga-tysvjp, 2026-09-16): same suppression as janitor_decide's own
+# sig_marker_stale — a story's terminal gate-status:passed marker can be just as stale
+# as a bug/task bead's (a revert after PASS that never relabeled the marker to
+# gate-status:superseded). Forcing story:done off that stale marker alone would be the
+# same false-positive class as ga-nkqook, just for a story bead. Blinds signal B alone;
+# signals A/C are unaffected.
 # ═════════════════════════════════════════════════════════════════════════════
 janitor_story_decide() {
   local is_epic="$1" has_open_marker="$2" already_done="$3" in_flight="$4" \
         has_builder="$5" delivery_active="$6" sig_commit="$7" sig_marker="$8" sig_branch="$9" \
-        sig_commit_stale="${10:-0}" sig_marker_superseded="${11:-0}" sig_commit_docs_only="${12:-0}"
+        sig_commit_stale="${10:-0}" sig_marker_superseded="${11:-0}" sig_commit_docs_only="${12:-0}" \
+        sig_marker_stale="${13:-0}"
   # — Guards (keep) — first match wins (each returns) —
   # SECURITY (sibling-path parity, ga-v3o6i sweep): ACTIVE-WORK guards MUST precede
   # already_done. A bead can carry a stale story:done label AND be re-opened (open
@@ -301,11 +330,13 @@ janitor_story_decide() {
   # — Merge evidence (done) — same triangulation as janitor_decide —
   if [ "$sig_commit" = "1" ] && [ "$sig_commit_stale" != "1" ] && [ "$sig_commit_docs_only" != "1" ]; then
                                    echo "done:commit-in-origin-main"; return 0; fi
-  if [ "$sig_marker" = "1" ];      then echo "done:terminal-gate-marker-passed"; return 0; fi
+  if [ "$sig_marker" = "1" ] && [ "$sig_marker_stale" != "1" ]; then
+                                   echo "done:terminal-gate-marker-passed"; return 0; fi
   if [ "$sig_branch" = "1" ];      then echo "done:branch-ancestor-of-origin-main"; return 0; fi
   if [ "$sig_commit" = "1" ] && [ "$sig_commit_docs_only" = "1" ]; then
                                    echo "keep:commit-evidence-docs-only-patch-staged"; return 0; fi
   if [ "$sig_commit" = "1" ];      then echo "keep:commit-evidence-superseded-by-newer-comment"; return 0; fi
+  if [ "$sig_marker" = "1" ];      then echo "keep:marker-evidence-superseded-by-newer-comment"; return 0; fi
   # ga-v8ui5 — same parity as janitor_decide: a superseded marker never marks a story done.
   if [ "$sig_marker_superseded" = "1" ]; then
                                    echo "keep:superseded-marker-needs-merge-evidence"; return 0; fi
@@ -796,6 +827,38 @@ has_terminal_superseded_marker() {
     >/dev/null 2>&1
 }
 
+# terminal_passed_marker_epoch <markers_json> — echoes the MOST RECENT closed_at
+# (epoch seconds) among CLOSED gate-status:passed markers, or -1 if none/unparseable.
+# Feeds marker_evidence_stale (ga-tysvjp) the same way commit_epoch feeds
+# commit_evidence_stale for signal A. Falls back to updated_at when closed_at is
+# absent (a marker's own bd record may not always populate closed_at — same
+# fallback idiom as crew-idle-check.sh's `ca = b.get("closed_at") or
+# b.get("updated_at")`). Picks the MAX epoch across multiple matching markers so a
+# later, still-valid passed marker is never treated as stale by an earlier
+# sibling's timestamp. FAIL-OPEN to -1 (non-numeric per commit_evidence_stale's own
+# validity check) on no match/unparseable date — same best-effort idiom as every
+# other marker/commit helper in this file.
+terminal_passed_marker_epoch() {
+  printf '%s' "$1" | jq -r '
+    [.[] | select((.status // "") == "closed" and ((.labels // []) | any(. == "gate-status:passed")))
+         | (try ((.closed_at // .updated_at // "") | fromdateiso8601) catch -1)]
+    | if length > 0 then max else -1 end
+  ' 2>/dev/null
+}
+
+# marker_evidence_stale <comments_json> <marker_closed_epoch> — rc0 iff any comment's
+# created_at is STRICTLY newer than <marker_closed_epoch>. Thin wrapper around
+# commit_evidence_stale (ga-tysvjp, 2026-09-16): Signal B's staleness check is the exact
+# same "did this bead's own story continue after the evidence's timestamp" question as
+# Signal A's (ga-2zp4h) — only the timestamp source differs (a marker's closed_at via
+# terminal_passed_marker_epoch, instead of a commit's committer-date via commit_epoch).
+# Delegating rather than duplicating the jq keeps the two signals' FAIL-OPEN semantics
+# identical by construction — see commit_evidence_stale's own docstring for the
+# rationale, which applies here unchanged.
+marker_evidence_stale() {
+  commit_evidence_stale "$1" "$2"
+}
+
 # branch_label_from_markers <markers_json> — echoes branch names from any
 # branch:<…> marker labels (one per line, de-duplicated).
 branch_label_from_markers() {
@@ -1092,7 +1155,7 @@ while IFS= read -r rig; do
     # rig's store — an HQ-home ga-*/dc-* bead — the legitimate cross-store case. (HQ-store
     # beads are swept in the HQ rig iteration where RGITDIR==HQ_GITDIR, so they scan HQ as
     # their own repo; this fallback covers a foreign bead that lives in a rig store.)
-    SIG_COMMIT=0; COMMIT_EVID=""; SIG_COMMIT_STALE=0; SIG_COMMIT_DOCS_ONLY=0
+    SIG_COMMIT=0; COMMIT_EVID=""; SIG_COMMIT_STALE=0; SIG_COMMIT_DOCS_ONLY=0; BCOMMENTS=""
     if [ "$IS_EPIC" = "0" ] && [ "$HAS_OPEN" = "0" ]; then
       MATCH_GITDIR=""; MATCH_CONTAINER=""
       if sha=$(scan_commit_subject_for_bead "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$BID"); then
@@ -1115,6 +1178,18 @@ while IFS= read -r rig; do
         # sig_commit_docs_only gate (ga-soxi9/ga-9n9z7 false-close guard).
         commit_touches_only_pending_patch "$MATCH_GITDIR" "$MATCH_CONTAINER" "$sha" && SIG_COMMIT_DOCS_ONLY=1
       fi
+    fi
+    # ga-tysvjp: a bead comment newer than the terminal marker's own closed_at
+    # suppresses signal B ALONE (signals A/C are unaffected) — see
+    # marker_evidence_stale / janitor_decide's sig_marker_stale gate. Reuses
+    # BCOMMENTS from signal A above when already fetched this iteration (same
+    # bead, same comment stream), else fetches fresh — avoids a duplicate
+    # comments_for_bead call when both signals fire for the same bead.
+    SIG_MARKER_STALE=0
+    if [ "$SIG_MARKER" = "1" ]; then
+      [ -z "$BCOMMENTS" ] && BCOMMENTS=$(comments_for_bead "$RPATH" "$BID")
+      MK_EPOCH=$(terminal_passed_marker_epoch "$MK")
+      marker_evidence_stale "$BCOMMENTS" "$MK_EPOCH" && SIG_MARKER_STALE=1
     fi
     # SIG_COMMIT_TRUSTED — signal A only when NOT stale and NOT docs-only (see above).
     # Signal C below gates on this, not on raw SIG_COMMIT, so a suppressed signal A
@@ -1151,7 +1226,7 @@ EOF
       done
     fi
 
-    VERDICT_LINE=$(janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SIG_BRANCH" "$SIG_COMMIT_STALE" "$SIG_MK_SUPER" "$IS_DELIV_PARTIAL" "$IS_DAEMON_HOLD" "$SIG_COMMIT_DOCS_ONLY")
+    VERDICT_LINE=$(janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SIG_BRANCH" "$SIG_COMMIT_STALE" "$SIG_MK_SUPER" "$IS_DELIV_PARTIAL" "$IS_DAEMON_HOLD" "$SIG_COMMIT_DOCS_ONLY" "$SIG_MARKER_STALE")
     VERDICT="${VERDICT_LINE%%:*}"; REASON="${VERDICT_LINE#*:}"
 
     if [ "$VERDICT" = "close" ]; then
@@ -1262,7 +1337,7 @@ EOF
 
     # Signal A — same strict subject-scope commit scan + rig/HQ repo-scoping as
     # the in_progress sweep above.
-    F_SIGCOMMIT=0; F_COMMIT_EVID=""; F_SIGCOMMIT_STALE=0; F_SIGCOMMIT_DOCS_ONLY=0
+    F_SIGCOMMIT=0; F_COMMIT_EVID=""; F_SIGCOMMIT_STALE=0; F_SIGCOMMIT_DOCS_ONLY=0; F_BCOMMENTS=""
     if [ "$F_EPIC" = "0" ] && [ "$F_HASOPEN" = "0" ]; then
       F_MATCH_GITDIR=""; F_MATCH_CONTAINER=""
       if sha=$(scan_commit_subject_for_bead "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$FID"); then
@@ -1282,6 +1357,17 @@ EOF
         # ga-fbycg: same docs-only-patch suppression as the in_progress sweep above.
         commit_touches_only_pending_patch "$F_MATCH_GITDIR" "$F_MATCH_CONTAINER" "$sha" && F_SIGCOMMIT_DOCS_ONLY=1
       fi
+    fi
+    # ga-tysvjp: same stale-comment suppression for signal B as the in_progress
+    # sweep above — this bucket is the EXACT sweep the ga-nkqook false-close
+    # narrated (a reverted-merge's stale terminal marker force-closing a bead
+    # reopened with fresh scope). Reuses F_BCOMMENTS from signal A above when
+    # already fetched this iteration, else fetches fresh.
+    F_SIGMARKER_STALE=0
+    if [ "$F_SIGMARKER" = "1" ]; then
+      [ -z "$F_BCOMMENTS" ] && F_BCOMMENTS=$(comments_for_bead "$RPATH" "$FID")
+      F_MK_EPOCH=$(terminal_passed_marker_epoch "$FMK")
+      marker_evidence_stale "$F_BCOMMENTS" "$F_MK_EPOCH" && F_SIGMARKER_STALE=1
     fi
     F_SIGCOMMIT_TRUSTED=0
     [ "$F_SIGCOMMIT" = "1" ] && [ "$F_SIGCOMMIT_STALE" != "1" ] && [ "$F_SIGCOMMIT_DOCS_ONLY" != "1" ] && F_SIGCOMMIT_TRUSTED=1
@@ -1306,7 +1392,7 @@ EOF
       done
     fi
 
-    F_VERDICT_LINE=$(janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE" "$F_SIGMK_SUPER" "$F_DELIV_PARTIAL" "$F_DAEMON_HOLD" "$F_SIGCOMMIT_DOCS_ONLY")
+    F_VERDICT_LINE=$(janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE" "$F_SIGMK_SUPER" "$F_DELIV_PARTIAL" "$F_DAEMON_HOLD" "$F_SIGCOMMIT_DOCS_ONLY" "$F_SIGMARKER_STALE")
     F_VERDICT="${F_VERDICT_LINE%%:*}"; F_REASON="${F_VERDICT_LINE#*:}"
 
     # ga-vokwv: sling-bead-name fallback. FID's OWN id carried no merge
@@ -1414,7 +1500,7 @@ EOF
     S_SIGMK_SUPER=0; has_terminal_superseded_marker "$SMK" && S_SIGMK_SUPER=1   # ga-v8ui5
 
     # Only pay for the git scans when no cheap guard already forces keep.
-    S_SIGCOMMIT=0; S_SIGBRANCH=0; S_COMMIT_EVID=""; S_BRANCH_EVID=""; S_SIGCOMMIT_STALE=0; S_SIGCOMMIT_DOCS_ONLY=0
+    S_SIGCOMMIT=0; S_SIGBRANCH=0; S_COMMIT_EVID=""; S_BRANCH_EVID=""; S_SIGCOMMIT_STALE=0; S_SIGCOMMIT_DOCS_ONLY=0; S_BCOMMENTS=""
     if [ "$S_EPIC" = "0" ] && [ "$S_DONE" = "0" ] && [ "$S_OPENMK" = "0" ] \
        && [ "$S_INFLIGHT" = "0" ] && [ "$S_BUILDER" = "0" ] && [ "$S_DELIV" = "0" ]; then
       # Signal A — commit whose SUBJECT SCOPE is this story id, in the story's OWN rig repo.
@@ -1463,8 +1549,19 @@ EOF
       fi
     fi
 
+    # ga-tysvjp: same stale-comment suppression for signal B as the in_progress/
+    # ga-hcj4 sweeps above — a story's terminal marker can be just as stale as a
+    # bug/task bead's. Reuses S_BCOMMENTS from signal A above when already
+    # fetched this iteration, else fetches fresh.
+    S_SIGMK_STALE=0
+    if [ "$S_SIGMK" = "1" ]; then
+      [ -z "$S_BCOMMENTS" ] && S_BCOMMENTS=$(comments_for_bead "$RPATH" "$SID")
+      S_MK_EPOCH=$(terminal_passed_marker_epoch "$SMK")
+      marker_evidence_stale "$S_BCOMMENTS" "$S_MK_EPOCH" && S_SIGMK_STALE=1
+    fi
+
     S_VERDICT_LINE=$(janitor_story_decide "$S_EPIC" "$S_OPENMK" "$S_DONE" "$S_INFLIGHT" \
-                       "$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_SIGCOMMIT_DOCS_ONLY")
+                       "$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_SIGCOMMIT_DOCS_ONLY" "$S_SIGMK_STALE")
     S_VERDICT="${S_VERDICT_LINE%%:*}"; S_REASON="${S_VERDICT_LINE#*:}"
 
     if [ "$S_VERDICT" = "done" ]; then
