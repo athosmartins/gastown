@@ -436,6 +436,36 @@ else
   rm -f "$RDIR"/*.json; printf '{not json' > "$RDIR/corrupt.json"
   check
   [ "$SCRAPER_DAILY_STATE" = "unknown" ] && ok "6f: unreadable marker -> unknown (never collapsed into clear)" || bad "6f: expected unknown, got $SCRAPER_DAILY_STATE"
+
+  # 6g: o CAMINHO REAL de produção — sem SCRAPER_BOOT_EPOCH injetado, a função
+  # lê o relógio de boot do `sysctl` sozinha. Os casos 6a-6f injetam a data e
+  # por isso NUNCA exercitaram essa leitura: foi assim que uma regex gulosa
+  # (`.*sec = ([0-9]+)`) passou no selftest inteiro devolvendo os
+  # MICROSSEGUNDOS de "usec = " em vez dos segundos — quatro ordens de grandeza
+  # abaixo, o que torna a proteção contra pid reusado inerte em silêncio.
+  echo "  -- 6g: sem SCRAPER_BOOT_EPOCH: a leitura do sysctl é exercitada de verdade --"
+  cat > "$FAKEBIN/sysctl" <<'SYSCTL'
+#!/usr/bin/env bash
+# Formato real do macOS, com o "usec" que a regex gulosa capturava por engano.
+echo "{ sec = 1789579812, usec = 958892 } Wed Sep 16 14:30:12 2026"
+SYSCTL
+  chmod +x "$FAKEBIN/sysctl"
+  rm -f "$RDIR"/*.json
+  # Marker iniciado DEPOIS desse boot (1789579812) e com pid vivo -> running.
+  DEPOIS=$(/bin/date -r 1789583412 +%Y-%m-%dT%H:%M:%S.000000)
+  mk pos_boot "$LIVE_PID" running "$DEPOIS"
+  PATH="$FAKEBIN:$PATH" SCRAPER_RODADA_DIR="$RDIR" scraper_daily_state
+  [ "$SCRAPER_DAILY_STATE" = "running" ] && ok "6g: rodada iniciada APÓS o boot lido do sysctl -> running" || bad "6g: esperava running, veio $SCRAPER_DAILY_STATE ($SCRAPER_DAILY_REASON)"
+
+  # Marker iniciado ANTES desse boot: só é excluído se o epoch lido for os
+  # SEGUNDOS. Com os microssegundos (958892), todo started_at real é maior e a
+  # exclusão nunca dispara — este é o assert que reprova a versão com a regex.
+  rm -f "$RDIR"/*.json
+  ANTES=$(/bin/date -r 1789576212 +%Y-%m-%dT%H:%M:%S.000000)
+  mk pre_boot "$LIVE_PID" running "$ANTES"
+  PATH="$FAKEBIN:$PATH" SCRAPER_RODADA_DIR="$RDIR" scraper_daily_state
+  [ "$SCRAPER_DAILY_STATE" = "clear" ] && ok "6g: rodada iniciada ANTES do boot -> clear (pid reusado, epoch lido em SEGUNDOS)" || bad "6g: esperava clear, veio $SCRAPER_DAILY_STATE — o epoch de boot provavelmente veio em microssegundos ($SCRAPER_DAILY_REASON)"
+  rm -f "$FAKEBIN/sysctl"
 fi
 
 echo ""

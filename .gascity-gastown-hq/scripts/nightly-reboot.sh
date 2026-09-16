@@ -328,7 +328,18 @@ scraper_daily_state() {
     local dir="${SCRAPER_RODADA_DIR:-/Users/athos/.property-scrapers/runtime/main/logs/rodada_status}"
     local boot="${SCRAPER_BOOT_EPOCH:-}"
     if [ -z "${boot}" ]; then
-        boot=$(sysctl -n kern.boottime 2>/dev/null | sed -E 's/.*sec = ([0-9]+).*/\1/')
+        # Token EXATO, não regex gulosa. `sysctl -n kern.boottime` imprime
+        #     { sec = 1789579812, usec = 958892 } Wed Sep 16 14:30:12 2026
+        # e um padrão `.*sec = ([0-9]+)` casa com o "sec" de **u**sec (o token
+        # "usec" termina em "sec"), devolvendo os MICROSSEGUNDOS — medido ao
+        # vivo nesta máquina: 958892 em vez de 1789579812, quatro ordens de
+        # grandeza abaixo. Com um valor desses, a comparação "iniciou antes do
+        # boot" nunca é verdadeira e a proteção contra pid reusado fica INERTE
+        # em silêncio. Mesmo bug já achado e consertado no ram-pressure-monitor
+        # (ga-rc7tz, 26/08) — é a segunda vez da cidade, então aqui vai por
+        # comparação de token, que não tem como casar "usec" com "sec".
+        boot=$(sysctl -n kern.boottime 2>/dev/null \
+               | awk '{for (i = 1; i <= NF; i++) if ($i == "sec") { v = $(i+2); gsub(/[^0-9]/, "", v); print v; exit } }')
     fi
     local out
     out=$(/usr/bin/python3 - "${dir}" "${boot}" <<'PY'
