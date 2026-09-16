@@ -72,9 +72,38 @@ read_swap_used_mb() {
   [ -n "${NCC_TEST_SWAP_MB+x}" ] && { echo "$NCC_TEST_SWAP_MB"; return; }
   sysctl vm.swapusage 2>/dev/null | grep -oE 'used = [0-9.]+M' | grep -oE '[0-9.]+' | head -1 | cut -d. -f1
 }
+read_boot_epoch() {   # ga-sadm5f: kern.boottime as unix epoch seconds — lets
+  # read_jetsam_count() clamp its lookback window at the boot boundary,
+  # mirroring ga-rc7tz's fix in ~/.gastown/scripts/ram-pressure-monitor.sh
+  # (same technique, different consumer — that fix was never propagated
+  # here). Anchor the sed match at the record's start (^\{): an unanchored
+  # `.*sec = ([0-9]+)` greedily matches the trailing `usec = ` field instead
+  # (it also contains the substring "sec = ") and silently returns
+  # microseconds as if they were the boot epoch.
+  [ -n "${NCC_TEST_BOOT_EPOCH+x}" ] && { echo "$NCC_TEST_BOOT_EPOCH"; return; }
+  sysctl -n kern.boottime 2>/dev/null | sed -nE 's/^\{ sec = ([0-9]+).*/\1/p'
+}
 read_jetsam_count() {
+  # ga-sadm5f: a reboot is usually CAUSED by RAM/jetsam pressure, so the last
+  # kill before every reboot sits inside this script's 24h lookback for a
+  # full day after the machine comes back healthy — guaranteeing a stale
+  # "please reboot" recommendation that reads identically to a fresh one
+  # (same bug class as ga-rc7tz, different consumer; that fix was never
+  # propagated to this script). Clamp the window to whichever is SHORTER:
+  # the configured lookback, or minutes elapsed since boot. If boot time
+  # can't be read, fall back to the full configured lookback — never
+  # silently suppress a real signal just because the clamp itself is
+  # unavailable.
   [ -n "${NCC_TEST_JETSAM_COUNT+x}" ] && { echo "$NCC_TEST_JETSAM_COUNT"; return; }
-  find "${JETSAM_REPORTS_DIR}" -iname "JetsamEvent*" -mmin "-${JETSAM_LOOKBACK_MIN}" 2>/dev/null | wc -l | tr -d '[:space:]'
+  local lookback_min="${JETSAM_LOOKBACK_MIN}" boot_epoch now_epoch uptime_min
+  boot_epoch="$(read_boot_epoch)"
+  if [ -n "${boot_epoch}" ] && [ "${boot_epoch}" -gt 0 ] 2>/dev/null; then
+    now_epoch=$(date +%s)
+    uptime_min=$(( (now_epoch - boot_epoch) / 60 ))
+    [ "${uptime_min}" -lt 0 ] 2>/dev/null && uptime_min=0
+    [ "${uptime_min}" -lt "${lookback_min}" ] 2>/dev/null && lookback_min="${uptime_min}"
+  fi
+  find "${JETSAM_REPORTS_DIR}" -iname "JetsamEvent*" -mmin "-${lookback_min}" 2>/dev/null | wc -l | tr -d '[:space:]'
 }
 read_disk_free_gb() {
   [ -n "${NCC_TEST_DISK_FREE_GB+x}" ] && { echo "$NCC_TEST_DISK_FREE_GB"; return; }
@@ -351,6 +380,56 @@ print("\n".join(bad))
   _s6b_digest="$(_weekly_digest "${NCC_TREND_LOG}")"
   echo "$_s6b_digest" | grep -q "swap pico n/aMB" && ok "unknown swap reading excluded from weekly digest peak calc (n/a, not fabricated 0)" \
     || bad "REGRESSION: unknown swap counted as a real data point in the digest: $_s6b_digest"
+
+  # ── ga-sadm5f: jetsam lookback must not cross the boot boundary ───────────
+  # These exercise read_jetsam_count() FOR REAL — unlike S1 above, which uses
+  # NCC_TEST_JETSAM_COUNT and bypasses the boot-clamp logic entirely, and
+  # unlike S1's real-find-lookup checks, which never touch boot time at all
+  # (fixture files are freshly `touch`ed, i.e. 0 minutes old, so the clamp
+  # never engages regardless of the box's real uptime). Same bug ga-rc7tz
+  # already fixed once in ~/.gastown/scripts/ram-pressure-monitor.sh; the fix
+  # was never propagated to this script's own independent jetsam reader.
+  unset NCC_TEST_JETSAM_COUNT
+  _ST_JETSAM_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ncc-jetsam-selftest.XXXXXX")"
+  _ST_JETSAM_DIR_SAVED="${JETSAM_REPORTS_DIR}"
+  JETSAM_REPORTS_DIR="${_ST_JETSAM_DIR}"
+
+  echo "S7: THE BUG THIS BEAD FIXED (ga-sadm5f) — a kill from BEFORE the last boot must not count just because it's still inside the configured 24h lookback (fixture: kill 60min old, boot 10min ago -> effective window clamps to 10min -> excluded, jetsam_count=0). Fails against the pre-fix read_jetsam_count, which ignores boot time entirely."
+  touch -t "$(date -v-60M +%Y%m%d%H%M.%S)" "${_ST_JETSAM_DIR}/JetsamEvent-prereboot.ips"
+  export NCC_TEST_BOOT_EPOCH=$(( $(date +%s) - 600 ))
+  _jc="$(read_jetsam_count)"
+  [ "${_jc}" = "0" ] && ok "pre-boot-only kill excluded once boot is recent (jetsam_count=0)" || bad "pre-boot kill should be excluded once boot is recent — got jetsam_count=${_jc}"
+
+  echo "S8: a kill AFTER boot still counts normally — the clamp doesn't weaken the real trigger"
+  rm -f "${_ST_JETSAM_DIR}"/JetsamEvent*
+  touch -t "$(date -v-1M +%Y%m%d%H%M.%S)" "${_ST_JETSAM_DIR}/JetsamEvent-postboot.ips"
+  _jc="$(read_jetsam_count)"
+  [ "${_jc}" = "1" ] && ok "post-boot kill still counts (jetsam_count=1)" || bad "post-boot kill should still count — got jetsam_count=${_jc}"
+
+  echo "S9: mixed pre- and post-boot kills — only the post-boot one counts"
+  rm -f "${_ST_JETSAM_DIR}"/JetsamEvent*
+  touch -t "$(date -v-60M +%Y%m%d%H%M.%S)" "${_ST_JETSAM_DIR}/JetsamEvent-prereboot.ips"
+  touch -t "$(date -v-1M +%Y%m%d%H%M.%S)" "${_ST_JETSAM_DIR}/JetsamEvent-postboot.ips"
+  _jc="$(read_jetsam_count)"
+  [ "${_jc}" = "1" ] && ok "mixed pre+post boot kills -> only the post-boot kill is counted (jetsam_count=1, not 2)" || bad "mixed fixture should count only the post-boot kill — got jetsam_count=${_jc}"
+
+  echo "S10: boot epoch unreadable -> falls back to the full configured lookback (ga-sadm5f AC2, fail-open) — never newly suppresses a real signal just because the clamp itself failed"
+  rm -f "${_ST_JETSAM_DIR}"/JetsamEvent*
+  touch -t "$(date -v-60M +%Y%m%d%H%M.%S)" "${_ST_JETSAM_DIR}/JetsamEvent-prereboot.ips"
+  export NCC_TEST_BOOT_EPOCH=""
+  _jc="$(read_jetsam_count)"
+  [ "${_jc}" = "1" ] && ok "unreadable boot epoch falls back to unclamped lookback (jetsam_count=1, matches pre-fix behavior)" || bad "unreadable boot epoch should not suppress a real kill — got jetsam_count=${_jc}"
+
+  echo "S11: uptime greater than the configured lookback -> clamp never engages, result unchanged from pre-fix (ga-sadm5f AC3)"
+  rm -f "${_ST_JETSAM_DIR}"/JetsamEvent*
+  touch -t "$(date -v-100M +%Y%m%d%H%M.%S)" "${_ST_JETSAM_DIR}/JetsamEvent-old-but-in-window.ips"
+  export NCC_TEST_BOOT_EPOCH=$(( $(date +%s) - 864000 ))
+  _jc="$(read_jetsam_count)"
+  [ "${_jc}" = "1" ] && ok "long-uptime machine (uptime >> lookback) -> clamp doesn't engage, still counts a 100min-old kill (jetsam_count=1)" || bad "long-uptime machine should behave exactly as before this fix — got jetsam_count=${_jc}"
+
+  unset NCC_TEST_BOOT_EPOCH
+  rm -rf "${_ST_JETSAM_DIR}"
+  JETSAM_REPORTS_DIR="${_ST_JETSAM_DIR_SAVED}"
 
   echo ""; echo "nightly-capacity-check selftest: PASS=$PASS FAIL=$FAIL"; [ "$FAIL" -eq 0 ] && exit 0 || exit 1
 fi
