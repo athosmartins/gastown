@@ -822,7 +822,7 @@ gc hook
 ```
 
 A metade da formula (step `next-iteration`, mesma técnica — `-C
-'{{rig_root}}'` + verificação pós-pour antes de assign/burn) já está
+'{{ .RigRoot }}'` + verificação pós-pour antes de assign/burn) já está
 corrigida em paralelo no override
 `packs/town-deltas/formulas/mol-witness-patrol.toml`. Qualquer pour manual
 fora da formula (ex.: o Step 3 acima) precisa sempre passar `--var
