@@ -7751,6 +7751,39 @@ ALL_CANDIDATES_COUNT=$(echo "$ALL_CANDIDATES_JSON" | jq 'length' 2>/dev/null || 
 # dead code on precisely the sweep shape this bug is about; caught by
 # Scenario TOPUP-1/4 failing red even after the fix was written, because the
 # harness's minimal fixture has zero fresh candidates by design).
+# _topup_rig_pending <pool>: rig-scoped fallback for the pending-bead query
+# inside _pilot_pool_topup below. Mirrors _scan_rig_fallback_pool's own
+# rig-discovery shape (L7643: `.rigs[] | select(.hq == false) | .path`) and
+# _pilot_emit_dispatchable's (L4429) — reused here via the pre-computed
+# _TOPUP_RIG_PATHS global (set once, right before both pool calls, so
+# wa-worker and ps-worker share a single `gc rig list` invocation instead of
+# paying for it twice).
+#
+# ga-q0ewpu: without this, gc.routed_to=<pool> is the ONLY signal a rig-native
+# (wa-*/ps-*) bead carries once pilot:dispatched excludes it from the main
+# candidate scan (see this function's own header comment below) — and the
+# pending-bead query only ever looked at $GC_CITY, where a rig-native bead
+# never lives. Measured live: wa-52q8u, wa-ah359, wa-c1hgd stranded
+# routed+unassigned at a saturated wa-worker cap until a human ran
+# pilot-manual-reclaim.sh by hand (wa-c1hgd twice — pilot:reclaim-count:2).
+# Always exits 0; emptiness of stdout is the "not found" signal, same
+# convention the direct bd probe already uses via its own `|| echo ""`.
+_topup_rig_pending() {
+  local _pool="$1" _rp _rig_pending
+  while IFS= read -r _rp; do
+    [ -z "$_rp" ] || [ ! -d "$_rp" ] && continue
+    [ "$_rp" = "$GC_CITY" ] && continue
+    _rig_pending=$(timeout 15 bd -C "$_rp" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
+      --exclude-type=epic --json --limit=1 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null || echo "")
+    if [ -n "$_rig_pending" ]; then
+      printf '%s' "$_rig_pending"
+      return 0
+    fi
+  done <<< "$_TOPUP_RIG_PATHS"
+  printf ''
+  return 0
+}
+
 _pilot_pool_topup() {
   local _pool="$1" _max="$2"
   local _live _global _pending
@@ -7787,6 +7820,18 @@ _pilot_pool_topup() {
       # Same `|| echo` reasoning as the _live probe above.
       _pending=$(timeout 15 bd -C "$GC_CITY" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
         --exclude-type=epic --json --limit=1 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null || echo "")
+      if [ -z "$_pending" ]; then
+        # ga-q0ewpu: HQ has nothing — fall through to each non-HQ rig store
+        # before giving up (own test seam, same set-even-to-empty convention
+        # as PILOT_TEST_WA_WORKER_TOPUP_PENDING above).
+        if [ "$_pool" = "wa-worker" ] && [ -n "${PILOT_TEST_WA_WORKER_TOPUP_RIG_PENDING+x}" ]; then
+          _pending="$PILOT_TEST_WA_WORKER_TOPUP_RIG_PENDING"
+        elif [ "$_pool" = "ps-worker" ] && [ -n "${PILOT_TEST_PS_WORKER_TOPUP_RIG_PENDING+x}" ]; then
+          _pending="$PILOT_TEST_PS_WORKER_TOPUP_RIG_PENDING"
+        else
+          _pending=$(_topup_rig_pending "$_pool" || echo "")
+        fi
+      fi
     fi
     [ -z "$_pending" ] && break
     if [ "$DRY_RUN" = "1" ]; then
@@ -7805,6 +7850,17 @@ _pilot_pool_topup() {
     fi
   done
 }
+# ga-q0ewpu: computed ONCE here (not inside _pilot_pool_topup/_topup_rig_pending)
+# so both pool calls below share a single `gc rig list` invocation. Same
+# fail-open convention as ga-07rb3 above (_scan_rig_fallback_pool,
+# _pilot_emit_dispatchable): a `gc rig list` failure just narrows this
+# sweep's top-up to HQ-only (the pre-fix behavior), never aborts the sweep.
+_TOPUP_RIG_PATHS_JSON=""
+if ! _TOPUP_RIG_PATHS_JSON=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json); then
+  warn "ga-93yxc: gc rig list failed while computing pool top-up rig scope — HQ-only this cycle."
+fi
+_TOPUP_RIG_PATHS=$(printf '%s' "$_TOPUP_RIG_PATHS_JSON" | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null)
+
 _pilot_pool_topup "wa-worker" "${PILOT_WA_WORKER_MAX:-4}"
 _pilot_pool_topup "ps-worker" "${PILOT_PS_WORKER_MAX:-2}"
 
