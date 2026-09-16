@@ -13,7 +13,14 @@
 #     1. native, transactionally-consistent  CALL DOLT_BACKUP('sync', <db>-backup)
 #        -> a LOCAL file:// staging store at .dolt-backup/<db> (also what gc doctor
 #        checks for; kept because it makes both stages INCREMENTAL and enables an
-#        instant local restore). Dolt GCs on backup, so staging << live noms.
+#        instant local restore).
+#        ⚠️ CORRECTED DOCTRINE (ga-8f1uh0, 2026-09-16): the line that used to be here
+#        ("Dolt GCs on backup, so staging << live noms") is FALSE — dolt-backup-reseed.sh
+#        (ga-ydrg9) already found and documented this: DOLT_BACKUP sync is APPEND-ONLY
+#        and never shrinks when the live source is compacted/squashed, so staging only
+#        ever grows. Measured 2026-09-16: hq alone was 13G local vs 6.9G live (~2x),
+#        gastown ~3x, whatsapp_automation ~2.6x — and it crashed Dolt twice that day on
+#        "no space left on device". See _reseed_staging_if_enabled below for the fix.
 #     2. aws s3 sync .dolt-backup/<db>/ -> s3://<bucket>/<db>/  (incremental; --delete
 #        prunes orphans; bucket VERSIONING retains history so a stable prefix gives
 #        point-in-time recovery without a full copy per day).
@@ -51,6 +58,15 @@ SYNC_TIMEOUT=600                          # per-db native DOLT_BACKUP sync
 S3_TIMEOUT=1200                           # per-db aws s3 sync
 PREFLIGHT_TIMEOUT=30                       # server reachability probe
 RETRY_WAITS_SEC="20 60 120"               # ga-gdsq5: escalating pauses, one connection-timeout retry per wait
+# ga-8f1uh0: reuse the already-verified reseed mechanism (fresh backup -> restore
+# -> row-count verify -> swap) to keep per-db local staging from growing without
+# bound. Same timeout budget dolt-compact-routine.sh's own reseed call already
+# uses. Opt-out escape hatch (RESEED_AFTER_UPLOAD=0) in case it ever needs to be
+# disabled without a code change; on by default because the growth it prevents
+# already crashed Dolt twice in one day.
+RESEED_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dolt-backup-reseed.sh"
+RESEED_TIMEOUT_SECS="${RESEED_TIMEOUT_SECS:-1800}"
+RESEED_AFTER_UPLOAD="${RESEED_AFTER_UPLOAD:-1}"
 # ga-o3nqy2: wiring for the shared server-free fallback (dolt-offline-backup-sync.sh).
 # Read only by that sourced file's functions, not visibly within this one —
 # the static analyzer can't see across the dynamic source path below.
@@ -98,6 +114,34 @@ is_connection_timeout_error() {
   esac
 }
 
+# ga-8f1uh0: dolt-backup-reseed.sh refuses (exit 1, nothing touched) when it
+# doesn't have its required 250%-of-live-size disk margin free — an EXPECTED,
+# self-healing condition (retried every run; resolves once space recovers),
+# not a data-integrity concern. Any OTHER reseed failure (new backup doesn't
+# restore, restored count can't be read, restored count < live) is a real
+# signal and must still notify_fail. Distinguishing the two by string-match on
+# reseed's own die() message, same pattern as the two detectors above.
+is_disk_margin_refusal() {
+  case "$1" in
+    *"disco insuficiente"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ga-8f1uh0: dolt-backup-reseed.sh also refuses (exit 1, nothing touched) when
+# a PRIOR run's .old/.new residue is still on disk (its own Preflight 3) — it
+# will not overwrite what might be an investigation in progress. Unlike a
+# disk-margin refusal this is NOT self-healing: it will keep refusing on
+# every future run until a human clears the residue once. Detected separately
+# so its notify_fail message can say exactly what to do instead of a generic
+# "ver $LOG" pointer.
+is_stale_residue_refusal() {
+  case "$1" in
+    *"resíduo de uma execução anterior"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # _sync_once <db> — one CALL DOLT_BACKUP('sync', ...) attempt for <db>; raw
 # dolt output goes wherever the caller redirects, dolt's own exit code is
 # returned. Factored out so the retry loop below and the selftest's
@@ -128,6 +172,57 @@ _sync_with_connection_timeout_retry() {
     fi
   done
   log "$db: DOLT_BACKUP sync FAILED (after connection-timeout retries)"
+  return 1
+}
+
+# _reseed_staging_if_enabled <db> — ga-8f1uh0: called AFTER this db's S3 sync
+# above already succeeded. .dolt-backup/<db> is APPEND-ONLY (see the corrected
+# header doctrine at the top of this file) so it only ever grows, independent
+# of whether the live source shrinks — hq alone reached 13G local vs 6.9G live
+# and crashed Dolt twice in one day on "no space left on device" (measured
+# 2026-09-16). Athos authorized reducing the local copy (AskUserQuestion,
+# Mayor session, 2026-09-16) with S3 already confirmed intact.
+#
+# Deliberately reuses dolt-backup-reseed.sh instead of a new delete-after-
+# verify path: it is the already-hardened, adversarially-reviewed mechanism
+# for exactly this problem (fresh backup in a new dir -> RESTORE it -> compare
+# row counts against the LIVE source -> only then swap; old copy kept as
+# .old for a human to clear). That is a stronger guarantee than diffing
+# against S3 would be, and — critically — it never leaves .dolt-backup/<db>
+# empty, so dolt-restore-verify.sh's own scheduled restores always still have
+# a local copy to restore from between runs.
+#
+# Fail-closed by construction: reseed's own preflight refuses (no swap, no
+# deletion, exit 1) without 250% of the live db size free AND a fresh backup
+# that demonstrably restores with row count >= live. A refusal for lack of
+# disk margin is EXPECTED here — logged, not alarmed on (see
+# is_disk_margin_refusal) — because it is exactly the condition this function
+# exists to eventually relieve, and it will keep being retried every run
+# until space recovers. Any OTHER failure reason is a real data-integrity
+# signal and is notify_fail'd immediately, same channel as every other
+# failure mode in this script.
+_reseed_staging_if_enabled() {
+  local db="$1"
+  [ "$RESEED_AFTER_UPLOAD" = "1" ] || return 0
+  local out rc
+  out="$(timeout "$RESEED_TIMEOUT_SECS" "$RESEED_SCRIPT" "$db" 2>&1)"
+  rc=$?
+  echo "$out" >> "$LOG"
+  if [ "$rc" -eq 0 ]; then
+    log "$db: staging reseed OK (freed accumulated backup bloat)"
+    return 0
+  fi
+  if is_disk_margin_refusal "$out"; then
+    log "$db: staging reseed skipped — insufficient disk margin today (expected; retried next run)"
+    return 0
+  fi
+  if is_stale_residue_refusal "$out"; then
+    log "$db: staging reseed BLOCKED — stale .old/.new residue from a prior run — ver $LOG"
+    notify_fail "backup off-box: reseed de $db bloqueado por resíduo (.old ou .new) de execução anterior em ${BACKUP_ROOT}/${db}.old — remova à mão uma vez para destravar"
+    return 1
+  fi
+  log "$db: staging reseed FAILED (rc=$rc, non-disk reason) — ver $LOG"
+  notify_fail "backup off-box: reseed do staging de $db falhou por motivo != espaço — ver $LOG"
   return 1
 }
 
@@ -325,6 +420,11 @@ for db in $DBS; do
   printf '%s\t%s\t%s\t%s\n' "$db" "$cnt" "${head:-}" "${sz:-}" >> "$RAW"
   log "$db: OK (issues=$cnt head=${head:-?} size=${sz:-?})"
   ok=$((ok+1))
+  # ga-8f1uh0: best-effort space reclaim, AFTER the counters above already
+  # reflect this run's real backup outcome — its own success/failure is
+  # logged and (when non-disk) notified inside the helper, but never changes
+  # $ok/$failed/$FAILED_DBS for the core backup that already succeeded.
+  _reseed_staging_if_enabled "$db"
 done
 
 # --- JSONL archive offsite mirror (ga-7gfd34) --------------------------------
