@@ -1,0 +1,14 @@
+# town-deltas: pack pequeno SÓ com deltas ADITIVOS desta town (não vendoriza gastown).
+[pack]
+name = "town-deltas"
+schema = 2
+
+# Footer dos crew (wa-1doi). session_live é APPEND across packs, então o
+# tmux-theme.sh do /system roda primeiro (dá o tema de tier a todos) e o
+# crew-theme.sh roda DEPOIS como override SELETIVO: só mexe em agentes listados
+# em crew-theme.conf; os demais ficam com o tema do /system. /system intocado.
+# Reversível: remova este bloco [global] e a resolução volta ao normal.
+[global]
+session_live = [
+  "/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/crew-theme.sh {{.Session}} {{.Agent}} /Users/athos/gt/.gascity-gastown-hq/packs/town-deltas",
+]

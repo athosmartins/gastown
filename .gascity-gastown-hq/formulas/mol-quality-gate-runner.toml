@@ -538,6 +538,60 @@ else
 fi
 ```
 
+**2b. Template-fragment / prompt-template parse guard (ga-8fwusw):**
+
+A Go text/template prompt-template or template-fragment file can be
+textually correct (clean diff, passes every grep-based selftest) yet FAIL
+TO PARSE -- and a parse failure on a shared/global fragment silently drops
+the ENTIRE fragment from every prompt that injects it, with no non-zero
+exit anywhere in the normal render path (`gc prime`, agent spawn print the
+error to stderr and continue). This bit the town for real: ga-3v2n4's own
+fix commit wrote `{{rig_root}}` as prose instead of the field form
+`{{ .RigRoot }}` in town-deltas.template.md, silently deleting ~52KB of
+global doctrine (including the multiple-choice mandate) from every agent
+prompt in the city, gate-green and 12/12-selftest-green throughout.
+
+This step folds `template-fragment-lint-guard.sh` into the SAME hard-gate
+`TEST_EXIT`/`TEST_OUTPUT` signal the language test command uses above --
+independent of it (a rig with no `RIG_TEST_CMD` still gets this check), and
+a no-op everywhere the diff doesn't touch a template-shaped file (so it is
+silent overhead for the common case: a Python/Go/JS change in any rig).
+
+```bash
+GUARD="$GC_CITY_PATH/packs/town-deltas/assets/template-fragment-lint-guard.sh"
+if [ -f "$GUARD" ]; then
+  # Same newline-safe splitting as the tier-classification loop above --
+  # not bare `$CHANGED_FILES` word-splitting, which breaks on nothing here
+  # today but shouldn't rely on filenames never containing IFS chars.
+  FRAGMENT_GUARD_FILES=()
+  while IFS= read -r FILE; do
+    [ -z "$FILE" ] && continue
+    FRAGMENT_GUARD_FILES+=("$FILE")
+  done <<< "$CHANGED_FILES"
+
+  if [ "${#FRAGMENT_GUARD_FILES[@]}" -gt 0 ]; then
+    FRAGMENT_GUARD_OUTPUT=$(bash "$GUARD" "$WORKTREE_PATH" "${FRAGMENT_GUARD_FILES[@]}" 2>&1)
+    FRAGMENT_GUARD_EXIT=$?
+    echo "$FRAGMENT_GUARD_OUTPUT"
+    if [ "$FRAGMENT_GUARD_EXIT" -ne 0 ]; then
+      TEST_EXIT=$FRAGMENT_GUARD_EXIT
+      TEST_OUTPUT="$TEST_OUTPUT
+
+TEMPLATE-FRAGMENT LINT FAILED (ga-8fwusw guard): a changed prompt-template
+or template-fragment file does not parse. A parse failure on a fragment
+silently drops the WHOLE fragment from every prompt that injects it --
+this is a hard gate, not a warning.
+$FRAGMENT_GUARD_OUTPUT"
+    fi
+  fi
+else
+  # Fail-soft, same convention as the other sourced/invoked town-deltas
+  # libs in quality-gate-dispatcher.sh: a city snapshot that predates this
+  # guard's own merge must not block on a check that cannot run yet.
+  echo "NOTE: template-fragment-lint-guard.sh not found at $GUARD -- skipping (pre-ga-8fwusw city snapshot?)."
+fi
+```
+
 **3. Handle test failure:**
 
 If `TEST_EXIT != 0`:
