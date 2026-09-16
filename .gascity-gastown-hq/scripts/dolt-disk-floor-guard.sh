@@ -1385,6 +1385,60 @@ _reap_code_sign_clone_orphans() {
   fi
 }
 
+# _reap_backup_residue — ninth reclaim lever, alongside _safe_reclaim and the
+# seven scratch/transcript/log/hf-cache/gocache/go-build/code-sign-clone
+# levers above (ga-8f1uh0): retired .dolt-backup/<db>.old residue left behind
+# by dolt-backup-reseed.sh (ga-ydrg9) accumulates with nothing to release it.
+# Each reseed swap creates exactly one .old, and dolt-backup-reseed.sh
+# deliberately never deletes it ("fica em .old para um humano remover depois
+# de olhar" — the right call when that mechanism was new and unproven). The
+# cost measured in production: dolt-s3-backup.sh's own reseed call REFUSES
+# outright while a db's prior .old still exists, so without this lever every
+# db can self-heal its backup bloat AT MOST ONCE before permanently needing a
+# human again — the opposite of what Athos's P0 escalation on ga-8f1uh0 asks
+# for ("a nossa própria infraestrutura consegue rodar esse comando quando ela
+# identificar que é seguro fazer isso").
+#
+# Delegates to the standalone, independently-selftested dolt-backup-residue-
+# reclaim.sh so its S3-verification safety logic — manifest presence (a real
+# `aws s3api head-object` on <db>/manifest) + generation freshness (the S3
+# fingerprint's run must be NEWER than the residue) + size coherence, ALL
+# three required before any delete — is unit- AND stubbed-integration-tested
+# in isolation, same pattern as the scratch/transcript/log reapers above.
+# Runs at WARN same as CRITICAL (no two-tier trade-off of its own, unlike
+# gocache/hf-cache): releasing S3-verified residue never disrupts anything
+# live, so there is no "wait for CRITICAL" reason to hold it back.
+#
+# DOLT_BACKUP_RESIDUE_RECLAIM_PROD=1 (same ga-h565g production-sentinel
+# pattern as SCRATCHPAD_REAPER_PROD/TRANSCRIPT_REAPER_PROD/LOG_REAPER_PROD
+# above): this function IS the real, launchd-driven caller dolt-backup-
+# residue-reclaim.sh's own sentinel is designed to trust — the ONLY place
+# that should ever set this opt-in. Without it, that script dry-runs (logs
+# what it would free, deletes nothing) whenever its BACKUP_ROOT resolves to
+# the real default — which is also what keeps this safe to invoke from this
+# file's own selftest below.
+_reap_backup_residue() {
+  if [ "$ENABLED" != "1" ]; then
+    log "backup-residue-reap SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"
+    return
+  fi
+  local reaper="$CITY/scripts/dolt-backup-residue-reclaim.sh"
+  if [ ! -f "$reaper" ]; then
+    log "backup-residue-reap SKIP — $reaper not found"
+    return
+  fi
+  # 180s: each candidate makes up to two bounded (20s default) AWS calls plus
+  # a couple of `du` reads; generous enough for a handful of .old residues
+  # (realistically at most one per db) even under a slow network, while still
+  # bounded so a wedged guard cycle can't hang past this file's own 300s
+  # StartInterval.
+  if DOLT_BACKUP_RESIDUE_RECLAIM_PROD=1 timeout 180 bash "$reaper" >> "$LOG" 2>&1; then
+    log "backup-residue-reap OK"
+  else
+    log "backup-residue-reap FAILED or aborted (nonzero exit) — see log lines above"
+  fi
+}
+
 # _resurrect_dolt <avail_gb> <class> — last-resort auto-respawn for a Dolt
 # sql-server CONFIRMED down while disk headroom is safe. Caller (main) has
 # already run _should_resurrect's gate; this function does the actual work.
@@ -1537,6 +1591,7 @@ main() {
   _reap_gocache "$was_critical"
   _reap_go_build_orphans
   _reap_code_sign_clone_orphans
+  _reap_backup_residue
 
   # re-read avail — reclaim may have freed space; `class` becomes the CURRENT
   # (post-reclaim) reading, used for logging/messaging. was_critical also

@@ -981,6 +981,71 @@ CITY="$REAL_CITY"
 rm -rf "$FAKE_CITY"
 
 echo ""
+echo "=== _reap_backup_residue: production sentinel wiring (ga-8f1uh0) ==="
+# Same proof as _reap_growing_logs above, for the ninth lever: dolt-backup-
+# residue-reclaim.sh's own header names _reap_backup_residue as the ONLY
+# allowed setter of DOLT_BACKUP_RESIDUE_RECLAIM_PROD=1. Hermetic: CITY is a
+# plain global, reassigned here to a disposable tmp dir containing a FAKE
+# dolt-backup-residue-reclaim.sh that only records what env it received —
+# never touches the real script, no real AWS call, no real deletion.
+FAKE_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city6.XXXXXX)"
+mkdir -p "$FAKE_CITY/scripts"
+CAPTURE_FILE="$FAKE_CITY/capture.txt"
+cat > "$FAKE_CITY/scripts/dolt-backup-residue-reclaim.sh" <<EOF
+#!/bin/bash
+echo "PROD=\${DOLT_BACKUP_RESIDUE_RECLAIM_PROD:-unset}" > "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY/scripts/dolt-backup-residue-reclaim.sh"
+
+REAL_CITY="$CITY"
+CITY="$FAKE_CITY"
+_reap_backup_residue
+CITY="$REAL_CITY"
+
+if [ -f "$CAPTURE_FILE" ] && grep -qx "PROD=1" "$CAPTURE_FILE"; then
+  ok "_reap_backup_residue: sets DOLT_BACKUP_RESIDUE_RECLAIM_PROD=1 when invoking the real reclaimer (production opt-in wired)"
+else
+  bad "_reap_backup_residue: did NOT set DOLT_BACKUP_RESIDUE_RECLAIM_PROD=1 — real launchd path would silently dry-run forever (got: $([ -f "$CAPTURE_FILE" ] && cat "$CAPTURE_FILE" || echo 'capture file missing'))"
+fi
+rm -rf "$FAKE_CITY"
+
+echo ""
+echo "=== _reap_backup_residue: guard-level ENABLED kill switch (ga-8f1uh0) ==="
+FAKE_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city7.XXXXXX)"
+mkdir -p "$FAKE_CITY/scripts"
+CAPTURE_FILE="$FAKE_CITY/capture.txt"
+cat > "$FAKE_CITY/scripts/dolt-backup-residue-reclaim.sh" <<EOF
+#!/bin/bash
+echo "CALLED" > "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY/scripts/dolt-backup-residue-reclaim.sh"
+
+REAL_CITY="$CITY"
+CITY="$FAKE_CITY"
+ENABLED=0
+_reap_backup_residue
+# shellcheck disable=SC2034  # read by every _reap_* call and main() in later scenarios below
+ENABLED=1
+CITY="$REAL_CITY"
+[ -f "$CAPTURE_FILE" ] && bad "_reap_backup_residue: ran the real reclaimer despite ENABLED=0" || ok "_reap_backup_residue: ENABLED=0 skips this lever too"
+rm -rf "$FAKE_CITY"
+
+echo ""
+echo "=== _reap_backup_residue: missing script degrades to SKIP, never errors (ga-8f1uh0) ==="
+FAKE_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city8.XXXXXX)"
+mkdir -p "$FAKE_CITY/scripts"
+REAL_CITY="$CITY"; CITY="$FAKE_CITY"
+if _reap_backup_residue; then
+  ok "_reap_backup_residue: missing script — returns cleanly (no crash)"
+else
+  bad "_reap_backup_residue: missing script should still return 0, got nonzero"
+fi
+CITY="$REAL_CITY"
+rm -rf "$FAKE_CITY"
+
+echo ""
 echo "=== _resurrect_dolt: escalation cooldown (ga-f4l2z, mirrors ga-q4cqr) ==="
 # Tests the REAL _resurrect_dolt (still the function sourced from the
 # library at this point — the main()-scenario section further below is what
@@ -1246,6 +1311,18 @@ _reap_go_build_orphans() { REAP_GO_BUILD_CALLS=$((REAP_GO_BUILD_CALLS+1)); }
 REAP_CODE_SIGN_CLONE_CALLS=0
 _reap_code_sign_clone_orphans() { REAP_CODE_SIGN_CLONE_CALLS=$((REAP_CODE_SIGN_CLONE_CALLS+1)); }
 
+# _reap_backup_residue is new (ga-8f1uh0), same reasoning as
+# _reap_go_build_orphans/_reap_code_sign_clone_orphans's stubs immediately
+# above: EXECUTION code (shells out to dolt-backup-residue-reclaim.sh, which
+# has its own independent unit + stubbed-integration selftest covering the
+# real S3-verification/deletion logic) stubbed as a no-op here so main()'s
+# WIRING is what gets proven — never a real AWS call or real deletion. Takes
+# no was_critical arg, same reasoning as the other two orphan-reap levers:
+# releasing S3-verified residue is safe at either tier, so there is nothing
+# for main() itself to gate.
+REAP_BACKUP_RESIDUE_CALLS=0
+_reap_backup_residue() { REAP_BACKUP_RESIDUE_CALLS=$((REAP_BACKUP_RESIDUE_CALLS+1)); }
+
 NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""
 record_notify() {
   NOTIFY_CALLS=$((NOTIFY_CALLS+1))
@@ -1288,7 +1365,7 @@ record_gc() {
 # shellcheck disable=SC2034  # read by main() in the sourced script
 GC=record_gc
 
-reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; REAP_GO_BUILD_CALLS=0; REAP_CODE_SIGN_CLONE_CALLS=0; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; }
+reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; REAP_GO_BUILD_CALLS=0; REAP_CODE_SIGN_CLONE_CALLS=0; REAP_BACKUP_RESIDUE_CALLS=0; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; }
 seed_state() {
   if [ -n "$1" ]; then echo "$1" > "$STATE_EPOCH_FILE"; else rm -f "$STATE_EPOCH_FILE"; fi
   if [ -n "$2" ]; then echo "$2" > "$STATE_AVAIL_FILE"; else rm -f "$STATE_AVAIL_FILE"; fi
@@ -1522,10 +1599,10 @@ echo "=== main(): scratchpad + transcript reap integration (ga-02pnu, ga-t1ub9) 
 reset_capture; seed_state "" ""
 queue_avail 2 20
 main
-if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ] && [ "$REAP_LOGS_CALLS" = "1" ] && [ "$REAP_HF_CALLS" = "1" ] && [ "$REAP_GOCACHE_CALLS" = "1" ] && [ "$REAP_GO_BUILD_CALLS" = "1" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "1" ]; then
-  ok "main(): _reap_dead_scratch, _reap_dead_transcripts, _reap_growing_logs, _reap_hf_cache, _reap_gocache, _reap_go_build_orphans, AND _reap_code_sign_clone_orphans each invoked exactly once alongside _safe_reclaim"
+if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ] && [ "$REAP_LOGS_CALLS" = "1" ] && [ "$REAP_HF_CALLS" = "1" ] && [ "$REAP_GOCACHE_CALLS" = "1" ] && [ "$REAP_GO_BUILD_CALLS" = "1" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "1" ] && [ "$REAP_BACKUP_RESIDUE_CALLS" = "1" ]; then
+  ok "main(): _reap_dead_scratch, _reap_dead_transcripts, _reap_growing_logs, _reap_hf_cache, _reap_gocache, _reap_go_build_orphans, _reap_code_sign_clone_orphans, AND _reap_backup_residue each invoked exactly once alongside _safe_reclaim"
 else
-  bad "main(): expected all seven reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_LOGS_CALLS=$REAP_LOGS_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS"
+  bad "main(): expected all eight reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_LOGS_CALLS=$REAP_LOGS_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS REAP_BACKUP_RESIDUE_CALLS=$REAP_BACKUP_RESIDUE_CALLS"
 fi
 if [ "$REAP_LAST_ARG" = "1" ]; then
   ok "main(): CRITICAL cycle (even after reclaim recovers it to NONE) passes was_critical=1 to _reap_dead_scratch (ga-rjhfz pressure plumbing)"
@@ -1575,10 +1652,10 @@ VM_LOG_PRE_COUNT=$(grep -c "vm_swap_gb=" "$LOG" 2>/dev/null || echo 0)
 reset_capture; seed_state "" ""
 queue_avail 20
 main
-if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ] && [ "$REAP_HF_CALLS" = "0" ] && [ "$REAP_GOCACHE_CALLS" = "0" ] && [ "$REAP_GO_BUILD_CALLS" = "0" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "0" ]; then
-  ok "main(): avail above floor on first read never invokes the scratch/transcript/hf-cache/gocache/go-build/code-sign-clone reapers"
+if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ] && [ "$REAP_HF_CALLS" = "0" ] && [ "$REAP_GOCACHE_CALLS" = "0" ] && [ "$REAP_GO_BUILD_CALLS" = "0" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "0" ] && [ "$REAP_BACKUP_RESIDUE_CALLS" = "0" ]; then
+  ok "main(): avail above floor on first read never invokes the scratch/transcript/hf-cache/gocache/go-build/code-sign-clone/backup-residue reapers"
 else
-  bad "main(): expected zero scratch/transcript/hf-cache/gocache/go-build/code-sign-clone reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS"
+  bad "main(): expected zero scratch/transcript/hf-cache/gocache/go-build/code-sign-clone/backup-residue reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS REAP_BACKUP_RESIDUE_CALLS=$REAP_BACKUP_RESIDUE_CALLS"
 fi
 # ga-sfj3i.2: the exact case this acceptance criterion exists for — a cycle
 # that never breaches ANY floor is precisely where the pre-fix guard logged
