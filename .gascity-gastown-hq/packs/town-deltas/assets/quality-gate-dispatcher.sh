@@ -6179,6 +6179,7 @@ PYEOF
             DR_OUT=$(RUNTIME_DIR="$DR_RUNTIME_DIR" PRE_DEPLOY_SHA="$DR_PRE_SHA" POST_DEPLOY_SHA="$DR_POST_SHA" \
               DEPLOY_EPOCH="$DR_EPOCH" SENSITIVE_DAEMONS="$DR_SENSITIVE" \
               EXTRA_RUNTIME_ROOTS="$DR_EXTRA_ROOTS" FORCE_RESTART_LABELS="$DR_FORCE_RESTART" \
+              BEAD_MERGE_PRE_SHA="$MERGE_PRE_MAIN_SHA" BEAD_MERGE_SHA="$MERGE_SHA" \
               DRY_RUN="$DRY_RUN" \
               bash "$GC_CITY/packs/town-deltas/assets/daemon-refresh.sh" 2>&1 || true)
             # ga-l7n3v: `|| true` on all three — under this script's set -euo
@@ -6194,7 +6195,20 @@ PYEOF
             DR_VERDICT=$(echo "$DR_OUT" | grep '^VERDICT=' | head -1 | sed 's/^VERDICT=//' || true)
             DR_REASON=$(echo "$DR_OUT" | grep '^REASON=' | head -1 | sed 's/^REASON=//' || true)
             DR_PROOF=$(echo "$DR_OUT" | grep '^PROOF=' | head -1 | sed 's/^PROOF=//' || true)
-            log "ga-l7n3v daemon-refresh: rig=$RIG runtime=$DR_RUNTIME_DIR verdict=$DR_VERDICT proof=$DR_PROOF reason=$DR_REASON"
+            # ga-agracx: a Step 1b plist gap daemon-refresh.sh found but could
+            # NOT attribute to $BEAD_ID's own merge (BEAD_MERGE_PRE_SHA/
+            # BEAD_MERGE_SHA above) — an earlier, unrelated commit introduced
+            # it and this bead's deploy just happened to be the one whose pull
+            # finally advanced the runtime past it. Deliberately never held
+            # against THIS bead (that was the bug); still nudged to Mayor below
+            # so the real gap is never silently lost.
+            DR_UNATTRIB=$(echo "$DR_OUT" | grep '^UNATTRIBUTED_JOB_GAP=' | head -1 | sed 's/^UNATTRIBUTED_JOB_GAP=//' || true)
+            log "ga-l7n3v daemon-refresh: rig=$RIG runtime=$DR_RUNTIME_DIR verdict=$DR_VERDICT proof=$DR_PROOF reason=$DR_REASON${DR_UNATTRIB:+ unattributed_job_gap=$DR_UNATTRIB}"
+            if [ -n "$DR_UNATTRIB" ] && [ "$DRY_RUN" != "1" ]; then
+              gc --city "$GC_CITY" session nudge mayor \
+                "Daemon refresh found an unattributed scheduled-job gap for rig $RIG ($DR_UNATTRIB) — NOT caused by $BEAD_ID (ga-agracx), whose own merge (sha=$MERGE_SHA) didn't touch it; an earlier commit still needs the job installed/loaded." \
+                2>/dev/null || true
+            fi
             case "$DR_VERDICT" in
               OK|SKIPPED)
                 # root-class:error-vs-empty (ga-vmq1i's own distinction, reused

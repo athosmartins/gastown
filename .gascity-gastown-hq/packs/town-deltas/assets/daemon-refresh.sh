@@ -340,6 +340,24 @@ set -uo pipefail
 RUNTIME_DIR="${RUNTIME_DIR:-}"
 PRE_DEPLOY_SHA="${PRE_DEPLOY_SHA:-}"
 POST_DEPLOY_SHA="${POST_DEPLOY_SHA:-}"
+# ga-agracx: OPTIONAL attribution-narrowing inputs, distinct from PRE/POST_
+# DEPLOY_SHA above. PRE/POST_DEPLOY_SHA is the WIDE runtime-checkout window
+# (correct for "is ANY daemon/job stale on this rig") — when the runtime
+# fell behind (a previous deploy failed/skipped), that window can span
+# SEVERAL beads' merges at once, so Step 1b's plist-installation check below
+# used to attribute a gap to whichever bead's deploy happened to close the
+# window, not the one that actually introduced it (same root class ga-3bdttu
+# fixed for story-delivery.sh's own blame decision, one caller up the stack —
+# see tests/story-delivery-daemon-refresh-attribution.test.sh). When a caller
+# passes BOTH of these (its own merge's pre-image and the merge commit
+# itself — quality-gate-dispatcher.sh already computes both as MERGE_PRE_
+# MAIN_SHA/MERGE_SHA before this call), Step 1b narrows JUST the blocking
+# JOB_NOT_INSTALLED verdict to gaps that range actually introduced, without
+# ever suppressing the underlying alert (see SJ_UNATTRIBUTED_REASON below).
+# Left empty by any caller that doesn't pass them (e.g. story-delivery.sh's
+# own call) — falls back to today's exact behavior, zero regression.
+BEAD_MERGE_PRE_SHA="${BEAD_MERGE_PRE_SHA:-}"
+BEAD_MERGE_SHA="${BEAD_MERGE_SHA:-}"
 DEPLOY_EPOCH="${DEPLOY_EPOCH:-0}"
 SENSITIVE_DAEMONS="${SENSITIVE_DAEMONS:-}"
 EXTRA_RUNTIME_ROOTS="${EXTRA_RUNTIME_ROOTS:-}"
@@ -512,10 +530,16 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   echo "PARSE_ERROR_UNLOADED=${PARSE_ERROR_UNLOADED:-}"
   echo "REASON=$reason"
   echo "PROOF=$proof"
+  # ga-agracx: a Step 1b plist gap this bead's own merge did NOT introduce —
+  # deliberately never folded into $reason or forced into $verdict (that
+  # would just reintroduce the misattribution this field exists to avoid).
+  # Always present (even empty) so a caller can check it unconditionally,
+  # same convention as PARSE_ERROR_LOADED/UNLOADED above.
+  echo "UNATTRIBUTED_JOB_GAP=${SJ_UNATTRIBUTED_REASON:-}"
   # Trailing JSON for the caller's bead comment / jsonl log.
-  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" <<'PY' 2>/dev/null || true
+  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" <<'PY' 2>/dev/null || true
 import json, sys
-v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu = sys.argv[1:12]
+v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg = sys.argv[1:13]
 sp = lambda s: [x for x in s.split() if x]
 print("JSON=" + json.dumps({
     "verdict": v, "reason": reason,
@@ -523,6 +547,7 @@ print("JSON=" + json.dumps({
     "fresh_fail": sp(ff), "guarded": sp(gd), "proof": proof,
     "already_fresh": sp(afr), "would_restart": sp(wr),
     "parse_error_loaded": sp(pel), "parse_error_unloaded": sp(peu),
+    "unattributed_job_gap": ujg,
 }))
 PY
   if [ "$DRY_RUN" = "1" ]; then exit 0; fi
@@ -532,6 +557,10 @@ PY
 AFFECTED=""; RESTARTED=""; FRESH_FAIL=""; GUARDED=""; ALREADY_FRESH=""; WOULD_RESTART=""
 # ga-ax0t9: achado do Step 1b que espera o Step 2 rodar antes de virar veredito.
 SJ_PENDING_REASON=""
+# ga-agracx: a real Step 1b gap that was NOT attributed to this bead's own
+# merge — never forces the verdict (contrast SJ_PENDING_REASON above), only
+# surfaced via emit()'s own UNATTRIBUTED_JOB_GAP field so it is never lost.
+SJ_UNATTRIBUTED_REASON=""
 # gate-fix-2 (ga-puq8z, gate_run=ga-9a45d): weakest confidence tier across all
 # ALREADY_FRESH daemons this run — starts optimistic, downgraded to
 # not_verified the moment any already-fresh match is only a COMMIT_EPOCH
@@ -602,7 +631,27 @@ SJ_CHANGED_PLISTS="$(echo "$CHANGED" | grep -E '\.plist$' || true)"
 if [ -n "${SJ_CHANGED_PLISTS// /}" ]; then
   SJ_MISSING=""
   SJ_UNLOADED=""
+  SJ_MISSING_UNATTRIB=""
+  SJ_UNLOADED_UNATTRIB=""
   SJ_CHECKED=""
+  # ga-agracx: this bead's OWN plist-touching set, computed once up front —
+  # only when BOTH attribution inputs are usable (non-empty, both resolve in
+  # THIS runtime checkout, and BEAD_MERGE_PRE_SHA is an actual ancestor of
+  # BEAD_MERGE_SHA — same guard chain ga-6zkhci established for story-
+  # delivery.sh's own MERGE_PRE_MAIN fallback; never trust the inputs blindly).
+  # Any guard failure (unset, unresolvable, not-an-ancestor) leaves attribution
+  # UNKNOWN, which below defaults to "attributable" — i.e. today's exact
+  # behavior — never silently exempting on a bad signal.
+  SJ_ATTRIBUTION_KNOWN=0
+  SJ_BEAD_OWN_PLISTS=""
+  if [ -n "$BEAD_MERGE_PRE_SHA" ] && [ -n "$BEAD_MERGE_SHA" ] \
+     && [ "$BEAD_MERGE_PRE_SHA" != "$BEAD_MERGE_SHA" ] \
+     && git -C "$RUNTIME_DIR" rev-parse --verify -q "$BEAD_MERGE_PRE_SHA" >/dev/null 2>&1 \
+     && git -C "$RUNTIME_DIR" rev-parse --verify -q "$BEAD_MERGE_SHA" >/dev/null 2>&1 \
+     && git -C "$RUNTIME_DIR" merge-base --is-ancestor "$BEAD_MERGE_PRE_SHA" "$BEAD_MERGE_SHA" 2>/dev/null; then
+    SJ_ATTRIBUTION_KNOWN=1
+    SJ_BEAD_OWN_PLISTS="$(git -C "$RUNTIME_DIR" diff --name-only "$BEAD_MERGE_PRE_SHA" "$BEAD_MERGE_SHA" 2>/dev/null | grep -E '\.plist$' || true)"
+  fi
   while IFS= read -r sj_rel; do
     [ -n "$sj_rel" ] || continue
     sj_path="$RUNTIME_DIR/$sj_rel"
@@ -631,14 +680,32 @@ PY
       continue
     fi
     SJ_CHECKED="$SJ_CHECKED $sj_label"
+    sj_broken=""
     if [ ! -f "$LAUNCH_AGENTS_DIR/$sj_label.plist" ]; then
-      SJ_MISSING="$SJ_MISSING $sj_label"
+      sj_broken="missing"
     elif ! $LAUNCHCTL_BIN list "$sj_label" >/dev/null 2>&1; then
-      SJ_UNLOADED="$SJ_UNLOADED $sj_label"
+      sj_broken="unloaded"
+    fi
+    if [ -n "$sj_broken" ]; then
+      # ga-agracx: the gap itself is established above (unconditionally, same
+      # as before) — this only decides which BUCKET it lands in. Unknown
+      # attribution (SJ_ATTRIBUTION_KNOWN=0) defaults to attributable, i.e.
+      # identical to pre-ga-agracx behavior.
+      sj_attributable=1
+      if [ "$SJ_ATTRIBUTION_KNOWN" = "1" ] && ! printf '%s\n' "$SJ_BEAD_OWN_PLISTS" | grep -Fxq "$sj_rel"; then
+        sj_attributable=0
+      fi
+      if [ "$sj_broken" = "missing" ]; then
+        if [ "$sj_attributable" = "1" ]; then SJ_MISSING="$SJ_MISSING $sj_label"; else SJ_MISSING_UNATTRIB="$SJ_MISSING_UNATTRIB $sj_label"; fi
+      else
+        if [ "$sj_attributable" = "1" ]; then SJ_UNLOADED="$SJ_UNLOADED $sj_label"; else SJ_UNLOADED_UNATTRIB="$SJ_UNLOADED_UNATTRIB $sj_label"; fi
+      fi
     fi
   done <<< "$SJ_CHANGED_PLISTS"
   SJ_MISSING="$(echo "$SJ_MISSING" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
   SJ_UNLOADED="$(echo "$SJ_UNLOADED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+  SJ_MISSING_UNATTRIB="$(echo "$SJ_MISSING_UNATTRIB" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+  SJ_UNLOADED_UNATTRIB="$(echo "$SJ_UNLOADED_UNATTRIB" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
   if [ -n "${SJ_MISSING// /}" ] || [ -n "${SJ_UNLOADED// /}" ]; then
     # gate_run=ga-3khhu (Reviewer-1 FAIL): this used to be AFFECTED="$SJ_CHECKED"
     # — the FULL set of plists this deploy touched, fine ones included, not
@@ -652,7 +719,13 @@ PY
     # missing/unloaded. SJ_MISSING and SJ_UNLOADED are disjoint by construction
     # (the if/elif above sets exactly one or neither per label), so no extra
     # dedup is needed here — line ~1105's existing normalize pass covers it.
-    AFFECTED="$SJ_MISSING $SJ_UNLOADED"
+    # ga-agracx: unattributed findings are STILL real gaps (Step 4 below just
+    # logs "not currently running — skipping" for any AFFECTED label with no
+    # live PID, the same as it always has for a never-installed job — no
+    # remedial action was ever gated on attribution), so they stay in AFFECTED
+    # for full visibility. Only SJ_PENDING_REASON below — the BLOCKING verdict
+    # — is scoped to what this bead's own merge actually introduced.
+    AFFECTED="$SJ_MISSING $SJ_UNLOADED $SJ_MISSING_UNATTRIB $SJ_UNLOADED_UNATTRIB"
     SJ_REASON="scheduled-job plist(s) changed by this deploy are not actually installed for launchd to run them"
     [ -n "${SJ_MISSING// /}" ] && SJ_REASON="$SJ_REASON — missing from $LAUNCH_AGENTS_DIR: $SJ_MISSING"
     [ -n "${SJ_UNLOADED// /}" ] && SJ_REASON="$SJ_REASON — present but not loaded (launchctl list): $SJ_UNLOADED"
@@ -661,13 +734,31 @@ PY
     # Step 2 nunca rodaria. Registra e segue; emit combina no fim.
     SJ_PENDING_REASON="$SJ_REASON"
   fi
+  if [ -n "${SJ_MISSING_UNATTRIB// /}" ] || [ -n "${SJ_UNLOADED_UNATTRIB// /}" ]; then
+    # ga-agracx: a real gap, but NOT introduced by this bead's own merge
+    # (BEAD_MERGE_PRE_SHA..BEAD_MERGE_SHA does not contain this plist) — an
+    # earlier, unrelated commit somewhere in the wider PRE_DEPLOY_SHA..
+    # POST_DEPLOY_SHA runtime-checkout window introduced it, and this deploy
+    # is simply the one whose pull finally advanced the runtime past it.
+    # Never silenced (Mayor's ACEITE 2 on ga-agracx: the alert must keep
+    # firing) — recorded here and surfaced via emit()'s own
+    # UNATTRIBUTED_JOB_GAP field so the caller can still act on it (e.g.
+    # nudge Mayor) without holding an innocent bead responsible for it.
+    AFFECTED="$SJ_MISSING $SJ_UNLOADED $SJ_MISSING_UNATTRIB $SJ_UNLOADED_UNATTRIB"
+    SJ_UNATTRIB_REASON="scheduled-job plist(s) somewhere in the wider deploy window are not actually installed for launchd to run them, but this bead's own merge did not introduce them"
+    [ -n "${SJ_MISSING_UNATTRIB// /}" ] && SJ_UNATTRIB_REASON="$SJ_UNATTRIB_REASON — missing from $LAUNCH_AGENTS_DIR: $SJ_MISSING_UNATTRIB"
+    [ -n "${SJ_UNLOADED_UNATTRIB// /}" ] && SJ_UNATTRIB_REASON="$SJ_UNATTRIB_REASON — present but not loaded (launchctl list): $SJ_UNLOADED_UNATTRIB"
+    log "Step 1b: unattributed JOB_NOT_INSTALLED gap (not caused by this bead's own merge) — $SJ_UNATTRIB_REASON"
+    SJ_UNATTRIBUTED_REASON="$SJ_UNATTRIB_REASON"
+  fi
   # gate_run=ga-3khhu: the log line below used to name the FULL $SJ_CHECKED,
   # which could (and did, in the reviewer's repro) name a label the block
   # above had just reported MISSING one line earlier — self-contradictory.
-  # Exclude anything already counted as missing/unloaded.
+  # Exclude anything already counted as missing/unloaded (ga-agracx: in
+  # EITHER attribution bucket — an unattributed gap is still not fine).
   SJ_FINE="$(comm -23 \
     <(echo "$SJ_CHECKED" | tr ' ' '\n' | grep -v '^$' | sort -u) \
-    <(printf '%s\n%s\n' "$SJ_MISSING" "$SJ_UNLOADED" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+    <(printf '%s\n%s\n%s\n%s\n' "$SJ_MISSING" "$SJ_UNLOADED" "$SJ_MISSING_UNATTRIB" "$SJ_UNLOADED_UNATTRIB" | tr ' ' '\n' | grep -v '^$' | sort -u) \
     | tr '\n' ' ' | sed 's/ $//')"
   if [ -n "${SJ_FINE// /}" ]; then
     log "Step 1b: scheduled-job plist(s) changed by this deploy are installed+loaded:$SJ_FINE (not proof they have run successfully — see JOB_NOT_INSTALLED's own ACTION text at the caller for that follow-up check)."
