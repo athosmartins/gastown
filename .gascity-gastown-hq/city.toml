@@ -28,7 +28,6 @@ source = "packs/town-deltas"
 [[rigs]]
 name = "property_scrapers"
 prefix = "ps"
-suspended = true
 [rigs.imports]
 
 # gt-kfr7m: pilot fix — rigs[].imports (V2 map field, NOT the bare `pack=`
@@ -60,6 +59,9 @@ source = ".gc/system/packs/gastown"
 [[rigs]]
 name = "lexbh"
 prefix = "lx"
+# Mayor 16/09: rig dormente ate a sancao do PL 574/2025 (lx-8jd).
+# Re-armar: gc agent resume + remover pilot:no-auto-dispatch da lx-8jd.
+suspended = true
 [rigs.imports]
 
 # gt-kfr7m: same fix, same rationale as marketing above.
