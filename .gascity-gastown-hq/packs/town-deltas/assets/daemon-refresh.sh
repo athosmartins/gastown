@@ -649,8 +649,20 @@ if [ -n "${SJ_CHANGED_PLISTS// /}" ]; then
      && git -C "$RUNTIME_DIR" rev-parse --verify -q "$BEAD_MERGE_PRE_SHA" >/dev/null 2>&1 \
      && git -C "$RUNTIME_DIR" rev-parse --verify -q "$BEAD_MERGE_SHA" >/dev/null 2>&1 \
      && git -C "$RUNTIME_DIR" merge-base --is-ancestor "$BEAD_MERGE_PRE_SHA" "$BEAD_MERGE_SHA" 2>/dev/null; then
-    SJ_ATTRIBUTION_KNOWN=1
-    SJ_BEAD_OWN_PLISTS="$(git -C "$RUNTIME_DIR" diff --name-only "$BEAD_MERGE_PRE_SHA" "$BEAD_MERGE_SHA" 2>/dev/null | grep -E '\.plist$' || true)"
+    # ga-agracx gate-fix: do NOT set SJ_ATTRIBUTION_KNOWN=1 until the diff
+    # ITSELF has actually succeeded — an empty result from a FAILED diff
+    # (git internal error, however unlikely after the three checks just
+    # above already succeeded) must not read the same as "ran fine, this
+    # bead's own range genuinely touches no plists": the former is
+    # third-state UNKNOWN (falls back to blame, the safe direction — a
+    # transient failure here must never silently exempt a truly-guilty
+    # bead), the latter is a real, confirmed negative.
+    sj_own_diff_rc=0
+    sj_own_diff_out="$(git -C "$RUNTIME_DIR" diff --name-only "$BEAD_MERGE_PRE_SHA" "$BEAD_MERGE_SHA" 2>/dev/null)" || sj_own_diff_rc=$?
+    if [ "$sj_own_diff_rc" -eq 0 ]; then
+      SJ_ATTRIBUTION_KNOWN=1
+      SJ_BEAD_OWN_PLISTS="$(printf '%s\n' "$sj_own_diff_out" | grep -E '\.plist$' || true)"
+    fi
   fi
   while IFS= read -r sj_rel; do
     [ -n "$sj_rel" ] || continue
