@@ -799,9 +799,27 @@ eq "AC4 shape 3: a recycled pool instance 'wa-worker-gadnuds' (already exited no
 # untouched (still correctly answers 0 for all three, confirming the
 # dispatcher's early pool-intercept is what changes, not the liveness
 # predicate itself).
-eq "AC1: author_is_alive() itself is unchanged — still 0 for the virtual slot label (proves the FIX is the early intercept, not a liveness-predicate change)" \
+#
+# ga-yvb2kh: author_is_alive() is not pure — it calls the REAL, live
+# `gc session list --json` (see its definition above) — so this assertion is
+# only deterministic when stubbed. Unstubbed, it depends on whatever
+# sessions happen to be running in the live city at test time: a genuinely
+# live pool slot's name/alias/agent_name CAN legitimately be the literal
+# string 'wa-worker-1' (Pilot's own numbered-slot convention), which flips
+# the result to 1 and fails this assertion — not a code regression, a
+# non-hermetic test tripping on real environment state. Stub `gc` the same
+# way 14b does below, scoped to this one call only.
+gc() {
+  if [ "$1" = "--city" ] && [ "$3" = "session" ] && [ "$4" = "list" ]; then
+    printf '{"sessions":[]}'
+    return 0
+  fi
+  return 1
+}
+eq "AC1: author_is_alive() itself is unchanged — still 0 for the virtual slot label when no live session matches it (proves the FIX is the early intercept, not a liveness-predicate change)" \
   "$(author_is_alive "wa-worker-1")" \
   "0"
+unset -f gc
 
 echo "── 13c. drift-guard: the pool intercept is wired in AND positioned before every circuit-break/bounce decision ──"
 grep -qF 'REBASE_AUTHOR_IS_POOL=$(rebase_author_is_pool "$REBASE_AUTHOR")' "$DISPATCHER" \
