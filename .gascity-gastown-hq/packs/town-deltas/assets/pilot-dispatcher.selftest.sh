@@ -6532,6 +6532,75 @@ fi
 has "$DISPATCHER" 'bd -C "\$GC_CITY" ready --metadata-field "gc\.routed_to=\$_pool" --unassigned' \
   "real (non-test-seam) pending-bead query targets RoutedPoolQuery's own shape: gc.routed_to=<pool> + unassigned"
 
+# ── Scenario TOPUP-RIG: rig-scoped fallback (ga-q0ewpu) ───────────────────────
+# The pending-bead query above only ever looked at $GC_CITY. A rig-native
+# (wa-*/ps-*) bead routed to a pool at session cap was therefore invisible to
+# top-up forever — measured live: wa-52q8u, wa-ah359, wa-c1hgd stranded
+# routed+unassigned until a human ran pilot-manual-reclaim.sh by hand. Fix
+# adds _topup_rig_pending(), a fallback that iterates every non-HQ rig store
+# the same way _scan_rig_fallback_pool (L7643) already does for the primary
+# candidate scan.
+#
+# run_topup_rig_scenario deliberately leaves PILOT_TEST_WA_WORKER_TOPUP_PENDING
+# UNSET (unlike run_topup_scenario above, which always sets it) so the
+# HQ-scoped query takes its real (shimmed) code path instead of the seam
+# short-circuit. The default bd shim's catch-all (`*) printf '[]'`, no case
+# arm matches `ready --metadata-field`) makes that HQ probe resolve empty
+# here, isolating the ga-q0ewpu rig fallback — engaged via its OWN test seam,
+# PILOT_TEST_WA_WORKER_TOPUP_RIG_PENDING — as the only thing under test.
+#   $1=PILOT_TEST_WA_WORKER_LIVE_COUNT
+#   $2=PILOT_TEST_WA_WORKER_TOPUP_RIG_PENDING (bead id, or "" for none)
+#   $3=DRY_RUN (default 1)
+run_topup_rig_scenario() {
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DRY_RUN="${3:-1}" \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
+    FAKE_BLOCKED_IDS="" \
+    FAKE_BUGS_JSON="[]" \
+    FAKE_TIER2_JSON="[]" \
+    PILOT_TEST_WA_WORKER_LIVE_COUNT="${1:-0}" \
+    GC_VARIABLE_SESSION_COUNT_OVERRIDE="${1:-0}" \
+    PILOT_TEST_WA_WORKER_TOPUP_RIG_PENDING="${2:-}" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+echo "Scenario TOPUP-RIG-1: HQ has no routed-unassigned bead but a RIG store does → still spawns (ga-q0ewpu)"
+LOG_TUR1="$(run_topup_rig_scenario "3" "wa-rig-pending1" "0")"
+if echo "$LOG_TUR1" | grep -q "ga-93yxc: pool top-up — wa-worker has free capacity (live=3 < 4) and wa-rig-pending1 is routed+unassigned with no worker from a prior sweep — spawning."; then
+  ok "topup: finds a rig-native routed-unassigned bead when HQ has none, and spawns for it (ga-q0ewpu fix present)"
+else
+  bad "topup: did NOT spawn for a rig-native pending bead despite HQ being empty — ga-q0ewpu regression (rig-native routed beads strand at pool-cap forever, same as the live wa-52q8u/wa-ah359/wa-c1hgd incident)"
+fi
+
+echo "Scenario TOPUP-RIG-2: HQ empty AND no rig has a pending bead either → correctly no-ops"
+LOG_TUR2="$(run_topup_rig_scenario "1" "" "0")"
+if echo "$LOG_TUR2" | grep -q "ga-93yxc: pool top-up"; then
+  bad "topup: attempted a spawn with no pending bead in HQ or any rig — should be a silent no-op"
+else
+  ok "topup: correctly no-ops when neither HQ nor any rig has a routed-unassigned bead"
+fi
+
+echo "Scenario TOPUP-RIG-3: structural — rig fallback exists and mirrors the HQ query shape"
+has "$DISPATCHER" '_topup_rig_pending\(\)' \
+  "_topup_rig_pending helper is defined (rig-scoped fallback for the top-up pending-bead query)"
+has "$DISPATCHER" 'bd -C "\$_rp" ready --metadata-field "gc\.routed_to=\$_pool" --unassigned' \
+  "rig-scoped pending query mirrors the HQ query exactly, just -C \$_rp instead of -C \$GC_CITY"
+has "$DISPATCHER" '_TOPUP_RIG_PATHS_JSON=\$\(gc_json_or_unknown gc --city "\$GC_CITY" rig list --json\)' \
+  "_TOPUP_RIG_PATHS_JSON is populated from a real 'gc rig list --json' call, same as _scan_rig_fallback_pool/_pilot_emit_dispatchable"
+has "$DISPATCHER" '_TOPUP_RIG_PATHS=\$\(printf' \
+  "_TOPUP_RIG_PATHS is derived from _TOPUP_RIG_PATHS_JSON"
+has "$DISPATCHER" 'done <<< "\$_TOPUP_RIG_PATHS"' \
+  "_topup_rig_pending's loop consumes _TOPUP_RIG_PATHS, the pre-computed rig-path list"
+
 # ── Scenario 16s–16v: phantom-claim guard (FOLLOW-UP #1, ga-9yb5s+) ──────────
 # A live crew member may hold story.assignee but NEVER start the build (phantom).
 # The phantom-claim guard inside _beadid_live_crew_owner must RELEASE (return 1)
