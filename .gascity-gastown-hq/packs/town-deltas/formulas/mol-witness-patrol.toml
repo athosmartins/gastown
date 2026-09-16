@@ -232,11 +232,41 @@ a NEW session with a different ID — the old one never comes back.
 
    Stream both JSON blobs through temp files, never `--argjson` on argv: on a
    busy city the session `command` fields are large and overflow ARG_MAX
-   (`argument list too long: jq`). Build the map once:
+   (`argument list too long: jq`). Neither read's exit code or output size is
+   optional to check: an empty `SESSION_BEADS_FILE` slurps cleanly into
+   `$session_beads = []` (valid jq, zero rows, no error), and a broken
+   `SESSIONS_FILE` can make even `SESSION_COUNT` itself read as 0 — both let
+   the step run to completion as if it had read a real (empty) roster
+   instead of having failed to read one at all. Build the map once, checking
+   both reads explicitly:
    ```bash
    SESSIONS_FILE=$(mktemp); SESSION_BEADS_FILE=$(mktemp)
-   gc session list --state=all --json > "$SESSIONS_FILE"
-   gc bd list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0 > "$SESSION_BEADS_FILE"
+   gc session list --state=all --json > "$SESSIONS_FILE" 2>"$SESSIONS_FILE.err"
+   SESSIONS_RC=$?
+   gc bd list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0 > "$SESSION_BEADS_FILE" 2>"$SESSION_BEADS_FILE.err"
+   SESSION_BEADS_RC=$?
+
+   # The live session list is load-bearing for the whole step: a failed or
+   # unparseable read here is NOT "zero sessions" and must not be treated
+   # like one. Abort recovery this cycle exactly like the empty-map
+   # fail-safe below, even if some partial JSON reached the file.
+   if [ "$SESSIONS_RC" -ne 0 ] || [ ! -s "$SESSIONS_FILE" ] || ! jq -e . "$SESSIONS_FILE" >/dev/null 2>&1; then
+     echo "FAIL-SAFE: gc session list read failed (rc=$SESSIONS_RC, $(wc -c <"$SESSIONS_FILE" | tr -d ' ') bytes) — skipping orphan recovery this cycle (treat all assignees as live)."
+     gc mail send mayor/ -s "WITNESS: orphan-recovery disabled — session list read failed" -m "gc session list --state=all --json exited rc=$SESSIONS_RC with $(wc -c <"$SESSIONS_FILE" | tr -d ' ') bytes of stdout. stderr: $(cat "$SESSIONS_FILE.err"). Skipping orphan recovery this cycle to avoid false-orphaning live agents."
+     rm -f "$SESSIONS_FILE" "$SESSIONS_FILE.err" "$SESSION_BEADS_FILE" "$SESSION_BEADS_FILE.err"
+     # Skip the rest of this step; proceed to check-refinery.
+   fi
+
+   # The session-beads overlay (configured_named_identity) only ever ADDS
+   # entries on top of the live session list — it is never the sole source
+   # of liveness. A failed/empty/invalid read here means "we don't know",
+   # not "zero rows to overlay": say so explicitly and fall back to the
+   # live list alone instead of silently proceeding as if the overlay had
+   # legitimately contributed nothing.
+   if [ "$SESSION_BEADS_RC" -ne 0 ] || [ ! -s "$SESSION_BEADS_FILE" ] || ! jq -e . "$SESSION_BEADS_FILE" >/dev/null 2>&1; then
+     echo "OVERLAY UNKNOWN: gc bd list (session beads) read failed (rc=$SESSION_BEADS_RC, $(wc -c <"$SESSION_BEADS_FILE" | tr -d ' ') bytes) — resolving liveness from the live session list only this cycle; the configured_named_identity overlay did not contribute."
+     printf '[]' > "$SESSION_BEADS_FILE"
+   fi
 
    LIVENESS_MAP=$(jq -n --slurpfile sessions "$SESSIONS_FILE" --slurpfile session_beads "$SESSION_BEADS_FILE" '
      def add($m; $key; $state; $closed):
@@ -255,15 +285,15 @@ a NEW session with a different ID — the old one never comes back.
 
    SESSION_COUNT=$(jq -r '(.sessions // []) | length' "$SESSIONS_FILE")
    MAP_COUNT=$(printf '%s' "$LIVENESS_MAP" | jq -r 'length')
-   rm -f "$SESSIONS_FILE" "$SESSION_BEADS_FILE"
-   ```
+   rm -f "$SESSIONS_FILE" "$SESSIONS_FILE.err" "$SESSION_BEADS_FILE" "$SESSION_BEADS_FILE.err"
 
-   **Fail safe — never orphan on an empty map.** If the map is empty while
-   sessions exist, the schema has drifted again (the exact failure in
-   gc-3tn8g). An empty map resolves every assignee to `absent` and would
-   false-orphan live agents. ABORT recovery this cycle — do NOT classify any
-   bead as orphaned — escalate, then continue to `check-refinery`:
-   ```bash
+   # Fail safe — never orphan on an empty map. If the map is empty while
+   # sessions exist, the schema has drifted again (the exact failure in
+   # gc-3tn8g) — a SEPARATE case from the read failures above (both reads
+   # reported success, but the resulting map is still empty). An empty map
+   # resolves every assignee to "absent" and would false-orphan live
+   # agents. ABORT recovery this cycle — do NOT classify any bead as
+   # orphaned — escalate, then continue to check-refinery:
    if [ "${MAP_COUNT:-0}" -eq 0 ] && [ "${SESSION_COUNT:-0}" -gt 0 ]; then
      echo "FAIL-SAFE: empty liveness map with $SESSION_COUNT live sessions — skipping orphan recovery (treat all assignees as live)."
      gc mail send mayor/ -s "WITNESS: orphan-recovery disabled — empty liveness map" -m "Built an empty assignee->state map from $SESSION_COUNT live sessions. gc session list --json schema likely drifted again (gc-3tn8g); skipping orphan recovery this cycle to avoid false-orphaning live agents. Re-check the recover-orphaned-beads liveness recipe."
