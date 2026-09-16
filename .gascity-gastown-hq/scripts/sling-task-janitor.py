@@ -17,6 +17,21 @@ This janitor closes a sling stub when ALL hold (conservative, fail-toward-KEEP):
     a closed / deferred / blocked / parked / missing parent = no active build → orphan)
   - it is older than MIN_AGE_MIN (default 60) — NEVER race a just-minted dispatch stub
 
+Candidates come from two queries, not one: the normal open/in_progress listing, PLUS
+sling stubs stuck in status==deferred whose defer_until has already expired (ga-uq84hf).
+Pilot's redispatch-suppression (_pilot_suppress_reused_sling in pilot-dispatcher.sh) hides
+a reused/pool-target sling by setting its bd status to the literal string "deferred" via
+`bd update --defer`. Unlike `bd ready` (which reconciles an expired defer_until back to
+status=open as a side effect of computing readiness), plain `bd list` never does — the
+status field stays "deferred" FOREVER until something explicitly calls `bd ready` or
+`bd undefer` on it. lifecycle-coherence-janitor's R6 rule is supposed to be that something;
+if it ever misses a candidate, this janitor's own open/in_progress-only listing previously
+had zero visibility into it and logged nothing at all (confirmed live: several sibling
+orphans each appeared exactly once across a 7349-sweep log — their first, correctly
+"too fresh" sweep — then total silence for ~21h until an unrelated dog's own `bd ready`
+pool-probe incidentally woke them). See _list_deferred_expired_slings for why this is a
+second, narrowly-scoped query rather than a widened status filter on the main listing.
+
 A "molecule" (e.g. mol-do-work) is a standing pool-demand order: while it is open, the
 supervisor keeps >=1 worker alive to execute its metadata["gc.var.issue"] target. If that
 target is already closed/deferred/gone, the molecule is a dead order — a worker boots,
@@ -86,6 +101,7 @@ _rigs_fn = None           # () -> list[str] store paths
 _do_notify_fn = None      # (msg, prio) -> None
 _target_status_fn = None  # (targets_by_store: dict[store, set[id]]) -> dict[id, status]
 _rig_name_map_fn = None   # () -> dict[rig_name, store_path]
+_deferred_slings_fn = None  # (store, now) -> list[dict]  (ga-uq84hf test seam)
 
 
 def _sh(args, timeout=20):
@@ -240,6 +256,32 @@ def _list_open(store):
     return _parse_bd_json(r.stdout)
 
 
+def _list_deferred_expired_slings(store, now):
+    """Sling-stub candidates stuck in status=deferred whose defer_until already expired
+    (ga-uq84hf) — see the module docstring for the full mechanism. Deliberately a SEPARATE
+    query rather than widening _list_open's status filter: molecules and steps have their
+    OWN, already-correct "deferred means frozen, not terminal" semantics
+    (_ORPHAN_TARGET_STATUSES excludes a deferred molecule target; _should_close_step KEEPs
+    a deferred-parent step) — folding every deferred bead into the general store_beads scan
+    would silently start feeding deferred molecules into _should_close_molecule (which never
+    checks a molecule's OWN status), risking a false-close of a molecule that is merely
+    frozen and meant to resume. This helper only ever returns beads that already pass
+    _is_sling (type==task, sling-shaped title) — structurally impossible for a molecule or
+    step, so merging its output straight into store_beads is safe. Same fail-toward-KEEP
+    contract as everywhere else: a future or unparseable defer_until is never expired."""
+    if _deferred_slings_fn is not None:
+        return _deferred_slings_fn(store, now)
+    r = _sh(["bash", BD_LIST_CACHED, "-C", store, "list", "--json", "--status", "deferred", "-n", "0"],
+            timeout=BD_TIMEOUT)
+    if r is None or r.returncode != 0:
+        return []
+    out = []
+    for b in (_parse_bd_json(r.stdout) or []):
+        if isinstance(b, dict) and _is_sling(b) and _defer_expired(b, now):
+            out.append(b)
+    return out
+
+
 _BEADID_RE = re.compile(r"\b([a-z]{2,3}-[a-z0-9]{4,})\b")
 
 
@@ -306,18 +348,32 @@ def _close(store, bead_id, reason):
     return bool(r and r.returncode == 0)
 
 
+def _parse_ts(ts):
+    """Parse a bd timestamp string (several tolerated formats) to a UTC epoch float,
+    or None if empty/unparseable."""
+    if not ts:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.datetime.strptime(ts[:19], fmt).replace(tzinfo=datetime.timezone.utc).timestamp()
+        except Exception:
+            continue
+    return None
+
+
 def _age_min(bead, now):
     """Minutes since updated_at (fallback created_at). Unparseable → 0 (treated as fresh → KEEP)."""
     ts = bead.get("updated_at") or bead.get("created_at") or ""
-    if not ts:
-        return 0.0
-    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
-        try:
-            dt = datetime.datetime.strptime(ts[:19], fmt).replace(tzinfo=datetime.timezone.utc)
-            return (now - dt.timestamp()) / 60.0
-        except Exception:
-            continue
-    return 0.0
+    epoch = _parse_ts(ts)
+    return 0.0 if epoch is None else (now - epoch) / 60.0
+
+
+def _defer_expired(bead, now):
+    """True iff bead's defer_until is a parseable timestamp already in the past.
+    Fail-toward-KEEP: an absent/unparseable/future defer_until returns False — "still
+    deferred" and "don't know" must never be mistaken for "expired" (ga-uq84hf)."""
+    epoch = _parse_ts(bead.get("defer_until") or "")
+    return epoch is not None and epoch <= now
 
 
 def _is_sling(bead):
@@ -598,6 +654,12 @@ def run_cycle(now):
         beads = _list_open(store)
         if beads is None:
             continue
+        # ga-uq84hf: fold in expired-deferred sling stubs too — see the module docstring
+        # and _list_deferred_expired_slings for why _list_open's own status=open,in_progress
+        # filter can never see these on its own. Structurally sling-only (both call sites
+        # agree via _is_sling), so this can never leak a bead into the molecule/step paths
+        # below.
+        beads = beads + _list_deferred_expired_slings(store, now)
         store_beads[store] = beads
         for b in beads:
             if isinstance(b, dict) and "story:in-flight" in set(b.get("labels") or []):
@@ -853,7 +915,7 @@ def main():
 # ── selftest ────────────────────────────────────────────────────────────────────
 def _selftest():
     global _bd_list_open_fn, _bd_close_fn, _sessions_fn, _rigs_fn, _do_notify_fn, MAX_PER_SWEEP
-    global _target_status_fn, _rig_name_map_fn, BD_BIN, GC_BIN
+    global _target_status_fn, _rig_name_map_fn, BD_BIN, GC_BIN, _deferred_slings_fn
     ok = [0]
     bad = [0]
     def _ok(m): ok[0] += 1; print("  ok  " + m)
@@ -1370,6 +1432,45 @@ print(json.dumps(found))
         _bad("BJ2: run_cycle did not notify the degraded-stores fallback", str(notified))
     GC_BIN = _saved_gc_bin
     _rigs_fn = lambda: ["HQ"]
+
+    print("Scenario BK (ga-uq84hf): _defer_expired unit checks — past → True, future → "
+          "False, missing/unparseable → False (fail-toward-KEEP)")
+    _ok("BK1: past defer_until is expired") if _defer_expired({"defer_until": "2020-01-01T00:00:00Z"}, NOW) else \
+        _bad("BK1: past defer_until not detected as expired")
+    _bad("BK2: future defer_until wrongly treated as expired") if _defer_expired({"defer_until": "2099-01-01T00:00:00Z"}, NOW) else \
+        _ok("BK2: future defer_until correctly NOT expired")
+    _bad("BK3: missing defer_until wrongly treated as expired") if _defer_expired({}, NOW) else \
+        _ok("BK3: missing defer_until correctly NOT expired (fail-toward-KEEP)")
+    _bad("BK4: garbage defer_until wrongly treated as expired") if _defer_expired({"defer_until": "not-a-date"}, NOW) else \
+        _ok("BK4: unparseable defer_until correctly NOT expired (fail-toward-KEEP)")
+
+    print("Scenario BL (ga-uq84hf): run_cycle CLOSES a sling stub stuck in status=deferred "
+          "with an EXPIRED defer_until — the exact production shape (several sibling "
+          "orphans, 2026-09-15/16): parent already closed, no live assignee, but bd status "
+          "stuck literal 'deferred' from Pilot's redispatch-suppression, invisible to "
+          "_list_open's own status=open,in_progress filter for as long as nothing else "
+          "calls `bd ready`/`bd undefer` on it. This is the scenario that REPROVES against "
+          "the pre-fix run_cycle: with _list_deferred_expired_slings not yet wired in, "
+          "_list_open alone returns [] and the orphan is never even considered.")
+    MAX_PER_SWEEP = 10
+    expired_deferred_stub = mk("dfr1", "fix bug ga-brnlfa-like", updated=OLD)
+    expired_deferred_stub["status"] = "deferred"
+    expired_deferred_stub["defer_until"] = "2026-06-20T00:00:00Z"  # long past NOW (2026-06-29)
+    closed_idsBL = []
+    _rigs_fn = lambda: ["HQ"]
+    _bd_list_open_fn = lambda store: []  # _list_open ALONE sees nothing — that's the bug
+    _deferred_slings_fn = lambda store, now: [expired_deferred_stub]
+    _sessions_fn = lambda: set()
+    _bd_close_fn = lambda store, bid, reason: (closed_idsBL.append(bid) or True)
+    _do_notify_fn = lambda m, p: None
+    _target_status_fn = lambda targets_by_store: {"ga-brnlfa-like": "closed"}
+    run_cycle(NOW)
+    if closed_idsBL == ["dfr1"]:
+        _ok("BL: closed the expired-deferred sling stub that _list_open alone would miss forever")
+    else:
+        _bad("BL: did not close the expired-deferred orphan", "closed=%s" % closed_idsBL)
+    _target_status_fn = None
+    _deferred_slings_fn = None
 
     print("\n[sling-janitor selftest] %d passed, %d failed" % (ok[0], bad[0]))
     sys.exit(1 if bad[0] else 0)
