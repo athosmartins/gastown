@@ -113,14 +113,14 @@ fi
 # ── Scenario 5: NEVER self-approve — the decision vocabulary excludes 'approve' ─
 echo "Scenario 5: the decision core can NEVER emit 'approve' (AC: revisor nunca aprova)"
 seen_approve=0
-for v in PASS FAIL TIMEOUT GARBAGE ""; do
+for v in PASS FAIL TIMEOUT GARBAGE "" INCONSISTENT; do
   for r in 0 1 2 3 4 5; do
     d=$(refino_gate_decision "$v" "$r" 3)
     case "$d" in approve|story:approved) seen_approve=1 ;; esac
-    case "$d" in promote|bounce|escalate|requeue) : ;; *) bad "unexpected decision token '$d' for verdict=$v round=$r"; esac
+    case "$d" in promote|bounce|escalate|requeue|inconsistent) : ;; *) bad "unexpected decision token '$d' for verdict=$v round=$r"; esac
   done
 done
-[ "$seen_approve" = "0" ] && ok "no input ever yields 'approve' (only promote/bounce/escalate/requeue)" || bad "REGRESSION: decision core emitted an approve token"
+[ "$seen_approve" = "0" ] && ok "no input ever yields 'approve' (only promote/bounce/escalate/requeue/inconsistent)" || bad "REGRESSION: decision core emitted an approve token"
 
 # ── Scenario 6: TIMEOUT / unknown verdict → requeue (never promote) ───────────
 echo "Scenario 6: TIMEOUT / unknown → requeue (never promote, never approve)"
@@ -130,6 +130,93 @@ D=$(refino_gate_decision "" 2 3)
 [ "$D" = "requeue" ] && ok "empty verdict → requeue" || bad "empty → expected requeue, got '$D'"
 D=$(refino_gate_decision "weird" 1 3)
 [ "$D" = "requeue" ] && ok "garbage verdict → requeue" || bad "garbage → expected requeue, got '$D'"
+
+# ── Scenario ga-huw02s: verdict:PASS beats verdict:FAIL on the SAME bead ──────
+# A duplicate/racing reviewer dispatch can label ONE verdict bead with BOTH
+# verdict:PASS and verdict:FAIL. The old call site checked PASS first
+# (`if ... PASS ... elif ... FAIL`), so PASS silently won whenever both were
+# present — a REPROVED story could advance toward Athos's approval queue
+# looking approved. Fixed: PASS+FAIL is a THIRD state (inconsistent), never
+# collapsed into either verdict in silence.
+echo "Scenario ga-huw02s: verdict:PASS + verdict:FAIL on the same verdict bead"
+
+# Characterization: reconstruct the OLD (pre-fix) inline label check exactly
+# as it shipped — proves the fixture is faithful to the reported bug before
+# proving the fix (same technique as the _dedup_sweep_old / OLD_BUG fixtures
+# above).
+_predates_fix_verdict_check() {
+  local vb_labels="$1"
+  if echo "$vb_labels" | grep -q "verdict:PASS"; then
+    echo "PASS"
+  elif echo "$vb_labels" | grep -q "verdict:FAIL"; then
+    echo "FAIL"
+  fi
+}
+BOTH_LABELS="area:infra,verdict:PASS,verdict:FAIL,lane:small"
+OLD_RESULT=$(_predates_fix_verdict_check "$BOTH_LABELS")
+[ "$OLD_RESULT" = "PASS" ] && ok "characterization: pre-fix inline check on PASS+FAIL labels resolves PASS (the ga-huw02s bug, reproduced — a REPROVED story would advance)" \
+  || bad "characterization: pre-fix check produced '$OLD_RESULT', expected 'PASS' (fixture not faithful to ga-huw02s)"
+unset -f _predates_fix_verdict_check
+
+# Fix: the shipped refino_gate_verdict_from_labels never collapses PASS+FAIL
+# into either verdict.
+NEW_RESULT=$(refino_gate_verdict_from_labels "$BOTH_LABELS")
+[ "$NEW_RESULT" = "INCONSISTENT" ] && ok "fix: refino_gate_verdict_from_labels(PASS+FAIL) → INCONSISTENT, never PASS (ga-huw02s)" \
+  || bad "REGRESSION (ga-huw02s): refino_gate_verdict_from_labels(PASS+FAIL) → '$NEW_RESULT', expected INCONSISTENT"
+
+# Control (AC3: don't trade one bug for another) — PASS-only and FAIL-only
+# resolve exactly as before.
+[ "$(refino_gate_verdict_from_labels "area:infra,verdict:PASS,lane:small")" = "PASS" ] \
+  && ok "control: PASS-only labels still resolve PASS" || bad "REGRESSION: PASS-only labels no longer resolve PASS"
+[ "$(refino_gate_verdict_from_labels "area:infra,verdict:FAIL,lane:small")" = "FAIL" ] \
+  && ok "control: FAIL-only labels still resolve FAIL" || bad "REGRESSION: FAIL-only labels no longer resolve FAIL"
+[ "$(refino_gate_verdict_from_labels "area:infra,verdict:pending,lane:small")" = "" ] \
+  && ok "control: still-pending labels (neither PASS nor FAIL) resolve empty" || bad "REGRESSION: pending-only labels no longer resolve empty"
+[ "$(refino_gate_verdict_from_labels "")" = "" ] \
+  && ok "control: empty label set resolves empty" || bad "REGRESSION: empty label set no longer resolves empty"
+
+# The decision core gives INCONSISTENT its OWN token — never promote, and
+# never bounce/escalate as if it were an ordinary FAIL (AC2: sinaliza
+# inconsistência; AC "não avança").
+D=$(refino_gate_decision "INCONSISTENT" 1 3)
+[ "$D" = "inconsistent" ] && ok "refino_gate_decision(INCONSISTENT) → inconsistent (never promote/bounce/escalate)" \
+  || bad "REGRESSION (ga-huw02s): refino_gate_decision(INCONSISTENT) → '$D', expected 'inconsistent'"
+D=$(refino_gate_decision "INCONSISTENT" 3 3)   # even at the round ceiling
+[ "$D" = "inconsistent" ] && ok "INCONSISTENT at the round ceiling still → inconsistent, not escalate" \
+  || bad "REGRESSION: INCONSISTENT at ceiling → '$D', expected 'inconsistent'"
+
+# Drift guards: the live wiring must actually use the new function, and the
+# old silently-wrong inline check must not reappear.
+echo "Drift guards ga-huw02s: live wiring matches the fix"
+if grep -qE 'if echo "\$VB_LABELS" \| grep -q "verdict:PASS"' "$DISPATCHER"; then
+  bad "REGRESSION (ga-huw02s): the old inline 'PASS wins' check is back in the dispatcher"
+else
+  ok "the old inline PASS-first/elif-FAIL check is gone from the dispatcher"
+fi
+if grep -q 'refino_gate_verdict_from_labels "\$VB_LABELS"' "$DISPATCHER"; then
+  ok "verdict poll loop calls refino_gate_verdict_from_labels (tested logic IS shipped logic)"
+else
+  bad "REGRESSION (ga-huw02s): verdict poll loop does not call refino_gate_verdict_from_labels — drift risk"
+fi
+if grep -q '^  inconsistent)' "$DISPATCHER"; then
+  ok "dispatcher body has an explicit 'inconsistent)' case (not silently absorbed into requeue|*)"
+else
+  bad "REGRESSION (ga-huw02s): dispatcher body has no explicit inconsistent) case"
+fi
+if grep -q 'refino-gate:inconsistent-verdict' "$DISPATCHER"; then
+  ok "inconsistent path flags the story with refino-gate:inconsistent-verdict (visible signal, not silent)"
+else
+  bad "REGRESSION (ga-huw02s): inconsistent path does not flag the story — signal is missing"
+fi
+# The inconsistent path must NOT promote to needs-approval (same guarantee as
+# Scenario 5, checked here against the actual call site rather than just the
+# pure function, since a call site could theoretically call
+# _refino_gate_relabel with needs-approval even after getting the right token).
+INCONSISTENT_BLOCK=$(awk '/^  inconsistent\)/{f=1} f{print} /^  requeue\|\*\)/{if(f)exit}' "$DISPATCHER")
+case "$INCONSISTENT_BLOCK" in
+  *story:needs-approval*) bad "REGRESSION (ga-huw02s): the inconsistent) block promotes to story:needs-approval — must never silently promote" ;;
+  *) ok "the inconsistent) block never promotes to story:needs-approval" ;;
+esac
 
 # ── Scenario 7: refiner resolution precedence ─────────────────────────────────
 echo "Scenario 7: refino_resolve_refiner precedence (meta > assignee > created_by)"

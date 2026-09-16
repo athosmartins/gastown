@@ -170,16 +170,21 @@ DRY_RUN="${DRY_RUN:-0}"
 # shipped logic (no parallel reimplementation).
 
 # refino_gate_decision <verdict> <rounds_so_far> <max_rounds>
-#   verdict        : PASS | FAIL | TIMEOUT | <anything-else>
+#   verdict        : PASS | FAIL | INCONSISTENT | TIMEOUT | <anything-else>
 #   rounds_so_far  : how many review rounds this story has ALREADY had (>=0;
 #                    this current round is counted, i.e. after incrementing).
 #   max_rounds     : the bounce-back ceiling (REFINO_MAX_ROUNDS).
 #
 #   Emits exactly one of:
-#     promote   — PASS: promote to story:needs-approval (Athos's queue).
-#     bounce    — FAIL within the round budget: send back to the refiner.
-#     escalate  — FAIL but the round budget is spent: hand to Athos (no loop).
-#     requeue   — TIMEOUT / unknown: leave for a later sweep, do NOT promote.
+#     promote      — PASS: promote to story:needs-approval (Athos's queue).
+#     bounce       — FAIL within the round budget: send back to the refiner.
+#     escalate     — FAIL but the round budget is spent: hand to Athos (no loop).
+#     inconsistent — ga-huw02s: the verdict bead carries BOTH verdict:PASS and
+#                    verdict:FAIL (duplicate/racing reviewer dispatch, or two
+#                    reviewers disagreeing). Neither verdict is trustworthy in
+#                    silence — never promote, never bounce/escalate as if it
+#                    were an ordinary FAIL.
+#     requeue      — TIMEOUT / unknown: leave for a later sweep, do NOT promote.
 #
 #   GUARANTEE (AC "revisor NUNCA aprova no lugar do Athos"): this function can
 #   only ever emit `promote` (→ needs-approval) — NEVER story:approved. There is
@@ -197,8 +202,38 @@ refino_gate_decision() {
         echo "bounce"
       fi
       ;;
+    INCONSISTENT) echo "inconsistent" ;;
     *) echo "requeue" ;;   # TIMEOUT, empty, or any unexpected token
   esac
+}
+
+# refino_gate_verdict_from_labels <labels_csv> — echo PASS | FAIL | INCONSISTENT | "".
+#   labels_csv : comma-joined labels off the verdict bead (jq '... | join(",")').
+#
+#   ga-huw02s: two refino-gate reviewers were dispatched to the SAME verdict
+#   bead 4 minutes apart. The first found a real FAIL and closed it; the
+#   second, evaluating independently, reached PASS and applied the standard
+#   verdict-recording update BEFORE reading the existing comments — landing
+#   verdict:PASS right beside the already-present verdict:FAIL. The OLD call
+#   site checked PASS first (`if ... PASS ... elif ... FAIL`), so with both
+#   labels present PASS silently won and FAIL was never even evaluated: a
+#   REPROVED story could advance toward Athos's approval queue looking
+#   approved. PASS+FAIL together is neither verdict — it is a THIRD state
+#   (inconsistent: duplicate dispatch or disagreeing reviewers) and must stop
+#   here rather than have either verdict picked in silence.
+refino_gate_verdict_from_labels() {
+  local labels="$1" has_pass=0 has_fail=0
+  case ",$labels," in *,verdict:PASS,*) has_pass=1 ;; esac
+  case ",$labels," in *,verdict:FAIL,*) has_fail=1 ;; esac
+  if [ "$has_pass" = "1" ] && [ "$has_fail" = "1" ]; then
+    echo "INCONSISTENT"
+  elif [ "$has_fail" = "1" ]; then
+    echo "FAIL"
+  elif [ "$has_pass" = "1" ]; then
+    echo "PASS"
+  else
+    echo ""
+  fi
 }
 
 # refino_next_round <current_rounds> — echo current+1 (sanitized; non-numeric→1).
@@ -808,10 +843,15 @@ FAIL_NOTES=""
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   VB=$(bd_ show "$VERDICT_BEAD_ID" --json 2>/dev/null || echo "[]")
   VB_LABELS=$(echo "$VB" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")')
-  if echo "$VB_LABELS" | grep -q "verdict:PASS"; then
+  VB_VERDICT=$(refino_gate_verdict_from_labels "$VB_LABELS")
+  if [ "$VB_VERDICT" = "PASS" ]; then
     VERDICT="PASS"; break
-  elif echo "$VB_LABELS" | grep -q "verdict:FAIL"; then
-    VERDICT="FAIL"
+  elif [ "$VB_VERDICT" = "FAIL" ] || [ "$VB_VERDICT" = "INCONSISTENT" ]; then
+    # ga-huw02s: INCONSISTENT (both verdict:PASS and verdict:FAIL present)
+    # still pulls FAIL_NOTES — whatever real FAIL text exists is the most
+    # important thing to surface, and the "inconsistent" decision branch
+    # below never promotes it regardless.
+    VERDICT="$VB_VERDICT"
     FAIL_NOTES=$(bd_ show "$VERDICT_BEAD_ID" --json 2>/dev/null \
       | jq -r 'if type=="array" then .[0] else . end | (.comments // [])[]?.text' 2>/dev/null \
       | grep -A50 "VERDICT: FAIL" | tail -n +2 | head -40 || echo "")
@@ -933,6 +973,21 @@ Athos: decida manualmente (aprovar, ajustar, ou cancelar)." 2>/dev/null || true
     gc --city "$GC_CITY" mail send mayor -s "Refino-gate escalou $STORY_ID" \
       -m "$STORY_ID estourou $REFINO_MAX_ROUNDS rodadas de revisão de refino sem passar. Promovido para needs-approval + refino-gate:escalated para o Athos decidir." 2>/dev/null || true
     log "  $STORY_ID → ESCALATED to Athos (round budget $REFINO_MAX_ROUNDS spent)."
+    ;;
+  inconsistent)
+    # ga-huw02s: verdict bead carries BOTH verdict:PASS and verdict:FAIL — a
+    # duplicate/racing reviewer dispatch, not a trustworthy verdict. Never
+    # silently pick one: do NOT promote (a reprovada story must never reach
+    # Athos's queue looking approved) and do NOT burn a bounce-back round on
+    # what might not even be a real FAIL. Leave story:refino-review in place
+    # (like requeue): the old verdict bead is already closed, so the next
+    # sweep creates a fresh one and gets a clean, single re-review.
+    bd_ update "$STORY_ID" --set-metadata "story.refino_gate_rounds=$PRIOR_ROUNDS" -q 2>/dev/null || true
+    bd_ label add "$STORY_ID" "refino-gate:inconsistent-verdict" -q 2>/dev/null || true
+    bd_ comment "$STORY_ID" "Refino-gate: veredito INCONSISTENTE no verdict bead $VERDICT_BEAD_ID — carrega verdict:PASS E verdict:FAIL ao mesmo tempo (revisão duplicada ou reviewers discordando, ver ga-huw02s). NÃO promovido para needs-approval, round NÃO consumido — não decidido em silêncio. Última reprovação registrada nesse bead:
+${FAIL_NOTES:-(sem notas)}
+Uma nova rodada de revisão será disparada no próximo sweep (o verdict bead antigo já está fechado)." 2>/dev/null || true
+    log "  $STORY_ID → INCONSISTENT verdict (PASS+FAIL on $VERDICT_BEAD_ID, ga-huw02s) — not promoted, round not consumed, clean re-review next sweep."
     ;;
   requeue|*)
     # TIMEOUT / unknown → leave for a later sweep. Restore the gate-input state
