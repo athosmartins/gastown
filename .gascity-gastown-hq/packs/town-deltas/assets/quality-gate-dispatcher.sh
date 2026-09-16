@@ -6175,13 +6175,15 @@ PYEOF
             DAEMON_HOLD_REASON="rig $RIG deploy_cmd failed after ${DR_DEPLOY_ATTEMPT:-1}/$GATE_DEPLOY_RETRY_MAX attempts (rc=$DR_DEPLOY_RC): $DR_DEPLOY_CMD"
             DAEMON_HOLD_DETAIL="$DR_DEPLOY_OUTPUT"
           else
+            # SELFTEST-EXTRACT ga-agracx-dryrun-merge-attribution: BEGIN
             DR_POST_SHA=$(git -C "$DR_RUNTIME_DIR" rev-parse HEAD 2>/dev/null || echo "")
             DR_OUT=$(RUNTIME_DIR="$DR_RUNTIME_DIR" PRE_DEPLOY_SHA="$DR_PRE_SHA" POST_DEPLOY_SHA="$DR_POST_SHA" \
               DEPLOY_EPOCH="$DR_EPOCH" SENSITIVE_DAEMONS="$DR_SENSITIVE" \
               EXTRA_RUNTIME_ROOTS="$DR_EXTRA_ROOTS" FORCE_RESTART_LABELS="$DR_FORCE_RESTART" \
-              BEAD_MERGE_PRE_SHA="$MERGE_PRE_MAIN_SHA" BEAD_MERGE_SHA="$MERGE_SHA" \
+              BEAD_MERGE_PRE_SHA="${MERGE_PRE_MAIN_SHA:-}" BEAD_MERGE_SHA="$MERGE_SHA" \
               DRY_RUN="$DRY_RUN" \
               bash "$GC_CITY/packs/town-deltas/assets/daemon-refresh.sh" 2>&1 || true)
+            # SELFTEST-EXTRACT ga-agracx-dryrun-merge-attribution: END
             # ga-l7n3v: `|| true` on all three — under this script's set -euo
             # pipefail, an unmatched grep piped into head/sed still propagates a
             # non-zero pipeline status and would abort the ENTIRE dispatcher
