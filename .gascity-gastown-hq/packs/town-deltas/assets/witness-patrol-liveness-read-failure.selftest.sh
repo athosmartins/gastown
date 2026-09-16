@@ -176,6 +176,25 @@ if [ "$SCENARIO_MAILED" = "yes" ]; then
 else
   bad "no mayor escalation on a broken live-session-list read"
 fi
+# The block must actually HALT here, not just print a message and fall
+# through (the exact defect a prior gate review caught: a comment saying
+# "skip the rest" with no exit/return/continue behind it). Three
+# independent signals of a real halt, not a coincidental empty result:
+if [ "$SCENARIO_RC" -eq 0 ]; then
+  ok "exits cleanly (rc=0) instead of running off the end into jq errors"
+else
+  bad "REGRESSION: block did not exit cleanly (rc=$SCENARIO_RC): $SCENARIO_OUT"
+fi
+if ! printf '%s' "$SCENARIO_OUT" | grep -q "OVERLAY UNKNOWN"; then
+  ok "does not fall through into the overlay guard (which would misreport a successful read as failed)"
+else
+  bad "REGRESSION: fell through into OVERLAY UNKNOWN after the sessions-list guard already fired: $SCENARIO_OUT"
+fi
+if ! printf '%s' "$SCENARIO_OUT" | grep -q "RESULT MAP_COUNT="; then
+  ok "never reaches the code after the block (proves the halt, not a coincidental zero)"
+else
+  bad "REGRESSION: execution reached past the guard into LIVENESS_MAP/SESSION_COUNT: $SCENARIO_OUT"
+fi
 
 # ── Scenario 4: live session list returns partial/invalid JSON (rc=0) ─────
 # Covers acceptance criterion (c): rc alone isn't the only failure shape —
@@ -187,6 +206,21 @@ if printf '%s' "$SCENARIO_OUT" | grep -q "FAIL-SAFE: gc session list read failed
   ok "aborts recovery this cycle on invalid JSON even when rc=0"
 else
   bad "REGRESSION: invalid-JSON session-list output was not caught. Output: $SCENARIO_OUT"
+fi
+if [ "$SCENARIO_RC" -eq 0 ]; then
+  ok "exits cleanly (rc=0) instead of running off the end into jq errors"
+else
+  bad "REGRESSION: block did not exit cleanly (rc=$SCENARIO_RC): $SCENARIO_OUT"
+fi
+if ! printf '%s' "$SCENARIO_OUT" | grep -q "OVERLAY UNKNOWN"; then
+  ok "does not fall through into the overlay guard (which would misreport a successful read as failed)"
+else
+  bad "REGRESSION: fell through into OVERLAY UNKNOWN after the sessions-list guard already fired: $SCENARIO_OUT"
+fi
+if ! printf '%s' "$SCENARIO_OUT" | grep -q "RESULT MAP_COUNT="; then
+  ok "never reaches the code after the block (proves the halt, not a coincidental zero)"
+else
+  bad "REGRESSION: execution reached past the guard into LIVENESS_MAP/SESSION_COUNT: $SCENARIO_OUT"
 fi
 
 # ── Scenario 5: pre-existing fail-safe still works (schema drift) ─────────

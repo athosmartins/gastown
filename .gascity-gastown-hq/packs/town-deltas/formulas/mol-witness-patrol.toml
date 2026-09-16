@@ -254,7 +254,17 @@ a NEW session with a different ID — the old one never comes back.
      echo "FAIL-SAFE: gc session list read failed (rc=$SESSIONS_RC, $(wc -c <"$SESSIONS_FILE" | tr -d ' ') bytes) — skipping orphan recovery this cycle (treat all assignees as live)."
      gc mail send mayor/ -s "WITNESS: orphan-recovery disabled — session list read failed" -m "gc session list --state=all --json exited rc=$SESSIONS_RC with $(wc -c <"$SESSIONS_FILE" | tr -d ' ') bytes of stdout. stderr: $(cat "$SESSIONS_FILE.err"). Skipping orphan recovery this cycle to avoid false-orphaning live agents."
      rm -f "$SESSIONS_FILE" "$SESSIONS_FILE.err" "$SESSION_BEADS_FILE" "$SESSION_BEADS_FILE.err"
-     # Skip the rest of this step; proceed to check-refinery.
+     # Actually skip the rest of this step — a comment alone does not stop
+     # execution. Without this, the block fell through into the overlay
+     # guard below (which would then misreport the session-beads read as
+     # failed, because its file was just deleted here even when that read
+     # had actually succeeded) and into LIVENESS_MAP/SESSION_COUNT, which
+     # still reference the now-deleted $SESSIONS_FILE — producing jq
+     # errors and an empty SESSION_COUNT that defeats the fail-safe below
+     # (it only fires when SESSION_COUNT is greater than 0). `exit` here
+     # only ends this shell invocation, not the witness agent itself —
+     # proceed to check-refinery per the step above.
+     exit 0
    fi
 
    # The session-beads overlay (configured_named_identity) only ever ADDS
