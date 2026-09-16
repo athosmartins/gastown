@@ -48,11 +48,14 @@
 # O teto tambem esta no env do launchd do Pilot (PILOT_WA_WORKER_MAX=2) —
 # mudar aqui sem mudar la deixa os dois discordando.
 #
-# E o teto NAO e a largura da lane: MAX_SMALL do pilot-dispatcher.sh e 5
-# (linha 87, default). O comentario de 11/09 acima diz "the Pilot small lane
-# opens 3 slots" e isso esta errado hoje. Com lane 5 e pool 2, o Pilot roteia
-# mais bead do que o pool pode consumir — e quando isso acontece a bead
-# encalha (ver ga-q0ewpu: o top-up que deveria repor consulta o store errado).
+# E o teto NAO e a largura da lane. O default no script e MAX_SMALL=5
+# (pilot-dispatcher.sh:87), mas o env do launchd do Pilot SOBRESCREVE com
+# MAX_SMALL=3 e MAX_BIG=1 — e 3 e o valor que vale (o log confirma: "small=3/3
+# ... big=1/1"). Ou seja, o comentario de 11/09 acima ("the Pilot small lane
+# opens 3 slots") esta CERTO; quem le so a linha 87 do script conclui 5 e erra.
+# O descasamento real e lane small 3 contra pool 2: o Pilot pode rotear uma 3a
+# bead small que o pool de 2 nunca consome — e ai ela encalha (ga-q0ewpu: o
+# top-up que deveria repor consulta o store errado).
 # Aumentar o teto NAO corrige esse encalhe, so o torna menos frequente.
 #
 # MODEL: Sonnet. Build work is well within Sonnet's capabilities. Keeps wa-worker
