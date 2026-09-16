@@ -268,13 +268,18 @@ def _list_deferred_expired_slings(store, now):
     frozen and meant to resume. This helper only ever returns beads that already pass
     _is_sling (type==task, sling-shaped title) — structurally impossible for a molecule or
     step, so merging its output straight into store_beads is safe. Same fail-toward-KEEP
-    contract as everywhere else: a future or unparseable defer_until is never expired."""
+    contract as everywhere else: a future or unparseable defer_until is never expired.
+    Mirrors _list_open's None-on-failure contract (never collapse "query failed" into
+    the same [] a genuine zero-candidates result would produce) — the caller degrades by
+    simply not augmenting this sweep, never by mistaking failure for "nothing to find"."""
     if _deferred_slings_fn is not None:
         return _deferred_slings_fn(store, now)
     r = _sh(["bash", BD_LIST_CACHED, "-C", store, "list", "--json", "--status", "deferred", "-n", "0"],
             timeout=BD_TIMEOUT)
     if r is None or r.returncode != 0:
-        return []
+        _log("WARN: bd list --status deferred failed in %s (rc=%s)" %
+             (os.path.basename(store), r.returncode if r else "err"))
+        return None
     out = []
     for b in (_parse_bd_json(r.stdout) or []):
         if isinstance(b, dict) and _is_sling(b) and _defer_expired(b, now):
@@ -658,8 +663,13 @@ def run_cycle(now):
         # and _list_deferred_expired_slings for why _list_open's own status=open,in_progress
         # filter can never see these on its own. Structurally sling-only (both call sites
         # agree via _is_sling), so this can never leak a bead into the molecule/step paths
-        # below.
-        beads = beads + _list_deferred_expired_slings(store, now)
+        # below. A failed query here (None) degrades by simply not augmenting this
+        # sweep's candidates — the open/in_progress data from _list_open above is
+        # already complete and unaffected, unlike a _list_open failure which must
+        # skip the whole store.
+        deferred_slings = _list_deferred_expired_slings(store, now)
+        if deferred_slings is not None:
+            beads = beads + deferred_slings
         store_beads[store] = beads
         for b in beads:
             if isinstance(b, dict) and "story:in-flight" in set(b.get("labels") or []):
@@ -920,6 +930,15 @@ def _selftest():
     bad = [0]
     def _ok(m): ok[0] += 1; print("  ok  " + m)
     def _bad(m, d=""): bad[0] += 1; print("  BAD " + m + ((" :: " + d) if d else ""))
+
+    # ga-uq84hf: hermetic default for every scenario below that doesn't itself
+    # care about expired-deferred slings — without this, an un-seamed
+    # run_cycle() call would fall through to _list_deferred_expired_slings'
+    # REAL body (a live _sh subprocess against a fake "HQ"/"S"/... store path),
+    # making pre-existing, unrelated scenarios accidentally depend on real
+    # subprocess/exit-code behavior instead of being fully seam-controlled like
+    # every other input in this file.
+    _deferred_slings_fn = lambda store, now: []
 
     NOW = datetime.datetime(2026, 6, 29, 12, 0, 0, tzinfo=datetime.timezone.utc).timestamp()
     OLD = "2026-06-23T00:00:00Z"   # 6 days old → past MIN_AGE
@@ -1470,7 +1489,7 @@ print(json.dumps(found))
     else:
         _bad("BL: did not close the expired-deferred orphan", "closed=%s" % closed_idsBL)
     _target_status_fn = None
-    _deferred_slings_fn = None
+    _deferred_slings_fn = lambda store, now: []  # restore the hermetic default
 
     print("\n[sling-janitor selftest] %d passed, %d failed" % (ok[0], bad[0]))
     sys.exit(1 if bad[0] else 0)
