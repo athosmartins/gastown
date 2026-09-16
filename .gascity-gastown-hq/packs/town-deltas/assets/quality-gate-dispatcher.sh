@@ -3945,6 +3945,62 @@ rebase_wt_git_dir() {
   esac
 }
 
+# ga-stisew: a bare git-dir has no working tree, so a merge-tree driven by a
+# `.gitattributes` merge driver (merge=union, merge=binary, etc.) never sees
+# that driver — `-c core.attributesFile=<path>` is the only way to make it
+# apply outside a checkout. Confirmed live (digo-wa, wa-92jot.1,
+# 2026-09-15): the SAME merge-tree call against the SAME two SHAs returned a
+# genuine CONFLICT without the flag and rc=0 (byte-identical tree to the
+# crew's own clone) with it, on a file whose own `.gitattributes` declares
+# `merge=union` precisely so it never conflicts. A healthy branch was
+# misclassified unknown:merge-tree-conflict, burning all 3 rebase retries
+# and escalating to the Mayor on a branch that needed no manual action.
+#
+# rebase_git_attributes_file <gd> <sha> — echoes the path to a temp file
+# holding a FILTERED copy of <sha>:.gitattributes' content, or "" if nothing
+# survives the filter (rig with no .gitattributes, or none of its lines
+# name a safe driver: caller omits the flag and today's plain merge-tree
+# call is unchanged). Reads via `git show <sha>:.gitattributes` against the
+# shared git-dir — i.e. from the COMMIT under verification, never from
+# whatever happens to be checked out on disk right now. Reading from disk
+# would reintroduce exactly the worktree-state dependency ga-slrz7 (above)
+# already had to remove once: this git-dir can be shared by other worktrees
+# at a different, or no, checkout. Caller owns cleanup of the returned temp
+# file (`rm -f`).
+#
+# FILTER, and why it is not optional: only lines naming one of git's 3
+# BUILT-IN merge drivers (union/text/binary) survive. Those need no
+# external command, so there is nothing to misconfigure or execute. A
+# CUSTOM driver name (`merge=<other>`) needs its command registered
+# separately (`merge.<name>.driver` in git config) — measured LIVE against
+# whatsapp_automation's own real .gitattributes (which is exactly the file
+# this fix must read) that this is NOT a hypothetical: alongside
+# `docs/data_dictionary.md merge=union` it also declares `daemons/
+# deploy_deps.json merge=deploydeps`, whose own comment says the driver
+# command is "registered per-clone in local git config" — i.e. not
+# guaranteed to exist for the gate's shared bare git-dir. Applying the file
+# unfiltered on the real incident's own SHAs (ga-slrz7's wa-zpgjl / marker
+# ga-hivi2 reproduction) made git try to exec that driver's script, which
+# failed on a relative path with no working tree to resolve it against, and
+# the resulting error turned a genuine "no" (content WAS lost — the actual
+# incident ga-slrz7 exists to catch) into "unknown:merge-tree-conflict" — a
+# false negative in the one direction this guard must never produce, caused
+# by a completely unrelated driver declared in the same file. Filtering by
+# line keeps this fix scoped to the built-in drivers it was measured safe
+# for, and is the reason Teste 6 in gate-rebase-content-verdict.selftest.sh
+# (the ga-slrz7 live-incident reproduction) must keep passing unchanged.
+rebase_git_attributes_file() {
+  local gd="$1" sha="$2" blob filtered tmp
+  if [ -z "$gd" ] || [ -z "$sha" ]; then printf ''; return 0; fi
+  blob=$(git --git-dir="$gd" show "${sha}:.gitattributes" 2>/dev/null)
+  if [ -z "$blob" ]; then printf ''; return 0; fi
+  filtered=$(printf '%s\n' "$blob" | grep -E '(^|[[:space:]])merge=(union|text|binary)([[:space:]]|$)' || true)
+  if [ -z "$filtered" ]; then printf ''; return 0; fi
+  tmp=$(mktemp "${TMPDIR:-/tmp}/gc-gate-attrs.XXXXXX" 2>/dev/null) || { printf ''; return 0; }
+  printf '%s\n' "$filtered" > "$tmp"
+  printf '%s' "$tmp"
+}
+
 # rebase_content_verdict <worktree> <main_ref> <orig_tip> <new_tip>
 #   yes           — a arvore do rebase bate com a do merge 3-way: nada se perdeu
 #   no            — DIFEREM: o rebase perdeu ou alterou conteudo; NAO empurrar
@@ -4010,8 +4066,17 @@ rebase_content_verdict() {
   # is not trustworthy here.
   local gd; gd=$(rebase_wt_git_dir "$wt")
   if [ -z "$gd" ]; then echo "unknown:no-gitdir"; return 0; fi
-  local out rc expected actual
-  out=$(git --git-dir="$gd" merge-tree --write-tree "$main_ref" "$orig_tip" 2>/dev/null); rc=$?
+  local out rc expected actual attrs_file
+  # ga-stisew: apply new_tip's own .gitattributes (if any) so a merge driver
+  # like merge=union is honored even though this call has no working tree —
+  # see rebase_git_attributes_file() above.
+  attrs_file=$(rebase_git_attributes_file "$gd" "$new_tip")
+  if [ -n "$attrs_file" ]; then
+    out=$(git --git-dir="$gd" -c core.attributesFile="$attrs_file" merge-tree --write-tree "$main_ref" "$orig_tip" 2>/dev/null); rc=$?
+    rm -f "$attrs_file" 2>/dev/null || true
+  else
+    out=$(git --git-dir="$gd" merge-tree --write-tree "$main_ref" "$orig_tip" 2>/dev/null); rc=$?
+  fi
   # ga-19rqcf: rc!=0 ALONE does not mean a real content conflict — measured
   # live that a merge-tree call failing for an entirely different reason
   # (e.g. a ref/SHA the shared git-dir cannot currently resolve) ALSO exits
@@ -4081,7 +4146,19 @@ rebase_content_lost_paths() {
   local out rc expected actual
   local _rclp_err_file
   _rclp_err_file=$(mktemp "${TMPDIR:-/tmp}/gc-gate-rclp-mergetree-err.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-rclp-mergetree-err.$$")
-  out=$(git --git-dir="$gd" merge-tree --write-tree "$main_ref" "$orig_tip" 2>"$_rclp_err_file"); rc=$?
+  # ga-stisew: same attribute-file fix as rebase_content_verdict() above —
+  # this is a SEPARATE merge-tree invocation and must be fixed independently,
+  # or the diverging-paths report stays blind to the same bug (measured:
+  # digo-wa's own repro showed "Diverging paths: <could not compute:
+  # merge-tree-conflict>" survive even after only the first call site was
+  # considered).
+  local _rclp_attrs_file; _rclp_attrs_file=$(rebase_git_attributes_file "$gd" "$new_tip")
+  if [ -n "$_rclp_attrs_file" ]; then
+    out=$(git --git-dir="$gd" -c core.attributesFile="$_rclp_attrs_file" merge-tree --write-tree "$main_ref" "$orig_tip" 2>"$_rclp_err_file"); rc=$?
+    rm -f "$_rclp_attrs_file" 2>/dev/null || true
+  else
+    out=$(git --git-dir="$gd" merge-tree --write-tree "$main_ref" "$orig_tip" 2>"$_rclp_err_file"); rc=$?
+  fi
   if [ "$rc" -ne 0 ]; then
     if [ -n "$out" ]; then
       rm -f "$_rclp_err_file" 2>/dev/null || true

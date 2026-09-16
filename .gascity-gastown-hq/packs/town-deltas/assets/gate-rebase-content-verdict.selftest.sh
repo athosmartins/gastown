@@ -41,6 +41,22 @@
 # contra os SHAs reais do incidente, via um worktree de reproducao de
 # verdade (nao um repo sintetico) — precisa continuar reprovando se alguem
 # reverter rebase_wt_git_dir() para usar `-C "$wt"` direto.
+#
+# 3º INCIDENTE (ga-stisew / wa-92jot.1, medido pela digo-wa, 2026-09-15): o
+# MESMO merge-tree, ja rodando contra o git-dir compartilhado (o fix da
+# ga-slrz7 acima), ainda dava veredito ERRADO quando o arquivo envolvido tem
+# merge driver custom no .gitattributes (ex.: `merge=union`) — um git-dir
+# bare nao tem working tree, entao o driver nunca era aplicado, e uma branch
+# perfeitamente sadia virava unknown:merge-tree-conflict, queimando as 3
+# tentativas de rebase e escalando ao Mayor (medido: claim->escalado em 11min,
+# so resolvido por rebase manual, ~40min de parede numa branch que nao
+# precisava de nenhuma acao humana). Fix: aplicar `-c
+# core.attributesFile=<materializado de <new_tip>:.gitattributes>` nas DUAS
+# chamadas de merge-tree (rebase_content_verdict E rebase_content_lost_paths
+# — sao call sites separados). O Teste 7 abaixo prova contra um fixture com
+# merge=union, usando um `git merge` de verdade numa working tree de verdade
+# como ground truth (nunca a mesma chamada merge-tree que esta sob teste) —
+# vermelho antes do fix, verde depois.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -228,6 +244,114 @@ if [ -d "$WA_REPO_GITDIR" ] \
   fi
 else
   echo "  skip — repo/commits do incidente real (wa-zpgjl) nao disponiveis neste ambiente (nao conta como FAIL)"
+fi
+
+# Teste 7 (ga-stisew) — merge=union num .gitattributes tracado: duas branches
+# EDITAM A MESMA LINHA de forma diferente — conflito de verdade sob merge
+# padrao (Teste 7a abaixo prova a premissa) — mas o proprio .gitattributes
+# do repo diz `merge=union`, ou seja, e uma branch SADIA. Ground-truth vem
+# de um `git rebase` de VERDADE (a mesma operacao que o gate verifica),
+# numa working tree onde o driver sempre valeu sem `-c core.attributesFile`
+# nenhum — nunca a mesma chamada merge-tree que este teste verifica, senao
+# o teste provaria a si mesmo. O "wt" passado pra rebase_content_verdict e
+# um CLONE BARE de verdade (sem working tree nenhuma) — um repo nao-bare
+# (como o `mkrepo()` dos Testes 1-6 usa) SEMPRE tem .gitattributes no disco
+# do proprio checkout e mascara exatamente o bug que este teste existe pra
+# pegar (medido: a 1a versao deste teste usava `-C` num repo nao-bare e
+# passava mesmo ANTES do fix, porque git lia o .gitattributes do disco, nao
+# da flag).
+RU="$TMP/repo-union"; mkdir -p "$RU"; git -C "$RU" init -q
+git -C "$RU" config user.email t@t; git -C "$RU" config user.name T
+printf 'union.txt merge=union\n' > "$RU/.gitattributes"
+printf 'l1\nSHARED\nl3\n' > "$RU/union.txt"
+git -C "$RU" add -A; git -C "$RU" commit -qm base
+git -C "$RU" branch -M umain
+git -C "$RU" checkout -q -b ufeat
+printf 'l1\nSHARED-feat\nl3\n' > "$RU/union.txt"
+git -C "$RU" add -A; git -C "$RU" commit -qm "ufeat: edita SHARED"
+git -C "$RU" checkout -q umain
+printf 'l1\nSHARED-main\nl3\n' > "$RU/union.txt"
+git -C "$RU" add -A; git -C "$RU" commit -qm "umain: edita SHARED"
+UMAIN=$(git -C "$RU" rev-parse umain); UFEAT=$(git -C "$RU" rev-parse ufeat)
+
+# Teste 7a — PREMISSA: a mesma edicao, num repo GEMEO sem merge=union
+# nenhum, tem de conflitar de verdade (rc!=0). Sem isto, os testes abaixo
+# poderiam passar por acidente porque o cenario nunca conflitava mesmo.
+RP="$TMP/repo-union-plain"; mkdir -p "$RP"; git -C "$RP" init -q
+git -C "$RP" config user.email t@t; git -C "$RP" config user.name T
+printf 'l1\nSHARED\nl3\n' > "$RP/union.txt"
+git -C "$RP" add -A; git -C "$RP" commit -qm base
+git -C "$RP" branch -M pmain
+git -C "$RP" checkout -q -b pfeat
+printf 'l1\nSHARED-feat\nl3\n' > "$RP/union.txt"
+git -C "$RP" add -A; git -C "$RP" commit -qm pfeat
+git -C "$RP" checkout -q pmain
+printf 'l1\nSHARED-main\nl3\n' > "$RP/union.txt"
+git -C "$RP" add -A; git -C "$RP" commit -qm pmain
+PMAIN=$(git -C "$RP" rev-parse pmain); PFEAT=$(git -C "$RP" rev-parse pfeat)
+git -C "$RP" merge-tree --write-tree "$PMAIN" "$PFEAT" >/dev/null 2>&1
+PRC=$?
+[ "$PRC" -ne 0 ] && ok "premissa: a mesma edicao SEM merge=union conflita de verdade (rc=$PRC)" \
+                 || bad "premissa quebrada: o fixture deveria conflitar sem merge=union, deu rc=0"
+
+# ground-truth: rebase de verdade, numa working tree de verdade.
+git -C "$RU" checkout -q ufeat
+if git -C "$RU" rebase umain -q >/dev/null 2>&1; then
+  UNEWTIP=$(git -C "$RU" rev-parse HEAD)
+  RU_BARE="$TMP/repo-union.bare.git"
+  git clone --bare -q "$RU" "$RU_BARE"
+
+  V7=$( . "$TMP/block.sh"; rebase_content_verdict "$RU_BARE" "$UMAIN" "$UFEAT" "$UNEWTIP" )
+  [ "$V7" = "yes" ] && ok "merge=union: bare merge-tree agora concorda com o rebase real => yes (antes: unknown:merge-tree-conflict)" \
+                    || bad "branch sadia sob merge=union deveria dar yes, deu '$V7'"
+
+  LOST7=$( . "$TMP/block.sh"; rebase_content_lost_paths "$RU_BARE" "$UMAIN" "$UFEAT" "$UNEWTIP" )
+  [ -z "$LOST7" ] && ok "rebase_content_lost_paths tambem reconhece (2o call site, sem paths divergentes)" \
+                   || bad "rebase_content_lost_paths deveria vir vazio (sem divergencia), deu: '$LOST7'"
+
+  # Teste 7c — prova que a leitura vem do COMMIT (git show), nao do disco de
+  # um worktree LIGADO ao mesmo bare (requisito 2 da bead): o worktree tem o
+  # proprio .gitattributes ADULTERADO (sem merge=union nenhum) no disco: se
+  # o veredito mudasse, a implementacao estaria lendo o arquivo do worktree,
+  # nao o blob do SHA sendo verificado — a mesma classe de dependencia que a
+  # ga-slrz7 (acima) ja teve de remover uma vez.
+  RU_WT="$TMP/repo-union-linkedwt"
+  git --git-dir="$RU_BARE" worktree add --detach -q "$RU_WT" "$UMAIN"
+  printf 'nada aqui — sem merge=union\n' > "$RU_WT/.gitattributes"
+  V7c=$( . "$TMP/block.sh"; rebase_content_verdict "$RU_WT" "$UMAIN" "$UFEAT" "$UNEWTIP" )
+  git --git-dir="$RU_BARE" worktree remove --force "$RU_WT" >/dev/null 2>&1 || true
+  [ "$V7c" = "yes" ] && ok "veredito le do commit (git show), nao do .gitattributes adulterado no disco do worktree" \
+                     || bad "adulterar o .gitattributes do worktree NAO deveria mudar o veredito, deu '$V7c' (leitura por disco, nao por commit)"
+else
+  echo "  skip — rebase de verdade (ground truth com merge=union) falhou neste ambiente, nao conta como FAIL"
+fi
+
+# Teste 7d (ga-stisew) — o FILTRO de driver: uma linha com driver CUSTOM
+# (nao-embutido) tem de ser DESCARTADA do arquivo materializado, mesmo
+# convivendo com uma linha valida (merge=union) no MESMO .gitattributes —
+# e o que salva o Teste 6 acima (incidente real: docs/data_dictionary.md
+# merge=union convive com daemons/deploy_deps.json merge=deploydeps) de
+# tentar executar um driver customizado nao configurado neste git-dir.
+RF="$TMP/repo-filter"; mkdir -p "$RF"; git -C "$RF" init -q
+git -C "$RF" config user.email t@t; git -C "$RF" config user.name T
+printf 'union.txt merge=union\ncustom.txt merge=bogus-unregistered-driver\n' > "$RF/.gitattributes"
+printf 'c1\n' > "$RF/custom.txt"
+git -C "$RF" add -A; git -C "$RF" commit -qm base
+FSHA=$(git -C "$RF" rev-parse HEAD)
+FBARE="$TMP/repo-filter.bare.git"; git clone --bare -q "$RF" "$FBARE"
+ATTRS_OUT=$( . "$TMP/block.sh"; rebase_git_attributes_file "$FBARE" "$FSHA" )
+if [ -n "$ATTRS_OUT" ] && [ -f "$ATTRS_OUT" ]; then
+  ATTRS_CONTENT=$(cat "$ATTRS_OUT"); rm -f "$ATTRS_OUT"
+  case "$ATTRS_CONTENT" in
+    *"bogus-unregistered-driver"*)
+      bad "filtro deveria descartar o driver customizado, mas ele sobreviveu: '$ATTRS_CONTENT'" ;;
+    *"union.txt merge=union"*)
+      ok "filtro mantem merge=union e descarta o driver customizado nao-embutido" ;;
+    *)
+      bad "filtro deveria manter a linha merge=union, arquivo materializado: '$ATTRS_CONTENT'" ;;
+  esac
+else
+  bad "rebase_git_attributes_file nao materializou arquivo nenhum (esperava um so com a linha union)"
 fi
 
 echo
