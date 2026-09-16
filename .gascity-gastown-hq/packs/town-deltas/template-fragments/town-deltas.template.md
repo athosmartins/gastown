@@ -732,4 +732,97 @@ o pool inteiro lê. A correção é no HÁBITO de quem cria bead pro próprio
 trabalho já em andamento, não na ferramenta. A razão precisa vir junto: bead
 sem dono = disponível pra despacho. Sem ela, esta regra vira decorativa e
 ninguém aplica.
+
+**WITNESS: o Startup Protocol Step 1/3 e o bloco "CRITICAL: No Idle State" do
+prompt nativo estão QUEBRADOS — substitua pelos comandos abaixo (ga-3v2n4).**
+Vale só pro papel witness; se não é o seu papel, pule esta seção.
+
+⚠️ **Por quê:** três defeitos medidos ao vivo, corroborados em 3 rigs
+(property_scrapers, lexbh, whatsapp_automation) entre 08/09 e 16/09 —
+(1) `gc bd list --assignee=... --status=in_progress` (Step 1) e o bloco de
+fallback nunca passam `--include-infra`: wisp/molecule são ephemeral e ficam
+invisíveis sem essa flag, então a checagem sempre volta vazia mesmo com um
+wisp vivo no hook; (2) o fallback usa `--type=wisp`, que é enum INVÁLIDO
+(`gc bd list --type=wisp` dá erro — o tipo certo é `molecule`), então a
+captura do id sempre resolve vazia; (3) `gc bd` resolve o banco de dados pelo
+cwd do processo chamador, e o agent-home do witness em rigs sem `.git` próprio
+no path do agente (lexbh, whatsapp_automation, deacon) resolve pro banco da
+HQ — o wisp poured cai em `ga-wisp-*` em vez de `<rig>-wisp-*`, e o PRÓPRIO
+`gc hook` do witness (que resolve por identidade de agente, não por cwd)
+nunca o vê ali. As três somadas: o witness nunca enxerga seu próprio wisp
+vivo, despeja um segundo, e o segundo pode vazar pro banco errado — um stray
+na HQ ficou 7 dias parado sem ninguém queimar (`ga-wisp-2ld24xp`).
+
+**Como aplicar** — troque o Step 1, o Step 3 e o bloco "CRITICAL: No Idle
+State" do prompt nativo pelos comandos abaixo. Deixe os Steps 2 e 4 do
+Startup Protocol nativo (mail, execução) como estão.
+
+**Step 1 substituto** — usa `gc hook`, que resolve por identidade de agente
+(`GC_AGENT`), não por cwd, e já foi comprovado achando o wisp certo nos 3
+rigs acima quando o `bd list` nativo falhava:
+```bash
+# Step 1: gc hook acha seu wisp por identidade, mesmo se o agent-home
+# cair no store errado (o que o bd list abaixo NÃO consegue).
+if gc hook >/tmp/witness-hook.json 2>&1; then
+  cat /tmp/witness-hook.json   # há trabalho — siga a partir daqui
+else
+  : # nada no hook — segue para Step 2 (mail) e Step 3 (bootstrap)
+fi
+```
+
+**Step 3 substituto** (bootstrap — só roda se Step 1 e Step 2 não acharam
+nada): pina o banco certo com `-C` e passa `rig_root` pra formula poder
+repetir o mesmo pin nos ciclos seguintes:
+```bash
+NEW_WISP=$(gc bd -C '{{ .RigRoot }}' mol wisp mol-witness-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}' --var rig_root='{{ .RigRoot }}' --json | jq -r '.new_epic_id // empty')
+if [ -z "$NEW_WISP" ] || ! gc bd -C '{{ .RigRoot }}' show "$NEW_WISP" --json >/dev/null 2>&1; then
+  echo "Bootstrap pour failed or landed outside {{ .RigRoot }} (NEW_WISP='$NEW_WISP')." >&2
+  exit 1
+fi
+gc bd -C '{{ .RigRoot }}' update "$NEW_WISP" --assignee="$GC_ALIAS"
+```
+
+**Bloco "CRITICAL: No Idle State" substituto** (corrige as 3 causas de uma
+vez: `--type=molecule --include-infra` em vez do `--type=wisp` inválido, e
+`-C` pinando o banco certo — com fallback gracioso pro cwd antigo só no caso
+extremo de um rig sem `RigRoot`, para não travar onde não há repo dedicado):
+```bash
+BD_C=(); [ -n '{{ .RigRoot }}' ] && BD_C=(-C '{{ .RigRoot }}')
+CURRENT_WISP=${GC_BEAD_ID:-}
+if [ -z "$CURRENT_WISP" ]; then
+  CURRENT_WISP=$(gc bd "${BD_C[@]}" list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+fi
+ASSIGNED_WISP=$(gc bd "${BD_C[@]}" list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
+pour_next() {
+  NEXT=$(gc bd "${BD_C[@]}" mol wisp mol-witness-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}' --var rig_root='{{ .RigRoot }}' --json | jq -r '.new_epic_id // empty')
+  if [ -z "$NEXT" ] || ! gc bd "${BD_C[@]}" show "$NEXT" --json >/dev/null 2>&1; then
+    echo "Could not pour/verify next witness wisp; not burning." >&2
+    return 1
+  fi
+  if ! gc bd "${BD_C[@]}" update "$NEXT" --assignee="$GC_AGENT"; then
+    echo "Could not assign next witness wisp; not burning." >&2
+    return 1
+  fi
+  printf '%s' "$NEXT"
+}
+if [ -n "$CURRENT_WISP" ] && [ -z "$ASSIGNED_WISP" ]; then
+  pour_next >/dev/null || exit 1
+  gc bd "${BD_C[@]}" mol burn "$CURRENT_WISP" --force
+elif [ -n "$CURRENT_WISP" ]; then
+  gc bd "${BD_C[@]}" mol burn "$CURRENT_WISP" --force
+elif [ -z "$ASSIGNED_WISP" ]; then
+  pour_next >/dev/null || exit 1
+fi
+gc hook
+```
+
+A metade da formula (step `next-iteration`, mesma técnica — `-C
+'{{rig_root}}'` + verificação pós-pour antes de assign/burn) já está
+corrigida em paralelo no override
+`packs/town-deltas/formulas/mol-witness-patrol.toml`. Qualquer pour manual
+fora da formula (ex.: o Step 3 acima) precisa sempre passar `--var
+rig_root='{{ .RigRoot }}'` junto com `--var binding_prefix=...` — sem isso o
+próprio step `next-iteration` trata `rig_root` vazio como erro (mail pro
+mayor + aborta), não como fallback silencioso, exatamente para não repetir
+o vazamento em silêncio.
 {{ end }}
