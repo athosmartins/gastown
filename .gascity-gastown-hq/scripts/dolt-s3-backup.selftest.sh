@@ -253,6 +253,172 @@ else
   bad "give-up path's notify/exit-0 wiring looks different than expected"
 fi
 
+# ── is_disk_margin_refusal() (ga-8f1uh0) ──────────────────────────────────────
+echo ""
+echo "── is_disk_margin_refusal() (ga-8f1uh0) ──"
+
+type is_disk_margin_refusal >/dev/null 2>&1 \
+  && ok "is_disk_margin_refusal defined by lib-mode source" \
+  || { bad "is_disk_margin_refusal NOT defined — lib mode broken"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="; exit 1; }
+
+# ── real captured refusal text (dolt-backup-reseed.sh's own die() message) → MUST match ──
+REAL_DISK_ERR="ABORTADO: disco insuficiente. NÃO iniciando: um sync que enche o disco no meio é exatamente como se corrompe o Dolt (precedente: ga-vs55, 14/07)."
+is_disk_margin_refusal "$REAL_DISK_ERR" && ok "real captured disk-margin refusal → detected" || bad "real captured disk-margin refusal NOT detected"
+
+# ── other reseed failure reasons → must NOT match (these are real data-integrity
+# signals and must still reach notify_fail, never get swallowed as "benign") ──
+is_disk_margin_refusal "o backup novo NÃO RESTAURA. Nada foi trocado; o antigo segue intacto." \
+  && bad "restore-failure message should NOT match disk-margin detector" \
+  || ok "restore-failure message → not detected (stays a real notify_fail)"
+is_disk_margin_refusal "o backup novo tem MENOS dado que a origem (100 < 200). Nada foi trocado." \
+  && bad "count-mismatch message should NOT match disk-margin detector" \
+  || ok "count-mismatch message → not detected (stays a real notify_fail)"
+is_disk_margin_refusal "" && bad "empty string should NOT match" || ok "empty string → not detected"
+
+# ── substring anywhere in a multi-line blob still matches (captured output is multi-line) ──
+MULTI_DISK="line one
+espaço: preciso ~11701MB, livre 5455MB
+ABORTADO: disco insuficiente. NÃO iniciando: ...
+line three"
+is_disk_margin_refusal "$MULTI_DISK" && ok "substring mid-multiline blob → detected" || bad "multiline blob NOT detected"
+
+# ── is_stale_residue_refusal() (ga-8f1uh0) ────────────────────────────────────
+echo ""
+echo "── is_stale_residue_refusal() (ga-8f1uh0) ──"
+
+type is_stale_residue_refusal >/dev/null 2>&1 \
+  && ok "is_stale_residue_refusal defined by lib-mode source" \
+  || { bad "is_stale_residue_refusal NOT defined — lib mode broken"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="; exit 1; }
+
+REAL_RESIDUE_ERR="ABORTADO: /Users/athos/gt/.gascity-gastown-hq/.dolt-backup/gastown.old já existe — resíduo de uma execução anterior. Investigue antes."
+is_stale_residue_refusal "$REAL_RESIDUE_ERR" && ok "real captured residue refusal → detected" || bad "real captured residue refusal NOT detected"
+is_stale_residue_refusal "$REAL_DISK_ERR" && bad "disk-margin message should NOT match residue detector" || ok "disk-margin message → not detected by residue detector"
+is_disk_margin_refusal "$REAL_RESIDUE_ERR" && bad "residue message should NOT match disk-margin detector" || ok "residue message → not detected by disk-margin detector"
+is_stale_residue_refusal "" && bad "empty string should NOT match" || ok "empty string → not detected"
+
+# ── drift-guard: live script must actually define the constant + wire the helper ──
+echo "── drift-guard: reseed-after-upload wiring present in live script (ga-8f1uh0) ──"
+if grep -qF 'RESEED_AFTER_UPLOAD="${RESEED_AFTER_UPLOAD:-1}"' "$SCRIPT"; then
+  ok "RESEED_AFTER_UPLOAD defaults to enabled (1) — the P1 fix is on by default, not just available"
+else
+  bad "RESEED_AFTER_UPLOAD default changed or missing — was the P1 fix silently disabled?"
+fi
+if grep -qF '_reseed_staging_if_enabled "$db"' "$SCRIPT"; then
+  ok "per-db loop calls _reseed_staging_if_enabled — wiring is live, not dead code"
+else
+  bad "_reseed_staging_if_enabled is defined but never called in the per-db loop"
+fi
+RESEED_CALL_LINE=$(grep -nF '_reseed_staging_if_enabled "$db"' "$SCRIPT" | head -1 | cut -d: -f1)
+OK_INCR_LINE=$(grep -nF 'ok=$((ok+1))' "$SCRIPT" | head -1 | cut -d: -f1)
+if [ -n "$RESEED_CALL_LINE" ] && [ -n "$OK_INCR_LINE" ] && [ "$RESEED_CALL_LINE" -gt "$OK_INCR_LINE" ]; then
+  ok "reseed call happens AFTER ok=\$((ok+1)) — its own outcome never corrupts the core backup's ok/failed counters"
+else
+  bad "reseed call is not positioned after the ok counter increment"
+fi
+if grep -qF 'RESEED_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dolt-backup-reseed.sh"' "$SCRIPT"; then
+  ok "RESEED_SCRIPT resolves relative to this script's own directory (not a hardcoded absolute path)"
+else
+  bad "RESEED_SCRIPT wiring missing or changed shape"
+fi
+
+# ── _reseed_staging_if_enabled() (ga-8f1uh0) — exercised live with a stub reseed
+# script and a stub notify binary (not just a drift-guard grep): proves the
+# disk-margin/other-failure split actually gates notify_fail, and that the
+# opt-out flag works. Real dolt-backup-reseed.sh and real notify are NEVER called.
+echo "── _reseed_staging_if_enabled() (ga-8f1uh0) — simulated stub test ──"
+
+type _reseed_staging_if_enabled >/dev/null 2>&1 \
+  && ok "_reseed_staging_if_enabled defined by lib-mode source" \
+  || { bad "_reseed_staging_if_enabled NOT defined — lib mode broken"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="; exit 1; }
+
+RESEED_STUB_DIR="$(mktemp -d)"
+NOTIFY_STUB_CALLS="$(mktemp)"
+RESEED_TEST_LOG="$(mktemp)"
+cat > "$RESEED_STUB_DIR/reseed.sh" <<'STUB'
+#!/bin/bash
+case "${RESEED_STUB_MODE:-ok}" in
+  ok) echo "=== re-seed de '$1' concluído com sucesso ==="; exit 0 ;;
+  disk) echo "ABORTADO: disco insuficiente. NÃO iniciando: ..."; exit 1 ;;
+  residue) echo "ABORTADO: .dolt-backup/$1.old já existe — resíduo de uma execução anterior. Investigue antes."; exit 1 ;;
+  other) echo "ABORTADO: o backup novo NÃO RESTAURA. Nada foi trocado."; exit 1 ;;
+esac
+STUB
+chmod +x "$RESEED_STUB_DIR/reseed.sh"
+cat > "$RESEED_STUB_DIR/notify" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$*" >> "$NOTIFY_STUB_CALLS"
+exit 0
+STUB
+chmod +x "$RESEED_STUB_DIR/notify"
+export NOTIFY_STUB_CALLS
+
+# Scenario A: reseed succeeds → logged OK, notify NOT called.
+: > "$NOTIFY_STUB_CALLS"; : > "$RESEED_TEST_LOG"
+RESEED_SCRIPT="$RESEED_STUB_DIR/reseed.sh" RESEED_TIMEOUT_SECS=5 RESEED_AFTER_UPLOAD=1 \
+  RESEED_STUB_MODE=ok LOG="$RESEED_TEST_LOG" NOTIFY="$RESEED_STUB_DIR/notify" \
+  _reseed_staging_if_enabled "testdb"
+RC=$?
+[ "$RC" -eq 0 ] && ok "scenario A (reseed OK): returns success" || bad "scenario A (reseed OK): expected success, got rc=$RC"
+grep -qF "staging reseed OK" "$RESEED_TEST_LOG" && ok "scenario A: logged the OK line" || bad "scenario A: missing OK log line"
+[ -s "$NOTIFY_STUB_CALLS" ] && bad "scenario A: notify should NOT fire on success" || ok "scenario A: notify correctly not called"
+
+# Scenario B: reseed refuses for disk margin → logged skip, notify NOT called
+# (expected/benign — would be daily noise until space recovers on its own).
+: > "$NOTIFY_STUB_CALLS"; : > "$RESEED_TEST_LOG"
+RESEED_SCRIPT="$RESEED_STUB_DIR/reseed.sh" RESEED_TIMEOUT_SECS=5 RESEED_AFTER_UPLOAD=1 \
+  RESEED_STUB_MODE=disk LOG="$RESEED_TEST_LOG" NOTIFY="$RESEED_STUB_DIR/notify" \
+  _reseed_staging_if_enabled "testdb"
+RC=$?
+[ "$RC" -eq 0 ] && ok "scenario B (disk-margin refusal): returns success (soft-skip, not a failure)" || bad "scenario B (disk-margin refusal): expected soft-skip rc=0, got rc=$RC"
+grep -qF "skipped — insufficient disk margin" "$RESEED_TEST_LOG" && ok "scenario B: logged the skip line" || bad "scenario B: missing skip log line"
+[ -s "$NOTIFY_STUB_CALLS" ] && bad "scenario B: notify should NOT fire on an expected disk-margin refusal" || ok "scenario B: notify correctly not called"
+
+# Scenario C: reseed fails for a NON-disk reason → logged FAILED, notify_fail DOES fire.
+: > "$NOTIFY_STUB_CALLS"; : > "$RESEED_TEST_LOG"
+RESEED_SCRIPT="$RESEED_STUB_DIR/reseed.sh" RESEED_TIMEOUT_SECS=5 RESEED_AFTER_UPLOAD=1 \
+  RESEED_STUB_MODE=other LOG="$RESEED_TEST_LOG" NOTIFY="$RESEED_STUB_DIR/notify" \
+  _reseed_staging_if_enabled "testdb"
+RC=$?
+[ "$RC" -eq 1 ] && ok "scenario C (non-disk failure): returns failure" || bad "scenario C (non-disk failure): expected rc=1, got rc=$RC"
+grep -qF "staging reseed FAILED" "$RESEED_TEST_LOG" && ok "scenario C: logged the FAILED line" || bad "scenario C: missing FAILED log line"
+[ -s "$NOTIFY_STUB_CALLS" ] && ok "scenario C: notify_fail correctly fired for a real (non-disk) failure" || bad "scenario C: notify_fail should have fired — a data-integrity signal must never go silent"
+
+# Scenario C2: reseed refuses for stale .old/.new residue → logged BLOCKED,
+# notify_fail DOES fire (not self-healing — needs a human to clear it once)
+# with a message naming the specific path to remove.
+: > "$NOTIFY_STUB_CALLS"; : > "$RESEED_TEST_LOG"
+RESEED_SCRIPT="$RESEED_STUB_DIR/reseed.sh" RESEED_TIMEOUT_SECS=5 RESEED_AFTER_UPLOAD=1 \
+  RESEED_STUB_MODE=residue LOG="$RESEED_TEST_LOG" NOTIFY="$RESEED_STUB_DIR/notify" \
+  BACKUP_ROOT="/fake/.dolt-backup" \
+  _reseed_staging_if_enabled "testdb"
+RC=$?
+[ "$RC" -eq 1 ] && ok "scenario C2 (residue refusal): returns failure" || bad "scenario C2 (residue refusal): expected rc=1, got rc=$RC"
+grep -qF "staging reseed BLOCKED" "$RESEED_TEST_LOG" && ok "scenario C2: logged the BLOCKED line" || bad "scenario C2: missing BLOCKED log line"
+grep -qF "resíduo (.old ou .new)" "$NOTIFY_STUB_CALLS" && ok "scenario C2: notify message names the residue cause specifically (actionable, not generic)" || bad "scenario C2: notify message should name the residue cause"
+
+# Scenario D: RESEED_AFTER_UPLOAD=0 → reseed script never even invoked.
+: > "$NOTIFY_STUB_CALLS"; : > "$RESEED_TEST_LOG"
+RESEED_MARKER_FILE="$(mktemp -u)"   # deliberately not created — its existence after the call is the tell
+export RESEED_MARKER_FILE
+cat > "$RESEED_STUB_DIR/reseed_marker.sh" <<'STUB'
+#!/bin/bash
+touch "$RESEED_MARKER_FILE"
+exit 0
+STUB
+chmod +x "$RESEED_STUB_DIR/reseed_marker.sh"
+RESEED_SCRIPT="$RESEED_STUB_DIR/reseed_marker.sh" RESEED_TIMEOUT_SECS=5 RESEED_AFTER_UPLOAD=0 \
+  LOG="$RESEED_TEST_LOG" NOTIFY="$RESEED_STUB_DIR/notify" \
+  _reseed_staging_if_enabled "testdb"
+RC=$?
+[ "$RC" -eq 0 ] && ok "scenario D (opt-out): returns success (no-op)" || bad "scenario D (opt-out): expected rc=0, got rc=$RC"
+[ -e "$RESEED_MARKER_FILE" ] && bad "scenario D: RESEED_AFTER_UPLOAD=0 must skip invoking the reseed script entirely" || ok "scenario D: reseed script correctly never invoked when disabled"
+rm -f "$RESEED_MARKER_FILE" 2>/dev/null || true
+unset RESEED_MARKER_FILE
+
+rm -rf "$RESEED_STUB_DIR" 2>/dev/null || true
+rm -f "$NOTIFY_STUB_CALLS" "$RESEED_TEST_LOG" 2>/dev/null || true
+unset NOTIFY_STUB_CALLS
+
 echo ""
 echo "── jsonl_sizes_match() (ga-7gfd34) ──"
 
