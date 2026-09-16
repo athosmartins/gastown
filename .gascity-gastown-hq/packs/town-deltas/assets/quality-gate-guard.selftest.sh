@@ -607,6 +607,24 @@ r=$(_gap1_default_pool_for_city "/Users/athos/gt/whatsapp_automation/crew/worker
 r=$(_gap1_default_pool_for_city "/Users/athos/gt/lexbh"); [ "$r" = "" ] && ok "unrecognized rig -> empty (a wrong route is worse than no route, per the Python original's own reasoning)" || bad "unrecognized rig got '$r'"
 r=$(_gap1_default_pool_for_city ""); [ "$r" = "" ] && ok "empty input -> empty, no crash" || bad "empty input got '$r'"
 
+# ── gate_pick_oldest_marker <markers_json> — ga-c2bk55 starvation fix ────────
+# Step 2 used to take jq '.[0]' of whatever order `bd list` returned, which is
+# not submission order. Live incident: a marker created 18:01:59Z ran ahead of
+# four markers created 16:21-16:38Z, one of which (a P1 fixing a 10-day
+# production outage) sat starved 1h23min behind newer submissions. The fix
+# must pick the OLDEST by created_at regardless of input array order.
+echo "gate_pick_oldest_marker: FIFO by created_at, independent of input order"
+NEWEST_FIRST='[{"id":"ga-newest","created_at":"2026-09-16T18:01:59Z"},{"id":"ga-mid","created_at":"2026-09-16T16:29:56Z"},{"id":"ga-oldest","created_at":"2026-09-16T16:21:07Z"}]'
+r=$(gate_pick_oldest_marker "$NEWEST_FIRST" | jq -r '.id')
+[ "$r" = "ga-oldest" ] && ok "newest-first input -> oldest-by-created_at still wins (the exact starvation shape: a fresh submission was NOT allowed to jump the queue)" || bad "REGRESSION ga-c2bk55: newest-first input picked '$r', not ga-oldest — a plain .[0] would reproduce the live starvation incident"
+ALREADY_OLDEST_FIRST='[{"id":"ga-oldest","created_at":"2026-09-16T16:21:07Z"},{"id":"ga-mid","created_at":"2026-09-16T16:29:56Z"},{"id":"ga-newest","created_at":"2026-09-16T18:01:59Z"}]'
+r=$(gate_pick_oldest_marker "$ALREADY_OLDEST_FIRST" | jq -r '.id')
+[ "$r" = "ga-oldest" ] && ok "already-oldest-first input -> still ga-oldest (no regression on the order bd happens to already return)" || bad "oldest-first input got '$r'"
+r=$(gate_pick_oldest_marker '[{"id":"ga-solo","created_at":"2026-09-16T12:00:00Z"}]' | jq -r '.id')
+[ "$r" = "ga-solo" ] && ok "single-element array -> that element" || bad "single-element got '$r'"
+r=$(gate_pick_oldest_marker '[]')
+[ "$r" = "null" ] && ok "empty array -> null (caller's existing COUNT=0 check upstream already prevents this from being reached in practice)" || bad "empty array got '$r'"
+
 echo ""
 echo "Results: $P passed, $F failed"
 [ "$F" -eq 0 ] && { echo "SELFTEST PASS"; exit 0; } || { echo "SELFTEST FAIL"; exit 1; }

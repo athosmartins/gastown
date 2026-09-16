@@ -118,7 +118,25 @@ while IFS= read -r row; do
   ID=$(printf '%s' "$row" | jq -r '.id')
   BRANCH=$(printf '%s' "$row" | jq -r '[.labels[]?|select(startswith("branch:"))|sub("^branch:";"")]|first // ""')
   SRCBEAD=$(printf '%s' "$row" | jq -r '[.labels[]?|select(startswith("source-bead:"))|sub("^source-bead:";"")]|first // ""')
-  RIG=$(printf '%s' "$row" | jq -r '[.labels[]?|select(startswith("bead-rig:"))|sub("^bead-rig:";"")]|first // ""')
+  # ga-c2bk55 / ga-cc0xu0: rig: (which repo holds the CODE) lives in the
+  # marker's description, not its bead-rig: label (which STORE holds the
+  # BEAD) — the two diverge for exactly the cross-repo submission case this
+  # field exists to detect (docs/gate-marker-recipe.md; same fix already
+  # applied in quality-gate-guard.sh's gate_bead_sibling_status_lines and
+  # quality-gate-dispatcher.sh's extract("rig")+label_fallback). Reading
+  # bead-rig: here sent every cross-repo marker (bead stored in gascity,
+  # code in another rig, e.g. whatsapp_automation) to ILEGÍVEL below — a
+  # false positive in THIS diagnostic, not in the gate itself: the branch
+  # exists in the code rig all along, this script was just looking for it
+  # in the wrong repo. bead-rig: label stays as fallback for the rare
+  # marker with no description routing block at all (mirrors the
+  # dispatcher's label_fallback), so a marker that worked under the old
+  # behavior keeps working.
+  DESC=$(printf '%s' "$row" | jq -r '.description // ""')
+  RIG=$(printf '%s\n' "$DESC" | sed -n 's/^rig:[ \t]*\(.*\)$/\1/p' | head -1)
+  if [ -z "$RIG" ]; then
+    RIG=$(printf '%s' "$row" | jq -r '[.labels[]?|select(startswith("bead-rig:"))|sub("^bead-rig:";"")]|first // ""')
+  fi
   GSTATUS=$(printf '%s' "$row" | jq -r '[.labels[]?|select(startswith("gate-status:"))]|join(",")')
 
   # (a) sem gate-status = invisível ao dispatcher por construção (ga-5jyo8)

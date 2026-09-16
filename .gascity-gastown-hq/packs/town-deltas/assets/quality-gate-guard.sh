@@ -2407,6 +2407,17 @@ gate_clear_assignee_if_holder() {
   return 1
 }
 
+# gate_pick_oldest_marker <markers_json> — pure: given a JSON array of
+# markers (as returned by `bd list --json`), returns the one with the
+# earliest created_at, or "null" for an empty array. Extracted into its own
+# function (ga-c2bk55) purely so the FIFO fix below is unit-testable via
+# GATE_GUARD_LIB_ONLY sourcing, same as this file's other pure decision
+# functions above — the logic itself is a one-line jq sort, unchanged by
+# the extraction.
+gate_pick_oldest_marker() {
+  printf '%s\n' "${1:-[]}" | jq 'sort_by(.created_at) | .[0]' 2>/dev/null
+}
+
 # ── Lib-only mode: source with GATE_GUARD_LIB_ONLY=1 to load pure functions ──
 # without running the live guard sweep. Used by tests and by the dispatcher.
 if [ -n "${GATE_GUARD_LIB_ONLY:-}" ]; then
@@ -4316,7 +4327,21 @@ fi
 # (race), the remove will report nothing changed and the re-fetch below will
 # confirm the claim is ours or not.
 
-MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq '.[0]')
+# ga-c2bk55: pick the OLDEST marker (FIFO), not whatever order `bd list`
+# happened to return. Measured live 2026-09-16: a marker created 18:01:59Z
+# (ga-4q5m49) ran ahead of four markers created 16:21-16:38Z, one of which
+# (ps-70jq, P1, a 10-day production outage fix) sat starved 1h23min behind
+# newer submissions with no signal anything was wrong. Without an explicit
+# order, FIFO isn't just unfair — nothing bounds how long an older marker can
+# be passed over, so a steady stream of newer submissions can starve it
+# indefinitely. Markers don't inherit the source bead's priority today
+# (commands/gate-done.md's `bd create` for the marker passes none), so
+# sorting by the marker's own .priority would not actually reflect P0/P1
+# urgency; FIFO is the fix that matches what's really in the data, and it's
+# what the bug report itself confirmed resolves the starvation (a
+# priority+age scheme would need priority propagated at marker-creation time
+# first — separate, larger change, not this lane:small fix).
+MARKER=$(gate_pick_oldest_marker "$MARKERS_JSON")
 MARKER_ID=$(printf '%s\n' "$MARKER" | jq -r '.id')
 
 log "Attempting to claim marker $MARKER_ID ..."
