@@ -587,6 +587,41 @@ run_sweep() {
   # as _gate_active above — R4/R8 below consult the SAME snapshot regardless of
   # which store they're currently walking).
   local _park_vocab; _park_vocab=$(_park_vocab_json)
+  # ── R4 hysteresis ledger (ga-51sbkb) ───────────────────────────────────────
+  # Mirrors orphan-sweep.sh's own fix for the IDENTICAL bug class (ga-u0vzx/
+  # ga-kq4jf/ga-114ll): a single `gc session list` snapshot is not reliable
+  # enough to treat _provably_dead()'s "absent from roster" verdict as proof
+  # by itself — a session's own restart (old session closes, new one has not
+  # registered yet) makes it momentarily absent, and R4 (unlike
+  # inflight-reclaim-guard.py's RECLAIM_TTL-gated reclaim) had no hysteresis
+  # at all, acting on the very next sweep. Confirmed live 2026-09-16
+  # (ga-51sbkb): oracle-wa's own assignee was cleared 3 separate times, always
+  # at the exact instant its old session closed and the new one had not yet
+  # reappeared in the roster — never because it was actually dead.
+  #
+  # This deliberately does NOT touch _provably_dead()/claimant_provably_dead()
+  # itself — that predicate's "absent = dead" branch is inflight-reclaim-
+  # guard.py's own regression-anchored fast-reclaim path (its DD-1 test:
+  # "was re-offered pre-fix"); weakening it at the source would resurrect
+  # THAT bug. Instead R4 must see the SAME bead provably-dead on
+  # R4_CONFIRM_THRESHOLD *consecutive* sweeps (default 2 — spans one full
+  # ~10min cooldown) before acting, or skip it while its `updated_at` is more
+  # recent than R4_RECENT_UPDATE_GRACE_SECS (default 1800s/30min) — a bead
+  # with fresh activity has an active owner even when this sweep's roster
+  # read didn't resolve them. A bead that drops out of candidacy on any
+  # intervening sweep (session reappeared, bead reassigned/relabeled/closed,
+  # or protected by the update-grace) has its counter pruned immediately, so
+  # only a SUSTAINED verdict — never a one-off gap — can ever fire. Fail-open
+  # toward "needs re-confirmation, never act yet": a corrupt/missing ledger
+  # must never make R4 MORE aggressive than its designed default.
+  local R4_LEDGER="${LCJ_R4_LEDGER:-$(dirname "$LOG")/lifecycle-coherence-janitor-r4-ledger.json}"
+  local R4_CONFIRM_THRESHOLD="${R4_CONFIRM_THRESHOLD:-2}"
+  local R4_RECENT_UPDATE_GRACE_SECS="${R4_RECENT_UPDATE_GRACE_SECS:-1800}"
+  mkdir -p "$(dirname "$R4_LEDGER")" 2>/dev/null || true
+  [ -f "$R4_LEDGER" ] || echo '{}' > "$R4_LEDGER" 2>/dev/null || true
+  local _r4_counts; _r4_counts=$(cat "$R4_LEDGER" 2>/dev/null) || _r4_counts='{}'
+  echo "$_r4_counts" | jq -e 'type == "object"' >/dev/null 2>&1 || _r4_counts='{}'
+  local _r4_candidates='{}'
   for store in $LCJ_STORES; do
     [ -d "$store" ] || continue
 
@@ -678,7 +713,8 @@ run_sweep() {
     _r4_seen=" "
     for _rlbl in story:approved ctx:ready; do
       for _pair in $("$BD" -C "$store" list -l "$_rlbl" --status open --json -n 0 2>/dev/null \
-                  | jq -r --argjson pv "$_park_vocab" '.[] | select((.assignee // "") != "" and (.assignee // "") != "mayor")
+                  | jq -r --argjson pv "$_park_vocab" 'now as $now
+                          | .[] | select((.assignee // "") != "" and (.assignee // "") != "mayor")
                           | ([.labels[]?]) as $l
                           | select(($l|index("story:in-flight"))==null and ($l|index("exec:manual"))==null
                                    and (($l | any(
@@ -687,17 +723,38 @@ run_sweep() {
                                            or ((($pv.exact // []) | index($lbl)) != null)
                                            or (($pv.prefixes // []) | any(. as $p | $lbl | startswith($p)))
                                        )) | not))
-                          | .id + "|" + .assignee' 2>/dev/null); do
+                          | ((.updated_at // .created_at // "") | try fromdateiso8601 catch null) as $epoch
+                          | (if $epoch != null then (($now - $epoch) | floor) else -1 end) as $age
+                          | .id + "|" + .assignee + "|" + ($age | tostring)' 2>/dev/null); do
         [ -n "$_pair" ] || continue
-        id="${_pair%%|*}"; _r4_assignee="${_pair#*|}"
+        id="${_pair%%|*}"; _r4_rest="${_pair#*|}"; _r4_assignee="${_r4_rest%%|*}"; _r4_update_age="${_r4_rest#*|}"
         case "$_r4_seen" in *" $id "*) continue ;; esac
         _r4_seen="$_r4_seen$id "
         _bead_locked "$id" && { log "R4 skip-locked (imp10): $id — advisory lock active"; continue; }
         if ! _provably_dead "$_r4_assignee"; then
           log "R4 skip-live-assignee (ga-6plfv): $id ($(basename "$store")) — assignee '$_r4_assignee' not provably dead, protected"; continue
         fi
-        _unassign "$store" "$id"; _strip "$store" "$id" pilot:dispatched
-        log "R4 ready-stale-assignee: $id ($(basename "$store")) — cleared assignee ($_r4_assignee, provably dead)"; n=$((n+1))
+        # ga-51sbkb: provably-dead is a CANDIDATE, not a verdict (see the
+        # hysteresis ledger set up above _park_vocab). A recent update
+        # protects outright — an active owner just touched this bead even
+        # though this sweep's roster read didn't resolve them; an unknown
+        # age (-1, no parseable timestamp) fails toward the SAME protection
+        # rather than toward acting. Otherwise the bead must reconfirm across
+        # R4_CONFIRM_THRESHOLD consecutive sweeps before R4 acts.
+        if [ "$_r4_update_age" -lt "$R4_RECENT_UPDATE_GRACE_SECS" ]; then
+          log "R4 skip-recent-update (ga-51sbkb): $id ($(basename "$store")) — assignee '$_r4_assignee' provably dead but bead updated ${_r4_update_age}s ago (< ${R4_RECENT_UPDATE_GRACE_SECS}s grace), protected"; continue
+        fi
+        _r4_candidates=$(echo "$_r4_candidates" | jq --arg id "$id" '.[$id] = 1') || _r4_candidates='{}'
+        _r4_prev=$(echo "$_r4_counts" | jq -r --arg id "$id" '.[$id] // 0' 2>/dev/null) || _r4_prev=0
+        _r4_new=$(( _r4_prev + 1 ))
+        if [ "$_r4_new" -ge "$R4_CONFIRM_THRESHOLD" ]; then
+          _unassign "$store" "$id"; _strip "$store" "$id" pilot:dispatched
+          log "R4 ready-stale-assignee: $id ($(basename "$store")) — cleared assignee ($_r4_assignee, provably dead, confirmed ${_r4_new}x consecutive sweeps)"; n=$((n+1))
+          _r4_counts=$(echo "$_r4_counts" | jq --arg id "$id" 'del(.[$id])') || true
+        else
+          log "R4 skip-unconfirmed (ga-51sbkb): $id ($(basename "$store")) — assignee '$_r4_assignee' provably dead (${_r4_new}/${R4_CONFIRM_THRESHOLD} consecutive sweeps), awaiting reconfirmation before clearing"
+          _r4_counts=$(echo "$_r4_counts" | jq --arg id "$id" --argjson n "$_r4_new" '.[$id] = $n') || true
+        fi
       done
     done
     # R6 (imp19 pilot:held expiry): pilot:held + pilot:held-until:<past-epoch> → strip both
@@ -1118,6 +1175,15 @@ run_sweep() {
       done
     done
   done
+  # ga-51sbkb: prune R4's ledger to only the beads that were STILL a
+  # provably-dead-and-past-grace candidate on THIS sweep — a bead that
+  # resolved live/unknown, got reassigned/relabeled/closed, or fell inside
+  # the update-grace this time round loses any count it had accumulated
+  # before. Only a run of CONSECUTIVE candidacy should ever reach
+  # R4_CONFIRM_THRESHOLD (mirrors orphan-sweep.sh's own ledger-prune step).
+  _r4_counts=$(echo "$_r4_counts" | jq --argjson keep "$_r4_candidates" \
+      'to_entries | map(select(.key as $k | $keep[$k] != null)) | from_entries' 2>/dev/null) || _r4_counts='{}'
+  echo "$_r4_counts" > "$R4_LEDGER" 2>/dev/null || true
   # CRITICAL: Dolt auto-commit is OFF (dolt.auto-commit=off). A `bd label remove`/`update` writes
   # to the WORKING SET but does NOT commit — so OTHER processes that read committed HEAD (the
   # painel's `bd list`, a fresh bd) never see the change, and the phantom card persists despite
@@ -1216,7 +1282,7 @@ case "\$a" in
   *"list -l story:approved --status closed"*)   echo '[{"id":"ca-1"},{"id":"ca-cancel","labels":["story:cancelled","story:approved"]},{"id":"ca-byreason","close_reason":"CANCELLED — requirements changed, replaced by ga-xyz"}]' ;;
   *"list -l story:in-flight --status blocked"*) echo '[{"id":"bl-1"}]' ;;
   *"list --status in_progress"*)                echo '[{"id":"ip-noasg","assignee":"","updated_at":"2020-01-01T00:00:00Z"},{"id":"ip-fresh","assignee":"","updated_at":"'"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"'"},{"id":"ip-asg","assignee":"mila-wa"},{"id":"ip-gate-active","assignee":"","updated_at":"2020-01-01T00:00:00Z"}]' ;;
-  *"list -l story:approved --status open"*)     echo '[{"id":"r4-asg","assignee":"mila-wa","labels":["story:approved"]},{"id":"r4-human","assignee":"mila-wa","labels":["story:approved","gate:needs-human:foo"]},{"id":"r4-human-bare","assignee":"mila-wa","labels":["story:approved","gate:needs-human"]},{"id":"r4-live","assignee":"crew-live","labels":["story:approved"]},{"id":"r4-ambiguous","assignee":"crew-ambiguous","labels":["story:approved"]},{"id":"r4-deacon","assignee":"deacon","labels":["story:approved"]},{"id":"r4-canon-blocked","assignee":"mila-wa","labels":["story:approved","blocked:needs-oracle-approval"]}]' ;;
+  *"list -l story:approved --status open"*)     echo '[{"id":"r4-asg","assignee":"mila-wa","labels":["story:approved"],"updated_at":"2020-01-01T00:00:00Z"},{"id":"r4-human","assignee":"mila-wa","labels":["story:approved","gate:needs-human:foo"]},{"id":"r4-human-bare","assignee":"mila-wa","labels":["story:approved","gate:needs-human"]},{"id":"r4-live","assignee":"crew-live","labels":["story:approved"]},{"id":"r4-ambiguous","assignee":"crew-ambiguous","labels":["story:approved"]},{"id":"r4-deacon","assignee":"deacon","labels":["story:approved"]},{"id":"r4-canon-blocked","assignee":"mila-wa","labels":["story:approved","blocked:needs-oracle-approval"],"updated_at":"2020-01-01T00:00:00Z"},{"id":"r4-recent-dead","assignee":"mila-wa","labels":["story:approved"],"updated_at":"'"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"'"}]' ;;
   *"list -l ctx:ready --status open"*)          echo '[]' ;;
   *"list -l ctx:ready --status closed"*)        echo '[{"id":"r5","labels":["ctx:ready"]},{"id":"r5-locked","labels":["ctx:ready"]},{"id":"r5-cancel","labels":["ctx:ready","story:cancelled"]},{"id":"r5-byreason","labels":["ctx:ready"],"close_reason":"discontinued: replaced by wa-xyz redesign"},{"id":"r5-gate-failed","labels":["ctx:ready","gate:failed","gate:needs-fix"]},{"id":"r5m","labels":["ctx:ready"]},{"id":"r5s","labels":["ctx:ready"]},{"id":"r5u","labels":["ctx:ready"]},{"id":"r9dot.1","labels":["ctx:ready"]},{"id":"r5mb","labels":["ctx:ready"]},{"id":"r5mm","labels":["ctx:ready"]}]' ;;
   *"show r5 "*|*"show r5-locked "*)             echo '[{"id":"r5","labels":["ctx:ready"]}]' ;;
@@ -1423,16 +1489,17 @@ GITSHIM
   grep -q 'update ip-noasg --status open'     "$ACT" && ok "R3: STALE in_progress + no assignee → status=open" || bad "R3 not opened"
   grep -q 'ip-fresh'                          "$ACT" && bad "R3 flipped a FRESH in_progress bead (routed-pool race!)" || ok "R3: fresh in_progress + no assignee → LEFT ALONE (grace protects a live crew build)"
   grep -q 'ip-asg'                            "$ACT" && bad "TOUCHED an in_progress bead WITH an assignee (unsafe!)" || ok "left the assigned in_progress bead alone (safe)"
-  grep -q 'update r4-asg --assignee'          "$ACT" && ok "R4: open story:approved with stale assignee → cleared (phantom worker)" || bad "R4 did not clear stale assignee"
+  grep -q 'update r4-asg --assignee'          "$ACT" && bad "R4 hysteresis (ga-51sbkb): cleared a phantom worker's assignee on the FIRST sweep — a lone provably-dead verdict must only be COUNTED, never acted on immediately (see the 2-sweep confirmation test below)" || ok "R4 (ga-51sbkb): first sweep only counts a provably-dead verdict, does not clear yet"
   grep -q 'update r4-human --assignee'        "$ACT" && bad "R4: cleared assignee on a gate:needs-human:foo bead (must be excluded — human braked for review)" || ok "R4: left gate:needs-human:foo bead's assignee alone (colon-suffixed exclusion works)"
   grep -q 'update r4-human-bare --assignee'   "$ACT" && bad "R4 bare-label bug (gate_run=ga-wisp-05leh8): cleared assignee on a BARE gate:needs-human bead (production code writes this form with no suffix)" || ok "R4: left bare gate:needs-human bead's assignee alone (bare-label exclusion works)"
   grep -q 'update r4-live --assignee'         "$ACT" && bad "R4 REGRESSION (ga-6plfv): cleared the assignee of a PROVABLY-LIVE session — this is the exact incident that ran 102 times in production before this fix" || ok "R4 (ga-6plfv): left a live session's assignee alone (liveness check works)"
   grep -q 'update r4-ambiguous --assignee'    "$ACT" && bad "R4 (ga-6plfv): cleared the assignee of a session in an UNRECOGNIZED state — unknown must fail safe as NOT provably dead" || ok "R4 (ga-6plfv): left an ambiguous-state session's assignee alone (fail-safe on unknown state)"
   grep -q 'update r4-deacon --assignee'       "$ACT" && bad "R4 (ga-6plfv): cleared assignee=deacon — coordinator exclusion gap the liveness check was supposed to close" || ok "R4 (ga-6plfv): left assignee=deacon alone (is_coordinator() protects it, same convention as assignee=mayor)"
-  grep -q 'update r4-asg --assignee'          "$ACT" && ok "R4 (ga-6plfv): mila-wa is absent from the session roster → still provably dead → still cleared (pre-fix behavior preserved for genuine phantoms)" || bad "R4 (ga-6plfv): regressed the genuinely-phantom case — mila-wa should still be cleared"
+  grep -q 'update r4-recent-dead --assignee'  "$ACT" && bad "R4 update-grace (ga-51sbkb): cleared a provably-dead assignee whose bead was updated moments ago — RECENT_UPDATE_GRACE must protect fresh activity regardless of the liveness verdict" || ok "R4 (ga-51sbkb): left a recently-updated-but-provably-dead bead alone (update-grace protects it)"
   # R4 canonical-park widening (ga-8lrud): r4-canon-blocked's assignee (mila-wa) is
-  # the SAME dead/absent-from-roster identity as r4-asg above (which DOES get
-  # cleared) — so this fixture isolates the park-exclusion itself: if it were
+  # the SAME dead/absent-from-roster identity as r4-asg above (which eventually
+  # clears once R4_CONFIRM_THRESHOLD consecutive sweeps confirm it — ga-51sbkb) —
+  # so this fixture isolates the park-exclusion itself: if it were ever
   # cleared, this test would fail even though liveness alone would have allowed
   # it, proving the canonical park check fires (and wins) before liveness is
   # even consulted.
@@ -1592,6 +1659,12 @@ GITSHIM
   # DRY-RUN makes no changes
   : > "$ACT"; LCJ_DRY_RUN=1; run_sweep
   [ ! -s "$ACT" ] && ok "DRY_RUN performs zero mutations" || bad "DRY_RUN mutated beads"
+  # ga-51sbkb: every run_sweep() call below this point (the R4 hysteresis
+  # e2e block) needs REAL mutations to land in $ACT to assert on them — a
+  # DRY_RUN left dangling here would make _unassign() silently no-op while
+  # the ledger bookkeeping still advances/clears as if it had acted,
+  # exactly the false-pass this reset prevents.
+  LCJ_DRY_RUN=0
 
   # ── Bootstrap coverage for the LCJ_STORES derivation (ga-3xfndz) ───────────
   # Every assertion above ran run_sweep() in-process with GC/BD/LCJ_NOTIFY
@@ -1671,6 +1744,37 @@ GCMULTISHIM
   [ "$_boot_derived_count" -eq 7 ] \
     && ok "bootstrap (ga-3xfndz): derived LCJ_STORES carries all 7 live rigs, none dropped" \
     || bad "bootstrap (ga-3xfndz): expected 7 derived stores, got $_boot_derived_count ('$_boot_derived')"
+
+  # ── R4 hysteresis, end-to-end across sweeps (ga-51sbkb) ────────────────────
+  # The assertions above (the main run_sweep() call near the top) already
+  # proved a single sweep only COUNTS r4-asg's provably-dead verdict and
+  # never acts on it. This block proves the other half of the same contract:
+  # the fix must delay R4's clear, not disable it — a genuinely, permanently
+  # dead assignee still has to go, or R4 stops doing the one job it exists
+  # for. Isolated to its own ledger file (a fresh path under $TMP) so it
+  # neither inherits nor is confused by whatever count the main flow's own
+  # run_sweep() calls already left in the DEFAULT ($TMP/log-derived) ledger.
+  LCJ_R4_LEDGER="$TMP/r4-ledger-e2e.json"; export LCJ_R4_LEDGER
+  : > "$ACT"
+  run_sweep
+  grep -q 'update r4-asg --assignee' "$ACT" \
+    && bad "R4 hysteresis (ga-51sbkb): cleared r4-asg on its FIRST sweep against a fresh ledger — a lone provably-dead snapshot must never act immediately" \
+    || ok "R4 hysteresis (ga-51sbkb): first sweep against a fresh ledger only counts r4-asg (1/2), does not clear it"
+  grep -q '"r4-asg"' "$LCJ_R4_LEDGER" 2>/dev/null \
+    && ok "R4 hysteresis (ga-51sbkb): first sweep recorded r4-asg in the confirmation ledger" \
+    || bad "R4 hysteresis (ga-51sbkb): ledger does not contain r4-asg after sweep 1 (got: $(cat "$LCJ_R4_LEDGER" 2>/dev/null))"
+  : > "$ACT"
+  run_sweep
+  grep -q 'update r4-asg --assignee' "$ACT" \
+    && ok "R4 hysteresis (ga-51sbkb): SECOND consecutive provably-dead sweep clears the genuinely-phantom assignee (confirmed 2/2)" \
+    || bad "R4 hysteresis (ga-51sbkb): still not cleared after 2 consecutive confirming sweeps — fix must not disable R4 entirely"
+  grep -q '"r4-asg"' "$LCJ_R4_LEDGER" 2>/dev/null \
+    && bad "R4 hysteresis (ga-51sbkb): r4-asg still sitting in the ledger after R4 acted on it (must be removed once cleared)" \
+    || ok "R4 hysteresis (ga-51sbkb): ledger entry removed once R4 acted on it"
+  grep -q 'update r4-recent-dead --assignee' "$ACT" \
+    && bad "R4 update-grace (ga-51sbkb): cleared a recently-updated bead on the SECOND sweep too — grace must protect it on every sweep it stays fresh, not just the first" \
+    || ok "R4 update-grace (ga-51sbkb): recently-updated bead still protected on the second sweep"
+  unset LCJ_R4_LEDGER
 
   echo ""; echo "lifecycle-coherence-janitor selftest: PASS=$PASS FAIL=$FAIL"; [ "$FAIL" -eq 0 ] && exit 0 || exit 1
 fi
