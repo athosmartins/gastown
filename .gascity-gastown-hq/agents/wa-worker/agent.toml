@@ -38,6 +38,23 @@
 # (disabled; fix in wa-ao1pl), not from workers. Revert to 2 if
 # dolt-disk-floor-guard goes CRITICAL again.
 #
+# ESSE REVERT ACONTECEU — e o valor abaixo e 2 de proposito, nao um 3 perdido.
+# Commit 415b78f18 "fix(ops): revert wa-worker pool 3 -> 2 under memory
+# saturation" desfez o f2a98cfbd acima. Ate 16/09 este bloco so contava a
+# subida e nao o revert, entao lido de cima a baixo ele sugeria que o 3 tinha
+# se perdido e devia ser 'restaurado'. Nao deve. Estado em 16/09 12:2x que
+# sustenta o 2: swap em 8.24 de 9.22 GB (89%) com o ratchet do macOS, que so
+# libera em reboot; memoria livre em 46% NAO e o numero que decide isso.
+# O teto tambem esta no env do launchd do Pilot (PILOT_WA_WORKER_MAX=2) —
+# mudar aqui sem mudar la deixa os dois discordando.
+#
+# E o teto NAO e a largura da lane: MAX_SMALL do pilot-dispatcher.sh e 5
+# (linha 87, default). O comentario de 11/09 acima diz "the Pilot small lane
+# opens 3 slots" e isso esta errado hoje. Com lane 5 e pool 2, o Pilot roteia
+# mais bead do que o pool pode consumir — e quando isso acontece a bead
+# encalha (ver ga-q0ewpu: o top-up que deveria repor consulta o store errado).
+# Aumentar o teto NAO corrige esse encalhe, so o torna menos frequente.
+#
 # MODEL: Sonnet. Build work is well within Sonnet's capabilities. Keeps wa-worker
 # off the scarce weekly Opus budget (which is reserved for Mayor / named crew).
 #
