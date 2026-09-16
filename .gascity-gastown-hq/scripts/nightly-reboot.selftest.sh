@@ -390,5 +390,54 @@ No new software available.'
 fi
 
 echo ""
+echo "── Scenario 6: scraper daily still running blocks the reboot (ps-70jq), tested in isolation ──"
+# 2026-09-06..16: this reboot fired at 01:00 every night while the
+# property_scrapers daily (00:01 → ~02:30) was still scraping, killing it
+# mid-run 10 nights in a row. Guard 4 reads that daily's own per-rodada marker
+# files. Same sentinel-extraction isolation as Scenarios 4/5 — never a full run.
+SCRAPER_SNIPPET="$TMP/scraper-daily-guard.sh"
+sed -n '/SCRAPER-DAILY-GUARD-START/,/SCRAPER-DAILY-GUARD-END/p' "$SCRIPT" > "$SCRAPER_SNIPPET"
+if [ ! -s "$SCRAPER_SNIPPET" ]; then
+  bad "6: sentinel extraction found nothing in $SCRIPT — cannot test the scraper-daily guard (expected on the pre-fix script)"
+else
+  # shellcheck source=/dev/null
+  source "$SCRAPER_SNIPPET"
+  RDIR="$TMP/rodada_status"
+  DEAD_PID=$(bash -c 'echo $$')   # a subshell that has already exited
+  LIVE_PID=$$
+  NOW_EPOCH=$(/bin/date +%s)
+  BOOT_EPOCH_FAKE=$((NOW_EPOCH - 7200))           # "booted 2h ago"
+  AFTER_BOOT=$(/bin/date -r $((NOW_EPOCH - 3600)) +%Y-%m-%dT%H:%M:%S.000000)
+  BEFORE_BOOT=$(/bin/date -r $((NOW_EPOCH - 90000)) +%Y-%m-%dT%H:%M:%S.000000)
+  mk() { printf '{"rodada_id":"%s","pid":%s,"phase":"scraping","status":"%s","started_at":"%s"}' "$1" "$2" "$3" "$4" > "$RDIR/$1.json"; }
+  check() { SCRAPER_RODADA_DIR="$RDIR" SCRAPER_BOOT_EPOCH="$BOOT_EPOCH_FAKE" scraper_daily_state; }
+
+  rm -rf "$RDIR"
+  check
+  [ "$SCRAPER_DAILY_STATE" = "clear" ] && ok "6a: no marker dir -> clear (box without the scraper rig must still reboot)" || bad "6a: expected clear, got $SCRAPER_DAILY_STATE"
+
+  mkdir -p "$RDIR"; mk live "$LIVE_PID" running "$AFTER_BOOT"
+  check
+  [ "$SCRAPER_DAILY_STATE" = "running" ] && ok "6b: running marker + live pid started this boot -> running (THE fix)" || bad "6b: expected running, got $SCRAPER_DAILY_STATE ($SCRAPER_DAILY_REASON)"
+  printf '%s' "$SCRAPER_DAILY_REASON" | grep -q "live" && ok "6b: reason names the rodada" || bad "6b: reason missing rodada id: $SCRAPER_DAILY_REASON"
+
+  rm -f "$RDIR"/*.json; mk dead "$DEAD_PID" running "$AFTER_BOOT"
+  check
+  [ "$SCRAPER_DAILY_STATE" = "clear" ] && ok "6c: running marker but pid gone -> clear (a dead daily must not block reboots forever)" || bad "6c: expected clear, got $SCRAPER_DAILY_STATE"
+
+  rm -f "$RDIR"/*.json; mk reused "$LIVE_PID" running "$BEFORE_BOOT"
+  check
+  [ "$SCRAPER_DAILY_STATE" = "clear" ] && ok "6d: marker from BEFORE this boot with a now-reused pid -> clear (pid reuse)" || bad "6d: expected clear, got $SCRAPER_DAILY_STATE"
+
+  rm -f "$RDIR"/*.json; mk done "$LIVE_PID" complete "$AFTER_BOOT"
+  check
+  [ "$SCRAPER_DAILY_STATE" = "clear" ] && ok "6e: complete marker -> clear" || bad "6e: expected clear, got $SCRAPER_DAILY_STATE"
+
+  rm -f "$RDIR"/*.json; printf '{not json' > "$RDIR/corrupt.json"
+  check
+  [ "$SCRAPER_DAILY_STATE" = "unknown" ] && ok "6f: unreadable marker -> unknown (never collapsed into clear)" || bad "6f: expected unknown, got $SCRAPER_DAILY_STATE"
+fi
+
+echo ""
 echo "nightly-reboot selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1

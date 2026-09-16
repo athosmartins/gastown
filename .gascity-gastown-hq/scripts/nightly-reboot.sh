@@ -303,11 +303,93 @@ fi
 # starting at 03:00. A healthy night still finishes on attempt 1 in seconds,
 # same as before — this budget only spends time on a night that would
 # otherwise have silently skipped.
+# --- Guard 4 helper: property_scrapers daily still running (ps-70jq) -------
+# 2026-09-06..16 this reboot killed the property_scrapers nightly daily
+# (starts 00:01, scraping + MotherDuck sync historically end 02:00-02:45)
+# mid-run TEN nights in a row: kern.boottime lined up night by night with the
+# last scraper_health.db row of each night, 6-7 long scrapers stopped
+# collecting and the sync phase never ran. Guards 2+3 only look at gate
+# markers and hq beads, so nothing here knew a scraper run was in flight.
+#
+# Source of truth is the daily's OWN durable per-rodada marker
+# (runner.py _write_rodada_status, ps-i9jf): one JSON per rodada with
+# status/pid/started_at. Three states, never collapsed:
+#   running  a marker is status=running, its pid is alive, AND it started
+#            after this boot (a pid recorded before the boot may since have
+#            been reused by an unrelated process)
+#   clear    no marker dir, or no marker satisfies the above
+#   unknown  a marker file exists but cannot be parsed -> treated as NOT safe,
+#            same fail-closed doctrine as Guards 2+3
+#
+# nightly-reboot.selftest.sh:SCRAPER-DAILY-GUARD-START — sentinel for the
+# selftest (Scenario 6), same isolation technique as the blocks above. Keep it
+# self-contained: only /usr/bin/python3 and the two overridable env vars.
+scraper_daily_state() {
+    local dir="${SCRAPER_RODADA_DIR:-/Users/athos/.property-scrapers/runtime/main/logs/rodada_status}"
+    local boot="${SCRAPER_BOOT_EPOCH:-}"
+    if [ -z "${boot}" ]; then
+        boot=$(sysctl -n kern.boottime 2>/dev/null | sed -E 's/.*sec = ([0-9]+).*/\1/')
+    fi
+    local out
+    out=$(/usr/bin/python3 - "${dir}" "${boot}" <<'PY'
+import json, os, sys
+from datetime import datetime
+d, boot = sys.argv[1], sys.argv[2]
+if not os.path.isdir(d):
+    print("clear\tno marker dir"); sys.exit(0)
+try:
+    boot = float(boot)
+except ValueError:
+    boot = None
+bad = []
+for name in sorted(os.listdir(d)):
+    if not name.endswith(".json"):
+        continue
+    try:
+        m = json.load(open(os.path.join(d, name)))
+        assert isinstance(m, dict)
+    except Exception as e:
+        bad.append(name); continue
+    if m.get("status") != "running":
+        continue
+    try:
+        os.kill(int(m.get("pid")), 0)
+    except ProcessLookupError:
+        continue
+    except PermissionError:
+        pass
+    except Exception:
+        continue
+    try:
+        started = datetime.fromisoformat(str(m.get("started_at"))).timestamp()
+    except Exception:
+        started = None
+    if boot is not None and started is not None and started < boot:
+        continue  # recorded before this boot: that pid is someone else now
+    print("running\trodada %s (pid %s, fase '%s', desde %s)" % (
+        m.get("rodada_id"), m.get("pid"), m.get("phase"), m.get("started_at")))
+    sys.exit(0)
+if bad:
+    print("unknown\tmarker(s) ilegível(is): " + ", ".join(bad)); sys.exit(0)
+print("clear\tnenhuma rodada de scraper em execução")
+PY
+)
+    if [ -z "${out}" ]; then
+        SCRAPER_DAILY_STATE="unknown"; SCRAPER_DAILY_REASON="marker check produced no output"
+        return 0
+    fi
+    SCRAPER_DAILY_STATE="${out%%	*}"
+    SCRAPER_DAILY_REASON="${out#*	}"
+    return 0
+}
+# nightly-reboot.selftest.sh:SCRAPER-DAILY-GUARD-END
+
 RETRY_INTERVAL="${NIGHTLY_REBOOT_RETRY_INTERVAL:-300}"
 RETRY_MAX_ATTEMPTS="${NIGHTLY_REBOOT_RETRY_MAX_ATTEMPTS:-18}"
 
-# Runs Guard 2 (gate markers) + Guard 3 (hq in-progress) once. Sets
-# BLOCK_REASON on failure. Returns 0 only if BOTH guards pass.
+# Runs Guard 2 (gate markers) + Guard 3 (hq in-progress) + Guard 4 (scraper
+# daily in flight, ps-70jq) once. Sets BLOCK_REASON on failure. Returns 0 only
+# if ALL guards pass.
 check_guards_once() {
     GATE_JSON=$("${CITY}/scripts/gate-queue-composition.sh" --json 2>"${GATE_ERR}")
     GATE_RC=$?
@@ -331,6 +413,15 @@ check_guards_once() {
         BLOCK_REASON="hq beads in_progress = ${HQ_INPROGRESS_COUNT}"
         return 1
     fi
+    scraper_daily_state
+    if [ "${SCRAPER_DAILY_STATE}" = "running" ]; then
+        BLOCK_REASON="property_scrapers daily em execução — ${SCRAPER_DAILY_REASON}"
+        return 1
+    fi
+    if [ "${SCRAPER_DAILY_STATE}" != "clear" ]; then
+        BLOCK_REASON="property_scrapers daily: estado desconhecido (${SCRAPER_DAILY_REASON}) — unknown treated as NOT safe"
+        return 1
+    fi
     return 0
 }
 
@@ -349,7 +440,7 @@ while true; do
     sleep "${RETRY_INTERVAL}"
     ATTEMPT=$((ATTEMPT+1))
 done
-log "guards OK on attempt ${ATTEMPT}/${RETRY_MAX_ATTEMPTS}: 0 real gate markers, 0 hq in_progress"
+log "guards OK on attempt ${ATTEMPT}/${RETRY_MAX_ATTEMPTS}: 0 real gate markers, 0 hq in_progress, no scraper daily running"
 
 # --- Informational only: other rigs' in_progress count (not a gate) ------
 # Precedent (2026-08-29 runbook) treated non-hq in-progress as non-blocking —
