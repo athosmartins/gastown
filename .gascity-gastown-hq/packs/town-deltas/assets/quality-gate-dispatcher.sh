@@ -3558,6 +3558,25 @@ gate_exile_recovery_sweep() {
       warn "gate_exile_recovery_sweep: origin/$m_branch does not resolve for marker $marker_id (unfetched or force-pushed away) — skipping this sweep."
       continue
     fi
+    # ga-10uqmi: this is deliberately still the TEXTUAL-only check
+    # (rig_merge_has_conflict), not rebase_content_verdict() — and that is
+    # now safe by construction, not by oversight. Before ga-10uqmi, a
+    # branch's REAL recurring failure could be a rebase-tree-vs-3-way-merge
+    # content mismatch (ga-m07gc) rather than a textual conflict; such a
+    # branch is, by definition, already textually clean (that absence of a
+    # textual conflict is exactly what made the mismatch possible), so this
+    # check would find verdict=0 on essentially every sweep and repeatedly
+    # clear its exile — a resonance loop that never converged. ga-10uqmi
+    # closed the loop UPSTREAM instead of here: a content-mismatch failure
+    # (see the Step 4c classification above, "PR_CONTENT_VERDICT" = "no")
+    # is now routed straight to gate-status:needs-rebase and never acquires
+    # the gate:rebase-fail-count/gate:exiled-tier5 labels this function
+    # selects on (the jq filter a few lines above) — so a content-mismatch
+    # marker can no longer BE a candidate here at all, and this function
+    # never needs to tell the two failure classes apart itself. Do not
+    # "fix" this into a rebase_content_verdict() check assuming ga-10uqmi
+    # was never applied — that would spend a real git worktree+rebase per
+    # exiled marker per sweep to re-guard against an already-closed path.
     verdict=$(rig_merge_has_conflict "origin/$DEFAULT_BRANCH" "origin/$m_branch")
     [ "$verdict" = "0" ] || continue
     attempt=$(read_rebase_attempt "$marker_id")
@@ -11286,6 +11305,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     # imp18: release the per-repo mutex (noop if never acquired or lib not loaded)
     [ "$_REBASE_MUTEX_HELD" = "1" ] && { type git_mutex_release >/dev/null 2>&1 && git_mutex_release "$RIG_PATH" 2>/dev/null || true; }
 
+    # SELFTEST-EXTRACT gate-10uqmi-rebase-fail-classify: BEGIN
     if [ "$AUTO_REBASE_OK" = "1" ] && [ "$BRANCH_IS_CURRENT" = "1" ]; then
       log "  Auto-rebase complete — branch is now current. Continuing with review."
       # ga-g0v96 (AC5): any retry saga for this marker is over now — clear the
@@ -11302,25 +11322,64 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       # ga-g0v96 (AC3): surface the CAPTURED diagnostic when we have one, instead
       # of the old zero-information "worktree/push error" string.
       HAS_CONFLICT=1
-      CONFLICT_KIND="transient"   # ga-q3ig2: plumbing failure, not a real conflict — retry is worthwhile.
-      if [ -n "$AUTO_REBASE_PUSH_ERR" ]; then
-        CONFLICT_FILES="auto-rebase push failed (exit=${AUTO_REBASE_PUSH_RC:-?}): $AUTO_REBASE_PUSH_ERR"
-      elif [ -n "${AUTO_MERGE_FALLBACK_ERR:-}" ]; then
-        # ga-byfbd (DEFEITO 2): the merge fallback (ga-qukyp) was tried and
-        # ALSO failed — genuinely unexpected, since merge-tree already
-        # proved this pair clean. Show both diagnostics: the rebase's own
-        # (which is what triggered the fallback in the first place — may be
-        # empty if git wrote nothing to stderr there) and the fallback's own.
-        CONFLICT_FILES="auto-rebase failed (${AUTO_REBASE_SETUP_ERR:-no stderr captured}); merge fallback (ga-byfbd/ga-qukyp) also failed: $AUTO_MERGE_FALLBACK_ERR"
-      elif [ -n "${AUTO_REBASE_SETUP_ERR:-}" ]; then
-        # ga-byfbd (DEFEITO 1): rebase/worktree-add's own captured stderr —
-        # reached when the merge fallback was never attempted (e.g.
-        # worktree-add itself failed, before any rebase was even tried).
-        CONFLICT_FILES="auto-rebase failed: $AUTO_REBASE_SETUP_ERR"
+      if [ "${PR_CONTENT_VERDICT:-}" = "no" ]; then
+        # ga-10uqmi: the attempt(s) above were git-level SUCCESSES (rebase or
+        # merge completed, a commit exists) but rebase_content_verdict()
+        # (ga-m07gc) proved the resulting tree does NOT match a real 3-way
+        # merge — content was silently altered/lost even though the commit
+        # survived. Re-running the identical rebase/merge reproduces the
+        # identical wrong tree every time: this is a DETERMINISTIC failure,
+        # never "transient". The old code below classified it "transient"
+        # unconditionally, which fed it into the bounded-retry/exile
+        # machinery — whose only exile-clearing check
+        # (gate_exile_recovery_sweep, ga-0ye7ar) is the coarser
+        # rig_merge_has_conflict TEXTUAL check. That check is, by
+        # construction, already "0" for any branch that reaches a content
+        # mismatch at all (the absence of a textual conflict is exactly
+        # what makes the mismatch possible/surprising in the first place),
+        # so the two safety valves compounded into a resonance loop that
+        # never converged and never reached a human (measured symptom:
+        # gate:rebase-fail-count oscillating 1/3 -> 2/3 -> 1/3 -> 2/3,
+        # never reaching 3/3). Deliberately checking "= no" rather than
+        # "!= yes" here (ga-pgxs78): rebase_content_verdict() also returns
+        # an explicit "unknown" when it could not verify — that must fall
+        # through to the ordinary transient/plumbing path below, exactly
+        # like a plain unset verdict, never be treated as a confirmed
+        # mismatch.
+        #
+        # Route it exactly like a genuine textual conflict
+        # (CONFLICT_KIND="merge") instead — both already mean
+        # "deterministic, retrying is pointless, needs a human or a fresh
+        # rebuild" and share the SAME, already-proven disposition below:
+        # immediate gate-status:needs-rebase, no attempt counter, no
+        # tier5 exile (so gate_exile_recovery_sweep's textual-only check
+        # never gets a chance to wrongly reinstate this class of failure —
+        # it no longer enters the exiled-tier5/rebase-fail-count label
+        # state at all).
+        CONFLICT_KIND="merge"
+        CONFLICT_FILES="auto-rebase/merge produced a tree that does not match a real 3-way merge (ga-m07gc) — content silently diverged though the commit itself survived. Diverging paths: ${_LOST_PATHS:-<none captured>}"
       else
-        CONFLICT_FILES="auto-rebase failed (worktree/push error) — no stderr captured"
+        CONFLICT_KIND="transient"   # ga-q3ig2: plumbing failure, not a real conflict — retry is worthwhile.
+        if [ -n "$AUTO_REBASE_PUSH_ERR" ]; then
+          CONFLICT_FILES="auto-rebase push failed (exit=${AUTO_REBASE_PUSH_RC:-?}): $AUTO_REBASE_PUSH_ERR"
+        elif [ -n "${AUTO_MERGE_FALLBACK_ERR:-}" ]; then
+          # ga-byfbd (DEFEITO 2): the merge fallback (ga-qukyp) was tried and
+          # ALSO failed — genuinely unexpected, since merge-tree already
+          # proved this pair clean. Show both diagnostics: the rebase's own
+          # (which is what triggered the fallback in the first place — may be
+          # empty if git wrote nothing to stderr there) and the fallback's own.
+          CONFLICT_FILES="auto-rebase failed (${AUTO_REBASE_SETUP_ERR:-no stderr captured}); merge fallback (ga-byfbd/ga-qukyp) also failed: $AUTO_MERGE_FALLBACK_ERR"
+        elif [ -n "${AUTO_REBASE_SETUP_ERR:-}" ]; then
+          # ga-byfbd (DEFEITO 1): rebase/worktree-add's own captured stderr —
+          # reached when the merge fallback was never attempted (e.g.
+          # worktree-add itself failed, before any rebase was even tried).
+          CONFLICT_FILES="auto-rebase failed: $AUTO_REBASE_SETUP_ERR"
+        else
+          CONFLICT_FILES="auto-rebase failed (worktree/push error) — no stderr captured"
+        fi
       fi
     fi
+    # SELFTEST-EXTRACT gate-10uqmi-rebase-fail-classify: END
   fi
 
   if [ "$BRANCH_IS_CURRENT" != "1" ]; then
