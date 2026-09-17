@@ -4840,6 +4840,12 @@ fi
 # the quota-stop comment above), so a "hold" set while finalizing a PRIOR
 # bead this sweep must never leak into THIS bead's stamp.
 GATE_SHA_FAIL_CLASS="code"
+# ga-39l9z2: sibling reset, same leak-across-beads reasoning as
+# GATE_SHA_FAIL_CLASS above. Set to 1 only at the one site (the merge-time
+# textual-conflict downgrade below) where the reviewers already approved
+# this exact content and the ONLY outstanding work is a rebase — see that
+# site's own comment for why it is scoped narrower than "hold" in general.
+GATE_NEEDS_REBASE_NOT_FIX="0"
 
 # ── ga-nooaw: FAIL-CLOSED BY SHA ─────────────────────────────────────────────
 # A prior, independent gate-run may already have rejected this EXACT commit
@@ -5615,6 +5621,24 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       # merge-time-conflict/rebase, branch-content-mismatch) is a git/infra outcome — the code itself
       # already PASSED review; nothing here judged the fix's content. Applies to the whole block
       # regardless of which sub-reason below fires.
+      if [ "$MERGE_RESULT" = "failed_merge_time_conflict" ]; then
+        # ga-39l9z2 (wa-dnzu0): a PURE textual conflict, detected by
+        # rig_merge_has_conflict BEFORE any rebase/merge was even attempted —
+        # no content-loss risk to weigh (nothing was written). This is the
+        # narrowest, safest member of the failed_* group above: the reviewers
+        # approved this content, main simply moved, and the only outstanding
+        # work is a mechanical rebase. Downstream (the fix-attempt-cap block)
+        # must not spend one of GATE_FIX_CAP's limited slots on it, or 3
+        # unlucky merge-time races exhaust the cap and escalate needs-human on
+        # code nobody ever asked to change (this is exactly what happened to
+        # wa-dnzu0: attempt 3/3 from a rebase race, zero review rejections).
+        # Deliberately NOT extended to failed_merge_time_rebase — that result
+        # is reached only AFTER an attempted rebase/merge failed, including
+        # the ga-m07gc content-verification refusal, which can itself signal
+        # a real problem worth a human's eyes after repeated failures; it
+        # keeps the existing cap-then-escalate path unchanged.
+        GATE_NEEDS_REBASE_NOT_FIX=1
+      fi
       if [ "$MERGE_RESULT" = "failed_branch_content_mismatch" ]; then
         # ga-pfgnv: same diagnostic spirit as Step 10's ga-y9a1d check (a
         # human needs to know this is a content-mismatch, not a generic git
@@ -6645,7 +6669,100 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       bd -C "$BEAD_CITY" label add "$BEAD_ID" "$(gate_sha_fail_label "$BRANCH_SHA" "${GATE_SHA_FAIL_CLASS:-code}")" -q 2>/dev/null || true
     fi
 
-    if [ "$PREV_ATTEMPT" -ge "$GATE_FIX_CAP" ]; then
+    if [ "$GATE_NEEDS_REBASE_NOT_FIX" = "1" ]; then
+      # (a2) MERGE-MECHANICAL FAILURE AFTER ALL-PASS — needs a rebase, not a
+      # fix. ga-39l9z2 (wa-dnzu0): this used to fall into the SAME
+      # PREV_ATTEMPT/cap machinery as a genuine review rejection below,
+      # silently consuming a gate:fix-attempt slot for work whose content the
+      # reviewers already approved (GATE_SHA_FAIL_CLASS=hold, ga-4cy2t,
+      # confirms this) — 3 unlucky merge-time races could exhaust
+      # GATE_FIX_CAP and escalate needs-human on code nobody ever asked to be
+      # rewritten. This branch never touches gate:fix-attempt:*; it labels
+      # gate:needs-rebase instead of gate:needs-fix, mirroring the existing
+      # pre-review pool-return convention (ga-tz0op, same file, search
+      # "REBASE_AUTHOR_IS_POOL") rather than inventing a new one.
+      log "Marking $BEAD_ID gate:needs-rebase (merge-mechanical failure after ALL-PASS, ga-39l9z2) — NOT counted as a fix attempt."
+      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing"    -q 2>/dev/null || true  # wa-qq33j: clear in-review state
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"  -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatching" -q 2>/dev/null || true
+
+      # ga-jyox/ga-ipf6: same live-named-crew-author check the needs-fix path
+      # uses below — a merge-time conflict races a still-live author's
+      # session exactly as much as a genuine review FAIL does; "the failure
+      # was mechanical" does not make a stranger dispatch on top of a live
+      # session any safer.
+      REBASE_FAIL_AUTHOR_ALIVE=$(author_is_alive "$AUTHOR")
+      _NR_RESOLVED_AUTHOR=$(resolve_recycled_author "$AUTHOR" "$AUTHOR_AGENT" "$REBASE_FAIL_AUTHOR_ALIVE")
+      if [ "$_NR_RESOLVED_AUTHOR" != "$AUTHOR" ]; then
+        AUTHOR="$_NR_RESOLVED_AUTHOR"
+        REBASE_FAIL_AUTHOR_ALIVE=1
+      fi
+      GATE_NR_ASSIGNEE_ACTION=$(gate_fail_assignee_action "$AUTHOR" "$REBASE_FAIL_AUTHOR_ALIVE")
+
+      if [ "$GATE_NR_ASSIGNEE_ACTION" = "keep" ]; then
+        log "Author $AUTHOR is a live named-crew session — keeping assignee + story:in-flight (ga-jyox) for the needs-rebase bounce too; nudging instead of pool-returning."
+        bd -C "$BEAD_CITY" assign "$BEAD_ID" "$AUTHOR" 2>/dev/null || true
+        bd -C "$BEAD_CITY" label add    "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" update       "$BEAD_ID" --unset-metadata gc.routed_to -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:queued" -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (merge-mechanical, ga-39l9z2) — labeled gate:needs-rebase; NOT counted as a gate:fix-attempt, since the reviewers already approved this content ($GATE_SHA_FAIL_CLASS class=hold). Author $AUTHOR is a LIVE crew session, so assignee + story:in-flight were kept; rebase onto current main and re-run /gate-done (no code changes needed)." 2>/dev/null || true
+        nudge_author_with_fallback "$BEAD_ID" "$NOTIFY_AUTHOR" "$AUTHOR" \
+          "Gate merge-conflict for $BEAD_ID (branch $BRANCH) — your reviewed code is fine, but it needs a rebase onto current main. Your assignee was kept; rebase and re-run /gate-done." \
+          "Gate needs-rebase live-crew nudge for $BEAD_ID (branch $BRANCH)" || true
+      else
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
+        _NR_CLEAR_RC=0
+        gate_clear_assignee_if_holder "$BEAD_ID" "$BEAD_CITY" || _NR_CLEAR_RC=$?
+        _NR_ROUTE=$(default_pool_route_for_rig "$RIG")
+        bd -C "$BEAD_CITY" update "$BEAD_ID" --set-metadata "gc.routed_to=$_NR_ROUTE" -q 2>/dev/null || true
+        # ga-39l9z2: same "verify, don't assume" discipline as the needs-fix
+        # pool-return arm below (ga-p5q3/ga-f54ui) — a post-write read
+        # failure is its own third state, never collapsed into "it failed".
+        # status/gate:queued are gated on a CONFIRMED-empty assignee: forcing
+        # them on a bead a DIFFERENT actor just claimed would fabricate
+        # assigned+in_progress+"open" simultaneously.
+        _NR_VERIFY_JSON=""
+        _NR_VERIFY_READ_OK=1
+        _NR_VERIFY_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _NR_VERIFY_READ_OK=0
+        [ -n "$_NR_VERIFY_JSON" ] || _NR_VERIFY_READ_OK=0
+        if [ "$_NR_VERIFY_READ_OK" = "0" ]; then
+          _NR_ROUTE_OBS="gc.routed_to=UNVERIFIED (post-write read failed — state unknown, NOT a claim the restore failed)"
+          _NR_ASSIGNEE_OBS="assignee=UNVERIFIED (post-write read failed)"
+          _NR_STATUS_OBS="status=UNVERIFIED (post-write read failed — left untouched)"
+          _NR_QUEUED_OBS="gate:queued=UNVERIFIED (post-write read failed — left untouched)"
+        else
+          _NR_ROUTE_OBSERVED=$(printf '%s' "$_NR_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .metadata["gc.routed_to"] // ""' 2>/dev/null || echo "")
+          if [ "$_NR_ROUTE_OBSERVED" = "$_NR_ROUTE" ]; then
+            _NR_ROUTE_OBS="gc.routed_to=$_NR_ROUTE (restored)"
+          else
+            _NR_ROUTE_OBS="gc.routed_to='${_NR_ROUTE_OBSERVED}' NOT $_NR_ROUTE — restore did not stick, needs investigation"
+          fi
+          _NR_ASSIGNEE_OBSERVED=$(printf '%s' "$_NR_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
+          if [ -z "$_NR_ASSIGNEE_OBSERVED" ]; then
+            _NR_ASSIGNEE_OBS="assignee=cleared"
+            # Confirmed nobody else holds the bead — safe to also reopen it
+            # and drop gate:queued (no live marker behind it once this run
+            # goes terminal-FAILED below; the pool probe's
+            # --exclude-label gate:queued otherwise hides this bead from
+            # every worker forever — wa-dnzu0's actual symptom).
+            bd -C "$BEAD_CITY" update       "$BEAD_ID" --status open -q 2>/dev/null || true
+            bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:queued"  -q 2>/dev/null || true
+            _NR_STATUS_OBS="status=open"
+            _NR_QUEUED_OBS="gate:queued=removed"
+          elif [ "$_NR_CLEAR_RC" = "13" ]; then
+            _NR_ASSIGNEE_OBS="assignee='${_NR_ASSIGNEE_OBSERVED}' NOT cleared — a different actor claimed it before the clear could apply (expected race, ga-yd8t6)"
+            _NR_STATUS_OBS="status=left untouched (assignee now held by a different actor)"
+            _NR_QUEUED_OBS="gate:queued=left untouched (assignee now held by a different actor)"
+          else
+            _NR_ASSIGNEE_OBS="assignee='${_NR_ASSIGNEE_OBSERVED}' NOT cleared — needs investigation (ga-yd8t6, rc=$_NR_CLEAR_RC)"
+            _NR_STATUS_OBS="status=left untouched (clear unverified)"
+            _NR_QUEUED_OBS="gate:queued=left untouched (clear unverified)"
+          fi
+        fi
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (merge-mechanical, ga-39l9z2) — labeled gate:needs-rebase; NOT counted as a gate:fix-attempt, since the reviewers already approved this content ($GATE_SHA_FAIL_CLASS class=hold). story:in-flight + gate:reviewing cleared. gc.routed_to restored to $_NR_ROUTE so pool workers can self-serve this bead — verified post-write, not assumed: $_NR_ROUTE_OBS; $_NR_ASSIGNEE_OBS; $_NR_STATUS_OBS; $_NR_QUEUED_OBS. Rebase onto current main and re-run /gate-done (no code changes needed)." 2>/dev/null || true
+      fi
+    elif [ "$PREV_ATTEMPT" -ge "$GATE_FIX_CAP" ]; then
       # (c) RETRY CAP REACHED — stop auto-retry, escalate to the Mayor ONCE.
       log "Gate fix-attempt cap reached for $BEAD_ID (prev=$PREV_ATTEMPT >= $GATE_FIX_CAP). Escalating; no further auto-retry."
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:needs-fix"   -q 2>/dev/null || true
@@ -6857,6 +6974,8 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         if [ "$_GFAIL_ROUTE_VERIFY_READ_OK" = "0" ]; then
           _GFAIL_ROUTE_OBS="gc.routed_to=UNVERIFIED (post-write read failed — state unknown, NOT a claim the restore failed)"
           _GFAIL_ASSIGNEE_OBS="assignee=UNVERIFIED (post-write read failed — state unknown, NOT a claim the clear failed)"
+          _GFAIL_STATUS_OBS="status=UNVERIFIED (post-write read failed — left untouched)"
+          _GFAIL_QUEUED_OBS="gate:queued=UNVERIFIED (post-write read failed — left untouched)"
         else
           _GFAIL_ROUTE_OBSERVED=$(printf '%s' "$_GFAIL_ROUTE_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .metadata["gc.routed_to"] // ""' 2>/dev/null || echo "")
           if [ "$_GFAIL_ROUTE_OBSERVED" = "$_GFAIL_ROUTE" ]; then
@@ -6867,13 +6986,33 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
           _GFAIL_ASSIGNEE_OBSERVED=$(printf '%s' "$_GFAIL_ROUTE_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
           if [ -z "$_GFAIL_ASSIGNEE_OBSERVED" ]; then
             _GFAIL_ASSIGNEE_OBS="assignee=cleared"
+            # ga-39l9z2 (wa-dnzu0): confirmed nobody else holds the bead —
+            # safe to also reopen it and drop gate:queued. Before this fix,
+            # this arm restored gc.routed_to (ga-f54ui) but left status at
+            # whatever gate-CLAIM time set it to (in_progress) and left
+            # gate:queued in place — both of which the pool probe's own
+            # filter requires absent/open (`--exclude-label gate:queued`,
+            # status=open), so the bead stayed invisible to every worker
+            # despite gc.routed_to being correctly restored. Gated on a
+            # CONFIRMED-empty assignee for the same reason as the needs-
+            # rebase arm above: forcing these on a bead a DIFFERENT actor
+            # just claimed would fabricate assigned+in_progress+"open"
+            # simultaneously.
+            bd -C "$BEAD_CITY" update       "$BEAD_ID" --status open -q 2>/dev/null || true
+            bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:queued"  -q 2>/dev/null || true
+            _GFAIL_STATUS_OBS="status=open"
+            _GFAIL_QUEUED_OBS="gate:queued=removed"
           elif [ "$_GFAIL_CLEAR_RC" = "13" ]; then
             _GFAIL_ASSIGNEE_OBS="assignee='${_GFAIL_ASSIGNEE_OBSERVED}' NOT cleared — a different actor claimed it before the clear could apply (expected race, ga-yd8t6)"
+            _GFAIL_STATUS_OBS="status=left untouched (assignee now held by a different actor)"
+            _GFAIL_QUEUED_OBS="gate:queued=left untouched (assignee now held by a different actor)"
           else
             _GFAIL_ASSIGNEE_OBS="assignee='${_GFAIL_ASSIGNEE_OBSERVED}' NOT cleared — needs investigation (ga-yd8t6, rc=$_GFAIL_CLEAR_RC)"
+            _GFAIL_STATUS_OBS="status=left untouched (clear unverified)"
+            _GFAIL_QUEUED_OBS="gate:queued=left untouched (clear unverified)"
           fi
         fi
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) cleared. gc.routed_to restored to $_GFAIL_ROUTE so pool workers can self-serve this bead (ga-f54ui) — verified post-write, not assumed: $_GFAIL_ROUTE_OBS; $_GFAIL_ASSIGNEE_OBS. The Pilot will also re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) cleared. gc.routed_to restored to $_GFAIL_ROUTE so pool workers can self-serve this bead (ga-f54ui) — verified post-write, not assumed: $_GFAIL_ROUTE_OBS; $_GFAIL_ASSIGNEE_OBS; $_GFAIL_STATUS_OBS; $_GFAIL_QUEUED_OBS (ga-39l9z2). The Pilot will also re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
       fi
     fi
   fi

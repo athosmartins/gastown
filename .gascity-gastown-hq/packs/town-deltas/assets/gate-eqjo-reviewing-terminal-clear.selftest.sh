@@ -117,11 +117,19 @@ echo "── 4. Regression guard: pre-existing wa-qq33j clear sites are untouche
 # wa-qq33j-tagged (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v) + 2
 # ga-n2cpe-tagged = 13. Confirmed via git blame (ga-dl72u): not a duplicate,
 # a distinct branch of the same if/else as the ga-k2wjn site.
+# ga-39l9z2 (2026-09-17) added a 14th site: a merge-time-conflict-after-ALL-
+# PASS FAIL now takes a NEW branch (GATE_NEEDS_REBASE_NOT_FIX) parallel to
+# the existing needs-fix branch, labeling gate:needs-rebase instead of
+# gate:needs-fix — it likewise leaves the PASS-reviewing state without
+# closing the bead, so it clears gate:reviewing too (tagged wa-qq33j, same
+# convention as every needs-fix/needs-human FAIL site) — 12 wa-qq33j-tagged
+# (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2) + 2 ga-n2cpe-
+# tagged = 14.
 TOTAL_CLEARS=$(grep -cF "$CLEAR_NEEDLE" "$DISPATCHER")
-if [ "$TOTAL_CLEARS" = "13" ]; then
-  ok "total gate:reviewing clear call sites = 13 (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 2 ga-n2cpe) — got $TOTAL_CLEARS"
+if [ "$TOTAL_CLEARS" = "14" ]; then
+  ok "total gate:reviewing clear call sites = 14 (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 2 ga-n2cpe) — got $TOTAL_CLEARS"
 else
-  bad "expected 13 total gate:reviewing clear call sites (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 2 ga-n2cpe), got $TOTAL_CLEARS — either a pre-existing site was lost or the new count drifted"
+  bad "expected 14 total gate:reviewing clear call sites (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 2 ga-n2cpe), got $TOTAL_CLEARS — either a pre-existing site was lost or the new count drifted"
 fi
 
 echo "── 5. MUTATION TEST: stripping the ga-n2cpe clears must flip sections 1-2 to RED ──"

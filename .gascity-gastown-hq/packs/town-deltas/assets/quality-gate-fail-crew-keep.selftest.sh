@@ -163,7 +163,7 @@ if grep -qF 'bd -C "$BEAD_CITY" assign "$BEAD_ID" "$AUTHOR" 2>/dev/null || true'
 else
   bad "needs-fix 'keep' arm missing the re-assign-to-\$AUTHOR call"
 fi
-if grep -qF 'story:in-flight + gate:reviewing (wa-qq33j) cleared. gc.routed_to restored to $_GFAIL_ROUTE so pool workers can self-serve this bead (ga-f54ui) — verified post-write, not assumed: $_GFAIL_ROUTE_OBS; $_GFAIL_ASSIGNEE_OBS.' "$DISPATCHER"; then
+if grep -qF 'story:in-flight + gate:reviewing (wa-qq33j) cleared. gc.routed_to restored to $_GFAIL_ROUTE so pool workers can self-serve this bead (ga-f54ui) — verified post-write, not assumed: $_GFAIL_ROUTE_OBS; $_GFAIL_ASSIGNEE_OBS; $_GFAIL_STATUS_OBS; $_GFAIL_QUEUED_OBS (ga-39l9z2).' "$DISPATCHER"; then
   ok "needs-fix 'clear' arm reports the OBSERVED assignee-clear state (ga-yd8t6) instead of an unconditional 'assignee cleared' assertion"
 else
   bad "needs-fix 'clear' arm no longer reports the observed post-write assignee state — ga-yd8t6 regression"
@@ -288,6 +288,45 @@ else
     ok "'clear' arm's verify step distinguishes UNVERIFIED (read failed) from a confirmed mismatch"
   else
     bad "'clear' arm's verify step collapses read-failure and confirmed-mismatch into the same observation"
+  fi
+  # ga-39l9z2 (wa-dnzu0): restoring gc.routed_to alone is NOT sufficient —
+  # the worker probe ALSO requires status=open and excludes gate:queued
+  # (`bd ready --exclude-label gate:queued`, status checked separately).
+  # Before this fix, this arm left status at whatever gate-CLAIM time set it
+  # to (in_progress) and never removed gate:queued, so a bead could carry a
+  # freshly-restored gc.routed_to and STILL be invisible to every pool
+  # worker — confirmed live on wa-dnzu0 (status=in_progress + stale
+  # gate:queued, zero open markers, invisible to `bd ready` until a human
+  # manually reopened it).
+  if printf '%s' "$CLEAR_ARM" | grep -qF -- '--status open'; then
+    ok "'clear' arm reopens the bead's status once the assignee-clear is confirmed (ga-39l9z2)"
+  else
+    bad "'clear' arm does NOT reopen status — bead stays in_progress and invisible to \`bd ready\` (ga-39l9z2/wa-dnzu0 regression)"
+  fi
+  if printf '%s' "$CLEAR_ARM" | grep -qF 'label remove "$BEAD_ID" "gate:queued"'; then
+    ok "'clear' arm removes the stale gate:queued label once the assignee-clear is confirmed (ga-39l9z2)"
+  else
+    bad "'clear' arm does NOT remove gate:queued — worker probe's --exclude-label gate:queued hides the bead forever (ga-39l9z2/wa-dnzu0 regression)"
+  fi
+  # Ordering/gating guard: the status-open + gate:queued-remove writes must
+  # sit in the CONFIRMED-empty-assignee branch specifically, not unconditionally
+  # — else a bead a different actor just claimed gets corrupted into
+  # assigned+in_progress+"open" simultaneously (same hazard section 11's own
+  # UNVERIFIED-vs-mismatch check protects against, one level further). Uses
+  # line-number bracketing rather than a hand-rolled awk boundary regex (a
+  # prior draft of this exact check had an unescaped '[' in its own 'elif'
+  # anchor and silently never matched — line numbers are simpler to get
+  # right and easier to verify by eye).
+  CLEARED_LN=$(printf '%s' "$CLEAR_ARM" | grep -nF '_GFAIL_ASSIGNEE_OBS="assignee=cleared"' | head -1 | cut -d: -f1 || true)
+  ELIF_LN=$(printf '%s' "$CLEAR_ARM" | grep -nF 'elif [ "$_GFAIL_CLEAR_RC" = "13" ]' | head -1 | cut -d: -f1 || true)
+  STATUS_OPEN_LN=$(printf '%s' "$CLEAR_ARM" | grep -nF -- '--status open' | head -1 | cut -d: -f1 || true)
+  QUEUED_RM_LN=$(printf '%s' "$CLEAR_ARM" | grep -nF 'label remove "$BEAD_ID" "gate:queued"' | head -1 | cut -d: -f1 || true)
+  if [ -n "$CLEARED_LN" ] && [ -n "$ELIF_LN" ] && [ -n "$STATUS_OPEN_LN" ] && [ -n "$QUEUED_RM_LN" ] \
+     && [ "$STATUS_OPEN_LN" -gt "$CLEARED_LN" ] && [ "$STATUS_OPEN_LN" -lt "$ELIF_LN" ] \
+     && [ "$QUEUED_RM_LN" -gt "$CLEARED_LN" ] && [ "$QUEUED_RM_LN" -lt "$ELIF_LN" ]; then
+    ok "status-open + gate:queued-remove sit between 'assignee=cleared' (line $CLEARED_LN) and the next elif (line $ELIF_LN) — gated on confirmed-empty-assignee, not unconditional (ga-39l9z2)"
+  else
+    bad "status-open + gate:queued-remove are NOT scoped to the confirmed-empty-assignee branch (cleared=$CLEARED_LN status=$STATUS_OPEN_LN queued=$QUEUED_RM_LN elif=$ELIF_LN) — risk of corrupting a bead a different actor just claimed"
   fi
 fi
 # Negative control: the needs-human (cap-exhausted) branch must remain
