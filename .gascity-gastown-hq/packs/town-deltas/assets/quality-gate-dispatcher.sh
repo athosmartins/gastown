@@ -933,8 +933,21 @@ classify_sibling_run() {
 # data loss, per this function's own docstring above). "unknown" is
 # gate-done.md's own placeholder for an unresolved rig, not a confirmed
 # identity, so it is never treated as a match on either side.
+#
+# ga-l7mvtw: a THIRD output, "SHA_STALE <id>", fires when the caller passes
+# its own current branch_sha (3rd arg) and the candidate's OWN recorded
+# branch_sha differs from it — i.e. the branch has moved on since that
+# sibling started, regardless of how young the sibling is by wall-clock age.
+# Callers treat it exactly like STALE (supersede and proceed): a live-but-
+# reviewing-an-abandoned-commit sibling is exactly as moot as an old dead
+# one (wa-54f62: a young "LIVE" sibling kept a fixed, newer marker waiting
+# 13 minutes behind a review of a commit its own author had already
+# abandoned). The comparison only runs when BOTH shas are known — an older
+# sibling bead predating this field, or a caller that could not resolve its
+# own current sha, falls through to the pre-existing age-only classification
+# unchanged.
 live_sibling_run_for_branch() {
-  local branch="$1" rig="$2" now_epoch run_json count i id status desc started started_epoch age_min verdict run_rig
+  local branch="$1" rig="$2" current_sha="${3:-}" now_epoch run_json count i id status desc started started_epoch age_min verdict run_rig sib_sha
   [ -z "$branch" ] && return 0
   case "$rig" in ''|unknown) return 0 ;; esac
   now_epoch=$(date +%s)
@@ -966,6 +979,15 @@ live_sibling_run_for_branch() {
     run_rig=$(printf '%s\n' "$desc" | grep -E '^rig:' | head -1 | sed 's/^rig: *//' || true)
     case "$run_rig" in ''|unknown) continue ;; esac
     [ "$run_rig" = "$rig" ] || continue
+    # ga-l7mvtw: a sibling reviewing a DIFFERENT commit than the branch's
+    # CURRENT tip is reviewing code the author already superseded — moot
+    # regardless of age. See this function's header for the full rationale.
+    if [ -n "$current_sha" ]; then
+      sib_sha=$(printf '%s\n' "$desc" | grep -E '^branch_sha:' | head -1 | sed 's/^branch_sha: *//' || true)
+      if [ -n "$sib_sha" ] && [ "$sib_sha" != "$current_sha" ]; then
+        echo "SHA_STALE $id"; return 0
+      fi
+    fi
     started=$(printf '%s\n' "$desc" | grep -E '^started_at:' | head -1 | sed 's/^started_at: *//' || true)
     if [ -z "$started" ]; then echo "LIVE $id"; return 0; fi   # no ts → conservative LIVE
     started_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "${started%%Z*}" "+%s" 2>/dev/null \
@@ -1130,6 +1152,46 @@ gate_bead_has_prior_sha_fail() {
   labels=$(bd -C "$city" show "$bead" --json 2>/dev/null \
     | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || echo "")
   gate_labels_have_sha_fail "$labels" "$sha"
+}
+
+# ── ga-l7mvtw: stale-reviewed-SHA fix-attempt guard ───────────────────────────
+# Production observed a marker get claimed and spend a full ~14-minute
+# reviewer run reviewing a commit an EARLIER, independent gate-run had
+# already rejected (wa-54f62: marker ga-ccrjxk / gate-run ga-i6pcpc reviewed
+# 4e30a7cbc after a prior run had already stamped it gate-sha-failed — the
+# author had since pushed the real fix, 3c40bc245, under a NEW marker left
+# waiting behind the stale one). The claim-time check (dispatcher Step 4b)
+# stops that exact case from being spawned at all. This pure decision is the
+# FINALIZE-time backstop for the narrower remaining race: a run whose
+# reviewed SHA had no stamp yet when claimed (nothing to catch it at claim
+# time) but the branch moved on WHILE the review was in flight. Either way, a
+# FAIL verdict against a commit the author already superseded must never
+# count against gate:fix-attempt.
+#
+# gate_sha_stale_action <reviewed_sha> <current_tip> — PURE (no IO, set -e
+# safe), unit-tested by gate-stale-sha-fix-attempt.selftest.sh.
+#   stale   — both known and DIFFERENT: the branch has moved past the commit
+#             this run reviewed. The finalize fix-attempt block skips the
+#             bump for this run (ga-l7mvtw).
+#   current — both known and EQUAL: this run reviewed the branch's actual
+#             tip. Proceed with the normal fix-attempt bump.
+#   unknown — either side is empty (current tip unresolved — fetch/rig
+#             failure, or a pre-ga-l7mvtw run bead with no recorded sha):
+#             cannot PROVE staleness, so default to the SAME handling as
+#             "current" — same error-vs-empty doctrine as
+#             gate_bead_has_prior_sha_fail above. A false "stale" would let
+#             a genuine FAIL dodge the attempt cap forever (unsafe); a false
+#             "current" only costs one ordinary retry cycle (the safe
+#             direction to err in).
+gate_sha_stale_action() {
+  local reviewed="$1" current="$2"
+  if [ -z "$reviewed" ] || [ -z "$current" ]; then
+    echo "unknown"; return 0
+  fi
+  if [ "$reviewed" != "$current" ]; then
+    echo "stale"; return 0
+  fi
+  echo "current"
 }
 
 # ── ga-lxz5w: SAME-BEAD SIBLING-BRANCH + LATE-HOLD pre-merge checks ───────────
@@ -6728,6 +6790,22 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
   if [ -n "$BEAD_ID" ] && [ "$DRY_RUN" != "1" ]; then
     GATE_FIX_CAP=3
 
+    # ga-l7mvtw: has the branch moved past the commit THIS run reviewed?
+    # Fresh fetch+resolve — Phase C can finalize in a LATER process/sweep
+    # than the one that claimed this run and spawned reviewers, so a
+    # variable set at claim time cannot be trusted here; re-derive live.
+    # See gate_sha_stale_action's header (above the lib-only guard) for the
+    # full rationale. FAIL-OPEN: an unresolved current tip degrades to
+    # "unknown", which gate_sha_stale_action treats as "current" (bump
+    # normally) — never silently treated as "stale" (which would let a
+    # genuine FAIL dodge the attempt cap).
+    _GATE_L7MVTW_CURRENT_TIP=""
+    if [ -n "$BRANCH" ]; then
+      git_rig fetch origin "$BRANCH" --quiet 2>/dev/null || true
+      _GATE_L7MVTW_CURRENT_TIP=$(rig_resolve_commit "origin/$BRANCH" 2>/dev/null || echo "")
+    fi
+    GATE_SHA_STALE_ACTION=$(gate_sha_stale_action "$BRANCH_SHA" "$_GATE_L7MVTW_CURRENT_TIP")
+
     # Read the source bead's current labels (story beads live in the HQ/city DB).
     # ga-h199q: routed through the read-cache shim — first read in the FAIL
     # self-healing block (no prior write to THIS bead in this invocation to
@@ -6901,6 +6979,18 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         fi
         bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (merge-mechanical, ga-39l9z2) — labeled gate:needs-rebase; NOT counted as a gate:fix-attempt, since the reviewers already approved this content (GATE_SHA_FAIL_CLASS=$GATE_SHA_FAIL_CLASS). story:in-flight + gate:reviewing cleared. gc.routed_to restored to $_NR_ROUTE so pool workers can self-serve this bead — verified post-write, not assumed: $_NR_ROUTE_OBS; $_NR_ASSIGNEE_OBS; $_NR_STATUS_OBS; $_NR_QUEUED_OBS. Rebase onto current main and re-run /gate-done (no code changes needed)." 2>/dev/null || true
       fi
+    elif [ "$GATE_SHA_STALE_ACTION" = "stale" ]; then
+      # (d) STALE REVIEW (ga-l7mvtw) — the branch has moved past the commit
+      # this run reviewed; the FAIL above is about code the author already
+      # superseded. Do NOT bump gate:fix-attempt and do NOT touch the
+      # cap/needs-human circuit-breaker over it — charging an attempt here
+      # would blame a review that never looked at the current code
+      # (wa-54f62 incident). Deliberately minimal footprint: a concurrent
+      # run for the newer commit may already own this bead's in-flight
+      # state (gate:reviewing/pilot:*/assignee), so nothing beyond this
+      # comment is touched here to avoid racing it.
+      log "Gate FAIL for $BEAD_ID reviewed a stale commit ($BRANCH_SHA != current tip ${_GATE_L7MVTW_CURRENT_TIP:-unknown}) — NOT bumping gate:fix-attempt (ga-l7mvtw, prev=$PREV_ATTEMPT unchanged)."
+      bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-l7mvtw: this gate run reviewed $BRANCH_SHA, but branch $BRANCH has since moved to ${_GATE_L7MVTW_CURRENT_TIP:-a newer commit} — treating the FAIL above as a review of already-superseded code. gate:fix-attempt left unchanged (still $PREV_ATTEMPT). If you haven't already, resubmit with /gate-done so the current commit gets reviewed." 2>/dev/null || true
     elif [ "$PREV_ATTEMPT" -ge "$GATE_FIX_CAP" ]; then
       # (c) RETRY CAP REACHED — stop auto-retry, escalate to the Mayor ONCE.
       log "Gate fix-attempt cap reached for $BEAD_ID (prev=$PREV_ATTEMPT >= $GATE_FIX_CAP). Escalating; no further auto-retry."
@@ -10276,6 +10366,50 @@ fi
 
 log "  Branch $BRANCH not yet merged into $DEFAULT_BRANCH — proceeding with review."
 
+# ── ga-l7mvtw: stale-SHA claim guard — refuse to spawn a reviewer for a
+# commit an EARLIER, independent gate-run already rejected ───────────────────
+# Incident (wa-54f62): an OLD marker got claimed after its branch_sha had
+# already earned a gate-sha-failed(code) stamp from an earlier, independent
+# gate-run (the author had since pushed a real fix under a NEW sha). The
+# dispatcher spun up a reviewer anyway (~14 wasted minutes), then relied on
+# the ga-nooaw fail-closed-by-SHA check (above, at finalize time) to
+# downgrade the inevitable PASS back to FAIL — by which point a fix-attempt
+# slot was already spent on a round that never looked at the actual fix.
+# Catching this HERE, before any reviewer is spawned and before the sibling
+# guard just below even runs, means a stale-SHA marker costs nothing: no
+# reviewer, no fix-attempt spent — and critically, no live sibling run left
+# for a NEWER marker on this same branch to yield to (see the sibling
+# guard's own YIELD case, exactly what starved ga-jjnnno in the incident).
+# SELFTEST-EXTRACT stale-sha-claim-guard: BEGIN
+if [ -n "$BEAD_ID" ] && [ -n "$BRANCH_SHA" ] \
+   && [ "$(gate_bead_has_prior_sha_fail "$BEAD_CITY" "$BEAD_ID" "$BRANCH_SHA")" = "yes" ]; then
+  warn "ga-l7mvtw: branch $BRANCH tip $BRANCH_SHA on marker $MARKER_ID already carries a gate-sha-failed(code) stamp on $BEAD_ID from an earlier, independent gate-run — refusing to spend a reviewer re-reviewing a commit already rejected. NOT spawning a reviewer; NOT touching gate:fix-attempt (that slot was already spent by the run that produced the original FAIL)."
+  set_gate_status "$MARKER_ID" "superseded"
+  bd -C "$GC_CITY" comment "$MARKER_ID" "Gate marker skipped (ga-l7mvtw): branch $BRANCH tip $BRANCH_SHA already carries a recorded gate-sha-failed(code) stamp on $BEAD_ID from an earlier, independent gate-run. No reviewer spawned; gate:fix-attempt untouched." 2>/dev/null || true
+  bd -C "$GC_CITY" close "$MARKER_ID" -r "Gate marker terminal: STALE-SHA (ga-l7mvtw) — branch $BRANCH tip $BRANCH_SHA already has a recorded gate-sha-failed(code) stamp on $BEAD_ID from an earlier gate-run. No reviewer spawned; fix-attempt untouched. Closed by dispatcher." 2>/dev/null || true
+  bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-l7mvtw: marker $MARKER_ID named a stale commit ($BRANCH_SHA) that an earlier, independent gate-run already rejected (gate-sha-failed:$BRANCH_SHA:code). Skipped without spending a reviewer or a fix-attempt. If you've already pushed a fix under a new commit, a fresh marker for that new SHA will be reviewed normally; if not, push your fix and resubmit with /gate-done." 2>/dev/null || true
+  if [ -n "$AUTHOR" ]; then
+    gc --city "$GC_CITY" mail send "$AUTHOR" \
+      -s "Gate: stale marker skipped, $BRANCH already has a FAIL on $BRANCH_SHA ($BEAD_ID)" \
+      -m "A queued gate marker for $BRANCH (bead $BEAD_ID) named commit $BRANCH_SHA, which an earlier, independent gate-run already rejected (gate-sha-failed:$BRANCH_SHA:code). The dispatcher skipped it without spending a reviewer or a fix-attempt (ga-l7mvtw). If you already pushed a fix under a new commit, no action needed — a fresh marker will be reviewed normally. If not, push your fix and resubmit with /gate-done." \
+      2>/dev/null || warn "Could not mail author $AUTHOR for stale-SHA marker $MARKER_ID"
+  fi
+  mkdir -p "$(dirname "$QG_LOG")"
+  jq -c -n \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg branch "$BRANCH" \
+    --arg bead "$BEAD_ID" \
+    --arg rig "${RIG:-unknown}" \
+    --arg marker "$MARKER_ID" \
+    --arg sha "$BRANCH_SHA" \
+    '{ts: $ts, event: "dispatcher_superseded", branch: $branch, bead: $bead, rig: $rig, marker: $marker, sha: $sha, reason: "stale_sha_already_failed"}' \
+    >> "$QG_LOG" 2>/dev/null || true
+  log "SUPPRESSED PUSH (wa-uthi non-terminal): stale-SHA marker skipped, no new outcome for the bead."
+  log "=== Dispatcher sweep complete: branch=$BRANCH verdict=SKIPPED (stale sha $BRANCH_SHA already gate-sha-failed) ==="
+  exit 0
+fi
+# SELFTEST-EXTRACT stale-sha-claim-guard: END
+
 # ── Step 4b-1 (ga-991au round 2): live-sibling-run guard, HOISTED before any
 # rebase/force-push ───────────────────────────────────────────────────────────
 # Originally this check ran only at Step 5b, AFTER Step 4c's auto-rebase — which
@@ -10296,7 +10430,7 @@ log "  Branch $BRANCH not yet merged into $DEFAULT_BRANCH — proceeding with re
 # caught before reviewers are spawned, just not before THIS marker's own
 # rebase/force-push (a narrower, rarer window than the one this hoist closes).
 if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
-  SIBLING_VERDICT=$(live_sibling_run_for_branch "$BRANCH" "$RIG" || echo "")
+  SIBLING_VERDICT=$(live_sibling_run_for_branch "$BRANCH" "$RIG" "$BRANCH_SHA" || echo "")
   case "$SIBLING_VERDICT" in
     "LIVE "*)
       SIBLING_RUN_ID="${SIBLING_VERDICT#LIVE }"
@@ -10315,6 +10449,13 @@ if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
       # stayed in gate-status:dispatching just above, and Step 0b only selects
       # gate-status:queued — so the next round cannot pick it again.
       gate_continue_or_exit "live-sibling-pre-rebase"
+      ;;
+    "SHA_STALE "*)
+      SIBLING_RUN_ID="${SIBLING_VERDICT#SHA_STALE }"
+      warn "Sibling gate-run $SIBLING_RUN_ID for branch $BRANCH is reviewing a commit the branch has since moved past (branch tip is now $BRANCH_SHA) — superseding it (ga-l7mvtw) and proceeding with a fresh run instead of yielding."
+      set_gate_status "$SIBLING_RUN_ID" "superseded" 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$SIBLING_RUN_ID" "Dispatcher: superseded — reviewing a commit branch $BRANCH has since moved past (tip is now $BRANCH_SHA). A fresh gate-run takes over (ga-l7mvtw live-sibling SHA guard, pre-rebase check)." 2>/dev/null || true
+      bd -C "$GC_CITY" close "$SIBLING_RUN_ID" -r "gate-run superseded (reviewing outdated commit; branch moved to $BRANCH_SHA) — fresh run for branch $BRANCH takes over. (ga-l7mvtw)" 2>/dev/null || true
       ;;
     "STALE "*)
       SIBLING_RUN_ID="${SIBLING_VERDICT#STALE }"
@@ -12081,7 +12222,7 @@ log "Tier: $TIER  required_reviewers: $REQUIRED_REVIEWERS"
 # where a sibling run starts DURING Step 4c/Step 5 (auto-rebase, tier
 # classification) — rare, but a real gap the early check alone cannot close.
 if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
-  SIBLING_VERDICT=$(live_sibling_run_for_branch "$BRANCH" "$RIG" || echo "")
+  SIBLING_VERDICT=$(live_sibling_run_for_branch "$BRANCH" "$RIG" "$BRANCH_SHA" || echo "")
   case "$SIBLING_VERDICT" in
     "LIVE "*)
       SIBLING_RUN_ID="${SIBLING_VERDICT#LIVE }"
@@ -12100,6 +12241,13 @@ if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
       # stayed in gate-status:dispatching just above, and Step 0b only selects
       # gate-status:queued — so the next round cannot pick it again.
       gate_continue_or_exit "live-sibling"
+      ;;
+    "SHA_STALE "*)
+      SIBLING_RUN_ID="${SIBLING_VERDICT#SHA_STALE }"
+      warn "Sibling gate-run $SIBLING_RUN_ID for branch $BRANCH is reviewing a commit the branch has since moved past (branch tip is now $BRANCH_SHA) — superseding it (ga-l7mvtw) and proceeding with a fresh run instead of yielding."
+      set_gate_status "$SIBLING_RUN_ID" "superseded" 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$SIBLING_RUN_ID" "Dispatcher: superseded — reviewing a commit branch $BRANCH has since moved past (tip is now $BRANCH_SHA). A fresh gate-run takes over (ga-l7mvtw live-sibling SHA guard)." 2>/dev/null || true
+      bd -C "$GC_CITY" close "$SIBLING_RUN_ID" -r "gate-run superseded (reviewing outdated commit; branch moved to $BRANCH_SHA) — fresh run for branch $BRANCH takes over. (ga-l7mvtw)" 2>/dev/null || true
       ;;
     "STALE "*)
       SIBLING_RUN_ID="${SIBLING_VERDICT#STALE }"
