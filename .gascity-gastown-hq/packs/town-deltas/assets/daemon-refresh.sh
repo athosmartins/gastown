@@ -522,6 +522,24 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   echo "GUARDED=${GUARDED:-}"
   echo "ALREADY_FRESH=${ALREADY_FRESH:-}"
   echo "WOULD_RESTART=${WOULD_RESTART:-}"
+  # (wa-th4b1) subset of GUARDED (never a superset — GUARDED itself is
+  # unchanged by this ranking) confirmed by compute_symbol_reachability.py to
+  # reach a changed symbol vs. only confirmed to import the changed file.
+  # Neither list is a partition of GUARDED: a label reached only via an
+  # ad-hoc (non-deploy_deps.json) match, or that fails open because the
+  # reachability helper errored, appears in GUARDED but in NEITHER of these
+  # two — treat that as "unranked", not as "confirmed closure-only". Always
+  # present (even empty), same convention as PARSE_ERROR_LOADED/UNLOADED.
+  gsc="$(comm -12 \
+    <(echo "${GUARDED:-}" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+    <(echo "${AFFECTED_SYMBOL_CONFIRMED:-}" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+    | tr '\n' ' ' | sed 's/ $//')"
+  gco="$(comm -12 \
+    <(echo "${GUARDED:-}" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+    <(echo "${AFFECTED_CLOSURE_ONLY:-}" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+    | tr '\n' ' ' | sed 's/ $//')"
+  echo "GUARDED_SYMBOL_CONFIRMED=$gsc"
+  echo "GUARDED_CLOSURE_ONLY=$gco"
   # ga-tdzsh: always present (even on the early-precondition emits above,
   # before plist discovery ever ran, where these are simply empty) so a
   # consumer can diff this field across runs without reparsing log text —
@@ -537,9 +555,9 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   # same convention as PARSE_ERROR_LOADED/UNLOADED above.
   echo "UNATTRIBUTED_JOB_GAP=${SJ_UNATTRIBUTED_REASON:-}"
   # Trailing JSON for the caller's bead comment / jsonl log.
-  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" <<'PY' 2>/dev/null || true
+  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" "$gsc" "$gco" <<'PY' 2>/dev/null || true
 import json, sys
-v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg = sys.argv[1:13]
+v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg, gsc, gco = sys.argv[1:15]
 sp = lambda s: [x for x in s.split() if x]
 print("JSON=" + json.dumps({
     "verdict": v, "reason": reason,
@@ -548,6 +566,7 @@ print("JSON=" + json.dumps({
     "already_fresh": sp(afr), "would_restart": sp(wr),
     "parse_error_loaded": sp(pel), "parse_error_unloaded": sp(peu),
     "unattributed_job_gap": ujg,
+    "guarded_symbol_confirmed": sp(gsc), "guarded_closure_only": sp(gco),
 }))
 PY
   if [ "$DRY_RUN" = "1" ]; then exit 0; fi
@@ -555,6 +574,8 @@ PY
 }
 
 AFFECTED=""; RESTARTED=""; FRESH_FAIL=""; GUARDED=""; ALREADY_FRESH=""; WOULD_RESTART=""
+# (wa-th4b1) ranking-only, see Step 3's own header comment for what these mean.
+AFFECTED_SYMBOL_CONFIRMED=""; AFFECTED_CLOSURE_ONLY=""
 # ga-ax0t9: achado do Step 1b que espera o Step 2 rodar antes de virar veredito.
 SJ_PENDING_REASON=""
 # ga-agracx: a real Step 1b gap that was NOT attributed to this bead's own
@@ -1433,6 +1454,37 @@ PY
   fi
 fi
 
+# ── symbol-reachability ranking (wa-th4b1) ────────────────────────────────────
+# json_entry_affected() above answers "does this entrypoint's closure include a
+# changed file?" — deliberately over-inclusive (see header point 14): importing
+# a file is enough to join its closure, regardless of which name was imported
+# or whether that name changed. wa-th4b1 measured three live deploys where the
+# resulting list was 12x-50x bigger than the daemons that actually execute the
+# changed code (e.g. a daemon importing an UNRELATED, unchanged symbol from the
+# same file the closure correctly flagged). compute_symbol_reachability.py adds
+# a second, narrower question on top, never instead: does some file in the
+# entrypoint's own closure import a name that either IS a changed top-level
+# function, or is an unchanged one whose own intra-file call graph reaches a
+# changed one? This can only ADD a ranking signal — JSON_AFFECTED_ENTRYPOINTS
+# itself, and therefore AFFECTED/GUARDED below, is completely unchanged by it.
+# Best-effort and fails open on any error (missing helper, unreadable repo,
+# unresolvable SHAs): every JSON_AFFECTED_ENTRYPOINTS member is treated as
+# symbol-reachable rather than silently ranked down — see that script's own
+# module docstring for why a false positive here is cheap and a false
+# negative is not.
+SYMBOL_REACH_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compute_symbol_reachability.py"
+JSON_AFFECTED_SYMBOL_ENTRYPOINTS="$JSON_AFFECTED_ENTRYPOINTS"
+if [ -f "$SYMBOL_REACH_SCRIPT" ] && [ -n "${JSON_AFFECTED_ENTRYPOINTS// /}" ]; then
+  SR_OUT="$(python3 "$SYMBOL_REACH_SCRIPT" --repo "$RUNTIME_DIR" --deps "$DEPLOY_DEPS_JSON" \
+      --pre "$PRE_DEPLOY_SHA" --post "$POST_DEPLOY_SHA" \
+      --entrypoints $JSON_AFFECTED_ENTRYPOINTS 2>/dev/null)"
+  if [ $? -eq 0 ]; then
+    JSON_AFFECTED_SYMBOL_ENTRYPOINTS="$(echo "$SR_OUT" | tr '\n' ' ')"
+  else
+    log "WARN: compute_symbol_reachability.py failed — every closure-affected entrypoint stays ranked as symbol-reachable for this run (fail open, same direction as every other check in this script)."
+  fi
+fi
+
 # does deploy_deps.json have a closure entry for <entrypoint-relpath> at all?
 json_covers_entry() {  # json_covers_entry <entrypoint-relpath>
   case " $JSON_KNOWN_ENTRYPOINTS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
@@ -1442,11 +1494,18 @@ json_covers_entry() {  # json_covers_entry <entrypoint-relpath>
 json_entry_affected() {  # json_entry_affected <entrypoint-relpath>
   case " $JSON_AFFECTED_ENTRYPOINTS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
 }
+# (wa-th4b1) of the entries json_entry_affected() already says yes to, is this
+# one CONFIRMED to reach a changed symbol (not just import the changed file)?
+json_entry_symbol_reachable() {  # json_entry_symbol_reachable <entrypoint-relpath>
+  case " $JSON_AFFECTED_SYMBOL_ENTRYPOINTS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
 
 # ── Step 3: resolve affected daemons ──────────────────────────────────────────
 for label in $DAEMON_LABELS; do
   entries="$(cat "$DISCO_DIR/$label")"
   affected=0
+  via_json=0
+  symbol_confirmed=0
   own_stems=""
   for e in $entries; do own_stems="$own_stems $(basename "$e" .py)"; done
 
@@ -1459,10 +1518,20 @@ for label in $DAEMON_LABELS; do
   # with the start file itself), so json_entry_affected already subsumes the
   # "direct" self-changed case below for a covered entry — no separate check
   # needed for it.
+  #
+  # (wa-th4b1) via_json/symbol_confirmed track WHY a label ended up in
+  # AFFECTED, purely for the ranking split below (AFFECTED_SYMBOL_CONFIRMED
+  # vs. AFFECTED_CLOSURE_ONLY) — they never change `affected` itself, so a
+  # label's presence in AFFECTED/GUARDED is byte-for-byte what it was before
+  # this ranking existed.
   ad_hoc_entries=""
   for e in $entries; do
     if json_covers_entry "$e"; then
-      json_entry_affected "$e" && affected=1
+      if json_entry_affected "$e"; then
+        affected=1
+        via_json=1
+        json_entry_symbol_reachable "$e" && symbol_confirmed=1
+      fi
     else
       ad_hoc_entries="$ad_hoc_entries $e"
     fi
@@ -1536,10 +1605,24 @@ for label in $DAEMON_LABELS; do
 
   [ "$affected" -eq 1 ] || continue
   AFFECTED="$AFFECTED $label"
+  # (wa-th4b1) ranking-only split, see the block's own header comment above —
+  # a label with NO json-covered entry at all (ad-hoc paths only) is left out
+  # of both lists: those mechanisms already AST-match a specific import name,
+  # so they do not exhibit the over-inclusive "50 daemons from one closure"
+  # shape this ranking exists to disambiguate.
+  if [ "$via_json" -eq 1 ]; then
+    if [ "$symbol_confirmed" -eq 1 ]; then
+      AFFECTED_SYMBOL_CONFIRMED="$AFFECTED_SYMBOL_CONFIRMED $label"
+    else
+      AFFECTED_CLOSURE_ONLY="$AFFECTED_CLOSURE_ONLY $label"
+    fi
+  fi
   log "AFFECTED: $label (entrypoints:$entries)"
 done
 
 AFFECTED="$(echo "$AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+AFFECTED_SYMBOL_CONFIRMED="$(echo "$AFFECTED_SYMBOL_CONFIRMED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+AFFECTED_CLOSURE_ONLY="$(echo "$AFFECTED_CLOSURE_ONLY" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
 
 # ga-fzfqsu: FORCE_RESTART_LABELS (delivery-runbooks.toml's daemon_restarts,
 # threaded through by the caller) forces its labels into AFFECTED
@@ -1733,7 +1816,31 @@ elif [ -n "${GUARDED// /}" ]; then
   # hops away was silently absent from a GUARDED list that named two
   # unrelated daemons instead, and the message gave no hint anything might
   # be missing — a reader had no reason to doubt the list was complete.
-  emit NEEDS_GUARDED_RESTART "sensitive hot-path daemon(s) need a guarded restart (import/template-closure match, not proven reachable to the changed symbols — a listed daemon may be a false positive; this is also NOT a full transitive closure — a daemon reached only through a deeper import chain can be missing from this list entirely, a false negative — verify by hand before treating this list as complete):${GUARDED}" not_verified
+  #
+  # (wa-th4b1) the paragraph above is still true (this stays NOT a proof, and
+  # NOT a full transitive closure) — but three independent live deploys
+  # measured GUARDED itself running 12x-50x bigger than the daemons that
+  # actually execute the changed code, with no way for a reader to tell which
+  # of the listed names is which. GSC_STEP5/GCO_STEP5 rank GUARDED by
+  # compute_symbol_reachability.py's confirmation (see that block's own
+  # header comment) WITHOUT shrinking GUARDED itself — a name absent from
+  # both sub-lists is simply unranked (ad-hoc match, or the helper failed
+  # open), never silently downgraded.
+  GSC_STEP5="$(comm -12 \
+    <(echo "${GUARDED:-}" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+    <(echo "${AFFECTED_SYMBOL_CONFIRMED:-}" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+    | tr '\n' ' ' | sed 's/ $//')"
+  GCO_STEP5="$(comm -12 \
+    <(echo "${GUARDED:-}" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+    <(echo "${AFFECTED_CLOSURE_ONLY:-}" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+    | tr '\n' ' ' | sed 's/ $//')"
+  SR_PREFIX=""
+  if [ -n "${GSC_STEP5// /}" ]; then
+    SR_PREFIX="RANKED (wa-th4b1): confirmed to reach a changed symbol, restart these first:${GSC_STEP5}."
+    [ -n "${GCO_STEP5// /}" ] && SR_PREFIX="$SR_PREFIX Closure-only (imports the changed file, but no changed symbol was confirmed reachable — lower priority, may be cosmetic):${GCO_STEP5}."
+    SR_PREFIX="$SR_PREFIX "
+  fi
+  emit NEEDS_GUARDED_RESTART "${SR_PREFIX}sensitive hot-path daemon(s) need a guarded restart (import/template-closure match, not proven reachable to the changed symbols — a listed daemon may be a false positive; this is also NOT a full transitive closure — a daemon reached only through a deeper import chain can be missing from this list entirely, a false negative — verify by hand before treating this list as complete):${GUARDED}" not_verified
 elif [ -n "${RESTARTED// /}" ]; then
   emit OK "all affected daemons restarted + verified fresh:${RESTARTED}" verified
 elif [ -n "${WOULD_RESTART// /}" ]; then
