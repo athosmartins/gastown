@@ -154,6 +154,32 @@ echo "Scenario 2b-orphan (ga-kb0kz): stale in-progress with EMPTY assignee → b
   && ok "ga-p5qgk shape (3d stale) → bounce" \
   || bad "ga-p5qgk shape → expected bounce"
 
+echo "Scenario 2b-orphan-gate (ga-bt1hjs): a post-gate orphan (gate:passed/delivery:*) is skip, NEVER bounce — it was delivered, not abandoned"
+# Same shape as the ga-w6vbc/ga-p5qgk orphan-bounce cases just above (empty
+# assignee, stale past orphan_ttl) EXCEPT the candidate also carries
+# gate:passed or delivery:*. Pre-fix, these hit the SAME orphan-reclaim
+# branch and got "bounce" too — the only thing distinguishing them is that
+# the story was already implemented and merged. Fails on the old code
+# (returns bounce), passes on the new code (returns skip).
+[ "$(auto_refino_lifecycle_state "story:refinement-in-progress,gate:passed" "" "$ACTOR" 51 50)" = "skip" ] \
+  && ok "in-progress+gate:passed, no assignee, 51m stale (would be bounce without this guard) → skip" \
+  || bad "post-gate orphan (gate:passed) → expected skip, got bounce (re-ingests delivered work)"
+[ "$(auto_refino_lifecycle_state "story:refinement-in-progress,delivery:pending-restart" "" "$ACTOR" 51 50)" = "skip" ] \
+  && ok "in-progress+delivery:pending-restart, no assignee, 51m stale → skip" \
+  || bad "post-gate orphan (delivery:pending-restart) → expected skip, got bounce"
+# The exact confirmed-live shape (wa-9j541): gate:passed AND
+# delivery:pending-restart together, assignee emptied when the implementing
+# session ended before the formal story:refino-review/approved/in-flight
+# transition ever landed — re-selected as bounce 3x before this fix.
+[ "$(auto_refino_lifecycle_state "ctx:ready,delivery:pending-restart,exec:auto,gate-sha-failed:b4da778:code,gate:passed,story:refinement-in-progress" "" "$ACTOR" 51 50)" = "skip" ] \
+  && ok "wa-9j541 shape (gate:passed+delivery:pending-restart, orphaned, stale) → skip (was re-ingested 3x — ga-bt1hjs)" \
+  || bad "wa-9j541 shape → expected skip, got bounce (the exact re-ingestion bug)"
+# gate:passed alone (no story:refinement-in-progress at all) is unaffected —
+# confirms no interaction/regression with the pre-existing terminal-state case.
+[ "$(auto_refino_lifecycle_state "gate:passed" "" "$ACTOR")" = "skip" ] \
+  && ok "gate:passed alone → skip (unchanged)" \
+  || bad "gate:passed alone → expected skip"
+
 echo "Scenario 2d (ga-kb0kz gate-fix, blocking issue 2): orphan age fails CLOSED on an unparseable timestamp"
 [ "$(auto_refino_orphan_age_min 0 999999)" = "0" ] \
   && ok "upd_epoch=0 (date-parse fallback) → age clamped to 0, never 'definitely stale enough'" \

@@ -291,17 +291,21 @@ auto_refino_orphan_age_min() {
 #     skip     — anything else: already refining (auto-refino:refining), already
 #                handed to the gate (story:refino-review / refino-gate:*),
 #                escalated (auto-refino:escalated), in Athos's queue
-#                (story:needs-approval), approved/in-flight/done/cancelled, a
-#                refinement-in-progress that is NOT ours (another refiner OR an
-#                interactive /refino session owns it — non-empty foreign
-#                assignee is NEVER reclaimed regardless of age: "no double-
-#                refine" holds for live claims, only a truly-empty assignee is
-#                ever an orphan), or an in-progress+empty-assignee bead that
-#                hasn't yet crossed orphan_ttl (still might be mid-transition).
+#                (story:needs-approval), approved/in-flight/done/cancelled,
+#                already past the gate (gate:passed) or in the delivery
+#                pipeline (any delivery:* label — ga-bt1hjs: implementation
+#                already happened, so this is never refino raw material
+#                regardless of story:* label hygiene), a refinement-in-progress
+#                that is NOT ours (another refiner OR an interactive /refino
+#                session owns it — non-empty foreign assignee is NEVER
+#                reclaimed regardless of age: "no double-refine" holds for live
+#                claims, only a truly-empty assignee is ever an orphan), or an
+#                in-progress+empty-assignee bead that hasn't yet crossed
+#                orphan_ttl (still might be mid-transition).
 #   GUARANTEE: a story already past the daemon (refino-review, needs-approval,
-#   approved, in-flight, done, cancelled, escalated) is NEVER reclassified as a
-#   candidate — the daemon cannot re-touch work it (or Athos, or the gate) has
-#   already moved forward.
+#   approved, in-flight, done, cancelled, escalated, gate:passed, delivery:*)
+#   is NEVER reclassified as a candidate — the daemon cannot re-touch work it
+#   (or Athos, or the gate) has already moved forward.
 auto_refino_lifecycle_state() {
   local labels="$1" assignee="$2" actor="$3" age_min="${4:-0}" orphan_ttl="${5:-50}"
   local csv=",$labels,"
@@ -311,11 +315,21 @@ auto_refino_lifecycle_state() {
   # now ALSO set on escalate so the story surfaces in "Sua vez"; it is terminal here
   # too (waiting on Athos) — a structural belt independent of auto-refino:escalated,
   # so even if the daemon's own marker is stripped the story is still not re-picked.
+  # gate:passed / delivery:* (ga-bt1hjs): the story was already implemented and
+  # merged — refino strictly precedes implementation, so ANY delivery:* value
+  # (not just the "active" ones) proves this is past the daemon. Without this,
+  # the orphan-reclaim case below can misread a post-gate story that never
+  # transitioned off story:refinement-in-progress (assignee emptied when the
+  # implementing session ended, before the formal
+  # story:refino-review/approved/in-flight handoff landed) as an abandoned
+  # refino claim and re-select it as "bounce" — re-ingesting already-delivered
+  # work (measured 3x on wa-9j541).
   case "$csv" in
     *,auto-refino:refining,*|*,auto-refino:escalated,*|*,refino-gate:reviewing,*|\
 *,story:refino-escalado,*|\
 *,story:refino-review,*|*,story:needs-approval,*|*,story:approved,*|\
-*,story:in-flight,*|*,story:done,*|*,story:cancelled,*)
+*,story:in-flight,*|*,story:done,*|*,story:cancelled,*|\
+*,gate:passed,*|*,delivery:*,*)
       echo "skip"; return ;;
   esac
 
