@@ -316,7 +316,42 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # updated_at exactly as before, preserving ga-w4k2z's anti-poison property
 # for the beads it actually protects against. Regression coverage:
 # pool-probe-priority-sort.selftest.sh's ga-oc6knj cases.
-bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --exclude-label "delivery:pending-restart" --json --sort priority --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select((.labels // []) | map(select(startswith("blocked:"))) | length == 0) | select((.labels // []) | map(select(startswith("gate:needs-human"))) | length == 0) | select((.labels // []) | map(select(startswith("pilot:text-veto"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | if length > 0 then (max < 3) else true end)] | sort_by([.priority, (if (((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | length) > 0 then (.updated_at // "") else (.created_at // .updated_at // "") end)]) | .[:1]'
+#
+# ga-onrnd6 (2026-09-17): also excludes next-action:* (vetoing UNLESS it ends
+# in a build-verb suffix) — same drift shape as every gap above (this probe
+# bypasses Pilot's own _filter_label_vetoes entirely, so it had no awareness
+# of this label at all). Live incident: wa-k1sr7 (mockup DONE, parked
+# next-action:athos-decide awaiting Athos's A/B/C pick, zero code left to
+# write) was still offered as a fresh candidate and dispatched 6 times before
+# a human noticed.
+# next-action: is OVERLOADED with two opposite meanings (pilot-dispatcher.sh's
+# _filter_label_vetoes gate (d) comment is the source of truth this mirrors,
+# character-for-character): the original convention (bare next-action:mayor,
+# next-action:athos+oracle, next-action:athos-decide) means "blocked on
+# Athos/a dependency" and must veto; refino's newer next-action:<crew>-
+# constroi/-reconstroi/-corrige-gate/-corrige convention means the OPPOSITE —
+# "ready, <crew> is who builds it" (ga-f7bek) — and must survive. Omitting
+# that carve-out would reinstate the exact 24h starvation bug ga-f7bek fixed.
+# Sibling fix, same day, same predicate fragment verbatim: ga-473mkh patched
+# poolDemandLabelFilterJQ() (internal/config/config.go — the dog pool's own
+# Step 1c probe) for this identical gap, confirmed live via ga-boftko
+# (bare next-action:mayor, 2026-09-16). That patch's own "Known adjacent gap"
+# note flagged this file (wa-worker/ps-worker's independently-hardcoded
+# copy) as unconfirmed and untouched — this is that follow-up.
+# Known adjacent gap, NOT fixed here (scope stays matched to what both live
+# incidents actually reported): waiting-on:/blocked-on:/depends-on: are
+# ALSO part of _filter_label_vetoes's full predicate and are STILL not
+# excluded by this probe. Deliberately not addressed in this pass — no live
+# incident named them here (unlike next-action:, corroborated 4 times across
+# two independent probes), and the reviewed ga-473mkh sibling fix scoped
+# itself the same way. _pilot_pool_topup gets the FULL family for free below
+# (it now calls _filter_label_vetoes directly, the actual canonical function,
+# rather than a hand-typed subset) — worth a follow-up bead if
+# waiting-on:/blocked-on:/depends-on: is ever caught live on THIS probe.
+# Same fix applied to wa-worker's identical copy and to the Step 1b3 fallback
+# below (both templates).
+# Regression coverage: pool-probe-next-action-family.selftest.sh.
+bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --exclude-label "delivery:pending-restart" --json --sort priority --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select((.labels // []) | map(select(startswith("blocked:"))) | length == 0) | select(((.labels // []) | map(select(test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not))) | length) == 0) | select((.labels // []) | map(select(startswith("gate:needs-human"))) | length == 0) | select((.labels // []) | map(select(startswith("pilot:text-veto"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | if length > 0 then (max < 3) else true end)] | sort_by([.priority, (if (((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | length) > 0 then (.updated_at // "") else (.created_at // .updated_at // "") end)]) | .[:1]'
 # If it returns a bead (output is NOT []), THAT BEAD IS YOURS. Claim it FIRST:
 #     gc bd update <id> --claim
 # verify the claim set assignee to your session, then go to the Build Protocol and build it.
@@ -366,7 +401,15 @@ bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=e
 # means an exclusion landing on Step 1b2 is never assumed to reach this
 # fallback automatically — it does not, until added here explicitly.
 # Regression coverage: pool-probe-delivery-pending-restart.selftest.sh.
-{{ .RoutedPoolQuery }} | jq -c '[.[] | select((.labels // []) | map(select(. == "delivery:pending-restart")) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | if length > 0 then (max < 3) else true end)]'
+#
+# ga-onrnd6: the next-action: exclusion added to Step 1b2 above is mirrored
+# into this fallback's post-filter too, same technique and same reasoning as
+# the delivery:pending-restart clause immediately above (the Go-rendered
+# poolDemandLabelFilterJQ() itself stays off-limits per the same Mayor
+# decision — this file's own drift history means a Step 1b2 fix is never
+# assumed to reach here automatically).
+# Regression coverage: pool-probe-next-action-family.selftest.sh.
+{{ .RoutedPoolQuery }} | jq -c '[.[] | select((.labels // []) | map(select(. == "delivery:pending-restart")) | length == 0) | select(((.labels // []) | map(select(test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not))) | length) == 0) | select(((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | if length > 0 then (max < 3) else true end)]'
 
 # Step 1c: ONLY if Steps 1a / 1b / 1b2 / 1b3 are ALL empty — no work — drain and exit.
 gc runtime drain-ack && exit

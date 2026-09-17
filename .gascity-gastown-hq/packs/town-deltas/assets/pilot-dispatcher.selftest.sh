@@ -6622,6 +6622,28 @@ else
   ok "topup: never considers the pilot:held candidate"
 fi
 
+echo "Scenario TOPUP-ELIGIBILITY-1b (ga-onrnd6): a next-action:-parked candidate is skipped in favor of an eligible sibling"
+# ga-onrnd6: _filter_candidates alone (the ga-oc6knj fix above) never covered
+# next-action:/waiting-on:/blocked-on:/depends-on: — that predicate lives in
+# _filter_label_vetoes, a separate chokepoint BUGS_JSON/DEBT_JSON/etc. already
+# chained but the topup pipeline never did. Mirrors TOPUP-ELIGIBILITY-1's
+# exact shape (a park label the worker probe already respects, top-up did
+# not) with next-action:athos-decide in place of pilot:held — same live
+# incident class as wa-k1sr7 (done-but-parked bead re-dispatched by topup
+# spawning a session for it after the worker probe itself had already
+# correctly stopped offering it).
+LOG_TUE1B="$(run_topup_candidates_scenario "3" '[{"id":"wa-parked-onrnd6","priority":1,"assignee":null,"description":"fixture body","issue_type":"task","labels":["next-action:athos-decide"]},{"id":"wa-eligible-onrnd6","priority":1,"assignee":null,"description":"fixture body","issue_type":"task","labels":[]}]')"
+if echo "$LOG_TUE1B" | grep -q "pool top-up.*wa-eligible-onrnd6"; then
+  ok "topup: spawns for the eligible sibling when the other routed candidate carries next-action:athos-decide"
+else
+  bad "topup: did NOT spawn for wa-eligible-onrnd6 — next-action eligibility filter not wired in, or over-broad (log: $LOG_TUE1B)"
+fi
+if echo "$LOG_TUE1B" | grep -q "wa-parked-onrnd6"; then
+  bad "topup: spawned (or considered) the next-action:athos-decide candidate — ga-onrnd6 regression, top-up ignoring the same park label the worker probe respects"
+else
+  ok "topup: never considers the next-action:athos-decide candidate"
+fi
+
 echo "Scenario TOPUP-ELIGIBILITY-2: reclaim-cap candidate with NO eligible sibling → correctly finds nothing (no spawn)"
 LOG_TUE2="$(run_topup_candidates_scenario "1" '[{"id":"wa-capped-oc6knj","priority":1,"assignee":null,"description":"fixture body","issue_type":"task","labels":["pilot:reclaim-count:3"]}]')"
 if echo "$LOG_TUE2" | grep -q "pool top-up"; then

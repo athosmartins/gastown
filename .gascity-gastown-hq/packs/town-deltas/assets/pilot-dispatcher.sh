@@ -7892,6 +7892,24 @@ ALL_CANDIDATES_COUNT=$(echo "$ALL_CANDIDATES_JSON" | jq 'length' 2>/dev/null || 
 # pipelines below now also chain _filter_exec_manual — same position (before
 # _filter_candidates) as every other candidate source in this file already
 # uses (see e.g. BUGS_JSON/CTXREADY_JSON below).
+#
+# ga-onrnd6: _filter_candidates alone still does not cover the next-action:/
+# waiting-on:/blocked-on:/depends-on: family (that predicate lives in
+# _filter_label_vetoes, a SEPARATE chokepoint — BUGS_JSON/DEBT_JSON/CHORE_JSON/
+# TASK_JSON chain it explicitly right after _filter_candidates below;
+# TIER2_JSON/CTXREADY_JSON/every rig pool get it "for free" via
+# _filter_dispatch_gates, which calls it internally). Both call sites below
+# (_topup_rig_pending's rig-scoped query and this function's own $GC_CITY
+# query), AND both PILOT_TEST_*_TOPUP_CANDIDATES_JSON hermetic test seams
+# (kept in lockstep with the real pipelines so a selftest against the seam
+# can never pass while the live pipeline behaves differently), now chain
+# _filter_label_vetoes right after _filter_candidates — same fix shape as
+# BUGS_JSON, reusing the existing chokepoint rather than re-typing a THIRD
+# copy of the next-action/waiting-on/blocked-on/depends-on predicate. Same
+# live incident this closes as the wa-worker/ps-worker Step 1b2/1b3 fix in
+# the prompt templates (wa-k1sr7 — done-but-parked next-action:athos-decide
+# bead, re-dispatched by top-up spawning a fresh session after the worker
+# probe itself had already correctly stopped offering it).
 _TOPUP_WORKER_EXCLUDE_LABELS=(
   --exclude-label "story:needs-human"
   --exclude-label "story:needs-approval"
@@ -7926,7 +7944,7 @@ _topup_rig_pending() {
     _rig_pending=$(timeout 15 bd -C "$_rp" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
       --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" --exclude-type epic \
       "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit=20 2>/dev/null \
-      | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null \
+      | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null \
       | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" \
         '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
     if [ -n "$_rig_pending" ]; then
@@ -7978,9 +7996,9 @@ _pilot_pool_topup() {
     # convention (${...+x}), same reason (this harness's PATH has no
     # `timeout`, so the live bd call below would silently 127 either way).
     elif [ "$_pool" = "wa-worker" ] && [ -n "${PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON+x}" ]; then
-      _pending=$(printf '%s' "$PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
+      _pending=$(printf '%s' "$PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
     elif [ "$_pool" = "ps-worker" ] && [ -n "${PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON+x}" ]; then
-      _pending=$(printf '%s' "$PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
+      _pending=$(printf '%s' "$PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
     else
       # Same `|| echo` reasoning as the _live probe above.
       # ga-oc6knj: widened --limit=1 -> --limit=20 and piped through
@@ -7992,7 +8010,7 @@ _pilot_pool_topup() {
       _pending=$(timeout 15 bd -C "$GC_CITY" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
         --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" --exclude-type epic \
         "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit=20 2>/dev/null \
-        | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null \
+        | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null \
         | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" \
           '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
       if [ -z "$_pending" ]; then
