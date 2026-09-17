@@ -7553,9 +7553,23 @@ DEFAULT_BRANCH=$(echo "$RIG_LIST_JSON" \
 # SELFTEST-EXTRACT gate-verdict-identity-link-fn: BEGIN
 gate_check_verdict_identity_link() {
   local _vb="$1"
-  local _vb_json _linked_id _comment_author
+  local _vb_json _vb_labels _linked_id _comment_author
 
   _vb_json=$(bd -C "$GC_CITY" show "$_vb" --json 2>/dev/null) || return 0
+
+  # ga-6wel0o self-audit: gate_collect_verdicts() re-scans EVERY verdict bead
+  # on EVERY sweep until the whole run finalizes (not just once per bead) —
+  # true for any required_reviewers>1 run where this bead's slot closes
+  # before its sibling slots do. Without this guard, an already-flagged bead
+  # would get a fresh duplicate audit comment each sweep (every ~1-4min)
+  # until the run completes. Idempotent: once flagged, stay flagged, done.
+  _vb_labels=$(printf '%s' "$_vb_json" | jq -r '
+      if type=="array" then .[0] else . end | (.labels // []) | join(" ")
+    ' 2>/dev/null || echo "")
+  case " $_vb_labels " in
+    *" verdict:identity-unlinked "*) return 0 ;;
+  esac
+
   _linked_id=$(printf '%s' "$_vb_json" | jq -r '
       if type=="array" then .[0] else . end
       | (.metadata["gc.session_name"] // .assignee // empty)

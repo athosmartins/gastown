@@ -82,6 +82,9 @@ ok "located live gate_check_verdict_identity_link() via sentinel extraction"
 #   vb-match            metadata.gc.session_name=reviewer-A  comment author=reviewer-A  -> no flag
 #   vb-assignee-fallback metadata={} assignee=reviewer-E      comment author=reviewer-E  -> no flag (assignee fallback)
 #   vb-mismatch         metadata.gc.session_name=reviewer-A  comment author=reviewer-B  -> FLAGGED (mismatch)
+#   vb-already-flagged  same mismatch as vb-mismatch, but ALREADY carries the
+#                       verdict:identity-unlinked label (as if a prior sweep
+#                       already flagged it)                                  -> no NEW writes (idempotent)
 #   vb-nolink           metadata=null assignee=null           comment author=reviewer-C  -> FLAGGED (no durable link)
 #   vb-nocomment        metadata.gc.session_name=reviewer-D  comments=[]                -> no flag (nothing to compare)
 #   vb-unreadable       bd show fails entirely                                          -> no flag, no crash
@@ -105,6 +108,7 @@ run_check() {
     VB_FALLBACK_COMMENTS='"'"'[{"author":"reviewer-E","text":"VERDICT: FAIL\nBlocking issue 1: nope."}]'"'"'
     VB_MISMATCH='"'"'{"metadata":{"gc.session_name":"reviewer-A"},"assignee":"reviewer-A"}'"'"'
     VB_MISMATCH_COMMENTS='"'"'[{"author":"reviewer-B","text":"VERDICT: PASS\nSummary: reviewed everything."}]'"'"'
+    VB_ALREADY_FLAGGED='"'"'{"metadata":{"gc.session_name":"reviewer-A"},"assignee":"reviewer-A","labels":["type:quality-gate-verdict","verdict:PASS","verdict:identity-unlinked"]}'"'"'
     VB_NOLINK='"'"'{"metadata":null,"assignee":null}'"'"'
     VB_NOLINK_COMMENTS='"'"'[{"author":"reviewer-C","text":"VERDICT: FAIL\nBlocking issue 1: race condition."}]'"'"'
     VB_NOCOMMENT='"'"'{"metadata":{"gc.session_name":"reviewer-D"},"assignee":"reviewer-D"}'"'"'
@@ -114,6 +118,7 @@ run_check() {
         *" show vb-match "*)             echo "$VB_MATCH"; return 0 ;;
         *" show vb-assignee-fallback "*) echo "$VB_FALLBACK"; return 0 ;;
         *" show vb-mismatch "*)          echo "$VB_MISMATCH"; return 0 ;;
+        *" show vb-already-flagged "*)   echo "$VB_ALREADY_FLAGGED"; return 0 ;;
         *" show vb-nolink "*)            echo "$VB_NOLINK"; return 0 ;;
         *" show vb-nocomment "*)         echo "$VB_NOCOMMENT"; return 0 ;;
         *" show vb-unreadable "*)        return 1 ;;
@@ -174,6 +179,30 @@ grep -q "comment vb-mismatch" "$BD_LOG" \
 case "$OUT" in
   *"IDENTITY MISMATCH"*"reviewer-A"*"reviewer-B"*) ok "WARN names both identities (linked=reviewer-A, actual=reviewer-B)" ;;
   *) bad "WARN did not name both identities as expected; got: $OUT" ;;
+esac
+rm -f "$BD_LOG"
+
+echo "── 3b. Idempotent: an ALREADY-flagged bead gets no duplicate comment on a later sweep ──"
+# gate_collect_verdicts() re-scans every verdict bead on every sweep until the
+# whole run finalizes — a required_reviewers>1 run whose sibling slots are
+# still pending would otherwise re-process this same closed, already-flagged
+# bead again next sweep. Without the idempotency guard this fixture would hit
+# the bd() mock's catch-all (no "comments vb-already-flagged" case is
+# defined) and log "UNEXPECTED:...".
+BD_LOG="$(mktemp)"
+OUT="$(run_check "$DISPATCHER" vb-already-flagged "$BD_LOG" 2>&1)"
+case "$OUT" in
+  *"RC=0"*) ok "vb-already-flagged: function returns cleanly (rc=0)" ;;
+  *) bad "vb-already-flagged: unexpected exit — $OUT" ;;
+esac
+if [ -s "$BD_LOG" ]; then
+  bad "vb-already-flagged triggered bd write(s) on a repeat sweep (not idempotent) — bd_log: $(tr '\n' ';' < "$BD_LOG")"
+else
+  ok "vb-already-flagged produced ZERO bd calls beyond the initial show (no duplicate comment, no wasted comments-fetch)"
+fi
+case "$OUT" in
+  *"IDENTITY MISMATCH"*|*"NO DURABLE LINK"*) bad "vb-already-flagged produced a fresh WARN on a repeat sweep: $OUT" ;;
+  *) ok "vb-already-flagged produced no fresh WARN (already recorded, nothing new to say)" ;;
 esac
 rm -f "$BD_LOG"
 
