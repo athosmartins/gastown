@@ -6630,20 +6630,91 @@ else
   ok "topup: correctly no-ops when the only routed candidate is at the reclaim cap"
 fi
 
-echo "Scenario TOPUP-ELIGIBILITY-3: structural — real HQ + rig-fallback queries widen to --limit=20 and pipe through _filter_candidates"
-# has() is a single-line grep -qE and the two query lines wrap across a `\`
-# continuation (the --limit=20 | _filter_candidates suffix lives on the
-# physical line AFTER the "bd ready ..." line has() already checks above),
-# so a single-pattern has() call can't anchor both halves at once. The
-# suffix line is byte-identical between the HQ query (_pilot_pool_topup) and
-# the rig-fallback query (_topup_rig_pending) — only the preceding line
-# differs ("$GC_CITY" vs "$_rp") — so asserting the suffix appears exactly
-# twice IS the proof both call sites picked up the fix, not just one.
-_topup_limit20_filter_count="$(grep -cF -- '--exclude-type=epic --json --limit=20 2>/dev/null | _filter_candidates 2>/dev/null | jq -r '"'"'.[0].id // empty'"'"' 2>/dev/null || echo "")' "$DISPATCHER" || true)"
-if [ "${_topup_limit20_filter_count:-0}" -eq 2 ]; then
-  ok "both top-up queries (HQ + rig-fallback) widened to --limit=20 and piped through _filter_candidates (ga-oc6knj)"
+echo "Scenario TOPUP-ELIGIBILITY-3: structural — real HQ + rig-fallback queries carry the full worker-probe --exclude-label set, chain _filter_exec_manual before _filter_candidates, and apply the EPIC-title regex (gate_run=ga-8pv70k follow-up)"
+# The first pattern is query-specific (--json/--limit=20 only exist on the
+# REAL bd ready call), so it's byte-identical TEXT at exactly the 2 real
+# call sites (_topup_rig_pending + _pilot_pool_topup's HQ branch) — same
+# "prove both call sites, not just one" logic the original TOPUP-
+# ELIGIBILITY-3 used. The other three patterns are the FILTER CHAIN
+# (_filter_exec_manual | _filter_candidates | the EPIC-title jq), which
+# ALSO appears at the 2 PILOT_TEST_*_TOPUP_CANDIDATES_JSON seam branches
+# (deliberately — the seam exists specifically to exercise this chain
+# against injected fixtures, see the ga-oc6knj comment above those
+# branches), so those expect 4, not 2.
+for _tue3_pat_want in \
+  '"${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit=20|2' \
+  '| _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null|4' \
+  '--arg epic_re "$_TOPUP_EPIC_TITLE_RE"|4' \
+  '"") | test($epic_re; "i")) | not)] | .[0].id // empty|4'; do
+  _tue3_pat="${_tue3_pat_want%|*}"
+  _tue3_want="${_tue3_pat_want##*|}"
+  _tue3_count="$(grep -cF -- "$_tue3_pat" "$DISPATCHER" || true)"
+  if [ "${_tue3_count:-0}" -eq "$_tue3_want" ]; then
+    ok "found $_tue3_want occurrence(s) as expected of: $_tue3_pat"
+  else
+    bad "expected exactly $_tue3_want occurrence(s) of '$_tue3_pat', found ${_tue3_count:-0} — HQ, rig-fallback, or a test seam is missing this piece of the ga-8pv70k follow-up fix"
+  fi
+done
+has "$DISPATCHER" '^_TOPUP_WORKER_EXCLUDE_LABELS=\(' \
+  "_TOPUP_WORKER_EXCLUDE_LABELS is a single shared array (not re-typed per call site)"
+has "$DISPATCHER" "_TOPUP_EPIC_TITLE_RE='\\^\\(EPIC\\|" \
+  "_TOPUP_EPIC_TITLE_RE mirrors the worker probe's EPIC/ÉPICO title-regex fallback"
+
+echo "Scenario TOPUP-ELIGIBILITY-3b: top-up's combined --exclude-label set (array + the gate:needs-human/needs:engine-window pair inlined alongside --exclude-type epic, per the file's own established pairing convention) cannot silently drift from the live wa-worker/ps-worker probe's own --exclude-label set (this IS the invariant-(c) gap gate_run=ga-8pv70k found — made structurally unable to regress unnoticed)"
+# Range covers the array definition through both call sites (ends at the
+# real, top-level "_pilot_pool_topup \"wa-worker\"" invocation, same end
+# marker _topup_vs_exit_block above already uses) so a label is found
+# whether it lives in the shared array or is written inline at a call site
+# (gate:needs-human/needs:engine-window are inline — see the ga-8pv70k
+# follow-up comment above _topup_rig_pending for why: the file's own
+# structural "paired with gate:needs-human" tests count RAW TEXT
+# occurrences, so keeping those two in lockstep with --exclude-type epic's
+# own un-deduped, twice-per-call-site count requires writing them the same
+# way, not through the array).
+_tue3b_topup_labels="$(awk '/^_TOPUP_WORKER_EXCLUDE_LABELS=\(/{f=1} f{print} /^_pilot_pool_topup "wa-worker"/{if(f)exit}' "$DISPATCHER" | grep -oE -- '--exclude-label "[^"]+"' | grep -oE '"[^"]+"' | tr -d '"' | sort -u)"
+if [ -z "$_tue3b_topup_labels" ]; then
+  bad "TOPUP-ELIGIBILITY-3b: could not extract any --exclude-label values from top-up's array+call-site block in $DISPATCHER — array/call sites missing or renamed?"
 else
-  bad "expected exactly 2 top-up query sites with --limit=20 | _filter_candidates, found ${_topup_limit20_filter_count:-0} — HQ and/or rig-fallback path missing the ga-oc6knj fix"
+  for _tue3b_pool in wa-worker ps-worker; do
+    _tue3b_tmpl="$SELF_DIR/../../../agents/$_tue3b_pool/prompt.template.md"
+    if [ ! -f "$_tue3b_tmpl" ]; then
+      bad "TOPUP-ELIGIBILITY-3b: cannot find $_tue3b_tmpl to diff against — drift check skipped, not passed"
+      continue
+    fi
+    _tue3b_tmpl_labels="$(grep -oE -- '--exclude-label "[^"]+"' "$_tue3b_tmpl" | grep -oE '"[^"]+"' | tr -d '"' | sort -u)"
+    _tue3b_missing="$(comm -23 <(printf '%s\n' "$_tue3b_tmpl_labels") <(printf '%s\n' "$_tue3b_topup_labels"))"
+    if [ -z "$_tue3b_missing" ]; then
+      ok "every label $_tue3b_pool's own probe excludes is also excluded by top-up (array or inline)"
+    else
+      bad "$_tue3b_pool's probe excludes label(s) top-up does NOT: $(echo "$_tue3b_missing" | tr '\n' ' ') — invariant (c) violated again, top-up could spawn a session for a bead $_tue3b_pool would refuse to self-serve"
+    fi
+  done
+fi
+
+echo "Scenario TOPUP-ELIGIBILITY-4: a routed exec:manual candidate is skipped (via the newly-chained _filter_exec_manual) in favor of an eligible sibling"
+LOG_TUE4="$(run_topup_candidates_scenario "3" '[{"id":"wa-manual-oc6knj","priority":1,"assignee":null,"description":"fixture body","issue_type":"task","labels":["exec:manual"]},{"id":"wa-eligible4-oc6knj","priority":1,"assignee":null,"description":"fixture body","issue_type":"task","labels":[]}]')"
+if echo "$LOG_TUE4" | grep -q "pool top-up.*wa-eligible4-oc6knj"; then
+  ok "topup: spawns for the eligible sibling when the other routed candidate carries exec:manual"
+else
+  bad "topup: did NOT spawn for wa-eligible4-oc6knj — exec:manual filtering not wired in, or over-broad (log: $LOG_TUE4)"
+fi
+if echo "$LOG_TUE4" | grep -q "wa-manual-oc6knj"; then
+  bad "topup: spawned (or considered) the exec:manual candidate — gate_run=ga-8pv70k regression, top-up ignoring a signal the worker probe's own --exclude-label already respects"
+else
+  ok "topup: never considers the exec:manual candidate"
+fi
+
+echo "Scenario TOPUP-ELIGIBILITY-5: a routed candidate with an EPIC-prefixed title (issue_type mistagged as non-epic) is skipped in favor of an eligible sibling"
+LOG_TUE5="$(run_topup_candidates_scenario "3" '[{"id":"wa-epic-oc6knj","priority":1,"assignee":null,"description":"fixture body","issue_type":"task","title":"EPIC: land assembly overhaul","labels":[]},{"id":"wa-eligible5-oc6knj","priority":1,"assignee":null,"description":"fixture body","issue_type":"task","labels":[]}]')"
+if echo "$LOG_TUE5" | grep -q "pool top-up.*wa-eligible5-oc6knj"; then
+  ok "topup: spawns for the eligible sibling when the other routed candidate has an EPIC-prefixed title"
+else
+  bad "topup: did NOT spawn for wa-eligible5-oc6knj — EPIC-title defense-in-depth not wired in, or over-broad (log: $LOG_TUE5)"
+fi
+if echo "$LOG_TUE5" | grep -q "wa-epic-oc6knj"; then
+  bad "topup: spawned (or considered) the EPIC-titled candidate — --exclude-type=epic alone missed it (issue_type was mistagged task) and the title-regex defense-in-depth the worker probe relies on (ga-7ha7g) is missing from top-up"
+else
+  ok "topup: never considers the EPIC-titled candidate"
 fi
 
 # ── Scenario TOPUP-RIG: rig-scoped fallback (ga-q0ewpu) ───────────────────────

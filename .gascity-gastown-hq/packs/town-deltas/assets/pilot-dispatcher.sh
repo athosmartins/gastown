@@ -7874,13 +7874,61 @@ ALL_CANDIDATES_COUNT=$(echo "$ALL_CANDIDATES_JSON" | jq 'length' 2>/dev/null || 
 # list here) is the same fix shape every other candidate source in this file
 # already gets — see its own header comment for why it is the designated
 # single chokepoint.
+#
+# ga-oc6knj gate_run=ga-8pv70k follow-up: _filter_candidates alone was NOT
+# actually equivalent to the worker probe, so the invariant-(c) gap above
+# only narrowed, it did not close. Verified against the reviewed SHA:
+# _filter_candidates has no check for ctx:thin, phone-proxy, gate:queued,
+# gate:reviewing, delivery:pending-restart, the story:unrefined/story:
+# refinement-in-progress/refino:* family, or the EPIC-title regex the worker
+# probe uses as defense-in-depth alongside its own type=epic exclusion; exec:manual
+# is handled only by the SEPARATE _filter_exec_manual, which neither call
+# site below invoked. Closing the actual gap: $_TOPUP_WORKER_EXCLUDE_LABELS
+# is the SAME --exclude-label set both agents/{wa-worker,ps-worker}/
+# prompt.template.md pass on their own Step 1b2 `bd ready` call (reused
+# verbatim, not re-typed a third time — a selftest diffs this array against
+# the live template files so the two can never silently drift apart again),
+# $_TOPUP_EPIC_TITLE_RE mirrors their jq title-regex fallback, and both query
+# pipelines below now also chain _filter_exec_manual — same position (before
+# _filter_candidates) as every other candidate source in this file already
+# uses (see e.g. BUGS_JSON/CTXREADY_JSON below).
+_TOPUP_WORKER_EXCLUDE_LABELS=(
+  --exclude-label "story:needs-human"
+  --exclude-label "story:needs-approval"
+  --exclude-label "needs-human"
+  --exclude-label "needs-human-decision"
+  --exclude-label "ctx:thin"
+  --exclude-label "story:epic"
+  --exclude-label "story:refinement-in-progress"
+  --exclude-label "story:unrefined"
+  --exclude-label "refino:policy-gap"
+  --exclude-label "refino:info-gap"
+  --exclude-label "auto-refino:escalated"
+  --exclude-label "story:refino-escalado"
+  --exclude-label "story:refino-review"
+  --exclude-label "auto-refino:refining"
+  --exclude-label "exec:manual"
+  --exclude-label "on-device"
+  --exclude-label "story:needs-device"
+  --exclude-label "phone-proxy"
+  --exclude-label "pilot:no-auto-dispatch"
+  --exclude-label "story:blocked"
+  --exclude-label "gate:queued"
+  --exclude-label "gate:reviewing"
+  --exclude-label "delivery:pending-restart"
+)
+_TOPUP_EPIC_TITLE_RE='^(EPIC|ÉPICO)[:\s]'
 _topup_rig_pending() {
   local _pool="$1" _rp _rig_pending
   while IFS= read -r _rp; do
     [ -z "$_rp" ] || [ ! -d "$_rp" ] && continue
     [ "$_rp" = "$GC_CITY" ] && continue
     _rig_pending=$(timeout 15 bd -C "$_rp" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
-      --exclude-type=epic --json --limit=20 2>/dev/null | _filter_candidates 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null || echo "")
+      --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" --exclude-type epic \
+      "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit=20 2>/dev/null \
+      | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null \
+      | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" \
+        '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
     if [ -n "$_rig_pending" ]; then
       printf '%s' "$_rig_pending"
       return 0
@@ -7930,9 +7978,9 @@ _pilot_pool_topup() {
     # convention (${...+x}), same reason (this harness's PATH has no
     # `timeout`, so the live bd call below would silently 127 either way).
     elif [ "$_pool" = "wa-worker" ] && [ -n "${PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON+x}" ]; then
-      _pending=$(printf '%s' "$PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON" | _filter_candidates 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null || echo "")
+      _pending=$(printf '%s' "$PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
     elif [ "$_pool" = "ps-worker" ] && [ -n "${PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON+x}" ]; then
-      _pending=$(printf '%s' "$PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON" | _filter_candidates 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null || echo "")
+      _pending=$(printf '%s' "$PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
     else
       # Same `|| echo` reasoning as the _live probe above.
       # ga-oc6knj: widened --limit=1 -> --limit=20 and piped through
@@ -7942,7 +7990,11 @@ _pilot_pool_topup() {
       # "nothing", masking every OTHER eligible routed-unassigned bead
       # sitting right behind it in the same query.
       _pending=$(timeout 15 bd -C "$GC_CITY" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
-        --exclude-type=epic --json --limit=20 2>/dev/null | _filter_candidates 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null || echo "")
+        --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" --exclude-type epic \
+        "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit=20 2>/dev/null \
+        | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null \
+        | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" \
+          '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
       if [ -z "$_pending" ]; then
         # ga-q0ewpu: HQ has nothing — fall through to each non-HQ rig store
         # before giving up (own test seam, same set-even-to-empty convention
