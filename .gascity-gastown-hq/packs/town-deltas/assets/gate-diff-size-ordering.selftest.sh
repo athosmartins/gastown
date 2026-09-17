@@ -263,7 +263,7 @@ grep -q 'gate_measure_diff_lines' "$DISPATCHER" \
 SIZE_SORT_COUNT=$(grep -c 'sort_by(\[diff_size, -created_epoch\])' "$DISPATCHER" || true)
 [ "$SIZE_SORT_COUNT" = "2" ] && ok "exactly 2 tiers (priority-fresh, other-fresh) use the size-aware sort — aged/overdue/rebase-fail tiers untouched" \
   || bad "expected exactly 2 occurrences of the size-aware sort, found $SIZE_SORT_COUNT — tier scope drifted"
-OVERDUE_LINE=$(grep -n 'map(select(is_overdue' "$DISPATCHER" | head -1 | cut -d: -f1)
+OVERDUE_LINE=$(grep -n 'map(select((is_overdue' "$DISPATCHER" | head -1 | cut -d: -f1)
 PRIO_AGED_LINE=$(grep -n 'is_aged))' "$DISPATCHER" | grep -v 'is_aged | not' | head -1 | cut -d: -f1)
 BROKEN_LINE=$(grep -n 'map(select(has_rebase_fail))' "$DISPATCHER" | head -1 | cut -d: -f1)
 if [ -n "$OVERDUE_LINE" ] && [ -n "$PRIO_AGED_LINE" ] && [ -n "$BROKEN_LINE" ] \

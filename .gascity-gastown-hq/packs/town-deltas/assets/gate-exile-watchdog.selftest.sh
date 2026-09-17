@@ -223,20 +223,30 @@ else
   bad "expected exactly 1 mayor mail, got $MAIL_COUNT (mail_log='$MAIL_LOG')"
 fi
 
-echo "── (12) drift-guards: shipped dispatcher wires the watchdog into Step 0b, before the quiet-hours/headroom gates ──"
-grep -q "gate_exile_watchdog_sweep \"\$MARKERS_JSON\"" "$DISPATCHER" \
-  && ok "Step 0b-0 calls gate_exile_watchdog_sweep with the live MARKERS_JSON" \
+echo "── (12) drift-guards: shipped dispatcher wires the watchdog into Step 0b, after recovery, before the quiet-hours/headroom gates ──"
+# ga-0ye7ar: the watchdog's own MARKERS_JSON input changed from the raw
+# $MARKERS_JSON to a $WATCHDOG_MARKERS_JSON filtered by gate_exile_recovery_sweep
+# (see quality-gate-dispatcher.sh's own comment at that call site for why: a
+# marker gate_exile_recovery_sweep just proved clean and cleared must not be
+# re-escalated by the watchdog off a stale pre-recovery label snapshot in the
+# same sweep). This selftest still exercises gate_exile_watchdog_sweep()
+# directly with hand-built fixtures (unaffected by that rename), so only the
+# call-site drift-guards below need updating for it.
+grep -q 'gate_exile_watchdog_sweep "\$WATCHDOG_MARKERS_JSON"' "$DISPATCHER" \
+  && ok "Step 0b-0 calls gate_exile_watchdog_sweep with the recovery-filtered WATCHDOG_MARKERS_JSON" \
   || bad "call site missing or drifted"
-WATCHDOG_CALL_LINE=$(grep -n 'gate_exile_watchdog_sweep "\$MARKERS_JSON"' "$DISPATCHER" | head -1 | cut -d: -f1)
+RECOVERY_CALL_LINE=$(grep -n 'gate_exile_recovery_sweep "\$MARKERS_JSON"' "$DISPATCHER" | head -1 | cut -d: -f1)
+WATCHDOG_CALL_LINE=$(grep -n 'gate_exile_watchdog_sweep "\$WATCHDOG_MARKERS_JSON"' "$DISPATCHER" | head -1 | cut -d: -f1)
 # "PAUSE new-run admission" is unique to the actual Step 0b heading further down
 # the file — a bare "ga-dxyvxr: quiet-hours admission gate" also appears in the
 # unrelated top-of-file header/changelog comments (line ~46), which would give a
 # false-early line number and silently defeat this ordering check.
 QUIET_HOURS_LINE=$(grep -n 'quiet-hours admission gate — PAUSE new-run admission' "$DISPATCHER" | head -1 | cut -d: -f1)
-if [ -n "$WATCHDOG_CALL_LINE" ] && [ -n "$QUIET_HOURS_LINE" ] && [ "$WATCHDOG_CALL_LINE" -lt "$QUIET_HOURS_LINE" ]; then
-  ok "watchdog call (line $WATCHDOG_CALL_LINE) runs BEFORE the quiet-hours admission pause (line $QUIET_HOURS_LINE) — escalation is not blocked by admission gates"
+if [ -n "$RECOVERY_CALL_LINE" ] && [ -n "$WATCHDOG_CALL_LINE" ] && [ -n "$QUIET_HOURS_LINE" ] \
+   && [ "$RECOVERY_CALL_LINE" -lt "$WATCHDOG_CALL_LINE" ] && [ "$WATCHDOG_CALL_LINE" -lt "$QUIET_HOURS_LINE" ]; then
+  ok "gate_exile_recovery_sweep (line $RECOVERY_CALL_LINE) runs BEFORE gate_exile_watchdog_sweep (line $WATCHDOG_CALL_LINE), both BEFORE the quiet-hours admission pause (line $QUIET_HOURS_LINE) — ga-0ye7ar: recovery gets first crack at a stale exile before the watchdog can escalate it, and neither is blocked by admission gates"
 else
-  bad "watchdog call ordering drifted relative to quiet-hours gate (watchdog=$WATCHDOG_CALL_LINE quiet_hours=$QUIET_HOURS_LINE)"
+  bad "call ordering drifted (recovery=$RECOVERY_CALL_LINE watchdog=$WATCHDOG_CALL_LINE quiet_hours=$QUIET_HOURS_LINE)"
 fi
 
 echo "── (13) gate-review fix: failed mail does NOT set gate:exile-escalated, so a later sweep retries instead of permanently dropping the escalation ──"

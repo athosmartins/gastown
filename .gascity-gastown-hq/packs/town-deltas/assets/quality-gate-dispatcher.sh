@@ -3427,6 +3427,104 @@ EOF_GATE_EXILE_IDS
 }
 # SELFTEST-EXTRACT gate-exile-watchdog: END
 
+# SELFTEST-EXTRACT gate-exile-recovery: BEGIN
+# gate_exile_recovery_sweep <markers_json>
+# ga-0ye7ar (wa-ycyf8, 2026-09-17): complements gate_exile_watchdog_sweep
+# (ga-faw5o) above with the OPPOSITE remediation. That function waits
+# $escalate_after (86400s/24h default) then GIVES UP on a still-exiled
+# marker and hands it to the Mayor. This one runs every sweep and clears
+# the exile IMMEDIATELY, the moment the underlying cause (a real merge
+# conflict) no longer holds — before ever waiting on a human.
+#
+# wa-ycyf8: a marker exiled by two TRANSIENT auto-rebase failures ("attempt
+# 2/3") sat 7h with a clean merge-tree the ENTIRE time. Nothing re-checked
+# the cause: the healthy tiers never reach an exiled marker while the queue
+# has anything else queued (has_rebase_fail sinks to the last of the 7
+# tiers in the marker-select block below), and the 24h watchdog is a much
+# slower, last-resort backstop, not a same-incident fix. Second time the
+# Mayor had to clear this by hand (wa-llq1a/wa-4zmm1, 11/09).
+#
+# Scope: has_rebase_fail markers only (0-1 in a healthy queue — cheap).
+# Reuses rig_merge_has_conflict (ga-ljbx/ga-78n2z), the SAME union-aware
+# pre-check the live rebase-attempt path already trusts, never a bespoke
+# merge-tree call that could disagree with it.
+#
+# Sets GATE_EXILE_RECOVERY_CLEARED_IDS (newline-separated marker ids this
+# call actually cleared) as its result — deliberately NOT stdout: log()/
+# warn() in this file write to stdout (see log(), ~line 4548), so a caller
+# capturing this function's stdout via $(...) would get diagnostic text
+# interleaved with the id list. A plain global, read by the caller right
+# after the (bare, uncaptured) call below, avoids that trap — the same
+# reason every other multi-step result in this file (MARKER_ID, COUNT, …)
+# is only ever captured around a pure jq pipeline, never around a function
+# that also logs.
+#
+# Deliberately NOT re-injecting a cleared marker into the caller's copy of
+# $MARKERS_JSON for the marker-select block further below: this sweep's
+# selection still sees it as exiled (tier 7, loses as always behind a
+# non-empty queue) and only rejoins the healthy tiers on the NEXT sweep's
+# fresh fetch — matching the Aceite criterion ("volta ao tier normal na
+# proxima varredura"). The cleared ids ARE consumed immediately, though, to
+# keep gate_exile_watchdog_sweep from acting on stale pre-recovery labels
+# in the SAME sweep (see the Step 0b-0 call site below).
+gate_exile_recovery_sweep() {
+  local markers_json="$1"
+  GATE_EXILE_RECOVERY_CLEARED_IDS=""
+  if [ "${GATE_EXILE_RECOVERY_ENABLED:-1}" != "1" ]; then
+    return 0
+  fi
+  local ids marker_id m_branch verdict attempt since_lines since_lbl
+  ids=$(printf '%s\n' "$markers_json" | jq -r '
+    .[] | select(
+      ((.labels // []) | map(select(test("^gate:(rebase-attempt|exiled-tier5):[0-9]+$"))) | length) > 0
+    ) | .id' 2>/dev/null || true)
+  [ -z "$ids" ] && return 0
+  while IFS= read -r marker_id; do
+    [ -z "$marker_id" ] && continue
+    DESC=$(printf '%s\n' "$markers_json" | jq -r --arg id "$marker_id" '.[] | select(.id == $id) | .description // ""' 2>/dev/null || echo "")
+    m_branch=$(extract "branch")
+    if [ -z "$m_branch" ]; then
+      warn "gate_exile_recovery_sweep: marker $marker_id has no branch: field — skipping clean-merge recheck this sweep."
+      continue
+    fi
+    RIG=$(extract "rig"); BEAD_ID=$(extract "bead_id"); BEAD_RIG=$(extract "bead_rig")
+    if ! gate_resolve_rig_context; then
+      warn "gate_exile_recovery_sweep: cannot resolve rig context for exiled marker $marker_id (rig=$RIG) — skipping this sweep."
+      continue
+    fi
+    if [ -z "$(rig_resolve_commit "origin/$m_branch")" ]; then
+      warn "gate_exile_recovery_sweep: origin/$m_branch does not resolve for marker $marker_id (unfetched or force-pushed away) — skipping this sweep."
+      continue
+    fi
+    verdict=$(rig_merge_has_conflict "origin/$DEFAULT_BRANCH" "origin/$m_branch")
+    [ "$verdict" = "0" ] || continue
+    warn "gate_exile_recovery_sweep: clearing rebase-fail exile on marker $marker_id — origin/$m_branch merges into origin/$DEFAULT_BRANCH with zero conflicts (ga-0ye7ar)."
+    attempt=$(read_rebase_attempt "$marker_id")
+    bd -C "$GC_CITY" label remove "$marker_id" "gate:exiled-tier5:$attempt"      -q 2>/dev/null || true
+    bd -C "$GC_CITY" label remove "$marker_id" "gate:rebase-attempt:$attempt"    -q 2>/dev/null || true
+    bd -C "$GC_CITY" label remove "$marker_id" "gate:rebase-fail-count:$attempt" -q 2>/dev/null || true
+    # gate:exiled-since carries a timestamp, not a bounded attempt counter, so
+    # (unlike the three labels above) its exact value can't be reconstructed —
+    # read it back off the same $markers_json snapshot instead.
+    since_lines=$(printf '%s\n' "$markers_json" | jq -r --arg id "$marker_id" '
+      .[] | select(.id == $id) | (.labels // [])[] | select(test("^gate:exiled-since:[0-9]+$"))' 2>/dev/null || true)
+    while IFS= read -r since_lbl; do
+      [ -z "$since_lbl" ] && continue
+      bd -C "$GC_CITY" label remove "$marker_id" "$since_lbl" -q 2>/dev/null || true
+    done <<EOF_SINCE
+$since_lines
+EOF_SINCE
+    bd -C "$GC_CITY" label remove "$marker_id" "gate:exile-escalated" -q 2>/dev/null || true
+    bd -C "$GC_CITY" comment "$marker_id" "Gate auto-recovery (ga-0ye7ar): cleared the rebase-fail exile automatically — origin/$m_branch now merges into origin/$DEFAULT_BRANCH with zero conflicts (a real merge-tree recheck, not an assumption). This marker rejoins the healthy tiers on the next sweep instead of waiting for a human or the 24h exile-watchdog escalation." 2>/dev/null || true
+    GATE_EXILE_RECOVERY_CLEARED_IDS="$GATE_EXILE_RECOVERY_CLEARED_IDS
+$marker_id"
+  done <<EOF_IDS
+$ids
+EOF_IDS
+  return 0
+}
+# SELFTEST-EXTRACT gate-exile-recovery: END
+
 # is_transient_spawn_error <spawn_err_text> — "1" if the captured stderr from a
 # failed `gc session new` reviewer spawn looks like a TRANSIENT connectivity
 # blip (Dolt/MySQL connection dropped mid-call), "0" otherwise. Pure (no I/O),
@@ -8890,7 +8988,36 @@ fi
 # See gate_exile_watchdog_sweep() (~line 3120) for the mechanics.
 GATE_EXILE_ESCALATE_AFTER_SECONDS="${GATE_EXILE_ESCALATE_AFTER_SECONDS:-86400}"
 case "$GATE_EXILE_ESCALATE_AFTER_SECONDS" in ''|*[!0-9]*) GATE_EXILE_ESCALATE_AFTER_SECONDS=86400 ;; esac
-gate_exile_watchdog_sweep "$MARKERS_JSON" "$GATE_EXILE_ESCALATE_AFTER_SECONDS" "$(date -u +%s)"
+
+# ── ga-0ye7ar (wa-ycyf8): rebase-fail exile AUTO-RECOVERY ────────────────────
+# Runs BEFORE the escalation watchdog on purpose: gate_exile_recovery_sweep
+# clears the exile the instant a real merge-tree recheck proves the original
+# conflict no longer exists, so a marker that has ALSO crossed the 24h
+# escalate_after threshold above gets a chance to be cleared, not mailed to
+# the Mayor, on this exact sweep. See gate_exile_recovery_sweep() (~line 3430)
+# for why: same placement rationale as the watchdog it sits next to (never
+# admits new work, only repairs existing exile state, so neither the
+# quiet-hours nor headroom "pause NEW admission" gate below applies to it).
+GATE_EXILE_RECOVERY_ENABLED="${GATE_EXILE_RECOVERY_ENABLED:-1}"
+case "$GATE_EXILE_RECOVERY_ENABLED" in 0) GATE_EXILE_RECOVERY_ENABLED=0 ;; *) GATE_EXILE_RECOVERY_ENABLED=1 ;; esac
+gate_exile_recovery_sweep "$MARKERS_JSON"
+
+# ga-0ye7ar: exclude whatever gate_exile_recovery_sweep just cleared from the
+# watchdog's input below — otherwise the watchdog would still act on ITS OWN
+# (unchanged, in-memory) copy of $MARKERS_JSON, built before recovery ran,
+# and could mail Mayor + park at gate-status:needs-rebase the exact marker
+# recovery just proved healthy and cleared, on the very same sweep. This is
+# not merely theoretical: it is reachable by any marker that sat
+# exiled-but-actually-clean past $GATE_EXILE_ESCALATE_AFTER_SECONDS — exactly
+# the shape of the incident this bead exists to fix, just aged further.
+if [ -n "$GATE_EXILE_RECOVERY_CLEARED_IDS" ]; then
+  WATCHDOG_MARKERS_JSON=$(printf '%s\n' "$MARKERS_JSON" | jq -c --arg ids "$GATE_EXILE_RECOVERY_CLEARED_IDS" '
+    ($ids | split("\n") | map(select(length > 0))) as $cleared
+    | map(select(($cleared | index(.id)) == null))' 2>/dev/null || echo "$MARKERS_JSON")
+else
+  WATCHDOG_MARKERS_JSON="$MARKERS_JSON"
+fi
+gate_exile_watchdog_sweep "$WATCHDOG_MARKERS_JSON" "$GATE_EXILE_ESCALATE_AFTER_SECONDS" "$(date -u +%s)"
 
 # ── ga-dxyvxr: quiet-hours admission gate — PAUSE new-run admission 00h-08h ────
 # There IS queued work (COUNT>0 above), but Athos's quiet-hours decision
@@ -9326,6 +9453,23 @@ case "$GATE_FRESH_SLOT_DUE" in true|false) ;; *) GATE_FRESH_SLOT_DUE=false ;; es
 # case measured above.
 GATE_MARKER_HARD_AGE_SECONDS="${GATE_MARKER_HARD_AGE_SECONDS:-$((GATE_MARKER_AGE_PROMOTE_SECONDS * 3))}"
 case "$GATE_MARKER_HARD_AGE_SECONDS" in ''|*[!0-9]*) GATE_MARKER_HARD_AGE_SECONDS=$((GATE_MARKER_AGE_PROMOTE_SECONDS * 3)) ;; esac
+# ga-0ye7ar (wa-ycyf8): EXILE-AGE ceiling — invariant (b) of the wa-ycyf8 fix.
+# Mirrors GATE_MARKER_HARD_AGE_SECONDS just above, but keyed on the EXILE's
+# own clock (gate:exiled-since, stamped by gate_exile_watchdog_sweep) rather
+# than the marker's created_at. Without this, has_rebase_fail's blanket
+# exclusion from is_overdue (ga-q3ig2, tier 1 below) means an exiled marker
+# in a queue that never empties can sail past is_overdue's own threshold and
+# STILL never reach the emergency tier — exactly the wa-ycyf8 incident (7h,
+# healthy queue 6-24 deep the entire time). Bounded, not a free pass for a
+# genuinely-broken branch: MAX_REBASE_ATTEMPTS (default 3) still caps how
+# many times it can be re-attempted before the existing attempt-based
+# escalation (Step 4c) takes it out of gate-status:queued entirely — this
+# only affects how SOON it gets its next already-bounded attempt. Defaults
+# to the same value as GATE_MARKER_HARD_AGE_SECONDS (one ceiling, healthy or
+# not) but is independently configurable. 0 disables the feature (same "0
+# turns it off" convention as GATE_FRESH_SLOT_WINDOW_SWEEPS above).
+GATE_EXILE_OVERDUE_SECONDS="${GATE_EXILE_OVERDUE_SECONDS:-$GATE_MARKER_HARD_AGE_SECONDS}"
+case "$GATE_EXILE_OVERDUE_SECONDS" in ''|*[!0-9]*) GATE_EXILE_OVERDUE_SECONDS="$GATE_MARKER_HARD_AGE_SECONDS" ;; esac
 # ga-r8u92 (ga-faw5o defeito 1): SIZE-AWARE SELECTION, healthy-not-aged tiers only.
 # Step 0b-0 (above, OUTSIDE this sentinel — mirrors how MARKERS_JSON itself is
 # built outside and merely CONSUMED here) annotates each candidate with
@@ -9348,6 +9492,7 @@ MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   --argjson now "$GATE_MARKER_NOW_EPOCH" \
   --argjson age_threshold "$GATE_MARKER_AGE_PROMOTE_SECONDS" \
   --argjson hard_threshold "$GATE_MARKER_HARD_AGE_SECONDS" \
+  --argjson exile_ceiling "$GATE_EXILE_OVERDUE_SECONDS" \
   --argjson reserve_fresh "$GATE_FRESH_SLOT_DUE" \
   --argjson diff_unknown "$GATE_DIFF_SIZE_UNKNOWN_SENTINEL" \
   --arg priority_authors "$GATE_PRIORITY_AUTHORS" '
@@ -9360,6 +9505,18 @@ MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   def is_aged: try (($now - (.created_at | fromdateiso8601)) > $age_threshold) catch false;
   # ga-ddm76: priority-blind emergency ceiling — see the shell comment above.
   def is_overdue: try (($now - (.created_at | fromdateiso8601)) > $hard_threshold) catch false;
+  # ga-0ye7ar: the exile clock itself, independent of created_at (see the shell
+  # comment above GATE_EXILE_OVERDUE_SECONDS). gate:exiled-since is stamped by
+  # gate_exile_watchdog_sweep the first sweep it notices a marker exiled —
+  # absent (never yet observed in exile, or already cleared by
+  # gate_exile_recovery_sweep) reads as "not old enough yet", the same
+  # conservative default the watchdog itself uses. That keeps a
+  # freshly-exiled marker (e.g. gate-priority-starvation-ceiling.selftest.sh
+  # case (4): overdue-by-created_at but no exiled-since label yet) sinking
+  # behind healthy markers exactly as before — this tier only admits a
+  # marker whose OWN exile has sat unconsidered long enough on its own terms.
+  def exiled_since_epoch: ([(.labels // [])[] | select(test("^gate:exiled-since:[0-9]+$")) | (sub("^gate:exiled-since:";"") | tonumber)] | max) // null;
+  def exile_overdue: ($exile_ceiling > 0) and (exiled_since_epoch != null) and (($now - exiled_since_epoch) > $exile_ceiling);
   # crew_of parses the <crew> segment of `branch: crew/<crew>/<bead>` from the
   # marker DESCRIPTION. MUST always yield exactly one value ("" when absent) —
   # `capture`/`scan` yield an EMPTY STREAM on no-match under jq, and `crew_of as
@@ -9389,7 +9546,13 @@ MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   # the secondary tiebreak (4cae0a2c49, Athos: desempate=mais novo — preserved
   # for equal-size diffs; unknown-size diffs tie at the sentinel and fall
   # through to it too).
-  (map(select(is_overdue and (has_rebase_fail | not)))                              | sort_by(.created_at))
+  # ga-0ye7ar: tier 1 now ALSO admits a has_rebase_fail marker once its own
+  # exile has run past $exile_ceiling (exile_overdue) — the ga-q3ig2 "a
+  # conflicted branch never jumps the queue" guarantee still holds for every
+  # OTHER tier (2-6 all keep excluding has_rebase_fail unchanged below), and
+  # gate-priority-starvation-ceiling.selftest.sh case (4) still passes
+  # because that fixture carries no gate:exiled-since label at all.
+  (map(select((is_overdue and (has_rebase_fail | not)) or (has_rebase_fail and exile_overdue))) | sort_by(.created_at))
   + (if $reserve_fresh then (map(select(has_rebase_fail | not)) | sort_by(.created_at) | reverse | .[0:1]) else [] end)
   + (map(select(is_priority and (has_rebase_fail | not) and is_aged))                 | sort_by(.created_at))
   + (map(select(is_priority and (has_rebase_fail | not) and (is_aged | not)))       | sort_by([diff_size, -created_epoch]))

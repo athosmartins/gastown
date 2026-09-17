@@ -215,7 +215,7 @@ has "$DISPATCHER" 'gate_fresh_slot_should_reserve'   "pure reserve/hold decision
 has "$DISPATCHER" 'GATE_FRESH_SLOT_WINDOW_SWEEPS'    "bounded-window tunable configured"
 has "$DISPATCHER" 'GATE_FRESH_SLOT_COUNT_FILE'       "persistent sweep counter wired"
 has "$DISPATCHER" 'reserve_fresh'                    "reserve_fresh seam threaded into the jq selection"
-OVERDUE_LINE=$(grep -n 'map(select(is_overdue' "$DISPATCHER" | head -1 | cut -d: -f1)
+OVERDUE_LINE=$(grep -n 'map(select((is_overdue' "$DISPATCHER" | head -1 | cut -d: -f1)
 RESERVE_LINE=$(grep -n 'reserve_fresh then' "$DISPATCHER" | head -1 | cut -d: -f1)
 PRIO_AGED_LINE=$(grep -n 'is_aged))' "$DISPATCHER" | grep -v 'is_aged | not' | head -1 | cut -d: -f1)
 BROKEN_LINE=$(grep -n 'map(select(has_rebase_fail))' "$DISPATCHER" | head -1 | cut -d: -f1)
