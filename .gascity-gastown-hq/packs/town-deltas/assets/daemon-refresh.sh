@@ -253,6 +253,36 @@
 #      template/asset matching (point 3/ga-jkj0) is untouched, a
 #      structurally separate question the file tracks under a different key
 #      ("assets") this fix does not consume.
+#  15. (ga-1ivcn4) The precondition below (PRE_DEPLOY_SHA==POST_DEPLOY_SHA)
+#      answers "did THIS invocation's own git-pull change anything" — a
+#      question about a RACE, not about the bead. If some OTHER path (a
+#      rig's 5-min cron, town-root-reconciler, a manual pull) already
+#      advanced RUNTIME_DIR to the merge before this call's own deploy step
+#      ran, PRE/POST_DEPLOY_SHA are BOTH already at (or past) that merge —
+#      their delta is empty even though the merge itself may have changed
+#      live runtime code no daemon has picked up yet. Measured live
+#      (wa-ycyf8, 2026-09-17): exactly this let a P0 close with
+#      VERDICT=SKIPPED/not_applicable while the affected daemon (notify_
+#      only_locked, never auto-restarted) kept serving the old code — closed
+#      as delivered with zero verification. When the caller also passes
+#      BEAD_MERGE_PRE_SHA/BEAD_MERGE_SHA (point 14's own attribution inputs —
+#      quality-gate-dispatcher.sh already computes and threads both
+#      through), a true no-op pull now falls back to THAT range instead of
+#      declaring SKIPPED outright: same guard chain Step 1b already
+#      established (ga-agracx) — never trust the inputs blindly, only fall
+#      back when both are non-empty, distinct, and BEAD_MERGE_PRE_SHA is a
+#      confirmed ancestor of BEAD_MERGE_SHA in THIS runtime checkout. Every
+#      step below (CHANGED, Step 1b, discovery, AFFECTED, restart/guard,
+#      verdict) then runs exactly as it would for any other genuine delta —
+#      a bead whose own merge is docs/tests-only still legitimately resolves
+#      to OK/not_applicable (point 9), and one that reaches a live,
+#      not-yet-restarted daemon now correctly reaches NEEDS_GUARDED_RESTART
+#      instead of being hidden behind the race. Any guard failure (inputs
+#      absent/unresolvable/not-an-ancestor/equal) — including every caller
+#      that simply doesn't pass them, e.g. story-delivery.sh's own primary
+#      call (it has its own separate MERGE_OWN_* side-channel probe instead
+#      — see ga-6zkhci) — falls straight through to today's exact
+#      SKIPPED/not_applicable behavior, zero regression.
 #
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
@@ -587,9 +617,34 @@ if [ -z "$RUNTIME_DIR" ] || ! git -C "$RUNTIME_DIR" rev-parse --is-inside-work-t
   log "runtime '$RUNTIME_DIR' is not a git work tree — skip (static daemon_restarts still apply)."
   emit SKIPPED "runtime not a git work tree" not_verified
 fi
-if [ -z "$PRE_DEPLOY_SHA" ] || [ -z "$POST_DEPLOY_SHA" ] || [ "$PRE_DEPLOY_SHA" = "$POST_DEPLOY_SHA" ]; then
+if [ -z "$PRE_DEPLOY_SHA" ] || [ -z "$POST_DEPLOY_SHA" ]; then
   log "no SHA delta ($PRE_DEPLOY_SHA .. $POST_DEPLOY_SHA) — deploy changed nothing — skip."
   emit SKIPPED "no source change in deploy" not_applicable
+fi
+if [ "$PRE_DEPLOY_SHA" = "$POST_DEPLOY_SHA" ]; then
+  # ga-1ivcn4 (header point 15): a true no-op pull only proves THIS
+  # invocation's own git-pull found nothing — not that the bead being
+  # checked changed nothing (some OTHER path may have already pulled it).
+  # Fall back to the bead's own merge range before giving up on it: same
+  # guard chain Step 1b already uses below for BEAD_MERGE_PRE_SHA/
+  # BEAD_MERGE_SHA (ga-agracx) — only when both are non-empty, distinct, and
+  # BEAD_MERGE_PRE_SHA is a confirmed ancestor of BEAD_MERGE_SHA in THIS
+  # runtime checkout. A caller that doesn't pass them (e.g. story-
+  # delivery.sh's own primary call) or passes an untrustworthy pair falls
+  # straight through to the exact same SKIPPED this precondition has always
+  # emitted here — zero regression.
+  if [ -n "$BEAD_MERGE_PRE_SHA" ] && [ -n "$BEAD_MERGE_SHA" ] \
+     && [ "$BEAD_MERGE_PRE_SHA" != "$BEAD_MERGE_SHA" ] \
+     && git -C "$RUNTIME_DIR" rev-parse --verify -q "$BEAD_MERGE_PRE_SHA" >/dev/null 2>&1 \
+     && git -C "$RUNTIME_DIR" rev-parse --verify -q "$BEAD_MERGE_SHA" >/dev/null 2>&1 \
+     && git -C "$RUNTIME_DIR" merge-base --is-ancestor "$BEAD_MERGE_PRE_SHA" "$BEAD_MERGE_SHA" 2>/dev/null; then
+    log "this invocation's own pull was a true no-op (PRE_DEPLOY_SHA==POST_DEPLOY_SHA=$POST_DEPLOY_SHA) — falling back to the bead's own merge range ($BEAD_MERGE_PRE_SHA..$BEAD_MERGE_SHA) instead of declaring SKIPPED, so a race with some other path that already pulled this merge cannot hide it from verification (ga-1ivcn4, wa-ycyf8)."
+    PRE_DEPLOY_SHA="$BEAD_MERGE_PRE_SHA"
+    POST_DEPLOY_SHA="$BEAD_MERGE_SHA"
+  else
+    log "no SHA delta ($PRE_DEPLOY_SHA .. $POST_DEPLOY_SHA) — deploy changed nothing — skip."
+    emit SKIPPED "no source change in deploy" not_applicable
+  fi
 fi
 
 # ── commit-epoch (ga-puq8z) ─────────────────────────────────────────────────────
