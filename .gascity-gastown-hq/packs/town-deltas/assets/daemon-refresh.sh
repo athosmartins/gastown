@@ -1719,10 +1719,23 @@ if [ -n "${DAEMON_BASELINE_OVERRIDES// /}" ] && [ -n "${AFFECTED// /}" ]; then
   # git diff --name-only <sha>..POST_DEPLOY_SHA, memoized per distinct <sha> —
   # several labels sharing the same last-resolved cycle (the common case) pay
   # for exactly one git invocation, not one per label.
-  ga0fawwr_narrow_changed() {  # ga0fawwr_narrow_changed <sha> -> multiline changed set
+  ga0fawwr_narrow_changed() {  # ga0fawwr_narrow_changed <sha> -> prints multiline changed
+    # set on stdout, returns 1 if the diff itself could not be computed at
+    # all. Third-state: a FAILED `git diff` and a SUCCESSFUL diff that just
+    # happens to be empty must never collapse into the same "" — the first
+    # means "unknown, could not check" (caller must keep the label as
+    # originally affected), the second means "confirmed, genuinely nothing
+    # changed" (a real, safe signal to downgrade on). Returning 1 only on the
+    # former, distinct from printing empty output on the latter, is what lets
+    # the caller tell them apart.
     local sha="$1" cache
     cache="$DISCO_DIR/.ga0fawwr-changed.$(echo "$sha" | tr -c 'A-Za-z0-9' '_')"
-    [ -f "$cache" ] || git -C "$RUNTIME_DIR" diff --name-only "$sha" "$POST_DEPLOY_SHA" > "$cache" 2>/dev/null
+    if [ ! -f "$cache" ]; then
+      if ! git -C "$RUNTIME_DIR" diff --name-only "$sha" "$POST_DEPLOY_SHA" > "$cache" 2>/dev/null; then
+        rm -f "$cache" 2>/dev/null
+        return 1
+      fi
+    fi
     cat "$cache" 2>/dev/null || true
   }
 
@@ -1739,13 +1752,20 @@ if [ -n "${DAEMON_BASELINE_OVERRIDES// /}" ] && [ -n "${AFFECTED// /}" ]; then
     local label="$1" changed="$2" e eb stem tmpl tb pat covered=0
     local entries json_entries="" adhoc_entries=""
     entries="$(cat "$DISCO_DIR/$label" 2>/dev/null || true)"
-    [ -n "${entries// /}" ] || return 1
+    # third-state: an entries file we can't read/find here is "don't know",
+    # not "no entries" — Step 3 already proved this label real (it's only
+    # ever called for a label already in $AFFECTED, and FORCE_RESTART_LABELS
+    # members are excluded before this is ever reached), so an unreadable
+    # file now is a filesystem hiccup, not evidence of a clean closure. Fail
+    # toward the SAFE side of a downgrade decision: still hit (0), i.e. never
+    # downgrade on a read we couldn't actually perform.
+    [ -n "${entries// /}" ] || return 0
     for e in $entries; do
       if json_covers_entry "$e"; then json_entries="$json_entries $e"; else adhoc_entries="$adhoc_entries $e"; fi
     done
 
     if [ -n "${json_entries// /}" ] && [ -f "$DEPLOY_DEPS_JSON" ]; then
-      local hit
+      local hit hit_rc
       hit="$(CHANGED_FOR_DDJ="$changed" ENTRIES_FOR_DDJ="$json_entries" python3 - "$DEPLOY_DEPS_JSON" <<'PY' 2>/dev/null
 import json, os, sys
 try:
@@ -1763,7 +1783,21 @@ for path, info in daemons.items():
         break
 PY
 )"
-      [ "$hit" = "HIT" ] && return 0
+      hit_rc=$?
+      if [ "$hit" = "HIT" ]; then
+        return 0
+      elif [ "$hit_rc" -ne 0 ]; then
+        # third-state: python/deploy_deps.json failed to answer at all for
+        # these exclusively-trusted entries (header point 14) — unknown, not
+        # "confirmed clean". A crashed check must never look like a clean
+        # one; fail toward keeping the label affected.
+        return 0
+      fi
+      # hit_rc==0 and hit != HIT: python ran fine and positively confirmed no
+      # intersection for every json-covered entry — trust that exclusively
+      # (header point 14) and do NOT fall through to ad-hoc for THESE
+      # entries; only adhoc_entries (below, entries json doesn't cover at
+      # all) can still keep the label affected.
     fi
     [ -n "${adhoc_entries// /}" ] || return 1
 
@@ -1829,8 +1863,15 @@ PY
       NARROWED_AFFECTED="$NARROWED_AFFECTED $label"
       continue
     fi
-    narrow_changed="$(ga0fawwr_narrow_changed "$override_sha")"
-    if ga0fawwr_label_hits "$label" "$narrow_changed"; then
+    if ! narrow_changed="$(ga0fawwr_narrow_changed "$override_sha")"; then
+      # `git diff` itself failed against a sha that passed every check above
+      # (real commit, correctly ordered) — a transient/environmental fault,
+      # not evidence of anything. Unknown, so keep the label exactly as the
+      # wide computation found it; never treat "could not check" as "checked
+      # and clean".
+      log "ga-0fawwr: could not compute the narrow changed-set for $label against override $override_sha (git diff failed) — leaving it in AFFECTED, unmodified."
+      NARROWED_AFFECTED="$NARROWED_AFFECTED $label"
+    elif ga0fawwr_label_hits "$label" "$narrow_changed"; then
       NARROWED_AFFECTED="$NARROWED_AFFECTED $label"
     else
       log "ga-0fawwr: $label downgraded out of AFFECTED — its own closure is clean since $override_sha (its individually-tracked last-clean point), even though the rig-wide window ($PRE_DEPLOY_SHA..$POST_DEPLOY_SHA) still intersects it via a DIFFERENT daemon's unresolved staleness."
