@@ -6706,7 +6706,32 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         bd -C "$BEAD_CITY" label add    "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
         bd -C "$BEAD_CITY" update       "$BEAD_ID" --unset-metadata gc.routed_to -q 2>/dev/null || true
         bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:queued" -q 2>/dev/null || true
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (merge-mechanical, ga-39l9z2) — labeled gate:needs-rebase; NOT counted as a gate:fix-attempt, since the reviewers already approved this content ($GATE_SHA_FAIL_CLASS class=hold). Author $AUTHOR is a LIVE crew session, so assignee + story:in-flight were kept; rebase onto current main and re-run /gate-done (no code changes needed)." 2>/dev/null || true
+        # ga-39l9z2 self-audit: mirrors the sibling needs-fix 'keep' arm's own
+        # KEEP_VERIFY_JSON discipline above — a bare "were kept" claim with no
+        # read-back is exactly the unverified-success shape ga-n7hu2 already
+        # caught once in that sibling arm. Verify the raw bead, not intent.
+        _NR_KEEP_VERIFY_JSON=""
+        _NR_KEEP_VERIFY_READ_OK=1
+        _NR_KEEP_VERIFY_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _NR_KEEP_VERIFY_READ_OK=0
+        [ -n "$_NR_KEEP_VERIFY_JSON" ] || _NR_KEEP_VERIFY_READ_OK=0
+        if [ "$_NR_KEEP_VERIFY_READ_OK" = "0" ]; then
+          _NR_KEEP_ASSIGNEE_OBS="assignee=UNVERIFIED (post-write read failed — state unknown, NOT a claim that the keep failed)"
+          _NR_KEEP_INFLIGHT_OBS="story:in-flight=UNVERIFIED (post-write read failed)"
+        else
+          _NR_KEEP_VERIFY_ASSIGNEE=$(printf '%s' "$_NR_KEEP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
+          _NR_KEEP_VERIFY_HAS_INFLIGHT=$(printf '%s' "$_NR_KEEP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | ((.labels // []) | index("story:in-flight")) != null' 2>/dev/null || echo "false")
+          if [ "$_NR_KEEP_VERIFY_ASSIGNEE" = "$AUTHOR" ]; then
+            _NR_KEEP_ASSIGNEE_OBS="assignee=$AUTHOR (kept)"
+          else
+            _NR_KEEP_ASSIGNEE_OBS="assignee='${_NR_KEEP_VERIFY_ASSIGNEE}' NOT $AUTHOR — keep action did not stick, needs investigation"
+          fi
+          if [ "$_NR_KEEP_VERIFY_HAS_INFLIGHT" = "true" ]; then
+            _NR_KEEP_INFLIGHT_OBS="story:in-flight=present"
+          else
+            _NR_KEEP_INFLIGHT_OBS="story:in-flight=MISSING even after re-add — needs investigation"
+          fi
+        fi
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (merge-mechanical, ga-39l9z2) — labeled gate:needs-rebase; NOT counted as a gate:fix-attempt, since the reviewers already approved this content (GATE_SHA_FAIL_CLASS=$GATE_SHA_FAIL_CLASS). Author $AUTHOR is a LIVE crew session, so this dispatcher acted to KEEP assignee + story:in-flight (ga-jyox) — verified post-write on the raw bead, not display: $_NR_KEEP_ASSIGNEE_OBS; $_NR_KEEP_INFLIGHT_OBS. Rebase onto current main and re-run /gate-done (no code changes needed)." 2>/dev/null || true
         nudge_author_with_fallback "$BEAD_ID" "$NOTIFY_AUTHOR" "$AUTHOR" \
           "Gate merge-conflict for $BEAD_ID (branch $BRANCH) — your reviewed code is fine, but it needs a rebase onto current main. Your assignee was kept; rebase and re-run /gate-done." \
           "Gate needs-rebase live-crew nudge for $BEAD_ID (branch $BRANCH)" || true
@@ -6760,7 +6785,7 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
             _NR_QUEUED_OBS="gate:queued=left untouched (clear unverified)"
           fi
         fi
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (merge-mechanical, ga-39l9z2) — labeled gate:needs-rebase; NOT counted as a gate:fix-attempt, since the reviewers already approved this content ($GATE_SHA_FAIL_CLASS class=hold). story:in-flight + gate:reviewing cleared. gc.routed_to restored to $_NR_ROUTE so pool workers can self-serve this bead — verified post-write, not assumed: $_NR_ROUTE_OBS; $_NR_ASSIGNEE_OBS; $_NR_STATUS_OBS; $_NR_QUEUED_OBS. Rebase onto current main and re-run /gate-done (no code changes needed)." 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (merge-mechanical, ga-39l9z2) — labeled gate:needs-rebase; NOT counted as a gate:fix-attempt, since the reviewers already approved this content (GATE_SHA_FAIL_CLASS=$GATE_SHA_FAIL_CLASS). story:in-flight + gate:reviewing cleared. gc.routed_to restored to $_NR_ROUTE so pool workers can self-serve this bead — verified post-write, not assumed: $_NR_ROUTE_OBS; $_NR_ASSIGNEE_OBS; $_NR_STATUS_OBS; $_NR_QUEUED_OBS. Rebase onto current main and re-run /gate-done (no code changes needed)." 2>/dev/null || true
       fi
     elif [ "$PREV_ATTEMPT" -ge "$GATE_FIX_CAP" ]; then
       # (c) RETRY CAP REACHED — stop auto-retry, escalate to the Mayor ONCE.

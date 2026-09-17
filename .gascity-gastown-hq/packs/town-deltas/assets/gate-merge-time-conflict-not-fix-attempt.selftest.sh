@@ -186,6 +186,24 @@ if [ -n "$NR_BODY" ]; then
   else
     bad "needs-rebase 'clear' sub-arm does not restore gc.routed_to"
   fi
+  # ga-39l9z2 self-audit (mandatory /gate-done third-state sweep): the 'keep'
+  # sub-arm originally claimed "assignee + story:in-flight were kept" with no
+  # post-write read-back — an unverified-success claim, the same shape
+  # ga-n7hu2 already caught once in the sibling needs-fix 'keep' arm. Fixed
+  # by mirroring that arm's own KEEP_VERIFY_JSON pattern; this guards the fix
+  # stays wired in.
+  NR_KEEP_SUBARM=$(printf '%s' "$NR_BODY" | awk '
+    /GATE_NR_ASSIGNEE_ACTION" = "keep"/ { flag=1 }
+    flag { print }
+    /^      else$/ { if (flag) exit }
+  ')
+  if [ -z "$NR_KEEP_SUBARM" ]; then
+    bad "NR_KEEP_SUBARM extraction produced nothing — inner if/else anchor drifted, cannot verify the 'keep' sub-arm's verify-read"
+  elif printf '%s' "$NR_KEEP_SUBARM" | grep -qF 'bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null'; then
+    ok "needs-rebase 'keep' sub-arm verifies its writes with a post-write read (not an unverified 'were kept' claim, ga-39l9z2 self-audit)"
+  else
+    bad "needs-rebase 'keep' sub-arm does NOT verify its writes — unverified-success claim (same class ga-n7hu2 caught in the sibling needs-fix arm)"
+  fi
 else
   bad "NR_BODY empty — cannot verify sub-arm (see A4)"
 fi
