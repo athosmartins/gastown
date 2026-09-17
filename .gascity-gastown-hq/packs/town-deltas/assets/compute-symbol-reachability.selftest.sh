@@ -228,6 +228,64 @@ N5=$(echo "$OUT5" | grep -c .)
   && ok "T5: unresolvable PRE sha fails open — both requested entrypoints echoed back" \
   || bad "T5: expected both entrypoints echoed back on fail-open, got $N5: [$OUT5]"
 
+# ── T6/T7: whole-module import (no "from X import Y") ────────────────────────
+# T6 — imported but the single-level Attribute scan finds ZERO uses of the
+#      bound name at all: fails open (reachable) rather than treat an
+#      unusual "confirmed unused" as safe to demote.
+# T7 — imported AND used, but only for an unrelated, unchanged function:
+#      a genuine negative, still correctly excluded.
+R6="$(mk_repo t6)"
+mkdir -p "$R6/lib" "$R6/daemons"
+cat > "$R6/lib/shared_util.py" <<'PY'
+def compute(x):
+    return x
+
+def other(x):
+    return x
+PY
+cat > "$R6/daemons/daemon_unused_import.py" <<'PY'
+import lib.shared_util
+
+def route(x):
+    return x
+PY
+cat > "$R6/daemons/daemon_uses_other.py" <<'PY'
+import lib.shared_util as su
+
+def route(x):
+    return su.other(x)
+PY
+git -C "$R6" add -A && git -C "$R6" commit -q -m pre
+PRE6="$(git -C "$R6" rev-parse HEAD)"
+
+cat > "$R6/lib/shared_util.py" <<'PY'
+def compute(x):
+    return x * 2
+
+def other(x):
+    return x
+PY
+git -C "$R6" add -A && git -C "$R6" commit -q -m post
+POST6="$(git -C "$R6" rev-parse HEAD)"
+
+cat > "$R6/daemons/deploy_deps.json" <<'JSON'
+{"daemons": {
+  "daemons/daemon_unused_import.py": {"closure": ["daemons/daemon_unused_import.py", "lib/shared_util.py"], "label": "com.test.unused-import"},
+  "daemons/daemon_uses_other.py": {"closure": ["daemons/daemon_uses_other.py", "lib/shared_util.py"], "label": "com.test.uses-other"}
+}}
+JSON
+
+OUT6="$("$PY" "$SCRIPT" --repo "$R6" --deps "$R6/daemons/deploy_deps.json" \
+  --pre "$PRE6" --post "$POST6" \
+  --entrypoints daemons/daemon_unused_import.py daemons/daemon_uses_other.py)"
+
+echo "$OUT6" | grep -qxF "daemons/daemon_unused_import.py" \
+  && ok "T6: whole-module import with zero attribute uses found fails open (reachable)" \
+  || bad "T6: expected daemon_unused_import.py to fail open — got: [$OUT6]"
+echo "$OUT6" | grep -qxF "daemons/daemon_uses_other.py" \
+  && bad "T7: daemon_uses_other.py (only ever calls the unrelated, unchanged other()) should NOT be reachable — got: [$OUT6]" \
+  || ok "T7: whole-module import used only for an unrelated, unchanged function correctly excluded"
+
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"
 if [ "$FAIL" = 0 ]; then echo "  RESULT: PASS"; exit 0; else echo "  RESULT: FAIL"; exit 1; fi

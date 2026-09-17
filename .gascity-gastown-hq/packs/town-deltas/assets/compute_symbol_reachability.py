@@ -281,7 +281,14 @@ def entrypoint_reaches_symbol(
             elif edge.bound is not None:
                 uses = all_attribute_uses(repo, m, attr_cache).get(edge.bound)
                 if uses is None:
-                    continue  # module imported but genuinely never dereferenced in m
+                    # A whole-module import with literally zero attribute
+                    # access anywhere in m is unusual enough (dynamic
+                    # getattr, a bare reference passed elsewhere, a
+                    # side-effect-only import) that "confirmed unused" is
+                    # less likely than "our single-level Attribute scan
+                    # missed the real usage pattern" — fail open rather than
+                    # silently treat this edge as contributing nothing.
+                    return True
                 used_names = uses
             else:
                 return True  # whole-module import we can't precisely track — fail open
