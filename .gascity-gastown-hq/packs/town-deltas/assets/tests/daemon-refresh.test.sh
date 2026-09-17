@@ -386,6 +386,12 @@ V=$(field VERDICT "$OUT")
 echo "$(field AFFECTED "$OUT")" | grep -q "com.test.ban-risk-dashboard" && ok "T5 importing dashboard marked affected" || nok "T5 affected" "$(field AFFECTED "$OUT")"
 [ "$V" = "OK" ] && ok "T5 verdict OK after fresh restart" || nok "T5 verdict" "got '$V' out=[$OUT]"
 [ "$(field PROOF "$OUT")" = "verified" ] && ok "T5 PROOF=verified" || nok "T5 proof" "got '$(field PROOF "$OUT")'"
+# wa-xokje: a LIVE, successfully-restarted daemon must never show up in
+# AFFECTED_NOT_RUNNING — that field is exclusively for the no-PID branch T6
+# exercises below, not a general "not a problem" bucket.
+echo "$(field AFFECTED_NOT_RUNNING "$OUT")" | grep -q "com.test.ban-risk-dashboard" \
+  && nok "T5 AFFECTED_NOT_RUNNING must not contain a live daemon" "$(field AFFECTED_NOT_RUNNING "$OUT")" \
+  || ok "T5 AFFECTED_NOT_RUNNING correctly excludes the live daemon"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T6: affected daemon is NOT currently running (no PID — e.g. a scheduled job) →
@@ -401,6 +407,12 @@ V=$(field VERDICT "$OUT")
 [ "$RC" -eq 0 ] && ok "T6 exit 0" || nok "T6 exit" "rc=$RC"
 [ ! -f "$MOCK/kicks.log" ] && ok "T6 scheduled/down job NOT kickstarted" || nok "T6 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 echo "$(field RESTARTED "$OUT")" | grep -q "daily-scraper" && nok "T6 should not restart" "restarted=$(field RESTARTED "$OUT")" || ok "T6 not in RESTARTED"
+# wa-xokje: this is the field a caller needs to tell "reaches only a
+# self-healing scheduled job" apart from "reaches a live daemon" — without
+# it, AFFECTED alone can't distinguish this case from T5's.
+echo "$(field AFFECTED_NOT_RUNNING "$OUT")" | grep -q "com.test.daily-scraper" \
+  && ok "T6 AFFECTED_NOT_RUNNING names the not-running scheduled job" \
+  || nok "T6 AFFECTED_NOT_RUNNING" "$(field AFFECTED_NOT_RUNNING "$OUT")"
 # ga-vmq1i (THE BUG THIS FIX IS ABOUT): AFFECTED is non-empty here but RESTARTED
 # is empty (the daemon was never running to restart). Before this fix, the
 # fall-through branch unconditionally emitted "all affected daemons restarted

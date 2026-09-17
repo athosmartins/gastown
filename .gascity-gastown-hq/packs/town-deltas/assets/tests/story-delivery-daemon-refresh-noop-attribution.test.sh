@@ -172,6 +172,25 @@ run_block() {
       git -C "$REPO" add -A; git -C "$REPO" commit -q -m C3
       OWN_TIP_SHA="$(git -C "$REPO" rev-parse HEAD)"
       ;;
+    scheduled_only)
+      # wa-xokje T8 (repro wa-bpbgp's scheduled-job half): own merge touches
+      # only a file whose sole reachable consumer is a scheduled/one-shot job
+      # with no live PID right now — e.g. scripts/detect_unloaded_committed_daemons.py,
+      # consumed solely by the daily com.whatsapp.unloaded-daemons-full-daily job.
+      echo cron2 > "$REPO/scripts/scheduled_job.py"
+      git -C "$REPO" add -A; git -C "$REPO" commit -q -m C2
+      OWN_TIP_SHA="$(git -C "$REPO" rev-parse HEAD)"
+      ;;
+    mixed_sensitive_scheduled)
+      # wa-xokje T9 (repro wa-bpbgp's ACTUAL full shape): own merge reaches
+      # BOTH a not-running scheduled job AND a live sensitive daemon in the
+      # same commit — must stay blamed; subtracting the scheduled job must
+      # never empty a set that still contains a live daemon.
+      echo prod4 > "$REPO/lib/sensitive_daemon_dep4.py"
+      echo cron3 > "$REPO/scripts/scheduled_job2.py"
+      git -C "$REPO" add -A; git -C "$REPO" commit -q -m C2
+      OWN_TIP_SHA="$(git -C "$REPO" rev-parse HEAD)"
+      ;;
     *)
       echo "run_block: unknown own_file_shape '$own_file_shape'" >&2
       exit 1
@@ -194,19 +213,39 @@ if [ "$DRY_RUN" = "1" ] && [ "${SIMULATE_MERGE_PROBE_CRASH:-0}" = "1" ]; then
   exit 124
 fi
 CHANGED="$(git -C "$RUNTIME_DIR" diff --name-only "$PRE_DEPLOY_SHA" "$POST_DEPLOY_SHA" 2>/dev/null)"
+# wa-xokje: model AFFECTED_NOT_RUNNING independently of the sensitive/live
+# signal — a real deploy can reach a not-running scheduled job, a live
+# sensitive daemon, both, or neither, and the two must combine correctly
+# (T9: subtracting the scheduled job must never empty a set that still
+# contains the live daemon).
+AFF=""; AFF_NR=""; GRD=""
+case "$CHANGED" in *scheduled*) AFF="$AFF com.test.scheduled-job"; AFF_NR="$AFF_NR com.test.scheduled-job" ;; esac
 case "$CHANGED" in
   *sensitive*)
+    AFF="$AFF com.test.central-sender"; GRD="$GRD com.test.central-sender"
     echo "VERDICT=NEEDS_GUARDED_RESTART"
-    echo "AFFECTED=com.test.central-sender"
+    echo "AFFECTED=${AFF# }"
+    echo "AFFECTED_NOT_RUNNING=${AFF_NR# }"
     echo "RESTARTED="
     echo "FRESH_FAIL="
-    echo "GUARDED=com.test.central-sender"
+    echo "GUARDED=${GRD# }"
     echo "REASON=sensitive hot-path daemon needs a guarded restart"
     exit 1
+    ;;
+  *scheduled*)
+    echo "VERDICT=OK"
+    echo "AFFECTED=${AFF# }"
+    echo "AFFECTED_NOT_RUNNING=${AFF_NR# }"
+    echo "RESTARTED="
+    echo "FRESH_FAIL="
+    echo "GUARDED="
+    echo "REASON=changed code touches no live daemon (only a not-currently-running scheduled job)"
+    exit 0
     ;;
   *)
     echo "VERDICT=OK"
     echo "AFFECTED="
+    echo "AFFECTED_NOT_RUNNING="
     echo "RESTARTED="
     echo "FRESH_FAIL="
     echo "GUARDED="
@@ -389,6 +428,48 @@ echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=0" \
 echo "$BD_CALLS" | grep -q "label add ga-test delivery:failed" \
   && ok "T7 delivery:failed added — earlier commit (C2) in this story's own branch IS the cause" \
   || nok "T7 failed-label" "$BD_CALLS"
+
+# ── T8 (wa-xokje): no-op pull, own merge touches ONLY a file whose sole
+#        reachable consumer is a not-running scheduled/one-shot job (repro
+#        wa-bpbgp's scheduled-job half — scripts/detect_unloaded_committed_daemons.py,
+#        consumed solely by daily com.whatsapp.unloaded-daemons-full-daily).
+#        AFFECTED is non-empty (the probe DOES see the job) but
+#        AFFECTED_NOT_RUNNING names it too, so AFFECTED_LIVE is empty →
+#        inert=1 → NOT blamed. Pre-fix (raw AFFECTED, no subtraction) this
+#        would have classified inert=0 and blamed the story forever — no
+#        amount of retrying could ever have changed that outcome. ─────────
+run_block scheduled_only correct
+[ "$RUN_RC" -eq 0 ] && ok "T8 block runs clean (rc=0)" || nok "T8 rc" "rc=$RUN_RC"
+echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=1" \
+  && ok "T8 own-merge-only probe classified inert (reaches only a not-running scheduled job)" \
+  || nok "T8 inert classification" "$LOG_OUT"
+[ "$REACHED" -eq 1 ] && ok "T8 block falls through past the verdict — delivery proceeds" \
+  || nok "T8 fell through" "REACHED=$REACHED"
+! echo "$BD_CALLS" | grep -q "delivery:failed" \
+  && ok "T8 delivery:failed NOT added — a self-healing scheduled job is not a reason to hold" \
+  || nok "T8 no failed-label" "$BD_CALLS"
+echo "$GC_CALLS" | grep -q "session nudge mayor" \
+  && ok "T8 Mayor still nudged — real staleness (C1) not silenced" \
+  || nok "T8 mayor nudged" "$GC_CALLS"
+
+# ── T9 (wa-xokje): control — no-op pull, own merge reaches BOTH a not-running
+#        scheduled job AND a live sensitive daemon in the same commit (repro
+#        wa-bpbgp's ACTUAL full shape: scripts/detect_unloaded_committed_daemons.py
+#        + the lazy-imported admin-dashboard dependency). Subtracting the
+#        scheduled job must never empty a set that still contains the live
+#        daemon → inert stays 0 → still blamed. Proves T8's fix doesn't
+#        over-exempt the mixed case. ───────────────────────────────────────
+run_block mixed_sensitive_scheduled correct
+[ "$RUN_RC" -eq 0 ] && ok "T9 block runs clean (rc=0; continue-based halt, BD state is the signal)" \
+  || nok "T9 rc" "rc=$RUN_RC"
+echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=0" \
+  && ok "T9 own-merge-only probe classified NOT inert (live daemon survives the subtraction)" \
+  || nok "T9 inert classification" "$LOG_OUT"
+[ "$REACHED" -eq 0 ] && ok "T9 block halts via continue (does not fall through)" \
+  || nok "T9 halted" "REACHED=$REACHED"
+echo "$BD_CALLS" | grep -q "label add ga-test delivery:failed" \
+  && ok "T9 delivery:failed added — the live daemon in this story's own merge IS a real cause" \
+  || nok "T9 failed-label" "$BD_CALLS"
 
 echo ""
 echo "story-delivery daemon-refresh no-op attribution tests: $PASS passed, $FAIL failed"

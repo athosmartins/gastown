@@ -2050,6 +2050,27 @@ else
     # attempted — empty means no live daemon is reachable from this story's
     # own delta at all (the only claim this probe needs to make); non-empty
     # means it is, regardless of how a real restart of it would have gone.
+    #
+    # wa-xokje: AFFECTED alone conflates two very different cases — reaching
+    # a LIVE daemon (may genuinely need a human's guarded restart) vs
+    # reaching ONLY a scheduled/one-shot job with no live PID right now
+    # (daemon-refresh.sh's own Step 4 already never kickstarts these — see
+    # its "not currently running" branch — because doing so would wrongly
+    # TRIGGER a one-shot job, and because such a job needs no restart at all:
+    # it will pick up the new code on its own, automatically, whenever
+    # launchd next fires it). Before this fix, a story whose own delta only
+    # touched a scheduled job's entrypoint (e.g.
+    # scripts/detect_unloaded_committed_daemons.py, consumed solely by the
+    # daily com.whatsapp.unloaded-daemons-full-daily job) was wrongly treated
+    # as "not inert" and held/retried every sweep forever — no amount of
+    # retrying could ever change that outcome (confirmed live: wa-bpbgp,
+    # numerically identical HALT output across 2h+ of 5-minute retries).
+    # AFFECTED_NOT_RUNNING (daemon-refresh.sh, same probe call) names the
+    # subset of AFFECTED with no live PID; subtract it here so inertness is
+    # decided on AFFECTED_LIVE — reachability into a live daemon only. A
+    # story that ALSO reaches a real live daemon (the common, mixed case)
+    # still correctly stays "not inert" below: subtracting a self-healing
+    # scheduled job never empties a set that also contains a live daemon.
     MERGE_OWN_OUT=$(RUNTIME_DIR="$RUNTIME_DIR" \
       PRE_DEPLOY_SHA="$MERGE_OWN_BASE_SHA" POST_DEPLOY_SHA="$MERGE_SHA" \
       DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
@@ -2058,10 +2079,18 @@ else
       timeout 180 bash "$REFRESH_HELPER" 2>/dev/null || true)
     MERGE_OWN_VERDICT_LINE=$(echo "$MERGE_OWN_OUT" | grep '^VERDICT=' | head -1 || true)
     MERGE_OWN_AFFECTED=$(echo "$MERGE_OWN_OUT" | grep '^AFFECTED=' | head -1 | sed 's/^AFFECTED=//' || true)
-    log "This-iteration pull was a true no-op (PRE_DEPLOY_SHA==POST_DEPLOY_SHA=$POST_DEPLOY_SHA) — asked daemon-refresh.sh (DRY_RUN=1, no real kickstart/drain) whether $STORY_ID's own merge $MERGE_SHA alone (vs pre-merge-main base $MERGE_OWN_BASE_SHA) reaches any live daemon: ${MERGE_OWN_VERDICT_LINE:-<unparseable output>} affected=[$MERGE_OWN_AFFECTED]."
+    MERGE_OWN_AFFECTED_NOT_RUNNING=$(echo "$MERGE_OWN_OUT" | grep '^AFFECTED_NOT_RUNNING=' | head -1 | sed 's/^AFFECTED_NOT_RUNNING=//' || true)
+    MERGE_OWN_AFFECTED_LIVE=""
+    for _moa in $MERGE_OWN_AFFECTED; do
+      case " $MERGE_OWN_AFFECTED_NOT_RUNNING " in
+        *" $_moa "*) ;;  # no live PID (scheduled/one-shot) — self-heals, never held for this
+        *) MERGE_OWN_AFFECTED_LIVE="$MERGE_OWN_AFFECTED_LIVE $_moa" ;;
+      esac
+    done
+    log "This-iteration pull was a true no-op (PRE_DEPLOY_SHA==POST_DEPLOY_SHA=$POST_DEPLOY_SHA) — asked daemon-refresh.sh (DRY_RUN=1, no real kickstart/drain) whether $STORY_ID's own merge $MERGE_SHA alone (vs pre-merge-main base $MERGE_OWN_BASE_SHA) reaches any live daemon: ${MERGE_OWN_VERDICT_LINE:-<unparseable output>} affected=[$MERGE_OWN_AFFECTED] affected_not_running=[$MERGE_OWN_AFFECTED_NOT_RUNNING] affected_live=[$MERGE_OWN_AFFECTED_LIVE]."
     if [ -z "$MERGE_OWN_VERDICT_LINE" ]; then
       : # unparseable helper output (crash/timeout) — stays unknown, existing blame fallback applies
-    elif [ -z "${MERGE_OWN_AFFECTED// /}" ]; then
+    elif [ -z "${MERGE_OWN_AFFECTED_LIVE// /}" ]; then
       THIS_PULL_STRUCTURALLY_INERT=1
     else
       THIS_PULL_STRUCTURALLY_INERT=0
@@ -2146,20 +2175,44 @@ else
           # THIS label to re-arm story:approved (retry to real deploy), vs. a prod-test
           # delivery:failed which must NOT auto-retry (e.g. a flaky test → infinite loop).
           bd -C "$STORY_STORE" label add    "$STORY_ID" "delivery:deploy-pending" -q 2>/dev/null || true
-          bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED (ga-iwv0 daemon refresh): $REFRESH_VERDICT — $REFRESH_REASON
+          # wa-xokje: a HALT this cycle can be numerically IDENTICAL to the
+          # last one — confirmed live (wa-bpbgp: same verdict + same GUARDED
+          # set across 2h07 of 5-minute retries, "numeros IDENTICOS"). Nothing
+          # about re-announcing an unchanged, already-reported condition every
+          # single cycle helps anyone — it is exactly the "chronic condition
+          # delivered as repeated acute alert" class this city already has a
+          # name for (wa-bpbgp's own fix; the 'erro-vs-vazio' family
+          # generally). Announce on first occurrence and on any real
+          # transition (verdict, guarded set, or freshfail set changes);
+          # stay quiet in between. The retry/label mechanics above are
+          # UNCHANGED: still retried every 5-minute sweep, still
+          # story:approved, still recovers the instant the verdict changes.
+          # Fails OPEN (always announce) if the fingerprint file can't be
+          # read/written — never silently drops a genuinely NEW failure.
+          HALT_FP_DIR="$GC_CITY/.gc/runtime/daemon-refresh-baseline/halt-fingerprint"
+          mkdir -p "$HALT_FP_DIR" 2>/dev/null || true
+          HALT_FP_FILE="$HALT_FP_DIR/$STORY_ID.txt"
+          HALT_FP_NEW="$REFRESH_VERDICT|$REFRESH_GUARDED|$REFRESH_FRESHFAIL"
+          HALT_FP_OLD="$(cat "$HALT_FP_FILE" 2>/dev/null || echo "")"
+          if [ -n "$HALT_FP_OLD" ] && [ "$HALT_FP_NEW" = "$HALT_FP_OLD" ]; then
+            log "Daemon refresh HALT unchanged since last report for $STORY_ID (verdict=$REFRESH_VERDICT) — suppressing duplicate comment/nudge (still retrying every sweep)."
+          else
+            printf '%s' "$HALT_FP_NEW" > "$HALT_FP_FILE" 2>/dev/null || true
+            bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED (ga-iwv0 daemon refresh): $REFRESH_VERDICT — $REFRESH_REASON
 A long-lived daemon serving rig '$RIG' is running code OLDER than this deploy and could not be safely refreshed/verified, so the merged feature would be DORMANT in production. story:done is WITHHELD (a dormant deploy must never be marked done).
 $REFRESH_ACTION
 Refresh detail:
 $REFRESH_OUT" 2>/dev/null || true
-          AUTHOR=$(echo "$STORY" | jq -r '.assignee // .created_by // ""' 2>/dev/null || echo "")
-          if [ -n "$AUTHOR" ] && [ "$AUTHOR" != "null" ]; then
-            gc --city "$GC_CITY" session nudge "$AUTHOR" \
-              "DELIVERY HALTED for $STORY_ID (ga-iwv0): $REFRESH_VERDICT — a daemon serving the merge is dormant/unverified. See bead; do NOT mark done." \
-              --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR"
+            AUTHOR=$(echo "$STORY" | jq -r '.assignee // .created_by // ""' 2>/dev/null || echo "")
+            if [ -n "$AUTHOR" ] && [ "$AUTHOR" != "null" ]; then
+              gc --city "$GC_CITY" session nudge "$AUTHOR" \
+                "DELIVERY HALTED for $STORY_ID (ga-iwv0): $REFRESH_VERDICT — a daemon serving the merge is dormant/unverified. See bead; do NOT mark done." \
+                --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR"
+            fi
+            gc --city "$GC_CITY" session nudge mayor \
+              "DELIVERY HALTED ($STORY_ID, rig $RIG): daemon refresh $REFRESH_VERDICT — $REFRESH_REASON. story:done withheld." \
+              2>/dev/null || true
           fi
-          gc --city "$GC_CITY" session nudge mayor \
-            "DELIVERY HALTED ($STORY_ID, rig $RIG): daemon refresh $REFRESH_VERDICT — $REFRESH_REASON. story:done withheld." \
-            2>/dev/null || true
         fi
         # wa-uthi: non-terminal (delivery:failed re-picked every cycle once the
         # daemon is refreshed) — no Athos push. Author + Mayor nudged above.
@@ -2399,6 +2452,11 @@ $(refino_criteria_status_line "${MISSING_META:-}")" 2>/dev/null || true
   # now genuinely deployed; stale markers must not linger on a delivered story.
   bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:deploy-pending" -q 2>/dev/null || true
   bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:failed"          -q 2>/dev/null || true
+  # wa-xokje: this story is genuinely delivered now — drop its halt-dedup
+  # fingerprint (see Step 5b) so a FUTURE, unrelated halt on this same
+  # STORY_ID (should one ever recur) is never silently matched against a
+  # stale fingerprint from a completely different incident.
+  rm -f "$GC_CITY/.gc/runtime/daemon-refresh-baseline/halt-fingerprint/$STORY_ID.txt" 2>/dev/null || true
   # ga-vmq1i: do not hardcode "verified in prod" here — DONE_PUSH_TAIL above is
   # already the single, accurate source of truth for what was actually
   # confirmed (including the NOT-verified case); repeating a blanket "verified"

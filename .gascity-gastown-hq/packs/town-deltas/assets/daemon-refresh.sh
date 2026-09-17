@@ -517,6 +517,10 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   fi
   echo "VERDICT=$verdict"
   echo "AFFECTED=${AFFECTED:-}"
+  # wa-xokje: always present (even empty), same convention as
+  # PARSE_ERROR_LOADED/UNLOADED below — a caller can check it unconditionally
+  # without reparsing log text.
+  echo "AFFECTED_NOT_RUNNING=${AFFECTED_NOT_RUNNING:-}"
   echo "RESTARTED=${RESTARTED:-}"
   echo "FRESH_FAIL=${FRESH_FAIL:-}"
   echo "GUARDED=${GUARDED:-}"
@@ -537,13 +541,13 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   # same convention as PARSE_ERROR_LOADED/UNLOADED above.
   echo "UNATTRIBUTED_JOB_GAP=${SJ_UNATTRIBUTED_REASON:-}"
   # Trailing JSON for the caller's bead comment / jsonl log.
-  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" <<'PY' 2>/dev/null || true
+  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" "${AFFECTED_NOT_RUNNING:-}" <<'PY' 2>/dev/null || true
 import json, sys
-v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg = sys.argv[1:13]
+v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg, anr = sys.argv[1:14]
 sp = lambda s: [x for x in s.split() if x]
 print("JSON=" + json.dumps({
     "verdict": v, "reason": reason,
-    "affected": sp(aff), "restarted": sp(res),
+    "affected": sp(aff), "affected_not_running": sp(anr), "restarted": sp(res),
     "fresh_fail": sp(ff), "guarded": sp(gd), "proof": proof,
     "already_fresh": sp(afr), "would_restart": sp(wr),
     "parse_error_loaded": sp(pel), "parse_error_unloaded": sp(peu),
@@ -555,6 +559,15 @@ PY
 }
 
 AFFECTED=""; RESTARTED=""; FRESH_FAIL=""; GUARDED=""; ALREADY_FRESH=""; WOULD_RESTART=""
+# wa-xokje: subset of AFFECTED that Step 4 below finds has no live PID at all
+# (a scheduled/one-shot job or an already-down daemon) — never kickstarted,
+# never a restart candidate, and — unlike a live daemon — cannot be made
+# fresh by ANY amount of retrying: it will pick up the new code on its own,
+# automatically, the next time launchd fires it. A caller comparing THIS
+# story's own delta against AFFECTED alone cannot tell "only reaches a
+# self-healing scheduled job" from "reaches a live daemon that genuinely
+# needs a human's guarded restart" — this field lets it.
+AFFECTED_NOT_RUNNING=""
 # ga-ax0t9: achado do Step 1b que espera o Step 2 rodar antes de virar veredito.
 SJ_PENDING_REASON=""
 # ga-agracx: a real Step 1b gap that was NOT attributed to this bead's own
@@ -1646,6 +1659,7 @@ for label in $AFFECTED; do
   # stale code. Skip the rest.
   if [ -z "$(daemon_pid "$label")" ]; then
     log "AFFECTED $label is not currently running (scheduled/one-shot or down) — not a dormant-running-daemon; skipping refresh."
+    AFFECTED_NOT_RUNNING="$AFFECTED_NOT_RUNNING $label"
     continue
   fi
   if is_sensitive "$label" || policy_says_sensitive "$label"; then
