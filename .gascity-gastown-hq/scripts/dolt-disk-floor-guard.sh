@@ -327,6 +327,31 @@ RESURRECT_TIMEOUT_SECS="${DOLT_DISK_FLOOR_RESURRECT_TIMEOUT_SECS:-90}"
 RESURRECT_ESCALATE_COOLDOWN_SECS="${DOLT_DISK_FLOOR_RESURRECT_ESCALATE_COOLDOWN_SECS:-3600}"
 STATE_RESURRECT_ESCALATE_FILE="$STATE_DIR/.dolt-disk-floor-guard.last-resurrect-escalate"
 
+# ga-74tts6: bound on one `dolt-backup-reseed.sh <db>` attempt triggered by
+# THIS guard at CRITICAL (see _reap_bloated_backup_staging) — separate from
+# dolt-s3-backup.sh's own RESEED_TIMEOUT_SECS (default 1800s) for the SAME
+# script's daily 04:00 call. That 1800s budget is fine for a once-a-day cron
+# job but would block this guard's own ~300s StartInterval cycle for up to 30
+# cycles' worth of wall time; 240s mirrors _reap_backup_residue's 180s
+# same-file precedent (a bit larger because a reseed does real sync/restore
+# I/O, not just an S3 head-object check). A timeout kill mid-reseed carries
+# the same "SEM BACKUP LOCAL, unalarmed" residual risk the daily cron's own
+# timeout wrapper already has — not a new risk this lever introduces, just a
+# second, shorter-fused caller of it.
+RESEED_TRIGGER_TIMEOUT_SECS="${DOLT_DISK_FLOOR_RESEED_TRIGGER_TIMEOUT_SECS:-240}"
+
+# ga-74tts6: per-db cooldown between guard-triggered reseed attempts. A
+# success moves avail back up, so the NEXT cycle's was_critical gate alone
+# would normally stop repeats — this cooldown only matters for the FAILURE
+# case (S3 proof failing, or the reseed timing out), where without it the
+# guard would retry the SAME losing attempt every single 5min CRITICAL cycle.
+# 30min gives a transient cause (e.g. a flaky S3 call) room to clear without
+# hammering, while still being far shorter than dolt-s3-backup.sh's own
+# once-a-day cadence — the whole point of this lever (ga-74tts6) is to not
+# wait for that.
+RESEED_TRIGGER_COOLDOWN_SECS="${DOLT_DISK_FLOOR_RESEED_TRIGGER_COOLDOWN_SECS:-1800}"
+STATE_RESEED_TRIGGER_DIR="$STATE_DIR/.dolt-disk-floor-guard.reseed-attempt"
+
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
 
@@ -1439,6 +1464,100 @@ _reap_backup_residue() {
   fi
 }
 
+# _reap_bloated_backup_staging <was_critical> — tenth reclaim lever (ga-74tts6):
+# unlike _reap_backup_residue above (which only ever releases ALREADY-retired
+# .old residue), this one triggers dolt-backup-reseed.sh's full shrink-in-place
+# mechanism for a db's LIVE .dolt-backup/<db> staging directory itself —
+# CRITICAL only, whereas residue-reap runs at WARN too, because a reseed is a
+# real reconstruct-and-verify operation (network/disk I/O, briefly no local
+# backup in the ultra-low-disk path), not a pure "delete what's already proven
+# safe" release.
+#
+# WHY THIS EXISTS: dolt-backup-reseed.sh (see its own header) now has a
+# low-disk AND an ultra-low-disk fallback so hq's staging bloat can shrink
+# even when free space is critically tight — but until now the ONLY caller was
+# dolt-s3-backup.sh's once-a-day 04:00 cron. The incident that opened this bead
+# happened at noon: dolt-disk-floor-guard was CRITICAL for two cycles, Athos
+# had to run the reseed by hand, and the very same catch-22 would have refused
+# again at the next 04:00 anyway (see ga-74tts6/ga-i99qsp's own history). This
+# lever closes that gap: the SAME relief the daily cron already runs, fired
+# immediately when the disk-floor guard confirms CRITICAL, instead of waiting
+# up to 24h.
+#
+# Enumerates "$CITY/.dolt-backup"/<db> (skipping *.old/*.new residue and any
+# db without a live counterpart under $DOLTDIR) rather than querying Dolt for
+# "SHOW DATABASES" — a pure filesystem listing keeps this lever usable even
+# when Dolt itself is degraded, consistent with this guard's own "last resort,
+# external, non-invasive" framing (see file header). Skips a db whose backup
+# dir already carries .new/.old residue — a reseed for it is either already in
+# flight or needs a human to clear stale residue first (dolt-backup-reseed.sh's
+# own Preflight 3); piling another attempt on top would only race it.
+#
+# Processes AT MOST ONE db per cycle (returns after the first attempt) so this
+# lever's worst-case added latency is bounded by RESEED_TRIGGER_TIMEOUT_SECS
+# regardless of how many dbs are eligible — if more than one genuinely needs
+# it, later CRITICAL cycles (5min apart) pick up the rest. Per-db cooldown
+# (RESEED_TRIGGER_COOLDOWN_SECS) avoids hammering a db whose reseed attempt
+# just failed; deliberately does NOT try to judge "is this db's backup
+# actually bloated enough to be worth it" — dolt-backup-reseed.sh's own
+# preflight already picks the safest available mode (normal/low-disk/ultra)
+# for whatever the CURRENT free space is, so an unnecessary attempt on an
+# already-lean backup just does the same reseed the daily cron would have
+# done anyway, not a wasted or risky one.
+_reap_bloated_backup_staging() {
+  local was_critical="${1:-0}"
+  if [ "$ENABLED" != "1" ]; then
+    log "backup-staging-reap SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"
+    return
+  fi
+  if [ "$was_critical" != "1" ]; then
+    return
+  fi
+  local reseed="$CITY/scripts/dolt-backup-reseed.sh"
+  if [ ! -f "$reseed" ]; then
+    log "backup-staging-reap SKIP — $reseed not found"
+    return
+  fi
+  local backup_root="$CITY/.dolt-backup"
+  if [ ! -d "$backup_root" ]; then
+    log "backup-staging-reap SKIP — $backup_root not found"
+    return
+  fi
+
+  mkdir -p "$STATE_RESEED_TRIGGER_DIR" 2>/dev/null || true
+  local now_epoch; now_epoch=$(date +%s)
+  local dir base db state_file last
+  for dir in "$backup_root"/*/; do
+    [ -d "$dir" ] || continue
+    base="$(basename "$dir")"
+    case "$base" in *.old|*.new) continue ;; esac
+    db="$base"
+    [ -d "$DOLTDIR/$db" ] || continue
+
+    if [ -e "$backup_root/$db.new" ] || [ -e "$backup_root/$db.old" ]; then
+      log "backup-staging-reap SKIP $db — .new/.old residue present (a reseed is already in flight or needs manual attention first)"
+      continue
+    fi
+
+    state_file="$STATE_RESEED_TRIGGER_DIR/$db"
+    last=""
+    [ -f "$state_file" ] && last="$(cat "$state_file" 2>/dev/null)"
+    if ! _cooldown_elapsed "$last" "$now_epoch" "$RESEED_TRIGGER_COOLDOWN_SECS"; then
+      log "backup-staging-reap SKIP $db — attempted within the last ${RESEED_TRIGGER_COOLDOWN_SECS}s (cooldown)"
+      continue
+    fi
+    echo "$now_epoch" > "$state_file" 2>/dev/null || true
+
+    log "backup-staging-reap: CRITICAL — triggering '$reseed $db' now instead of waiting for the daily 04:00 dolt-s3-backup.sh run (ga-74tts6) …"
+    if timeout "$RESEED_TRIGGER_TIMEOUT_SECS" "$reseed" "$db" >> "$LOG" 2>&1; then
+      log "backup-staging-reap OK — $db reseed completed"
+    else
+      log "backup-staging-reap: $db reseed did not complete within ${RESEED_TRIGGER_TIMEOUT_SECS}s this cycle, or refused (non-fatal — see log lines above for reseed's own diagnosis; eligible again after the ${RESEED_TRIGGER_COOLDOWN_SECS}s per-db cooldown)"
+    fi
+    return
+  done
+}
+
 # _resurrect_dolt <avail_gb> <class> — last-resort auto-respawn for a Dolt
 # sql-server CONFIRMED down while disk headroom is safe. Caller (main) has
 # already run _should_resurrect's gate; this function does the actual work.
@@ -1592,6 +1711,7 @@ main() {
   _reap_go_build_orphans
   _reap_code_sign_clone_orphans
   _reap_backup_residue
+  _reap_bloated_backup_staging "$was_critical"
 
   # re-read avail — reclaim may have freed space; `class` becomes the CURRENT
   # (post-reclaim) reading, used for logging/messaging. was_critical also

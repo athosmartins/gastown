@@ -1046,6 +1046,165 @@ CITY="$REAL_CITY"
 rm -rf "$FAKE_CITY"
 
 echo ""
+echo "=== _reap_bloated_backup_staging: invokes reseed for an eligible db, CRITICAL only (ga-74tts6) ==="
+# Hermetic: CITY/DOLTDIR/STATE_RESEED_TRIGGER_DIR redirected to a disposable
+# tmp tree containing a FAKE dolt-backup-reseed.sh that only records the db
+# name it was invoked with — never the real script, no real S3/dolt call.
+FAKE_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city9.XXXXXX)"
+mkdir -p "$FAKE_CITY/scripts" "$FAKE_CITY/.dolt-backup/hq" "$FAKE_CITY/.beads/dolt/hq"
+CAPTURE_FILE="$FAKE_CITY/capture.txt"
+cat > "$FAKE_CITY/scripts/dolt-backup-reseed.sh" <<EOF
+#!/bin/bash
+echo "CALLED_WITH=\$1" > "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY/scripts/dolt-backup-reseed.sh"
+
+REAL_CITY="$CITY"; REAL_DOLTDIR="$DOLTDIR"; REAL_STATE_RESEED_TRIGGER_DIR="$STATE_RESEED_TRIGGER_DIR"
+CITY="$FAKE_CITY"; DOLTDIR="$FAKE_CITY/.beads/dolt"; STATE_RESEED_TRIGGER_DIR="$FAKE_CITY/state-reseed"
+_reap_bloated_backup_staging 1
+CITY="$REAL_CITY"; DOLTDIR="$REAL_DOLTDIR"; STATE_RESEED_TRIGGER_DIR="$REAL_STATE_RESEED_TRIGGER_DIR"
+
+if [ -f "$CAPTURE_FILE" ] && grep -qx "CALLED_WITH=hq" "$CAPTURE_FILE"; then
+  ok "_reap_bloated_backup_staging(was_critical=1): invokes dolt-backup-reseed.sh with the eligible db name"
+else
+  bad "_reap_bloated_backup_staging(was_critical=1): did not invoke reseed as expected (got: $([ -f "$CAPTURE_FILE" ] && cat "$CAPTURE_FILE" || echo 'capture file missing'))"
+fi
+rm -rf "$FAKE_CITY"
+
+echo ""
+echo "=== _reap_bloated_backup_staging: CRITICAL-only gating (ga-74tts6) ==="
+FAKE_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city10.XXXXXX)"
+mkdir -p "$FAKE_CITY/scripts" "$FAKE_CITY/.dolt-backup/hq" "$FAKE_CITY/.beads/dolt/hq"
+CAPTURE_FILE="$FAKE_CITY/capture.txt"
+cat > "$FAKE_CITY/scripts/dolt-backup-reseed.sh" <<EOF
+#!/bin/bash
+echo "CALLED" > "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY/scripts/dolt-backup-reseed.sh"
+
+REAL_CITY="$CITY"; REAL_DOLTDIR="$DOLTDIR"; REAL_STATE_RESEED_TRIGGER_DIR="$STATE_RESEED_TRIGGER_DIR"
+CITY="$FAKE_CITY"; DOLTDIR="$FAKE_CITY/.beads/dolt"; STATE_RESEED_TRIGGER_DIR="$FAKE_CITY/state-reseed"
+_reap_bloated_backup_staging 0
+_reap_bloated_backup_staging
+CITY="$REAL_CITY"; DOLTDIR="$REAL_DOLTDIR"; STATE_RESEED_TRIGGER_DIR="$REAL_STATE_RESEED_TRIGGER_DIR"
+
+if [ -f "$CAPTURE_FILE" ]; then
+  bad "_reap_bloated_backup_staging: invoked reseed on a non-CRITICAL cycle (was_critical=0 and no-arg) — should be a strict no-op"
+else
+  ok "_reap_bloated_backup_staging: was_critical=0 and no-arg (default) both correctly skip — CRITICAL-only cost is real (real sync/restore I/O)"
+fi
+rm -rf "$FAKE_CITY"
+
+echo ""
+echo "=== _reap_bloated_backup_staging: guard-level ENABLED kill switch (ga-74tts6) ==="
+FAKE_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city11.XXXXXX)"
+mkdir -p "$FAKE_CITY/scripts" "$FAKE_CITY/.dolt-backup/hq" "$FAKE_CITY/.beads/dolt/hq"
+CAPTURE_FILE="$FAKE_CITY/capture.txt"
+cat > "$FAKE_CITY/scripts/dolt-backup-reseed.sh" <<EOF
+#!/bin/bash
+echo "CALLED" > "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY/scripts/dolt-backup-reseed.sh"
+
+REAL_CITY="$CITY"; REAL_DOLTDIR="$DOLTDIR"; REAL_STATE_RESEED_TRIGGER_DIR="$STATE_RESEED_TRIGGER_DIR"
+CITY="$FAKE_CITY"; DOLTDIR="$FAKE_CITY/.beads/dolt"; STATE_RESEED_TRIGGER_DIR="$FAKE_CITY/state-reseed"
+ENABLED=0
+_reap_bloated_backup_staging 1
+# shellcheck disable=SC2034  # read by every _reap_* call and main() in later scenarios below
+ENABLED=1
+CITY="$REAL_CITY"; DOLTDIR="$REAL_DOLTDIR"; STATE_RESEED_TRIGGER_DIR="$REAL_STATE_RESEED_TRIGGER_DIR"
+[ -f "$CAPTURE_FILE" ] && bad "_reap_bloated_backup_staging: ran the real reseed script despite ENABLED=0" || ok "_reap_bloated_backup_staging: ENABLED=0 skips this lever too"
+rm -rf "$FAKE_CITY"
+
+echo ""
+echo "=== _reap_bloated_backup_staging: missing script degrades to SKIP, never errors (ga-74tts6) ==="
+FAKE_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city12.XXXXXX)"
+mkdir -p "$FAKE_CITY/scripts" "$FAKE_CITY/.dolt-backup/hq" "$FAKE_CITY/.beads/dolt/hq"
+REAL_CITY="$CITY"; REAL_DOLTDIR="$DOLTDIR"
+CITY="$FAKE_CITY"; DOLTDIR="$FAKE_CITY/.beads/dolt"
+if _reap_bloated_backup_staging 1; then
+  ok "_reap_bloated_backup_staging: missing reseed script — returns cleanly (no crash)"
+else
+  bad "_reap_bloated_backup_staging: missing script should still return 0, got nonzero"
+fi
+CITY="$REAL_CITY"; DOLTDIR="$REAL_DOLTDIR"
+rm -rf "$FAKE_CITY"
+
+echo ""
+echo "=== _reap_bloated_backup_staging: skips a db with .old residue, still processes another (ga-74tts6) ==="
+FAKE_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city13.XXXXXX)"
+mkdir -p "$FAKE_CITY/scripts" "$FAKE_CITY/.dolt-backup/hq" "$FAKE_CITY/.dolt-backup/hq.old" "$FAKE_CITY/.dolt-backup/lexbh" "$FAKE_CITY/.beads/dolt/hq" "$FAKE_CITY/.beads/dolt/lexbh"
+CAPTURE_FILE="$FAKE_CITY/capture.txt"
+cat > "$FAKE_CITY/scripts/dolt-backup-reseed.sh" <<EOF
+#!/bin/bash
+echo "CALLED_WITH=\$1" >> "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY/scripts/dolt-backup-reseed.sh"
+
+REAL_CITY="$CITY"; REAL_DOLTDIR="$DOLTDIR"; REAL_STATE_RESEED_TRIGGER_DIR="$STATE_RESEED_TRIGGER_DIR"
+CITY="$FAKE_CITY"; DOLTDIR="$FAKE_CITY/.beads/dolt"; STATE_RESEED_TRIGGER_DIR="$FAKE_CITY/state-reseed"
+_reap_bloated_backup_staging 1
+CITY="$REAL_CITY"; DOLTDIR="$REAL_DOLTDIR"; STATE_RESEED_TRIGGER_DIR="$REAL_STATE_RESEED_TRIGGER_DIR"
+
+if [ -f "$CAPTURE_FILE" ] && grep -qx "CALLED_WITH=lexbh" "$CAPTURE_FILE"; then
+  ok "_reap_bloated_backup_staging: skipped hq (residue present) and processed lexbh instead"
+else
+  bad "_reap_bloated_backup_staging: expected only lexbh to be attempted, got: $([ -f "$CAPTURE_FILE" ] && cat "$CAPTURE_FILE" || echo 'capture file missing')"
+fi
+rm -rf "$FAKE_CITY"
+
+echo ""
+echo "=== _reap_bloated_backup_staging: processes at most one db per cycle (ga-74tts6) ==="
+FAKE_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city14.XXXXXX)"
+mkdir -p "$FAKE_CITY/scripts" "$FAKE_CITY/.dolt-backup/hq" "$FAKE_CITY/.dolt-backup/lexbh" "$FAKE_CITY/.beads/dolt/hq" "$FAKE_CITY/.beads/dolt/lexbh"
+CAPTURE_FILE="$FAKE_CITY/capture.txt"
+cat > "$FAKE_CITY/scripts/dolt-backup-reseed.sh" <<EOF
+#!/bin/bash
+echo "\$1" >> "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY/scripts/dolt-backup-reseed.sh"
+
+REAL_CITY="$CITY"; REAL_DOLTDIR="$DOLTDIR"; REAL_STATE_RESEED_TRIGGER_DIR="$STATE_RESEED_TRIGGER_DIR"
+CITY="$FAKE_CITY"; DOLTDIR="$FAKE_CITY/.beads/dolt"; STATE_RESEED_TRIGGER_DIR="$FAKE_CITY/state-reseed"
+_reap_bloated_backup_staging 1
+CITY="$REAL_CITY"; DOLTDIR="$REAL_DOLTDIR"; STATE_RESEED_TRIGGER_DIR="$REAL_STATE_RESEED_TRIGGER_DIR"
+
+CALL_COUNT=0
+[ -f "$CAPTURE_FILE" ] && CALL_COUNT=$(wc -l < "$CAPTURE_FILE" | tr -d ' ')
+if [ "$CALL_COUNT" = "1" ]; then
+  ok "_reap_bloated_backup_staging: exactly one db attempted per cycle even with two eligible (got: $(cat "$CAPTURE_FILE" 2>/dev/null))"
+else
+  bad "_reap_bloated_backup_staging: expected exactly one attempt, got $CALL_COUNT (contents: $(cat "$CAPTURE_FILE" 2>/dev/null))"
+fi
+rm -rf "$FAKE_CITY"
+
+echo ""
+echo "=== _reap_bloated_backup_staging: per-db cooldown suppresses a repeat attempt (ga-74tts6) ==="
+FAKE_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city15.XXXXXX)"
+mkdir -p "$FAKE_CITY/scripts" "$FAKE_CITY/.dolt-backup/hq" "$FAKE_CITY/.beads/dolt/hq" "$FAKE_CITY/state-reseed"
+CAPTURE_FILE="$FAKE_CITY/capture.txt"
+cat > "$FAKE_CITY/scripts/dolt-backup-reseed.sh" <<EOF
+#!/bin/bash
+echo "CALLED" >> "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY/scripts/dolt-backup-reseed.sh"
+date +%s > "$FAKE_CITY/state-reseed/hq"   # "just attempted" — well within the default cooldown
+
+REAL_CITY="$CITY"; REAL_DOLTDIR="$DOLTDIR"; REAL_STATE_RESEED_TRIGGER_DIR="$STATE_RESEED_TRIGGER_DIR"
+CITY="$FAKE_CITY"; DOLTDIR="$FAKE_CITY/.beads/dolt"; STATE_RESEED_TRIGGER_DIR="$FAKE_CITY/state-reseed"
+_reap_bloated_backup_staging 1
+CITY="$REAL_CITY"; DOLTDIR="$REAL_DOLTDIR"; STATE_RESEED_TRIGGER_DIR="$REAL_STATE_RESEED_TRIGGER_DIR"
+
+[ -f "$CAPTURE_FILE" ] && bad "_reap_bloated_backup_staging: ran despite an active per-db cooldown" || ok "_reap_bloated_backup_staging: active cooldown correctly suppresses the attempt"
+rm -rf "$FAKE_CITY"
+
+echo ""
 echo "=== _resurrect_dolt: escalation cooldown (ga-f4l2z, mirrors ga-q4cqr) ==="
 # Tests the REAL _resurrect_dolt (still the function sourced from the
 # library at this point — the main()-scenario section further below is what
@@ -1323,6 +1482,20 @@ _reap_code_sign_clone_orphans() { REAP_CODE_SIGN_CLONE_CALLS=$((REAP_CODE_SIGN_C
 REAP_BACKUP_RESIDUE_CALLS=0
 _reap_backup_residue() { REAP_BACKUP_RESIDUE_CALLS=$((REAP_BACKUP_RESIDUE_CALLS+1)); }
 
+# _reap_bloated_backup_staging is new (ga-74tts6), same reasoning as
+# _reap_backup_residue's stub immediately above: EXECUTION code (shells out to
+# dolt-backup-reseed.sh, which has its own independent hermetic selftest
+# covering the real low-disk/ultra-low-disk logic, plus this file's own
+# isolated tests above covering the wiring — db enumeration, residue-skip,
+# one-per-cycle, cooldown) stubbed as a no-op here so main()'s WIRING is what
+# gets proven — never a real reseed. Takes was_critical as $1, same reasoning
+# as _reap_hf_cache/_reap_gocache: the CRITICAL-only gate lives INSIDE the
+# real function, not in main()'s wiring, so this must be called (and
+# captured) on every cycle that reaches the reclaim step, regardless of tier.
+REAP_BACKUP_STAGING_CALLS=0
+REAP_BACKUP_STAGING_LAST_ARG=""
+_reap_bloated_backup_staging() { REAP_BACKUP_STAGING_CALLS=$((REAP_BACKUP_STAGING_CALLS+1)); REAP_BACKUP_STAGING_LAST_ARG="${1:-}"; }
+
 NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""
 record_notify() {
   NOTIFY_CALLS=$((NOTIFY_CALLS+1))
@@ -1365,7 +1538,7 @@ record_gc() {
 # shellcheck disable=SC2034  # read by main() in the sourced script
 GC=record_gc
 
-reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; REAP_GO_BUILD_CALLS=0; REAP_CODE_SIGN_CLONE_CALLS=0; REAP_BACKUP_RESIDUE_CALLS=0; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; }
+reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; REAP_GO_BUILD_CALLS=0; REAP_CODE_SIGN_CLONE_CALLS=0; REAP_BACKUP_RESIDUE_CALLS=0; REAP_BACKUP_STAGING_CALLS=0; REAP_BACKUP_STAGING_LAST_ARG=""; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; }
 seed_state() {
   if [ -n "$1" ]; then echo "$1" > "$STATE_EPOCH_FILE"; else rm -f "$STATE_EPOCH_FILE"; fi
   if [ -n "$2" ]; then echo "$2" > "$STATE_AVAIL_FILE"; else rm -f "$STATE_AVAIL_FILE"; fi
@@ -1599,10 +1772,10 @@ echo "=== main(): scratchpad + transcript reap integration (ga-02pnu, ga-t1ub9) 
 reset_capture; seed_state "" ""
 queue_avail 2 20
 main
-if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ] && [ "$REAP_LOGS_CALLS" = "1" ] && [ "$REAP_HF_CALLS" = "1" ] && [ "$REAP_GOCACHE_CALLS" = "1" ] && [ "$REAP_GO_BUILD_CALLS" = "1" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "1" ] && [ "$REAP_BACKUP_RESIDUE_CALLS" = "1" ]; then
-  ok "main(): _reap_dead_scratch, _reap_dead_transcripts, _reap_growing_logs, _reap_hf_cache, _reap_gocache, _reap_go_build_orphans, _reap_code_sign_clone_orphans, AND _reap_backup_residue each invoked exactly once alongside _safe_reclaim"
+if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ] && [ "$REAP_LOGS_CALLS" = "1" ] && [ "$REAP_HF_CALLS" = "1" ] && [ "$REAP_GOCACHE_CALLS" = "1" ] && [ "$REAP_GO_BUILD_CALLS" = "1" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "1" ] && [ "$REAP_BACKUP_RESIDUE_CALLS" = "1" ] && [ "$REAP_BACKUP_STAGING_CALLS" = "1" ]; then
+  ok "main(): _reap_dead_scratch, _reap_dead_transcripts, _reap_growing_logs, _reap_hf_cache, _reap_gocache, _reap_go_build_orphans, _reap_code_sign_clone_orphans, _reap_backup_residue, AND _reap_bloated_backup_staging each invoked exactly once alongside _safe_reclaim"
 else
-  bad "main(): expected all eight reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_LOGS_CALLS=$REAP_LOGS_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS REAP_BACKUP_RESIDUE_CALLS=$REAP_BACKUP_RESIDUE_CALLS"
+  bad "main(): expected all nine reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_LOGS_CALLS=$REAP_LOGS_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS REAP_BACKUP_RESIDUE_CALLS=$REAP_BACKUP_RESIDUE_CALLS REAP_BACKUP_STAGING_CALLS=$REAP_BACKUP_STAGING_CALLS"
 fi
 if [ "$REAP_LAST_ARG" = "1" ]; then
   ok "main(): CRITICAL cycle (even after reclaim recovers it to NONE) passes was_critical=1 to _reap_dead_scratch (ga-rjhfz pressure plumbing)"
@@ -1618,6 +1791,11 @@ if [ "$REAP_GOCACHE_LAST_ARG" = "1" ]; then
   ok "main(): CRITICAL cycle also passes was_critical=1 to _reap_gocache (ga-yi68q)"
 else
   bad "main(): expected _reap_gocache to receive was_critical=1 on a CRITICAL cycle, got REAP_GOCACHE_LAST_ARG='$REAP_GOCACHE_LAST_ARG'"
+fi
+if [ "$REAP_BACKUP_STAGING_LAST_ARG" = "1" ]; then
+  ok "main(): CRITICAL cycle also passes was_critical=1 to _reap_bloated_backup_staging (ga-74tts6)"
+else
+  bad "main(): expected _reap_bloated_backup_staging to receive was_critical=1 on a CRITICAL cycle, got REAP_BACKUP_STAGING_LAST_ARG='$REAP_BACKUP_STAGING_LAST_ARG'"
 fi
 
 # Scenario E2 (ga-rjhfz) — a cycle that is WARN, never CRITICAL, must pass
@@ -1643,6 +1821,11 @@ if [ "$REAP_GOCACHE_CALLS" = "1" ] && [ "$REAP_GOCACHE_LAST_ARG" = "0" ]; then
 else
   bad "main(): expected _reap_gocache called once with was_critical=0 on a WARN-only cycle, got REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GOCACHE_LAST_ARG='$REAP_GOCACHE_LAST_ARG'"
 fi
+if [ "$REAP_BACKUP_STAGING_CALLS" = "1" ] && [ "$REAP_BACKUP_STAGING_LAST_ARG" = "0" ]; then
+  ok "main(): non-critical WARN cycle still calls _reap_bloated_backup_staging but with was_critical=0 (the CRITICAL-only gate lives INSIDE the real function, not in main()'s wiring — ga-74tts6)"
+else
+  bad "main(): expected _reap_bloated_backup_staging called once with was_critical=0 on a WARN-only cycle, got REAP_BACKUP_STAGING_CALLS=$REAP_BACKUP_STAGING_CALLS REAP_BACKUP_STAGING_LAST_ARG='$REAP_BACKUP_STAGING_LAST_ARG'"
+fi
 
 # Scenario F — a cycle that never reaches the floor at all (avail comfortably
 # above warn on the FIRST read) must take the top early-return and never touch
@@ -1652,10 +1835,10 @@ VM_LOG_PRE_COUNT=$(grep -c "vm_swap_gb=" "$LOG" 2>/dev/null || echo 0)
 reset_capture; seed_state "" ""
 queue_avail 20
 main
-if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ] && [ "$REAP_HF_CALLS" = "0" ] && [ "$REAP_GOCACHE_CALLS" = "0" ] && [ "$REAP_GO_BUILD_CALLS" = "0" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "0" ] && [ "$REAP_BACKUP_RESIDUE_CALLS" = "0" ]; then
-  ok "main(): avail above floor on first read never invokes the scratch/transcript/hf-cache/gocache/go-build/code-sign-clone/backup-residue reapers"
+if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ] && [ "$REAP_HF_CALLS" = "0" ] && [ "$REAP_GOCACHE_CALLS" = "0" ] && [ "$REAP_GO_BUILD_CALLS" = "0" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "0" ] && [ "$REAP_BACKUP_RESIDUE_CALLS" = "0" ] && [ "$REAP_BACKUP_STAGING_CALLS" = "0" ]; then
+  ok "main(): avail above floor on first read never invokes the scratch/transcript/hf-cache/gocache/go-build/code-sign-clone/backup-residue/backup-staging reapers"
 else
-  bad "main(): expected zero scratch/transcript/hf-cache/gocache/go-build/code-sign-clone/backup-residue reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS REAP_BACKUP_RESIDUE_CALLS=$REAP_BACKUP_RESIDUE_CALLS"
+  bad "main(): expected zero scratch/transcript/hf-cache/gocache/go-build/code-sign-clone/backup-residue/backup-staging reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS REAP_BACKUP_RESIDUE_CALLS=$REAP_BACKUP_RESIDUE_CALLS REAP_BACKUP_STAGING_CALLS=$REAP_BACKUP_STAGING_CALLS"
 fi
 # ga-sfj3i.2: the exact case this acceptance criterion exists for — a cycle
 # that never breaches ANY floor is precisely where the pre-fix guard logged

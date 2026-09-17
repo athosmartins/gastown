@@ -62,6 +62,24 @@
 # exatamente o que o desenho normal evita e só é aceita aqui por não haver
 # alternativa com o disco que existe. RESEED_ALLOW_LOW_DISK=0 desliga tudo
 # isto e volta ao comportamento antigo (só recusa).
+#
+# ═══ MODO ULTRA DE BAIXO DISCO (ga-74tts6) ═══
+#
+# O modo acima ainda exige ~120% do vivo livre PARA CONSTRUIR a cópia nova com
+# o antigo no lugar -- para o hq real (7,7G vivo) isso são ~9,2GB, e o
+# incidente que abriu esta bead teve o disco em CRITICAL (~4-6GB livres):
+# nem o modo de baixo disco cabia, e ele voltava a recusar às 04:00 também.
+# Mesmo catch-22 de ga-i99qsp, com o limiar menor.
+#
+# Quando nem uma cópia nova cabe com o antigo no lugar (Preflight 2), mas
+# LIBERAR o antigo abriria espaço suficiente (livre + tamanho do antigo >=
+# 120% do vivo), a ordem se inverte por completo: prova via S3 -> libera o
+# antigo -> só ENTÃO constrói a cópia nova -> verifica -> promove. A MESMA
+# prova de duas partes do modo de baixo disco normal (nunca uma prova mais
+# fraca só porque a situação é mais urgente); se falhar, nada é apagado. Se a
+# liberação nem bastaria (livre + antigo ainda < 120% do vivo), o script
+# recusa exatamente como antes -- apagar o antigo sem conseguir reconstruir
+# o novo não ajudaria em nada.
 set -uo pipefail
 
 # shellcheck disable=SC1091
@@ -208,21 +226,64 @@ _run_reseed() {
   log "espaço: preciso ~$((NEED_KB/1024))MB (fluxo normal, ${DISK_MARGIN_PCT}%), livre $((FREE_KB/1024))MB"
 
   local LOW_DISK_MODE=0
+  local FREE_OLD_FIRST=0
   if [ "$FREE_KB" -lt "$NEED_KB" ]; then
     if [ "$RESEED_ALLOW_LOW_DISK" != "1" ]; then
       die "disco insuficiente. NÃO iniciando: um sync que enche o disco no meio é exatamente como se corrompe o Dolt (precedente: ga-vs55, 14/07). (modo de baixo disco desabilitado via RESEED_ALLOW_LOW_DISK=0)"
     fi
     local LOW_NEED_KB=$(( LIVE_KB * LOW_DISK_MARGIN_PCT / 100 ))
-    if [ "$FREE_KB" -lt "$LOW_NEED_KB" ]; then
-      die "disco insuficiente até para o modo de baixo disco (preciso ~$((LOW_NEED_KB/1024))MB para UMA cópia nova, livre $((FREE_KB/1024))MB). NÃO iniciando: um sync que enche o disco no meio é exatamente como se corrompe o Dolt (precedente: ga-vs55, 14/07)."
-    fi
     LOW_DISK_MODE=1
-    log "modo de baixo disco ativado para '$DB': livre $((FREE_KB/1024))MB cobre uma cópia nova (~$((LOW_NEED_KB/1024))MB) mas não as duas do fluxo normal (~$((NEED_KB/1024))MB) -- vou liberar o backup antigo, com prova do S3, SE precisar do espaço dele para a verificação."
+    if [ "$FREE_KB" -lt "$LOW_NEED_KB" ]; then
+      # ga-74tts6: o hq real bateu exatamente aqui — livre (~4-6GB) nem cobre
+      # os ~120% (~9,2GB) que este modo de baixo disco pede para construir a
+      # cópia nova COM o antigo ainda no lugar. A recusa direta (comportamento
+      # antigo) faz o mecanismo de alívio recusar exatamente quando ele é mais
+      # necessário -- o mesmo catch-22 que abriu esta bead. Antes de desistir,
+      # verifica se LIBERAR o antigo (com a MESMA prova do S3 que o Passo 1.5
+      # abaixo já usa) abriria espaço suficiente -- só então vale a pena pagar
+      # o preço de inverter a ordem (apagar antes de construir).
+      local OLD_DIR_KB=0
+      if [ -d "$BACKUP_DIR" ]; then
+        OLD_DIR_KB=$(du -sk "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
+        case "$OLD_DIR_KB" in ''|*[!0-9]*) OLD_DIR_KB=0 ;; esac
+      fi
+      local PROJECTED_KB=$(( FREE_KB + OLD_DIR_KB ))
+      if [ "$PROJECTED_KB" -lt "$LOW_NEED_KB" ]; then
+        die "disco insuficiente até liberando o backup antigo (livre $((FREE_KB/1024))MB + antigo $((OLD_DIR_KB/1024))MB = $((PROJECTED_KB/1024))MB, preciso ~$((LOW_NEED_KB/1024))MB para UMA cópia nova). NÃO iniciando: um sync que enche o disco no meio é exatamente como se corrompe o Dolt (precedente: ga-vs55, 14/07)."
+      fi
+      FREE_OLD_FIRST=1
+      log "livre $((FREE_KB/1024))MB não cobre nem uma cópia nova (~$((LOW_NEED_KB/1024))MB) com o antigo ainda no lugar -- mas liberando o antigo (~$((OLD_DIR_KB/1024))MB, com prova do S3) chegaria a ~$((PROJECTED_KB/1024))MB, o suficiente. Vou provar e liberar ANTES de escrever qualquer coisa nova (ordem invertida do modo de baixo disco normal abaixo)."
+    else
+      log "modo de baixo disco ativado para '$DB': livre $((FREE_KB/1024))MB cobre uma cópia nova (~$((LOW_NEED_KB/1024))MB) mas não as duas do fluxo normal (~$((NEED_KB/1024))MB) -- vou liberar o backup antigo, com prova do S3, SE precisar do espaço dele para a verificação."
+    fi
   fi
 
   # ── Preflight 3: estado limpo ────────────────────────────────────────────────
   [ -e "$NEW_DIR" ] && die "$NEW_DIR já existe — resíduo de uma execução anterior. Investigue antes; não vou sobrescrever backup."
   [ -e "$OLD_DIR" ] && die "$OLD_DIR já existe — resíduo de uma execução anterior. Investigue antes."
+
+  local OLD_FREED_EARLY=0
+
+  # ── Passo 0.5 (só quando nem uma cópia nova cabe com o antigo no lugar,
+  # ga-74tts6): liberar o antigo AGORA, com prova do S3, ANTES de escrever
+  # qualquer coisa nova. Ordem invertida do modo de baixo disco normal (Passo
+  # 1.5 abaixo, que só libera DEPOIS de construir o novo, e só se precisar) --
+  # aqui não há escolha: o Preflight 2 já confirmou que o antigo TEM que sair
+  # do caminho antes de haver espaço para o novo. Mesma prova de duas partes
+  # (_s3_current_backup_verified), fail-closed por construção: se falhar, nada
+  # é apagado.
+  if [ "$FREE_OLD_FIRST" = "1" ]; then
+    if ! _s3_current_backup_verified "$DB" "$BACKUP_DIR"; then
+      die "modo ULTRA de baixo disco: prova do S3 FALHOU para '$DB' (manifest ausente ou tamanho incoerente) -- NADA foi apagado. O backup antigo segue intacto em $BACKUP_DIR."
+    fi
+    local OLD_FREED_SIZE; OLD_FREED_SIZE="$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')"
+    log "modo ULTRA de baixo disco: prova do S3 OK para '$DB' -- liberando o antigo ($BACKUP_DIR, ~${OLD_FREED_SIZE:-?}) ANTES de construir, porque não há espaço para os dois coexistirem."
+    if ! rm -rf "$BACKUP_DIR"; then
+      die "modo ULTRA de baixo disco: rm -rf do backup antigo falhou -- NADA foi trocado, mas investigue $BACKUP_DIR manualmente (pode estar parcialmente removido)."
+    fi
+    OLD_FREED_EARLY=1
+    log "modo ULTRA de baixo disco: antigo liberado (~${OLD_FREED_SIZE:-?}). ATENÇÃO: '$DB' fica SEM BACKUP LOCAL até a verificação abaixo terminar -- o S3 (verificado agora) é o único fallback nesta janela."
+  fi
 
   # ── Passo 1: backup novo, em local novo ─────────────────────────────────────
   # ga-o3nqy2: server-free (dolt-offline-backup-sync.sh) — sem isso, o mesmo
@@ -239,14 +300,16 @@ _run_reseed() {
   OLD_FILES=$(find "$BACKUP_DIR" -name "*.darc" 2>/dev/null | wc -l | tr -d ' ')
   log "backup novo: $NEW_FILES arquivo(s) | antigo: $OLD_FILES arquivo(s)"
 
-  # ── Passo 1.5 (só no modo de baixo disco): liberar o antigo SE precisar ─────
-  # do espaço dele para caber a verificação (a segunda cópia). Deferido até
-  # aqui de propósito -- o mais tarde possível -- para maximizar a chance de
-  # NUNCA precisar tocar no antigo (se o uso real veio menor que a estimativa
-  # conservadora do Preflight 2, por exemplo) e minimizar a janela sem backup
-  # local quando precisar mesmo.
-  local OLD_FREED_EARLY=0
-  if [ "$LOW_DISK_MODE" = "1" ]; then
+  # ── Passo 1.5 (só no modo de baixo disco NORMAL): liberar o antigo SE ───────
+  # precisar do espaço dele para caber a verificação (a segunda cópia).
+  # Deferido até aqui de propósito -- o mais tarde possível -- para maximizar a
+  # chance de NUNCA precisar tocar no antigo (se o uso real veio menor que a
+  # estimativa conservadora do Preflight 2, por exemplo) e minimizar a janela
+  # sem backup local quando precisar mesmo. Pulado quando o Passo 0.5 já
+  # liberou o antigo (OLD_FREED_EARLY=1, modo ULTRA) -- $BACKUP_DIR já não
+  # existe nesse caso, e tentar provar/apagar de novo aqui destruiria a prova
+  # (du de um diretório inexistente não é "incoerente", é vazio).
+  if [ "$LOW_DISK_MODE" = "1" ] && [ "$OLD_FREED_EARLY" != "1" ]; then
     local FREE_KB_NOW VERIFY_NEED_KB
     FREE_KB_NOW=$(df -k /System/Volumes/Data 2>/dev/null | awk 'NR==2{print $4}')
     VERIFY_NEED_KB=$(( LIVE_KB * LOW_DISK_MARGIN_PCT / 100 ))

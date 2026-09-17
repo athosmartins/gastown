@@ -290,16 +290,78 @@ while read -r line; do
 done < "$ROOT3/classify.log"
 rm -rf "$ROOT3" 2>/dev/null
 
-# ── Scenario 4: disk too tight even for low-disk mode → refuses cleanly,
-#    still classified as the (streak-tracked) margin refusal, nothing touched ──
+# ── Scenario 4: disk too tight even AFTER freeing the old backup → refuses
+#    cleanly, still classified as the (streak-tracked) margin refusal, nothing
+#    touched. live=10M → LOW_NEED=12M; old=5M so freeing it only ever projects
+#    to free(1M)+old(5M)=6M, still short of the 12M a single fresh copy needs —
+#    genuinely no amount of freeing helps here (ga-74tts6: distinct from
+#    scenarios 6/7 below, where freeing the — much bigger — old backup DOES
+#    clear the bar). ──
 ROOT4="/tmp/reseed-selftest-s4.$$"
-setup_scenario "$ROOT4" 10 20 22   # total=22M: barely covers old+live already, no room for even one fresh copy
+setup_scenario "$ROOT4" 10 5 16   # total=16M: live=10M+old=5M used, 1M free — even freeing old (5M) only projects to 6M < 12M needed
 run_scenario "$ROOT4" FAKE_LIVE_COUNT=50
-if [ "$RC" -ne 0 ]; then ok "scenario 4 (too tight even for low-disk): exits non-zero"; else bad "scenario 4: expected non-zero exit, got 0"; fi
-if grep -q "insuficiente até para o modo de baixo disco" "$ROOT4/out.log" 2>/dev/null; then ok "scenario 4: distinctive 'even low-disk mode' refusal message present"; else bad "scenario 4: missing the low-disk-also-insufficient message"; fi
+if [ "$RC" -ne 0 ]; then ok "scenario 4 (too tight even after freeing old): exits non-zero"; else bad "scenario 4: expected non-zero exit, got 0"; fi
+if grep -q "insuficiente até liberando o backup antigo" "$ROOT4/out.log" 2>/dev/null; then ok "scenario 4: distinctive 'even freeing the old backup' refusal message present"; else bad "scenario 4: missing the freeing-old-still-insufficient message"; fi
 if grep -q "disco insuficiente" "$ROOT4/out.log" 2>/dev/null; then ok "scenario 4: still classifiable by is_disk_margin_refusal (so the streak counter tracks it)"; else bad "scenario 4: should still match 'disco insuficiente' for the streak counter to see it"; fi
 if [ -d "$ROOT4/city/.dolt-backup/hq" ] && [ ! -e "$ROOT4/city/.dolt-backup/hq.new" ] && [ ! -e "$ROOT4/city/.dolt-backup/hq.old" ]; then ok "scenario 4: nothing touched (no .new, no .old, original backup dir untouched)"; else bad "scenario 4: expected nothing touched"; fi
 rm -rf "$ROOT4" 2>/dev/null
+
+# ── Scenario 6 (ACCEPTANCE #1, ga-74tts6): free space below 100% of live (and
+#    below the normal low-disk-mode's own 120% margin) but freeing the old
+#    (bloated) backup — S3-verified first — opens enough room → staging is
+#    freed BEFORE any new write, and free space ends up higher than before ──
+ROOT6="/tmp/reseed-selftest-s6.$$"
+setup_scenario "$ROOT6" 10 20 35   # live=10M, old=20M(bloated), free=5M (50% of live — below even the 120% low-disk margin)
+FREE_BEFORE_KB=$(( 35*1024 - $(city_used_kb "$ROOT6") ))
+run_scenario "$ROOT6" FAKE_LIVE_COUNT=50 FAKE_RESTORED_COUNT=50 FAKE_NEW_BACKUP_MB=10 FAKE_AWS_MANIFEST_OK=1 FAKE_AWS_FINGERPRINT_OK=1 FAKE_FP_DB=hq FAKE_FP_SIZE=20M
+if [ "$RC" -eq 0 ]; then ok "scenario 6 (ultra-low-disk, S3 verified): exits 0"; else bad "scenario 6: expected exit 0, got $RC — $(tail -5 "$ROOT6/out.log")"; fi
+if grep -q "modo ULTRA de baixo disco" "$ROOT6/out.log" 2>/dev/null; then ok "scenario 6: ultra-low-disk mode activated"; else bad "scenario 6: ultra-low-disk mode should have activated"; fi
+if grep -q "ANTES de construir" "$ROOT6/out.log" 2>/dev/null; then ok "scenario 6: log shows the old backup was freed BEFORE writing anything new (inverted order)"; else bad "scenario 6: missing the freed-before-building log line"; fi
+NEW_KB=$(du -sk "$ROOT6/city/.dolt-backup/hq" 2>/dev/null | awk '{print $1}')
+OLD_KB_APPROX=$((20*1024))
+if [ -n "$NEW_KB" ] && [ "$NEW_KB" -lt "$OLD_KB_APPROX" ]; then ok "scenario 6: staging shrunk (${NEW_KB}KB < old ${OLD_KB_APPROX}KB)"; else bad "scenario 6: staging should have shrunk, got ${NEW_KB:-?}KB"; fi
+if [ -e "$ROOT6/city/.dolt-backup/hq.old" ]; then bad "scenario 6: ultra path should NOT leave a .old (old was freed proactively with S3 proof, not renamed)"; else ok "scenario 6: no .old residue left"; fi
+FREE_AFTER_KB=$(( 35*1024 - $(city_used_kb "$ROOT6") ))
+if [ "$FREE_AFTER_KB" -gt "$FREE_BEFORE_KB" ]; then ok "scenario 6: free space increased (before=${FREE_BEFORE_KB}KB after=${FREE_AFTER_KB}KB)"; else bad "scenario 6: free space should have increased (before=${FREE_BEFORE_KB}KB after=${FREE_AFTER_KB}KB)"; fi
+if grep -q "prova do S3 OK" "$ROOT6/out.log" 2>/dev/null; then ok "scenario 6: log has the S3-proof line"; else bad "scenario 6: log missing the S3-proof line"; fi
+rm -rf "$ROOT6" 2>/dev/null
+
+# ── Scenario 7 (ACCEPTANCE #2, ga-74tts6): same ultra-low-disk trigger as
+#    scenario 6, but the S3 proof FAILS → NOTHING deleted, distinctive alarm,
+#    and NEW_DIR is never even created (the proof runs before any write) ──
+ROOT7="/tmp/reseed-selftest-s7.$$"
+setup_scenario "$ROOT7" 10 20 35
+OLD_KB_BEFORE=$(du -sk "$ROOT7/city/.dolt-backup/hq" 2>/dev/null | awk '{print $1}')
+run_scenario "$ROOT7" FAKE_LIVE_COUNT=50 FAKE_NEW_BACKUP_MB=10 FAKE_AWS_MANIFEST_OK=0 FAKE_AWS_FINGERPRINT_OK=1
+if [ "$RC" -ne 0 ]; then ok "scenario 7 (ultra-low-disk, S3 proof fails): exits non-zero"; else bad "scenario 7: expected non-zero exit, got 0"; fi
+OLD_KB_AFTER=$(du -sk "$ROOT7/city/.dolt-backup/hq" 2>/dev/null | awk '{print $1}')
+if [ "$OLD_KB_BEFORE" = "$OLD_KB_AFTER" ]; then ok "scenario 7: old backup UNCHANGED (${OLD_KB_AFTER}KB) — nothing deleted"; else bad "scenario 7: old backup should be unchanged, was ${OLD_KB_BEFORE}KB now ${OLD_KB_AFTER}KB"; fi
+if [ -e "$ROOT7/city/.dolt-backup/hq.new" ]; then bad "scenario 7: .new should never have been created — the proof runs before Passo 1"; else ok "scenario 7: .new correctly never created (proof-before-write ordering)"; fi
+if grep -q "modo ULTRA de baixo disco: prova do S3 FALHOU" "$ROOT7/out.log" 2>/dev/null; then ok "scenario 7: distinctive ultra-mode 'prova do S3 FALHOU' message present"; else bad "scenario 7: missing the distinctive proof-failed message"; fi
+if grep -q "disco insuficiente" "$ROOT7/out.log" 2>/dev/null; then bad "scenario 7: message must NOT also match is_disk_margin_refusal's pattern (would misclassify as silent/expected)"; else ok "scenario 7: message does not collide with the disk-margin-refusal pattern"; fi
+( PATH="$ROOT7/bin:$PATH" DOLT_S3_BACKUP_LIB=1 . "$S3_BACKUP_SCRIPT"
+  if is_low_disk_proof_failed_refusal "$(cat "$ROOT7/out.log")"; then
+    echo "  PASS: scenario 7: dolt-s3-backup.sh's is_low_disk_proof_failed_refusal classifies the ultra-mode proof failure the same as the normal low-disk one"
+  else
+    echo "  FAIL: scenario 7: is_low_disk_proof_failed_refusal did NOT classify this output — would be misrouted"
+  fi
+) > "$ROOT7/classify.log" 2>&1
+cat "$ROOT7/classify.log"
+grep -q "^  PASS:" "$ROOT7/classify.log" && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+rm -rf "$ROOT7" 2>/dev/null
+
+# ── Scenario 8 (invariant c via the NEW trigger path): ultra mode frees the
+#    old backup (S3 proof passed) and THEN the rebuild itself fails → same
+#    "SEM BACKUP LOCAL" alarm as scenario 3's normal-low-disk-mode trigger,
+#    proving OLD_FREED_EARLY is honored identically regardless of which step
+#    (0.5 or 1.5) set it ──
+ROOT8="/tmp/reseed-selftest-s8.$$"
+setup_scenario "$ROOT8" 10 20 35
+run_scenario "$ROOT8" FAKE_LIVE_COUNT=50 FAKE_NEW_BACKUP_MB=10 FAKE_AWS_MANIFEST_OK=1 FAKE_AWS_FINGERPRINT_OK=1 FAKE_FP_DB=hq FAKE_FP_SIZE=20M FAKE_RESTORE_FAIL=1
+if [ "$RC" -ne 0 ]; then ok "scenario 8 (ultra freed-then-rebuild-fails): exits non-zero"; else bad "scenario 8: expected non-zero exit, got 0"; fi
+if grep -q "SEM BACKUP LOCAL" "$ROOT8/out.log" 2>/dev/null; then ok "scenario 8: distinctive 'SEM BACKUP LOCAL' message present"; else bad "scenario 8: missing the distinctive no-local-backup message"; fi
+if [ -e "$ROOT8/city/.dolt-backup/hq" ]; then bad "scenario 8: old was freed and new was never promoted — .dolt-backup/hq should not exist"; else ok "scenario 8: confirms the invariant-(c) window is real via the ultra trigger too"; fi
+rm -rf "$ROOT8" 2>/dev/null
 
 # ── Scenario 5: RESEED_ALLOW_LOW_DISK=0 → old refuse-only behavior preserved ──
 ROOT5="/tmp/reseed-selftest-s5.$$"
