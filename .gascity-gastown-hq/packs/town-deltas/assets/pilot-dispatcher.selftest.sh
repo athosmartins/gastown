@@ -783,6 +783,32 @@ run_capacity() {
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
 
+# ga-3hhnyn: forces BOTH lanes full via MAX_SMALL=0/MAX_BIG=0 env overrides
+# (the dispatcher honors these directly — no need to construct lane-labeled
+# FAKE_INFLIGHT_JSON occupants) to exercise the lanes-full backoff log's
+# eligible-vs-waiting split. FAKE_TIER2_JSON feeds the SAME `-l story:approved`
+# query the backoff path's cheap WAITING_APPROVED/ELIGIBLE_APPROVED count uses.
+#   $1 = FAKE_TIER2_JSON (the -l story:approved query result)
+run_lanefull() {
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DRY_RUN=1 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
+    MAX_SMALL=0 \
+    MAX_BIG=0 \
+    FAKE_TIER2_JSON="${1:-[]}" \
+    FAKE_BLOCKED_IDS="" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
 # ── ctx:ready candidate-source runner (PILOT_CTX_READY_QUERIES default-on) ─────
 # Drives a DRY sweep with the ctx:ready candidate query fixture injected. Proves
 # the new candidate source: an unassigned ctx:ready chore/task IS dispatched; an
@@ -8250,6 +8276,57 @@ NORMAL_STEP5_LITERAL='DISPATCH_STEP5="5. Commit, push, then run /gate-done."'
 grep -qF "$NORMAL_STEP5_LITERAL" "$DISPATCHER" \
   && ok "ga-ycsl9: the normal (non-beads-repo) DISPATCH_STEP5 default is untouched — label instruction stays scoped to the beads-repo branch" \
   || bad "ga-ycsl9: REGRESSION — the normal DISPATCH_STEP5 default text changed; verify the label instruction did not leak into the non-beads-repo path"
+
+# ── Scenario ga-3hhnyn: lanes-full backoff log separates waiting from eligible ─
+# Bug: the backoff log unconditionally said "both lanes full — none can
+# dispatch this sweep", blaming lane capacity even when every waiting
+# story:approved bead was independently vetoed (pilot:no-auto-dispatch,
+# blocked-on:*, waiting-on:*, next-action:*) and would not have dispatched
+# with any number of free slots. Measured live: 8 waiting, 0 eligible, logged
+# as a lane-capacity problem.
+TIER2_ALL_VETOED='[
+  {"id":"tt-lf-blocked","title":"blocked-on veto fixture","priority":1,"issue_type":"feature","description":"fixture body — context for veto test","status":"open","labels":["story:approved","blocked-on:tt-other"],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}},
+  {"id":"tt-lf-noauto","title":"pilot:no-auto-dispatch veto fixture","priority":1,"issue_type":"feature","description":"fixture body — context for veto test","status":"open","labels":["story:approved","pilot:no-auto-dispatch"],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}},
+  {"id":"tt-lf-waiting","title":"waiting-on veto fixture","priority":1,"issue_type":"feature","description":"fixture body — context for veto test","status":"open","labels":["story:approved","waiting-on:pr-9999"],"assignee":null,"created_at":"2026-06-01T00:00:03Z","metadata":{}}
+]'
+
+echo "Scenario ga-3hhnyn-a: both lanes full + ALL waiting approved beads vetoed -> log says 0 eligible, does not blame lane capacity"
+LOGLFA="$(run_lanefull "$TIER2_ALL_VETOED")"
+if echo "$LOGLFA" | grep -q "Dispatch queue: 3 story:approved waiting (HQ), 0 eligible"; then
+  ok "ga-3hhnyn: log reports 3 waiting / 0 eligible when every waiting bead carries a veto label"
+else
+  bad "ga-3hhnyn: log did NOT report the waiting/eligible split (expected 'Dispatch queue: 3 story:approved waiting (HQ), 0 eligible')"
+fi
+if echo "$LOGLFA" | grep -q "none can dispatch this sweep"; then
+  bad "ga-3hhnyn: REGRESSION — log still blames lane capacity ('none can dispatch this sweep') when 0 beads were actually eligible"
+else
+  ok "ga-3hhnyn: log does NOT blame lane capacity when nothing was eligible anyway"
+fi
+if echo "$LOGLFA" | grep -q "NOT the blocker"; then
+  ok "ga-3hhnyn: log honestly states lane occupancy is not the blocker"
+else
+  bad "ga-3hhnyn: log missing the 'not the blocker' honesty clause"
+fi
+
+# ── Scenario ga-3hhnyn-b: no over-correction — a genuinely eligible bead still
+# gets the lane-capacity attribution when lanes really are the blocker.
+TIER2_ONE_ELIGIBLE='[
+  {"id":"tt-lf-blocked","title":"blocked-on veto fixture","priority":1,"issue_type":"feature","description":"fixture body — context for veto test","status":"open","labels":["story:approved","blocked-on:tt-other"],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}},
+  {"id":"tt-lf-clean","title":"no veto - genuinely eligible fixture","priority":1,"issue_type":"feature","description":"fixture body — context for veto test","status":"open","labels":["story:approved"],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}}
+]'
+
+echo "Scenario ga-3hhnyn-b: both lanes full + at least one ELIGIBLE waiting bead -> log still attributes non-dispatch to lane capacity"
+LOGLFB="$(run_lanefull "$TIER2_ONE_ELIGIBLE")"
+if echo "$LOGLFB" | grep -q "Dispatch queue: 2 story:approved waiting, 1 eligible (HQ; both lanes full — none can dispatch this sweep)"; then
+  ok "ga-3hhnyn: log reports 2 waiting / 1 eligible AND still attributes non-dispatch to full lanes (true positive preserved)"
+else
+  bad "ga-3hhnyn: log did not preserve the lane-capacity attribution when a bead WAS actually eligible"
+fi
+if echo "$LOGLFB" | grep -q "Both lanes full (small=0/0 unclassified_lane=0, big=0/0). Pilot backing off."; then
+  ok "ga-3hhnyn: slot-occupancy line still prints when lane capacity IS the real blocker"
+else
+  bad "ga-3hhnyn: slot-occupancy line missing/changed when lane capacity IS the real blocker"
+fi
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""

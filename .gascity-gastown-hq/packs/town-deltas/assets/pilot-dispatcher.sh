@@ -7014,14 +7014,39 @@ log "Gate reviewers: active=${REVIEWERS_ACTIVE}/${MAX_REVIEWERS}  free=${REVIEWE
 if [ "$SMALL_SLOTS" -eq "0" ] && [ "$BIG_SLOTS" -eq "0" ]; then
   # ga-8c1 AC5: even when backing off, surface the dispatch-queue depth so every
   # sweep's log reports what's waiting (cheap count — no full tier scan).
-  WAITING_APPROVED=$(bd -C "$GC_CITY" list --json \
+  # ga-3hhnyn: a bead can carry story:approved and still be permanently vetoed
+  # (pilot:no-auto-dispatch, blocked-on:*, waiting-on:*, next-action:*) — it
+  # would not dispatch even with free slots. The old log blamed "both lanes
+  # full" unconditionally, conflating "queued" with "actually dispatchable"
+  # (measured live: 8 waiting, 0 eligible, yet logged as a lane-capacity
+  # problem — "represada por capacidade" and "parada por veto" are OPPOSITE
+  # operational calls). ELIGIBLE_APPROVED reuses the SAME already-fetched
+  # JSON via a local jq filter — still one bd call, so the "cheap count"
+  # intent above still holds. Narrow veto criterion, verified against that
+  # live 8-bead case (0/8 eligible): gate:needs-* is deliberately NOT treated
+  # as a veto here, so a more transient gate state never inflates the
+  # "parked on purpose" bucket.
+  WAITING_JSON=$(bd -C "$GC_CITY" list --json \
     -l "story:approved" \
     --exclude-label "story:in-flight" \
     --exclude-label "story:done" \
     --exclude-label "pilot:dispatched" \
-    -n 0 2>/dev/null | jq 'length' 2>/dev/null || echo "?")
-  log "Dispatch queue: ${WAITING_APPROVED} story:approved waiting (HQ; both lanes full — none can dispatch this sweep)."
-  log "Both lanes full (small=${IN_FLIGHT_SMALL_CLASSIFIED}/${MAX_SMALL} unclassified_lane=${IN_FLIGHT_UNCLASSIFIED}, big=${IN_FLIGHT_BIG}/${MAX_BIG}). Pilot backing off."
+    -n 0 2>/dev/null || echo "[]")
+  WAITING_APPROVED=$(echo "$WAITING_JSON" | jq 'length' 2>/dev/null || echo "?")
+  ELIGIBLE_APPROVED=$(echo "$WAITING_JSON" | jq '[ .[] | select(
+      ((.labels // []) | map(select(
+        . == "pilot:no-auto-dispatch"
+        or startswith("blocked-on:")
+        or startswith("waiting-on:")
+        or startswith("next-action:")
+      )) | length) == 0
+    ) ] | length' 2>/dev/null || echo "?")
+  if [ "${ELIGIBLE_APPROVED:-?}" = "0" ]; then
+    log "Dispatch queue: ${WAITING_APPROVED} story:approved waiting (HQ), 0 eligible — all parked on purpose (veto label); lane occupancy small=${IN_FLIGHT_SMALL_CLASSIFIED}/${MAX_SMALL} big=${IN_FLIGHT_BIG}/${MAX_BIG} is NOT the blocker."
+  else
+    log "Dispatch queue: ${WAITING_APPROVED} story:approved waiting, ${ELIGIBLE_APPROVED} eligible (HQ; both lanes full — none can dispatch this sweep)."
+    log "Both lanes full (small=${IN_FLIGHT_SMALL_CLASSIFIED}/${MAX_SMALL} unclassified_lane=${IN_FLIGHT_UNCLASSIFIED}, big=${IN_FLIGHT_BIG}/${MAX_BIG}). Pilot backing off."
+  fi
   exit 0
 fi
 
