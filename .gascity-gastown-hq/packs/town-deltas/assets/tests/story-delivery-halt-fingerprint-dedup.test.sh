@@ -38,11 +38,33 @@
 # T4: a DIFFERENT story's FIRST HALT in the SAME city (sharing the same
 #     halt-fingerprint directory) → not suppressed by story 1's fingerprint —
 #     the dedup key is per-STORY_ID, never global.
+#
+# ga-vv5ngy: T1-T4 above prove wa-xokje's dedup itself, but confirmed LIVE
+# (wa-bpbgp, 2026-09-17, ~1h after wa-xokje merged) that an unresolved HALT
+# whose fingerprint keeps matching stays suppressed FOREVER — indistinguishable,
+# to the author/Mayor/next worker, from the story having quietly gone away.
+# T5/T6 cover the fix: a per-story "last announced" timestamp alongside the
+# fingerprint, with a spaced reminder once HALT_FP_REMINDER_INTERVAL_S has
+# elapsed since that timestamp, even though the fingerprint never changed.
+#
+# T5: same story, same fingerprint as its last report, but that report is now
+#     older than HALT_FP_REMINDER_INTERVAL_S → a SHORT reminder comment fires
+#     (author + Mayor nudged again) — invariant (c): it must NOT repeat the
+#     full daemon list ("Refresh detail:"/$REFRESH_OUT), only point back at
+#     the original. The stored timestamp is refreshed to now.
+# T6: immediately after T5 (no time elapsed since T5's just-refreshed
+#     timestamp), same fingerprint again → back to fully silent — the
+#     reminder is spaced, not "announce from now on".
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DELIVERY="$SCRIPT_DIR/../story-delivery.sh"
+# Exercise the spaced-reminder path on a short, real interval rather than
+# mocking time — T5/T6 below use a real `sleep` to cross it. Comfortably
+# larger than T1-T4's own back-to-back runtime (well under 1s) so it never
+# fires early for those.
+export HALT_FP_REMINDER_INTERVAL_S=2
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ok   - $1"; }
@@ -186,6 +208,43 @@ echo "$BD_CALLS" | grep -q "comment ga-test2" \
   || nok "T4 comment" "$BD_CALLS"
 echo "$GC_CALLS" | grep -q "session nudge mayor" \
   && ok "T4 different story's first HALT: Mayor nudged" || nok "T4 mayor nudge" "$GC_CALLS"
+
+# ── T5: ga-vv5ngy spaced reminder — same story (fresh id), first HALT
+#        announces as usual, then the SAME fingerprint again after
+#        HALT_FP_REMINDER_INTERVAL_S has elapsed → reminder fires ─────────
+write_stub "com.test.central-sender"
+run_block ga-test3
+[ "$RUN_RC" -eq 0 ] && ok "T5 setup: first HALT for ga-test3 runs clean" \
+  || nok "T5 setup rc" "rc=$RUN_RC"
+echo "$BD_CALLS" | grep -q "comment ga-test3" \
+  && ok "T5 setup: first HALT announced" || nok "T5 setup comment" "$BD_CALLS"
+sleep 3
+run_block ga-test3
+[ "$RUN_RC" -eq 0 ] && ok "T5 block runs clean (rc=0)" || nok "T5 rc" "rc=$RUN_RC"
+echo "$BD_CALLS" | grep -q "comment ga-test3" \
+  && ok "T5 same fingerprint, reminder interval elapsed: comment fires" \
+  || nok "T5 comment" "$BD_CALLS"
+echo "$BD_CALLS" | grep -q "STILL unresolved" \
+  && ok "T5 reminder comment is marked as a reminder, not a fresh HALT" \
+  || nok "T5 reminder wording" "$BD_CALLS"
+! echo "$BD_CALLS" | grep -q "Refresh detail:" \
+  && ok "T5 invariant (c): reminder does NOT repeat the full daemon list" \
+  || nok "T5 should not include Refresh detail:" "$BD_CALLS"
+echo "$GC_CALLS" | grep -q "session nudge crew/tester" \
+  && ok "T5 reminder: author nudged again" || nok "T5 author nudge" "$GC_CALLS"
+echo "$GC_CALLS" | grep -q "session nudge mayor" \
+  && ok "T5 reminder: Mayor nudged again" || nok "T5 mayor nudge" "$GC_CALLS"
+
+# ── T6: immediately after T5 (timestamp just refreshed), same fingerprint
+#        again → back to silent — the reminder is SPACED, not sticky ──────
+run_block ga-test3
+[ "$RUN_RC" -eq 0 ] && ok "T6 block runs clean (rc=0)" || nok "T6 rc" "rc=$RUN_RC"
+! echo "$BD_CALLS" | grep -q "comment ga-test3" \
+  && ok "T6 right after a reminder, unchanged: comment suppressed again" \
+  || nok "T6 comment should be suppressed" "$BD_CALLS"
+! echo "$GC_CALLS" | grep -q "session nudge mayor" \
+  && ok "T6 right after a reminder, unchanged: Mayor nudge suppressed again" \
+  || nok "T6 mayor nudge should be suppressed" "$GC_CALLS"
 
 echo ""
 echo "story-delivery halt-fingerprint dedup tests: $PASS passed, $FAIL failed"

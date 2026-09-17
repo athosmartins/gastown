@@ -2184,34 +2184,84 @@ else
           # name for (wa-bpbgp's own fix; the 'erro-vs-vazio' family
           # generally). Announce on first occurrence and on any real
           # transition (verdict, guarded set, or freshfail set changes);
-          # stay quiet in between. The retry/label mechanics above are
-          # UNCHANGED: still retried every 5-minute sweep, still
+          # stay quiet in between — except for a spaced reminder (ga-vv5ngy):
+          # confirmed live that wa-xokje's dedup ALSO stayed silent past its
+          # own fingerprint match on a bead that was never actually resolving
+          # (wa-bpbgp again, ~1h after wa-xokje shipped), which is just as
+          # unhelpful as spamming — "quiet" and "abandoned" must not look the
+          # same to whoever is watching the bead. The retry/label mechanics
+          # above are UNCHANGED: still retried every 5-minute sweep, still
           # story:approved, still recovers the instant the verdict changes.
           # Fails OPEN (always announce) if the fingerprint file can't be
           # read/written — never silently drops a genuinely NEW failure.
           HALT_FP_DIR="$GC_CITY/.gc/runtime/daemon-refresh-baseline/halt-fingerprint"
-          mkdir -p "$HALT_FP_DIR" 2>/dev/null || true
+          mkdir -p "$HALT_FP_DIR" 2>/dev/null \
+            || warn "could not create halt-fingerprint dir $HALT_FP_DIR for $STORY_ID (non-fatal; dedup fails open — will announce this cycle)"
           HALT_FP_FILE="$HALT_FP_DIR/$STORY_ID.txt"
+          # ga-vv5ngy: line 1 is the dedup key (unchanged from wa-xokje:
+          # verdict|guarded|freshfail); line 2 is the epoch this fingerprint
+          # was last ANNOUNCED (not merely seen). Read the two lines
+          # separately so a pre-ga-vv5ngy, wa-xokje-era file (fingerprint
+          # only, no line 2) degrades to "timestamp unknown" rather than a
+          # parse error — `sed -n Np` on a missing line prints nothing, it
+          # does not fail.
           HALT_FP_NEW="$REFRESH_VERDICT|$REFRESH_GUARDED|$REFRESH_FRESHFAIL"
-          HALT_FP_OLD="$(cat "$HALT_FP_FILE" 2>/dev/null || echo "")"
+          HALT_FP_NOW="$(date +%s)"
+          HALT_FP_OLD="$(sed -n '1p' "$HALT_FP_FILE" 2>/dev/null || echo "")"
+          HALT_FP_OLD_TS="$(sed -n '2p' "$HALT_FP_FILE" 2>/dev/null || echo "")"
+          case "$HALT_FP_OLD_TS" in ''|*[!0-9]*) HALT_FP_OLD_TS=0 ;; esac
+          # Spaced reminder (ga-vv5ngy invariant b): an unresolved HALT that
+          # never changes must not stay silent FOREVER just because it
+          # matches the dedup key — that reads as "nothing is happening" to
+          # whoever is watching the bead. Default once per day; overridable
+          # (the halt-fingerprint-dedup hermetic tests set this low so the
+          # reminder path is exercised without a real 24h wait).
+          HALT_FP_REMINDER_INTERVAL_S="${HALT_FP_REMINDER_INTERVAL_S:-86400}"
           if [ -n "$HALT_FP_OLD" ] && [ "$HALT_FP_NEW" = "$HALT_FP_OLD" ]; then
+            if [ "$HALT_FP_OLD_TS" -gt 0 ] && [ $(( HALT_FP_NOW - HALT_FP_OLD_TS )) -lt "$HALT_FP_REMINDER_INTERVAL_S" ]; then
+              HALT_FP_MODE="silent"
+            else
+              HALT_FP_MODE="reminder"
+            fi
+          else
+            HALT_FP_MODE="announce"
+          fi
+          if [ "$HALT_FP_MODE" = "silent" ]; then
             log "Daemon refresh HALT unchanged since last report for $STORY_ID (verdict=$REFRESH_VERDICT) — suppressing duplicate comment/nudge (still retrying every sweep)."
           else
-            printf '%s' "$HALT_FP_NEW" > "$HALT_FP_FILE" 2>/dev/null || true
-            bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED (ga-iwv0 daemon refresh): $REFRESH_VERDICT — $REFRESH_REASON
+            printf '%s\n%s\n' "$HALT_FP_NEW" "$HALT_FP_NOW" > "$HALT_FP_FILE" 2>/dev/null \
+              || warn "could not persist halt-fingerprint for $STORY_ID at $HALT_FP_FILE (non-fatal; may re-announce next cycle)"
+            if [ "$HALT_FP_MODE" = "reminder" ]; then
+              # Invariant (c): never repeat the full daemon list past the
+              # first announcement for this fingerprint — point back at it.
+              bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED (ga-iwv0 daemon refresh) — STILL unresolved, unchanged since the last report: $REFRESH_VERDICT — $REFRESH_REASON
+Not repeating the full daemon list here — see the earlier 'Delivery HALTED' comment on this bead for it (ga-vv5ngy spaced reminder: fires every ${HALT_FP_REMINDER_INTERVAL_S}s while the condition stays unchanged). story:done remains WITHHELD.
+$REFRESH_ACTION" 2>/dev/null || true
+              AUTHOR=$(echo "$STORY" | jq -r '.assignee // .created_by // ""' 2>/dev/null || echo "")
+              if [ -n "$AUTHOR" ] && [ "$AUTHOR" != "null" ]; then
+                gc --city "$GC_CITY" session nudge "$AUTHOR" \
+                  "DELIVERY still HALTED for $STORY_ID (ga-iwv0): $REFRESH_VERDICT — unchanged since last report. See bead; do NOT mark done." \
+                  --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR"
+              fi
+              gc --city "$GC_CITY" session nudge mayor \
+                "DELIVERY still HALTED ($STORY_ID, rig $RIG): daemon refresh $REFRESH_VERDICT unchanged since last report — $REFRESH_REASON. story:done withheld." \
+                2>/dev/null || true
+            else
+              bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED (ga-iwv0 daemon refresh): $REFRESH_VERDICT — $REFRESH_REASON
 A long-lived daemon serving rig '$RIG' is running code OLDER than this deploy and could not be safely refreshed/verified, so the merged feature would be DORMANT in production. story:done is WITHHELD (a dormant deploy must never be marked done).
 $REFRESH_ACTION
 Refresh detail:
 $REFRESH_OUT" 2>/dev/null || true
-            AUTHOR=$(echo "$STORY" | jq -r '.assignee // .created_by // ""' 2>/dev/null || echo "")
-            if [ -n "$AUTHOR" ] && [ "$AUTHOR" != "null" ]; then
-              gc --city "$GC_CITY" session nudge "$AUTHOR" \
-                "DELIVERY HALTED for $STORY_ID (ga-iwv0): $REFRESH_VERDICT — a daemon serving the merge is dormant/unverified. See bead; do NOT mark done." \
-                --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR"
+              AUTHOR=$(echo "$STORY" | jq -r '.assignee // .created_by // ""' 2>/dev/null || echo "")
+              if [ -n "$AUTHOR" ] && [ "$AUTHOR" != "null" ]; then
+                gc --city "$GC_CITY" session nudge "$AUTHOR" \
+                  "DELIVERY HALTED for $STORY_ID (ga-iwv0): $REFRESH_VERDICT — a daemon serving the merge is dormant/unverified. See bead; do NOT mark done." \
+                  --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR"
+              fi
+              gc --city "$GC_CITY" session nudge mayor \
+                "DELIVERY HALTED ($STORY_ID, rig $RIG): daemon refresh $REFRESH_VERDICT — $REFRESH_REASON. story:done withheld." \
+                2>/dev/null || true
             fi
-            gc --city "$GC_CITY" session nudge mayor \
-              "DELIVERY HALTED ($STORY_ID, rig $RIG): daemon refresh $REFRESH_VERDICT — $REFRESH_REASON. story:done withheld." \
-              2>/dev/null || true
           fi
         fi
         # wa-uthi: non-terminal (delivery:failed re-picked every cycle once the
