@@ -95,17 +95,23 @@ has_call() { grep -qF -- "$1" "$CALLS" 2>/dev/null; }   # exact-substring, any r
 echo "pilot-hold-escalate.selftest — shared hold/escalate counter (ga-2n7xw)"
 
 # ── Scenario A (AC1): DRY_RUN — counter math logged, but NEVER mutates ────────
-echo "Scenario A: DRY_RUN hold #1 (ga-lfvs6, cap=3) logs count=1/3, makes no bd/gc call"
+echo "Scenario A: DRY_RUN hold #1 (ga-lfvs6, cap=3) logs count=1/3, makes no bd/gc MUTATION call"
 run_hold "db1" "bd-1" "ga-lfvs6" "no idle crew" "map a crew" '[]' 3 1
 if has_call "log	[pilot-hold] WOULD stamp pilot:held-count:ga-lfvs6:1 on bd-1 (hold 1/3)"; then
   ok "DRY_RUN first hold logs the correct count/cap"
 else
   bad "DRY_RUN first hold did not log the expected text (dump: $(cat "$CALLS" | tr '\n' '|'))"
 fi
-if grep -qE '^(bd|gc)	' "$CALLS"; then
-  bad "REGRESSION: DRY_RUN performed a real bd/gc mutation"
+# ga-230cyn: the live re-check's `bd show` is a READ that now runs regardless
+# of DRY_RUN (same "reads always run, only writes respect DRY_RUN" shape as
+# the pre-existing _pilot_defer_extend), so the blanket "no bd/gc call at all"
+# check this scenario used pre-ga-230cyn would false-positive on that read.
+# Assert no MUTATING call specifically instead — the property this scenario
+# actually cares about (DRY_RUN never writes).
+if grep -qE '^bd	-C [^	]* (label|comment|update) ' "$CALLS" || grep -qE '^gc	' "$CALLS"; then
+  bad "REGRESSION: DRY_RUN performed a real bd/gc mutation (dump: $(cat "$CALLS" | tr '\n' '|'))"
 else
-  ok "DRY_RUN performs no bd/gc mutation (log-only)"
+  ok "DRY_RUN performs no bd/gc MUTATION (the ga-230cyn live-recheck read, if any, is fine — only label/comment/update/mail would not be)"
 fi
 
 echo "Scenario A2: DRY_RUN hold #3 (prior count=2) logs WOULD ESCALATE, not another WOULD stamp"
@@ -382,6 +388,194 @@ fi
 
 echo "Scenario I7: drift-guard — the bare no-auto-dispatch alias is wired into _pilot_hold_or_escalate (ga-rfpm9)"
 echo "$HOLD_FN" | grep -q '"no-auto-dispatch"' && ok "_pilot_hold_or_escalate carries the bare no-auto-dispatch skip clause" || bad "bare no-auto-dispatch skip clause missing from _pilot_hold_or_escalate"
+
+# ── Scenario J/K/L (ga-230cyn AC1/AC2): live re-check before hold/escalation ──
+# Bug ga-230cyn: the $_phe_labels a caller passes in is a snapshot from
+# whenever ITS OWN candidate scan ran — possibly minutes stale by the time
+# this function executes. Real incident (ga-bt1hjs, 2026-09-17): gastown.dog-2
+# claimed the bead at 07:55:55Z; the Pilot's ga-jazy9 3rd refusal fired at
+# 07:58:50Z off a pre-claim snapshot and stamped gate:needs-human(:technical)
+# — which the gate's pre-push live re-check (ga-360a7l) treats as a
+# withdrawal — onto a bead a dog was already 3 minutes into building
+# (delivered clean at 08:05Z). _pilot_hold_or_escalate now re-reads the bead
+# LIVE before touching anything and skips the ENTIRE cycle (no hold stamp,
+# no escalation) when the live read shows either an actively-building claim
+# or an already-built (gate:queued/reviewing) bead.
+#
+# These scenarios need `bd show <id> --json` to answer with a SPECIFIC live
+# payload, which the shared top-of-file bd() (a pure call-logger, used by
+# run_hold above) cannot do — same reason Scenario H further up uses its own
+# self-contained subshell instead of run_hold. _session_is_live_builder is
+# stubbed directly rather than extracted from the live file: its own
+# correctness is covered by pilot-dispatcher.session-liveness.selftest.sh;
+# this file only needs to prove _pilot_hold_or_escalate correctly CONSULTS it
+# and reacts to the result.
+echo "Scenario J (ga-230cyn AC1): live dog claim at cap (3rd refusal) skips hold/escalation entirely"
+: > "$CALLS"
+(
+  DRY_RUN=0
+  bd() {
+    printf 'bd\t%s\n' "$*" >> "$CALLS"
+    case "$*" in
+      *"show ga-bt1hjs --json"*)
+        printf '[{"status":"in_progress","assignee":"gastown.dog-2","labels":[]}]' ;;
+    esac
+  }
+  gc()   { printf 'gc\t%s\n'   "$*" >> "$CALLS"; }
+  log()  { printf 'log\t%s\n'  "$*" >> "$CALLS"; }
+  warn() { printf 'warn\t%s\n' "$*" >> "$CALLS"; }
+  _session_is_live_builder() { [ "$1" = "gastown.dog-2" ]; }
+  eval "$HOLD_FN"
+  _pilot_hold_or_escalate "db1" "ga-bt1hjs" "ga-jazy9" "no idle crew" "map a crew" '["pilot:held-count:ga-jazy9:2"]' 3
+)
+if has_call "gate:needs-human"; then
+  bad "REGRESSION (ga-230cyn): escalated a bead with a live dog claim (dump: $(cat "$CALLS" | tr '\n' '|'))"
+else
+  ok "no gate:needs-human stamped on a live-claimed bead"
+fi
+if has_call "mail send mayor"; then
+  bad "REGRESSION (ga-230cyn): mailed the Mayor about a bead a dog is actively building"
+else
+  ok "no Mayor mail for a live-claimed bead"
+fi
+if has_call "held-count"; then
+  bad "REGRESSION (ga-230cyn): stamped a hold-count label on a live-claimed bead — the whole cycle should skip, not just escalation"
+else
+  ok "no hold-count stamp either — the whole cycle skips (same 'skip entirely' shape as the AC3 checks above)"
+fi
+if has_call "live claim"; then
+  ok "logs the live-claim skip reason"
+else
+  bad "did not log why the live-claimed bead was skipped (dump: $(cat "$CALLS" | tr '\n' '|'))"
+fi
+
+echo "Scenario K (ga-230cyn AC2): gate:queued bead — hold/escalation path never runs"
+: > "$CALLS"
+(
+  DRY_RUN=0
+  bd() {
+    printf 'bd\t%s\n' "$*" >> "$CALLS"
+    case "$*" in
+      *"show ga-queued1 --json"*)
+        printf '[{"status":"open","assignee":"","labels":["gate:queued"]}]' ;;
+    esac
+  }
+  gc()   { printf 'gc\t%s\n'   "$*" >> "$CALLS"; }
+  log()  { printf 'log\t%s\n'  "$*" >> "$CALLS"; }
+  warn() { printf 'warn\t%s\n' "$*" >> "$CALLS"; }
+  _session_is_live_builder() { return 1; }
+  eval "$HOLD_FN"
+  _pilot_hold_or_escalate "db1" "ga-queued1" "ga-lfvs6" "no idle crew" "map a crew" '["pilot:held-count:ga-lfvs6:2"]' 3
+)
+if has_call "held-count" || has_call "gate:needs-human" || has_call "mail send mayor"; then
+  bad "REGRESSION (ga-230cyn): touched a gate:queued bead — hold/escalation path must never run at all (dump: $(cat "$CALLS" | tr '\n' '|'))"
+else
+  ok "gate:queued bead: no hold-count stamp, no escalation label, no mail — the path never runs"
+fi
+if has_call "already built"; then
+  ok "logs the already-built skip reason"
+else
+  bad "did not log why the gate:queued bead was skipped (dump: $(cat "$CALLS" | tr '\n' '|'))"
+fi
+
+echo "Scenario K2: gate:reviewing (not just gate:queued) is also recognized as already-built"
+: > "$CALLS"
+(
+  DRY_RUN=0
+  bd() {
+    printf 'bd\t%s\n' "$*" >> "$CALLS"
+    case "$*" in
+      *"show ga-reviewing1 --json"*)
+        printf '[{"status":"open","assignee":"","labels":["gate:reviewing"]}]' ;;
+    esac
+  }
+  gc()   { printf 'gc\t%s\n'   "$*" >> "$CALLS"; }
+  log()  { printf 'log\t%s\n'  "$*" >> "$CALLS"; }
+  warn() { printf 'warn\t%s\n' "$*" >> "$CALLS"; }
+  _session_is_live_builder() { return 1; }
+  eval "$HOLD_FN"
+  _pilot_hold_or_escalate "db1" "ga-reviewing1" "ga-lfvs6" "no idle crew" "map a crew" '[]' 3
+)
+if has_call "held-count" || has_call "gate:needs-human" || has_call "mail send mayor"; then
+  bad "REGRESSION (ga-230cyn): touched a gate:reviewing bead (dump: $(cat "$CALLS" | tr '\n' '|'))"
+else
+  ok "gate:reviewing bead also skips the hold/escalation path entirely"
+fi
+
+echo "Scenario L (no false-positive): a bead with no live claim and not built still holds/escalates exactly as before"
+: > "$CALLS"
+(
+  DRY_RUN=0
+  bd() {
+    printf 'bd\t%s\n' "$*" >> "$CALLS"
+    case "$*" in
+      *"show ga-normal1 --json"*)
+        printf '[{"status":"open","assignee":"","labels":[]}]' ;;
+    esac
+  }
+  gc()   { printf 'gc\t%s\n'   "$*" >> "$CALLS"; }
+  log()  { printf 'log\t%s\n'  "$*" >> "$CALLS"; }
+  warn() { printf 'warn\t%s\n' "$*" >> "$CALLS"; }
+  _session_is_live_builder() { return 1; }
+  eval "$HOLD_FN"
+  _pilot_hold_or_escalate "db1" "ga-normal1" "ga-jazy9" "no idle crew" "map a crew" '["pilot:held-count:ga-jazy9:2"]' 3
+)
+if has_call "bd	-C db1 label add ga-normal1 gate:needs-human -q" && has_call "mail send mayor"; then
+  ok "a genuinely-undispatchable bead (no live claim, not built) still escalates normally at cap"
+else
+  bad "REGRESSION (ga-230cyn): the live re-check over-fired and suppressed a legitimate escalation (dump: $(cat "$CALLS" | tr '\n' '|'))"
+fi
+
+echo "Scenario L2 (no false-positive): an in_progress bead whose assignee is NOT a live builder (stale/dead claim) still escalates normally"
+: > "$CALLS"
+(
+  DRY_RUN=0
+  bd() {
+    printf 'bd\t%s\n' "$*" >> "$CALLS"
+    case "$*" in
+      *"show ga-dead1 --json"*)
+        printf '[{"status":"in_progress","assignee":"gastown.dog-9","labels":[]}]' ;;
+    esac
+  }
+  gc()   { printf 'gc\t%s\n'   "$*" >> "$CALLS"; }
+  log()  { printf 'log\t%s\n'  "$*" >> "$CALLS"; }
+  warn() { printf 'warn\t%s\n' "$*" >> "$CALLS"; }
+  _session_is_live_builder() { return 1; }   # dead/asleep — not actively building
+  eval "$HOLD_FN"
+  _pilot_hold_or_escalate "db1" "ga-dead1" "ga-jazy9" "no idle crew" "map a crew" '["pilot:held-count:ga-jazy9:2"]' 3
+)
+if has_call "bd	-C db1 label add ga-dead1 gate:needs-human -q" && has_call "mail send mayor"; then
+  ok "an in_progress bead with a DEAD/asleep assignee (not an active builder) still escalates — the guard checks liveness, not just status"
+else
+  bad "REGRESSION (ga-230cyn): a stale in_progress claim wrongly suppressed a legitimate escalation (dump: $(cat "$CALLS" | tr '\n' '|'))"
+fi
+
+echo "Scenario L3 (fail-open on unreadable live state): bd show fails — proceeds with the ORIGINAL (pre-ga-230cyn) hold/escalate behavior"
+: > "$CALLS"
+(
+  DRY_RUN=0
+  bd() {
+    printf 'bd\t%s\n' "$*" >> "$CALLS"
+    case "$*" in
+      *"show ga-unreadable1 --json"*) return 1 ;;
+    esac
+  }
+  gc()   { printf 'gc\t%s\n'   "$*" >> "$CALLS"; }
+  log()  { printf 'log\t%s\n'  "$*" >> "$CALLS"; }
+  warn() { printf 'warn\t%s\n' "$*" >> "$CALLS"; }
+  _session_is_live_builder() { return 1; }
+  eval "$HOLD_FN"
+  _pilot_hold_or_escalate "db1" "ga-unreadable1" "ga-jazy9" "no idle crew" "map a crew" '["pilot:held-count:ga-jazy9:2"]' 3
+)
+if has_call "bd	-C db1 label add ga-unreadable1 gate:needs-human -q" && has_call "mail send mayor"; then
+  ok "fail-open: an unreadable live state does not block a legitimate escalation (mirrors the ga-zzrts verify-before-claim guards' own fail-open convention)"
+else
+  bad "REGRESSION (ga-230cyn): an unreadable bd show wrongly suppressed escalation, diverging from this file's established fail-open convention (dump: $(cat "$CALLS" | tr '\n' '|'))"
+fi
+
+echo "Scenario M: drift-guard — the ga-230cyn live re-check is wired into _pilot_hold_or_escalate"
+echo "$HOLD_FN" | grep -q '_session_is_live_builder' && ok "_pilot_hold_or_escalate consults live builder-liveness before escalating (ga-230cyn)" || bad "live builder-liveness check missing from _pilot_hold_or_escalate (ga-230cyn regression)"
+echo "$HOLD_FN" | grep -qF 'gate:(queued|reviewing)' && ok "_pilot_hold_or_escalate checks for already-built (gate:queued/reviewing) state (ga-230cyn)" || bad "already-built (gate:queued/reviewing) check missing from _pilot_hold_or_escalate (ga-230cyn regression)"
 
 # ── _pilot_defer_extend (ga-sfj3i.1) ───────────────────────────────────────────
 # A Pilot timed hold (the pilot:held-until label stamped by ga-lfvs6/ga-4zqwm)

@@ -2153,6 +2153,14 @@ PILOT_HOLD_ESCALATE_CAP="${PILOT_HOLD_ESCALATE_CAP:-3}"
 # take the MAX of the prefix, never an exact match) — an acceptable tradeoff
 # for not adding a bd round-trip to every dispatch-refusal sweep.
 #
+# ga-230cyn: before any of the above, re-reads the bead LIVE and skips the
+# entire cycle (no stamp, no escalation) if it already has a live claim
+# actively building it or is already queued/under review at the gate — see
+# the live re-check block below. This is the one bd round-trip this function
+# adds beyond the purge design above (which still deliberately avoids a
+# SECOND one by reusing the caller's in-memory labels_json for the purge
+# itself).
+#
 # At/above cap: comments the bead, adds gate:needs-human + gate:needs-human:
 # technical (a Pilot-dispatch refusal is a technical/scoping circuit-breaker
 # park, not a product decision — mirrors do_escalate()'s rationale in
@@ -2443,6 +2451,42 @@ _pilot_hold_or_escalate() {
       )
     ' >/dev/null 2>&1; then
     log "[pilot-hold] $_phe_slug: $_phe_id already parked by explicit decision (no-auto-dispatch/needs-human) — skipping hold-count/escalation (ga-1mqdz AC3)"
+    return 0
+  fi
+
+  # ga-230cyn: $_phe_labels above is the CALLER's in-memory snapshot — taken
+  # whenever its own candidate scan ran, possibly minutes before this function
+  # actually executes. Confirmed live (ga-bt1hjs, 2026-09-17): gastown.dog-2
+  # claimed the bead at 07:55:55Z; the ga-jazy9 3rd refusal fired at 07:58:50Z
+  # off a pre-claim snapshot and stamped gate:needs-human(:technical) — which
+  # the gate's pre-push live re-check (ga-360a7l) treats as a withdrawal — onto
+  # a bead a dog was already 3 minutes into building and delivered clean at
+  # 08:05Z. One fresh `bd show` here, right before any mutation, closes that
+  # window: either the bead is already built (queued/under review at the
+  # gate — the "Pilot couldn't dispatch this" premise is moot, there is
+  # nothing left to hold or escalate) or it already has a live claim actively
+  # building it (ditto). Fail-open on an unreadable/empty read — mirrors the
+  # ga-zzrts verify-before-claim guards elsewhere in this file (the read
+  # defaults to "[]", every field below comes back "", no condition below
+  # matches, and the ORIGINAL hold/escalate behavior proceeds unchanged) —
+  # never a second, divergent verification idiom in the same file.
+  local _phe_live_json _phe_live_labels _phe_live_status _phe_live_assignee
+  _phe_live_json=$(bd -C "$_phe_db" show "$_phe_id" --json 2>/dev/null || echo "[]")
+  _phe_live_labels=$(printf '%s' "$_phe_live_json" \
+    | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null || echo "")
+  _phe_live_status=$(printf '%s' "$_phe_live_json" \
+    | jq -r 'if type=="array" then .[0] else . end | (.status // "")' 2>/dev/null || echo "")
+  _phe_live_assignee=$(printf '%s' "$_phe_live_json" \
+    | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
+  [ "$_phe_live_assignee" = "null" ] && _phe_live_assignee=""
+
+  if printf '%s\n' "$_phe_live_labels" | grep -qE '^gate:(queued|reviewing)$'; then
+    log "[pilot-hold] $_phe_slug: $_phe_id already built (gate:queued/reviewing per live re-check) — skipping hold/escalation entirely (ga-230cyn)"
+    return 0
+  fi
+  if [ "$_phe_live_status" = "in_progress" ] && [ -n "$_phe_live_assignee" ] \
+     && _session_is_live_builder "$_phe_live_assignee"; then
+    log "[pilot-hold] $_phe_slug: $_phe_id has a live claim ($_phe_live_assignee actively building per live re-check) — skipping hold/escalation entirely (ga-230cyn)"
     return 0
   fi
 
