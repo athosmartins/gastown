@@ -2115,6 +2115,72 @@ echo "$(field AFFECTED "$OUT")" | grep -q "com.test.bigclosure" \
   && ok "T54 non-ancestor override safely ignored — falls back to the wide-window verdict (still AFFECTED)" \
   || nok "T54 affected" "AFFECTED=[$(field AFFECTED "$OUT")]"
 
+# ════════════════════════════════════════════════════════════════════════════
+# T55 (ga-gjum0y): a scheduled-job plist committed by this deploy, never
+#     installed under LAUNCH_AGENTS_DIR at all (same shape as T37) — but this
+#     time its label is recorded in restart_policy.yaml's scheduled_job_opt_out.
+#     A missing plist has nowhere to carry a Disabled=true key (T40's
+#     mechanism doesn't reach this case at all), so this is the ONLY way to
+#     express "never installed on purpose" for a job that was never installed.
+#     Must resolve OK, exactly like T39's installed+loaded control — never
+#     JOB_NOT_INSTALLED, and never SKIPPED/not_applicable either (this proves
+#     the exemption reaches all the way to a real verdict, not just a
+#     different-flavored non-OK).
+# ════════════════════════════════════════════════════════════════════════════
+new_case t55
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && git commit -q -m base --allow-empty )
+PRE=$(git -C "$RUNTIME" rev-parse HEAD)
+make_plist "$RUNTIME/launchd" com.test.optoutmissing "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/optoutmissing.py"
+cat > "$RUNTIME/daemons/restart_policy.yaml" <<'EOF'
+scheduled_job_opt_out:
+  - com.test.optoutmissing   # T55 fixture: recorded decision, never installed
+EOF
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && \
+  GIT_AUTHOR_DATE="@$POST_COMMIT_EPOCH" GIT_COMMITTER_DATE="@$POST_COMMIT_EPOCH" \
+  git commit -q -m deploy )
+POST=$(git -C "$RUNTIME" rev-parse HEAD)
+# deliberately do NOT copy the plist into $AGENTS — opt-out must cover this.
+OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" PRE_DEPLOY_SHA="$PRE" POST_DEPLOY_SHA="$POST" \
+  DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
+  EXTRA_RUNTIME_ROOTS="${EXTRA_RUNTIME_ROOTS:-}" LAUNCH_AGENTS_DIR="$AGENTS" \
+  LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
+  DRY_RUN=0 bash "$HELPER" 2>/dev/null); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T55 verdict OK (scheduled_job_opt_out covers a never-installed job)" || nok "T55 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -eq 0 ] && ok "T55 exit 0" || nok "T55 exit" "rc=$RC"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T56 (ga-gjum0y): companion to T55 — the plist IS installed under
+#     LAUNCH_AGENTS_DIR (someone copied the file, or it was installed long
+#     ago) but launchd never has it loaded (same shape as T38, e.g. a rig
+#     owner ran `launchctl disable` on it — a launchd-side database, never
+#     written back into the plist's own Disabled key, so T40's mechanism
+#     cannot see it either). Its label is ALSO in scheduled_job_opt_out.
+#     Must resolve OK, not JOB_NOT_INSTALLED.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t56
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && git commit -q -m base --allow-empty )
+PRE=$(git -C "$RUNTIME" rev-parse HEAD)
+make_plist "$RUNTIME/launchd" com.test.optoutunloaded "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/optoutunloaded.py"
+cat > "$RUNTIME/daemons/restart_policy.yaml" <<'EOF'
+scheduled_job_opt_out:
+  - com.test.optoutunloaded   # T56 fixture: recorded decision, launchctl-disabled
+EOF
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && \
+  GIT_AUTHOR_DATE="@$POST_COMMIT_EPOCH" GIT_COMMITTER_DATE="@$POST_COMMIT_EPOCH" \
+  git commit -q -m deploy )
+POST=$(git -C "$RUNTIME" rev-parse HEAD)
+make_plist "$AGENTS" com.test.optoutunloaded "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/optoutunloaded.py"
+# deliberately do NOT seed_loaded/seed_running — mirrors `launchctl disable`.
+OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" PRE_DEPLOY_SHA="$PRE" POST_DEPLOY_SHA="$POST" \
+  DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
+  EXTRA_RUNTIME_ROOTS="${EXTRA_RUNTIME_ROOTS:-}" LAUNCH_AGENTS_DIR="$AGENTS" \
+  LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
+  DRY_RUN=0 bash "$HELPER" 2>/dev/null); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T56 verdict OK (scheduled_job_opt_out covers an installed-but-unloaded job)" || nok "T56 verdict" "got '$V' out=[$OUT]"
+[ "$RC" -eq 0 ] && ok "T56 exit 0" || nok "T56 exit" "rc=$RC"
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"

@@ -630,6 +630,55 @@ warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [story-delivery] WARN: $*"; }
 echo ""
 log "=== Delivery sweep start (DRY_RUN=${DRY_RUN}) ==="
 
+# ── Step 0a: daemon-refresh baseline staleness alarm (ga-gjum0y) ──────────────
+# Runs once per sweep, unconditionally — deliberately NOT inside Step 5b below,
+# which only executes for a rig that HAS a story awaiting delivery right now.
+# The whole incident this closes is a baseline stuck for 5 days while zero
+# stories reached OK|SKIPPED for that rig — gating the alarm on the same
+# story traffic that stopped flowing would reproduce the exact silence being
+# fixed. Self-contained: scans whatever *.sha files this mechanism has itself
+# already written under daemon-refresh-baseline/ (one per rig that has ever
+# gone through Step 5b at least once) — no separate rig-enumeration needed.
+# Dedup is by the SHA VALUE the marker is stuck at, not by wall-clock time:
+# a baseline stuck on the same sha for 40 sweeps alarms once, but a baseline
+# that recovers and later gets stuck on a DIFFERENT sha is a new episode and
+# alarms again (invariant c: "um por sequência", never permanent silence).
+DAEMON_REFRESH_BASELINE_DIR_TOP="$GC_CITY/.gc/runtime/daemon-refresh-baseline"
+DAEMON_REFRESH_STALE_DAYS="${DAEMON_REFRESH_STALE_DAYS:-2}"
+if [ -d "$DAEMON_REFRESH_BASELINE_DIR_TOP" ]; then
+  for _drb_sha_file in "$DAEMON_REFRESH_BASELINE_DIR_TOP"/*.sha; do
+    [ -f "$_drb_sha_file" ] || continue
+    _drb_rig="$(basename "$_drb_sha_file" .sha)"
+    # macOS (BSD stat) and Linux (GNU stat) spell "mtime as epoch seconds"
+    # differently — try both, same fallback idiom used elsewhere in this repo.
+    _drb_mtime="$(stat -f %m "$_drb_sha_file" 2>/dev/null || stat -c %Y "$_drb_sha_file" 2>/dev/null || echo "")"
+    if [ -z "$_drb_mtime" ]; then
+      warn "daemon-refresh baseline staleness check: could not stat $_drb_sha_file (unknown mtime) — skipping this rig this sweep, not silently treating as fresh."
+      continue
+    fi
+    _drb_age_days=$(( ( $(date +%s) - _drb_mtime ) / 86400 ))
+    if [ "$_drb_age_days" -ge "$DAEMON_REFRESH_STALE_DAYS" ]; then
+      _drb_sha_value="$(cat "$_drb_sha_file" 2>/dev/null || echo "")"
+      _drb_alarm_marker="$DAEMON_REFRESH_BASELINE_DIR_TOP/$_drb_rig.staleness-alarmed"
+      _drb_already_alarmed="$(cat "$_drb_alarm_marker" 2>/dev/null || echo "")"
+      if [ -n "$_drb_sha_value" ] && [ "$_drb_already_alarmed" = "$_drb_sha_value" ]; then
+        : # already alarmed for this exact stuck sha — do not repeat every sweep
+      else
+        warn "daemon-refresh baseline for rig $_drb_rig has not advanced in ${_drb_age_days}d (stuck at ${_drb_sha_value:-<empty>}) — alarming (ga-gjum0y; this used to be silent)."
+        if [ "$DRY_RUN" != "1" ]; then
+          gc --city "$GC_CITY" session nudge mayor \
+            "daemon-refresh baseline for rig $_drb_rig frozen ${_drb_age_days}d at ${_drb_sha_value:-<empty>} — every deploy's diff window keeps widening (ga-gjum0y). Likely cause: some daemon/scheduled-job on this rig can never reach OK|SKIPPED (e.g. a real NEEDS_GUARDED_RESTART nobody restarted, or a scheduled-job installation gap with no opt-out recorded in restart_policy.yaml)." \
+            2>/dev/null || true
+          # Record the marker even if the nudge above failed (gc unreachable,
+          # etc.) — a lost notification should not ALSO turn into permanent
+          # spam every 5 minutes; the next distinct stuck sha still alarms.
+          printf '%s' "$_drb_sha_value" > "$_drb_alarm_marker" 2>/dev/null || true
+        fi
+      fi
+    fi
+  done
+fi
+
 # ── Step 0: Read runbook file ─────────────────────────────────────────────────
 # Parse TOML runbook via Python (available everywhere this runs).
 if [ ! -f "$RUNBOOK_FILE" ]; then

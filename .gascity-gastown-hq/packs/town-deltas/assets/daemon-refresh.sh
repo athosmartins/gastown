@@ -441,6 +441,10 @@ log() { echo "[daemon-refresh] $*" >&2; }
 #                           case, never silently fall back to it.
 RESTART_POLICY_YAML="$RUNTIME_DIR/daemons/restart_policy.yaml"
 POLICY_AUTO=""; POLICY_DEPLOY_RESTART=""; POLICY_NOTIFY_ONLY_LOCKED=""; POLICY_GUARDS=""; POLICY_NO_RESTART_PATHS=""; POLICY_PARSE_OK=""
+# ga-gjum0y: scheduled-job labels a rig owner has deliberately decided NOT to
+# install/load (recorded decision, not a gap) — see Step 1b below, at its
+# point of use, for the full incident this closes.
+POLICY_SCHEDULED_JOB_OPT_OUT=""
 if [ -f "$RESTART_POLICY_YAML" ]; then
   eval "$(python3 - "$RESTART_POLICY_YAML" <<'PY' 2>/dev/null
 import re, shlex, sys
@@ -511,6 +515,7 @@ if policy is not None:
     print("POLICY_DEPLOY_RESTART=" + shlex.quote(strlist("deploy_restart")))
     print("POLICY_NOTIFY_ONLY_LOCKED=" + shlex.quote(strlist("notify_only_locked")))
     print("POLICY_NO_RESTART_PATHS=" + shlex.quote(strlist("no_restart_paths")))
+    print("POLICY_SCHEDULED_JOB_OPT_OUT=" + shlex.quote(strlist("scheduled_job_opt_out")))
     guards = policy.get("restart_guard_scripts") or {}
     if isinstance(guards, dict):
         pairs = " ".join(f"{d}={s}" for d, s in guards.items()
@@ -772,6 +777,28 @@ PY
       log "Step 1b: $sj_label ($sj_rel) is Disabled=true (intentionally manual) — skipping."
       continue
     fi
+    # ga-gjum0y: a label the rig owner recorded as deliberately not
+    # installed/not loaded (restart_policy.yaml's scheduled_job_opt_out) is
+    # the SAME kind of decision as Disabled=true above — it just can't be
+    # expressed that way when the job was never installed at all (no plist
+    # on disk to carry a Disabled key) or was disabled via `launchctl
+    # disable` (a separate launchd-side database, never written back into
+    # the plist's own content). Incident: com.whatsapp.pbh-edificacao-scrape
+    # (never installed) and com.whatsapp.ficha360-search-index-refresh
+    # (installed, `launchctl disable`d) forced VERDICT=JOB_NOT_INSTALLED on
+    # every deploy that merely touched their committed plists, which in turn
+    # never let this rig's daemon-refresh-baseline advance (wa-waxw8 recorded
+    # both as OPT-IN; see restart_policy.yaml for the per-label reason).
+    # Checked as a whitespace-bounded substring match (same idiom as every
+    # other space-separated accumulator in this file, e.g. GUARDED/AFFECTED
+    # below) — never a plain case glob, so "com.foo.bar" cannot false-match
+    # "com.foo.barbaz".
+    case " $POLICY_SCHEDULED_JOB_OPT_OUT " in
+      *" $sj_label "*)
+        log "Step 1b: $sj_label ($sj_rel) is in restart_policy.yaml's scheduled_job_opt_out (recorded decision, not a gap) — skipping."
+        continue
+        ;;
+    esac
     SJ_CHECKED="$SJ_CHECKED $sj_label"
     sj_broken=""
     if [ ! -f "$LAUNCH_AGENTS_DIR/$sj_label.plist" ]; then
