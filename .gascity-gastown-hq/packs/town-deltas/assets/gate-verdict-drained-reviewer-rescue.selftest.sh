@@ -77,10 +77,18 @@ extract_block() {
 #   vb-closed-happy    closed verdict:PASS  assignee=whoever           -> pre-existing closed path, unaffected
 run_collect_verdicts() {
   local file="$1" bd_log="$2" peek_log="$3"
-  local fn_collect fn_peek_dead
+  local fn_collect fn_peek_dead fn_identity_link
   fn_collect="$(extract_block "$file" "gate-collect-verdicts-fn")"
   fn_peek_dead="$(extract_block "$file" "session-peek-reports-dead-fn")"
-  if [ -z "$fn_collect" ] || [ -z "$fn_peek_dead" ]; then
+  # ga-6wel0o: gate_collect_verdicts() now calls gate_check_verdict_identity_link()
+  # for every closed verdict bead — it must be in scope here too, or this
+  # extracted-lib-only run errors "command not found" the instant a bead
+  # closes. None of this suite's fixture comments carry an "author" field, so
+  # the identity-link check is a guaranteed no-op for all of them (nothing to
+  # compare against -> returns early) — it cannot change this test's own
+  # assertions, only keep the call resolvable.
+  fn_identity_link="$(extract_block "$file" "gate-verdict-identity-link-fn")"
+  if [ -z "$fn_collect" ] || [ -z "$fn_peek_dead" ] || [ -z "$fn_identity_link" ]; then
     echo "COULD_NOT_EXTRACT_BLOCK" >&2
     return 99
   fi
@@ -134,6 +142,7 @@ run_collect_verdicts() {
     warn() { echo "WARN: $*" >&2; }
 
     '"$fn_peek_dead"'
+    '"$fn_identity_link"'
     '"$fn_collect"'
 
     gate_collect_verdicts

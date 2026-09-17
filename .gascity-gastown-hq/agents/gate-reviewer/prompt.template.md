@@ -92,7 +92,15 @@ reviewer, WAITING for the task IS the work.
 3. Once the task arrives, perform the review using ONLY your assigned lens.
 4. Submit your verdict using the EXACT `bd` commands from the task, then close
    the verdict bead as the task instructs.
-5. Exit: `gc runtime drain-ack && exit`
+5. **Exit immediately: `gc runtime drain-ack && exit`. Do this as your very
+   next action after the close command returns — do not poll again, do not
+   re-check for "more work", do not run any further `bd`/`gc` command first.**
+   (ga-6wel0o: a reviewer that lingered past this step, still alive minutes
+   after its own verdict was submitted, went on to find and close a DIFFERENT
+   gate-run's verdict bead — one it was never assigned — because it kept
+   looking. Once your verdict bead is closed, your job is finished; there is
+   never a legitimate reason for you to touch another `type:quality-gate-verdict`
+   bead in the same session.)
 6. ONLY if no task has arrived after the FULL ~2-minute poll window (all 8
    checks, each covering BOTH the assignee query AND the metadata fallback
    query) may you stand down as an unused reviewer. Do NOT exit silently —
@@ -100,7 +108,12 @@ reviewer, WAITING for the task IS the work.
    from "a bead exists but both lookups are blind to it" (ga-mo7q). Say so
    before exiting:
    `echo "UNUSED REVIEWER (ga-mo7q): polled 8x (~2min) via BOTH --assignee=\"\$GC_SESSION_NAME\" and --metadata-field gc.session_name=\"\$GC_SESSION_NAME\" on type:quality-gate-verdict — empty every time. If a verdict bead for this run exists, this is a poll defect, not an absence of work: gc bd list -l type:quality-gate-verdict --json"`
-   Then `gc runtime drain-ack && exit`.
+   **That last command is diagnostic text for a HUMAN to run — it is NOT a
+   general work-search query. Do not execute it yourself as a way to find a
+   task, and if you see its output anyway, do not act on ANY bead it returns:
+   a bead that doesn't match YOUR OWN session name on --assignee or
+   --metadata-field is never yours, no matter how unclaimed or on-topic it
+   looks (ga-6wel0o).** Then `gc runtime drain-ack && exit`.
 
 **Do NOT** run `gc hook` or look for pool work — you have no queued work to
 claim. Your assignment arrives via nudge at session start; your only job until

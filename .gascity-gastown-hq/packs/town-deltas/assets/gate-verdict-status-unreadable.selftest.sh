@@ -124,8 +124,14 @@ fi
 # the logs). This proves: no crash, no mis-count, no destructive action.
 echo "── 3. gate_collect_verdicts(): bd-show failure is skipped, not mis-counted ──"
 FN_COLLECT="$(extract_block "$DISPATCHER" "gate-collect-verdicts-fn")"
-if [ -z "$FN_COLLECT" ]; then
-  bad "could not extract gate-collect-verdicts-fn block — aborting Part 3"
+# ga-6wel0o: gate_collect_verdicts() now calls gate_check_verdict_identity_link()
+# for every closed verdict bead — must be in scope or this lib-only run errors
+# "command not found". None of this fixture's beads carry a VERDICT comment
+# with an .author field, so the check is a guaranteed no-op here (nothing to
+# compare against -> returns early) — it cannot change this Part's own counts.
+FN_IDENTITY_LINK="$(extract_block "$DISPATCHER" "gate-verdict-identity-link-fn")"
+if [ -z "$FN_COLLECT" ] || [ -z "$FN_IDENTITY_LINK" ]; then
+  bad "could not extract gate-collect-verdicts-fn/gate-verdict-identity-link-fn block — aborting Part 3"
 else
   BD_LOG3="$(mktemp)"
   OUT3="$(bash -c '
@@ -147,6 +153,7 @@ else
     log()  { echo "LOG: $*" >&2; }
     warn() { echo "WARN: $*" >&2; }
     session_peek_reports_dead() { echo 0; }
+    '"$FN_IDENTITY_LINK"'
     '"$FN_COLLECT"'
     gate_collect_verdicts
     printf "RESULT|VERDICTS_RECEIVED=%s|ANY_FAIL=%s\n" "$VERDICTS_RECEIVED" "$ANY_FAIL"

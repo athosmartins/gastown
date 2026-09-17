@@ -7513,6 +7513,79 @@ DEFAULT_BRANCH=$(echo "$RIG_LIST_JSON" \
 # wall-clock-based hang/stranded-run detectors (already cross-invocation-safe
 # by design) are the other backstop for this same failure mode. Nothing hangs
 # forever; a rare failure mode is just detected slower. See ga-eqjo PR.
+#
+# ── ga-6wel0o: verdict-bead identity link verification ────────────────────────
+# gate_collect_verdicts (below) counts ANY closed verdict bead carrying a
+# PASS/FAIL verdict as authoritative for its (gate-run, reviewer-index) slot —
+# it has never checked WHO actually closed it. Nothing stops a completely
+# unrelated bd actor from writing a verdict for a bead it was never assigned.
+#
+# MEASURED LIVE 2026-09-17 (ga-6wel0o, gate-run ga-f40t9d, branch
+# crew/wa-worker/wa-hphyc, required_reviewers=1): verdict bead ga-8jbtfq was
+# durably assigned (ga-67hae, assign_verdict_bead_verified) to
+# gate-reviewer-adhoc-e9160e4899 — a reviewer that never ACKed (a known,
+# ACCEPTED failure mode; see the ga-eqjo scope-reduction note above — a stuck
+# reviewer is meant to be caught by the outer VERDICT_TIMEOUT_MINUTES, not
+# silently substituted). Instead, ga-8jbtfq was closed with a well-formed
+# "VERDICT: PASS" by gate-reviewer-adhoc-94fbe0f8d3 — an UNRELATED reviewer
+# whose own task (a different branch, a different gate-run) had already
+# completed ~20 minutes earlier. By the time gate_collect_verdicts ran,
+# ga-8jbtfq's assignee AND metadata.gc.session_name were BOTH empty — the
+# durable link ga-67hae writes at spawn time was gone — and nothing detected
+# the substitution: Phase C read "1/1 verdicts" and merged. Same failure
+# family the reviewer prompt template's THIRD STATE section warns every
+# reviewer to hunt for in OTHER people's code (root-class:error-vs-empty) —
+# this is that shape in the dispatcher's own verdict-acceptance path.
+#
+# This does NOT reject a mismatched verdict — the review that landed was
+# real, substantive work; discarding it to force a redundant re-review is the
+# more expensive mistake (this file's own "segurar trabalho bom e o erro caro
+# e silencioso" convention, ga-cjrxh). It makes the anomaly VISIBLE: label the
+# bead so it is queryable (`bd list -l verdict:identity-unlinked`), comment on
+# it with both identities, and log loudly. Never touches VERDICTS_RECEIVED/
+# ANY_FAIL — the caller decides PASS/FAIL exactly as before this fix; this is
+# a pure audit-trail side effect.
+#
+# $1 = verdict bead id. Self-contained (does its own bd show/comments reads)
+# so it drops into gate_collect_verdicts as a single additive call without
+# disturbing that function's own, separately-hardened VB_JSON/VB_COMMENTS_JSON
+# handling (ga-art5/ga-kf0v/ga-86l90a8).
+# SELFTEST-EXTRACT gate-verdict-identity-link-fn: BEGIN
+gate_check_verdict_identity_link() {
+  local _vb="$1"
+  local _vb_json _linked_id _comment_author
+
+  _vb_json=$(bd -C "$GC_CITY" show "$_vb" --json 2>/dev/null) || return 0
+  _linked_id=$(printf '%s' "$_vb_json" | jq -r '
+      if type=="array" then .[0] else . end
+      | (.metadata["gc.session_name"] // .assignee // empty)
+    ' 2>/dev/null || echo "")
+
+  _comment_author=$(bd -C "$GC_CITY" comments "$_vb" --json 2>/dev/null | jq -r '
+      [ .[]? | select((.text // .body // "") | test("^\\s*VERDICT:"; "i")) ]
+      | last | .author // empty
+    ' 2>/dev/null || echo "")
+
+  # Nothing to compare against (comment unreadable, or no VERDICT: comment
+  # yet) — inconclusive, not an anomaly. The PASS/FAIL branches in
+  # gate_collect_verdicts already have their own empty-comment handling
+  # (ga-kf0v); this check stays silent rather than false-flag on top of it.
+  [ -z "$_comment_author" ] && return 0
+
+  if [ -n "$_linked_id" ] && [ "$_linked_id" = "$_comment_author" ]; then
+    return 0  # durable link present and matches who actually wrote it.
+  fi
+
+  if [ -n "$_linked_id" ]; then
+    warn "  Verdict bead $_vb: IDENTITY MISMATCH — durably linked to '$_linked_id' (ga-67hae) but the VERDICT comment was authored by '$_comment_author' (ga-6wel0o). Counting the verdict (real review work, not discarded) but flagging for audit."
+  else
+    warn "  Verdict bead $_vb: NO DURABLE LINK at collection time (assignee and metadata.gc.session_name both empty) — the VERDICT comment was authored by '$_comment_author', an identity this bead's own record never named (ga-6wel0o). Counting the verdict but flagging for audit."
+  fi
+  bd -C "$GC_CITY" label add "$_vb" "verdict:identity-unlinked" -q 2>/dev/null || true
+  bd -C "$GC_CITY" comment "$_vb" "ga-6wel0o: this verdict was accepted, but the reviewer identity that recorded it ('$_comment_author') does not match this bead's durable ownership link ('${_linked_id:-<none>}'). The review content itself was not re-evaluated by this check." >/dev/null 2>&1 || true
+  return 0
+}
+# SELFTEST-EXTRACT gate-verdict-identity-link-fn: END
 # SELFTEST-EXTRACT gate-collect-verdicts-fn: BEGIN
 gate_collect_verdicts() {
   VERDICTS_RECEIVED=0
@@ -7570,6 +7643,7 @@ gate_collect_verdicts() {
 
     if [ "$VB_STATUS" = "closed" ]; then
       VERDICTS_RECEIVED=$((VERDICTS_RECEIVED + 1))
+      gate_check_verdict_identity_link "$VB"
       if echo "$VB_LABELS" | grep -q "verdict:PASS"; then
         : # explicit PASS — continue
       elif echo "$VB_LABELS" | grep -q "verdict:FAIL"; then
