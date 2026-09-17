@@ -373,6 +373,58 @@ RC=$?
 grep -qF "skipped — insufficient disk margin" "$RESEED_TEST_LOG" && ok "scenario B: logged the skip line" || bad "scenario B: missing skip log line"
 [ -s "$NOTIFY_STUB_CALLS" ] && bad "scenario B: notify should NOT fire on an expected disk-margin refusal" || ok "scenario B: notify correctly not called"
 
+# Scenario B2 (ga-i99qsp, invariant d): a margin refusal that REPEATS must
+# escalate to one notify_fail per streak (MARGIN_REFUSAL_ALARM_THRESHOLD),
+# not stay silent forever — the old scenario B above only proves the FIRST
+# occurrence stays quiet; this proves the streak actually gets tracked, one
+# db's streak doesn't bleed into another's, and success resets it.
+echo "── margin-refusal streak counter (ga-i99qsp, invariant d) ──"
+MARGIN_STATE_DIR="$(mktemp -d)"
+: > "$NOTIFY_STUB_CALLS"; : > "$RESEED_TEST_LOG"
+for i in 1 2; do
+  RESEED_SCRIPT="$RESEED_STUB_DIR/reseed.sh" RESEED_TIMEOUT_SECS=5 RESEED_AFTER_UPLOAD=1 \
+    RESEED_STUB_MODE=disk LOG="$RESEED_TEST_LOG" NOTIFY="$RESEED_STUB_DIR/notify" \
+    MARGIN_REFUSAL_STATE_DIR="$MARGIN_STATE_DIR" MARGIN_REFUSAL_ALARM_THRESHOLD=3 \
+    _reseed_staging_if_enabled "streakdb"
+done
+[ -s "$NOTIFY_STUB_CALLS" ] && bad "scenario B2: notify should NOT have fired yet after only 2 of 3 consecutive refusals" || ok "scenario B2: notify correctly silent through refusals 1-2 of 3"
+grep -qF "1/3 rodadas" "$RESEED_TEST_LOG" && ok "scenario B2: log shows the streak count (1/3) on the first refusal" || bad "scenario B2: missing the streak-count log line"
+
+RESEED_SCRIPT="$RESEED_STUB_DIR/reseed.sh" RESEED_TIMEOUT_SECS=5 RESEED_AFTER_UPLOAD=1 \
+  RESEED_STUB_MODE=disk LOG="$RESEED_TEST_LOG" NOTIFY="$RESEED_STUB_DIR/notify" \
+  MARGIN_REFUSAL_STATE_DIR="$MARGIN_STATE_DIR" MARGIN_REFUSAL_ALARM_THRESHOLD=3 \
+  _reseed_staging_if_enabled "streakdb"
+[ -s "$NOTIFY_STUB_CALLS" ] && ok "scenario B2: notify FIRES on the 3rd consecutive refusal (streak reached threshold)" || bad "scenario B2: notify should have fired on the 3rd consecutive refusal"
+grep -qF "3 rodadas seguidas" "$NOTIFY_STUB_CALLS" && ok "scenario B2: notify message names the streak length" || bad "scenario B2: notify message should name the streak length"
+
+: > "$NOTIFY_STUB_CALLS"
+RESEED_SCRIPT="$RESEED_STUB_DIR/reseed.sh" RESEED_TIMEOUT_SECS=5 RESEED_AFTER_UPLOAD=1 \
+  RESEED_STUB_MODE=disk LOG="$RESEED_TEST_LOG" NOTIFY="$RESEED_STUB_DIR/notify" \
+  MARGIN_REFUSAL_STATE_DIR="$MARGIN_STATE_DIR" MARGIN_REFUSAL_ALARM_THRESHOLD=3 \
+  _reseed_staging_if_enabled "streakdb"
+[ -s "$NOTIFY_STUB_CALLS" ] && bad "scenario B2: notify should NOT fire again immediately after alarming — the streak must reset" || ok "scenario B2: streak resets after alarming (4th refusal alone doesn't re-fire)"
+
+: > "$NOTIFY_STUB_CALLS"
+RESEED_SCRIPT="$RESEED_STUB_DIR/reseed.sh" RESEED_TIMEOUT_SECS=5 RESEED_AFTER_UPLOAD=1 \
+  RESEED_STUB_MODE=disk LOG="$RESEED_TEST_LOG" NOTIFY="$RESEED_STUB_DIR/notify" \
+  MARGIN_REFUSAL_STATE_DIR="$MARGIN_STATE_DIR" MARGIN_REFUSAL_ALARM_THRESHOLD=3 \
+  _reseed_staging_if_enabled "otherdb"
+[ -s "$NOTIFY_STUB_CALLS" ] && bad "scenario B2: a DIFFERENT db's first refusal must not inherit streakdb's count" || ok "scenario B2: per-db streaks are independent (otherdb's 1st refusal doesn't alarm)"
+
+RESEED_SCRIPT="$RESEED_STUB_DIR/reseed.sh" RESEED_TIMEOUT_SECS=5 RESEED_AFTER_UPLOAD=1 \
+  RESEED_STUB_MODE=ok LOG="$RESEED_TEST_LOG" NOTIFY="$RESEED_STUB_DIR/notify" \
+  MARGIN_REFUSAL_STATE_DIR="$MARGIN_STATE_DIR" MARGIN_REFUSAL_ALARM_THRESHOLD=3 \
+  _reseed_staging_if_enabled "otherdb"
+: > "$NOTIFY_STUB_CALLS"
+for i in 1 2; do
+  RESEED_SCRIPT="$RESEED_STUB_DIR/reseed.sh" RESEED_TIMEOUT_SECS=5 RESEED_AFTER_UPLOAD=1 \
+    RESEED_STUB_MODE=disk LOG="$RESEED_TEST_LOG" NOTIFY="$RESEED_STUB_DIR/notify" \
+    MARGIN_REFUSAL_STATE_DIR="$MARGIN_STATE_DIR" MARGIN_REFUSAL_ALARM_THRESHOLD=3 \
+    _reseed_staging_if_enabled "otherdb"
+done
+[ -s "$NOTIFY_STUB_CALLS" ] && bad "scenario B2: a success in between must reset the streak (2 refusals after an OK should not alarm at threshold 3)" || ok "scenario B2: a reseed success resets the streak — a later run of failures needs the full streak again"
+rm -rf "$MARGIN_STATE_DIR" 2>/dev/null || true
+
 # Scenario C: reseed fails for a NON-disk reason → logged FAILED, notify_fail DOES fire.
 : > "$NOTIFY_STUB_CALLS"; : > "$RESEED_TEST_LOG"
 RESEED_SCRIPT="$RESEED_STUB_DIR/reseed.sh" RESEED_TIMEOUT_SECS=5 RESEED_AFTER_UPLOAD=1 \

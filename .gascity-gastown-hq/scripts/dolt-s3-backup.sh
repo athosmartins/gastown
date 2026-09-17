@@ -67,6 +67,19 @@ RETRY_WAITS_SEC="20 60 120"               # ga-gdsq5: escalating pauses, one con
 RESEED_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dolt-backup-reseed.sh"
 RESEED_TIMEOUT_SECS="${RESEED_TIMEOUT_SECS:-1800}"
 RESEED_AFTER_UPLOAD="${RESEED_AFTER_UPLOAD:-1}"
+# ga-i99qsp: dolt-backup-reseed.sh's own disk-margin refusal used to be purely
+# "expected; retried next run" forever — for a db whose disk is CONSISTENTLY
+# too tight (even for reseed's own low-disk fallback), that meant permanent
+# silence, exactly the "silêncio repetido" shape ga-3euoj already named as a
+# bug elsewhere in this city. Tracks consecutive margin-refusals PER DB in a
+# tiny state dir; one notify_fail per streak once it reaches the threshold,
+# then resets so the NEXT alarm only fires after another full streak (not
+# every single cycle while the condition persists). Reset to 0 on any reseed
+# success. Fail-soft: a bookkeeping problem here (can't write the state file)
+# must never block or alter the backup flow itself — it only downgrades this
+# one escalation to "never alarms," which is a regression, not a new outage.
+MARGIN_REFUSAL_STATE_DIR="${RESEED_MARGIN_REFUSAL_STATE_DIR:-$CITY/.gc/logs/.dolt-reseed-margin-refusals}"
+MARGIN_REFUSAL_ALARM_THRESHOLD="${RESEED_MARGIN_REFUSAL_ALARM_THRESHOLD:-3}"
 # ga-o3nqy2: wiring for the shared server-free fallback (dolt-offline-backup-sync.sh).
 # Read only by that sourced file's functions, not visibly within this one —
 # the static analyzer can't see across the dynamic source path below.
@@ -142,6 +155,60 @@ is_stale_residue_refusal() {
   esac
 }
 
+# ga-i99qsp: dolt-backup-reseed.sh's low-disk fallback refuses (exit 1,
+# NOTHING touched — no rename, no delete) when the S3 proof it needs before
+# freeing the old copy early doesn't hold (manifest missing or size
+# incoherent with the fingerprint). Unlike is_disk_margin_refusal this is NOT
+# the expected/self-healing case — the db stays bloated until whatever broke
+# the S3 proof is fixed (a failed upload, a stale fingerprint), so it must
+# notify_fail with its own specific message rather than the generic one.
+is_low_disk_proof_failed_refusal() {
+  case "$1" in
+    *"prova do S3 FALHOU"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ga-i99qsp: the low-disk fallback's worst case — it already freed the old
+# local copy (S3 proof passed) and something AFTER that failed (rebuild
+# didn't restore, restored count unreadable/short, or the final promote mv
+# itself failed). <db> now has NO local backup at all; the S3 copy from
+# before the deletion is the only fallback until this is fixed by hand. This
+# must never be silently absorbed into a generic "failed, see log" line —
+# it changes what dolt-restore-verify.sh's local-restore checks can rely on.
+is_local_backup_lost_refusal() {
+  case "$1" in
+    *"SEM BACKUP LOCAL"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _margin_refusal_count_after_increment <db> — increments (creating if
+# absent) the per-db consecutive-margin-refusal counter and echoes the NEW
+# count. Fail-soft: if the state dir can't be created/written, echoes the
+# threshold itself so a persistent bookkeeping failure surfaces as an alarm
+# rather than silently disabling the escalation this function exists for.
+_margin_refusal_count_after_increment() {
+  local db="$1" f n
+  if ! mkdir -p "$MARGIN_REFUSAL_STATE_DIR" 2>/dev/null; then
+    echo "$MARGIN_REFUSAL_ALARM_THRESHOLD"
+    return
+  fi
+  f="$MARGIN_REFUSAL_STATE_DIR/$db"
+  n="$(cat "$f" 2>/dev/null)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  n=$((n+1))
+  echo "$n" > "$f" 2>/dev/null
+  echo "$n"
+}
+
+# _margin_refusal_reset <db> — clears the streak counter: called on any
+# reseed success (the condition resolved) and right after an alarm fires (so
+# the NEXT alarm needs another full streak, not one refusal more).
+_margin_refusal_reset() {
+  rm -f "$MARGIN_REFUSAL_STATE_DIR/$1" 2>/dev/null || true
+}
+
 # _sync_once <db> — one CALL DOLT_BACKUP('sync', ...) attempt for <db>; raw
 # dolt output goes wherever the caller redirects, dolt's own exit code is
 # returned. Factored out so the retry loop below and the selftest's
@@ -194,13 +261,18 @@ _sync_with_connection_timeout_retry() {
 #
 # Fail-closed by construction: reseed's own preflight refuses (no swap, no
 # deletion, exit 1) without 250% of the live db size free AND a fresh backup
-# that demonstrably restores with row count >= live. A refusal for lack of
-# disk margin is EXPECTED here — logged, not alarmed on (see
-# is_disk_margin_refusal) — because it is exactly the condition this function
-# exists to eventually relieve, and it will keep being retried every run
-# until space recovers. Any OTHER failure reason is a real data-integrity
-# signal and is notify_fail'd immediately, same channel as every other
-# failure mode in this script.
+# that demonstrably restores with row count >= live. ga-i99qsp: reseed now
+# ALSO has a low-disk fallback for exactly the case that used to make this an
+# unconditional dead end for a chronically-tight db (hq: staging bloat itself
+# ate the margin the fix needed) — see dolt-backup-reseed.sh's own header. A
+# refusal for lack of disk margin is still logged, not alarmed, on the FIRST
+# few occurrences (see is_disk_margin_refusal) because a transient tight day
+# is expected and self-healing — but it now escalates to one notify_fail per
+# consecutive streak (MARGIN_REFUSAL_ALARM_THRESHOLD) instead of staying
+# silent forever, because "even the low-disk margin never fits" is no longer
+# assumed to always self-heal. Any OTHER failure reason (including the two
+# new low-disk-specific ones below) is a real signal and is notify_fail'd
+# immediately, same channel as every other failure mode in this script.
 _reseed_staging_if_enabled() {
   local db="$1"
   [ "$RESEED_AFTER_UPLOAD" = "1" ] || return 0
@@ -210,15 +282,38 @@ _reseed_staging_if_enabled() {
   echo "$out" >> "$LOG"
   if [ "$rc" -eq 0 ]; then
     log "$db: staging reseed OK (freed accumulated backup bloat)"
+    _margin_refusal_reset "$db"
     return 0
   fi
   if is_disk_margin_refusal "$out"; then
-    log "$db: staging reseed skipped — insufficient disk margin today (expected; retried next run)"
+    # ga-i99qsp: reseed itself now has a low-disk fallback (see its own
+    # header) — this branch only still fires when even THAT minimal margin
+    # isn't free, a genuinely more severe condition than the old "always
+    # retried, always silent" framing assumed. Track the streak; escalate
+    # once per streak instead of staying silent forever (ga-3euoj shape).
+    local n; n="$(_margin_refusal_count_after_increment "$db")"
+    if [ "$n" -ge "$MARGIN_REFUSAL_ALARM_THRESHOLD" ]; then
+      log "$db: staging reseed skipped — insufficient disk margin for ${n} rodadas seguidas (mesmo o modo de baixo disco não coube) — ALARME"
+      notify_fail "backup off-box: reseed de $db sem margem de disco por ${n} rodadas seguidas — mesmo o modo de baixo disco (dolt-backup-reseed.sh) não coube nesse tempo. Ver $LOG."
+      _margin_refusal_reset "$db"
+    else
+      log "$db: staging reseed skipped — insufficient disk margin today (expected; retried next run; ${n}/${MARGIN_REFUSAL_ALARM_THRESHOLD} rodadas seguidas)"
+    fi
     return 0
   fi
   if is_stale_residue_refusal "$out"; then
     log "$db: staging reseed BLOCKED — stale .old/.new residue from a prior run — ver $LOG"
     notify_fail "backup off-box: reseed de $db bloqueado por resíduo (.old ou .new) de execução anterior em ${BACKUP_ROOT}/${db}.old — remova à mão uma vez para destravar"
+    return 1
+  fi
+  if is_low_disk_proof_failed_refusal "$out"; then
+    log "$db: staging reseed (modo de baixo disco) recusado — prova do S3 falhou, NADA apagado — ver $LOG"
+    notify_fail "backup off-box: reseed de $db em modo de baixo disco não conseguiu confirmar o S3 (manifest ausente ou tamanho incoerente) — NADA foi apagado, mas $db segue com o staging bloated até isso ser corrigido. Ver $LOG."
+    return 1
+  fi
+  if is_local_backup_lost_refusal "$out"; then
+    log "$db: staging reseed CRÍTICO — modo de baixo disco liberou o backup antigo e a reconstrução FALHOU depois — $db pode estar SEM BACKUP LOCAL — ver $LOG"
+    notify_fail "backup off-box: reseed de $db em modo de baixo disco liberou o backup antigo (com prova do S3) e a reconstrução FALHOU — $db pode estar SEM BACKUP LOCAL agora. O S3 verificado antes da liberação é o único fallback. Ver $LOG imediatamente."
     return 1
   fi
   log "$db: staging reseed FAILED (rc=$rc, non-disk reason) — ver $LOG"
