@@ -7855,13 +7855,32 @@ ALL_CANDIDATES_COUNT=$(echo "$ALL_CANDIDATES_JSON" | jq 'length' 2>/dev/null || 
 # pilot-manual-reclaim.sh by hand (wa-c1hgd twice — pilot:reclaim-count:2).
 # Always exits 0; emptiness of stdout is the "not found" signal, same
 # convention the direct bd probe already uses via its own `|| echo ""`.
+#
+# ga-oc6knj: widened --limit=1 -> --limit=20 and piped through _filter_candidates
+# (the dispatcher's own single chokepoint gate — see its definition/callers
+# above) before picking the survivor. Pre-fix this ONLY checked
+# gc.routed_to=<pool>+unassigned+not-epic — none of pilot:held (incl. expiry),
+# the pilot:reclaim-count cap, gate:needs-human/story:needs-human,
+# pool:refused[:reason], or any of the dozen-plus other park/veto labels the
+# wa-worker/ps-worker prompt probe (Step 1b2 in both templates) already
+# enforces on its side of the SAME gc.routed_to queue. Two independently
+# maintained "is this bead eligible" definitions is the exact ga-oc6knj
+# invariant (c) violation: top-up could spawn a session "for" a bead the
+# worker probe would refuse to serve the instant it looked — that session
+# just claims a DIFFERENT bead instead (silently correct from ITS
+# perspective, but the pending bead top-up meant to unstick stays stuck,
+# and a pool slot got spent on work top-up never intended). Reusing
+# _filter_candidates (rather than re-typing a third copy of the exclude-label
+# list here) is the same fix shape every other candidate source in this file
+# already gets — see its own header comment for why it is the designated
+# single chokepoint.
 _topup_rig_pending() {
   local _pool="$1" _rp _rig_pending
   while IFS= read -r _rp; do
     [ -z "$_rp" ] || [ ! -d "$_rp" ] && continue
     [ "$_rp" = "$GC_CITY" ] && continue
     _rig_pending=$(timeout 15 bd -C "$_rp" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
-      --exclude-type=epic --json --limit=1 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null || echo "")
+      --exclude-type=epic --json --limit=20 2>/dev/null | _filter_candidates 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null || echo "")
     if [ -n "$_rig_pending" ]; then
       printf '%s' "$_rig_pending"
       return 0
@@ -7903,10 +7922,27 @@ _pilot_pool_topup() {
       _pending="$PILOT_TEST_WA_WORKER_TOPUP_PENDING"
     elif [ "$_pool" = "ps-worker" ] && [ -n "${PILOT_TEST_PS_WORKER_TOPUP_PENDING+x}" ]; then
       _pending="$PILOT_TEST_PS_WORKER_TOPUP_PENDING"
+    # ga-oc6knj: separate test seam that injects the RAW (pre-filter)
+    # candidate array and exercises the real _filter_candidates call below —
+    # unlike PILOT_TEST_*_TOPUP_PENDING above (which injects the already-
+    # decided final id and so tests only the capacity/loop logic), this one
+    # is what proves the eligibility fix itself. Same set-even-to-empty
+    # convention (${...+x}), same reason (this harness's PATH has no
+    # `timeout`, so the live bd call below would silently 127 either way).
+    elif [ "$_pool" = "wa-worker" ] && [ -n "${PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON+x}" ]; then
+      _pending=$(printf '%s' "$PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON" | _filter_candidates 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null || echo "")
+    elif [ "$_pool" = "ps-worker" ] && [ -n "${PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON+x}" ]; then
+      _pending=$(printf '%s' "$PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON" | _filter_candidates 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null || echo "")
     else
       # Same `|| echo` reasoning as the _live probe above.
+      # ga-oc6knj: widened --limit=1 -> --limit=20 and piped through
+      # _filter_candidates (see _topup_rig_pending's header comment above for
+      # the full rationale — this HQ query had the identical gap). A single
+      # ineligible bead at --limit=1 used to make top-up correctly find
+      # "nothing", masking every OTHER eligible routed-unassigned bead
+      # sitting right behind it in the same query.
       _pending=$(timeout 15 bd -C "$GC_CITY" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
-        --exclude-type=epic --json --limit=1 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null || echo "")
+        --exclude-type=epic --json --limit=20 2>/dev/null | _filter_candidates 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null || echo "")
       if [ -z "$_pending" ]; then
         # ga-q0ewpu: HQ has nothing — fall through to each non-HQ rig store
         # before giving up (own test seam, same set-even-to-empty convention

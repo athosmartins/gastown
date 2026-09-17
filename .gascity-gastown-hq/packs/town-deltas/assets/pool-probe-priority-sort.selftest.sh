@@ -287,6 +287,34 @@ run_case() {
     '[{"id":"reclaimed-p0-below-cap","priority":0,"updated_at":"2026-01-01T00:00:00Z","labels":["pilot:reclaim-count:2"]},{"id":"clean-p1","priority":1,"updated_at":"2026-09-10T22:00:00Z","labels":[]}]' \
     "reclaimed-p0-below-cap"
 
+  # 6a. (ga-oc6knj) the core reported defect: a NEVER-reclaimed bead (no
+  # pilot:reclaim-count label at all) whose updated_at was JUST bumped by
+  # the Pilot's own dispatch write must still win the tiebreak against a
+  # same-priority sibling that was routed earlier but hasn't been re-touched
+  # since — because on created_at (which the dispatch write never touches)
+  # it genuinely has been waiting longer. Literal shape of the live
+  # wa-aaekc/wa-yzx9g repro (transcript 0bc29f56, 17/09): the just-dispatched
+  # bead's updated_at (01:40:55Z) is LATER than the other bead's (23:38:41Z
+  # the previous day) even though its created_at is EARLIER — pre-fix, plain
+  # updated_at sorting picked the wrong winner here.
+  assert_winner "$label ga-oc6knj-first-dispatch-not-penalized" "$prog" \
+    '[{"id":"older-just-dispatched","priority":2,"created_at":"2026-09-16T23:38:41Z","updated_at":"2026-09-17T01:40:55Z","labels":[]},{"id":"newer-waiting","priority":2,"created_at":"2026-09-17T00:00:00Z","updated_at":"2026-09-16T23:38:41Z","labels":[]}]' \
+    "older-just-dispatched"
+
+  # 6b. (ga-oc6knj) ga-w4k2z's anti-poison property, re-proven with a REAL
+  # pilot:reclaim-count label this time (test 2 above exercises the same
+  # shape incidentally, via the created_at-and-updated_at-both-absent
+  # fallback, not because either fixture actually carries reclaim history —
+  # this case makes the GENUINELY-reclaimed branch of the compound key
+  # itself the thing under test): two same-priority beads that have BOTH
+  # already been reclaimed once — the one reclaimed AGAIN just now (updated_at
+  # bumped) must still lose to the sibling that has been idle since ITS OWN
+  # earlier reclaim. Proves the fix does not regress ga-w4k2z for a bead that
+  # actually IS repeatedly failing, only for a bead's first-ever dispatch.
+  assert_winner "$label ga-oc6knj-real-reclaim-still-anti-poison" "$prog" \
+    '[{"id":"just-reclaimed-again","priority":1,"updated_at":"2026-09-17T01:40:55Z","labels":["pilot:reclaim-count:1"]},{"id":"reclaimed-earlier-idle-since","priority":1,"updated_at":"2026-09-16T20:00:00Z","labels":["pilot:reclaim-count:1"]}]' \
+    "reclaimed-earlier-idle-since"
+
   # 7-9. (ga-0pg2o gate-fix round 2) Step 1b3's fallback post-filter must
   # apply the SAME reclaim-cap exclusion as Step 1b2 — GATE-FEEDBACK on
   # round 1 named the reopened gap: a capped bead that is the sole occupant

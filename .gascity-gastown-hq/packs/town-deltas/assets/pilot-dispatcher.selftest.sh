@@ -6569,6 +6569,83 @@ fi
 has "$DISPATCHER" 'bd -C "\$GC_CITY" ready --metadata-field "gc\.routed_to=\$_pool" --unassigned' \
   "real (non-test-seam) pending-bead query targets RoutedPoolQuery's own shape: gc.routed_to=<pool> + unassigned"
 
+# ── Scenario TOPUP-ELIGIBILITY (ga-oc6knj) ────────────────────────────────────
+# Pre-fix, top-up's pending-bead query checked ONLY gc.routed_to=<pool> +
+# unassigned + not-epic at --limit=1 — none of pilot:held, the
+# pilot:reclaim-count cap, gate:needs-human, or any other park/veto label the
+# wa-worker/ps-worker prompt probe already enforces on the SAME gc.routed_to
+# queue (invariant c: one definition of "eligible", not two). The fix widens
+# the fetch to --limit=20 and pipes the result through _filter_candidates —
+# the dispatcher's own canonical chokepoint gate, reused rather than
+# re-typed as a third copy of the exclude-label list.
+#
+# run_topup_candidates_scenario injects the RAW (pre-filter) candidate array
+# via PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON — a seam separate from
+# PILOT_TEST_WA_WORKER_TOPUP_PENDING (which injects the already-decided FINAL
+# id and so cannot exercise the filter itself). Same reason this needs its
+# own seam at all (see that var's own comment above): this harness's PATH has
+# no `timeout`, so the real `timeout 15 bd -C ... ready ...` call would
+# silently 127 rather than reach _filter_candidates either way.
+#   $1=PILOT_TEST_WA_WORKER_LIVE_COUNT  $2=candidates JSON array
+run_topup_candidates_scenario() {
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DRY_RUN="0" \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
+    FAKE_BLOCKED_IDS="" \
+    FAKE_BUGS_JSON="[]" \
+    FAKE_TIER2_JSON="[]" \
+    PILOT_TEST_WA_WORKER_LIVE_COUNT="${1:-0}" \
+    GC_VARIABLE_SESSION_COUNT_OVERRIDE="${1:-0}" \
+    PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON="$2" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+echo "Scenario TOPUP-ELIGIBILITY-1: a pilot:held candidate is skipped in favor of an eligible sibling"
+LOG_TUE1="$(run_topup_candidates_scenario "3" '[{"id":"wa-held-oc6knj","priority":1,"assignee":null,"description":"fixture body","issue_type":"task","labels":["pilot:held","pilot:held-until:9999999999"]},{"id":"wa-eligible-oc6knj","priority":1,"assignee":null,"description":"fixture body","issue_type":"task","labels":[]}]')"
+if echo "$LOG_TUE1" | grep -q "pool top-up.*wa-eligible-oc6knj"; then
+  ok "topup: spawns for the eligible sibling when the other routed candidate is pilot:held"
+else
+  bad "topup: did NOT spawn for wa-eligible-oc6knj — eligibility filter not wired in, or over-broad (log: $LOG_TUE1)"
+fi
+if echo "$LOG_TUE1" | grep -q "wa-held-oc6knj"; then
+  bad "topup: spawned (or considered) the pilot:held candidate — ga-oc6knj regression, top-up ignoring the same hold the worker probe respects"
+else
+  ok "topup: never considers the pilot:held candidate"
+fi
+
+echo "Scenario TOPUP-ELIGIBILITY-2: reclaim-cap candidate with NO eligible sibling → correctly finds nothing (no spawn)"
+LOG_TUE2="$(run_topup_candidates_scenario "1" '[{"id":"wa-capped-oc6knj","priority":1,"assignee":null,"description":"fixture body","issue_type":"task","labels":["pilot:reclaim-count:3"]}]')"
+if echo "$LOG_TUE2" | grep -q "pool top-up"; then
+  bad "topup: attempted a spawn for a bead at the reclaim cap — should be a silent no-op, same as the worker probe's own reclaim-cap exclusion (log: $LOG_TUE2)"
+else
+  ok "topup: correctly no-ops when the only routed candidate is at the reclaim cap"
+fi
+
+echo "Scenario TOPUP-ELIGIBILITY-3: structural — real HQ + rig-fallback queries widen to --limit=20 and pipe through _filter_candidates"
+# has() is a single-line grep -qE and the two query lines wrap across a `\`
+# continuation (the --limit=20 | _filter_candidates suffix lives on the
+# physical line AFTER the "bd ready ..." line has() already checks above),
+# so a single-pattern has() call can't anchor both halves at once. The
+# suffix line is byte-identical between the HQ query (_pilot_pool_topup) and
+# the rig-fallback query (_topup_rig_pending) — only the preceding line
+# differs ("$GC_CITY" vs "$_rp") — so asserting the suffix appears exactly
+# twice IS the proof both call sites picked up the fix, not just one.
+_topup_limit20_filter_count="$(grep -cF -- '--exclude-type=epic --json --limit=20 2>/dev/null | _filter_candidates 2>/dev/null | jq -r '"'"'.[0].id // empty'"'"' 2>/dev/null || echo "")' "$DISPATCHER" || true)"
+if [ "${_topup_limit20_filter_count:-0}" -eq 2 ]; then
+  ok "both top-up queries (HQ + rig-fallback) widened to --limit=20 and piped through _filter_candidates (ga-oc6knj)"
+else
+  bad "expected exactly 2 top-up query sites with --limit=20 | _filter_candidates, found ${_topup_limit20_filter_count:-0} — HQ and/or rig-fallback path missing the ga-oc6knj fix"
+fi
+
 # ── Scenario TOPUP-RIG: rig-scoped fallback (ga-q0ewpu) ───────────────────────
 # The pending-bead query above only ever looked at $GC_CITY. A rig-native
 # (wa-*/ps-*) bead routed to a pool at session cap was therefore invisible to

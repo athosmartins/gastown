@@ -1101,6 +1101,44 @@ def update_strand_clock(bead_state, is_currently_stranded, assignee, now):
     return 0.0, event
 
 
+def update_never_claimed_flag(bead_state, is_currently_stranded, assignee):
+    """Track whether the bead's CURRENT stranded streak has had assignee=''
+    on every cycle observed so far (never claimed by any worker), vs. having
+    seen a non-empty assignee at some point in this same streak (claimed,
+    then that claimant went dark — an ordinary dead-worker reclaim). Shares
+    bead_state with update_strand_clock (same dict, keyed by bead_id) via its
+    own key ("ever_claimed_while_stranded") so the two never collide — no
+    I/O, pure, unit-testable, same shape as update_strand_clock/
+    update_refusal_clock.
+
+    ga-oc6knj: a bead the Pilot ROUTES (story:in-flight/pilot:dispatched, or
+    gc.routed_to for a rig-native pool dispatch) but that no worker session
+    ever actually claims never has a non-empty assignee at all — reported
+    live as inflight-reclaim-guard's OWN "started stranded clock: bead=X
+    assignee=''" line, for the bead's entire stranded lifetime (wa-ylh0x,
+    wa-yzx9g, wa-c1hgd, 17/09). do_reclaim() must not charge that bead's
+    pilot:reclaim-count thrash cap the same as a real dead-worker reclaim —
+    see do_reclaim()'s own docstring for how never_had_owner (this
+    function's return value) changes what it writes.
+
+    No separate reset call is needed: a streak that is no longer stranded
+    (is_currently_stranded=False — a live session or fresh branch progress
+    was observed) pops the key here, so the NEXT streak starts fresh via the
+    same "key absent -> default False (never claimed yet)" read below,
+    mirroring how update_strand_clock itself clears first_seen_stranded on
+    exactly the same transition.
+
+    Returns True iff assignee has been falsy on EVERY cycle of the current
+    streak, including this one.
+    """
+    if not is_currently_stranded:
+        bead_state.pop("ever_claimed_while_stranded", None)
+        return False
+    if assignee:
+        bead_state["ever_claimed_while_stranded"] = True
+    return not bead_state.get("ever_claimed_while_stranded", False)
+
+
 def update_refusal_clock(bead_state, has_explicit_refusal, now):
     """Update a bead's per-cycle refusal-age clock in bead_state; return
     refusal_age_secs. Mutates only the passed bead_state dict — no I/O — same
@@ -2688,6 +2726,30 @@ def parse_reclaim_count(labels):
     return 0
 
 
+def parse_starvation_count(labels):
+    """Extract pilot:starvation-count:N from labels. Returns int (0 if absent or invalid).
+
+    ga-oc6knj: tracked SEPARATELY from pilot:reclaim-count — same shape as
+    ga-be4x's parse_refusal_count split, for the same reason: a bead that was
+    reclaimed because it was NEVER claimed (queue starvation — see
+    update_never_claimed_flag) is a different failure class than a bead
+    reclaimed because a real claimant went dark, and only the latter should
+    ever spend MAX_RECLAIMS toward gate:needs-human escalation. This counter
+    is audit/visibility only (do_reclaim bumps it instead of
+    pilot:reclaim-count on a never-claimed reclaim) — nothing currently caps
+    or escalates on it; a chronically-starved bead just keeps cycling back
+    into the pool for a fresh try, which is invariant (b)'s intent ("fome é
+    sinal para o dispatcher ou Mayor, não escalação needs-human").
+    """
+    for lbl in labels:
+        if lbl.startswith("pilot:starvation-count:"):
+            try:
+                return int(lbl[len("pilot:starvation-count:"):])
+            except ValueError:
+                pass
+    return 0
+
+
 def parse_refusal_count(labels):
     """Extract pilot:refusal-count:N from labels. Returns int (0 if absent or invalid).
 
@@ -3054,9 +3116,31 @@ def _close_orphaned_sling(bd_prefix, sling_bead_id, target_bead_id, hold_secs):
 
 def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=None,
                 has_explicit_refusal=False, refusal_count=0, bridge_sources=None,
-                sling_bead_id=None):
+                sling_bead_id=None, never_had_owner=False):
     """Strip story:in-flight (+pilot:dispatched if present), clear assignee,
     bump reclaim label.
+
+    ga-oc6knj: never_had_owner=True (from update_never_claimed_flag, via
+    run_cycle) means this bead's entire stranded streak had assignee=''
+    the whole time — no worker session ever claimed it, so this is queue
+    starvation (a dispatcher/routing-probe problem — see the wa-worker/
+    ps-worker prompt template's own ga-oc6knj fix for the root cause), not
+    a dead builder. Reported live: 3 beads (wa-ylh0x, wa-yzx9g, wa-c1hgd)
+    reached pilot:reclaim-count:3 -> gate:needs-human with ZERO real
+    dispatch attempts, purely from this conflation.
+    When True, this reclaim does NOT touch pilot:reclaim-count at all
+    (new_count stays == the incoming reclaim_count — no strike spent) and
+    does NOT stamp the pilot:held reloop-cooldown (step 3b) — both exist
+    specifically to protect against a bead that keeps failing REAL
+    attempts, which a bead nobody has ever tried has by definition not
+    done; stamping pilot:held here would only add an unhelpful 1h delay on
+    top of the starvation this fix exists to shorten. A separate,
+    non-escalating pilot:starvation-count:N label is bumped instead, purely
+    for audit visibility (parse_starvation_count) — nothing currently reads
+    it back into any cap/escalation decision, matching invariant (b): "fome
+    é sinal para o dispatcher ou Mayor, não escalação needs-human para a
+    crew." Defaults False: every existing caller that doesn't pass it keeps
+    pre-fix behavior exactly.
 
     ga-mfeip (cross-store): rig_root, when set, routes every bd mutation to the
     bead's own rig store (bd -C rig_root) instead of defaulting to HQ. HQ-native
@@ -3100,7 +3184,9 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
 
     Returns True if all bd ops succeeded, False if any failed (still best-effort).
     """
-    new_count = reclaim_count + 1
+    starvation_count = parse_starvation_count(labels)
+    new_count = reclaim_count if never_had_owner else reclaim_count + 1
+    new_starvation_count = starvation_count + 1 if never_had_owner else starvation_count
     ok = True
 
     # 0. ga-ufr7: push-before-reclaim safety net. A builder that went quiet from
@@ -3190,20 +3276,40 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
         print(f"[INFLIGHT-RECLAIM] warn: clear assignee {bead_id}: {exc}", flush=True)
         # Non-fatal: Pilot can still re-dispatch without assignee being empty
 
-    # 3. Bump reclaim count label (remove old, add new)
-    if reclaim_count > 0:
+    # 3. Bump reclaim count label (remove old, add new) — UNLESS this reclaim
+    #    is pure queue starvation (ga-oc6knj: never_had_owner), in which case
+    #    pilot:reclaim-count is left completely untouched (no strike spent)
+    #    and a separate, non-escalating pilot:starvation-count:N is bumped
+    #    instead. See this function's own docstring for why the two must
+    #    never share a counter.
+    if never_had_owner:
+        if starvation_count > 0:
+            try:
+                subprocess.run(
+                    _bd + ["label", "remove", bead_id, f"pilot:starvation-count:{starvation_count}", "-q"],
+                    capture_output=True, text=True, timeout=15)
+            except Exception:
+                pass  # old label may already be missing; ignore
         try:
             subprocess.run(
-                _bd + ["label", "remove", bead_id, f"pilot:reclaim-count:{reclaim_count}", "-q"],
+                _bd + ["label", "add", bead_id, f"pilot:starvation-count:{new_starvation_count}", "-q"],
                 capture_output=True, text=True, timeout=15)
-        except Exception:
-            pass  # old label may already be missing; ignore
-    try:
-        subprocess.run(
-            _bd + ["label", "add", bead_id, f"pilot:reclaim-count:{new_count}", "-q"],
-            capture_output=True, text=True, timeout=15)
-    except Exception as exc:
-        print(f"[INFLIGHT-RECLAIM] warn: set reclaim-count label {bead_id}: {exc}", flush=True)
+        except Exception as exc:
+            print(f"[INFLIGHT-RECLAIM] warn: set starvation-count label {bead_id}: {exc}", flush=True)
+    else:
+        if reclaim_count > 0:
+            try:
+                subprocess.run(
+                    _bd + ["label", "remove", bead_id, f"pilot:reclaim-count:{reclaim_count}", "-q"],
+                    capture_output=True, text=True, timeout=15)
+            except Exception:
+                pass  # old label may already be missing; ignore
+        try:
+            subprocess.run(
+                _bd + ["label", "add", bead_id, f"pilot:reclaim-count:{new_count}", "-q"],
+                capture_output=True, text=True, timeout=15)
+        except Exception as exc:
+            print(f"[INFLIGHT-RECLAIM] warn: set reclaim-count label {bead_id}: {exc}", flush=True)
 
     # 3a. [ga-be4x gate-fix-2: refusal-count bump now happens inside
     #      _promote_refusal_labels(), called at step 1b above — no separate
@@ -3225,9 +3331,14 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
     #     FAIL-OPEN: if the bd calls fail, the hold is not stamped — identical to pre-fix
     #     behaviour (Pilot may re-dispatch, which is acceptable on a first-time transient).
     #     Env-gate: RECLAIM_RELOOP_HOLD_SECS (default 3600 = 1h). Set 0 to disable.
+    #     ga-oc6knj: also gated on `not never_had_owner` — the re-loop this cooldown
+    #     protects against is "Pilot keeps re-dispatching to the same crew that keeps
+    #     failing/declining it", which does not describe a bead nobody has tried yet.
+    #     Stamping pilot:held here would just bolt an unhelpful 1h delay onto the
+    #     starvation this fix exists to shorten, working directly against it.
     _reloop_hold = int(os.environ.get("RECLAIM_RELOOP_HOLD_SECS", "3600"))
     _sling_closed = False
-    if reclaim_count >= 1 and _reloop_hold > 0:
+    if reclaim_count >= 1 and _reloop_hold > 0 and not never_had_owner:
         _held_until = int(time.time()) + _reloop_hold
         try:
             subprocess.run(
@@ -3277,14 +3388,21 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
     #     in the same cycle) is rare, and is still covered by the standalone
     #     reclaim_cap_escalation_sweep.py detector, which re-reads live labels
     #     fresh from bd rather than a stale in-memory snapshot.
-    if new_count >= MAX_RECLAIMS and not has_explicit_refusal:
+    #     ga-oc6knj: also gated on `not never_had_owner`, belt-and-suspenders —
+    #     new_count == reclaim_count (unchanged) whenever never_had_owner is
+    #     True, so this can only equal-or-exceed MAX_RECLAIMS if reclaim_count
+    #     already was, which would have made reclaim_decision() choose
+    #     "escalate" over "reclaim" and never call this function at all. The
+    #     explicit guard makes that invariant self-evident here too, rather
+    #     than resting entirely on reasoning about the caller.
+    if new_count >= MAX_RECLAIMS and not has_explicit_refusal and not never_had_owner:
         do_escalate(bead_id, bead_title, new_count, idle_min, labels, rig_root=rig_root)
 
     # 4. Audit comment
     cleared = " + ".join(l for l in ("story:in-flight", "pilot:dispatched")
                          if l in labels) or "(no in-flight label)"
     _hold_note = (f" pilot:held stamped for {_reloop_hold//60}min cooldown to prevent re-loop (reclaim {new_count-1}+)."
-                  if reclaim_count >= 1 and _reloop_hold > 0 else "")
+                  if reclaim_count >= 1 and _reloop_hold > 0 and not never_had_owner else "")
     _sling_note = (f" Its dispatch sling {sling_bead_id} was also closed "
                    f"(superseded-by-reclaim-hold, ga-xlnkf)."
                    if _sling_closed else "")
@@ -3296,6 +3414,13 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
         f"drain. refusal {new_refusal_count}/{REFUSAL_ESCALATE_THRESHOLD}; one more "
         f"independent refusal escalates to gate:needs-human regardless of reclaim cap."
         if has_explicit_refusal else "")
+    _starvation_note = (
+        f" ga-oc6knj: this reclaim is QUEUE STARVATION — no worker ever claimed this "
+        f"bead during its stranded wait (not a dead builder). pilot:reclaim-count is "
+        f"UNCHANGED at {new_count}/{MAX_RECLAIMS} (no strike spent, no reloop-hold "
+        f"stamped); pilot:starvation-count now {new_starvation_count} (audit-only, "
+        f"never caps or escalates)."
+        if never_had_owner else "")
     try:
         subprocess.run(
             _bd + ["comment", bead_id,
@@ -3306,7 +3431,8 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
              f"{_hold_note}"
              f"{_sling_note}"
              f"{_preserve_note}"
-             f"{_refusal_note} "
+             f"{_refusal_note}"
+             f"{_starvation_note} "
              f"Pilot will re-dispatch. (reclaim {new_count}/{MAX_RECLAIMS})"],
             capture_output=True, text=True, timeout=15)
     except Exception:
@@ -4410,6 +4536,15 @@ def run_cycle(state, escalated_alerted):
         if is_currently_stranded:
             stranded_count += 1
 
+        # ga-oc6knj: has this bead's CURRENT stranded streak had assignee=''
+        # on every cycle so far (never claimed by any worker), as opposed to
+        # having been claimed and then abandoned? Shares bead_state with
+        # update_strand_clock just above (same dict, different key) — see
+        # update_never_claimed_flag's own docstring for the full incident.
+        # Threaded through to Pass 2 (classified tuple) so do_reclaim() can
+        # skip spending pilot:reclaim-count's thrash cap on pure starvation.
+        never_had_owner = update_never_claimed_flag(bead_state, is_currently_stranded, assignee)
+
         reclaim_count = parse_reclaim_count(labels)
 
         # has_explicit_refusal / refusal_count: computed earlier now (see the
@@ -4476,8 +4611,10 @@ def run_cycle(state, escalated_alerted):
         # (ga-xlnkf) lets Pass 2 close this bead's OWN dispatch sling if this
         # cycle reclaims+holds it — a different sling than bridge_sources', which
         # is about a refusal LABEL bridged FROM a sling, not the sling's identity.
+        # never_had_owner (ga-oc6knj) lets Pass 2's do_reclaim() distinguish
+        # queue starvation from a dead builder — see update_never_claimed_flag.
         classified.append((bead_id, title, labels, assignee, action, idle_min, reclaim_count,
-                            rig_root, bridge_sources, sling_bead_id))
+                            rig_root, bridge_sources, sling_bead_id, never_had_owner))
 
     # --- Pool-dead alert (BEFORE per-bead actuation, ga-dbibq) ---
     # Emits [POOL-DEAD] Mayor mail when >= POOL_DEAD_MIN beads from the same pool
@@ -4486,7 +4623,7 @@ def run_cycle(state, escalated_alerted):
 
     # --- Pass 2: per-bead actuation (logic unchanged from prior single-pass) ---
     for (bead_id, title, labels, assignee, action, idle_min, reclaim_count,
-         rig_root, bridge_sources, sling_bead_id) in classified:
+         rig_root, bridge_sources, sling_bead_id, never_had_owner) in classified:
         # ga-be4x: re-derive from labels (already in the tuple — no new fields
         # needed) so actuation makes the SAME refusal-vs-death distinction
         # Pass 1 used to classify the action in the first place.
@@ -4496,14 +4633,24 @@ def run_cycle(state, escalated_alerted):
         if action == "reclaim":
             ok = do_reclaim(bead_id, title, reclaim_count, idle_min, labels, rig_root=rig_root,
                              has_explicit_refusal=has_explicit_refusal, refusal_count=refusal_count,
-                             bridge_sources=bridge_sources, sling_bead_id=sling_bead_id)
+                             bridge_sources=bridge_sources, sling_bead_id=sling_bead_id,
+                             never_had_owner=never_had_owner)
             status = "RECLAIMED" if ok else "RECLAIM-FAILED"
             _refusal_tag = (f" refusal={refusal_count + 1}/{REFUSAL_ESCALATE_THRESHOLD}"
                              if has_explicit_refusal else "")
+            # ga-oc6knj: never_had_owner reclaims do NOT bump reclaim_count (see
+            # do_reclaim), so the log must not claim they do — a distinct
+            # "never_claimed" tag replaces the misleading "reclaim=N/MAX" text
+            # for exactly this case, so a log scan (the same technique that
+            # diagnosed this bug) can tell the two failure classes apart at a
+            # glance instead of re-deriving it from bead history.
+            _reclaim_tag = (
+                f"never_claimed starvation={parse_starvation_count(labels) + 1}"
+                if never_had_owner else f"reclaim={reclaim_count + 1}/{MAX_RECLAIMS}")
             emit(
                 f"[INFLIGHT-RECLAIM] [{status}] bead={bead_id} "
                 f"idle={idle_min:.0f}min no_live_session no_recent_branch "
-                f"reclaim={reclaim_count + 1}/{MAX_RECLAIMS}{_refusal_tag} title={title!r}"
+                f"{_reclaim_tag}{_refusal_tag} title={title!r}"
             )
             # Reset state clock — bead left in-flight (or will be re-tracked if partially failed)
             state.pop(bead_id, None)
@@ -8940,6 +9087,125 @@ def _selftest():
             os.environ.pop("RECLAIM_RELOOP_HOLD_SECS", None)
         else:
             os.environ["RECLAIM_RELOOP_HOLD_SECS"] = _orig_reloop_env
+
+    # -------------------------------------------------------------------
+    # Section: never_had_owner / pilot:starvation-count (ga-oc6knj)
+    # -------------------------------------------------------------------
+    check("UNC-1: update_never_claimed_flag — never claimed (assignee='' every cycle) -> True",
+          [update_never_claimed_flag({}, True, "")][0] is True)
+    check("UNC-2: update_never_claimed_flag — claimed from streak start (assignee set on cycle 1) -> False",
+          update_never_claimed_flag({}, True, "wa-worker-1") is False)
+    _unc3_bs = {}
+    update_never_claimed_flag(_unc3_bs, True, "")                       # cycle 1: still unclaimed
+    _unc3_result = update_never_claimed_flag(_unc3_bs, True, "wa-worker-2")  # cycle 2: claimed mid-streak
+    check("UNC-3: update_never_claimed_flag — claimed PARTWAY through a streak -> False from that cycle on",
+          _unc3_result is False, f"result={_unc3_result!r}")
+    _unc3b_result = update_never_claimed_flag(_unc3_bs, True, "")       # cycle 3: claimant vanished again
+    check("UNC-3b: update_never_claimed_flag — once claimed this streak, stays False even if assignee empties again",
+          _unc3b_result is False, f"result={_unc3b_result!r}")
+    _unc4_bs = {"ever_claimed_while_stranded": True}
+    _unc4_result = update_never_claimed_flag(_unc4_bs, False, "")       # streak ends: live session/progress seen
+    check("UNC-4: update_never_claimed_flag — streak ending resets state (not-stranded -> False, key cleared)",
+          _unc4_result is False and "ever_claimed_while_stranded" not in _unc4_bs,
+          f"result={_unc4_result!r} state={_unc4_bs!r}")
+
+    check("PSC-1: parse_starvation_count: present -> int",
+          parse_starvation_count(["pilot:starvation-count:2"]) == 2)
+    check("PSC-2: parse_starvation_count: absent -> 0",
+          parse_starvation_count(["story:in-flight"]) == 0)
+    check("PSC-3: parse_starvation_count: malformed -> 0 (fail-safe)",
+          parse_starvation_count(["pilot:starvation-count:nan"]) == 0)
+
+    # do_reclaim(never_had_owner=True) end-to-end — the FALSIFIABLE proof
+    # behind acceptance criterion 2: "reclaim de bead com assignee='' do
+    # início ao fim NÃO incrementa pilot:reclaim-count (ou incrementa um
+    # contador separado que NÃO escala a bead)".
+    _orig_run_noc = subprocess.run
+
+    def _make_noc_stub(mutations):
+        def _run(cmd, **kw):
+            _cmd_list = list(cmd) if isinstance(cmd, (list, tuple)) else [cmd]
+            mutations.append(_cmd_list)
+            class _R:
+                returncode = 0
+                stderr = ""
+                stdout = ""
+            if len(_cmd_list) >= 2 and _cmd_list[0] == "bd" and _cmd_list[1] == "show":
+                # _remove_label_verified's read-back: report the in-flight
+                # labels already gone so step 1 confirms on the first try
+                # (no retry/sleep) regardless of which label was targeted.
+                _bead_id = _cmd_list[2] if len(_cmd_list) > 2 else "unknown"
+                _R.stdout = json.dumps([{"id": _bead_id, "labels": []}])
+            return _R()
+        return _run
+
+    _noc_mutations = []
+    subprocess.run = _make_noc_stub(_noc_mutations)
+    try:
+        do_reclaim("ga-starved1", "never claimed bead", reclaim_count=0, idle_min=30.0,
+                   labels=["story:in-flight", "pilot:dispatched"], never_had_owner=True)
+        check("NOC-1 (ga-oc6knj): never_had_owner reclaim does NOT add any pilot:reclaim-count label",
+              not any(len(m) >= 5 and m[0] == "bd" and m[1] == "label" and m[2] == "add"
+                      and m[4].startswith("pilot:reclaim-count:") for m in _noc_mutations),
+              f"mutations={_noc_mutations!r}")
+        check("NOC-2 (ga-oc6knj): never_had_owner reclaim DOES add pilot:starvation-count:1 instead",
+              ["bd", "label", "add", "ga-starved1", "pilot:starvation-count:1", "-q"] in _noc_mutations,
+              f"mutations={_noc_mutations!r}")
+        check("NOC-3 (ga-oc6knj): never_had_owner reclaim does NOT stamp pilot:held (no reloop-cooldown "
+              "— that hold protects against a real repeat failure, not pure starvation)",
+              not any(len(m) >= 5 and m[0] == "bd" and m[1] == "label" and m[2] == "add"
+                      and m[4] == "pilot:held" for m in _noc_mutations),
+              f"mutations={_noc_mutations!r}")
+        check("NOC-4 (ga-oc6knj): never_had_owner reclaim still clears assignee and reopens the bead "
+              "(it IS still a real reclaim — the bead goes back to the pool for a fresh try)",
+              ["bd", "assign", "ga-starved1", ""] in _noc_mutations
+              and ["bd", "update", "ga-starved1", "--status", "open"] in _noc_mutations,
+              f"mutations={_noc_mutations!r}")
+    finally:
+        subprocess.run = _orig_run_noc
+
+    # A SECOND consecutive never_had_owner reclaim (starvation-count already
+    # at 1 from a prior cycle) must bump 1->2, removing the stale label, and
+    # must STILL never touch pilot:reclaim-count — proves the two counters
+    # advance independently across repeat starvation, not just once.
+    _noc2_mutations = []
+    subprocess.run = _make_noc_stub(_noc2_mutations)
+    try:
+        do_reclaim("ga-starved2", "never claimed bead, 2nd starvation cycle", reclaim_count=0,
+                   idle_min=55.0,
+                   labels=["story:in-flight", "pilot:dispatched", "pilot:starvation-count:1"],
+                   never_had_owner=True)
+        check("NOC-5 (ga-oc6knj): a SECOND never_had_owner reclaim bumps starvation-count 1 -> 2",
+              ["bd", "label", "add", "ga-starved2", "pilot:starvation-count:2", "-q"] in _noc2_mutations,
+              f"mutations={_noc2_mutations!r}")
+        check("NOC-6 (ga-oc6knj): the 2nd starvation reclaim removes the OLD starvation-count:1 label",
+              ["bd", "label", "remove", "ga-starved2", "pilot:starvation-count:1", "-q"] in _noc2_mutations,
+              f"mutations={_noc2_mutations!r}")
+        check("NOC-7 (ga-oc6knj): still zero pilot:reclaim-count mutations on the 2nd starvation cycle",
+              not any(len(m) >= 5 and m[0] == "bd" and m[1] == "label" and m[2] == "add"
+                      and m[4].startswith("pilot:reclaim-count:") for m in _noc2_mutations),
+              f"mutations={_noc2_mutations!r}")
+    finally:
+        subprocess.run = _orig_run_noc
+
+    # Control: never_had_owner=False (the default every pre-existing caller
+    # already uses) is completely unaffected — reclaim-count bumps exactly
+    # as before, pilot:starvation-count is never touched.
+    _noc_ctrl_mutations = []
+    subprocess.run = _make_noc_stub(_noc_ctrl_mutations)
+    try:
+        do_reclaim("ga-realworker1", "claimed then abandoned bead", reclaim_count=0, idle_min=30.0,
+                   labels=["story:in-flight", "pilot:dispatched"])
+        check("NOC-CTRL-1 (ga-oc6knj): default never_had_owner=False still bumps pilot:reclaim-count:1 "
+              "(pre-fix behavior unchanged for a REAL dead-worker reclaim)",
+              ["bd", "label", "add", "ga-realworker1", "pilot:reclaim-count:1", "-q"] in _noc_ctrl_mutations,
+              f"mutations={_noc_ctrl_mutations!r}")
+        check("NOC-CTRL-2 (ga-oc6knj): default never_had_owner=False never touches pilot:starvation-count",
+              not any(len(m) >= 5 and m[0] == "bd" and m[1] == "label"
+                      and m[4].startswith("pilot:starvation-count:") for m in _noc_ctrl_mutations),
+              f"mutations={_noc_ctrl_mutations!r}")
+    finally:
+        subprocess.run = _orig_run_noc
 
     print(f"\nResults: {PASS} passed, {FAIL} failed")
     return FAIL == 0

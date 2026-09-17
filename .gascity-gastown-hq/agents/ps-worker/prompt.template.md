@@ -286,7 +286,37 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # named domain owner for a timing decision a generic ephemeral worker has
 # no basis to make safely. Regression coverage:
 # pool-probe-delivery-pending-restart.selftest.sh.
-bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --exclude-label "delivery:pending-restart" --json --sort priority --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select((.labels // []) | map(select(startswith("blocked:"))) | length == 0) | select((.labels // []) | map(select(startswith("gate:needs-human"))) | length == 0) | select((.labels // []) | map(select(startswith("pilot:text-veto"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | if length > 0 then (max < 3) else true end)] | sort_by([.priority, (.updated_at // .created_at // "")]) | .[:1]'
+#
+# ga-oc6knj: the tiebreak's fallback-to-updated_at (ga-w4k2z, kept below for
+# GENUINELY-reclaimed beads) also fired on a bead's OWN FIRST dispatch —
+# Pilot's dispatch write itself (story:in-flight + pilot:dispatched labels +
+# a comment) bumps updated_at, so a bead JUST routed always sorted to the
+# BACK of its priority tier, behind every sibling it hadn't yet raced. Each
+# missed pick + reclaim + redispatch re-bumped updated_at again, so the bead
+# could never win a same-priority tiebreak as long as ANY untouched sibling
+# existed — proven live 17/09 (transcript 0bc29f56) on the WA side: probe
+# order [wa-aaekc(updated 23:38, re-routed earlier), wa-yzx9g(updated
+# 01:40:43, =dispatch instant), wa-ylh0x(updated 01:40:55, =dispatch
+# instant)] handed the session to wa-aaekc; wa-yzx9g/wa-ylh0x each burned
+# reclaim attempts without ever being tried once — same probe shape as this
+# ps-worker copy, so the same fix applies here.
+# Compounded by inflight-reclaim-guard.py's do_reclaim() (ga-oc6knj fix
+# there too) charging a NEVER-claimed bead's reclaim the same MAX_RECLAIMS
+# cap as a real dead-worker reclaim, so pure queue starvation alone reached
+# gate:needs-human in 3 cycles with zero attempts.
+# Fix is NOT a plain switch to created_at (that would just reinstate
+# ga-w4k2z's poisoned-bead-camps-position-0-forever bug for a bead that DOES
+# fail repeatedly, since created_at never moves). Instead: branch on whether
+# this bead carries ANY pilot:reclaim-count:<n> label (i.e. has it EVER
+# actually been reclaimed after a real attempt) — reusing the exact same
+# label-parsing sub-expression as the cap-exclusion clause immediately to
+# the left. Zero such labels (never reclaimed, incl. every first-ever
+# dispatch) -> sort by created_at (stable, immune to the dispatcher's own
+# routing writes). One or more (proven poisoned at least once) -> sort by
+# updated_at exactly as before, preserving ga-w4k2z's anti-poison property
+# for the beads it actually protects against. Regression coverage:
+# pool-probe-priority-sort.selftest.sh's ga-oc6knj cases.
+bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --exclude-label "delivery:pending-restart" --json --sort priority --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select((.labels // []) | map(select(startswith("blocked:"))) | length == 0) | select((.labels // []) | map(select(startswith("gate:needs-human"))) | length == 0) | select((.labels // []) | map(select(startswith("pilot:text-veto"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | if length > 0 then (max < 3) else true end)] | sort_by([.priority, (if (((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | length) > 0 then (.updated_at // "") else (.created_at // .updated_at // "") end)]) | .[:1]'
 # If it returns a bead (output is NOT []), THAT BEAD IS YOURS. Claim it FIRST:
 #     gc bd update <id> --claim
 # verify the claim set assignee to your session, then go to the Build Protocol and build it.
