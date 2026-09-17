@@ -189,10 +189,22 @@ echo "$LEAD_PART" | grep -q "com.test.old-daemon" \
 echo "$BD_CALLS" | grep -q "Context only — NOT attributed to this merge" \
   && ok "T1 wide list demoted to an explicitly-marked context line" \
   || nok "T1 missing context-demotion marker" "$BD_CALLS"
-CONTEXT_PART="$(echo "$BD_CALLS" | awk '/Context only/{p=1} p{print}')"
-echo "$CONTEXT_PART" | grep -q "com.test.old-daemon" \
+# Scoped to the single "Context only" LINE itself (not everything after it —
+# the same bd comment also appends a raw "Refresh detail: $REFRESH_OUT" dump
+# further down, which legitimately contains every daemon name unfiltered
+# since it's raw daemon-refresh.sh stdout, not the human-facing narrative).
+CONTEXT_LINE="$(echo "$BD_CALLS" | grep "Context only — NOT attributed to this merge")"
+echo "$CONTEXT_LINE" | grep -q "com.test.old-daemon" \
   && ok "T1 demoted context line still names the unattributed daemon (nothing hidden, just de-prioritized)" \
-  || nok "T1 old-daemon missing entirely from context line" "$CONTEXT_PART"
+  || nok "T1 old-daemon missing entirely from context line" "$CONTEXT_LINE"
+# gate_run=ga-c6ke4i (Reviewer-1 FAIL): the context line used to interpolate
+# the RAW wide list, so an already-attributed daemon (named in the lead
+# "restart THESE" line) also leaked into this "NOT attributed" line two lines
+# later — self-contradictory. Assert the exclusion directly: new-daemon must
+# appear ONLY in the lead, never here too.
+echo "$CONTEXT_LINE" | grep -q "com.test.new-daemon" \
+  && nok "T1 context line wrongly re-lists the already-attributed daemon (new-daemon) as NOT attributed — self-contradicts the lead line" "$CONTEXT_LINE" \
+  || ok "T1 context line correctly excludes the already-attributed daemon (new-daemon) — no self-contradiction with the lead line"
 
 # ── T3 (mode=path_a): a real pull happened, narrow probe never ran → no
 #    per-bead attribution this run → falls back to the ORIGINAL wide-list-

@@ -2190,9 +2190,24 @@ else
           # row, and in wa-gyqzr's case the wide list didn't even CONTAIN the
           # one daemon that actually needed restarting.
           if [ "$THIS_PULL_STRUCTURALLY_INERT" = "0" ] && [ -n "${MERGE_OWN_AFFECTED// /}" ]; then
+            # gate_run=ga-c6ke4i (Reviewer-1 FAIL): the demoted line below used
+            # to interpolate the raw $REFRESH_GUARDED wide list. Whenever a
+            # narrow-attributed daemon was ALSO present in the wide sweep (the
+            # common case — MERGE_PRE_MAIN..MERGE_SHA is normally a sub-range
+            # of the wide baseline..POST window), that same daemon appeared
+            # both in the lead "restart THESE for this merge" line and, two
+            # lines later, in a line calling it "NOT attributed to this merge"
+            # / "from EARLIER merges" — a self-contradiction. Subtract the
+            # already-attributed set first, same set-difference shape as
+            # SJ_FINE's fix for the identical contradiction class in
+            # daemon-refresh.sh (gate_run=ga-3khhu).
+            REFRESH_GUARDED_CONTEXT_ONLY="$(comm -23 \
+              <(echo "$REFRESH_GUARDED" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+              <(echo "$MERGE_OWN_AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+              | tr '\n' ' ' | sed 's/ $//')"
             REFRESH_ACTION="ACTION: restart THESE for this merge — per-bead attribution ($STORY_ID's own delta $MERGE_OWN_BASE_SHA..$MERGE_SHA reaches, already computed above):$MERGE_OWN_AFFECTED
 Drain in-flight messages/webhooks first, then re-run delivery. (Configure a DRAIN_CMD_<label> for daemon-refresh.sh to automate this.)
-Context only — NOT attributed to this merge: other sensitive daemon(s) the wide sweep found older than their own closure, from EARLIER merges (cosmetic unless one of them actually uses a changed symbol; do not restart these on THIS story's account alone):${REFRESH_GUARDED}
+Context only — NOT attributed to this merge: other sensitive daemon(s) the wide sweep found older than their own closure, from EARLIER merges (cosmetic unless one of them actually uses a changed symbol; do not restart these on THIS story's account alone):${REFRESH_GUARDED_CONTEXT_ONLY}
 CAVEAT (ga-puq8z): both lists above are import/template-closure matches, not proof of reachability to the changed symbols — if in doubt, compare \`ps -o lstart= -p <pid>\` against commit $POST_DEPLOY_SHA before restarting."
           else
             REFRESH_ACTION="ACTION: perform a guarded/graceful restart of the flagged hot-path daemon(s) ($REFRESH_GUARDED) — drain in-flight messages/webhooks first — then re-run delivery. (Configure a DRAIN_CMD_<label> for daemon-refresh.sh to automate this.) No per-bead attribution available this run (this story's own pull was not a true no-op, or the attribution probe above did not return a parseable result) — this is the wide sweep's list only. CAVEAT (ga-puq8z): flagged by import/template-closure matching, not proven reachable to the changed symbols — if in doubt, compare \`ps -o lstart= -p <pid>\` against commit $POST_DEPLOY_SHA before restarting."
