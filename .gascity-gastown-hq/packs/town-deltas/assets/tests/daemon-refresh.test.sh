@@ -1916,6 +1916,72 @@ echo "$(field RESTARTED "$OUT")" | grep -q "com.test.lexbh-dashboard" && ok "T50
 grep -q "com.test.lexbh-dashboard" "$MOCK/kicks.log" 2>/dev/null && ok "T50 kickstart invoked" || nok "T50 kickstart" "log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 [ "$(field PROOF "$OUT")" = "verified" ] && ok "T50 PROOF=verified (real restart+fresh confirmed, not a blind fire-and-forget kick)" || nok "T50 proof" "got '$(field PROOF "$OUT")'"
 
+# ════════════════════════════════════════════════════════════════════════════
+# T51 (ga-9lug2k): deploy_deps.json covers EVERY entrypoint this run discovers
+# (the fixture's one daemon), and the flagged daemon's affected=1 came from
+# that real recursive closure, not the ad-hoc scan. The NEEDS_GUARDED_RESTART
+# REASON must say coverage is complete for this run (no "verify by hand / may
+# be incomplete") while still naming the two risks that survive JSON coverage
+# regardless: the JSON itself going stale, and template/asset reachability,
+# which deploy_deps.json's closure never tracks (header point 14).
+# ════════════════════════════════════════════════════════════════════════════
+new_case t51
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+cat > "$RUNTIME/daemons/deploy_deps.json" <<'JSONEOF'
+{
+  "_generated_by": "scripts/gen_daemon_deps.py",
+  "daemons": {
+    "daemons/central_sender.py": {
+      "label": "com.test.central-sender",
+      "closure": ["daemons/central_sender.py"]
+    }
+  }
+}
+JSONEOF
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+seed_running com.test.central-sender 5101 "$STALE_LSTART"
+OUT=$(run_helper daemons/central_sender.py); RC=$?
+V=$(field VERDICT "$OUT")
+REASON="$(field REASON "$OUT")"
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T51 verdict NEEDS_GUARDED_RESTART" || nok "T51 verdict" "got '$V' out=[$OUT]"
+echo "$REASON" | grep -qi "real recursive closure" && ok "T51 REASON asserts full-closure coverage (deploy_deps.json 1/1)" || nok "T51 full-closure wording" "$REASON"
+echo "$REASON" | grep -qi "does NOT apply here" && ok "T51 REASON retires the false-negative caveat for this run" || nok "T51 retired caveat" "$REASON"
+echo "$REASON" | grep -qi "template" && ok "T51 REASON still names template/asset reachability as a residual risk" || nok "T51 template caveat kept" "$REASON"
+echo "$REASON" | grep -qi "stale" && ok "T51 REASON still names JSON staleness as a residual risk" || nok "T51 staleness caveat kept" "$REASON"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T52 (ga-9lug2k): control — deploy_deps.json exists but does NOT cover every
+# entrypoint this run discovers (a second declared daemon it never mentions)
+# → coverage is partial (1/2), so the REASON must keep the ORIGINAL
+# conservative wording (verify by hand / may be incomplete), never T51's
+# full-closure claim. Proves T51's assertion is earned per-run from the real
+# coverage count, not triggered merely by deploy_deps.json existing.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t52
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+cat > "$RUNTIME/daemons/ban_risk_dashboard.py" <<<'print("dash")'
+cat > "$RUNTIME/daemons/deploy_deps.json" <<'JSONEOF'
+{
+  "_generated_by": "scripts/gen_daemon_deps.py",
+  "daemons": {
+    "daemons/central_sender.py": {
+      "label": "com.test.central-sender",
+      "closure": ["daemons/central_sender.py"]
+    }
+  }
+}
+JSONEOF
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+make_plist "$AGENTS" com.test.ban-risk-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/ban_risk_dashboard.py"
+seed_running com.test.central-sender 5201 "$STALE_LSTART"
+seed_running com.test.ban-risk-dashboard 5202 "$STALE_LSTART"
+OUT=$(run_helper daemons/central_sender.py); RC=$?
+V=$(field VERDICT "$OUT")
+REASON="$(field REASON "$OUT")"
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T52 verdict NEEDS_GUARDED_RESTART" || nok "T52 verdict" "got '$V' out=[$OUT]"
+echo "$REASON" | grep -qi "verify by hand" && ok "T52 REASON keeps the conservative wording (coverage is partial: 1/2 entrypoints)" || nok "T52 conservative wording kept" "$REASON"
+! echo "$REASON" | grep -qi "does NOT apply here" && ok "T52 REASON does NOT claim full-closure coverage" || nok "T52 wrongly claimed full closure" "$REASON"
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"
