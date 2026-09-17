@@ -1922,6 +1922,14 @@ else
      && git -C "$RUNTIME_DIR" merge-base --is-ancestor "$DAEMON_REFRESH_BASELINE_SHA" "$POST_DEPLOY_SHA" 2>/dev/null; then
     DAEMON_REFRESH_PRE_SHA="$DAEMON_REFRESH_BASELINE_SHA"
   fi
+  # ga-0fawwr: per-daemon baseline overrides — see daemon-refresh.sh's own
+  # comment at its point of use (end of its Step 3) for the full rationale.
+  # Read as free-form text and handed to the helper verbatim; the helper
+  # alone validates each "<label> <sha>" line's ancestry before trusting it,
+  # so a stale/foreign/corrupt line here can only ever be ignored there,
+  # never misused — this read needs no validation of its own.
+  DAEMON_REFRESH_PERDAEMON_FILE="$DAEMON_REFRESH_BASELINE_DIR/$RIG.perdaemon"
+  DAEMON_BASELINE_OVERRIDES="$(cat "$DAEMON_REFRESH_PERDAEMON_FILE" 2>/dev/null || echo "")"
   # ga-3bdttu: DAEMON_REFRESH_PRE_SHA above can be far older than this story's
   # own pull — frozen at whatever it was when an earlier, still-unresolved
   # sensitive-daemon restart last blocked the marker from advancing (the
@@ -2112,6 +2120,7 @@ else
     PRE_DEPLOY_SHA="$DAEMON_REFRESH_PRE_SHA" POST_DEPLOY_SHA="$POST_DEPLOY_SHA" \
     DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
     EXTRA_RUNTIME_ROOTS="$EXTRA_RUNTIME_ROOTS" \
+    DAEMON_BASELINE_OVERRIDES="$DAEMON_BASELINE_OVERRIDES" \
     DRY_RUN="$DRY_RUN" \
     bash "$REFRESH_HELPER" || true)
   REFRESH_VERDICT=$(echo "$REFRESH_OUT" | grep '^VERDICT=' | head -1 | sed 's/^VERDICT=//')
@@ -2119,6 +2128,14 @@ else
   REFRESH_RESTARTED=$(echo "$REFRESH_OUT" | grep '^RESTARTED=' | head -1 | sed 's/^RESTARTED=//')
   REFRESH_GUARDED=$(echo "$REFRESH_OUT" | grep '^GUARDED=' | head -1 | sed 's/^GUARDED=//')
   REFRESH_FRESHFAIL=$(echo "$REFRESH_OUT" | grep '^FRESH_FAIL=' | head -1 | sed 's/^FRESH_FAIL=//')
+  # ga-0fawwr: every label this cycle's discovery examined — may be genuinely
+  # absent (an older daemon-refresh.sh predating this field, same hazard the
+  # PROOF field below already guards against), so `|| true` here for the same
+  # reason: under this script's `set -euo pipefail`, an unmatched grep piped
+  # into head/sed still propagates a non-zero pipeline status and would kill
+  # the whole sweep otherwise. Empty is the safe fallback either way — the
+  # write-back block further below simply does nothing without it.
+  REFRESH_ALL_LABELS=$(echo "$REFRESH_OUT" | grep '^ALL_LABELS=' | head -1 | sed 's/^ALL_LABELS=//' || true)
   # ga-vmq1i: PROOF disambiguates a positive restart+fresh confirmation from a
   # VERDICT=OK/SKIPPED that never actually confirmed anything live — fail
   # closed to not_verified if the helper's output predates this field or is
@@ -2131,6 +2148,40 @@ else
   REFRESH_PROOF=$(echo "$REFRESH_OUT" | grep '^PROOF=' | head -1 | sed 's/^PROOF=//' || true)
   [ -n "$REFRESH_PROOF" ] || REFRESH_PROOF="not_verified"
   log "Daemon refresh verdict=$REFRESH_VERDICT restarted=[$REFRESH_RESTARTED] guarded=[$REFRESH_GUARDED] freshfail=[$REFRESH_FRESHFAIL] proof=$REFRESH_PROOF reason=$REFRESH_REASON"
+  # ga-0fawwr: per-daemon baseline advance — independent of the rig-wide
+  # OK|SKIPPED gate below, which starves for days whenever even ONE daemon
+  # stays guarded (see daemon-refresh.sh's own comment on
+  # DAEMON_BASELINE_OVERRIDES, at its point of use, for the full incident).
+  # REFRESH_ALL_LABELS is every daemon this cycle's discovery actually
+  # examined (empty on every early short-circuit — nothing ran, nothing to
+  # record); of those, any NOT left in GUARDED or FRESH_FAIL this cycle is —
+  # by definition — resolved as of POST_DEPLOY_SHA (never affected at all, or
+  # affected-and-restarted-and-verified), and gets its OWN baseline advanced
+  # regardless of what any OTHER daemon on the same rig is still stuck on. A
+  # still-stuck label is simply left untouched (or absent, the first time) —
+  # its window keeps growing until IT specifically resolves, exactly like the
+  # rig-wide marker did before this fix, just scoped to the one daemon
+  # actually responsible instead of every daemon sharing its rig.
+  if [ "$DRY_RUN" != "1" ] && [ -n "$POST_DEPLOY_SHA" ] && [ -n "${REFRESH_ALL_LABELS// /}" ]; then
+    PERDAEMON_NEW=""
+    # carry forward every existing entry NOT examined this cycle untouched —
+    # a rig can have daemons this run's discovery didn't see (e.g. a plist
+    # parse error) whose own last-known baseline must not be silently dropped.
+    if [ -f "$DAEMON_REFRESH_PERDAEMON_FILE" ]; then
+      while IFS=' ' read -r pd_label pd_sha; do
+        [ -n "$pd_label" ] || continue
+        case " $REFRESH_ALL_LABELS " in *" $pd_label "*) continue ;; esac
+        PERDAEMON_NEW="${PERDAEMON_NEW}${pd_label} ${pd_sha}"$'\n'
+      done < "$DAEMON_REFRESH_PERDAEMON_FILE"
+    fi
+    for pd_label in $REFRESH_ALL_LABELS; do
+      case " $REFRESH_GUARDED " in *" $pd_label "*) continue ;; esac
+      case " $REFRESH_FRESHFAIL " in *" $pd_label "*) continue ;; esac
+      PERDAEMON_NEW="${PERDAEMON_NEW}${pd_label} ${POST_DEPLOY_SHA}"$'\n'
+    done
+    printf '%s' "$PERDAEMON_NEW" > "$DAEMON_REFRESH_PERDAEMON_FILE" 2>/dev/null \
+      || warn "could not persist per-daemon baseline for rig $RIG at $DAEMON_REFRESH_PERDAEMON_FILE (non-fatal; next sweep falls back to the rig-wide marker for every label)"
+  fi
   case "$REFRESH_VERDICT" in
     OK|SKIPPED)
       if [ -n "${REFRESH_RESTARTED// /}" ]; then

@@ -1982,6 +1982,139 @@ REASON="$(field REASON "$OUT")"
 echo "$REASON" | grep -qi "verify by hand" && ok "T52 REASON keeps the conservative wording (coverage is partial: 1/2 entrypoints)" || nok "T52 conservative wording kept" "$REASON"
 ! echo "$REASON" | grep -qi "does NOT apply here" && ok "T52 REASON does NOT claim full-closure coverage" || nok "T52 wrongly claimed full closure" "$REASON"
 
+# ════════════════════════════════════════════════════════════════════════════
+# T53 (ga-0fawwr): per-daemon baseline narrowing. Simulates the reported
+# incident directly: the RIG-WIDE PRE_DEPLOY_SHA a caller feeds this script is
+# frozen at C0 (some OTHER, unmodeled daemon on the same rig is still stuck
+# GUARDED, so the caller's own shared marker never advanced past it) — but
+# com.test.bigclosure's OWN last-individually-clean point is C1 (a PREVIOUS
+# cycle already resolved the one real change to its closure, lib/shared.py,
+# and the caller recorded that as this label's DAEMON_BASELINE_OVERRIDES
+# entry). Nothing in bigclosure's closure changes again between C1 and C2
+# (POST) — only a DIFFERENT daemon's own dependency (lib/otherlib.py) does.
+# Pre-fix (or with the override ignored), bigclosure would be flagged
+# AFFECTED on every cycle regardless, purely because the wide C0..C2 window
+# still contains the OLD lib/shared.py change — exactly the "restart quase
+# todo ciclo" measured live in the bug report. Proves both halves together:
+# the false positive is suppressed AND a real one (otherdaemon — no override
+# yet, so it is evaluated against the wide window exactly like before this
+# fix) is not accidentally swept away with it.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t53
+mkdir -p "$RUNTIME/lib"
+cat > "$RUNTIME/lib/shared.py" <<<'def v(): return 1'
+cat > "$RUNTIME/lib/otherlib.py" <<<'def v(): return 1'
+cat > "$RUNTIME/daemons/bigclosure.py" <<'PYEOF'
+from lib import shared
+def index():
+    return shared.v()
+PYEOF
+cat > "$RUNTIME/daemons/otherdaemon.py" <<'PYEOF'
+from lib import otherlib
+def run():
+    return otherlib.v()
+PYEOF
+cat > "$RUNTIME/daemons/deploy_deps.json" <<'JSONEOF'
+{
+  "_generated_by": "scripts/gen_daemon_deps.py",
+  "daemons": {
+    "daemons/bigclosure.py": {
+      "label": "com.test.bigclosure",
+      "closure": ["daemons/bigclosure.py", "lib/shared.py"]
+    }
+  }
+}
+JSONEOF
+make_plist "$AGENTS" com.test.bigclosure "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/bigclosure.py"
+make_plist "$AGENTS" com.test.otherdaemon "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/otherdaemon.py"
+seed_running com.test.bigclosure 30001 "$STALE_LSTART"
+seed_running com.test.otherdaemon 30002 "$STALE_LSTART"
+seed_restart com.test.otherdaemon 30099 "$FRESH_LSTART"
+
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && git commit -q -m t53-base --allow-empty )
+SHA_C0=$(git -C "$RUNTIME" rev-parse HEAD)
+echo "def v(): return 2" > "$RUNTIME/lib/shared.py"
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && git commit -q -m t53-c1 --allow-empty )
+SHA_C1=$(git -C "$RUNTIME" rev-parse HEAD)
+echo "def v(): return 2" > "$RUNTIME/lib/otherlib.py"
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && GIT_AUTHOR_DATE="@$POST_COMMIT_EPOCH" GIT_COMMITTER_DATE="@$POST_COMMIT_EPOCH" git commit -q -m t53-c2 --allow-empty )
+SHA_C2=$(git -C "$RUNTIME" rev-parse HEAD)
+
+OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" \
+  PRE_DEPLOY_SHA="$SHA_C0" POST_DEPLOY_SHA="$SHA_C2" \
+  DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="" EXTRA_RUNTIME_ROOTS="" \
+  FORCE_RESTART_LABELS="" \
+  DAEMON_BASELINE_OVERRIDES="com.test.bigclosure $SHA_C1" \
+  LAUNCH_AGENTS_DIR="$AGENTS" LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" \
+  VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 DRY_RUN=0 \
+  bash "$HELPER" 2>/dev/null); RC=$?
+echo "$(field AFFECTED "$OUT")" | grep -q "com.test.bigclosure" \
+  && nok "T53 bigclosure must be downgraded out of AFFECTED (its own closure is clean since its override point C1)" "AFFECTED=[$(field AFFECTED "$OUT")]" \
+  || ok "T53 bigclosure downgraded out of AFFECTED via its per-daemon override"
+echo "$(field AFFECTED "$OUT")" | grep -q "com.test.otherdaemon" \
+  && ok "T53 otherdaemon (no override yet) still correctly AFFECTED via the wide window — real staleness never hidden" \
+  || nok "T53 otherdaemon affected" "$(field AFFECTED "$OUT")"
+grep -q "com.test.bigclosure" "$MOCK/kicks.log" 2>/dev/null \
+  && nok "T53 bigclosure must not be kickstarted" "log: $(cat "$MOCK/kicks.log")" \
+  || ok "T53 bigclosure never kickstarted (downgrade reaches Step 4 too, not just the AFFECTED report)"
+grep -q "com.test.otherdaemon" "$MOCK/kicks.log" 2>/dev/null \
+  && ok "T53 otherdaemon correctly kickstarted" \
+  || nok "T53 otherdaemon kickstart" "log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T54 (ga-0fawwr): an override whose sha resolves to a real commit but is NOT
+# an ancestor of POST_DEPLOY_SHA (a diverged/rewritten branch, or simply a
+# stale/foreign value that ended up in the wrong rig's file) must be ignored
+# outright — the same ancestor-safety contract story-delivery.sh's own
+# rig-wide marker already enforces. Falls back to the ORIGINAL wide-window
+# verdict: still correctly AFFECTED, never silently cleared by an unusable
+# override.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t54
+mkdir -p "$RUNTIME/lib"
+cat > "$RUNTIME/lib/shared.py" <<<'def v(): return 1'
+cat > "$RUNTIME/daemons/bigclosure.py" <<'PYEOF'
+from lib import shared
+def index():
+    return shared.v()
+PYEOF
+cat > "$RUNTIME/daemons/deploy_deps.json" <<'JSONEOF'
+{
+  "_generated_by": "scripts/gen_daemon_deps.py",
+  "daemons": {
+    "daemons/bigclosure.py": {
+      "label": "com.test.bigclosure",
+      "closure": ["daemons/bigclosure.py", "lib/shared.py"]
+    }
+  }
+}
+JSONEOF
+make_plist "$AGENTS" com.test.bigclosure "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/bigclosure.py"
+seed_running com.test.bigclosure 30101 "$STALE_LSTART"
+
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && git commit -q -m t54-base --allow-empty )
+SHA_C0=$(git -C "$RUNTIME" rev-parse HEAD)
+git -C "$RUNTIME" checkout -q --orphan t54-side
+echo side > "$RUNTIME/side.txt"
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && git commit -q -m t54-side --allow-empty )
+SHA_SIDE=$(git -C "$RUNTIME" rev-parse HEAD)
+git -C "$RUNTIME" checkout -q main 2>/dev/null || git -C "$RUNTIME" checkout -q master
+echo "def v(): return 2" > "$RUNTIME/lib/shared.py"
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && GIT_AUTHOR_DATE="@$POST_COMMIT_EPOCH" GIT_COMMITTER_DATE="@$POST_COMMIT_EPOCH" git commit -q -m t54-c1 --allow-empty )
+SHA_C1=$(git -C "$RUNTIME" rev-parse HEAD)
+
+OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" \
+  PRE_DEPLOY_SHA="$SHA_C0" POST_DEPLOY_SHA="$SHA_C1" \
+  DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="" EXTRA_RUNTIME_ROOTS="" \
+  FORCE_RESTART_LABELS="" \
+  DAEMON_BASELINE_OVERRIDES="com.test.bigclosure $SHA_SIDE" \
+  LAUNCH_AGENTS_DIR="$AGENTS" LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" \
+  VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 DRY_RUN=0 \
+  bash "$HELPER" 2>/dev/null); RC=$?
+echo "$(field AFFECTED "$OUT")" | grep -q "com.test.bigclosure" \
+  && ok "T54 non-ancestor override safely ignored — falls back to the wide-window verdict (still AFFECTED)" \
+  || nok "T54 affected" "AFFECTED=[$(field AFFECTED "$OUT")]"
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"

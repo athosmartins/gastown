@@ -358,6 +358,11 @@
 #   DRY_RUN           1 = report only, no kickstart/verify (default 0)
 #   DRAIN_CMD_<label> optional graceful-drain command for a sensitive daemon
 #                     (<label> sanitized: non-alnum → _)
+#   DAEMON_BASELINE_OVERRIDES (ga-0fawwr) optional per-daemon baseline
+#                     narrowing — one "<label> <sha>" pair per line. See the
+#                     big comment at its point of use (end of Step 3, just
+#                     before Step 4) for the full rationale. Empty (default)
+#                     = identical behavior to before this fix.
 # Test seams:
 #   LAUNCH_AGENTS_DIR (default $HOME/Library/LaunchAgents)
 #   LAUNCHCTL_BIN     (default launchctl)
@@ -370,6 +375,7 @@ set -uo pipefail
 RUNTIME_DIR="${RUNTIME_DIR:-}"
 PRE_DEPLOY_SHA="${PRE_DEPLOY_SHA:-}"
 POST_DEPLOY_SHA="${POST_DEPLOY_SHA:-}"
+DAEMON_BASELINE_OVERRIDES="${DAEMON_BASELINE_OVERRIDES:-}"
 # ga-agracx: OPTIONAL attribution-narrowing inputs, distinct from PRE/POST_
 # DEPLOY_SHA above. PRE/POST_DEPLOY_SHA is the WIDE runtime-checkout window
 # (correct for "is ANY daemon/job stale on this rig") — when the runtime
@@ -546,6 +552,13 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
     proof="not_verified"
   fi
   echo "VERDICT=$verdict"
+  # ga-0fawwr: every label THIS run's discovery actually examined (empty on
+  # every early-precondition emit above, before discovery ever ran — nothing
+  # to report). Lets the caller (story-delivery.sh) advance a per-daemon
+  # baseline marker for whichever labels are NOT in GUARDED/FRESH_FAIL below,
+  # independently of every other daemon on the same rig — see
+  # DAEMON_BASELINE_OVERRIDES above for the full mechanism this feeds.
+  echo "ALL_LABELS=${DAEMON_LABELS:-}"
   echo "AFFECTED=${AFFECTED:-}"
   # wa-xokje: always present (even empty), same convention as
   # PARSE_ERROR_LOADED/UNLOADED below — a caller can check it unconditionally
@@ -1662,6 +1675,169 @@ for fr_label in $FORCE_RESTART_LABELS; do
   esac
 done
 AFFECTED="$(echo "$AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+
+# ── per-daemon baseline narrowing (ga-0fawwr) ─────────────────────────────────
+# THE BUG THIS BLOCK FIXES: everything above computes ONE shared $CHANGED
+# window (this call's own PRE_DEPLOY_SHA..POST_DEPLOY_SHA) and applies it to
+# EVERY daemon on the rig alike. The caller (story-delivery.sh) only ever
+# advances that shared PRE_DEPLOY_SHA when the WHOLE rig comes back OK|SKIPPED
+# in one cycle — deliberately (ga-gokm6/ga-3bdttu): advancing it on a partial
+# pass would hide a real unresolved staleness from every future sweep, not
+# just this one. But the two facts compound badly: a rig with even ONE daemon
+# that legitimately needs a human's guarded restart (and can stay that way for
+# days — e.g. inbound_sweep.py's own restart_guard_scripts deliberately defers
+# while it is "between chats") freezes that SAME shared window for every OTHER
+# daemon too. A daemon with a large import closure (inbound_sweep.py: 53
+# files, the largest in the WA fleet) then intersects SOME file in that
+# ever-widening window on nearly every cycle, regardless of whether anything
+# in ITS OWN closure specifically changed since it was last individually
+# clean — measured live: 115 of 194 cycles NEEDS_GUARDED_RESTART over 5
+# days/507 files of accumulated drift, with the rig-wide baseline advancing
+# only twice in that window.
+#
+# THE FIX: the caller additionally tracks, per label, the POST_DEPLOY_SHA of
+# the last cycle in which THAT SPECIFIC label was not stuck (not in GUARDED,
+# not in FRESH_FAIL) — see DAEMON_BASELINE_OVERRIDES above — and we use it
+# here to ask a NARROWER, label-specific question for any label the wide/
+# shared computation above already flagged AFFECTED: does this label's
+# closure ALSO intersect the changed set since ITS OWN last-clean point,
+# specifically? This can only ever REMOVE a label from AFFECTED, never add
+# one: a label with no override (every label, the first cycle this ships) or
+# an unusable one (see the ancestor checks below) is left completely
+# untouched — byte-for-byte identical to this script's behavior before this
+# fix. A label that fails the narrow recheck too (its OWN window ALSO
+# intersects its closure) stays in AFFECTED exactly as before; nothing here
+# ever hides a real, unresolved restart need — it only stops re-litigating one
+# that a DIFFERENT sibling daemon's own stuck state was incidentally widening.
+#
+# Runs AFTER FORCE_RESTART_LABELS is folded in (never reconsiders a static
+# always-restart override — that list is direct operator/runbook intent, not
+# closure-diff evidence) and BEFORE Step 4, so a downgraded label never
+# reaches the restart/verify machinery at all this cycle — same as if it had
+# never been flagged.
+if [ -n "${DAEMON_BASELINE_OVERRIDES// /}" ] && [ -n "${AFFECTED// /}" ]; then
+  # git diff --name-only <sha>..POST_DEPLOY_SHA, memoized per distinct <sha> —
+  # several labels sharing the same last-resolved cycle (the common case) pay
+  # for exactly one git invocation, not one per label.
+  ga0fawwr_narrow_changed() {  # ga0fawwr_narrow_changed <sha> -> multiline changed set
+    local sha="$1" cache
+    cache="$DISCO_DIR/.ga0fawwr-changed.$(echo "$sha" | tr -c 'A-Za-z0-9' '_')"
+    [ -f "$cache" ] || git -C "$RUNTIME_DIR" diff --name-only "$sha" "$POST_DEPLOY_SHA" > "$cache" 2>/dev/null
+    cat "$cache" 2>/dev/null || true
+  }
+
+  # is <label> still affected once measured against its OWN narrower <changed>
+  # set? Same signals Step 3 above already trusts (deploy_deps.json closure
+  # when it covers an entry, else direct/basename + import-stem + routes-hop +
+  # template), replicated here rather than shared with Step 3's loop — that
+  # loop is optimized to run once for the WHOLE rig against the wide $CHANGED;
+  # this one runs rarely (only for a label already flagged AFFECTED that also
+  # has a usable override) against a label-specific narrow set, so a second,
+  # smaller implementation is the lower-risk choice over threading a second
+  # changed-set through the shared one.
+  ga0fawwr_label_hits() {  # ga0fawwr_label_hits <label> <changed-multiline> -> 0 if still affected
+    local label="$1" changed="$2" e eb stem tmpl tb pat covered=0
+    local entries json_entries="" adhoc_entries=""
+    entries="$(cat "$DISCO_DIR/$label" 2>/dev/null || true)"
+    [ -n "${entries// /}" ] || return 1
+    for e in $entries; do
+      if json_covers_entry "$e"; then json_entries="$json_entries $e"; else adhoc_entries="$adhoc_entries $e"; fi
+    done
+
+    if [ -n "${json_entries// /}" ] && [ -f "$DEPLOY_DEPS_JSON" ]; then
+      local hit
+      hit="$(CHANGED_FOR_DDJ="$changed" ENTRIES_FOR_DDJ="$json_entries" python3 - "$DEPLOY_DEPS_JSON" <<'PY' 2>/dev/null
+import json, os, sys
+try:
+    daemons = json.load(open(sys.argv[1], encoding="utf-8"))["daemons"]
+except Exception:
+    sys.exit(1)
+changed = {ln for ln in os.environ.get("CHANGED_FOR_DDJ", "").splitlines() if ln}
+entries = set(os.environ.get("ENTRIES_FOR_DDJ", "").split())
+for path, info in daemons.items():
+    if path not in entries or not isinstance(info, dict):
+        continue
+    closure = {x for x in (info.get("closure") or []) if isinstance(x, str)}
+    if changed & closure:
+        print("HIT")
+        break
+PY
+)"
+      [ "$hit" = "HIT" ] && return 0
+    fi
+    [ -n "${adhoc_entries// /}" ] || return 1
+
+    local c_py c_stems="" c_tpl_basenames py_basenames
+    c_py="$(echo "$changed" | grep -E '\.py$' || true)"
+    c_tpl_basenames="$(echo "$changed" | grep -E '\.(html|htm|jinja2?|j2)$' | while read -r f; do [ -n "$f" ] && basename "$f"; done)"
+    py_basenames="$(echo "$c_py" | while read -r f; do [ -n "$f" ] && basename "$f"; done)"
+    # tests/**, docs/**, *.md never contribute a stem — same universal claim
+    # DEFAULT_NO_RESTART_PATTERNS already establishes for the wide computation.
+    set -f
+    while IFS= read -r pyf; do
+      [ -n "$pyf" ] || continue
+      covered=0
+      for pat in $DEFAULT_NO_RESTART_PATTERNS; do
+        # shellcheck disable=SC2254  # deliberate glob match, not literal
+        case "$pyf" in $pat) covered=1; break ;; esac
+      done
+      [ "$covered" -eq 1 ] || c_stems="$c_stems $(basename "$pyf" .py)"
+    done <<< "$c_py"
+    set +f
+
+    for e in $adhoc_entries; do
+      echo "$c_py" | grep -qxF "$e" && return 0
+      eb="$(basename "$e")"
+      echo "$py_basenames" | grep -qxF "$eb" && return 0
+    done
+    for stem in $c_stems; do
+      for e in $adhoc_entries; do
+        daemon_imports_stem "$RUNTIME_DIR/$e" "$stem" && return 0
+        daemon_imports_stem_via_routes "$e" "$stem" && return 0
+      done
+    done
+    if [ -n "${c_tpl_basenames// /}" ]; then
+      for e in $adhoc_entries; do
+        [ -f "$RUNTIME_DIR/$e" ] || continue
+        while IFS= read -r tmpl; do
+          [ -n "$tmpl" ] || continue
+          tb="$(basename "$tmpl")"
+          echo "$c_tpl_basenames" | grep -qxF "$tb" && return 0
+        done < <(daemon_template_names "$RUNTIME_DIR/$e")
+      done
+    fi
+    return 1
+  }
+
+  NARROWED_AFFECTED=""
+  for label in $AFFECTED; do
+    # never reconsider a static always-restart override — see comment above.
+    case " $FORCE_RESTART_LABELS " in
+      *" $label "*) NARROWED_AFFECTED="$NARROWED_AFFECTED $label"; continue ;;
+    esac
+    override_sha="$(printf '%s\n' "$DAEMON_BASELINE_OVERRIDES" | awk -v l="$label" '$1==l{print $2; exit}')"
+    if [ -z "$override_sha" ] \
+       || [ "$override_sha" = "$PRE_DEPLOY_SHA" ] \
+       || ! git -C "$RUNTIME_DIR" cat-file -e "${override_sha}^{commit}" 2>/dev/null \
+       || ! git -C "$RUNTIME_DIR" merge-base --is-ancestor "$override_sha" "$POST_DEPLOY_SHA" 2>/dev/null \
+       || ! git -C "$RUNTIME_DIR" merge-base --is-ancestor "$PRE_DEPLOY_SHA" "$override_sha" 2>/dev/null; then
+      # no usable, strictly-narrower override for this label (missing, equal
+      # to the wide baseline already used above, unresolvable, or not
+      # actually between PRE_DEPLOY_SHA and POST_DEPLOY_SHA in this rig's
+      # real history — a rebase/force-push/wrong-rig value) — leave it in
+      # AFFECTED untouched, exactly as before this fix.
+      NARROWED_AFFECTED="$NARROWED_AFFECTED $label"
+      continue
+    fi
+    narrow_changed="$(ga0fawwr_narrow_changed "$override_sha")"
+    if ga0fawwr_label_hits "$label" "$narrow_changed"; then
+      NARROWED_AFFECTED="$NARROWED_AFFECTED $label"
+    else
+      log "ga-0fawwr: $label downgraded out of AFFECTED — its own closure is clean since $override_sha (its individually-tracked last-clean point), even though the rig-wide window ($PRE_DEPLOY_SHA..$POST_DEPLOY_SHA) still intersects it via a DIFFERENT daemon's unresolved staleness."
+    fi
+  done
+  AFFECTED="$(echo "$NARROWED_AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+fi
 
 if [ -z "${AFFECTED// /}" ]; then
   # ga-vmq1i: py/template files DID change but detection (a bounded entrypoint
