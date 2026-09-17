@@ -163,7 +163,7 @@ grep -q 'def is_overdue' "$DISPATCHER" \
   && ok "is_overdue predicate present" || bad "is_overdue predicate missing"
 grep -q 'GATE_MARKER_HARD_AGE_SECONDS' "$DISPATCHER" \
   && ok "hard-age ceiling is a configurable GATE_* tunable (matches house convention)" || bad "hard-age threshold not configurable"
-OVERDUE_LINE=$(grep -n 'map(select(is_overdue' "$DISPATCHER" | head -1 | cut -d: -f1)
+OVERDUE_LINE=$(grep -n 'map(select((is_overdue' "$DISPATCHER" | head -1 | cut -d: -f1)
 PRIO_AGED_LINE=$(grep -n 'is_aged))' "$DISPATCHER" | grep -v 'is_aged | not' | head -1 | cut -d: -f1)
 BROKEN_LINE=$(grep -n 'map(select(has_rebase_fail))' "$DISPATCHER" | head -1 | cut -d: -f1)
 if [ -n "$OVERDUE_LINE" ] && [ -n "$PRIO_AGED_LINE" ] && [ -n "$BROKEN_LINE" ] \

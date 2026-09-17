@@ -933,8 +933,21 @@ classify_sibling_run() {
 # data loss, per this function's own docstring above). "unknown" is
 # gate-done.md's own placeholder for an unresolved rig, not a confirmed
 # identity, so it is never treated as a match on either side.
+#
+# ga-l7mvtw: a THIRD output, "SHA_STALE <id>", fires when the caller passes
+# its own current branch_sha (3rd arg) and the candidate's OWN recorded
+# branch_sha differs from it — i.e. the branch has moved on since that
+# sibling started, regardless of how young the sibling is by wall-clock age.
+# Callers treat it exactly like STALE (supersede and proceed): a live-but-
+# reviewing-an-abandoned-commit sibling is exactly as moot as an old dead
+# one (wa-54f62: a young "LIVE" sibling kept a fixed, newer marker waiting
+# 13 minutes behind a review of a commit its own author had already
+# abandoned). The comparison only runs when BOTH shas are known — an older
+# sibling bead predating this field, or a caller that could not resolve its
+# own current sha, falls through to the pre-existing age-only classification
+# unchanged.
 live_sibling_run_for_branch() {
-  local branch="$1" rig="$2" now_epoch run_json count i id status desc started started_epoch age_min verdict run_rig
+  local branch="$1" rig="$2" current_sha="${3:-}" now_epoch run_json count i id status desc started started_epoch age_min verdict run_rig sib_sha
   [ -z "$branch" ] && return 0
   case "$rig" in ''|unknown) return 0 ;; esac
   now_epoch=$(date +%s)
@@ -966,6 +979,15 @@ live_sibling_run_for_branch() {
     run_rig=$(printf '%s\n' "$desc" | grep -E '^rig:' | head -1 | sed 's/^rig: *//' || true)
     case "$run_rig" in ''|unknown) continue ;; esac
     [ "$run_rig" = "$rig" ] || continue
+    # ga-l7mvtw: a sibling reviewing a DIFFERENT commit than the branch's
+    # CURRENT tip is reviewing code the author already superseded — moot
+    # regardless of age. See this function's header for the full rationale.
+    if [ -n "$current_sha" ]; then
+      sib_sha=$(printf '%s\n' "$desc" | grep -E '^branch_sha:' | head -1 | sed 's/^branch_sha: *//' || true)
+      if [ -n "$sib_sha" ] && [ "$sib_sha" != "$current_sha" ]; then
+        echo "SHA_STALE $id"; return 0
+      fi
+    fi
     started=$(printf '%s\n' "$desc" | grep -E '^started_at:' | head -1 | sed 's/^started_at: *//' || true)
     if [ -z "$started" ]; then echo "LIVE $id"; return 0; fi   # no ts → conservative LIVE
     started_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "${started%%Z*}" "+%s" 2>/dev/null \
@@ -1130,6 +1152,46 @@ gate_bead_has_prior_sha_fail() {
   labels=$(bd -C "$city" show "$bead" --json 2>/dev/null \
     | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || echo "")
   gate_labels_have_sha_fail "$labels" "$sha"
+}
+
+# ── ga-l7mvtw: stale-reviewed-SHA fix-attempt guard ───────────────────────────
+# Production observed a marker get claimed and spend a full ~14-minute
+# reviewer run reviewing a commit an EARLIER, independent gate-run had
+# already rejected (wa-54f62: marker ga-ccrjxk / gate-run ga-i6pcpc reviewed
+# 4e30a7cbc after a prior run had already stamped it gate-sha-failed — the
+# author had since pushed the real fix, 3c40bc245, under a NEW marker left
+# waiting behind the stale one). The claim-time check (dispatcher Step 4b)
+# stops that exact case from being spawned at all. This pure decision is the
+# FINALIZE-time backstop for the narrower remaining race: a run whose
+# reviewed SHA had no stamp yet when claimed (nothing to catch it at claim
+# time) but the branch moved on WHILE the review was in flight. Either way, a
+# FAIL verdict against a commit the author already superseded must never
+# count against gate:fix-attempt.
+#
+# gate_sha_stale_action <reviewed_sha> <current_tip> — PURE (no IO, set -e
+# safe), unit-tested by gate-stale-sha-fix-attempt.selftest.sh.
+#   stale   — both known and DIFFERENT: the branch has moved past the commit
+#             this run reviewed. The finalize fix-attempt block skips the
+#             bump for this run (ga-l7mvtw).
+#   current — both known and EQUAL: this run reviewed the branch's actual
+#             tip. Proceed with the normal fix-attempt bump.
+#   unknown — either side is empty (current tip unresolved — fetch/rig
+#             failure, or a pre-ga-l7mvtw run bead with no recorded sha):
+#             cannot PROVE staleness, so default to the SAME handling as
+#             "current" — same error-vs-empty doctrine as
+#             gate_bead_has_prior_sha_fail above. A false "stale" would let
+#             a genuine FAIL dodge the attempt cap forever (unsafe); a false
+#             "current" only costs one ordinary retry cycle (the safe
+#             direction to err in).
+gate_sha_stale_action() {
+  local reviewed="$1" current="$2"
+  if [ -z "$reviewed" ] || [ -z "$current" ]; then
+    echo "unknown"; return 0
+  fi
+  if [ "$reviewed" != "$current" ]; then
+    echo "stale"; return 0
+  fi
+  echo "current"
 }
 
 # ── ga-lxz5w: SAME-BEAD SIBLING-BRANCH + LATE-HOLD pre-merge checks ───────────
@@ -3427,6 +3489,120 @@ EOF_GATE_EXILE_IDS
 }
 # SELFTEST-EXTRACT gate-exile-watchdog: END
 
+# SELFTEST-EXTRACT gate-exile-recovery: BEGIN
+# gate_exile_recovery_sweep <markers_json>
+# ga-0ye7ar (wa-ycyf8, 2026-09-17): complements gate_exile_watchdog_sweep
+# (ga-faw5o) above with the OPPOSITE remediation. That function waits
+# $escalate_after (86400s/24h default) then GIVES UP on a still-exiled
+# marker and hands it to the Mayor. This one runs every sweep and clears
+# the exile IMMEDIATELY, the moment the underlying cause (a real merge
+# conflict) no longer holds — before ever waiting on a human.
+#
+# wa-ycyf8: a marker exiled by two TRANSIENT auto-rebase failures ("attempt
+# 2/3") sat 7h with a clean merge-tree the ENTIRE time. Nothing re-checked
+# the cause: the healthy tiers never reach an exiled marker while the queue
+# has anything else queued (has_rebase_fail sinks to the last of the 7
+# tiers in the marker-select block below), and the 24h watchdog is a much
+# slower, last-resort backstop, not a same-incident fix. Second time the
+# Mayor had to clear this by hand (wa-llq1a/wa-4zmm1, 11/09).
+#
+# Scope: has_rebase_fail markers only (0-1 in a healthy queue — cheap).
+# Reuses rig_merge_has_conflict (ga-ljbx/ga-78n2z), the SAME union-aware
+# pre-check the live rebase-attempt path already trusts, never a bespoke
+# merge-tree call that could disagree with it.
+#
+# Sets GATE_EXILE_RECOVERY_CLEARED_IDS (newline-separated marker ids this
+# call actually cleared) as its result — deliberately NOT stdout: log()/
+# warn() in this file write to stdout (see log(), ~line 4548), so a caller
+# capturing this function's stdout via $(...) would get diagnostic text
+# interleaved with the id list. A plain global, read by the caller right
+# after the (bare, uncaptured) call below, avoids that trap — the same
+# reason every other multi-step result in this file (MARKER_ID, COUNT, …)
+# is only ever captured around a pure jq pipeline, never around a function
+# that also logs.
+#
+# Deliberately NOT re-injecting a cleared marker into the caller's copy of
+# $MARKERS_JSON for the marker-select block further below: this sweep's
+# selection still sees it as exiled (tier 7, loses as always behind a
+# non-empty queue) and only rejoins the healthy tiers on the NEXT sweep's
+# fresh fetch — matching the Aceite criterion ("volta ao tier normal na
+# proxima varredura"). The cleared ids ARE consumed immediately, though, to
+# keep gate_exile_watchdog_sweep from acting on stale pre-recovery labels
+# in the SAME sweep (see the Step 0b-0 call site below).
+gate_exile_recovery_sweep() {
+  local markers_json="$1"
+  GATE_EXILE_RECOVERY_CLEARED_IDS=""
+  if [ "${GATE_EXILE_RECOVERY_ENABLED:-1}" != "1" ]; then
+    return 0
+  fi
+  local ids marker_id m_branch verdict attempt since_lines since_lbl still_exiled
+  ids=$(printf '%s\n' "$markers_json" | jq -r '
+    .[] | select(
+      ((.labels // []) | map(select(test("^gate:(rebase-attempt|exiled-tier5):[0-9]+$"))) | length) > 0
+    ) | .id' 2>/dev/null || true)
+  [ -z "$ids" ] && return 0
+  while IFS= read -r marker_id; do
+    [ -z "$marker_id" ] && continue
+    DESC=$(printf '%s\n' "$markers_json" | jq -r --arg id "$marker_id" '.[] | select(.id == $id) | .description // ""' 2>/dev/null || echo "")
+    m_branch=$(extract "branch")
+    if [ -z "$m_branch" ]; then
+      warn "gate_exile_recovery_sweep: marker $marker_id has no branch: field — skipping clean-merge recheck this sweep."
+      continue
+    fi
+    RIG=$(extract "rig"); BEAD_ID=$(extract "bead_id"); BEAD_RIG=$(extract "bead_rig")
+    if ! gate_resolve_rig_context; then
+      warn "gate_exile_recovery_sweep: cannot resolve rig context for exiled marker $marker_id (rig=$RIG) — skipping this sweep."
+      continue
+    fi
+    if [ -z "$(rig_resolve_commit "origin/$m_branch")" ]; then
+      warn "gate_exile_recovery_sweep: origin/$m_branch does not resolve for marker $marker_id (unfetched or force-pushed away) — skipping this sweep."
+      continue
+    fi
+    verdict=$(rig_merge_has_conflict "origin/$DEFAULT_BRANCH" "origin/$m_branch")
+    [ "$verdict" = "0" ] || continue
+    attempt=$(read_rebase_attempt "$marker_id")
+    bd -C "$GC_CITY" label remove "$marker_id" "gate:exiled-tier5:$attempt"      -q 2>/dev/null || true
+    bd -C "$GC_CITY" label remove "$marker_id" "gate:rebase-attempt:$attempt"    -q 2>/dev/null || true
+    bd -C "$GC_CITY" label remove "$marker_id" "gate:rebase-fail-count:$attempt" -q 2>/dev/null || true
+    # gate:exiled-since carries a timestamp, not a bounded attempt counter, so
+    # (unlike the three labels above) its exact value can't be reconstructed —
+    # read it back off the same $markers_json snapshot instead.
+    since_lines=$(printf '%s\n' "$markers_json" | jq -r --arg id "$marker_id" '
+      .[] | select(.id == $id) | (.labels // [])[] | select(test("^gate:exiled-since:[0-9]+$"))' 2>/dev/null || true)
+    while IFS= read -r since_lbl; do
+      [ -z "$since_lbl" ] && continue
+      bd -C "$GC_CITY" label remove "$marker_id" "$since_lbl" -q 2>/dev/null || true
+    done <<EOF_SINCE
+$since_lines
+EOF_SINCE
+    bd -C "$GC_CITY" label remove "$marker_id" "gate:exile-escalated" -q 2>/dev/null || true
+    # ga-0ye7ar (self-audit before submission): verify the removals actually
+    # stuck via a fresh read-back BEFORE claiming success anywhere — every
+    # `bd label remove` above is fire-and-forget (`|| true`), so a silent
+    # Dolt write failure must not be followed by a bead comment asserting the
+    # exile is cleared, and must not exclude the marker from the watchdog
+    # below (per this readback it is, in that case, still actually exiled).
+    # Mirrors the ga-ehbw5 pattern (gate-done's own marker-creation
+    # verification) and closes the exact "comment claims an action neither
+    # confirmed nor completed" gap ga-faw5o rounds 2-3 fixed in the sibling
+    # watchdog function above — the same defect class, one function over.
+    still_exiled=$(bd -C "$GC_CITY" show "$marker_id" --json 2>/dev/null \
+      | jq -r 'if type=="array" then .[0] else . end | ((.labels // []) | map(select(test("^gate:(rebase-attempt|exiled-tier5):[0-9]+$"))) | length) > 0' 2>/dev/null || echo "true")
+    if [ "$still_exiled" = "false" ]; then
+      warn "gate_exile_recovery_sweep: cleared rebase-fail exile on marker $marker_id (verified by re-read) — origin/$m_branch merges into origin/$DEFAULT_BRANCH with zero conflicts (ga-0ye7ar)."
+      bd -C "$GC_CITY" comment "$marker_id" "Gate auto-recovery (ga-0ye7ar): cleared the rebase-fail exile automatically — origin/$m_branch now merges into origin/$DEFAULT_BRANCH with zero conflicts (a real merge-tree recheck, not an assumption), confirmed by re-reading the marker after the label removals. This marker rejoins the healthy tiers on the next sweep instead of waiting for a human or the 24h exile-watchdog escalation." 2>/dev/null || true
+      GATE_EXILE_RECOVERY_CLEARED_IDS="$GATE_EXILE_RECOVERY_CLEARED_IDS
+$marker_id"
+    else
+      warn "gate_exile_recovery_sweep: attempted to clear rebase-fail exile on marker $marker_id but a re-read still shows it exiled (a label remove call may have silently failed) — leaving it exiled for a later sweep to retry; NOT commenting, NOT excluding it from the watchdog."
+    fi
+  done <<EOF_IDS
+$ids
+EOF_IDS
+  return 0
+}
+# SELFTEST-EXTRACT gate-exile-recovery: END
+
 # is_transient_spawn_error <spawn_err_text> — "1" if the captured stderr from a
 # failed `gc session new` reviewer spawn looks like a TRANSIENT connectivity
 # blip (Dolt/MySQL connection dropped mid-call), "0" otherwise. Pure (no I/O),
@@ -4840,6 +5016,12 @@ fi
 # the quota-stop comment above), so a "hold" set while finalizing a PRIOR
 # bead this sweep must never leak into THIS bead's stamp.
 GATE_SHA_FAIL_CLASS="code"
+# ga-39l9z2: sibling reset, same leak-across-beads reasoning as
+# GATE_SHA_FAIL_CLASS above. Set to 1 only at the one site (the merge-time
+# textual-conflict downgrade below) where the reviewers already approved
+# this exact content and the ONLY outstanding work is a rebase — see that
+# site's own comment for why it is scoped narrower than "hold" in general.
+GATE_NEEDS_REBASE_NOT_FIX="0"
 # SELFTEST-EXTRACT finalize-failclass-reset: BEGIN
 # ga-mcapdq: the comment above assumes a pre-set FAIL entering this function
 # always came from "the reviewer/content verdict computed earlier" — true
@@ -5632,6 +5814,24 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       # merge-time-conflict/rebase, branch-content-mismatch) is a git/infra outcome — the code itself
       # already PASSED review; nothing here judged the fix's content. Applies to the whole block
       # regardless of which sub-reason below fires.
+      if [ "$MERGE_RESULT" = "failed_merge_time_conflict" ]; then
+        # ga-39l9z2 (wa-dnzu0): a PURE textual conflict, detected by
+        # rig_merge_has_conflict BEFORE any rebase/merge was even attempted —
+        # no content-loss risk to weigh (nothing was written). This is the
+        # narrowest, safest member of the failed_* group above: the reviewers
+        # approved this content, main simply moved, and the only outstanding
+        # work is a mechanical rebase. Downstream (the fix-attempt-cap block)
+        # must not spend one of GATE_FIX_CAP's limited slots on it, or 3
+        # unlucky merge-time races exhaust the cap and escalate needs-human on
+        # code nobody ever asked to change (this is exactly what happened to
+        # wa-dnzu0: attempt 3/3 from a rebase race, zero review rejections).
+        # Deliberately NOT extended to failed_merge_time_rebase — that result
+        # is reached only AFTER an attempted rebase/merge failed, including
+        # the ga-m07gc content-verification refusal, which can itself signal
+        # a real problem worth a human's eyes after repeated failures; it
+        # keeps the existing cap-then-escalate path unchanged.
+        GATE_NEEDS_REBASE_NOT_FIX=1
+      fi
       if [ "$MERGE_RESULT" = "failed_branch_content_mismatch" ]; then
         # ga-pfgnv: same diagnostic spirit as Step 10's ga-y9a1d check (a
         # human needs to know this is a content-mismatch, not a generic git
@@ -6607,6 +6807,22 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
   if [ -n "$BEAD_ID" ] && [ "$DRY_RUN" != "1" ]; then
     GATE_FIX_CAP=3
 
+    # ga-l7mvtw: has the branch moved past the commit THIS run reviewed?
+    # Fresh fetch+resolve — Phase C can finalize in a LATER process/sweep
+    # than the one that claimed this run and spawned reviewers, so a
+    # variable set at claim time cannot be trusted here; re-derive live.
+    # See gate_sha_stale_action's header (above the lib-only guard) for the
+    # full rationale. FAIL-OPEN: an unresolved current tip degrades to
+    # "unknown", which gate_sha_stale_action treats as "current" (bump
+    # normally) — never silently treated as "stale" (which would let a
+    # genuine FAIL dodge the attempt cap).
+    _GATE_L7MVTW_CURRENT_TIP=""
+    if [ -n "$BRANCH" ]; then
+      git_rig fetch origin "$BRANCH" --quiet 2>/dev/null || true
+      _GATE_L7MVTW_CURRENT_TIP=$(rig_resolve_commit "origin/$BRANCH" 2>/dev/null || echo "")
+    fi
+    GATE_SHA_STALE_ACTION=$(gate_sha_stale_action "$BRANCH_SHA" "$_GATE_L7MVTW_CURRENT_TIP")
+
     # Read the source bead's current labels (story beads live in the HQ/city DB).
     # ga-h199q: routed through the read-cache shim — first read in the FAIL
     # self-healing block (no prior write to THIS bead in this invocation to
@@ -6662,7 +6878,137 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       bd -C "$BEAD_CITY" label add "$BEAD_ID" "$(gate_sha_fail_label "$BRANCH_SHA" "${GATE_SHA_FAIL_CLASS:-code}")" -q 2>/dev/null || true
     fi
 
-    if [ "$PREV_ATTEMPT" -ge "$GATE_FIX_CAP" ]; then
+    if [ "$GATE_NEEDS_REBASE_NOT_FIX" = "1" ]; then
+      # (a2) MERGE-MECHANICAL FAILURE AFTER ALL-PASS — needs a rebase, not a
+      # fix. ga-39l9z2 (wa-dnzu0): this used to fall into the SAME
+      # PREV_ATTEMPT/cap machinery as a genuine review rejection below,
+      # silently consuming a gate:fix-attempt slot for work whose content the
+      # reviewers already approved (GATE_SHA_FAIL_CLASS=hold, ga-4cy2t,
+      # confirms this) — 3 unlucky merge-time races could exhaust
+      # GATE_FIX_CAP and escalate needs-human on code nobody ever asked to be
+      # rewritten. This branch never touches gate:fix-attempt:*; it labels
+      # gate:needs-rebase instead of gate:needs-fix, mirroring the existing
+      # pre-review pool-return convention (ga-tz0op, same file, search
+      # "REBASE_AUTHOR_IS_POOL") rather than inventing a new one.
+      log "Marking $BEAD_ID gate:needs-rebase (merge-mechanical failure after ALL-PASS, ga-39l9z2) — NOT counted as a fix attempt."
+      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing"    -q 2>/dev/null || true  # wa-qq33j: clear in-review state
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"  -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatching" -q 2>/dev/null || true
+
+      # ga-jyox/ga-ipf6: same live-named-crew-author check the needs-fix path
+      # uses below — a merge-time conflict races a still-live author's
+      # session exactly as much as a genuine review FAIL does; "the failure
+      # was mechanical" does not make a stranger dispatch on top of a live
+      # session any safer.
+      REBASE_FAIL_AUTHOR_ALIVE=$(author_is_alive "$AUTHOR")
+      _NR_RESOLVED_AUTHOR=$(resolve_recycled_author "$AUTHOR" "$AUTHOR_AGENT" "$REBASE_FAIL_AUTHOR_ALIVE")
+      if [ "$_NR_RESOLVED_AUTHOR" != "$AUTHOR" ]; then
+        AUTHOR="$_NR_RESOLVED_AUTHOR"
+        REBASE_FAIL_AUTHOR_ALIVE=1
+      fi
+      GATE_NR_ASSIGNEE_ACTION=$(gate_fail_assignee_action "$AUTHOR" "$REBASE_FAIL_AUTHOR_ALIVE")
+
+      if [ "$GATE_NR_ASSIGNEE_ACTION" = "keep" ]; then
+        log "Author $AUTHOR is a live named-crew session — keeping assignee + story:in-flight (ga-jyox) for the needs-rebase bounce too; nudging instead of pool-returning."
+        bd -C "$BEAD_CITY" assign "$BEAD_ID" "$AUTHOR" 2>/dev/null || true
+        bd -C "$BEAD_CITY" label add    "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" update       "$BEAD_ID" --unset-metadata gc.routed_to -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:queued" -q 2>/dev/null || true
+        # ga-39l9z2 self-audit: mirrors the sibling needs-fix 'keep' arm's own
+        # KEEP_VERIFY_JSON discipline above — a bare "were kept" claim with no
+        # read-back is exactly the unverified-success shape ga-n7hu2 already
+        # caught once in that sibling arm. Verify the raw bead, not intent.
+        _NR_KEEP_VERIFY_JSON=""
+        _NR_KEEP_VERIFY_READ_OK=1
+        _NR_KEEP_VERIFY_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _NR_KEEP_VERIFY_READ_OK=0
+        [ -n "$_NR_KEEP_VERIFY_JSON" ] || _NR_KEEP_VERIFY_READ_OK=0
+        if [ "$_NR_KEEP_VERIFY_READ_OK" = "0" ]; then
+          _NR_KEEP_ASSIGNEE_OBS="assignee=UNVERIFIED (post-write read failed — state unknown, NOT a claim that the keep failed)"
+          _NR_KEEP_INFLIGHT_OBS="story:in-flight=UNVERIFIED (post-write read failed)"
+        else
+          _NR_KEEP_VERIFY_ASSIGNEE=$(printf '%s' "$_NR_KEEP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
+          _NR_KEEP_VERIFY_HAS_INFLIGHT=$(printf '%s' "$_NR_KEEP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | ((.labels // []) | index("story:in-flight")) != null' 2>/dev/null || echo "false")
+          if [ "$_NR_KEEP_VERIFY_ASSIGNEE" = "$AUTHOR" ]; then
+            _NR_KEEP_ASSIGNEE_OBS="assignee=$AUTHOR (kept)"
+          else
+            _NR_KEEP_ASSIGNEE_OBS="assignee='${_NR_KEEP_VERIFY_ASSIGNEE}' NOT $AUTHOR — keep action did not stick, needs investigation"
+          fi
+          if [ "$_NR_KEEP_VERIFY_HAS_INFLIGHT" = "true" ]; then
+            _NR_KEEP_INFLIGHT_OBS="story:in-flight=present"
+          else
+            _NR_KEEP_INFLIGHT_OBS="story:in-flight=MISSING even after re-add — needs investigation"
+          fi
+        fi
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (merge-mechanical, ga-39l9z2) — labeled gate:needs-rebase; NOT counted as a gate:fix-attempt, since the reviewers already approved this content (GATE_SHA_FAIL_CLASS=$GATE_SHA_FAIL_CLASS). Author $AUTHOR is a LIVE crew session, so this dispatcher acted to KEEP assignee + story:in-flight (ga-jyox) — verified post-write on the raw bead, not display: $_NR_KEEP_ASSIGNEE_OBS; $_NR_KEEP_INFLIGHT_OBS. Rebase onto current main and re-run /gate-done (no code changes needed)." 2>/dev/null || true
+        nudge_author_with_fallback "$BEAD_ID" "$NOTIFY_AUTHOR" "$AUTHOR" \
+          "Gate merge-conflict for $BEAD_ID (branch $BRANCH) — your reviewed code is fine, but it needs a rebase onto current main. Your assignee was kept; rebase and re-run /gate-done." \
+          "Gate needs-rebase live-crew nudge for $BEAD_ID (branch $BRANCH)" || true
+      else
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
+        _NR_CLEAR_RC=0
+        gate_clear_assignee_if_holder "$BEAD_ID" "$BEAD_CITY" || _NR_CLEAR_RC=$?
+        _NR_ROUTE=$(default_pool_route_for_rig "$RIG")
+        bd -C "$BEAD_CITY" update "$BEAD_ID" --set-metadata "gc.routed_to=$_NR_ROUTE" -q 2>/dev/null || true
+        # ga-39l9z2: same "verify, don't assume" discipline as the needs-fix
+        # pool-return arm below (ga-p5q3/ga-f54ui) — a post-write read
+        # failure is its own third state, never collapsed into "it failed".
+        # status/gate:queued are gated on a CONFIRMED-empty assignee: forcing
+        # them on a bead a DIFFERENT actor just claimed would fabricate
+        # assigned+in_progress+"open" simultaneously.
+        _NR_VERIFY_JSON=""
+        _NR_VERIFY_READ_OK=1
+        _NR_VERIFY_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _NR_VERIFY_READ_OK=0
+        [ -n "$_NR_VERIFY_JSON" ] || _NR_VERIFY_READ_OK=0
+        if [ "$_NR_VERIFY_READ_OK" = "0" ]; then
+          _NR_ROUTE_OBS="gc.routed_to=UNVERIFIED (post-write read failed — state unknown, NOT a claim the restore failed)"
+          _NR_ASSIGNEE_OBS="assignee=UNVERIFIED (post-write read failed)"
+          _NR_STATUS_OBS="status=UNVERIFIED (post-write read failed — left untouched)"
+          _NR_QUEUED_OBS="gate:queued=UNVERIFIED (post-write read failed — left untouched)"
+        else
+          _NR_ROUTE_OBSERVED=$(printf '%s' "$_NR_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .metadata["gc.routed_to"] // ""' 2>/dev/null || echo "")
+          if [ "$_NR_ROUTE_OBSERVED" = "$_NR_ROUTE" ]; then
+            _NR_ROUTE_OBS="gc.routed_to=$_NR_ROUTE (restored)"
+          else
+            _NR_ROUTE_OBS="gc.routed_to='${_NR_ROUTE_OBSERVED}' NOT $_NR_ROUTE — restore did not stick, needs investigation"
+          fi
+          _NR_ASSIGNEE_OBSERVED=$(printf '%s' "$_NR_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
+          if [ -z "$_NR_ASSIGNEE_OBSERVED" ]; then
+            _NR_ASSIGNEE_OBS="assignee=cleared"
+            # Confirmed nobody else holds the bead — safe to also reopen it
+            # and drop gate:queued (no live marker behind it once this run
+            # goes terminal-FAILED below; the pool probe's
+            # --exclude-label gate:queued otherwise hides this bead from
+            # every worker forever — wa-dnzu0's actual symptom).
+            bd -C "$BEAD_CITY" update       "$BEAD_ID" --status open -q 2>/dev/null || true
+            bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:queued"  -q 2>/dev/null || true
+            _NR_STATUS_OBS="status=open"
+            _NR_QUEUED_OBS="gate:queued=removed"
+          elif [ "$_NR_CLEAR_RC" = "13" ]; then
+            _NR_ASSIGNEE_OBS="assignee='${_NR_ASSIGNEE_OBSERVED}' NOT cleared — a different actor claimed it before the clear could apply (expected race, ga-yd8t6)"
+            _NR_STATUS_OBS="status=left untouched (assignee now held by a different actor)"
+            _NR_QUEUED_OBS="gate:queued=left untouched (assignee now held by a different actor)"
+          else
+            _NR_ASSIGNEE_OBS="assignee='${_NR_ASSIGNEE_OBSERVED}' NOT cleared — needs investigation (ga-yd8t6, rc=$_NR_CLEAR_RC)"
+            _NR_STATUS_OBS="status=left untouched (clear unverified)"
+            _NR_QUEUED_OBS="gate:queued=left untouched (clear unverified)"
+          fi
+        fi
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (merge-mechanical, ga-39l9z2) — labeled gate:needs-rebase; NOT counted as a gate:fix-attempt, since the reviewers already approved this content (GATE_SHA_FAIL_CLASS=$GATE_SHA_FAIL_CLASS). story:in-flight + gate:reviewing cleared. gc.routed_to restored to $_NR_ROUTE so pool workers can self-serve this bead — verified post-write, not assumed: $_NR_ROUTE_OBS; $_NR_ASSIGNEE_OBS; $_NR_STATUS_OBS; $_NR_QUEUED_OBS. Rebase onto current main and re-run /gate-done (no code changes needed)." 2>/dev/null || true
+      fi
+    elif [ "$GATE_SHA_STALE_ACTION" = "stale" ]; then
+      # (d) STALE REVIEW (ga-l7mvtw) — the branch has moved past the commit
+      # this run reviewed; the FAIL above is about code the author already
+      # superseded. Do NOT bump gate:fix-attempt and do NOT touch the
+      # cap/needs-human circuit-breaker over it — charging an attempt here
+      # would blame a review that never looked at the current code
+      # (wa-54f62 incident). Deliberately minimal footprint: a concurrent
+      # run for the newer commit may already own this bead's in-flight
+      # state (gate:reviewing/pilot:*/assignee), so nothing beyond this
+      # comment is touched here to avoid racing it.
+      log "Gate FAIL for $BEAD_ID reviewed a stale commit ($BRANCH_SHA != current tip ${_GATE_L7MVTW_CURRENT_TIP:-unknown}) — NOT bumping gate:fix-attempt (ga-l7mvtw, prev=$PREV_ATTEMPT unchanged)."
+      bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-l7mvtw: this gate run reviewed $BRANCH_SHA, but branch $BRANCH has since moved to ${_GATE_L7MVTW_CURRENT_TIP:-a newer commit} — treating the FAIL above as a review of already-superseded code. gate:fix-attempt left unchanged (still $PREV_ATTEMPT). If you haven't already, resubmit with /gate-done so the current commit gets reviewed." 2>/dev/null || true
+    elif [ "$PREV_ATTEMPT" -ge "$GATE_FIX_CAP" ]; then
       # (c) RETRY CAP REACHED — stop auto-retry, escalate to the Mayor ONCE.
       log "Gate fix-attempt cap reached for $BEAD_ID (prev=$PREV_ATTEMPT >= $GATE_FIX_CAP). Escalating; no further auto-retry."
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:needs-fix"   -q 2>/dev/null || true
@@ -6887,6 +7233,8 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         if [ "$_GFAIL_ROUTE_VERIFY_READ_OK" = "0" ]; then
           _GFAIL_ROUTE_OBS="gc.routed_to=UNVERIFIED (post-write read failed — state unknown, NOT a claim the restore failed)"
           _GFAIL_ASSIGNEE_OBS="assignee=UNVERIFIED (post-write read failed — state unknown, NOT a claim the clear failed)"
+          _GFAIL_STATUS_OBS="status=UNVERIFIED (post-write read failed — left untouched)"
+          _GFAIL_QUEUED_OBS="gate:queued=UNVERIFIED (post-write read failed — left untouched)"
         else
           _GFAIL_ROUTE_OBSERVED=$(printf '%s' "$_GFAIL_ROUTE_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .metadata["gc.routed_to"] // ""' 2>/dev/null || echo "")
           if [ "$_GFAIL_ROUTE_OBSERVED" = "$_GFAIL_ROUTE" ]; then
@@ -6897,13 +7245,33 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
           _GFAIL_ASSIGNEE_OBSERVED=$(printf '%s' "$_GFAIL_ROUTE_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
           if [ -z "$_GFAIL_ASSIGNEE_OBSERVED" ]; then
             _GFAIL_ASSIGNEE_OBS="assignee=cleared"
+            # ga-39l9z2 (wa-dnzu0): confirmed nobody else holds the bead —
+            # safe to also reopen it and drop gate:queued. Before this fix,
+            # this arm restored gc.routed_to (ga-f54ui) but left status at
+            # whatever gate-CLAIM time set it to (in_progress) and left
+            # gate:queued in place — both of which the pool probe's own
+            # filter requires absent/open (`--exclude-label gate:queued`,
+            # status=open), so the bead stayed invisible to every worker
+            # despite gc.routed_to being correctly restored. Gated on a
+            # CONFIRMED-empty assignee for the same reason as the needs-
+            # rebase arm above: forcing these on a bead a DIFFERENT actor
+            # just claimed would fabricate assigned+in_progress+"open"
+            # simultaneously.
+            bd -C "$BEAD_CITY" update       "$BEAD_ID" --status open -q 2>/dev/null || true
+            bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:queued"  -q 2>/dev/null || true
+            _GFAIL_STATUS_OBS="status=open"
+            _GFAIL_QUEUED_OBS="gate:queued=removed"
           elif [ "$_GFAIL_CLEAR_RC" = "13" ]; then
             _GFAIL_ASSIGNEE_OBS="assignee='${_GFAIL_ASSIGNEE_OBSERVED}' NOT cleared — a different actor claimed it before the clear could apply (expected race, ga-yd8t6)"
+            _GFAIL_STATUS_OBS="status=left untouched (assignee now held by a different actor)"
+            _GFAIL_QUEUED_OBS="gate:queued=left untouched (assignee now held by a different actor)"
           else
             _GFAIL_ASSIGNEE_OBS="assignee='${_GFAIL_ASSIGNEE_OBSERVED}' NOT cleared — needs investigation (ga-yd8t6, rc=$_GFAIL_CLEAR_RC)"
+            _GFAIL_STATUS_OBS="status=left untouched (clear unverified)"
+            _GFAIL_QUEUED_OBS="gate:queued=left untouched (clear unverified)"
           fi
         fi
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) cleared. gc.routed_to restored to $_GFAIL_ROUTE so pool workers can self-serve this bead (ga-f54ui) — verified post-write, not assumed: $_GFAIL_ROUTE_OBS; $_GFAIL_ASSIGNEE_OBS. The Pilot will also re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) cleared. gc.routed_to restored to $_GFAIL_ROUTE so pool workers can self-serve this bead (ga-f54ui) — verified post-write, not assumed: $_GFAIL_ROUTE_OBS; $_GFAIL_ASSIGNEE_OBS; $_GFAIL_STATUS_OBS; $_GFAIL_QUEUED_OBS (ga-39l9z2). The Pilot will also re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
       fi
     fi
   fi
@@ -8772,7 +9140,36 @@ fi
 # See gate_exile_watchdog_sweep() (~line 3120) for the mechanics.
 GATE_EXILE_ESCALATE_AFTER_SECONDS="${GATE_EXILE_ESCALATE_AFTER_SECONDS:-86400}"
 case "$GATE_EXILE_ESCALATE_AFTER_SECONDS" in ''|*[!0-9]*) GATE_EXILE_ESCALATE_AFTER_SECONDS=86400 ;; esac
-gate_exile_watchdog_sweep "$MARKERS_JSON" "$GATE_EXILE_ESCALATE_AFTER_SECONDS" "$(date -u +%s)"
+
+# ── ga-0ye7ar (wa-ycyf8): rebase-fail exile AUTO-RECOVERY ────────────────────
+# Runs BEFORE the escalation watchdog on purpose: gate_exile_recovery_sweep
+# clears the exile the instant a real merge-tree recheck proves the original
+# conflict no longer exists, so a marker that has ALSO crossed the 24h
+# escalate_after threshold above gets a chance to be cleared, not mailed to
+# the Mayor, on this exact sweep. See gate_exile_recovery_sweep() (~line 3430)
+# for why: same placement rationale as the watchdog it sits next to (never
+# admits new work, only repairs existing exile state, so neither the
+# quiet-hours nor headroom "pause NEW admission" gate below applies to it).
+GATE_EXILE_RECOVERY_ENABLED="${GATE_EXILE_RECOVERY_ENABLED:-1}"
+case "$GATE_EXILE_RECOVERY_ENABLED" in 0) GATE_EXILE_RECOVERY_ENABLED=0 ;; *) GATE_EXILE_RECOVERY_ENABLED=1 ;; esac
+gate_exile_recovery_sweep "$MARKERS_JSON"
+
+# ga-0ye7ar: exclude whatever gate_exile_recovery_sweep just cleared from the
+# watchdog's input below — otherwise the watchdog would still act on ITS OWN
+# (unchanged, in-memory) copy of $MARKERS_JSON, built before recovery ran,
+# and could mail Mayor + park at gate-status:needs-rebase the exact marker
+# recovery just proved healthy and cleared, on the very same sweep. This is
+# not merely theoretical: it is reachable by any marker that sat
+# exiled-but-actually-clean past $GATE_EXILE_ESCALATE_AFTER_SECONDS — exactly
+# the shape of the incident this bead exists to fix, just aged further.
+if [ -n "$GATE_EXILE_RECOVERY_CLEARED_IDS" ]; then
+  WATCHDOG_MARKERS_JSON=$(printf '%s\n' "$MARKERS_JSON" | jq -c --arg ids "$GATE_EXILE_RECOVERY_CLEARED_IDS" '
+    ($ids | split("\n") | map(select(length > 0))) as $cleared
+    | map(select(($cleared | index(.id)) == null))' 2>/dev/null || echo "$MARKERS_JSON")
+else
+  WATCHDOG_MARKERS_JSON="$MARKERS_JSON"
+fi
+gate_exile_watchdog_sweep "$WATCHDOG_MARKERS_JSON" "$GATE_EXILE_ESCALATE_AFTER_SECONDS" "$(date -u +%s)"
 
 # ── ga-dxyvxr: quiet-hours admission gate — PAUSE new-run admission 00h-08h ────
 # There IS queued work (COUNT>0 above), but Athos's quiet-hours decision
@@ -9208,6 +9605,23 @@ case "$GATE_FRESH_SLOT_DUE" in true|false) ;; *) GATE_FRESH_SLOT_DUE=false ;; es
 # case measured above.
 GATE_MARKER_HARD_AGE_SECONDS="${GATE_MARKER_HARD_AGE_SECONDS:-$((GATE_MARKER_AGE_PROMOTE_SECONDS * 3))}"
 case "$GATE_MARKER_HARD_AGE_SECONDS" in ''|*[!0-9]*) GATE_MARKER_HARD_AGE_SECONDS=$((GATE_MARKER_AGE_PROMOTE_SECONDS * 3)) ;; esac
+# ga-0ye7ar (wa-ycyf8): EXILE-AGE ceiling — invariant (b) of the wa-ycyf8 fix.
+# Mirrors GATE_MARKER_HARD_AGE_SECONDS just above, but keyed on the EXILE's
+# own clock (gate:exiled-since, stamped by gate_exile_watchdog_sweep) rather
+# than the marker's created_at. Without this, has_rebase_fail's blanket
+# exclusion from is_overdue (ga-q3ig2, tier 1 below) means an exiled marker
+# in a queue that never empties can sail past is_overdue's own threshold and
+# STILL never reach the emergency tier — exactly the wa-ycyf8 incident (7h,
+# healthy queue 6-24 deep the entire time). Bounded, not a free pass for a
+# genuinely-broken branch: MAX_REBASE_ATTEMPTS (default 3) still caps how
+# many times it can be re-attempted before the existing attempt-based
+# escalation (Step 4c) takes it out of gate-status:queued entirely — this
+# only affects how SOON it gets its next already-bounded attempt. Defaults
+# to the same value as GATE_MARKER_HARD_AGE_SECONDS (one ceiling, healthy or
+# not) but is independently configurable. 0 disables the feature (same "0
+# turns it off" convention as GATE_FRESH_SLOT_WINDOW_SWEEPS above).
+GATE_EXILE_OVERDUE_SECONDS="${GATE_EXILE_OVERDUE_SECONDS:-$GATE_MARKER_HARD_AGE_SECONDS}"
+case "$GATE_EXILE_OVERDUE_SECONDS" in ''|*[!0-9]*) GATE_EXILE_OVERDUE_SECONDS="$GATE_MARKER_HARD_AGE_SECONDS" ;; esac
 # ga-r8u92 (ga-faw5o defeito 1): SIZE-AWARE SELECTION, healthy-not-aged tiers only.
 # Step 0b-0 (above, OUTSIDE this sentinel — mirrors how MARKERS_JSON itself is
 # built outside and merely CONSUMED here) annotates each candidate with
@@ -9230,6 +9644,7 @@ MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   --argjson now "$GATE_MARKER_NOW_EPOCH" \
   --argjson age_threshold "$GATE_MARKER_AGE_PROMOTE_SECONDS" \
   --argjson hard_threshold "$GATE_MARKER_HARD_AGE_SECONDS" \
+  --argjson exile_ceiling "$GATE_EXILE_OVERDUE_SECONDS" \
   --argjson reserve_fresh "$GATE_FRESH_SLOT_DUE" \
   --argjson diff_unknown "$GATE_DIFF_SIZE_UNKNOWN_SENTINEL" \
   --arg priority_authors "$GATE_PRIORITY_AUTHORS" '
@@ -9242,6 +9657,18 @@ MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   def is_aged: try (($now - (.created_at | fromdateiso8601)) > $age_threshold) catch false;
   # ga-ddm76: priority-blind emergency ceiling — see the shell comment above.
   def is_overdue: try (($now - (.created_at | fromdateiso8601)) > $hard_threshold) catch false;
+  # ga-0ye7ar: the exile clock itself, independent of created_at (see the shell
+  # comment above GATE_EXILE_OVERDUE_SECONDS). gate:exiled-since is stamped by
+  # gate_exile_watchdog_sweep the first sweep it notices a marker exiled —
+  # absent (never yet observed in exile, or already cleared by
+  # gate_exile_recovery_sweep) reads as "not old enough yet", the same
+  # conservative default the watchdog itself uses. That keeps a
+  # freshly-exiled marker (e.g. gate-priority-starvation-ceiling.selftest.sh
+  # case (4): overdue-by-created_at but no exiled-since label yet) sinking
+  # behind healthy markers exactly as before — this tier only admits a
+  # marker whose OWN exile has sat unconsidered long enough on its own terms.
+  def exiled_since_epoch: ([(.labels // [])[] | select(test("^gate:exiled-since:[0-9]+$")) | (sub("^gate:exiled-since:";"") | tonumber)] | max) // null;
+  def exile_overdue: ($exile_ceiling > 0) and (exiled_since_epoch != null) and (($now - exiled_since_epoch) > $exile_ceiling);
   # crew_of parses the <crew> segment of `branch: crew/<crew>/<bead>` from the
   # marker DESCRIPTION. MUST always yield exactly one value ("" when absent) —
   # `capture`/`scan` yield an EMPTY STREAM on no-match under jq, and `crew_of as
@@ -9271,7 +9698,13 @@ MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   # the secondary tiebreak (4cae0a2c49, Athos: desempate=mais novo — preserved
   # for equal-size diffs; unknown-size diffs tie at the sentinel and fall
   # through to it too).
-  (map(select(is_overdue and (has_rebase_fail | not)))                              | sort_by(.created_at))
+  # ga-0ye7ar: tier 1 now ALSO admits a has_rebase_fail marker once its own
+  # exile has run past $exile_ceiling (exile_overdue) — the ga-q3ig2 "a
+  # conflicted branch never jumps the queue" guarantee still holds for every
+  # OTHER tier (2-6 all keep excluding has_rebase_fail unchanged below), and
+  # gate-priority-starvation-ceiling.selftest.sh case (4) still passes
+  # because that fixture carries no gate:exiled-since label at all.
+  (map(select((is_overdue and (has_rebase_fail | not)) or (has_rebase_fail and exile_overdue))) | sort_by(.created_at))
   + (if $reserve_fresh then (map(select(has_rebase_fail | not)) | sort_by(.created_at) | reverse | .[0:1]) else [] end)
   + (map(select(is_priority and (has_rebase_fail | not) and is_aged))                 | sort_by(.created_at))
   + (map(select(is_priority and (has_rebase_fail | not) and (is_aged | not)))       | sort_by([diff_size, -created_epoch]))
@@ -9979,6 +10412,50 @@ fi
 
 log "  Branch $BRANCH not yet merged into $DEFAULT_BRANCH — proceeding with review."
 
+# ── ga-l7mvtw: stale-SHA claim guard — refuse to spawn a reviewer for a
+# commit an EARLIER, independent gate-run already rejected ───────────────────
+# Incident (wa-54f62): an OLD marker got claimed after its branch_sha had
+# already earned a gate-sha-failed(code) stamp from an earlier, independent
+# gate-run (the author had since pushed a real fix under a NEW sha). The
+# dispatcher spun up a reviewer anyway (~14 wasted minutes), then relied on
+# the ga-nooaw fail-closed-by-SHA check (above, at finalize time) to
+# downgrade the inevitable PASS back to FAIL — by which point a fix-attempt
+# slot was already spent on a round that never looked at the actual fix.
+# Catching this HERE, before any reviewer is spawned and before the sibling
+# guard just below even runs, means a stale-SHA marker costs nothing: no
+# reviewer, no fix-attempt spent — and critically, no live sibling run left
+# for a NEWER marker on this same branch to yield to (see the sibling
+# guard's own YIELD case, exactly what starved ga-jjnnno in the incident).
+# SELFTEST-EXTRACT stale-sha-claim-guard: BEGIN
+if [ -n "$BEAD_ID" ] && [ -n "$BRANCH_SHA" ] \
+   && [ "$(gate_bead_has_prior_sha_fail "$BEAD_CITY" "$BEAD_ID" "$BRANCH_SHA")" = "yes" ]; then
+  warn "ga-l7mvtw: branch $BRANCH tip $BRANCH_SHA on marker $MARKER_ID already carries a gate-sha-failed(code) stamp on $BEAD_ID from an earlier, independent gate-run — refusing to spend a reviewer re-reviewing a commit already rejected. NOT spawning a reviewer; NOT touching gate:fix-attempt (that slot was already spent by the run that produced the original FAIL)."
+  set_gate_status "$MARKER_ID" "superseded"
+  bd -C "$GC_CITY" comment "$MARKER_ID" "Gate marker skipped (ga-l7mvtw): branch $BRANCH tip $BRANCH_SHA already carries a recorded gate-sha-failed(code) stamp on $BEAD_ID from an earlier, independent gate-run. No reviewer spawned; gate:fix-attempt untouched." 2>/dev/null || true
+  bd -C "$GC_CITY" close "$MARKER_ID" -r "Gate marker terminal: STALE-SHA (ga-l7mvtw) — branch $BRANCH tip $BRANCH_SHA already has a recorded gate-sha-failed(code) stamp on $BEAD_ID from an earlier gate-run. No reviewer spawned; fix-attempt untouched. Closed by dispatcher." 2>/dev/null || true
+  bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-l7mvtw: marker $MARKER_ID named a stale commit ($BRANCH_SHA) that an earlier, independent gate-run already rejected (gate-sha-failed:$BRANCH_SHA:code). Skipped without spending a reviewer or a fix-attempt. If you've already pushed a fix under a new commit, a fresh marker for that new SHA will be reviewed normally; if not, push your fix and resubmit with /gate-done." 2>/dev/null || true
+  if [ -n "$AUTHOR" ]; then
+    gc --city "$GC_CITY" mail send "$AUTHOR" \
+      -s "Gate: stale marker skipped, $BRANCH already has a FAIL on $BRANCH_SHA ($BEAD_ID)" \
+      -m "A queued gate marker for $BRANCH (bead $BEAD_ID) named commit $BRANCH_SHA, which an earlier, independent gate-run already rejected (gate-sha-failed:$BRANCH_SHA:code). The dispatcher skipped it without spending a reviewer or a fix-attempt (ga-l7mvtw). If you already pushed a fix under a new commit, no action needed — a fresh marker will be reviewed normally. If not, push your fix and resubmit with /gate-done." \
+      2>/dev/null || warn "Could not mail author $AUTHOR for stale-SHA marker $MARKER_ID"
+  fi
+  mkdir -p "$(dirname "$QG_LOG")"
+  jq -c -n \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg branch "$BRANCH" \
+    --arg bead "$BEAD_ID" \
+    --arg rig "${RIG:-unknown}" \
+    --arg marker "$MARKER_ID" \
+    --arg sha "$BRANCH_SHA" \
+    '{ts: $ts, event: "dispatcher_superseded", branch: $branch, bead: $bead, rig: $rig, marker: $marker, sha: $sha, reason: "stale_sha_already_failed"}' \
+    >> "$QG_LOG" 2>/dev/null || true
+  log "SUPPRESSED PUSH (wa-uthi non-terminal): stale-SHA marker skipped, no new outcome for the bead."
+  log "=== Dispatcher sweep complete: branch=$BRANCH verdict=SKIPPED (stale sha $BRANCH_SHA already gate-sha-failed) ==="
+  exit 0
+fi
+# SELFTEST-EXTRACT stale-sha-claim-guard: END
+
 # ── Step 4b-1 (ga-991au round 2): live-sibling-run guard, HOISTED before any
 # rebase/force-push ───────────────────────────────────────────────────────────
 # Originally this check ran only at Step 5b, AFTER Step 4c's auto-rebase — which
@@ -9999,7 +10476,7 @@ log "  Branch $BRANCH not yet merged into $DEFAULT_BRANCH — proceeding with re
 # caught before reviewers are spawned, just not before THIS marker's own
 # rebase/force-push (a narrower, rarer window than the one this hoist closes).
 if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
-  SIBLING_VERDICT=$(live_sibling_run_for_branch "$BRANCH" "$RIG" || echo "")
+  SIBLING_VERDICT=$(live_sibling_run_for_branch "$BRANCH" "$RIG" "$BRANCH_SHA" || echo "")
   case "$SIBLING_VERDICT" in
     "LIVE "*)
       SIBLING_RUN_ID="${SIBLING_VERDICT#LIVE }"
@@ -10018,6 +10495,13 @@ if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
       # stayed in gate-status:dispatching just above, and Step 0b only selects
       # gate-status:queued — so the next round cannot pick it again.
       gate_continue_or_exit "live-sibling-pre-rebase"
+      ;;
+    "SHA_STALE "*)
+      SIBLING_RUN_ID="${SIBLING_VERDICT#SHA_STALE }"
+      warn "Sibling gate-run $SIBLING_RUN_ID for branch $BRANCH is reviewing a commit the branch has since moved past (branch tip is now $BRANCH_SHA) — superseding it (ga-l7mvtw) and proceeding with a fresh run instead of yielding."
+      set_gate_status "$SIBLING_RUN_ID" "superseded" 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$SIBLING_RUN_ID" "Dispatcher: superseded — reviewing a commit branch $BRANCH has since moved past (tip is now $BRANCH_SHA). A fresh gate-run takes over (ga-l7mvtw live-sibling SHA guard, pre-rebase check)." 2>/dev/null || true
+      bd -C "$GC_CITY" close "$SIBLING_RUN_ID" -r "gate-run superseded (reviewing outdated commit; branch moved to $BRANCH_SHA) — fresh run for branch $BRANCH takes over. (ga-l7mvtw)" 2>/dev/null || true
       ;;
     "STALE "*)
       SIBLING_RUN_ID="${SIBLING_VERDICT#STALE }"
@@ -11784,7 +12268,7 @@ log "Tier: $TIER  required_reviewers: $REQUIRED_REVIEWERS"
 # where a sibling run starts DURING Step 4c/Step 5 (auto-rebase, tier
 # classification) — rare, but a real gap the early check alone cannot close.
 if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
-  SIBLING_VERDICT=$(live_sibling_run_for_branch "$BRANCH" "$RIG" || echo "")
+  SIBLING_VERDICT=$(live_sibling_run_for_branch "$BRANCH" "$RIG" "$BRANCH_SHA" || echo "")
   case "$SIBLING_VERDICT" in
     "LIVE "*)
       SIBLING_RUN_ID="${SIBLING_VERDICT#LIVE }"
@@ -11803,6 +12287,13 @@ if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
       # stayed in gate-status:dispatching just above, and Step 0b only selects
       # gate-status:queued — so the next round cannot pick it again.
       gate_continue_or_exit "live-sibling"
+      ;;
+    "SHA_STALE "*)
+      SIBLING_RUN_ID="${SIBLING_VERDICT#SHA_STALE }"
+      warn "Sibling gate-run $SIBLING_RUN_ID for branch $BRANCH is reviewing a commit the branch has since moved past (branch tip is now $BRANCH_SHA) — superseding it (ga-l7mvtw) and proceeding with a fresh run instead of yielding."
+      set_gate_status "$SIBLING_RUN_ID" "superseded" 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$SIBLING_RUN_ID" "Dispatcher: superseded — reviewing a commit branch $BRANCH has since moved past (tip is now $BRANCH_SHA). A fresh gate-run takes over (ga-l7mvtw live-sibling SHA guard)." 2>/dev/null || true
+      bd -C "$GC_CITY" close "$SIBLING_RUN_ID" -r "gate-run superseded (reviewing outdated commit; branch moved to $BRANCH_SHA) — fresh run for branch $BRANCH takes over. (ga-l7mvtw)" 2>/dev/null || true
       ;;
     "STALE "*)
       SIBLING_RUN_ID="${SIBLING_VERDICT#STALE }"

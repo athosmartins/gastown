@@ -1944,6 +1944,17 @@ else
   # PRE_DEPLOY_SHA was captured), so this range cannot show this story's own
   # files at all and guessing here would be worse than the existing fallback.
   THIS_PULL_STRUCTURALLY_INERT=""
+  # ga-9lug2k: reset alongside THIS_PULL_STRUCTURALLY_INERT, for the identical
+  # leakage reason — MERGE_OWN_AFFECTED is only ever (re-)populated below, and
+  # only on the Path-B (true no-op) branch. Without this reset, a story that
+  # takes Path A (PRE!=POST) right after a sibling story that took Path B in
+  # the SAME sweep would inherit the sibling's stale attribution: Path A sets
+  # its own THIS_PULL_STRUCTURALLY_INERT (0 or 1) same as always, and the halt
+  # builder below keys on THIS_PULL_STRUCTURALLY_INERT="0" plus a non-empty
+  # MERGE_OWN_AFFECTED to decide whether to lead with it — a stale non-empty
+  # value here would satisfy that check with the WRONG story's daemon list.
+  MERGE_OWN_AFFECTED=""
+  MERGE_OWN_VERDICT_LINE=""
   if [ -n "$PRE_DEPLOY_SHA" ] && [ "$PRE_DEPLOY_SHA" != "$POST_DEPLOY_SHA" ]; then
     THIS_PULL_CHANGED="$(git -C "$RUNTIME_DIR" diff --name-only "$PRE_DEPLOY_SHA" "$POST_DEPLOY_SHA" 2>/dev/null || true)"
     if [ -n "${THIS_PULL_CHANGED// /}" ]; then
@@ -2163,7 +2174,44 @@ else
           # already-fresh check (COMMIT_EPOCH-based, ga-puq8z) already ran and
           # did NOT clear this daemon, but a human deciding whether to bounce a
           # hot-path daemon on this alone should know the detection basis.
-          REFRESH_ACTION="ACTION: perform a guarded/graceful restart of the flagged hot-path daemon(s) ($REFRESH_GUARDED) — drain in-flight messages/webhooks first — then re-run delivery. (Configure a DRAIN_CMD_<label> for daemon-refresh.sh to automate this.) CAVEAT (ga-puq8z): flagged by import/template-closure matching, not proven reachable to the changed symbols — if in doubt, compare \`ps -o lstart= -p <pid>\` against commit $POST_DEPLOY_SHA before restarting."
+          #
+          # ga-9lug2k: lead with the per-bead attribution this block ALREADY
+          # computed above (Path B / MERGE_OWN_*), reusing it instead of
+          # making every reader re-derive it by hand. THIS_PULL_STRUCTURALLY_
+          # INERT="0" is the only state that guarantees MERGE_OWN_AFFECTED is
+          # both freshly set THIS iteration (reset above, ga-9lug2k) AND
+          # non-empty (see the if/elif above: "1" means empty-and-inert,
+          # unset/unknown means Path A ran instead, or the probe was
+          # unparseable — neither carries a trustworthy attribution here).
+          # Measured cost this fixes (wa-b26ju, wa-gyqzr, 2026-09-16): without
+          # it, the ~50-daemon wide list was the ONLY thing a halt ever
+          # showed, so every reader re-derived by hand what this script had
+          # already computed a few lines above — ~30-60min each, twice in a
+          # row, and in wa-gyqzr's case the wide list didn't even CONTAIN the
+          # one daemon that actually needed restarting.
+          if [ "$THIS_PULL_STRUCTURALLY_INERT" = "0" ] && [ -n "${MERGE_OWN_AFFECTED// /}" ]; then
+            # gate_run=ga-c6ke4i (Reviewer-1 FAIL): the demoted line below used
+            # to interpolate the raw $REFRESH_GUARDED wide list. Whenever a
+            # narrow-attributed daemon was ALSO present in the wide sweep (the
+            # common case — MERGE_PRE_MAIN..MERGE_SHA is normally a sub-range
+            # of the wide baseline..POST window), that same daemon appeared
+            # both in the lead "restart THESE for this merge" line and, two
+            # lines later, in a line calling it "NOT attributed to this merge"
+            # / "from EARLIER merges" — a self-contradiction. Subtract the
+            # already-attributed set first, same set-difference shape as
+            # SJ_FINE's fix for the identical contradiction class in
+            # daemon-refresh.sh (gate_run=ga-3khhu).
+            REFRESH_GUARDED_CONTEXT_ONLY="$(comm -23 \
+              <(echo "$REFRESH_GUARDED" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+              <(echo "$MERGE_OWN_AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+              | tr '\n' ' ' | sed 's/ $//')"
+            REFRESH_ACTION="ACTION: restart THESE for this merge — per-bead attribution ($STORY_ID's own delta $MERGE_OWN_BASE_SHA..$MERGE_SHA reaches, already computed above):$MERGE_OWN_AFFECTED
+Drain in-flight messages/webhooks first, then re-run delivery. (Configure a DRAIN_CMD_<label> for daemon-refresh.sh to automate this.)
+Context only — NOT attributed to this merge: other sensitive daemon(s) the wide sweep found older than their own closure, from EARLIER merges (cosmetic unless one of them actually uses a changed symbol; do not restart these on THIS story's account alone):${REFRESH_GUARDED_CONTEXT_ONLY}
+CAVEAT (ga-puq8z): both lists above are import/template-closure matches, not proof of reachability to the changed symbols — if in doubt, compare \`ps -o lstart= -p <pid>\` against commit $POST_DEPLOY_SHA before restarting."
+          else
+            REFRESH_ACTION="ACTION: perform a guarded/graceful restart of the flagged hot-path daemon(s) ($REFRESH_GUARDED) — drain in-flight messages/webhooks first — then re-run delivery. (Configure a DRAIN_CMD_<label> for daemon-refresh.sh to automate this.) No per-bead attribution available this run (this story's own pull was not a true no-op, or the attribution probe above did not return a parseable result) — this is the wide sweep's list only. CAVEAT (ga-puq8z): flagged by import/template-closure matching, not proven reachable to the changed symbols — if in doubt, compare \`ps -o lstart= -p <pid>\` against commit $POST_DEPLOY_SHA before restarting."
+          fi
         else
           REFRESH_ACTION="ACTION: investigate why the restarted daemon(s) ($REFRESH_FRESHFAIL) did not come up fresh (crash on boot? wrong launchd label? port in use?), fix forward, then re-run delivery."
         fi

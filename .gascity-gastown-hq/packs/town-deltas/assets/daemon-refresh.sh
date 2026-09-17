@@ -1446,6 +1446,34 @@ PY
   fi
 fi
 
+# ga-9lug2k: aggregate, per-run coverage accounting — how many of THIS run's
+# discovered entrypoints (Step 3 below, all of $DAEMON_LABELS) had their
+# import-reachability decided by deploy_deps.json's real recursive closure vs
+# fell back to the bounded ad-hoc heuristic (entrypoint-direct + one
+# routes/*.py hop). Incremented by Step 3's existing per-daemon loop (one
+# bump per entry already being iterated there — no new loop, no new python3
+# spawn). Consulted by Step 5 (verdict) below to decide whether the
+# NEEDS_GUARDED_RESTART caveat can honestly say "closure is complete for
+# every entrypoint this run considered" instead of the generic "verify by
+# hand" — never guessed, only asserted when the count proves it.
+TOTAL_ENTRY_COUNT=0
+JSON_COVERED_ENTRY_COUNT=0
+
+# Regen date for that same caveat — prefer the commit that last touched the
+# file in RUNTIME_DIR's own history (the real "when was this rig's closure
+# last regenerated" answer for a checked-out deploy), falling back to the
+# file's own mtime when the path isn't git-tracked (non-git runtime, or a
+# freshly-copied file never committed). Never fatal either way: cosmetic
+# context in a message, not a correctness input.
+DEPLOY_DEPS_REGEN=""
+if [ -f "$DEPLOY_DEPS_JSON" ]; then
+  DEPLOY_DEPS_REGEN="$(git -C "$RUNTIME_DIR" log -1 --format=%ad --date=short -- daemons/deploy_deps.json 2>/dev/null || true)"
+  if [ -z "$DEPLOY_DEPS_REGEN" ]; then
+    DEPLOY_DEPS_REGEN="$(stat -f '%Sm' -t '%Y-%m-%d' "$DEPLOY_DEPS_JSON" 2>/dev/null || true)"
+  fi
+  [ -n "$DEPLOY_DEPS_REGEN" ] || DEPLOY_DEPS_REGEN="unknown date"
+fi
+
 # does deploy_deps.json have a closure entry for <entrypoint-relpath> at all?
 json_covers_entry() {  # json_covers_entry <entrypoint-relpath>
   case " $JSON_KNOWN_ENTRYPOINTS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
@@ -1474,7 +1502,9 @@ for label in $DAEMON_LABELS; do
   # needed for it.
   ad_hoc_entries=""
   for e in $entries; do
+    TOTAL_ENTRY_COUNT=$((TOTAL_ENTRY_COUNT + 1))
     if json_covers_entry "$e"; then
+      JSON_COVERED_ENTRY_COUNT=$((JSON_COVERED_ENTRY_COUNT + 1))
       json_entry_affected "$e" && affected=1
     else
       ad_hoc_entries="$ad_hoc_entries $e"
@@ -1747,7 +1777,27 @@ elif [ -n "${GUARDED// /}" ]; then
   # hops away was silently absent from a GUARDED list that named two
   # unrelated daemons instead, and the message gave no hint anything might
   # be missing — a reader had no reason to doubt the list was complete.
-  emit NEEDS_GUARDED_RESTART "sensitive hot-path daemon(s) need a guarded restart (import/template-closure match, not proven reachable to the changed symbols — a listed daemon may be a false positive; this is also NOT a full transitive closure — a daemon reached only through a deeper import chain can be missing from this list entirely, a false negative — verify by hand before treating this list as complete):${GUARDED}" not_verified
+  #
+  # ga-9lug2k: that false-negative half is no longer true for a rig where
+  # deploy_deps.json covers every entrypoint this run considered — measured
+  # live for whatsapp_automation (75/75, regenerated 2026-09-16) — and
+  # repeating "verify by hand, may be incomplete" on a closure that already
+  # IS complete just re-teaches a reader to distrust a list that has already
+  # closed the gap it's warning about. Assert completeness only when
+  # TOTAL_ENTRY_COUNT/JSON_COVERED_ENTRY_COUNT (Step 3's own per-entry tally,
+  # never guessed) actually prove it for THIS run; fall back to the original
+  # conservative wording the instant they don't (no deploy_deps.json,
+  # unparseable JSON — WARN case above, or partial coverage). Even when
+  # asserted, two risks stay real regardless of JSON coverage: the JSON
+  # itself going stale (hence the regen date), and TEMPLATE/asset
+  # reachability, a structurally separate mechanism this closure does not
+  # track (header point 14) — "full closure" here means imports only.
+  if [ -f "$DEPLOY_DEPS_JSON" ] && [ "$TOTAL_ENTRY_COUNT" -gt 0 ] && [ "$JSON_COVERED_ENTRY_COUNT" -eq "$TOTAL_ENTRY_COUNT" ]; then
+    NGR_REASON="sensitive hot-path daemon(s) need a guarded restart (import reachability for every entrypoint this run considered — ${TOTAL_ENTRY_COUNT}/${TOTAL_ENTRY_COUNT} — resolved via daemons/deploy_deps.json's real recursive closure, regenerated ${DEPLOY_DEPS_REGEN}: the bare-name/bounded-hop false-negative risk does NOT apply here. Two residual risks remain regardless: the JSON going stale since that regen date, and TEMPLATE/asset reachability, a structurally separate mechanism this closure does not track — verify those two, and still confirm a listed daemon isn't a false positive, before restarting):${GUARDED}"
+  else
+    NGR_REASON="sensitive hot-path daemon(s) need a guarded restart (import/template-closure match, not proven reachable to the changed symbols — a listed daemon may be a false positive; this is also NOT a full transitive closure — a daemon reached only through a deeper import chain can be missing from this list entirely, a false negative — verify by hand before treating this list as complete):${GUARDED}"
+  fi
+  emit NEEDS_GUARDED_RESTART "$NGR_REASON" not_verified
 elif [ -n "${RESTARTED// /}" ]; then
   emit OK "all affected daemons restarted + verified fresh:${RESTARTED}" verified
 elif [ -n "${WOULD_RESTART// /}" ]; then
