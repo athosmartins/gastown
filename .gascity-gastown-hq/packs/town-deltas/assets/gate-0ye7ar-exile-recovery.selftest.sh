@@ -69,6 +69,7 @@ STUB_RESOLVE_RC=0      # exit code gate_resolve_rig_context returns
 STUB_RESOLVE_COMMIT="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"  # rig_resolve_commit output; "" simulates unfetched ref
 STUB_MERGE_VERDICT="0" # rig_merge_has_conflict default output when the branch name carries no explicit hint
 STUB_ATTEMPT="2"       # read_rebase_attempt output
+STUB_SHOW_STILL_EXILED="false"  # post-removal readback: does the marker STILL carry an exile label?
 
 # Mirrors the real extract() one-liner (quality-gate-dispatcher.sh ~line
 # 7739) exactly — trivial enough that duplicating it here does not risk the
@@ -95,12 +96,21 @@ read_rebase_attempt() { printf '%s' "$STUB_ATTEMPT"; }
 bd() {
   # bd -C "$GC_CITY" label remove "$id" "$label" -q
   # bd -C "$GC_CITY" comment "$id" "text"
+  # bd -C "$GC_CITY" show "$id" --json
   if [ "$3" = "label" ] && [ "$4" = "remove" ]; then
     LABEL_REMOVE_LOG="$LABEL_REMOVE_LOG|$5:$6"
     return 0
   fi
   if [ "$3" = "comment" ]; then
     COMMENT_LOG="$COMMENT_LOG|$4"
+    return 0
+  fi
+  if [ "$3" = "show" ]; then
+    if [ "$STUB_SHOW_STILL_EXILED" = "true" ]; then
+      printf '[{"id":"%s","labels":["gate-status:queued","gate:exiled-tier5:9"]}]' "$4"
+    else
+      printf '[{"id":"%s","labels":["gate-status:queued"]}]' "$4"
+    fi
     return 0
   fi
   return 0
@@ -110,7 +120,7 @@ warn() { WARN_LOG="$WARN_LOG|$*"; }
 reset_stubs() {
   LABEL_REMOVE_LOG=""; COMMENT_LOG=""; WARN_LOG=""; RESOLVE_CALLS=""; MERGE_CHECK_CALLS=""
   STUB_RESOLVE_RC=0; STUB_RESOLVE_COMMIT="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
-  STUB_MERGE_VERDICT="0"; STUB_ATTEMPT="2"; GATE_EXILE_RECOVERY_ENABLED=1
+  STUB_MERGE_VERDICT="0"; STUB_ATTEMPT="2"; STUB_SHOW_STILL_EXILED="false"; GATE_EXILE_RECOVERY_ENABLED=1
 }
 
 # mk <id> <branch> <labels-csv>
@@ -154,6 +164,18 @@ if [ "$LABEL_REMOVE_LOG" = "$EXPECT" ] && [ "$COMMENT_LOG" = "|m3" ] && [ "$GATE
   ok "clean-merge-tree exiled marker fully cleared: exiled-tier5/rebase-attempt/rebase-fail-count/exiled-since/exile-escalated all removed at attempt=2, comment posted, id reported cleared"
 else
   bad "expected full clear, got labels='$LABEL_REMOVE_LOG' comment='$COMMENT_LOG' cleared='$GATE_EXILE_RECOVERY_CLEARED_IDS'"
+fi
+
+echo "── (A3b) self-audit catch: label removals ran but a re-read STILL shows the marker exiled -> no false 'cleared' comment, not excluded from the watchdog ──"
+reset_stubs
+STUB_MERGE_VERDICT="0"; STUB_ATTEMPT="2"; STUB_SHOW_STILL_EXILED="true"
+MARKERS=$(printf '[%s]' "$(mk m3b "crew/oracle/m3b" "gate-status:queued,gate:exiled-tier5:2")")
+gate_exile_recovery_sweep "$MARKERS"
+if [ -n "$LABEL_REMOVE_LOG" ] && [ -z "$COMMENT_LOG" ] && [ -z "$GATE_EXILE_RECOVERY_CLEARED_IDS" ] \
+   && echo "$WARN_LOG" | grep -qi "still shows it exiled"; then
+  ok "the label removes were attempted, but the post-removal re-read still shows an exile label — no bead comment was posted claiming a clear that a silent write failure may have prevented, and the marker was NOT excluded from the watchdog's input (verified before claimed, ga-faw5o rounds 2-3 pattern applied here too)"
+else
+  bad "expected removals attempted but no false 'cleared' claim, got labels='$LABEL_REMOVE_LOG' comment='$COMMENT_LOG' cleared='$GATE_EXILE_RECOVERY_CLEARED_IDS' warn='$WARN_LOG'"
 fi
 
 echo "── (A4) rig context cannot be resolved: skips gracefully, no crash, no clear ──"
@@ -348,6 +370,9 @@ grep -q 'gate_exile_recovery_sweep()' "$DISPATCHER" \
   && ok "gate_exile_recovery_sweep is defined in the shipped dispatcher" || bad "gate_exile_recovery_sweep missing"
 grep -q 'GATE_EXILE_RECOVERY_ENABLED' "$DISPATCHER" \
   && ok "exile-recovery sweep has a reversible GATE_* enable flag (house convention)" || bad "no enable flag for exile-recovery"
+grep -q 'still_exiled=\$(bd -C "\$GC_CITY" show "\$marker_id" --json' "$DISPATCHER" \
+  && ok "exile-recovery verifies the clear by re-reading the marker before commenting/excluding it (ga-faw5o rounds 2-3 pattern, applied here too)" \
+  || bad "exile-recovery no longer re-reads before claiming success — the comment-claims-more-than-delivered gap is back"
 grep -q 'map(select((is_overdue and (has_rebase_fail | not)) or (has_rebase_fail and exile_overdue))' "$DISPATCHER" \
   && ok "tier 1's select expression wires exile_overdue in alongside the existing is_overdue arm" || bad "tier 1 select expression drifted from the tested shape"
 

@@ -3473,7 +3473,7 @@ gate_exile_recovery_sweep() {
   if [ "${GATE_EXILE_RECOVERY_ENABLED:-1}" != "1" ]; then
     return 0
   fi
-  local ids marker_id m_branch verdict attempt since_lines since_lbl
+  local ids marker_id m_branch verdict attempt since_lines since_lbl still_exiled
   ids=$(printf '%s\n' "$markers_json" | jq -r '
     .[] | select(
       ((.labels // []) | map(select(test("^gate:(rebase-attempt|exiled-tier5):[0-9]+$"))) | length) > 0
@@ -3498,7 +3498,6 @@ gate_exile_recovery_sweep() {
     fi
     verdict=$(rig_merge_has_conflict "origin/$DEFAULT_BRANCH" "origin/$m_branch")
     [ "$verdict" = "0" ] || continue
-    warn "gate_exile_recovery_sweep: clearing rebase-fail exile on marker $marker_id — origin/$m_branch merges into origin/$DEFAULT_BRANCH with zero conflicts (ga-0ye7ar)."
     attempt=$(read_rebase_attempt "$marker_id")
     bd -C "$GC_CITY" label remove "$marker_id" "gate:exiled-tier5:$attempt"      -q 2>/dev/null || true
     bd -C "$GC_CITY" label remove "$marker_id" "gate:rebase-attempt:$attempt"    -q 2>/dev/null || true
@@ -3515,9 +3514,26 @@ gate_exile_recovery_sweep() {
 $since_lines
 EOF_SINCE
     bd -C "$GC_CITY" label remove "$marker_id" "gate:exile-escalated" -q 2>/dev/null || true
-    bd -C "$GC_CITY" comment "$marker_id" "Gate auto-recovery (ga-0ye7ar): cleared the rebase-fail exile automatically — origin/$m_branch now merges into origin/$DEFAULT_BRANCH with zero conflicts (a real merge-tree recheck, not an assumption). This marker rejoins the healthy tiers on the next sweep instead of waiting for a human or the 24h exile-watchdog escalation." 2>/dev/null || true
-    GATE_EXILE_RECOVERY_CLEARED_IDS="$GATE_EXILE_RECOVERY_CLEARED_IDS
+    # ga-0ye7ar (self-audit before submission): verify the removals actually
+    # stuck via a fresh read-back BEFORE claiming success anywhere — every
+    # `bd label remove` above is fire-and-forget (`|| true`), so a silent
+    # Dolt write failure must not be followed by a bead comment asserting the
+    # exile is cleared, and must not exclude the marker from the watchdog
+    # below (per this readback it is, in that case, still actually exiled).
+    # Mirrors the ga-ehbw5 pattern (gate-done's own marker-creation
+    # verification) and closes the exact "comment claims an action neither
+    # confirmed nor completed" gap ga-faw5o rounds 2-3 fixed in the sibling
+    # watchdog function above — the same defect class, one function over.
+    still_exiled=$(bd -C "$GC_CITY" show "$marker_id" --json 2>/dev/null \
+      | jq -r 'if type=="array" then .[0] else . end | ((.labels // []) | map(select(test("^gate:(rebase-attempt|exiled-tier5):[0-9]+$"))) | length) > 0' 2>/dev/null || echo "true")
+    if [ "$still_exiled" = "false" ]; then
+      warn "gate_exile_recovery_sweep: cleared rebase-fail exile on marker $marker_id (verified by re-read) — origin/$m_branch merges into origin/$DEFAULT_BRANCH with zero conflicts (ga-0ye7ar)."
+      bd -C "$GC_CITY" comment "$marker_id" "Gate auto-recovery (ga-0ye7ar): cleared the rebase-fail exile automatically — origin/$m_branch now merges into origin/$DEFAULT_BRANCH with zero conflicts (a real merge-tree recheck, not an assumption), confirmed by re-reading the marker after the label removals. This marker rejoins the healthy tiers on the next sweep instead of waiting for a human or the 24h exile-watchdog escalation." 2>/dev/null || true
+      GATE_EXILE_RECOVERY_CLEARED_IDS="$GATE_EXILE_RECOVERY_CLEARED_IDS
 $marker_id"
+    else
+      warn "gate_exile_recovery_sweep: attempted to clear rebase-fail exile on marker $marker_id but a re-read still shows it exiled (a label remove call may have silently failed) — leaving it exiled for a later sweep to retry; NOT commenting, NOT excluding it from the watchdog."
+    fi
   done <<EOF_IDS
 $ids
 EOF_IDS
