@@ -4840,6 +4840,23 @@ fi
 # the quota-stop comment above), so a "hold" set while finalizing a PRIOR
 # bead this sweep must never leak into THIS bead's stamp.
 GATE_SHA_FAIL_CLASS="code"
+# SELFTEST-EXTRACT finalize-failclass-reset: BEGIN
+# ga-mcapdq: the comment above assumes a pre-set FAIL entering this function
+# always came from "the reviewer/content verdict computed earlier" — true
+# for the fast path, but Phase C's genuine-timeout-with-a-live-reviewer
+# branch (the "else" beside the dead-reviewer requeue, above the caller of
+# this function) ALSO pre-sets OVERALL_VERDICT="FAIL" despite no reviewer
+# ever answering. GATE_FAIL_NO_EVAL (plain script-global, same relay idiom
+# as QUOTA_REQUEUE/REQUEUE_REASON above) is that branch's signal. Captured
+# into a function-local, and the script-global zeroed immediately, so a
+# stale 1 can never leak into a LATER bead finalized later in this same
+# sweep — identical staleness concern to QUOTA_REQUEUE/REQUEUE_REASON.
+local GATE_FAIL_NO_EVAL_RUN="${GATE_FAIL_NO_EVAL:-0}"
+GATE_FAIL_NO_EVAL=0
+if [ "$GATE_FAIL_NO_EVAL_RUN" = "1" ]; then
+  GATE_SHA_FAIL_CLASS="hold"  # ga-mcapdq: timeout produced no verdict from anyone — not a code rejection
+fi
+# SELFTEST-EXTRACT finalize-failclass-reset: END
 
 # ── ga-nooaw: FAIL-CLOSED BY SHA ─────────────────────────────────────────────
 # A prior, independent gate-run may already have rejected this EXACT commit
@@ -6699,13 +6716,26 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       bd -C "$BEAD_CITY" assign "$BEAD_ID" "" 2>/dev/null || true
     else
       # (b) TRANSITION TO A PILOT-RE-DISPATCHABLE needs-fix STATE.
-      NEW_ATTEMPT=$((PREV_ATTEMPT + 1))
-      log "Marking $BEAD_ID gate:needs-fix (attempt $NEW_ATTEMPT/$GATE_FIX_CAP) for autonomous Pilot re-dispatch."
-      # Bump the attempt counter (drop any stale counters first).
-      for OLD in $(printf '%s' "$SRC_LABELS" | tr ' ' '\n' | grep '^gate:fix-attempt:'); do
-        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "$OLD" -q 2>/dev/null || true
-      done
-      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:fix-attempt:${NEW_ATTEMPT}" -q 2>/dev/null || true
+      # SELFTEST-EXTRACT finalize-fixattempt-bump: BEGIN
+      if [ "$GATE_FAIL_NO_EVAL_RUN" = "1" ]; then
+        # ga-mcapdq: a reviewer timeout never evaluated this code (no
+        # verdict from anyone) — leave gate:fix-attempt:* exactly as-is.
+        # Bumping it here would burn one of the author's GATE_FIX_CAP
+        # auto-retries on a run that never actually judged their content
+        # (same family as ga-39l9z2/ga-l7mvtw: the counter must register
+        # rejection, not administrative/infra noise).
+        NEW_ATTEMPT="$PREV_ATTEMPT"
+        log "Marking $BEAD_ID gate:needs-fix (reviewer timeout, ga-mcapdq) — fix-attempt left at $PREV_ATTEMPT, no evaluation occurred."
+      else
+        NEW_ATTEMPT=$((PREV_ATTEMPT + 1))
+        log "Marking $BEAD_ID gate:needs-fix (attempt $NEW_ATTEMPT/$GATE_FIX_CAP) for autonomous Pilot re-dispatch."
+        # Bump the attempt counter (drop any stale counters first).
+        for OLD in $(printf '%s' "$SRC_LABELS" | tr ' ' '\n' | grep '^gate:fix-attempt:'); do
+          bd -C "$BEAD_CITY" label remove "$BEAD_ID" "$OLD" -q 2>/dev/null || true
+        done
+        bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:fix-attempt:${NEW_ATTEMPT}" -q 2>/dev/null || true
+      fi
+      # SELFTEST-EXTRACT finalize-fixattempt-bump: END
       bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-fix"                  -q 2>/dev/null || true
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing"   -q 2>/dev/null || true  # wa-qq33j: clear in-review state (FAIL/needs-fix)
       # Clear stale Pilot claim labels left over from the failed dispatch.
@@ -8194,6 +8224,22 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
           warn "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) TIMED OUT after ${PC_ELAPSED}s (limit=${PC_TIMEOUT_SECS}s) with $VERDICTS_RECEIVED/$REQUIRED_REVIEWERS verdicts. Treating as FAIL."
           OVERALL_VERDICT="FAIL"
           FAIL_REASONS="TIMEOUT: reviewers did not submit verdicts within ${PC_TIMEOUT_MIN} minutes."
+          # SELFTEST-EXTRACT phase-c-genuine-timeout-no-eval: BEGIN
+          # ga-mcapdq: at least one pending reviewer is confirmed LIVE (not
+          # dead — see the dead-reviewer branch above) but slow/wedged, so
+          # this run genuinely timed out with NO verdict from anyone. That
+          # is a FAIL (unlike dead-reviewer, this doesn't self-heal via
+          # requeue — see this bead's own "invariantes" for why: an
+          # always-alive-but-wedged reviewer would requeue forever), but it
+          # is NOT a code rejection — nobody evaluated the content. Signal
+          # this to gate_finalize_run() so its fail-class reset (top of
+          # function) classes it "hold", and its fix-attempt bump (Step 10
+          # FAIL path) leaves the counter untouched — same script-global
+          # relay idiom as QUOTA_REQUEUE/REQUEUE_REASON just above, read
+          # once and zeroed at each consumption site so it can never leak
+          # into a later, unrelated bead finalized later in this sweep.
+          GATE_FAIL_NO_EVAL=1
+          # SELFTEST-EXTRACT phase-c-genuine-timeout-no-eval: END
           # SELFTEST-EXTRACT phase-c-timeout-close-fn: BEGIN
           for PC_VB in "${VERDICT_BEAD_IDS[@]}"; do
             # ga-art5: same conflation this whole bead exists to close, now
