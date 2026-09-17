@@ -2165,11 +2165,31 @@ else
     fi
   fi
   log "Daemon refresh: pre=$DAEMON_REFRESH_PRE_SHA post=$POST_DEPLOY_SHA (this-pull-pre=$PRE_DEPLOY_SHA) this-pull-structurally-inert=${THIS_PULL_STRUCTURALLY_INERT:-unknown} sensitive='$SENSITIVE_DAEMONS' extra_roots='$EXTRA_RUNTIME_ROOTS' ..."
+  # ga-xz3ypu: pass this bead's own merge range through so daemon-refresh.sh's
+  # Step 1b (ga-agracx) can tell "this bead's own plist" apart from "some
+  # other bead's plist" — same BEAD_MERGE_PRE_SHA/BEAD_MERGE_SHA convention
+  # quality-gate-dispatcher.sh's own call site already uses (its
+  # MERGE_PRE_MAIN_SHA/MERGE_SHA are this file's MERGE_PRE_MAIN/MERGE_SHA).
+  # Neither call site here ever set these before, so Step 1b's attribution
+  # guard always took its "unknown" branch — which defaults to attributable —
+  # for every story-delivery.sh-driven deploy (wa-a7tca/wa-8urdy, 2026-09-17).
+  # Deliberately NOT MERGE_OWN_BASE_SHA (used above, in the Path-B-only elif):
+  # that var is assigned only when PRE_DEPLOY_SHA==POST_DEPLOY_SHA — on the far
+  # more common Path A it is never assigned at all, and referencing it here
+  # would be an unbound-variable abort under this file's `set -euo pipefail`.
+  # MERGE_SHA/MERGE_PRE_MAIN are always defined (defaulted "" earlier in the
+  # sweep loop), and by this point MERGE_VERDICT=="verified" is guaranteed
+  # (the pre-deploy merge-verification HALT above already `continue`d
+  # otherwise). daemon-refresh.sh's own guard independently re-verifies
+  # non-empty/distinct/ancestor before trusting either value, so an empty or
+  # stale MERGE_PRE_MAIN here can only ever fall back to today's existing
+  # (safe) attribute-by-default behavior — never misattribute.
   REFRESH_OUT=$(RUNTIME_DIR="$RUNTIME_DIR" \
     PRE_DEPLOY_SHA="$DAEMON_REFRESH_PRE_SHA" POST_DEPLOY_SHA="$POST_DEPLOY_SHA" \
     DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
     EXTRA_RUNTIME_ROOTS="$EXTRA_RUNTIME_ROOTS" \
     DAEMON_BASELINE_OVERRIDES="$DAEMON_BASELINE_OVERRIDES" \
+    BEAD_MERGE_PRE_SHA="${MERGE_PRE_MAIN:-}" BEAD_MERGE_SHA="${MERGE_SHA:-}" \
     DRY_RUN="$DRY_RUN" \
     bash "$REFRESH_HELPER" || true)
   REFRESH_VERDICT=$(echo "$REFRESH_OUT" | grep '^VERDICT=' | head -1 | sed 's/^VERDICT=//')
