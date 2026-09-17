@@ -376,6 +376,15 @@ JSON
     # inject specific approved-feature fixtures to exercise _filter_dispatch_gates
     # on the HQ TIER2 path (ga-25-hq-tier2-gates). Default [] keeps every other
     # scenario byte-identical to before this seam existed.
+    # ga-3hhnyn: FAKE_TIER2_QUERY_FAIL=1 simulates the query itself failing
+    # (non-zero exit, no stdout) so a scenario can prove the lanes-full
+    # backoff path's WAITING_QUERY_OK guard fails closed to "unknown" rather
+    # than collapsing a failed query into "[]" (root-class:error-vs-empty).
+    # Default 0/unset keeps every other scenario byte-identical.
+    if [ "${FAKE_TIER2_QUERY_FAIL:-0}" = "1" ]; then
+      echo "simulated bd failure for story:approved query" >&2
+      exit 1
+    fi
     printf '%s' "${FAKE_TIER2_JSON:-[]}" ;;
   *"--created-after"*)
     # ga-6psx5: sling orphan-adoption lookup — "did gc sling already create a
@@ -789,6 +798,7 @@ run_capacity() {
 # eligible-vs-waiting split. FAKE_TIER2_JSON feeds the SAME `-l story:approved`
 # query the backoff path's cheap WAITING_APPROVED/ELIGIBLE_APPROVED count uses.
 #   $1 = FAKE_TIER2_JSON (the -l story:approved query result)
+#   $2 = FAKE_TIER2_QUERY_FAIL (1 = simulate the query itself failing)
 run_lanefull() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
@@ -804,6 +814,7 @@ run_lanefull() {
     MAX_SMALL=0 \
     MAX_BIG=0 \
     FAKE_TIER2_JSON="${1:-[]}" \
+    FAKE_TIER2_QUERY_FAIL="${2:-0}" \
     FAKE_BLOCKED_IDS="" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
@@ -8302,10 +8313,15 @@ if echo "$LOGLFA" | grep -q "none can dispatch this sweep"; then
 else
   ok "ga-3hhnyn: log does NOT blame lane capacity when nothing was eligible anyway"
 fi
-if echo "$LOGLFA" | grep -q "NOT the blocker"; then
+if echo "$LOGLFA" | grep -q "not lane capacity"; then
   ok "ga-3hhnyn: log honestly states lane occupancy is not the blocker"
 else
-  bad "ga-3hhnyn: log missing the 'not the blocker' honesty clause"
+  bad "ga-3hhnyn: log missing the 'not lane capacity' honesty clause"
+fi
+if echo "$LOGLFA" | grep -q "Both lanes full (small=0/0 unclassified_lane=0, big=0/0). Pilot backing off."; then
+  ok "ga-3hhnyn: factual slot-occupancy line still prints (informational, not framed as the cause)"
+else
+  bad "ga-3hhnyn: factual slot-occupancy line missing when all waiting beads were vetoed"
 fi
 
 # ── Scenario ga-3hhnyn-b: no over-correction — a genuinely eligible bead still
@@ -8326,6 +8342,23 @@ if echo "$LOGLFB" | grep -q "Both lanes full (small=0/0 unclassified_lane=0, big
   ok "ga-3hhnyn: slot-occupancy line still prints when lane capacity IS the real blocker"
 else
   bad "ga-3hhnyn: slot-occupancy line missing/changed when lane capacity IS the real blocker"
+fi
+
+# ── Scenario ga-3hhnyn-c: the story:approved query itself FAILS (root-class:
+# error-vs-empty) — must report "unknown", never collapse into "0 eligible"
+# (which would falsely assert every waiting bead is vetoed) or a specific
+# eligible count derived from an empty fallback.
+echo "Scenario ga-3hhnyn-c: story:approved query FAILS -> log says counts are unknown, never '0 eligible' or a lane-capacity verdict"
+LOGLFC="$(run_lanefull "[]" "1")"
+if echo "$LOGLFC" | grep -q "UNKNOWN this sweep"; then
+  ok "ga-3hhnyn: a failed story:approved query is reported as unknown, not silently zero"
+else
+  bad "ga-3hhnyn: REGRESSION — a failed story:approved query did not produce the 'UNKNOWN this sweep' line"
+fi
+if echo "$LOGLFC" | grep -qE "0 eligible|eligible \(HQ; both lanes full"; then
+  bad "ga-3hhnyn: REGRESSION — a failed query was reported as a concrete eligible count (error collapsed into empty)"
+else
+  ok "ga-3hhnyn: a failed query is NOT reported as any concrete eligible count"
 fi
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
