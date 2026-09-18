@@ -2248,6 +2248,27 @@ else
   REFRESH_REASON=$(echo  "$REFRESH_OUT" | grep '^REASON='  | head -1 | sed 's/^REASON=//')
   REFRESH_RESTARTED=$(echo "$REFRESH_OUT" | grep '^RESTARTED=' | head -1 | sed 's/^RESTARTED=//')
   REFRESH_GUARDED=$(echo "$REFRESH_OUT" | grep '^GUARDED=' | head -1 | sed 's/^GUARDED=//')
+  # ga-87solq: GUARDED_OWN (wa-flysp, header point 16) is the subset of
+  # REFRESH_GUARDED whose OWN entrypoint/template changed — CLOSURE_ONLY
+  # members are "known noise" per this file's own REFRESH_ACTION text below,
+  # yet the NEEDS_GUARDED_RESTART_UNATTRIBUTED check further down used to
+  # intersect against the full combined REFRESH_GUARDED, so a story whose
+  # own delta only ever closure-reaches a stuck daemon could never be
+  # exonerated. Measured live: every story since the baseline froze at
+  # 8cb99239 (9h+/51 commits, 8 manual unblocks) reached a wide, closure-
+  # contaminated guarded set via a shared file (e.g. daemons/deploy_deps.json
+  # regeneration touching dozens of daemons' recorded closures) — the
+  # intersection was never empty, so the rig-wide marker never advanced.
+  # Absent line (older daemon-refresh.sh predating this field) falls back to
+  # the full combined list — never assume "nothing own-file stuck" when the
+  # split simply is not available; a present-but-empty line means the split
+  # ran and genuinely found no own-file-changed member, which IS trustworthy.
+  REFRESH_GUARDED_OWN_LINE=$(echo "$REFRESH_OUT" | grep '^GUARDED_OWN=' | head -1 || true)
+  if [ -n "$REFRESH_GUARDED_OWN_LINE" ]; then
+    REFRESH_GUARDED_OWN=$(echo "$REFRESH_GUARDED_OWN_LINE" | sed 's/^GUARDED_OWN=//')
+  else
+    REFRESH_GUARDED_OWN="$REFRESH_GUARDED"
+  fi
   REFRESH_FRESHFAIL=$(echo "$REFRESH_OUT" | grep '^FRESH_FAIL=' | head -1 | sed 's/^FRESH_FAIL=//')
   # ga-0fawwr: every label this cycle's discovery examined — may be genuinely
   # absent (an older daemon-refresh.sh predating this field, same hazard the
@@ -2331,15 +2352,28 @@ else
       # account of 52 OTHER sensitive daemons stuck in the wide window for
       # unrelated reasons (no drain path, nobody restarts them every deploy).
       # Same fix shape as ga-xz3ypu (JOB_NOT_INSTALLED): attribute by
-      # intersecting the CURRENT guarded set ($REFRESH_GUARDED) with what this
-      # bead's own merge actually reaches ($MERGE_OWN_AFFECTED, already computed
-      # above) — no new infrastructure, matches invariant (a).
+      # intersecting the CURRENT guarded set with what this bead's own merge
+      # actually reaches ($MERGE_OWN_AFFECTED, already computed above) — no
+      # new infrastructure, matches invariant (a).
+      #
+      # ga-87solq: intersect against REFRESH_GUARDED_OWN, not the full
+      # REFRESH_GUARDED. A daemon this bead's delta only reaches via
+      # transitively-changed imports (closure-only) is exactly the "known
+      # noise" class REFRESH_ACTION's own CLOSURE-ONLY text already
+      # disclaims below — it was never safe to treat as proof this bead
+      # caused it, so it should never have been able to block exoneration
+      # either. MERGE_OWN_AFFECTED itself is deliberately left as the raw,
+      # unnarrowed reach (not similarly split into own/closure-only) —
+      # conservative on purpose: this bead's own contribution being "closure-
+      # only" toward a genuinely-own-file-stuck daemon does not prove this
+      # bead is blameless for it, only the reverse (an own-file-stuck daemon
+      # this bead cannot even closure-reach) does.
       NEEDS_GUARDED_RESTART_UNATTRIBUTED=0
       if [ "$REFRESH_VERDICT" = "NEEDS_GUARDED_RESTART" ] \
          && [ "$THIS_PULL_STRUCTURALLY_INERT" = "0" ] \
          && [ -n "${MERGE_OWN_AFFECTED// /}" ] \
          && [ -z "$(comm -12 \
-              <(echo "$REFRESH_GUARDED" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+              <(echo "$REFRESH_GUARDED_OWN" | tr ' ' '\n' | grep -v '^$' | sort -u) \
               <(echo "$MERGE_OWN_AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u))" ]; then
         NEEDS_GUARDED_RESTART_UNATTRIBUTED=1
       fi
