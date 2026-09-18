@@ -285,6 +285,22 @@ GO_BUILD_ORPHAN_GRACE_SECS="${DOLT_DISK_FLOOR_GO_BUILD_ORPHAN_GRACE_SECS:-1800}"
 # same as a go-build dir, so the same age-only (not size-based) grace applies.
 CODE_SIGN_CLONE_ORPHAN_GRACE_SECS="${DOLT_DISK_FLOOR_CODE_SIGN_CLONE_ORPHAN_GRACE_SECS:-1800}"
 
+# ga-ofi307: seconds a per-invocation shadow git repo under
+# /private/tmp/claude-<uid>/bash-edit-diff/<hash>/ (Claude Code's own Bash-tool
+# edit-diff rendering cache — see _reap_bash_edit_diff_orphans) must sit
+# untouched (mtime age) before this lever will delete it. Age-ONLY grace,
+# deliberately with NO liveness check (unlike GO_BUILD_ORPHAN_GRACE_SECS/
+# CODE_SIGN_CLONE_ORPHAN_GRACE_SECS above, both gated by a real lsof liveness
+# probe): each subdirectory is named by a content hash, not a PID or session
+# id, so there is no live-process correlation this guard could check even if
+# it wanted to (confirmed live, ga-ofi307: "sem correlacao com sessao viva").
+# mtime is the only signal available, and it is a reliable one — an active
+# session rewrites its own dir's index on every edit. Default of 7200 (2h)
+# matches this bead's own manual remediation the night it was filed: 31 dirs
+# untouched >2h were safe to delete (3.4GB freed), preserving the 7 still-
+# active ones with zero side effects (the cache regenerates on next use).
+BASH_EDIT_DIFF_ORPHAN_GRACE_SECS="${DOLT_DISK_FLOOR_BASH_EDIT_DIFF_GRACE_SECS:-7200}"
+
 NOTIFY_COOLDOWN_SECS="${DOLT_DISK_FLOOR_NOTIFY_COOLDOWN_SECS:-3600}"   # 1h — tighter
                         # than disk-pressure-monitor's 6h; this is Dolt-specific
                         # last-resort protection, not general city monitoring.
@@ -671,6 +687,18 @@ _code_sign_clone_root() {
   echo "$parent/X/com.google.Chrome.code_sign_clone"
 }
 
+# _bash_edit_diff_root → /private/tmp/claude-<uid>/bash-edit-diff, the root
+# Claude Code's own Bash-tool edit-diff renderer uses for its per-invocation
+# shadow git repos (see _reap_bash_edit_diff_orphans's header for the full
+# incident, ga-ofi307). Same "claude-$(id -u)" convention scratchpad-
+# reaper.sh's own SCRATCH_REAL_DEFAULT_ROOT already uses — this is a SIBLING
+# of that scratchpad root, not nested inside it, which is exactly why neither
+# the scratchpad reaper nor the transcript reaper ever saw it ("ficam num
+# diretorio irmao, com nome proprio, sem correlacao com sessao viva").
+_bash_edit_diff_root() {
+  echo "/private/tmp/claude-$(id -u 2>/dev/null)/bash-edit-diff"
+}
+
 # _dir_size_mb <dir> → integer MB used by <dir>, or "" if du fails/parses
 # oddly (e.g. dir doesn't exist) — MB granularity (not GB, unlike
 # _gocache_size_gb) because individual go-build<N> dirs commonly run well
@@ -832,6 +860,91 @@ _should_reap_code_sign_clone_dir() {
   [ "$age_secs" -ge "$grace_secs" ]
 }
 
+# _should_reap_bash_edit_diff_dir <age_secs> <grace_secs> → 0 (true) only when
+# age_secs >= grace_secs. Age-ONLY — see BASH_EDIT_DIFF_ORPHAN_GRACE_SECS's own
+# comment for why no liveness check exists for this lever (no PID/session
+# correlation to check against, unlike the two _should_reap_*_dir functions
+# above). Non-numeric/empty age or grace fails CLOSED — same never-guess-to-
+# justify-deleting discipline as every other _should_reap_* function here.
+_should_reap_bash_edit_diff_dir() {
+  local age_secs="$1" grace_secs="$2"
+  case "$age_secs" in ''|*[!0-9]*) return 1 ;; esac
+  case "$grace_secs" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$age_secs" -ge "$grace_secs" ]
+}
+
+# _top_disk_consumers [n] → the N largest immediate entries across a fixed,
+# bounded set of scratch/cache roots this guard already knows about (one
+# level deep each) — printed as "MB path", largest first. Companion to
+# _top_mem_processes above, same rationale (ga-ofi307, invariant b of that
+# bead): this guard's other reclaim levers each only ever look at the ONE
+# specific directory shape they were written for, so a genuinely NEW consumer
+# (like the bash-edit-diff cache before this bead — 3.5GB, larger than every
+# Dolt database in the city combined, sitting in a directory none of the
+# other levers ever looked at) stays invisible until a human runs `du` by
+# hand to find it, exactly what happened the night this bead was filed. This
+# does NOT replace a lever with real reclaim logic of its own — a genuinely
+# new consumer still needs one written for it, same as bash-edit-diff got
+# here — it exists so the NEXT unknown consumer shows up in this guard's own
+# alert BEFORE a human has to go looking, by measuring one level into the
+# SAME parent directories the levers above already resolve (the bash-edit-
+# diff parent, the go-build tmp root, the code-sign-clone parent, GOCACHE's
+# parent, and $CITY/.dolt-backup) — the bash-edit-diff parent in particular
+# is the exact directory that hid this incident's own consumer ("ficam num
+# diretorio irmao" — see this file's own header).
+#
+# Deliberately NOT a whole-filesystem walk (never `find /`, `find ~`, or a
+# recursive scan from `/`) — every root here is one this guard (or a reaper
+# it already shells out to) already touches, so this stays a handful of
+# bounded, ONE-LEVEL scans, never a scan of TCC-protected user directories
+# (Desktop/Documents/Downloads/iCloud/network mounts).
+#
+# ONE `du -sk` PER ENTRY, NOT ONE PER ROOT: an earlier version of this
+# function looped calling _dir_size_mb (its own `du -sk` process) per
+# immediate entry — measured LIVE against this guard's own
+# DARWIN_USER_TEMP_DIR (_go_build_tmp_root): ~20,000 entries, 100s+ wall time
+# from pure fork/exec overhead alone, an unacceptable cost for something that
+# runs on every alert. The opposite extreme — one single `du -sk "$dir"/*`
+# call passing every entry as an argv — measured WORSE: "argument list too
+# long" (ARG_MAX) on that same ~20,000-entry root, a hard failure, not just
+# slow. `find -maxdepth 1 -mindepth 1 -print0 | xargs -0 du -sk` is the
+# correct middle ground: xargs chunks the argv itself to stay under ARG_MAX
+# while still batching far fewer `du` process spawns than one-per-entry —
+# measured on the SAME 20,000-entry root: ~4s (and correctly surfaced an
+# 812MB outlier). timeout-bounded per root (20s — comfortably above the
+# slowest root measured live, ~/Library/Caches at ~15s) so one unusually
+# large or deep root can't stall the others; a partial result across the
+# remaining roots is far better than none (ga-p5q3 "couldn't finish" is not
+# "couldn't measure" — a bounded partial scan still reports what it saw).
+#
+# Best-effort, same empty-means-unmeasured contract as _top_mem_processes: a
+# root that doesn't resolve, doesn't exist, or times out is silently skipped,
+# never fabricated as a zero-size entry. Not gated by ENABLED — this is a
+# read, not a reclaim action, same precedent as _vm_swap_gb/_top_mem_processes
+# above.
+_top_disk_consumers() {
+  local n="${1:-8}"
+  local roots="" r
+  r="$(_bash_edit_diff_root)";  [ -n "$r" ] && [ -d "$(dirname "$r")" ] && roots="${roots}$(dirname "$r")"$'\n'
+  r="$(_go_build_tmp_root)";    [ -n "$r" ] && [ -d "$r" ]              && roots="${roots}${r}"$'\n'
+  r="$(_code_sign_clone_root)"; [ -n "$r" ] && [ -d "$(dirname "$r")" ] && roots="${roots}$(dirname "$r")"$'\n'
+  r="$(_gocache_dir)";          [ -n "$r" ] && [ -d "$(dirname "$r")" ] && roots="${roots}$(dirname "$r")"$'\n'
+  [ -d "$CITY/.dolt-backup" ] && roots="${roots}${CITY}/.dolt-backup"$'\n'
+  [ -z "$roots" ] && { echo ""; return; }
+
+  local out="" dir kb path
+  while IFS= read -r dir; do
+    [ -z "$dir" ] && continue
+    while IFS=$'\t' read -r kb path; do
+      case "$kb" in ''|*[!0-9]*) continue ;; esac
+      out="${out}$(( kb / 1024 )) ${path}"$'\n'
+    done < <(find "$dir" -maxdepth 1 -mindepth 1 -print0 2>/dev/null | timeout 20 xargs -0 du -sk 2>/dev/null)
+  done <<< "$roots"
+
+  [ -z "$out" ] && { echo ""; return; }
+  printf '%s' "$out" | sort -rn | head -n "$n"
+}
+
 # ════════════════════════════════════════════════════════════════════════════════
 # EXECUTION (side-effecting; NOT exercised by the selftest)
 # ════════════════════════════════════════════════════════════════════════════════
@@ -894,7 +1007,20 @@ _safe_reclaim() {
   log "reclaim: avail=${before}GB at/below floor — running 'gc dolt-cleanup --force' …"
   if timeout 60 "$GC" dolt-cleanup --force >> "$LOG" 2>&1; then
     local after; after="$(_avail_gb "$DOLTDIR")"
-    log "reclaim OK — avail ${before}GB -> ${after:-?}GB"
+    # ga-ofi307: a command that exits 0 but frees literally nothing, while the
+    # disk is STILL at/below the warn floor, is not "OK" — logging it that way
+    # reads as calm success when it is the most misleading form of failure
+    # (see this file's own header). "OK" stays reserved for a real gain, or
+    # for avail already back above floor by the time this ran; zero-or-
+    # negative gain while still at/below floor gets its own, explicitly
+    # non-calm wording instead. main()'s post-reclaim diagnosis (ga-sfj3i.3)
+    # is what actually escalates this across the whole cycle — this is just
+    # the one per-lever line that must never read as calm success on its own.
+    if [ -n "$after" ] && [ "$after" -le "$before" ] && [ "$after" -le "$FLOOR_WARN_GB" ]; then
+      log "reclaim ZERO GAIN — avail ${before}GB -> ${after}GB, still at/below floor(${FLOOR_WARN_GB}GB): dolt-cleanup ran but freed nothing measurable — NOT relief, see diagnosis below"
+    else
+      log "reclaim OK — avail ${before}GB -> ${after:-?}GB"
+    fi
   else
     log "reclaim FAILED (gc dolt-cleanup --force nonzero exit)"
   fi
@@ -1410,6 +1536,88 @@ _reap_code_sign_clone_orphans() {
   fi
 }
 
+# _reap_bash_edit_diff_orphans [root] — reclaim lever (ga-ofi307): Claude
+# Code's own Bash-tool edit-diff renderer creates one full shadow git repo
+# (HEAD, config, index, objects/, refs/) per distinct edit target under
+# /private/tmp/claude-<uid>/bash-edit-diff/<hash>/ and never cleans any of
+# them up itself. MEASURED 2026-09-17 20:36: 38 of these, 250-360MB each
+# (3.5GB total) — the single largest consumer on the host that night, LARGER
+# than every Dolt database in the city combined (whatsapp_automation, the
+# next biggest, is 340MB) — and invisible to every other lever in this file:
+# not a scratchpad (_reap_dead_scratch only walks REGISTERED session
+# scratchpad dirs, and this is a sibling directory with its own name, not
+# nested under any of them), not a transcript, not GOCACHE, not a go-build or
+# code-sign-clone orphan. The guard ran that night and logged "reclaim OK —
+# avail 7GB -> 7GB" — a confident-looking success over a complete non-effect
+# (see this file's own header and _safe_reclaim's zero-gain wording above,
+# also fixed by this bead).
+#
+# Same directory-walk/mtime-age shape as _reap_go_build_orphans and
+# _reap_code_sign_clone_orphans above, deliberately MINUS their lsof
+# liveness check — see BASH_EDIT_DIFF_ORPHAN_GRACE_SECS's own comment for why
+# no liveness signal exists for this class of directory (no PID/session
+# correlation to check against; mtime is the only signal). Runs at WARN same
+# as CRITICAL (no two-tier trade-off of its own, same reasoning as go-build/
+# code-sign-clone: this is a regenerable cache, not live session state — the
+# bug's own overnight manual remediation deleted from a LIVE host with zero
+# side effects, "cache efemero, regeneravel sob demanda — nao e dado de
+# ninguem").
+#
+# Logs one line per candidate (name, MB, age, kept-or-deleted-and-why), same
+# as the two sibling orphan-reap levers above, even when nothing qualifies.
+# [root] overrides the resolved _bash_edit_diff_root for the selftest's
+# hermetic fixture; production always calls this with no argument.
+_reap_bash_edit_diff_orphans() {
+  local root="${1:-$(_bash_edit_diff_root)}"
+  if [ "$ENABLED" != "1" ]; then
+    log "bash-edit-diff-reap SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"
+    return
+  fi
+  if [ -z "$root" ] || [ ! -d "$root" ]; then
+    log "bash-edit-diff-reap SKIP — bash-edit-diff cache dir unresolved or missing (root='${root:-empty}')"
+    return
+  fi
+
+  local now; now=$(date +%s)
+  local dir base mb mtime age considered=0 freed_mb=0 unmeasured_deleted=0
+
+  for dir in "$root"/*; do
+    [ -d "$dir" ] || continue
+    considered=$((considered+1))
+    base="$(basename "$dir")"
+    mb="$(_dir_size_mb "$dir")"
+    mtime="$(stat -f %m "$dir" 2>/dev/null)"
+    if [ -z "$mtime" ]; then
+      log "bash-edit-diff-reap: ${base} (${mb:-unmeasured}MB) — SPARED (could not stat mtime; never guess age)"
+      continue
+    fi
+    age=$(( now - mtime ))
+
+    if _should_reap_bash_edit_diff_dir "$age" "$BASH_EDIT_DIFF_ORPHAN_GRACE_SECS"; then
+      if rm -rf "$dir" 2>>"$LOG"; then
+        if [ -n "$mb" ]; then
+          freed_mb=$(( freed_mb + mb ))
+        else
+          unmeasured_deleted=$((unmeasured_deleted+1))
+        fi
+        log "bash-edit-diff-reap: ${base} (${mb:-unmeasured}MB, age=${age}s) — DELETED (past ${BASH_EDIT_DIFF_ORPHAN_GRACE_SECS}s grace; ephemeral, regenerated on next edit)"
+      else
+        log "bash-edit-diff-reap: ${base} (${mb:-unmeasured}MB, age=${age}s) — DELETE FAILED (rm nonzero exit)"
+      fi
+    else
+      log "bash-edit-diff-reap: ${base} (${mb:-unmeasured}MB, age=${age}s) — SPARED (too young: age=${age}s < grace=${BASH_EDIT_DIFF_ORPHAN_GRACE_SECS}s)"
+    fi
+  done
+
+  if [ "$considered" -eq 0 ]; then
+    log "bash-edit-diff-reap: no cache dirs under ${root}"
+  elif [ "$unmeasured_deleted" -gt 0 ]; then
+    log "bash-edit-diff-reap: considered=${considered} freed=${freed_mb}MB+ (${unmeasured_deleted} deleted dir(s) had unmeasured size, not counted in freed total) under ${root}"
+  else
+    log "bash-edit-diff-reap: considered=${considered} freed=${freed_mb}MB under ${root}"
+  fi
+}
+
 # _reap_backup_residue — ninth reclaim lever, alongside _safe_reclaim and the
 # seven scratch/transcript/log/hf-cache/gocache/go-build/code-sign-clone
 # levers above (ga-8f1uh0): retired .dolt-backup/<db>.old residue left behind
@@ -1710,6 +1918,7 @@ main() {
   _reap_gocache "$was_critical"
   _reap_go_build_orphans
   _reap_code_sign_clone_orphans
+  _reap_bash_edit_diff_orphans
   _reap_backup_residue
   _reap_bloated_backup_staging "$was_critical"
 
@@ -1794,6 +2003,19 @@ main() {
       log "top memory-footprint processes: unmeasured (top produced no rows)"
     fi
 
+    # ga-ofi307 (invariant b): top DISK consumers across this guard's known
+    # scratch/cache roots — see _top_disk_consumers' own header. Logged only
+    # when actually alerting, same placement/rationale as top_mem above. This
+    # is what turns a bare "cause not identified" (below) into something a
+    # human can act on without first running `du` by hand.
+    local top_disk; top_disk="$(_top_disk_consumers 8)"
+    if [ -n "$top_disk" ]; then
+      log "top disk consumers (MB path, known scratch/cache roots):"
+      printf '%s\n' "$top_disk" | while IFS= read -r _disk_line; do log "  $_disk_line"; done
+    else
+      log "top disk consumers: unmeasured (no known roots present or du failed)"
+    fi
+
     log "class=${class} was_critical=${was_critical}: avail=${avail}GB (warn=${FLOOR_WARN_GB}GB crit=${FLOOR_CRITICAL_GB}GB) — notifying"
     # ga-ff6t9: notify's own content classifier (classify_route_detail(), in
     # whatsapp_automation/scripts/notify) decides push-vs-digest from MESSAGE
@@ -1874,7 +2096,12 @@ kills anything itself):
 ${top_mem:-  (unmeasured — top produced no rows)}
 
 (ga-sfj3i.2 measured the vm_swap<->disk correlation and the Mayor's own follow-up falsified a
-broader causal claim against 40 days of this guard's history — see that bead for the raw numbers.)"
+broader causal claim against 40 days of this guard's history — see that bead for the raw numbers.)
+
+Top disk consumers measured this cycle across this guard's known scratch/cache roots (MB path;
+ga-ofi307 — catches a new large consumer, the way bash-edit-diff's 3.5GB cache was before this
+bead, before a human has to find it by hand):
+${top_disk:-  (unmeasured — no known roots present or du failed)}"
         "$GC" mail send mayor -s "Dolt disk-floor CRITICAL: avail=${avail}GB" -m "$mail_body" 2>/dev/null || log "WARN: gc mail send mayor failed"
       else
         log "CRITICAL sample ${pending}/${CRITICAL_MAIL_SUSTAIN} — PENDING, not yet mailing Mayor (single-cycle dip may self-recover; notify above already fired unconditionally)"

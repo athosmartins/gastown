@@ -643,6 +643,204 @@ _reap_code_sign_clone_orphans "/nonexistent/path/$$/code-sign-clone-does-not-exi
 ok "_reap_code_sign_clone_orphans: nonexistent root skips cleanly (no crash — this line only runs if it didn't)"
 
 echo ""
+echo "=== _bash_edit_diff_root / _should_reap_bash_edit_diff_dir (ga-ofi307) ==="
+# ── _bash_edit_diff_root: real $(id -u)-derived path — NOT stubbed, same
+#    rationale as _code_sign_clone_root's own shape test above ─────────────
+r="$(_bash_edit_diff_root)"
+case "$r" in
+  /private/tmp/claude-*/bash-edit-diff) ok "_bash_edit_diff_root(): resolved to the expected /private/tmp/claude-<uid>/bash-edit-diff shape ($r)" ;;
+  *) bad "_bash_edit_diff_root(): expected /private/tmp/claude-<uid>/bash-edit-diff shape, got '$r'" ;;
+esac
+
+# ── _should_reap_bash_edit_diff_dir: age-ONLY boundary coverage — no
+#    liveness arg, unlike _should_reap_go_build_dir/_should_reap_code_sign_
+#    clone_dir above (ga-ofi307: no PID/session correlation exists for this
+#    directory class — see BASH_EDIT_DIFF_ORPHAN_GRACE_SECS's own comment) ──
+_should_reap_bash_edit_diff_dir 7200 7200 && ok "should_reap_bash_edit_diff_dir: age==grace → true (boundary inclusive)" || bad "should_reap_bash_edit_diff_dir 7200/7200 should be true (inclusive boundary)"
+_should_reap_bash_edit_diff_dir 7201 7200 && ok "should_reap_bash_edit_diff_dir: age(7201)>=grace(7200) → true" || bad "should_reap_bash_edit_diff_dir 7201/7200 should be true"
+_should_reap_bash_edit_diff_dir 7199 7200 && bad "should_reap_bash_edit_diff_dir: age(7199)<grace(7200) should NOT reap" || ok "should_reap_bash_edit_diff_dir: age below grace → false (too young)"
+_should_reap_bash_edit_diff_dir "" 7200   && bad "should_reap_bash_edit_diff_dir: empty age should fail CLOSED" || ok "should_reap_bash_edit_diff_dir: empty age → fails closed"
+_should_reap_bash_edit_diff_dir 7200 ""   && bad "should_reap_bash_edit_diff_dir: empty grace should fail CLOSED" || ok "should_reap_bash_edit_diff_dir: empty grace → fails closed"
+_should_reap_bash_edit_diff_dir abc 7200  && bad "should_reap_bash_edit_diff_dir: non-numeric age should fail CLOSED" || ok "should_reap_bash_edit_diff_dir: non-numeric age → fails closed"
+
+echo ""
+echo "=== _reap_bash_edit_diff_orphans (ga-ofi307): real directory walk, hermetic fixture ==="
+# WHY: the real incident this bead exists for — a 3.5GB, 38-directory cache
+# under /private/tmp/claude-<uid>/bash-edit-diff/ that every OTHER lever in
+# this file was blind to (acceptance test 1: "disco abaixo do piso + cache de
+# diff grande e antigo -> o guard libera e reporta o ganho real"). Two
+# candidates: an OLD dir (must delete, with a real measurable payload so the
+# freed-MB assertion below is meaningful, not a rounds-to-zero artifact) and
+# a NEW dir still inside the grace window (must spare) — no in-use candidate,
+# unlike the go-build/code-sign-clone fixtures above, since this lever has NO
+# liveness check to exercise (age is the only signal, by design — see this
+# lever's own header).
+BED_ROOT="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-bed.XXXXXX)"
+
+BED_OLD="$BED_ROOT/10730595755780137790-4591840309193377447-96a4180e768d522b"
+mkdir -p "$BED_OLD/objects"
+head -c 5242880 /dev/zero > "$BED_OLD/index" 2>/dev/null   # 5MB — real, measurable payload
+touch -t "$OLD_TS" "$BED_OLD"
+
+BED_NEW="$BED_ROOT/4342029083087454221-9927937567073590141-0a886f1dc6265784"
+mkdir -p "$BED_NEW/objects"
+echo "fresh" > "$BED_NEW/index"   # mtime defaults to now — inside grace
+
+# shellcheck disable=SC2034  # read by _reap_bash_edit_diff_orphans in the sourced script
+# 1800s (not the production 7200s default — already covered by the boundary
+# tests above): OLD_TS is shared with the go-build/code-sign-clone fixtures
+# above and is fixed at "1 hour ago", so the grace value here just needs to
+# stay below that, same convention those fixtures already use.
+BASH_EDIT_DIFF_ORPHAN_GRACE_SECS=1800
+_reap_bash_edit_diff_orphans "$BED_ROOT"
+
+if [ ! -d "$BED_OLD" ]; then
+  ok "_reap_bash_edit_diff_orphans: old (>=grace) cache dir DELETED"
+else
+  bad "_reap_bash_edit_diff_orphans: old cache dir should have been DELETED, still present"
+fi
+if [ -d "$BED_NEW" ]; then
+  ok "_reap_bash_edit_diff_orphans: new (within grace) cache dir SPARED"
+else
+  bad "_reap_bash_edit_diff_orphans: new cache dir should be spared by the grace period, was removed"
+fi
+if grep -qE "bash-edit-diff-reap: .*— DELETED" "$LOG" 2>/dev/null && grep -qE "bash-edit-diff-reap: considered=2 freed=[1-9][0-9]*MB( |$)" "$LOG" 2>/dev/null; then
+  ok "_reap_bash_edit_diff_orphans: logs a real per-candidate DELETED line AND a non-zero measured MB gain (acceptance test 1 — reports real gain, not silence)"
+else
+  bad "_reap_bash_edit_diff_orphans: expected a DELETED line and a non-zero freed=NMB summary, log tail: $(tail -6 "$LOG" 2>/dev/null | tr '\n' ';')"
+fi
+rm -rf "$BED_ROOT"
+
+# ── _reap_bash_edit_diff_orphans: nonexistent root → SKIP cleanly, never crash ──
+_reap_bash_edit_diff_orphans "/nonexistent/path/$$/bash-edit-diff-does-not-exist"
+ok "_reap_bash_edit_diff_orphans: nonexistent root skips cleanly (no crash — this line only runs if it didn't)"
+
+echo ""
+echo "=== _safe_reclaim (ga-ofi307): zero-gain wording must not read as calm 'OK' ==="
+# WHY: the real incident this bead exists for — 'gc dolt-cleanup --force' ran
+# successfully (exit 0) but froze nothing, and the OLD wording logged
+# "reclaim OK — avail 7GB -> 7GB" verbatim, live, 2026-09-17 20:36 — the exact
+# misleading-success shape this bead names ("a forma mais enganosa de falha:
+# le como sucesso"). GC and gc_dolt_probe stubbed so this exercises ONLY the
+# wording/condition logic, never a real dolt-cleanup write or a real (if
+# read-only) probe against this host's actual live Dolt server.
+gc_dolt_probe() { return 0; }   # confirmed-healthy, so _safe_reclaim proceeds
+GC=true                          # harmless no-op standing in for dolt-cleanup, exit 0
+
+_avail_gb() { echo "7"; }        # before=7 (arg) -> after=7: zero gain, still <= warn floor(8)
+_safe_reclaim 7
+if grep -q "reclaim ZERO GAIN — avail 7GB -> 7GB" "$LOG" 2>/dev/null; then
+  ok "_safe_reclaim: zero gain while still at/below floor logs 'ZERO GAIN', never calm 'OK'"
+else
+  bad "_safe_reclaim: expected a 'reclaim ZERO GAIN' line, log tail: $(tail -3 "$LOG" 2>/dev/null | tr '\n' ';')"
+fi
+if grep -qE '\] reclaim OK — avail 7GB -> 7GB' "$LOG" 2>/dev/null; then
+  bad "_safe_reclaim: MUST NOT log the old calm 'reclaim OK' wording for a zero-gain, still-below-floor cycle"
+else
+  ok "_safe_reclaim: does not log the old misleading 'reclaim OK' wording for this cycle"
+fi
+
+_avail_gb() { echo "20"; }       # after=20: real gain, back above floor
+_safe_reclaim 7
+if grep -q "reclaim OK — avail 7GB -> 20GB" "$LOG" 2>/dev/null; then
+  ok "_safe_reclaim: a real gain still logs plain 'OK' (opposite remedies stay distinguishable — ga-sfj3i.3 discipline)"
+else
+  bad "_safe_reclaim: expected 'reclaim OK — avail 7GB -> 20GB' for a real gain, log tail: $(tail -3 "$LOG" 2>/dev/null | tr '\n' ';')"
+fi
+
+_avail_gb() { echo "20"; }       # before=20, after=20: zero gain, but NEVER actually below floor
+_safe_reclaim 20
+if grep -q "reclaim OK — avail 20GB -> 20GB" "$LOG" 2>/dev/null; then
+  ok "_safe_reclaim: zero gain while comfortably above floor still logs plain 'OK' (not a false alarm)"
+else
+  bad "_safe_reclaim: expected plain 'OK' for zero-gain-but-above-floor, log tail: $(tail -3 "$LOG" 2>/dev/null | tr '\n' ';')"
+fi
+
+echo ""
+echo "=== _top_disk_consumers (ga-ofi307): real scan, hermetic fixture, ARG_MAX-safe on a large root ==="
+# WHY: proves this reads real sizes via the real find|xargs|du pipeline
+# (nothing stubbed here — the main()-level stub added later in this file is
+# ONLY for main()-scenario determinism, see that stub's own comment) AND that
+# the xargs-batched approach survives a root with far more entries than a
+# single `du` invocation's argv could hold. MEASURED live against this host's
+# actual DARWIN_USER_TEMP_DIR (~20,000 entries) while building this bead: a
+# naive one-`du`-per-entry loop took 100s+ wall time from fork/exec overhead
+# alone, and a single `du -sk "$dir"/*` batching every entry into one argv
+# failed outright with "argument list too long" (ARG_MAX) — see this
+# function's own header for both measurements. 500 entries here is enough to
+# exercise the same batching path without the real test suite paying the
+# full ~20,000-entry cost.
+TDC_ROOT="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-tdc.XXXXXX)"
+mkdir -p "$TDC_ROOT/bashdiff/big-cache-dir" "$TDC_ROOT/gobuildtmp" \
+         "$TDC_ROOT/codesign_parent/X/com.google.Chrome.code_sign_clone" \
+         "$TDC_ROOT/gocache_parent/go-build" "$TDC_ROOT/city/.dolt-backup"
+head -c 5242880 /dev/zero > "$TDC_ROOT/bashdiff/big-cache-dir/payload" 2>/dev/null   # the one big entry this test proves gets surfaced
+for i in $(seq 1 500); do mkdir -p "$TDC_ROOT/gobuildtmp/entry$i"; echo x > "$TDC_ROOT/gobuildtmp/entry$i/f"; done
+
+# Point the four resolver functions + CITY at the fixture tree. Deliberately
+# left overridden afterward, NOT restored — same precedent as this file's own
+# main()-level gc_dolt_probe_robust override below: nothing between here and
+# that section calls these four functions for real again (their own dedicated
+# shape/fixture tests above already ran), and the main()-level section stubs
+# the REAP functions that would otherwise call them wholesale.
+_bash_edit_diff_root()  { echo "$TDC_ROOT/bashdiff/leaf"; }   # dirname() is the scanned root
+_go_build_tmp_root()    { echo "$TDC_ROOT/gobuildtmp"; }
+_code_sign_clone_root() { echo "$TDC_ROOT/codesign_parent/X/com.google.Chrome.code_sign_clone"; }
+_gocache_dir()          { echo "$TDC_ROOT/gocache_parent/go-build"; }
+CITY="$TDC_ROOT/city"
+
+tdc_result="$(_top_disk_consumers 5)"
+
+case "$tdc_result" in
+  *"big-cache-dir"*) ok "_top_disk_consumers: planted 5MB fixture dir surfaced in the result" ;;
+  *) bad "_top_disk_consumers: planted fixture dir missing from result — got: $(printf '%s' "$tdc_result" | tr '\n' ';')" ;;
+esac
+tdc_first_line="$(printf '%s\n' "$tdc_result" | head -1)"
+case "$tdc_first_line" in
+  *"big-cache-dir"*) ok "_top_disk_consumers: the 5MB fixture sorts FIRST (largest-first ordering, beating 500 tiny siblings)" ;;
+  *) bad "_top_disk_consumers: expected the largest (5MB) fixture first, got: $tdc_first_line" ;;
+esac
+tdc_line_count="$(printf '%s\n' "$tdc_result" | grep -c .)"
+[ "$tdc_line_count" -le 5 ] && ok "_top_disk_consumers: respects the requested n=5 cap (got $tdc_line_count lines)" || bad "_top_disk_consumers: exceeded requested n=5 cap, got $tdc_line_count lines"
+rm -rf "$TDC_ROOT"
+
+# ── _top_disk_consumers: no roots resolve/exist → empty, never a crash ──────
+_bash_edit_diff_root() { echo ""; }
+_go_build_tmp_root() { echo ""; }
+_code_sign_clone_root() { echo ""; }
+_gocache_dir() { echo ""; }
+CITY="/nonexistent/path/$$/no-such-city"
+tdc_empty="$(_top_disk_consumers 5)"
+[ -z "$tdc_empty" ] && ok "_top_disk_consumers: no roots resolve → empty result, never a crash" || bad "_top_disk_consumers: expected empty result when no roots resolve, got: $tdc_empty"
+
+# Restore the four resolvers + CITY to their real implementations — later
+# scenarios in THIS file don't call them directly again, but leaving a global
+# like CITY pointed at a deleted tmp dir is needless risk for any future
+# addition between here and the main()-level section's own (deliberately
+# permanent) stubs.
+_bash_edit_diff_root() { echo "/private/tmp/claude-$(id -u 2>/dev/null)/bash-edit-diff"; }
+_go_build_tmp_root() {
+  local d
+  d="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null)"
+  [ -z "$d" ] && { echo ""; return; }
+  echo "${d%/}"
+}
+_code_sign_clone_root() {
+  local t parent
+  t="$(_go_build_tmp_root)"
+  [ -z "$t" ] && { echo ""; return; }
+  parent="$(dirname "$t")"
+  echo "$parent/X/com.google.Chrome.code_sign_clone"
+}
+_gocache_dir() {
+  local d
+  d="$(command -v go >/dev/null 2>&1 && go env GOCACHE 2>/dev/null)"
+  [ -n "$d" ] && { echo "$d"; return; }
+  echo "$HOME/Library/Caches/go-build"
+}
+CITY="/Users/athos/gt/.gascity-gastown-hq"
+
+echo ""
 echo "=== _reap_dead_scratch: production sentinel wiring (ga-h565g) ==="
 # _reap_dead_scratch is the REAL caller scratchpad-reaper.sh's own header
 # names as the one allowed to set SCRATCHPAD_REAPER_PROD=1 (ga-h565g) — this
@@ -1377,6 +1575,17 @@ _vm_swap_gb() { echo "7"; }
 # _vm_swap_gb stub immediately above (ga-sfj3i.3, ga-xz5re).
 _top_mem_processes() { printf '%s\n' "51664 1 1870M 302M com.gastown.dolt-server dolt" "11357 1 253M 4M - claude"; }
 
+# _top_disk_consumers is new (ga-ofi307), same reasoning as _top_mem_processes
+# immediately above: real and hermetic in isolation (proven with its own
+# fixture below), but STUBBED here so main()-scenario assertions on log/mail
+# content don't depend on this host's actual scratch/cache directory sizes at
+# test time — and so this whole suite doesn't pay this function's real,
+# measured ~20-40s cost (multiple `find | xargs du` passes over this host's
+# actual DARWIN_USER_TEMP_DIR and ~/Library/Caches) on EVERY main() scenario
+# that reaches the notify branch, same rationale as the _top_mem_processes
+# stub.
+_top_disk_consumers() { printf '%s\n' "3583 /private/tmp/claude-501/bash-edit-diff" "812 /var/folders/gj/T/pytest-of-athos"; }
+
 # _safe_reclaim's own mechanics (gc dolt-cleanup --force, health probe) are
 # EXECUTION code out of scope for this file (see section banner above) —
 # stubbed as a no-op here too, same as every other main()-only side effect.
@@ -1470,6 +1679,17 @@ _reap_go_build_orphans() { REAP_GO_BUILD_CALLS=$((REAP_GO_BUILD_CALLS+1)); }
 REAP_CODE_SIGN_CLONE_CALLS=0
 _reap_code_sign_clone_orphans() { REAP_CODE_SIGN_CLONE_CALLS=$((REAP_CODE_SIGN_CLONE_CALLS+1)); }
 
+# _reap_bash_edit_diff_orphans is new (ga-ofi307), same reasoning as
+# _reap_go_build_orphans/_reap_code_sign_clone_orphans's stubs immediately
+# above: EXECUTION code (real directory walk + real rm, already proven in
+# isolation with a hermetic fixture earlier in this file) stubbed as a no-op
+# here so main()'s WIRING is what gets proven — never a real scan of this
+# host's actual /private/tmp/claude-<uid>/bash-edit-diff. Takes no
+# was_critical arg, same reasoning as its two orphan-reap siblings (age-only
+# grace, no two-tier gate for main() to pass).
+REAP_BASH_EDIT_DIFF_CALLS=0
+_reap_bash_edit_diff_orphans() { REAP_BASH_EDIT_DIFF_CALLS=$((REAP_BASH_EDIT_DIFF_CALLS+1)); }
+
 # _reap_backup_residue is new (ga-8f1uh0), same reasoning as
 # _reap_go_build_orphans/_reap_code_sign_clone_orphans's stubs immediately
 # above: EXECUTION code (shells out to dolt-backup-residue-reclaim.sh, which
@@ -1538,7 +1758,7 @@ record_gc() {
 # shellcheck disable=SC2034  # read by main() in the sourced script
 GC=record_gc
 
-reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; REAP_GO_BUILD_CALLS=0; REAP_CODE_SIGN_CLONE_CALLS=0; REAP_BACKUP_RESIDUE_CALLS=0; REAP_BACKUP_STAGING_CALLS=0; REAP_BACKUP_STAGING_LAST_ARG=""; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; }
+reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; REAP_GO_BUILD_CALLS=0; REAP_CODE_SIGN_CLONE_CALLS=0; REAP_BASH_EDIT_DIFF_CALLS=0; REAP_BACKUP_RESIDUE_CALLS=0; REAP_BACKUP_STAGING_CALLS=0; REAP_BACKUP_STAGING_LAST_ARG=""; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; }
 seed_state() {
   if [ -n "$1" ]; then echo "$1" > "$STATE_EPOCH_FILE"; else rm -f "$STATE_EPOCH_FILE"; fi
   if [ -n "$2" ]; then echo "$2" > "$STATE_AVAIL_FILE"; else rm -f "$STATE_AVAIL_FILE"; fi
@@ -1729,6 +1949,36 @@ case "$NOTIFY_LAST_MSG" in
   *) bad "main(): unresolved notify message missing the honest-unknown framing — got: $NOTIFY_LAST_MSG" ;;
 esac
 
+# Scenario I2 (ga-ofi307, acceptance test 2/3): the exact "cause not
+# identified" shape above is precisely where a bare alert is a dead end for
+# whoever reads it — this proves the top-disk-consumers measurement (stubbed
+# fixture: "3583 .../bash-edit-diff" and "812 .../pytest-of-athos") actually
+# reaches BOTH the permanent log AND the durable Mayor-mail body alongside
+# that diagnosis, turning "cause not identified" into something actionable
+# instead of requiring a human to go run `du` by hand — the whole point of
+# invariant (b). Reuses Scenario I's exact setup (CRITICAL, sustain already
+# 1 so this cycle confirms and mails).
+reset_capture; seed_state "" ""; seed_critical_sustain 1
+_vm_swap_gb() { echo "1"; }
+queue_avail 2 2
+main
+_vm_swap_gb() { echo "7"; }   # restore default stub for later scenarios
+if grep -q "top disk consumers (MB path, known scratch/cache roots):" "$LOG" 2>/dev/null && grep -q "  3583 /private/tmp/claude-501/bash-edit-diff" "$LOG" 2>/dev/null; then
+  ok "main(): top-disk-consumers measurement is logged alongside the diagnosis (invariant b — not silence, not a dead end)"
+else
+  bad "main(): expected the top-disk-consumers block in LOG, tail: $(tail -8 "$LOG" 2>/dev/null | tr '\n' ';')"
+fi
+if [ "$GC_MAIL_CALLS" = "1" ]; then
+  case "$GC_MAIL_LAST_BODY" in
+    *"Top disk consumers measured this cycle"*"3583 /private/tmp/claude-501/bash-edit-diff"*)
+      ok "main(): CRITICAL mail to Mayor includes the top-disk-consumers paragraph with the actual measured entries" ;;
+    *)
+      bad "main(): mail body missing the top-disk-consumers paragraph — got: $(printf '%s' "$GC_MAIL_LAST_BODY" | tr '\n' ';' | cut -c1-500)" ;;
+  esac
+else
+  bad "main(): expected this CRITICAL cycle (sustain already 1) to confirm and mail, GC_MAIL_CALLS=$GC_MAIL_CALLS"
+fi
+
 # Scenario J — reclaim effect UNMEASURABLE (post-reclaim df read itself
 # fails, e.g. a transient df hiccup): must say "could not measure", never
 # silently fall back to claiming either specific cause on fabricated data
@@ -1772,10 +2022,10 @@ echo "=== main(): scratchpad + transcript reap integration (ga-02pnu, ga-t1ub9) 
 reset_capture; seed_state "" ""
 queue_avail 2 20
 main
-if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ] && [ "$REAP_LOGS_CALLS" = "1" ] && [ "$REAP_HF_CALLS" = "1" ] && [ "$REAP_GOCACHE_CALLS" = "1" ] && [ "$REAP_GO_BUILD_CALLS" = "1" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "1" ] && [ "$REAP_BACKUP_RESIDUE_CALLS" = "1" ] && [ "$REAP_BACKUP_STAGING_CALLS" = "1" ]; then
-  ok "main(): _reap_dead_scratch, _reap_dead_transcripts, _reap_growing_logs, _reap_hf_cache, _reap_gocache, _reap_go_build_orphans, _reap_code_sign_clone_orphans, _reap_backup_residue, AND _reap_bloated_backup_staging each invoked exactly once alongside _safe_reclaim"
+if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ] && [ "$REAP_LOGS_CALLS" = "1" ] && [ "$REAP_HF_CALLS" = "1" ] && [ "$REAP_GOCACHE_CALLS" = "1" ] && [ "$REAP_GO_BUILD_CALLS" = "1" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "1" ] && [ "$REAP_BASH_EDIT_DIFF_CALLS" = "1" ] && [ "$REAP_BACKUP_RESIDUE_CALLS" = "1" ] && [ "$REAP_BACKUP_STAGING_CALLS" = "1" ]; then
+  ok "main(): _reap_dead_scratch, _reap_dead_transcripts, _reap_growing_logs, _reap_hf_cache, _reap_gocache, _reap_go_build_orphans, _reap_code_sign_clone_orphans, _reap_bash_edit_diff_orphans, _reap_backup_residue, AND _reap_bloated_backup_staging each invoked exactly once alongside _safe_reclaim"
 else
-  bad "main(): expected all nine reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_LOGS_CALLS=$REAP_LOGS_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS REAP_BACKUP_RESIDUE_CALLS=$REAP_BACKUP_RESIDUE_CALLS REAP_BACKUP_STAGING_CALLS=$REAP_BACKUP_STAGING_CALLS"
+  bad "main(): expected all ten reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_LOGS_CALLS=$REAP_LOGS_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS REAP_BASH_EDIT_DIFF_CALLS=$REAP_BASH_EDIT_DIFF_CALLS REAP_BACKUP_RESIDUE_CALLS=$REAP_BACKUP_RESIDUE_CALLS REAP_BACKUP_STAGING_CALLS=$REAP_BACKUP_STAGING_CALLS"
 fi
 if [ "$REAP_LAST_ARG" = "1" ]; then
   ok "main(): CRITICAL cycle (even after reclaim recovers it to NONE) passes was_critical=1 to _reap_dead_scratch (ga-rjhfz pressure plumbing)"
@@ -1835,10 +2085,10 @@ VM_LOG_PRE_COUNT=$(grep -c "vm_swap_gb=" "$LOG" 2>/dev/null || echo 0)
 reset_capture; seed_state "" ""
 queue_avail 20
 main
-if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ] && [ "$REAP_HF_CALLS" = "0" ] && [ "$REAP_GOCACHE_CALLS" = "0" ] && [ "$REAP_GO_BUILD_CALLS" = "0" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "0" ] && [ "$REAP_BACKUP_RESIDUE_CALLS" = "0" ] && [ "$REAP_BACKUP_STAGING_CALLS" = "0" ]; then
-  ok "main(): avail above floor on first read never invokes the scratch/transcript/hf-cache/gocache/go-build/code-sign-clone/backup-residue/backup-staging reapers"
+if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ] && [ "$REAP_HF_CALLS" = "0" ] && [ "$REAP_GOCACHE_CALLS" = "0" ] && [ "$REAP_GO_BUILD_CALLS" = "0" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "0" ] && [ "$REAP_BASH_EDIT_DIFF_CALLS" = "0" ] && [ "$REAP_BACKUP_RESIDUE_CALLS" = "0" ] && [ "$REAP_BACKUP_STAGING_CALLS" = "0" ]; then
+  ok "main(): avail above floor on first read never invokes the scratch/transcript/hf-cache/gocache/go-build/code-sign-clone/bash-edit-diff/backup-residue/backup-staging reapers"
 else
-  bad "main(): expected zero scratch/transcript/hf-cache/gocache/go-build/code-sign-clone/backup-residue/backup-staging reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS REAP_BACKUP_RESIDUE_CALLS=$REAP_BACKUP_RESIDUE_CALLS REAP_BACKUP_STAGING_CALLS=$REAP_BACKUP_STAGING_CALLS"
+  bad "main(): expected zero scratch/transcript/hf-cache/gocache/go-build/code-sign-clone/bash-edit-diff/backup-residue/backup-staging reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS REAP_BASH_EDIT_DIFF_CALLS=$REAP_BASH_EDIT_DIFF_CALLS REAP_BACKUP_RESIDUE_CALLS=$REAP_BACKUP_RESIDUE_CALLS REAP_BACKUP_STAGING_CALLS=$REAP_BACKUP_STAGING_CALLS"
 fi
 # ga-sfj3i.2: the exact case this acceptance criterion exists for — a cycle
 # that never breaches ANY floor is precisely where the pre-fix guard logged
