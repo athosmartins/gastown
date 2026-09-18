@@ -1631,6 +1631,170 @@ _reap_bash_edit_diff_orphans() {
   fi
 }
 
+# _is_test_dolt_config_path <config_path> — pure classifier (ga-fqj42): true
+# iff <config_path> sits under one of the SIX cmd/bd test-tmp-dir prefixes
+# third_party/beads/scripts/clean-test-tmp.sh already treats as test-only
+# (mirrors disk-pressure-monitor.sh pass 14's own list verbatim — both lists
+# must stay in sync; see that pass's header for the canonical source).
+# Substring match, not a path-segment match: MkdirTemp always creates the
+# prefixed dir as a single top-level entry directly under $TMPDIR, so a
+# plain case-glob is sufficient without a second stat/split round-trip.
+# Empty input never matches (fails closed — never guess a path is a test
+# path from nothing).
+_is_test_dolt_config_path() {
+  local cfg="${1:-}"
+  [ -n "$cfg" ] || return 1
+  case "$cfg" in
+    *beads-bd-tests-*|*beads-shared-server-bd-*|*bd-testbin-*|*bd-init-test-*|*bd-init-permissions-test-*|*bd-embedded-init-test-*)
+      return 0 ;;
+    *)
+      return 1 ;;
+  esac
+}
+
+# _reap_orphan_test_dolt_processes — reclaim lever (ga-fqj42): SIGTERMs a
+# `dolt sql-server` TEST instance (spun up by `go test -tags=integration
+# ./cmd/bd/...`) that outlived its parent test run and got reparented to
+# launchd. MEASURED incident (2026-09-10): pid 4768, 25min old, holding
+# 785MB, mis-classified "active server or non-test path" and PROTECTED by
+# `gc dolt-cleanup`'s own testConfigPathPrefixes() allowlist — that
+# classifier only ever covered cmd/gc's own test prefixes, never cmd/bd's
+# (a separate, vendored Go module under third_party/beads). This lever is
+# the live-PROCESS half of that gap; the DIRECTORY half (a server that
+# already died on its own, leaving pure disk litter with no PID to key off)
+# is disk-pressure-monitor.sh pass 14's job, already live since 2026-09-10.
+#
+# Mayor's own triage (2026-09-18, ga-fqj42 comment) placed the process-kill
+# half here, in shell — deliberately NOT inside gc dolt-cleanup's Go
+# classifier, even though a separate, already-staged engine patch
+# (docs/pending-engine-window/ga-fqj42-dolt-cleanup-beads-test-prefixes.patch)
+# extends that SAME classifier for a different purpose (so a human running
+# `gc dolt-cleanup` by hand also recognizes these dirs). Reasoning: that
+# classifier's job is choosing which DATABASES to DROP inside an
+# already-running server, by name prefix; this job is choosing which OS
+# PROCESS to kill, by its --config PATH — a different domain. Folding this
+# into the DB-name classifier would (a) make routine tuning of this list
+# depend on a Mayor-coordinated engine window, (b) put a process kill
+# inside a tool whose blast radius today is bounded to "DROP DATABASE under
+# an allowlisted prefix", and (c) mix two different safety models into one
+# decision point. This lever needs no engine window: it is a shell-only,
+# unattended stopgap that starts protecting the city the next time this
+# guard's own StartInterval (5min) fires, not whenever the next engine
+# window happens to land.
+#
+# Safe-by-construction discriminator, REQUIRING BOTH conditions together —
+# NEVER ppid==1 alone: production-drift-guard.sh:328-332 already documents
+# that ppid==1 alone also matches the real, launchd-owned PRODUCTION dolt
+# sql-server (a "launchd-owned daemon" is exactly what ppid==1 means, and
+# production is one). VERIFIED live 2026-09-18 (Mayor's own triage comment
+# on this bead): prod's pid was ppid=1 with --config under
+# $CITY/.gc/runtime/packs/dolt/dolt-config.yaml, which contains none of
+# _is_test_dolt_config_path's six prefixes — so the two conditions can
+# never both hold for a real production server, by construction, not by
+# convention:
+#   1. ppid == 1 (reparented to launchd — a live test run's dolt sql-server
+#      is still parented to the `go test` process itself, never launchd;
+#      still-parented is never a reap candidate, at any age)
+#   2. _is_test_dolt_config_path on its --config argument's value
+#
+# Extra belt-and-suspenders beyond the two conditions above (which are
+# already safe by construction): unconditionally excludes whatever PID
+# dolt-pid-lib.sh's dolt_server_pid resolves as the CANONICAL production
+# server — the same basename==dolt + live-LISTEN-socket-verified resolver
+# every other destructive Dolt lever in this city already trusts (ga-0bjqix)
+# — even if it somehow also matched both conditions above. A missing/
+# unreadable dolt-pid-lib.sh degrades this ONE extra check silently (the
+# primary two-condition discriminator above still holds by construction),
+# rather than blocking every OTHER lever in this file.
+#
+# Candidate enumeration mirrors dolt-pid-lib.sh's own false-positive
+# defenses rather than trusting a bare `pgrep -f`: pgrep's search STRING
+# ("dolt" + "sql-server") can match a `claude` agent session whose injected
+# system prompt embeds this exact doctrine text verbatim — this very
+# file's own header comment is one such text, and a headless agent's argv
+# can legally contain multi-thousand-token prompt text (ga-0bjqix,
+# "pgrep-f-matches-other-agents-embedded-prompt"). Every pgrep hit is
+# re-verified by executable basename (`ps -o comm=` must resolve to
+# "dolt") before its ppid/--config are ever inspected; a candidate failing
+# that check is skipped, never guessed at.
+#
+# kill -TERM only, never -KILL: dolt sql-server shuts down cleanly on
+# SIGTERM, and this lever's job is only to stop the leak from growing, not
+# to guarantee instant death. The DATA/CONFIG DIRECTORY is deliberately
+# left alone here for the existing lsof-gated directory reapers to remove
+# once THEY can confirm no process still holds it open — killing and
+# rm -rf-ing in the same breath would race a process that takes a moment
+# to exit.
+#
+# Test seam: DOLT_DISK_FLOOR_GUARD_KILL_SINK=<file> appends the pid instead
+# of signaling it (mirrors worktree-reaper.sh's own WORKTREE_REAPER_KILL_SINK
+# convention) — the selftest fakes `pgrep`/`ps` on PATH and asserts against
+# this sink file, so no real process is ever involved.
+_reap_orphan_test_dolt_processes() {
+  if [ "$ENABLED" != "1" ]; then
+    log "orphan-test-dolt-reap SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"
+    return
+  fi
+  if ! command -v pgrep >/dev/null 2>&1; then
+    log "orphan-test-dolt-reap SKIP — pgrep not found on PATH (cannot enumerate candidates; never guess)"
+    return
+  fi
+
+  if ! declare -f dolt_server_pid >/dev/null 2>&1 && [ -r "$CITY/scripts/dolt-pid-lib.sh" ]; then
+    # shellcheck disable=SC1090,SC1091
+    . "$CITY/scripts/dolt-pid-lib.sh"
+  fi
+  local prod_pid=""
+  declare -f dolt_server_pid >/dev/null 2>&1 && prod_pid="$(dolt_server_pid 2>/dev/null)"
+
+  local pid="" comm="" ppid="" cmd="" cfg="" considered=0 killed=0
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    considered=$((considered+1))
+
+    if [ -n "$prod_pid" ] && [ "$pid" = "$prod_pid" ]; then
+      log "orphan-test-dolt-reap: pid=${pid} — SPARED (is the canonical production server per dolt-pid-lib.sh)"
+      continue
+    fi
+
+    comm="$(ps -o comm= -p "$pid" 2>/dev/null)"
+    case "${comm##*/}" in
+      dolt) ;;
+      *)
+        log "orphan-test-dolt-reap: pid=${pid} — SPARED (basename '${comm:-unknown}' != dolt; pgrep -f matched something else, e.g. an agent's own prompt text)"
+        continue
+        ;;
+    esac
+
+    ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    if [ "$ppid" != "1" ]; then
+      log "orphan-test-dolt-reap: pid=${pid} — SPARED (ppid=${ppid:-unknown} != 1; still parented to its own test run)"
+      continue
+    fi
+
+    cmd="$(ps -o command= -p "$pid" 2>/dev/null)"
+    cfg="$(printf '%s\n' "$cmd" | awk '{for (i=1;i<=NF;i++) if ($i=="--config") {print $(i+1); exit}}')"
+    if ! _is_test_dolt_config_path "$cfg"; then
+      log "orphan-test-dolt-reap: pid=${pid} — SPARED (ppid=1 but --config='${cfg:-none}' is not under a known cmd/bd test-tmp prefix; ppid==1 alone is never sufficient — production-drift-guard.sh:328-332)"
+      continue
+    fi
+
+    if [ -n "${DOLT_DISK_FLOOR_GUARD_KILL_SINK:-}" ]; then
+      echo "$pid" >> "$DOLT_DISK_FLOOR_GUARD_KILL_SINK"
+    else
+      kill -TERM "$pid" 2>/dev/null
+    fi
+    killed=$((killed+1))
+    log "orphan-test-dolt-reap: pid=${pid} — KILLED (SIGTERM; ppid=1, --config='${cfg}')"
+  done < <(pgrep -f 'dolt sql-server' 2>/dev/null)
+
+  if [ "$considered" -eq 0 ]; then
+    log "orphan-test-dolt-reap: no dolt sql-server processes found"
+  else
+    log "orphan-test-dolt-reap: considered=${considered} killed=${killed}"
+  fi
+}
+
 # _reap_backup_residue — ninth reclaim lever, alongside _safe_reclaim and the
 # seven scratch/transcript/log/hf-cache/gocache/go-build/code-sign-clone
 # levers above (ga-8f1uh0): retired .dolt-backup/<db>.old residue left behind
@@ -1932,6 +2096,7 @@ main() {
   _reap_go_build_orphans
   _reap_code_sign_clone_orphans
   _reap_bash_edit_diff_orphans
+  _reap_orphan_test_dolt_processes
   _reap_backup_residue
   _reap_bloated_backup_staging "$was_critical"
 

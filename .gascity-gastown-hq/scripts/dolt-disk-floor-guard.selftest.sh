@@ -716,6 +716,185 @@ _reap_bash_edit_diff_orphans "/nonexistent/path/$$/bash-edit-diff-does-not-exist
 ok "_reap_bash_edit_diff_orphans: nonexistent root skips cleanly (no crash — this line only runs if it didn't)"
 
 echo ""
+echo "=== _is_test_dolt_config_path (ga-fqj42) ==="
+# Mirrors third_party/beads/scripts/clean-test-tmp.sh's six canonical
+# cmd/bd test-tmp-dir prefixes verbatim (same list disk-pressure-monitor.sh
+# pass 14 already uses) — all six must match, and a production config path
+# must never match any of them.
+_is_test_dolt_config_path "/tmp/beads-bd-tests-abc123/.dolt/config.yaml" && ok "beads-bd-tests- prefix matches" || bad "beads-bd-tests- prefix should match"
+_is_test_dolt_config_path "/tmp/beads-shared-server-bd-xyz/config.yaml" && ok "beads-shared-server-bd- prefix matches" || bad "beads-shared-server-bd- prefix should match"
+_is_test_dolt_config_path "/tmp/bd-testbin-000/x" && ok "bd-testbin- prefix matches" || bad "bd-testbin- prefix should match"
+_is_test_dolt_config_path "/tmp/bd-init-test-000/x" && ok "bd-init-test- prefix matches" || bad "bd-init-test- prefix should match"
+_is_test_dolt_config_path "/tmp/bd-init-permissions-test-000/x" && ok "bd-init-permissions-test- prefix matches" || bad "bd-init-permissions-test- prefix should match"
+_is_test_dolt_config_path "/tmp/bd-embedded-init-test-000/x" && ok "bd-embedded-init-test- prefix matches" || bad "bd-embedded-init-test- prefix should match"
+_is_test_dolt_config_path "/Users/athos/gt/.gascity-gastown-hq/.gc/runtime/packs/dolt/dolt-config.yaml" && bad "production config path should NEVER match" || ok "production config path correctly does not match (verified live 2026-09-18: prod's real --config value)"
+_is_test_dolt_config_path "" && bad "empty config path should never match (fails closed)" || ok "empty config path correctly fails closed"
+
+echo ""
+echo "=== _reap_orphan_test_dolt_processes (ga-fqj42): real pgrep/ps walk, hermetic fixture ==="
+# WHY: the real incident this bead exists for — a `dolt sql-server` TEST
+# instance (pid 4768, 25min, 785MB, 2026-09-10) reparented to launchd after
+# its parent `go test -tags=integration ./cmd/bd/...` run died, mis-classified
+# "active server or non-test path" by gc dolt-cleanup's own allowlist and left
+# running. Four candidates, faked via pgrep/ps shadowed on PATH (no real
+# process is ever touched — DOLT_DISK_FLOOR_GUARD_KILL_SINK captures pids
+# instead of signaling them):
+#   99991 — TRUE orphan: comm=dolt, ppid=1, --config under a known test-tmp
+#           prefix -> must be KILLED (appears in the sink).
+#   99992 — production look-alike: comm=dolt, ppid=1 (production IS a
+#           launchd-owned daemon too -- ppid=1 alone is never sufficient),
+#           --config NOT under any test-tmp prefix -> must be SPARED.
+#   99993 — pgrep false-positive: comm is NOT dolt (simulates pgrep -f
+#           'dolt sql-server' matching a claude agent session whose own
+#           injected system prompt embeds that literal string, ga-0bjqix)
+#           -> must be SPARED via the basename check, before its
+#           ppid/--config are ever inspected.
+#   99994 — still-live test run: comm=dolt, ppid=5678 (still parented to its
+#           own `go test` process, not yet orphaned), --config under a known
+#           test-tmp prefix -> must be SPARED (ppid != 1).
+ODP_FAKEBIN="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-odp-bin.XXXXXX)"
+cat > "$ODP_FAKEBIN/pgrep" <<'EOF'
+#!/bin/bash
+echo 99991
+echo 99992
+echo 99993
+echo 99994
+EOF
+chmod +x "$ODP_FAKEBIN/pgrep"
+
+cat > "$ODP_FAKEBIN/ps" <<'EOF'
+#!/bin/bash
+field=""; pid=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) field="$2"; shift 2 ;;
+    -p) pid="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$pid" in
+  99991)
+    case "$field" in
+      comm=) echo "/usr/local/bin/dolt" ;;
+      ppid=) echo "    1" ;;
+      command=) echo "dolt sql-server --config /tmp/beads-bd-tests-abc123/.dolt/config.yaml --port 12345" ;;
+    esac ;;
+  99992)
+    case "$field" in
+      comm=) echo "/usr/local/bin/dolt" ;;
+      ppid=) echo "    1" ;;
+      command=) echo "dolt sql-server --config /Users/athos/gt/.gascity-gastown-hq/.gc/runtime/packs/dolt/dolt-config.yaml" ;;
+    esac ;;
+  99993)
+    case "$field" in
+      comm=) echo "/usr/local/bin/claude" ;;
+      ppid=) echo "    1" ;;
+      command=) echo "claude --system-prompt has the literal text dolt sql-server embedded in it" ;;
+    esac ;;
+  99994)
+    case "$field" in
+      comm=) echo "/usr/local/bin/dolt" ;;
+      ppid=) echo " 5678" ;;
+      command=) echo "dolt sql-server --config /tmp/beads-bd-tests-def456/.dolt/config.yaml" ;;
+    esac ;;
+esac
+EOF
+chmod +x "$ODP_FAKEBIN/ps"
+
+ODP_SINK="$(mktemp /tmp/dolt-disk-floor-guard-selftest-odp-sink.XXXXXX)"
+REAL_PATH="$PATH"
+PATH="$ODP_FAKEBIN:$PATH"
+DOLT_DISK_FLOOR_GUARD_KILL_SINK="$ODP_SINK" _reap_orphan_test_dolt_processes
+PATH="$REAL_PATH"
+
+if grep -qx 99991 "$ODP_SINK" 2>/dev/null; then
+  ok "_reap_orphan_test_dolt_processes: true orphan (ppid=1, test-tmp --config) KILLED"
+else
+  bad "_reap_orphan_test_dolt_processes: true orphan should have been killed, sink: $(cat "$ODP_SINK" 2>/dev/null | tr '\n' ';')"
+fi
+if grep -qx 99992 "$ODP_SINK" 2>/dev/null; then
+  bad "_reap_orphan_test_dolt_processes: production look-alike (ppid=1, non-test --config) must NEVER be killed"
+else
+  ok "_reap_orphan_test_dolt_processes: production look-alike SPARED (ppid==1 alone is never sufficient)"
+fi
+if grep -qx 99993 "$ODP_SINK" 2>/dev/null; then
+  bad "_reap_orphan_test_dolt_processes: non-dolt pgrep false-positive must NEVER be killed"
+else
+  ok "_reap_orphan_test_dolt_processes: pgrep false-positive (basename != dolt) SPARED"
+fi
+if grep -qx 99994 "$ODP_SINK" 2>/dev/null; then
+  bad "_reap_orphan_test_dolt_processes: still-parented (ppid!=1) test server must NEVER be killed"
+else
+  ok "_reap_orphan_test_dolt_processes: still-parented test server SPARED (ppid != 1)"
+fi
+if grep -qE "orphan-test-dolt-reap: pid=99991 .* KILLED" "$LOG" 2>/dev/null; then
+  ok "_reap_orphan_test_dolt_processes: logs a KILLED line for the true orphan"
+else
+  bad "_reap_orphan_test_dolt_processes: expected a KILLED log line for pid=99991, log tail: $(tail -8 "$LOG" 2>/dev/null | tr '\n' ';')"
+fi
+rm -rf "$ODP_FAKEBIN"
+rm -f "$ODP_SINK"
+
+echo ""
+echo "=== _reap_orphan_test_dolt_processes (ga-fqj42): canonical production PID excluded even if it coincidentally matches the config-path check (defense in depth) ==="
+# A synthetic worst case: pid 99995 looks EXACTLY like a true orphan (comm=dolt,
+# ppid=1, --config under a known test-tmp prefix) — but dolt_server_pid (the
+# SAME basename==dolt + live-LISTEN-socket-verified resolver every other
+# destructive Dolt lever in this city already trusts, ga-0bjqix) is stubbed to
+# name it as the canonical production server. It must still be spared: the
+# exclusion is unconditional, not merely "whichever check happens to disagree
+# with production."
+ODP_FAKEBIN2="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-odp-bin2.XXXXXX)"
+cat > "$ODP_FAKEBIN2/pgrep" <<'EOF'
+#!/bin/bash
+echo 99995
+EOF
+chmod +x "$ODP_FAKEBIN2/pgrep"
+cat > "$ODP_FAKEBIN2/ps" <<'EOF'
+#!/bin/bash
+field=""; pid=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) field="$2"; shift 2 ;;
+    -p) pid="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$field" in
+  comm=) echo "/usr/local/bin/dolt" ;;
+  ppid=) echo "    1" ;;
+  command=) echo "dolt sql-server --config /tmp/beads-bd-tests-lookalike/.dolt/config.yaml" ;;
+esac
+EOF
+chmod +x "$ODP_FAKEBIN2/ps"
+
+dolt_server_pid() { echo 99995; }
+ODP_SINK2="$(mktemp /tmp/dolt-disk-floor-guard-selftest-odp-sink2.XXXXXX)"
+REAL_PATH="$PATH"
+PATH="$ODP_FAKEBIN2:$PATH"
+DOLT_DISK_FLOOR_GUARD_KILL_SINK="$ODP_SINK2" _reap_orphan_test_dolt_processes
+PATH="$REAL_PATH"
+unset -f dolt_server_pid
+
+if grep -qx 99995 "$ODP_SINK2" 2>/dev/null; then
+  bad "_reap_orphan_test_dolt_processes: dolt_server_pid-resolved canonical production PID must NEVER be killed, even if its config path also happens to match a test-tmp prefix"
+else
+  ok "_reap_orphan_test_dolt_processes: canonical production PID excluded unconditionally (defense in depth beyond the config-path check alone)"
+fi
+rm -rf "$ODP_FAKEBIN2"
+rm -f "$ODP_SINK2"
+
+# ── _reap_orphan_test_dolt_processes: ENABLED=0 kill switch → SKIP, no pgrep call ──
+ODP_SINK3="$(mktemp /tmp/dolt-disk-floor-guard-selftest-odp-sink3.XXXXXX)"
+ENABLED=0 DOLT_DISK_FLOOR_GUARD_KILL_SINK="$ODP_SINK3" _reap_orphan_test_dolt_processes
+if [ ! -s "$ODP_SINK3" ] && grep -q "orphan-test-dolt-reap SKIP.*ENABLED=0" "$LOG" 2>/dev/null; then
+  ok "_reap_orphan_test_dolt_processes: DOLT_DISK_FLOOR_GUARD_ENABLED=0 skips the whole lever"
+else
+  bad "_reap_orphan_test_dolt_processes: ENABLED=0 should skip cleanly with no candidates touched"
+fi
+rm -f "$ODP_SINK3"
+
+echo ""
 echo "=== _safe_reclaim (ga-ofi307): zero-gain wording must not read as calm 'OK' ==="
 # WHY: the real incident this bead exists for — 'gc dolt-cleanup --force' ran
 # successfully (exit 0) but froze nothing, and the OLD wording logged
@@ -1711,6 +1890,17 @@ _reap_code_sign_clone_orphans() { REAP_CODE_SIGN_CLONE_CALLS=$((REAP_CODE_SIGN_C
 REAP_BASH_EDIT_DIFF_CALLS=0
 _reap_bash_edit_diff_orphans() { REAP_BASH_EDIT_DIFF_CALLS=$((REAP_BASH_EDIT_DIFF_CALLS+1)); }
 
+# _reap_orphan_test_dolt_processes is new (ga-fqj42), same reasoning as its
+# three orphan-reap siblings immediately above: EXECUTION code (real pgrep
+# enumeration + real ps introspection + real kill -TERM, already proven in
+# isolation with a hermetic faked-pgrep/ps fixture earlier in this file)
+# stubbed as a no-op here so main()'s WIRING is what gets proven — never a
+# real process scan of this host. Takes no was_critical arg, same reasoning
+# as its siblings: the discriminator (ppid==1 AND test-tmp --config) is a
+# per-candidate classification, not a global two-tier gate.
+REAP_ORPHAN_TEST_DOLT_CALLS=0
+_reap_orphan_test_dolt_processes() { REAP_ORPHAN_TEST_DOLT_CALLS=$((REAP_ORPHAN_TEST_DOLT_CALLS+1)); }
+
 # _reap_backup_residue is new (ga-8f1uh0), same reasoning as
 # _reap_go_build_orphans/_reap_code_sign_clone_orphans's stubs immediately
 # above: EXECUTION code (shells out to dolt-backup-residue-reclaim.sh, which
@@ -1779,7 +1969,7 @@ record_gc() {
 # shellcheck disable=SC2034  # read by main() in the sourced script
 GC=record_gc
 
-reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; REAP_GO_BUILD_CALLS=0; REAP_CODE_SIGN_CLONE_CALLS=0; REAP_BASH_EDIT_DIFF_CALLS=0; REAP_BACKUP_RESIDUE_CALLS=0; REAP_BACKUP_STAGING_CALLS=0; REAP_BACKUP_STAGING_LAST_ARG=""; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; }
+reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; REAP_GO_BUILD_CALLS=0; REAP_CODE_SIGN_CLONE_CALLS=0; REAP_BASH_EDIT_DIFF_CALLS=0; REAP_ORPHAN_TEST_DOLT_CALLS=0; REAP_BACKUP_RESIDUE_CALLS=0; REAP_BACKUP_STAGING_CALLS=0; REAP_BACKUP_STAGING_LAST_ARG=""; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; }
 seed_state() {
   if [ -n "$1" ]; then echo "$1" > "$STATE_EPOCH_FILE"; else rm -f "$STATE_EPOCH_FILE"; fi
   if [ -n "$2" ]; then echo "$2" > "$STATE_AVAIL_FILE"; else rm -f "$STATE_AVAIL_FILE"; fi
@@ -2043,10 +2233,10 @@ echo "=== main(): scratchpad + transcript reap integration (ga-02pnu, ga-t1ub9) 
 reset_capture; seed_state "" ""
 queue_avail 2 20
 main
-if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ] && [ "$REAP_LOGS_CALLS" = "1" ] && [ "$REAP_HF_CALLS" = "1" ] && [ "$REAP_GOCACHE_CALLS" = "1" ] && [ "$REAP_GO_BUILD_CALLS" = "1" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "1" ] && [ "$REAP_BASH_EDIT_DIFF_CALLS" = "1" ] && [ "$REAP_BACKUP_RESIDUE_CALLS" = "1" ] && [ "$REAP_BACKUP_STAGING_CALLS" = "1" ]; then
-  ok "main(): _reap_dead_scratch, _reap_dead_transcripts, _reap_growing_logs, _reap_hf_cache, _reap_gocache, _reap_go_build_orphans, _reap_code_sign_clone_orphans, _reap_bash_edit_diff_orphans, _reap_backup_residue, AND _reap_bloated_backup_staging each invoked exactly once alongside _safe_reclaim"
+if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ] && [ "$REAP_LOGS_CALLS" = "1" ] && [ "$REAP_HF_CALLS" = "1" ] && [ "$REAP_GOCACHE_CALLS" = "1" ] && [ "$REAP_GO_BUILD_CALLS" = "1" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "1" ] && [ "$REAP_BASH_EDIT_DIFF_CALLS" = "1" ] && [ "$REAP_ORPHAN_TEST_DOLT_CALLS" = "1" ] && [ "$REAP_BACKUP_RESIDUE_CALLS" = "1" ] && [ "$REAP_BACKUP_STAGING_CALLS" = "1" ]; then
+  ok "main(): _reap_dead_scratch, _reap_dead_transcripts, _reap_growing_logs, _reap_hf_cache, _reap_gocache, _reap_go_build_orphans, _reap_code_sign_clone_orphans, _reap_bash_edit_diff_orphans, _reap_orphan_test_dolt_processes, _reap_backup_residue, AND _reap_bloated_backup_staging each invoked exactly once alongside _safe_reclaim"
 else
-  bad "main(): expected all ten reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_LOGS_CALLS=$REAP_LOGS_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS REAP_BASH_EDIT_DIFF_CALLS=$REAP_BASH_EDIT_DIFF_CALLS REAP_BACKUP_RESIDUE_CALLS=$REAP_BACKUP_RESIDUE_CALLS REAP_BACKUP_STAGING_CALLS=$REAP_BACKUP_STAGING_CALLS"
+  bad "main(): expected all eleven reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_LOGS_CALLS=$REAP_LOGS_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS REAP_BASH_EDIT_DIFF_CALLS=$REAP_BASH_EDIT_DIFF_CALLS REAP_ORPHAN_TEST_DOLT_CALLS=$REAP_ORPHAN_TEST_DOLT_CALLS REAP_BACKUP_RESIDUE_CALLS=$REAP_BACKUP_RESIDUE_CALLS REAP_BACKUP_STAGING_CALLS=$REAP_BACKUP_STAGING_CALLS"
 fi
 if [ "$REAP_LAST_ARG" = "1" ]; then
   ok "main(): CRITICAL cycle (even after reclaim recovers it to NONE) passes was_critical=1 to _reap_dead_scratch (ga-rjhfz pressure plumbing)"
@@ -2106,10 +2296,10 @@ VM_LOG_PRE_COUNT=$(grep -c "vm_swap_gb=" "$LOG" 2>/dev/null || echo 0)
 reset_capture; seed_state "" ""
 queue_avail 20
 main
-if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ] && [ "$REAP_HF_CALLS" = "0" ] && [ "$REAP_GOCACHE_CALLS" = "0" ] && [ "$REAP_GO_BUILD_CALLS" = "0" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "0" ] && [ "$REAP_BASH_EDIT_DIFF_CALLS" = "0" ] && [ "$REAP_BACKUP_RESIDUE_CALLS" = "0" ] && [ "$REAP_BACKUP_STAGING_CALLS" = "0" ]; then
-  ok "main(): avail above floor on first read never invokes the scratch/transcript/hf-cache/gocache/go-build/code-sign-clone/bash-edit-diff/backup-residue/backup-staging reapers"
+if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ] && [ "$REAP_HF_CALLS" = "0" ] && [ "$REAP_GOCACHE_CALLS" = "0" ] && [ "$REAP_GO_BUILD_CALLS" = "0" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "0" ] && [ "$REAP_BASH_EDIT_DIFF_CALLS" = "0" ] && [ "$REAP_ORPHAN_TEST_DOLT_CALLS" = "0" ] && [ "$REAP_BACKUP_RESIDUE_CALLS" = "0" ] && [ "$REAP_BACKUP_STAGING_CALLS" = "0" ]; then
+  ok "main(): avail above floor on first read never invokes the scratch/transcript/hf-cache/gocache/go-build/code-sign-clone/bash-edit-diff/orphan-test-dolt/backup-residue/backup-staging reapers"
 else
-  bad "main(): expected zero scratch/transcript/hf-cache/gocache/go-build/code-sign-clone/bash-edit-diff/backup-residue/backup-staging reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS REAP_BASH_EDIT_DIFF_CALLS=$REAP_BASH_EDIT_DIFF_CALLS REAP_BACKUP_RESIDUE_CALLS=$REAP_BACKUP_RESIDUE_CALLS REAP_BACKUP_STAGING_CALLS=$REAP_BACKUP_STAGING_CALLS"
+  bad "main(): expected zero scratch/transcript/hf-cache/gocache/go-build/code-sign-clone/bash-edit-diff/orphan-test-dolt/backup-residue/backup-staging reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS REAP_BASH_EDIT_DIFF_CALLS=$REAP_BASH_EDIT_DIFF_CALLS REAP_ORPHAN_TEST_DOLT_CALLS=$REAP_ORPHAN_TEST_DOLT_CALLS REAP_BACKUP_RESIDUE_CALLS=$REAP_BACKUP_RESIDUE_CALLS REAP_BACKUP_STAGING_CALLS=$REAP_BACKUP_STAGING_CALLS"
 fi
 # ga-sfj3i.2: the exact case this acceptance criterion exists for — a cycle
 # that never breaches ANY floor is precisely where the pre-fix guard logged
