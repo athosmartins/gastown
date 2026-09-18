@@ -136,25 +136,48 @@ echo "    to the PARENT's own database — this is why a real, separate rig"
 echo "    checkout is mandatory, never \$DOLTDIR/\$db directly)"
 RT="$SCRATCH/regression-real-bd"
 mkdir -p "$RT/store-a" "$RT/store-b"
-( cd "$RT/store-a" && bd init --non-interactive --prefix rta >/dev/null 2>&1 )
-( cd "$RT/store-b" && bd init --non-interactive --prefix rtb >/dev/null 2>&1 )
-bd -C "$RT/store-a" create "fixture bead A" -t task -q >/dev/null 2>&1
-bd -C "$RT/store-b" create "fixture bead B1" -t task -q >/dev/null 2>&1
-bd -C "$RT/store-b" create "fixture bead B2" -t task -q >/dev/null 2>&1
+# ga-97a3ut: pre-creating the git repo (separately, before `bd init` runs its
+# OWN internal `git init`) is load-bearing here, not decorative. Root-caused
+# live 2026-09-18: when `bd init --non-interactive` has to initialize the git
+# repo itself, under a target whose ancestry is $SCRATCH → a mktemp -d dir →
+# the OS temp root, it silently plants its embedded store at the OS temp
+# root's own .beads (e.g. $TMPDIR/.beads on macOS) instead of locally at
+# $RT/store-a/.beads — reproducibly, even on an otherwise-clean machine with
+# no pre-existing stray .beads anywhere. Every subsequent fixture then aliases
+# into that one shared, ever-growing store: this bug's reported symptom (same
+# count both stores, growing by this run's own create count every time), not
+# a reappearance of the real finding-1 regression. A git repo that already
+# exists at the target BEFORE `bd init` runs sidesteps whatever internal
+# root-detection step misfires — confirmed deterministic across repeated
+# fresh-machine-state runs. `bd`'s own resolution/init behavior is out of this
+# script's control, so the guard below stays as defense in depth: a genuinely
+# isolated `bd init` always leaves its own metadata.json locally, and if some
+# other cause ever defeats the workaround, this catches it instead of
+# silently misreporting a false "finding-1 bug is back".
+( cd "$RT/store-a" && git init -q && bd init --non-interactive --prefix rta >/dev/null 2>&1 )
+( cd "$RT/store-b" && git init -q && bd init --non-interactive --prefix rtb >/dev/null 2>&1 )
+_local_store_ok() { [ -f "$1/.beads/metadata.json" ]; }
+if _local_store_ok "$RT/store-a" && _local_store_ok "$RT/store-b"; then
+  bd -C "$RT/store-a" create "fixture bead A" -t task -q >/dev/null 2>&1
+  bd -C "$RT/store-b" create "fixture bead B1" -t task -q >/dev/null 2>&1
+  bd -C "$RT/store-b" create "fixture bead B2" -t task -q >/dev/null 2>&1
 
-cnt_a="$(_snapshot_db "$RT/store-a" | awk '{print $1}')"
-cnt_b="$(_snapshot_db "$RT/store-b" | awk '{print $1}')"
-[ "$cnt_a" = "1" ] && ok "store-a (real, separate rig checkout) correctly reads its OWN count (1)" || bad "expected store-a count=1, got '$cnt_a'"
-[ "$cnt_b" = "2" ] && ok "store-b (real, separate rig checkout) correctly reads its OWN count (2)" || bad "expected store-b count=2, got '$cnt_b'"
-[ "$cnt_a" != "$cnt_b" ] && ok "two distinct real dbs → two distinct counts (THIS is the actual bug: before the fix, both were indistinguishable)" || bad "REGRESSION: store-a and store-b returned the SAME count ($cnt_a) — finding-1 bug is back"
+  cnt_a="$(_snapshot_db "$RT/store-a" | awk '{print $1}')"
+  cnt_b="$(_snapshot_db "$RT/store-b" | awk '{print $1}')"
+  [ "$cnt_a" = "1" ] && ok "store-a (real, separate rig checkout) correctly reads its OWN count (1)" || bad "expected store-a count=1, got '$cnt_a'"
+  [ "$cnt_b" = "2" ] && ok "store-b (real, separate rig checkout) correctly reads its OWN count (2)" || bad "expected store-b count=2, got '$cnt_b'"
+  [ "$cnt_a" != "$cnt_b" ] && ok "two distinct real dbs → two distinct counts (THIS is the actual bug: before the fix, both were indistinguishable)" || bad "REGRESSION: store-a and store-b returned the SAME count ($cnt_a) — finding-1 bug is back"
 
-# Reproduce the ORIGINAL bug shape directly (a path nested under store-a's
-# own tree, mimicking $CITY/.beads/dolt/<db> nested under $CITY/.beads/), to
-# prove this fixture harness is actually capable of catching a regression —
-# not just coincidentally passing.
-mkdir -p "$RT/store-a/fake-nested/dolt/some-other-db"
-cnt_nested="$(_snapshot_db "$RT/store-a/fake-nested/dolt/some-other-db" | awk '{print $1}')"
-[ "$cnt_nested" = "$cnt_a" ] && ok "confirmed bug mechanism: a path NESTED under store-a's tree silently aliases store-a's own count ($cnt_a) — proves why callers must resolve a real rig checkout, never construct a path under a shared parent" || bad "expected the nested path to alias store-a's count ($cnt_a), got '$cnt_nested'"
+  # Reproduce the ORIGINAL bug shape directly (a path nested under store-a's
+  # own tree, mimicking $CITY/.beads/dolt/<db> nested under $CITY/.beads/), to
+  # prove this fixture harness is actually capable of catching a regression —
+  # not just coincidentally passing.
+  mkdir -p "$RT/store-a/fake-nested/dolt/some-other-db"
+  cnt_nested="$(_snapshot_db "$RT/store-a/fake-nested/dolt/some-other-db" | awk '{print $1}')"
+  [ "$cnt_nested" = "$cnt_a" ] && ok "confirmed bug mechanism: a path NESTED under store-a's tree silently aliases store-a's own count ($cnt_a) — proves why callers must resolve a real rig checkout, never construct a path under a shared parent" || bad "expected the nested path to alias store-a's count ($cnt_a), got '$cnt_nested'"
+else
+  bad "test environment poisoned (ga-97a3ut): bd init did not create an isolated local .beads under \$RT (store-a local=$(_local_store_ok "$RT/store-a" && echo yes || echo NO), store-b local=$(_local_store_ok "$RT/store-b" && echo yes || echo NO)) — an ANCESTOR .beads directory is shadowing them (bd's -C/cwd resolution walks up looking for .beads with no ceiling at \$TMPDIR). Check \$TMPDIR/.beads first, move it aside, and re-run; skipping the rest of this section since its results would be meaningless."
+fi
 rm -rf "$RT"
 
 echo "── _largest_db_mb (real filesystem, MB granularity — not GB, see script header) ──"
