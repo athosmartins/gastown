@@ -6473,6 +6473,14 @@ fi
 # top-up decision as the only thing under test.
 #   $1=PILOT_TEST_WA_WORKER_LIVE_COUNT  $2=PILOT_TEST_WA_WORKER_TOPUP_PENDING (bead id, or "" for none)
 #   $3=DRY_RUN (default 1)              $4=GC_VARIABLE_SESSION_COUNT_OVERRIDE (default $1)
+# ga-swnsg3: PILOT_DOLT_LATENCY_OVERRIDE_MS="100" below is an explicit
+# healthy-Dolt override. Without it, _dolt_probe's shim call ("gc dolt
+# health", unhandled by SHIMBIN's fake gc) returns no signal, and
+# _dolt_saturated fail-safes to SATURATED (its own documented behavior for
+# a blind probe — see _dolt_saturated's header). That was harmless before
+# ga-swnsg3 (top-up never checked Dolt health at all); now that it does, an
+# unset override here would make top-up skip on every call, breaking this
+# scenario's actual point (pool-cap/eligibility/rig-fallback), not testing it.
 run_topup_scenario() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
@@ -6488,6 +6496,7 @@ run_topup_scenario() {
     FAKE_BLOCKED_IDS="" \
     FAKE_BUGS_JSON="[]" \
     FAKE_TIER2_JSON="[]" \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS="100" \
     PILOT_TEST_WA_WORKER_LIVE_COUNT="${1:-0}" \
     GC_VARIABLE_SESSION_COUNT_OVERRIDE="${4:-${1:-0}}" \
     PILOT_TEST_WA_WORKER_TOPUP_PENDING="${2:-}" \
@@ -6587,6 +6596,7 @@ has "$DISPATCHER" 'bd -C "\$GC_CITY" ready --metadata-field "gc\.routed_to=\$_po
 # no `timeout`, so the real `timeout 15 bd -C ... ready ...` call would
 # silently 127 rather than reach _filter_candidates either way.
 #   $1=PILOT_TEST_WA_WORKER_LIVE_COUNT  $2=candidates JSON array
+# ga-swnsg3: same healthy-Dolt override rationale as run_topup_scenario above.
 run_topup_candidates_scenario() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
@@ -6602,6 +6612,7 @@ run_topup_candidates_scenario() {
     FAKE_BLOCKED_IDS="" \
     FAKE_BUGS_JSON="[]" \
     FAKE_TIER2_JSON="[]" \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS="100" \
     PILOT_TEST_WA_WORKER_LIVE_COUNT="${1:-0}" \
     GC_VARIABLE_SESSION_COUNT_OVERRIDE="${1:-0}" \
     PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON="$2" \
@@ -6758,6 +6769,7 @@ fi
 #   $1=PILOT_TEST_WA_WORKER_LIVE_COUNT
 #   $2=PILOT_TEST_WA_WORKER_TOPUP_RIG_PENDING (bead id, or "" for none)
 #   $3=DRY_RUN (default 1)
+# ga-swnsg3: same healthy-Dolt override rationale as run_topup_scenario above.
 run_topup_rig_scenario() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
@@ -6773,6 +6785,7 @@ run_topup_rig_scenario() {
     FAKE_BLOCKED_IDS="" \
     FAKE_BUGS_JSON="[]" \
     FAKE_TIER2_JSON="[]" \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS="100" \
     PILOT_TEST_WA_WORKER_LIVE_COUNT="${1:-0}" \
     GC_VARIABLE_SESSION_COUNT_OVERRIDE="${1:-0}" \
     PILOT_TEST_WA_WORKER_TOPUP_RIG_PENDING="${2:-}" \
@@ -8529,6 +8542,106 @@ if echo "$LOGLFC" | grep -qE "0 eligible|eligible \(HQ; both lanes full"; then
   bad "ga-3hhnyn: REGRESSION — a failed query was reported as a concrete eligible count (error collapsed into empty)"
 else
   ok "ga-3hhnyn: a failed query is NOT reported as any concrete eligible count"
+fi
+
+# ── Scenario ga-swnsg3: pool top-up now ALSO runs when Step 1 backs off with
+# both lanes full, not just on the (already-covered, TOPUP-6) zero-candidates
+# exit. Bug: the "Both lanes full ... backing off" branch (Step 1) did `exit
+# 0` before Step 2d was even reached, so a freed wa-worker/ps-worker slot
+# idled until the ~45min never-started recovery whenever the Pilot's 4
+# dispatch lanes (3 small + 1 big) — which exceed the wa-worker pool cap of 2
+# by design — filled with dispatched-but-workerless beads. Measured live:
+# wa-v5ya9 (P1) starved 181min this way. run_lanefull_topup combines
+# run_lanefull's MAX_SMALL=0/MAX_BIG=0 fixture (forces the lanes-full branch)
+# with run_topup_scenario's topup seam (drives the top-up decision), so the
+# SAME sweep exercises both halves of the bug at once.
+#   $1=PILOT_TEST_WA_WORKER_LIVE_COUNT  $2=PILOT_TEST_WA_WORKER_TOPUP_PENDING
+#   $3=DRY_RUN (default 0)              $4=PILOT_DOLT_LATENCY_OVERRIDE_MS (default 100=healthy)
+#   $5=PILOT_WA_WORKER_MAX (default 4)
+run_lanefull_topup() {
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DRY_RUN="${3:-0}" \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
+    MAX_SMALL=0 \
+    MAX_BIG=0 \
+    FAKE_TIER2_JSON="[]" \
+    FAKE_TIER2_QUERY_FAIL="0" \
+    FAKE_BLOCKED_IDS="" \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS="${4:-100}" \
+    PILOT_WA_WORKER_MAX="${5:-4}" \
+    PILOT_TEST_WA_WORKER_LIVE_COUNT="${1:-0}" \
+    GC_VARIABLE_SESSION_COUNT_OVERRIDE="${1:-0}" \
+    PILOT_TEST_WA_WORKER_TOPUP_PENDING="${2:-}" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+echo "Scenario ga-swnsg3-a: both lanes full + wa-worker below cap + a pending routed-unassigned bead -> top-up STILL spawns (the exact incident: top-up used to be unreachable once lanes filled)"
+LOG_SW_A="$(run_lanefull_topup "1" "wa-pending-sw-a" "0" "100" "2")"
+if echo "$LOG_SW_A" | grep -q "Both lanes full (small=0/0 unclassified_lane=0, big=0/0). Pilot backing off."; then
+  ok "ga-swnsg3: fixture genuinely forces the lanes-full backoff branch (precondition confirmed, not assumed)"
+else
+  bad "ga-swnsg3: fixture did NOT reach the lanes-full backoff branch — scenario proves nothing"
+fi
+if echo "$LOG_SW_A" | grep -q "ga-93yxc: pool top-up — wa-worker has free capacity (live=1 < 2) and wa-pending-sw-a is routed+unassigned with no worker from a prior sweep — spawning."; then
+  ok "ga-swnsg3: pool top-up spawns for a routed-unassigned bead EVEN WHEN both lanes are full (fix present)"
+else
+  bad "ga-swnsg3: REGRESSION — pool top-up did not spawn when lanes were full (the exact incident: a freed builder slot would idle until the ~45min never-started recovery)"
+fi
+
+echo "Scenario ga-swnsg3-b: both lanes full + wa-worker AT cap -> top-up still does NOT spawn (cap respected even on the lanes-full path)"
+LOG_SW_B="$(run_lanefull_topup "2" "wa-pending-sw-b" "0" "100" "2")"
+if echo "$LOG_SW_B" | grep -q "wa-pending-sw-b"; then
+  bad "ga-swnsg3: REGRESSION — top-up spawned (or queried) despite live=2 >= max=2 while lanes were full — cap not respected"
+else
+  ok "ga-swnsg3: top-up correctly skips when the pool is already at cap, even on the lanes-full path"
+fi
+
+echo "Scenario ga-swnsg3-c: both lanes full + DRY_RUN=1 -> top-up logs the WOULD-decision only, no real-spawn claim"
+LOG_SW_C="$(run_lanefull_topup "1" "wa-pending-sw-c" "1" "100" "2")"
+if echo "$LOG_SW_C" | grep -q "DRY_RUN=1 — WOULD: pool top-up spawn wa-worker for wa-pending-sw-c"; then
+  ok "ga-swnsg3: DRY_RUN=1 still emits the WOULD-log on the lanes-full path"
+else
+  bad "ga-swnsg3: DRY_RUN=1 did NOT log the top-up decision on the lanes-full path"
+fi
+if echo "$LOG_SW_C" | grep -q "pool top-up — wa-worker session spawned for wa-pending-sw-c"; then
+  bad "ga-swnsg3: REGRESSION — DRY_RUN=1 claims a real spawn happened on the lanes-full path"
+else
+  ok "ga-swnsg3: DRY_RUN=1 makes no real-spawn claim on the lanes-full path"
+fi
+
+echo "Scenario ga-swnsg3-d: both lanes full + Dolt SATURATED at sweep start -> top-up backs off too (the ACEITE ressalva: top-up must not add load to a hot Dolt)"
+LOG_SW_D="$(run_lanefull_topup "1" "wa-pending-sw-d" "0" "3000" "2")"
+if echo "$LOG_SW_D" | grep -q "Both lanes full (small=0/0 unclassified_lane=0, big=0/0). Pilot backing off."; then
+  ok "ga-swnsg3: fixture still reaches the lanes-full backoff branch with Dolt saturated"
+else
+  bad "ga-swnsg3: fixture did NOT reach the lanes-full backoff branch — scenario proves nothing"
+fi
+if echo "$LOG_SW_D" | grep -q "ga-swnsg3: pool top-up — Dolt saturated at sweep start, skipping wa-worker top-up"; then
+  ok "ga-swnsg3: top-up correctly backs off when Dolt is saturated, even on the lanes-full path"
+else
+  bad "ga-swnsg3: REGRESSION — top-up did not report backing off for a saturated Dolt"
+fi
+if echo "$LOG_SW_D" | grep -q "wa-pending-sw-d"; then
+  bad "ga-swnsg3: REGRESSION — top-up considered/spawned a pending bead despite Dolt being saturated"
+else
+  ok "ga-swnsg3: top-up never even queries the pending bead while Dolt is saturated"
+fi
+
+echo "Scenario ga-swnsg3-e: structural — top-up call sites appear BEFORE the 'Both lanes full' backoff exit (TOPUP-6 already proved 'before the zero-candidates exit'; this proves the OTHER early-exit that ga-swnsg3 is actually about)"
+_swnsg3_topup_vs_lanefull="$(awk '/^_pilot_pool_topup "wa-worker"/{f=1} f{print} /Pilot backing off\./{if(f)exit}' "$DISPATCHER")"
+if printf '%s' "$_swnsg3_topup_vs_lanefull" | grep -q "Pilot backing off"; then
+  ok "ga-swnsg3: top-up call sites appear BEFORE the both-lanes-full backoff exit — a freed pool slot fills even while lanes stay saturated"
+else
+  bad "ga-swnsg3: REGRESSION — top-up call sites do NOT precede the both-lanes-full backoff exit (a freed slot would idle until the ~45min never-started recovery again)"
 fi
 
 # ── Verdict ───────────────────────────────────────────────────────────────────

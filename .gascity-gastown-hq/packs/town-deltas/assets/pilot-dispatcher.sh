@@ -7055,6 +7055,284 @@ REVIEWER_SLOTS=$((MAX_REVIEWERS - REVIEWERS_ACTIVE))
 [ "$REVIEWER_SLOTS" -lt "0" ] && REVIEWER_SLOTS=0
 log "Gate reviewers: active=${REVIEWERS_ACTIVE}/${MAX_REVIEWERS}  free=${REVIEWER_SLOTS}"
 
+# ── Step 2d: ga-93yxc pool top-up ─────────────────────────────────────────────
+# The wa-worker/ps-worker cap-skip a few hundred lines down (ga-mfeip,
+# ga-v3o6i) sets gc.routed_to=<pool> and used to log "supervisor picks it up
+# when slot frees" — but no such mechanism exists. Both pools have
+# min_active_sessions=0 and wake_mode=fresh (no running session, no hook cycle
+# to "see it next time"), and the wa-worker agent.toml itself documents "we do
+# NOT rely on supervisor auto-spawn". So a routed-but-uncapacitated bead sat
+# unassigned with no worker until the inflight-reclaim-guard's TTL (25min+)
+# reclaimed it, got re-picked by the NEXT sweep, hit the same cap, and
+# repeated — measured live: wa-0i9zj dispatched 4x (02:04-05:17) and never
+# built once; at one point 29 wa-workers asleep, 0 active, 3 beads "in flight"
+# with nobody on them, gate stalled 97min because nothing finished (ga-93yxc).
+#
+# Fix: every sweep, independent of whether THIS sweep found any fresh
+# candidate, re-check live count vs max for each ephemeral pool and spawn a
+# worker for any already-routed-but-unassigned bead while capacity remains —
+# so a freed slot is filled on its VERY NEXT sweep (launchd re-execs this
+# script every 300s), not after a TTL wait. Respects the same GLOBAL
+# variable-session cap (ga-jezvn) a fresh dispatch would, and DRY_RUN (no real
+# spawn — logs what WOULD happen, mirrors every other mutation in this file).
+#
+# MUST run BEFORE the ALL_CANDIDATES_COUNT==0 early-exit right below: a quiet
+# sweep with nothing NEW to dispatch is exactly when an old routed-but-stuck
+# bead most needs a retry, and that early exit used to skip every later step
+# (including the original placement of this fix, right before Step 5 —
+# dead code on precisely the sweep shape this bug is about; caught by
+# Scenario TOPUP-1/4 failing red even after the fix was written, because the
+# harness's minimal fixture has zero fresh candidates by design).
+#
+# ga-swnsg3: this block's placement ALSO matters for a second early-exit —
+# Step 1's "Both lanes full ... backing off" branch, which sits immediately
+# below this block now (it used to sit ABOVE, back when this block lived
+# right after Step 2's candidate gathering instead of here). The Pilot's
+# small+big lanes (3+1=4, Step 1 above) exceed the wa-worker pool cap (2,
+# ga-xsd03) by design — bug/debt dispatch runs ahead of pool capacity, same
+# as everything else in Step 1 — so lanes routinely fill with
+# dispatched-but-workerless beads (see ga-mfeip's cap-skip a few hundred
+# lines below) while a wa-worker/ps-worker slot sits free. With this block
+# at its ORIGINAL position (after Step 2), that early-exit skipped it every
+# time the lanes were full — which is the ONLY time a freed pool slot most
+# needs the retry. Measured live: wa-v5ya9 (P1) starved 181min, 4/5
+# in-flight beads workerless, 1 free wa-worker slot, "Pilot backing off"
+# logged every sweep in between. Moving the whole block here (before Step
+# 1, not just before the zero-candidates exit) closes both early-exit gaps
+# with one placement.
+# _topup_rig_pending <pool>: rig-scoped fallback for the pending-bead query
+# inside _pilot_pool_topup below. Mirrors _scan_rig_fallback_pool's own
+# rig-discovery shape (L7643: `.rigs[] | select(.hq == false) | .path`) and
+# _pilot_emit_dispatchable's (L4429) — reused here via the pre-computed
+# _TOPUP_RIG_PATHS global (set once, right before both pool calls, so
+# wa-worker and ps-worker share a single `gc rig list` invocation instead of
+# paying for it twice).
+#
+# ga-q0ewpu: without this, gc.routed_to=<pool> is the ONLY signal a rig-native
+# (wa-*/ps-*) bead carries once pilot:dispatched excludes it from the main
+# candidate scan (see this function's own header comment below) — and the
+# pending-bead query only ever looked at $GC_CITY, where a rig-native bead
+# never lives. Measured live: wa-52q8u, wa-ah359, wa-c1hgd stranded
+# routed+unassigned at a saturated wa-worker cap until a human ran
+# pilot-manual-reclaim.sh by hand (wa-c1hgd twice — pilot:reclaim-count:2).
+# Always exits 0; emptiness of stdout is the "not found" signal, same
+# convention the direct bd probe already uses via its own `|| echo ""`.
+#
+# ga-oc6knj: widened --limit=1 -> --limit=20 and piped through _filter_candidates
+# (the dispatcher's own single chokepoint gate — see its definition/callers
+# above) before picking the survivor. Pre-fix this ONLY checked
+# gc.routed_to=<pool>+unassigned+not-epic — none of pilot:held (incl. expiry),
+# the pilot:reclaim-count cap, gate:needs-human/story:needs-human,
+# pool:refused[:reason], or any of the dozen-plus other park/veto labels the
+# wa-worker/ps-worker prompt probe (Step 1b2 in both templates) already
+# enforces on its side of the SAME gc.routed_to queue. Two independently
+# maintained "is this bead eligible" definitions is the exact ga-oc6knj
+# invariant (c) violation: top-up could spawn a session "for" a bead the
+# worker probe would refuse to serve the instant it looked — that session
+# just claims a DIFFERENT bead instead (silently correct from ITS
+# perspective, but the pending bead top-up meant to unstick stays stuck,
+# and a pool slot got spent on work top-up never intended). Reusing
+# _filter_candidates (rather than re-typing a third copy of the exclude-label
+# list here) is the same fix shape every other candidate source in this file
+# already gets — see its own header comment for why it is the designated
+# single chokepoint.
+#
+# ga-oc6knj gate_run=ga-8pv70k follow-up: _filter_candidates alone was NOT
+# actually equivalent to the worker probe, so the invariant-(c) gap above
+# only narrowed, it did not close. Verified against the reviewed SHA:
+# _filter_candidates has no check for ctx:thin, phone-proxy, gate:queued,
+# gate:reviewing, delivery:pending-restart, the story:unrefined/story:
+# refinement-in-progress/refino:* family, or the EPIC-title regex the worker
+# probe uses as defense-in-depth alongside its own type=epic exclusion; exec:manual
+# is handled only by the SEPARATE _filter_exec_manual, which neither call
+# site below invoked. Closing the actual gap: $_TOPUP_WORKER_EXCLUDE_LABELS
+# is the SAME --exclude-label set both agents/{wa-worker,ps-worker}/
+# prompt.template.md pass on their own Step 1b2 `bd ready` call (reused
+# verbatim, not re-typed a third time — a selftest diffs this array against
+# the live template files so the two can never silently drift apart again),
+# $_TOPUP_EPIC_TITLE_RE mirrors their jq title-regex fallback, and both query
+# pipelines below now also chain _filter_exec_manual — same position (before
+# _filter_candidates) as every other candidate source in this file already
+# uses (see e.g. BUGS_JSON/CTXREADY_JSON below).
+#
+# ga-onrnd6: _filter_candidates alone still does not cover the next-action:/
+# waiting-on:/blocked-on:/depends-on: family (that predicate lives in
+# _filter_label_vetoes, a SEPARATE chokepoint — BUGS_JSON/DEBT_JSON/CHORE_JSON/
+# TASK_JSON chain it explicitly right after _filter_candidates below;
+# TIER2_JSON/CTXREADY_JSON/every rig pool get it "for free" via
+# _filter_dispatch_gates, which calls it internally). Both call sites below
+# (_topup_rig_pending's rig-scoped query and this function's own $GC_CITY
+# query), AND both PILOT_TEST_*_TOPUP_CANDIDATES_JSON hermetic test seams
+# (kept in lockstep with the real pipelines so a selftest against the seam
+# can never pass while the live pipeline behaves differently), now chain
+# _filter_label_vetoes right after _filter_candidates — same fix shape as
+# BUGS_JSON, reusing the existing chokepoint rather than re-typing a THIRD
+# copy of the next-action/waiting-on/blocked-on/depends-on predicate. Same
+# live incident this closes as the wa-worker/ps-worker Step 1b2/1b3 fix in
+# the prompt templates (wa-k1sr7 — done-but-parked next-action:athos-decide
+# bead, re-dispatched by top-up spawning a fresh session after the worker
+# probe itself had already correctly stopped offering it).
+_TOPUP_WORKER_EXCLUDE_LABELS=(
+  --exclude-label "story:needs-human"
+  --exclude-label "story:needs-approval"
+  --exclude-label "needs-human"
+  --exclude-label "needs-human-decision"
+  --exclude-label "ctx:thin"
+  --exclude-label "story:epic"
+  --exclude-label "story:refinement-in-progress"
+  --exclude-label "story:unrefined"
+  --exclude-label "refino:policy-gap"
+  --exclude-label "refino:info-gap"
+  --exclude-label "auto-refino:escalated"
+  --exclude-label "story:refino-escalado"
+  --exclude-label "story:refino-review"
+  --exclude-label "auto-refino:refining"
+  --exclude-label "exec:manual"
+  --exclude-label "on-device"
+  --exclude-label "story:needs-device"
+  --exclude-label "phone-proxy"
+  --exclude-label "pilot:no-auto-dispatch"
+  --exclude-label "story:blocked"
+  --exclude-label "gate:queued"
+  --exclude-label "gate:reviewing"
+  --exclude-label "delivery:pending-restart"
+)
+_TOPUP_EPIC_TITLE_RE='^(EPIC|ÉPICO)[:\s]'
+_topup_rig_pending() {
+  local _pool="$1" _rp _rig_pending
+  while IFS= read -r _rp; do
+    [ -z "$_rp" ] || [ ! -d "$_rp" ] && continue
+    [ "$_rp" = "$GC_CITY" ] && continue
+    _rig_pending=$(timeout 15 bd -C "$_rp" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
+      --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" --exclude-type epic \
+      "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit=20 2>/dev/null \
+      | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null \
+      | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" \
+        '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
+    if [ -n "$_rig_pending" ]; then
+      printf '%s' "$_rig_pending"
+      return 0
+    fi
+  done <<< "$_TOPUP_RIG_PATHS"
+  printf ''
+  return 0
+}
+
+_pilot_pool_topup() {
+  local _pool="$1" _max="$2"
+  local _live _global _pending
+
+  # ga-swnsg3: skip entirely when Dolt was saturated at sweep start —
+  # spawning a session is itself Dolt load (session-state writes), so
+  # top-up must back off the same way normal dispatch already throttles on
+  # this signal (PILOT_DOLT_SATURATED_AT_START, set once near the top of
+  # the sweep) instead of piling more load onto an already-hot data plane.
+  # Retries next sweep once Dolt cools, same as every other skip below.
+  # Defaults to "0" (not saturated) when unset, matching every other reader
+  # of this flag in the file — so hermetic tests that never set it (nearly
+  # all of them) are unaffected.
+  if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ]; then
+    log "  ga-swnsg3: pool top-up — Dolt saturated at sweep start, skipping $_pool top-up this sweep (retries next sweep)."
+    return 0
+  fi
+
+  if [ "$_pool" = "wa-worker" ] && [ -n "${PILOT_TEST_WA_WORKER_LIVE_COUNT:-}" ]; then
+    _live="$PILOT_TEST_WA_WORKER_LIVE_COUNT"
+  elif [ "$_pool" = "ps-worker" ] && [ -n "${PILOT_TEST_PS_WORKER_LIVE_COUNT:-}" ]; then
+    _live="$PILOT_TEST_PS_WORKER_LIVE_COUNT"
+  else
+    # `|| echo "0"` mirrors every sibling live-count probe in this file (e.g.
+    # gc_variable_session_count, the ga-mfeip cap-check above): without it, a
+    # missing `timeout` binary (127, "command not found" — genuinely absent
+    # from PATH in some harnesses/environments, not merely a bd/gc failure)
+    # leaves the substitution both EMPTY and non-zero-exit with nothing to
+    # consume that status, which — confirmed by direct bisection, bash
+    # 5.3.15 — aborts the whole script despite `set -e` being OFF. The
+    # trailing `case` below is defense in depth (handles a non-numeric but
+    # non-empty result), not a substitute for this.
+    _live=$(timeout 10 gc --city "$GC_CITY" session list --json 2>/dev/null \
+      | jq --arg t "$_pool" '[.sessions[]? | select(.template==$t and (.state=="active" or .state=="creating"))] | length' 2>/dev/null || echo "0")
+  fi
+  case "$_live" in ''|*[!0-9]*) _live=0 ;; esac
+  _global=$(gc_variable_session_count)
+  case "$_global" in ''|*[!0-9]*) _global=0 ;; esac
+
+  while [ "$_live" -lt "$_max" ] && [ "$_global" -lt "$GC_VARIABLE_SESSION_MAX" ]; do
+    # Test seam mirrors PILOT_TEST_WA_WORKER_LIVE_COUNT above: set to (even an
+    # empty string) to bypass the live bd probe entirely for hermetic tests.
+    if [ "$_pool" = "wa-worker" ] && [ -n "${PILOT_TEST_WA_WORKER_TOPUP_PENDING+x}" ]; then
+      _pending="$PILOT_TEST_WA_WORKER_TOPUP_PENDING"
+    elif [ "$_pool" = "ps-worker" ] && [ -n "${PILOT_TEST_PS_WORKER_TOPUP_PENDING+x}" ]; then
+      _pending="$PILOT_TEST_PS_WORKER_TOPUP_PENDING"
+    # ga-oc6knj: separate test seam that injects the RAW (pre-filter)
+    # candidate array and exercises the real _filter_candidates call below —
+    # unlike PILOT_TEST_*_TOPUP_PENDING above (which injects the already-
+    # decided final id and so tests only the capacity/loop logic), this one
+    # is what proves the eligibility fix itself. Same set-even-to-empty
+    # convention (${...+x}), same reason (this harness's PATH has no
+    # `timeout`, so the live bd call below would silently 127 either way).
+    elif [ "$_pool" = "wa-worker" ] && [ -n "${PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON+x}" ]; then
+      _pending=$(printf '%s' "$PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
+    elif [ "$_pool" = "ps-worker" ] && [ -n "${PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON+x}" ]; then
+      _pending=$(printf '%s' "$PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
+    else
+      # Same `|| echo` reasoning as the _live probe above.
+      # ga-oc6knj: widened --limit=1 -> --limit=20 and piped through
+      # _filter_candidates (see _topup_rig_pending's header comment above for
+      # the full rationale — this HQ query had the identical gap). A single
+      # ineligible bead at --limit=1 used to make top-up correctly find
+      # "nothing", masking every OTHER eligible routed-unassigned bead
+      # sitting right behind it in the same query.
+      _pending=$(timeout 15 bd -C "$GC_CITY" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
+        --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" --exclude-type epic \
+        "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit=20 2>/dev/null \
+        | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null \
+        | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" \
+          '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
+      if [ -z "$_pending" ]; then
+        # ga-q0ewpu: HQ has nothing — fall through to each non-HQ rig store
+        # before giving up (own test seam, same set-even-to-empty convention
+        # as PILOT_TEST_WA_WORKER_TOPUP_PENDING above).
+        if [ "$_pool" = "wa-worker" ] && [ -n "${PILOT_TEST_WA_WORKER_TOPUP_RIG_PENDING+x}" ]; then
+          _pending="$PILOT_TEST_WA_WORKER_TOPUP_RIG_PENDING"
+        elif [ "$_pool" = "ps-worker" ] && [ -n "${PILOT_TEST_PS_WORKER_TOPUP_RIG_PENDING+x}" ]; then
+          _pending="$PILOT_TEST_PS_WORKER_TOPUP_RIG_PENDING"
+        else
+          _pending=$(_topup_rig_pending "$_pool" || echo "")
+        fi
+      fi
+    fi
+    [ -z "$_pending" ] && break
+    if [ "$DRY_RUN" = "1" ]; then
+      log "  ga-93yxc: DRY_RUN=1 — WOULD: pool top-up spawn $_pool for $_pending (live=$_live < $_max, global=$_global < $GC_VARIABLE_SESSION_MAX, no worker from a prior sweep's dispatch)"
+      break
+    fi
+    log "  ga-93yxc: pool top-up — $_pool has free capacity (live=$_live < $_max) and $_pending is routed+unassigned with no worker from a prior sweep — spawning."
+    if timeout "${PILOT_SPAWN_TIMEOUT_SECS:-60}" gc --city "$GC_CITY" session new "$_pool" --no-attach \
+        --title-hint "pool top-up: $_pending" >/dev/null 2>&1; then
+      log "  ga-93yxc: pool top-up — $_pool session spawned for $_pending."
+      _live=$((_live + 1))
+      _global=$((_global + 1))
+    else
+      warn "ga-93yxc: pool top-up spawn failed for $_pool ($_pending) — will retry next sweep."
+      break
+    fi
+  done
+}
+# ga-q0ewpu: computed ONCE here (not inside _pilot_pool_topup/_topup_rig_pending)
+# so both pool calls below share a single `gc rig list` invocation. Same
+# fail-open convention as ga-07rb3 above (_scan_rig_fallback_pool,
+# _pilot_emit_dispatchable): a `gc rig list` failure just narrows this
+# sweep's top-up to HQ-only (the pre-fix behavior), never aborts the sweep.
+_TOPUP_RIG_PATHS_JSON=""
+if ! _TOPUP_RIG_PATHS_JSON=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json); then
+  warn "ga-93yxc: gc rig list failed while computing pool top-up rig scope — HQ-only this cycle."
+fi
+_TOPUP_RIG_PATHS=$(printf '%s' "$_TOPUP_RIG_PATHS_JSON" | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null)
+
+_pilot_pool_topup "wa-worker" "${PILOT_WA_WORKER_MAX:-4}"
+_pilot_pool_topup "ps-worker" "${PILOT_PS_WORKER_MAX:-2}"
+
 if [ "$SMALL_SLOTS" -eq "0" ] && [ "$BIG_SLOTS" -eq "0" ]; then
   # ga-8c1 AC5: even when backing off, surface the dispatch-queue depth so every
   # sweep's log reports what's waiting (cheap count — no full tier scan).
@@ -7809,253 +8087,6 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
 fi
 
 ALL_CANDIDATES_COUNT=$(echo "$ALL_CANDIDATES_JSON" | jq 'length' 2>/dev/null || echo "0")
-
-# ── Step 2d: ga-93yxc pool top-up ─────────────────────────────────────────────
-# The wa-worker/ps-worker cap-skip a few hundred lines down (ga-mfeip,
-# ga-v3o6i) sets gc.routed_to=<pool> and used to log "supervisor picks it up
-# when slot frees" — but no such mechanism exists. Both pools have
-# min_active_sessions=0 and wake_mode=fresh (no running session, no hook cycle
-# to "see it next time"), and the wa-worker agent.toml itself documents "we do
-# NOT rely on supervisor auto-spawn". So a routed-but-uncapacitated bead sat
-# unassigned with no worker until the inflight-reclaim-guard's TTL (25min+)
-# reclaimed it, got re-picked by the NEXT sweep, hit the same cap, and
-# repeated — measured live: wa-0i9zj dispatched 4x (02:04-05:17) and never
-# built once; at one point 29 wa-workers asleep, 0 active, 3 beads "in flight"
-# with nobody on them, gate stalled 97min because nothing finished (ga-93yxc).
-#
-# Fix: every sweep, independent of whether THIS sweep found any fresh
-# candidate, re-check live count vs max for each ephemeral pool and spawn a
-# worker for any already-routed-but-unassigned bead while capacity remains —
-# so a freed slot is filled on its VERY NEXT sweep (launchd re-execs this
-# script every 300s), not after a TTL wait. Respects the same GLOBAL
-# variable-session cap (ga-jezvn) a fresh dispatch would, and DRY_RUN (no real
-# spawn — logs what WOULD happen, mirrors every other mutation in this file).
-#
-# MUST run BEFORE the ALL_CANDIDATES_COUNT==0 early-exit right below: a quiet
-# sweep with nothing NEW to dispatch is exactly when an old routed-but-stuck
-# bead most needs a retry, and that early exit used to skip every later step
-# (including the original placement of this fix, right before Step 5 —
-# dead code on precisely the sweep shape this bug is about; caught by
-# Scenario TOPUP-1/4 failing red even after the fix was written, because the
-# harness's minimal fixture has zero fresh candidates by design).
-# _topup_rig_pending <pool>: rig-scoped fallback for the pending-bead query
-# inside _pilot_pool_topup below. Mirrors _scan_rig_fallback_pool's own
-# rig-discovery shape (L7643: `.rigs[] | select(.hq == false) | .path`) and
-# _pilot_emit_dispatchable's (L4429) — reused here via the pre-computed
-# _TOPUP_RIG_PATHS global (set once, right before both pool calls, so
-# wa-worker and ps-worker share a single `gc rig list` invocation instead of
-# paying for it twice).
-#
-# ga-q0ewpu: without this, gc.routed_to=<pool> is the ONLY signal a rig-native
-# (wa-*/ps-*) bead carries once pilot:dispatched excludes it from the main
-# candidate scan (see this function's own header comment below) — and the
-# pending-bead query only ever looked at $GC_CITY, where a rig-native bead
-# never lives. Measured live: wa-52q8u, wa-ah359, wa-c1hgd stranded
-# routed+unassigned at a saturated wa-worker cap until a human ran
-# pilot-manual-reclaim.sh by hand (wa-c1hgd twice — pilot:reclaim-count:2).
-# Always exits 0; emptiness of stdout is the "not found" signal, same
-# convention the direct bd probe already uses via its own `|| echo ""`.
-#
-# ga-oc6knj: widened --limit=1 -> --limit=20 and piped through _filter_candidates
-# (the dispatcher's own single chokepoint gate — see its definition/callers
-# above) before picking the survivor. Pre-fix this ONLY checked
-# gc.routed_to=<pool>+unassigned+not-epic — none of pilot:held (incl. expiry),
-# the pilot:reclaim-count cap, gate:needs-human/story:needs-human,
-# pool:refused[:reason], or any of the dozen-plus other park/veto labels the
-# wa-worker/ps-worker prompt probe (Step 1b2 in both templates) already
-# enforces on its side of the SAME gc.routed_to queue. Two independently
-# maintained "is this bead eligible" definitions is the exact ga-oc6knj
-# invariant (c) violation: top-up could spawn a session "for" a bead the
-# worker probe would refuse to serve the instant it looked — that session
-# just claims a DIFFERENT bead instead (silently correct from ITS
-# perspective, but the pending bead top-up meant to unstick stays stuck,
-# and a pool slot got spent on work top-up never intended). Reusing
-# _filter_candidates (rather than re-typing a third copy of the exclude-label
-# list here) is the same fix shape every other candidate source in this file
-# already gets — see its own header comment for why it is the designated
-# single chokepoint.
-#
-# ga-oc6knj gate_run=ga-8pv70k follow-up: _filter_candidates alone was NOT
-# actually equivalent to the worker probe, so the invariant-(c) gap above
-# only narrowed, it did not close. Verified against the reviewed SHA:
-# _filter_candidates has no check for ctx:thin, phone-proxy, gate:queued,
-# gate:reviewing, delivery:pending-restart, the story:unrefined/story:
-# refinement-in-progress/refino:* family, or the EPIC-title regex the worker
-# probe uses as defense-in-depth alongside its own type=epic exclusion; exec:manual
-# is handled only by the SEPARATE _filter_exec_manual, which neither call
-# site below invoked. Closing the actual gap: $_TOPUP_WORKER_EXCLUDE_LABELS
-# is the SAME --exclude-label set both agents/{wa-worker,ps-worker}/
-# prompt.template.md pass on their own Step 1b2 `bd ready` call (reused
-# verbatim, not re-typed a third time — a selftest diffs this array against
-# the live template files so the two can never silently drift apart again),
-# $_TOPUP_EPIC_TITLE_RE mirrors their jq title-regex fallback, and both query
-# pipelines below now also chain _filter_exec_manual — same position (before
-# _filter_candidates) as every other candidate source in this file already
-# uses (see e.g. BUGS_JSON/CTXREADY_JSON below).
-#
-# ga-onrnd6: _filter_candidates alone still does not cover the next-action:/
-# waiting-on:/blocked-on:/depends-on: family (that predicate lives in
-# _filter_label_vetoes, a SEPARATE chokepoint — BUGS_JSON/DEBT_JSON/CHORE_JSON/
-# TASK_JSON chain it explicitly right after _filter_candidates below;
-# TIER2_JSON/CTXREADY_JSON/every rig pool get it "for free" via
-# _filter_dispatch_gates, which calls it internally). Both call sites below
-# (_topup_rig_pending's rig-scoped query and this function's own $GC_CITY
-# query), AND both PILOT_TEST_*_TOPUP_CANDIDATES_JSON hermetic test seams
-# (kept in lockstep with the real pipelines so a selftest against the seam
-# can never pass while the live pipeline behaves differently), now chain
-# _filter_label_vetoes right after _filter_candidates — same fix shape as
-# BUGS_JSON, reusing the existing chokepoint rather than re-typing a THIRD
-# copy of the next-action/waiting-on/blocked-on/depends-on predicate. Same
-# live incident this closes as the wa-worker/ps-worker Step 1b2/1b3 fix in
-# the prompt templates (wa-k1sr7 — done-but-parked next-action:athos-decide
-# bead, re-dispatched by top-up spawning a fresh session after the worker
-# probe itself had already correctly stopped offering it).
-_TOPUP_WORKER_EXCLUDE_LABELS=(
-  --exclude-label "story:needs-human"
-  --exclude-label "story:needs-approval"
-  --exclude-label "needs-human"
-  --exclude-label "needs-human-decision"
-  --exclude-label "ctx:thin"
-  --exclude-label "story:epic"
-  --exclude-label "story:refinement-in-progress"
-  --exclude-label "story:unrefined"
-  --exclude-label "refino:policy-gap"
-  --exclude-label "refino:info-gap"
-  --exclude-label "auto-refino:escalated"
-  --exclude-label "story:refino-escalado"
-  --exclude-label "story:refino-review"
-  --exclude-label "auto-refino:refining"
-  --exclude-label "exec:manual"
-  --exclude-label "on-device"
-  --exclude-label "story:needs-device"
-  --exclude-label "phone-proxy"
-  --exclude-label "pilot:no-auto-dispatch"
-  --exclude-label "story:blocked"
-  --exclude-label "gate:queued"
-  --exclude-label "gate:reviewing"
-  --exclude-label "delivery:pending-restart"
-)
-_TOPUP_EPIC_TITLE_RE='^(EPIC|ÉPICO)[:\s]'
-_topup_rig_pending() {
-  local _pool="$1" _rp _rig_pending
-  while IFS= read -r _rp; do
-    [ -z "$_rp" ] || [ ! -d "$_rp" ] && continue
-    [ "$_rp" = "$GC_CITY" ] && continue
-    _rig_pending=$(timeout 15 bd -C "$_rp" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
-      --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" --exclude-type epic \
-      "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit=20 2>/dev/null \
-      | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null \
-      | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" \
-        '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
-    if [ -n "$_rig_pending" ]; then
-      printf '%s' "$_rig_pending"
-      return 0
-    fi
-  done <<< "$_TOPUP_RIG_PATHS"
-  printf ''
-  return 0
-}
-
-_pilot_pool_topup() {
-  local _pool="$1" _max="$2"
-  local _live _global _pending
-
-  if [ "$_pool" = "wa-worker" ] && [ -n "${PILOT_TEST_WA_WORKER_LIVE_COUNT:-}" ]; then
-    _live="$PILOT_TEST_WA_WORKER_LIVE_COUNT"
-  elif [ "$_pool" = "ps-worker" ] && [ -n "${PILOT_TEST_PS_WORKER_LIVE_COUNT:-}" ]; then
-    _live="$PILOT_TEST_PS_WORKER_LIVE_COUNT"
-  else
-    # `|| echo "0"` mirrors every sibling live-count probe in this file (e.g.
-    # gc_variable_session_count, the ga-mfeip cap-check above): without it, a
-    # missing `timeout` binary (127, "command not found" — genuinely absent
-    # from PATH in some harnesses/environments, not merely a bd/gc failure)
-    # leaves the substitution both EMPTY and non-zero-exit with nothing to
-    # consume that status, which — confirmed by direct bisection, bash
-    # 5.3.15 — aborts the whole script despite `set -e` being OFF. The
-    # trailing `case` below is defense in depth (handles a non-numeric but
-    # non-empty result), not a substitute for this.
-    _live=$(timeout 10 gc --city "$GC_CITY" session list --json 2>/dev/null \
-      | jq --arg t "$_pool" '[.sessions[]? | select(.template==$t and (.state=="active" or .state=="creating"))] | length' 2>/dev/null || echo "0")
-  fi
-  case "$_live" in ''|*[!0-9]*) _live=0 ;; esac
-  _global=$(gc_variable_session_count)
-  case "$_global" in ''|*[!0-9]*) _global=0 ;; esac
-
-  while [ "$_live" -lt "$_max" ] && [ "$_global" -lt "$GC_VARIABLE_SESSION_MAX" ]; do
-    # Test seam mirrors PILOT_TEST_WA_WORKER_LIVE_COUNT above: set to (even an
-    # empty string) to bypass the live bd probe entirely for hermetic tests.
-    if [ "$_pool" = "wa-worker" ] && [ -n "${PILOT_TEST_WA_WORKER_TOPUP_PENDING+x}" ]; then
-      _pending="$PILOT_TEST_WA_WORKER_TOPUP_PENDING"
-    elif [ "$_pool" = "ps-worker" ] && [ -n "${PILOT_TEST_PS_WORKER_TOPUP_PENDING+x}" ]; then
-      _pending="$PILOT_TEST_PS_WORKER_TOPUP_PENDING"
-    # ga-oc6knj: separate test seam that injects the RAW (pre-filter)
-    # candidate array and exercises the real _filter_candidates call below —
-    # unlike PILOT_TEST_*_TOPUP_PENDING above (which injects the already-
-    # decided final id and so tests only the capacity/loop logic), this one
-    # is what proves the eligibility fix itself. Same set-even-to-empty
-    # convention (${...+x}), same reason (this harness's PATH has no
-    # `timeout`, so the live bd call below would silently 127 either way).
-    elif [ "$_pool" = "wa-worker" ] && [ -n "${PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON+x}" ]; then
-      _pending=$(printf '%s' "$PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
-    elif [ "$_pool" = "ps-worker" ] && [ -n "${PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON+x}" ]; then
-      _pending=$(printf '%s' "$PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
-    else
-      # Same `|| echo` reasoning as the _live probe above.
-      # ga-oc6knj: widened --limit=1 -> --limit=20 and piped through
-      # _filter_candidates (see _topup_rig_pending's header comment above for
-      # the full rationale — this HQ query had the identical gap). A single
-      # ineligible bead at --limit=1 used to make top-up correctly find
-      # "nothing", masking every OTHER eligible routed-unassigned bead
-      # sitting right behind it in the same query.
-      _pending=$(timeout 15 bd -C "$GC_CITY" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
-        --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" --exclude-type epic \
-        "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit=20 2>/dev/null \
-        | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null \
-        | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" \
-          '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
-      if [ -z "$_pending" ]; then
-        # ga-q0ewpu: HQ has nothing — fall through to each non-HQ rig store
-        # before giving up (own test seam, same set-even-to-empty convention
-        # as PILOT_TEST_WA_WORKER_TOPUP_PENDING above).
-        if [ "$_pool" = "wa-worker" ] && [ -n "${PILOT_TEST_WA_WORKER_TOPUP_RIG_PENDING+x}" ]; then
-          _pending="$PILOT_TEST_WA_WORKER_TOPUP_RIG_PENDING"
-        elif [ "$_pool" = "ps-worker" ] && [ -n "${PILOT_TEST_PS_WORKER_TOPUP_RIG_PENDING+x}" ]; then
-          _pending="$PILOT_TEST_PS_WORKER_TOPUP_RIG_PENDING"
-        else
-          _pending=$(_topup_rig_pending "$_pool" || echo "")
-        fi
-      fi
-    fi
-    [ -z "$_pending" ] && break
-    if [ "$DRY_RUN" = "1" ]; then
-      log "  ga-93yxc: DRY_RUN=1 — WOULD: pool top-up spawn $_pool for $_pending (live=$_live < $_max, global=$_global < $GC_VARIABLE_SESSION_MAX, no worker from a prior sweep's dispatch)"
-      break
-    fi
-    log "  ga-93yxc: pool top-up — $_pool has free capacity (live=$_live < $_max) and $_pending is routed+unassigned with no worker from a prior sweep — spawning."
-    if timeout "${PILOT_SPAWN_TIMEOUT_SECS:-60}" gc --city "$GC_CITY" session new "$_pool" --no-attach \
-        --title-hint "pool top-up: $_pending" >/dev/null 2>&1; then
-      log "  ga-93yxc: pool top-up — $_pool session spawned for $_pending."
-      _live=$((_live + 1))
-      _global=$((_global + 1))
-    else
-      warn "ga-93yxc: pool top-up spawn failed for $_pool ($_pending) — will retry next sweep."
-      break
-    fi
-  done
-}
-# ga-q0ewpu: computed ONCE here (not inside _pilot_pool_topup/_topup_rig_pending)
-# so both pool calls below share a single `gc rig list` invocation. Same
-# fail-open convention as ga-07rb3 above (_scan_rig_fallback_pool,
-# _pilot_emit_dispatchable): a `gc rig list` failure just narrows this
-# sweep's top-up to HQ-only (the pre-fix behavior), never aborts the sweep.
-_TOPUP_RIG_PATHS_JSON=""
-if ! _TOPUP_RIG_PATHS_JSON=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json); then
-  warn "ga-93yxc: gc rig list failed while computing pool top-up rig scope — HQ-only this cycle."
-fi
-_TOPUP_RIG_PATHS=$(printf '%s' "$_TOPUP_RIG_PATHS_JSON" | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null)
-
-_pilot_pool_topup "wa-worker" "${PILOT_WA_WORKER_MAX:-4}"
-_pilot_pool_topup "ps-worker" "${PILOT_PS_WORKER_MAX:-2}"
 
 if [ "$ALL_CANDIDATES_COUNT" = "0" ]; then
   log "No dispatchable candidates (Tier 1 or Tier 2). Exiting."
