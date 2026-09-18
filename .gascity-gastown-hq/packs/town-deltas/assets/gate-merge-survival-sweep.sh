@@ -285,7 +285,7 @@ DEDUP_STREAM=$(printf '%s\n' "$LEDGER_DEDUP" \
   | jq -rc '.' 2>/dev/null \
   | awk 'match($0,/"merge_sha":"[0-9a-f]+"/){ k=substr($0,RSTART,RLENGTH); if(!s[k]++) print }' 2>/dev/null || true)
 
-SURVIVED=0; HEALED=0; DIVERGED=0; UNRESOLVED=0; CHECKED=0; PRUNED=0
+SURVIVED=0; HEALED=0; DIVERGED=0; UNRESOLVED=0; CHECKED=0; PRUNED=0; DOWNGRADED=0
 # NOTE: macOS /bin/bash is 3.2 — NO associative arrays. Dedup fetches with an
 # indexed array + linear membership check (same pattern as merged-bead-janitor).
 declare -a KEEP_LINES=()
@@ -535,6 +535,15 @@ if [ "${#PENDING_DIVERGENT[@]}" -gt 0 ]; then
       if [ "$RECHECK_VERDICT" = "survived" ]; then
         SURVIVED=$((SURVIVED+1))
         [ -f "$ALERT_DIR/$SHA" ] && rm -f "$ALERT_DIR/$SHA" 2>/dev/null || true
+      else
+        # ff_heal or unresolved on recheck: this run took no action for the
+        # entry (heal isn't re-attempted here — see parse_entry_fields's
+        # doc-comment on why — and unresolved is soft-escalated only from the
+        # first pass), so it belongs in neither SURVIVED/HEALED/DIVERGED/
+        # UNRESOLVED. Tally it separately rather than let it vanish from the
+        # summary entirely — checked=... should stay reconcilable against
+        # what actually happened to every candidate.
+        DOWNGRADED=$((DOWNGRADED+1))
       fi
       continue
     fi
@@ -567,7 +576,7 @@ if [ "$PRUNED" -gt 0 ] && [ "$DRY_RUN" = "0" ]; then
   fi
 fi
 
-log "=== survival-sweep complete — checked=$CHECKED survived=$SURVIVED healed=$HEALED divergent=$DIVERGED unresolved=$UNRESOLVED pruned=$PRUNED dry_run=$DRY_RUN ==="
+log "=== survival-sweep complete — checked=$CHECKED survived=$SURVIVED healed=$HEALED divergent=$DIVERGED unresolved=$UNRESOLVED downgraded=$DOWNGRADED pruned=$PRUNED dry_run=$DRY_RUN ==="
 # Per-event notifies (heal / orphan / unresolved) already fired above — loud and
 # per-sha rate-limited; no duplicate roll-up here.
 exit 0
