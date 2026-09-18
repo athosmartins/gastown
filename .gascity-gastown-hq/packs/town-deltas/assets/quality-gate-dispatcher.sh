@@ -11467,6 +11467,37 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
         # state at all).
         CONFLICT_KIND="merge"
         CONFLICT_FILES="auto-rebase/merge produced a tree that does not match a real 3-way merge (ga-m07gc) — content silently diverged though the commit itself survived. Diverging paths: ${_LOST_PATHS:-<none captured>}"
+      elif [ "${PR_COMMIT_VERDICT:-}" = "no" ]; then
+        # ga-wfbvx2: the sibling verdict, one check over — branch_bead_commit_verdict()
+        # (ga-y9a1d) instead of rebase_content_verdict() (ga-m07gc) just above. Same
+        # shape, same fix as ga-10uqmi: the attempt above was a git-level SUCCESS (a
+        # rebase/merge commit exists) but none of this branch's own commits mention
+        # bead $BEAD_ID — that is baked into the branch's git history, so retrying the
+        # identical rebase/merge reproduces the identical "no" every time. Deterministic,
+        # never "transient". Measured live (Mayor, 2026-09-17,
+        # fix/wa-aoznq-scheduled-job-opt-out): the OLD code below fell through to the
+        # generic "transient" bucket unconditionally for THIS verdict too, feeding it
+        # the same bounded-retry/exile machinery ga-10uqmi already proved resonates
+        # without ever escalating — measured as 4+ auto-rebase rounds (19:46-20:28) and
+        # a burned review cycle (PASS 20:06, refused again 20:11 on a condition already
+        # true since 19:01). Deliberately checking "= no" and not "!= yes", mirroring
+        # ga-pgxs78/the sibling check above: branch_bead_commit_verdict() also returns
+        # "skip" (nothing to check — zero commits ahead, or no bead id) and that must
+        # fall through to the ordinary transient/plumbing path below unchanged, never be
+        # treated as a confirmed mismatch.
+        #
+        # Route it the same way ga-10uqmi routes its own sibling verdict: immediate
+        # gate-status:needs-rebase, no attempt counter, no tier5 exile. CONFLICT_FILES
+        # below REUSES _gate_push_skip_reason() (ga-744kvc, defined above) rather than
+        # hand-writing a second, driftable copy of the same fact — this is the exact
+        # helper that already composes "no commit on this branch mentions bead X —
+        # rename the subject to fix(X) or cite the id in the body" for the log line at
+        # every one of the six call sites above, so the marker comment a builder reads
+        # (this value, surfaced downstream via bd comment) says the identical thing as
+        # the log they might also be looking at (ga-wfbvx2 invariant a: both surfaces,
+        # not just one).
+        CONFLICT_KIND="merge"
+        CONFLICT_FILES="branch-content-coherence (ga-y9a1d/ga-wfbvx2): $(_gate_push_skip_reason "$PR_COMMIT_VERDICT" "${PR_CONTENT_VERDICT:-}" "$BRANCH" "$BEAD_ID")"
       else
         CONFLICT_KIND="transient"   # ga-q3ig2: plumbing failure, not a real conflict — retry is worthwhile.
         if [ -n "$AUTO_REBASE_PUSH_ERR" ]; then
