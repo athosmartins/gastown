@@ -198,6 +198,39 @@ _heal() {
     && log "  HEAL: cleared assignee on $bead" \
     || log "  HEAL WARN: failed to clear assignee on $bead"
 
+  # ga-lkbw82 defect #3: the calls above reporting exit 0 is not proof they
+  # persisted — this exact bead's own incident had `bd assign <bead> ""`
+  # exit cleanly while the bead stayed assignee=oracle-wa (comment claimed
+  # "unassigned and reopened" anyway). Re-read the bead and report what
+  # ACTUALLY landed instead of trusting the calls' own exit codes.
+  local verify_json clear_fail=""
+  verify_json=$("$BD" -C "$store" show "$bead" --json 2>/dev/null)
+  if [ -n "$verify_json" ]; then
+    local verify_parsed still_assignee still_dispatched still_inflight
+    # gate-done self-audit (ga-lkbw82): a non-empty but UNPARSEABLE response
+    # must not silently read as "confirmed clean" — the fields below would
+    # all come back empty/false from a failed jq parse too, which is exactly
+    # the same shape as a genuinely-cleared bead. Check the parse succeeded
+    # (resolves to a real object) before trusting any field read from it.
+    verify_parsed=$(printf '%s' "$verify_json" | jq -r 'if type=="array" then .[0] else . end | (type == "object")' 2>/dev/null)
+    if [ "$verify_parsed" != "true" ]; then
+      clear_fail="could not parse verification response from bd show"
+    else
+      still_assignee=$(printf '%s' "$verify_json" | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null)
+      still_dispatched=$(printf '%s' "$verify_json" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | any(. == "pilot:dispatched")' 2>/dev/null)
+      still_inflight=$(printf '%s' "$verify_json" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | any(. == "story:in-flight")' 2>/dev/null)
+      [ -n "$still_assignee" ] && clear_fail="${clear_fail}assignee still '$still_assignee'; "
+      [ "$still_dispatched" = "true" ] && clear_fail="${clear_fail}pilot:dispatched still present; "
+      [ "$still_inflight" = "true" ] && clear_fail="${clear_fail}story:in-flight still present; "
+    fi
+  else
+    clear_fail="could not re-read bead to verify (bd show failed)"
+  fi
+  if [ -n "$clear_fail" ]; then
+    log "  HEAL VERIFY FAILED: $bead — $clear_fail"
+    notify_fail "crew-liveness-probe: heal do bead $bead so limpou PARCIALMENTE ($clear_fail) — bead pode continuar invisivel pro despacho"
+  fi
+
   # Suspend the crew agent so Pilot does NOT re-dispatch to the same dead session.
   # Pilot honors this via _crew_is_suspended() → gc agent list | awk '$2=="suspended"'
   # checked at pick_pool_builder() (pilot-dispatcher.sh lines 750, 760).
@@ -209,27 +242,25 @@ _heal() {
   # identity changes (proof of restart — the actual cure, per ga-ld0ch); `gc
   # agent resume <name>` also works manually at any time.
   #
-  # ⚠️ OUTSTANDING (Mayor, ga-ld0ch bead comment, 2026-09-10T16:26Z): before
-  # CLP_HEAL_ENABLED=1 is ever set in production, this suspend step still
-  # needs ONE of (a) removal (Mayor's stated preference — "suspender não
-  # destrava sessão nenhuma"), or (b) a guard that NEVER suspends a crew with
-  # a live/attached session, proven by a test. The -C→--city fix in this same
-  # diff makes this call actually WORK for the first time (it was previously
-  # silent dead code), so leaving it as-is is what would newly activate the
-  # exact risk class Mayor flagged — a wedged-but-alive crew a human is
-  # actively attached to getting suspended out from under them, same shape as
-  # the 2026-09-10 incident this bead exists to guard against. Deliberately
-  # NOT resolved in this fix: it is a design/product call for Mayor to make
-  # (remove vs. build "attached" detection — a real feature, not a small
-  # patch), not something to decide unilaterally while a gate-fix cap is
-  # ticking. CLP_HEAL_ENABLED defaults to 0 (line ~87), so this is inert
-  # until someone deliberately opts in — flagged here, and in a bead comment,
-  # so that decision point isn't silently missed.
+  # RESOLVED (ga-lkbw82, 2026-09-18 — was OUTSTANDING per ga-ld0ch bead comment
+  # 2026-09-10T16:26Z): the caller (run_probe) now REFUSES to reach this
+  # function at all unless BOTH (a) _session_attached() confirms no human is
+  # actively watching the crew's session, and (b) _worktree_activity_since()
+  # proves no real git activity (staged/committed work) happened in the
+  # crew's work_dir during the stale window — together this IS the "guard
+  # that never suspends a crew with a live/attached session, proven by a
+  # test" the outstanding note asked for. The oracle-wa incident (7 files
+  # staged, zero bead activity) is exactly the shape (b) now catches before
+  # ever calling _heal.
   if "$GC" --city "$CLP_CITY" agent suspend "$crew" 2>/dev/null; then
     log "  HEAL: suspended crew agent $crew"
     _record_heal_marker "$crew" "$bead" "$store" "$ident"
-    _comment_bead "$store" "$bead" "crew-liveness-probe: suspended crew agent '$crew' after 2 confirmed sweeps with no commit activity on this bead (>= ${CLP_PROBE_STALE_MIN}min stale, reconfirmed >= ${CLP_CONFIRM_MIN}min later). Bead unassigned and reopened for dispatch. '$crew' auto-resumes once its session restarts (new session identity detected), or resume manually: gc agent resume $crew"
-    notify_info "crew-liveness-probe: suspendi $crew (bead $bead confirmado travado 2x) — auto-retoma quando a sessao reiniciar, ou: gc agent resume $crew"
+    if [ -n "$clear_fail" ]; then
+      _comment_bead "$store" "$bead" "crew-liveness-probe: suspended crew agent '$crew' after 2 confirmed sweeps with no commit activity on this bead (>= ${CLP_PROBE_STALE_MIN}min stale, reconfirmed >= ${CLP_CONFIRM_MIN}min later). PARTIAL: verification after write found: $clear_fail — bead may still be invisible to dispatch; needs manual check. '$crew' auto-resumes once its session restarts (new session identity detected), or resume manually: gc agent resume $crew"
+    else
+      _comment_bead "$store" "$bead" "crew-liveness-probe: suspended crew agent '$crew' after 2 confirmed sweeps with no commit activity on this bead (>= ${CLP_PROBE_STALE_MIN}min stale, reconfirmed >= ${CLP_CONFIRM_MIN}min later). Bead unassigned and reopened for dispatch (verified: assignee cleared, labels removed). '$crew' auto-resumes once its session restarts (new session identity detected), or resume manually: gc agent resume $crew"
+    fi
+    notify_info "crew-liveness-probe: suspendi $crew (bead $bead confirmado travado 2x)$( [ -n "$clear_fail" ] && printf ' -- LIMPEZA PARCIAL, ver comentario' ) — auto-retoma quando a sessao reiniciar, ou: gc agent resume $crew"
   else
     log "  HEAL WARN: failed to suspend crew agent $crew (may not be a city agent)"
     notify_fail "crew-liveness-probe: falha ao suspender crew $crew apos heal do bead $bead — crew wedged pode ser re-despachado"
@@ -337,6 +368,19 @@ _session_identity() {
     '.sessions[]? | select(.name == $n) | "\(.id)|\(.created_at)"' 2>/dev/null | head -1
 }
 
+# _session_attached crew-name — true if the crew's current live session has a
+# human actively attached (a terminal/UI watching it) right now, per `gc
+# session list --json`'s own `attached` field. ga-lkbw82 ACEITE #2 / the
+# original ga-ld0ch outstanding note both name this literally: heal must
+# never fire on a "live/attached" session. Empty/missing reads as "not
+# attached" (fail toward the more permissive read here is safe precisely
+# because this is only ONE of several independent gates before heal fires,
+# not the last line of defense).
+_session_attached() {
+  printf '%s' "$_sessions_json_cache" | jq -r --arg n "$1" \
+    '.sessions[]? | select(.name == $n) | (.attached // false)' 2>/dev/null | head -1
+}
+
 # _state_file bead-id crew-id — returns path to confirmation state file
 _state_file() {
   mkdir -p "$CLP_STATE_DIR" 2>/dev/null || true
@@ -400,6 +444,52 @@ _is_committed_suspend() {
     | grep -qF 'suspended = true'
 }
 
+# _crew_work_dir crew-name — the crew's persistent worktree path, read from
+# the cached `gc agent list --json` (_load_agent_list_json). Empty if that
+# load failed or the crew has no work_dir configured.
+_crew_work_dir() {
+  printf '%s' "$_agent_list_json_cache" | jq -r --arg n "$1" \
+    '.agents[]? | select(.name == $n) | (.work_dir // empty)' 2>/dev/null | head -1
+}
+
+# _worktree_activity_since work_dir since_epoch — ga-lkbw82 defect #2: a stale
+# bead `updated_at` is not proof a crew stopped working, only proof the BEAD
+# wasn't touched. This checks the two real work signals named in that bead's
+# ACEITE #2 (mtime do worktree/índice; commits no branch): the git index
+# mtime (bumped by `git add` — exactly what the oracle-wa incident's "7
+# staged files, no commit" produced) and the last commit time on whatever
+# branch is currently checked out. Prints:
+#   1  real activity found at/after since_epoch — crew is NOT actually wedged
+#   0  confirmed no activity in that window
+#   2  could not determine (missing/invalid work_dir) — NOT proof either way
+_worktree_activity_since() {
+  local wd="$1" since="$2"
+  [ -n "$wd" ] && [ -d "$wd/.git" ] || { echo 2; return; }
+  if [ -e "$wd/.git/index" ]; then
+    local idx_mtime
+    idx_mtime=$(stat -f %m "$wd/.git/index" 2>/dev/null || stat -c %Y "$wd/.git/index" 2>/dev/null)
+    if [ -n "$idx_mtime" ] && [ "$idx_mtime" -ge "$since" ] 2>/dev/null; then
+      echo 1; return
+    fi
+  fi
+  local commit_epoch commit_rc
+  commit_epoch=$(timeout 5 git -C "$wd" log -1 --format=%ct HEAD 2>/dev/null)
+  commit_rc=$?
+  if [ "$commit_rc" -ne 0 ]; then
+    # git log itself FAILED (timeout, lock contention, corrupted ref) rather
+    # than cleanly resolving a commit time. That is a different state than
+    # "confirmed no recent commit" and must not collapse into it — gate-done
+    # self-audit (ga-lkbw82): erring toward "0" here would let heal proceed
+    # on a work_dir we genuinely couldn't read, exactly the shape ACEITE #2
+    # exists to prevent.
+    echo 2; return
+  fi
+  if [ -n "$commit_epoch" ] && [ "$commit_epoch" -ge "$since" ] 2>/dev/null; then
+    echo 1; return
+  fi
+  echo 0
+}
+
 run_probe() {
   if [ "$CLP_ENABLED" != "1" ]; then log "disabled (CLP_ENABLED!=1)"; return 0; fi
   local store id assignee updated_at stale_sec probed=0 healed=0 live_sessions
@@ -409,6 +499,9 @@ run_probe() {
   # Cache live sessions once per probe run (gc session list is expensive)
   _load_sessions_json
   live_sessions=$(_live_sessions)
+  # ga-lkbw82 defect #2: also cache agent list (for work_dir lookups) so the
+  # confirmed-wedged branch below can check real git activity before healing.
+  _load_agent_list_json
 
   # Clean up state files for beads that have cleared (stale/expired files ≥ 2h old).
   # *.suspended-by-probe is deliberately NOT included — see _heal_marker_file().
@@ -447,12 +540,52 @@ run_probe() {
       # First sweep: nudge + record state. Do NOT heal yet.
       # Second sweep (state file ≥ CLP_CONFIRM_MIN old): confirmed wedged → maybe heal.
       if _is_confirmed "$id" "$assignee"; then
+        # ga-lkbw82 ACEITE #2 / ga-ld0ch outstanding note: a crew with a
+        # human actively ATTACHED must never be suspended, full stop —
+        # independent of git activity. Checked first because it's a hard
+        # block, not evidence to weigh against bd staleness.
+        if [ "$(_session_attached "$assignee")" = "true" ]; then
+          log "  HEAL SKIPPED: $assignee's session is ATTACHED (human watching) — never suspending an attached session (ga-lkbw82 ACEITE #2)"
+          if [ "$CLP_HEAL_ENABLED" = "1" ]; then
+            notify_fail "crew-liveness-probe: heal do bead $id/$assignee adiado — sessao ANEXADA (humano acompanhando), nunca suspender"
+          fi
+          _nudge "$assignee" "$id"
+          probed=$(( probed + 1 ))
+          continue
+        fi
+
+        # ga-lkbw82 defect #2: the bead's own updated_at being stale is NOT
+        # proof the crew stopped — check real git activity in its work_dir
+        # before trusting the bd-only signal (the oracle-wa incident had 7
+        # files staged, zero bead activity). Real activity found means this
+        # crew was never actually wedged; disprove and reset, don't heal.
+        local work_dir activity since_epoch
+        work_dir=$(_crew_work_dir "$assignee")
+        since_epoch=$(( now - stale_threshold ))
+        activity=$(_worktree_activity_since "$work_dir" "$since_epoch")
+
+        if [ "$activity" = "1" ]; then
+          log "probe NOT-WEDGED: $id assignee=$assignee stale=${stale_sec}s but real git activity found in work_dir='$work_dir' within the window — bead updated_at was stale, the crew was not (ga-lkbw82 defect #2 guard); clearing confirmation state"
+          _clear_state "$id" "$assignee"
+          continue
+        fi
+
         # CONFIRMED: crew was nudged ≥ CLP_CONFIRM_MIN ago and is STILL stale+alive
         log "probe CONFIRMED-WEDGED: $id assignee=$assignee stale=${stale_sec}s — crew is confirmed wedged (2-sweep)"
         if [ "$CLP_HEAL_ENABLED" = "1" ]; then
-          _heal "$assignee" "$id" "$store" "$(_session_identity "$assignee")"
-          _clear_state "$id" "$assignee"
-          healed=$(( healed + 1 ))
+          if [ "$activity" = "2" ]; then
+            # ga-lkbw82 ACEITE #2: heal only runs with PROOF the crew isn't
+            # alive. An unresolved/non-git work_dir is not proof either way —
+            # fail closed on the destructive path rather than guess.
+            log "  HEAL SKIPPED: cannot confirm absence of git activity for $assignee (work_dir='$work_dir' unresolved or not a git checkout) — refusing to suspend without proof"
+            notify_fail "crew-liveness-probe: heal do bead $id/$assignee adiado — nao foi possivel confirmar ausencia de atividade git (work_dir='$work_dir')"
+            _nudge "$assignee" "$id"
+            probed=$(( probed + 1 ))
+          else
+            _heal "$assignee" "$id" "$store" "$(_session_identity "$assignee")"
+            _clear_state "$id" "$assignee"
+            healed=$(( healed + 1 ))
+          fi
         else
           log "  HEAL skipped (CLP_HEAL_ENABLED!=1) — crew $assignee still wedged on $id"
           # Re-nudge since we skipped heal, so crew gets another poke
@@ -474,13 +607,21 @@ run_probe() {
 
 # run_resume_scan — the other half of imp21's heal (ga-ld0ch): auto-resume a
 # crew THIS script suspended once it looks healthy again. "Healthy again" =
-# its live session identity differs from what it was at suspend time — either
-# a genuinely new session (restarted, the real cure per ga-ld0ch's own
-# incident writeup) or no session at all (the old wedged one exited; resuming
-# just lets the reconciler start a clean one instead of leaving the crew
-# stuck suspended forever with nothing running). Never acts on a crew without
-# a marker THIS function's sibling _heal() wrote, so a deliberate/committed
-# suspension is never touched.
+# its live session identity is a NEW, NON-EMPTY value, different from what it
+# was at suspend time — proof of an actual restart (the real cure per
+# ga-ld0ch's own incident writeup). Never acts on a crew without a marker
+# THIS function's sibling _heal() wrote, so a deliberate/committed suspension
+# is never touched.
+#
+# ga-lkbw82 defect #4 (RESOLVED — this docstring used to claim "no session at
+# all" ALSO counted as healthy-again; that was the bug, not a feature): an
+# EMPTY ident_now proves nothing — it just means no session is live *right
+# now*, which is equally true the instant after suspend and hours later with
+# the crew still genuinely wedged and unattended. The real incident's own
+# logged comment was literally "identity changed (ga-3d247q|... -> )" for a
+# crew that had simply vanished, not restarted — reading that as "resumed"
+# unsuspended a crew nothing had actually fixed. Only a fresh, non-empty
+# identity is evidence of a restart; absence is a third state, handled below.
 run_resume_scan() {
   [ "$CLP_HEAL_ENABLED" = "1" ] || { log "resume-scan skipped (CLP_HEAL_ENABLED!=1)"; return 0; }
   [ -d "$CLP_STATE_DIR" ] || return 0
@@ -524,7 +665,16 @@ run_resume_scan() {
     fi
 
     ident_now=$(_session_identity "$crew")
-    if [ "$ident_now" != "$ident_then" ]; then
+    if [ -z "$ident_now" ]; then
+      # ga-lkbw82 defect #4: no live session at all right now is not proof of
+      # a restart — it reads identically whether the crew restarted a second
+      # ago and hasn't reappeared yet, or never restarted at all. Leave the
+      # marker and the suspension untouched; a REAL restart will show up here
+      # as a new non-empty identity on a later cycle and fall into the branch
+      # below instead.
+      local age_min=$(( ( $(date +%s) - suspended_at ) / 60 ))
+      log "resume-scan: $crew has NO live session right now (was '$ident_then', suspended ${age_min}min) — absence is not proof of a restart, not auto-resuming"
+    elif [ "$ident_now" != "$ident_then" ]; then
       log "resume-scan: $crew session identity changed ('$ident_then' -> '$ident_now') — treating as restarted, auto-resuming"
       if [ "$CLP_DRY_RUN" = "1" ]; then
         log "  DRY: would resume $crew"
@@ -617,6 +767,20 @@ echo "\$*" >> "${NOTIFY_LOG}"
 NOTIFYSHIM
   chmod +x "$TMP/notify"
 
+  # ga-lkbw82 defect #2 fixture: a real git checkout standing in for a crew's
+  # persistent work_dir, backdated so it shows NO activity by default (existing
+  # heal-fires scenarios below need this baseline). Scenario 36 freshens it
+  # (git add) to prove the activity guard blocks heal when real work exists.
+  _fmt_iso()   { date -u -r "$1" "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d "@$1" "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null; }
+  _fmt_touch() { date -u -r "$1" "+%Y%m%d%H%M.%S"      2>/dev/null || date -u -d "@$1" "+%Y%m%d%H%M.%S"      2>/dev/null; }
+  OLD_EPOCH=$(( NOW_ST - 100000 ))
+  CREWDIR="$TMP/crewdir-mila-wa"
+  mkdir -p "$CREWDIR"
+  git -C "$CREWDIR" init -q 2>/dev/null
+  GIT_AUTHOR_DATE="$(_fmt_iso "$OLD_EPOCH")" GIT_COMMITTER_DATE="$(_fmt_iso "$OLD_EPOCH")" \
+    git -C "$CREWDIR" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m "old baseline" 2>/dev/null
+  touch -t "$(_fmt_touch "$OLD_EPOCH")" "$CREWDIR/.git/index" 2>/dev/null
+
   # Stale bead (updated 20 min ago), live crew
   STALE_TS=$(date -u -r $(( NOW_ST - 1200 )) "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
              || date -u -d "@$(( NOW_ST - 1200 ))" "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)
@@ -629,9 +793,31 @@ NOTIFYSHIM
 case "\$*" in
   *"list -l story:in-flight -l pilot:dispatched"*)
     echo '[{"id":"wa-stale","assignee":"mila-wa","updated_at":"'"$STALE_TS"'"},{"id":"wa-fresh","assignee":"mila-wa","updated_at":"'"$FRESH_TS"'"},{"id":"wa-dead","assignee":"dead-crew","updated_at":"'"$STALE_TS"'"}]' ;;
+  *"show "*)
+    # Reflects a controllable post-write bead state for _heal()'s verify-
+    # after-write step (ga-lkbw82 defect #3). Defaults to "cleared" so
+    # existing heal-succeeds scenarios keep passing; touch
+    # \$TMP/show_assignee_stuck to simulate the silent-no-op failure shape
+    # (bd reports exit 0 but assignee/labels never actually changed).
+    # \$TMP/show_garbage_json — self-audit fixture (ga-lkbw82): a non-empty
+    # but UNPARSEABLE response, distinct from both of the above.
+    if [ -f "${TMP}/show_garbage_json" ]; then
+      echo 'not valid json {{{'
+    elif [ -f "${TMP}/show_assignee_stuck" ]; then
+      echo '[{"id":"wa-stale","assignee":"mila-wa","labels":["pilot:dispatched","story:in-flight"]}]'
+    else
+      echo '[{"id":"wa-stale","assignee":"","labels":[]}]'
+    fi
+    ;;
   *"label remove"*) echo "\$*" >> "${HEAL_LOG}" ;;
   *"assign"*) echo "\$*" >> "${HEAL_LOG}" ;;
-  *"comment"*) echo "\$*" >> "${COMMENT_LOG}" ;;
+  *"comment"*)
+    echo "\$*" >> "${COMMENT_LOG}"
+    # Also capture the actual --file content (the real comment TEXT), not
+    # just the argv line, so assertions can check what the comment SAYS.
+    FILEARG="\${@: -1}"
+    [ -f "\$FILEARG" ] && cat "\$FILEARG" >> "${COMMENT_LOG}"
+    ;;
   *) echo '[]' ;;
 esac
 BDSHIM
@@ -672,7 +858,16 @@ case "\$*" in
     [ -f "${TMP}/session_list_missing_key" ] && { echo '{"filters":{},"ok":true,"schema_version":"1"}'; exit 0; }
     EXTRA_SESSION=""
     [ -f "${TMP}/extra_session_name" ] && EXTRA_SESSION=',{"name":"'"\$(cat "${TMP}/extra_session_name")"'","id":"sess-extra","created_at":"2026-01-01T00:00:00Z"}'
-    echo '{"filters":{},"ok":true,"schema_version":"1","sessions":[{"name":"mila-wa","id":"'"\$SID"'","created_at":"2026-01-01T00:00:00Z"}'"\$EXTRA_SESSION"']}' ;;
+    if [ -f "${TMP}/mila_wa_no_session" ]; then
+      # ga-lkbw82 defect #4 fixture: mila-wa has NO live session at all right
+      # now (distinct from "a new session" — this is the empty-identity shape).
+      echo '{"filters":{},"ok":true,"schema_version":"1","sessions":['"\${EXTRA_SESSION#,}"']}'
+    else
+      ATTACHED=false
+      [ -f "${TMP}/mila_wa_attached" ] && ATTACHED=true
+      echo '{"filters":{},"ok":true,"schema_version":"1","sessions":[{"name":"mila-wa","id":"'"\$SID"'","created_at":"2026-01-01T00:00:00Z","attached":'"\$ATTACHED"'}'"\$EXTRA_SESSION"']}'
+    fi
+    ;;
   *"nudge"*) echo "\$*" >> "${NUDGE_LOG}" ;;
   *"-C "*"agent suspend"*|*"-C "*"agent resume"*|*"-C "*"agent list --json"*)
     # Gate-fix (ga-ld0ch review, attempt 2): the real gc binary rejects the
@@ -729,7 +924,7 @@ case "\$*" in
     if grep -qxF "mila-wa" "${TMP}/suspended_state" 2>/dev/null; then SUS=true; else SUS=false; fi
     EXTRA_AGENT=""
     [ -f "${TMP}/extra_agent_name" ] && EXTRA_AGENT=',{"name":"'"\$(cat "${TMP}/extra_agent_name")"'","suspended":true}'
-    echo '{"agents":[{"name":"mila-wa","suspended":'"\$SUS"'}'"\$EXTRA_AGENT"']}'
+    echo '{"agents":[{"name":"mila-wa","suspended":'"\$SUS"',"work_dir":"'"${CREWDIR}"'"}'"\$EXTRA_AGENT"']}'
     ;;
   *) true ;;
 esac
@@ -1113,6 +1308,73 @@ GCSHIM
   [ -n "$MUTANT_HIT" ] \
     && ok "35b: structural detector has teeth (flags a synthetic unrouted \$GC --json call)" \
     || bad "35b: structural detector did NOT flag a synthetic unrouted call — Scenario 35 could pass vacuously"
+
+  echo ""
+  echo "=== Scenario 36 (ga-lkbw82 defect #2): live crew with staged-but-uncommitted changes in its work_dir is NOT suspended, even though the bead's own updated_at looks stale — 'stopped' must not be measured by bd updated_at alone ==="
+  : > "$NUDGE_LOG"; : > "$HEAL_LOG"; : > "$SUSPEND_LOG"; : > "$NOTIFY_LOG"; : > "$TMP/suspended_state"
+  rm -f "$CLP_STATE_DIR"/mila-wa.suspended-by-probe 2>/dev/null
+  CLP_ENABLED=1; CLP_HEAL_ENABLED=1; CLP_PROBE_STALE_MIN=15; CLP_DRY_RUN=0
+  echo $(( NOW_ST - (8 * 60 + 60) )) > "$TMP/state/wa-stale__mila-wa.nudged"   # confirmed (2nd sweep)
+  # Simulate real work: stage a new file in the crew's work_dir right now —
+  # this is exactly the oracle-wa incident's shape (7 staged files, no commit).
+  echo "wip" > "$CREWDIR/new_file.txt"
+  git -C "$CREWDIR" add new_file.txt 2>/dev/null   # bumps .git/index mtime to NOW
+  run_probe
+  [ -s "$SUSPEND_LOG" ] && bad "36: suspended a crew with real staged git activity in its work_dir" || ok "36: did NOT suspend — staged activity correctly recognized as 'not actually wedged'"
+  [ -f "$TMP/state/wa-stale__mila-wa.nudged" ] && bad "36: confirmation state not cleared after real activity was found" || ok "36: confirmation state cleared once real activity disproved staleness"
+  # Restore the fixture to its old/no-activity baseline for any later use.
+  git -C "$CREWDIR" reset -q -- new_file.txt 2>/dev/null; rm -f "$CREWDIR/new_file.txt"
+  touch -t "$(_fmt_touch "$OLD_EPOCH")" "$CREWDIR/.git/index" 2>/dev/null
+
+  echo ""
+  echo "=== Scenario 37 (ga-lkbw82 defect #3): _heal() verifies its own writes instead of trusting exit codes — a silent no-op (assignee/labels NOT actually cleared) is reported as an explicit PARTIAL failure, not a blanket success ==="
+  : > "$SUSPEND_LOG"; : > "$COMMENT_LOG"; : > "$NOTIFY_LOG"; : > "$TMP/suspended_state"
+  rm -f "$CLP_STATE_DIR"/mila-wa.suspended-by-probe 2>/dev/null
+  touch "$TMP/show_assignee_stuck"   # bd shim: `show` reports the bead as still assigned+labeled after the writes
+  CLP_DRY_RUN=0
+  _load_sessions_json
+  _heal "mila-wa" "wa-stale" "$TMP" "$(_session_identity mila-wa)"
+  rm -f "$TMP/show_assignee_stuck"
+  grep -qi "parcial\|partial" "$NOTIFY_LOG" && ok "37: heal notified an explicit PARTIAL-failure when verification found assignee/labels still present" || bad "37: heal did not notify about the verify-after-write failure (silent no-op went unreported)"
+  grep -qi "partial\|still\|ainda" "$COMMENT_LOG" && ok "37: heal's bead comment states the partial failure explicitly, not a blanket success claim" || bad "37: heal's bead comment did not report the verification failure"
+
+  echo ""
+  echo "=== Scenario 38 (ga-lkbw82 defect #4): resume-scan does NOT auto-resume when the crew has NO live session at all (identity EMPTY) — absence must not be read as 'restarted'; matches the real incident's own logged shape 'identity changed (X -> )' ==="
+  : > "$RESUME_LOG"; : > "$COMMENT_LOG"; : > "$NOTIFY_LOG"; : > "$TMP/suspended_state"
+  rm -f "$CLP_STATE_DIR"/mila-wa.suspended-by-probe "${TMP}/mila_wa_no_session" "${TMP}/extra_session_name" "${TMP}/show_assignee_stuck" 2>/dev/null
+  echo "sess-empty-base" > "$TMP/session_id"
+  _load_sessions_json
+  _heal "mila-wa" "wa-stale" "$TMP" "$(_session_identity mila-wa)"
+  MARKER38="$CLP_STATE_DIR/mila-wa.suspended-by-probe"
+  touch "${TMP}/mila_wa_no_session"   # simulate: the wedged session simply exited -- no new one
+  CLP_HEAL_ENABLED=1
+  run_resume_scan
+  rm -f "${TMP}/mila_wa_no_session"
+  [ -s "$RESUME_LOG" ] && bad "38: resume-scan called gc agent resume when the crew had NO live session (empty identity read as 'restarted')" || ok "38: resume-scan correctly did NOT resume on empty identity"
+  [ -f "$MARKER38" ] && ok "38: marker preserved -- still waiting for a REAL restart (non-empty new identity)" || bad "38: marker was wrongly cleared despite no proof of a restart"
+
+  echo ""
+  echo "=== Scenario 39 (ga-lkbw82 ACEITE #2 / ga-ld0ch outstanding note): a crew with an ATTACHED session (human actively watching) is never suspended, even with confirmed bd-staleness and no git activity ==="
+  : > "$NUDGE_LOG"; : > "$HEAL_LOG"; : > "$SUSPEND_LOG"; : > "$NOTIFY_LOG"; : > "$TMP/suspended_state"
+  rm -f "$CLP_STATE_DIR"/mila-wa.suspended-by-probe 2>/dev/null
+  CLP_ENABLED=1; CLP_HEAL_ENABLED=1; CLP_PROBE_STALE_MIN=15; CLP_DRY_RUN=0
+  echo $(( NOW_ST - (8 * 60 + 60) )) > "$TMP/state/wa-stale__mila-wa.nudged"   # confirmed (2nd sweep)
+  touch "${TMP}/mila_wa_attached"   # no git activity either -- attached must block on its own
+  run_probe
+  rm -f "${TMP}/mila_wa_attached"
+  [ -s "$SUSPEND_LOG" ] && bad "39: suspended a crew whose session is ATTACHED (human watching)" || ok "39: did NOT suspend an attached crew, regardless of git activity"
+
+  echo ""
+  echo "=== Scenario 40 (gate-done self-audit, ga-lkbw82): _heal()'s verify step treats an UNPARSEABLE bd show response as a failure to verify, not as 'confirmed clean' ==="
+  : > "$SUSPEND_LOG"; : > "$COMMENT_LOG"; : > "$NOTIFY_LOG"; : > "$TMP/suspended_state"
+  rm -f "$CLP_STATE_DIR"/mila-wa.suspended-by-probe 2>/dev/null
+  touch "$TMP/show_garbage_json"
+  CLP_DRY_RUN=0
+  _load_sessions_json
+  _heal "mila-wa" "wa-stale" "$TMP" "$(_session_identity mila-wa)"
+  rm -f "$TMP/show_garbage_json"
+  grep -qi "parcial\|partial" "$NOTIFY_LOG" && ok "40: heal notified an explicit failure when the verify read-back was unparseable" || bad "40: an unparseable verify response was silently treated as success"
+  grep -qi "could not parse\|partial" "$COMMENT_LOG" && ok "40: heal's bead comment reports the unparseable verification, not a blanket success claim" || bad "40: heal's bead comment did not report the unparseable verification"
 
   echo ""
   echo "crew-liveness-probe selftest: PASS=$PASS FAIL=$FAIL"

@@ -7,7 +7,7 @@
 		<key>CLP_ENABLED</key>
 		<string>1</string>
 		<key>CLP_HEAL_ENABLED</key>
-		<string>1</string>
+		<string>0</string>
 		<key>HOME</key>
 		<string>/Users/athos</string>
 		<key>PATH</key>
