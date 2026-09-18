@@ -2269,6 +2269,28 @@ else
       fi
       ;;
     *)
+      # ga-49fwiw: for NEEDS_GUARDED_RESTART specifically, THIS_PULL_STRUCTURALLY_
+      # INERT alone is too coarse a filter — it only answers "does this bead's own
+      # merge reach ANY live daemon", not "is any daemon it reaches among the ones
+      # CURRENTLY still stuck in the wide-window GUARDED list". wa-a7tca's own
+      # merge reached exactly one live daemon (com.whatsapp.demand-dashboard,
+      # already restarted+verified 9min post-merge), so THIS_PULL_STRUCTURALLY_
+      # INERT="0" (it IS reachable) — yet the whole delivery was held for ~6h on
+      # account of 52 OTHER sensitive daemons stuck in the wide window for
+      # unrelated reasons (no drain path, nobody restarts them every deploy).
+      # Same fix shape as ga-xz3ypu (JOB_NOT_INSTALLED): attribute by
+      # intersecting the CURRENT guarded set ($REFRESH_GUARDED) with what this
+      # bead's own merge actually reaches ($MERGE_OWN_AFFECTED, already computed
+      # above) — no new infrastructure, matches invariant (a).
+      NEEDS_GUARDED_RESTART_UNATTRIBUTED=0
+      if [ "$REFRESH_VERDICT" = "NEEDS_GUARDED_RESTART" ] \
+         && [ "$THIS_PULL_STRUCTURALLY_INERT" = "0" ] \
+         && [ -n "${MERGE_OWN_AFFECTED// /}" ] \
+         && [ -z "$(comm -12 \
+              <(echo "$REFRESH_GUARDED" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+              <(echo "$MERGE_OWN_AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u))" ]; then
+        NEEDS_GUARDED_RESTART_UNATTRIBUTED=1
+      fi
       if [ "$THIS_PULL_STRUCTURALLY_INERT" = "1" ]; then
         # ga-3bdttu: verdict is real (some daemon IS stale) but this story's
         # own merge did not cause it (its own delta is tests/docs/md-only) —
@@ -2283,6 +2305,35 @@ else
           gc --city "$GC_CITY" session nudge mayor \
             "Daemon refresh $REFRESH_VERDICT persists for rig $RIG ($REFRESH_REASON) — NOT caused by $STORY_ID, whose own merge is tests/docs/md-only; an earlier commit still needs a guarded restart." \
             2>/dev/null || true
+        fi
+      elif [ "$NEEDS_GUARDED_RESTART_UNATTRIBUTED" = "1" ]; then
+        # ga-49fwiw: this bead's own merge DOES reach a live daemon (not
+        # structurally inert), but NONE of the daemon(s) currently stuck in
+        # NEEDS_GUARDED_RESTART belong to this bead — invariant (b): the wide
+        # window stays visible and charged (nudge below), but does not retain
+        # whoever didn't cause it.
+        log "Daemon refresh verdict=$REFRESH_VERDICT — none of the currently-guarded daemon(s) ($REFRESH_GUARDED) are attributed to $STORY_ID's own merge (which reaches: $MERGE_OWN_AFFECTED) — not holding this delivery for it."
+        if [ "$DRY_RUN" != "1" ]; then
+          gc --city "$GC_CITY" session nudge mayor \
+            "Daemon refresh $REFRESH_VERDICT persists for rig $RIG — NOT attributed to $STORY_ID (its own merge reaches [$MERGE_OWN_AFFECTED], none currently in the guarded list [$REFRESH_GUARDED]); an earlier commit still needs a guarded restart." \
+            2>/dev/null || true
+          # ga-49fwiw invariant (c): unlike the pre-existing inert branch above
+          # (deliberately left un-advanced — see its own comment), THIS branch
+          # DOES advance the rig-wide marker: this bead's own portion of the
+          # wide window is fully examined (MERGE_OWN_AFFECTED is non-empty and
+          # every daemon it reaches is confirmed NOT in the current guarded
+          # set), and any daemon still genuinely stuck keeps its OWN
+          # per-daemon override baseline frozen regardless — the unconditional
+          # per-daemon advance above already excludes anything still in
+          # $REFRESH_GUARDED/$REFRESH_FRESHFAIL (ga-0fawwr), so nothing is
+          # hidden from a future sweep. Only the self-feeding wide-window
+          # growth this bug's own root-cause section describes (verdict never
+          # OK -> marker never advances -> window widens -> more daemons
+          # match -> verdict never OK) stops.
+          if [ -n "$POST_DEPLOY_SHA" ]; then
+            printf '%s\n' "$POST_DEPLOY_SHA" > "$DAEMON_REFRESH_BASELINE_FILE" 2>/dev/null \
+              || warn "could not persist daemon-refresh baseline for rig $RIG at $DAEMON_REFRESH_BASELINE_FILE (non-fatal; next sweep falls back to its own pre-pull HEAD)"
+          fi
         fi
       else
         err "Daemon refresh did NOT pass (verdict=$REFRESH_VERDICT): $REFRESH_REASON"
