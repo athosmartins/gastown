@@ -170,14 +170,21 @@ rm -f "$_PUSH_ERR_FILE"
 
 if [ "$PUSH_RC" -ne 0 ] && [ -n "$CAPTURED" ]; then
   ok "a genuine push failure against a bogus remote produces real, non-empty stderr — $(printf '%s' "$CAPTURED" | wc -c | tr -d ' ') bytes captured"
-  # Mirror exactly what all 6 real call sites do with this value: the guard
-  # this bead adds must be a no-op once AUTO_REBASE_PUSH_ERR is genuinely
-  # non-empty, and must NEVER call _gate_push_skip_reason in that case.
+  # Mirror the REAL call-site guard verbatim (quality-gate-dispatcher.sh, all
+  # 6 sites: `if [ -z "$AUTO_REBASE_PUSH_ERR" ]; then AUTO_REBASE_PUSH_ERR=$(_gate_push_skip_reason ...); fi`).
+  # AUTO_REBASE_PUSH_ERR is already non-empty (a genuine captured git stderr),
+  # so the guard must be a no-op. Feed a commit_verdict of "no" — if the guard
+  # ever regresses and fires anyway, _gate_push_skip_reason's output ("no
+  # commit on this branch mentions bead...") can never equal $CAPTURED, so the
+  # assertion below would catch it.
   AUTO_REBASE_PUSH_ERR="$CAPTURED"
   if [ -z "$AUTO_REBASE_PUSH_ERR" ]; then
-    bad "IMPOSSIBLE: captured stderr was non-empty but the guard's own condition saw it as empty"
-  else
+    AUTO_REBASE_PUSH_ERR=$(_gate_push_skip_reason "no" "yes" "dummy-branch" "ga-xxxxx")
+  fi
+  if [ "$AUTO_REBASE_PUSH_ERR" = "$CAPTURED" ]; then
     ok "the ga-744kvc guard leaves a genuinely-captured git stderr untouched — real git failures still show their real stderr, never a verdict-naming string"
+  else
+    bad "the guard fired on an already-non-empty AUTO_REBASE_PUSH_ERR and overwrote it — got '$AUTO_REBASE_PUSH_ERR', expected untouched '$CAPTURED'"
   fi
 else
   bad "fake-remote push did not fail with captured stderr as expected (rc=$PUSH_RC, captured='$CAPTURED') — fixture assumption broken, cannot prove AC1"
