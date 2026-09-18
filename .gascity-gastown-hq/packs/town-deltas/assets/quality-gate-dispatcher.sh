@@ -10999,9 +10999,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               else
                 AUTO_REBASE_PUSH_RC=$?
                 AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
-                # ga-744kvc: push never ran (the && chain short-circuited on a
-                # verdict, not a git failure) — name the decision instead of
-                # falling through to "no stderr captured".
+                # ga-744kvc: AUTO_REBASE_PUSH_ERR is still empty — most often
+                # because the && chain short-circuited on a verdict before
+                # push ever ran. Name that decision when it applies; a no-op
+                # otherwise (both verdicts "yes" — a genuine git failure with
+                # truly empty stderr falls through to the existing generic
+                # fallback below, unchanged).
                 if [ -z "$AUTO_REBASE_PUSH_ERR" ]; then
                   AUTO_REBASE_PUSH_ERR=$(_gate_push_skip_reason "${PR_COMMIT_VERDICT:-}" "${PR_CONTENT_VERDICT:-}" "$BRANCH" "$BEAD_ID")
                 fi
@@ -11066,9 +11069,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
             else
               AUTO_REBASE_PUSH_RC=$?
               AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
-              # ga-744kvc: push never ran (the && chain short-circuited on a
-              # verdict, not a git failure) — name the decision instead of
-              # falling through to "no stderr captured".
+              # ga-744kvc: AUTO_REBASE_PUSH_ERR is still empty — most often
+              # because the && chain short-circuited on a verdict before
+              # push ever ran. Name that decision when it applies; a no-op
+              # otherwise (both verdicts "yes" — a genuine git failure with
+              # truly empty stderr falls through to the existing generic
+              # fallback below, unchanged).
               if [ -z "$AUTO_REBASE_PUSH_ERR" ]; then
                 AUTO_REBASE_PUSH_ERR=$(_gate_push_skip_reason "${PR_COMMIT_VERDICT:-}" "${PR_CONTENT_VERDICT:-}" "$BRANCH" "$BEAD_ID")
               fi
@@ -11154,9 +11160,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               else
                 AUTO_REBASE_PUSH_RC=$?
                 AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
-                # ga-744kvc: push never ran (the && chain short-circuited on a
-                # verdict, not a git failure) — name the decision instead of
-                # falling through to "no stderr captured".
+                # ga-744kvc: AUTO_REBASE_PUSH_ERR is still empty — most often
+                # because the && chain short-circuited on a verdict before
+                # push ever ran. Name that decision when it applies; a no-op
+                # otherwise (both verdicts "yes" — a genuine git failure with
+                # truly empty stderr falls through to the existing generic
+                # fallback below, unchanged).
                 if [ -z "$AUTO_REBASE_PUSH_ERR" ]; then
                   AUTO_REBASE_PUSH_ERR=$(_gate_push_skip_reason "${PR_COMMIT_VERDICT:-}" "${PR_CONTENT_VERDICT:-}" "$BRANCH" "$BEAD_ID")
                 fi
@@ -11237,9 +11246,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               else
                 AUTO_REBASE_PUSH_RC=$?
                 AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
-                # ga-744kvc: push never ran (the && chain short-circuited on a
-                # verdict, not a git failure) — name the decision instead of
-                # falling through to "no stderr captured".
+                # ga-744kvc: AUTO_REBASE_PUSH_ERR is still empty — most often
+                # because the && chain short-circuited on a verdict before
+                # push ever ran. Name that decision when it applies; a no-op
+                # otherwise (both verdicts "yes" — a genuine git failure with
+                # truly empty stderr falls through to the existing generic
+                # fallback below, unchanged).
                 if [ -z "$AUTO_REBASE_PUSH_ERR" ]; then
                   AUTO_REBASE_PUSH_ERR=$(_gate_push_skip_reason "${PR_COMMIT_VERDICT:-}" "${PR_CONTENT_VERDICT:-}" "$BRANCH" "$BEAD_ID")
                 fi
@@ -11294,9 +11306,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
             else
               AUTO_REBASE_PUSH_RC=$?
               AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
-              # ga-744kvc: push never ran (the && chain short-circuited on a
-              # verdict, not a git failure) — name the decision instead of
-              # falling through to "no stderr captured".
+              # ga-744kvc: AUTO_REBASE_PUSH_ERR is still empty — most often
+              # because the && chain short-circuited on a verdict before
+              # push ever ran. Name that decision when it applies; a no-op
+              # otherwise (both verdicts "yes" — a genuine git failure with
+              # truly empty stderr falls through to the existing generic
+              # fallback below, unchanged).
               if [ -z "$AUTO_REBASE_PUSH_ERR" ]; then
                 AUTO_REBASE_PUSH_ERR=$(_gate_push_skip_reason "${PR_COMMIT_VERDICT:-}" "${PR_CONTENT_VERDICT:-}" "$BRANCH" "$BEAD_ID")
               fi
@@ -11357,9 +11372,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               else
                 AUTO_REBASE_PUSH_RC=$?
                 AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
-                # ga-744kvc: push never ran (the && chain short-circuited on a
-                # verdict, not a git failure) — name the decision instead of
-                # falling through to "no stderr captured".
+                # ga-744kvc: AUTO_REBASE_PUSH_ERR is still empty — most often
+                # because the && chain short-circuited on a verdict before
+                # push ever ran. Name that decision when it applies; a no-op
+                # otherwise (both verdicts "yes" — a genuine git failure with
+                # truly empty stderr falls through to the existing generic
+                # fallback below, unchanged).
                 if [ -z "$AUTO_REBASE_PUSH_ERR" ]; then
                   AUTO_REBASE_PUSH_ERR=$(_gate_push_skip_reason "${PR_COMMIT_VERDICT:-}" "${PR_CONTENT_VERDICT:-}" "$BRANCH" "$BEAD_ID")
                 fi
