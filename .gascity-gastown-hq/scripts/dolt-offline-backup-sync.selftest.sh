@@ -259,7 +259,16 @@ else
   bad "dolt-s3-backup.sh does not source dolt-offline-backup-sync.sh"
 fi
 RETRY_LINE=$(grep -nF '_sync_with_connection_timeout_retry "$db"' "$S3_SCRIPT" | head -1 | cut -d: -f1)
-OFFLINE_CALL_LINE=$(grep -nF '_offline_backup_sync "$db"' "$S3_SCRIPT" | head -1 | cut -d: -f1)
+# ga-yct7r1: dolt-s3-backup.sh now has a SECOND, earlier call site for
+# `_offline_backup_sync "$db"` — inside _sync_with_stale_manifest_recovery's
+# own definition, which (like every function def) sits textually before the
+# main per-db loop this drift-guard actually cares about. `head -1` would
+# grab that new, earlier call site and false-positive-fail this check even
+# though the connection-timeout branch's own wiring is untouched. The main
+# loop's call is always the LAST occurrence in the file (function defs
+# precede the loop that uses them), so `tail -1` re-targets the same call
+# site this check originally meant to verify.
+OFFLINE_CALL_LINE=$(grep -nF '_offline_backup_sync "$db"' "$S3_SCRIPT" | tail -1 | cut -d: -f1)
 if [ -n "$RETRY_LINE" ] && [ -n "$OFFLINE_CALL_LINE" ] && [ "$OFFLINE_CALL_LINE" -gt "$RETRY_LINE" ]; then
   ok "offline fallback is called AFTER the connection-timeout retry, not before/instead of it"
 else

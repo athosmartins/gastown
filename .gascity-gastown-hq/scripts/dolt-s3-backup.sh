@@ -242,6 +242,42 @@ _sync_with_connection_timeout_retry() {
   return 1
 }
 
+# _sync_with_stale_manifest_recovery <db> <dest> — called after an initial
+# sync attempt already failed with is_stale_manifest_error. Wipes the local
+# staging dir (structural corruption per is_stale_manifest_error's own header
+# — safely regenerable, never touches live .beads/dolt or S3) and retries
+# ONCE via the server.
+#
+# ga-yct7r1: that server-mediated retry is PREDICTABLE to fail for the SAME
+# structural reason the offline path exists for — a live server holds a
+# cached view of the staging dir that was just wiped out from under it. That
+# made this the one branch most likely to need the offline fallback and, until
+# this fix, the one branch that didn't have it (the sibling
+# is_connection_timeout_error branch already falls back to
+# _offline_backup_sync below). So, same invariant as that branch: only count
+# this db as failed if BOTH the reinit-retry AND the offline fallback fail.
+# Returns 0 on either recovery path succeeding; returns 1 (having logged the
+# FAILED tripwire dolt-compact-routine.sh's precondition greps for) otherwise.
+_sync_with_stale_manifest_recovery() {
+  local db="$1" dest="$2"
+  log "$db: stale-manifest staging detected — auto-reinit ${dest} and retry once"
+  case "$dest" in
+    "$BACKUP_ROOT"/*) rm -rf "${dest:?}" ;;
+    *) log "$db: REFUSING auto-reinit — dest '$dest' outside BACKUP_ROOT (safety guard)" ;;
+  esac
+  if _sync_once "$db" >> "$LOG" 2>&1; then
+    log "$db: auto-recover OK after staging reinit"
+    return 0
+  fi
+  log "$db: stale-manifest retry FAILED — falling back to offline sync (no server involved)"
+  if _offline_backup_sync "$db" "$dest"; then
+    log "$db: offline-sync fallback OK"
+    return 0
+  fi
+  log "$db: DOLT_BACKUP sync FAILED (after stale-manifest recovery)"
+  return 1
+}
+
 # _reseed_staging_if_enabled <db> — ga-8f1uh0: called AFTER this db's S3 sync
 # above already succeeded. .dolt-backup/<db> is APPEND-ONLY (see the corrected
 # header doctrine at the top of this file) so it only ever grows, independent
@@ -465,19 +501,14 @@ for db in $DBS; do
         --user root --no-tls sql -q "USE \`$db\`; CALL DOLT_BACKUP('sync', '${db}-backup');" > "$SYNC_OUT" 2>&1; then
     cat "$SYNC_OUT" >> "$LOG"
     if is_stale_manifest_error "$(cat "$SYNC_OUT")"; then
-      # Structural staging corruption (see is_stale_manifest_error above). The
-      # local staging is regenerable — never touches live .beads/dolt or S3 — so
-      # wipe just this db's dest and retry ONCE with a fresh full sync.
-      log "$db: stale-manifest staging detected — auto-reinit ${dest} and retry once"
-      case "$dest" in
-        "$BACKUP_ROOT"/*) rm -rf "${dest:?}" ;;
-        *) log "$db: REFUSING auto-reinit — dest '$dest' outside BACKUP_ROOT (safety guard)" ;;
-      esac
-      if ! DOLT_CLI_PASSWORD='' timeout "$SYNC_TIMEOUT" "$DOLT" --host "$HOST" --port "$PORT" \
-            --user root --no-tls sql -q "USE \`$db\`; CALL DOLT_BACKUP('sync', '${db}-backup');" >> "$LOG" 2>&1; then
-        log "$db: DOLT_BACKUP sync FAILED (after auto-recover retry)"; failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"; continue
+      # Structural staging corruption (see is_stale_manifest_error above).
+      # ga-yct7r1: reinit-retry alone used to give up here with no fallback —
+      # _sync_with_stale_manifest_recovery now falls back to the same
+      # server-free _offline_backup_sync the connection-timeout branch below
+      # already uses, before counting this db as failed.
+      if ! _sync_with_stale_manifest_recovery "$db" "$dest"; then
+        failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"; continue
       fi
-      log "$db: auto-recover OK after staging reinit"
     elif is_connection_timeout_error "$(cat "$SYNC_OUT")"; then
       # Transient/load-dependent (ga-gdsq5) — staging itself is fine, only the
       # connection was cut mid-sync, so retry the same sync with no reinit,

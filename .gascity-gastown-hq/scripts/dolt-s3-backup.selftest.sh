@@ -57,11 +57,118 @@ if grep -qF '"$BACKUP_ROOT"/*)' "$SCRIPT"; then
 else
   bad "auto-reinit path-safety guard missing"
 fi
-if grep -qF 'after auto-recover retry' "$SCRIPT"; then
-  ok "retry is bounded to once (no infinite retry loop)"
+if grep -qF '_sync_with_stale_manifest_recovery "$db" "$dest"' "$SCRIPT"; then
+  ok "sync step calls _sync_with_stale_manifest_recovery on stale-manifest detection"
 else
-  bad "bounded-retry-once wiring missing"
+  bad "sync step does NOT call _sync_with_stale_manifest_recovery — detection is dead code"
 fi
+
+# ── _sync_with_stale_manifest_recovery() (ga-yct7r1) — exercised live with a
+# simulated-failure stub (not just a drift-guard grep): the OLD code physically
+# could not pass scenario B below (it had no offline fallback at all, and
+# counted the db as failed the moment the reinit-retry failed) — this proves
+# the fallback is real, not just declared. Real dolt/network are NEVER called:
+# $DOLT is pointed at a fake stub binary, and _offline_backup_sync is shadowed
+# by a controllable stub (its own behavior is covered by
+# dolt-offline-backup-sync.selftest.sh — here we only need to prove this
+# function calls it correctly and reacts to its result).
+echo "── _sync_with_stale_manifest_recovery() (ga-yct7r1) — simulated-failure test ──"
+
+type _sync_with_stale_manifest_recovery >/dev/null 2>&1 \
+  && ok "_sync_with_stale_manifest_recovery defined by lib-mode source" \
+  || { bad "_sync_with_stale_manifest_recovery NOT defined — lib mode broken"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="; exit 1; }
+
+SMR_STUB_DIR="$(mktemp -d)"
+SMR_DOLT_COUNT_FILE="$(mktemp)"
+SMR_LOG="$(mktemp)"
+SMR_DEST_PARENT="$(mktemp -d)"
+SMR_DEST="$SMR_DEST_PARENT/testdb"
+
+cat > "$SMR_STUB_DIR/dolt" <<'STUB'
+#!/bin/bash
+# Fake `dolt`: the reinit-retry attempt. Fails with the stale-manifest
+# signature unless SMR_STUB_RETRY_OK=1.
+n=$(( $(cat "$SMR_DOLT_COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$SMR_DOLT_COUNT_FILE"
+if [ "${SMR_STUB_RETRY_OK:-0}" = "1" ]; then
+  echo "ok"
+  exit 0
+fi
+echo "error opening table file: table file not found: /fake/path"
+exit 1
+STUB
+chmod +x "$SMR_STUB_DIR/dolt"
+
+SMR_OFFLINE_CALLS="$(mktemp)"
+# Shadow the real _offline_backup_sync (sourced from dolt-offline-backup-sync.sh
+# at the top of dolt-s3-backup.sh) for the duration of this scenario block only.
+_offline_backup_sync() {
+  printf '%s %s\n' "$1" "$2" >> "$SMR_OFFLINE_CALLS"
+  [ "${SMR_STUB_OFFLINE_OK:-0}" = "1" ]
+}
+
+_run_smr_scenario() {
+  # <retry_ok> <offline_ok> <label>
+  local retry_ok="$1" offline_ok="$2" label="$3"
+  echo "  -- scenario: $label --"
+  rm -rf "$SMR_DEST"; mkdir -p "$SMR_DEST"; touch "$SMR_DEST/marker"
+  echo 0 > "$SMR_DOLT_COUNT_FILE"
+  : > "$SMR_LOG"; : > "$SMR_OFFLINE_CALLS"
+  DOLT="$SMR_STUB_DIR/dolt" HOST=127.0.0.1 PORT=0 LOG="$SMR_LOG" BACKUP_ROOT="$SMR_DEST_PARENT" \
+    SMR_STUB_RETRY_OK="$retry_ok" SMR_STUB_OFFLINE_OK="$offline_ok" \
+    _sync_with_stale_manifest_recovery "testdb" "$SMR_DEST"
+}
+
+# Scenario A: reinit-retry succeeds → offline fallback never invoked.
+if _run_smr_scenario 1 0 "reinit-retry succeeds"; then
+  ok "scenario A (retry succeeds): returns success"
+else
+  bad "scenario A (retry succeeds): should have returned success"
+fi
+grep -qF "auto-recover OK after staging reinit" "$SMR_LOG" \
+  && ok "scenario A: logged the auto-recover OK line" || bad "scenario A: missing auto-recover OK log line"
+[ -s "$SMR_OFFLINE_CALLS" ] \
+  && bad "scenario A: offline fallback should NOT be invoked when the retry itself succeeds" \
+  || ok "scenario A: offline fallback correctly not invoked"
+[ ! -e "$SMR_DEST/marker" ] \
+  && ok "scenario A: staging dir was wiped before the retry (auto-reinit ran)" \
+  || bad "scenario A: staging dir marker survived — auto-reinit did not run"
+
+# Scenario B (the bug ga-yct7r1 closes): reinit-retry fails, offline fallback
+# succeeds → the round finishes OK via the fallback, with BOTH log lines the
+# bug's invariant (b) requires (which path failed, which path saved it).
+if _run_smr_scenario 0 1 "retry fails, offline fallback succeeds"; then
+  ok "scenario B (offline fallback succeeds): returns success — proves the fallback this bug was missing"
+else
+  bad "scenario B (offline fallback succeeds): should have returned success"
+fi
+grep -qF "stale-manifest retry FAILED — falling back to offline sync (no server involved)" "$SMR_LOG" \
+  && ok "scenario B: logged which path was attempted (falling back)" || bad "scenario B: missing the falling-back log line"
+grep -qF "offline-sync fallback OK" "$SMR_LOG" \
+  && ok "scenario B: logged offline-sync fallback OK" || bad "scenario B: missing the offline-sync fallback OK log line"
+[ "$(cat "$SMR_OFFLINE_CALLS")" = "testdb $SMR_DEST" ] \
+  && ok "scenario B: offline fallback invoked with the correct db + dest" \
+  || bad "scenario B: offline fallback invoked with unexpected args: $(cat "$SMR_OFFLINE_CALLS")"
+grep -qF "DOLT_BACKUP sync FAILED" "$SMR_LOG" \
+  && bad "scenario B: must NOT log a FAILED tripwire — it eventually succeeded via the fallback" \
+  || ok "scenario B: no FAILED tripwire logged on eventual success"
+
+# Scenario C: reinit-retry AND offline fallback both fail → counts as failed,
+# fail-closed with the FAILED tripwire logged (invariant c: never a silent OK).
+if _run_smr_scenario 0 0 "retry fails, offline fallback also fails"; then
+  bad "scenario C (both fail): should have returned failure"
+else
+  ok "scenario C (both fail): returns failure"
+fi
+grep -qF "DOLT_BACKUP sync FAILED (after stale-manifest recovery)" "$SMR_LOG" \
+  && ok "scenario C: logged the FAILED tripwire" || bad "scenario C: missing the FAILED tripwire line"
+grep -qF "offline-sync fallback OK" "$SMR_LOG" \
+  && bad "scenario C: must NOT log a false offline-sync fallback OK line" \
+  || ok "scenario C: no false success line when the offline fallback also failed"
+
+unset -f _offline_backup_sync
+rm -rf "$SMR_STUB_DIR" "$SMR_DEST_PARENT" 2>/dev/null || true
+rm -f "$SMR_DOLT_COUNT_FILE" "$SMR_LOG" "$SMR_OFFLINE_CALLS" 2>/dev/null || true
 
 # ── is_connection_timeout_error() — ga-gdsq5 transient-timeout retry mitigation ──
 echo "── is_connection_timeout_error() (ga-gdsq5) ──"
