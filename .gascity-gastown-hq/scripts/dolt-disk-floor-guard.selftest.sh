@@ -756,6 +756,27 @@ else
   bad "_safe_reclaim: expected plain 'OK' for zero-gain-but-above-floor, log tail: $(tail -3 "$LOG" 2>/dev/null | tr '\n' ';')"
 fi
 
+# Found during this bead's own pre-flight self-audit (ga-ofi307): the
+# ORIGINAL one-line version of this log call already had this gap, unchanged
+# — an unmeasurable post-reclaim read (df failing right after a successful
+# dolt-cleanup) fell through to the exact same "OK" text as a genuine gain
+# ("?GB" silently standing in for the missing number). "don't know"
+# collapsing into "good news" is the same defect family this whole bead
+# exists to fix, one level narrower — closed here since the block was
+# already being rewritten.
+_avail_gb() { echo ""; }         # after unmeasurable (simulated df failure)
+_safe_reclaim 7
+if grep -q "reclaim: dolt-cleanup succeeded but post-reclaim avail is UNMEASURABLE" "$LOG" 2>/dev/null; then
+  ok "_safe_reclaim: unmeasurable post-reclaim avail is reported as unknown, never as calm 'OK'"
+else
+  bad "_safe_reclaim: expected an UNMEASURABLE line for a failed post-reclaim df read, log tail: $(tail -3 "$LOG" 2>/dev/null | tr '\n' ';')"
+fi
+if grep -qE '\] reclaim OK — avail 7GB -> \?GB' "$LOG" 2>/dev/null; then
+  bad "_safe_reclaim: MUST NOT log the old 'reclaim OK ... ?GB' wording when the post-reclaim read failed"
+else
+  ok "_safe_reclaim: does not log the old '?GB'-as-OK wording for an unmeasurable read"
+fi
+
 echo ""
 echo "=== _top_disk_consumers (ga-ofi307): real scan, hermetic fixture, ARG_MAX-safe on a large root ==="
 # WHY: proves this reads real sizes via the real find|xargs|du pipeline

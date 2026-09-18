@@ -1016,10 +1016,23 @@ _safe_reclaim() {
     # non-calm wording instead. main()'s post-reclaim diagnosis (ga-sfj3i.3)
     # is what actually escalates this across the whole cycle — this is just
     # the one per-lever line that must never read as calm success on its own.
-    if [ -n "$after" ] && [ "$after" -le "$before" ] && [ "$after" -le "$FLOOR_WARN_GB" ]; then
+    #
+    # Same discipline extended to a THIRD case the original one-line version
+    # of this log call already had, unchanged, before this bead: an
+    # unmeasurable post-reclaim read (df itself failing right after a
+    # successful dolt-cleanup) used to fall through to the exact same "OK"
+    # text as a genuine large gain (`${after:-?}GB` silently printing "?GB"
+    # while still saying "OK") — "don't know" collapsing into "good news",
+    # the same family of bug this whole bead exists to fix, just one level
+    # narrower. Caught during this bead's own pre-flight self-audit, not the
+    # original incident — fixed here since the block was already being
+    # rewritten.
+    if [ -z "$after" ]; then
+      log "reclaim: dolt-cleanup succeeded but post-reclaim avail is UNMEASURABLE (df failed) — effect unknown, not 'OK' (avail_before=${before}GB)"
+    elif [ "$after" -le "$before" ] && [ "$after" -le "$FLOOR_WARN_GB" ]; then
       log "reclaim ZERO GAIN — avail ${before}GB -> ${after}GB, still at/below floor(${FLOOR_WARN_GB}GB): dolt-cleanup ran but freed nothing measurable — NOT relief, see diagnosis below"
     else
-      log "reclaim OK — avail ${before}GB -> ${after:-?}GB"
+      log "reclaim OK — avail ${before}GB -> ${after}GB"
     fi
   else
     log "reclaim FAILED (gc dolt-cleanup --force nonzero exit)"
