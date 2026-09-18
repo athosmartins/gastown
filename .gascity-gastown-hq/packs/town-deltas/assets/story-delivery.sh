@@ -615,6 +615,36 @@ task_bead_last_event_at() {
     2>/dev/null | jq -r '.[0].created_at // ""' 2>/dev/null || echo ""
 }
 
+# ga-rugqks: Step 1's selector (story:approved + gate:passed, minus
+# story:done) decides which beads enter the per-story loop, but the loop
+# body itself then never re-checks a bead's CURRENT status before mutating
+# it — it only ever reads $STORY_LABELS, a snapshot taken once at Step 1.
+# A bead can be closed OUT OF BAND (e.g. a human closing it directly after
+# independently verifying delivery) at any point between that snapshot and
+# this iteration's own mutations, and Step 5b's own daemon-refresh
+# subprocess alone is documented elsewhere in this file
+# (task_reconciler_gate_passed_too_fresh's header, wa-n27z0) to take up to
+# 6.5-10 minutes per cycle — plenty of time for exactly that race. Live
+# case: wa-a7tca was closed by the Mayor at 21:23:57 (delivered, verified
+# live); the sweep still in flight re-added delivery:failed +
+# delivery:deploy-pending and re-nudged its owner at 21:33:55, ~10 minutes
+# later, over work that was already done.
+#
+# Call this immediately before any label/comment/nudge mutation (and before
+# re-running deploy/reconcile/merge-verify) so an externally-closed bead is
+# never reprocessed. Always re-queries live state via `bd show` (never
+# trusts $STORY_LABELS). Fails OPEN (returns 1 / "not closed") on any bd
+# error, empty, or unparseable result — a transient bd hiccup must never
+# look identical to "already closed" and silently swallow a genuine
+# delivery halt/failure that still needs to be reported.
+story_bead_closed_now() {
+  local store="$1" bead_id="$2"
+  local status
+  status=$(bd -C "$store" show "$bead_id" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | .status // ""' 2>/dev/null || echo "")
+  [ "$status" = "closed" ]
+}
+
 # Lib-only mode: `STORY_DELIVERY_LIB_ONLY=1 source story-delivery.sh` defines the
 # helpers above without running the live sweep, so the selftest exercises the
 # real functions (one source of truth, no copy-drift). Mirrors merged-bead-janitor.sh.
@@ -1339,6 +1369,17 @@ while IFS= read -r STORY; do
 
   log "Processing story $STORY_ID: $STORY_TITLE"
   log "Labels: $STORY_LABELS"
+
+# ga-rugqks: $STORY_LABELS above is a Step-1-time snapshot — re-verify the
+# bead's CURRENT status fresh before doing anything else this iteration.
+# Any bead reaching this loop already carries gate:passed (Step 1's own
+# selector requires it), so skipping an already-closed one here can never
+# be used to dodge delivery verification for a bead that still needs it —
+# it only stops reprocessing a bead someone already closed with proof.
+if story_bead_closed_now "$STORY_STORE" "$STORY_ID"; then
+  log "Story $STORY_ID is already closed (verified live, not from the Step-1 label snapshot) — skipping, no mutation."
+  continue
+fi
 
 # Skip if already marked story:done (idempotency guard)
 if echo "$STORY_LABELS" | grep -q "story:done"; then
@@ -2192,6 +2233,17 @@ else
     BEAD_MERGE_PRE_SHA="${MERGE_PRE_MAIN:-}" BEAD_MERGE_SHA="${MERGE_SHA:-}" \
     DRY_RUN="$DRY_RUN" \
     bash "$REFRESH_HELPER" || true)
+  # ga-rugqks: the daemon-refresh subprocess just above is the one step in
+  # this loop documented to take up to 6.5-10 minutes per cycle (see
+  # task_reconciler_gate_passed_too_fresh's header, wa-n27z0) — long enough
+  # for someone to close this exact bead (independently verified delivered)
+  # while this call was in flight. Re-check fresh, right where the real
+  # incident's own timestamps land, before acting on a verdict that no
+  # longer matters to anyone.
+  if story_bead_closed_now "$STORY_STORE" "$STORY_ID"; then
+    log "Story $STORY_ID was closed while daemon-refresh was in flight — skipping verdict handling, no mutation."
+    continue
+  fi
   REFRESH_VERDICT=$(echo "$REFRESH_OUT" | grep '^VERDICT=' | head -1 | sed 's/^VERDICT=//')
   REFRESH_REASON=$(echo  "$REFRESH_OUT" | grep '^REASON='  | head -1 | sed 's/^REASON=//')
   REFRESH_RESTARTED=$(echo "$REFRESH_OUT" | grep '^RESTARTED=' | head -1 | sed 's/^RESTARTED=//')
