@@ -301,7 +301,12 @@
 #      changes NEITHER which labels land in GUARDED NOR the VERDICT; a
 #      closure-only daemon is still exactly as blocking as before (point 1's
 #      false-negative caveat — a real reachability gap can hide in either
-#      bucket — is unaffected).
+#      bucket — is unaffected). A FORCE_RESTART_LABELS entry (point 5's
+#      static override — reached only via that separate loop, never via
+#      Step 3's own_hit computation, exactly because Step 2 couldn't resolve
+#      an entrypoint for it at all — see T50/T61) is classified GUARDED_OWN
+#      by construction: it is an explicit operator directive, the strongest
+#      signal this script has, never "known closure-only noise".
 #
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
@@ -1766,6 +1771,17 @@ for fr_label in $FORCE_RESTART_LABELS; do
     *)
       log "FORCE_RESTART_LABELS: $fr_label forced into AFFECTED (daemon_restarts static override, not entrypoint-matched)."
       AFFECTED="$AFFECTED $fr_label"
+      # wa-flysp (header point 16, pre-flight self-audit finding): a
+      # force-restart label never runs through Step 3's own_hit loop above
+      # (it can be added here precisely because Step 2 couldn't even
+      # discover an entrypoint for it), so it would otherwise default to
+      # GUARDED_CLOSURE_ONLY by omission if it later becomes GUARDED — a
+      # "don't know" (own_hit was never evaluated) silently collapsing into
+      # the SAME bucket as "checked and it's transitively-only", mislabeling
+      # an explicit operator override as "known noise, verify by hand"
+      # instead of the strongest, most-actionable signal this script has.
+      # Treat it as own/actionable by construction — never closure-only.
+      AFFECTED_OWN="$AFFECTED_OWN $fr_label"
       ;;
   esac
 done

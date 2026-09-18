@@ -2314,6 +2314,49 @@ echo "$OUT" | grep -q '^GUARDED_CLOSURE_ONLY=' && ok "T60 GUARDED_CLOSURE_ONLY f
 [ -z "$(field GUARDED_OWN "$OUT")" ] && ok "T60 GUARDED_OWN empty" || nok "T60 guarded_own empty" "$(field GUARDED_OWN "$OUT")"
 [ -z "$(field GUARDED_CLOSURE_ONLY "$OUT")" ] && ok "T60 GUARDED_CLOSURE_ONLY empty" || nok "T60 guarded_closure_only empty" "$(field GUARDED_CLOSURE_ONLY "$OUT")"
 
+# ════════════════════════════════════════════════════════════════════════════
+# T61 (wa-flysp, header point 16, pre-flight self-audit finding): a
+# FORCE_RESTART_LABELS entry (same python-m/unresolvable-entrypoint shape as
+# T50, but SENSITIVE + no drain here instead of SAFE) never runs through
+# Step 3's own_hit loop at all — it is added to AFFECTED entirely outside
+# that loop, precisely because Step 2 couldn't discover an entrypoint for it.
+# Without an explicit own-hit classification for this path, it would default
+# to GUARDED_CLOSURE_ONLY by omission — mislabeling an explicit operator
+# override (the STRONGEST signal this script has, stronger than an ordinary
+# own-file-changed match) as "known noise, verify by hand". Must land in
+# GUARDED_OWN instead.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t61
+mkdir -p "$RUNTIME/dashboard"
+cat > "$RUNTIME/dashboard/app.py" <<<'print("forced sensitive dashboard")'
+cat > "$AGENTS/com.test.central-sender-forced.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.test.central-sender-forced</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$RUNTIME/.venv/bin/python</string>
+    <string>-m</string>
+    <string>flask</string>
+    <string>run</string>
+  </array>
+  <key>WorkingDirectory</key><string>$RUNTIME</string>
+</dict>
+</plist>
+EOF
+seed_running com.test.central-sender-forced 61001 "$STALE_LSTART"
+# deliberately NO seed_restart, NO drain command: sensitive + no drain path -> GUARDED
+FORCE_RESTART_LABELS="com.test.central-sender-forced"
+OUT=$(run_helper dashboard/app.py); RC=$?
+FORCE_RESTART_LABELS=""
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T61 verdict NEEDS_GUARDED_RESTART" || nok "T61 verdict" "got '$V' out=[$OUT]"
+echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender-forced" && ok "T61 forced-in daemon still in flat GUARDED" || nok "T61 guarded" "$(field GUARDED "$OUT")"
+echo "$(field GUARDED_OWN "$OUT")" | grep -q "com.test.central-sender-forced" && ok "T61 FORCE_RESTART_LABELS entry classified GUARDED_OWN, not closure-only noise" || nok "T61 guarded_own" "$(field GUARDED_OWN "$OUT")"
+echo "$(field GUARDED_CLOSURE_ONLY "$OUT")" | grep -q "com.test.central-sender-forced" && nok "T61 must NOT be in GUARDED_CLOSURE_ONLY" "$(field GUARDED_CLOSURE_ONLY "$OUT")" || ok "T61 correctly excluded from GUARDED_CLOSURE_ONLY"
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"
