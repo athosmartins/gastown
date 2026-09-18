@@ -1381,6 +1381,59 @@ gap2_arm_needs_remerge() {
   bd -C "$GC_CITY" comment "$bead_id" "ga-pa36 GAP-2 reconciler: sling bead $sling_id gate-passed+closed, but no independent evidence the parent's own fix ($bead_id) is merged into origin/main was found (checked branches fix/$bead_id*, feat/$bead_id*, feature/$bead_id*, refactor/$bead_id*, docs/$bead_id*, chore/$bead_id*, test/$bead_id*, crew/*/$bead_id*, and sling fix/$sling_id*, feat/$sling_id*, feature/$sling_id*, refactor/$sling_id*, docs/$sling_id*, chore/$sling_id*, test/$sling_id*, crew/*/$sling_id*). ga-6ync4 fix: never trust sling-passed alone. story:in-flight + pilot:dispatched cleared; gate:needs-fix + gate:needs-remerge set (ga-e2n96: needs-remerge is the distinct re-submission signal — no reviewer ever rejected this code) so Pilot resubmits the existing branch to the gate or escalates, instead of dispatching a builder with an empty brief. (If this parent's delivery is legitimately untracked, apply the delivery:untracked label — see ga-x2x63.)" 2>/dev/null || true
 }
 
+# gap2_wait_active_marker <bead_id> <sling_id> <marker_hit> <prev_wait_state> —
+# ga-crgfa0: the wait:active-marker arm posts a "still queued for review, not
+# abandoned" comment every sweep the SAME gate marker stays active — measured
+# live 2026-09-18, ga-kmm6rb got 11 byte-identical copies in ~79 minutes (one
+# per ~3min sweep), one Dolt commit each, burying the real comments under
+# them. Nothing in this arm ever changes a label (that is the whole point —
+# ga-4tgga's fail-safe is "don't touch labels while a marker might still
+# resolve things"), so an unconditional comment re-fires on unchanged state
+# forever.
+#
+# <marker_hit> is gap2_marker_for_bead's own return shape, "<marker_id>
+# <gate-status>" — already the right granularity to dedup on: a NEW marker
+# (fresh submission) or the SAME marker's gate-status advancing (queued ->
+# running) must still get its own comment, only a byte-identical repeat must
+# not. <prev_wait_state> is the bead's own gap2.waiting_marker metadata value
+# as the CALLER last read it (this function does no bd show of its own — the
+# caller already has the full bead JSON fetched once per sweep iteration, see
+# SC_SHOW in Step 0c.2 below; a second fetch here would be redundant I/O for
+# every sweep, not just the ones that actually change).
+gap2_wait_active_marker() {
+  local bead_id="$1" sling_id="$2" marker_hit="$3" prev_wait_state="$4"
+  # No log() call here (unlike the call site) — log()/warn() are defined
+  # below the GATE_GUARD_LIB_ONLY cutoff, so this lib-region function must
+  # stay silent on the no-op path, same convention as its siblings
+  # (gap2_arm_needs_remerge, gap2_free_refused_stranded) just above.
+  [ "$marker_hit" = "$prev_wait_state" ] && return 0
+  bd -C "$GC_CITY" comment "$bead_id" "ga-pa36 GAP-2 reconciler: sling bead $sling_id gate-passed+closed; parent's own fix not yet independently verified in origin/main, but an ACTIVE quality-gate-marker ($marker_hit) is currently processing it — still queued for review, not abandoned. No labels changed; will re-check next sweep. (ga-4tgga; comment deduped per marker/gate-status — ga-crgfa0)" 2>/dev/null || true
+  bd -C "$GC_CITY" update "$bead_id" --set-metadata "gap2.waiting_marker=$marker_hit" -q 2>/dev/null || true
+}
+
+# gap2_skip_no_changes <bead_id> <sling_id> <no_changes_token> <prev_state> —
+# ga-crgfa0: same dedup shape as gap2_wait_active_marker just above, applied
+# to the OTHER GAP-2 arm the bug's own "what to do" section flagged as
+# possibly sharing the same repeat-per-sweep defect — ga-hr44j's
+# skip:no-changes-stranded arm. It also never touches a label (by design:
+# "na duvida, nao fechar"), so a parent stuck inert behind the same closed
+# sling re-enters this branch and would re-post the identical comment every
+# sweep for as long as it stays inert — potentially longer-lived than
+# wait:active-marker, since nothing ever resolves it automatically.
+#
+# State key is "<sling_id>:<no_changes_token>" rather than the token alone —
+# a LATER sling that also closes no-changes (a resubmission attempt) must
+# still get its own comment, and the sling id is what distinguishes that
+# resubmission from the one already announced.
+gap2_skip_no_changes() {
+  local bead_id="$1" sling_id="$2" no_changes_token="$3" prev_state="$4"
+  local state="$sling_id:$no_changes_token"
+  # No log() call here — see gap2_wait_active_marker's doc-comment above.
+  [ "$state" = "$prev_state" ] && return 0
+  bd -C "$GC_CITY" comment "$bead_id" "ga-pa36 GAP-2 reconciler (ga-hr44j): sling bead $sling_id closed with a no-delivery close_reason (matched \"$no_changes_token\") — a sling closing this way means the worker found nothing to build, which is the opposite of a completed review, not a variant of one. Leaving story:in-flight/pilot:dispatched/all labels untouched rather than closing or re-arming (na duvida, nao fechar); will re-check next sweep in case a later sling terminates differently. (comment deduped per sling — ga-crgfa0)" 2>/dev/null || true
+  bd -C "$GC_CITY" update "$bead_id" --set-metadata "gap2.no_changes_announced=$state" -q 2>/dev/null || true
+}
+
 # gap2_apply_pass_verdict <bead_id> <sling_id> <is_story_approved> <verdict> —
 # ga-1un0n: the SHARED terminal action for free:pass-stranded's two
 # affirmative verdicts (close:merge-verified / close:untracked-delivery).
@@ -3816,7 +3869,10 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
         # other mechanism (defer_until, pilot:no-auto-dispatch, a human) owns
         # deciding when this parent becomes eligible for re-dispatch.
         warn "GAP-2: $SC_ID sling $SLING_ID closed via no-changes/no-action (\"$SLING_NO_CHANGES_TOKEN\") — NOT a delivery signal; leaving parent untouched (inert)"
-        bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler (ga-hr44j): sling bead $SLING_ID closed with a no-delivery close_reason (matched \"$SLING_NO_CHANGES_TOKEN\") — a sling closing this way means the worker found nothing to build, which is the opposite of a completed review, not a variant of one. Leaving story:in-flight/pilot:dispatched/all labels untouched rather than closing or re-arming (na duvida, nao fechar); will re-check next sweep in case a later sling terminates differently." 2>/dev/null || true
+        # ga-crgfa0: comment only if the announced sling+token actually
+        # changed since the last sweep — see gap2_skip_no_changes doc-comment.
+        GAP2_PREV_NO_CHANGES_STATE=$(echo "$SC_SHOW" | jq -r '.metadata["gap2.no_changes_announced"] // ""' 2>/dev/null || echo "")
+        gap2_skip_no_changes "$SC_ID" "$SLING_ID" "$SLING_NO_CHANGES_TOKEN" "$GAP2_PREV_NO_CHANGES_STATE"
         ;;
       free:pass-stranded)
         warn "GAP-2: $SC_ID stranded (sling $SLING_ID closed/passed) — freeing lane"
@@ -3987,7 +4043,12 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
             ;;
           wait:active-marker)
             log "GAP-2: $SC_ID sling $SLING_ID gate-passed+closed, parent's own fix not yet verified in origin/main, but an ACTIVE gate marker ($GAP2_ACTIVE_HIT) is still processing it — not touching labels, waiting for the gate."
-            bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed+closed; parent's own fix not yet independently verified in origin/main, but an ACTIVE quality-gate-marker ($GAP2_ACTIVE_HIT) is currently processing it — still queued for review, not abandoned. No labels changed; will re-check next sweep. (ga-4tgga)" 2>/dev/null || true
+            # ga-crgfa0: comment only if the announced marker/gate-status
+            # actually changed since the last sweep — see
+            # gap2_wait_active_marker doc-comment (11 identical copies on
+            # ga-kmm6rb, 2026-09-18, is the regression this guards).
+            GAP2_PREV_WAIT_STATE=$(echo "$SC_SHOW" | jq -r '.metadata["gap2.waiting_marker"] // ""' 2>/dev/null || echo "")
+            gap2_wait_active_marker "$SC_ID" "$SLING_ID" "$GAP2_ACTIVE_HIT" "$GAP2_PREV_WAIT_STATE"
             ;;
           *)
             # ga-4tgga race guard: re-check for an active marker RIGHT before
