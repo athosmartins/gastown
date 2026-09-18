@@ -4397,6 +4397,61 @@ branch_bead_commit_verdict() {
   fi
 }
 
+# SELFTEST-EXTRACT gate-744kvc-push-skip-reason: BEGIN
+# _gate_push_skip_reason <commit_verdict> <content_verdict> <branch> <bead_id>
+#
+# ga-744kvc: names WHY the gate-time auto-rebase/auto-merge push at Step 4c
+# never ran, for the specific case where the reason is a GATE DECISION
+# (branch_bead_commit_verdict/rebase_content_verdict returning something
+# other than "yes") rather than a git-level command failure. Every one of
+# the 6 push-attempt call sites below guards its `git push` behind
+# `[ "$PR_COMMIT_VERDICT" = "yes" ] && [ "$PR_CONTENT_VERDICT" = "yes" ] &&
+# git push ...` — when either verdict is not "yes", the `&&` chain
+# short-circuits BEFORE git push ever runs, so the push's own stderr capture
+# file (_PUSH_ERR_FILE) stays empty by construction. That emptiness then fed
+# straight into "${AUTO_REBASE_PUSH_ERR:-<no stderr captured>}", which reads
+# as "git failed and left no trace" when what actually happened is "the gate
+# itself refused to push, on purpose, for a reason it already knew".
+#
+# Root-caused live (ga-wfbvx2, Mayor, 2026-09-17 20:3x): the
+# fix/wa-aoznq-scheduled-job-opt-out incident that ga-744kvc itself was filed
+# against was exactly this — branch_bead_commit_verdict returned "no"
+# because the commit subject cited a DIFFERENT bead, not because git or the
+# worktree/push path failed. "Isso reforça o invariante (b): quando não há
+# stderr, diga QUAL comando e QUAL decisão, nunca uma frase que sugere falha
+# de git" (ga-744kvc comment thread) — this helper is that naming.
+#
+# There is no subprocess stderr to lose here (no 2>capture is being fixed) —
+# the fix is to say what actually happened instead of staying silent. Echoes
+# empty when BOTH verdicts are "yes" (the caller's own AUTO_REBASE_PUSH_ERR,
+# if still empty in that case, is a genuine contentless plumbing failure —
+# ga-10uqmi's classification block already has its own honest fallback for
+# that, deliberately left untouched by this bead).
+_gate_push_skip_reason() {
+  local commit_verdict="$1" content_verdict="$2" branch="$3" bead_id="$4"
+  if [ -n "$commit_verdict" ] && [ "$commit_verdict" != "yes" ]; then
+    case "$commit_verdict" in
+      skip)
+        # branch_bead_commit_verdict() itself returns "skip" only when it had
+        # nothing to check (zero commits ahead of main, or no bead id) — not
+        # a violation, but still not a git error, so still worth naming.
+        printf 'gate declined to push %s: branch_bead_commit_verdict had nothing to verify (no commits ahead of main, or no bead id) — not a git error' "$branch"
+        ;;
+      *)
+        printf 'gate refused to push %s: no commit on this branch mentions bead %s (branch_bead_commit_verdict=%s) — rename the commit subject to fix(%s) or cite the id in the body' "$branch" "$bead_id" "$commit_verdict" "$bead_id"
+        ;;
+    esac
+    return 0
+  fi
+  if [ -n "$content_verdict" ] && [ "$content_verdict" != "yes" ]; then
+    printf 'gate refused to push %s: rebase_content_verdict=%s (resulting tree does not verifiably match a real 3-way merge)' "$branch" "$content_verdict"
+    return 0
+  fi
+  printf ''
+  return 0
+}
+# SELFTEST-EXTRACT gate-744kvc-push-skip-reason: END
+
 # gate_apply_needs_human <bead_city> <bead_id> [sub_label] — apply the
 # gate:needs-human circuit-breaker (plus an optional classification sub-label
 # like gate:needs-human:technical) to a bead, then RE-READ the bead's own
@@ -10944,6 +10999,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               else
                 AUTO_REBASE_PUSH_RC=$?
                 AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
+                # ga-744kvc: push never ran (the && chain short-circuited on a
+                # verdict, not a git failure) — name the decision instead of
+                # falling through to "no stderr captured".
+                if [ -z "$AUTO_REBASE_PUSH_ERR" ]; then
+                  AUTO_REBASE_PUSH_ERR=$(_gate_push_skip_reason "${PR_COMMIT_VERDICT:-}" "${PR_CONTENT_VERDICT:-}" "$BRANCH" "$BEAD_ID")
+                fi
                 [ "$PR_COMMIT_VERDICT" != "yes" ] && warn "  ga-itkbt/ga-y9a1d: pre-review auto-merge onto $MAIN_HEAD_SHA did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$PR_COMMIT_VERDICT) — refusing to push."
                 if [ "$PR_CONTENT_VERDICT" != "yes" ]; then
                   _LOST_PATHS=$(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')
@@ -11005,6 +11066,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
             else
               AUTO_REBASE_PUSH_RC=$?
               AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
+              # ga-744kvc: push never ran (the && chain short-circuited on a
+              # verdict, not a git failure) — name the decision instead of
+              # falling through to "no stderr captured".
+              if [ -z "$AUTO_REBASE_PUSH_ERR" ]; then
+                AUTO_REBASE_PUSH_ERR=$(_gate_push_skip_reason "${PR_COMMIT_VERDICT:-}" "${PR_CONTENT_VERDICT:-}" "$BRANCH" "$BEAD_ID")
+              fi
               [ "$PR_COMMIT_VERDICT" != "yes" ] && warn "  ga-itkbt/ga-y9a1d: pre-review auto-rebase onto $MAIN_HEAD_SHA did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$PR_COMMIT_VERDICT) — refusing to push."
               if [ "$PR_CONTENT_VERDICT" != "yes" ]; then
                 _LOST_PATHS=$(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')
@@ -11087,6 +11154,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               else
                 AUTO_REBASE_PUSH_RC=$?
                 AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
+                # ga-744kvc: push never ran (the && chain short-circuited on a
+                # verdict, not a git failure) — name the decision instead of
+                # falling through to "no stderr captured".
+                if [ -z "$AUTO_REBASE_PUSH_ERR" ]; then
+                  AUTO_REBASE_PUSH_ERR=$(_gate_push_skip_reason "${PR_COMMIT_VERDICT:-}" "${PR_CONTENT_VERDICT:-}" "$BRANCH" "$BEAD_ID")
+                fi
                 [ "$PR_COMMIT_VERDICT" != "yes" ] && warn "  ga-itkbt/ga-y9a1d: pre-review auto-merge fallback onto $MAIN_HEAD_SHA did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$PR_COMMIT_VERDICT) — refusing to push."
                 if [ "$PR_CONTENT_VERDICT" != "yes" ]; then
                   _LOST_PATHS=$(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')
@@ -11164,6 +11237,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               else
                 AUTO_REBASE_PUSH_RC=$?
                 AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
+                # ga-744kvc: push never ran (the && chain short-circuited on a
+                # verdict, not a git failure) — name the decision instead of
+                # falling through to "no stderr captured".
+                if [ -z "$AUTO_REBASE_PUSH_ERR" ]; then
+                  AUTO_REBASE_PUSH_ERR=$(_gate_push_skip_reason "${PR_COMMIT_VERDICT:-}" "${PR_CONTENT_VERDICT:-}" "$BRANCH" "$BEAD_ID")
+                fi
                 [ "$PR_COMMIT_VERDICT" != "yes" ] && warn "  ga-itkbt/ga-y9a1d: pre-review auto-merge (self-repo) onto $MAIN_HEAD_SHA did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$PR_COMMIT_VERDICT) — refusing to push."
                 if [ "$PR_CONTENT_VERDICT" != "yes" ]; then
                   _LOST_PATHS=$(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')
@@ -11215,6 +11294,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
             else
               AUTO_REBASE_PUSH_RC=$?
               AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
+              # ga-744kvc: push never ran (the && chain short-circuited on a
+              # verdict, not a git failure) — name the decision instead of
+              # falling through to "no stderr captured".
+              if [ -z "$AUTO_REBASE_PUSH_ERR" ]; then
+                AUTO_REBASE_PUSH_ERR=$(_gate_push_skip_reason "${PR_COMMIT_VERDICT:-}" "${PR_CONTENT_VERDICT:-}" "$BRANCH" "$BEAD_ID")
+              fi
               [ "$PR_COMMIT_VERDICT" != "yes" ] && warn "  ga-itkbt/ga-y9a1d: pre-review auto-rebase (self-repo) onto $MAIN_HEAD_SHA did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$PR_COMMIT_VERDICT) — refusing to push."
               if [ "$PR_CONTENT_VERDICT" != "yes" ]; then
                 _LOST_PATHS=$(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')
@@ -11272,6 +11357,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               else
                 AUTO_REBASE_PUSH_RC=$?
                 AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
+                # ga-744kvc: push never ran (the && chain short-circuited on a
+                # verdict, not a git failure) — name the decision instead of
+                # falling through to "no stderr captured".
+                if [ -z "$AUTO_REBASE_PUSH_ERR" ]; then
+                  AUTO_REBASE_PUSH_ERR=$(_gate_push_skip_reason "${PR_COMMIT_VERDICT:-}" "${PR_CONTENT_VERDICT:-}" "$BRANCH" "$BEAD_ID")
+                fi
                 [ "$PR_COMMIT_VERDICT" != "yes" ] && warn "  ga-itkbt/ga-y9a1d: pre-review auto-merge fallback (self-repo) onto $MAIN_HEAD_SHA did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$PR_COMMIT_VERDICT) — refusing to push."
                 if [ "$PR_CONTENT_VERDICT" != "yes" ]; then
                   _LOST_PATHS=$(rebase_content_lost_paths "$TMP_REBASE_WT" "$MAIN_HEAD_SHA" "origin/$BRANCH" "$NEW_TIP" | tr '\n' ' ')
