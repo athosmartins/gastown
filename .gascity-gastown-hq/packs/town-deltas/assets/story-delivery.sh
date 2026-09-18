@@ -2375,7 +2375,53 @@ else
          && [ -z "$(comm -12 \
               <(echo "$REFRESH_GUARDED_OWN" | tr ' ' '\n' | grep -v '^$' | sort -u) \
               <(echo "$MERGE_OWN_AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u))" ]; then
-        NEEDS_GUARDED_RESTART_UNATTRIBUTED=1
+        # ga-g63ejg: an empty intersection with REFRESH_GUARDED_OWN only proves
+        # this bead's own affected daemon(s) are off the WIDE sweep's radar —
+        # never that they are actually fresh. The wide sweep's own [PRE,POST]
+        # window can advance past this bead's merge without the daemon it
+        # touches ever being independently re-examined or restarted (e.g. an
+        # EARLIER bead's own unattributed branch, right below, moves the
+        # rig-wide marker straight to ITS OWN POST_DEPLOY_SHA regardless of
+        # what other files landed in the same range) — so a daemon whose only
+        # changed file was THIS bead's own merge can permanently drop off
+        # REFRESH_GUARDED_OWN without ever being confirmed fresh. Live: wa-
+        # xn0w0 was closed story:done while com.whatsapp.map-viewer was still
+        # confirmed serving the pre-merge JS bundle 7min after this exact
+        # branch logged "not holding this delivery for it" and exonerated.
+        #
+        # Re-probe this bead's own AFFECTED set directly: force every label in
+        # it through daemon-refresh.sh's SENSITIVE already_fresh() check
+        # (pid-start-epoch vs. this bead's own commit, $MERGE_SHA) regardless
+        # of the rig's real sensitive/safe classification. A SAFE daemon's
+        # normal DRY_RUN=1 path never runs this check (it always reports
+        # WOULD_RESTART — real-restart semantics don't need to know whether a
+        # restart is actually needed, since kickstarting a SAFE daemon for
+        # real is harmless either way), which is exactly why the ORIGINAL
+        # MERGE_OWN_OUT probe above cannot answer "is it stale RIGHT NOW" for
+        # one. Same DRY_RUN=1 contract as MERGE_OWN_OUT — never kickstarts or
+        # drains anything for real, a pure live-process snapshot check.
+        MERGE_OWN_FRESH_OUT=$(RUNTIME_DIR="$RUNTIME_DIR" \
+          PRE_DEPLOY_SHA="$MERGE_OWN_BASE_SHA" POST_DEPLOY_SHA="$MERGE_SHA" \
+          DEPLOY_EPOCH="$DEPLOY_EPOCH" \
+          SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS $MERGE_OWN_AFFECTED" \
+          EXTRA_RUNTIME_ROOTS="$EXTRA_RUNTIME_ROOTS" \
+          DRY_RUN=1 \
+          timeout 180 bash "$REFRESH_HELPER" 2>/dev/null || true)
+        MERGE_OWN_FRESH_VERDICT_LINE=$(echo "$MERGE_OWN_FRESH_OUT" | grep '^VERDICT=' | head -1 || true)
+        MERGE_OWN_LIVE_STALE=$(echo "$MERGE_OWN_FRESH_OUT" | grep '^GUARDED=' | head -1 | sed 's/^GUARDED=//' || true)
+        log "Freshness re-probe for $STORY_ID's own affected daemon(s) [$MERGE_OWN_AFFECTED] (forced through the SENSITIVE already_fresh() check): ${MERGE_OWN_FRESH_VERDICT_LINE:-<unparseable output>} still-stale=[$MERGE_OWN_LIVE_STALE]."
+        if [ -n "$MERGE_OWN_FRESH_VERDICT_LINE" ] && [ -z "${MERGE_OWN_LIVE_STALE// /}" ]; then
+          NEEDS_GUARDED_RESTART_UNATTRIBUTED=1
+        else
+          # Third state (unparseable re-probe: no VERDICT= line at all,
+          # crash/timeout) is deliberately NOT treated as fresh — same
+          # fail-closed default this file uses everywhere else for "can't
+          # tell" (verify-before-completion's own rule: if we can't tell,
+          # don't release). NEEDS_GUARDED_RESTART_UNATTRIBUTED stays 0, so
+          # control falls through to the existing hold branch below exactly
+          # as if the intersection had NOT been empty.
+          log "Daemon refresh verdict=$REFRESH_VERDICT — $STORY_ID's own merge reaches [$MERGE_OWN_AFFECTED], none currently in the wide guarded list [$REFRESH_GUARDED_OWN], but the freshness re-probe did not confirm it fresh — holding this delivery for it (ga-g63ejg: absence from the wide sweep's list does not prove fresh)."
+        fi
       fi
       if [ "$THIS_PULL_STRUCTURALLY_INERT" = "1" ]; then
         # ga-3bdttu: verdict is real (some daemon IS stale) but this story's
