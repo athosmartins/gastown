@@ -369,6 +369,58 @@ has_reclaim_escalation() {
   return 1
 }
 
+# GATE_AUTO_UNBLOCK_FIX_ATTEMPT_CAP must track quality-gate-dispatcher.sh's
+# own GATE_FIX_CAP (a hardcoded local there, not env-overridable — currently
+# 3), so both scripts agree on what "cap exhausted" means for the SAME
+# gate:fix-attempt:N label family. Overridable here only for the selftest.
+GATE_AUTO_UNBLOCK_FIX_ATTEMPT_CAP="${GATE_AUTO_UNBLOCK_FIX_ATTEMPT_CAP:-3}"
+
+# has_fix_attempt_cap_escalation <labels-multilinha> → 0 se gate:fix-attempt:N
+# (dono: quality-gate-dispatcher.sh, circuit-breaker ga-55syh) está NO cap ou
+# acima (ga-3pkhtc). Mesma FORMA de blind spot que has_reclaim_escalation()
+# acima já corrigiu (ga-18uhg0), cap IRMÃO: um gate:needs-human(:technical)
+# co-presente aqui não é uma trava órfã nem um caso pra tentativa mais forte
+# — é o freio de N-tentativas que OUTRO subsistema já armou e VERIFICOU
+# (gate_apply_needs_human, ga-55syh) depois de esgotar seu próprio orçamento
+# de auto-retry. R1-R4 não sabem que gate:fix-attempt existe: R1 lê "sem
+# commit novo ainda" (o estado normal logo após a Nª reprovação) como trava
+# órfã; R4 lê as mesmas reprovações repetidas (gate-sha-failed:*, um contador
+# DIFERENTE que cresce junto) como "escala de escopo, redespacha com teste
+# estrutural" — os dois, sem saber, desarmam um freio desenhado pra exigir
+# um humano de verdade. Confirmado ao vivo (ga-3pkhtc): um bead armado e
+# verificado ("verified applied" — a mensagem estava correta no momento em
+# que foi escrita) teve o label removido pela varredura seguinte do
+# gate-auto-unblock.plist (StartInterval=1200s, ~20min depois — o "minutos
+# depois" observado bate exato), deixando só gate:fix-attempt:3 e os
+# gate-sha-failed:* como evidência (strip_lock só toca gate:needs-human*,
+# nunca os contadores — por isso sobreviveram pra provar o que aconteceu).
+#
+# Espelha a leitura com reset-sentinel que quality-gate-dispatcher.sh JÁ usa
+# pro mesmo contador (ga-26df, "Current fix-attempt count" nesse arquivo) em
+# vez de um max/any ingênuo: um gate:fix-attempt:0 explícito é SEMPRE um
+# reset humano deliberado e vence qualquer :N remanescente mais alto (resíduo
+# de bump automático que o reset não apaga) — sem isto, este guard criaria o
+# bug ESPELHO: um bead genuinamente resetado por um humano ficaria invisível
+# a R1-R4 PRA SEMPRE. Dois chokepoints lendo a MESMA família de label têm que
+# concordar (precedente ga-3lsy1) — esta é essa concordância, não um segundo
+# idioma divergente.
+has_fix_attempt_cap_escalation() {
+  local v max=0 has_reset=0 n
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    case "$v" in
+      gate:fix-attempt:0) has_reset=1 ;;
+      gate:fix-attempt:*)
+        n="${v#gate:fix-attempt:}"
+        case "$n" in ''|*[!0-9]*) continue ;; esac
+        [ "$n" -gt "$max" ] && max="$n"
+        ;;
+    esac
+  done <<< "$1"
+  [ "$has_reset" = "1" ] && return 1
+  [ "$max" -ge "$GATE_AUTO_UNBLOCK_FIX_ATTEMPT_CAP" ]
+}
+
 # strip_lock <rig> <bead> <labels-multilinha> — remove TODAS as
 # variantes gate:needs-human* PRESENTES NA LISTA JÁ FORNECIDA (mesma
 # leitura que has_protected_variant já validou como segura — não
@@ -687,6 +739,11 @@ main() {
         # nova, é a mesma trava, então também não deve virar spam.
         rule="R5"
         why="bead carrega pilot:reclaim-count:escalated-at-* (reclaim-cap esgotado, ga-egd5av) — R1-R4 pulados incondicionalmente: a mesma evidência 'sem branch/commit' que R1-R4 leriam já é o motivo pelo qual isto foi escalado, não uma trava órfã (triagem ga-18uhg0)"
+      elif has_fix_attempt_cap_escalation "$labels"; then
+        # ga-3pkhtc: mesma técnica do bloco reclaim acima, cap irmão — pula
+        # decide() (e portanto R1-R4) incondicionalmente; força sempre R5.
+        rule="R5"
+        why="bead carrega gate:fix-attempt:N com N >= ${GATE_AUTO_UNBLOCK_FIX_ATTEMPT_CAP} (circuit-breaker de quality-gate-dispatcher.sh esgotado e VERIFICADO, ga-55syh) — R1-R4 pulados incondicionalmente: R1 leria 'sem commit novo' como trava órfã e R4 leria as reprovações repetidas como caso pra redespachar com teste mais forte; nenhuma das duas pode decidir por um bead onde outro subsistema já determinou que o auto-retry tem que parar (ga-3pkhtc)"
       else
         IFS='|' read -r rule why <<< "$(decide "$rig" "$id" "$labels")"
       fi

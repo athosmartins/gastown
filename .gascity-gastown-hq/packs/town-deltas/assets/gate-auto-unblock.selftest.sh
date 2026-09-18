@@ -713,6 +713,63 @@ else
     "OUT=$OUT REMOVED=$(cat "$TMP/fx.wa-reclaimr3/removed.log" 2>/dev/null)"
 fi
 
+# ── ga-3pkhtc: gate:fix-attempt cap esgotado (quality-gate-dispatcher.sh,
+# GATE_FIX_CAP=3) é a MESMA classe de blind spot que ga-18uhg0 já corrigiu
+# para o cap de reclaim — mas para o cap IRMÃO, e este nunca ganhou o
+# guard equivalente. Caso real: uma escalação de cap (gate:needs-human +
+# gate:needs-human:technical) foi aplicada e VERIFICADA por
+# gate_apply_needs_human() (ga-55syh) — a mensagem "verified applied"
+# estava correta no momento em que foi escrita — mas a bead não tinha
+# commit novo ainda (típico logo após a 3ª reprovação), então R1 leu
+# "sem trabalho novo" como trava órfã e removeu o label ~20min depois
+# (StartInterval do gate-auto-unblock.plist), sem NUNCA olhar
+# gate:fix-attempt:N. O freio de 3 tentativas virou letra morta: bastava
+# esperar a próxima varredura. Mesma fixture do teste R1 sem-branch
+# (ga-ih4ma) acima, mas com gate:fix-attempt:3 (cap) também presente.
+setup ga-3pkhtc '["gate:needs-human","gate:needs-human:technical","gate:fix-attempt:3"]' '' '' ''
+OUT="$(run)"
+if printf '%s' "$OUT" | grep -q "R5 ga-3pkhtc" \
+   && ! printf '%s' "$OUT" | grep -qE "R[1-4] ga-3pkhtc" \
+   && [ ! -s "$TMP/fx.ga-3pkhtc/removed.log" ]; then
+  ok "ga-3pkhtc: gate:fix-attempt:3 (cap) + sem branch/commit → força R5 (chamar humano), não R1 (trava órfã) — o mesmo bug do ga-18uhg0, cap irmão"
+else
+  bad "ga-3pkhtc: bead com gate:fix-attempt no cap deveria escalar (R5), não ser lida como trava órfã e destravada (R1) — reabre o ciclo despacho→reprovação→auto-limpeza" \
+    "OUT=$OUT REMOVED=$(cat "$TMP/fx.ga-3pkhtc/removed.log" 2>/dev/null)"
+fi
+
+# ── ga-3pkhtc: o mesmo guard vence mesmo quando decide() teria dado R4
+# (3+ gate-sha-failed:*, branch com trabalho único) — prova "R1-R4
+# incondicionalmente", não só um desvio do caso R1 sem-branch. Este é o
+# caminho que a investigação ao vivo apontou como o mais provável: um
+# bead cap-esgotado quase sempre também carrega 3+ gate-sha-failed:*
+# (mesma reprovação repetida conta pros dois contadores independentes).
+setup wa-fixattemptr4 '["gate:needs-human","gate:needs-human:technical","gate:fix-attempt:3","gate-sha-failed:a:code","gate-sha-failed:b:code","gate-sha-failed:c:code"]' \
+  'origin/crew/mila/wa-fixattemptr4' '+ b40be47f' '1700000000' \
+  '[{"created_at":"2026-08-15T10:00:00Z","text":"VERDICT: FAIL em lib/x.py"}]'
+OUT="$(run)"
+if printf '%s' "$OUT" | grep -q "R5 wa-fixattemptr4" \
+   && ! printf '%s' "$OUT" | grep -qE "R[1-4] wa-fixattemptr4" \
+   && [ ! -s "$TMP/fx.wa-fixattemptr4/removed.log" ]; then
+  ok "ga-3pkhtc: gate:fix-attempt:3 vence mesmo quando 3+ gate-sha-failed:* dariam R4 — nenhuma de R1-R4 decide por este bead"
+else
+  bad "ga-3pkhtc: mesmo com branch+trabalho+3 gate-sha-failed:* (que normalmente dá R4 — 'escala de ESCOPO, redespacha com teste estrutural'), um bead com gate:fix-attempt no cap deveria forçar R5, não R4 — R4 auto-redespacharia exatamente o que o circuit-breaker foi desenhado pra impedir" \
+    "OUT=$OUT REMOVED=$(cat "$TMP/fx.wa-fixattemptr4/removed.log" 2>/dev/null)"
+fi
+
+# ── ga-3pkhtc: reset sentinel (gate:fix-attempt:0) — um reset HUMANO
+# deliberado precisa continuar liberando R1-R4, mesmo com um
+# gate:fix-attempt:N>=cap remanescente (resíduo de bump automático, não
+# tocado pelo reset — ga-26df, mesmo arquivo). Sem isto, o guard novo
+# criaria o bug ESPELHO: um bead genuinamente resetado ficaria invisível
+# a R1-R4 PRA SEMPRE, nunca mais destravável automaticamente.
+setup ga-3pkhtc-reset '["gate:needs-human","gate:fix-attempt:0","gate:fix-attempt:3"]' '' '' ''
+OUT="$(run)"
+if printf '%s' "$OUT" | grep -q "R1 ga-3pkhtc-reset"; then
+  ok "ga-3pkhtc: gate:fix-attempt:0 (reset humano) vence um :3 remanescente — R1-R4 voltam a decidir normalmente (ga-26df, mesma semântica que quality-gate-dispatcher.sh já usa pro próprio contador)"
+else
+  bad "ga-3pkhtc: gate:fix-attempt:0 deveria sinalizar reset humano e liberar R1-R4 de novo, mesmo com um :3 remanescente coexistindo" "$OUT"
+fi
+
 # ── kill switch ────────────────────────────────────────────────────────
 setup ga-off '["gate:needs-human"]' '' '' ''
 OUT="$(GATE_AUTO_UNBLOCK_ENABLED=0 GC_CITY_PATH="$TMP" WA_RIG="$TMP" PS_RIG="$TMP" \
