@@ -7218,6 +7218,56 @@ _topup_rig_pending() {
   return 0
 }
 
+# _pilot_topup_spawn pool pending — spawns a pool worker session for top-up.
+# ga-kmm6rb: the old inline call discarded BOTH stdout and stderr via
+# `>/dev/null 2>&1`, so all 3/3 top-up spawn failures observed since the
+# ga-swnsg3 merge left zero diagnostic trail — just a generic "failed, will
+# retry next sweep." Never redirect this call's stderr to /dev/null again;
+# capture it and log it on every failure, so the NEXT failure is diagnosable
+# instead of another blank slate.
+#
+# Also retries ONCE immediately on failure: the dispatch-path spawn
+# (dispatch_one(), ~L9829/9884) uses the structurally identical `gc --city
+# ... session new <pool> --no-attach --title-hint ... >/dev/null 2>&1` shape
+# and succeeded in the same window the top-up spawn failed 3/3 times —
+# ruling out an argument/environment difference between the two paths
+# (ACEITE #2's third hypothesis, closed by direct code comparison, not
+# guesswork). The remaining, CORROBORATED hypothesis is a transient Dolt
+# error: the Mayor's own manual run of this exact command hit "listing
+# sessions: search wisps (merge): search wisps: invalid connection" under
+# high Dolt CPU and succeeded on a second try — ACEITE #2's first branch
+# ("se for erro transitório de Dolt, retry curto dentro da mesma varredura").
+# If this retry does not fully explain the next live failure, the captured
+# stderr text this function now logs will show that directly — this is a
+# reasoned bet given the available evidence, not a substitute for that live
+# proof (ACEITE #3), which needs a real production sweep to observe.
+_pilot_topup_spawn() {
+  local _pool="$1" _pending="$2" _err _rc
+  _err=$(timeout "${PILOT_SPAWN_TIMEOUT_SECS:-60}" gc --city "$GC_CITY" session new "$_pool" --no-attach \
+      --title-hint "pool top-up: $_pending" 2>&1 >/dev/null)
+  _rc=$?
+  if [ "$_rc" -eq 0 ]; then
+    return 0
+  fi
+  warn "ga-kmm6rb: pool top-up spawn failed for $_pool ($_pending), attempt 1/2 (exit=$_rc): ${_err:-<no stderr captured>} — retrying once this sweep"
+  # ga-kmm6rb: a brief pause before retrying, not an instant back-to-back
+  # call. The corroborating evidence (Mayor's manual reproduction) was a
+  # transient Dolt "invalid connection" under high CPU that cleared by the
+  # time of a SECOND, separately-typed command — an instant retry risks
+  # hitting the exact same saturated instant again, giving the retry no
+  # better odds than the original attempt.
+  sleep "${PILOT_TOPUP_RETRY_DELAY_SECS:-3}"
+  _err=$(timeout "${PILOT_SPAWN_TIMEOUT_SECS:-60}" gc --city "$GC_CITY" session new "$_pool" --no-attach \
+      --title-hint "pool top-up: $_pending" 2>&1 >/dev/null)
+  _rc=$?
+  if [ "$_rc" -eq 0 ]; then
+    log "  ga-kmm6rb: pool top-up spawn for $_pool ($_pending) succeeded on retry (attempt 1 had failed, see prior warn line)."
+    return 0
+  fi
+  warn "ga-kmm6rb: pool top-up spawn failed for $_pool ($_pending), attempt 2/2 -- retry also failed (exit=$_rc): ${_err:-<no stderr captured>} — giving up this sweep, will retry next sweep."
+  return 1
+}
+
 _pilot_pool_topup() {
   local _pool="$1" _max="$2"
   local _live _global _pending
@@ -7308,13 +7358,11 @@ _pilot_pool_topup() {
       break
     fi
     log "  ga-93yxc: pool top-up — $_pool has free capacity (live=$_live < $_max) and $_pending is routed+unassigned with no worker from a prior sweep — spawning."
-    if timeout "${PILOT_SPAWN_TIMEOUT_SECS:-60}" gc --city "$GC_CITY" session new "$_pool" --no-attach \
-        --title-hint "pool top-up: $_pending" >/dev/null 2>&1; then
+    if _pilot_topup_spawn "$_pool" "$_pending"; then
       log "  ga-93yxc: pool top-up — $_pool session spawned for $_pending."
       _live=$((_live + 1))
       _global=$((_global + 1))
     else
-      warn "ga-93yxc: pool top-up spawn failed for $_pool ($_pending) — will retry next sweep."
       break
     fi
   done
