@@ -32,7 +32,8 @@ rc1() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then bad "$d — expected 
 # ── Load the REAL functions (lib-only = no live sweep) ──────────────────────
 SURVIVAL_LIB_ONLY=1 source "$SWEEP" \
   || { echo "FATAL: could not source sweep in lib-only mode"; exit 1; }
-for fn in survival_classify rig_gitdir git_in iso_to_epoch entry_within_retention; do
+for fn in survival_classify rig_gitdir git_in iso_to_epoch entry_within_retention \
+          raw_fetch recheck_divergent divergent_surge parse_entry_fields; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by sweep"; exit 1; }
 done
 
@@ -195,6 +196,189 @@ grep -q 'com.gascity.gate-merge-survival-sweep' "$PLIST" && ok "plist Label corr
 grep -q '<key>StartInterval</key>' "$PLIST"              && ok "plist uses StartInterval" || bad "plist missing StartInterval"
 grep -q '<key>RunAtLoad</key><true/>' "$PLIST"           && ok "plist RunAtLoad=true"     || bad "plist missing RunAtLoad"
 grep -q 'gate-merge-survival-sweep.sh' "$PLIST"          && ok "plist points at the sweep script" || bad "plist ProgramArguments wrong"
+
+# ── 8. ga-8hm65g: divergent_surge (pure predicate) ──────────────────────────
+echo "── 8. ga-8hm65g: divergent_surge threshold predicate ──"
+rc1 "0 confirmed never surges, any threshold"        divergent_surge 0 5
+rc1 "3 confirmed under threshold 5 -> not a surge"   divergent_surge 3 5
+rc0 "10 confirmed over threshold 5 -> surge"         divergent_surge 10 5
+rc1 "5 confirmed == threshold 5 -> not a surge (strict >)" divergent_surge 5 5
+rc1 "0 confirmed never surges even vs a negative threshold (misconfig guard)" divergent_surge 0 -1
+
+# ── 9. ga-8hm65g: recheck_divergent — invariant (a)+(b) ─────────────────────
+# Acceptance criterion 1: "ref local velho + commit presente no remoto ->
+# re-check com fetch classifica survived." Build a real local "origin" (a
+# bare repo) + a rig clone whose CACHED local origin/main is stale, then
+# advance the real remote past that stale point, and prove recheck_divergent
+# (a) actually re-fetches and (b) reports the verdict and the value it was
+# computed against as the SAME single reading (never two separate resolutions
+# that could disagree, which is the split-read bug ga-8hm65g was filed
+# against).
+echo "── 9. ga-8hm65g: recheck_divergent (fresh-fetch re-verify) ──"
+T9="$T/ga8hm65g_recheck"; mkdir -p "$T9"
+RO9="$T9/origin.git"; git init -q --bare -b main "$RO9" >/dev/null 2>&1
+RR9="$T9/rig"; git clone -q "$RO9" "$RR9" >/dev/null 2>&1
+git -C "$RR9" config user.email t@example.com
+git -C "$RR9" config user.name  tester
+echo base > "$RR9/base"; git -C "$RR9" add .; git -C "$RR9" commit -q -m base
+git -C "$RR9" push -q origin main
+BASE9=$(git -C "$RR9" rev-parse HEAD)
+# SIDE9 = the sha we'll recheck: a SIBLING of the stale ref (common ancestor
+# BASE9, neither a descendant of the other) — genuinely divergent from it,
+# not just "behind" it (a direct-descendant fixture would classify ff_heal,
+# not divergent, and never exercise this path).
+git -C "$RR9" checkout -q -b side "$BASE9"
+echo side > "$RR9/side"; git -C "$RR9" add .; git -C "$RR9" commit -q -m side
+SIDE9=$(git -C "$RR9" rev-parse HEAD)
+git -C "$RR9" checkout -q main
+# MSTALE9 = a second commit on main, sibling to SIDE9. Push it so origin/main
+# advances to MSTALE9 — this is the value the rig's cache will hold as
+# "stale" once fetched.
+echo mstale > "$RR9/mstale"; git -C "$RR9" add .; git -C "$RR9" commit -q -m mstale
+MSTALE9=$(git -C "$RR9" rev-parse HEAD)
+git -C "$RR9" push -q origin main
+# Populate the rig's cached origin/main (== MSTALE9) — this is the "ref local
+# velho" precondition: stale relative to what origin is ABOUT to become.
+git -C "$RR9" fetch -q origin
+eq "fixture: cached origin/main starts at MSTALE9" "$(git -C "$RR9" rev-parse origin/main)" "$MSTALE9"
+eq "fixture (precondition): SIDE9 genuinely divergent from stale cached origin/main" \
+  "$(survival_classify "$RR9" 0 "$SIDE9" "$(git -C "$RR9" rev-parse origin/main)")" "divergent"
+# Advance the REAL remote past SIDE9 (merge commit, so SIDE9 becomes an
+# ancestor) — simulates an async push landing on the shared remote, same
+# shape as the live incident. Done via a separate clone so RR9's own cached
+# refs are untouched by this push.
+RO9_WORK="$T9/origin_work"; git clone -q "$RO9" "$RO9_WORK" >/dev/null 2>&1
+git -C "$RO9_WORK" fetch -q "$RR9" side:refs/remotes/origin/side >/dev/null 2>&1
+git -C "$RO9_WORK" merge -q --no-ff -m "land side" refs/remotes/origin/side >/dev/null 2>&1
+git -C "$RO9_WORK" push -q origin main
+HEALED9=$(git -C "$RO9_WORK" rev-parse HEAD)
+# RR9's LOCAL cached origin/main is still stale (MSTALE9) — no fetch since.
+eq "fixture: rig's cached origin/main is still stale (no fetch yet)" "$(git -C "$RR9" rev-parse origin/main)" "$MSTALE9"
+
+RECHECK9=$(recheck_divergent "$RR9" 0 "$SIDE9" "main")
+RV9="${RECHECK9%%$'\t'*}"; RO9_NOW="${RECHECK9#*$'\t'}"
+eq "recheck_divergent: fresh fetch reclassifies stale-divergent as survived" "$RV9" "survived"
+eq "recheck_divergent: reported origin_now is the FRESH value (not the stale cached one)" "$RO9_NOW" "$HEALED9"
+eq "recheck_divergent: rig's local cache is now updated by the recheck's own fetch" "$(git -C "$RR9" rev-parse origin/main)" "$HEALED9"
+
+# Invariant (b) directly: verdict and reported value must be a single
+# consistent read. Prove it against the classifier itself, using EXACTLY the
+# value recheck_divergent reported.
+eq "invariant (b): the reported origin_now, re-classified, agrees with the reported verdict" \
+  "$(survival_classify "$RR9" 0 "$SIDE9" "$RO9_NOW")" "$RV9"
+
+# Genuinely-still-divergent case: recheck must NOT falsely downgrade.
+git -C "$RR9" checkout -q -b other9 "$BASE9"
+echo other > "$RR9/other"; git -C "$RR9" add .; git -C "$RR9" commit -q -m other9
+OTHER9=$(git -C "$RR9" rev-parse HEAD)
+git -C "$RR9" checkout -q main
+RECHECK9B=$(recheck_divergent "$RR9" 0 "$OTHER9" "main")
+eq "recheck_divergent: a genuinely still-divergent sha stays divergent (no false downgrade)" "${RECHECK9B%%$'\t'*}" "divergent"
+
+# ── 10. drift-guard: ga-8hm65g PASS 2 wiring ────────────────────────────────
+echo "── 10. drift-guard: ga-8hm65g PASS-2 wiring ──"
+grep -q 'declare -a PENDING_DIVERGENT' "$SWEEP" && ok "divergent candidates are queued, not escalated inline" || bad "PENDING_DIVERGENT array missing"
+grep -q 'PENDING_DIVERGENT+=("\$entry")' "$SWEEP" && ok "first-pass divergent) case defers instead of calling escalate_divergent" || bad "divergent) case no longer defers"
+grep -q 'recheck_divergent "\$RGITDIR" "\$RCONTAINER" "\$SHA" "\$RDEFAULT"' "$SWEEP" && ok "PASS 2 calls recheck_divergent before deciding" || bad "PASS 2 recheck call missing"
+grep -q 'if divergent_surge "\${#CONFIRMED_DIVERGENT\[@\]}" "\$SURGE_THRESHOLD"; then' "$SWEEP" && ok "surge threshold gates the escalation branch" || bad "surge-threshold branch missing"
+grep -q 'escalate_surge "\${#CONFIRMED_DIVERGENT\[@\]}"' "$SWEEP" && ok "over-threshold path calls escalate_surge" || bad "escalate_surge call missing"
+# escalate_surge itself must never call bd (reopen/label are exactly the
+# destructive actions invariant (d) suspends) — extract its body and assert.
+SURGE_BODY="$(sed -n '/^escalate_surge() {/,/^}/p' "$SWEEP")"
+[ -n "$SURGE_BODY" ] && ok "escalate_surge body extracted" || bad "could not extract escalate_surge body"
+printf '%s' "$SURGE_BODY" | grep -q 'bd -C' \
+  && bad "escalate_surge touches bd (reopen/label) — invariant (d) requires it never does" \
+  || ok "escalate_surge never calls bd — no reopen/label during a surge"
+printf '%s' "$SURGE_BODY" | grep -q 'mail send mayor' && ok "escalate_surge still mails Mayor (aggregated, once)" || bad "escalate_surge missing Mayor mail"
+
+# ── 11. full-sweep integration (DRY_RUN): invariant (d) surge threshold ────
+# Acceptance criterion 2: "10 divergentes numa rodada -> acoes destrutivas
+# suspensas, um alarme agregado." Ten ledger entries, each on its own branch
+# off a shared base, each genuinely divergent from the FINAL state of origin
+# (unrelated commits keep advancing origin/main so nothing self-heals) — runs
+# the REAL script end-to-end under SURVIVAL_DRY_RUN=1 (so a would-be bug can
+# never touch a real bd/mail — dry-run is the safety net, not the thing under
+# test) and inspects the log for what WOULD have happened.
+echo "── 11. full-sweep integration: invariant (d) surge threshold (10 divergent) ──"
+TB="$T/ga8hm65g_surge"; mkdir -p "$TB"
+ROB="$TB/origin.git"; git init -q --bare -b main "$ROB" >/dev/null 2>&1
+RRB="$TB/rig"; git clone -q "$ROB" "$RRB" >/dev/null 2>&1
+git -C "$RRB" config user.email t@example.com
+git -C "$RRB" config user.name  tester
+echo base > "$RRB/base"; git -C "$RRB" add .; git -C "$RRB" commit -q -m base
+git -C "$RRB" push -q origin main
+BASEB=$(git -C "$RRB" rev-parse HEAD)
+LEDGERB="$TB/ledger.jsonl"; : > "$LEDGERB"
+for i in $(seq 1 10); do
+  git -C "$RRB" checkout -q -b "side$i" "$BASEB" >/dev/null 2>&1
+  echo "s$i" > "$RRB/s$i"; git -C "$RRB" add .; git -C "$RRB" commit -q -m "S$i"
+  SHAI=$(git -C "$RRB" rev-parse HEAD)
+  git -C "$RRB" checkout -q main >/dev/null 2>&1
+  printf '{"ts":"%s","rig":"rigB","rig_path":"%s","default_branch":"main","branch":"side%s","bead":"","bead_city":"","gate_run":"","merge_sha":"%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RRB" "$i" "$SHAI" >> "$LEDGERB"
+  # Advance origin/main with an UNRELATED commit each round so every side
+  # branch stays genuinely divergent from origin's final tip either way.
+  echo "m$i" > "$RRB/m$i"; git -C "$RRB" add .; git -C "$RRB" commit -q -m "M$i"
+  git -C "$RRB" push -q origin main
+done
+
+OUTB=$(GC_CITY_PATH="$TB/city" SURVIVAL_LEDGER_FILE="$LEDGERB" SURVIVAL_ALERT_DIR="$TB/alerted" \
+  SURVIVAL_DIVERGENT_SURGE_THRESHOLD=5 SURVIVAL_DRY_RUN=1 SURVIVAL_LOG_STDOUT=1 bash "$SWEEP" 2>&1)
+
+printf '%s\n' "$OUTB" | grep -q 'WOULD-ESCALATE(divergent)' \
+  && bad "surge: an individual per-sha escalation fired during a 10-divergent surge — output:
+$OUTB" \
+  || ok "surge: no individual per-sha escalation fired during a 10-divergent surge"
+SURGE_LINES_B=$(printf '%s\n' "$OUTB" | grep -c 'WOULD-ESCALATE(surge)')
+[ "$SURGE_LINES_B" = "1" ] \
+  && ok "surge: exactly ONE aggregated surge alarm for 10 confirmed-divergent" \
+  || bad "surge: expected exactly 1 aggregated alarm, got $SURGE_LINES_B — output:
+$OUTB"
+printf '%s\n' "$OUTB" | grep -q '10 confirmed-divergent' \
+  && ok "surge alarm reports the true confirmed count (10)" \
+  || bad "surge alarm does not report the count 10 — output:
+$OUTB"
+RECHECK_LINES_B=$(printf '%s\n' "$OUTB" | grep -c '^\[.*\] \[survival-sweep\] RECHECK ')
+[ "$RECHECK_LINES_B" = "10" ] \
+  && ok "surge: all 10 candidates were independently rechecked before the surge decision" \
+  || bad "surge: expected 10 RECHECK log lines, got $RECHECK_LINES_B"
+
+# ── 12. full-sweep integration (DRY_RUN): under threshold escalates normally
+# Companion to #11 — proves the threshold gate works BOTH directions: a small
+# number of genuinely-confirmed divergences still escalates individually
+# (invariant a/c confirm-then-reopen, not "never reopen anything").
+echo "── 12. full-sweep integration: under-threshold divergence still escalates individually ──"
+TC="$T/ga8hm65g_small"; mkdir -p "$TC"
+ROC="$TC/origin.git"; git init -q --bare -b main "$ROC" >/dev/null 2>&1
+RRC="$TC/rig"; git clone -q "$ROC" "$RRC" >/dev/null 2>&1
+git -C "$RRC" config user.email t@example.com
+git -C "$RRC" config user.name  tester
+echo base > "$RRC/base"; git -C "$RRC" add .; git -C "$RRC" commit -q -m base
+git -C "$RRC" push -q origin main
+BASEC=$(git -C "$RRC" rev-parse HEAD)
+LEDGERC="$TC/ledger.jsonl"; : > "$LEDGERC"
+for i in 1 2; do
+  git -C "$RRC" checkout -q -b "side$i" "$BASEC" >/dev/null 2>&1
+  echo "s$i" > "$RRC/s$i"; git -C "$RRC" add .; git -C "$RRC" commit -q -m "S$i"
+  SHAI=$(git -C "$RRC" rev-parse HEAD)
+  git -C "$RRC" checkout -q main >/dev/null 2>&1
+  printf '{"ts":"%s","rig":"rigC","rig_path":"%s","default_branch":"main","branch":"side%s","bead":"","bead_city":"","gate_run":"","merge_sha":"%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RRC" "$i" "$SHAI" >> "$LEDGERC"
+  echo "m$i" > "$RRC/m$i"; git -C "$RRC" add .; git -C "$RRC" commit -q -m "M$i"
+  git -C "$RRC" push -q origin main
+done
+
+OUTC=$(GC_CITY_PATH="$TC/city" SURVIVAL_LEDGER_FILE="$LEDGERC" SURVIVAL_ALERT_DIR="$TC/alerted" \
+  SURVIVAL_DIVERGENT_SURGE_THRESHOLD=5 SURVIVAL_DRY_RUN=1 SURVIVAL_LOG_STDOUT=1 bash "$SWEEP" 2>&1)
+
+INDIV_LINES_C=$(printf '%s\n' "$OUTC" | grep -c 'WOULD-ESCALATE(divergent)')
+[ "$INDIV_LINES_C" = "2" ] \
+  && ok "under threshold: both genuinely-divergent entries escalate individually" \
+  || bad "under threshold: expected 2 individual escalations, got $INDIV_LINES_C — output:
+$OUTC"
+printf '%s\n' "$OUTC" | grep -q 'WOULD-ESCALATE(surge)' \
+  && bad "under threshold: surge path fired for only 2 confirmed-divergent (should not)" \
+  || ok "under threshold: surge path did not fire for only 2 confirmed-divergent"
 
 echo ""
 echo "──────────────────────────────────────────"
