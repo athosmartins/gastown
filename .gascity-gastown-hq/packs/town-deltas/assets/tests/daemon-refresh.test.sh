@@ -88,6 +88,17 @@
 #      to a human follow-up once installed+loaded is confirmed (see the
 #      JOB_NOT_INSTALLED ACTION text at the call sites in
 #      quality-gate-dispatcher.sh).
+#  15. (wa-flysp) Every label landing in GUARDED is ALSO classified into
+#      GUARDED_OWN (its own entrypoint/template is itself in the diff — T57)
+#      or GUARDED_CLOSURE_ONLY (reached only via a transitively-changed
+#      import/route-hop — T58), new always-present fields (T60) that partition
+#      GUARDED without changing its own membership (T58's backward-compat
+#      check). REASON renders OWN-FILE-CHANGED before CLOSURE-ONLY when both
+#      are present (T59) — the actionable half is never buried under noise —
+#      and a 100%-closure-only GUARDED list still renders its section rather
+#      than silently omitting the split (T58, mirrors the exact bug class
+#      whatsapp_automation's own daemon_refresh_advisory.py::render_advisory()
+#      was fixed for).
 #
 # All external effects (launchctl, ps) are injected via LAUNCHCTL_BIN / PS_BIN
 # and a mock state dir, so the test touches NO real daemons. The plist scan and
@@ -2180,6 +2191,128 @@ OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" PRE_DEPLOY_SHA="$PRE" POST_DEPLOY_
 V=$(field VERDICT "$OUT")
 [ "$V" = "OK" ] && ok "T56 verdict OK (scheduled_job_opt_out covers an installed-but-unloaded job)" || nok "T56 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -eq 0 ] && ok "T56 exit 0" || nok "T56 exit" "rc=$RC"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T57 (wa-flysp, header point 16): a SENSITIVE daemon GUARDED because its own
+# entrypoint file is directly in the diff (same fixture as T4) must be
+# classified GUARDED_OWN, not GUARDED_CLOSURE_ONLY — and REASON must render
+# an OWN-FILE-CHANGED section, with no CLOSURE-ONLY section (nothing to put
+# in it).
+# ════════════════════════════════════════════════════════════════════════════
+# explicit, not inherited: SENSITIVE_DAEMONS has been reassigned several
+# times above (e.g. line ~1714) for earlier sections' own fixtures — T57-T60
+# below set exactly what they need rather than depending on whatever the
+# last preceding test happened to leave behind.
+SENSITIVE_DAEMONS="central-sender slot-scheduler"
+new_case t57
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+seed_running com.test.central-sender 57001 "$STALE_LSTART"
+OUT=$(run_helper daemons/central_sender.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T57 verdict NEEDS_GUARDED_RESTART" || nok "T57 verdict" "got '$V' out=[$OUT]"
+echo "$(field GUARDED_OWN "$OUT")" | grep -q "com.test.central-sender" && ok "T57 own-file-changed daemon lands in GUARDED_OWN" || nok "T57 guarded_own" "$(field GUARDED_OWN "$OUT")"
+echo "$(field GUARDED_CLOSURE_ONLY "$OUT")" | grep -q "com.test.central-sender" && nok "T57 must NOT be in GUARDED_CLOSURE_ONLY" "$(field GUARDED_CLOSURE_ONLY "$OUT")" || ok "T57 not in GUARDED_CLOSURE_ONLY"
+[ -z "$(field GUARDED_CLOSURE_ONLY "$OUT")" ] && ok "T57 GUARDED_CLOSURE_ONLY empty (nothing closure-only this run)" || nok "T57 guarded_closure_only empty" "$(field GUARDED_CLOSURE_ONLY "$OUT")"
+R57="$(field REASON "$OUT")"
+echo "$R57" | grep -q "OWN-FILE-CHANGED" && ok "T57 REASON renders an OWN-FILE-CHANGED section" || nok "T57 reason own-section" "$R57"
+echo "$R57" | grep -q "CLOSURE-ONLY" && nok "T57 REASON must NOT render a CLOSURE-ONLY section (nothing to show)" "$R57" || ok "T57 no CLOSURE-ONLY section"
+# same partition must reach the trailing JSON, not just the KEY=value lines.
+echo "$OUT" | grep '^JSON=' | sed 's/^JSON=//' | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["guarded_own"] == ["com.test.central-sender"], d["guarded_own"]
+assert d["guarded_closure_only"] == [], d["guarded_closure_only"]
+' 2>/tmp/t57_json_err \
+  && ok "T57 JSON guarded_own/guarded_closure_only match the KEY=value lines" \
+  || nok "T57 JSON" "$(cat /tmp/t57_json_err 2>/dev/null)"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T58 (wa-flysp, header point 16): a SENSITIVE daemon GUARDED only via
+# import-level reachability (same shape as T5's fixture, but SENSITIVE +
+# no drain instead of SAFE) — its OWN file never changed, only a routes/*.py
+# module it imports. Must classify GUARDED_CLOSURE_ONLY, not GUARDED_OWN, and
+# REASON must render a CLOSURE-ONLY section with no OWN-FILE-CHANGED section.
+# The pre-existing flat GUARDED field must still contain it too (backward
+# compat: no existing caller's parsing of GUARDED= may change).
+# ════════════════════════════════════════════════════════════════════════════
+new_case t58
+cat > "$RUNTIME/routes/channel_admin_api.py" <<<'def register(app): pass'
+cat > "$RUNTIME/daemons/central_sender.py" <<'PYEOF'
+from routes.channel_admin_api import register
+register(None)
+PYEOF
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+seed_running com.test.central-sender 58001 "$STALE_LSTART"
+# deploy changes ONLY the imported route file, never central_sender.py itself
+OUT=$(run_helper routes/channel_admin_api.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T58 verdict NEEDS_GUARDED_RESTART" || nok "T58 verdict" "got '$V' out=[$OUT]"
+echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" && ok "T58 still in flat GUARDED (backward compat)" || nok "T58 guarded" "$(field GUARDED "$OUT")"
+echo "$(field GUARDED_CLOSURE_ONLY "$OUT")" | grep -q "com.test.central-sender" && ok "T58 import-only daemon lands in GUARDED_CLOSURE_ONLY" || nok "T58 guarded_closure_only" "$(field GUARDED_CLOSURE_ONLY "$OUT")"
+echo "$(field GUARDED_OWN "$OUT")" | grep -q "com.test.central-sender" && nok "T58 must NOT be in GUARDED_OWN" "$(field GUARDED_OWN "$OUT")" || ok "T58 not in GUARDED_OWN"
+[ -z "$(field GUARDED_OWN "$OUT")" ] && ok "T58 GUARDED_OWN empty (nothing own-file-changed this run)" || nok "T58 guarded_own empty" "$(field GUARDED_OWN "$OUT")"
+R58="$(field REASON "$OUT")"
+echo "$R58" | grep -q "CLOSURE-ONLY" && ok "T58 REASON renders a CLOSURE-ONLY section" || nok "T58 reason closure-section" "$R58"
+# the exact historical bug class this guards against (mirrors WA's own
+# daemon-refresh-step5-ranking.selftest.sh "GUARDED but zero symbol-confirmed
+# must still show its section" case): a 100%-closure-only GUARDED list must
+# not silently omit the OWN-FILE-CHANGED header's absence — it must render
+# ZERO own-file-changed daemons, not skip discussing the split at all.
+echo "$R58" | grep -q "OWN-FILE-CHANGED" && nok "T58 REASON must NOT render an OWN-FILE-CHANGED section (nothing to show)" "$R58" || ok "T58 no OWN-FILE-CHANGED section"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T59 (wa-flysp, header point 16): a MIXED deploy — one SENSITIVE daemon
+# GUARDED via its own file changing, a DIFFERENT SENSITIVE daemon GUARDED
+# only via import-level reachability — both land in GUARDED (unchanged
+# behavior), but must split correctly into the two new buckets, AND the
+# rendered REASON must place the OWN-FILE-CHANGED section BEFORE the
+# CLOSURE-ONLY section (the actionable half must never be buried after the
+# noise — the whole point of this bead).
+# ════════════════════════════════════════════════════════════════════════════
+new_case t59
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+cat > "$RUNTIME/routes/channel_admin_api.py" <<<'def register(app): pass'
+cat > "$RUNTIME/daemons/slot_scheduler.py" <<'PYEOF'
+from routes.channel_admin_api import register
+register(None)
+PYEOF
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+make_plist "$AGENTS" com.test.slot-scheduler "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/slot_scheduler.py"
+seed_running com.test.central-sender 59001 "$STALE_LSTART"
+seed_running com.test.slot-scheduler 59101 "$STALE_LSTART"
+# this deploy changes central_sender.py's OWN file AND the route slot_scheduler
+# only imports — never slot_scheduler.py itself.
+OUT=$(run_helper daemons/central_sender.py routes/channel_admin_api.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T59 verdict NEEDS_GUARDED_RESTART" || nok "T59 verdict" "got '$V' out=[$OUT]"
+echo "$(field GUARDED_OWN "$OUT")" | grep -q "com.test.central-sender" && ok "T59 central-sender in GUARDED_OWN" || nok "T59 guarded_own central" "$(field GUARDED_OWN "$OUT")"
+echo "$(field GUARDED_CLOSURE_ONLY "$OUT")" | grep -q "com.test.slot-scheduler" && ok "T59 slot-scheduler in GUARDED_CLOSURE_ONLY" || nok "T59 guarded_closure_only slot" "$(field GUARDED_CLOSURE_ONLY "$OUT")"
+echo "$(field GUARDED_OWN "$OUT")" | grep -q "com.test.slot-scheduler" && nok "T59 slot-scheduler must NOT be in GUARDED_OWN" "$(field GUARDED_OWN "$OUT")" || ok "T59 slot-scheduler correctly excluded from GUARDED_OWN"
+echo "$(field GUARDED_CLOSURE_ONLY "$OUT")" | grep -q "com.test.central-sender" && nok "T59 central-sender must NOT be in GUARDED_CLOSURE_ONLY" "$(field GUARDED_CLOSURE_ONLY "$OUT")" || ok "T59 central-sender correctly excluded from GUARDED_CLOSURE_ONLY"
+R59="$(field REASON "$OUT")"
+OWN_POS="${R59%%OWN-FILE-CHANGED*}"
+CLOSURE_POS="${R59%%CLOSURE-ONLY*}"
+[ "${#OWN_POS}" -lt "${#CLOSURE_POS}" ] && ok "T59 OWN-FILE-CHANGED section renders BEFORE CLOSURE-ONLY (actionable half first)" || nok "T59 section order" "$R59"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T60 (wa-flysp, header point 16): GUARDED_OWN/GUARDED_CLOSURE_ONLY must be
+# ALWAYS-PRESENT fields (even empty) on a verdict that never reaches Step 4's
+# GUARDED branch at all — same convention as AFFECTED_NOT_RUNNING/
+# PARSE_ERROR_LOADED. Reuses T2's plain SAFE-auto-restart fixture.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t60
+cat > "$RUNTIME/daemons/ban_risk_dashboard.py" <<<'print("dash")'
+make_plist "$AGENTS" com.test.ban-risk-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/ban_risk_dashboard.py"
+seed_running com.test.ban-risk-dashboard 60001 "$STALE_LSTART"
+seed_restart com.test.ban-risk-dashboard 60099 "$FRESH_LSTART"
+OUT=$(run_helper daemons/ban_risk_dashboard.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T60 verdict OK" || nok "T60 verdict" "got '$V' out=[$OUT]"
+echo "$OUT" | grep -q '^GUARDED_OWN=' && ok "T60 GUARDED_OWN field present (even empty) on a non-GUARDED verdict" || nok "T60 guarded_own present" "out=[$OUT]"
+echo "$OUT" | grep -q '^GUARDED_CLOSURE_ONLY=' && ok "T60 GUARDED_CLOSURE_ONLY field present (even empty) on a non-GUARDED verdict" || nok "T60 guarded_closure_only present" "out=[$OUT]"
+[ -z "$(field GUARDED_OWN "$OUT")" ] && ok "T60 GUARDED_OWN empty" || nok "T60 guarded_own empty" "$(field GUARDED_OWN "$OUT")"
+[ -z "$(field GUARDED_CLOSURE_ONLY "$OUT")" ] && ok "T60 GUARDED_CLOSURE_ONLY empty" || nok "T60 guarded_closure_only empty" "$(field GUARDED_CLOSURE_ONLY "$OUT")"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""

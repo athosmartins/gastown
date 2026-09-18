@@ -283,6 +283,25 @@
 #      call (it has its own separate MERGE_OWN_* side-channel probe instead
 #      — see ga-6zkhci) — falls straight through to today's exact
 #      SKIPPED/not_applicable behavior, zero regression.
+#  16. (wa-flysp) GUARDED itself stays a single flat list (unchanged — callers
+#      already parse it), but every label added to it is ALSO independently
+#      classified as own-file-changed vs. closure-only: did THIS label's own
+#      entrypoint file/template appear in the diff, or was it flagged only
+#      because it (transitively) imports something else that changed? Real
+#      incident this answers (wa-aknpy/wa-h140n, 2026-09-18): a daemon whose
+#      OWN .py file changed — the single strongest signal this script has —
+#      was buried inside a same-day 27-daemon GUARDED list dominated by
+#      closure-only noise, and nobody could tell which of the 27 actually
+#      mattered without manually re-deriving what Step 3 already knew and
+#      threw away. GUARDED_OWN/GUARDED_CLOSURE_ONLY (new fields, always
+#      present even empty — same convention as AFFECTED_NOT_RUNNING/
+#      PARSE_ERROR_LOADED) surface that split structurally, and REASON's text
+#      renders OWN-FILE-CHANGED first, CLOSURE-ONLY second, so the actionable
+#      half is never buried under the noise. Presentation/attribution only —
+#      changes NEITHER which labels land in GUARDED NOR the VERDICT; a
+#      closure-only daemon is still exactly as blocking as before (point 1's
+#      false-negative caveat — a real reachability gap can hide in either
+#      bucket — is unaffected).
 #
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
@@ -325,6 +344,12 @@
 # all human logging goes to STDERR.
 #   VERDICT=OK|SKIPPED|VERIFY_FAILED|NEEDS_GUARDED_RESTART|JOB_NOT_INSTALLED
 #   AFFECTED=<labels>   RESTARTED=<labels>   FRESH_FAIL=<labels>   GUARDED=<labels>
+#   GUARDED_OWN=<labels>   GUARDED_CLOSURE_ONLY=<labels>   (wa-flysp, header
+#     point 16: always present, even empty. A partition of GUARDED — every
+#     label in GUARDED is in exactly one of these two, never both, never
+#     neither. OWN = this label's own entrypoint file/template is itself in
+#     the diff. CLOSURE_ONLY = flagged only via a transitively-changed import/
+#     route-hop/JSON-closure member, its own file untouched.)
 #   WOULD_RESTART=<labels>   (ga-omfwe: DRY_RUN=1 only — labels that would be
 #     restarted for real; RESTARTED is always empty under DRY_RUN=1, so the
 #     two never collapse into the same string)
@@ -572,6 +597,11 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   echo "RESTARTED=${RESTARTED:-}"
   echo "FRESH_FAIL=${FRESH_FAIL:-}"
   echo "GUARDED=${GUARDED:-}"
+  # wa-flysp (header point 16): always present, even empty — same convention
+  # as AFFECTED_NOT_RUNNING/PARSE_ERROR_LOADED above. A partition of GUARDED:
+  # every label in GUARDED is in exactly one of these two, never both.
+  echo "GUARDED_OWN=${GUARDED_OWN:-}"
+  echo "GUARDED_CLOSURE_ONLY=${GUARDED_CLOSURE_ONLY:-}"
   echo "ALREADY_FRESH=${ALREADY_FRESH:-}"
   echo "WOULD_RESTART=${WOULD_RESTART:-}"
   # ga-tdzsh: always present (even on the early-precondition emits above,
@@ -589,14 +619,15 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   # same convention as PARSE_ERROR_LOADED/UNLOADED above.
   echo "UNATTRIBUTED_JOB_GAP=${SJ_UNATTRIBUTED_REASON:-}"
   # Trailing JSON for the caller's bead comment / jsonl log.
-  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" "${AFFECTED_NOT_RUNNING:-}" <<'PY' 2>/dev/null || true
+  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" "${AFFECTED_NOT_RUNNING:-}" "${GUARDED_OWN:-}" "${GUARDED_CLOSURE_ONLY:-}" <<'PY' 2>/dev/null || true
 import json, sys
-v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg, anr = sys.argv[1:14]
+v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg, anr, gd_own, gd_co = sys.argv[1:16]
 sp = lambda s: [x for x in s.split() if x]
 print("JSON=" + json.dumps({
     "verdict": v, "reason": reason,
     "affected": sp(aff), "affected_not_running": sp(anr), "restarted": sp(res),
     "fresh_fail": sp(ff), "guarded": sp(gd), "proof": proof,
+    "guarded_own": sp(gd_own), "guarded_closure_only": sp(gd_co),
     "already_fresh": sp(afr), "would_restart": sp(wr),
     "parse_error_loaded": sp(pel), "parse_error_unloaded": sp(peu),
     "unattributed_job_gap": ujg,
@@ -607,6 +638,10 @@ PY
 }
 
 AFFECTED=""; RESTARTED=""; FRESH_FAIL=""; GUARDED=""; ALREADY_FRESH=""; WOULD_RESTART=""
+# wa-flysp (header point 16): AFFECTED_OWN is a subset of AFFECTED (which
+# labels' own file/template changed); GUARDED_OWN/GUARDED_CLOSURE_ONLY
+# partition GUARDED the same way, built from it at Step 4 below.
+AFFECTED_OWN=""; GUARDED_OWN=""; GUARDED_CLOSURE_ONLY=""
 # wa-xokje: subset of AFFECTED that Step 4 below finds has no live PID at all
 # (a scheduled/one-shot job or an already-down daemon) — never kickstarted,
 # never a restart candidate, and — unlike a live daemon — cannot be made
@@ -1675,9 +1710,42 @@ for label in $DAEMON_LABELS; do
   [ "$affected" -eq 1 ] || continue
   AFFECTED="$AFFECTED $label"
   log "AFFECTED: $label (entrypoints:$entries)"
+
+  # wa-flysp (header point 16): independently of WHICH check above set
+  # affected=1 (direct, import-level, route-hop, JSON-closure, or template),
+  # also record whether THIS label's OWN entrypoint file/template
+  # specifically — not a transitively-imported sibling module — is itself in
+  # the changed set. A SECOND, fully independent pass over $entries (not
+  # $ad_hoc_entries — a JSON-covered entry's own file counts too) against
+  # $CHANGED_PY/$CHANGED_BASENAMES/$CHANGED_TEMPLATE_BASENAMES directly,
+  # deliberately NOT threaded through the five short-circuited affected=1
+  # branches above — those are exactly-tuned and heavily bug-fixed on their
+  # CURRENT shape (ga-dn9ye, ga-q617u, ga-9lsuq0); a fully separate read-only
+  # pass here can never perturb them.
+  own_hit=0
+  for e in $entries; do
+    if echo "$CHANGED_PY" | grep -qxF "$e"; then own_hit=1; break; fi
+    eb="$(basename "$e")"
+    if echo "$CHANGED_BASENAMES" | grep -qxF "$eb"; then own_hit=1; break; fi
+  done
+  if [ "$own_hit" -eq 0 ] && [ -n "${CHANGED_TEMPLATE_BASENAMES// /}" ]; then
+    for e in $entries; do
+      [ -f "$RUNTIME_DIR/$e" ] || continue
+      while IFS= read -r tmpl; do
+        [ -n "$tmpl" ] || continue
+        tb="$(basename "$tmpl")"
+        if echo "$CHANGED_TEMPLATE_BASENAMES" | grep -qxF "$tb"; then
+          own_hit=1; break
+        fi
+      done < <(daemon_template_names "$RUNTIME_DIR/$e")
+      [ "$own_hit" -eq 1 ] && break
+    done
+  fi
+  [ "$own_hit" -eq 1 ] && AFFECTED_OWN="$AFFECTED_OWN $label"
 done
 
 AFFECTED="$(echo "$AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+AFFECTED_OWN="$(echo "$AFFECTED_OWN" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
 
 # ga-fzfqsu: FORCE_RESTART_LABELS (delivery-runbooks.toml's daemon_restarts,
 # threaded through by the caller) forces its labels into AFFECTED
@@ -1907,6 +1975,15 @@ PY
   AFFECTED="$(echo "$NARROWED_AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
 fi
 
+# wa-flysp (header point 16): keep AFFECTED_OWN in lockstep with any
+# per-daemon narrowing just above — a label downgraded OUT of AFFECTED (its
+# own closure clean since its individually-tracked last-clean point) must
+# never survive as "own file changed" either. A plain intersection against
+# the now-final AFFECTED, correct whether or not the narrowing block above
+# even ran (its own guard can skip it entirely when DAEMON_BASELINE_OVERRIDES/
+# AFFECTED are empty — this is then a same-set no-op).
+AFFECTED_OWN="$(for l in $AFFECTED_OWN; do case " $AFFECTED " in *" $l "*) echo "$l" ;; esac; done | tr '\n' ' ' | sed 's/ $//')"
+
 if [ -z "${AFFECTED// /}" ]; then
   # ga-vmq1i: py/template files DID change but detection (a bounded entrypoint
   # + routes-hop scan — see the import-level/route-hop/template-level comments
@@ -1979,6 +2056,19 @@ already_fresh() {  # already_fresh <label> -> 0/1; sets AFR_TIER on a 0 return
   return 0
 }
 
+# wa-flysp (header point 16): partitions a label just added to GUARDED into
+# GUARDED_OWN (its own file/template is in the diff) or GUARDED_CLOSURE_ONLY
+# (reached only via a transitively-changed import/route-hop/JSON-closure
+# member) — using AFFECTED_OWN, computed once at Step 3 above. A tiny wrapper
+# so the three call sites below (drain-guard-refused, no-drain-configured,
+# safe-guard-refused) stay one line each instead of repeating the case match.
+classify_guarded() {  # classify_guarded <label>
+  case " $AFFECTED_OWN " in
+    *" $1 "*) GUARDED_OWN="$GUARDED_OWN $1" ;;
+    *) GUARDED_CLOSURE_ONLY="$GUARDED_CLOSURE_ONLY $1" ;;
+  esac
+}
+
 for label in $AFFECTED; do
   # Only refresh LONG-LIVED daemons that are running RIGHT NOW (have a live PID).
   # A discovered job with no current PID is a scheduled/one-shot agent (e.g. a
@@ -2009,6 +2099,7 @@ for label in $AFFECTED; do
       if ! guard_allows_restart "$label"; then
         log "SENSITIVE $label: guard refused — NOT draining/restarting; flagged for guarded restart."
         GUARDED="$GUARDED $label"
+        classify_guarded "$label"
         continue
       fi
       log "SENSITIVE $label: draining via \$$drain_var then restarting (guarded path)."
@@ -2027,6 +2118,7 @@ for label in $AFFECTED; do
     else
       log "SENSITIVE $label: NO drain path configured — NOT auto-bounced; flagged for guarded restart."
       GUARDED="$GUARDED $label"
+      classify_guarded "$label"
     fi
     continue
   fi
@@ -2036,6 +2128,7 @@ for label in $AFFECTED; do
   if ! guard_allows_restart "$label"; then
     log "SAFE $label: guard refused — NOT auto-bounced; flagged for guarded restart."
     GUARDED="$GUARDED $label"
+    classify_guarded "$label"
     continue
   fi
   log "SAFE $label: kickstart -k + verify fresh."
@@ -2055,6 +2148,8 @@ done
 RESTARTED="$(echo "$RESTARTED" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
 FRESH_FAIL="$(echo "$FRESH_FAIL" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
 GUARDED="$(echo "$GUARDED" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
+GUARDED_OWN="$(echo "$GUARDED_OWN" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+GUARDED_CLOSURE_ONLY="$(echo "$GUARDED_CLOSURE_ONLY" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
 ALREADY_FRESH="$(echo "$ALREADY_FRESH" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
 WOULD_RESTART="$(echo "$WOULD_RESTART" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
 
@@ -2091,10 +2186,25 @@ elif [ -n "${GUARDED// /}" ]; then
   # itself going stale (hence the regen date), and TEMPLATE/asset
   # reachability, a structurally separate mechanism this closure does not
   # track (header point 14) — "full closure" here means imports only.
+  # wa-flysp (header point 16): rank GUARDED before either REASON branch
+  # below — own-file-changed FIRST (the actionable half: the deployer should
+  # have restarted these and didn't), closure-only SECOND (known noise, same
+  # caveat as always). Renders a section even when the OTHER bucket is empty
+  # — a GUARDED list that is 100% closure-only must still show a
+  # CLOSURE-ONLY header, not silently vanish (mirrors the exact bug
+  # whatsapp_automation's own daemon_refresh_advisory.py::render_advisory()
+  # was fixed for, delivered wa-th4b1 — see its step5-ranking selftest).
+  NGR_RANKED=""
+  if [ -n "${GUARDED_OWN// /}" ]; then
+    NGR_RANKED="${NGR_RANKED} || OWN-FILE-CHANGED ($(echo "$GUARDED_OWN" | wc -w | tr -d ' ')) -- its own entrypoint/template is in THIS diff, the deployer should have restarted these and didn't, restart THESE first:${GUARDED_OWN}"
+  fi
+  if [ -n "${GUARDED_CLOSURE_ONLY// /}" ]; then
+    NGR_RANKED="${NGR_RANKED} || CLOSURE-ONLY ($(echo "$GUARDED_CLOSURE_ONLY" | wc -w | tr -d ' ')) -- only imports something that changed, its own code is untouched (known noise -- verify reachability by hand before restarting):${GUARDED_CLOSURE_ONLY}"
+  fi
   if [ -f "$DEPLOY_DEPS_JSON" ] && [ "$TOTAL_ENTRY_COUNT" -gt 0 ] && [ "$JSON_COVERED_ENTRY_COUNT" -eq "$TOTAL_ENTRY_COUNT" ]; then
-    NGR_REASON="sensitive hot-path daemon(s) need a guarded restart (import reachability for every entrypoint this run considered — ${TOTAL_ENTRY_COUNT}/${TOTAL_ENTRY_COUNT} — resolved via daemons/deploy_deps.json's real recursive closure, regenerated ${DEPLOY_DEPS_REGEN}: the bare-name/bounded-hop false-negative risk does NOT apply here. Two residual risks remain regardless: the JSON going stale since that regen date, and TEMPLATE/asset reachability, a structurally separate mechanism this closure does not track — verify those two, and still confirm a listed daemon isn't a false positive, before restarting):${GUARDED}"
+    NGR_REASON="sensitive hot-path daemon(s) need a guarded restart (import reachability for every entrypoint this run considered — ${TOTAL_ENTRY_COUNT}/${TOTAL_ENTRY_COUNT} — resolved via daemons/deploy_deps.json's real recursive closure, regenerated ${DEPLOY_DEPS_REGEN}: the bare-name/bounded-hop false-negative risk does NOT apply here. Two residual risks remain regardless: the JSON going stale since that regen date, and TEMPLATE/asset reachability, a structurally separate mechanism this closure does not track — verify those two, and still confirm a listed daemon isn't a false positive, before restarting):${GUARDED}${NGR_RANKED}"
   else
-    NGR_REASON="sensitive hot-path daemon(s) need a guarded restart (import/template-closure match, not proven reachable to the changed symbols — a listed daemon may be a false positive; this is also NOT a full transitive closure — a daemon reached only through a deeper import chain can be missing from this list entirely, a false negative — verify by hand before treating this list as complete):${GUARDED}"
+    NGR_REASON="sensitive hot-path daemon(s) need a guarded restart (import/template-closure match, not proven reachable to the changed symbols — a listed daemon may be a false positive; this is also NOT a full transitive closure — a daemon reached only through a deeper import chain can be missing from this list entirely, a false negative — verify by hand before treating this list as complete):${GUARDED}${NGR_RANKED}"
   fi
   emit NEEDS_GUARDED_RESTART "$NGR_REASON" not_verified
 elif [ -n "${RESTARTED// /}" ]; then
