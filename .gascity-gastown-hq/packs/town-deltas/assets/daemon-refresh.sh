@@ -307,6 +307,71 @@
 #      an entrypoint for it at all — see T50/T61) is classified GUARDED_OWN
 #      by construction: it is an explicit operator directive, the strongest
 #      signal this script has, never "known closure-only noise".
+#  17. (ga-8q1ulq, building on wa-th4b1) Point 16's split is still file-level:
+#      "this label's own file is in the diff" vs. "this label only imports a
+#      file that is". Measured live 18/09 on three real halts (wa-46k9n,
+#      wa-6m0ec, wa-ut5lc): even with that split, each one still left 19-29
+#      daemons with no way to tell which, if any, actually EXECUTES the
+#      changed code — a human (thies-wa) walked the call graph by hand every
+#      time, and the real answer was 1 daemon (or 0) each time (confirmed
+#      even inside GUARDED_OWN: wa-ut5lc's com.whatsapp.conversation-monitor
+#      had its own file in the diff yet was NOT among the daemons thies-wa
+#      confirmed actually call a changed symbol — an own-file change can
+#      still touch code nothing calls). The rig's own scripts/
+#      compute_symbol_reachability.py (wa-th4b1, already gate-passed and
+#      live) already answers "does this entrypoint's call graph reach a
+#      symbol that actually changed", not just "does it import the file that
+#      changed" — but nothing in this HQ copy ever called it: the WA rig's
+#      own scripts/daemon-refresh.sh wrapper and daemon_refresh_advisory.py
+#      do, but story-delivery.sh calls THIS file, which didn't (confirmed
+#      live by the Mayor on wa-th4b1: "ela nunca chama o
+#      compute_symbol_reachability.py ... só ranqueia own-file ×
+#      closure-only"). When $RUNTIME_DIR/scripts/compute_symbol_
+#      reachability.py exists, every label in GUARDED (both point-16
+#      buckets — see the conversation-monitor case above) is independently
+#      classified a THIRD way, via symbol_reachability_for():
+#        SYMBOL-CONFIRMED         — the entrypoint's call graph reaches a
+#                                   symbol that changed in this window
+#                                   (via=direct or via=graph).
+#        SEM EVIDÊNCIA DE SÍMBOLO — ran cleanly, found no such path (still
+#                                   just import-closure noise; same caveat as
+#                                   CLOSURE-ONLY — not a full transitive
+#                                   closure, a false negative can hide here).
+#        NÃO CALCULADO            — the subprocess gave no usable answer
+#                                   (nonzero exit, per-daemon or total-budget
+#                                   timeout, or output that did not parse as
+#                                   the expected JSON). NEVER folded into SEM
+#                                   EVIDÊNCIA — an unanswered question is not
+#                                   a negative answer (the same distinction
+#                                   PROOF's not_verified already draws for
+#                                   the verdict as a whole, applied here per
+#                                   daemon).
+#      Presentation/attribution only, exactly like point 16: NEVER changes
+#      VERDICT, NEVER removes a label from GUARDED or moves it between
+#      GUARDED_OWN/GUARDED_CLOSURE_ONLY — only adds an independent, always-
+#      present-even-empty third split (GUARDED_SYMBOL_CONFIRMED/_NO_EVIDENCE/
+#      _NOT_COMPUTED) and a matching REASON section, rendered after the
+#      point-16 sections. Window: prefers BEAD_MERGE_PRE_SHA/BEAD_MERGE_SHA
+#      (this bead's own attribution range, point 14/ga-agracx) over the wider
+#      PRE_DEPLOY_SHA/POST_DEPLOY_SHA when the same ancestor-guard used there
+#      passes — a narrower, more relevant diff makes for a more precise
+#      reachability answer, the same reason attribution prefers it elsewhere
+#      in this file. Closure: the entrypoint's real deploy_deps.json closure
+#      (point 14) when covered, else the full $CHANGED_PY set — coarser, but
+#      Step 3's ad-hoc matching (direct/import-stem/routes-hop) does not
+#      retain which specific changed file triggered a given label, and
+#      threading that through its exactly-tuned branches is out of scope
+#      here (see json_closure_for_entry()'s call site in
+#      symbol_reachability_for()). A same-named-function collision this
+#      coarser closure can invite is the underlying tool's own documented,
+#      accepted bias — it promotes toward SYMBOL-CONFIRMED rather than
+#      hiding a real one. A rig without the script behaves identically to
+#      today, no error: SYMBOL_SCRIPT simply doesn't exist, the whole block
+#      is skipped, and all three new fields stay empty. Bounded cost:
+#      SYMBOL_REACHABILITY_TIMEOUT per daemon, SYMBOL_REACHABILITY_TOTAL_
+#      TIMEOUT for the whole batch — either one tripping degrades the
+#      remaining daemon(s) to NÃO CALCULADO rather than stalling the halt
+#      (the caller already wraps this whole script in `timeout 180`).
 #
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
@@ -355,6 +420,12 @@
 #     neither. OWN = this label's own entrypoint file/template is itself in
 #     the diff. CLOSURE_ONLY = flagged only via a transitively-changed import/
 #     route-hop/JSON-closure member, its own file untouched.)
+#   GUARDED_SYMBOL_CONFIRMED=<labels>   GUARDED_SYMBOL_NO_EVIDENCE=<labels>
+#     GUARDED_SYMBOL_NOT_COMPUTED=<labels>   (ga-8q1ulq, header point 17: a
+#     THIRD, independent split of GUARDED, orthogonal to GUARDED_OWN/
+#     GUARDED_CLOSURE_ONLY above — not a subdivision of either bucket. Always
+#     present, even empty. All three stay empty when $RUNTIME_DIR/scripts/
+#     compute_symbol_reachability.py does not exist.)
 #   WOULD_RESTART=<labels>   (ga-omfwe: DRY_RUN=1 only — labels that would be
 #     restarted for real; RESTARTED is always empty under DRY_RUN=1, so the
 #     two never collapse into the same string)
@@ -399,6 +470,11 @@
 #   PS_BIN            (default ps)
 #   VERIFY_TIMEOUT    seconds to wait for a fresh process (default 20)
 #   VERIFY_INTERVAL   poll interval seconds (default 1)
+#   SYMBOL_REACHABILITY_TIMEOUT   seconds per daemon for compute_symbol_
+#                     reachability.py (default 5; ga-8q1ulq, header point 17)
+#   SYMBOL_REACHABILITY_TOTAL_TIMEOUT   seconds for the whole GUARDED batch
+#                     (default 30; same point) — either budget tripping
+#                     degrades the remaining daemon(s) to NÃO CALCULADO.
 
 set -uo pipefail
 
@@ -437,6 +513,12 @@ DRY_RUN="${DRY_RUN:-0}"
 LAUNCH_AGENTS_DIR="${LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 LAUNCHCTL_BIN="${LAUNCHCTL_BIN:-launchctl}"
 PS_BIN="${PS_BIN:-ps}"
+# ga-8q1ulq (header point 17): bounds the cost of the new per-GUARDED-label
+# symbol-reachability subprocess call — a rig-side git-show-heavy AST walk,
+# not a cheap check. Either budget tripping degrades the affected daemon(s)
+# to NÃO CALCULADO, never blocks the halt past it.
+SYMBOL_REACHABILITY_TIMEOUT="${SYMBOL_REACHABILITY_TIMEOUT:-5}"
+SYMBOL_REACHABILITY_TOTAL_TIMEOUT="${SYMBOL_REACHABILITY_TOTAL_TIMEOUT:-30}"
 VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-20}"
 VERIFY_INTERVAL="${VERIFY_INTERVAL:-1}"
 
@@ -607,6 +689,13 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   # every label in GUARDED is in exactly one of these two, never both.
   echo "GUARDED_OWN=${GUARDED_OWN:-}"
   echo "GUARDED_CLOSURE_ONLY=${GUARDED_CLOSURE_ONLY:-}"
+  # ga-8q1ulq (header point 17): a THIRD, independent split of GUARDED —
+  # always present, even empty, same convention as GUARDED_OWN/
+  # GUARDED_CLOSURE_ONLY above. All three stay empty when the rig has no
+  # compute_symbol_reachability.py.
+  echo "GUARDED_SYMBOL_CONFIRMED=${GUARDED_SYMBOL_CONFIRMED:-}"
+  echo "GUARDED_SYMBOL_NO_EVIDENCE=${GUARDED_SYMBOL_NO_EVIDENCE:-}"
+  echo "GUARDED_SYMBOL_NOT_COMPUTED=${GUARDED_SYMBOL_NOT_COMPUTED:-}"
   echo "ALREADY_FRESH=${ALREADY_FRESH:-}"
   echo "WOULD_RESTART=${WOULD_RESTART:-}"
   # ga-tdzsh: always present (even on the early-precondition emits above,
@@ -624,15 +713,17 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   # same convention as PARSE_ERROR_LOADED/UNLOADED above.
   echo "UNATTRIBUTED_JOB_GAP=${SJ_UNATTRIBUTED_REASON:-}"
   # Trailing JSON for the caller's bead comment / jsonl log.
-  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" "${AFFECTED_NOT_RUNNING:-}" "${GUARDED_OWN:-}" "${GUARDED_CLOSURE_ONLY:-}" <<'PY' 2>/dev/null || true
+  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" "${AFFECTED_NOT_RUNNING:-}" "${GUARDED_OWN:-}" "${GUARDED_CLOSURE_ONLY:-}" "${GUARDED_SYMBOL_CONFIRMED:-}" "${GUARDED_SYMBOL_NO_EVIDENCE:-}" "${GUARDED_SYMBOL_NOT_COMPUTED:-}" <<'PY' 2>/dev/null || true
 import json, sys
-v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg, anr, gd_own, gd_co = sys.argv[1:16]
+v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg, anr, gd_own, gd_co, gd_sc, gd_sne, gd_snc = sys.argv[1:19]
 sp = lambda s: [x for x in s.split() if x]
 print("JSON=" + json.dumps({
     "verdict": v, "reason": reason,
     "affected": sp(aff), "affected_not_running": sp(anr), "restarted": sp(res),
     "fresh_fail": sp(ff), "guarded": sp(gd), "proof": proof,
     "guarded_own": sp(gd_own), "guarded_closure_only": sp(gd_co),
+    "guarded_symbol_confirmed": sp(gd_sc), "guarded_symbol_no_evidence": sp(gd_sne),
+    "guarded_symbol_not_computed": sp(gd_snc),
     "already_fresh": sp(afr), "would_restart": sp(wr),
     "parse_error_loaded": sp(pel), "parse_error_unloaded": sp(peu),
     "unattributed_job_gap": ujg,
@@ -647,6 +738,10 @@ AFFECTED=""; RESTARTED=""; FRESH_FAIL=""; GUARDED=""; ALREADY_FRESH=""; WOULD_RE
 # labels' own file/template changed); GUARDED_OWN/GUARDED_CLOSURE_ONLY
 # partition GUARDED the same way, built from it at Step 4 below.
 AFFECTED_OWN=""; GUARDED_OWN=""; GUARDED_CLOSURE_ONLY=""
+# ga-8q1ulq (header point 17): a THIRD, independent split of GUARDED, built
+# lazily in Step 5 (not here at Step 3/4, unlike GUARDED_OWN/
+# GUARDED_CLOSURE_ONLY) — see symbol_reachability_for()'s call site.
+GUARDED_SYMBOL_CONFIRMED=""; GUARDED_SYMBOL_NO_EVIDENCE=""; GUARDED_SYMBOL_NOT_COMPUTED=""
 # wa-xokje: subset of AFFECTED that Step 4 below finds has no live PID at all
 # (a scheduled/one-shot job or an already-down daemon) — never kickstarted,
 # never a restart candidate, and — unlike a live daemon — cannot be made
@@ -1552,6 +1647,11 @@ daemon_imports_stem_via_routes() {  # daemon_imports_stem_via_routes <entrypoint
 # filtering here would be a no-op at best, and one more place for the two
 # filters to silently drift apart at worst.
 DEPLOY_DEPS_JSON="$RUNTIME_DIR/daemons/deploy_deps.json"
+# ga-8q1ulq (header point 17): rig-owned symbol-reachability CLI (wa-th4b1) —
+# generic, never vendored/reimplemented here. Its mere presence gates the
+# whole ranking layer in Step 5 below (point 17's own item 3: absent =
+# today's exact behavior, no error).
+SYMBOL_SCRIPT="$RUNTIME_DIR/scripts/compute_symbol_reachability.py"
 JSON_KNOWN_ENTRYPOINTS=""
 JSON_AFFECTED_ENTRYPOINTS=""
 if [ -f "$DEPLOY_DEPS_JSON" ]; then
@@ -1617,6 +1717,30 @@ json_covers_entry() {  # json_covers_entry <entrypoint-relpath>
 # this deploy's changed files?
 json_entry_affected() {  # json_entry_affected <entrypoint-relpath>
   case " $JSON_AFFECTED_ENTRYPOINTS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+# closure paths (one per line) deploy_deps.json has for <entrypoint-relpath>,
+# or nothing if it doesn't cover that entry or the file can't be read.
+# (ga-8q1ulq, header point 17) Re-reads the file rather than reusing
+# DDJ_LINES above: DDJ_LINES only ever kept path MEMBERSHIP (K:/A:), never
+# the closure LISTS themselves, and only entries that end up GUARDED (a
+# small subset of JSON_KNOWN_ENTRYPOINTS) ever need their closure — reading
+# those few here, lazily, is cheaper than carrying every entry's full
+# closure through the whole run whether or not it is ever used.
+json_closure_for_entry() {  # json_closure_for_entry <entrypoint-relpath>
+  [ -f "$DEPLOY_DEPS_JSON" ] || return 1
+  python3 - "$DEPLOY_DEPS_JSON" "$1" <<'PY' 2>/dev/null
+import json, sys
+try:
+    daemons = json.load(open(sys.argv[1], encoding="utf-8"))["daemons"]
+    entry = daemons.get(sys.argv[2])
+except Exception:
+    sys.exit(1)
+if not isinstance(entry, dict):
+    sys.exit(1)
+for p in entry.get("closure") or []:
+    if isinstance(p, str):
+        print(p)
+PY
 }
 
 # ── Step 3: resolve affected daemons ──────────────────────────────────────────
@@ -2085,6 +2209,92 @@ classify_guarded() {  # classify_guarded <label>
   esac
 }
 
+# ga-8q1ulq (header point 17): does <label>'s entrypoint call graph reach a
+# symbol that changed in [$SYMREACH_BEFORE, $SYMREACH_AFTER]? Delegates to
+# the rig's own compute_symbol_reachability.py (wa-th4b1) — never
+# reimplemented here, same "consult the rig, don't vendor a second copy"
+# choice deploy_deps.json consultation already makes above. Only called from
+# Step 5, lazily, for labels already in GUARDED — never during Step 3/4 — so
+# the cost is paid only on a run that is actually about to render a
+# NEEDS_GUARDED_RESTART halt. Sets SYMREACH_STATE to one of confirmed |
+# no_evidence | not_computed and, only when confirmed, SYMREACH_VIA/
+# SYMREACH_PATH (diagnostic detail — logged, not rendered into REASON, same
+# bare-label-list convention GUARDED_OWN/GUARDED_CLOSURE_ONLY already use).
+symbol_reachability_for() {  # symbol_reachability_for <label>
+  local label="$1" entries entry e c out rc parsed
+  entries="$(cat "$DISCO_DIR/$label" 2>/dev/null || true)"
+  entry=""
+  for e in $entries; do entry="$e"; break; done
+  SYMREACH_VIA=""; SYMREACH_PATH=""
+  if [ -z "$entry" ]; then
+    # A FORCE_RESTART_LABELS entry (points 5/16): Step 2 never resolved an
+    # entrypoint for it at all, so there is no file to point the AST parser
+    # at. Same tri-state honesty as everywhere else here: unknown, not "no
+    # evidence".
+    SYMREACH_STATE="not_computed"
+    log "symbol-reachability $label: no resolved entrypoint — NÃO CALCULADO, ranking unaffected."
+    return 0
+  fi
+
+  set -- --repo "$RUNTIME_DIR" --entrypoint "$entry"
+  for e in $entries; do
+    [ "$e" = "$entry" ] && continue
+    set -- "$@" --closure "$e"
+  done
+  if json_covers_entry "$entry"; then
+    while IFS= read -r c; do
+      [ -n "$c" ] && set -- "$@" --closure "$c"
+    done < <(json_closure_for_entry "$entry")
+  else
+    # ad-hoc tier (header point 17): no deploy_deps.json closure for this
+    # entrypoint. Coarser fallback — the full changed-.py set, not just what
+    # this label actually imports — deliberately, rather than threading a
+    # new per-label "which changed file triggered this" tracker through
+    # Step 3's exactly-tuned ad-hoc branches (a fully independent, read-only
+    # addition, same boundary point 16 already established for AFFECTED_OWN).
+    while IFS= read -r c; do
+      [ -n "$c" ] && set -- "$@" --closure "$c"
+    done < <(printf '%s\n' "$CHANGED_PY")
+  fi
+  set -- "$@" --before "$SYMREACH_BEFORE" --after "$SYMREACH_AFTER"
+
+  out="$(timeout "$SYMBOL_REACHABILITY_TIMEOUT" python3 "$SYMBOL_SCRIPT" "$@" 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    SYMREACH_STATE="not_computed"
+    log "symbol-reachability $label ($entry): compute_symbol_reachability.py did not return an answer (exit $rc, timeout=${SYMBOL_REACHABILITY_TIMEOUT}s) — NÃO CALCULADO, ranking unaffected."
+    return 0
+  fi
+  parsed="$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    r = d.get("reaches")
+except Exception:
+    r = None
+if r is True:
+    print("STATE:confirmed")
+    print("VIA:" + (d.get("via") or ""))
+    print("PATH:" + ",".join(d.get("path") or []))
+elif r is False:
+    print("STATE:no_evidence")
+else:
+    print("STATE:not_computed")
+' 2>/dev/null)"
+  SYMREACH_STATE="$(printf '%s\n' "$parsed" | sed -n 's/^STATE://p')"
+  case "$SYMREACH_STATE" in
+    confirmed)
+      SYMREACH_VIA="$(printf '%s\n' "$parsed" | sed -n 's/^VIA://p')"
+      SYMREACH_PATH="$(printf '%s\n' "$parsed" | sed -n 's/^PATH://p')"
+      ;;
+    no_evidence) ;;
+    *)
+      SYMREACH_STATE="not_computed"
+      log "symbol-reachability $label ($entry): compute_symbol_reachability.py returned output that did not parse as the expected JSON — NÃO CALCULADO, ranking unaffected."
+      ;;
+  esac
+}
+
 for label in $AFFECTED; do
   # Only refresh LONG-LIVED daemons that are running RIGHT NOW (have a live PID).
   # A discovered job with no current PID is a scheduled/one-shot agent (e.g. a
@@ -2216,6 +2426,55 @@ elif [ -n "${GUARDED// /}" ]; then
   fi
   if [ -n "${GUARDED_CLOSURE_ONLY// /}" ]; then
     NGR_RANKED="${NGR_RANKED} || CLOSURE-ONLY ($(echo "$GUARDED_CLOSURE_ONLY" | wc -w | tr -d ' ')) -- only imports something that changed, its own code is untouched (known noise -- verify reachability by hand before restarting):${GUARDED_CLOSURE_ONLY}"
+  fi
+  # ga-8q1ulq (header point 17): a THIRD, independent ranking pass — symbol
+  # (not file) level — only when the rig has the calculator, only up to the
+  # time budget below. Rendered AFTER the point-16 sections above, never
+  # instead of them. Lazy on purpose: this loop's subprocess calls are the
+  # single most expensive thing this script does, so they only ever run on
+  # a batch that is actually about to render a NEEDS_GUARDED_RESTART halt.
+  if [ -f "$SYMBOL_SCRIPT" ]; then
+    SYMREACH_BEFORE="$PRE_DEPLOY_SHA"; SYMREACH_AFTER="$POST_DEPLOY_SHA"
+    # Prefer this bead's own attribution range over the wider deploy window
+    # when it's available and trustworthy — same ancestor-guard chain
+    # ga-agracx already established (point 14) for the same reason: a
+    # narrower, more relevant diff makes for a more precise answer.
+    if [ -n "$BEAD_MERGE_PRE_SHA" ] && [ -n "$BEAD_MERGE_SHA" ] \
+       && [ "$BEAD_MERGE_PRE_SHA" != "$BEAD_MERGE_SHA" ] \
+       && git -C "$RUNTIME_DIR" rev-parse --verify -q "$BEAD_MERGE_PRE_SHA" >/dev/null 2>&1 \
+       && git -C "$RUNTIME_DIR" rev-parse --verify -q "$BEAD_MERGE_SHA" >/dev/null 2>&1 \
+       && git -C "$RUNTIME_DIR" merge-base --is-ancestor "$BEAD_MERGE_PRE_SHA" "$BEAD_MERGE_SHA" 2>/dev/null; then
+      SYMREACH_BEFORE="$BEAD_MERGE_PRE_SHA"; SYMREACH_AFTER="$BEAD_MERGE_SHA"
+    fi
+    SR_BUDGET_START=$SECONDS
+    for label in $GUARDED; do
+      if [ $((SECONDS - SR_BUDGET_START)) -ge "$SYMBOL_REACHABILITY_TOTAL_TIMEOUT" ]; then
+        GUARDED_SYMBOL_NOT_COMPUTED="$GUARDED_SYMBOL_NOT_COMPUTED $label"
+        log "symbol-reachability $label: skipped — total budget (${SYMBOL_REACHABILITY_TOTAL_TIMEOUT}s) already spent on earlier daemons this run — NÃO CALCULADO, ranking unaffected."
+        continue
+      fi
+      symbol_reachability_for "$label"
+      case "$SYMREACH_STATE" in
+        confirmed)
+          GUARDED_SYMBOL_CONFIRMED="$GUARDED_SYMBOL_CONFIRMED $label"
+          log "symbol-reachability $label: CONFIRMED (via=$SYMREACH_VIA${SYMREACH_PATH:+, path=$SYMREACH_PATH})."
+          ;;
+        no_evidence) GUARDED_SYMBOL_NO_EVIDENCE="$GUARDED_SYMBOL_NO_EVIDENCE $label" ;;
+        *)           GUARDED_SYMBOL_NOT_COMPUTED="$GUARDED_SYMBOL_NOT_COMPUTED $label" ;;
+      esac
+    done
+    GUARDED_SYMBOL_CONFIRMED="$(echo "$GUARDED_SYMBOL_CONFIRMED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+    GUARDED_SYMBOL_NO_EVIDENCE="$(echo "$GUARDED_SYMBOL_NO_EVIDENCE" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+    GUARDED_SYMBOL_NOT_COMPUTED="$(echo "$GUARDED_SYMBOL_NOT_COMPUTED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+    if [ -n "${GUARDED_SYMBOL_CONFIRMED// /}" ]; then
+      NGR_RANKED="${NGR_RANKED} || SYMBOL-CONFIRMED ($(echo "$GUARDED_SYMBOL_CONFIRMED" | wc -w | tr -d ' ')) -- entrypoint's call graph reaches a symbol that changed in this window (wa-th4b1), restart THESE first:${GUARDED_SYMBOL_CONFIRMED}"
+    fi
+    if [ -n "${GUARDED_SYMBOL_NO_EVIDENCE// /}" ]; then
+      NGR_RANKED="${NGR_RANKED} || SEM EVIDÊNCIA DE SÍMBOLO ($(echo "$GUARDED_SYMBOL_NO_EVIDENCE" | wc -w | tr -d ' ')) -- imports what changed, no call-graph path found to a changed symbol (not a full transitive closure -- verify by hand):${GUARDED_SYMBOL_NO_EVIDENCE}"
+    fi
+    if [ -n "${GUARDED_SYMBOL_NOT_COMPUTED// /}" ]; then
+      NGR_RANKED="${NGR_RANKED} || NÃO CALCULADO ($(echo "$GUARDED_SYMBOL_NOT_COMPUTED" | wc -w | tr -d ' ')) -- compute_symbol_reachability.py gave no usable answer for these (error/timeout/unparseable output) -- absence of evidence is not evidence of absence, verify by hand:${GUARDED_SYMBOL_NOT_COMPUTED}"
+    fi
   fi
   if [ -f "$DEPLOY_DEPS_JSON" ] && [ "$TOTAL_ENTRY_COUNT" -gt 0 ] && [ "$JSON_COVERED_ENTRY_COUNT" -eq "$TOTAL_ENTRY_COUNT" ]; then
     NGR_REASON="sensitive hot-path daemon(s) need a guarded restart (import reachability for every entrypoint this run considered — ${TOTAL_ENTRY_COUNT}/${TOTAL_ENTRY_COUNT} — resolved via daemons/deploy_deps.json's real recursive closure, regenerated ${DEPLOY_DEPS_REGEN}: the bare-name/bounded-hop false-negative risk does NOT apply here. Two residual risks remain regardless: the JSON going stale since that regen date, and TEMPLATE/asset reachability, a structurally separate mechanism this closure does not track — verify those two, and still confirm a listed daemon isn't a false positive, before restarting):${GUARDED}${NGR_RANKED}"

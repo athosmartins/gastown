@@ -99,6 +99,20 @@
 #      than silently omitting the split (T58, mirrors the exact bug class
 #      whatsapp_automation's own daemon_refresh_advisory.py::render_advisory()
 #      was fixed for).
+#  16. (ga-8q1ulq) When $RUNTIME_DIR/scripts/compute_symbol_reachability.py
+#      exists, every label in GUARDED is independently classified a THIRD
+#      way — SYMBOL-CONFIRMED (T62), SEM EVIDÊNCIA DE SÍMBOLO (T63), or NÃO
+#      CALCULADO (T64, a subprocess crash — NEVER folded into "no evidence").
+#      A mixed batch renders all three sections, in that order, without
+#      changing VERDICT or GUARDED membership (T66). A rig without the
+#      script behaves identically to today — no new section, all three new
+#      fields empty (T65). A per-daemon timeout (T67) or an exhausted total
+#      budget (T68) both degrade to NÃO CALCULADO rather than stalling the
+#      halt. The window prefers BEAD_MERGE_PRE_SHA/BEAD_MERGE_SHA over the
+#      wider PRE_DEPLOY_SHA/POST_DEPLOY_SHA when the point-14 ancestor-guard
+#      passes (T69) — a stub compute_symbol_reachability.py records its own
+#      argv so these tests can assert on --before/--after directly, not just
+#      the classification outcome.
 #
 # All external effects (launchctl, ps) are injected via LAUNCHCTL_BIN / PS_BIN
 # and a mock state dir, so the test touches NO real daemons. The plist scan and
@@ -238,6 +252,60 @@ seed_loaded() {  # seed_loaded <label>
   : > "$MOCK/loaded.$1"
 }
 
+# ga-8q1ulq: a stub compute_symbol_reachability.py, CLI-compatible with the
+# real one (--repo/--entrypoint/--closure*/--before/--after, one JSON object
+# on stdout) but driven by a control file per <entrypoint-relpath> instead of
+# real AST analysis — the underlying algorithm is wa-th4b1's own tested
+# concern, not this HQ integration's. Reads $MOCK_DIR the same way the
+# launchctl/ps mocks above do (inherited from run_helper's exported
+# MOCK_DIR, no extra wiring). Also records its own argv per entrypoint so
+# tests can assert on --closure/--before/--after directly (T69).
+make_symbol_script() {  # make_symbol_script <runtime-dir>
+  mkdir -p "$1/scripts"
+  cat > "$1/scripts/compute_symbol_reachability.py" <<'PYEOF'
+#!/usr/bin/env python3
+import argparse, json, os, sys, time
+ap = argparse.ArgumentParser()
+ap.add_argument("--repo", default="")
+ap.add_argument("--entrypoint", required=True)
+ap.add_argument("--closure", action="append", default=[])
+ap.add_argument("--before", required=True)
+ap.add_argument("--after", required=True)
+args = ap.parse_args()
+mock = os.environ.get("MOCK_DIR", "")
+sanitized = args.entrypoint.replace("/", "_")
+if mock:
+    with open(os.path.join(mock, "symbol_argv." + sanitized), "w") as f:
+        json.dump(vars(args), f)
+mode = "no_evidence"
+ctrl = os.path.join(mock, "symbol_mode." + sanitized) if mock else ""
+if ctrl and os.path.exists(ctrl):
+    with open(ctrl) as f:
+        mode = f.read().strip()
+if mode == "confirmed":
+    print(json.dumps({"reaches": True, "via": "direct", "path": ["handler"], "changed_symbols": ["handler"], "warnings": []}))
+elif mode == "confirmed_graph":
+    print(json.dumps({"reaches": True, "via": "graph", "path": ["entry", "mid", "handler"], "changed_symbols": ["handler"], "warnings": []}))
+elif mode == "no_evidence":
+    print(json.dumps({"reaches": False, "via": None, "path": [], "changed_symbols": ["other"], "warnings": []}))
+elif mode == "crash":
+    sys.exit(1)
+elif mode == "hang":
+    time.sleep(20)
+elif mode == "badjson":
+    print("not valid json")
+sys.exit(0)
+PYEOF
+  chmod +x "$1/scripts/compute_symbol_reachability.py"
+}
+# seed_symbol_result <entrypoint-relpath> <mode>  — mode is one of
+# confirmed|confirmed_graph|no_evidence|crash|hang|badjson (default when
+# unseeded: no_evidence).
+seed_symbol_result() {
+  local sanitized="${1//\//_}"
+  echo "$2" > "$MOCK/symbol_mode.$sanitized"
+}
+
 run_helper() {  # run_helper <changed-relpaths...>  (commits a deploy diff first)
   # PRE = current HEAD; mutate the listed files; POST = new HEAD.
   ( cd "$RUNTIME"
@@ -260,6 +328,7 @@ run_helper() {  # run_helper <changed-relpaths...>  (commits a deploy diff first
   MOCK_DIR="$MOCK" \
   RUNTIME_DIR="$RUNTIME" \
   PRE_DEPLOY_SHA="$PRE" POST_DEPLOY_SHA="$POST" \
+  BEAD_MERGE_PRE_SHA="${BEAD_MERGE_PRE_SHA:-}" BEAD_MERGE_SHA="${BEAD_MERGE_SHA:-}" \
   DEPLOY_EPOCH="$DEPLOY_EPOCH" \
   SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
   EXTRA_RUNTIME_ROOTS="${EXTRA_RUNTIME_ROOTS:-}" \
@@ -267,6 +336,8 @@ run_helper() {  # run_helper <changed-relpaths...>  (commits a deploy diff first
   LAUNCH_AGENTS_DIR="$AGENTS" \
   LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" \
   VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
+  SYMBOL_REACHABILITY_TIMEOUT="${SYMBOL_REACHABILITY_TIMEOUT:-2}" \
+  SYMBOL_REACHABILITY_TOTAL_TIMEOUT="${SYMBOL_REACHABILITY_TOTAL_TIMEOUT:-10}" \
   DRY_RUN="${DRY_RUN:-0}" \
   bash "$HELPER" 2>/dev/null
 }
@@ -2356,6 +2427,233 @@ V=$(field VERDICT "$OUT")
 echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender-forced" && ok "T61 forced-in daemon still in flat GUARDED" || nok "T61 guarded" "$(field GUARDED "$OUT")"
 echo "$(field GUARDED_OWN "$OUT")" | grep -q "com.test.central-sender-forced" && ok "T61 FORCE_RESTART_LABELS entry classified GUARDED_OWN, not closure-only noise" || nok "T61 guarded_own" "$(field GUARDED_OWN "$OUT")"
 echo "$(field GUARDED_CLOSURE_ONLY "$OUT")" | grep -q "com.test.central-sender-forced" && nok "T61 must NOT be in GUARDED_CLOSURE_ONLY" "$(field GUARDED_CLOSURE_ONLY "$OUT")" || ok "T61 correctly excluded from GUARDED_CLOSURE_ONLY"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T62 (ga-8q1ulq, header point 17): rig HAS compute_symbol_reachability.py,
+# and it reports reaches=true for the one GUARDED daemon -> SYMBOL-CONFIRMED.
+# ════════════════════════════════════════════════════════════════════════════
+SENSITIVE_DAEMONS="central-sender"
+new_case t62
+make_symbol_script "$RUNTIME"
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+seed_running com.test.central-sender 62001 "$STALE_LSTART"
+seed_symbol_result daemons/central_sender.py confirmed
+OUT=$(run_helper daemons/central_sender.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T62 verdict NEEDS_GUARDED_RESTART" || nok "T62 verdict" "got '$V' out=[$OUT]"
+echo "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")" | grep -q "com.test.central-sender" && ok "T62 lands in GUARDED_SYMBOL_CONFIRMED" || nok "T62 guarded_symbol_confirmed" "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")"
+[ -z "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" ] && ok "T62 GUARDED_SYMBOL_NO_EVIDENCE empty" || nok "T62 guarded_symbol_no_evidence" "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")"
+[ -z "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" ] && ok "T62 GUARDED_SYMBOL_NOT_COMPUTED empty" || nok "T62 guarded_symbol_not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
+echo "$(field REASON "$OUT")" | grep -q "SYMBOL-CONFIRMED" && ok "T62 REASON renders a SYMBOL-CONFIRMED section" || nok "T62 reason" "$(field REASON "$OUT")"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T63 (ga-8q1ulq, header point 17): same shape as T62, but the calculator
+# reports reaches=false (no evidence of a call-graph path) -> SEM EVIDÊNCIA
+# DE SÍMBOLO, never silently promoted to SYMBOL-CONFIRMED.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t63
+make_symbol_script "$RUNTIME"
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+seed_running com.test.central-sender 63001 "$STALE_LSTART"
+seed_symbol_result daemons/central_sender.py no_evidence
+OUT=$(run_helper daemons/central_sender.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T63 verdict NEEDS_GUARDED_RESTART" || nok "T63 verdict" "got '$V' out=[$OUT]"
+echo "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" | grep -q "com.test.central-sender" && ok "T63 lands in GUARDED_SYMBOL_NO_EVIDENCE" || nok "T63 guarded_symbol_no_evidence" "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")"
+[ -z "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")" ] && ok "T63 GUARDED_SYMBOL_CONFIRMED empty" || nok "T63 guarded_symbol_confirmed" "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")"
+[ -z "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" ] && ok "T63 GUARDED_SYMBOL_NOT_COMPUTED empty" || nok "T63 guarded_symbol_not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
+echo "$(field REASON "$OUT")" | grep -q "SEM EVIDÊNCIA DE SÍMBOLO" && ok "T63 REASON renders a SEM EVIDÊNCIA DE SÍMBOLO section" || nok "T63 reason" "$(field REASON "$OUT")"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T64 (ga-8q1ulq, header point 17 / ACEITE item 2): the calculator subprocess
+# CRASHES (nonzero exit) for the one GUARDED daemon -> NÃO CALCULADO. Must
+# NEVER be folded into SEM EVIDÊNCIA DE SÍMBOLO (a crash is not a negative
+# answer), and must NEVER change VERDICT or pull the label out of the flat
+# GUARDED list — this layer only reorders/annotates.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t64
+make_symbol_script "$RUNTIME"
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+seed_running com.test.central-sender 64001 "$STALE_LSTART"
+seed_symbol_result daemons/central_sender.py crash
+OUT=$(run_helper daemons/central_sender.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T64 verdict still NEEDS_GUARDED_RESTART (unaffected by the crash)" || nok "T64 verdict" "got '$V' out=[$OUT]"
+echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" && ok "T64 label still in flat GUARDED (membership unaffected)" || nok "T64 guarded" "$(field GUARDED "$OUT")"
+echo "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" | grep -q "com.test.central-sender" && ok "T64 lands in GUARDED_SYMBOL_NOT_COMPUTED" || nok "T64 guarded_symbol_not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
+[ -z "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" ] && ok "T64 NOT folded into GUARDED_SYMBOL_NO_EVIDENCE" || nok "T64 guarded_symbol_no_evidence must be empty" "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")"
+[ -z "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")" ] && ok "T64 GUARDED_SYMBOL_CONFIRMED empty" || nok "T64 guarded_symbol_confirmed" "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")"
+echo "$(field REASON "$OUT")" | grep -q "NÃO CALCULADO" && ok "T64 REASON renders a NÃO CALCULADO section" || nok "T64 reason" "$(field REASON "$OUT")"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T65 (ga-8q1ulq, header point 17 / ACEITE item 3): a rig WITHOUT
+# scripts/compute_symbol_reachability.py behaves identically to today — no
+# error, no new REASON section, all three new fields stay empty. Same
+# fixture shape as T62-64, just never calls make_symbol_script.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t65
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+seed_running com.test.central-sender 65001 "$STALE_LSTART"
+OUT=$(run_helper daemons/central_sender.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T65 verdict NEEDS_GUARDED_RESTART" || nok "T65 verdict" "got '$V' out=[$OUT]"
+[ -z "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")" ] && ok "T65 GUARDED_SYMBOL_CONFIRMED empty (no calculator on this rig)" || nok "T65 guarded_symbol_confirmed" "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")"
+[ -z "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" ] && ok "T65 GUARDED_SYMBOL_NO_EVIDENCE empty" || nok "T65 guarded_symbol_no_evidence" "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")"
+[ -z "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" ] && ok "T65 GUARDED_SYMBOL_NOT_COMPUTED empty" || nok "T65 guarded_symbol_not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
+R65="$(field REASON "$OUT")"
+echo "$R65" | grep -qE "SYMBOL-CONFIRMED|SEM EVIDÊNCIA DE SÍMBOLO|NÃO CALCULADO" && nok "T65 REASON must NOT mention any symbol-ranking section" "$R65" || ok "T65 no symbol-ranking section in REASON"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T66 (ga-8q1ulq, header point 17): a MIXED GUARDED batch — one CONFIRMED,
+# one NO_EVIDENCE, one CRASHED (NOT_COMPUTED) — all three sections must
+# render, in that order, and VERDICT/flat-GUARDED membership stay exactly
+# what point 16 alone would have produced (this layer only reorders/
+# annotates). Also checks the trailing JSON, not just the KEY=value lines.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t66
+make_symbol_script "$RUNTIME"
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+cat > "$RUNTIME/daemons/slot_scheduler.py" <<<'print("slot")'
+cat > "$RUNTIME/daemons/conversation_monitor.py" <<<'print("conv")'
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+make_plist "$AGENTS" com.test.slot-scheduler "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/slot_scheduler.py"
+make_plist "$AGENTS" com.test.conversation-monitor "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/conversation_monitor.py"
+seed_running com.test.central-sender 66001 "$STALE_LSTART"
+seed_running com.test.slot-scheduler 66101 "$STALE_LSTART"
+seed_running com.test.conversation-monitor 66201 "$STALE_LSTART"
+seed_symbol_result daemons/central_sender.py confirmed
+seed_symbol_result daemons/slot_scheduler.py no_evidence
+seed_symbol_result daemons/conversation_monitor.py crash
+SENSITIVE_DAEMONS="central-sender slot-scheduler conversation-monitor"
+OUT=$(run_helper daemons/central_sender.py daemons/slot_scheduler.py daemons/conversation_monitor.py); RC=$?
+SENSITIVE_DAEMONS="central-sender"
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T66 verdict NEEDS_GUARDED_RESTART" || nok "T66 verdict" "got '$V' out=[$OUT]"
+for l in com.test.central-sender com.test.slot-scheduler com.test.conversation-monitor; do
+  echo "$(field GUARDED "$OUT")" | grep -q "$l" && ok "T66 $l still in flat GUARDED" || nok "T66 guarded $l" "$(field GUARDED "$OUT")"
+done
+echo "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")" | grep -q "com.test.central-sender" && ok "T66 central-sender in GUARDED_SYMBOL_CONFIRMED" || nok "T66 confirmed" "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")"
+echo "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" | grep -q "com.test.slot-scheduler" && ok "T66 slot-scheduler in GUARDED_SYMBOL_NO_EVIDENCE" || nok "T66 no_evidence" "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")"
+echo "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" | grep -q "com.test.conversation-monitor" && ok "T66 conversation-monitor in GUARDED_SYMBOL_NOT_COMPUTED" || nok "T66 not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
+R66="$(field REASON "$OUT")"
+CONF_POS="${R66%%SYMBOL-CONFIRMED*}"
+NOEV_POS="${R66%%SEM EVIDÊNCIA DE SÍMBOLO*}"
+NC_POS="${R66%%NÃO CALCULADO*}"
+[ "${#CONF_POS}" -lt "${#NOEV_POS}" ] && [ "${#NOEV_POS}" -lt "${#NC_POS}" ] && ok "T66 sections render in order SYMBOL-CONFIRMED, SEM EVIDÊNCIA DE SÍMBOLO, NÃO CALCULADO" || nok "T66 section order" "$R66"
+echo "$OUT" | grep '^JSON=' | sed 's/^JSON=//' | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["guarded_symbol_confirmed"] == ["com.test.central-sender"], d["guarded_symbol_confirmed"]
+assert d["guarded_symbol_no_evidence"] == ["com.test.slot-scheduler"], d["guarded_symbol_no_evidence"]
+assert d["guarded_symbol_not_computed"] == ["com.test.conversation-monitor"], d["guarded_symbol_not_computed"]
+' 2>/tmp/t66_json_err \
+  && ok "T66 JSON guarded_symbol_* fields match the KEY=value lines" \
+  || nok "T66 JSON" "$(cat /tmp/t66_json_err 2>/dev/null)"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T67 (ga-8q1ulq, header point 17 / ACEITE item 4): a per-daemon
+# SYMBOL_REACHABILITY_TIMEOUT bounds a hung compute_symbol_reachability.py —
+# degrades to NÃO CALCULADO instead of stalling the halt past its budget.
+# The stub's "hang" mode sleeps 20s; the test overrides the timeout down to
+# 1s so this stays a fast test, not a slow one.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t67
+make_symbol_script "$RUNTIME"
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+seed_running com.test.central-sender 67001 "$STALE_LSTART"
+seed_symbol_result daemons/central_sender.py hang
+SYMBOL_REACHABILITY_TIMEOUT=1
+OUT=$(run_helper daemons/central_sender.py); RC=$?
+SYMBOL_REACHABILITY_TIMEOUT=2
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T67 verdict NEEDS_GUARDED_RESTART" || nok "T67 verdict" "got '$V' out=[$OUT]"
+echo "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" | grep -q "com.test.central-sender" && ok "T67 per-daemon timeout degrades to GUARDED_SYMBOL_NOT_COMPUTED" || nok "T67 guarded_symbol_not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T68 (ga-8q1ulq, header point 17 / ACEITE item 4): SYMBOL_REACHABILITY_
+# TOTAL_TIMEOUT=0 means the whole-batch budget is already spent before the
+# loop starts — every GUARDED label is degraded to NÃO CALCULADO WITHOUT the
+# calculator ever being invoked for them (no symbol_argv.* recorded), not
+# just timing each one out individually. Two daemons prove it is a BATCH
+# budget, not a per-daemon one re-armed for each label.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t68
+make_symbol_script "$RUNTIME"
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+cat > "$RUNTIME/daemons/slot_scheduler.py" <<<'print("slot")'
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+make_plist "$AGENTS" com.test.slot-scheduler "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/slot_scheduler.py"
+seed_running com.test.central-sender 68001 "$STALE_LSTART"
+seed_running com.test.slot-scheduler 68101 "$STALE_LSTART"
+seed_symbol_result daemons/central_sender.py confirmed
+seed_symbol_result daemons/slot_scheduler.py confirmed
+SENSITIVE_DAEMONS="central-sender slot-scheduler"
+SYMBOL_REACHABILITY_TOTAL_TIMEOUT=0
+OUT=$(run_helper daemons/central_sender.py daemons/slot_scheduler.py); RC=$?
+SYMBOL_REACHABILITY_TOTAL_TIMEOUT=10
+SENSITIVE_DAEMONS="central-sender"
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T68 verdict NEEDS_GUARDED_RESTART" || nok "T68 verdict" "got '$V' out=[$OUT]"
+NC68="$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
+echo "$NC68" | grep -q "com.test.central-sender" && echo "$NC68" | grep -q "com.test.slot-scheduler" \
+  && ok "T68 exhausted total budget degrades BOTH daemons to GUARDED_SYMBOL_NOT_COMPUTED" \
+  || nok "T68 guarded_symbol_not_computed" "$NC68"
+[ ! -e "$MOCK/symbol_argv.daemons_central_sender.py" ] && [ ! -e "$MOCK/symbol_argv.daemons_slot_scheduler.py" ] \
+  && ok "T68 calculator never invoked once the total budget was already spent" \
+  || nok "T68 stub should not have been called" "argv files exist under $MOCK"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T69 (ga-8q1ulq, header point 17 / ACEITE item 1): the reachability window
+# prefers this bead's own BEAD_MERGE_PRE_SHA/BEAD_MERGE_SHA over the wider
+# PRE_DEPLOY_SHA/POST_DEPLOY_SHA once a later, unrelated bystander commit
+# widens the deploy window beyond this bead's own range (header point 14's
+# "runtime fell behind" shape) — proven against the stub's own recorded
+# argv, not just the classification outcome. Bypasses run_helper() (which
+# owns its own base/deploy commit dance) to construct the three-commit
+# history this needs.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t69
+make_symbol_script "$RUNTIME"
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+seed_running com.test.central-sender 69001 "$STALE_LSTART"
+SENSITIVE_DAEMONS="central-sender"
+( cd "$RUNTIME"; git add -A >/dev/null 2>&1; git commit -q -m base --allow-empty )
+WIDE_PRE=$(git -C "$RUNTIME" rev-parse HEAD)
+echo "# changed $(date +%s%N)" >> "$RUNTIME/daemons/central_sender.py"
+( cd "$RUNTIME"; git add -A >/dev/null 2>&1; git commit -q -m "bead merge" --allow-empty )
+BEAD_PRE="$WIDE_PRE"
+BEAD_POST=$(git -C "$RUNTIME" rev-parse HEAD)
+echo "# bystander $(date +%s%N)" >> "$RUNTIME/README.md"
+( cd "$RUNTIME"; git add -A >/dev/null 2>&1; git commit -q -m bystander --allow-empty )
+WIDE_POST=$(git -C "$RUNTIME" rev-parse HEAD)
+OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" \
+  PRE_DEPLOY_SHA="$WIDE_PRE" POST_DEPLOY_SHA="$WIDE_POST" \
+  BEAD_MERGE_PRE_SHA="$BEAD_PRE" BEAD_MERGE_SHA="$BEAD_POST" \
+  DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
+  EXTRA_RUNTIME_ROOTS="" FORCE_RESTART_LABELS="" \
+  LAUNCH_AGENTS_DIR="$AGENTS" LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" \
+  VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
+  SYMBOL_REACHABILITY_TIMEOUT=2 SYMBOL_REACHABILITY_TOTAL_TIMEOUT=10 \
+  DRY_RUN=0 bash "$HELPER" 2>/dev/null); RC=$?
+SENSITIVE_DAEMONS="central-sender"
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T69 verdict NEEDS_GUARDED_RESTART" || nok "T69 verdict" "got '$V' out=[$OUT]"
+ARGV_FILE="$MOCK/symbol_argv.daemons_central_sender.py"
+[ -f "$ARGV_FILE" ] && ok "T69 calculator was invoked (argv recorded)" || nok "T69 argv file" "missing $ARGV_FILE"
+python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["before"] == sys.argv[2], (d["before"], sys.argv[2])
+assert d["after"] == sys.argv[3], (d["after"], sys.argv[3])
+' "$ARGV_FILE" "$BEAD_PRE" "$BEAD_POST" 2>/tmp/t69_err \
+  && ok "T69 --before/--after use the bead's own merge range, not the wider deploy window" \
+  || nok "T69 window preference" "$(cat /tmp/t69_err 2>/dev/null)"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
