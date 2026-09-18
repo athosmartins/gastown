@@ -90,9 +90,16 @@ run_block() {
 
   local wide_own_line=""
   case "$mode" in
-    closure_only) wide_own_line='echo "GUARDED_OWN=com.test.old-daemon"' ;;
-    own)          wide_own_line='echo "GUARDED_OWN=com.test.old-daemon com.test.new-daemon"' ;;
-    no_split)     wide_own_line='' ;;
+    closure_only)     wide_own_line='echo "GUARDED_OWN=com.test.old-daemon"' ;;
+    own)              wide_own_line='echo "GUARDED_OWN=com.test.old-daemon com.test.new-daemon"' ;;
+    no_split)         wide_own_line='' ;;
+    # T7: the field IS present but its VALUE is empty — the whole current
+    # GUARDED backlog is closure-only, own-file-wise genuinely clean. This is
+    # the "present-but-empty vs absent" distinction the fix's fallback logic
+    # exists to get right: must NOT be confused with no_split above (which
+    # correctly falls back to the full list) — here the split ran and
+    # positively found nothing own-file-stuck, which IS trustworthy.
+    all_closure_only) wide_own_line='echo "GUARDED_OWN="' ;;
     *) echo "run_block: unknown mode '$mode'" >&2; exit 1 ;;
   esac
 
@@ -202,6 +209,19 @@ echo "$BD_CALLS" | grep -q "delivery:failed" \
 [ "$BASELINE_AFTER" = "$EXPECT_C0" ] \
   && ok "T6 rig-wide baseline marker did NOT advance" \
   || nok "T6 baseline marker unexpectedly changed" "want(unchanged)=$EXPECT_C0 got=$BASELINE_AFTER"
+
+# ── T7 (mode=all_closure_only): GUARDED_OWN present but EMPTY — the whole
+#    current backlog is closure-only, positively confirmed clean of any
+#    own-file-changed member. Must exonerate + advance, same as T4, proving
+#    "present-but-empty" is trusted and NOT confused with "absent" (T6) ────
+run_block all_closure_only
+[ "$RUN_RC" -eq 0 ] && ok "T7 block runs clean (rc=0)" || nok "T7 rc" "rc=$RUN_RC"
+echo "$BD_CALLS" | grep -q "delivery:failed" \
+  && nok "T7 delivery WAS held even though GUARDED_OWN was positively empty" "$BD_CALLS" \
+  || ok "T7 delivery is NOT held (GUARDED_OWN empty-but-present correctly trusted)"
+[ "$BASELINE_AFTER" = "$EXPECT_C2" ] \
+  && ok "T7 rig-wide baseline marker ADVANCED to POST_DEPLOY_SHA" \
+  || nok "T7 baseline marker did not advance" "want=$EXPECT_C2 got=$BASELINE_AFTER"
 
 echo ""
 echo "story-delivery guarded-restart closure-only attribution tests: $PASS passed, $FAIL failed"
