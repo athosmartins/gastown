@@ -175,11 +175,35 @@
 # owned, don't also route to the pool" state this exclusion exists to catch.
 # See this script's own --selftest scenario 46.
 #
+# FOURTEENTH exclusion (ga-zyzv7r): gate:passed present → excluded. Root
+# cause: two OTHER watchdogs racing ahead of story-delivery.sh's own Step 1b
+# task reconciler can re-arm a bead that just finished, not one that was
+# never dispatched. Confirmed live on ga-yct7r1: 01:15 gate PASSES and
+# merges (gate:passed stamped); 01:22 gate-recovery-watchdog's phantom-marker
+# sweep correctly clears the now-stale gate:queued label (no marker will
+# ever drain it — the marker already finished) but frames this as "bead is a
+# dispatch candidate again"; 01:31 THIS watchdog sees ctx:ready+exec:auto,
+# open, no gc.routed_to (never needed one — Step 1b's own reconciler closes
+# bug/task beads by content-diff, not dispatch) and "restores" a route the
+# bead never needed, making it claimable by the very next pool session
+# before the reconciler's ~5min-cadence sweep gets to close it. gate:passed
+# on a bead that already survived the story:* exclusion above (i.e. a
+# non-story bug/task bead — Step 1b's own territory) means "merge-verified,
+# awaiting close", never "needs dispatch". Does NOT need a story:approved
+# carve-out the way story:* itself might seem to: any story:approved (or
+# other story:*) bead is already excluded by that earlier check regardless
+# of gate:passed, so by construction every candidate that reaches this
+# fourteenth check is already story-label-free — exactly the Step 1b shape
+# this exclusion targets, never story-delivery's own gate:passed+
+# story:approved deploy/prod-test path. See this script's own --selftest
+# scenario 53.
+#
 # What's left: status=open, NOT epic, ctx:ready AND exec:auto BOTH present
 # (the "looks ready in the panel" signal ga-f54ui's own text uses),
-# gc.routed_to empty/absent, no story:* label, unassigned, aged past grace,
-# none of the thirteen holds/wrappers/graph-steps/parks/active-gates/
-# recent-dispatches/ownership above applying.
+# gc.routed_to empty/absent, no story:* label, no gate:passed label,
+# unassigned, aged past grace, none of the fourteen holds/wrappers/
+# graph-steps/parks/active-gates/recent-dispatches/ownership/terminal-gate
+# above applying.
 #
 # GRACE PERIOD (PMRW_GRACE_MINUTES, default 10): unlike GMMSW's gate-status
 # loss (happens once, atomically, at marker creation — 5min grace), an armed
@@ -468,15 +492,16 @@ _state_load() {
 #   present   — still open, still armed, still unrouted: dropped from this
 #               sweep for some OTHER reason (transient read blip, etc.) —
 #               NOT resolved.
-# KNOWN SCOPE LIMIT: this recheck deliberately does NOT re-test the five
-# label-based exclusions added to the main sweep filter (story:*,
+# KNOWN SCOPE LIMIT: this recheck deliberately does NOT re-test the label-
+# based exclusions added to the main sweep filter (story:*,
 # pilot:refusal-count:*, needs:engine-window, no-auto-dispatch, active-gate
-# probe) — only the core armed/routed/closed/gone signals. A bead that
-# newly acquires one of those five AFTER being tracked stays in state as
-# "present"/UNVERIFIED indefinitely rather than being pruned as resolved.
-# Harmless: cooldown already suppresses re-alerting regardless of state, so
-# this is a state-file hygiene gap only, never a false-alert or missed-alert
-# risk. Not worth duplicating the full filter here for that payoff.
+# probe, gate:passed — ga-zyzv7r) — only the core armed/routed/closed/gone
+# signals. A bead that newly acquires one of those AFTER being tracked stays
+# in state as "present"/UNVERIFIED indefinitely rather than being pruned as
+# resolved. Harmless: cooldown already suppresses re-alerting regardless of
+# state, so this is a state-file hygiene gap only, never a false-alert or
+# missed-alert risk. Not worth duplicating the full filter here for that
+# payoff.
 _bead_recheck_status() {
   local _id="$1" _store="$2" _out _rc
   _out=$("$BD_BIN" -C "$_store" list --id "$_id" --all --json 2>/dev/null \
@@ -786,6 +811,7 @@ run_sweep() {
               | select(((.labels // []) | (index("needs:engine-window") or index("framework:engine"))) | not)
               | select(((.labels // []) | (index("no-auto-dispatch") or index("pilot:no-auto-dispatch"))) | not)
               | select(((.labels // []) | any(startswith("blocked-on:") or startswith("blocked-by:") or startswith("blocked:"))) | not)
+              | select(((.labels // []) | index("gate:passed")) | not)
               | select(((.assignee // "") | test("\\S")) | not)
               | select( ((( .updated_at // .created_at // "") | fromdateiso8601?) // 9999999999) < $cut )
         ]
@@ -2181,6 +2207,17 @@ CRASHPY
   C52="$TMP/comm52"; : > "$C52"
   PMRW_TEST_COMMENTS_LOG="$C52" run_sweep >/dev/null
   grep -q "ga-52 (store-a): gc.routed_to -> gastown.dog" "$LOG" 2>/dev/null && ok "scenario 52: non-owner-signal created_by still falls through to store default" || bad "scenario 52 (ga-no6qa REGRESSION): store-default fallback broken for a plain/dog creator"
+
+  # ── Scenario 53 (ga-zyzv7r): gate:passed → excluded (terminal, awaiting
+  # Step 1b's own task-reconciler close, never "needs dispatch") ───────────
+  echo "Scenario 53 (ga-zyzv7r): gate:passed present, no story:* label → excluded (merge-verified, awaiting close, not a routing gap)"
+  reset_stores
+  printf '[%s]' "$(mk ga-53 open 'ctx:ready,exec:auto,gate:passed' "$OLD_TS")" > "$TMP/fixtures/store-a.json"
+  N53="$TMP/notif53"; M53="$TMP/mail53"; C53="$TMP/comm53"; : > "$N53"; : > "$M53"; : > "$C53"
+  PMRW_TEST_NOTIFIED="$N53" PMRW_TEST_MAILED="$M53" PMRW_TEST_COMMENTS_LOG="$C53" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 53: gate:passed excluded (return 0)" || bad "scenario 53 (ga-zyzv7r REGRESSION): a terminal gate:passed bead was flagged/repaired as if it needed dispatch, got rc=$rc"
+  [ ! -s "$C53" ] && [ ! -s "$N53" ] && [ ! -s "$M53" ] && ok "scenario 53: no repair write / alert fired on a gate:passed bead" || bad "scenario 53 (ga-zyzv7r REGRESSION): gate:passed bead should never be repaired or alerted on"
 
   echo ""
   echo "pilot-missing-route-watchdog selftest: PASS=$PASS FAIL=$FAIL"
