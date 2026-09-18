@@ -429,6 +429,37 @@ fi
   && ok "ambiguous/neutral code task → exec:auto (default)" || bad "neutral code task → expected exec:auto"
 [ "$(context_check_exec_class "" "")" = "exec:auto" ] \
   && ok "empty title+desc → exec:auto (default, never falsely manual)" || bad "empty → expected exec:auto"
+# 10g0 — ga-dpas3r: context_check_negated, the pure helper backing the
+#        negation-awareness fix below. A trigger substring inside a PROHIBITION
+#        ("nunca X") must not read the same as a request for X.
+if declare -F context_check_negated >/dev/null 2>&1; then
+  ok "context_check_negated is defined (exposed lib-only)"
+else
+  bad "context_check_negated not exposed by lib-only source"
+fi
+[ "$(context_check_negated "nunca criar conta em nome do usuario" "criar conta")" = "yes" ] \
+  && ok "context_check_negated: 'nunca criar conta' → yes (same-clause negation precedes)" || bad "context_check_negated: same-clause negation not detected"
+[ "$(context_check_negated "por favor, criar conta nova para o teste" "criar conta")" = "no" ] \
+  && ok "context_check_negated: 'criar conta' with no negation → no" || bad "context_check_negated REGRESSION: false positive on a genuine request"
+[ "$(context_check_negated "provisionar credencial" "criar conta")" = "no" ] \
+  && ok "context_check_negated: phrase absent entirely → no" || bad "context_check_negated: absent phrase should be 'no'"
+[ "$(context_check_negated "nunca apague o log. depois disso, criar conta de teste." "criar conta")" = "no" ] \
+  && ok "context_check_negated: negation in an EARLIER, different clause does not leak forward across a '.'" || bad "context_check_negated REGRESSION: negation window leaked across a sentence boundary"
+# 10g — ga-dpas3r: a PROHIBITION must not tip exec:manual just because its
+#       trigger substring occurs inside it — "nunca criar conta" contains
+#       "criar conta" but FORBIDS it, the opposite of a request (wa-vrs3g).
+[ "$(context_check_exec_class "cadastro de fonte de dados" "nunca criar conta em nome do usuario; apenas ler dados publicos via API")" = "exec:auto" ] \
+  && ok "ga-dpas3r: 'nunca criar conta' (prohibition) → exec:auto, not exec:manual (wa-vrs3g)" || bad "ga-dpas3r REGRESSION: negated 'criar conta' over-tagged exec:manual (wa-vrs3g)"
+[ "$(context_check_exec_class "guardrail de escopo" "NAO criar conta nova em nenhum servico externo durante este bug fix")" = "exec:auto" ] \
+  && ok "ga-dpas3r: 'NAO criar conta' (uppercase prohibition) → exec:auto" || bad "ga-dpas3r REGRESSION: uppercase negated 'criar conta' over-tagged exec:manual"
+# ga-dpas3r: a bare MENTION of a portal noun (a research category, or an
+# access-method description) is not a request for a human to pass that gate
+# personally — cartório/captcha need a paired action verb, same lesson ga-s16ob
+# already taught section 1's bare device nouns (wa-jjztr).
+[ "$(context_check_exec_class "mapear fontes de dados publicos" "pesquisar em fontes como cartorios, prefeituras e tribunais para levantar o historico do imovel")" = "exec:auto" ] \
+  && ok "ga-dpas3r: 'pesquisar cartorios' (research-category mention) → exec:auto, not exec:manual (wa-jjztr)" || bad "ga-dpas3r REGRESSION: bare 'cartorios' mention over-tagged exec:manual (wa-jjztr)"
+[ "$(context_check_exec_class "mapear fontes de dados publicos" "algumas fontes tem acesso via captcha ou API, conforme o portal disponibilizar")" = "exec:auto" ] \
+  && ok "ga-dpas3r: 'acesso via captcha' (access-method mention) → exec:auto, not exec:manual (wa-jjztr)" || bad "ga-dpas3r REGRESSION: bare 'captcha' mention over-tagged exec:manual (wa-jjztr)"
 # 10f — exec vocabulary is bounded to exactly exec:manual | exec:auto.
 ec_bad=0
 for pair in "physical phone proxy|x" "rodar script|y" "|"; do

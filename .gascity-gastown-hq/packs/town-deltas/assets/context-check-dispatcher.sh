@@ -631,6 +631,74 @@ context_check_effective_text() {
 # physical / human-credential signal tips it to exec:manual. Pure (no I/O), so it
 # is unit-tested by the selftest and the tested logic IS the shipped logic.
 
+# ── Negation-aware matching (ga-dpas3r) ────────────────────────────────────────
+# A bare substring match cannot tell a PROHIBITION ("nunca criar conta") from a
+# REQUEST ("criar conta") — same substring, opposite meaning. Confirmed live:
+# wa-vrs3g's guardrail "nunca criar conta" tipped exec:manual on the strength of
+# the substring "criar conta" alone, and the workaround (rewriting the guardrail
+# until the word disappeared) degraded a security-relevant description just to
+# dodge the matcher. Applied to §2/§3/§4 below — NOT §1a/§1b: ga-s16ob's own
+# wa-y9nh0 regression test relies on a NEGATED device-touch mention ("NUNCA
+# rootear", "sem toque humano") still tipping exec:manual, because that bead's
+# whole DOMAIN is physical-device work; that is a deliberate, already-tested,
+# different judgment call this fix does not revisit.
+
+# context_check_clause_before <text> <phrase> — emit the portion of <text> in
+#   the same clause as, and preceding, the FIRST occurrence of <phrase> (clauses
+#   are bounded by . ; ! ? or a newline — sentence-scoped, not word-bounded, so
+#   "nunca, em hipótese alguma, crie uma conta" still counts as negated). Emits
+#   "" if <phrase> does not occur in <text>. Assumes <text>/<phrase> are already
+#   lowercased by the caller (matches this function's own single `tr` call).
+#   Pure (parameter expansion only, no I/O, no external tools).
+context_check_clause_before() {
+  local text="$1" phrase="$2" before nl=$'\n'
+  case "$text" in
+    *"$phrase"*) : ;;
+    *) echo ""; return ;;
+  esac
+  before="${text%%"$phrase"*}"        # everything before the FIRST occurrence
+  before="${before##*[.;!?$nl]}"      # keep only the tail after the last clause delimiter
+  printf '%s' "$before"
+}
+
+# context_check_negated <text> <phrase> — emit "yes" iff <phrase> occurs in
+#   <text> AND is preceded, in the same clause, by a negation word (pt/en) —
+#   i.e. the phrase is being forbidden, not requested. Emits "no" if <phrase>
+#   is absent, or present with no preceding same-clause negation (a genuine,
+#   actionable occurrence). Pure (no I/O).
+context_check_negated() {
+  local text="$1" phrase="$2" clause
+  clause="$(context_check_clause_before "$text" "$phrase")"
+  [ -z "$clause" ] && { echo "no"; return; }
+  case " $clause " in
+    *" nunca "*|*" não "*|*" nao "*|*" jamais "*|*" evite "*|*" evitar "*|\
+*" sem "*|*" nem "*|*" never "*|*" don't "*|*" dont "*|*" do not "*|\
+*" cannot "*|*" can't "*)
+      echo "yes"; return ;;
+  esac
+  echo "no"
+}
+
+# context_check_any_unnegated <text> <phrase1> [phrase2 ...] — emit "yes" iff at
+#   least one <phraseN> occurs in <text> AND is NOT negated in its own
+#   occurrence's clause (context_check_negated above). A phrase that only occurs
+#   inside a negated clause does not count. Pure (no I/O). Every §2/§3/§4
+#   trigger block below routes its single-literal phrases through this one call
+#   site, so the fix covers the whole reachable pattern class, not only the one
+#   reported phrase.
+context_check_any_unnegated() {
+  local text="$1"; shift
+  local p
+  for p in "$@"; do
+    case "$text" in
+      *"$p"*)
+        [ "$(context_check_negated "$text" "$p")" = "no" ] && { echo "yes"; return; }
+        ;;
+    esac
+  done
+  echo "no"
+}
+
 # context_check_exec_class <title> <desc> — emit "exec:manual" iff title+desc
 #   carry a clear physical-device / human-identity-credential / human-provisioning
 #   signal; else "exec:auto" (default). Case-insensitive (en + pt). Conservative:
@@ -673,24 +741,37 @@ context_check_exec_class() {
   esac
   # 2. GOV / 3rd-party PORTAL gated by HUMAN identity (CPF + CAPTCHA, e-SIC/LAI,
   #    cartório). An agent cannot pass a human-identity / CAPTCHA gate.
-  case "$t" in
-    *"e-sic"*|*"esic"*|*" lai "*|*" lai)"*|*"(lai"*|*"lei de acesso"*|\
-*"captcha"*|*"cartório"*|*"cartorio"*|*"planta genérica"*|*"planta generica"*|\
-*"pedido de informa"*|*"protocolo presencial"*|*"presencial"*)
-      echo "exec:manual"; return ;;
-  esac
+  #    captcha/cartório are matched via a paired ACTION VERB, not as bare nouns
+  #    (ga-dpas3r — same lesson §1 already learned via ga-s16ob): "pesquisar
+  #    cartórios" as a research category, or "acesso via captcha" describing how
+  #    a THIRD-PARTY site works, is a MENTION, not a request for a human to pass
+  #    that gate personally. Negation-aware too, via context_check_any_unnegated.
+  if [ "$(context_check_any_unnegated "$t" \
+    "e-sic" "esic" " lai " " lai)" "(lai" "lei de acesso" \
+    "planta genérica" "planta generica" \
+    "pedido de informa" "protocolo presencial" "presencial" \
+    "resolver o captcha" "resolver captcha" "resolver o recaptcha" "resolver recaptcha" \
+    "resolver hcaptcha" "quebrar o captcha" "passar pelo captcha" \
+    "solve the captcha" "solving the captcha" "solve captcha" \
+    "ir ao cartório" "ir ao cartorio" "ir até o cartório" "ir até o cartorio" \
+    "comparecer ao cartório" "comparecer ao cartorio" \
+    "comparecer no cartório" "comparecer no cartorio")" = "yes" ]; then
+    echo "exec:manual"; return
+  fi
   # 3. HUMAN-held CREDENTIAL / account / channel PROVISIONING (a secret/identity
   #    a human must create or hold). "provisionar canal Whapi", "criar conta",
   #    "credencial". Kept tight: pair provisioning verbs with credential/account/
   #    channel nouns so a generic "provision a table" code task stays exec:auto.
-  case "$t" in
-    *"provisionar canal"*|*"provisionar conta"*|*"provisionar credencial"*|\
-*"provisionar número"*|*"provisionar numero"*|\
-*"provision a channel"*|*"provision an account"*|*"provision credential"*|\
-*"provision a number"*|*"criar conta"*|*"nova conta"*|*"new account"*|\
-*"cadastrar conta"*|*"canal whapi"*)
-      echo "exec:manual"; return ;;
-  esac
+  #    Negation-aware (ga-dpas3r): a GUARDRAIL that PROHIBITS one of these
+  #    ("nunca criar conta") must not read as a request for it — see wa-vrs3g.
+  if [ "$(context_check_any_unnegated "$t" \
+    "provisionar canal" "provisionar conta" "provisionar credencial" \
+    "provisionar número" "provisionar numero" \
+    "provision a channel" "provision an account" "provision credential" \
+    "provision a number" "criar conta" "nova conta" "new account" \
+    "cadastrar conta" "canal whapi")" = "yes" ]; then
+    echo "exec:manual"; return
+  fi
   # 4. HUMAN DESIGN / BUSINESS-DECISION GATE — the work itself is gated on a human
   #    design approval or a cost/business decision BEFORE any code (not physical, not
   #    a credential — the spec needs a human call first). A crew that auto-builds these
@@ -699,14 +780,21 @@ context_check_exec_class() {
   #    Caught the recurring design-first mis-dispatch: wa-tozk ("DESIGN-FIRST —
   #    aguardando OK do thies/Athos antes de qualquer código"), wa-1my1 ("spec aprovado
   #    por Athos antes de codar"), wa-yma9 ("bloqueado em decisão de custo").
+  #    Negation-aware (ga-dpas3r) for the single-literal phrases below.
+  if [ "$(context_check_any_unnegated "$t" \
+    "design-first" "design first" \
+    "antes de qualquer código" "antes de qualquer codigo" \
+    "aguardando ok do" "aguardando aprovação" "aguardando aprovacao" \
+    "aguardando review humano" "aguardando decisão" "aguardando decisao" \
+    "aprovação do design" "aprovacao do design" \
+    "decisão de custo" "decisao de custo" "cost decision" "business decision")" = "yes" ]; then
+    echo "exec:manual"; return
+  fi
+  # Compound (two-part, unbounded-gap) pattern kept as its own literal check —
+  # not a single substring, so it doesn't fit context_check_any_unnegated's
+  # one-phrase-at-a-time model; unchanged, out of scope for ga-dpas3r.
   case "$t" in
-    *"design-first"*|*"design first"*|\
-*"antes de qualquer código"*|*"antes de qualquer codigo"*|\
-*"aprovad"*"antes de codar"*|*"aprovad"*"antes de programar"*|\
-*"aguardando ok do"*|*"aguardando aprovação"*|*"aguardando aprovacao"*|\
-*"aguardando review humano"*|*"aguardando decisão"*|*"aguardando decisao"*|\
-*"aprovação do design"*|*"aprovacao do design"*|\
-*"decisão de custo"*|*"decisao de custo"*|*"cost decision"*|*"business decision"*)
+    *"aprovad"*"antes de codar"*|*"aprovad"*"antes de programar"*)
       echo "exec:manual"; return ;;
   esac
   # Default: a crew agent can try it.
