@@ -68,8 +68,22 @@ min_deploy_gap_minutes = 5
 name            = "whatsapp_automation"
 runtime_dir     = "/Users/athos/gt/whatsapp_automation"
 git_repo        = "/Users/athos/gt/whatsapp_automation"
-# Self-repo rig: git pull on the repo root.
-deploy_cmd      = "git -C /Users/athos/gt/whatsapp_automation pull --ff-only"
+# ga-nh1muq: was a bare `git pull --ff-only` — this repo also has
+# com.whatsapp.deploy-sync (launchd, 60s) independently pulling the SAME
+# runtime_dir with zero coordination, and a plain pull decides what to merge
+# by reading .git/FETCH_HEAD, a shared file either puller's fetch can clobber
+# out from under the other mid-flight. Confirmed live (two story-delivery
+# pull failures 27min apart, two different FETCH_HEAD symptoms) and
+# reproduced deterministically via a real concurrent race in
+# scripts/git-deploy-pull.selftest.sh. git-deploy-pull.sh fetches, then
+# merges the durable refs/remotes/origin/main ref directly (never reads
+# FETCH_HEAD) AND serializes against com.whatsapp.deploy-sync (now converted
+# to the same wrapper) via the city's per-repo git mutex
+# (scripts/git-lock-hygiene.sh, imp18) — fetch+merge alone still measured a
+# MORE frequent transient "cannot lock ref" failure under real concurrency
+# than today's bug (77/150 vs the mutexed pairing's 0/40), so both parts are
+# required, not just the FETCH_HEAD fix alone.
+deploy_cmd      = "/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/git-deploy-pull.sh /Users/athos/gt/whatsapp_automation main"
 daemon_restarts = []   # WA worker managed by gc session; no STATIC launchd restart
 # ga-iwv0: the daemon-refresh step auto-restarts affected SAFE dashboards after
 # deploy + verifies freshness. These hot-path daemons (live send, inbound

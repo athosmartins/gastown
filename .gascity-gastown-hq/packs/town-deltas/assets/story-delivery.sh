@@ -1636,21 +1636,46 @@ log "Runbook loaded: deploy_cmd='$DEPLOY_CMD' runtime='$RUNTIME_DIR' test='$PROD
 # the incoming merge adds as tracked. Identical duplicates are backed up +
 # removed; a genuine divergence halts + escalates (never clobbered).
 #
-# SCOPE: only run when the deploy will execute a FATAL `pull --ff-only` (the
-# bug's domain — property_scrapers, whatsapp_automation). Rigs whose deploy
-# swallows pull failures (e.g. gascity: "... 2>/dev/null || true") or that don't
-# pull at all are NOT subject to the untracked-overwrite abort, so the reconcile
-# must NOT run for them — otherwise a pre-existing, harmless untracked file in
-# that runtime (e.g. the town root's .gitignore) would wrongly halt delivery.
+# SCOPE: only run when the deploy will execute a FATAL fast-forward-only
+# merge (the bug's domain — property_scrapers, whatsapp_automation). Rigs
+# whose deploy swallows pull failures (e.g. gascity: "... 2>/dev/null ||
+# true") or that don't pull at all are NOT subject to the untracked-overwrite
+# abort, so the reconcile must NOT run for them — otherwise a pre-existing,
+# harmless untracked file in that runtime (e.g. the town root's .gitignore)
+# would wrongly halt delivery.
+#
+# ga-nh1muq: matches `pull --ff-only` (property_scrapers), the explicit
+# `merge --ff-only` a deploy_cmd takes after switching off the racy
+# FETCH_HEAD-reading `pull` form (lexbh's pre-existing "fetch && merge
+# --ff-only" entry — that rig was silently missing this same reconcile
+# before this fix, since its deploy_cmd never matched the old pull-only
+# pattern either), AND a deploy_cmd that calls out to
+# scripts/git-deploy-pull.sh (whatsapp_automation, after this same bead's
+# fix). That last one is NOT textually a "pull"/"merge" invocation at all —
+# it's an opaque call to a wrapper script that performs the fatal ff-merge
+# INTERNALLY, invisible to a string match on $DEPLOY_CMD — so it needs its
+# own explicit alternative rather than being caught by the other two
+# patterns (caught by story-delivery.selftest.sh section 12, which failed
+# on exactly this gap during development). All three shapes abort
+# identically on an untracked-file collision — same git merge/checkout
+# machinery underneath — so all three need the same protection.
+# SELFTEST-EXTRACT run-reconcile-classify: BEGIN
+# (kept extractable+runnable standalone by story-delivery.selftest.sh's
+# "run-reconcile-classify" section — mirrors the technique
+# scripts/git-lock-hygiene.sh uses for the same reason: this classifies pure
+# string shape with no I/O, so a snippet harness can drive it directly
+# against every known deploy_cmd shape without sourcing/running the whole
+# 2900+ line script.)
 RUN_RECONCILE=0
 case "$DEPLOY_CMD" in
-  *"pull --ff-only"*)
+  *"pull --ff-only"*|*"merge --ff-only"*|*"git-deploy-pull.sh"*)
     case "$DEPLOY_CMD" in
-      *"|| true"*) RUN_RECONCILE=0 ;;  # pull failure swallowed → not fatal
+      *"|| true"*) RUN_RECONCILE=0 ;;  # failure swallowed → not fatal
       *)           RUN_RECONCILE=1 ;;
     esac
     ;;
 esac
+# SELFTEST-EXTRACT run-reconcile-classify: END
 
 if [ "$RUN_RECONCILE" != "1" ]; then
   log "Pre-deploy reconcile skipped — deploy_cmd for rig '$RIG' does not run a fatal ff-pull."

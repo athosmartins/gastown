@@ -718,6 +718,52 @@ ANCHOR_EFFECTIVE=$(task_gate_passed_age_anchor "$ANCHOR_OLD_ISO" "$ANCHOR_NEW_IS
 rc0 task_reconciler_gate_passed_too_fresh "$ANCHOR_EFFECTIVE" "$ANCHOR_NOW" 20
 ok "FIX PROVEN: feeding the combined anchor (picks the fresh gate:passed-adjacent timestamp) into the SAME unchanged freshness check now correctly defers on the exact wa-1psgk shape"
 
+# ── 12. Step 3.5 RUN_RECONCILE classifier (ga-nh1muq) ────────────────────────
+# This logic is pure top-level script (not a function), deep inside the main
+# per-story loop — STORY_DELIVERY_LIB_ONLY sourcing above never reaches it
+# (by design: lib-only mode exists specifically to avoid running the live
+# sweep). Extract just the classifier via the SELFTEST-EXTRACT sentinels
+# (same technique scripts/git-lock-hygiene.sh uses for the same reason —
+# see that file's T23-T25 for the original precedent) and drive it directly
+# against every deploy_cmd shape actually configured in
+# delivery-runbooks.toml today, plus the swallowed-form case no current rig
+# uses yet but the inner check must still handle correctly.
+echo "── 12. Step 3.5 RUN_RECONCILE classifier (deploy_cmd shape -> reconcile?) ──"
+# Reuses $TMPROOT (set up in section 2 above, cleaned by its own EXIT trap)
+# rather than mktemp -d + a second `trap ... EXIT` — bash EXIT traps don't
+# stack, so a second one here would silently replace section 2's and leak
+# $TMPROOT for the rest of this file's run.
+RECONCILE_EXTRACT_DIR="$TMPROOT/run-reconcile-classify"
+mkdir -p "$RECONCILE_EXTRACT_DIR"
+sed -n '/# SELFTEST-EXTRACT run-reconcile-classify: BEGIN/,/# SELFTEST-EXTRACT run-reconcile-classify: END/p' "$SCRIPT" \
+  | sed '1d;$d' > "$RECONCILE_EXTRACT_DIR/classify.sh"
+cat > "$RECONCILE_EXTRACT_DIR/harness.sh" <<'HARNESSEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+DEPLOY_CMD="$1"
+. "$2"
+printf '%s' "$RUN_RECONCILE"
+HARNESSEOF
+classify() { bash "$RECONCILE_EXTRACT_DIR/harness.sh" "$1" "$RECONCILE_EXTRACT_DIR/classify.sh"; }
+
+eq "property_scrapers' unchanged fatal pull (no || true) -> reconcile (regression guard, pre-existing behavior)" \
+   "$(classify "git -C /Users/athos/.property-scrapers/runtime/main pull --ff-only")" "1"
+
+eq "whatsapp_automation's NEW git-deploy-pull.sh wrapper deploy_cmd -> reconcile (this bead's own fix must stay covered)" \
+   "$(classify "/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/git-deploy-pull.sh /Users/athos/gt/whatsapp_automation main")" "1"
+
+eq "lexbh's pre-existing fetch+merge deploy_cmd -> reconcile (ga-nh1muq ALSO fixes a latent gap: this rig matched NEITHER pattern before, so it was silently unreconciled)" \
+   "$(classify "git -C /Users/athos/.lexbh fetch origin && git -C /Users/athos/.lexbh merge --ff-only origin/main")" "1"
+
+eq "gascity's swallowed pull (|| true) -> NOT fatal, no reconcile (unchanged — this is the class Step 3.5's SCOPE comment exists for)" \
+   "$(classify "git -C /Users/athos/gt pull --ff-only origin main 2>/dev/null || true; /Users/athos/gt/.gascity-gastown-hq/scripts/skill-integrity-install.sh")" "0"
+
+eq "hypothetical swallowed fetch+merge (|| true) -> NOT fatal, no reconcile (proves the inner swallowed-check covers the NEW outer pattern too, not just the old pull form)" \
+   "$(classify "git -C /some/dir fetch origin && git -C /some/dir merge --ff-only origin/main 2>/dev/null || true")" "0"
+
+eq "empty deploy_cmd (e.g. gastown, marketing) -> no reconcile" \
+   "$(classify "")" "0"
+
 echo ""
 echo "═══════════════════════════════════════"
 echo "PASS=$PASS FAIL=$FAIL"
