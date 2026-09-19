@@ -128,6 +128,7 @@ if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
 fi
 
 git push origin HEAD
+_PUSH_RC=$?
 
 # ga-ljbx: fail-closed push verification. The gate guard/dispatcher operate
 # entirely off origin — if the branch is NOT actually on the push remote, the
@@ -135,13 +136,41 @@ git push origin HEAD
 # strands. `git push` can also report success while the ref does not land
 # (proxy/auth edge cases), so we ASSERT the ref exists on origin before writing
 # the marker. Abort loudly otherwise.
-if [ -z "$(git ls-remote --heads origin "$BRANCH" 2>/dev/null)" ]; then
+#
+# ga-d3n094: the exit code of `git push` above was never checked, and the
+# assertion only tested branch EXISTENCE (`git ls-remote --heads` non-empty) —
+# not identity. On a RE-anchor/resubmit, the branch already exists on origin
+# from a PRIOR push; if this push is then rejected (e.g. a pre-push hook
+# guard), origin's ref stays at the OLD sha and the existence check still
+# passes, so "Push verified" printed and the marker got created pointing at
+# stale code. Fail closed on the exit code first, then compare shas — existence
+# is not identity.
+if [ "$_PUSH_RC" -ne 0 ]; then
+  echo "ERROR: 'git push origin HEAD' failed (exit $_PUSH_RC)."
+  echo "  Fix the push (auth, network, pre-push hook rejection — check output above)"
+  echo "  and re-run /gate-done. Marker NOT created."
+  exit 1
+fi
+_REMOTE_LS=$(git ls-remote --heads origin "$BRANCH" 2>/dev/null)
+if [ -z "$_REMOTE_LS" ]; then
   echo "ERROR: branch '$BRANCH' is NOT present on origin after push."
   echo "  The quality gate operates off origin and cannot see unpushed work."
   echo "  Fix the push (auth, network, remote) and re-run /gate-done. Marker NOT created."
   exit 1
 fi
-echo "Push verified: $BRANCH present on origin."
+_REMOTE_SHA=$(printf '%s' "$_REMOTE_LS" | awk '{print $1}')
+_LOCAL_SHA=$(git rev-parse HEAD)
+if [ "$_REMOTE_SHA" != "$_LOCAL_SHA" ]; then
+  echo "ERROR: origin's $BRANCH is at $_REMOTE_SHA but local HEAD is $_LOCAL_SHA."
+  echo "  The push did not actually update origin to your latest commit — origin"
+  echo "  still has an OLDER version of this branch (existence is not identity;"
+  echo "  likely a rejected push, e.g. a pre-push hook, on a branch that already"
+  echo "  existed on origin from a prior submission)."
+  echo "  Fix the push (check for hook rejection output above) and re-run"
+  echo "  /gate-done. Marker NOT created."
+  exit 1
+fi
+echo "Push verified: $BRANCH present on origin at $_LOCAL_SHA."
 ```
 
 If push fails, fix the issue (auth, network, conflict) and retry.
