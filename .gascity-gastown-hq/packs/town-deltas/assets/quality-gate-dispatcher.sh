@@ -2155,6 +2155,65 @@ gate_scaled_verdict_timeout() {
   printf '%s' "$eff"
 }
 
+# ── ga-4158gs: floor the verdict timeout by a touched file's KNOWN selftest cost ─
+# gate_scaled_verdict_timeout (above) scales by diff SIZE only (files/lines), which
+# badly underestimates cost when a SMALL diff touches a file whose companion
+# selftest is large and slow. Measured case: ga-wnojmm was a 2-file/~170-line diff
+# to pilot-dispatcher.sh (diff-size-scaled timeout ≈25m) — but the reviewer's own
+# A/B check ran pilot-dispatcher.selftest.sh (its ~900-scenario companion) TWICE,
+# branch and base, inside that SAME window. Directly measured (ga-4158gs,
+# 2026-09-19, quiet host): ONE solo run = 892/892 passed in 1099.84s wall-clock
+# (~18.3m) — CPU time was only ~35s of that, so the cost is dominated by process-
+# spawn/IO overhead (~94+ real subprocess invocations of the dispatcher), not raw
+# computation. Table default below rounds that up to 20m for headroom under
+# heavier production load. This function floors
+# the timeout at (measured single-run cost × 2 + margin) whenever the diff touches
+# a file in the table below, regardless of how small the diff itself is. The ×2
+# covers the A/B check's branch+base pair whether it runs them sequentially or
+# concurrently — on real hardware, contention from running two CPU-bound copies
+# at once never makes them slower in combination than running them fully
+# sequentially, so ×2 is always a safe upper bound either way. Deliberately NOT
+# clamped to VERDICT_TIMEOUT_MAX_MINUTES (that cap fits the diff-SIZE scaler, not
+# a measured selftest cost) but IS clamped to its own
+# VERDICT_TIMEOUT_HEAVY_SELFTEST_FLOOR_MAX_MINUTES ceiling (default 120m) so a
+# misconfigured cost override or a future runaway selftest can't produce an
+# unbounded wait.
+#
+# Table is per-file SINGLE-run cost in minutes, each independently env-overridable
+# so a re-measurement (a companion selftest grows over time — this file's own
+# comment above still says "~380 assertions / 383 passing" from 2026-07-02; the
+# live file had grown to ~900 scenarios by the time ga-4158gs measured it) never
+# requires a code change. Only add an entry once you've actually measured its
+# companion selftest as expensive — checked for this bead and NOT added because
+# they measure cheap: story-delivery.selftest.sh (~18s), quality-gate-dispatcher's
+# own selftests (no single dominant file; each is well under 15s).
+#
+# Args: <changed_files newline-list>. Echoes the floor in minutes (integer, 0 if no
+# known-heavy file is touched). Fail-safe: no match, or a non-numeric configured
+# cost, contributes 0 → no floor, degrading to gate_scaled_verdict_timeout alone
+# (today's behavior). Unit-tested by gate-verdict-timeout-scale.selftest.sh.
+gate_heavy_selftest_floor_minutes() {
+  local changed="$1"
+  local margin="${VERDICT_TIMEOUT_HEAVY_SELFTEST_MARGIN_MINUTES:-5}"
+  local maxm="${VERDICT_TIMEOUT_HEAVY_SELFTEST_FLOOR_MAX_MINUTES:-120}"
+  case "$margin" in ''|*[!0-9]*) margin=5 ;; esac
+  case "$maxm"   in ''|*[!0-9]*) maxm=120 ;; esac
+  local floor=0 entry pattern cost candidate
+  for entry in \
+    "pilot-dispatcher\.sh:${VERDICT_TIMEOUT_HEAVY_COST_PILOT_DISPATCHER_MINUTES:-20}" \
+  ; do
+    pattern="${entry%%:*}"
+    cost="${entry#*:}"
+    case "$cost" in ''|*[!0-9]*) continue ;; esac
+    candidate=$(( cost * 2 + margin ))
+    [ "$candidate" -gt "$maxm" ] && candidate="$maxm"
+    if printf '%s\n' "$changed" | grep -qE "(^|/)${pattern}\$"; then
+      [ "$candidate" -gt "$floor" ] && floor="$candidate"
+    fi
+  done
+  printf '%s' "$floor"
+}
+
 # ── ga-evjs2: scale the frozen-reviewer staleness window by diff size ───────────
 # Mirror of gate_scaled_verdict_timeout but in SECONDS with its own cap. base is
 # REVIEWER_STALE_SECS (the silence window before a listed+peek-alive reviewer is
@@ -12535,6 +12594,28 @@ _VT_BASE="$VERDICT_TIMEOUT_MINUTES"
 VERDICT_TIMEOUT_MINUTES=$(gate_scaled_verdict_timeout "$_VT_BASE" "$DIFF_FILE_COUNT" "$DIFF_LINE_COUNT")
 if [ "$VERDICT_TIMEOUT_MINUTES" != "$_VT_BASE" ]; then
   log "ga-ltr3c: scaled verdict timeout ${_VT_BASE}m → ${VERDICT_TIMEOUT_MINUTES}m for diff (${DIFF_FILE_COUNT} files, ${DIFF_LINE_COUNT} lines; cap=${VERDICT_TIMEOUT_MAX_MINUTES}m)."
+fi
+
+# ga-4158gs: a small diff can still touch a file with an expensive companion
+# selftest (see gate_heavy_selftest_floor_minutes above) — the diff-size scaler
+# just above has no way to know that, so floor the timeout independently here.
+_VT_HEAVY_FLOOR=$(gate_heavy_selftest_floor_minutes "$CHANGED_FILES")
+case "$_VT_HEAVY_FLOOR" in ''|*[!0-9]*) _VT_HEAVY_FLOOR=0 ;; esac
+if [ "$_VT_HEAVY_FLOOR" -gt "$VERDICT_TIMEOUT_MINUTES" ]; then
+  log "ga-4158gs: heavy-selftest floor ${_VT_HEAVY_FLOOR}m > diff-scaled ${VERDICT_TIMEOUT_MINUTES}m — raising (diff touches a file with a known-expensive companion selftest)."
+  VERDICT_TIMEOUT_MINUTES="$_VT_HEAVY_FLOOR"
+fi
+# ga-4158gs: the heavy floor deliberately ignores VERDICT_TIMEOUT_MAX_MINUTES (that
+# cap exists for the diff-SIZE scaler, not for a measured selftest cost), but
+# REVIEWER_SESSION_TTL_MINUTES (set once, above, from the pre-diff MAX+20) is what
+# actually keeps the reviewer SESSION alive — without this, a floor bigger than
+# MAX+20 would raise the outer verdict wait past the point the session itself gets
+# reaped as orphaned (line ~9033), silently defeating the floor. Keep the same
+# "TTL tracks the ceiling" invariant gate_scaled_verdict_timeout already gets for
+# free from its clamp (selftest section 7) true for the floor too.
+if [ "$((VERDICT_TIMEOUT_MINUTES + 20))" -gt "$REVIEWER_SESSION_TTL_MINUTES" ]; then
+  log "ga-4158gs: raising REVIEWER_SESSION_TTL_MINUTES ${REVIEWER_SESSION_TTL_MINUTES}m → $((VERDICT_TIMEOUT_MINUTES + 20))m so the reviewer session outlives the heavy-selftest floor."
+  REVIEWER_SESSION_TTL_MINUTES=$((VERDICT_TIMEOUT_MINUTES + 20))
 fi
 
 # ga-evjs2: scale the frozen-reviewer staleness window by the SAME diff size, so a
