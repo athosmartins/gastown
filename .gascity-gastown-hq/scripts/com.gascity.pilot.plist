@@ -31,7 +31,7 @@
 		<key>PILOT_SUSPENDED_CREWS_OVERRIDE</key>
 		<string>batista-ps</string>
 		<key>PILOT_WA_WORKER_MAX</key>
-		<string>4</string>
+		<string>2</string>
 	</dict>
 	<key>Label</key>
 	<string>com.gascity.pilot</string>
