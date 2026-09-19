@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.cdp-tab-guard</string>
+
+  <!-- Tab-level memory guard for the shared automation Chrome (:9222, com.athos.chrome-cdp)
+       (ga-w7rcut). Closes a tab ONLY when its renderer's FOOTPRINT (compressed memory
+       included) is >= 1536 MB AND its CPU has been quiet for >= 10 min (3 min under memory
+       pressure). Never the Chrome process, never the last page, at most 2 tabs per run and
+       8 per hour. See scripts/cdp-tab-guard.py (header = design, tradeoffs, known limits).
+
+       WHY: 2026-09-19 07:44-07:52 four renderers hit 3.0/2.8/2.6/2.4 GB (agent puppeteer
+       scripts left one multi-GB tab open per run: disconnect() does not close the tab) ->
+       swap 6->10 GB -> disk 10->2 GB. chrome_cdp_watchdog.sh caps `ps rss`, blind to
+       compressed memory, and recycles the WHOLE Chrome when it does fire.
+
+       Cost of one run, measured 2026-09-19 at load average ~30: 0.2-0.4 s wall, ~0.2 s CPU,
+       no CDP connection (it only talks to Chrome when a heavy+idle renderer exists). The
+       heavy path can take up to ~2 min on a starved box; the script holds a single-instance
+       flock, so an overlapping launchd start exits at once ("SKIP locked").
+
+       KILL SWITCH (stops closing without unloading the job; it keeps logging WOULD_CLOSE):
+           touch /Users/athos/gt/.gascity-gastown-hq/.gc/cdp-tab-guard/DISABLED
+       Log:    .gc/logs/cdp-tab-guard.log     Heartbeat for watchers: .gc/cdp-tab-guard/status.json
+
+       INSTALL (merged is NOT installed): cp this file to ~/Library/LaunchAgents/com.gascity.cdp-tab-guard.plist,
+       launchctl bootstrap gui/$(id -u) it, then `launchctl kickstart gui/$(id -u)/com.gascity.cdp-tab-guard`
+       and read the log for an "ok renderers=..." line. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/cdp-tab-guard.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <!-- 60 s: a burst took ~8 min to go from 4 to 10 GB of swap, so a few looks per burst are
+       enough, and the idle window (3 min under pressure) is counted in observed samples. -->
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+
+  <!-- ga-9wv5: an unset ProcessType defaults to Standard, which macOS DAS can defer
+       indefinitely under load/thermal pressure ("pended nondemand spawn = interval"). This
+       guard exists for exactly those moments, so it must not be deferrable. -->
+  <key>ProcessType</key><string>Interactive</string>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/cdp-tab-guard-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/cdp-tab-guard-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict>
+</plist>
