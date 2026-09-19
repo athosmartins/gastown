@@ -43,22 +43,28 @@ renderer shared by several tabs (SHARED); a chrome:// page; the last remaining p
 that answered but could not be placed (PARTIAL_PROBE — it might share the renderer); a
 placement that does not reproduce right before closing (UNCONFIRMED); a renderer burning CPU
 during placement (DEFER_NOISY); a state file we cannot parse; any CDP failure. A page that
-cannot run JS at all (crashed/wedged) is `dead`, not `unresolved`: every page in a renderer
-shares its main thread, so a dead page cannot share a renderer with a page that answered.
+cannot run JS at all (crashed/wedged) or that no longer exists is `dead`, not `unresolved`: every
+page in a renderer shares its main thread, so a dead page cannot share a renderer with a page that
+answered. A page that failed for ANY other reason is `unresolved` and blocks the close.
 
 SAFETY VALVES: single-instance flock; MAX_CLOSE_RUN / MAX_CLOSE_HOUR caps; never the last
-page (playwright connectOverCDP needs >= 1 page); kill switch = ACTION=0 or the file
-<state_dir>/DISABLED (both downgrade to a dry run that logs WOULD_CLOSE); a hard 120 s alarm.
+page (playwright connectOverCDP needs >= 1 page); no close without a durable "CLOSING" log
+line (an unwritable log is loud on stderr and blocks the close); kill switch = ACTION set to
+anything but 1, or the file <state_dir>/DISABLED (both downgrade to a dry run that logs
+WOULD_CLOSE); a hard 120 s alarm.
 
-KNOWN LIMITS: (1) a renderer that steadily burns >= 15 ms of CPU per 0.5 s defers ALL closes
-(DEFER_NOISY repeating in the log is the tell); (2) only `page` targets are closable — a heavy
+KNOWN LIMITS: (1) a renderer that burns >= 15 ms of CPU in EVERY one of three 1.2 s looks (0.6 s
+apart) defers ALL closes (DEFER_NOISY repeating in the log is the tell); noise that is quiet on any
+single look does not defer, and the placement + the re-confirmation still guard the close;
+(2) only `page` targets are closable — a heavy
 renderer hosting only iframes/extension pages stays UNMAPPED; (3) the silent-tab case above.
 
 OUT OF SCOPE: chrome_cdp_watchdog.sh keeps its whole-Chrome recycle and its `ps rss` cap
 (moving that cap to footprint is a separate follow-up); the MBP Chrome (:9223).
 
-CONFIG (env, CDP_TAB_GUARD_*; garbage or non-positive values fall back to the default so a
-typo can never lower the ceiling to 0): PORT 9222 · ACTION 1 · CEILING_MB 1536 · IDLE_SEC 600
+CONFIG (env, CDP_TAB_GUARD_*; garbage or non-positive numeric values fall back to the default so
+a typo can never lower the ceiling to 0; ACTION is armed only by an absent variable or exactly 1,
+anything else is a dry run): PORT 9222 · ACTION 1 · CEILING_MB 1536 · IDLE_SEC 600
 · IDLE_SEC_PRESSURE 180 · PRESSURE_TOTAL_MB 6144 · PRESSURE_SWAP_MB 8192 · ACTIVE_CPU_MS_PER_MIN
 150 · MAX_GAP_SEC 300 · MAX_CLOSE_RUN 2 · MAX_CLOSE_HOUR 8 · MIN_PAGES_KEEP 1 · PROBE_MS 50 (CPU-ms
 of work per probe) · STATE_DIR / LOG / LOCK (default under $GC_CITY_PATH/.gc).
@@ -113,13 +119,17 @@ def _num(env, name, default, cast, lo, strict=False):
 
 
 class Config:
-    """Env-driven knobs. Non-positive / unparsable values fall back to the default."""
+    """Env-driven knobs. Non-positive / unparsable numeric values fall back to the default
+    (a safe one); ACTION is the exception and fails toward the inert dry run instead."""
 
     @classmethod
     def from_env(cls, env):
         c = cls()
         c.port = _num(env, "port", 9222, int, 1)
-        c.action = _num(env, "action", 1, int, 0)
+        # Only an explicit 1 (or an absent variable) arms the guard. A present-but-unparseable
+        # value (off / yes / empty) is a dry run: a typo must never leave a disarm attempt live.
+        raw_action = env.get("CDP_TAB_GUARD_ACTION")
+        c.action = 1 if raw_action is None or str(raw_action).strip() == "1" else 0
         c.ceiling_mb = _num(env, "ceiling_mb", 1536.0, float, 0.0, strict=True)
         c.idle_sec = _num(env, "idle_sec", 600, int, 0)
         c.idle_sec_pressure = _num(env, "idle_sec_pressure", 180, int, 0)
@@ -225,18 +235,34 @@ def read_swap_mb():
 def step_idle(entry, sample, now, cfg):
     """Track how long a renderer's CPU has been quiet. Returns (new_entry, idle_for_s).
     Anything we cannot vouch for (first sight, recycled pid, a hole in observation, a
-    clock or counter that went backwards) restarts the clock: unknown is never idle."""
+    clock or counter that went backwards, a history entry of the wrong shape) restarts the
+    clock: unknown is never idle."""
     fresh = {"start": sample["start"], "idle_since": now, "last_ts": now, "last_cpu_ms": sample["cpu_ms"]}
-    if not entry or entry.get("start") != sample["start"]:
+    if not isinstance(entry, dict) or entry.get("start") != sample["start"]:
         return fresh, 0
-    gap = now - entry["last_ts"]
-    delta = sample["cpu_ms"] - entry["last_cpu_ms"]
-    if gap <= 0 or gap > cfg.max_gap_sec or delta < 0:
-        return fresh, 0
-    active = (delta / gap * 60.0) >= cfg.active_cpu_ms_per_min
-    idle_since = now if active else entry["idle_since"]
+    try:
+        gap = now - entry["last_ts"]
+        delta = sample["cpu_ms"] - entry["last_cpu_ms"]
+        if gap <= 0 or gap > cfg.max_gap_sec or delta < 0:
+            return fresh, 0
+        active = (delta / gap * 60.0) >= cfg.active_cpu_ms_per_min
+        idle_since = now if active else entry["idle_since"]
+        idle_for = int(now - idle_since)
+    except (KeyError, TypeError):
+        return fresh, 0            # a history entry of the wrong shape: cannot vouch for it
     return ({"start": sample["start"], "idle_since": idle_since, "last_ts": now,
-             "last_cpu_ms": sample["cpu_ms"]}, int(now - idle_since))
+             "last_cpu_ms": sample["cpu_ms"]}, idle_for)
+
+
+def credit_own_cpu(entries, own_cpu_ms):
+    """Advance each tracked renderer's stored CPU baseline by the CPU this guard itself burned in it
+    (its probes run JS inside the very renderer it is judging). Without this the next run reads the
+    guard's own probing as tab activity, resets the idle clock, and a tab the guard keeps looking at
+    can never be closed. Real activity is untouched: only the measured probe cost is skipped."""
+    for pid, ms in own_cpu_ms.items():
+        e = entries.get(str(pid))
+        if isinstance(e, dict) and _is_num(e.get("last_cpu_ms")):
+            e["last_cpu_ms"] += ms
 
 
 def classify(fp_mb, idle_for_s, pressure, cfg):
@@ -264,6 +290,21 @@ def pick_probe_pid(deltas_ms, probe_ms):
     if len(ranked) > 1 and ranked[1][1] * 2 >= top:
         return None
     return top_pid
+
+
+def attribute_probe_burn(deltas_ms, probe_ms):
+    """(renderer pid, cpu ms) that one probe attempt burned, or None when it cannot be attributed.
+    Attributed when a single renderer clearly dominates (runner-up < 50% of it) — deliberately
+    WITHOUT the confidence floor that pick_probe_pid needs: an under-powered attempt (the work
+    calibration warming up, a retry) still burned real CPU in that renderer, and left uncredited it
+    reads as tab activity at the next sample. Capped at 4x the probe so the credit can never absorb
+    real activity, only the probe's own (measured ~= probe_ms) cost."""
+    ranked = sorted(deltas_ms.items(), key=lambda kv: -kv[1])
+    if not ranked or ranked[0][1] <= 0:
+        return None
+    if len(ranked) > 1 and ranked[1][1] * 2 >= ranked[0][1]:
+        return None
+    return ranked[0][0], min(ranked[0][1], 4.0 * probe_ms)
 
 
 def decide(candidates, mapping, targets, cfg, closes_last_hour):
@@ -308,6 +349,15 @@ def decide(candidates, mapping, targets, cfg, closes_last_hour):
 
 class CDPError(Exception):
     pass
+
+
+class CDPTimeout(CDPError):
+    pass
+
+
+class PageDead(CDPError):
+    """The page provably cannot share a renderer with a page that answers: it cannot run JS at
+    all (a trivial evaluate timed out) or it no longer exists."""
 
 
 class CDPClient:
@@ -361,12 +411,12 @@ class CDPClient:
         while len(buf) < n:
             left = deadline - time.time()
             if left <= 0:
-                raise CDPError("timed out waiting for the browser")
+                raise CDPTimeout("timed out waiting for the browser")
             self.sock.settimeout(left)
             try:
                 chunk = self.sock.recv(n - len(buf))
             except socket.timeout:
-                raise CDPError("timed out waiting for the browser")
+                raise CDPTimeout("timed out waiting for the browser")
             if not chunk:
                 raise CDPError("connection closed by the browser")
             buf += chunk
@@ -429,7 +479,7 @@ class CDPClient:
                 return resp.get("result", {})
 
 
-PROBE_N_START, PROBE_N_MIN, PROBE_N_MAX = 18_000_000, 2_000_000, 150_000_000
+PROBE_N_MIN, PROBE_N_MAX, PROBE_N_PER_MS = 2_000_000, 150_000_000, 370_000   # ~2.7 ns of CPU per iteration
 
 
 class Prober:
@@ -443,21 +493,31 @@ class Prober:
         self.client = client
         self.pids = sorted(renderer_pids)
         self.probe_ms = probe_ms
-        self.n = PROBE_N_START
+        self.n = int(max(PROBE_N_MIN, min(PROBE_N_MAX, probe_ms * PROBE_N_PER_MS)))   # starts near the target
+        self.burned = {}      # renderer pid -> CPU ms this guard itself burned there (see credit_own_cpu)
 
     def _cpu(self):
         return {p: (read_proc(p) or {}).get("cpu_ms") for p in self.pids}
 
     def probe(self, tid):
-        """Per-renderer CPU deltas (ms) while `tid` runs the probe. Raises on CDP failure —
-        including a page that cannot answer a trivial evaluate within 5 s (a crashed tab never
-        answers; without this ping one would cost the whole probe timeout on every run)."""
+        """Per-renderer CPU deltas (ms) while `tid` runs the probe. Raises PageDead when the page is
+        gone or cannot answer a trivial evaluate within 5 s (a crashed tab never answers; without
+        this ping one would cost the whole probe timeout on every run), and any other CDPError /
+        exception for every other failure — those pages are alive as far as we can tell."""
         js = "(function(n){var x=0;for(var i=0;i<n;i++)x+=Math.sqrt(i);return x})(%d)" % self.n
         before = self._cpu()
-        sid = self.client.call("Target.attachToTarget", {"targetId": tid, "flatten": True})["sessionId"]
         try:
-            self.client.call("Runtime.evaluate", {"expression": "1", "returnByValue": True},
-                             session_id=sid, timeout=5)
+            sid = self.client.call("Target.attachToTarget", {"targetId": tid, "flatten": True})["sessionId"]
+        except CDPError as ex:
+            if "No target with given id" in str(ex):
+                raise PageDead("gone: %s" % ex)
+            raise
+        try:
+            try:
+                self.client.call("Runtime.evaluate", {"expression": "1", "returnByValue": True},
+                                 session_id=sid, timeout=5)
+            except CDPTimeout:
+                raise PageDead("did not answer a trivial evaluate within 5 s")
             self.client.call("Runtime.evaluate", {"expression": js, "returnByValue": True},
                              session_id=sid, timeout=30)
         finally:
@@ -469,49 +529,82 @@ class Prober:
         deltas = {p: after[p] - before[p] for p in self.pids
                   if before.get(p) is not None and after.get(p) is not None}
         top = max(deltas.values(), default=0.0)
+        burn = attribute_probe_burn(deltas, self.probe_ms)
+        if burn is not None:
+            self.burned[burn[0]] = self.burned.get(burn[0], 0.0) + burn[1]
         scale = max(0.25, min(4.0, self.probe_ms / max(top, 1e-3)))
         self.n = int(max(PROBE_N_MIN, min(PROBE_N_MAX, self.n * scale)))
         return deltas
 
     def map_pages(self, page_ids, budget_s=45.0):
         """(mapping {renderer pid: [page ids]}, unresolved [page ids], dead [page ids]).
-        dead       = the page could not run JS at all (crashed / wedged / gone). Every page in a
-                     renderer shares its main thread, so a dead page cannot share a renderer with a
-                     page that did answer — it never blocks a close.
-        unresolved = the page answered but could not be placed convincingly after 3 tries, or the
-                     budget ran out before it was probed. It MAY share a candidate's renderer, so
-                     the caller must not close anything while any exist."""
+        dead       = PageDead: the page is gone or could not run JS at all (crashed / wedged). Every
+                     page in a renderer shares its main thread, so a dead page cannot share a
+                     renderer with a page that did answer — it never blocks a close.
+        unresolved = anything else: the page failed for another reason, answered but could not be
+                     placed convincingly after 3 tries, or the budget ran out before it was probed.
+                     It MAY share a candidate's renderer, so the caller must not close anything
+                     while any exist."""
         mapping, unresolved, dead = {}, [], []
         end = time.time() + budget_s
         for tid in page_ids:
-            pid, failed = None, False
+            pid, is_dead = None, False
             for _attempt in range(3):
                 if time.time() > end:
                     break
                 try:
                     pid = pick_probe_pid(self.probe(tid), self.probe_ms)
+                except PageDead:
+                    is_dead = True
+                    break
                 except Exception:
-                    failed = True
                     break
                 if pid is not None:
                     break
             if pid is not None:
                 mapping.setdefault(pid, []).append(tid)
-            elif failed:
+            elif is_dead:
                 dead.append(tid)
             else:
                 unresolved.append(tid)
         return mapping, unresolved, dead
 
 
-def busy_renderers(pids, window_s=0.5, max_ms=15.0):
-    """Renderers burning CPU right now (>= max_ms in window_s; an idle page sits under 2 ms).
-    Placing tabs by CPU while a neighbour burns CPU can mis-place a tab, so the caller defers."""
+def busy_renderers(pids, window_s=1.2, max_ms=15.0):
+    """Renderers burning CPU right now (>= max_ms in window_s; an idle page sits under 2 ms). The window
+    is longer than 1 s on purpose: Chrome throttles background-tab timers to 1 Hz, and a shorter window
+    misses such a burst about half the time. Also counts
+    any renderer that is alive but unreadable (unknown is not quiet). A process that exited is churn,
+    not noise. Placing tabs by CPU while a neighbour burns CPU can mis-place a tab, so the caller defers."""
     first = {p: (read_proc(p) or {}).get("cpu_ms") for p in pids}
     time.sleep(window_s)
     second = {p: (read_proc(p) or {}).get("cpu_ms") for p in pids}
-    return sorted(p for p in pids if first.get(p) is not None and second.get(p) is not None
-                  and second[p] - first[p] >= max_ms)
+    busy = []
+    for p in pids:
+        a, b = first.get(p), second.get(p)
+        if a is not None and b is not None:
+            if b - a >= max_ms:
+                busy.append(p)
+        elif _pid_alive(p):
+            busy.append(p)
+    return sorted(busy)
+
+
+def wait_for_quiet(pids, attempts=3, pause_s=0.6, check=None):
+    """Up to `attempts` looks at whether any renderer is burning CPU, `pause_s` apart. [] as soon as
+    one look is quiet; otherwise the busy pids of the last look. Sporadic noise must not starve the
+    guard (on the production Chrome some extension renderer burst >= 15 ms in 22% of 1.2 s windows,
+    measured 2026-09-19); a neighbour that is steadily or repeatedly busy stays busy across looks and
+    is still deferred for."""
+    check = check or busy_renderers
+    busy = []
+    for i in range(attempts):
+        busy = check(pids)
+        if not busy:
+            return []
+        if i < attempts - 1:
+            time.sleep(pause_s)
+    return busy
 
 
 # ───────────────────────────── state, logging, run ─────────────────────────────
@@ -533,24 +626,44 @@ def _write_json_atomic(path, obj):
     os.replace(tmp, path)
 
 
+def _is_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
 def load_state(cfg, log):
+    """The state, always in the same shape: {'pids': {str: dict}, 'closes': [num], 'last_heartbeat': num}.
+    A missing file is a fresh start; an unparsable file or a part of the wrong type is logged and
+    replaced (valid JSON of the wrong shape must not crash every run — the crash would come before
+    the rewrite, so it would never heal). Fresh history means no tab can look idle yet: inert."""
+    empty = {"pids": {}, "closes": [], "last_heartbeat": 0}
     try:
         with open(cfg.state_path) as f:
             st = json.load(f)
         if not isinstance(st, dict):
             raise ValueError("state is not an object")
-        return st
     except FileNotFoundError:
-        return {}
+        return empty
     except Exception as ex:
         log("STATE unreadable (%s) — starting fresh; nothing will be closed until idle time is re-observed"
             % type(ex).__name__)
-        return {}
+        return empty
+    pids, closes, hb = st.get("pids"), st.get("closes"), st.get("last_heartbeat")
+    clean = {
+        "pids": {str(k): v for k, v in pids.items() if isinstance(v, dict)} if isinstance(pids, dict) else {},
+        "closes": [t for t in closes if _is_num(t)] if isinstance(closes, list) else [],
+        "last_heartbeat": hb if _is_num(hb) else 0,
+    }
+    if (clean["pids"] != (pids or {}) or clean["closes"] != (closes or []) or clean["last_heartbeat"] != (hb or 0)):
+        log("STATE had an unexpected shape — kept the well-typed parts, dropped the rest")
+    return clean
 
 
 def make_logger(cfg, verbose=False):
     def log(msg):
+        """Append one line. Returns True only when it reached the log file; on failure the line goes
+        to stderr under LOG UNWRITABLE so the failure is loud, and the caller can refuse to act."""
         line = "[%s] %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+        ok = True
         try:
             os.makedirs(os.path.dirname(cfg.log_path), exist_ok=True)
             try:
@@ -560,10 +673,12 @@ def make_logger(cfg, verbose=False):
                 pass
             with open(cfg.log_path, "a") as f:
                 f.write(line + "\n")
-        except OSError:
-            pass
+        except OSError as ex:
+            ok = False
+            print("LOG UNWRITABLE (%s): %s" % (type(ex).__name__, line), file=sys.stderr)
         if verbose:
             print(line)
+        return ok
     return log
 
 
@@ -601,10 +716,10 @@ def _target_ids(client):
 def act(cfg, state, candidates, renderer_pids, now, live, log):
     """Connect, map tabs to renderers, decide, and (when live) close. Returns closes made."""
     made = 0
-    noisy = busy_renderers(sorted(renderer_pids))
+    noisy = wait_for_quiet(sorted(renderer_pids))
     if noisy:
-        log("DEFER_NOISY renderer(s) %s are burning CPU right now — placing tabs by CPU could mis-place "
-            "one, so no tab is probed or closed this run" % noisy)
+        log("DEFER_NOISY renderer(s) %s kept burning CPU across three looks — placing tabs by CPU could "
+            "mis-place one, so no tab is probed or closed this run" % noisy)
         return 0
     client = CDPClient.connect(cfg.port, timeout=10)
     try:
@@ -612,6 +727,7 @@ def act(cfg, state, candidates, renderer_pids, now, live, log):
         targets = {t["targetId"]: t for t in infos}
         page_ids = [t["targetId"] for t in infos if t.get("type") == "page"]
         prober = Prober(client, renderer_pids, cfg.probe_ms)
+        state["own_cpu_ms"] = prober.burned      # same dict: filled as probing proceeds, read by run_once
         mapping, unresolved, dead = prober.map_pages(page_ids)
         log("PROBE pages=%d placed=%d unresolved=%d dead=%d" % (
             len(page_ids), sum(len(v) for v in mapping.values()), len(unresolved), len(dead)))
@@ -623,6 +739,7 @@ def act(cfg, state, candidates, renderer_pids, now, live, log):
                     c["pid"], c["fp_mb"], c["idle_for_s"], len(unresolved), len(page_ids)))
             return 0
         closes = [t for t in state.get("closes", []) if now - t < 3600]
+        state["closes"] = closes          # same list: every confirmed close is recorded as it happens
         decisions = decide(candidates, mapping, targets, cfg, len(closes))
         for d in decisions:
             t = targets.get(d["target"]) if d["target"] else None
@@ -638,13 +755,20 @@ def act(cfg, state, candidates, renderer_pids, now, live, log):
             if not live:
                 log("WOULD_CLOSE %s" % what)
                 continue
-            try:
-                confirmed = pick_probe_pid(prober.probe(d["target"]), cfg.probe_ms) == d["pid"]
-            except Exception:
-                confirmed = False
+            confirmed = False
+            for _look in range(2):        # like the mapping phase: one ambiguous look is not a verdict
+                try:
+                    got = pick_probe_pid(prober.probe(d["target"]), cfg.probe_ms)
+                except Exception:
+                    break
+                if got == d["pid"]:
+                    confirmed = True
+                    break
             if not confirmed:
                 log("SKIP UNCONFIRMED %s (placement did not reproduce right before closing)" % what)
                 continue
+            if not log("CLOSING %s" % what):
+                continue        # no durable record, no close (LOG UNWRITABLE is on stderr)
             client.call("Target.closeTarget", {"targetId": d["target"]})
             gone = False
             for _ in range(24):
@@ -664,7 +788,6 @@ def act(cfg, state, candidates, renderer_pids, now, live, log):
                 log("CLOSED %s renderer_exited=%s" % (what, exited))
             else:
                 log("CLOSE_INEFFECTIVE %s (target still listed 6s after closeTarget)" % what)
-        state["closes"] = closes
     finally:
         client.close()
     return made
@@ -681,18 +804,20 @@ def run_once(cfg, verbose=False):
         return 0
     now = time.time()
     state = load_state(cfg, log)
-    ps = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True, timeout=15).stdout
-    main_pid, rends = parse_family(ps, cfg.port)
+    ps_run = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True, timeout=15)
+    main_pid, rends = parse_family(ps_run.stdout, cfg.port)
     if main_pid is None:
-        log("UNMEASURED no Chrome main process with --remote-debugging-port=%d in `ps` — "
-            "nothing was evaluated, nothing was closed" % cfg.port)
+        log("UNMEASURED no Chrome main process with --remote-debugging-port=%d in `ps` (ps rc=%d) — "
+            "nothing was evaluated, nothing was closed" % (cfg.port, ps_run.returncode))
+        _write_json_atomic(cfg.status_path, {"ts": now, "measured": False, "renderers": None,
+                                             "reason": "no chrome main process for port %d" % cfg.port})
         return 0
 
     samples = {pid: read_proc(pid) for pid in rends}
     # A renderer that exited between `ps` and the read is normal churn; only a live process we
     # cannot read is worth reporting.
     unreadable = sorted(pid for pid, s in samples.items() if s is None and _pid_alive(pid))
-    old = state.get("pids") or {}
+    old = state["pids"]
     new_pids, evals = {}, []
     for pid, s in samples.items():
         if s is None:
@@ -729,9 +854,10 @@ def run_once(cfg, verbose=False):
         try:
             closed = act(cfg, state, candidates, rends, now, live, log)
         except Exception as ex:
-            log("ERROR acting on %d heavy idle renderer(s): %s: %s — nothing closed by this run's failure path"
-                % (len(candidates), type(ex).__name__, ex))
+            log("ERROR acting on %d heavy idle renderer(s): %s: %s — a close may already have been issued "
+                "before the failure: check the CLOSING/CLOSED lines above" % (len(candidates), type(ex).__name__, ex))
 
+    credit_own_cpu(new_pids, state.pop("own_cpu_ms", None) or {})
     state["v"] = 1
     state["pids"] = new_pids
     state["closes"] = [t for t in state.get("closes", []) if now - t < 3600]
@@ -741,7 +867,8 @@ def run_once(cfg, verbose=False):
         state["last_heartbeat"] = now
     _write_json_atomic(cfg.state_path, state)
     _write_json_atomic(cfg.status_path, {
-        "ts": now, "renderers": len(evals), "unreadable": len(unreadable), "total_mb": round(total_mb, 1),
+        "ts": now, "measured": True, "renderers": len(evals), "unreadable": len(unreadable),
+        "total_mb": round(total_mb, 1),
         "max_mb": round(max_mb, 1), "heavy": len(heavy), "pressure": pressure, "live": live,
         "closed_this_run": closed, "closes_last_hour": len(state["closes"])})
     return 0

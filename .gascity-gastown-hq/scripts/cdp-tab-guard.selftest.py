@@ -153,6 +153,33 @@ class IdleTrackerTests(unittest.TestCase):
         entry, idle = G.step_idle(entry, self._s(1, 100.0), 1060, self.cfg)  # counter went back
         self.assertEqual(idle, 0)
 
+    def test_the_guards_own_probe_cpu_is_not_activity(self):
+        """Catches: the guard's own probing (it burns CPU inside the renderer it inspects) being read
+        as tab activity at the next sample, so a heavy idle tab that keeps getting probed would look
+        busy for ever and never be closed."""
+        e1, _ = G.step_idle(None, self._s(1, 5000.0), 1000, self.cfg)
+        control = dict(e1)                                        # untouched copy (credit works in place)
+        entries = {"7": e1}
+        G.credit_own_cpu(entries, {7: 200.0})                     # the guard burned 200 ms inside pid 7
+        self.assertEqual(entries["7"]["last_cpu_ms"], 5200.0)
+        _, idle = G.step_idle(entries["7"], self._s(1, 5205.0), 1060, self.cfg)   # 200 ours + 5 real
+        self.assertEqual(idle, 60)
+        _, idle_uncredited = G.step_idle(control, self._s(1, 5205.0), 1060, self.cfg)  # control: 205 ms/min
+        self.assertEqual(idle_uncredited, 0)
+        G.credit_own_cpu({}, {9: 5.0})                            # a renderer we do not track: ignored
+
+    def test_malformed_history_is_first_sight_not_a_crash(self):
+        """Catches: a history entry of the wrong shape (hand-edited or half-written state) raising on
+        every run, which would leave the guard permanently silent."""
+        bad = [{"start": 111},
+               {"start": 111, "idle_since": "x", "last_ts": 990, "last_cpu_ms": 1.0},
+               {"start": 111, "idle_since": 1000, "last_ts": None, "last_cpu_ms": 1.0},
+               "garbage", []]
+        for entry in bad:
+            new, idle = G.step_idle(entry, self._s(111, 5.0), 1000, self.cfg)
+            self.assertEqual(idle, 0, repr(entry))
+            self.assertEqual(new["start"], 111, repr(entry))
+
 
 class ClassifyTests(unittest.TestCase):
     def setUp(self):
@@ -188,6 +215,104 @@ class ClassifyTests(unittest.TestCase):
         for bad in ("0", "-5", "abc", ""):
             cfg = env_cfg(ceiling_mb=bad, idle_sec=1, idle_sec_pressure=1)
             self.assertEqual(G.classify(30.0, 9999, False, cfg), "OK", "ceiling=%r" % bad)
+
+
+class ConfigTests(unittest.TestCase):
+    def test_only_an_explicit_1_arms_the_guard(self):
+        """Catches: a typo in the kill switch (ACTION=off / yes / empty) falling back to the LIVE
+        default, so an operator who tried to disarm the guard leaves it closing tabs."""
+        self.assertEqual(G.Config.from_env({}).action, 1)        # absent: the documented default
+        for raw, want in (("1", 1), (" 1 ", 1), ("0", 0), ("off", 0), ("yes", 0), ("true", 0),
+                          ("", 0), ("2", 0), ("-1", 0)):
+            self.assertEqual(G.Config.from_env({"CDP_TAB_GUARD_ACTION": raw}).action, want, repr(raw))
+
+
+class LoadStateTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="cdp-tab-guard-loadstate-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.cfg = env_cfg(state_dir=self.dir)
+        self.logged = []
+
+    def _load(self, text=None):
+        if text is not None:
+            pathlib.Path(self.cfg.state_path).write_text(text)
+        return G.load_state(self.cfg, self.logged.append)
+
+    def test_missing_file_is_an_empty_normalized_state(self):
+        self.assertEqual(self._load(), {"pids": {}, "closes": [], "last_heartbeat": 0})
+
+    def test_wrong_shapes_are_replaced_not_propagated(self):
+        """Catches: valid JSON of the wrong shape raising in every run. The crash comes before the
+        state is rewritten, so it would never heal."""
+        st = self._load('{"pids": [], "closes": "x", "last_heartbeat": "y"}')
+        self.assertEqual(st, {"pids": {}, "closes": [], "last_heartbeat": 0})
+        self.assertTrue(any("STATE" in line for line in self.logged), "repair must be visible: %r" % self.logged)
+
+    def test_well_typed_parts_survive_and_junk_parts_are_dropped(self):
+        """Catches: throwing away good history because one entry is junk (the guard would forget
+        how long every tab has been idle)."""
+        st = self._load('{"pids": {"5": {"start": 1}, "6": "junk"}, "closes": [1.5, "x", true, 2],'
+                        ' "last_heartbeat": 7}')
+        self.assertEqual(st, {"pids": {"5": {"start": 1}}, "closes": [1.5, 2], "last_heartbeat": 7})
+
+
+class BusyRenderersTests(unittest.TestCase):
+    def test_a_process_that_exited_is_not_busy(self):
+        """Catches: normal renderer churn (one exiting during the check) deferring every run."""
+        self.assertEqual(G.busy_renderers([4194301], window_s=0.05), [])
+
+    def test_a_one_hertz_bursty_neighbour_is_caught_by_the_default_window(self):
+        """Catches: a check window shorter than the period of a throttled background timer (1 Hz).
+        The burst then falls outside the window about half the time and the guard places tabs while
+        a neighbour is about to burn CPU."""
+        child = subprocess.Popen([sys.executable, "-c",
+                                  "import time\nwhile True:\n    t = time.process_time()\n"
+                                  "    while time.process_time() - t < 0.04:\n        pass\n    time.sleep(0.96)\n"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        # Eight looks at different phases of the cycle. A 0.5 s window catches a 1 Hz burst only about half
+        # the time, so with three looks the old default passed by luck (~10%); with eight it passes ~0.4%.
+        for _ in range(8):
+            self.assertEqual(G.busy_renderers([child.pid]), [child.pid])
+            time.sleep(0.37)
+
+    def test_an_alive_but_unreadable_process_counts_as_busy(self):
+        """Catches: 'cannot read its CPU' being treated as 'quiet'. An unreadable renderer could be
+        the one burning CPU and drowning the probe. (pid 1 is alive but unreadable to this user.)"""
+        self.assertEqual(G.busy_renderers([1], window_s=0.05), [1])
+
+
+class WaitForQuietTests(unittest.TestCase):
+    @staticmethod
+    def _scripted(answers):
+        seq, calls = iter(answers), []
+
+        def check(pids):
+            calls.append(list(pids))
+            return next(seq)
+        return check, calls
+
+    def test_sporadic_noise_does_not_defer(self):
+        """Catches: hard-deferring on a single noisy look. On the production Chrome some extension
+        renderer burst over 15 ms in 22% of 1.2 s windows (measured), so a one-look rule would leave
+        the guard blind about one run in five."""
+        check, calls = self._scripted([[7], [7], []])
+        self.assertEqual(G.wait_for_quiet([7], attempts=3, pause_s=0, check=check), [])
+        self.assertEqual(len(calls), 3)
+
+    def test_persistent_noise_still_defers_with_the_last_look(self):
+        """Catches: giving up on noise too early (the neighbour that is still busy on the last look
+        must be reported so the guard does not place tabs while it burns CPU)."""
+        check, calls = self._scripted([[7], [7, 9], [9]])
+        self.assertEqual(G.wait_for_quiet([7, 9], attempts=3, pause_s=0, check=check), [9])
+        self.assertEqual(len(calls), 3)
+
+    def test_a_quiet_first_look_returns_at_once(self):
+        """Catches: always spending every attempt (each look costs more than a second)."""
+        check, calls = self._scripted([[]])
+        self.assertEqual(G.wait_for_quiet([7], attempts=3, pause_s=0, check=check), [])
+        self.assertEqual(len(calls), 1)
 
 
 class PressureTests(unittest.TestCase):
@@ -240,6 +365,24 @@ ALL_TARGETS = _targets(
     _t("X1", url="chrome://settings/"),
     _t("E1", typ="service_worker", url="chrome-extension://abc/sw.js"),
 )
+
+
+class AttributeProbeBurnTests(unittest.TestCase):
+    def test_table(self):
+        """Catches: a probe's CPU going uncredited because the attempt was below the placement
+        confidence floor (the work calibration warming up, or a retry): that burn then reads as tab
+        activity at the next sample. Also: crediting an ambiguous attempt (activity would be hidden),
+        and crediting without a cap (real activity could be absorbed)."""
+        cases = [  # deltas, probe_ms, want
+            ({101: 48.0, 102: 2.0}, 150, (101, 48.0)),       # under-powered (below the 60 ms floor) but clear
+            ({101: 148.0, 102: 3.0}, 150, (101, 148.0)),
+            ({101: 300.0, 102: 1.0}, 50, (101, 200.0)),      # capped at 4x the probe
+            ({101: 60.0, 102: 40.0}, 50, None),              # two renderers burned: cannot say which is ours
+            ({101: 0.0, 102: 0.0}, 50, None),                # nothing burned
+            ({}, 50, None),
+        ]
+        for deltas, probe_ms, want in cases:
+            self.assertEqual(G.attribute_probe_burn(deltas, probe_ms), want, str(deltas))
 
 
 class DecideTests(unittest.TestCase):
@@ -359,15 +502,22 @@ class CdpClientTimeoutTests(unittest.TestCase):
 
 HEAVY_HTML = ("<script>const a=new Uint8Array(260*1024*1024);"
               "for(let i=0;i<a.length;i+=4096)a[i]=1;window.__a=a;</script><p>heavy</p>")
-HEAVY_BUSY_HTML = (HEAVY_HTML +
-                   "<script>setInterval(()=>{const t=performance.now();"
-                   "while(performance.now()-t<40){}},60);</script>")
+# The busy fixtures burn a fixed amount of WORK (not wall time: a wall-clock loop gets only a fraction of a CPU on
+# a loaded box). V8 compiles the loop to ~0.9 ns/iteration (measured 2026-09-19: 20e6 iterations = ~18 ms of CPU),
+# so the sizes below are in ms of CPU at that rate.
+HEAVY_BUSY_HTML = (HEAVY_HTML +      # ~14 ms of CPU every 60 ms: far above the idle line at any load
+                   "<script>setInterval(()=>{let x=0;for(let i=0;i<15e6;i++)x+=Math.sqrt(i);window.__x=x;},60);</script>")
 LIGHT_HTML = "<p>light</p>"
-BUSY_HTML = ("<script>setInterval(()=>{const t=performance.now();"
-             "while(performance.now()-t<40){}},60);</script><p>busy</p>")
+# A 1 Hz burst is what background-tab throttling leaves. It must clear the guard's "busy" line (15 ms per 1.2 s
+# window) by a wide margin: the 20e6-iteration version (~18 ms) sat 3 ms above it, so any window that clipped the
+# burst read as quiet, the guard (correctly) went on to close the heavy tab, and this suite flaked under load.
+# 100e6 iterations = ~90 ms of CPU per burst. The 1 Hz window-length rule itself is pinned deterministically by
+# BusyRenderersTests.test_a_one_hertz_bursty_neighbour_is_caught_by_the_default_window.
+BUSY_HTML = ("<script>setInterval(()=>{let x=0;for(let i=0;i<100e6;i++)x+=Math.sqrt(i);window.__x=x;},1000);"
+             "</script><p>busy</p>")
 
 
-def _http(port, path, method="GET", timeout=5):
+def _http(port, path, method="GET", timeout=30):
     req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path), method=method)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         body = r.read().decode()
@@ -440,9 +590,23 @@ class TestChrome:
         fps = [(G.read_proc(p) or {}).get("footprint_mb", 0.0) for p in rends]
         return max(fps) if fps else 0.0
 
-    def new_resident_page(self, name, floor_mb=200.0):
+    def wait_quiet(self, timeout=90.0):
+        """Until NO renderer has burned 8 ms or more of CPU over a 2 s window (the post-load GC tail of a
+        260 MB page, or a fresh renderer's start-up, is what this waits out)."""
+        def quiet():
+            ps = subprocess.check_output(["ps", "-axo", "pid=,ppid=,command="], text=True)
+            _, rends = G.parse_family(ps, self.port)
+            a = {p: (G.read_proc(p) or {}).get("cpu_ms") for p in rends}
+            time.sleep(2.0)
+            b = {p: (G.read_proc(p) or {}).get("cpu_ms") for p in rends}
+            return all(a[p] is None or b[p] is None or b[p] - a[p] < 8.0 for p in rends)
+        wait_for(quiet, timeout, "every renderer to go quiet")
+
+    def new_resident_page(self, name, floor_mb=200.0, quiet=True):
         tid = self.new_page(name)
         wait_for(lambda: self.max_renderer_mb() >= floor_mb, 30, "%s to become resident" % name)
+        if quiet:
+            self.wait_quiet()
         return tid
 
 
@@ -505,13 +669,34 @@ class E2E(unittest.TestCase):
         self.assertEqual(sorted(stamps), ["HEAVY_IDLE", "PROBE"], self.log_text())
         return stamps["PROBE"] - stamps["HEAVY_IDLE"]
 
-    def two_runs(self, **cfg):
-        """First sight, let the idle requirement elapse, then the decisive run."""
+    def decisive_run(self, page_id, attempts=5, **cfg):
+        """Run the guard until `page_id` is gone (at most `attempts` runs, 2 s apart). A run may legitimately
+        skip on renderer noise (DEFER_NOISY / UNCONFIRMED) — in production launchd simply runs it again a
+        minute later; the test does the same a few seconds later. On a starved box (load 50+, about a million
+        page compressions a minute, measured 2026-09-19) healthy pages can also miss the guard's 5 s liveness
+        ping for tens of seconds (PROBE dead=N -> SKIP UNMAPPED: inert, by design), so this keeps trying for
+        longer than a quiet machine would need; a guard that never closes still fails after `attempts` runs.
+        Returns the last CompletedProcess."""
+        r = None
+        for _ in range(attempts):
+            r = self.run_guard(**cfg)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            if page_id not in {t["id"] for t in FX.pages()}:
+                break
+            time.sleep(2.0)
+        return r
+
+    def two_runs(self, closes=None, **cfg):
+        """First sight, let the idle requirement elapse, then the decisive run. With `closes=<page id>` the
+        decisive run is retried (see decisive_run) when that page is still open afterwards."""
         time.sleep(1.5)                       # let post-load GC/finalizers settle
         r1 = self.run_guard(**cfg)
         time.sleep(3.5)
         r2 = self.run_guard(**cfg)
         self.assertEqual((r1.returncode, r2.returncode), (0, 0), (r1.stderr, r2.stderr))
+        if closes is not None and closes in {t["id"] for t in FX.pages()}:
+            time.sleep(2.0)
+            r2 = self.decisive_run(closes, attempts=2, **cfg)
         return r2
 
     # ---- the core contract -------------------------------------------------
@@ -522,7 +707,7 @@ class E2E(unittest.TestCase):
         release the renderer."""
         heavy = FX.new_resident_page("heavy.html")
         light = FX.new_page("light.html")
-        self.two_runs()
+        self.two_runs(closes=heavy)
         ids = {t["id"] for t in FX.pages()}
         self.assertNotIn(heavy, ids, "heavy idle page must be closed\n" + self.log_text())
         self.assertIn(light, ids, "light page must survive")
@@ -537,7 +722,7 @@ class E2E(unittest.TestCase):
         on CPU activity, and the pre-probe deferral while any renderer burns CPU). Either layer alone
         keeps this tab open, so this proves the system; the idle tracker's own rule is pinned by
         IdleTrackerTests and the deferral by test_a_noisy_neighbour_defers_placement..."""
-        busy = FX.new_resident_page("heavy-busy.html")
+        busy = FX.new_resident_page("heavy-busy.html", quiet=False)
         self.two_runs()
         self.assertIn(busy, {t["id"] for t in FX.pages()}, self.log_text())
         self.assertIn("HEAVY_NOT_IDLE", self.log_text())
@@ -588,6 +773,11 @@ class E2E(unittest.TestCase):
         FX.new_resident_page("heavy.html")
         FX.new_page("light.html")
         self.two_runs(max_close_run=1)
+        for _ in range(2):        # a noisy run may close nothing; production simply runs again a minute later
+            if len([t for t in FX.pages() if t["url"].endswith("heavy.html")]) < 2:
+                break
+            time.sleep(2.0)
+            self.run_guard(max_close_run=1)
         heavy_left = [t for t in FX.pages() if t["url"].endswith("heavy.html")]
         self.assertEqual(len(heavy_left), 1, self.log_text())
         self.assertIn("CAP_RUN", self.log_text())
@@ -609,7 +799,7 @@ class E2E(unittest.TestCase):
         self.assertIn(heavy, {t["id"] for t in FX.pages()})
         self.assertIn("SKIP locked", self.log_text())
         fcntl.flock(held, fcntl.LOCK_UN)
-        self.assertEqual(self.run_guard().returncode, 0)
+        self.decisive_run(heavy)
         self.assertNotIn(heavy, {t["id"] for t in FX.pages()}, self.log_text())
 
     # ---- three-state discipline ----------------------------------------------
@@ -630,6 +820,8 @@ class E2E(unittest.TestCase):
         r = self.run_guard(port=9999)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("UNMEASURED", self.log_text())
+        st = json.loads(pathlib.Path(self.state, "status.json").read_text())   # alive but blind, said so
+        self.assertIs(st["measured"], False)
 
     def test_an_attached_cdp_client_does_not_protect_a_heavy_idle_page(self):
         """Catches: 'attached' being used as an in-use signal. Under playwright-mcp EVERY tab
@@ -640,7 +832,7 @@ class E2E(unittest.TestCase):
         client = G.CDPClient.connect(TEST_PORT, timeout=10)
         self.addCleanup(client.close)
         client.call("Target.attachToTarget", {"targetId": heavy, "flatten": True})
-        self.two_runs()
+        self.two_runs(closes=heavy)
         self.assertNotIn(heavy, {t["id"] for t in FX.pages()}, self.log_text())
 
     # ---- placement hazards ------------------------------------------------------
@@ -657,12 +849,17 @@ class E2E(unittest.TestCase):
         self.addCleanup(client.close)
         ps = subprocess.check_output(["ps", "-axo", "pid=,ppid=,command="], text=True)
         _, rends = G.parse_family(ps, TEST_PORT)
-        pid = G.pick_probe_pid(G.Prober(client, rends, 40).probe(crashed), 40)
+        prober, pid = G.Prober(client, rends, 40), None
+        for _ in range(8):                  # a loaded box can make one probe ambiguous
+            pid = G.pick_probe_pid(prober.probe(crashed), 40)
+            if pid is not None:
+                break
+            time.sleep(1.0)
         self.assertIsNotNone(pid, "could not place the tab that is about to be crashed")
         os.kill(pid, signal.SIGKILL)
         time.sleep(1.5)
         t0 = time.time()
-        self.two_runs()
+        self.two_runs(closes=heavy)
         self.assertLess(time.time() - t0, 100, "runs took too long: " + self.log_text())
         ids = {t["id"] for t in FX.pages()}
         self.assertNotIn(heavy, ids, self.log_text())
@@ -683,7 +880,7 @@ class E2E(unittest.TestCase):
         self.assertIn("DEFER_NOISY", self.log_text())
         FX.close_page(busy)
         time.sleep(1.5)
-        self.assertEqual(self.run_guard().returncode, 0)
+        self.decisive_run(heavy)
         self.assertNotIn(heavy, {t["id"] for t in FX.pages()}, self.log_text())
 
     def test_two_tabs_in_one_renderer_are_never_closed(self):
@@ -710,14 +907,19 @@ class E2E(unittest.TestCase):
         best = max(rends, key=lambda p: (G.read_proc(p) or {"footprint_mb": 0.0})["footprint_mb"])
         return rends, {"pid": best, "fp_mb": G.read_proc(best)["footprint_mb"], "idle_for_s": 999}
 
-    def _act(self, prober_cls):
+    def _act(self, prober_cls, state=None):
         """Run the guard's real act() against the real Chrome with `prober_cls` as the placement
         mechanism. Returns (closes made, the log lines it wrote)."""
         rends, cand = self._heavy_candidate()
         cfg = env_cfg(port=TEST_PORT, probe_ms=40, state_dir=self.state)
         lines = []
+
+        def log(msg):                       # like the real logger: True means "durably written"
+            lines.append(msg)
+            return True
+
         with mock.patch.object(G, "Prober", prober_cls):
-            made = G.act(cfg, {}, [cand], rends, time.time(), True, lines.append)
+            made = G.act(cfg, state if state is not None else {}, [cand], rends, time.time(), True, log)
         return made, "\n".join(lines)
 
     def test_act_closes_with_the_real_prober_positive_control(self):
@@ -777,6 +979,119 @@ class E2E(unittest.TestCase):
         self.assertIn(heavy, {t["id"] for t in FX.pages()})
         self.assertIn("UNCONFIRMED", log)
 
+    def test_a_guard_that_cannot_log_does_not_close_anything(self):
+        """Catches: closing tabs with no durable record. When the log cannot be written (a full disk
+        is the very incident this guard exists for) an unrecorded close is worse than none: nobody
+        can tell what disappeared or why. With the log fixed, the same state closes the tab."""
+        heavy = FX.new_resident_page("heavy.html")
+        FX.new_page("light.html")
+        time.sleep(1.5)
+        self.assertEqual(self.run_guard().returncode, 0)                   # first sight, normal log
+        time.sleep(3.5)
+        blocker = os.path.join(self.state, "not-a-directory")
+        pathlib.Path(blocker).write_text("")
+        r = self.run_guard(log=os.path.join(blocker, "guard.log"))         # log path under a regular file
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(heavy, {t["id"] for t in FX.pages()})
+        self.assertIn("LOG UNWRITABLE", r.stderr)                            # loud, not silent
+        self.decisive_run(heavy)                                           # log fixed: now it acts
+        self.assertNotIn(heavy, {t["id"] for t in FX.pages()}, self.log_text())
+
+    def test_a_page_that_fails_for_an_unknown_reason_blocks_the_close(self):
+        """Catches: every probe failure being filed as 'dead'. Only 'cannot run JS at all' and 'gone'
+        provably cannot share the heavy renderer; a page that errored for any other reason (context
+        destroyed by a navigation, a protocol hiccup) is alive and may share it."""
+        heavy = FX.new_resident_page("heavy.html")
+        light = FX.new_page("light.html")
+        time.sleep(1.5)
+
+        class Failing(G.Prober):
+            def probe(self, tid):
+                if tid == light:
+                    raise G.CDPError("Runtime.evaluate: {'code': -32000, 'message': 'Cannot find context'}")
+                return super().probe(tid)
+
+        made, log = self._act(Failing)
+        self.assertEqual(made, 0, log)
+        self.assertIn(heavy, {t["id"] for t in FX.pages()})
+        self.assertIn("PARTIAL_PROBE", log)
+
+    def test_a_page_that_vanished_is_dead_not_unresolved(self):
+        """Catches: a tab an agent closed a moment ago ('No target with given id') being treated as
+        an unplaceable page that blocks every close. It is gone, so it cannot share anything. Uses the
+        REAL prober against a really closed target, so it pins Chrome's actual error behaviour."""
+        gone = FX.new_page("light.html")
+        FX.new_page("light.html")
+        time.sleep(1.0)
+        FX.close_page(gone)
+        time.sleep(0.5)
+        client = G.CDPClient.connect(TEST_PORT, timeout=10)
+        self.addCleanup(client.close)
+        ps = subprocess.check_output(["ps", "-axo", "pid=,ppid=,command="], text=True)
+        _, rends = G.parse_family(ps, TEST_PORT)
+        mapping, unresolved, dead = G.Prober(client, rends, 40).map_pages([gone])
+        self.assertEqual((mapping, unresolved, dead), ({}, [], [gone]))
+
+    def test_the_guards_probe_cpu_is_recorded_against_the_renderer_it_burned_in(self):
+        """Catches: probe CPU never being credited (0) or credited in the wrong units (x1000). With
+        probe_ms=40 the mapping probe and the confirmation probe burn roughly 80 ms in the heavy
+        renderer; the state hands that number to run_once so it can be excluded from 'activity'."""
+        FX.new_resident_page("heavy.html")
+        FX.new_page("light.html")
+        FX.wait_quiet()
+        state = {}
+        made, log = self._act(G.Prober, state)
+        self.assertEqual(made, 1, log)
+        burned = state["own_cpu_ms"]
+        self.assertTrue(burned, "nothing recorded: " + log)
+        top = max(burned.values())
+        self.assertTrue(30.0 <= top <= 400.0, "recorded %r" % burned)
+
+    def test_the_guards_own_probing_does_not_reset_a_tabs_idle_clock(self):
+        """Catches: the guard's own probe CPU being read as tab activity end-to-end. A heavy idle tab
+        that was probed but not closed (dry run, a cap, a deferral) would look busy at the next run,
+        so a tab the guard keeps looking at could never be closed. An idle heavy renderer measures
+        ~0.03 ms/s; one 150 ms probe over the ~10-35 s between two runs is 4-15 ms/s, above the 4 ms/s
+        threshold used here, so without the credit run 3 sees activity and the tab is never closed."""
+        heavy = FX.new_resident_page("heavy.html")           # heavy tab + the blank page, nothing else
+        tight = dict(active_cpu_ms_per_min=240, probe_ms=150)   # 4 ms/s; a fresh page's idle-GC bursts are <= ~20 ms
+        self.assertEqual(self.run_guard(**tight).returncode, 0)            # first sight
+        time.sleep(12)                                                      # dilutes those bursts below the threshold
+        r2 = self.run_guard(action=0, **tight)                              # probes the heavy tab, closes nothing
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertIn("WOULD_CLOSE", self.log_text(), "run 2 never reached the probe")
+        time.sleep(1.0)
+        self.decisive_run(heavy, **tight)                                  # live: the idle clock must have survived
+        self.assertNotIn(heavy, {t["id"] for t in FX.pages()}, self.log_text())
+
+    def test_one_ambiguous_confirmation_look_is_not_a_verdict(self):
+        """Catches: skipping a close because the confirmation probe was inconclusive ONCE. On a noisy
+        machine that is routine (the mapping phase already allows three looks), and the tab would stay
+        open until the next run for no reason. A confirmation that keeps failing is still UNCONFIRMED
+        (see test_a_placement_that_does_not_reproduce_right_before_closing_is_not_acted_on)."""
+        heavy = FX.new_resident_page("heavy.html")
+        FX.new_page("light.html")
+        FX.wait_quiet()
+
+        class FirstConfirmInconclusive(G.Prober):
+            confirming = False
+            spent = False
+
+            def map_pages(self, page_ids, budget_s=45.0):
+                out = super().map_pages(page_ids, budget_s)
+                self.confirming = True
+                return out
+
+            def probe(self, tid):
+                if self.confirming and not self.spent:
+                    self.spent = True
+                    return {}                            # one look with nothing conclusive in it
+                return super().probe(tid)
+
+        made, log = self._act(FirstConfirmInconclusive)
+        self.assertEqual(made, 1, log)
+        self.assertNotIn(heavy, {t["id"] for t in FX.pages()})
+
     def test_status_file_is_a_heartbeat_for_watchers(self):
         """Catches: a guard that runs but leaves no proof of life for the watchdogs."""
         FX.new_page("light.html")
@@ -784,6 +1099,7 @@ class E2E(unittest.TestCase):
         self.assertEqual(self.run_guard().returncode, 0)
         st = json.loads(pathlib.Path(self.state, "status.json").read_text())
         self.assertLess(abs(time.time() - st["ts"]), 60)
+        self.assertIs(st["measured"], True)
         self.assertGreaterEqual(st["renderers"], 1)
 
 
