@@ -43,9 +43,10 @@ renderer shared by several tabs (SHARED); a chrome:// page; the last remaining p
 that answered but could not be placed (PARTIAL_PROBE — it might share the renderer); a
 placement that does not reproduce right before closing (UNCONFIRMED); a renderer burning CPU
 during placement (DEFER_NOISY); a state file we cannot parse; any CDP failure. A page that
-cannot run JS at all (crashed/wedged) or that no longer exists is `dead`, not `unresolved`: every
-page in a renderer shares its main thread, so a dead page cannot share a renderer with a page that
-answered. A page that failed for ANY other reason is `unresolved` and blocks the close.
+cannot run JS at all (crashed/wedged: a trivial evaluate gets PING_S seconds, PING_S_PRESSURE under
+memory pressure) or that no longer exists is `dead`, not `unresolved`: every page in a renderer
+shares its main thread, so a dead page cannot share a renderer with a page that answered. A page
+that failed for ANY other reason is `unresolved` and blocks the close.
 
 SAFETY VALVES: single-instance flock; MAX_CLOSE_RUN / MAX_CLOSE_HOUR caps; never the last
 page (playwright connectOverCDP needs >= 1 page); no close without a durable "CLOSING" log
@@ -57,7 +58,13 @@ KNOWN LIMITS: (1) a renderer that burns >= 15 ms of CPU in EVERY one of three 1.
 apart) defers ALL closes (DEFER_NOISY repeating in the log is the tell); noise that is quiet on any
 single look does not defer, and the placement + the re-confirmation still guard the close;
 (2) only `page` targets are closable — a heavy
-renderer hosting only iframes/extension pages stays UNMAPPED; (3) the silent-tab case above.
+renderer hosting only iframes/extension pages stays UNMAPPED; (3) the silent-tab case above;
+(4) a renderer so starved or so compressed that it misses the liveness ping is read as dead, so
+its tab is never mapped and the run ends in SKIP UNMAPPED (inert, never a wrong close). Measured
+2026-09-19 with a suite reniced to the floor on a box at load 55+: PROBE dead=1 then SKIP UNMAPPED,
+three pages taking 21 s to map. `PROBE dead=N` + `SKIP UNMAPPED` repeating in the log while a heavy
+tab exists is the tell: raise CDP_TAB_GUARD_PING_S; (5) every page must be placed within the 45 s
+mapping budget, so on a starved box with very many tabs the run can end in PARTIAL_PROBE (inert).
 
 OUT OF SCOPE: chrome_cdp_watchdog.sh keeps its whole-Chrome recycle and its `ps rss` cap
 (moving that cap to footprint is a separate follow-up); the MBP Chrome (:9223).
@@ -67,7 +74,9 @@ a typo can never lower the ceiling to 0; ACTION is armed only by an absent varia
 anything else is a dry run): PORT 9222 · ACTION 1 · CEILING_MB 1536 · IDLE_SEC 600
 · IDLE_SEC_PRESSURE 180 · PRESSURE_TOTAL_MB 6144 · PRESSURE_SWAP_MB 8192 · ACTIVE_CPU_MS_PER_MIN
 150 · MAX_GAP_SEC 300 · MAX_CLOSE_RUN 2 · MAX_CLOSE_HOUR 8 · MIN_PAGES_KEEP 1 · PROBE_MS 50 (CPU-ms
-of work per probe) · STATE_DIR / LOG / LOCK (default under $GC_CITY_PATH/.gc).
+of work per probe) · PING_S 5 · PING_S_PRESSURE 20 (seconds a page gets to answer a trivial evaluate
+before it is read as dead; the pressure value is never shorter than PING_S) · STATE_DIR / LOG / LOCK
+(default under $GC_CITY_PATH/.gc).
 
 Files: <state_dir>/state.json (idle tracking), status.json (heartbeat for watchers),
 guard.lock, DISABLED (kill switch); log: <city>/.gc/logs/cdp-tab-guard.log.
@@ -141,6 +150,10 @@ class Config:
         c.max_close_hour = _num(env, "max_close_hour", 8, int, 0)
         c.min_pages_keep = _num(env, "min_pages_keep", 1, int, 1)
         c.probe_ms = _num(env, "probe_ms", 50, int, 0, strict=True)   # CPU-ms of work per probe
+        # Liveness ping: seconds a page gets to answer a trivial evaluate before it is read as dead. Longer
+        # under memory pressure, when a compressed or starved renderer is slow but alive; never shorter.
+        c.ping_s = _num(env, "ping_s", 5.0, float, 0.0, strict=True)
+        c.ping_s_pressure = max(c.ping_s, _num(env, "ping_s_pressure", 20.0, float, 0.0, strict=True))
         city = env.get("GC_CITY_PATH") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         c.state_dir = env.get("CDP_TAB_GUARD_STATE_DIR") or os.path.join(city, ".gc", "cdp-tab-guard")
         c.log_path = env.get("CDP_TAB_GUARD_LOG") or os.path.join(city, ".gc", "logs", "cdp-tab-guard.log")
@@ -489,10 +502,11 @@ class Prober:
     guard (measured 2026-09-19: load average 44 on 10 cores; 300 ms of CPU took 2-4 s of wall).
     The amount of work self-calibrates to `probe_ms` of CPU from each probe's own result."""
 
-    def __init__(self, client, renderer_pids, probe_ms):
+    def __init__(self, client, renderer_pids, probe_ms, ping_s=5.0):
         self.client = client
         self.pids = sorted(renderer_pids)
         self.probe_ms = probe_ms
+        self.ping_s = ping_s
         self.n = int(max(PROBE_N_MIN, min(PROBE_N_MAX, probe_ms * PROBE_N_PER_MS)))   # starts near the target
         self.burned = {}      # renderer pid -> CPU ms this guard itself burned there (see credit_own_cpu)
 
@@ -501,7 +515,7 @@ class Prober:
 
     def probe(self, tid):
         """Per-renderer CPU deltas (ms) while `tid` runs the probe. Raises PageDead when the page is
-        gone or cannot answer a trivial evaluate within 5 s (a crashed tab never answers; without
+        gone or cannot answer a trivial evaluate within `ping_s` (a crashed tab never answers; without
         this ping one would cost the whole probe timeout on every run), and any other CDPError /
         exception for every other failure — those pages are alive as far as we can tell."""
         js = "(function(n){var x=0;for(var i=0;i<n;i++)x+=Math.sqrt(i);return x})(%d)" % self.n
@@ -515,9 +529,9 @@ class Prober:
         try:
             try:
                 self.client.call("Runtime.evaluate", {"expression": "1", "returnByValue": True},
-                                 session_id=sid, timeout=5)
+                                 session_id=sid, timeout=self.ping_s)
             except CDPTimeout:
-                raise PageDead("did not answer a trivial evaluate within 5 s")
+                raise PageDead("did not answer a trivial evaluate within %g s" % self.ping_s)
             self.client.call("Runtime.evaluate", {"expression": js, "returnByValue": True},
                              session_id=sid, timeout=30)
         finally:
@@ -713,8 +727,9 @@ def _target_ids(client):
     return {t["targetId"] for t in client.call("Target.getTargets")["targetInfos"]}
 
 
-def act(cfg, state, candidates, renderer_pids, now, live, log):
-    """Connect, map tabs to renderers, decide, and (when live) close. Returns closes made."""
+def act(cfg, state, candidates, renderer_pids, now, live, log, pressure=False):
+    """Connect, map tabs to renderers, decide, and (when live) close. Returns closes made.
+    `pressure` (memory pressure, as run_once measured it) selects the longer liveness ping."""
     made = 0
     noisy = wait_for_quiet(sorted(renderer_pids))
     if noisy:
@@ -726,7 +741,7 @@ def act(cfg, state, candidates, renderer_pids, now, live, log):
         infos = client.call("Target.getTargets")["targetInfos"]
         targets = {t["targetId"]: t for t in infos}
         page_ids = [t["targetId"] for t in infos if t.get("type") == "page"]
-        prober = Prober(client, renderer_pids, cfg.probe_ms)
+        prober = Prober(client, renderer_pids, cfg.probe_ms, cfg.ping_s_pressure if pressure else cfg.ping_s)
         state["own_cpu_ms"] = prober.burned      # same dict: filled as probing proceeds, read by run_once
         mapping, unresolved, dead = prober.map_pages(page_ids)
         log("PROBE pages=%d placed=%d unresolved=%d dead=%d" % (
@@ -852,7 +867,7 @@ def run_once(cfg, verbose=False):
     closed = 0
     if candidates:
         try:
-            closed = act(cfg, state, candidates, rends, now, live, log)
+            closed = act(cfg, state, candidates, rends, now, live, log, pressure)
         except Exception as ex:
             log("ERROR acting on %d heavy idle renderer(s): %s: %s — a close may already have been issued "
                 "before the failure: check the CLOSING/CLOSED lines above" % (len(candidates), type(ex).__name__, ex))

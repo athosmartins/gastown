@@ -226,6 +226,73 @@ class ConfigTests(unittest.TestCase):
                           ("", 0), ("2", 0), ("-1", 0)):
             self.assertEqual(G.Config.from_env({"CDP_TAB_GUARD_ACTION": raw}).action, want, repr(raw))
 
+    def test_ping_timeouts_default_and_never_shrink_under_pressure(self):
+        """Catches: a garbage or zero PING_S making every page read as dead at once (nothing could ever
+        be mapped or closed), and the pressure ping ending up SHORTER than the normal one (the box is
+        slowest exactly when the longer ping is needed)."""
+        c = env_cfg()
+        self.assertEqual((c.ping_s, c.ping_s_pressure), (5.0, 20.0))
+        for raw in ("0", "-3", "abc", "", "nan", "inf"):
+            self.assertEqual(env_cfg(ping_s=raw).ping_s, 5.0, repr(raw))
+            self.assertEqual(env_cfg(ping_s_pressure=raw).ping_s_pressure, 20.0, repr(raw))
+        self.assertEqual(env_cfg(ping_s=9).ping_s, 9.0)
+        self.assertEqual(env_cfg(ping_s=30, ping_s_pressure=10).ping_s_pressure, 30.0)
+
+
+class PingTimeoutTests(unittest.TestCase):
+    """The liveness ping is what separates a crashed tab (dead: never blocks a close) from a slow one."""
+
+    class FakeClient:
+        def __init__(self, ping_times_out):
+            self.ping_times_out = ping_times_out
+            self.calls = []
+
+        def call(self, method, params=None, session_id=None, timeout=None):
+            self.calls.append((method, (params or {}).get("expression"), timeout))
+            if method == "Target.getTargets":
+                return {"targetInfos": []}
+            if method == "Target.attachToTarget":
+                return {"sessionId": "s1"}
+            if method == "Runtime.evaluate" and (params or {}).get("expression") == "1" and self.ping_times_out:
+                raise G.CDPTimeout("timed out waiting for the browser")
+            return {}
+
+        def close(self):
+            pass
+
+    def test_the_ping_uses_the_configured_timeout(self):
+        """Catches: the timeout staying hard-wired at 5 s while the knob and the pressure value are
+        decoration."""
+        client = self.FakeClient(ping_times_out=False)
+        G.Prober(client, [], 40, ping_s=7.5).probe("t1")
+        ping = [c for c in client.calls if c[0] == "Runtime.evaluate" and c[1] == "1"]
+        self.assertEqual([c[2] for c in ping], [7.5])
+
+    def test_a_ping_timeout_is_a_dead_page_and_says_how_long_it_waited(self):
+        """Catches: a page that misses the ping being filed as anything but dead (blocking every close
+        forever), or a log that hides how long the guard waited."""
+        client = self.FakeClient(ping_times_out=True)
+        with self.assertRaises(G.PageDead) as cm:
+            G.Prober(client, [], 40, ping_s=7.5).probe("t1")
+        self.assertIn("7.5", str(cm.exception))
+
+    def test_memory_pressure_selects_the_longer_ping(self):
+        """Catches: the pressure ping being computed by Config but never handed to the prober."""
+        seen = []
+
+        class Recording(G.Prober):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                seen.append(self.ping_s)
+
+        cfg = env_cfg(ping_s=6, ping_s_pressure=17)
+        for pressure in (False, True):
+            with mock.patch.object(G, "Prober", Recording), \
+                    mock.patch.object(G.CDPClient, "connect", return_value=self.FakeClient(False)), \
+                    mock.patch.object(G, "wait_for_quiet", return_value=[]):
+                G.act(cfg, {}, [], [], time.time(), False, lambda msg: True, pressure)
+        self.assertEqual(seen, [6.0, 17.0])
+
 
 class LoadStateTests(unittest.TestCase):
     def setUp(self):
@@ -646,6 +713,10 @@ class E2E(unittest.TestCase):
             "ceiling_mb": 150, "idle_sec": 3, "idle_sec_pressure": 3,
             "pressure_total_mb": 10 ** 9, "pressure_swap_mb": 10 ** 9,   # tier off in tests
             "active_cpu_ms_per_min": 600, "max_gap_sec": 120, "probe_ms": 40, "action": 1,
+            # Generous liveness ping: this suite runs reniced to the floor on a loaded box, where a healthy
+            # heavy page can miss the production 5 s ping (PROBE dead=1 -> SKIP UNMAPPED, seen three times on
+            # 2026-09-19 at load 55+). The tests about dead pages set their own short ping.
+            "ping_s": 30, "ping_s_pressure": 30,
         }
         base.update(cfg)
         env.update({"CDP_TAB_GUARD_" + k.upper(): str(v) for k, v in base.items()})
@@ -849,7 +920,7 @@ class E2E(unittest.TestCase):
         self.addCleanup(client.close)
         ps = subprocess.check_output(["ps", "-axo", "pid=,ppid=,command="], text=True)
         _, rends = G.parse_family(ps, TEST_PORT)
-        prober, pid = G.Prober(client, rends, 40), None
+        prober, pid = G.Prober(client, rends, 40, ping_s=30.0), None
         for _ in range(8):                  # a loaded box can make one probe ambiguous
             pid = G.pick_probe_pid(prober.probe(crashed), 40)
             if pid is not None:
@@ -859,13 +930,15 @@ class E2E(unittest.TestCase):
         os.kill(pid, signal.SIGKILL)
         time.sleep(1.5)
         t0 = time.time()
-        self.two_runs(closes=heavy)
+        # This test is about the ping itself, so it keeps a short one (8 s: a bit above the production 5 s
+        # to ride out a loaded box) instead of the harness's generous default.
+        self.two_runs(closes=heavy, ping_s=8, ping_s_pressure=8)
         self.assertLess(time.time() - t0, 100, "runs took too long: " + self.log_text())
         ids = {t["id"] for t in FX.pages()}
         self.assertNotIn(heavy, ids, self.log_text())
         self.assertIn(crashed, ids, "the guard must not touch a tab it was not asked about")
         self.assertIn("dead=1", self.log_text())
-        # Without the 5 s liveness ping the dead tab costs the whole 30 s work timeout.
+        # Without the liveness ping the dead tab costs the whole 30 s work timeout.
         self.assertLess(self.probe_phase_seconds(), 25, self.log_text())
 
     def test_a_noisy_neighbour_defers_placement_instead_of_guessing(self):
@@ -911,7 +984,7 @@ class E2E(unittest.TestCase):
         """Run the guard's real act() against the real Chrome with `prober_cls` as the placement
         mechanism. Returns (closes made, the log lines it wrote)."""
         rends, cand = self._heavy_candidate()
-        cfg = env_cfg(port=TEST_PORT, probe_ms=40, state_dir=self.state)
+        cfg = env_cfg(port=TEST_PORT, probe_ms=40, state_dir=self.state, ping_s=30, ping_s_pressure=30)
         lines = []
 
         def log(msg):                       # like the real logger: True means "durably written"
