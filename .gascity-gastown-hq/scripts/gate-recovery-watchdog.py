@@ -3782,10 +3782,30 @@ def _open_quality_gate_marker_sources():
     return out
 
 
+def _gate_label_is_post_merge(labels):
+    """PURE (no I/O, unit-tested) — FIX 8 guard (ga-1ze3fr): a bead carrying
+    gate:passed, or any delivery:* label, already passed the gate and merged;
+    its lingering gate:queued/gate:reviewing label is stale HISTORY (the
+    dispatcher's PASS path never strips it), not a stuck phantom state. Before
+    this guard, FIX 8 saw "label present, no open marker" and could not tell
+    that apart from a genuinely stranded label — it cleared the label and
+    declared the bead "a dispatch candidate again" while delivery was still in
+    flight (e.g. NEEDS_GUARDED_RESTART), and the painel's route-backfill then
+    re-added gc.routed_to, handing the bead to the pool as a false P0 (the
+    ga-1ze3fr class: wa-r4ehy.2, wa-q0crq, wa-gabee). True → exclude this bead
+    from FIX 8 candidacy, regardless of marker state."""
+    labels = labels or []
+    if "gate:passed" in labels:
+        return True
+    return any(l.startswith("delivery:") for l in labels)
+
+
 def _beads_with_gate_label(label):
     """[(bead_id, store), ...] for every open/in_progress bead across HQ + every known
     rig carrying `label` (gate:queued or gate:reviewing) — a marker's source bead can
     live in any rig, not just HQ (mirrors FIX 4's _source_review_state rig resolution).
+    Excludes any bead where _gate_label_is_post_merge() is True (gate:passed or
+    delivery:* — already merged, in delivery, not a phantom candidate; ga-1ze3fr).
     None on ANY store query failure (fail-safe: FIX 8 aborts the whole sweep rather than
     scan a partial rig population and risk false-clearing based on incomplete data)."""
     stores = [CITY] + [p for p in _rig_paths().values() if p and p != CITY]
@@ -3800,7 +3820,8 @@ def _beads_with_gate_label(label):
         except Exception:
             return None
         for row in rows:
-            if label in (row.get("labels") or []):
+            row_labels = row.get("labels") or []
+            if label in row_labels and not _gate_label_is_post_merge(row_labels):
                 out.append((row.get("id"), store))
     return out
 
@@ -4707,6 +4728,58 @@ def _selftest():
     race = _update_orphan_gate_label_hits(race, set())  # sweep 2: marker now visible, not a candidate
     ok(("ga-race", "gate:queued") not in race,
        "sweep 2 (marker now visible) resets the streak to gone — confirms hysteresis actually prevented the false clear, not just delayed it")
+    # FIX 8 — _gate_label_is_post_merge (ga-1ze3fr): a bead that already PASSED
+    # the gate and merged must never be treated as a phantom-label candidate,
+    # no matter how long it sits with no open marker — it's in delivery, not
+    # stuck. wa-r4ehy.2/wa-q0crq/wa-gabee were all this exact shape.
+    ok(_gate_label_is_post_merge(["gate:queued"]) is False,
+       "gate:queued alone (no gate:passed, no delivery:*) -> NOT post-merge; FIX 8 keeps treating it as a candidate exactly as before (must NOT over-exclude genuine phantoms)")
+    ok(_gate_label_is_post_merge(["gate:queued", "gate:passed"]) is True,
+       "gate:queued + gate:passed -> post-merge; the ga-1ze3fr bug shape (passed+merged, gate:queued left over, no open marker) — excluded from FIX 8 candidacy")
+    ok(_gate_label_is_post_merge(["gate:reviewing", "delivery:pending-restart"]) is True,
+       "gate:reviewing + delivery:pending-restart -> post-merge (the NEEDS_GUARDED_RESTART hold, ga-l7n3v) — excluded")
+    ok(_gate_label_is_post_merge(["gate:queued", "delivery:running"]) is True,
+       "any delivery:* label, not just pending-restart -> excluded (prefix match, not a fixed enum)")
+    ok(_gate_label_is_post_merge([]) is False and _gate_label_is_post_merge(None) is False,
+       "no labels / None -> not post-merge, never crashes (fail-open to prior behavior, fail-safe on bad input)")
+    ok(_gate_label_is_post_merge(["delivery"]) is False,
+       "a bare 'delivery' label with no colon does NOT match the delivery:* prefix test (guards a startswith('delivery') typo that would over-exclude unrelated labels)")
+    ok(_gate_label_is_post_merge(["deliverywrong:x"]) is False,
+       "a label merely starting with the letters 'delivery' but no colon boundary must NOT match — startswith('delivery:') requires the colon")
+    # FIX 8 end-to-end (ga-1ze3fr acceptance criteria): prove the guard is
+    # actually WIRED into _beads_with_gate_label's I/O path, not just correct
+    # in isolation. Mocks sh() (this file's established pattern, e.g. the
+    # _fake_sh_vtms block above) for both the `gc rig list` call _rig_paths()
+    # makes and the `bd list` call this function makes, and force-resets the
+    # _RIG_PATHS cache first so the rig-list mock is guaranteed to be hit
+    # regardless of what an earlier test in this run may have cached.
+    _real_rig_paths_state = dict(_RIG_PATHS)
+    def _fake_sh_fix8(args, timeout=20, stdin=None):
+        if args and args[0] == "gc":
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout='{"rigs":[]}')
+        if len(args) > 4 and args[4] == "list":
+            return subprocess.CompletedProcess(args=args, returncode=0,
+                stdout='[{"id":"wa-r4ehy.2","labels":["gate:queued","gate:passed","delivery:pending-restart"]},'
+                       '{"id":"wa-plain","labels":["gate:queued"]}]')
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="")
+    _real_sh_fix8 = globals()["sh"]
+    try:
+        _RIG_PATHS["ts"] = 0.0
+        _RIG_PATHS["map"] = {}
+        _RIG_PATHS["by_prefix"] = {}
+        globals()["sh"] = _fake_sh_fix8
+        fix8_result = _beads_with_gate_label("gate:queued")
+        ok(fix8_result is not None, "query succeeds (fake sh answers both the rig-list and bd-list calls)")
+        fix8_ids = [bid for bid, _store in (fix8_result or [])]
+        ok("wa-r4ehy.2" not in fix8_ids,
+           "REGRESSION (reproduces FAIL on pre-fix code): the ga-1ze3fr shape (gate:queued + gate:passed + delivery:pending-restart, no open marker) is EXCLUDED — pre-fix code had no _gate_label_is_post_merge filter and would have included it as an orphan candidate")
+        ok("wa-plain" in fix8_ids,
+           "a plain gate:queued bead with no gate:passed/delivery:* is still INCLUDED — unchanged prior behavior for the genuine-phantom case")
+    finally:
+        globals()["sh"] = _real_sh_fix8
+        _RIG_PATHS["ts"] = _real_rig_paths_state["ts"]
+        _RIG_PATHS["map"] = _real_rig_paths_state["map"]
+        _RIG_PATHS["by_prefix"] = _real_rig_paths_state["by_prefix"]
     # FIX 8 scope guard: reap_orphan_gate_labels must NEVER touch story:*/assignee — the
     # ga-yzw06 trap this bug explicitly warns against (an over-eager fix that repositions
     # lifecycle state instead of just clearing the phantom label). Static source-inspection
