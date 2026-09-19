@@ -1,0 +1,20 @@
+# town-deltas override (ga-u8nbt9): the embedded maintenance reaper skipped EVERY
+# database silently since bd split wisp_dependencies/dependencies.depends_on_id
+# into depends_on_issue_id / depends_on_wisp_id / depends_on_external. Its schema
+# probe demanded the old column and did `|| continue` ("skip silently"), so no
+# step ever ran: no stale-wisp close, no purge, no anomaly, no mail — the summary
+# read "purged:0" while hq.wisps grew to 23k rows (99% closed) and every
+# scan-shaped wisps read (session lookup by metadata, work probes) slowed to 5-30 s.
+#
+# Script vendored into town-deltas/assets/scripts so $PACK_DIR resolves here (the
+# embedded maintenance copy is gitignored and re-extracted from the gc binary on
+# reload) — same recipe as the wisp-compact override (ga-3rqwa). What the vendored
+# script changes is listed at the top of scripts/reaper.sh. Everything below is
+# identical to the embedded order.
+#
+# Verify after a reload:  gc order show mol-dog-reaper   -> Source: .../town-deltas/...
+[order]
+description = "Reap stale wisps and purge closed molecules"
+exec = "$PACK_DIR/assets/scripts/reaper.sh"
+trigger = "cooldown"
+interval = "30m"
