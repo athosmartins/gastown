@@ -797,11 +797,14 @@ context_check_exec_class() {
   t="${t//Ó/ó}"; t="${t//Ò/ò}"; t="${t//Ô/ô}"; t="${t//Õ/õ}"; t="${t//Ö/ö}"
   t="${t//Ú/ú}"; t="${t//Ù/ù}"; t="${t//Û/û}"; t="${t//Ü/ü}"
   t="${t//Ç/ç}"; t="${t//Ñ/ñ}"
-  # Normalize curly/smart single-quote variants to the ASCII apostrophe the
-  # "don't"/"can't" literals below use (ga-dpas3r attempt 4, reviewer repro:
-  # U+2019 RIGHT SINGLE QUOTATION MARK — the glyph phone/editor autocorrect
-  # substitutes for a typed plain apostrophe, sibling of the already-tested
-  # straight-quote and no-apostrophe spellings). Same root cause as the
+  # Normalize curly/smart single-quote (and lookalike) variants to the ASCII
+  # apostrophe the "don't"/"can't" literals below use (ga-dpas3r attempt 4,
+  # reviewer repro: U+2019 RIGHT SINGLE QUOTATION MARK — the glyph phone/
+  # editor autocorrect substitutes for a typed plain apostrophe, sibling of
+  # the already-tested straight-quote and no-apostrophe spellings). U+2018
+  # and U+00B4 ACUTE ACCENT (a bare stray accent some keyboards/dead-key
+  # layouts leave behind in place of an apostrophe) are the same failure
+  # shape, flagged in the same review round (Mayor). Same root cause as the
   # accent fold above: a Unicode form the original ASCII-only preprocessing
   # never anticipated. Routed through a helper var, not a literal `'` inside
   # ${t//pattern/replacement} — a bare quote there desyncs bash's own quote
@@ -809,7 +812,7 @@ context_check_exec_class() {
   # as string data instead of erroring — caught only by re-running the exec-
   # class output, not by `bash -n`, which stayed clean throughout).
   local sq="'"
-  t="${t//’/$sq}"; t="${t//‘/$sq}"
+  t="${t//’/$sq}"; t="${t//‘/$sq}"; t="${t//´/$sq}"
   # 1a. PHYSICAL device / hardware / physical proxy — unambiguous standalone.
   #    "phone-as-Claro-mobile-proxy" (physical phone), SIM swaps, hardware proxies,
   #    explicit "human must touch it" phrasing. ga-s16ob: bare device NOUNS

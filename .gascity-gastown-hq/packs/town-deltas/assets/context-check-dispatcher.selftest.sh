@@ -524,6 +524,12 @@ fi
   && ok "ga-dpas3r attempt 4: curly-quote 'don’t' (U+2019) prohibition → exec:auto (reviewer repro 2)" || bad "ga-dpas3r REGRESSION: curly-quote 'don’t' prohibition over-tagged exec:manual (reviewer repro 2)"
 [ "$(context_check_exec_class "guardrail" "We can’t create a new account automatically here.")" = "exec:auto" ] \
   && ok "ga-dpas3r attempt 4: curly-quote 'can’t' (sibling negator, same mechanism) → exec:auto" || bad "ga-dpas3r REGRESSION: curly-quote 'can’t' prohibition over-tagged exec:manual"
+[ "$(context_check_exec_class "guardrail" "We don´t create a new account automatically here.")" = "exec:auto" ] \
+  && ok "ga-dpas3r attempt 4: acute-accent 'don´t' (U+00B4, dead-key/keyboard lookalike) prohibition → exec:auto (Mayor review)" || bad "ga-dpas3r REGRESSION: acute-accent 'don´t' prohibition over-tagged exec:manual (Mayor review)"
+[ "$(context_check_exec_class "" "NÃo criar conta nova, apenas ler dados publicos")" = "exec:auto" ] \
+  && ok "ga-dpas3r attempt 4: mixed-case 'NÃo' (leading caps only) still folds and negates" || bad "ga-dpas3r REGRESSION: mixed-case 'NÃo' failed to fold"
+[ "$(context_check_exec_class "" "nÃO criar conta nova, apenas ler dados publicos")" = "exec:auto" ] \
+  && ok "ga-dpas3r attempt 4: mixed-case 'nÃO' (trailing caps only) still folds and negates" || bad "ga-dpas3r REGRESSION: mixed-case 'nÃO' failed to fold"
 # Class fix, not just the cited "NÃO"/"don't": the accent fold is a single
 # shared preprocessing step, so it also reaches accented literals OUTSIDE
 # the negation-word list — §4's business-decision gate — for an all-caps
