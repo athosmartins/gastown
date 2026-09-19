@@ -661,22 +661,70 @@ context_check_clause_before() {
   printf '%s' "$before"
 }
 
-# context_check_negated <text> <phrase> — emit "yes" iff the FIRST occurrence of
-#   <phrase> in <text> is preceded, in the same clause, by a negation word
-#   (pt/en) — i.e. that occurrence is being forbidden, not requested. Emits "no"
-#   if <phrase> is absent, or its first occurrence has no preceding same-clause
-#   negation. Only inspects the FIRST occurrence — context_check_any_unnegated
-#   (below) loops this over every occurrence, since a later one can be a
-#   genuine request even when the first is a prohibition (ga-dpas3r attempt 2,
-#   blocking issue 1). Two negation scopes, not one — see the two case blocks
-#   below: SENTENCE ADVERBS (pure negators, no object of their own) match
-#   across the full same-clause text; PHRASE-LOCAL NEGATORS (bind to whatever
-#   word immediately follows them) match only within the tighter sub-clause
-#   after the last comma (ga-dpas3r attempt 3). Pure (no I/O).
-context_check_negated() {
-  local text="$1" phrase="$2" clause padded tight tight_padded
-  clause="$(context_check_clause_before "$text" "$phrase")"
-  [ -z "$clause" ] && { echo "no"; return; }
+# context_check_cut_after_adversative <clause> — emit the tail of <clause>
+#   AFTER its LAST adversative conjunction (mas/porém/porem/contudo/
+#   entretanto/todavia/exceto/salvo/but/however/except), matched as a whole
+#   word tolerant of adjoining comma/colon/semicolon/parens (same tolerance
+#   as the negation-word checks below). Emits <clause> unchanged (just
+#   space-padded) if no adversative word occurs. An adversative conjunction
+#   ends a SENTENCE-ADVERB negator's scope the same way a clause delimiter
+#   does; a comma or a coordinating conjunction (ou, e, nem, or, and, nor)
+#   does NOT (ga-dpas3r 5th attempt, Mayor, gate_run=ga-lvl2t2): "não criar
+#   conta, mas criar conta de teste" must read the SECOND "criar conta" as a
+#   fresh, unnegated request, while "nunca criar conta pessoal ou criar conta
+#   comercial" must read BOTH as the one prohibition they are. Pure (no I/O).
+context_check_cut_after_adversative() {
+  local clause="$1" padded best cand w
+  padded=" ${clause//[,:;()]/ } "
+  best="$padded"
+  for w in mas porém porem contudo entretanto todavia exceto salvo but however except; do
+    case "$padded" in
+      *" $w "*)
+        cand="${padded##*" $w "}"
+        [ "${#cand}" -lt "${#best}" ] && best="$cand"
+        ;;
+    esac
+  done
+  printf '%s' "$best"
+}
+
+# context_check_clause_is_negated <clause> — emit "yes" iff <clause> (text in
+#   the same clause as, and preceding, a trigger-phrase occurrence — already
+#   delimiter-bounded by the caller, e.g. via context_check_clause_before or
+#   the accumulation in context_check_any_unnegated below) carries a negation
+#   word that still governs that occurrence. Shared by context_check_negated
+#   (single, first-occurrence path) and context_check_any_unnegated's
+#   multi-occurrence walk, so both apply the identical scope rule instead of
+#   two copies silently drifting apart. Two negation scopes, not one:
+#     SENTENCE ADVERBS (nunca/não/jamais/never/don't/cannot/… — pure negators
+#     with no complement of their own) match across the full clause, narrowed
+#     only by context_check_cut_after_adversative above — a comma or a
+#     coordinating conjunction (ou/e/nem/or/and/nor) does NOT end this scope
+#     (ga-dpas3r 5th attempt, Mayor, gate_run=ga-lvl2t2): "nunca X ou X" /
+#     "nunca X e X" / "nunca X nem X" under one "nunca" is ONE oração, not
+#     two, and stays negated throughout — see context_check_any_unnegated for
+#     why the caller must accumulate rather than discard scanned text for
+#     this to hold across repeated occurrences of the same phrase.
+#     PHRASE-LOCAL NEGATORS (sem/nem/evite/evitar — bind to whatever word
+#     immediately follows them) match only within the tighter sub-clause
+#     after the LAST comma of the ORIGINAL (non-adversative-cut) <clause>
+#     (ga-dpas3r attempt 3) — deliberately untouched by the 5th attempt: no
+#     reported gap ties an adversative conjunction to this narrower group, so
+#     it is left alone rather than risk a new failure mode chasing an
+#     untested one.
+#   KNOWN, DELIBERATE limitation (Mayor, 5th attempt item 3 — the safe side,
+#   not a gap): a genuinely NEW, unhedged order stated right after a negation
+#   with no delimiter and no adversative conjunction between them still reads
+#   as negated (e.g. "nunca revisar isso, criar conta amanha" → still "yes").
+#   This is deliberately the safe-by-design direction (Mayor item 2): an
+#   under-detected negation ships exec:manual, which merely parks a bead in
+#   front of Athos for a task that is not his; an over-extended negation
+#   ships exec:auto, which self-corrects (the crew agent hits the real
+#   human/credential blocker mid-task and parks with next-action:athos-
+#   decide instead). When genuinely unsure which way a scope reads, tip
+#   exec:auto, never exec:manual. Pure (no I/O).
+context_check_clause_is_negated() {
+  local clause="$1" scoped padded tight tight_padded
   # A negation word can be directly followed by punctuation instead of a space
   # ("nunca, em hipótese alguma, criar conta") — normalize comma/colon/
   # semicolon/parens to spaces before the word-boundary check. Without this,
@@ -684,7 +732,8 @@ context_check_negated() {
   # reads as unnegated (ga-dpas3r attempt 2, blocking issue 2 — reopened the
   # exact wa-vrs3g class this function exists to close, for a comma-qualified
   # variant of the same guardrail wording).
-  padded=" ${clause//[,:;()]/ } "
+  scoped="$(context_check_cut_after_adversative "$clause")"
+  padded=" ${scoped//[,:;()]/ } "
   # SENTENCE ADVERBS: pure negation particles with no complement of their own
   # — they attach to the clause's VERB wherever it sits, so they may legally
   # dangle across a comma-set-off aside ("nunca, em hipotese alguma, criar
@@ -717,7 +766,8 @@ context_check_negated() {
   # class of leak, not just the two cited words. Adjacent, no-comma usage
   # ("sem criar conta", "evitar provisionar conta", "nem provisionar conta")
   # still negates correctly, because with no comma present the tight
-  # sub-clause equals the full clause.
+  # sub-clause equals the full clause. Uses the ORIGINAL <clause>, not the
+  # adversative-cut <scoped> text — see the function header.
   tight="${clause##*,}"
   tight_padded=" ${tight//[:;()]/ } "
   case "$tight_padded" in
@@ -725,6 +775,22 @@ context_check_negated() {
       echo "yes"; return ;;
   esac
   echo "no"
+}
+
+# context_check_negated <text> <phrase> — emit "yes" iff the FIRST occurrence of
+#   <phrase> in <text> is preceded, in the same clause, by a negation word
+#   (pt/en) — i.e. that occurrence is being forbidden, not requested. Emits "no"
+#   if <phrase> is absent, or its first occurrence has no preceding same-clause
+#   negation. Only inspects the FIRST occurrence — context_check_any_unnegated
+#   (below) loops this over every occurrence, since a later one can be a
+#   genuine request even when the first is a prohibition (ga-dpas3r attempt 2,
+#   blocking issue 1). Thin wrapper over context_check_clause_is_negated (see
+#   that function for the two negation scopes). Pure (no I/O).
+context_check_negated() {
+  local text="$1" phrase="$2" clause
+  clause="$(context_check_clause_before "$text" "$phrase")"
+  [ -z "$clause" ] && { echo "no"; return; }
+  context_check_clause_is_negated "$clause"
 }
 
 # context_check_any_unnegated <text> <phrase1> [phrase2 ...] — emit "yes" iff at
@@ -735,22 +801,40 @@ context_check_negated() {
 #   ...") must still be caught by its second, unnegated occurrence —
 #   context_check_negated alone only ever sees the first, so relying on it
 #   directly here silently downgrades a real request to unactionable (ga-dpas3r
-#   attempt 2, blocking issue 1). Pure (no I/O). Every §2/§3/§4 trigger block
-#   below routes its single-literal phrases through this one call site, so the
-#   fix covers the whole reachable pattern class, not only the one reported
-#   phrase.
+#   attempt 2, blocking issue 1). ACCUMULATES a `consumed` prefix instead of
+#   discarding scanned text as it advances (ga-dpas3r 5th attempt, Mayor,
+#   gate_run=ga-lvl2t2): the previous version advanced past a negated
+#   occurrence via `remaining="${remaining#*"$p"}"`, which strips the negator
+#   word itself along with it — so a SECOND occurrence of the SAME phrase
+#   still under the SAME "nunca" (joined by "ou"/"e"/"nem", no clause
+#   delimiter in between) lost its governing negator and read as a fresh,
+#   unnegated request, exactly backwards. `consumed` never shrinks, so the
+#   clause recomputed for each occurrence (`consumed`+`before`, re-bounded by
+#   the last clause delimiter — context_check_clause_is_negated narrows it
+#   further at the last adversative conjunction) still sees every negator
+#   that actually governs it, however many occurrences back it was written.
+#   Pure (no I/O). Every §2/§3/§4 trigger block below routes its
+#   single-literal phrases through this one call site, so the fix covers the
+#   whole reachable pattern class, not only the one reported phrase.
 context_check_any_unnegated() {
   local text="$1"; shift
-  local p remaining
+  local p consumed remaining before clause nl=$'\n'
   for p in "$@"; do
+    consumed=""
     remaining="$text"
     while :; do
       case "$remaining" in
         *"$p"*) : ;;
         *) break ;;
       esac
-      [ "$(context_check_negated "$remaining" "$p")" = "no" ] && { echo "yes"; return; }
-      # This occurrence was negated — advance past it and check the next one.
+      before="${remaining%%"$p"*}"
+      clause="${consumed}${before}"
+      clause="${clause##*[.;!?$nl]}"       # re-bound to the current clause only
+      [ "$(context_check_clause_is_negated "$clause")" = "no" ] && { echo "yes"; return; }
+      # This occurrence was negated — advance past it, but keep everything
+      # scanned so far in `consumed` (never discard) so a later occurrence of
+      # the same phrase, still under the same negator, can still see it.
+      consumed="${consumed}${before}${p}"
       remaining="${remaining#*"$p"}"
     done
   done

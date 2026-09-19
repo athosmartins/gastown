@@ -539,6 +539,46 @@ fi
   && ok "ga-dpas3r attempt 4: accented-uppercase 'DECISÃO DE CUSTO' (§4, outside negation list) still tips exec:manual" || bad "ga-dpas3r REGRESSION: accented-uppercase §4 phrase stopped matching after the fold"
 [ "$(context_check_exec_class "pipeline" "CRIAR CONTA NOVA PARA O PARCEIRO, JÁ")" = "exec:manual" ] \
   && ok "ga-dpas3r attempt 4: genuine accented-uppercase request (no negation) still tips exec:manual (not over-corrected to always-auto)" || bad "ga-dpas3r REGRESSION: accented-uppercase genuine request wrongly fell to exec:auto"
+# 10g0g — ga-dpas3r 5th attempt (Mayor, gate_run=ga-lvl2t2): SCOPE-based
+#        negation. Mayor's rule after the 4th gate FAIL: a negation word's
+#        scope runs from the negator to the end of the SENTENCE (next
+#        .;!?/newline) OR an adversative conjunction (mas/porém/porem/
+#        contudo/entretanto/todavia/exceto/salvo/but/however/except) —
+#        whichever comes first. Coordination (ou/e/nem/or/and/nor) and a bare
+#        comma do NOT end the scope. These 5 cases are the Mayor's own
+#        mandatory acceptance tests, verbatim (comment 2026-09-19T06:12:57Z).
+[ "$(context_check_exec_class "" "nunca criar conta pessoal ou criar conta comercial")" = "exec:auto" ] \
+  && ok "ga-dpas3r 5th attempt: 'nunca X ou X' (coordination) stays ONE negated clause → exec:auto (Mayor test 1)" || bad "ga-dpas3r REGRESSION: 'nunca X ou X' lost its negation across 'ou' → exec:manual (Mayor test 1)"
+[ "$(context_check_exec_class "" "nunca criar conta pessoal e criar conta comercial")" = "exec:auto" ] \
+  && ok "ga-dpas3r 5th attempt: 'nunca X e X' (coordination) stays ONE negated clause → exec:auto (Mayor test 2)" || bad "ga-dpas3r REGRESSION: 'nunca X e X' lost its negation across 'e' → exec:manual (Mayor test 2)"
+[ "$(context_check_exec_class "" "nunca criar conta pessoal nem criar conta comercial")" = "exec:auto" ] \
+  && ok "ga-dpas3r 5th attempt: 'nunca X nem X' (coordination) stays ONE negated clause → exec:auto (Mayor test 3)" || bad "ga-dpas3r REGRESSION: 'nunca X nem X' lost its negation across 'nem' → exec:manual (Mayor test 3)"
+[ "$(context_check_exec_class "" "não criar conta, mas criar conta de teste")" = "exec:manual" ] \
+  && ok "ga-dpas3r 5th attempt: adversative 'mas' ENDS negation scope → 2nd occurrence is a fresh request → exec:manual (Mayor test 4)" || bad "ga-dpas3r REGRESSION: 'mas' failed to end negation scope → exec:auto (Mayor test 4)"
+[ "$(context_check_exec_class "" "Não precisa revisar. Criar conta no portal X")" = "exec:manual" ] \
+  && ok "ga-dpas3r 5th attempt: '.' ENDS negation scope → next sentence is a fresh request → exec:manual (Mayor test 5)" || bad "ga-dpas3r REGRESSION: negation leaked across '.' into the next sentence → exec:auto (Mayor test 5)"
+# Class fix, not just the 5 cited repros: the same scope rule must hold
+# case-folded/all-caps (interacts with attempt 4's accent fold), with a
+# comma immediately before the coordinating conjunction (the natural PT
+# spelling), in English (the classifier is bilingual — untested for the
+# NEW adversative words until now), for a different adversative word than
+# "mas"/"but" (porém), and must not have over-corrected to always-auto (a
+# plain, non-negated coordination of two genuine requests must still tip
+# exec:manual — either arm of the "ou" is independently actionable).
+[ "$(context_check_exec_class "" "NUNCA CRIAR CONTA PESSOAL OU CRIAR CONTA COMERCIAL")" = "exec:auto" ] \
+  && ok "ga-dpas3r 5th attempt: all-caps 'NUNCA X OU X' still stays one negated clause after case-fold → exec:auto" || bad "ga-dpas3r REGRESSION: all-caps 'NUNCA X OU X' lost its negation → exec:manual"
+[ "$(context_check_exec_class "" "nunca criar conta, ou criar conta comercial")" = "exec:auto" ] \
+  && ok "ga-dpas3r 5th attempt: comma-before-'ou' (natural PT spelling) still stays one negated clause → exec:auto" || bad "ga-dpas3r REGRESSION: comma immediately before 'ou' ended the scope early → exec:manual"
+[ "$(context_check_exec_class "" "we don't need a new account here except creating a new account for the test suite is fine")" = "exec:manual" ] \
+  && ok "ga-dpas3r 5th attempt: English adversative 'except' ends scope → 2nd 'new account' is a fresh request → exec:manual" || bad "ga-dpas3r REGRESSION: English 'except' failed to end negation scope → exec:auto"
+[ "$(context_check_exec_class "" "we don't need a new account here, however creating a new account for staging is fine")" = "exec:manual" ] \
+  && ok "ga-dpas3r 5th attempt: English adversative 'however' ends scope → 2nd 'new account' is a fresh request → exec:manual" || bad "ga-dpas3r REGRESSION: English 'however' failed to end negation scope → exec:auto"
+[ "$(context_check_exec_class "" "nunca criar conta, porém criar conta de teste é necessário")" = "exec:manual" ] \
+  && ok "ga-dpas3r 5th attempt: adversative 'porém' (not just 'mas') ends scope → exec:manual" || bad "ga-dpas3r REGRESSION: adversative 'porém' failed to end negation scope → exec:auto"
+[ "$(context_check_exec_class "" "NUNCA CRIAR CONTA, PORÉM CRIAR CONTA DE TESTE É NECESSÁRIO")" = "exec:manual" ] \
+  && ok "ga-dpas3r 5th attempt: accented-uppercase 'PORÉM' still ends scope after case-fold → exec:manual" || bad "ga-dpas3r REGRESSION: accented-uppercase 'PORÉM' failed to fold/end negation scope → exec:auto"
+[ "$(context_check_exec_class "" "criar conta pessoal ou criar conta comercial")" = "exec:manual" ] \
+  && ok "ga-dpas3r 5th attempt: plain 'X ou X' with NO negator — both genuine requests — still tips exec:manual (not over-corrected to always-auto)" || bad "ga-dpas3r REGRESSION: un-negated 'X ou X' wrongly fell to exec:auto"
 # 10g — ga-dpas3r: a PROHIBITION must not tip exec:manual just because its
 #       trigger substring occurs inside it — "nunca criar conta" contains
 #       "criar conta" but FORBIDS it, the opposite of a request (wa-vrs3g).
