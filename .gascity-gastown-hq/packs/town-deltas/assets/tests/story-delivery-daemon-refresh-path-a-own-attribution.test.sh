@@ -200,12 +200,20 @@ echo "$BD_CALLS" | grep -q "Context only — NOT attributed to this merge" \
   && ok "T1 wide list demoted to an explicitly-marked context line" \
   || nok "T1 missing context-demotion marker" "$BD_CALLS"
 CONTEXT_LINE="$(echo "$BD_CALLS" | grep "Context only — NOT attributed to this merge")"
-echo "$CONTEXT_LINE" | grep -q "com.whatsapp.ficha360" \
-  && ok "T1 ficha360 reported as context (pending from another delivery), not blamed on this story" \
-  || nok "T1 ficha360 missing entirely from context line" "$CONTEXT_LINE"
-echo "$CONTEXT_LINE" | grep -q "com.whatsapp.map-viewer" \
-  && ok "T1 map-viewer reported as context (pending from another delivery), not blamed on this story" \
-  || nok "T1 map-viewer missing entirely from context line" "$CONTEXT_LINE"
+# ga-8i2nds UPDATE: this used to assert the context line NAMES ficha360 and
+# map-viewer ("nothing hidden, just de-prioritized"). A delivery's halt now
+# lists only ITS OWN daemons (ga-8i2nds Aceite 1) — the two other deliveries'
+# daemons are acknowledged as a COUNT on the context line, and "nothing hidden"
+# is kept by the full wide list staying in the log.
+echo "$CONTEXT_LINE" | grep -q "2 other sensitive daemon" \
+  && ok "T1 the other deliveries' daemons (ficha360, map-viewer) are acknowledged on the context line as a count, not blamed on this story" \
+  || nok "T1 context line does not count the 2 other flagged daemons" "$CONTEXT_LINE"
+echo "$CONTEXT_LINE" | grep -qE "com.whatsapp.(ficha360|map-viewer)" \
+  && nok "T1 context line still names another delivery's daemon" "$CONTEXT_LINE" \
+  || ok "T1 context line names none of them (they belong to other deliveries)"
+echo "$LOG_OUT" | grep -q "guarded=\[.*com.whatsapp.ficha360.*com.whatsapp.map-viewer" \
+  && ok "T1 nothing hidden — ficha360 and map-viewer stay in the log's wide list" \
+  || nok "T1 the wide list is missing from the log" "$LOG_OUT"
 [ "$BASELINE_AFTER" = "$EXPECT_C0" ] \
   && ok "T1 rig-wide baseline marker did NOT advance (demand-dashboard's real hold is unresolved)" \
   || nok "T1 baseline marker unexpectedly changed" "want(unchanged)=$EXPECT_C0 got=$BASELINE_AFTER"

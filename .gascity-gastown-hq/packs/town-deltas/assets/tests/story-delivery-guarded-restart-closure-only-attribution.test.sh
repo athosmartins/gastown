@@ -108,8 +108,33 @@ run_block() {
   # Same technique as story-delivery-guarded-restart-attribution.test.sh —
   # this test is about the RETENTION DECISION, not closure-detection
   # mechanics (already covered by daemon-refresh.test.sh and friends).
+  # ga-8i2nds: the hold/release decision is now the bead-scoped freshness
+  # re-probe (a second DRY_RUN=1 call whose SENSITIVE_DAEMONS the caller forces
+  # to include the reached labels); the overlap with the wide guarded set only
+  # decides whether a release may advance the rig-wide marker. T5/T6 are the
+  # "new-daemon genuinely needs a guarded restart" controls, so in those modes
+  # the re-probe reports it STILL STALE — that is what makes them holds now.
+  local reprobe_stale=""
+  case "$mode" in
+    own|no_split) reprobe_stale="com.test.new-daemon" ;;
+  esac
   cat > "$GC_CITY/packs/town-deltas/assets/daemon-refresh.sh" <<EOF
 if [ "\$DRY_RUN" = "1" ]; then
+  if [ -n "$reprobe_stale" ]; then
+    case " \$SENSITIVE_DAEMONS " in
+      *" $reprobe_stale "*)
+        echo "VERDICT=NEEDS_GUARDED_RESTART"
+        echo "AFFECTED=com.test.new-daemon"
+        echo "AFFECTED_NOT_RUNNING="
+        echo "RESTARTED="
+        echo "FRESH_FAIL="
+        echo "GUARDED=$reprobe_stale"
+        echo "GUARDED_OWN=$reprobe_stale"
+        echo "REASON=freshness re-probe: still stale"
+        echo "ALL_LABELS="
+        exit 1 ;;
+    esac
+  fi
   echo "VERDICT=OK"
   echo "AFFECTED=com.test.new-daemon"
   echo "AFFECTED_NOT_RUNNING="
