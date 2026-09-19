@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  FONTE VERSIONADA do launchd do quality-gate-dispatcher (ga-4158gs, Mayor 19/09/2026).
+  Instalado em: ~/Library/LaunchAgents/com.gascity.quality-gate-dispatcher.plist
+  Até 19/09 este plist só existia instalado, sem fonte no repo: uma reinstalação
+  apagaria em silêncio o que foi mudado nele. Mude AQUI e copie pro instalado
+  (launchctl bootout + bootstrap com o dispatcher ocioso), nunca só no instalado.
+  - GC_VARIABLE_SESSION_MAX=9: decisão do Athos 19/09 ~03:3x ("WA 4, cidade 9");
+    o mesmo valor está em scripts/com.gascity.pilot.plist. Voltar pra 6 = pergunta pra ele.
+  - VERDICT_TIMEOUT_MINUTES fica AUSENTE de propósito (default 22 no script). O
+    45 provisório de 19/09 05:31 saiu às 06:30, quando o piso por custo de selftest
+    (ga-4158gs, gate_heavy_selftest_floor_minutes) entrou no ar.
+-->
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>BEADS_DOLT_PORT</key>
+		<string>52756</string>
+		<key>GATE_CODE_REVIEWERS</key>
+		<string>1</string>
+		<key>GATE_DOLT_CPU_HOT</key>
+		<string>300</string>
+		<key>GATE_DOLT_CPU_WARM</key>
+		<string>280</string>
+		<key>GATE_MAX_ADMITS_PER_SWEEP</key>
+		<string>3</string>
+		<key>GC_CITY_PATH</key>
+		<string>/Users/athos/gt/.gascity-gastown-hq</string>
+		<key>GC_VARIABLE_SESSION_MAX</key>
+		<string>9</string>
+		<key>HOME</key>
+		<string>/Users/athos</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+	</dict>
+	<key>Label</key>
+	<string>com.gascity.quality-gate-dispatcher</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/quality-gate-dispatcher.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/quality-gate-dispatcher-launchd.err</string>
+	<key>StandardOutPath</key>
+	<string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/quality-gate-dispatcher-launchd.out</string>
+	<key>StartInterval</key>
+	<integer>60</integer>
+</dict>
+</plist>
