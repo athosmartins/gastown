@@ -10,11 +10,20 @@
        human caught it by hand). This job takes ONE sample per invocation
        (latest session-reconciler-trace segment's last `ts`, plus a
        `launchctl print` liveness check on the supervisor itself), and
-       pages Mayor (mail+notify, cooldown-deduped) only when the process
-       is confirmed alive AND the trace has gone stale past the threshold
-       — never on a merely-unreadable trace, and never duplicating
-       supervisor-restart-watchdog's (ga-b0gltl) dead-process alert. It
-       never restarts, reconfigures, or otherwise touches the supervisor.
+       mails Mayor (cooldown-deduped) whenever the process is confirmed
+       alive AND the trace has gone stale past the 900s threshold — never
+       on a merely-unreadable trace, and never duplicating supervisor-
+       restart-watchdog's (ga-b0gltl) dead-process alert. Athos's phone
+       (notify) is a separate, higher bar: only once a single episode has
+       run past 1800s does it also page him — mail-only below that, so
+       Mayor-level infra noise doesn't wake him. REOPENED 2026-09-19: v1
+       shipped straight to main (skipped the gate) with a 300s threshold
+       and no hysteresis, and paged Athos's phone every ~6-7min all night
+       once the reconciler's own tick cadence degraded to 6-7min under
+       load — see the script header for the full fix (900s threshold,
+       3-consecutive-OK hysteresis before an episode is considered over,
+       tiered mail/notify). It never restarts, reconfigures, or otherwise
+       touches the supervisor.
        Deliberately a raw launchd StartInterval job, not a `gc order`: gc
        order triggers are evaluated from INSIDE the very loop this guard
        watches, so a wedged loop could silently stop firing its own
@@ -25,8 +34,8 @@
        selftest's own AC3 check asserts duration stays under 1/10th of
        StartInterval, so this can never stack concurrent instances or
        become the load it observes. StartInterval=120s gives ~2min worst-
-       case detection latency past the 5min staleness threshold, well
-       inside the 8-19min episode lengths actually observed. -->
+       case detection latency past the 900s (15min) staleness threshold,
+       well inside the 8-19min episode lengths actually observed. -->
   <key>ProgramArguments</key><array>
     <string>/bin/bash</string>
     <string>/Users/athos/gt/.gascity-gastown-hq/scripts/reconciler-stall-detector.sh</string>

@@ -22,10 +22,31 @@
 #              parseable `ts` in its last few lines. An unreadable state is
 #              never silently promoted to OK — see AC1 in ga-srp8hk.
 #   STALLED  — supervisor alive, trace readable, but the last record is
-#              older than the threshold (default 300s). Only this state
-#              pages (mail to Mayor + notify), with a cooldown so one long
-#              episode doesn't spam.
+#              older than the threshold (default 900s). Only this state
+#              pages (mail to Mayor always; notify/phone only past a
+#              second, higher escalation threshold), with a cooldown so
+#              one long episode doesn't spam.
 #   OK       — supervisor alive, last record inside the threshold.
+#
+# REOPENED 2026-09-19 (Mayor, comment on this bead): the first version of
+# this script shipped straight to main (bypassing the gate — do not repeat
+# that; this fix goes through the gate) with a 300s threshold and paged
+# Athos's phone every ~6-7min all night, because (a) 300s is BELOW today's
+# degraded-but-alive tick cadence (measured 6-7min per loop under
+# load_demand_snapshot slowness, ga-4ibmk6) so almost every tick looked
+# "stalled", and (b) the OK path unconditionally cleared the cooldown file
+# on a SINGLE healthy tick, so the very next slow tick re-armed and paged
+# again. Fixed here by: raising the threshold to 900s (separates genuine
+# multi-minute stalls from merely-slow-but-alive ticks — replay-verified
+# against the real 2026-09-18 trace: catches the two 18-19min gaps,
+# correctly ignores the 12.7min and 13.7min sub-threshold gaps and every
+# 6-7min tick); requiring RSD_REQUIRED_OK_STREAK consecutive OK reads
+# before treating an episode as over (a lone lucky tick no longer re-arms
+# immediate paging — the ORIGINAL cooldown window, or sustained recovery,
+# is what ends an episode now); and gating the notify/phone channel on a
+# separate, higher RSD_NOTIFY_ESCALATION_SEC so Mayor-level infra noise
+# (this script's whole subject) reaches Mayor by mail without waking
+# Athos's phone unless the stall is long enough to matter to him too.
 #
 # Deliberately a raw launchd StartInterval plist (reconciler-stall-
 # detector.plist), NOT a `gc order` (cooldown-trigger exec order): `gc
@@ -49,13 +70,26 @@ set -uo pipefail
 CITY="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
 TRACE_ROOT="${SESSION_RECONCILER_TRACE_ROOT:-${GC_CITY_RUNTIME_DIR:-$CITY/.gc/runtime}/session-reconciler-trace}"
 SEGMENTS_DIR="$TRACE_ROOT/segments"
-STALL_THRESHOLD_SEC="${RSD_STALL_THRESHOLD_SEC:-300}"
+STALL_THRESHOLD_SEC="${RSD_STALL_THRESHOLD_SEC:-900}"
 STATE_DIR="${RSD_STATE_DIR:-$CITY/.gc/state}"
 COOLDOWN_FILE="${RSD_COOLDOWN_FILE:-$STATE_DIR/reconciler-stall-detector-last-alert}"
 ALERT_COOLDOWN_SEC="${RSD_ALERT_COOLDOWN_SEC:-900}"
+# Hysteresis (ga-srp8hk reopen): number of CONSECUTIVE OK reads required
+# before an ongoing cooldown/episode is considered over and cleared early.
+# A single healthy tick no longer re-arms immediate paging for the very
+# next slow tick -- at StartInterval=120s, 3 means ~6min of sustained
+# health, roughly one full degraded-tick interval.
+REQUIRED_OK_STREAK="${RSD_REQUIRED_OK_STREAK:-3}"
+OK_STREAK_FILE="${RSD_OK_STREAK_FILE:-$STATE_DIR/reconciler-stall-detector-ok-streak}"
+# Notify (Athos's phone) is a second, higher bar than mail (Mayor): this is
+# infra Mayor resolves, so mail always fires once cooldown allows it, but
+# the phone only rings if the stall has run long enough to matter past
+# Mayor's own response window.
+NOTIFY_ESCALATION_SEC="${RSD_NOTIFY_ESCALATION_SEC:-1800}"
 LOG="${RSD_LOG:-$CITY/.gc/logs/reconciler-stall-detector.log}"
 SUPERVISOR_LABEL="${RSD_SUPERVISOR_LABEL:-com.gascity.supervisor}"
 SUPERVISOR_LOG="${GC_SUPERVISOR_LOG:-/Users/athos/.gc/supervisor.log}"
+SUPERVISOR_LOG_TAIL_BYTES="${RSD_SUPERVISOR_LOG_TAIL_BYTES:-1000000}"
 UID_NUM="$(id -u)"
 NOTIFY_BIN="${NOTIFY_BIN:-notify}"
 GC_BIN="${GC_BIN:-gc}"
@@ -277,22 +311,42 @@ log "state=$STATE age_sec=${AGE_SEC:-} last_ts=${LAST_TS:-} seg=${SEG_FILE:-} re
 
 case "$STATE" in
   OK)
-    # Clear any stale cooldown so a FUTURE, distinct stall episode alerts
-    # immediately rather than silently inheriting this episode's window.
-    rm -f "$COOLDOWN_FILE" 2>/dev/null || true
-    echo "reconciler-stall-detector: OK age_sec=$AGE_SEC"
+    # Hysteresis (ga-srp8hk reopen): require RSD_REQUIRED_OK_STREAK
+    # CONSECUTIVE OK reads before clearing the cooldown early. A single
+    # fresh tick landing mid-degradation must not immediately re-arm
+    # paging for the very next slow tick -- that was the night-long-pages
+    # bug. Any non-OK read resets this streak to 0 (below), so only a
+    # genuinely sustained recovery ends an episode ahead of the cooldown's
+    # own natural expiry.
+    OK_STREAK=0
+    if [ -f "$OK_STREAK_FILE" ]; then
+      OK_STREAK="$(cat "$OK_STREAK_FILE" 2>/dev/null)" || OK_STREAK=0
+      case "$OK_STREAK" in ''|*[!0-9]*) OK_STREAK=0 ;; esac
+    fi
+    OK_STREAK=$(( OK_STREAK + 1 ))
+    printf '%s\n' "$OK_STREAK" > "$OK_STREAK_FILE" 2>/dev/null || true
+    if [ "$OK_STREAK" -ge "$REQUIRED_OK_STREAK" ]; then
+      rm -f "$COOLDOWN_FILE" 2>/dev/null || true
+      echo "reconciler-stall-detector: OK age_sec=$AGE_SEC ok_streak=$OK_STREAK (episode cleared)"
+    else
+      echo "reconciler-stall-detector: OK age_sec=$AGE_SEC ok_streak=$OK_STREAK/$REQUIRED_OK_STREAK (cooldown, if any, left standing)"
+    fi
     exit 0
     ;;
   UNKNOWN)
     # Reported, never silently promoted to OK -- but not itself paged: an
     # unreadable trace is genuinely inconclusive, and "supervisor not
-    # running" is ga-b0gltl's alert to send, not duplicated here.
+    # running" is ga-b0gltl's alert to send, not duplicated here. Neither
+    # the cooldown nor the OK streak is touched -- "couldn't tell" must
+    # never count as evidence of health OR of stalling.
     echo "reconciler-stall-detector: UNKNOWN ($REASON)"
     exit 0
     ;;
 esac
 
-# ---- STALLED: cooldown check before doing any paging work ----
+# ---- STALLED: any stall breaks a healthy streak, then cooldown check
+# before doing any paging work ----
+printf '%s\n' 0 > "$OK_STREAK_FILE" 2>/dev/null || true
 NOW_EP="$(now_epoch)"
 if [ -f "$COOLDOWN_FILE" ]; then
   LAST_ALERT_EP="$(cat "$COOLDOWN_FILE" 2>/dev/null)" || LAST_ALERT_EP=0
@@ -310,16 +364,50 @@ fi
 # ---- gather alert diagnostics (only reached when actually about to page) ----
 AGE_MIN=$(( AGE_SEC / 60 ))
 SWAP_LINE="$(sysctl vm.swapusage 2>/dev/null)"
+# Episode window = [last known-good tick, now] -- i.e. exactly the span
+# this stall has been ongoing. Equivalent to LAST_TS's own epoch without
+# needing to reparse it.
+EPISODE_START_EP=$(( NOW_EP - AGE_SEC ))
 # supervisor.log routinely mis-classifies as binary to plain `grep` (BSD
 # grep on this file's very-long-line UTF-8 text) and silently returns
-# nothing -- always `grep -a` here.
-IOTIMEOUT_LINES="$(tail -c 200000 "$SUPERVISOR_LOG" 2>/dev/null | grep -a 'i/o timeout' | tail -5)"
+# nothing -- always `grep -a` here. Lines are then filtered to the CURRENT
+# episode's own window (ga-srp8hk reopen: an alert at 22:36 previously
+# showed unrelated 21:05-21:25 lines from an earlier, already-resolved
+# episode, which read as confusing/stale evidence). supervisor.log's mysql
+# driver lines carry a LOCAL "YYYY/MM/DD HH:MM:SS" timestamp (this host's
+# own tz, matching wall-clock `now`) -- never assume UTC here.
+IOTIMEOUT_LINES="$(tail -c "$SUPERVISOR_LOG_TAIL_BYTES" "$SUPERVISOR_LOG" 2>/dev/null | grep -a 'i/o timeout' | python3 -c '
+import sys, re, time, datetime
+window_start_ep = int(sys.argv[1])
+now_ep = int(sys.argv[2])
+pat = re.compile(r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})")
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    m = pat.search(line)
+    if not m:
+        continue
+    try:
+        dt = datetime.datetime.strptime(m.group(1), "%Y/%m/%d %H:%M:%S")
+        ep = int(time.mktime(dt.timetuple()))
+    except Exception:
+        continue
+    if window_start_ep <= ep <= now_ep:
+        print(line)
+' "$EPISODE_START_EP" "$NOW_EP" | tail -5)"
 START_PENDING_COUNT="unknown"
 if [ -x "$BD_LIST_CACHED" ]; then
   SP="$(timeout 20 bash "$BD_LIST_CACHED" -C "$CITY" list -l gc:session --json --include-infra --limit 0 2>/dev/null \
     | jq '[.[] | select(.metadata.state=="start-pending" and .metadata.wake_attempts=="0")] | length' 2>/dev/null)"
   case "$SP" in ''|*[!0-9]*) ;; *) START_PENDING_COUNT="$SP" ;; esac
 fi
+
+# Notify (Athos's phone) is gated on a SEPARATE, higher bar than the mail
+# alert below: this is infra Mayor resolves, so mail is the primary
+# channel every time cooldown allows it, and the phone only escalates once
+# the stall has run long enough (RSD_NOTIFY_ESCALATION_SEC) that Athos
+# plausibly needs to know too -- not on every Mayor-level blip.
+ESCALATE_TO_NOTIFY=0
+[ "$AGE_SEC" -ge "$NOTIFY_ESCALATION_SEC" ] && ESCALATE_TO_NOTIFY=1
 
 TITLE="Reconciler stalled ${AGE_MIN}min (gc.session reconciler)"
 BODY="$(cat <<EOF
@@ -329,24 +417,30 @@ Last trace record: ${LAST_TS}
 Segment file: ${SEG_FILE}
 Sessions start-pending w/ wake_attempts=0: ${START_PENDING_COUNT}
 ${SWAP_LINE}
-Recent supervisor.log i/o timeout lines (last 5 in tail):
-${IOTIMEOUT_LINES:-(none found in the checked tail)}
+Recent supervisor.log i/o timeout lines within this episode window (last 5):
+${IOTIMEOUT_LINES:-(none found within this episode window)}
 
+Mailed to Mayor (infra channel). Phone notify $( [ "$ESCALATE_TO_NOTIFY" = "1" ] && echo "ALSO sent -- stall exceeds ${NOTIFY_ESCALATION_SEC}s escalation bar" || echo "withheld -- under the ${NOTIFY_ESCALATION_SEC}s escalation bar, Mayor-only for now" ).
 Detection-only guard (ga-srp8hk) -- nothing was restarted or touched.
 EOF
 )"
 
-# ---- alert: notify first (Dolt-independent -- reaches Athos even if bd/gc
-# mail are themselves wedged by the same Dolt i/o-timeout condition), mail
-# second with a concrete-name fallback (the alias form "mayor/" does an
-# extra live-session-listing bd read before it can send -- observed failing
-# 3/3 under real Dolt flakiness, exactly the condition this alert fires
-# under -- so the bare alias is used first, and on failure the concrete
-# session name is tried once rather than retrying the same failure mode) ----
-if command -v "$NOTIFY_BIN" >/dev/null 2>&1; then
-  "$NOTIFY_BIN" -t "$TITLE" -p 4 "$BODY" >/dev/null 2>&1 || log "notify call failed (non-fatal)"
+# ---- alert: mail to Mayor is the primary channel (concrete-name fallback:
+# the alias form "mayor/" does an extra live-session-listing bd read before
+# it can send -- observed failing 3/3 under real Dolt flakiness, exactly
+# the condition this alert fires under -- so the bare alias is used first,
+# and on failure the concrete session name is tried once rather than
+# retrying the same failure mode). Notify (Athos's phone, Dolt-independent)
+# only fires once escalated above, and goes first among the two so it
+# reaches him even if mail is itself wedged by the same condition. ----
+if [ "$ESCALATE_TO_NOTIFY" = "1" ]; then
+  if command -v "$NOTIFY_BIN" >/dev/null 2>&1; then
+    "$NOTIFY_BIN" -t "$TITLE" -p 4 "$BODY" >/dev/null 2>&1 || log "notify call failed (non-fatal)"
+  else
+    log "notify binary not found on PATH ($NOTIFY_BIN) -- skipped"
+  fi
 else
-  log "notify binary not found on PATH ($NOTIFY_BIN) -- skipped"
+  log "age_sec=$AGE_SEC below notify escalation bar (${NOTIFY_ESCALATION_SEC}s) -- mail-only, Athos's phone not paged"
 fi
 
 MAIL_OK=0
@@ -358,7 +452,11 @@ if command -v "$GC_BIN" >/dev/null 2>&1; then
     if timeout 45 "$GC_BIN" mail send "$MAYOR_ADDR_FALLBACK" -s "$TITLE" -m "$BODY" --notify >/dev/null 2>&1; then
       MAIL_OK=1
     else
-      log "gc mail send ALSO failed against $MAYOR_ADDR_FALLBACK -- alert delivered via notify only"
+      if [ "$ESCALATE_TO_NOTIFY" = "1" ]; then
+        log "gc mail send ALSO failed against $MAYOR_ADDR_FALLBACK -- alert delivered via notify only"
+      else
+        log "gc mail send ALSO failed against $MAYOR_ADDR_FALLBACK -- alert NOT delivered on any channel (below notify escalation bar, no fallback left)"
+      fi
     fi
   fi
 else
@@ -366,6 +464,6 @@ else
 fi
 
 echo "$NOW_EP" > "$COOLDOWN_FILE" 2>/dev/null || true
-log "ALERTED state=STALLED age_sec=$AGE_SEC age_min=$AGE_MIN mail_ok=$MAIL_OK"
-echo "reconciler-stall-detector: STALLED age_sec=$AGE_SEC (alerted, mail_ok=$MAIL_OK)"
+log "ALERTED state=STALLED age_sec=$AGE_SEC age_min=$AGE_MIN mail_ok=$MAIL_OK escalated_to_notify=$ESCALATE_TO_NOTIFY"
+echo "reconciler-stall-detector: STALLED age_sec=$AGE_SEC (alerted, mail_ok=$MAIL_OK, escalated_to_notify=$ESCALATE_TO_NOTIFY)"
 exit 0
