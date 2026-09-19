@@ -113,18 +113,22 @@ KILL_SWITCH = os.path.join(CITY, ".gc/state/quorum-convergence-watchdog.disabled
 # Mayor and dogs are never included; adhoc/polecat sessions are excluded at runtime.
 #
 # wa-14p4c (Athos 2026-09-19, "Manter só nos horários"): peter-wa is
-# deliberately NOT in this roster, even though it can now have a live session
-# during its 07:00/19:00 touchpoint window (agent.toml suspended=false). This
-# watchdog's own selection gate (_get_active_named_crews) only checks whether
-# a session is currently active — it never checks the agent's `suspended`
-# flag — so during that window peter-wa would otherwise be selectable, and a
-# 2-of-3 vote can autonomously `bd update <bead> --assignee peter-wa` with
-# zero human approval (_execute_action, reassign:<crew>). Athos's decision was
-# explicit: peter "não pega bead nenhuma" — not even briefly, not even via a
-# quorum vote while its touchpoint session happens to be up. Do not re-add
-# peter-wa here without a corresponding change to make this watchdog respect
-# `suspended` (it doesn't today, unlike pilot-dispatcher.sh's own
-# _crew_is_suspended check).
+# deliberately NOT in this roster, even though it can briefly have a live
+# session during its 07:00/19:00 touchpoint window (agent.toml stays
+# suspended=true as the STEADY STATE — the WA-repo wrapper/closer toggle it
+# to false only for the duration of that window, per gate-feedback ga-lltq86:
+# pilot-dispatcher.sh's _crew_is_suspended is a domain-independent safety net
+# that strips any stray assignee=peter-wa before dispatch, so leaving
+# suspended=true whenever there is no active touchpoint is load-bearing).
+# This watchdog's own selection gate (_get_active_named_crews) only checks
+# whether a session is currently active, never `suspended` — so during that
+# brief window peter-wa would otherwise be selectable as a VOTER. Removing it
+# from the roster stops that. It does NOT, by itself, stop a DIFFERENT
+# legitimately-selected crew from voting "reassign:peter-wa" as a TARGET —
+# that hole is closed separately, in VALID_ACTION_RE and _execute_action
+# below (both explicitly refuse "peter-wa" as a reassignment target,
+# regardless of roster membership). Athos's decision was explicit: peter "não
+# pega bead nenhuma" — not even briefly, not even via a quorum vote.
 QUORUM_CREW_ROSTER = [
     "mila-wa",      # WA/painel/UI/Kanban
     "oracle-wa",    # warming/on-device/presença
@@ -148,8 +152,19 @@ DOMAIN_TO_OWNER: dict[str, str] = {
 }
 
 # Valid actions the watchdog can execute autonomously.
+#
+# gate-feedback (ga-lltq86 reviewer, wa-14p4c): removing peter-wa from
+# QUORUM_CREW_ROSTER/DOMAIN_TO_OWNER only stops it being SELECTED as a voter
+# or auto-suggested owner — it does nothing to stop a DIFFERENT, legitimately
+# selected crew from voting "QUORUM_VOTE: reassign:peter-wa" (plausible,
+# since peter-wa is the known real-estate/ArcGIS specialist), which
+# _execute_action below would otherwise honor with no target validation at
+# all. The negative lookahead rejects that vote at parse time, case-
+# insensitively (matches VALID_ACTION_RE's own re.IGNORECASE); the identical
+# check inside _execute_action is the execution-layer backstop so a future
+# change to vote parsing can't silently reopen this by itself.
 VALID_ACTION_RE = re.compile(
-    r'^(reclaim|reassign:[a-zA-Z0-9._-]+|needs-human|close:.+)$', re.IGNORECASE)
+    r'^(reclaim|reassign:(?!peter-wa$)[a-zA-Z0-9._-]+|needs-human|close:.+)$', re.IGNORECASE)
 
 # Pattern to parse a vote from a comment body.
 VOTE_LINE_RE = re.compile(r'^QUORUM_VOTE:\s*(.+)$', re.MULTILINE | re.IGNORECASE)
@@ -527,6 +542,14 @@ def _execute_action(bead_id: str, action: str) -> bool:
     if action.startswith("reassign:"):
         crew = action.split(":", 1)[1].strip()
         if not crew:
+            return False
+        # gate-feedback (ga-lltq86 reviewer, wa-14p4c): execution-layer
+        # backstop — VALID_ACTION_RE already rejects "reassign:peter-wa" at
+        # vote-parsing time, but this function has no way to know whether
+        # every caller goes through that regex, so it must refuse the
+        # dangerous target itself too. peter-wa must never be an autonomous
+        # quorum-vote reassignment target, full stop.
+        if crew.lower() == "peter-wa":
             return False
         r = _run([BD, "update", bead_id, "--assignee", crew], timeout=BD_TIMEOUT)
         return r is not None

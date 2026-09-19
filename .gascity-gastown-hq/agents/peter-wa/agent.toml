@@ -5,17 +5,4 @@ work_dir = "/Users/athos/gt/whatsapp_automation/crew/peter"
 
 option_defaults = { effort = "high" }
 
-# wa-14p4c (Athos 2026-09-19, "Manter só nos horários"): peter-wa is NOT
-# suspended so the 07:00/19:00 touchpoint wrapper's `gc session new`/`wake`
-# never fails on a suspended-agent check — that failure was the exact bug this
-# bead fixes. min_active_sessions=0 above already means the reconciler never
-# proactively spawns a warm session; the ONLY thing that creates one is the
-# wrapper's explicit call at a touchpoint, and scripts/peter/peter_session_
-# closer.sh (WA repo, launchd every 5min) closes it again once idle >= 30min
-# or at a 2h ceiling. Do not flip this back to suspended=true as part of that
-# lifecycle — toggling suspend/resume around the window was considered and
-# rejected (it reintroduces exactly the "07:00 fails if resume didn't run
-# first" risk class, and crew-autopin-guard's suspended-check no longer needs
-# to protect this agent because peter-wa was removed from its APIN_CREWS
-# allowlist instead — see ~/.gastown/scripts/crew-autopin-guard.sh).
-suspended = false
+suspended = true

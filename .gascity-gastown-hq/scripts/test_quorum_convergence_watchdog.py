@@ -98,5 +98,76 @@ class TestConveneQuorumPreservesMetadata(unittest.TestCase):
         self.assertIn("quorum.convened_at", marked)
 
 
+class TestPeterWaNeverAnAutonomousReassignTarget(unittest.TestCase):
+    """gate-feedback (ga-lltq86, wa-14p4c): removing peter-wa from
+    QUORUM_CREW_ROSTER/DOMAIN_TO_OWNER only stops it being SELECTED as a
+    voter — it does not stop a different, legitimately selected crew from
+    voting "reassign:peter-wa" as a TARGET, which _execute_action previously
+    honored with no target validation at all. Both layers (regex parse-time
+    rejection, and the execution-layer backstop) must independently refuse
+    this, regardless of the crew roster's contents."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.qcw = _load_qcw()
+
+    def test_valid_action_re_rejects_reassign_peter_wa(self):
+        self.assertIsNone(self.qcw.VALID_ACTION_RE.match("reassign:peter-wa"))
+        # Case-insensitive, matching VALID_ACTION_RE's own re.IGNORECASE.
+        self.assertIsNone(self.qcw.VALID_ACTION_RE.match("REASSIGN:Peter-Wa"))
+
+    def test_valid_action_re_still_accepts_other_crews(self):
+        # The fix must not collaterally break every other legitimate target.
+        self.assertIsNotNone(self.qcw.VALID_ACTION_RE.match("reassign:oracle-wa"))
+        self.assertIsNotNone(self.qcw.VALID_ACTION_RE.match("reassign:mila-wa"))
+        self.assertIsNotNone(self.qcw.VALID_ACTION_RE.match("reclaim"))
+        self.assertIsNotNone(self.qcw.VALID_ACTION_RE.match("needs-human"))
+
+    def test_execute_action_refuses_peter_wa_even_when_called_directly(self):
+        # Backstop: even if some future caller bypasses VALID_ACTION_RE
+        # entirely and hands _execute_action the action string directly, it
+        # must still refuse — proving the fix is not solely a regex fix.
+        calls = []
+
+        def fake_run(cmd, timeout=None):
+            calls.append(cmd)
+            return "ok"
+
+        orig_run = self.qcw._run
+        self.qcw._run = fake_run
+        try:
+            result = self.qcw._execute_action("ga-somebead", "reassign:peter-wa")
+        finally:
+            self.qcw._run = orig_run
+
+        self.assertFalse(result, "must return False for reassign:peter-wa")
+        assignee_calls = [c for c in calls if "--assignee" in c]
+        self.assertEqual(
+            assignee_calls, [],
+            f"bd update --assignee must never be called for peter-wa, got: {assignee_calls}",
+        )
+
+    def test_execute_action_still_reassigns_other_crews(self):
+        # The execution-layer backstop must not collaterally block every
+        # other legitimate reassignment target.
+        calls = []
+
+        def fake_run(cmd, timeout=None):
+            calls.append(cmd)
+            return "ok"
+
+        orig_run = self.qcw._run
+        self.qcw._run = fake_run
+        try:
+            result = self.qcw._execute_action("ga-somebead", "reassign:oracle-wa")
+        finally:
+            self.qcw._run = orig_run
+
+        self.assertTrue(result)
+        assignee_calls = [c for c in calls if "--assignee" in c]
+        self.assertEqual(len(assignee_calls), 1)
+        self.assertIn("oracle-wa", assignee_calls[0])
+
+
 if __name__ == "__main__":
     unittest.main()
