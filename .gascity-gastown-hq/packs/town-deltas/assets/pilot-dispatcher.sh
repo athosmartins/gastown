@@ -746,7 +746,15 @@ PILOT_USED_BUILDERS=""
 # Matches path/keyword signals across title + description + criteria + labels
 # (case-insensitive). First match wins; order is most-specific-first.
 bead_domain() {
-  local bead="$1" hay
+  local bead="$1" hay dom_override
+  # ga-cfc6wd: explicit label override, read FIRST, ahead of every keyword
+  # check below — lets a misclassification be corrected (domain:<name>, e.g.
+  # domain:data or domain:warming) without touching the regexes here. First
+  # domain:<x> label wins if more than one is present.
+  dom_override=$(echo "$bead" | jq -r '
+      ((.labels // [])[] | select(startswith("domain:")) | sub("^domain:"; ""))
+    ' 2>/dev/null | head -1)
+  [ -n "$dom_override" ] && { echo "$dom_override"; return 0; }
   hay=$(echo "$bead" | jq -r '
       [ (.title // ""), (.description // ""),
         (.acceptance_criteria // .metadata["story.criterios"] // ""),
@@ -792,7 +800,22 @@ bead_domain() {
   if printf '%s' "$hay" | grep -iqE 'arcgis|zoneamento|geometria|geo-?match|quarteir|cadastr|\bitbi\b|[ií]ndice cadastral|im[oó]ve(l|is)|funil[ _-]?im[oó]vel|deals?.*(fora de bh|im[oó]ve)'; then
     echo "real-estate"; return 0
   fi
-  if printf '%s' "$hay" | grep -iqE 'warming|warm-?up|aquecimento|\bchip(s)?\b|ban-?prevention|ban-?risk|on-?device send|group-?send'; then
+  # ga-cfc6wd: bare "warming"/"aquecimento"/"chip(s)" alone are too broad — they
+  # false-positive on ENGINE-CODE bugs that merely mention the ramp/chip concept
+  # as background (wa-eequm cites rewarm_on_recovery.py/chip_ban_detector.py as
+  # investigation candidates; wa-5f8df says "NAO e o estado do chip" while
+  # REFUTING that hypothesis; wa-8yfoi mentions "risco de ban" as a side-effect
+  # of a retry-queue design) — none of those beads are operação EM APARELHO,
+  # they are slot_scheduler/central_sender/outreach_worker code fixes the pool
+  # can build like any other. Compound/specific phrases stay unconditional
+  # (already narrow enough); the bare/ambiguous words only count as warming
+  # when they appear near an actual physical-device signal (aparelho/
+  # dispositivo/ADB) — see pilot-dispatcher.selftest.sh Scenario ga-cfc6wd for
+  # the false-positive fixtures this was measured against.
+  if printf '%s' "$hay" | grep -iqE 'warm-?up|ban-?prevention|ban-?risk|on-?device send|group-?send'; then
+    echo "warming"; return 0
+  fi
+  if printf '%s' "$hay" | grep -iqE '(warming|aquecimento|\bchip(s)?\b).{0,60}(\baparelho\b|\bdispositivo\b|\badb\b)|(\baparelho\b|\bdispositivo\b|\badb\b).{0,60}(warming|aquecimento|\bchip(s)?\b)'; then
     echo "warming"; return 0
   fi
   if printf '%s' "$hay" | grep -iqE 'financeiro|\bledger\b|enrichment|scraper|mega data set|net ?imoveis|viva ?real|\bemail\b|pipedrive|property data|\bdados\b'; then

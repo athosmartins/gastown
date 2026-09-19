@@ -3431,6 +3431,28 @@ NVNBEAD='{"title":"Contagem: enriquecer deals/imóveis fora de BH com geometria+
 [ "$(_dom "$WARM_BEAD")" = warming ]            && ok "chip/aquecimento → warming"                              || bad "warming misclassified: '$(_dom "$WARM_BEAD")'"
 [ "$(_own warming)" = oracle-wa ]               && ok "warming prefers oracle-wa"                               || bad "warming owner wrong: '$(_own warming)'"
 
+# ── Scenario ga-cfc6wd: bare chip/aquecimento no longer hijacks ENGINE-CODE bugs
+# into the ownerless warming domain (with crews ended, warming has no pool
+# fallback — see rig_domain_requires_persistent_owner). Only counts as warming
+# when the word appears near an actual on-device signal (aparelho/dispositivo/
+# ADB); a domain:<x> label overrides everything else, checked first. Fixtures
+# below are trimmed/paraphrased from the real beads that motivated this fix,
+# not verbatim copies. ─────────────────────────────────────────────────────
+echo "Scenario ga-cfc6wd: warming narrowed to on-device ops + domain:<x> label override"
+EEQUM_SHAPED='{"title":"Note20-normal só recebe ~4 msgs/dia (cap 10) mesmo saudável — gargalo de atribuição, não execução nem queda","description":"Candidatos vistos por grep: lib/rewarm_on_recovery.py reancora a rampa de aquecimento pra chip que voltou de BAN. lib/chip_ban_detector.py mesma familia, mesmo gatilho de ban. Achar o codigo em slot_scheduler.py::_assign_slots_for_channel."}'
+[ "$(_dom "$EEQUM_SHAPED")" != warming ]        && ok "wa-eequm-shaped scheduler bug (chip/aquecimento only as file-name/investigation context) is NOT warming → pool" || bad "REGRESSION (ga-cfc6wd): engine-code bug still misclassified as warming: '$(_dom "$EEQUM_SHAPED")'"
+CHIP_REFUTED='{"title":"canal que volta nao e religado","description":"NAO e o estado do chip: todos os chips que estao enviando tambem estao em STANDBY no chip_pool. Hipotese refutada."}'
+[ "$(_dom "$CHIP_REFUTED")" != warming ]        && ok "bare chip mention while REFUTING the chip-state hypothesis is NOT warming → pool" || bad "REGRESSION (ga-cfc6wd): text refuting chip-state still misclassified as warming: '$(_dom "$CHIP_REFUTED")'"
+BANRISK_SIDEEFFECT='{"title":"113 leads parados sem retry automatico","description":"consumir teto do dia como qualquer envio novo, concentraria volume atipico nos chips, que e risco de ban. Diluir."}'
+[ "$(_dom "$BANRISK_SIDEEFFECT")" != warming ]  && ok "chip/ban mentioned only as a retry-design side-effect is NOT warming → pool" || bad "REGRESSION (ga-cfc6wd): retry-queue bug still misclassified as warming: '$(_dom "$BANRISK_SIDEEFFECT")'"
+REAL_WARMING='{"title":"rodar aquecimento dos chips novos no aparelho X"}'
+[ "$(_dom "$REAL_WARMING")" = warming ]         && ok "genuine on-device ramp request (aquecimento ... no aparelho) still classifies warming" || bad "REGRESSION (ga-cfc6wd): genuine on-device warming request no longer classifies as warming: '$(_dom "$REAL_WARMING")'"
+[ "$(_dom "$WARM_BEAD")" = warming ]            && ok "ga-cfc6wd control: Scenario 17f's own WARM_BEAD fixture (on-device send) unaffected" || bad "ga-cfc6wd REGRESSION: WARM_BEAD fixture broke: '$(_dom "$WARM_BEAD")'"
+DOMAIN_OVERRIDE_DATA='{"title":"bug no chip pool","description":"aquecimento","labels":["domain:data","ctx:ready"]}'
+[ "$(_dom "$DOMAIN_OVERRIDE_DATA")" = data ]    && ok "domain:data label overrides a chip/aquecimento keyword match → data" || bad "REGRESSION (ga-cfc6wd): domain:<x> label override not honored: '$(_dom "$DOMAIN_OVERRIDE_DATA")'"
+DOMAIN_OVERRIDE_INFRA='{"title":"totally unrelated infra title","description":"nothing chip-related here","labels":["domain:infra"]}'
+[ "$(_dom "$DOMAIN_OVERRIDE_INFRA")" = infra ]  && ok "domain:infra label wins even with zero infra keywords present" || bad "REGRESSION (ga-cfc6wd): domain:<x> label override not honored for a non-warming target: '$(_dom "$DOMAIN_OVERRIDE_INFRA")'"
+
 # ── Scenario 17g (ga-uvfs6): warming dispatches DIRECTLY to oracle-wa ─────────
 # Bug ga-uvfs6: rig_domain_owner has ALWAYS mapped warming→oracle-wa (Scenario
 # 17 above), but the pilot-rewire (2026-06-25) moved WA to virtual pool slots
