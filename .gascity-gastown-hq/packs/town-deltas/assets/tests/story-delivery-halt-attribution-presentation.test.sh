@@ -40,11 +40,19 @@
 #     of ever reaching the halt at all) — covered by the existing
 #     no-op-attribution T1/T2; this file's T3 below instead covers the
 #     "probe ran but returned nothing" precise-fallback case directly.
-# T3: control — narrow probe never ran for this story (Path A: PRE_DEPLOY_SHA
-#     != POST_DEPLOY_SHA) → MERGE_OWN_AFFECTED stays empty (reset, never set)
-#     → the halt ACTION text must fall back to the ORIGINAL wide-list-only
-#     wording, explicitly noting no per-bead attribution was available —
-#     never silently omit the wide list just because it's now "secondary".
+# T3 (ga-ndu4ic UPDATE, 2026-09-19 — was "control: narrow probe never ran,
+#     Path A"; that is no longer true): ga-ndu4ic taught the narrow probe to
+#     run UNCONDITIONALLY instead of only on Path B (a true no-op pull) —
+#     real deliveries usually take Path A (this iteration's own pull is what
+#     fetches the story's own merge), so gating the probe to Path B alone
+#     meant it silently never engaged for the common case. Confirmed live:
+#     wa-vbsm5.1 (2026-09-18) reached only demand-dashboard, yet the halt
+#     blamed it for two OTHER deliveries' own daemons (ficha360, map-viewer)
+#     that merely shared its wide window — see
+#     story-delivery-daemon-refresh-path-a-own-attribution.test.sh for the
+#     dedicated repro. T3 below now mirrors T1 (disagree) exactly, just
+#     reached via Path A instead of Path B — proving the two paths behave
+#     identically now that both run the same probe.
 
 set -uo pipefail
 
@@ -68,10 +76,10 @@ MARKER_REL=".gc/runtime/daemon-refresh-baseline/whatsapp_automation.sha"
 #     new_sensitive.py (this story's own C2) → GUARDED names BOTH daemons.
 #     Narrow call (DRY_RUN=1, MERGE_PRE_MAIN=C1..MERGE_SHA=C2) sees ONLY
 #     new_sensitive.py → AFFECTED names only the one this story caused.
-#   "path_a" (T3): PRE_DEPLOY_SHA=C0 != POST_DEPLOY_SHA=C2 (a real pull
-#     happened) → Step 5b never calls the narrow per-bead probe at all (that
-#     fallback is scoped to the true no-op branch only) → MERGE_OWN_AFFECTED
-#     stays at its reset empty value all the way to the halt.
+#   "path_a" (T3, ga-ndu4ic): PRE_DEPLOY_SHA=C0 != POST_DEPLOY_SHA=C2 (a real
+#     pull happened) — the narrow per-bead probe now runs regardless, so this
+#     must behave exactly like "disagree" (T1): lead with new-daemon, demote
+#     old-daemon to "Context only".
 run_block() {
   local mode="$1"
   local T; T="$(mktemp -d)"
@@ -148,8 +156,9 @@ EOF
       MERGE_SHA="$SHA_C2"; MERGE_REF="origin/main"; MERGE_PRE_MAIN="$SHA_C1"
       ;;
     path_a)
-      # A real pull happened this iteration — the narrow per-bead fallback
-      # (scoped to PRE_DEPLOY_SHA==POST_DEPLOY_SHA only) never triggers.
+      # A real pull happened this iteration — ga-ndu4ic: the narrow per-bead
+      # probe now runs regardless (no longer scoped to PRE_DEPLOY_SHA==
+      # POST_DEPLOY_SHA only).
       PRE_DEPLOY_SHA="$SHA_C0"; POST_DEPLOY_SHA="$SHA_C2"
       MERGE_SHA="$SHA_C2"; MERGE_REF="origin/main"; MERGE_PRE_MAIN="$SHA_C1"
       ;;
@@ -206,24 +215,36 @@ echo "$CONTEXT_LINE" | grep -q "com.test.new-daemon" \
   && nok "T1 context line wrongly re-lists the already-attributed daemon (new-daemon) as NOT attributed — self-contradicts the lead line" "$CONTEXT_LINE" \
   || ok "T1 context line correctly excludes the already-attributed daemon (new-daemon) — no self-contradiction with the lead line"
 
-# ── T3 (mode=path_a): a real pull happened, narrow probe never ran → no
-#    per-bead attribution this run → falls back to the ORIGINAL wide-list-
-#    only wording, explicitly saying so (never silently drops the wide list,
-#    never fabricates a "restart THESE" claim it can't back up) ───────────
+# ── T3 (mode=path_a, ga-ndu4ic): a real pull happened this iteration, but
+#    the narrow probe now runs regardless of Path A/B — must behave EXACTLY
+#    like T1 (disagree): lead with new-daemon, demote old-daemon to context.
+#    Before ga-ndu4ic this fell back to the wide-list-only wording with no
+#    attribution at all — the exact shape of wa-vbsm5.1 (2026-09-18) ──────
 run_block path_a
 [ "$RUN_RC" -eq 0 ] && ok "T3 block runs clean (rc=0)" || nok "T3 rc" "rc=$RUN_RC"
 echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=0" \
-  && ok "T3 own-merge classified via the static tests/docs/md pattern (Path A), not the probe" \
+  && ok "T3 own-merge classified via the probe (Path A now runs it too), not just the pattern check" \
   || nok "T3 inert classification" "$LOG_OUT"
-! echo "$BD_CALLS" | grep -q "restart THESE for this merge" \
-  && ok "T3 halt does NOT claim a per-bead attribution it never computed" \
-  || nok "T3 wrongly claimed per-bead attribution" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "No per-bead attribution available this run" \
-  && ok "T3 halt explicitly says why (falls back to wide-list-only, honestly)" \
-  || nok "T3 missing fallback explanation" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "com.test.new-daemon" \
-  && ok "T3 wide list (the only list available) still names the real finding" \
-  || nok "T3 wide list missing from fallback halt" "$BD_CALLS"
+echo "$BD_CALLS" | grep -q "restart THESE for this merge" \
+  && ok "T3 halt now leads with the per-bead attribution phrase on Path A too (ga-ndu4ic)" \
+  || nok "T3 missing lead-with phrase — Path A attribution regressed" "$BD_CALLS"
+LEAD_PART="$(echo "$BD_CALLS" | awk '/Context only/{exit} {print}')"
+echo "$LEAD_PART" | grep -q "com.test.new-daemon" \
+  && ok "T3 leading action names the precisely-attributed daemon (new-daemon)" \
+  || nok "T3 lead missing new-daemon" "$LEAD_PART"
+echo "$LEAD_PART" | grep -q "com.test.old-daemon" \
+  && nok "T3 leading action wrongly names the unattributed daemon (old-daemon leaked into the lead)" "$LEAD_PART" \
+  || ok "T3 leading action does NOT name the unattributed daemon (old-daemon kept out of the lead)"
+echo "$BD_CALLS" | grep -q "Context only — NOT attributed to this merge" \
+  && ok "T3 wide list demoted to an explicitly-marked context line" \
+  || nok "T3 missing context-demotion marker" "$BD_CALLS"
+CONTEXT_LINE="$(echo "$BD_CALLS" | grep "Context only — NOT attributed to this merge")"
+echo "$CONTEXT_LINE" | grep -q "com.test.old-daemon" \
+  && ok "T3 demoted context line still names the unattributed daemon (nothing hidden, just de-prioritized)" \
+  || nok "T3 old-daemon missing entirely from context line" "$CONTEXT_LINE"
+echo "$CONTEXT_LINE" | grep -q "com.test.new-daemon" \
+  && nok "T3 context line wrongly re-lists the already-attributed daemon (new-daemon) as NOT attributed" "$CONTEXT_LINE" \
+  || ok "T3 context line correctly excludes the already-attributed daemon (new-daemon)"
 
 echo ""
 echo "story-delivery halt attribution presentation tests: $PASS passed, $FAIL failed"

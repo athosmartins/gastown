@@ -2082,24 +2082,49 @@ else
         THIS_PULL_STRUCTURALLY_INERT=0
       fi
     fi
-  elif [ -n "$MERGE_SHA" ] \
-       && [ -n "$MERGE_PRE_MAIN" ] \
-       && MERGE_OWN_BASE_SHA="$(git -C "$RUNTIME_DIR" rev-parse --verify -q "$MERGE_PRE_MAIN" 2>/dev/null)" \
-       && [ -n "$MERGE_OWN_BASE_SHA" ] \
-       && git -C "$RUNTIME_DIR" merge-base --is-ancestor "$MERGE_OWN_BASE_SHA" "$MERGE_SHA" 2>/dev/null; then
-    # ga-6zkhci: PRE_DEPLOY_SHA==POST_DEPLOY_SHA means THIS iteration's pull was
-    # a true no-op (ga-gokm6's scenario: something else — a sibling story's
-    # delivery earlier in the same sweep, or a crew's own post-merge fast-
-    # forward — already advanced RUNTIME_DIR's HEAD past this story's merge
-    # before PRE_DEPLOY_SHA was captured above). That range genuinely carries
-    # no information about this story's own files, so the pattern check above
-    # never runs — but this story's own delta has a real, known diff
-    # regardless of what the pull did, IF we know the right base to diff
-    # from. Confirmed live (story-delivery.log 2026-09-14): wa-ibaqq
-    # (docs/mockups/*.html only) and wa-mjpjs (scripts/lib files no daemon
-    # imports) were both held on exactly this gap — THIS_PULL_STRUCTURALLY_INERT
-    # stayed unset, so the case statement below fell to blame/hold for
-    # staleness neither one caused.
+  fi
+  # ga-ndu4ic: the block above (Path A: THIS iteration's own pull moved HEAD,
+  # PRE_DEPLOY_SHA != POST_DEPLOY_SHA) only proves whether ITS OWN pull's
+  # PRE..POST window is tests/docs/md-only — and that window is NOT scoped to
+  # this story alone whenever more than one merge lands in the same pull
+  # cycle (routine in this city, ~90 commits/day). The block below used to
+  # run ONLY as an `elif` — i.e. ONLY on Path B (PRE_DEPLOY_SHA==
+  # POST_DEPLOY_SHA, a true no-op pull) — so the one genuinely story-scoped
+  # probe (MERGE_PRE_MAIN..MERGE_SHA: exactly this story's own commits,
+  # however many, regardless of what else got pulled alongside them) NEVER
+  # ran on Path A, the more common case. Every per-bead OWN-attribution and
+  # baseline-advance-on-exoneration mechanism below (ga-49fwiw/ga-g63ejg/
+  # ga-87solq) silently never engaged for it as a result — confirmed live:
+  # wa-vbsm5.1 (2026-09-18 22:0x, ga-ndu4ic) took Path B by coincidence and
+  # WAS correctly narrowed to demand-dashboard alone, but the identical shape
+  # on Path A (the common case) falls straight to the wide-list-only,
+  # unattributed halt below, blaming the reporting story for every daemon
+  # ANY delivery left stuck since the baseline last advanced. Run this probe
+  # whenever MERGE_SHA/MERGE_PRE_MAIN resolve validly, UNCONDITIONALLY (an
+  # `if`, not an `elif` off the block above) — its result, when parseable, is
+  # always at least as accurate as the pattern check above (scoped to exactly
+  # this story's own commits; the pattern check's PRE..POST window is not),
+  # so it OVERRIDES THIS_PULL_STRUCTURALLY_INERT/MERGE_OWN_AFFECTED whenever
+  # it successfully runs — on EITHER path.
+  if [ -n "$MERGE_SHA" ] \
+     && [ -n "$MERGE_PRE_MAIN" ] \
+     && MERGE_OWN_BASE_SHA="$(git -C "$RUNTIME_DIR" rev-parse --verify -q "$MERGE_PRE_MAIN" 2>/dev/null)" \
+     && [ -n "$MERGE_OWN_BASE_SHA" ] \
+     && git -C "$RUNTIME_DIR" merge-base --is-ancestor "$MERGE_OWN_BASE_SHA" "$MERGE_SHA" 2>/dev/null; then
+    # ga-6zkhci: on Path B (PRE_DEPLOY_SHA==POST_DEPLOY_SHA, a true no-op
+    # pull — ga-gokm6's scenario: something else, a sibling story's delivery
+    # earlier in the same sweep or a crew's own post-merge fast-forward,
+    # already advanced RUNTIME_DIR's HEAD past this story's merge before
+    # PRE_DEPLOY_SHA was captured above), the pattern check above never even
+    # runs (its own PRE==POST window is empty) — this story's own delta still
+    # has a real, known diff regardless of what the pull did, IF we know the
+    # right base to diff from. Confirmed live (story-delivery.log
+    # 2026-09-14): wa-ibaqq (docs/mockups/*.html only) and wa-mjpjs
+    # (scripts/lib files no daemon imports) were both held on exactly this
+    # gap — THIS_PULL_STRUCTURALLY_INERT stayed unset, so the case statement
+    # below fell to blame/hold for staleness neither one caused. (ga-ndu4ic:
+    # this probe now ALSO runs on Path A, for the identical reason — see the
+    # comment above this block.)
     #
     # fix-attempt-2 (gate_run ga-u0gc14) used MERGE_SHA^ (the parent commit)
     # as that base and got it wrong: quality-gate-dispatcher.sh's direct_ff
@@ -2118,12 +2143,13 @@ else
     # resolves to a real object in RUNTIME_DIR AND is an actual ancestor of
     # MERGE_SHA before using it as a diff base (an unresolvable or
     # non-ancestor value — corrupted comment, force-pushed history, a merge
-    # from before this field existed — is the THIRD STATE: this whole elif's
-    # condition then evaluates false, THIS_PULL_STRUCTURALLY_INERT stays
-    # unset, and the existing blame/hold behavior below applies exactly as it
-    # did before this fix. Never fall back to guessing MERGE_SHA^ or any
-    # other substitute — an unrecorded base means UNKNOWN, not "assume single
-    # commit".
+    # from before this field existed — is the THIRD STATE: this whole if's
+    # condition then evaluates false, THIS_PULL_STRUCTURALLY_INERT is left
+    # exactly as the Path-A pattern check above set it (or stays unset, on
+    # Path B with nothing to fall back on), and the existing blame/hold
+    # behavior below applies exactly as it did before this fix. Never fall
+    # back to guessing MERGE_SHA^ or any other substitute — an unrecorded
+    # base means UNKNOWN, not "assume single commit".
     #
     # Ask daemon-refresh.sh itself — DRY_RUN=1 hardcoded (never the outer
     # $DRY_RUN): this is a pure classification probe on a delta that has
@@ -2196,9 +2222,9 @@ else
         *) MERGE_OWN_AFFECTED_LIVE="$MERGE_OWN_AFFECTED_LIVE $_moa" ;;
       esac
     done
-    log "This-iteration pull was a true no-op (PRE_DEPLOY_SHA==POST_DEPLOY_SHA=$POST_DEPLOY_SHA) — asked daemon-refresh.sh (DRY_RUN=1, no real kickstart/drain) whether $STORY_ID's own merge $MERGE_SHA alone (vs pre-merge-main base $MERGE_OWN_BASE_SHA) reaches any live daemon: ${MERGE_OWN_VERDICT_LINE:-<unparseable output>} affected=[$MERGE_OWN_AFFECTED] affected_not_running=[$MERGE_OWN_AFFECTED_NOT_RUNNING] affected_live=[$MERGE_OWN_AFFECTED_LIVE]."
+    log "Per-story attribution probe (this-iteration-pull pre=$PRE_DEPLOY_SHA post=$POST_DEPLOY_SHA) — asked daemon-refresh.sh (DRY_RUN=1, no real kickstart/drain) whether $STORY_ID's own merge $MERGE_SHA alone (vs pre-merge-main base $MERGE_OWN_BASE_SHA) reaches any live daemon: ${MERGE_OWN_VERDICT_LINE:-<unparseable output>} affected=[$MERGE_OWN_AFFECTED] affected_not_running=[$MERGE_OWN_AFFECTED_NOT_RUNNING] affected_live=[$MERGE_OWN_AFFECTED_LIVE]."
     if [ -z "$MERGE_OWN_VERDICT_LINE" ]; then
-      : # unparseable helper output (crash/timeout) — stays unknown, existing blame fallback applies
+      : # unparseable helper output (crash/timeout) — leave THIS_PULL_STRUCTURALLY_INERT/MERGE_OWN_AFFECTED exactly as the Path-A pattern check (if it ran) already set them; existing blame fallback applies either way
     elif [ -z "${MERGE_OWN_AFFECTED_LIVE// /}" ]; then
       THIS_PULL_STRUCTURALLY_INERT=1
     else

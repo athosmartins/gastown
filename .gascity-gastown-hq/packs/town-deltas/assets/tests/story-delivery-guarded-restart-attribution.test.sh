@@ -41,11 +41,29 @@
 #     (delivery:failed + HALT comment), and the rig-wide baseline marker must
 #     NOT advance — proves the new branch does not fire when attribution is
 #     real, and that the pre-existing hold path is untouched.
-# T3 (control — no attribution data available, Path A): a real pull happened
-#     this iteration (PRE_DEPLOY_SHA != POST_DEPLOY_SHA), so the narrow
-#     per-bead probe never runs and MERGE_OWN_AFFECTED stays empty. Falls
-#     back to the ORIGINAL wide-list-only hold behavior unchanged, and the
-#     rig-wide baseline marker must NOT advance.
+# T3 (ga-ndu4ic UPDATE, 2026-09-19 — was "control: no attribution data
+#     available, Path A"; that is no longer true, see below) / T4 (new):
+#     ga-ndu4ic taught this same probe to run UNCONDITIONALLY (an `if`, not
+#     an `elif` off the Path-A pattern-check block) instead of only on Path B
+#     (PRE_DEPLOY_SHA==POST_DEPLOY_SHA, a true no-op pull) — real deliveries
+#     usually take Path A (this iteration's own pull is what fetches the
+#     story's own merge), so gating the accurate probe to Path B alone meant
+#     it silently never engaged for the common case. Confirmed live:
+#     wa-vbsm5.1 (2026-09-18) reached only demand-dashboard, yet the halt
+#     blamed it for two OTHER deliveries' own daemons (ficha360, map-viewer)
+#     that merely shared its wide baseline..HEAD window — see
+#     story-delivery-daemon-refresh-path-a-own-attribution.test.sh for the
+#     dedicated repro of that exact shape. T3 and T4 below now mirror T2 and
+#     T1 respectively, just reached via Path A instead of Path B — proving
+#     the two paths behave identically now that both run the same probe.
+# T3 (mode=path_a, attributed — mirrors T2): this bead's own merge reaches a
+#     live daemon (new-daemon) that IS in the current wide GUARDED set. Must
+#     still be held (delivery:failed + HALT comment, leading with the
+#     per-bead attribution), and the baseline marker must NOT advance.
+# T4 (mode=path_a, unattributed — mirrors T1): this bead's own merge reaches
+#     ONE live daemon (new-daemon) NOT in the current wide GUARDED set (only
+#     an unrelated old-daemon is stuck). Delivery must NOT be held, mayor
+#     still nudged, baseline marker must advance.
 
 set -uo pipefail
 
@@ -70,8 +88,12 @@ MARKER_REL=".gc/runtime/daemon-refresh-baseline/whatsapp_automation.sha"
 #   "attributed" (T2): same narrow result, but wide/real call's GUARDED
 #     names BOTH old-daemon AND new-daemon — new-daemon genuinely still
 #     needs a guarded restart.
-#   "path_a" (T3): a real pull happened (PRE_DEPLOY_SHA != POST_DEPLOY_SHA)
-#     — the narrow per-bead probe never runs at all.
+#   "path_a_attributed" (T3): same as "attributed", but reached via a real
+#     pull (PRE_DEPLOY_SHA != POST_DEPLOY_SHA) instead of a no-op — proves
+#     the probe now also runs, and still correctly holds, on Path A.
+#   "path_a_unattributed" (T4): same as "unattributed", but reached via a
+#     real pull instead of a no-op — proves the probe now also runs, and
+#     still correctly exonerates, on Path A.
 run_block() {
   local mode="$1"
   local T; T="$(mktemp -d)"
@@ -163,7 +185,11 @@ EOF
       PRE_DEPLOY_SHA="$SHA_C2"; POST_DEPLOY_SHA="$SHA_C2"
       MERGE_SHA="$SHA_C2"; MERGE_REF="origin/main"; MERGE_PRE_MAIN="$SHA_C1"
       ;;
-    path_a)
+    path_a_attributed|path_a_unattributed)
+      # A real pull happened this iteration (PRE_DEPLOY_SHA=C0 !=
+      # POST_DEPLOY_SHA=C2) — ga-ndu4ic: the probe now runs here too, using
+      # the same MERGE_PRE_MAIN=C1..MERGE_SHA=C2 story-own range as the
+      # no-op modes above.
       PRE_DEPLOY_SHA="$SHA_C0"; POST_DEPLOY_SHA="$SHA_C2"
       MERGE_SHA="$SHA_C2"; MERGE_REF="origin/main"; MERGE_PRE_MAIN="$SHA_C1"
       ;;
@@ -229,21 +255,47 @@ echo "$BD_CALLS" | grep -q "restart THESE for this merge" \
   && ok "T2 rig-wide baseline marker did NOT advance (stayed at pre-existing value) — new branch correctly did not fire" \
   || nok "T2 baseline marker unexpectedly changed" "want(unchanged)=$EXPECT_C0 got=$BASELINE_AFTER"
 
-# ── T3 (mode=path_a): control — no per-bead attribution available this run
-#    (a real pull happened) → original wide-list-only hold, unchanged ─────
+# ── T3 (mode=path_a_attributed, ga-ndu4ic) — mirrors T2 via Path A: new-
+#    daemon IS still in the current guarded set → must still hold ────────
 STUB_NARROW_AFFECTED="com.test.new-daemon"
 STUB_WIDE_GUARDED="com.test.old-daemon com.test.new-daemon"
-run_block path_a
+run_block path_a_attributed
 [ "$RUN_RC" -eq 0 ] && ok "T3 block runs clean (rc=0)" || nok "T3 rc" "rc=$RUN_RC"
+echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=0" \
+  && ok "T3 own-merge probe classified NOT inert (via the probe, on Path A too)" \
+  || nok "T3 inert classification" "$LOG_OUT"
 echo "$BD_CALLS" | grep -q "delivery:failed" \
-  && ok "T3 delivery IS held (no attribution data available — falls back to wide list, correctly conservative)" \
+  && ok "T3 delivery IS held (delivery:failed set) — still-attributed daemon correctly blocks" \
   || nok "T3 delivery was wrongly NOT held" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "No per-bead attribution available this run" \
-  && ok "T3 halt explicitly says no per-bead attribution was available (honest fallback, ga-9lug2k)" \
-  || nok "T3 missing fallback explanation" "$BD_CALLS"
+echo "$BD_CALLS" | grep -q "restart THESE for this merge" \
+  && ok "T3 halt now leads with the per-bead attribution phrase on Path A too (ga-ndu4ic — this used to be unavailable here)" \
+  || nok "T3 missing lead-with phrase — Path A attribution regressed" "$BD_CALLS"
 [ "$BASELINE_AFTER" = "$EXPECT_C0" ] \
-  && ok "T3 rig-wide baseline marker did NOT advance" \
+  && ok "T3 rig-wide baseline marker did NOT advance (still-attributed hold correctly does not advance it)" \
   || nok "T3 baseline marker unexpectedly changed" "want(unchanged)=$EXPECT_C0 got=$BASELINE_AFTER"
+
+# ── T4 (mode=path_a_unattributed, ga-ndu4ic) — mirrors T1 via Path A: new-
+#    daemon reaches a live daemon NOT in the current wide GUARDED set (only
+#    unrelated old-daemon is stuck) → must NOT be held, baseline advances ──
+STUB_NARROW_AFFECTED="com.test.new-daemon"
+STUB_WIDE_GUARDED="com.test.old-daemon"
+run_block path_a_unattributed
+[ "$RUN_RC" -eq 0 ] && ok "T4 block runs clean (rc=0)" || nok "T4 rc" "rc=$RUN_RC"
+echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=0" \
+  && ok "T4 own-merge probe classified NOT inert (new-daemon is a real hit)" \
+  || nok "T4 inert classification" "$LOG_OUT"
+echo "$BD_CALLS" | grep -q "delivery:failed" \
+  && nok "T4 delivery WAS held (delivery:failed set) — Path A did not get the same exoneration as Path B (T1)" "$BD_CALLS" \
+  || ok "T4 delivery is NOT held (no delivery:failed) — Path A now exonerates exactly like Path B (T1)"
+echo "$BD_CALLS" | grep -q "Delivery HALTED" \
+  && nok "T4 a HALT comment was wrongly posted for an unattributed daemon" "$BD_CALLS" \
+  || ok "T4 no HALT comment posted (nothing to blame this bead for)"
+echo "$GC_CALLS" | grep -q "session nudge mayor" \
+  && ok "T4 mayor is still nudged — invariant (b): the gap stays visible/charged" \
+  || nok "T4 missing mayor nudge (invariant b violated)" "$GC_CALLS"
+[ "$BASELINE_AFTER" = "$EXPECT_C2" ] \
+  && ok "T4 rig-wide baseline marker ADVANCED to POST_DEPLOY_SHA on Path A too (ga-ndu4ic, closes the Aceite-3 loop)" \
+  || nok "T4 baseline marker did not advance" "want=$EXPECT_C2 got=$BASELINE_AFTER"
 
 echo ""
 echo "story-delivery guarded-restart attribution tests: $PASS passed, $FAIL failed"
