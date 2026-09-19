@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.gascity.reconciler-stall-detector</string>
+
+  <!-- Detection-only alert (ga-srp8hk): com.gascity.supervisor's session-
+       reconciler loop can go quiet — process alive, no new trace record —
+       for many minutes with nothing else noticing (measured 2026-09-18:
+       3 episodes in one hour, up to 19min, gate blocked ~1h before a
+       human caught it by hand). This job takes ONE sample per invocation
+       (latest session-reconciler-trace segment's last `ts`, plus a
+       `launchctl print` liveness check on the supervisor itself), and
+       pages Mayor (mail+notify, cooldown-deduped) only when the process
+       is confirmed alive AND the trace has gone stale past the threshold
+       — never on a merely-unreadable trace, and never duplicating
+       supervisor-restart-watchdog's (ga-b0gltl) dead-process alert. It
+       never restarts, reconfigures, or otherwise touches the supervisor.
+       Deliberately a raw launchd StartInterval job, not a `gc order`: gc
+       order triggers are evaluated from INSIDE the very loop this guard
+       watches, so a wedged loop could silently stop firing its own
+       watchdog too — see the script header. Single-instance-locked
+       (ga-y0g5x pattern, same idiom as supervisor-restart-watchdog.sh): a
+       measured OK-path run takes ~0.2s and a measured full alert-path run
+       (real diagnostics, faked send calls) stays far under 12s — the
+       selftest's own AC3 check asserts duration stays under 1/10th of
+       StartInterval, so this can never stack concurrent instances or
+       become the load it observes. StartInterval=120s gives ~2min worst-
+       case detection latency past the 5min staleness threshold, well
+       inside the 8-19min episode lengths actually observed. -->
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/reconciler-stall-detector.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  <key>StartInterval</key><integer>120</integer>
+  <key>RunAtLoad</key><true/>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/reconciler-stall-detector-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/reconciler-stall-detector-launchd.err</string>
+
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key><string>/Users/athos</string>
+  </dict>
+</dict></plist>
