@@ -62,6 +62,15 @@
 #     Path A; the rig-wide marker still does not advance.
 # T9 (control): NO overlap + fresh re-probe is still released AND still advances
 #     the marker — the pre-existing ga-49fwiw invariant (c) must not regress.
+# T10–T16 (third state, found by the gate-done self-audit): a re-probe that gives
+#     no consistent answer — a verdict with no GUARDED= line, a
+#     NEEDS_GUARDED_RESTART verdict over an empty list, or ANY verdict other than
+#     OK over an empty list (JOB_NOT_INSTALLED, VERIFY_FAILED, SKIPPED: each one
+#     leaves GUARDED empty, and that emptiness is not evidence of freshness —
+#     JOB_NOT_INSTALLED is the wa-s5fux incident) — is HELD, never released as
+#     fresh, and the log says what the re-probe actually returned. Covers the
+#     overlap path (which the release now depends on) and the pre-existing
+#     no-overlap path that shares the same read.
 
 set -uo pipefail
 
@@ -82,7 +91,11 @@ MARKER_REL=".gc/runtime/daemon-refresh-baseline/whatsapp_automation.sha"
 # run_block — scenario is driven by exported FAKE_* env vars (read by the fake
 # daemon-refresh.sh below, which runs as a subprocess):
 #   FAKE_REACH      labels this story's own delta reaches (per-story probe)
-#   FAKE_REPROBE    stale | fresh | unparseable — the freshness re-probe result
+#   FAKE_REPROBE    stale | fresh | unparseable | noguarded | contradiction |
+#                   verdict:<NAME> — the freshness re-probe result (noguarded = a
+#                   verdict with no GUARDED= line; contradiction =
+#                   NEEDS_GUARDED_RESTART over an empty list; verdict:<NAME> =
+#                   VERDICT=<NAME> over an empty GUARDED= line)
 #   FAKE_STALE      labels the re-probe reports still stale (mode=stale)
 #   FAKE_WIDE       labels the WIDE (real, non-dry-run) sweep reports GUARDED
 #   FAKE_WIDE_OWN   the OWN-FILE-CHANGED subset of FAKE_WIDE
@@ -127,6 +140,24 @@ if [ "${DRY_RUN:-0}" = "1" ]; then
       # the bead-scoped freshness re-probe
       case "$FAKE_REPROBE" in
         unparseable) exit 1 ;;
+        noguarded)
+          # a verdict but NO GUARDED= line at all (truncated / partial output)
+          echo "VERDICT=OK"
+          echo "AFFECTED=$FAKE_REACH"
+          exit 0 ;;
+        contradiction)
+          # a verdict that says "stale" over an EMPTY list — self-contradictory
+          echo "VERDICT=NEEDS_GUARDED_RESTART"
+          echo "AFFECTED=$FAKE_REACH"
+          echo "GUARDED="
+          exit 1 ;;
+        verdict:*)
+          # some OTHER verdict (JOB_NOT_INSTALLED / VERIFY_FAILED / SKIPPED) over
+          # an EMPTY GUARDED= — well-formed, but an empty list here is not "fresh"
+          echo "VERDICT=${FAKE_REPROBE#verdict:}"
+          echo "AFFECTED=$FAKE_REACH"
+          echo "GUARDED="
+          exit 0 ;;
         fresh)
           echo "VERDICT=OK"
           echo "AFFECTED=$FAKE_REACH"
@@ -294,7 +325,7 @@ echo "$GC_CALLS" | grep -q "session nudge mayor" \
 echo "$GC_CALLS" | grep "session nudge mayor" | grep -q "com.whatsapp.ficha360" \
   && ok "T2 the nudge names the overlapping daemon (ficha360), so the release is explained" \
   || nok "T2 the nudge does not name the overlap" "$GC_CALLS"
-echo "$LOG_OUT" | grep -q "started AFTER its merge commit" \
+echo "$LOG_OUT" | grep -q "still running code older than its merge commit" \
   && ok "T2 log states why the wide flag does not apply to this merge" \
   || nok "T2 missing explanation in the log" "$LOG_OUT"
 [ "$BASELINE_AFTER" = "$EXPECT_C0" ] \
@@ -415,6 +446,51 @@ echo "$BD_CALLS" | grep -q "delivery:failed" \
 [ "$BASELINE_AFTER" = "$EXPECT_C2" ] \
   && ok "T9 rig-wide marker advanced to the window tip (ga-49fwiw invariant c preserved for the no-overlap release)" \
   || nok "T9 marker did not advance on a no-overlap release" "want=$EXPECT_C2 got=$BASELINE_AFTER"
+
+# ── T10–T16: "the re-probe did not say" is never read as "fresh" ────────────
+# The release the overlap now allows rests on the re-probe, so the re-probe's
+# own third state has to hold. A verdict WITHOUT a GUARDED= line (a truncated or
+# partial output — emit() prints VERDICT= first and GUARDED= later), and a
+# NEEDS_GUARDED_RESTART verdict over an EMPTY list (self-contradictory), must
+# both be held and worded "NOT confirmed stale" — never released as fresh. So must
+# any verdict OTHER than OK over an empty list: JOB_NOT_INSTALLED (a scheduled job
+# this delivery ships never ran — held on every other read of that verdict, the
+# wa-s5fux incident), VERIFY_FAILED and SKIPPED all print GUARDED= empty too, and
+# only VERDICT=OK over an empty GUARDED= is positive evidence of freshness.
+third_state_case() {  # third_state_case <label> <reprobe-mode> <overlap:1|0> <expected-log-fragment>
+  local label="$1" got="$4"
+  FAKE_REACH="com.whatsapp.slot-scheduler com.whatsapp.campaign-api"
+  FAKE_REPROBE="$2"; FAKE_STALE=""
+  FAKE_WIDE="$WIDE_COMMON"; FAKE_WIDE_OWN="com.whatsapp.ficha360"
+  if [ "$3" = "1" ]; then   # the reach includes the wide OWN-FILE daemon (the wa-catpm shape)
+    FAKE_REACH="com.whatsapp.demand-dashboard com.whatsapp.ficha360"
+    FAKE_WIDE="$WIDE_COMMON com.whatsapp.demand-dashboard"
+  fi
+  ATTRIBUTED=1 RUNS=1 run_block
+  [ "$RUN_RC" -eq 0 ] && ok "$label block runs clean (rc=0)" || nok "$label rc" "rc=$RUN_RC"
+  echo "$BD_CALLS" | grep -q "delivery:failed" \
+    && ok "$label delivery IS held — the re-probe did not say, so it is never read as fresh" \
+    || nok "$label delivery was RELEASED on a re-probe that gave no consistent answer" "$BD_CALLS"
+  echo "$BD_CALLS" | grep -q "NOT confirmed stale" \
+    && ok "$label the halt says the list is NOT confirmed stale (no false precision)" \
+    || nok "$label halt does not disclose that the re-probe gave no usable answer" "$BD_CALLS"
+  echo "$LOG_OUT" | grep -q "no consistent VERDICT/GUARDED pair" \
+    && ok "$label the log names the third state" \
+    || nok "$label log does not say the re-probe output was inconsistent" "$LOG_OUT"
+  echo "$LOG_OUT" | grep -qF "$got" \
+    && ok "$label the log shows what the re-probe actually returned ($got)" \
+    || nok "$label log does not show the re-probe's actual output (wanted: $got)" "$LOG_OUT"
+  [ "$BASELINE_AFTER" = "$EXPECT_C0" ] \
+    && ok "$label rig-wide marker unchanged" \
+    || nok "$label marker changed" "want=$EXPECT_C0 got=$BASELINE_AFTER"
+}
+third_state_case "T10 (overlap, verdict without a GUARDED= line)"       noguarded                  1 "got [VERDICT=OK] / [no GUARDED= line]"
+third_state_case "T11 (overlap, NEEDS_GUARDED_RESTART over empty list)"  contradiction              1 "got [VERDICT=NEEDS_GUARDED_RESTART] / [GUARDED=]"
+third_state_case "T12 (no overlap, verdict without a GUARDED= line)"     noguarded                  0 "got [VERDICT=OK] / [no GUARDED= line]"
+third_state_case "T13 (overlap, JOB_NOT_INSTALLED over empty GUARDED=)"  verdict:JOB_NOT_INSTALLED  1 "got [VERDICT=JOB_NOT_INSTALLED] / [GUARDED=]"
+third_state_case "T14 (overlap, VERIFY_FAILED over empty GUARDED=)"      verdict:VERIFY_FAILED      1 "got [VERDICT=VERIFY_FAILED] / [GUARDED=]"
+third_state_case "T15 (overlap, SKIPPED over empty GUARDED=)"            verdict:SKIPPED            1 "got [VERDICT=SKIPPED] / [GUARDED=]"
+third_state_case "T16 (no overlap, JOB_NOT_INSTALLED over empty GUARDED=)" verdict:JOB_NOT_INSTALLED 0 "got [VERDICT=JOB_NOT_INSTALLED] / [GUARDED=]"
 
 echo ""
 echo "story-delivery bead-scoped halt (ga-8i2nds) tests: $PASS passed, $FAIL failed"

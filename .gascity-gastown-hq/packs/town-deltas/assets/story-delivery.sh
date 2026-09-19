@@ -2458,6 +2458,7 @@ else
       MERGE_OWN_WIDE_OVERLAP=""
       MERGE_OWN_FRESH_OUT=""
       MERGE_OWN_FRESH_VERDICT_LINE=""
+      MERGE_OWN_FRESH_GUARDED_LINE=""
       MERGE_OWN_LIVE_STALE=""
       if [ "$REFRESH_VERDICT" = "NEEDS_GUARDED_RESTART" ] \
          && [ "$THIS_PULL_STRUCTURALLY_INERT" = "0" ] \
@@ -2528,9 +2529,40 @@ else
           DRY_RUN=1 \
           timeout 180 bash "$REFRESH_HELPER" 2>/dev/null || true)
         MERGE_OWN_FRESH_VERDICT_LINE=$(echo "$MERGE_OWN_FRESH_OUT" | grep '^VERDICT=' | head -1 || true)
+        # ga-8i2nds (third-state audit): keep the GUARDED= LINE itself, not only
+        # its value. A verdict with NO GUARDED= line at all is "the re-probe did
+        # not say", and must not read as "GUARDED is empty, nothing is stale".
+        # daemon-refresh.sh's emit() prints VERDICT= first and GUARDED= some
+        # fifteen lines later, so a truncated/partial output is exactly this
+        # shape — and an overlap used to force a hold before this read decided
+        # anything, so the release it can now cause has to rest on positive
+        # evidence.
+        MERGE_OWN_FRESH_GUARDED_LINE=$(echo "$MERGE_OWN_FRESH_OUT" | grep '^GUARDED=' | head -1 || true)
         MERGE_OWN_LIVE_STALE=$(echo "$MERGE_OWN_FRESH_OUT" | grep '^GUARDED=' | head -1 | sed 's/^GUARDED=//' || true)
         log "Freshness re-probe for $STORY_ID's own affected daemon(s) [$MERGE_OWN_AFFECTED] (forced through the SENSITIVE already_fresh() check): ${MERGE_OWN_FRESH_VERDICT_LINE:-<unparseable output>} still-stale=[$MERGE_OWN_LIVE_STALE]."
-        if [ -n "$MERGE_OWN_FRESH_VERDICT_LINE" ] && [ -z "${MERGE_OWN_LIVE_STALE// /}" ]; then
+        # Three states, and only the first one releases:
+        #   clean       — the re-probe printed BOTH a VERDICT= and a GUARDED= line,
+        #                 the verdict is exactly VERDICT=OK, and GUARDED is empty:
+        #                 positive evidence nothing this merge reaches is stale.
+        #                 In this mode (DRY_RUN=1, every reached label forced
+        #                 through the SENSITIVE already_fresh() check) the helper
+        #                 has exactly two healthy outputs: VERDICT=OK over an empty
+        #                 GUARDED (all fresh) and VERDICT=NEEDS_GUARDED_RESTART
+        #                 over a named list (some stale). Every OTHER verdict —
+        #                 JOB_NOT_INSTALLED (a scheduled job this delivery ships
+        #                 never ran: the wa-s5fux incident, held by every other
+        #                 read of this verdict in this file), VERIFY_FAILED,
+        #                 SKIPPED — leaves GUARDED empty too, and that emptiness
+        #                 is NOT evidence of freshness.
+        #   stale       — it NAMED the still-stale daemons (GUARDED non-empty).
+        #   unparseable — anything else: no VERDICT, no GUARDED= line, a verdict
+        #                 other than OK over an empty list, or a
+        #                 NEEDS_GUARDED_RESTART that contradicts its own empty
+        #                 list. "The re-probe did not say" — held, never read as
+        #                 fresh.
+        if [ "$MERGE_OWN_FRESH_VERDICT_LINE" = "VERDICT=OK" ] \
+           && [ -n "$MERGE_OWN_FRESH_GUARDED_LINE" ] \
+           && [ -z "${MERGE_OWN_LIVE_STALE// /}" ]; then
           NEEDS_GUARDED_RESTART_UNATTRIBUTED=1
           BEAD_REPROBE_STATE="clean"
           # Only the pre-existing exoneration (no overlap with the wide guarded
@@ -2544,18 +2576,22 @@ else
           if [ -z "$MERGE_OWN_WIDE_OVERLAP" ]; then
             UNATTRIBUTED_ADVANCES_MARKER=1
           fi
-        elif [ -n "$MERGE_OWN_FRESH_VERDICT_LINE" ]; then
+        elif [ -n "$MERGE_OWN_FRESH_VERDICT_LINE" ] && [ -n "${MERGE_OWN_LIVE_STALE// /}" ]; then
           BEAD_REPROBE_STATE="stale"
           log "Daemon refresh verdict=$REFRESH_VERDICT — $STORY_ID's own merge reaches [$MERGE_OWN_AFFECTED]; the freshness re-probe confirms [$MERGE_OWN_LIVE_STALE] still run code older than the merge commit ($MERGE_SHA) — holding this delivery for exactly those (wide-window overlap: [${MERGE_OWN_WIDE_OVERLAP:-none}])."
         else
           BEAD_REPROBE_STATE="unparseable"
           # Third state (unparseable re-probe: no VERDICT= line at all,
-          # crash/timeout) is deliberately NOT treated as fresh — same
+          # crash/timeout, no GUARDED= line, a verdict other than OK over an
+          # empty list, or a NEEDS_GUARDED_RESTART that contradicts its own
+          # empty list) is deliberately NOT treated as fresh — same
           # fail-closed default this file uses everywhere else for "can't
           # tell" (verify-before-completion's own rule: if we can't tell,
           # don't release). NEEDS_GUARDED_RESTART_UNATTRIBUTED stays 0, so
-          # control falls through to the hold branch below.
-          log "Daemon refresh verdict=$REFRESH_VERDICT — $STORY_ID's own merge reaches [$MERGE_OWN_AFFECTED], but the freshness re-probe did not confirm it fresh (unparseable output) — holding this delivery for it (ga-g63ejg: absence from the wide sweep's list does not prove fresh; wide-window overlap: [${MERGE_OWN_WIDE_OVERLAP:-none}])."
+          # control falls through to the hold branch below. The log names
+          # what the re-probe actually returned, so an operator reading a
+          # hold can tell "it crashed" from "it said JOB_NOT_INSTALLED".
+          log "Daemon refresh verdict=$REFRESH_VERDICT — $STORY_ID's own merge reaches [$MERGE_OWN_AFFECTED], but the freshness re-probe did not confirm it fresh (no consistent VERDICT/GUARDED pair in its output — got [${MERGE_OWN_FRESH_VERDICT_LINE:-no VERDICT line}] / [${MERGE_OWN_FRESH_GUARDED_LINE:-no GUARDED= line}]; only VERDICT=OK over an empty GUARDED= counts as fresh) — holding this delivery for it (ga-g63ejg: absence from the wide sweep's list does not prove fresh; wide-window overlap: [${MERGE_OWN_WIDE_OVERLAP:-none}])."
         fi
       fi
       if [ "$THIS_PULL_STRUCTURALLY_INERT" = "1" ]; then
@@ -2585,14 +2621,14 @@ else
           # re-probe above for why that wide flag is not evidence about THIS
           # merge. The wide names that overlap are kept in the log/nudge (they
           # are the reason a reader would otherwise suspect this release).
-          log "Daemon refresh verdict=$REFRESH_VERDICT — the wide window flags [$MERGE_OWN_WIDE_OVERLAP], which $STORY_ID's own merge reaches, but the freshness re-probe confirms every daemon it reaches [$MERGE_OWN_AFFECTED] started AFTER its merge commit ($MERGE_SHA); the wide flag is measured against the window tip ($POST_DEPLOY_SHA), not this merge — not holding this delivery for it. Rig-wide baseline marker left where it is (ga-8i2nds: a pending sibling's window must not be skipped)."
+          log "Daemon refresh verdict=$REFRESH_VERDICT — the wide window flags [$MERGE_OWN_WIDE_OVERLAP], which $STORY_ID's own merge reaches, but the freshness re-probe finds none of the daemons it reaches [$MERGE_OWN_AFFECTED] still running code older than its merge commit ($MERGE_SHA); the wide flag is measured against the window tip ($POST_DEPLOY_SHA), not this merge — not holding this delivery for it. Rig-wide baseline marker left where it is (ga-8i2nds: a pending sibling's window must not be skipped)."
         else
           log "Daemon refresh verdict=$REFRESH_VERDICT — none of the currently-guarded daemon(s) ($REFRESH_GUARDED) are attributed to $STORY_ID's own merge (which reaches: $MERGE_OWN_AFFECTED) — not holding this delivery for it."
         fi
         if [ "$DRY_RUN" != "1" ]; then
           if [ -n "$MERGE_OWN_WIDE_OVERLAP" ]; then
             gc --city "$GC_CITY" session nudge mayor \
-              "Daemon refresh $REFRESH_VERDICT persists for rig $RIG — $STORY_ID released on its own evidence: the wide window flags [$MERGE_OWN_WIDE_OVERLAP] (which its merge reaches), but every daemon its merge reaches [$MERGE_OWN_AFFECTED] started after the merge commit ($MERGE_SHA). The wide flag is judged against the window tip, not this merge; another commit may still need a guarded restart." \
+              "Daemon refresh $REFRESH_VERDICT persists for rig $RIG — $STORY_ID released on its own evidence: the wide window flags [$MERGE_OWN_WIDE_OVERLAP] (which its merge reaches), but none of the daemons its merge reaches [$MERGE_OWN_AFFECTED] still runs code older than the merge commit ($MERGE_SHA). The wide flag is judged against the window tip, not this merge; another commit may still need a guarded restart." \
               2>/dev/null || true
           else
             gc --city "$GC_CITY" session nudge mayor \
