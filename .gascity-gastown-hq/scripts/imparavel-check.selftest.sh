@@ -806,6 +806,75 @@ m.check_approved, m.check_gate, m.check_pilot, m.check_dolt = _zz_ca, _zz_cg, _z
 m._pilot_slots, m._pilot_candidates, m._sweep_in_flight, m.RIGS = _zz_slots, _zz_cand, _zz_swf, _zz_rigs
 m._read_pilot_log_tail = _zz_read_tail
 
+print("── ga-in9ebr: _pool_cap_saturated() reads the POOL-SATURATED marker from the CURRENT sweep only ──")
+_pcs_start = "[2026-09-19 12:00:00] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ==="
+_pcs_complete = ("[2026-09-19 12:00:04] [pilot-dispatcher] === Pilot sweep complete: dispatched=0"
+                 " (small_slots=2 big_slots=0 dolt_saturated_at_start=0) ===")
+_pcs_mark = ("[2026-09-19 12:00:03] [pilot-dispatcher] ga-in9ebr: POOL-SATURATED sweep — dispatched=0 only because"
+             " 3 candidate(s) are queued behind full worker capacity (backpressure, not a stall).")
+eq("marker inside the current sweep → True",
+   m._pool_cap_saturated([_pcs_start, "x", _pcs_mark, _pcs_complete]), True)
+eq("current sweep WITHOUT the marker → False",
+   m._pool_cap_saturated([_pcs_start, "x", _pcs_complete]), False)
+eq("marker only in an OLDER sweep (a later start follows) → False (segment-scoped: no stale reading)",
+   m._pool_cap_saturated([_pcs_start, _pcs_mark, _pcs_complete,
+                          "[2026-09-19 12:05:00] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===", "x"]), False)
+eq("no snapshot at all → None (unknown, never False)", m._pool_cap_saturated(None), None)
+eq("no sweep-start boundary visible → None (unknown, never a positive)",
+   m._pool_cap_saturated(["x", _pcs_mark]), None)
+
+print("── main() end-to-end: ga-in9ebr — worker-capacity backpressure is ℹ️/✅, never a false ❌ ──")
+_pc_ca, _pc_cg, _pc_cp, _pc_cd = m.check_approved, m.check_gate, m.check_pilot, m.check_dolt
+_pc_slots, _pc_cand, _pc_swf, _pc_rigs = m._pilot_slots, m._pilot_candidates, m._sweep_in_flight, m.RIGS
+_pc_read_tail, _pc_elapsed = m._read_pilot_log_tail, m._sweep_in_flight_elapsed_min
+m.check_approved = lambda: {
+    "total": 2, "parked_count": 0, "in_gate_count": 0, "buildable_count": 2,
+    "flowing_count": 0, "held_count": 0,
+    "stuck": [{"id": "wa-QUEUED1", "rig": "WA", "title": "queued behind the worker cap", "lane": "small"},
+              {"id": "wa-QUEUED2", "rig": "WA", "title": "queued behind the worker cap", "lane": "small"}],
+    "read_err": [], "warns": [], "from_dispatchable": True, "snap_age_min": 1.0,
+}
+m.check_gate = lambda: {"active": [], "parked": [], "last_pass_min": 1.0,
+                         "reviewer_alive": True, "oldest_active_min": None,
+                         "stalled": False, "stall_reason": ""}
+m.check_pilot = lambda: {"alive": True, "last_sweep_min": 0.5}
+m.check_dolt = lambda: {"responsive": True, "latency_ms": 10}
+m.RIGS = []
+# A lane HAS room and the sweep's candidates want it → the lane-level _pool_saturated() is False. Before
+# ga-in9ebr this exact shape (beads queued behind a full WORKER pool, lanes free) was a false ❌ once the
+# Pilot stopped faking those beads as in-flight.
+m._pilot_slots = lambda lines: {"small": 2, "big": 0}
+m._pilot_candidates = lambda lines: {"small": 3, "big": 0}
+m._sweep_in_flight = lambda lines: False
+m._sweep_in_flight_elapsed_min = lambda lines: 3.0
+
+def _pc_run(lines):
+    m._read_pilot_log_tail = lambda: lines
+    buf = io.StringIO(); code = None
+    try:
+        with contextlib.redirect_stdout(buf):
+            m.main()
+    except SystemExit as e:
+        code = e.code
+    return code, buf.getvalue()
+
+_pc_code, _pc_out = _pc_run([_pcs_start, "x", _pcs_mark, _pcs_complete])
+eq("marker present → exit 0 (✅ IMPARÁVEL), not ❌", _pc_code, 0)
+eq("marker present → report does NOT say NÃO IMPARÁVEL", "NÃO IMPARÁVEL" in _pc_out, False)
+eq("marker present → the ℹ️ note names WORKER capacity and the queued beads",
+   ("pool de workers" in _pc_out and "wa-QUEUED1" in _pc_out), True)
+eq("marker present → the recap never claims lane slots are full (they are free)",
+   ("Pool cheio" in _pc_out or "slots cheios" in _pc_out), False)
+_pc_code2, _pc_out2 = _pc_run([_pcs_start, "x", _pcs_complete])
+eq("CONTROL: same fixture WITHOUT the marker → exit 1 (a real stall is still a ❌)", _pc_code2, 1)
+eq("CONTROL: the ❌ verdict text is present", "NÃO IMPARÁVEL" in _pc_out2, True)
+_pc_code3, _pc_out3 = _pc_run(["x", _pcs_mark])
+eq("marker but NO sweep-start boundary (unreadable segment) → does NOT suppress the ❌", _pc_code3, 1)
+
+m.check_approved, m.check_gate, m.check_pilot, m.check_dolt = _pc_ca, _pc_cg, _pc_cp, _pc_cd
+m._pilot_slots, m._pilot_candidates, m._sweep_in_flight, m.RIGS = _pc_slots, _pc_cand, _pc_swf, _pc_rigs
+m._read_pilot_log_tail, m._sweep_in_flight_elapsed_min = _pc_read_tail, _pc_elapsed
+
 print("── main() end-to-end: ga-zkxdw regression — defects 1+2, all 3 falsifiable cenários ──")
 _z_ca, _z_cg, _z_cp, _z_cd = m.check_approved, m.check_gate, m.check_pilot, m.check_dolt
 _z_slots, _z_cand, _z_swf, _z_rigs = m._pilot_slots, m._pilot_candidates, m._sweep_in_flight, m.RIGS
