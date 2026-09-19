@@ -75,6 +75,12 @@ MAX_CLASSIFY = int(os.environ.get("IMP_MAX_CLASSIFY", "40"))  # cap to avoid han
 # ga-zkxdw attempt 4: cap on how long a genuinely in-flight sweep may downgrade
 # a FAIL to a WARN — past this, a hung sweep must escalate, not wait forever.
 SWEEP_IN_FLIGHT_BUDGET_MIN = int(os.environ.get("IMP_SWEEP_BUDGET_MIN", "15"))
+# ga-in9ebr: pilot-dispatcher.sh logs this marker in a sweep that dispatched NOTHING only because
+# every candidate it tried was queued behind full worker capacity (wa-worker/ps-worker session caps,
+# or the combined ga-jezvn cap). The sweep-complete line only carries LANE slots, so without the
+# marker a busy worker pool is indistinguishable from a silent stall (and, before ga-in9ebr, the
+# Pilot hid it by marking those beads falsely in-flight).
+POOL_SATURATED_MARK = "ga-in9ebr: POOL-SATURATED sweep"
 
 # Labels that mark a bead as NOT auto-dispatchable right now (not a silent stall).
 # A bead carrying ANY of these is parked for a real reason — the Pilot correctly
@@ -686,6 +692,32 @@ def _pool_saturated(slots, candidates):
     return slots["small"] <= 0 and slots["big"] <= 0
 
 
+def _pool_cap_saturated(lines):
+    """PURE (no I/O — unit-testable). True iff the CURRENT sweep's own log segment (bounded by the
+    last '=== Pilot sweep start', same shared snapshot as _pilot_slots()/_pilot_candidates()/
+    _sweep_in_flight()) carries the Pilot's POOL-SATURATED marker — i.e. the sweep dispatched
+    nothing only because every candidate it tried was queued behind full WORKER capacity. That is
+    healthy backpressure, not a silent stall, whatever the LANE slots say (ga-in9ebr).
+
+    Returns None when the segment is unreadable (no snapshot / no sweep-start marker visible):
+    an unreadable signal must never SUPPRESS a real stall — only a positively-observed marker may
+    (same fail-open convention as _pilot_slots()/_sweep_in_flight())."""
+    seg = _current_sweep_lines(lines)
+    if seg is None:
+        return None
+    return any(POOL_SATURATED_MARK in line for line in seg)
+
+
+def _pool_cap_note(stuck):
+    """ℹ️ note text for a _pool_cap_saturated()==True sweep (ga-in9ebr). Names the real cause —
+    worker capacity, not lane slots — so the reader is not told slots are full when a lane is free."""
+    ids = ", ".join("%s/%s" % (s["rig"], s["id"]) for s in stuck[:6])
+    return ("pool de workers (wa-worker/ps-worker) no teto de sessões: neste sweep o Pilot enfileirou"
+            " todos os candidatos atrás de capacidade de worker cheia (vaga de LANE livre não ajuda —"
+            " falta worker, não lane) — %d construível(is) na fila aguardam um worker, NÃO é falha:"
+            " %s" % (len(stuck), ids))
+
+
 def _saturation_reason(slots, candidates):
     """Classifies WHY _pool_saturated(slots, candidates) is True, so diagnostic
     text can name the actual cause instead of collapsing three distinct causes
@@ -974,6 +1006,7 @@ def main():
     candidates = _pilot_candidates(pilot_log_lines)
     sweep_in_flight = _sweep_in_flight(pilot_log_lines)
     sweep_elapsed_min = _sweep_in_flight_elapsed_min(pilot_log_lines)
+    pool_cap_saturated = _pool_cap_saturated(pilot_log_lines)   # ga-in9ebr: worker-capacity backpressure
 
     # REAL building count across ALL stores (HQ+rigs). The dispatchable flowing_count is
     # ~0 by construction (dispatchable = not-yet-dispatched); rig-native builds (ps-/wa-)
@@ -1063,6 +1096,10 @@ def main():
     if a["stuck"] and (p.get("alive") is not False):
         if pool_saturated:
             notes.append(_saturation_note(saturation_reason, slots, candidates, a["stuck"]))
+        elif pool_cap_saturated is True:
+            # ga-in9ebr: the sweep's own log positively says it dispatched nothing ONLY because every
+            # candidate was queued behind full worker capacity — healthy backpressure, not a stall.
+            notes.append(_pool_cap_note(a["stuck"]))
         elif sweep_in_flight and not sweep_wait_expired:
             # ga-zkxdw DEFEITO 2: a sweep takes ~5-6min; a snapshot taken mid-sweep
             # cannot distinguish "skipped" from "not reached yet" — genuinely
@@ -1203,8 +1240,14 @@ def main():
                   % ("ocioso correto" if not building_now else "fila dispatchable parqueada (mas há build ativo acima)",
                      a["parked_count"]))
         elif notes:
-            print("  %s (ver nota ℹ️ acima). Alta demanda saudável, não travamento."
-                  % _saturation_summary(saturation_reason, slots, candidates))
+            if saturation_reason is not None:
+                print("  %s (ver nota ℹ️ acima). Alta demanda saudável, não travamento."
+                      % _saturation_summary(saturation_reason, slots, candidates))
+            else:
+                # ga-in9ebr: the note came from the worker-capacity branch — never claim lane slots
+                # are full (they may well be free) and never index `slots` (it can be None here).
+                print("  Pool de workers no teto de sessões (ver nota ℹ️ acima)."
+                      " Alta demanda saudável, não travamento.")
         else:
             print("  Nenhuma construível parada em silêncio; gate fluindo ou ocioso-com-fila-vazia;"
                   " pilot e Dolt vivos.")

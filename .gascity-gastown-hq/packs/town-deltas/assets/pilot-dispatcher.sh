@@ -97,9 +97,11 @@ MAX_REVIEWERS="${MAX_REVIEWERS:-6}"
 # ── wa-worker spawn cap (ga-v3o6i runaway fix) ────────────────────────────────
 # Max concurrent live (active + creating) wa-worker sessions. Mirrors the agent's
 # max_active_sessions=4. Before spawning, Pilot counts live sessions via `gc
-# session list`; if >= cap, it skips the spawn and relies on the supervisor
-# reconciler to start a session once a slot is free. This prevents the runaway
-# that spawned 39 sessions when earlier sweeps' workers hadn't drained yet.
+# session list`; if >= cap, it skips the spawn and QUEUES the bead (ga-in9ebr:
+# claim released, bead stays story:approved + gc.routed_to, NOT marked in-flight)
+# — the ga-93yxc pool top-up (Step 2d) opens a session once a slot is free. This
+# prevents the runaway that spawned 39 sessions when earlier sweeps' workers
+# hadn't drained yet.
 # Override via plist env or test seam: PILOT_WA_WORKER_MAX=4
 PILOT_WA_WORKER_MAX="${PILOT_WA_WORKER_MAX:-4}"
 # TEST-ONLY seam: when set, overrides the live `gc session list` count.
@@ -109,6 +111,16 @@ PILOT_TEST_WA_WORKER_LIVE_COUNT="${PILOT_TEST_WA_WORKER_LIVE_COUNT:-}"
 PILOT_PS_WORKER_MAX="${PILOT_PS_WORKER_MAX:-2}"
 # TEST-ONLY seam: override live gc session list count for ps-worker pool.
 PILOT_TEST_PS_WORKER_LIVE_COUNT="${PILOT_TEST_PS_WORKER_LIVE_COUNT:-}"
+# ── ga-in9ebr: pre-claim skip for beads already queued behind a FULL worker pool.
+# A bead that carries gc.routed_to=wa-worker|ps-worker (stamped by any earlier
+# pool-arm attempt) whose pool is positively at its per-pool cap cannot dispatch this sweep, so
+# dispatch_lane() skips it BEFORE the atomic claim — otherwise every sweep would
+# claim + release (~5 Dolt writes) every queued bead of a saturated pool. Only a
+# positive "pool is full" reading skips; an unreadable probe falls through to
+# dispatch_one(), which re-checks fresh. Set PILOT_POOL_CAP_PRECLAIM_SKIP=0 to
+# disable (falls back to claim→cap→release per sweep; the bead is still queued
+# correctly, just with the churn).
+PILOT_POOL_CAP_PRECLAIM_SKIP="${PILOT_POOL_CAP_PRECLAIM_SKIP:-1}"
 
 # ── ga-jezvn: GLOBAL variable-session cap, shared with quality-gate-dispatcher.sh
 # Athos-decided ceiling (AskUserQuestion via Mayor, 2026-09-06): the ephemeral
@@ -126,14 +138,15 @@ PILOT_TEST_PS_WORKER_LIVE_COUNT="${PILOT_TEST_PS_WORKER_LIVE_COUNT:-}"
 # (this script) + gate reviewers (quality-gate-dispatcher.sh)" — not dogs.
 #
 # On cap hit: release the claim and return, exactly like a spawn failure
-# (ga-d20od) — NOT like the per-pool caps just below (which hand off to the
-# supervisor reconciler via gc.routed_to + story:in-flight and rely on it to
-# spawn once ITS OWN per-template cap allows). The supervisor does not know
-# about this cross-script COMBINED cap — handing off here would just let it
-# spawn the instant the per-template cap alone is satisfied, silently
-# bypassing this check. Only leaving the bead a plain story:approved candidate
-# (no in-flight marking) guarantees THIS script's own next sweep re-checks the
-# combined count fresh — that is what actually enforces it.
+# (ga-d20od) — and, since ga-in9ebr, exactly like the per-pool caps just below
+# too (they used to hand off via gc.routed_to + story:in-flight, i.e. a false
+# "em execução" with no worker behind it, and rely on a spawn that never came).
+# The supervisor does not know about this cross-script COMBINED cap — handing
+# off here would just let it spawn the instant the per-template cap alone is
+# satisfied, silently bypassing this check. Only leaving the bead a plain
+# story:approved candidate (no in-flight marking) guarantees THIS script's own
+# next sweep re-checks the combined count fresh — that is what actually
+# enforces it.
 GC_VARIABLE_SESSION_MAX="${GC_VARIABLE_SESSION_MAX:-6}"
 case "$GC_VARIABLE_SESSION_MAX" in ''|*[!0-9]*) GC_VARIABLE_SESSION_MAX=6 ;; esac
 # TEST-ONLY seam (mirrors PILOT_TEST_WA_WORKER_LIVE_COUNT): overrides the live
@@ -1488,6 +1501,21 @@ mark_pool_builder() {
     *" $1 "*) : ;;
     *) PILOT_USED_BUILDERS="${PILOT_USED_BUILDERS:+$PILOT_USED_BUILDERS }$1" ;;
   esac
+}
+
+# unmark_pool_builder <builder> — inverse of mark_pool_builder (idempotent; a builder that
+# was never marked is a no-op). ga-in9ebr: dispatch_one() marks its pool slot BEFORE the
+# session-cap check, so a bead that then QUEUES behind a full pool did no work this sweep
+# yet would keep the slot — and the next first-sight candidates of that pool would hit
+# "all crew busy/used this sweep … deferring" (a plain `return 1`) instead of being queued
+# the same way. Giving the slot back keeps every candidate of a full pool on the same path.
+# MUST be called in the main shell (never a subshell) so the global persists.
+unmark_pool_builder() {
+  local _umb_x _umb_out=""
+  for _umb_x in $PILOT_USED_BUILDERS; do
+    [ "$_umb_x" = "$1" ] || _umb_out="${_umb_out:+$_umb_out }$_umb_x"
+  done
+  PILOT_USED_BUILDERS="$_umb_out"
 }
 
 # ── Lane classification ───────────────────────────────────────────────────────
@@ -8267,6 +8295,167 @@ if [ -n "$_QUEUE_LINES" ]; then
   while IFS= read -r _q; do [ -n "$_q" ] && log "$_q"; done <<< "$_QUEUE_LINES"
 fi
 
+# ── ga-in9ebr: worker pool at its session cap → QUEUE the bead, never fake a dispatch ──
+# Measured 2026-09-19 (wa-h8j8d, P1): 12 dispatch→reclaim cycles in 10.5h. With the
+# wa-worker pool at its cap, dispatch_one() logged "pool at session cap — skip spawn"
+# and then FELL THROUGH into the unconditional story:in-flight + pilot:dispatched +
+# "Pilot dispatched builder" marking: a durable "em execução" that no worker was ever
+# assigned to. inflight-reclaim-guard gave the bead back ~30min later (QUEUE STARVATION,
+# pilot:starvation-count+1), the Pilot "dispatched" it again, and so on. Side effects of
+# the lie: the painel showed work nobody was doing; approved-state-reconciler never saw
+# the wait (an "in-flight" bead is not stalled); every cycle burned ~5 useless Dolt
+# writes; and the fake dispatch counted as a SUCCESS (DISPATCHED++) while its phantom
+# in-flight bead filled a Pilot LANE slot, so a saturated pool never looked like
+# "dispatched=0" to the Step 5 stall detector either.
+#
+# The honest state for a bead that cannot get a worker NOW is the same one the sibling
+# release paths already produce (global cap ga-jezvn, spawn failure ga-d20od): claim
+# released, still story:approved + gc.routed_to (so the ga-93yxc pool top-up and the
+# workers' RoutedPoolQuery keep seeing it), unassigned, NOT in-flight/dispatched.
+#
+# Two pieces, because a post-claim release alone would trade the false state for churn
+# (claim → cap → release on every queued bead, every sweep):
+#   1. _pilot_release_pool_cap_queued — dispatch_one()'s cap branches (post-claim; the
+#      first sight of a bead, before gc.routed_to exists, can only be decided there).
+#   2. _pilot_pool_cap_full_for — dispatch_lane()'s PRE-claim skip for a bead ALREADY
+#      committed (gc.routed_to) to a pool that is positively at cap: zero writes.
+# Only a positive "pool is full" reading skips. Every "cannot tell" path (probe failed,
+# non-numeric, unknown pool, kill switch) returns 1 = proceed, so an unreadable session
+# list never suppresses a dispatch; dispatch_one() re-checks fresh regardless. The per-sweep
+# count cache can be stale (sweeps run ~5min apart and it is only ever bumped UP after this
+# script's own spawns), which can defer a bead by at most one sweep — never strand it.
+_PCAP_LIVE_WA=""   # per-sweep cache of the live wa-worker count ("" = not probed yet)
+_PCAP_LIVE_PS=""   # same for ps-worker
+_PCAP_N=""         # out-param of _pilot_pool_live_count
+_PCAP_POOL=""      # out-params of _pilot_pool_cap_full_for (valid only after a hit)
+_PCAP_LIVE=""
+_PCAP_MAX=""
+_PCAP_CALL_QUEUED=0   # dispatch_lane() reads this after dispatch_one(): did THIS call end as a cap QUEUE?
+_PCAP_WARNED_WA=""    # "cannot read the live count" is announced once per pool per sweep (see below)
+_PCAP_WARNED_PS=""
+
+# _pilot_pool_live_count <wa-worker|ps-worker> — sets _PCAP_N, returns 0 iff the count is
+# a real integer. NEVER call via $(...): the per-sweep cache lives in the caller's shell.
+_pilot_pool_live_count() {
+  local _pool="$1" _n="" _sl=""
+  case "$_pool" in
+    wa-worker)
+      _n="${_PCAP_LIVE_WA:-}"
+      if [ -z "$_n" ] && [ -n "${PILOT_TEST_WA_WORKER_LIVE_COUNT:-}" ]; then _n="$PILOT_TEST_WA_WORKER_LIVE_COUNT"; fi
+      # A probe already failed for this pool this sweep: do not pay another failing (up to 10s)
+      # probe per routed candidate — dispatch_one() re-checks fresh for the ones that get that far.
+      if [ -z "$_n" ] && [ -n "${_PCAP_WARNED_WA:-}" ]; then return 1; fi ;;
+    ps-worker)
+      _n="${_PCAP_LIVE_PS:-}"
+      if [ -z "$_n" ] && [ -n "${PILOT_TEST_PS_WORKER_LIVE_COUNT:-}" ]; then _n="$PILOT_TEST_PS_WORKER_LIVE_COUNT"; fi
+      if [ -z "$_n" ] && [ -n "${_PCAP_WARNED_PS:-}" ]; then return 1; fi ;;
+    *) return 1 ;;
+  esac
+  if [ -z "$_n" ]; then
+    # gc_json_or_unknown (ga-07509), not `… || echo ""`: a failing gc still prints an error envelope
+    # (e.g. {"ok":false,…}) that parses as valid JSON and would count as "0 sessions" — a KNOWN zero,
+    # indistinguishable from a genuinely empty pool. It yields data or FAILURE, and a reply with no
+    # .sessions array is unknown too. Same active+creating count as dispatch_one() and _pilot_pool_topup.
+    if _sl=$(gc_json_or_unknown timeout 10 gc --city "$GC_CITY" session list --json); then
+      _n=$(printf '%s' "$_sl" | jq -r --arg t "$_pool" 'if (.sessions | type) == "array" then ([.sessions[] | select(.template==$t and (.state=="active" or .state=="creating"))] | length) else empty end' 2>/dev/null || echo "")
+    fi
+  fi
+  case "$_n" in
+    ''|*[!0-9]*)
+      # Third state — the count could not be read. Not skipping is the deliberate default
+      # (only a POSITIVE "pool is full" may suppress a dispatch, and dispatch_one() re-probes
+      # fresh), but it must not be SILENT: once per pool per sweep, so a dead probe shows up
+      # here instead of as unexplained claim→cap→release churn quietly coming back.
+      case "$_pool" in
+        wa-worker)
+          if [ -z "${_PCAP_WARNED_WA:-}" ]; then
+            _PCAP_WARNED_WA=1
+            warn "ga-in9ebr: cannot read the wa-worker live session count (session list unreadable) — pre-claim pool-cap skip is OFF for wa-worker this sweep; dispatch_one() re-checks fresh."
+          fi ;;
+        ps-worker)
+          if [ -z "${_PCAP_WARNED_PS:-}" ]; then
+            _PCAP_WARNED_PS=1
+            warn "ga-in9ebr: cannot read the ps-worker live session count (session list unreadable) — pre-claim pool-cap skip is OFF for ps-worker this sweep; dispatch_one() re-checks fresh."
+          fi ;;
+      esac
+      return 1 ;;
+  esac
+  case "$_pool" in
+    wa-worker) _PCAP_LIVE_WA="$_n" ;;
+    ps-worker) _PCAP_LIVE_PS="$_n" ;;
+  esac
+  _PCAP_N="$_n"
+  return 0
+}
+
+# _pilot_pool_cap_full_for <story_json> — returns 0 (and sets _PCAP_POOL/_PCAP_LIVE/_PCAP_MAX)
+# iff the candidate is ALREADY committed to a worker pool (metadata gc.routed_to =
+# wa-worker|ps-worker — the same reading _pilot_routed_to_pool_guard treats as binding) and
+# that pool's live session count is POSITIVELY known and >= its per-pool cap. gc.routed_to
+# is written by ANY earlier pool-arm attempt (dispatch_one stamps it before the spawn/cap
+# checks), so it also marks beads whose earlier dispatch was reclaimed — all of them are
+# pool-committed. With PILOT_SPAWN_WA_WORKER/PILOT_SPAWN_PS_WORKER=0 (nudge-only debug mode)
+# dispatch_one() never reaches the cap check and hands the bead to a worker to claim, so the
+# skip must stay out of that mode's way.
+_pilot_pool_cap_full_for() {
+  local _story="$1" _routed _pool _max
+  if [ "${PILOT_POOL_CAP_PRECLAIM_SKIP:-1}" != "1" ]; then return 1; fi
+  _routed=$(printf '%s' "$_story" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null || echo "")
+  case "$_routed" in
+    wa-worker) [ "${PILOT_SPAWN_WA_WORKER:-1}" = "1" ] || return 1
+               _pool="wa-worker"; _max="${PILOT_WA_WORKER_MAX:-4}" ;;
+    ps-worker) [ "${PILOT_SPAWN_PS_WORKER:-1}" = "1" ] || return 1
+               _pool="ps-worker"; _max="${PILOT_PS_WORKER_MAX:-2}" ;;
+    *) return 1 ;;
+  esac
+  case "$_max" in ''|*[!0-9]*) return 1 ;; esac
+  _pilot_pool_live_count "$_pool" || return 1
+  if [ "$_PCAP_N" -lt "$_max" ]; then return 1; fi
+  _PCAP_POOL="$_pool"; _PCAP_LIVE="$_PCAP_N"; _PCAP_MAX="$_max"
+  return 0
+}
+
+# _pilot_note_pool_cap_queued <bead_id> — count a cap-queued bead ONCE per sweep (the ga-y1m40
+# rig fallback re-walks the same beads). Returns 0 when newly noted, 1 when already known.
+_pilot_note_pool_cap_queued() {
+  case " ${POOL_CAP_QUEUED_IDS:-} " in
+    *" $1 "*) return 1 ;;
+  esac
+  POOL_CAP_QUEUED_IDS="${POOL_CAP_QUEUED_IDS:-} $1"
+  POOL_CAP_QUEUED=$(( ${POOL_CAP_QUEUED:-0} + 1 ))
+  return 0
+}
+
+# _pilot_capacity_queued <bead_id> [<builder>] — bookkeeping for a dispatch that ended QUEUED behind
+# worker capacity (the per-pool cap below, or the combined ga-jezvn cap): count the bead once per
+# sweep, flag THIS dispatch_one() call as a capacity queue for dispatch_lane(), and give back the
+# pool slot dispatch_one() reserved before the cap check (see unmark_pool_builder). Shared so both
+# kinds of cap stay on the same accounting — a global-cap sweep is saturation just like a per-pool
+# one, and must not read as a Pilot stall to the Step 5 detector either.
+_pilot_capacity_queued() {
+  _pilot_note_pool_cap_queued "$1" || true
+  _PCAP_CALL_QUEUED=1
+  if [ -n "${2:-}" ]; then unmark_pool_builder "$2"; fi
+  return 0
+}
+
+# _pilot_release_pool_cap_queued <bead_id> <bead_city> [<builder>] — dispatch_one()'s per-pool cap
+# branches call this and then `return 1`. Releases the claim (label first, then the stamp — the
+# sibling release order) and clears pilot.sling_bead: nothing was slung, and a stale "Pilot dispatch
+# fingerprint" on a bead that may wait HOURS in the queue would make the ownership guard read a later
+# external crew claim as the Pilot's own dispatch (the wa-5wv49 double-dispatch class). gc.routed_to
+# is deliberately left SET. Every write is `|| true`: a failed release leaves pilot:dispatching for
+# the Step 0 TTL recovery (a label without its stamp is re-stamped, then released after the TTL),
+# never a wedge.
+_pilot_release_pool_cap_queued() {
+  local _bid="$1" _city="$2"
+  bd -C "$_city" label remove "$_bid" "pilot:dispatching" -q 2>/dev/null || true
+  bd -C "$_city" update "$_bid" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+  bd -C "$_city" update "$_bid" --unset-metadata "pilot.sling_bead" -q 2>/dev/null || true
+  _pilot_capacity_queued "$_bid" "${3:-}"
+  return 0
+}
+
 # ── Dispatch helper ───────────────────────────────────────────────────────────
 # dispatch_one <story_json> <lane> <dispatch_tier>
 # Handles: claim, verify, builder routing, sling, bead transitions, logging, ntfy.
@@ -9940,6 +10129,8 @@ TASK
             log "  ga-jezvn: GLOBAL variable-session cap hit ($_gc_variable_count/$GC_VARIABLE_SESSION_MAX: wa-worker+ps-worker+gate-reviewer combined) — QUEUED for $STORY_ID (claim released, story:approved retained; this script's own next sweep re-checks fresh)."
             bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
             bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+            # ga-in9ebr: a global-cap queue is saturation too — same accounting as the per-pool cap.
+            _pilot_capacity_queued "$STORY_ID" "$BUILDER_TARGET"
             DISPATCH_RESULT="rig_native_global_session_cap_queued"
             return 1
           fi
@@ -9953,6 +10144,15 @@ TASK
           # sweep once a slot frees — NOT the supervisor scale_check, which
           # does not auto-spawn wa-worker (agent.toml opts out; measured live,
           # see Step 2d's header comment). Fail-open on probe error.
+          #
+          # ga-in9ebr: at cap the bead is QUEUED — claim released, return 1 —
+          # and NOT allowed to fall through to the story:in-flight +
+          # pilot:dispatched marking further down. That marking used to run
+          # here with no worker behind it: a false "em execução" the
+          # inflight-reclaim-guard gave back ~30min later, 12 cycles in 10.5h
+          # on wa-h8j8d. See the ga-in9ebr block above dispatch_one() for the
+          # full incident, and _pilot_pool_cap_full_for for the pre-claim skip
+          # that stops the claim→cap→release churn on later sweeps.
           if [ -n "${PILOT_TEST_WA_WORKER_LIVE_COUNT:-}" ]; then
             _live_wa_count="$PILOT_TEST_WA_WORKER_LIVE_COUNT"
           else
@@ -9961,7 +10161,10 @@ TASK
           fi
           _live_wa_count="${_live_wa_count:-0}"
           if [ "${_live_wa_count:-0}" -ge "${PILOT_WA_WORKER_MAX:-4}" ] 2>/dev/null; then
-            log "  ga-mfeip: wa-worker pool at session cap ($_live_wa_count active/creating >= ${PILOT_WA_WORKER_MAX:-4} max) — skip spawn for $STORY_ID (gc.routed_to=wa-worker set; ga-93yxc pool top-up retries on a later sweep once a slot frees)"
+            log "  ga-in9ebr: wa-worker pool at session cap ($_live_wa_count active/creating >= ${PILOT_WA_WORKER_MAX:-4} max) — QUEUED $STORY_ID: claim released, story:approved + gc.routed_to=wa-worker kept, NOT marked in-flight/dispatched (ga-93yxc pool top-up opens a session once a slot frees)."
+            _pilot_release_pool_cap_queued "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET"
+            DISPATCH_RESULT="rig_native_pool_session_cap_queued"
+            return 1
           else
             log "  ga-mfeip: spawning wa-worker for $STORY_ID (slot=$BUILDER_TARGET, live=$_live_wa_count < ${PILOT_WA_WORKER_MAX:-4})."
             # spawn timeout raised 30→60 (env PILOT_SPAWN_TIMEOUT_SECS): under a HOT Dolt
@@ -9971,6 +10174,8 @@ TASK
                 --title-hint "build $STORY_ID: $STORY_TITLE" \
                 >/dev/null 2>&1; then
               log "  ga-mfeip: wa-worker session spawned for $STORY_ID (slot=$BUILDER_TARGET)."
+              # ga-in9ebr: keep the per-sweep pre-claim count honest (a spawn only ever raises it).
+              if [ -n "${_PCAP_LIVE_WA:-}" ]; then _PCAP_LIVE_WA=$(( _PCAP_LIVE_WA + 1 )); fi
             else
               warn "ga-mfeip: Could not spawn wa-worker for $STORY_ID — gc.routed_to=wa-worker set; ga-93yxc pool top-up retries on a later sweep"
               # ga-d20od: the spawn genuinely failed/timed out — no worker was
@@ -10008,6 +10213,8 @@ TASK
             log "  ga-jezvn: GLOBAL variable-session cap hit ($_gc_variable_count/$GC_VARIABLE_SESSION_MAX: wa-worker+ps-worker+gate-reviewer combined) — QUEUED for $STORY_ID (claim released, story:approved retained; this script's own next sweep re-checks fresh)."
             bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
             bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+            # ga-in9ebr: a global-cap queue is saturation too — same accounting as the per-pool cap.
+            _pilot_capacity_queued "$STORY_ID" "$BUILDER_TARGET"
             DISPATCH_RESULT="rig_native_global_session_cap_queued"
             return 1
           fi
@@ -10019,13 +10226,20 @@ TASK
           fi
           _live_ps_count="${_live_ps_count:-0}"
           if [ "${_live_ps_count:-0}" -ge "${PILOT_PS_WORKER_MAX:-2}" ] 2>/dev/null; then
-            log "  ga-mfeip: ps-worker pool at session cap ($_live_ps_count active/creating >= ${PILOT_PS_WORKER_MAX:-2} max) — skip spawn for $STORY_ID (gc.routed_to=ps-worker set; ga-93yxc pool top-up retries on a later sweep once a slot frees)"
+            # ga-in9ebr: mirrors the wa-worker cap branch above — QUEUE, do not fall
+            # through to the in-flight marking (see the comment there).
+            log "  ga-in9ebr: ps-worker pool at session cap ($_live_ps_count active/creating >= ${PILOT_PS_WORKER_MAX:-2} max) — QUEUED $STORY_ID: claim released, story:approved + gc.routed_to=ps-worker kept, NOT marked in-flight/dispatched (ga-93yxc pool top-up opens a session once a slot frees)."
+            _pilot_release_pool_cap_queued "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET"
+            DISPATCH_RESULT="rig_native_pool_session_cap_queued"
+            return 1
           else
             log "  ga-mfeip: spawning ps-worker for $STORY_ID (live=$_live_ps_count < ${PILOT_PS_WORKER_MAX:-2})."
             if timeout "${PILOT_SPAWN_TIMEOUT_SECS:-60}" gc --city "$GC_CITY" session new ps-worker --no-attach \
                 --title-hint "build $STORY_ID: $STORY_TITLE" \
                 >/dev/null 2>&1; then
               log "  ga-mfeip: ps-worker session spawned for $STORY_ID."
+              # ga-in9ebr: keep the per-sweep pre-claim count honest (a spawn only ever raises it).
+              if [ -n "${_PCAP_LIVE_PS:-}" ]; then _PCAP_LIVE_PS=$(( _PCAP_LIVE_PS + 1 )); fi
             else
               warn "ga-mfeip: Could not spawn ps-worker for $STORY_ID — gc.routed_to=ps-worker set; ga-93yxc pool top-up retries on a later sweep"
               # ga-d20od: mirrors the wa-worker spawn-failure rollback above —
@@ -10498,6 +10712,16 @@ No-diff deliverable (mockup, report, data-op, verified-live/no-changes finding)?
 
 DISPATCHED=0
 OWNERSHIP_GUARD_VETO_COUNT=0   # ga-8jxe1 AC4 — see the two increment sites in dispatch_one()
+# ga-in9ebr: candidates left QUEUED because their worker pool is at its session cap
+# (counted once per bead per sweep), and NONQUEUE_FAILS = every OTHER reason a sweep can
+# come up empty: a dispatch_one() attempt that failed for a non-cap reason, plus one per
+# lane loop that ended with candidates un-attempted (iteration guard, empty pick, Dolt
+# back-off — see dispatch_lane). "Nothing dispatched, but only because every pool was
+# full" is saturation, not a stall — the Step 5 detector below uses the pair to tell
+# them apart.
+POOL_CAP_QUEUED=0
+POOL_CAP_QUEUED_IDS=""
+NONQUEUE_FAILS=0
 
 # dispatch_lane <lane> <candidates_json> <free_slots>
 # Loops pick→dispatch→remove until the lane is full or candidates are exhausted.
@@ -10518,6 +10742,7 @@ dispatch_lane() {
   _iter_max=$(( $(echo "$pool" | jq 'length' 2>/dev/null || echo "0") + 2 ))
 
   local filled=0
+  local _exhausted=0   # ga-in9ebr: 1 iff the loop ended because EVERY candidate was attempted
   while [ "$filled" -lt "$cap" ] && [ "$slots" -gt 0 ]; do
     _iter=$((_iter + 1))
     if [ "$_iter" -gt "$_iter_max" ]; then
@@ -10526,7 +10751,7 @@ dispatch_lane() {
     fi
     local n
     n=$(echo "$pool" | jq 'length' 2>/dev/null || echo "0")
-    [ "${n:-0}" -le 0 ] 2>/dev/null && break
+    if [ "${n:-0}" -le 0 ] 2>/dev/null; then _exhausted=1; break; fi
 
     local pick pick_id
     pick=$(_top_candidate "$pool")
@@ -10539,6 +10764,20 @@ dispatch_lane() {
     # DRY_RUN — which makes zero state changes — still advances through the pool.
     pool=$(echo "$pool" | jq --arg id "$pick_id" '[.[] | select(.id != $id)]' 2>/dev/null || echo "$pool")
 
+    # ── ga-in9ebr AC2: skip a bead QUEUED behind a full worker pool BEFORE the claim ──
+    # A candidate already committed to wa-worker/ps-worker (gc.routed_to, stamped by any
+    # earlier pool-arm attempt) whose pool is positively at cap cannot dispatch this sweep. Skipping
+    # here — not inside dispatch_one() — is what keeps a saturated pool from costing
+    # ~5 Dolt writes per queued bead per sweep (claim → cap → release). No slot is
+    # consumed and the loop simply moves to the next candidate, so a full pool never
+    # blocks a candidate for a pool that has room (see dispatch_one()/_pilot_pool_cap_full_for).
+    if _pilot_pool_cap_full_for "$pick"; then
+      if _pilot_note_pool_cap_queued "$pick_id"; then
+        log "ga-in9ebr: $pick_id QUEUED — routed to $_PCAP_POOL, pool at session cap ($_PCAP_LIVE active/creating >= $_PCAP_MAX max); not claimed, no writes this sweep (the ga-93yxc pool top-up opens a session once a slot frees)."
+      fi
+      continue
+    fi
+
     # wa-tm2a: derive the tier from THIS bead's own type (the pool is mixed), so a
     # story gets the "build story" template and a bug gets "fix bug" — independent
     # of what else is in the pool this sweep.
@@ -10547,10 +10786,15 @@ dispatch_lane() {
 
     # Only a SUCCESSFUL dispatch consumes a slot; a skip leaves the slot free and
     # simply moves to the next candidate. dispatch_one is the atomic-claim owner.
+    # ga-in9ebr: tell a cap QUEUE (capacity, not a fault) apart from every other
+    # non-dispatch, so a sweep that only queued behind full pools is not read as a stall.
+    _PCAP_CALL_QUEUED=0
     if dispatch_one "$pick" "$lane" "$pick_tier"; then
       filled=$((filled + 1))
       slots=$((slots - 1))
       DISPATCHED=$((DISPATCHED + 1))
+    elif [ "$_PCAP_CALL_QUEUED" != "1" ]; then
+      NONQUEUE_FAILS=$((NONQUEUE_FAILS + 1))
     fi
 
     # Mid-loop Dolt backoff (constraint a): if work remains, re-check the cheap CPU
@@ -10568,6 +10812,15 @@ dispatch_lane() {
       fi
     fi
   done
+
+  # ga-in9ebr: the loop can also end with candidates left UN-attempted — the iteration guard,
+  # an empty/unreadable pick, or the mid-loop Dolt back-off all `break` out of it. That is not
+  # pool saturation, so it must not let Step 5 read the sweep as "every candidate was queued
+  # behind a full pool" (which would hide a real stall, e.g. a hot Dolt). Still-free capacity
+  # (filled<cap, slots>0) + no clean exhaustion == cut short.
+  if [ "$_exhausted" != "1" ] && [ "$filled" -lt "$cap" ] && [ "$slots" -gt 0 ]; then
+    NONQUEUE_FAILS=$((NONQUEUE_FAILS + 1))
+  fi
 
   log "Lane $lane: dispatched ${filled} this sweep (cap=${cap}, slots_left=${slots})."
 }
@@ -10620,6 +10873,26 @@ if [ "$OWNERSHIP_GUARD_VETO_COUNT" -gt "0" ] 2>/dev/null; then
   log "ga-8jxe1: ownership-guard vetoed ${OWNERSHIP_GUARD_VETO_COUNT} candidate(s) this sweep."
 fi
 
+# ga-in9ebr: same idea for the worker-capacity caps — "dispatched=0" alone reads as a fault, so
+# say how many candidates were merely waiting for a worker slot. Silent when nothing was queued.
+#
+# _pool_saturated_sweep=1 iff the sweep dispatched nothing ONLY because every candidate it tried
+# was queued behind full worker capacity (per-pool cap or the combined ga-jezvn cap) AND no lane
+# loop was cut short (NONQUEUE_FAILS counts every other reason a sweep comes up empty). One
+# predicate, two consumers: the POOL-SATURATED marker below — the line other detectors read, since
+# the sweep-complete line only carries LANE slots and cannot tell a busy pool from a stall — and
+# the Step 5 stall gate.
+_pool_saturated_sweep=0
+if [ "$DISPATCHED" -eq "0" ] && [ "${POOL_CAP_QUEUED:-0}" -gt 0 ] && [ "${NONQUEUE_FAILS:-0}" -eq 0 ]; then
+  _pool_saturated_sweep=1
+fi
+if [ "${POOL_CAP_QUEUED:-0}" -gt 0 ] 2>/dev/null; then
+  log "ga-in9ebr: pool-cap queued this sweep: ${POOL_CAP_QUEUED} candidate(s) (left story:approved + gc.routed_to, NOT marked in-flight; the ga-93yxc top-up opens a session as slots free)."
+fi
+if [ "$_pool_saturated_sweep" = "1" ]; then
+  log "ga-in9ebr: POOL-SATURATED sweep — dispatched=0 only because ${POOL_CAP_QUEUED} candidate(s) are queued behind full worker capacity (backpressure, not a stall)."
+fi
+
 if [ "$DISPATCHED" -eq "0" ]; then
   log "No dispatches this sweep (lane slots may have been won by a concurrent process, or all picks skipped)."
 fi
@@ -10638,7 +10911,18 @@ fi
 # file — "makes zero state changes").
 PILOT_STALL_STATE="$GC_CITY/.gc/pilot-dispatcher-stall.count"
 PILOT_STALL_ALERT_CAP="${PILOT_STALL_ALERT_CAP:-3}"
-if [ "$DRY_RUN" != "1" ] && [ "$DISPATCHED" -eq "0" ] && { [ "$SMALL_SLOTS" -gt "0" ] || [ "$BIG_SLOTS" -gt "0" ]; }; then
+# ga-in9ebr: a sweep that dispatched nothing ONLY because every candidate it tried was
+# queued behind a full worker pool is saturation, not a stall. Before ga-in9ebr the
+# false in-flight marking hid this: the fake dispatch returned success (DISPATCHED>0)
+# and its phantom in-flight bead also filled a lane slot, so a saturated pool never
+# showed up here as "dispatched=0 with free slots". With the marking gone that is
+# exactly what it looks like, and without this exclusion a merely BUSY pool would trip
+# the streak and send the p4 "Pilot estagnado" ntfy every 3 sweeps. Requires ZERO other
+# failures (NONQUEUE_FAILS, which also counts a loop cut short with candidates
+# un-attempted) so a real stall on unrelated candidates is not masked; a saturated
+# sweep falls to the elif below and RESETS the streak. (_pool_saturated_sweep is computed above,
+# next to the summary lines, so this gate and the POOL-SATURATED log marker share one predicate.)
+if [ "$DRY_RUN" != "1" ] && [ "$DISPATCHED" -eq "0" ] && [ "$_pool_saturated_sweep" != "1" ] && { [ "$SMALL_SLOTS" -gt "0" ] || [ "$BIG_SLOTS" -gt "0" ]; }; then
   _stall_count=0
   [ -f "$PILOT_STALL_STATE" ] && _stall_count=$(cat "$PILOT_STALL_STATE" 2>/dev/null || echo "0")
   case "$_stall_count" in ''|*[!0-9]*) _stall_count=0 ;; esac
