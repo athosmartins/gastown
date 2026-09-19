@@ -393,7 +393,19 @@ _STORY_DELIVERY_GUARD_SIB="${_STORY_DELIVERY_SELF_DIR}/quality-gate-guard.sh"
 if [ -r "$_STORY_DELIVERY_GUARD_SIB" ]; then
   GATE_GUARD_LIB_ONLY=1 source "$_STORY_DELIVERY_GUARD_SIB"
 fi
-unset _STORY_DELIVERY_SELF_DIR _STORY_DELIVERY_GUARD_SIB
+# ga-rj7b1a: Step 6 runs the rig's prod tests, which can be heavy suites (pytest, the
+# pilot selftest). Lower THIS process's priority now (ni 15) so everything it spawns
+# inherits it and never competes with Dolt / the supervisor on equal terms. Safe for
+# this driver: daemons are restarted through `launchctl kickstart` (launchd-owned, so
+# they do not inherit); the driver itself is not latency-critical. Same readability
+# rule as the sibling above: a missing helper must not kill the init — the priority is
+# a courtesy, so it degrades to "runs at the inherited priority", never to "no delivery".
+_STORY_DELIVERY_HSG_SIB="${_STORY_DELIVERY_SELF_DIR}/heavy-selftest-guard.sh"
+if [ -r "$_STORY_DELIVERY_HSG_SIB" ]; then
+  source "$_STORY_DELIVERY_HSG_SIB"
+  heavy_selftest_lowprio
+fi
+unset _STORY_DELIVERY_SELF_DIR _STORY_DELIVERY_GUARD_SIB _STORY_DELIVERY_HSG_SIB
 # guard.sh sets its OWN LOG=$LOG_DIR/quality-gate-guard.log at source time —
 # restore ours (GC_CITY/LOG_DIR are already identical in both files, so only
 # LOG needs it). Mirrors quality-gate-dispatcher.sh's identical restore right

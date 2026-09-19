@@ -32,6 +32,16 @@ base = "builtin:claude"
 # plain "claude" provider above and keep their full MCP surface untouched.
 args_append = ["--settings", "{\"remoteControlAtStartup\":false}", "--model", "sonnet", "--strict-mcp-config"]
 ready_delay_ms = 0
+# ga-rj7b1a: every pool/ephemeral session is launched through claude-lowprio.sh (town-deltas assets), which
+# renices ITSELF to ni 15 and then exec()s the real claude. Everything the session spawns inherits
+# that niceness, so the heavy suites it runs (pilot-dispatcher.selftest.sh, pytest -n 6, go test) are
+# low-priority BY CONSTRUCTION and can no longer compete with Dolt and the supervisor on equal terms
+# (2026-09-19: 23 concurrent test trees, load 56-64 on 10 cores, supervisor demand read 1795 s vs ~60 s
+# normal, gate stalled). path_check keeps the engine's "is it installed" probe on the REAL claude, not
+# on the wrapper. The Mayor and attended crews ("claude" / "claude-rc") are deliberately NOT wrapped.
+# Kill switch, for NEW launches and with no config reload: touch <city>/.gc/no-lowprio (script header).
+command = "/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/claude-lowprio.sh"
+path_check = "claude"
 
 [imports]
 [imports.gastown]

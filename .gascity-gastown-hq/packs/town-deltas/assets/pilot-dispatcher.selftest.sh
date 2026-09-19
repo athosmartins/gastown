@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
-# ── Runtime expectation (ga-iuzk1) ─────────────────────────────────────────
-# This is BY FAR the largest file in this directory: ~380 assertions driven
-# through ~94 real `pilot-dispatcher.sh` subprocess invocations (each spawns
-# a fresh bash interpreter for the ~4500-line dispatcher). Measured full-run
-# wall time: ~140s (2026-07-02, on the reference dev host) — vs. a sibling
-# median around 150-200 lines / well under 15s. If you're batch-verifying
-# every `*.selftest.sh` in this directory with a uniform short bound (a
-# `timeout 15` sweep is the go-to convention here), that bound WILL kill this
-# file mid-run with no PASS/FAIL summary. That is NOT a hang — every scenario
-# passes given enough time (383/383 as of this writing; see ga-iuzk1). Give
-# this file its own `timeout 180` (or no bound) rather than reusing the
-# per-file default that's sized for its much smaller siblings.
+# ── Runtime expectation + machine-wide single-flight (ga-iuzk1, ga-rj7b1a) ────
+# This is BY FAR the largest file in this directory: hundreds of scenario blocks
+# driven through real `pilot-dispatcher.sh` subprocess invocations (each spawns a
+# fresh bash interpreter for the ~7000-line dispatcher) — vs. a sibling median
+# around 150-200 lines / well under 15s. Wall time: ~140s on 2026-07-02 (~380
+# assertions, ga-iuzk1) but 17+ min on 2026-09-19, when the box was saturated
+# (ga-rj7b1a: the Mayor ran it with a 3400s bound). A uniform short bound (the
+# `timeout 15` sweep convention here) WILL kill it mid-run with no PASS/FAIL
+# summary. That is NOT a hang. Give it no bound, or one sized for a busy host.
+#
+# It is a HEAVY suite (ga-rj7b1a), so it protects the machine instead of competing
+# with Dolt and the supervisor: it renices itself to ni 15 (children inherit) and
+# takes a machine-wide lock — at most ONE full run in flight per machine. A second
+# run waits (SELFTEST_LOCK_WAIT_SECS), then exits 75 = "NOT RUN", never a test
+# failure: retry later. The gate's reviewers are the exception: they never queue
+# (their verdict timeout already budgets for their own A/B pair of runs). Iterating
+# on a change? Run the smaller pilot-*.selftest.sh siblings and leave the full file
+# for the gate. Knobs: heavy-selftest-guard.sh.
 #
 # pilot-dispatcher.selftest.sh — Regression harness for the Pilot dispatcher.
 #
@@ -71,9 +77,22 @@ if [ ! -f "$DISPATCHER" ]; then
   exit 2
 fi
 
+# ── Heavy suite: low priority + one full run per machine (ga-rj7b1a) ──────────
+# Taken BEFORE any fixture exists: a second run waits here (or exits 75 = NOT RUN)
+# instead of adding another ~90-process tree to a box that Dolt and the supervisor
+# share. A readability check, not a bare `source`: a missing sibling (partial deploy)
+# would otherwise kill this script under a caller's `set -e`; here it runs unguarded
+# and SAYS so.
+if [ -r "$SELF_DIR/heavy-selftest-guard.sh" ]; then
+  . "$SELF_DIR/heavy-selftest-guard.sh"
+  heavy_selftest_guard pilot-dispatcher
+else
+  echo "[heavy-selftest] WARN heavy-selftest-guard.sh not found next to this selftest — running UNGUARDED (inherited priority, no single-flight)" >&2
+fi
+
 # ── Throwaway workspace ───────────────────────────────────────────────────────
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pilot-selftest.XXXXXX")"
-cleanup() { rm -rf "$WORK"; }
+cleanup() { rm -rf "$WORK"; heavy_selftest_release 2>/dev/null || true; }
 trap cleanup EXIT
 
 SHIMBIN="$WORK/bin"
