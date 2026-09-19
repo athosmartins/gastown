@@ -34,13 +34,31 @@
 # need Part 2 (the mutex functions), so GIT_LOCK_RIG_ROOTS is pre-set below to
 # skip that discovery unconditionally.
 #
+# UPDATE (ga-zhwi4l): the fetch below used to be unscoped (`git fetch origin`,
+# no refspec) — it tries to update EVERY remote-tracking ref, not just
+# $BRANCH's. whatsapp_automation has dozens of `crew/wa-worker/*` branches
+# pushed continuously by workers whose worktrees share THIS repo's ref store;
+# an unscoped fetch races those pushes for the lock on THEIR ref, even though
+# this deploy never reads it — confirmed live: "cannot lock ref
+# 'refs/remotes/origin/crew/wa-worker/wa-r17d3': is at f991f37... but expected
+# 9f1b1fb...". Fix: fetch only `+refs/heads/$BRANCH:refs/remotes/origin/
+# $BRANCH` — git then has no reason to touch any other ref, so that class of
+# collision cannot happen at all (see selftest G). If "cannot lock ref" still
+# occurs on $BRANCH's OWN ref (some other process racing that identical ref —
+# the mutex above only serializes OUR callers, not a non-cooperating one like
+# deploy_daemons.sh — see selftest H), treat it exactly like mutex-busy:
+# transient (exit 75), never a real deploy failure.
+#
 # Usage: git-deploy-pull.sh <repo_dir> [<branch>]   (branch defaults to main)
 # Exit 0  = fast-forwarded (or already up to date).
-# Exit 75 = could not acquire the per-repo deploy mutex within the wait budget
-#           (another deploy is genuinely in flight) — a TRANSIENT,
-#           not-our-fault non-completion. Callers should treat this exactly
-#           like "try again next cycle," never as a real deploy failure
-#           (75 = EX_TEMPFAIL in sysexits.h — chosen for that reason).
+# Exit 75 = a TRANSIENT, not-our-fault non-completion — either (a) could not
+#           acquire the per-repo deploy mutex within the wait budget (another
+#           deploy is genuinely in flight), or (b) the branch-scoped fetch hit
+#           "cannot lock ref" on $BRANCH's own remote-tracking ref because some
+#           OTHER process raced that identical ref outside our mutex
+#           (ga-zhwi4l). Callers should treat this exactly like "try again
+#           next cycle," never as a real deploy failure (75 = EX_TEMPFAIL in
+#           sysexits.h — chosen for that reason).
 # Other nonzero = a real git failure (diverged history, network, missing
 #           branch, ...) — a normal, actionable deploy failure.
 set -uo pipefail
@@ -58,7 +76,17 @@ MUTEX_POLL_SEC="${GIT_DEPLOY_PULL_MUTEX_POLL_SEC:-0.2}"
 # the extra serialization against the "cannot lock ref" class.
 if [ ! -r "$GLH" ]; then
   echo "git-deploy-pull.sh: git-lock-hygiene.sh not found/readable at $GLH — falling back to unlocked fetch+merge" >&2
-  git -C "$REPO" fetch origin --quiet && git -C "$REPO" merge --ff-only "origin/$BRANCH" --quiet
+  _fetch_err="$(git -C "$REPO" fetch origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" --quiet 2>&1)"
+  RC=$?
+  if [ "$RC" -ne 0 ]; then
+    if printf '%s' "$_fetch_err" | grep -q 'cannot lock ref'; then
+      echo "git-deploy-pull.sh: transient 'cannot lock ref' on $BRANCH's own remote-tracking ref (unlocked fallback) — try again next cycle" >&2
+      exit 75
+    fi
+    printf '%s\n' "$_fetch_err" >&2
+    exit "$RC"
+  fi
+  git -C "$REPO" merge --ff-only "origin/$BRANCH" --quiet
   exit $?
 fi
 
@@ -83,8 +111,16 @@ if [ "$_acquired" -ne 1 ]; then
   exit 75
 fi
 
-git -C "$REPO" fetch origin --quiet
+_fetch_err="$(git -C "$REPO" fetch origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" --quiet 2>&1)"
 RC=$?
+if [ "$RC" -ne 0 ] && printf '%s' "$_fetch_err" | grep -q 'cannot lock ref'; then
+  echo "git-deploy-pull.sh: transient 'cannot lock ref' on $BRANCH's own remote-tracking ref — try again next cycle" >&2
+  git_mutex_release "$REPO"
+  exit 75
+fi
+if [ "$RC" -ne 0 ]; then
+  printf '%s\n' "$_fetch_err" >&2
+fi
 if [ "$RC" -eq 0 ]; then
   git -C "$REPO" merge --ff-only "origin/$BRANCH" --quiet
   RC=$?

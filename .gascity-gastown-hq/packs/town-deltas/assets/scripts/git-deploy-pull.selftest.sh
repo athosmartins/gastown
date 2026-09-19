@@ -17,6 +17,18 @@
 # (see git-deploy-pull.sh's own header): sourcing git-lock-hygiene.sh without
 # pre-setting GIT_LOCK_RIG_ROOTS triggers a live `gc rig list` call on every
 # invocation.
+# G/H (ga-zhwi4l): the fetch used to be unscoped (`git fetch origin`, no
+# refspec), so it raced ANY concurrent ref update on the repo, not just
+# updates to $BRANCH — in production, worker `crew/wa-worker/*` pushes share
+# this repo's ref store and collided with main's deploy fetch ("cannot lock
+# ref 'refs/remotes/origin/crew/wa-worker/wa-r17d3'..."). G1 proves the old
+# unscoped pattern really does fail under a real concurrent update of an
+# UNRELATED branch; G2 proves the shipped, branch-scoped fetch does not, by
+# calling the real script. H proves the narrower residual this fix's own
+# backstop covers: a collision on $BRANCH's OWN ref (from some other
+# non-cooperating process, e.g. deploy_daemons.sh) still degrades to
+# transient (75), never a real failure — same real-concurrent-process
+# technique as D, not a mocked git.
 #
 # Everything runs against throwaway git repos under a mktemp -d directory;
 # the real whatsapp_automation checkout is never touched.
@@ -56,6 +68,17 @@ seed_runtime() { must git clone --quiet "$ORIGIN" "$1"; must git -C "$1" checkou
 advance_origin() {
   must git -C "$OTHER" -c user.name=test -c user.email=test@test commit --quiet --allow-empty -m "upstream work $RANDOM"
   must git -C "$OTHER" push --quiet origin HEAD:main
+}
+# Unlike main, other-branch is seeded once and never touched again by anyone
+# else — a repeat fetch of an unchanged ref is a same-SHA no-op that may never
+# even attempt the ref-lock write, so G's race (below) needs this to generate
+# genuine lock contention on that specific ref, the same way advance_origin
+# does for D/D2/H's races on main.
+advance_other_branch() {
+  must git -C "$OTHER" checkout --quiet other-branch
+  must git -C "$OTHER" -c user.name=test -c user.email=test@test commit --quiet --allow-empty -m "crew work $RANDOM"
+  must git -C "$OTHER" push --quiet origin HEAD:other-branch
+  must git -C "$OTHER" checkout --quiet main
 }
 run_script() { # $1=repo $2=branch(optional) -> exit code in $?, stdout+stderr in $WORK/last.txt
   bash "$SCRIPT" "$1" "${2:-main}" >"$WORK/last.txt" 2>&1
@@ -231,6 +254,115 @@ bash "$SCRIPT" "$WORK/does-not-exist-$RANDOM" main >/dev/null 2>&1
 _F2_ELAPSED=$(( $(date +%s) - _F2_START ))
 [ "$_F2_ELAPSED" -lt 5 ] && ok \
   || bad "F2: git-deploy-pull.sh took ${_F2_ELAPSED}s on a trivial failing invocation (>=5s) — sourcing git-lock-hygiene.sh is likely doing live rig discovery again"
+
+# ── G. crew/*-style ref churn on an UNRELATED branch must not break main's deploy ──
+# ga-zhwi4l: an unscoped `git fetch origin` (no refspec) tries to update EVERY
+# remote-tracking ref, including ones this deploy never reads — "other-branch"
+# here stands in for a worker's `crew/wa-worker/*` branch (worker worktrees
+# share this repo's ref store in production). G1 proves the unscoped pattern
+# (embedded inline — exactly line 61/86 read before this bead) really can fail
+# when a real concurrent process touches ONLY that unrelated ref, never
+# touching $BRANCH at all. G2 proves the shipped, branch-scoped fetch (the
+# actual git-deploy-pull.sh, post-fix) never does, because it has no reason to
+# touch that ref in the first place — so unlike D2, this is a deterministic
+# assertion (always rc=0), not a "0 or 75" tolerance.
+RT_G="$WORK/rt-crewref-old"; seed_runtime "$RT_G"
+OLD_UNSCOPED_FAILED=0
+OLD_UNSCOPED_MSG=""
+for i in $(seq 1 30); do
+  advance_other_branch
+  ( git -C "$RT_G" fetch origin --quiet && git -C "$RT_G" merge --ff-only origin/main --quiet ) 2>"$WORK/g-old-$i.err" &
+  VPID=$!
+  ( git -C "$RT_G" fetch origin other-branch --quiet ) 2>/dev/null &
+  IPID=$!
+  wait "$VPID"; VRC=$?
+  wait "$IPID"
+  if [ "$VRC" -ne 0 ] && grep -q 'cannot lock ref' "$WORK/g-old-$i.err"; then
+    OLD_UNSCOPED_FAILED=1
+    OLD_UNSCOPED_MSG="$(cat "$WORK/g-old-$i.err")"
+    break
+  fi
+done
+if [ "$OLD_UNSCOPED_FAILED" -eq 1 ]; then
+  ok
+else
+  bad "G1 (base-fails check): unscoped 'git fetch origin' did NOT hit 'cannot lock ref' even once across 30 iterations racing a concurrent update of an UNRELATED ref — this selftest is not exercising ga-zhwi4l's race; strengthen it before trusting G2 below."
+fi
+
+RT_G2="$WORK/rt-crewref-new"; seed_runtime "$RT_G2"
+NEW_SCOPED_BAD=0
+NEW_SCOPED_MSG=""
+for i in $(seq 1 30); do
+  advance_origin
+  advance_other_branch
+  ORIGIN_TIP=$(git -C "$OTHER" rev-parse HEAD)
+  ( run_script "$RT_G2" main; echo "rc=$?" > "$WORK/g-new-$i.rc" ) &
+  VPID=$!
+  ( git -C "$RT_G2" fetch origin other-branch --quiet ) 2>/dev/null &
+  IPID=$!
+  wait "$VPID"
+  wait "$IPID"
+  VRC=$(sed -n 's/^rc=//p' "$WORK/g-new-$i.rc")
+  AFTER=$(git -C "$RT_G2" rev-parse HEAD)
+  if [ "$VRC" != "0" ]; then
+    NEW_SCOPED_BAD=1
+    NEW_SCOPED_MSG="iter $i: git-deploy-pull.sh returned rc=$VRC (expected always 0) racing a concurrent update of an unrelated branch ref — the branch-scoped fetch should never even contend on that ref"
+    break
+  fi
+  if [ "$AFTER" != "$ORIGIN_TIP" ]; then
+    NEW_SCOPED_BAD=1
+    NEW_SCOPED_MSG="iter $i: reported success (rc=0) but HEAD ($AFTER) != origin tip ($ORIGIN_TIP) — SILENT WRONG STATE"
+    break
+  fi
+done
+if [ "$NEW_SCOPED_BAD" -eq 0 ]; then
+  ok
+else
+  bad "G2: git-deploy-pull.sh (branch-scoped fetch) misbehaved racing a concurrent update of an unrelated branch ref: $NEW_SCOPED_MSG"
+fi
+
+# ── H. collision on the deploy branch's OWN ref degrades to transient (75) ────
+# ga-zhwi4l part 2: G above eliminates the crew/* collision class entirely,
+# but if some OTHER non-cooperating process independently races a fetch of
+# the SAME branch (outside this wrapper's mutex — deploy_daemons.sh is the
+# real one, out of scope per D2's own comment, but the shape is identical),
+# the resulting "cannot lock ref" must be treated like mutex-busy (75), never
+# surfaced as a real deploy failure. Real concurrent fetches of the identical
+# ref — same mechanism as D, just narrowed to one ref instead of two — not a
+# mocked/synthetic git failure.
+RT_H="$WORK/rt-ownref-backstop"; seed_runtime "$RT_H"
+BACKSTOP_HIT=0
+BAD_RC_SEEN=0
+BAD_RC_MSG=""
+for i in $(seq 1 30); do
+  advance_origin
+  ORIGIN_TIP=$(git -C "$OTHER" rev-parse HEAD)
+  ( run_script "$RT_H" main; echo "rc=$?" > "$WORK/h-wrap-$i.rc" ) &
+  WPID=$!
+  ( git -C "$RT_H" fetch origin main --quiet ) 2>/dev/null &
+  IPID=$!
+  wait "$WPID"; wait "$IPID"
+  WRC=$(sed -n 's/^rc=//p' "$WORK/h-wrap-$i.rc")
+  AFTER=$(git -C "$RT_H" rev-parse HEAD)
+  case "$WRC" in
+    75) BACKSTOP_HIT=1 ;;
+    0) : ;;
+    *) BAD_RC_SEEN=1; BAD_RC_MSG="iter $i: unexpected rc=$WRC (not 0, not 75)"; break ;;
+  esac
+  if [ "$WRC" = "0" ] && [ "$AFTER" != "$ORIGIN_TIP" ]; then
+    BAD_RC_SEEN=1; BAD_RC_MSG="iter $i: wrapper reported success (rc=0) but HEAD ($AFTER) != origin tip ($ORIGIN_TIP) — SILENT WRONG STATE"; break
+  fi
+done
+if [ "$BAD_RC_SEEN" -eq 1 ]; then
+  bad "H own-ref backstop: $BAD_RC_MSG"
+else
+  ok
+fi
+if [ "$BACKSTOP_HIT" -eq 1 ]; then
+  ok
+else
+  bad "H (base-fires check): never observed rc=75 from a concurrent same-ref race across 30 iterations — this selftest is not exercising the backstop path; strengthen it before trusting the H own-ref-unchanged check above."
+fi
 
 echo "git-deploy-pull selftest: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
