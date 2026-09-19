@@ -2078,6 +2078,11 @@ else
   # value here would satisfy that check with the WRONG story's daemon list.
   MERGE_OWN_AFFECTED=""
   MERGE_OWN_VERDICT_LINE=""
+  # ga-8i2nds: the raw per-story probe output is now read by the bead-scoped
+  # halt detail further down, so it needs the same per-story reset as the two
+  # variables above — otherwise a story that never runs the probe (unresolvable
+  # MERGE_PRE_MAIN) would render the PREVIOUS story's probe output as its own.
+  MERGE_OWN_OUT=""
   # ga-nuou9v: same leakage reason as MERGE_OWN_AFFECTED above — only set
   # when THIS_PULL_STRUCTURALLY_INERT is (re-)set to "1" below, on whichever
   # of Path A/Path B actually ran this iteration. Read (below) only where
@@ -2284,10 +2289,15 @@ else
   # Neither call site here ever set these before, so Step 1b's attribution
   # guard always took its "unknown" branch — which defaults to attributable —
   # for every story-delivery.sh-driven deploy (wa-a7tca/wa-8urdy, 2026-09-17).
-  # Deliberately NOT MERGE_OWN_BASE_SHA (used above, in the Path-B-only elif):
-  # that var is assigned only when PRE_DEPLOY_SHA==POST_DEPLOY_SHA — on the far
-  # more common Path A it is never assigned at all, and referencing it here
-  # would be an unbound-variable abort under this file's `set -euo pipefail`.
+  # Deliberately NOT MERGE_OWN_BASE_SHA (assigned in the `if` above): that var
+  # is only assigned when this story's MERGE_PRE_MAIN resolves and is an
+  # ancestor of MERGE_SHA (ga-ndu4ic made that `if` run on Path A too, so it is
+  # no longer Path-B-only). When it does NOT, the var is either never assigned
+  # (an unbound-variable abort under this file's `set -euo pipefail`) or still
+  # holds a PREVIOUS story's value from the same sweep. Every later use of it —
+  # the freshness re-probe and the bead-scoped halt (ga-8i2nds) — is therefore
+  # gated on MERGE_OWN_AFFECTED being non-empty: reset per story above, and
+  # only ever populated inside that same `if`.
   # MERGE_SHA/MERGE_PRE_MAIN are always defined (defaulted "" earlier in the
   # sweep loop), and by this point MERGE_VERDICT=="verified" is guaranteed
   # (the pre-deploy merge-verification HALT above already `continue`d
@@ -2439,12 +2449,52 @@ else
       # bead is blameless for it, only the reverse (an own-file-stuck daemon
       # this bead cannot even closure-reach) does.
       NEEDS_GUARDED_RESTART_UNATTRIBUTED=0
+      # ga-8i2nds: what the bead-scoped freshness re-probe concluded, so the
+      # release branch and the halt builder below can each say which evidence
+      # they rest on ("none" = it never ran for this story). Reset per story
+      # for the usual sweep-loop leakage reason.
+      BEAD_REPROBE_STATE="none"
+      UNATTRIBUTED_ADVANCES_MARKER=0
+      MERGE_OWN_WIDE_OVERLAP=""
+      MERGE_OWN_FRESH_OUT=""
+      MERGE_OWN_FRESH_VERDICT_LINE=""
+      MERGE_OWN_LIVE_STALE=""
       if [ "$REFRESH_VERDICT" = "NEEDS_GUARDED_RESTART" ] \
          && [ "$THIS_PULL_STRUCTURALLY_INERT" = "0" ] \
-         && [ -n "${MERGE_OWN_AFFECTED// /}" ] \
-         && [ -z "$(comm -12 \
+         && [ -n "${MERGE_OWN_AFFECTED// /}" ]; then
+        # ga-8i2nds: this branch used to run ONLY when the wide guarded set did
+        # NOT overlap this bead's own reach — an overlap was taken as proof the
+        # bead's daemon is stale and went straight to the hold. The wide sweep
+        # does not measure that: daemon-refresh.sh's already_fresh() compares a
+        # daemon's process start against the commit time of the wide window's
+        # TIP (POST_DEPLOY_SHA), so a daemon restarted AFTER this bead's merge
+        # but BEFORE some later, unrelated commit is reported stale for a
+        # change it already runs. Measured live 2026-09-19 (rig baseline ~7h
+        # behind): com.whatsapp.ficha360, restarted 08:25:07, was flagged for
+        # wa-catpm — merge committed 08:08:44, in the runtime checkout from
+        # 08:22:59, and its own diff really did touch ficha360 — so wa-catpm
+        # was held; a read-only re-probe of that merge against the live
+        # processes came back VERDICT=OK, all 5 reached daemons already fresh.
+        # (wa-ben95, held for the same ficha360 flag, is a REAL hold: the same
+        # re-probe finds com.whatsapp.clientes-dashboard older than its merge —
+        # which is exactly why the re-probe decides, not the wide flag.)
+        # The question a hold has to answer is "does a daemon THIS merge
+        # reaches still run code older than THIS merge", and this re-probe
+        # answers exactly that, overlap or not — so it decides in both cases,
+        # and ITS stale list (never the wide list) is what a hold reports.
+        # The overlap only changes what a release does with the rig-wide
+        # marker (see the release branch below).
+        #
+        # Known tolerance (inherited from ga-g63ejg, not introduced here):
+        # "fresh" is pid-start > the merge COMMIT's time, a LOWER bound on when
+        # the code reached the runtime checkout (wa-catpm: 14min later). A
+        # daemon restarted inside that gap would read fresh while still running
+        # pre-merge code. Closing it means flooring the reference at the
+        # checkout-arrival time inside daemon-refresh.sh — a separate change.
+        MERGE_OWN_WIDE_OVERLAP="$(comm -12 \
               <(echo "$REFRESH_GUARDED_OWN" | tr ' ' '\n' | grep -v '^$' | sort -u) \
-              <(echo "$MERGE_OWN_AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u))" ]; then
+              <(echo "$MERGE_OWN_AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+              | tr '\n' ' ' | sed 's/ $//')"
         # ga-g63ejg: an empty intersection with REFRESH_GUARDED_OWN only proves
         # this bead's own affected daemon(s) are off the WIDE sweep's radar —
         # never that they are actually fresh. The wide sweep's own [PRE,POST]
@@ -2482,15 +2532,30 @@ else
         log "Freshness re-probe for $STORY_ID's own affected daemon(s) [$MERGE_OWN_AFFECTED] (forced through the SENSITIVE already_fresh() check): ${MERGE_OWN_FRESH_VERDICT_LINE:-<unparseable output>} still-stale=[$MERGE_OWN_LIVE_STALE]."
         if [ -n "$MERGE_OWN_FRESH_VERDICT_LINE" ] && [ -z "${MERGE_OWN_LIVE_STALE// /}" ]; then
           NEEDS_GUARDED_RESTART_UNATTRIBUTED=1
+          BEAD_REPROBE_STATE="clean"
+          # Only the pre-existing exoneration (no overlap with the wide guarded
+          # set, ga-49fwiw invariant c) advances the rig-wide marker. An
+          # overlap-exoneration (ga-8i2nds) must NOT: the marker is the PRE of
+          # every later wide window, so moving it to POST_DEPLOY_SHA drops any
+          # still-pending sibling's merge out of its own next window — that
+          # sibling's wide verdict then reads SKIPPED/OK on an empty range and
+          # its own stale daemons are never looked at again. This branch's
+          # evidence is about THIS merge only, so it releases THIS story only.
+          if [ -z "$MERGE_OWN_WIDE_OVERLAP" ]; then
+            UNATTRIBUTED_ADVANCES_MARKER=1
+          fi
+        elif [ -n "$MERGE_OWN_FRESH_VERDICT_LINE" ]; then
+          BEAD_REPROBE_STATE="stale"
+          log "Daemon refresh verdict=$REFRESH_VERDICT — $STORY_ID's own merge reaches [$MERGE_OWN_AFFECTED]; the freshness re-probe confirms [$MERGE_OWN_LIVE_STALE] still run code older than the merge commit ($MERGE_SHA) — holding this delivery for exactly those (wide-window overlap: [${MERGE_OWN_WIDE_OVERLAP:-none}])."
         else
+          BEAD_REPROBE_STATE="unparseable"
           # Third state (unparseable re-probe: no VERDICT= line at all,
           # crash/timeout) is deliberately NOT treated as fresh — same
           # fail-closed default this file uses everywhere else for "can't
           # tell" (verify-before-completion's own rule: if we can't tell,
           # don't release). NEEDS_GUARDED_RESTART_UNATTRIBUTED stays 0, so
-          # control falls through to the existing hold branch below exactly
-          # as if the intersection had NOT been empty.
-          log "Daemon refresh verdict=$REFRESH_VERDICT — $STORY_ID's own merge reaches [$MERGE_OWN_AFFECTED], none currently in the wide guarded list [$REFRESH_GUARDED_OWN], but the freshness re-probe did not confirm it fresh — holding this delivery for it (ga-g63ejg: absence from the wide sweep's list does not prove fresh)."
+          # control falls through to the hold branch below.
+          log "Daemon refresh verdict=$REFRESH_VERDICT — $STORY_ID's own merge reaches [$MERGE_OWN_AFFECTED], but the freshness re-probe did not confirm it fresh (unparseable output) — holding this delivery for it (ga-g63ejg: absence from the wide sweep's list does not prove fresh; wide-window overlap: [${MERGE_OWN_WIDE_OVERLAP:-none}])."
         fi
       fi
       if [ "$THIS_PULL_STRUCTURALLY_INERT" = "1" ]; then
@@ -2514,11 +2579,26 @@ else
         # NEEDS_GUARDED_RESTART belong to this bead — invariant (b): the wide
         # window stays visible and charged (nudge below), but does not retain
         # whoever didn't cause it.
-        log "Daemon refresh verdict=$REFRESH_VERDICT — none of the currently-guarded daemon(s) ($REFRESH_GUARDED) are attributed to $STORY_ID's own merge (which reaches: $MERGE_OWN_AFFECTED) — not holding this delivery for it."
+        if [ -n "$MERGE_OWN_WIDE_OVERLAP" ]; then
+          # ga-8i2nds: released on the bead-scoped re-probe even though the wide
+          # window names daemon(s) this merge reaches — see the comment at the
+          # re-probe above for why that wide flag is not evidence about THIS
+          # merge. The wide names that overlap are kept in the log/nudge (they
+          # are the reason a reader would otherwise suspect this release).
+          log "Daemon refresh verdict=$REFRESH_VERDICT — the wide window flags [$MERGE_OWN_WIDE_OVERLAP], which $STORY_ID's own merge reaches, but the freshness re-probe confirms every daemon it reaches [$MERGE_OWN_AFFECTED] started AFTER its merge commit ($MERGE_SHA); the wide flag is measured against the window tip ($POST_DEPLOY_SHA), not this merge — not holding this delivery for it. Rig-wide baseline marker left where it is (ga-8i2nds: a pending sibling's window must not be skipped)."
+        else
+          log "Daemon refresh verdict=$REFRESH_VERDICT — none of the currently-guarded daemon(s) ($REFRESH_GUARDED) are attributed to $STORY_ID's own merge (which reaches: $MERGE_OWN_AFFECTED) — not holding this delivery for it."
+        fi
         if [ "$DRY_RUN" != "1" ]; then
-          gc --city "$GC_CITY" session nudge mayor \
-            "Daemon refresh $REFRESH_VERDICT persists for rig $RIG — NOT attributed to $STORY_ID (its own merge reaches [$MERGE_OWN_AFFECTED], none currently in the guarded list [$REFRESH_GUARDED]); an earlier commit still needs a guarded restart." \
-            2>/dev/null || true
+          if [ -n "$MERGE_OWN_WIDE_OVERLAP" ]; then
+            gc --city "$GC_CITY" session nudge mayor \
+              "Daemon refresh $REFRESH_VERDICT persists for rig $RIG — $STORY_ID released on its own evidence: the wide window flags [$MERGE_OWN_WIDE_OVERLAP] (which its merge reaches), but every daemon its merge reaches [$MERGE_OWN_AFFECTED] started after the merge commit ($MERGE_SHA). The wide flag is judged against the window tip, not this merge; another commit may still need a guarded restart." \
+              2>/dev/null || true
+          else
+            gc --city "$GC_CITY" session nudge mayor \
+              "Daemon refresh $REFRESH_VERDICT persists for rig $RIG — NOT attributed to $STORY_ID (its own merge reaches [$MERGE_OWN_AFFECTED], none currently in the guarded list [$REFRESH_GUARDED]); an earlier commit still needs a guarded restart." \
+              2>/dev/null || true
+          fi
           # ga-49fwiw invariant (c): unlike the pre-existing inert branch above
           # (deliberately left un-advanced — see its own comment), THIS branch
           # DOES advance the rig-wide marker: this bead's own portion of the
@@ -2532,13 +2612,33 @@ else
           # growth this bug's own root-cause section describes (verdict never
           # OK -> marker never advances -> window widens -> more daemons
           # match -> verdict never OK) stops.
-          if [ -n "$POST_DEPLOY_SHA" ]; then
+          #
+          # ga-8i2nds: only when the exoneration was the no-overlap kind. A
+          # release that rests on the bead-scoped re-probe DESPITE a wide
+          # overlap (UNATTRIBUTED_ADVANCES_MARKER=0) proves nothing about the
+          # rest of the window, so it leaves the marker alone.
+          if [ "$UNATTRIBUTED_ADVANCES_MARKER" = "1" ] && [ -n "$POST_DEPLOY_SHA" ]; then
             printf '%s\n' "$POST_DEPLOY_SHA" > "$DAEMON_REFRESH_BASELINE_FILE" 2>/dev/null \
               || warn "could not persist daemon-refresh baseline for rig $RIG at $DAEMON_REFRESH_BASELINE_FILE (non-fatal; next sweep falls back to its own pre-pull HEAD)"
           fi
         fi
       else
         err "Daemon refresh did NOT pass (verdict=$REFRESH_VERDICT): $REFRESH_REASON"
+        # ga-8i2nds: what the halt posts as its headline, its raw detail block
+        # and its dedup key. Default = the wide sweep's own text, unchanged —
+        # the right (and only honest) thing to show when this story has no
+        # bead-scoped attribution. The bead-scoped branch below overrides all
+        # three, because the wide REASON is a property of the WIDE WINDOW
+        # (baseline..tip), identical for every story delivered while that
+        # baseline stays put, and its wording ("its own entrypoint/template is
+        # in THIS diff ... restart THESE first") reads as a claim about this
+        # story's diff. Measured live 2026-09-19: wa-r4ehy.3's posted halt (diff:
+        # slot_scheduler.py + queue_database.py) headlined a 36-daemon list and
+        # told it com.whatsapp.ficha360 was OWN-FILE-CHANGED; the Mayor reported
+        # the same list on wa-r4ehy.2, wa-catpm and wa-ben95 (ga-8i2nds).
+        HALT_REASON="$REFRESH_REASON"
+        HALT_DETAIL="$REFRESH_OUT"
+        HALT_FP_LIST="$REFRESH_GUARDED"
         if [ "$REFRESH_VERDICT" = "NEEDS_GUARDED_RESTART" ]; then
           # ga-puq8z ACEITE 2: this verdict is single-hop import/template-closure
           # detection (daemon-refresh.sh Step 3), not proof the daemon's live
@@ -2578,10 +2678,53 @@ else
               <(echo "$REFRESH_GUARDED" | tr ' ' '\n' | grep -v '^$' | sort -u) \
               <(echo "$MERGE_OWN_AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u) \
               | tr '\n' ' ' | sed 's/ $//')"
-            REFRESH_ACTION="ACTION: restart THESE for this merge — per-bead attribution ($STORY_ID's own delta $MERGE_OWN_BASE_SHA..$MERGE_SHA reaches, already computed above):$MERGE_OWN_AFFECTED
+            # ga-8i2nds: the halt lists ONLY this merge's own daemons. Which
+            # ones depends on what the bead-scoped freshness re-probe (run
+            # above, whether or not the wide list overlapped) concluded:
+            #   stale       -> the daemons it confirmed still run pre-merge code
+            #                  (started before this merge's commit) — the
+            #                  precise "restart THESE" list, not the full reach
+            #                  (a reached daemon restarted after the merge is
+            #                  fresh and needs nothing);
+            #   unparseable -> it could not say, so fall back to this merge's
+            #                  full LIVE reach, worded as "not confirmed stale"
+            #                  (fail closed: still held, never called fresh).
+            # A hold never reaches this point in the "clean" state (released
+            # above), so BEAD_REPROBE_STATE is "stale" or "unparseable" here —
+            # or "none" if the re-probe somehow did not run, which is worded
+            # exactly like unparseable rather than guessed at.
+            if [ "$BEAD_REPROBE_STATE" = "stale" ]; then
+              HALT_OWN_LIST="$(echo "$MERGE_OWN_LIVE_STALE" | tr -s ' ' | sed 's/^ //; s/ $//')"
+              HALT_OWN_BASIS="the freshness re-probe found each of these started BEFORE this merge's commit $MERGE_SHA, i.e. still running pre-merge code"
+            else
+              HALT_OWN_LIST="$(echo "$MERGE_OWN_AFFECTED_LIVE" | tr -s ' ' | sed 's/^ //; s/ $//')"
+              [ -n "$HALT_OWN_LIST" ] || HALT_OWN_LIST="$(echo "$MERGE_OWN_AFFECTED" | tr -s ' ' | sed 's/^ //; s/ $//')"
+              HALT_OWN_BASIS="the freshness re-probe was unavailable, so this is the merge's full live reach — NOT confirmed stale"
+            fi
+            HALT_OWN_COUNT="$(echo "$HALT_OWN_LIST" | wc -w | tr -d ' ')"
+            HALT_REACH_COUNT="$(echo "$MERGE_OWN_AFFECTED_LIVE" | wc -w | tr -d ' ')"
+            HALT_CONTEXT_COUNT="$(echo "$REFRESH_GUARDED_CONTEXT_ONLY" | wc -w | tr -d ' ')"
+            if [ "$BEAD_REPROBE_STATE" = "stale" ]; then
+              HALT_REASON="this merge's own delta ($MERGE_OWN_BASE_SHA..$MERGE_SHA) reaches $HALT_REACH_COUNT live daemon(s); $HALT_OWN_COUNT of them still run code older than the merge: $HALT_OWN_LIST"
+            else
+              HALT_REASON="this merge's own delta ($MERGE_OWN_BASE_SHA..$MERGE_SHA) reaches $HALT_REACH_COUNT live daemon(s), could not confirm which are stale (freshness re-probe unavailable): $HALT_OWN_LIST"
+            fi
+            # The raw block: this merge's own probe output, KEY=value lines
+            # only (the wide run's stdout carries its whole discovery log —
+            # hundreds of lines per comment, re-posted on every announce).
+            # Prefer the re-probe (says which reached daemons are stale AND
+            # which are already fresh), fall back to the plain probe.
+            HALT_DETAIL_BODY="$(echo "${MERGE_OWN_FRESH_OUT:-$MERGE_OWN_OUT}" | grep -E '^(VERDICT|REASON|AFFECTED|AFFECTED_NOT_RUNNING|RESTARTED|FRESH_FAIL|GUARDED|GUARDED_OWN|GUARDED_CLOSURE_ONLY|ALREADY_FRESH|PROOF)=' || true)"
+            # An empty body must not read as "the probe found nothing": say
+            # that it produced nothing parseable (the third state).
+            [ -n "$HALT_DETAIL_BODY" ] || HALT_DETAIL_BODY="(the bead-scoped probe produced no parseable KEY=value output — see story-delivery.log)"
+            HALT_DETAIL="Bead-scoped detail — this merge's own delta $MERGE_OWN_BASE_SHA..$MERGE_SHA, NOT the rig-wide window:
+$HALT_DETAIL_BODY"
+            HALT_FP_LIST="$HALT_OWN_LIST"
+            REFRESH_ACTION="ACTION: restart THESE for this merge — per-bead attribution ($STORY_ID's own delta $MERGE_OWN_BASE_SHA..$MERGE_SHA reaches them; $HALT_OWN_BASIS):$HALT_OWN_LIST
 Drain in-flight messages/webhooks first, then re-run delivery. (Configure a DRAIN_CMD_<label> for daemon-refresh.sh to automate this.)
-Context only — NOT attributed to this merge: other sensitive daemon(s) the wide sweep found older than their own closure, from EARLIER merges (cosmetic unless one of them actually uses a changed symbol; do not restart these on THIS story's account alone):${REFRESH_GUARDED_CONTEXT_ONLY}
-CAVEAT (ga-puq8z): both lists above are import/template-closure matches, not proof of reachability to the changed symbols — if in doubt, compare \`ps -o lstart= -p <pid>\` against commit $POST_DEPLOY_SHA before restarting."
+Context only — NOT attributed to this merge: $HALT_CONTEXT_COUNT other sensitive daemon(s) flagged by the rig-wide window ($DAEMON_REFRESH_PRE_SHA..$POST_DEPLOY_SHA), which is judged against that window's tip commit, not this merge (cosmetic unless one of them actually uses a changed symbol; do not restart these on THIS story's account). Names deliberately omitted so this halt lists only this merge's own daemons (ga-8i2nds) — the full list is in story-delivery.log, the 'Daemon refresh verdict=' lines of this sweep.
+CAVEAT (ga-puq8z): the list above is an import/template-closure match against this merge's own delta, not proof of reachability to the changed symbols — if in doubt, compare \`ps -o lstart= -p <pid>\` against this merge's commit $MERGE_SHA before restarting."
           else
             REFRESH_ACTION="ACTION: perform a guarded/graceful restart of the flagged hot-path daemon(s) ($REFRESH_GUARDED) — drain in-flight messages/webhooks first — then re-run delivery. (Configure a DRAIN_CMD_<label> for daemon-refresh.sh to automate this.) No per-bead attribution available this run (this story's own pull was not a true no-op, or the attribution probe above did not return a parseable result) — this is the wide sweep's list only. CAVEAT (ga-puq8z): flagged by import/template-closure matching, not proven reachable to the changed symbols — if in doubt, compare \`ps -o lstart= -p <pid>\` against commit $POST_DEPLOY_SHA before restarting."
           fi
@@ -2633,7 +2776,13 @@ CAVEAT (ga-puq8z): both lists above are import/template-closure matches, not pro
           # only, no line 2) degrades to "timestamp unknown" rather than a
           # parse error — `sed -n Np` on a missing line prints nothing, it
           # does not fail.
-          HALT_FP_NEW="$REFRESH_VERDICT|$REFRESH_GUARDED|$REFRESH_FRESHFAIL"
+          # ga-8i2nds: the list in the key is whatever the halt itself reports —
+          # this merge's own stale daemons when it has bead-scoped attribution,
+          # the wide guarded list otherwise (HALT_FP_LIST, set above). Keying on
+          # the WIDE list while the comment shows the bead-scoped one would
+          # re-announce on every unrelated change to the wide window and stay
+          # silent when the bead's own list actually changed.
+          HALT_FP_NEW="$REFRESH_VERDICT|$HALT_FP_LIST|$REFRESH_FRESHFAIL"
           HALT_FP_NOW="$(date +%s)"
           HALT_FP_OLD="$(sed -n '1p' "$HALT_FP_FILE" 2>/dev/null || echo "")"
           HALT_FP_OLD_TS="$(sed -n '2p' "$HALT_FP_FILE" 2>/dev/null || echo "")"
@@ -2662,7 +2811,7 @@ CAVEAT (ga-puq8z): both lists above are import/template-closure matches, not pro
             if [ "$HALT_FP_MODE" = "reminder" ]; then
               # Invariant (c): never repeat the full daemon list past the
               # first announcement for this fingerprint — point back at it.
-              bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED (ga-iwv0 daemon refresh) — STILL unresolved, unchanged since the last report: $REFRESH_VERDICT — $REFRESH_REASON
+              bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED (ga-iwv0 daemon refresh) — STILL unresolved, unchanged since the last report: $REFRESH_VERDICT — $HALT_REASON
 Not repeating the full daemon list here — see the earlier 'Delivery HALTED' comment on this bead for it (ga-vv5ngy spaced reminder: fires every ${HALT_FP_REMINDER_INTERVAL_S}s while the condition stays unchanged). story:done remains WITHHELD.
 $REFRESH_ACTION" 2>/dev/null || true
               AUTHOR=$(echo "$STORY" | jq -r '.assignee // .created_by // ""' 2>/dev/null || echo "")
@@ -2672,14 +2821,14 @@ $REFRESH_ACTION" 2>/dev/null || true
                   --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR"
               fi
               gc --city "$GC_CITY" session nudge mayor \
-                "DELIVERY still HALTED ($STORY_ID, rig $RIG): daemon refresh $REFRESH_VERDICT unchanged since last report — $REFRESH_REASON. story:done withheld." \
+                "DELIVERY still HALTED ($STORY_ID, rig $RIG): daemon refresh $REFRESH_VERDICT unchanged since last report — $HALT_REASON. story:done withheld." \
                 2>/dev/null || true
             else
-              bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED (ga-iwv0 daemon refresh): $REFRESH_VERDICT — $REFRESH_REASON
+              bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED (ga-iwv0 daemon refresh): $REFRESH_VERDICT — $HALT_REASON
 A long-lived daemon serving rig '$RIG' is running code OLDER than this deploy and could not be safely refreshed/verified, so the merged feature would be DORMANT in production. story:done is WITHHELD (a dormant deploy must never be marked done).
 $REFRESH_ACTION
 Refresh detail:
-$REFRESH_OUT" 2>/dev/null || true
+$HALT_DETAIL" 2>/dev/null || true
               AUTHOR=$(echo "$STORY" | jq -r '.assignee // .created_by // ""' 2>/dev/null || echo "")
               if [ -n "$AUTHOR" ] && [ "$AUTHOR" != "null" ]; then
                 gc --city "$GC_CITY" session nudge "$AUTHOR" \
@@ -2687,7 +2836,7 @@ $REFRESH_OUT" 2>/dev/null || true
                   --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR"
               fi
               gc --city "$GC_CITY" session nudge mayor \
-                "DELIVERY HALTED ($STORY_ID, rig $RIG): daemon refresh $REFRESH_VERDICT — $REFRESH_REASON. story:done withheld." \
+                "DELIVERY HALTED ($STORY_ID, rig $RIG): daemon refresh $REFRESH_VERDICT — $HALT_REASON. story:done withheld." \
                 2>/dev/null || true
             fi
           fi

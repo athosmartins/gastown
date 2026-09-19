@@ -123,8 +123,34 @@ run_block() {
   # REFRESH_VERDICT + REFRESH_GUARDED + MERGE_OWN_AFFECTED +
   # THIS_PULL_STRUCTURALLY_INERT), not the import/template-closure detection
   # mechanics (already covered by daemon-refresh.test.sh and friends).
+  # ga-8i2nds: the hold/release decision is now the bead-scoped freshness
+  # re-probe (a second DRY_RUN=1 call whose SENSITIVE_DAEMONS the caller forces
+  # to include the reached labels), not the overlap with the wide guarded set —
+  # the overlap alone no longer holds anything. So "genuinely still needs a
+  # guarded restart" (the premise of the attributed modes, T2/T3) has to be
+  # expressed where the decision now reads it: the re-probe reports new-daemon
+  # STILL STALE in those modes, and fresh (the plain default below) otherwise.
+  STUB_REPROBE_STALE=""
+  case "$mode" in
+    attributed|path_a_attributed) STUB_REPROBE_STALE="com.test.new-daemon" ;;
+  esac
   cat > "$GC_CITY/packs/town-deltas/assets/daemon-refresh.sh" <<EOF
 if [ "\$DRY_RUN" = "1" ]; then
+  if [ -n "$STUB_REPROBE_STALE" ]; then
+    case " \$SENSITIVE_DAEMONS " in
+      *" $STUB_REPROBE_STALE "*)
+        echo "VERDICT=NEEDS_GUARDED_RESTART"
+        echo "AFFECTED=$STUB_NARROW_AFFECTED"
+        echo "AFFECTED_NOT_RUNNING="
+        echo "RESTARTED="
+        echo "FRESH_FAIL="
+        echo "GUARDED=$STUB_REPROBE_STALE"
+        echo "GUARDED_OWN=$STUB_REPROBE_STALE"
+        echo "REASON=freshness re-probe: still stale"
+        echo "ALL_LABELS="
+        exit 1 ;;
+    esac
+  fi
   echo "VERDICT=OK"
   echo "AFFECTED=$STUB_NARROW_AFFECTED"
   echo "AFFECTED_NOT_RUNNING="

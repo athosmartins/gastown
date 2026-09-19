@@ -203,9 +203,20 @@ echo "$BD_CALLS" | grep -q "Context only — NOT attributed to this merge" \
 # further down, which legitimately contains every daemon name unfiltered
 # since it's raw daemon-refresh.sh stdout, not the human-facing narrative).
 CONTEXT_LINE="$(echo "$BD_CALLS" | grep "Context only — NOT attributed to this merge")"
+# ga-8i2nds UPDATE: the context line used to NAME the unattributed daemon
+# ("nothing hidden, just de-prioritized"). A delivery's halt now lists only ITS
+# OWN daemons (ga-8i2nds Aceite 1: the wide list was identical on every story
+# while the baseline stayed frozen) — the unattributed daemon is acknowledged as
+# a COUNT here, and "nothing hidden" is kept by the wide list staying in the log.
+echo "$CONTEXT_LINE" | grep -q "1 other sensitive daemon" \
+  && ok "T1 demoted context line still acknowledges the unattributed daemon, as a count (de-prioritized, not silent)" \
+  || nok "T1 context line does not count the unattributed daemon" "$CONTEXT_LINE"
 echo "$CONTEXT_LINE" | grep -q "com.test.old-daemon" \
-  && ok "T1 demoted context line still names the unattributed daemon (nothing hidden, just de-prioritized)" \
-  || nok "T1 old-daemon missing entirely from context line" "$CONTEXT_LINE"
+  && nok "T1 context line names the unattributed daemon (belongs to an earlier merge)" "$CONTEXT_LINE" \
+  || ok "T1 context line does not name the unattributed daemon"
+echo "$LOG_OUT" | grep -q "guarded=\[.*com.test.old-daemon" \
+  && ok "T1 nothing hidden — the unattributed daemon stays in the log's wide list" \
+  || nok "T1 old-daemon missing from the log's wide list" "$LOG_OUT"
 # gate_run=ga-c6ke4i (Reviewer-1 FAIL): the context line used to interpolate
 # the RAW wide list, so an already-attributed daemon (named in the lead
 # "restart THESE" line) also leaked into this "NOT attributed" line two lines
@@ -239,9 +250,16 @@ echo "$BD_CALLS" | grep -q "Context only — NOT attributed to this merge" \
   && ok "T3 wide list demoted to an explicitly-marked context line" \
   || nok "T3 missing context-demotion marker" "$BD_CALLS"
 CONTEXT_LINE="$(echo "$BD_CALLS" | grep "Context only — NOT attributed to this merge")"
+# ga-8i2nds UPDATE — see T1: count on the context line, names stay in the log.
+echo "$CONTEXT_LINE" | grep -q "1 other sensitive daemon" \
+  && ok "T3 demoted context line still acknowledges the unattributed daemon, as a count (de-prioritized, not silent)" \
+  || nok "T3 context line does not count the unattributed daemon" "$CONTEXT_LINE"
 echo "$CONTEXT_LINE" | grep -q "com.test.old-daemon" \
-  && ok "T3 demoted context line still names the unattributed daemon (nothing hidden, just de-prioritized)" \
-  || nok "T3 old-daemon missing entirely from context line" "$CONTEXT_LINE"
+  && nok "T3 context line names the unattributed daemon (belongs to an earlier merge)" "$CONTEXT_LINE" \
+  || ok "T3 context line does not name the unattributed daemon"
+echo "$LOG_OUT" | grep -q "guarded=\[.*com.test.old-daemon" \
+  && ok "T3 nothing hidden — the unattributed daemon stays in the log's wide list" \
+  || nok "T3 old-daemon missing from the log's wide list" "$LOG_OUT"
 echo "$CONTEXT_LINE" | grep -q "com.test.new-daemon" \
   && nok "T3 context line wrongly re-lists the already-attributed daemon (new-daemon) as NOT attributed" "$CONTEXT_LINE" \
   || ok "T3 context line correctly excludes the already-attributed daemon (new-daemon)"
