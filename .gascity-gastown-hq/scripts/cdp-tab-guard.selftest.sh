@@ -10,8 +10,14 @@
 # guard's log per test), CDP_TAB_GUARD_UNDER_TEST=<path> (run the suite against another copy
 # of the guard — used for mutation checks).
 #
+# Runs at low priority (renice +15) so it never competes with Dolt / the supervisor for CPU:
+# on 2026-09-19 parallel heavy suites, this one included, took the city to load 64 (ga-rj7b1a).
+#
 # Exit: 0 = all pass, non-zero = any failure.
 set -euo pipefail
+# Best effort, never fails the suite. The exec below keeps this PID, so the private Chrome and
+# every guard run inherit the priority. (Raising the nice value needs no privilege.)
+renice -n 15 $$ >/dev/null 2>&1 || true
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="${CDP_TAB_GUARD_SELFTEST_PYTHON:-/opt/homebrew/bin/python3}"
 [ -x "$PY" ] || PY="$(command -v python3)"
