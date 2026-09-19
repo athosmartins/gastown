@@ -668,9 +668,13 @@ context_check_clause_before() {
 #   negation. Only inspects the FIRST occurrence — context_check_any_unnegated
 #   (below) loops this over every occurrence, since a later one can be a
 #   genuine request even when the first is a prohibition (ga-dpas3r attempt 2,
-#   blocking issue 1). Pure (no I/O).
+#   blocking issue 1). Two negation scopes, not one — see the two case blocks
+#   below: SENTENCE ADVERBS (pure negators, no object of their own) match
+#   across the full same-clause text; PHRASE-LOCAL NEGATORS (bind to whatever
+#   word immediately follows them) match only within the tighter sub-clause
+#   after the last comma (ga-dpas3r attempt 3). Pure (no I/O).
 context_check_negated() {
-  local text="$1" phrase="$2" clause padded
+  local text="$1" phrase="$2" clause padded tight tight_padded
   clause="$(context_check_clause_before "$text" "$phrase")"
   [ -z "$clause" ] && { echo "no"; return; }
   # A negation word can be directly followed by punctuation instead of a space
@@ -681,10 +685,43 @@ context_check_negated() {
   # exact wa-vrs3g class this function exists to close, for a comma-qualified
   # variant of the same guardrail wording).
   padded=" ${clause//[,:;()]/ } "
+  # SENTENCE ADVERBS: pure negation particles with no complement of their own
+  # — they attach to the clause's VERB wherever it sits, so they may legally
+  # dangle across a comma-set-off aside ("nunca, em hipotese alguma, criar
+  # conta" — the aside qualifies "nunca" itself, not an alternative object).
+  # English don't/do not/cannot/can't are auxiliary negators that likewise
+  # only ever govern a following VERB, never a noun of their own, so the same
+  # reasoning applies; "never" is included here too — its one common
+  # noun-adjacent idiom ("never mind") is a fixed verbal collocation, not the
+  # preposition/verb-takes-noun-object shape the PHRASE-LOCAL group below
+  # exists to fence off.
   case "$padded" in
-    *" nunca "*|*" não "*|*" nao "*|*" jamais "*|*" evite "*|*" evitar "*|\
-*" sem "*|*" nem "*|*" never "*|*" don't "*|*" dont "*|*" do not "*|\
-*" cannot "*|*" can't "*)
+    *" nunca "*|*" não "*|*" nao "*|*" jamais "*|*" never "*|*" don't "*|\
+*" dont "*|*" do not "*|*" cannot "*|*" can't "*)
+      echo "yes"; return ;;
+  esac
+  # PHRASE-LOCAL NEGATORS: "sem" (preposition), "evitar"/"evite" (transitive
+  # verb) and "nem" (quantifier/particle — "nem tudo") all take the WORD
+  # IMMEDIATELY FOLLOWING them as their own object/complement, so that object
+  # can be a different, EARLIER thing than the trigger phrase later in the
+  # same comma-delimited sentence: "sem duvida, criar conta" negates
+  # "duvida", not "criar conta"; "evitar retrabalho, provisionar conta"
+  # negates "retrabalho", not "provisionar conta". Restricting these three to
+  # the TIGHT sub-clause after the LAST comma stops that leak — a fixed
+  # expression like either example above can no longer reach across its
+  # comma to falsely negate an unrelated, genuinely-unhedged later request
+  # (ga-dpas3r attempt 3, gate_run=ga-yydf1o, reproduced with both "sem
+  # duvida," and "evitar retrabalho,"). "nem" shares the identical shape
+  # ("nem tudo, provisionar conta..." binds to "tudo", not the trigger) so it
+  # moves here too even though the reviewer's repro didn't name it — same
+  # class of leak, not just the two cited words. Adjacent, no-comma usage
+  # ("sem criar conta", "evitar provisionar conta", "nem provisionar conta")
+  # still negates correctly, because with no comma present the tight
+  # sub-clause equals the full clause.
+  tight="${clause##*,}"
+  tight_padded=" ${tight//[:;()]/ } "
+  case "$tight_padded" in
+    *" sem "*|*" nem "*|*" evite "*|*" evitar "*)
       echo "yes"; return ;;
   esac
   echo "no"

@@ -473,6 +473,41 @@ fi
   && ok "ga-dpas3r attempt 2: 2nd, genuine 'provisionar conta' request after a negated 1st → exec:manual (fix1 end-to-end)" || bad "ga-dpas3r REGRESSION: genuine 2nd occurrence after a negated 1st stayed exec:auto (fix1 end-to-end)"
 [ "$(context_check_exec_class "guardrail de escopo" "Nunca, em hipotese alguma, criar conta nova para este robo.")" = "exec:auto" ] \
   && ok "ga-dpas3r attempt 2: comma-qualified 'Nunca, em hipotese alguma,' prohibition → exec:auto (fix2 end-to-end)" || bad "ga-dpas3r REGRESSION: comma right after negation word over-tagged exec:manual (fix2 end-to-end)"
+# 10g0d — ga-dpas3r attempt 3 (gate_run=ga-yydf1o): "sem"/"evitar"/"evite" are a
+#        preposition/verb that takes the WORD IMMEDIATELY FOLLOWING them as its
+#        own object — unlike "nunca"/"não"/"jamais" (pure adverbs, no object of
+#        their own), that object can be a different, EARLIER thing than the
+#        trigger phrase later in the same comma-delimited sentence. "sem duvida,"
+#        negates "duvida", not a genuine request appearing after the comma; same
+#        for "evitar retrabalho,". Both silently downgraded a real request to
+#        exec:auto before this fix.
+[ "$(context_check_negated "sem duvida, criar conta nova para o parceiro." "criar conta")" = "no" ] \
+  && ok "context_check_negated: 'sem duvida,' does not reach across the comma to negate an unrelated later phrase (ga-dpas3r attempt 3)" || bad "context_check_negated REGRESSION: 'sem duvida,' falsely negated an unrelated later phrase (ga-dpas3r attempt 3)"
+[ "$(context_check_negated "evitar retrabalho, provisionar conta de servico agora." "provisionar conta")" = "no" ] \
+  && ok "context_check_negated: 'evitar retrabalho,' does not reach across the comma to negate an unrelated later phrase (ga-dpas3r attempt 3)" || bad "context_check_negated REGRESSION: 'evitar retrabalho,' falsely negated an unrelated later phrase (ga-dpas3r attempt 3)"
+# Class fix, not just the two cited words: "nem" (quantifier — "nem tudo") has
+# the identical shape (binds to the word right after it, e.g. "tudo", not a
+# later trigger) and was NOT named in the gate feedback, but ships the same fix
+# pre-emptively rather than waiting for a third report of the same bug family.
+[ "$(context_check_negated "nem tudo esta definido, provisionar conta e o proximo passo." "provisionar conta")" = "no" ] \
+  && ok "context_check_negated: 'nem tudo,' does not reach across the comma to negate an unrelated later phrase (class fix, ga-dpas3r attempt 3)" || bad "context_check_negated REGRESSION: 'nem tudo,' falsely negated an unrelated later phrase (class fix, ga-dpas3r attempt 3)"
+# Regression: adjacent (no comma) usage of all three must still negate — the
+# tightened scope must not lose the true positives this whole fix protects.
+[ "$(context_check_negated "sem criar conta nenhuma, resolva localmente" "criar conta")" = "yes" ] \
+  && ok "context_check_negated: 'sem criar conta' (adjacent, no comma before the phrase) still negates" || bad "context_check_negated REGRESSION: adjacent 'sem' stopped negating"
+[ "$(context_check_negated "evite provisionar conta sem necessidade real" "provisionar conta")" = "yes" ] \
+  && ok "context_check_negated: 'evite provisionar conta' (adjacent, no comma before the phrase) still negates" || bad "context_check_negated REGRESSION: adjacent 'evite' stopped negating"
+[ "$(context_check_negated "nem provisionar conta seria necessario aqui" "provisionar conta")" = "yes" ] \
+  && ok "context_check_negated: 'nem provisionar conta' (adjacent, no comma before the phrase) still negates" || bad "context_check_negated REGRESSION: adjacent 'nem' stopped negating"
+# 10g0e — same cases, end-to-end through exec_class (title+desc, real case).
+[ "$(context_check_exec_class "pipeline" "Sem dúvida, criar conta nova para o parceiro.")" = "exec:manual" ] \
+  && ok "ga-dpas3r attempt 3: 'Sem duvida, criar conta...' genuine request → exec:manual (end-to-end)" || bad "ga-dpas3r REGRESSION: 'Sem duvida, criar conta...' genuine request stayed exec:auto (end-to-end)"
+[ "$(context_check_exec_class "pipeline" "Evitar retrabalho, provisionar conta de serviço agora.")" = "exec:manual" ] \
+  && ok "ga-dpas3r attempt 3: 'Evitar retrabalho, provisionar conta...' genuine request → exec:manual (end-to-end)" || bad "ga-dpas3r REGRESSION: 'Evitar retrabalho, provisionar conta...' genuine request stayed exec:auto (end-to-end)"
+[ "$(context_check_exec_class "pipeline" "Nem tudo esta definido, provisionar conta e o proximo passo.")" = "exec:manual" ] \
+  && ok "ga-dpas3r attempt 3: 'Nem tudo, provisionar conta...' genuine request → exec:manual (class fix, end-to-end)" || bad "ga-dpas3r REGRESSION: 'Nem tudo, provisionar conta...' genuine request stayed exec:auto (class fix, end-to-end)"
+[ "$(context_check_exec_class "guardrail" "Sem criar conta, resolva localmente.")" = "exec:auto" ] \
+  && ok "ga-dpas3r attempt 3: 'Sem criar conta,' (adjacent prohibition) → exec:auto (end-to-end)" || bad "ga-dpas3r REGRESSION: adjacent 'Sem criar conta,' prohibition over-tagged exec:manual (end-to-end)"
 # 10g — ga-dpas3r: a PROHIBITION must not tip exec:manual just because its
 #       trigger substring occurs inside it — "nunca criar conta" contains
 #       "criar conta" but FORBIDS it, the opposite of a request (wa-vrs3g).
