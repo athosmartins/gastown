@@ -133,7 +133,10 @@ while IFS= read -r row; do
   # dispatcher's label_fallback), so a marker that worked under the old
   # behavior keeps working.
   DESC=$(printf '%s' "$row" | jq -r '.description // ""')
-  RIG=$(printf '%s\n' "$DESC" | sed -n 's/^rig:[ \t]*\(.*\)$/\1/p' | head -1)
+  # ga-b1djxn: [[:space:]], not a bracketed backslash-t — BSD sed (macOS) reads
+  # that bracket as {space, backslash, t}, so a rig named "tmux" came out as
+  # "mux" and the marker was misfiled as ILEGÍVEL ("rig não resolveu").
+  RIG=$(printf '%s\n' "$DESC" | sed -n 's/^rig:[[:space:]]*\(.*\)$/\1/p' | head -1)
   if [ -z "$RIG" ]; then
     RIG=$(printf '%s' "$row" | jq -r '[.labels[]?|select(startswith("bead-rig:"))|sub("^bead-rig:";"")]|first // ""')
   fi

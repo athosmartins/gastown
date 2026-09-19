@@ -2373,12 +2373,18 @@ gate_bead_sibling_status_lines() {
     desc=$(printf '%s' "$sib" | jq -r '.description // ""' 2>/dev/null || echo "")
     branch=$(printf '%s\n' "$labels" | tr ' ' '\n' | sed -n 's/^branch:\(.*\)$/\1/p' | head -1)
     if [ -z "$branch" ]; then
-      branch=$(printf '%s\n' "$desc" | sed -n 's/^branch:[ \t]*\(.*\)$/\1/p' | head -1)
+      # ga-b1djxn: the separator class MUST be [[:space:]]. On macOS (BSD sed)
+      # a backslash-t inside a bracket expression is NOT a tab — the bracket
+      # became {space, backslash, t}, which ate the leading t's of the value
+      # ("test/x" -> "est/x") and never stripped a real tab.
+      branch=$(printf '%s\n' "$desc" | sed -n 's/^branch:[[:space:]]*\(.*\)$/\1/p' | head -1)
     fi
     [ -z "$branch" ] && continue
     # ga-cc0xu0: rig: has no label form (only bead-rig:, wrong semantics —
     # see this function's header comment) — description-only.
-    rig=$(printf '%s\n' "$desc" | sed -n 's/^rig:[ \t]*\(.*\)$/\1/p' | head -1)
+    # ga-b1djxn: [[:space:]], same reason as the branch fallback above
+    # (a rig named "tmux" was read as "mux").
+    rig=$(printf '%s\n' "$desc" | sed -n 's/^rig:[[:space:]]*\(.*\)$/\1/p' | head -1)
     # ga-7fwt1: route through marker_status_from_labels() (defined above in
     # this same file) instead of a bare `head -1`. A sibling mid-transition
     # through one of ga-7fwt1's now-fixed add-before-remove sites (or any
