@@ -8,14 +8,19 @@
 #
 #   L1  low priority: absolute, inherited, never lowers, never stacks, kill switches, fail-open, set -e safe
 #   L2  single-flight lock: mutual exclusion (a real 6-way race), wait-then-acquire, bounded wait -> rc 75
-#       "NOT RUN", stale / recycled-pid owners reclaimed, live owners never stolen from, unknown != dead,
-#       fail-open when the lock cannot be created, re-entrancy, release only your own lock, SIGTERM release
+#       "NOT RUN", stale / recycled-pid owners reclaimed, live owners never stolen from — not even when owner
+#       and waiter run in DIFFERENT locales / timezones (ps renders lstart through the caller's LC_* / TZ),
+#       and not when ps PRINTS a good start time but exits non-zero (the value is the evidence, not the
+#       status) — unknown != dead, fail-open when the lock cannot be created or a stale one cannot be removed
+#       (never announced as reclaimed, never an endless retry, also under a caller's set -euo pipefail),
+#       re-entrancy, release only your own lock, SIGTERM release
 #   L2b gate callers (reviewers) never queue for the lock — they run the suite twice per review inside a
 #       verdict timeout already sized for it — but take it when free, so builders yield to the gate
 #   L3  wiring: pilot-dispatcher.selftest.sh and story-delivery.sh actually use it (a helper nobody sources
 #       protects nothing)
 #   L4  end to end: the REAL pilot selftest refuses (rc 75, no scenario run) while the lock is held, and
-#       holds — then releases on a kill — the lock while it runs
+#       holds — then releases on a timeout kill — the lock while it runs (timeout's group kill can cut bash's
+#       EXIT trap short now and then: a clean release within 3 kills, and no residue that wedges the next run)
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -55,13 +60,14 @@ child() {
 
 wait_file() { local f="$1" n="$2" i=0; while [ ! -e "$f" ] && [ "$i" -lt $((n * 10)) ]; do sleep 0.1; i=$((i+1)); done; [ -e "$f" ]; }
 
-# hold NAME SECS — a background process that takes the lock, signals it holds it, sleeps, stamps the time,
-# then releases (the stamp comes FIRST so a waiter can never be observed acquiring "before" it).
+# hold NAME SECS [ENV=VAL…] — a background process that takes the lock, signals it holds it, sleeps, stamps
+# the time, then releases (the stamp comes FIRST so a waiter can never be observed acquiring "before" it).
+# The optional assignments give the HOLDER its own locale / timezone (see the L2 locale-and-TZ cases).
 HOLDER_PID=""
 hold() {
-  local name="$1" secs="$2"
+  local name="$1" secs="$2"; shift 2
   rm -f "$W/held.$name" "$W/released.$name"
-  env -i PATH="$PATH" HOME="$W" TMPDIR="$W" HSG_GUARD="$GUARD" GC_HEAVY_LOCK_ROOT="$ROOT" SELFTEST_LOCK_POLL_SECS=0.1 \
+  env -i PATH="$PATH" HOME="$W" TMPDIR="$W" HSG_GUARD="$GUARD" GC_HEAVY_LOCK_ROOT="$ROOT" SELFTEST_LOCK_POLL_SECS=0.1 ${1+"$@"} \
     bash -c ". \"\$HSG_GUARD\"; heavy_selftest_lock $name; echo \$\$ > \"$W/held.$name\"; sleep $secs; date +%s > \"$W/released.$name\"; heavy_selftest_release" >/dev/null 2>&1 &
   HOLDER_PID=$!
   wait_file "$W/held.$name" 10
@@ -160,6 +166,97 @@ hold u 6
 SHIM_PATH="$W/shim-ps:$PATH" child SELFTEST_LOCK_WAIT_SECS=0 -- 'heavy_selftest_lock u; echo SHOULD-NOT-REACH'
 [ "$CRC" -eq 75 ] && ok "with ps unusable the owner state is UNKNOWN, treated as busy — never stolen on a blind ps" || bad "lock stolen while ps was broken: rc=$CRC out=[$CO]"
 kill "$HOLDER_PID" 2>/dev/null; wait "$HOLDER_PID" 2>/dev/null
+
+echo "  — ps that PRINTS a good start time but exits non-zero: the value is the evidence, the exit status is not —"
+# Measured 2026-09-19 (load ~35): reading a just-born process's start time through `LC_ALL=C TZ=UTC ps` as a bash
+# prefix assignment exited NON-ZERO in ~5-8% of runs although ps had printed the right value; the guard's
+# `v="$(ps ...)" || v=""` then threw the value away. Read on the OWNER side that empty start time means "cannot
+# record who holds the lock" (the suite runs UNGUARDED); read on the WAITER side, from the owner's pid, it means
+# "owner is dead" and a LIVE lock is destroyed. The shim runs the real ps, then exits 1 — for every pid
+# (SHIM_RC_PID=ALL) or only for one (SHIM_RC_PID=<pid>), so the waiter's own start-time self-check still works and
+# only the OWNER's read is affected.
+mkdir -p "$W/shim-psrc"
+cat > "$W/shim-psrc/ps" <<'SHIM'
+#!/bin/bash
+/bin/ps "$@"; rc=$?
+pid=""; while [ "$#" -gt 0 ]; do case "$1" in -p) pid="${2:-}" ;; esac; shift; done
+case "${SHIM_RC_PID:-}" in ALL) exit 1 ;; "") ;; *) [ "$pid" = "$SHIM_RC_PID" ] && exit 1 ;; esac
+exit $rc
+SHIM
+chmod +x "$W/shim-psrc/ps"
+SHIM_PATH="$W/shim-psrc:$PATH" child SHIM_RC_PID=ALL -- 'heavy_selftest_lock psrc; L="$GC_HEAVY_LOCK_ROOT/psrc.lock"; grep -q "^pid=$$\$" "$L/owner" && echo HELD; grep -q "^lstart=.\+" "$L/owner" && echo HAS-LSTART; heavy_selftest_release'
+[ "$CRC" -eq 0 ] && [ "$CO" = "HELD
+HAS-LSTART" ] && ok "a ps that printed the start time but exited 1 still gives a proper owner record (the printed value is used)" || bad "rc=$CRC out=[$CO] err=[$(printf '%s' "$CE" | head -2)]"
+case "$CE" in *UNGUARDED*) bad "the good start time was thrown away and the suite ran UNGUARDED: [$(printf '%s' "$CE" | head -1)]" ;; *) ok "…and it never fell open to UNGUARDED over a non-zero exit status" ;; esac
+hold psr 6
+SHIM_PATH="$W/shim-psrc:$PATH" child SELFTEST_LOCK_WAIT_SECS=0 SHIM_RC_PID="$(cat "$W/held.psr")" -- 'heavy_selftest_lock psr; echo SHOULD-NOT-REACH'
+if [ "$CRC" -eq 75 ] && [ -z "$CO" ]; then ok "a LIVE owner whose start time is read through a ps that exits 1 is still alive (busy, rc 75), not stale"; else bad "rc=$CRC out=[$CO] err=[$(printf '%s' "$CE" | head -2)]"; fi
+case "$CE" in *"reclaimed"*) bad "a live owner's lock was reclaimed over a non-zero ps exit status: [$(printf '%s' "$CE" | head -1)]" ;; *) ok "…and no reclaim was announced" ;; esac
+kill "$HOLDER_PID" 2>/dev/null; wait "$HOLDER_PID" 2>/dev/null
+
+echo "  — a LIVE owner is alive to every participant, whatever locale / timezone each one runs in —"
+# `ps -o lstart=` renders through the CALLER's locale (LC_ALL / LC_TIME / LANG) and TZ, so ONE live process has a
+# different start-time string in every environment ("Sat Sep 19 17:02:46 2026", "sáb 19 set 17:02:46 2026",
+# "Sat Sep 19 20:02:46 2026" under TZ=UTC). The lock records the owner's string and a DIFFERENT process compares
+# it later: read in two environments, a live owner is judged dead, its lock is destroyed and the waiter runs
+# beside it — single-flight silently stops being single (the gate's finding on ga-rj7b1a). Every other case in
+# this file runs under env -i (no LC_* / TZ), so both sides always shared one representation and the suite was
+# blind to exactly this input. Here the owner and the waiter deliberately DIFFER.
+LSPROBE_PT="$(env -i PATH="$PATH" LC_ALL=pt_BR.UTF-8 ps -p $$ -o lstart= 2>/dev/null)"
+LSPROBE_C="$(env -i PATH="$PATH" LC_ALL=C ps -p $$ -o lstart= 2>/dev/null)"
+LZ=0
+# "OWNER-ENV|WAITER-ENV" (space-separated assignments; empty = the bare env -i default). A TZ pair always bites
+# (UTC and Tokyo are 9 h apart); a locale pair only bites where pt_BR.UTF-8 really renders differently.
+for pair in "TZ=UTC|TZ=Asia/Tokyo" "TZ=Asia/Tokyo|TZ=UTC" "LC_ALL=pt_BR.UTF-8|LC_ALL=C" "LC_ALL=C|LC_ALL=pt_BR.UTF-8" "|LC_ALL=pt_BR.UTF-8 TZ=Asia/Tokyo"; do
+  LZ=$((LZ + 1)); oenv="${pair%%|*}"; wenv="${pair#*|}"; nm="lz$LZ"
+  case "$pair" in
+    LC_ALL=*) if [ -z "$LSPROBE_PT" ] || [ "$LSPROBE_PT" = "$LSPROBE_C" ]; then skip "pt_BR.UTF-8 renders lstart like C on this host — the locale pair [$pair] cannot bite"; continue; fi ;;
+  esac
+  hold "$nm" 8 $oenv
+  if [ ! -s "$W/held.$nm" ]; then bad "[$pair] the holder never took the lock"; kill "$HOLDER_PID" 2>/dev/null; wait "$HOLDER_PID" 2>/dev/null; continue; fi
+  hpid="$(cat "$W/held.$nm")"
+  child SELFTEST_LOCK_WAIT_SECS=0 $wenv -- "heavy_selftest_lock $nm; echo SHOULD-NOT-REACH"
+  if [ "$CRC" -eq 75 ] && [ -z "$CO" ]; then ok "owner [${oenv:-default}] vs waiter [${wenv:-default}]: the LIVE owner is busy (rc 75), not stale"; else bad "owner [${oenv:-default}] vs waiter [${wenv:-default}]: rc=$CRC out=[$CO] err=[$(printf '%s' "$CE" | head -2)]"; fi
+  case "$CE" in *"reclaimed"*) bad "[$pair] announced a reclaim of a LIVE owner's lock: [$(printf '%s' "$CE" | head -1)]" ;; *) ok "…and never claims to have reclaimed a live owner's lock" ;; esac
+  if kill -0 "$hpid" 2>/dev/null && [ -f "$ROOT/$nm.lock/owner" ]; then ok "…and the owner is still alive with its lock intact"; else bad "[$pair] the live owner lost its lock (or died)"; fi
+  rec="$(sed -n 's/^lstart=//p' "$ROOT/$nm.lock/owner" 2>/dev/null | head -1)"
+  raw="$(env -i PATH="$PATH" LC_ALL=C TZ=UTC ps -p "$hpid" -o lstart= 2>/dev/null)"
+  if [ -n "$rec" ] && [ "$rec" = "${raw//  / }" ]; then ok "…and the start time on record is the canonical (C / UTC) reading, whatever the owner's own environment"; else bad "[$pair] recorded start time [$rec] is not the canonical [${raw//  / }]"; fi
+  kill "$HOLDER_PID" 2>/dev/null; wait "$HOLDER_PID" 2>/dev/null
+done
+
+echo "  — a stale lock that cannot be removed: never announced as reclaimed, never an endless loop —"
+# _hsg_reclaim used to `rm -rf "$lock" || true`, then announce "reclaimed" and return success whether or not
+# the directory was still there; the caller retried at once — no sleep, no wait bound — so a lock that could
+# not be removed spun forever printing a claim that was false on every turn. The shim fails every rm of a
+# *.lock path (a persistent permission / filesystem failure); a timeout stops the OLD code's spin from
+# hanging this suite, and would show up as rc 124.
+mkdir -p "$W/shim-rm"
+cat > "$W/shim-rm/rm" <<'SHIM'
+#!/bin/bash
+for a in "$@"; do last="$a"; done
+case "$last" in *.lock) exit 1 ;; esac
+exec /bin/rm "$@"
+SHIM
+chmod +x "$W/shim-rm/rm"
+DEAD_RF="$(bash -c 'echo $$')"
+mkdir -p "$ROOT/rf.lock"
+printf 'pid=%s\nlstart=Mon Jan  1 00:00:00 2001\nsince=1\ncmd=x\n' "$DEAD_RF" > "$ROOT/rf.lock/owner"
+S=$(date +%s)
+SHIM_PATH="$W/shim-rm:$PATH" NICE_PREFIX="timeout 15" child SELFTEST_LOCK_WAIT_SECS=0 -- 'heavy_selftest_lock rf; echo CONTINUED'
+E=$(( $(date +%s) - S ))
+if [ "$CRC" -eq 0 ] && [ "$CO" = "CONTINUED" ] && [ "$E" -le 5 ]; then ok "a stale lock that cannot be removed fails OPEN after one try (took ${E}s), no endless retry loop"; else bad "rc=$CRC out=[$CO] took ${E}s err=[$(printf '%s' "$CE" | head -2)]"; fi
+case "$CE" in *"could not remove"*"UNGUARDED"*) ok "…and says so, UNGUARDED, loudly" ;; *) bad "silent or wrong fail-open: [$(printf '%s' "$CE" | head -2)]" ;; esac
+case "$CE" in *"reclaimed"*) bad "it CLAIMED to have reclaimed a lock it could not remove: [$(printf '%s' "$CE" | head -1)]" ;; *) ok "…and never claims a reclaim that did not happen" ;; esac
+# The same two paths under a caller's `set -euo pipefail` (the pilot selftest and story-delivery are sourced by
+# scripts that use it): a non-zero status inside the guard — _hsg_reclaim now returns 2 — must never abort them.
+mkdir -p "$ROOT/se1.lock" "$ROOT/se2.lock"
+for l in se1 se2; do printf 'pid=%s\nlstart=Mon Jan  1 00:00:00 2001\nsince=1\ncmd=x\n' "$DEAD_RF" > "$ROOT/$l.lock/owner"; done
+child SELFTEST_LOCK_WAIT_SECS=0 -- 'set -euo pipefail; heavy_selftest_lock se1; echo LOCKED; heavy_selftest_release; echo RELEASED'
+[ "$CRC" -eq 0 ] && [ "$CO" = "LOCKED
+RELEASED" ] && ok "reclaiming a stale lock, then acquiring and releasing, survives the caller's set -euo pipefail" || bad "rc=$CRC out=[$CO] err=[$(printf '%s' "$CE" | head -2)]"
+SHIM_PATH="$W/shim-rm:$PATH" NICE_PREFIX="timeout 15" child SELFTEST_LOCK_WAIT_SECS=0 -- 'set -euo pipefail; heavy_selftest_lock se2; echo CONTINUED'
+[ "$CRC" -eq 0 ] && [ "$CO" = "CONTINUED" ] && ok "…and so does the cannot-remove path (status 2): it fails open instead of aborting the caller" || bad "rc=$CRC out=[$CO] err=[$(printf '%s' "$CE" | head -2)]"
 
 echo "  — fail-open, re-entrancy, ownership, signals —"
 child GC_HEAVY_LOCK_ROOT=/dev/null/nope -- 'heavy_selftest_lock f; echo CONTINUED'
@@ -294,17 +391,43 @@ if [ -f "$PILOT_SELFTEST" ] && grep -q 'heavy_selftest_guard pilot-dispatcher' "
   ! grep -qE '✓|✗|Scenario|passed' "$W/p4.out" && ok "and ran no scenario at all (stdout has no assertions)" || bad "it ran scenarios despite the lock: $(head -3 "$W/p4.out")"
   kill "$H4" 2>/dev/null; wait "$H4" 2>/dev/null
 
-  rm -rf "$ROOT4"; mkdir -p "$ROOT4"
-  env -i PATH="$PATH" HOME="$W" TMPDIR="$W" GC_HEAVY_LOCK_ROOT="$ROOT4" timeout 12 bash "$PILOT_SELFTEST" > "$W/p5.out" 2> "$W/p5.err" &
-  P5=$!
-  if wait_file "$ROOT4/pilot-dispatcher.lock/owner" 10; then
-    owner="$(sed -n 's/^pid=//p' "$ROOT4/pilot-dispatcher.lock/owner")"
-    kill -0 "$owner" 2>/dev/null && ok "a free lock is taken by the running suite (owner pid $owner is the suite)" || bad "owner pid $owner is not alive"
+  # `timeout` signals the child AND its whole process group, so bash can be handed SIGTERM twice and — by its own
+  # rule for a repeated terminating signal — die AT ONCE, without finishing its EXIT trap. Measured 2026-09-19 at
+  # load ~35: a script whose only content is `trap 'sleep .3; echo done > f' EXIT; sleep 30` left f unwritten in
+  # 2 of 60 `timeout` kills, with no guard code anywhere near it — and a strict one-shot "the lock must be gone"
+  # here flaked once in ~8 full runs. So the trap is NOT guaranteed to finish, and a residual lock is not by
+  # itself a wiring defect. What must hold is (a) the EXIT-trap wiring really releases the lock: at least one of
+  # up to 3 kills ends clean (a wiring that never releases leaks all 3), and (b) whatever a killed run does leave
+  # behind never WEDGES the next one: its owner is dead, so the next run reclaims it at once.
+  KILL_CLEAN=0; KILL_TRY=0; KILL_WEDGED=0; KILL_NOTAKEN=0
+  while [ "$KILL_CLEAN" -eq 0 ] && [ "$KILL_TRY" -lt 3 ]; do
+    KILL_TRY=$((KILL_TRY + 1))
+    rm -rf "$ROOT4"; mkdir -p "$ROOT4"
+    env -i PATH="$PATH" HOME="$W" TMPDIR="$W" GC_HEAVY_LOCK_ROOT="$ROOT4" timeout 12 bash "$PILOT_SELFTEST" > "$W/p5.out" 2> "$W/p5.err" &
+    P5=$!
+    if wait_file "$ROOT4/pilot-dispatcher.lock/owner" 10; then
+      owner="$(sed -n 's/^pid=//p' "$ROOT4/pilot-dispatcher.lock/owner")"
+      if [ "$KILL_TRY" -eq 1 ]; then kill -0 "$owner" 2>/dev/null && ok "a free lock is taken by the running suite (owner pid $owner is the suite)" || bad "owner pid $owner is not alive"; fi
+    else
+      # never let "no lock because the suite never got that far" pass as "no lock because it released it"
+      bad "the running suite never took the lock (try $KILL_TRY)"; KILL_NOTAKEN=1; wait "$P5" 2>/dev/null; break
+    fi
+    wait "$P5" 2>/dev/null
+    if [ ! -d "$ROOT4/pilot-dispatcher.lock" ]; then
+      KILL_CLEAN=1
+    else
+      child GC_HEAVY_LOCK_ROOT="$ROOT4" SELFTEST_LOCK_WAIT_SECS=0 -- 'heavy_selftest_lock pilot-dispatcher; echo GOT; heavy_selftest_release'
+      { [ "$CRC" -eq 0 ] && [ "$CO" = "GOT" ]; } || KILL_WEDGED=1
+    fi
+  done
+  if [ "$KILL_NOTAKEN" -eq 1 ]; then
+    :   # already reported above
+  elif [ "$KILL_CLEAN" -eq 1 ] && [ "$KILL_WEDGED" -eq 0 ]; then
+    if [ "$KILL_TRY" -eq 1 ]; then ok "killed by timeout mid-run, it releases the lock (EXIT trap) — nothing left to reclaim"
+    else ok "killed by timeout mid-run, it releases the lock (EXIT trap) — clean on try $KILL_TRY; timeout's group kill had cut the earlier trap short and that residue was reclaimed at once"; fi
   else
-    bad "the running suite never took the lock"
+    bad "lock leaked after a timeout kill (clean release: $KILL_CLEAN after $KILL_TRY tries; a residue wedged the next run: $KILL_WEDGED)"
   fi
-  wait "$P5" 2>/dev/null
-  [ ! -d "$ROOT4/pilot-dispatcher.lock" ] && ok "killed by timeout mid-run, it releases the lock (EXIT trap) — nothing left to reclaim" || bad "lock leaked after a timeout kill"
 else
   bad "pilot-dispatcher.selftest.sh is not wired to the guard yet — the end-to-end cases were NOT run (they would launch the whole 20-30 min suite unguarded)"
 fi
