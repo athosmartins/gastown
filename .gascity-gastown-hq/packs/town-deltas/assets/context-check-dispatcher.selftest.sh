@@ -508,6 +508,31 @@ fi
   && ok "ga-dpas3r attempt 3: 'Nem tudo, provisionar conta...' genuine request → exec:manual (class fix, end-to-end)" || bad "ga-dpas3r REGRESSION: 'Nem tudo, provisionar conta...' genuine request stayed exec:auto (class fix, end-to-end)"
 [ "$(context_check_exec_class "guardrail" "Sem criar conta, resolva localmente.")" = "exec:auto" ] \
   && ok "ga-dpas3r attempt 3: 'Sem criar conta,' (adjacent prohibition) → exec:auto (end-to-end)" || bad "ga-dpas3r REGRESSION: adjacent 'Sem criar conta,' prohibition over-tagged exec:manual (end-to-end)"
+# 10g0f — ga-dpas3r attempt 4 (gate_run=ga-2n0g4c): the preceding fixes all
+#        assumed title+desc arrive already ASCII-foldable, but `tr 'A-Z' 'a-z'`
+#        only maps single-byte ASCII — an uppercase ACCENTED letter's UTF-8
+#        bytes pass through untouched ("NÃO" → "nÃo"), and a curly/smart
+#        apostrophe (U+2019, what phone/editor autocorrect substitutes for a
+#        typed one) never equals the ASCII "'" the "don't"/"can't" literals
+#        use. Both silently fell through to exec:auto for a genuine
+#        prohibition/negation this fix exists to detect — the exact
+#        wa-vrs3g class again, reached via a Unicode form instead of a
+#        wording gap this time.
+[ "$(context_check_exec_class "guardrail de escopo" "NÃO criar conta nova em nenhum servico externo durante este bug fix")" = "exec:auto" ] \
+  && ok "ga-dpas3r attempt 4: accented-uppercase 'NÃO criar conta' (prohibition) → exec:auto (reviewer repro 1)" || bad "ga-dpas3r REGRESSION: accented-uppercase 'NÃO' prohibition over-tagged exec:manual (reviewer repro 1)"
+[ "$(context_check_exec_class "guardrail" "We don’t create a new account automatically here, ever.")" = "exec:auto" ] \
+  && ok "ga-dpas3r attempt 4: curly-quote 'don’t' (U+2019) prohibition → exec:auto (reviewer repro 2)" || bad "ga-dpas3r REGRESSION: curly-quote 'don’t' prohibition over-tagged exec:manual (reviewer repro 2)"
+[ "$(context_check_exec_class "guardrail" "We can’t create a new account automatically here.")" = "exec:auto" ] \
+  && ok "ga-dpas3r attempt 4: curly-quote 'can’t' (sibling negator, same mechanism) → exec:auto" || bad "ga-dpas3r REGRESSION: curly-quote 'can’t' prohibition over-tagged exec:manual"
+# Class fix, not just the cited "NÃO"/"don't": the accent fold is a single
+# shared preprocessing step, so it also reaches accented literals OUTSIDE
+# the negation-word list — §4's business-decision gate — for an all-caps
+# title/desc, and a genuine (non-negated) accented-uppercase request must
+# still tip exec:manual, proving the fold didn't just make everything auto.
+[ "$(context_check_exec_class "F11 inbound" "BLOQUEADO EM DECISÃO DE CUSTO: opção gratuita vs paga")" = "exec:manual" ] \
+  && ok "ga-dpas3r attempt 4: accented-uppercase 'DECISÃO DE CUSTO' (§4, outside negation list) still tips exec:manual" || bad "ga-dpas3r REGRESSION: accented-uppercase §4 phrase stopped matching after the fold"
+[ "$(context_check_exec_class "pipeline" "CRIAR CONTA NOVA PARA O PARCEIRO, JÁ")" = "exec:manual" ] \
+  && ok "ga-dpas3r attempt 4: genuine accented-uppercase request (no negation) still tips exec:manual (not over-corrected to always-auto)" || bad "ga-dpas3r REGRESSION: accented-uppercase genuine request wrongly fell to exec:auto"
 # 10g — ga-dpas3r: a PROHIBITION must not tip exec:manual just because its
 #       trigger substring occurs inside it — "nunca criar conta" contains
 #       "criar conta" but FORBIDS it, the opposite of a request (wa-vrs3g).

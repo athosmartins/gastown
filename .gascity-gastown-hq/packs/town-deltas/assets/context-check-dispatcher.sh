@@ -764,6 +764,52 @@ context_check_any_unnegated() {
 context_check_exec_class() {
   local t
   t=$(printf '%s\n%s' "${1:-}" "${2:-}" | tr 'A-Z' 'a-z')
+  # Fold what the ASCII-only tr above cannot reach (ga-dpas3r attempt 4,
+  # gate_run=ga-2n0g4c): `tr 'A-Z' 'a-z'` only maps single-byte ASCII, so an
+  # uppercase accented letter's UTF-8 bytes pass through untouched — "NÃO"
+  # becomes "nÃo", not "não", and matches neither the "não" nor the "nao"
+  # literal below. That's not just a negation-word gap: EVERY accented
+  # literal phrase this classifier matches on (§4's "aprovação", "decisão",
+  # "presença física") has the identical failure for an all-caps title/desc.
+  # Fixed once here, upstream of every section, rather than per call site.
+  #
+  # Locale-independent on purpose: this daemon runs under launchd with NO
+  # LANG/LC_ALL set (com.gascity.context-check-dispatcher.plist's
+  # EnvironmentVariables omits both), i.e. the C locale — verified live
+  # (`env -i PATH="$PATH" HOME="$HOME" bash -c '...'`, matching that exact
+  # plist environment) that in this state `iconv -t ASCII//TRANSLIT`
+  # mistransliterates ("NÃO" → "N~AO", not "NAO") and a locale-aware
+  # `tr '[:upper:]' '[:lower:]'`/`awk tolower()` would not fold multibyte
+  # UTF-8 either — the C locale has no multibyte concept. Bash's literal
+  # `${var//X/Y}` substring substitution, by contrast, works on the raw
+  # UTF-8 bytes regardless of locale (same mechanism the file's own
+  # literal non-ASCII case patterns, e.g. *" não "*, already rely on) —
+  # confirmed empirically under the exact bare launchd environment above.
+  # Covers the Portuguese/Spanish accented letters reachable via this
+  # classifier's own phrase lists; does NOT handle NFD (decomposed,
+  # combining-mark) Unicode input — no report has shown that form in
+  # practice, and bead text arrives NFC (human editors, browsers, and
+  # other Claude agents all emit NFC), so this is a known, documented
+  # non-goal, not a silent gap.
+  t="${t//Á/á}"; t="${t//À/à}"; t="${t//Â/â}"; t="${t//Ã/ã}"; t="${t//Ä/ä}"
+  t="${t//É/é}"; t="${t//È/è}"; t="${t//Ê/ê}"; t="${t//Ë/ë}"
+  t="${t//Í/í}"; t="${t//Ì/ì}"; t="${t//Î/î}"; t="${t//Ï/ï}"
+  t="${t//Ó/ó}"; t="${t//Ò/ò}"; t="${t//Ô/ô}"; t="${t//Õ/õ}"; t="${t//Ö/ö}"
+  t="${t//Ú/ú}"; t="${t//Ù/ù}"; t="${t//Û/û}"; t="${t//Ü/ü}"
+  t="${t//Ç/ç}"; t="${t//Ñ/ñ}"
+  # Normalize curly/smart single-quote variants to the ASCII apostrophe the
+  # "don't"/"can't" literals below use (ga-dpas3r attempt 4, reviewer repro:
+  # U+2019 RIGHT SINGLE QUOTATION MARK — the glyph phone/editor autocorrect
+  # substitutes for a typed plain apostrophe, sibling of the already-tested
+  # straight-quote and no-apostrophe spellings). Same root cause as the
+  # accent fold above: a Unicode form the original ASCII-only preprocessing
+  # never anticipated. Routed through a helper var, not a literal `'` inside
+  # ${t//pattern/replacement} — a bare quote there desyncs bash's own quote
+  # balancing (confirmed: it silently swallowed unrelated later script text
+  # as string data instead of erroring — caught only by re-running the exec-
+  # class output, not by `bash -n`, which stayed clean throughout).
+  local sq="'"
+  t="${t//’/$sq}"; t="${t//‘/$sq}"
   # 1a. PHYSICAL device / hardware / physical proxy — unambiguous standalone.
   #    "phone-as-Claro-mobile-proxy" (physical phone), SIM swaps, hardware proxies,
   #    explicit "human must touch it" phrasing. ga-s16ob: bare device NOUNS
