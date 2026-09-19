@@ -1407,8 +1407,16 @@ gap2_wait_active_marker() {
   # stay silent on the no-op path, same convention as its siblings
   # (gap2_arm_needs_remerge, gap2_free_refused_stranded) just above.
   [ "$marker_hit" = "$prev_wait_state" ] && return 0
-  bd -C "$GC_CITY" comment "$bead_id" "ga-pa36 GAP-2 reconciler: sling bead $sling_id gate-passed+closed; parent's own fix not yet independently verified in origin/main, but an ACTIVE quality-gate-marker ($marker_hit) is currently processing it — still queued for review, not abandoned. No labels changed; will re-check next sweep. (ga-4tgga; comment deduped per marker/gate-status — ga-crgfa0)" 2>/dev/null || true
-  bd -C "$GC_CITY" update "$bead_id" --set-metadata "gap2.waiting_marker=$marker_hit" -q 2>/dev/null || true
+  # GATE-FEEDBACK (gate_run=ga-fcvvoi): only stamp the dedup marker when the
+  # comment itself actually posted. bd comment can fail transiently — this
+  # file discards stderr on nearly every bd call precisely because Dolt is
+  # documented-fragile — and stamping the metadata unconditionally would make
+  # a failed post look "already announced" to every later sweep, silently
+  # and PERMANENTLY losing the notification instead of just delaying it to
+  # the next sweep the way the pre-dedup code did.
+  if bd -C "$GC_CITY" comment "$bead_id" "ga-pa36 GAP-2 reconciler: sling bead $sling_id gate-passed+closed; parent's own fix not yet independently verified in origin/main, but an ACTIVE quality-gate-marker ($marker_hit) is currently processing it — still queued for review, not abandoned. No labels changed; will re-check next sweep. (ga-4tgga; comment deduped per marker/gate-status — ga-crgfa0)" 2>/dev/null; then
+    bd -C "$GC_CITY" update "$bead_id" --set-metadata "gap2.waiting_marker=$marker_hit" -q 2>/dev/null || true
+  fi
 }
 
 # gap2_skip_no_changes <bead_id> <sling_id> <no_changes_token> <prev_state> —
@@ -1430,8 +1438,13 @@ gap2_skip_no_changes() {
   local state="$sling_id:$no_changes_token"
   # No log() call here — see gap2_wait_active_marker's doc-comment above.
   [ "$state" = "$prev_state" ] && return 0
-  bd -C "$GC_CITY" comment "$bead_id" "ga-pa36 GAP-2 reconciler (ga-hr44j): sling bead $sling_id closed with a no-delivery close_reason (matched \"$no_changes_token\") — a sling closing this way means the worker found nothing to build, which is the opposite of a completed review, not a variant of one. Leaving story:in-flight/pilot:dispatched/all labels untouched rather than closing or re-arming (na duvida, nao fechar); will re-check next sweep in case a later sling terminates differently. (comment deduped per sling — ga-crgfa0)" 2>/dev/null || true
-  bd -C "$GC_CITY" update "$bead_id" --set-metadata "gap2.no_changes_announced=$state" -q 2>/dev/null || true
+  # GATE-FEEDBACK (gate_run=ga-fcvvoi): same fix as gap2_wait_active_marker
+  # above — only stamp the dedup marker when the comment itself actually
+  # posted, so a transient bd-comment failure just retries next sweep
+  # instead of permanently, silently suppressing the notification.
+  if bd -C "$GC_CITY" comment "$bead_id" "ga-pa36 GAP-2 reconciler (ga-hr44j): sling bead $sling_id closed with a no-delivery close_reason (matched \"$no_changes_token\") — a sling closing this way means the worker found nothing to build, which is the opposite of a completed review, not a variant of one. Leaving story:in-flight/pilot:dispatched/all labels untouched rather than closing or re-arming (na duvida, nao fechar); will re-check next sweep in case a later sling terminates differently. (comment deduped per sling — ga-crgfa0)" 2>/dev/null; then
+    bd -C "$GC_CITY" update "$bead_id" --set-metadata "gap2.no_changes_announced=$state" -q 2>/dev/null || true
+  fi
 }
 
 # gap2_apply_pass_verdict <bead_id> <sling_id> <is_story_approved> <verdict> —
