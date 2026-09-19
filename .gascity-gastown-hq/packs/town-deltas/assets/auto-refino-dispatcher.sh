@@ -448,7 +448,7 @@ auto_refino_has_lifecycle_label() {
   echo "no"
 }
 
-# auto_refino_is_ingestable_raw <id> <issue_type> <labels_csv> <ephemeral> <exclude_labels> <age_minutes> <min_age_minutes> <assignee> <has_children> <has_refino_metadata>
+# auto_refino_is_ingestable_raw <id> <issue_type> <labels_csv> <ephemeral> <exclude_labels> <age_minutes> <min_age_minutes> <assignee> <has_children> <has_refino_metadata> <has_athos_acao>
 #   Emit "yes" iff this bead is a RAW Triagem story eligible for AUTO-INGESTION
 #   into the funnel — i.e. it qualifies the way the painel's _qualifies_for_triagem
 #   does, restricted to the funnel's product-story scope. ALL must hold:
@@ -511,12 +511,26 @@ auto_refino_has_lifecycle_label() {
 #           once at refino time is untouched by any of those label-clearing
 #           paths, so it is the first POSITIVE, not-label-based signal that
 #           this bead was already refined.
+#         - has_athos_acao="yes" (caller MUST compute via `bd show <id>
+#           --json` / the candidate row's own `.metadata` checking whether the
+#           `athos.acao` key is non-empty) → this bead is parked in Athos's
+#           own decision queue (REGRA Nº 3: the painel-visible "O QUE VOCÊ
+#           FAZ" field), independent of its CURRENT label state (bug
+#           ga-kuve7h, wa-bpnty 19/09: `story:approved` was stripped for a
+#           ~6h window and the RAW sweep re-ingested the bead as a fresh idea,
+#           opening a duplicate refinement task). exec:manual and any
+#           next-action:* label are the same signal in label form — checked
+#           directly against `labels` below, no extra param needed — but a
+#           label can be transiently cleared the same way story:* can;
+#           athos.acao is the label-independent positive signal, same
+#           rationale as has_refino_metadata above.
 #   Status (open) is enforced at the query level (--status open), exactly as the
 #   labelled queries already are; this pure predicate covers the rest.
 auto_refino_is_ingestable_raw() {
   local id="$1" itype="$2" labels="$3" ephemeral="$4" ex="${5:-}"
   local age_min="${6:-}" min_age="${7:-0}"
   local assignee="${8:-}" has_children="${9:-no}" has_refino_metadata="${10:-no}"
+  local has_athos_acao="${11:-no}"
   # Sanitize like auto_refino_next_attempt: garbage/empty age_min fails OPEN
   # (treated as ancient, i.e. never age-excluded) so a missing/unparseable
   # updated_at can never silently starve the RAW funnel. Garbage min_age
@@ -564,6 +578,19 @@ auto_refino_is_ingestable_raw() {
   # also drops these; classifier-side defense in depth). csv is comma-wrapped
   # so *,prefix* matches any label starting with prefix.
   case "$csv" in *,blocked:*|*,needs-human*|*,pilot:held*|*,blocked-on:*|*,pool:refused:*) echo "no"; return ;; esac
+  # parked in Athos's own decision queue (REGRA Nº 3; bug ga-kuve7h, wa-bpnty
+  # 19/09): exec:manual and any next-action:* label mean a human decision is
+  # already surfaced and pending in Athos's queue — the RAW sweep must never
+  # treat that as an untriaged idea (the RAW jq query also drops these;
+  # classifier-side defense in depth).
+  case "$csv" in *,exec:manual,*|*,next-action:*) echo "no"; return ;; esac
+  # same signal, metadata form (bug ga-kuve7h): a bead can lose exec:manual/
+  # next-action:* labels transiently (the exact wa-bpnty race: story:approved
+  # was stripped for a ~6h window) while athos.acao metadata — written once
+  # when the bead was routed to Athos's queue — survives untouched, same
+  # rationale as has_refino_metadata being a label-independent positive
+  # signal above.
+  [ "$has_athos_acao" = "yes" ] && { echo "no"; return; }
   # too-freshly-mutated (ga-51ry): this bead was updated inside the last
   # min_age minutes — likely mid a non-atomic recovery transition (a
   # story:*/gate:* protective label was JUST cleared and the replacement has
@@ -1210,6 +1237,20 @@ if [ "$AUTO_REFINO_INGEST_RAW_TRIAGEM" = "1" ]; then
         startswith("pilot:held") or startswith("blocked-on:") or
         startswith("pool:refused:")
       ))) | not))
+    # Drop beads parked in the Athos decision queue (REGRA No 3; bug
+    # ga-kuve7h, wa-bpnty 19/09): exec:manual and any next-action:* label mean
+    # a human decision is already surfaced and pending — re-ingesting as a
+    # fresh idea re-asks a question already routed to Athos, the exact defect
+    # that produced the duplicate task wa-wisp-4b1w3v. Mirrors the
+    # classifier-side guard in auto_refino_is_ingestable_raw (defense in depth).
+    | map(select(((.labels // []) | any(. == "exec:manual")) | not))
+    | map(select(((.labels // []) | any(type=="string" and startswith("next-action:"))) | not))
+    # Same signal, metadata form. Unlike has_refino_metadata/has_children
+    # above (genuinely classifier-only — they need a live per-row `bd show`/
+    # `bd children` call this pure jq layer cannot make), athos.acao IS
+    # present in this bulk `bd list --json` payload (verified empirically
+    # against a live bead, 2026-09-19), so it can be filtered here directly.
+    | map(select((((.metadata // {})["athos.acao"] // "") | tostring | length) == 0))
     # Drop beads mutated too recently (ga-51ry, 3rd occurrence wa-soe8a): a
     # manual/automated recovery transition (e.g. the Mayor clearing
     # gate:needs-human to retry) can clear the LAST protective story:*/gate:*
@@ -1250,6 +1291,14 @@ while IFS= read -r row; do
   c_labels=$(_labels_csv "$row")
   c_assignee=$(echo "$row" | jq -r '.assignee // empty')
   c_ephemeral=$(echo "$row" | jq -r 'if (.ephemeral // false)==true then "true" else "false" end')
+  # athos.acao (bug ga-kuve7h): pure jq read of the already-fetched row, no
+  # live call — safe to compute eagerly for every candidate, unlike
+  # c_has_children/c_has_refino_metadata below (deliberately lazy, real `bd`
+  # calls, only for the one candidate that reaches the raw-ingest branch).
+  c_has_athos_acao="no"
+  if echo "$row" | jq -e '(((.metadata // {})["athos.acao"] // "") | tostring | length) > 0' >/dev/null 2>&1; then
+    c_has_athos_acao="yes"
+  fi
   # Age since last update, in minutes (ga-51ry RAW min-age guard input). Same
   # BSD/GNU date-parsing fallback as the TTL-recovery pass above; unparseable
   # timestamp → epoch 0 → huge age → guard fails open (never age-excludes).
@@ -1319,7 +1368,7 @@ while IFS= read -r row; do
             ' >/dev/null 2>&1; then
           c_has_refino_metadata="yes"
         fi
-        if [ "$(auto_refino_is_ingestable_raw "$c_id" "$c_type" "$c_labels" "$c_ephemeral" "$AUTO_REFINO_EXCLUDE_LABELS" "$c_age_min" "$AUTO_REFINO_RAW_MIN_AGE_MINUTES" "$c_assignee" "$c_has_children" "$c_has_refino_metadata")" = "yes" ]; then
+        if [ "$(auto_refino_is_ingestable_raw "$c_id" "$c_type" "$c_labels" "$c_ephemeral" "$AUTO_REFINO_EXCLUDE_LABELS" "$c_age_min" "$AUTO_REFINO_RAW_MIN_AGE_MINUTES" "$c_assignee" "$c_has_children" "$c_has_refino_metadata" "$c_has_athos_acao")" = "yes" ]; then
           STORY="$row"; RAW_INGEST=1
           log "  ingest $c_id: raw Triagem story (no story:* label) → applying story:unrefined entry label"
           break

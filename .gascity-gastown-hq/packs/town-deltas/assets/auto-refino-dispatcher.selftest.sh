@@ -1645,7 +1645,7 @@ if grep -qF 'map(select(((.assignee // "") | length) == 0))' "$DISPATCHER" \
    && grep -qF '*,refino:policy-gap,*) echo "no"' "$DISPATCHER" \
    && grep -qF 'bd_ children "$c_id" --json' "$DISPATCHER" \
    && grep -qF 'bd_ show "$c_id" --json' "$DISPATCHER" \
-   && grep -qF '"$c_assignee" "$c_has_children" "$c_has_refino_metadata")' "$DISPATCHER"; then
+   && grep -qF '"$c_assignee" "$c_has_children" "$c_has_refino_metadata" "$c_has_athos_acao")' "$DISPATCHER"; then
   ok "16b. claimed/split/escalated guard present in jq filter (assignee+policy-gap) AND classifier (all 3 + has_children + has_refino_metadata wiring) (bug ga-blron, ga-mk6ve)"
 else
   bad "16b. claimed/split/escalated guard missing from jq filter or classifier wiring — occurrences 1-4 (or the 9th, ga-mk6ve) can re-form"
@@ -1870,6 +1870,86 @@ if grep -qF 'c_orphan_age_min=$(auto_refino_orphan_age_min "$c_upd_epoch" "$c_ag
   ok "20g. the classify loop derives c_orphan_age_min via the fail-closed clamp, not raw c_age_min directly"
 else
   bad "20g. c_orphan_age_min is not derived via auto_refino_orphan_age_min — epoch-0 fallback can reclaim on an unknown age again"
+fi
+
+# ── Scenario 21 (bug ga-kuve7h): RAW sweep must not swallow a bead already
+#    parked in Athos's own decision queue (REGRA No 3). wa-bpnty (feature
+#    aprovada, mockup entregue, exec:manual + athos.acao metadata) lost its
+#    story:approved label for a ~6h window (22:25Z-04:43Z, 19/09) and the RAW
+#    sweep — which only ever checked for the PRESENCE of a story:* label, not
+#    for any of the other three signals that mean "already surfaced to
+#    Athos" — treated it as a brand-new idea, applied story:unrefined, and
+#    opened a duplicate refinement task (wa-wisp-4b1w3v). Three independent
+#    signals, each of which must exclude on its own (any one can be
+#    transiently cleared without the others, same shape as the story:approved
+#    race that caused this bug in the first place):
+#      - exec:manual label
+#      - any next-action:* label (next-action:athos*, next-action:mayor, ...)
+#      - athos.acao metadata non-empty (NEW 11th OPTIONAL trailing param,
+#        same backward-compat convention as has_refino_metadata/has_children)
+EX="scraper build infra config deploy migration pipeline"
+echo "Scenario 21 (ga-kuve7h): Athos-queue guard — exec:manual / next-action:* / athos.acao all exclude RAW ingestion"
+
+# (a) exec:manual label alone — the exact wa-bpnty shape.
+[ "$(auto_refino_is_ingestable_raw "wa-bpnty" "feature" "ctx:ready,exec:manual" "false" "$EX")" = "no" ] \
+  && ok "(a) exec:manual label (wa-bpnty shape) → no (Athos's queue respected)" \
+  || bad "(a) exec:manual label → expected no (wa-bpnty regression would re-form)"
+
+# (b) any next-action:* label, including the athos/mayor-targeted variants.
+[ "$(auto_refino_is_ingestable_raw "wa-x1" "feature" "ctx:ready,next-action:athos-decide" "false" "$EX")" = "no" ] \
+  && ok "(b) next-action:athos-decide → no" \
+  || bad "(b) next-action:athos-decide → expected no"
+[ "$(auto_refino_is_ingestable_raw "wa-x2" "feature" "next-action:mayor" "false" "$EX")" = "no" ] \
+  && ok "(b) next-action:mayor (prefix match, not athos-specific) → no" \
+  || bad "(b) next-action:mayor → expected no"
+
+# Anchoring: a label that merely CONTAINS "next-action" without the colon
+# prefix must NOT trip the guard — same comma-bounded-prefix discipline as
+# the Scenario 15 "unblocked-reason" near-miss check.
+[ "$(auto_refino_is_ingestable_raw "wa-x3" "feature" "next-actionable,frontend" "false" "$EX")" = "yes" ] \
+  && ok "(b) next-actionable (near-miss, not a real next-action: label) → yes (no false-positive over-reject)" \
+  || bad "(b) near-miss substring label → expected yes (funnel over-rejected)"
+
+# (c) athos.acao metadata alone — no exec:manual/next-action label at all
+#     (proves the metadata guard is independent, not just piggybacking on the
+#     label checks — exactly the gap a story:approved-style label race opens).
+[ "$(auto_refino_is_ingestable_raw "wa-y1" "feature" "ctx:ready" "false" "$EX" "" "" "" "" "no" "yes")" = "no" ] \
+  && ok "(c) athos.acao metadata alone, no matching label → no (label-independent positive signal)" \
+  || bad "(c) athos.acao metadata alone → expected no"
+[ "$(auto_refino_is_ingestable_raw "ga-fresh9" "feature" "frontend" "false" "$EX")" = "yes" ] \
+  && ok "(c) has_athos_acao param omitted → yes (backward-compat default, funnel not starved)" \
+  || bad "(c) omitted has_athos_acao → expected yes"
+[ "$(auto_refino_is_ingestable_raw "ga-fresh9" "feature" "frontend" "false" "$EX" "" "" "" "" "no" "no")" = "yes" ] \
+  && ok "(c) has_athos_acao=no explicit → yes" \
+  || bad "(c) has_athos_acao=no explicit → expected yes"
+
+# (d) the exact wa-bpnty shape with BOTH signals present at once (real-world
+#     shape: exec:manual label AND athos.acao metadata together).
+[ "$(auto_refino_is_ingestable_raw "wa-bpnty" "feature" "ctx:ready,exec:manual" "false" "$EX" "" "" "" "" "no" "yes")" = "no" ] \
+  && ok "(d) exec:manual label + athos.acao metadata together (full wa-bpnty shape) → no" \
+  || bad "(d) full wa-bpnty shape → expected no"
+
+# Regression: a genuinely raw story with none of these three signals is
+# still ingested — the RAW-ingestion fix's original starvation guarantee
+# must not return.
+[ "$(auto_refino_is_ingestable_raw "ga-fresh10" "feature" "frontend" "false" "$EX")" = "yes" ] \
+  && ok "genuine raw story (no Athos-queue signal) → still yes (funnel not starved)" \
+  || bad "genuine raw story → expected yes (starvation regression)"
+
+# 21b. Drift-guard: all three signals present in BOTH the RAW jq filter and
+#      the is_ingestable_raw classifier — defense in depth, same structure as
+#      15b/16b/18b above.
+if grep -qF 'case "$csv" in *,exec:manual,*|*,next-action:*) echo "no"; return ;; esac' "$DISPATCHER" \
+   && grep -qF '[ "$has_athos_acao" = "yes" ] && { echo "no"; return; }' "$DISPATCHER" \
+   && grep -qF 'has_athos_acao="${11:-no}"' "$DISPATCHER" \
+   && grep -qF 'map(select(((.labels // []) | any(. == "exec:manual")) | not))' "$DISPATCHER" \
+   && grep -qF 'any(type=="string" and startswith("next-action:"))' "$DISPATCHER" \
+   && grep -qF '(((.metadata // {})["athos.acao"] // "") | tostring | length) == 0' "$DISPATCHER" \
+   && grep -qF 'c_has_athos_acao="no"' "$DISPATCHER" \
+   && grep -qF '"$c_has_refino_metadata" "$c_has_athos_acao")' "$DISPATCHER"; then
+  ok "21b. Athos-queue guard (exec:manual + next-action:* + athos.acao) present in BOTH the RAW jq filter and classifier, and wired into the live call site (bug ga-kuve7h)"
+else
+  bad "21b. Athos-queue guard missing from jq filter, classifier, or the live call-site wiring — wa-bpnty-shape re-ingestion can re-form"
 fi
 
 echo ""
