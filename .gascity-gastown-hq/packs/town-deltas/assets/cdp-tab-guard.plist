@@ -15,10 +15,12 @@
        swap 6->10 GB -> disk 10->2 GB. chrome_cdp_watchdog.sh caps `ps rss`, blind to
        compressed memory, and recycles the WHOLE Chrome when it does fire.
 
-       Cost of one run, measured 2026-09-19 at load average ~30: 0.2-0.4 s wall, ~0.2 s CPU,
+       Cost of one run, measured 2026-09-19 at load average 30-36: 0.2-0.6 s wall, ~0.2 s CPU,
        no CDP connection (it only talks to Chrome when a heavy+idle renderer exists). The
-       heavy path can take up to ~2 min on a starved box; the script holds a single-instance
-       flock, so an overlapping launchd start exits at once ("SKIP locked").
+       heavy path can take up to ~2 min on a starved box (a hard 120 s alarm ends it); the
+       script holds a single-instance flock, so an overlapping launchd start exits at once
+       ("SKIP locked"). Every knob is an env var (CDP_TAB_GUARD_*, listed in the script header);
+       none is set here, so the defaults apply: armed, 1536 MB ceiling, 10 min idle.
 
        KILL SWITCH (stops closing without unloading the job; it keeps logging WOULD_CLOSE):
            touch /Users/athos/gt/.gascity-gastown-hq/.gc/cdp-tab-guard/DISABLED
