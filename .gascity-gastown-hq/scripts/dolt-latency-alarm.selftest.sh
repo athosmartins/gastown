@@ -17,6 +17,19 @@
 #   4. Full-sweep integration: cold-start min-samples gate, alarm-on-transition,
 #      no-duplicate-notify while still degraded, clear-on-recovery, kill switch,
 #      lock contention (live holder skips / dead holder reclaims)
+#   5. (ga-0k78d4) Dolt scheduling-priority (nice) detector — the three states
+#      ok / alarm / unknown, at four levels:
+#        5a. proc_nice against the REAL ps on real processes, checked against the
+#            kernel's own getpriority(2) (read through python, not through ps)
+#        5b. proc_nice's parse contract (padding, sign, empty, garbage, multi-line)
+#        5c. dolt_nice_state classification (incl. "no live Dolt" and "ps broken")
+#        5d. full ticks through the REAL script (not SOURCE_ONLY): one alarm per
+#            episode, clear on recovery, healthy = silent, unknown != ok, unknown
+#            never clears an active alarm, kill switch, independence from the
+#            latency alarm (separate markers, and a failing latency probe does not
+#            stop the nice check)
+#      Every tick's log goes to a scratch file (DOLT_LATENCY_ALARM_LOG) so nothing
+#      here writes fake ALARM/CLEARED lines into the live log.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,8 +52,11 @@ WORK=$(mktemp -d)
 # running this test happens to have one -- is harmless; its PID just never
 # matches and that candidate is correctly rejected.)
 sleep 300 & DLA_REAL_PID=$!
+# ga-0k78d4: extra long-lived helpers (section 5a spawns two); reaped by the trap below
+# even if the run is interrupted, so a stray `sleep 300` cannot outlive the test.
+DLA_EXTRA_PIDS=""
 
-trap 'kill "$DLA_REAL_PID" 2>/dev/null; rm -rf "$WORK"' EXIT
+trap 'kill "$DLA_REAL_PID" $DLA_EXTRA_PIDS 2>/dev/null; rm -rf "$WORK"' EXIT
 
 REAL_PYTHON3="$(command -v python3)"
 
@@ -108,6 +124,13 @@ cat > "$STUBS/ps" <<'STUB'
 pid=""
 for a in "$@"; do case "$a" in [0-9]*) pid="$a" ;; esac; done
 case " $* " in
+  # ga-0k78d4: `ps -o ni= -p PID` (matched by substring, not by argv position, so a flag
+  # inserted before it cannot silently route it to the wrong branch). Real ps pads the
+  # value ("[ 0]" measured live), so the default reply is padded too.
+  *"ni="*)
+    [ "${DLA_PS_FAIL:-0}" = "1" ] && exit 1                                  # ps broken: no output, rc 1
+    [ -n "${DLA_PS_NI_RAW+x}" ] && { printf '%s\n' "$DLA_PS_NI_RAW"; exit 0; }  # verbatim override (garbage / multi-line)
+    printf '%3s\n' "${DLA_PS_NI:-0}" ;;
   *"%cpu"*) echo "0.0" ;;
   *) if [ -n "${DLA_PGREP_PID:-}" ] && [ "$pid" = "${DLA_PGREP_PID:-}" ]; then echo "dolt"; else echo "?"; fi ;;
 esac
@@ -238,15 +261,25 @@ STUB
 chmod +x "$NOTIFY_STUB"
 
 run_tick() {  # run_tick — one script invocation with the stub PATH + isolated state
+  # ga-0k78d4: TICK_LOG -> a scratch log (default /dev/null, so no tick ever writes into the
+  # live log); DLA_PS_NI / DLA_PS_FAIL drive the ps stub; TICK_NO_DOLT=1 -> pgrep finds no
+  # server; DLA_GC_UNREACHABLE / DLA_PY_FAIL fail the latency probes. All explicit, all
+  # defaulted, so a knob set for one scenario cannot leak into the next.
+  local _dolt_pid="$DLA_REAL_PID"
+  [ "${TICK_NO_DOLT:-0}" = "1" ] && _dolt_pid=""
   PATH="$STUBS:$PATH" \
     GC_BIN="$STUBS/gc" \
     DOLT_LATENCY_ALARM_STATE_DIR="$TICK_STATE" \
+    DOLT_LATENCY_ALARM_LOG="${TICK_LOG:-/dev/null}" \
     DOLT_LATENCY_ALARM_ENABLED="${TICK_ENABLED:-1}" \
     NOTIFY_CALLS="$NOTIFY_CALLS" \
     GC_CALLS="$GC_CALLS" \
-    DLA_PGREP_PID="$DLA_REAL_PID" DLA_LISTEN_PORT=52756 \
+    DLA_PGREP_PID="$_dolt_pid" DLA_LISTEN_PORT=52756 \
     DLA_GC_LATENCY_MS="${DLA_GC_LATENCY_MS:-150}" \
     DLA_CONN_COUNT="${DLA_CONN_COUNT:-2}" \
+    DLA_PS_NI="${DLA_PS_NI:-0}" DLA_PS_FAIL="${DLA_PS_FAIL:-0}" \
+    DLA_GC_UNREACHABLE="${DLA_GC_UNREACHABLE:-0}" DLA_PY_FAIL="${DLA_PY_FAIL:-0}" \
+    DOLT_NICE_UNKNOWN_NOTIFY_AFTER="${DLA_NICE_NOTIFY_AFTER:-}" \
     bash "$SCRIPT" >/dev/null 2>&1
 }
 
@@ -284,9 +317,9 @@ DLA_CONN_COUNT=2 DLA_GC_LATENCY_MS=900 run_tick
 DLA_CONN_COUNT=2 DLA_GC_LATENCY_MS=900 run_tick
 DLA_CONN_COUNT=2 DLA_GC_LATENCY_MS=900 run_tick
 [ -s "$NOTIFY_CALLS" ] && ok "latency-only (conns healthy at 2): alarm fires on latency alone" || nope "latency-only degradation should have alarmed"
-# (Not asserting against $LOG content: LOG uses the hardcoded CITY path, same
-# awkward-to-isolate tradeoff dolt-hang-watchdog.selftest.sh's own header notes —
-# the notify-call assertion above already fully proves this tick's decision.)
+# (Not asserting against the log here: the notify-call assertion above already fully
+# proves this tick's decision. The log IS assertable now -- run_tick points it at
+# TICK_LOG via DOLT_LATENCY_ALARM_LOG -- and section 5 does assert on it.)
 
 # 4f. kill switch: degraded readings still detected (state updates) but never notify
 TICK_STATE="$WORK/sweep-e"; mkdir -p "$TICK_STATE"
@@ -313,6 +346,249 @@ mkdir -p "$TICK_STATE/dolt-latency-alarm.lock.d"
 echo "$deadpid" > "$TICK_STATE/dolt-latency-alarm.lock.d/pid"
 DLA_CONN_COUNT=50 DLA_GC_LATENCY_MS=900 run_tick
 [ -s "$TICK_STATE/dolt-latency-alarm.conn-window" ] && ok "lock: dead holder PID → reclaimed, tick proceeded" || nope "dead-holder lock should have been reclaimed"
+
+# ══ 5. (ga-0k78d4) Dolt scheduling-priority (nice) detector ═════════════════════════
+# The why is in the SECOND SIGNAL block of dolt-latency-alarm.sh's header. Three states, never
+# collapsed: ok (nice 0) / alarm (nice != 0) / unknown (could not read -- and that is NOT nice 0).
+
+expect_line() {  # expect_line FILE EXACT-LINE DESCRIPTION — pass iff FILE holds EXACT-LINE verbatim
+  if grep -qxF -- "$2" "$1" 2>/dev/null; then ok "$3"; else nope "$3 [want: $2 | got: $(grep -F -- "${2%%=*}=" "$1" 2>/dev/null | head -1)]"; fi
+}
+ncalls() {  # ncalls FILE PATTERN — how many lines of FILE match PATTERN (0 when none, or FILE missing)
+  local _n
+  _n="$(grep -c -- "$2" "$1" 2>/dev/null)" || true
+  echo "${_n:-0}"
+}
+nice_scenario() {  # nice_scenario NAME — fresh isolated state + notify log + detector log for one scenario
+  TICK_STATE="$WORK/nice-$1"; mkdir -p "$TICK_STATE"
+  NOTIFY_CALLS="$WORK/nice-$1.notify"; GC_CALLS="$WORK/nice-$1.gc"; TICK_LOG="$WORK/nice-$1.log"
+  : > "$NOTIFY_CALLS"; : > "$GC_CALLS"; : > "$TICK_LOG"
+}
+
+# 5a. proc_nice against the REAL ps, on REAL processes (no ps stub on PATH), checked against the
+# kernel's own answer -- getpriority(2), read through python: an independent path. The expected
+# value is asked of the kernel and never hard-coded: zsh runs a background job at nice +5
+# (BG_NICE) and `nice -n 15` ADDS to its parent's nice (clamped at 20), so a literal 0 or 15
+# would be wrong on some runner.
+kernel_nice() {  # kernel_nice PID — PID's nice per getpriority(2); empty when unreadable
+  "$REAL_PYTHON3" -c 'import os,sys; print(os.getpriority(os.PRIO_PROCESS, int(sys.argv[1])))' "$1" 2>/dev/null
+}
+sleep 300 & DLA_NICE_P0=$!
+nice -n 15 sleep 300 & DLA_NICE_P15=$!
+DLA_EXTRA_PIDS="$DLA_NICE_P0 $DLA_NICE_P15"
+# `nice` applies its priority a moment AFTER the fork: wait (bounded) until the kernel reports it,
+# so the comparison below cannot race the setpriority call.
+_i=0
+while [ "$_i" -lt 60 ]; do
+  _k="$(kernel_nice "$DLA_NICE_P15")"
+  { [ -n "$_k" ] && [ "$_k" -ge 15 ]; } 2>/dev/null && break
+  sleep 0.1; _i=$((_i+1))
+done
+( : ) & DLA_NICE_GONE=$!; wait "$DLA_NICE_GONE" 2>/dev/null   # spawn+reap: a PID that WAS live and is not anymore
+STATE5A="$WORK/state-nice-real"; mkdir -p "$STATE5A"
+(
+  export DOLT_LATENCY_ALARM_SOURCE_ONLY=1 DOLT_LATENCY_ALARM_STATE_DIR="$STATE5A"
+  # shellcheck disable=SC1090
+  source "$SCRIPT"
+  declare -f proc_nice >/dev/null 2>&1 && echo "defined=yes" || echo "defined=no"
+  echo "plain_proc=$(proc_nice "$DLA_NICE_P0")"
+  echo "plain_kernel=$(kernel_nice "$DLA_NICE_P0")"
+  echo "niced_proc=$(proc_nice "$DLA_NICE_P15")"
+  echo "niced_kernel=$(kernel_nice "$DLA_NICE_P15")"
+  _g="$(proc_nice "$DLA_NICE_GONE")"; _grc=$?
+  echo "gone=[$_g] rc=$_grc"
+  _g="$(proc_nice 99999999)"; _grc=$?
+  echo "toolarge=[$_g] rc=$_grc"
+) > "$WORK/nice-real.out" 2>&1
+nice_field() { sed -n "s/^$1=//p" "$WORK/nice-real.out" | head -1; }
+expect_line "$WORK/nice-real.out" "defined=yes" "5a: proc_nice is defined by the script (SOURCE_ONLY reaches it)"
+_pp="$(nice_field plain_proc)"; _pk="$(nice_field plain_kernel)"
+{ [ -n "$_pk" ] && [ "$_pp" = "$_pk" ]; } && ok "5a: real ps, plain process: proc_nice ($_pp) == kernel getpriority ($_pk)" || nope "5a: plain process: proc_nice='$_pp' kernel='$_pk'"
+_np="$(nice_field niced_proc)"; _nk="$(nice_field niced_kernel)"
+{ [ -n "$_nk" ] && [ "$_np" = "$_nk" ] && [ "$_nk" -ge 15 ]; } 2>/dev/null && ok "5a: real ps, 'nice -n 15' process: proc_nice ($_np) == kernel ($_nk) and >= 15 (the reading is not vacuously 0)" || nope "5a: niced process: proc_nice='$_np' kernel='$_nk' (want equal, and >= 15)"
+expect_line "$WORK/nice-real.out" "gone=[] rc=1" "5a: a PID that was live and is gone → prints nothing, rc 1 (unreadable — never 0)"
+expect_line "$WORK/nice-real.out" "toolarge=[] rc=1" "5a: a PID ps rejects outright → prints nothing, rc 1"
+kill "$DLA_NICE_P0" "$DLA_NICE_P15" 2>/dev/null
+wait "$DLA_NICE_P0" "$DLA_NICE_P15" 2>/dev/null   # reap: keeps bash 3.2's "Terminated" job notices out of the log
+DLA_EXTRA_PIDS=""
+
+# 5b. proc_nice's parse contract, driven through the ps stub (DLA_PS_NI = a padded reply, like real
+# ps; DLA_PS_NI_RAW = a verbatim reply; DLA_PS_FAIL = ps exits 1 with no output). Only exactly ONE
+# line holding exactly ONE integer is a nice value. Anything else must print nothing and return 1,
+# and must never be glued into a number.
+STATE5B="$WORK/state-nice-parse"; mkdir -p "$STATE5B"
+(
+  export DOLT_LATENCY_ALARM_SOURCE_ONLY=1 DOLT_LATENCY_ALARM_STATE_DIR="$STATE5B"
+  export PATH="$STUBS:$PATH"
+  # shellcheck disable=SC1090
+  source "$SCRIPT"
+  pn() {  # pn LABEL — proc_nice on a fixed PID; prints "LABEL=[stdout] rc=N" (the stub's reply comes from the caller's DLA_PS_* env)
+    local _o _rc
+    _o="$(proc_nice 4242)"; _rc=$?
+    echo "$1=[$_o] rc=$_rc"
+  }
+  DLA_PS_NI=0   pn pad_zero
+  DLA_PS_NI=15  pn pad_15
+  DLA_PS_NI=-5  pn neg_5
+  DLA_PS_NI=-15 pn neg_15
+  DLA_PS_NI_RAW=""       pn empty_line
+  DLA_PS_NI_RAW="abc"    pn alpha
+  DLA_PS_NI_RAW="1x"     pn digit_then_alpha
+  DLA_PS_NI_RAW="5-"     pn trailing_minus
+  DLA_PS_NI_RAW="--5"    pn double_minus
+  DLA_PS_NI_RAW="-"      pn lone_minus
+  DLA_PS_NI_RAW="+5"     pn plus_sign
+  DLA_PS_NI_RAW="0 15"   pn two_fields
+  DLA_PS_NI_RAW=$'0\n15' pn two_lines
+  DLA_PS_NI_RAW="ps: process id too large: 1" pn error_text_on_stdout
+  DLA_PS_FAIL=1          pn ps_failed
+  _o="$(proc_nice "")"; _rc=$?; echo "no_pid=[$_o] rc=$_rc"
+) > "$WORK/nice-parse.out" 2>&1
+expect_line "$WORK/nice-parse.out" "pad_zero=[0] rc=0"    "5b: padded '  0' → 0, rc 0"
+expect_line "$WORK/nice-parse.out" "pad_15=[15] rc=0"     "5b: padded ' 15' → 15, rc 0"
+expect_line "$WORK/nice-parse.out" "neg_5=[-5] rc=0"      "5b: '-5' → -5 (a negative nice is a value, not an error)"
+expect_line "$WORK/nice-parse.out" "neg_15=[-15] rc=0"    "5b: '-15' → -15"
+expect_line "$WORK/nice-parse.out" "empty_line=[] rc=1"   "5b: an empty reply → nothing, rc 1 (never 0)"
+expect_line "$WORK/nice-parse.out" "alpha=[] rc=1"        "5b: 'abc' → nothing, rc 1"
+expect_line "$WORK/nice-parse.out" "digit_then_alpha=[] rc=1" "5b: '1x' → nothing, rc 1"
+expect_line "$WORK/nice-parse.out" "trailing_minus=[] rc=1"   "5b: '5-' → nothing, rc 1"
+expect_line "$WORK/nice-parse.out" "double_minus=[] rc=1"     "5b: '--5' → nothing, rc 1"
+expect_line "$WORK/nice-parse.out" "lone_minus=[] rc=1"       "5b: a lone '-' → nothing, rc 1"
+expect_line "$WORK/nice-parse.out" "plus_sign=[] rc=1"        "5b: '+5' → nothing, rc 1 (ps never prints a plus; refuse rather than guess)"
+expect_line "$WORK/nice-parse.out" "two_fields=[] rc=1"       "5b: '0 15' (two fields on one line) → nothing, rc 1"
+expect_line "$WORK/nice-parse.out" "two_lines=[] rc=1"        "5b: two lines → nothing, rc 1 (never glued into 015)"
+expect_line "$WORK/nice-parse.out" "error_text_on_stdout=[] rc=1" "5b: an error message that lands on stdout is not a nice value"
+expect_line "$WORK/nice-parse.out" "ps_failed=[] rc=1"        "5b: ps exiting non-zero with no output → nothing, rc 1"
+expect_line "$WORK/nice-parse.out" "no_pid=[] rc=1"           "5b: an empty PID argument → nothing, rc 1"
+
+# 5c. dolt_nice_state — the three-state classification. The PID goes through the REAL
+# dolt_server_pid (only its ps/pgrep/lsof inputs are stubbed).
+STATE5C="$WORK/state-nice-state"; mkdir -p "$STATE5C"
+(
+  export DOLT_LATENCY_ALARM_SOURCE_ONLY=1 DOLT_LATENCY_ALARM_STATE_DIR="$STATE5C"
+  export PATH="$STUBS:$PATH"
+  export DLA_LISTEN_PORT=52756
+  # shellcheck disable=SC1090
+  source "$SCRIPT"
+  echo "ok=$(DLA_PGREP_PID=$DLA_REAL_PID DLA_PS_NI=0 dolt_nice_state)"
+  echo "alarm=$(DLA_PGREP_PID=$DLA_REAL_PID DLA_PS_NI=15 dolt_nice_state)"
+  echo "alarm_negative=$(DLA_PGREP_PID=$DLA_REAL_PID DLA_PS_NI=-5 dolt_nice_state)"
+  echo "no_dolt=$(DLA_PGREP_PID='' dolt_nice_state)"
+  echo "ps_failed=$(DLA_PGREP_PID=$DLA_REAL_PID DLA_PS_FAIL=1 dolt_nice_state)"
+  echo "ps_garbage=$(DLA_PGREP_PID=$DLA_REAL_PID DLA_PS_NI_RAW=abc dolt_nice_state)"
+) > "$WORK/nice-state.out" 2>&1
+expect_line "$WORK/nice-state.out" "ok=ok ni=0 pid=$DLA_REAL_PID"                      "5c: nice 0 → ok"
+expect_line "$WORK/nice-state.out" "alarm=alarm ni=15 pid=$DLA_REAL_PID"               "5c: nice 15 → alarm"
+expect_line "$WORK/nice-state.out" "alarm_negative=alarm ni=-5 pid=$DLA_REAL_PID"      "5c: nice -5 → alarm (any deviation from the default is worth a line)"
+expect_line "$WORK/nice-state.out" "no_dolt=unknown no-live-dolt-server"               "5c: no live Dolt → unknown (not ok, not alarm)"
+expect_line "$WORK/nice-state.out" "ps_failed=unknown nice-unreadable pid=$DLA_REAL_PID"  "5c: Dolt live but ps broken → unknown (NOT ok)"
+expect_line "$WORK/nice-state.out" "ps_garbage=unknown nice-unreadable pid=$DLA_REAL_PID" "5c: Dolt live but ps prints garbage → unknown (NOT ok)"
+
+# 5d. full ticks through the REAL script (a real subprocess, stubbed world).
+RUNBOOK="${DLA_RUNBOOK_PATH:-$SCRIPT_DIR/../docs/runbooks/dolt-priority-nice.md}"
+
+# 5d-1. healthy Dolt (nice 0): silent -- and the tick still ran to the end, so silence is not a crash
+nice_scenario healthy
+run_tick; run_tick; run_tick
+[ -s "$NOTIFY_CALLS" ] && nope "5d healthy (nice 0): must be silent, got: $(cat "$NOTIFY_CALLS")" || ok "5d healthy (nice 0): 3 ticks → no notify"
+{ [ ! -f "$TICK_STATE/dolt-latency-alarm.nice-active" ] && [ ! -f "$TICK_STATE/dolt-latency-alarm.nice-unknown" ]; } && ok "5d healthy: no nice marker written" || nope "5d healthy: a nice marker exists"
+[ "$(ncalls "$TICK_LOG" 'NICE')" = "0" ] && ok "5d healthy: nothing NICE-related in the log" || nope "5d healthy: unexpected NICE log line: $(grep NICE "$TICK_LOG")"
+[ -s "$TICK_STATE/dolt-latency-alarm.conn-window" ] && ok "5d healthy: the tick ran to the end (latency window recorded)" || nope "5d healthy: latency window empty — the tick did not complete"
+
+# 5d-2. nice 15: ONE alarm per episode
+nice_scenario alarm
+DLA_PS_NI=15 run_tick
+[ "$(ncalls "$NOTIFY_CALLS" 'Dolt em prioridade baixa')" = "1" ] && ok "5d alarm: nice 15 → exactly one 'Dolt em prioridade baixa' notify" || nope "5d alarm: notify calls: $(cat "$NOTIFY_CALLS")"
+[ -f "$TICK_STATE/dolt-latency-alarm.nice-active" ] && ok "5d alarm: episode marker written" || nope "5d alarm: episode marker missing"
+grep -q "NICE ALARM" "$TICK_LOG" && ok "5d alarm: logged as NICE ALARM" || nope "5d alarm: no NICE ALARM line in the log"
+grep -q 'docs/runbooks/dolt-priority-nice.md' "$NOTIFY_CALLS" && ok "5d alarm: the notify names the runbook" || nope "5d alarm: the notify does not name the runbook"
+[ -s "$RUNBOOK" ] && ok "5d alarm: the runbook the alert points at exists" || nope "5d alarm: the alert points at docs/runbooks/dolt-priority-nice.md but $RUNBOOK is missing/empty"
+grep -q 'ps -o ni=' "$RUNBOOK" 2>/dev/null && ok "5d alarm: the runbook carries the post-start check (ps -o ni=)" || nope "5d alarm: the runbook lacks the 'ps -o ni=' post-start check"
+DLA_PS_NI=15 run_tick; DLA_PS_NI=15 run_tick
+[ "$(ncalls "$NOTIFY_CALLS" 'Dolt em prioridade baixa')" = "1" ] && ok "5d alarm: 2 more ticks still at nice 15 → no repeat notify (one per episode)" || nope "5d alarm: re-notified inside one episode: $(cat "$NOTIFY_CALLS")"
+
+# 5d-3. recovery, then a NEW episode (continues the same scenario)
+DLA_PS_NI=0 run_tick
+[ "$(ncalls "$NOTIFY_CALLS" 'Dolt voltou a nice 0')" = "1" ] && ok "5d recovery: nice back to 0 → one 'Dolt voltou a nice 0' notify" || nope "5d recovery: notify calls: $(cat "$NOTIFY_CALLS")"
+[ ! -f "$TICK_STATE/dolt-latency-alarm.nice-active" ] && ok "5d recovery: episode marker removed" || nope "5d recovery: episode marker still there"
+grep -q "NICE alarm CLEARED" "$TICK_LOG" && ok "5d recovery: logged as CLEARED" || nope "5d recovery: no CLEARED line in the log"
+DLA_PS_NI=0 run_tick
+[ "$(wc -l < "$NOTIFY_CALLS" | tr -d ' ')" = "2" ] && ok "5d recovery: healthy again → silent (2 notifies in total: alarm + clear)" || nope "5d recovery: unexpected extra notify: $(cat "$NOTIFY_CALLS")"
+DLA_PS_NI=15 run_tick
+[ "$(ncalls "$NOTIFY_CALLS" 'Dolt em prioridade baixa')" = "2" ] && ok "5d recovery: a NEW episode after recovery alarms again" || nope "5d recovery: a second episode did not alarm: $(cat "$NOTIFY_CALLS")"
+
+# 5d-4. unknown != ok: ps broken while Dolt is live
+nice_scenario unknown
+DLA_PS_FAIL=1 run_tick; DLA_PS_FAIL=1 run_tick
+[ ! -s "$NOTIFY_CALLS" ] && ok "5d unknown: 2 unreadable ticks (< threshold 3) → silent" || nope "5d unknown: notified too early: $(cat "$NOTIFY_CALLS")"
+[ ! -f "$TICK_STATE/dolt-latency-alarm.nice-active" ] && ok "5d unknown: unreadable is NOT an alarm (no episode marker)" || nope "5d unknown: unreadable raised the alarm"
+[ "$(cat "$TICK_STATE/dolt-latency-alarm.nice-unknown" 2>/dev/null)" = "2" ] && ok "5d unknown: the unreadable streak is counted (2)" || nope "5d unknown: streak counter = '$(cat "$TICK_STATE/dolt-latency-alarm.nice-unknown" 2>/dev/null)'"
+grep -q "NICE UNKNOWN" "$TICK_LOG" && ok "5d unknown: logged as NICE UNKNOWN" || nope "5d unknown: no NICE UNKNOWN line in the log"
+[ "$(ncalls "$TICK_LOG" 'CLEARED')" = "0" ] && ok "5d unknown: never logged as CLEARED (unreadable is not 'nice 0')" || nope "5d unknown: logged a CLEARED"
+DLA_PS_FAIL=1 run_tick
+[ "$(ncalls "$NOTIFY_CALLS" 'nao consegui ler o nice')" = "1" ] && ok "5d unknown: 3rd consecutive unreadable tick → one 'detector is blind' notify" || nope "5d unknown: notify calls: $(cat "$NOTIFY_CALLS")"
+DLA_PS_FAIL=1 run_tick; DLA_PS_FAIL=1 run_tick
+[ "$(ncalls "$NOTIFY_CALLS" 'nao consegui ler o nice')" = "1" ] && ok "5d unknown: 2 more unreadable ticks → still just the one notify (escalates once)" || nope "5d unknown: repeated the blind notify: $(cat "$NOTIFY_CALLS")"
+[ "$(ncalls "$NOTIFY_CALLS" 'prioridade baixa')" = "0" ] && ok "5d unknown: never raised the nice alarm" || nope "5d unknown: raised the nice alarm: $(cat "$NOTIFY_CALLS")"
+DLA_PS_NI=0 run_tick
+grep -q "NICE readable again after 5 unknown tick" "$TICK_LOG" && ok "5d unknown: a readable tick logs the end of the streak (5)" || nope "5d unknown: no 'readable again' line: $(grep NICE "$TICK_LOG")"
+[ ! -f "$TICK_STATE/dolt-latency-alarm.nice-unknown" ] && ok "5d unknown: the streak counter is removed once readable" || nope "5d unknown: streak counter survived a readable tick"
+
+# 5d-5. unknown must NEVER clear an active alarm (an unreadable Dolt is not a healthy one)
+nice_scenario keeps-alarm
+DLA_PS_NI=15 run_tick
+DLA_PS_FAIL=1 run_tick; DLA_PS_FAIL=1 run_tick; DLA_PS_FAIL=1 run_tick
+[ -f "$TICK_STATE/dolt-latency-alarm.nice-active" ] && ok "5d keeps-alarm: 3 unreadable ticks while alarmed → the alarm marker is NOT cleared" || nope "5d keeps-alarm: unreadable cleared an active alarm"
+[ "$(ncalls "$NOTIFY_CALLS" 'Dolt voltou a nice 0')" = "0" ] && ok "5d keeps-alarm: ...and no 'back to nice 0' notify" || nope "5d keeps-alarm: announced recovery from an unreadable state: $(cat "$NOTIFY_CALLS")"
+DLA_PS_NI=15 run_tick
+[ "$(ncalls "$NOTIFY_CALLS" 'Dolt em prioridade baixa')" = "1" ] && ok "5d keeps-alarm: back to a readable nice 15 → same episode, no re-notify" || nope "5d keeps-alarm: the episode was reset by the unreadable gap: $(cat "$NOTIFY_CALLS")"
+DLA_PS_NI=0 run_tick
+{ [ "$(ncalls "$NOTIFY_CALLS" 'Dolt voltou a nice 0')" = "1" ] && [ ! -f "$TICK_STATE/dolt-latency-alarm.nice-active" ]; } && ok "5d keeps-alarm: only a readable nice 0 clears it" || nope "5d keeps-alarm: final clear missing: $(cat "$NOTIFY_CALLS")"
+
+# 5d-6. no live Dolt at all: unknown as well -- not ok, not alarm
+nice_scenario nodolt
+TICK_NO_DOLT=1 run_tick; TICK_NO_DOLT=1 run_tick; TICK_NO_DOLT=1 run_tick
+{ [ ! -f "$TICK_STATE/dolt-latency-alarm.nice-active" ] && [ "$(cat "$TICK_STATE/dolt-latency-alarm.nice-unknown" 2>/dev/null)" = "3" ]; } && ok "5d no-dolt: no live server → unknown (streak 3), not alarm, not ok" || nope "5d no-dolt: markers wrong (unknown='$(cat "$TICK_STATE/dolt-latency-alarm.nice-unknown" 2>/dev/null)')"
+grep -q "no-live-dolt-server" "$TICK_LOG" && ok "5d no-dolt: the log names the reason" || nope "5d no-dolt: reason missing from the log"
+[ "$(ncalls "$NOTIFY_CALLS" 'nao consegui ler o nice')" = "1" ] && ok "5d no-dolt: the blind-detector notify fires once at the threshold" || nope "5d no-dolt: notify calls: $(cat "$NOTIFY_CALLS")"
+
+# 5d-7. kill switch: still detected, marked and logged -- never notified
+nice_scenario killswitch
+TICK_ENABLED=0 DLA_PS_NI=15 run_tick
+[ ! -s "$NOTIFY_CALLS" ] && ok "5d kill switch (ENABLED=0): the nice alarm never notifies" || nope "5d kill switch: notified anyway: $(cat "$NOTIFY_CALLS")"
+{ [ -f "$TICK_STATE/dolt-latency-alarm.nice-active" ] && grep -q "NICE ALARM" "$TICK_LOG"; } && ok "5d kill switch: the alarm is still tracked and logged" || nope "5d kill switch: the detector went blind with the switch off"
+
+# 5d-8. independence from the latency alarm
+nice_scenario indep-probes-fail
+DLA_GC_UNREACHABLE=1 DLA_PY_FAIL=1 DLA_PS_NI=15 run_tick
+{ [ "$(ncalls "$NOTIFY_CALLS" 'Dolt em prioridade baixa')" = "1" ] && [ -f "$TICK_STATE/dolt-latency-alarm.nice-active" ]; } && ok "5d independence: both latency probes failing does not stop the nice check" || nope "5d independence: nice check lost when the probes fail: $(cat "$NOTIFY_CALLS")"
+
+nice_scenario indep-lat-clears
+for _ in 1 2 3; do DLA_CONN_COUNT=50 DLA_GC_LATENCY_MS=900 DLA_PS_NI=15 run_tick; done
+{ [ -f "$TICK_STATE/dolt-latency-alarm.active" ] && [ -f "$TICK_STATE/dolt-latency-alarm.nice-active" ]; } && ok "5d independence: both alarms can be active at once" || nope "5d independence: setup failed (latency active? $([ -f "$TICK_STATE/dolt-latency-alarm.active" ] && echo y || echo n), nice active? $([ -f "$TICK_STATE/dolt-latency-alarm.nice-active" ] && echo y || echo n))"
+for _ in 1 2 3 4 5; do DLA_CONN_COUNT=2 DLA_GC_LATENCY_MS=150 DLA_PS_NI=15 run_tick; done
+{ [ ! -f "$TICK_STATE/dolt-latency-alarm.active" ] && [ -f "$TICK_STATE/dolt-latency-alarm.nice-active" ]; } && ok "5d independence: the latency alarm clearing does NOT clear the nice alarm" || nope "5d independence: latency clear touched the nice marker"
+{ [ "$(ncalls "$NOTIFY_CALLS" 'Dolt normalizou')" = "1" ] && [ "$(ncalls "$NOTIFY_CALLS" 'Dolt voltou a nice 0')" = "0" ]; } && ok "5d independence: only 'Dolt normalizou' was announced" || nope "5d independence: notify calls: $(cat "$NOTIFY_CALLS")"
+
+nice_scenario indep-nice-clears
+for _ in 1 2 3; do DLA_CONN_COUNT=50 DLA_GC_LATENCY_MS=900 DLA_PS_NI=15 run_tick; done
+DLA_CONN_COUNT=50 DLA_GC_LATENCY_MS=900 DLA_PS_NI=0 run_tick
+{ [ ! -f "$TICK_STATE/dolt-latency-alarm.nice-active" ] && [ -f "$TICK_STATE/dolt-latency-alarm.active" ]; } && ok "5d independence: nice back to 0 clears ONLY the nice alarm — the latency alarm stays" || nope "5d independence: nice clear touched the latency marker"
+{ [ "$(ncalls "$NOTIFY_CALLS" 'Dolt voltou a nice 0')" = "1" ] && [ "$(ncalls "$NOTIFY_CALLS" 'Dolt normalizou')" = "0" ]; } && ok "5d independence: only 'Dolt voltou a nice 0' was announced" || nope "5d independence: notify calls: $(cat "$NOTIFY_CALLS")"
+
+# 5d-9. the DOLT_NICE_UNKNOWN_NOTIFY_AFTER knob: honoured when valid, defaulted (3) when not
+nice_scenario after2
+DLA_NICE_NOTIFY_AFTER=2 DLA_PS_FAIL=1 run_tick
+[ "$(ncalls "$NOTIFY_CALLS" 'nao consegui ler o nice')" = "0" ] && ok "5d knob: NOTIFY_AFTER=2 → 1st unreadable tick is silent" || nope "5d knob: notified on tick 1"
+DLA_NICE_NOTIFY_AFTER=2 DLA_PS_FAIL=1 run_tick
+[ "$(ncalls "$NOTIFY_CALLS" 'nao consegui ler o nice')" = "1" ] && ok "5d knob: NOTIFY_AFTER=2 → notifies on the 2nd" || nope "5d knob: no notify on tick 2"
+for _bad in abc 0; do
+  nice_scenario "bad-$_bad"
+  DLA_NICE_NOTIFY_AFTER="$_bad" DLA_PS_FAIL=1 run_tick; DLA_NICE_NOTIFY_AFTER="$_bad" DLA_PS_FAIL=1 run_tick
+  _b2="$(ncalls "$NOTIFY_CALLS" 'nao consegui ler o nice')"
+  DLA_NICE_NOTIFY_AFTER="$_bad" DLA_PS_FAIL=1 run_tick
+  { [ "$_b2" = "0" ] && [ "$(ncalls "$NOTIFY_CALLS" 'nao consegui ler o nice')" = "1" ]; } && ok "5d knob: NOTIFY_AFTER='$_bad' (invalid) → falls back to 3, and still notifies (the blind alert cannot be silenced by a bad value)" || nope "5d knob: NOTIFY_AFTER='$_bad': after 2 ticks=$_b2 notifies, after 3=$(ncalls "$NOTIFY_CALLS" 'nao consegui ler o nice')"
+done
 
 echo
 echo "==== $PASS passed, $FAIL failed ===="

@@ -71,7 +71,55 @@
 # load against shared production Dolt to find out where it breaks. Full
 # methodology + raw data: ga-sfgh4 bead comments.
 #
-# Kill switch: DOLT_LATENCY_ALARM_ENABLED=0 -> probe + log only, never notify.
+# SECOND SIGNAL, SAME TICK (ga-0k78d4): the Dolt server's SCHEDULING PRIORITY (nice).
+# Detection only -- it never renices, restarts or kills anything.
+#
+#   WHY: ga-rj7b1a (scripts/claude-lowprio.sh) starts every pool/ephemeral session (dog,
+#   wa/ps-worker, gate-reviewer, refiners, deacon, boot) at nice 15 so heavy test suites
+#   cannot starve Dolt, and everything such a session spawns inherits that. NOT LIVE YET as
+#   of 2026-09-19 (still in the gate; a pool session's shell measured nice 0) -- this
+#   detector is placed BEFORE it lands, and is useful today too: any nice != 0 parent does
+#   it (a zsh `cmd &` runs at nice +5). Dolt is NOT shielded from it:
+#   .gc/system/packs/bd/assets/scripts/gc-beads-bd.sh (~line 2098) starts the server as a
+#   plain background child of whoever ran `gc dolt start|restart`
+#   (`nohup sh -c 'exec dolt sql-server ...' &`; no nice/renice/taskpolicy anywhere in
+#   that file), so a hand-run start from a wrapped session leaves Dolt at nice 15 -- the
+#   OPPOSITE of what ga-rj7b1a is for: Dolt loses CPU to every nice-0 process under
+#   contention, slow by construction, and nothing in the latency/connection medians above
+#   names that as the cause. The supervisor's own respawn is a launchd child at nice 0
+#   and is unaffected; the live server measured nice 0 on 2026-09-19.
+#
+#   NOT FIXABLE BY renice: lowering a nice value needs root. Measured 2026-09-19 on this
+#   host: `renice 0 -p <pid>` (and `renice -n -15 -p <pid>`) as the daemon user, on a
+#   `nice -n 15` process, both fail with "setpriority: Permission denied". The cure is
+#   restarting Dolt from a nice-0 parent -- a Mayor-coordinated, diagnostics-first action
+#   (docs/runbooks/dolt-priority-nice.md) -- so this alarm only tells someone.
+#
+#   THREE STATES, never collapsed (an error must not read as "ok" -- same class as the
+#   live_dolt_port() note below):
+#     ok      nice == 0   silent; clears an active alarm.
+#     alarm   nice != 0   one notify per episode. Any deviation from the default priority
+#                         is worth a line; a negative value needs root, so it would be
+#                         deliberate.
+#     unknown no live Dolt PID, or ps failed / printed anything but exactly one integer.
+#             NEVER counts as nice 0: it neither raises nor clears the alarm, it is
+#             logged, and after DOLT_NICE_UNKNOWN_NOTIFY_AFTER consecutive ticks
+#             (default 3) it notifies ONCE that the detector is blind.
+#   The PID comes from dolt_server_pid() (basename + LISTEN verified), never from a bare
+#   `pgrep | head -1`.
+#
+#   NO MEDIAN WINDOW: the signals above are noisy samples, hence MIN_SAMPLES; a process's
+#   nice value is an attribute, not a sample, so one reading decides. It runs BEFORE the
+#   latency probes on purpose: it is ~50 ms of local pid resolution + `ps` (measured
+#   2026-09-19, against a ~12s tick), and a slow or failed probe (up to
+#   SERVE_CONFIRM_TIMEOUT) must neither delay nor skip it. It rides this job's
+#   existing 60s launchd tick and single-instance lock: no new job, no new poll.
+#   State: STATE_DIR/dolt-latency-alarm.nice-active (episode marker) and .nice-unknown
+#   (consecutive-unknown counter) -- deliberately NOT the latency alarm's own .active
+#   marker, so neither alarm can ever clear the other.
+#
+# Kill switch: DOLT_LATENCY_ALARM_ENABLED=0 -> probe + log only, never notify (covers both
+# signals).
 set -uo pipefail
 
 CITY="/Users/athos/gt/.gascity-gastown-hq"
@@ -80,7 +128,10 @@ CITY="/Users/athos/gt/.gascity-gastown-hq"
 # never a bare process-table sort). See dolt-pid-lib.sh.
 # shellcheck source=dolt-pid-lib.sh
 source "$(dirname "${BASH_SOURCE[0]:-$0}")/dolt-pid-lib.sh"
-LOG="$CITY/.gc/logs/dolt-latency-alarm.log"
+# ga-0k78d4: overridable (test-only seam, same shape as dolt-hang-watchdog.sh's
+# DOLT_WATCHDOG_LOG) so the selftest can assert on log lines -- and stop writing its fake
+# ALARM/CLEARED lines into the live log. Unset in production: the path is unchanged.
+LOG="${DOLT_LATENCY_ALARM_LOG:-$CITY/.gc/logs/dolt-latency-alarm.log}"
 DOLT_PORT_DEFAULT="${BEADS_DOLT_PORT:-52756}"
 
 LATENCY_ALARM_MS="${DOLT_LATENCY_ALARM_MS:-500}"
@@ -110,6 +161,16 @@ LATENCY_WINDOW_FILE="$STATE_DIR/dolt-latency-alarm.latency-window"
 CONN_WINDOW_FILE="$STATE_DIR/dolt-latency-alarm.conn-window"
 ALARM_ACTIVE_FILE="$STATE_DIR/dolt-latency-alarm.active"
 LOCK_DIR="$STATE_DIR/dolt-latency-alarm.lock.d"
+
+# ga-0k78d4: nice-detector state (see the header). Separate files from ALARM_ACTIVE_FILE on
+# purpose: the latency alarm clearing must never clear the nice alarm, or vice versa.
+NICE_ACTIVE_FILE="$STATE_DIR/dolt-latency-alarm.nice-active"
+NICE_UNKNOWN_FILE="$STATE_DIR/dolt-latency-alarm.nice-unknown"
+NICE_UNKNOWN_NOTIFY_AFTER="${DOLT_NICE_UNKNOWN_NOTIFY_AFTER:-3}"
+# A non-numeric or zero override would make the "detector is blind" comparison error out
+# and never fire -- a silent failure of the one alert that exists to break silence. Fall
+# back to the default instead.
+case "$NICE_UNKNOWN_NOTIFY_AFTER" in ''|*[!0-9]*|0) NICE_UNKNOWN_NOTIFY_AFTER=3 ;; esac
 
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
@@ -239,6 +300,112 @@ get_latency_ms() {
   printf '%s' "$lat"
 }
 
+# ── ga-0k78d4: Dolt scheduling-priority (nice) detector — the why is in the header. ──
+
+# proc_nice PID — print PID's numeric nice value and return 0. When it cannot be read (no
+# PID, ps failed, process gone, anything but exactly one integer) print NOTHING and return
+# 1: "could not read" must never look like "reads 0".
+proc_nice() {
+  local _pid="${1:-}" _raw _ni
+  [ -n "$_pid" ] || return 1
+  _raw="$(ps -o ni= -p "$_pid" 2>/dev/null)" || return 1
+  # Exactly one non-empty line holding exactly one field (real ps pads the value with
+  # spaces). Two lines, or a line with two fields, is not "a nice value" -- refuse it
+  # rather than gluing the pieces into a number.
+  _ni="$(printf '%s\n' "$_raw" | awk 'NF { n++; if (NF == 1) v = $1; else bad = 1 } END { if (n == 1 && !bad) print v }')"
+  case "$_ni" in
+    ''|-|*[!0-9-]*|?*-*) return 1 ;;   # empty, lone "-", non-numeric, or a "-" past the first char
+  esac
+  printf '%s' "$_ni"
+}
+
+# dolt_nice_state — one line on stdout, always exit 0: "<state> <detail>" with state in
+# ok | alarm | unknown (see the header). The PID is resolved live by dolt_server_pid.
+dolt_nice_state() {
+  local _pid _ni
+  _pid="$(dolt_server_pid)"
+  if [ -z "$_pid" ]; then
+    echo "unknown no-live-dolt-server"
+    return 0
+  fi
+  if ! _ni="$(proc_nice "$_pid")"; then
+    echo "unknown nice-unreadable pid=$_pid"
+    return 0
+  fi
+  if [ "$_ni" -ne 0 ]; then
+    echo "alarm ni=$_ni pid=$_pid"
+  else
+    echo "ok ni=0 pid=$_pid"
+  fi
+  return 0
+}
+
+# nice_notify PRIORITY TITLE MESSAGE — notify unless the kill switch is off; never fails the tick.
+nice_notify() {
+  [ "$LATENCY_ALARM_ENABLED" = "1" ] || return 0
+  command -v notify >/dev/null 2>&1 || return 0
+  notify -p "$1" -t "$2" "$3" >/dev/null 2>&1 || true
+  return 0
+}
+
+# nice_tick — one detector pass: read the state, apply the transition rules, log/notify.
+# Anything that is not exactly "ok" or "alarm" is treated as unknown (the fail-safe
+# default) -- never as ok. Invoked once per tick from the execution block below.
+nice_tick() {
+  local _line _state _detail _n
+  _line="$(dolt_nice_state)"
+  _state="${_line%% *}"
+  _detail="${_line#* }"
+
+  # A readable answer ends any running unknown streak (audit line only).
+  case "$_state" in
+    ok|alarm)
+      if [ -f "$NICE_UNKNOWN_FILE" ]; then
+        _n="$(cat "$NICE_UNKNOWN_FILE" 2>/dev/null)"
+        log "NICE readable again after ${_n:-?} unknown tick(s) — ${_detail}"
+        rm -f "$NICE_UNKNOWN_FILE" 2>/dev/null || true
+      fi
+      ;;
+  esac
+
+  case "$_state" in
+    alarm)
+      # One notify per episode: the marker is what keeps a still-bad Dolt from re-paging
+      # every 60s tick.
+      if [ ! -f "$NICE_ACTIVE_FILE" ]; then
+        log "NICE ALARM (ga-0k78d4): Dolt is not at nice 0 — ${_detail}. Detection only, nothing was changed. renice back down needs root; the cure is a restart from a nice-0 parent via the Mayor (docs/runbooks/dolt-priority-nice.md)"
+        nice_notify 3 'Dolt em prioridade baixa' "Dolt (${_detail}) NAO esta em nice 0 — perde CPU pra qualquer processo (provavel: iniciado a mao por sessao de pool, ga-0k78d4). So aviso, nada foi alterado; renice pra baixo exige root. Cura: reiniciar o Dolt a partir de um shell nice 0 via Mayor — docs/runbooks/dolt-priority-nice.md"
+        echo "$_detail" > "$NICE_ACTIVE_FILE" 2>/dev/null || true
+      fi
+      ;;
+    ok)
+      if [ -f "$NICE_ACTIVE_FILE" ]; then
+        log "NICE alarm CLEARED — Dolt back at nice 0 (${_detail})"
+        nice_notify 2 'Dolt voltou a nice 0' "prioridade do Dolt normalizada (${_detail})"
+        rm -f "$NICE_ACTIVE_FILE" 2>/dev/null || true
+      fi
+      ;;
+    *)
+      # unknown -- and ANY unexpected token lands here too. It is not "ok": it neither
+      # clears an active alarm nor raises one. Logged on the first tick of a streak, and
+      # escalated once when the streak reaches NICE_UNKNOWN_NOTIFY_AFTER.
+      _n=0
+      [ -f "$NICE_UNKNOWN_FILE" ] && _n="$(cat "$NICE_UNKNOWN_FILE" 2>/dev/null)"
+      case "$_n" in ''|*[!0-9]*) _n=0 ;; esac
+      _n=$((10#$_n + 1))
+      echo "$_n" > "$NICE_UNKNOWN_FILE" 2>/dev/null || true
+      if [ "$_n" -eq 1 ]; then
+        log "NICE UNKNOWN (ga-0k78d4): ${_detail:-no state} — NOT treated as nice 0; an active alarm (if any) is left as it is"
+      fi
+      if [ "$_n" -eq "$NICE_UNKNOWN_NOTIFY_AFTER" ]; then
+        log "NICE UNKNOWN for ${_n} consecutive ticks — the nice detector is BLIND (${_detail:-no state})"
+        nice_notify 2 'Dolt: nao consegui ler o nice' "${_n} ticks seguidos sem ler a prioridade do Dolt (${_detail:-sem estado}) — o detector de ga-0k78d4 esta cego; isso NAO quer dizer nice 0. Se o Dolt esta no ar: ps -o ni= -p <pid>"
+      fi
+      ;;
+  esac
+  return 0
+}
+
 # ════════════════════════════════════════════════════════════════════════════
 # Everything below actually TOUCHES the world (lock, live Dolt probes, state
 # files, notify) — guarded so a selftest can
@@ -263,6 +430,10 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
 fi
 echo "$$" > "$LOCK_DIR/pid" 2>/dev/null || true
 trap 'rm -rf "$LOCK_DIR" 2>/dev/null || true' EXIT
+
+# ga-0k78d4: Dolt scheduling-priority detector. FIRST on purpose (see the header): a few ms
+# of local ps must neither wait behind, nor be skipped because of, a latency probe.
+nice_tick
 
 _lat="$(get_latency_ms)"
 _conns="$(conn_count)"
