@@ -4558,23 +4558,23 @@ has "$DISPATCHER" 'ga-hn3kh'                    "ga-hn3kh guard comment is wired
 # (so STORY_RIG infers "lexbh" from the prefix, but STORY_RIG_EXPLICIT stays 0
 # since no metadata["story.rig"] is set — the precise precondition that lets
 # content-keyword inference override the bead's own native rig).
-echo "Scenario 18am-1 (ga-gbzxos AC1): lx- bead with 'terreno', batista-ps suspended → HELD, not batista-ps"
+echo "Scenario 18am-1 (ga-gbzxos AC1, updated by ga-wnojmm): lx- bead with 'terreno', batista-ps suspended → ps-worker pool, not batista-ps, not held forever"
 LX_TERRENO='[{"id":"lx-dnwtest","title":"Recorte de data errado no chat sobre quota de terreno por UH","priority":2,"issue_type":"bug","description":"fixture body — quota de terreno por UH conforme lei de uso do solo","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-09-06T12:47:00Z","metadata":{}}]'
 LOG18AM1="$(PILOT_SUSPENDED_CREWS_OVERRIDE="batista-ps" run_capacity 10 "[]" 1 "$LX_TERRENO")"
 B18AM1="$(dispatched_builder "$LOG18AM1")"
 if [ "$B18AM1" = "batista-ps" ]; then
   bad "REGRESSION (ga-gbzxos): lx- bead dispatched to SUSPENDED batista-ps — the lx-dnw infinite-loop bug"
 elif echo "$B18AM1" | grep -qE '^gastown\.dog'; then
-  bad "lx- bead fell to the dog pool instead of holding (a dog cannot build a lexbh domain task either)"
-elif [ -n "$B18AM1" ]; then
-  bad "lx- bead routed unexpectedly while owning crew suspended (got: '$B18AM1')"
+  bad "lx- bead fell to the dog pool instead of the ps-worker pool (a dog cannot build a lexbh domain task either)"
+elif [ "$B18AM1" = "ps-worker" ]; then
+  ok "ga-wnojmm: lx- bead with suspended domain-default crew now falls back to the ps-worker pool instead of holding forever (all named crews suspended, 2026-09-19)"
 else
-  ok "lx- bead with suspended domain-default crew HELD (no dispatch to any crew or the dog)"
+  bad "lx- bead routed unexpectedly while owning crew suspended (got: '${B18AM1:-none}')"
 fi
 if echo "$LOG18AM1" | grep -qi "SUSPENDED"; then
-  ok "hold was attributed to the crew being suspended (log names the real cause, not a generic unmapped-rig hold)"
+  ok "pool-fallback routing was attributed to the crew being suspended (log names the real cause, not a generic unmapped-rig fallback)"
 else
-  bad "hold log does not mention SUSPENDED — can't distinguish this from an unrelated unmapped-rig hold"
+  bad "routing log does not mention SUSPENDED — can't distinguish this from an unrelated fallback"
 fi
 
 echo "Scenario 18am-2 (ga-gbzxos AC2): genuine property_scrapers domain build, batista-ps suspended → HELD, not batista-ps"
@@ -4595,10 +4595,28 @@ LOG18AM2="$(PILOT_SUSPENDED_CREWS_OVERRIDE="batista-ps" run_capacity 10 "[]" 1 "
 B18AM2="$(dispatched_builder "$LOG18AM2")"
 if [ "$B18AM2" = "batista-ps" ]; then
   bad "REGRESSION (ga-gbzxos): genuine property_scrapers domain build dispatched to SUSPENDED batista-ps"
-elif [ -n "$B18AM2" ]; then
-  bad "property_scrapers domain build routed unexpectedly while owning crew suspended (got: '$B18AM2')"
+elif [ "$B18AM2" = "ps-worker" ]; then
+  ok "ga-wnojmm: property_scrapers domain build with suspended domain-default crew now falls back to the ps-worker pool (matches the story's AC1: 'PS sem dono -> rota ps-worker, nao adia')"
 else
-  ok "property_scrapers domain build with suspended domain-default crew HELD (no dispatch), matching AC2 (same-rig case, not just cross-rig)"
+  bad "property_scrapers domain build routed unexpectedly while owning crew suspended (got: '${B18AM2:-none}')"
+fi
+
+echo "Scenario 18am-2b (ga-wnojmm): pool ALSO exhausted (ps-worker busy this sweep) → still HELD, no double-booking"
+NOW_ISO18AM2B="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+INFLIGHT18AM2B="[{\"id\":\"if-psworker\",\"labels\":[\"story:in-flight\",\"lane:small\"],\"updated_at\":\"$NOW_ISO18AM2B\",\"metadata\":{\"pilot.sling_bead\":\"tt-sling-psworker\"}}]"
+SESSIONS18AM2B='{"sessions":[{"session_name":"ps-worker","closed":false}]}'
+SLINGMAP18AM2B='{"tt-sling-psworker":"ps-worker"}'
+LOG18AM2B="$(PILOT_SUSPENDED_CREWS_OVERRIDE="batista-ps" run_capacity 10 "$INFLIGHT18AM2B" 1 "$PS_DOMAIN_SMALL" "$SESSIONS18AM2B" "$SLINGMAP18AM2B")"
+if echo "$LOG18AM2B" | grep -q "Busy builders (live in-flight): ps-worker"; then
+  ok "precondition: ps-worker computed as busy this sweep (fixture wired correctly)"
+else
+  bad "precondition failed: ps-worker not computed as busy — the result below is not trustworthy"
+fi
+B18AM2B="$(dispatched_builder "$LOG18AM2B")"
+if [ -z "$B18AM2B" ]; then
+  ok "ga-wnojmm: batista-ps suspended AND ps-worker busy → correctly HELD (pool-fallback does not force a 2nd concurrent ps-worker session)"
+else
+  bad "REGRESSION (ga-wnojmm): dispatched to '$B18AM2B' while ps-worker was already busy this sweep — double-booking risk"
 fi
 
 echo "Scenario 18am-3 (control): SAME lx- fixture with batista-ps ACTIVE still dispatches normally (no over-correction)"
@@ -8193,6 +8211,64 @@ if [ "$WARM_BUILDER" = "oracle-wa" ]; then
   ok "ga-pp00f control: warming (Scenario 17g fixture) still dispatches to oracle-wa, unaffected by the hex addition"
 else
   bad "ga-pp00f REGRESSION: warming routing changed after adding the hex domain (got: '${WARM_BUILDER:-none}')"
+fi
+
+# ── Scenario ga-wnojmm-hex: hex-native WA bug with its structural owner
+# SUSPENDED (not just busy) must still never leak into the wa-worker pool
+# (ga-pp00f-c already proves that for the transient-busy case), but — unlike
+# busy, which resolves on its own — a suspended owner never comes back
+# without a human action, so the OLD behaviour (Scenario ga-pp00f-c's plain
+# "deferring ... to next sweep" log line, no bead-visible label, no
+# escalation) means this bead holds mute and unbounded, forever. Route it
+# through the same shared hold/escalate counter every other stuck-dispatch
+# site already uses (ga-2n7xw), scoped to domain=hex ONLY — warming is
+# deliberately excluded (Regra No 4: no behaviour change there without an
+# explicit Athos citation, since it touches a real device) and is proven
+# unaffected by the control scenario below.
+echo "Scenario ga-wnojmm-hex-a: hex-native WA bug with SUSPENDED batista-wa → still never dispatched, but now VISIBLY held (1/3)"
+LOG_WNOJMM_HEX_A="$(PILOT_SUSPENDED_CREWS_OVERRIDE="batista-wa" run_capacity 10 "[]" 1 "$HEX_BUG")"
+HEXBUILDER_WNOJMM_A="$(builders_of "$LOG_WNOJMM_HEX_A")"
+if echo "$HEXBUILDER_WNOJMM_A" | grep -qE '^wa-worker-[0-9]+$'; then
+  bad "REGRESSION (ga-pp00f): hex-native bug leaked into the wa-worker pool ($HEXBUILDER_WNOJMM_A) once batista-wa was suspended"
+elif [ -n "$HEXBUILDER_WNOJMM_A" ]; then
+  bad "hex-native bug with suspended owner routed unexpectedly (got: '$HEXBUILDER_WNOJMM_A')"
+else
+  ok "hex-native bug with suspended batista-wa correctly never dispatched (structural pool-exclusion still holds)"
+fi
+if echo "$LOG_WNOJMM_HEX_A" | grep -qF "WOULD stamp pilot:held-count:ga-wnojmm-hex:1 on tt-wahex (hold 1/3)"; then
+  ok "ga-wnojmm: suspended-owner hex bead now stamps a VISIBLE hold counter (was: silent 'deferring' log only, no bead-visible trace)"
+else
+  bad "ga-wnojmm REGRESSION: suspended-owner hex bead did not stamp a hold counter — still silent/invisible (log: $LOG_WNOJMM_HEX_A)"
+fi
+if echo "$LOG_WNOJMM_HEX_A" | grep -qi "SUSPENDED"; then
+  ok "the hold reason names the real cause (owner suspended, not a generic unmapped-domain hold)"
+else
+  bad "hold reason does not mention SUSPENDED — can't distinguish this from an unrelated hold"
+fi
+
+echo "Scenario ga-wnojmm-hex-b: SAME suspended-owner hex bug, prior hold count=2 → ESCALATES on the 3rd sweep, never loops silently forever"
+HEX_BUG_HELD2='[{"id":"tt-wahex","title":"celula Hex dedup: normaliza data sem format=mixed","priority":1,"issue_type":"bug","description":"a celula de notebook Hex que decide qual proprietario fica usa pd.to_datetime(errors=coerce) sem format=mixed","status":"open","labels":["pilot:held-count:ga-wnojmm-hex:2"],"assignee":null,"created_at":"2026-06-01T00:00:04Z","metadata":{"story.rig":"whatsapp_automation"}}]'
+LOG_WNOJMM_HEX_B="$(PILOT_SUSPENDED_CREWS_OVERRIDE="batista-wa" run_capacity 10 "[]" 1 "$HEX_BUG_HELD2")"
+if echo "$LOG_WNOJMM_HEX_B" | grep -qF "WOULD ESCALATE tt-wahex (ga-wnojmm-hex, hold 3/3) to Mayor"; then
+  ok "ga-wnojmm: 3rd consecutive hold on a suspended hex owner ESCALATES to the Mayor instead of holding a 4th time — the 'adiam pra sempre' bug is closed"
+else
+  bad "ga-wnojmm REGRESSION: 3rd hold on suspended hex owner did not escalate (log: $LOG_WNOJMM_HEX_B)"
+fi
+
+echo "Scenario ga-wnojmm-hex-c (control, Regra No 4): warming with its owner SUSPENDED is UNCHANGED — no new hold-count stamp, no escalation, no pool leak"
+LOG_WNOJMM_WARM_CTL="$(PILOT_SUSPENDED_CREWS_OVERRIDE="oracle-wa" run_capacity 10 "[]" 1 "$WARM_BUG")"
+WARMBUILDER_CTL="$(builders_of "$LOG_WNOJMM_WARM_CTL")"
+if echo "$WARMBUILDER_CTL" | grep -qE '^wa-worker-[0-9]+$'; then
+  bad "REGRESSION: warming leaked into the wa-worker pool once oracle-wa was suspended — Regra No 4 requires NO behaviour change here without an explicit Athos decision"
+elif [ -n "$WARMBUILDER_CTL" ]; then
+  bad "warming with suspended owner routed unexpectedly (got: '$WARMBUILDER_CTL')"
+else
+  ok "warming with suspended oracle-wa still never dispatched (unchanged)"
+fi
+if echo "$LOG_WNOJMM_WARM_CTL" | grep -qF "pilot:held-count:ga-wnojmm-hex"; then
+  bad "REGRESSION (Regra No 4 violation): warming picked up the NEW hex-only visible-hold treatment — this story deliberately scopes it to domain=hex only"
+else
+  ok "warming correctly did NOT receive the new visible-hold treatment (scoped to hex only, per Regra No 4 — warming stays exactly as it was)"
 fi
 
 # ── Scenario 26: ga-m2gqb RAM-pressure back-off (deferred remainder of ga-7xne1) ──

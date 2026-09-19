@@ -8666,10 +8666,20 @@ LIVESEC
     # If the owner is busy/suspended/at-cap/human-engaged, fall through to the
     # normal pool rotation below UNCHANGED (same as any other domain) — this
     # never blocks dispatch, it only redirects it when the owner is available.
+    local _OWNER_SUSPENDED=0
     if [ -n "$_PREFER" ] && rig_domain_requires_persistent_owner "$STORY_RIG" "$_DOMAIN"; then
       local _OWNER_BUSY=0
       _crew_session_human_engaged "$_PREFER" && _OWNER_BUSY=1
-      _crew_is_suspended "$_PREFER" && _OWNER_BUSY=1
+      # ga-wnojmm: SUSPENDED is tracked separately from the generic busy flag —
+      # busy/at-cap/human-engaged are TRANSIENT (will resolve on their own next
+      # sweep, so a silent retry is correct); suspended is STRUCTURAL (this
+      # owner will never come back without a human unsuspending it, so a
+      # silent retry-forever is the ga-wnojmm bug: an invisible, non-escalating
+      # loop). See the defer branch below for the visible-hold consequence.
+      if _crew_is_suspended "$_PREFER"; then
+        _OWNER_BUSY=1
+        _OWNER_SUSPENDED=1
+      fi
       _crew_at_inflight_cap "$_PREFER" && _OWNER_BUSY=1
       case " $PILOT_BUSY_BUILDERS " in *" $_PREFER "*) _OWNER_BUSY=1 ;; esac
       case " $PILOT_USED_BUILDERS " in *" $_PREFER "*) _OWNER_BUSY=1 ;; esac
@@ -8684,6 +8694,30 @@ LIVESEC
     if [ -z "$BUILDER_TARGET" ]; then
       log "POOL($STORY_RIG): all crew busy/used this sweep or domain-excluded (domain=${_DOMAIN:-none} prefer=${_PREFER:-none} exclude=${_EXCLUDE:-none} pool=[$_POOL] busy=[${PILOT_BUSY_BUILDERS:-none}] used=[${PILOT_USED_BUILDERS:-none}]) — deferring $STORY_ID to next sweep. Releasing claim."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      # ga-wnojmm: domain=hex specifically (never warming — Regra No 4, no
+      # change without an explicit Athos citation, since warming touches a
+      # real device) — a SUSPENDED structural owner with no pool fallback
+      # (rig_domain_exclude blocks it, by design: ga-pp00f/ga-ppx8h) means
+      # this bead will hit this exact branch every sweep, forever, with no
+      # human ever seeing it — the bug this story reports as "adiam pra
+      # sempre" (defer forever). Route it through the SAME shared hold/
+      # escalate counter every other stuck-dispatch site already uses
+      # (ga-2n7xw), so it's visible on the bead (pilot:held-count:ga-wnojmm-
+      # hex:N) and reaches the Mayor after 3 sweeps instead of looping mute.
+      if [ "$_OWNER_SUSPENDED" = "1" ] && [ "$_DOMAIN" = "hex" ]; then
+        # ga-wnojmm fix-2: log the SUSPENDED reason explicitly, rather than
+        # relying on _pilot_hold_or_escalate to print it — its own DRY_RUN
+        # branch only echoes $_phe_reason on the Nth (escalating) call
+        # ("WOULD ESCALATE ... to Mayor: <reason>"); a plain 1st/2nd hold
+        # ("WOULD stamp ...") never prints the reason at all. Without this
+        # line, hold #1/#2's log carries no visible "why", indistinguishable
+        # from any other unmapped-domain hold.
+        warn "ga-wnojmm: $STORY_RIG/$_DOMAIN domain build requires persistent owner $_PREFER, which is SUSPENDED, and the pool is domain-excluded for it (ga-pp00f/ga-ppx8h) — would defer silently forever otherwise. Routing through the shared hold/escalate counter instead."
+        _pilot_hold_or_escalate "$STORY_BEAD_CITY" "$STORY_ID" "ga-wnojmm-hex" \
+          "$STORY_RIG/$_DOMAIN domain build requires persistent owner $_PREFER, which is SUSPENDED — this domain is structurally pool-incompatible (Hex-notebook-native work produces no git diff, ga-pp00f) so it cannot fall back to $_POOL either" \
+          "unsuspend $_PREFER, or set a live explicit assignee on $STORY_ID" \
+          "$(echo "$STORY" | jq -c '.labels // []' 2>/dev/null || echo '[]')"
+      fi
       return 1
     fi
     mark_pool_builder "$BUILDER_TARGET"
@@ -9184,7 +9218,42 @@ LIVESEC
               STORY_RIG="$_DOMAIN_RIG"
               mark_pool_builder "$_DOM_DEFAULT"
             else
-              # (3) no idle persistent crew for the domain → DEFER with timed hold.
+              # ga-wnojmm (2026-09-19, all named crews suspended — city runs on
+              # generic pool workers only): property_scrapers has no live
+              # persistent-crew default anymore (batista-ps permanently
+              # suspended, not just busy) — fall back to the SAME ephemeral
+              # ps-worker pool a directly-rig-tagged property_scrapers bead
+              # already uses (rig_to_builders/pick_pool_builder), instead of
+              # holding forever for a crew that will never come back.
+              # Scoped to property_scrapers ONLY: whatsapp_automation domains
+              # reaching THIS guard (hex/warming) have their own structural
+              # pool-exclusion (rig_domain_exclude) that this coarse rig-level
+              # guard cannot see — falling back to wa-worker here could leak a
+              # pool-incompatible domain bead in, reproducing ga-pp00f/ga-ppx8h.
+              # Leave WA's behaviour on this path unchanged; see rig_domain_
+              # requires_persistent_owner's own call site for the WA/hex fix.
+              # ga-wnojmm fix-2: gate on `_DOM_DEFAULT` being EMPTY, not just this
+              # rig — `_DOM_BUSY=1` also covers a crew that is merely busy/used
+              # THIS SWEEP (transient, self-clearing next sweep: Scenario 18e /
+              # ga-2n7xw-a/b's precondition). Since the busy/used check above only
+              # ever runs `if [ -n "$_DOM_DEFAULT" ]`, `_DOM_DEFAULT` empty here
+              # can ONLY mean "never mapped" or "cleared because SUSPENDED"
+              # (ga-gbzxos, above) — never "busy". Without this guard, a plain
+              # busy-this-sweep default (still non-empty, still a real crew that
+              # will free up on its own) also leaked into the pool fallback,
+              # breaking correct backpressure (measured: 3 pre-existing scenarios
+              # regressed exactly this way when this guard was missing).
+              local _DOM_POOL=""
+              if [ "$_DOMAIN_RIG" = "property_scrapers" ] && [ -z "$_DOM_DEFAULT" ]; then
+                _DOM_POOL=$(pick_pool_builder "$_DOMAIN_RIG" "" "" 2>/dev/null || echo "")
+              fi
+              if [ -n "$_DOM_POOL" ]; then
+                log "ga-wnojmm: $STORY_ID is a $_DOMAIN_RIG domain build mis-routed to the dog pool (was target=$BUILDER_TARGET) — the rig's named domain-default crew is unmapped or SUSPENDED (all named crews permanently suspended per Athos 2026-09-19), routing to pool builder $_DOM_POOL instead of holding forever."
+                BUILDER_TARGET="$_DOM_POOL"
+                STORY_RIG="$_DOMAIN_RIG"
+                mark_pool_builder "$_DOM_POOL"
+              else
+              # (3) no idle persistent crew AND no pool slot for the domain → DEFER with timed hold.
               # imp20: stamp pilot:held + pilot:held-until:<epoch+3600> instead of just
               # returning 1 (plain defer). Without a timed hold, the bead is queued
               # immediately and Pilot re-dispatches on the next sweep — the claim-but-park
@@ -9237,6 +9306,7 @@ LIVESEC
                 "map/free a persistent crew for $_DOMAIN_RIG, or set a live explicit assignee on $STORY_ID" \
                 "$(echo "$STORY" | jq -c '.labels // []' 2>/dev/null || echo '[]')"
               return 1
+              fi
             fi
           fi
         fi
