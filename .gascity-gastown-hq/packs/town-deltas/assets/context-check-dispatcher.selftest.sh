@@ -295,6 +295,27 @@ echo "Scenario 5: verifiable-signal detection (HOW-TO-VERIFY / concrete artifact
 - [ ] step two")" = "yes" ]                                                                   && ok "task-list checklist → signal" || bad "checklist → expected signal"
 [ "$(context_check_has_verifiable_signal "make it better somehow")" = "no" ]                   && ok "vague prose → no signal" || bad "vague → expected no signal"
 [ "$(context_check_has_verifiable_signal "")" = "no" ]                                         && ok "empty → no signal" || bad "empty → expected no signal"
+# ga-gqokrx — context_check_has_verifiable_signal has the identical ASCII-only
+# case-fold gap ga-dpas3r fixed in context_check_exec_class: `tr 'A-Z' 'a-z'`
+# doesn't touch an uppercase accented letter's UTF-8 bytes, so an uppercase
+# "É" passes through untouched and matches neither the "critério" nor the
+# "criterio" alternative already listed above. Reuses the exact accent-fold
+# ga-dpas3r added upstream in context_check_exec_class (no apostrophe fold
+# needed here — this function has no apostrophe-based literals).
+#
+# NOTE on the bead's own repro string: ga-gqokrx's reported repro
+# ("CRITÉRIO DE ACEITE: retorna 200 se autenticado") in fact returns "yes"
+# today, unfixed — it already contains the literal (unaccented, already-
+# lowercase) word "retorna", which independently satisfies the signal check
+# regardless of the CRITÉRIO fold bug. Verified directly against the shipped
+# (pre-fix) function before writing these tests. The two cases below isolate
+# the actual fold gap with no such confound: no other vocabulary word,
+# checklist marker or file-extension/command literal appears in either
+# string, so each must fail on the accent fold alone, not by accident.
+[ "$(context_check_has_verifiable_signal "CRITÉRIO obrigatorio para este trabalho ficar completo e aceitavel sem duvida")" = "yes" ] \
+  && ok "ga-gqokrx: all-caps 'CRITÉRIO', no other trigger word → signal" || bad "ga-gqokrx REGRESSION: all-caps 'CRITÉRIO' failed to fold → no signal"
+[ "$(context_check_has_verifiable_signal "critÉrio obrigatorio para este trabalho ficar completo e aceitavel sem duvida")" = "yes" ] \
+  && ok "ga-gqokrx: lone uppercase accented letter 'critÉrio' → signal" || bad "ga-gqokrx REGRESSION: lone uppercase accented letter 'critÉrio' failed to fold"
 
 # ── Scenario 6: mechanical verdict — complete → ready ; empty/vague → thin ────
 echo "Scenario 6: mechanical verdict"

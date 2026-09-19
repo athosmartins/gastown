@@ -473,6 +473,22 @@ context_check_skip_reason() {
 context_check_has_verifiable_signal() {
   local t
   t=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+  # Fold what the ASCII-only tr above cannot reach (ga-gqokrx, same root cause
+  # as ga-dpas3r's fold in context_check_exec_class): `tr 'A-Z' 'a-z'` only
+  # maps single-byte ASCII, so an uppercase accented letter's UTF-8 bytes
+  # pass through untouched — "CRITÉRIO" becomes "critÉrio", matching neither
+  # the "critério" nor the "criterio" alternative below. Locale-independent
+  # literal byte substitution, same mechanism/rationale as the sibling fix
+  # (this daemon runs under launchd with no LANG/LC_ALL set, i.e. the C
+  # locale, where tr/awk case folding does not multibyte-fold at all). No
+  # apostrophe fold needed here — this function has no apostrophe-based
+  # literals.
+  t="${t//Á/á}"; t="${t//À/à}"; t="${t//Â/â}"; t="${t//Ã/ã}"; t="${t//Ä/ä}"
+  t="${t//É/é}"; t="${t//È/è}"; t="${t//Ê/ê}"; t="${t//Ë/ë}"
+  t="${t//Í/í}"; t="${t//Ì/ì}"; t="${t//Î/î}"; t="${t//Ï/ï}"
+  t="${t//Ó/ó}"; t="${t//Ò/ò}"; t="${t//Ô/ô}"; t="${t//Õ/õ}"; t="${t//Ö/ö}"
+  t="${t//Ú/ú}"; t="${t//Ù/ù}"; t="${t//Û/û}"; t="${t//Ü/ü}"
+  t="${t//Ç/ç}"; t="${t//Ñ/ñ}"
   # acceptance/verification + observable-outcome vocabulary (en + pt). No comments
   # inside the alternation: bash forbids a comment line between `\`-joined patterns.
   case "$t" in
