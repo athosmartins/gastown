@@ -445,6 +445,34 @@ fi
   && ok "context_check_negated: phrase absent entirely → no" || bad "context_check_negated: absent phrase should be 'no'"
 [ "$(context_check_negated "nunca apague o log. depois disso, criar conta de teste." "criar conta")" = "no" ] \
   && ok "context_check_negated: negation in an EARLIER, different clause does not leak forward across a '.'" || bad "context_check_negated REGRESSION: negation window leaked across a sentence boundary"
+# 10g0a — ga-dpas3r attempt 2, blocking issue 2 (gate_run=ga-6ibdui): a negation
+#        word immediately followed by punctuation ("nunca," with a comma, not a
+#        trailing space) must still be recognized as negating the clause — the
+#        word-boundary match used to require a literal space on both sides and
+#        silently missed this, reopening the wa-vrs3g false-positive class for a
+#        comma-qualified variant of the exact wording this fix targets.
+[ "$(context_check_negated "nunca, em hipotese alguma, criar conta nova para este robo." "criar conta")" = "yes" ] \
+  && ok "context_check_negated: comma-qualified 'nunca, em hipotese alguma,' still negates (ga-dpas3r attempt 2 fix2)" || bad "context_check_negated REGRESSION: comma right after negation word broke the match (ga-dpas3r attempt 2 fix2)"
+# Class fix, not just the cited comma instance: colon and parens directly
+# abutting the negation word must negate too (same mechanism, different glyph).
+[ "$(context_check_negated "nunca: sob nenhuma hipotese, criar conta" "criar conta")" = "yes" ] \
+  && ok "context_check_negated: colon-qualified 'nunca:' still negates (fix2 generalizes beyond comma)" || bad "context_check_negated REGRESSION: colon right after negation word broke the match"
+[ "$(context_check_negated "(nunca) criar conta imediatamente" "criar conta")" = "yes" ] \
+  && ok "context_check_negated: parenthesized '(nunca)' still negates (fix2 generalizes beyond comma)" || bad "context_check_negated REGRESSION: parens around negation word broke the match"
+# 10g0b — ga-dpas3r attempt 2, blocking issue 1 (gate_run=ga-6ibdui): a phrase
+#        that occurs TWICE — once inside a prohibition, once later as a genuine
+#        request — must be caught by its second, unnegated occurrence.
+#        context_check_negated alone only ever inspects the FIRST occurrence;
+#        context_check_any_unnegated must scan every occurrence, or the second,
+#        real request silently downgrades to exec:auto (a human-required
+#        credential-provisioning task misclassified as agent-executable).
+[ "$(context_check_any_unnegated "nunca provisionar conta de admin automaticamente. ao final, e necessario provisionar conta de servico dedicada para este pipeline." "provisionar conta")" = "yes" ] \
+  && ok "context_check_any_unnegated: 2nd unnegated occurrence caught after a negated 1st (ga-dpas3r attempt 2 fix1)" || bad "context_check_any_unnegated REGRESSION: only inspected the first occurrence, missed the genuine second request (ga-dpas3r attempt 2 fix1)"
+# 10g0c — same two cases, end-to-end through exec_class (title+desc, real case).
+[ "$(context_check_exec_class "pipeline de contas" "Nunca provisionar conta de admin automaticamente. Ao final, e necessario provisionar conta de servico dedicada para este pipeline.")" = "exec:manual" ] \
+  && ok "ga-dpas3r attempt 2: 2nd, genuine 'provisionar conta' request after a negated 1st → exec:manual (fix1 end-to-end)" || bad "ga-dpas3r REGRESSION: genuine 2nd occurrence after a negated 1st stayed exec:auto (fix1 end-to-end)"
+[ "$(context_check_exec_class "guardrail de escopo" "Nunca, em hipotese alguma, criar conta nova para este robo.")" = "exec:auto" ] \
+  && ok "ga-dpas3r attempt 2: comma-qualified 'Nunca, em hipotese alguma,' prohibition → exec:auto (fix2 end-to-end)" || bad "ga-dpas3r REGRESSION: comma right after negation word over-tagged exec:manual (fix2 end-to-end)"
 # 10g — ga-dpas3r: a PROHIBITION must not tip exec:manual just because its
 #       trigger substring occurs inside it — "nunca criar conta" contains
 #       "criar conta" but FORBIDS it, the opposite of a request (wa-vrs3g).

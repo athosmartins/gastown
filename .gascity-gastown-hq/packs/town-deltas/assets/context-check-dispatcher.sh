@@ -661,16 +661,27 @@ context_check_clause_before() {
   printf '%s' "$before"
 }
 
-# context_check_negated <text> <phrase> — emit "yes" iff <phrase> occurs in
-#   <text> AND is preceded, in the same clause, by a negation word (pt/en) —
-#   i.e. the phrase is being forbidden, not requested. Emits "no" if <phrase>
-#   is absent, or present with no preceding same-clause negation (a genuine,
-#   actionable occurrence). Pure (no I/O).
+# context_check_negated <text> <phrase> — emit "yes" iff the FIRST occurrence of
+#   <phrase> in <text> is preceded, in the same clause, by a negation word
+#   (pt/en) — i.e. that occurrence is being forbidden, not requested. Emits "no"
+#   if <phrase> is absent, or its first occurrence has no preceding same-clause
+#   negation. Only inspects the FIRST occurrence — context_check_any_unnegated
+#   (below) loops this over every occurrence, since a later one can be a
+#   genuine request even when the first is a prohibition (ga-dpas3r attempt 2,
+#   blocking issue 1). Pure (no I/O).
 context_check_negated() {
-  local text="$1" phrase="$2" clause
+  local text="$1" phrase="$2" clause padded
   clause="$(context_check_clause_before "$text" "$phrase")"
   [ -z "$clause" ] && { echo "no"; return; }
-  case " $clause " in
+  # A negation word can be directly followed by punctuation instead of a space
+  # ("nunca, em hipótese alguma, criar conta") — normalize comma/colon/
+  # semicolon/parens to spaces before the word-boundary check. Without this,
+  # the trailing comma breaks the " nunca "-style match and the prohibition
+  # reads as unnegated (ga-dpas3r attempt 2, blocking issue 2 — reopened the
+  # exact wa-vrs3g class this function exists to close, for a comma-qualified
+  # variant of the same guardrail wording).
+  padded=" ${clause//[,:;()]/ } "
+  case "$padded" in
     *" nunca "*|*" não "*|*" nao "*|*" jamais "*|*" evite "*|*" evitar "*|\
 *" sem "*|*" nem "*|*" never "*|*" don't "*|*" dont "*|*" do not "*|\
 *" cannot "*|*" can't "*)
@@ -680,21 +691,31 @@ context_check_negated() {
 }
 
 # context_check_any_unnegated <text> <phrase1> [phrase2 ...] — emit "yes" iff at
-#   least one <phraseN> occurs in <text> AND is NOT negated in its own
-#   occurrence's clause (context_check_negated above). A phrase that only occurs
-#   inside a negated clause does not count. Pure (no I/O). Every §2/§3/§4
-#   trigger block below routes its single-literal phrases through this one call
-#   site, so the fix covers the whole reachable pattern class, not only the one
-#   reported phrase.
+#   least one <phraseN> has SOME occurrence in <text> that is not negated in
+#   its own clause. Scans every occurrence of each phrase, not only the first:
+#   a phrase repeated once inside a prohibition and again as a genuine request
+#   ("Nunca provisionar conta ... Ao final, e necessario provisionar conta
+#   ...") must still be caught by its second, unnegated occurrence —
+#   context_check_negated alone only ever sees the first, so relying on it
+#   directly here silently downgrades a real request to unactionable (ga-dpas3r
+#   attempt 2, blocking issue 1). Pure (no I/O). Every §2/§3/§4 trigger block
+#   below routes its single-literal phrases through this one call site, so the
+#   fix covers the whole reachable pattern class, not only the one reported
+#   phrase.
 context_check_any_unnegated() {
   local text="$1"; shift
-  local p
+  local p remaining
   for p in "$@"; do
-    case "$text" in
-      *"$p"*)
-        [ "$(context_check_negated "$text" "$p")" = "no" ] && { echo "yes"; return; }
-        ;;
-    esac
+    remaining="$text"
+    while :; do
+      case "$remaining" in
+        *"$p"*) : ;;
+        *) break ;;
+      esac
+      [ "$(context_check_negated "$remaining" "$p")" = "no" ] && { echo "yes"; return; }
+      # This occurrence was negated — advance past it and check the next one.
+      remaining="${remaining#*"$p"}"
+    done
   done
   echo "no"
 }
