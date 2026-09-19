@@ -48,6 +48,10 @@
 #   - DRY_RUN=1 → no label transitions / no spawn; logs "WOULD …" instead.
 #   - DRAIN-SAFE: this file + its plist + the refino-gate-reviewer template are
 #     the ONLY artifacts. Does not touch the CODE gate, city.toml, or skills.
+#   - EXIT CODE (ga-owlmfj): launchd and daemon-presence-watchdog read it as "is
+#     the daemon healthy". 0 = the sweep ran — INCLUDING a handled start failure
+#     (claim released, retried next sweep). 1 = the start failure is PERSISTENT
+#     (REFINO_START_FAIL_ESCALATE_AT consecutive sweeps) or the sweep itself died.
 #
 # Usage:
 #   bash refino-gate-dispatcher.sh            # normal run
@@ -153,6 +157,36 @@ case "$REFINO_RECONVENE_GRACE_SECS" in ''|*[!0-9]*) REFINO_RECONVENE_GRACE_SECS=
 REFINO_RECONVENE_DEAD_STREAK_MIN="${REFINO_RECONVENE_DEAD_STREAK_MIN:-2}"
 case "$REFINO_RECONVENE_DEAD_STREAK_MIN" in ''|*[!0-9]*) REFINO_RECONVENE_DEAD_STREAK_MIN=2 ;; esac
 [ "$REFINO_RECONVENE_DEAD_STREAK_MIN" -lt 1 ] 2>/dev/null && REFINO_RECONVENE_DEAD_STREAK_MIN=1
+
+# ── ga-owlmfj: a HANDLED start failure is not a daemon crash ──────────────────
+# Step 5 (reviewer spawn) fails intermittently: 7 times in this log, 5 of them in a
+# row on 19/09 16:22-16:39 local while beads p95 latency was 12-14s — and the
+# identical spawn worked at 16:43. (The mechanism is inferred from that timing:
+# the real gc error text was hidden by the old 300-char log truncation, see
+# refino_spawn_err_summary.) Step 4 (verdict-bead create) has never been observed
+# failing but has the identical exit path. The dispatcher already handles a start
+# failure correctly — releases the claim, logs ERROR, the NEXT sweep retries — and
+# then it used to `exit 1`. daemon-presence-watchdog reads ANY positive exit as a
+# code failure: 2 in a row = CRASH-LOOP -> `kickstart -k` (which kills whatever
+# sweep is in flight, healthy review included) -> heals exhausted -> the Mayor is
+# paged for a job that was working as designed.
+#
+# Contract now: a start failure exits 0 while it is TRANSIENT and exits 1 once it
+# has repeated REFINO_START_FAIL_ESCALATE_AT sweeps in a row (default 6, ~18 min),
+# so a genuinely broken spawn still reaches the watchdog's existing escalation.
+# If the streak cannot be recorded we cannot prove the failure is transient, so we
+# exit 1 exactly as before this change — never quieter than the old behavior.
+REFINO_START_FAIL_ESCALATE_AT="${REFINO_START_FAIL_ESCALATE_AT:-6}"
+case "$REFINO_START_FAIL_ESCALATE_AT" in ''|*[!0-9]*) REFINO_START_FAIL_ESCALATE_AT=6 ;; esac
+[ "$REFINO_START_FAIL_ESCALATE_AT" -lt 1 ] 2>/dev/null && REFINO_START_FAIL_ESCALATE_AT=1
+# Failures further apart than this are not "consecutive": the streak starts over.
+# 15 min = ~3.5x the gap between consecutive failing sweeps actually observed
+# (4.0-4.3 min on 19/09), so a real streak never expires mid-way but an old one
+# cannot leak into an unrelated blip.
+REFINO_START_FAIL_STREAK_TTL_SECS="${REFINO_START_FAIL_STREAK_TTL_SECS:-900}"
+case "$REFINO_START_FAIL_STREAK_TTL_SECS" in ''|*[!0-9]*) REFINO_START_FAIL_STREAK_TTL_SECS=900 ;; esac
+# "<count> <epoch of the last failure>" — absent = no failure streak.
+REFINO_START_FAIL_STREAK_FILE="${REFINO_START_FAIL_STREAK_FILE:-$GC_CITY/.gc/refino-gate.start-fail-streak}"
 
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 
@@ -321,6 +355,96 @@ refino_slot_action() {
   if [ "$bead_closed" = "1" ]; then echo "received"; return 0; fi
   if [ "$session_dead" = "1" ] && [ "$budget" -gt 0 ] 2>/dev/null; then echo "respawn"; return 0; fi
   echo "wait"
+}
+
+# ── ga-owlmfj: handled start failures (Step 4 verdict create / Step 5 spawn) ──
+# See the REFINO_START_FAIL_* block up top for WHY a handled failure must not exit 1.
+
+# refino_start_fail_exit_code <streak> <escalate_at> — echo 0 | 1. PURE.
+#   0 = TRANSIENT (streak below the limit): exit 0, the next sweep retries.
+#   1 = PERSISTENT (streak reached the limit) OR UNKNOWN.
+#   An empty/garbage streak is UNKNOWN, not "zero failures": it must not read as
+#   healthy, so it exits 1 — as loud as before this fix. escalate_at floors at 1
+#   so a misconfigured 0 can never switch escalation off.
+refino_start_fail_exit_code() {
+  local streak="$1" at="$2"
+  case "$streak" in ''|*[!0-9]*) echo 1; return 0 ;; esac
+  case "$at" in ''|*[!0-9]*) at=6 ;; esac
+  [ "$at" -lt 1 ] && at=1
+  if [ "$streak" -ge "$at" ]; then echo 1; else echo 0; fi
+}
+
+# refino_spawn_err_summary <file> — one log-safe line (<=300 chars) from the
+# captured stderr of `gc session new`. gc prefixes its calls with a ~500-char
+# 'warning: builtin pack "gastown" on disk differs from the copy embedded in this
+# gc binary' banner (present in this log since at least 16/09), so the old
+# `head -c 300` logged ONLY the banner and the actual failure was never visible.
+# Drop that banner, collapse newlines, cap at 300. Never fails. Three states, not
+# two: real error text / "gc printed nothing but the banner" (empty -> the caller
+# logs 'none') / "could not read the capture at all" (explicit marker) — so a lost
+# capture never masquerades as a quiet gc.
+refino_spawn_err_summary() {
+  local f="$1" out
+  [ -r "$f" ] || { printf '<stderr capture unavailable>'; return 0; }
+  out=$( { grep -v '^warning: builtin pack ' "$f" 2>/dev/null || true; } \
+    | tr '\n' ' ' | sed 's/[[:space:]]*$//' | head -c 300 ) || out=""
+  printf '%s' "$out"
+}
+
+# _refino_start_fail_bump — record one more CONSECUTIVE start failure. Echoes the
+# new streak; returns 1 (echoing nothing) if it cannot be persisted, so the caller
+# can tell "streak is N" from "could not count". A streak whose last failure is
+# older than REFINO_START_FAIL_STREAK_TTL_SECS starts over (failures hours apart
+# are not consecutive; also bounds a stale file after the failing story was
+# resolved some other way).
+_refino_start_fail_bump() {
+  local f="$REFINO_START_FAIL_STREAK_FILE" now prev_n=0 prev_ts=0 n
+  now=$(date +%s)
+  if [ -f "$f" ]; then
+    { read -r prev_n prev_ts < "$f"; } 2>/dev/null || true
+    # An existing but unparseable file means the prior count is UNKNOWN: restart at
+    # 1, but say so — a silent restart would let corruption quietly defer escalation.
+    # (>&2: this runs inside $(...) whose stdout IS the returned streak value.)
+    case "$prev_n" in ''|*[!0-9]*) warn "  Start-failure streak file $f is unparseable (restarting the count at 1)." >&2; prev_n=0 ;; esac
+    case "$prev_ts" in ''|*[!0-9]*) prev_ts=0 ;; esac
+    [ $(( now - prev_ts )) -gt "$REFINO_START_FAIL_STREAK_TTL_SECS" ] && prev_n=0
+  fi
+  n=$(( prev_n + 1 ))
+  printf '%s %s\n' "$n" "$now" > "$f" 2>/dev/null || return 1
+  printf '%s' "$n"
+}
+
+# A reviewer that DID spawn ends any failure streak.
+_refino_start_fail_reset() { rm -f "$REFINO_START_FAIL_STREAK_FILE" 2>/dev/null || true; }
+
+# refino_start_failed_exit <spawn_fail|verdict_create_fail> <story_id> [detail]
+#   Epilogue of a HANDLED start failure — the CALLER has already released the
+#   claim and cleaned up (fail-closed: nothing promoted, no verdict invented).
+#   Counts the streak, appends the audit line, logs what it decided, and exits
+#   with refino_start_fail_exit_code. Never returns.
+refino_start_failed_exit() {
+  local kind="$1" sid="$2" detail="${3:-}" streak="" code
+  if streak=$(_refino_start_fail_bump); then
+    code=$(refino_start_fail_exit_code "$streak" "$REFINO_START_FAIL_ESCALATE_AT")
+  else
+    streak=""
+    code=1
+    warn "  Start-failure streak NOT recorded ($REFINO_START_FAIL_STREAK_FILE unwritable) — cannot prove this failure is transient, so exiting 1 exactly as before ga-owlmfj."
+  fi
+  # Same event name + fields as before for spawn_fail (existing readers keep
+  # working); streak/exit are additive.
+  jq -c -n --arg ts "$(ts)" --arg ev "$kind" --arg story "$sid" --arg e "$detail" \
+    --arg streak "${streak:-0}" --argjson code "$code" \
+    '{ts:$ts, event:$ev, story:$story, spawn_err:$e, streak:($streak|tonumber), exit:$code}' \
+    >> "$RG_LOG" 2>/dev/null || true
+  if [ -n "$streak" ]; then
+    if [ "$code" = "0" ]; then
+      log "  Start failure #${streak} (${kind}, ${sid}) is TRANSIENT so far — claim released, exiting 0; the next sweep retries. Escalates (exit 1) at ${REFINO_START_FAIL_ESCALATE_AT} consecutive."
+    else
+      err "  Start failure #${streak} (${kind}, ${sid}) reached the limit of ${REFINO_START_FAIL_ESCALATE_AT} consecutive — PERSISTENT, not a blip. Exiting 1 so daemon-presence-watchdog escalates."
+    fi
+  fi
+  exit "$code"
 }
 
 # ── TESTABLE I/O HELPER (bd_ is dependency-injected — selftest stubs it) ───────
@@ -627,16 +751,30 @@ story: $STORY_ID
 title: $STORY_TITLE
 refiner: ${REFINER:-unknown}
 The reviewer closes this bead with verdict:PASS or verdict:FAIL + notes." \
-    --json 2>/dev/null | jq -r '.id // empty')
+    --json 2>/dev/null | jq -r '.id // empty' || echo "")
+  # ga-owlmfj: the `|| echo ""` above is load-bearing. Without it a bd create that
+  # EXITS NON-ZERO fails this assignment under set -e + pipefail and the script
+  # dies RIGHT HERE — before the branch below can log, release the claim or count
+  # the failure, so that branch was unreachable for the usual way a create fails
+  # (same class as ga-indr6o: an unguarded bd_ pipeline kills the whole sweep).
   if [ -z "$VERDICT_BEAD_ID" ]; then
     err "Failed to create verdict bead for $STORY_ID — releasing claim, will retry next sweep."
     bd_ label remove "$STORY_ID" "refino-gate:reviewing" -q 2>/dev/null || true
-    exit 1
+    refino_start_failed_exit verdict_create_fail "$STORY_ID"
   fi
   log "  Verdict bead: $VERDICT_BEAD_ID (created)"
 fi
 
 # The review task = the rubric (Definition of Refined) + the exact bd commands.
+#
+# ga-owlmfj: this heredoc is UNQUOTED on purpose ($STORY_ID etc. must expand), so
+# its whole body — including the "# ..." comment lines the reviewer reads — is
+# subject to COMMAND SUBSTITUTION. NEVER put a backtick or a dollar-paren in it.
+# A backticked bd serve in the comment below EXECUTED bd serve on every single
+# review: harmless noise under launchd (cwd=/, 146 blocks in the job's .err), but
+# with a .beads reachable from cwd it STARTS AN HTTP SERVER and blocks this sweep
+# forever while holding the claim. The selftest renders this exact text and fails
+# on any executed command or unescaped substitution.
 REVIEW_TASK=$(cat <<TASK
 REFINO QUALITY GATE — You review the QUALITY of a refined product story.
 You do NOT approve it (only Athos approves). You attest that the refinement is
@@ -685,7 +823,7 @@ RECORD YOUR VERDICT with EXACTLY these commands, then exit:
 # applyLabelUpdates (cmd/bd/show_unit_helpers.go), which runs the entire ADD loop
 # to completion and THEN the REMOVE loop; internal/storage/dolt/labels.go has
 # AddLabel and RemoveLabel each opening and committing their OWN sql.Tx. This town
-# runs dolt_mode="server" against a live dolt sql-server with no `bd serve` proxy,
+# runs dolt_mode="server" against a live dolt sql-server with no 'bd serve' proxy,
 # which is exactly that code path. So a mid-call failure still leaves a partial
 # state — it just moved: the surviving half is now "verdict:PASS added, pending
 # NOT removed" (both labels present) instead of "pending removed, PASS never
@@ -777,7 +915,9 @@ refino_spawn_reviewer() {
     --title "refino-reviewer: $STORY_ID (round $THIS_ROUND)${_title_suffix}" \
     --json \
     2>"$_spawn_err_file" || echo "{}")
-  _spawn_err=$(head -c 300 "$_spawn_err_file" 2>/dev/null || echo "")
+  # ga-owlmfj: NOT `head -c 300` — that logged only the engine's builtin-pack
+  # banner and hid the real error. See refino_spawn_err_summary.
+  _spawn_err=$(refino_spawn_err_summary "$_spawn_err_file")
   rm -f "$_spawn_err_file" 2>/dev/null || true
   SESSION_ID=$(echo "$SESSION_JSON" | jq -r '.session_id // empty')
   if [ -z "$SESSION_ID" ]; then
@@ -820,10 +960,11 @@ if ! refino_spawn_reviewer "spawn"; then
   err "Failed to spawn refino reviewer for $STORY_ID — releasing claim (retry next sweep). spawn_err=${_spawn_err:-none}"
   bd_ label remove "$STORY_ID" "refino-gate:reviewing" -q 2>/dev/null || true
   bd_ close "$VERDICT_BEAD_ID" 2>/dev/null || true
-  jq -c -n --arg ts "$(ts)" --arg story "$STORY_ID" --arg e "${_spawn_err:-none}" \
-    '{ts:$ts, event:"spawn_fail", story:$story, spawn_err:$e}' >> "$RG_LOG" 2>/dev/null || true
-  exit 1
+  # Audit line (spawn_fail) is written by the helper, which also decides the exit
+  # code — a handled, retried-next-sweep failure is NOT a daemon crash (ga-owlmfj).
+  refino_start_failed_exit spawn_fail "$STORY_ID" "${_spawn_err:-none}"
 fi
+_refino_start_fail_reset   # a reviewer that spawned ends any start-failure streak
 log "  Reviewer session spawned: $SESSION_ID"
 log "  Rubric delivered to reviewer for $STORY_ID (durable pull, ga-67hae)."
 

@@ -359,7 +359,12 @@ fi
 #    dispatcher logs to $GC_CITY/.gc/logs/…, not stdout, so assert on the log
 #    file. With no live bd, the queue is empty → it exits 0 without spawning.
 _drycity="$(mktemp -d)"
-REFINO_CITY_OVERRIDE="$_drycity" DRY_RUN=1 \
+# ga-owlmfj: scan ONLY the temp city. Without REFINO_GATE_STORES the script's
+# default store list includes the REAL whatsapp_automation / property_scrapers
+# stores, and /opt/homebrew/bin on PATH puts the REAL bd in reach — so this
+# "hermetic" check read production and, whenever a story was queued there, reached
+# the rubric heredoc (which then ran a backticked bd serve and hung the selftest).
+REFINO_CITY_OVERRIDE="$_drycity" REFINO_GATE_STORES="$_drycity" DRY_RUN=1 \
   PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
   bash "$DISPATCHER" >/dev/null 2>&1
 _dryrc=$?
@@ -747,18 +752,28 @@ fi
 # "finished normally but happened to return non-zero."
 echo "Regression: _refino_gate_find_pending_verdict survives a failing bd_ query (gate-run ga-indr6o)"
 
-OLD_PROBE_OUTPUT=$(
-  set -euo pipefail
-  bd_() { return 1; }  # simulate Dolt down / query timeout / connection refused
-  _predates_fix_probe() {
-    local story_id="$1"
-    bd_ query --json "whatever" --limit 0 2>/dev/null \
-      | jq -r 'sort_by(.created_at // "") | .[0].id // empty' 2>/dev/null
-  }
-  echo "BEFORE"
-  _predates_fix_probe "fixture-story" >/dev/null 2>&1
-  echo "AFTER"
-) 2>/dev/null || true
+# ga-owlmfj: BOTH probes below now run in a FRESH bash process ($BASH + a script
+# file), not in a `$( ... ) || true` subshell of this file. Whether `set -e` is
+# honoured inside a command substitution that sits on the left of `||` differs
+# between bash versions: macOS /bin/bash 3.2 honours it, Homebrew bash 5.3 (first
+# on the PATH of the gate guard/dispatcher since 08-29) IGNORES it. Under 5.3 the
+# old form (a) failed the characterization on main itself and (b) made the "fix"
+# probe below PASS VACUOUSLY — it could not detect a reverted `|| echo` guard. A
+# fresh top-level script has the same errexit semantics on every version.
+_probe_dir=$(mktemp -d)
+cat > "$_probe_dir/old.sh" <<'PROBE'
+set -euo pipefail
+bd_() { return 1; }  # simulate Dolt down / query timeout / connection refused
+_predates_fix_probe() {
+  local story_id="$1"
+  bd_ query --json "whatever" --limit 0 2>/dev/null \
+    | jq -r 'sort_by(.created_at // "") | .[0].id // empty' 2>/dev/null
+}
+echo "BEFORE"
+_predates_fix_probe "fixture-story" >/dev/null 2>&1
+echo "AFTER"
+PROBE
+OLD_PROBE_OUTPUT=$("$BASH" "$_probe_dir/old.sh" 2>/dev/null || true)
 
 if printf '%s' "$OLD_PROBE_OUTPUT" | grep -q "AFTER"; then
   bad "characterization: expected the pre-fix shape to die under set -euo pipefail before printing AFTER — it didn't (fixture not faithful to gate-run ga-indr6o); output=[$OLD_PROBE_OUTPUT]"
@@ -768,13 +783,16 @@ else
   bad "characterization: probe didn't even reach BEFORE — harness is broken, not the fixture; output=[$OLD_PROBE_OUTPUT]"
 fi
 
-NEW_PROBE_OUTPUT=$(
-  set -euo pipefail
-  bd_() { return 1; }  # identical simulated failure, against the REAL function
-  echo "BEFORE"
-  _refino_gate_find_pending_verdict "fixture-story" >/dev/null 2>&1
-  echo "AFTER"
-) 2>/dev/null || true
+cat > "$_probe_dir/new.sh" <<'PROBE'
+set -euo pipefail
+REFINO_GATE_LIB=1 . "$PROBE_DISPATCHER"   # the REAL shipped functions, lib mode
+bd_() { return 1; }  # identical simulated failure, against the REAL function
+echo "BEFORE"
+_refino_gate_find_pending_verdict "fixture-story" >/dev/null 2>&1
+echo "AFTER"
+PROBE
+NEW_PROBE_OUTPUT=$(PROBE_DISPATCHER="$DISPATCHER" "$BASH" "$_probe_dir/new.sh" 2>/dev/null || true)
+rm -rf "$_probe_dir"
 
 if printf '%s' "$NEW_PROBE_OUTPUT" | grep -q "AFTER"; then
   ok "fix: the REAL _refino_gate_find_pending_verdict survives a failing bd_ query — falls through to the documented fail-safe instead of killing the sweep (gate-run ga-indr6o)"
@@ -782,6 +800,247 @@ else
   bad "REGRESSION (gate-run ga-indr6o): _refino_gate_find_pending_verdict still dies under set -euo pipefail when bd_ query fails — the || echo fallback is missing or was reverted; output=[$NEW_PROBE_OUTPUT]"
 fi
 unset -f bd_ _predates_fix_probe 2>/dev/null || true
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ga-owlmfj — the "crash-loop" alert on this dispatcher had TWO distinct causes,
+# and the one the alert pointed at was the harmless one.
+#
+#  (A) THE NOISE (what the alert quoted). The reviewer-rubric heredoc
+#      (REVIEW_TASK=$(cat <<TASK … TASK), UNQUOTED so $STORY_ID etc. expand)
+#      carried a comment with a backticked `bd serve`. In an unquoted heredoc
+#      backticks are COMMAND SUBSTITUTION: every review EXECUTED `bd serve`.
+#      Under launchd (cwd=/) it just fails and prints "no beads database found
+#      + bd serve usage" into the job's .err (146 blocks, byte-identical to a
+#      minimal repro). It never caused exit=1 — but with any .beads reachable
+#      from cwd it STARTS AN HTTP SERVER and blocks the sweep forever holding
+#      the claim (observed 19/09: the pre-fix selftest, run from a cwd inside the
+#      city, hung on exactly this and left an orphan `bd db-proxy-child`).
+#  (B) THE EXIT CODE (what actually raised the alarm). `gc session new` fails
+#      intermittently (7 times in the run log, 5 in a row on 19/09 while beads p95
+#      latency was 12-14s); the verdict-bead create has the same exit path. The
+#      dispatcher handles a start failure correctly — releases the claim, logs
+#      ERROR, retries next sweep — and then `exit 1`s. daemon-presence-watchdog
+#      reads any positive exit as a code failure: 2 in a row = CRASH-LOOP →
+#      `kickstart -k` (kills whatever sweep is in flight) → heals exhausted → Mayor
+#      paged. A handled, retried-next-sweep blip is not a crash. (And a create that
+#      exits non-zero never even reached that graceful branch: unguarded pipeline
+#      under set -e + pipefail — test B7.)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── (A) static + dynamic: rendering the rubric must execute NOTHING ───────────
+echo "Regression ga-owlmfj (A): the REVIEW_TASK heredoc must not execute any command"
+_rt_block=$(awk '/^REVIEW_TASK=\$\(cat <<TASK$/{f=1} f{print} f&&/^\)$/{exit}' "$DISPATCHER")
+_rt_first=$(printf '%s\n' "$_rt_block" | sed -n '1p')
+_rt_last=$(printf '%s\n' "$_rt_block" | sed -n '$p')
+if [ "$_rt_first" != 'REVIEW_TASK=$(cat <<TASK' ] || [ "$_rt_last" != ')' ]; then
+  bad "harness: could not extract the REVIEW_TASK heredoc from the shipped dispatcher (refusing a vacuous pass) first=[$_rt_first] last=[$_rt_last]"
+else
+  ok "harness: extracted the shipped REVIEW_TASK heredoc ($(printf '%s\n' "$_rt_block" | wc -l | tr -d ' ') lines)"
+  # static: the body is UNQUOTED, so ANY unescaped backtick or $( is command
+  # substitution. (Body = between the opening line and the closing ')'.)
+  _rt_hits=$(printf '%s\n' "$_rt_block" | sed '1d;$d' | sed -E 's/\\.//g' | grep -nE '`|\$\(' || true)
+  if [ -z "$_rt_hits" ]; then
+    ok "static: no unescaped backtick / \$( inside the unquoted rubric heredoc"
+  else
+    bad "REGRESSION (ga-owlmfj): the unquoted rubric heredoc contains command substitution — it EXECUTES on every review: $(printf '%s' "$_rt_hits" | head -3 | tr '\n' '|')"
+  fi
+  # dynamic: render the SHIPPED text with fixture bd/gc/notify on PATH; any call = FAIL
+  _rt_sb=$(mktemp -d)
+  mkdir -p "$_rt_sb/shim"
+  for _c in bd gc notify; do
+    printf '#!/bin/bash\necho "%s $*" >> "%s/exec.log"\nexit 1\n' "$_c" "$_rt_sb" > "$_rt_sb/shim/$_c"
+    chmod +x "$_rt_sb/shim/$_c"
+  done
+  {
+    echo 'set -euo pipefail'
+    echo 'STORY_ID=zz-fx1; STORY_TITLE="Fixture story"; M_MODE=""; S_TYPE=""'
+    echo 'M_RESUMO=r; M_OQUEE=o; M_ESTRELA=e; M_EQUILIB=q; M_DASH=d; M_CRIT="c1
+c2"; M_DEPS=p; M_FORA=f; M_SIZE=s'
+    echo 'REFINO_GATE_STORE=/fixture/store; VERDICT_BEAD_ID=zz-wisp-fx'
+    printf '%s\n' "$_rt_block"
+    echo 'printf "%s" "$REVIEW_TASK"'
+  } > "$_rt_sb/render.sh"
+  ( cd / && env -i PATH="$_rt_sb/shim:/usr/bin:/bin" /bin/bash "$_rt_sb/render.sh" ) > "$_rt_sb/rendered" 2> "$_rt_sb/stderr" || true
+  if [ ! -s "$_rt_sb/exec.log" ]; then
+    ok "dynamic: rendering the rubric ran no bd/gc/notify command"
+  else
+    bad "REGRESSION (ga-owlmfj): rendering the rubric EXECUTED: $(head -3 "$_rt_sb/exec.log" | tr '\n' '|')"
+  fi
+  if [ ! -s "$_rt_sb/stderr" ]; then
+    ok "dynamic: rendering the rubric wrote nothing to stderr (no more \"no beads database found\" noise in the job's .err)"
+  else
+    bad "REGRESSION (ga-owlmfj): rendering the rubric emitted stderr: $(head -c 160 "$_rt_sb/stderr" | tr '\n' ' ')"
+  fi
+  if grep -q 'no .bd serve. proxy' "$_rt_sb/rendered" \
+     && grep -q '^STORY: zz-fx1 — Fixture story$' "$_rt_sb/rendered" \
+     && grep -q '^bd -C "/fixture/store" update "zz-wisp-fx" --add-label verdict:PASS --remove-label verdict:pending$' "$_rt_sb/rendered"; then
+    ok "rendered rubric keeps the words 'bd serve' as TEXT and still expands \$STORY_ID / \$REFINO_GATE_STORE / \$VERDICT_BEAD_ID"
+  else
+    bad "rendered rubric lost the 'bd serve' text or stopped expanding variables (a substituted-away word reads as 'no  proxy'): $(grep -m1 'proxy' "$_rt_sb/rendered" | head -c 120)"
+  fi
+  rm -rf "$_rt_sb"
+fi
+
+# ── (B) pure decision + spawn-error summary (lib mode) ────────────────────────
+echo "Regression ga-owlmfj (B): start-failure exit-code decision is PURE and fails LOUD when unsure"
+if declare -F refino_start_fail_exit_code >/dev/null 2>&1; then
+  [ "$(refino_start_fail_exit_code 1 6)" = "0" ] && ok "1st consecutive start failure → exit 0 (transient)" || bad "streak 1/6 should exit 0"
+  [ "$(refino_start_fail_exit_code 5 6)" = "0" ] && ok "5th of 6 → still exit 0 (the 19/09 burst was exactly 5 sweeps)" || bad "streak 5/6 should exit 0"
+  [ "$(refino_start_fail_exit_code 6 6)" = "1" ] && ok "6th consecutive → exit 1 (PERSISTENT → existing watchdog escalation)" || bad "streak 6/6 should exit 1"
+  [ "$(refino_start_fail_exit_code 40 6)" = "1" ] && ok "streak far past the limit stays exit 1" || bad "streak 40/6 should exit 1"
+  [ "$(refino_start_fail_exit_code 1 0)" = "1" ] && ok "escalate_at floor is 1 (a misconfigured 0 cannot silence escalation)" || bad "escalate_at 0 must floor to 1 → exit 1"
+  [ "$(refino_start_fail_exit_code "" 6)" = "1" ] && ok "UNKNOWN streak (empty) → exit 1: cannot prove transient, so stay as loud as before the fix" || bad "empty streak must exit 1 (fail loud), not 0"
+  [ "$(refino_start_fail_exit_code "abc" 6)" = "1" ] && ok "UNKNOWN streak (garbage) → exit 1" || bad "garbage streak must exit 1 (fail loud)"
+else
+  bad "REGRESSION (ga-owlmfj): refino_start_fail_exit_code is not defined"
+fi
+
+echo "Regression ga-owlmfj (B2): spawn_err summary skips the engine's builtin-pack banner so the REAL error is logged"
+if declare -F refino_spawn_err_summary >/dev/null 2>&1; then
+  _se=$(mktemp)
+  # the banner alone is > 300 chars: pre-fix head -c 300 logged ONLY the banner
+  { printf 'warning: builtin pack "gastown" on disk differs from the copy embedded in this gc binary (19 files: agents/boot/prompt.template.md, agents/deacon/prompt.template.md, agents/mayor/prompt.template.md, agents/polecat/prompt.template.md, agents/refinery/prompt.template.md, +14 more), and gc has no materialize-history record for it — this is either a local edit or content left over from an older binary\n'; echo 'Error: session bead create timed out'; } > "$_se"
+  [ "$(refino_spawn_err_summary "$_se")" = "Error: session bead create timed out" ] && ok "banner + real error → only the real error" || bad "summary should be the real error, got [$(refino_spawn_err_summary "$_se")]"
+  printf 'Error: plain failure\nmore detail\n' > "$_se"
+  [ "$(refino_spawn_err_summary "$_se")" = "Error: plain failure more detail" ] && ok "no banner → unchanged, collapsed to ONE log line (newlines → spaces)" || bad "no-banner summary wrong: [$(refino_spawn_err_summary "$_se")]"
+  printf 'warning: builtin pack "gastown" on disk differs\n' > "$_se"
+  [ -z "$(refino_spawn_err_summary "$_se")" ] && ok "banner only → empty (caller prints 'none', it is not an error text)" || bad "banner-only should summarize to empty"
+  [ "$(refino_spawn_err_summary "/nonexistent/spawn-err")" = "<stderr capture unavailable>" ] \
+    && ok "missing/unreadable capture → explicit '<stderr capture unavailable>' (a lost capture must not read like a quiet gc), no crash under set -e" \
+    || bad "missing capture should say so, got [$(refino_spawn_err_summary "/nonexistent/spawn-err")]"
+  rm -f "$_se"
+else
+  bad "REGRESSION (ga-owlmfj): refino_spawn_err_summary is not defined"
+fi
+
+# ── (B3) end to end: the REAL shipped script, /bin/bash 3.2, fixture bd/gc ───
+# Not a re-implementation: bash "$DISPATCHER" itself, so the exit code asserted
+# here is the exit code launchd/the watchdog would read.
+_ow_run() {   # _ow_run <spawn: fail|ok> <create: ok|fail> <streak seed | -> [streak path]
+  local spawn="$1" create="$2" seed="$3" spath="${4:-}" _to=""
+  OW_SB=$(mktemp -d)
+  mkdir -p "$OW_SB/shim" "$OW_SB/city/.gc" "$OW_SB/home"
+  [ -n "$spath" ] || spath="$OW_SB/streak"
+  [ "$seed" = "-" ] || printf '%s\n' "$seed" > "$OW_SB/streak"
+  OW_STREAK_PATH="$spath"
+  cat > "$OW_SB/shim/bd" <<'SHIM'
+#!/bin/bash
+echo "bd $*" >> "$OW_CALLS"
+case " $* " in
+  *" list "*)
+    case " $* " in
+      *"--exclude-label"*) printf '%s' "$OW_QUEUE_JSON" ;;
+      *) printf '[]' ;;
+    esac ;;
+  *" query "*) printf '[]' ;;
+  *" create "*)
+    if [ "$OW_CREATE" = "ok" ]; then printf '{"id":"zz-wisp-fx"}'; else echo "fixture: bd create failed" >&2; exit 1; fi ;;
+  *" show zz-wisp-fx "*) printf '[{"id":"zz-wisp-fx","assignee":"fx-session","labels":["type:refino-gate-verdict","verdict:PASS"]}]' ;;
+  *" show "*) printf '[{"id":"zz-fx1","labels":["story:refino-review","refino-gate:reviewing"],"metadata":{"story.resumo":"r"},"issue_type":"feature"}]' ;;
+esac
+exit 0
+SHIM
+  cat > "$OW_SB/shim/gc" <<'SHIM'
+#!/bin/bash
+echo "gc $*" >> "$OW_CALLS"
+case " $* " in
+  *" session new "*)
+    if [ "$OW_SPAWN" = "ok" ]; then
+      printf '{"session_id":"ga-wisp-fx","session_name":"fx-session"}'
+    else
+      # real shape of the failure: a long engine banner FIRST, the actual error after it
+      printf 'warning: builtin pack "gastown" on disk differs from the copy embedded in this gc binary (19 files: agents/boot/prompt.template.md, agents/deacon/prompt.template.md, agents/mayor/prompt.template.md, agents/polecat/prompt.template.md, +15 more), and gc has no materialize-history record for it\n' >&2
+      echo 'Error: fixture: session bead create timed out (dolt busy)' >&2
+      exit 1
+    fi ;;
+esac
+exit 0
+SHIM
+  printf '#!/bin/bash\necho "notify $*" >> "$OW_CALLS"\nexit 0\n' > "$OW_SB/shim/notify"
+  chmod +x "$OW_SB/shim/bd" "$OW_SB/shim/gc" "$OW_SB/shim/notify"
+  command -v timeout >/dev/null 2>&1 && _to="timeout 120"
+  local _jqdir; _jqdir=$(dirname "$(command -v jq)")
+  # NB: sourcing the dispatcher at the top of this file turned on `set -e` in THIS
+  # shell, so a non-zero exit from the script under test must be captured with
+  # `|| OW_RC=$?` — a bare `OW_RC=$?` on the next line is never reached.
+  OW_RC=0
+  ( cd / && $_to env -i HOME="$OW_SB/home" PATH="$OW_SB/shim:$_jqdir:/usr/bin:/bin" \
+      REFINO_CITY_OVERRIDE="$OW_SB/city" REFINO_GATE_STORES="$OW_SB/city" QUIET_HOURS_OVERRIDE=OPEN \
+      REFINO_START_FAIL_STREAK_FILE="$spath" \
+      OW_CALLS="$OW_SB/calls" OW_SPAWN="$spawn" OW_CREATE="$create" \
+      OW_QUEUE_JSON='[{"id":"zz-fx1","title":"Fixture story","created_at":"2026-09-19T00:00:00Z","assignee":"","created_by":"auto-refino","issue_type":"feature","metadata":{},"labels":["story:refino-review"]}]' \
+      /bin/bash "$DISPATCHER" ) > "$OW_SB/out" 2> "$OW_SB/err" || OW_RC=$?
+  OW_LOG=$(cat "$OW_SB/city/.gc/logs/refino-gate-dispatcher.log" 2>/dev/null || echo "")
+  OW_CALLS_TXT=$(cat "$OW_SB/calls" 2>/dev/null || echo "")
+  OW_AUDIT=$(cat "$OW_SB/city/.gc/refino-gate.jsonl" 2>/dev/null || echo "")
+  OW_STREAK_TXT=$(cat "$spath" 2>/dev/null || echo "")
+}
+_ow_done() { rm -rf "$OW_SB"; }
+
+echo "Regression ga-owlmfj (B3): ONE transient reviewer-spawn failure is handled, not a crash"
+_ow_run fail ok -
+if [ "$OW_RC" -eq 0 ]; then
+  ok "spawn fails once (streak file absent) → the sweep exits 0 — no false CRASH-LOOP / no kickstart of a healthy job"
+else
+  bad "REGRESSION (ga-owlmfj): a single handled spawn failure exits $OW_RC (watchdog reads that as a code failure). log: $(printf '%s' "$OW_LOG" | tail -n 2 | tr '\n' '|' | cut -c1-260)"
+fi
+printf '%s\n' "$OW_CALLS_TXT" | grep -q 'label remove zz-fx1 refino-gate:reviewing' && ok "fail-closed: the review claim is released" || bad "claim was NOT released on spawn failure"
+printf '%s\n' "$OW_CALLS_TXT" | grep -q 'close zz-wisp-fx' && ok "fail-closed: the just-created verdict bead is closed (no orphan wisp)" || bad "verdict bead not closed on spawn failure"
+printf '%s\n' "$OW_CALLS_TXT" | grep -qE 'label add zz-fx1 story:needs-approval|--add-label story:needs-approval' && bad "spawn failure must NEVER promote the story to Athos's queue" || ok "fail-closed: nothing promoted / no verdict fabricated"
+printf '%s\n' "$OW_LOG" | grep -q 'ERROR: Failed to spawn refino reviewer for zz-fx1' && ok "still LOGGED as ERROR (handled ≠ silent)" || bad "the spawn failure is no longer logged as ERROR"
+printf '%s\n' "$OW_LOG" | grep 'Failed to spawn' | grep -q 'session bead create timed out' \
+  && ok "the log carries the REAL cause (banner skipped), not just the 300-char engine warning" \
+  || bad "the log still hides the real spawn error behind the engine banner: $(printf '%s' "$OW_LOG" | grep 'Failed to spawn' | head -c 200)"
+printf '%s\n' "$OW_AUDIT" | grep '"event":"spawn_fail"' | grep -q '"story":"zz-fx1"' && ok "audit line spawn_fail still written (existing consumers keep working)" || bad "audit spawn_fail line missing"
+printf '%s\n' "$OW_AUDIT" | grep '"event":"spawn_fail"' | grep -q '"streak":1' && ok "audit line records streak=1" || bad "audit line has no streak=1"
+case "$OW_STREAK_TXT" in "1 "*) ok "streak file now says 1 consecutive failure" ;; *) bad "streak file should start with '1 ', got [$OW_STREAK_TXT]" ;; esac
+_ow_done
+
+echo "Regression ga-owlmfj (B4): a PERSISTENT failure still escalates (this is not a silencer)"
+_ow_run fail ok "5 $(date +%s)"
+if [ "$OW_RC" -eq 1 ]; then
+  ok "6th consecutive start failure → exit 1 → daemon-presence-watchdog's existing crash-loop/escalation path fires"
+else
+  bad "REGRESSION (ga-owlmfj): the 6th consecutive failure exited $OW_RC — persistent breakage would now be SILENT"
+fi
+printf '%s\n' "$OW_LOG" | grep -q 'PERSISTENT' && ok "log says PERSISTENT with the streak, so the watchdog alert is explainable" || bad "no PERSISTENT marker in the log"
+_ow_done
+
+echo "Regression ga-owlmfj (B5): a STALE streak (old failures long ago) does not count as consecutive"
+_ow_run fail ok "50 $(( $(date +%s) - 7200 ))"
+[ "$OW_RC" -eq 0 ] && ok "50 failures 2h ago + 1 now → treated as the 1st → exit 0" || bad "stale streak wrongly escalated (rc=$OW_RC)"
+case "$OW_STREAK_TXT" in "1 "*) ok "stale streak restarted at 1" ;; *) bad "stale streak should restart at 1, got [$OW_STREAK_TXT]" ;; esac
+_ow_done
+
+echo "Regression ga-owlmfj (B5b): a CORRUPT streak file restarts the count VISIBLY, not silently"
+_ow_run fail ok "not-a-number garbage"
+[ "$OW_RC" -eq 0 ] && ok "unparseable streak file → count restarts at 1 → exit 0" || bad "corrupt streak file wrongly escalated (rc=$OW_RC)"
+printf '%s\n' "$OW_LOG" | grep -q 'streak file .* is unparseable' && ok "…and the restart is LOGGED (silent restart would let corruption quietly defer escalation)" || bad "corrupt streak file restarted the count without saying so"
+case "$OW_STREAK_TXT" in "1 "*) ok "streak file rewritten cleanly ('1 <epoch>')" ;; *) bad "corrupt streak file was not repaired, got [$OW_STREAK_TXT]" ;; esac
+_ow_done
+
+echo "Regression ga-owlmfj (B6): a successful spawn resets the streak"
+_ow_run ok ok "3 $(date +%s)"
+[ "$OW_RC" -eq 0 ] && ok "sweep with a working spawn completes (exit 0)" || bad "success path exited $OW_RC; log: $(printf '%s' "$OW_LOG" | tail -n 2 | tr '\n' '|' | cut -c1-200)"
+printf '%s\n' "$OW_LOG" | grep -q 'Refino gate sweep done for zz-fx1' && ok "success path ran through to 'sweep done' (fixture is faithful)" || bad "success path did not complete — fixture broken"
+[ ! -e "$OW_STREAK_PATH" ] && ok "streak file removed after a successful spawn" || bad "streak file survived a successful spawn: [$OW_STREAK_TXT]"
+_ow_done
+
+echo "Regression ga-owlmfj (B7): the verdict-bead create failure path is handled the same way"
+_ow_run ok fail -
+[ "$OW_RC" -eq 0 ] && ok "verdict-bead create failure (1st) → exit 0" || bad "REGRESSION (ga-owlmfj): a handled verdict-create failure exits $OW_RC"
+printf '%s\n' "$OW_LOG" | grep -q 'ERROR: Failed to create verdict bead for zz-fx1' && ok "still logged as ERROR" || bad "verdict-create failure no longer logged"
+printf '%s\n' "$OW_CALLS_TXT" | grep -q 'label remove zz-fx1 refino-gate:reviewing' && ok "claim released" || bad "claim not released on verdict-create failure"
+printf '%s\n' "$OW_CALLS_TXT" | grep -q 'session new' && bad "must not spawn a reviewer when there is no verdict bead" || ok "no reviewer spawned without a verdict bead"
+printf '%s\n' "$OW_AUDIT" | grep -q '"event":"verdict_create_fail"' && ok "audit line verdict_create_fail written" || bad "audit verdict_create_fail line missing"
+_ow_done
+
+echo "Regression ga-owlmfj (B8): if the streak cannot be recorded, stay as loud as before (exit 1) — never quieter"
+_ow_run fail ok - "/nonexistent-dir-ga-owlmfj/streak"
+[ "$OW_RC" -eq 1 ] && ok "unwritable streak file → exit 1 (cannot prove the failure is transient)" || bad "unwritable streak must fail loud (exit 1), got rc=$OW_RC"
+printf '%s\n' "$OW_LOG" | grep -qi 'cannot prove\|unwritable' && ok "log explains why it stayed loud" || bad "no explanation logged for the loud fallback"
+_ow_done
+unset -f _ow_run _ow_done 2>/dev/null || true
 
 echo ""
 echo "refino-gate-dispatcher.selftest: PASS=$PASS FAIL=$FAIL"
