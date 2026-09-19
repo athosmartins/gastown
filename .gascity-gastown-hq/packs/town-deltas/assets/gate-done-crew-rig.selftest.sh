@@ -485,7 +485,6 @@ else
     "$PROD_ROOT/whatsapp_automation/crew/mila/.claude/commands/gate-done.md"
     "$PROD_ROOT/whatsapp_automation/crew/oracle/.claude/commands/gate-done.md"
     "$PROD_ROOT/whatsapp_automation/crew/peter/.claude/commands/gate-done.md"
-    "$PROD_ROOT/whatsapp_automation/crew/property_scrapers/.claude/commands/gate-done.md"
     "$PROD_ROOT/whatsapp_automation/crew/thies/.claude/commands/gate-done.md"
     "$PROD_ROOT/whatsapp_automation/refinery/rig/.claude/commands/gate-done.md"
     "$PROD_ROOT/whatsapp_automation/witness/rig/.claude/commands/gate-done.md"

@@ -4011,12 +4011,12 @@ gate_spawn_failure_requeue_or_error() {
   return 0
 }
 
-# branch_tip_is_merge_commit <branch_ref> — "1" if <branch_ref>'s tip commit
-# itself has a second parent (i.e. IS a merge commit), "0" otherwise —
-# including when the ref cannot be resolved at all (fail toward the existing,
-# well-tested rebase path rather than the newer merge path on an ambiguous
-# read; an unresolvable ref is already handled upstream of this check by
-# MT_VERDICT="err").
+# branch_has_merge_in_range <branch_ref> <upstream_ref> — "1" if any commit
+# reachable from <branch_ref> but not from <upstream_ref> is itself a merge
+# commit (has 2+ parents), "0" otherwise — including when either ref cannot
+# be resolved at all (fail toward the existing, well-tested rebase path
+# rather than the newer merge path on an ambiguous read; an unresolvable ref
+# is already handled upstream of this check by MT_VERDICT="err").
 # ga-kyxih: `git rebase <upstream>` (used unconditionally below, no
 # --rebase-merges) treats the rebased range as a flat, linearized patch
 # series — it does not correctly replay a commit that is ITSELF a merge (e.g.
@@ -4027,16 +4027,31 @@ gate_spawn_failure_requeue_or_error() {
 # literal `git rebase` can still misbehave or fail on such a branch even when
 # merge-tree reported clean — while a real `git merge` (the strategy the
 # branch's own history already used once) resolves it correctly, with zero
-# conflicts in one incident and a trivial additive conflict in the other. This
-# predicate lets the call sites below route merge-commit-tip branches to
-# `git merge` instead of `git rebase`, without touching the rebase path at all
-# for the overwhelming-majority linear-history case (AC3 non-regression).
-# `<ref>^2` only resolves when a SECOND parent exists — the cheapest, most
-# direct test; no log-parsing, no `rev-list --parents` field-counting.
-branch_tip_is_merge_commit() {
+# conflicts in one incident and a trivial additive conflict in the other.
+# ga-sg1axd: the original predicate here (branch_tip_is_merge_commit) tested
+# ONLY the tip commit (`<ref>^2`). wa-q0crq (P0) hit gate-status:needs-rebase
+# TWICE with a merge-tree already proven clean, because its real shape was
+# [re-anchor merge commit] + [one ordinary commit on top] (a regenerated
+# deploy_deps.json) — a merge further back in the branch's own history, not
+# at the tip. The tip-only test returned "0", so the gate still routed
+# through `git rebase`, which drops merge commits from the replay entirely
+# and can silently lose whatever that merge itself resolved. Testing the
+# whole upstream..branch interval catches this shape too, while a real
+# linear branch (the overwhelming-majority case) still returns "0" exactly
+# as before (AC3 non-regression) — `git rev-list --merges` only lists
+# commits that themselves have 2+ parents, so a plain history yields empty
+# output regardless of range size.
+# This predicate lets the call sites below route ANY branch carrying a merge
+# commit not yet on <upstream_ref> to `git merge` instead of `git rebase`,
+# without touching the rebase path at all for real linear history.
+branch_has_merge_in_range() {
   local branch_ref="${1:-}"
-  [ -z "$branch_ref" ] && { printf '0'; return 0; }
-  if git_rig rev-parse --verify -q "${branch_ref}^2" >/dev/null 2>&1; then
+  local upstream_ref="${2:-}"
+  if [ -z "$branch_ref" ] || [ -z "$upstream_ref" ]; then
+    printf '0'
+    return 0
+  fi
+  if [ -n "$(git_rig rev-list --merges -n1 "${upstream_ref}..${branch_ref}" 2>/dev/null)" ]; then
     printf '1'
   else
     printf '0'
@@ -4057,7 +4072,7 @@ branch_tip_is_merge_commit() {
 # as permanently alive, and the branch waits forever for a push race that was
 # never going to happen. The branch's own git history is the one signal that
 # cannot be reassigned/misattributed after the fact — same reasoning
-# branch_tip_is_merge_commit above already relies on git_rig for. Gas Town
+# branch_has_merge_in_range above already relies on git_rig for. Gas Town
 # commits carry the committing agent's own alias as GIT_AUTHOR_NAME (verified:
 # `git log` on this repo shows author "gastown.dog-1", not a human name), so
 # `%an` lands in the exact identity namespace author_is_alive() already
@@ -10773,10 +10788,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
   # ga-kyxih: computed once per sweep, independent of MT_VERDICT (a structural
   # fact about the branch's own history, not about its relationship to main).
   # Used below both to route the auto-rebase-vs-auto-merge choice and to
-  # tailor the bounce/retry messaging further down when a merge-commit-tip
-  # branch still needs a human (a genuine conflict even under merge, or an
-  # unexpected merge failure).
-  BRANCH_TIP_IS_MERGE_COMMIT=$(branch_tip_is_merge_commit "origin/$BRANCH")
+  # tailor the bounce/retry messaging further down when a branch carrying an
+  # internal merge commit still needs a human (a genuine conflict even under
+  # merge, or an unexpected merge failure).
+  # ga-sg1axd: broadened from a tip-only check to the whole upstream..branch
+  # interval — see branch_has_merge_in_range()'s own docblock for why.
+  BRANCH_HAS_MERGE_IN_RANGE=$(branch_has_merge_in_range "origin/$BRANCH" "origin/$DEFAULT_BRANCH")
 
   if [ "$MT_VERDICT" = "err" ]; then
     # Undeterminable (unrelated histories OR a ref still settling). Do NOT bounce to
@@ -11033,14 +11050,14 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     # ga-hzhn6k: human-readable reason for merging instead of rebasing,
     # shared by both the container-rig and self-repo branches below so the
     # sweep log and the marker comment always say WHY — distinct from
-    # ga-kyxih's pre-existing tip-is-a-merge-commit reason, so a reader of
-    # either the log or the bead comment never sees "tip was already a merge
-    # commit" attributed to a branch whose tip is a plain, linear commit.
+    # ga-kyxih's pre-existing has-merge-in-range reason, so a reader of
+    # either the log or the bead comment never sees "contains a merge commit"
+    # attributed to a branch whose full history is plain and linear.
     _MERGE_NOT_REBASE_WHY=""
     if [ "$FORCE_MERGE_REANCHOR" = "1" ]; then
       _MERGE_NOT_REBASE_WHY="ga-hzhn6k: $REBASE_AHEAD commits ahead of GATE_REBASE_AHEAD_MAX=${GATE_REBASE_AHEAD_MAX}, but merge-tree already proved the merge clean — re-anchoring instead of exiling into an unresolvable retry loop"
-    elif [ "$BRANCH_TIP_IS_MERGE_COMMIT" = "1" ]; then
-      _MERGE_NOT_REBASE_WHY="ga-kyxih: tip is itself a merge commit — rebase is not applicable"
+    elif [ "$BRANCH_HAS_MERGE_IN_RANGE" = "1" ]; then
+      _MERGE_NOT_REBASE_WHY="ga-kyxih/ga-sg1axd: branch contains a merge commit not yet on $DEFAULT_BRANCH — rebase is not applicable"
     fi
 
     if [ "$IS_CONTAINER_RIG" = "1" ] && [ "$HAS_CONFLICT" = "0" ]; then
@@ -11053,12 +11070,14 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       _REBASE_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gc-gate-autorebase-rebase.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-autorebase-rebase.$$")
       if git_rig worktree add "$TMP_REBASE_WT" "origin/$BRANCH" 2>"$_WT_ERR_FILE"; then
         rm -f "$_WT_ERR_FILE" 2>/dev/null || true
-        if [ "$BRANCH_TIP_IS_MERGE_COMMIT" = "1" ] || [ "$FORCE_MERGE_REANCHOR" = "1" ]; then
-          # ga-kyxih: this branch's own tip is already a merge commit — `git
-          # rebase` (the else-branch below) linearizes/mishandles that
-          # history (see branch_tip_is_merge_commit() above for why). Use a
-          # real `git merge` instead; merge-tree already predicted this would
-          # be clean (HAS_CONFLICT=0 to have reached this block at all).
+        if [ "$BRANCH_HAS_MERGE_IN_RANGE" = "1" ] || [ "$FORCE_MERGE_REANCHOR" = "1" ]; then
+          # ga-kyxih: this branch's own history already contains a merge
+          # commit not yet on $DEFAULT_BRANCH — `git rebase` (the else-branch
+          # below) linearizes/mishandles that history (see
+          # branch_has_merge_in_range() above for why; ga-sg1axd broadened
+          # this from a tip-only check). Use a real `git merge` instead;
+          # merge-tree already predicted this would be clean (HAS_CONFLICT=0
+          # to have reached this block at all).
           # ga-hzhn6k: the SAME merge remedy also applies — and is now also
           # triggered — when the branch is merely too far ahead for the
           # rebase envelope; see _MERGE_NOT_REBASE_WHY above for which of the
@@ -11125,7 +11144,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               rm -f "$_PUSH_ERR_FILE" 2>/dev/null || true
             fi
           else
-            warn "  Auto-merge git merge command failed (unexpected, ga-kyxih — merge-tree reported no conflicts; tip is itself a merge commit)"
+            warn "  Auto-merge git merge command failed (unexpected, ga-kyxih — merge-tree reported no conflicts; branch has a merge commit not yet on $DEFAULT_BRANCH)"
             git -C "$TMP_REBASE_WT" merge --abort 2>/dev/null || true
           fi
         # ga-euopg: identity scoped via -c to this invocation only — see note
@@ -11206,18 +11225,24 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
           git -C "$TMP_REBASE_WT" rebase --abort 2>/dev/null || true
           # ga-byfbd (DEFEITO 2): `git rebase` REPLAYS each commit as a flat
           # patch — it can fail even when the two sides' FINAL TREES don't
-          # actually conflict (e.g. the branch carries an earlier re-anchor
-          # merge commit somewhere in its history — see do_merge_ff's
-          # ga-qukyp comment above for the full replay-vs-3-way-merge
-          # mechanism; branch_tip_is_merge_commit above only catches a merge
-          # commit AT THE TIP, not one further back, so this case reaches
-          # here instead of the upfront merge branch). merge-tree already
-          # proved this exact pair clean (HAS_CONFLICT=0 is what got us into
-          # this whole block), so a rebase failure here is a structural
-          # replay artifact, not a real conflict. do_merge_ff already has
-          # this fallback at MERGE time; this ports it to GATE time — the
-          # gap ga-byfbd reports (measured live, wa-wpbfi: rebase failed 5x
-          # across bounded retries, the tip merged clean with zero conflict).
+          # actually conflict. merge-tree already proved this exact pair
+          # clean (HAS_CONFLICT=0 is what got us into this whole block), so a
+          # rebase failure here is a structural replay artifact, not a real
+          # conflict. See do_merge_ff's ga-qukyp comment above for the full
+          # replay-vs-3-way-merge mechanism.
+          # ga-sg1axd: this branch used to be reached (instead of the upfront
+          # merge branch above) whenever the branch carried a merge commit
+          # ANYWHERE in its history, because the old predicate
+          # (branch_tip_is_merge_commit) only tested the tip.
+          # branch_has_merge_in_range now catches that shape upfront, so this
+          # fallback is defense-in-depth for OTHER rebase-replay failures on
+          # branches with no internal merge at all — a rebase failure
+          # reaching here is no longer evidence the upfront check missed
+          # something; check BRANCH_HAS_MERGE_IN_RANGE first. do_merge_ff
+          # already has this fallback at MERGE time; this ports it to GATE
+          # time — the gap ga-byfbd reports (measured live, wa-wpbfi: rebase
+          # failed 5x across bounded retries, the tip merged clean with zero
+          # conflict).
           warn "  Auto-rebase git rebase command failed (merge-tree reported no conflicts) — trying merge fallback (ga-byfbd/ga-qukyp): ${AUTO_REBASE_SETUP_ERR:-<no stderr captured>}"
           _MERGE_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gc-gate-autorebase-merge.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-autorebase-merge.$$")
           if git -C "$TMP_REBASE_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" merge "origin/$DEFAULT_BRANCH" -m "Merge origin/$DEFAULT_BRANCH into $BRANCH (gate auto-merge fallback — rebase-replay failed despite zero merge-tree conflict, ga-byfbd/ga-qukyp)" 2>"$_MERGE_ERR_FILE"; then
@@ -11308,10 +11333,12 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       _REBASE_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gc-gate-autorebase-rebase.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-autorebase-rebase.$$")
       if git -C "$GIT_DIR_PATH" worktree add "$TMP_REBASE_WT" "origin/$BRANCH" 2>"$_WT_ERR_FILE"; then
         rm -f "$_WT_ERR_FILE" 2>/dev/null || true
-        if [ "$BRANCH_TIP_IS_MERGE_COMMIT" = "1" ] || [ "$FORCE_MERGE_REANCHOR" = "1" ]; then
+        if [ "$BRANCH_HAS_MERGE_IN_RANGE" = "1" ] || [ "$FORCE_MERGE_REANCHOR" = "1" ]; then
           # ga-kyxih: see the container-rig branch above for why — this
-          # branch's own tip is already a merge commit, so `git rebase` (the
-          # elif-branch below) is not applicable; use a real `git merge`.
+          # branch's own history already contains a merge commit not yet on
+          # $DEFAULT_BRANCH (ga-sg1axd broadened this from a tip-only check),
+          # so `git rebase` (the elif-branch below) is not applicable; use a
+          # real `git merge`.
           # ga-hzhn6k: same merge remedy, also triggered when the branch is
           # merely too far ahead for the rebase envelope — see
           # _MERGE_NOT_REBASE_WHY above for which reason applies this sweep.
@@ -11370,7 +11397,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               rm -f "$_PUSH_ERR_FILE" 2>/dev/null || true
             fi
           else
-            warn "  Auto-merge git merge command failed (self-repo, unexpected, ga-kyxih — merge-tree reported no conflicts; tip is itself a merge commit)"
+            warn "  Auto-merge git merge command failed (self-repo, unexpected, ga-kyxih — merge-tree reported no conflicts; branch has a merge commit not yet on $DEFAULT_BRANCH)"
             git -C "$TMP_REBASE_WT" merge --abort 2>/dev/null || true
           fi
         # ga-euopg: see identity-scoping note above (container-rig branch).
@@ -12091,14 +12118,14 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       # path) so the next sweep re-reads the author's rebased tip and proceeds.
       warn "Branch $BRANCH: genuine merge conflict (${CONFLICT_FILES:-conflicts}); author $REBASE_AUTHOR is live — bouncing for manual rebase."
       set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
-      # ga-kyxih (AC2/AC4): when this branch's OWN tip is already a merge
-      # commit, a manual "rebase" is not the applicable fix either (see
-      # branch_tip_is_merge_commit() above — the same reason auto-rebase
-      # itself is skipped for this class) — tell the author to MERGE, not
-      # rebase, instead of the generic instruction that doesn't match their
-      # branch's history shape.
-      if [ "$BRANCH_TIP_IS_MERGE_COMMIT" = "1" ]; then
-        _REBASE_ACTION_ADVICE="this branch's own tip is already a merge commit, so rebase is not the applicable fix (ga-kyxih) — run 'git merge origin/$DEFAULT_BRANCH' into $BRANCH, resolve the conflict, and push"
+      # ga-kyxih (AC2/AC4): when this branch already carries a merge commit
+      # not yet on $DEFAULT_BRANCH, a manual "rebase" is not the applicable
+      # fix either (see branch_has_merge_in_range() above; ga-sg1axd — the
+      # same reason auto-rebase itself is skipped for this class) — tell the
+      # author to MERGE, not rebase, instead of the generic instruction that
+      # doesn't match their branch's history shape.
+      if [ "$BRANCH_HAS_MERGE_IN_RANGE" = "1" ]; then
+        _REBASE_ACTION_ADVICE="this branch already contains a merge commit not yet on $DEFAULT_BRANCH, so rebase is not the applicable fix (ga-kyxih) — run 'git merge origin/$DEFAULT_BRANCH' into $BRANCH, resolve the conflict, and push"
       else
         _REBASE_ACTION_ADVICE="manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, resolve conflicts, and re-run /gate-done"
       fi
@@ -12181,17 +12208,18 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
         bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS (gt-4tk5m): branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) — $_PUSH_DIAG. Re-queued for next sweep; no /gate-done re-run needed.${_TIER5_NOTE}" 2>/dev/null || true
         # ga-6dp9 (gate-fix-2): same notify-identity fix as the bounce branches
         # above — REBASE_AUTHOR is this branch's own verified-alive identity.
-        # ga-kyxih (AC4): a merge-commit-tip branch reaching THIS retry path
-        # means the auto-merge attempt above (branch_tip_is_merge_commit())
-        # itself hit trouble — no longer the common self-healing plumbing
-        # blip the default "no action needed" wording assumes. Don't leave
-        # the author waiting: tell them the deterministic fallback now, not
-        # only after retries are exhausted. Non-merge-commit-tip branches
-        # (the overwhelming majority of transient retries) keep the
-        # original, correct "no action needed" wording unchanged.
-        if [ "$BRANCH_TIP_IS_MERGE_COMMIT" = "1" ]; then
+        # ga-kyxih (AC4): a branch carrying an internal merge commit reaching
+        # THIS retry path means the auto-merge attempt above
+        # (branch_has_merge_in_range(), ga-sg1axd) itself hit trouble — no
+        # longer the common self-healing plumbing blip the default "no
+        # action needed" wording assumes. Don't leave the author waiting:
+        # tell them the deterministic fallback now, not only after retries
+        # are exhausted. Branches with no internal merge (the overwhelming
+        # majority of transient retries) keep the original, correct "no
+        # action needed" wording unchanged.
+        if [ "$BRANCH_HAS_MERGE_IN_RANGE" = "1" ]; then
           gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
-            "Gate auto-retry for branch $BRANCH (${BEAD_ID:-unknown}): auto-merge hit a transient failure (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — re-queued for next sweep. Your branch's tip is already a merge commit (ga-kyxih), so if this keeps failing after $MAX_REBASE_ATTEMPTS attempts, don't wait: run 'git merge origin/$DEFAULT_BRANCH' into $BRANCH yourself and push." \
+            "Gate auto-retry for branch $BRANCH (${BEAD_ID:-unknown}): auto-merge hit a transient failure (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — re-queued for next sweep. Your branch already contains a merge commit not yet on $DEFAULT_BRANCH (ga-kyxih), so if this keeps failing after $MAX_REBASE_ATTEMPTS attempts, don't wait: run 'git merge origin/$DEFAULT_BRANCH' into $BRANCH yourself and push." \
             --delivery wait-idle 2>/dev/null || true
         else
           gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
@@ -12232,12 +12260,13 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
       # gate-health-monitor / a fresh re-dispatch can re-anchor or rebuild it.
       err "Branch $BRANCH: genuine merge conflict vs $DEFAULT_BRANCH, author dead/empty — immediate needs-rebase (no retry; conflict is deterministic)."
       set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
-      # ga-kyxih (AC2): name the merge-commit-tip cause distinctly when it
-      # applies (see branch_tip_is_merge_commit() above). No live author to
-      # notify here (AC4 targets the live-author paths above) — this only
-      # sharpens the marker's own diagnostic text for whoever triages it.
-      if [ "$BRANCH_TIP_IS_MERGE_COMMIT" = "1" ]; then
-        _REBASE_REANCHOR_ADVICE="This branch's own tip is already a merge commit (ga-kyxih) — re-anchoring means 'git merge origin/$DEFAULT_BRANCH' into $BRANCH, not a rebase."
+      # ga-kyxih (AC2): name the has-merge-in-range cause distinctly when it
+      # applies (see branch_has_merge_in_range() above; ga-sg1axd). No live
+      # author to notify here (AC4 targets the live-author paths above) —
+      # this only sharpens the marker's own diagnostic text for whoever
+      # triages it.
+      if [ "$BRANCH_HAS_MERGE_IN_RANGE" = "1" ]; then
+        _REBASE_REANCHOR_ADVICE="This branch already contains a merge commit not yet on $DEFAULT_BRANCH (ga-kyxih) — re-anchoring means 'git merge origin/$DEFAULT_BRANCH' into $BRANCH, not a rebase."
       else
         _REBASE_REANCHOR_ADVICE="Needs re-anchor/rebuild or a Mayor decision."
       fi

@@ -398,7 +398,7 @@ grep -qF 'bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:rebase-retry:$NEXT_AT
 # ever told to act.
 echo "── 10. ga-kyxih: merge-commit-tip branches route to git merge, not git rebase ──"
 
-echo "── 10a. branch_tip_is_merge_commit: real git fixtures, not string matching ──"
+echo "── 10a. branch_has_merge_in_range: real git fixtures, not string matching ──"
 _FIXTURE_REPO="$(mktemp -d "${TMPDIR:-/tmp}/gc-gate-mergetip-fixture.XXXXXX")"
 git -C "$_FIXTURE_REPO" init -q -b main
 git -C "$_FIXTURE_REPO" -c user.email="t@t" -c user.name="t" commit -q --allow-empty -m "root"
@@ -425,36 +425,46 @@ git -C "$_FIXTURE_REPO" -c user.email="t@t" -c user.name="t" branch still-linear
 # so parent-count detection is exercised for real, not string-matched.
 git_rig() { git -C "$_FIXTURE_REPO" "$@"; }
 
-eq "still-linear-branch tip (plain commit, single parent) → 0 (not a merge commit)" \
-  "$(branch_tip_is_merge_commit "still-linear-branch")" \
+eq "still-linear-branch (plain commits, no merge anywhere in range) → 0 (not a merge commit)" \
+  "$(branch_has_merge_in_range "still-linear-branch" "main")" \
   "0"
-eq "merge-tip-branch tip (the merge commit just created) → 1 (IS a merge commit)" \
-  "$(branch_tip_is_merge_commit "merge-tip-branch")" \
+eq "merge-tip-branch (the merge commit just created, AT the tip) → 1 (IS a merge commit)" \
+  "$(branch_has_merge_in_range "merge-tip-branch" "main")" \
   "1"
-eq "empty ref → 0 (fail toward the existing, well-tested rebase path)" \
-  "$(branch_tip_is_merge_commit "")" \
+eq "empty branch_ref → 0 (fail toward the existing, well-tested rebase path)" \
+  "$(branch_has_merge_in_range "" "main")" \
   "0"
-eq "unresolvable ref → 0 (fail toward the existing rebase path, never toward the newer merge path on an ambiguous read)" \
-  "$(branch_tip_is_merge_commit "refs/heads/does-not-exist-xyz")" \
+eq "empty upstream_ref → 0 (same fail-safe direction)" \
+  "$(branch_has_merge_in_range "still-linear-branch" "")" \
   "0"
+eq "unresolvable branch_ref → 0 (fail toward the existing rebase path, never toward the newer merge path on an ambiguous read)" \
+  "$(branch_has_merge_in_range "refs/heads/does-not-exist-xyz" "main")" \
+  "0"
+# ga-sg1axd: the class of bug this rename fixes — a merge commit further BACK
+# in the branch's own history, not at the tip (wa-q0crq's exact shape) — is
+# covered in full by the dedicated gate-sg1axd-merge-in-range.selftest.sh;
+# not duplicated here.
 
 unset -f git_rig
 rm -rf "$_FIXTURE_REPO"
 
-echo "── 10b. drift-guard: both rebase-attempt sites route on BRANCH_TIP_IS_MERGE_COMMIT before falling to git rebase ──"
+echo "── 10b. drift-guard: both rebase-attempt sites route on BRANCH_HAS_MERGE_IN_RANGE before falling to git rebase ──"
 # ga-hzhn6k: the routing condition at these two call sites now also ORs in
 # FORCE_MERGE_REANCHOR (a branch too far ahead for the rebase envelope, but
 # already merge-tree-proven clean, re-anchors via the SAME merge path) — so
 # the literal condition text this drift-guard pins on gained a clause. Match
 # the new text with -F (fixed string) rather than count a bare
-# BRANCH_TIP_IS_MERGE_COMMIT substring, which would also match unrelated
+# BRANCH_HAS_MERGE_IN_RANGE substring, which would also match unrelated
 # occurrences elsewhere in the file (a different rebase-retry sweep) and
 # could pass without ever actually exercising these two sites.
-_MERGE_ROUTE_COUNT=$(grep -cF 'if [ "$BRANCH_TIP_IS_MERGE_COMMIT" = "1" ] || [ "$FORCE_MERGE_REANCHOR" = "1" ]; then' "$DISPATCHER" || true)
+# ga-sg1axd: variable renamed from BRANCH_TIP_IS_MERGE_COMMIT — the old name
+# asserted "tip", which stopped being true once the predicate started
+# checking the whole upstream..branch interval.
+_MERGE_ROUTE_COUNT=$(grep -cF 'if [ "$BRANCH_HAS_MERGE_IN_RANGE" = "1" ] || [ "$FORCE_MERGE_REANCHOR" = "1" ]; then' "$DISPATCHER" || true)
 if [ "${_MERGE_ROUTE_COUNT:-0}" -ge 2 ]; then
-  ok "BRANCH_TIP_IS_MERGE_COMMIT||FORCE_MERGE_REANCHOR routing present at both rig-type call sites (count=$_MERGE_ROUTE_COUNT)"
+  ok "BRANCH_HAS_MERGE_IN_RANGE||FORCE_MERGE_REANCHOR routing present at both rig-type call sites (count=$_MERGE_ROUTE_COUNT)"
 else
-  bad "BRANCH_TIP_IS_MERGE_COMMIT||FORCE_MERGE_REANCHOR routing found fewer than 2 times (count=${_MERGE_ROUTE_COUNT:-0}) — one rig-type call site may be missing the fix"
+  bad "BRANCH_HAS_MERGE_IN_RANGE||FORCE_MERGE_REANCHOR routing found fewer than 2 times (count=${_MERGE_ROUTE_COUNT:-0}) — one rig-type call site may be missing the fix"
 fi
 # ga-byfbd: the stderr redirect changed from 2>/dev/null to a captured temp
 # file (DEFEITO 1 — the rebase's own stderr was the one call in this block
@@ -465,9 +475,9 @@ fi
 grep -qF 'elif git -C "$TMP_REBASE_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" rebase "origin/$DEFAULT_BRANCH" 2>"$_REBASE_ERR_FILE"; then' "$DISPATCHER" \
   && ok "the ORIGINAL rebase invocation is preserved as the elif fallback, now with captured stderr (AC3 non-regression: linear branches still rebase; ga-byfbd)" \
   || bad "original rebase invocation (as an elif fallback) not found — AC3 non-regression may be broken"
-grep -qF 'BRANCH_TIP_IS_MERGE_COMMIT=$(branch_tip_is_merge_commit "origin/$BRANCH")' "$DISPATCHER" \
-  && ok "BRANCH_TIP_IS_MERGE_COMMIT is computed once per sweep from the live branch tip" \
-  || bad "BRANCH_TIP_IS_MERGE_COMMIT computation call site missing/renamed"
+grep -qF 'BRANCH_HAS_MERGE_IN_RANGE=$(branch_has_merge_in_range "origin/$BRANCH" "origin/$DEFAULT_BRANCH")' "$DISPATCHER" \
+  && ok "BRANCH_HAS_MERGE_IN_RANGE is computed once per sweep, over the whole upstream..branch interval (ga-sg1axd)" \
+  || bad "BRANCH_HAS_MERGE_IN_RANGE computation call site missing/renamed"
 
 echo "── 10c. drift-guard: AC2 — merge-commit-tip auto-fix path is logged distinctly from a real git-rebase failure ──"
 # ga-hzhn6k: the two per-rig-type log lines now interpolate a shared
@@ -476,9 +486,9 @@ echo "── 10c. drift-guard: AC2 — merge-commit-tip auto-fix path is logged 
 # wording inline at each call site. The distinctive wording itself is
 # unchanged and still lives in the source, verbatim, in that assignment —
 # check there instead of at the (now-parameterized) log call sites.
-grep -qF '_MERGE_NOT_REBASE_WHY="ga-kyxih: tip is itself a merge commit — rebase is not applicable"' "$DISPATCHER" \
-  && ok "the ga-kyxih merge-commit-tip reason text is still present verbatim (now shared via _MERGE_NOT_REBASE_WHY)" \
-  || bad "ga-kyxih merge-commit-tip reason text missing/reworded"
+grep -qF '_MERGE_NOT_REBASE_WHY="ga-kyxih/ga-sg1axd: branch contains a merge commit not yet on $DEFAULT_BRANCH — rebase is not applicable"' "$DISPATCHER" \
+  && ok "the ga-kyxih/ga-sg1axd has-merge-in-range reason text is still present verbatim (now shared via _MERGE_NOT_REBASE_WHY)" \
+  || bad "ga-kyxih/ga-sg1axd has-merge-in-range reason text missing/reworded"
 grep -qF 'log "  Auto-merge (${_MERGE_NOT_REBASE_WHY}): merging $DEFAULT_BRANCH into $BRANCH instead of rebasing ..."' "$DISPATCHER" \
   && ok "auto-merge path (container-rig) logs the shared reason string distinctly from a real git-rebase failure" \
   || bad "container-rig auto-merge log message missing/reworded"
@@ -527,7 +537,7 @@ grep -qF "re-anchoring means 'git merge origin/\$DEFAULT_BRANCH' into \$BRANCH, 
 # off the wrong identity, so the branch waited forever for a push race that
 # was never going to happen — Mayor was never going to push it. Fix: resolve
 # the rebase-liveness identity from the branch's own git history FIRST
-# (branch_tip_commit_author, new — mirrors branch_tip_is_merge_commit's git_rig
+# (branch_tip_commit_author, new — mirrors branch_has_merge_in_range's git_rig
 # usage above), falling back to the pre-existing trusted/crew/marker-author
 # chain unchanged when git history is unavailable.
 echo "── 11. ga-gxbxu: rebase-liveness keyed on the branch's OWN commit author, never the /gate-done SUBMITTER ──"

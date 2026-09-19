@@ -29,9 +29,11 @@
 #     reincided ~2 months later as wa-hcefm above.
 #
 # Six sites, not four: pre-review additionally has an upfront "merge instead
-# of rebase" path (when the branch's own tip is already a merge commit, or it
-# is too far ahead for the rebase envelope) that merge-time does not — see
-# BRANCH_TIP_IS_MERGE_COMMIT / FORCE_MERGE_REANCHOR in quality-gate-dispatcher.sh.
+# of rebase" path (when the branch already contains a merge commit not yet on
+# the default branch, or it is too far ahead for the rebase envelope) that
+# merge-time does not — see BRANCH_HAS_MERGE_IN_RANGE / FORCE_MERGE_REANCHOR
+# in quality-gate-dispatcher.sh (ga-sg1axd renamed this from
+# BRANCH_TIP_IS_MERGE_COMMIT once the check stopped being tip-only).
 # Every one of the six pushes a rebase or merge result to the branch, so every
 # one gets the guard.
 set -uo pipefail

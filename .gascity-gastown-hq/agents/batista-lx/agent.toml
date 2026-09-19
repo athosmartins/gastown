@@ -1,5 +1,5 @@
 max_active_sessions = 1
-suspended = false
+suspended = true
 work_dir = "/Users/athos/gt/lexbh/crew/batista"
 
 option_defaults = { effort = "high" }
