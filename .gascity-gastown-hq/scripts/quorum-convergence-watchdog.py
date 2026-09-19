@@ -111,10 +111,23 @@ KILL_SWITCH = os.path.join(CITY, ".gc/state/quorum-convergence-watchdog.disabled
 
 # Persistent named crews eligible as quorum voters (ordered by seniority/relevance).
 # Mayor and dogs are never included; adhoc/polecat sessions are excluded at runtime.
+#
+# wa-14p4c (Athos 2026-09-19, "Manter só nos horários"): peter-wa is
+# deliberately NOT in this roster, even though it can now have a live session
+# during its 07:00/19:00 touchpoint window (agent.toml suspended=false). This
+# watchdog's own selection gate (_get_active_named_crews) only checks whether
+# a session is currently active — it never checks the agent's `suspended`
+# flag — so during that window peter-wa would otherwise be selectable, and a
+# 2-of-3 vote can autonomously `bd update <bead> --assignee peter-wa` with
+# zero human approval (_execute_action, reassign:<crew>). Athos's decision was
+# explicit: peter "não pega bead nenhuma" — not even briefly, not even via a
+# quorum vote while its touchpoint session happens to be up. Do not re-add
+# peter-wa here without a corresponding change to make this watchdog respect
+# `suspended` (it doesn't today, unlike pilot-dispatcher.sh's own
+# _crew_is_suspended check).
 QUORUM_CREW_ROSTER = [
     "mila-wa",      # WA/painel/UI/Kanban
     "oracle-wa",    # warming/on-device/presença
-    "peter-wa",     # Contagem/geo/ArcGIS/incorporação
     "digo-wa",      # phone-proxy/WAP/IPs/relay/financeiro
     "thies-wa",     # WA senior (general)
     "batista-ps",   # property scrapers
@@ -123,11 +136,13 @@ QUORUM_CREW_ROSTER = [
 ]
 
 # Domain → primary owner (mirrors pilot-dispatcher.sh bead_domain + rig_domain_owner).
+# "real-estate" has no owner entry (see wa-14p4c note on QUORUM_CREW_ROSTER
+# above — its former owner, peter-wa, must never be autonomously assignable
+# here). A real-estate bead just falls back to the generic roster-fill below.
 DOMAIN_TO_OWNER: dict[str, str] = {
     "frontend":         "mila-wa",
     "wa-integration":   "mila-wa",
     "warming":          "oracle-wa",
-    "real-estate":      "peter-wa",
     "data":             "digo-wa",
     "property-scrapers": "batista-ps",
 }
