@@ -13,7 +13,9 @@
 #
 # SAFETY (this CLOSES sessions — mirror of the gate's own liveness discipline):
 #   * ONLY ephemeral adhoc patterns are eligible (auto-refiner / gastown.dog /
-#     gate-reviewer / refino-gate-reviewer + "-adhoc-"). A hard exclude on every
+#     gate-reviewer / refino-gate-reviewer / wa-worker / ps-worker + "-adhoc-"; the
+#     worker classes were added by ga-jn82py — every Pilot dispatch spawns one that
+#     sleeps forever, 37 had leaked by 2026-09-19). A hard exclude on every
 #     NAMED crew / core session (mila/digo/batista/oracle/peter/thies/mayor/deacon/
 #     boot/control-dispatcher/gastown__) means a misclassified row can NEVER be reaped.
 #   * An asleep/draining/drained session is reaped on the existing path. A session
@@ -33,9 +35,26 @@
 #     killed even if it momentarily reads asleep between turns.
 #   * The drained/idle signal is REQUIRED together with age — we never reap on age
 #     alone, and never reap on the bead alone (bead resolution is best-effort).
+#   * A session with a client ATTACHED (census `attached` = true) is never reaped, in
+#     any class (ga-jn82py). A missing / non-boolean `attached` (or `closed`) is "don't
+#     know" and keeps the session too — only an explicit false lets it go on.
+#   * Worker-class sessions (wa-worker-adhoc-* / ps-worker-adhoc-*) do real, long-running
+#     work, so a worker mid-task can look idle. Once every other gate has passed they
+#     need ONE more (ga-jn82py): no non-closed bead may be assigned to any of the
+#     session's identities (id / name / alias / session_name) in ANY store listed in
+#     routes.jsonl. "Bead" is meant broadly: open/in_progress/blocked/deferred, ephemeral
+#     wisps and mail messages included (observed live: the auto-handoff "context cycle"
+#     note a worker had just sent itself). What holds a session is logged as
+#     detail=held <store>:<bead>(<type>). The lookup is fail-CLOSED — only an explicit
+#     clean answer from every store that exists (a route whose store directory is
+#     definitively absent is skipped) lets the reap proceed; a bd error/timeout, a
+#     non-list payload, an unreadable routes file, zero stores checked, or an identity
+#     that is not a plain token all KEEP the session. After 2 consecutive failed
+#     lookups in one sweep the rest are kept WITHOUT a call (a consistently wedged Dolt
+#     costs 2 timeouts per sweep, not one per candidate).
 #   * Kill switch ADHOC_REAPER_ENABLED=0 → census/log only, no closes.
-# The ONLY mutation is `gc session close` on eligible adhoc sessions. No bd writes,
-# no rm of data, no Dolt surgery.
+# The ONLY mutation is `gc session close` on eligible adhoc sessions. No bd writes (the
+# worker-class lock only READS, via `bd query`), no rm of data, no Dolt surgery.
 set -uo pipefail
 
 GT=/Users/athos/gt
@@ -57,6 +76,14 @@ GC_BIN="${ADHOC_REAPER_GC:-gc}"                 # overridable for selftest stubb
 # specifically to avoid the Dolt connect-storm this script's own header docstring
 # describes; bypassing it in production would reintroduce that exact problem.
 SESSION_LIST_SCRIPT="${ADHOC_REAPER_SESSION_LIST_SCRIPT:-$CITY/scripts/gc-session-list-cached.sh}"
+# ga-jn82py worker-class assigned-bead lock (see the header). Overridable for selftest
+# stubbing; production uses the real `bd` and the city's own prefix→store registry.
+BD_BIN="${ADHOC_REAPER_BD:-bd}"
+BD_TIMEOUT_SEC="${ADHOC_REAPER_BD_TIMEOUT_SEC:-60}"   # per store: a Dolt-timeout failure was observed
+                                                      # taking 33-39s to surface, so 60s leaves room
+                                                      # for a slow-but-successful answer
+ROUTES_FILE="${ADHOC_REAPER_ROUTES_FILE:-$CITY/.beads/routes.jsonl}"
+BEAD_LOOKUP_MAX_FAILURES="${ADHOC_REAPER_BEAD_LOOKUP_MAX_FAILURES:-2}"
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 now_epoch() { date +%s; }
@@ -65,8 +92,11 @@ log() { printf '%s\n' "$1" >> "$LOG" 2>/dev/null; }
 # Ephemeral adhoc prefixes the dispatchers spawn. A session name must START with one
 # of these AND contain "-adhoc-" to be eligible. Discovered via `gc session list`:
 #   auto-refiner-adhoc-*, gastown.dog-adhoc-*, gate-reviewer-adhoc-*,
-#   refino-gate-reviewer-adhoc-*
-ADHOC_PREFIXES='auto-refiner-adhoc- gastown.dog-adhoc- gate-reviewer-adhoc- refino-gate-reviewer-adhoc-'
+#   refino-gate-reviewer-adhoc-*, wa-worker-adhoc-*, ps-worker-adhoc-*
+# The worker prefixes are ALSO the "worker class" (they get the extra assigned-bead lock,
+# see the header). Defined once and appended below so the two lists cannot drift apart.
+WORKER_ADHOC_PREFIXES='wa-worker-adhoc- ps-worker-adhoc-'
+ADHOC_PREFIXES="auto-refiner-adhoc- gastown.dog-adhoc- gate-reviewer-adhoc- refino-gate-reviewer-adhoc- $WORKER_ADHOC_PREFIXES"
 
 # Named crews / core sessions — defense in depth. If a name matches ANY of these it
 # is NEVER eligible, regardless of the adhoc check. (A crew would never carry
@@ -84,6 +114,17 @@ is_adhoc_eligible() {
   done
   [ "$matched" = "0" ] || return 1
   case "$name" in *-adhoc-*) return 0 ;; *) return 1 ;; esac
+}
+
+# is_worker_adhoc <session_name> → 0 (worker class) | 1. Pure; no I/O. Says nothing about
+# eligibility — call is_adhoc_eligible first. Only these sessions get the assigned-bead
+# lock, because only they do real long-running work that can look idle mid-task.
+is_worker_adhoc() {
+  local name="$1" p
+  for p in $WORKER_ADHOC_PREFIXES; do
+    case "$name" in "$p"*) return 0 ;; esac
+  done
+  return 1
 }
 
 # session_state_is_drained <state> → 1 (drained/idle — finished its turn) | 0.
@@ -191,9 +232,12 @@ except Exception:
 
 # ---- census ---------------------------------------------------------------------
 # One structured read of every session. Each line:
-#   id<TAB>name<TAB>state<TAB>closed<TAB>created_at<TAB>last_active<TAB>title
-# (title is LAST so the read loop can keep it as the remainder; last_active is sanitized
-# of tabs defensively too.)
+#   id<TAB>name<TAB>state<TAB>closed<TAB>created_at<TAB>last_active<TAB>attached<TAB>alias<TAB>session_name<TAB>title
+# (title is LAST so the read loop can keep it as the remainder.) Every column BEFORE the
+# title is guaranteed non-empty ("-" placeholder): the read loop splits on TAB, which bash
+# treats as IFS-whitespace, so an empty column would silently collapse and shift every
+# later field — an empty last_active used to do exactly that. `attached` is normalised to
+# true | false | unknown (key absent or not a JSON boolean) instead of being left to guess.
 #
 # Split into two steps (ga-dd2h0 gate-feedback round 1) so a census FAILURE and a
 # census that is genuinely empty can never collapse into the same signal: previously
@@ -225,17 +269,123 @@ except Exception:
     sys.exit(2)
 if not isinstance(d, dict) or not isinstance(d.get("sessions"), list):
     sys.exit(3)
+def col(v):
+    s = "" if v is None else str(v)
+    s = s.replace("\t", " ").replace("\n", " ")
+    return s if s.strip() else "-"
+def attached(v):
+    return "true" if v is True else "false" if v is False else "unknown"
 for s in d["sessions"]:
     print("\t".join([
-        str(s.get("id","")),
-        str(s.get("name","")),
-        str(s.get("state","")),
-        str(s.get("closed","")),
-        str(s.get("created_at","")),
-        str(s.get("last_active","")).replace("\t"," "),
-        str(s.get("title","")).replace("\t"," "),
+        col(s.get("id","")),
+        col(s.get("name","")),
+        col(s.get("state","")),
+        col(s.get("closed","")),
+        col(s.get("created_at","")),
+        col(s.get("last_active","")),
+        attached(s.get("attached")),
+        col(s.get("alias","")),
+        col(s.get("session_name","")),
+        ("" if s.get("title") is None else str(s.get("title"))).replace("\t"," ").replace("\n"," "),
     ]))
 ' 2>/dev/null
+}
+
+# worker_bead_lock <id> <name> <alias> <session_name> → ONE line on stdout (ga-jn82py):
+#   clear <n>/<m>              every store that exists answered and NONE holds a non-closed
+#                              bead assigned to any identity of this session (n = stores
+#                              queried, m = routes; a route whose .beads is DEFINITIVELY
+#                              absent — ENOENT — is skipped, any other stat error is
+#                              unknown) → the reap may go on
+#   held <store>:<bead>(<type>)[,...][,+N]
+#                              a non-closed bead is assigned to it → KEEP (first store that
+#                              has one; at most 5 beads listed, +N = how many more)
+#   unknown <reason>           anything else → KEEP
+# The caller reaps ONLY on the exact prefix "clear " — empty or garbled output is unknown.
+# One query per store: bd -C <store> query "(assignee=A OR assignee=B ...) AND NOT status=closed".
+# Equality on assignee is fast on every store, while a status-only scan of HQ's wisps table
+# times out under load (measured 2026-09-19), and `bd query` — unlike a plain `bd list` —
+# also returns ephemeral wisps. A failing `bd query` exits 1 AND prints a JSON error OBJECT
+# on stdout, so the exit code and the payload shape are BOTH checked. stdin is /dev/null:
+# this runs inside the census read loop and must not consume its input. Each identity must
+# be a plain token, because it is spliced into the query expression.
+worker_bead_lock() {
+  python3 -c '
+import json, os, re, subprocess, sys
+bd, tmo_s, routes, city = sys.argv[1:5]
+raw = sys.argv[5:]
+
+def out(line):
+    print(line)
+    sys.exit(0)
+
+ids = []
+for i in raw:
+    if i and i != "-" and i not in ids:
+        ids.append(i)
+if not ids:
+    out("unknown no_identity")
+for i in ids:
+    if not re.fullmatch(r"[A-Za-z0-9._/@:+-]+", i):
+        out("unknown identity_unsafe")
+try:
+    tmo = float(tmo_s)
+    if tmo <= 0:
+        raise ValueError
+except ValueError:
+    out("unknown bad_timeout")
+stores = []
+try:
+    with open(routes) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            p = os.path.realpath(os.path.join(city, json.loads(line)["path"]))
+            if p not in stores:
+                stores.append(p)
+except Exception:
+    out("unknown routes_unreadable")
+if not stores:
+    out("unknown routes_empty")
+expr = "(" + " OR ".join("assignee=" + i for i in ids) + ") AND NOT status=closed"
+checked = 0
+for st in stores:
+    tag = os.path.basename(st)
+    try:
+        os.stat(os.path.join(st, ".beads"))
+    except FileNotFoundError:
+        continue
+    except OSError:
+        out("unknown store_unreadable:" + tag)
+    try:
+        r = subprocess.run([bd, "-C", st, "query", expr, "--json", "--limit", "0"],
+                           capture_output=True, text=True, timeout=tmo,
+                           stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        out("unknown timeout:" + tag)
+    except Exception:
+        out("unknown bd_exec_failed:" + tag)
+    if r.returncode != 0:
+        out("unknown rc%d:%s" % (r.returncode, tag))
+    try:
+        d = json.loads(r.stdout)
+    except Exception:
+        out("unknown unparseable:" + tag)
+    if not isinstance(d, list):
+        out("unknown not_a_list:" + tag)
+    if any(not isinstance(b, dict) or not b.get("id") for b in d):
+        out("unknown malformed_element:" + tag)
+    checked += 1
+    if d:
+        shown = ["%s(%s)" % (b["id"], b.get("issue_type") or "?") for b in d[:5]]
+        if len(d) > 5:
+            shown.append("+%d" % (len(d) - 5))
+        out("held " + tag + ":" + ",".join(shown))
+if checked == 0:
+    out("unknown no_store_checked")
+out("clear %d/%d" % (checked, len(stores)))
+' "$BD_BIN" "$BD_TIMEOUT_SEC" "$ROUTES_FILE" "$CITY" "$@" </dev/null 2>/dev/null
 }
 
 # Sourcing guard: the selftest sources this file to unit-test the pure helpers
@@ -243,6 +393,8 @@ for s in d["sessions"]:
 [ "${ADHOC_REAPER_SOURCE_ONLY:-0}" = "1" ] && return 0 2>/dev/null
 
 reaped=0; kept_young=0; kept_active=0; kept_alive_peek=0; kept_peek_inconclusive=0; skipped_other=0; would_reap=0; eligible=0
+kept_attached=0; kept_has_bead=0; kept_bead_lookup_failed=0   # ga-jn82py
+bead_lookup_failures=0                                        # consecutive failed worker-lock lookups (circuit breaker)
 
 RAW_JSON="$(list_sessions_raw)"; raw_status=$?
 if [ "$raw_status" -ne 0 ]; then
@@ -263,16 +415,42 @@ if [ -z "$CENSUS" ]; then
   exit 0
 fi
 
-while IFS=$'\t' read -r id name state closed created last_active title; do
+while IFS=$'\t' read -r id name state closed created last_active attached alias session_name title; do
   [ -n "$name" ] || continue
+  decision_log=""   # a reap decision is announced only once the worker lock (below) has passed
   # eligibility: ephemeral adhoc + not a named/core crew
   if ! is_adhoc_eligible "$name"; then
     skipped_other=$((skipped_other+1)); continue
   fi
   eligible=$((eligible+1))
 
-  # already closed → nothing to do
-  case "$closed" in true|True|TRUE|1) skipped_other=$((skipped_other+1)); continue ;; esac
+  # already closed → nothing to do. Only an explicit "false" lets a session go on: a missing
+  # or unrecognised `closed` is "don't know", not "open" — skipped, never acted on.
+  case "$closed" in
+    true|True|TRUE|1) skipped_other=$((skipped_other+1)); continue ;;
+    false|False|FALSE|0) : ;;
+    *)
+      skipped_other=$((skipped_other+1))
+      log "$(printf '{"ts":"%s","event":"keep","reason":"closed_unknown","id":"%s","name":"%s"}' "$(ts)" "$id" "$name")"
+      continue ;;
+  esac
+
+  # ga-jn82py: NEVER reap a session a client is attached to — someone is looking at it,
+  # whatever its state / idle / age say. Every class. Only an explicit `false` lets a
+  # session go on: a missing or non-boolean `attached` is "don't know", and closing a
+  # session a human may be looking at cannot be undone, so it is KEPT
+  # (reason=attached_unknown). Both outcomes are counted in kept_attached.
+  case "$attached" in
+    false) : ;;
+    true)
+      kept_attached=$((kept_attached+1))
+      log "$(printf '{"ts":"%s","event":"keep","reason":"attached","id":"%s","name":"%s","state":"%s"}' "$(ts)" "$id" "$name" "$state")"
+      continue ;;
+    *)
+      kept_attached=$((kept_attached+1))
+      log "$(printf '{"ts":"%s","event":"keep","reason":"attached_unknown","id":"%s","name":"%s","state":"%s"}' "$(ts)" "$id" "$name" "$state")"
+      continue ;;
+  esac
 
   # Classify the state. Two reapable buckets, everything else kept:
   #   drained-family (asleep/draining/drained/dormant/suspended) → existing peek-veto path
@@ -310,7 +488,7 @@ while IFS=$'\t' read -r id name state closed created last_active title; do
       # ga-dd2h0: never claimed a task, so the idle floor below is defeated by its own
       # poll-for-work loop (see title_shows_no_task's comment) — the age floor already
       # passed above, and that's the only signal left that still means anything here.
-      log "$(printf '{"ts":"%s","event":"reap_no_task","id":"%s","name":"%s","state":"%s","age_min":%s}' "$(ts)" "$id" "$name" "$state" "$age")"
+      decision_log="$(printf '{"ts":"%s","event":"reap_no_task","id":"%s","name":"%s","state":"%s","age_min":%s}' "$(ts)" "$id" "$name" "$state" "$age")"
       # fall through to the close block
     else
       idle=$(idle_minutes "$last_active")
@@ -333,7 +511,7 @@ while IFS=$'\t' read -r id name state closed created last_active title; do
       # finished turn, so (unlike the drained path) it does NOT veto the reap here — the
       # idle floor already established the turn is over. Inconclusive/glitch is fine.
       peek_err="$("$GC_BIN" --city "$CITY" session peek "$id" --lines 1 2>&1 >/dev/null || true)"
-      log "$(printf '{"ts":"%s","event":"reap_active_idle","id":"%s","name":"%s","state":"%s","age_min":%s,"idle_min":%s}' "$(ts)" "$id" "$name" "$state" "$age" "$idle")"
+      decision_log="$(printf '{"ts":"%s","event":"reap_active_idle","id":"%s","name":"%s","state":"%s","age_min":%s,"idle_min":%s}' "$(ts)" "$id" "$name" "$state" "$age" "$idle")"
       # fall through to the close block
     fi
   else
@@ -370,6 +548,36 @@ while IFS=$'\t' read -r id name state closed created last_active title; do
     fi
   fi
 
+  # ga-jn82py: ASSIGNED-BEAD LOCK — the last gate, worker class only (see the header). It
+  # sits AFTER every cheaper gate on purpose: a session that is young / recently active /
+  # attached / peek-alive never costs a lookup (each one is up to one bd query per store,
+  # against the Dolt that is already the city's weak point). Only an explicit
+  # "clear <n>/<m>" lets the reap proceed; held, error, timeout, junk or empty all KEEP.
+  if is_worker_adhoc "$name"; then
+    if [ "$bead_lookup_failures" -ge "$BEAD_LOOKUP_MAX_FAILURES" ]; then
+      lock_verdict="unknown circuit_open"
+    else
+      lock_verdict="$(worker_bead_lock "$id" "$name" "$alias" "$session_name")"
+      case "$lock_verdict" in
+        "clear "*|"held "*) bead_lookup_failures=0 ;;
+        *) bead_lookup_failures=$((bead_lookup_failures+1)) ;;
+      esac
+    fi
+    lock_detail="$(printf '%s' "${lock_verdict:-empty_output}" | tr -c 'A-Za-z0-9._:,/=()+ -' '_')"
+    case "$lock_verdict" in
+      "clear "*) : ;;
+      "held "*)
+        kept_has_bead=$((kept_has_bead+1))
+        log "$(printf '{"ts":"%s","event":"keep","reason":"has_assigned_bead","id":"%s","name":"%s","state":"%s","detail":"%s"}' "$(ts)" "$id" "$name" "$state" "$lock_detail")"
+        continue ;;
+      *)
+        kept_bead_lookup_failed=$((kept_bead_lookup_failed+1))
+        log "$(printf '{"ts":"%s","event":"keep","reason":"bead_lookup_failed","id":"%s","name":"%s","state":"%s","detail":"%s"}' "$(ts)" "$id" "$name" "$state" "$lock_detail")"
+        continue ;;
+    esac
+  fi
+  if [ -n "$decision_log" ]; then log "$decision_log"; fi
+
   # bead hint (best-effort, advisory only — not a gate). Title carries the source
   # bead like "auto-refiner: ga-sf661 (attempt 1)".
   bead="$(printf '%s' "$title" | grep -oE 'ga-[a-z0-9]{5,7}|gt-[a-z0-9]{5,7}|wa-[a-z0-9]{4,7}' | head -1)"
@@ -397,6 +605,6 @@ done <<EOF
 $CENSUS
 EOF
 
-log "$(printf '{"ts":"%s","event":"sweep","enabled":"%s","min_age_min":%s,"idle_min":%s,"eligible":%s,"reaped":%s,"would_reap":%s,"kept_young":%s,"kept_active":%s,"kept_alive_peek":%s,"kept_peek_inconclusive":%s,"skipped_other":%s}' \
-  "$(ts)" "$ENABLED" "$MIN_AGE_MIN" "$IDLE_MIN" "$eligible" "$reaped" "$would_reap" "$kept_young" "$kept_active" "$kept_alive_peek" "$kept_peek_inconclusive" "$skipped_other")"
+log "$(printf '{"ts":"%s","event":"sweep","enabled":"%s","min_age_min":%s,"idle_min":%s,"eligible":%s,"reaped":%s,"would_reap":%s,"kept_young":%s,"kept_active":%s,"kept_alive_peek":%s,"kept_peek_inconclusive":%s,"skipped_other":%s,"kept_attached":%s,"kept_has_bead":%s,"kept_bead_lookup_failed":%s}' \
+  "$(ts)" "$ENABLED" "$MIN_AGE_MIN" "$IDLE_MIN" "$eligible" "$reaped" "$would_reap" "$kept_young" "$kept_active" "$kept_alive_peek" "$kept_peek_inconclusive" "$skipped_other" "$kept_attached" "$kept_has_bead" "$kept_bead_lookup_failed")"
 exit 0
