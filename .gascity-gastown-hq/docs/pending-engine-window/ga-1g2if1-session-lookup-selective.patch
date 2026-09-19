@@ -1,0 +1,965 @@
+# ga-1g2if1 (dog gastown.dog-2, 2026-09-19): session lookups stop scanning every closed wisp.
+# Base: consolidated/engine-window-20260919 @ 4f4837703 (the live gc-1.1.1-engwin0919).
+# NOT COMPILED AND NOT RUN in its final form (data disk at 97%; GOCACHE is wiped hourly).
+# Before the swap run:  go vet ./internal/beads ./internal/session && go test ./internal/beads ./internal/session
+# A failure there is a defect of this patch, not of the base: hand the bead back.
+# A/B numbers, review findings and the phase-2 plan: comment on bead ga-1g2if1.
+
+diff --git a/internal/beads/list_selective.go b/internal/beads/list_selective.go
+new file mode 100644
+index 000000000..1d5464a1b
+--- /dev/null
++++ b/internal/beads/list_selective.go
+@@ -0,0 +1,8 @@
++package beads
++
++// SelectiveProbeLimit is the page size of the bounded first read that a store
++// may issue for a ListQuery with Selective set. It is far above the number of
++// beads an identity lookup (one session name, one alias, one agent) can match,
++// so the unbounded repeat that follows a full page is a safety net rather than
++// a normal path.
++const SelectiveProbeLimit = 32
+diff --git a/internal/beads/list_selective_test.go b/internal/beads/list_selective_test.go
+new file mode 100644
+index 000000000..6bcf4338a
+--- /dev/null
++++ b/internal/beads/list_selective_test.go
+@@ -0,0 +1,305 @@
++package beads
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"reflect"
++	"testing"
++	"time"
++
++	beadslib "github.com/steveyegge/beads"
++)
++
++// selectiveUpstream stands in for the upstream beads search. Like the real SQL
++// it applies the metadata equality filter first and the limit after, and it
++// ignores predicates NativeDoltStore only applies client-side (UpdatedBefore).
++type selectiveUpstream struct {
++	issues  []*beadslib.Issue
++	limits  []int                  // Limit of every SearchIssues call, in order
++	filters []beadslib.IssueFilter // the whole filter of every call, in order
++	err     error
++}
++
++func (u *selectiveUpstream) search(_ context.Context, _ string, filter beadslib.IssueFilter) ([]*beadslib.Issue, error) {
++	u.limits = append(u.limits, filter.Limit)
++	u.filters = append(u.filters, filter)
++	if u.err != nil {
++		return nil, u.err
++	}
++	var out []*beadslib.Issue
++	for _, issue := range u.issues {
++		var meta map[string]string
++		_ = json.Unmarshal(issue.Metadata, &meta)
++		match := true
++		for k, v := range filter.MetadataFields {
++			if meta[k] != v {
++				match = false
++				break
++			}
++		}
++		if !match {
++			continue
++		}
++		out = append(out, issue)
++		if filter.Limit > 0 && len(out) >= filter.Limit {
++			break
++		}
++	}
++	return out, nil
++}
++
++func selectiveIssue(id, sessionName string, updatedAt time.Time) *beadslib.Issue {
++	return &beadslib.Issue{
++		ID:        id,
++		Title:     id,
++		Status:    beadslib.StatusOpen,
++		IssueType: beadslib.TypeTask,
++		Priority:  2,
++		CreatedAt: updatedAt,
++		UpdatedAt: updatedAt,
++		Metadata:  json.RawMessage(fmt.Sprintf(`{"session_name":%q}`, sessionName)),
++	}
++}
++
++func selectiveIssues(n int) []*beadslib.Issue {
++	base := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
++	out := make([]*beadslib.Issue, 0, n+1)
++	for i := 0; i < n; i++ {
++		out = append(out, selectiveIssue(fmt.Sprintf("gc-%02d", i), "worker-1", base.Add(time.Duration(i)*time.Second)))
++	}
++	return append(out, selectiveIssue("gc-other", "worker-2", base))
++}
++
++func newSelectiveStore(issues []*beadslib.Issue) (*NativeDoltStore, *selectiveUpstream) {
++	up := &selectiveUpstream{issues: issues}
++	return newNativeDoltStoreForTest(&nativeDoltStorageSpy{searchIssues: up.search}), up
++}
++
++func selectiveLookup() ListQuery {
++	return ListQuery{Metadata: map[string]string{"session_name": "worker-1"}, Selective: true}
++}
++
++func selectiveIDs(beads []Bead) []string {
++	out := make([]string, len(beads))
++	for i, b := range beads {
++		out[i] = b.ID
++	}
++	return out
++}
++
++// The point of the hint: upstream must first see a BOUNDED query, because only
++// a bounded query lets the vendored bd search take its narrow id-only scan.
++func TestNativeDoltStoreListSelectiveProbesWithBoundedLimitFirst(t *testing.T) {
++	store, up := newSelectiveStore(selectiveIssues(3))
++
++	got, err := store.List(selectiveLookup())
++	if err != nil {
++		t.Fatalf("List: %v", err)
++	}
++	if len(got) != 3 {
++		t.Fatalf("List returned %d beads, want 3", len(got))
++	}
++	if want := []int{SelectiveProbeLimit}; !reflect.DeepEqual(up.limits, want) {
++		t.Fatalf("upstream limits = %v, want a single bounded probe %v", up.limits, want)
++	}
++
++	// Control: without the hint the read reaches upstream unbounded, as before.
++	unhinted := selectiveLookup()
++	unhinted.Selective = false
++	store, up = newSelectiveStore(selectiveIssues(3))
++	if _, err := store.List(unhinted); err != nil {
++		t.Fatalf("List (no hint): %v", err)
++	}
++	if want := []int{0}; !reflect.DeepEqual(up.limits, want) {
++		t.Fatalf("upstream limits without the hint = %v, want %v", up.limits, want)
++	}
++}
++
++// The hint changes how the rows are read, never which rows come back.
++func TestNativeDoltStoreListSelectiveResultMatchesUnhintedListForEveryMatchCount(t *testing.T) {
++	for _, n := range []int{0, 1, SelectiveProbeLimit - 1, SelectiveProbeLimit, SelectiveProbeLimit + 1, SelectiveProbeLimit + 8} {
++		t.Run(fmt.Sprintf("matches=%d", n), func(t *testing.T) {
++			hintedStore, _ := newSelectiveStore(selectiveIssues(n))
++			plainStore, _ := newSelectiveStore(selectiveIssues(n))
++			plain := selectiveLookup()
++			plain.Selective = false
++
++			got, err := hintedStore.List(selectiveLookup())
++			if err != nil {
++				t.Fatalf("List (hinted): %v", err)
++			}
++			want, err := plainStore.List(plain)
++			if err != nil {
++				t.Fatalf("List (plain): %v", err)
++			}
++			if len(got) != n {
++				t.Fatalf("hinted List returned %d beads, want all %d (a probe page must never truncate)", len(got), n)
++			}
++			if !reflect.DeepEqual(selectiveIDs(got), selectiveIDs(want)) {
++				t.Fatalf("hinted List differs from plain List:\n got=%v\nwant=%v", selectiveIDs(got), selectiveIDs(want))
++			}
++		})
++	}
++}
++
++// A full probe page cannot prove the result is complete, so the query is
++// repeated unbounded. Exactly-full is the boundary a "len > limit" check gets wrong.
++func TestNativeDoltStoreListSelectiveRepeatsUnboundedWhenProbePageIsFull(t *testing.T) {
++	for _, n := range []int{SelectiveProbeLimit, SelectiveProbeLimit + 5} {
++		t.Run(fmt.Sprintf("matches=%d", n), func(t *testing.T) {
++			store, up := newSelectiveStore(selectiveIssues(n))
++
++			if _, err := store.List(selectiveLookup()); err != nil {
++				t.Fatalf("List: %v", err)
++			}
++			if want := []int{SelectiveProbeLimit, 0}; !reflect.DeepEqual(up.limits, want) {
++				t.Fatalf("upstream limits = %v, want probe then unbounded %v", up.limits, want)
++			}
++		})
++	}
++}
++
++// The probe is judged on the UPSTREAM row count. UpdatedBefore is applied only
++// client-side, so a probe page whose every row it later drops must not be read
++// as "complete": here the only surviving row sits beyond the first page.
++func TestNativeDoltStoreListSelectiveJudgesTheProbeOnUpstreamRows(t *testing.T) {
++	recent := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
++	old := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
++	var issues []*beadslib.Issue
++	for i := 0; i < SelectiveProbeLimit; i++ {
++		issues = append(issues, selectiveIssue(fmt.Sprintf("gc-recent-%02d", i), "worker-1", recent))
++	}
++	issues = append(issues, selectiveIssue("gc-old", "worker-1", old))
++	store, up := newSelectiveStore(issues)
++
++	query := selectiveLookup()
++	query.UpdatedBefore = time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
++
++	got, err := store.List(query)
++	if err != nil {
++		t.Fatalf("List: %v", err)
++	}
++	if ids := selectiveIDs(got); !reflect.DeepEqual(ids, []string{"gc-old"}) {
++		t.Fatalf("List = %v, want [gc-old]: the first upstream page was full, so the query had to be repeated unbounded", ids)
++	}
++	if want := []int{SelectiveProbeLimit, 0}; !reflect.DeepEqual(up.limits, want) {
++		t.Fatalf("upstream limits = %v, want probe then unbounded %v", up.limits, want)
++	}
++}
++
++func TestNativeDoltStoreListSelectiveLeavesACallerLimitAlone(t *testing.T) {
++	store, up := newSelectiveStore(selectiveIssues(10))
++	query := selectiveLookup()
++	query.Limit = 5
++
++	got, err := store.List(query)
++	if err != nil {
++		t.Fatalf("List: %v", err)
++	}
++	if len(got) != 5 {
++		t.Fatalf("List returned %d beads, want the caller's limit of 5", len(got))
++	}
++	if want := []int{5}; !reflect.DeepEqual(up.limits, want) {
++		t.Fatalf("upstream limits = %v, want the caller's own limit %v", up.limits, want)
++	}
++}
++
++// Only the limit may differ between the probe and the unbounded repeat: a probe
++// that rebuilt the filter and dropped a predicate would return rows the caller
++// never asked for.
++func TestNativeDoltStoreListSelectiveProbeChangesOnlyTheLimit(t *testing.T) {
++	store, up := newSelectiveStore(selectiveIssues(SelectiveProbeLimit + 3))
++
++	if _, err := store.List(selectiveLookup()); err != nil {
++		t.Fatalf("List: %v", err)
++	}
++	if len(up.filters) != 2 {
++		t.Fatalf("upstream calls = %d, want the probe and the unbounded repeat", len(up.filters))
++	}
++	probe, full := up.filters[0], up.filters[1]
++	if probe.Limit != SelectiveProbeLimit || full.Limit != 0 {
++		t.Fatalf("limits = %d, %d, want %d, 0", probe.Limit, full.Limit, SelectiveProbeLimit)
++	}
++	probe.Limit = 0
++	if !reflect.DeepEqual(probe, full) {
++		t.Fatalf("probe filter differs from the unbounded filter beyond Limit:\n probe=%+v\n  full=%+v", probe, full)
++	}
++	// The status filter must survive: an open-only lookup must never see closed rows.
++	if len(full.ExcludeStatus) != 1 || full.ExcludeStatus[0] != beadslib.StatusClosed {
++		t.Fatalf("ExcludeStatus = %#v, want [closed]", full.ExcludeStatus)
++	}
++}
++
++// The hint is only honored for a selective query. A query that includes closed
++// rows can match a long history (a full probe page would double the cost of an
++// unbounded scan), and a label-driven or unfiltered query is not an identity
++// lookup, so all of them reach upstream unbounded, as before.
++func TestNativeDoltStoreListSelectiveIgnoresQueriesThatCanMatchManyBeads(t *testing.T) {
++	cases := []struct {
++		name  string
++		shape func(q *ListQuery)
++	}{
++		{"includes closed rows", func(q *ListQuery) { q.IncludeClosed = true }},
++		{"closed-only status", func(q *ListQuery) { q.Status = "closed" }},
++		{"label-driven search", func(q *ListQuery) { q.Label = "gc:session" }},
++		{"no metadata filter", func(q *ListQuery) { q.Metadata = nil; q.AllowScan = true }},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			store, up := newSelectiveStore(selectiveIssues(3))
++			query := selectiveLookup()
++			tc.shape(&query)
++
++			if _, err := store.List(query); err != nil {
++				t.Fatalf("List: %v", err)
++			}
++			if want := []int{0}; !reflect.DeepEqual(up.limits, want) {
++				t.Fatalf("upstream limits = %v, want %v: the hint must not bound this query", up.limits, want)
++			}
++		})
++	}
++}
++
++// A local sort keeps the upstream limit at zero; the probe must still return the
++// complete, locally sorted result.
++func TestNativeDoltStoreListSelectiveWithLocalSortReturnsCompleteSortedResult(t *testing.T) {
++	base := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
++	issues := []*beadslib.Issue{
++		selectiveIssue("gc-new", "worker-1", base.Add(2*time.Minute)),
++		selectiveIssue("gc-old", "worker-1", base),
++		selectiveIssue("gc-mid", "worker-1", base.Add(time.Minute)),
++	}
++	store, up := newSelectiveStore(issues)
++	query := selectiveLookup()
++	query.Sort = SortCreatedAsc
++
++	got, err := store.List(query)
++	if err != nil {
++		t.Fatalf("List: %v", err)
++	}
++	if ids := selectiveIDs(got); !reflect.DeepEqual(ids, []string{"gc-old", "gc-mid", "gc-new"}) {
++		t.Fatalf("List = %v, want every match sorted oldest first", ids)
++	}
++	if want := []int{SelectiveProbeLimit}; !reflect.DeepEqual(up.limits, want) {
++		t.Fatalf("upstream limits = %v, want %v", up.limits, want)
++	}
++}
++
++func TestNativeDoltStoreListSelectiveHardErrorIsNotRetried(t *testing.T) {
++	store, up := newSelectiveStore(selectiveIssues(3))
++	boom := errors.New("dolt: read timeout")
++	up.err = boom
++
++	got, err := store.List(selectiveLookup())
++	if !errors.Is(err, boom) {
++		t.Fatalf("err = %v, want %v", err, boom)
++	}
++	if got != nil {
++		t.Fatalf("beads = %+v, want nil on a hard error", got)
++	}
++	if len(up.limits) != 1 {
++		t.Fatalf("upstream calls = %d, want 1 (a failed probe must not be retried unbounded)", len(up.limits))
++	}
++}
+diff --git a/internal/beads/native_dolt_store.go b/internal/beads/native_dolt_store.go
+index 6681b8ce7..ab964eb93 100644
+--- a/internal/beads/native_dolt_store.go
++++ b/internal/beads/native_dolt_store.go
+@@ -569,7 +569,7 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
+ 	filter := nativeIssueFilterFromListQuery(query)
+ 	ctx, cancel := nativeDoltOperationContext(context.TODO())
+ 	defer cancel()
+-	issues, err := storage.SearchIssues(ctx, "", filter)
++	issues, err := nativeSearchIssues(ctx, storage, query, filter)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -584,6 +584,49 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
+ 	return ApplyListQuery(beads, query), nil
+ }
+ 
++// nativeSearchIssues runs the upstream search for List. A Selective metadata
++// lookup that reaches upstream without a limit is read as a bounded probe of
++// SelectiveProbeLimit rows first: any bounded query makes the vendored beads
++// search scan only `id` and batch-fetch the survivors by primary key ("Pattern
++// B", issueops.searchTableInTxT) instead of streaming every column of every
++// row the metadata predicate visits. On hq.wisps that took a status-filtered
++// session lookup from 0.4-0.75 s to 0.05-0.08 s (ga-1g2if1).
++//
++// The probe is exact because it is judged on the UPSTREAM row count, before
++// any client-side filtering in ApplyListQuery: fewer rows than the limit means
++// upstream had no more, so the page is the complete candidate set (and a page
++// that a predicate applied only client-side would later thin out cannot be
++// mistaken for a complete one); a full page may be cut short, so the query is
++// repeated unbounded. A caller-supplied limit already reaches upstream and is
++// left alone.
++//
++// Only queries that are selective by nature are probed: a status-filtered,
++// label-free metadata lookup. A query that includes closed rows can match a
++// long history (a recycled named session leaves one closed bead per restart),
++// where a full probe page would double the cost of an unbounded JSON scan that
++// the narrow projection barely shortens, and a label-driven search is not
++// bounded here at all.
++func nativeSearchIssues(ctx context.Context, storage beadslib.Storage, query ListQuery, filter beadslib.IssueFilter) ([]*beadslib.Issue, error) {
++	if !nativeSelectiveProbeApplies(query, filter) {
++		return storage.SearchIssues(ctx, "", filter)
++	}
++	probe := filter
++	probe.Limit = SelectiveProbeLimit
++	issues, err := storage.SearchIssues(ctx, "", probe)
++	if err != nil || len(issues) < SelectiveProbeLimit {
++		return issues, err
++	}
++	return storage.SearchIssues(ctx, "", filter)
++}
++
++func nativeSelectiveProbeApplies(query ListQuery, filter beadslib.IssueFilter) bool {
++	return query.Selective &&
++		filter.Limit == 0 &&
++		len(query.Metadata) > 0 &&
++		query.Label == "" &&
++		!query.IncludesClosed()
++}
++
+ // ListOpen returns non-closed beads by default, or beads with the given status.
+ func (s *NativeDoltStore) ListOpen(status ...string) ([]Bead, error) {
+ 	query := ListQuery{AllowScan: true}
+diff --git a/internal/beads/query.go b/internal/beads/query.go
+index 98534185d..b240a19a4 100644
+--- a/internal/beads/query.go
++++ b/internal/beads/query.go
+@@ -113,6 +113,21 @@ type ListQuery struct {
+ 	// implementations ignore it. Use it only for lifecycle gates that must
+ 	// observe external mutations immediately.
+ 	Live bool
++	// Selective declares that the caller expects a metadata lookup to match
++	// only a handful of live beads (an identity lookup such as "the open
++	// session whose session_name is X"). It is a hint, never a contract: a
++	// Selective query that matches many beads still returns all of them.
++	// NativeDoltStore honors it for a status-filtered, label-free metadata
++	// lookup by running it as a bounded probe of SelectiveProbeLimit rows
++	// first, which lets the backing beads search scan only ids and hydrate the
++	// few survivors instead of streaming every column of every row the
++	// metadata predicate visits; the result is identical either way. Every
++	// other store ignores the hint (one that applies a limit before its
++	// client-side filters could not honor it exactly), and so does
++	// NativeDoltStore for a query that includes closed rows, which can match a
++	// long history.
++	Selective bool
++
+ 	Sort SortOrder
+ 	// TierMode selects the storage tier(s) to read from. Zero value
+ 	// (TierIssues) preserves the legacy single-tier behavior.
+diff --git a/internal/session/metadata_candidates.go b/internal/session/metadata_candidates.go
+index 4f6015b46..5296b1aa2 100644
+--- a/internal/session/metadata_candidates.go
++++ b/internal/session/metadata_candidates.go
+@@ -10,16 +10,26 @@ import (
+ // metadata filter. Each filter must contain exactly one key/value pair; empty
+ // filters are ignored. Results are deduplicated by bead ID in query order.
+ func ExactMetadataSessionCandidates(store beads.Store, includeClosed bool, filters ...map[string]string) ([]beads.Bead, error) {
+-	return exactMetadataSessionCandidates(store, includeClosed, "", filters...)
++	return exactMetadataSessionCandidates(store, includeClosed, "", false, filters...)
+ }
+ 
+ // ExactMetadataSessionCandidatesWithStatus returns session beads matching any
+ // exact metadata filter and the requested bead status.
+ func ExactMetadataSessionCandidatesWithStatus(store beads.Store, status string, filters ...map[string]string) ([]beads.Bead, error) {
+-	return exactMetadataSessionCandidates(store, false, strings.TrimSpace(status), filters...)
++	return exactMetadataSessionCandidates(store, false, strings.TrimSpace(status), false, filters...)
+ }
+ 
+-func exactMetadataSessionCandidates(store beads.Store, includeClosed bool, status string, filters ...map[string]string) ([]beads.Bead, error) {
++// liveExactMetadataSessionCandidates is ExactMetadataSessionCandidates read
++// live: it bypasses any cache in front of the store, so a bead another process
++// created a moment ago is visible. The identity-availability checks need that:
++// a query that includes closed rows always reaches the backing store, so
++// dropping closed rows from one of them must not also drop its freshness
++// (ga-1g2if1).
++func liveExactMetadataSessionCandidates(store beads.Store, includeClosed bool, filters ...map[string]string) ([]beads.Bead, error) {
++	return exactMetadataSessionCandidates(store, includeClosed, "", true, filters...)
++}
++
++func exactMetadataSessionCandidates(store beads.Store, includeClosed bool, status string, live bool, filters ...map[string]string) ([]beads.Bead, error) {
+ 	if store == nil {
+ 		return nil, nil
+ 	}
+@@ -43,8 +53,14 @@ func exactMetadataSessionCandidates(store beads.Store, includeClosed bool, statu
+ 			continue
+ 		}
+ 		seenQueries[queryKey] = true
++		// An exact-value lookup matches a handful of beads at most: mark it
++		// Selective so NativeDoltStore can read a status-filtered one as a
++		// bounded probe (ga-1g2if1). The hint is inert when closed rows are
++		// included; the result is identical either way.
+ 		query := beads.ListQuery{
+-			Metadata: map[string]string{key: value},
++			Metadata:  map[string]string{key: value},
++			Selective: true,
++			Live:      live,
+ 		}
+ 		if status != "" {
+ 			query.Status = status
+diff --git a/internal/session/names.go b/internal/session/names.go
+index 96970c8b8..9a634fb67 100644
+--- a/internal/session/names.go
++++ b/internal/session/names.go
+@@ -419,13 +419,7 @@ func ensureSessionNameAvailableForSelfAndOwner(store beads.Store, name, selfID,
+ 	if name == "" {
+ 		return nil
+ 	}
+-	all, err := ExactMetadataSessionCandidates(store, true,
+-		map[string]string{"session_name": name},
+-		map[string]string{"alias": name},
+-		map[string]string{"agent_name": name},
+-		map[string]string{"template": name},
+-		map[string]string{"common_name": name},
+-	)
++	all, err := sessionNameHolderCandidates(store, name)
+ 	if err != nil {
+ 		return fmt.Errorf("listing sessions: %w", err)
+ 	}
+@@ -486,6 +480,49 @@ func ensureSessionNameAvailableForSelfAndOwner(store beads.Store, name, selfID,
+ 	return nil
+ }
+ 
++// sessionNameHolderCandidates returns the session beads that may hold name as
++// session_name, alias, agent_name, template or common_name: session_name
++// matches first, then the rest, each bead once.
++//
++// Closed rows are read for the session_name key only. An explicit session name
++// is a permanent identity, so a closed session_name holder keeps the name
++// reserved; for every other key the availability loop skips a closed bead, so
++// reading closed rows for them only added four more full scans of every closed
++// wisp row per check (ga-1g2if1: seconds each on hq.wisps, several times a
++// tick while a configured name stays blocked). Those four are read live and
++// status-filtered: a lookup that includes closed rows always reaches the
++// backing store, so a plain (cache-served) open-only read would be staler than
++// the check used to be, and the live status-filtered read is cheap.
++func sessionNameHolderCandidates(store beads.Store, name string) ([]beads.Bead, error) {
++	held, err := ExactMetadataSessionCandidates(store, true,
++		map[string]string{"session_name": name},
++	)
++	if err != nil {
++		return nil, err
++	}
++	live, err := liveExactMetadataSessionCandidates(store, false,
++		map[string]string{"alias": name},
++		map[string]string{"agent_name": name},
++		map[string]string{"template": name},
++		map[string]string{"common_name": name},
++	)
++	if err != nil {
++		return nil, err
++	}
++	seen := make(map[string]bool, len(held))
++	out := make([]beads.Bead, 0, len(held)+len(live))
++	for _, b := range held {
++		seen[b.ID] = true
++		out = append(out, b)
++	}
++	for _, b := range live {
++		if !seen[b.ID] {
++			out = append(out, b)
++		}
++	}
++	return out, nil
++}
++
+ func failedCreateIdentityReleased(b beads.Bead) bool {
+ 	return strings.TrimSpace(b.Metadata["state"]) == string(StateFailedCreate)
+ }
+@@ -622,7 +659,11 @@ func isConfiguredNamedSessionRuntimeName(cfg *config.City, name, owner string) b
+ // ensureSessionNameAvailableForSelf so the legacy-bypass path cannot
+ // suppress rejections from live alias or identifier collisions.
+ func noLiveSessionNameCollisions(store beads.Store, name, selfID, selfOwner string) bool {
+-	all, err := ExactMetadataSessionCandidates(store, true,
++	// Live beads only: every closed row is skipped below, so asking the store
++	// for closed rows would only add five full scans of them (ga-1g2if1). Read
++	// live so a bead another process created a moment ago still counts, as it
++	// did when this asked for closed rows.
++	all, err := liveExactMetadataSessionCandidates(store, false,
+ 		map[string]string{"session_name": name},
+ 		map[string]string{"alias": name},
+ 		map[string]string{"agent_name": name},
+diff --git a/internal/session/names_scan_test.go b/internal/session/names_scan_test.go
+new file mode 100644
+index 000000000..bb0b4a09a
+--- /dev/null
++++ b/internal/session/names_scan_test.go
+@@ -0,0 +1,242 @@
++package session
++
++import (
++	"errors"
++	"strings"
++	"testing"
++
++	"github.com/gastownhall/gascity/internal/beads"
++)
++
++// ga-1g2if1: the session-name availability checks used to send five sequential
++// IncludeClosed lookups (session_name, alias, agent_name, template,
++// common_name). With no status predicate, each one is a full scan of every
++// closed wisp row and takes seconds on hq.wisps. Closed rows can only change
++// the answer for the session_name key (explicit names are permanent), so only
++// that lookup may ask for them. The other lookups are status-filtered, and they
++// are read LIVE: a lookup that includes closed rows always reaches the backing
++// store, so dropping the closed rows must not also drop the freshness the
++// check used to get from that.
++
++func metadataKeyOfQuery(q beads.ListQuery) string {
++	for k := range q.Metadata {
++		return k
++	}
++	return ""
++}
++
++// closedKeysOf returns the metadata keys whose lookup asked for closed rows, and
++// the set of keys that were looked up at all.
++func closedKeysOf(queries []beads.ListQuery) (closed []string, looked map[string]bool) {
++	looked = map[string]bool{}
++	for _, q := range queries {
++		key := metadataKeyOfQuery(q)
++		if key == "" {
++			continue
++		}
++		looked[key] = true
++		if q.IncludeClosed {
++			closed = append(closed, key)
++		}
++	}
++	return closed, looked
++}
++
++func TestEnsureSessionNameAvailableReadsClosedRowsOnlyForSessionName(t *testing.T) {
++	store := &listCountingStore{MemStore: beads.NewMemStore()}
++
++	if err := ensureSessionNameAvailable(store, "fresh-name"); err != nil {
++		t.Fatalf("ensureSessionNameAvailable: %v", err)
++	}
++
++	closed, looked := closedKeysOf(store.queries)
++	for _, key := range []string{"session_name", "alias", "agent_name", "template", "common_name"} {
++		if !looked[key] {
++			t.Errorf("no %q lookup reached the store; the availability check must still cover every identity key", key)
++		}
++	}
++	if len(closed) != 1 || closed[0] != "session_name" {
++		t.Fatalf("lookups that scanned closed rows = %v, want only [session_name]: a closed alias, agent_name, template or common_name holder never blocks a name, so scanning closed rows for those keys is wasted work", closed)
++	}
++	for _, q := range store.queries {
++		if key := metadataKeyOfQuery(q); key != "" && key != "session_name" && !q.Live {
++			t.Errorf("%q lookup %+v was not read live; without closed rows it would be served from a cache that may not have seen a bead another process just created", key, q)
++		}
++	}
++}
++
++func TestNoLiveSessionNameCollisionsNeverReadsClosedRows(t *testing.T) {
++	store := &listCountingStore{MemStore: beads.NewMemStore()}
++
++	if !noLiveSessionNameCollisions(store, "fresh-name", "", "") {
++		t.Fatal("noLiveSessionNameCollisions = false on an empty store, want true")
++	}
++
++	closed, looked := closedKeysOf(store.queries)
++	for _, key := range []string{"session_name", "alias", "agent_name", "template", "common_name"} {
++		if !looked[key] {
++			t.Errorf("no %q lookup reached the store; the live-collision check must still cover every identity key", key)
++		}
++	}
++	if len(closed) != 0 {
++		t.Fatalf("lookups that scanned closed rows = %v, want none: this check only asks about LIVE beads and skips every closed row", closed)
++	}
++	for _, q := range store.queries {
++		if key := metadataKeyOfQuery(q); key != "" && !q.Live {
++			t.Errorf("%q lookup %+v was not read live; this check gates the legacy bypass and must see a bead another process just created", key, q)
++		}
++	}
++}
++
++// The freshness regression the review found: a bead another process creates
++// straight in the backing store is invisible to a cache that has not seen it
++// yet. The checks must still see it, as they did while every lookup asked for
++// closed rows (which always reaches the backing store).
++func TestEnsureSessionNameAvailableSeesLiveBeadsTheCacheHasNotSeen(t *testing.T) {
++	for _, key := range []string{"alias", "agent_name", "template", "common_name"} {
++		t.Run(key, func(t *testing.T) {
++			backing := beads.NewMemStore()
++			cache := beads.NewCachingStoreForTest(backing, nil)
++			if err := cache.PrimeActive(); err != nil {
++				t.Fatalf("PrimeActive: %v", err)
++			}
++			if _, err := backing.Create(beads.Bead{
++				Type:     BeadType,
++				Labels:   []string{LabelSession},
++				Metadata: map[string]string{"session_name": "other", key: "taken"},
++			}); err != nil {
++				t.Fatalf("Create in backing store: %v", err)
++			}
++
++			if err := ensureSessionNameAvailable(cache, "taken"); !errors.Is(err, ErrSessionNameExists) {
++				t.Fatalf("err = %v, want ErrSessionNameExists: a live bead holding %q as %s exists in the backing store", err, "taken", key)
++			}
++		})
++	}
++}
++
++func TestNoLiveSessionNameCollisionsSeesLiveBeadsTheCacheHasNotSeen(t *testing.T) {
++	backing := beads.NewMemStore()
++	cache := beads.NewCachingStoreForTest(backing, nil)
++	if err := cache.PrimeActive(); err != nil {
++		t.Fatalf("PrimeActive: %v", err)
++	}
++	if _, err := backing.Create(beads.Bead{
++		Type:     BeadType,
++		Labels:   []string{LabelSession},
++		Metadata: map[string]string{"session_name": "other", "alias": "taken"},
++	}); err != nil {
++		t.Fatalf("Create in backing store: %v", err)
++	}
++
++	if noLiveSessionNameCollisions(cache, "taken", "", "") {
++		t.Fatal("noLiveSessionNameCollisions = true, want false: a live alias holder exists in the backing store")
++	}
++}
++
++// The reduction above must not change any answer. These pin the closed-row
++// rules the loop in ensureSessionNameAvailableForSelfAndOwner already had.
++func TestEnsureSessionNameAvailableClosedRowRulesAreUnchanged(t *testing.T) {
++	cases := []struct {
++		name    string
++		meta    map[string]string
++		closed  bool
++		wantErr bool
++	}{
++		{"closed session_name holder keeps the name reserved", map[string]string{"session_name": "taken"}, true, true},
++		{"open session_name holder blocks", map[string]string{"session_name": "taken"}, false, true},
++		{"closed alias holder does not block", map[string]string{"session_name": "other", "alias": "taken"}, true, false},
++		{"closed agent_name holder does not block", map[string]string{"session_name": "other", "agent_name": "taken"}, true, false},
++		{"closed template holder does not block", map[string]string{"session_name": "other", "template": "taken"}, true, false},
++		{"closed common_name holder does not block", map[string]string{"session_name": "other", "common_name": "taken"}, true, false},
++		{"open alias holder blocks", map[string]string{"session_name": "other", "alias": "taken"}, false, true},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			store := beads.NewMemStore()
++			b, err := store.Create(beads.Bead{Type: BeadType, Labels: []string{LabelSession}, Metadata: tc.meta})
++			if err != nil {
++				t.Fatalf("Create: %v", err)
++			}
++			if tc.closed {
++				if err := store.Close(b.ID); err != nil {
++					t.Fatalf("Close: %v", err)
++				}
++			}
++
++			err = ensureSessionNameAvailable(store, "taken")
++			if tc.wantErr && !errors.Is(err, ErrSessionNameExists) {
++				t.Fatalf("err = %v, want ErrSessionNameExists", err)
++			}
++			if !tc.wantErr && err != nil {
++				t.Fatalf("err = %v, want nil", err)
++			}
++		})
++	}
++}
++
++// When a closed configured-named holder releases the name, the error must name
++// the OPEN bead that still blocks it (the session_name matches are read first,
++// then the rest, each bead once).
++func TestEnsureSessionNameAvailableNamesTheOpenBlockerWhenAClosedNamedHolderIsReleased(t *testing.T) {
++	store := beads.NewMemStore()
++	closedHolder, err := store.Create(beads.Bead{
++		Type:     BeadType,
++		Labels:   []string{LabelSession},
++		Metadata: map[string]string{"session_name": "taken", "configured_named_session": "true"},
++	})
++	if err != nil {
++		t.Fatalf("Create closed holder: %v", err)
++	}
++	if err := store.Close(closedHolder.ID); err != nil {
++		t.Fatalf("Close: %v", err)
++	}
++	openBlocker, err := store.Create(beads.Bead{
++		Type:     BeadType,
++		Labels:   []string{LabelSession},
++		Metadata: map[string]string{"session_name": "other", "alias": "taken"},
++	})
++	if err != nil {
++		t.Fatalf("Create open blocker: %v", err)
++	}
++
++	err = ensureSessionNameAvailable(store, "taken")
++	if !errors.Is(err, ErrSessionNameExists) {
++		t.Fatalf("err = %v, want ErrSessionNameExists from the open alias holder", err)
++	}
++	if !strings.Contains(err.Error(), openBlocker.ID) {
++		t.Fatalf("err = %q, want it to name the open blocker %s", err.Error(), openBlocker.ID)
++	}
++}
++
++func TestNoLiveSessionNameCollisionsClosedRowRulesAreUnchanged(t *testing.T) {
++	cases := []struct {
++		name   string
++		meta   map[string]string
++		closed bool
++		want   bool
++	}{
++		{"closed session_name holder is not a live collision", map[string]string{"session_name": "taken"}, true, true},
++		{"open session_name holder collides", map[string]string{"session_name": "taken"}, false, false},
++		{"closed alias holder is not a live collision", map[string]string{"session_name": "other", "alias": "taken"}, true, true},
++		{"open alias holder collides", map[string]string{"session_name": "other", "alias": "taken"}, false, false},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			store := beads.NewMemStore()
++			b, err := store.Create(beads.Bead{Type: BeadType, Labels: []string{LabelSession}, Metadata: tc.meta})
++			if err != nil {
++				t.Fatalf("Create: %v", err)
++			}
++			if tc.closed {
++				if err := store.Close(b.ID); err != nil {
++					t.Fatalf("Close: %v", err)
++				}
++			}
++
++			if got := noLiveSessionNameCollisions(store, "taken", "", ""); got != tc.want {
++				t.Fatalf("noLiveSessionNameCollisions = %v, want %v", got, tc.want)
++			}
++		})
++	}
++}
+diff --git a/internal/session/resolve.go b/internal/session/resolve.go
+index 77aa7a449..050fdf368 100644
+--- a/internal/session/resolve.go
++++ b/internal/session/resolve.go
+@@ -127,9 +127,14 @@ func listSessionBeadsByMetadata(store beads.Store, key, value string, allowClose
+ 	if key == "" || value == "" {
+ 		return nil, nil
+ 	}
++	// An exact-value lookup matches a handful of beads at most: mark it
++	// Selective so NativeDoltStore can read a status-filtered one as a bounded
++	// probe (ga-1g2if1). The hint is inert when closed rows are included; the
++	// result is identical either way.
+ 	raw, err := store.List(beads.ListQuery{
+ 		Metadata:      map[string]string{key: value},
+ 		IncludeClosed: allowClosed,
++		Selective:     true,
+ 	})
+ 	if err != nil {
+ 		return nil, err
+diff --git a/internal/session/selective_lookup_test.go b/internal/session/selective_lookup_test.go
+new file mode 100644
+index 000000000..cd66c8fc5
+--- /dev/null
++++ b/internal/session/selective_lookup_test.go
+@@ -0,0 +1,139 @@
++package session_test
++
++import (
++	"fmt"
++	"testing"
++
++	"github.com/gastownhall/gascity/internal/beads"
++	"github.com/gastownhall/gascity/internal/session"
++)
++
++// ga-1g2if1: a session identity lookup (one session_name, one alias, one
++// agent) matches a handful of live beads at most. It must declare that with
++// ListQuery.Selective: for a status-filtered lookup NativeDoltStore then lets
++// the backing beads search take its narrow id-only scan instead of streaming
++// ~52 columns for every row the JSON metadata predicate visits (0.4-0.75 s ->
++// 0.05-0.08 s on hq.wisps); it ignores the hint when closed rows are included.
++// These tests pin that the flag is set, not what each store does with it. The
++// hint never changes which beads come back; the store-level tests in
++// internal/beads pin that exactness.
++
++func newSelectiveLookupStore() *listCountingStore {
++	return &listCountingStore{Store: beads.NewMemStore()}
++}
++
++func metadataLookupsOf(calls []beads.ListQuery) []beads.ListQuery {
++	var out []beads.ListQuery
++	for _, q := range calls {
++		if len(q.Metadata) > 0 {
++			out = append(out, q)
++		}
++	}
++	return out
++}
++
++func requireSelectiveMetadataLookups(t *testing.T, calls []beads.ListQuery) {
++	t.Helper()
++	lookups := metadataLookupsOf(calls)
++	if len(lookups) == 0 {
++		t.Fatal("no metadata lookup reached the store")
++	}
++	for _, q := range lookups {
++		if !q.Selective {
++			t.Errorf("metadata lookup %+v was not marked Selective; an identity lookup must say so the store can take its narrow id-only scan", q)
++		}
++	}
++}
++
++func createSessionBeads(t *testing.T, store beads.Store, n int, meta map[string]string) {
++	t.Helper()
++	for i := 0; i < n; i++ {
++		if _, err := store.Create(beads.Bead{
++			Title:    fmt.Sprintf("dup-%02d", i),
++			Type:     session.BeadType,
++			Labels:   []string{session.LabelSession},
++			Metadata: meta,
++		}); err != nil {
++			t.Fatalf("Create %d: %v", i, err)
++		}
++	}
++}
++
++func TestResolveSessionIDMetadataLookupsAreSelective(t *testing.T) {
++	store := newSelectiveLookupStore()
++	b, err := store.Create(beads.Bead{
++		Type:     session.BeadType,
++		Labels:   []string{session.LabelSession},
++		Metadata: map[string]string{"alias": "overseer"},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	id, err := session.ResolveSessionID(store, "overseer")
++	if err != nil {
++		t.Fatalf("ResolveSessionID: %v", err)
++	}
++	if id != b.ID {
++		t.Fatalf("ResolveSessionID = %q, want %q", id, b.ID)
++	}
++	requireSelectiveMetadataLookups(t, store.listCalls)
++}
++
++func TestResolveSessionIDAllowClosedFallbackLookupsAreSelective(t *testing.T) {
++	store := newSelectiveLookupStore()
++	b, err := store.Create(beads.Bead{
++		Type:     session.BeadType,
++		Labels:   []string{session.LabelSession},
++		Metadata: map[string]string{"session_name": "sky"},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := store.Close(b.ID); err != nil {
++		t.Fatal(err)
++	}
++
++	id, err := session.ResolveSessionIDAllowClosed(store, "sky")
++	if err != nil {
++		t.Fatalf("ResolveSessionIDAllowClosed: %v", err)
++	}
++	if id != b.ID {
++		t.Fatalf("ResolveSessionIDAllowClosed = %q, want %q", id, b.ID)
++	}
++	requireSelectiveMetadataLookups(t, store.listCalls)
++}
++
++func TestExactMetadataSessionCandidatesLookupsAreSelective(t *testing.T) {
++	store := newSelectiveLookupStore()
++	createSessionBeads(t, store, 1, map[string]string{"agent_name": "worker", "template": "worker"})
++
++	got, err := session.ExactMetadataSessionCandidates(store, false,
++		map[string]string{"agent_name": "worker"},
++		map[string]string{"template": "worker"},
++	)
++	if err != nil {
++		t.Fatalf("ExactMetadataSessionCandidates: %v", err)
++	}
++	if len(got) != 1 {
++		t.Fatalf("candidates = %d, want 1 (deduped across filters)", len(got))
++	}
++	requireSelectiveMetadataLookups(t, store.listCalls)
++}
++
++// The session helpers themselves never cap a result: however many beads match,
++// they all come back. (MemStore ignores the hint, so this pins the helpers, not
++// the probe; the probe's exactness is pinned in internal/beads.)
++func TestExactMetadataSessionCandidatesDoNotCapTheResult(t *testing.T) {
++	const dup = 40 // more than one probe page
++	store := newSelectiveLookupStore()
++	createSessionBeads(t, store, dup, map[string]string{"session_name": "dup-name"})
++
++	got, err := session.ExactMetadataSessionCandidates(store, false, map[string]string{"session_name": "dup-name"})
++	if err != nil {
++		t.Fatalf("ExactMetadataSessionCandidates: %v", err)
++	}
++	if len(got) != dup {
++		t.Fatalf("ExactMetadataSessionCandidates = %d beads, want all %d", len(got), dup)
++	}
++}
