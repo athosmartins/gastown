@@ -55,16 +55,29 @@
 # T6: immediately after T5 (no time elapsed since T5's just-refreshed
 #     timestamp), same fingerprint again → back to fully silent — the
 #     reminder is spaced, not "announce from now on".
+#
+# ga-q29hsf: this test used to cross the interval with a REAL sleep against a
+# 2s interval, assuming every back-to-back run took "well under 1s". The script
+# measures with `date +%s` (whole seconds), so the effective silent window was
+# only 1-2s wide: on a loaded machine (load average 60-80) one run outlasted
+# it, the reminder fired "early", and the "should be suppressed" asserts (T2/T6)
+# failed with no relation to the diff under test. Now no assertion depends on
+# how fast a run is. The interval is far longer than any run could take (so
+# "suppressed" cannot be crossed by load), and T5 gets its "the last report is
+# older than the interval" precondition by rewinding the persisted epoch (line 2
+# of the story's fingerprint file — the script's own state, read by the same
+# code path as in production) instead of sleeping.
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DELIVERY="$SCRIPT_DIR/../story-delivery.sh"
-# Exercise the spaced-reminder path on a short, real interval rather than
-# mocking time — T5/T6 below use a real `sleep` to cross it. Comfortably
-# larger than T1-T4's own back-to-back runtime (well under 1s) so it never
-# fires early for those.
-export HALT_FP_REMINDER_INTERVAL_S=2
+# Deliberately HUGE relative to any run (an hour): "suppressed" (T2/T6) must
+# hold however slow the machine is, so nothing here may depend on a run
+# finishing inside a short window (ga-q29hsf). T5 reaches the "interval
+# elapsed" side by backdating the stored epoch (backdate_halt_fp below),
+# never by waiting.
+export HALT_FP_REMINDER_INTERVAL_S=3600
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ok   - $1"; }
@@ -150,6 +163,29 @@ run_block() {
   [ -f "$T/reached.marker" ] && REACHED=1 || REACHED=0
 }
 
+# backdate_halt_fp <story_id> — rewinds the persisted "last announced" epoch
+# (line 2 of the story's halt-fingerprint file, see story-delivery.sh) to TWICE
+# HALT_FP_REMINDER_INTERVAL_S in the past, leaving line 1 (the dedup key)
+# untouched. Stands in for "that much real time has passed" without a sleep:
+# the block still reads the file, subtracts, and compares exactly as in
+# production. Records a FAIL itself and returns 1 if there is no fingerprint to
+# rewind or the rewrite did not take, so a vacuous T5 setup cannot pass silently.
+backdate_halt_fp() {
+  local f="$GC_CITY/.gc/runtime/daemon-refresh-baseline/halt-fingerprint/$1.txt"
+  local key ts
+  key="$(sed -n '1p' "$f" 2>/dev/null || true)"
+  if [ -z "$key" ]; then
+    nok "backdate_halt_fp: no fingerprint recorded for $1" "$f"
+    return 1
+  fi
+  ts=$(( $(date +%s) - 2 * HALT_FP_REMINDER_INTERVAL_S ))
+  printf '%s\n%s\n' "$key" "$ts" > "$f"
+  if [ "$(sed -n '1p' "$f")" != "$key" ] || [ "$(sed -n '2p' "$f")" != "$ts" ]; then
+    nok "backdate_halt_fp: rewrite of $1 fingerprint did not take" "$(cat "$f" 2>/dev/null)"
+    return 1
+  fi
+}
+
 # ── T1: first HALT for ga-test1 → announced ──────────────────────────────
 write_stub "com.test.central-sender"
 run_block ga-test1
@@ -218,7 +254,10 @@ run_block ga-test3
   || nok "T5 setup rc" "rc=$RUN_RC"
 echo "$BD_CALLS" | grep -q "comment ga-test3" \
   && ok "T5 setup: first HALT announced" || nok "T5 setup comment" "$BD_CALLS"
-sleep 3
+# ga-q29hsf: the "last report is older than the interval" precondition is SET,
+# not waited for — a sleep here raced a loaded machine and slowed every gate run.
+backdate_halt_fp ga-test3 \
+  && ok "T5 setup: ga-test3's last report backdated past the reminder interval"
 run_block ga-test3
 [ "$RUN_RC" -eq 0 ] && ok "T5 block runs clean (rc=0)" || nok "T5 rc" "rc=$RUN_RC"
 echo "$BD_CALLS" | grep -q "comment ga-test3" \
