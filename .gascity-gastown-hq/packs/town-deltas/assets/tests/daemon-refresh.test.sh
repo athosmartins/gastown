@@ -264,43 +264,101 @@ make_symbol_script() {  # make_symbol_script <runtime-dir>
   mkdir -p "$1/scripts"
   cat > "$1/scripts/compute_symbol_reachability.py" <<'PYEOF'
 #!/usr/bin/env python3
+# ga-4oh2r6: --batch added alongside the original single-entry CLI (unchanged
+# below). Both branches share the SAME per-entrypoint seed_symbol_result()
+# mode file, so an existing single-entry test's seeding still works verbatim
+# if pointed at --batch instead.
 import argparse, json, os, sys, time
 ap = argparse.ArgumentParser()
 ap.add_argument("--repo", default="")
-ap.add_argument("--entrypoint", required=True)
+ap.add_argument("--entrypoint")
 ap.add_argument("--closure", action="append", default=[])
 ap.add_argument("--before", required=True)
 ap.add_argument("--after", required=True)
+ap.add_argument("--batch")
 args = ap.parse_args()
 mock = os.environ.get("MOCK_DIR", "")
+
+
+def result_for(entrypoint):
+    sanitized = entrypoint.replace("/", "_")
+    mode = "no_evidence"
+    ctrl = os.path.join(mock, "symbol_mode." + sanitized) if mock else ""
+    if ctrl and os.path.exists(ctrl):
+        with open(ctrl) as f:
+            mode = f.read().strip()
+    if mode == "confirmed":
+        return {"reaches": True, "via": "direct", "path": ["handler"], "changed_symbols": ["handler"], "warnings": []}
+    if mode == "confirmed_graph":
+        return {"reaches": True, "via": "graph", "path": ["entry", "mid", "handler"], "changed_symbols": ["handler"], "warnings": []}
+    if mode == "no_evidence":
+        return {"reaches": False, "via": None, "path": [], "changed_symbols": ["other"], "warnings": []}
+    return mode  # "crash" | "hang" | "badjson" | "missing" — handled by caller
+
+
+if args.batch:
+    with open(args.batch, encoding="utf-8") as f:
+        manifest = json.load(f)
+    if mock:
+        with open(os.path.join(mock, "symbol_batch_argv.json"), "w") as f:
+            json.dump({"before": args.before, "after": args.after, "batch": args.batch,
+                       "n_entries": len(manifest["entries"])}, f)
+        # ga-4oh2r6: counts INVOCATIONS of this stub in --batch mode, not
+        # entries processed -- the whole point being tested is "N GUARDED
+        # daemons -> ONE process", so this file's own byte content (an
+        # incrementing counter, not a boolean flag) is what proves that, not
+        # just its existence (which a regression back to N separate calls,
+        # each overwriting the same filename, would leave looking identical).
+        counter_path = os.path.join(mock, "symbol_batch_invocations")
+        try:
+            with open(counter_path) as f:
+                n = int(f.read().strip() or "0")
+        except FileNotFoundError:
+            n = 0
+        with open(counter_path, "w") as f:
+            f.write(str(n + 1))
+    for entry in manifest["entries"]:
+        r = result_for(entry["entrypoint"])
+        if r == "crash":
+            sys.exit(1)
+        elif r == "hang":
+            time.sleep(20)
+        elif r == "missing":
+            continue  # this entry never gets a JSONL line -- process keeps going
+        elif r == "badjson":
+            print("not valid json")
+            sys.stdout.flush()
+        else:
+            out = dict(r)
+            out["label"] = entry["label"]
+            print(json.dumps(out))
+            sys.stdout.flush()
+    sys.exit(0)
+
+# single-entry CLI — unchanged from the pre-ga-4oh2r6 stub.
 sanitized = args.entrypoint.replace("/", "_")
 if mock:
     with open(os.path.join(mock, "symbol_argv." + sanitized), "w") as f:
         json.dump(vars(args), f)
-mode = "no_evidence"
-ctrl = os.path.join(mock, "symbol_mode." + sanitized) if mock else ""
-if ctrl and os.path.exists(ctrl):
-    with open(ctrl) as f:
-        mode = f.read().strip()
-if mode == "confirmed":
-    print(json.dumps({"reaches": True, "via": "direct", "path": ["handler"], "changed_symbols": ["handler"], "warnings": []}))
-elif mode == "confirmed_graph":
-    print(json.dumps({"reaches": True, "via": "graph", "path": ["entry", "mid", "handler"], "changed_symbols": ["handler"], "warnings": []}))
-elif mode == "no_evidence":
-    print(json.dumps({"reaches": False, "via": None, "path": [], "changed_symbols": ["other"], "warnings": []}))
-elif mode == "crash":
+r = result_for(args.entrypoint)
+if r == "crash":
     sys.exit(1)
-elif mode == "hang":
+elif r == "hang":
     time.sleep(20)
-elif mode == "badjson":
+elif r == "badjson":
     print("not valid json")
+elif isinstance(r, dict):
+    print(json.dumps(r))
 sys.exit(0)
 PYEOF
   chmod +x "$1/scripts/compute_symbol_reachability.py"
 }
 # seed_symbol_result <entrypoint-relpath> <mode>  — mode is one of
-# confirmed|confirmed_graph|no_evidence|crash|hang|badjson (default when
-# unseeded: no_evidence).
+# confirmed|confirmed_graph|no_evidence|crash|hang|badjson|missing (default
+# when unseeded: no_evidence). "missing" (ga-4oh2r6) only means anything in
+# --batch mode: the entry is silently omitted from the JSONL output instead
+# of crashing the whole invocation — models one daemon's line never arriving
+# without taking the rest of the batch down with it.
 seed_symbol_result() {
   local sanitized="${1//\//_}"
   echo "$2" > "$MOCK/symbol_mode.$sanitized"
@@ -336,7 +394,6 @@ run_helper() {  # run_helper <changed-relpaths...>  (commits a deploy diff first
   LAUNCH_AGENTS_DIR="$AGENTS" \
   LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" \
   VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
-  SYMBOL_REACHABILITY_TIMEOUT="${SYMBOL_REACHABILITY_TIMEOUT:-2}" \
   SYMBOL_REACHABILITY_TOTAL_TIMEOUT="${SYMBOL_REACHABILITY_TOTAL_TIMEOUT:-10}" \
   DRY_RUN="${DRY_RUN:-0}" \
   bash "$HELPER" 2>/dev/null
@@ -2508,11 +2565,23 @@ R65="$(field REASON "$OUT")"
 echo "$R65" | grep -qE "SYMBOL-CONFIRMED|SEM EVIDÊNCIA DE SÍMBOLO|NÃO CALCULADO" && nok "T65 REASON must NOT mention any symbol-ranking section" "$R65" || ok "T65 no symbol-ranking section in REASON"
 
 # ════════════════════════════════════════════════════════════════════════════
-# T66 (ga-8q1ulq, header point 17): a MIXED GUARDED batch — one CONFIRMED,
-# one NO_EVIDENCE, one CRASHED (NOT_COMPUTED) — all three sections must
-# render, in that order, and VERDICT/flat-GUARDED membership stay exactly
-# what point 16 alone would have produced (this layer only reorders/
-# annotates). Also checks the trailing JSON, not just the KEY=value lines.
+# T66 (ga-8q1ulq, header point 17; updated ga-4oh2r6 for batch mode): a MIXED
+# GUARDED batch — one CONFIRMED, one NO_EVIDENCE, one whose line never
+# arrives (NOT_COMPUTED) — all three sections must render, in that order,
+# and VERDICT/flat-GUARDED membership stay exactly what point 16 alone would
+# have produced (this layer only reorders/annotates). Also checks the
+# trailing JSON, not just the KEY=value lines.
+#
+# Uses seed mode "missing", not "crash", for the third daemon (ga-4oh2r6):
+# in the single-process --batch world all three entries share ONE manifest
+# and one invocation, processed in whatever order $GUARDED iterates them —
+# "crash" (sys.exit(1) mid-loop) would non-deterministically also wipe out
+# any sibling entries the stub hadn't reached yet, making this test's outcome
+# depend on iteration order instead of on the thing it's actually testing.
+# "missing" (this bead's own addition to the stub) omits just the one
+# entry's JSONL line while the stub keeps going — order-independent, and the
+# realistic shape of "this daemon's answer never arrived" (a genuinely
+# crashing whole-batch invocation is covered separately, T64/T67).
 # ════════════════════════════════════════════════════════════════════════════
 new_case t66
 make_symbol_script "$RUNTIME"
@@ -2527,7 +2596,7 @@ seed_running com.test.slot-scheduler 66101 "$STALE_LSTART"
 seed_running com.test.conversation-monitor 66201 "$STALE_LSTART"
 seed_symbol_result daemons/central_sender.py confirmed
 seed_symbol_result daemons/slot_scheduler.py no_evidence
-seed_symbol_result daemons/conversation_monitor.py crash
+seed_symbol_result daemons/conversation_monitor.py missing
 SENSITIVE_DAEMONS="central-sender slot-scheduler conversation-monitor"
 OUT=$(run_helper daemons/central_sender.py daemons/slot_scheduler.py daemons/conversation_monitor.py); RC=$?
 SENSITIVE_DAEMONS="central-sender"
@@ -2555,11 +2624,14 @@ assert d["guarded_symbol_not_computed"] == ["com.test.conversation-monitor"], d[
   || nok "T66 JSON" "$(cat /tmp/t66_json_err 2>/dev/null)"
 
 # ════════════════════════════════════════════════════════════════════════════
-# T67 (ga-8q1ulq, header point 17 / ACEITE item 4): a per-daemon
-# SYMBOL_REACHABILITY_TIMEOUT bounds a hung compute_symbol_reachability.py —
+# T67 (ga-8q1ulq, header point 17 / ACEITE item 4; updated ga-4oh2r6): the
+# batch invocation hanging is bounded by SYMBOL_REACHABILITY_TOTAL_TIMEOUT —
 # degrades to NÃO CALCULADO instead of stalling the halt past its budget.
-# The stub's "hang" mode sleeps 20s; the test overrides the timeout down to
-# 1s so this stays a fast test, not a slow one.
+# There is no more PER-DAEMON timeout to test separately (point 18 removed
+# it along with the per-label subprocess loop it governed): a single-entry
+# batch makes the total budget BE the effective per-daemon bound, which is
+# exactly what this test now exercises. The stub's "hang" mode sleeps 20s;
+# the test overrides the TOTAL timeout down to 1s so this stays a fast test.
 # ════════════════════════════════════════════════════════════════════════════
 new_case t67
 make_symbol_script "$RUNTIME"
@@ -2567,20 +2639,24 @@ cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
 make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
 seed_running com.test.central-sender 67001 "$STALE_LSTART"
 seed_symbol_result daemons/central_sender.py hang
-SYMBOL_REACHABILITY_TIMEOUT=1
+SYMBOL_REACHABILITY_TOTAL_TIMEOUT=1
 OUT=$(run_helper daemons/central_sender.py); RC=$?
-SYMBOL_REACHABILITY_TIMEOUT=2
+SYMBOL_REACHABILITY_TOTAL_TIMEOUT=10
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T67 verdict NEEDS_GUARDED_RESTART" || nok "T67 verdict" "got '$V' out=[$OUT]"
-echo "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" | grep -q "com.test.central-sender" && ok "T67 per-daemon timeout degrades to GUARDED_SYMBOL_NOT_COMPUTED" || nok "T67 guarded_symbol_not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
+echo "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" | grep -q "com.test.central-sender" && ok "T67 hung batch invocation degrades to GUARDED_SYMBOL_NOT_COMPUTED" || nok "T67 guarded_symbol_not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
 
 # ════════════════════════════════════════════════════════════════════════════
-# T68 (ga-8q1ulq, header point 17 / ACEITE item 4): SYMBOL_REACHABILITY_
-# TOTAL_TIMEOUT=0 means the whole-batch budget is already spent before the
-# loop starts — every GUARDED label is degraded to NÃO CALCULADO WITHOUT the
-# calculator ever being invoked for them (no symbol_argv.* recorded), not
-# just timing each one out individually. Two daemons prove it is a BATCH
-# budget, not a per-daemon one re-armed for each label.
+# T68 (ga-8q1ulq, header point 17 / ACEITE item 4; updated ga-4oh2r6):
+# SYMBOL_REACHABILITY_TOTAL_TIMEOUT=0 means the whole batch's budget is
+# already spent before the (single, now) invocation would even happen —
+# every GUARDED label is degraded to NÃO CALCULADO WITHOUT the calculator
+# ever being invoked at all (no symbol_batch_argv.json recorded — this is
+# the explicit `-le 0` pre-check point 18 added specifically because
+# `timeout 0 cmd` does NOT mean "time out instantly"; verified live,
+# coreutils treats a 0 duration as no bound). Two daemons in one manifest
+# prove this is the one shared budget check, not something re-evaluated per
+# label the way the old per-label loop's SECONDS-based check was.
 # ════════════════════════════════════════════════════════════════════════════
 new_case t68
 make_symbol_script "$RUNTIME"
@@ -2603,9 +2679,9 @@ NC68="$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
 echo "$NC68" | grep -q "com.test.central-sender" && echo "$NC68" | grep -q "com.test.slot-scheduler" \
   && ok "T68 exhausted total budget degrades BOTH daemons to GUARDED_SYMBOL_NOT_COMPUTED" \
   || nok "T68 guarded_symbol_not_computed" "$NC68"
-[ ! -e "$MOCK/symbol_argv.daemons_central_sender.py" ] && [ ! -e "$MOCK/symbol_argv.daemons_slot_scheduler.py" ] \
+[ ! -e "$MOCK/symbol_batch_argv.json" ] \
   && ok "T68 calculator never invoked once the total budget was already spent" \
-  || nok "T68 stub should not have been called" "argv files exist under $MOCK"
+  || nok "T68 stub should not have been called" "symbol_batch_argv.json exists under $MOCK"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T69 (ga-8q1ulq, header point 17 / ACEITE item 1): the reachability window
@@ -2639,13 +2715,16 @@ OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" \
   EXTRA_RUNTIME_ROOTS="" FORCE_RESTART_LABELS="" \
   LAUNCH_AGENTS_DIR="$AGENTS" LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" \
   VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
-  SYMBOL_REACHABILITY_TIMEOUT=2 SYMBOL_REACHABILITY_TOTAL_TIMEOUT=10 \
+  SYMBOL_REACHABILITY_TOTAL_TIMEOUT=10 \
   DRY_RUN=0 bash "$HELPER" 2>/dev/null); RC=$?
 SENSITIVE_DAEMONS="central-sender"
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T69 verdict NEEDS_GUARDED_RESTART" || nok "T69 verdict" "got '$V' out=[$OUT]"
-ARGV_FILE="$MOCK/symbol_argv.daemons_central_sender.py"
-[ -f "$ARGV_FILE" ] && ok "T69 calculator was invoked (argv recorded)" || nok "T69 argv file" "missing $ARGV_FILE"
+# ga-4oh2r6: --before/--after are now batch-level args (one manifest, one
+# call), recorded by the stub to symbol_batch_argv.json instead of a
+# per-daemon symbol_argv.<entrypoint> file.
+ARGV_FILE="$MOCK/symbol_batch_argv.json"
+[ -f "$ARGV_FILE" ] && ok "T69 calculator was invoked (batch argv recorded)" || nok "T69 argv file" "missing $ARGV_FILE"
 python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -2654,6 +2733,60 @@ assert d["after"] == sys.argv[3], (d["after"], sys.argv[3])
 ' "$ARGV_FILE" "$BEAD_PRE" "$BEAD_POST" 2>/tmp/t69_err \
   && ok "T69 --before/--after use the bead's own merge range, not the wider deploy window" \
   || nok "T69 window preference" "$(cat /tmp/t69_err 2>/dev/null)"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T70 (ga-4oh2r6): the actual regression this bead fixes — FIVE GUARDED
+# daemons in one run must trigger exactly ONE compute_symbol_reachability.py
+# invocation, not five. Measured in production before this fix: 17 GUARDED
+# daemons -> 17 separate subprocesses, each re-fetching+re-parsing its own
+# entrypoint+closure from scratch with zero sharing, blowing both the old
+# per-daemon (5s) and total (30s) budgets -- 17/17 landed on NÃO CALCULADO on
+# the feature's first real production run (story-delivery.log:120141-120158).
+# Proven via symbol_batch_invocations, an incrementing counter the stub
+# writes on every --batch invocation (not just file existence, which a
+# regression back to N separate calls overwriting the same filename would
+# leave looking identical) -- and independently, via the manifest's own
+# recorded entry count (n_entries) matching all five labels in one shot.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t70
+make_symbol_script "$RUNTIME"
+T70_LABELS="alpha bravo charlie delta echo"
+T70_FILES=""
+for n in $T70_LABELS; do
+  cat > "$RUNTIME/daemons/${n}_daemon.py" <<EOF
+print("$n")
+EOF
+  make_plist "$AGENTS" "com.test.$n" "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/${n}_daemon.py"
+  T70_FILES="$T70_FILES daemons/${n}_daemon.py"
+done
+i=70100
+for n in $T70_LABELS; do
+  seed_running "com.test.$n" "$i" "$STALE_LSTART"
+  seed_symbol_result "daemons/${n}_daemon.py" confirmed
+  i=$((i+1))
+done
+SENSITIVE_DAEMONS="$T70_LABELS"
+# shellcheck disable=SC2086 -- $T70_FILES is intentionally word-split (list of relpaths)
+OUT=$(run_helper $T70_FILES); RC=$?
+SENSITIVE_DAEMONS="central-sender"
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T70 verdict NEEDS_GUARDED_RESTART" || nok "T70 verdict" "got '$V' out=[$OUT]"
+for n in $T70_LABELS; do
+  echo "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")" | grep -q "com.test.$n" \
+    && ok "T70 com.test.$n correctly SYMBOL-CONFIRMED" \
+    || nok "T70 com.test.$n missing from GUARDED_SYMBOL_CONFIRMED" "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")"
+done
+INVOCATIONS="$(cat "$MOCK/symbol_batch_invocations" 2>/dev/null || echo "<missing>")"
+[ "$INVOCATIONS" = "1" ] \
+  && ok "T70 exactly ONE compute_symbol_reachability.py invocation for 5 GUARDED daemons (was 5 before ga-4oh2r6)" \
+  || nok "T70 invocation count" "symbol_batch_invocations=$INVOCATIONS (expected 1)"
+python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["n_entries"] == 5, d["n_entries"]
+' "$MOCK/symbol_batch_argv.json" 2>/tmp/t70_err \
+  && ok "T70 the one invocation carried all 5 entries in its manifest" \
+  || nok "T70 manifest entry count" "$(cat /tmp/t70_err 2>/dev/null)"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""

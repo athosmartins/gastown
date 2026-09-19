@@ -693,6 +693,14 @@ run_presence_drift_sweep() {
         fi
         continue
       fi
+      # ga-d0s6dc: same rule the CRITICAL loop already applies (_deliberately_disabled,
+      # ga-4zyex) — launchctl-disable is the intentional-stop signal. Without this check,
+      # a job disabled on purpose (plist still sitting in scripts/ or packs/town-deltas/
+      # assets/) reads as "never deployed" and pages every cooldown window.
+      if _deliberately_disabled "$label"; then
+        log "PRESENCE-DRIFT SKIP $label: launchctl-disabled (parada deliberada) — nao alarmo (src=$dir)"
+        continue
+      fi
       undeployed="$undeployed $label"
       last="$(_pd_last_get "$label")"
       since=$(( now - last ))
@@ -1043,6 +1051,14 @@ case "\$1" in
     done
     printf '\tpath = %s/%s.plist\n' "\$LAUNCH_DIR" "\$_lbl"
     exit 0 ;;
+  print-disabled)
+    # ga-d0s6dc: \`launchctl print-disabled gui/<uid>\` → emit one "=> disabled"
+    # line per label in DPW_TEST_DISABLED, matching the real command's shape
+    # closely enough for _deliberately_disabled's own grep to match.
+    for _dl in \$DPW_TEST_DISABLED; do
+      printf '\t"%s" => disabled\n' "\$_dl"
+    done
+    exit 0 ;;
 esac
 exit 0
 STUB
@@ -1086,6 +1102,7 @@ PLIST
 
   export DPW_TEST_LOADED DPW_TEST_EXIT DPW_RELOAD   # exported so the stub subprocess sees them
   export DPW_TEST_PLIST_PATH DPW_TEST_PLIST_PATH_UNKNOWN   # ga-sb1wu: same reasoning, for the print stub
+  DPW_TEST_DISABLED=""; export DPW_TEST_DISABLED   # ga-d0s6dc: same reasoning, for the print-disabled stub
   ALL="com.gascity.alpha com.gascity.beta com.gascity.gamma"
 
   # Disable provenance checks for scenarios 1-12 (tested explicitly in scenarios 13-17)
@@ -1314,6 +1331,15 @@ case "$1" in
       case "$kv" in "$_lbl:"*) printf '\tpath = %s\n' "${kv#*:}"; exit 0 ;; esac
     done
     printf '\tpath = %s/%s.plist\n' "$LAUNCH_DIR" "$_lbl"
+    exit 0 ;;
+  print-disabled)
+    # ga-d0s6dc: same as the first stub above (line ~1054) — THIS is the stub
+    # actually in effect from here on (nothing reinstalls the fuller one above,
+    # per the comment on the print case just above), so scenario 33b needs
+    # this case here too, not just on the first stub.
+    for _dl in $DPW_TEST_DISABLED; do
+      printf '\t"%s" => disabled\n' "$_dl"
+    done
     exit 0 ;;
 esac
 exit 0
@@ -1669,6 +1695,18 @@ GCSTUB31
   run_presence_drift_sweep >/dev/null 2>&1
   [ -s "$MAILSENT31" ] && ok "same label drifts again post-recovery: alerts fresh (no inherited cooldown)" || bad "same label post-recovery: unexpectedly suppressed"
   unset DPW_TEST_NOW
+
+  echo "Scenario 33b (ga-d0s6dc): presence-drift — label is launchctl-DISABLED (deliberate stop, ga-4zyex) → no alert; same label re-enabled → alerts as before"
+  : > "$MAILSENT31"; : > "$LOG"; rm -rf "${STATE}.presence-drift"
+  DPW_TEST_LOADED="com.gascity.epsilon"; DPW_TEST_DISABLED="com.gascity.delta"
+  run_presence_drift_sweep; rc33b=$?
+  [ "$rc33b" -eq 0 ] && ok "deliberately-disabled label: sweep returns 0 (no drift reported)" || bad "deliberately-disabled label: sweep wrongly returned 1"
+  [ ! -s "$MAILSENT31" ] && ok "deliberately-disabled label: no mail sent" || bad "deliberately-disabled label: mail wrongly sent"
+  grep -q "SKIP com.gascity.delta" "$LOG" && ok "deliberately-disabled label: skip logged" || bad "deliberately-disabled label: missing skip log line"
+  : > "$MAILSENT31"; : > "$LOG"; DPW_TEST_DISABLED=""
+  run_presence_drift_sweep; rc33b2=$?
+  [ "$rc33b2" -eq 1 ] && ok "same label, NOT disabled: sweep returns 1 (alerts as before)" || bad "same label, not disabled: sweep should still alert"
+  [ -s "$MAILSENT31" ] && ok "same label, NOT disabled: mail sent (regression guard — undeployed still alerts)" || bad "same label, not disabled: expected mail, none sent"
 
   # ── ga-95bi4 selftest scenarios 34–38 ────────────────────────────────────
   # The acceptance bar from the bug report itself: running the watchdog N times

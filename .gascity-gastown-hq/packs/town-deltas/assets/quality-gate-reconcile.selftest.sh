@@ -74,6 +74,8 @@ type gap2_apply_pass_verdict       >/dev/null 2>&1 || { echo "FATAL: gap2_apply_
 type gap2_refused_token            >/dev/null 2>&1 || { echo "FATAL: gap2_refused_token not defined by guard (ga-eu75w)"; exit 1; }
 type gap2_free_refused_stranded    >/dev/null 2>&1 || { echo "FATAL: gap2_free_refused_stranded not defined by guard (ga-eu75w)"; exit 1; }
 type open_verdict_ids_from_json    >/dev/null 2>&1 || { echo "FATAL: open_verdict_ids_from_json not defined by guard (ga-g4m18)"; exit 1; }
+type gap2_wait_active_marker       >/dev/null 2>&1 || { echo "FATAL: gap2_wait_active_marker not defined by guard (ga-crgfa0)"; exit 1; }
+type gap2_skip_no_changes          >/dev/null 2>&1 || { echo "FATAL: gap2_skip_no_changes not defined by guard (ga-crgfa0)"; exit 1; }
 
 # ── 0. age_minutes_of must read the bead 'Z' timestamps as UTC (not local) ───
 # Regression lock for the TZ bug that made every age negative (off by the host's
@@ -947,6 +949,187 @@ else
     && bad "REGRESSION ga-1un0n: found an UNGATED 'label add \$SC_ID gate:passed' directly in the sweep — this is the exact bypass line the bug reports" \
     || ok "no ungated gate:passed write remains in the sweep — it only happens inside the verdict-gated gap2_apply_pass_verdict"
 fi
+
+# ── 6i. gap2_wait_active_marker (ga-crgfa0: dedup repeated identical comment) ──
+# Measured live 2026-09-18: ga-kmm6rb got 11 BYTE-IDENTICAL "still queued for
+# review" comments in ~79 minutes (one per sweep) while the same gate marker
+# sat active — one Dolt commit per copy, and the real comments buried under
+# them. gap2_wait_active_marker is the extracted wait:active-marker arm body
+# (previously inline in the Step 0c.2 case statement): it must post the
+# comment only when the announced <marker_id, gate-status> pair actually
+# changed since the LAST sweep, tracked via the parent's own
+# gap2.waiting_marker metadata (caller reads it, passes it in as
+# <prev_wait_state> — this function stays a pure-ish unit doing its own I/O,
+# same shape as gap2_arm_needs_remerge/gap2_free_refused_stranded above).
+echo "── 6i. gap2_wait_active_marker (ga-crgfa0: dedup repeated identical comment) ──"
+
+GC_CITY=/tmp/ga-crgfa0-fake-city
+
+# Three consecutive sweeps, SAME marker. Sweep 1 has no prior state (first
+# time this parent waits). Sweeps 2 and 3 pass back the value sweep 1's own
+# --set-metadata call would have written — exactly what a real re-run reads
+# back from bd show, since nothing else in this state changes between sweeps.
+GAP2_WAIT_CALLS="$(mktemp)"
+bd() { printf '%s\n' "$*" >> "$GAP2_WAIT_CALLS"; return 0; }
+gap2_wait_active_marker "ga-fake-parent" "ga-fake-sling" "ga-wisp-aaa queued" ""
+gap2_wait_active_marker "ga-fake-parent" "ga-fake-sling" "ga-wisp-aaa queued" "ga-wisp-aaa queued"
+gap2_wait_active_marker "ga-fake-parent" "ga-fake-sling" "ga-wisp-aaa queued" "ga-wisp-aaa queued"
+unset -f bd
+
+GAP2_WAIT_COMMENT_COUNT=$(grep -cF -- "comment ga-fake-parent" "$GAP2_WAIT_CALLS" || true)
+[ "$GAP2_WAIT_COMMENT_COUNT" -eq 1 ] \
+  && ok "gap2_wait_active_marker posts exactly 1 comment across 3 sweeps with the SAME marker (=1)" \
+  || bad "gap2_wait_active_marker posted $GAP2_WAIT_COMMENT_COUNT comments across 3 identical sweeps — expected exactly 1 (ga-crgfa0: this is the 11-copies-in-one-bead regression)"
+
+grep -qF -- "-C $GC_CITY update ga-fake-parent --set-metadata gap2.waiting_marker=ga-wisp-aaa queued -q" "$GAP2_WAIT_CALLS" \
+  && ok "gap2_wait_active_marker stamps gap2.waiting_marker metadata so the NEXT sweep can detect no change" \
+  || bad "gap2_wait_active_marker never stamped gap2.waiting_marker metadata — nothing for a real next sweep to compare against, so the dedup could never actually engage outside this test"
+rm -f "$GAP2_WAIT_CALLS"
+
+# A genuinely NEW marker (fresh gate submission replacing a superseded one)
+# must still get its own comment — the dedup must not be a one-shot mute.
+GAP2_WAIT_CALLS2="$(mktemp)"
+bd() { printf '%s\n' "$*" >> "$GAP2_WAIT_CALLS2"; return 0; }
+gap2_wait_active_marker "ga-fake-parent" "ga-fake-sling" "ga-wisp-bbb queued" "ga-wisp-aaa queued"
+unset -f bd
+grep -qF -- "comment ga-fake-parent" "$GAP2_WAIT_CALLS2" \
+  && ok "gap2_wait_active_marker posts a NEW comment when the marker id changes" \
+  || bad "gap2_wait_active_marker skipped commenting for a genuinely NEW marker id — dedup is too aggressive"
+rm -f "$GAP2_WAIT_CALLS2"
+
+# A gate-status change on the SAME marker (queued -> running: still active,
+# but progressed) must also get a new comment — gap2_marker_for_bead's own
+# "<id> <status>" return shape makes this fall out for free; lock it in.
+GAP2_WAIT_CALLS3="$(mktemp)"
+bd() { printf '%s\n' "$*" >> "$GAP2_WAIT_CALLS3"; return 0; }
+gap2_wait_active_marker "ga-fake-parent" "ga-fake-sling" "ga-wisp-aaa running" "ga-wisp-aaa queued"
+unset -f bd
+grep -qF -- "comment ga-fake-parent" "$GAP2_WAIT_CALLS3" \
+  && ok "gap2_wait_active_marker posts a NEW comment when the SAME marker's gate-status changes (queued -> running)" \
+  || bad "gap2_wait_active_marker skipped commenting on a gate-status change for the same marker"
+rm -f "$GAP2_WAIT_CALLS3"
+
+# Drift-guard companion (mirrors 6e's gap2_arm_needs_remerge check): the
+# wait:active-marker case arm must actually call this function, not just
+# define it unused.
+grep -q 'gap2_wait_active_marker "\$SC_ID" "\$SLING_ID" "\$GAP2_ACTIVE_HIT"' "$GUARD" \
+  && ok "the wait:active-marker arm actually calls gap2_wait_active_marker" \
+  || bad "gap2_wait_active_marker is defined but the case-statement arm never calls it"
+
+# ── 6i-bis. gap2_wait_active_marker must not stamp dedup state when bd
+# comment fails (GATE-FEEDBACK gate_run=ga-fcvvoi, attempt 1) ──
+# The FIRST fix attempt (6i above) called --set-metadata unconditionally
+# right after `bd comment`, discarding its exit status via
+# `2>/dev/null || true`. A reviewer caught this: bd comment can fail
+# transiently (this file discards stderr on nearly every bd call precisely
+# because Dolt is documented-fragile), and stamping the metadata
+# unconditionally would make a failed post look "already announced" to
+# every later sweep — the notification is lost SILENTLY and PERMANENTLY
+# instead of just retried next sweep, a regression versus the pre-dedup
+# behavior. The stub below fails ONLY the `comment` subcommand, checked by
+# argument position ($3, after `-C "$GC_CITY"`) rather than by grepping the
+# logged text — the human-readable message itself contains the word
+# "comment" ("comment deduped per marker/gate-status"), so a substring test
+# would falsely match every call, not just the comment one.
+echo "── 6i-bis. gap2_wait_active_marker skips the dedup stamp when bd comment fails (GATE-FEEDBACK ga-fcvvoi) ──"
+
+GAP2_WAITFAIL_CALLS="$(mktemp)"
+bd() {
+  printf '%s\n' "$*" >> "$GAP2_WAITFAIL_CALLS"
+  [ "$3" = "comment" ] && return 1
+  return 0
+}
+gap2_wait_active_marker "ga-fake-parent4" "ga-fake-sling4" "ga-wisp-ccc queued" ""
+unset -f bd
+
+[ "$(grep -cF -- "comment ga-fake-parent4" "$GAP2_WAITFAIL_CALLS")" -eq 1 ] \
+  && ok "gap2_wait_active_marker still attempts the comment even though bd will fail it" \
+  || bad "gap2_wait_active_marker never attempted the comment in the failure-stub scenario — test stub itself is broken"
+
+grep -qF -- "update ga-fake-parent4 --set-metadata gap2.waiting_marker=" "$GAP2_WAITFAIL_CALLS" \
+  && bad "REGRESSION ga-fcvvoi: gap2_wait_active_marker stamped gap2.waiting_marker even though the bd comment call FAILED — a transient Dolt failure would now be silently and PERMANENTLY mistaken for 'already announced'" \
+  || ok "gap2_wait_active_marker does NOT stamp gap2.waiting_marker when the comment call fails — next sweep will retry instead of losing the notification forever"
+rm -f "$GAP2_WAITFAIL_CALLS"
+
+# Follow-up sweep, SAME marker, prev_wait_state still "" (nothing was ever
+# stamped by the failed sweep above, exactly as a real caller reading back
+# empty metadata would see) — this time bd succeeds, proving a transient
+# failure just delays the retry to the next sweep rather than losing it.
+GAP2_WAITRETRY_CALLS="$(mktemp)"
+bd() { printf '%s\n' "$*" >> "$GAP2_WAITRETRY_CALLS"; return 0; }
+gap2_wait_active_marker "ga-fake-parent4" "ga-fake-sling4" "ga-wisp-ccc queued" ""
+unset -f bd
+grep -qF -- "comment ga-fake-parent4" "$GAP2_WAITRETRY_CALLS" \
+  && ok "gap2_wait_active_marker retries the comment on the NEXT sweep after a failed post (self-healing preserved)" \
+  || bad "gap2_wait_active_marker did not retry on the next sweep — a failed post would be lost forever"
+rm -f "$GAP2_WAITRETRY_CALLS"
+
+# ── 6j. gap2_skip_no_changes (ga-crgfa0: same dedup, skip:no-changes-stranded arm) ──
+# The bug's own "what to do" section: the SAME repeat-per-sweep shape exists
+# in the ga-hr44j "leaving parent untouched (inert)" comment — nothing in
+# that arm ever changes story:in-flight/pilot:dispatched/the linked sling, so
+# a persistently-inert parent re-enters this exact branch and re-posts the
+# identical comment every sweep, same as wait:active-marker did.
+echo "── 6j. gap2_skip_no_changes (ga-crgfa0: dedup the ga-hr44j no-changes-stranded comment) ──"
+
+GAP2_NOCHG_CALLS="$(mktemp)"
+bd() { printf '%s\n' "$*" >> "$GAP2_NOCHG_CALLS"; return 0; }
+gap2_skip_no_changes "ga-fake-parent2" "ga-fake-sling2" "no-changes: nothing to build" ""
+gap2_skip_no_changes "ga-fake-parent2" "ga-fake-sling2" "no-changes: nothing to build" "ga-fake-sling2:no-changes: nothing to build"
+gap2_skip_no_changes "ga-fake-parent2" "ga-fake-sling2" "no-changes: nothing to build" "ga-fake-sling2:no-changes: nothing to build"
+unset -f bd
+
+GAP2_NOCHG_COMMENT_COUNT=$(grep -cF -- "comment ga-fake-parent2" "$GAP2_NOCHG_CALLS" || true)
+[ "$GAP2_NOCHG_COMMENT_COUNT" -eq 1 ] \
+  && ok "gap2_skip_no_changes posts exactly 1 comment across 3 sweeps with the SAME sling+token (=1)" \
+  || bad "gap2_skip_no_changes posted $GAP2_NOCHG_COMMENT_COUNT comments across 3 identical sweeps — expected exactly 1"
+rm -f "$GAP2_NOCHG_CALLS"
+
+# A DIFFERENT sling (a later resubmission that also closed no-changes) must
+# still get its own comment.
+GAP2_NOCHG_CALLS2="$(mktemp)"
+bd() { printf '%s\n' "$*" >> "$GAP2_NOCHG_CALLS2"; return 0; }
+gap2_skip_no_changes "ga-fake-parent2" "ga-fake-sling3" "no-changes: nothing to build" "ga-fake-sling2:no-changes: nothing to build"
+unset -f bd
+grep -qF -- "comment ga-fake-parent2" "$GAP2_NOCHG_CALLS2" \
+  && ok "gap2_skip_no_changes posts a NEW comment when a later sling terminates no-changes too" \
+  || bad "gap2_skip_no_changes skipped commenting for a genuinely NEW sling — dedup is too aggressive"
+rm -f "$GAP2_NOCHG_CALLS2"
+
+grep -q 'gap2_skip_no_changes "\$SC_ID" "\$SLING_ID" "\$SLING_NO_CHANGES_TOKEN"' "$GUARD" \
+  && ok "the skip:no-changes-stranded arm actually calls gap2_skip_no_changes" \
+  || bad "gap2_skip_no_changes is defined but the case-statement arm never calls it"
+
+# ── 6j-bis. gap2_skip_no_changes must not stamp dedup state when bd comment
+# fails (GATE-FEEDBACK gate_run=ga-fcvvoi, attempt 1) — same fix, other arm ──
+echo "── 6j-bis. gap2_skip_no_changes skips the dedup stamp when bd comment fails (GATE-FEEDBACK ga-fcvvoi) ──"
+
+GAP2_NOCHGFAIL_CALLS="$(mktemp)"
+bd() {
+  printf '%s\n' "$*" >> "$GAP2_NOCHGFAIL_CALLS"
+  [ "$3" = "comment" ] && return 1
+  return 0
+}
+gap2_skip_no_changes "ga-fake-parent5" "ga-fake-sling5" "no-changes: nothing to build" ""
+unset -f bd
+
+[ "$(grep -cF -- "comment ga-fake-parent5" "$GAP2_NOCHGFAIL_CALLS")" -eq 1 ] \
+  && ok "gap2_skip_no_changes still attempts the comment even though bd will fail it" \
+  || bad "gap2_skip_no_changes never attempted the comment in the failure-stub scenario — test stub itself is broken"
+
+grep -qF -- "update ga-fake-parent5 --set-metadata gap2.no_changes_announced=" "$GAP2_NOCHGFAIL_CALLS" \
+  && bad "REGRESSION ga-fcvvoi: gap2_skip_no_changes stamped gap2.no_changes_announced even though the bd comment call FAILED — same permanent-silent-loss regression as gap2_wait_active_marker" \
+  || ok "gap2_skip_no_changes does NOT stamp gap2.no_changes_announced when the comment call fails — next sweep will retry"
+rm -f "$GAP2_NOCHGFAIL_CALLS"
+
+GAP2_NOCHGRETRY_CALLS="$(mktemp)"
+bd() { printf '%s\n' "$*" >> "$GAP2_NOCHGRETRY_CALLS"; return 0; }
+gap2_skip_no_changes "ga-fake-parent5" "ga-fake-sling5" "no-changes: nothing to build" ""
+unset -f bd
+grep -qF -- "comment ga-fake-parent5" "$GAP2_NOCHGRETRY_CALLS" \
+  && ok "gap2_skip_no_changes retries the comment on the NEXT sweep after a failed post (self-healing preserved)" \
+  || bad "gap2_skip_no_changes did not retry on the next sweep — a failed post would be lost forever"
+rm -f "$GAP2_NOCHGRETRY_CALLS"
 
 # ── 7. drift-guard: guard implements both GAP-1 and GAP-2 sweeps ──────────────
 echo "── 7. drift-guard: guard implements ga-pa36 GAP-1 + GAP-2 sweeps ──"

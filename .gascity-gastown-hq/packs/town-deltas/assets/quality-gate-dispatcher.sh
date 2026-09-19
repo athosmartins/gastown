@@ -512,6 +512,42 @@ session_is_dead() {
 }
 # SELFTEST-EXTRACT session-is-dead-fn: END
 
+# reviewer_session_confirmed_closed <assignee> <sessions_json> → echoes 1 iff
+# <assignee> is PRESENT in <sessions_json> with .closed == true; 0 otherwise —
+# INCLUDING when <assignee> is absent from the list entirely. Pure; no I/O.
+#
+# ga-s4potx: narrower than session_is_dead()/reviewer_session_alive() on
+# purpose. Those both treat "absent from the list" as dead too — correct for
+# their own job (a debounced, multi-poll liveness check backstopped by a
+# grace window), but wrong for THIS predicate's job: a same-sweep, no-debounce
+# signal Phase C can act on immediately, before its own outer VERDICT_TIMEOUT
+# elapses. A session that simply has not been CREATED yet (still start-
+# pending under supervisor load) is ALSO absent from the list — the exact
+# ga-wcd86 shape ("a session can sit minutes in start-pending and still come
+# up alive") — so treating absence as confirmed-dead here would requeue a
+# run whose reviewer was seconds from booting. An explicit `.closed == true`
+# has no such ambiguity: it is written once, by the session's own
+# close/terminate path, and never reverts — a closed session cannot un-close
+# itself, so this signal needs no debounce and no grace window. See this
+# bead's own body for the incident this closes: 3 gate-runs sat 26-43 minutes
+# past their reviewer session's confirmed close, waiting out the full outer
+# timeout for no reason.
+# SELFTEST-EXTRACT reviewer-session-confirmed-closed-fn: BEGIN
+reviewer_session_confirmed_closed() {
+  local assignee="${1:-}" sessions_json="${2:-}"
+  [ -z "$assignee" ] && { echo 0; return 0; }
+  if printf '%s' "$sessions_json" | jq -e --arg a "$assignee" \
+       '[(if type=="array" then . else (.sessions // []) end)[]
+        | select((.session_name==$a) or (.name==$a) or (.alias==$a) or (.id==$a) or (.agent_name==$a))
+        | (.closed == true)]
+       | any' >/dev/null 2>&1; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+# SELFTEST-EXTRACT reviewer-session-confirmed-closed-fn: END
+
 # classify_slot_action <bead_closed 0|1> <session_dead 0|1> <budget_remaining int>
 # The single decision for ONE reviewer slot in a poll iteration. Pure; no I/O.
 #   received → verdict bead is closed (a verdict — PASS or FAIL — was recorded);
@@ -8202,6 +8238,56 @@ gate_collect_verdicts() {
   done
 }
 # SELFTEST-EXTRACT gate-collect-verdicts-fn: END
+
+# gate_phase_c_all_pending_closed — true (exit 0) iff this run has at least
+# one still-pending (non-closed) verdict bead AND EVERY still-pending verdict
+# bead's reviewer session is CONFIRMED CLOSED (reviewer_session_confirmed_closed,
+# above). False (exit 1) if there are no pending slots (nothing to requeue —
+# the caller's own VERDICTS_RECEIVED==REQUIRED_REVIEWERS branch already
+# handles an all-delivered run), if any pending slot's session is not
+# confirmed closed, or if any read this needs is unreadable this sweep (fails
+# toward "keep waiting", never toward a premature requeue —
+# root-class:error-vs-empty, same discipline as the timeout-gated dead-
+# reviewer classify loop in the caller below). Reads the script-global
+# VERDICT_BEAD_IDS/SESSION_IDS arrays and GC_CITY already populated by the
+# phase-c-verdict-rehydrate block above gate_collect_verdicts — the same
+# state contract that function itself relies on.
+#
+# ga-s4potx: this is the DEBOUNCE-FREE counterpart to the timeout-gated
+# dead-reviewer classify loop in the caller. That loop only runs once
+# PC_ELAPSED > PC_TIMEOUT_SECS — by design, per ga-eqjo's scope reduction
+# (see gate_collect_verdicts' header comment) — so a reviewer session closed
+# minutes into a run still waited out the FULL 15-50m outer timeout before
+# anything noticed (measured live: 26-43 minutes, 3 runs in 1h — see this
+# bead's body). A session bead closed=true can never reopen, so THIS check
+# carries no such tradeoff and can safely run every sweep, independent of
+# elapsed time.
+# SELFTEST-EXTRACT phase-c-closed-reviewer-classify-fn: BEGIN
+gate_phase_c_all_pending_closed() {
+  local _pcc_sess_json _pcc_any_pending=0 _pcc_all_closed=1 _pcc_j _pcc_vb _pcc_vb_json _pcc_vb_st _pcc_sid
+  _pcc_sess_json=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json) || true
+  [ -z "$_pcc_sess_json" ] && return 1
+  for _pcc_j in "${!VERDICT_BEAD_IDS[@]}"; do
+    _pcc_vb="${VERDICT_BEAD_IDS[$_pcc_j]}"
+    if ! _pcc_vb_json=$(bd -C "$GC_CITY" show "$_pcc_vb" --json 2>/dev/null); then
+      return 1   # unreadable -- can't confirm, don't guess (root-class:error-vs-empty)
+    fi
+    _pcc_vb_st=$(printf '%s' "$_pcc_vb_json" | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
+    [ "$_pcc_vb_st" = "closed" ] && continue
+    _pcc_any_pending=1
+    _pcc_sid="${SESSION_IDS[$_pcc_j]:-}"
+    if [ "$_pcc_sid" = "__UNKNOWN__" ] || [ -z "$_pcc_sid" ]; then
+      return 1   # unreadable assignee capture -- can't confirm either (mirrors ga-i5s5)
+    fi
+    if [ "$(reviewer_session_confirmed_closed "$_pcc_sid" "$_pcc_sess_json")" != "1" ]; then
+      _pcc_all_closed=0
+      break
+    fi
+  done
+  [ "$_pcc_any_pending" = "1" ] && [ "$_pcc_all_closed" = "1" ]
+}
+# SELFTEST-EXTRACT phase-c-closed-reviewer-classify-fn: END
+
 # extract <field-name> — parse a "<field-name>: value" line out of $DESC.
 # Hoisted (ga-eqjo) so Phase C can reuse it on a run bead's description the
 # same way Step 2 uses it on a marker's. ga-7zjs1: trailing `|| true` keeps a
@@ -8559,10 +8645,24 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       QUOTA_REQUEUE=0
       REQUEUE_REASON="quota"
 
+      # SELFTEST-EXTRACT phase-c-verdict-decision: BEGIN
       if [ "$VERDICTS_RECEIVED" -eq "$REQUIRED_REVIEWERS" ]; then
         OVERALL_VERDICT="PASS"
         [ "$ANY_FAIL" = "1" ] && OVERALL_VERDICT="FAIL"
         log "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) complete — $VERDICTS_RECEIVED/$REQUIRED_REVIEWERS verdicts, overall=$OVERALL_VERDICT (elapsed ${PC_ELAPSED}s). Finalizing."
+        gate_finalize_run
+      elif gate_phase_c_all_pending_closed; then
+        # ga-s4potx: a reviewer session bead CONFIRMED CLOSED is a terminal,
+        # no-debounce signal (see gate_phase_c_all_pending_closed's header) —
+        # it can never revert, so there is nothing to gain from waiting out
+        # the outer timeout below (which exists for AMBIGUOUS deadness:
+        # absent-from-list, wedged, slow — states that DO need a grace
+        # window). Re-queue THIS sweep via the exact same QUOTA_REQUEUE/
+        # REQUEUE_REASON/gate_finalize_run contract the sibling dead-reviewer
+        # branch below already uses at timeout, just reached without waiting.
+        QUOTA_REQUEUE=1
+        REQUEUE_REASON="dead-reviewer"
+        warn "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) has ALL pending reviewer session(s) CONFIRMED CLOSED — re-queuing now instead of waiting out the ${PC_TIMEOUT_MIN}m timeout (ga-s4potx)."
         gate_finalize_run
       elif [ "$PC_ELAPSED" -gt "$PC_TIMEOUT_SECS" ]; then
         PC_QLIM=$(gate_quota_limited)
@@ -8721,6 +8821,7 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       else
         log "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) still in flight ($VERDICTS_RECEIVED/$REQUIRED_REVIEWERS verdicts, ${PC_ELAPSED}s/${PC_TIMEOUT_SECS}s) — leaving for a future sweep."
       fi
+      # SELFTEST-EXTRACT phase-c-verdict-decision: END
     done
     GATE_SWEEP_HAS_MORE_WORK=0
   fi
