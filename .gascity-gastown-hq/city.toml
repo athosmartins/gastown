@@ -6,6 +6,20 @@ global_fragments = ["command-glossary", "operational-awareness", "town-deltas"]
 [providers.claude]
 base = "builtin:claude"
 ready_delay_ms = 0
+# wa-m6nkr: "claude" + Remote Control from the first second, for a named crew whose session is
+# born FRESH (peter-wa: a new session per 07:00/19:00 touchpoint, wa-14p4c) and so never gets the
+# one-time manual /rc that a long-lived session used to get. Every claude session in this city is
+# launched with `--settings <city>/.gc/settings.json`, which carries remoteControlAtStartup=false
+# and beats Athos's global true; the CLI flag is what wins (measured 2026-09-19, claude 2.1.278:
+# with the flag the session's ~/.claude/sessions/<pid>.json gets a bridgeSessionId within 60s and the
+# pane says "/remote-control is active"; the identical launch without it never does).
+# Athos's 2026-08-30 policy stands (RC only for the Mayor and named crews): pool/autonomous roles
+# stay on claude-headless. Nothing here is keyed on the provider NAME — no script in the city
+# branches on `provider == "claude"`.
+[providers.claude-rc]
+base = "builtin:claude"
+args_append = ["--remote-control"]
+ready_delay_ms = 0
 [providers.claude-headless]
 base = "builtin:claude"
 # ga-rpejh: every claude-headless session otherwise inherits the full user-level
