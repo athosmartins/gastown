@@ -39,6 +39,22 @@ source = ".gc/system/packs/gastown"
 [imports.town-deltas]
 source = "packs/town-deltas"
 
+# ga-5mu653: the wisp-compact order is switched OFF at every scope. It was a silent no-op
+# (its `.ephemeral == true` filter matches nothing: bd 1.1.0 emits `ephemeral: null` for
+# wisps-table rows) and its rules are wrong even if it worked: it PROMOTES wisps that
+# carry a comment to permanent issues and deletes with one `bd delete` process per row.
+# Wisp retention belongs to the mol-dog-reaper SQL purge (ga-u8nbt9: batched, 48h, closed
+# mail is never purged - ga-3rqwa).
+# Why `skip` and not a town-deltas override/tombstone: a same-name override only shadows the
+# CITY-scoped instance. The maintenance pack's builtin order also registers one instance PER
+# RIG (wisp-compact:rig:<rig>); those stayed enabled (3 showed runs in `gc order history` on
+# 2026-09-19) and use the builtin script, which has no mail carve-out. `skip` excludes the
+# name at every scope (measured 2026-09-19 with `gc order list --json` on the live city and
+# on a throwaway city that has a rig).
+# Do not remove this line before a replacement retention design exists.
+[orders]
+skip = ["wisp-compact"]
+
 [[rigs]]
 name = "property_scrapers"
 prefix = "ps"

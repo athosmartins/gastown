@@ -7,8 +7,8 @@
 #
 # Root problem (ga-3rqwa): a bead filed from a mail, citing it only in prose,
 # leaves NO way to answer "who actually wrote this?" once the mail is gone —
-# and mail *does* eventually go away (wisp-compact TTL purge, retention
-# policy, or just human error). The fix is to copy the mail's sender/
+# and mail *does* eventually go away (`gc mail archive`/`delete` hard-deletes
+# the bead, a retention policy, or just human error). The fix is to copy the mail's sender/
 # timestamp/recipient onto the NEW bead at creation time, so the answer lives
 # on the work item itself and never depends on the source mail's continued
 # existence or on anyone's memory of what it said.

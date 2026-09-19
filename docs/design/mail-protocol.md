@@ -488,7 +488,10 @@ bucket) actually destroyed it -- fixed in ga-3rqwa by exempting
 `issue_type == "message"` from that janitor's delete branch (and from the
 reaper's purge SQL). **That fix is real and still correct for the janitor
 path, but it never touched the actual deletion path**, which sits one layer
-up. Verified directly against the running engine's source
+up. (That janitor, the `wisp-compact` order, was switched off in ga-5mu653: it
+had been a silent no-op since bd 1.1.0, and TTL retention of wisps now belongs
+to the reaper's purge SQL (ga-u8nbt9), which carries the same closed-mail
+exemption.) Verified directly against the running engine's source
 (`internal/mail/beadmail/beadmail.go`): `Archive()` calls the store's
 `Delete()` unconditionally -- including when the message is already
 closed, where it still deletes rather than no-op'ing -- and `Delete()` is

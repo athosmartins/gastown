@@ -215,7 +215,10 @@ Wisp parentage no longer lives on the wisps row (the schema has no
 `type='parent-child'` and `depends_on_id`. The SDK `ParentID` field is
 projected from those rows for Dolt-backed beads. Do not close non-closed wisps
 by age alone.
-`wisp-compact.sh` promotes non-closed wisps past TTL for stuck detection.
+The old `wisp-compact` order used to promote non-closed wisps past TTL to
+permanent for stuck detection; it is switched off (ga-5mu653), so nothing
+promotes them any more: apart from the closed-parent subset closed below, stale
+non-closed wisps are only reported here.
 The close step repeats until no schema-safe candidates remain, so a stale
 multi-level child chain whose root is closed converges in one reaper run.
 
@@ -292,7 +295,7 @@ Mail messages live as beads (Type=message), not in a SQL table — use `bd`
 for any mail cleanup, never DELETE FROM mail. ga-3rqwa: this was previously
 prose-only (this sentence existed, but the DELETE above had no WHERE-clause
 enforcement of it) — a live audit found an archived mail wisp hard-deleted
-by the sibling `wisp-compact.sh` order, which had the identical gap. The
+by the sibling `wisp-compact.sh` order (since switched off, ga-5mu653), which had the identical gap. The
 `issue_type NOT IN ('message')` clause above makes the SQL itself match what
 this paragraph always claimed, instead of depending on whoever runs this
 step to remember and hand-append the exclusion.

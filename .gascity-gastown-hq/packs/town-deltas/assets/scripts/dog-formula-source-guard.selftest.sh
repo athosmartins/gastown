@@ -4,14 +4,15 @@
 # `.`/source is a POSIX special builtin: when the target cannot be read, the
 # shell terminates IMMEDIATELY under set -euo pipefail — this is the same
 # mechanism ga-q4sadt fixed for the core gate/dispatch pipeline, applied here
-# to 5 dog-formula scripts that dot-sourced a sibling with NO guard at all
+# to 4 dog-formula scripts that dot-sourced a sibling with NO guard at all
 # (not even a broken `|| true`):
 #
-#   wisp-compact.sh     — _bd_trace.sh
 #   gate-sweep.sh        — _bd_trace.sh
 #   orphan-sweep.sh      — _bd_trace.sh
 #   digest-sweep.sh      — _bd_trace.sh
 #   mol-dog-doctor.sh    — runtime.sh AND latency.sh (2 sites)
+#
+# (wisp-compact.sh was a 5th; it was removed together with its order — ga-5mu653.)
 #
 # A briefly missing/unreadable sibling would kill any of these dog formulas
 # with a raw bash error and zero context, instead of a clear diagnosis.
@@ -48,7 +49,7 @@ EOF
   ( /bin/bash "$dir/probe.sh" 2>/dev/null )
 }
 
-# --- for the 4 _bd_trace.sh sites (sibling lives next to the probe itself) ---
+# --- for the 3 _bd_trace.sh sites (sibling lives next to the probe itself) ---
 test_bd_trace_site() {
   local label="$1" file="$2" start_re="$3" end_re="$4"
   local idiom
@@ -167,11 +168,6 @@ test_mol_dog_doctor_site() {
     && ok "$label: sibling PRESENT and defines '$symbol' → reaches REACHED normally (guard did not make it permanently inert)" \
     || bad "$label: sibling PRESENT-and-defines-'$symbol' case broke (got: '${out3:-<empty>}')"
 }
-
-echo ""
-echo "-- wisp-compact.sh --"
-test_bd_trace_site "_bd_trace.sh source" "wisp-compact.sh" \
-  '^__SCRIPT_DIR=' '^fi$'
 
 echo ""
 echo "-- gate-sweep.sh --"
