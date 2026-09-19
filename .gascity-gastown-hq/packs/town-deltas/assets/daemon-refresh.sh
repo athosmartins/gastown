@@ -329,7 +329,9 @@
 #      closure-only"). When $RUNTIME_DIR/scripts/compute_symbol_
 #      reachability.py exists, every label in GUARDED (both point-16
 #      buckets — see the conversation-monitor case above) is independently
-#      classified a THIRD way, via symbol_reachability_for():
+#      classified a THIRD way, via symbol_reachability_manifest_entry() +
+#      one batched compute_symbol_reachability.py --batch call (ga-4oh2r6 —
+#      see point 18 below for why this is one call, not one per label):
 #        SYMBOL-CONFIRMED         — the entrypoint's call graph reaches a
 #                                   symbol that changed in this window
 #                                   (via=direct or via=graph).
@@ -337,15 +339,19 @@
 #                                   just import-closure noise; same caveat as
 #                                   CLOSURE-ONLY — not a full transitive
 #                                   closure, a false negative can hide here).
-#        NÃO CALCULADO            — the subprocess gave no usable answer
-#                                   (nonzero exit, per-daemon or total-budget
-#                                   timeout, or output that did not parse as
-#                                   the expected JSON). NEVER folded into SEM
-#                                   EVIDÊNCIA — an unanswered question is not
-#                                   a negative answer (the same distinction
-#                                   PROOF's not_verified already draws for
-#                                   the verdict as a whole, applied here per
-#                                   daemon).
+#        NÃO CALCULADO            — no resolved entrypoint, the batch
+#                                   invocation gave no usable answer at all
+#                                   (nonzero exit or total-budget timeout), or
+#                                   this label's own line never arrived in the
+#                                   batch's output (killed mid-run — the
+#                                   calculator flushes each entry as it
+#                                   completes, so this only affects whichever
+#                                   entries hadn't finished yet). NEVER folded
+#                                   into SEM EVIDÊNCIA — an unanswered
+#                                   question is not a negative answer (the
+#                                   same distinction PROOF's not_verified
+#                                   already draws for the verdict as a whole,
+#                                   applied here per daemon).
 #      Presentation/attribution only, exactly like point 16: NEVER changes
 #      VERDICT, NEVER removes a label from GUARDED or moves it between
 #      GUARDED_OWN/GUARDED_CLOSURE_ONLY — only adds an independent, always-
@@ -362,16 +368,47 @@
 #      retain which specific changed file triggered a given label, and
 #      threading that through its exactly-tuned branches is out of scope
 #      here (see json_closure_for_entry()'s call site in
-#      symbol_reachability_for()). A same-named-function collision this
-#      coarser closure can invite is the underlying tool's own documented,
-#      accepted bias — it promotes toward SYMBOL-CONFIRMED rather than
-#      hiding a real one. A rig without the script behaves identically to
-#      today, no error: SYMBOL_SCRIPT simply doesn't exist, the whole block
-#      is skipped, and all three new fields stay empty. Bounded cost:
-#      SYMBOL_REACHABILITY_TIMEOUT per daemon, SYMBOL_REACHABILITY_TOTAL_
-#      TIMEOUT for the whole batch — either one tripping degrades the
-#      remaining daemon(s) to NÃO CALCULADO rather than stalling the halt
-#      (the caller already wraps this whole script in `timeout 180`).
+#      symbol_reachability_manifest_entry()). A same-named-function collision
+#      this coarser closure can invite is the underlying tool's own
+#      documented, accepted bias — it promotes toward SYMBOL-CONFIRMED rather
+#      than hiding a real one. A rig without the script behaves identically
+#      to today, no error: SYMBOL_SCRIPT simply doesn't exist, the whole
+#      block is skipped, and all three new fields stay empty. Bounded cost:
+#      SYMBOL_REACHABILITY_TOTAL_TIMEOUT for the ONE batch invocation (see
+#      point 18) — tripping it degrades every label that hadn't finished
+#      yet to NÃO CALCULADO rather than stalling the halt (the caller
+#      already wraps this whole script in `timeout 180`).
+#  18. (ga-4oh2r6, replacing point 17's per-label subprocess) Point 17 called
+#      compute_symbol_reachability.py once PER GUARDED label — bounded by
+#      SYMBOL_REACHABILITY_TIMEOUT (5s) per call and SYMBOL_REACHABILITY_
+#      TOTAL_TIMEOUT (30s) for the whole loop. Measured live 18/09, the first
+#      real production run after merge (story-delivery.log:120141-120158):
+#      6 of 17 daemons hit the 5s per-daemon timeout, the other 11 were
+#      skipped once the 30s total budget was already spent — 17/17 landed on
+#      NÃO CALCULADO, the feature shipped live and delivered nothing on its
+#      first real run. Root cause: each subprocess re-fetched (git show) and
+#      re-parsed (ast) every file in its own entrypoint+closure from
+#      scratch, with zero sharing across daemons — measured on this rig's
+#      real deploy_deps.json, closures run 130-211 files each and overlap
+#      ~86% between daemons (2517 summed paths across 17 daemons, 340
+#      distinct). Fix: compute_symbol_reachability.py's --batch mode
+#      (wa-zqyi4, companion bead, same "consult the rig, don't vendor a
+#      second copy" choice this whole point-17/18 layer already made) takes
+#      ALL of this run's GUARDED entries in one manifest and answers them in
+#      one process with a shared (ref,path) cache — measured on the real
+#      repro window (979f89533..d5383b04b, whatsapp_automation, same 17
+#      daemons): ~3-5s total, where the unbatched loop had been timing out
+#      at 30s on roughly half of repeated runs under this machine's real
+#      load (`uptime` load average ~30 — fork/exec of hundreds of `git show`
+#      subprocesses competes for scheduler CPU under load in a way one
+#      persistent process's pipe I/O does not; see GitBatchReader in the
+#      rig's compute_symbol_reachability.py). SYMBOL_REACHABILITY_TIMEOUT
+#      (the old per-daemon bound) is gone — there is only one process now,
+#      so only SYMBOL_REACHABILITY_TOTAL_TIMEOUT still applies, to that one
+#      call. Classification semantics (SYMBOL-CONFIRMED/SEM EVIDÊNCIA DE
+#      SÍMBOLO/NÃO CALCULADO, never promoted into VERDICT, never removing a
+#      label from GUARDED) are UNCHANGED from point 17 — this point only
+#      changes HOW the answer is computed, never what it means.
 #
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
@@ -470,11 +507,14 @@
 #   PS_BIN            (default ps)
 #   VERIFY_TIMEOUT    seconds to wait for a fresh process (default 20)
 #   VERIFY_INTERVAL   poll interval seconds (default 1)
-#   SYMBOL_REACHABILITY_TIMEOUT   seconds per daemon for compute_symbol_
-#                     reachability.py (default 5; ga-8q1ulq, header point 17)
-#   SYMBOL_REACHABILITY_TOTAL_TIMEOUT   seconds for the whole GUARDED batch
-#                     (default 30; same point) — either budget tripping
-#                     degrades the remaining daemon(s) to NÃO CALCULADO.
+#   SYMBOL_REACHABILITY_TOTAL_TIMEOUT   seconds for the ONE batched
+#                     compute_symbol_reachability.py --batch call covering
+#                     every GUARDED label this run (default 30; ga-8q1ulq,
+#                     header point 17, batched by point 18/ga-4oh2r6 — there
+#                     used to be a SYMBOL_REACHABILITY_TIMEOUT per-daemon
+#                     bound too, removed with the per-label subprocess loop
+#                     it governed) — tripping it degrades whichever labels
+#                     hadn't finished yet to NÃO CALCULADO.
 
 set -uo pipefail
 
@@ -513,11 +553,14 @@ DRY_RUN="${DRY_RUN:-0}"
 LAUNCH_AGENTS_DIR="${LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 LAUNCHCTL_BIN="${LAUNCHCTL_BIN:-launchctl}"
 PS_BIN="${PS_BIN:-ps}"
-# ga-8q1ulq (header point 17): bounds the cost of the new per-GUARDED-label
-# symbol-reachability subprocess call — a rig-side git-show-heavy AST walk,
-# not a cheap check. Either budget tripping degrades the affected daemon(s)
-# to NÃO CALCULADO, never blocks the halt past it.
-SYMBOL_REACHABILITY_TIMEOUT="${SYMBOL_REACHABILITY_TIMEOUT:-5}"
+# ga-8q1ulq (header point 17), batched by point 18/ga-4oh2r6: bounds the cost
+# of the ONE symbol-reachability --batch call covering every GUARDED label
+# this run — a rig-side git-show+AST-heavy computation, not a cheap check.
+# Tripping it degrades whichever label(s) hadn't finished yet to NÃO
+# CALCULADO, never blocks the halt past it. There used to be a second,
+# per-daemon SYMBOL_REACHABILITY_TIMEOUT bound here too; it governed the
+# per-label subprocess loop point 18 replaced, and has no meaning against a
+# single batched call, so it's gone — only the total budget remains.
 SYMBOL_REACHABILITY_TOTAL_TIMEOUT="${SYMBOL_REACHABILITY_TOTAL_TIMEOUT:-30}"
 VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-20}"
 VERIFY_INTERVAL="${VERIFY_INTERVAL:-1}"
@@ -2209,41 +2252,46 @@ classify_guarded() {  # classify_guarded <label>
   esac
 }
 
-# ga-8q1ulq (header point 17): does <label>'s entrypoint call graph reach a
-# symbol that changed in [$SYMREACH_BEFORE, $SYMREACH_AFTER]? Delegates to
-# the rig's own compute_symbol_reachability.py (wa-th4b1) — never
-# reimplemented here, same "consult the rig, don't vendor a second copy"
-# choice deploy_deps.json consultation already makes above. Only called from
-# Step 5, lazily, for labels already in GUARDED — never during Step 3/4 — so
-# the cost is paid only on a run that is actually about to render a
-# NEEDS_GUARDED_RESTART halt. Sets SYMREACH_STATE to one of confirmed |
-# no_evidence | not_computed and, only when confirmed, SYMREACH_VIA/
-# SYMREACH_PATH (diagnostic detail — logged, not rendered into REASON, same
-# bare-label-list convention GUARDED_OWN/GUARDED_CLOSURE_ONLY already use).
-symbol_reachability_for() {  # symbol_reachability_for <label>
-  local label="$1" entries entry e c out rc parsed
+# ga-4oh2r6, replacing the ga-8q1ulq per-label symbol_reachability_for(): does
+# <label>'s entrypoint call graph reach a symbol that changed in
+# [$SYMREACH_BEFORE, $SYMREACH_AFTER]? Same closure resolution as before
+# (json_covers_entry/json_closure_for_entry, or the ad-hoc CHANGED_PY
+# fallback) — this function ONLY builds one JSON manifest entry now, it no
+# longer invokes the calculator itself. The invocation moved to ONE call for
+# the WHOLE GUARDED batch (see the loop below) because 17 separate `timeout
+# N python3 compute_symbol_reachability.py ...` subprocesses, one per
+# daemon, blew both the per-daemon and total budgets in production 18/09
+# (story-delivery.log:120141-120158, 6 timeouts + 11 skipped = 17/17 NÃO
+# CALCULADO) — closures in the real rig run 130-211 files each with ~86%
+# overlap between daemons (2517 summed paths, 340 distinct), and each
+# separate invocation re-fetched + re-parsed every file from scratch with no
+# sharing across daemons. compute_symbol_reachability.py's own --batch mode
+# (wa-zqyi4, companion bead, same "consult the rig, don't vendor a second
+# copy" choice this function's docstring already established) now does that
+# work ONCE per run with a shared cache, and this function's only job is to
+# describe what the batch needs to know about <label>.
+#
+# Prints nothing and returns 1 when no entrypoint resolved (a
+# FORCE_RESTART_LABELS entry, points 5/16: Step 2 never found a file to
+# point the AST parser at) — the caller degrades that label straight to
+# NÃO CALCULADO without adding it to the manifest at all, same tri-state
+# honesty as before (unknown, never folded into "no evidence").
+symbol_reachability_manifest_entry() {  # symbol_reachability_manifest_entry <label>
+  local label="$1" entries entry e c closures=()
   entries="$(cat "$DISCO_DIR/$label" 2>/dev/null || true)"
   entry=""
   for e in $entries; do entry="$e"; break; done
-  SYMREACH_VIA=""; SYMREACH_PATH=""
   if [ -z "$entry" ]; then
-    # A FORCE_RESTART_LABELS entry (points 5/16): Step 2 never resolved an
-    # entrypoint for it at all, so there is no file to point the AST parser
-    # at. Same tri-state honesty as everywhere else here: unknown, not "no
-    # evidence".
-    SYMREACH_STATE="not_computed"
-    log "symbol-reachability $label: no resolved entrypoint — NÃO CALCULADO, ranking unaffected."
-    return 0
+    return 1
   fi
 
-  set -- --repo "$RUNTIME_DIR" --entrypoint "$entry"
   for e in $entries; do
     [ "$e" = "$entry" ] && continue
-    set -- "$@" --closure "$e"
+    closures+=("$e")
   done
   if json_covers_entry "$entry"; then
     while IFS= read -r c; do
-      [ -n "$c" ] && set -- "$@" --closure "$c"
+      [ -n "$c" ] && closures+=("$c")
     done < <(json_closure_for_entry "$entry")
   else
     # ad-hoc tier (header point 17): no deploy_deps.json closure for this
@@ -2253,46 +2301,16 @@ symbol_reachability_for() {  # symbol_reachability_for <label>
     # Step 3's exactly-tuned ad-hoc branches (a fully independent, read-only
     # addition, same boundary point 16 already established for AFFECTED_OWN).
     while IFS= read -r c; do
-      [ -n "$c" ] && set -- "$@" --closure "$c"
+      [ -n "$c" ] && closures+=("$c")
     done < <(printf '%s\n' "$CHANGED_PY")
   fi
-  set -- "$@" --before "$SYMREACH_BEFORE" --after "$SYMREACH_AFTER"
 
-  out="$(timeout "$SYMBOL_REACHABILITY_TIMEOUT" python3 "$SYMBOL_SCRIPT" "$@" 2>/dev/null)"
-  rc=$?
-  if [ "$rc" -ne 0 ]; then
-    SYMREACH_STATE="not_computed"
-    log "symbol-reachability $label ($entry): compute_symbol_reachability.py did not return an answer (exit $rc, timeout=${SYMBOL_REACHABILITY_TIMEOUT}s) — NÃO CALCULADO, ranking unaffected."
-    return 0
-  fi
-  parsed="$(printf '%s' "$out" | python3 -c '
+  python3 -c '
 import json, sys
-try:
-    d = json.load(sys.stdin)
-    r = d.get("reaches")
-except Exception:
-    r = None
-if r is True:
-    print("STATE:confirmed")
-    print("VIA:" + (d.get("via") or ""))
-    print("PATH:" + ",".join(d.get("path") or []))
-elif r is False:
-    print("STATE:no_evidence")
-else:
-    print("STATE:not_computed")
-' 2>/dev/null)"
-  SYMREACH_STATE="$(printf '%s\n' "$parsed" | sed -n 's/^STATE://p')"
-  case "$SYMREACH_STATE" in
-    confirmed)
-      SYMREACH_VIA="$(printf '%s\n' "$parsed" | sed -n 's/^VIA://p')"
-      SYMREACH_PATH="$(printf '%s\n' "$parsed" | sed -n 's/^PATH://p')"
-      ;;
-    no_evidence) ;;
-    *)
-      SYMREACH_STATE="not_computed"
-      log "symbol-reachability $label ($entry): compute_symbol_reachability.py returned output that did not parse as the expected JSON — NÃO CALCULADO, ranking unaffected."
-      ;;
-  esac
+label, entry = sys.argv[1], sys.argv[2]
+closure = sys.argv[3:]
+print(json.dumps({"label": label, "entrypoint": entry, "closure": closure}))
+' "$label" "$entry" "${closures[@]}"
 }
 
 for label in $AFFECTED; do
@@ -2427,12 +2445,26 @@ elif [ -n "${GUARDED// /}" ]; then
   if [ -n "${GUARDED_CLOSURE_ONLY// /}" ]; then
     NGR_RANKED="${NGR_RANKED} || CLOSURE-ONLY ($(echo "$GUARDED_CLOSURE_ONLY" | wc -w | tr -d ' ')) -- only imports something that changed, its own code is untouched (known noise -- verify reachability by hand before restarting):${GUARDED_CLOSURE_ONLY}"
   fi
-  # ga-8q1ulq (header point 17): a THIRD, independent ranking pass — symbol
-  # (not file) level — only when the rig has the calculator, only up to the
-  # time budget below. Rendered AFTER the point-16 sections above, never
-  # instead of them. Lazy on purpose: this loop's subprocess calls are the
-  # single most expensive thing this script does, so they only ever run on
-  # a batch that is actually about to render a NEEDS_GUARDED_RESTART halt.
+  # ga-8q1ulq (header point 17), batched by ga-4oh2r6: a THIRD, independent
+  # ranking pass — symbol (not file) level — only when the rig has the
+  # calculator, only up to the time budget below. Rendered AFTER the
+  # point-16 sections above, never instead of them. Lazy on purpose: this
+  # is the single most expensive thing this script does, so it only ever
+  # runs on a batch that is actually about to render a NEEDS_GUARDED_RESTART
+  # halt.
+  #
+  # ga-4oh2r6: ONE python3 invocation for the whole GUARDED batch, not one
+  # per label. The prior per-label loop called compute_symbol_reachability.py
+  # as a fresh subprocess per daemon, each re-fetching+re-parsing every file
+  # in its own closure from scratch — measured blowing both the 5s-per-daemon
+  # and 30s-total budgets on 17/17 daemons the same day this feature shipped
+  # (story-delivery.log:120141-120158). The rig's --batch mode (wa-zqyi4)
+  # shares one (ref,path) cache across every daemon in the run instead;
+  # measured on the real repro window (979f89533..d5383b04b, 17 daemons):
+  # ~3-5s total, down from timing out at 30s on roughly half of repeated
+  # runs under this machine's real load. SYMBOL_REACHABILITY_TIMEOUT (the
+  # old PER-DAEMON bound) no longer applies to anything — there is only one
+  # process now, bounded by SYMBOL_REACHABILITY_TOTAL_TIMEOUT below.
   if [ -f "$SYMBOL_SCRIPT" ]; then
     SYMREACH_BEFORE="$PRE_DEPLOY_SHA"; SYMREACH_AFTER="$POST_DEPLOY_SHA"
     # Prefer this bead's own attribution range over the wider deploy window
@@ -2446,23 +2478,102 @@ elif [ -n "${GUARDED// /}" ]; then
        && git -C "$RUNTIME_DIR" merge-base --is-ancestor "$BEAD_MERGE_PRE_SHA" "$BEAD_MERGE_SHA" 2>/dev/null; then
       SYMREACH_BEFORE="$BEAD_MERGE_PRE_SHA"; SYMREACH_AFTER="$BEAD_MERGE_SHA"
     fi
-    SR_BUDGET_START=$SECONDS
-    for label in $GUARDED; do
-      if [ $((SECONDS - SR_BUDGET_START)) -ge "$SYMBOL_REACHABILITY_TOTAL_TIMEOUT" ]; then
+
+    if [ "$SYMBOL_REACHABILITY_TOTAL_TIMEOUT" -le 0 ] 2>/dev/null; then
+      # `timeout 0 cmd` is NOT "time out instantly" -- coreutils treats a
+      # 0 duration as no bound at all (verified live: `timeout 0 sleep 5`
+      # runs sleep to completion, exit 0). The old per-label loop's own
+      # SECONDS-based budget check degraded every label without ever
+      # invoking the calculator once TOTAL_TIMEOUT was 0 from the start;
+      # this explicit pre-check preserves that exact behavior instead of
+      # relying on `timeout`'s ambiguous zero-duration semantics.
+      log "symbol-reachability: SYMBOL_REACHABILITY_TOTAL_TIMEOUT is $SYMBOL_REACHABILITY_TOTAL_TIMEOUT -- skipping the batch calculator entirely, all GUARDED labels NÃO CALCULADO."
+      for label in $GUARDED; do
         GUARDED_SYMBOL_NOT_COMPUTED="$GUARDED_SYMBOL_NOT_COMPUTED $label"
-        log "symbol-reachability $label: skipped — total budget (${SYMBOL_REACHABILITY_TOTAL_TIMEOUT}s) already spent on earlier daemons this run — NÃO CALCULADO, ranking unaffected."
-        continue
+      done
+    else
+      SR_MANIFEST="$(mktemp "${TMPDIR:-/tmp}/daemon-refresh-symreach.XXXXXX.json")"
+      {
+        printf '{"entries": ['
+        SR_FIRST=1
+        for label in $GUARDED; do
+          SR_LINE="$(symbol_reachability_manifest_entry "$label")" || {
+            # No resolved entrypoint (FORCE_RESTART_LABELS, points 5/16) --
+            # never in the manifest at all, straight to NÃO CALCULADO.
+            GUARDED_SYMBOL_NOT_COMPUTED="$GUARDED_SYMBOL_NOT_COMPUTED $label"
+            log "symbol-reachability $label: no resolved entrypoint — NÃO CALCULADO, ranking unaffected."
+            continue
+          }
+          [ "$SR_FIRST" -eq 0 ] && printf ','
+          printf '%s' "$SR_LINE"
+          SR_FIRST=0
+        done
+        printf ']}'
+      } > "$SR_MANIFEST"
+
+      SR_OUT="$(timeout "$SYMBOL_REACHABILITY_TOTAL_TIMEOUT" python3 "$SYMBOL_SCRIPT" \
+                  --batch "$SR_MANIFEST" --before "$SYMREACH_BEFORE" --after "$SYMREACH_AFTER" 2>/dev/null)"
+      SR_RC=$?
+      rm -f "$SR_MANIFEST"
+      if [ "$SR_RC" -ne 0 ]; then
+        log "symbol-reachability: batch invocation did not complete (exit $SR_RC, timeout=${SYMBOL_REACHABILITY_TOTAL_TIMEOUT}s) — any label with no JSONL line below is NÃO CALCULADO (partial output, if any, is still honored: compute_symbol_reachability.py flushes each entry as it completes, so a mid-batch kill only loses the entries that hadn't finished yet)."
       fi
-      symbol_reachability_for "$label"
-      case "$SYMREACH_STATE" in
-        confirmed)
-          GUARDED_SYMBOL_CONFIRMED="$GUARDED_SYMBOL_CONFIRMED $label"
-          log "symbol-reachability $label: CONFIRMED (via=$SYMREACH_VIA${SYMREACH_PATH:+, path=$SYMREACH_PATH})."
-          ;;
-        no_evidence) GUARDED_SYMBOL_NO_EVIDENCE="$GUARDED_SYMBOL_NO_EVIDENCE $label" ;;
-        *)           GUARDED_SYMBOL_NOT_COMPUTED="$GUARDED_SYMBOL_NOT_COMPUTED $label" ;;
-      esac
-    done
+
+      # ONE python3 pass classifies every label from the JSONL output --
+      # never a per-label subprocess just to look up its own line. A label
+      # absent from SR_OUT entirely (killed mid-batch, or never made it
+      # into the manifest above) falls through every branch below and is
+      # classified NOT_COMPUTED by the shell loop that follows, same
+      # tri-state honesty as the old per-label timeout: an unanswered
+      # question, never a negative answer.
+      SR_CLASSIFY="$(printf '%s\n' "$SR_OUT" | python3 -c '
+import json, sys
+confirmed, no_evidence = [], []
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    label = d.get("label")
+    if not label:
+        continue
+    r = d.get("reaches")
+    if r is True:
+        confirmed.append(label)
+    elif r is False:
+        no_evidence.append(label)
+    # r is anything else (missing/null) -> not appended to either list;
+    # the shell loop below defaults an unmatched label to NOT_COMPUTED.
+print(" ".join(confirmed))
+print(" ".join(no_evidence))
+' 2>/dev/null)"
+      SR_CONFIRMED_RAW=" $(printf '%s\n' "$SR_CLASSIFY" | sed -n '1p') "
+      SR_NO_EVIDENCE_RAW=" $(printf '%s\n' "$SR_CLASSIFY" | sed -n '2p') "
+
+      for label in $GUARDED; do
+        case "$SR_CONFIRMED_RAW" in
+          *" $label "*)
+            GUARDED_SYMBOL_CONFIRMED="$GUARDED_SYMBOL_CONFIRMED $label"
+            log "symbol-reachability $label: CONFIRMED."
+            continue
+            ;;
+        esac
+        case "$SR_NO_EVIDENCE_RAW" in
+          *" $label "*)
+            GUARDED_SYMBOL_NO_EVIDENCE="$GUARDED_SYMBOL_NO_EVIDENCE $label"
+            continue
+            ;;
+        esac
+        # Not in either list: either it was already routed to NOT_COMPUTED
+        # above (no resolved entrypoint), in which case it's already there
+        # and this is a harmless re-add (dedup'd by the sort -u below), or
+        # its JSONL line never arrived (batch timeout/crash mid-run).
+        GUARDED_SYMBOL_NOT_COMPUTED="$GUARDED_SYMBOL_NOT_COMPUTED $label"
+      done
+    fi
     GUARDED_SYMBOL_CONFIRMED="$(echo "$GUARDED_SYMBOL_CONFIRMED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
     GUARDED_SYMBOL_NO_EVIDENCE="$(echo "$GUARDED_SYMBOL_NO_EVIDENCE" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
     GUARDED_SYMBOL_NOT_COMPUTED="$(echo "$GUARDED_SYMBOL_NOT_COMPUTED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
