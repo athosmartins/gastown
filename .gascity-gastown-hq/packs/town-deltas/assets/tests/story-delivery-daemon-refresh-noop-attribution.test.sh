@@ -191,6 +191,15 @@ run_block() {
       git -C "$REPO" add -A; git -C "$REPO" commit -q -m C2
       OWN_TIP_SHA="$(git -C "$REPO" rev-parse HEAD)"
       ;;
+    job_not_installed)
+      # ga-nuou9v T10 (repro wa-s5fux): own merge SHIPS a scheduled job's
+      # plist + entrypoint that is not installed/loaded in launchd — unlike
+      # "scheduled_only" above, the "no live PID" here means "will NEVER
+      # run", not "installed, next launchd fire self-heals".
+      echo notinstalled > "$REPO/scripts/notinstalled_job.py"
+      git -C "$REPO" add -A; git -C "$REPO" commit -q -m C2
+      OWN_TIP_SHA="$(git -C "$REPO" rev-parse HEAD)"
+      ;;
     *)
       echo "run_block: unknown own_file_shape '$own_file_shape'" >&2
       exit 1
@@ -220,7 +229,22 @@ CHANGED="$(git -C "$RUNTIME_DIR" diff --name-only "$PRE_DEPLOY_SHA" "$POST_DEPLO
 # contains the live daemon).
 AFF=""; AFF_NR=""; GRD=""
 case "$CHANGED" in *scheduled*) AFF="$AFF com.test.scheduled-job"; AFF_NR="$AFF_NR com.test.scheduled-job" ;; esac
+case "$CHANGED" in *notinstalled*) AFF="$AFF com.test.not-installed-job"; AFF_NR="$AFF_NR com.test.not-installed-job" ;; esac
 case "$CHANGED" in
+  *notinstalled*)
+    # ga-nuou9v T10: mirrors real daemon-refresh.sh's emit() — Step 1b's
+    # JOB_NOT_INSTALLED verdict is FORCED ahead of whatever Step 2/3 would
+    # otherwise find (real emit(), gate ga-ax0t9), so this branch must be
+    # checked before *sensitive* below, not after.
+    echo "VERDICT=JOB_NOT_INSTALLED"
+    echo "AFFECTED=${AFF# }"
+    echo "AFFECTED_NOT_RUNNING=${AFF_NR# }"
+    echo "RESTARTED="
+    echo "FRESH_FAIL="
+    echo "GUARDED="
+    echo "REASON=scheduled-job plist(s) changed by this deploy are not actually installed for launchd to run them — missing from /fake/LaunchAgents: com.test.not-installed-job"
+    exit 1
+    ;;
   *sensitive*)
     AFF="$AFF com.test.central-sender"; GRD="$GRD com.test.central-sender"
     echo "VERDICT=NEEDS_GUARDED_RESTART"
@@ -342,6 +366,17 @@ echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=1" \
 ! echo "$BD_CALLS" | grep -q "delivery:failed" \
   && ok "T2 delivery:failed NOT added — innocent story not blamed" \
   || nok "T2 no failed-label" "$BD_CALLS"
+# ga-nuou9v (ACEITE 3): T2's own delta is scripts/cron_only.py — NOT
+# tests/**, docs/**, or *.md — so the nudge-to-mayor message must never
+# claim "tests/docs/md-only" for it; that would be a false, specific factual
+# claim about a delta that plainly isn't. It must give the real reason this
+# delta was judged inert instead (it reaches no live daemon).
+! echo "$GC_CALLS" | grep -q "tests/docs/md-only" \
+  && ok "T2 nudge message does not falsely claim tests/docs/md-only for a non-tests/docs delta" \
+  || nok "T2 nudge wording (false tests/docs/md-only claim)" "$GC_CALLS"
+echo "$GC_CALLS" | grep -q "confirmed to reach no live daemon" \
+  && ok "T2 nudge message gives the real, accurate reason" \
+  || nok "T2 nudge wording (accurate reason)" "$GC_CALLS"
 
 # ── T3: control — no-op pull, own merge DOES reach a (simulated) live
 #        sensitive daemon → still blamed ────────────────────────────────────
@@ -470,6 +505,39 @@ echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=0" \
 echo "$BD_CALLS" | grep -q "label add ga-test delivery:failed" \
   && ok "T9 delivery:failed added — the live daemon in this story's own merge IS a real cause" \
   || nok "T9 failed-label" "$BD_CALLS"
+
+# ── T10 (ga-nuou9v, repro wa-s5fux): no-op pull, own merge SHIPS a scheduled
+#        job's plist that is NOT installed/loaded in launchd (own merge ADDS
+#        the plist + entrypoint; the "no live PID" it has is because launchd
+#        was never told about it, not because it is a legitimately
+#        self-healing scheduled job). Pre-fix: AFFECTED_NOT_RUNNING names the
+#        not-installed label same as any legitimately-scheduled job, so
+#        AFFECTED_LIVE was wrongly empty → inert=1 → exonerated → story:done
+#        despite the job never having run (the exact wa-s5fux incident: the
+#        watchdog job stayed uninstalled and the bead closed anyway). Post-fix:
+#        VERDICT=JOB_NOT_INSTALLED forces inert=0 regardless of AFFECTED_LIVE
+#        → delivery held, not closed, with an ACTION message that tells the
+#        reader to install the job (not the generic "did not come up fresh"
+#        text, which is actively wrong here — nothing ever ran to crash). ──
+run_block job_not_installed correct
+[ "$RUN_RC" -eq 0 ] && ok "T10 block runs clean (rc=0)" || nok "T10 rc" "rc=$RUN_RC"
+echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=0" \
+  && ok "T10 own-merge-only probe classified NOT inert — JOB_NOT_INSTALLED never counts as self-heal" \
+  || nok "T10 inert classification" "$LOG_OUT"
+[ "$REACHED" -eq 0 ] && ok "T10 block halts via continue — delivery is held, not exonerated" \
+  || nok "T10 halted" "REACHED=$REACHED"
+echo "$BD_CALLS" | grep -q "label add ga-test delivery:failed" \
+  && ok "T10 delivery:failed added — a never-installed job can never self-heal" \
+  || nok "T10 failed-label" "$BD_CALLS"
+echo "$BD_CALLS" | grep -q "label add ga-test delivery:deploy-pending" \
+  && ok "T10 delivery:deploy-pending added" \
+  || nok "T10 deploy-pending" "$BD_CALLS"
+echo "$BD_CALLS" | grep -Eq "launchctl load|launchctl bootstrap" \
+  && ok "T10 ACTION message tells the reader to install the job" \
+  || nok "T10 ACTION message (install guidance)" "$BD_CALLS"
+! echo "$BD_CALLS" | grep -q "did not come up fresh" \
+  && ok "T10 ACTION message does NOT use the crash-oriented generic text (nothing ever ran)" \
+  || nok "T10 ACTION message (wrong generic text)" "$BD_CALLS"
 
 echo ""
 echo "story-delivery daemon-refresh no-op attribution tests: $PASS passed, $FAIL failed"

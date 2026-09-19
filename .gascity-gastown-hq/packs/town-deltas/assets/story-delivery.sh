@@ -2053,6 +2053,13 @@ else
   # value here would satisfy that check with the WRONG story's daemon list.
   MERGE_OWN_AFFECTED=""
   MERGE_OWN_VERDICT_LINE=""
+  # ga-nuou9v: same leakage reason as MERGE_OWN_AFFECTED above — only set
+  # when THIS_PULL_STRUCTURALLY_INERT is (re-)set to "1" below, on whichever
+  # of Path A/Path B actually ran this iteration. Read (below) only where
+  # THIS_PULL_STRUCTURALLY_INERT="1" is already known true, so a stale value
+  # here could otherwise mislabel a DIFFERENT story's inert reason as this
+  # one's.
+  THIS_PULL_INERT_PREDICATE=""
   if [ -n "$PRE_DEPLOY_SHA" ] && [ "$PRE_DEPLOY_SHA" != "$POST_DEPLOY_SHA" ]; then
     THIS_PULL_CHANGED="$(git -C "$RUNTIME_DIR" diff --name-only "$PRE_DEPLOY_SHA" "$POST_DEPLOY_SHA" 2>/dev/null || true)"
     if [ -n "${THIS_PULL_CHANGED// /}" ]; then
@@ -2078,6 +2085,7 @@ else
       set +f
       if [ -z "${this_pull_uncovered// /}" ]; then
         THIS_PULL_STRUCTURALLY_INERT=1
+        THIS_PULL_INERT_PREDICATE="tests/docs/md-only"
       else
         THIS_PULL_STRUCTURALLY_INERT=0
       fi
@@ -2199,8 +2207,19 @@ else
     log "This-iteration pull was a true no-op (PRE_DEPLOY_SHA==POST_DEPLOY_SHA=$POST_DEPLOY_SHA) — asked daemon-refresh.sh (DRY_RUN=1, no real kickstart/drain) whether $STORY_ID's own merge $MERGE_SHA alone (vs pre-merge-main base $MERGE_OWN_BASE_SHA) reaches any live daemon: ${MERGE_OWN_VERDICT_LINE:-<unparseable output>} affected=[$MERGE_OWN_AFFECTED] affected_not_running=[$MERGE_OWN_AFFECTED_NOT_RUNNING] affected_live=[$MERGE_OWN_AFFECTED_LIVE]."
     if [ -z "$MERGE_OWN_VERDICT_LINE" ]; then
       : # unparseable helper output (crash/timeout) — stays unknown, existing blame fallback applies
+    elif [ "$MERGE_OWN_VERDICT_LINE" = "VERDICT=JOB_NOT_INSTALLED" ]; then
+      # ga-nuou9v (wa-s5fux): a job this bead's own merge added/touched that
+      # is missing from launchd or present-but-not-loaded can NEVER self-heal
+      # via "next scheduled run" — daemon-refresh.sh never runs a job launchd
+      # doesn't know about. AFFECTED_NOT_RUNNING's "no live PID" test cannot
+      # tell that apart from a legitimately-installed scheduled job with no
+      # live PID right now (both have no PID, for opposite reasons), so never
+      # let the AFFECTED_LIVE subtraction below decide inert-ness once
+      # daemon-refresh.sh has already told us, by name, which case this is.
+      THIS_PULL_STRUCTURALLY_INERT=0
     elif [ -z "${MERGE_OWN_AFFECTED_LIVE// /}" ]; then
       THIS_PULL_STRUCTURALLY_INERT=1
+      THIS_PULL_INERT_PREDICATE="confirmed to reach no live daemon"
     else
       THIS_PULL_STRUCTURALLY_INERT=0
     fi
@@ -2432,10 +2451,10 @@ else
         # underlying staleness is real and still unresolved for whichever
         # earlier commit actually caused it, and advancing the marker here
         # would hide it from every future sweep too, not just this story.
-        log "Daemon refresh verdict=$REFRESH_VERDICT ($REFRESH_REASON) predates $STORY_ID's own merge (its own delta is tests/docs/md-only) — not holding this delivery for it."
+        log "Daemon refresh verdict=$REFRESH_VERDICT ($REFRESH_REASON) predates $STORY_ID's own merge (its own delta is ${THIS_PULL_INERT_PREDICATE:-tests/docs/md-only}) — not holding this delivery for it."
         if [ "$DRY_RUN" != "1" ]; then
           gc --city "$GC_CITY" session nudge mayor \
-            "Daemon refresh $REFRESH_VERDICT persists for rig $RIG ($REFRESH_REASON) — NOT caused by $STORY_ID, whose own merge is tests/docs/md-only; an earlier commit still needs a guarded restart." \
+            "Daemon refresh $REFRESH_VERDICT persists for rig $RIG ($REFRESH_REASON) — NOT caused by $STORY_ID, whose own merge is ${THIS_PULL_INERT_PREDICATE:-tests/docs/md-only}; an earlier commit still needs a guarded restart." \
             2>/dev/null || true
         fi
       elif [ "$NEEDS_GUARDED_RESTART_UNATTRIBUTED" = "1" ]; then
@@ -2515,6 +2534,13 @@ CAVEAT (ga-puq8z): both lists above are import/template-closure matches, not pro
           else
             REFRESH_ACTION="ACTION: perform a guarded/graceful restart of the flagged hot-path daemon(s) ($REFRESH_GUARDED) — drain in-flight messages/webhooks first — then re-run delivery. (Configure a DRAIN_CMD_<label> for daemon-refresh.sh to automate this.) No per-bead attribution available this run (this story's own pull was not a true no-op, or the attribution probe above did not return a parseable result) — this is the wide sweep's list only. CAVEAT (ga-puq8z): flagged by import/template-closure matching, not proven reachable to the changed symbols — if in doubt, compare \`ps -o lstart= -p <pid>\` against commit $POST_DEPLOY_SHA before restarting."
           fi
+        elif [ "$REFRESH_VERDICT" = "JOB_NOT_INSTALLED" ]; then
+          # ga-nuou9v: same fix shape as quality-gate-dispatcher.sh's
+          # DAEMON_HOLD_ACTION (ga-l7n3v) for the bug/task-merge flow — the
+          # generic crash-oriented default below ("did not come up fresh")
+          # does not fit this case at all: nothing ever ran, so say so and
+          # name the actual remedy (install the job), not a restart.
+          REFRESH_ACTION="ACTION: install the missing scheduled job(s) named in the reason above: copy the plist(s) into ~/Library/LaunchAgents and \`launchctl load\` (or \`launchctl bootstrap\`) them, then confirm \`launchctl list <label>\` succeeds. This verdict only proves the job is installed+loaded — NOT that a run has actually completed successfully (a job installed today may not reach its next scheduled window for hours) — so also wait for, or manually trigger via \`launchctl kickstart -k\`, one run and confirm a readable result lands in its log before re-running delivery."
         else
           REFRESH_ACTION="ACTION: investigate why the restarted daemon(s) ($REFRESH_FRESHFAIL) did not come up fresh (crash on boot? wrong launchd label? port in use?), fix forward, then re-run delivery."
         fi
