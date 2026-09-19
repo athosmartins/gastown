@@ -671,6 +671,16 @@ run_sweep() {
   local active_sessions_json; active_sessions_json="$(_golw_active_sessions_json)"
 
   # Accumulate flagged candidates as TSV lines: id\tstore\tage_min\tlabels\tartifact_status\tartifact_count
+  # ga-al3rfs: these rows are TAB-joined and read back with `IFS=$'\t' read`, and TAB is
+  # IFS-whitespace — an EMPTY field would collapse and slide every later field one slot
+  # left, silently. Audited 2026-09-19: none can be empty TODAY, by construction — id and
+  # store are never blank, age_min is a number or "?", labels holds the gate:* labels of a
+  # candidate that the candidate filter below only keeps when it has at least one
+  # (`any(startswith("gate:"))`), artifact_status/count come from _gate_artifact_probe
+  # (none|unknown|<status>, and a count), and is_park/is_live are 0|1. If you add a field
+  # that CAN be empty, either join with 0x1f (as the `rows` stage of
+  # pilot-missing-route-watchdog.sh does, ga-no6qa) or guarantee a non-empty placeholder
+  # for every column before the last (as the adhoc-session-reaper.sh census does, ga-jn82py).
   local flagged_tsv=""
   local store cand_json aged_json
   for store in $GOLW_STORES; do

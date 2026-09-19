@@ -424,6 +424,17 @@ while IFS=$'\t' read -r id name state closed created last_active attached alias 
   fi
   eligible=$((eligible+1))
 
+  # A row with no id is malformed. The census turns an absent/blank id into the "-" placeholder
+  # (col() above), which would otherwise be handed to `gc session close` as if it were a real
+  # session id — what that call does with it is unverified — so reject it here, loudly, before any
+  # decision can reach the close. (ga-al3rfs: reproduced against main before this guard — an
+  # id-less, drained, old row was REAPED via `gc session close -`.)
+  if [ -z "$id" ] || [ "$id" = "-" ]; then
+    skipped_other=$((skipped_other+1))
+    log "$(printf '{"ts":"%s","event":"keep","reason":"malformed_row_no_id","name":"%s","state":"%s"}' "$(ts)" "$name" "$state")"
+    continue
+  fi
+
   # already closed → nothing to do. Only an explicit "false" lets a session go on: a missing
   # or unrecognised `closed` is "don't know", not "open" — skipped, never acted on.
   case "$closed" in

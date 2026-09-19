@@ -747,6 +747,13 @@ run_sweep() {
   local state; state="$(_state_load)"
 
   # Accumulate flagged candidates as TSV: id, store, age_min, labels, issue_type
+  # ga-al3rfs: these rows are TAB-joined and read back with `IFS=$'\t' read`, and TAB is
+  # IFS-whitespace — an EMPTY field would collapse and slide every later field one slot
+  # left, silently. Audited 2026-09-19: none can be empty TODAY, by construction — id and
+  # store are never blank, age_min is a number or "?", labels always holds ctx:ready and
+  # exec:auto (the sel_json filter below requires both), and issue_type falls back to "?".
+  # A field that CAN be empty must be joined with 0x1f instead, as the `rows` stage below
+  # already does (ga-no6qa).
   local flagged_tsv=""
   local repaired_tsv=""
   # ga-9tgos: computed once — under PMRW_AUTO_REPAIR=1 and not dry-run, EVERY

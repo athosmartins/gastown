@@ -725,6 +725,87 @@ put_sessions '{"id":"ga-wisp-w26","name":"gate-reviewer-adhoc-w26","state":"asle
 run_reaper 1 dead
 if [ "$(closed_count)" = "0" ] && [ "$(keep_reason_for gate-reviewer-adhoc-w26)" = "closed_unknown" ]; then ok "(w26) closed absent → KEPT (closed_unknown), never acted on"; else nope "(w26) session with unknown closed was reaped: closed=$(closed_count) reason='$(keep_reason_for gate-reviewer-adhoc-w26)' — CRITICAL"; fi
 
+# ---- ga-al3rfs: ABSENT-FIELD alignment + id-less rows -------------------------------------
+# The census is one TAB-joined row per session, read back with `IFS=$'\t' read`. TAB is
+# IFS-whitespace, so an EMPTY column would COLLAPSE and slide every later field one slot left,
+# silently (the ga-al3rfs audit of every tab-IFS reader found this reaper the only one where a shift
+# was actually reachable). It is safe because parse_census guarantees every column BEFORE the title
+# is non-empty: a "-" placeholder (ga-jn82py, col()). (n1)/(n2) pin that invariant at the unit level,
+# so an empty column that would shift a later non-empty one fails HERE and not in production;
+# (n)/(o) pin the two dangerous directions
+# end to end; (p) is the scenario that FAILED before the id guard existed (it reaped an id-less
+# row via `gc session close -`). A field that can be empty and has no placeholder must be joined
+# with a non-whitespace delimiter (0x1f) instead.
+
+# (n1) unit: a session with ONLY a name — every optional field absent. Every column before the title
+#      must still be NON-EMPTY (placeholder) and land in its own slot; `attached` must be the
+#      normalised "unknown", not a guess. A column added to parse_census without col() would
+#      collapse here (bash `read` merges adjacent TABs) and misalign `attached` and everything after.
+_n1_row="$(printf '%s' '{"sessions":[{"name":"y"}]}' | parse_census)"
+IFS=$'\t' read -r _c_id _c_name _c_state _c_closed _c_created _c_last _c_att _c_alias _c_sess _c_title <<< "$_n1_row"
+if [ "$_c_id|$_c_name|$_c_state|$_c_closed|$_c_created|$_c_last|$_c_att|$_c_alias|$_c_sess|$_c_title" = "-|y|-|-|-|-|unknown|-|-|" ]; then
+  ok "(n1) parse_census: a name-only session keeps every pre-title column non-empty and aligned ('-' placeholders, attached=unknown)"
+else
+  nope "(n1) parse_census misaligned or left a column empty: '$_c_id|$_c_name|$_c_state|$_c_closed|$_c_created|$_c_last|$_c_att|$_c_alias|$_c_sess|$_c_title'"
+fi
+
+# (n2) unit: free text cannot split or forge a row — a title carrying a newline and a tab stays ONE row
+#      and ONE title field (flattened to spaces), and the columns before it stay in place.
+_n2_row="$(printf '%s' '{"sessions":[{"id":"x","name":"y","state":"asleep","closed":false,"created_at":"c","last_active":"l","attached":false,"title":"a\nb\tc"}]}' | parse_census)"
+IFS=$'\t' read -r _c_id _c_name _c_state _c_closed _c_created _c_last _c_att _c_alias _c_sess _c_title <<< "$_n2_row"
+if [ "$(printf '%s\n' "$_n2_row" | awk 'END{print NR}')" = "1" ] && [ "$_c_created|$_c_last|$_c_att|$_c_title" = "c|l|false|a b c" ]; then
+  ok "(n2) parse_census: a newline/tab inside a title is flattened — one row, one title field, columns aligned"
+else
+  nope "(n2) hostile title split or shifted the row: rows=$(printf '%s\n' "$_n2_row" | awk 'END{print NR}') created='$_c_created' last='$_c_last' att='$_c_att' title='$_c_title'"
+fi
+
+# The scenarios below carry "attached":false so the ga-jn82py attached-veto does not mask the path under test.
+
+# (n) created_at ABSENT + drained + OLD last_active + peek dead. Age is unknown, so the reaper must
+#     fail SAFE and KEEP (age_unknown). A census that slid last_active into `created` would read that
+#     2h-old value as the session's AGE and REAP it — on a field that was never its created_at.
+AHR_FIXTURE="$STUBDIR/n.json"
+cat > "$AHR_FIXTURE" <<EOF
+{"sessions":[{"id":"ga-wisp-n","name":"auto-refiner-adhoc-nnn","state":"asleep","closed":false,"last_active":"$(old_ts)","title":"auto-refiner: ga-n (attempt 1)","attached":false}]}
+EOF
+run_reaper 1 dead
+if [ "$(closed_count)" = "0" ] && [ "$(keep_reason_for auto-refiner-adhoc-nnn)" = "age_unknown" ]; then
+  ok "(n) created_at absent + drained + old last_active → kept for age_unknown (last_active NOT read as the age)"
+else
+  nope "(n) absent created_at was misread: closed=$(closed_count) reason='$(keep_reason_for auto-refiner-adhoc-nnn)' log=$(grep -F ga-wisp-n "$AHR_LOG" | head -1)"
+fi
+
+# (o) last_active ABSENT + title==name (never claimed a task) + old created_at: the ga-dd2h0 path must
+#     still fire and REAP. A census that slid the title into last_active would leave `title` empty,
+#     title_shows_no_task would fail safe to 0 and the session would be KEPT forever — a leak, on
+#     exactly the class of session this reaper exists to stop.
+AHR_FIXTURE="$STUBDIR/o.json"
+cat > "$AHR_FIXTURE" <<EOF
+{"sessions":[{"id":"ga-wisp-o","name":"gate-reviewer-adhoc-ooo","state":"active","closed":false,"created_at":"$(old_ts)","title":"gate-reviewer-adhoc-ooo","attached":false}]}
+EOF
+run_reaper 1 dead
+if [ "$(closed_count)" = "1" ] && closed_has "ga-wisp-o" && log_has '"event":"reap_no_task"'; then
+  ok "(o) last_active absent + title==name + old → REAPED via reap_no_task (title stayed in the title slot)"
+else
+  nope "(o) absent last_active shifted the title out of place: closed=$(closed_count) log=$(grep -F ga-wisp-o "$AHR_LOG" | head -1)"
+fi
+
+# (p) id ABSENT on an otherwise reapable, eligible row. An id-less row must be REJECTED as malformed —
+#     never handed to `gc session close` (what a blank or placeholder id does there is unverified).
+#     Asserted on the RAW close log (-s: an EMPTY-argument call leaves a blank line that closed_count's
+#     NF filter skips, a placeholder one leaves "-") AND on the reason, so a row that is skipped by
+#     accident does not pass. Before the guard this row was REAPED via `gc session close -`.
+AHR_FIXTURE="$STUBDIR/p.json"
+cat > "$AHR_FIXTURE" <<EOF
+{"sessions":[{"name":"auto-refiner-adhoc-ppp","state":"asleep","closed":false,"created_at":"$(old_ts)","last_active":"$(zero_ts)","title":"auto-refiner: ga-p (attempt 1)","attached":false}]}
+EOF
+run_reaper 1 dead
+if [ ! -s "$AHR_CLOSE_LOG" ] && [ "$(keep_reason_for auto-refiner-adhoc-ppp)" = "malformed_row_no_id" ]; then
+  ok "(p) id absent → rejected as malformed_row_no_id, gc session close never called"
+else
+  nope "(p) id-less row was not rejected as malformed: close-log='$(tr '\n' ' ' < "$AHR_CLOSE_LOG")' reason='$(keep_reason_for auto-refiner-adhoc-ppp)' log=$(grep -F ppp "$AHR_LOG" | head -1)"
+fi
+
 rm -rf "$STUBDIR" /tmp/_ahr_gc_stub_unit 2>/dev/null
 echo
 echo "selftest: $PASS passed, $FAIL failed"
