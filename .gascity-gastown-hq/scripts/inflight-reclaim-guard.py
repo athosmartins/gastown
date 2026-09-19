@@ -1684,12 +1684,23 @@ _SLING_TITLE_RE = re.compile(r'^(?:fix bug|build story)\s+(\S+):')
 
 def list_gate_active_source_beads():
     """Return set of source-bead IDs that currently have an active gate marker
-    (gate-status:ready, dispatching, queued, or claimed).
+    (gate-status:ready, dispatching, queued, claimed, or reviewing — all on
+    type:quality-gate-marker — or gate-status:running on the separate
+    type:quality-gate-run bead type).
 
     "ready" is included because /gate-done writes a fresh marker in that state;
     promotion to "queued" happens later via a separate sweep, so omitting
     "ready" opens a race window where a just-submitted fix's marker is
     invisible to this check (ga-cxzby).
+
+    ga-vfk8al: "reviewing"/"running" were missing entirely, so once a
+    gate-runner actually started reviewing a branch (marker or run past
+    queued/claimed), this guard stopped recognizing the source bead as
+    gate-active — a bead sitting in_progress with an expired claim lease could
+    then be reclaimed as abandoned while a reviewer was genuinely still
+    working it. pilot-dispatcher.sh's _beadid_has_active_gate_artifact already
+    treated reviewing/running as active and documents the marker-vs-run split
+    this now mirrors label-for-label.
 
     ga-lrglm: a bug/story dispatched through the standard sling-task wrapper
     ("fix bug <ID>: ..." / "build story <ID>: ...") gets its gate marker keyed
@@ -1714,7 +1725,19 @@ def list_gate_active_source_beads():
     and skips the cycle rather than risking a false reclaim).
     """
     active_source_beads = set()
-    for gate_lbl in ("gate-status:ready", "gate-status:dispatching", "gate-status:queued", "gate-status:claimed"):
+    # ga-vfk8al: (type-label, gate-status-label) pairs. "reviewing" is a
+    # type:quality-gate-marker state (guard -> queue -> dispatch -> review
+    # pipeline); "running" is emitted only on the separate type:quality-gate-run
+    # bead type (reviewer live) — see pilot-dispatcher.sh's
+    # _beadid_has_active_gate_artifact, the reference for this split.
+    for type_lbl, gate_lbl in (
+        ("type:quality-gate-marker", "gate-status:ready"),
+        ("type:quality-gate-marker", "gate-status:dispatching"),
+        ("type:quality-gate-marker", "gate-status:queued"),
+        ("type:quality-gate-marker", "gate-status:claimed"),
+        ("type:quality-gate-marker", "gate-status:reviewing"),
+        ("type:quality-gate-run", "gate-status:running"),
+    ):
         try:
             result = subprocess.run(
                 # --include-infra (ga-vm20x, Mayor 07/08): gate markers are
@@ -1725,7 +1748,7 @@ def list_gate_active_source_beads():
                 # reclaim it as if no gate work were in flight.
                 ["bd", "list",
                  "--include-infra",
-                 "--label", "type:quality-gate-marker",
+                 "--label", type_lbl,
                  "--label", gate_lbl,
                  "--json", "--limit", "0"],
                 capture_output=True, text=True, timeout=20)
@@ -5572,6 +5595,30 @@ def _selftest():
         _sb8 = list_gate_active_source_beads()
         check("SB-8: mixed direct + sling markers → union is correct, no cross-contamination",
               _sb8 == frozenset({"ga-djjeq", "ga-d2jil", "ga-native1"}), f"got={_sb8!r}")
+
+        # --- SB-10 (ga-vfk8al): gate-status:reviewing on type:quality-gate-marker
+        # → must be gate-active. Before this fix "reviewing" was entirely absent
+        # from the queried label set, so once a gate-runner actually started
+        # reviewing a branch (marker transitions past queued/claimed), the source
+        # bead silently dropped out of this guard's protection. ---
+        subprocess.run = _stub_bd(
+            {"gate-status:reviewing": [["source-bead:ga-revA", "type:quality-gate-marker"]]},
+            {"ga-revA": "a directly-dispatched bead, no sling wrapper"},
+        )
+        _sb10 = list_gate_active_source_beads()
+        check("SB-10 (ga-vfk8al): gate-status:reviewing marker → source bead is gate-active",
+              _sb10 == frozenset({"ga-revA"}), f"got={_sb10!r}")
+
+        # --- SB-11 (ga-vfk8al): gate-status:running lives on the SEPARATE
+        # type:quality-gate-run bead type (reviewer live), never on
+        # type:quality-gate-marker — must also be recognized as gate-active. ---
+        subprocess.run = _stub_bd(
+            {"gate-status:running": [["source-bead:ga-runA", "type:quality-gate-run"]]},
+            {"ga-runA": "a directly-dispatched bead, no sling wrapper"},
+        )
+        _sb11 = list_gate_active_source_beads()
+        check("SB-11 (ga-vfk8al): gate-status:running on type:quality-gate-run → source bead is gate-active",
+              _sb11 == frozenset({"ga-runA"}), f"got={_sb11!r}")
     finally:
         subprocess.run = _orig_run_sb
 
