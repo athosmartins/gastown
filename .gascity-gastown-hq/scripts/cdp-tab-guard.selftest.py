@@ -270,11 +270,15 @@ class PingTimeoutTests(unittest.TestCase):
 
     def test_a_ping_timeout_is_a_dead_page_and_says_how_long_it_waited(self):
         """Catches: a page that misses the ping being filed as anything but dead (blocking every close
-        forever), or a log that hides how long the guard waited."""
+        forever), a log that hides how long the guard waited, and a crashed tab being handed the long
+        work evaluate anyway (it would cost the whole 30 s work timeout on every run: the reason the
+        ping exists)."""
         client = self.FakeClient(ping_times_out=True)
         with self.assertRaises(G.PageDead) as cm:
             G.Prober(client, [], 40, ping_s=7.5).probe("t1")
         self.assertIn("7.5", str(cm.exception))
+        work = [c for c in client.calls if c[0] == "Runtime.evaluate" and c[1] != "1"]
+        self.assertEqual(work, [], "a page that missed the ping must not be given the long work evaluate")
 
     def test_memory_pressure_selects_the_longer_ping(self):
         """Catches: the pressure ping being computed by Config but never handed to the prober."""
@@ -332,17 +336,27 @@ class BusyRenderersTests(unittest.TestCase):
     def test_a_one_hertz_bursty_neighbour_is_caught_by_the_default_window(self):
         """Catches: a check window shorter than the period of a throttled background timer (1 Hz).
         The burst then falls outside the window about half the time and the guard places tabs while
-        a neighbour is about to burn CPU."""
-        child = subprocess.Popen([sys.executable, "-c",
-                                  "import time\nwhile True:\n    t = time.process_time()\n"
-                                  "    while time.process_time() - t < 0.04:\n        pass\n    time.sleep(0.96)\n"])
-        self.addCleanup(child.wait)
-        self.addCleanup(child.kill)
-        # Eight looks at different phases of the cycle. A 0.5 s window catches a 1 Hz burst only about half
-        # the time, so with three looks the old default passed by luck (~10%); with eight it passes ~0.4%.
-        for _ in range(8):
-            self.assertEqual(G.busy_renderers([child.pid]), [child.pid])
-            time.sleep(0.37)
+        a neighbour is about to burn CPU.
+        A synthetic clock and CPU counter drive this, on purpose: an earlier version spawned a real
+        child that burns 40 ms a second, and on a starved box (this suite runs reniced to the floor at
+        load 50+) the child simply did not get the CPU, so the test measured the machine, not the code."""
+        clock = [1000.0]
+        burst_ms, burst_s = 40.0, 0.04          # a 1 Hz timer burns 40 ms at the start of every second
+
+        def cpu_ms(t):
+            whole, frac = divmod(t, 1.0)
+            return whole * burst_ms + min(frac, burst_s) / burst_s * burst_ms
+
+        def fake_read_proc(_pid):
+            return {"cpu_ms": cpu_ms(clock[0]), "footprint_mb": 0.0, "start": 1}
+
+        def fake_sleep(seconds):
+            clock[0] += seconds
+
+        with mock.patch.object(G, "read_proc", fake_read_proc), mock.patch.object(G.time, "sleep", fake_sleep):
+            for i in range(8):                  # eight phases of the 1 s cycle: a 0.5 s window misses the burst on 4 of them
+                clock[0] = 1000.0 + i * 0.125
+                self.assertEqual(G.busy_renderers([7]), [7], "phase %.3f s" % (i * 0.125))
 
     def test_an_alive_but_unreadable_process_counts_as_busy(self):
         """Catches: 'cannot read its CPU' being treated as 'quiet'. An unreadable renderer could be
@@ -729,17 +743,6 @@ class E2E(unittest.TestCase):
         except FileNotFoundError:
             return ""
 
-    def probe_phase_seconds(self):
-        """Seconds between the HEAVY_IDLE evaluation and the PROBE summary in the guard log."""
-        import re
-        stamps = {}
-        for line in self.log_text().splitlines():
-            for key in ("HEAVY_IDLE", "PROBE"):
-                if "] " + key + " " in line and key not in stamps:
-                    stamps[key] = time.mktime(time.strptime(line[1:20], "%Y-%m-%d %H:%M:%S"))
-        self.assertEqual(sorted(stamps), ["HEAVY_IDLE", "PROBE"], self.log_text())
-        return stamps["PROBE"] - stamps["HEAVY_IDLE"]
-
     def decisive_run(self, page_id, attempts=5, **cfg):
         """Run the guard until `page_id` is gone (at most `attempts` runs, 2 s apart). A run may legitimately
         skip on renderer noise (DEFER_NOISY / UNCONFIRMED) — in production launchd simply runs it again a
@@ -930,16 +933,16 @@ class E2E(unittest.TestCase):
         os.kill(pid, signal.SIGKILL)
         time.sleep(1.5)
         t0 = time.time()
-        # This test is about the ping itself, so it keeps a short one (8 s: a bit above the production 5 s
-        # to ride out a loaded box) instead of the harness's generous default.
+        # A short ping keeps the crashed tab cheap; the harness's generous default would make it cost 30 s.
         self.two_runs(closes=heavy, ping_s=8, ping_s_pressure=8)
         self.assertLess(time.time() - t0, 100, "runs took too long: " + self.log_text())
         ids = {t["id"] for t in FX.pages()}
         self.assertNotIn(heavy, ids, self.log_text())
         self.assertIn(crashed, ids, "the guard must not touch a tab it was not asked about")
-        self.assertIn("dead=1", self.log_text())
-        # Without the liveness ping the dead tab costs the whole 30 s work timeout.
-        self.assertLess(self.probe_phase_seconds(), 25, self.log_text())
+        self.assertRegex(self.log_text(), r"dead=[1-9]")     # the crashed tab was read as dead (a starved box may add more)
+        # That a dead tab is never handed the 30 s work evaluate is pinned deterministically by
+        # PingTimeoutTests. A wall-clock bound on the probe phase would only measure how starved the box
+        # is (41 s on 2026-09-19 at load 50, for a run that closed the right tab).
 
     def test_a_noisy_neighbour_defers_placement_instead_of_guessing(self):
         """Catches: placing tabs by CPU while another tab burns CPU (the neighbour drowns the probe
