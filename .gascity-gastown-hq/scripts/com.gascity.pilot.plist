@@ -8,6 +8,8 @@
 		<string>52756</string>
 		<key>GC_CITY_PATH</key>
 		<string>/Users/athos/gt/.gascity-gastown-hq</string>
+		<key>GC_VARIABLE_SESSION_MAX</key>
+		<string>9</string>
 		<key>HOME</key>
 		<string>/Users/athos</string>
 		<key>MAX_BIG</key>
@@ -29,7 +31,7 @@
 		<key>PILOT_SUSPENDED_CREWS_OVERRIDE</key>
 		<string>batista-ps</string>
 		<key>PILOT_WA_WORKER_MAX</key>
-		<string>3</string>
+		<string>4</string>
 	</dict>
 	<key>Label</key>
 	<string>com.gascity.pilot</string>

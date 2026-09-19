@@ -58,6 +58,17 @@
 # top-up que deveria repor consulta o store errado).
 # Aumentar o teto NAO corrige esse encalhe, so o torna menos frequente.
 #
+# Raised 2 -> 4 on 2026-09-19 ~03:3x BRT (Athos, AskUserQuestion na sessao do
+# Mayor 1603d407: "WA 4, cidade 9"). Por que: as 9 crews foram encerradas as
+# 01:29 (decisao dele), entao o WA passou a depender SO deste pool, com 41
+# beads prontas na fila (3 P0, 17 P1). Estado que sustenta o 4: reboot em 18/09
+# 20:15 (swap 3,8 de 5,1 GB), memoria livre 60%, disco 9,4 GB (acima do warn de
+# 8 GB do dolt-disk-floor-guard), e 7 sessoes de crew a menos. Casa com as
+# lanes do Pilot (MAX_SMALL=3 + MAX_BIG=1 = 4). Mudado junto: PILOT_WA_WORKER_MAX=4
+# e GC_VARIABLE_SESSION_MAX=9 no env do launchd do Pilot e do quality-gate-dispatcher.
+# Mesma regra de volta: se o swap saturar de novo ou o disk-floor ficar CRITICAL,
+# volta pra 2 (e avisa o Athos, que decidiu o 4).
+#
 # MODEL: Sonnet. Build work is well within Sonnet's capabilities. Keeps wa-worker
 # off the scarce weekly Opus budget (which is reserved for Mayor / named crew).
 #
@@ -66,7 +77,7 @@
 
 work_dir = "/Users/athos/gt/whatsapp_automation/crew/worker"
 min_active_sessions = 0
-max_active_sessions = 2
+max_active_sessions = 4
 idle_timeout = "2h"
 wake_mode = "fresh"
 model = "sonnet"
