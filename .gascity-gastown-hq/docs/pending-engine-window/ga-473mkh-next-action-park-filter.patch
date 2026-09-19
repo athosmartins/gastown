@@ -1,11 +1,11 @@
 diff --git a/internal/config/config.go b/internal/config/config.go
-index 7fe3b755a..447397a8c 100644
+index 96fe58858..8aaff52bd 100644
 --- a/internal/config/config.go
 +++ b/internal/config/config.go
-@@ -3387,7 +3387,20 @@ func poolDemandLabelFilterJQ() string {
- 			// used to live only in the Pilot's log visible on the bead. Without it
- 			// the dog pool's self-serve probe DISAGREED with the Pilot it mirrors:
- 			// Pilot honors the veto, probe handed the bead out as available work.
+@@ -3410,7 +3410,20 @@ func poolDemandLabelFilterJQ() string {
+ 			// NOT reuse it for an "is this already MINE" check (Tier 1/2); see
+ 			// assignedTierExclusionFilterJQ's doc-comment for why that conflation
+ 			// is a live double-dispatch bug, not just an over-match.
 -			`| select(((.labels // []) | map(select(startswith("blocked:") or startswith("blocked-reason:") or startswith("gate:needs-human") or startswith("pilot:refused-reason:") or startswith("pilot:text-veto"))) | length) == 0) ]`)
 +			// ga-473mkh: next-action:* is the 6th veto class. Like ga-42mlf's
 +			// text-veto gap, this probe disagreed with pilot-dispatcher.sh's
@@ -23,12 +23,12 @@ index 7fe3b755a..447397a8c 100644
 +			`| select(((.labels // []) | map(select(startswith("blocked:") or startswith("blocked-reason:") or startswith("gate:needs-human") or startswith("pilot:refused-reason:") or startswith("pilot:text-veto") or (test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not)))) | length) == 0) ]`)
  }
  
- // moleculeLiveStepFilterShell returns a shell pipeline stage that reads a bd
+ // assignedTierExclusionFilterJQ is the "is this already mine" filter for the
 diff --git a/internal/config/config_test.go b/internal/config/config_test.go
-index 26dd09456..e832b070f 100644
+index c62899348..26d49f40c 100644
 --- a/internal/config/config_test.go
 +++ b/internal/config/config_test.go
-@@ -2211,6 +2211,48 @@ func TestPoolDemandLabelFilterJQExcludesTextVeto(t *testing.T) {
+@@ -2313,6 +2313,48 @@ func TestPoolDemandLabelFilterJQExcludesTextVeto(t *testing.T) {
  	}
  }
  
