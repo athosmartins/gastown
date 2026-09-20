@@ -67,6 +67,14 @@ import time
 import sys as _sys
 _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 from gc_ledger import gc_ledger_append as _tsw_ledger
+# ga-9d7it9: imported apart from the writer above so a gc_ledger that predates the
+# selftest guard degrades to "cannot tell => write the marker" instead of an
+# ImportError that would take this daemon down at startup.
+try:
+    from gc_ledger import flow_authority_write_blocked as _tsw_fa_blocked
+except ImportError:
+    def _tsw_fa_blocked(path):  # type: ignore
+        return None
 import datetime as _tsw_datetime
 import park_labels
 import reclaim_liveness
@@ -401,6 +409,14 @@ FLOW_AUTHORITY_TTL_SEC = int(os.environ.get("TSW_FLOW_AUTHORITY_TTL_SEC", "7200"
 
 def _write_flow_authority(now, dimension):
     """Write the flow-authority marker file (imp14). Called after TSW mails Mayor."""
+    # ga-9d7it9: a selftest/pytest run must never overwrite the LIVE marker — PTH/PSW/
+    # FFF defer their Mayor mail off it, so a fixture marker mutes or erases a real
+    # one. A hermetic run that points TSW_FLOW_AUTHORITY_FILE at a scratch path is
+    # not the live file and still writes.
+    blocked = _tsw_fa_blocked(FLOW_AUTHORITY_FILE)
+    if blocked:
+        _log("imp14: selftest (%s): NOT writing the LIVE flow-authority marker" % blocked)
+        return
     try:
         import json as _json
         runtime_dir = os.path.dirname(FLOW_AUTHORITY_FILE)

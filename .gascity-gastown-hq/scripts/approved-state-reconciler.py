@@ -58,6 +58,14 @@ try:
 except ImportError:
     def _arc_ledger(name, data, *, fail_open=False):  # type: ignore
         pass
+# ga-9d7it9: a SEPARATE import, so an older gc_ledger that lacks the new name can never
+# turn _arc_ledger above into the no-op and silently drop production ledger rows.
+# Missing => cannot tell => production behaviour (write the marker).
+try:
+    from gc_ledger import flow_authority_write_blocked as _arc_fa_blocked
+except ImportError:
+    def _arc_fa_blocked(path):  # type: ignore
+        return None
 import park_labels
 import gate_queue_backlog
 from gate_queue_backlog import (
@@ -1001,6 +1009,14 @@ def _do_comment_add(rig_root, bead_id, text):
 # ── flow-authority marker ─────────────────────────────────────────────────────
 def _write_flow_authority(now, dimension):
     """Write flow-authority.json so other daemons (TSW/PSW/PTH) can defer Mayor mail."""
+    # ga-9d7it9: a selftest/pytest run must never overwrite the LIVE marker — the
+    # readers defer their Mayor mail off it, so a fixture marker mutes or erases a
+    # real one. A hermetic run that points ARC_FLOW_AUTHORITY_FILE at a scratch path
+    # is not the live file and still writes.
+    blocked = _arc_fa_blocked(FLOW_AUTHORITY_FILE)
+    if blocked:
+        _log("selftest (%s): NOT writing the LIVE flow-authority marker" % blocked)
+        return
     try:
         runtime_dir = os.path.dirname(FLOW_AUTHORITY_FILE)
         os.makedirs(runtime_dir, exist_ok=True)

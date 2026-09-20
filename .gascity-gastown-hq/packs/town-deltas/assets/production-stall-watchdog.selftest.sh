@@ -45,6 +45,13 @@ if [[ ! -f "$WD_SCRIPT" ]]; then
   exit 1
 fi
 
+# ga-9d7it9: every scenario below runs `python3 -c`, whose argv is ['-c'] — the signal
+# gc_ledger's selftest guard reads never sees it, so the confirmed-escalation scenarios'
+# REAL _ledger("human-touch", ...) rows ("wa ahead=3") were landing in the LIVE ledger.
+# Exported here, every python child is positively a test run and gc_ledger diverts its
+# writes to a scratch dir (scenario 19 pins that).
+export GC_SELFTEST=1
+
 PASS=0
 FAIL=0
 
@@ -393,6 +400,25 @@ print('OUT=%r' % out)
 assert isinstance(out, list) and len(out)==1 and out[0]['id']=='ga-a'
 print('OK_BD_TRAILING')
 " "OK_BD_TRAILING"
+
+# --- 19. the harness's ledger writes are diverted, never live (ga-9d7it9) ------
+# Same two-tick confirmed escalation as scenario 2, but this one looks at WHERE the
+# real human-touch row went. Public gc_ledger API only: ledger_path() follows a
+# selftest redirect, LIVE_LEDGER_DIR is the production dir the guard protects.
+run_test "confirmed escalation writes its human-touch row to the diverted ledger, never the live one" "
+$HARNESS
+import gc_ledger
+st = m.new_state()
+m._FINDINGS = [('deploy-block','wa ahead=3')]
+m.run_tick(1000.0, st)
+m.run_tick(2600.0, st)   # confirmed -> escalates -> real _ledger('human-touch', ...)
+p = gc_ledger.ledger_path('human-touch')
+print('LEDGER_PATH=%s' % p)
+assert not p.startswith(gc_ledger.LIVE_LEDGER_DIR), 'harness NOT diverted: its rows would hit the LIVE ledger'
+rows = [l for l in open(p, encoding='utf-8') if 'wa ahead=3' in l]
+assert len(rows) >= 1, 'the escalation row did not land where ledger_path() says'
+print('OK_LEDGER_DIVERTED')
+" "OK_LEDGER_DIVERTED"
 
 echo "----------------------------------------"
 echo "production-stall-watchdog selftest: ${PASS} passed, ${FAIL} failed"
