@@ -244,6 +244,57 @@ _PILOT_SWEEP_PAUSED_RE = re.compile(
 _PILOT_SWEEP_SLOTS_RE = re.compile(
     r"Pilot sweep complete: dispatched=\d+ \(small_slots=(\d+) big_slots=(\d+)")
 
+# ── pool-cap containment evidence (ga-9ekn2l) ────────────────────────────────
+# When a builder pool (wa-worker/ps-worker) is at its session cap, the Pilot
+# QUEUES the bead without writing anything and says so, PER BEAD, in its own log
+# (ga-in9ebr): "pool at session cap (N active/creating >= M max)". This
+# reconciler had no way to read that. Its only capacity signal,
+# _pool_has_capacity(), compares live sessions against POOL_BY_RIG_BASENAME — a
+# hand-copied constant that had drifted from the cap the Pilot really enforces
+# (WA 4 vs live 2, PS 2 vs live 1). The cap is an operator lever, flipped by
+# PILOT_WA_WORKER_MAX in com.gascity.pilot.plist — it went 4→2 on 2026-09-19 alone
+# (commit 03860b70c, "WA 4→2 de novo": not the first flip) and the Pilot log
+# carries cap values 4 and 2 inside that one day, so no constant can track it.
+# The Pilot's own words carry the cap it actually enforced, so that is what gets
+# read here.
+#
+# Consequence of the blind spot: the FRONT-of-queue bead — the one
+# _pilot_queue_suppress_reason() deliberately never suppresses — alarmed
+# "dispatch failing" for a wait that was working exactly as designed (wa-ho1ol,
+# 1774min, mail ga-wisp-frc2n), sending the reader to hunt a filter bug in
+# pilot-dispatcher.sh that did not exist.
+#
+# The two emission shapes below are the ones packs/town-deltas/assets/
+# pilot-dispatcher.sh writes today (its lines ~10164/10231 and ~10776). Both
+# were checked against the REAL log, 1011 + 17 lines — not against a
+# paraphrase, which is exactly how _PILOT_SWEEP_SLOTS_RE above shipped matching
+# zero real lines (ga-5d5se). `—` is the em dash the Pilot writes.
+#   pick preflight: "ga-in9ebr: <bead> QUEUED — routed to <pool>, pool at session
+#                    cap (<live> active/creating >= <max> max); not claimed, ..."
+#   dispatch_one:   "ga-in9ebr: <pool> pool at session cap (<live> active/creating
+#                    >= <max> max) — QUEUED <bead>: claim released, ..."
+# (An older "ga-mfeip: ... pool at session cap ... — skip spawn for <bead>" shape
+# also sits in the log history; the current pilot source no longer emits it, so it
+# is deliberately not matched — an unmatched line only ever means "no evidence".)
+_PILOT_CAP_PICK_RE = re.compile(
+    r"ga-in9ebr: (?P<bead>\S+) QUEUED — routed to (?P<pool>[^,\s]+), "
+    r"pool at session cap \((?P<live>\d+) active/creating >= (?P<max>\d+) max\)")
+_PILOT_CAP_DISPATCH_RE = re.compile(
+    r"ga-in9ebr: (?P<pool>\S+) pool at session cap "
+    r"\((?P<live>\d+) active/creating >= (?P<max>\d+) max\) — QUEUED (?P<bead>[^\s:]+):")
+# How long a cap line stays evidence. Same margin reasoning as
+# PILOT_DISPATCHABLE_TTL / PILOT_SWEEP_PAUSE_TTL_SEC (ga-abfcdz, ga-ndh7jm):
+# real sweep-to-sweep intervals run 640-1394s, and a whole-sweep deferral (which
+# evaluates nothing, so refreshes nothing) can stretch the gap to ~2 sweeps —
+# 1800s stays above that while still going stale if the Pilot genuinely stops
+# evaluating. Past it the evidence is dropped and the bead is judged on the
+# other signals, exactly as before this fix.
+PILOT_CAP_EVIDENCE_TTL_SEC = 1800
+# Clock-skew allowance for a cap line dated slightly AHEAD of `now` (the log stamps
+# local wall time; this process reads its own clock). Beyond it the line is dropped
+# — a future-dated line cannot be shown to be fresh.
+_CAP_EVIDENCE_FUTURE_SKEW_SEC = 300
+
 # ── test seams (monkeypatched in --selftest) ───────────────────────────────────
 # These module-level callables let selftests redirect I/O without spawning subprocesses.
 # None = use the real implementation; any callable = use that callable instead.
@@ -295,11 +346,12 @@ def _load_state():
                 d.setdefault("flagged", {})
                 d.setdefault("reclaim_exhausted", {})
                 d.setdefault("branch_stranded", {})
+                d.setdefault("capacity_wait", {})
                 return d
     except Exception:
         pass
     return {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {},
-            "reclaim_exhausted": {}, "branch_stranded": {}}
+            "reclaim_exhausted": {}, "branch_stranded": {}, "capacity_wait": {}}
 
 
 def _save_state(state):
@@ -330,7 +382,7 @@ def _prune_state(state, now):
     """
     cutoff = now - 7 * 24 * 3600
     for key in ("routed", "alarmed", "first_seen_approved", "flagged", "reclaim_exhausted",
-                "branch_stranded"):
+                "branch_stranded", "capacity_wait"):
         bucket = state.get(key, {})
         if not isinstance(bucket, dict):
             _log("WARN: state[%r] is a %s, not a mapping — reset to empty" % (
@@ -1358,6 +1410,97 @@ def _lane_capacity_suppress_reason(labels, now):
             "budget, not a dispatch failure (ga-2yyez)" % (lane, small_slots, big_slots))
 
 
+# ── pool-cap containment evidence reader (ga-9ekn2l) ─────────────────────────
+def _pilot_cap_evidence(now):
+    """Return {bead_id: {"pool", "live", "max", "epoch"}} for every bead the
+    Pilot ITSELF reported QUEUED at a pool session cap in its most recent
+    dispatch-evaluating sweep, or None when the Pilot log cannot be read.
+
+    THREE states, never collapsed (root-class:error-vs-empty — the same discipline
+    as every other measurement helper in this file):
+      None  → the Pilot's CURRENT dispatch decision is NOT in the window: the log
+              was empty/unreadable, holds no evaluating sweep at all (only
+              deferral/pause lines, or nothing datable), or its newest evaluating
+              sweep is older than PILOT_CAP_EVIDENCE_TTL_SEC. Pool-cap containment
+              was neither confirmed nor ruled out. Callers must NOT read this as
+              "not held".
+      {}    → a FRESH evaluating sweep was seen and no bead is cap-queued: a bead
+              missing from a measured map is positively "not held at the cap".
+      {...} → positively measured, per bead, in the Pilot's own words.
+
+    "Most recent evaluating sweep" rule. The Pilot logs exactly one such line per
+    still-capped candidate per evaluating sweep — measured over wa-ho1ol: 14
+    consecutive sweeps, one cap line each and nothing else. So a bead that was
+    cap-queued in an older sweep but is ABSENT from a later COMPLETED one is no
+    longer held by the cap (the cap freed, or something else holds it now) and
+    must go back to the normal alarm path — otherwise a genuine dispatch failure
+    would stay explained by a stale cap line. A whole-sweep pause/deferral
+    ("dispatched=0 (paused|deferred: ...)") evaluates nothing, so it neither
+    refreshes nor supersedes evidence; that gap is covered by the sweep-pause
+    suppression upstream and bounded here by PILOT_CAP_EVIDENCE_TTL_SEC. Lines
+    logged after the last completed sweep belong to the sweep still running and
+    are overlaid on top (absence there disproves nothing yet).
+
+    A cap line whose timestamp cannot be parsed is skipped, never trusted: an
+    undatable line cannot be shown to be fresh, and "no evidence" is the
+    alarm-preserving direction. The same goes for one dated in the FUTURE beyond
+    a small clock-skew allowance (a stepped clock must not make old evidence look
+    fresh forever).
+    """
+    if _read_pilot_log_lines is not None:
+        lines = _read_pilot_log_lines()   # test seam (shared with _is_pilot_alive)
+    else:
+        lines = _tail(PILOT_LOG, LOG_TAIL)
+    if not lines:
+        return None
+
+    completed = {}   # cap lines of the newest COMPLETED evaluating sweep
+    running = {}     # cap lines logged since that sweep completed (still running)
+    newest_eval = None   # epoch of the newest DATABLE proof the Pilot evaluated dispatch
+
+    def _proof(t):
+        # Only a datable, not-future-dated timestamp counts as proof of an evaluation:
+        # a stepped clock must not be able to manufacture a "fresh" measurement.
+        nonlocal newest_eval
+        if t is not None and (t - now) <= _CAP_EVIDENCE_FUTURE_SKEW_SEC:
+            if newest_eval is None or t > newest_eval:
+                newest_eval = t
+
+    for line in lines:
+        if _PILOT_SWEEP_RE.search(line):
+            if _PILOT_SWEEP_PAUSED_RE.search(line):
+                continue   # whole-sweep pause/deferral: evaluated nothing
+            _proof(_ts_epoch(line))
+            completed, running = running, {}
+            continue
+        m = _PILOT_CAP_PICK_RE.search(line) or _PILOT_CAP_DISPATCH_RE.search(line)
+        if not m:
+            continue
+        epoch = _ts_epoch(line)
+        if epoch is None:
+            continue
+        _proof(epoch)   # a datable cap line is itself proof a sweep evaluated
+        running[m.group("bead")] = {
+            "pool": m.group("pool"),
+            "live": int(m.group("live")),
+            "max": int(m.group("max")),
+            "epoch": epoch,
+        }
+
+    if newest_eval is None or (now - newest_eval) > PILOT_CAP_EVIDENCE_TTL_SEC:
+        # Readable log, but the Pilot's CURRENT dispatch decision is not in it: no
+        # evaluating sweep at all, or the newest one is older than the TTL. Say "don't
+        # know" — never "measured: nothing is capped", which is the value an evaluating
+        # sweep that queued nothing would return (and which would make the alarm body
+        # claim a sweep did not queue the bead when that sweep is too old to say).
+        return None
+
+    evidence = dict(completed)
+    evidence.update(running)
+    return {bid: ev for bid, ev in evidence.items()
+            if -_CAP_EVIDENCE_FUTURE_SKEW_SEC <= (now - ev["epoch"]) <= PILOT_CAP_EVIDENCE_TTL_SEC}
+
+
 # ── route a bead out of story:approved ───────────────────────────────────────
 def _route_bead(rig_root, bead, route_to, signal, now, state):
     """Route bead out of story:approved into its true state.
@@ -1485,7 +1628,7 @@ def _alarm_record(state, bead_id):
 
 
 def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_throughput=None,
-                     dispatchable=None):
+                     dispatchable=None, cap_evidence=None):
     """Fire a starve alarm for a buildable bead that has not been dispatched.
 
     This is case 3 of the core guarantee: the bead matched NONE of this
@@ -1511,6 +1654,15 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
     decided the bead's queue position does NOT explain the wait, so this only
     renders context via _pilot_queue_body_line() (AC1-AC3) plus a delta against
     the PREVIOUS alarm's recorded position, if any (AC4).
+
+    cap_evidence (ga-9ekn2l): the once-per-cycle _pilot_cap_evidence() map (None
+    if the Pilot log was unreadable). A bead the Pilot itself queued at a pool
+    session cap never gets here — _process_store() diverts it to
+    _alarm_capacity_wait() (a different, correctly-worded note). So this only
+    renders WHICH of the remaining two states applies, in the body: measured
+    and NOT cap-held, or unmeasured. Without that line a reader cannot tell
+    "checked, not the cap" from "could not check" — the two states the old
+    alarm silently collapsed together with the third (cap-contained).
     """
     bead_id = bead.get("id") or bead.get("issue_id") or ""
     if not bead_id:
@@ -1631,11 +1783,27 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
             queue_line += " Since last alarm: changed from %s to %s." % (
                 _qpos_desc(prev_qpos), _qpos_desc(cur_qpos))
 
+    # ga-9ekn2l: say which of the three states this alarm is in — dispatch failed
+    # (this alarm, cap checked and negative), contained by the pool cap (never
+    # reaches here; see _alarm_capacity_wait), or cannot tell (log unreadable).
+    # "NÃO MEDIDO" is deliberately not the "COULD NOT READ"/"COULD NOT MEASURE"
+    # phrase the queue/gate lines use — other checks key off those substrings.
+    if cap_evidence is None:
+        cap_line = ("Pool-cap evidence (Pilot log): NÃO MEDIDO — the Pilot log holds no FRESH "
+                    "dispatch-evaluating sweep (unreadable, only deferral/pause lines, or older "
+                    "than %ds), so containment by the pool session cap was neither confirmed "
+                    "nor ruled out." % PILOT_CAP_EVIDENCE_TTL_SEC)
+    else:
+        cap_line = ("Pool-cap evidence (Pilot log): none for this bead — the Pilot's most "
+                    "recent dispatch-evaluating sweep did NOT queue it at a pool session cap, "
+                    "so this is not cap containment.")
+
     body = (
         "APPROVED-STATE-RECONCILER: buildable bead starving — dispatch path failing\n\n"
         "Bead: %s — %s\n"
         "Status: story:approved, age: %dmin, not dispatched, pilot alive, "
         "alarm #%d for this incident\n"
+        "%s\n"
         "%s\n"
         "%s\n"
         "%s\n\n"
@@ -1654,7 +1822,7 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
         "   _extra_alarm_suppress_reason() em scripts/approved-state-reconciler.py antes\n"
         "   de re-despachar manualmente ou adicionar story:approved de volta.\n"
     ) % (bead_id, title, int(age_min), alarm_ordinal, gate_line, queue_line, pause_line,
-         STARVE_MIN, rig_root, bead_id)
+         cap_line, STARVE_MIN, rig_root, bead_id)
 
     notify_msg = ("STARVE ALARM%s: bead %s story:approved há %dmin, pilot alive, "
                   "não despachado — dispatch path failing" % (
@@ -1687,6 +1855,135 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
     state.setdefault("alarmed", {})[bead_id] = {
         "last": now, "count": alarm_ordinal, "fp": labels_fp, "qpos": cur_qpos,
     }
+
+
+# ── pool-cap capacity-wait note (ga-9ekn2l) ───────────────────────────────────
+def _alarm_capacity_wait(rig_root, bead, age_min, ev, cap_evidence, now, state):
+    """Mail the Mayor a 'waiting for pool CAPACITY — NOT a dispatch failure' note
+    for a bead the Pilot itself queued at a pool session cap.
+
+    This is the reclassification the "dispatch failing" alarm was missing. The
+    bead is NOT silently dropped: that it has waited Nmin is real information,
+    and a cap that holds work for hours is a capacity decision the Mayor owns.
+    What changes is the SUBJECT and the DIAGNOSIS — they now name the true cause,
+    so nobody is sent hunting a filter bug in pilot-dispatcher.sh that does not
+    exist (the wa-ho1ol mail, ga-wisp-frc2n, did exactly that).
+
+    Rate-limited per POOL, not per bead. Containment is a property of the pool:
+    with the cap at 2 and 37 approved beads behind it the Pilot logs a cap line
+    for every one of them, so a per-bead policy would mail the Mayor once per bead
+    as the queue drains — trading a false alarm for a flood. One note per pool per
+    backoff window (the AC3 tiers, _alarm_backoff_sec) keeps it a heartbeat, and
+    each note names the queue depth and the oldest waiter, so nothing the per-bead
+    mails would have said is lost. A change of the cap itself (fingerprint
+    "pool:max") is a NEW incident and fires immediately: the operator moved the
+    lever, and the Mayor should hear what that did to the queue.
+
+    Deliberately NOT done, each for a reason:
+      - no _write_flow_authority(): that marker tells the throughput/production
+        stall watchdogs to defer THEIR Mayor mail. A capacity note is not an
+        escalation of a flow stall — and a pool "at cap" whose sessions are zombies
+        is precisely what those watchdogs exist to catch. Claiming authority here
+        would mute them.
+      - no ntfy phone push and no human-touch ledger entry: nothing here asks a
+        human to act (the false alarm this replaces DID count as a human touch).
+
+    Never fires in DRY_RUN mode (no state update, no mutation).
+    """
+    bead_id = bead.get("id") or bead.get("issue_id") or ""
+    if not bead_id:
+        return
+
+    pool = ev["pool"]
+    cap = ev["max"]
+    live = ev["live"]
+    fp = "%s:%d" % (pool, cap)
+
+    bucket = state.setdefault("capacity_wait", {})
+    raw = bucket.get(pool)
+    last, count, prev_fp = 0.0, 0, None
+    if isinstance(raw, dict):
+        try:
+            last, count, prev_fp = float(raw.get("last", 0.0)), int(raw.get("count", 0)), raw.get("fp")
+        except (TypeError, ValueError):
+            # Corrupt record: treat as "no prior note" — a visible note is better than
+            # an exception that aborts every remaining bead in this rig for the cycle.
+            last, count, prev_fp = 0.0, 0, None
+    state_changed = prev_fp is not None and prev_fp != fp
+    if state_changed:
+        count = 0   # the cap moved — new incident, restart escalation
+
+    if not state_changed and (now - last) < _alarm_backoff_sec(count):
+        _log("  capacity-wait backoff active for pool %s (count=%d, last %.0fmin ago, "
+             "next in >=%.0fmin) — skipping %s" % (
+             pool, count, (now - last) / 60.0,
+             (_alarm_backoff_sec(count) - (now - last)) / 60.0, bead_id))
+        return
+
+    ordinal = count + 1
+
+    # Queue depth and oldest waiter at THIS cap, from the same evidence read that
+    # diverted this bead here — the age comes from the daemon's own first-seen
+    # clock (never updated_at, which any comment resets), same as the alarm path.
+    waiting = [b for b, e in cap_evidence.items() if e["pool"] == pool]
+    fsa = state.get("first_seen_approved", {})
+    waits = sorted(((now - fsa[b]) / 60.0, b) for b in waiting if b in fsa)
+    if waits:
+        oldest_age, oldest_id = waits[-1]
+    else:
+        oldest_age, oldest_id = age_min, bead_id
+
+    _log("CAPACITY-WAIT (not dispatch-failing): pool %s | %d active/creating >= %d max | "
+         "%d queued at the cap | oldest %s %.0fmin | trigger %s | ordinal=%d%s" % (
+         pool, live, cap, len(waiting), oldest_id, oldest_age, bead_id, ordinal,
+         " (cap changed → escalation reset)" if state_changed else ""))
+
+    if DRY_RUN:
+        _log("DRY_RUN: would send capacity-wait note for pool %s (trigger %s, ordinal=%d)" % (
+             pool, bead_id, ordinal))
+        return  # no state update, no mutations
+
+    cap_env = "PILOT_%s_MAX" % re.sub(r"[^A-Z0-9]+", "_", pool.upper())
+    seen_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ev["epoch"]))
+    subject = ("Reconciler: aguardando capacidade do pool %s — %d ativa(s) no teto %d, "
+               "%d bead(s) na fila (mais antiga %s, %dmin) — NÃO é falha de despacho%s"
+               % (pool, live, cap, len(waiting), oldest_id, int(oldest_age),
+                  "" if ordinal == 1 else " (repeat #%d)" % ordinal))
+    body = (
+        "APPROVED-STATE-RECONCILER: aguardando CAPACIDADE do pool — NÃO é falha de despacho\n\n"
+        "Pool: %s — %d sessão(ões) active/creating para um teto de %d (palavras do próprio\n"
+        "Pilot, último sweep avaliador, hora local %s)\n"
+        "Fila neste teto: %d bead(s) que o Pilot deixou QUEUED; a mais antiga é %s (%dmin).\n"
+        "Nota #%d para este pool (disparada ao avaliar %s — só rastro, não é a bead que mais espera).\n\n"
+        "O QUE É: o Pilot viu a bead, achou-a despachável e a enfileirou SEM escrever nada\n"
+        "porque o pool está no teto de sessões (ga-in9ebr). É contenção deliberada de\n"
+        "capacidade — não é bug de query nem de filtro no pilot-dispatcher.sh. A bead sai\n"
+        "sozinha quando um slot libera. Esta nota é UMA por pool (backoff 1h/4h/12h), não\n"
+        "uma por bead.\n\n"
+        "CONFERIR (só se a espera parecer longa demais):\n"
+        "1. gc session list | grep %s — as %d sessões ativas estão progredindo? Sessão\n"
+        "   zumbi/fantasma ocupando o teto trava a fila SEM o despacho falhar: teto cheio\n"
+        "   é o sintoma, não a causa.\n"
+        "2. O teto %d é o desejado? Vem do env %s do Pilot (com.gascity.pilot.plist) —\n"
+        "   é alavanca operacional; mexer nela é decisão de capacidade, não de despacho.\n"
+        "Fonte: linhas 'ga-in9ebr: ... pool at session cap' de .gc/logs/pilot-dispatcher.log.\n"
+    ) % (pool, live, cap, seen_at, len(waiting), oldest_id, int(oldest_age),
+         ordinal, bead_id, pool, live, cap, cap_env)
+
+    if _do_mail_mayor is not None:
+        sent = bool(_do_mail_mayor(subject, body))
+    else:
+        proc = _sh([GC_BIN, "mail", "send", MAYOR_ADDR, "-s", subject, "-m", body, "--notify"],
+                   timeout=45)
+        sent = proc is not None and getattr(proc, "returncode", 1) == 0
+    if not sent:
+        # Same convention as _alarm_starving (state is recorded either way, so a dead
+        # mail path is not retried once per bead per cycle) — but never SILENT: the
+        # reader of this log must be able to see the note did not go out.
+        _log("WARN: capacity-wait mail to %s FAILED for pool %s — state still recorded, "
+             "so the next note is due only after the backoff" % (MAYOR_ADDR, pool))
+
+    bucket[pool] = {"last": now, "count": ordinal, "fp": fp}
 
 
 # ── reclaim-exhausted note (ga-ag16) ──────────────────────────────────────────
@@ -2457,7 +2754,7 @@ def _branch_stranded_reason(bead_id):
 # ── process one store ─────────────────────────────────────────────────────────
 def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
                     gate_depth=None, gate_throughput=None, dispatchable=None,
-                    sweep_pause_state=None):
+                    sweep_pause_state=None, cap_evidence=None):
     """Scan story:approved open beads in rig_root; classify and act on each one.
 
     built_ids: set of bead ids with a live BUILT marker (from _gate_marker_source_beads(),
@@ -2481,6 +2778,12 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
     None if missing/stale/unreadable. Consulted by _pilot_queue_suppress_reason()
     immediately before the starve alarm fires, and rendered into that alarm's
     body regardless (same pattern as gate_depth/gate_throughput above).
+
+    cap_evidence (ga-9ekn2l): the beads the Pilot itself reported QUEUED at a
+    pool session cap in its latest evaluating sweep, from _pilot_cap_evidence(),
+    computed ONCE per cycle in run_cycle() (the Pilot log is HQ-wide). None if
+    the log was unreadable — a bead is then judged as before but its alarm says
+    the cap question was NÃO MEDIDO, never "not held".
 
     Returns (processed, routed, alarmed) int counts.
     On query error: logs + returns (0, 0, 0) — fail-open; other stores are unaffected.
@@ -2771,6 +3074,25 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
                  bead_id, starve_age_min))
             continue
 
+        # POOL-CAP CONTAINMENT (ga-9ekn2l): the Pilot itself logged that it queued
+        # THIS bead at a pool session cap in its latest evaluating sweep. That is
+        # the Pilot's own statement of why the bead waits, so it outranks any
+        # re-derivation below — and in particular _pool_has_capacity(), whose
+        # hand-copied cap had drifted (WA 4 vs the live 2) and so read "has
+        # capacity" while the Pilot was refusing to spawn. Checked BEFORE that
+        # call for a second reason: with a correct cap it would `continue`
+        # silently, and this wait must stay visible (the Mayor asked for the
+        # alarm to be reclassified, not erased). Not counted in `alarmed`: this
+        # is deliberately not an alarm about a failure.
+        cap_ev = cap_evidence.get(bead_id) if cap_evidence else None
+        if cap_ev is not None:
+            _log("  %s: daemon-age=%.0fmin, the Pilot queued it at the %s session cap "
+                 "(%d active/creating >= %d max) — capacity wait, NOT dispatch failing" % (
+                 bead_id, starve_age_min, cap_ev["pool"], cap_ev["live"], cap_ev["max"]))
+            _alarm_capacity_wait(rig_root, bead, starve_age_min, cap_ev, cap_evidence,
+                                 now, state)
+            continue
+
         # IMPORTANT 1: capacity check — only alarm if builder pool has free slots.
         # A saturated pool means the bead is legitimately queued behind active work.
         has_cap, cap_note = _pool_has_capacity(rig_root, now)
@@ -2912,7 +3234,7 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
 
         # ALARM: buildable bead starving, pilot alive, pool has capacity, dispatch failing.
         _alarm_starving(rig_root, bead, starve_age_min, now, state, gate_depth, gate_throughput,
-                         dispatchable)
+                         dispatchable, cap_evidence)
         alarmed += 1
 
     return processed, routed, alarmed
@@ -2979,6 +3301,19 @@ def run_cycle(now, state):
              "starve-alarm sweep-pause suppression degrades to 'unmeasured' "
              "this cycle (see ga-nq0jo)")
 
+    # Pool-cap containment evidence (ga-9ekn2l): what the Pilot ITSELF logged as
+    # QUEUED at a pool session cap in its latest evaluating sweep. The Pilot log
+    # is HQ-wide, so read once per cycle. None = log unreadable; _process_store()
+    # / _alarm_starving() treat that as NÃO MEDIDO (containment neither confirmed
+    # nor ruled out), never as "no bead is held at the cap".
+    cap_evidence = _pilot_cap_evidence(now)
+    if cap_evidence is None:
+        _log("  pilot log unreadable or holds no fresh evaluating sweep — starve-alarm "
+             "pool-cap containment degrades to 'unmeasured' this cycle (see ga-9ekn2l)")
+    else:
+        _log("  pilot pool-cap evidence: %d bead(s) queued at a session cap in the "
+             "latest evaluating sweep" % len(cap_evidence))
+
     total_p = total_r = total_a = 0
 
     for rig_root in RIG_ROOTS:
@@ -3000,7 +3335,7 @@ def run_cycle(now, state):
         try:
             p, r, a = _process_store(rig_root, now, state, pilot_alive, built_ids,
                                       blocked_ids, gate_depth, gate_throughput,
-                                      dispatchable, sweep_pause_state)
+                                      dispatchable, sweep_pause_state, cap_evidence)
             total_p += p
             total_r += r
             total_a += a
@@ -3256,12 +3591,48 @@ def _selftest():
       (ga-2yyez-lane-h) cross-lane isolation: small_slots=0 but the bead is
                 lane:big with big_slots=1 → STILL alarms — small-lane
                 saturation must never suppress a big-lane bead
+      (ga-9ekn2l-a..f) _pilot_cap_evidence() — the Pilot's OWN "QUEUED at pool
+                session cap" log line as per-bead evidence: both REAL emission
+                shapes parse, verbatim (a); a whole-sweep deferral neither
+                supersedes nor refreshes evidence and the TTL bounds it (b); a
+                bead absent from a later COMPLETED evaluating sweep is no
+                longer cap-held (c); lines of the sweep still running overlay
+                without disproving the older ones (d); unreadable log → None
+                vs read-but-empty → {} (e); an undatable line is never
+                evidence (f)
+      (ga-9ekn2l-b2) the per-line TTL drops a STALE cap line riding along with
+                FRESH evidence (old completed sweep + long deferral + a fresh
+                in-progress sweep)
+      (ga-9ekn2l-g) END-TO-END, mirrors wa-ho1ol (1774min, mail ga-wisp-frc2n):
+                front-of-queue bead whose pool the Pilot itself logged as at
+                cap, while _pool_has_capacity's hand-copied cap still reads
+                "has capacity" → NO "dispatch failing"; exactly ONE capacity-
+                wait note; no flow-authority claim, no human-touch row, no push
+      (ga-9ekn2l-h,i) falsification: no cap line for the bead in the latest
+                evaluating sweep (h), or a cap line only in an OLDER sweep (i)
+                → STILL "dispatch failing", body says the cap was checked and
+                is not the cause
+      (ga-9ekn2l-j) volume: 3 cap-queued beads x every rig → ONE note per pool;
+                none inside the backoff; repeat #2 after 1h; a change of the
+                cap itself fires immediately
+      (ga-9ekn2l-l) third state: cap evidence unmeasured → alarm kept, body
+                says NÃO MEDIDO, never "not held"
+      (ga-9ekn2l-m,o) DRY_RUN mails and records nothing; _prune_state expires
+                capacity_wait entries
+      (ga-9ekn2l-e2,f2) self-audit fixes: a readable log holding NO evaluating
+                sweep (only deferral/pause lines) is unmeasured (None), not
+                "measured: nothing capped" (e2); a cap line dated in the FUTURE
+                beyond the skew allowance is dropped, one inside it kept (f2)
+      (ga-9ekn2l-p,q) a capacity_wait record with a corrupt count does not
+                abort the rig's cycle — the note still goes out (p); a failed
+                mail send is logged, never silent (q)
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
     global _bd_blocked, _bd_show_full, _bd_has_built_branch, _bd_branch_stranded
     global _read_pilot_dispatchable_file, _read_pilot_sweep_pause_state_file
     global _pilot_dispatchable_reason_file
+    global _arc_ledger, _write_flow_authority
     global DRY_RUN, STARVE_MIN, FLOW_GRACE_MIN, ROUTE_COOLDOWN_SEC, ALARM_COOLDOWN_SEC
     global _OWNERSHIP_REPOS
 
@@ -3378,6 +3749,24 @@ def _selftest():
     _do_mail_mayor = _stub_mail
     _do_notify = _stub_notify
     _sh = _stub_sh_fast
+    # ga-9ekn2l HERMETICITY FIX: until now this selftest ran the REAL _arc_ledger
+    # and the REAL _write_flow_authority on every alarm-path scenario, so each run
+    # (two of them mine, measured) appended fake rows
+    # (bead ids like hq-038, wa-001) to the live human-touch/flow ledgers and
+    # overwrote the live flow-authority.json with an expired marker. Measured
+    # 2026-09-20 with a deliberately strict rule (a bead id of the form hq-NNN or
+    # wa-NNN, which no real bead has): AT LEAST 3940 of the reconciler's 5845
+    # human-touch rows (67%) and 799 of its 2202 flow-ledger rows (36%) are
+    # fixtures — the human-touch metric was mostly test artifacts. Both are stubbed
+    # to capture lists now (cleared by _reset()), which also lets a scenario assert
+    # what a code path did NOT do — e.g. that a capacity-wait note claims no flow
+    # authority and writes no human-touch row. Rows already written are NOT
+    # removed here: that ledger is append-only and other processes write it live.
+    # The historical rows and the other selftests (not audited) are ga-9d7it9.
+    ledger_calls = []
+    flow_authority_calls = []
+    _arc_ledger = lambda name, data, *, fail_open=False: ledger_calls.append((name, data))
+    _write_flow_authority = lambda now, dimension: flow_authority_calls.append(dimension)
     # Hermetic defaults for the gate-queue-backlog module (ga-dbfm9/ga-ahn3v):
     # gate_queue_backlog.py keeps its own separate _sh (deliberately not shared
     # with callers — see that module's docstring), so rebinding _sh above does
@@ -3463,6 +3852,8 @@ def _selftest():
         comments.clear()
         mail_calls.clear()
         notify_calls.clear()
+        ledger_calls.clear()
+        flow_authority_calls.clear()
         return {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
 
     def _reset_captures():
@@ -3472,6 +3863,8 @@ def _selftest():
         comments.clear()
         mail_calls.clear()
         notify_calls.clear()
+        ledger_calls.clear()
+        flow_authority_calls.clear()
 
     globals()["DRY_RUN"] = False
 
@@ -5984,6 +6377,421 @@ def _selftest():
                          _veto_bid,))
             else:
                 _ok("(ga-ulg9j: %s): no false alarm" % _veto_lbl)
+
+    # ── ga-9ekn2l: pool-cap containment — the Pilot's own "QUEUED at session cap" ─
+    # FIXTURES: the four _REAL_* constants are REAL pilot-dispatcher.log lines,
+    # verbatim (copied 2026-09-20 from .gc/logs/pilot-dispatcher.log) — not a
+    # paraphrase: ga-5d5se shipped a regex validated only against a paraphrased
+    # fixture and it matched zero real lines. — is the em dash the Pilot
+    # writes. Scenarios that need lines "recent" relative to NOW re-derive them
+    # from the same text with the helpers below.
+    _REAL_CAP_PICK = (
+        "[2026-09-20 01:24:13] [pilot-dispatcher] ga-in9ebr: wa-ho1ol QUEUED — routed to "
+        "wa-worker, pool at session cap (2 active/creating >= 2 max); not claimed, no writes "
+        "this sweep (the ga-93yxc pool top-up opens a session once a slot frees).")
+    _REAL_CAP_DISPATCH = (
+        "[2026-09-19 16:05:16] [pilot-dispatcher]   ga-in9ebr: wa-worker pool at session cap "
+        "(4 active/creating >= 4 max) — QUEUED wa-zdzc8: claim released, story:approved + "
+        "gc.routed_to=wa-worker kept, NOT marked in-flight/dispatched (ga-93yxc pool top-up "
+        "opens a session once a slot frees).")
+    _REAL_SWEEP_NORMAL = (
+        "[2026-09-20 01:24:14] [pilot-dispatcher] === Pilot sweep complete: dispatched=1 "
+        "(small_slots=3 big_slots=1 dolt_saturated_at_start=0) ===")
+    _REAL_SWEEP_DEFERRED = (
+        "[2026-09-20 01:35:11] [pilot-dispatcher] === Pilot sweep complete: dispatched=0 "
+        "(deferred: cross-stage gate-congested + resource-contended, ga-d0hz3) ===")
+
+    def _cap_pick_line(epoch, bead, pool="wa-worker", live=2, cap=2):
+        ts = time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(epoch))
+        return ("%s [pilot-dispatcher] ga-in9ebr: %s QUEUED — routed to %s, pool at "
+                "session cap (%d active/creating >= %d max); not claimed, no writes this "
+                "sweep (the ga-93yxc pool top-up opens a session once a slot frees)."
+                % (ts, bead, pool, live, cap))
+
+    def _cap_log_at(t, beads, live=2, cap=2):
+        """One evaluating sweep ending at t: a cap line per bead, then the real-shaped
+        sweep-complete line (small_slots=3, so the lane check can never explain the wait)."""
+        lines = [_cap_pick_line(t - 60 + i, b, live=live, cap=cap)
+                 for i, b in enumerate(beads)]
+        lines.append(_sweep_log_line_slots(t - 40, 3, 1))
+        return lines
+
+    def _sh_wa_two_active(args, timeout=20):
+        """`gc session list --json` reporting 2 active wa-worker sessions. Against
+        _pool_has_capacity's hand-copied cap of 4 that reads "has capacity" — exactly
+        what it read live while the Pilot was refusing to spawn at its real cap of 2."""
+        if list(args[:3]) == [GC_BIN, "session", "list"]:
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stderr="",
+                stdout=json.dumps({"sessions": [
+                    {"template": "wa-worker", "state": "active"},
+                    {"template": "wa-worker", "state": "active"}]}))
+        return _stub_sh_fast(args, timeout)
+
+    def _sweep_deferred_line9(epoch):
+        """A whole-sweep deferral in the REAL shape (evaluates nothing)."""
+        ts = time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(epoch))
+        return ("%s [pilot-dispatcher] === Pilot sweep complete: dispatched=0 (deferred: "
+                "cross-stage gate-congested + resource-contended, ga-d0hz3) ===" % ts)
+
+    def _cap_mails():
+        return [(s, b) for s, b in mail_calls if "aguardando capacidade" in s]
+
+    def _df_mails():
+        return [(s, b) for s, b in mail_calls if "dispatch failing" in s]
+
+    def _pause_off():
+        return {"active": False, "reason": "", "detail": "",
+                "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW))}
+
+    def _dispatchable_front(bid):
+        return {"items": [{"id": bid, "priority": 2},
+                          {"id": "ga-9ekn2l-o1", "priority": 2},
+                          {"id": "ga-9ekn2l-o2", "priority": 2}]}
+
+    _LBL9 = ["story:approved", "ctx:ready", "exec:auto", "lane:small"]
+
+    print("\nScenario (ga-9ekn2l-a): the two REAL cap-line shapes, verbatim, parse "
+          "into per-bead evidence (pool, live, max)")
+    _read_pilot_log_lines = lambda: [_REAL_CAP_PICK, _REAL_SWEEP_NORMAL]
+    ev9a = _pilot_cap_evidence(_ts_epoch(_REAL_SWEEP_NORMAL) + 60)
+    _read_pilot_log_lines = lambda: [_REAL_CAP_DISPATCH]
+    ev9a2 = _pilot_cap_evidence(_ts_epoch(_REAL_CAP_DISPATCH) + 60)
+    _pick_ok = bool(ev9a) and ev9a.get("wa-ho1ol", {}).get("pool") == "wa-worker" \
+        and ev9a["wa-ho1ol"]["live"] == 2 and ev9a["wa-ho1ol"]["max"] == 2
+    _disp_ok = bool(ev9a2) and ev9a2.get("wa-zdzc8", {}).get("pool") == "wa-worker" \
+        and ev9a2["wa-zdzc8"]["live"] == 4 and ev9a2["wa-zdzc8"]["max"] == 4
+    if _pick_ok and _disp_ok:
+        _ok("(ga-9ekn2l-a): pick-preflight (wa-ho1ol 2>=2) and dispatch_one "
+            "(wa-zdzc8 4>=4) shapes both parse")
+    else:
+        _bad("(ga-9ekn2l-a)", "pick=%r dispatch=%r" % (ev9a, ev9a2))
+
+    print("\nScenario (ga-9ekn2l-b): the REAL 01:24 evaluating sweep followed by the "
+          "REAL 01:35 whole-sweep deferral — a deferral evaluates nothing, so it must "
+          "NOT supersede the evidence; the TTL still bounds it")
+    _read_pilot_log_lines = lambda: [_REAL_CAP_PICK, _REAL_SWEEP_NORMAL, _REAL_SWEEP_DEFERRED]
+    _t_cap = _ts_epoch(_REAL_CAP_PICK)
+    ev9b_in = _pilot_cap_evidence(_t_cap + 22 * 60)   # the moment this was measured live
+    ev9b_out = _pilot_cap_evidence(_t_cap + PILOT_CAP_EVIDENCE_TTL_SEC + 60)
+    if ev9b_in is not None and "wa-ho1ol" in ev9b_in and ev9b_out is None:
+        _ok("(ga-9ekn2l-b): still evidence 22min after the cap line across a deferral; "
+            "once the newest evaluating sweep is older than the TTL the answer is "
+            "'unmeasured' (None) — not 'measured: nothing capped' ({})")
+    else:
+        _bad("(ga-9ekn2l-b)", "in=%r out=%r" % (ev9b_in, ev9b_out))
+
+    print("\nScenario (ga-9ekn2l-b2): the per-line TTL is what stops a STALE cap line "
+          "riding along with FRESH evidence — an old completed sweep capped x, the "
+          "Pilot then deferred for a long stretch, and the sweep now running caps only "
+          "y: newest proof is fresh (measured), yet x's own line is past the TTL")
+    _read_pilot_log_lines = lambda: [
+        _cap_pick_line(NOW - 3000, "ga-9ekn2l-x"), _sweep_log_line_slots(NOW - 2999, 3, 1),
+        _sweep_deferred_line9(NOW - 100),
+        _cap_pick_line(NOW - 30, "ga-9ekn2l-y"),
+    ]
+    ev9b2 = _pilot_cap_evidence(NOW)
+    if ev9b2 is not None and set(ev9b2) == {"ga-9ekn2l-y"}:
+        _ok("(ga-9ekn2l-b2): fresh in-progress line kept, 50-minute-old line dropped")
+    else:
+        _bad("(ga-9ekn2l-b2)", "got %r, want only ga-9ekn2l-y" % (ev9b2,))
+
+    print("\nScenario (ga-9ekn2l-c): a bead cap-queued in an older sweep but ABSENT "
+          "from a later COMPLETED evaluating sweep is no longer cap-held (both are "
+          "inside the TTL, so only the supersede rule can exclude it)")
+    _read_pilot_log_lines = lambda: [
+        _cap_pick_line(NOW - 1500, "ga-9ekn2l-x"), _cap_pick_line(NOW - 1499, "ga-9ekn2l-y"),
+        _sweep_log_line_slots(NOW - 1498, 3, 1),
+        _cap_pick_line(NOW - 700, "ga-9ekn2l-y"),
+        _sweep_log_line_slots(NOW - 699, 3, 1),
+    ]
+    ev9c = _pilot_cap_evidence(NOW)
+    if ev9c is not None and set(ev9c) == {"ga-9ekn2l-y"}:
+        _ok("(ga-9ekn2l-c): only the bead still capped in the latest evaluating sweep "
+            "remains evidence")
+    else:
+        _bad("(ga-9ekn2l-c)", "got %r, want only ga-9ekn2l-y" % (ev9c,))
+
+    print("\nScenario (ga-9ekn2l-d): lines of the sweep STILL RUNNING (no complete "
+          "line yet) overlay the last completed sweep without disproving it")
+    _read_pilot_log_lines = lambda: [
+        _cap_pick_line(NOW - 900, "ga-9ekn2l-x"), _sweep_log_line_slots(NOW - 899, 3, 1),
+        _cap_pick_line(NOW - 100, "ga-9ekn2l-z"),
+    ]
+    ev9d = _pilot_cap_evidence(NOW)
+    if ev9d is not None and set(ev9d) == {"ga-9ekn2l-x", "ga-9ekn2l-z"}:
+        _ok("(ga-9ekn2l-d): completed-sweep and in-progress-sweep evidence both kept")
+    else:
+        _bad("(ga-9ekn2l-d)", "got %r" % (ev9d,))
+
+    print("\nScenario (ga-9ekn2l-e): root-class:error-vs-empty — unreadable log is "
+          "None, a log that WAS read with no cap lines is {} (never the same value)")
+    _read_pilot_log_lines = lambda: []
+    ev9e_unread = _pilot_cap_evidence(NOW)
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    ev9e_empty = _pilot_cap_evidence(NOW)
+    if ev9e_unread is None and ev9e_empty == {}:
+        _ok("(ga-9ekn2l-e): unreadable -> None, read-but-empty -> {}")
+    else:
+        _bad("(ga-9ekn2l-e)", "unreadable=%r empty=%r" % (ev9e_unread, ev9e_empty))
+
+    print("\nScenario (ga-9ekn2l-f): a cap line with no parseable timestamp is never "
+          "evidence (it cannot be shown to be fresh)")
+    _read_pilot_log_lines = lambda: [
+        "[pilot-dispatcher] ga-in9ebr: ga-9ekn2l-u QUEUED — routed to wa-worker, pool at "
+        "session cap (2 active/creating >= 2 max); not claimed, no writes this sweep",
+        _sweep_log_line_slots(NOW - 60, 3, 1)]
+    ev9f = _pilot_cap_evidence(NOW)
+    if ev9f == {}:
+        _ok("(ga-9ekn2l-f): undatable cap line skipped")
+    else:
+        _bad("(ga-9ekn2l-f)", "got %r" % (ev9f,))
+
+    print("\nScenario (ga-9ekn2l-g): END-TO-END, mirrors wa-ho1ol (1774min, mail "
+          "ga-wisp-frc2n) — front-of-queue bead, the Pilot itself logged the pool at "
+          "its cap, _pool_has_capacity's hand-copied cap still reads 'has capacity', "
+          "the lane has free slots: NO 'dispatch failing'; ONE capacity-wait note that "
+          "claims no flow authority, writes no human-touch row, sends no push")
+    _b9g = "ga-9ekn2l-g"
+    _bd_approved = lambda root: [_make_bead(_b9g, labels=list(_LBL9))]
+    _read_pilot_log_lines = lambda: _cap_log_at(NOW, [_b9g, "ga-9ekn2l-o1", "ga-9ekn2l-o2"])
+    _read_pilot_dispatchable_file = lambda: _dispatchable_front(_b9g)
+    _read_pilot_sweep_pause_state_file = _pause_off
+    _sh = _sh_wa_two_active
+    st = _reset()
+    st["first_seen_approved"][_b9g] = NOW - 1774 * 60
+    run_cycle(NOW, st)
+    _sh = _stub_sh_fast
+    cap9g, df9g = _cap_mails(), _df_mails()
+    _g_problems = []
+    if df9g:
+        _g_problems.append("still alarmed 'dispatch failing': %r" % (df9g,))
+    if len(cap9g) != 1:
+        _g_problems.append("want exactly 1 capacity-wait note, got %d" % len(cap9g))
+    else:
+        _s9g, _b9g_body = cap9g[0]
+        for needle in ("wa-worker", "teto 2", "3 bead(s) na fila", "1774min",
+                       "NÃO é falha de despacho"):
+            if needle not in _s9g:
+                _g_problems.append("subject missing %r: %r" % (needle, _s9g))
+        for needle in ("PILOT_WA_WORKER_MAX", "ga-in9ebr", "gc session list"):
+            if needle not in _b9g_body:
+                _g_problems.append("body missing %r" % needle)
+        if "dispatch path failing" in _b9g_body:
+            _g_problems.append("body still says 'dispatch path failing'")
+    if flow_authority_calls:
+        _g_problems.append("claimed flow authority: %r" % (flow_authority_calls,))
+    if any(n == "human-touch" for n, _ in ledger_calls):
+        _g_problems.append("wrote a human-touch ledger row")
+    if notify_calls:
+        _g_problems.append("pushed a notification: %r" % (notify_calls,))
+    if label_adds or label_removes:
+        _g_problems.append("touched labels: %r %r" % (label_adds, label_removes))
+    if st.get("capacity_wait", {}).get("wa-worker", {}).get("count") != 1:
+        _g_problems.append("capacity_wait state not recorded: %r" % (st.get("capacity_wait"),))
+    if _g_problems:
+        _bad("(ga-9ekn2l-g)", "; ".join(_g_problems))
+    else:
+        _ok("(ga-9ekn2l-g): reclassified — 1 capacity-wait note, 0 'dispatch failing', "
+            "no flow-authority/ledger/push side effects")
+
+    print("\nScenario (ga-9ekn2l-h): falsification — SAME bead and fixtures but the "
+          "latest evaluating sweep logged a cap line only for OTHER beads → STILL "
+          "'dispatch failing' (the fix is not a blanket suppress), and the body says "
+          "the cap was checked and is not the cause")
+    _read_pilot_log_lines = lambda: _cap_log_at(NOW, ["ga-9ekn2l-o1", "ga-9ekn2l-o2"])
+    _sh = _sh_wa_two_active
+    st = _reset()
+    st["first_seen_approved"][_b9g] = NOW - 1774 * 60
+    run_cycle(NOW, st)
+    _sh = _stub_sh_fast
+    df9h, cap9h = _df_mails(), _cap_mails()
+    if (len(df9h) == 1 and not cap9h
+            and "Pool-cap evidence (Pilot log): none for this bead" in df9h[0][1]
+            and flow_authority_calls == ["approved-starve:%s" % _b9g]
+            and any(n == "human-touch" for n, _ in ledger_calls)):
+        _ok("(ga-9ekn2l-h): still alarms; body states the cap was checked and is not "
+            "the cause; the real alarm keeps its flow-authority claim and ledger row")
+    else:
+        _bad("(ga-9ekn2l-h)", "df=%r cap=%r flow=%r ledger=%r" % (
+             [s for s, _ in df9h], [s for s, _ in cap9h], flow_authority_calls,
+             [n for n, _ in ledger_calls]))
+
+    print("\nScenario (ga-9ekn2l-i): falsification — the bead WAS cap-queued, but only "
+          "in an OLDER sweep; the latest evaluating sweep does not list it → STILL "
+          "'dispatch failing' (a stale cap line must not hide a genuine failure)")
+    _read_pilot_log_lines = lambda: [
+        _cap_pick_line(NOW - 1400, _b9g), _sweep_log_line_slots(NOW - 1399, 3, 1),
+        _cap_pick_line(NOW - 700, "ga-9ekn2l-o1"), _sweep_log_line_slots(NOW - 40, 3, 1),
+    ]
+    st = _reset()
+    st["first_seen_approved"][_b9g] = NOW - 1774 * 60
+    run_cycle(NOW, st)
+    if len(_df_mails()) == 1 and not _cap_mails():
+        _ok("(ga-9ekn2l-i): superseded cap line does not suppress")
+    else:
+        _bad("(ga-9ekn2l-i)", "df=%r cap=%r" % (
+             [s for s, _ in _df_mails()], [s for s, _ in _cap_mails()]))
+
+    print("\nScenario (ga-9ekn2l-j): volume — 3 cap-queued beads x every rig → ONE "
+          "note per pool, none inside the backoff, repeat #2 after 1h, and a change "
+          "of the cap itself fires immediately (a per-bead policy would mail once "
+          "per bead as the queue drains)")
+    _beads_j = ["ga-9ekn2l-j0", "ga-9ekn2l-j1", "ga-9ekn2l-j2"]
+    _bd_approved = lambda root: [_make_bead(b, labels=list(_LBL9)) for b in _beads_j]
+    _read_pilot_dispatchable_file = lambda: None
+    st = _reset()
+    for _bj in _beads_j:
+        st["first_seen_approved"][_bj] = NOW - 1774 * 60
+    _read_pilot_log_lines = lambda: _cap_log_at(NOW, _beads_j)
+    run_cycle(NOW, st)
+    n9j1, subj9j1 = len(_cap_mails()), [s for s, _ in _cap_mails()]
+    _reset_captures()
+    _t2 = NOW + 600
+    _read_pilot_log_lines = lambda: _cap_log_at(_t2, _beads_j)
+    run_cycle(_t2, st)
+    n9j2 = len(_cap_mails())
+    _reset_captures()
+    _t3 = NOW + 3700
+    _read_pilot_log_lines = lambda: _cap_log_at(_t3, _beads_j)
+    run_cycle(_t3, st)
+    n9j3, subj9j3 = len(_cap_mails()), [s for s, _ in _cap_mails()]
+    _reset_captures()
+    _t4 = NOW + 4300
+    _read_pilot_log_lines = lambda: _cap_log_at(_t4, _beads_j, live=4, cap=4)
+    run_cycle(_t4, st)
+    n9j4, subj9j4 = len(_cap_mails()), [s for s, _ in _cap_mails()]
+    if (n9j1 == 1 and n9j2 == 0 and n9j3 == 1 and "repeat #2" in subj9j3[0]
+            and n9j4 == 1 and "teto 4" in subj9j4[0] and "repeat" not in subj9j4[0]
+            and not _df_mails()):
+        _ok("(ga-9ekn2l-j): 1 note / 0 inside backoff / repeat #2 at +1h / immediate "
+            "note when the cap moved 2->4; never 'dispatch failing'")
+    else:
+        _bad("(ga-9ekn2l-j)", "n1=%s n2=%s n3=%s(%s) n4=%s(%s)" % (
+             n9j1, n9j2, n9j3, subj9j3, n9j4, subj9j4))
+
+    print("\nScenario (ga-9ekn2l-l): third state — cap evidence UNMEASURED (None) → "
+          "the alarm is kept and its body says NÃO MEDIDO, never 'not held'")
+    _b9l = "ga-9ekn2l-l"
+    _bd_approved = lambda root: [_make_bead(_b9l, labels=list(_LBL9))]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    _read_pilot_dispatchable_file = lambda: None
+    _read_pilot_sweep_pause_state_file = lambda: None
+    st = _reset()
+    st["first_seen_approved"][_b9l] = NOW - 1774 * 60
+    _process_store(RIG_ROOTS[0], NOW, st, True, set(), set())   # cap_evidence defaults to None
+    df9l = _df_mails()
+    if (len(df9l) == 1 and "NÃO MEDIDO" in df9l[0][1]
+            and "none for this bead" not in df9l[0][1] and not _cap_mails()):
+        _ok("(ga-9ekn2l-l): unmeasured cap evidence alarms and says NÃO MEDIDO")
+    else:
+        _bad("(ga-9ekn2l-l)", "df=%r cap=%r" % (df9l, _cap_mails()))
+
+    print("\nScenario (ga-9ekn2l-m): DRY_RUN — a cap-contained bead mails nothing and "
+          "records no capacity_wait state")
+    globals()["DRY_RUN"] = True
+    _bd_approved = lambda root: [_make_bead(_b9g, labels=list(_LBL9))]
+    _read_pilot_log_lines = lambda: _cap_log_at(NOW, [_b9g])
+    _read_pilot_sweep_pause_state_file = _pause_off
+    st = _reset()
+    st["first_seen_approved"][_b9g] = NOW - 1774 * 60
+    run_cycle(NOW, st)
+    globals()["DRY_RUN"] = False
+    if not mail_calls and not st.get("capacity_wait"):
+        _ok("(ga-9ekn2l-m): DRY_RUN sent nothing and recorded nothing")
+    else:
+        _bad("(ga-9ekn2l-m)", "mail=%r state=%r" % (mail_calls, st.get("capacity_wait")))
+
+    print("\nScenario (ga-9ekn2l-o): _prune_state expires a stale capacity_wait entry "
+          "(>7d) and keeps a fresh one")
+    st = _reset()
+    st["capacity_wait"] = {
+        "wa-worker": {"last": NOW - 8 * 86400, "count": 2, "fp": "wa-worker:2"},
+        "ps-worker": {"last": NOW - 3600, "count": 1, "fp": "ps-worker:1"}}
+    _prune_state(st, NOW)
+    if "wa-worker" not in st["capacity_wait"] and "ps-worker" in st["capacity_wait"]:
+        _ok("(ga-9ekn2l-o): stale capacity_wait pruned, fresh kept")
+    else:
+        _bad("(ga-9ekn2l-o)", "got %r" % (st["capacity_wait"],))
+
+    print("\nScenario (ga-9ekn2l-e2): self-audit fix — a READABLE log that holds no "
+          "evaluating sweep at all (only whole-sweep deferrals) is 'don't know' "
+          "(None), never 'measured: nothing is capped' ({})")
+    _read_pilot_log_lines = lambda: [_sweep_deferred_line9(NOW - 900),
+                                     _sweep_deferred_line9(NOW - 300)]
+    ev9e2 = _pilot_cap_evidence(NOW)
+    _read_pilot_log_lines = lambda: [_sweep_deferred_line9(NOW - 300),
+                                     _cap_pick_line(NOW - 100, "ga-9ekn2l-e2")]
+    ev9e2b = _pilot_cap_evidence(NOW)
+    if ev9e2 is None and ev9e2b is not None and "ga-9ekn2l-e2" in ev9e2b:
+        _ok("(ga-9ekn2l-e2): deferral-only log -> None; a datable cap line proves "
+            "a sweep evaluated -> measured")
+    else:
+        _bad("(ga-9ekn2l-e2)", "deferral-only=%r with-cap-line=%r" % (ev9e2, ev9e2b))
+
+    print("\nScenario (ga-9ekn2l-f2): self-audit fix — a cap line dated in the FUTURE "
+          "beyond the clock-skew allowance is dropped (a stepped clock must not make "
+          "old evidence look fresh); one inside the allowance is kept")
+    _read_pilot_log_lines = lambda: [
+        _cap_pick_line(NOW + 3600, "ga-9ekn2l-future"),
+        _cap_pick_line(NOW + 60, "ga-9ekn2l-skew"),
+        _sweep_log_line_slots(NOW - 10, 3, 1)]
+    # list order is chronological order; the timestamps are deliberately NOT — that is
+    # what a stepped clock looks like. Both cap lines belong to the sweep that ends at
+    # the complete line, so only the future-dating rule can tell them apart.
+    ev9f2 = _pilot_cap_evidence(NOW)
+    # ...and if the ONLY evaluation proof is future-dated, it must not count as a fresh
+    # measurement either: unmeasured (None), not "measured: nothing capped" ({}).
+    _read_pilot_log_lines = lambda: [_cap_pick_line(NOW + 3600, "ga-9ekn2l-future")]
+    ev9f2b = _pilot_cap_evidence(NOW)
+    if ev9f2 is not None and set(ev9f2) == {"ga-9ekn2l-skew"} and ev9f2b is None:
+        _ok("(ga-9ekn2l-f2): +3600s dropped, +60s kept; future-only proof -> unmeasured")
+    else:
+        _bad("(ga-9ekn2l-f2)", "got %r; future-only=%r" % (ev9f2, ev9f2b))
+
+    print("\nScenario (ga-9ekn2l-p): a CORRUPT capacity_wait record (non-numeric "
+          "'count') must not abort the rig's cycle — the note still goes out. ('last' "
+          "is deliberately left numeric: a corrupt 'last' never gets this far, the "
+          "shared _prune_state() at the top of run_cycle() trips on it first — a "
+          "pre-existing fragility of every state bucket, not this change's scope)")
+    _b9p = "ga-9ekn2l-p"
+    _bd_approved = lambda root: [_make_bead(_b9p, labels=list(_LBL9))]
+    _read_pilot_log_lines = lambda: _cap_log_at(NOW, [_b9p])
+    _read_pilot_dispatchable_file = lambda: None
+    _read_pilot_sweep_pause_state_file = _pause_off
+    st = _reset()
+    st["first_seen_approved"][_b9p] = NOW - 1774 * 60
+    st["capacity_wait"] = {"wa-worker": {"last": NOW - 60, "count": "x", "fp": "wa-worker:2"}}
+    _p_exc = None
+    try:
+        run_cycle(NOW, st)
+    except Exception as _e:   # run_cycle fail-opens per rig, so also inspect the log below
+        _p_exc = _e
+    if _p_exc is None and len(_cap_mails()) == 1 and st["capacity_wait"]["wa-worker"]["count"] == 1:
+        _ok("(ga-9ekn2l-p): corrupt record treated as 'no prior note'; note sent, "
+            "state rewritten clean")
+    else:
+        _bad("(ga-9ekn2l-p)", "exc=%r mails=%r state=%r" % (
+             _p_exc, [s for s, _ in _cap_mails()], st.get("capacity_wait")))
+
+    print("\nScenario (ga-9ekn2l-q): a FAILED mail send is logged (never silent); "
+          "state is still recorded, same convention as _alarm_starving")
+    import io as _io9, contextlib as _ctx9
+    _do_mail_mayor = lambda subject, body: False
+    _bd_approved = lambda root: [_make_bead(_b9p, labels=list(_LBL9))]
+    st = _reset()
+    st["first_seen_approved"][_b9p] = NOW - 1774 * 60
+    _q_buf = _io9.StringIO()
+    with _ctx9.redirect_stdout(_q_buf):
+        run_cycle(NOW, st)
+    _do_mail_mayor = _stub_mail
+    if ("capacity-wait mail" in _q_buf.getvalue() and "FAILED" in _q_buf.getvalue()
+            and st.get("capacity_wait", {}).get("wa-worker", {}).get("count") == 1):
+        _ok("(ga-9ekn2l-q): failed send logged WARN; state recorded")
+    else:
+        _bad("(ga-9ekn2l-q)", "log=%r state=%r" % (
+             [l for l in _q_buf.getvalue().splitlines() if "capacity" in l][:3],
+             st.get("capacity_wait")))
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
