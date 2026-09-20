@@ -13,8 +13,18 @@
 # identical to the embedded order.
 #
 # Verify after a reload:  gc order show mol-dog-reaper   -> Source: .../town-deltas/...
+#
+# ga-x2fj8h: `timeout` is now declared. An exec order that declares none gets the engine
+# default of 300 s (orders.Order.TimeoutOrDefault), and the script's wall-clock budgets add
+# up: GC_REAPER_PURGE_BUDGET_S 240 + GC_REAPER_ORPHAN_BUDGET_S 180, plus the fixed work
+# (session prune, stale-wisp close, the Dolt commit, the summary) — 8 minutes in the worst
+# case. A run the runner kills half-way loses the Dolt commit AND the DOG_DONE summary
+# (with its anomaly mail). Steady-state runs take ~1 min, which is why nobody noticed the
+# ceiling. 900 s covers the budgets with margin; reaper-orphan-sweep.selftest.sh (O13)
+# fails if the budgets are ever raised past it.
 [order]
 description = "Reap stale wisps and purge closed molecules"
 exec = "$PACK_DIR/assets/scripts/reaper.sh"
 trigger = "cooldown"
 interval = "30m"
+timeout = "900s"

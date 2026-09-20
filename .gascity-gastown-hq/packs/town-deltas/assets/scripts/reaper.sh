@@ -45,6 +45,68 @@
 #  5. Anomaly mail to the mayor is deduplicated (same anomaly text is not
 #     re-sent within GC_REAPER_ANOMALY_MAIL_TTL_S, default 6h): the reaper runs
 #     every 30 min on every rig.
+#  6. ga-x2fj8h — THE CHUNK THAT FAILED, AND THE 2.9M ORPHANS NOBODY LOOKED AT.
+#     (a) purge_chunk sent five DELETEs as ONE multi-statement bounded by WISPS (500
+#         ids). Rows per wisp are not bounded (a live wisp owns up to ~1000 wisp_events
+#         rows, measured 19/09) and wisp_events is a 1.9M-row table keyed by a random
+#         uuid, so removing a row is a random read. One statement could therefore run
+#         past Dolt's 30 s read cutoff ("error on line 6 for query DELETE FROM
+#         hq.wisp_events"), and because the loop stopped at the FIRST failed chunk and
+#         the oldest candidates are always retried first, one heavy chunk could stall
+#         the whole purge. Now every child delete is ROW-bounded (DELETE ... LIMIT n in
+#         a loop), adaptive (a slow or failed statement halves the batch and is
+#         retried), a failed chunk is skipped (a circuit breaker stops the purge after
+#         GC_REAPER_PURGE_MAX_CONSEC_FAIL in a row) and the failure reaches the
+#         DOG_DONE summary (purge_failed_chunks, last_error), not only the mail.
+#         Partial state after a failed chunk is harmless BY DESIGN: children go first
+#         and the wisps row last, so a half-emptied wisp is still a purge candidate
+#         next run — never an orphan. The statements are separate auto-commits: the
+#         chunk is idempotent (safe to retry), not atomic.
+#     (b) ORPHAN SWEEP (step 2b). The purge above stops CREATING orphans; the ones
+#         already there (wisps hard-deleted before ga-u8nbt9 without their children:
+#         measured on the live hq at 19/09 22:08 BRT — 1,871,768 wisp_events and
+#         ~674k wisp_labels; wisp_comments and wisp_dependencies had none) were never
+#         looked at again. Each run removes, within
+#         GC_REAPER_ORPHAN_BUDGET_S, child rows whose wisp no longer exists: selected by
+#         an anti-join with a LIMIT (index-ordered, stops early), deleted by issue_id
+#         with the SAME NOT EXISTS re-checked inside the DELETE, so a row of a live wisp
+#         cannot be removed even if the selection was stale. Never by age. It doubles as
+#         the detector: a run that sweeps more than GC_REAPER_ORPHAN_ALERT rows means
+#         something still deletes wisps without their children, and says so.
+#         A failed selection is NOT "no orphans" (get_sql_rows leaves the result empty
+#         either way): SQL_ROWS_FAILED tells them apart.
+#     (c) SAFETY RAILS of the sweep, and why (measured 19/09 on a scaled replica of hq.wisp_events:
+#         same DDL and row mix, a scratch Dolt with the live auto-GC config, 229k orphans of 237k
+#         rows). Deleting them cost ~3 KB of TRANSIENT disk per row — the size peaked at +714 MB over
+#         a 177 MB baseline, then auto-GC folded it back to 8 MB — and it made no difference
+#         whether the rows went by issue_id (this script) or by primary-key range (+791 MB), so a
+#         cleverer delete order does not buy the disk back (why was not isolated; the three
+#         indexes of the table cannot all be clustered by one order, and are the suspect). The live
+#         volume sat at 96% (8.3 GiB free), and an unbounded drain of 1.87M rows is ~5.6 GB of
+#         peak. Hence: a ROW cap per run (GC_REAPER_ORPHAN_MAX_ROWS, so what one run adds before
+#         auto-GC catches up is bounded — HARD, never exceeded: the last DELETE batch is shrunk to
+#         what is left of the allowance, because one sampled round can name wisps owning far more
+#         rows than the sample), a FREE-DISK floor re-read every round
+#         (GC_REAPER_ORPHAN_MIN_FREE_GB; an unreadable df is "cannot tell", not "enough"), no sweep
+#         after the purge's failure breaker tripped (Dolt is unwell), and no delete at all while
+#         `wisps` is empty or unreadable (NOT EXISTS against an empty table makes EVERY child row
+#         an orphan). A halted sweep is counted and named in the DOG_DONE line
+#         (orphan_halted_dbs, orphan_halt) — never a silent skip.
+#         LIVE CORRECTION (measured on the real hq, 19/09 23:31, 12,000 orphan events deleted with
+#         this script's statement shape): +97 MB, i.e. ~8 KB per row (2.7x the replica), and it did
+#         NOT fold back. The orphans live in oldgen, which the default GC (`CALL dolt_gc()` — all
+#         the 2-hourly dolt-gc-maintenance job ever runs) never collects; only `dolt gc --full`
+#         does. So a delete-based drain ADDS disk until a full GC. That job is itself gated on
+#         free space of max(200% of the store, store + 3 GB) (~15 GiB for the 7.6 GB hq) and had
+#         skipped 26 cycles running (~52 h) on 19/09. Hence the free-disk floor defaults to 18 GiB:
+#         ABOVE that gate (and above the disk-floor guard's WARN of 8 GiB), so the sweep can never
+#         eat the headroom the GC needs to give space back. On a disk as full as 19/09's the sweep
+#         is inert by design (orphan_halt says why); it works once space is freed, or after a
+#         table rebuild (bead ga-x2fj8h / ga-5dggst). Space is returned only by a full GC: this
+#         script never runs gc.
+#         The order declares timeout = "900s" (orders/mol-dog-reaper.toml): the engine default for
+#         an exec order is 300 s, and PURGE_BUDGET_S 240 + ORPHAN_BUDGET_S 180 + the fixed work
+#         can pass it.
 set -euo pipefail
 
 # Trace bd invocations to $GC_BD_TRACE when set (no-op otherwise).
@@ -73,6 +135,24 @@ PURGE_MAX_PER_RUN="${GC_REAPER_PURGE_MAX_PER_RUN:-5000}" # wisps per database pe
 PURGE_BUDGET_S="${GC_REAPER_PURGE_BUDGET_S:-240}"      # wall-clock budget for all chunks
 ISSUE_STEPS="${GC_REAPER_ISSUE_STEPS:-}"               # empty = steps 3/4 OFF (see header)
 ANOMALY_MAIL_TTL_S="${GC_REAPER_ANOMALY_MAIL_TTL_S:-21600}"
+# ga-x2fj8h: child rows are deleted in ROW-bounded statements (a wisp owns an unbounded
+# number of rows), and orphan child rows are swept (see header note 6).
+PURGE_ROW_BATCH="${GC_REAPER_PURGE_ROW_BATCH:-1000}"           # child rows per DELETE statement
+PURGE_STMT_SLOW_S="${GC_REAPER_PURGE_STMT_SLOW_S:-8}"          # a statement this slow halves the batch (Dolt cuts at 30 s)
+PURGE_STMT_TRIES="${GC_REAPER_PURGE_STMT_TRIES:-3}"            # attempts per statement; each retry halves the batch
+PURGE_RETRY_PAUSE_S="${GC_REAPER_PURGE_RETRY_PAUSE_S:-2}"      # breather before a retry (a timed-out statement means Dolt is hot)
+PURGE_MAX_CONSEC_FAIL="${GC_REAPER_PURGE_MAX_CONSEC_FAIL:-3}"  # failed chunks in a row before the purge gives up this run
+ORPHAN_SWEEP="${GC_REAPER_ORPHAN_SWEEP:-1}"                    # 0 switches the orphan sweep off
+ORPHAN_SELECT_ROWS="${GC_REAPER_ORPHAN_SELECT_ROWS:-2000}"     # orphan rows sampled per round (their wisp ids are then swept)
+ORPHAN_BUDGET_S="${GC_REAPER_ORPHAN_BUDGET_S:-180}"            # wall-clock budget of the whole sweep, all databases
+ORPHAN_ALERT="${GC_REAPER_ORPHAN_ALERT:-5000}"                 # sweeping more than this in one run is an anomaly
+ORPHAN_PAUSE_S="${GC_REAPER_ORPHAN_PAUSE_S:-0.2}"              # breather between rounds (Dolt is hot)
+# A deleted child row costs ~8 KB of disk on the live hq (measured 19/09; ~3 KB on a small replica)
+# and only a `dolt gc --full` gives it back (header note 6c). So a run is bounded in ROWS as well as
+# in time, and refuses to work below a free-disk floor that sits ABOVE the headroom gate of the GC
+# job (max(200% of the store, store + 3 GB): ~15 GiB for the 7.6 GB hq) and the disk guard's WARN.
+ORPHAN_MAX_ROWS="${GC_REAPER_ORPHAN_MAX_ROWS:-100000}"         # rows ONE run may sweep, all databases
+ORPHAN_MIN_FREE_GB="${GC_REAPER_ORPHAN_MIN_FREE_GB:-18}"       # no sweep below this much free disk on the city volume (0 = guard off)
 
 # Convert Go durations to SQL INTERVAL hours for Dolt.
 duration_to_hours() {
@@ -182,11 +262,35 @@ SCHEMA_SKIPPED_DBS=0
 TOTAL_WOULD_PURGE=0
 PURGE_BATCHES=0
 PURGE_CAPPED_DBS=0
+# ga-x2fj8h counters — a chunk that failed for good, and what the orphan sweep did, reach the
+# summary too. PURGE_LAST_ERROR keeps a SHORT head+tail of the last failed statement's error so
+# the DOG_DONE line names the cause (the mail carries the whole text).
+PURGE_FAILED_CHUNKS=0
+PURGE_CHILD_ROWS=0
+PURGE_LAST_ERROR=""
+ORPHAN_SWEPT=0
+ORPHAN_CAPPED_DBS=0
+ORPHAN_FAILED=0
+ORPHAN_HALTED_DBS=0    # a safety rail cut the sweep of a database short (disk floor, Dolt unwell, empty wisps)
+ORPHAN_HALT_REASON=""  # short, comma-free: the LAST such reason, for the DOG_DONE line
+PURGE_TRIPPED=0        # the purge's consecutive-failure breaker fired in this run: Dolt is unwell
+TOTAL_WOULD_SWEEP=0
+ORPHAN_DEADLINE=""   # $SECONDS value the sweep must stop at; set lazily by its first use
 PURGE_START_EPOCH=$(date +%s)
 ANOMALIES=""
 
 sanitize_output() {
     printf '%s' "$1" | tr '\n' ' ' | cut -c1-4000
+}
+
+# ga-x2fj8h: Dolt echoes the FAILING STATEMENT inside its error ("error on line N for query <sql>:
+# <cause>"), and the purge/sweep statements carry IN (<hundreds of ids>) lists: measured on real Dolt,
+# a failing 500-id DELETE answers ~10 KB with the CAUSE at the very end, so the 4000-char head cut of
+# sanitize_output kept the ids and dropped the cause (the DOG_DONE last_error and the mail never said
+# WHY). The lists also differ every run, which defeated the anomaly-mail dedupe (keyed on the text).
+# Collapse them to IN (...) before anything is truncated.
+strip_id_lists() {
+    printf '%s' "$1" | tr '\n' ' ' | sed -E 's/IN \([^)]*\)/IN (...)/g'
 }
 
 record_anomaly() {
@@ -225,6 +329,30 @@ validate_num PURGE_BATCH 500 1
 validate_num PURGE_MAX_PER_RUN 5000 1
 validate_num PURGE_BUDGET_S 240 1
 validate_num ANOMALY_MAIL_TTL_S 21600 0
+validate_num PURGE_ROW_BATCH 1000 50
+validate_num PURGE_STMT_SLOW_S 8 1
+validate_num PURGE_STMT_TRIES 3 1
+validate_num PURGE_RETRY_PAUSE_S 2 0
+validate_num PURGE_MAX_CONSEC_FAIL 3 1
+validate_num ORPHAN_SELECT_ROWS 2000 50
+validate_num ORPHAN_BUDGET_S 180 1
+validate_num ORPHAN_ALERT 5000 1
+validate_num ORPHAN_MAX_ROWS 100000 2   # 2, not 1: a one-row DELETE is never sent (delete_rows_bounded), so a cap of 1 would sweep nothing
+validate_num ORPHAN_MIN_FREE_GB 18 0
+case "$ORPHAN_SWEEP" in
+    0|1) ;;
+    *)
+        record_anomaly "config" "GC_REAPER_ORPHAN_SWEEP='$ORPHAN_SWEEP' is not 0 or 1; using the default 1"
+        ORPHAN_SWEEP=1
+        ;;
+esac
+# A decimal number of seconds (sleep accepts a fraction): digits with at most one dot.
+case "$ORPHAN_PAUSE_S" in
+    ''|.|*[!0-9.]*|*.*.*)
+        record_anomaly "config" "GC_REAPER_ORPHAN_PAUSE_S='$ORPHAN_PAUSE_S' is not a number of seconds; using the default 0.2"
+        ORPHAN_PAUSE_S=0.2
+        ;;
+esac
 
 # ga-u8nbt9: `SHOW DATABASES` failing (Dolt down, connection cut at the 30 s read
 # timeout) leaves DATABASES empty, which the loop below reads as "no work" and the
@@ -323,6 +451,12 @@ get_sql_count() {
 }
 
 SQL_ROWS_RESULT=""
+# ga-x2fj8h: an EMPTY SQL_ROWS_RESULT means either "no rows" or "no answer" — this function
+# returns 0 for both (a failure is only recorded as an anomaly). A caller that acts on
+# "no rows" (the orphan sweep: "no orphans left, the table is clean") must read
+# SQL_ROWS_FAILED, or a query cut at Dolt's 30 s read timeout reads as a clean table.
+SQL_ROWS_FAILED=0
+SQL_ROWS_ERR=""
 get_sql_rows() {
     local db="$1"
     local label="$2"
@@ -332,14 +466,20 @@ get_sql_rows() {
     local stderr_output
 
     SQL_ROWS_RESULT=""
+    SQL_ROWS_FAILED=0
+    SQL_ROWS_ERR=""
     if ! stderr_file=$(mktemp); then
-        record_anomaly "$db" "$label query failed for $db: could not create stderr capture file"
+        SQL_ROWS_FAILED=1
+        SQL_ROWS_ERR="$label query failed for $db: could not create stderr capture file"
+        record_anomaly "$db" "$SQL_ROWS_ERR"
         return 0
     fi
     if ! output=$(dolt_sql -r csv -q "$query" 2>"$stderr_file"); then
         stderr_output=$(cat "$stderr_file" 2>/dev/null || true)
         rm -f "$stderr_file"
-        record_anomaly "$db" "$label query failed for $db: $(sanitize_output "$stderr_output $output")"
+        SQL_ROWS_FAILED=1
+        SQL_ROWS_ERR="$label query failed for $db: $(sanitize_output "$stderr_output $output")"
+        record_anomaly "$db" "$SQL_ROWS_ERR"
         return 0
     fi
     rm -f "$stderr_file"
@@ -410,7 +550,11 @@ close_city_issue() {
     )
 }
 
-run_sql_change() {
+# ga-x2fj8h: run_sql_change_quiet is the original run_sql_change WITHOUT recording the failure:
+# the text is left in SQL_CHANGE_ERR and the CALLER decides — retry with a smaller batch, or
+# give up and raise the anomaly. A statement retried three times must not become three mails.
+SQL_CHANGE_ERR=""
+run_sql_change_quiet() {
     local db="$1"
     local label="$2"
     local query="$3"
@@ -420,8 +564,9 @@ run_sql_change() {
     local stderr_output
 
     SQL_CHANGE_ROWS_RESULT=0
+    SQL_CHANGE_ERR=""
     if ! stderr_file=$(mktemp); then
-        record_anomaly "$db" "$label failed for $db: could not create stderr capture file"
+        SQL_CHANGE_ERR="$label failed for $db: could not create stderr capture file"
         return 1
     fi
     # DML (DELETE/UPDATE) against a database-qualified table still needs an
@@ -436,7 +581,7 @@ SELECT ROW_COUNT();
     " 2>"$stderr_file"); then
         stderr_output=$(cat "$stderr_file" 2>/dev/null || true)
         rm -f "$stderr_file"
-        record_anomaly "$db" "$label failed for $db: $(sanitize_output "$stderr_output $output")"
+        SQL_CHANGE_ERR="$label failed for $db: $(sanitize_output "$(strip_id_lists "$stderr_output $output")")"
         return 1
     fi
     stderr_output=$(cat "$stderr_file" 2>/dev/null || true)
@@ -444,12 +589,109 @@ SELECT ROW_COUNT();
 
     rows=$(printf '%s\n' "$output" | tail -1 | tr -d '\r')
     if [ -z "$rows" ] || ! [[ "$rows" =~ ^[0-9]+$ ]]; then
-        record_anomaly "$db" "$label returned non-numeric row count for $db: $(sanitize_output "$stderr_output $output")"
+        SQL_CHANGE_ERR="$label returned non-numeric row count for $db: $(sanitize_output "$(strip_id_lists "$stderr_output $output")")"
         return 1
     fi
 
     SQL_CHANGE_ROWS_RESULT="$rows"
     return 0
+}
+
+run_sql_change() {
+    if run_sql_change_quiet "$@"; then
+        return 0
+    fi
+    record_anomaly "$1" "$SQL_CHANGE_ERR"
+    return 1
+}
+
+# ga-x2fj8h: one line, no commas or quotes (the DOG_DONE summary is comma-separated), keeping
+# the HEAD (what failed, where) and the TAIL (the cause) of a long error text.
+short_error() {
+    printf '%s' "$1" | tr '\n,"' '   ' | tr -s ' ' \
+        | awk '{ s = $0; if (length(s) > 240) s = substr(s, 1, 70) " ... " substr(s, length(s) - 150); print s }'
+}
+
+# A statement gave up for good: mail it (anomaly) AND keep a short form for the DOG_DONE summary.
+note_failure() {  # note_failure <db> <full error text>
+    PURGE_LAST_ERROR=$(short_error "$2")
+    record_anomaly "$1" "$2"
+}
+
+# ga-x2fj8h: DELETE the rows of <table> matching <where>, in ROW-bounded statements, until none
+# remain. Rows per wisp are unbounded and removing a wisp_events row is a random read (uuid key,
+# 1.9M rows): one big statement can run past Dolt's 30 s cutoff, so the bound is on ROWS.
+#  * adaptive: a statement slower than PURGE_STMT_SLOW_S halves the next batch; a FAILED one is
+#    retried (PURGE_STMT_TRIES attempts) with half the batch. The floor is 50 rows.
+#  * a batch that removes fewer rows than asked for means nothing matching is left (measured
+#    against real Dolt: ROW_COUNT() after DELETE ... LIMIT n is exact).
+#  * the optional <max-rows> is a cap that is NEVER exceeded by this call (0 = none): the last
+#    batch is shrunk to what is left of the allowance (and a remainder of a single row is left
+#    for the next run — see the check below). It is a cap on ROWS, not on rounds: the orphan
+#    sweep hands the whole "sampled wisp ids" set to one call, and a wisp owns up to ~1000 rows,
+#    so a per-round check alone let one round delete every row of the sampled wisps and blow
+#    through GC_REAPER_ORPHAN_MAX_ROWS (found by selftest O14: cap 25, 120 rows swept). The
+#    disk-transient bound of header note 6c needs the hard form.
+# Sets CHILD_ROWS_DELETED (rows removed by THIS call, even when it fails part-way) and
+# CHILD_DELETE_ERR. Returns 0 = nothing left; 1 = failed for good; 2 = the deadline (a $SECONDS
+# value; empty = none) passed while rows remain; 3 = <max-rows> was reached (rows may remain).
+CHILD_ROWS_DELETED=0
+CHILD_DELETE_ERR=""
+delete_rows_bounded() {  # delete_rows_bounded <db> <table> <where> [<deadline>] [<max-rows>]
+    local db="$1" table="$2" where="$3" deadline="${4:-}" max_rows="${5:-0}"
+    local limit="$PURGE_ROW_BATCH" tries=0 t0 dt use remaining
+
+    CHILD_ROWS_DELETED=0
+    CHILD_DELETE_ERR=""
+    while :; do
+        if [ -n "$deadline" ] && [ "$SECONDS" -ge "$deadline" ]; then
+            return 2
+        fi
+        use=$limit
+        if [ "$max_rows" -gt 0 ]; then
+            remaining=$((max_rows - CHILD_ROWS_DELETED))
+            # A one-row statement is never sent, so a remainder of 1 is left for the next run: on
+            # this Dolt, DELETE ... LIMIT 1 on a table that carries a foreign key (wisp_dependencies)
+            # answers ROW_COUNT() = -1 although the row IS removed (measured with `dolt sql`; every
+            # other LIMIT and every other table counts exactly), and the row-count check reads -1 as
+            # a failed statement and retries it — the row is gone but uncounted, and the sweep
+            # raises a false "removed nothing" anomaly (selftest O8b).
+            if [ "$remaining" -lt 2 ]; then
+                return 3
+            fi
+            if [ "$use" -gt "$remaining" ]; then
+                use=$remaining
+            fi
+        fi
+        t0=$SECONDS
+        if run_sql_change_quiet "$db" "purging $table rows" \
+            "DELETE FROM \`$db\`.$table WHERE $where LIMIT $use"; then
+            tries=0
+            CHILD_ROWS_DELETED=$((CHILD_ROWS_DELETED + SQL_CHANGE_ROWS_RESULT))
+            if [ "$SQL_CHANGE_ROWS_RESULT" -lt "$use" ]; then
+                return 0
+            fi
+            dt=$((SECONDS - t0))
+            if [ "$dt" -ge "$PURGE_STMT_SLOW_S" ] && [ "$limit" -gt 50 ]; then
+                limit=$((limit / 2))
+                [ "$limit" -lt 50 ] && limit=50
+            elif [ "$dt" -lt $((PURGE_STMT_SLOW_S / 4)) ] && [ "$limit" -lt "$PURGE_ROW_BATCH" ]; then
+                # Dolt has calmed down: grow back toward the configured batch, so one slow
+                # moment does not leave the rest of a long drain crawling at tiny batches.
+                limit=$((limit * 2))
+                [ "$limit" -gt "$PURGE_ROW_BATCH" ] && limit=$PURGE_ROW_BATCH
+            fi
+        else
+            tries=$((tries + 1))
+            CHILD_DELETE_ERR="$SQL_CHANGE_ERR"
+            if [ "$tries" -ge "$PURGE_STMT_TRIES" ]; then
+                return 1
+            fi
+            limit=$((limit / 2))
+            [ "$limit" -lt 50 ] && limit=50
+            sleep "$PURGE_RETRY_PAUSE_S"
+        fi
+    done
 }
 
 # ga-u8nbt9: purge closed wisps older than PURGE_AGE_H hours.
@@ -488,24 +730,55 @@ purge_candidate_sql() {  # purge_candidate_sql <db> <select-list> [<tail>]
     "
 }
 
-purge_chunk() {  # purge_chunk <db> <quoted-id-list>; returns 1 when the SQL failed
+# ga-x2fj8h: this used to be ONE multi-statement of five DELETEs bounded by wisps (500 ids). A
+# failure in the third (wisp_events, "error on line 6") left the labels and comments already gone,
+# stopped the whole purge, and the next run retried the very same oldest chunk. Now each child
+# table is drained in ROW-bounded statements (delete_rows_bounded) — children first, the wisps
+# rows LAST — so a chunk that fails part-way leaves half-emptied wisps that are still purge
+# candidates (idempotent: the next run finishes them), never orphans.
+# Returns 0 = the chunk is purged; 1 = a statement failed for good (recorded, in the summary);
+# 2 = the time budget ran out while rows remain (nothing failed; the work carries over).
+purge_chunk() {  # purge_chunk <db> <quoted-id-list> <seconds-allowed>
     local db="$1"
     local list="$2"
+    local allowed="$3"
+    local deadline=$((SECONDS + allowed))
+    local table
+    local rc
+    local try=0
 
-    if run_sql_change "$db" "purging closed wisps" "
-        DELETE FROM \`$db\`.wisp_labels WHERE issue_id IN ($list);
-        DELETE FROM \`$db\`.wisp_comments WHERE issue_id IN ($list);
-        DELETE FROM \`$db\`.wisp_events WHERE issue_id IN ($list);
-        DELETE FROM \`$db\`.wisp_dependencies WHERE issue_id IN ($list);
-        DELETE FROM \`$db\`.wisps WHERE id IN ($list)
-    "; then
-        DB_PURGED=$((DB_PURGED + SQL_CHANGE_ROWS_RESULT))
-        TOTAL_PURGED=$((TOTAL_PURGED + SQL_CHANGE_ROWS_RESULT))
-        DB_MUTATIONS=$((DB_MUTATIONS + SQL_CHANGE_ROWS_RESULT))
-        PURGE_BATCHES=$((PURGE_BATCHES + 1))
-        return 0
-    fi
-    return 1
+    for table in wisp_labels wisp_comments wisp_events wisp_dependencies; do
+        rc=0
+        delete_rows_bounded "$db" "$table" "issue_id IN ($list)" "$deadline" || rc=$?
+        PURGE_CHILD_ROWS=$((PURGE_CHILD_ROWS + CHILD_ROWS_DELETED))
+        DB_MUTATIONS=$((DB_MUTATIONS + CHILD_ROWS_DELETED))
+        case "$rc" in
+            0) ;;
+            2) return 2 ;;
+            *)
+                PURGE_FAILED_CHUNKS=$((PURGE_FAILED_CHUNKS + 1))
+                note_failure "$db" "$CHILD_DELETE_ERR"
+                return 1
+                ;;
+        esac
+    done
+
+    while :; do
+        if run_sql_change_quiet "$db" "purging closed wisps" "DELETE FROM \`$db\`.wisps WHERE id IN ($list)"; then
+            DB_PURGED=$((DB_PURGED + SQL_CHANGE_ROWS_RESULT))
+            TOTAL_PURGED=$((TOTAL_PURGED + SQL_CHANGE_ROWS_RESULT))
+            DB_MUTATIONS=$((DB_MUTATIONS + SQL_CHANGE_ROWS_RESULT))
+            PURGE_BATCHES=$((PURGE_BATCHES + 1))
+            return 0
+        fi
+        try=$((try + 1))
+        if [ "$try" -ge "$PURGE_STMT_TRIES" ]; then
+            PURGE_FAILED_CHUNKS=$((PURGE_FAILED_CHUNKS + 1))
+            note_failure "$db" "$SQL_CHANGE_ERR"
+            return 1
+        fi
+        sleep "$PURGE_RETRY_PAUSE_S"
+    done
 }
 
 purge_closed_wisps() {  # purge_closed_wisps <db>
@@ -519,6 +792,8 @@ purge_closed_wisps() {  # purge_closed_wisps <db>
     local bad=0
     local capped=0
     local elapsed
+    local consec=0
+    local rc
 
     if [ -n "$DRY_RUN" ]; then
         get_sql_count "$db" "closed wisp purge (dry run)" "$(purge_candidate_sql "$db" 'COUNT(*)')"
@@ -565,10 +840,30 @@ purge_closed_wisps() {  # purge_closed_wisps <db>
         done <<< "$chunk"
         [ -n "$list" ] || continue
 
-        if ! purge_chunk "$db" "$list"; then
-            capped=1   # the SQL failure is already an anomaly; work remains
-            break
-        fi
+        # ga-x2fj8h: the chunk is handed what is LEFT of the budget as a deadline, so it cannot run
+        # on past it (before, one 500-wisp DELETE alone could outlast the whole budget).
+        # A chunk that FAILED (recorded, counted in the summary) no longer stops the purge: it
+        # stays a candidate and the others still go — but PURGE_MAX_CONSEC_FAIL failures in a row
+        # mean Dolt is unwell, and hammering it further would only make it worse.
+        rc=0
+        purge_chunk "$db" "$list" $((PURGE_BUDGET_S - elapsed)) || rc=$?
+        case "$rc" in
+            0)
+                consec=0
+                ;;
+            2)
+                capped=1   # out of time with rows remaining — nothing failed; the next run carries on
+                break
+                ;;
+            *)
+                capped=1   # the failure is already an anomaly; the chunk is retried next run
+                consec=$((consec + 1))
+                if [ "$consec" -ge "$PURGE_MAX_CONSEC_FAIL" ]; then
+                    PURGE_TRIPPED=1   # the orphan sweep reads this: no piling on an unwell Dolt
+                    break
+                fi
+                ;;
+        esac
     done
 
     if [ "$bad" -gt 0 ]; then
@@ -576,6 +871,219 @@ purge_closed_wisps() {  # purge_closed_wisps <db>
     fi
     if [ "$capped" -eq 1 ]; then
         PURGE_CAPPED_DBS=$((PURGE_CAPPED_DBS + 1))
+    fi
+    return 0
+}
+
+# ga-x2fj8h — step 2b: sweep ORPHAN child rows, i.e. rows of wisp_comments / wisp_dependencies /
+# wisp_labels / wisp_events whose wisp no longer exists.
+#  * SELECT: an anti-join with a LIMIT. It is index-ordered on issue_id, so it stops as soon as it
+#    has ORPHAN_SELECT_ROWS orphan rows (measured 19/09 on the 1.9M-row wisp_events: ~0.5 ms per
+#    row; the same anti-join WITHOUT a limit costs 15-25 s, right at Dolt's 30 s cutoff).
+#  * DELETE: by issue_id (indexed), ROW-bounded (delete_rows_bounded), with the SAME NOT EXISTS
+#    re-checked inside the statement — a row of a live wisp cannot be removed even if the sample
+#    was stale. Only "the wisp is gone" qualifies; never age.
+#  * A failed SELECT is NOT "no orphans" (SQL_ROWS_FAILED): it is reported, and the table skipped.
+#  * Small tables first, so a run that runs out of budget has still finished them. The whole sweep
+#    is bounded by ORPHAN_BUDGET_S of wall-clock ($SECONDS: no fork, and independent of the `date`
+#    the purge budget reads); what is left is reported (orphan_capped_dbs) and carries over.
+#  * Safety rails (header note 6c): a ROW cap per run, a free-disk floor, no sweep after the purge's
+#    failure breaker tripped, and no delete at all while `wisps` looks empty (NOT EXISTS against an
+#    empty table makes EVERY child row an "orphan").
+DB_ORPHANS=0
+
+# Free KB of the volume the city — and so the Dolt data dir — lives on; empty when unreadable.
+orphan_free_kb() {
+    df -Pk "$CITY_ABS" 2>/dev/null | awk 'NR==2 { print $4 }'
+}
+
+# 0 = enough free disk (or the guard is off); 1 = below the floor; 2 = the free space could not be
+# read. "Cannot tell" is NOT "enough": a destructive job that needs headroom stays inert.
+ORPHAN_FREE_KB=""
+orphan_disk_state() {
+    ORPHAN_FREE_KB=""
+    [ "$ORPHAN_MIN_FREE_GB" -gt 0 ] || return 0
+    ORPHAN_FREE_KB=$(orphan_free_kb)
+    if ! [[ "$ORPHAN_FREE_KB" =~ ^[0-9]+$ ]]; then
+        return 2
+    fi
+    if [ "$ORPHAN_FREE_KB" -lt $((ORPHAN_MIN_FREE_GB * 1048576)) ]; then
+        return 1
+    fi
+    return 0
+}
+
+# A safety rail cut the sweep of <db> short. mail=1 raises an anomaly (something is wrong that a
+# human should see); mail=0 is for conditions other alarms already cover (low disk, Dolt unwell).
+# Either way the DOG_DONE line carries the count and the reason.
+halt_orphan_sweep() {  # halt_orphan_sweep <db> <reason> <mail:0|1>
+    ORPHAN_HALTED_DBS=$((ORPHAN_HALTED_DBS + 1))
+    ORPHAN_HALT_REASON=$(short_error "$2")
+    if [ "$3" = "1" ]; then
+        record_anomaly "$1" "orphan sweep halted for $1: $2"
+    fi
+}
+
+halt_orphan_disk() {  # halt_orphan_disk <db> <orphan_disk_state rc: 1 = low, 2 = unreadable>
+    if [ "$2" -eq 1 ]; then
+        halt_orphan_sweep "$1" "free disk $((ORPHAN_FREE_KB / 1048576)) GiB is below the floor of $ORPHAN_MIN_FREE_GB GiB (headroom the dolt_gc job needs)" 0
+    else
+        halt_orphan_sweep "$1" "free disk space could not be read (df -Pk $CITY_ABS); not sweeping blind" 1
+    fi
+}
+
+sweep_orphan_children() {  # sweep_orphan_children <db>
+    local db="$1"
+    local table ids list id rc bad bad_seen
+    local swept_db=0
+    local capped=0
+    local failed=0
+    local halted=0
+    local sweep_t0=$SECONDS
+
+    DB_ORPHANS=0
+    [ "$ORPHAN_SWEEP" = "1" ] || return 0
+
+    if [ -n "$DRY_RUN" ]; then
+        # A bounded probe: counting EVERY orphan of wisp_events would cost as much as the sweep.
+        for table in wisp_comments wisp_dependencies wisp_labels wisp_events; do
+            get_sql_count "$db" "orphan $table rows (dry run)" "
+                SELECT COUNT(*) FROM (
+                    SELECT 1 FROM \`$db\`.$table c
+                    WHERE NOT EXISTS (SELECT 1 FROM \`$db\`.wisps w WHERE w.id = c.issue_id)
+                    LIMIT $ORPHAN_SELECT_ROWS
+                ) orphan_probe
+            "
+            TOTAL_WOULD_SWEEP=$((TOTAL_WOULD_SWEEP + SQL_COUNT_RESULT))
+        done
+        return 0
+    fi
+
+    if [ "$PURGE_TRIPPED" -eq 1 ]; then
+        # The purge just gave up after consecutive failed chunks: Dolt is unwell. The sweep would
+        # only add load (anti-join samples + deletes), so it waits for the next run.
+        halt_orphan_sweep "$db" "the purge failure breaker tripped in this run (Dolt is unwell); not adding load" 0
+        return 0
+    fi
+
+    [ -n "$ORPHAN_DEADLINE" ] || ORPHAN_DEADLINE=$((SECONDS + ORPHAN_BUDGET_S))
+
+    for table in wisp_comments wisp_dependencies wisp_labels wisp_events; do
+        bad_seen=0
+        while :; do
+            if [ "$SECONDS" -ge "$ORPHAN_DEADLINE" ]; then
+                capped=1
+                break
+            fi
+            # Row cap of the whole run (ORPHAN_SWEPT holds the databases already finished).
+            if [ $((ORPHAN_SWEPT + swept_db)) -ge "$ORPHAN_MAX_ROWS" ]; then
+                capped=1
+                break
+            fi
+            # Free-disk floor, re-read every round: a drain that itself eats disk must see it.
+            rc=0
+            orphan_disk_state || rc=$?
+            if [ "$rc" -ne 0 ]; then
+                halt_orphan_disk "$db" "$rc"
+                halted=1
+                break
+            fi
+            get_sql_rows "$db" "orphan $table sample" "
+                SELECT c.issue_id FROM \`$db\`.$table c
+                WHERE NOT EXISTS (SELECT 1 FROM \`$db\`.wisps w WHERE w.id = c.issue_id)
+                LIMIT $ORPHAN_SELECT_ROWS
+            "
+            if [ "$SQL_ROWS_FAILED" -eq 1 ]; then
+                # "No answer" is not "no orphans": say so, and go on to the next table.
+                failed=1
+                PURGE_LAST_ERROR=$(short_error "$SQL_ROWS_ERR")
+                break
+            fi
+            ids=$(printf '%s\n' "$SQL_ROWS_RESULT" | sed '/^[[:space:]]*$/d' | sort -u)
+            [ -n "$ids" ] || break   # nothing left: this table is clean
+
+            # Seatbelt: child rows exist, so `wisps` must not be empty (or unreadable — get_sql_count
+            # reads a failed probe as 0 and raises its own anomaly). Against an empty `wisps` the
+            # NOT EXISTS guard holds for EVERY row: the whole table would be "orphans". Re-read on
+            # EVERY round, not once per database: a `wisps` table emptied or rebuilt while the sweep
+            # runs (a migration, another actor) must stop the very next DELETE, not the next run.
+            # Only reached when there is something to delete, so a legitimately empty rig database
+            # costs nothing and raises nothing.
+            get_sql_count "$db" "wisps emptiness probe" "SELECT COUNT(*) FROM (SELECT 1 FROM \`$db\`.wisps LIMIT 1) wisps_probe"
+            if [ "$SQL_COUNT_RESULT" -lt 1 ]; then
+                halt_orphan_sweep "$db" "the wisps table of $db is empty or unreadable while $table has rows: every child row would look orphaned; nothing deleted" 1
+                halted=1
+                break
+            fi
+
+            list=""
+            bad=0
+            while IFS= read -r id; do
+                [ -n "$id" ] || continue
+                # ids are interpolated into SQL: accept only the alphabet bd generates.
+                if ! [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]*$ ]]; then
+                    bad=$((bad + 1))
+                    continue
+                fi
+                list="${list:+$list,}'$id'"
+            done <<< "$ids"
+            [ "$bad" -gt "$bad_seen" ] && bad_seen=$bad
+            if [ -z "$list" ]; then
+                # Every sampled orphan has an id we refuse to interpolate; sampling again would
+                # return the same rows for ever. Stop this table (the anomaly below says so).
+                break
+            fi
+
+            # The allowance is what is LEFT of the run's row cap (> 0: the check at the top of the
+            # round just passed), handed down so the cap is exact — one round names up to
+            # ORPHAN_SELECT_ROWS wisps and each owns many rows, so a per-round check overshoots.
+            rc=0
+            delete_rows_bounded "$db" "$table" \
+                "issue_id IN ($list) AND NOT EXISTS (SELECT 1 FROM \`$db\`.wisps w WHERE w.id = $table.issue_id)" \
+                "$ORPHAN_DEADLINE" "$((ORPHAN_MAX_ROWS - ORPHAN_SWEPT - swept_db))" || rc=$?
+            swept_db=$((swept_db + CHILD_ROWS_DELETED))
+            case "$rc" in
+                0)
+                    ;;
+                2|3)
+                    capped=1   # 2 = out of time, 3 = out of row allowance: work remains for the next run
+                    break
+                    ;;
+                *)
+                    failed=1
+                    note_failure "$db" "$CHILD_DELETE_ERR"
+                    break
+                    ;;
+            esac
+            if [ "$CHILD_ROWS_DELETED" -eq 0 ]; then
+                # The sample named orphans yet the guarded DELETE removed none: sampling again would
+                # loop. Stop this table and say so.
+                record_anomaly "$db" "orphan $table sample of up to $ORPHAN_SELECT_ROWS rows was named but the guarded DELETE removed nothing; sweep of $table stopped"
+                break
+            fi
+            sleep "$ORPHAN_PAUSE_S"
+        done
+        if [ "$bad_seen" -gt 0 ]; then
+            record_anomaly "$db" "orphan $table rows with wisp id(s) of unexpected characters (up to $bad_seen per sample) were NOT swept"
+        fi
+        if [ "$capped" -eq 1 ] || [ "$halted" -eq 1 ]; then
+            break
+        fi
+    done
+
+    # The sweep is best-effort and has its own budget: its time must not be charged to the PURGE budget
+    # of the databases that come after this one (purge_closed_wisps measures `elapsed` from
+    # PURGE_START_EPOCH), or a long drain would starve their purge on every run — and the purge, not the
+    # sweep, is what keeps the wisps tables small. Shift the purge clock by the time spent here.
+    PURGE_START_EPOCH=$((PURGE_START_EPOCH + SECONDS - sweep_t0))
+    ORPHAN_SWEPT=$((ORPHAN_SWEPT + swept_db))
+    DB_ORPHANS=$swept_db
+    DB_MUTATIONS=$((DB_MUTATIONS + swept_db))
+    if [ "$capped" -eq 1 ]; then
+        ORPHAN_CAPPED_DBS=$((ORPHAN_CAPPED_DBS + 1))
+    fi
+    if [ "$failed" -eq 1 ]; then
+        ORPHAN_FAILED=$((ORPHAN_FAILED + 1))
     fi
     return 0
 }
@@ -695,6 +1203,9 @@ while IFS= read -r DB; do
     # Step 2: Purge — delete closed wisps past purge_age (ga-u8nbt9: rewritten,
     # see purge_closed_wisps above: NULL-safe, mail-safe, chunked, children too).
     purge_closed_wisps "$DB"
+
+    # Step 2b (ga-x2fj8h): sweep the child rows whose wisp is already gone (see the function).
+    sweep_orphan_children "$DB"
 
     # ga-u8nbt9: steps 3 and 4 mutate PERMANENT issues and have not run since the
     # schema split (see the header note). They stay OFF unless GC_REAPER_ISSUE_STEPS
@@ -870,7 +1381,7 @@ while IFS= read -r DB; do
     if [ -z "$DRY_RUN" ] && [ "$DB_MUTATIONS" -gt 0 ]; then
         if ! COMMIT_OUTPUT=$(dolt_sql -q "
             USE \`$DB\`;
-            CALL DOLT_COMMIT('-Am', 'reaper: stale_wisps=$STALE_WISP_COUNT closed_wisps=$DB_CLOSED_WISPS purged=$DB_PURGED stale_issues=$DB_ISSUES_CLOSED expired_issues=$DB_EXPIRED_ISSUES_CLOSED', '--author', 'reaper <reaper@gastown.local>')
+            CALL DOLT_COMMIT('-Am', 'reaper: stale_wisps=$STALE_WISP_COUNT closed_wisps=$DB_CLOSED_WISPS purged=$DB_PURGED orphans=$DB_ORPHANS stale_issues=$DB_ISSUES_CLOSED expired_issues=$DB_EXPIRED_ISSUES_CLOSED', '--author', 'reaper <reaper@gastown.local>')
         " 2>&1); then
             case "$COMMIT_OUTPUT" in
                 *"nothing to commit"*|*"Nothing to commit"*)
@@ -928,6 +1439,20 @@ if [ -d "$CITY_BEADS_DIR" ] && [ -z "$DRY_RUN" ] && command -v gc >/dev/null 2>&
     fi
 fi
 
+# ga-x2fj8h: the sweep doubles as the orphan DETECTOR. The purge deletes children with their wisp,
+# so a steady-state run should find (almost) none; a run that had to sweep more than the threshold
+# says so. Stable text (no counts): the mail dedup above then sends it once per TTL — the number
+# is in the DOG_DONE summary (orphan_swept).
+# Only a run that FINISHED its sweep can be told from a new producer: while the ga-x2fj8h backlog
+# drains, every run stops at its row/time budget (orphan_capped_dbs) or a safety rail
+# (orphan_halted_dbs) and sweeps far more than the threshold BY DESIGN — mailing each 6 h would
+# page the mayor a few times a day for a known, tracked drain. The run that finishes the backlog
+# trips it once ("the tail of the backlog"); a new producer trips it every run it outpaces the
+# threshold without hitting a budget.
+if [ "$ORPHAN_SWEPT" -gt "$ORPHAN_ALERT" ] && [ "$ORPHAN_CAPPED_DBS" -eq 0 ] && [ "$ORPHAN_HALTED_DBS" -eq 0 ]; then
+    record_anomaly "orphans" "one run swept more than $ORPHAN_ALERT child rows of wisps that no longer exist without hitting a budget (orphan_swept in the DOG_DONE line): the tail of the ga-x2fj8h backlog, or something still deletes wisps without their children"
+fi
+
 if [ "$HAD_DATABASES" -eq 0 ] && [ "$SESSION_PRUNE_ATTEMPTED" -eq 0 ] && [ -z "$ANOMALIES" ]; then
     exit 0
 fi
@@ -962,9 +1487,20 @@ fi
 
 ISSUE_STEPS_STATE="off"
 [ -n "$ISSUE_STEPS" ] && ISSUE_STEPS_STATE="on"
-SUMMARY="reaper — stale_wisps:$TOTAL_STALE_WISPS, closed_wisps:$TOTAL_CLOSED_WISPS, purged:$TOTAL_PURGED, sessions-pruned:$TOTAL_SESSIONS_PRUNED, closed:$TOTAL_ISSUES_CLOSED, expired:$TOTAL_EXPIRED_ISSUES_CLOSED, expired_skipped:$TOTAL_EXPIRED_ISSUES_SKIPPED, skipped_non_city_issues:$TOTAL_STALE_ISSUES_SKIPPED, mail_wisps:$TOTAL_MAIL_WISPS, purge_age_h:$PURGE_AGE_H, purge_batches:$PURGE_BATCHES, purge_capped_dbs:$PURGE_CAPPED_DBS, schema_skipped_dbs:$SCHEMA_SKIPPED_DBS, issue_steps:$ISSUE_STEPS_STATE, anomalies:$ANOMALY_COUNT"
+# ga-x2fj8h: the new counters go BEFORE issue_steps so the tail of the line is unchanged. A chunk
+# that failed for good, and a sweep that failed or ran out of budget, are numbers here — the
+# 19/09 failure ("error on line 6 ... wisp_events") was only ever in the mail.
+SUMMARY="reaper — stale_wisps:$TOTAL_STALE_WISPS, closed_wisps:$TOTAL_CLOSED_WISPS, purged:$TOTAL_PURGED, sessions-pruned:$TOTAL_SESSIONS_PRUNED, closed:$TOTAL_ISSUES_CLOSED, expired:$TOTAL_EXPIRED_ISSUES_CLOSED, expired_skipped:$TOTAL_EXPIRED_ISSUES_SKIPPED, skipped_non_city_issues:$TOTAL_STALE_ISSUES_SKIPPED, mail_wisps:$TOTAL_MAIL_WISPS, purge_age_h:$PURGE_AGE_H, purge_batches:$PURGE_BATCHES, purge_capped_dbs:$PURGE_CAPPED_DBS, purge_failed_chunks:$PURGE_FAILED_CHUNKS, purge_child_rows:$PURGE_CHILD_ROWS, orphan_swept:$ORPHAN_SWEPT, orphan_capped_dbs:$ORPHAN_CAPPED_DBS, orphan_failed_dbs:$ORPHAN_FAILED, orphan_halted_dbs:$ORPHAN_HALTED_DBS, schema_skipped_dbs:$SCHEMA_SKIPPED_DBS, issue_steps:$ISSUE_STEPS_STATE, anomalies:$ANOMALY_COUNT"
 if [ -n "$DRY_RUN" ]; then
-    SUMMARY="$SUMMARY, would_close_wisps:$TOTAL_WOULD_CLOSE_WISPS, would_expire:$TOTAL_WOULD_EXPIRE, would_purge:$TOTAL_WOULD_PURGE (dry run)"
+    SUMMARY="$SUMMARY, would_close_wisps:$TOTAL_WOULD_CLOSE_WISPS, would_expire:$TOTAL_WOULD_EXPIRE, would_purge:$TOTAL_WOULD_PURGE, would_sweep:$TOTAL_WOULD_SWEEP (dry run)"
+fi
+# The cause, when a statement gave up for good (short, comma-free; the mail carries the full text).
+if [ -n "$PURGE_LAST_ERROR" ]; then
+    SUMMARY="$SUMMARY, last_error: $PURGE_LAST_ERROR"
+fi
+# Why a safety rail cut the orphan sweep short (short, comma-free; halted dbs are counted above).
+if [ -n "$ORPHAN_HALT_REASON" ]; then
+    SUMMARY="$SUMMARY, orphan_halt: $ORPHAN_HALT_REASON"
 fi
 
 gc session nudge deacon/ "DOG_DONE: $SUMMARY" 2>/dev/null || true
