@@ -28,7 +28,13 @@ cat > "$GC_BIN" <<'EOF'
 #!/bin/bash
 echo "GC-CALLED $*" >> "${FAKE_GC_LOG:-/dev/null}"
 if [ "$3" = "SELECT COUNT(*) FROM \`${FAKE_LIVE_DB:-nonexistent}\`.issues" ]; then :; fi
-echo "${FAKE_GC_SQL_OUTPUT:-}"
+# The snapshot-baseline query (ga-jsk5p8) is told apart by its SUM(created_at
+# ...) so a test can feed it a two-column row while the plain COUNT(*) baseline
+# keeps its own one-column output.
+case "$*" in
+  *"SUM(created_at"*) echo "${FAKE_GC_SQL2_OUTPUT:-}" ;;
+  *) echo "${FAKE_GC_SQL_OUTPUT:-}" ;;
+esac
 exit "${FAKE_GC_EXIT:-0}"
 EOF
 chmod +x "$GC_BIN"
@@ -156,7 +162,7 @@ _reset_fixture() {
   rm -rf "$DOLTDIR" "$BACKUP_ROOT"
   mkdir -p "$DOLTDIR/hq" "$BACKUP_ROOT/hq"
   : > "$RESTORE_VERIFY_LOG"
-  unset FAKE_DOLT_SQL_OUTPUT FAKE_GC_SQL_OUTPUT FAKE_DOLT_RESTORE_FAIL
+  unset FAKE_DOLT_SQL_OUTPUT FAKE_GC_SQL_OUTPUT FAKE_GC_SQL2_OUTPUT FAKE_DOLT_RESTORE_FAIL
 }
 
 echo "── _verify_one_db: no live db -> SKIP, never touches dolt/backup ──"
@@ -220,6 +226,114 @@ echo "── _verify_one_db: restored count GREW during verification -> still OK
 _reset_fixture
 OUT="$(FAKE_GC_SQL_OUTPUT='| 500' FAKE_DOLT_SQL_OUTPUT='| 503' _verify_one_db hq)"
 [ "$OUT" = "hq=OK(503)" ] && ok "the city writes continuously — restored > live (not just ==) is still OK, same rule as dolt-backup-reseed.sh" || bad "expected 'hq=OK(503)', got '$OUT'"
+
+# ════════════════════════════════════════════════════════════════════════════
+# 2b. Snapshot baseline (ga-jsk5p8): the backup is charged only for rows that
+#     existed when it was taken, and a DEAD backup job is caught explicitly
+# ════════════════════════════════════════════════════════════════════════════
+# The regression this section exists for (ga-fd84uf, 20/09): the weekly job ran
+# 31 min after the backup, ONE bead was created in between, so restored 5107 <
+# live 5108 and a perfectly good backup was filed as a P1 FAIL (a row-ID diff
+# proved nothing else was missing). Same class as ga-o6e6y: an ad-hoc run 19h
+# after the backup, gap 93 with 292 rows created since. The old rule only
+# passed on quiet Sundays.
+NOW=1789891200                       # 2026-09-20 08:00:00 UTC, pinned as RESTORE_VERIFY_NOW_EPOCH
+_set_manifest() {                    # _set_manifest <db> <mtime_epoch>
+  mkdir -p "$BACKUP_ROOT/$1"
+  : > "$BACKUP_ROOT/$1/manifest"
+  perl -e 'utime($ARGV[0], $ARGV[0], $ARGV[1]) or die "utime: $!"' "$2" "$BACKUP_ROOT/$1/manifest"
+}
+
+echo "── helpers: _epoch_to_utc / _backup_mtime_epoch ──"
+[ "$(_epoch_to_utc 1789891200 2>/dev/null)" = "2026-09-20 08:00:00" ] && ok "epoch 1789891200 -> '2026-09-20 08:00:00' (UTC, the timezone bd stores created_at in)" || bad "expected '2026-09-20 08:00:00', got '$(_epoch_to_utc 1789891200 2>&1)'"
+[ -z "$(_epoch_to_utc abc 2>/dev/null)" ] && ok "non-numeric epoch -> empty (never a date built from garbage)" || bad "non-numeric epoch should produce empty"
+[ -z "$(_epoch_to_utc -5 2>/dev/null)" ] && ok "negative epoch -> empty" || bad "negative epoch should produce empty"
+[ -z "$(_epoch_to_utc '' 2>/dev/null)" ] && ok "empty epoch -> empty" || bad "empty epoch should produce empty"
+_reset_fixture
+[ -z "$(_backup_mtime_epoch hq 2>/dev/null)" ] && ok "no manifest -> empty (UNKNOWN, never 0)" || bad "a missing manifest should produce empty"
+_set_manifest hq 1789889341
+[ "$(_backup_mtime_epoch hq 2>/dev/null)" = "1789889341" ] && ok "reads the manifest mtime as epoch seconds" || bad "expected 1789889341, got '$(_backup_mtime_epoch hq 2>&1)'"
+
+echo "── a typo'd override falls back to the documented default (never an empty arithmetic operand) ──"
+V="$(env RESTORE_VERIFY_LIB=1 RESTORE_VERIFY_LOG="$SCRATCH/override.log" RESTORE_VERIFY_SNAPSHOT_SLACK_SEC=abc RESTORE_VERIFY_MAX_BACKUP_AGE_H= bash -c ". '$SCRIPT'; echo \"\$SNAPSHOT_SLACK_SEC \$MAX_BACKUP_AGE_H\"" 2>/dev/null)"
+[ "$V" = "900 36" ] && ok "garbage slack -> 900s and empty max-age -> 36h (documented defaults)" || bad "expected '900 36', got '$V'"
+V="$(env RESTORE_VERIFY_LIB=1 RESTORE_VERIFY_LOG="$SCRATCH/override.log" RESTORE_VERIFY_SNAPSHOT_SLACK_SEC=0900 RESTORE_VERIFY_MAX_BACKUP_AGE_H=036 bash -c ". '$SCRIPT'; echo \"\$SNAPSHOT_SLACK_SEC \$MAX_BACKUP_AGE_H \$(( SNAPSHOT_SLACK_SEC + 1 ))\"" 2>/dev/null)"
+[ "$V" = "900 36 901" ] && ok "leading zeros ('0900', '036') are forced to base 10, not read as octal inside \$(( ))" || bad "expected '900 36 901', got '$V'"
+X="$(RESTORE_VERIFY_NOW_EPOCH=abc _now_epoch 2>/dev/null)"
+case "$X" in ''|*[!0-9]*) bad "a garbage NOW hook must fall back to the real clock (numeric), got '$X'" ;; *) ok "a non-numeric RESTORE_VERIFY_NOW_EPOCH is ignored -> real clock ($X)" ;; esac
+[ "$(RESTORE_VERIFY_NOW_EPOCH=1789891200 _now_epoch)" = "1789891200" ] && ok "a numeric RESTORE_VERIFY_NOW_EPOCH pins 'now'" || bad "the NOW hook should pin the clock"
+
+echo "── snapshot baseline: ga-fd84uf's exact case (1 bead created after the backup) -> OK, not FAIL ──"
+_reset_fixture; _set_manifest hq $(( NOW - 1860 ))    # backup finished 31 min before the run
+OUT="$(FAKE_GC_SQL_OUTPUT='| 5108' FAKE_GC_SQL2_OUTPUT='| 5108 | 1 |' FAKE_DOLT_SQL_OUTPUT='| 5107' RESTORE_VERIFY_NOW_EPOCH=$NOW _verify_one_db hq)"; RC=$?
+[ "$OUT" = "hq=OK(5107)" ] && ok "restored 5107 < live 5108, but the 1 missing row was created after the snapshot -> OK (the false P1 FAIL of 20/09)" || bad "expected 'hq=OK(5107)', got '$OUT'"
+[ "$RC" -eq 0 ] && ok "a tolerated post-snapshot gap exits 0" || bad "expected exit 0, got $RC"
+grep -q "criadas apos o backup=1" "$RESTORE_VERIFY_LOG" && ok "the tolerated gap is still visible in the log (auditable, not swallowed)" || bad "expected the gap detail in the log: $(cat "$RESTORE_VERIFY_LOG")"
+
+echo "── snapshot baseline: ga-o6e6y's case (ad-hoc run 19h after the backup, 292 rows created since) -> OK ──"
+_reset_fixture; _set_manifest hq $(( NOW - 68400 ))
+OUT="$(FAKE_GC_SQL_OUTPUT='| 3524' FAKE_GC_SQL2_OUTPUT='| 3524 | 292 |' FAKE_DOLT_SQL_OUTPUT='| 3431' RESTORE_VERIFY_NOW_EPOCH=$NOW _verify_one_db hq)"
+[ "$OUT" = "hq=OK(3431)" ] && ok "restored 3431 < live 3524 with 292 rows created since the backup -> OK (expected 3232)" || bad "expected 'hq=OK(3431)', got '$OUT'"
+
+echo "── snapshot baseline: rows that EXISTED at the snapshot are missing from the restore -> still FAIL ──"
+_reset_fixture; _set_manifest hq $(( NOW - 1860 ))
+OUT="$(FAKE_GC_SQL_OUTPUT='| 5108' FAKE_GC_SQL2_OUTPUT='| 5108 | 1 |' FAKE_DOLT_SQL_OUTPUT='| 5100' RESTORE_VERIFY_NOW_EPOCH=$NOW _verify_one_db hq)"; RC=$?
+[ "$OUT" = "hq=FAIL(restaurado:5100<esperado:5107,vivo:5108,pos-backup:1)" ] && ok "a real shortfall (5100 < 5107 expected at the snapshot) is FAIL and names restored, expected, live AND post-backup (auditable from the summary bead alone)" || bad "expected 'hq=FAIL(restaurado:5100<esperado:5107,vivo:5108,pos-backup:1)', got '$OUT'"
+[ "$RC" -ne 0 ] && ok "a real shortfall exits nonzero" || bad "a real shortfall should exit nonzero"
+_reset_fixture; _set_manifest hq $(( NOW - 600 ))
+OUT="$(FAKE_GC_SQL_OUTPUT='| 500' FAKE_GC_SQL2_OUTPUT='| 500 | 0 |' FAKE_DOLT_SQL_OUTPUT='| 499' RESTORE_VERIFY_NOW_EPOCH=$NOW _verify_one_db hq)"
+[ "$OUT" = "hq=FAIL(restaurado:499<esperado:500,vivo:500,pos-backup:0)" ] && ok "nothing created since the backup and restored is 1 short -> FAIL (strictness intact when nothing explains the gap)" || bad "expected 'hq=FAIL(restaurado:499<esperado:500,vivo:500,pos-backup:0)', got '$OUT'"
+
+echo "── freshness: backup OLDER than the limit and the db CHANGED since -> FAIL(defasado) (a dead backup job) ──"
+# The old restored>=live rule caught a dead backup job only by accident (old
+# backup => restored < live). Tolerating post-snapshot rows must not open that
+# blind spot, so the same situation is now an explicit FAIL of its own.
+_reset_fixture; _set_manifest hq $(( NOW - 180000 ))   # 50h old
+OUT="$(FAKE_GC_SQL_OUTPUT='| 1000' FAKE_GC_SQL2_OUTPUT='| 1000 | 40 |' FAKE_DOLT_SQL_OUTPUT='| 960' RESTORE_VERIFY_NOW_EPOCH=$NOW _verify_one_db hq)"; RC=$?
+[ "$OUT" = "hq=FAIL(defasado:50h>36h,pos-backup:40)" ] && ok "50h-old backup of a db that gained 40 rows since -> FAIL(defasado:50h>36h,pos-backup:40)" || bad "expected 'hq=FAIL(defasado:50h>36h,pos-backup:40)', got '$OUT'"
+[ "$RC" -ne 0 ] && ok "a stale backup exits nonzero" || bad "a stale backup should exit nonzero"
+_reset_fixture; _set_manifest hq $(( NOW - 129600 ))   # exactly 36h: the limit is inclusive
+OUT="$(FAKE_GC_SQL_OUTPUT='| 1000' FAKE_GC_SQL2_OUTPUT='| 1000 | 40 |' FAKE_DOLT_SQL_OUTPUT='| 960' RESTORE_VERIFY_NOW_EPOCH=$NOW _verify_one_db hq)"
+[ "$OUT" = "hq=OK(960)" ] && ok "a backup exactly at the age limit is still OK (only strictly older fails)" || bad "expected 'hq=OK(960)', got '$OUT'"
+echo "── freshness: an OLD backup of a QUIET db (nothing created since) -> OK ──"
+_reset_fixture; _set_manifest hq $(( NOW - 720000 ))   # 200h old, nothing new
+OUT="$(FAKE_GC_SQL_OUTPUT='| 5' FAKE_GC_SQL2_OUTPUT='| 5 | 0 |' FAKE_DOLT_SQL_OUTPUT='| 5' RESTORE_VERIFY_NOW_EPOCH=$NOW _verify_one_db hq)"
+[ "$OUT" = "hq=OK(5)" ] && ok "a quiet db may keep an old backup: nothing is missing from it" || bad "expected 'hq=OK(5)', got '$OUT'"
+
+echo "── unknown baseline: manifest present but the snapshot query fails or is garbled -> STRICT rule (never weaker) ──"
+_reset_fixture; _set_manifest hq $(( NOW - 600 ))
+OUT="$(FAKE_GC_SQL_OUTPUT='| 500' FAKE_GC_SQL2_OUTPUT='' FAKE_DOLT_SQL_OUTPUT='| 499' RESTORE_VERIFY_NOW_EPOCH=$NOW _verify_one_db hq)"
+[ "$OUT" = "hq=FAIL(restaurado:499<vivo:500)" ] && ok "snapshot query failed -> falls back to the strict live-count rule" || bad "expected 'hq=FAIL(restaurado:499<vivo:500)', got '$OUT'"
+OUT="$(FAKE_GC_SQL_OUTPUT='| 500' FAKE_GC_SQL2_OUTPUT='| abc | def |' FAKE_DOLT_SQL_OUTPUT='| 499' RESTORE_VERIFY_NOW_EPOCH=$NOW _verify_one_db hq)"
+[ "$OUT" = "hq=FAIL(restaurado:499<vivo:500)" ] && ok "garbled snapshot output -> strict rule (a bad read never widens the tolerance)" || bad "expected 'hq=FAIL(restaurado:499<vivo:500)', got '$OUT'"
+OUT="$(FAKE_GC_SQL_OUTPUT='| 100' FAKE_GC_SQL2_OUTPUT='| 100 | 250 |' FAKE_DOLT_SQL_OUTPUT='| 99' RESTORE_VERIFY_NOW_EPOCH=$NOW _verify_one_db hq)"
+[ "$OUT" = "hq=FAIL(restaurado:99<vivo:100)" ] && ok "an impossible reading (250 post-snapshot rows > 100 live rows) is not a measurement -> strict rule, never a widened tolerance" || bad "expected 'hq=FAIL(restaurado:99<vivo:100)', got '$OUT'"
+OUT="$(FAKE_GC_SQL_OUTPUT='' FAKE_GC_SQL2_OUTPUT='' FAKE_DOLT_SQL_OUTPUT='| 499' RESTORE_VERIFY_NOW_EPOCH=$NOW _verify_one_db hq)"
+[ "$OUT" = "hq=SKIP(sem-baseline)" ] && ok "both baselines unreadable -> SKIP(sem-baseline), the honest third state" || bad "expected 'hq=SKIP(sem-baseline)', got '$OUT'"
+
+echo "── no manifest at all: the snapshot instant is UNKNOWN -> a widening answer must not even be consulted (STRICT rule) ──"
+# The cases above have a manifest and a bad/failed read. This one has NO manifest
+# (bead ga-jsk5p8, point 5: "manifest ausente => regra ESTRITA"). The fake gc
+# would happily answer '| 500 | 3 |' (3 post-snapshot rows => expected 497 =>
+# restored 499 would PASS); the verdict has to stay the strict live-count one,
+# because without a manifest there is no cutoff to charge those rows against.
+_reset_fixture
+: > "$SCRATCH/fake-gc.log"
+OUT="$(FAKE_GC_LOG="$SCRATCH/fake-gc.log" FAKE_GC_SQL_OUTPUT='| 500' FAKE_GC_SQL2_OUTPUT='| 500 | 3 |' FAKE_DOLT_SQL_OUTPUT='| 499' RESTORE_VERIFY_NOW_EPOCH=$NOW _verify_one_db hq)"
+[ "$OUT" = "hq=FAIL(restaurado:499<vivo:500)" ] && ok "no manifest -> the snapshot answer is ignored and the strict rule applies (unknown never weakens the check)" || bad "expected 'hq=FAIL(restaurado:499<vivo:500)', got '$OUT'"
+[ "$(grep -c 'SUM(created_at' "$SCRATCH/fake-gc.log")" = "0" ] && ok "and the snapshot query is never even issued (there is no cutoff to put in it)" || bad "the snapshot query must not run without a manifest: $(cat "$SCRATCH/fake-gc.log")"
+
+echo "── the cutoff sent to SQL is the manifest mtime minus SNAPSHOT_SLACK_SEC, in UTC, in ONE statement ──"
+_reset_fixture; _set_manifest hq $NOW                  # manifest 08:00:00Z, default slack 900s -> 07:45:00
+: > "$SCRATCH/fake-gc.log"
+FAKE_GC_LOG="$SCRATCH/fake-gc.log" FAKE_GC_SQL_OUTPUT='| 10' FAKE_GC_SQL2_OUTPUT='| 10 | 0 |' FAKE_DOLT_SQL_OUTPUT='| 10' RESTORE_VERIFY_NOW_EPOCH=$NOW _verify_one_db hq >/dev/null
+grep -q "created_at > '2026-09-20 07:45:00'" "$SCRATCH/fake-gc.log" && ok "default slack: cutoff = 08:00:00Z - 900s = 07:45:00" || bad "expected cutoff 07:45:00 in the SQL: $(cat "$SCRATCH/fake-gc.log")"
+[ "$(grep -c 'GC-CALLED' "$SCRATCH/fake-gc.log")" = "1" ] && ok "live count and post-snapshot count come from ONE statement (both describe the same instant)" || bad "expected exactly 1 gc call, got $(grep -c 'GC-CALLED' "$SCRATCH/fake-gc.log")"
+SAVED_SLACK="$SNAPSHOT_SLACK_SEC"; SNAPSHOT_SLACK_SEC=0
+: > "$SCRATCH/fake-gc.log"
+FAKE_GC_LOG="$SCRATCH/fake-gc.log" FAKE_GC_SQL_OUTPUT='| 10' FAKE_GC_SQL2_OUTPUT='| 10 | 0 |' FAKE_DOLT_SQL_OUTPUT='| 10' RESTORE_VERIFY_NOW_EPOCH=$NOW _verify_one_db hq >/dev/null
+SNAPSHOT_SLACK_SEC="$SAVED_SLACK"
+grep -q "created_at > '2026-09-20 08:00:00'" "$SCRATCH/fake-gc.log" && ok "slack 0: cutoff = the manifest time itself" || bad "expected cutoff 08:00:00 in the SQL: $(cat "$SCRATCH/fake-gc.log")"
 
 # ════════════════════════════════════════════════════════════════════════════
 # 3. _file_summary_bead

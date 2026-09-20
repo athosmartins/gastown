@@ -1,7 +1,10 @@
 #!/bin/bash
 # dolt-restore-verify.sh (ga-jz7gg, scope items 3+4) — read-only, disk-safe
 # weekly integrity check: restores each backed-up db to a scratch dir,
-# compares its issue count against the live db, deletes the scratch copy,
+# compares its issue count against what the live db held WHEN THE BACKUP WAS
+# TAKEN (ga-jsk5p8 — not against the live db of right now, except when the
+# snapshot time cannot be determined: then the old strict live-now rule
+# applies; see the snapshot-baseline block below), deletes the scratch copy,
 # and files ONE summary bead per run so the result surfaces in the digest
 # (see mol-digest-generate.toml's "Restore-verify" collect-data section).
 #
@@ -54,6 +57,39 @@ NOTIFY="${NOTIFY:-/Users/athos/.local/bin/notify}"
 DISK_MARGIN_PCT="${RESTORE_VERIFY_DISK_MARGIN_PCT:-200}"
 ONLY_DBS="${RESTORE_VERIFY_ONLY_DBS:-}"   # space-separated allowlist; empty = every backed-up db
 
+# ── Snapshot baseline (ga-jsk5p8) ───────────────────────────────────────────
+# A backup is a snapshot of the PAST; the live db keeps growing after it. The
+# old rule ("restored < live-now => FAIL") therefore condemned a perfect backup
+# whenever ONE row was created between the snapshot and the live read: ga-fd84uf
+# (WA, 20/09: restored 5107 < live 5108; the extra row was created 8 min AFTER
+# the backup and the row-ID diff proved nothing else was missing) and, earlier,
+# ga-o6e6y (hq, an ad-hoc run 19h after the backup). It only ever passed on
+# quiet Sundays because no row happened to land in the 31 min between the reseed
+# (~04:29) and this job (05:00).
+# The fix is to charge the backup only for rows that existed when it was taken:
+#   expected = live_now - (live rows created AFTER the snapshot)
+# and to keep, EXPLICITLY, the one thing the old rule caught by accident — a
+# DEAD backup job (old backup => restored < live): if the db has changed since
+# the backup and the backup is older than MAX_BACKUP_AGE_H, that is a FAIL of
+# its own. A quiet db (nothing created since) may keep an old backup: nothing
+# is missing from it.
+#   SNAPSHOT_SLACK_SEC: how far BEFORE the manifest's mtime the real snapshot
+#     may sit (the manifest is written when the sync FINISHES; hq's sync takes
+#     minutes). Rows created inside that window are not charged to the backup.
+#   MAX_BACKUP_AGE_H: age ceiling, applied only when the db changed since.
+# KNOWN TRADE-OFF (accepted): rows created inside the slack window are never
+# charged to the backup, so if the backup DID capture some of them it can mask
+# an equal number of lost OLDER rows. The slack is the price of not
+# false-alarming on a slow sync; RESTORE_VERIFY_SNAPSHOT_SLACK_SEC=0 removes the
+# masking window at the cost of possible false alarms when a sync is slow.
+SNAPSHOT_SLACK_SEC="${RESTORE_VERIFY_SNAPSHOT_SLACK_SEC:-900}"
+MAX_BACKUP_AGE_H="${RESTORE_VERIFY_MAX_BACKUP_AGE_H:-36}"
+# A typo'd override must not turn into an empty arithmetic operand later.
+case "$SNAPSHOT_SLACK_SEC" in ''|*[!0-9]*) SNAPSHOT_SLACK_SEC=900 ;; esac
+case "$MAX_BACKUP_AGE_H" in ''|*[!0-9]*) MAX_BACKUP_AGE_H=36 ;; esac
+# A leading zero ("0900") would be read as OCTAL inside $(( )) and abort the run.
+SNAPSHOT_SLACK_SEC=$((10#$SNAPSHOT_SLACK_SEC)); MAX_BACKUP_AGE_H=$((10#$MAX_BACKUP_AGE_H))
+
 mkdir -p "$(dirname "$LOG")" 2>/dev/null
 # File-only, never stdout: _verify_one_db's stdout is a RETURN CHANNEL (its
 # final "db=STATUS(...)" line is captured via command substitution by both
@@ -103,6 +139,61 @@ _discover_dbs() {
   (cd "$root" 2>/dev/null && ls -1 2>/dev/null) | grep -vE '\.(new|old)$' || true
 }
 
+# _now_epoch — wall clock, epoch seconds. RESTORE_VERIFY_NOW_EPOCH is a TEST
+# HOOK (pins "now" so the age tests do not depend on the real clock); nothing
+# in production sets it, and a non-numeric value is ignored (real clock), never
+# fed into the age arithmetic.
+_now_epoch() {
+  case "${RESTORE_VERIFY_NOW_EPOCH:-}" in
+    ''|*[!0-9]*) date +%s ;;
+    *) echo "$RESTORE_VERIFY_NOW_EPOCH" ;;
+  esac
+}
+
+# _backup_mtime_epoch <db> — mtime (epoch) of the backup's manifest. dolt
+# writes the manifest LAST, when a sync/reseed finishes, so it is the closest
+# external clock for "when was this backup taken" — external on purpose: a
+# clock derived from the backup's own rows (its newest created_at, its HEAD
+# commit date) would shrink together with a truncated backup and hide the loss.
+# Prints NOTHING (never 0) when there is no manifest or it is unreadable: the
+# caller reads that as UNKNOWN and keeps the strict rule.
+_backup_mtime_epoch() {
+  local mf="$BACKUP_ROOT/$1/manifest" m=""
+  [ -f "$mf" ] || return 0
+  m=$(stat -f %m "$mf" 2>/dev/null)                                    # BSD / macOS
+  case "$m" in ''|*[!0-9]*) m=$(stat -c %Y "$mf" 2>/dev/null) ;; esac  # GNU
+  case "$m" in ''|*[!0-9]*) return 0 ;; esac
+  echo "$m"
+}
+
+# _epoch_to_utc <epoch> — "YYYY-MM-DD HH:MM:SS" in UTC, the timezone bd stores
+# created_at in (calibrated live: a bead's SQL created_at equals its JSON ...Z
+# time). Prints NOTHING on a non-numeric/negative epoch or an odd date output,
+# and the shape is checked before it is ever spliced into SQL.
+_epoch_to_utc() {
+  local e="$1" out=""
+  case "$e" in ''|*[!0-9]*) return 0 ;; esac
+  out=$(date -u -r "$e" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)                                  # BSD / macOS
+  case "$out" in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\ [0-9][0-9]:[0-9][0-9]:[0-9][0-9]) ;;
+    *) out=$(date -u -d "@$e" '+%Y-%m-%d %H:%M:%S' 2>/dev/null) ;;                          # GNU
+  esac
+  case "$out" in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\ [0-9][0-9]:[0-9][0-9]:[0-9][0-9]) echo "$out" ;; esac
+}
+
+# _live_counts_with_post <db> <cutoff_utc> — ONE atomic query, prints
+# "<live> <post>": the live issue count, and how many of those rows were created
+# AFTER cutoff (rows a backup taken at cutoff cannot contain). One statement, so
+# both numbers describe the same instant — two queries seconds apart would let a
+# row created in between count as "post-backup" and quietly widen the tolerance.
+# Prints NOTHING if the query fails or its output is not two numbers.
+_live_counts_with_post() {
+  local db="$1" cutoff="$2" row
+  row=$(timeout 60 "$GC_BIN" dolt sql -q "SELECT COUNT(*), COALESCE(SUM(created_at > '$cutoff'),0) FROM \`$db\`.issues" 2>/dev/null \
+        | grep -E '^\| *[0-9]+ *\| *[0-9]+ *\|' | head -1)
+  [ -n "$row" ] || return 0
+  printf '%s\n' "$row" | awk -F'|' '{gsub(/[[:space:]]/,"",$2); gsub(/[[:space:]]/,"",$3); print $2, $3}'
+}
+
 # _verify_one_db <db> — echoes "<db>=OK(n)" / "SKIP(reason)" / "FAIL(reason)"
 # to stdout and returns 0 for OK/SKIP, 1 for FAIL. SKIP is deliberately NOT a
 # failure: "could not check right now" (no baseline, no disk headroom) is a
@@ -122,9 +213,34 @@ _verify_one_db() {
     return 0
   fi
 
-  local live_count
-  live_count=$(timeout 60 "$GC_BIN" dolt sql -q "SELECT COUNT(*) FROM \`$db\`.issues" 2>/dev/null \
-               | grep -oE '^\| *[0-9]+' | grep -oE '[0-9]+' | head -1)
+  # Baseline = the live db as it was WHEN THE BACKUP WAS TAKEN (see the
+  # "Snapshot baseline" block at the top). Everything below fails toward the OLD
+  # strict rule: no readable manifest, a bad timestamp, or a failed/garbled
+  # combined query all leave post_count EMPTY, and the verdict then compares
+  # against the plain live count exactly as before. Unknown never means a
+  # weaker check — only a measured post-snapshot row count can widen it.
+  local snap_epoch cutoff="" live_count="" post_count="" both="" read_epoch
+  snap_epoch=$(_backup_mtime_epoch "$db")
+  if [ -n "$snap_epoch" ]; then
+    cutoff=$(_epoch_to_utc $(( snap_epoch - SNAPSHOT_SLACK_SEC )))
+  fi
+  if [ -n "$cutoff" ]; then
+    both=$(_live_counts_with_post "$db" "$cutoff")
+    if [ -n "$both" ]; then
+      live_count="${both% *}"
+      post_count="${both#* }"
+      # Post-snapshot rows are a SUBSET of the live rows: post > live is not a
+      # measurement (garbled / mis-parsed read). Discard it — the strict rule
+      # applies — rather than let an impossible number widen the tolerance.
+      if [ "$post_count" -gt "$live_count" ]; then live_count=""; post_count=""; fi
+    fi
+  fi
+  read_epoch=$(_now_epoch)
+  if [ -z "$live_count" ]; then
+    post_count=""
+    live_count=$(timeout 60 "$GC_BIN" dolt sql -q "SELECT COUNT(*) FROM \`$db\`.issues" 2>/dev/null \
+                 | grep -oE '^\| *[0-9]+' | grep -oE '[0-9]+' | head -1)
+  fi
   if [ -z "$live_count" ]; then
     log "'$db': nao consegui ler a contagem viva — sem baseline nao ha verificacao possivel"
     echo "${db}=SKIP(sem-baseline)"
@@ -159,14 +275,45 @@ _verify_one_db() {
     echo "${db}=FAIL(nao-restaura-ou-sem-leitura)"
     return 1
   fi
-  # A origem pode crescer durante a verificacao (a cidade escreve o tempo
-  # todo) — por isso >=, nunca ==. Mesma regra do dolt-backup-reseed.sh.
-  if [ "$restored_count" -lt "$live_count" ]; then
-    log "'$db': restaurado ($restored_count) < vivo ($live_count) — backup pode estar defasado ou incompleto"
-    echo "${db}=FAIL(restaurado:${restored_count}<vivo:${live_count})"
+  if [ -z "$post_count" ]; then
+    # No snapshot baseline (manifest unknown / combined query failed): the
+    # STRICT pre-ga-jsk5p8 rule — the restored copy must cover everything the
+    # live db holds right now. It can false-alarm on a busy db; it never
+    # accepts a restore with FEWER rows than the live db holds right now.
+    if [ "$restored_count" -lt "$live_count" ]; then
+      log "'$db': restaurado ($restored_count) < vivo ($live_count) — backup pode estar defasado ou incompleto (sem baseline do snapshot: regra estrita)"
+      echo "${db}=FAIL(restaurado:${restored_count}<vivo:${live_count})"
+      return 1
+    fi
+    log "'$db': OK (restaurado=$restored_count >= vivo=$live_count; sem baseline do snapshot: regra estrita)"
+    echo "${db}=OK(${restored_count})"
+    return 0
+  fi
+
+  # Snapshot baseline. The restored copy has to hold every row that existed
+  # when the backup was taken; rows created after it are not its fault. (The
+  # live read above happens BEFORE the restore, so growth DURING this
+  # verification is irrelevant — what matters is growth AFTER THE SNAPSHOT.)
+  local expected age_s age_h
+  expected=$(( live_count - post_count ))
+  if [ "$expected" -lt 0 ]; then expected=0; fi
+  if [ "$restored_count" -lt "$expected" ]; then
+    log "'$db': restaurado ($restored_count) < esperado no snapshot ($expected = vivo $live_count - $post_count criadas apos o backup) — linhas que existiam no backup NAO voltaram no restore"
+    echo "${db}=FAIL(restaurado:${restored_count}<esperado:${expected},vivo:${live_count},pos-backup:${post_count})"
     return 1
   fi
-  log "'$db': OK (restaurado=$restored_count >= vivo=$live_count)"
+  # Freshness, explicit. Tolerating post-snapshot rows would otherwise blind
+  # this check to a dead backup job (old backup => big gap => "just growth").
+  # Only when the db HAS changed since: a quiet db may keep an old backup.
+  age_s=$(( read_epoch - snap_epoch ))
+  if [ "$age_s" -lt 0 ]; then age_s=0; fi
+  age_h=$(( age_s / 3600 ))
+  if [ "$post_count" -gt 0 ] && [ "$age_s" -gt $(( MAX_BACKUP_AGE_H * 3600 )) ]; then
+    log "'$db': backup com ${age_h}h (limite ${MAX_BACKUP_AGE_H}h) e o banco JA mudou desde ele ($post_count issues novas) — o job de backup nao esta acompanhando o banco"
+    echo "${db}=FAIL(defasado:${age_h}h>${MAX_BACKUP_AGE_H}h,pos-backup:${post_count})"
+    return 1
+  fi
+  log "'$db': OK (restaurado=$restored_count >= esperado no snapshot=$expected; vivo=$live_count, criadas apos o backup=$post_count, backup com ${age_h}h)"
   echo "${db}=OK(${restored_count})"
   return 0
 }
