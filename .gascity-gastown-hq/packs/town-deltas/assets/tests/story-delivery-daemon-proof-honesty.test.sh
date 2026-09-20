@@ -29,8 +29,23 @@
 #      change needs no restart (daemon-refresh.sh header point 8), so this
 #      must be treated as confirmed, not as an unverified daemon — NO
 #      delivery:daemon-unverified label, "tested in prod" wording unchanged.
+#   H6 (ga-j3lh6p) REFRESH_PROOF=symbol_unreachable_locked → Step 5b released the
+#      story because every still-stale daemon is notify_only_locked AND has no
+#      call-graph path to a symbol the merge changed. A THIRD answer: not
+#      "verified" (nothing was restarted) and not "not_verified" (it WAS checked).
+#      Own label (delivery:daemon-stale-locked), NO delivery:daemon-unverified, and
+#      wording that says a locked daemon is still on old code — never "may still
+#      be dormant", never "verified in prod".
 
 set -uo pipefail
+
+# ga-j3lh6p (flake fix): every assertion below used to be `echo "$LAST_BD" | grep
+# -q pat`. Under `set -o pipefail` that is a SIGPIPE race: macOS BUFSIZ is 1024,
+# so echoing anything larger goes out in chunks, grep -q exits on the first match,
+# the next chunk kills echo (141), and the pipeline reads as a FAILED match even
+# though the text is there. Measured on an UNTOUCHED origin/main: 2 of 14 runs
+# failed (a different `tested-label` / `story-done` assertion each time). A
+# here-string has no writer process to kill, so it cannot race.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DELIVERY="$SCRIPT_DIR/../story-delivery.sh"
@@ -86,39 +101,58 @@ run_block() {
 
 # H1: REFRESH_PROOF=verified → happy path, unchanged wording
 run_block verified
-echo "$LAST_BD" | grep -q "label add ga-test delivery:tested" && ok "H1 delivery:tested added" || nok "H1 tested-label" "$LAST_BD"
-! echo "$LAST_BD" | grep -q "delivery:daemon-unverified" && ok "H1 NO delivery:daemon-unverified label" || nok "H1 daemon-unverified" "$LAST_BD"
-echo "$LAST_BD" | grep -q "close ga-test -r.*tested in prod" && ok "H1 close_reason says tested in prod" || nok "H1 close-reason" "$LAST_BD"
+grep -q "label add ga-test delivery:tested" <<<"$LAST_BD" && ok "H1 delivery:tested added" || nok "H1 tested-label" "$LAST_BD"
+! grep -q "delivery:daemon-unverified" <<<"$LAST_BD" && ok "H1 NO delivery:daemon-unverified label" || nok "H1 daemon-unverified" "$LAST_BD"
+grep -q "close ga-test -r.*tested in prod" <<<"$LAST_BD" && ok "H1 close_reason says tested in prod" || nok "H1 close-reason" "$LAST_BD"
 
 # H2: REFRESH_PROOF=not_applicable → same happy-path wording (nothing false to claim)
 run_block not_applicable
-echo "$LAST_BD" | grep -q "label add ga-test delivery:tested" && ok "H2 delivery:tested added" || nok "H2 tested-label" "$LAST_BD"
-! echo "$LAST_BD" | grep -q "delivery:daemon-unverified" && ok "H2 NO delivery:daemon-unverified label" || nok "H2 daemon-unverified" "$LAST_BD"
+grep -q "label add ga-test delivery:tested" <<<"$LAST_BD" && ok "H2 delivery:tested added" || nok "H2 tested-label" "$LAST_BD"
+! grep -q "delivery:daemon-unverified" <<<"$LAST_BD" && ok "H2 NO delivery:daemon-unverified label" || nok "H2 daemon-unverified" "$LAST_BD"
 
 # H3 (THE BUG'S OWN SCENARIO): REFRESH_PROOF=not_verified, baseline-only test
 # (STORY_TEST_MISSING=1) — exactly wa-3dfnw's shape: prod-test harness passed,
 # daemon-refresh never confirmed the live process picked up the code.
 run_block not_verified 1
-echo "$LAST_BD" | grep -q "label add ga-test delivery:daemon-unverified" && ok "H3 delivery:daemon-unverified label IS added" || nok "H3 daemon-unverified" "$LAST_BD"
-echo "$LAST_BD" | grep -qi "NOT VERIFIED" && ok "H3 close_reason says daemon liveness NOT verified" || nok "H3 not-verified-text" "$LAST_BD"
-! echo "$LAST_BD" | grep -q "verified in prod" && ok "H3 close_reason does NOT claim 'verified in prod'" || nok "H3 false-verified-claim" "$LAST_BD"
+grep -q "label add ga-test delivery:daemon-unverified" <<<"$LAST_BD" && ok "H3 delivery:daemon-unverified label IS added" || nok "H3 daemon-unverified" "$LAST_BD"
+grep -qi "NOT VERIFIED" <<<"$LAST_BD" && ok "H3 close_reason says daemon liveness NOT verified" || nok "H3 not-verified-text" "$LAST_BD"
+! grep -q "verified in prod" <<<"$LAST_BD" && ok "H3 close_reason does NOT claim 'verified in prod'" || nok "H3 false-verified-claim" "$LAST_BD"
 # story:done is still set — a genuinely-untestable daemon claim halts nothing on
 # its own (that's Step 5b's VERIFY_FAILED/NEEDS_GUARDED_RESTART job, already
 # covered by story-delivery-step5b.test.sh); this step's job is honest labeling.
-echo "$LAST_BD" | grep -q "label add ga-test story:done" && ok "H3 story:done still set (labeling honesty, not a new halt)" || nok "H3 story-done" "$LAST_BD"
+grep -q "label add ga-test story:done" <<<"$LAST_BD" && ok "H3 story:done still set (labeling honesty, not a new halt)" || nok "H3 story-done" "$LAST_BD"
 
 # H4: the literal false claim can never resurface, in any scenario this file drives.
-for p in verified not_applicable not_verified asset_served_per_request; do
+for p in verified not_applicable not_verified asset_served_per_request symbol_unreachable_locked; do
   run_block "$p"
-  ! echo "$LAST_BD" | grep -q "verified in prod" && ok "H4 [$p] 'verified in prod' never appears" || nok "H4 [$p]" "$LAST_BD"
+  ! grep -q "verified in prod" <<<"$LAST_BD" && ok "H4 [$p] 'verified in prod' never appears" || nok "H4 [$p]" "$LAST_BD"
 done
 
 # H5 (ga-y108i): REFRESH_PROOF=asset_served_per_request → same happy path as
 # H1/H2 — a no_restart_paths-proven change is confirmed, not unverified.
 run_block asset_served_per_request
-echo "$LAST_BD" | grep -q "label add ga-test delivery:tested" && ok "H5 delivery:tested added" || nok "H5 tested-label" "$LAST_BD"
-! echo "$LAST_BD" | grep -q "delivery:daemon-unverified" && ok "H5 NO delivery:daemon-unverified label" || nok "H5 daemon-unverified" "$LAST_BD"
-echo "$LAST_BD" | grep -q "close ga-test -r.*tested in prod" && ok "H5 close_reason says tested in prod" || nok "H5 close-reason" "$LAST_BD"
+grep -q "label add ga-test delivery:tested" <<<"$LAST_BD" && ok "H5 delivery:tested added" || nok "H5 tested-label" "$LAST_BD"
+! grep -q "delivery:daemon-unverified" <<<"$LAST_BD" && ok "H5 NO delivery:daemon-unverified label" || nok "H5 daemon-unverified" "$LAST_BD"
+grep -q "close ga-test -r.*tested in prod" <<<"$LAST_BD" && ok "H5 close_reason says tested in prod" || nok "H5 close-reason" "$LAST_BD"
+
+# H6 (ga-j3lh6p): REFRESH_PROOF=symbol_unreachable_locked — Step 5b released this
+# story because every still-stale daemon is notify_only_locked AND has no
+# call-graph path to a symbol the merge changed. That is a THIRD answer, neither
+# "verified" (nothing was restarted, the daemon really is still stale) nor
+# "not_verified" (we DID check, and the analysis says it is not dormant). Folding
+# it into delivery:daemon-unverified would put "could not check" and "checked,
+# proven not needed" in one label, and the terminal push would tell Athos
+# "merged code may still be dormant" for a case the system judged safe. So it
+# gets its own label and its own wording — and the wording must not overclaim:
+# it is evidence, not proof, and says a locked daemon is still on old code.
+run_block symbol_unreachable_locked
+[[ "$LAST_BD" == *"label add ga-test delivery:tested"* ]] && ok "H6 delivery:tested added (the rig harness passed)" || nok "H6 tested-label" "$LAST_BD"
+[[ "$LAST_BD" != *"delivery:daemon-unverified"* ]] && ok "H6 NO delivery:daemon-unverified (that label means 'could not check', which is not what happened)" || nok "H6 daemon-unverified wrongly added" "$LAST_BD"
+[[ "$LAST_BD" == *"label add ga-test delivery:daemon-stale-locked"* ]] && ok "H6 delivery:daemon-stale-locked IS added (queryable: a locked daemon was left on old code, on evidence)" || nok "H6 stale-locked label" "$LAST_BD"
+[[ "$LAST_BD" == *"close ga-test -r"*"tested in prod"* ]] && ok "H6 close_reason says tested in prod" || nok "H6 close-reason" "$LAST_BD"
+[[ "$LAST_BD" == *"notify_only_locked"* ]] && ok "H6 close_reason names the locked daemon caveat (does not overclaim)" || nok "H6 locked caveat missing from the close reason" "$LAST_BD"
+[[ "$LAST_BD" != *"NOT VERIFIED"* && "$LAST_BD" != *"may still be dormant"* ]] && ok "H6 close_reason does NOT say liveness was unverified / may be dormant" || nok "H6 alarming wording for a proven-cosmetic case" "$LAST_BD"
+[[ "$LAST_BD" == *"label add ga-test story:done"* ]] && ok "H6 story:done set" || nok "H6 story-done" "$LAST_BD"
 
 echo ""
 echo "story-delivery daemon-proof-honesty tests: $PASS passed, $FAIL failed"

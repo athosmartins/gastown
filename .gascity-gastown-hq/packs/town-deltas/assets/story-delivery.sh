@@ -2667,6 +2667,13 @@ else
       MERGE_OWN_ARRIVAL_EPOCH=""
       MERGE_OWN_REPROBE_EPOCH=""
       MERGE_OWN_LIVE_STALE=""
+      # ga-j3lh6p: what the helper proved about the still-stale set, reset per
+      # story for the same sweep-loop leakage reason as the vars above. All empty
+      # = "no split was made", which is exactly what an older helper gets.
+      MERGE_OWN_FRESH_COSMETIC_LINE=""
+      MERGE_OWN_FRESH_COSMETIC=""
+      MERGE_OWN_ACTIONABLE_STALE=""
+      MERGE_OWN_LOCKED_COSMETIC_STALE=""
       if [ "$REFRESH_VERDICT" = "NEEDS_GUARDED_RESTART" ] \
          && [ "$THIS_PULL_STRUCTURALLY_INERT" = "0" ] \
          && [ -n "${MERGE_OWN_AFFECTED// /}" ]; then
@@ -2775,6 +2782,14 @@ else
         # ga-c3oyk6: the probe's OWN proof tier ("verified" only when every reached
         # daemon's pid-start cleared the floor above). Absent line = "did not say".
         MERGE_OWN_FRESH_PROOF=$(echo "$MERGE_OWN_FRESH_OUT" | grep '^PROOF=' | head -1 | sed 's/^PROOF=//' || true)
+        # ga-j3lh6p: the still-stale labels daemon-refresh.sh proved BOTH locked
+        # against automation (restart_policy.yaml notify_only_locked) AND cleanly
+        # without a call-graph path to any symbol this merge's own delta changed
+        # (its header point 19). Keep the LINE, not only its value: a helper that
+        # predates the field prints none, and "did not say" must never be read as
+        # an answer in either direction — here it simply means no split is made.
+        MERGE_OWN_FRESH_COSMETIC_LINE=$(echo "$MERGE_OWN_FRESH_OUT" | grep '^GUARDED_LOCKED_COSMETIC=' | head -1 || true)
+        MERGE_OWN_FRESH_COSMETIC=$(echo "$MERGE_OWN_FRESH_COSMETIC_LINE" | sed 's/^GUARDED_LOCKED_COSMETIC=//')
         log "Freshness re-probe for $STORY_ID's own affected daemon(s) [$MERGE_OWN_AFFECTED] (forced through the SENSITIVE already_fresh() check): ${MERGE_OWN_FRESH_VERDICT_LINE:-<unparseable output>} still-stale=[$MERGE_OWN_LIVE_STALE] proof=${MERGE_OWN_FRESH_PROOF:-none} (freshness floor $MERGE_OWN_REPROBE_EPOCH: merge arrived in the runtime at ${MERGE_OWN_ARRIVAL_EPOCH:-unknown}, this deploy started $DEPLOY_EPOCH)."
         # Three states, and only the first one releases:
         #   clean       — the re-probe printed BOTH a VERDICT= and a GUARDED= line,
@@ -2815,7 +2830,46 @@ else
           fi
         elif [ -n "$MERGE_OWN_FRESH_VERDICT_LINE" ] && [ -n "${MERGE_OWN_LIVE_STALE// /}" ]; then
           BEAD_REPROBE_STATE="stale"
-          log "Daemon refresh verdict=$REFRESH_VERDICT — $STORY_ID's own merge reaches [$MERGE_OWN_AFFECTED]; the freshness re-probe confirms [$MERGE_OWN_LIVE_STALE] still run code older than the merge commit ($MERGE_SHA) — holding this delivery for exactly those (wide-window overlap: [${MERGE_OWN_WIDE_OVERLAP:-none}])."
+          # ga-j3lh6p: split the still-stale set into what a human / guarded
+          # restart can act on and what daemon-refresh.sh proved LOCKED against
+          # every automation AND without a call-graph path to any symbol this
+          # merge changed — staleness that is cosmetic and can never self-heal
+          # (wa-z66jb, wa-ho1ol 20/09: held forever, closed by hand each time).
+          # Eligibility is deliberately narrow, and every "no" defaults to the
+          # hold this file has always made:
+          #   - only a re-probe verdict of EXACTLY NEEDS_GUARDED_RESTART: a
+          #     JOB_NOT_INSTALLED that also lists a guarded label is a job that
+          #     never ran, and no symbol split can excuse that;
+          #   - only when the helper printed the GUARDED_LOCKED_COSMETIC line at
+          #     all (an older helper gets no split — absent != empty);
+          #   - positive membership per label: a stale label the helper did not
+          #     NAME stays actionable. An empty line names nothing, so nothing is
+          #     excused; a name that is not stale excuses nothing.
+          # A locked daemon whose symbol IS reached (SYMBOL-CONFIRMED), was never
+          # computed, or was flagged by a partial analysis is never named by the
+          # helper, so it can never reach this split: this is NOT "ignore
+          # notify_only_locked".
+          MERGE_OWN_ACTIONABLE_STALE="$MERGE_OWN_LIVE_STALE"
+          if [ "$MERGE_OWN_FRESH_VERDICT_LINE" = "VERDICT=NEEDS_GUARDED_RESTART" ] \
+             && [ -n "$MERGE_OWN_FRESH_COSMETIC_LINE" ]; then
+            MERGE_OWN_ACTIONABLE_STALE=""
+            for _sl in $MERGE_OWN_LIVE_STALE; do
+              case " $MERGE_OWN_FRESH_COSMETIC " in
+                *" $_sl "*) MERGE_OWN_LOCKED_COSMETIC_STALE="$MERGE_OWN_LOCKED_COSMETIC_STALE $_sl" ;;
+                *)          MERGE_OWN_ACTIONABLE_STALE="$MERGE_OWN_ACTIONABLE_STALE $_sl" ;;
+              esac
+            done
+            MERGE_OWN_ACTIONABLE_STALE="$(echo "$MERGE_OWN_ACTIONABLE_STALE" | tr -s ' ' | sed 's/^ //; s/ $//')"
+            MERGE_OWN_LOCKED_COSMETIC_STALE="$(echo "$MERGE_OWN_LOCKED_COSMETIC_STALE" | tr -s ' ' | sed 's/^ //; s/ $//')"
+            if [ -z "${MERGE_OWN_ACTIONABLE_STALE// /}" ]; then
+              BEAD_REPROBE_STATE="locked-cosmetic"
+            fi
+          fi
+          if [ "$BEAD_REPROBE_STATE" = "locked-cosmetic" ]; then
+            log "Daemon refresh verdict=$REFRESH_VERDICT — $STORY_ID's own merge reaches [$MERGE_OWN_AFFECTED]; the freshness re-probe confirms [$MERGE_OWN_LIVE_STALE] still run code older than the merge commit ($MERGE_SHA), but EVERY one of them is notify_only_locked (no automation may restart it) AND has no call-graph path to any symbol this merge changed ($MERGE_OWN_BASE_SHA..$MERGE_SHA) — cosmetic staleness that can never self-heal; NOT holding this delivery for it (ga-j3lh6p; wide-window overlap: [${MERGE_OWN_WIDE_OVERLAP:-none}])."
+          else
+            log "Daemon refresh verdict=$REFRESH_VERDICT — $STORY_ID's own merge reaches [$MERGE_OWN_AFFECTED]; the freshness re-probe confirms [$MERGE_OWN_LIVE_STALE] still run code older than the merge commit ($MERGE_SHA) — holding this delivery for exactly those (wide-window overlap: [${MERGE_OWN_WIDE_OVERLAP:-none}])."
+          fi
         else
           BEAD_REPROBE_STATE="unparseable"
           # Third state (unparseable re-probe: no VERDICT= line at all,
@@ -2951,6 +3005,35 @@ else
               || warn "could not persist daemon-refresh baseline for rig $RIG at $DAEMON_REFRESH_BASELINE_FILE (non-fatal; next sweep falls back to its own pre-pull HEAD)"
           fi
         fi
+      elif [ "$BEAD_REPROBE_STATE" = "locked-cosmetic" ]; then
+        # ga-j3lh6p: this merge DOES reach daemon(s) still running pre-merge code,
+        # and every one of them is locked against all automation AND has no
+        # call-graph path to a symbol this merge changed. Holding would hold
+        # FOREVER — nothing can ever restart them (wa-z66jb, wa-ho1ol 20/09:
+        # delivery:deploy-pending permanent, closed by hand after ~20min of
+        # investigation each) — so the delivery proceeds to Step 6, with the
+        # reason RECORDED on the bead, where it can be audited and disproved.
+        # The proof tier says what was actually established: not "verified"
+        # (nothing was restarted; the daemon really is still stale) and not the
+        # generic "not_verified" either (we DID check, and the analysis says the
+        # merged code is not dormant there). One value for both would put "could
+        # not check" and "checked, judged not needed" in the same label — Step 8
+        # gives this tier its own label and its own wording, the way
+        # asset_served_per_request does for a policy-proven safe change.
+        # Deliberately does NOT advance the rig-wide baseline marker (ga-8i2nds:
+        # this evidence is about THIS merge only, so it releases THIS story only;
+        # moving the marker would drop a still-pending sibling's merge out of its
+        # own next window).
+        REFRESH_PROOF="symbol_unreachable_locked"
+        if [ "$DRY_RUN" != "1" ]; then
+          bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery NOT held for a locked daemon (ga-j3lh6p) — released on positive evidence, recorded here so it can be audited and disproved.
+Daemon(s) still running pre-merge code: $MERGE_OWN_LOCKED_COSMETIC_STALE
+Why that is not a dormant deploy:
+  1. notify_only_locked in restart_policy.yaml — no automation may restart it (a restart halts what it hosts, e.g. the outreach worker), so a hold on it could never clear by itself.
+  2. daemon-refresh.sh's symbol reachability, on this merge's own delta $MERGE_OWN_BASE_SHA..$MERGE_SHA, found NO call-graph path from its entrypoint to any symbol this merge changed. The analysis was cleanly evaluated — an unparseable entrypoint or a partial analysis would have been NOT COMPUTED and held.
+LIMIT: 'no call-graph path' is evidence, not proof — a changed module-level constant read by an unchanged function, or a call chain the AST walk does not follow, is invisible to it. To check by hand: run compute_symbol_reachability.py --before $MERGE_OWN_BASE_SHA --after $MERGE_SHA for that daemon, or compare \`ps -o lstart= -p <pid>\` with the merge commit date. If the daemon DOES need the new code, restart it in a window where halting what it hosts is acceptable.
+This delivery is recorded as proof=symbol_unreachable_locked (label delivery:daemon-stale-locked) — not as verified." 2>/dev/null || true
+        fi
       else
         err "Daemon refresh did NOT pass (verdict=$REFRESH_VERDICT): $REFRESH_REASON"
         # ga-8i2nds: what the halt posts as its headline, its raw detail block
@@ -3022,8 +3105,25 @@ else
             # above), so BEAD_REPROBE_STATE is "stale" or "unparseable" here —
             # or "none" if the re-probe somehow did not run, which is worded
             # exactly like unparseable rather than guessed at.
+            # ga-j3lh6p: a still-stale daemon the helper proved locked against all
+            # automation AND without a call-graph path to any symbol this merge
+            # changed (MERGE_OWN_LOCKED_COSMETIC_STALE — set above only for a
+            # NEEDS_GUARDED_RESTART re-probe that printed the field) stays out of
+            # the "restart THESE" list: restarting it halts what it hosts (the
+            # outreach worker) and buys nothing here, so telling a human to do it
+            # is actively harmful advice. It is still NAMED, with the reason, on
+            # its own line, so it cannot silently vanish from a hold — and once
+            # the daemons that ARE actionable are handled, the next sweep's
+            # re-probe re-checks everything that is left on the same evidence and
+            # releases the story only if all of it still holds (a locked daemon
+            # whose analysis came back NOT COMPUTED under load would hold again).
+            HALT_LOCKED_NOTE=""; HALT_LOCKED_CLAUSE=""
             if [ "$BEAD_REPROBE_STATE" = "stale" ]; then
-              HALT_OWN_LIST="$(echo "$MERGE_OWN_LIVE_STALE" | tr -s ' ' | sed 's/^ //; s/ $//')"
+              HALT_OWN_LIST="$(echo "$MERGE_OWN_ACTIONABLE_STALE" | tr -s ' ' | sed 's/^ //; s/ $//')"
+              if [ -n "${MERGE_OWN_LOCKED_COSMETIC_STALE// /}" ]; then
+                HALT_LOCKED_NOTE=$'\n'"Not listed above: $MERGE_OWN_LOCKED_COSMETIC_STALE — notify_only_locked (no automation may restart it) and no call-graph path to any symbol this merge changed: cosmetic staleness. Do NOT restart it on this story's account — a restart halts what it hosts and buys nothing here. Once the daemon(s) above are handled, the next sweep re-checks this one on the same evidence and, only if it still holds, releases the story (ga-j3lh6p)."
+                HALT_LOCKED_CLAUSE=" (plus $(echo "$MERGE_OWN_LOCKED_COSMETIC_STALE" | wc -w | tr -d ' ') more still on old code but locked with no call-graph path to a changed symbol — cosmetic, not listed: ga-j3lh6p)"
+              fi
               HALT_OWN_BASIS="the freshness re-probe found each of these started BEFORE this merge's commit $MERGE_SHA, i.e. still running pre-merge code"
             else
               HALT_OWN_LIST="$(echo "$MERGE_OWN_AFFECTED_LIVE" | tr -s ' ' | sed 's/^ //; s/ $//')"
@@ -3034,7 +3134,7 @@ else
             HALT_REACH_COUNT="$(echo "$MERGE_OWN_AFFECTED_LIVE" | wc -w | tr -d ' ')"
             HALT_CONTEXT_COUNT="$(echo "$REFRESH_GUARDED_CONTEXT_ONLY" | wc -w | tr -d ' ')"
             if [ "$BEAD_REPROBE_STATE" = "stale" ]; then
-              HALT_REASON="this merge's own delta ($MERGE_OWN_BASE_SHA..$MERGE_SHA) reaches $HALT_REACH_COUNT live daemon(s); $HALT_OWN_COUNT of them still run code older than the merge: $HALT_OWN_LIST"
+              HALT_REASON="this merge's own delta ($MERGE_OWN_BASE_SHA..$MERGE_SHA) reaches $HALT_REACH_COUNT live daemon(s); $HALT_OWN_COUNT of them still run code older than the merge: $HALT_OWN_LIST$HALT_LOCKED_CLAUSE"
             else
               HALT_REASON="this merge's own delta ($MERGE_OWN_BASE_SHA..$MERGE_SHA) reaches $HALT_REACH_COUNT live daemon(s), could not confirm which are stale (freshness re-probe unavailable): $HALT_OWN_LIST"
             fi
@@ -3043,7 +3143,7 @@ else
             # hundreds of lines per comment, re-posted on every announce).
             # Prefer the re-probe (says which reached daemons are stale AND
             # which are already fresh), fall back to the plain probe.
-            HALT_DETAIL_BODY="$(echo "${MERGE_OWN_FRESH_OUT:-$MERGE_OWN_OUT}" | grep -E '^(VERDICT|REASON|AFFECTED|AFFECTED_NOT_RUNNING|RESTARTED|FRESH_FAIL|GUARDED|GUARDED_OWN|GUARDED_CLOSURE_ONLY|ALREADY_FRESH|PROOF)=' || true)"
+            HALT_DETAIL_BODY="$(echo "${MERGE_OWN_FRESH_OUT:-$MERGE_OWN_OUT}" | grep -E '^(VERDICT|REASON|AFFECTED|AFFECTED_NOT_RUNNING|RESTARTED|FRESH_FAIL|GUARDED|GUARDED_OWN|GUARDED_CLOSURE_ONLY|GUARDED_SYMBOL_CONFIRMED|GUARDED_SYMBOL_NO_EVIDENCE|GUARDED_SYMBOL_NOT_COMPUTED|GUARDED_LOCKED_COSMETIC|ALREADY_FRESH|PROOF)=' || true)"
             # An empty body must not read as "the probe found nothing": say
             # that it produced nothing parseable (the third state).
             [ -n "$HALT_DETAIL_BODY" ] || HALT_DETAIL_BODY="(the bead-scoped probe produced no parseable KEY=value output — see story-delivery.log)"
@@ -3051,7 +3151,7 @@ else
 $HALT_DETAIL_BODY"
             HALT_FP_LIST="$HALT_OWN_LIST"
             REFRESH_ACTION="ACTION: restart THESE for this merge — per-bead attribution ($STORY_ID's own delta $MERGE_OWN_BASE_SHA..$MERGE_SHA reaches them; $HALT_OWN_BASIS):$HALT_OWN_LIST
-Drain in-flight messages/webhooks first, then re-run delivery. (Configure a DRAIN_CMD_<label> for daemon-refresh.sh to automate this.)
+Drain in-flight messages/webhooks first, then re-run delivery. (Configure a DRAIN_CMD_<label> for daemon-refresh.sh to automate this.)${HALT_LOCKED_NOTE}
 Context only — NOT attributed to this merge: $HALT_CONTEXT_COUNT other sensitive daemon(s) flagged by the rig-wide window ($DAEMON_REFRESH_PRE_SHA..$POST_DEPLOY_SHA), which is judged against that window's tip commit, not this merge (cosmetic unless one of them actually uses a changed symbol; do not restart these on THIS story's account). Names deliberately omitted so this halt lists only this merge's own daemons (ga-8i2nds) — the full list is in story-delivery.log, the 'Daemon refresh verdict=' lines of this sweep.
 CAVEAT (ga-puq8z): the list above is an import/template-closure match against this merge's own delta, not proof of reachability to the changed symbols — if in doubt, compare \`ps -o lstart= -p <pid>\` against this merge's commit $MERGE_SHA before restarting."
           else
@@ -3325,6 +3425,14 @@ else
   # was misread.
   case "$REFRESH_PROOF" in
     verified|not_applicable|asset_served_per_request) : ;;
+    # ga-j3lh6p: Step 5b released this story because every still-stale daemon is
+    # notify_only_locked AND has no call-graph path to a symbol the merge
+    # changed. That is a THIRD answer — not "verified" (nothing was restarted;
+    # the daemon really is still stale) and not "unverified" (we DID check and
+    # judged it not needed). delivery:daemon-unverified means "could not check";
+    # putting this case under it would make two different facts one label, and
+    # tell Athos "may still be dormant" about something the system judged safe.
+    symbol_unreachable_locked) bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:daemon-stale-locked" -q 2>/dev/null || true ;;
     *) bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:daemon-unverified" -q 2>/dev/null || true ;;
   esac
 
@@ -3365,6 +3473,10 @@ NOTE: $DONE_NOTE" 2>/dev/null || true
     # policy-proven not_applicable, see daemon-refresh.sh header point 8).
     case "$REFRESH_PROOF" in
       verified|not_applicable|asset_served_per_request) : ;;
+      # ga-j3lh6p: says exactly what is known and no more — a locked daemon IS
+      # still on the old code; the analysis found no call-graph path from it to
+      # anything this merge changed. Evidence, not proof.
+      symbol_unreachable_locked) DONE_PUSH_TAIL="deployed + tested in prod; a notify_only_locked daemon still runs the old code — no call-graph path from it to a symbol this merge changed (evidence, not proof; see delivery:daemon-stale-locked)" ;;
       *) DONE_PUSH_TAIL="deployed (rig harness passed); DAEMON LIVENESS NOT VERIFIED — merged code may still be dormant, see delivery:daemon-unverified" ;;
     esac
     bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery COMPLETE. story:done (delivery:tested).
