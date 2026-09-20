@@ -768,6 +768,50 @@ def test_startup_line_says_where_the_cap_came_from(wd, fake, monkeypatch, tmp_pa
     assert "cap_source={%r: %r}" % (POOL, source) in startup[0]
 
 
+def _pool_with_demand(fake, active, asleep=0):
+    """`active` active dogs and `asleep` asleep ones under demand that has already
+    lasted long enough to act on. Returns the run_cycle state for it."""
+    fake.beads = [bead("ga-open", labels=["ctx:ready"])]
+    fake.sessions = ([_active_dog(n) for n in range(active)]
+                     + [_asleep_dog()] * asleep)
+    return {POOL: {"pinned_ids": [], "demand_first_seen_ts": time.time() - 3600,
+                   "idle_first_seen_ts": 0.0}}
+
+
+@pytest.mark.parametrize("answer,stand_in", [
+    pytest.param((0, config_show(dog=4), ""), False, id="read"),
+    pytest.param((1, "", "Error: city not ready"), True, id="not-read"),
+])
+def test_stuck_alert_says_when_the_cap_it_reports_is_a_stand_in(wd, fake, capsys, answer, stand_in):
+    """Break caught: [STUCK] is pushed to ntfy as `active=4/3` -- for ~2h while the
+    config said 6 -- and nothing on the alert said the 3 was not a reading. An
+    alert whose cap IS a reading must read exactly as before."""
+    fake.config = answer
+    caps = wd.load_pool_max_active([POOL])
+    state = _pool_with_demand(fake, active=4)
+    capsys.readouterr()
+    wd.run_cycle(caps, state, {})
+    stuck = [l for l in capsys.readouterr().out.splitlines() if "[STUCK]" in l]
+    assert len(stuck) == 1, stuck
+    if stand_in:
+        assert "active=4/3 (cap: the hardcoded fallback" in stuck[0]
+    else:
+        assert "active=4/4 " in stuck[0] and "(cap:" not in stuck[0]
+
+
+def test_scaled_up_line_says_when_the_cap_it_reports_is_a_stand_in(wd, fake, capsys):
+    """Break caught: the wake line prints `active=2->3/3` too, and a wake decided
+    against a guess must say so."""
+    fake.config = (1, "", "Error: city not ready")
+    caps = wd.load_pool_max_active([POOL])
+    state = _pool_with_demand(fake, active=2, asleep=1)        # 2 active < the stand-in 3
+    capsys.readouterr()
+    wd.run_cycle(caps, state, {})
+    scaled = [l for l in capsys.readouterr().out.splitlines() if "[SCALED-UP]" in l]
+    assert len(scaled) == 1, scaled
+    assert "/3 (cap: the hardcoded fallback" in scaled[0]
+
+
 # ---------------------------------------------------------------------------
 # Drift guard: the watchdog's copy of the probe vocabulary vs the live engine
 # ---------------------------------------------------------------------------

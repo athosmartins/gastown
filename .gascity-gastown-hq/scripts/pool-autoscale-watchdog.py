@@ -172,11 +172,13 @@ _CAP_SOURCE_WORDS = {"last-good": "the last value it gave",
 
 
 def _read_config_caps(pool_templates):
-    """One read of `gc config show` -> (caps, reasons). Never raises.
+    """One read of `gc config show` -> (caps, reasons).
 
     `caps` has an entry only for a pool the config gave a number for; `reasons`
-    says, for every other pool, why it did not. Pool templates like
-    "gastown.dog" map to config agent name "dog" (the last component).
+    says, for every other pool, why it did not. A command that fails or times out
+    is a reason, not an exception; load_pool_max_active() guards the rest. Pool
+    templates like "gastown.dog" map to config agent name "dog" (the last
+    component).
     """
     try:
         result = subprocess.run(
@@ -244,6 +246,19 @@ def _report_cap_transition(pool, cap, source, why):
     elif before is not None:
         print(f"[POOL-AUTOSCALE] [CAP-CHANGED] pool={pool} max_active_sessions "
               f"{before[0]}->{cap} (the config changed)", flush=True)
+
+
+def _cap_note(pool):
+    """Text for an alert line saying its cap is a stand-in, not a number the config
+    just gave: "" when it is a reading, so a healthy alert reads as it always did.
+    An alert that prints `active=4/3` must not let the 3 pass for the config's.
+    A pool load_pool_max_active() never resolved (a caller that brings its own
+    caps, as the tests do; main() resolves every managed pool first) gets no note:
+    this module has made no stand-in for it."""
+    source = _cap_in_use.get(pool, (None, "config"))[1]
+    if source == "config":
+        return ""
+    return f" (cap: {_CAP_SOURCE_WORDS[source]}, the config gave no number)"
 
 
 def load_pool_max_active(pool_templates):
@@ -712,7 +727,7 @@ def run_cycle(pool_caps, state, stuck_alerted):
                 f"[POOL-AUTOSCALE] [{status}] pool={pool} "
                 f"woke+pinned={target['id']}({target['name']}) "
                 f"demand={demand} active={active_count}→"
-                f"{active_count + (1 if ok else 0)}/{max_active} "
+                f"{active_count + (1 if ok else 0)}/{max_active}{_cap_note(pool)} "
                 f"reason: {reason}"
             )
             if ok:
@@ -743,7 +758,7 @@ def run_cycle(pool_caps, state, stuck_alerted):
             if now - last_stuck >= STUCK_REALERT_SEC:
                 emit(
                     f"[POOL-AUTOSCALE] [STUCK] pool={pool} "
-                    f"demand={demand} active={active_count}/{max_active} "
+                    f"demand={demand} active={active_count}/{max_active}{_cap_note(pool)} "
                     f"asleep={asleep_count} stuck_sessions={stuck_count} "
                     f"reason: {reason}"
                 )
