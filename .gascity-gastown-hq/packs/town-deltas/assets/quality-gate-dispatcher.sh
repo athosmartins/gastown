@@ -3225,6 +3225,59 @@ gate_close_source_terminal() {
 }
 # SELFTEST-EXTRACT gate-close-source-terminal-fn: END
 
+# daemon_refresh_locked_cosmetic_release <daemon-refresh-output>
+# ga-j3lh6p (the class sweep's second consumer; story-delivery.sh Step 5b is the
+# first): decides whether a NEEDS_GUARDED_RESTART verdict should STOP holding a
+# merged bug/task bead as delivery:pending-restart.
+#
+# THE DEFECT: the ga-l7n3v hold below fires on ANY verdict that is not OK/SKIPPED,
+# reading only VERDICT/REASON/PROOF — never GUARDED, never the symbol split. A
+# bug/task whose merge touches a lib imported by a notify_only_locked daemon
+# (com.whatsapp.demand-dashboard: "Trava humana: NUNCA auto", a restart halts the
+# outreach worker it hosts) is held for a daemon NO automation can ever restart,
+# and merged-bead-janitor.sh guards delivery:pending-restart, so nothing else
+# releases it: it stays open until somebody closes it by hand (wa-z66jb / wa-ho1ol
+# paid exactly that on the story-delivery side, 20/09, ~20min of investigation each).
+# daemon-refresh.sh (header point 19) now names, in GUARDED_LOCKED_COSMETIC, the
+# GUARDED subset that is BOTH locked against automation AND cleanly evaluated to
+# "no call-graph path to any symbol this merge changed".
+#
+# Returns 0 and prints the covered labels iff ALL of these hold — every "no" is the
+# hold this dispatcher has always made:
+#   - the FIRST VERDICT= line is exactly NEEDS_GUARDED_RESTART (a JOB_NOT_INSTALLED
+#     or VERIFY_FAILED that also lists a guarded label is a job that never ran / a
+#     daemon that did not come up — no symbol split can excuse that);
+#   - GUARDED= names at least one label (nothing-to-release is not a release);
+#   - the helper printed a GUARDED_LOCKED_COSMETIC= line AT ALL (an older helper
+#     prints none, and absent != empty);
+#   - EVERY GUARDED label is named there — positive membership per label. An empty
+#     line names nothing, so nothing is excused; a name that is not stale excuses
+#     nothing; one ordinary stale daemon keeps the whole hold (it is real work).
+# A locked daemon whose symbol IS reached, was never computed, or was flagged by a
+# partial analysis is never named by the helper, so it cannot get here: this is NOT
+# "ignore notify_only_locked".
+# Lines are matched anchored at column 0: the dispatcher merges the helper's stderr
+# into DR_OUT, so a log line that merely CONTAINS "GUARDED=" mid-line must not count.
+# SELFTEST-EXTRACT daemon-refresh-locked-cosmetic-release-fn: BEGIN
+daemon_refresh_locked_cosmetic_release() {
+  local _out="$1" _verdict _guarded _cos_line _cos _l _covered=""
+  _verdict=$(grep '^VERDICT=' <<<"$_out" | head -1 | sed 's/^VERDICT=//' || true)
+  [ "$_verdict" = "NEEDS_GUARDED_RESTART" ] || return 1
+  _guarded=$(grep '^GUARDED=' <<<"$_out" | head -1 | sed 's/^GUARDED=//' || true)
+  [ -n "${_guarded// /}" ] || return 1
+  _cos_line=$(grep '^GUARDED_LOCKED_COSMETIC=' <<<"$_out" | head -1 || true)
+  [ -n "$_cos_line" ] || return 1
+  _cos="${_cos_line#GUARDED_LOCKED_COSMETIC=}"
+  for _l in $_guarded; do
+    case " $_cos " in
+      *" $_l "*) _covered="${_covered:+$_covered }$_l" ;;
+      *) return 1 ;;
+    esac
+  done
+  printf '%s' "$_covered"
+}
+# SELFTEST-EXTRACT daemon-refresh-locked-cosmetic-release-fn: END
+
 # gate_rebase_attempt_advanced <intended_next_attempt> <actual_highest_after_write>
 # ga-6dp9 (bug 3 of 3): the gate:exiled-tier5:N label swap (remove old, add
 # new) is fire-and-forget (`|| true`, matching this script's fail-soft
@@ -6467,6 +6520,10 @@ $PARTIAL_EVIDENCE" 2>/dev/null || true
         DAEMON_HOLD_REASON=""
         DAEMON_HOLD_DETAIL=""
         DAEMON_SOFT_WARN=""
+        # ga-j3lh6p: which delivery:* label a soft-warn close carries. Empty = the
+        # default delivery:daemon-unverified ("could not check"); set only by the
+        # locked-cosmetic release below ("checked, judged not needed").
+        DAEMON_SOFT_WARN_LABEL=""
         _gl7n3v_runbook_field() {  # _gl7n3v_runbook_field <rig> <field>
           # Standalone re-implementation of story-delivery.sh's own
           # get_runbook_field() — duplicated rather than sourced, matching
@@ -6651,6 +6708,7 @@ PYEOF
                 "Daemon refresh found an unattributed scheduled-job gap for rig $RIG ($DR_UNATTRIB) — NOT caused by $BEAD_ID (ga-agracx), whose own merge (sha=$MERGE_SHA) didn't touch it; an earlier commit still needs the job installed/loaded." \
                 2>/dev/null || true
             fi
+            # SELFTEST-EXTRACT daemon-refresh-verdict-case: BEGIN
             case "$DR_VERDICT" in
               OK|SKIPPED)
                 # root-class:error-vs-empty (ga-vmq1i's own distinction, reused
@@ -6681,11 +6739,41 @@ PYEOF
                 DAEMON_SOFT_WARN="daemon-refresh.sh produced no verdict (helper-level failure, not a confirmed-stale daemon)"
                 ;;
               *)
-                DAEMON_HOLD_VERDICT="$DR_VERDICT"
-                DAEMON_HOLD_REASON="$DR_REASON"
-                DAEMON_HOLD_DETAIL="$DR_OUT"
+                # ga-j3lh6p: a NEEDS_GUARDED_RESTART whose EVERY guarded daemon the
+                # helper proved locked against all automation AND without a
+                # call-graph path to a symbol this merge changed would otherwise
+                # hold this bead as delivery:pending-restart FOREVER — nothing can
+                # restart those daemons, and merged-bead-janitor.sh guards that
+                # label, so nothing releases it (see
+                # daemon_refresh_locked_cosmetic_release for the exact rule and why
+                # each "no" holds). Released here, RECORDED on the bead so it can be
+                # audited and disproved, and closed with its own label rather than
+                # delivery:daemon-unverified: that label means "could not check",
+                # and this was checked.
+                DR_COSMETIC_LABELS=""
+                if [ "$DR_VERDICT" = "NEEDS_GUARDED_RESTART" ]; then
+                  DR_COSMETIC_LABELS="$(daemon_refresh_locked_cosmetic_release "$DR_OUT" || true)"
+                fi
+                if [ -n "$DR_COSMETIC_LABELS" ]; then
+                  DAEMON_SOFT_WARN="notify_only_locked daemon(s) [$DR_COSMETIC_LABELS] still run the pre-merge code, with no call-graph path to any symbol this merge changed (evidence, not proof)"
+                  DAEMON_SOFT_WARN_LABEL="delivery:daemon-stale-locked"
+                  if [ "${DRY_RUN:-0}" != "1" ]; then
+                    bd -C "$BEAD_CITY" comment "$BEAD_ID" "Daemon verification NOT holding this close for a locked daemon (ga-j3lh6p) — released on positive evidence, recorded here so it can be audited and disproved.
+Daemon(s) still running pre-merge code: $DR_COSMETIC_LABELS
+Why that is not a dormant merge:
+  1. notify_only_locked in restart_policy.yaml — no automation may restart it (a restart halts what it hosts, e.g. the outreach worker), so a hold on it could never clear by itself; merged-bead-janitor.sh guards delivery:pending-restart, so nothing else would release it either.
+  2. daemon-refresh.sh's symbol reachability found NO call-graph path from its entrypoint to any symbol this merge changed (this merge's delta: ${MERGE_PRE_MAIN_SHA:-<pre-merge base unknown>}..$MERGE_SHA; deploy window: $DR_PRE_SHA..$DR_POST_SHA). The analysis was cleanly evaluated — an unparseable entrypoint or a partial analysis would have been NOT COMPUTED and held.
+LIMIT: 'no call-graph path' is evidence, not proof — a changed module-level constant read by an unchanged function, or a call chain the AST walk does not follow, is invisible to it. To check by hand: run compute_symbol_reachability.py --before <base> --after $MERGE_SHA for that daemon, or compare \`ps -o lstart= -p <pid>\` with the merge commit date. If the daemon DOES need the new code, restart it in a window where halting what it hosts is acceptable.
+Closed with delivery:daemon-stale-locked (not delivery:daemon-unverified — this was checked, not skipped)." 2>/dev/null || true
+                  fi
+                else
+                  DAEMON_HOLD_VERDICT="$DR_VERDICT"
+                  DAEMON_HOLD_REASON="$DR_REASON"
+                  DAEMON_HOLD_DETAIL="$DR_OUT"
+                fi
                 ;;
             esac
+            # SELFTEST-EXTRACT daemon-refresh-verdict-case: END
           fi
         fi
 
@@ -6773,10 +6861,21 @@ $DAEMON_HOLD_DETAIL" 2>/dev/null || true
           log "Closing source bug/task $BEAD_ID (gate PASS + merged sha=$MERGE_SHA)."
           bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
           _CLOSE_REASON="Quality gate PASSED — branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA, gate_run=$GATE_RUN_ID). Closed by autonomous dispatcher (ga-esbg)."
+          # SELFTEST-EXTRACT daemon-soft-warn-close: BEGIN
           if [ -n "$DAEMON_SOFT_WARN" ]; then
-            bd -C "$BEAD_CITY" label add "$BEAD_ID" "delivery:daemon-unverified" -q 2>/dev/null || true
-            _CLOSE_REASON="$_CLOSE_REASON (ga-l7n3v: daemon liveness not positively confirmed — $DAEMON_SOFT_WARN; see delivery:daemon-unverified.)"
+            if [ "${DAEMON_SOFT_WARN_LABEL:-}" = "delivery:daemon-stale-locked" ]; then
+              # ga-j3lh6p: a locked daemon left on old code ON PURPOSE, on evidence
+              # (daemon_refresh_locked_cosmetic_release). Its own label and wording:
+              # "liveness not positively confirmed" would tell the next reader the
+              # check was skipped, when it was done and judged the daemon not needed.
+              bd -C "$BEAD_CITY" label add "$BEAD_ID" "delivery:daemon-stale-locked" -q 2>/dev/null || true
+              _CLOSE_REASON="$_CLOSE_REASON (ga-j3lh6p: $DAEMON_SOFT_WARN; see delivery:daemon-stale-locked.)"
+            else
+              bd -C "$BEAD_CITY" label add "$BEAD_ID" "delivery:daemon-unverified" -q 2>/dev/null || true
+              _CLOSE_REASON="$_CLOSE_REASON (ga-l7n3v: daemon liveness not positively confirmed — $DAEMON_SOFT_WARN; see delivery:daemon-unverified.)"
+            fi
           fi
+          # SELFTEST-EXTRACT daemon-soft-warn-close: END
           # ga-v5acl: gate_close_source_terminal now owns the retry-on-refusal
           # path (lease-aware `bd reclaim --older-than 0s`, then (ga-2emo8) a
           # merge-verified --force). Was: unconditional `bd assign --force` +
