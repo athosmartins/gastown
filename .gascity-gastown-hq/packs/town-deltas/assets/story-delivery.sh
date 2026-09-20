@@ -657,6 +657,42 @@ story_bead_closed_now() {
   [ "$status" = "closed" ]
 }
 
+# ga-c3oyk6: unix epoch at which <sha> became reachable from <runtime_dir>'s HEAD
+# — when the merge's code actually landed in the checkout the daemons run from.
+# It is the bead-scoped freshness re-probe's floor (Step 5b) in place of
+# DEPLOY_EPOCH, which is "now" for THIS sweep iteration. On a retry (hold ->
+# ops restart the daemon -> the next sweep re-checks) every daemon restarted
+# between the first deploy and the retry sits BEFORE the retry's DEPLOY_EPOCH,
+# so it can only reach already_fresh()'s weaker "correlation" tier
+# (PROOF=not_verified) and the story is closed delivery:daemon-unverified
+# ("may still be dormant") over daemons that provably started AFTER the code
+# arrived. Live: wa-0n0bj 2026-09-20 — merge landed 03:31:46Z, demand-dashboard
+# restarted 03:39:47Z, the retry's DEPLOY_EPOCH was 03:44Z.
+#
+# Read from HEAD's reflog, newest first: the entries whose commit contains <sha>
+# form the current "arrival run" and the answer is the OLDEST entry of that run.
+# Never guesses: prints NOTHING (the caller keeps its own DEPLOY_EPOCH) when the
+# runtime is not a git checkout, <sha> is unknown to it, the newest reflog entry
+# does not contain <sha> (the merge is not in the runtime at all), or a
+# timestamp does not parse. Reaching the $cap bound, an unreadable entry or the
+# end of the reflog prints the oldest run entry seen — LATER than the true
+# arrival, i.e. only ever stricter for a freshness floor, never looser.
+runtime_arrival_epoch() {  # runtime_arrival_epoch <runtime_dir> <sha> [<cap>]
+  local rt="$1" sha="$2" cap="${3:-500}" n=0 arrival="" ent when
+  [ -n "$rt" ] && [ -n "$sha" ] || return 0
+  git -C "$rt" rev-parse --verify -q "${sha}^{commit}" >/dev/null 2>&1 || return 0
+  while IFS=' ' read -r ent when; do
+    [ -n "$ent" ] || continue
+    n=$((n + 1))
+    [ "$n" -le "$cap" ] || break
+    git -C "$rt" merge-base --is-ancestor "$sha" "$ent" 2>/dev/null || break
+    when="${when//[^0-9]/}"   # HEAD@{1789875106} -> 1789875106 (no braces: bash 3.2)
+    [ -n "$when" ] || { arrival=""; break; }
+    arrival="$when"
+  done < <(git -C "$rt" reflog show --date=unix --format='%H %gd' HEAD 2>/dev/null)
+  printf '%s' "$arrival"
+}
+
 # Lib-only mode: `STORY_DELIVERY_LIB_ONLY=1 source story-delivery.sh` defines the
 # helpers above without running the live sweep, so the selftest exercises the
 # real functions (one source of truth, no copy-drift). Mirrors merged-bead-janitor.sh.
@@ -2466,11 +2502,18 @@ else
       # they rest on ("none" = it never ran for this story). Reset per story
       # for the usual sweep-loop leakage reason.
       BEAD_REPROBE_STATE="none"
+      # ga-c3oyk6: the re-probe's own proof tier when (and only when) it came
+      # back "clean" — what lets a release override the WIDE window's
+      # PROOF=not_verified for THIS story (see the release branch below).
+      BEAD_REPROBE_PROOF=""
       UNATTRIBUTED_ADVANCES_MARKER=0
       MERGE_OWN_WIDE_OVERLAP=""
       MERGE_OWN_FRESH_OUT=""
       MERGE_OWN_FRESH_VERDICT_LINE=""
       MERGE_OWN_FRESH_GUARDED_LINE=""
+      MERGE_OWN_FRESH_PROOF=""
+      MERGE_OWN_ARRIVAL_EPOCH=""
+      MERGE_OWN_REPROBE_EPOCH=""
       MERGE_OWN_LIVE_STALE=""
       if [ "$REFRESH_VERDICT" = "NEEDS_GUARDED_RESTART" ] \
          && [ "$THIS_PULL_STRUCTURALLY_INERT" = "0" ] \
@@ -2533,9 +2576,35 @@ else
         # MERGE_OWN_OUT probe above cannot answer "is it stale RIGHT NOW" for
         # one. Same DRY_RUN=1 contract as MERGE_OWN_OUT — never kickstarts or
         # drains anything for real, a pure live-process snapshot check.
+        # ga-c3oyk6: the re-probe's "verified" bar is pid-start > DEPLOY_EPOCH —
+        # this iteration's start. On a RETRY that bar is later than the moment
+        # the merge really reached the runtime, so a daemon the operator
+        # restarted in between (the normal hold -> restart -> retry flow) could
+        # only ever score the weaker commit-time correlation tier, and the
+        # release below then inherited the WIDE window's PROOF=not_verified
+        # (Step 8: delivery:daemon-unverified, "may still be dormant") with the
+        # bead-scoped probe having just answered VERDICT=OK still-stale=[]
+        # (wa-0n0bj, 2026-09-20). Floor the probe at the merge's arrival in the
+        # runtime checkout instead. That does make "verified" reachable for a
+        # daemon started between the arrival and DEPLOY_EPOCH — the intent: it
+        # started after the code was in the checkout, and DEPLOY_EPOCH was only
+        # ever a conservative upper bound on that moment. It never goes below
+        # the arrival, and only ever LOWERS the floor: a later or unprovable
+        # arrival keeps DEPLOY_EPOCH, and a respawn between the merge's commit
+        # time and its arrival (old code still checked out) stays not_verified.
+        MERGE_OWN_ARRIVAL_EPOCH="$(runtime_arrival_epoch "$RUNTIME_DIR" "$MERGE_SHA" || true)"
+        MERGE_OWN_REPROBE_EPOCH="$DEPLOY_EPOCH"
+        case "$MERGE_OWN_ARRIVAL_EPOCH" in
+          ''|*[!0-9]*) MERGE_OWN_ARRIVAL_EPOCH="" ;;
+          *)
+            if [ "$MERGE_OWN_ARRIVAL_EPOCH" -lt "$DEPLOY_EPOCH" ]; then
+              MERGE_OWN_REPROBE_EPOCH="$MERGE_OWN_ARRIVAL_EPOCH"
+            fi
+            ;;
+        esac
         MERGE_OWN_FRESH_OUT=$(RUNTIME_DIR="$RUNTIME_DIR" \
           PRE_DEPLOY_SHA="$MERGE_OWN_BASE_SHA" POST_DEPLOY_SHA="$MERGE_SHA" \
-          DEPLOY_EPOCH="$DEPLOY_EPOCH" \
+          DEPLOY_EPOCH="$MERGE_OWN_REPROBE_EPOCH" \
           SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS $MERGE_OWN_AFFECTED" \
           EXTRA_RUNTIME_ROOTS="$EXTRA_RUNTIME_ROOTS" \
           DRY_RUN=1 \
@@ -2551,7 +2620,10 @@ else
         # evidence.
         MERGE_OWN_FRESH_GUARDED_LINE=$(echo "$MERGE_OWN_FRESH_OUT" | grep '^GUARDED=' | head -1 || true)
         MERGE_OWN_LIVE_STALE=$(echo "$MERGE_OWN_FRESH_OUT" | grep '^GUARDED=' | head -1 | sed 's/^GUARDED=//' || true)
-        log "Freshness re-probe for $STORY_ID's own affected daemon(s) [$MERGE_OWN_AFFECTED] (forced through the SENSITIVE already_fresh() check): ${MERGE_OWN_FRESH_VERDICT_LINE:-<unparseable output>} still-stale=[$MERGE_OWN_LIVE_STALE]."
+        # ga-c3oyk6: the probe's OWN proof tier ("verified" only when every reached
+        # daemon's pid-start cleared the floor above). Absent line = "did not say".
+        MERGE_OWN_FRESH_PROOF=$(echo "$MERGE_OWN_FRESH_OUT" | grep '^PROOF=' | head -1 | sed 's/^PROOF=//' || true)
+        log "Freshness re-probe for $STORY_ID's own affected daemon(s) [$MERGE_OWN_AFFECTED] (forced through the SENSITIVE already_fresh() check): ${MERGE_OWN_FRESH_VERDICT_LINE:-<unparseable output>} still-stale=[$MERGE_OWN_LIVE_STALE] proof=${MERGE_OWN_FRESH_PROOF:-none} (freshness floor $MERGE_OWN_REPROBE_EPOCH: merge arrived in the runtime at ${MERGE_OWN_ARRIVAL_EPOCH:-unknown}, this deploy started $DEPLOY_EPOCH)."
         # Three states, and only the first one releases:
         #   clean       — the re-probe printed BOTH a VERDICT= and a GUARDED= line,
         #                 the verdict is exactly VERDICT=OK, and GUARDED is empty:
@@ -2577,6 +2649,7 @@ else
            && [ -z "${MERGE_OWN_LIVE_STALE// /}" ]; then
           NEEDS_GUARDED_RESTART_UNATTRIBUTED=1
           BEAD_REPROBE_STATE="clean"
+          BEAD_REPROBE_PROOF="$MERGE_OWN_FRESH_PROOF"
           # Only the pre-existing exoneration (no overlap with the wide guarded
           # set, ga-49fwiw invariant c) advances the rig-wide marker. An
           # overlap-exoneration (ga-8i2nds) must NOT: the marker is the PRE of
@@ -2627,6 +2700,25 @@ else
         # NEEDS_GUARDED_RESTART belong to this bead — invariant (b): the wide
         # window stays visible and charged (nudge below), but does not retain
         # whoever didn't cause it.
+        #
+        # ga-c3oyk6: this story is released on the bead-scoped re-probe's OWN
+        # evidence, so its daemon-liveness PROOF has to come from that probe,
+        # not from the WIDE window it was just exonerated from. REFRESH_PROOF is
+        # still the window's here (always not_verified under NEEDS_GUARDED_
+        # RESTART) and Step 8 keys delivery:daemon-unverified + "may still be
+        # dormant" off it — contradicting the probe that just found every daemon
+        # this merge reaches running code newer than the merge (wa-0n0bj,
+        # 2026-09-20: labelled 11s after "VERDICT=OK still-stale=[]"). Only the
+        # strongest answer counts: proof=verified over VERDICT=OK and an empty
+        # GUARDED (BEAD_REPROBE_STATE=clean), i.e. every running daemon reached
+        # started after the merge landed. Anything weaker — the not_verified
+        # correlation tier, not_applicable, a missing PROOF line — leaves the
+        # window's fail-closed value in place. Per story: REFRESH_PROOF is reset
+        # for each one (above), and from here on only Step 8 reads it.
+        if [ "$BEAD_REPROBE_STATE" = "clean" ] && [ "$BEAD_REPROBE_PROOF" = "verified" ]; then
+          log "Daemon refresh: $STORY_ID's daemon-liveness proof is bead-scoped — the freshness re-probe says proof=verified (every running daemon its merge reaches [$MERGE_OWN_AFFECTED] started after the merge landed in the runtime; floor $MERGE_OWN_REPROBE_EPOCH), overriding the wide window's proof=$REFRESH_PROOF for this story only."
+          REFRESH_PROOF="verified"
+        fi
         if [ -n "$MERGE_OWN_WIDE_OVERLAP" ]; then
           # ga-8i2nds: released on the bead-scoped re-probe even though the wide
           # window names daemon(s) this merge reaches — see the comment at the
