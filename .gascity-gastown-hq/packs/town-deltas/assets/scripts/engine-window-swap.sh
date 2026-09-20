@@ -70,6 +70,23 @@ die() { printf '[engine-window-swap] ERRO: %s\n' "$*" >&2; exit 1; }
 [ -d "$LIBEXEC" ] || die "libexec não existe: $LIBEXEC"
 [ -e "$DEST" ] && die "$DEST já existe — escolha outro nome, nunca sobrescreva um binário que pode estar em uso"
 
+# ga-ta2w6r: nunca expor a cidade a um binário cuja FONTE só existe neste disco.
+# Em 20/09/2026 o gc que a cidade inteira roda vinha do topo de uma branch com 12
+# commits em nenhum remoto (~20 patches de três janelas). Este gate lê o stamp do
+# PRÓPRIO binário (main.commit) — não o nome de uma branch — e o confere contra os
+# remotos do repo do engine ANTES de qualquer mutação (install/codesign/symlink/
+# kickstart). Fail-closed: sem prova (inclusive rede fora) recusa. Bypass
+# deliberado e barulhento: ENGINE_WINDOW_SKIP_BACKUP_CHECK=1 (ex.: GitHub fora do
+# ar num P0). Rollback (ln -sfn <anterior>) não passa por aqui e nunca é barrado.
+GC_SRC_ROOT="${GC_SRC_ROOT:-/Users/athos/gt/.local-patches/_src-hookfix}"
+EB_LIB="${ENGINE_BACKUP_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/engine-backup-lib.sh}"
+[ -f "$EB_LIB" ] || die "lib de backup ausente: $EB_LIB (ga-ta2w6r)"
+# shellcheck source=lib/engine-backup-lib.sh
+. "$EB_LIB"
+EB_LOG=log
+eb_require_backed_up "$SRC" "$GC_SRC_ROOT" gc "$NAME" \
+  || die "swap RECUSADO: sem prova de que a fonte deste binário tem backup (motivo acima). Nada foi instalado nem trocado."
+
 PREV="$(readlink -f "$LINK" 2>/dev/null || true)"
 log "symlink atual -> ${PREV:-<nenhum>}"
 

@@ -169,11 +169,16 @@ while IFS='|' read -r name kind bin repo <&3; do
         OK)
             streak_reset "art:$name"
             ;;
-        MISSING | ORPHAN)
+        MISSING)
             alarm=1
             hint=$(eb_branch_hint "$repo" "$commit")
             notify_once "art:$name:$commit:$state" "Engine SEM backup: $name roda de commit fora de qualquer remoto" \
-                "$name ($real) deriva de $commit e $detail. Um incidente de disco perde a fonte do que roda. Empurre: git -C $repo push origin ${hint:-<branch>}." 4 >/dev/null || true
+                "$name ($real) deriva do commit $commit, que NENHUM remoto contem: a fonte do que roda so existe neste disco, e um incidente de disco a perde. Empurre: git -C $repo push origin ${hint:-<branch que contem $commit>}." 4 >/dev/null || true
+            ;;
+        ORPHAN)
+            alarm=1
+            notify_once "art:$name:$commit:$state" "Engine SEM fonte rastreavel: $name" \
+                "$name ($real) deriva do commit $commit, que nem existe no repo-fonte $repo (nem apos fetch): a fonte pode nao existir em lugar nenhum. Compilou de outro checkout? Ache-o e empurre." 4 >/dev/null || true
             ;;
         UNSTAMPED)
             alarm=1

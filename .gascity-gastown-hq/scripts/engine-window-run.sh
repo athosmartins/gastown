@@ -7,13 +7,28 @@
 #
 # USO
 #   engine-window-run.sh            # = check. Read-only. Nao muda nada.
-#   engine-window-run.sh build      # builda; NAO troca o binario vivo
-#   engine-window-run.sh swap       # troca o symlink; guarda o anterior
+#   engine-window-run.sh push       # empurra a branch da janela pro remoto e VERIFICA o efeito
+#   engine-window-run.sh build      # push (acima) + builda; NAO troca o binario vivo
+#   engine-window-run.sh swap       # exige backup verificado da fonte; troca o symlink
 #   engine-window-run.sh rollback   # volta pro binario anterior
 #
-# A ORDEM E SEMPRE check -> build -> swap. Cada fase e separada de proposito:
-# uma fase que builda E troca junto nao deixa voce inspecionar o resultado
-# antes de expor a cidade a ele.
+# A ORDEM E SEMPRE check -> push -> build -> swap ('build' e 'arm' ja fazem o
+# push). Cada fase e separada de proposito: uma fase que builda E troca junto
+# nao deixa voce inspecionar o resultado antes de expor a cidade a ele.
+#
+# POR QUE O PUSH FAZ PARTE DA JANELA (ga-ta2w6r, Mayor 20/09/2026)
+# A branch consolidated/engine-window-20260919 ficou com 12 commits em NENHUM
+# remoto (~20 patches de tres janelas) enquanto o binario que a cidade inteira
+# roda foi compilado do topo dela. A janela consolidava, compilava e trocava sem
+# nenhum passo que empurrasse a fonte: etapa ausente, nao esquecimento. Agora:
+#   * push/build/arm: o worktree tem que estar LIMPO e exatamente no commit da
+#     branch (senao o main.commit do binario nao descreve o que foi compilado) e
+#     a branch e empurrada (sem force) com o efeito VERIFICADO antes de compilar;
+#   * swap: recusa se o commit que o binario declara nao esta em nenhum remoto.
+# Bypass deliberado e barulhento (notify): ENGINE_WINDOW_SKIP_BACKUP_CHECK=1
+# (ex.: GitHub fora do ar num P0). Rollback NUNCA e barrado: voltar pro binario
+# anterior tem que ser sempre possivel. O detector horario que cobre o resto:
+# packs/town-deltas/assets/scripts/engine-binary-backup-guard.sh.
 #
 # POR QUE O SWAP NAO DERRUBA A CIDADE
 # O SO resolve o symlink no exec. Processo que ja esta rodando continua com o
@@ -23,7 +38,9 @@
 # servidor precisava sair inteiro.
 set -uo pipefail
 
-SRC=/Users/athos/gt/.local-patches/_src-hookfix
+# Os caminhos abaixo aceitam override por env (defaults INALTERADOS) so para o
+# selftest poder rodar as fases num sandbox sem tocar no symlink vivo do gc.
+SRC="${ENGINE_WINDOW_SRC:-/Users/athos/gt/.local-patches/_src-hookfix}"
 
 # A JANELA E PARAMETRIZAVEL DE PROPOSITO (Mayor, 05/09). Antes estes quatro
 # valores eram fixos e apontavam para a janela de 29/08. Em 05/09 eu fui rodar
@@ -38,16 +55,27 @@ SRC=/Users/athos/gt/.local-patches/_src-hookfix
 ENGINE_WINDOW="${ENGINE_WINDOW:-20260919}"
 BRANCH="${ENGINE_WINDOW_BRANCH:-consolidated/engine-window-$ENGINE_WINDOW}"
 WORKTREE="${ENGINE_WINDOW_WORKTREE:-/Users/athos/gt/.gc-worktrees/engine-window-${ENGINE_WINDOW#2026}}"
-LIBEXEC="$HOME/.local/libexec"
+LIBEXEC="${ENGINE_WINDOW_LIBEXEC:-$HOME/.local/libexec}"
 LABEL="${ENGINE_WINDOW_LABEL:-gc-1.1.1-engwin${ENGINE_WINDOW#2026}}"
 TAG="${ENGINE_WINDOW_TAG:-engwin-$ENGINE_WINDOW}"
-SYMLINK=/opt/homebrew/bin/gc
-PREV_FILE="$HOME/.gastown/run/engine-window-prev-target"
-LOG=/Users/athos/gt/.gascity-gastown-hq/.gc/logs/engine-window-run.log
-PREFLIGHT=/Users/athos/gt/.gascity-gastown-hq/scripts/engine-build-preflight.sh
+SYMLINK="${ENGINE_WINDOW_SYMLINK:-/opt/homebrew/bin/gc}"
+PREV_FILE="${ENGINE_WINDOW_PREV_FILE:-$HOME/.gastown/run/engine-window-prev-target}"
+LOG="${ENGINE_WINDOW_LOG:-/Users/athos/gt/.gascity-gastown-hq/.gc/logs/engine-window-run.log}"
+PREFLIGHT="${ENGINE_WINDOW_PREFLIGHT:-/Users/athos/gt/.gascity-gastown-hq/scripts/engine-build-preflight.sh}"
+PUSH_REMOTE="${ENGINE_WINDOW_PUSH_REMOTE:-origin}"
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG"; }
 die() { log "ABORTADO: $*"; exit 1; }
+
+# ga-ta2w6r: lib compartilhada com engine-window-swap.sh e com o guard horario.
+# Mora no pack (packs/town-deltas/assets/scripts/lib/) porque os outros dois
+# moram la; este script mora em scripts/, entao o caminho sai do PROPRIO local.
+# Sem a lib nao ha como provar backup: recusa em vez de seguir sem o gate.
+EB_LIB="${ENGINE_BACKUP_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../packs/town-deltas/assets/scripts/lib/engine-backup-lib.sh}"
+[ -f "$EB_LIB" ] || { echo "ABORTADO: lib de backup ausente: $EB_LIB (ga-ta2w6r)" >&2; exit 1; }
+# shellcheck source=/dev/null
+. "$EB_LIB"
+EB_LOG=log   # as mensagens da lib entram no mesmo log da janela
 
 ensure_worktree() {
   # Idioma seguro: git worktree remove (casa Bash(git:*), nao dispara o prompt
@@ -58,6 +86,42 @@ ensure_worktree() {
       || die "nao consegui criar worktree de $BRANCH"
     log "worktree criado: $WORKTREE ($BRANCH)"
   fi
+}
+
+# ga-ta2w6r: a fonte do que vai rodar tem que existir FORA deste disco ANTES de o
+# binario existir. So retorna 0 com o EFEITO verificado (eb_push_branch faz um
+# fetch novo e procura o commit num remoto: o rc=0 do `git push` nao basta).
+# Antes disso o worktree tem que ser EXATAMENTE o commit que sera empurrado -- o
+# `main.commit` do binario so descreve o que foi compilado se conteudo == commit.
+# Nunca faz force-push: historia divergente no remoto e decisao de humano.
+ensure_backed_up() {
+  if [ "${ENGINE_WINDOW_SKIP_BACKUP_CHECK:-0}" = "1" ]; then
+    log "!!! PUSH/BACKUP IGNORADO (ENGINE_WINDOW_SKIP_BACKUP_CHECK=1 -- bypass deliberado)"
+    command -v notify >/dev/null 2>&1 && notify -p 4 -t 'Engine window: push/backup IGNORADO' \
+      "janela $ENGINE_WINDOW segue sem provar que a fonte tem backup (bypass deliberado)" >/dev/null 2>&1
+    return 0
+  fi
+  ensure_worktree
+  local tip head dirty
+  tip=$(git -C "$WORKTREE" rev-parse --verify --quiet "refs/heads/${BRANCH}^{commit}" 2>/dev/null) \
+    || { log "  backup ....... FALHOU: a branch $BRANCH nao existe"; return 1; }
+  head=$(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null) \
+    || { log "  backup ....... FALHOU: nao consegui ler o HEAD de $WORKTREE"; return 1; }
+  if [ "$head" != "$tip" ]; then
+    log "  backup ....... FALHOU: $WORKTREE esta em $(printf '%.9s' "$head") mas $BRANCH aponta pra $(printf '%.9s' "$tip") -- o build compilaria algo diferente do que seria empurrado."
+    return 1
+  fi
+  dirty=$(git -C "$WORKTREE" status --porcelain --untracked-files=no 2>/dev/null) \
+    || { log "  backup ....... FALHOU: nao consegui ler o estado de $WORKTREE"; return 1; }
+  if [ -n "$dirty" ]; then
+    log "  backup ....... FALHOU: $WORKTREE tem mudancas nao-commitadas (o binario carregaria conteudo que nenhum commit descreve):"
+    printf '%s\n' "$dirty" | sed -n '1,5p' | sed 's/^/                   /' | tee -a "$LOG"
+    return 1
+  fi
+  log "  backup ....... empurrando $BRANCH ($(printf '%.9s' "$tip")) para $PUSH_REMOTE..."
+  eb_push_branch "$WORKTREE" "$BRANCH" "$PUSH_REMOTE" \
+    || { log "  backup ....... FALHOU (ver o push acima) -- nada sera buildado."; return 1; }
+  log "  backup ....... OK -- $BRANCH esta em $PUSH_REMOTE."
 }
 
 phase_check() {
@@ -126,6 +190,20 @@ phase_check() {
     rc=1
   fi
 
+  # 5. Backup da fonte (ga-ta2w6r). So LE -- sem fetch e sem push ('push'/'build'
+  #    empurram) --, por isso e informativo e nao entra no rc: quem conserta e a
+  #    fase seguinte, e reprovar o check por algo que o build resolve so criaria
+  #    atrito (e pioraria o 'arm', que aceita check reprovado de proposito).
+  if [ -n "${head:-}" ]; then
+    local _bk
+    EB_NO_FETCH=1 eb_fetch_all "$SRC"
+    _bk=$(eb_backup_state "$SRC" "$BRANCH")
+    case "$_bk" in
+      OK\|*) log "  backup ....... OK (so refs locais, sem fetch) — ${_bk#*|}" ;;
+      *)     log "  backup ....... PENDENTE — $BRANCH nao consta em nenhum remoto (${_bk#*|}). 'push' ou 'build' empurram." ;;
+    esac
+  fi
+
   log "  binario vivo agora: $(readlink "$SYMLINK" 2>/dev/null || echo '?')"
   if [ "$rc" -eq 0 ]; then
     log "VEREDITO: pronto pra 'build'."
@@ -144,6 +222,8 @@ phase_build() {
     phase_check || true
   fi
   ensure_worktree
+  log "=== PUSH (o backup da fonte vem ANTES do build) ==="
+  ensure_backed_up || { log "BUILD NAO INICIADO: sem backup verificado da fonte nada e compilado (ga-ta2w6r). Nada foi buildado nem trocado."; return 1; }
   log "=== BUILD ==="
   # Tag pra o binario se identificar em 'gc version' (o Makefile deriva VERSION
   # de git describe --tags --exact-match; sem tag ele reporta 'dev', que e
@@ -169,6 +249,11 @@ phase_swap() {
   local out="$LIBEXEC/$LABEL"
   [ -x "$out" ] || die "nao existe $out — rode 'build' primeiro."
   "$out" version >/dev/null 2>&1 || die "$out nao roda. Nao vou trocar."
+  # ga-ta2w6r: nunca expor a cidade a um binario cuja fonte so existe neste disco.
+  # O gate le o stamp do PROPRIO binario (main.commit), nao a branch: pega tambem
+  # o caso do binario ter sido compilado de outro worktree/branch.
+  eb_require_backed_up "$out" "$SRC" gc "$LABEL" \
+    || { log "SWAP RECUSADO -- o symlink NAO foi tocado (motivo acima)."; return 1; }
   local prev; prev=$(readlink "$SYMLINK" 2>/dev/null) || die "nao consegui ler $SYMLINK"
   mkdir -p "$(dirname "$PREV_FILE")"
   printf '%s\n' "$prev" > "$PREV_FILE"
@@ -211,6 +296,10 @@ LABEL_PLIST="com.gascity.engine-window-postboot"
 
 phase_arm() {
   phase_check || log "AVISO: check reprovou (esperado se o swap ainda nao foi devolvido — o reboot resolve isso). Armando mesmo assim."
+  # ga-ta2w6r: o push acontece AGORA, com humano por perto e rede de pe -- nao no
+  # pos-boot, onde uma falha de rede desperdicaria o reboot (o ganho expira em
+  # ~1h40). Sem backup verificado nao se arma.
+  ensure_backed_up || die "nao armo: a fonte da janela nao tem backup verificado (motivo acima). Resolva e arme de novo (ou ENGINE_WINDOW_SKIP_BACKUP_CHECK=1, deliberadamente)."
   cat > "$PLIST" <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -308,11 +397,12 @@ phase_post_boot() {
 mkdir -p "$(dirname "$LOG")"
 case "${1:-check}" in
   check)    phase_check ;;
+  push)     log "=== PUSH ==="; ensure_backed_up ;;
   build)    phase_build "$@" ;;
   swap)     phase_swap ;;
   rollback)  phase_rollback ;;
   arm)       phase_arm ;;
   disarm)    phase_disarm ;;
   post-boot) phase_post_boot ;;
-  *) echo "uso: $(basename "$0") [check|build|swap|rollback|arm|disarm]"; exit 2 ;;
+  *) echo "uso: $(basename "$0") [check|push|build|swap|rollback|arm|disarm]"; exit 2 ;;
 esac
