@@ -454,6 +454,16 @@ if [ "${1:-}" = "--selftest" ]; then
   TMP="$(mktemp -d "${TMPDIR:-/tmp}/git-lock-hygiene-selftest.XXXXXX")"
   trap 'rm -rf "$TMP"' EXIT
 
+  # ga-d8zeli: _log_json appends every removed/would_remove event to $LOG, which
+  # defaults to the LIVE sweeps log — and the fixture repos below fire those events
+  # for real (8 per run; measured 2026-09-20: 746 of the 36791 lines in the live
+  # git-lock-hygiene.jsonl were selftest fixtures). Point $LOG at scratch for the
+  # whole selftest, unconditionally: an inherited GIT_LOCK_LOG must not be able to
+  # aim a selftest back at production. Here rather than in the wrapper because more
+  # than one caller runs this block (scripts/git-lock-hygiene.selftest.sh,
+  # gate-git-lock-hygiene.selftest.sh, a bare `--selftest`); the wrapper pins it.
+  LOG="$TMP/git-lock-hygiene.jsonl"
+
   # Absolute path to this script itself — needed by T23-T25 below, which
   # extract the SELFTEST-EXTRACT root-resolve-loop block from this exact
   # file (see those tests' own header comment for why they extract rather

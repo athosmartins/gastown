@@ -2,7 +2,8 @@
 # escalation-router.selftest.sh — prove escalation-router.sh (ga-qw3p.1) in isolation.
 #
 # Sources the router in library mode (--lib) so the REAL functions are tested —
-# one source of truth, no copy-drift. Zero live Dolt / gc / network access.
+# one source of truth, no copy-drift. Zero live Dolt / gc / network access, and
+# (ga-d8zeli) no writes to a live city's log — section 6 pins that.
 # Exit 0 iff every assertion holds.
 
 set -uo pipefail
@@ -20,6 +21,37 @@ eq() {
   else bad "$label: expected [$want], got [$got]"
   fi
 }
+
+# ── Sandbox cities (ga-d8zeli) ───────────────────────────────────────────────
+# escalation-router.sh derives CITY / LOG_DIR / JSONL ONCE, when it is sourced
+# (escalation-router.sh:77-79): CITY = ESCALATION_CITY > GC_CITY > the live city.
+# _er_log then appends every line to $JSONL directly — DRY_RUN included — so before
+# this block every escalation_route call below logged into the LIVE
+# escalation-router.jsonl (measured 2026-09-20: 126 of its 2053 lines carry the
+# fixture subject "chip warming failed" and 182 carry "Dolt: gate stalled"). Hence
+# the sandbox must be exported BEFORE the source below, not merely "before the
+# scenarios".
+#   SBX_CITY     the city this selftest runs against (ESCALATION_CITY).
+#   SBX_AMBIENT  a decoy standing in for the caller's own GC_CITY (in production,
+#                the live city): anything that slips past the ESCALATION_CITY
+#                override lands here instead. It must stay untouched — section 6
+#                asserts that.
+# Both carry scripts/gc-ledger.sh: SBX_CITY because section 4's Dolt-independent
+# fallback sources "$CITY/scripts/gc-ledger.sh"; SBX_AMBIENT so that a broken
+# override fails section 6 alone instead of also failing section 4. It is
+# symlinked to the REAL one from the same checkout as the router under test, so
+# the code exercised is still the real code.
+SBX="$(mktemp -d -t escalation-router-selftest)" \
+  || { echo "FATAL: could not create the sandbox dir"; exit 1; }
+trap 'rm -rf "$SBX"' EXIT
+REAL_LEDGER_SH="$SELF_DIR/../../../scripts/gc-ledger.sh"
+[ -r "$REAL_LEDGER_SH" ] \
+  || { echo "FATAL: gc-ledger.sh not found at $REAL_LEDGER_SH (expected city/scripts/, three levels above assets/)"; exit 1; }
+_mk_city() { mkdir -p "$1/.gc/logs" "$1/scripts" && ln -s "$REAL_LEDGER_SH" "$1/scripts/gc-ledger.sh"; }
+SBX_CITY="$SBX/city";       _mk_city "$SBX_CITY"    || { echo "FATAL: could not build the sandbox city"; exit 1; }
+SBX_AMBIENT="$SBX/ambient"; _mk_city "$SBX_AMBIENT" || { echo "FATAL: could not build the ambient decoy city"; exit 1; }
+export GC_CITY="$SBX_AMBIENT"
+export ESCALATION_CITY="$SBX_CITY"   # highest precedence — an inherited value can't aim this run at a real city
 
 # ── Load REAL functions in library mode ──────────────────────────────────────
 source "$ROUTER" --lib \
@@ -273,6 +305,18 @@ grep -q 'digo-wa'                    "$ROUTER" && ok "phone crew wired"         
 grep -q 'peter-wa'                   "$ROUTER" && ok "geo crew wired"              || bad "geo crew missing"
 grep -q 'escalation_classify_rig_origin' "$ROUTER" && ok "rig-origin fn defined"   || bad "rig-origin fn missing"
 grep -q '\-\-rig\|\-r)'              "$ROUTER" && ok "--rig CLI flag present"       || bad "--rig CLI flag missing"
+
+# ── 6. hermetic: no city log was touched but the sandbox's own (ga-d8zeli) ───
+echo ""
+echo "── 6. hermetic — nothing leaked into the ambient (live) city log ──"
+sbx_log="$SBX_CITY/.gc/logs/escalation-router.jsonl"
+ambient_log="$SBX_AMBIENT/.gc/logs/escalation-router.jsonl"
+# The ambient check alone would pass vacuously if the router had stopped logging
+# altogether, so first prove the redirect target really received the log lines.
+if [ -s "$sbx_log" ]; then ok "sandbox city log received the selftest's log lines ($(wc -l < "$sbx_log" | tr -d ' '))"
+else bad "sandbox city log is empty — the router did not log into it, so the ambient check below proves nothing"; fi
+if [ -s "$ambient_log" ]; then bad "leaked $(wc -l < "$ambient_log" | tr -d ' ') line(s) into the ambient city's escalation-router.jsonl — under the gate or launchd that is the LIVE log"
+else ok "ambient city log untouched"; fi
 
 # ── result ────────────────────────────────────────────────────────────────────
 echo ""
