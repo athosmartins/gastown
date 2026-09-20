@@ -295,7 +295,7 @@ while IFS='|' read -r name kind bin repo <&3; do
             [ -n "$newest" ] || newest="$b"
             scope="fora"
             [ "$b" = "$newest" ] && scope="mais-nova"
-            if [ -n "$wt_branches" ] && printf '%s\n' "$wt_branches" | grep -qxF -- "$b"; then scope="worktree-da-janela"; fi
+            if [ -n "$wt_branches" ] && printf '%s\n' "$wt_branches" | grep -xF -- "$b" >/dev/null; then scope="worktree-da-janela"; fi
             br=$(eb_backup_state "$repo" "$tip")
             bstate="${br%%|*}"
             bdetail="${br#*|}"
