@@ -6528,7 +6528,7 @@ case "\$*" in
   *"rig list"*)      printf '{"rigs":[{"name":"whatsapp_automation","path":"$CAPQ_WA_RIG_DIR","hq":false},{"name":"property_scrapers","path":"$CAPQ_PS_RIG_DIR","hq":false}]}' ;;
   *sling*)           printf '{"bead_id":"tt-capq-sling-1"}' ;;
   *"session list"*)  echo x >> "\${PILOT_TEST_STATE:-/tmp/pilot-selftest-state}/session_list.calls"; if [ -n "\${CAPQ_SESSION_LIST_OUT:-}" ]; then printf '%s' "\$CAPQ_SESSION_LIST_OUT"; else printf '{"sessions":[]}'; fi ;;
-  *"session new"*)   echo "\$*" >> "\${PILOT_TEST_STATE:-/tmp/pilot-selftest-state}/session_new.log" ;;
+  *"session new"*)   if [ -n "\${CAPQ_FAIL_SPAWN_FOR:-}" ] && printf '%s' "\$*" | grep -qF -- "\$CAPQ_FAIL_SPAWN_FOR"; then exit 1; fi; echo "\$*" >> "\${PILOT_TEST_STATE:-/tmp/pilot-selftest-state}/session_new.log" ;;
   *"session nudge"*) : ;;
   *) : ;;
 esac
@@ -6571,6 +6571,7 @@ run_capq_dispatch() {
     PILOT_DOLT_LATENCY_OVERRIDE_MS="$([ "${5:-0}" = "1" ] && echo 3000 || echo 100)" \
     PILOT_DOLT_CPU_OVERRIDE="$([ "${5:-0}" = "1" ] && echo 250 || echo 10)" \
     CAPQ_SESSION_LIST_OUT="${4:-}" \
+    CAPQ_FAIL_SPAWN_FOR="${CAPQ_FAIL_SPAWN_FOR:-}" \
     PILOT_INFLIGHT_RETRIES=3 \
     PILOT_INFLIGHT_SLEEP=0 \
     DISPATCH_TO_CAPACITY=1 \
@@ -6873,6 +6874,123 @@ has "$DISPATCHER" 'PILOT_POOL_CAP_PRECLAIM_SKIP' "CAPQ-H: pre-claim skip has an 
 has "$DISPATCHER" 'cannot read the ps-worker live session count' "CAPQ-H: the ps-worker unreadable-count warning exists (mirror of wa-worker)"
 has "$DISPATCHER" '^unmark_pool_builder\(\)' "CAPQ-H: unmark_pool_builder exists (a cap-queued bead gives its virtual builder slot back)"
 has "$DISPATCHER" 'ga-in9ebr: POOL-SATURATED sweep' "CAPQ-H: the POOL-SATURATED marker line exists (imparavel-check reads it)"
+
+# ── Scenario SWEEP (ga-ov3gow): the per-sweep `pilot_sweep` aggregate event ─────────────────────────────
+# Bug ga-ov3gow: pilot-dispatcher.jsonl only ever got a `pilot_dispatch` line from the END of dispatch_one(), so a
+# pool/global cap queue, a failed spawn, a failed sling or a guard refusal (`DISPATCH_RESULT=...; return 1`) left NO
+# trace — the painel's "Sucesso" tile could not see saturation or failure. Mayor's decision: ONE aggregate event
+# per sweep, as its OWN type `pilot_sweep` — never new `result` values inside pilot_dispatch, which the painel's
+# Ritmo / sparkline / lane split / Sucesso all count as dispatches (daemons/painel_visibilidade.py
+# _load_pilot_activity filters on event == "pilot_dispatch").
+# The emitter's classification, accounting and portability are proven fast in
+# pilot-dispatcher.sweep-event.selftest.sh; THESE are the RUNTIME scenarios — the real dispatch_one → dispatch_lane →
+# emit chain (DRY_RUN=0, rig-native arm, on the CAPQ harness above). A wiring bug (DISPATCH_RESULT invisible to the
+# caller, a path that never notes its outcome) only shows here. Every scenario carries a vacuity guard: a log line
+# proving the branch it claims to exercise really ran. Text checks read the log through a here-string, never
+# `echo "$LOG" | grep -q`: under this file's pipefail the reader exits at the first match and the writer's SIGPIPE
+# turns a successful match into a failure (measured 15% false negatives).
+SWEEP_JSONL="$FIXCITY/.gc/pilot-dispatcher.jsonl"
+sweep_n() { local _c; _c=$(jq -s --arg e "$1" '[.[] | select(.event==$e)] | length' "$SWEEP_JSONL" 2>/dev/null) || _c=0; printf '%s' "${_c:-0}"; }
+sweep_expect() { # <jq expr over the LAST pilot_sweep line> <expected, compact JSON> <description>
+  local _g
+  _g="$(jq -sc '[.[] | select(.event=="pilot_sweep")] | (.[-1] // {}) | '"$1" "$SWEEP_JSONL" 2>/dev/null)"
+  if [ "$_g" = "$2" ]; then ok "$3"; else bad "$3 — expected $2, got ${_g:-<no output>}"; fi
+}
+SWEEP_CLOSES='(.candidates == (.dispatched + .queued_pool_cap + .queued_global_cap + .spawn_failed + ([.refused_by_guard[]] | add // 0) + .failed_other + .unclassified))'
+
+echo "Scenario SWEEP-A (ga-ov3gow): pool at cap — a ROUTED bead (pre-claim skip) AND a first-sight bead (in-arm cap) → ONE pilot_sweep line, queued_pool_cap=2, NO pilot_dispatch line"
+SWEEP_A_FX="[$(capq_bead wa-swa1 10 wa-worker whatsapp_automation),$(capq_bead wa-swa2 11 '' whatsapp_automation)]"
+LOG_SWA="$(run_capq_dispatch "$SWEEP_A_FX" 4 0)"
+if grep -q "ga-in9ebr: wa-swa1 QUEUED" <<< "$LOG_SWA" && grep -q "wa-worker pool at session cap.*QUEUED wa-swa2" <<< "$LOG_SWA"; then
+  ok "SWEEP-A: harness reached BOTH queue paths (the pre-claim skip and the in-arm cap) — not a vacuous pass"
+else
+  bad "SWEEP-A: the harness did not reach both queue paths — the assertions below prove nothing"
+fi
+[ "$(sweep_n pilot_sweep)" = "1" ] \
+  && ok "SWEEP-A: exactly ONE pilot_sweep line for the sweep (not one per queued bead)" \
+  || bad "SWEEP-A: expected exactly one pilot_sweep line, got $(sweep_n pilot_sweep) — before ga-ov3gow a queued sweep left NO trace at all"
+sweep_expect '.candidates' '2'          "SWEEP-A: both queued beads counted as evaluated candidates"
+sweep_expect '.queued_pool_cap' '2'     "SWEEP-A: queued_pool_cap=2 — the pre-claim path AND the in-arm path land in the SAME bucket"
+sweep_expect '.queued_global_cap' '0'   "SWEEP-A: … and none is attributed to the global cap"
+sweep_expect '.dispatched' '0'          "SWEEP-A: dispatched=0"
+sweep_expect '.pool_saturated' '1'      "SWEEP-A: pool_saturated=1 (the ga-in9ebr predicate — a busy pool, not a stall)"
+sweep_expect '.results' '{"rig_native_pool_session_cap_queued":2}' "SWEEP-A: results carries the per-name truth"
+sweep_expect "$SWEEP_CLOSES" 'true'     "SWEEP-A: the buckets add up to candidates"
+[ "$(sweep_n pilot_dispatch)" = "0" ] \
+  && ok "SWEEP-A: NO pilot_dispatch line — a queue is not a dispatch (Ritmo / sparkline / Sucesso stay honest)" \
+  || bad "SWEEP-A: a pilot_dispatch line was written for beads that only QUEUED — it would inflate the painel's Ritmo"
+
+echo "Scenario SWEEP-B (ga-ov3gow): a MIXED sweep — one dispatched, one queued, one spawn that FAILED — each in its own bucket; only the dispatched bead leaves a pilot_dispatch line"
+SWEEP_B_FX="[$(capq_bead wa-swb1 10 wa-worker whatsapp_automation),$(capq_bead ps-swb1 11 '' property_scrapers),$(capq_bead ps-swb2 12 '' property_scrapers)]"
+CAPQ_FAIL_SPAWN_FOR="build ps-swb2:"
+LOG_SWB="$(run_capq_dispatch "$SWEEP_B_FX" 4 0)"
+CAPQ_FAIL_SPAWN_FOR=""
+if grep -q "ga-in9ebr: wa-swb1 QUEUED" <<< "$LOG_SWB" && grep -q "ps-worker session spawned for ps-swb1" <<< "$LOG_SWB" \
+   && grep -q "Could not spawn ps-worker for ps-swb2" <<< "$LOG_SWB"; then
+  ok "SWEEP-B: harness reached all three paths (queued pre-claim, spawned OK, spawn FAILED) — not a vacuous pass"
+else
+  bad "SWEEP-B: the harness did not reach all three paths — the assertions below prove nothing"
+fi
+[ "$(sweep_n pilot_sweep)" = "1" ] && ok "SWEEP-B: exactly ONE pilot_sweep line" || bad "SWEEP-B: expected one pilot_sweep line, got $(sweep_n pilot_sweep)"
+sweep_expect '.candidates' '3'          "SWEEP-B: 3 candidates evaluated"
+sweep_expect '.dispatched' '1'          "SWEEP-B: dispatched=1"
+sweep_expect '.queued_pool_cap' '1'     "SWEEP-B: queued_pool_cap=1"
+sweep_expect '.spawn_failed' '1'        "SWEEP-B: spawn_failed=1 — a spawn that failed is no longer invisible"
+sweep_expect '.failed_other' '0'        "SWEEP-B: failed_other=0 (the spawn failure is not double-counted)"
+sweep_expect '.unclassified' '0'        "SWEEP-B: unclassified=0 (every non-dispatch here NAMED its reason — DISPATCH_RESULT reached the caller)"
+sweep_expect '.pool_saturated' '0'      "SWEEP-B: pool_saturated=0 (something dispatched — not saturation)"
+sweep_expect '.results' '{"rig_native_ok":1,"rig_native_pool_session_cap_queued":1,"rig_native_spawn_failed":1}' "SWEEP-B: results carries all three names"
+sweep_expect "$SWEEP_CLOSES" 'true'     "SWEEP-B: the buckets add up to candidates"
+_swb_pd="$(jq -sc '[.[] | select(.event=="pilot_dispatch") | [.story_id, .result]]' "$SWEEP_JSONL" 2>/dev/null)"
+[ "$_swb_pd" = '[["ps-swb1","rig_native_ok"]]' ] \
+  && ok "SWEEP-B: the pilot_dispatch stream is UNCHANGED — one line, for the bead that really dispatched, result rig_native_ok" \
+  || bad "SWEEP-B: pilot_dispatch stream changed — expected [[\"ps-swb1\",\"rig_native_ok\"]], got $_swb_pd"
+grep -q "Pilot sweep complete: dispatched=1" <<< "$LOG_SWB" \
+  && ok "SWEEP-B: the event's dispatched matches the log's canonical 'sweep complete: dispatched=1' counter" \
+  || bad "SWEEP-B: the sweep-complete counter disagrees with the event"
+
+echo "Scenario SWEEP-C (ga-ov3gow): the combined GLOBAL cap lands in queued_global_cap — apart from the pool cap (different cause, different remedy)"
+SWEEP_C_FX="[$(capq_bead wa-swc1 10 '' whatsapp_automation),$(capq_bead ps-swc1 11 '' property_scrapers)]"
+LOG_SWC="$(run_capq_dispatch "$SWEEP_C_FX" 0 0 "" 0 1 1 6)"
+grep -q "ga-jezvn: GLOBAL variable-session cap hit" <<< "$LOG_SWC" \
+  && ok "SWEEP-C: harness reached the real global-cap branch (not a vacuous pass)" \
+  || bad "SWEEP-C: the global-cap branch was NEVER reached — the assertions below prove nothing"
+sweep_expect '.queued_global_cap' '2'   "SWEEP-C: queued_global_cap=2 (both beads, wa and ps)"
+sweep_expect '.queued_pool_cap' '0'     "SWEEP-C: queued_pool_cap=0 — the two causes are not merged"
+sweep_expect '.dispatched' '0'          "SWEEP-C: dispatched=0"
+sweep_expect '.pool_saturated' '1'      "SWEEP-C: a global-cap sweep is saturation too (same predicate as the per-pool cap)"
+sweep_expect '.results' '{"rig_native_global_session_cap_queued":2}' "SWEEP-C: results carries the global-cap name"
+sweep_expect "$SWEEP_CLOSES" 'true'     "SWEEP-C: the buckets add up to candidates"
+
+echo "Scenario SWEEP-D (ga-ov3gow): a sweep with NO candidates exits before the dispatch loops and writes NO line — so a missing pilot_sweep is NOT a liveness signal (pinned: the header block above dispatch_lane() says so)"
+LOG_SWD="$(run_capq_dispatch "[]" 0 0)"
+grep -q "No dispatchable candidates (Tier 1 or Tier 2). Exiting." <<< "$LOG_SWD" \
+  && ok "SWEEP-D: harness reached the 'no dispatchable candidates' early exit (not a vacuous pass)" \
+  || bad "SWEEP-D: the no-candidates early exit was NEVER reached — the assertions below prove nothing"
+[ "$(sweep_n pilot_sweep)" = "0" ] \
+  && ok "SWEEP-D: NO pilot_sweep line — an early exit never evaluated a candidate (absence != dead Pilot)" \
+  || bad "SWEEP-D: an early-exit sweep wrote $(sweep_n pilot_sweep) pilot_sweep line(s) — the documented contract ('only a sweep that reaches the dispatch loops emits') changed; update the header block above dispatch_lane() and this scenario together"
+[ "$(sweep_n pilot_dispatch)" = "0" ] && ok "SWEEP-D: no pilot_dispatch line either" || bad "SWEEP-D: a pilot_dispatch line appeared for a sweep with no candidates"
+
+echo "Scenario SWEEP-E (ga-ov3gow): the HQ sling arm — a sling that never returns a bead_id is a NAMED failure, counted in failed_other (neither lost nor a success)"
+LOG_SWE="$(run_sling_retry 0 1)"
+grep -q "gc sling returned no bead_id" <<< "$LOG_SWE" \
+  && ok "SWEEP-E: harness reached the sling-failure branch (not a vacuous pass)" \
+  || bad "SWEEP-E: the sling-failure branch was NEVER reached — the assertions below prove nothing"
+sweep_expect '.candidates' '1'          "SWEEP-E: 1 candidate evaluated"
+sweep_expect '.failed_other' '1'        "SWEEP-E: failed_other=1 (sling_no_bead_id)"
+sweep_expect '.dispatched' '0'          "SWEEP-E: dispatched=0"
+sweep_expect '.pool_saturated' '0'      "SWEEP-E: a failure is NOT saturation (pool_saturated=0)"
+sweep_expect '.results' '{"sling_no_bead_id":1}' "SWEEP-E: results names the failure"
+sweep_expect "$SWEEP_CLOSES" 'true'     "SWEEP-E: the buckets add up to candidates"
+[ "$(sweep_n pilot_dispatch)" = "0" ] && ok "SWEEP-E: no pilot_dispatch line for a failed sling (unchanged)" || bad "SWEEP-E: a pilot_dispatch line was written for a failed sling"
+
+echo "Scenario SWEEP-F (ga-ov3gow): a DRY_RUN sweep is tagged dry_run='1' so a simulation can be excluded, exactly like pilot_dispatch"
+LOG_SWF="$(run_dispatch "")"
+[ "$(sweep_n pilot_sweep)" = "1" ] && ok "SWEEP-F: DRY_RUN=1 also leaves exactly one pilot_sweep line" || bad "SWEEP-F: DRY_RUN=1 left $(sweep_n pilot_sweep) pilot_sweep lines (expected 1)"
+sweep_expect '.dry_run' '"1"'           "SWEEP-F: dry_run is the string '1' (same encoding as pilot_dispatch.dry_run)"
+sweep_expect '(.dispatched >= 1)' 'true' "SWEEP-F: the simulated dispatch is counted in dispatched"
+sweep_expect "$SWEEP_CLOSES" 'true'     "SWEEP-F: the buckets add up to candidates"
 
 # ── Scenario TOPUP: pool top-up (ga-93yxc) ────────────────────────────────────
 # The cap-skip above (ga-mfeip, ga-v3o6i) sets gc.routed_to=<pool> and gives up

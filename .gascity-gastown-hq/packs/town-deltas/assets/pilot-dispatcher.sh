@@ -8466,6 +8466,11 @@ dispatch_one() {
 
   local STORY_ID STORY_TITLE STORY_PRIORITY STORY_LABELS STORY_RIG STORY_BEAD_CITY
   local STORY_ESTRELA STORY_CRITERIA STORY_EQUILIBRIOS STORY_RIG_EXPLICIT
+  # ga-ov3gow: dispatch_lane() reads DISPATCH_RESULT after we return, to tally WHY a candidate did not
+  # dispatch (the per-sweep `pilot_sweep` event). Reset on entry so an early `return 1` — one of the
+  # guards that fire before any result is chosen — reads as "unnamed", never as the PREVIOUS candidate's
+  # result. Deliberately global: see the note at its former `local` declaration below.
+  DISPATCH_RESULT=""
   STORY_ID=$(echo "$STORY" | jq -r '.id')
   STORY_TITLE=$(echo "$STORY" | jq -r '(.title // .description // "untitled") | .[0:100]')
   STORY_PRIORITY=$(echo "$STORY" | jq -r '.priority // 99')
@@ -9912,7 +9917,10 @@ TASK
   fi
 
   # ── Dispatch via gc sling (HQ beads) or bd assign (rig-native beads) ─────────
-  local DISPATCH_EPOCH DISPATCH_RESULT SLING_BEAD_ID NOW
+  # ga-ov3gow: DISPATCH_RESULT is NOT local (it used to be): every `DISPATCH_RESULT=...; return 1` below
+  # is a reason the caller never saw, so a queue / failed spawn / guard refusal left no trace anywhere.
+  # It is a global set only in this function and read by dispatch_lane() straight after the call.
+  local DISPATCH_EPOCH SLING_BEAD_ID NOW
   DISPATCH_EPOCH=$(date +%s)
   NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -10722,6 +10730,107 @@ OWNERSHIP_GUARD_VETO_COUNT=0   # ga-8jxe1 AC4 — see the two increment sites in
 POOL_CAP_QUEUED=0
 POOL_CAP_QUEUED_IDS=""
 NONQUEUE_FAILS=0
+DISPATCH_RESULT=""   # ga-ov3gow: global on purpose — set by dispatch_one(), read by dispatch_lane() (see there)
+
+# ── ga-ov3gow: the per-sweep aggregate event (`pilot_sweep`) ──────────────────────────────────────────
+# pilot-dispatcher.jsonl used to receive a line only from the END of dispatch_one(), so every exit that
+# does `DISPATCH_RESULT=...; return 1` — a pool/global session-cap queue, a failed spawn, a guard
+# refusal, a failed assign/sling — left no trace. The painel's "Sucesso" tile measured "of the dispatches
+# that reached the end, how many succeeded", so saturation and failure never showed.
+#
+# ONE line per completed sweep, as its OWN event type — never as new `result` values inside
+# `pilot_dispatch`: the painel's Ritmo, sparkline, lane split and Sucesso all count pilot_dispatch lines
+# (daemons/painel_visibilidade.py _load_pilot_activity filters on event == "pilot_dispatch"), so a queue
+# or failure written under that name would inflate the very tiles this exists to make honest. One line
+# per SWEEP, not per bead: a queued bead is re-evaluated every sweep and the painel reads only a 256 KiB
+# tail of this file, so the size must not depend on the queue depth (ga-in9ebr AC2 already forbids
+# per-sweep per-bead Dolt writes for the same reason). No bead ids — the goal is Pilot health, not
+# per-bead audit.
+# Only a sweep that REACHES the dispatch loops writes a line. Every early exit writes nothing: the RAM /
+# quota / quiet-hours pauses, the gate-congested deferral, "No dispatchable candidates" and "Both lanes
+# full ... Pilot backing off". So a missing line is NOT a liveness signal — it means no sweep got to
+# evaluate candidates, for any of those reasons. (The painel's own "silent past 30 min with an approved
+# backlog" alarm reads pilot_dispatch lines only and does not depend on it.)
+#
+# Fields — every bucket is always present, and the buckets add up to `candidates`:
+#   candidates          distinct candidate beads evaluated: attempted by dispatch_one() or skipped pre-claim
+#   dispatched          dispatch_one() returned 0 (includes a DRY_RUN "would dispatch")
+#   queued_pool_cap     left queued behind a full wa-worker/ps-worker pool (pre-claim skip OR in-arm cap)
+#   queued_global_cap   left queued behind the combined ga-jezvn session cap — a different cause, kept apart
+#   spawn_failed        the worker session could not be spawned
+#   refused_by_guard    {<DISPATCH_RESULT of the guard>: n} — a deliberate refusal, not a fault
+#   failed_other        any other NAMED failure (assign / sling / in-flight) and any name not classified here
+#   unclassified        dispatch_one() returned non-zero WITHOUT naming a result (its early guards, a lost
+#                       claim, a hold): counted so the accounting closes — never read as a success
+#   pool_saturated      the ga-in9ebr predicate (_pool_saturated_sweep); consumers must not re-derive it
+#   small_slots, big_slots   free lane capacity when the sweep started (tells a stall from saturation)
+#   results             {<DISPATCH_RESULT>: n} — the per-name tally of the SAME outcomes the buckets above
+#                       count (both come from one per-bead outcome list), in the vocabulary of
+#                       pilot_dispatch.result; a nameless exit is only in `unclassified`. (A pre-claim
+#                       pool-cap skip never reaches dispatch_one(); it is filed under the name
+#                       dispatch_one() gives the in-arm pool cap — one kind of queue, one name.)
+# A bead the rig fallback (Step 4b) re-walks counts once, as it ENDED (the last outcome wins).
+#
+# Adding a DISPATCH_RESULT name? Classify it in _pilot_sweep_emit's jq or it reads as failed_other, and a
+# benign new state would look like a Pilot fault — the drift guard in
+# pilot-dispatcher.sweep-event.selftest.sh (B4) fails until you do.
+SWEEP_OUTCOMES=""   # one "<bead_id>\t<rc>\t<DISPATCH_RESULT>\n" per candidate outcome this sweep
+
+# _pilot_sweep_note <bead_id> <rc> [<result>] — record how ONE candidate ended. In memory only: nothing
+# is written per candidate, so a saturated pool still costs zero writes per bead.
+_pilot_sweep_note() {
+  SWEEP_OUTCOMES="${SWEEP_OUTCOMES:-}${1}"$'\t'"${2}"$'\t'"${3:-}"$'\n'
+  return 0
+}
+
+# _pilot_sweep_emit — append the ONE aggregate line. Never fatal (observability must not turn into an
+# outage: it always returns 0), but never SILENT either: a write that fails is announced with a WARN, because
+# a lost line would otherwise read as "no sweep evaluated candidates" — the very blind spot this event
+# removes. A slot/saturation value that is not a number is written as null (unknown), never as a 0 that a
+# consumer would read as "no free slot" / "not saturated". jq does the tally, so bash 3.2 (no associative
+# arrays) is no constraint.
+_pilot_sweep_emit() {
+  local _ts _line
+  _ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if _line=$(printf '%s' "${SWEEP_OUTCOMES:-}" | jq -R -s -c \
+    --arg ts "$_ts" --arg dry_run "${DRY_RUN:-0}" \
+    --arg saturated "${_pool_saturated_sweep:-0}" \
+    --arg small "${SMALL_SLOTS:-0}" --arg big "${BIG_SLOTS:-0}" '
+    def num($s): (try ($s | tonumber) catch null);
+    def cls($o):
+      if $o.rc == "0" then "dispatched"
+      elif $o.r == "rig_native_pool_session_cap_queued" then "queued_pool_cap"
+      elif $o.r == "rig_native_global_session_cap_queued" then "queued_global_cap"
+      elif $o.r == "rig_native_spawn_failed" then "spawn_failed"
+      elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_pool_target_only", "rig_dedup_skip"]
+           | any(.[]; . == $o.r) then "refused_by_guard"
+      elif $o.r == "" then "unclassified"
+      else "failed_other" end;
+    (split("\n") | map(select(length > 0) | split("\t"))) as $rows
+    | (reduce $rows[] as $x ({}; .[$x[0]] = {rc: ($x[1] // ""), r: ($x[2] // "")})) as $by_bead
+    | ($by_bead | [.[]]) as $outs
+    | def n($c): [$outs[] | select(cls(.) == $c)] | length;
+      def tally($xs): $xs | group_by(.) | map({key: .[0], value: length}) | from_entries;
+      { ts: $ts, event: "pilot_sweep", dry_run: $dry_run,
+        candidates: ($outs | length),
+        dispatched: n("dispatched"),
+        queued_pool_cap: n("queued_pool_cap"),
+        queued_global_cap: n("queued_global_cap"),
+        spawn_failed: n("spawn_failed"),
+        refused_by_guard: tally([$outs[] | select(cls(.) == "refused_by_guard") | .r]),
+        failed_other: n("failed_other"),
+        unclassified: n("unclassified"),
+        pool_saturated: num($saturated),
+        small_slots: num($small), big_slots: num($big),
+        results: tally([$outs[] | select(.r != "") | .r]) }
+    ' 2>/dev/null) && [ -n "$_line" ] \
+     && { mkdir -p "$(dirname "$PILOT_LOG")" && printf '%s\n' "$_line" >> "$PILOT_LOG"; } 2>/dev/null; then
+    :
+  else
+    warn "ga-ov3gow: could not append the pilot_sweep line to $PILOT_LOG — this sweep leaves no aggregate event (its dispatch results are unaffected)."
+  fi
+  return 0
+}
 
 # dispatch_lane <lane> <candidates_json> <free_slots>
 # Loops pick→dispatch→remove until the lane is full or candidates are exhausted.
@@ -10775,6 +10884,9 @@ dispatch_lane() {
       if _pilot_note_pool_cap_queued "$pick_id"; then
         log "ga-in9ebr: $pick_id QUEUED — routed to $_PCAP_POOL, pool at session cap ($_PCAP_LIVE active/creating >= $_PCAP_MAX max); not claimed, no writes this sweep (the ga-93yxc pool top-up opens a session once a slot frees)."
       fi
+      # ga-ov3gow: this bead never reaches dispatch_one(), so nothing else would record it — and it is the
+      # commonest queue path. Same name dispatch_one() gives the in-arm cap: one kind of queue, one bucket.
+      _pilot_sweep_note "$pick_id" 1 "rig_native_pool_session_cap_queued"
       continue
     fi
 
@@ -10790,11 +10902,17 @@ dispatch_lane() {
     # non-dispatch, so a sweep that only queued behind full pools is not read as a stall.
     _PCAP_CALL_QUEUED=0
     if dispatch_one "$pick" "$lane" "$pick_tier"; then
+      _pilot_sweep_note "$pick_id" 0 "${DISPATCH_RESULT:-}"
       filled=$((filled + 1))
       slots=$((slots - 1))
       DISPATCHED=$((DISPATCHED + 1))
-    elif [ "$_PCAP_CALL_QUEUED" != "1" ]; then
-      NONQUEUE_FAILS=$((NONQUEUE_FAILS + 1))
+    else
+      # ga-ov3gow: record WHY it did not dispatch (DISPATCH_RESULT, "" when dispatch_one() returned from
+      # one of its early guards without naming a reason) for the per-sweep `pilot_sweep` event.
+      _pilot_sweep_note "$pick_id" 1 "${DISPATCH_RESULT:-}"
+      if [ "$_PCAP_CALL_QUEUED" != "1" ]; then
+        NONQUEUE_FAILS=$((NONQUEUE_FAILS + 1))
+      fi
     fi
 
     # Mid-loop Dolt backoff (constraint a): if work remains, re-check the cheap CPU
@@ -10896,6 +11014,10 @@ fi
 if [ "$DISPATCHED" -eq "0" ]; then
   log "No dispatches this sweep (lane slots may have been won by a concurrent process, or all picks skipped)."
 fi
+
+# ga-ov3gow: the sweep's ONE aggregate `pilot_sweep` line (schema: the block above dispatch_lane). After
+# _pool_saturated_sweep exists — it is a field — and before Step 5, so a Step 5 failure cannot cost the event.
+_pilot_sweep_emit
 
 # ── Step 5: Stall observability (ga-y1m40) ────────────────────────────────────
 # No alarm existed for "lane(s) had free slots and nothing dispatched, sweep
