@@ -119,28 +119,16 @@ else
     ok "ratchet scans $n_files production-class scripts under packs/ and scripts/"
     # shellcheck disable=SC2046
     FINDINGS="$(cd "$CITY_DIR" && scan_pipefail_grep_q_files $(printf '%s ' $PROD_LIST))"
-    # known, tracked exception: reaper.sh is fixed in ga-hpdpij (in flight when this landed).
-    # Pinned to the exact count measured 20/09/2026, not "any n>0" — an untracked count
-    # would let a genuinely NEW site slip in disguised as this old, already-known debt
-    # (the very defect class this self-audit section exists to catch, ga-5bxuam's own
-    # gate-done sweep). Fewer sites (partial independent fix) is fine, not flagged; the
-    # bar to update on ga-hpdpij's own merge is: KNOWN_N=0, or delete this exception.
-    KNOWN="packs/town-deltas/assets/scripts/reaper.sh"
-    KNOWN_N=4
     bad_files=0
     while IFS= read -r pf; do
       [ -z "$pf" ] && continue
       n=$(grep -c "^${pf//./\\.}:" <<<"$FINDINGS")
       if [ "$n" -gt 0 ]; then
-        if [ "$pf" = "$KNOWN" ] && [ "$n" -le "$KNOWN_N" ]; then
-          ok "known exception (ga-hpdpij): $pf has $n site(s) (<= $KNOWN_N tracked) until that fix lands"
-        else
-          bad "$pf: $n \`| grep -q\` site(s) under pipefail (first: $(grep -m1 "^${pf//./\\.}:" <<<"$FINDINGS" | cut -c1-150))"
-          bad_files=$((bad_files + 1))
-        fi
+        bad "$pf: $n \`| grep -q\` site(s) under pipefail (first: $(grep -m1 "^${pf//./\\.}:" <<<"$FINDINGS" | cut -c1-150))"
+        bad_files=$((bad_files + 1))
       fi
     done < <(cut -d: -f1 <<<"$FINDINGS" | sort -u)
-    [ "$bad_files" = 0 ] && ok "no production script (other than the tracked exception) carries the racy idiom"
+    [ "$bad_files" = 0 ] && ok "no production script carries the racy idiom"
   fi
   # informational, not asserted: the debt that remains in test code
   TEST_LIST="$(cd "$CITY_DIR" 2>/dev/null && find packs scripts -type f \( -name '*.selftest.sh' -o -name '*.test.sh' -o -path '*/tests/*.sh' \) \
