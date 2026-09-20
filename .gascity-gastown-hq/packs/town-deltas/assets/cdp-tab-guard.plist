@@ -12,8 +12,10 @@
 
        WHY: 2026-09-19 07:44-07:52 four renderers hit 3.0/2.8/2.6/2.4 GB (agent puppeteer
        scripts left one multi-GB tab open per run: disconnect() does not close the tab) ->
-       swap 6->10 GB -> disk 10->2 GB. chrome_cdp_watchdog.sh caps `ps rss`, blind to
-       compressed memory, and recycles the WHOLE Chrome when it does fire.
+       swap 6->10 GB -> disk 10->2 GB. At that time chrome_cdp_watchdog.sh capped `ps rss`,
+       blind to compressed memory, and it recycles the WHOLE Chrome when it fires. Since
+       ga-4kn6j8 it caps the same FOOTPRINT (4096 MB) and recycles only after 900 s over
+       the cap (180 s over 8192 MB), so this guard gets the first chance to close the heavy tab.
 
        Cost of one run, measured 2026-09-19 at load average 30-36: 0.2-0.6 s wall, ~0.2 s CPU,
        no CDP connection (it only talks to Chrome when a heavy+idle renderer exists). The

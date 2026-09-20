@@ -66,8 +66,12 @@ three pages taking 21 s to map. `PROBE dead=N` + `SKIP UNMAPPED` repeating in th
 tab exists is the tell: raise CDP_TAB_GUARD_PING_S; (5) every page must be placed within the 45 s
 mapping budget, so on a starved box with very many tabs the run can end in PARTIAL_PROBE (inert).
 
-OUT OF SCOPE: chrome_cdp_watchdog.sh keeps its whole-Chrome recycle and its `ps rss` cap
-(moving that cap to footprint is a separate follow-up); the MBP Chrome (:9223).
+OUT OF SCOPE: (a) chrome_cdp_watchdog.sh keeps the whole-Chrome recycle. Since ga-4kn6j8 it caps
+this same FOOTPRINT number (4096 MB), no longer `ps rss` (the blind spot above), and recycles
+only after the footprint stays over the cap for 900 s (CHROME_CAP_GRACE_S = this guard's 10 min
+idle window + ~5 min to close the tab), so this guard gets the first chance; >= 8192 MB for 180 s
+recycles without waiting the full grace. It reads none of this guard's files, by design: if
+IDLE_SEC changes, revisit that grace by hand. (b) the MBP Chrome (:9223).
 
 CONFIG (env, CDP_TAB_GUARD_*; garbage or non-positive numeric values fall back to the default so
 a typo can never lower the ceiling to 0; ACTION is armed only by an absent variable or exactly 1,
