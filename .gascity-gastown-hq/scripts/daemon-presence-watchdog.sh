@@ -2028,8 +2028,8 @@ GCSTUB43
   # "must be absent" check fail unconditionally regardless of the real
   # function's content (confirmed live while writing this scenario).
   _s48_prod_code="$(awk '/if \[ "\$\{1:-\}" = "--selftest"/{exit} {print}' "$0")"
-  if grep -qF 'strings "$resolved" 2>/dev/null | grep -qF "$marker"' <<< "$_s48_prod_code"; then
-    bad "_binary_has_marker regressed to the racy strings|grep -qF direct-pipe form"
+  if grep -qF 'strings "$resolved" 2>/dev/null | grep -qF "$marker"' <<< "$_s48_prod_code"; then   # erro-vs-vazio: ok quoted text of the racy form the guard forbids, not a pipeline
+    bad "_binary_has_marker regressed to the racy strings|grep -qF direct-pipe form"   # erro-vs-vazio: ok message text, not a pipeline
   else
     ok "_binary_has_marker's racy direct-pipe form is gone"
   fi

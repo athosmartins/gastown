@@ -33,7 +33,7 @@ set +e  # the harness counts its own pass/fail
 for fn in scan_shell_query_masking scan_js_empty_catch scan_py_bare_except scan_launchd_no_notify \
   scan_bd_list_no_limit scan_bd_gate_no_infra scan_bd_formatted_output_parsed scan_pipe_then_exit_code \
   scan_jq_length_as_existence scan_git_stale_cache_check _allowlisted _allowlisted_range \
-  _join_continued_lines _split_statements run_scan; do
+  _join_continued_lines _split_statements run_scan scan_pipefail_grep_q scan_pipefail_grep_q_files; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by scanner"; exit 1; }
 done
 
@@ -1033,6 +1033,153 @@ _perf_elapsed=$(( $(date +%s) - _perf_start ))
   || bad "ga-jd3kux PERF REGRESSION: scan_py_bare_except took ${_perf_elapsed}s on the 4000-line worst-case file, expected <=10s (measured ~0.019s when this fix was written) — check for an accidental reintroduction of a per-line fork"
 rm -rf "$PERFDIR"
 
+# ══════════════════════════════════════════════════════════════════════
+# C10 (ga-5bxuam): `<writer> | grep -q ...` in a script that sets pipefail.
+# Detection + falsification + the race the docstring claims, on THIS host.
+# NOTE for whoever edits this section: it must not use `| grep -q` itself
+# (this file runs under pipefail) — read text via here-strings / grep -c.
+# ══════════════════════════════════════════════════════════════════════
+echo "── scan_pipefail_grep_q (C10, ga-5bxuam) ──"
+C10DIR="$FIXDIR/c10"
+mkdir -p "$C10DIR"
+
+# c10_n <file>... — number of C10 findings (grep -c reads to EOF: no early exit).
+c10_n() { local o; o="$(scan_pipefail_grep_q_files "$@")"; [ -z "$o" ] && { echo 0; return; }; grep -c ':C10:' <<<"$o"; }
+
+# ── true positives: every shape the tree actually used (250 sites in 53 files) ──
+cat > "$C10DIR/bad_printf.sh" <<'EOF'
+set -uo pipefail
+if printf '%s' "$x" | grep -qE 'a|b'; then echo yes; fi
+EOF
+cat > "$C10DIR/bad_echo_flags.sh" <<'EOF'
+set -euo pipefail
+echo "$x" | grep -Fxq -- "$y" && echo hit
+EOF
+cat > "$C10DIR/bad_long_flags.sh" <<'EOF'
+set -o pipefail
+cmd | grep --quiet foo
+cmd | grep --silent bar
+EOF
+cat > "$C10DIR/bad_cmdsub.sh" <<'EOF'
+set -o errexit -o pipefail
+v=$(cmd | grep -qi foo && echo 1)
+msg="$(echo "$x" | grep -q x && echo yes)"
+EOF
+cat > "$C10DIR/bad_continuation.sh" <<'EOF'
+set -uo pipefail
+printf '%s' "$norm" | grep -Eq \
+  'AAA|BBB' && return 0
+EOF
+cat > "$C10DIR/bad_negated_prefixed.sh" <<'EOF'
+set -uo pipefail
+if ! printf '%s\n' "$x" | grep -q foo; then :; fi
+cmd | command grep -q foo
+cmd | /usr/bin/grep -qx foo
+EOF
+[ "$(c10_n "$C10DIR/bad_printf.sh")" = 1 ] && ok "C10: printf | grep -qE under pipefail is flagged" || bad "C10: printf | grep -qE not flagged"
+[ "$(c10_n "$C10DIR/bad_echo_flags.sh")" = 1 ] && ok "C10: echo | grep -Fxq -- under set -euo pipefail is flagged" || bad "C10: echo | grep -Fxq not flagged"
+[ "$(c10_n "$C10DIR/bad_long_flags.sh")" = 2 ] && ok "C10: --quiet and --silent are flagged" || bad "C10: long quiet flags: $(c10_n "$C10DIR/bad_long_flags.sh") findings, want 2"
+[ "$(c10_n "$C10DIR/bad_cmdsub.sh")" = 2 ] && ok "C10: inside \$(...) and \"\$(...)\" (set -o errexit -o pipefail form) is flagged" || bad "C10: command substitution: $(c10_n "$C10DIR/bad_cmdsub.sh") findings, want 2"
+o="$(scan_pipefail_grep_q "$C10DIR/bad_continuation.sh")"
+[ "$(c10_n "$C10DIR/bad_continuation.sh")" = 1 ] && [[ "$o" == *"bad_continuation.sh:2:C10:"* ]] \
+  && ok "C10: a backslash-continued statement is reported once, on its START line" || bad "C10: continuation: $o"
+[ "$(c10_n "$C10DIR/bad_negated_prefixed.sh")" = 3 ] && ok "C10: '! x | grep -q', 'command grep -q' and '/usr/bin/grep -qx' are flagged" || bad "C10: negated/prefixed: $(c10_n "$C10DIR/bad_negated_prefixed.sh") findings, want 3"
+
+# ── falsification: the FIXED forms and unrelated shapes must produce ZERO ──
+cat > "$C10DIR/good_shapes.sh" <<'EOF'
+set -uo pipefail
+printf '%s' "$x" | grep -E 'a|b' >/dev/null
+printf '%s' "$labels" | grep "gate:needs-human" >/dev/null && echo blocked
+grep -q foo <<<"$x"
+grep -q foo /etc/hosts
+cmd || grep -q foo file
+cmd | grep -c foo
+# printf '%s' "$x" | grep -q commented-out
+cmd | grep -e "-q" file
+EOF
+cat > "$C10DIR/good_no_pipefail.sh" <<'EOF'
+set -u
+printf '%s' "$x" | grep -q foo && echo "safe without pipefail: the status is grep's"
+EOF
+cat > "$C10DIR/good_pipefail_off.sh" <<'EOF'
+set +o pipefail
+printf '%s' "$x" | grep -q foo
+EOF
+cat > "$C10DIR/allowlisted.sh" <<'EOF'
+set -uo pipefail
+printf '%s' "$x" | grep -q foo   # erro-vs-vazio: ok fixture, deliberate
+printf '%s' "$x" | grep -q foo
+EOF
+[ "$(c10_n "$C10DIR/good_shapes.sh")" = 0 ] && ok "C10 falsification: fixed forms, here-string, file operand, ||, grep -c, comment and quoted -q are all clean" || bad "C10 falsification: $(scan_pipefail_grep_q "$C10DIR/good_shapes.sh")"
+[ "$(c10_n "$C10DIR/good_no_pipefail.sh")" = 0 ] && ok "C10 falsification: the same idiom WITHOUT pipefail is not a finding" || bad "C10: flagged a file without pipefail"
+[ "$(c10_n "$C10DIR/good_pipefail_off.sh")" = 0 ] && ok "C10 falsification: 'set +o pipefail' does not enable it" || bad "C10: set +o pipefail treated as enabling"
+o="$(scan_pipefail_grep_q "$C10DIR/allowlisted.sh")"
+[ "$(c10_n "$C10DIR/allowlisted.sh")" = 1 ] && [[ "$o" == *"allowlisted.sh:3:C10:"* ]] \
+  && ok "C10: '# erro-vs-vazio: ok <razao>' suppresses exactly its own line" || bad "C10: allowlist: $o"
+
+# ── pipefail SCOPE: column-0 set = whole rest of file; nested/one-liner = local ──
+cat > "$C10DIR/scoped_subshell.sh" <<'EOF'
+set -u
+before() { printf '%s' "$x" | grep -q foo; }
+( set -o pipefail; printf '%s' "$x" | grep -q foo )
+after() { printf '%s' "$x" | grep -q foo; }
+EOF
+cat > "$C10DIR/scoped_global_later.sh" <<'EOF'
+set -u
+pre() { echo "$x" | grep -q foo; }
+set -euo pipefail
+post() { echo "$x" | grep -q foo; }
+EOF
+o="$(scan_pipefail_grep_q "$C10DIR/scoped_subshell.sh")"
+[ "$(c10_n "$C10DIR/scoped_subshell.sh")" = 1 ] && [[ "$o" == *"scoped_subshell.sh:3:C10:"* ]] \
+  && ok "C10 scope: only the one-line '( set -o pipefail; ... )' subshell is flagged, not the code before/after it" || bad "C10 scope (subshell): $o"
+o="$(scan_pipefail_grep_q "$C10DIR/scoped_global_later.sh")"
+[ "$(c10_n "$C10DIR/scoped_global_later.sh")" = 1 ] && [[ "$o" == *"scoped_global_later.sh:4:C10:"* ]] \
+  && ok "C10 scope: a column-0 'set -euo pipefail' enables only what comes AFTER it" || bad "C10 scope (global): $o"
+
+# ── multi-file pass: pipefail state must NOT leak from one file into the next ──
+o="$(scan_pipefail_grep_q_files "$C10DIR/bad_printf.sh" "$C10DIR/good_no_pipefail.sh" "$C10DIR/bad_echo_flags.sh")"
+n_bad=$(grep -c "bad_" <<<"$o"); n_good=$(grep -c "good_no_pipefail" <<<"$o")
+[ "$n_bad" = 2 ] && [ "$n_good" = 0 ] && ok "C10 multi-file: one awk pass, correct FILENAME attribution, no pipefail leak between files" || bad "C10 multi-file: bad=$n_bad good=$n_good  ($o)"
+[ -z "$(scan_pipefail_grep_q_files 2>&1)" ] && ok "C10: no files -> no output, no error" || bad "C10: output with zero files"
+
+# ── wired into run_scan ──
+C10OUT="$(mktemp)"
+run_scan "$C10OUT" "$C10DIR"
+n_scan=$(grep -c ':C10:' "$C10OUT")
+# bad_printf 1 + bad_echo_flags 1 + bad_long_flags 2 + bad_cmdsub 2 + bad_continuation 1 + bad_negated_prefixed 3
+#   + allowlisted 1 + scoped_subshell 1 + scoped_global_later 1 = 13
+[ "$n_scan" = 13 ] && ok "run_scan reports C10 for a whole directory (13 findings; good/allowlisted fixtures stay silent)" || bad "run_scan C10 count: $n_scan, want 13"
+rm -f "$C10OUT"
+
+# ── the claim itself, on this host, deterministic: >64 KB input, match on line 1 ──
+# grep -q leaves after the first read while printf is still writing: the writer gets
+# SIGPIPE, pipefail makes the pipeline 141, and a MATCH reads as "no match".
+BIG="$(printf 'needle\n'; head -c 140000 /dev/zero | tr '\0' 'x')"
+race_bad=0
+for _i in 1 2 3 4 5; do
+  ( set -o pipefail; printf '%s\n' "$BIG" | grep -q needle ) || race_bad=$((race_bad + 1))  # erro-vs-vazio: ok deliberate: this IS the race being demonstrated
+done
+[ "$race_bad" -ge 1 ] && ok "race reproduced: 'printf | grep -q needle' (pattern on line 1, 140 KB) reported NO MATCH in $race_bad of 5 runs" \
+  || bad "race NOT reproduced (0 of 5) — the premise of C10 is unproven on this host; investigate before trusting the scanner"
+fix_bad=0
+for _i in 1 2 3 4 5; do
+  ( set -o pipefail; printf '%s\n' "$BIG" | grep needle >/dev/null ) || fix_bad=$((fix_bad + 1))
+  ( set -o pipefail; grep -q needle <<<"$BIG" ) || fix_bad=$((fix_bad + 1))
+done
+[ "$fix_bad" = 0 ] && ok "both fixes hold on the same input: 'grep PAT >/dev/null' and 'grep -q PAT <<<\"\$var\"' matched 10 of 10" || bad "a recommended fix failed $fix_bad of 10 times on the 140 KB input"
+# equivalence on ordinary inputs: the drop-q form answers exactly like -q. The REFERENCE reads the
+# input from a file (grep -q PAT < file: no pipeline, so it cannot race); the candidate is the pipe.
+eq_bad=0
+EQF="$FIXDIR/c10_eq_input"
+for input in "" "needle" "xneedlex" $'a\nneedle\nb' $'a\nb' "NEEDLE" "-needle"; do
+  printf '%s' "$input" > "$EQF"
+  grep -q needle < "$EQF"; a=$?
+  ( set -o pipefail; printf '%s' "$input" | grep needle >/dev/null ); b=$?
+  [ "$a" = "$b" ] || eq_bad=$((eq_bad + 1))
+done
+[ "$eq_bad" = 0 ] && ok "equivalence: 'grep -q PAT < file' and 'printf | grep PAT >/dev/null' agree on empty / match / no-match / multiline / case / leading-dash input" || bad "equivalence broken on $eq_bad input(s)"
+
 echo "── run_scan end-to-end (mixed fixture dir) ──"
 MIXED_OUT="$(mktemp)"
 run_scan "$MIXED_OUT" "$FIXDIR/mixed"
@@ -1135,7 +1282,7 @@ rm -f "$CLEAN_OUT"
 echo "── CLI wrapper ──"
 out="$(bash "$SCANNER" --path "$FIXDIR/mixed" --quiet)"; rc=$?
 [ "$rc" = "0" ] && ok "CLI exits 0 on a completed scan with findings" || bad "CLI exit code was $rc, expected 0"
-printf '%s\n' "$out" | grep -q '^error-empty-conflation-scan: 30 finding(s)$' \
+printf '%s\n' "$out" | grep '^error-empty-conflation-scan: 30 finding(s)$' >/dev/null \
   && ok "CLI summary line reports 30 finding(s)" || bad "CLI summary line unexpected: $(printf '%s\n' "$out" | head -1)"
 
 bash "$SCANNER" --path "$FIXDIR/does-not-exist" --quiet >/tmp/.conflation-selftest-missing-path.$$ 2>&1
@@ -1155,7 +1302,7 @@ rm -f "/tmp/.conflation-selftest-missing-path.$$"
 echo "── real-tree smoke test ──"
 real_out="$(bash "$SCANNER" --quiet)"; rc=$?
 [ "$rc" = "0" ] && ok "real-tree scan completes, exit 0" || bad "real-tree scan exited $rc"
-printf '%s\n' "$real_out" | grep -qE '^error-empty-conflation-scan: [0-9]+ finding' \
+printf '%s\n' "$real_out" | grep -E '^error-empty-conflation-scan: [0-9]+ finding' >/dev/null \
   && ok "real-tree scan prints a well-formed summary line" || bad "real-tree scan summary line malformed: $(printf '%s\n' "$real_out" | head -1)"
 
 echo ""

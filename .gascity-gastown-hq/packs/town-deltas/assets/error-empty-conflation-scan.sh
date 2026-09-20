@@ -19,6 +19,11 @@
 #       succeeded with zero rows": `VAR=$(query-cmd ...) ... || echo <empty>`.
 #   C3  a launchd job whose target script never calls a notification path —
 #       silence is not success.
+#   C4-C9  see the scan_* docstrings below (bd list without --limit, gate beads
+#       without --include-infra, ...).
+#   C10 (ga-5bxuam) `<writer> | grep -q ...` in a script that sets pipefail: the
+#       early-exiting reader lets the writer catch SIGPIPE and a MATCH is
+#       reported as "no match" (7-22% at load 40). Details at scan_pipefail_grep_q.
 #
 # Calibrated against real precedent already in this codebase:
 #   verdict_count_from_query()  — quality-gate-guard.sh, ga-jfo7
@@ -798,6 +803,95 @@ scan_git_stale_cache_check() {
   done
 }
 
+# ── C10 (ga-5bxuam): `<writer> | grep -q ...` in a script that sets pipefail ──
+# The reader exits on its FIRST match while the writer (printf / echo / a
+# command) can still be writing. The writer then catches SIGPIPE, and with
+# `set -o pipefail` the pipeline's status becomes the writer's 141 instead of
+# grep's 0: a MATCH is reported as "no match". No abort, no error text — a
+# wrong DECISION (guard, skip, "not found"), and only while the machine is busy.
+# It is the quietest member of the pipefail family: `tail | head` SIGPIPE and
+# a no-match `grep` both ABORT the script loudly; this one just answers wrong.
+#
+# Measured 20/09/2026 on this host at load 37-45, pattern ALWAYS present,
+# 1500 tries per cell (false "no match"):
+#   printf | grep -q    130 B 7.5%   1.9 KB 5.1%   4 KB 8.1%
+#   echo   | grep -q    130 B 5.2%   1.9 KB 7.3%   4 KB 22%
+#   here-string, and `| grep PAT >/dev/null` (no -q):  0% at every size.
+# and 100% deterministic once the input is bigger than the pipe buffer (64 KB).
+#
+# FIX (pick one; NEVER `|| true`, it hides the flip instead of removing it):
+#   - drop -q and add >/dev/null:   x | grep -E PAT >/dev/null   (grep reads to
+#     EOF, so the writer always finishes; exit status is still grep's and
+#     pipefail still reflects a genuinely failing writer)
+#   - grep -q PAT <<<"$var"          (no pipeline at all; a here-string always
+#     ends in a newline, so `printf '%s' ""` differs for empty-matching PAT)
+#   - case / grep -q PAT file
+#
+# Heuristic, report-only, like the rest of this file. Scope rules:
+#   - pipefail is enabled by a `set ... -o pipefail` / `shopt -so pipefail`
+#     line. At column 0 it enables the rest of the FILE; anywhere else (an
+#     indented line, or inside `( set -o pipefail; ... )`) it is scoped to the
+#     next column-0 `}` / `)` (a one-line subshell: that line only).
+#   - a hit needs a `|` right before the reader, so `grep -q PAT file` and
+#     `grep -q PAT <<<"$v"` are NOT findings (no writer, nothing to SIGPIPE).
+#   - heredoc bodies and multi-line quoted strings are NOT tracked: a line in
+#     one that looks like the idiom is reported. Mark reviewed-and-fine lines
+#     with the shared allowlist comment:  # erro-vs-vazio: ok <razao>
+#   - `-eq`-style clusters where q is the ARGUMENT of -e are reported too
+#     (rare; allowlist them).
+#
+# ONE awk process handles any number of files (state is reset at each file's
+# first line), so a whole-tree ratchet stays cheap: the per-file fork this
+# file's other detectors pay is exactly what made scans slow (ga-kqznp).
+_C10_AWK_PROGRAM=""
+IFS= read -r -d '' _C10_AWK_PROGRAM <<'C10AWK' || true
+BEGIN {
+  IDIOM = "(^|[^|])[|][[:space:]]*((command|builtin)[[:space:]]+|/usr/bin/|/bin/)*(grep|egrep|fgrep|ugrep)[[:space:]]+([^|;&]*[[:space:]])?(-[A-Za-z0-9]*q[A-Za-z0-9]*|--quiet|--silent)([[:space:]]|$|[;&|)])"
+  SETPF = "(^|[^A-Za-z0-9_])(set|shopt)[[:space:]]+([^;#|&]*[[:space:]])?-[A-Za-z]*o[[:space:]]+pipefail"
+}
+FNR == 1 { pf = 0; pf_local = 0; cont = 0; buf = "" }
+{
+  line = $0
+  if (line ~ /^[})]/) pf_local = 0
+  if (cont) { buf = buf " " line } else { buf = line; start = FNR }
+  if (line ~ /\\$/) { buf = substr(buf, 1, length(buf) - 1); cont = 1; next }
+  cont = 0
+  t = buf
+  sub(/^[[:space:]]+/, "", t)
+  if (t ~ /^#/) next
+  oneshot = 0
+  if (buf ~ SETPF) {
+    if (buf ~ /^(set|shopt)[[:space:]]/) pf = 1
+    else {
+      pf_local = 1
+      if (buf ~ /[(][^)]*(set|shopt)[^)]*pipefail[^)]*[)]/) oneshot = 1
+    }
+  }
+  if ((pf || pf_local) && buf ~ IDIOM) {
+    if (tolower(buf) !~ /erro-vs-vazio:[[:space:]]*ok/) {
+      s = buf
+      gsub(/[[:space:]]+/, " ", s)
+      sub(/^ /, "", s)
+      if (length(s) > 200) s = substr(s, 1, 200)
+      printf "%s:%d:C10:%s\n", FILENAME, start, s
+    }
+  }
+  if (oneshot) pf_local = 0
+}
+C10AWK
+
+# scan_pipefail_grep_q_files <file>... — the multi-file core (one awk process).
+# Prints "file:line:C10:snippet". Unreadable files are skipped by awk itself.
+scan_pipefail_grep_q_files() {
+  [ "$#" -gt 0 ] || return 0
+  awk "$_C10_AWK_PROGRAM" "$@" 2>/dev/null
+}
+
+# scan_pipefail_grep_q <file> — same calling convention as every other scan_*.
+scan_pipefail_grep_q() {
+  scan_pipefail_grep_q_files "$1"
+}
+
 # ── driver ───────────────────────────────────────────────────────────────────
 # run_scan <findings_file> <root>... — appends "file:line:CATEGORY:snippet"
 # lines to findings_file (truncated first). Count is the caller's job (just
@@ -911,6 +1005,13 @@ run_scan() {
     fi
 
     scan_git_stale_cache_check "$f" >>"$findings_file"
+
+    # ga-5bxuam (C10): early-exit `grep -q` reader under pipefail. File-level
+    # pre-filter (one cheap grep, no pipe): a file that never mentions
+    # pipefail cannot be in scope, so most files skip the awk pass entirely.
+    if grep -q 'pipefail' "$f" 2>/dev/null; then
+      scan_pipefail_grep_q "$f" >>"$findings_file"
+    fi
   done < <(find "${roots[@]}" -type f -name '*.sh' "${EXCL[@]}" -print0 2>/dev/null)
 
   while IFS= read -r -d '' f; do
