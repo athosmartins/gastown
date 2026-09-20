@@ -107,6 +107,42 @@
 #         The order declares timeout = "900s" (orders/mol-dog-reaper.toml): the engine default for
 #         an exec order is 300 s, and PURGE_BUDGET_S 240 + ORPHAN_BUDGET_S 180 + the fixed work
 #         can pass it.
+#  7. ga-hpdpij — TWO OBSERVABILITY GAPS THAT LEFT THE ORPHANS INVISIBLE (found executing ga-5dggst).
+#     (a) THE SUMMARY IS DURABLE. It used to leave the script only as `gc session nudge deacon/ ... || true` and
+#         a stdout echo — 0 hits in .gc/events.jsonl or in the deacon's transcript, so "purge_failed_chunks:0,
+#         anomalies:0" had to be inferred by SQL. Every run now appends ONE line (UTC timestamp + the exact DOG_DONE
+#         summary) to $GC_REAPER_SUMMARY_LOG (default <city>/.gc/runtime/reaper-summary.log; ~40 KB/day at one run
+#         per 30 min), size-capped (GC_REAPER_SUMMARY_LOG_MAX_BYTES, default 256 KiB) with GC_REAPER_SUMMARY_LOG_KEEP
+#         (default 3) rotated generations (.1 .. .N): `tail -2 <log>` answers "what did the last two rounds do"
+#         without SQL. A log that cannot be written never fails the run but is NOT silent: the stdout and DOG_DONE
+#         line then end in summary_log:FAILED. One that was written but could not be size-capped (the size was
+#         unreadable, or the live file could not be moved aside) ends in summary_log:UNCAPPED instead.
+#     (b) THE ORPHANS ARE COUNTED WHETHER OR NOT THE SWEEP RUNS. The "new producer" alert (note 6b) only fires in a
+#         run whose sweep finished. With the sweep stopped by the free-disk floor (18 GiB; ~10 GiB free on 20/09),
+#         switched off, capped or halted, no NEW orphan was counted or alerted — and with the backlog at 0 in all
+#         8 databases, their return would have been invisible. A read-only phase AFTER the whole per-database loop
+#         now counts, per database, the orphan rows of wisp_comments / wisp_labels / wisp_events (an anti-join
+#         against `wisps`, LIMIT GC_REAPER_ORPHAN_COUNT_ALERT+1 per table: it stops early and cannot run past
+#         Dolt's 30 s cutoff) and reports orphan_count in the summary — the orphans LEFT after this run's sweep.
+#         EVERY bead store is counted, including one the reaper SKIPPED for an unrecognised wisp_dependencies schema
+#         (schema_skipped_dbs): the count never reads that table, and that database is the one nobody is cleaning
+#         (ga-u8nbt9). Leaving it out printed orphan_count:0 while 500 orphans sat in it.
+#         More than GC_REAPER_ORPHAN_COUNT_ALERT (default 1000) in ONE database is an anomaly (mailed, sweep or no
+#         sweep). Its text carries no counts, so the dedupe of note 5 sends it once per TTL; the number is in the
+#         summary.
+#         THREE states, never two: a read that failed — or that the phase's own budget (GC_REAPER_ORPHAN_COUNT_BUDGET_S,
+#         default 90) never reached — is UNKNOWN, never a 0. orphan_count is a number when every probe answered and
+#         none hit its cap, "N+" (a lower bound) when something was capped or unanswered, "unknown" when nothing was
+#         measured or nothing measured had orphans while something else went unanswered, "off" with
+#         GC_REAPER_ORPHAN_COUNT=0; orphan_count_unknown:<probes> says how many probes got no answer.
+#         Why AFTER the loop and not per database: time spent inside it is charged to the purge budget of every
+#         later database (the same hazard the sweep's clock shift guards against, selftest O18; here C7).
+#     (c) THE SCHEMA PROBE NO LONGER FALSE-NEGATIVES. Building (b) exposed a flake in this script's own
+#         probe_dependency_table: `printf "$fields" | grep -qx <column>` under `set -o pipefail` can report FAILURE
+#         although the column is listed (grep -q exits on the first match; its writer catches SIGPIPE). It skipped
+#         HEALTHY databases as "unrecognised schema" — measured 8 of 300 probes at load ~45 (and every probe on a
+#         140 KB column list) — and made the reaper selftests fail at random under load. It is now the pipe-free
+#         field_listed (selftest C13). The same idiom may live in other scripts: ga-5bxuam.
 set -euo pipefail
 
 # Trace bd invocations to $GC_BD_TRACE when set (no-op otherwise).
@@ -153,6 +189,14 @@ ORPHAN_PAUSE_S="${GC_REAPER_ORPHAN_PAUSE_S:-0.2}"              # breather betwee
 # job (max(200% of the store, store + 3 GB): ~15 GiB for the 7.6 GB hq) and the disk guard's WARN.
 ORPHAN_MAX_ROWS="${GC_REAPER_ORPHAN_MAX_ROWS:-100000}"         # rows ONE run may sweep, all databases
 ORPHAN_MIN_FREE_GB="${GC_REAPER_ORPHAN_MIN_FREE_GB:-18}"       # no sweep below this much free disk on the city volume (0 = guard off)
+# ga-hpdpij (header note 7): a read-only COUNT of the orphan child rows every run — whether or not the sweep runs —
+# and a durable copy of the summary line.
+ORPHAN_COUNT="${GC_REAPER_ORPHAN_COUNT:-1}"                    # 0 switches the orphan COUNT off (the sweep has its own switch)
+ORPHAN_COUNT_ALERT="${GC_REAPER_ORPHAN_COUNT_ALERT:-1000}"     # orphan rows LEFT in ONE database above this is an anomaly
+ORPHAN_COUNT_BUDGET_S="${GC_REAPER_ORPHAN_COUNT_BUDGET_S:-90}" # wall-clock budget of the whole count phase, all databases
+SUMMARY_LOG="${GC_REAPER_SUMMARY_LOG:-$CITY_ABS/.gc/runtime/reaper-summary.log}"
+SUMMARY_LOG_MAX_BYTES="${GC_REAPER_SUMMARY_LOG_MAX_BYTES:-262144}"  # rotate the log at this size
+SUMMARY_LOG_KEEP="${GC_REAPER_SUMMARY_LOG_KEEP:-3}"                 # rotated generations kept (.1 .. .N)
 
 # Convert Go durations to SQL INTERVAL hours for Dolt.
 duration_to_hours() {
@@ -276,6 +320,15 @@ ORPHAN_HALT_REASON=""  # short, comma-free: the LAST such reason, for the DOG_DO
 PURGE_TRIPPED=0        # the purge's consecutive-failure breaker fired in this run: Dolt is unwell
 TOTAL_WOULD_SWEEP=0
 ORPHAN_DEADLINE=""   # $SECONDS value the sweep must stop at; set lazily by its first use
+# ga-hpdpij counters (header note 7b) — the read-only orphan COUNT, all databases. Three states: counted,
+# counted zero, could not count; only the first two ever reach ORPHAN_COUNT_TOTAL.
+ORPHAN_COUNT_TOTAL=0      # orphan rows counted (each probe capped at ORPHAN_COUNT_ALERT+1)
+ORPHAN_COUNT_PROBES=0     # (database, table) probes that ANSWERED
+ORPHAN_COUNT_CAPPED=0     # of those, the ones that hit the cap: the real number is AT LEAST what was counted
+ORPHAN_COUNT_UNKNOWN=0    # probes with NO answer (failed read, or the phase ran out of budget) — never a zero
+ORPHAN_COUNT_OVER_DBS=0   # databases with more than ORPHAN_COUNT_ALERT orphan rows left
+ORPHAN_COUNT_TEXT="unknown"   # what the summary prints for orphan_count (set by count_orphan_children)
+COUNT_DBS=""              # the bead stores (safe name + a wisps table) the main loop met, whatever it then did with them: the ones the count visits
 PURGE_START_EPOCH=$(date +%s)
 ANOMALIES=""
 
@@ -339,11 +392,22 @@ validate_num ORPHAN_BUDGET_S 180 1
 validate_num ORPHAN_ALERT 5000 1
 validate_num ORPHAN_MAX_ROWS 100000 2   # 2, not 1: a one-row DELETE is never sent (delete_rows_bounded), so a cap of 1 would sweep nothing
 validate_num ORPHAN_MIN_FREE_GB 18 0
+validate_num ORPHAN_COUNT_ALERT 1000 1
+validate_num ORPHAN_COUNT_BUDGET_S 90 1
+validate_num SUMMARY_LOG_MAX_BYTES 262144 1024
+validate_num SUMMARY_LOG_KEEP 3 1
 case "$ORPHAN_SWEEP" in
     0|1) ;;
     *)
         record_anomaly "config" "GC_REAPER_ORPHAN_SWEEP='$ORPHAN_SWEEP' is not 0 or 1; using the default 1"
         ORPHAN_SWEEP=1
+        ;;
+esac
+case "$ORPHAN_COUNT" in
+    0|1) ;;
+    *)
+        record_anomaly "config" "GC_REAPER_ORPHAN_COUNT='$ORPHAN_COUNT' is not 0 or 1; using the default 1"
+        ORPHAN_COUNT=1
         ;;
 esac
 # A decimal number of seconds (sleep accepts a fraction): digits with at most one dot.
@@ -419,6 +483,11 @@ elif [ -n "$CITY_DB" ] && ! database_list_contains "$CITY_DB"; then
 fi
 
 SQL_COUNT_RESULT=0
+# ga-hpdpij: SQL_COUNT_RESULT is 0 both for "counted zero" and for "could not count" (this function returns 0
+# either way; a failure is only recorded as an anomaly). A caller that must tell them apart — the orphan COUNT,
+# whose whole point is that a failed read never reads as "no orphans" — reads SQL_COUNT_FAILED, the twin of
+# SQL_ROWS_FAILED below. 0 = SQL_COUNT_RESULT is a real answer, 1 = it is not.
+SQL_COUNT_FAILED=0
 get_sql_count() {
     local db="$1"
     local label="$2"
@@ -429,13 +498,16 @@ get_sql_count() {
     local count
 
     SQL_COUNT_RESULT=0
+    SQL_COUNT_FAILED=0
     if ! stderr_file=$(mktemp); then
+        SQL_COUNT_FAILED=1
         record_anomaly "$db" "$label count failed for $db: could not create stderr capture file"
         return 0
     fi
     if ! output=$(dolt_sql -r csv -q "$query" 2>"$stderr_file"); then
         stderr_output=$(cat "$stderr_file" 2>/dev/null || true)
         rm -f "$stderr_file"
+        SQL_COUNT_FAILED=1
         record_anomaly "$db" "$label count failed for $db: $(sanitize_output "$stderr_output $output")"
         return 0
     fi
@@ -443,6 +515,7 @@ get_sql_count() {
 
     count=$(printf '%s\n' "$output" | tail -1 | tr -d '\r')
     if [ -z "$count" ] || ! [[ "$count" =~ ^[0-9]+$ ]]; then
+        SQL_COUNT_FAILED=1
         record_anomaly "$db" "$label count returned non-numeric value for $db: $(sanitize_output "$output")"
         return 0
     fi
@@ -500,6 +573,18 @@ get_sql_rows() {
 DEP_FLAVOR=""
 DEP_WISP_TARGET_COL=""
 DEP_ISSUE_TARGET_COL=""
+# field_listed <newline-separated names> <name>: is <name> one of the names — a WHOLE line, like `grep -x`?
+# A `case` on the whole string, NOT `printf "$names" | grep -qx <name>`: under `set -o pipefail` a grep that matches
+# and exits early can leave its writer with SIGPIPE, and the pipeline then reports FAILURE although the column IS
+# there. Measured 20/09 on this very input shape (a 130-byte column list, the pattern present every time): 44 false
+# negatives in 4000 tries at load ~45. In probe_dependency_table that read as "unrecognised schema" and skipped a
+# HEALTHY database for the whole run, with a misleading anomaly (ga-hpdpij; the class is ga-5bxuam).
+field_listed() {
+    case $'\n'"$1"$'\n' in
+        *$'\n'"$2"$'\n'*) return 0 ;;
+    esac
+    return 1
+}
 probe_dependency_table() {
     local db="$1"
     local table="$2"
@@ -515,17 +600,17 @@ probe_dependency_table() {
     fi
 
     fields=$(printf '%s\n' "$output" | tail -n +2 | cut -d, -f1 | tr -d '\r')
-    printf '%s\n' "$fields" | grep -qx 'issue_id' || return 1
+    field_listed "$fields" 'issue_id' || return 1
 
-    if printf '%s\n' "$fields" | grep -qx 'depends_on_issue_id'; then
+    if field_listed "$fields" 'depends_on_issue_id'; then
         DEP_FLAVOR="split"
         DEP_ISSUE_TARGET_COL="depends_on_issue_id"
-        if printf '%s\n' "$fields" | grep -qx 'depends_on_wisp_id'; then
+        if field_listed "$fields" 'depends_on_wisp_id'; then
             DEP_WISP_TARGET_COL="depends_on_wisp_id"
         fi
         return 0
     fi
-    if printf '%s\n' "$fields" | grep -qx 'depends_on_id'; then
+    if field_listed "$fields" 'depends_on_id'; then
         DEP_FLAVOR="legacy"
         DEP_ISSUE_TARGET_COL="depends_on_id"
         DEP_WISP_TARGET_COL="depends_on_id"
@@ -1088,6 +1173,83 @@ sweep_orphan_children() {  # sweep_orphan_children <db>
     return 0
 }
 
+# ga-hpdpij (header note 7b) — COUNT, never delete, the orphan child rows of every bead store the loop below
+# met (a safe name + a `wisps` table), whatever the sweep did (ran, halted by the disk floor or the purge breaker,
+# capped, switched off) and even when the reaper SKIPPED the database for its wisp_dependencies schema.
+# The sweep only reports what it swept, and its "new producer" alert only fires in a run that finished: with the
+# sweep stopped, a return of the orphans was invisible.
+#  * BOUNDED: an anti-join with LIMIT cap, cap = ORPHAN_COUNT_ALERT + 1 — index-ordered on issue_id, it stops as
+#    soon as it has `cap` orphan rows (the sweep's sample has the same shape: ~0.5 ms per orphan row on the
+#    1.9M-row wisp_events, where the same anti-join WITHOUT a limit costs 15-25 s, right at Dolt's 30 s cutoff).
+#    cap = alert + 1 keeps both answers exact: a database is over the limit iff its counted sum is > the alert,
+#    and a probe that reaches the cap is a LOWER BOUND (the summary says "N+").
+#  * THREE STATES: get_sql_count leaves 0 in SQL_COUNT_RESULT for a read that failed; SQL_COUNT_FAILED tells
+#    "counted zero" from "could not count". A failed probe — and one this phase's own budget never reached — is
+#    UNKNOWN: it never adds to the total and never reads as "no orphans" (get_sql_count already recorded the
+#    anomaly of a failed read; a budget cut is recorded below).
+#  * Its own budget ($SECONDS: no fork), and it runs AFTER the loop: a slow count must not be charged to the purge
+#    budget of the databases after it (selftest C7), and the order's timeout (orders/mol-dog-reaper.toml) covers
+#    it (selftest C12).
+#  * `wisps` is queried directly by the anti-join: an emptied `wisps` makes every child row an orphan. For the
+#    SWEEP that is a reason not to delete; for a count it is simply the truth (and one mail per TTL).
+# Sets ORPHAN_COUNT_TEXT: "off" | "unknown" | "N" | "N+" (see header note 7b).
+ORPHAN_COUNT_TABLES="wisp_comments wisp_labels wisp_events"   # small tables first, like the sweep
+count_orphan_children() {
+    local db table cap db_total deadline
+    local budget_hit=0
+
+    ORPHAN_COUNT_TEXT="off"
+    [ "$ORPHAN_COUNT" = "1" ] || return 0
+
+    cap=$((ORPHAN_COUNT_ALERT + 1))
+    deadline=$((SECONDS + ORPHAN_COUNT_BUDGET_S))
+    while IFS= read -r db; do
+        [ -n "$db" ] || continue
+        db_total=0
+        for table in $ORPHAN_COUNT_TABLES; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+                budget_hit=1
+                ORPHAN_COUNT_UNKNOWN=$((ORPHAN_COUNT_UNKNOWN + 1))
+                continue
+            fi
+            # One line on purpose (the selftest targets it by regex); $db passed valid_database_identifier.
+            get_sql_count "$db" "orphan $table" "SELECT COUNT(*) FROM (SELECT 1 FROM \`$db\`.$table c WHERE NOT EXISTS (SELECT 1 FROM \`$db\`.wisps w WHERE w.id = c.issue_id) LIMIT $cap) orphan_count_probe"
+            if [ "$SQL_COUNT_FAILED" -eq 1 ]; then
+                ORPHAN_COUNT_UNKNOWN=$((ORPHAN_COUNT_UNKNOWN + 1))
+                continue
+            fi
+            ORPHAN_COUNT_PROBES=$((ORPHAN_COUNT_PROBES + 1))
+            if [ "$SQL_COUNT_RESULT" -ge "$cap" ]; then
+                ORPHAN_COUNT_CAPPED=$((ORPHAN_COUNT_CAPPED + 1))
+            fi
+            db_total=$((db_total + SQL_COUNT_RESULT))
+        done
+        ORPHAN_COUNT_TOTAL=$((ORPHAN_COUNT_TOTAL + db_total))
+        if [ "$db_total" -gt "$ORPHAN_COUNT_ALERT" ]; then
+            ORPHAN_COUNT_OVER_DBS=$((ORPHAN_COUNT_OVER_DBS + 1))
+            # Stable text, NO counts: the mail dedupe keys on it, so this is sent once per TTL, not every run
+            # the number moves. The number is orphan_count in the DOG_DONE line and in the durable log.
+            record_anomaly "$db" "more than $ORPHAN_COUNT_ALERT child rows of wisps that no longer exist (orphan_count in the DOG_DONE line): the orphan sweep is not keeping up (stopped, capped or off) or something deletes wisps without their children"
+        fi
+    done <<EOF
+$COUNT_DBS
+EOF
+    if [ "$budget_hit" -eq 1 ]; then
+        record_anomaly "orphans" "the orphan count ran out of its ${ORPHAN_COUNT_BUDGET_S}s budget (GC_REAPER_ORPHAN_COUNT_BUDGET_S): some databases or tables were NOT counted (orphan_count_unknown in the DOG_DONE line)"
+    fi
+
+    if [ "$ORPHAN_COUNT_PROBES" -eq 0 ]; then
+        ORPHAN_COUNT_TEXT="unknown"                          # nothing was measured
+    elif [ "$ORPHAN_COUNT_TOTAL" -eq 0 ] && [ "$ORPHAN_COUNT_UNKNOWN" -gt 0 ]; then
+        ORPHAN_COUNT_TEXT="unknown"                          # the zeros that answered do not speak for the probes that did not
+    elif [ "$ORPHAN_COUNT_CAPPED" -gt 0 ] || [ "$ORPHAN_COUNT_UNKNOWN" -gt 0 ]; then
+        ORPHAN_COUNT_TEXT="${ORPHAN_COUNT_TOTAL}+"           # at least this many
+    else
+        ORPHAN_COUNT_TEXT="$ORPHAN_COUNT_TOTAL"              # every probe answered and none was capped: exact
+    fi
+    return 0
+}
+
 while IFS= read -r DB; do
     [ -z "$DB" ] && continue
     if ! valid_database_identifier "$DB"; then
@@ -1100,6 +1262,17 @@ while IFS= read -r DB; do
         # server into noise. See gastownhall/gascity#1816.
         continue
     fi
+    # ga-hpdpij (header note 7b): every database that reaches this line has a safe name and a `wisps` table — it is
+    # a bead store — so the orphan COUNT that runs after the loop (count_orphan_children) visits it, WHETHER OR NOT
+    # the reaper can then work on it. The count reads wisps and wisp_comments / wisp_labels / wisp_events and never
+    # wisp_dependencies, so the schema gate just below (which stops the purge and the sweep) has no business
+    # stopping the count either: a database the reaper skipped for its schema is exactly one nobody is cleaning
+    # (ga-u8nbt9), and leaving it out would print an exact-looking orphan_count over the OTHER databases while this
+    # one — the likeliest place for orphans — went unmeasured (repro: 500 orphan events in a schema-skipped
+    # database read as orphan_count:0). If its child tables cannot be read either, the probes fail and the count
+    # says so (unknown / "N+"); it never says 0. Kept here, not counted here: time spent inside this loop is
+    # charged to the purge budget of every later database.
+    COUNT_DBS="${COUNT_DBS}${DB}"$'\n'
     # ga-u8nbt9: this gate used to be `... || continue` with the comment "skip
     # silently". Once bd split depends_on_id it skipped EVERY database and
     # nothing anywhere said so. An unrecognised schema is now an anomaly AND a
@@ -1397,6 +1570,10 @@ done <<EOF
 $DATABASES
 EOF
 
+# ga-hpdpij (header note 7b): the read-only orphan COUNT, after every database's purge and sweep — so it reports
+# the orphans LEFT — and whether or not the sweep ran.
+count_orphan_children
+
 # Step 6: prune closed gm session beads from the city's primary bead store.
 if [ -d "$CITY_BEADS_DIR" ] && command -v bd >/dev/null 2>&1; then
     SESSION_PRUNE_ATTEMPTED=1
@@ -1490,7 +1667,9 @@ ISSUE_STEPS_STATE="off"
 # ga-x2fj8h: the new counters go BEFORE issue_steps so the tail of the line is unchanged. A chunk
 # that failed for good, and a sweep that failed or ran out of budget, are numbers here — the
 # 19/09 failure ("error on line 6 ... wisp_events") was only ever in the mail.
-SUMMARY="reaper — stale_wisps:$TOTAL_STALE_WISPS, closed_wisps:$TOTAL_CLOSED_WISPS, purged:$TOTAL_PURGED, sessions-pruned:$TOTAL_SESSIONS_PRUNED, closed:$TOTAL_ISSUES_CLOSED, expired:$TOTAL_EXPIRED_ISSUES_CLOSED, expired_skipped:$TOTAL_EXPIRED_ISSUES_SKIPPED, skipped_non_city_issues:$TOTAL_STALE_ISSUES_SKIPPED, mail_wisps:$TOTAL_MAIL_WISPS, purge_age_h:$PURGE_AGE_H, purge_batches:$PURGE_BATCHES, purge_capped_dbs:$PURGE_CAPPED_DBS, purge_failed_chunks:$PURGE_FAILED_CHUNKS, purge_child_rows:$PURGE_CHILD_ROWS, orphan_swept:$ORPHAN_SWEPT, orphan_capped_dbs:$ORPHAN_CAPPED_DBS, orphan_failed_dbs:$ORPHAN_FAILED, orphan_halted_dbs:$ORPHAN_HALTED_DBS, schema_skipped_dbs:$SCHEMA_SKIPPED_DBS, issue_steps:$ISSUE_STEPS_STATE, anomalies:$ANOMALY_COUNT"
+# ga-hpdpij: orphan_count* (the orphans LEFT, counted whether or not the sweep ran; "unknown" — never 0 — when
+# they could not be counted; header note 7b) go there too, right after orphan_halted_dbs.
+SUMMARY="reaper — stale_wisps:$TOTAL_STALE_WISPS, closed_wisps:$TOTAL_CLOSED_WISPS, purged:$TOTAL_PURGED, sessions-pruned:$TOTAL_SESSIONS_PRUNED, closed:$TOTAL_ISSUES_CLOSED, expired:$TOTAL_EXPIRED_ISSUES_CLOSED, expired_skipped:$TOTAL_EXPIRED_ISSUES_SKIPPED, skipped_non_city_issues:$TOTAL_STALE_ISSUES_SKIPPED, mail_wisps:$TOTAL_MAIL_WISPS, purge_age_h:$PURGE_AGE_H, purge_batches:$PURGE_BATCHES, purge_capped_dbs:$PURGE_CAPPED_DBS, purge_failed_chunks:$PURGE_FAILED_CHUNKS, purge_child_rows:$PURGE_CHILD_ROWS, orphan_swept:$ORPHAN_SWEPT, orphan_capped_dbs:$ORPHAN_CAPPED_DBS, orphan_failed_dbs:$ORPHAN_FAILED, orphan_halted_dbs:$ORPHAN_HALTED_DBS, orphan_count:$ORPHAN_COUNT_TEXT, orphan_count_unknown:$ORPHAN_COUNT_UNKNOWN, orphan_count_over_dbs:$ORPHAN_COUNT_OVER_DBS, schema_skipped_dbs:$SCHEMA_SKIPPED_DBS, issue_steps:$ISSUE_STEPS_STATE, anomalies:$ANOMALY_COUNT"
 if [ -n "$DRY_RUN" ]; then
     SUMMARY="$SUMMARY, would_close_wisps:$TOTAL_WOULD_CLOSE_WISPS, would_expire:$TOTAL_WOULD_EXPIRE, would_purge:$TOTAL_WOULD_PURGE, would_sweep:$TOTAL_WOULD_SWEEP (dry run)"
 fi
@@ -1502,6 +1681,48 @@ fi
 if [ -n "$ORPHAN_HALT_REASON" ]; then
     SUMMARY="$SUMMARY, orphan_halt: $ORPHAN_HALT_REASON"
 fi
+
+# ga-hpdpij (header note 7a): the durable copy of the line the deacon is nudged with — the nudge below is
+# `|| true` and lands nowhere anyone can grep. ONE line per run: UTC timestamp + the exact summary. Rotated by
+# size (SUMMARY_LOG_MAX_BYTES), SUMMARY_LOG_KEEP generations. Returns 0 = written and, if it was due, rotated;
+# 1 = could not write; 2 = WRITTEN, but the size cap could not be enforced (the size was unreadable, or the live
+# file could not be moved aside): nothing is lost, the file just keeps growing — the caller says so.
+# `set -e` is ignored inside a function called from an `if`, so every step that can fail says `|| return 1` itself.
+append_summary_log() {  # append_summary_log <line>
+    local line="$1" bytes i capped=1
+    mkdir -p "$(dirname "$SUMMARY_LOG")" 2>/dev/null || return 1
+    if [ -f "$SUMMARY_LOG" ]; then
+        bytes=$(wc -c < "$SUMMARY_LOG" 2>/dev/null | tr -d ' ') || bytes=""
+        if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
+            capped=0    # the size is unknown: not rotating is the inert choice, but not a silent one
+        elif [ "$bytes" -ge "$SUMMARY_LOG_MAX_BYTES" ]; then
+            # .N is dropped, .(N-1) -> .N ... .1 -> .2, the live file -> .1
+            i=$SUMMARY_LOG_KEEP
+            rm -f "$SUMMARY_LOG.$i" 2>/dev/null || true
+            while [ "$i" -gt 1 ]; do
+                if [ -f "$SUMMARY_LOG.$((i - 1))" ]; then
+                    mv -f "$SUMMARY_LOG.$((i - 1))" "$SUMMARY_LOG.$i" 2>/dev/null || true
+                fi
+                i=$((i - 1))
+            done
+            mv -f "$SUMMARY_LOG" "$SUMMARY_LOG.1" 2>/dev/null || capped=0   # only THIS move enforces the cap
+        fi
+    fi
+    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$line" >> "$SUMMARY_LOG" 2>/dev/null || return 1
+    [ "$capped" -eq 1 ] || return 2
+    return 0
+}
+# A log that cannot be written must not fail the run — the reaper's real work is done — but it must not be
+# silent either (that is the gap this fixes): the nudge and the stdout line below say so. So does a log that WAS
+# written but could not be size-capped (summary_log:UNCAPPED). The line itself, written first, cannot carry
+# either word: they describe the write.
+SUMLOG_RC=0
+append_summary_log "$SUMMARY" || SUMLOG_RC=$?
+case "$SUMLOG_RC" in
+    0) ;;
+    2) SUMMARY="$SUMMARY, summary_log:UNCAPPED" ;;
+    *) SUMMARY="$SUMMARY, summary_log:FAILED" ;;
+esac
 
 gc session nudge deacon/ "DOG_DONE: $SUMMARY" 2>/dev/null || true
 echo "reaper: $SUMMARY"

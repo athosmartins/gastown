@@ -22,6 +22,12 @@
 # (with its anomaly mail). Steady-state runs take ~1 min, which is why nobody noticed the
 # ceiling. 900 s covers the budgets with margin; reaper-orphan-sweep.selftest.sh (O13)
 # fails if the budgets are ever raised past it.
+#
+# ga-hpdpij: a THIRD budget, GC_REAPER_ORPHAN_COUNT_BUDGET_S 90 (the read-only orphan count that runs after the
+# per-database loop), joins the two above: 240 + 180 + 90 + the fixed work is ~9.5 minutes in the worst case, still
+# inside 900 s. reaper-orphan-count.selftest.sh (C12) fails if the three budgets + 120 s of fixed work are ever
+# raised past the timeout. Each run also appends its summary line to .gc/runtime/reaper-summary.log (header note 7
+# of scripts/reaper.sh): `tail -2` of that file is what the last two rounds did, no SQL needed.
 [order]
 description = "Reap stale wisps and purge closed molecules"
 exec = "$PACK_DIR/assets/scripts/reaper.sh"
