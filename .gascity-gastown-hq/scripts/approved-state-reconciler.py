@@ -248,21 +248,22 @@ _PILOT_SWEEP_SLOTS_RE = re.compile(
 # When a builder pool (wa-worker/ps-worker) is at its session cap, the Pilot
 # QUEUES the bead without writing anything and says so, PER BEAD, in its own log
 # (ga-in9ebr): "pool at session cap (N active/creating >= M max)". This
-# reconciler had no way to read that. Its only capacity signal,
-# _pool_has_capacity(), compares live sessions against POOL_BY_RIG_BASENAME — a
-# hand-copied constant that had drifted from the cap the Pilot really enforces
-# (WA 4 vs live 2, PS 2 vs live 1). The cap is an operator lever, flipped by
-# PILOT_WA_WORKER_MAX in com.gascity.pilot.plist — it went 4→2 on 2026-09-19 alone
-# (commit 03860b70c, "WA 4→2 de novo": not the first flip) and the Pilot log
-# carries cap values 4 and 2 inside that one day, so no constant can track it.
-# The Pilot's own words carry the cap it actually enforced, so that is what gets
-# read here.
+# reconciler did not read that. What it had, _pool_has_capacity(), answers for the
+# POOL and never for a bead: it compares live sessions against the cap read from
+# the installed Pilot plist (_pool_cap(), ga-zowwdz) — before ga-zowwdz, against a
+# hand-copied constant that had drifted from the cap the Pilot really enforced
+# (WA 4 vs live 2, PS 2 vs live 1; the cap is an operator lever, PILOT_WA_WORKER_MAX
+# in com.gascity.pilot.plist, and went 4→2 on 2026-09-19 alone, commit 03860b70c).
+# For a pool that IS at its cap that call can only end in a log-only "pool SATURATED
+# — skip alarm" (cap read correctly) or in "capacity unknown" (unreadable plist →
+# conservative alarm). Neither tells the Mayor that THIS bead is waiting because of
+# the cap, nor for how long. The Pilot's own words do, so that is what gets read here.
 #
-# Consequence of the blind spot: the FRONT-of-queue bead — the one
-# _pilot_queue_suppress_reason() deliberately never suppresses — alarmed
-# "dispatch failing" for a wait that was working exactly as designed (wa-ho1ol,
-# 1774min, mail ga-wisp-frc2n), sending the reader to hunt a filter bug in
-# pilot-dispatcher.sh that did not exist.
+# Consequence of the blind spot (measured 2026-09-20, before ga-zowwdz derived the
+# cap live): the FRONT-of-queue bead — the one _pilot_queue_suppress_reason()
+# deliberately never suppresses — alarmed "dispatch failing" for a wait that was
+# working exactly as designed (wa-ho1ol, 1774min, mail ga-wisp-frc2n), sending the
+# reader to hunt a filter bug in pilot-dispatcher.sh that did not exist.
 #
 # The two emission shapes below are the ones packs/town-deltas/assets/
 # pilot-dispatcher.sh writes today (its lines ~10164/10231 and ~10776). Both
@@ -3259,15 +3260,17 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
         # evidence TTL, that it queued THIS bead at a pool session cap — in the newest
         # sweep that walked the bead, which is NOT necessarily the newest sweep at all
         # (evidence is kept across sweeps that did not walk every candidate, see
-        # _pilot_cap_evidence). That is
-        # the Pilot's own statement of why the bead waits, so it outranks any
-        # re-derivation below — and in particular _pool_has_capacity(), whose
-        # hand-copied cap had drifted (WA 4 vs the live 2) and so read "has
-        # capacity" while the Pilot was refusing to spawn. Checked BEFORE that
-        # call for a second reason: with a correct cap it would `continue`
-        # silently, and this wait must stay visible (the Mayor asked for the
-        # alarm to be reclassified, not erased). Not counted in `alarmed`: this
-        # is deliberately not an alarm about a failure.
+        # _pilot_cap_evidence). That is the Pilot's own statement of why the bead
+        # waits, so it outranks any re-derivation below — in particular
+        # _pool_has_capacity(), which answers for the whole pool and can also read
+        # "capacity unknown" (unreadable Pilot plist → conservative alarm), i.e. a
+        # false "dispatch failing" for a bead the Pilot is deliberately holding.
+        # Checked BEFORE that call for a second reason: since ga-zowwdz it reads the
+        # cap live, and a correctly read cap makes it `continue` silently ("pool
+        # SATURATED — skip alarm", log only) — but this wait must stay visible (the
+        # Mayor asked for the alarm to be reclassified, not erased). Scenario
+        # (ga-9ekn2l-g2) pins that order. Not counted in `alarmed`: this is
+        # deliberately not an alarm about a failure.
         cap_ev = cap_evidence.get(bead_id) if cap_evidence else None
         if cap_ev is not None:
             _log("  %s: daemon-age=%.0fmin, the Pilot queued it at the %s session cap "
@@ -3795,9 +3798,16 @@ def _selftest():
                 in-progress sweep)
       (ga-9ekn2l-g) END-TO-END, mirrors wa-ho1ol (1774min, mail ga-wisp-frc2n):
                 front-of-queue bead whose pool the Pilot itself logged as at
-                cap, while _pool_has_capacity's hand-copied cap still reads
-                "has capacity" → NO "dispatch failing"; exactly ONE capacity-
-                wait note; no flow-authority claim, no human-touch row, no push
+                cap, while _pool_has_capacity cannot say "saturated" (the
+                selftest's Pilot plist is unreadable → "capacity unknown" →
+                conservative alarm) → NO "dispatch failing"; exactly ONE
+                capacity-wait note; no flow-authority claim, no human-touch
+                row, no push
+      (ga-9ekn2l-g2) same bead and log, but the live cap is READ correctly
+                (throwaway plist WA=2, 2 wa-worker active): _pool_has_capacity
+                would `continue` silently ("pool SATURATED"); the evidence check
+                runs first, so the wait is still reported — exactly ONE
+                capacity-wait note, 0 "dispatch failing", no silent skip
       (ga-9ekn2l-h,i) falsification: no cap line for the bead in the latest
                 evaluating sweep (h), or a cap line only in an OLDER sweep (i)
                 → STILL "dispatch failing", body says the cap was checked and
@@ -6670,9 +6680,11 @@ def _selftest():
         return lines
 
     def _sh_wa_two_active(args, timeout=20):
-        """`gc session list --json` reporting 2 active wa-worker sessions. Against
-        _pool_has_capacity's hand-copied cap of 4 that reads "has capacity" — exactly
-        what it read live while the Pilot was refusing to spawn at its real cap of 2."""
+        """`gc session list --json` reporting 2 active wa-worker sessions — the Pilot's
+        real cap of 2 when wa-ho1ol false-alarmed (2026-09-20). What _pool_has_capacity
+        makes of it depends on the cap it can READ: with the selftest's unreadable Pilot
+        plist (the suite default, ga-zowwdz) it says "capacity unknown" and the alarm
+        stays conservative (g); with a throwaway plist of WA=2 it says "saturated" (g2)."""
         if list(args[:3]) == [GC_BIN, "session", "list"]:
             return subprocess.CompletedProcess(
                 args=args, returncode=0, stderr="",
@@ -6826,9 +6838,10 @@ def _selftest():
 
     print("\nScenario (ga-9ekn2l-g): END-TO-END, mirrors wa-ho1ol (1774min, mail "
           "ga-wisp-frc2n) — front-of-queue bead, the Pilot itself logged the pool at "
-          "its cap, _pool_has_capacity's hand-copied cap still reads 'has capacity', "
-          "the lane has free slots: NO 'dispatch failing'; ONE capacity-wait note that "
-          "claims no flow authority, writes no human-touch row, sends no push")
+          "its cap, _pool_has_capacity cannot say 'saturated' (Pilot plist unreadable "
+          "→ 'capacity unknown'), the lane has free slots: NO 'dispatch failing'; ONE "
+          "capacity-wait note that claims no flow authority, writes no human-touch "
+          "row, sends no push")
     _b9g = "ga-9ekn2l-g"
     _bd_approved = lambda root: [_make_bead(_b9g, labels=list(_LBL9))]
     _read_pilot_log_lines = lambda: _cap_log_at(NOW, [_b9g, "ga-9ekn2l-o1", "ga-9ekn2l-o2"])
@@ -6871,6 +6884,59 @@ def _selftest():
     else:
         _ok("(ga-9ekn2l-g): reclassified — 1 capacity-wait note, 0 'dispatch failing', "
             "no flow-authority/ledger/push side effects")
+
+    print("\nScenario (ga-9ekn2l-g2): the SAME bead and Pilot log as (g), but the live cap "
+          "is READ correctly (throwaway Pilot plist WA=2, 2 wa-worker active): "
+          "_pool_has_capacity now says SATURATED and, were it to run first, would "
+          "`continue` silently (ga-zowwdz) — the evidence check runs BEFORE it, so the "
+          "wait is still reported: ONE capacity-wait note, 0 'dispatch failing', and no "
+          "silent 'pool SATURATED — skip alarm'")
+    _fd9g2, _plist9g2 = tempfile.mkstemp(prefix="arc-selftest-pilot-", suffix=".plist")
+    with os.fdopen(_fd9g2, "wb") as _f9g2:
+        plistlib.dump({"EnvironmentVariables": {"PILOT_WA_WORKER_MAX": "2"}}, _f9g2)
+    globals()["PILOT_PLIST"] = _plist9g2
+    _bd_approved = _wa_store_only(_make_bead(_b9g, labels=list(_LBL9)))
+    _read_pilot_log_lines = lambda: _cap_log_at(NOW, [_b9g, "ga-9ekn2l-o1", "ga-9ekn2l-o2"])
+    _sh = _sh_wa_two_active
+    try:
+        # The precondition that gives this scenario its meaning: with THIS plist and THESE
+        # sessions the pool-level check answers "saturated". Were it to say "has capacity"
+        # or "unknown", the run below would pass for a reason that has nothing to do with
+        # which of the two checks comes first.
+        _has9g2, _note9g2 = _pool_has_capacity("/x/whatsapp_automation", NOW)
+        st = _reset()
+        st["first_seen_approved"][_b9g] = NOW - 1774 * 60
+        _buf9g2 = io.StringIO()
+        with contextlib.redirect_stdout(_buf9g2):
+            run_cycle(NOW, st)
+        sys.stdout.write(_buf9g2.getvalue())   # keep the suite's own output complete
+    finally:
+        _sh = _stub_sh_fast
+        globals()["PILOT_PLIST"] = _NO_PILOT_PLIST
+        os.unlink(_plist9g2)
+        _bd_approved = lambda root: [_make_bead(_b9g, labels=list(_LBL9))]   # (g)'s, for (h)…
+    cap9g2, df9g2 = _cap_mails(), _df_mails()
+    _g2_problems = []
+    if _has9g2 or "pool saturated" not in _note9g2 or "cap 2 from plist" not in _note9g2:
+        _g2_problems.append("precondition broken — with a plist cap of 2 and 2 active the "
+                            "pool-level check must say saturated: %r %r" % (_has9g2, _note9g2))
+    if df9g2:
+        _g2_problems.append("still alarmed 'dispatch failing': %r" % ([s for s, _ in df9g2],))
+    if len(cap9g2) != 1:
+        _g2_problems.append("want exactly 1 capacity-wait note, got %d (0 = the wait went "
+                            "SILENT behind the pool-level skip)" % len(cap9g2))
+    if "pool SATURATED — skip alarm" in _buf9g2.getvalue():
+        _g2_problems.append("the silent 'pool SATURATED — skip alarm' path ran for the bead")
+    if "capacity wait, NOT dispatch failing" not in _buf9g2.getvalue():
+        _g2_problems.append("the evidence diversion did not log")
+    if flow_authority_calls or notify_calls or any(n == "human-touch" for n, _ in ledger_calls):
+        _g2_problems.append("side effects: flow=%r notify=%r ledger=%r" % (
+            flow_authority_calls, notify_calls, [n for n, _ in ledger_calls]))
+    if _g2_problems:
+        _bad("(ga-9ekn2l-g2)", "; ".join(_g2_problems))
+    else:
+        _ok("(ga-9ekn2l-g2): plist cap 2 read → the pool-level check says saturated, yet the "
+            "wait is reported (1 capacity-wait note, 0 'dispatch failing', no silent skip)")
 
     print("\nScenario (ga-9ekn2l-h): falsification — SAME bead and fixtures but the "
           "latest evaluating sweep logged a cap line only for OTHER beads → STILL "
