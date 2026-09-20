@@ -120,6 +120,18 @@ ok "(F0) isolation guard block found in deployed formula"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# Bound git's upward repo-discovery to $TMP (ga-4frmd8). Without this, a
+# stray .git sitting higher up the tree — observed in production: macOS's
+# own TMPDIR sometimes has one at its root — makes scenario (H)'s
+# "definitely not a repo" fixture actually resolve INSIDE that ancestor
+# repo, so `git rev-parse --git-dir` succeeds when the guard expects it to
+# fail, and (H) flakes/fails depending on what else is in that ancestor at
+# the moment. This stops the climb at $TMP without affecting any of the
+# real repos this script creates below it (their own .git is found on the
+# way down, never requiring a climb past $TMP). Resolve via `pwd -P` first,
+# matching how the guard itself resolves paths (see (F3)).
+export GIT_CEILING_DIRECTORIES="$(cd "$TMP" && pwd -P)"
+
 git init -q -b main --bare "$TMP/origin.git"
 git clone -q "$TMP/origin.git" "$TMP/shared-root" 2>/dev/null
 echo "test repo" > "$TMP/shared-root/README.md"
