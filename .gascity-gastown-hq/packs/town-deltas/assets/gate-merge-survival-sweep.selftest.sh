@@ -122,7 +122,7 @@ grep -q 'ga-lzj2e' "$DISPATCHER"                       && ok "dispatcher edit ta
 # with a container rig and needs the same protection. See section 6 below
 # for the functional proof of the classification itself.
 grep -q 'NEEDS_SURVIVAL_LEDGER:-0' "$DISPATCHER"       && ok "ledger guarded by NEEDS_SURVIVAL_LEDGER (ga-wvdl6)" || bad "survival-ledger gate missing/reverted to IS_CONTAINER_RIG-only"
-grep -Eq 'grep -Eq .\^\[0-9a-f\]\{7,40\}' "$DISPATCHER" && ok "ledger guarded to a real merge SHA"   || bad "sha guard missing"
+grep -Eq 'grep -E .\^\[0-9a-f\]\{7,40\}' "$DISPATCHER" && ok "ledger guarded to a real merge SHA"   || bad "sha guard missing"
 
 # ── 6. functional: NEEDS_SURVIVAL_LEDGER classification (ga-wvdl6) ─────────
 # PROBLEM: IS_CONTAINER_RIG is a pure ".repo.git exists" structural fact.

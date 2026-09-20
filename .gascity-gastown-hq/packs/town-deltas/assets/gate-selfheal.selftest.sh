@@ -100,13 +100,14 @@ grep -q 'gate:fix-attempt:'              "$GATE" && ok "gate bumps fix-attempt c
 # ga-26df (refined, ga-wisp-198xqe): the parser in BOTH dispatchers must implement
 # `:0`-override-else-MAX, NOT plain MIN (head -1, which stalls on a {1,2} residue) and
 # NOT plain MAX (tail -1 alone, which discards manual clears). The signature of the right
-# shape is a `grep -qx 0` reset check paired with a `sort -n | tail -1` fallback. A future
+# shape is a `grep -x 0 >/dev/null` reset check (ga-5bxuam: no -q, so a matching 0 is never
+# lost to a SIGPIPE under pipefail) paired with a `sort -n | tail -1` fallback. A future
 # edit collapsing either back to a single head -1 / tail -1 re-introduces one of the two
 # bugs, and this drift-guard is the only thing that would notice (the unit tests above
 # exercise a local mirror, not these files).
 for _f in "$GATE" "$PILOT"; do
   _n=$(basename "$_f")
-  if grep -q 'grep -qx 0' "$_f" && grep -Fq "sed -n 's/^gate:fix-attempt:\\([0-9]\\{1,\\}\\)\$/\\1/p'" "$_f"; then
+  if grep -q 'grep -x 0 >/dev/null' "$_f" && grep -Fq "sed -n 's/^gate:fix-attempt:\\([0-9]\\{1,\\}\\)\$/\\1/p'" "$_f"; then
     ok "$_n fix-attempt parser is :0-override-else-MAX (not plain MIN/MAX)"
   else
     bad "$_n fix-attempt parser lost the :0-override guard — MIN stall or MAX clear-discard regression (ga-26df)"
