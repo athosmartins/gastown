@@ -295,6 +295,54 @@ PILOT_CAP_EVIDENCE_TTL_SEC = 1800
 # — a future-dated line cannot be shown to be fresh.
 _CAP_EVIDENCE_FUTURE_SKEW_SEC = 300
 
+# ── which sweeps PROVE the Pilot walked every candidate (ga-9ekn2l gate-fix 1) ─────
+# GATE-FIX (attempt 1 FAIL, root-class:error-vs-empty): the first version read EVERY
+# normal "Pilot sweep complete" line as an exhaustive walk of the candidate pool, so a
+# bead ABSENT from a later sweep's cap lines was taken as positively "not held at the
+# cap" — its older evidence was erased and the alarm body asserted "the Pilot did NOT
+# queue it". False: the Pilot logs a cap line only for a candidate it WALKS, and
+# dispatch_lane() (pilot-dispatcher.sh ~10730) runs `while filled < cap && slots > 0`,
+# so the moment a lane's slots/cap are consumed the candidates behind the dispatch are
+# never looked at — they get no line although their pool is still at its cap.
+# Measured over the whole real log on 2026-09-20 (892 normal sweeps, 890 of them with a
+# neighbour on each side): the beads capped in the sweeps before AND after a sweep k were
+# missing from k in 4 of the 403 dispatched>=1 sweeps (62 bead-absences) and in 0 of the
+# 487 dispatched=0 ones. Worked example, verbatim in
+# the tests: 2026-09-19 16:52:20, "Lane small: dispatched 1 this sweep (cap=1,
+# slots_left=0)" — 28 beads capped at 16:37:45 and 30 at 17:07:44, only 2 at 16:52:20;
+# the 26 in between (wa-c8s2w, front of its queue, among them) were simply not walked.
+#
+# A dispatched=0 sweep is not automatically a full walk either — three things leave
+# candidates unattempted without dispatching anything:
+#   * a lane that started with NO free slot is never entered (dispatch_lane is only
+#     called when slots>0). The complete line's small_slots/big_slots are the START
+#     values (the globals are passed by value), so a 0 there means that lane was not
+#     walked at all;
+#   * the mid-loop Dolt back-off and the iteration guard `break` out of a lane loop, and
+#     each logs "... — stopping [small|big ]loop ...". Real occurrence: 2026-09-15
+#     09:29:52 "Dolt health UNREADABLE mid-sweep ... stopping small loop after 0
+#     dispatch(es)" — a dispatched=0 sweep that walked only part of its pool. (The other
+#     two texts have no occurrence in the log yet; they are matched from the source.)
+#   * a complete line carrying no counters this reader can parse, or no usable timestamp.
+# So a sweep counts as a FULL WALK only when it dispatched nothing, BOTH lanes started
+# with a free slot, and no lane loop was cut short; everything else is NON-EXHAUSTIVE
+# (see _sweep_walk_verdict). A non-exhaustive sweep's own cap lines still add/refresh
+# evidence, but it neither erases older evidence (the per-line TTL bounds that) nor
+# licenses "the Pilot did not queue this bead" — absence proves nothing there.
+# Both regexes were checked against the REAL log on 2026-09-20 (not just a fixture — the
+# ga-5d5se lesson): _PILOT_SWEEP_WALK_RE matches every normal complete line (893/893),
+# _PILOT_LOOP_CUT_RE both real cut-short lines (2/2).
+_PILOT_SWEEP_WALK_RE = re.compile(
+    r"Pilot sweep complete: dispatched=(?P<dispatched>\d+) "
+    r"\(small_slots=(?P<small>\d+) big_slots=(?P<big>\d+)")
+_PILOT_LOOP_CUT_RE = re.compile(r"stopping (?:(?:small|big) )?loop")
+# A sweep that STARTED and never logged its complete line (killed, crashed: measured
+# 2026-09-20, 100 of 1059 starts in the real log, one of them leaving cap lines behind)
+# walked an unknown part of its pool — the very case of this block. Without a start marker
+# its lines would be merged into the NEXT sweep's block, and a later full walk would then
+# inherit the aborted sweep's stale cap lines as if they were its own.
+_PILOT_SWEEP_START_RE = re.compile(r"=== Pilot sweep start")
+
 # ── test seams (monkeypatched in --selftest) ───────────────────────────────────
 # These module-level callables let selftests redirect I/O without spawning subprocesses.
 # None = use the real implementation; any callable = use that callable instead.
@@ -1411,41 +1459,107 @@ def _lane_capacity_suppress_reason(labels, now):
 
 
 # ── pool-cap containment evidence reader (ga-9ekn2l) ─────────────────────────
+class _CapEvidence(dict):
+    """{bead_id: {"pool", "live", "max", "epoch"}} — the pool-cap evidence of one cycle —
+    plus what a bead's ABSENCE from that map is worth.
+
+      walked_all  True iff the NEWEST completed evaluating sweep in the Pilot log was
+                  positively a FULL WALK of every candidate (_sweep_walk_verdict) and is
+                  itself within PILOT_CAP_EVIDENCE_TTL_SEC. Only then is "no cap line for
+                  this bead" a MEASURED negative — the Pilot looked at it and it was not
+                  capped. False: absence proves nothing (the bead may simply not have
+                  been walked).
+      why         when walked_all is False, the reason, worded for the alarm body.
+
+    A dict subclass so every plain-map reader (.get/.items/len/truthiness/==) keeps
+    working. The class-level defaults are the SAFE ones, so a caller that builds a bare
+    map — or hands over a bare dict, read via getattr(x, "walked_all", False) — can never
+    assert a negative that nobody measured.
+    """
+    walked_all = False
+    why = "the reading carries no information about which candidates the Pilot walked"
+
+
+def _sweep_walk_verdict(counters, cut, dated):
+    """(walked_all, why) for one NORMAL sweep-complete line.
+
+    counters — the _PILOT_SWEEP_WALK_RE match on that line (None if it carries none);
+    cut      — True iff a lane loop logged "stopping ... loop" inside this sweep;
+    dated    — True iff the line has a parseable, not-future-dated timestamp.
+    `why` is only meaningful when walked_all is False: it is a clause worded for the alarm
+    body ("... NÃO MEDIDO ...: <why>"). See the comment block above _PILOT_SWEEP_WALK_RE
+    for why each condition exists and what was measured.
+    """
+    if not dated:
+        return False, "the Pilot's newest completed sweep line has no usable timestamp"
+    if counters is None:
+        return False, ("the Pilot's newest completed sweep line carries no dispatched/slots "
+                       "counters this reader can parse")
+    dispatched = int(counters.group("dispatched"))
+    small, big = int(counters.group("small")), int(counters.group("big"))
+    if dispatched > 0:
+        return False, ("the Pilot's newest completed sweep dispatched %d bead(s), and a lane "
+                       "stops walking its candidates the moment its slots/cap are consumed — "
+                       "the ones behind the dispatch were never looked at" % dispatched)
+    if small < 1 or big < 1:
+        return False, ("in the Pilot's newest completed sweep a lane started with no free "
+                       "slot (small_slots=%d big_slots=%d), and a lane without slots is not "
+                       "walked at all" % (small, big))
+    if cut:
+        return False, ("in the Pilot's newest completed sweep a lane loop was cut short (a "
+                       "'stopping ... loop' warning) with candidates still un-attempted")
+    return True, ""
+
+
 def _pilot_cap_evidence(now):
-    """Return {bead_id: {"pool", "live", "max", "epoch"}} for every bead the
-    Pilot ITSELF reported QUEUED at a pool session cap in its most recent
-    dispatch-evaluating sweep, or None when the Pilot log cannot be read.
+    """Return a _CapEvidence — {bead_id: {"pool", "live", "max", "epoch"}} for every bead
+    the Pilot ITSELF reported QUEUED at a pool session cap within
+    PILOT_CAP_EVIDENCE_TTL_SEC — or None when the Pilot log cannot be read or holds no
+    fresh evaluating sweep.
 
-    THREE states, never collapsed (root-class:error-vs-empty — the same discipline
-    as every other measurement helper in this file):
-      None  → the Pilot's CURRENT dispatch decision is NOT in the window: the log
-              was empty/unreadable, holds no evaluating sweep at all (only
-              deferral/pause lines, or nothing datable), or its newest evaluating
-              sweep is older than PILOT_CAP_EVIDENCE_TTL_SEC. Pool-cap containment
-              was neither confirmed nor ruled out. Callers must NOT read this as
-              "not held".
-      {}    → a FRESH evaluating sweep was seen and no bead is cap-queued: a bead
-              missing from a measured map is positively "not held at the cap".
-      {...} → positively measured, per bead, in the Pilot's own words.
+    THREE states, never collapsed (root-class:error-vs-empty — the same discipline as
+    every other measurement helper in this file), and the third is a property of the
+    map itself:
+      None                    → the Pilot's CURRENT dispatch decision is NOT in the
+                                window: the log was empty/unreadable, holds no evaluating
+                                sweep at all (only deferral/pause lines, or nothing
+                                datable), or its newest evaluating sweep is older than
+                                PILOT_CAP_EVIDENCE_TTL_SEC. Pool-cap containment was
+                                neither confirmed nor ruled out. Callers must NOT read
+                                this as "not held".
+      map, .walked_all=True   → the newest completed evaluating sweep walked EVERY
+                                candidate (_sweep_walk_verdict) and is fresh: a bead
+                                missing from the map is positively "not held at the cap".
+      map, .walked_all=False  → the newest completed sweep did NOT provably walk every
+                                candidate (it dispatched, a lane had no slot, a lane loop
+                                was cut short, ...): a bead missing from the map is
+                                UNMEASURED — `.why` says why. Its per-bead entries are
+                                still positive evidence.
 
-    "Most recent evaluating sweep" rule. The Pilot logs exactly one such line per
-    still-capped candidate per evaluating sweep — measured over wa-ho1ol: 14
-    consecutive sweeps, one cap line each and nothing else. So a bead that was
-    cap-queued in an older sweep but is ABSENT from a later COMPLETED one is no
-    longer held by the cap (the cap freed, or something else holds it now) and
-    must go back to the normal alarm path — otherwise a genuine dispatch failure
-    would stay explained by a stale cap line. A whole-sweep pause/deferral
-    ("dispatched=0 (paused|deferred: ...)") evaluates nothing, so it neither
-    refreshes nor supersedes evidence; that gap is covered by the sweep-pause
-    suppression upstream and bounded here by PILOT_CAP_EVIDENCE_TTL_SEC. Lines
-    logged after the last completed sweep belong to the sweep still running and
-    are overlaid on top (absence there disproves nothing yet).
+    How sweeps combine (GATE-FIX attempt 1: this used to treat every completed sweep as a
+    full walk). The Pilot logs one cap line per still-capped candidate it WALKS. So:
+      - a FULL-WALK sweep supersedes: a bead cap-queued in an older sweep but absent from
+        it is no longer held by the cap (the cap freed, or something else holds it now)
+        and goes back to the normal alarm path — otherwise a genuine dispatch failure
+        would stay explained by a stale cap line;
+      - a NON-exhaustive sweep only adds/refreshes: its silence about a bead is not a
+        statement about that bead, so older evidence stays (bounded by the per-line TTL,
+        which is what stops it explaining a bead forever);
+      - a whole-sweep pause/deferral ("dispatched=0 (paused|deferred: ...)") evaluates
+        nothing, so it neither refreshes nor supersedes; that gap is covered by the
+        sweep-pause suppression upstream and bounded here by the TTL;
+      - lines logged after the last completed sweep belong to the sweep still running
+        and are overlaid on top (absence there disproves nothing yet); a sweep that
+        STARTED and never completed (a later start line arrives first) is folded in as a
+        non-exhaustive block, so it neither supersedes anything nor leaks its lines and
+        its cut-short flag into the next sweep's verdict.
 
     A cap line whose timestamp cannot be parsed is skipped, never trusted: an
     undatable line cannot be shown to be fresh, and "no evidence" is the
     alarm-preserving direction. The same goes for one dated in the FUTURE beyond
     a small clock-skew allowance (a stepped clock must not make old evidence look
-    fresh forever).
+    fresh forever) — and for a sweep-complete line that is undatable or future-dated,
+    which can never be the proof of a full walk.
     """
     if _read_pilot_log_lines is not None:
         lines = _read_pilot_log_lines()   # test seam (shared with _is_pilot_alive)
@@ -1454,9 +1568,11 @@ def _pilot_cap_evidence(now):
     if not lines:
         return None
 
-    completed = {}   # cap lines of the newest COMPLETED evaluating sweep
-    running = {}     # cap lines logged since that sweep completed (still running)
-    newest_eval = None   # epoch of the newest DATABLE proof the Pilot evaluated dispatch
+    kept = {}        # evidence carried by COMPLETED evaluating sweeps
+    running = {}     # cap lines logged since the last completed sweep (one still running)
+    running_cut = False   # a lane loop logged "stopping ... loop" since the last complete line
+    newest_eval = None    # epoch of the newest DATABLE proof the Pilot evaluated dispatch
+    last_walk = None      # (epoch|None, walked_all, why) of the newest COMPLETED evaluating sweep
 
     def _proof(t):
         # Only a datable, not-future-dated timestamp counts as proof of an evaluation:
@@ -1467,11 +1583,31 @@ def _pilot_cap_evidence(now):
                 newest_eval = t
 
     for line in lines:
+        if _PILOT_SWEEP_START_RE.search(line):
+            # Whatever is still in `running` belongs to a sweep that never completed (a
+            # normal sweep's complete line has already emptied it). It walked an unknown
+            # part of its pool: fold it in as a NON-exhaustive block — its cap lines stay
+            # evidence, but it supersedes nothing and does not bleed into the next verdict.
+            kept.update(running)
+            running, running_cut = {}, False
+            continue
         if _PILOT_SWEEP_RE.search(line):
             if _PILOT_SWEEP_PAUSED_RE.search(line):
                 continue   # whole-sweep pause/deferral: evaluated nothing
-            _proof(_ts_epoch(line))
-            completed, running = running, {}
+            t = _ts_epoch(line)
+            _proof(t)
+            walked, why = _sweep_walk_verdict(
+                _PILOT_SWEEP_WALK_RE.search(line), running_cut,
+                t is not None and (t - now) <= _CAP_EVIDENCE_FUTURE_SKEW_SEC)
+            if walked:
+                kept = running          # a FULL WALK supersedes whatever older sweeps said
+            else:
+                kept.update(running)    # NON-exhaustive: adds/refreshes, never erases
+            last_walk = (t, walked, why)
+            running, running_cut = {}, False
+            continue
+        if _PILOT_LOOP_CUT_RE.search(line):
+            running_cut = True
             continue
         m = _PILOT_CAP_PICK_RE.search(line) or _PILOT_CAP_DISPATCH_RE.search(line)
         if not m:
@@ -1495,10 +1631,24 @@ def _pilot_cap_evidence(now):
         # claim a sweep did not queue the bead when that sweep is too old to say).
         return None
 
-    evidence = dict(completed)
+    evidence = dict(kept)
     evidence.update(running)
-    return {bid: ev for bid, ev in evidence.items()
-            if -_CAP_EVIDENCE_FUTURE_SKEW_SEC <= (now - ev["epoch"]) <= PILOT_CAP_EVIDENCE_TTL_SEC}
+    out = _CapEvidence(
+        (bid, ev) for bid, ev in evidence.items()
+        if -_CAP_EVIDENCE_FUTURE_SKEW_SEC <= (now - ev["epoch"]) <= PILOT_CAP_EVIDENCE_TTL_SEC)
+    if last_walk is None:
+        out.why = ("the Pilot log holds no COMPLETED evaluating sweep, only cap lines of "
+                   "one still running")
+    else:
+        t, walked, why = last_walk
+        if not walked:
+            out.why = why
+        elif (now - t) > PILOT_CAP_EVIDENCE_TTL_SEC:
+            out.why = ("the Pilot's newest completed sweep is older than %ds"
+                       % PILOT_CAP_EVIDENCE_TTL_SEC)
+        else:
+            out.walked_all, out.why = True, ""
+    return out
 
 
 # ── route a bead out of story:approved ───────────────────────────────────────
@@ -1660,9 +1810,12 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
     session cap never gets here — _process_store() diverts it to
     _alarm_capacity_wait() (a different, correctly-worded note). So this only
     renders WHICH of the remaining two states applies, in the body: measured
-    and NOT cap-held, or unmeasured. Without that line a reader cannot tell
-    "checked, not the cap" from "could not check" — the two states the old
-    alarm silently collapsed together with the third (cap-contained).
+    and NOT cap-held (the newest sweep walked every candidate: map.walked_all),
+    or unmeasured (no fresh sweep at all, or a sweep that did not provably walk
+    every candidate — there a missing cap line proves nothing). Without that
+    line a reader cannot tell "checked, not the cap" from "could not check" —
+    the two states the old alarm silently collapsed together with the third
+    (cap-contained).
     """
     bead_id = bead.get("id") or bead.get("issue_id") or ""
     if not bead_id:
@@ -1793,10 +1946,23 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
                     "dispatch-evaluating sweep (unreadable, only deferral/pause lines, or older "
                     "than %ds), so containment by the pool session cap was neither confirmed "
                     "nor ruled out." % PILOT_CAP_EVIDENCE_TTL_SEC)
-    else:
+    elif getattr(cap_evidence, "walked_all", False):
+        # A MEASURED negative: the newest completed sweep walked every candidate, so a
+        # missing cap line means the Pilot looked at this bead and it was not capped.
         cap_line = ("Pool-cap evidence (Pilot log): none for this bead — the Pilot's most "
-                    "recent dispatch-evaluating sweep did NOT queue it at a pool session cap, "
-                    "so this is not cap containment.")
+                    "recent dispatch-evaluating sweep walked every candidate and did NOT "
+                    "queue it at a pool session cap, so this is not cap containment.")
+    else:
+        # GATE-FIX (attempt 1): a missing cap line only means "not capped" when the sweep
+        # walked the bead. A sweep that dispatched (its lane stops at cap/slots), had a
+        # lane without slots, or was cut short never looked at the candidates behind it,
+        # so absence there is UNMEASURED — asserting "did NOT queue it" was a false
+        # sentence that also pointed the reader away from the cap. A bare dict (no
+        # attribute) lands here too: the safe default is "not measured", never "negative".
+        cap_line = ("Pool-cap evidence (Pilot log): NÃO MEDIDO — no cap line for this "
+                    "bead, but that does not show the pool cap is not the cause: %s. "
+                    "Containment by the pool session cap was neither confirmed nor ruled "
+                    "out." % (getattr(cap_evidence, "why", "") or _CapEvidence.why))
 
     body = (
         "APPROVED-STATE-RECONCILER: buildable bead starving — dispatch path failing\n\n"
@@ -1895,8 +2061,18 @@ def _alarm_capacity_wait(rig_root, bead, age_min, ev, cap_evidence, now, state):
         return
 
     pool = ev["pool"]
-    cap = ev["max"]
-    live = ev["live"]
+    # The cap/live named in the note — and fingerprinted for the backoff — are the POOL's
+    # newest reading, never the trigger bead's own line. Evidence kept across NON-exhaustive
+    # sweeps can legitimately mix a pre-flip cap with a post-flip one (real, 2026-09-19:
+    # wa-c8s2w's line says 4>=4 at 16:36, the sweep after says 3>=2), and fingerprinting the
+    # trigger bead's own line makes the fingerprint flip with iteration order — every flip
+    # is "the cap moved, a NEW incident", which fires immediately (probe of the first
+    # version: caps [2,4,2,4,2,4] -> 6 notes instead of 1). The (epoch, max, live) key is
+    # total, so the pick does not depend on dict order either.
+    cur = max((e for e in cap_evidence.values() if e["pool"] == pool) if cap_evidence else (),
+              key=lambda e: (e["epoch"], e["max"], e["live"]), default=ev)
+    cap = cur["max"]
+    live = cur["live"]
     fp = "%s:%d" % (pool, cap)
 
     bucket = state.setdefault("capacity_wait", {})
@@ -1925,6 +2101,9 @@ def _alarm_capacity_wait(rig_root, bead, age_min, ev, cap_evidence, now, state):
     # Queue depth and oldest waiter at THIS cap, from the same evidence read that
     # diverted this bead here — the age comes from the daemon's own first-seen
     # clock (never updated_at, which any comment resets), same as the alarm path.
+    # Beads with a FRESH cap line for this pool. Evidence is kept across sweeps that did not
+    # walk everyone, so a bead dispatched inside the TTL is still counted until its line
+    # ages out: the depth is informational (it names the queue's size), not a live length.
     waiting = [b for b, e in cap_evidence.items() if e["pool"] == pool]
     fsa = state.get("first_seen_approved", {})
     waits = sorted(((now - fsa[b]) / 60.0, b) for b in waiting if b in fsa)
@@ -1944,7 +2123,7 @@ def _alarm_capacity_wait(rig_root, bead, age_min, ev, cap_evidence, now, state):
         return  # no state update, no mutations
 
     cap_env = "PILOT_%s_MAX" % re.sub(r"[^A-Z0-9]+", "_", pool.upper())
-    seen_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ev["epoch"]))
+    seen_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(cur["epoch"]))
     subject = ("Reconciler: aguardando capacidade do pool %s — %d ativa(s) no teto %d, "
                "%d bead(s) na fila (mais antiga %s, %dmin) — NÃO é falha de despacho%s"
                % (pool, live, cap, len(waiting), oldest_id, int(oldest_age),
@@ -1952,7 +2131,7 @@ def _alarm_capacity_wait(rig_root, bead, age_min, ev, cap_evidence, now, state):
     body = (
         "APPROVED-STATE-RECONCILER: aguardando CAPACIDADE do pool — NÃO é falha de despacho\n\n"
         "Pool: %s — %d sessão(ões) active/creating para um teto de %d (palavras do próprio\n"
-        "Pilot, último sweep avaliador, hora local %s)\n"
+        "Pilot, linha mais recente deste pool no log, hora local %s)\n"
         "Fila neste teto: %d bead(s) que o Pilot deixou QUEUED; a mais antiga é %s (%dmin).\n"
         "Nota #%d para este pool (disparada ao avaliar %s — só rastro, não é a bead que mais espera).\n\n"
         "O QUE É: o Pilot viu a bead, achou-a despachável e a enfileirou SEM escrever nada\n"
@@ -2780,10 +2959,12 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
     body regardless (same pattern as gate_depth/gate_throughput above).
 
     cap_evidence (ga-9ekn2l): the beads the Pilot itself reported QUEUED at a
-    pool session cap in its latest evaluating sweep, from _pilot_cap_evidence(),
+    pool session cap within the evidence TTL, from _pilot_cap_evidence(),
     computed ONCE per cycle in run_cycle() (the Pilot log is HQ-wide). None if
     the log was unreadable — a bead is then judged as before but its alarm says
-    the cap question was NÃO MEDIDO, never "not held".
+    the cap question was NÃO MEDIDO, never "not held". The map also carries
+    .walked_all: whether the newest sweep walked EVERY candidate, i.e. whether a
+    bead's absence from the map is a measured "not held" or just unmeasured.
 
     Returns (processed, routed, alarmed) int counts.
     On query error: logs + returns (0, 0, 0) — fail-open; other stores are unaffected.
@@ -3074,8 +3255,11 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
                  bead_id, starve_age_min))
             continue
 
-        # POOL-CAP CONTAINMENT (ga-9ekn2l): the Pilot itself logged that it queued
-        # THIS bead at a pool session cap in its latest evaluating sweep. That is
+        # POOL-CAP CONTAINMENT (ga-9ekn2l): the Pilot itself logged, within the
+        # evidence TTL, that it queued THIS bead at a pool session cap — in the newest
+        # sweep that walked the bead, which is NOT necessarily the newest sweep at all
+        # (evidence is kept across sweeps that did not walk every candidate, see
+        # _pilot_cap_evidence). That is
         # the Pilot's own statement of why the bead waits, so it outranks any
         # re-derivation below — and in particular _pool_has_capacity(), whose
         # hand-copied cap had drifted (WA 4 vs the live 2) and so read "has
@@ -3302,17 +3486,23 @@ def run_cycle(now, state):
              "this cycle (see ga-nq0jo)")
 
     # Pool-cap containment evidence (ga-9ekn2l): what the Pilot ITSELF logged as
-    # QUEUED at a pool session cap in its latest evaluating sweep. The Pilot log
-    # is HQ-wide, so read once per cycle. None = log unreadable; _process_store()
-    # / _alarm_starving() treat that as NÃO MEDIDO (containment neither confirmed
-    # nor ruled out), never as "no bead is held at the cap".
+    # QUEUED at a pool session cap (kept across sweeps that did not walk every
+    # candidate, bounded by the per-line TTL). The Pilot log is HQ-wide, so read
+    # once per cycle. None = log unreadable; _process_store() / _alarm_starving()
+    # treat that as NÃO MEDIDO (containment neither confirmed nor ruled out), never
+    # as "no bead is held at the cap". The same goes for a bead missing from a map
+    # whose newest sweep did not walk every candidate (.walked_all False).
     cap_evidence = _pilot_cap_evidence(now)
     if cap_evidence is None:
         _log("  pilot log unreadable or holds no fresh evaluating sweep — starve-alarm "
              "pool-cap containment degrades to 'unmeasured' this cycle (see ga-9ekn2l)")
     else:
-        _log("  pilot pool-cap evidence: %d bead(s) queued at a session cap in the "
-             "latest evaluating sweep" % len(cap_evidence))
+        _log("  pilot pool-cap evidence: %d bead(s) with a fresh 'QUEUED at a session cap' "
+             "line; a bead missing from it is %s" % (
+             len(cap_evidence),
+             "MEASURED not-held (the newest sweep walked every candidate)"
+             if getattr(cap_evidence, "walked_all", False) else
+             "UNMEASURED (%s)" % (getattr(cap_evidence, "why", "") or _CapEvidence.why)))
 
     total_p = total_r = total_a = 0
 
@@ -3595,7 +3785,7 @@ def _selftest():
                 session cap" log line as per-bead evidence: both REAL emission
                 shapes parse, verbatim (a); a whole-sweep deferral neither
                 supersedes nor refreshes evidence and the TTL bounds it (b); a
-                bead absent from a later COMPLETED evaluating sweep is no
+                bead absent from a later FULL-WALK evaluating sweep is no
                 longer cap-held (c); lines of the sweep still running overlay
                 without disproving the older ones (d); unreadable log → None
                 vs read-but-empty → {} (e); an undatable line is never
@@ -3626,6 +3816,18 @@ def _selftest():
       (ga-9ekn2l-p,q) a capacity_wait record with a corrupt count does not
                 abort the rig's cycle — the note still goes out (p); a failed
                 mail send is logged, never silent (q)
+      (ga-9ekn2l-c2,h2,r,r2,r3,w) GATE-FIX 1 (attempt 1 FAIL: every completed
+                sweep was read as a full walk, so a bead absent from a sweep
+                that DISPATCHED — whose lane stopped at slots_left=0 — lost its
+                evidence and the alarm claimed "did NOT queue it"). A sweep
+                counts as a full walk only if dispatched=0, both lanes started
+                with a slot and no lane loop was cut short (c2: a dispatching
+                sweep keeps older evidence; h2/r3: the alarm body says NÃO
+                MEDIDO there; w: the whole class of non-walk reasons, plus
+                running-only and stale-walk). r/r2: the REAL 2026-09-19
+                16:37/16:52/17:07 sweeps, verbatim — wa-c8s2w stays explained
+                across the dispatching sweep, ONE note naming the pool's newest
+                cap although the kept lines mix caps 4 and 2
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
@@ -6166,11 +6368,15 @@ def _selftest():
     # the real emission line exactly (verified against 3 live lines pulled
     # from .gc/logs/pilot-dispatcher.log) so these scenarios only pass when
     # the regex actually works against reality.
-    def _sweep_log_line_slots(epoch, small, big, dolt_saturated=0):
+    def _sweep_log_line_slots(epoch, small, big, dolt_saturated=0, dispatched=1):
+        # `dispatched` defaults to 1, as this fixture always did (the ga-2yyez lane
+        # scenarios do not care). ga-9ekn2l gate-fix 1: it DOES matter there — a sweep
+        # that dispatched did not walk every candidate — so those scenarios pass it
+        # explicitly instead of inheriting a default that silently meant "non-exhaustive".
         ts = time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(epoch))
-        return ("%s [pilot-dispatcher] === Pilot sweep complete: dispatched=1 "
+        return ("%s [pilot-dispatcher] === Pilot sweep complete: dispatched=%d "
                 "(small_slots=%d big_slots=%d dolt_saturated_at_start=%d) ===" % (
-                ts, small, big, dolt_saturated))
+                ts, dispatched, small, big, dolt_saturated))
 
     print("\nScenario (ga-2yyez-lane-a): _latest_sweep_lane_slots() reads "
           "small_slots/big_slots off the MOST RECENT normal sweep line, not "
@@ -6401,6 +6607,50 @@ def _selftest():
         "[2026-09-20 01:35:11] [pilot-dispatcher] === Pilot sweep complete: dispatched=0 "
         "(deferred: cross-stage gate-congested + resource-contended, ga-d0hz3) ===")
 
+    # GATE-FIX 1 (attempt 1 FAIL) regression fixtures: the THREE consecutive REAL sweeps of
+    # 2026-09-19 the gate reviewer replayed, verbatim from .gc/logs/pilot-dispatcher.log
+    # (only the lines that matter; nothing edited, "—" is the em dash the Pilot writes).
+    #   A 16:37:45  dispatched=0, both lanes with a slot: a FULL WALK; wa-c8s2w capped 4>=4.
+    #   B 16:52:20  dispatched=1: "Lane small: dispatched 1 (cap=1, slots_left=0)" — the small
+    #               lane stopped after ga-owlmfj, so wa-c8s2w (and 25 more beads capped in
+    #               A *and* C) was never walked and got NO line; the big lane still had a
+    #               slot and logged its two.
+    #   C 17:07:44  dispatched=0, full walk; wa-c8s2w capped again, now 2>=2 (the cap moved).
+    _REAL_SWEEP_A = [
+        "[2026-09-19 16:36:28] [pilot-dispatcher] ga-in9ebr: wa-c8s2w QUEUED — routed to wa-worker, pool at session cap (4 active/creating >= 4 max); not claimed, no writes this sweep (the ga-93yxc pool top-up opens a session once a slot frees).",
+        "[2026-09-19 16:37:45] [pilot-dispatcher] Lane small: dispatched 0 this sweep (cap=1, slots_left=1).",
+        "[2026-09-19 16:37:45] [pilot-dispatcher] Lane big: dispatched 0 this sweep (cap=1, slots_left=1).",
+        "[2026-09-19 16:37:45] [pilot-dispatcher] === Pilot sweep complete: dispatched=0 (small_slots=1 big_slots=1 dolt_saturated_at_start=0) ===",
+    ]
+    _REAL_SWEEP_B = [
+        "[2026-09-19 16:52:15] [pilot-dispatcher] Lane small: dispatched 1 this sweep (cap=1, slots_left=0).",
+        "[2026-09-19 16:52:20] [pilot-dispatcher] ga-in9ebr: wa-jjztr QUEUED — routed to wa-worker, pool at session cap (3 active/creating >= 2 max); not claimed, no writes this sweep (the ga-93yxc pool top-up opens a session once a slot frees).",
+        "[2026-09-19 16:52:20] [pilot-dispatcher] ga-in9ebr: wa-0r2bt QUEUED — routed to wa-worker, pool at session cap (3 active/creating >= 2 max); not claimed, no writes this sweep (the ga-93yxc pool top-up opens a session once a slot frees).",
+        "[2026-09-19 16:52:20] [pilot-dispatcher] Lane big: dispatched 0 this sweep (cap=1, slots_left=1).",
+        "[2026-09-19 16:52:20] [pilot-dispatcher] === Pilot sweep complete: dispatched=1 (small_slots=1 big_slots=1 dolt_saturated_at_start=0) ===",
+    ]
+    _REAL_SWEEP_C = [
+        "[2026-09-19 17:06:03] [pilot-dispatcher] ga-in9ebr: wa-c8s2w QUEUED — routed to wa-worker, pool at session cap (2 active/creating >= 2 max); not claimed, no writes this sweep (the ga-93yxc pool top-up opens a session once a slot frees).",
+        "[2026-09-19 17:07:44] [pilot-dispatcher] Lane small: dispatched 0 this sweep (cap=1, slots_left=1).",
+        "[2026-09-19 17:07:44] [pilot-dispatcher] Lane big: dispatched 0 this sweep (cap=1, slots_left=1).",
+        "[2026-09-19 17:07:44] [pilot-dispatcher] === Pilot sweep complete: dispatched=0 (small_slots=1 big_slots=1 dolt_saturated_at_start=0) ===",
+    ]
+    # The one REAL "a lane loop was cut short with dispatched=0" line (2026-09-15 09:29:52).
+    _REAL_LOOP_CUT = (
+        "[2026-09-15 09:29:52] [pilot-dispatcher] WARN: Dolt health UNREADABLE mid-sweep "
+        "(cpu=% lat=?ms — probe returned no signal, NOT a measured value) — stopping small "
+        "loop after 0 dispatch(es), same fail-safe as genuine saturation (ga-hzt7; ga-rk5va "
+        "backoff).")
+
+    def _restamp_real(lines, shift):
+        """The SAME real lines with only the leading timestamp moved by `shift` seconds —
+        relative spacing kept to the second. The selftest's clock is NOW, not 2026-09-19."""
+        out = []
+        for l in lines:
+            ts = time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(_ts_epoch(l) + shift))
+            out.append(re.sub(r"^\[[^\]]+\]", ts, l, count=1))
+        return out
+
     def _cap_pick_line(epoch, bead, pool="wa-worker", live=2, cap=2):
         ts = time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(epoch))
         return ("%s [pilot-dispatcher] ga-in9ebr: %s QUEUED — routed to %s, pool at "
@@ -6408,12 +6658,15 @@ def _selftest():
                 "sweep (the ga-93yxc pool top-up opens a session once a slot frees)."
                 % (ts, bead, pool, live, cap))
 
-    def _cap_log_at(t, beads, live=2, cap=2):
+    def _cap_log_at(t, beads, live=2, cap=2, dispatched=0):
         """One evaluating sweep ending at t: a cap line per bead, then the real-shaped
-        sweep-complete line (small_slots=3, so the lane check can never explain the wait)."""
+        sweep-complete line (small_slots=3, so the lane check can never explain the wait).
+        By default a FULL WALK (dispatched=0, both lanes with a slot): these fixtures model
+        "everything the Pilot could try is queued at the cap", the shape a bead's absence
+        is a MEASURED negative in. Pass dispatched=N for a sweep that did not walk everyone."""
         lines = [_cap_pick_line(t - 60 + i, b, live=live, cap=cap)
                  for i, b in enumerate(beads)]
-        lines.append(_sweep_log_line_slots(t - 40, 3, 1))
+        lines.append(_sweep_log_line_slots(t - 40, 3, 1, dispatched=dispatched))
         return lines
 
     def _sh_wa_two_active(args, timeout=20):
@@ -6497,20 +6750,44 @@ def _selftest():
         _bad("(ga-9ekn2l-b2)", "got %r, want only ga-9ekn2l-y" % (ev9b2,))
 
     print("\nScenario (ga-9ekn2l-c): a bead cap-queued in an older sweep but ABSENT "
-          "from a later COMPLETED evaluating sweep is no longer cap-held (both are "
-          "inside the TTL, so only the supersede rule can exclude it)")
+          "from a later FULL-WALK evaluating sweep (dispatched=0, both lanes with a "
+          "slot, nothing cut short) is no longer cap-held (both are inside the TTL, so "
+          "only the supersede rule can exclude it) — and against that sweep a bead "
+          "missing from the map is a MEASURED not-held (walked_all)")
     _read_pilot_log_lines = lambda: [
         _cap_pick_line(NOW - 1500, "ga-9ekn2l-x"), _cap_pick_line(NOW - 1499, "ga-9ekn2l-y"),
         _sweep_log_line_slots(NOW - 1498, 3, 1),
         _cap_pick_line(NOW - 700, "ga-9ekn2l-y"),
-        _sweep_log_line_slots(NOW - 699, 3, 1),
+        _sweep_log_line_slots(NOW - 699, 3, 1, dispatched=0),
     ]
     ev9c = _pilot_cap_evidence(NOW)
-    if ev9c is not None and set(ev9c) == {"ga-9ekn2l-y"}:
-        _ok("(ga-9ekn2l-c): only the bead still capped in the latest evaluating sweep "
-            "remains evidence")
+    if ev9c is not None and set(ev9c) == {"ga-9ekn2l-y"} and ev9c.walked_all:
+        _ok("(ga-9ekn2l-c): only the bead still capped in the latest FULL-WALK sweep "
+            "remains evidence; absence from it is measured (walked_all)")
     else:
-        _bad("(ga-9ekn2l-c)", "got %r, want only ga-9ekn2l-y" % (ev9c,))
+        _bad("(ga-9ekn2l-c)", "got %r walked_all=%r, want only ga-9ekn2l-y measured" % (
+             ev9c, getattr(ev9c, "walked_all", None)))
+
+    print("\nScenario (ga-9ekn2l-c2): GATE-FIX 1 — the SAME shape, but the later sweep "
+          "DISPATCHED (dispatched=1): it stopped walking once its slots were consumed, "
+          "so x's silence in it proves nothing → x STAYS evidence (older, still inside "
+          "the TTL), y is refreshed, and a bead missing from the map is UNMEASURED "
+          "(walked_all False, and the reason names the dispatch)")
+    _read_pilot_log_lines = lambda: [
+        _cap_pick_line(NOW - 1500, "ga-9ekn2l-x"), _cap_pick_line(NOW - 1499, "ga-9ekn2l-y"),
+        _sweep_log_line_slots(NOW - 1498, 3, 1),
+        _cap_pick_line(NOW - 700, "ga-9ekn2l-y"),
+        _sweep_log_line_slots(NOW - 699, 3, 1, dispatched=1),
+    ]
+    ev9c2 = _pilot_cap_evidence(NOW)
+    if (ev9c2 is not None and set(ev9c2) == {"ga-9ekn2l-x", "ga-9ekn2l-y"}
+            and ev9c2["ga-9ekn2l-y"]["epoch"] == NOW - 700
+            and not ev9c2.walked_all and "dispatched 1 bead" in ev9c2.why):
+        _ok("(ga-9ekn2l-c2): a dispatching sweep keeps the older evidence and reads as "
+            "UNMEASURED for the beads it did not list")
+    else:
+        _bad("(ga-9ekn2l-c2)", "got %r walked_all=%r why=%r" % (
+             ev9c2, getattr(ev9c2, "walked_all", None), getattr(ev9c2, "why", None)))
 
     print("\nScenario (ga-9ekn2l-d): lines of the sweep STILL RUNNING (no complete "
           "line yet) overlay the last completed sweep without disproving it")
@@ -6617,12 +6894,38 @@ def _selftest():
              [s for s, _ in df9h], [s for s, _ in cap9h], flow_authority_calls,
              [n for n, _ in ledger_calls]))
 
+    print("\nScenario (ga-9ekn2l-h2): GATE-FIX 1 — SAME bead, but the latest evaluating "
+          "sweep DISPATCHED (so it stopped walking its pool): the missing cap line "
+          "proves nothing → STILL 'dispatch failing' (nothing is suppressed), but the "
+          "body says NÃO MEDIDO, names why, and does NOT assert 'did NOT queue it'")
+    _read_pilot_log_lines = lambda: _cap_log_at(NOW, ["ga-9ekn2l-o1", "ga-9ekn2l-o2"],
+                                                dispatched=1)
+    _sh = _sh_wa_two_active
+    st = _reset()
+    st["first_seen_approved"][_b9g] = NOW - 1774 * 60
+    run_cycle(NOW, st)
+    _sh = _stub_sh_fast
+    df9h2, cap9h2 = _df_mails(), _cap_mails()
+    if (len(df9h2) == 1 and not cap9h2
+            and "Pool-cap evidence (Pilot log): NÃO MEDIDO" in df9h2[0][1]
+            and "dispatched 1 bead" in df9h2[0][1]
+            and "none for this bead" not in df9h2[0][1]
+            and "did NOT queue it" not in df9h2[0][1]):
+        _ok("(ga-9ekn2l-h2): still alarms; the body says NÃO MEDIDO with the reason, "
+            "never the false 'did NOT queue it'")
+    else:
+        _bad("(ga-9ekn2l-h2)", "df=%r cap=%r body=%r" % (
+             [s for s, _ in df9h2], [s for s, _ in cap9h2],
+             [l for l in (df9h2[0][1] if df9h2 else "").splitlines() if "Pool-cap" in l]))
+
     print("\nScenario (ga-9ekn2l-i): falsification — the bead WAS cap-queued, but only "
-          "in an OLDER sweep; the latest evaluating sweep does not list it → STILL "
-          "'dispatch failing' (a stale cap line must not hide a genuine failure)")
+          "in an OLDER sweep; the latest evaluating sweep (a FULL WALK) does not list "
+          "it → STILL 'dispatch failing' (a stale cap line must not hide a genuine "
+          "failure)")
     _read_pilot_log_lines = lambda: [
         _cap_pick_line(NOW - 1400, _b9g), _sweep_log_line_slots(NOW - 1399, 3, 1),
-        _cap_pick_line(NOW - 700, "ga-9ekn2l-o1"), _sweep_log_line_slots(NOW - 40, 3, 1),
+        _cap_pick_line(NOW - 700, "ga-9ekn2l-o1"),
+        _sweep_log_line_slots(NOW - 40, 3, 1, dispatched=0),
     ]
     st = _reset()
     st["first_seen_approved"][_b9g] = NOW - 1774 * 60
@@ -6632,6 +6935,201 @@ def _selftest():
     else:
         _bad("(ga-9ekn2l-i)", "df=%r cap=%r" % (
              [s for s, _ in _df_mails()], [s for s, _ in _cap_mails()]))
+
+    # ── GATE-FIX 1 (attempt 1 FAIL): a sweep that did not walk everyone must not erase ──
+    print("\nScenario (ga-9ekn2l-r): GATE-FIX 1, the REAL REPLAY — sweeps A 16:37:45 "
+          "(dispatched=0), B 16:52:20 (dispatched=1, 'Lane small: dispatched 1 (cap=1, "
+          "slots_left=0)') and C 17:07:44 (dispatched=0), verbatim. wa-c8s2w is capped "
+          "in A and C and has NO line in B only because B never walked it: evidence "
+          "must survive B (and B's absences read UNMEASURED), C's full walk refreshes it")
+    _shift_r = (NOW - 30) - _ts_epoch(_REAL_SWEEP_B[-1])   # B's complete line -> NOW-30
+    _rA, _rB, _rC = (_restamp_real(s, _shift_r)
+                     for s in (_REAL_SWEEP_A, _REAL_SWEEP_B, _REAL_SWEEP_C))
+    _now_rA, _now_rB, _now_rC = _ts_epoch(_rA[-1]) + 30, NOW, _ts_epoch(_rC[-1]) + 30
+    _read_pilot_log_lines = lambda: list(_rA)
+    ev_rA = _pilot_cap_evidence(_now_rA)
+    _read_pilot_log_lines = lambda: list(_rA) + list(_rB)
+    ev_rB = _pilot_cap_evidence(_now_rB)
+    _read_pilot_log_lines = lambda: list(_rA) + list(_rB) + list(_rC)
+    ev_rC = _pilot_cap_evidence(_now_rC)
+    _r_problems = []
+    if not (ev_rA is not None and set(ev_rA) == {"wa-c8s2w"} and ev_rA.walked_all
+            and ev_rA["wa-c8s2w"]["max"] == 4):
+        _r_problems.append("after A: %r walked_all=%r" % (
+            ev_rA, getattr(ev_rA, "walked_all", None)))
+    if not (ev_rB is not None and set(ev_rB) == {"wa-c8s2w", "wa-jjztr", "wa-0r2bt"}
+            and not ev_rB.walked_all and "dispatched 1 bead" in ev_rB.why):
+        _r_problems.append("after B (the 16:52 false negative): %r walked_all=%r why=%r" % (
+            ev_rB, getattr(ev_rB, "walked_all", None), getattr(ev_rB, "why", None)))
+    # C in this trimmed fixture lists only wa-c8s2w; being a full walk it supersedes B's two.
+    if not (ev_rC is not None and set(ev_rC) == {"wa-c8s2w"} and ev_rC.walked_all
+            and ev_rC["wa-c8s2w"]["max"] == 2):
+        _r_problems.append("after C: %r walked_all=%r" % (
+            ev_rC, getattr(ev_rC, "walked_all", None)))
+    if _r_problems:
+        _bad("(ga-9ekn2l-r)", "; ".join(_r_problems))
+    else:
+        _ok("(ga-9ekn2l-r): wa-c8s2w stays evidence across the dispatching 16:52 sweep "
+            "(which reads UNMEASURED); the 17:07 full walk refreshes it and reads measured")
+
+    print("\nScenario (ga-9ekn2l-r2): the same REAL replay END-TO-END at the cycle right "
+          "after B — 3 approved beads, all with evidence, with MIXED caps (wa-c8s2w's "
+          "kept line says 4>=4, the sweep after says 3>=2): NO 'dispatch failing', ONE "
+          "capacity-wait note, naming the POOL's newest cap (2) — not the trigger "
+          "bead's own (4), which would flip the fingerprint and mail again at once")
+    _rb = ["wa-c8s2w", "wa-jjztr", "wa-0r2bt"]
+    _bd_approved = lambda root: [_make_bead(b, labels=list(_LBL9)) for b in _rb]
+    _read_pilot_log_lines = lambda: list(_rA) + list(_rB)
+    _read_pilot_dispatchable_file = lambda: _dispatchable_front("wa-c8s2w")
+    _read_pilot_sweep_pause_state_file = _pause_off
+    _sh = _sh_wa_two_active
+    st = _reset()
+    for _b in _rb:
+        st["first_seen_approved"][_b] = NOW - 600 * 60
+    run_cycle(NOW, st)
+    _sh = _stub_sh_fast
+    cap9r, df9r = _cap_mails(), _df_mails()
+    _r2_problems = []
+    if df9r:
+        _r2_problems.append("still alarmed 'dispatch failing': %r" % ([s for s, _ in df9r],))
+    if len(cap9r) != 1:
+        _r2_problems.append("want exactly 1 capacity-wait note, got %d: %r" % (
+            len(cap9r), [s for s, _ in cap9r]))
+    else:
+        if "teto 2" not in cap9r[0][0] or "teto 4" in cap9r[0][0]:
+            _r2_problems.append("note must name the pool's newest cap (2): %r" % cap9r[0][0])
+        if "3 bead(s) na fila" not in cap9r[0][0]:
+            _r2_problems.append("queue depth should count all 3 beads: %r" % cap9r[0][0])
+    if st.get("capacity_wait", {}).get("wa-worker", {}).get("fp") != "wa-worker:2":
+        _r2_problems.append("fingerprint should be wa-worker:2: %r" % (st.get("capacity_wait"),))
+    if flow_authority_calls or notify_calls or any(n == "human-touch" for n, _ in ledger_calls):
+        _r2_problems.append("side effects: flow=%r notify=%r ledger=%r" % (
+            flow_authority_calls, notify_calls, [n for n, _ in ledger_calls]))
+    if _r2_problems:
+        _bad("(ga-9ekn2l-r2)", "; ".join(_r2_problems))
+    else:
+        _ok("(ga-9ekn2l-r2): the false alarm does not re-fire after the dispatching "
+            "sweep; one note, pool-level cap, no flow-authority/ledger/push")
+
+    print("\nScenario (ga-9ekn2l-r3): the same REAL log at the same cycle, but for a bead "
+          "with NO cap line at all: still 'dispatch failing' (not suppressed), and since "
+          "B did not walk everyone the body says NÃO MEDIDO — never 'did NOT queue it'")
+    _b9r3 = "ga-9ekn2l-r3"
+    _bd_approved = lambda root: [_make_bead(_b9r3, labels=list(_LBL9))]
+    _read_pilot_dispatchable_file = lambda: _dispatchable_front(_b9r3)
+    _sh = _sh_wa_two_active
+    st = _reset()
+    st["first_seen_approved"][_b9r3] = NOW - 600 * 60
+    run_cycle(NOW, st)
+    _sh = _stub_sh_fast
+    df9r3, cap9r3 = _df_mails(), _cap_mails()
+    if (len(df9r3) == 1 and not cap9r3
+            and "Pool-cap evidence (Pilot log): NÃO MEDIDO" in df9r3[0][1]
+            and "dispatched 1 bead" in df9r3[0][1]
+            and "none for this bead" not in df9r3[0][1]
+            and "did NOT queue it" not in df9r3[0][1]):
+        _ok("(ga-9ekn2l-r3): unrelated bead still alarms, honestly — NÃO MEDIDO, with "
+            "the reason from the real 16:52 sweep")
+    else:
+        _bad("(ga-9ekn2l-r3)", "df=%r cap=%r" % (
+             [s for s, _ in df9r3], [s for s, _ in cap9r3]))
+
+    print("\nScenario (ga-9ekn2l-w): GATE-FIX 1, the CLASS — every reason a completed "
+          "sweep can fail to have walked all its candidates (a dispatch; a lane with no "
+          "slot, either lane; a lane loop cut short — the REAL 2026-09-15 line; a "
+          "complete line with no counters; an undatable one) KEEPS older evidence and "
+          "reads UNMEASURED; the control (a genuine full walk) supersedes and reads "
+          "measured. Two more: cap lines of a sweep still running with no completed "
+          "sweep at all, and a full walk older than the TTL beside a fresh running line")
+    # x is capped in an OLDER completed sweep (cap line + its complete line, both inside
+    # the TTL); each case below is the LATER sweep. Without _w_prev x's line would belong
+    # to the later sweep's own block and nothing could supersede it.
+    _w_x = _cap_pick_line(NOW - 1500, "ga-9ekn2l-wx")
+    _w_prev = _sweep_log_line_slots(NOW - 1499, 3, 1)
+    _w_cut = _restamp_real([_REAL_LOOP_CUT], (NOW - 150) - _ts_epoch(_REAL_LOOP_CUT))
+    _w_cases = [
+        ("a dispatch", [_sweep_log_line_slots(NOW - 100, 3, 1, dispatched=1)]),
+        ("small lane has no slot", [_sweep_log_line_slots(NOW - 100, 0, 1, dispatched=0)]),
+        ("big lane has no slot", [_sweep_log_line_slots(NOW - 100, 3, 0, dispatched=0)]),
+        ("lane loop cut short (REAL line)",
+         _w_cut + [_sweep_log_line_slots(NOW - 100, 3, 1, dispatched=0)]),
+        ("no counters on the line",
+         [time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(NOW - 100)) +
+          " [pilot-dispatcher] === Pilot sweep complete: dispatched=0 ==="]),
+        ("undatable complete line",
+         ["[pilot-dispatcher] === Pilot sweep complete: dispatched=0 (small_slots=3 "
+          "big_slots=1 dolt_saturated_at_start=0) ==="]),
+        ("future-dated full-walk line (+3600s: a stepped clock is not proof)",
+         [_sweep_log_line_slots(NOW + 3600, 3, 1, dispatched=0)]),
+    ]
+    _w_problems = []
+    for _w_name, _w_tail in _w_cases:
+        _read_pilot_log_lines = lambda: [_w_x, _w_prev] + _w_tail
+        _w_ev = _pilot_cap_evidence(NOW)
+        if not (_w_ev is not None and "ga-9ekn2l-wx" in _w_ev and not _w_ev.walked_all
+                and _w_ev.why):
+            _w_problems.append("%s: got %r walked_all=%r why=%r" % (
+                _w_name, _w_ev, getattr(_w_ev, "walked_all", None),
+                getattr(_w_ev, "why", None)))
+    _read_pilot_log_lines = lambda: [
+        _w_x, _w_prev, _sweep_log_line_slots(NOW - 100, 3, 1, dispatched=0)]
+    _w_ctl = _pilot_cap_evidence(NOW)
+    if not (_w_ctl is not None and "ga-9ekn2l-wx" not in _w_ctl and _w_ctl.walked_all):
+        _w_problems.append("control (full walk): got %r walked_all=%r" % (
+            _w_ctl, getattr(_w_ctl, "walked_all", None)))
+    # The cut-short flag belongs to ONE sweep: a clean full walk that follows a cut-short
+    # one is a full walk again. A flag that leaked across sweeps would keep x for good.
+    _w_cut2 = _restamp_real([_REAL_LOOP_CUT], (NOW - 800) - _ts_epoch(_REAL_LOOP_CUT))
+    _read_pilot_log_lines = lambda: [
+        _w_x, _w_prev] + _w_cut2 + [
+        _sweep_log_line_slots(NOW - 790, 3, 1, dispatched=0),   # cut short: keeps x
+        _sweep_log_line_slots(NOW - 100, 3, 1, dispatched=0)]   # clean: supersedes
+    _w_leak = _pilot_cap_evidence(NOW)
+    if not (_w_leak is not None and "ga-9ekn2l-wx" not in _w_leak and _w_leak.walked_all):
+        _w_problems.append("clean full walk after a cut-short sweep: got %r walked_all=%r" % (
+            _w_leak, getattr(_w_leak, "walked_all", None)))
+    # A sweep that STARTED and never completed (100 of 1059 real starts; one left cap lines
+    # behind) walked an unknown part of its pool. Its lines must not be inherited by the next
+    # sweep's block: a later genuine full walk supersedes them; a later non-walk keeps them.
+    _w_start = lambda t: (time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(t))
+                          + " [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===")
+    _read_pilot_log_lines = lambda: [
+        _w_x, _w_prev,
+        _w_start(NOW - 1400), _cap_pick_line(NOW - 1300, "ga-9ekn2l-wa"),   # never completed
+        _w_start(NOW - 600), _sweep_log_line_slots(NOW - 100, 3, 1, dispatched=0)]
+    _w_ab = _pilot_cap_evidence(NOW)
+    if not (_w_ab is not None and dict(_w_ab) == {} and _w_ab.walked_all):
+        _w_problems.append("aborted sweep bled into the next full walk: got %r walked_all=%r" % (
+            _w_ab, getattr(_w_ab, "walked_all", None)))
+    _read_pilot_log_lines = lambda: [
+        _w_x, _w_prev,
+        _w_start(NOW - 1400), _cap_pick_line(NOW - 1300, "ga-9ekn2l-wa"),
+        _w_start(NOW - 600), _sweep_log_line_slots(NOW - 100, 3, 1, dispatched=1)]
+    _w_ab2 = _pilot_cap_evidence(NOW)
+    if not (_w_ab2 is not None and set(_w_ab2) == {"ga-9ekn2l-wx", "ga-9ekn2l-wa"}
+            and not _w_ab2.walked_all):
+        _w_problems.append("aborted sweep's lines lost under a non-walk: got %r walked_all=%r" % (
+            _w_ab2, getattr(_w_ab2, "walked_all", None)))
+    _read_pilot_log_lines = lambda: [_cap_pick_line(NOW - 100, "ga-9ekn2l-wr")]
+    _w_run = _pilot_cap_evidence(NOW)
+    if not (_w_run is not None and set(_w_run) == {"ga-9ekn2l-wr"} and not _w_run.walked_all
+            and "COMPLETED" in _w_run.why):
+        _w_problems.append("running-only: got %r walked_all=%r why=%r" % (
+            _w_run, getattr(_w_run, "walked_all", None), getattr(_w_run, "why", None)))
+    _read_pilot_log_lines = lambda: [
+        _sweep_log_line_slots(NOW - 2000, 3, 1, dispatched=0),
+        _cap_pick_line(NOW - 100, "ga-9ekn2l-ws")]
+    _w_old = _pilot_cap_evidence(NOW)
+    if not (_w_old is not None and set(_w_old) == {"ga-9ekn2l-ws"} and not _w_old.walked_all
+            and "older than" in _w_old.why):
+        _w_problems.append("stale full walk: got %r walked_all=%r why=%r" % (
+            _w_old, getattr(_w_old, "walked_all", None), getattr(_w_old, "why", None)))
+    if _w_problems:
+        _bad("(ga-9ekn2l-w)", "; ".join(_w_problems))
+    else:
+        _ok("(ga-9ekn2l-w): 7 non-walk classes + running-only + stale-walk keep evidence "
+            "and read UNMEASURED; the control full walk supersedes and reads measured, "
+            "also right after a cut-short or an aborted sweep")
 
     print("\nScenario (ga-9ekn2l-j): volume — 3 cap-queued beads x every rig → ONE "
           "note per pool, none inside the backoff, repeat #2 after 1h, and a change "
