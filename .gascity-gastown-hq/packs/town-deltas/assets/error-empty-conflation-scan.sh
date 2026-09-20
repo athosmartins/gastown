@@ -364,9 +364,9 @@ scan_js_empty_catch() {
       *catch*) ;;
       *) continue ;;
     esac
-    if printf '%s\n' "$line" | grep -Eq 'catch[[:space:]]*\([^)]*\)[[:space:]]*\{[[:space:]]*\}'; then
+    if printf '%s\n' "$line" | grep -E 'catch[[:space:]]*\([^)]*\)[[:space:]]*\{[[:space:]]*\}' >/dev/null; then
       _allowlisted "$file" "$lineno" || echo "${file}:${lineno}:C1:${line}"
-    elif printf '%s\n' "$line" | grep -Eq 'catch[[:space:]]*\([^)]*\)[[:space:]]*\{[[:space:]]*$'; then
+    elif printf '%s\n' "$line" | grep -E 'catch[[:space:]]*\([^)]*\)[[:space:]]*\{[[:space:]]*$' >/dev/null; then
       waiting=1
       start=$lineno
     fi
@@ -557,9 +557,9 @@ scan_bd_list_no_limit() {
     [ -z "$start" ] && continue
     while IFS= read -r stmt || [ -n "$stmt" ]; do
       [ -z "$stmt" ] && continue
-      printf '%s' "$stmt" | grep -Eq "([^A-Za-z0-9_]|^)bd([^A-Za-z0-9_].*)?[[:space:]]list([[:space:]]|\$)" || continue
-      printf '%s' "$stmt" | grep -Eq -- '--json' || continue
-      printf '%s' "$stmt" | grep -Eq -- '--limit[[:space:]]+0|-n[[:space:]]+0|--limit=0' && continue
+      printf '%s' "$stmt" | grep -E "([^A-Za-z0-9_]|^)bd([^A-Za-z0-9_].*)?[[:space:]]list([[:space:]]|\$)" >/dev/null || continue
+      printf '%s' "$stmt" | grep -E -- '--json' >/dev/null || continue
+      printf '%s' "$stmt" | grep -E -- '--limit[[:space:]]+0|-n[[:space:]]+0|--limit=0' >/dev/null && continue
       _allowlisted_range "$file" "$start" "$end" && continue
       echo "${file}:${start}:C4:${stmt}"
     done < <(_split_statements "$frag")
@@ -601,9 +601,9 @@ scan_bd_gate_no_infra() {
     [ -z "$start" ] && continue
     while IFS= read -r stmt || [ -n "$stmt" ]; do
       [ -z "$stmt" ] && continue
-      printf '%s' "$stmt" | grep -Eq "([^A-Za-z0-9_]|^)bd([^A-Za-z0-9_].*)?[[:space:]](list|show)([[:space:]]|\$)" || continue
-      printf '%s' "$stmt" | grep -Eq -- 'type:quality-gate-' || continue
-      printf '%s' "$stmt" | grep -Eq -- '--include-infra' && continue
+      printf '%s' "$stmt" | grep -E "([^A-Za-z0-9_]|^)bd([^A-Za-z0-9_].*)?[[:space:]](list|show)([[:space:]]|\$)" >/dev/null || continue
+      printf '%s' "$stmt" | grep -E -- 'type:quality-gate-' >/dev/null || continue
+      printf '%s' "$stmt" | grep -E -- '--include-infra' >/dev/null && continue
       _allowlisted_range "$file" "$start" "$end" && continue
       echo "${file}:${start}:C5:${stmt}"
     done < <(_split_statements "$frag")
@@ -652,9 +652,9 @@ scan_bd_formatted_output_parsed() {
     [ -z "$start" ] && continue
     while IFS= read -r stmt || [ -n "$stmt" ]; do
       [ -z "$stmt" ] && continue
-      printf '%s' "$stmt" | grep -Eq "([^A-Za-z0-9_]|^)bd([^A-Za-z0-9_].*)?[[:space:]](comments|show)([[:space:]]|\$)" || continue
-      printf '%s' "$stmt" | grep -Eq -- '--json' && continue
-      printf '%s' "$stmt" | grep -Eq '\|[[:space:]]*(grep|egrep|sed|awk)([^A-Za-z0-9_]|$)' || continue
+      printf '%s' "$stmt" | grep -E "([^A-Za-z0-9_]|^)bd([^A-Za-z0-9_].*)?[[:space:]](comments|show)([[:space:]]|\$)" >/dev/null || continue
+      printf '%s' "$stmt" | grep -E -- '--json' >/dev/null && continue
+      printf '%s' "$stmt" | grep -E '\|[[:space:]]*(grep|egrep|sed|awk)([^A-Za-z0-9_]|$)' >/dev/null || continue
       _allowlisted_range "$file" "$start" "$end" && continue
       echo "${file}:${start}:C6:${stmt}"
     done < <(_split_statements "$frag")

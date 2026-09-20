@@ -42,7 +42,7 @@ case "$FC_SNIP" in
   *_filter_candidates*) : ;;
   *) fail "could not extract _filter_candidates from deployed file — did it move/rename?" ;;
 esac
-echo "$FC_SNIP" | grep -q 'or . == "no-auto-dispatch"' \
+echo "$FC_SNIP" | grep 'or . == "no-auto-dispatch"' >/dev/null \
   || fail "_filter_candidates lacks the bare no-auto-dispatch clause — fix not deployed"
 log "_filter_candidates carries the bare no-auto-dispatch clause"
 
@@ -52,7 +52,7 @@ case "$HOLD_SNIP" in
   *_pilot_hold_or_escalate*) : ;;
   *) fail "could not extract _pilot_hold_or_escalate from deployed file — did it move/rename?" ;;
 esac
-echo "$HOLD_SNIP" | grep -q 'or . == "no-auto-dispatch"' \
+echo "$HOLD_SNIP" | grep 'or . == "no-auto-dispatch"' >/dev/null \
   || fail "_pilot_hold_or_escalate lacks the bare no-auto-dispatch clause — fix not deployed"
 log "_pilot_hold_or_escalate carries the bare no-auto-dispatch clause"
 
@@ -67,7 +67,7 @@ case "$CCD_SNIP" in
   *context_check_is_parked*) : ;;
   *) fail "could not extract context_check_is_parked from deployed file — did it move/rename?" ;;
 esac
-echo "$CCD_SNIP" | grep -q 'pilot:no-auto-dispatch|no-auto-dispatch)' \
+echo "$CCD_SNIP" | grep 'pilot:no-auto-dispatch|no-auto-dispatch)' >/dev/null \
   || fail "context_check_is_parked lacks the bare no-auto-dispatch alias — fix not deployed"
 log "context_check_is_parked carries the bare no-auto-dispatch alias"
 

@@ -185,7 +185,7 @@ stderr_has_real_fatal() {
     | grep -vE '^-+ Logging error -+$')
   # A real fatal: an actual Python traceback, an explicit FATAL, a bind clash,
   # or an OSError code. (Anchored to reduce accidental matches on log text.)
-  printf '%s\n' "$filtered" | grep -qE 'Traceback \(most recent call last\)|^[A-Za-z_]+Error:|\bFATAL\b|Address already in use|OSError|\[Errno [0-9]+\]'
+  printf '%s\n' "$filtered" | grep -E 'Traceback \(most recent call last\)|^[A-Za-z_]+Error:|\bFATAL\b|Address already in use|OSError|\[Errno [0-9]+\]' >/dev/null
 }
 
 # health check for a daemon AFTER kickstart. Returns 0 healthy, 1 unhealthy.
@@ -222,7 +222,7 @@ verify_healthy() {
       fi
       if (( fresh == 1 )); then
         if [[ -n "$port" ]]; then
-          if curl -s -m 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/health" 2>/dev/null | grep -q '^200$'; then
+          if curl -s -m 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/health" 2>/dev/null | grep '^200$' >/dev/null; then
             log "  health($d): OK pid=$pid (was ${pre_pid:-none}) started=$(date -r "$sepoch" '+%H:%M:%S') /health=200 (after ${waited}s)"
             return 0
           fi

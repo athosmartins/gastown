@@ -35,7 +35,7 @@ for cfg in "$CITY"/agents/*/agent.toml; do
     [[ -f "$cfg" ]] || continue
     grep -q "^max_active_sessions = 1" "$cfg" || continue
     agent=$(basename "$(dirname "$cfg")")
-    if "$GC" --city "$CITY" session list 2>/dev/null | grep -qE "^[[:space:]]*ga-session-[a-f0-9]+[[:space:]]+${agent}[[:space:]]+(active|creating|start-pending)"; then
+    if "$GC" --city "$CITY" session list 2>/dev/null | grep -E "^[[:space:]]*ga-session-[a-f0-9]+[[:space:]]+${agent}[[:space:]]+(active|creating|start-pending)" >/dev/null; then
         CANDIDATE="$agent"
         break
     fi
@@ -64,7 +64,7 @@ if [[ "$EXIT_CODE" == "0" ]]; then
     fail "gc session new '$CANDIDATE' succeeded despite max_active_sessions=1 — fix not active"
 fi
 
-if ! echo "$STDERR_OUT" | grep -q "max_active_sessions"; then
+if ! echo "$STDERR_OUT" | grep "max_active_sessions" >/dev/null; then
     fail "gc session new '$CANDIDATE' failed but stderr missing 'max_active_sessions': $STDERR_OUT"
 fi
 

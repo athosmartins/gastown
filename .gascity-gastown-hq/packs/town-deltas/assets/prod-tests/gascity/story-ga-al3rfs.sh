@@ -36,9 +36,9 @@ log "Deployed reaper found: $REAPER"
 # CODE = the non-comment lines only, so a comment alone cannot satisfy the checks below.
 # grep -F throughout: the patterns carry a literal `$`, which a regex would read as an anchor.
 CODE="$(grep -v '^[[:space:]]*#' "$REAPER")"
-printf '%s\n' "$CODE" | grep -F -q 'malformed_row_no_id' \
+printf '%s\n' "$CODE" | grep -F 'malformed_row_no_id' >/dev/null \
   || fail "malformed_row_no_id guard missing from the deployed reaper — an id-less row can reach gc session close"
-printf '%s\n' "$CODE" | grep -F -q '[ "$id" = "-" ]' \
+printf '%s\n' "$CODE" | grep -F '[ "$id" = "-" ]' >/dev/null \
   || fail "the guard does not reject the census placeholder id (\"-\") — an id-less row still reads as a real id"
 log "malformed_row_no_id guard (rejects blank AND placeholder id) present in the deployed reaper (code lines) ✓"
 
@@ -61,11 +61,11 @@ RESULT="$(
     ' _ "$REAPER" 2>/dev/null
 )"
 
-echo "$RESULT" | grep -F -q 'NO_PARSE_CENSUS' \
+echo "$RESULT" | grep -F 'NO_PARSE_CENSUS' >/dev/null \
   && fail "deployed reaper does not define parse_census when sourced"
-echo "$RESULT" | grep -F -q 'ALIGN=-|y|-|-|-|-|unknown|-|-|' \
+echo "$RESULT" | grep -F 'ALIGN=-|y|-|-|-|-|unknown|-|-|' >/dev/null \
   || fail "deployed parse_census misaligned or left a column empty for a name-only session — got: $(echo "$RESULT" | grep -F 'ALIGN=' | head -1)"
-echo "$RESULT" | grep -F -q 'ROWS=1' \
+echo "$RESULT" | grep -F 'ROWS=1' >/dev/null \
   || fail "a newline inside a title split the deployed census into more than one row — got: $(echo "$RESULT" | grep -F 'ROWS=' | head -1)"
 log "deployed parse_census keeps absent fields aligned ('-' placeholders) and one row per session ✓"
 
@@ -74,7 +74,7 @@ log "deployed parse_census keeps absent fields aligned ('-' placeholders) and on
 OUT="$(bash "$SELFTEST" 2>&1)"; RC=$?
 [[ "$RC" -eq 0 ]] || fail "deployed adhoc-session-reaper selftest failed (rc=$RC): $(echo "$OUT" | grep -E '^(FAIL|selftest:)' | head -5 | tr '\n' ' ')"
 for scen in '(n1) ' '(n2) ' '(n) ' '(o) ' '(p) '; do
-  echo "$OUT" | grep -F -q "ok   - $scen" \
+  echo "$OUT" | grep -F "ok   - $scen" >/dev/null \
     || fail "selftest ran without ga-al3rfs scenario ${scen}— stale or truncated selftest"
 done
 log "deployed selftest green: $(echo "$OUT" | grep -E '^selftest:' | tail -1) ✓"

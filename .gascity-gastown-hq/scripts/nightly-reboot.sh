@@ -196,7 +196,7 @@ macos_update_check_state() {
     MACOS_UPDATE_REASON="softwareupdate --list --no-scan failed (rc=${SU_LIST_RC})"
     return 0
   fi
-  if printf '%s' "${SU_LIST_OUT}" | grep -q "Action: restart"; then
+  if printf '%s' "${SU_LIST_OUT}" | grep "Action: restart" >/dev/null; then
     MACOS_UPDATE_STATE="pending"
     MACOS_UPDATE_REASON="update with Action: restart pending"
   else
@@ -252,7 +252,7 @@ macos_update_install_if_ready() {
     return 0
   fi
 
-  if printf '%s' "${SU_INSTALL_OUT}" | grep -qi "not enough free disk space"; then
+  if printf '%s' "${SU_INSTALL_OUT}" | grep -i "not enough free disk space" >/dev/null; then
     local disk_msg
     disk_msg=$(printf '%s' "${SU_INSTALL_OUT}" | grep -i "not enough free disk space" | head -1)
     log "ERROR: macOS update falhou por falta de espaço em disco (rc=${su_rc}): ${disk_msg} — update continua pendente; prosseguindo com o reboot mesmo assim"

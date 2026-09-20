@@ -347,7 +347,7 @@ else
     for db in $ALL_DBS; do
         db_dir="$DOLT_DATA_DIR/$db"
         if [ -d "$db_dir/.dolt" ]; then
-            if (cd "$db_dir" && dolt backup 2>/dev/null | awk '{print $1}' | grep -qx "${db}-backup"); then
+            if (cd "$db_dir" && dolt backup 2>/dev/null | awk '{print $1}' | grep -x "${db}-backup" >/dev/null); then
                 DATABASES="$DATABASES $db"
             fi
         fi

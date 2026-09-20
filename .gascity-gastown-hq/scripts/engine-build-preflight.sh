@@ -220,19 +220,19 @@ print("\n".join(bad))
   _s3_out=$(PREFLIGHT_TEST_DISK_FREE_GB=8.19 PREFLIGHT_TEST_SWAP_FREE_GB=1.40 \
     PREFLIGHT_TEST_GOCACHE_GB=0 PREFLIGHT_TEST_LOADAVG_RAW='{ 38.81 30 21.97 }' \
     bash "${BASH_SOURCE[0]}" --json)
-  printf '%s' "$_s3_out" | grep -q '"recommendation":"NAO RECOMENDADO' \
+  printf '%s' "$_s3_out" | grep '"recommendation":"NAO RECOMENDADO' >/dev/null \
     && ok "numeros do incidente recomendam NAO RECOMENDADO" \
     || bad "numeros do incidente recomendaram seguir (isto e o bug original): $_s3_out"
-  printf '%s' "$_s3_out" | grep -q '"swap_verdict":"ABAIXO"' \
+  printf '%s' "$_s3_out" | grep '"swap_verdict":"ABAIXO"' >/dev/null \
     && ok "swap marcado ABAIXO com 1,40GB livres" || bad "swap nao marcado: $_s3_out"
-  printf '%s' "$_s3_out" | grep -q '"gocache_verdict":"FRIO-SEM-FOLGA"' \
+  printf '%s' "$_s3_out" | grep '"gocache_verdict":"FRIO-SEM-FOLGA"' >/dev/null \
     && ok "gocache marcado frio-sem-folga" || bad "gocache nao marcado: $_s3_out"
 
   echo "S4: leitura saudavel recomenda seguir"
   _s4_out=$(PREFLIGHT_TEST_DISK_FREE_GB=20 PREFLIGHT_TEST_SWAP_FREE_GB=8 \
     PREFLIGHT_TEST_GOCACHE_GB=3 PREFLIGHT_TEST_LOADAVG_RAW='{ 5 5 5 }' \
     bash "${BASH_SOURCE[0]}" --json)
-  printf '%s' "$_s4_out" | grep -q '"recommendation":"OK PARA COMECAR' \
+  printf '%s' "$_s4_out" | grep '"recommendation":"OK PARA COMECAR' >/dev/null \
     && ok "numeros saudaveis recomendam seguir" \
     || bad "numeros saudaveis nao recomendaram seguir: $_s4_out"
 
@@ -240,9 +240,9 @@ print("\n".join(bad))
   _s5_out=$(PREFLIGHT_TEST_DISK_FREE_GB=20 PREFLIGHT_TEST_SWAP_FREE_GB='__UNKNOWN__' \
     PREFLIGHT_TEST_GOCACHE_GB=3 PREFLIGHT_TEST_LOADAVG_RAW='{ 5 5 5 }' \
     bash "${BASH_SOURCE[0]}" --json)
-  printf '%s' "$_s5_out" | grep -q '"swap_verdict":"DESCONHECIDO"' \
+  printf '%s' "$_s5_out" | grep '"swap_verdict":"DESCONHECIDO"' >/dev/null \
     && ok "swap ilegivel vira DESCONHECIDO, nao OK" || bad "swap ilegivel nao marcado certo: $_s5_out"
-  printf '%s' "$_s5_out" | grep -q '"recommendation":"NAO RECOMENDADO' \
+  printf '%s' "$_s5_out" | grep '"recommendation":"NAO RECOMENDADO' >/dev/null \
     && ok "sinal DESCONHECIDO reprova a recomendacao final" \
     || bad "sinal DESCONHECIDO nao deveria deixar passar: $_s5_out"
 
@@ -254,12 +254,12 @@ print("\n".join(bad))
   _s6_out=$(PREFLIGHT_TEST_DISK_FREE_GB=20 PREFLIGHT_TEST_SWAP_FREE_GB=8 \
     PREFLIGHT_TEST_GOCACHE_GB=3 PREFLIGHT_TEST_LOADAVG_RAW='{ 38.81 30 21.97 }' \
     bash "${BASH_SOURCE[0]}" --json)
-  printf '%s' "$_s6_out" | grep -q '"load_verdict":"SUBINDO"' \
+  printf '%s' "$_s6_out" | grep '"load_verdict":"SUBINDO"' >/dev/null \
     && ok "load subindo marcado SUBINDO" || bad "load subindo nao marcado: $_s6_out"
-  printf '%s' "$_s6_out" | grep -q '"recommendation":"NAO RECOMENDADO' \
+  printf '%s' "$_s6_out" | grep '"recommendation":"NAO RECOMENDADO' >/dev/null \
     && ok "load SUBINDO sozinho ja reprova a recomendacao (nao so um sufixo ATENCAO)" \
     || bad "load subindo com os outros 3 saudaveis ainda recomendou seguir (bug original, isolado): $_s6_out"
-  printf '%s' "$_s6_out" | grep -qi 'ATENCAO' \
+  printf '%s' "$_s6_out" | grep -i 'ATENCAO' >/dev/null \
     && bad "sufixo ATENCAO obsoleto ainda presente — deveria ter sido substituido pelo bad-gate: $_s6_out" \
     || ok "sufixo ATENCAO obsoleto removido (load agora reprova de verdade, nao so avisa)"
 
@@ -269,9 +269,9 @@ print("\n".join(bad))
   _s7_out=$(PREFLIGHT_TEST_DISK_FREE_GB=20 PREFLIGHT_TEST_SWAP_FREE_GB=8 \
     PREFLIGHT_TEST_GOCACHE_GB=3 PREFLIGHT_TEST_LOADAVG_RAW='__UNKNOWN__' \
     bash "${BASH_SOURCE[0]}" --json)
-  printf '%s' "$_s7_out" | grep -q '"load_verdict":"DESCONHECIDO"' \
+  printf '%s' "$_s7_out" | grep '"load_verdict":"DESCONHECIDO"' >/dev/null \
     && ok "load ilegivel marcado DESCONHECIDO" || bad "load ilegivel nao marcado: $_s7_out"
-  printf '%s' "$_s7_out" | grep -q '"recommendation":"NAO RECOMENDADO' \
+  printf '%s' "$_s7_out" | grep '"recommendation":"NAO RECOMENDADO' >/dev/null \
     && ok "load DESCONHECIDO sozinho ja reprova a recomendacao (4o sinal, mesma regra dos outros 3)" \
     || bad "load ilegivel com os outros 3 saudaveis ainda recomendou seguir (bug original, isolado): $_s7_out"
 

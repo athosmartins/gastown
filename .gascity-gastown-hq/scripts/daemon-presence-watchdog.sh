@@ -91,7 +91,7 @@ DPW_RELOAD="${DPW_RELOAD:-1}"     # 1 = auto-reload absent critical daemons; 0 =
 _deliberately_disabled() {
   local lbl="$1"
   launchctl print-disabled "gui/$UID_NUM" 2>/dev/null \
-    | grep -qE "\"$lbl\" *=> *disabled"
+    | grep -E "\"$lbl\" *=> *disabled" >/dev/null
 }
 # 1 = suppress a heartbeat-WEDGE flag when the machine only just booted/woke (the
 # staleness is then attributable to launchd suspending StartInterval timers during

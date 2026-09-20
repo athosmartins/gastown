@@ -1791,13 +1791,13 @@ OUTCOME="TIMEOUT"
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   TB=$(bd_ show "$TASK_BEAD_ID" --json 2>/dev/null || echo "[]")
   TB_LABELS=$(echo "$TB" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")')
-  if echo "$TB_LABELS" | grep -q "outcome:REFINED"; then
+  if echo "$TB_LABELS" | grep "outcome:REFINED" >/dev/null; then
     OUTCOME="REFINED"; break
-  elif echo "$TB_LABELS" | grep -q "outcome:ESCALATE:info-gap"; then
+  elif echo "$TB_LABELS" | grep "outcome:ESCALATE:info-gap" >/dev/null; then
     OUTCOME="ESCALATE:info-gap"; break
-  elif echo "$TB_LABELS" | grep -q "outcome:ESCALATE"; then
+  elif echo "$TB_LABELS" | grep "outcome:ESCALATE" >/dev/null; then
     OUTCOME="ESCALATE"; break
-  elif echo "$TB_LABELS" | grep -q "outcome:SPLIT"; then
+  elif echo "$TB_LABELS" | grep "outcome:SPLIT" >/dev/null; then
     OUTCOME="SPLIT"; break
   fi
   # ga-bvbm: past the boot grace period, periodically check whether the refiner

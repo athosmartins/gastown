@@ -137,8 +137,8 @@ escalation_classify_topic() {
   [ -z "$text" ] && { echo ""; return 0; }
 
   # warming / chip / on-device — most specific; must precede wa (warming uses WA stack)
-  if printf '%s' "$text" | grep -iqE \
-      'warming|warm-?up|aquecimento|\bchip(s)?\b|ban-?prevent|ban-?risk|on-?device[ _-]?send|group-?send|chip.?(ban|aquec)|aquec.*chip'; then
+  if printf '%s' "$text" | grep -iE \
+      'warming|warm-?up|aquecimento|\bchip(s)?\b|ban-?prevent|ban-?risk|on-?device[ _-]?send|group-?send|chip.?(ban|aquec)|aquec.*chip' >/dev/null; then
     echo "warming"; return 0
   fi
 
@@ -146,33 +146,33 @@ escalation_classify_topic() {
   # NOTE: ban/IP patterns use word boundaries to avoid false positives like
   # "kanban pipedrive" matching case-insensitive ban.*IP (kanban→ban, pipedrive→ip).
   # \bban ensures "ban" starts a word (not inside kanban); \bIP\b ensures "IP" is whole-word.
-  if printf '%s' "$text" | grep -iqE \
-      'phone-?proxy|phone.proxy|\bWAP\b|\bIP[ _-]?pool\b|relay[ _-]?IP|relay[ _-]?server|proxy[ _-]?pool|\bban.*\bIP\b|\bIP.*\bban\b|sms.?proxy|proxy.*slot'; then
+  if printf '%s' "$text" | grep -iE \
+      'phone-?proxy|phone.proxy|\bWAP\b|\bIP[ _-]?pool\b|relay[ _-]?IP|relay[ _-]?server|proxy[ _-]?pool|\bban.*\bIP\b|\bIP.*\bban\b|sms.?proxy|proxy.*slot' >/dev/null; then
     echo "phone-proxy"; return 0
   fi
 
   # wa-integration: painel / kanban / pipedrive / whapi / whatsapp — before geo/property
   # (WA features often mention imóvel/ITBI because painel shows deal data, so WA wins)
-  if printf '%s' "$text" | grep -iqE \
-      'pipedrive|whapi|\bwhatsapp\b|urblink_design_system|drive[_ ]bridge|\bpainel\b|painel\.urblink|\bkanban\b|filter[ -]?pills|frota|mila-?wa|wa-?painel|wa-?kanban|mila.crew|envio[ _-]?mensagem|disparo.*mensagem'; then
+  if printf '%s' "$text" | grep -iE \
+      'pipedrive|whapi|\bwhatsapp\b|urblink_design_system|drive[_ ]bridge|\bpainel\b|painel\.urblink|\bkanban\b|filter[ -]?pills|frota|mila-?wa|wa-?painel|wa-?kanban|mila.crew|envio[ _-]?mensagem|disparo.*mensagem' >/dev/null; then
     echo "wa"; return 0
   fi
 
   # geo / ArcGIS / zoneamento / incorporação / quarteirão
-  if printf '%s' "$text" | grep -iqE \
-      'arcgis|zoneamento|geometria|geo-?match|quarteir(ã|Ã|a)o|incorpora(ç|Ç|c)(ã|Ã|a)o|geocod|georreferenc|lat[ -/]?lon|point-in-polygon|(í|Í|i)ndice cadastral|indice cadastral|centroid'; then
+  if printf '%s' "$text" | grep -iE \
+      'arcgis|zoneamento|geometria|geo-?match|quarteir(ã|Ã|a)o|incorpora(ç|Ç|c)(ã|Ã|a)o|geocod|georreferenc|lat[ -/]?lon|point-in-polygon|(í|Í|i)ndice cadastral|indice cadastral|centroid' >/dev/null; then
     echo "geo"; return 0
   fi
 
   # property-scrapers: cadastro/ITBI/CNPJ/RFB/PBH/motherduck/scraper/terreno/lote
-  if printf '%s' "$text" | grep -iqE \
-      'scraper|scrape|\bcadastro\b|cadastr[ao]|\bITBI\b|\bRFB\b|receita federal|\bCNAE\b|\bCNPJ\b|\bPBH\b|motherduck|\bHex notebook\b|pesquisa_mercado|propriet(á|Á|a)ri|\bim(ó|Ó|o)vel\b|\bim(ó|Ó|o)veis\b|\blote\b|\blotes\b|\bterreno\b|cart(ó|Ó|o)rio|matr(í|Í|i)cula|mega.?data.?set|batista-?ps|property.?scrap'; then
+  if printf '%s' "$text" | grep -iE \
+      'scraper|scrape|\bcadastro\b|cadastr[ao]|\bITBI\b|\bRFB\b|receita federal|\bCNAE\b|\bCNPJ\b|\bPBH\b|motherduck|\bHex notebook\b|pesquisa_mercado|propriet(á|Á|a)ri|\bim(ó|Ó|o)vel\b|\bim(ó|Ó|o)veis\b|\blote\b|\blotes\b|\bterreno\b|cart(ó|Ó|o)rio|matr(í|Í|i)cula|mega.?data.?set|batista-?ps|property.?scrap' >/dev/null; then
     echo "property"; return 0
   fi
 
   # infra: gate / refino / dolt / framework / supervisor — goes to Mayor (explicit)
-  if printf '%s' "$text" | grep -iqE \
-      '\bgate\b|\bdolt\b|gate.?dispatcher|\breviewer\b|\bdispatcher\b|\bsupervisor\b|\bframework\b|headroom|\brefinery\b|refino|pilot.?dispatcher|launchd|launchctl|\bplist\b|daemon.presence'; then
+  if printf '%s' "$text" | grep -iE \
+      '\bgate\b|\bdolt\b|gate.?dispatcher|\breviewer\b|\bdispatcher\b|\bsupervisor\b|\bframework\b|headroom|\brefinery\b|refino|pilot.?dispatcher|launchd|launchctl|\bplist\b|daemon.presence' >/dev/null; then
     echo "infra"; return 0
   fi
 

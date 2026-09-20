@@ -202,7 +202,7 @@ _pr_touches_compiled_go() {
     log "WARN: gh pr diff --name-only failed for PR #$pr_num (rc=$rc) — cannot determine whether it touches compiled Go sources; defaulting to touches=yes (fail safe)"
     return 0
   fi
-  if printf '%s\n' "$files" | grep -qE '(^|/)go\.(mod|sum)$|\.go$'; then
+  if printf '%s\n' "$files" | grep -E '(^|/)go\.(mod|sum)$|\.go$' >/dev/null; then
     return 0
   fi
   return 1
@@ -381,7 +381,7 @@ run_sweep() {
     open_pr_nums=$(printf '%s' "$all_prs" | jq -r '.[] | select(.state=="OPEN") | .number')
     while IFS= read -r n; do
       [ -z "$n" ] && continue
-      if printf '%s\n' "$tracked_pr_nums" | grep -qx "$n"; then
+      if printf '%s\n' "$tracked_pr_nums" | grep -x "$n" >/dev/null; then
         # Now has a tracker -> clear any stale orphan-alert record so a
         # FUTURE re-orphaning (e.g. the tracker bead gets deleted) can alert
         # again.

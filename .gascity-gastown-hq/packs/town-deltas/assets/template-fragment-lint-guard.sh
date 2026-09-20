@@ -65,7 +65,7 @@ MATCH_RE='(^|/)template-fragments/|(^|/)prompts/shared/|\.template\.md$|\.md\.tm
 RELEVANT=()
 for f in "$@"; do
   [ -z "$f" ] && continue
-  if printf '%s\n' "$f" | grep -qE "$MATCH_RE"; then
+  if printf '%s\n' "$f" | grep -E "$MATCH_RE" >/dev/null; then
     RELEVANT+=("$f")
   fi
 done

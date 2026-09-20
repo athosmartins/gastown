@@ -184,8 +184,8 @@ rm -f "$TMP_SESS"
 # (idle, waiting-for-input, unclassifiable, empty) returns non-zero -> NOT a
 # candidate -> no action (fail-safe toward inaction).
 is_active_work() {
-    printf '%s' "$1" | grep -Eq '(…|\.\.\.)[^(]*\(([0-9]+m[[:space:]]+)?[0-9]+s' && return 0
-    printf '%s' "$1" | grep -q 'esc to interrupt' && return 0
+    printf '%s' "$1" | grep -E '(…|\.\.\.)[^(]*\(([0-9]+m[[:space:]]+)?[0-9]+s' >/dev/null && return 0
+    printf '%s' "$1" | grep 'esc to interrupt' >/dev/null && return 0
     return 1
 }
 
@@ -221,7 +221,7 @@ if [ -d "$NUDGED_DIR" ]; then
     for f in "$NUDGED_DIR"/*; do
         [ -e "$f" ] || continue
         bn="$(basename "$f")"
-        if ! printf '%s' "$ACTIVE_WORK_NAMES" | grep -qx "$bn"; then
+        if ! printf '%s' "$ACTIVE_WORK_NAMES" | grep -x "$bn" >/dev/null; then
             log "$bn: no longer active-work (recovered/idle) -> clear freeze state"
             rm -f "$f"
         fi
@@ -252,7 +252,7 @@ while [ "$idx" -lt "${#CAND_NAME[@]}" ]; do
     sf="$NUDGED_DIR/$name"
 
     # Dedup: a dog is already handling this target.
-    if [ -n "$WARRANT_TARGETS" ] && printf '%s\n' "$WARRANT_TARGETS" | grep -qx "$name"; then
+    if [ -n "$WARRANT_TARGETS" ] && printf '%s\n' "$WARRANT_TARGETS" | grep -x "$name" >/dev/null; then
         log "$name: open warrant already exists — skip (dog handling)"
         rm -f "$sf"
         continue

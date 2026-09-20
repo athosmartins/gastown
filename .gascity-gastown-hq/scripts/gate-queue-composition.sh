@@ -148,7 +148,7 @@ while IFS= read -r row; do
     continue
   fi
   # (b) mais de um gate-status = invariante corrompido; não dá pra dizer onde está
-  if printf '%s' "$GSTATUS" | grep -q ','; then
+  if printf '%s' "$GSTATUS" | grep ',' >/dev/null; then
     UNKNOWN=$((UNKNOWN+1)); UNK_L="$UNK_L\n    $ID  DOIS gate-status ($GSTATUS) — estado ambíguo"
     continue
   fi

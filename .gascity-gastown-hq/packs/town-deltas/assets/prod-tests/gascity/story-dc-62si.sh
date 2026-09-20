@@ -59,7 +59,7 @@ TEST_OUT="$(cd "$SRC" && go test ./internal/doctor/... \
     echo "$TEST_OUT" >&2
     fail "regression tests failed against the live tree"
 }
-echo "$TEST_OUT" | grep -c '^--- PASS' | grep -q '^2$' \
+echo "$TEST_OUT" | grep -c '^--- PASS' | grep '^2$' >/dev/null \
     || fail "expected exactly 2 passing tests, got:
 $TEST_OUT"
 log "both regression tests pass (rig->town-db is accepted; genuine drift is still flagged)"

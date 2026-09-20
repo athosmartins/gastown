@@ -93,7 +93,7 @@ delete_merged_local_branch() {
   [ -n "$def" ] || def="main"
   # merged check against origin/<default>; any uncertainty → do NOT delete.
   git -C "$repo" rev-parse --verify -q "refs/remotes/origin/$def" >/dev/null 2>&1 || return 0
-  if git -C "$repo" branch --merged "refs/remotes/origin/$def" 2>/dev/null | sed 's/^[* ] *//' | grep -qx "$br"; then
+  if git -C "$repo" branch --merged "refs/remotes/origin/$def" 2>/dev/null | sed 's/^[* ] *//' | grep -x "$br" >/dev/null; then
     if [ "$ENABLED" = "1" ]; then
       git -C "$repo" branch -D "$br" >/dev/null 2>&1 && {
         branches_deleted=$((branches_deleted+1))
@@ -196,7 +196,7 @@ _worktree_in_use() {
 # Returns 0 (reaped) or 1 (kept/refused — always logged, never silent).
 preserve_and_reap_dirty() {
   local repo="$1" wt="$2" br="$3" age="$4" label sha tag_ref preserved_to parent tmp_index tree ignored_path
-  git -C "$wt" status --porcelain 2>/dev/null | grep -q . || return 1   # not actually dirty — leave to normal skip
+  git -C "$wt" status --porcelain 2>/dev/null | grep . >/dev/null || return 1   # not actually dirty — leave to normal skip
   parent="$(git -C "$wt" rev-parse HEAD 2>/dev/null)" || return 1
   tmp_index="$(mktemp)" || return 1
   # Stage the full current state (modified + untracked + deleted) into a SCRATCH
@@ -337,7 +337,7 @@ _maybe_kill_zombie() {
   cmd="$(_pid_cmdline "$pid")"
   [ -n "$cmd" ] || return 0                                      # dead/unknown → nothing to kill
   case "$cmd" in *[Cc]laude*) : ;; *) return 0 ;; esac          # must be a claude process
-  if printf '%s' "$cmd" | grep -qiE 'pilot|gate|mayor|deacon|witness|reconcil|supervis|dispatch|watchdog|reaper|sheriff|refin|daemon|kickstart|observer'; then
+  if printf '%s' "$cmd" | grep -iE 'pilot|gate|mayor|deacon|witness|reconcil|supervis|dispatch|watchdog|reaper|sheriff|refin|daemon|kickstart|observer' >/dev/null; then
     printf '{"ts":"%s","event":"kill_skipped_protected","pid":%s}\n' "$(ts)" "$pid" >> "$LOG" 2>/dev/null
     return 0                                                     # controller process → NEVER signal
   fi

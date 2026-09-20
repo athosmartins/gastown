@@ -73,7 +73,7 @@ git_in() {
 # token_bounded <bead_id> <text> — rc0 iff text contains bead_id as a whole
 # token (not a substring of a longer id).
 token_bounded() {
-  printf '%s' "$2" | grep -Eq "(^|[^[:alnum:]-])$1([^[:alnum:]-]|\$)"
+  printf '%s' "$2" | grep -E "(^|[^[:alnum:]-])$1([^[:alnum:]-]|\$)" >/dev/null
 }
 
 # subject_impl_scopes_bead <subject_line> <bead_id> — rc0 iff <bead_id> is the
@@ -1231,7 +1231,7 @@ if [ -z "$FORCE_STORY_ID" ]; then
       # additive/non-blocking — never delivery:partial or scope:needs-review,
       # which hold the bead; that would reopen exactly the deadlock
       # ga-cjrxh's release-over-hold bias exists to prevent.
-      if [ "$TASK_IS_PARTIAL" != "1" ] && printf '%s' "$TASK_PARTIAL_REASON_RAW" | grep -q '^escopo-multiplo:possivel'; then
+      if [ "$TASK_IS_PARTIAL" != "1" ] && printf '%s' "$TASK_PARTIAL_REASON_RAW" | grep '^escopo-multiplo:possivel' >/dev/null; then
         if [ "$DRY_RUN" = "1" ]; then
           log "DRY_RUN=1 — WOULD: bd -C $TASK_STORE comment $TASK_BEAD_ID (scope advisory, ga-a7bt6u) + label scope:advisory"
         else
@@ -1430,13 +1430,13 @@ if story_bead_closed_now "$STORY_STORE" "$STORY_ID"; then
 fi
 
 # Skip if already marked story:done (idempotency guard)
-if echo "$STORY_LABELS" | grep -q "story:done"; then
+if echo "$STORY_LABELS" | grep "story:done" >/dev/null; then
   log "Story $STORY_ID already labeled story:done — skipping."
   continue
 fi
 
 # Skip if already in delivery (prevents parallel runs)
-if echo "$STORY_LABELS" | grep -q "delivery:running"; then
+if echo "$STORY_LABELS" | grep "delivery:running" >/dev/null; then
   log "Story $STORY_ID already has delivery:running — skipping (already in flight)."
   continue
 fi
@@ -1447,7 +1447,7 @@ fi
 # that human to fix the rig value or the runbook (that unbounded-comment loop
 # — 18 identical halts in 1h on ga-dv2gk — is exactly what the retry cap
 # exists to stop). Removing the label lets the sweep retry automatically.
-if echo "$STORY_LABELS" | grep -q "delivery:no-deploy-cmd-exhausted"; then
+if echo "$STORY_LABELS" | grep "delivery:no-deploy-cmd-exhausted" >/dev/null; then
   log "Story $STORY_ID already escalated (delivery:no-deploy-cmd-exhausted, ga-aqqj0) — no deploy_cmd halt already reported to a human. Skipping."
   continue
 fi
@@ -1525,7 +1525,7 @@ DELIVERY_START=$(date +%s)
 #   2. metadata field  story.rig
 #   3. Parse the gate comment ("merged to <rig>/main") — set by dispatcher
 RIG=""
-if echo "$STORY_LABELS" | grep -oE "rig:[a-z_]+" | head -1 | grep -q "rig:"; then
+if echo "$STORY_LABELS" | grep -oE "rig:[a-z_]+" | head -1 | grep "rig:" >/dev/null; then
   RIG=$(echo "$STORY_LABELS" | grep -oE "rig:[a-z_]+" | head -1 | sed 's/rig://')
 fi
 
@@ -3304,12 +3304,12 @@ else
   # Pilot when it autonomously pulled the story). Used to differentiate the
   # terminal DONE push so Athos can tell autonomous Pilot deliveries apart.
   PILOT_ORIGIN=0
-  if echo "$STORY_LABELS" | grep -q "pilot:dispatched"; then
+  if echo "$STORY_LABELS" | grep "pilot:dispatched" >/dev/null; then
     PILOT_ORIGIN=1
   else
     BEAD_LABELS_NOW=$(bd -C "$STORY_STORE" show "$STORY_ID" --json 2>/dev/null \
       | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' 2>/dev/null || echo "")
-    echo "$BEAD_LABELS_NOW" | grep -q "pilot:dispatched" && PILOT_ORIGIN=1 || true
+    echo "$BEAD_LABELS_NOW" | grep "pilot:dispatched" >/dev/null && PILOT_ORIGIN=1 || true
   fi
   PILOT_PREFIX=""
   [ "$PILOT_ORIGIN" = "1" ] && PILOT_PREFIX="🤖 [Pilot] "

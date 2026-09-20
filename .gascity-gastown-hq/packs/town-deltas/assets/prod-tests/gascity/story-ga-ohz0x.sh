@@ -73,9 +73,9 @@ log "selftest source clean of 'Verdicts:' references ✓"
 # count. Asserting an exact pass/fail count here would make this prod test a permanent
 # false-negative gate over a pre-existing, unrelated issue this bead was never asked to fix.
 out=$(bash "$LIVE_SELFTEST" 2>&1) || true
-echo "$out" | grep -qE '^pipeline-throughput-heartbeat selftest: [0-9]+ passed, [0-9]+ failed$' \
+echo "$out" | grep -E '^pipeline-throughput-heartbeat selftest: [0-9]+ passed, [0-9]+ failed$' >/dev/null \
     || { echo "$out" >&2; fail "comprehensive selftest did not complete (no summary line — likely a crash or import error)"; }
-if echo "$out" | grep -qi "VERDICTS_RE\|NameError"; then
+if echo "$out" | grep -i "VERDICTS_RE\|NameError" >/dev/null; then
     echo "$out" >&2
     fail "comprehensive selftest output mentions VERDICTS_RE or a NameError — stale reference"
 fi

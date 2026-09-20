@@ -261,7 +261,7 @@ if [ "${1:-}" = "--selftest" ]; then
   echo "S4: main() end-to-end — wrapped command actually runs when clear, exit code + stdout propagate"
   rm -rf "${_ST_LOCKDIR}"; rm -f "${_ST_RAMFILE}"
   _S4_OUT="$(HESL_MAX_WAIT_SECS=5 HESL_POLL_SECS=1 main bash -c 'echo ran-ok; exit 7' 2>&1)"; _s4_rc=$?
-  echo "${_S4_OUT}" | grep -q "ran-ok" && ok "wrapped command's stdout reached the caller" || bad "wrapped command output missing — got: ${_S4_OUT}"
+  echo "${_S4_OUT}" | grep "ran-ok" >/dev/null && ok "wrapped command's stdout reached the caller" || bad "wrapped command output missing — got: ${_S4_OUT}"
   [ "${_s4_rc}" = "7" ] && ok "wrapped command's exit code (7) propagated through the wrapper" || bad "exit code did not propagate — got ${_s4_rc}, expected 7"
   [ -d "${_ST_LOCKDIR}" ] && bad "lock still held after the wrapped command finished (leak)" || ok "lock released after the wrapped command finished"
 

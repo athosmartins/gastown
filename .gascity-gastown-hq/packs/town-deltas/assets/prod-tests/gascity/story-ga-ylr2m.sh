@@ -30,7 +30,7 @@ TEST_OUT="$(bash "$ASSETS/tests/daemon-refresh.test.sh" 2>&1)" || {
   echo "$TEST_OUT" >&2
   fail "tests/daemon-refresh.test.sh failed against the live tree"
 }
-echo "$TEST_OUT" | grep -qE '^daemon-refresh tests: [0-9]+ passed, 0 failed$' \
+echo "$TEST_OUT" | grep -E '^daemon-refresh tests: [0-9]+ passed, 0 failed$' >/dev/null \
   || fail "tests/daemon-refresh.test.sh did not report a clean 0-failed result:
 $TEST_OUT"
 log "daemon-refresh's full suite passes clean"
@@ -97,10 +97,10 @@ PSEOF
     LAUNCHCTL_BIN="$E2E_TMP/bin/launchctl" PS_BIN="$E2E_TMP/bin/ps" \
     bash "$SCRIPT" 2>&1
   )"
-  echo "$E2E_OUT" | grep -q "^VERDICT=NEEDS_GUARDED_RESTART$" \
+  echo "$E2E_OUT" | grep "^VERDICT=NEEDS_GUARDED_RESTART$" >/dev/null \
     || fail "real restart_policy.yaml E2E: frota_dashboard.py (notify_only_locked in production) did NOT come back NEEDS_GUARDED_RESTART — the live gap this bead closes may have regressed. Output:
 $E2E_OUT"
-  echo "$E2E_OUT" | grep "^GUARDED=" | grep -q "com.e2e.frota-dashboard" \
+  echo "$E2E_OUT" | grep "^GUARDED=" | grep "com.e2e.frota-dashboard" >/dev/null \
     || fail "real restart_policy.yaml E2E: frota_dashboard.py was not flagged GUARDED. Output:
 $E2E_OUT"
   log "real restart_policy.yaml E2E: frota_dashboard.py (notify_only_locked in production) correctly flagged NEEDS_GUARDED_RESTART, not auto-kickstarted"

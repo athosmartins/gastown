@@ -26,7 +26,7 @@ TEST_OUT="$(bash "$CITY/packs/town-deltas/assets/scripts/storage-inventory-month
   echo "$TEST_OUT" >&2
   fail "storage-inventory-monthly.selftest.sh failed against the live tree"
 }
-echo "$TEST_OUT" | grep -qE 'RESULT: PASS=[0-9]+ FAIL=0$' \
+echo "$TEST_OUT" | grep -E 'RESULT: PASS=[0-9]+ FAIL=0$' >/dev/null \
   || fail "storage-inventory-monthly.selftest.sh did not report a clean FAIL=0 result:
 $TEST_OUT"
 log "storage-inventory-monthly's full suite passes clean"
@@ -40,7 +40,7 @@ grep -q "Storage — inventário mensal (ga-z297h)" "$FORMULA" \
   || fail "mol-digest-generate.toml's digest markdown template has no Storage section for ga-z297h"
 
 # ── The monthly launchd job is actually scheduled, not just a present-but-unloaded plist ──
-if launchctl list 2>/dev/null | grep -q "com.gascity.storage-inventory-monthly"; then
+if launchctl list 2>/dev/null | grep "com.gascity.storage-inventory-monthly" >/dev/null; then
   log "com.gascity.storage-inventory-monthly is registered with launchd"
 else
   fail "com.gascity.storage-inventory-monthly is NOT registered with launchd — the monthly job is not actually scheduled (a present-but-unloaded plist is not automation)"

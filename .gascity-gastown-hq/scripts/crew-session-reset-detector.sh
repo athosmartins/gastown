@@ -57,10 +57,10 @@ while IFS=$'\t' read -r agent id; do
   # agent (a real reset) would false-negative as "still the same, no change".
   # Line 44 below already uses -qxF for its own single-column check; this one
   # was the one site left unanchored.
-  if printf '%s\n' "$CUR" | grep -qxF "$(printf '%s\t%s' "$agent" "$id")"; then
+  if printf '%s\n' "$CUR" | grep -xF "$(printf '%s\t%s' "$agent" "$id")" >/dev/null; then
     continue   # same id still live → no change
   fi
-  if printf '%s\n' "$cur_agents" | grep -qxF "$agent"; then
+  if printf '%s\n' "$cur_agents" | grep -xF "$agent" >/dev/null; then
     newids="$(printf '%s\n' "$CUR" | awk -F'\t' -v a="$agent" '$1==a{print $2}' | paste -sd, -)"
     log "RESET: crew '$agent' session $id is gone; agent now on [$newids]"
     [ "$NOTIFY" = "1" ] && command -v notify >/dev/null 2>&1 && notify -p 3 -t 'crew-session-reset' "Crew $agent reset: $id → [$newids] (ga-b41wn churn)" >/dev/null 2>&1 || true

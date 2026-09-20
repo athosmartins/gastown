@@ -79,27 +79,27 @@ run_park() {
 run_park "ga-test-sling1" || fail "(P1) PARK PROCEDURE exited non-zero"
 CALLS=$(cat "$BD_LOG")
 
-sed -n '1p' "$BD_LOG" | grep -qF 'dep ga-test-blocker1 --blocks ga-test-issue1' \
+sed -n '1p' "$BD_LOG" | grep -F 'dep ga-test-blocker1 --blocks ga-test-issue1' >/dev/null \
   && log "  (P1a) OK: dep --blocks call correct" \
   || fail "(P1a) dep --blocks call wrong or out of order. Got:
 $CALLS"
 
-sed -n '2p' "$BD_LOG" | grep -qF 'label remove ga-test-issue1 ctx:ready,exec:auto,story:in-flight' \
+sed -n '2p' "$BD_LOG" | grep -F 'label remove ga-test-issue1 ctx:ready,exec:auto,story:in-flight' >/dev/null \
   && log "  (P1b) OK: label strip is a single comma-joined call, before the add" \
   || fail "(P1b) label remove call wrong or out of order. Got:
 $CALLS"
 
-sed -n '3p' "$BD_LOG" | grep -qF 'label add ga-test-issue1 pilot:no-auto-dispatch' \
+sed -n '3p' "$BD_LOG" | grep -F 'label add ga-test-issue1 pilot:no-auto-dispatch' >/dev/null \
   && log "  (P1c) OK: label add pilot:no-auto-dispatch, after the strip" \
   || fail "(P1c) label add call wrong or out of order. Got:
 $CALLS"
 
-sed -n '4p' "$BD_LOG" | grep -qF 'comment ga-test-issue1' \
+sed -n '4p' "$BD_LOG" | grep -F 'comment ga-test-issue1' >/dev/null \
   && log "  (P1d) OK: comment call present" \
   || fail "(P1d) comment call wrong or out of order. Got:
 $CALLS"
 
-sed -n '5p' "$BD_LOG" | grep -qF 'update ga-test-sling1 --set-metadata gc.outcome=parked --status=closed' \
+sed -n '5p' "$BD_LOG" | grep -F 'update ga-test-sling1 --set-metadata gc.outcome=parked --status=closed' >/dev/null \
   && log "  (P1e) OK: sling closed with gc.outcome=parked (not pass)" \
   || fail "(P1e) sling-close call wrong, missing, or out of order. Got:
 $CALLS"

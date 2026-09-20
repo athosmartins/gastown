@@ -338,9 +338,9 @@ print("\n".join(bad))
   echo "S5: _weekly_digest — pure text summary"
   printf '2020-01-01 free_pct=60 swap_mb=1000 jetsam=0 disk_free_gb=100\n2020-01-02 free_pct=40 swap_mb=3000 jetsam=2 disk_free_gb=90\n' > "${_ST_TREND}"
   _digest="$(_weekly_digest "${_ST_TREND}")"
-  echo "$_digest" | grep -q "3000MB" && ok "digest reports peak swap 3000MB" || bad "digest missing peak swap: $_digest"
-  echo "$_digest" | grep -q "jetsam total 2" && ok "digest reports jetsam total 2" || bad "digest missing jetsam total: $_digest"
-  echo "$_digest" | grep -q "40%" && ok "digest reports free% minimum 40" || bad "digest missing free% min: $_digest"
+  echo "$_digest" | grep "3000MB" >/dev/null && ok "digest reports peak swap 3000MB" || bad "digest missing peak swap: $_digest"
+  echo "$_digest" | grep "jetsam total 2" >/dev/null && ok "digest reports jetsam total 2" || bad "digest missing jetsam total: $_digest"
+  echo "$_digest" | grep "40%" >/dev/null && ok "digest reports free% minimum 40" || bad "digest missing free% min: $_digest"
   _empty_digest="$(_weekly_digest "/nonexistent")"
   [ -n "$_empty_digest" ] && ok "no trend log -> digest still returns text, not empty/crash" || bad "should return a fallback string"
 
@@ -378,7 +378,7 @@ print("\n".join(bad))
   # read "0MB" here since it's the only line; correctly excluded, it must
   # read "n/a" (no numeric swap readings at all in this log).
   _s6b_digest="$(_weekly_digest "${NCC_TREND_LOG}")"
-  echo "$_s6b_digest" | grep -q "swap pico n/aMB" && ok "unknown swap reading excluded from weekly digest peak calc (n/a, not fabricated 0)" \
+  echo "$_s6b_digest" | grep "swap pico n/aMB" >/dev/null && ok "unknown swap reading excluded from weekly digest peak calc (n/a, not fabricated 0)" \
     || bad "REGRESSION: unknown swap counted as a real data point in the digest: $_s6b_digest"
 
   # ── ga-sadm5f: jetsam lookback must not cross the boot boundary ───────────

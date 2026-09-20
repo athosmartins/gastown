@@ -454,11 +454,11 @@ context_check_is_candidate() {
 context_check_skip_reason() {
   local id="$1" built_ids="$2" blocked_ids="$3" ex_built="${4:-1}" ex_blocked="${5:-1}"
   if [ "$ex_built" = "1" ] && [ -n "$built_ids" ] \
-     && printf '%s\n' "$built_ids" | grep -qx "$id" 2>/dev/null; then
+     && printf '%s\n' "$built_ids" | grep -x "$id" 2>/dev/null >/dev/null; then
     echo "built"; return
   fi
   if [ "$ex_blocked" = "1" ] && [ -n "$blocked_ids" ] \
-     && printf '%s\n' "$blocked_ids" | grep -qx "$id" 2>/dev/null; then
+     && printf '%s\n' "$blocked_ids" | grep -x "$id" 2>/dev/null >/dev/null; then
     echo "blocked"; return
   fi
   echo ""
@@ -1119,8 +1119,8 @@ TASK
   while [ "$(date +%s)" -lt "$_deadline" ]; do
     _vb=$(bd_ show "$_verdict_bead" --json 2>/dev/null || echo "[]")
     _vl=$(echo "$_vb" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")')
-    if echo "$_vl" | grep -q "verdict:READY"; then _verdict="READY"; break
-    elif echo "$_vl" | grep -q "verdict:THIN"; then _verdict="THIN"; break; fi
+    if echo "$_vl" | grep "verdict:READY" >/dev/null; then _verdict="READY"; break
+    elif echo "$_vl" | grep "verdict:THIN" >/dev/null; then _verdict="THIN"; break; fi
     sleep "$CONTEXT_CHECK_VERDICT_POLL_INTERVAL"
   done
   echo "$_verdict"
@@ -1397,9 +1397,9 @@ while IFS= read -r row; do
   # loop: exec:manual cleared → Pilot sees exec:auto + ctx:ready → dispatches a crew
   # that cannot complete the task → mila clears it → Pilot re-dispatches → repeat.
   if [ -n "$EXEC" ]; then
-    if echo ",$c_labels," | grep -qF ",$EXEC,"; then
+    if echo ",$c_labels," | grep -F ",$EXEC," >/dev/null; then
       : # already correctly labeled — no thrash
-    elif [ "$EXEC" = "exec:auto" ] && echo ",$c_labels," | grep -qF ",exec:manual,"; then
+    elif [ "$EXEC" = "exec:auto" ] && echo ",$c_labels," | grep -F ",exec:manual," >/dev/null; then
       # AUTHORITATIVE-HOLD: bead already has exec:manual; classifier returned exec:auto
       # (conservative default). Never demote — exec:manual wins. Log and skip.
       log "  $c_id: exec-class hold — existing exec:manual is authoritative; classifier returned exec:auto (conservative default) — NOT downgrading (ga-l5ud0)"

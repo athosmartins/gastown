@@ -44,7 +44,7 @@ base=$(cat "$BASELINE" 2>/dev/null)
 new=""
 while IFS= read -r id; do
   [ -z "$id" ] && continue
-  if ! printf '%s\n' "$base" | grep -qxF "$id"; then new="$id"; break; fi
+  if ! printf '%s\n' "$base" | grep -xF "$id" >/dev/null; then new="$id"; break; fi
 done <<< "$cur"
 
 if [ -n "$new" ]; then

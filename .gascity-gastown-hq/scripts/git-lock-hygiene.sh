@@ -198,7 +198,7 @@ _git_repo_has_live_process() {
   # ps aux covers: `git -C /path/to/repo ...` and any process cd'd into the repo
   # (macOS ps shows the executable path for many tools). False-negative is safe
   # (we'd skip cleaning a stale lock), false-positive would be a bug (skip when stale).
-  ps aux 2>/dev/null | grep '[g]it' | grep -qF "$repo"
+  ps aux 2>/dev/null | grep '[g]it' | grep -F "$repo" >/dev/null
 }
 
 # Determine if a lock file or directory is stale:

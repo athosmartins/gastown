@@ -446,8 +446,8 @@ marker_status_from_labels() {
 # or an unexpected bead shape never becomes grounds to supersede a live run.
 marker_active_from_labels() {
   local labels="$1"
-  printf '%s\n' "$labels" | grep -qE "gate-status:(ready|queued|claimed|dispatching|running)" && { echo 1; return; }
-  printf '%s\n' "$labels" | grep -qE "gate-status:" || { echo 1; return; }
+  printf '%s\n' "$labels" | grep -E "gate-status:(ready|queued|claimed|dispatching|running)" >/dev/null && { echo 1; return; }
+  printf '%s\n' "$labels" | grep -E "gate-status:" >/dev/null || { echo 1; return; }
   echo 0
 }
 
@@ -1821,13 +1821,13 @@ _gate_delivery_header_class() {
   # "=== CRITERIO DE ACEITE (falsificavel) ===" — but bare "AC[0-9]" would then
   # fire on any header merely CONTAINING "ac" before a digit. Anchored to a word
   # start; the rest stay substrings on purpose.)
-  if printf '%s' "$norm" | grep -Eq 'CRITERIO DE ACEITE|CRITERIOS DE ACEITE|COMO TESTAR|VERIFICACAO|PLANO DE TESTE|TESTES?:|\bAC[0-9]'; then
+  if printf '%s' "$norm" | grep -E 'CRITERIO DE ACEITE|CRITERIOS DE ACEITE|COMO TESTAR|VERIFICACAO|PLANO DE TESTE|TESTES?:|\bAC[0-9]' >/dev/null; then
     echo "verification"; return 0
   fi
-  if printf '%s' "$norm" | grep -Eq 'FIX PEDIDO|ENTREGAVEIS|ESCOPO|O QUE FAZER'; then
+  if printf '%s' "$norm" | grep -E 'FIX PEDIDO|ENTREGAVEIS|ESCOPO|O QUE FAZER' >/dev/null; then
     echo "scope"; return 0
   fi
-  if printf '%s' "$norm" | grep -Eq 'O CICLO|A CADEIA|SINTOMA|A MEDICAO|O DEFEITO|EVIDENCIA|COMO ACONTECE'; then
+  if printf '%s' "$norm" | grep -E 'O CICLO|A CADEIA|SINTOMA|A MEDICAO|O DEFEITO|EVIDENCIA|COMO ACONTECE' >/dev/null; then
     echo "diagnostic"; return 0
   fi
   echo "unknown"
@@ -1859,17 +1859,17 @@ _gate_delivery_item_is_verification() {
   # EVIDENCIA. A silent -1 on the deliverable count flips an exactly-3-item
   # real multi-scope run from HOLD to RELEASE, and can drop it under the
   # ADVISORY bar too, so not even the warning fires.
-  printf '%s' "$norm" | grep -Eq \
-    '^(FIXTURE|CONTROLE|CONTROL|CENARIO|CASO DE TESTE|INVARIANTE|PLACAR|REGRESSAO|EVIDENCIA|PROVA|BASELINE)\b' \
+  printf '%s' "$norm" | grep -E \
+    '^(FIXTURE|CONTROLE|CONTROL|CENARIO|CASO DE TESTE|INVARIANTE|PLACAR|REGRESSAO|EVIDENCIA|PROVA|BASELINE)\b' >/dev/null \
     && return 0
   # AC1/AC10/AC11 — deliberately NOT \b-anchored, and therefore split out of the
   # alternation above instead of taking a blanket \b on the whole group: \b
   # between two DIGITS is not a boundary, so "AC[0-9]\b" stops matching at AC10.
-  printf '%s' "$norm" | grep -Eq '^AC[0-9]' && return 0
-  printf '%s' "$norm" | grep -Eq \
-    '^(RODAR|CONFERIR|MEDIR|VERIFICAR|VALIDAR|CHECAR|TESTAR|GARANTIR|CONFIRMAR|REPRODUZIR|PROVAR|ASSERTAR|OBSERVAR)\b' \
+  printf '%s' "$norm" | grep -E '^AC[0-9]' >/dev/null && return 0
+  printf '%s' "$norm" | grep -E \
+    '^(RODAR|CONFERIR|MEDIR|VERIFICAR|VALIDAR|CHECAR|TESTAR|GARANTIR|CONFIRMAR|REPRODUZIR|PROVAR|ASSERTAR|OBSERVAR)\b' >/dev/null \
     && return 0
-  printf '%s' "$norm" | grep -Eq '^(NAO|NUNCA|JAMAIS)\b' && return 0
+  printf '%s' "$norm" | grep -E '^(NAO|NUNCA|JAMAIS)\b' >/dev/null && return 0
   return 1
 }
 
@@ -1956,12 +1956,12 @@ _gate_delivery_list_run() {
   # helper, because it mutates five locals — same shape as the pre-ga-cjrxh
   # code, which flushed in both places for the same reason.
   while IFS= read -r line; do
-    if printf '%s\n' "$line" | grep -Eq "$pattern"; then
+    if printf '%s\n' "$line" | grep -E "$pattern" >/dev/null; then
       [ "$run_n" -eq 0 ] && run_header="$pending_header"
       run="${run}${line}"$'\n'
       run_n=$((run_n + 1))
       _gate_delivery_item_is_verification "$line" || run_d=$((run_d + 1))
-    elif printf '%s' "$line" | grep -Eq '^[[:space:]]+[^[:space:]]'; then
+    elif printf '%s' "$line" | grep -E '^[[:space:]]+[^[:space:]]' >/dev/null; then
       : # indented, non-blank, non-matching: wrapped continuation of the
         # current item's text — does not break the run, not counted, and
         # (ga-1yxyt) never updates pending_header — a continuation is part
@@ -2571,7 +2571,7 @@ validate_rig() {
     fi
     return 1
   fi
-  echo "$known_rigs" | grep -qx "$val"
+  echo "$known_rigs" | grep -x "$val" >/dev/null
 }
 
 # ── Shared prelude: currently-running gate-runs (ga-cgynn) ───────────────────
@@ -2670,8 +2670,8 @@ if [ "$TRANSIENT_COUNT" -gt 0 ]; then
     T_LABELS=$(echo "$T" | jq -r '(.labels // []) | join(" ")')
 
     T_STATUS=""
-    echo "$T_LABELS" | grep -q "gate-status:dispatching" && T_STATUS="dispatching"
-    echo "$T_LABELS" | grep -q "gate-status:claimed"     && T_STATUS="claimed"
+    echo "$T_LABELS" | grep "gate-status:dispatching" >/dev/null && T_STATUS="dispatching"
+    echo "$T_LABELS" | grep "gate-status:claimed" >/dev/null     && T_STATUS="claimed"
     [ -z "$T_STATUS" ] && continue
 
     T_AGE=$(age_minutes_of "$T_UPDATED" "$NOW_EPOCH")
@@ -2681,7 +2681,7 @@ if [ "$TRANSIENT_COUNT" -gt 0 ]; then
 
     _T_MARKER_FOUND=0
     if [ -n "$RUNNING_GATERUN_MARKER_IDS" ] \
-      && printf '%s\n' "$RUNNING_GATERUN_MARKER_IDS" | grep -qx "$T_ID"; then
+      && printf '%s\n' "$RUNNING_GATERUN_MARKER_IDS" | grep -x "$T_ID" >/dev/null; then
       _T_MARKER_FOUND=1
     fi
     # ga-qj1xh: route through companion_liveness_from_query so a failed shared
@@ -3830,7 +3830,7 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
       SLING_CLOSE_REASON=$(echo "$SLING_JSON" | jq -r '.close_reason // ""' 2>/dev/null || echo "")
 
       [ "$SLING_STATUS" = "closed" ] && SLING_CLOSED=1
-      echo "$SLING_LABELS" | grep -qE "gate:needs-fix|gate:needs-human" && SLING_NEEDS_FIX=1 || true
+      echo "$SLING_LABELS" | grep -E "gate:needs-fix|gate:needs-human" >/dev/null && SLING_NEEDS_FIX=1 || true
 
       # ga-eu75w: a refused sling was never gate-reviewed — its terminal state
       # must not be read as "gate-passed" just because it lacks gate:needs-fix
@@ -3908,7 +3908,7 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
         # an affirmative verdict differs (gate:passed handoff vs. direct
         # close), decided by gap2_apply_pass_verdict below.
         GAP2_IS_STORY=0
-        echo "$SC_LABELS" | grep -q "story:approved" && GAP2_IS_STORY=1
+        echo "$SC_LABELS" | grep "story:approved" >/dev/null && GAP2_IS_STORY=1
 
         # sling-passed+closed is a done-SIGNAL, not proof the PARENT's own fix
         # landed (ga-6ync4 — same root flaw as ga-266z8's story-delivery.sh
@@ -3935,7 +3935,7 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
         # active marker" case let Pilot redispatch a second builder the moment
         # the strip landed, regardless of what the verdict turned out to be.
         GAP2_HAS_UNTRACKED_MARKER=0
-        echo "$SC_LABELS" | grep -q "delivery:untracked" && GAP2_HAS_UNTRACKED_MARKER=1
+        echo "$SC_LABELS" | grep "delivery:untracked" >/dev/null && GAP2_HAS_UNTRACKED_MARKER=1
 
         # Check for an ACTIVE gate marker on the parent's OWN fix BEFORE
         # running the (slower) merge-ancestry search below — same
@@ -4038,7 +4038,7 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
                     --grep="^fix bug ${GAP2_TRY_ID}:" \
                     --format=%H 2>/dev/null); do
                   GAP2_CAND_SUBJ=$(git -C "$GC_CITY" log --format=%s -n 1 "$GAP2_CAND_SHA" 2>/dev/null)
-                  if printf '%s\n' "$GAP2_CAND_SUBJ" | grep -Eq "^[a-z]+\(${GAP2_TRY_ID}\):|^fix bug ${GAP2_TRY_ID}:"; then
+                  if printf '%s\n' "$GAP2_CAND_SUBJ" | grep -E "^[a-z]+\(${GAP2_TRY_ID}\):|^fix bug ${GAP2_TRY_ID}:" >/dev/null; then
                     GAP2_SUBJ_SHA="$GAP2_CAND_SHA"
                     break
                   fi
@@ -4460,12 +4460,12 @@ VERIFY_JSON=$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null \
   | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "{}")
 CURRENT_LABELS=$(echo "$VERIFY_JSON" | jq -r '(.labels // []) | join(",")' 2>/dev/null || echo "")
 
-if echo "$CURRENT_LABELS" | grep -q "gate-status:claimed"; then
+if echo "$CURRENT_LABELS" | grep "gate-status:claimed" >/dev/null; then
   log "Marker $MARKER_ID already claimed by another sweep. Skipping."
   exit 0
 fi
 
-if ! echo "$CURRENT_LABELS" | grep -q "gate-status:ready"; then
+if ! echo "$CURRENT_LABELS" | grep "gate-status:ready" >/dev/null; then
   log "Marker $MARKER_ID no longer ready (raced away before claim). Skipping."
   exit 0
 fi
@@ -4699,7 +4699,7 @@ fi
 
 # Session-id normalization: strip adhoc suffix from session IDs to get the crew role.
 # e.g. "digo-wa-adhoc-e2510107f6" → "digo-wa", "batista-lx-adhoc-abc123" → "batista-lx"
-if [ -n "$AUTHOR" ] && echo "$AUTHOR" | grep -qE "-adhoc-[0-9a-f]+" 2>/dev/null; then
+if [ -n "$AUTHOR" ] && echo "$AUTHOR" | grep -E "-adhoc-[0-9a-f]+" 2>/dev/null >/dev/null; then
   AUTHOR_NORMALIZED=$(echo "$AUTHOR" | sed 's/-adhoc-[0-9a-f]*$//')
   log "  Author '$AUTHOR' looks like a session-id; normalizing to crew role '$AUTHOR_NORMALIZED'."
   AUTHOR="$AUTHOR_NORMALIZED"
@@ -4908,7 +4908,7 @@ if { [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; } && [ -n "$BEAD_ID" ]; then
     | jq -r --arg r "$_bid_prefix" '.rigs[] | select(.name == $r or .prefix == $r) | .path' 2>/dev/null | head -1 || echo "")
 fi
 # Trailing-segment fallback: mila-wa → wa.
-if { [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; } && [ -n "$RIG" ] && printf '%s' "$RIG" | grep -q '-'; then
+if { [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; } && [ -n "$RIG" ] && printf '%s' "$RIG" | grep '-' >/dev/null; then
   _rig_tail="${RIG##*-}"
   RIG_PATH=$(echo "$RIG_LIST_JSON" \
     | jq -r --arg r "$_rig_tail" '.rigs[] | select(.name == $r or .prefix == $r) | .path' 2>/dev/null | head -1 || echo "")

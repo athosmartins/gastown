@@ -129,7 +129,7 @@ worktree_is_live() {
   # silently authorize deletion; treat it as live instead (the safe default).
   ps_out="$(ps -Ao command= 2>/dev/null)"
   [ -z "$ps_out" ] && return 0
-  printf '%s\n' "$ps_out" | grep -F -- "$wt" | grep -qv '^grep ' && return 0
+  printf '%s\n' "$ps_out" | grep -F -- "$wt" | grep -v '^grep ' >/dev/null && return 0
   return 1
 }
 

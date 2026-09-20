@@ -104,7 +104,7 @@ compute_hash() {
 # is_reload_in_progress — returns 0 if "already in progress" error
 is_reload_in_progress() {
     local out="$1"
-    echo "$out" | grep -q "already in progress"
+    echo "$out" | grep "already in progress" >/dev/null
 }
 
 # Synchronous soft reload — used when file watcher detects a change.

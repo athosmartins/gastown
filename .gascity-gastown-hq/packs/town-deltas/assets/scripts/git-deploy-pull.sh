@@ -79,7 +79,7 @@ if [ ! -r "$GLH" ]; then
   _fetch_err="$(git -C "$REPO" fetch origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" --quiet 2>&1)"
   RC=$?
   if [ "$RC" -ne 0 ]; then
-    if printf '%s' "$_fetch_err" | grep -q 'cannot lock ref'; then
+    if printf '%s' "$_fetch_err" | grep 'cannot lock ref' >/dev/null; then
       echo "git-deploy-pull.sh: transient 'cannot lock ref' on $BRANCH's own remote-tracking ref (unlocked fallback) — try again next cycle" >&2
       exit 75
     fi
@@ -113,7 +113,7 @@ fi
 
 _fetch_err="$(git -C "$REPO" fetch origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" --quiet 2>&1)"
 RC=$?
-if [ "$RC" -ne 0 ] && printf '%s' "$_fetch_err" | grep -q 'cannot lock ref'; then
+if [ "$RC" -ne 0 ] && printf '%s' "$_fetch_err" | grep 'cannot lock ref' >/dev/null; then
   echo "git-deploy-pull.sh: transient 'cannot lock ref' on $BRANCH's own remote-tracking ref — try again next cycle" >&2
   git_mutex_release "$REPO"
   exit 75

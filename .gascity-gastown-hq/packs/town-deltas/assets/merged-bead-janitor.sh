@@ -500,7 +500,7 @@ git_in() {
 # token_bounded <bead_id> <text> — rc0 iff text contains bead_id as a whole
 # token (not a substring of a longer id). Guards e.g. wa-1 vs wa-12.
 token_bounded() {
-  printf '%s' "$2" | grep -Eq "(^|[^[:alnum:]-])$1([^[:alnum:]-]|\$)"
+  printf '%s' "$2" | grep -E "(^|[^[:alnum:]-])$1([^[:alnum:]-]|\$)" >/dev/null
 }
 
 # scan_commit_for_bead <git_dir> <is_container> <ref> <bead_id>
@@ -1484,14 +1484,14 @@ EOF
     SASSIGNEE=$(printf '%s' "$s" | jq -r '.assignee // ""' 2>/dev/null || true)
 
     S_EPIC=0;     [ "$STYPE" = "epic" ] && S_EPIC=1
-    S_DONE=0;     printf '%s' "$SLABELS" | grep -qw "story:done"      && S_DONE=1
-    S_INFLIGHT=0; printf '%s' "$SLABELS" | grep -qw "story:in-flight" && S_INFLIGHT=1
+    S_DONE=0;     printf '%s' "$SLABELS" | grep -w "story:done" >/dev/null      && S_DONE=1
+    S_INFLIGHT=0; printf '%s' "$SLABELS" | grep -w "story:in-flight" >/dev/null && S_INFLIGHT=1
     S_BUILDER=0;  [ -n "$SASSIGNEE" ] && S_BUILDER=1
     # delivery owns the bead while it is actively running OR has a recorded
     # failure (a failed deploy/prod-test must NOT be masked as story:done).
     S_DELIV=0
-    if printf '%s' "$SLABELS" | grep -qw "delivery:running" \
-       || printf '%s' "$SLABELS" | grep -qw "delivery:failed"; then S_DELIV=1; fi
+    if printf '%s' "$SLABELS" | grep -w "delivery:running" >/dev/null \
+       || printf '%s' "$SLABELS" | grep -w "delivery:failed" >/dev/null; then S_DELIV=1; fi
 
     # Markers (HQ-resident, regardless of which store the bead lives in).
     SMK=$(markers_for_bead "$SID")
@@ -1740,7 +1740,7 @@ EOF
         break
       fi
       AHEAD=$(git_in "$RGITDIR" "$RCONTAINER" rev-list --count "origin/$RDEFAULT..origin/$cb" 2>/dev/null || echo "ERR")
-      LWT=0; printf '%s\n' "$WT_CREW" | grep -Fxq "$cb" && LWT=1
+      LWT=0; printf '%s\n' "$WT_CREW" | grep -Fx "$cb" >/dev/null && LWT=1
       FRESH=$(branch_is_fresh "$RGITDIR" "$RCONTAINER" "origin/$cb" "$BRANCH_FRESH_DAYS")
       # CONTENT-IN-MAIN (squash-aware merge test). ahead==0 is the cheap fast-path
       # (strict ancestor ⟹ trivially content-in-main, no extra git call). Otherwise

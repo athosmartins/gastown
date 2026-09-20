@@ -799,10 +799,10 @@ bead_domain() {
   # batista-wa instead of the pool) is cheap to notice/bounce and far
   # smaller than the reclaim-loop this fix closes; a keyword regex over
   # freeform prose cannot fully distinguish "is about" from "mentions".
-  if printf '%s' "$hay" | grep -iqE 'hex[ -]?notebook|notebook.{0,10}\bhex\b|hex[ -]?cell|c[ée]lula.{0,15}\bhex\b|hex-native|hex-monitor|hex-api|hex\.tech|hex[ -]?project|hex[ -]?run|hex[ -]?schedule|hex[ -]?publish|hex[ -]?draft'; then
+  if printf '%s' "$hay" | grep -iE 'hex[ -]?notebook|notebook.{0,10}\bhex\b|hex[ -]?cell|c[ée]lula.{0,15}\bhex\b|hex-native|hex-monitor|hex-api|hex\.tech|hex[ -]?project|hex[ -]?run|hex[ -]?schedule|hex[ -]?publish|hex[ -]?draft' >/dev/null; then
     echo "hex"; return 0
   fi
-  if printf '%s' "$hay" | grep -iqE 'urblink_design_system|design[ -]system|painel[ -]?hist|\bfrontend\b|\bui\b|\bux\b|\bkanban\b|\bcss\b|stylesheet|layout'; then
+  if printf '%s' "$hay" | grep -iE 'urblink_design_system|design[ -]system|painel[ -]?hist|\bfrontend\b|\bui\b|\bux\b|\bkanban\b|\bcss\b|stylesheet|layout' >/dev/null; then
     echo "frontend"; return 0
   fi
   # real-estate BEFORE data: property enrichment carries "enrichment" (a data keyword) but
@@ -810,7 +810,7 @@ bead_domain() {
   # NOT oracle (warming) or thies (satmap visual layer only). This is the wa-nvn9/wa-o65d
   # round-robin-to-oracle loop oracle hit, and the wa-nvn9 misroute-to-thies when peter was
   # human-engaged.
-  if printf '%s' "$hay" | grep -iqE 'arcgis|zoneamento|geometria|geo-?match|quarteir|cadastr|\bitbi\b|[ií]ndice cadastral|im[oó]ve(l|is)|funil[ _-]?im[oó]vel|deals?.*(fora de bh|im[oó]ve)'; then
+  if printf '%s' "$hay" | grep -iE 'arcgis|zoneamento|geometria|geo-?match|quarteir|cadastr|\bitbi\b|[ií]ndice cadastral|im[oó]ve(l|is)|funil[ _-]?im[oó]vel|deals?.*(fora de bh|im[oó]ve)' >/dev/null; then
     echo "real-estate"; return 0
   fi
   # ga-cfc6wd: bare "warming"/"aquecimento"/"chip(s)" alone are too broad — they
@@ -825,16 +825,16 @@ bead_domain() {
   # when they appear near an actual physical-device signal (aparelho/
   # dispositivo/ADB) — see pilot-dispatcher.selftest.sh Scenario ga-cfc6wd for
   # the false-positive fixtures this was measured against.
-  if printf '%s' "$hay" | grep -iqE 'warm-?up|ban-?prevention|ban-?risk|on-?device send|group-?send'; then
+  if printf '%s' "$hay" | grep -iE 'warm-?up|ban-?prevention|ban-?risk|on-?device send|group-?send' >/dev/null; then
     echo "warming"; return 0
   fi
-  if printf '%s' "$hay" | grep -iqE '(warming|aquecimento|\bchip(s)?\b).{0,60}(\baparelho\b|\bdispositivo\b|\badb\b)|(\baparelho\b|\bdispositivo\b|\badb\b).{0,60}(warming|aquecimento|\bchip(s)?\b)'; then
+  if printf '%s' "$hay" | grep -iE '(warming|aquecimento|\bchip(s)?\b).{0,60}(\baparelho\b|\bdispositivo\b|\badb\b)|(\baparelho\b|\bdispositivo\b|\badb\b).{0,60}(warming|aquecimento|\bchip(s)?\b)' >/dev/null; then
     echo "warming"; return 0
   fi
-  if printf '%s' "$hay" | grep -iqE 'financeiro|\bledger\b|enrichment|scraper|mega data set|net ?imoveis|viva ?real|\bemail\b|pipedrive|property data|\bdados\b'; then
+  if printf '%s' "$hay" | grep -iE 'financeiro|\bledger\b|enrichment|scraper|mega data set|net ?imoveis|viva ?real|\bemail\b|pipedrive|property data|\bdados\b' >/dev/null; then
     echo "data"; return 0
   fi
-  if printf '%s' "$hay" | grep -iqE '\bdolt\b|gate dispatcher|\breviewer\b|\bdispatcher\b|\bframework\b|headroom|\brefinery\b'; then
+  if printf '%s' "$hay" | grep -iE '\bdolt\b|gate dispatcher|\breviewer\b|\bdispatcher\b|\bframework\b|headroom|\brefinery\b' >/dev/null; then
     echo "infra"; return 0
   fi
   echo ""
@@ -983,11 +983,11 @@ bead_content_rig() {
   # The painel UI is mila's (WA) domain; property_scrapers builds the SCRAPERS, not the UI.
   # Narrow on purpose: "drive bridge" (the WA itbi_drive_bridge) not bare "Hex"; "painel"/
   # "kanban"/"filter pills" not bare "dashboard" (a Hex-notebook dashboard stays property).
-  if printf '%s' "$hay" | grep -iqE 'pipedrive|whapi|whatsapp|urblink_design_system|drive[_ ]bridge|\bpainel\b|painel\.urblink|\bkanban\b|filter[ -]?pills'; then
+  if printf '%s' "$hay" | grep -iE 'pipedrive|whapi|whatsapp|urblink_design_system|drive[_ ]bridge|\bpainel\b|painel\.urblink|\bkanban\b|filter[ -]?pills' >/dev/null; then
     echo "whatsapp_automation"; return 0
   fi
   # property_scrapers domain (the recurring misroute family).
-  if printf '%s' "$hay" | grep -iqE 'scraper|scrape|\bcadastro\b|cadastr[ao]|\bITBI\b|\bRFB\b|receita federal|\bCNAE\b|\bCNPJ\b|\bPBH\b|motherduck|\bHex\b|hex notebook|geocod|georreferenc|lat[ -/]?lon|point-in-polygon|pesquisa_mercado|propriet[áa]ri|\bim[óo]vel\b|\bim[óo]veis\b|\blote\b|\blotes\b|\bterreno\b|terreno_livre|cart[óo]rio|matr[íi]cula|incorpora|índice cadastral|indice cadastral|mega_data_set|mega data set'; then
+  if printf '%s' "$hay" | grep -iE 'scraper|scrape|\bcadastro\b|cadastr[ao]|\bITBI\b|\bRFB\b|receita federal|\bCNAE\b|\bCNPJ\b|\bPBH\b|motherduck|\bHex\b|hex notebook|geocod|georreferenc|lat[ -/]?lon|point-in-polygon|pesquisa_mercado|propriet[áa]ri|\bim[óo]vel\b|\bim[óo]veis\b|\blote\b|\blotes\b|\bterreno\b|terreno_livre|cart[óo]rio|matr[íi]cula|incorpora|índice cadastral|indice cadastral|mega_data_set|mega data set' >/dev/null; then
     echo "property_scrapers"; return 0
   fi
   # whatsapp_automation domain features authored as HQ (ga-) beads.
@@ -997,7 +997,7 @@ bead_content_rig() {
   # vazia"). Audited: EVERY historical match of dispar* across this HQ's bead corpus
   # (open + closed) was this false cognate, never the genuine WA noun ("disparo de
   # mensagem"). \b on both sides keeps the real signal, drops the verb collision.
-  if printf '%s' "$hay" | grep -iqE '\bpainel\b|whatsapp|\bwhapi\b|pipedrive|urblink_design_system|design[ -]system|painel-hist|kanban hist|\bfrota\b|\bcanais\b|\bcanal\b de alerta|\bdisparos?\b|envio de mensagem'; then
+  if printf '%s' "$hay" | grep -iE '\bpainel\b|whatsapp|\bwhapi\b|pipedrive|urblink_design_system|design[ -]system|painel-hist|kanban hist|\bfrota\b|\bcanais\b|\bcanal\b de alerta|\bdisparos?\b|envio de mensagem' >/dev/null; then
     echo "whatsapp_automation"; return 0
   fi
   echo ""
@@ -1049,7 +1049,7 @@ bead_targets_beads_repo() {
   # that describe the beads-repo symptom in "bd binary" terms instead of
   # naming the repo. Same false-positive profile as the six literals above:
   # a specific, narrow, stable compound string, not a bare "bd"/"beads" mention.
-  if printf '%s' "$hay" | grep -iqE 'steveyegge/beads|gastownhall/beads|athosmartins/beads|\bgt/beads\b|\bbeads repo\b|\bbeads-repo\b|\bbd-binary-separate-from-gascity-engine\b'; then
+  if printf '%s' "$hay" | grep -iE 'steveyegge/beads|gastownhall/beads|athosmartins/beads|\bgt/beads\b|\bbeads repo\b|\bbeads-repo\b|\bbd-binary-separate-from-gascity-engine\b' >/dev/null; then
     echo "1"; return 0
   fi
   echo ""
@@ -1178,7 +1178,7 @@ bead_path_rig() {
   hay=$(_bead_path_haystack "$bead")
   [ -z "$hay" ] && { echo ""; return 0; }
   # (1) UNAMBIGUOUS HQ/framework paths (do NOT exist in any product rig).
-  if printf '%s' "$hay" | grep -qE '(^|[^[:alnum:]._/-])(packs|skills|agents)/|(^|[^[:alnum:]._/-])\.claude/|(city|pack)\.toml|town-deltas' 2>/dev/null; then
+  if printf '%s' "$hay" | grep -E '(^|[^[:alnum:]._/-])(packs|skills|agents)/|(^|[^[:alnum:]._/-])\.claude/|(city|pack)\.toml|town-deltas' 2>/dev/null >/dev/null; then
     echo "gascity"; return 0
   fi
   # (2) crew/<name>/ → owning rig by crew-name suffix (mirror the *-wa/*-ps owner map).
@@ -1193,11 +1193,11 @@ bead_path_rig() {
   #     property_scrapers. shared/ is DELIBERATELY EXCLUDED (ga-xzfl review FINDING 3):
   #     it exists on disk in BOTH whatsapp_automation AND property_scrapers, so a shared/
   #     citation is AMBIGUOUS and must fall through to owner/content, never force WA.
-  if printf '%s' "$hay" | grep -qE '(^|[^[:alnum:]._/-])(outreach|painel)/' 2>/dev/null; then
+  if printf '%s' "$hay" | grep -E '(^|[^[:alnum:]._/-])(outreach|painel)/' 2>/dev/null >/dev/null; then
     echo "whatsapp_automation"; return 0
   fi
   # (4) property_scrapers product path (scrapers/ is a PS-exclusive top-level dir).
-  if printf '%s' "$hay" | grep -qE '(^|[^[:alnum:]._/-])scrapers/' 2>/dev/null; then
+  if printf '%s' "$hay" | grep -E '(^|[^[:alnum:]._/-])scrapers/' 2>/dev/null >/dev/null; then
     echo "property_scrapers"; return 0
   fi
   # (5) DELIBERATELY NO bare-scripts/ rule (ga-xzfl review FINDING 1): scripts/ is a top-level
@@ -1291,7 +1291,7 @@ _rig_has_any_basename() {
   [ "$_grc" != "0" ] && return 0   # probe FAILED (timeout/not-a-repo) → fail-open (present)
   for _n in $_names; do
     [ -z "$_n" ] && continue
-    printf '%s\n' "$_list" | grep -qE "(^|/)$(printf '%s' "$_n" | sed -E 's/\./\\./g')\$" 2>/dev/null && return 0
+    printf '%s\n' "$_list" | grep -E "(^|/)$(printf '%s' "$_n" | sed -E 's/\./\\./g')\$" 2>/dev/null >/dev/null && return 0
   done
   return 1  # every cited filename is absent from every tracked path in the rig
 }
@@ -1527,8 +1527,8 @@ classify_lane() {
   # 1. Explicit label wins.
   local labels
   labels=$(echo "$bead" | jq -r '(.labels // []) | join(",")' 2>/dev/null || echo "")
-  if echo "$labels" | grep -q "lane:big";   then echo "big";   return; fi
-  if echo "$labels" | grep -q "lane:small"; then echo "small"; return; fi
+  if echo "$labels" | grep "lane:big" >/dev/null;   then echo "big";   return; fi
+  if echo "$labels" | grep "lane:small" >/dev/null; then echo "small"; return; fi
 
   # 2. story.size_check metadata == "epic" → big.
   local size_check
@@ -1710,7 +1710,7 @@ _pilot_unsuppress_sling() {
   _pus_lbls=$(bd -C "$_pus_city" show "$_pus_id" --json 2>/dev/null \
     | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null) || return 0
   [ -z "$_pus_lbls" ] && return 0
-  if ! printf '%s\n' "$_pus_lbls" | grep -q '^pilot:held$'; then
+  if ! printf '%s\n' "$_pus_lbls" | grep '^pilot:held$' >/dev/null; then
     return 0   # nothing to undo — never suppressed, or already cleared
   fi
   _pus_expiry_lbl=$(printf '%s\n' "$_pus_lbls" | grep -E '^pilot:held-until:[0-9]+$' | head -1) || true
@@ -2531,7 +2531,7 @@ _pilot_hold_or_escalate() {
     | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
   [ "$_phe_live_assignee" = "null" ] && _phe_live_assignee=""
 
-  if printf '%s\n' "$_phe_live_labels" | grep -qE '^gate:(queued|reviewing)$'; then
+  if printf '%s\n' "$_phe_live_labels" | grep -E '^gate:(queued|reviewing)$' >/dev/null; then
     log "[pilot-hold] $_phe_slug: $_phe_id already built (gate:queued/reviewing per live re-check) — skipping hold/escalation entirely (ga-230cyn)"
     return 0
   fi
@@ -4926,13 +4926,13 @@ _ASLEEP_SESSION_IDS=$(echo "$_SESSIONS_JSON" \
 # _session_is_live <identifier> — exit 0 iff <identifier> is a non-closed session.
 _session_is_live() {
   [ -n "${1:-}" ] || return 1
-  printf '%s\n' "$_LIVE_SESSION_IDS" | grep -Fxq -- "$1"
+  printf '%s\n' "$_LIVE_SESSION_IDS" | grep -Fx -- "$1" >/dev/null
 }
 
 # _session_is_asleep <identifier> — exit 0 iff <identifier> is a non-closed, asleep session.
 _session_is_asleep() {
   [ -n "${1:-}" ] || return 1
-  printf '%s\n' "$_ASLEEP_SESSION_IDS" | grep -Fxq -- "$1"
+  printf '%s\n' "$_ASLEEP_SESSION_IDS" | grep -Fx -- "$1" >/dev/null
 }
 
 # _session_is_live_builder <identifier> — exit 0 iff the session is a worker that
@@ -5175,7 +5175,7 @@ print(is_active_owner(p["assignee"], p["session_meta"], p["idle_threshold_min"])
 
   # Bridge unavailable, produced unexpected output, or returned None (coordinator
   # immunity — see the comment above) — original jq/grep check.
-  printf '%s\n' "$_ACTIVE_OWNER_IDS" | grep -Fxq -- "$_sao_asg"
+  printf '%s\n' "$_ACTIVE_OWNER_IDS" | grep -Fx -- "$_sao_asg" >/dev/null
 }
 
 # ── Stale-sling liveness (dead-builder HOL-block fix) ─────────────────────────
@@ -5209,7 +5209,7 @@ _target_has_real_branch() {
     [ -n "$_r" ] && [ -d "$_r" ] || continue
     git -C "$_r" for-each-ref --format='%(refname)' \
         "refs/remotes/origin/crew/*/$1" "refs/heads/crew/*/$1" \
-        "refs/remotes/origin/fix/$1-*" "refs/heads/fix/$1-*" 2>/dev/null | grep -q . && return 0
+        "refs/remotes/origin/fix/$1-*" "refs/heads/fix/$1-*" 2>/dev/null | grep . >/dev/null && return 0
   done <<< "$_repos"
   return 1
 }
@@ -5647,9 +5647,9 @@ _beadid_has_crew_branch() {
     #    timeout / offline remote is NOT evidence of a branch → fall through
     #    (fail-open), never block.
     if git -C "$_repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1 \
-       || git -C "$_repo" remote 2>/dev/null | grep -q .; then
+       || git -C "$_repo" remote 2>/dev/null | grep . >/dev/null; then
       if timeout 8 git -C "$_repo" ls-remote --heads origin "crew/*/${_bid}" "crew/${_bid}" "fix/${_bid}-*" 2>/dev/null \
-          | grep -qiE "refs/heads/${_re}"; then
+          | grep -iE "refs/heads/${_re}" >/dev/null; then
         return 0
       fi
     fi
@@ -5709,9 +5709,9 @@ _beadid_matched_crew_branch_ref() {
       return 0
     fi
     if git -C "$_repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1 \
-       || git -C "$_repo" remote 2>/dev/null | grep -q .; then
+       || git -C "$_repo" remote 2>/dev/null | grep . >/dev/null; then
       if timeout 8 git -C "$_repo" ls-remote --heads origin "crew/*/${_bid}" "crew/${_bid}" "fix/${_bid}-*" 2>/dev/null \
-          | grep -qiE "refs/heads/${_re}"; then
+          | grep -iE "refs/heads/${_re}" >/dev/null; then
         printf '%s\t' "$_repo"   # repo known, ref unresolved locally (ls-remote-only)
         return 0
       fi
@@ -5862,7 +5862,7 @@ _beadid_needs_remerge_branch() {
       return 0
     fi
     if git -C "$_repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1 \
-       || git -C "$_repo" remote 2>/dev/null | grep -q .; then
+       || git -C "$_repo" remote 2>/dev/null | grep . >/dev/null; then
       _match=$(timeout 8 git -C "$_repo" ls-remote --heads origin "fix/${_bid}" "fix/${_bid}-*" 2>/dev/null | head -1 | awk '{print $2}')
       if [ -n "$_match" ]; then
         printf '%s\t%s' "$_repo" "${_match#refs/heads/}"
@@ -6141,7 +6141,7 @@ _beadid_mentioned_in_attached_session() {
   _hit_lines=$(printf '%s' "$_cache" | grep -E "(^|[^A-Za-z0-9_-])${_bid}([^A-Za-z0-9_-]|\$)") || return 1
   [ -n "$_hit_lines" ] || return 1
   printf '%s' "$_hit_lines" \
-    | grep -qE '(^|[^A-Za-z0-9_-])(bd|gc|git)([^A-Za-z0-9_-]|$)|[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]*'"${_bid}"
+    | grep -E '(^|[^A-Za-z0-9_-])(bd|gc|git)([^A-Za-z0-9_-]|$)|[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]*'"${_bid}" >/dev/null
 }
 
 # _ownership_guard_should_refuse <bead_id> <bead_json> <bead_city> — emit a short
@@ -6473,7 +6473,7 @@ _ns_label_blocks_release() {
     case "$_label" in
       ""|gate:needs-fix) continue ;;
     esac
-    printf '%s\n' "$_label" | grep -q '^gate:fix-attempt:[0-9]\{1,\}$' && continue
+    printf '%s\n' "$_label" | grep '^gate:fix-attempt:[0-9]\{1,\}$' >/dev/null && continue
     case "$_label" in
       gate:*) return 0 ;;
     esac
@@ -8540,7 +8540,7 @@ dispatch_one() {
   # Pull the latest such comment and the attempt counter so the builder prompt
   # tells the re-dispatched builder to fix THE SPECIFIC issues (not redo the work).
   local STORY_GATE_FEEDBACK="" STORY_FIX_ATTEMPT="" GATE_FIX_SECTION=""
-  if echo "$STORY_LABELS" | grep -q "gate:needs-fix"; then
+  if echo "$STORY_LABELS" | grep "gate:needs-fix" >/dev/null; then
     # ga-26df: `:0` reset sentinel wins, else MAX — mirrors the dispatcher-side reader.
     # This label is READ here only (for the feedback banner), never written; but it must
     # match the dispatcher's semantics or the banner would show a different attempt number
@@ -8548,7 +8548,7 @@ dispatch_one() {
     # `|| true` label-removal in the bump loop); see the dispatcher comment (ga-wisp-198xqe).
     _PA=$(echo "$STORY_LABELS" | tr ',' '\n' \
       | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p')
-    if printf '%s\n' "$_PA" | grep -qx 0; then
+    if printf '%s\n' "$_PA" | grep -x 0 >/dev/null; then
       STORY_FIX_ATTEMPT=0
     else
       STORY_FIX_ATTEMPT=$(printf '%s\n' "$_PA" | sort -n | tail -1)
@@ -8592,8 +8592,8 @@ FIXSEC
   # can be found. Whichever path runs, gate:needs-fix/needs-remerge is stripped
   # so the bead never sits ambiguous — it moves into gate:queued or
   # gate:needs-human, both pre-existing, independently-monitored states.
-  if echo "$STORY_LABELS" | grep -q "gate:needs-remerge" \
-     || { echo "$STORY_LABELS" | grep -q "gate:needs-fix" && [ -z "$STORY_GATE_FEEDBACK" ]; }; then
+  if echo "$STORY_LABELS" | grep "gate:needs-remerge" >/dev/null \
+     || { echo "$STORY_LABELS" | grep "gate:needs-fix" >/dev/null && [ -z "$STORY_GATE_FEEDBACK" ]; }; then
     log "  ga-e2n96: $STORY_ID carries gate:needs-fix/needs-remerge with ZERO feedback — will NOT dispatch a builder with an empty brief. Searching for an existing branch to resubmit..."
 
     local REMERGE_MATCH="" REMERGE_REPO="" REMERGE_REF=""
@@ -8723,12 +8723,12 @@ LIVESEC
       | jq -r 'if type=="array" then .[0] else . end | (.metadata["source-bead"] // .metadata["source_bead"] // "")' \
       2>/dev/null || echo "")
 
-    if echo "$VERIFY_LABELS" | grep -q "story:in-flight"; then
+    if echo "$VERIFY_LABELS" | grep "story:in-flight" >/dev/null; then
       log "Story $STORY_ID is already in-flight (race condition). Releasing claim."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       return 1
     fi
-    if echo "$VERIFY_LABELS" | grep -q "story:done"; then
+    if echo "$VERIFY_LABELS" | grep "story:done" >/dev/null; then
       log "Story $STORY_ID is already done. Releasing claim."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       return 1
@@ -8736,7 +8736,7 @@ LIVESEC
     # (ga-zzrts fix b) gate:needs-human — bead deliberately parked for human/engine path.
     # The bd list queries already exclude this label; this guard catches the race where
     # gate:needs-human is added BETWEEN the query-time snapshot and claim acquisition.
-    if echo "$VERIFY_LABELS" | grep -q "gate:needs-human"; then
+    if echo "$VERIFY_LABELS" | grep "gate:needs-human" >/dev/null; then
       warn "ga-zzrts(b): $STORY_ID has gate:needs-human at dispatch time — race or stale query. Releasing claim and skipping."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       return 1
@@ -8745,7 +8745,7 @@ LIVESEC
     # bd list excludes pilot:dispatched; this is the last-resort guard for the case where
     # story:in-flight was stripped (crash/race) but pilot:dispatched survived — without
     # this check the Pilot would emit a second sling for the same source bead (ga-2aigc).
-    if echo "$VERIFY_LABELS" | grep -q "pilot:dispatched"; then
+    if echo "$VERIFY_LABELS" | grep "pilot:dispatched" >/dev/null; then
       warn "ga-zzrts(c): $STORY_ID already has pilot:dispatched — prior-sweep duplicate guard. Releasing claim."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       return 1
@@ -9243,7 +9243,7 @@ LIVESEC
               [ (.title // ""), (.description // ""),
                 (.acceptance_criteria // .metadata["story.criterios"] // ""),
                 ((.labels // []) | join(" ")) ] | join("  ")
-            ' 2>/dev/null | grep -iqE '\bdolt\b|gate dispatcher|\breviewer\b|\bdispatcher\b|\bframework\b|headroom|\brefinery\b'; then
+            ' 2>/dev/null | grep -iE '\bdolt\b|gate dispatcher|\breviewer\b|\bdispatcher\b|\bframework\b|headroom|\brefinery\b' >/dev/null; then
             _FW_EXEMPT=1; _FW_REASON="infra-keyword-shadowed(bead_domain=$_FW_DOMAIN)"
           fi
           # (g) ga-pmkoar: a bead from the FRAMEWORK's own beads store (id prefix "gt-")
@@ -9813,25 +9813,25 @@ TASK
     _PREDISPATCH_LABELS=$(echo "$_PREDISPATCH_JSON" \
       | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' \
       2>/dev/null || echo "")
-    if echo "$_PREDISPATCH_LABELS" | grep -q "gate:needs-human"; then
+    if echo "$_PREDISPATCH_LABELS" | grep "gate:needs-human" >/dev/null; then
       warn "ga-88g2: $STORY_ID now has gate:needs-human (escalated during builder-target resolution, after the ga-zzrts claim-verify passed clean). Releasing claim and skipping — NOT dispatching a builder onto a circuit-broken bead."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
       return 1
     fi
-    if echo "$_PREDISPATCH_LABELS" | grep -q "story:in-flight"; then
+    if echo "$_PREDISPATCH_LABELS" | grep "story:in-flight" >/dev/null; then
       warn "ga-88g2: $STORY_ID now has story:in-flight (raced by a concurrent dispatch/reclaim during builder-target resolution). Releasing claim and skipping."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
       return 1
     fi
-    if echo "$_PREDISPATCH_LABELS" | grep -q "story:done"; then
+    if echo "$_PREDISPATCH_LABELS" | grep "story:done" >/dev/null; then
       warn "ga-88g2: $STORY_ID now has story:done (completed during builder-target resolution). Releasing claim and skipping."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
       return 1
     fi
-    if echo "$_PREDISPATCH_LABELS" | grep -q "pilot:dispatched"; then
+    if echo "$_PREDISPATCH_LABELS" | grep "pilot:dispatched" >/dev/null; then
       warn "ga-88g2: $STORY_ID now has pilot:dispatched (dispatched via another path during builder-target resolution). Releasing claim and skipping."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
@@ -9908,7 +9908,7 @@ TASK
       2>/dev/null || echo "false")
     if [ "$_mayor_hold_active" = "true" ]; then
       local _gwlabel_desc="has"
-      echo "$_PREDISPATCH_LABELS" | grep -q "gate:needs-fix" && _gwlabel_desc="is gate:needs-fix with"
+      echo "$_PREDISPATCH_LABELS" | grep "gate:needs-fix" >/dev/null && _gwlabel_desc="is gate:needs-fix with"
       warn "ga-pd7j: $STORY_ID $_gwlabel_desc a gastown__mayor comment inside the ${PILOT_MAYOR_HOLD_GRACE_SECS:-300}s grace window — deferring this sweep so an out-of-band hold isn't raced onto a builder. Releasing claim and skipping."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true

@@ -84,7 +84,7 @@ _live() { gc session list --json 2>/dev/null; }
 _cache_looks_valid() {
   [ -f "$CACHE" ] || return 1
   [ "$(head -c 1 "$CACHE" 2>/dev/null)" = "{" ] || return 1
-  head -c 64 "$CACHE" 2>/dev/null | grep -q '"sessions"'
+  head -c 64 "$CACHE" 2>/dev/null | grep '"sessions"' >/dev/null
 }
 
 # Serve the cache IFF it passes the sanity check; a corrupt cache is dropped and we

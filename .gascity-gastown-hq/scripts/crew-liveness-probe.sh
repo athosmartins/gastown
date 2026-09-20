@@ -441,7 +441,7 @@ _record_watchdog_notify() {
 # just fails closed to "not committed" (empty grep, function returns false).
 _is_committed_suspend() {
   git -C "$CLP_FRAMEWORK_REPO" show "HEAD:.gascity-gastown-hq/agents/${1}/agent.toml" 2>/dev/null \
-    | grep -qF 'suspended = true'
+    | grep -F 'suspended = true' >/dev/null
 }
 
 # _crew_work_dir crew-name — the crew's persistent worktree path, read from
@@ -530,7 +530,7 @@ run_probe() {
       # Check if assignee is a live session.
       # If NOT live: a dead session means the reclaim-guard will handle it; skip.
       # We only act on sessions still alive (wedged, not dead).
-      if ! echo "$live_sessions" | grep -qF "$assignee" 2>/dev/null; then
+      if ! echo "$live_sessions" | grep -F "$assignee" 2>/dev/null >/dev/null; then
         log "probe skip: $id assignee=$assignee — NOT a live session (may already be dead/reclaimed)"
         _clear_state "$id" "$assignee"
         continue
@@ -735,7 +735,7 @@ run_suspend_watchdog() {
     # live session merely CONTAINING $name (e.g. "gate-reviewer-adhoc-<hash>"
     # vs suspended agent "gate-reviewer") would false-positive as "live" —
     # gate-fix for ga-ld0ch review, see Scenario 21.
-    printf '%s\n' "$alive_names" | grep -qxF "$name" 2>/dev/null || continue   # not live — a different problem
+    printf '%s\n' "$alive_names" | grep -xF "$name" 2>/dev/null >/dev/null || continue   # not live — a different problem
     _is_committed_suspend "$name" && continue   # deliberate, reviewed suspension — not an anomaly
     if _should_watchdog_notify "$name"; then
       log "WATCHDOG: $name is suspended=true with a LIVE session and no probe marker — unexplained suspension, invisible unless someone looks (ga-ld0ch shape)"
@@ -1025,9 +1025,9 @@ GCSHIM
   echo ""
   echo "=== Scenario 9: real session-list envelope shape (object, not bare array) parses correctly (ga-ld0ch root cause) ==="
   _load_sessions_json
-  echo "$(_live_sessions)" | grep -qF "mila-wa" && ok "9: _live_sessions() found mila-wa in the REAL {sessions:[...]} envelope" || bad "9: _live_sessions() failed against the real envelope shape"
+  echo "$(_live_sessions)" | grep -F "mila-wa" >/dev/null && ok "9: _live_sessions() found mila-wa in the REAL {sessions:[...]} envelope" || bad "9: _live_sessions() failed against the real envelope shape"
   IDENT9=$(_session_identity "mila-wa")
-  { [ -n "$IDENT9" ] && echo "$IDENT9" | grep -qF "sess-A"; } && ok "9: _session_identity() resolved mila-wa's session id" || bad "9: _session_identity() did not resolve mila-wa"
+  { [ -n "$IDENT9" ] && echo "$IDENT9" | grep -F "sess-A" >/dev/null; } && ok "9: _session_identity() resolved mila-wa's session id" || bad "9: _session_identity() did not resolve mila-wa"
 
   echo ""
   echo "=== Scenario 10: _heal() records a resume marker + durable bd comment + notify on successful suspend ==="

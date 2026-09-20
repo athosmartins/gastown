@@ -28,9 +28,9 @@ fail() { echo "[prod-test:gascity ga-1xnfx] FAIL: $*" >&2; exit 1; }
 log "template fragment present ✓"
 
 # ── 2. Template wrapper still intact (a bad edit could have broken this) ──────
-head -1 "$FRAGMENT" | grep -q '{{ define "town-deltas" }}' \
+head -1 "$FRAGMENT" | grep '{{ define "town-deltas" }}' >/dev/null \
     || fail "template define wrapper missing/moved from line 1"
-tail -1 "$FRAGMENT" | grep -q '{{ end }}' \
+tail -1 "$FRAGMENT" | grep '{{ end }}' >/dev/null \
     || fail "template end wrapper missing/moved from last line"
 log "define/end wrapper intact ✓"
 
@@ -38,7 +38,7 @@ log "define/end wrapper intact ✓"
 # to one whitespace-collapsed line first rather than depending on where a
 # hand-wrapped markdown line break happens to fall.
 NORMALIZED="$(tr '\n' ' ' < "$FRAGMENT" | tr -s '[:space:]' ' ')"
-phrase_present() { printf '%s' "$NORMALIZED" | grep -qF "$1"; }
+phrase_present() { printf '%s' "$NORMALIZED" | grep -F "$1" >/dev/null; }
 
 # ── 3. The doctrine paragraph itself landed ───────────────────────────────────
 grep -q "ga-1xnfx" "$FRAGMENT" \

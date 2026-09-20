@@ -411,7 +411,7 @@ PY
 )"
     rm -f "$tmp"
     [ -z "$fresh_sessions" ] && return 1
-    if printf '%s\n' "$fresh_sessions" | grep -qx "$assignee"; then
+    if printf '%s\n' "$fresh_sessions" | grep -x "$assignee" >/dev/null; then
         printf '%s' "$assignee"
         return 0
     fi
@@ -456,7 +456,7 @@ pane_shows_permission_prompt() {
     peek_out="$(timeout 15 "$GC" session peek "$sess" --lines 40 2>/dev/null || true)"
     [ -z "$peek_out" ] && return 1
     tail_out="$(printf '%s\n' "$peek_out" | tail -12)"
-    printf '%s' "$tail_out" | grep -qE 'Do you want to proceed\?|requires confirmation'
+    printf '%s' "$tail_out" | grep -E 'Do you want to proceed\?|requires confirmation' >/dev/null
 }
 
 # permission_prompt_blocked_command (ga-iog1v / AC2 de ga-q640n): quando
@@ -519,7 +519,7 @@ pane_shows_active_child_process() {
     peek_out="$(timeout 15 "$GC" session peek "$sess" --lines 40 2>/dev/null || true)"
     [ -z "$peek_out" ] && return 1
     tail_out="$(printf '%s\n' "$peek_out" | tail -20)"
-    printf '%s' "$tail_out" | grep -qE 'Running [0-9]+ shell (command|commands)|Running…|Running\.\.\.'
+    printf '%s' "$tail_out" | grep -E 'Running [0-9]+ shell (command|commands)|Running…|Running\.\.\.' >/dev/null
 }
 
 # pane_extract_token_count (ga-0xmxt): reads the CLI's own streaming token
@@ -1383,7 +1383,7 @@ done <<< "$STUCK_LIST"
 for sf in "$ESCDIR"/*; do
     [ -f "$sf" ] || continue
     bn="$(basename "$sf")"
-    if ! printf '%s' " $ALL_INPROGRESS_IDS " | grep -qF " $bn "; then
+    if ! printf '%s' " $ALL_INPROGRESS_IDS " | grep -F " $bn " >/dev/null; then
         log "$bn: no longer in_progress (closed/advanced) — clearing escalation state"
         rm -f "$sf"
     fi
@@ -1395,7 +1395,7 @@ done
 for tf in "$TOKDIR"/*; do
     [ -f "$tf" ] || continue
     bn="$(basename "$tf")"
-    if ! printf '%s' " $ALL_INPROGRESS_IDS " | grep -qF " $bn "; then
+    if ! printf '%s' " $ALL_INPROGRESS_IDS " | grep -F " $bn " >/dev/null; then
         rm -f "$tf"
     fi
 done
@@ -1406,7 +1406,7 @@ done
 for rf in "$RESUMEDIR"/*; do
     [ -f "$rf" ] || continue
     bn="$(basename "$rf")"
-    if ! printf '%s' " $ALL_INPROGRESS_IDS " | grep -qF " $bn "; then
+    if ! printf '%s' " $ALL_INPROGRESS_IDS " | grep -F " $bn " >/dev/null; then
         rm -f "$rf"
     fi
 done
@@ -1476,10 +1476,10 @@ while IFS='|' read -r bead_id assignee age_secs title labels active_window; do
             [ -z "$gate_blocked_cmd" ] && gate_blocked_cmd="(comando não determinado — veja gc session peek $gate_reviewer_sess --lines 40)"
             log "$bead_id: EM GATE mas reviewer $gate_reviewer_sess BLOQUEADO-EM-PROMPT ${age_min}min — NÃO suprimindo (ga-lxk26): comando=[$gate_blocked_cmd]"
             gate_failure_markers=""
-            if printf '%s' "$labels" | grep -q "gate:needs-human"; then
+            if printf '%s' "$labels" | grep "gate:needs-human" >/dev/null; then
                 gate_failure_markers="${gate_failure_markers}gate:needs-human "
             fi
-            if printf '%s' "$labels" | grep -q "story:blocked"; then
+            if printf '%s' "$labels" | grep "story:blocked" >/dev/null; then
                 gate_failure_markers="${gate_failure_markers}story:blocked "
             fi
             [ -z "$gate_failure_markers" ] && gate_failure_markers="nenhum"
@@ -1564,7 +1564,7 @@ while IFS='|' read -r bead_id assignee age_secs title labels active_window; do
     sess_status="ausente/desconhecida"
     live_session_name=""
     if [ -n "$assignee" ]; then
-        if printf '%s\n' "$ACTIVE_SESSIONS" | grep -qx "$assignee"; then
+        if printf '%s\n' "$ACTIVE_SESSIONS" | grep -x "$assignee" >/dev/null; then
             sess_status="ativa (responde ao session list)"
             live_session_name="$assignee"
         else
@@ -1768,10 +1768,10 @@ while IFS='|' read -r bead_id assignee age_secs title labels active_window; do
 
     # Failure markers present?
     failure_markers=""
-    if printf '%s' "$labels" | grep -q "gate:needs-human"; then
+    if printf '%s' "$labels" | grep "gate:needs-human" >/dev/null; then
         failure_markers="${failure_markers}gate:needs-human "
     fi
-    if printf '%s' "$labels" | grep -q "story:blocked"; then
+    if printf '%s' "$labels" | grep "story:blocked" >/dev/null; then
         failure_markers="${failure_markers}story:blocked "
     fi
     [ -z "$failure_markers" ] && failure_markers="nenhum"

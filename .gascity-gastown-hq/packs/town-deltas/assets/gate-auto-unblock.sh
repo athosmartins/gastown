@@ -282,7 +282,7 @@ has_own_work() {
     printf 'unknown'
     return 0
   fi
-  if printf '%s' "$out" | grep -q '^+'; then
+  if printf '%s' "$out" | grep '^+' >/dev/null; then
     printf 'yes'
   else
     printf 'no'
@@ -624,7 +624,7 @@ decide() {
   # bug/mesmo fix que last_fail_epoch, mesma chamada bd show.
   verdict="$(printf '%s' "$show_json" \
     | jq -r '[.[0].comments[]?|select((.text//"")|test("VERDICT: FAIL"))]|last|.text // empty' 2>/dev/null)"
-  if printf '%s' "$verdict" | grep -qE '\.(py|sh|go|js|html|json)\b'; then
+  if printf '%s' "$verdict" | grep -E '\.(py|sh|go|js|html|json)\b' >/dev/null; then
     # ⚠️ (revisor, gate-run ga-oaqy39, blocking issue 3): $verdict era
     # extraído e usado SÓ no teste grep -q acima — o texto nunca chegava
     # ao retorno de decide() nem ao comentário de main(), então

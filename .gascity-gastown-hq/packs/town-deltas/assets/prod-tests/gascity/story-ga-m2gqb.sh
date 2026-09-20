@@ -76,7 +76,7 @@ check_live_wired() {
     local label="$1"
     local live; live="$(launchctl print "gui/${UID_N}/${label}" 2>/dev/null)"
     [[ -n "$live" ]] || fail "$label is not loaded in launchd at all"
-    echo "$live" | grep -q "heavy-eval-stagger-lock.sh" \
+    echo "$live" | grep "heavy-eval-stagger-lock.sh" >/dev/null \
         || fail "$label is loaded but its live ProgramArguments do NOT reference heavy-eval-stagger-lock.sh — plist was edited but never reloaded, or reverted"
     log "  $label live-wired through the stagger lock ✓"
 }

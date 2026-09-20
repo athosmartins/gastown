@@ -119,7 +119,7 @@ except Exception as e:
 '
 _creds="$(python3 -c "$_py_extract_creds" 2>&1)"
 
-if printf '%s\n' "$_creds" | grep -q '^ERROR:'; then
+if printf '%s\n' "$_creds" | grep '^ERROR:' >/dev/null; then
   log "ERROR: failed to extract Cloudflare credentials: $_creds"
   notify_fail "cloudflared DNS reconcile: falha ao extrair credenciais do Cloudflare"
   exit 1
@@ -148,7 +148,7 @@ _reconcile_fallback() {
     if [[ $rc -ne 0 ]]; then
       log "FAIL  $host :: $(printf '%s\n' "$out" | tail -1)"
       failed=$((failed+1))
-    elif printf '%s\n' "$out" | grep -qi 'already configured'; then
+    elif printf '%s\n' "$out" | grep -i 'already configured' >/dev/null; then
       ok=$((ok+1))
     else
       log "CREATED $host :: $(printf '%s\n' "$out" | tail -1)"
@@ -195,7 +195,7 @@ log "reconcile start: tunnel=$TUNNEL_ID yaml_hosts=$yaml_count cloudflare_config
 MISSING_HOSTS=""
 while IFS= read -r host; do
   [[ -z "$host" ]] && continue
-  if ! printf '%s\n' "$CF_CONFIGURED" | grep -qxF "$host"; then
+  if ! printf '%s\n' "$CF_CONFIGURED" | grep -xF "$host" >/dev/null; then
     MISSING_HOSTS="${MISSING_HOSTS}${host}"$'\n'
   fi
 done <<< "$YAML_HOSTS"

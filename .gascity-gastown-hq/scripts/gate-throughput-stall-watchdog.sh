@@ -314,7 +314,7 @@ run_sweep() {
   local quota_limited=0
 
   # B1: log-pattern check (fast, Dolt-independent)
-  if echo "$log_lines" | grep -qE "(cota=LIMITED|quota-limited)"; then
+  if echo "$log_lines" | grep -E "(cota=LIMITED|quota-limited)" >/dev/null; then
     quota_limited=1
     log "FALSE-POSITIVE GUARD B1: dispatcher log shows quota-limited — suppressing stall alert"
   fi
@@ -399,7 +399,7 @@ run_sweep() {
   # bracket, so ts_str comes back empty and it's skipped, same as always.)
   local last_passed_epoch=0
   while IFS= read -r line; do
-    if echo "$line" | grep -q "Gate PASSED"; then
+    if echo "$line" | grep "Gate PASSED" >/dev/null; then
       # Timestamp format: [2026-06-23 17:33:31]
       local ts_str; ts_str="$(echo "$line" | grep -oE '\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\]' | tr -d '[]')"
       if [ -n "$ts_str" ]; then
@@ -452,12 +452,12 @@ run_sweep() {
   if [ -n "${GTSW_TEST_SESSIONS+x}" ]; then
     session_output="${GTSW_TEST_SESSIONS}"
     active_reviewer=0
-    if echo "$session_output" | grep -q "gate-reviewer"; then
+    if echo "$session_output" | grep "gate-reviewer" >/dev/null; then
       active_reviewer=1
     fi
   elif command -v "$GC_BIN" >/dev/null 2>&1; then
     session_output="$("$GC_BIN" session list 2>/dev/null)" || session_output=""
-    if echo "$session_output" | grep -q "gate-reviewer"; then
+    if echo "$session_output" | grep "gate-reviewer" >/dev/null; then
       active_reviewer=1
     fi
   else

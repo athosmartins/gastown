@@ -37,7 +37,7 @@ COMPACT_TEST_OUT="$(bash "$CITY/scripts/dolt-compact-routine.selftest.sh" 2>&1)"
   echo "$COMPACT_TEST_OUT" >&2
   fail "dolt-compact-routine.selftest.sh failed against the live tree"
 }
-echo "$COMPACT_TEST_OUT" | grep -qE 'RESULT: PASS=[0-9]+ FAIL=0$' \
+echo "$COMPACT_TEST_OUT" | grep -E 'RESULT: PASS=[0-9]+ FAIL=0$' >/dev/null \
   || fail "dolt-compact-routine.selftest.sh did not report a clean FAIL=0 result:
 $COMPACT_TEST_OUT"
 log "dolt-compact-routine's full suite (including the reseed scenarios) passes clean"
@@ -58,12 +58,12 @@ RESTORE_TEST_OUT="$(bash "$CITY/scripts/dolt-restore-verify.selftest.sh" 2>&1)" 
   echo "$RESTORE_TEST_OUT" >&2
   fail "dolt-restore-verify.selftest.sh failed against the live tree"
 }
-echo "$RESTORE_TEST_OUT" | grep -qE 'RESULT: PASS=[0-9]+ FAIL=0$' \
+echo "$RESTORE_TEST_OUT" | grep -E 'RESULT: PASS=[0-9]+ FAIL=0$' >/dev/null \
   || fail "dolt-restore-verify.selftest.sh did not report a clean FAIL=0 result:
 $RESTORE_TEST_OUT"
 log "dolt-restore-verify's full suite passes clean"
 
-if launchctl list 2>/dev/null | grep -q "com.gascity.dolt-restore-verify"; then
+if launchctl list 2>/dev/null | grep "com.gascity.dolt-restore-verify" >/dev/null; then
   log "com.gascity.dolt-restore-verify is registered with launchd"
 else
   fail "com.gascity.dolt-restore-verify is NOT registered with launchd — the weekly job is not actually scheduled (a present-but-unloaded plist is not automation, see gascity-native-template-fragment-source-location-class gotcha)"

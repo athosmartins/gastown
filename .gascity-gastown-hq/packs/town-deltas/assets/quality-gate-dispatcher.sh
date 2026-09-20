@@ -1009,7 +1009,7 @@ live_sibling_run_for_branch() {
     status=$(printf '%s\n' "$run_json" | jq -r ".[$i].status // \"\"" 2>/dev/null || echo "")
     [ "$status" = "open" ] || continue   # closed/superseded/errored sibling is NEVER live
     desc=$(printf '%s\n' "$run_json" | jq -r ".[$i].description // \"\"" 2>/dev/null || echo "")
-    printf '%s\n' "$desc" | grep -qF "Autonomous gate run for ${branch}." || continue
+    printf '%s\n' "$desc" | grep -F "Autonomous gate run for ${branch}." >/dev/null || continue
     # ga-tvpo6z: candidate's own rig must also be confirmed and equal to ours
     # — same fail-toward-not-yielding direction as the caller-rig check above.
     run_rig=$(printf '%s\n' "$desc" | grep -E '^rig:' | head -1 | sed 's/^rig: *//' || true)
@@ -2207,7 +2207,7 @@ gate_heavy_selftest_floor_minutes() {
     case "$cost" in ''|*[!0-9]*) continue ;; esac
     candidate=$(( cost * 2 + margin ))
     [ "$candidate" -gt "$maxm" ] && candidate="$maxm"
-    if printf '%s\n' "$changed" | grep -qE "(^|/)${pattern}\$"; then
+    if printf '%s\n' "$changed" | grep -E "(^|/)${pattern}\$" >/dev/null; then
       [ "$candidate" -gt "$floor" ] && floor="$candidate"
     fi
   done
@@ -3259,7 +3259,7 @@ gate_rebase_attempt_advanced() {
 # is (ga-kgtiw).
 gate_labels_have_status() {
   local labels="${1:-}"
-  if printf '%s\n' "$labels" | tr ' ' '\n' | grep -q '^gate-status:'; then
+  if printf '%s\n' "$labels" | tr ' ' '\n' | grep '^gate-status:' >/dev/null; then
     printf '1'
   else
     printf '0'
@@ -4994,7 +4994,7 @@ supersede_sibling_runs() {
     sibling_marker=$(parse_marker_id "$sibling_desc")
 
     if [ "$sibling_marker" = "$this_marker" ] || \
-       { [ -n "$bead_id" ] && echo "$sibling_desc" | grep -q "source_bead: $bead_id"; }; then
+       { [ -n "$bead_id" ] && echo "$sibling_desc" | grep "source_bead: $bead_id" >/dev/null; }; then
       log "  Superseding sibling gate-run $sibling_id (marker=$sibling_marker, branch=$branch)"
       set_gate_status "$sibling_id" "superseded"
       bd -C "$GC_CITY" comment "$sibling_id" "Dispatcher: gate-run superseded proactively on terminal path (marker $this_marker reached terminal; branch $branch). No need to wait for 90m TTL fallback. (ga-tmug Vector B)" 2>/dev/null || true
@@ -6199,7 +6199,7 @@ fi
     # FULLY GUARDED: a ledger failure must NEVER affect the gate outcome
     # (every step `|| true` / non-fatal; runs only on a real merge SHA).
     if [ "$DRY_RUN" != "1" ] && [ "${NEEDS_SURVIVAL_LEDGER:-0}" = "1" ] \
-       && printf '%s' "$MERGE_SHA" | grep -Eq '^[0-9a-f]{7,40}$'; then
+       && printf '%s' "$MERGE_SHA" | grep -E '^[0-9a-f]{7,40}$' >/dev/null; then
       SURVIVAL_LEDGER="$GC_CITY/.gc/merge-survival-ledger.jsonl"
       mkdir -p "$GC_CITY/.gc" 2>/dev/null || true
       LEDGER_LINE=$(jq -nc \
@@ -6274,7 +6274,7 @@ fi
       SRC_LABELS=$(printf '%s' "$SRC_JSON" | jq -r '(.labels // []) | join(" ")' 2>/dev/null || echo "")
       BUILDER_ASSIGNEE=$(printf '%s' "$SRC_JSON" | jq -r '.assignee // ""' 2>/dev/null || echo "")
       IS_STORY=0
-      if printf '%s' "$SRC_LABELS" | grep -q "story:approved"; then IS_STORY=1; fi
+      if printf '%s' "$SRC_LABELS" | grep "story:approved" >/dev/null; then IS_STORY=1; fi
 
       # ga-k2wjn: does the source bead's OWN body look like it enumerates
       # multiple approved deliverables? If so, "the gate approved this diff"
@@ -6295,7 +6295,7 @@ fi
       # computation block.
       IS_DAEMON_HOLD=0
       if [ "$IS_STORY" != "1" ]; then
-        if printf '%s' "$SRC_LABELS" | grep -q "scope_covered:all"; then
+        if printf '%s' "$SRC_LABELS" | grep "scope_covered:all" >/dev/null; then
           IS_PARTIAL=0
         else
           SRC_DESC=$(printf '%s' "$SRC_JSON" | jq -r '((.description // "") + "\n" + (.notes // ""))' 2>/dev/null || echo "")
@@ -6335,7 +6335,7 @@ fi
           # non-blocking on purpose — never delivery:partial or
           # scope:needs-review, which HOLD the bead; ga-cjrxh's
           # release-over-hold bias for this class of signal stays intact.
-          if [ "$IS_PARTIAL" != "1" ] && printf '%s' "$PARTIAL_REASON_RAW" | grep -q '^escopo-multiplo:possivel'; then
+          if [ "$IS_PARTIAL" != "1" ] && printf '%s' "$PARTIAL_REASON_RAW" | grep '^escopo-multiplo:possivel' >/dev/null; then
             bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate scope advisory (ga-a7bt6u): $PARTIAL_REASON_RAW" 2>/dev/null || true
             bd -C "$BEAD_CITY" label add "$BEAD_ID" "scope:advisory" -q 2>/dev/null || true
           fi
@@ -6912,7 +6912,7 @@ $DAEMON_HOLD_DETAIL" 2>/dev/null || true
       # a notification emoji/prefix), no state transition depends on it.
       BEAD_LABELS_NOW=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
         | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' 2>/dev/null || echo "")
-      if echo "$BEAD_LABELS_NOW" | grep -q "pilot:dispatched"; then
+      if echo "$BEAD_LABELS_NOW" | grep "pilot:dispatched" >/dev/null; then
         PILOT_ORIGIN=1
       fi
     fi
@@ -7037,7 +7037,7 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
     # so a {1,2} residue still advances toward GATE_FIX_CAP instead of stalling.
     _ATTEMPTS=$(printf '%s' "$SRC_LABELS" | tr ' ' '\n' \
       | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p')
-    if printf '%s\n' "$_ATTEMPTS" | grep -qx 0; then
+    if printf '%s\n' "$_ATTEMPTS" | grep -x 0 >/dev/null; then
       PREV_ATTEMPT=0                                              # reset sentinel → reset wins
     else
       PREV_ATTEMPT=$(printf '%s\n' "$_ATTEMPTS" | sort -n | tail -1)   # else MAX (cap-safe)
@@ -7209,7 +7209,7 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       { source "$GC_CITY/scripts/gc-ledger.sh" 2>/dev/null && \
         gc_ledger_append "human-touch" "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"source_daemon\":\"quality-gate-dispatcher\",\"stage\":\"executa\",\"kind\":\"technical\",\"bead_id\":\"${BEAD_ID}\",\"reason\":\"Gate fix-cap exhausted (${GATE_FIX_CAP} attempts) — circuit-breaker park (armed=$_NH_STATUS)\"}"; } 2>/dev/null || true
       # Escalate EXACTLY once: only mail if gate:needs-human was not already set.
-      if ! printf '%s' "$SRC_LABELS" | grep -q "gate:needs-human"; then
+      if ! printf '%s' "$SRC_LABELS" | grep "gate:needs-human" >/dev/null; then
         _NH_MAIL_SUBJ="Gate needs-human: $BEAD_ID exhausted $GATE_FIX_CAP fix attempts"
         [ "$_NH_STATUS" != "armed" ] && _NH_MAIL_SUBJ="CIRCUIT-BREAKER FAILED TO ARM: $BEAD_ID exhausted $GATE_FIX_CAP fix attempts, NOT protected"
         gc --city "$GC_CITY" mail send mayor \
@@ -7941,7 +7941,7 @@ if { [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; } && [ -n "$BEAD_ID" ]; then
   [ -n "$RIG_PATH" ] && log "  rig='$RIG' unresolved; derived from bead-id prefix '$_bid_prefix' -> $RIG_PATH"
 fi
 # Trailing-segment fallback: mila-wa → wa
-if { [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; } && [ -n "$RIG" ] && printf '%s' "$RIG" | grep -q '-'; then
+if { [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; } && [ -n "$RIG" ] && printf '%s' "$RIG" | grep '-' >/dev/null; then
   _rig_tail="${RIG##*-}"
   RIG_PATH=$(echo "$RIG_LIST_JSON" \
     | jq -r --arg r "$_rig_tail" '.rigs[] | select(.name == $r or .prefix == $r) | .path' 2>/dev/null | head -1 || echo "")
@@ -8225,7 +8225,7 @@ gate_collect_verdicts() {
     # proven discriminator (same check the gt-bewtm headroom janitor uses
     # above in this file): a drained session answers "session not found" on
     # stderr; a genuinely alive-but-slow one answers with real scrollback.
-    if [ "$VB_STATUS" != "closed" ] && echo "$VB_LABELS" | grep -qE "verdict:(PASS|FAIL)"; then
+    if [ "$VB_STATUS" != "closed" ] && echo "$VB_LABELS" | grep -E "verdict:(PASS|FAIL)" >/dev/null; then
       VB_ASSIGNEE=$(echo "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""')
       if [ -n "$VB_ASSIGNEE" ]; then
         VB_PEEK_ERR=$(gc --city "$GC_CITY" session peek "$VB_ASSIGNEE" --lines 1 2>&1 >/dev/null || true)
@@ -8240,9 +8240,9 @@ gate_collect_verdicts() {
     if [ "$VB_STATUS" = "closed" ]; then
       VERDICTS_RECEIVED=$((VERDICTS_RECEIVED + 1))
       gate_check_verdict_identity_link "$VB"
-      if echo "$VB_LABELS" | grep -q "verdict:PASS"; then
+      if echo "$VB_LABELS" | grep "verdict:PASS" >/dev/null; then
         : # explicit PASS — continue
-      elif echo "$VB_LABELS" | grep -q "verdict:FAIL"; then
+      elif echo "$VB_LABELS" | grep "verdict:FAIL" >/dev/null; then
         ANY_FAIL=1
         # Collect the fail reason from the reviewer's verdict comment.
         # NOTE (ga-kf0v): the beads "bd comments --json" schema uses .text
@@ -9243,7 +9243,7 @@ if [ "$NEEDS_REBASE_COUNT" -gt 0 ]; then
           # the merge via git a few lines above.
           gate_release_stale_assignee "$BEAD_ID" 1 \
             || warn "  Step 0a-4: could not release assignee on $BEAD_ID even after lease-aware reclaim (ga-v5acl)."
-          if printf '%s' "$NR_SRC_LABELS" | grep -q "story:approved"; then
+          if printf '%s' "$NR_SRC_LABELS" | grep "story:approved" >/dev/null; then
             # STORY → hand off to story-delivery, same as Step 4b's already-merged
             # path: gate:passed is delivery's pickup signal; do not close here.
             bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:passed" -q 2>/dev/null || true
@@ -9984,11 +9984,11 @@ log "Attempting to claim marker $MARKER_ID ..."
 VERIFY_JSON=$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null || echo "[]")
 VERIFY_LABELS=$(echo "$VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' 2>/dev/null || echo "")
 
-if echo "$VERIFY_LABELS" | grep -q "gate-status:dispatching"; then
+if echo "$VERIFY_LABELS" | grep "gate-status:dispatching" >/dev/null; then
   log "Marker $MARKER_ID already dispatching by another process. Skipping."
   exit 0
 fi
-if ! echo "$VERIFY_LABELS" | grep -q "gate-status:queued"; then
+if ! echo "$VERIFY_LABELS" | grep "gate-status:queued" >/dev/null; then
   log "Marker $MARKER_ID no longer queued (raced away before claim). Skipping."
   exit 0
 fi
@@ -10194,7 +10194,7 @@ fi
 #    (e.g. "digo-adhoc-e2510107f6"), strip the adhoc suffix to get the crew role.
 #    We keep the FULL id as the exclusion target AND the normalized role — a
 #    reviewer session matches if its alias contains either form.
-if [ -n "$AUTHOR" ] && echo "$AUTHOR" | grep -qE "-adhoc-[0-9a-f]+" 2>/dev/null; then
+if [ -n "$AUTHOR" ] && echo "$AUTHOR" | grep -E "-adhoc-[0-9a-f]+" 2>/dev/null >/dev/null; then
   AUTHOR_BASE=$(echo "$AUTHOR" | sed 's/-adhoc-[0-9a-f]*$//')
   log "  Author '$AUTHOR' looks like a session-id; normalized to base role '$AUTHOR_BASE'."
   AUTHOR="$AUTHOR_BASE"
@@ -10202,7 +10202,7 @@ fi
 # wa-worker FAIL normalizer (pilot-rewire): a wa-worker build uses an ephemeral session
 # (wa-worker or wa-worker-<sid>) that has already drained by FAIL time.
 # Route FAIL to the Mayor so the human always gets a signal, never a dead-session nudge.
-if [ -n "$AUTHOR" ] && echo "$AUTHOR" | grep -qE "^wa-worker" 2>/dev/null; then
+if [ -n "$AUTHOR" ] && echo "$AUTHOR" | grep -E "^wa-worker" 2>/dev/null >/dev/null; then
   log "  Author '$AUTHOR' is a wa-worker ephemeral session — routing FAIL nudge to Mayor (the human signal)"
   AUTHOR="mayor"
 fi
@@ -10212,7 +10212,7 @@ fi
 # here even though the work is real and merge-ready. Route its author to the Mayor (the
 # human signal) instead of deferring forever. Without this, every worker-built bead defers
 # permanently at the fail-safe below (observed: wa-14w76/wa-oly1 stuck gate-status:deferred).
-if { [ -z "$AUTHOR" ] || [ "$AUTHOR" = "null" ]; } && echo "$BRANCH" | grep -qE "^crew/wa-worker/" 2>/dev/null; then
+if { [ -z "$AUTHOR" ] || [ "$AUTHOR" = "null" ]; } && echo "$BRANCH" | grep -E "^crew/wa-worker/" 2>/dev/null >/dev/null; then
   log "  Author unresolved but branch '$BRANCH' is an ephemeral wa-worker build — routing author to Mayor."
   AUTHOR="mayor"
 fi
@@ -10595,7 +10595,7 @@ if [ "$ALREADY_MERGED" = "1" ]; then
         SUPERSEDE_SRC_LABELS=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
           | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || echo "")
         SUPERSEDE_IS_STORY=0
-        if printf '%s' "$SUPERSEDE_SRC_LABELS" | grep -q "story:approved"; then SUPERSEDE_IS_STORY=1; fi
+        if printf '%s' "$SUPERSEDE_SRC_LABELS" | grep "story:approved" >/dev/null; then SUPERSEDE_IS_STORY=1; fi
 
         # ga-67hae PILOT-CASCADE FIX: branch already merged → strip story:in-flight so
         # the Pilot lane slot frees. The PASS path strips it at merge (ga-3h8l) but this
@@ -12633,7 +12633,7 @@ if [ -n "$CHANGED_FILES" ]; then
   ANY_CODE=0
   while IFS= read -r f; do
     [ -z "$f" ] && continue
-    if ! echo "$f" | grep -qE "$NON_CODE_PATTERN"; then
+    if ! echo "$f" | grep -E "$NON_CODE_PATTERN" >/dev/null; then
       ANY_CODE=1
       break
     fi
@@ -13278,7 +13278,7 @@ for _ack_attempt in $(seq 1 "$ACK_MAX_RETRIES"); do
     # session-peek check right below on any given poll iteration).
     _vb_labels=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" show "$_vb" --json 2>/dev/null \
       | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || echo "verdict:pending")
-    if ! echo "$_vb_labels" | grep -q "verdict:pending"; then
+    if ! echo "$_vb_labels" | grep "verdict:pending" >/dev/null; then
       REVIEWER_ACKED[$k]=1
       log "  ACK (verdict-progressed): reviewer $((k+1)) session=$_sid bead=$_vb"
       continue

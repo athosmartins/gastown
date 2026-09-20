@@ -108,7 +108,7 @@ NAMED_EXCLUDE_RE='(^|[-_.])(mila|digo|batista|oracle|peter|thies|mayor|deacon|bo
 is_adhoc_eligible() {
   local name="$1" p matched=1
   # hard exclude named/core first — this wins over everything
-  if printf '%s' "$name" | grep -Eq "$NAMED_EXCLUDE_RE"; then return 1; fi
+  if printf '%s' "$name" | grep -E "$NAMED_EXCLUDE_RE" >/dev/null; then return 1; fi
   for p in $ADHOC_PREFIXES; do
     case "$name" in "$p"*) matched=0; break ;; esac
   done

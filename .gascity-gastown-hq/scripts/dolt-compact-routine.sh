@@ -302,7 +302,7 @@ _backup_today_ok() {
     "[$today "*) ;;
     *) echo "latest backup run is not from today ($today): $start_line"; return 1 ;;
   esac
-  if ! printf '%s' "$block" | grep -qE '=== run complete: ok=[0-9]+ failed=0 total=[0-9]+ ==='; then
+  if ! printf '%s' "$block" | grep -E '=== run complete: ok=[0-9]+ failed=0 total=[0-9]+ ===' >/dev/null; then
     local complete_line
     complete_line="$(printf '%s' "$block" | grep -m1 '=== run complete')"
     if [ -z "$complete_line" ]; then
@@ -329,7 +329,7 @@ _backup_today_ok() {
   fi
   while IFS= read -r db; do
     [ -n "$db" ] || continue
-    if ! printf '%s' "$block" | grep -qE "\] ${db}: OK \("; then
+    if ! printf '%s' "$block" | grep -E "\] ${db}: OK \(" >/dev/null; then
       echo "backup block does not list ${db}: OK"
       return 1
     fi

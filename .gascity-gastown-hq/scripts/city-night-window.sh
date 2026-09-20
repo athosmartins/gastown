@@ -85,7 +85,7 @@ city_is_suspended() {
     in_ws && /^[[:space:]]*suspended[[:space:]]*=/ {
       if ($0 ~ /true/) { print "yes"; exit }
     }
-  ' "${CITY}/city.toml" 2>/dev/null | grep -q yes
+  ' "${CITY}/city.toml" 2>/dev/null | grep yes >/dev/null
 }
 
 in_night_window() {

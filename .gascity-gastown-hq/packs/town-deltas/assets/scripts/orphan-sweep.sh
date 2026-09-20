@@ -240,13 +240,13 @@ LIVE_SESSION_IDS=$(jq -r -s '
 
 agent_exists() {
     local candidate="$1"
-    [ -n "$candidate" ] && printf '%s\n' "$AGENTS" | grep -Fxq -- "$candidate"
+    [ -n "$candidate" ] && printf '%s\n' "$AGENTS" | grep -Fx -- "$candidate" >/dev/null
 }
 
 live_session_match() {
     local candidate="$1"
     [ -n "$candidate" ] && [ -n "$LIVE_SESSION_IDS" ] \
-        && printf '%s\n' "$LIVE_SESSION_IDS" | grep -Fxq -- "$candidate"
+        && printf '%s\n' "$LIVE_SESSION_IDS" | grep -Fx -- "$candidate" >/dev/null
 }
 
 # Step 3: Find orphaned beads (assigned to non-existent agents).

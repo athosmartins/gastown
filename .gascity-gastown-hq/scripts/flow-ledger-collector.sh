@@ -91,7 +91,7 @@ _count_log_pattern() {
     [[ "$epoch_ts" -ge "$cutoff" ]] || continue
 
     # Pattern match
-    if echo "$line" | grep -qE "$pattern" 2>/dev/null; then
+    if echo "$line" | grep -E "$pattern" 2>/dev/null >/dev/null; then
       count=$((count+1))
     fi
   done < <(tail -2000 "$logfile" 2>/dev/null || true)

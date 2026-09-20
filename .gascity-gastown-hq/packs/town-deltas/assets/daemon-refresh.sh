@@ -990,7 +990,7 @@ PY
       # attribution (SJ_ATTRIBUTION_KNOWN=0) defaults to attributable, i.e.
       # identical to pre-ga-agracx behavior.
       sj_attributable=1
-      if [ "$SJ_ATTRIBUTION_KNOWN" = "1" ] && ! printf '%s\n' "$SJ_BEAD_OWN_PLISTS" | grep -Fxq "$sj_rel"; then
+      if [ "$SJ_ATTRIBUTION_KNOWN" = "1" ] && ! printf '%s\n' "$SJ_BEAD_OWN_PLISTS" | grep -Fx "$sj_rel" >/dev/null; then
         sj_attributable=0
       fi
       if [ "$sj_broken" = "missing" ]; then
@@ -1818,9 +1818,9 @@ for label in $DAEMON_LABELS; do
   # file is already handled via its own closure above)
   if [ "$affected" -eq 0 ]; then
     for e in $ad_hoc_entries; do
-      if echo "$CHANGED_PY" | grep -qxF "$e"; then affected=1; break; fi
+      if echo "$CHANGED_PY" | grep -xF "$e" >/dev/null; then affected=1; break; fi
       eb="$(basename "$e")"
-      if echo "$CHANGED_BASENAMES" | grep -qxF "$eb"; then affected=1; break; fi
+      if echo "$CHANGED_BASENAMES" | grep -xF "$eb" >/dev/null; then affected=1; break; fi
     done
   fi
 
@@ -1871,7 +1871,7 @@ for label in $DAEMON_LABELS; do
       while IFS= read -r tmpl; do
         [ -n "$tmpl" ] || continue
         tb="$(basename "$tmpl")"
-        if echo "$CHANGED_TEMPLATE_BASENAMES" | grep -qxF "$tb"; then
+        if echo "$CHANGED_TEMPLATE_BASENAMES" | grep -xF "$tb" >/dev/null; then
           affected=1; break
         fi
       done < <(daemon_template_names "$RUNTIME_DIR/$e")
@@ -1896,9 +1896,9 @@ for label in $DAEMON_LABELS; do
   # pass here can never perturb them.
   own_hit=0
   for e in $entries; do
-    if echo "$CHANGED_PY" | grep -qxF "$e"; then own_hit=1; break; fi
+    if echo "$CHANGED_PY" | grep -xF "$e" >/dev/null; then own_hit=1; break; fi
     eb="$(basename "$e")"
-    if echo "$CHANGED_BASENAMES" | grep -qxF "$eb"; then own_hit=1; break; fi
+    if echo "$CHANGED_BASENAMES" | grep -xF "$eb" >/dev/null; then own_hit=1; break; fi
   done
   if [ "$own_hit" -eq 0 ] && [ -n "${CHANGED_TEMPLATE_BASENAMES// /}" ]; then
     for e in $entries; do
@@ -1906,7 +1906,7 @@ for label in $DAEMON_LABELS; do
       while IFS= read -r tmpl; do
         [ -n "$tmpl" ] || continue
         tb="$(basename "$tmpl")"
-        if echo "$CHANGED_TEMPLATE_BASENAMES" | grep -qxF "$tb"; then
+        if echo "$CHANGED_TEMPLATE_BASENAMES" | grep -xF "$tb" >/dev/null; then
           own_hit=1; break
         fi
       done < <(daemon_template_names "$RUNTIME_DIR/$e")
@@ -2098,9 +2098,9 @@ PY
     set +f
 
     for e in $adhoc_entries; do
-      echo "$c_py" | grep -qxF "$e" && return 0
+      echo "$c_py" | grep -xF "$e" >/dev/null && return 0
       eb="$(basename "$e")"
-      echo "$py_basenames" | grep -qxF "$eb" && return 0
+      echo "$py_basenames" | grep -xF "$eb" >/dev/null && return 0
     done
     for stem in $c_stems; do
       for e in $adhoc_entries; do
@@ -2114,7 +2114,7 @@ PY
         while IFS= read -r tmpl; do
           [ -n "$tmpl" ] || continue
           tb="$(basename "$tmpl")"
-          echo "$c_tpl_basenames" | grep -qxF "$tb" && return 0
+          echo "$c_tpl_basenames" | grep -xF "$tb" >/dev/null && return 0
         done < <(daemon_template_names "$RUNTIME_DIR/$e")
       done
     fi

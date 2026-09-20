@@ -47,7 +47,7 @@ log "  close_dead_reviewer_verdicts present ✓"
 
 log "Checking the wrapper is wired specifically into supersede:dead-reviewers..."
 DEAD_ARM="$(sed -n '/supersede:dead-reviewers)/,/;;/p' "$GUARD")"
-printf '%s\n' "$DEAD_ARM" | grep -qF 'close_dead_reviewer_verdicts "$GR_ID"' \
+printf '%s\n' "$DEAD_ARM" | grep -F 'close_dead_reviewer_verdicts "$GR_ID"' >/dev/null \
   || fail "close_dead_reviewer_verdicts is not called inside supersede:dead-reviewers) on the deployed guard"
 log "  wired into supersede:dead-reviewers ✓"
 
