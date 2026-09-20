@@ -146,9 +146,9 @@ LOG="$(run_dispatch)"
 
 echo ""
 echo "Scenario 1: plain chore bead (tt-chore-normal), no ctx:ready — MUST dispatch"
-if echo "$LOG" | grep -qE "(Lane picks|small|big).*tt-chore-normal|tt-chore-normal.*(Lane picks|dispatch)"; then
+if echo "$LOG" | grep -E "(Lane picks|small|big).*tt-chore-normal|tt-chore-normal.*(Lane picks|dispatch)" >/dev/null; then
   ok "tt-chore-normal appears in dispatch picks"
-elif echo "$LOG" | grep -q "tt-chore-normal"; then
+elif echo "$LOG" | grep "tt-chore-normal" >/dev/null; then
   ok "tt-chore-normal referenced in dispatch log (candidate reached the pool)"
 else
   bad "tt-chore-normal NOT referenced anywhere in dispatch log — fix did not make it a candidate"
@@ -158,7 +158,7 @@ fi
 
 echo ""
 echo "Scenario 2: plain task bead (tt-task-normal), no ctx:ready — MUST dispatch"
-if echo "$LOG" | grep -q "tt-task-normal"; then
+if echo "$LOG" | grep "tt-task-normal" >/dev/null; then
   ok "tt-task-normal referenced in dispatch log (candidate reached the pool)"
 else
   bad "tt-task-normal NOT referenced anywhere in dispatch log — fix did not make it a candidate"
@@ -168,7 +168,7 @@ fi
 
 echo ""
 echo "Scenario 3: chore bead labeled type:quality-gate-marker — MUST NOT dispatch"
-if echo "$LOG" | grep -q "tt-chore-gatemarker"; then
+if echo "$LOG" | grep "tt-chore-gatemarker" >/dev/null; then
   bad "REGRESSION: tt-chore-gatemarker appeared in dispatch log — gate-marker bookkeeping bead exposed as a candidate"
 else
   ok "tt-chore-gatemarker NOT in dispatch log (excluded by type:quality-gate-marker)"
@@ -176,7 +176,7 @@ fi
 
 echo ""
 echo "Scenario 4: chore bead labeled ctx:thin — MUST NOT dispatch"
-if echo "$LOG" | grep -q "tt-chore-thin"; then
+if echo "$LOG" | grep "tt-chore-thin" >/dev/null; then
   bad "REGRESSION: tt-chore-thin appeared in dispatch log — under-specified bead dispatched"
 else
   ok "tt-chore-thin NOT in dispatch log (excluded by ctx:thin)"

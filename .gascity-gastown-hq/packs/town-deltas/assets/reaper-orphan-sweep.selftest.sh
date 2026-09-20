@@ -314,10 +314,10 @@ sql "INSERT INTO wisps (id,status,issue_type,created_at,updated_at,closed_at) VA
 : > "$CALLS"; rm -f "$CITY/.gc/runtime/reaper-anomaly-mailed"; echo 999 > "$T/failcount"
 run_reaper FAIL_RE='DELETE FROM `hq`.wisp_events'
 [ "$(field purge_failed_chunks)" = "1" ] && ok "O5b the 200-id chunk failed for good (purge_failed_chunks:1)" || nok "O5b setup: the chunk did not fail" "$OUT"
-printf '%s' "$OUT" | grep -q 'last_error:.*context canceled' && ok "O5b DOG_DONE last_error keeps the CAUSE of a >5 KB failing statement" || nok "O5b the cause was truncated away" "$(printf '%s' "$OUT" | grep -o 'last_error:.*' | cut -c1-300)"
-if printf '%s' "$OUT" | grep -q 'bulk-wisp-'; then nok "O5b the id list leaked into the DOG_DONE line" "$(printf '%s' "$OUT" | grep -o 'last_error:.*' | cut -c1-300)"; else ok "O5b no id list in the DOG_DONE line"; fi
-grep 'mail send' "$CALLS" | grep -q 'context canceled' && ok "O5b the mail names the cause" || nok "O5b the mail lost the cause" "$(grep 'mail send' "$CALLS" | cut -c1-300)"
-if grep 'mail send' "$CALLS" | grep -q 'bulk-wisp-'; then nok "O5b the id list leaked into the mail"; else ok "O5b the mail carries no id list"; fi
+printf '%s' "$OUT" | grep 'last_error:.*context canceled' >/dev/null && ok "O5b DOG_DONE last_error keeps the CAUSE of a >5 KB failing statement" || nok "O5b the cause was truncated away" "$(printf '%s' "$OUT" | grep -o 'last_error:.*' | cut -c1-300)"
+if printf '%s' "$OUT" | grep 'bulk-wisp-' >/dev/null; then nok "O5b the id list leaked into the DOG_DONE line" "$(printf '%s' "$OUT" | grep -o 'last_error:.*' | cut -c1-300)"; else ok "O5b no id list in the DOG_DONE line"; fi
+grep 'mail send' "$CALLS" | grep 'context canceled' >/dev/null && ok "O5b the mail names the cause" || nok "O5b the mail lost the cause" "$(grep 'mail send' "$CALLS" | cut -c1-300)"
+if grep 'mail send' "$CALLS" | grep 'bulk-wisp-' >/dev/null; then nok "O5b the id list leaked into the mail"; else ok "O5b the mail carries no id list"; fi
 : > "$CALLS"; echo 999 > "$T/failcount"
 run_reaper FAIL_RE='DELETE FROM `hq`.wisp_events'     # the same failure on the next run; the anomaly state is kept
 [ "$(mail_count)" = "0" ] && ok "O5b the same failure next run is NOT mailed again (the text is stable, dedupe holds)" || nok "O5b mailed again — the text changes every run" "$(grep 'mail send' "$CALLS" | cut -c1-260)"
@@ -341,7 +341,7 @@ new_db; seed_orphans; : > "$CALLS"; rm -f "$CITY/.gc/runtime/reaper-anomaly-mail
 run_reaper FAIL_RE='SELECT c.issue_id'
 [ "$(field orphan_failed_dbs)" = "1" ] && ok "O7 orphan_failed_dbs:1 — the failure is COUNTED" || nok "O7 a failed sample is silent" "$OUT"
 [ "$(field orphan_swept)" = "0" ] && [ "$(orphans)" = "3,2,4,1" ] && ok "O7 nothing was deleted on a failed sample" || nok "O7 rows deleted" "$(orphans)"
-printf '%s' "$OUT" | grep -q 'last_error:.*context canceled' && ok "O7 the cause is in the summary" || nok "O7 no last_error" "$OUT"
+printf '%s' "$OUT" | grep 'last_error:.*context canceled' >/dev/null && ok "O7 the cause is in the summary" || nok "O7 no last_error" "$OUT"
 [ "$(field anomalies)" -ge 1 ] 2>/dev/null && ok "O7 an anomaly is recorded" || nok "O7 no anomaly" "$OUT"
 
 # ── O8: the detector ──────────────────────────────────────────────────────────
@@ -356,7 +356,7 @@ echo "O9: dry run"
 new_db; seed_orphans; : > "$CALLS"
 run_reaper GC_REAPER_DRY_RUN=1
 [ "$(orphans)" = "3,2,4,1" ] && [ "$(live)" = "3,1,3,1" ] && ok "O9 dry run deletes nothing" || nok "O9 dry run mutated the database" "$(orphans) / $(live)"
-[ "$(field would_sweep)" = "10" ] && printf '%s' "$OUT" | grep -q '(dry run)' && ok "O9 reports would_sweep:10" || nok "O9 dry-run summary" "$OUT"
+[ "$(field would_sweep)" = "10" ] && printf '%s' "$OUT" | grep '(dry run)' >/dev/null && ok "O9 reports would_sweep:10" || nok "O9 dry-run summary" "$OUT"
 
 # ── O10: the kill switch and its validation ───────────────────────────────────
 echo "O10: GC_REAPER_ORPHAN_SWEEP"
@@ -460,7 +460,7 @@ echo "O15: free-disk floor"
 new_db; seed_orphans; : > "$CALLS"; rm -f "$CITY/.gc/runtime/reaper-anomaly-mailed"
 run_reaper FAKE_DF_AVAIL_KB=1048576     # 1 GiB free < the default floor (18 GiB, see O15b)
 [ "$(orphans)" = "3,2,4,1" ] && [ "$(field orphan_swept)" = "0" ] && ok "O15 below the floor: nothing is deleted" || nok "O15 swept below the floor" "$OUT | $(orphans)"
-[ "$(field orphan_halted_dbs)" = "1" ] && printf '%s' "$OUT" | grep -q 'orphan_halt: .*below the floor' && ok "O15 the DOG_DONE line counts it and names the reason" || nok "O15 the halt is silent" "$OUT"
+[ "$(field orphan_halted_dbs)" = "1" ] && printf '%s' "$OUT" | grep 'orphan_halt: .*below the floor' >/dev/null && ok "O15 the DOG_DONE line counts it and names the reason" || nok "O15 the halt is silent" "$OUT"
 [ "$(mail_count)" = "0" ] && ok "O15 low disk is not a mail (the disk guard already alarms)" || nok "O15 mailed" "$(cat "$CALLS")"
 run_reaper FAKE_DF_AVAIL_KB=1048576 GC_REAPER_ORPHAN_MIN_FREE_GB=0
 [ "$(orphans)" = "0,0,0,0" ] && [ "$(field orphan_halted_dbs)" = "0" ] && ok "O15 GC_REAPER_ORPHAN_MIN_FREE_GB=0 switches the guard off" || nok "O15 guard-off" "$OUT | $(orphans)"
@@ -478,7 +478,7 @@ echo "O15b: the default floor is 18 GiB — above the dolt_gc headroom gate"
 new_db; seed_orphans; : > "$CALLS"; rm -f "$CITY/.gc/runtime/reaper-anomaly-mailed"
 run_reaper FAKE_DF_AVAIL_KB=17825792    # 17 GiB free: under the default
 [ "$(orphans)" = "3,2,4,1" ] && [ "$(field orphan_halted_dbs)" = "1" ] && ok "O15b 17 GiB free: the sweep stays inert" || nok "O15b swept under the default floor" "$OUT | $(orphans)"
-printf '%s' "$OUT" | grep -q 'orphan_halt: free disk 17 GiB is below the floor of 18 GiB' && ok "O15b the DOG_DONE line names both numbers" || nok "O15b halt reason" "$OUT"
+printf '%s' "$OUT" | grep 'orphan_halt: free disk 17 GiB is below the floor of 18 GiB' >/dev/null && ok "O15b the DOG_DONE line names both numbers" || nok "O15b halt reason" "$OUT"
 run_reaper FAKE_DF_AVAIL_KB=19922944    # 19 GiB free: above it
 [ "$(orphans)" = "0,0,0,0" ] && [ "$(field orphan_halted_dbs)" = "0" ] && ok "O15b 19 GiB free: the sweep runs" || nok "O15b did not sweep above the default floor" "$OUT | $(orphans)"
 
@@ -521,7 +521,7 @@ echo 999 > "$T/failcount"; rm -f "$CITY/.gc/runtime/reaper-anomaly-mailed"
 run_reaper GC_REAPER_PURGE_BATCH=1 FAIL_RE='DELETE FROM `hq`.wisp_events'
 [ "$(field purge_failed_chunks)" = "3" ] && ok "O17 (setup) the breaker tripped after 3 failed chunks" || nok "O17 setup: the breaker did not trip" "$OUT"
 [ "$(scalar "SELECT COUNT(*) FROM wisp_labels WHERE issue_id='gone-x'")" = "1" ] && [ "$(field orphan_swept)" = "0" ] && ok "O17 the sweep did not run: the orphan is still there" || nok "O17 the sweep piled on an unwell Dolt" "$OUT"
-[ "$(field orphan_halted_dbs)" = "1" ] && printf '%s' "$OUT" | grep -q 'orphan_halt: .*failure breaker' && ok "O17 counted and named in the DOG_DONE line" || nok "O17 the halt is silent" "$OUT"
+[ "$(field orphan_halted_dbs)" = "1" ] && printf '%s' "$OUT" | grep 'orphan_halt: .*failure breaker' >/dev/null && ok "O17 counted and named in the DOG_DONE line" || nok "O17 the halt is silent" "$OUT"
 
 # ── O18: a slow sweep in one database must not eat the PURGE budget of the next ─
 # purge_closed_wisps measures its budget from the start of the script, and the sweep runs inside the

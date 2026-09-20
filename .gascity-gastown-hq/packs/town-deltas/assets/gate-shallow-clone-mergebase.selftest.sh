@@ -120,8 +120,8 @@ fi
 #    ahead of BRANCH_SHA=$(rig_resolve_commit ...). ───────────────────────────
 if [ -f "$GATE" ]; then
   PREFLIGHT_BLOCK="$(awk '/git_rig fetch origin 2>\/dev\/null \|\| warn/{c=1} c{print} /^BRANCH_SHA=/{if(c) exit}' "$GATE" 2>/dev/null || true)"
-  if printf '%s' "$PREFLIGHT_BLOCK" | grep -q -- 'is-shallow-repository' \
-     && printf '%s' "$PREFLIGHT_BLOCK" | grep -q -- 'fetch origin --unshallow'; then
+  if printf '%s' "$PREFLIGHT_BLOCK" | grep -- 'is-shallow-repository' >/dev/null \
+     && printf '%s' "$PREFLIGHT_BLOCK" | grep -- 'fetch origin --unshallow' >/dev/null; then
     ok "dispatcher runs the shallow-clone preflight (is-shallow-repository + fetch --unshallow) before BRANCH_SHA resolution"
   else
     bad "dispatcher is MISSING the shallow-clone preflight ahead of BRANCH_SHA resolution (ga-ymbv regression)"
@@ -137,8 +137,8 @@ fi
 #    clean. ────────────────────────────────────────────────────────────────
 if [ -f "$GATE" ]; then
   MERGE_FF_BLOCK="$(awk '/^[[:space:]]*do_merge_ff\(\) \{/{c=1} c{print} /^[[:space:]]*local IS_ANC/{if(c) exit}' "$GATE" 2>/dev/null || true)"
-  if printf '%s' "$MERGE_FF_BLOCK" | grep -q -- 'is-shallow-repository' \
-     && printf '%s' "$MERGE_FF_BLOCK" | grep -q -- 'fetch origin --unshallow'; then
+  if printf '%s' "$MERGE_FF_BLOCK" | grep -- 'is-shallow-repository' >/dev/null \
+     && printf '%s' "$MERGE_FF_BLOCK" | grep -- 'fetch origin --unshallow' >/dev/null; then
     ok "do_merge_ff() re-checks shallow state before its own ancestry checks (ga-0eh7o)"
   else
     bad "do_merge_ff() is MISSING the shallow-clone re-check before its ancestry checks (ga-0eh7o regression: a repo re-shallowed DURING review would silently fail merge with failed_sha_resolution even though the branch is mergeable)"

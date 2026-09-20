@@ -144,15 +144,15 @@ AWK_SLICE=$(awk '
   /Main moved during review — attempt inline rebase before push/ { exit }
 ' "$DISPATCHER")
 
-if printf '%s' "$AWK_SLICE" | grep -qF 'gate_branch_already_merged "$BRANCH" "$DEFAULT_BRANCH"'; then
+if printf '%s' "$AWK_SLICE" | grep -F 'gate_branch_already_merged "$BRANCH" "$DEFAULT_BRANCH"' >/dev/null; then
   ok "do_merge_ff calls gate_branch_already_merged between the IS_ANC check and the rebase attempt"
 else
   bad "gate_branch_already_merged call NOT found between IS_ANC and the rebase attempt (ga-dpnpu5 fix missing or misplaced)"
 fi
 
-if printf '%s' "$AWK_SLICE" | grep -qF 'MERGE_RESULT="already_merged"' \
-  && printf '%s' "$AWK_SLICE" | grep -qF 'MERGE_SHA="$CUR_BRANCH"' \
-  && printf '%s' "$AWK_SLICE" | grep -qF 'return 0'; then
+if printf '%s' "$AWK_SLICE" | grep -F 'MERGE_RESULT="already_merged"' >/dev/null \
+  && printf '%s' "$AWK_SLICE" | grep -F 'MERGE_SHA="$CUR_BRANCH"' >/dev/null \
+  && printf '%s' "$AWK_SLICE" | grep -F 'return 0' >/dev/null; then
   ok "the short-circuit sets MERGE_SHA, sets MERGE_RESULT=already_merged, and returns 0 (non-failure) before the rebase attempt"
 else
   bad "short-circuit does not set the expected MERGE_SHA/MERGE_RESULT/return 0 triple"

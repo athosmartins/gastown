@@ -97,46 +97,46 @@ run_step3() {
 
 # ── R1 (FIXTURE): FIRST_HALT — no pre-existing retry label ──────────────────
 run_step3 FIRST_HALT ""
-echo "$LAST_BD" | grep -q 'label add ga-test "\?delivery:no-deploy-cmd-retry:1"\?' \
+echo "$LAST_BD" | grep 'label add ga-test "\?delivery:no-deploy-cmd-retry:1"\?' >/dev/null \
   && ok "R1 FIRST_HALT: retry-count bumped to delivery:no-deploy-cmd-retry:1" || nok "R1 retry-count not bumped" "$LAST_BD"
-echo "$LAST_BD" | grep -q "attempt 1/3" \
+echo "$LAST_BD" | grep "attempt 1/3" >/dev/null \
   && ok "R1 FIRST_HALT: comment names the attempt count (1/3)" || nok "R1 comment attempt count" "$LAST_BD"
-! echo "$LAST_BD" | grep -q "no-deploy-cmd-exhausted" \
+! echo "$LAST_BD" | grep "no-deploy-cmd-exhausted" >/dev/null \
   && ok "R1 FIRST_HALT: does NOT escalate yet" || nok "R1 escalated too early" "$LAST_BD"
 [ -z "$LAST_GC" ] && ok "R1 FIRST_HALT: Mayor NOT mailed yet" || nok "R1 unexpected mayor mail" "$LAST_GC"
-echo "$LAST_BD" | grep -q "label add ga-test delivery:failed" \
+echo "$LAST_BD" | grep "label add ga-test delivery:failed" >/dev/null \
   && ok "R1 FIRST_HALT: delivery:failed added (existing behavior preserved)" || nok "R1 delivery:failed missing" "$LAST_BD"
 
 # ── R2 (FIXTURE): MID_RETRY — already at retry:1, this is the 2nd halt ──────
 run_step3 MID_RETRY "delivery:no-deploy-cmd-retry:1"
-echo "$LAST_BD" | grep -q 'label remove ga-test "\?delivery:no-deploy-cmd-retry:1"\?' \
+echo "$LAST_BD" | grep 'label remove ga-test "\?delivery:no-deploy-cmd-retry:1"\?' >/dev/null \
   && ok "R2 MID_RETRY: stale delivery:no-deploy-cmd-retry:1 removed" || nok "R2 stale label not removed" "$LAST_BD"
-echo "$LAST_BD" | grep -q 'label add ga-test "\?delivery:no-deploy-cmd-retry:2"\?' \
+echo "$LAST_BD" | grep 'label add ga-test "\?delivery:no-deploy-cmd-retry:2"\?' >/dev/null \
   && ok "R2 MID_RETRY: retry-count bumped to delivery:no-deploy-cmd-retry:2" || nok "R2 retry-count not bumped" "$LAST_BD"
-! echo "$LAST_BD" | grep -q "no-deploy-cmd-exhausted" \
+! echo "$LAST_BD" | grep "no-deploy-cmd-exhausted" >/dev/null \
   && ok "R2 MID_RETRY: does NOT escalate yet (2 of 3)" || nok "R2 escalated too early" "$LAST_BD"
 [ -z "$LAST_GC" ] && ok "R2 MID_RETRY: Mayor NOT mailed yet" || nok "R2 unexpected mayor mail" "$LAST_GC"
 
 # ── R3 (FIXTURE): CAP_TRIP — already at retry:2, this is the 3rd (=MAX) halt ─
 run_step3 CAP_TRIP "delivery:no-deploy-cmd-retry:2"
-echo "$LAST_BD" | grep -q 'label remove ga-test "\?delivery:no-deploy-cmd-retry:2"\?' \
+echo "$LAST_BD" | grep 'label remove ga-test "\?delivery:no-deploy-cmd-retry:2"\?' >/dev/null \
   && ok "R3 CAP_TRIP: stale delivery:no-deploy-cmd-retry:2 removed" || nok "R3 stale label not removed" "$LAST_BD"
-echo "$LAST_BD" | grep -q "no-deploy-cmd-exhausted" \
+echo "$LAST_BD" | grep "no-deploy-cmd-exhausted" >/dev/null \
   && ok "R3 CAP_TRIP: CAP REACHED -> delivery:no-deploy-cmd-exhausted added" || nok "R3 exhausted label not added" "$LAST_BD"
-echo "$LAST_BD" | grep -q "gate:needs-human" \
+echo "$LAST_BD" | grep "gate:needs-human" >/dev/null \
   && ok "R3 CAP_TRIP: gate:needs-human added (surfaces to a human queue)" || nok "R3 gate:needs-human missing" "$LAST_BD"
-! echo "$LAST_BD" | grep -qE 'label add ga-test "?delivery:no-deploy-cmd-retry:3"?' \
+! echo "$LAST_BD" | grep -E 'label add ga-test "?delivery:no-deploy-cmd-retry:3"?' >/dev/null \
   && ok "R3 CAP_TRIP: no fresh retry label added (retrying stops)" || nok "R3 kept retrying past the cap" "$LAST_BD"
-echo "$LAST_GC" | grep -q "mail send mayor" \
+echo "$LAST_GC" | grep "mail send mayor" >/dev/null \
   && ok "R3 CAP_TRIP: Mayor mailed" || nok "R3 mayor not mailed" "$LAST_GC"
-echo "$LAST_GC" | grep -q "'origin'" \
+echo "$LAST_GC" | grep "'origin'" >/dev/null \
   && ok "R3 CAP_TRIP: mayor mail names the offending rig value" || nok "R3 mayor mail missing rig name" "$LAST_GC"
-echo "$LAST_BD" | grep -q "3/3" \
+echo "$LAST_BD" | grep "3/3" >/dev/null \
   && ok "R3 CAP_TRIP: comment names the final attempt count (3/3)" || nok "R3 comment attempt count" "$LAST_BD"
 
 # ── R4 (CONTROLE): HAPPY_PATH — deploy_cmd resolves normally ────────────────
 run_step3 HAPPY_PATH ""
-! echo "$LAST_BD" | grep -q "delivery:failed" \
+! echo "$LAST_BD" | grep "delivery:failed" >/dev/null \
   && ok "R4 HAPPY_PATH: no delivery:failed (no regression on the working case)" || nok "R4 unexpected delivery:failed" "$LAST_BD"
 [ -z "$LAST_BD" ] && ok "R4 HAPPY_PATH: no bd calls at all (falls through cleanly)" || nok "R4 unexpected bd calls" "$LAST_BD"
 [ -z "$LAST_GC" ] && ok "R4 HAPPY_PATH: no mayor mail" || nok "R4 unexpected mayor mail" "$LAST_GC"

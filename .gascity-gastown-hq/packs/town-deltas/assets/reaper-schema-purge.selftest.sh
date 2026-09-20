@@ -168,9 +168,9 @@ WANT="w-child-open w-closed-parent2 w-issue-child w-old-mail w-old-open w-parent
 [ "$REMAIN" = "$WANT" ] && ok "R1 exactly the right wisps survive" || nok "R1 surviving wisps differ" "got: $REMAIN | want: $WANT"
 [ "$(field purged)" = "5" ] && ok "R1 purged:5 (old task/chore, NULL-closed_at, and the closed parent+child chain)" \
   || nok "R1 summary purged count" "$OUT"
-sql "SELECT 1 FROM wisps WHERE id='w-old-mail'" | grep -q 1 && ok "R1 closed MAIL is never purged (ga-3rqwa)" || nok "R1 closed mail was hard-deleted"
-sql "SELECT 1 FROM wisps WHERE id='w-parent-old'" | grep -q 1 && ok "R1 a closed parent that still has an OPEN child is kept" || nok "R1 closed parent of an open child was purged"
-sql "SELECT 1 FROM wisps WHERE id='w-old-nullclosed'" | grep -q 1 && nok "R1 a closed row with NULL closed_at is immortal" || ok "R1 closed row with NULL closed_at is purged via updated_at"
+sql "SELECT 1 FROM wisps WHERE id='w-old-mail'" | grep 1 >/dev/null && ok "R1 closed MAIL is never purged (ga-3rqwa)" || nok "R1 closed mail was hard-deleted"
+sql "SELECT 1 FROM wisps WHERE id='w-parent-old'" | grep 1 >/dev/null && ok "R1 a closed parent that still has an OPEN child is kept" || nok "R1 closed parent of an open child was purged"
+sql "SELECT 1 FROM wisps WHERE id='w-old-nullclosed'" | grep 1 >/dev/null && nok "R1 a closed row with NULL closed_at is immortal" || ok "R1 closed row with NULL closed_at is purged via updated_at"
 ORPH="$(scalar "SELECT (SELECT COUNT(*) FROM wisp_labels l LEFT JOIN wisps w ON w.id=l.issue_id WHERE w.id IS NULL)
   + (SELECT COUNT(*) FROM wisp_comments c LEFT JOIN wisps w ON w.id=c.issue_id WHERE w.id IS NULL)
   + (SELECT COUNT(*) FROM wisp_events e LEFT JOIN wisps w ON w.id=e.issue_id WHERE w.id IS NULL)
@@ -229,7 +229,7 @@ echo "R5: dry run"
 new_db split; seed_main; : > "$CALLS"
 run_reaper GC_REAPER_DRY_RUN=1
 [ "$(scalar "SELECT COUNT(*) FROM wisps")" = "13" ] && ok "R5 dry run deletes nothing" || nok "R5 dry run mutated the database"
-[ "$(field would_purge)" = "5" ] && printf '%s' "$OUT" | grep -q '(dry run)' && ok "R5 reports would_purge:5" || nok "R5 dry-run summary" "$OUT"
+[ "$(field would_purge)" = "5" ] && printf '%s' "$OUT" | grep '(dry run)' >/dev/null && ok "R5 reports would_purge:5" || nok "R5 dry-run summary" "$OUT"
 
 # ── R6: issue steps on ────────────────────────────────────────────────────────
 echo "R6: GC_REAPER_ISSUE_STEPS=1"

@@ -41,7 +41,7 @@ check_exit() {
 
 check_contains() {
   local desc="$1" haystack="$2" needle_re="$3"
-  if printf '%s' "$haystack" | grep -qE "$needle_re"; then
+  if printf '%s' "$haystack" | grep -E "$needle_re" >/dev/null; then
     echo "PASS: $desc"
     PASS=$((PASS + 1))
   else

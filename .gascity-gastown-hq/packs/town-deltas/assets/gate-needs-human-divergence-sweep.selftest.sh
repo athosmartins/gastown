@@ -233,7 +233,7 @@ if [ -f "$DISPATCHER" ]; then
     | cut -d: -f1)
   _bij_ok=1; _bij_bad_line=""
   for _site in $NEEDS_HUMAN_SITES; do
-    if ! sed -n "${_site},$((_site + 40))p" "$DISPATCHER" | grep -Eq 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"|notify_author_with_fallback'; then
+    if ! sed -n "${_site},$((_site + 40))p" "$DISPATCHER" | grep -E 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"|notify_author_with_fallback' >/dev/null; then
       _bij_ok=0; _bij_bad_line="$_site"; break
     fi
   done

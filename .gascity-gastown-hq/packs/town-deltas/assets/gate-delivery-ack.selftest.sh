@@ -68,12 +68,12 @@ has "$GATE" 'nudge "\$_sid" "\$\{REVIEW_TASKS\[\$k\]\}" --delivery queue' "idle 
 # grepping instead of freezing one single-line literal that the wrapper/warn
 # refactor already broke twice.
 GATE_JOINED=$(awk '{ if (sub(/\\$/, "")) { printf "%s ", $0; next } else { print } }' "$GATE")
-if echo "$GATE_JOINED" | grep -qE 'REVIEW_TASKS\[\$k\]\}" --delivery queue 2>/dev/null[[:space:]]*\|\| warn'; then
+if echo "$GATE_JOINED" | grep -E 'REVIEW_TASKS\[\$k\]\}" --delivery queue 2>/dev/null[[:space:]]*\|\| warn' >/dev/null; then
   ok "re-queue nudge failure is diagnosed via warn, not silently swallowed (ga-vne2)"
 else
   bad "re-queue nudge failure is diagnosed via warn, not silently swallowed (ga-vne2) — pattern not found"
 fi
-if echo "$GATE_JOINED" | grep -qE 'REVIEW_TASKS\[\$k\]\}" --delivery queue 2>/dev/null[[:space:]]*\|\| true([[:space:]]|$)'; then
+if echo "$GATE_JOINED" | grep -E 'REVIEW_TASKS\[\$k\]\}" --delivery queue 2>/dev/null[[:space:]]*\|\| true([[:space:]]|$)' >/dev/null; then
   bad "re-queue nudge does not silently swallow failure — forbidden pattern present: || true"
 else
   ok "re-queue nudge does not silently swallow failure with a bare || true"

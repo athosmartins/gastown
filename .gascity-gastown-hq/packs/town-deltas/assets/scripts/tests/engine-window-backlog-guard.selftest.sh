@@ -145,10 +145,10 @@ NC=$(wc -l < "$NOTIFY_LOG" | tr -d ' ')
 
 echo "── 4. functional: human-readable output lists each patch under its bucket ──"
 OUT1H=$(TEST_SIZE_THRESHOLD=100 TEST_AGE_THRESHOLD_S=2592000 TEST_SEEN_FILE="$WORK/seen-baseline2.json" run_guard)
-printf '%s' "$OUT1H" | grep -q "ga-p1-pending.patch" && ok "ga-p1 listed in human output" || bad "ga-p1 missing from human output"
-printf '%s' "$OUT1H" | grep -q "ga-p2-landed.patch" && ok "ga-p2 listed in human output" || bad "ga-p2 missing from human output"
-printf '%s' "$OUT1H" | grep -q "ga-p3-conflict.patch" && ok "ga-p3 listed in human output" || bad "ga-p3 missing from human output"
-printf '%s' "$OUT1H" | grep -q "ga-p4-marked.patch.APLICADO-20260101" && ok "ga-p4 listed in human output" || bad "ga-p4 missing from human output"
+printf '%s' "$OUT1H" | grep "ga-p1-pending.patch" >/dev/null && ok "ga-p1 listed in human output" || bad "ga-p1 missing from human output"
+printf '%s' "$OUT1H" | grep "ga-p2-landed.patch" >/dev/null && ok "ga-p2 listed in human output" || bad "ga-p2 missing from human output"
+printf '%s' "$OUT1H" | grep "ga-p3-conflict.patch" >/dev/null && ok "ga-p3 listed in human output" || bad "ga-p3 missing from human output"
+printf '%s' "$OUT1H" | grep "ga-p4-marked.patch.APLICADO-20260101" >/dev/null && ok "ga-p4 listed in human output" || bad "ga-p4 missing from human output"
 
 echo "── 5. functional: SIZE threshold breach (backlog=pending+unknown=3 > 2) fires notify ──"
 : > "$NOTIFY_LOG"
@@ -193,8 +193,8 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 OUT6=$(TEST_LOCK_FILE="$LOCK_FOR_TEST" TEST_SIZE_THRESHOLD=1 TEST_AGE_THRESHOLD_S=1 TEST_SEEN_FILE="$WORK/seen-lock.json" run_guard 2>&1) || true
 wait "$HOLDER_PID" 2>/dev/null || true
-printf '%s' "$OUT6" | grep -qi "outra inst" && ok "locked run prints the 'already running' message and exits" || bad "locked run did not report the lock (got: $OUT6)"
-printf '%s' "$OUT6" | grep -q "COMPOSIÇÃO" && bad "locked run still computed a composition -- lock did not actually block work" || ok "locked run computed no composition"
+printf '%s' "$OUT6" | grep -i "outra inst" >/dev/null && ok "locked run prints the 'already running' message and exits" || bad "locked run did not report the lock (got: $OUT6)"
+printf '%s' "$OUT6" | grep "COMPOSIÇÃO" >/dev/null && bad "locked run still computed a composition -- lock did not actually block work" || ok "locked run computed no composition"
 NC6=$(wc -l < "$NOTIFY_LOG" | tr -d ' ')
 [ "$NC6" = "0" ] && ok "locked run made zero notify calls" || bad "locked run made $NC6 notify call(s) -- should be 0"
 
@@ -211,7 +211,7 @@ OUT7=$(TEST_SEEN_FILE="$WORK/seen-badsrc.json" \
 RC7=$?
 set -e
 [ "$RC7" = "2" ] && ok "unreadable SRC_TREE exits 2" || bad "expected exit 2, got $RC7"
-printf '%s' "$OUT7" | grep -qi "ERRO" && ok "unreadable SRC_TREE prints an ERRO, not silent JSON" || bad "no ERRO message on unreadable SRC_TREE (got: $OUT7)"
+printf '%s' "$OUT7" | grep -i "ERRO" >/dev/null && ok "unreadable SRC_TREE prints an ERRO, not silent JSON" || bad "no ERRO message on unreadable SRC_TREE (got: $OUT7)"
 
 echo "── 11. edge case: empty patch dir -> total=0, exit 0, no notify ──"
 EMPTY_CITY="$WORK/empty-city"
@@ -258,7 +258,7 @@ OUT9H=$(env -i PATH="/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin" HOME="$HOME
         ENGINE_WINDOW_GUARD_LOCK="$WORK/other2.lock" \
         NOTIFY_BIN="$FAKE_NOTIFY" NOTIFY_LOG="$NOTIFY_LOG" \
         bash "$SCRIPT")
-printf '%s' "$OUT9H" | grep -q "ga-p9-notes-RECIPE.md" && ok "non-.patch artifact named in human-readable output" || bad "ga-p9-notes-RECIPE.md missing from human output"
+printf '%s' "$OUT9H" | grep "ga-p9-notes-RECIPE.md" >/dev/null && ok "non-.patch artifact named in human-readable output" || bad "ga-p9-notes-RECIPE.md missing from human output"
 
 echo "── 13. regression (gate-feedback ga-tae4f): default relative CITY ('.') still classifies correctly ──"
 # The run_guard() helper above always forces GC_CITY_PATH="$CITY" as an
@@ -306,7 +306,7 @@ OUT11=$(env -i PATH="/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin" HOME="$HOME
         ENGINE_WINDOW_GUARD_LOCK="$WORK/pct.lock" \
         NOTIFY_BIN="$FAKE_NOTIFY" NOTIFY_LOG="$NOTIFY_LOG" \
         bash "$SCRIPT")
-printf '%s' "$OUT11" | grep -qF "ga-p10-100%-done.patch" && ok "'%' in filename printed verbatim, not consumed as a format directive" || bad "'%' in filename corrupted the listing (got: $OUT11)"
+printf '%s' "$OUT11" | grep -F "ga-p10-100%-done.patch" >/dev/null && ok "'%' in filename printed verbatim, not consumed as a format directive" || bad "'%' in filename corrupted the listing (got: $OUT11)"
 
 echo "── 15. static invariant (ga-0ehtp): wrong-location scan never rm/mv's anything ──"
 # Detection-only extends to the new check too: it must only ever read

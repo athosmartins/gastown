@@ -192,10 +192,10 @@ grep -qE 'if \[ -n "\$BEAD_RAW" \]' "$GUARD" \
 # unit-tested end-to-end in the dedicated selftest.
 echo "── 7. drift-guard: ga-oo66/ga-z3i2p — AUTHOR is mailed on Step 5a park (not just commented) ──"
 STEP5A_BLOCK=$(awk '/# ── Step 5a:/{f=1} f{print} f&&/# ── Resolve the store that OWNS the source bead/{exit}' "$GUARD")
-printf '%s\n' "$STEP5A_BLOCK" | grep -Eq 'mail send "\$_park_candidate"' \
+printf '%s\n' "$STEP5A_BLOCK" | grep -E 'mail send "\$_park_candidate"' >/dev/null \
   && ok "Step 5a mails a resolved author candidate on park (ga-oo66/ga-z3i2p)" \
   || bad "Step 5a still only comments — author has no durable park signal (ga-oo66 regression)"
-printf '%s\n' "$STEP5A_BLOCK" | grep -qF 'PARK_NOTIFY_CANDIDATES="$NOTIFY_AUTHOR"' \
+printf '%s\n' "$STEP5A_BLOCK" | grep -F 'PARK_NOTIFY_CANDIDATES="$NOTIFY_AUTHOR"' >/dev/null \
   && ok "Step 5a candidate list is seeded from NOTIFY_AUTHOR (still author-derived, not an arbitrary target)" \
   || bad "Step 5a candidate list no longer seeded from NOTIFY_AUTHOR — may notify the wrong identity"
 # Each park reason (needs-approval, withdraw [ga-360a7l], needs-human) plus
@@ -205,13 +205,13 @@ printf '%s\n' "$STEP5A_BLOCK" | grep -qF 'PARK_NOTIFY_CANDIDATES="$NOTIFY_AUTHOR
 eq "Step 5a covers all 4 park-action branches with a tailored unblock hint" \
   "$(printf '%s\n' "$STEP5A_BLOCK" | grep -c 'UNBLOCK_HINT=')" \
   "4"
-printf '%s\n' "$STEP5A_BLOCK" | grep -qi 'not queued' \
+printf '%s\n' "$STEP5A_BLOCK" | grep -i 'not queued' >/dev/null \
   && ok "Step 5a mail explicitly distinguishes 'parked' from 'queued, reviewers incoming'" \
   || bad "Step 5a mail does not distinguish park from queued — the ga-oo66 root-cause silence survives"
-printf '%s\n' "$STEP5A_BLOCK" | grep -qF 'gc --city "$GC_CITY" mail send mayor' \
+printf '%s\n' "$STEP5A_BLOCK" | grep -F 'gc --city "$GC_CITY" mail send mayor' >/dev/null \
   && ok "Step 5a escalates to mayor when every author candidate fails (ga-z3i2p AC2)" \
   || bad "Step 5a has no mayor-escalation fallback — a total mail failure is silent again"
-printf '%s\n' "$STEP5A_BLOCK" | grep -qF 'bd -C "$GC_CITY" comment "$MARKER_ID"' \
+printf '%s\n' "$STEP5A_BLOCK" | grep -F 'bd -C "$GC_CITY" comment "$MARKER_ID"' >/dev/null \
   && ok "Step 5a leaves a durable marker comment when author-notify fails (ga-z3i2p AC2, second signal)" \
   || bad "Step 5a does not mark the bead on notify failure — 'could not notify' looks identical to 'notified'"
 # Ordering: notify attempt before close, mirroring the comment-then-mail-then-

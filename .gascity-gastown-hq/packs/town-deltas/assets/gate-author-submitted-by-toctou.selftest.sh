@@ -98,7 +98,7 @@ BLOCK="$(awk '
   grab && /^fi$/ { c++; if (c==1) exit }
 ' "$DISPATCHER_SRC")"
 
-if ! printf '%s\n' "$BLOCK" | grep -q 'gate.submitted_by'; then
+if ! printf '%s\n' "$BLOCK" | grep 'gate.submitted_by' >/dev/null; then
   bad "could not isolate the metadata-check block (awk anchor drift?) — skipping B"
 else
   ok "isolated metadata-check block"

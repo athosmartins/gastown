@@ -378,7 +378,7 @@ eq "close_dead_reviewer_verdicts has exactly ONE call site in the guard" \
 # second call site to hide, so it structurally cannot also fire from
 # supersede:marker)/abort:age)/skip).
 G4M18_DEAD_ARM=$(sed -n '/supersede:dead-reviewers)/,/;;/p' "$GUARD")
-printf '%s\n' "$G4M18_DEAD_ARM" | grep -q 'close_dead_reviewer_verdicts "\$GR_ID"' \
+printf '%s\n' "$G4M18_DEAD_ARM" | grep 'close_dead_reviewer_verdicts "\$GR_ID"' >/dev/null \
   && ok "the single call site lives INSIDE the supersede:dead-reviewers arm (acceptance criteria 1+2)" \
   || bad "close_dead_reviewer_verdicts is not called inside supersede:dead-reviewers) — ga-g4m18 acceptance criteria not met"
 
@@ -390,7 +390,7 @@ printf '%s\n' "$G4M18_DEAD_ARM" | grep -q 'close_dead_reviewer_verdicts "\$GR_ID
 MUT_G4M18="$(mktemp)"
 grep -v 'close_dead_reviewer_verdicts "\$GR_ID"' "$GUARD" > "$MUT_G4M18"
 MUT_G4M18_DEAD_ARM=$(sed -n '/supersede:dead-reviewers)/,/;;/p' "$MUT_G4M18")
-if printf '%s\n' "$MUT_G4M18_DEAD_ARM" | grep -q 'close_dead_reviewer_verdicts "\$GR_ID"'; then
+if printf '%s\n' "$MUT_G4M18_DEAD_ARM" | grep 'close_dead_reviewer_verdicts "\$GR_ID"' >/dev/null; then
   bad "mutation-test: stripping the call site did not make the detection logic go red — the check above may be vacuous"
 else
   ok "mutation-test: stripping the call site correctly flips the detection logic red — the check above is not vacuous"
@@ -675,7 +675,7 @@ eq "gap2_query_active_markers EXCLUDES the closed-but-mislabeled marker (ga-4tgg
 # merely somewhere else in the file — DUP_MARKERS_JSON already has it, so a
 # bare file-wide grep would false-pass even with this call site unfixed).
 GAP2_QAM_BODY=$(sed -n '/^gap2_query_active_markers() {/,/^}/p' "$GUARD")
-printf '%s' "$GAP2_QAM_BODY" | grep -q -- '--status open' \
+printf '%s' "$GAP2_QAM_BODY" | grep -- '--status open' >/dev/null \
   && ok "gap2_query_active_markers's own body filters --status open" \
   || bad "gap2_query_active_markers missing --status open in its own body — closed-but-mislabeled markers will false-positive as active (ga-4tgga gate-feedback)"
 
@@ -799,7 +799,7 @@ grep -qF -- "comment ga-fake-parent" "$GAP2_REFUSED_CALLS" \
 # that prose. Caught live while writing this very test (ga-eu75w) — the exact
 # error-vs-empty shape this city's own doctrine warns about: a match must
 # mean what it claims to mean, not just contain the right characters.
-if grep -E -- 'label (add|remove)' "$GAP2_REFUSED_CALLS" | grep -qF -- "needs-human"; then
+if grep -E -- 'label (add|remove)' "$GAP2_REFUSED_CALLS" | grep -F -- "needs-human" >/dev/null; then
   bad "gap2_free_refused_stranded issued a label add/remove naming needs-human — acceptance criterion violated"
 else
   ok "gap2_free_refused_stranded never issues a label mutation naming gate:needs-human*"
@@ -940,7 +940,7 @@ else
     && ok "classify_gap2_bugtask_verdict is called EXACTLY once — one verification path for every parent type" \
     || bad "expected exactly 1 classify_gap2_bugtask_verdict call site in this arm — got $(echo "$GAP1UN0N_ARM_TEXT" | grep -c 'classify_gap2_bugtask_verdict "') (verification path may have been duplicated or is still branch-specific)"
 
-  echo "$GAP1UN0N_ARM_TEXT" | grep -q 'gap2_apply_pass_verdict "\$SC_ID" "\$SLING_ID" "\$GAP2_IS_STORY"' \
+  echo "$GAP1UN0N_ARM_TEXT" | grep 'gap2_apply_pass_verdict "\$SC_ID" "\$SLING_ID" "\$GAP2_IS_STORY"' >/dev/null \
     && ok "the close:merge-verified|close:untracked-delivery arm actually calls gap2_apply_pass_verdict, passing the computed story flag" \
     || bad "gap2_apply_pass_verdict is defined but the case-statement arm never calls it with the computed story flag"
 
@@ -948,7 +948,7 @@ else
   # directly off $SC_ID, outside of any verdict-gated function. If this
   # reappears anywhere in the arm, the bypass is back regardless of what
   # else changed.
-  echo "$GAP1UN0N_ARM_TEXT" | grep -q 'label add "\$SC_ID" "gate:passed"' \
+  echo "$GAP1UN0N_ARM_TEXT" | grep 'label add "\$SC_ID" "gate:passed"' >/dev/null \
     && bad "REGRESSION ga-1un0n: found an UNGATED 'label add \$SC_ID gate:passed' directly in the sweep — this is the exact bypass line the bug reports" \
     || ok "no ungated gate:passed write remains in the sweep — it only happens inside the verdict-gated gap2_apply_pass_verdict"
 fi
@@ -1467,8 +1467,8 @@ grep -q 'close "$sibling_id"'                "$DISPATCHER" && ok "supersede_sibl
 # (A-invariant) gate-status:error is terminal-FAILED but must stay OPEN so
 # gate-health-monitor.py can page a human (ga-piscg). Closing it would blind the
 # escalation — assert NO close follows the error transitions.
-! grep -A2 'set_gate_status "$T_ID" "error"'     "$GUARD" | grep -q 'close "$T_ID"'     && ok "Vector A error marker NOT closed (gate-health-monitor invariant)"    || bad "Vector A error marker is closed — breaks human paging (ga-piscg)"
-! grep -A2 'set_gate_status "$MARKER_ID" "error"' "$GUARD" | grep -q 'close "$MARKER_ID"' && ok "validation-error marker NOT closed (gate-health-monitor invariant)" || bad "validation-error marker is closed — breaks human paging (ga-piscg)"
+! grep -A2 'set_gate_status "$T_ID" "error"'     "$GUARD" | grep 'close "$T_ID"' >/dev/null     && ok "Vector A error marker NOT closed (gate-health-monitor invariant)"    || bad "Vector A error marker is closed — breaks human paging (ga-piscg)"
+! grep -A2 'set_gate_status "$MARKER_ID" "error"' "$GUARD" | grep 'close "$MARKER_ID"' >/dev/null && ok "validation-error marker NOT closed (gate-health-monitor invariant)" || bad "validation-error marker is closed — breaks human paging (ga-piscg)"
 
 # (D-unit) EXERCISE set_gate_status with a mock bd: a bead carrying TWO leaked
 # gate-status labels must end with exactly ONE (the target), non-gate labels kept.
@@ -1489,7 +1489,7 @@ bd() {
     local op="$4" lbl="$6"
     case "$op" in
       remove) _MOCK_LABELS=$(printf '%s\n' $_MOCK_LABELS | grep -vx "$lbl" | tr '\n' ' ' || true) ;;
-      add)    printf '%s\n' $_MOCK_LABELS | grep -qx "$lbl" || _MOCK_LABELS="$_MOCK_LABELS $lbl" ;;
+      add)    printf '%s\n' $_MOCK_LABELS | grep -x "$lbl" >/dev/null || _MOCK_LABELS="$_MOCK_LABELS $lbl" ;;
     esac
     return 0
   fi
@@ -1498,8 +1498,8 @@ bd() {
 set_gate_status fake-bead passed
 _n=$(printf '%s\n' $_MOCK_LABELS | grep -c '^gate-status:' || true)
 eq "exactly ONE gate-status:* label after transition" "$_n" "1"
-printf '%s\n' $_MOCK_LABELS | grep -qx 'gate-status:passed' && ok "surviving gate-status label is the target (passed)" || bad "target label gate-status:passed missing after transition"
-printf '%s\n' $_MOCK_LABELS | grep -qx 'other:keepme'       && ok "non-gate-status labels left untouched"            || bad "set_gate_status clobbered a non-gate-status label"
+printf '%s\n' $_MOCK_LABELS | grep -x 'gate-status:passed' >/dev/null && ok "surviving gate-status label is the target (passed)" || bad "target label gate-status:passed missing after transition"
+printf '%s\n' $_MOCK_LABELS | grep -x 'other:keepme' >/dev/null       && ok "non-gate-status labels left untouched"            || bad "set_gate_status clobbered a non-gate-status label"
 unset -f bd
 
 # (D-unit-2, ga-i0n83) The ADD must run BEFORE the removes — the reverse order
@@ -1529,7 +1529,7 @@ bd() {
     _CALL_LOG="$_CALL_LOG $op:$lbl"
     case "$op" in
       remove) _MOCK_LABELS=$(printf '%s\n' $_MOCK_LABELS | grep -vx "$lbl" | tr '\n' ' ' || true) ;;
-      add)    printf '%s\n' $_MOCK_LABELS | grep -qx "$lbl" || _MOCK_LABELS="$_MOCK_LABELS $lbl" ;;
+      add)    printf '%s\n' $_MOCK_LABELS | grep -x "$lbl" >/dev/null || _MOCK_LABELS="$_MOCK_LABELS $lbl" ;;
     esac
     return 0
   fi
@@ -1714,7 +1714,7 @@ bd() {
     _CALL_LOG="$_CALL_LOG $op:$lbl"
     case "$op" in
       remove) _MOCK_LABELS=$(printf '%s\n' $_MOCK_LABELS | grep -vx "$lbl" | tr '\n' ' ' || true) ;;
-      add)    printf '%s\n' $_MOCK_LABELS | grep -qx "$lbl" || _MOCK_LABELS="$_MOCK_LABELS $lbl" ;;
+      add)    printf '%s\n' $_MOCK_LABELS | grep -x "$lbl" >/dev/null || _MOCK_LABELS="$_MOCK_LABELS $lbl" ;;
     esac
     return 0
   fi

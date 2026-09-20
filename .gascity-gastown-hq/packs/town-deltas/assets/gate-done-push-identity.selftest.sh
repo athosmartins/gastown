@@ -42,7 +42,7 @@ STEP1_SCRIPT=$(awk '
   found && incode { print }
 ' "$GATE_DONE_MD")
 
-if [ -z "$STEP1_SCRIPT" ] || ! printf '%s' "$STEP1_SCRIPT" | grep -q 'git push origin HEAD'; then
+if [ -z "$STEP1_SCRIPT" ] || ! printf '%s' "$STEP1_SCRIPT" | grep 'git push origin HEAD' >/dev/null; then
   echo "FATAL: could not extract Step 1's bash block from $GATE_DONE_MD"
   echo "  (heading '## Step 1: Push your branch' or its \`\`\`bash fence may have moved)."
   exit 1
@@ -102,7 +102,7 @@ else
   bad "Step 1 exited 0 despite the push being rejected by the pre-push hook"
 fi
 
-if printf '%s' "$STEP1_OUT" | grep -q "Push verified"; then
+if printf '%s' "$STEP1_OUT" | grep "Push verified" >/dev/null; then
   bad "Step 1 printed 'Push verified' even though the push was rejected — output:\n$STEP1_OUT"
 else
   ok "Step 1 did not claim 'Push verified' on a rejected push"
@@ -129,7 +129,7 @@ else
   bad "Step 1 failed (exit $HAPPY_RC) on a clean push with nothing rejecting it — output:\n$HAPPY_OUT"
 fi
 
-if printf '%s' "$HAPPY_OUT" | grep -qF "Push verified: $HAPPY_BRANCH present on origin at $HAPPY_SHA"; then
+if printf '%s' "$HAPPY_OUT" | grep -F "Push verified: $HAPPY_BRANCH present on origin at $HAPPY_SHA" >/dev/null; then
   ok "Step 1 printed the expected verified line with the correct sha"
 else
   bad "Step 1 did not print the expected verified line — output:\n$HAPPY_OUT"

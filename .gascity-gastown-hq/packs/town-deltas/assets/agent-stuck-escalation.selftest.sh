@@ -1152,7 +1152,7 @@ GC_CITY_PATH="$WORK/city" GC="$SHIM/gc" BD="$SHIM/bd" NOTIFY_BIN="$SHIM/notify" 
     ESCALATION_STORES="$WORK/city" \
     bash "$SCRIPT" > /dev/null 2>&1
 _new_lines="$(tail -n "+$((_log_before + 1))" "$WORK/city/.gc/logs/agent-stuck-escalation.log")"
-printf '%s' "$_new_lines" | grep -qF "STUCK=3600s" && ok "T50: script's own default is 3600s when STUCK_AGENT_SEC is unset" || bad "T50: expected internal default STUCK=3600s in pass-start log line"
+printf '%s' "$_new_lines" | grep -F "STUCK=3600s" >/dev/null && ok "T50: script's own default is 3600s when STUCK_AGENT_SEC is unset" || bad "T50: expected internal default STUCK=3600s in pass-start log line"
 
 echo "T51: generic escalation mail body leads with confirmation, not destructive action (ga-0xmxt wording change)"
 echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
@@ -1389,7 +1389,7 @@ git -C "$_gitrepo" checkout -q -
 _cherry_check="$(git -C "$_gitrepo" cherry origin/main HEAD)"
 _naive_ancestor="no"
 git -C "$_gitrepo" merge-base --is-ancestor origin/main HEAD 2>/dev/null && _naive_ancestor="yes"
-printf '%s' "$_cherry_check" | grep -q '^-' && ok "T62 fixture: git cherry correctly says '-' (already upstream)" || bad "T62 fixture setup failed — git cherry did not report '-' (got: $_cherry_check)"
+printf '%s' "$_cherry_check" | grep '^-' >/dev/null && ok "T62 fixture: git cherry correctly says '-' (already upstream)" || bad "T62 fixture setup failed — git cherry did not report '-' (got: $_cherry_check)"
 [ "$_naive_ancestor" = "no" ] && ok "T62 fixture: naive ref-ancestor check says NOT merged — this is the false-alarm shape the fix must not reproduce" || bad "T62 fixture degenerate — origin/main IS a plain ancestor, doesn't exercise the ref-vs-patch-id distinction"
 echo '{"sessions":[{"name":"dog-idle62","state":"active","work_dir":"'"$_gitrepo"'"}]}' > "$SESSIONS_FIXTURE"
 make_transcript_fixture dog-idle62 3600

@@ -188,23 +188,23 @@ if [ -f "$GATE_DONE" ]; then
   src=$(cat "$GATE_DONE")
   step3_src=$(printf '%s\n' "$src" | awk '/^## Step 3:/{flag=1} flag; /^## Step 4:/{flag=0}')
 
-  printf '%s' "$step3_src" | grep -qF 'pilot.sling_bead' \
+  printf '%s' "$step3_src" | grep -F 'pilot.sling_bead' >/dev/null \
     && ok "(G1) gate-done.md Step 3 reads pilot.sling_bead to find the calling sling" \
     || bad "(G1) gate-done.md Step 3 missing pilot.sling_bead lookup (ga-6lwpy regression)"
 
-  printf '%s' "$step3_src" | grep -qF '"$_SLING_BEAD_ID" != "$BEAD_ID"' \
+  printf '%s' "$step3_src" | grep -F '"$_SLING_BEAD_ID" != "$BEAD_ID"' >/dev/null \
     && ok "(G2) gate-done.md excludes the rig-native self-referential case (sling_bead==story_id)" \
     || bad "(G2) gate-done.md missing the rig-native exclusion -- would try to close the STORY bead"
 
-  printf '%s' "$step3_src" | grep -qF '$_SLING_STATUS" = "in_progress"' \
+  printf '%s' "$step3_src" | grep -F '$_SLING_STATUS" = "in_progress"' >/dev/null \
     && ok "(G3) gate-done.md only closes an in_progress sling" \
     || bad "(G3) gate-done.md missing the in_progress guard before closing"
 
-  printf '%s' "$step3_src" | grep -qF '_SLING_IS_MINE' \
+  printf '%s' "$step3_src" | grep -F '_SLING_IS_MINE' >/dev/null \
     && ok "(G4) gate-done.md verifies the sling is assigned to the CALLING session before closing" \
     || bad "(G4) gate-done.md missing the assignee/identity check -- could close another session's claim"
 
-  printf '%s' "$step3_src" | grep -qF 'bd -C "$GC_CITY_PATH" close "$_SLING_BEAD_ID"' \
+  printf '%s' "$step3_src" | grep -F 'bd -C "$GC_CITY_PATH" close "$_SLING_BEAD_ID"' >/dev/null \
     && ok "(G5) gate-done.md closes the sling bead in GC_CITY_PATH (gc sling always creates task beads in HQ)" \
     || bad "(G5) gate-done.md missing (or mis-scoped) the actual bd close call"
 

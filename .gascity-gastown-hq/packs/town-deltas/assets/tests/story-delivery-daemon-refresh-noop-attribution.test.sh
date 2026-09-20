@@ -342,15 +342,15 @@ EOF
 # ── T1: no-op pull, own merge is docs-only → NOT blamed (repro wa-ibaqq) ─────
 run_block docs correct
 [ "$RUN_RC" -eq 0 ] && ok "T1 block runs clean (rc=0)" || nok "T1 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=1" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=1" >/dev/null \
   && ok "T1 own-merge-only probe classified inert (docs-only)" \
   || nok "T1 inert classification" "$LOG_OUT"
 [ "$REACHED" -eq 1 ] && ok "T1 block falls through past the verdict (no continue) — delivery proceeds" \
   || nok "T1 fell through" "REACHED=$REACHED"
-! echo "$BD_CALLS" | grep -q "delivery:failed" \
+! echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && ok "T1 delivery:failed NOT added — innocent story not blamed" \
   || nok "T1 no failed-label" "$BD_CALLS"
-echo "$GC_CALLS" | grep -q "session nudge mayor" \
+echo "$GC_CALLS" | grep "session nudge mayor" >/dev/null \
   && ok "T1 Mayor still nudged — real staleness (C1) not silenced" \
   || nok "T1 mayor nudged" "$GC_CALLS"
 
@@ -358,12 +358,12 @@ echo "$GC_CALLS" | grep -q "session nudge mayor" \
 #        tests/docs/md path either) → NOT blamed (repro wa-mjpjs) ───────────
 run_block harmless correct
 [ "$RUN_RC" -eq 0 ] && ok "T2 block runs clean (rc=0)" || nok "T2 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=1" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=1" >/dev/null \
   && ok "T2 own-merge-only probe classified inert (harmless script, real reachability not a path pattern)" \
   || nok "T2 inert classification" "$LOG_OUT"
 [ "$REACHED" -eq 1 ] && ok "T2 block falls through past the verdict — delivery proceeds" \
   || nok "T2 fell through" "REACHED=$REACHED"
-! echo "$BD_CALLS" | grep -q "delivery:failed" \
+! echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && ok "T2 delivery:failed NOT added — innocent story not blamed" \
   || nok "T2 no failed-label" "$BD_CALLS"
 # ga-nuou9v (ACEITE 3): T2's own delta is scripts/cron_only.py — NOT
@@ -371,10 +371,10 @@ echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=1" \
 # claim "tests/docs/md-only" for it; that would be a false, specific factual
 # claim about a delta that plainly isn't. It must give the real reason this
 # delta was judged inert instead (it reaches no live daemon).
-! echo "$GC_CALLS" | grep -q "tests/docs/md-only" \
+! echo "$GC_CALLS" | grep "tests/docs/md-only" >/dev/null \
   && ok "T2 nudge message does not falsely claim tests/docs/md-only for a non-tests/docs delta" \
   || nok "T2 nudge wording (false tests/docs/md-only claim)" "$GC_CALLS"
-echo "$GC_CALLS" | grep -q "confirmed to reach no live daemon" \
+echo "$GC_CALLS" | grep "confirmed to reach no live daemon" >/dev/null \
   && ok "T2 nudge message gives the real, accurate reason" \
   || nok "T2 nudge wording (accurate reason)" "$GC_CALLS"
 
@@ -383,15 +383,15 @@ echo "$GC_CALLS" | grep -q "confirmed to reach no live daemon" \
 run_block sensitive correct
 [ "$RUN_RC" -eq 0 ] && ok "T3 block runs clean (rc=0; continue-based halt, BD state is the signal)" \
   || nok "T3 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=0" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=0" >/dev/null \
   && ok "T3 own-merge-only probe classified NOT inert (control)" \
   || nok "T3 inert classification" "$LOG_OUT"
 [ "$REACHED" -eq 0 ] && ok "T3 block halts via continue (does not fall through)" \
   || nok "T3 halted" "REACHED=$REACHED"
-echo "$BD_CALLS" | grep -q "label add ga-test delivery:failed" \
+echo "$BD_CALLS" | grep "label add ga-test delivery:failed" >/dev/null \
   && ok "T3 delivery:failed added — this story's own merge IS the cause" \
   || nok "T3 failed-label" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "label add ga-test delivery:deploy-pending" \
+echo "$BD_CALLS" | grep "label add ga-test delivery:deploy-pending" >/dev/null \
   && ok "T3 delivery:deploy-pending added" \
   || nok "T3 deploy-pending" "$BD_CALLS"
 
@@ -400,12 +400,12 @@ echo "$BD_CALLS" | grep -q "label add ga-test delivery:deploy-pending" \
 #        behavior (Mayor's required test: "merge sem base gravada") ────────
 run_block docs missing 0 1
 [ "$RUN_RC" -eq 0 ] && ok "T4 block runs clean (rc=0)" || nok "T4 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=unknown" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=unknown" >/dev/null \
   && ok "T4 absent pre_merge_main → inert stays unknown (never guessed)" \
   || nok "T4 inert classification" "$LOG_OUT"
 [ "$REACHED" -eq 0 ] && ok "T4 block halts via continue (falls back to existing blame behavior)" \
   || nok "T4 halted" "REACHED=$REACHED"
-echo "$BD_CALLS" | grep -q "label add ga-test delivery:failed" \
+echo "$BD_CALLS" | grep "label add ga-test delivery:failed" >/dev/null \
   && ok "T4 delivery:failed added — unknown attribution defaults to blame, not exemption" \
   || nok "T4 failed-label" "$BD_CALLS"
 
@@ -422,12 +422,12 @@ echo "$BD_CALLS" | grep -q "label add ga-test delivery:failed" \
 run_block docs correct 1 1
 [ "$RUN_RC" -eq 0 ] && ok "T5 block runs clean despite merge-own probe crash/timeout (rc=0)" \
   || nok "T5 rc — merge-own probe crash killed the whole block instead of falling back" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=unknown" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=unknown" >/dev/null \
   && ok "T5 unparseable probe output → inert stays unknown (never guessed)" \
   || nok "T5 inert classification" "$LOG_OUT"
 [ "$REACHED" -eq 0 ] && ok "T5 block halts via continue (falls back to existing blame behavior, does not crash)" \
   || nok "T5 halted" "REACHED=$REACHED"
-echo "$BD_CALLS" | grep -q "label add ga-test delivery:failed" \
+echo "$BD_CALLS" | grep "label add ga-test delivery:failed" >/dev/null \
   && ok "T5 delivery:failed added — unknown attribution defaults to blame, not exemption" \
   || nok "T5 failed-label" "$BD_CALLS"
 
@@ -437,12 +437,12 @@ echo "$BD_CALLS" | grep -q "label add ga-test delivery:failed" \
 #        original "unusable base" coverage under the new mechanism) ───────
 run_block docs garbage 0 1
 [ "$RUN_RC" -eq 0 ] && ok "T6 block runs clean (rc=0)" || nok "T6 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=unknown" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=unknown" >/dev/null \
   && ok "T6 unresolvable pre_merge_main → inert stays unknown (never guessed)" \
   || nok "T6 inert classification" "$LOG_OUT"
 [ "$REACHED" -eq 0 ] && ok "T6 block halts via continue (falls back to existing blame behavior)" \
   || nok "T6 halted" "REACHED=$REACHED"
-echo "$BD_CALLS" | grep -q "label add ga-test delivery:failed" \
+echo "$BD_CALLS" | grep "label add ga-test delivery:failed" >/dev/null \
   && ok "T6 delivery:failed added — unknown attribution defaults to blame, not exemption" \
   || nok "T6 failed-label" "$BD_CALLS"
 
@@ -455,12 +455,12 @@ echo "$BD_CALLS" | grep -q "label add ga-test delivery:failed" \
 #        true pre-story base) and wrongly exempt this story. ─────────────
 run_block two_commit correct 0 1
 [ "$RUN_RC" -eq 0 ] && ok "T7 block runs clean (rc=0)" || nok "T7 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=0" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=0" >/dev/null \
   && ok "T7 multi-commit own-merge probe classified NOT inert (pre_merge_main spans both commits)" \
   || nok "T7 inert classification" "$LOG_OUT"
 [ "$REACHED" -eq 0 ] && ok "T7 block halts via continue (does not fall through)" \
   || nok "T7 halted" "REACHED=$REACHED"
-echo "$BD_CALLS" | grep -q "label add ga-test delivery:failed" \
+echo "$BD_CALLS" | grep "label add ga-test delivery:failed" >/dev/null \
   && ok "T7 delivery:failed added — earlier commit (C2) in this story's own branch IS the cause" \
   || nok "T7 failed-label" "$BD_CALLS"
 
@@ -475,15 +475,15 @@ echo "$BD_CALLS" | grep -q "label add ga-test delivery:failed" \
 #        amount of retrying could ever have changed that outcome. ─────────
 run_block scheduled_only correct
 [ "$RUN_RC" -eq 0 ] && ok "T8 block runs clean (rc=0)" || nok "T8 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=1" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=1" >/dev/null \
   && ok "T8 own-merge-only probe classified inert (reaches only a not-running scheduled job)" \
   || nok "T8 inert classification" "$LOG_OUT"
 [ "$REACHED" -eq 1 ] && ok "T8 block falls through past the verdict — delivery proceeds" \
   || nok "T8 fell through" "REACHED=$REACHED"
-! echo "$BD_CALLS" | grep -q "delivery:failed" \
+! echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && ok "T8 delivery:failed NOT added — a self-healing scheduled job is not a reason to hold" \
   || nok "T8 no failed-label" "$BD_CALLS"
-echo "$GC_CALLS" | grep -q "session nudge mayor" \
+echo "$GC_CALLS" | grep "session nudge mayor" >/dev/null \
   && ok "T8 Mayor still nudged — real staleness (C1) not silenced" \
   || nok "T8 mayor nudged" "$GC_CALLS"
 
@@ -497,12 +497,12 @@ echo "$GC_CALLS" | grep -q "session nudge mayor" \
 run_block mixed_sensitive_scheduled correct
 [ "$RUN_RC" -eq 0 ] && ok "T9 block runs clean (rc=0; continue-based halt, BD state is the signal)" \
   || nok "T9 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=0" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=0" >/dev/null \
   && ok "T9 own-merge-only probe classified NOT inert (live daemon survives the subtraction)" \
   || nok "T9 inert classification" "$LOG_OUT"
 [ "$REACHED" -eq 0 ] && ok "T9 block halts via continue (does not fall through)" \
   || nok "T9 halted" "REACHED=$REACHED"
-echo "$BD_CALLS" | grep -q "label add ga-test delivery:failed" \
+echo "$BD_CALLS" | grep "label add ga-test delivery:failed" >/dev/null \
   && ok "T9 delivery:failed added — the live daemon in this story's own merge IS a real cause" \
   || nok "T9 failed-label" "$BD_CALLS"
 
@@ -521,21 +521,21 @@ echo "$BD_CALLS" | grep -q "label add ga-test delivery:failed" \
 #        text, which is actively wrong here — nothing ever ran to crash). ──
 run_block job_not_installed correct
 [ "$RUN_RC" -eq 0 ] && ok "T10 block runs clean (rc=0)" || nok "T10 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=0" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=0" >/dev/null \
   && ok "T10 own-merge-only probe classified NOT inert — JOB_NOT_INSTALLED never counts as self-heal" \
   || nok "T10 inert classification" "$LOG_OUT"
 [ "$REACHED" -eq 0 ] && ok "T10 block halts via continue — delivery is held, not exonerated" \
   || nok "T10 halted" "REACHED=$REACHED"
-echo "$BD_CALLS" | grep -q "label add ga-test delivery:failed" \
+echo "$BD_CALLS" | grep "label add ga-test delivery:failed" >/dev/null \
   && ok "T10 delivery:failed added — a never-installed job can never self-heal" \
   || nok "T10 failed-label" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "label add ga-test delivery:deploy-pending" \
+echo "$BD_CALLS" | grep "label add ga-test delivery:deploy-pending" >/dev/null \
   && ok "T10 delivery:deploy-pending added" \
   || nok "T10 deploy-pending" "$BD_CALLS"
-echo "$BD_CALLS" | grep -Eq "launchctl load|launchctl bootstrap" \
+echo "$BD_CALLS" | grep -E "launchctl load|launchctl bootstrap" >/dev/null \
   && ok "T10 ACTION message tells the reader to install the job" \
   || nok "T10 ACTION message (install guidance)" "$BD_CALLS"
-! echo "$BD_CALLS" | grep -q "did not come up fresh" \
+! echo "$BD_CALLS" | grep "did not come up fresh" >/dev/null \
   && ok "T10 ACTION message does NOT use the crash-oriented generic text (nothing ever ran)" \
   || nok "T10 ACTION message (wrong generic text)" "$BD_CALLS"
 

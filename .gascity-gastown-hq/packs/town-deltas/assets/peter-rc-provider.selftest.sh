@@ -44,14 +44,14 @@ rc_block="$(block claude-rc)"
 if [ -z "$rc_block" ]; then
   bad "no [providers.claude-rc] block in city.toml"
 else
-  echo "$rc_block" | grep -q '^base = "builtin:claude"$' \
+  echo "$rc_block" | grep '^base = "builtin:claude"$' >/dev/null \
     && ok "claude-rc is built on builtin:claude" || bad "claude-rc is not based on builtin:claude"
-  args_of claude-rc | grep -q -- '--remote-control' \
+  args_of claude-rc | grep -- '--remote-control' >/dev/null \
     && ok "claude-rc.args_append carries --remote-control" || bad "claude-rc.args_append is missing --remote-control"
 fi
 
 echo "── 2. claude-rc adds nothing else that changes behaviour ──"
-if args_of claude-rc | grep -q -E -- '--strict-mcp-config|--mcp-config|--model|--settings|remoteControlAtStartup|--effort|--dangerously'; then
+if args_of claude-rc | grep -E -- '--strict-mcp-config|--mcp-config|--model|--settings|remoteControlAtStartup|--effort|--dangerously' >/dev/null; then
   bad "claude-rc.args_append carries a flag beyond --remote-control: $(args_of claude-rc)"
 else
   ok "claude-rc.args_append is only the RC flag (Mayor/crew MCP surface, model and permissions untouched)"
@@ -68,12 +68,12 @@ grep -q '^min_active_sessions = 0$' "$PETER_TOML" && grep -q '^max_active_sessio
   && ok "peter-wa session caps unchanged (min 0 / max 1)" || bad "peter-wa min/max_active_sessions changed"
 
 echo "── 4. RC did not leak (Athos 2026-08-30: only Mayor + named crews) ──"
-if args_of claude | grep -q -- '--remote-control'; then
+if args_of claude | grep -- '--remote-control' >/dev/null; then
   bad "plain claude provider carries --remote-control — this would change the Mayor and every crew"
 else
   ok "plain claude provider untouched"
 fi
-if args_of claude-headless | grep -q -- '--remote-control'; then
+if args_of claude-headless | grep -- '--remote-control' >/dev/null; then
   bad "claude-headless carries --remote-control — pool/autonomous roles must stay headless"
 else
   ok "claude-headless has no --remote-control (pool roles stay headless)"

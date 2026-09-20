@@ -40,7 +40,7 @@ eq()  { if [ "$2" = "$3" ]; then ok "$1 (=$2)"; else bad "$1: expected [$3], got
 # manual-clear case (a reset stamps :0, which wins) without the MIN stall.
 _attempt() {  # stdin: newline-separated numeric suffixes
   local nums; nums=$(cat)
-  if printf '%s\n' "$nums" | grep -qx 0; then echo 0
+  if printf '%s\n' "$nums" | grep -x 0 >/dev/null; then echo 0
   else printf '%s\n' "$nums" | sort -n | tail -1; fi
 }
 attempt_from_space() { printf '%s' "$1" | tr ' ' '\n' \
@@ -187,13 +187,13 @@ echo "── 7. drift-guard: cap (needs-human) branch ALSO clears in-flight mark
 # and prove it now strips the stale in-flight claim. needs-human still blocks the
 # Pilot (asserted in section 6); this only fixes the lying data-model state.
 CAP_BLOCK="$(awk '/RETRY CAP REACHED/{f=1} f{print} f&&/^    else[[:space:]]*$/{exit}' "$GATE")"
-printf '%s\n' "$CAP_BLOCK" | grep -q 'label remove "\$BEAD_ID" "story:in-flight"' \
+printf '%s\n' "$CAP_BLOCK" | grep 'label remove "\$BEAD_ID" "story:in-flight"' >/dev/null \
   && ok "cap branch clears story:in-flight" \
   || bad "cap branch leaves story:in-flight (ga-5w0hr: bead strands SEM WORKER)"
-printf '%s\n' "$CAP_BLOCK" | grep -q 'label remove "\$BEAD_ID" "pilot:dispatched"' \
+printf '%s\n' "$CAP_BLOCK" | grep 'label remove "\$BEAD_ID" "pilot:dispatched"' >/dev/null \
   && ok "cap branch clears pilot:dispatched" \
   || bad "cap branch leaves pilot:dispatched (stale Pilot claim)"
-printf '%s\n' "$CAP_BLOCK" | grep -Eq 'assign "\$BEAD_ID" ""' \
+printf '%s\n' "$CAP_BLOCK" | grep -E 'assign "\$BEAD_ID" ""' >/dev/null \
   && ok "cap branch clears stale builder assignee" \
   || bad "cap branch leaves stale assignee (hides bead from Pilot _filter_candidates)"
 
@@ -230,7 +230,7 @@ NEEDS_HUMAN_SITES=$(grep -nE '_NH_STATUS=\$\(gate_apply_needs_human "\$BEAD_CITY
   | cut -d: -f1)
 _bij_ok=1; _bij_bad_line=""
 for _site in $NEEDS_HUMAN_SITES; do
-  if ! sed -n "${_site},$((_site + 40))p" "$GATE" | grep -Eq 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"|notify_author_with_fallback'; then
+  if ! sed -n "${_site},$((_site + 40))p" "$GATE" | grep -E 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"|notify_author_with_fallback' >/dev/null; then
     _bij_ok=0; _bij_bad_line="$_site"; break
   fi
 done
@@ -249,7 +249,7 @@ grep -Eq 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"' "$GATE" \
 CAP_MAIL_BLOCK="$(awk '/Escalate EXACTLY once/{f=1} f{print} f&&/^      fi[[:space:]]*$/{exit}' "$GATE")"
 # ga-36ta4: widened to also recognize notify_author_with_fallback() — same
 # reasoning as the bijection fix above.
-printf '%s\n' "$CAP_MAIL_BLOCK" | grep -Eq 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"|notify_author_with_fallback' \
+printf '%s\n' "$CAP_MAIL_BLOCK" | grep -E 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"|notify_author_with_fallback' >/dev/null \
   && ok "cap-exhaustion author-mail is inside the escalate-exactly-once guard" \
   || bad "cap-exhaustion author-mail is OUTSIDE the once-only guard — would spam on re-entry"
 

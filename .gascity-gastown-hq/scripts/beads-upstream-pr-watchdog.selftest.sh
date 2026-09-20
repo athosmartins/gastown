@@ -229,17 +229,17 @@ echo "== discover_tracker_beads (dynamic, no hardcoded map) =="
 
 rows="$(discover_tracker_beads)"
 eq "discovers exactly 3 (PR,bead) rows across both cities" "$(printf '%s\n' "$rows" | grep -c .)" "3"
-if printf '%s' "$rows" | awk -F'\t' '$1=="5439" && $2=="ga-5ksp5"' | grep -q .; then
+if printf '%s' "$rows" | awk -F'\t' '$1=="5439" && $2=="ga-5ksp5"' | grep . >/dev/null; then
   ok "5439 -> ga-5ksp5 discovered in HQ city"
 else
   bad "5439 -> ga-5ksp5 NOT discovered: $rows"
 fi
-if printf '%s' "$rows" | awk -F'\t' '$1=="5439" && $2=="wa-msxg5"' | grep -q .; then
+if printf '%s' "$rows" | awk -F'\t' '$1=="5439" && $2=="wa-msxg5"' | grep . >/dev/null; then
   ok "5439 -> wa-msxg5 discovered in WA city (second tracker, same PR)"
 else
   bad "5439 -> wa-msxg5 NOT discovered: $rows"
 fi
-if printf '%s' "$rows" | awk -F'\t' '$1=="6001" && $2=="ga-6001-tracker"' | grep -q .; then
+if printf '%s' "$rows" | awk -F'\t' '$1=="6001" && $2=="ga-6001-tracker"' | grep . >/dev/null; then
   ok "6001 -> ga-6001-tracker discovered despite deferred status"
 else
   bad "6001 tracker (deferred status) NOT discovered: $rows"

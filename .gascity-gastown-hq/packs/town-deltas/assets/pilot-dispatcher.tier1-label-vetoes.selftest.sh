@@ -135,27 +135,27 @@ OUT="$(run_pipeline "$FIXTURES" "_filter_candidates | _filter_terminal_status | 
 KEPT="$(ids_of "$OUT")"
 echo "  kept: $KEPT"
 
-echo "$KEPT" | grep -q '"tt-tier1-normal"' \
+echo "$KEPT" | grep '"tt-tier1-normal"' >/dev/null \
   && ok "tt-tier1-normal survives (control)" \
   || bad "tt-tier1-normal was dropped — fix over-blocks ordinary Tier-1 work (kept=$KEPT)"
 
-echo "$KEPT" | grep -q '"tt-tier1-next-action-mayor"' \
+echo "$KEPT" | grep '"tt-tier1-next-action-mayor"' >/dev/null \
   && bad "REGRESSION: tt-tier1-next-action-mayor survived (ga-eirlk5 not fixed — the exact ga-1exon4 shape) (kept=$KEPT)" \
   || ok "tt-tier1-next-action-mayor dropped (ga-eirlk5 AC1 closed)"
 
-echo "$KEPT" | grep -q '"tt-tier1-next-action-constroi"' \
+echo "$KEPT" | grep '"tt-tier1-next-action-constroi"' >/dev/null \
   && ok "tt-tier1-next-action-constroi survives (refino routing label is not a veto — AC2)" \
   || bad "tt-tier1-next-action-constroi was dropped — fix over-blocks refino's *-constroi routing convention (kept=$KEPT)"
 
-echo "$KEPT" | grep -q '"tt-tier1-waiting-on"' \
+echo "$KEPT" | grep '"tt-tier1-waiting-on"' >/dev/null \
   && bad "REGRESSION: tt-tier1-waiting-on survived (AC3a not closed) (kept=$KEPT)" \
   || ok "tt-tier1-waiting-on dropped (AC3a closed)"
 
-echo "$KEPT" | grep -q '"tt-tier1-blocked-on"' \
+echo "$KEPT" | grep '"tt-tier1-blocked-on"' >/dev/null \
   && bad "REGRESSION: tt-tier1-blocked-on survived (AC3b not closed) (kept=$KEPT)" \
   || ok "tt-tier1-blocked-on dropped (AC3b closed)"
 
-echo "$KEPT" | grep -q '"tt-tier1-shortdesc"' \
+echo "$KEPT" | grep '"tt-tier1-shortdesc"' >/dev/null \
   && ok "tt-tier1-shortdesc survives (gate (b)'s spec floor stays HQ-Tier-1-exempt — AC4)" \
   || bad "tt-tier1-shortdesc was dropped — fix wrongly applied gate (b)'s spec floor to Tier-1 HQ (kept=$KEPT)"
 
@@ -164,7 +164,7 @@ echo "Scenario 7: negative control — the OLD Tier-1 chain (_filter_candidates 
 echo "  _filter_terminal_status, WITHOUT _filter_label_vetoes) does NOT catch next-action:mayor"
 OUT7="$(run_pipeline "$FIXTURES" "_filter_candidates | _filter_terminal_status")"
 KEPT7="$(ids_of "$OUT7")"
-echo "$KEPT7" | grep -q '"tt-tier1-next-action-mayor"' \
+echo "$KEPT7" | grep '"tt-tier1-next-action-mayor"' >/dev/null \
   && ok "confirms _filter_terminal_status alone never vetoed next-action:mayor — ga-eirlk5 could only be closed by adding _filter_label_vetoes to the chain, not by editing _filter_terminal_status" \
   || bad "unexpected: the old chain (without _filter_label_vetoes) already drops next-action:mayor (kept7=$KEPT7) — is this fixture wrong, or was the bug already fixed elsewhere?"
 

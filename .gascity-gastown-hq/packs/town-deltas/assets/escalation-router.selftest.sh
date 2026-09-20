@@ -309,7 +309,7 @@ if [ -f "$LEDGER_FILE" ] && python3 -c "import json; json.loads(open('$LEDGER_FI
 else
   bad "ledger line is not valid JSON (or file missing)"
 fi
-if [ -f "$LEDGER_FILE" ] && tail -1 "$LEDGER_FILE" | grep -q "Dolt: gate stalled"; then
+if [ -f "$LEDGER_FILE" ] && tail -1 "$LEDGER_FILE" | grep "Dolt: gate stalled" >/dev/null; then
   ok "ledger line carries the original subject"
 else
   bad "ledger line missing original subject"
@@ -381,7 +381,7 @@ grep -q '\-\-rig\|\-r)'              "$ROUTER" && ok "--rig CLI flag present"   
 # build rejects or misreads would go quiet instead of loud).
 _MB_BRACKET_RE='\[[^]]*[^[:print:]][^]]*\]'
 _classifier_src="$(sed -n '/^escalation_classify_topic()/,/^}/p' "$ROUTER" | grep -v '^[[:space:]]*#')"
-printf '%s\n' 'x[óo]y' | LC_ALL=C grep -qE "$_MB_BRACKET_RE"; _mb_ctl_rc=$?
+printf '%s\n' 'x[óo]y' | LC_ALL=C grep -E "$_MB_BRACKET_RE" >/dev/null; _mb_ctl_rc=$?
 _mb_brackets="$(printf '%s\n' "$_classifier_src" | LC_ALL=C grep -nE "$_MB_BRACKET_RE")"; _mb_rc=$?
 if [ -z "$_classifier_src" ]; then
   bad "classifier body not extractable from $ROUTER — the multibyte-bracket guard would pass vacuously"

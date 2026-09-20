@@ -55,7 +55,7 @@ want_ok = active.get("gate-reviewer", 0) == 1 and active.get("gastown.dog", 0) =
 print("RESULT_OK" if want_ok else ("RESULT_BAD got=%r" % (active,)))
 PY
 )"
-if echo "$PY30XI3_OUT" | grep -q "^RESULT_OK"; then
+if echo "$PY30XI3_OUT" | grep "^RESULT_OK" >/dev/null; then
   ok "ga-30xi3: active_sessions() still counts BOTH templates despite one corrupted line"
 else
   bad "ga-30xi3: active_sessions() lost session counts to a decode failure ($PY30XI3_OUT)"

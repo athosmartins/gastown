@@ -530,7 +530,7 @@ RESEED_NOTIFY_LINE="$(grep -i "reseed" "$SCRATCH/fake-notify.log" 2>/dev/null)"
 # the db name, and a whole-log grep would false-pass here even with the
 # reseed-failure notify never implemented at all (caught live while writing
 # this test: the whole-log version passed before the feature existed).
-printf '%s' "$RESEED_NOTIFY_LINE" | grep -q "whatsapp_automation" && ok "notify names which db's reseed failed" || bad "notify should name the failing db, got: $RESEED_NOTIFY_LINE"
+printf '%s' "$RESEED_NOTIFY_LINE" | grep "whatsapp_automation" >/dev/null && ok "notify names which db's reseed failed" || bad "notify should name the failing db, got: $RESEED_NOTIFY_LINE"
 FAKE_RESEED_FAIL_DB=""
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="

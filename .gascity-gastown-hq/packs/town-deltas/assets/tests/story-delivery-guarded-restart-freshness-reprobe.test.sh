@@ -194,16 +194,16 @@ EOF
 run_block stale
 [ "$RUN_RC" -eq 0 ] && ok "T1 block runs clean (rc=0; continue-based halt, BD state is the signal)" \
   || nok "T1 rc" "rc=$RUN_RC"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && ok "T1 delivery IS held (delivery:failed set) — confirmed-stale daemon correctly blocks (the bug this fix closes)" \
   || nok "T1 delivery was wrongly NOT held for a confirmed-stale daemon" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "Delivery HALTED" \
+echo "$BD_CALLS" | grep "Delivery HALTED" >/dev/null \
   && ok "T1 HALT comment posted" \
   || nok "T1 missing HALT comment" "$BD_CALLS"
 [ "$BASELINE_AFTER" = "$EXPECT_C0" ] \
   && ok "T1 rig-wide baseline marker did NOT advance — new branch correctly did not exonerate" \
   || nok "T1 baseline marker unexpectedly changed" "want(unchanged)=$EXPECT_C0 got=$BASELINE_AFTER"
-echo "$LOG_OUT" | grep -q "freshness re-probe" \
+echo "$LOG_OUT" | grep "freshness re-probe" >/dev/null \
   && ok "T1 log shows the freshness re-probe ran" \
   || nok "T1 log does not mention the freshness re-probe" "$LOG_OUT"
 
@@ -211,13 +211,13 @@ echo "$LOG_OUT" | grep -q "freshness re-probe" \
 #    fresh (restarted via some other path) → must exonerate, like before ──
 run_block fresh
 [ "$RUN_RC" -eq 0 ] && ok "T2 block runs clean (rc=0)" || nok "T2 rc" "rc=$RUN_RC log=[$LOG_OUT]"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && nok "T2 delivery WAS held even though the re-probe confirmed it fresh" "$BD_CALLS" \
   || ok "T2 delivery is NOT held (re-probe positively confirmed fresh)"
-echo "$BD_CALLS" | grep -q "Delivery HALTED" \
+echo "$BD_CALLS" | grep "Delivery HALTED" >/dev/null \
   && nok "T2 a HALT comment was wrongly posted" "$BD_CALLS" \
   || ok "T2 no HALT comment posted"
-echo "$GC_CALLS" | grep -q "session nudge mayor" \
+echo "$GC_CALLS" | grep "session nudge mayor" >/dev/null \
   && ok "T2 mayor is still nudged — invariant (b): the gap stays visible/charged" \
   || nok "T2 missing mayor nudge" "$GC_CALLS"
 [ "$BASELINE_AFTER" = "$EXPECT_C2" ] \
@@ -230,7 +230,7 @@ echo "$GC_CALLS" | grep -q "session nudge mayor" \
 run_block unparseable
 [ "$RUN_RC" -eq 0 ] && ok "T3 block runs clean (rc=0; continue-based halt, BD state is the signal)" \
   || nok "T3 rc" "rc=$RUN_RC"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && ok "T3 delivery IS held (unparseable re-probe correctly defaults to NOT fresh)" \
   || nok "T3 delivery was wrongly NOT held on an unparseable re-probe" "$BD_CALLS"
 [ "$BASELINE_AFTER" = "$EXPECT_C0" ] \

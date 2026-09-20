@@ -84,12 +84,12 @@ for LN in $SITE_LINES; do
   # into unrelated code (the next real statement after every site's clear
   # pair is its own `bd ... comment ...` call, still well inside the window).
   WINDOW=$(sed -n "${LN},$((LN + 15))p" "$DISPATCHER")
-  if printf '%s' "$WINDOW" | grep -q 'label remove "\$BEAD_ID" "gate:failed"'; then
+  if printf '%s' "$WINDOW" | grep 'label remove "\$BEAD_ID" "gate:failed"' >/dev/null; then
     ok "site #$SITE_N (line $LN): gate:failed cleared alongside gate:passed write"
   else
     bad "site #$SITE_N (line $LN): gate:failed NOT cleared within 15 lines of the gate:passed write"
   fi
-  if printf '%s' "$WINDOW" | grep -q 'label remove "\$BEAD_ID" "gate:needs-fix"'; then
+  if printf '%s' "$WINDOW" | grep 'label remove "\$BEAD_ID" "gate:needs-fix"' >/dev/null; then
     ok "site #$SITE_N (line $LN): gate:needs-fix cleared alongside gate:passed write"
   else
     bad "site #$SITE_N (line $LN): gate:needs-fix NOT cleared within 15 lines of the gate:passed write"

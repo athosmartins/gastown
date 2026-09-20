@@ -291,22 +291,22 @@ echo "ga-wxwao: post-restart still-unhealthy branch calls escalate_emergency (--
 if [ -f "$SRC" ]; then
   _still_unhealthy_block=$(sed -n '/WARN: Dolt STILL unhealthy after restart/,/^fi$/p' "$SRC")
   if [ -n "$_still_unhealthy_block" ]; then
-    if printf '%s' "$_still_unhealthy_block" | grep -q 'escalate_emergency\.py'; then
+    if printf '%s' "$_still_unhealthy_block" | grep 'escalate_emergency\.py' >/dev/null; then
       ok "still-unhealthy branch calls escalate_emergency.py"
     else
       bad "ga-wxwao regressao: still-unhealthy branch nao chama mais escalate_emergency.py"
     fi
-    if printf '%s' "$_still_unhealthy_block" | grep -q -- '--class town-halted'; then
+    if printf '%s' "$_still_unhealthy_block" | grep -- '--class town-halted' >/dev/null; then
       ok "escalate_emergency call uses --class town-halted (correct sanctioned class)"
     else
       bad "ga-wxwao regressao: escalate_emergency call nao usa --class town-halted"
     fi
-    if printf '%s' "$_still_unhealthy_block" | grep -qE "notify[[:space:]]+-p[[:space:]]+5[[:space:]]+-t[[:space:]]+'Dolt hang-watchdog'"; then
+    if printf '%s' "$_still_unhealthy_block" | grep -E "notify[[:space:]]+-p[[:space:]]+5[[:space:]]+-t[[:space:]]+'Dolt hang-watchdog'" >/dev/null; then
       bad "ga-wxwao regressao: ramo still-unhealthy AINDA chama notify -p 5 direto — dupla notificacao (escalate_emergency ja chama notify internamente)"
     else
       ok "raw ad-hoc 'notify -p 5' call removed from still-unhealthy branch (no double-notify)"
     fi
-    if printf '%s' "$_still_unhealthy_block" | grep -q "NEEDS HUMAN"; then
+    if printf '%s' "$_still_unhealthy_block" | grep "NEEDS HUMAN" >/dev/null; then
       ok "message still says NEEDS HUMAN (human-readable urgency preserved, even though it's no longer load-bearing for notify's own classifier)"
     else
       bad "ga-wxwao: NEEDS HUMAN text lost from the escalation message"

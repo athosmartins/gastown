@@ -364,7 +364,7 @@ if [ "$PCT" = "33.5" ]; then ok "budget % computed (335/1000 = 33.5%)"; else bad
 : > "$FIX/proj-b/session-active2.jsonl"
 exhaust_line -600 "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-active2.jsonl"
 run bash "$SUT" --line
-if [ "$RC" = "0" ] && printf '%s' "$OUT" | grep -q '^QUOTA: not limited — sporadic'; then
+if [ "$RC" = "0" ] && printf '%s' "$OUT" | grep '^QUOTA: not limited — sporadic' >/dev/null; then
   ok "--line single sporadic → 'QUOTA: not limited — sporadic…' (exit 0) (ga-burst)"
 else
   bad "--line single sporadic" "rc=$RC out=$OUT"
@@ -373,7 +373,7 @@ fi
 exhaust_line -240 "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-active2.jsonl"
 exhaust_line -60  "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-active2.jsonl"
 run bash "$SUT" --line
-if [ "$RC" = "2" ] && printf '%s' "$OUT" | grep -q '^QUOTA: LIMITED (session)'; then
+if [ "$RC" = "2" ] && printf '%s' "$OUT" | grep '^QUOTA: LIMITED (session)' >/dev/null; then
   ok "--line burst(2) → 'QUOTA: LIMITED (session)…' (exit 2) (ga-burst)"
 else
   bad "--line burst limited" "rc=$RC out=$OUT"

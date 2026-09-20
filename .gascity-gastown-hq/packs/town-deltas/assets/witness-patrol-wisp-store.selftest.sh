@@ -84,13 +84,13 @@ else
     bad "found unpinned calls in next-iteration: wisp=$UNPINNED_WISP burn=$UNPINNED_BURN update=$UNPINNED_UPDATE"
   fi
 
-  if printf '%s\n' "$STEP_BODY" | grep -q 'show "\$NEXT" --json'; then
+  if printf '%s\n' "$STEP_BODY" | grep 'show "\$NEXT" --json' >/dev/null; then
     ok "next-iteration verifies the pour landed in the right store before assign/burn"
   else
     bad "next-iteration MISSING the post-pour same-store verification"
   fi
 
-  if printf '%s\n' "$STEP_BODY" | grep -q 'rig_root var not supplied'; then
+  if printf '%s\n' "$STEP_BODY" | grep 'rig_root var not supplied' >/dev/null; then
     ok "next-iteration fails safe (mails mayor, exits) when rig_root is empty"
   else
     bad "next-iteration MISSING the empty-rig_root fail-safe guard"
@@ -106,13 +106,13 @@ NEW_SECTION="$(sed -n '/WITNESS: o Startup Protocol/,$p' "$TEMPLATE")"
 if [ -z "$NEW_SECTION" ]; then
   bad "ga-3v2n4 witness correction section not found in town-deltas.template.md"
 else
-  if printf '%s\n' "$NEW_SECTION" | grep -q 'ga-3v2n4'; then
+  if printf '%s\n' "$NEW_SECTION" | grep 'ga-3v2n4' >/dev/null; then
     ok "correction section cites ga-3v2n4"
   else
     bad "correction section present but doesn't cite ga-3v2n4"
   fi
 
-  if printf '%s\n' "$NEW_SECTION" | grep -q 'gc hook'; then
+  if printf '%s\n' "$NEW_SECTION" | grep 'gc hook' >/dev/null; then
     ok "Step 1 replacement uses gc hook (agent-identity resolution, not cwd)"
   else
     bad "Step 1 replacement MISSING gc hook"
@@ -139,7 +139,7 @@ else
     bad "fallback code uses --type=molecule --include-infra only $TYPE_MOLECULE_COUNT times, expected >=2"
   fi
 
-  if printf '%s\n' "$FALLBACK_CODE" | grep -q -- '--type=wisp'; then
+  if printf '%s\n' "$FALLBACK_CODE" | grep -- '--type=wisp' >/dev/null; then
     bad "fallback code REGRESSION: still contains the invalid --type=wisp enum"
   else
     ok "fallback code contains no bare --type=wisp (invalid enum) usage"
@@ -164,12 +164,12 @@ fi
 # ── Scenario 5: the -C pin degrades gracefully AND visibly, never silently ──
 echo ""
 echo "Scenario 5: BD_C is built defensively (empty RigRoot -> no -C, not a crash) and visibly (not silently)"
-if printf '%s\n' "$NEW_SECTION" | grep -q "BD_C=(-C '{{ \.RigRoot }}')"; then
+if printf '%s\n' "$NEW_SECTION" | grep "BD_C=(-C '{{ \.RigRoot }}')" >/dev/null; then
   ok "BD_C falls back to no -C when {{ .RigRoot }} is empty, instead of passing -C ''"
 else
   bad "BD_C construction MISSING or changed shape — verify the empty-RigRoot fallback still holds"
 fi
-if printf '%s\n' "$NEW_SECTION" | grep -q 'WARNING:.*RigRoot.*is empty'; then
+if printf '%s\n' "$NEW_SECTION" | grep 'WARNING:.*RigRoot.*is empty' >/dev/null; then
   ok "empty-RigRoot fallback is VISIBLE (warns to stderr) rather than silent"
 else
   bad "empty-RigRoot fallback is SILENT — third-state violation (degrading without any signal)"

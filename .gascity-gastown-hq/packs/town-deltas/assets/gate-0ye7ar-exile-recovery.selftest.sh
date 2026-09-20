@@ -172,7 +172,7 @@ STUB_MERGE_VERDICT="0"; STUB_ATTEMPT="2"; STUB_SHOW_STILL_EXILED="true"
 MARKERS=$(printf '[%s]' "$(mk m3b "crew/oracle/m3b" "gate-status:queued,gate:exiled-tier5:2")")
 gate_exile_recovery_sweep "$MARKERS"
 if [ -n "$LABEL_REMOVE_LOG" ] && [ -z "$COMMENT_LOG" ] && [ -z "$GATE_EXILE_RECOVERY_CLEARED_IDS" ] \
-   && echo "$WARN_LOG" | grep -qi "still shows it exiled"; then
+   && echo "$WARN_LOG" | grep -i "still shows it exiled" >/dev/null; then
   ok "the label removes were attempted, but the post-removal re-read still shows an exile label — no bead comment was posted claiming a clear that a silent write failure may have prevented, and the marker was NOT excluded from the watchdog's input (verified before claimed, ga-faw5o rounds 2-3 pattern applied here too)"
 else
   bad "expected removals attempted but no false 'cleared' claim, got labels='$LABEL_REMOVE_LOG' comment='$COMMENT_LOG' cleared='$GATE_EXILE_RECOVERY_CLEARED_IDS' warn='$WARN_LOG'"
@@ -184,7 +184,7 @@ STUB_RESOLVE_RC=1
 MARKERS=$(printf '[%s]' "$(mk m4 "crew/oracle/m4" "gate-status:queued,gate:exiled-tier5:1")")
 gate_exile_recovery_sweep "$MARKERS"
 RC=$?
-if [ "$RC" -eq 0 ] && [ -z "$LABEL_REMOVE_LOG" ] && [ -z "$GATE_EXILE_RECOVERY_CLEARED_IDS" ] && echo "$WARN_LOG" | grep -qi "cannot resolve rig context"; then
+if [ "$RC" -eq 0 ] && [ -z "$LABEL_REMOVE_LOG" ] && [ -z "$GATE_EXILE_RECOVERY_CLEARED_IDS" ] && echo "$WARN_LOG" | grep -i "cannot resolve rig context" >/dev/null; then
   ok "unresolvable rig context is skipped (warned, not crashed) — sweep continues past it (rc=$RC)"
 else
   bad "expected a graceful skip, got rc=$RC labels='$LABEL_REMOVE_LOG' warn='$WARN_LOG'"
@@ -195,7 +195,7 @@ reset_stubs
 STUB_RESOLVE_COMMIT=""
 MARKERS=$(printf '[%s]' "$(mk m5 "crew/oracle/m5" "gate-status:queued,gate:exiled-tier5:1")")
 gate_exile_recovery_sweep "$MARKERS"
-if [ -z "$LABEL_REMOVE_LOG" ] && [ -z "$GATE_EXILE_RECOVERY_CLEARED_IDS" ] && echo "$WARN_LOG" | grep -qi "does not resolve"; then
+if [ -z "$LABEL_REMOVE_LOG" ] && [ -z "$GATE_EXILE_RECOVERY_CLEARED_IDS" ] && echo "$WARN_LOG" | grep -i "does not resolve" >/dev/null; then
   ok "unresolvable branch ref (not yet fetched) is skipped, not treated as a false conflict or a crash"
 else
   bad "expected a graceful skip, got labels='$LABEL_REMOVE_LOG' warn='$WARN_LOG'"
@@ -219,7 +219,7 @@ reset_stubs
 STUB_MERGE_VERDICT="0"; STUB_ATTEMPT="3"
 MARKERS=$(printf '[%s]' "$(mk m7 "crew/oracle/m7" "gate-status:queued,gate:rebase-attempt:3")")
 gate_exile_recovery_sweep "$MARKERS"
-if echo "$LABEL_REMOVE_LOG" | grep -q "m7:gate:exiled-tier5:3" && echo "$LABEL_REMOVE_LOG" | grep -q "m7:gate:rebase-attempt:3" \
+if echo "$LABEL_REMOVE_LOG" | grep "m7:gate:exiled-tier5:3" >/dev/null && echo "$LABEL_REMOVE_LOG" | grep "m7:gate:rebase-attempt:3" >/dev/null \
    && [ "$GATE_EXILE_RECOVERY_CLEARED_IDS" = "$(printf '\nm7')" ]; then
   ok "legacy gate:rebase-attempt:N label is still recognized and cleared — a marker exiled before the rename is not silently invisible to recovery either"
 else
@@ -233,9 +233,9 @@ MARKERS=$(printf '[%s,%s,%s]' \
   "$(mk clean_m      "crew/oracle/cleanbranch-c8"   "gate-status:queued,gate:exiled-tier5:2")" \
   "$(mk still_broken "crew/oracle/brokenbranch-b8"  "gate-status:queued,gate:exiled-tier5:2")")
 gate_exile_recovery_sweep "$MARKERS"
-if echo "$LABEL_REMOVE_LOG" | grep -q "clean_m:gate:exiled-tier5" \
-   && ! echo "$LABEL_REMOVE_LOG" | grep -q "still_broken:gate:exiled-tier5" \
-   && ! echo "$LABEL_REMOVE_LOG" | grep -q "healthy:" \
+if echo "$LABEL_REMOVE_LOG" | grep "clean_m:gate:exiled-tier5" >/dev/null \
+   && ! echo "$LABEL_REMOVE_LOG" | grep "still_broken:gate:exiled-tier5" >/dev/null \
+   && ! echo "$LABEL_REMOVE_LOG" | grep "healthy:" >/dev/null \
    && [ "$GATE_EXILE_RECOVERY_CLEARED_IDS" = "$(printf '\nclean_m')" ]; then
   ok "3 markers in one sweep, each handled independently: healthy untouched, clean_m cleared, still_broken left exiled (log='$LABEL_REMOVE_LOG')"
 else

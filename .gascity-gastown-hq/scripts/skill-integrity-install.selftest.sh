@@ -61,9 +61,9 @@ DIR1="$TMP/s1"; mkdir -p "$DIR1"
 mk_plist "$DIR1/newthing.plist" "com.gascity.newthing"
 _is_loaded() { [ "$1" = "__never__" ]; }  # everything reports not-loaded (before AND after install)
 OUT="$(scan_and_install_new_plists "$DIR1" 2>&1)"
-if printf '%s' "$OUT" | grep -q "NEW PLIST detected.*com.gascity.newthing" \
-   && printf '%s' "$OUT" | grep -q "Skipping launchd install for com.gascity.newthing" \
-   && printf '%s' "$OUT" | grep -q "WARNING: installed com.gascity.newthing but launchctl still does not show it loaded"; then
+if printf '%s' "$OUT" | grep "NEW PLIST detected.*com.gascity.newthing" >/dev/null \
+   && printf '%s' "$OUT" | grep "Skipping launchd install for com.gascity.newthing" >/dev/null \
+   && printf '%s' "$OUT" | grep "WARNING: installed com.gascity.newthing but launchctl still does not show it loaded" >/dev/null; then
   ok "new plist detected, install_plist called, post-install re-check correctly WARNs (still not loaded under this mock)"
 else
   bad "expected a NEW PLIST detection + install_plist call + post-install WARNING for com.gascity.newthing" "$OUT"
@@ -124,8 +124,8 @@ mk_plist "$DIR5/first.plist" "com.gascity.first"
 mk_plist "$DIR5/second.plist" "com.gascity.second"
 _is_loaded() { return 1; }
 OUT="$(scan_and_install_new_plists "$DIR5" 2>&1)"
-if printf '%s' "$OUT" | grep -q "com.gascity.first" \
-   && printf '%s' "$OUT" | grep -q "com.gascity.second"; then
+if printf '%s' "$OUT" | grep "com.gascity.first" >/dev/null \
+   && printf '%s' "$OUT" | grep "com.gascity.second" >/dev/null; then
   ok "both new plists installed in the same sweep, neither skipped the other"
 else
   bad "a sweep with 2 new plists must install both, not just the first" "$OUT"
@@ -143,8 +143,8 @@ mk_plist "$DIR6/skill-audit.plist" "com.gascity.skill-audit"
 mk_plist "$DIR6/brandnew.plist" "com.gascity.brandnew"
 _is_loaded() { [ "$1" = "com.gascity.skill-audit" ]; }
 OUT="$(scan_and_install_new_plists "$DIR6" 2>&1)"
-if ! printf '%s' "$OUT" | grep -q "skill-audit" \
-   && printf '%s' "$OUT" | grep -q "com.gascity.brandnew"; then
+if ! printf '%s' "$OUT" | grep "skill-audit" >/dev/null \
+   && printf '%s' "$OUT" | grep "com.gascity.brandnew" >/dev/null; then
   ok "already-loaded hardcoded-elsewhere label untouched; genuinely new sibling still installed"
 else
   bad "loop must not re-touch com.gascity.skill-audit (already installed by the hardcoded call above it), but must still catch a genuinely new sibling plist" "$OUT"
@@ -169,8 +169,8 @@ _is_loaded() {
   [ "$n" -ge 1 ]  # false on 1st call (pre-install check), true on 2nd+ (post-install re-check)
 }
 OUT="$(scan_and_install_new_plists "$DIR7" 2>&1)"
-if printf '%s' "$OUT" | grep -q "NEW PLIST detected.*com.gascity.nowlive" \
-   && printf '%s' "$OUT" | grep -q "VERIFIED: com.gascity.nowlive now loaded"; then
+if printf '%s' "$OUT" | grep "NEW PLIST detected.*com.gascity.nowlive" >/dev/null \
+   && printf '%s' "$OUT" | grep "VERIFIED: com.gascity.nowlive now loaded" >/dev/null; then
   ok "post-install re-check queries launchctl again and reports VERIFIED once it's genuinely loaded"
 else
   bad "post-install check must re-query and report VERIFIED, not just trust install_plist's own exit code" "$OUT"

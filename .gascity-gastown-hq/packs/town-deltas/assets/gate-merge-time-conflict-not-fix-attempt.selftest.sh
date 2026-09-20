@@ -98,7 +98,7 @@ fi
 REBASE_RESULT_LN=$(grep -n 'MERGE_RESULT="failed_merge_time_rebase"' "$DISPATCHER" | head -1 | cut -d: -f1 || true)
 if [ -n "$REBASE_RESULT_LN" ]; then
   REBASE_WINDOW=$(sed -n "${REBASE_RESULT_LN},$((REBASE_RESULT_LN + 5))p" "$DISPATCHER")
-  if printf '%s' "$REBASE_WINDOW" | grep -qF 'GATE_NEEDS_REBASE_NOT_FIX=1'; then
+  if printf '%s' "$REBASE_WINDOW" | grep -F 'GATE_NEEDS_REBASE_NOT_FIX=1' >/dev/null; then
     bad "failed_merge_time_rebase unexpectedly sets GATE_NEEDS_REBASE_NOT_FIX — scope crept beyond the documented ga-m07gc exclusion"
   else
     ok "failed_merge_time_rebase does NOT set GATE_NEEDS_REBASE_NOT_FIX (scope correctly excludes the content-loss-risk case, ga-m07gc)"
@@ -139,12 +139,12 @@ else
   else
     ok "needs-rebase branch contains no 'bd label add/remove' targeting gate:fix-attempt — the counter is provably untouched by this path (mentions of the word in comments/messages are fine — checked the actual label mutations, not prose)"
   fi
-  if printf '%s' "$NR_BODY" | grep -qF 'label add    "$BEAD_ID" "gate:needs-rebase"'; then
+  if printf '%s' "$NR_BODY" | grep -F 'label add    "$BEAD_ID" "gate:needs-rebase"' >/dev/null; then
     ok "needs-rebase branch labels the bead gate:needs-rebase (not gate:needs-fix)"
   else
     bad "needs-rebase branch does not add gate:needs-rebase — wiring missing/renamed"
   fi
-  if printf '%s' "$NR_BODY" | grep -qF 'label add "$BEAD_ID" "gate:needs-fix"'; then
+  if printf '%s' "$NR_BODY" | grep -F 'label add "$BEAD_ID" "gate:needs-fix"' >/dev/null; then
     bad "needs-rebase branch ALSO adds gate:needs-fix — should be mutually exclusive with the needs-fix arm"
   else
     ok "needs-rebase branch does not also add gate:needs-fix (mutually exclusive with the needs-fix arm)"
@@ -181,7 +181,7 @@ if [ -n "$NR_BODY" ]; then
       bad "needs-rebase 'clear' sub-arm does NOT correctly scope status-open/gate:queued-remove (cleared=$NR_CLEARED_LN status=$NR_STATUS_LN queued=$NR_QUEUED_LN elif=$NR_ELIF_LN)"
     fi
   fi
-  if printf '%s' "$NR_BODY" | grep -qF '_NR_ROUTE=$(default_pool_route_for_rig "$RIG")'; then
+  if printf '%s' "$NR_BODY" | grep -F '_NR_ROUTE=$(default_pool_route_for_rig "$RIG")' >/dev/null; then
     ok "needs-rebase 'clear' sub-arm restores gc.routed_to via default_pool_route_for_rig (same convention as ga-f54ui)"
   else
     bad "needs-rebase 'clear' sub-arm does not restore gc.routed_to"
@@ -199,7 +199,7 @@ if [ -n "$NR_BODY" ]; then
   ')
   if [ -z "$NR_KEEP_SUBARM" ]; then
     bad "NR_KEEP_SUBARM extraction produced nothing — inner if/else anchor drifted, cannot verify the 'keep' sub-arm's verify-read"
-  elif printf '%s' "$NR_KEEP_SUBARM" | grep -qF 'bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null'; then
+  elif printf '%s' "$NR_KEEP_SUBARM" | grep -F 'bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null' >/dev/null; then
     ok "needs-rebase 'keep' sub-arm verifies its writes with a post-write read (not an unverified 'were kept' claim, ga-39l9z2 self-audit)"
   else
     bad "needs-rebase 'keep' sub-arm does NOT verify its writes — unverified-success claim (same class ga-n7hu2 caught in the sibling needs-fix arm)"

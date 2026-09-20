@@ -153,24 +153,24 @@ EOF
 #        NEEDS_GUARDED_RESTART → must NOT be blamed ─────────────────────────
 run_block C1 C2 C0
 [ "$RUN_RC" -eq 0 ] && ok "T1 block runs clean (rc=0)" || nok "T1 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=1" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=1" >/dev/null \
   && ok "T1 own-merge correctly classified structurally inert" \
   || nok "T1 inert classification" "$LOG_OUT"
 [ "$REACHED" -eq 1 ] && ok "T1 block falls through past the verdict (no continue) — delivery proceeds" \
   || nok "T1 fell through" "REACHED=$REACHED"
-! echo "$BD_CALLS" | grep -q "delivery:failed" \
+! echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && ok "T1 delivery:failed NOT added — innocent story not blamed" \
   || nok "T1 no failed-label" "$BD_CALLS"
-! echo "$BD_CALLS" | grep -q "delivery:deploy-pending" \
+! echo "$BD_CALLS" | grep "delivery:deploy-pending" >/dev/null \
   && ok "T1 delivery:deploy-pending NOT added" \
   || nok "T1 no deploy-pending" "$BD_CALLS"
-! echo "$GC_CALLS" | grep -q "session nudge crew/tester" \
+! echo "$GC_CALLS" | grep "session nudge crew/tester" >/dev/null \
   && ok "T1 author NOT nudged — did nothing wrong" \
   || nok "T1 no author nudge" "$GC_CALLS"
-echo "$GC_CALLS" | grep -q "session nudge mayor" \
+echo "$GC_CALLS" | grep "session nudge mayor" >/dev/null \
   && ok "T1 Mayor still nudged — real staleness not silenced" \
   || nok "T1 mayor nudged" "$GC_CALLS"
-echo "$GC_CALLS" | grep -q "NOT caused by ga-test" \
+echo "$GC_CALLS" | grep "NOT caused by ga-test" >/dev/null \
   && ok "T1 Mayor nudge explicitly clears this story of blame" \
   || nok "T1 mayor nudge wording" "$GC_CALLS"
 [ "$MARKER_AFTER" = "$EXPECT_C0" ] \
@@ -182,21 +182,21 @@ echo "$GC_CALLS" | grep -q "NOT caused by ga-test" \
 run_block C0 C1 ""
 [ "$RUN_RC" -eq 0 ] && ok "T2 block runs clean (rc=0; continue-based halt, BD state is the signal)" \
   || nok "T2 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=0" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=0" >/dev/null \
   && ok "T2 own-merge correctly classified NOT structurally inert" \
   || nok "T2 inert classification" "$LOG_OUT"
 [ "$REACHED" -eq 0 ] && ok "T2 block halts via continue (does not fall through)" \
   || nok "T2 halted" "REACHED=$REACHED"
-echo "$BD_CALLS" | grep -q "label add ga-test delivery:failed" \
+echo "$BD_CALLS" | grep "label add ga-test delivery:failed" >/dev/null \
   && ok "T2 delivery:failed added — this story's own merge IS the cause" \
   || nok "T2 failed-label" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "label add ga-test delivery:deploy-pending" \
+echo "$BD_CALLS" | grep "label add ga-test delivery:deploy-pending" >/dev/null \
   && ok "T2 delivery:deploy-pending added" \
   || nok "T2 deploy-pending" "$BD_CALLS"
-echo "$GC_CALLS" | grep -q "session nudge crew/tester" \
+echo "$GC_CALLS" | grep "session nudge crew/tester" >/dev/null \
   && ok "T2 author nudged" \
   || nok "T2 author nudge" "$GC_CALLS"
-echo "$GC_CALLS" | grep -q "session nudge mayor" \
+echo "$GC_CALLS" | grep "session nudge mayor" >/dev/null \
   && ok "T2 Mayor nudged" \
   || nok "T2 mayor nudge" "$GC_CALLS"
 
@@ -205,12 +205,12 @@ echo "$GC_CALLS" | grep -q "session nudge mayor" \
 #        never guess an exemption ───────────────────────────────────────────
 run_block C2 C2 C0
 [ "$RUN_RC" -eq 0 ] && ok "T3 block runs clean (rc=0)" || nok "T3 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=unknown" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=unknown" >/dev/null \
   && ok "T3 no-op range → inert stays unknown (never guessed)" \
   || nok "T3 inert classification" "$LOG_OUT"
 [ "$REACHED" -eq 0 ] && ok "T3 block halts via continue (falls back to existing behavior)" \
   || nok "T3 halted" "REACHED=$REACHED"
-echo "$BD_CALLS" | grep -q "label add ga-test delivery:failed" \
+echo "$BD_CALLS" | grep "label add ga-test delivery:failed" >/dev/null \
   && ok "T3 delivery:failed added — unknown attribution defaults to blame, not exemption" \
   || nok "T3 failed-label" "$BD_CALLS"
 [ "$MARKER_AFTER" = "$EXPECT_C0" ] \

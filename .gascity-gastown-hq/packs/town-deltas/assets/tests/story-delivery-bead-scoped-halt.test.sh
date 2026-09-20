@@ -270,37 +270,37 @@ FAKE_STALE="com.whatsapp.campaign-api com.whatsapp.call-vcard-notifier"
 FAKE_WIDE="$WIDE_COMMON"; FAKE_WIDE_OWN="com.whatsapp.ficha360"
 ATTRIBUTED=1 RUNS=1 run_block
 [ "$RUN_RC" -eq 0 ] && ok "T1 block runs clean (rc=0)" || nok "T1 rc" "rc=$RUN_RC"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && ok "T1 delivery IS held — two of the merge's reached daemons really run pre-merge code" \
   || nok "T1 delivery wrongly NOT held" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "Delivery HALTED" \
+echo "$BD_CALLS" | grep "Delivery HALTED" >/dev/null \
   && ok "T1 halt comment posted" || nok "T1 no halt comment" "$BD_CALLS"
-echo "$BD_CALLS$GC_CALLS" | grep -q "ficha360" \
+echo "$BD_CALLS$GC_CALLS" | grep "ficha360" >/dev/null \
   && nok "T1 Aceite 2 VIOLATED: a comment/nudge names ficha360, which this story's diff never touches" "$(echo "$BD_CALLS$GC_CALLS" | grep -m3 ficha360 | cut -c1-260)" \
   || ok "T1 Aceite 2: no comment or nudge names ficha360"
-echo "$BD_CALLS$GC_CALLS" | grep -q "OWN-FILE-CHANGED" \
+echo "$BD_CALLS$GC_CALLS" | grep "OWN-FILE-CHANGED" >/dev/null \
   && nok "T1 Aceite 2 VIOLATED: the wide window's OWN-FILE-CHANGED classification leaked into a comment/nudge" "$(echo "$BD_CALLS$GC_CALLS" | grep -m2 OWN-FILE-CHANGED | cut -c1-260)" \
   || ok "T1 Aceite 2: the wide OWN-FILE-CHANGED classification is not shown as this story's"
 LEAD_PART="$(echo "$BD_CALLS" | awk '/Context only/{exit} {print}')"
-echo "$LEAD_PART" | grep -q "com.whatsapp.campaign-api" && echo "$LEAD_PART" | grep -q "com.whatsapp.call-vcard-notifier" \
+echo "$LEAD_PART" | grep "com.whatsapp.campaign-api" >/dev/null && echo "$LEAD_PART" | grep "com.whatsapp.call-vcard-notifier" >/dev/null \
   && ok "T1 the halt names both daemons that are really stale for this merge" \
   || nok "T1 stale daemons missing from the halt" "$LEAD_PART"
-echo "$LEAD_PART" | grep -q "com.whatsapp.slot-scheduler" \
+echo "$LEAD_PART" | grep "com.whatsapp.slot-scheduler" >/dev/null \
   && nok "T1 Aceite 1 VIOLATED: the halt lists slot-scheduler, which the re-probe found already fresh" "$LEAD_PART" \
   || ok "T1 Aceite 1: the fresh reached daemon (slot-scheduler) is not on the restart list"
-echo "$LEAD_PART" | grep -q "com.whatsapp.approval-monitor" \
+echo "$LEAD_PART" | grep "com.whatsapp.approval-monitor" >/dev/null \
   && nok "T1 Aceite 1 VIOLATED: an unrelated wide-window daemon (approval-monitor) is in the halt's lead" "$LEAD_PART" \
   || ok "T1 Aceite 1: no unrelated wide-window daemon in the halt's lead"
 CONTEXT_LINE="$(echo "$BD_CALLS" | grep "Context only — NOT attributed to this merge" | head -1)"
 [ -n "$CONTEXT_LINE" ] && ok "T1 the wide window is still acknowledged on an explicit 'Context only' line" \
   || nok "T1 missing the Context-only line" "$BD_CALLS"
-echo "$CONTEXT_LINE" | grep -qE '[0-9]+ other sensitive daemon' \
+echo "$CONTEXT_LINE" | grep -E '[0-9]+ other sensitive daemon' >/dev/null \
   && ok "T1 the context line carries a count of the other flagged daemons" \
   || nok "T1 context line has no count" "$CONTEXT_LINE"
-echo "$CONTEXT_LINE" | grep -q "com.whatsapp\." \
+echo "$CONTEXT_LINE" | grep "com.whatsapp\." >/dev/null \
   && nok "T1 the context line still lists wide-window daemon names" "$CONTEXT_LINE" \
   || ok "T1 the context line lists no daemon names (only this merge's own are named)"
-echo "$LOG_OUT" | grep -q "guarded=\[.*com.whatsapp.ficha360.*com.whatsapp.approval-monitor" \
+echo "$LOG_OUT" | grep "guarded=\[.*com.whatsapp.ficha360.*com.whatsapp.approval-monitor" >/dev/null \
   && ok "T1 nothing is hidden: the full wide list is still in the log" \
   || nok "T1 the wide list is missing from the log" "$LOG_OUT"
 [ "$BASELINE_AFTER" = "$EXPECT_C0" ] \
@@ -313,19 +313,19 @@ FAKE_REPROBE=fresh; FAKE_STALE=""
 FAKE_WIDE="$WIDE_COMMON com.whatsapp.demand-dashboard"; FAKE_WIDE_OWN="com.whatsapp.ficha360"
 ATTRIBUTED=1 RUNS=1 run_block
 [ "$RUN_RC" -eq 0 ] && ok "T2 block runs clean (rc=0)" || nok "T2 rc" "rc=$RUN_RC"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && nok "T2 delivery WAS held although every daemon the merge reaches started after it (the wa-catpm false positive)" "$BD_CALLS" \
   || ok "T2 delivery is NOT held — the wide flag was measured against the window tip, not this merge"
-echo "$BD_CALLS" | grep -q "Delivery HALTED" \
+echo "$BD_CALLS" | grep "Delivery HALTED" >/dev/null \
   && nok "T2 a halt comment was posted" "$BD_CALLS" \
   || ok "T2 no halt comment"
-echo "$GC_CALLS" | grep -q "session nudge mayor" \
+echo "$GC_CALLS" | grep "session nudge mayor" >/dev/null \
   && ok "T2 mayor is still nudged — the release must stay visible" \
   || nok "T2 missing mayor nudge" "$GC_CALLS"
-echo "$GC_CALLS" | grep "session nudge mayor" | grep -q "com.whatsapp.ficha360" \
+echo "$GC_CALLS" | grep "session nudge mayor" | grep "com.whatsapp.ficha360" >/dev/null \
   && ok "T2 the nudge names the overlapping daemon (ficha360), so the release is explained" \
   || nok "T2 the nudge does not name the overlap" "$GC_CALLS"
-echo "$LOG_OUT" | grep -q "still running code older than its merge commit" \
+echo "$LOG_OUT" | grep "still running code older than its merge commit" >/dev/null \
   && ok "T2 log states why the wide flag does not apply to this merge" \
   || nok "T2 missing explanation in the log" "$LOG_OUT"
 [ "$BASELINE_AFTER" = "$EXPECT_C0" ] \
@@ -338,15 +338,15 @@ FAKE_REPROBE=stale; FAKE_STALE="com.whatsapp.clientes-dashboard"
 FAKE_WIDE="$WIDE_COMMON com.whatsapp.clientes-dashboard"; FAKE_WIDE_OWN="com.whatsapp.ficha360"
 ATTRIBUTED=1 RUNS=1 run_block
 [ "$RUN_RC" -eq 0 ] && ok "T3 block runs clean (rc=0)" || nok "T3 rc" "rc=$RUN_RC"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && ok "T3 Aceite 3: delivery IS held — clientes-dashboard really runs pre-merge code" \
   || nok "T3 Aceite 3 VIOLATED: a truly stale daemon no longer blocks delivery" "$BD_CALLS"
 LEAD_PART="$(echo "$BD_CALLS" | awk '/Context only/{exit} {print}')"
-echo "$LEAD_PART" | grep -q "com.whatsapp.clientes-dashboard" \
+echo "$LEAD_PART" | grep "com.whatsapp.clientes-dashboard" >/dev/null \
   && ok "T3 the halt names the one stale daemon (clientes-dashboard)" \
   || nok "T3 clientes-dashboard missing" "$LEAD_PART"
 for d in com.whatsapp.ficha360 com.whatsapp.demand-dashboard; do
-  echo "$LEAD_PART" | grep -q "$d" \
+  echo "$LEAD_PART" | grep "$d" >/dev/null \
     && nok "T3 the halt lists $d, which the re-probe found already fresh" "$LEAD_PART" \
     || ok "T3 the halt does not list the fresh reached daemon $d"
 done
@@ -357,10 +357,10 @@ FAKE_REPROBE=unparseable; FAKE_STALE=""
 FAKE_WIDE="$WIDE_COMMON com.whatsapp.demand-dashboard"; FAKE_WIDE_OWN="com.whatsapp.ficha360"
 ATTRIBUTED=1 RUNS=1 run_block
 [ "$RUN_RC" -eq 0 ] && ok "T4 block runs clean (rc=0)" || nok "T4 rc" "rc=$RUN_RC"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && ok "T4 delivery IS held (an unparseable re-probe is never treated as fresh)" \
   || nok "T4 delivery wrongly NOT held on an unparseable re-probe" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "NOT confirmed stale" \
+echo "$BD_CALLS" | grep "NOT confirmed stale" >/dev/null \
   && ok "T4 the halt says the list is NOT confirmed stale (no false precision)" \
   || nok "T4 halt does not disclose that the re-probe was unavailable" "$BD_CALLS"
 [ "$BASELINE_AFTER" = "$EXPECT_C0" ] \
@@ -372,13 +372,13 @@ FAKE_REPROBE=stale; FAKE_STALE="com.whatsapp.campaign-api"
 FAKE_WIDE="$WIDE_COMMON"; FAKE_WIDE_OWN="com.whatsapp.ficha360"
 ATTRIBUTED=0 RUNS=1 run_block
 [ "$RUN_RC" -eq 0 ] && ok "T5 block runs clean (rc=0)" || nok "T5 rc" "rc=$RUN_RC"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && ok "T5 delivery IS held (wide verdict, nothing to exonerate on)" \
   || nok "T5 delivery wrongly NOT held" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "OWN-FILE-CHANGED" \
+echo "$BD_CALLS" | grep "OWN-FILE-CHANGED" >/dev/null \
   && ok "T5 without a merge range the wide text is shown as before — the honest fallback is unchanged" \
   || nok "T5 the wide fallback text disappeared" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "No per-bead attribution available" \
+echo "$BD_CALLS" | grep "No per-bead attribution available" >/dev/null \
   && ok "T5 the halt still says no per-bead attribution was available" \
   || nok "T5 missing the no-attribution disclosure" "$BD_CALLS"
 
@@ -405,17 +405,17 @@ FAKE_REPROBE=stale; FAKE_STALE="com.whatsapp.campaign-api com.whatsapp.call-vcar
 FAKE_WIDE="$WIDE_COMMON"; FAKE_WIDE_OWN="com.whatsapp.ficha360"
 PATH_A=1 ATTRIBUTED=1 RUNS=1 run_block
 [ "$RUN_RC" -eq 0 ] && ok "T7 (Path A) block runs clean (rc=0)" || nok "T7 rc" "rc=$RUN_RC"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && ok "T7 (Path A) delivery IS held — two reached daemons really run pre-merge code" \
   || nok "T7 (Path A) delivery wrongly NOT held" "$BD_CALLS"
-echo "$BD_CALLS$GC_CALLS" | grep -qE "ficha360|OWN-FILE-CHANGED" \
+echo "$BD_CALLS$GC_CALLS" | grep -E "ficha360|OWN-FILE-CHANGED" >/dev/null \
   && nok "T7 (Path A) Aceite 2 VIOLATED: ficha360 / the wide OWN-FILE-CHANGED text leaked into a comment/nudge" "$(echo "$BD_CALLS$GC_CALLS" | grep -m2 -E 'ficha360|OWN-FILE-CHANGED' | cut -c1-260)" \
   || ok "T7 (Path A) Aceite 2: neither ficha360 nor OWN-FILE-CHANGED appears in any comment/nudge"
 LEAD_PART="$(echo "$BD_CALLS" | awk '/Context only/{exit} {print}')"
-echo "$LEAD_PART" | grep -q "com.whatsapp.campaign-api" && echo "$LEAD_PART" | grep -q "com.whatsapp.call-vcard-notifier" \
+echo "$LEAD_PART" | grep "com.whatsapp.campaign-api" >/dev/null && echo "$LEAD_PART" | grep "com.whatsapp.call-vcard-notifier" >/dev/null \
   && ok "T7 (Path A) the halt names both really-stale daemons" \
   || nok "T7 (Path A) stale daemons missing from the halt" "$LEAD_PART"
-echo "$LEAD_PART" | grep -qE "com.whatsapp.(slot-scheduler|approval-monitor|ban-risk-dashboard)" \
+echo "$LEAD_PART" | grep -E "com.whatsapp.(slot-scheduler|approval-monitor|ban-risk-dashboard)" >/dev/null \
   && nok "T7 (Path A) Aceite 1 VIOLATED: the halt lists a fresh or unrelated daemon" "$LEAD_PART" \
   || ok "T7 (Path A) Aceite 1: only this merge's own stale daemons are listed"
 
@@ -425,7 +425,7 @@ FAKE_REPROBE=fresh; FAKE_STALE=""
 FAKE_WIDE="$WIDE_COMMON com.whatsapp.demand-dashboard"; FAKE_WIDE_OWN="com.whatsapp.ficha360"
 PATH_A=1 ATTRIBUTED=1 RUNS=1 run_block
 [ "$RUN_RC" -eq 0 ] && ok "T8 (Path A) block runs clean (rc=0)" || nok "T8 rc" "rc=$RUN_RC"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && nok "T8 (Path A) delivery WAS held although every reached daemon started after the merge" "$BD_CALLS" \
   || ok "T8 (Path A) delivery is NOT held (the wide flag is judged against the window tip)"
 [ "$BASELINE_AFTER" = "$EXPECT_C0" ] \
@@ -440,7 +440,7 @@ FAKE_REPROBE=fresh; FAKE_STALE=""
 FAKE_WIDE="$WIDE_COMMON"; FAKE_WIDE_OWN="com.whatsapp.ficha360"   # ficha360 is NOT in this reach
 ATTRIBUTED=1 RUNS=1 run_block
 [ "$RUN_RC" -eq 0 ] && ok "T9 block runs clean (rc=0)" || nok "T9 rc" "rc=$RUN_RC"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && nok "T9 delivery WAS held although the re-probe cleared every reached daemon" "$BD_CALLS" \
   || ok "T9 delivery is NOT held (re-probe fresh, no wide overlap)"
 [ "$BASELINE_AFTER" = "$EXPECT_C2" ] \
@@ -468,16 +468,16 @@ third_state_case() {  # third_state_case <label> <reprobe-mode> <overlap:1|0> <e
   fi
   ATTRIBUTED=1 RUNS=1 run_block
   [ "$RUN_RC" -eq 0 ] && ok "$label block runs clean (rc=0)" || nok "$label rc" "rc=$RUN_RC"
-  echo "$BD_CALLS" | grep -q "delivery:failed" \
+  echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
     && ok "$label delivery IS held — the re-probe did not say, so it is never read as fresh" \
     || nok "$label delivery was RELEASED on a re-probe that gave no consistent answer" "$BD_CALLS"
-  echo "$BD_CALLS" | grep -q "NOT confirmed stale" \
+  echo "$BD_CALLS" | grep "NOT confirmed stale" >/dev/null \
     && ok "$label the halt says the list is NOT confirmed stale (no false precision)" \
     || nok "$label halt does not disclose that the re-probe gave no usable answer" "$BD_CALLS"
-  echo "$LOG_OUT" | grep -q "no consistent VERDICT/GUARDED pair" \
+  echo "$LOG_OUT" | grep "no consistent VERDICT/GUARDED pair" >/dev/null \
     && ok "$label the log names the third state" \
     || nok "$label log does not say the re-probe output was inconsistent" "$LOG_OUT"
-  echo "$LOG_OUT" | grep -qF "$got" \
+  echo "$LOG_OUT" | grep -F "$got" >/dev/null \
     && ok "$label the log shows what the re-probe actually returned ($got)" \
     || nok "$label log does not show the re-probe's actual output (wanted: $got)" "$LOG_OUT"
   [ "$BASELINE_AFTER" = "$EXPECT_C0" ] \

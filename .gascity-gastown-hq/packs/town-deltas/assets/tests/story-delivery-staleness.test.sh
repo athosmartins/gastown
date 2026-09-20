@@ -101,30 +101,30 @@ FATAL='git -C /Users/athos/gt pull --ff-only'
 # ── S1: CURRENT → proceed ─────────────────────────────────────────────────────
 run_block CURRENT "$SWALLOWED"
 [ "$RUN_RC" -eq 0 ] && ok "S1 CURRENT → block exits 0 (proceeds)" || nok "S1 exit" "rc=$RUN_RC"
-! echo "$LAST_BD" | grep -q "delivery:failed" && ok "S1 no delivery:failed label" || nok "S1 failed-label" "$LAST_BD"
+! echo "$LAST_BD" | grep "delivery:failed" >/dev/null && ok "S1 no delivery:failed label" || nok "S1 failed-label" "$LAST_BD"
 
 # ── S2: STALE (behind/diverged) → HALT, no story:done ─────────────────────────
 run_block STALE "$SWALLOWED"
 # Block halts via `continue` (loop-based); for-loop exits 0. BD state is the halt signal.
 [ "$RUN_RC" -eq 0 ] && ok "S2 STALE → block exits 0 (continue-based halt; BD state is primary signal)" || nok "S2 rc" "rc=$RUN_RC"
-echo "$LAST_BD" | grep -q "label add ga-test delivery:failed" && ok "S2 delivery:failed added" || nok "S2 failed-label" "$LAST_BD"
-echo "$LAST_BD" | grep -q "label remove ga-test delivery:running" && ok "S2 delivery:running removed" || nok "S2 running-removed" "$LAST_BD"
-! echo "$LAST_BD" | grep -q "label add ga-test story:done" && ok "S2 story:done label NOT set" || nok "S2 story-done" "$LAST_BD"
-echo "$LAST_GC" | grep -q "session nudge mayor" && ok "S2 mayor nudged" || nok "S2 mayor-nudge" "$LAST_GC"
-echo "$LAST_GC" | grep -q "session nudge crew/tester" && ok "S2 author nudged" || nok "S2 author-nudge" "$LAST_GC"
+echo "$LAST_BD" | grep "label add ga-test delivery:failed" >/dev/null && ok "S2 delivery:failed added" || nok "S2 failed-label" "$LAST_BD"
+echo "$LAST_BD" | grep "label remove ga-test delivery:running" >/dev/null && ok "S2 delivery:running removed" || nok "S2 running-removed" "$LAST_BD"
+! echo "$LAST_BD" | grep "label add ga-test story:done" >/dev/null && ok "S2 story:done label NOT set" || nok "S2 story-done" "$LAST_BD"
+echo "$LAST_GC" | grep "session nudge mayor" >/dev/null && ok "S2 mayor nudged" || nok "S2 mayor-nudge" "$LAST_GC"
+echo "$LAST_GC" | grep "session nudge crew/tester" >/dev/null && ok "S2 author nudged" || nok "S2 author-nudge" "$LAST_GC"
 
 # ── S3: UNVERIFIABLE → fail-closed HALT ───────────────────────────────────────
 run_block UNVERIFIABLE "$SWALLOWED"
 # Block halts via `continue`; for-loop exits 0. BD state is the halt signal.
 [ "$RUN_RC" -eq 0 ] && ok "S3 UNVERIFIABLE → block exits 0 (continue-based fail-closed; BD state is primary signal)" || nok "S3 rc" "rc=$RUN_RC"
-echo "$LAST_BD" | grep -q "label add ga-test delivery:failed" && ok "S3 delivery:failed added" || nok "S3 failed-label" "$LAST_BD"
-! echo "$LAST_BD" | grep -q "label add ga-test story:done" && ok "S3 story:done label NOT set" || nok "S3 story-done" "$LAST_BD"
+echo "$LAST_BD" | grep "label add ga-test delivery:failed" >/dev/null && ok "S3 delivery:failed added" || nok "S3 failed-label" "$LAST_BD"
+! echo "$LAST_BD" | grep "label add ga-test story:done" >/dev/null && ok "S3 story:done label NOT set" || nok "S3 story-done" "$LAST_BD"
 
 # ── S4: OUT-OF-SCOPE (fatal ff-pull) → gate skipped entirely ──────────────────
 run_block STALE "$FATAL"
 [ "$RUN_RC" -eq 0 ] && ok "S4 fatal-pull rig → gate skipped, exits 0" || nok "S4 exit" "rc=$RUN_RC"
 [ -z "$LAST_GIT" ] && ok "S4 no git probes (gate inactive for fatal-pull rigs)" || nok "S4 git-probed" "$LAST_GIT"
-! echo "$LAST_BD" | grep -q "delivery:failed" && ok "S4 no delivery:failed label" || nok "S4 failed-label" "$LAST_BD"
+! echo "$LAST_BD" | grep "delivery:failed" >/dev/null && ok "S4 no delivery:failed label" || nok "S4 failed-label" "$LAST_BD"
 
 # ── S5/S6: Multi-story regression (loop continues past .[0] halt) ─────────────
 # Runs the FULL delivery script in DRY_RUN=1 with a 2-story fixture: .[0] halts
@@ -215,15 +215,15 @@ GITEOF
 
 # ── S5: Multi-story — rig-unknown halt on .[0] does NOT block .[1] ────────────
 run_sweep_multi RIG_UNKNOWN
-echo "$SWEEP_LOG" | grep -q "Processing story ga-ms-a" && ok "S5 .[0] ga-ms-a was attempted" || nok "S5 a-attempted" "$(echo "$SWEEP_LOG" | tail -5)"
-echo "$SWEEP_LOG" | grep -q "Processing story ga-ms-b" && ok "S5 .[1] ga-ms-b was attempted (not starved)" || nok "S5 b-not-starved" "$(echo "$SWEEP_LOG" | tail -5)"
-echo "$SWEEP_LOG" | grep -q "Delivery sweep complete.*ga-ms-b" && ok "S5 .[1] ga-ms-b reached sweep-complete" || nok "S5 b-complete" "$(echo "$SWEEP_LOG" | grep -E 'ms-b|finished' | tail -5 || echo '(no ms-b lines)')"
+echo "$SWEEP_LOG" | grep "Processing story ga-ms-a" >/dev/null && ok "S5 .[0] ga-ms-a was attempted" || nok "S5 a-attempted" "$(echo "$SWEEP_LOG" | tail -5)"
+echo "$SWEEP_LOG" | grep "Processing story ga-ms-b" >/dev/null && ok "S5 .[1] ga-ms-b was attempted (not starved)" || nok "S5 b-not-starved" "$(echo "$SWEEP_LOG" | tail -5)"
+echo "$SWEEP_LOG" | grep "Delivery sweep complete.*ga-ms-b" >/dev/null && ok "S5 .[1] ga-ms-b reached sweep-complete" || nok "S5 b-complete" "$(echo "$SWEEP_LOG" | grep -E 'ms-b|finished' | tail -5 || echo '(no ms-b lines)')"
 
 # ── S6: Multi-story — no-deploy-cmd halt on .[0] does NOT block .[1] ──────────
 run_sweep_multi NO_DEPLOY_CMD
-echo "$SWEEP_LOG" | grep -q "Processing story ga-ms-a" && ok "S6 .[0] ga-ms-a was attempted" || nok "S6 a-attempted" "$(echo "$SWEEP_LOG" | tail -5)"
-echo "$SWEEP_LOG" | grep -q "Processing story ga-ms-b" && ok "S6 .[1] ga-ms-b was attempted (not starved)" || nok "S6 b-not-starved" "$(echo "$SWEEP_LOG" | tail -5)"
-echo "$SWEEP_LOG" | grep -q "Delivery sweep complete.*ga-ms-b" && ok "S6 .[1] ga-ms-b reached sweep-complete" || nok "S6 b-complete" "$(echo "$SWEEP_LOG" | grep -E 'ms-b|finished' | tail -5 || echo '(no ms-b lines)')"
+echo "$SWEEP_LOG" | grep "Processing story ga-ms-a" >/dev/null && ok "S6 .[0] ga-ms-a was attempted" || nok "S6 a-attempted" "$(echo "$SWEEP_LOG" | tail -5)"
+echo "$SWEEP_LOG" | grep "Processing story ga-ms-b" >/dev/null && ok "S6 .[1] ga-ms-b was attempted (not starved)" || nok "S6 b-not-starved" "$(echo "$SWEEP_LOG" | tail -5)"
+echo "$SWEEP_LOG" | grep "Delivery sweep complete.*ga-ms-b" >/dev/null && ok "S6 .[1] ga-ms-b reached sweep-complete" || nok "S6 b-complete" "$(echo "$SWEEP_LOG" | grep -E 'ms-b|finished' | tail -5 || echo '(no ms-b lines)')"
 
 echo ""
 echo "story-delivery staleness-gate tests: $PASS passed, $FAIL failed"

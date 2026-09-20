@@ -136,7 +136,7 @@ CITY_A="$SCRATCH_ROOT/city-a"
 : > "$SCRATCH_ROOT/calls.log"
 mk_segment "$CITY_A" "$(( NOW - 360 ))"
 OUT_A="$(run_detector "$CITY_A" "$NOW" env FAKE_SUPERVISOR_ALIVE=1)"
-echo "$OUT_A" | grep -q '^reconciler-stall-detector: OK' && ok "A: last lap 6min ago (360s) -> OK under the new 900s threshold (was the night-long-pages bug)" || bad "A: expected OK, got: $OUT_A"
+echo "$OUT_A" | grep '^reconciler-stall-detector: OK' >/dev/null && ok "A: last lap 6min ago (360s) -> OK under the new 900s threshold (was the night-long-pages bug)" || bad "A: expected OK, got: $OUT_A"
 [ ! -s "$SCRATCH_ROOT/calls.log" ] && ok "A: no notify/mail call on a merely-slow-but-alive tick" || bad "A: unexpected call(s): $(cat "$SCRATCH_ROOT/calls.log")"
 
 # A2. Genuinely stalled: last lap 16min ago (960s, past the 900s threshold)
@@ -146,8 +146,8 @@ CITY_A2="$SCRATCH_ROOT/city-a2"
 : > "$SCRATCH_ROOT/calls.log"
 mk_segment "$CITY_A2" "$(( NOW - 960 ))"
 OUT_A2="$(run_detector "$CITY_A2" "$NOW" env FAKE_SUPERVISOR_ALIVE=1)"
-echo "$OUT_A2" | grep -q '^reconciler-stall-detector: STALLED' && ok "A2: last lap 16min ago (960s) -> STALLED" || bad "A2: expected STALLED, got: $OUT_A2"
-echo "$OUT_A2" | grep -q 'age_sec=960' && ok "A2: age_sec=960 reported exactly" || bad "A2: age mismatch: $OUT_A2"
+echo "$OUT_A2" | grep '^reconciler-stall-detector: STALLED' >/dev/null && ok "A2: last lap 16min ago (960s) -> STALLED" || bad "A2: expected STALLED, got: $OUT_A2"
+echo "$OUT_A2" | grep 'age_sec=960' >/dev/null && ok "A2: age_sec=960 reported exactly" || bad "A2: age mismatch: $OUT_A2"
 grep -q '^gc mail send' "$SCRATCH_ROOT/calls.log" && ok "A2: gc mail send was called" || bad "A2: gc mail send not called"
 [ -f "$CITY_A2/.gc/state/reconciler-stall-detector-last-alert" ] && ok "A2: cooldown file written after alert" || bad "A2: cooldown file missing"
 
@@ -156,7 +156,7 @@ CITY_B="$SCRATCH_ROOT/city-b"
 : > "$SCRATCH_ROOT/calls.log"
 mk_segment "$CITY_B" "$(( NOW - 60 ))"
 OUT_B="$(run_detector "$CITY_B" "$NOW" env FAKE_SUPERVISOR_ALIVE=1)"
-echo "$OUT_B" | grep -q '^reconciler-stall-detector: OK' && ok "B: last lap 1min ago -> OK" || bad "B: expected OK, got: $OUT_B"
+echo "$OUT_B" | grep '^reconciler-stall-detector: OK' >/dev/null && ok "B: last lap 1min ago -> OK" || bad "B: expected OK, got: $OUT_B"
 [ ! -s "$SCRATCH_ROOT/calls.log" ] && ok "B: no notify/mail/bd-list call on OK" || bad "B: unexpected call(s) on OK path: $(cat "$SCRATCH_ROOT/calls.log")"
 
 # C. Segments dir entirely absent -> UNKNOWN, no alert.
@@ -164,8 +164,8 @@ CITY_C="$SCRATCH_ROOT/city-c"
 : > "$SCRATCH_ROOT/calls.log"
 mkdir -p "$CITY_C"
 OUT_C="$(run_detector "$CITY_C" "$NOW" env FAKE_SUPERVISOR_ALIVE=1)"
-echo "$OUT_C" | grep -q '^reconciler-stall-detector: UNKNOWN' && ok "C: missing segments dir -> UNKNOWN" || bad "C: expected UNKNOWN, got: $OUT_C"
-echo "$OUT_C" | grep -q 'no_segments_dir' && ok "C: reason names no_segments_dir" || bad "C: reason missing: $OUT_C"
+echo "$OUT_C" | grep '^reconciler-stall-detector: UNKNOWN' >/dev/null && ok "C: missing segments dir -> UNKNOWN" || bad "C: expected UNKNOWN, got: $OUT_C"
+echo "$OUT_C" | grep 'no_segments_dir' >/dev/null && ok "C: reason names no_segments_dir" || bad "C: reason missing: $OUT_C"
 [ ! -s "$SCRATCH_ROOT/calls.log" ] && ok "C: no alert on UNKNOWN" || bad "C: unexpected alert on UNKNOWN: $(cat "$SCRATCH_ROOT/calls.log")"
 
 # D. Segment file present but every line corrupted -> UNKNOWN, no alert.
@@ -175,8 +175,8 @@ DIR_D="$CITY_D/.gc/runtime/session-reconciler-trace/segments/2026/09/19"
 mkdir -p "$DIR_D"
 printf 'not json at all\n{"also": "not valid"\nstill garbage\n' > "$DIR_D/segment-000001.jsonl"
 OUT_D="$(run_detector "$CITY_D" "$NOW" env FAKE_SUPERVISOR_ALIVE=1)"
-echo "$OUT_D" | grep -q '^reconciler-stall-detector: UNKNOWN' && ok "D: corrupted segment content -> UNKNOWN" || bad "D: expected UNKNOWN, got: $OUT_D"
-echo "$OUT_D" | grep -q 'unparseable_tail' && ok "D: reason names unparseable_tail" || bad "D: reason missing: $OUT_D"
+echo "$OUT_D" | grep '^reconciler-stall-detector: UNKNOWN' >/dev/null && ok "D: corrupted segment content -> UNKNOWN" || bad "D: expected UNKNOWN, got: $OUT_D"
+echo "$OUT_D" | grep 'unparseable_tail' >/dev/null && ok "D: reason names unparseable_tail" || bad "D: reason missing: $OUT_D"
 [ ! -s "$SCRATCH_ROOT/calls.log" ] && ok "D: no alert on corrupted trace" || bad "D: unexpected alert: $(cat "$SCRATCH_ROOT/calls.log")"
 
 echo "== ga-srp8hk: 'supervisor sem processo' is its own UNKNOWN cause, and is NEVER duplicated as an alert (ga-b0gltl's job) =="
@@ -187,8 +187,8 @@ CITY_E="$SCRATCH_ROOT/city-e"
 : > "$SCRATCH_ROOT/calls.log"
 mk_segment "$CITY_E" "$(( NOW - 5 ))"
 OUT_E="$(run_detector "$CITY_E" "$NOW" env FAKE_SUPERVISOR_ALIVE=0)"
-echo "$OUT_E" | grep -q '^reconciler-stall-detector: UNKNOWN' && ok "E: supervisor not running -> UNKNOWN even with a fresh trace" || bad "E: expected UNKNOWN, got: $OUT_E"
-echo "$OUT_E" | grep -q 'supervisor_not_running' && ok "E: reason names supervisor_not_running" || bad "E: reason missing: $OUT_E"
+echo "$OUT_E" | grep '^reconciler-stall-detector: UNKNOWN' >/dev/null && ok "E: supervisor not running -> UNKNOWN even with a fresh trace" || bad "E: expected UNKNOWN, got: $OUT_E"
+echo "$OUT_E" | grep 'supervisor_not_running' >/dev/null && ok "E: reason names supervisor_not_running" || bad "E: reason missing: $OUT_E"
 [ ! -s "$SCRATCH_ROOT/calls.log" ] && ok "E: no alert sent (ga-b0gltl's job, not duplicated here)" || bad "E: unexpected alert: $(cat "$SCRATCH_ROOT/calls.log")"
 
 echo "== ga-srp8hk: partial trailing write tolerance =="
@@ -202,7 +202,7 @@ mk_segment "$CITY_H" "$(( NOW - 30 ))"
 DIR_H="$CITY_H/.gc/runtime/session-reconciler-trace/segments/2026/09/19"
 printf '{"seq":2,"record_type":"cycle_start","ts":"2026-09-19T99:99:99.999999Z' >> "$DIR_H/segment-000001.jsonl"
 OUT_H="$(run_detector "$CITY_H" "$NOW" env FAKE_SUPERVISOR_ALIVE=1)"
-echo "$OUT_H" | grep -q '^reconciler-stall-detector: OK' && ok "H: valid line behind a truncated trailing write -> resolves OK, not UNKNOWN" || bad "H: expected OK, got: $OUT_H"
+echo "$OUT_H" | grep '^reconciler-stall-detector: OK' >/dev/null && ok "H: valid line behind a truncated trailing write -> resolves OK, not UNKNOWN" || bad "H: expected OK, got: $OUT_H"
 
 echo "== ga-srp8hk: alert cooldown suppresses duplicate pages, and clears on recovery =="
 
@@ -216,7 +216,7 @@ run_detector "$CITY_F" "$NOW" env FAKE_SUPERVISOR_ALIVE=1 >/dev/null
 OUT_F2="$(run_detector "$CITY_F" "$NOW" env FAKE_SUPERVISOR_ALIVE=1)"
 MAIL_CALLS_F="$(grep -c '^gc mail send' "$SCRATCH_ROOT/calls.log" || true)"
 [ "$MAIL_CALLS_F" = "1" ] && ok "F: second STALLED tick within cooldown -> still exactly 1 mail send total" || bad "F: expected 1 mail send, got $MAIL_CALLS_F"
-echo "$OUT_F2" | grep -q 'cooldown' && ok "F: second run's own output names the cooldown suppression" || bad "F: $OUT_F2"
+echo "$OUT_F2" | grep 'cooldown' >/dev/null && ok "F: second run's own output names the cooldown suppression" || bad "F: $OUT_F2"
 
 echo "== ga-srp8hk reopen: hysteresis -- a LONE healthy tick must not re-arm immediate paging =="
 
@@ -232,11 +232,11 @@ mk_segment "$CITY_G1" "$(( NOW - 960 ))"
 run_detector "$CITY_G1" "$NOW" env FAKE_SUPERVISOR_ALIVE=1 >/dev/null    # 1st STALLED -> alerts, writes cooldown
 mk_segment "$CITY_G1" "$NOW"                                             # one healthy tick lands
 OUT_G1_OK="$(run_detector "$CITY_G1" "$NOW" env FAKE_SUPERVISOR_ALIVE=1)" # OK, streak=1 (< 3) -> cooldown left standing
-echo "$OUT_G1_OK" | grep -q 'ok_streak=1/3' && ok "G1: single OK reports streak 1/3, cooldown left standing" || bad "G1: $OUT_G1_OK"
+echo "$OUT_G1_OK" | grep 'ok_streak=1/3' >/dev/null && ok "G1: single OK reports streak 1/3, cooldown left standing" || bad "G1: $OUT_G1_OK"
 [ -f "$CITY_G1/.gc/state/reconciler-stall-detector-last-alert" ] && ok "G1: cooldown file still present after only 1 OK" || bad "G1: cooldown file was cleared after just 1 OK -- hysteresis not applied"
 mk_segment "$CITY_G1" "$(( NOW - 960 ))"                                  # stalls again, moments later
 OUT_G1_RESTALL="$(run_detector "$CITY_G1" "$(( NOW + 30 ))" env FAKE_SUPERVISOR_ALIVE=1)"
-echo "$OUT_G1_RESTALL" | grep -q 'cooldown' && ok "G1: fresh stall right after a single OK stays SUPPRESSED by the original cooldown (the exact bug this fix closes)" || bad "G1: $OUT_G1_RESTALL"
+echo "$OUT_G1_RESTALL" | grep 'cooldown' >/dev/null && ok "G1: fresh stall right after a single OK stays SUPPRESSED by the original cooldown (the exact bug this fix closes)" || bad "G1: $OUT_G1_RESTALL"
 MAIL_CALLS_G1="$(grep -c '^gc mail send' "$SCRATCH_ROOT/calls.log" || true)"
 [ "$MAIL_CALLS_G1" = "1" ] && ok "G1: still exactly 1 mail send total across the whole sequence (1 alert, not 2)" || bad "G1: expected 1 mail send, got $MAIL_CALLS_G1"
 
@@ -257,7 +257,7 @@ OK_STREAK_FILE_G2="$CITY_G2/.gc/state/reconciler-stall-detector-ok-streak"
 [ ! -f "$CITY_G2/.gc/state/reconciler-stall-detector-last-alert" ] && ok "G2: cooldown cleared after 3 consecutive OK ticks (sustained recovery)" || bad "G2: cooldown still present after sustained recovery"
 mk_segment "$CITY_G2" "$(( NOW - 960 ))"                                   # stalls again, moments later
 OUT_G2_RESTALL="$(run_detector "$CITY_G2" "$(( NOW + 4 ))" env FAKE_SUPERVISOR_ALIVE=1)"
-echo "$OUT_G2_RESTALL" | grep -q '^reconciler-stall-detector: STALLED' && ok "G2: fresh stall right after SUSTAINED recovery alerts again immediately" || bad "G2: $OUT_G2_RESTALL"
+echo "$OUT_G2_RESTALL" | grep '^reconciler-stall-detector: STALLED' >/dev/null && ok "G2: fresh stall right after SUSTAINED recovery alerts again immediately" || bad "G2: $OUT_G2_RESTALL"
 MAIL_CALLS_G2="$(grep -c '^gc mail send' "$SCRATCH_ROOT/calls.log" || true)"
 [ "$MAIL_CALLS_G2" = "2" ] && ok "G2: two distinct episodes (separated by a genuinely sustained recovery) -> 2 mail sends total" || bad "G2: expected 2 mail sends, got $MAIL_CALLS_G2"
 
@@ -381,7 +381,7 @@ CITY_L1="$SCRATCH_ROOT/city-l1"
 : > "$SCRATCH_ROOT/calls.log"
 mk_segment "$CITY_L1" "$(( NOW - 960 ))"
 OUT_L1="$(run_detector "$CITY_L1" "$NOW" env FAKE_SUPERVISOR_ALIVE=1)"
-echo "$OUT_L1" | grep -q 'escalated_to_notify=0' && ok "L1: 960s stall reports escalated_to_notify=0" || bad "L1: $OUT_L1"
+echo "$OUT_L1" | grep 'escalated_to_notify=0' >/dev/null && ok "L1: 960s stall reports escalated_to_notify=0" || bad "L1: $OUT_L1"
 grep -q '^gc mail send' "$SCRATCH_ROOT/calls.log" && ok "L1: mail fires at 960s (past the 900s STALLED bar)" || bad "L1: mail did not fire"
 grep -q '^notify ' "$SCRATCH_ROOT/calls.log" && bad "L1: notify fired at 960s -- should be withheld under the 1800s escalation bar" || ok "L1: notify correctly withheld -- Mayor-only, Athos's phone not paged"
 
@@ -390,7 +390,7 @@ CITY_L2="$SCRATCH_ROOT/city-l2"
 : > "$SCRATCH_ROOT/calls.log"
 mk_segment "$CITY_L2" "$(( NOW - 1860 ))"
 OUT_L2="$(run_detector "$CITY_L2" "$NOW" env FAKE_SUPERVISOR_ALIVE=1)"
-echo "$OUT_L2" | grep -q 'escalated_to_notify=1' && ok "L2: 1860s stall reports escalated_to_notify=1" || bad "L2: $OUT_L2"
+echo "$OUT_L2" | grep 'escalated_to_notify=1' >/dev/null && ok "L2: 1860s stall reports escalated_to_notify=1" || bad "L2: $OUT_L2"
 grep -q '^gc mail send' "$SCRATCH_ROOT/calls.log" && ok "L2: mail fires at 1860s" || bad "L2: mail did not fire"
 grep -q '^notify ' "$SCRATCH_ROOT/calls.log" && ok "L2: notify ALSO fires past the 1800s escalation bar -- Athos's phone paged" || bad "L2: notify did not fire"
 
@@ -401,7 +401,7 @@ CITY_L3="$SCRATCH_ROOT/city-l3"
 : > "$SCRATCH_ROOT/calls.log"
 mk_segment "$CITY_L3" "$(( NOW - 1800 ))"
 OUT_L3="$(run_detector "$CITY_L3" "$NOW" env FAKE_SUPERVISOR_ALIVE=1)"
-echo "$OUT_L3" | grep -q 'escalated_to_notify=1' && ok "L3: age_sec exactly 1800 escalates (boundary is >=, not >)" || bad "L3: $OUT_L3"
+echo "$OUT_L3" | grep 'escalated_to_notify=1' >/dev/null && ok "L3: age_sec exactly 1800 escalates (boundary is >=, not >)" || bad "L3: $OUT_L3"
 
 echo "== ga-srp8hk reopen: i/o-timeout lines are filtered to the CURRENT episode window =="
 
@@ -469,7 +469,7 @@ while [ "$POLL_EP" -le "$LAST_EP" ]; do
   done
   mk_segment "$CITY_REPLAY" "${REPLAY_TICKS_EP[$LATEST_IDX]}"
   OUT_POLL="$(run_detector "$CITY_REPLAY" "$POLL_EP" env FAKE_SUPERVISOR_ALIVE=1)"
-  echo "$OUT_POLL" | grep -q 'alerted' && echo "poll=$POLL_EP $OUT_POLL" >> "$REPLAY_ALERT_LOG"
+  echo "$OUT_POLL" | grep 'alerted' >/dev/null && echo "poll=$POLL_EP $OUT_POLL" >> "$REPLAY_ALERT_LOG"
   POLL_EP=$(( POLL_EP + 120 ))
 done
 

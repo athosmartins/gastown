@@ -180,22 +180,22 @@ EOF
 run_block disagree
 [ "$RUN_RC" -eq 0 ] && ok "T1 block runs clean (rc=0; continue-based halt, BD state is the signal)" \
   || nok "T1 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=0" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=0" >/dev/null \
   && ok "T1 own-merge probe classified NOT inert (new_sensitive.py is a real hit)" \
   || nok "T1 inert classification" "$LOG_OUT"
 COMMENT_CALL="$(echo "$BD_CALLS" | grep "bd -C .* comment ga-test" || true)"
 [ -n "$COMMENT_CALL" ] && ok "T1 halt comment was posted" || nok "T1 no comment call found" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "restart THESE for this merge" \
+echo "$BD_CALLS" | grep "restart THESE for this merge" >/dev/null \
   && ok "T1 halt leads with the per-bead attribution phrase" \
   || nok "T1 missing lead-with phrase" "$BD_CALLS"
 LEAD_PART="$(echo "$BD_CALLS" | awk '/Context only/{exit} {print}')"
-echo "$LEAD_PART" | grep -q "com.test.new-daemon" \
+echo "$LEAD_PART" | grep "com.test.new-daemon" >/dev/null \
   && ok "T1 leading action names the precisely-attributed daemon (new-daemon)" \
   || nok "T1 lead missing new-daemon" "$LEAD_PART"
-echo "$LEAD_PART" | grep -q "com.test.old-daemon" \
+echo "$LEAD_PART" | grep "com.test.old-daemon" >/dev/null \
   && nok "T1 leading action wrongly names the unattributed daemon (old-daemon leaked into the lead)" "$LEAD_PART" \
   || ok "T1 leading action does NOT name the unattributed daemon (old-daemon kept out of the lead)"
-echo "$BD_CALLS" | grep -q "Context only — NOT attributed to this merge" \
+echo "$BD_CALLS" | grep "Context only — NOT attributed to this merge" >/dev/null \
   && ok "T1 wide list demoted to an explicitly-marked context line" \
   || nok "T1 missing context-demotion marker" "$BD_CALLS"
 # Scoped to the single "Context only" LINE itself (not everything after it —
@@ -208,13 +208,13 @@ CONTEXT_LINE="$(echo "$BD_CALLS" | grep "Context only — NOT attributed to this
 # OWN daemons (ga-8i2nds Aceite 1: the wide list was identical on every story
 # while the baseline stayed frozen) — the unattributed daemon is acknowledged as
 # a COUNT here, and "nothing hidden" is kept by the wide list staying in the log.
-echo "$CONTEXT_LINE" | grep -q "1 other sensitive daemon" \
+echo "$CONTEXT_LINE" | grep "1 other sensitive daemon" >/dev/null \
   && ok "T1 demoted context line still acknowledges the unattributed daemon, as a count (de-prioritized, not silent)" \
   || nok "T1 context line does not count the unattributed daemon" "$CONTEXT_LINE"
-echo "$CONTEXT_LINE" | grep -q "com.test.old-daemon" \
+echo "$CONTEXT_LINE" | grep "com.test.old-daemon" >/dev/null \
   && nok "T1 context line names the unattributed daemon (belongs to an earlier merge)" "$CONTEXT_LINE" \
   || ok "T1 context line does not name the unattributed daemon"
-echo "$LOG_OUT" | grep -q "guarded=\[.*com.test.old-daemon" \
+echo "$LOG_OUT" | grep "guarded=\[.*com.test.old-daemon" >/dev/null \
   && ok "T1 nothing hidden — the unattributed daemon stays in the log's wide list" \
   || nok "T1 old-daemon missing from the log's wide list" "$LOG_OUT"
 # gate_run=ga-c6ke4i (Reviewer-1 FAIL): the context line used to interpolate
@@ -222,7 +222,7 @@ echo "$LOG_OUT" | grep -q "guarded=\[.*com.test.old-daemon" \
 # "restart THESE" line) also leaked into this "NOT attributed" line two lines
 # later — self-contradictory. Assert the exclusion directly: new-daemon must
 # appear ONLY in the lead, never here too.
-echo "$CONTEXT_LINE" | grep -q "com.test.new-daemon" \
+echo "$CONTEXT_LINE" | grep "com.test.new-daemon" >/dev/null \
   && nok "T1 context line wrongly re-lists the already-attributed daemon (new-daemon) as NOT attributed — self-contradicts the lead line" "$CONTEXT_LINE" \
   || ok "T1 context line correctly excludes the already-attributed daemon (new-daemon) — no self-contradiction with the lead line"
 
@@ -233,34 +233,34 @@ echo "$CONTEXT_LINE" | grep -q "com.test.new-daemon" \
 #    attribution at all — the exact shape of wa-vbsm5.1 (2026-09-18) ──────
 run_block path_a
 [ "$RUN_RC" -eq 0 ] && ok "T3 block runs clean (rc=0)" || nok "T3 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=0" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=0" >/dev/null \
   && ok "T3 own-merge classified via the probe (Path A now runs it too), not just the pattern check" \
   || nok "T3 inert classification" "$LOG_OUT"
-echo "$BD_CALLS" | grep -q "restart THESE for this merge" \
+echo "$BD_CALLS" | grep "restart THESE for this merge" >/dev/null \
   && ok "T3 halt now leads with the per-bead attribution phrase on Path A too (ga-ndu4ic)" \
   || nok "T3 missing lead-with phrase — Path A attribution regressed" "$BD_CALLS"
 LEAD_PART="$(echo "$BD_CALLS" | awk '/Context only/{exit} {print}')"
-echo "$LEAD_PART" | grep -q "com.test.new-daemon" \
+echo "$LEAD_PART" | grep "com.test.new-daemon" >/dev/null \
   && ok "T3 leading action names the precisely-attributed daemon (new-daemon)" \
   || nok "T3 lead missing new-daemon" "$LEAD_PART"
-echo "$LEAD_PART" | grep -q "com.test.old-daemon" \
+echo "$LEAD_PART" | grep "com.test.old-daemon" >/dev/null \
   && nok "T3 leading action wrongly names the unattributed daemon (old-daemon leaked into the lead)" "$LEAD_PART" \
   || ok "T3 leading action does NOT name the unattributed daemon (old-daemon kept out of the lead)"
-echo "$BD_CALLS" | grep -q "Context only — NOT attributed to this merge" \
+echo "$BD_CALLS" | grep "Context only — NOT attributed to this merge" >/dev/null \
   && ok "T3 wide list demoted to an explicitly-marked context line" \
   || nok "T3 missing context-demotion marker" "$BD_CALLS"
 CONTEXT_LINE="$(echo "$BD_CALLS" | grep "Context only — NOT attributed to this merge")"
 # ga-8i2nds UPDATE — see T1: count on the context line, names stay in the log.
-echo "$CONTEXT_LINE" | grep -q "1 other sensitive daemon" \
+echo "$CONTEXT_LINE" | grep "1 other sensitive daemon" >/dev/null \
   && ok "T3 demoted context line still acknowledges the unattributed daemon, as a count (de-prioritized, not silent)" \
   || nok "T3 context line does not count the unattributed daemon" "$CONTEXT_LINE"
-echo "$CONTEXT_LINE" | grep -q "com.test.old-daemon" \
+echo "$CONTEXT_LINE" | grep "com.test.old-daemon" >/dev/null \
   && nok "T3 context line names the unattributed daemon (belongs to an earlier merge)" "$CONTEXT_LINE" \
   || ok "T3 context line does not name the unattributed daemon"
-echo "$LOG_OUT" | grep -q "guarded=\[.*com.test.old-daemon" \
+echo "$LOG_OUT" | grep "guarded=\[.*com.test.old-daemon" >/dev/null \
   && ok "T3 nothing hidden — the unattributed daemon stays in the log's wide list" \
   || nok "T3 old-daemon missing from the log's wide list" "$LOG_OUT"
-echo "$CONTEXT_LINE" | grep -q "com.test.new-daemon" \
+echo "$CONTEXT_LINE" | grep "com.test.new-daemon" >/dev/null \
   && nok "T3 context line wrongly re-lists the already-attributed daemon (new-daemon) as NOT attributed" "$CONTEXT_LINE" \
   || ok "T3 context line correctly excludes the already-attributed daemon (new-daemon)"
 

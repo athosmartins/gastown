@@ -319,7 +319,7 @@ fi
 # comments quote the old pattern verbatim (so a reader can see what changed),
 # which would otherwise make this guard permanently fail against itself.
 # Only EXECUTABLE code containing the old pattern is a real regression.
-if grep -vE '^\s*#' "$SCRIPT" 2>/dev/null | grep -qE 'grep -oE "merged to \[a-z_\]\+/main"'; then
+if grep -vE '^\s*#' "$SCRIPT" 2>/dev/null | grep -E 'grep -oE "merged to \[a-z_\]\+/main"' >/dev/null; then
   bad "the old ad hoc \"merged to [a-z_]+/main\" (no sha anchor, head -1) regex is back as LIVE CODE in story-delivery.sh — this IS the ga-aqqj0 bug"
 else
   ok "the old ad hoc rig-from-comment regex is gone from live code"

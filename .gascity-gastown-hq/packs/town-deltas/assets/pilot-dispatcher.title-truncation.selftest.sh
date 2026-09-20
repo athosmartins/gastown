@@ -55,12 +55,12 @@ fi
 echo "── 2. drift-guard: codepoint-safe jq slice wired at both call sites ──"
 STORY_TITLE_LINE=$(grep -E '^\s*STORY_TITLE=' "$DISPATCHER" | head -1)
 STORY_ESTRELA_LINE=$(grep -E '^\s*STORY_ESTRELA=' "$DISPATCHER" | head -1)
-if echo "$STORY_TITLE_LINE" | grep -qE '\.\[0:100\]'; then
+if echo "$STORY_TITLE_LINE" | grep -E '\.\[0:100\]' >/dev/null; then
   ok "STORY_TITLE uses jq .[0:100] codepoint slice"
 else
   bad "STORY_TITLE does not use a jq .[0:100] slice: $STORY_TITLE_LINE"
 fi
-if echo "$STORY_ESTRELA_LINE" | grep -qE '\.\[0:200\]'; then
+if echo "$STORY_ESTRELA_LINE" | grep -E '\.\[0:200\]' >/dev/null; then
   ok "STORY_ESTRELA uses jq .[0:200] codepoint slice"
 else
   bad "STORY_ESTRELA does not use a jq .[0:200] slice: $STORY_ESTRELA_LINE"

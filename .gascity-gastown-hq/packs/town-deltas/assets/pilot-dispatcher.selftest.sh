@@ -929,19 +929,19 @@ echo "pilot-dispatcher.selftest — dependency-blocking filter (ga-5ew)"
 echo "Scenario 1: tt-blkd BLOCKED — must skip it and dispatch tt-unblk"
 LOG1="$(run_dispatch "tt-blkd")"
 
-if echo "$LOG1" | grep -q "excluded 1 blocked candidate"; then
+if echo "$LOG1" | grep "excluded 1 blocked candidate" >/dev/null; then
   ok "logged exclusion of the blocked candidate"
 else
   bad "did NOT log exclusion (expected 'excluded 1 blocked candidate')"
 fi
 
-if echo "$LOG1" | grep -q "Lane picks — small: tt-unblk"; then
+if echo "$LOG1" | grep "Lane picks — small: tt-unblk" >/dev/null; then
   ok "dispatched the UNBLOCKED bug (tt-unblk)"
 else
   bad "did not pick tt-unblk as the small-lane dispatch"
 fi
 
-if echo "$LOG1" | grep -q "Lane picks — small: tt-blkd"; then
+if echo "$LOG1" | grep "Lane picks — small: tt-blkd" >/dev/null; then
   bad "REGRESSION: dispatched the blocked bug (tt-blkd)"
 else
   ok "did NOT dispatch the blocked bug"
@@ -951,13 +951,13 @@ fi
 echo "Scenario 2: nothing blocked — must pick highest priority (tt-blkd) and not exclude"
 LOG2="$(run_dispatch "")"
 
-if echo "$LOG2" | grep -q "excluded .* blocked candidate"; then
+if echo "$LOG2" | grep "excluded .* blocked candidate" >/dev/null; then
   bad "over-filtered: emitted an exclusion when nothing was blocked"
 else
   ok "no spurious exclusion when blocked-set is empty"
 fi
 
-if echo "$LOG2" | grep -q "Lane picks — small: tt-blkd"; then
+if echo "$LOG2" | grep "Lane picks — small: tt-blkd" >/dev/null; then
   ok "picked the highest-priority bug (tt-blkd) when unblocked"
 else
   bad "did not pick the highest-priority bug when nothing was blocked"
@@ -971,13 +971,13 @@ fi
 echo "Scenario 3: needs:engine-window bug (P0) must be excluded, keeper (P1) dispatched"
 LOG3="$(run_dispatch "" 1)"
 
-if echo "$LOG3" | grep -q "Lane picks — small: tt-engwin"; then
+if echo "$LOG3" | grep "Lane picks — small: tt-engwin" >/dev/null; then
   bad "LEAK: dispatched the engine-window bug (tt-engwin)"
 else
   ok "did NOT dispatch the engine-window bug"
 fi
 
-if echo "$LOG3" | grep -q "Lane picks — small: tt-keep"; then
+if echo "$LOG3" | grep "Lane picks — small: tt-keep" >/dev/null; then
   ok "dispatched the normal keeper bug (tt-keep) instead"
 else
   bad "did not dispatch the keeper bug (tt-keep)"
@@ -1006,19 +1006,19 @@ fi
 echo "Scenario 3b: unlabeled engine-rebuild-signal bug excluded by body-text veto; benign P0 mention still dispatched"
 LOG3B="$(run_dispatch "" 0 "" 0 0 1)"
 
-if echo "$LOG3B" | grep -q "Lane picks — small: tt-engsignal"; then
+if echo "$LOG3B" | grep "Lane picks — small: tt-engsignal" >/dev/null; then
   bad "LEAK: dispatched the unlabeled engine-signal bug (tt-engsignal)"
 else
   ok "did NOT dispatch the unlabeled engine-signal bug"
 fi
 
-if echo "$LOG3B" | grep -q "Lane picks — small: tt-frameworklabel"; then
+if echo "$LOG3B" | grep "Lane picks — small: tt-frameworklabel" >/dev/null; then
   bad "LEAK: dispatched the framework:engine-labeled bug (tt-frameworklabel)"
 else
   ok "did NOT dispatch the framework:engine-labeled bug"
 fi
 
-if echo "$LOG3B" | grep -q "Lane picks — small: tt-benign"; then
+if echo "$LOG3B" | grep "Lane picks — small: tt-benign" >/dev/null; then
   ok "dispatched the benign same-priority control (tt-benign) — regex not over-broad"
 else
   bad "did not dispatch the benign control (tt-benign) — regex may be over-broad, or veto broke the P0 pick"
@@ -1033,13 +1033,13 @@ fi
 echo "Scenario 3e: split-epic shell (P0 epic) must be excluded, keeper (P1 bug) dispatched"
 LOG3E="$(run_dispatch "" 0 "" 1)"
 
-if echo "$LOG3E" | grep -q "Lane picks — small: tt-epic"; then
+if echo "$LOG3E" | grep "Lane picks — small: tt-epic" >/dev/null; then
   bad "LEAK: dispatched the split-epic shell (tt-epic)"
 else
   ok "did NOT dispatch the split-epic shell"
 fi
 
-if echo "$LOG3E" | grep -q "Lane picks — small: tt-keep"; then
+if echo "$LOG3E" | grep "Lane picks — small: tt-keep" >/dev/null; then
   ok "dispatched the normal keeper bug (tt-keep) instead"
 else
   bad "did not dispatch the keeper bug (tt-keep)"
@@ -1177,7 +1177,7 @@ CONTROL_KIND_BEAD='[{"id":"bd-finalize","assignee":null,"labels":[],"description
 UNRELATED_META='[{"id":"bd-has-meta","assignee":null,"labels":[],"description":"x","metadata":{"story.rig":"whatsapp_automation"}}]'
 [ "$(_fc "$UNRELATED_META")" = '["bd-has-meta"]' ] && ok "ga-iu9m/ga-enfe: bead with unrelated metadata still dispatchable (no false-positive)" || bad "ga-iu9m/ga-enfe: false-positive — unrelated-metadata bead wrongly excluded (got: $(_fc "$UNRELATED_META"))"
 
-echo "$_FC_FN" | grep -q 'gc.root_bead_id' && ok "_filter_candidates carries the gc.root_bead_id workflow-step exclusion clause" || bad "gc.root_bead_id exclusion clause missing from _filter_candidates"
+echo "$_FC_FN" | grep 'gc.root_bead_id' >/dev/null && ok "_filter_candidates carries the gc.root_bead_id workflow-step exclusion clause" || bad "gc.root_bead_id exclusion clause missing from _filter_candidates"
 
 # ── Scenario 3e3b (ga-vhzy1): _reconcile_empty_description_signal exempts graph.v2
 # control beads from blocked:sem-descricao, mirroring _filter_candidates' own
@@ -1203,11 +1203,11 @@ RED_OUT2="$(_red "$RED_ROOT")"
 
 RED_STALE='[{"id":"ga-5soui","description":"","labels":["blocked:sem-descricao"],"created_by":"control-dispatcher","metadata":{"gc.root_bead_id":"ga-033hc","gc.kind":"workflow-finalize"}}]'
 RED_OUT3="$(_red "$RED_STALE")"
-printf '%s' "$RED_OUT3" | grep -q 'WOULD remove.*ga-5soui' && ok "ga-vhzy1: already-mislabeled graph.v2 bead has the stale label scheduled for removal" || bad "ga-vhzy1: stale label not scheduled for removal (got: $RED_OUT3)"
+printf '%s' "$RED_OUT3" | grep 'WOULD remove.*ga-5soui' >/dev/null && ok "ga-vhzy1: already-mislabeled graph.v2 bead has the stale label scheduled for removal" || bad "ga-vhzy1: stale label not scheduled for removal (got: $RED_OUT3)"
 
 RED_NORMAL='[{"id":"dc-abcde","description":"","labels":[],"created_by":"someone","metadata":{}}]'
 RED_OUT4="$(_red "$RED_NORMAL")"
-printf '%s' "$RED_OUT4" | grep -q 'WOULD add.*dc-abcde' && ok "ga-vhzy1: ordinary non-graph.v2 empty-description bead is STILL flagged (non-regression)" || bad "ga-vhzy1: non-regression broken -- ordinary empty-description bead not flagged (got: $RED_OUT4)"
+printf '%s' "$RED_OUT4" | grep 'WOULD add.*dc-abcde' >/dev/null && ok "ga-vhzy1: ordinary non-graph.v2 empty-description bead is STILL flagged (non-regression)" || bad "ga-vhzy1: non-regression broken -- ordinary empty-description bead not flagged (got: $RED_OUT4)"
 
 # ── Scenario 3e4 (ga-nimyz): Pilot's own sling/dispatch-wrapper beads excluded ──
 # Live reproduction: dispatching ga-4iw15 created sling bead ga-mr8ej
@@ -1242,7 +1242,7 @@ SLING_WRAPPER_BEAD='[{"id":"bd-sling","assignee":null,"labels":["ctx:ready","exe
 REDISPATCH_STORY_BEAD='[{"id":"bd-redispatch","assignee":null,"labels":["pilot:dispatched"],"description":"x","metadata":{}}]'
 [ "$(_fc "$REDISPATCH_STORY_BEAD")" = '["bd-redispatch"]' ] && ok "ga-nimyz AC4: real re-dispatched story (pilot:dispatched, no pilot.sling_for) stays candidatable" || bad "ga-nimyz AC4: false-positive — re-dispatched story wrongly excluded (got: $(_fc "$REDISPATCH_STORY_BEAD"))"
 
-echo "$_FC_FN" | grep -q 'pilot.sling_for' && ok "_filter_candidates carries the pilot.sling_for sling-wrapper exclusion clause" || bad "pilot.sling_for exclusion clause missing from _filter_candidates"
+echo "$_FC_FN" | grep 'pilot.sling_for' >/dev/null && ok "_filter_candidates carries the pilot.sling_for sling-wrapper exclusion clause" || bad "pilot.sling_for exclusion clause missing from _filter_candidates"
 
 # ── Scenario ga-nf4x5 (SECURITY): story:needs-approval is the Athos
 # MERIT/legal sign-off gate — distinct from story:needs-human (an INFO-GAP:
@@ -1258,7 +1258,7 @@ echo "$_FC_FN" | grep -q 'pilot.sling_for' && ok "_filter_candidates carries the
 echo "Scenario ga-nf4x5: story:needs-approval bead is excluded from the candidate pool (human merit/legal gate)"
 NEEDS_APPROVAL='[{"id":"bd-needs-approval","assignee":null,"labels":["story:needs-approval","ctx:ready","exec:auto"],"description":"x"},{"id":"bd-approval-free","assignee":null,"labels":["ctx:ready","exec:auto"],"description":"x"}]'
 [ "$(_fc "$NEEDS_APPROVAL")" = '["bd-approval-free"]' ] && ok "ga-nf4x5: story:needs-approval+ctx:ready+exec:auto bead excluded; clean sibling kept" || bad "ga-nf4x5: story:needs-approval bead leaked into candidates (SECURITY REGRESSION): $(_fc "$NEEDS_APPROVAL")"
-echo "$_FC_FN" | grep -q '"story:needs-approval"' && ok "_filter_candidates carries the story:needs-approval clause" || bad "story:needs-approval clause missing from _filter_candidates"
+echo "$_FC_FN" | grep '"story:needs-approval"' >/dev/null && ok "_filter_candidates carries the story:needs-approval clause" || bad "story:needs-approval clause missing from _filter_candidates"
 
 # AC1(b)/AC2 cross-check: the routed-pool probes (wa-worker/ps-worker) must
 # carry the SAME exclusion independently of _filter_candidates — they bypass
@@ -1297,7 +1297,7 @@ echo "Scenario ga-3lsy1b: needs-human-decision sub-variant is also excluded (sta
 NEEDS_HUMAN_DECISION='[{"id":"bd-needs-human-decision","assignee":null,"labels":["needs-human-decision"],"description":"x"},{"id":"bd-human-free2","assignee":null,"labels":[],"description":"x"}]'
 [ "$(_fc "$NEEDS_HUMAN_DECISION")" = '["bd-human-free2"]' ] && ok "ga-3lsy1: needs-human-decision bug excluded; clean sibling kept" || bad "ga-3lsy1: needs-human-decision bead leaked into candidates (SAFETY REGRESSION): $(_fc "$NEEDS_HUMAN_DECISION")"
 
-echo "$_FC_FN" | grep -q 'startswith("needs-human")' && ok "_filter_candidates carries the bare needs-human clause" || bad "bare needs-human clause missing from _filter_candidates"
+echo "$_FC_FN" | grep 'startswith("needs-human")' >/dev/null && ok "_filter_candidates carries the bare needs-human clause" || bad "bare needs-human clause missing from _filter_candidates"
 
 # ── Scenario ga-1mqdz AC1: pilot:no-auto-dispatch must exclude candidacy STANDALONE ──
 # Bug ga-1mqdz: pilot:no-auto-dispatch is the direct Mayor/human "stop dispatching
@@ -1314,7 +1314,7 @@ echo "$_FC_FN" | grep -q 'startswith("needs-human")' && ok "_filter_candidates c
 echo "Scenario ga-1mqdz: pilot:no-auto-dispatch bead is excluded from the candidate pool standalone"
 NO_AUTO_DISPATCH='[{"id":"bd-no-auto","assignee":null,"labels":["pilot:no-auto-dispatch","ctx:ready","exec:auto"],"description":"x"},{"id":"bd-auto-free","assignee":null,"labels":["ctx:ready","exec:auto"],"description":"x"}]'
 [ "$(_fc "$NO_AUTO_DISPATCH")" = '["bd-auto-free"]' ] && ok "ga-1mqdz: pilot:no-auto-dispatch bead excluded even with ctx:ready+exec:auto present; clean sibling kept" || bad "ga-1mqdz: pilot:no-auto-dispatch bead leaked into candidates: $(_fc "$NO_AUTO_DISPATCH")"
-echo "$_FC_FN" | grep -q '"pilot:no-auto-dispatch"' && ok "_filter_candidates carries the pilot:no-auto-dispatch clause" || bad "pilot:no-auto-dispatch clause missing from _filter_candidates"
+echo "$_FC_FN" | grep '"pilot:no-auto-dispatch"' >/dev/null && ok "_filter_candidates carries the pilot:no-auto-dispatch clause" || bad "pilot:no-auto-dispatch clause missing from _filter_candidates"
 
 # ── Scenario ga-rfpm9: bare "no-auto-dispatch" (no pilot: prefix) is a
 # DIFFERENT jq string than pilot:no-auto-dispatch — silently unrecognized
@@ -1327,7 +1327,7 @@ echo "$_FC_FN" | grep -q '"pilot:no-auto-dispatch"' && ok "_filter_candidates ca
 echo "Scenario ga-rfpm9: bare no-auto-dispatch (no pilot: prefix) bead is ALSO excluded from the candidate pool standalone"
 NO_AUTO_DISPATCH_BARE='[{"id":"bd-no-auto-bare","assignee":null,"labels":["no-auto-dispatch","ctx:ready","exec:auto"],"description":"x"},{"id":"bd-auto-free2","assignee":null,"labels":["ctx:ready","exec:auto"],"description":"x"}]'
 [ "$(_fc "$NO_AUTO_DISPATCH_BARE")" = '["bd-auto-free2"]' ] && ok "ga-rfpm9: bare no-auto-dispatch bead excluded even with ctx:ready+exec:auto present; clean sibling kept" || bad "ga-rfpm9: bare no-auto-dispatch bead leaked into candidates: $(_fc "$NO_AUTO_DISPATCH_BARE")"
-echo "$_FC_FN" | grep -q '"no-auto-dispatch"' && ok "_filter_candidates carries the bare no-auto-dispatch clause" || bad "bare no-auto-dispatch clause missing from _filter_candidates"
+echo "$_FC_FN" | grep '"no-auto-dispatch"' >/dev/null && ok "_filter_candidates carries the bare no-auto-dispatch clause" || bad "bare no-auto-dispatch clause missing from _filter_candidates"
 # Negative control: a label that merely SHARES the "no-auto-dispatch" substring
 # without being an exact standalone label must NOT false-positive — the fix
 # uses exact equality (. == "no-auto-dispatch"), not startswith/contains, so a
@@ -1504,8 +1504,8 @@ echo "Scenario 3e2k-benign (ga-xdukc): 'decision' as an ordinary mid-title word 
 BENIGN_DECISION_WORD='[{"id":"bd-benign-decision","assignee":null,"labels":[],"title":"Refactor the decision tree module in the pricing engine","description":"unrelated to any Athos approval, just an engineering refactor"}]'
 [ "$(_fc "$BENIGN_DECISION_WORD")" = '["bd-benign-decision"]' ] && ok "ga-xdukc: mid-title 'decision' word NOT caught by the anchored veto (no over-broad regex)" || bad "ga-xdukc: REGRESSION — benign mid-title 'decision' word wrongly excluded (got: $(_fc "$BENIGN_DECISION_WORD"))"
 
-echo "$_FC_FN" | grep -qE 'DECIS\[' && ok "_filter_candidates carries the DECISAO/DECISION title-anchor clause" || bad "DECISAO/DECISION title-anchor clause missing from _filter_candidates"
-echo "$_FC_FN" | grep -qE 'athos decide' && ok "_filter_candidates carries the so-o-Athos-decide body-phrase clause" || bad "so-o-Athos-decide body-phrase clause missing from _filter_candidates"
+echo "$_FC_FN" | grep -E 'DECIS\[' >/dev/null && ok "_filter_candidates carries the DECISAO/DECISION title-anchor clause" || bad "DECISAO/DECISION title-anchor clause missing from _filter_candidates"
+echo "$_FC_FN" | grep -E 'athos decide' >/dev/null && ok "_filter_candidates carries the so-o-Athos-decide body-phrase clause" || bad "so-o-Athos-decide body-phrase clause missing from _filter_candidates"
 
 # ── Scenario ga-fnnyy: 🚨 compliance/safety marker excluded via body-text veto,
 # independent of labels ──────────────────────────────────────────────────────
@@ -1534,7 +1534,7 @@ echo "Scenario ga-fnnyy-noemoji: plain-language safety mention WITHOUT the 🚨 
 NO_EMOJI='[{"id":"bd-no-emoji","assignee":null,"labels":[],"title":"expose owner data on the ficha","description":"this touches personal data, compliance should look at it eventually"}]'
 [ "$(_fc "$NO_EMOJI")" = '["bd-no-emoji"]' ] && ok "ga-fnnyy: no false-positive on safety-adjacent prose lacking the 🚨 marker" || bad "ga-fnnyy: REGRESSION — non-marked bead wrongly excluded (got: $(_fc "$NO_EMOJI"))"
 
-echo "$_FC_FN" | grep -qF '🚨' && ok "_filter_candidates carries the 🚨 compliance-marker clause" || bad "🚨 compliance-marker clause missing from _filter_candidates"
+echo "$_FC_FN" | grep -F '🚨' >/dev/null && ok "_filter_candidates carries the 🚨 compliance-marker clause" || bad "🚨 compliance-marker clause missing from _filter_candidates"
 
 # ── Scenario OWN-GUARD (ga-htjni ext; wa-5wv49 / wa-xnuxd) ──────────────────────
 # The reported systemic double-dispatch: a crew/human creates a bead intending to
@@ -1881,19 +1881,19 @@ _attmention "wa-1ccdz" && bad "OWN-GUARD(e-unit13): unrelated evidence on anothe
 echo "Scenario 3f: pre-approval/in-triage stories must be excluded, keeper (P1 bug) dispatched"
 LOG3F="$(run_dispatch "" 0 "" 0 1)"
 
-if echo "$LOG3F" | grep -q "Lane picks — small: tt-triage"; then
+if echo "$LOG3F" | grep "Lane picks — small: tt-triage" >/dev/null; then
   bad "LEAK: dispatched an in-triage story (tt-triage)"
 else
   ok "did NOT dispatch the in-triage story (tt-triage)"
 fi
 
-if echo "$LOG3F" | grep -q "Lane picks — small: tt-mislabel"; then
+if echo "$LOG3F" | grep "Lane picks — small: tt-mislabel" >/dev/null; then
   bad "LEAK: dispatched a mislabeled approved+unrefined story (tt-mislabel)"
 else
   ok "did NOT dispatch the mislabeled approved+unrefined story (tt-mislabel)"
 fi
 
-if echo "$LOG3F" | grep -q "Lane picks — small: tt-keep"; then
+if echo "$LOG3F" | grep "Lane picks — small: tt-keep" >/dev/null; then
   ok "dispatched the normal keeper bug (tt-keep) instead"
 else
   bad "did not dispatch the keeper bug (tt-keep)"
@@ -1923,7 +1923,7 @@ FRESH_STAMP="$((NOW - 60))"   # 1m young → fresh
 # 4a: old stamp → release.
 STALE_OLD='[{"id":"tt-stale","title":"x","description":"fixture body — context for veto test","status":"open","updated_at":"2020-01-01T00:00:00Z","labels":["story:approved","pilot:dispatching"],"metadata":{"pilot.dispatching_at":"'"$OLD_STAMP"'"}}]'
 LOG4A="$(run_step0 "$STALE_OLD")"
-if echo "$LOG4A" | grep -q "Releasing stale pilot:dispatching claim on tt-stale"; then
+if echo "$LOG4A" | grep "Releasing stale pilot:dispatching claim on tt-stale" >/dev/null; then
   ok "old stamp (age>TTL) → released the stale claim"
 else
   bad "old stamp should have been released"
@@ -1932,12 +1932,12 @@ fi
 # 4b: fresh stamp but ANCIENT updated_at → must KEEP (the actual Defect A repro).
 STALE_FRESH='[{"id":"tt-fresh","title":"x","description":"fixture body — context for veto test","status":"open","updated_at":"2020-01-01T00:00:00Z","labels":["story:approved","pilot:dispatching"],"metadata":{"pilot.dispatching_at":"'"$FRESH_STAMP"'"}}]'
 LOG4B="$(run_step0 "$STALE_FRESH")"
-if echo "$LOG4B" | grep -q "claim is fresh.*tt-fresh\|tt-fresh.*claim is fresh"; then
+if echo "$LOG4B" | grep "claim is fresh.*tt-fresh\|tt-fresh.*claim is fresh" >/dev/null; then
   ok "fresh stamp + ancient updated_at → KEPT (Defect A fixed)"
 else
   bad "fresh claim was not kept (Defect A regression)"
 fi
-if echo "$LOG4B" | grep -q "Releasing stale pilot:dispatching claim on tt-fresh"; then
+if echo "$LOG4B" | grep "Releasing stale pilot:dispatching claim on tt-fresh" >/dev/null; then
   bad "REGRESSION: released a FRESH claim (the ga-8nu8x double-dispatch bug)"
 else
   ok "did NOT release the fresh claim"
@@ -1946,12 +1946,12 @@ fi
 # 4c: no stamp (legacy) → must stamp now, NOT release.
 STALE_NOSTAMP='[{"id":"tt-legacy","title":"x","description":"fixture body — context for veto test","status":"open","updated_at":"2020-01-01T00:00:00Z","labels":["story:approved","pilot:dispatching"],"metadata":{}}]'
 LOG4C="$(run_step0 "$STALE_NOSTAMP")"
-if echo "$LOG4C" | grep -q "no pilot.dispatching_at stamp"; then
+if echo "$LOG4C" | grep "no pilot.dispatching_at stamp" >/dev/null; then
   ok "legacy claim with no stamp → stamped now, not released"
 else
   bad "legacy claim path did not trigger stamp-now behavior"
 fi
-if echo "$LOG4C" | grep -q "Releasing stale pilot:dispatching claim on tt-legacy"; then
+if echo "$LOG4C" | grep "Releasing stale pilot:dispatching claim on tt-legacy" >/dev/null; then
   bad "REGRESSION: released an un-stamped legacy claim (would re-dispatch fresh work)"
 else
   ok "did NOT release the un-stamped legacy claim"
@@ -2002,7 +2002,7 @@ if grep -q "released tt-flight" "$STATE/releases.log" 2>/dev/null; then
 else
   bad "claim was not released on the happy path"
 fi
-if echo "$LOG5A" | grep -q "DURABLE-INFLIGHT FAILED"; then
+if echo "$LOG5A" | grep "DURABLE-INFLIGHT FAILED" >/dev/null; then
   bad "happy path wrongly reported DURABLE-INFLIGHT FAILED"
 else
   ok "no false in-flight failure on the happy path"
@@ -2027,7 +2027,7 @@ fi
 
 # 5b: failure injection — in-flight write swallowed → must NOT release the claim.
 LOG5B="$(run_real_dispatch 1)"
-if echo "$LOG5B" | grep -q "DURABLE-INFLIGHT FAILED on tt-flight"; then
+if echo "$LOG5B" | grep "DURABLE-INFLIGHT FAILED on tt-flight" >/dev/null; then
   ok "unconfirmed in-flight → aborted hard with a loud error"
 else
   bad "did not detect/announce the unconfirmed in-flight write"
@@ -2050,7 +2050,7 @@ echo "Scenario 5c: gate:needs-human landing mid-dispatch aborts BEFORE a builder
 # 5c: escalation injected after the 1st `bd show` (the ga-zzrts claim-verify) —
 # i.e. exactly the ga-w5agg race: clean at claim-verify time, escalated after.
 LOG5C="$(run_real_dispatch_escalate 1)"
-if echo "$LOG5C" | grep -q "ga-88g2:.*tt-flight now has gate:needs-human"; then
+if echo "$LOG5C" | grep "ga-88g2:.*tt-flight now has gate:needs-human" >/dev/null; then
   ok "pre-dispatch re-check detected the mid-dispatch escalation and logged it"
 else
   bad "REGRESSION: no ga-88g2 pre-dispatch re-check fired — the race is unguarded (would dispatch onto a circuit-broken bead, as ga-w5agg's 9th dispatch did)"
@@ -2060,7 +2060,7 @@ if [ -f "$STATE/tt-flight.inflight" ]; then
 else
   ok "story:in-flight was never set — dispatch correctly aborted before finalization"
 fi
-if echo "$LOG5C" | grep -q "Dispatch complete:"; then
+if echo "$LOG5C" | grep "Dispatch complete:" >/dev/null; then
   bad "REGRESSION: dispatch completed (builder notified) despite the mid-dispatch escalation"
 else
   ok "no builder was notified — aborted before the sling/nudge step"
@@ -2070,7 +2070,7 @@ fi
 # new re-check must be a pure no-op on the ordinary happy path (no false positive).
 echo "Scenario 5d: control — no escalation → new re-check never false-positives (ga-88g2)"
 LOG5D="$(run_real_dispatch_escalate "")"
-if echo "$LOG5D" | grep -q "ga-88g2:"; then
+if echo "$LOG5D" | grep "ga-88g2:" >/dev/null; then
   bad "REGRESSION: pre-dispatch re-check fired with no escalation injected (false positive)"
 else
   ok "no false positive — re-check stayed silent on the plain happy path"
@@ -2096,7 +2096,7 @@ _MH_RECENT=$(date -u -r $(( _MH_NOW - 30 )) +%Y-%m-%dT%H:%M:%SZ)
 _MH_OLD=$(date -u -r $(( _MH_NOW - 3600 )) +%Y-%m-%dT%H:%M:%SZ)
 
 LOG5E="$(run_real_dispatch_mayorhold "[{\"author\":\"gastown__mayor\",\"text\":\"HOLD: engine-window disposition\",\"created_at\":\"$_MH_RECENT\"}]" 300)"
-if echo "$LOG5E" | grep -q "ga-pd7j:.*tt-flight is gate:needs-fix with a gastown__mayor comment"; then
+if echo "$LOG5E" | grep "ga-pd7j:.*tt-flight is gate:needs-fix with a gastown__mayor comment" >/dev/null; then
   ok "pre-dispatch re-check detected the fresh Mayor comment and logged it"
 else
   bad "REGRESSION: no ga-pd7j Mayor-hold check fired — a fresh out-of-band hold would be raced onto a builder"
@@ -2106,7 +2106,7 @@ if [ -f "$STATE/tt-flight.inflight" ]; then
 else
   ok "story:in-flight was never set — dispatch correctly deferred before finalization"
 fi
-if echo "$LOG5E" | grep -q "Dispatch complete:"; then
+if echo "$LOG5E" | grep "Dispatch complete:" >/dev/null; then
   bad "REGRESSION: dispatch completed (builder notified) despite the fresh Mayor comment"
 else
   ok "no builder was notified — deferred before the sling/nudge step"
@@ -2114,7 +2114,7 @@ fi
 
 echo "Scenario 5f: control — no comments at all → new re-check never false-positives (ga-pd7j)"
 LOG5F="$(run_real_dispatch_mayorhold "" 300)"
-if echo "$LOG5F" | grep -q "ga-pd7j:"; then
+if echo "$LOG5F" | grep "ga-pd7j:" >/dev/null; then
   bad "REGRESSION: Mayor-hold re-check fired with no comments injected (false positive)"
 else
   ok "no false positive — re-check stayed silent with no comments present"
@@ -2127,7 +2127,7 @@ fi
 
 echo "Scenario 5g: control — old Mayor comment + fresh non-Mayor comment → still no false positive (ga-pd7j)"
 LOG5G="$(run_real_dispatch_mayorhold "[{\"author\":\"gastown__mayor\",\"text\":\"old disposition\",\"created_at\":\"$_MH_OLD\"},{\"author\":\"dog-abc123\",\"text\":\"status update\",\"created_at\":\"$_MH_RECENT\"}]" 300)"
-if echo "$LOG5G" | grep -q "ga-pd7j:"; then
+if echo "$LOG5G" | grep "ga-pd7j:" >/dev/null; then
   bad "REGRESSION: Mayor-hold re-check fired on a stale Mayor comment / fresh non-Mayor comment (false positive)"
 else
   ok "no false positive — re-check correctly ignores expired Mayor comments and non-Mayor authors"
@@ -2150,7 +2150,7 @@ fi
 echo "Scenario 5h: pilot:no-auto-dispatch landing mid-dispatch aborts BEFORE a builder is dispatched (ga-4iw15 AC1)"
 
 LOG5H="$(run_real_dispatch_noauto 1)"
-if echo "$LOG5H" | grep -q "ga-4iw15:.*tt-flight.*pilot:no-auto-dispatch"; then
+if echo "$LOG5H" | grep "ga-4iw15:.*tt-flight.*pilot:no-auto-dispatch" >/dev/null; then
   ok "pre-dispatch re-check detected the mid-dispatch Mayor hold (pilot:no-auto-dispatch) and logged it"
 else
   bad "REGRESSION: no ga-4iw15 pre-dispatch re-check fired for pilot:no-auto-dispatch — the ga-9uwbw race is still unguarded"
@@ -2160,7 +2160,7 @@ if [ -f "$STATE/tt-flight.inflight" ]; then
 else
   ok "story:in-flight was never set — dispatch correctly aborted before finalization"
 fi
-if echo "$LOG5H" | grep -q "Dispatch complete:"; then
+if echo "$LOG5H" | grep "Dispatch complete:" >/dev/null; then
   bad "REGRESSION: dispatch completed (builder notified) despite the mid-dispatch pilot:no-auto-dispatch hold"
 else
   ok "no builder was notified — aborted before the sling/nudge step"
@@ -2168,7 +2168,7 @@ fi
 
 echo "Scenario 5i: control — no pilot:no-auto-dispatch injected → new re-check never false-positives (ga-4iw15 AC1)"
 LOG5I="$(run_real_dispatch_noauto "")"
-if echo "$LOG5I" | grep -q "ga-4iw15:"; then
+if echo "$LOG5I" | grep "ga-4iw15:" >/dev/null; then
   bad "REGRESSION: pre-dispatch re-check fired with no pilot:no-auto-dispatch injected (false positive)"
 else
   ok "no false positive — re-check stayed silent on the plain happy path"
@@ -2187,7 +2187,7 @@ fi
 # a reimplementation) — the same evidentiary bar as Scenario 5h/5i.
 echo "Scenario ga-rfpm9 (late re-check): bare no-auto-dispatch landing mid-dispatch ALSO aborts before a builder is dispatched"
 LOG5H_BARE="$(run_real_dispatch_noauto 1 "no-auto-dispatch")"
-if echo "$LOG5H_BARE" | grep -q "ga-4iw15:.*tt-flight.*no-auto-dispatch"; then
+if echo "$LOG5H_BARE" | grep "ga-4iw15:.*tt-flight.*no-auto-dispatch" >/dev/null; then
   ok "pre-dispatch re-check also recognizes the bare no-auto-dispatch alias (ga-rfpm9)"
 else
   bad "REGRESSION: bare no-auto-dispatch did not trip the ga-4iw15 pre-dispatch re-check (ga-rfpm9)"
@@ -2197,7 +2197,7 @@ if [ -f "$STATE/tt-flight.inflight" ]; then
 else
   ok "story:in-flight was never set — dispatch correctly aborted (bare label, ga-rfpm9)"
 fi
-if echo "$LOG5H_BARE" | grep -q "Dispatch complete:"; then
+if echo "$LOG5H_BARE" | grep "Dispatch complete:" >/dev/null; then
   bad "REGRESSION: dispatch completed (builder notified) despite the mid-dispatch bare no-auto-dispatch hold"
 else
   ok "no builder was notified — aborted before the sling/nudge step (bare label, ga-rfpm9)"
@@ -2213,7 +2213,7 @@ fi
 # deferral.
 echo "Scenario 5j: fresh gastown__mayor comment defers an ORDINARY (non gate:needs-fix) dispatch (ga-4iw15 AC2)"
 LOG5J="$(run_real_dispatch_mayorhold "[{\"author\":\"gastown__mayor\",\"text\":\"HOLD: re-measure first\",\"created_at\":\"$_MH_RECENT\"}]" 300 0)"
-if echo "$LOG5J" | grep -q "ga-pd7j:.*tt-flight has a gastown__mayor comment"; then
+if echo "$LOG5J" | grep "ga-pd7j:.*tt-flight has a gastown__mayor comment" >/dev/null; then
   ok "pre-dispatch re-check deferred an ordinary candidate on a fresh Mayor comment, independent of gate:needs-fix (AC2)"
 else
   bad "REGRESSION: AC2 did not fire — the Mayor-grace window is still gated on gate:needs-fix, so a hold on any other kind of dispatch can still be raced"
@@ -2226,7 +2226,7 @@ fi
 
 echo "Scenario 5k: control — ordinary candidate, NO Mayor comment, gate:needs-fix absent → still dispatches normally (ga-4iw15 AC2)"
 LOG5K="$(run_real_dispatch_mayorhold "" 300 0)"
-if echo "$LOG5K" | grep -q "ga-pd7j:"; then
+if echo "$LOG5K" | grep "ga-pd7j:" >/dev/null; then
   bad "REGRESSION: AC2 broadening false-positived on an ordinary candidate with no Mayor activity at all"
 else
   ok "no false positive — broadened grace check stays silent with no Mayor comment present"
@@ -2248,12 +2248,12 @@ fi
 # such branch exists. Either way the reason is logged, naming the bead (AC1).
 echo "Scenario ga-e2n96(a): gate:needs-remerge + existing branch → resubmit to gate, no builder dispatched"
 LOGE2N96A="$(run_dispatch_remerge "gate:needs-remerge" "tt-remerge")"
-if echo "$LOGE2N96A" | grep -q "ga-e2n96:.*WOULD: resubmit.*tt-remerge"; then
+if echo "$LOGE2N96A" | grep "ga-e2n96:.*WOULD: resubmit.*tt-remerge" >/dev/null; then
   ok "ga-e2n96(a): resubmit-to-gate path chosen and logged, naming the bead"
 else
   bad "ga-e2n96(a) REGRESSION: no resubmit-to-gate log line for tt-remerge with a matched branch"
 fi
-if echo "$LOGE2N96A" | grep -q "Dispatch complete:"; then
+if echo "$LOGE2N96A" | grep "Dispatch complete:" >/dev/null; then
   bad "ga-e2n96(a) REGRESSION: a builder was dispatched despite zero feedback (empty-brief bug reproduced)"
 else
   ok "ga-e2n96(a): no builder was dispatched — empty-brief dispatch correctly skipped"
@@ -2261,12 +2261,12 @@ fi
 
 echo "Scenario ga-e2n96(b): gate:needs-remerge + NO existing branch → escalate to gate:needs-human, no builder dispatched"
 LOGE2N96B="$(run_dispatch_remerge "gate:needs-remerge" "")"
-if echo "$LOGE2N96B" | grep -q "ga-e2n96:.*WOULD: escalate.*tt-remerge"; then
+if echo "$LOGE2N96B" | grep "ga-e2n96:.*WOULD: escalate.*tt-remerge" >/dev/null; then
   ok "ga-e2n96(b): escalate-to-human path chosen and logged, naming the bead"
 else
   bad "ga-e2n96(b) REGRESSION: no escalate log line for tt-remerge with no matched branch"
 fi
-if echo "$LOGE2N96B" | grep -q "Dispatch complete:"; then
+if echo "$LOGE2N96B" | grep "Dispatch complete:" >/dev/null; then
   bad "ga-e2n96(b) REGRESSION: a builder was dispatched despite zero feedback and no branch"
 else
   ok "ga-e2n96(b): no builder was dispatched — empty-brief dispatch correctly skipped"
@@ -2274,12 +2274,12 @@ fi
 
 echo "Scenario ga-e2n96(c): legacy bare gate:needs-fix (pre-fix label shape) + zero feedback + branch found → same resubmit safety net"
 LOGE2N96C="$(run_dispatch_remerge "gate:needs-fix" "tt-remerge")"
-if echo "$LOGE2N96C" | grep -q "ga-e2n96:.*WOULD: resubmit.*tt-remerge"; then
+if echo "$LOGE2N96C" | grep "ga-e2n96:.*WOULD: resubmit.*tt-remerge" >/dev/null; then
   ok "ga-e2n96(c): bare gate:needs-fix with zero feedback ALSO takes the safety net (covers pre-fix / already-in-flight beads)"
 else
   bad "ga-e2n96(c) REGRESSION: bare gate:needs-fix + zero feedback fell through to blind builder dispatch"
 fi
-if echo "$LOGE2N96C" | grep -q "Dispatch complete:"; then
+if echo "$LOGE2N96C" | grep "Dispatch complete:" >/dev/null; then
   bad "ga-e2n96(c) REGRESSION: a builder was dispatched for bare gate:needs-fix with zero feedback"
 else
   ok "ga-e2n96(c): no builder was dispatched for the legacy bare-label shape"
@@ -2287,12 +2287,12 @@ fi
 
 echo "Scenario ga-e2n96(d) CONTROL: gate:needs-fix + REAL feedback (>0 chars) still dispatches a builder normally (AC2, must not regress)"
 LOGE2N96D="$(run_dispatch_remerge_with_feedback "gate:needs-fix")"
-if echo "$LOGE2N96D" | grep -q "ga-e2n96:.*WOULD:"; then
+if echo "$LOGE2N96D" | grep "ga-e2n96:.*WOULD:" >/dev/null; then
   bad "ga-e2n96(d) REGRESSION: the zero-feedback guard fired despite REAL feedback being present — would break the whole gate-fix loop (AC2)"
 else
   ok "ga-e2n96(d): zero-feedback guard stayed silent — real feedback takes the ordinary path"
 fi
-if echo "$LOGE2N96D" | grep -q "injecting reviewer feedback (6[0-9] chars)\|injecting reviewer feedback ([1-9][0-9]* chars)"; then
+if echo "$LOGE2N96D" | grep "injecting reviewer feedback (6[0-9] chars)\|injecting reviewer feedback ([1-9][0-9]* chars)" >/dev/null; then
   ok "ga-e2n96(d): real feedback still gets injected into the builder brief, as before"
 else
   bad "ga-e2n96(d) REGRESSION: real feedback was not injected (chars count wrong or missing)"
@@ -2330,19 +2330,19 @@ fi
 echo "Scenario 7: tt-depblk has an OPEN explicit dep — must hold it and dispatch tt-blkd"
 LOG7="$(run_dispatch "" 0 "tt-openbase")"
 
-if echo "$LOG7" | grep -q "holding tt-depblk — explicit dep tt-openbase"; then
+if echo "$LOG7" | grep "holding tt-depblk — explicit dep tt-openbase" >/dev/null; then
   ok "logged hold on the explicit-dep candidate"
 else
   bad "did NOT log hold (expected 'holding tt-depblk — explicit dep tt-openbase')"
 fi
 
-if echo "$LOG7" | grep -q "Lane picks — small: tt-blkd"; then
+if echo "$LOG7" | grep "Lane picks — small: tt-blkd" >/dev/null; then
   ok "dispatched tt-blkd (explicit-dep candidate correctly held back)"
 else
   bad "did not pick tt-blkd while tt-depblk was held"
 fi
 
-if echo "$LOG7" | grep -q "Lane picks — small: tt-depblk"; then
+if echo "$LOG7" | grep "Lane picks — small: tt-depblk" >/dev/null; then
   bad "REGRESSION: dispatched a candidate with an open explicit dep (tt-depblk)"
 else
   ok "did NOT dispatch the explicit-dep candidate"
@@ -2355,13 +2355,13 @@ fi
 echo "Scenario 8: tt-depblk's explicit dep is CLOSED — must NOT hold, picks tt-depblk"
 LOG8="$(run_dispatch "" 0 "tt-closedbase")"
 
-if echo "$LOG8" | grep -q "holding tt-depblk"; then
+if echo "$LOG8" | grep "holding tt-depblk" >/dev/null; then
   bad "over-filtered: held a candidate whose explicit dep is already closed"
 else
   ok "no spurious hold when the explicit dep is closed"
 fi
 
-if echo "$LOG8" | grep -q "Lane picks — small: tt-depblk"; then
+if echo "$LOG8" | grep "Lane picks — small: tt-depblk" >/dev/null; then
   ok "dispatched tt-depblk once its explicit dep was satisfied (auto-clear)"
 else
   bad "did not pick tt-depblk after its explicit dep closed"
@@ -2373,13 +2373,13 @@ fi
 echo "Scenario 9: healthy Dolt + 2 candidates + free slots → dispatch BOTH in one sweep"
 LOG9="$(run_capacity 10)"
 
-if echo "$LOG9" | grep -q "Dolt health OK"; then
+if echo "$LOG9" | grep "Dolt health OK" >/dev/null; then
   ok "Dolt probed healthy via override seam (dispatch-to-capacity armed)"
 else
   bad "did not arm dispatch-to-capacity on a healthy Dolt"
 fi
 
-if echo "$LOG9" | grep -q "Lane small: dispatched 2 this sweep"; then
+if echo "$LOG9" | grep "Lane small: dispatched 2 this sweep" >/dev/null; then
   ok "dispatched BOTH small candidates in ONE sweep (dispatch-to-capacity)"
 else
   bad "did NOT fill both slots in one sweep (expected 'Lane small: dispatched 2')"
@@ -2388,12 +2388,12 @@ fi
 # ── Scenario 9b: the literal AC — 5 free small slots + 5 ready candidates → 5 ───
 echo "Scenario 9b: 5 free slots + 5 candidates → dispatch ALL 5 in one sweep, never more"
 LOG9B="$(run_capacity 10 "[]" 1 "$FIVE_SMALL_BUGS")"
-if echo "$LOG9B" | grep -q "Lane small: dispatched 5 this sweep"; then
+if echo "$LOG9B" | grep "Lane small: dispatched 5 this sweep" >/dev/null; then
   ok "filled all 5 small slots in a single sweep (AC satisfied)"
 else
   bad "did not dispatch all 5 (expected 'Lane small: dispatched 5')"
 fi
-if echo "$LOG9B" | grep -qE "Lane small: dispatched ([6-9]|[1-9][0-9]+) this sweep"; then
+if echo "$LOG9B" | grep -E "Lane small: dispatched ([6-9]|[1-9][0-9]+) this sweep" >/dev/null; then
   bad "REGRESSION: exceeded the small-lane cap of 5"
 else
   ok "never exceeded the small-lane cap (MAX_SMALL=5)"
@@ -2405,19 +2405,19 @@ fi
 echo "Scenario 10: saturated Dolt → throttle to 1 dispatch/lane (constraint a backoff)"
 LOG10="$(run_capacity 300)"
 
-if echo "$LOG10" | grep -q "Dolt SATURATED at sweep start"; then
+if echo "$LOG10" | grep "Dolt SATURATED at sweep start" >/dev/null; then
   ok "detected Dolt saturation at sweep start"
 else
   bad "did not detect saturation (CPU override 300 > 200 ceiling)"
 fi
 
-if echo "$LOG10" | grep -q "Lane small: dispatched 1 this sweep"; then
+if echo "$LOG10" | grep "Lane small: dispatched 1 this sweep" >/dev/null; then
   ok "throttled to a SINGLE dispatch under saturation (legacy-safe)"
 else
   bad "did not throttle to 1 under saturation (capacity loop ignored the backoff)"
 fi
 
-if echo "$LOG10" | grep -q "Lane small: dispatched 2 this sweep"; then
+if echo "$LOG10" | grep "Lane small: dispatched 2 this sweep" >/dev/null; then
   bad "REGRESSION: filled both slots while Dolt was saturated (added load to a hot server)"
 else
   ok "did NOT fill multiple slots under saturation"
@@ -2486,17 +2486,17 @@ LOG10C="$(env -i \
     FAKE_BLOCKED_IDS="" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log")"
-if echo "$LOG10C" | grep -q "Dolt health UNREADABLE at sweep start"; then
+if echo "$LOG10C" | grep "Dolt health UNREADABLE at sweep start" >/dev/null; then
   ok "blind probe logs the distinct UNREADABLE message"
 else
   bad "blind probe did not log UNREADABLE (still conflating probe-failure with saturation?)"
 fi
-if echo "$LOG10C" | grep -q "Dolt SATURATED at sweep start"; then
+if echo "$LOG10C" | grep "Dolt SATURATED at sweep start" >/dev/null; then
   bad "REGRESSION: blind probe logged the genuine-saturation message (ambiguous with a real Dolt storm)"
 else
   ok "blind probe did NOT log the genuine-saturation message (no longer ambiguous)"
 fi
-if echo "$LOG10C" | grep -q "Lane small: dispatched 1 this sweep"; then
+if echo "$LOG10C" | grep "Lane small: dispatched 1 this sweep" >/dev/null; then
   ok "blind probe still throttled to 1 dispatch/lane (fail-safe decision unchanged)"
 else
   bad "blind probe did not throttle (fail-safe decision regressed — this would be dangerous)"
@@ -2505,7 +2505,7 @@ fi
 # ── Scenario 10b: feature switch off → legacy single-pick even when healthy ────
 echo "Scenario 10b: DISPATCH_TO_CAPACITY=0 → single dispatch even on a healthy Dolt"
 LOG10B="$(run_capacity 10 "[]" 0)"
-if echo "$LOG10B" | grep -q "Lane small: dispatched 1 this sweep"; then
+if echo "$LOG10B" | grep "Lane small: dispatched 1 this sweep" >/dev/null; then
   ok "feature-off honored (legacy one-per-lane)"
 else
   bad "DISPATCH_TO_CAPACITY=0 did not fall back to single dispatch"
@@ -2521,25 +2521,25 @@ STALE_ISO="$(date -u -v-3H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '3 hour
 INFLIGHT="[{\"id\":\"if-fresh\",\"labels\":[\"story:in-flight\"],\"updated_at\":\"$NOW_ISO\"},{\"id\":\"if-stale\",\"labels\":[\"story:in-flight\"],\"updated_at\":\"$STALE_ISO\"}]"
 LOG11="$(run_capacity 10 "$INFLIGHT")"
 
-if echo "$LOG11" | grep -q "Stale in-flight: 1 bead"; then
+if echo "$LOG11" | grep "Stale in-flight: 1 bead" >/dev/null; then
   ok "detected the stale in-flight occupant"
 else
   bad "did not detect the stale in-flight occupant"
 fi
 
-if echo "$LOG11" | grep -q "live=1 (raw=2 stale=1 age=1 dead=0)"; then
+if echo "$LOG11" | grep "live=1 (raw=2 stale=1 age=1 dead=0)" >/dev/null; then
   ok "slot count corrected: 1 live occupant, 1 stale freed (age)"
 else
   bad "slot count not corrected (expected 'live=1 (raw=2 stale=1 age=1 dead=0)')"
 fi
 
-if echo "$LOG11" | grep -q "Stale ids: if-stale"; then
+if echo "$LOG11" | grep "Stale ids: if-stale" >/dev/null; then
   ok "named the stale bead (if-stale)"
 else
   bad "did not name the stale bead id"
 fi
 
-if echo "$LOG11" | grep -q "Stale ids:.*if-fresh"; then
+if echo "$LOG11" | grep "Stale ids:.*if-fresh" >/dev/null; then
   bad "REGRESSION: treated the FRESH bead as stale (would over-free slots)"
 else
   ok "fresh bead correctly kept as a live occupant"
@@ -2562,25 +2562,25 @@ SESSIONS12='{"sessions":[{"session_name":"live-sess","template":"gastown.dog","c
 SLINGMAP12='{"tt-sling-dead":"dead-sess","tt-sling-live":"live-sess","tt-sling-none":""}'
 LOG12="$(run_capacity 10 "$INFLIGHT12" 1 "" "$SESSIONS12" "$SLINGMAP12")"
 
-if echo "$LOG12" | grep -q "live=2 (raw=3 stale=1 age=0 dead=1)"; then
+if echo "$LOG12" | grep "live=2 (raw=3 stale=1 age=0 dead=1)" >/dev/null; then
   ok "slot count corrected: 2 live occupants, 1 dead-worker freed"
 else
   bad "slot count not corrected (expected 'live=2 (raw=3 stale=1 age=0 dead=1)')"
 fi
 
-if echo "$LOG12" | grep -q "Dead-worker in-flight: 1 bead"; then
+if echo "$LOG12" | grep "Dead-worker in-flight: 1 bead" >/dev/null; then
   ok "detected the dead-worker in-flight occupant"
 else
   bad "did not detect the dead-worker in-flight occupant"
 fi
 
-if echo "$LOG12" | grep -q "Dead ids: if-dead"; then
+if echo "$LOG12" | grep "Dead ids: if-dead" >/dev/null; then
   ok "named the dead-worker bead (if-dead)"
 else
   bad "did not name the dead-worker bead id"
 fi
 
-if echo "$LOG12" | grep -qE "Dead ids:.*(if-live|if-noassg)"; then
+if echo "$LOG12" | grep -E "Dead ids:.*(if-live|if-noassg)" >/dev/null; then
   bad "REGRESSION: freed a LIVE or unresolved bead (would over-dispatch)"
 else
   ok "live + no-assignee beads correctly kept as live occupants"
@@ -2593,13 +2593,13 @@ fi
 echo "Scenario 12b: empty roster disables dead-worker check (fail-safe)"
 LOG12B="$(run_capacity 10 "$INFLIGHT12" 1 "" "" "$SLINGMAP12")"
 
-if echo "$LOG12B" | grep -q "live=3 (raw=3 stale=0 age=0 dead=0)"; then
+if echo "$LOG12B" | grep "live=3 (raw=3 stale=0 age=0 dead=0)" >/dev/null; then
   ok "empty roster → all 3 kept, zero freed (no over-dispatch)"
 else
   bad "empty roster did not fail safe (expected 'live=3 (raw=3 stale=0 age=0 dead=0)')"
 fi
 
-if echo "$LOG12B" | grep -q "Dead-worker in-flight:"; then
+if echo "$LOG12B" | grep "Dead-worker in-flight:" >/dev/null; then
   bad "REGRESSION: ran dead-worker check against an empty roster"
 else
   ok "dead-worker check correctly suppressed on empty roster"
@@ -2620,7 +2620,7 @@ if [ -f "$STATE/tt-flight.inflight" ]; then
 else
   bad "sling did not recover via retry (tt-flight never reached in-flight)"
 fi
-if echo "$LOG13A" | grep -qE "attempt 1/3|attempt 2/3"; then
+if echo "$LOG13A" | grep -E "attempt 1/3|attempt 2/3" >/dev/null; then
   ok "retry path was exercised (logged attempt N/3)"
 else
   bad "no retry attempt was logged"
@@ -2628,17 +2628,17 @@ fi
 
 echo "Scenario 13b: persistent sling failure attributed to REAL error, not the warning (ga-eu8vr)"
 LOG13B="$(run_sling_retry 0 1)"   # always fail
-if echo "$LOG13B" | grep -q "store ACCESSIBLE, transient sling-write failure"; then
+if echo "$LOG13B" | grep "store ACCESSIBLE, transient sling-write failure" >/dev/null; then
   ok "failure correctly degraded: store-accessible transient, claim released for retry"
 else
   bad "did not emit the store-accessible transient attribution"
 fi
-if echo "$LOG13B" | grep -q "Store is required"; then
+if echo "$LOG13B" | grep "Store is required" >/dev/null; then
   ok "the REAL stdout error (Store is required) was surfaced"
 else
   bad "real stdout error was not surfaced"
 fi
-if echo "$LOG13B" | grep -qE "aborting dispatch \(err: .*version_compat"; then
+if echo "$LOG13B" | grep -E "aborting dispatch \(err: .*version_compat" >/dev/null; then
   bad "REGRESSION: still misattributes the abort to the benign version_compat warning"
 else
   ok "no longer blames the benign version_compat warning"
@@ -2648,7 +2648,7 @@ if grep -q "released tt-flight" "$STATE/releases.log" 2>/dev/null; then
 else
   bad "claim was not released after persistent sling failure"
 fi
-if echo "$LOG13B" | grep -q "ga-6psx5:.*adopting it instead of minting a duplicate"; then
+if echo "$LOG13B" | grep "ga-6psx5:.*adopting it instead of minting a duplicate" >/dev/null; then
   bad "REGRESSION (ga-6psx5): orphan-adoption fired with no orphan bead present (false positive)"
 else
   ok "ga-6psx5 orphan guard stays silent when no matching bead actually exists (negative control)"
@@ -2672,7 +2672,7 @@ fi
 # proving no duplicate is minted, not just that dispatch eventually succeeds.
 echo "Scenario 13c: sling adopts an orphaned bead instead of minting a duplicate (ga-6psx5)"
 LOG13C="$(run_sling_retry 0 1 '[{"id":"tt-orphan-1","title":"fix bug tt-flight: Durable in-flight fixture","status":"open","created_at":"2026-08-31T00:00:00Z"}]')"
-if echo "$LOG13C" | grep -q "ga-6psx5:.*adopting it instead of minting a duplicate"; then
+if echo "$LOG13C" | grep "ga-6psx5:.*adopting it instead of minting a duplicate" >/dev/null; then
   ok "orphan-adoption path fired when a matching bead already existed"
 else
   bad "REGRESSION (ga-6psx5): did not adopt the pre-existing orphan bead"
@@ -2688,7 +2688,7 @@ if [ "$_sling_calls" = "1" ]; then
 else
   bad "REGRESSION (ga-6psx5): gc sling was invoked $_sling_calls times — expected 1 (duplicate still being minted)"
 fi
-if echo "$LOG13C" | grep -q "no bead_id for tt-flight after"; then
+if echo "$LOG13C" | grep "no bead_id for tt-flight after" >/dev/null; then
   bad "REGRESSION: fell through to the legacy persistent-failure path despite an adoptable orphan"
 else
   ok "did not fall through to the legacy 'failed after N attempts' path"
@@ -2725,22 +2725,22 @@ run_quota() { # $1=PILOT_QUOTA_OVERRIDE  $2=PILOT_QUOTA_ETA_OVERRIDE
 
 echo "Scenario 14a: quota LIMITED → PAUSE sweep, dispatch nothing, ETA in notice"
 LOG14A="$(run_quota 2 'resets 5pm (in 12min)')"
-if echo "$LOG14A" | grep -q "PAUSING all dispatch"; then
+if echo "$LOG14A" | grep "PAUSING all dispatch" >/dev/null; then
   ok "quota-limited sweep logs the pause"
 else
   bad "quota-limited sweep did NOT pause (expected 'PAUSING all dispatch')"
 fi
-if echo "$LOG14A" | grep -q "dispatched=0 (paused: cota 5h limitada"; then
+if echo "$LOG14A" | grep "dispatched=0 (paused: cota 5h limitada" >/dev/null; then
   ok "sweep-complete line reports dispatched=0 (paused)"
 else
   bad "sweep-complete did not report the paused/dispatched=0 state"
 fi
-if echo "$LOG14A" | grep -q "resets 5pm (in 12min)"; then
+if echo "$LOG14A" | grep "resets 5pm (in 12min)" >/dev/null; then
   ok "pause notice carries the reset ETA (AC4)"
 else
   bad "pause notice missing the reset ETA"
 fi
-if echo "$LOG14A" | grep -qE "pegou uma história|gc sling|story:in-flight"; then
+if echo "$LOG14A" | grep -E "pegou uma história|gc sling|story:in-flight" >/dev/null; then
   bad "REGRESSION: dispatched/slung a builder despite exhausted quota"
 else
   ok "no builder dispatched under exhausted quota (AC1)"
@@ -2748,7 +2748,7 @@ fi
 
 echo "Scenario 14b: quota OK → no pause, sweep proceeds normally"
 LOG14B="$(run_quota 0)"
-if echo "$LOG14B" | grep -q "PAUSING all dispatch"; then
+if echo "$LOG14B" | grep "PAUSING all dispatch" >/dev/null; then
   bad "REGRESSION: paused the sweep when quota was fine"
 else
   ok "quota-OK sweep does not pause (proceeds to dispatch logic)"
@@ -2799,7 +2799,7 @@ if [ "$TOTAL15A" -ge 4 ] && [ "$DISTINCT15A" -ge 4 ]; then
 else
   bad "REGRESSION: WA work not distributed to 4 slots (total=$TOTAL15A distinct=$DISTINCT15A — slot exhaustion not working?)"
 fi
-if echo "$B15A" | grep -qvE '^wa-worker-[0-9]+$'; then
+if echo "$B15A" | grep -vE '^wa-worker-[0-9]+$' >/dev/null; then
   bad "a dispatch targeted a non-wa-worker-slot builder: $(echo "$B15A" | grep -vE '^wa-worker-[0-9]+$' | tr '\n' ' ')"
 else
   ok "every dispatch targeted a wa-worker-N slot (pilot-rewire: ephemeral pool)"
@@ -2830,12 +2830,12 @@ SLINGMAP15C='{"tt-sling-digo":"digo-wa"}'
 WA_ONE_BUG='[{"id":"tt-wax","title":"wa bug x","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"whatsapp_automation"}}]'
 LOG15C="$(run_capacity 10 "$INFLIGHT15C" 1 "$WA_ONE_BUG" "$SESSIONS15C" "$SLINGMAP15C")"
 B15C="$(builders_of "$LOG15C")"
-if echo "$LOG15C" | grep -q "Busy builders (live in-flight): digo-wa"; then
+if echo "$LOG15C" | grep "Busy builders (live in-flight): digo-wa" >/dev/null; then
   ok "busy-builder set still computed from live in-flight work (digo-wa busy)"
 else
   bad "did not compute/log the busy-builder set (expected 'Busy builders (live in-flight): digo-wa')"
 fi
-if echo "$B15C" | grep -qE '^wa-worker-[0-9]+$'; then
+if echo "$B15C" | grep -E '^wa-worker-[0-9]+$' >/dev/null; then
   ok "WA bug dispatched to wa-worker slot ($B15C) — named-crew busy-set does not block ephemeral pool"
 elif [ -z "$B15C" ]; then
   bad "WA bug deferred (wa-worker slot available but not dispatched — pool routing broken?)"
@@ -2871,7 +2871,7 @@ SESSIONS15F='{"sessions":[{"session_name":"digo-wa-gawispcze4o4","name":"digo-wa
 SLINGMAP15F='{"tt-sling-digo2":"digo-wa-gawispcze4o4"}'
 LOG15F="$(run_capacity 10 "$INFLIGHT15F" 1 "$WA_ONE_BUG" "$SESSIONS15F" "$SLINGMAP15F")"
 B15F="$(builders_of "$LOG15F")"
-if echo "$B15F" | grep -qE '^wa-worker-[0-9]+$'; then
+if echo "$B15F" | grep -E '^wa-worker-[0-9]+$' >/dev/null; then
   ok "WA bug dispatched to wa-worker slot ($B15F) — digo-wa session_name busy-set irrelevant to ephemeral pool"
 elif [ -z "$B15F" ]; then
   bad "WA bug deferred when a wa-worker slot is available — pool routing broken"
@@ -2900,7 +2900,7 @@ NS_SESS='{"sessions":[{"session_name":"digo-wa","closed":false}]}'
 # 16a: aged, no sling, no branch, no gate → RELEASE.
 NS_REL='[{"id":"tt-ns-rel","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
 LOG16A="$(run_neverstarted "$NS_REL" "" "" "")"
-if echo "$LOG16A" | grep -q "releasing never-started in-flight bead tt-ns-rel"; then
+if echo "$LOG16A" | grep "releasing never-started in-flight bead tt-ns-rel" >/dev/null; then
   ok "released a never-started bead (aged, no worker/branch/gate)"
 else
   bad "did NOT release the never-started bead tt-ns-rel"
@@ -2909,7 +2909,7 @@ fi
 # 16b: fresh dispatch (age < threshold) → KEEP.
 NS_FRESH_J='[{"id":"tt-ns-fresh","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_FRESH"'"}}]'
 LOG16B="$(run_neverstarted "$NS_FRESH_J" "" "" "")"
-if echo "$LOG16B" | grep -q "releasing never-started in-flight bead tt-ns-fresh"; then
+if echo "$LOG16B" | grep "releasing never-started in-flight bead tt-ns-fresh" >/dev/null; then
   bad "REGRESSION: released a FRESH dispatch (age < 15m threshold)"
 else
   ok "fresh dispatch kept (age < threshold — worker may still be spawning)"
@@ -2918,7 +2918,7 @@ fi
 # 16c: a surviving crew branch → KEEP (real work landed before the worker died).
 NS_BR='[{"id":"tt-ns-branch","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
 LOG16C="$(run_neverstarted "$NS_BR" "tt-ns-branch" "" "")"
-if echo "$LOG16C" | grep -q "releasing never-started in-flight bead tt-ns-branch"; then
+if echo "$LOG16C" | grep "releasing never-started in-flight bead tt-ns-branch" >/dev/null; then
   bad "REGRESSION: released a bead that HAS a crew branch"
 else
   ok "bead with a surviving crew branch kept"
@@ -2941,7 +2941,7 @@ fi
 # markers that mean "an attempt is under review right now" and still block.
 NS_GATE='[{"id":"tt-ns-gate","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched","gate:reviewing"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
 LOG16D="$(run_neverstarted "$NS_GATE" "" "" "")"
-if echo "$LOG16D" | grep -q "releasing never-started in-flight bead tt-ns-gate"; then
+if echo "$LOG16D" | grep "releasing never-started in-flight bead tt-ns-gate" >/dev/null; then
   bad "REGRESSION: released a bead under ACTIVE gate review (gate:reviewing)"
 else
   ok "bead under active gate review (gate:reviewing) kept"
@@ -2953,7 +2953,7 @@ fi
 # activity signal → RELEASE, same as any other never-started bead.
 NS_GATE_HIST='[{"id":"tt-ns-gate-hist","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched","gate:needs-fix","gate:fix-attempt:1"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
 LOG16D2="$(run_neverstarted "$NS_GATE_HIST" "" "" "")"
-if echo "$LOG16D2" | grep -q "releasing never-started in-flight bead tt-ns-gate-hist"; then
+if echo "$LOG16D2" | grep "releasing never-started in-flight bead tt-ns-gate-hist" >/dev/null; then
   ok "ga-pb8z5: stale gate:needs-fix/fix-attempt history alone no longer blocks release"
 else
   bad "ga-pb8z5 REGRESSION: bare gate:needs-fix/fix-attempt history still blocks release forever"
@@ -2976,7 +2976,7 @@ fi
 # that carry their own gate:* history).
 NS_GATE_DEAD='[{"id":"tt-ns-gate-dead","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched","gate:needs-fix","gate:fix-attempt:1"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-gate-dead"}}]'
 LOG16D3="$(run_neverstarted "$NS_GATE_DEAD" "" "$NS_SESS" '{"tt-sling-gate-dead":"ghost-wa"}')"
-if echo "$LOG16D3" | grep -q "releasing never-started in-flight bead tt-ns-gate-dead"; then
+if echo "$LOG16D3" | grep "releasing never-started in-flight bead tt-ns-gate-dead" >/dev/null; then
   ok "ga-pb8z5: bead stuck on gate:needs-fix with a confirmed-dead builder is released (real-incident shape)"
 else
   bad "ga-pb8z5 REGRESSION: bead with dead builder + stale gate:needs-fix stayed invisible forever (the exact incident)"
@@ -2988,7 +2988,7 @@ fi
 # again and is currently being reviewed.
 NS_GATE_ACTIVE2='[{"id":"tt-ns-gate-active2","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched","gate:needs-fix","gate:fix-attempt:1","gate:reviewing"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
 LOG16D4="$(run_neverstarted "$NS_GATE_ACTIVE2" "" "" "")"
-if echo "$LOG16D4" | grep -q "releasing never-started in-flight bead tt-ns-gate-active2"; then
+if echo "$LOG16D4" | grep "releasing never-started in-flight bead tt-ns-gate-active2" >/dev/null; then
   bad "REGRESSION: released a bead under active gate:reviewing despite stale gate:needs-fix also present"
 else
   ok "control: gate:needs-fix history + ACTIVE gate:reviewing still kept (only stale labels are ignored)"
@@ -3000,7 +3000,7 @@ fi
 # be swept up by the narrower strip).
 NS_GATE_HUMAN='[{"id":"tt-ns-gate-human","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched","gate:needs-human"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-gate-human"}}]'
 LOG16D5="$(run_neverstarted "$NS_GATE_HUMAN" "" "$NS_SESS" '{"tt-sling-gate-human":"ghost-wa"}')"
-if echo "$LOG16D5" | grep -q "releasing never-started in-flight bead tt-ns-gate-human"; then
+if echo "$LOG16D5" | grep "releasing never-started in-flight bead tt-ns-gate-human" >/dev/null; then
   bad "REGRESSION: released a gate:needs-human bead — must always stay human-gated"
 else
   ok "gate:needs-human always blocks release regardless of age (human-gate invariant preserved)"
@@ -3027,7 +3027,7 @@ has "$DISPATCHER" '_ns_label_blocks_release "\$_sling_labels" && continue' "ga-p
 # test coverage for the exact shape that broke it. Must RELEASE, same as 16d2.
 NS_GATE_HIST2='[{"id":"tt-ns-gate-hist2","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched","gate:needs-fix","gate:fix-attempt:1","gate:fix-attempt:2"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
 LOG16D7="$(run_neverstarted "$NS_GATE_HIST2" "" "" "")"
-if echo "$LOG16D7" | grep -q "releasing never-started in-flight bead tt-ns-gate-hist2"; then
+if echo "$LOG16D7" | grep "releasing never-started in-flight bead tt-ns-gate-hist2" >/dev/null; then
   ok "ga-pb8z5: two coexisting gate:fix-attempt:N labels (residue race) no longer blocks release"
 else
   bad "ga-pb8z5 REGRESSION: two coexisting gate:fix-attempt:N labels still block release forever (the gate-review-caught bug)"
@@ -3045,7 +3045,7 @@ fi
 # both guards share the same predicate.
 NS_SELFREF='[{"id":"tt-ns-selfref","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched","gate:needs-fix","gate:fix-attempt:1"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-ns-selfref"}}]'
 LOG16D8="$(run_neverstarted "$NS_SELFREF" "" "$NS_SESS" '{"tt-ns-selfref":"ghost-wa"}' "" "" "" '{"tt-ns-selfref":"gate:needs-fix"}')"
-if echo "$LOG16D8" | grep -q "releasing never-started in-flight bead tt-ns-selfref"; then
+if echo "$LOG16D8" | grep "releasing never-started in-flight bead tt-ns-selfref" >/dev/null; then
   ok "ga-pb8z5 attempt 2: self-referential sling (routed-pool shape) with bare gate:needs-fix no longer re-blocks via Guard 2"
 else
   bad "ga-pb8z5 attempt 2 REGRESSION: self-referential sling still re-blocks on Guard 2 despite Guard 1 releasing the same label (net-zero fix)"
@@ -3060,7 +3060,7 @@ fi
 # piggybacking on Guard 1 already having released.
 NS_SLING_GATEHIST='[{"id":"tt-ns-sling-gatehist","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-gatehist-distinct"}}]'
 LOG16D9="$(run_neverstarted "$NS_SLING_GATEHIST" "" "$NS_SESS" '{"tt-sling-gatehist-distinct":"ghost-wa"}' "" "" "" '{"tt-sling-gatehist-distinct":"gate:needs-fix"}')"
-if echo "$LOG16D9" | grep -q "releasing never-started in-flight bead tt-ns-sling-gatehist"; then
+if echo "$LOG16D9" | grep "releasing never-started in-flight bead tt-ns-sling-gatehist" >/dev/null; then
   ok "ga-pb8z5 attempt 2: distinct sling bead's own bare gate:needs-fix no longer blocks release (Guard 2 isolated from Guard 1)"
 else
   bad "ga-pb8z5 attempt 2 REGRESSION: distinct sling bead's own stale gate:needs-fix still blocks release forever"
@@ -3072,7 +3072,7 @@ fi
 # sling side too, same fail-safe-to-KEEP default as Guard 1's 16d4 control.
 NS_SLING_ACTIVE='[{"id":"tt-ns-sling-active","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-active-distinct"}}]'
 LOG16D10="$(run_neverstarted "$NS_SLING_ACTIVE" "" "$NS_SESS" '{"tt-sling-active-distinct":"ghost-wa"}' "" "" "" '{"tt-sling-active-distinct":"gate:reviewing"}')"
-if echo "$LOG16D10" | grep -q "releasing never-started in-flight bead tt-ns-sling-active"; then
+if echo "$LOG16D10" | grep "releasing never-started in-flight bead tt-ns-sling-active" >/dev/null; then
   bad "REGRESSION: released despite the sling bead carrying an ACTIVE gate:reviewing marker"
 else
   ok "control: sling-side ACTIVE gate:reviewing still blocks release (Guard 2 fail-safe preserved)"
@@ -3081,7 +3081,7 @@ fi
 # 16e: a sling whose assignee is a LIVE session → KEEP (build in flight).
 NS_LIVE='[{"id":"tt-ns-live","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-live"}}]'
 LOG16E="$(run_neverstarted "$NS_LIVE" "" "$NS_SESS" '{"tt-sling-live":"digo-wa"}')"
-if echo "$LOG16E" | grep -q "releasing never-started in-flight bead tt-ns-live"; then
+if echo "$LOG16E" | grep "releasing never-started in-flight bead tt-ns-live" >/dev/null; then
   bad "REGRESSION: released a bead whose builder session is LIVE"
 else
   ok "bead with a live builder session kept"
@@ -3090,7 +3090,7 @@ fi
 # 16f: a sling whose assignee is PROVABLY gone (roster trustworthy) → RELEASE.
 NS_DEAD='[{"id":"tt-ns-dead","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-dead"}}]'
 LOG16F="$(run_neverstarted "$NS_DEAD" "" "$NS_SESS" '{"tt-sling-dead":"ghost-wa"}')"
-if echo "$LOG16F" | grep -q "releasing never-started in-flight bead tt-ns-dead"; then
+if echo "$LOG16F" | grep "releasing never-started in-flight bead tt-ns-dead" >/dev/null; then
   ok "released a bead whose builder session is provably gone"
 else
   bad "did NOT release the dead-worker never-started bead tt-ns-dead"
@@ -3100,12 +3100,12 @@ fi
 # (the ga-2azzj Defect-A discipline: never release on first sight).
 NS_LEGACY='[{"id":"tt-ns-legacy","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{}}]'
 LOG16G="$(run_neverstarted "$NS_LEGACY" "" "" "")"
-if echo "$LOG16G" | grep -q "no pilot.dispatched_at stamp.*stamping now, NOT releasing"; then
+if echo "$LOG16G" | grep "no pilot.dispatched_at stamp.*stamping now, NOT releasing" >/dev/null; then
   ok "legacy bead is stamped, not released on first sight (Defect-A guard)"
 else
   bad "legacy stamp-now guard did not fire for tt-ns-legacy"
 fi
-if echo "$LOG16G" | grep -q "releasing never-started in-flight bead tt-ns-legacy"; then
+if echo "$LOG16G" | grep "releasing never-started in-flight bead tt-ns-legacy" >/dev/null; then
   bad "REGRESSION: released a legacy bead on first sight (Defect-A violation)"
 else
   ok "legacy bead NOT released on first sight"
@@ -3114,7 +3114,7 @@ fi
 # 16h: sling present but roster untrustworthy (empty) → KEEP (cannot prove dead).
 NS_UNTRUST='[{"id":"tt-ns-untrust","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-x"}}]'
 LOG16H="$(run_neverstarted "$NS_UNTRUST" "" "" "")"
-if echo "$LOG16H" | grep -q "releasing never-started in-flight bead tt-ns-untrust"; then
+if echo "$LOG16H" | grep "releasing never-started in-flight bead tt-ns-untrust" >/dev/null; then
   bad "REGRESSION: released a sling-bearing bead while the roster was untrustworthy"
 else
   ok "sling-bearing bead kept when roster is untrustworthy (cannot prove worker dead)"
@@ -3133,7 +3133,7 @@ echo "Scenario 16L: ga-9yb5s — a live crew owner of the story protects it from
 NS_CREW_SESS='{"sessions":[{"session_name":"batista-ps","closed":false}]}'
 NS_CREW='[{"id":"tt-ns-crew","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
 LOG16L="$(run_neverstarted "$NS_CREW" "" "$NS_CREW_SESS" '{"tt-ns-crew":"batista-ps"}')"
-if echo "$LOG16L" | grep -q "releasing never-started in-flight bead tt-ns-crew"; then
+if echo "$LOG16L" | grep "releasing never-started in-flight bead tt-ns-crew" >/dev/null; then
   bad "REGRESSION (ga-9yb5s): released a story owned by a LIVE crew (false reclaim → double-dispatch)"
 else
   ok "story owned by a live crew is kept (ga-9yb5s parity with ga-htjni dispatch guard)"
@@ -3145,7 +3145,7 @@ fi
 echo "Scenario 16m: ga-9yb5s — a DEAD crew owner does NOT pin the bead (no deadlock)"
 NS_CREWD='[{"id":"tt-ns-crewdead","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
 LOG16M="$(run_neverstarted "$NS_CREWD" "" "$NS_CREW_SESS" '{"tt-ns-crewdead":"ghost-ps"}')"
-if echo "$LOG16M" | grep -q "releasing never-started in-flight bead tt-ns-crewdead"; then
+if echo "$LOG16M" | grep "releasing never-started in-flight bead tt-ns-crewdead" >/dev/null; then
   ok "story whose crew owner is provably gone is released (no deadlock)"
 else
   bad "REGRESSION (ga-9yb5s): a DEAD crew owner pinned a genuine orphan (deadlock risk)"
@@ -3158,7 +3158,7 @@ echo "Scenario 16n: ga-9yb5s — a dog-pool assignee is not treated as a crew ow
 NS_DOG='[{"id":"tt-ns-dog","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
 NS_DOG_SESS='{"sessions":[{"session_name":"gastown.dog","closed":false}]}'
 LOG16N="$(run_neverstarted "$NS_DOG" "" "$NS_DOG_SESS" '{"tt-ns-dog":"gastown.dog"}')"
-if echo "$LOG16N" | grep -q "releasing never-started in-flight bead tt-ns-dog"; then
+if echo "$LOG16N" | grep "releasing never-started in-flight bead tt-ns-dog" >/dev/null; then
   ok "dog-pool assignee not mistaken for a crew owner (dog reclaim unchanged)"
 else
   bad "REGRESSION (ga-9yb5s): a dog-pool assignee blocked reclaim (should be sling-tracked only)"
@@ -3174,7 +3174,7 @@ NS_VERYOLD="$((NS_NOW - 90000))"   # 25h old → past the 24h owner-grace window
 NS_OG='[{"id":"tt-ns-ograce","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_VERYOLD"'"}}]'
 LOG16O="$(run_neverstarted "$NS_OG" "" "$NS_CREW_SESS" '{"tt-ns-ograce":"batista-ps"}' "batista-ps")"
 echo "Scenario 16o: owner-grace releases a never-started owned bead whose crew progressed elsewhere"
-if echo "$LOG16O" | grep -q "releasing never-started in-flight bead tt-ns-ograce"; then
+if echo "$LOG16O" | grep "releasing never-started in-flight bead tt-ns-ograce" >/dev/null; then
   ok "owner-grace: aged>24h + no branch + owner pushed other branches → released (ga-mfeip)"
 else
   bad "owner-grace did NOT release a 25h-stale never-started owned bead whose crew progressed"
@@ -3184,7 +3184,7 @@ fi
 NS_OG2='[{"id":"tt-ns-ograce2","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_VERYOLD"'"}}]'
 LOG16P="$(run_neverstarted "$NS_OG2" "" "$NS_CREW_SESS" '{"tt-ns-ograce2":"batista-ps"}' "")"
 echo "Scenario 16p: owner-grace KEEPS when the crew shows no progress elsewhere (conservative)"
-if echo "$LOG16P" | grep -q "releasing never-started in-flight bead tt-ns-ograce2"; then
+if echo "$LOG16P" | grep "releasing never-started in-flight bead tt-ns-ograce2" >/dev/null; then
   bad "REGRESSION: released an owned bead with NO skip-proof (crew not progressed) — false-reclaim risk"
 else
   ok "owner-grace KEEPS the bead when the crew has not progressed elsewhere (slow-build safe)"
@@ -3194,7 +3194,7 @@ fi
 NS_OG3='[{"id":"tt-ns-ograce3","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
 LOG16Q="$(run_neverstarted "$NS_OG3" "" "$NS_CREW_SESS" '{"tt-ns-ograce3":"batista-ps"}' "batista-ps")"
 echo "Scenario 16q: owner-grace KEEPS a bead still within the grace window (age gates the release)"
-if echo "$LOG16Q" | grep -q "releasing never-started in-flight bead tt-ns-ograce3"; then
+if echo "$LOG16Q" | grep "releasing never-started in-flight bead tt-ns-ograce3" >/dev/null; then
   bad "REGRESSION: released an owned bead aged only 1h (< 24h owner-grace) — premature reclaim"
 else
   ok "owner-grace KEEPS a bead within the grace window even with progress proof (age gates it)"
@@ -3218,7 +3218,7 @@ has "$DISPATCHER" 'owner-grace' "owner-grace release path wired into the never-s
 echo "Scenario 16r1 (ga-l7pp): an unclaimed-but-fresh sling is KEPT, not released"
 NS_QUEUED='[{"id":"tt-ns-queued","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-queued"}}]'
 LOG16R1="$(run_neverstarted "$NS_QUEUED" "" "$NS_SESS" "" "" "" "" "" "")"
-if echo "$LOG16R1" | grep -q "releasing never-started in-flight bead tt-ns-queued"; then
+if echo "$LOG16R1" | grep "releasing never-started in-flight bead tt-ns-queued" >/dev/null; then
   bad "REGRESSION (ga-l7pp): released a story whose sling is unclaimed but still queued/fresh — orphans the sling, mints a sibling (ga-kuuk double-dispatch mechanism)"
 else
   ok "unclaimed-but-fresh sling is kept (pool hasn't served it yet, not abandoned)"
@@ -3231,12 +3231,12 @@ fi
 echo "Scenario 16r2 (ga-l7pp): an unclaimed-and-stale sling releases the story AND closes the orphan"
 NS_QUEUED_STALE='[{"id":"tt-ns-queued-stale","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-queued-stale"}}]'
 LOG16R2="$(run_neverstarted "$NS_QUEUED_STALE" "" "$NS_SESS" "" "" "" "" "" "tt-sling-queued-stale")"
-if echo "$LOG16R2" | grep -q "releasing never-started in-flight bead tt-ns-queued-stale"; then
+if echo "$LOG16R2" | grep "releasing never-started in-flight bead tt-ns-queued-stale" >/dev/null; then
   ok "unclaimed-and-stale sling is released (genuine orphan, pool never served it)"
 else
   bad "REGRESSION (ga-l7pp): did NOT release a genuinely stale unclaimed-sling never-started bead"
 fi
-if echo "$LOG16R2" | grep -q "tt-sling-queued-stale is unclaimed AND stale"; then
+if echo "$LOG16R2" | grep "tt-sling-queued-stale is unclaimed AND stale" >/dev/null; then
   ok "orphaned stale sling is closed before the story releases (no lingering claimable duplicate)"
 else
   bad "REGRESSION (ga-l7pp): released the story but did NOT close the orphaned stale sling bead"
@@ -3249,7 +3249,7 @@ fi
 echo "Scenario 16r3 (ga-l7pp): unclaimed sling still kept when roster is untrustworthy (parity with 16h)"
 NS_QUEUED_UNTRUST='[{"id":"tt-ns-queued-untrust","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-queued-untrust"}}]'
 LOG16R3="$(run_neverstarted "$NS_QUEUED_UNTRUST" "" "" "" "" "" "" "" "")"
-if echo "$LOG16R3" | grep -q "releasing never-started in-flight bead tt-ns-queued-untrust"; then
+if echo "$LOG16R3" | grep "releasing never-started in-flight bead tt-ns-queued-untrust" >/dev/null; then
   bad "REGRESSION (ga-l7pp): released an unclaimed-sling bead while the roster was untrustworthy"
 else
   ok "unclaimed-but-fresh sling kept even when roster is untrustworthy (fail-open by default)"
@@ -3273,7 +3273,7 @@ fi
 echo "Scenario 16r4 (ga-brnlfa): an unclaimed-but-fresh DEFERRED sling is KEPT, not released"
 NS_DEFERRED='[{"id":"tt-ns-deferred","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-deferred"}}]'
 LOG16R4="$(run_neverstarted "$NS_DEFERRED" "" "$NS_SESS" "" "" "" "" "" "" "deferred")"
-if echo "$LOG16R4" | grep -q "releasing never-started in-flight bead tt-ns-deferred"; then
+if echo "$LOG16R4" | grep "releasing never-started in-flight bead tt-ns-deferred" >/dev/null; then
   bad "REGRESSION (ga-brnlfa): released a story whose sling is deferred but still fresh — the exact ga-t8aay1 double-path incident"
 else
   ok "unclaimed-but-fresh DEFERRED sling is kept (same treatment as open/in_progress, R6 will clear the defer)"
@@ -3290,12 +3290,12 @@ fi
 echo "Scenario 16r5 (ga-brnlfa): an unclaimed-and-stale DEFERRED sling releases the story AND closes the orphan"
 NS_DEFERRED_STALE='[{"id":"tt-ns-deferred-stale","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-deferred-stale"}}]'
 LOG16R5="$(run_neverstarted "$NS_DEFERRED_STALE" "" "$NS_SESS" "" "" "" "" "" "tt-sling-deferred-stale" "deferred")"
-if echo "$LOG16R5" | grep -q "releasing never-started in-flight bead tt-ns-deferred-stale"; then
+if echo "$LOG16R5" | grep "releasing never-started in-flight bead tt-ns-deferred-stale" >/dev/null; then
   ok "unclaimed-and-stale DEFERRED sling is released (genuine orphan, defer never resolved)"
 else
   bad "REGRESSION (ga-brnlfa): did NOT release a genuinely stale deferred-sling never-started bead"
 fi
-if echo "$LOG16R5" | grep -q "tt-sling-deferred-stale is unclaimed AND stale"; then
+if echo "$LOG16R5" | grep "tt-sling-deferred-stale is unclaimed AND stale" >/dev/null; then
   ok "orphaned stale DEFERRED sling is closed before the story releases (no lingering claimable duplicate)"
 else
   bad "REGRESSION (ga-brnlfa): released the story but did NOT close the orphaned stale DEFERRED sling bead"
@@ -3312,7 +3312,7 @@ PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
   PILOT_TEST_BRANCH_BEADS="" FAKE_BLOCKED_IDS="" \
   bash "$DISPATCHER" >/dev/null 2>&1 || true
 LOG16I="$(cat "$FIXCITY/.gc/logs/pilot-dispatcher.log")"
-if echo "$LOG16I" | grep -q "releasing never-started in-flight bead"; then
+if echo "$LOG16I" | grep "releasing never-started in-flight bead" >/dev/null; then
   bad "detector ran despite PILOT_NEVERSTARTED_MINUTES=0"
 else
   ok "PILOT_NEVERSTARTED_MINUTES=0 fully disables the detector"
@@ -3380,7 +3380,7 @@ echo "Scenario 17b: data bug (email/financeiro/enrichment) dispatched to wa-work
 # pilot-rewire: domain prefer for digo-wa is now a no-op because digo-wa is not in the
 # wa-worker pool. Data bugs dispatch to a wa-worker slot (not held for digo-wa).
 DATA_BUILDER="$(builder_for_domain "$LOG17" data)"
-if echo "$DATA_BUILDER" | grep -qE '^wa-worker-[0-9]+$'; then
+if echo "$DATA_BUILDER" | grep -E '^wa-worker-[0-9]+$' >/dev/null; then
   ok "data bug dispatched to wa-worker slot ($DATA_BUILDER) — domain prefer no-op for ephemeral pool"
 elif [ -z "$DATA_BUILDER" ]; then
   bad "data bug was not dispatched (no domain=data Builder target line)"
@@ -3403,14 +3403,14 @@ echo "Scenario 17d: unknown-domain WA bug dispatched to wa-worker slot (FAIL-OPE
 WA_UNKNOWN='[{"id":"tt-waunk","title":"wa generic bug with no area signal","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"whatsapp_automation"}}]'
 LOG17D="$(run_capacity 10 "[]" 1 "$WA_UNKNOWN")"
 UNK_BUILDER="$(builders_of "$LOG17D")"
-if echo "$UNK_BUILDER" | grep -qE '^wa-worker-[0-9]+$'; then
+if echo "$UNK_BUILDER" | grep -E '^wa-worker-[0-9]+$' >/dev/null; then
   ok "unknown-domain WA bug dispatched to wa-worker slot ($UNK_BUILDER) — fail-open, pool rotation"
 elif [ -z "$UNK_BUILDER" ]; then
   bad "unknown-domain WA bug not dispatched (wa-worker slot available but not taken)"
 else
   bad "unknown-domain WA bug went to unexpected target: '${UNK_BUILDER:-none}'"
 fi
-if echo "$LOG17D" | grep -q "Builder target:.*domain=none"; then
+if echo "$LOG17D" | grep "Builder target:.*domain=none" >/dev/null; then
   ok "unknown domain logged as domain=none (classifier returned empty, no spurious steer)"
 else
   bad "unknown-domain dispatch did not log domain=none"
@@ -3440,10 +3440,10 @@ RE_BEAD='{"title":"enriquecer deals/imóveis fora de BH com geometria+zoneamento
 WARM_BEAD='{"title":"aquecimento de chip novo no grupo","description":"on-device send"}'
 [ "$(_dom "$RE_BEAD")" = real-estate ]          && ok "ArcGIS/imóvel enrichment → real-estate (not data→digo)" || bad "real-estate misclassified: '$(_dom "$RE_BEAD")'"
 [ "$(_own real-estate)" = peter-wa ]            && ok "real-estate prefers peter-wa"                            || bad "real-estate owner wrong: '$(_own real-estate)'"
-echo "$(_exc real-estate)" | grep -q oracle-wa  && ok "real-estate EXCLUDES oracle-wa (kills the loop oracle reported)" || bad "real-estate does not exclude oracle"
+echo "$(_exc real-estate)" | grep oracle-wa >/dev/null  && ok "real-estate EXCLUDES oracle-wa (kills the loop oracle reported)" || bad "real-estate does not exclude oracle"
 # wa-nvn9 root: peter-wa human-engaged → pool rotation picked thies-wa (not excluded). thies owns
 # the satmap/visual layer only; peter owns the ArcGIS/zoneamento/imóvel enrichment pipeline.
-echo "$(_exc real-estate)" | grep -q thies-wa  && ok "real-estate EXCLUDES thies-wa (wa-nvn9 misroute to thies when peter human-engaged)" || bad "real-estate does not exclude thies-wa"
+echo "$(_exc real-estate)" | grep thies-wa >/dev/null  && ok "real-estate EXCLUDES thies-wa (wa-nvn9 misroute to thies when peter human-engaged)" || bad "real-estate does not exclude thies-wa"
 # Confirm the wa-nvn9 title/description keywords (geometria+zoneamento+ArcGIS+quarteirao_map) classify real-estate.
 NVNBEAD='{"title":"Contagem: enriquecer deals/imóveis fora de BH com geometria+zoneamento do ArcGIS (plugar no funil imovel-to-campanha + quarteirao_map)","description":"API ArcGIS pública de Contagem sem auth, f=geojson."}'
 [ "$(_dom "$NVNBEAD")" = real-estate ]          && ok "wa-nvn9 exact title (geometria+zoneamento+ArcGIS+quarteirao_map) → real-estate" || bad "wa-nvn9 bead misclassified: '$(_dom "$NVNBEAD")'"
@@ -3491,12 +3491,12 @@ LOG17G="$(run_capacity 10 "[]" 1 "$WARM_BUG")"
 WARM_BUILDER="$(builder_for_domain "$LOG17G" warming)"
 if [ "$WARM_BUILDER" = "oracle-wa" ]; then
   ok "warming bug dispatched DIRECTLY to oracle-wa (structural owner, ga-uvfs6 fix)"
-elif echo "$WARM_BUILDER" | grep -qE '^wa-worker-[0-9]+$'; then
+elif echo "$WARM_BUILDER" | grep -E '^wa-worker-[0-9]+$' >/dev/null; then
   bad "REGRESSION (ga-uvfs6): warming bug went to generic wa-worker pool ($WARM_BUILDER) instead of oracle-wa — the 2026-07-17 owner decision is not honored"
 else
   bad "warming bug routed unexpectedly (got: '${WARM_BUILDER:-none}')"
 fi
-if echo "$LOG17G" | grep -q "gc.routed_to=wa-worker"; then
+if echo "$LOG17G" | grep "gc.routed_to=wa-worker" >/dev/null; then
   bad "REGRESSION (ga-uvfs6): warming bug still stamped gc.routed_to=wa-worker despite direct oracle-wa dispatch"
 else
   ok "warming bug did NOT receive gc.routed_to=wa-worker stamp (named-crew path used instead)"
@@ -3512,7 +3512,7 @@ fi
 # Re-assert 17b's own data-domain expectation still holds with the new guard wired in
 # (belt-and-suspenders: 17b already covers this, but this ties the regression explicitly
 # to rig_domain_requires_persistent_owner rather than relying only on the shared fixture).
-if echo "$DATA_BUILDER" | grep -qE '^wa-worker-[0-9]+$'; then
+if echo "$DATA_BUILDER" | grep -E '^wa-worker-[0-9]+$' >/dev/null; then
   ok "ga-uvfs6 control: data bug (digo-wa mapped but NOT structurally required) still pool-routed ($DATA_BUILDER)"
 else
   bad "ga-uvfs6 control: data bug unexpectedly bypassed the pool (got: '${DATA_BUILDER:-none}') — rig_domain_requires_persistent_owner too broad"
@@ -3539,20 +3539,20 @@ SLINGMAP_PPX8H='{"tt-sling-oracle":"oracle-wa"}'
 
 echo "Scenario ga-ppx8h-a: warming-domain WA bug with a BUSY oracle-wa DEFERS — does NOT leak into the wa-worker pool"
 LOG_PPX8H_A="$(run_capacity 10 "$INFLIGHT_PPX8H" 1 "$WARM_BUG" "$SESSIONS_PPX8H" "$SLINGMAP_PPX8H")"
-if echo "$LOG_PPX8H_A" | grep -q "Busy builders (live in-flight): oracle-wa"; then
+if echo "$LOG_PPX8H_A" | grep "Busy builders (live in-flight): oracle-wa" >/dev/null; then
   ok "busy-builder set computed with oracle-wa busy (fixture wired correctly)"
 else
   bad "did not compute oracle-wa as busy — fixture not wired as intended, the result below is not trustworthy"
 fi
 WARMBUILDER_PPX8H_A="$(builders_of "$LOG_PPX8H_A")"
-if echo "$WARMBUILDER_PPX8H_A" | grep -qE '^wa-worker-[0-9]+$'; then
+if echo "$WARMBUILDER_PPX8H_A" | grep -E '^wa-worker-[0-9]+$' >/dev/null; then
   bad "REGRESSION (ga-ppx8h): warming bug leaked into the wa-worker pool ($WARMBUILDER_PPX8H_A) when oracle-wa was busy — reproduces the on-device misroute this fix exists to close"
 elif [ -z "$WARMBUILDER_PPX8H_A" ]; then
   ok "warming bug correctly DEFERRED (no dispatch) while oracle-wa is busy — never touches the wa-worker pool"
 else
   bad "warming bug went to an unexpected target while oracle-wa was busy: '$WARMBUILDER_PPX8H_A'"
 fi
-if echo "$LOG_PPX8H_A" | grep -q "deferring tt-wawarm to next sweep"; then
+if echo "$LOG_PPX8H_A" | grep "deferring tt-wawarm to next sweep" >/dev/null; then
   ok "defer is logged explicitly (domain-excluded from the fallback pool, not a silent drop)"
 else
   bad "no explicit defer log line found for tt-wawarm — investigate before trusting the outcome above"
@@ -3562,7 +3562,7 @@ echo "Scenario ga-ppx8h-b (control): a non-warming WA bug in the SAME sweep as a
 TWO_BUGS_PPX8H="[$(echo "$WARM_BUG" | jq -c '.[0]'),$(echo "$WA_ONE_BUG" | jq -c '.[0]')]"
 LOG_PPX8H_B="$(run_capacity 10 "$INFLIGHT_PPX8H" 1 "$TWO_BUGS_PPX8H" "$SESSIONS_PPX8H" "$SLINGMAP_PPX8H")"
 NONWARM_BUILDER_PPX8H_B="$(echo "$LOG_PPX8H_B" | grep 'Builder target:' | grep -v 'domain=warming' | sed -E 's/.*Builder target: ([^ ]+).*/\1/' | head -1)"
-if echo "$NONWARM_BUILDER_PPX8H_B" | grep -qE '^wa-worker-[0-9]+$'; then
+if echo "$NONWARM_BUILDER_PPX8H_B" | grep -E '^wa-worker-[0-9]+$' >/dev/null; then
   ok "non-warming WA bug still dispatched to a wa-worker slot ($NONWARM_BUILDER_PPX8H_B) in the same sweep — warming exclusion is domain-scoped, not sweep-wide"
 else
   bad "non-warming WA bug did not dispatch as expected (got: '${NONWARM_BUILDER_PPX8H_B:-none}') — warming fix may be over-broad"
@@ -3634,17 +3634,17 @@ echo "Scenario 17a: ACTIVE crew session → REUSE (hook + follow_up submit), nev
 # Uses a PS bug → routes to batista-ps (persistent crew, reuse applies).
 # wa-worker-* are ephemeral (like gastown.dog) → excluded from reuse.
 LOG17A="$(run_capacity_reuse 1 "$GT4_PS_BUG" "$GT4_SESS_ACTIVE")"
-if echo "$LOG17A" | grep -qE "REUSE\(gt-4st3n\): batista-ps has an existing active session"; then
+if echo "$LOG17A" | grep -E "REUSE\(gt-4st3n\): batista-ps has an existing active session" >/dev/null; then
   ok "classified the active crew session for reuse (no 2nd spawn)"
 else
   bad "did not classify the active session for reuse (expected REUSE(gt-4st3n) … batista-ps … active)"
 fi
-if echo "$LOG17A" | grep -qE "WOULD: gc session submit batista-ps .* --intent follow_up"; then
+if echo "$LOG17A" | grep -E "WOULD: gc session submit batista-ps .* --intent follow_up" >/dev/null; then
   ok "delivers via non-interrupting follow_up submit to the existing session"
 else
   bad "did not choose non-interrupting follow_up submit for the active session"
 fi
-if echo "$LOG17A" | grep -q "WOULD: gc session wake"; then
+if echo "$LOG17A" | grep "WOULD: gc session wake" >/dev/null; then
   bad "must NOT wake an already-active session"
 else
   ok "active session is not waked (only asleep sessions are)"
@@ -3652,17 +3652,17 @@ fi
 
 echo "Scenario 17b: ASLEEP crew session → wake the EXISTING session, then reuse (no parallel)"
 LOG17B="$(run_capacity_reuse 1 "$GT4_PS_BUG" "$GT4_SESS_ASLEEP")"
-if echo "$LOG17B" | grep -qE "REUSE\(gt-4st3n\): batista-ps has an existing asleep session"; then
+if echo "$LOG17B" | grep -E "REUSE\(gt-4st3n\): batista-ps has an existing asleep session" >/dev/null; then
   ok "classified the asleep crew session for reuse"
 else
   bad "did not classify the asleep session for reuse (expected REUSE(gt-4st3n) … batista-ps … asleep)"
 fi
-if echo "$LOG17B" | grep -qE "WOULD: gc session wake batista-ps"; then
+if echo "$LOG17B" | grep -E "WOULD: gc session wake batista-ps" >/dev/null; then
   ok "wakes the existing asleep session (no parallel spawn)"
 else
   bad "did not wake the existing asleep session"
 fi
-if echo "$LOG17B" | grep -qE "WOULD: gc session submit batista-ps .* --intent follow_up"; then
+if echo "$LOG17B" | grep -E "WOULD: gc session submit batista-ps .* --intent follow_up" >/dev/null; then
   ok "asleep path also delivers via non-interrupting follow_up submit"
 else
   bad "asleep path did not choose follow_up submit"
@@ -3670,12 +3670,12 @@ fi
 
 echo "Scenario 17c: NO existing session → spawn is correct (legacy sling path), no REUSE"
 LOG17C="$(run_capacity_reuse 1 "$GT4_PS_BUG" "$GT4_SESS_NONE")"
-if echo "$LOG17C" | grep -q "REUSE(gt-4st3n)"; then
+if echo "$LOG17C" | grep "REUSE(gt-4st3n)" >/dev/null; then
   bad "REGRESSION: claimed reuse when no session exists (would never spawn → starvation)"
 else
   ok "no session → no reuse (spawn path taken)"
 fi
-if echo "$LOG17C" | grep -q "spawn: no existing session"; then
+if echo "$LOG17C" | grep "spawn: no existing session" >/dev/null; then
   ok "logs the spawn path explicitly when there is no session to reuse"
 else
   bad "did not log the spawn path for the no-session case"
@@ -3683,12 +3683,12 @@ fi
 
 echo "Scenario 17d: gastown.dog is a DOG POOL → always spawn, exempt from reuse"
 LOG17D="$(run_capacity_reuse 1 "$GT4_GC_BUG" "$GT4_SESS_DOG")"
-if echo "$LOG17D" | grep -q "Builder target: gastown.dog"; then
+if echo "$LOG17D" | grep "Builder target: gastown.dog" >/dev/null; then
   ok "gascity bug routed to the gastown.dog pool"
 else
   bad "gascity bug did not route to gastown.dog (fixture drift)"
 fi
-if echo "$LOG17D" | grep -q "REUSE(gt-4st3n)"; then
+if echo "$LOG17D" | grep "REUSE(gt-4st3n)" >/dev/null; then
   bad "REGRESSION: dog pool must be exempt — reuse would break multi-instance design"
 else
   ok "dog pool exempt from reuse even with a live gastown.dog session present"
@@ -3698,7 +3698,7 @@ echo "Scenario 17e: PILOT_REUSE_SESSION=0 restores legacy behaviour (no reuse cl
 # Use a PS bug (batista-ps — persistent crew, reuse applies when flag=1).
 # With flag=0, reuse must not fire even for persistent crew.
 LOG17E="$(run_capacity_reuse 0 "$GT4_PS_BUG" "$GT4_SESS_ACTIVE")"
-if echo "$LOG17E" | grep -q "REUSE(gt-4st3n)"; then
+if echo "$LOG17E" | grep "REUSE(gt-4st3n)" >/dev/null; then
   bad "REGRESSION: reuse fired with PILOT_REUSE_SESSION=0 (flag not honoured)"
 else
   ok "PILOT_REUSE_SESSION=0 disables reuse (legacy spawn+nudge path)"
@@ -3739,12 +3739,12 @@ LOG18A="$(run_capacity 10 "[]" 1 "$PS_DOMAIN_SMALL")"
 B18A="$(dispatched_builder "$LOG18A")"
 if [ "$B18A" = "batista-ps" ]; then
   ok "lane:small property_scrapers domain build routed to batista-ps (not the dog)"
-elif echo "$B18A" | grep -qE '^gastown\.dog'; then
+elif echo "$B18A" | grep -E '^gastown\.dog' >/dev/null; then
   bad "REGRESSION: domain build landed on the dog pool ($B18A) — the recurring misroute"
 else
   bad "domain build routed unexpectedly (got: '${B18A:-none}')"
 fi
-if echo "$LOG18A" | grep -q "ga-lfvs6: .* domain build .* routing to the owning persistent crew batista-ps"; then
+if echo "$LOG18A" | grep "ga-lfvs6: .* domain build .* routing to the owning persistent crew batista-ps" >/dev/null; then
   ok "domain-route guard logged the re-route to batista-ps"
 else
   bad "domain-route guard did not log the affirmative re-route"
@@ -3756,7 +3756,7 @@ LOG18B="$(run_capacity 10 "[]" 1 "$PS_DOMAIN_DATA")"
 B18B="$(dispatched_builder "$LOG18B")"
 if [ "$B18B" = "batista-ps" ]; then
   ok "lane:small ITBI/CNAE data-build routed to batista-ps (not the dog)"
-elif echo "$B18B" | grep -qE '^gastown\.dog'; then
+elif echo "$B18B" | grep -E '^gastown\.dog' >/dev/null; then
   bad "REGRESSION: data-build landed on the dog pool ($B18B)"
 else
   bad "data-build routed unexpectedly (got: '${B18B:-none}')"
@@ -3770,7 +3770,7 @@ if [ "$(echo "$B18C" | grep -c .)" -ge 5 ] && [ -z "$(echo "$B18C" | grep -vE '^
 else
   bad "REGRESSION: generic HQ routing changed (got: $(echo "$B18C" | sort -u | tr '\n' ' '))"
 fi
-if echo "$LOG18C" | grep -q "ga-lfvs6:"; then
+if echo "$LOG18C" | grep "ga-lfvs6:" >/dev/null; then
   bad "domain-route guard fired on generic HQ work (false positive)"
 else
   ok "domain-route guard stayed silent on generic HQ work (no false positive)"
@@ -3784,7 +3784,7 @@ LOG18D="$(run_capacity 10 "[]" 1 "$PS_DOMAIN_BIG")"
 B18D="$(dispatched_builder "$LOG18D")"
 if [ "$B18D" = "batista-ps" ]; then
   ok "lane:big domain build also routed to batista-ps (lane-agnostic)"
-elif echo "$B18D" | grep -qE '^gastown\.dog'; then
+elif echo "$B18D" | grep -E '^gastown\.dog' >/dev/null; then
   bad "REGRESSION: lane:big domain build landed on the dog pool ($B18D)"
 else
   bad "lane:big domain build routed unexpectedly (got: '${B18D:-none}')"
@@ -3799,11 +3799,11 @@ SESSIONS18E='{"sessions":[{"session_name":"batista-ps","closed":false}]}'
 SLINGMAP18E='{"tt-sling-ps":"batista-ps"}'
 LOG18E="$(run_capacity 10 "$INFLIGHT18E" 1 "$PS_DOMAIN_SMALL" "$SESSIONS18E" "$SLINGMAP18E")"
 B18E="$(dispatched_builder "$LOG18E")"
-if echo "$B18E" | grep -qE '^gastown\.dog'; then
+if echo "$B18E" | grep -E '^gastown\.dog' >/dev/null; then
   bad "REGRESSION: domain build fell back to a dog while batista-ps was busy ($B18E)"
 elif [ "$B18E" = "batista-ps" ]; then
   bad "domain build dispatched to batista-ps despite it being busy (mutex bypass)"
-elif echo "$LOG18E" | grep -q "ga-lfvs6: REFUSING"; then
+elif echo "$LOG18E" | grep "ga-lfvs6: REFUSING" >/dev/null; then
   ok "domain build DEFERRED (no dispatch, no dog) while owning crew busy — correct backpressure"
 elif [ -z "$B18E" ]; then
   ok "domain build not dispatched to any builder while owning crew busy (deferred)"
@@ -3829,9 +3829,9 @@ LOG18G="$(run_capacity 10 "[]" 1 "$WA_PIPEDRIVE")"
 B18G="$(dispatched_builder "$LOG18G")"
 if [ "$B18G" = "batista-ps" ]; then
   bad "REGRESSION (ga-lt8cw): WA pipedrive feature misrouted to property_scrapers/batista-ps"
-elif echo "$B18G" | grep -qE '^gastown\.dog'; then
+elif echo "$B18G" | grep -E '^gastown\.dog' >/dev/null; then
   bad "REGRESSION (ga-lt8cw): WA pipedrive feature landed on the dog pool ($B18G)"
-elif echo "$LOG18G" | grep -q "whatsapp_automation domain build" || [ -z "$B18G" ]; then
+elif echo "$LOG18G" | grep "whatsapp_automation domain build" >/dev/null || [ -z "$B18G" ]; then
   ok "WA pipedrive feature classified WA → deferred/owned, not the property misroute"
 else
   bad "WA pipedrive feature routed unexpectedly (got: '${B18G:-none}')"
@@ -3843,9 +3843,9 @@ LOG18H="$(run_capacity 10 "[]" 1 "$WA_BRIDGE")"
 B18H="$(dispatched_builder "$LOG18H")"
 if [ "$B18H" = "batista-ps" ]; then
   bad "REGRESSION (ga-nq64a): WA itbi_drive_bridge feature misrouted to property_scrapers/batista-ps"
-elif echo "$B18H" | grep -qE '^gastown\.dog'; then
+elif echo "$B18H" | grep -E '^gastown\.dog' >/dev/null; then
   bad "REGRESSION (ga-nq64a): WA bridge feature landed on the dog pool ($B18H)"
-elif echo "$LOG18H" | grep -q "whatsapp_automation domain build" || [ -z "$B18H" ]; then
+elif echo "$LOG18H" | grep "whatsapp_automation domain build" >/dev/null || [ -z "$B18H" ]; then
   ok "WA bridge feature classified WA → deferred/owned, not the property misroute"
 else
   bad "WA bridge feature routed unexpectedly (got: '${B18H:-none}')"
@@ -3882,9 +3882,9 @@ LOG18K="$(run_capacity 10 "[]" 1 "$WA_OWNER_ITBI")"
 B18K="$(dispatched_builder "$LOG18K")"
 if [ "$B18K" = "batista-ps" ]; then
   bad "REGRESSION (ga-nlh79): *-wa-owned bead with ITBI/Contagem nouns misrouted to batista-ps — owner-authoritative guard not firing"
-elif echo "$B18K" | grep -qE '^gastown\.dog'; then
+elif echo "$B18K" | grep -E '^gastown\.dog' >/dev/null; then
   bad "REGRESSION (ga-nlh79): *-wa-owned bead landed on dog pool — owner guard not promoting to WA crew"
-elif echo "$LOG18K" | grep -q "ga-nlh79.*owner-authoritative\|whatsapp_automation.*domain build\|REFUSING.*whatsapp_automation" || [ -z "$B18K" ]; then
+elif echo "$LOG18K" | grep "ga-nlh79.*owner-authoritative\|whatsapp_automation.*domain build\|REFUSING.*whatsapp_automation" >/dev/null || [ -z "$B18K" ]; then
   ok "ga-nlh79: *-wa-owned bead with property nouns → WA domain (not batista-ps), owner guard fired"
 else
   bad "ga-nlh79: *-wa-owned bead routed unexpectedly (got: '${B18K:-none}')"
@@ -3895,9 +3895,9 @@ LOG18K2="$(run_capacity 10 "[]" 1 "$WA_OWNER_NOMATCH")"
 B18K2="$(dispatched_builder "$LOG18K2")"
 if [ "$B18K2" = "batista-ps" ]; then
   bad "REGRESSION (ga-nlh79): mila-wa-owned bead with no WA keyword misrouted to batista-ps"
-elif echo "$B18K2" | grep -qE '^gastown\.dog'; then
+elif echo "$B18K2" | grep -E '^gastown\.dog' >/dev/null; then
   bad "REGRESSION (ga-nlh79): mila-wa-owned bead landed on dog pool"
-elif echo "$LOG18K2" | grep -q "ga-nlh79.*owner-authoritative\|whatsapp_automation.*domain build\|REFUSING.*whatsapp_automation" || [ -z "$B18K2" ]; then
+elif echo "$LOG18K2" | grep "ga-nlh79.*owner-authoritative\|whatsapp_automation.*domain build\|REFUSING.*whatsapp_automation" >/dev/null || [ -z "$B18K2" ]; then
   ok "ga-nlh79: mila-wa-owned bead with no WA keyword → WA domain, owner guard fired"
 else
   bad "ga-nlh79: mila-wa-owned bead routed unexpectedly (got: '${B18K2:-none}')"
@@ -3908,7 +3908,7 @@ LOG18K3="$(run_capacity 10 "[]" 1 "$PS_OWNER_GENUINE")"
 B18K3="$(dispatched_builder "$LOG18K3")"
 if [ "$B18K3" = "batista-ps" ]; then
   ok "ga-nlh79 preservation: genuine property bead (batista-ps owner) still routes to batista-ps"
-elif echo "$B18K3" | grep -qE '^gastown\.dog'; then
+elif echo "$B18K3" | grep -E '^gastown\.dog' >/dev/null; then
   bad "REGRESSION: genuine property bead landed on dog (owner guard over-fired on ps owner)"
 else
   bad "REGRESSION: genuine property bead routed unexpectedly (got: '${B18K3:-none}')"
@@ -3974,20 +3974,20 @@ INFRA_LIFO_OBJ="$(echo "$INFRA_LIFO" | jq -c '.[0]')"
 [ "$(_dom "$INFRA_LIFO_OBJ")" = infra ] && ok "bead_domain classifies ga-tgo7q shape as infra (framework)" || bad "bead_domain not infra: '$(_dom "$INFRA_LIFO_OBJ")'"
 LOG18M="$(run_capacity 10 "[]" 1 "$INFRA_LIFO")"
 B18M="$(dispatched_builder "$LOG18M")"
-if echo "$B18M" | grep -qE '^gastown\.dog'; then
+if echo "$B18M" | grep -E '^gastown\.dog' >/dev/null; then
   ok "infra bead DISPATCHED to the dog pool ($B18M) — framework work builds on the dog (fix works)"
-elif [ -z "$B18M" ] && echo "$LOG18M" | grep -q "REFUSING"; then
+elif [ -z "$B18M" ] && echo "$LOG18M" | grep "REFUSING" >/dev/null; then
   bad "REGRESSION: infra bead REFUSED to the dog pool + held (the ga-tgo7q 336-loop stall)"
 else
   bad "infra bead routed unexpectedly (got: '${B18M:-none}')"
 fi
-echo "$LOG18M" | grep -q "framework-dog-exempt: ga-tgtest" && ok "exemption logged for ga-tgo7q shape" || bad "framework-dog-exempt not logged for ga-tgo7q shape"
-echo "$LOG18M" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-tgtest" && bad "ga-tgo7q shape still refused (bug present)" || ok "ga-tgo7q shape NOT refused (no pilot:held loop)"
+echo "$LOG18M" | grep "framework-dog-exempt: ga-tgtest" >/dev/null && ok "exemption logged for ga-tgo7q shape" || bad "framework-dog-exempt not logged for ga-tgo7q shape"
+echo "$LOG18M" | grep "REFUSING to dispatch whatsapp_automation domain build ga-tgtest" >/dev/null && bad "ga-tgo7q shape still refused (bug present)" || ok "ga-tgo7q shape NOT refused (no pilot:held loop)"
 
 echo "Scenario 18m2 (ga-tgo7q, guard OFF): PILOT_FRAMEWORK_DOG_EXEMPT=0 reproduces the REFUSE+hold bug"
 LOG18M0="$(PILOT_FRAMEWORK_DOG_EXEMPT=0 run_capacity 10 "[]" 1 "$INFRA_LIFO")"
 B18M0="$(dispatched_builder "$LOG18M0")"
-if [ -z "$B18M0" ] && echo "$LOG18M0" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-tgtest"; then
+if [ -z "$B18M0" ] && echo "$LOG18M0" | grep "REFUSING to dispatch whatsapp_automation domain build ga-tgtest" >/dev/null; then
   ok "with exemption OFF the bead is REFUSED+held (proves the fix is EXACTLY what flips the behaviour)"
 else
   bad "toggle-off did not reproduce the refuse (knob not wired?) got builder='${B18M0:-none}'"
@@ -4005,14 +4005,14 @@ INFRA_REV_OBJ="$(echo "$INFRA_REVIEWER" | jq -c '.[0]')"
 [ "$(_dom "$INFRA_REV_OBJ")" = infra ] && ok "bead_domain classifies ga-evjs2 shape as infra (framework) — unaffected by the ga-r4jnu fix" || bad "bead_domain not infra: '$(_dom "$INFRA_REV_OBJ")'"
 LOG18N="$(run_capacity 10 "[]" 1 "$INFRA_REVIEWER")"
 B18N="$(dispatched_builder "$LOG18N")"
-if echo "$B18N" | grep -qE '^gastown\.dog'; then
+if echo "$B18N" | grep -E '^gastown\.dog' >/dev/null; then
   ok "gate-reviewer infra bead DISPATCHED to the dog pool ($B18N) — fix works"
-elif [ -z "$B18N" ] && echo "$LOG18N" | grep -q "REFUSING"; then
+elif [ -z "$B18N" ] && echo "$LOG18N" | grep "REFUSING" >/dev/null; then
   bad "REGRESSION: gate-reviewer infra bead REFUSED to the dog pool + held (the ga-evjs2 stall)"
 else
   bad "gate-reviewer infra bead routed unexpectedly (got: '${B18N:-none}')"
 fi
-echo "$LOG18N" | grep -q "framework-dog-exempt: ga-evtest" && bad "exemption fired for ga-evjs2 shape but bead_content_rig should already be empty post-ga-r4jnu (redundant firing suggests the word-boundary fix regressed)" || ok "framework-dog-exempt correctly silent for ga-evjs2 shape (ga-r4jnu: nothing to exempt — bead_content_rig already returns empty)"
+echo "$LOG18N" | grep "framework-dog-exempt: ga-evtest" >/dev/null && bad "exemption fired for ga-evjs2 shape but bead_content_rig should already be empty post-ga-r4jnu (redundant firing suggests the word-boundary fix regressed)" || ok "framework-dog-exempt correctly silent for ga-evjs2 shape (ga-r4jnu: nothing to exempt — bead_content_rig already returns empty)"
 
 echo "Scenario 18o (no regression): genuine PRODUCT-domain beads are NEVER infra-exempted → still steered to crew"
 # The exemption keys on bead_domain=infra; a real product build classifies as its PRODUCT
@@ -4026,7 +4026,7 @@ echo "Scenario 18o (no regression): genuine PRODUCT-domain beads are NEVER infra
 LOG18O="$(run_capacity 10 "[]" 1 "$PS_DOMAIN_SMALL")"
 B18O="$(dispatched_builder "$LOG18O")"
 [ "$B18O" = batista-ps ] && ok "property_scrapers domain build STILL → batista-ps (product routing not regressed)" || bad "REGRESSION: property build → '${B18O:-none}' (expected batista-ps)"
-echo "$LOG18O" | grep -q "framework-dog-exempt" && bad "exemption wrongly fired on a property build" || ok "exemption stayed silent on the property build (bead_domain≠infra)"
+echo "$LOG18O" | grep "framework-dog-exempt" >/dev/null && bad "exemption wrongly fired on a property build" || ok "exemption stayed silent on the property build (bead_domain≠infra)"
 
 echo "Scenario 18p (fail-open): a ga- HQ bead with NO domain signal → dog dispatch, exemption silent"
 NODOMAIN='[{"id":"ga-nodtest","title":"bump the sweep log verbosity flag default","priority":3,"issue_type":"bug","description":"flip a logging default; no domain content whatsoever","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-07-01T00:00:03Z","metadata":{}}]'
@@ -4034,8 +4034,8 @@ NODOMAIN_OBJ="$(echo "$NODOMAIN" | jq -c '.[0]')"
 [ -z "$(_bcr "$NODOMAIN_OBJ")" ] && ok "no-domain bead: bead_content_rig empty (nothing to exempt)" || bad "no-domain bead unexpectedly inferred rig: '$(_bcr "$NODOMAIN_OBJ")'"
 LOG18P="$(run_capacity 10 "[]" 1 "$NODOMAIN")"
 B18P="$(dispatched_builder "$LOG18P")"
-echo "$B18P" | grep -qE '^gastown\.dog' && ok "unknown-domain HQ bead dispatched to the dog (fail-open unchanged)" || bad "unknown-domain HQ bead routed unexpectedly: '${B18P:-none}'"
-echo "$LOG18P" | grep -q "framework-dog-exempt" && bad "exemption fired on a no-domain bead (should only touch an inferred product rig)" || ok "exemption silent on no-domain bead (only acts on a mis-inferred product rig)"
+echo "$B18P" | grep -E '^gastown\.dog' >/dev/null && ok "unknown-domain HQ bead dispatched to the dog (fail-open unchanged)" || bad "unknown-domain HQ bead routed unexpectedly: '${B18P:-none}'"
+echo "$LOG18P" | grep "framework-dog-exempt" >/dev/null && bad "exemption fired on a no-domain bead (should only touch an inferred product rig)" || ok "exemption silent on no-domain bead (only acts on a mis-inferred product rig)"
 
 echo "Scenario 18q: drift-guard — framework-dog-exempt is wired into the live dispatcher"
 has "$DISPATCHER" 'PILOT_FRAMEWORK_DOG_EXEMPT'   "framework-dog-exempt knob is wired"
@@ -4065,21 +4065,21 @@ INFRA_SHADOWED_OBJ="$(echo "$INFRA_SHADOWED" | jq -c '.[0]')"
 [ "$(_dom "$INFRA_SHADOWED_OBJ")" = frontend ] && ok "precondition: bead_domain returns frontend (NOT infra) — kanban shadows the ALSO-present infra keyword, exemption (a) alone would miss this" || bad "precondition changed: bead_domain='$(_dom "$INFRA_SHADOWED_OBJ")' (expected frontend)"
 LOG18Q2="$(run_capacity 10 "[]" 1 "$INFRA_SHADOWED")"
 B18Q2="$(dispatched_builder "$LOG18Q2")"
-if echo "$B18Q2" | grep -qE '^gastown\.dog'; then
+if echo "$B18Q2" | grep -E '^gastown\.dog' >/dev/null; then
   ok "shadowed-infra bead DISPATCHED to the dog pool ($B18Q2) — condition (f) catches what (a) missed"
-elif [ -z "$B18Q2" ] && echo "$LOG18Q2" | grep -q "REFUSING"; then
+elif [ -z "$B18Q2" ] && echo "$LOG18Q2" | grep "REFUSING" >/dev/null; then
   bad "REGRESSION: shadowed-infra bead REFUSED to the dog pool + held (ga-1mqdz AC2 reproduced)"
 else
   bad "shadowed-infra bead routed unexpectedly (got: '${B18Q2:-none}')"
 fi
-echo "$LOG18Q2" | grep -q "framework-dog-exempt: ga-ac2test" && ok "exemption logged for the shadowed-infra shape" || bad "framework-dog-exempt not logged for the shadowed-infra shape"
-echo "$LOG18Q2" | grep -q "infra-keyword-shadowed" && ok "exemption reason correctly attributes condition (f), not (a)" || bad "exemption did not log the expected condition-(f) reason (infra-keyword-shadowed)"
-echo "$LOG18Q2" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-ac2test" && bad "shadowed-infra shape still refused (ga-1mqdz AC2 not fixed)" || ok "shadowed-infra shape NOT refused (no pilot:held loop)"
+echo "$LOG18Q2" | grep "framework-dog-exempt: ga-ac2test" >/dev/null && ok "exemption logged for the shadowed-infra shape" || bad "framework-dog-exempt not logged for the shadowed-infra shape"
+echo "$LOG18Q2" | grep "infra-keyword-shadowed" >/dev/null && ok "exemption reason correctly attributes condition (f), not (a)" || bad "exemption did not log the expected condition-(f) reason (infra-keyword-shadowed)"
+echo "$LOG18Q2" | grep "REFUSING to dispatch whatsapp_automation domain build ga-ac2test" >/dev/null && bad "shadowed-infra shape still refused (ga-1mqdz AC2 not fixed)" || ok "shadowed-infra shape NOT refused (no pilot:held loop)"
 
 echo "Scenario 18q2b (ga-1mqdz, guard OFF): PILOT_FRAMEWORK_DOG_EXEMPT=0 reproduces the REFUSE+hold bug"
 LOG18Q2B="$(PILOT_FRAMEWORK_DOG_EXEMPT=0 run_capacity 10 "[]" 1 "$INFRA_SHADOWED")"
 B18Q2B="$(dispatched_builder "$LOG18Q2B")"
-if [ -z "$B18Q2B" ] && echo "$LOG18Q2B" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-ac2test"; then
+if [ -z "$B18Q2B" ] && echo "$LOG18Q2B" | grep "REFUSING to dispatch whatsapp_automation domain build ga-ac2test" >/dev/null; then
   ok "with exemption OFF the shadowed-infra bead is REFUSED+held (proves condition (f) is exactly what flips the behaviour)"
 else
   bad "toggle-off did not reproduce the refuse (knob not wired to condition (f)?) got builder='${B18Q2B:-none}'"
@@ -4102,23 +4102,23 @@ GT_PREFIX_OBJ="$(echo "$GT_PREFIX_BEAD" | jq -c '.[0]')"
 [ "$(_dom "$GT_PREFIX_OBJ")" != infra ] && ok "precondition: bead_domain is NOT infra (conditions a/f alone would miss this — no dolt/dispatcher/framework/etc keyword)" || bad "precondition changed: bead_domain unexpectedly infra"
 LOG_GTPFX="$(run_capacity 10 "[]" 1 "$GT_PREFIX_BEAD")"
 B_GTPFX="$(dispatched_builder "$LOG_GTPFX")"
-if echo "$B_GTPFX" | grep -qE '^gastown\.dog'; then
+if echo "$B_GTPFX" | grep -E '^gastown\.dog' >/dev/null; then
   ok "gt-prefixed bead DISPATCHED to the dog pool ($B_GTPFX) — condition (g) catches what (a)-(f) missed"
-elif [ -z "$B_GTPFX" ] && echo "$LOG_GTPFX" | grep -q "REFUSING"; then
+elif [ -z "$B_GTPFX" ] && echo "$LOG_GTPFX" | grep "REFUSING" >/dev/null; then
   bad "REGRESSION (ga-pmkoar): gt-prefixed bead REFUSED to the dog pool + held (the 7th framework-dog-exempt stall shape)"
 else
   bad "gt-prefixed bead routed unexpectedly (got: '${B_GTPFX:-none}')"
 fi
-echo "$LOG_GTPFX" | grep -q "framework-dog-exempt: gt-fwtest" && ok "exemption logged for the gt-prefix shape" || bad "framework-dog-exempt not logged for the gt-prefix shape"
-echo "$LOG_GTPFX" | grep -q "gt-prefix-framework-store" && ok "exemption reason correctly attributes condition (g)" || bad "exemption did not log the expected condition-(g) reason (gt-prefix-framework-store)"
-echo "$LOG_GTPFX" | grep -q "REFUSING to dispatch whatsapp_automation domain build gt-fwtest" && bad "gt-prefix shape still refused (ga-pmkoar not fixed)" || ok "gt-prefix shape NOT refused (no pilot:held loop)"
+echo "$LOG_GTPFX" | grep "framework-dog-exempt: gt-fwtest" >/dev/null && ok "exemption logged for the gt-prefix shape" || bad "framework-dog-exempt not logged for the gt-prefix shape"
+echo "$LOG_GTPFX" | grep "gt-prefix-framework-store" >/dev/null && ok "exemption reason correctly attributes condition (g)" || bad "exemption did not log the expected condition-(g) reason (gt-prefix-framework-store)"
+echo "$LOG_GTPFX" | grep "REFUSING to dispatch whatsapp_automation domain build gt-fwtest" >/dev/null && bad "gt-prefix shape still refused (ga-pmkoar not fixed)" || ok "gt-prefix shape NOT refused (no pilot:held loop)"
 
 echo "Scenario ga-pmkoar-b (control): the SAME content on a ga- (HQ) id does NOT gt-prefix-exempt (Scenario 18k2/18ak's tie-break stays untouched)"
 GA_CONTROL_BEAD='[{"id":"ga-fwctltest","title":"Config de merge driver diverge entre .git e .repo.git no whatsapp_automation","priority":2,"issue_type":"bug","description":"O rig whatsapp_automation tem dois git dirs (.git e .repo.git) com configuracoes de merge driver diferentes entre eles - um dos dois nao tem o driver semantico configurado, entao o resultado do merge diverge conforme o caminho usado.","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"gastown.mayor","created_at":"2026-09-11T00:00:01Z","metadata":{}}]'
 LOG_GACTL="$(run_capacity 10 "[]" 1 "$GA_CONTROL_BEAD")"
-if echo "$LOG_GACTL" | grep -q "gt-prefix-framework-store"; then
+if echo "$LOG_GACTL" | grep "gt-prefix-framework-store" >/dev/null; then
   bad "condition (g) wrongly fired on a ga- (non-gt) id — prefix exemption must stay scoped to gt- only"
-elif echo "$LOG_GACTL" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-fwctltest"; then
+elif echo "$LOG_GACTL" | grep "REFUSING to dispatch whatsapp_automation domain build ga-fwctltest" >/dev/null; then
   ok "condition (g) correctly silent on a ga- id — bead stays refused/held exactly as before this fix (unchanged tie-break)"
 else
   bad "ga- control bead routed unexpectedly (got log: '$(dispatched_builder "$LOG_GACTL")')"
@@ -4127,7 +4127,7 @@ fi
 echo "Scenario ga-pmkoar-c (guard control): PILOT_FRAMEWORK_DOG_EXEMPT=0 reproduces the REFUSE+hold bug for the gt-prefix shape too"
 LOG_GTPFX0="$(PILOT_FRAMEWORK_DOG_EXEMPT=0 run_capacity 10 "[]" 1 "$GT_PREFIX_BEAD")"
 B_GTPFX0="$(dispatched_builder "$LOG_GTPFX0")"
-if [ -z "$B_GTPFX0" ] && echo "$LOG_GTPFX0" | grep -q "REFUSING to dispatch whatsapp_automation domain build gt-fwtest"; then
+if [ -z "$B_GTPFX0" ] && echo "$LOG_GTPFX0" | grep "REFUSING to dispatch whatsapp_automation domain build gt-fwtest" >/dev/null; then
   ok "with exemption OFF the gt-prefix bead is REFUSED+held (proves condition (g) is exactly what flips the behaviour)"
 else
   bad "toggle-off did not reproduce the refuse (knob not wired to condition (g)?) got builder='${B_GTPFX0:-none}'"
@@ -4154,19 +4154,19 @@ _bcb_pmk() { ( eval "$_HAY_FN_PMK"; eval "$_BCB_FN_PMK"; bead_cited_basenames "$
 [ "$(_bcb_pmk "$HQFILE_OBJ")" = "daemon-refresh.sh" ] && ok "precondition: fixture cites bare filename daemon-refresh.sh" || bad "precondition changed: bead_cited_basenames='$(_bcb_pmk "$HQFILE_OBJ")'"
 LOG_HQFILE="$(PILOT_TEST_RIG_HAS_FILE=gascity run_capacity 10 "[]" 1 "$HQFILE_CONTENT_BEAD")"
 B_HQFILE="$(dispatched_builder "$LOG_HQFILE")"
-if echo "$B_HQFILE" | grep -qE '^gastown\.dog'; then
+if echo "$B_HQFILE" | grep -E '^gastown\.dog' >/dev/null; then
   ok "HQ-only-basename bead DISPATCHED to the dog pool ($B_HQFILE) — condition (h) catches the bead_content_rig-fallback shape the owner-branch ga-zzqza check could not see"
-elif [ -z "$B_HQFILE" ] && echo "$LOG_HQFILE" | grep -q "REFUSING"; then
+elif [ -z "$B_HQFILE" ] && echo "$LOG_HQFILE" | grep "REFUSING" >/dev/null; then
   bad "REGRESSION (ga-pmkoar): HQ-only-basename bead (bead_content_rig-fallback shape) REFUSED to the dog pool + held"
 else
   bad "HQ-only-basename bead routed unexpectedly (got: '${B_HQFILE:-none}')"
 fi
-echo "$LOG_HQFILE" | grep -q "framework-dog-exempt: ga-hqfiletest" && ok "exemption logged for the bead_content_rig-fallback existence-test shape" || bad "framework-dog-exempt not logged for the bead_content_rig-fallback existence-test shape"
-echo "$LOG_HQFILE" | grep -q "hq-only-basename-exists" && ok "exemption reason correctly attributes condition (h)" || bad "exemption did not log the expected condition-(h) reason (hq-only-basename-exists)"
+echo "$LOG_HQFILE" | grep "framework-dog-exempt: ga-hqfiletest" >/dev/null && ok "exemption logged for the bead_content_rig-fallback existence-test shape" || bad "framework-dog-exempt not logged for the bead_content_rig-fallback existence-test shape"
+echo "$LOG_HQFILE" | grep "hq-only-basename-exists" >/dev/null && ok "exemption reason correctly attributes condition (h)" || bad "exemption did not log the expected condition-(h) reason (hq-only-basename-exists)"
 
 echo "Scenario ga-pmkoar-f (guard control): PILOT_HQ_PATH_EXISTS_GUARD=0 disables condition (h) too (one knob, both branches)"
 LOG_HQFILE0="$(PILOT_HQ_PATH_EXISTS_GUARD=0 PILOT_TEST_RIG_HAS_FILE=gascity run_capacity 10 "[]" 1 "$HQFILE_CONTENT_BEAD")"
-if echo "$LOG_HQFILE0" | grep -q "hq-only-basename-exists"; then
+if echo "$LOG_HQFILE0" | grep "hq-only-basename-exists" >/dev/null; then
   bad "condition (h) fired despite PILOT_HQ_PATH_EXISTS_GUARD=0 (kill-switch not honored)"
 else
   ok "condition (h) silent when PILOT_HQ_PATH_EXISTS_GUARD=0 (single knob disables both the owner-branch and fallback-branch existence tests)"
@@ -4222,27 +4222,27 @@ XZFL_OBJ="$(echo "$XZFL_SELF" | jq -c '.[0]')"
 [ "$(_dom "$XZFL_OBJ")" != infra ] && ok "bead_domain is NOT infra for the self-case ('scraper'⊂data wins before infra — why the infra-only exemption missed it)" || bad "bead_domain unexpectedly infra"
 LOG18S="$(run_capacity 10 "[]" 1 "$XZFL_SELF")"
 B18S="$(dispatched_builder "$LOG18S")"
-if echo "$B18S" | grep -qE '^gastown\.dog'; then
+if echo "$B18S" | grep -E '^gastown\.dog' >/dev/null; then
   ok "self-case DISPATCHED to the dog (framework work builds on the HQ checkout the dog has)"
 elif [ "$B18S" = batista-ps ]; then
   bad "REGRESSION (ga-xzfl): the router-bug bead misrouted to batista-ps → NEVERSTART (the exact bug)"
 else
   bad "self-case routed unexpectedly (got: '${B18S:-none}')"
 fi
-echo "$LOG18S" | grep -q "framework-dog-exempt: ga-xzfltest is gascity-framework work (bead_path_rig=gascity)" && ok "self-case exempted via bead_path_rig=gascity (the new path-authoritative condition)" || bad "self-case not exempted via bead_path_rig=gascity"
+echo "$LOG18S" | grep "framework-dog-exempt: ga-xzfltest is gascity-framework work (bead_path_rig=gascity)" >/dev/null && ok "self-case exempted via bead_path_rig=gascity (the new path-authoritative condition)" || bad "self-case not exempted via bead_path_rig=gascity"
 
 echo "Scenario 18t (ga-xzfl): a framework/pack:town-deltas/dog-pool LABEL exempts a product-keyword bead → dog"
 LABEL_FW='[{"id":"ga-lbltest","title":"scraper cadastro ITBI de imoveis — property words but framework-labeled","priority":2,"issue_type":"bug","description":"property_scrapers scraper imovel ITBI, but this is dog-pool framework work","status":"open","labels":["lane:small","story:approved","framework"],"assignee":null,"created_at":"2026-07-11T00:00:02Z","metadata":{}}]'
 LOG18T="$(run_capacity 10 "[]" 1 "$LABEL_FW")"
 B18T="$(dispatched_builder "$LOG18T")"
-if echo "$B18T" | grep -qE '^gastown\.dog'; then
+if echo "$B18T" | grep -E '^gastown\.dog' >/dev/null; then
   ok "framework-labeled bead → dog despite property keywords"
 elif [ "$B18T" = batista-ps ]; then
   bad "framework-labeled bead misrouted to batista-ps (label exemption not honored)"
 else
   bad "framework-labeled bead routed unexpectedly (got: '${B18T:-none}')"
 fi
-echo "$LOG18T" | grep -q "framework-dog-exempt: ga-lbltest is gascity-framework work (framework-label)" && ok "label-exemption logged (reason=framework-label)" || bad "label exemption not logged"
+echo "$LOG18T" | grep "framework-dog-exempt: ga-lbltest is gascity-framework work (framework-label)" >/dev/null && ok "label-exemption logged (reason=framework-label)" || bad "label exemption not logged"
 
 echo "Scenario 18u (ga-xzfl Mode-A): WA bead citing outreach/ with property nouns → WA, NOT batista-ps"
 MODE_A='[{"id":"ga-modea","title":"outreach flow includes proprietario imovel ITBI data in the deal","priority":3,"issue_type":"feature","description":"outreach/deal_builder.py enriches the deal with imovel/ITBI/proprietario nouns","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-07-11T00:00:03Z","metadata":{}}]'
@@ -4250,9 +4250,9 @@ LOG18U="$(run_capacity 10 "[]" 1 "$MODE_A")"
 B18U="$(dispatched_builder "$LOG18U")"
 if [ "$B18U" = batista-ps ]; then
   bad "REGRESSION (Mode-A): WA outreach/shared bead misrouted to batista-ps on property nouns"
-elif echo "$B18U" | grep -qE '^gastown\.dog'; then
+elif echo "$B18U" | grep -E '^gastown\.dog' >/dev/null; then
   bad "Mode-A WA bead landed on the dog ($B18U) — should classify as whatsapp_automation"
-elif echo "$LOG18U" | grep -q "path-authoritative rig=whatsapp_automation"; then
+elif echo "$LOG18U" | grep "path-authoritative rig=whatsapp_automation" >/dev/null; then
   ok "Mode-A: outreach//shared/ path → whatsapp_automation (path beats the property nouns), NOT batista-ps"
 else
   bad "Mode-A routed unexpectedly (got: '${B18U:-none}')"
@@ -4262,12 +4262,12 @@ echo "Scenario 18v (ga-xzfl Mode-B): framework bead (packs/) with product keywor
 MODE_B='[{"id":"ga-modeb","title":"packs/town-deltas/assets/quality-gate-dispatcher.sh — fix a whatsapp/painel/pipedrive wording in a log line","priority":2,"issue_type":"bug","description":"the dispatcher log line mentions whatsapp/painel/pipedrive; edit packs/town-deltas/assets/quality-gate-dispatcher.sh","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-07-11T00:00:04Z","metadata":{}}]'
 LOG18V="$(run_capacity 10 "[]" 1 "$MODE_B")"
 B18V="$(dispatched_builder "$LOG18V")"
-if echo "$B18V" | grep -qE '^gastown\.dog'; then
+if echo "$B18V" | grep -E '^gastown\.dog' >/dev/null; then
   ok "Mode-B: framework-path bead → dog despite whatsapp/painel keywords (NOT WA-rehomed)"
 else
   bad "Mode-B framework bead routed unexpectedly (got: '${B18V:-none}') — expected dog"
 fi
-echo "$LOG18V" | grep -q "framework-dog-exempt: ga-modeb is gascity-framework work (bead_path_rig=gascity)" && ok "Mode-B exempted via bead_path_rig=gascity" || bad "Mode-B not exempted via path"
+echo "$LOG18V" | grep "framework-dog-exempt: ga-modeb is gascity-framework work (bead_path_rig=gascity)" >/dev/null && ok "Mode-B exempted via bead_path_rig=gascity" || bad "Mode-B not exempted via path"
 
 echo "Scenario 18w (ga-xzfl): missing-file guard — file present in HQ, absent in routed rig → REFUSE, fall open to dog"
 # GENUINE MISLOCATION (FINDING 2): the cited file exists in HQ (gascity) but NOT in the routed
@@ -4275,8 +4275,8 @@ echo "Scenario 18w (ga-xzfl): missing-file guard — file present in HQ, absent 
 MISSING_FIX='[{"id":"ga-missfile","title":"whatsapp painel kanban tweak that names packs/town-deltas/assets/gate-marker-rehome-janitor.sh","priority":2,"issue_type":"bug","description":"whatsapp painel kanban work — but the only file cited is packs/town-deltas/assets/gate-marker-rehome-janitor.sh, which lives in HQ, not in whatsapp_automation","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-07-11T00:00:05Z","metadata":{}}]'
 LOG18W="$(PILOT_PATH_RIG_GUARD=0 PILOT_MISSING_FILE_GUARD=1 PILOT_TEST_RIG_HAS_FILE=gascity run_capacity 10 "[]" 1 "$MISSING_FIX")"
 B18W="$(dispatched_builder "$LOG18W")"
-echo "$LOG18W" | grep -q "missing-file guard: ga-missfile" && ok "missing-file guard FIRED: cited file present in HQ, absent in whatsapp_automation → cleared the inference" || bad "missing-file guard did NOT fire (expected refuse+reroute)"
-if echo "$B18W" | grep -qE '^gastown\.dog'; then
+echo "$LOG18W" | grep "missing-file guard: ga-missfile" >/dev/null && ok "missing-file guard FIRED: cited file present in HQ, absent in whatsapp_automation → cleared the inference" || bad "missing-file guard did NOT fire (expected refuse+reroute)"
+if echo "$B18W" | grep -E '^gastown\.dog' >/dev/null; then
   ok "after the missing-file refuse the bead fell OPEN to the dog (which builds in HQ, where the file is)"
 elif [ "$B18W" = batista-ps ]; then
   bad "missing-file bead misrouted to batista-ps"
@@ -4285,7 +4285,7 @@ else
 fi
 echo "Scenario 18w2 (control): PILOT_MISSING_FILE_GUARD=0 → NO refuse (kill-switch works)"
 LOG18W0="$(PILOT_PATH_RIG_GUARD=0 PILOT_MISSING_FILE_GUARD=0 PILOT_TEST_RIG_HAS_FILE=gascity run_capacity 10 "[]" 1 "$MISSING_FIX")"
-echo "$LOG18W0" | grep -q "missing-file guard: ga-missfile" && bad "guard fired despite PILOT_MISSING_FILE_GUARD=0" || ok "guard silent when disabled (kill-switch honored)"
+echo "$LOG18W0" | grep "missing-file guard: ga-missfile" >/dev/null && bad "guard fired despite PILOT_MISSING_FILE_GUARD=0" || ok "guard silent when disabled (kill-switch honored)"
 
 # ── Scenario 18x (ga-xzfl review FINDING 2): CREATE-FILE bead — cited file exists in NO rig ──
 # "create scrapers/foo_novo.py": bead_path_rig maps scrapers/ → property_scrapers, but the file
@@ -4297,12 +4297,12 @@ LOG18X="$(PILOT_MISSING_FILE_GUARD=1 PILOT_TEST_RIG_HAS_FILE=0 run_capacity 10 "
 B18X="$(dispatched_builder "$LOG18X")"
 if [ "$B18X" = batista-ps ]; then
   ok "create-file bead → batista-ps (correct rig to create the new file), NOT dogged"
-elif echo "$B18X" | grep -qE '^gastown\.dog'; then
+elif echo "$B18X" | grep -E '^gastown\.dog' >/dev/null; then
   bad "REGRESSION (FINDING 2): create-file bead DOGGED → HQ lacks scrapers/ too → NEVERSTART"
 else
   bad "create-file bead routed unexpectedly (got: '${B18X:-none}')"
 fi
-echo "$LOG18X" | grep -q "missing-file guard: ga-createf" && bad "FINDING 2: guard wrongly fired on a create-file bead (HQ also lacks the file)" || ok "missing-file guard stayed SILENT on the create-file bead (HQ also lacks it → not mislocated)"
+echo "$LOG18X" | grep "missing-file guard: ga-createf" >/dev/null && bad "FINDING 2: guard wrongly fired on a create-file bead (HQ also lacks the file)" || ok "missing-file guard stayed SILENT on the create-file bead (HQ also lacks it → not mislocated)"
 
 # ── Scenario 18y (ga-xzfl review FINDING 1): owner-authoritative scripts/ must beat gascity ──
 # A product-crew-OWNED bead citing a bare scripts/<file> with NO product keyword must route to
@@ -4313,7 +4313,7 @@ LOG18Y="$(run_capacity 10 "[]" 1 "$OWNED_PS")"
 B18Y="$(dispatched_builder "$LOG18Y")"
 if [ "$B18Y" = batista-ps ]; then
   ok "ps-worker-owned scripts/ bead → batista-ps (owner-authoritative preserved)"
-elif echo "$B18Y" | grep -qE '^gastown\.dog'; then
+elif echo "$B18Y" | grep -E '^gastown\.dog' >/dev/null; then
   bad "REGRESSION (FINDING 1): owned scripts/ bead FORCED to gascity→dog → HQ scripts/ shares no basenames → NEVERSTART"
 else
   bad "owned scripts/ bead routed unexpectedly (got: '${B18Y:-none}')"
@@ -4322,7 +4322,7 @@ echo "Scenario 18y2 (FINDING 1): *-wa-owned bare scripts/ bead (no keyword) → 
 OWNED_WA='[{"id":"ga-ownwa","title":"adjust the nightly sweep timing","priority":2,"issue_type":"bug","description":"tweak scripts/nightly_sweep.py interval — no product keyword whatsoever","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"mila-wa","created_at":"2026-07-11T00:00:08Z","metadata":{}}]'
 LOG18Y2="$(run_capacity 10 "[]" 1 "$OWNED_WA")"
 B18Y2="$(dispatched_builder "$LOG18Y2")"
-if echo "$B18Y2" | grep -qE '^gastown\.dog'; then
+if echo "$B18Y2" | grep -E '^gastown\.dog' >/dev/null; then
   bad "REGRESSION (FINDING 1): *-wa-owned scripts/ bead FORCED to gascity→dog → NEVERSTART"
 elif [ "$B18Y2" = batista-ps ]; then
   bad "*-wa-owned scripts/ bead misrouted to batista-ps"
@@ -4337,7 +4337,7 @@ LOG18Z="$(run_capacity 10 "[]" 1 "$SHARED_PS")"
 B18Z="$(dispatched_builder "$LOG18Z")"
 if [ "$B18Z" = batista-ps ]; then
   ok "shared/ + PS content → batista-ps (shared/ no longer force-maps to WA)"
-elif echo "$LOG18Z" | grep -q "path-authoritative rig=whatsapp_automation"; then
+elif echo "$LOG18Z" | grep "path-authoritative rig=whatsapp_automation" >/dev/null; then
   bad "REGRESSION (FINDING 3): shared/ force-mapped to WA → PS scraper held on the wrong rig"
 else
   bad "shared/ PS-content bead routed unexpectedly (got: '${B18Z:-none}')"
@@ -4392,14 +4392,14 @@ LOG18AC="$(run_capacity 10 "[]" 1 "$WA_OWNER_INFER")"
 B18AC="$(dispatched_builder "$LOG18AC")"
 if [ "$B18AC" = "oracle-wa" ]; then
   ok "ga-7ti1t: WA domain build with no rig-default crew routed to inferred owner oracle-wa (not held)"
-elif echo "$B18AC" | grep -qE '^gastown\.dog'; then
+elif echo "$B18AC" | grep -E '^gastown\.dog' >/dev/null; then
   bad "REGRESSION (ga-7ti1t): domain build with an inferrable owner still landed on the dog pool"
 elif [ -z "$B18AC" ]; then
   bad "REGRESSION (ga-7ti1t): domain build with an inferrable owner (oracle-wa-ganav3) still held/deferred — inference did not fire"
 else
   bad "ga-7ti1t: domain build routed unexpectedly (got: '${B18AC:-none}')"
 fi
-echo "$LOG18AC" | grep -q "ga-7ti1t: ga-h7test has no rig-default crew for whatsapp_automation — inferred owner oracle-wa from creator" \
+echo "$LOG18AC" | grep "ga-7ti1t: ga-h7test has no rig-default crew for whatsapp_automation — inferred owner oracle-wa from creator" >/dev/null \
   && ok "ga-7ti1t: inference logged with the correct reason" \
   || bad "ga-7ti1t: inference log line missing or malformed"
 
@@ -4412,7 +4412,7 @@ LOG18AD="$(run_capacity 10 "$INFLIGHT18AD" 1 "$WA_OWNER_INFER" "$SESSIONS18AD" "
 B18AD="$(dispatched_builder "$LOG18AD")"
 if [ "$B18AD" = "oracle-wa" ]; then
   bad "ga-7ti1t: inferred owner oracle-wa double-dispatched despite being busy this sweep (mutex bypass)"
-elif echo "$B18AD" | grep -qE '^gastown\.dog'; then
+elif echo "$B18AD" | grep -E '^gastown\.dog' >/dev/null; then
   bad "REGRESSION (ga-7ti1t): domain build fell back to a dog while the inferred owner was busy"
 else
   ok "ga-7ti1t: domain build with a BUSY inferred owner correctly DEFERRED (no double-dispatch — reuses the existing busy-check)"
@@ -4421,7 +4421,7 @@ fi
 echo "Scenario 18ae (ga-7ti1t regression): WA domain build with NO crew-shaped owner → still DEFERRED (ga-2n7xw hold/escalate unchanged)"
 LOG18AE="$(run_capacity 10 "[]" 1 "$WA_PIPEDRIVE")"
 B18AE="$(dispatched_builder "$LOG18AE")"
-if echo "$B18AE" | grep -qE '^gastown\.dog'; then
+if echo "$B18AE" | grep -E '^gastown\.dog' >/dev/null; then
   bad "REGRESSION: WA domain build with no owner-match landed on the dog pool"
 elif [ "$B18AE" = "batista-ps" ]; then
   bad "REGRESSION: WA domain build with no owner-match misrouted to batista-ps"
@@ -4541,19 +4541,19 @@ _bcb_hn3() { ( eval "$_HAY_FN_HN3"; eval "$_BCB_FN_HN3"; bead_cited_basenames "$
   || bad "precondition changed: bead_cited_basenames='$(_bcb_hn3 "$BARE_FILE_OBJ")'"
 LOG18AJ="$(PILOT_TEST_RIG_HAS_FILE=gascity run_capacity 10 "[]" 1 "$BARE_FILE_BEAD")"
 B18AJ="$(dispatched_builder "$LOG18AJ")"
-if echo "$B18AJ" | grep -qE '^gastown\.dog'; then
+if echo "$B18AJ" | grep -E '^gastown\.dog' >/dev/null; then
   ok "ga-hn3kh: bare-filename-only citation triggers the ga-zzqza HQ-only override → dog dispatch (ga-shqn shape FIXED)"
-elif [ "$B18AJ" = whatsapp_automation ] || { [ -z "$B18AJ" ] && echo "$LOG18AJ" | grep -q "REFUSING"; }; then
+elif [ "$B18AJ" = whatsapp_automation ] || { [ -z "$B18AJ" ] && echo "$LOG18AJ" | grep "REFUSING" >/dev/null; }; then
   bad "REGRESSION (ga-hn3kh): bare-filename citation still refused/held on whatsapp_automation — the ga-shqn misroute is back"
 else
   bad "ga-hn3kh bare-filename scenario routed unexpectedly (got: '${B18AJ:-none}')"
 fi
-echo "$LOG18AJ" | grep -q "ga-zzqza: ga-baretest cites" && ok "ga-zzqza override fired+logged for the bare-filename citation" || bad "ga-zzqza override did not fire/log for the bare-filename citation"
+echo "$LOG18AJ" | grep "ga-zzqza: ga-baretest cites" >/dev/null && ok "ga-zzqza override fired+logged for the bare-filename citation" || bad "ga-zzqza override did not fire/log for the bare-filename citation"
 
 echo "Scenario 18aj2 (control): PILOT_HQ_PATH_EXISTS_GUARD=0 → bare-filename signal ignored too, owner wins"
 LOG18AJ0="$(PILOT_TEST_RIG_HAS_FILE=gascity PILOT_HQ_PATH_EXISTS_GUARD=0 run_capacity 10 "[]" 1 "$BARE_FILE_BEAD")"
 B18AJ0="$(dispatched_builder "$LOG18AJ0")"
-if echo "$LOG18AJ0" | grep -q "ga-nlh79.*owner-authoritative" || [ -z "$B18AJ0" ]; then
+if echo "$LOG18AJ0" | grep "ga-nlh79.*owner-authoritative" >/dev/null || [ -z "$B18AJ0" ]; then
   ok "kill-switch: PILOT_HQ_PATH_EXISTS_GUARD=0 disables the bare-filename override too (owner-authoritative path taken)"
 else
   bad "kill-switch did not disable the bare-filename override (got builder='${B18AJ0:-none}')"
@@ -4572,9 +4572,9 @@ echo "Scenario 18ak (KNOWN LIMITATION): content-free ga-*/WA-owner POV bead (ga-
 POV_NOFILE='[{"id":"ga-povtest","title":"POV+spike: integrar modelos chineses baratos ao Gas City","priority":1,"issue_type":"feature","description":"modelos chineses sao mais baratos e hoje nao tem integracao com o Gas City; comparar custo e performance","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"mila-wa-gawisphchfmo","created_at":"2026-07-17T00:00:00Z","metadata":{}}]'
 LOG18AK="$(run_capacity 10 "[]" 1 "$POV_NOFILE")"
 B18AK="$(dispatched_builder "$LOG18AK")"
-if echo "$B18AK" | grep -qE '^gastown\.dog'; then
+if echo "$B18AK" | grep -E '^gastown\.dog' >/dev/null; then
   bad "behavior changed: content-free ga-* POV bead now dogged — if intentional this needs its own story/AC, not a side effect of ga-hn3kh"
-elif echo "$LOG18AK" | grep -q "ga-nlh79.*owner-authoritative" || [ -z "$B18AK" ]; then
+elif echo "$LOG18AK" | grep "ga-nlh79.*owner-authoritative" >/dev/null || [ -z "$B18AK" ]; then
   ok "confirmed unchanged: content-free ga-*/WA-owner bead still owner-routes to WA — same as Scenario 18k2, intentionally NOT fixed by ga-hn3kh"
 else
   bad "content-free POV bead routed unexpectedly (got: '${B18AK:-none}')"
@@ -4605,14 +4605,14 @@ LOG18AM1="$(PILOT_SUSPENDED_CREWS_OVERRIDE="batista-ps" run_capacity 10 "[]" 1 "
 B18AM1="$(dispatched_builder "$LOG18AM1")"
 if [ "$B18AM1" = "batista-ps" ]; then
   bad "REGRESSION (ga-gbzxos): lx- bead dispatched to SUSPENDED batista-ps — the lx-dnw infinite-loop bug"
-elif echo "$B18AM1" | grep -qE '^gastown\.dog'; then
+elif echo "$B18AM1" | grep -E '^gastown\.dog' >/dev/null; then
   bad "lx- bead fell to the dog pool instead of the ps-worker pool (a dog cannot build a lexbh domain task either)"
 elif [ "$B18AM1" = "ps-worker" ]; then
   ok "ga-wnojmm: lx- bead with suspended domain-default crew now falls back to the ps-worker pool instead of holding forever (all named crews suspended, 2026-09-19)"
 else
   bad "lx- bead routed unexpectedly while owning crew suspended (got: '${B18AM1:-none}')"
 fi
-if echo "$LOG18AM1" | grep -qi "SUSPENDED"; then
+if echo "$LOG18AM1" | grep -i "SUSPENDED" >/dev/null; then
   ok "pool-fallback routing was attributed to the crew being suspended (log names the real cause, not a generic unmapped-rig fallback)"
 else
   bad "routing log does not mention SUSPENDED — can't distinguish this from an unrelated fallback"
@@ -4648,7 +4648,7 @@ INFLIGHT18AM2B="[{\"id\":\"if-psworker\",\"labels\":[\"story:in-flight\",\"lane:
 SESSIONS18AM2B='{"sessions":[{"session_name":"ps-worker","closed":false}]}'
 SLINGMAP18AM2B='{"tt-sling-psworker":"ps-worker"}'
 LOG18AM2B="$(PILOT_SUSPENDED_CREWS_OVERRIDE="batista-ps" run_capacity 10 "$INFLIGHT18AM2B" 1 "$PS_DOMAIN_SMALL" "$SESSIONS18AM2B" "$SLINGMAP18AM2B")"
-if echo "$LOG18AM2B" | grep -q "Busy builders (live in-flight): ps-worker"; then
+if echo "$LOG18AM2B" | grep "Busy builders (live in-flight): ps-worker" >/dev/null; then
   ok "precondition: ps-worker computed as busy this sweep (fixture wired correctly)"
 else
   bad "precondition failed: ps-worker not computed as busy — the result below is not trustworthy"
@@ -4670,7 +4670,7 @@ else
 fi
 
 echo "Scenario 18am-4: drift-guard — suspended-check is wired into the ga-lfvs6 _DOM_DEFAULT branch"
-if awk '/_DOM_DEFAULT=\$\(rig_domain_default_builder/{f=1} f{print} f&&/_DOM_BUSY=0/{exit}' "$DISPATCHER" | grep -q '_crew_is_suspended "\$_DOM_DEFAULT"'; then
+if awk '/_DOM_DEFAULT=\$\(rig_domain_default_builder/{f=1} f{print} f&&/_DOM_BUSY=0/{exit}' "$DISPATCHER" | grep '_crew_is_suspended "\$_DOM_DEFAULT"' >/dev/null; then
   ok "_crew_is_suspended is checked against _DOM_DEFAULT before the busy/idle decision"
 else
   bad "_DOM_DEFAULT suspended-check MISSING — ITEM 6 parity not wired for the rig-wide default builder"
@@ -4787,7 +4787,7 @@ env -i \
   FAKE_BLOCKED_IDS="" \
   bash "$DISPATCHER" >/dev/null 2>&1 || true
 LOG19F="$(cat "$FIXCITY/.gc/logs/pilot-dispatcher.log")"
-if echo "$LOG19F" | grep -q "=== Pilot sweep complete\|=== Pilot sweep start"; then
+if echo "$LOG19F" | grep "=== Pilot sweep complete\|=== Pilot sweep start" >/dev/null; then
   ok "sweep ran to completion despite an unwritable emit path (fail-open, no abort)"
 else
   bad "an emit failure aborted the sweep (NOT fail-open)"
@@ -4847,12 +4847,12 @@ echo "Scenario 20a: unassigned ctx:ready chore is a candidate and dispatches (de
 # FAKE_BUGS_JSON='[]' makes the ctx:ready chore the ONLY candidate, so the pick is
 # unambiguous proof the new source fed the pool.
 LOG20A="$(run_ctxready "$CTX_ONE_CHORE" "[]")"
-if echo "$LOG20A" | grep -q "ctx:ready chore/task/debt: 1 candidate"; then
+if echo "$LOG20A" | grep "ctx:ready chore/task/debt: 1 candidate" >/dev/null; then
   ok "ctx:ready query sourced the chore as a candidate (PILOT_CTX_READY_QUERIES=1 default)"
 else
   bad "ctx:ready chore was NOT sourced (expected 'ctx:ready chore/task/debt: 1 candidate')"
 fi
-if echo "$LOG20A" | grep -q "Lane picks — small: tt-ctx-chore"; then
+if echo "$LOG20A" | grep "Lane picks — small: tt-ctx-chore" >/dev/null; then
   ok "dispatched the unassigned ctx:ready chore"
 else
   bad "did NOT dispatch the ctx:ready chore (expected 'Lane picks — small: tt-ctx-chore')"
@@ -4861,12 +4861,12 @@ fi
 # ── Scenario 20a2: env-gate still turns it OFF (PILOT_CTX_READY_QUERIES=0) ──────
 echo "Scenario 20a2: PILOT_CTX_READY_QUERIES=0 disables the ctx:ready source (env-gate honored)"
 LOG20A2="$(run_ctxready "$CTX_ONE_CHORE" "[]" 0)"
-if echo "$LOG20A2" | grep -q "ctx:ready chore/task/debt:"; then
+if echo "$LOG20A2" | grep "ctx:ready chore/task/debt:" >/dev/null; then
   bad "ctx:ready query ran while gated OFF (env-gate not honored)"
 else
   ok "ctx:ready query SKIPPED when gated off (byte-equivalent to legacy)"
 fi
-if echo "$LOG20A2" | grep -q "Lane picks — small: tt-ctx-chore"; then
+if echo "$LOG20A2" | grep "Lane picks — small: tt-ctx-chore" >/dev/null; then
   bad "dispatched a ctx:ready chore while the source was gated OFF"
 else
   ok "no ctx:ready dispatch when gated off"
@@ -4881,12 +4881,12 @@ CTX_ASSIGNED='[
   {"id":"tt-ctx-free","title":"free ctx:ready task","priority":1,"issue_type":"task","description":"fixture body — unowned","status":"open","labels":["ctx:ready"],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}}
 ]'
 LOG20B="$(run_ctxready "$CTX_ASSIGNED" "[]")"
-if echo "$LOG20B" | grep -q "Lane picks — small: tt-ctx-owned"; then
+if echo "$LOG20B" | grep "Lane picks — small: tt-ctx-owned" >/dev/null; then
   bad "REGRESSION: dispatched an ASSIGNED ctx:ready task (owned-exclusion lost)"
 else
   ok "did NOT dispatch the assigned ctx:ready task (owned-exclusion preserved)"
 fi
-if echo "$LOG20B" | grep -q "Lane picks — small: tt-ctx-free"; then
+if echo "$LOG20B" | grep "Lane picks — small: tt-ctx-free" >/dev/null; then
   ok "dispatched the UNASSIGNED ctx:ready task instead (P1, the only eligible one)"
 else
   bad "did not dispatch the unassigned ctx:ready task"
@@ -4904,12 +4904,12 @@ CTX_SIX_CHORES='[
   {"id":"tt-cx6","title":"ctx chore 6","priority":0,"issue_type":"chore","description":"fixture body — context","status":"open","labels":["ctx:ready"],"assignee":null,"created_at":"2026-06-01T00:00:06Z","metadata":{}}
 ]'
 LOG20C="$(run_ctxready "$CTX_SIX_CHORES" "[]")"
-if echo "$LOG20C" | grep -q "Lane small: dispatched 5 this sweep"; then
+if echo "$LOG20C" | grep "Lane small: dispatched 5 this sweep" >/dev/null; then
   ok "filled exactly the 5 free small slots from the ctx:ready backlog (cap honored)"
 else
   bad "did not dispatch all 5 ctx:ready chores (expected 'Lane small: dispatched 5')"
 fi
-if echo "$LOG20C" | grep -qE "Lane small: dispatched ([6-9]|[1-9][0-9]+) this sweep"; then
+if echo "$LOG20C" | grep -E "Lane small: dispatched ([6-9]|[1-9][0-9]+) this sweep" >/dev/null; then
   bad "REGRESSION: ctx:ready backlog flooded past the small-lane cap of 5"
 else
   ok "ctx:ready backlog never exceeded MAX_SMALL — cannot flood the crews"
@@ -4921,12 +4921,12 @@ fi
 echo "Scenario 20d: ctx:ready dispatch DEFERS under the cross-stage gate-congestion yield"
 #                       ctxJSON          bugs  gate gateCongested doltCPU(300=saturated)
 LOG20D="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 1 300)"
-if echo "$LOG20D" | grep -q "Cross-stage YIELD (ga-d0hz3)"; then
+if echo "$LOG20D" | grep "Cross-stage YIELD (ga-d0hz3)" >/dev/null; then
   ok "ctx:ready sweep yielded to the congested Gate under resource contention"
 else
   bad "did not yield under gate-congested + resource-tight (ga-d0hz3 not honored for ctx:ready)"
 fi
-if echo "$LOG20D" | grep -q "Lane picks — small: tt-cx"; then
+if echo "$LOG20D" | grep "Lane picks — small: tt-cx" >/dev/null; then
   bad "REGRESSION: dispatched ctx:ready work while the Gate was congested + Dolt hot"
 else
   ok "dispatched NO ctx:ready work during the cross-stage yield (no Gate flood)"
@@ -4943,7 +4943,7 @@ echo "Scenario 20f: structural — the ctx:ready query keeps every existing excl
 CTXBLOCK=$(awk '/Step 2a-ctx:/{f=1} f{print} /CTXREADY_COUNT=\$\(echo/{if(f)exit}' "$DISPATCHER")
 for excl in "story:in-flight" "story:done" "gate:passed" "pilot:dispatching" \
             "gate:needs-human" "needs:engine-window" "pilot:dispatched" "ctx:thin"; do
-  if echo "$CTXBLOCK" | grep -q "exclude-label \"$excl\""; then
+  if echo "$CTXBLOCK" | grep "exclude-label \"$excl\"" >/dev/null; then
     ok "ctx:ready query excludes $excl"
   else
     bad "ctx:ready query is MISSING the $excl exclusion"
@@ -4964,12 +4964,12 @@ CTX_MANUAL='[
   {"id":"tt-ctx-auto","title":"exec:auto task fixture","priority":1,"issue_type":"task","description":"fixture body — fully automatable","status":"open","labels":["ctx:ready","exec:auto"],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}}
 ]'
 LOG21A="$(run_ctxready "$CTX_MANUAL" "[]")"
-if echo "$LOG21A" | grep -q "Lane picks — small: tt-ctx-manual"; then
+if echo "$LOG21A" | grep "Lane picks — small: tt-ctx-manual" >/dev/null; then
   bad "REGRESSION: dispatched an exec:manual ctx:ready bead (ga-mfeip AC3 violation)"
 else
   ok "exec:manual ctx:ready bead was NOT dispatched (ga-mfeip AC3 preserved)"
 fi
-if echo "$LOG21A" | grep -q "Lane picks — small: tt-ctx-auto"; then
+if echo "$LOG21A" | grep "Lane picks — small: tt-ctx-auto" >/dev/null; then
   ok "exec:auto ctx:ready bead WAS dispatched (only manual is excluded)"
 else
   bad "exec:auto bead was NOT dispatched — over-filtered or no candidate sourced"
@@ -4981,7 +4981,7 @@ CTX_NOLABEL='[
   {"id":"tt-ctx-nolabel","title":"no-exec-label ctx:ready task","priority":0,"issue_type":"task","description":"fixture body — no exec label","status":"open","labels":["ctx:ready"],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}}
 ]'
 LOG21B="$(run_ctxready "$CTX_NOLABEL" "[]")"
-if echo "$LOG21B" | grep -q "Lane picks — small: tt-ctx-nolabel"; then
+if echo "$LOG21B" | grep "Lane picks — small: tt-ctx-nolabel" >/dev/null; then
   ok "ctx:ready task with no exec: label IS dispatched (conservative default: auto-OK)"
 else
   bad "ctx:ready task with no exec: label was NOT dispatched — over-filter regression"
@@ -5020,7 +5020,7 @@ has "$DISPATCHER" 'pilot.sling_bead=\$STORY_ID' \
 echo "Scenario 21e: structural — TTL recovery covers rig ctx:ready beads (no story:approved filter)"
 # The TTL query must NOT require story:approved so it catches chore/task rig beads.
 _ttl_block=$(awk '/Helper: scan one DB for stale pilot:dispatching/{f=1} f{print} /^}$/{if(f)exit}' "$DISPATCHER")
-if echo "$_ttl_block" | grep -q '"story:approved"'; then
+if echo "$_ttl_block" | grep '"story:approved"' >/dev/null; then
   bad "REGRESSION: TTL recovery still requires story:approved — rig ctx:ready beads won't be cleaned up"
 else
   ok "TTL recovery does NOT require story:approved — covers rig ctx:ready beads (ga-mfeip)"
@@ -5044,12 +5044,12 @@ CTX_THIN='[
   {"id":"tt-spec","title":"specced task","priority":1,"issue_type":"task","description":"fixture body — a properly specified task with enough context for a crew to build it","status":"open","labels":["ctx:ready"],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}}
 ]'
 LOG22A="$(run_ctxready "$CTX_THIN" "[]")"
-if echo "$LOG22A" | grep -q "Lane picks — small: tt-thin"; then
+if echo "$LOG22A" | grep "Lane picks — small: tt-thin" >/dev/null; then
   bad "REGRESSION: dispatched a thin/un-spec'd ctx:ready bead (gate (b) violation)"
 else
   ok "thin/un-spec'd ctx:ready bead was NOT dispatched (gate (b))"
 fi
-if echo "$LOG22A" | grep -q "Lane picks — small: tt-spec"; then
+if echo "$LOG22A" | grep "Lane picks — small: tt-spec" >/dev/null; then
   ok "the well-specified ctx:ready bead WAS dispatched (only the stub is dropped)"
 else
   bad "the well-specified bead was NOT dispatched — gate (b) over-filtered"
@@ -5062,12 +5062,12 @@ CTX_BLKLABEL='[
   {"id":"tt-noblk","title":"no precondition","priority":1,"issue_type":"task","description":"fixture body — a clean task with no precondition labels whatsoever here","status":"open","labels":["ctx:ready"],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}}
 ]'
 LOG22B="$(run_ctxready "$CTX_BLKLABEL" "[]")"
-if echo "$LOG22B" | grep -q "Lane picks — small: tt-blklabel"; then
+if echo "$LOG22B" | grep "Lane picks — small: tt-blklabel" >/dev/null; then
   bad "REGRESSION: dispatched a blocked-on:-labelled ctx:ready bead (gate (c) violation)"
 else
   ok "blocked-on:-labelled ctx:ready bead was NOT dispatched (gate (c))"
 fi
-if echo "$LOG22B" | grep -q "Lane picks — small: tt-noblk"; then
+if echo "$LOG22B" | grep "Lane picks — small: tt-noblk" >/dev/null; then
   ok "the clean ctx:ready bead WAS dispatched (only the precondition-labelled one is dropped)"
 else
   bad "the clean bead was NOT dispatched — gate (c) over-filtered"
@@ -5083,12 +5083,12 @@ CTX_BLOCKED_STATUS='[
   {"id":"tt-open-ok","title":"open buildable","priority":1,"issue_type":"task","description":"fixture body — a normal open task with enough context to build right here","status":"open","labels":["ctx:ready","exec:auto"],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}}
 ]'
 LOG22B2="$(run_ctxready "$CTX_BLOCKED_STATUS" "[]")"
-if echo "$LOG22B2" | grep -q "Lane picks — small: tt-blocked-status"; then
+if echo "$LOG22B2" | grep "Lane picks — small: tt-blocked-status" >/dev/null; then
   bad "REGRESSION: dispatched a status=blocked ctx:ready bead (gate (a) violation — wa-tozk/wa-1my1 class)"
 else
   ok "status=blocked ctx:ready bead was NOT dispatched (gate (a) — crew/triage lock holds)"
 fi
-if echo "$LOG22B2" | grep -q "Lane picks — small: tt-open-ok"; then
+if echo "$LOG22B2" | grep "Lane picks — small: tt-open-ok" >/dev/null; then
   ok "the status=open bead WAS dispatched (only the blocked-status one is gated)"
 else
   bad "the status=open bead was NOT dispatched — gate (a) status-check over-filtered"
@@ -5102,12 +5102,12 @@ CTX_DESIGNFIRST='[
   {"id":"tt-buildable","title":"normal task","priority":1,"issue_type":"task","description":"fixture body — a normal open task with enough context to build right here now","status":"open","labels":["ctx:ready","exec:auto"],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}}
 ]'
 LOG22B3="$(run_ctxready "$CTX_DESIGNFIRST" "[]")"
-if echo "$LOG22B3" | grep -q "Lane picks — small: tt-designfirst"; then
+if echo "$LOG22B3" | grep "Lane picks — small: tt-designfirst" >/dev/null; then
   bad "REGRESSION: dispatched a design-first ctx:ready bead (gate (a) violation — wa-1my1 class)"
 else
   ok "design-first ctx:ready bead was NOT dispatched (gate (a) — needs Athos design approval)"
 fi
-if echo "$LOG22B3" | grep -q "Lane picks — small: tt-buildable"; then
+if echo "$LOG22B3" | grep "Lane picks — small: tt-buildable" >/dev/null; then
   ok "the normal buildable bead WAS dispatched (only the design-first one is gated)"
 else
   bad "the normal bead was NOT dispatched — design-first gate over-filtered"
@@ -5158,17 +5158,17 @@ FAKE_TIER1_DEFERRED='[
   {"id":"tt-open-keep","title":"Open bug should still dispatch","priority":1,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}}
 ]'
 LOG22I="$(run_capacity 10 "[]" 1 "$FAKE_TIER1_DEFERRED")"
-if echo "$LOG22I" | grep -q "Selected .* tt-deferred"; then
+if echo "$LOG22I" | grep "Selected .* tt-deferred" >/dev/null; then
   bad "REGRESSION (ga-mdpe4c): status=deferred HQ Tier-1 bug was re-selected/logged — gate (a) leak reopened"
 else
   ok "status=deferred HQ Tier-1 bug was NOT selected (gate (a) — same treatment ctx:ready already got in 22b2)"
 fi
-if echo "$LOG22I" | grep -q "Lane picks — small: tt-deferred"; then
+if echo "$LOG22I" | grep "Lane picks — small: tt-deferred" >/dev/null; then
   bad "REGRESSION (ga-mdpe4c): status=deferred HQ Tier-1 bug was DISPATCHED (would have built a deferred bead)"
 else
   ok "status=deferred HQ Tier-1 bug was NOT dispatched"
 fi
-if echo "$LOG22I" | grep -q "Lane picks — small: tt-open-keep"; then
+if echo "$LOG22I" | grep "Lane picks — small: tt-open-keep" >/dev/null; then
   ok "the open P1 bug WAS dispatched instead (only the deferred P0 one is gated — no over-filtering)"
 else
   bad "the open bug was NOT dispatched — gate (a) over-filtered the HQ Tier-1 pool"
@@ -5190,7 +5190,7 @@ FAKE_TIER1_SHORTDESC='[
   {"id":"tt-shortdesc","title":"Short-description bug fixture","priority":0,"issue_type":"bug","description":"fixture body","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}}
 ]'
 LOG22J="$(run_capacity 10 "[]" 1 "$FAKE_TIER1_SHORTDESC")"
-if echo "$LOG22J" | grep -q "Lane picks — small: tt-shortdesc"; then
+if echo "$LOG22J" | grep "Lane picks — small: tt-shortdesc" >/dev/null; then
   ok "a short-description (12-char), status=open HQ Tier-1 bug still dispatches — gate (b)'s spec floor deliberately NOT extended to Tier-1 by this fix"
 else
   bad "REGRESSION (ga-mdpe4c): a short-description status=open HQ Tier-1 bug was NOT dispatched — _filter_terminal_status is over-filtering (did it become the full _filter_dispatch_gates again?)"
@@ -5403,25 +5403,25 @@ INFLIGHT_4UHRP='[
 ]'
 LOG4UHRP="$(run_capacity 10 "$INFLIGHT_4UHRP")"
 
-if echo "$LOG4UHRP" | grep -q "live=7 (raw=7 stale=0 age=0 dead=0)"; then
+if echo "$LOG4UHRP" | grep "live=7 (raw=7 stale=0 age=0 dead=0)" >/dev/null; then
   ok "raw in-flight total (live=7) untouched by the gate-resident stage — only the lane split changes"
 else
   bad "in-flight total corrupted by the gate-resident stage (expected 'live=7 (raw=7 stale=0 age=0 dead=0)', got: $(echo "$LOG4UHRP" | grep 'In-flight:'))"
 fi
 
-if echo "$LOG4UHRP" | grep -q "Gate-resident in-flight: 4 bead"; then
+if echo "$LOG4UHRP" | grep "Gate-resident in-flight: 4 bead" >/dev/null; then
   ok "detected the 4 gate-resident occupants"
 else
   bad "did not detect gate-resident in-flight occupants (expected 'Gate-resident in-flight: 4 bead')"
 fi
 
-if echo "$LOG4UHRP" | grep -q "gate_resident=4  small=2/5  unclassified_lane=0  big=1/2"; then
+if echo "$LOG4UHRP" | grep "gate_resident=4  small=2/5  unclassified_lane=0  big=1/2" >/dev/null; then
   ok "AC1: occupancy corrected to 2 small + 1 big = 3 actually-building occupants (not 7); unclassified_lane=0 control (ga-wtqli)"
 else
   bad "AC1 FAILED: occupancy not corrected (expected 'gate_resident=4  small=2/5  unclassified_lane=0  big=1/2', got: $(echo "$LOG4UHRP" | grep 'In-flight:'))"
 fi
 
-if echo "$LOG4UHRP" | grep -qE "Gate-resident in-flight:.*if-build[123]"; then
+if echo "$LOG4UHRP" | grep -E "Gate-resident in-flight:.*if-build[123]" >/dev/null; then
   bad "AC2 REGRESSION: a genuinely-building bead (no gate:* label) was wrongly freed from the lane count"
 else
   ok "AC2: beads without a gate:* label still count as occupants (control, no over-freeing)"
@@ -5457,19 +5457,19 @@ INFLIGHT_WTQLI_AC3='[
 ]'
 LOG_WTQLI_AC3="$(run_capacity 10 "$INFLIGHT_WTQLI_AC3")"
 
-if echo "$LOG_WTQLI_AC3" | grep -q "gate_resident=0  small=1/5  unclassified_lane=1  big=0/2"; then
+if echo "$LOG_WTQLI_AC3" | grep "gate_resident=0  small=1/5  unclassified_lane=1  big=0/2" >/dev/null; then
   ok "AC3: small=1 unclassified_lane=1 — distinguished, not summed into small=2"
 else
   bad "AC3 FAILED: expected 'small=1/5  unclassified_lane=1', got: $(echo "$LOG_WTQLI_AC3" | grep 'In-flight:')"
 fi
 
-if echo "$LOG_WTQLI_AC3" | grep -qE "Unclassified-lane in-flight: 1 bead.*wt-unclass1"; then
+if echo "$LOG_WTQLI_AC3" | grep -E "Unclassified-lane in-flight: 1 bead.*wt-unclass1" >/dev/null; then
   ok "AC2: unclassified occupant named by id in the warn line (Stale/Dead/Gate-resident pattern)"
 else
   bad "AC2 FAILED: unclassified-lane warn line missing or doesn't name wt-unclass1 (got: $(echo "$LOG_WTQLI_AC3" | grep -i unclassified))"
 fi
 
-if echo "$LOG_WTQLI_AC3" | grep -qE "Unclassified-lane in-flight:.*wt-small1"; then
+if echo "$LOG_WTQLI_AC3" | grep -E "Unclassified-lane in-flight:.*wt-small1" >/dev/null; then
   bad "AC3 REGRESSION: the explicitly-classified lane:small bead (wt-small1) was wrongly counted as unclassified"
 else
   ok "AC3 control: the explicitly-classified lane:small bead is NOT named in the unclassified warn"
@@ -5480,7 +5480,7 @@ fi
 # consumes a small-lane slot exactly as before; only the LOG breakdown
 # changed. 5 small slots, 2 occupants (wt-small1 + wt-unclass1, both count
 # against the cap) → 3 free. A behavior-changing "fix" would show 4 free.
-if echo "$LOG_WTQLI_AC3" | grep -q "Available slots: small=3"; then
+if echo "$LOG_WTQLI_AC3" | grep "Available slots: small=3" >/dev/null; then
   ok "AC5: dispatch cap unchanged — unclassified bead still consumes a small slot (3/5 free, not 4/5)"
 else
   bad "AC5 FAILED: dispatch behavior changed (expected 'Available slots: small=3', got: $(echo "$LOG_WTQLI_AC3" | grep 'Available slots'))"
@@ -5994,8 +5994,8 @@ echo "Scenario 22f: gate (f) — rig-native dispatch re-checks the live assignee
 has "$DISPATCHER" 'rig_dedup_skip'  "gate (f) dedup-skip result code present"
 # The dedup re-reads the CURRENT assignee from the rig DB right before assigning.
 _dedup_block="$(awk '/RIG-NATIVE dispatch \(ga-mfeip\)/{f=1} f{print} /rig_native_ok/{if(f)exit}' "$DISPATCHER")"
-if printf '%s' "$_dedup_block" | grep -q 'bd -C "\$STORY_BEAD_CITY" show "\$STORY_ID"' \
-   && printf '%s' "$_dedup_block" | grep -q '_cur_asg.*!=.*_SLING_TARGET'; then
+if printf '%s' "$_dedup_block" | grep 'bd -C "\$STORY_BEAD_CITY" show "\$STORY_ID"' >/dev/null \
+   && printf '%s' "$_dedup_block" | grep '_cur_asg.*!=.*_SLING_TARGET' >/dev/null; then
   ok "gate (f): fresh assignee re-read + mismatch-skip wired before the rig-native assign (_SLING_TARGET)"
 else
   bad "gate (f): dedup re-check missing from the rig-native dispatch path"
@@ -6044,13 +6044,13 @@ echo "Scenario 23a: WA rig story:approved feature IS dispatched when HQ also has
 WA_RIG_FEATURE_FX='[{"id":"wa-zybp","title":"WA rig approved feature fixture","priority":0,"issue_type":"feature","description":"fixture body — WA rig story:approved feature, 80+ chars to clear spec floor","status":"open","labels":["story:approved"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{"story.rig":"whatsapp_automation"}}]'
 HQ_BUG_FX='[{"id":"tt-hq-bug","title":"HQ bug fixture","priority":1,"issue_type":"bug","description":"fixture body","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}}]'
 LOG23A="$(run_wa_rig_tier2 "$WA_RIG_FEATURE_FX" "$HQ_BUG_FX")"
-if echo "$LOG23A" | grep -q "Lane picks.*wa-zybp\|WOULD DISPATCH.*wa-zybp\|Dispatch:.*wa-zybp\|small: wa-zybp\|big: wa-zybp"; then
+if echo "$LOG23A" | grep "Lane picks.*wa-zybp\|WOULD DISPATCH.*wa-zybp\|Dispatch:.*wa-zybp\|small: wa-zybp\|big: wa-zybp" >/dev/null; then
   ok "WA rig story:approved feature (wa-zybp) dispatched even though HQ bug also present"
 else
   bad "WA rig story:approved feature NOT dispatched when HQ has bugs — Bug A regression"
 fi
 # The WA rig feature must appear in the pool log (merged into primary, not fallback).
-if echo "$LOG23A" | grep -q "WA_RIG_TIER2\|story:approved rig\|Bug A fix"; then
+if echo "$LOG23A" | grep "WA_RIG_TIER2\|story:approved rig\|Bug A fix" >/dev/null; then
   ok "WA_RIG_TIER2 pool was scanned and logged in primary merge (not fallback-only)"
 else
   bad "WA rig tier-2 pool scan log not found — may not have run in primary merge path"
@@ -6059,7 +6059,7 @@ fi
 # ── Scenario 23b: env-gate OFF — PILOT_WA_RIG_APPROVED_QUERIES=0 disables scan ─
 echo "Scenario 23b: PILOT_WA_RIG_APPROVED_QUERIES=0 disables WA rig approved scan"
 LOG23B="$(run_wa_rig_tier2 "$WA_RIG_FEATURE_FX" "$HQ_BUG_FX" "0")"
-if echo "$LOG23B" | grep -q "Lane picks.*wa-zybp\|WOULD DISPATCH.*wa-zybp\|small: wa-zybp\|big: wa-zybp"; then
+if echo "$LOG23B" | grep "Lane picks.*wa-zybp\|WOULD DISPATCH.*wa-zybp\|small: wa-zybp\|big: wa-zybp" >/dev/null; then
   bad "WA rig feature dispatched even though PILOT_WA_RIG_APPROVED_QUERIES=0 — gate not honored"
 else
   ok "WA rig feature NOT dispatched when PILOT_WA_RIG_APPROVED_QUERIES=0 (env-gate honored)"
@@ -6132,12 +6132,12 @@ echo "Scenario 23e: rig Tier-1 bug IS dispatched when HQ also has bugs (ga-3oxo5
 RIG_TIER1_BUG_FX='[{"id":"ps-3oxo5fx","title":"property_scrapers rig bug fixture, 80+ chars to clear the spec floor for dispatch eligibility","priority":0,"issue_type":"bug","description":"fixture body — rig-native Tier-1 bug, long enough to clear the spec floor gate","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]'
 HQ_BUG_FX_23E='[{"id":"tt-hq-bug-23e","title":"HQ bug fixture","priority":1,"issue_type":"bug","description":"fixture body","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}}]'
 LOG23E="$(run_rig_tier1 "$RIG_TIER1_BUG_FX" "$HQ_BUG_FX_23E")"
-if echo "$LOG23E" | grep -q "Lane picks.*ps-3oxo5fx\|WOULD DISPATCH.*ps-3oxo5fx\|Dispatch:.*ps-3oxo5fx\|small: ps-3oxo5fx\|big: ps-3oxo5fx"; then
+if echo "$LOG23E" | grep "Lane picks.*ps-3oxo5fx\|WOULD DISPATCH.*ps-3oxo5fx\|Dispatch:.*ps-3oxo5fx\|small: ps-3oxo5fx\|big: ps-3oxo5fx" >/dev/null; then
   ok "rig Tier-1 bug (ps-3oxo5fx) dispatched even though HQ bug also present — this is the fix, not just wiring"
 else
   bad "rig Tier-1 bug NOT dispatched when HQ has bugs — ga-3oxo5 regression (the exact starvation this bug reports)"
 fi
-if echo "$LOG23E" | grep -q "ga-3oxo5, unconditional\|Tier-1 rig bug/tech-debt total"; then
+if echo "$LOG23E" | grep "ga-3oxo5, unconditional\|Tier-1 rig bug/tech-debt total" >/dev/null; then
   ok "rig Tier-1 pool was scanned and logged in the PRIMARY merge (not fallback-only, ga-3oxo5)"
 else
   bad "rig Tier-1 pool scan not logged in primary merge — ga-3oxo5 fix not actually wired into the live sweep"
@@ -6145,14 +6145,14 @@ fi
 
 echo "Scenario 23f (control, ga-3oxo5 AC3 regression): PILOT_RIG_TIER1_QUERIES=0 disables the new scan cleanly"
 LOG23F="$(run_rig_tier1 "$RIG_TIER1_BUG_FX" "$HQ_BUG_FX_23E" "0")"
-if echo "$LOG23F" | grep -q "ps-3oxo5fx"; then
+if echo "$LOG23F" | grep "ps-3oxo5fx" >/dev/null; then
   bad "rig Tier-1 bug appeared even with PILOT_RIG_TIER1_QUERIES=0 — the off-switch does not actually disable the scan"
 else
   ok "PILOT_RIG_TIER1_QUERIES=0 cleanly disables the new scan (deliberate-exclusion capability preserved, ga-3oxo5 AC3)"
 fi
 # HQ's own bug must still dispatch when the rig scan is off — proves the toggle
 # scopes to the NEW pool only, not a wholesale sweep failure.
-if echo "$LOG23F" | grep -q "tt-hq-bug-23e"; then
+if echo "$LOG23F" | grep "tt-hq-bug-23e" >/dev/null; then
   ok "HQ bug still dispatches with the rig Tier-1 scan disabled (toggle is scoped, not a sweep-wide break)"
 else
   bad "HQ bug did not dispatch with PILOT_RIG_TIER1_QUERIES=0 — the toggle broke more than the rig scan"
@@ -6169,7 +6169,7 @@ echo "Scenario 24: WA rig tier-2 gap fix — exec:manual + empty-spec features a
 echo "Scenario 24a: exec:manual WA story:approved feature is EXCLUDED from WA rig tier-2"
 WA_RIG_EXECMANUAL_FX='[{"id":"wa-i02u-fx","title":"LAI e-SIC fixture — exec:manual","priority":2,"issue_type":"feature","description":"Submit LAI request on Fala.BR using Athos CPF credentials — requires human login","status":"open","labels":["story:approved","exec:manual"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{"story.rig":"whatsapp_automation"}}]'
 LOG24A="$(run_wa_rig_tier2 "$WA_RIG_EXECMANUAL_FX" "$HQ_BUG_FX")"
-if echo "$LOG24A" | grep -q "Lane picks.*wa-i02u-fx\|WOULD DISPATCH.*wa-i02u-fx\|small: wa-i02u-fx\|big: wa-i02u-fx"; then
+if echo "$LOG24A" | grep "Lane picks.*wa-i02u-fx\|WOULD DISPATCH.*wa-i02u-fx\|small: wa-i02u-fx\|big: wa-i02u-fx" >/dev/null; then
   bad "REGRESSION: exec:manual WA story:approved feature (wa-i02u-fx) dispatched — ga-wisp-a1radr gap not fixed"
 else
   ok "exec:manual WA story:approved feature (wa-i02u-fx) NOT dispatched (gap fixed, mila ga-wisp-a1radr)"
@@ -6181,7 +6181,7 @@ echo "Scenario 24b: empty-AC/empty-spec WA story:approved feature is EXCLUDED fr
 # no story.criterios. The dispatch gate (b) must reject it.
 WA_RIG_EMPTYSPEC_FX='[{"id":"wa-0z8e-fx","title":"Android FLAG_SECURE R&D","priority":2,"issue_type":"feature","description":"","status":"open","labels":["story:approved"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{"story.rig":"whatsapp_automation"}}]'
 LOG24B="$(run_wa_rig_tier2 "$WA_RIG_EMPTYSPEC_FX" "$HQ_BUG_FX")"
-if echo "$LOG24B" | grep -q "Lane picks.*wa-0z8e-fx\|WOULD DISPATCH.*wa-0z8e-fx\|small: wa-0z8e-fx\|big: wa-0z8e-fx"; then
+if echo "$LOG24B" | grep "Lane picks.*wa-0z8e-fx\|WOULD DISPATCH.*wa-0z8e-fx\|small: wa-0z8e-fx\|big: wa-0z8e-fx" >/dev/null; then
   bad "REGRESSION: empty-spec WA story:approved feature (wa-0z8e-fx) dispatched — ga-wisp-a1radr gap not fixed"
 else
   ok "empty-spec WA story:approved feature (wa-0z8e-fx) NOT dispatched (spec-floor gate b enforced)"
@@ -6194,7 +6194,7 @@ LOG24C="$(run_wa_rig_tier2 "$WA_RIG_GOODSPEC_FX" "$HQ_BUG_FX")"
 # Match the log patterns the dispatcher emits for a DRY_RUN dispatch:
 #   "build story wa-good-fx:" appears in the Task title line inside the WOULD DISPATCH block.
 #   "→ story:in-flight.*wa-good-fx" appears in the post-dispatch summary line.
-if echo "$LOG24C" | grep -q "wa-good-fx.*story:in-flight\|story:in-flight.*wa-good-fx\|build story wa-good-fx\|Selected.*wa-good-fx"; then
+if echo "$LOG24C" | grep "wa-good-fx.*story:in-flight\|story:in-flight.*wa-good-fx\|build story wa-good-fx\|Selected.*wa-good-fx" >/dev/null; then
   ok "Well-specified WA story:approved feature (wa-good-fx) dispatched (no false-drop)"
 else
   bad "Well-specified WA story:approved feature (wa-good-fx) NOT dispatched — false-drop regression"
@@ -6210,7 +6210,7 @@ fi
 # The override seam must also apply the full chain (test coverage would be hollow otherwise).
 # Check that the override block feeds into _filter_exec_manual (not just _filter_candidates).
 if awk '/PILOT_WA_RIG_TIER2_OVERRIDE\+x/,/PILOT_WA_RIG_APPROVED_QUERIES/' "$DISPATCHER" \
-    | grep -qF '_filter_exec_manual'; then
+    | grep -F '_filter_exec_manual' >/dev/null; then
   ok "Override test seam also applies _filter_exec_manual (hermetic tests exercise the gate)"
 else
   bad "Override test seam does NOT apply _filter_exec_manual — filter tests are hollow"
@@ -6235,7 +6235,7 @@ fi
 echo "Scenario 24e: exec:manual + co-occurring park label (needs-label-review) is EXCLUDED (ga-0kqjl)"
 WA_RIG_EXECMANUAL_PARKED_FX='[{"id":"wa-2tp0p-fx","title":"exec:manual + needs-label-review fixture (ga-0kqjl)","priority":1,"issue_type":"feature","description":"fixture reproducing ga-0kqjl: exec:manual co-occurring with a PARK_EXACT label (needs-label-review) must still be excluded from dispatch — derive() rule 4 (park) fires before rule 10 (exec:manual), so a derived-state-only check misses it","status":"open","labels":["story:approved","exec:manual","needs-label-review"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{"story.rig":"whatsapp_automation"}}]'
 LOG24E="$(run_wa_rig_tier2 "$WA_RIG_EXECMANUAL_PARKED_FX" "$HQ_BUG_FX")"
-if echo "$LOG24E" | grep -q "wa-2tp0p-fx.*story:in-flight\|story:in-flight.*wa-2tp0p-fx\|build story wa-2tp0p-fx\|Selected.*wa-2tp0p-fx"; then
+if echo "$LOG24E" | grep "wa-2tp0p-fx.*story:in-flight\|story:in-flight.*wa-2tp0p-fx\|build story wa-2tp0p-fx\|Selected.*wa-2tp0p-fx" >/dev/null; then
   bad "REGRESSION: exec:manual+needs-label-review WA feature (wa-2tp0p-fx) dispatched — ga-0kqjl gap not fixed (derive() rule-4 park pre-empts rule-10 exec:manual; bridge-only state check misses it)"
 else
   ok "exec:manual+needs-label-review WA feature (wa-2tp0p-fx) NOT dispatched (ga-0kqjl fixed — direct label check no longer depends on derive() rule ordering)"
@@ -6281,7 +6281,7 @@ run_hq_tier2() {
 echo "Scenario 25a: empty-spec HQ approved feature is EXCLUDED by gate (b)"
 HQ_EMPTYSPEC_FX='[{"id":"tt-hq-empty","title":"Empty-spec HQ approved feature","priority":2,"issue_type":"feature","description":"stub","status":"open","labels":["story:approved"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]'
 LOG25A="$(run_hq_tier2 "$HQ_EMPTYSPEC_FX")"
-if echo "$LOG25A" | grep -q "Lane picks.*tt-hq-empty\|dispatched.*tt-hq-empty"; then
+if echo "$LOG25A" | grep "Lane picks.*tt-hq-empty\|dispatched.*tt-hq-empty" >/dev/null; then
   bad "REGRESSION: empty-spec HQ approved feature (tt-hq-empty) dispatched — gate (b) not applied to HQ TIER2"
 else
   ok "empty-spec HQ approved feature (tt-hq-empty) NOT dispatched (gate b enforced on HQ TIER2)"
@@ -6291,7 +6291,7 @@ fi
 echo "Scenario 25b: exec:manual HQ approved feature is EXCLUDED from HQ TIER2"
 HQ_EXECMANUAL_FX='[{"id":"tt-hq-manual","title":"Manual HQ feature requiring gov portal login","priority":1,"issue_type":"feature","description":"Submit e-SIC request on Fala.BR using Athos credentials — requires human login to the portal","status":"open","labels":["story:approved","exec:manual"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]'
 LOG25B="$(run_hq_tier2 "$HQ_EXECMANUAL_FX")"
-if echo "$LOG25B" | grep -q "Lane picks.*tt-hq-manual\|dispatched.*tt-hq-manual"; then
+if echo "$LOG25B" | grep "Lane picks.*tt-hq-manual\|dispatched.*tt-hq-manual" >/dev/null; then
   bad "REGRESSION: exec:manual HQ approved feature (tt-hq-manual) dispatched — _filter_exec_manual not applied to HQ TIER2"
 else
   ok "exec:manual HQ approved feature (tt-hq-manual) NOT dispatched (exec:manual gate applied to HQ TIER2)"
@@ -6301,7 +6301,7 @@ fi
 echo "Scenario 25c: well-specified HQ approved feature IS dispatched (no false-drop regression)"
 HQ_GOODSPEC_FX='[{"id":"tt-hq-good","title":"Pipedrive: incluir demais imóveis do proprietário ao enviar deal","priority":2,"issue_type":"feature","description":"Ao enviar um deal ao Pipedrive o payload inclui os demais imóveis vinculados ao mesmo CPF/CNPJ do proprietário — consulta na base consolidada e monta o campo imoveis_vinculados no corpo do request","status":"open","labels":["story:approved"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{"story.criterios":"CPF/CNPJ do proprietário buscado na base; lista de imóveis montada; deal criado com imoveis_vinculados preenchido"}}]'
 LOG25C="$(run_hq_tier2 "$HQ_GOODSPEC_FX")"
-if echo "$LOG25C" | grep -q "Lane picks.*tt-hq-good\|dispatched.*tt-hq-good\|small.*tt-hq-good\|big.*tt-hq-good"; then
+if echo "$LOG25C" | grep "Lane picks.*tt-hq-good\|dispatched.*tt-hq-good\|small.*tt-hq-good\|big.*tt-hq-good" >/dev/null; then
   ok "Well-specified HQ approved feature (tt-hq-good) dispatched — no false-drop on HQ TIER2"
 else
   bad "Well-specified HQ approved feature (tt-hq-good) NOT dispatched — false-drop regression on HQ TIER2"
@@ -6433,7 +6433,7 @@ echo "Scenario NEW-L1: cap guard is inside the PILOT_SPAWN_WA_WORKER=1 block (co
 # the gc session new call, so PILOT_SPAWN_WA_WORKER=0 still short-circuits before
 # any session list probe. Verify by extracting the spawn block text.
 _spawn_block=$(awk '/PILOT_SPAWN_WA_WORKER:-1.*=.*1/{f=1} f{print} /PILOT_SPAWN_WA_WORKER=0.*skipping/{if(f)exit}' "$DISPATCHER")
-if echo "$_spawn_block" | grep -q 'wa-worker pool at session cap\|_live_wa_count'; then
+if echo "$_spawn_block" | grep 'wa-worker pool at session cap\|_live_wa_count' >/dev/null; then
   ok "cap guard (_live_wa_count check) is inside the PILOT_SPAWN_WA_WORKER=1 block (correct placement)"
 else
   bad "cap guard NOT found inside the PILOT_SPAWN_WA_WORKER=1 block — may run even when spawn is disabled"
@@ -6441,7 +6441,7 @@ fi
 
 echo "Scenario NEW-L2: cap guard reads from PILOT_TEST_WA_WORKER_LIVE_COUNT seam first"
 _cap_block=$(awk '/PILOT_TEST_WA_WORKER_LIVE_COUNT/{p=1} p{print} p&&/fi/{exit}' "$DISPATCHER" | head -10)
-if echo "$_cap_block" | grep -q 'PILOT_TEST_WA_WORKER_LIVE_COUNT'; then
+if echo "$_cap_block" | grep 'PILOT_TEST_WA_WORKER_LIVE_COUNT' >/dev/null; then
   ok "cap guard reads PILOT_TEST_WA_WORKER_LIVE_COUNT test seam before live probe (hermetic tests possible)"
 else
   bad "cap guard does NOT read PILOT_TEST_WA_WORKER_LIVE_COUNT — hermetic test seam missing or mis-ordered"
@@ -6479,13 +6479,13 @@ has "$DISPATCHER" 'rig_native_spawn_failed' \
 
 echo "Scenario NEW-M2: wa-worker spawn failure rolls back pilot:dispatching and aborts BEFORE the unconditional in-flight marking"
 _wa_spawnfail_block="$(awk '/Could not spawn wa-worker/{f=1} f{print} /PILOT_SPAWN_WA_WORKER=0 — skipping/{if(f)exit}' "$DISPATCHER")"
-if printf '%s' "$_wa_spawnfail_block" | grep -q 'label remove "\$STORY_ID" "pilot:dispatching"' \
-   && printf '%s' "$_wa_spawnfail_block" | grep -q 'return 1'; then
+if printf '%s' "$_wa_spawnfail_block" | grep 'label remove "\$STORY_ID" "pilot:dispatching"' >/dev/null \
+   && printf '%s' "$_wa_spawnfail_block" | grep 'return 1' >/dev/null; then
   ok "wa-worker: spawn-failure branch strips pilot:dispatching and returns 1 (ga-d20od fix present)"
 else
   bad "wa-worker: spawn-failure branch does NOT roll back pilot:dispatching / return 1 — orphan-label regression (ga-d20od)"
 fi
-if printf '%s' "$_wa_spawnfail_block" | grep -q 'unset-metadata "gc.routed_to"'; then
+if printf '%s' "$_wa_spawnfail_block" | grep 'unset-metadata "gc.routed_to"' >/dev/null; then
   bad "wa-worker: spawn-failure branch unsets gc.routed_to — supervisor reconcile would lose the pool demand signal (ga-d20od intent: leave it SET)"
 else
   ok "wa-worker: spawn-failure branch leaves gc.routed_to SET (supervisor reconcile can still see the pool demand)"
@@ -6493,8 +6493,8 @@ fi
 
 echo "Scenario NEW-M3: ps-worker mirror — same spawn-failure rollback (ga-d20od)"
 _ps_spawnfail_block="$(awk '/Could not spawn ps-worker/{f=1} f{print} /PILOT_SPAWN_PS_WORKER=0 — skipping/{if(f)exit}' "$DISPATCHER")"
-if printf '%s' "$_ps_spawnfail_block" | grep -q 'label remove "\$STORY_ID" "pilot:dispatching"' \
-   && printf '%s' "$_ps_spawnfail_block" | grep -q 'return 1'; then
+if printf '%s' "$_ps_spawnfail_block" | grep 'label remove "\$STORY_ID" "pilot:dispatching"' >/dev/null \
+   && printf '%s' "$_ps_spawnfail_block" | grep 'return 1' >/dev/null; then
   ok "ps-worker: spawn-failure branch strips pilot:dispatching and returns 1 (ga-d20od fix mirrored)"
 else
   bad "ps-worker: spawn-failure branch does NOT roll back pilot:dispatching / return 1 — orphan-label regression (ga-d20od)"
@@ -6604,7 +6604,7 @@ CAPQ_PS_ROUTED_FX='[{"id":"ps-capq2","title":"Fixture ps-worker ja roteada (ga-i
 
 echo "Scenario CAPQ-A (ga-in9ebr): wa-worker pool AT cap → bead is queued, NOT marked in-flight/dispatched, no dispatch comment, no spawn"
 LOG_CQA="$(run_capq_dispatch "$CAPQ_WA_FX" 4 0)"
-if echo "$LOG_CQA" | grep -q "wa-worker pool at session cap"; then
+if echo "$LOG_CQA" | grep "wa-worker pool at session cap" >/dev/null; then
   ok "CAPQ-A: harness reached the real wa-worker cap branch (not a vacuous pass)"
 else
   bad "CAPQ-A: the wa-worker cap branch was NEVER reached — harness broken, the assertions below prove nothing"
@@ -6639,13 +6639,13 @@ fi
 [ "$(capq_n 'unset-metadata pilot.sling_bead')" -ge 1 ] \
   && ok "CAPQ-A: stale Pilot dispatch fingerprint (pilot.sling_bead) cleared — nothing was slung" \
   || bad "CAPQ-A: pilot.sling_bead left on a bead that was never dispatched (the ownership guard would read it as a Pilot dispatch and miss an external crew claim)"
-echo "$LOG_CQA" | grep -q "dispatched=0" \
+echo "$LOG_CQA" | grep "dispatched=0" >/dev/null \
   && ok "CAPQ-A: sweep summary reports dispatched=0 (no slot consumed by a phantom dispatch)" \
   || bad "CAPQ-A: sweep summary does not report dispatched=0"
 
 echo "Scenario CAPQ-B (ga-in9ebr): ps-worker mirror — pool AT cap → queued, NOT marked in-flight"
 LOG_CQB="$(run_capq_dispatch "$CAPQ_PS_FX" 0 2)"
-if echo "$LOG_CQB" | grep -q "ps-worker pool at session cap"; then
+if echo "$LOG_CQB" | grep "ps-worker pool at session cap" >/dev/null; then
   ok "CAPQ-B: harness reached the real ps-worker cap branch"
 else
   bad "CAPQ-B: the ps-worker cap branch was NEVER reached — harness broken"
@@ -6667,7 +6667,7 @@ fi
 grep -q 'session new wa-worker' "$STATE/session_new.log" 2>/dev/null \
   && ok "CAPQ-C: below cap a wa-worker session IS spawned" \
   || bad "CAPQ-C: below cap no wa-worker session was spawned"
-echo "$LOG_CQC" | grep -q "dispatched=1" \
+echo "$LOG_CQC" | grep "dispatched=1" >/dev/null \
   && ok "CAPQ-C: sweep summary reports dispatched=1" \
   || bad "CAPQ-C: sweep summary does not report dispatched=1"
 
@@ -6676,7 +6676,7 @@ LOG_CQD="$(run_capq_dispatch "$CAPQ_WA_ROUTED_FX" 4 0)"
 [ "$(capq_n 'label (add|remove) wa-capq2')" = "0" ] && [ "$(capq_n 'update wa-capq2')" = "0" ] && [ "$(capq_n 'comment wa-capq2')" = "0" ] \
   && ok "CAPQ-D: no claim/release/metadata/comment writes on the queued bead (was: claim→cap→release every sweep)" \
   || bad "CAPQ-D: the Pilot still wrote to a bead already queued for a full pool — per-sweep churn (ga-in9ebr AC2)"
-echo "$LOG_CQD" | grep -q "ga-in9ebr: wa-capq2 QUEUED" \
+echo "$LOG_CQD" | grep "ga-in9ebr: wa-capq2 QUEUED" >/dev/null \
   && ok "CAPQ-D: skip is logged once per bead with the QUEUED marker (greppable)" \
   || bad "CAPQ-D: no 'ga-in9ebr: wa-capq2 QUEUED' line — the skip is invisible in the pilot log"
 [ ! -s "$STATE/session_new.log" ] \
@@ -6684,14 +6684,14 @@ echo "$LOG_CQD" | grep -q "ga-in9ebr: wa-capq2 QUEUED" \
   || bad "CAPQ-D: a session was spawned for a bead whose pool is at cap"
 LOG_CQD2="$(run_capq_dispatch "$CAPQ_PS_ROUTED_FX" 0 2)"
 [ "$(capq_n 'label (add|remove) ps-capq2')" = "0" ] && [ "$(capq_n 'update ps-capq2')" = "0" ] \
-  && echo "$LOG_CQD2" | grep -q "ga-in9ebr: ps-capq2 QUEUED" \
+  && echo "$LOG_CQD2" | grep "ga-in9ebr: ps-capq2 QUEUED" >/dev/null \
   && ok "CAPQ-D: ps-worker mirror — routed bead at a full ps pool is skipped pre-claim with zero writes" \
   || bad "CAPQ-D: ps-worker mirror — routed bead at a full ps pool still churned or was not logged"
 
 echo "Scenario CAPQ-E (ga-in9ebr): a routed bead whose pool has ROOM is NOT skipped (pre-claim skip only on positive at-cap evidence)"
 LOG_CQE="$(run_capq_dispatch "$CAPQ_WA_ROUTED_FX" 3 0)"
 [ "$(capq_n 'label add wa-capq2 story:in-flight')" -ge 1 ] && grep -q 'session new wa-worker' "$STATE/session_new.log" 2>/dev/null \
-  && ! echo "$LOG_CQE" | grep -q "ga-in9ebr: wa-capq2 QUEUED" \
+  && ! echo "$LOG_CQE" | grep "ga-in9ebr: wa-capq2 QUEUED" >/dev/null \
   && ok "CAPQ-E: routed bead at wa-worker 3/4 dispatches normally (in-flight + spawn), no QUEUED skip" \
   || bad "CAPQ-E: a routed bead with pool room was skipped or not dispatched — over-blocking"
 
@@ -6699,7 +6699,7 @@ echo "Scenario CAPQ-F (ga-in9ebr): a full wa pool must NOT starve a candidate fo
 CAPQ_MIX_FX="[$(printf '%s' "$CAPQ_WA_ROUTED_FX" | sed 's/^\[//; s/\]$//' | sed 's/"priority":2/"priority":0/'),$(printf '%s' "$CAPQ_PS_FX" | sed 's/^\[//; s/\]$//')]"
 LOG_CQF="$(run_capq_dispatch "$CAPQ_MIX_FX" 4 0)"
 if [ "$(capq_n 'label add ps-capq1 story:in-flight')" -ge 1 ] && grep -q 'session new ps-worker' "$STATE/session_new.log" 2>/dev/null \
-   && [ "$(capq_n 'label (add|remove) wa-capq2')" = "0" ] && echo "$LOG_CQF" | grep -q "ga-in9ebr: wa-capq2 QUEUED"; then
+   && [ "$(capq_n 'label (add|remove) wa-capq2')" = "0" ] && echo "$LOG_CQF" | grep "ga-in9ebr: wa-capq2 QUEUED" >/dev/null; then
   ok "CAPQ-F: P0 wa bead (pool full) is skipped; the P2 ps bead (pool has room) still dispatches in the same sweep"
 else
   bad "CAPQ-F: the full wa pool blocked (or mis-handled) the ps candidate — head-of-line blocking / over-skip"
@@ -6707,19 +6707,19 @@ fi
 
 echo "Scenario CAPQ-G (ga-in9ebr): a sweep whose ONLY non-dispatch reason is pool saturation is NOT a Pilot stall (no streak, no page)"
 LOG_CQG="$(run_capq_dispatch "$CAPQ_WA_ROUTED_FX" 4 0)"
-if [ ! -f "$FIXCITY/.gc/pilot-dispatcher-stall.count" ] && ! echo "$LOG_CQG" | grep -q "ga-y1m40: dispatched=0 with free slots"; then
+if [ ! -f "$FIXCITY/.gc/pilot-dispatcher-stall.count" ] && ! echo "$LOG_CQG" | grep "ga-y1m40: dispatched=0 with free slots" >/dev/null; then
   ok "CAPQ-G: saturated pool → no stall streak recorded and no 'Pilot estagnado' path (busy ≠ stalled)"
 else
   bad "CAPQ-G: a merely SATURATED pool was counted as a Pilot stall — would page Athos (p4 ntfy) every 15min"
 fi
-echo "$LOG_CQG" | grep -q "ga-in9ebr: pool-cap queued this sweep: 1" \
+echo "$LOG_CQG" | grep "ga-in9ebr: pool-cap queued this sweep: 1" >/dev/null \
   && ok "CAPQ-G: sweep summary states how many candidates were queued by the pool cap" \
   || bad "CAPQ-G: no 'pool-cap queued this sweep' summary — saturation is invisible in the pilot log"
-echo "$LOG_CQG" | grep -q "ga-in9ebr: POOL-SATURATED sweep" \
+echo "$LOG_CQG" | grep "ga-in9ebr: POOL-SATURATED sweep" >/dev/null \
   && ok "CAPQ-G: the sweep logs the POOL-SATURATED marker that imparavel-check & co. read (busy pool != stall)" \
   || bad "CAPQ-G: no POOL-SATURATED marker — other detectors cannot tell a busy pool from a stall"
 LOG_CQG2="$(run_capq_dispatch "$CAPQ_PS_ROUTED_FX" 0 2)"
-if [ ! -f "$FIXCITY/.gc/pilot-dispatcher-stall.count" ] && echo "$LOG_CQG2" | grep -q "ga-in9ebr: POOL-SATURATED sweep"; then
+if [ ! -f "$FIXCITY/.gc/pilot-dispatcher-stall.count" ] && echo "$LOG_CQG2" | grep "ga-in9ebr: POOL-SATURATED sweep" >/dev/null; then
   ok "CAPQ-G: ps-worker mirror — a saturated ps pool is not a stall either (marker logged, no streak)"
 else
   bad "CAPQ-G: ps-worker mirror — a merely saturated ps pool was counted as a stall or left no marker"
@@ -6731,7 +6731,7 @@ _cqi_warns=$(printf '%s\n' "$LOG_CQI" | grep -c 'ga-in9ebr: cannot read the wa-w
 [ "$_cqi_warns" = "1" ] \
   && ok "CAPQ-I: the unreadable probe is announced exactly once per sweep (visible fail-open, not silent)" \
   || bad "CAPQ-I: expected exactly ONE 'cannot read the wa-worker live session count' warning, saw $_cqi_warns"
-echo "$LOG_CQI" | grep -q "ga-in9ebr: wa-capq2 QUEUED" \
+echo "$LOG_CQI" | grep "ga-in9ebr: wa-capq2 QUEUED" >/dev/null \
   && bad "CAPQ-I: a bead was skipped on an UNREADABLE count — a blind probe must never suppress a dispatch" \
   || ok "CAPQ-I: no skip on an unreadable count"
 [ "$(capq_n 'label add wa-capq2 pilot:dispatching')" -ge 1 ] \
@@ -6766,13 +6766,13 @@ _nc_warns=$(printf '%s\n' "$_nc_log3" | grep -c 'ga-in9ebr: cannot read the wa-w
 echo "Scenario CAPQ-J (ga-in9ebr): a lane loop CUT SHORT by the Dolt back-off is NOT 'saturation' — the stall streak must still count"
 CAPQ_TWO_FX="[$(printf '%s' "$CAPQ_WA_FX" | sed 's/^\[//; s/\]$//' | sed 's/"priority":2/"priority":0/'),$(printf '%s' "$CAPQ_WA2_FX" | sed 's/^\[//; s/\]$//')]"
 LOG_CQJ="$(run_capq_dispatch "$CAPQ_TWO_FX" 4 0 "" 1)"
-echo "$LOG_CQJ" | grep -q "Dolt saturated mid-sweep" \
+echo "$LOG_CQJ" | grep "Dolt saturated mid-sweep" >/dev/null \
   && ok "CAPQ-J: harness cut the lane loop short with a candidate still waiting (not a vacuous pass)" \
   || bad "CAPQ-J: the mid-sweep Dolt back-off never fired — the scenario proves nothing"
-echo "$LOG_CQJ" | grep -q "ga-in9ebr: wa-worker pool at session cap" \
+echo "$LOG_CQJ" | grep "ga-in9ebr: wa-worker pool at session cap" >/dev/null \
   && ok "CAPQ-J: the first candidate WAS cap-queued before the loop was cut (so POOL_CAP_QUEUED>0)" \
   || bad "CAPQ-J: no cap-queue happened — the scenario cannot distinguish 'saturated' from 'cut short'"
-if [ -f "$FIXCITY/.gc/pilot-dispatcher-stall.count" ] && echo "$LOG_CQJ" | grep -q "ga-y1m40: dispatched=0 with free slots"; then
+if [ -f "$FIXCITY/.gc/pilot-dispatcher-stall.count" ] && echo "$LOG_CQJ" | grep "ga-y1m40: dispatched=0 with free slots" >/dev/null; then
   ok "CAPQ-J: cut-short sweep still counts toward the stall streak (a hot Dolt is a real stall, not 'busy pool')"
 else
   bad "CAPQ-J: a sweep CUT SHORT by Dolt back-off was classified as pool saturation — a real stall would be hidden"
@@ -6789,12 +6789,12 @@ _cqi3_w=$(printf '%s\n' "$LOG_CQI3" | grep -c 'ga-in9ebr: cannot read the wa-wor
 
 echo "Scenario CAPQ-L (ga-in9ebr): PILOT_POOL_CAP_PRECLAIM_SKIP=0 disables ONLY the pre-claim skip — the bead is still QUEUED honestly (claim → cap → release), never in-flight"
 LOG_CQL="$(run_capq_dispatch "$CAPQ_WA_ROUTED_FX" 4 0 "" 0 0)"
-if [ "$(capq_n 'label add wa-capq2 pilot:dispatching')" -ge 1 ] && ! echo "$LOG_CQL" | grep -q "ga-in9ebr: wa-capq2 QUEUED"; then
+if [ "$(capq_n 'label add wa-capq2 pilot:dispatching')" -ge 1 ] && ! echo "$LOG_CQL" | grep "ga-in9ebr: wa-capq2 QUEUED" >/dev/null; then
   ok "CAPQ-L: with the knob off the routed bead IS claimed (no pre-claim skip)"
 else
   bad "CAPQ-L: the kill switch did not disable the pre-claim skip"
 fi
-echo "$LOG_CQL" | grep -q "wa-worker pool at session cap.*QUEUED wa-capq2" \
+echo "$LOG_CQL" | grep "wa-worker pool at session cap.*QUEUED wa-capq2" >/dev/null \
   && ok "CAPQ-L: ...and the post-claim cap branch still queued it" \
   || bad "CAPQ-L: with the pre-claim skip off the post-claim cap branch did not queue the bead"
 [ "$(capq_n 'label add wa-capq2 story:in-flight')" = "0" ] && [ "$(capq_n 'label add wa-capq2 pilot:dispatched')" = "0" ] \
@@ -6808,7 +6808,7 @@ _cqm_spawns=$(grep -c 'session new wa-worker' "$STATE/session_new.log" 2>/dev/nu
 [ "$_cqm_spawns" = "1" ] \
   && ok "CAPQ-M: exactly ONE wa-worker session spawned for two routed beads with a single free slot" \
   || bad "CAPQ-M: $_cqm_spawns wa-worker sessions spawned for a single free slot — the per-sweep count was not bumped after the spawn"
-echo "$LOG_CQM" | grep -qE "ga-in9ebr: wa-cm[12] QUEUED" \
+echo "$LOG_CQM" | grep -E "ga-in9ebr: wa-cm[12] QUEUED" >/dev/null \
   && ok "CAPQ-M: the second routed bead was QUEUED pre-claim once the first spawn filled the pool" \
   || bad "CAPQ-M: the second routed bead was not queued after the pool filled"
 
@@ -6821,10 +6821,10 @@ _cqn_q=$(printf '%s\n' "$LOG_CQN" | grep -c 'wa-worker pool at session cap.*QUEU
 [ "$_cqn_q" = "5" ] \
   && ok "CAPQ-N: all 5 first-sight beads were QUEUED through the cap branch" \
   || bad "CAPQ-N: only $_cqn_q of 5 first-sight beads reached the cap branch — the rest were deferred for lack of a builder slot"
-echo "$LOG_CQN" | grep -q "all crew busy/used this sweep" \
+echo "$LOG_CQN" | grep "all crew busy/used this sweep" >/dev/null \
   && bad "CAPQ-N: a first-sight bead was deferred with 'all crew busy/used' — a slot reserved by a bead that only QUEUED was not given back" \
   || ok "CAPQ-N: no first-sight bead was deferred for lack of a builder slot"
-if echo "$LOG_CQN" | grep -q "ga-in9ebr: POOL-SATURATED sweep" && [ ! -f "$FIXCITY/.gc/pilot-dispatcher-stall.count" ]; then
+if echo "$LOG_CQN" | grep "ga-in9ebr: POOL-SATURATED sweep" >/dev/null && [ ! -f "$FIXCITY/.gc/pilot-dispatcher-stall.count" ]; then
   ok "CAPQ-N: the 5-bead sweep is POOL-SATURATED (marker logged, no stall streak)"
 else
   bad "CAPQ-N: the 5-bead saturated sweep was counted as a stall (or left no marker) — the deferred bead read as a real failure"
@@ -6832,13 +6832,13 @@ fi
 
 echo "Scenario CAPQ-O (ga-in9ebr): the combined ga-jezvn GLOBAL cap is saturation too — same accounting as the per-pool cap (no false stall)"
 LOG_CQO="$(run_capq_dispatch "$CAPQ_WA_FX" 0 0 "" 0 1 1 6)"
-echo "$LOG_CQO" | grep -q "ga-jezvn: GLOBAL variable-session cap hit" \
+echo "$LOG_CQO" | grep "ga-jezvn: GLOBAL variable-session cap hit" >/dev/null \
   && ok "CAPQ-O: harness reached the real global-cap branch (not a vacuous pass)" \
   || bad "CAPQ-O: the global-cap branch was NEVER reached — the assertions below prove nothing"
 [ "$(capq_n 'label add wa-capq1 story:in-flight')" = "0" ] \
   && ok "CAPQ-O: the global-cap release still leaves the bead un-marked (unchanged behavior)" \
   || bad "CAPQ-O: story:in-flight was written under the global cap"
-if echo "$LOG_CQO" | grep -q "ga-in9ebr: POOL-SATURATED sweep" && [ ! -f "$FIXCITY/.gc/pilot-dispatcher-stall.count" ]; then
+if echo "$LOG_CQO" | grep "ga-in9ebr: POOL-SATURATED sweep" >/dev/null && [ ! -f "$FIXCITY/.gc/pilot-dispatcher-stall.count" ]; then
   ok "CAPQ-O: a global-cap-saturated sweep is logged POOL-SATURATED and does not feed the stall streak"
 else
   bad "CAPQ-O: a global-cap-saturated sweep was counted as a Pilot stall (would page every 3 sweeps)"
@@ -6846,10 +6846,10 @@ fi
 
 echo "Scenario CAPQ-P (ga-in9ebr): PILOT_SPAWN_WA_WORKER=0 (nudge-only debug mode) — the pre-claim skip must stay out of its way"
 LOG_CQP="$(run_capq_dispatch "$CAPQ_WA_ROUTED_FX" 4 0 "" 0 1 0)"
-echo "$LOG_CQP" | grep -q "PILOT_SPAWN_WA_WORKER=0 — skipping auto-spawn" \
+echo "$LOG_CQP" | grep "PILOT_SPAWN_WA_WORKER=0 — skipping auto-spawn" >/dev/null \
   && ok "CAPQ-P: harness reached the spawn-disabled branch (not a vacuous pass)" \
   || bad "CAPQ-P: the spawn-disabled branch was never reached — the assertions below prove nothing"
-if [ "$(capq_n 'label add wa-capq2 pilot:dispatching')" -ge 1 ] && ! echo "$LOG_CQP" | grep -q "ga-in9ebr: wa-capq2 QUEUED"; then
+if [ "$(capq_n 'label add wa-capq2 pilot:dispatching')" -ge 1 ] && ! echo "$LOG_CQP" | grep "ga-in9ebr: wa-capq2 QUEUED" >/dev/null; then
   ok "CAPQ-P: with spawning disabled the routed bead is NOT pre-claim skipped (dispatch_one never checks the cap in that mode)"
 else
   bad "CAPQ-P: the pre-claim skip fired although PILOT_SPAWN_WA_WORKER=0 — it changed the nudge-only debug mode"
@@ -6860,14 +6860,14 @@ _capq_wa_block="$(awk '/wa-worker pool at session cap/{f=1} f{print} /spawning w
 _capq_ps_block="$(awk '/ps-worker pool at session cap/{f=1} f{print} /spawning ps-worker for/{if(f)exit}' "$DISPATCHER")"
 for _pool in wa ps; do
   eval "_capq_blk=\"\$_capq_${_pool}_block\""
-  if printf '%s' "$_capq_blk" | grep -q '_pilot_release_pool_cap_queued' && printf '%s' "$_capq_blk" | grep -q 'return 1'; then
+  if printf '%s' "$_capq_blk" | grep '_pilot_release_pool_cap_queued' >/dev/null && printf '%s' "$_capq_blk" | grep 'return 1' >/dev/null; then
     ok "CAPQ-H: ${_pool}-worker cap branch releases the claim and returns 1 before the in-flight marking"
   else
     bad "CAPQ-H: ${_pool}-worker cap branch does NOT release+return — it still falls through to story:in-flight (ga-in9ebr)"
   fi
 done
 _capq_lane_block="$(awk '/^dispatch_lane\(\)/{f=1} f{print} /if dispatch_one "\$pick"/{if(f)exit}' "$DISPATCHER")"
-printf '%s' "$_capq_lane_block" | grep -q '_pilot_pool_cap_full_for' \
+printf '%s' "$_capq_lane_block" | grep '_pilot_pool_cap_full_for' >/dev/null \
   && ok "CAPQ-H: dispatch_lane consults the pre-claim pool-cap skip BEFORE dispatch_one" \
   || bad "CAPQ-H: dispatch_lane does not consult the pre-claim skip before dispatch_one — claim churn per sweep (ga-in9ebr AC2)"
 has "$DISPATCHER" 'PILOT_POOL_CAP_PRECLAIM_SKIP' "CAPQ-H: pre-claim skip has an env kill switch (PILOT_POOL_CAP_PRECLAIM_SKIP=0 disables it)"
@@ -7073,7 +7073,7 @@ echo "Scenario TOPUP-1: below cap + a pending routed-unassigned bead → spawns"
 # same reason (see NEW-L's own comment). What's NEW and under test here is the
 # DECISION to spawn, which fires before that call.
 LOG_TU1="$(run_topup_scenario "3" "wa-pending1" "0")"
-if echo "$LOG_TU1" | grep -q "ga-93yxc: pool top-up — wa-worker has free capacity (live=3 < 4) and wa-pending1 is routed+unassigned with no worker from a prior sweep — spawning."; then
+if echo "$LOG_TU1" | grep "ga-93yxc: pool top-up — wa-worker has free capacity (live=3 < 4) and wa-pending1 is routed+unassigned with no worker from a prior sweep — spawning." >/dev/null; then
   ok "topup: decides to spawn wa-worker for a pending routed-unassigned bead when live < max (ga-93yxc fix present)"
 else
   bad "topup: did NOT decide to spawn for wa-pending1 despite free capacity — ga-93yxc regression (a routed bead would starve until TTL reclaim, same as the live incident)"
@@ -7081,7 +7081,7 @@ fi
 
 echo "Scenario TOPUP-2: AT cap + a pending bead → does NOT spawn (cap respected)"
 LOG_TU2="$(run_topup_scenario "4" "wa-pending2" "0")"
-if echo "$LOG_TU2" | grep -q "wa-pending2"; then
+if echo "$LOG_TU2" | grep "wa-pending2" >/dev/null; then
   bad "topup: spawned (or queried) despite live=4 >= max=4 — cap NOT respected (runaway risk, ga-v3o6i class)"
 else
   ok "topup: correctly skips when the pool is already at cap"
@@ -7089,7 +7089,7 @@ fi
 
 echo "Scenario TOPUP-3: below cap but NO pending bead → does NOT spawn (nothing to do)"
 LOG_TU3="$(run_topup_scenario "1" "" "0")"
-if echo "$LOG_TU3" | grep -q "ga-93yxc: pool top-up"; then
+if echo "$LOG_TU3" | grep "ga-93yxc: pool top-up" >/dev/null; then
   bad "topup: attempted a spawn with no pending routed bead — should be a silent no-op"
 else
   ok "topup: correctly no-ops when no routed-unassigned bead is pending"
@@ -7097,12 +7097,12 @@ fi
 
 echo "Scenario TOPUP-4: DRY_RUN=1 logs the decision but does not claim a real spawn happened"
 LOG_TU4="$(run_topup_scenario "1" "wa-pending4" "1")"
-if echo "$LOG_TU4" | grep -q "DRY_RUN=1 — WOULD: pool top-up spawn wa-worker for wa-pending4"; then
+if echo "$LOG_TU4" | grep "DRY_RUN=1 — WOULD: pool top-up spawn wa-worker for wa-pending4" >/dev/null; then
   ok "topup: DRY_RUN=1 emits a WOULD-log for the pending bead (decision logic runs even in dry-run)"
 else
   bad "topup: DRY_RUN=1 did NOT log the top-up decision — dry-run path broken or unreachable"
 fi
-if echo "$LOG_TU4" | grep -q "pool top-up — wa-worker session spawned for wa-pending4"; then
+if echo "$LOG_TU4" | grep "pool top-up — wa-worker session spawned for wa-pending4" >/dev/null; then
   bad "topup: DRY_RUN=1 claims a real spawn happened — DRY_RUN not respected (would make live changes in dry-run mode)"
 else
   ok "topup: DRY_RUN=1 makes no real-spawn claim (mirrors every other mutation in this file)"
@@ -7110,7 +7110,7 @@ fi
 
 echo "Scenario TOPUP-5: GLOBAL variable-session cap (ga-jezvn) blocks top-up even with per-pool room"
 LOG_TU5="$(run_topup_scenario "1" "wa-pending5" "0" "6")"
-if echo "$LOG_TU5" | grep -q "wa-pending5"; then
+if echo "$LOG_TU5" | grep "wa-pending5" >/dev/null; then
   bad "topup: spawned despite the GLOBAL variable-session cap being saturated (wa-worker+ps-worker+gate-reviewer combined) — ga-jezvn not respected by top-up"
 else
   ok "topup: respects the GLOBAL variable-session cap, not just the per-pool one"
@@ -7124,7 +7124,7 @@ has "$DISPATCHER" '^_pilot_pool_topup "ps-worker"' \
 has "$DISPATCHER" '_live" -lt "\$_max" \] && \[ "\$_global" -lt "\$GC_VARIABLE_SESSION_MAX"' \
   "top-up while-loop checks both the per-pool cap AND the global variable-session cap"
 _topup_vs_exit_block="$(awk '/_pilot_pool_topup "wa-worker"/{f=1} f{print} /No dispatchable candidates \(Tier 1 or Tier 2\)\. Exiting\./{if(f)exit}' "$DISPATCHER")"
-if printf '%s' "$_topup_vs_exit_block" | grep -q "No dispatchable candidates"; then
+if printf '%s' "$_topup_vs_exit_block" | grep "No dispatchable candidates" >/dev/null; then
   ok "topup call sites appear BEFORE the zero-candidates early exit — runs even on a quiet sweep with nothing new to dispatch"
 else
   bad "REGRESSION: topup call sites do NOT precede the zero-candidates early exit — a quiet sweep would skip top-up entirely (the exact bug this fix targets)"
@@ -7176,12 +7176,12 @@ run_topup_candidates_scenario() {
 
 echo "Scenario TOPUP-ELIGIBILITY-1: a pilot:held candidate is skipped in favor of an eligible sibling"
 LOG_TUE1="$(run_topup_candidates_scenario "3" '[{"id":"wa-held-oc6knj","priority":1,"assignee":null,"description":"fixture body","issue_type":"task","labels":["pilot:held","pilot:held-until:9999999999"]},{"id":"wa-eligible-oc6knj","priority":1,"assignee":null,"description":"fixture body","issue_type":"task","labels":[]}]')"
-if echo "$LOG_TUE1" | grep -q "pool top-up.*wa-eligible-oc6knj"; then
+if echo "$LOG_TUE1" | grep "pool top-up.*wa-eligible-oc6knj" >/dev/null; then
   ok "topup: spawns for the eligible sibling when the other routed candidate is pilot:held"
 else
   bad "topup: did NOT spawn for wa-eligible-oc6knj — eligibility filter not wired in, or over-broad (log: $LOG_TUE1)"
 fi
-if echo "$LOG_TUE1" | grep -q "wa-held-oc6knj"; then
+if echo "$LOG_TUE1" | grep "wa-held-oc6knj" >/dev/null; then
   bad "topup: spawned (or considered) the pilot:held candidate — ga-oc6knj regression, top-up ignoring the same hold the worker probe respects"
 else
   ok "topup: never considers the pilot:held candidate"
@@ -7198,12 +7198,12 @@ echo "Scenario TOPUP-ELIGIBILITY-1b (ga-onrnd6): a next-action:-parked candidate
 # spawning a session for it after the worker probe itself had already
 # correctly stopped offering it).
 LOG_TUE1B="$(run_topup_candidates_scenario "3" '[{"id":"wa-parked-onrnd6","priority":1,"assignee":null,"description":"fixture body","issue_type":"task","labels":["next-action:athos-decide"]},{"id":"wa-eligible-onrnd6","priority":1,"assignee":null,"description":"fixture body","issue_type":"task","labels":[]}]')"
-if echo "$LOG_TUE1B" | grep -q "pool top-up.*wa-eligible-onrnd6"; then
+if echo "$LOG_TUE1B" | grep "pool top-up.*wa-eligible-onrnd6" >/dev/null; then
   ok "topup: spawns for the eligible sibling when the other routed candidate carries next-action:athos-decide"
 else
   bad "topup: did NOT spawn for wa-eligible-onrnd6 — next-action eligibility filter not wired in, or over-broad (log: $LOG_TUE1B)"
 fi
-if echo "$LOG_TUE1B" | grep -q "wa-parked-onrnd6"; then
+if echo "$LOG_TUE1B" | grep "wa-parked-onrnd6" >/dev/null; then
   bad "topup: spawned (or considered) the next-action:athos-decide candidate — ga-onrnd6 regression, top-up ignoring the same park label the worker probe respects"
 else
   ok "topup: never considers the next-action:athos-decide candidate"
@@ -7211,7 +7211,7 @@ fi
 
 echo "Scenario TOPUP-ELIGIBILITY-2: reclaim-cap candidate with NO eligible sibling → correctly finds nothing (no spawn)"
 LOG_TUE2="$(run_topup_candidates_scenario "1" '[{"id":"wa-capped-oc6knj","priority":1,"assignee":null,"description":"fixture body","issue_type":"task","labels":["pilot:reclaim-count:3"]}]')"
-if echo "$LOG_TUE2" | grep -q "pool top-up"; then
+if echo "$LOG_TUE2" | grep "pool top-up" >/dev/null; then
   bad "topup: attempted a spawn for a bead at the reclaim cap — should be a silent no-op, same as the worker probe's own reclaim-cap exclusion (log: $LOG_TUE2)"
 else
   ok "topup: correctly no-ops when the only routed candidate is at the reclaim cap"
@@ -7224,7 +7224,7 @@ echo "Scenario CAPQ-K (ga-in9ebr AC5): the bead a pool-cap QUEUE leaves behind i
 # bead from it, it only lied to everything else. Asserts on the "pool top-up … <id>" log line, like the
 # TOPUP-ELIGIBILITY scenarios (this harness has no `timeout`, so the spawn call itself 127s).
 LOG_CQK="$(run_topup_candidates_scenario "3" '[{"id":"wa-capq-topup","priority":2,"assignee":null,"description":"fixture body","issue_type":"feature","labels":["story:approved","lane:small"],"metadata":{"gc.routed_to":"wa-worker","story.rig":"whatsapp_automation"}}]')"
-if echo "$LOG_CQK" | grep -q "pool top-up.*wa-capq-topup"; then
+if echo "$LOG_CQK" | grep "pool top-up.*wa-capq-topup" >/dev/null; then
   ok "CAPQ-K: a pool-cap-queued bead is picked by the pool top-up once a slot is free (ga-93yxc not regressed)"
 else
   bad "CAPQ-K: the top-up did NOT pick the bead a pool-cap QUEUE leaves behind — a freed slot would idle (AC5 regression)"
@@ -7293,12 +7293,12 @@ fi
 
 echo "Scenario TOPUP-ELIGIBILITY-4: a routed exec:manual candidate is skipped (via the newly-chained _filter_exec_manual) in favor of an eligible sibling"
 LOG_TUE4="$(run_topup_candidates_scenario "3" '[{"id":"wa-manual-oc6knj","priority":1,"assignee":null,"description":"fixture body","issue_type":"task","labels":["exec:manual"]},{"id":"wa-eligible4-oc6knj","priority":1,"assignee":null,"description":"fixture body","issue_type":"task","labels":[]}]')"
-if echo "$LOG_TUE4" | grep -q "pool top-up.*wa-eligible4-oc6knj"; then
+if echo "$LOG_TUE4" | grep "pool top-up.*wa-eligible4-oc6knj" >/dev/null; then
   ok "topup: spawns for the eligible sibling when the other routed candidate carries exec:manual"
 else
   bad "topup: did NOT spawn for wa-eligible4-oc6knj — exec:manual filtering not wired in, or over-broad (log: $LOG_TUE4)"
 fi
-if echo "$LOG_TUE4" | grep -q "wa-manual-oc6knj"; then
+if echo "$LOG_TUE4" | grep "wa-manual-oc6knj" >/dev/null; then
   bad "topup: spawned (or considered) the exec:manual candidate — gate_run=ga-8pv70k regression, top-up ignoring a signal the worker probe's own --exclude-label already respects"
 else
   ok "topup: never considers the exec:manual candidate"
@@ -7306,12 +7306,12 @@ fi
 
 echo "Scenario TOPUP-ELIGIBILITY-5: a routed candidate with an EPIC-prefixed title (issue_type mistagged as non-epic) is skipped in favor of an eligible sibling"
 LOG_TUE5="$(run_topup_candidates_scenario "3" '[{"id":"wa-epic-oc6knj","priority":1,"assignee":null,"description":"fixture body","issue_type":"task","title":"EPIC: land assembly overhaul","labels":[]},{"id":"wa-eligible5-oc6knj","priority":1,"assignee":null,"description":"fixture body","issue_type":"task","labels":[]}]')"
-if echo "$LOG_TUE5" | grep -q "pool top-up.*wa-eligible5-oc6knj"; then
+if echo "$LOG_TUE5" | grep "pool top-up.*wa-eligible5-oc6knj" >/dev/null; then
   ok "topup: spawns for the eligible sibling when the other routed candidate has an EPIC-prefixed title"
 else
   bad "topup: did NOT spawn for wa-eligible5-oc6knj — EPIC-title defense-in-depth not wired in, or over-broad (log: $LOG_TUE5)"
 fi
-if echo "$LOG_TUE5" | grep -q "wa-epic-oc6knj"; then
+if echo "$LOG_TUE5" | grep "wa-epic-oc6knj" >/dev/null; then
   bad "topup: spawned (or considered) the EPIC-titled candidate — --exclude-type=epic alone missed it (issue_type was mistagged task) and the title-regex defense-in-depth the worker probe relies on (ga-7ha7g) is missing from top-up"
 else
   ok "topup: never considers the EPIC-titled candidate"
@@ -7362,7 +7362,7 @@ run_topup_rig_scenario() {
 
 echo "Scenario TOPUP-RIG-1: HQ has no routed-unassigned bead but a RIG store does → still spawns (ga-q0ewpu)"
 LOG_TUR1="$(run_topup_rig_scenario "3" "wa-rig-pending1" "0")"
-if echo "$LOG_TUR1" | grep -q "ga-93yxc: pool top-up — wa-worker has free capacity (live=3 < 4) and wa-rig-pending1 is routed+unassigned with no worker from a prior sweep — spawning."; then
+if echo "$LOG_TUR1" | grep "ga-93yxc: pool top-up — wa-worker has free capacity (live=3 < 4) and wa-rig-pending1 is routed+unassigned with no worker from a prior sweep — spawning." >/dev/null; then
   ok "topup: finds a rig-native routed-unassigned bead when HQ has none, and spawns for it (ga-q0ewpu fix present)"
 else
   bad "topup: did NOT spawn for a rig-native pending bead despite HQ being empty — ga-q0ewpu regression (rig-native routed beads strand at pool-cap forever, same as the live wa-52q8u/wa-ah359/wa-c1hgd incident)"
@@ -7370,7 +7370,7 @@ fi
 
 echo "Scenario TOPUP-RIG-2: HQ empty AND no rig has a pending bead either → correctly no-ops"
 LOG_TUR2="$(run_topup_rig_scenario "1" "" "0")"
-if echo "$LOG_TUR2" | grep -q "ga-93yxc: pool top-up"; then
+if echo "$LOG_TUR2" | grep "ga-93yxc: pool top-up" >/dev/null; then
   bad "topup: attempted a spawn with no pending bead in HQ or any rig — should be a silent no-op"
 else
   ok "topup: correctly no-ops when neither HQ nor any rig has a routed-unassigned bead"
@@ -7401,12 +7401,12 @@ NS_ORACLE_SESS='{"sessions":[{"session_name":"oracle-wa","closed":false}]}'
 NS_PHANTOM='[{"id":"tt-ns-phantom","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
 echo "Scenario 16s: phantom-guard — stale crew-owned bead with no branch is released"
 LOG16S="$(run_neverstarted "$NS_PHANTOM" "" "$NS_ORACLE_SESS" '{"tt-ns-phantom":"oracle-wa"}' "" "" "tt-ns-phantom")"
-if echo "$LOG16S" | grep -q "releasing never-started in-flight bead tt-ns-phantom"; then
+if echo "$LOG16S" | grep "releasing never-started in-flight bead tt-ns-phantom" >/dev/null; then
   ok "phantom-guard: stale crew-assigned bead with no branch is released (FOLLOW-UP #1)"
 else
   bad "phantom-guard DID NOT release stale crew-assigned no-branch bead tt-ns-phantom (still blocking wa-worker pool)"
 fi
-if echo "$LOG16S" | grep -q "refusing to release"; then
+if echo "$LOG16S" | grep "refusing to release" >/dev/null; then
   bad "phantom-guard still logged 'refusing to release' for phantom bead tt-ns-phantom (ga-9yb5s not phantom-aware)"
 else
   ok "phantom-guard: 'refusing to release' log NOT emitted for phantom bead (correct)"
@@ -7416,7 +7416,7 @@ fi
 NS_PHANTOM_BR='[{"id":"tt-ns-phantom-br","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
 echo "Scenario 16t: phantom-guard — crew-owned bead WITH a branch is kept (active build)"
 LOG16T="$(run_neverstarted "$NS_PHANTOM_BR" "" "$NS_ORACLE_SESS" '{"tt-ns-phantom-br":"oracle-wa"}' "" "tt-ns-phantom-br" "tt-ns-phantom-br")"
-if echo "$LOG16T" | grep -q "releasing never-started in-flight bead tt-ns-phantom-br"; then
+if echo "$LOG16T" | grep "releasing never-started in-flight bead tt-ns-phantom-br" >/dev/null; then
   bad "REGRESSION (phantom-guard): released a crew-owned bead that HAS a branch (active build stolen)"
 else
   ok "phantom-guard KEEPS crew-owned bead when a branch exists (active build protected)"
@@ -7429,7 +7429,7 @@ echo "Scenario 16u: phantom-guard — recent crew-owned bead (no branch, <45min)
 # PILOT_TEST_PHANTOM_STALE_BEADS is empty → the guard uses the timestamp path;
 # since the bd shim returns no updated_at the epoch parse yields 0 → fail-conservative KEEP.
 LOG16U="$(run_neverstarted "$NS_PHANTOM_FR" "" "$NS_ORACLE_SESS" '{"tt-ns-phantom-fr":"oracle-wa"}' "" "" "")"
-if echo "$LOG16U" | grep -q "releasing never-started in-flight bead tt-ns-phantom-fr"; then
+if echo "$LOG16U" | grep "releasing never-started in-flight bead tt-ns-phantom-fr" >/dev/null; then
   bad "REGRESSION (phantom-guard): released a crew-owned bead that is within the 45min window"
 else
   ok "phantom-guard KEEPS crew-owned bead that is within the staleness window (recent claim safe)"
@@ -7457,7 +7457,7 @@ has "$DISPATCHER" 'phantom: stale.*no branch'            "phantom-guard release 
 echo "Scenario 16w: ga-d2jil — a sling carrying a gate:* label protects the bead even with a dead-looking builder session"
 NS_ATGATE='[{"id":"tt-ns-atgate","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-atgate"}}]'
 LOG16W="$(run_neverstarted "$NS_ATGATE" "" "$NS_SESS" '{"tt-sling-atgate":"ghost-wa"}' "" "" "" '{"tt-sling-atgate":"gate:reviewing"}')"
-if echo "$LOG16W" | grep -q "releasing never-started in-flight bead tt-ns-atgate"; then
+if echo "$LOG16W" | grep "releasing never-started in-flight bead tt-ns-atgate" >/dev/null; then
   bad "REGRESSION (ga-d2jil): released a bead whose SLING carries a gate:* label (already reached the gate — false double-dispatch)"
 else
   ok "bead kept when its sling/task carries a gate:* label, even with a provably-dead builder session (ga-d2jil)"
@@ -7469,7 +7469,7 @@ fi
 echo "Scenario 16x: ga-d2jil control — dead-worker sling with NO gate label still releases (16f unchanged)"
 NS_DEAD2='[{"id":"tt-ns-dead2","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-dead2"}}]'
 LOG16X="$(run_neverstarted "$NS_DEAD2" "" "$NS_SESS" '{"tt-sling-dead2":"ghost-wa"}')"
-if echo "$LOG16X" | grep -q "releasing never-started in-flight bead tt-ns-dead2"; then
+if echo "$LOG16X" | grep "releasing never-started in-flight bead tt-ns-dead2" >/dev/null; then
   ok "control: dead-worker sling with no gate label still releases (ga-d2jil did not weaken 16f)"
 else
   bad "REGRESSION (ga-d2jil control): a dead-worker sling with NO gate label was kept (over-protection introduced)"
@@ -7547,17 +7547,17 @@ run_ps_worker_dispatch() {
 
 echo "Scenario PS-WORKER-A: property_scrapers rig-native story:approved bead routes to ps-worker (NOT batista-ps)"
 LOG_PSW="$(run_ps_worker_dispatch "[]" "$PS_WORKER_FX" "0")"
-if echo "$LOG_PSW" | grep -q "Builder target: ps-worker"; then
+if echo "$LOG_PSW" | grep "Builder target: ps-worker" >/dev/null; then
   ok "ps-worker: Builder target is ps-worker (property_scrapers routing correct)"
 else
   bad "ps-worker: Builder target is NOT ps-worker — routing broken (expected ps-worker, not batista-ps)"
 fi
-if echo "$LOG_PSW" | grep -q "session new ps-worker --no-attach"; then
+if echo "$LOG_PSW" | grep "session new ps-worker --no-attach" >/dev/null; then
   ok "ps-worker: DRY_RUN log shows rig-native spawn 'WOULD: gc ... session new ps-worker --no-attach'"
 else
   bad "ps-worker: 'session new ps-worker --no-attach' NOT in log — spawn arm missing or rig-native path not triggered"
 fi
-if echo "$LOG_PSW" | grep -q "batista-ps"; then
+if echo "$LOG_PSW" | grep "batista-ps" >/dev/null; then
   bad "ps-worker: batista-ps appeared in dispatch log — old routing NOT replaced"
 else
   ok "ps-worker: batista-ps NOT in dispatch log (routing correctly migrated to ps-worker)"
@@ -7613,12 +7613,12 @@ LOG_POA="$(run_ps_worker_dispatch_own_guard "[]" "$PS_WORKER_FX" "0" "ps-test1" 
 # guard as the pass condition (both give the identical collision-safe outcome); signal-(a)
 # logic itself already has isolated unit coverage under Scenario 22h (ga-htjni). The
 # ga-sndpm call site's continued existence is verified structurally below (POOL-OWN-STRUCT).
-if echo "$LOG_POA" | grep -Eq "ga-(htjni|sndpm): REFUSING (routed-pool )?dispatch of ps-test1"; then
+if echo "$LOG_POA" | grep -E "ga-(htjni|sndpm): REFUSING (routed-pool )?dispatch of ps-test1" >/dev/null; then
   ok "pool-own(a): routed-pool dispatch refused when a crew branch already exists for the candidate"
 else
   bad "pool-own(a): REGRESSION — no ownership-guard refusal logged; a bead with an existing crew branch would still get gc.routed_to stamped (collision risk)"
 fi
-if echo "$LOG_POA" | grep -q "session new ps-worker --no-attach"; then
+if echo "$LOG_POA" | grep "session new ps-worker --no-attach" >/dev/null; then
   bad "pool-own(a): REGRESSION — pool worker spawn happened despite an existing crew branch for the candidate"
 else
   ok "pool-own(a): pool worker spawn correctly skipped"
@@ -7626,7 +7626,7 @@ fi
 # ga-8jxe1 AC4: this real end-to-end sweep (1 candidate, 1 ownership-guard refusal)
 # is exactly the shape that made the original bug hard to diagnose — the log used
 # to say only "dispatched=0" with no hint the guard was the cause.
-if echo "$LOG_POA" | grep -q "ga-8jxe1: ownership-guard vetoed 1 candidate(s) this sweep."; then
+if echo "$LOG_POA" | grep "ga-8jxe1: ownership-guard vetoed 1 candidate(s) this sweep." >/dev/null; then
   ok "ga-8jxe1 AC4: sweep summary reports the ownership-guard veto count for a real refusal (was invisible before)"
 else
   bad "ga-8jxe1 AC4: REGRESSION — veto count missing from the sweep summary despite a real ownership-guard refusal"
@@ -7636,12 +7636,12 @@ echo "Scenario POOL-OWN-D (ga-sndpm): routed-pool dispatch REFUSED when candidat
 LOG_POD="$(run_ps_worker_dispatch_own_guard "[]" "$PS_WORKER_FX" "0" "" "ps-test1")"
 # ga-6hkzy: same static-seam reasoning as POOL-OWN-A above — ga-htjni fires first with
 # "(gating:active)" and the dispatch never reaches the ga-sndpm re-verification call site.
-if echo "$LOG_POD" | grep -Eq "ga-(htjni|sndpm): REFUSING (routed-pool )?dispatch of ps-test1"; then
+if echo "$LOG_POD" | grep -E "ga-(htjni|sndpm): REFUSING (routed-pool )?dispatch of ps-test1" >/dev/null; then
   ok "pool-own(d): routed-pool dispatch refused when an active gate marker already exists for the candidate"
 else
   bad "pool-own(d): REGRESSION — no ownership-guard refusal logged; a bead being actively gated would still get gc.routed_to stamped (collision risk)"
 fi
-if echo "$LOG_POD" | grep -q "session new ps-worker --no-attach"; then
+if echo "$LOG_POD" | grep "session new ps-worker --no-attach" >/dev/null; then
   bad "pool-own(d): REGRESSION — pool worker spawn happened despite an active gate marker for the candidate"
 else
   ok "pool-own(d): pool worker spawn correctly skipped"
@@ -7649,19 +7649,19 @@ fi
 
 echo "Scenario POOL-OWN-CTL (ga-sndpm): control — routed-pool dispatch STILL proceeds when candidate is genuinely free"
 LOG_POCTL="$(run_ps_worker_dispatch_own_guard "[]" "$PS_WORKER_FX" "0" "" "")"
-if echo "$LOG_POCTL" | grep -q "ga-sndpm: REFUSING routed-pool dispatch"; then
+if echo "$LOG_POCTL" | grep "ga-sndpm: REFUSING routed-pool dispatch" >/dev/null; then
   bad "pool-own(control): REGRESSION — a genuinely free candidate was refused (over-blocking)"
 else
   ok "pool-own(control): a genuinely free candidate is NOT refused (no over-blocking)"
 fi
-if echo "$LOG_POCTL" | grep -q "session new ps-worker --no-attach"; then
+if echo "$LOG_POCTL" | grep "session new ps-worker --no-attach" >/dev/null; then
   ok "pool-own(control): pool worker spawn still proceeds for a genuinely free candidate"
 else
   bad "pool-own(control): REGRESSION — pool worker spawn missing even with no competing ownership signal"
 fi
 # ga-8jxe1 AC4 control: zero refusals this sweep → the summary line must stay
 # absent entirely, not print "vetoed 0 candidate(s)" noise every sweep.
-if echo "$LOG_POCTL" | grep -q "ownership-guard vetoed"; then
+if echo "$LOG_POCTL" | grep "ownership-guard vetoed" >/dev/null; then
   bad "ga-8jxe1 AC4: veto-count line appeared despite ZERO refusals this sweep (should stay silent when nothing was vetoed)"
 else
   ok "ga-8jxe1 AC4: veto-count line correctly absent when nothing was vetoed this sweep"
@@ -7697,7 +7697,7 @@ QM7U_BUG_NONE='[{"id":"ga-qm7ut0","title":"qm7u no reclaim-count fixture","prior
 
 echo "Scenario QM7U-a (ga-qm7u): pilot:reclaim-count:1 → live-verify-first section injected into dispatch prompt"
 LOG_QM7U_A="$(run_capacity_reuse 1 "$QM7U_BUG_RC1" "$GT4_SESS_NONE")"
-if echo "$LOG_QM7U_A" | grep -q "ga-qm7ut1 has pilot:reclaim-count:1 — injecting live-verify-first section"; then
+if echo "$LOG_QM7U_A" | grep "ga-qm7ut1 has pilot:reclaim-count:1 — injecting live-verify-first section" >/dev/null; then
   ok "ga-qm7u: reclaim-count:1 candidate gets the live-verify-first section injected"
 else
   bad "ga-qm7u: reclaim-count:1 candidate did NOT get the live-verify-first section injected (log: $LOG_QM7U_A)"
@@ -7705,7 +7705,7 @@ fi
 
 echo "Scenario QM7U-b (ga-qm7u): pilot:reclaim-count:2 → live-verify-first section still injected"
 LOG_QM7U_B="$(run_capacity_reuse 1 "$QM7U_BUG_RC2" "$GT4_SESS_NONE")"
-if echo "$LOG_QM7U_B" | grep -q "ga-qm7ut2 has pilot:reclaim-count:2 — injecting live-verify-first section"; then
+if echo "$LOG_QM7U_B" | grep "ga-qm7ut2 has pilot:reclaim-count:2 — injecting live-verify-first section" >/dev/null; then
   ok "ga-qm7u: reclaim-count:2 candidate gets the live-verify-first section injected"
 else
   bad "ga-qm7u: reclaim-count:2 candidate did NOT get the live-verify-first section injected (log: $LOG_QM7U_B)"
@@ -7713,7 +7713,7 @@ fi
 
 echo "Scenario QM7U-c (ga-qm7u): no pilot:reclaim-count label → section NOT injected (no regression on common case)"
 LOG_QM7U_C="$(run_capacity_reuse 1 "$QM7U_BUG_NONE" "$GT4_SESS_NONE")"
-if echo "$LOG_QM7U_C" | grep -q "injecting live-verify-first section"; then
+if echo "$LOG_QM7U_C" | grep "injecting live-verify-first section" >/dev/null; then
   bad "ga-qm7u: REGRESSION — live-verify-first section injected with no reclaim-count history (log: $LOG_QM7U_C)"
 else
   ok "ga-qm7u: no reclaim-count label → section correctly NOT injected"
@@ -7729,7 +7729,7 @@ fi
 echo "Scenario QM7U-d (ga-qm7u): feature-tier (story:approved) candidate with pilot:reclaim-count:1 → live-verify-first section injected (covers the OTHER DISPATCH_TASK template)"
 QM7U_FEATURE_RC1='[{"id":"ga-qm7utf1","title":"qm7u feature-tier reclaim-count 1 fixture","priority":2,"issue_type":"feature","description":"fixture body — context for veto test","status":"open","labels":["story:approved","pilot:reclaim-count:1"],"assignee":null,"created_at":"2026-06-01T00:00:04Z","metadata":{"story.criterios":"fixture acceptance criteria for veto test"}}]'
 LOG_QM7U_D="$(run_hq_tier2 "$QM7U_FEATURE_RC1")"
-if echo "$LOG_QM7U_D" | grep -q "ga-qm7utf1 has pilot:reclaim-count:1 — injecting live-verify-first section"; then
+if echo "$LOG_QM7U_D" | grep "ga-qm7utf1 has pilot:reclaim-count:1 — injecting live-verify-first section" >/dev/null; then
   ok "ga-qm7u: feature-tier candidate with reclaim-count:1 gets the live-verify-first section injected (story/feature DISPATCH_TASK template covered)"
 else
   bad "ga-qm7u: feature-tier candidate with reclaim-count:1 did NOT get the live-verify-first section injected (log: $LOG_QM7U_D)"
@@ -7904,7 +7904,7 @@ else
   bad "ga-f7bek AC5: debug mode stdout is not the expected clean JSON (log-line leakage?): '$F7BEK_DEBUG_STDOUT'"
 fi
 F7BEK_DEBUG_STDERR="$(export PILOT_DISPATCH_GATES_DEBUG=1; printf '%s' "$F7BEK_FIXTURE" | _filter_dispatch_gates 2>&1 >/dev/null)"
-if printf '%s' "$F7BEK_DEBUG_STDERR" | grep -q "veto id=wa-like-4e2m8" && printf '%s' "$F7BEK_DEBUG_STDERR" | grep -q "veto id=wa-like-athos-decide"; then
+if printf '%s' "$F7BEK_DEBUG_STDERR" | grep "veto id=wa-like-4e2m8" >/dev/null && printf '%s' "$F7BEK_DEBUG_STDERR" | grep "veto id=wa-like-athos-decide" >/dev/null; then
   ok "ga-f7bek AC5: debug mode attributes per-bead veto reasons to stderr (wa-like-4e2m8, wa-like-athos-decide)"
 else
   bad "ga-f7bek AC5: debug mode did not log the expected per-bead vetoes (stderr: '$F7BEK_DEBUG_STDERR')"
@@ -7979,21 +7979,21 @@ echo "Scenario ga-zzqza-a: HQ-only path (created_by=*-wa) → dog, owner-authori
 HQPATH_WA='[{"id":"ga-hqpathwa","title":"tidy up scripts/root-class-count.sh output formatting","priority":2,"issue_type":"bug","description":"cosmetic fix to scripts/root-class-count.sh — no product keyword whatsoever","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"mila-wa","created_at":"2026-07-24T00:00:01Z","metadata":{}}]'
 LOG_ZZQZA_A="$(PILOT_TEST_RIG_HAS_FILE=gascity run_capacity 10 "[]" 1 "$HQPATH_WA")"
 B_ZZQZA_A="$(dispatched_builder "$LOG_ZZQZA_A")"
-if echo "$B_ZZQZA_A" | grep -qE '^gastown\.dog'; then
+if echo "$B_ZZQZA_A" | grep -E '^gastown\.dog' >/dev/null; then
   ok "HQ-only path (*-wa owner) → dog, per Mayor ruling (owner-authoritative preempted)"
 elif [ -z "$B_ZZQZA_A" ]; then
   bad "REGRESSION (ga-zzqza): HQ-only path bead DEFERRED/held instead of dispatched to dog — new guard did not fire"
 else
   bad "ga-zzqza-a routed unexpectedly (got: '${B_ZZQZA_A:-none}')"
 fi
-echo "$LOG_ZZQZA_A" | grep -q "ga-zzqza: ga-hqpathwa cites path(s) present in HQ" && ok "ga-zzqza guard logged the HQ-only verdict" || bad "ga-zzqza guard did not log (expected fire)"
-echo "$LOG_ZZQZA_A" | grep -q "ga-nlh79.*owner-authoritative" && bad "REGRESSION: owner-authoritative (ga-nlh79) STILL fired despite HQ-only path — should have been preempted" || ok "owner-authoritative correctly did NOT fire (preempted by HQ-only path)"
+echo "$LOG_ZZQZA_A" | grep "ga-zzqza: ga-hqpathwa cites path(s) present in HQ" >/dev/null && ok "ga-zzqza guard logged the HQ-only verdict" || bad "ga-zzqza guard did not log (expected fire)"
+echo "$LOG_ZZQZA_A" | grep "ga-nlh79.*owner-authoritative" >/dev/null && bad "REGRESSION: owner-authoritative (ga-nlh79) STILL fired despite HQ-only path — should have been preempted" || ok "owner-authoritative correctly did NOT fire (preempted by HQ-only path)"
 
 echo "Scenario ga-zzqza-b: HQ-only path (created_by=ps-worker) → dog too (guard is owner-agnostic, not WA-only)"
 HQPATH_PS='[{"id":"ga-hqpathps","title":"tidy up scripts/root-class-count.sh output formatting","priority":2,"issue_type":"bug","description":"cosmetic fix to scripts/root-class-count.sh — no product keyword whatsoever","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"ps-worker-1","created_at":"2026-07-24T00:00:02Z","metadata":{}}]'
 LOG_ZZQZA_B="$(PILOT_TEST_RIG_HAS_FILE=gascity run_capacity 10 "[]" 1 "$HQPATH_PS")"
 B_ZZQZA_B="$(dispatched_builder "$LOG_ZZQZA_B")"
-if echo "$B_ZZQZA_B" | grep -qE '^gastown\.dog'; then
+if echo "$B_ZZQZA_B" | grep -E '^gastown\.dog' >/dev/null; then
   ok "HQ-only path (ps-worker owner) → dog too (guard is symmetric across WA/PS owners)"
 elif [ "$B_ZZQZA_B" = batista-ps ]; then
   bad "REGRESSION (ga-zzqza): HQ-only path bead misrouted to batista-ps — owner-authoritative not preempted for PS owner"
@@ -8006,16 +8006,16 @@ LOG_ZZQZA_C="$(PILOT_TEST_RIG_HAS_FILE="gascity whatsapp_automation" run_capacit
 B_ZZQZA_C="$(dispatched_builder "$LOG_ZZQZA_C")"
 if [ "$B_ZZQZA_C" = batista-ps ]; then
   bad "REGRESSION: ambiguous-path bead misrouted to batista-ps"
-elif echo "$B_ZZQZA_C" | grep -qE '^gastown\.dog'; then
+elif echo "$B_ZZQZA_C" | grep -E '^gastown\.dog' >/dev/null; then
   bad "REGRESSION (ga-zzqza AMBIGUOUS case): path present in BOTH HQ and WA still forced to dog — should defer to owner-authoritative tie-break per Mayor ruling"
 else
   ok "ambiguous path (present in HQ AND WA) → owner-authoritative fallback wins (WA/held), NOT forced to dog"
 fi
-echo "$LOG_ZZQZA_C" | grep -q "ga-zzqza: ga-hqpathwa cites path" && bad "ga-zzqza guard wrongly fired on an AMBIGUOUS path (present in >1 rig)" || ok "ga-zzqza guard correctly stayed silent on the ambiguous case (tie-break defers to owner)"
+echo "$LOG_ZZQZA_C" | grep "ga-zzqza: ga-hqpathwa cites path" >/dev/null && bad "ga-zzqza guard wrongly fired on an AMBIGUOUS path (present in >1 rig)" || ok "ga-zzqza guard correctly stayed silent on the ambiguous case (tie-break defers to owner)"
 
 echo "Scenario ga-zzqza-d (kill-switch control): PILOT_HQ_PATH_EXISTS_GUARD=0 → NO preemption (guard disabled)"
 LOG_ZZQZA_D="$(PILOT_HQ_PATH_EXISTS_GUARD=0 PILOT_TEST_RIG_HAS_FILE=gascity run_capacity 10 "[]" 1 "$HQPATH_WA")"
-echo "$LOG_ZZQZA_D" | grep -q "ga-zzqza: ga-hqpathwa cites path" && bad "guard fired despite PILOT_HQ_PATH_EXISTS_GUARD=0" || ok "guard silent when disabled (kill-switch honored) — falls back to owner-authoritative"
+echo "$LOG_ZZQZA_D" | grep "ga-zzqza: ga-hqpathwa cites path" >/dev/null && bad "guard fired despite PILOT_HQ_PATH_EXISTS_GUARD=0" || ok "guard silent when disabled (kill-switch honored) — falls back to owner-authoritative"
 
 echo "Scenario ga-zzqza: drift-guard — HQ-path-existence guard is wired"
 has "$DISPATCHER" 'ga-zzqza'                       "ga-zzqza HQ-path-existence guard is wired"
@@ -8064,7 +8064,7 @@ echo "Scenario ga-r4jnu-b: end-to-end — the EXACT live adjacency (domain bead,
 DOMTEST_BEAD='{"id":"ga-r4domtest","title":"code-mode MCP servers configuration for context injection","priority":1,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"mila-wa","created_at":"2026-07-26T00:00:01Z","metadata":{}}'
 R4JNU_SEQ="[${DOMTEST_BEAD},${DISKLEAK_BEAD}]"
 LOG_R4JNU="$(run_capacity 10 "[]" 1 "$R4JNU_SEQ")"
-echo "$LOG_R4JNU" | grep -q "ga-nlh79: ga-r4domtest owner-authoritative rig.*whatsapp_automation" \
+echo "$LOG_R4JNU" | grep "ga-nlh79: ga-r4domtest owner-authoritative rig.*whatsapp_automation" >/dev/null \
   && ok "sequence setup faithful: the genuine WA domain bead (first claim) still classifies whatsapp_automation via owner-authoritative inference, exactly like ga-lt2dz" \
   || bad "sequence setup broken: the domain bead no longer classifies whatsapp_automation — test no longer reproduces the real adjacency"
 # ga-7ti1t (Mayor re-scope, landed AFTER this scenario was written): created_by=mila-wa
@@ -8073,14 +8073,14 @@ echo "$LOG_R4JNU" | grep -q "ga-nlh79: ga-r4domtest owner-authoritative rig.*wha
 # BETTER outcome: this adjacency case is itself now fixed by ga-7ti1t). The refuse+hold
 # branch this scenario originally exercised is still live and still covered elsewhere
 # (Scenario 18ae, WA_PIPEDRIVE — no crew-shaped owner to infer from).
-if echo "$LOG_R4JNU" | grep -q "ga-7ti1t: ga-r4domtest has no rig-default crew for whatsapp_automation — inferred owner mila-wa"; then
+if echo "$LOG_R4JNU" | grep "ga-7ti1t: ga-r4domtest has no rig-default crew for whatsapp_automation — inferred owner mila-wa" >/dev/null; then
   ok "ga-7ti1t: the domain bead (mila-wa owner) is now inferred+dispatched instead of refused+held (this adjacency case is itself fixed)"
-elif echo "$LOG_R4JNU" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-r4domtest"; then
+elif echo "$LOG_R4JNU" | grep "REFUSING to dispatch whatsapp_automation domain build ga-r4domtest" >/dev/null; then
   bad "REGRESSION (ga-7ti1t): mila-wa-owned domain bead fell back to REFUSING+hold — owner inference did not fire"
 else
   bad "domain bead (first claim) routed unexpectedly — neither inferred+dispatched nor refused"
 fi
-if echo "$LOG_R4JNU" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-r4diskleak"; then
+if echo "$LOG_R4JNU" | grep "REFUSING to dispatch whatsapp_automation domain build ga-r4diskleak" >/dev/null; then
   bad "REGRESSION (ga-r4jnu): the generic disk-leak bead (second claim, right after a domain bead) was STILL falsely refused+held"
 else
   ok "ga-r4jnu FIXED: the generic disk-leak bead is NOT refused, despite following a genuine domain bead in the same pass"
@@ -8090,7 +8090,7 @@ fi
 # outcome by bead ID instead of the shared dispatched_builder() helper's blind head -1
 # (which would now grab the FIRST dispatch, ga-r4domtest/mila-wa, not this bead's).
 B_R4JNU="$(echo "$LOG_R4JNU" | grep -oE 'ga-r4diskleak → story:in-flight \(builder=[^ )]+' | sed -E 's/.*builder=//' | head -1)"
-echo "$B_R4JNU" | grep -qE '^gastown\.dog' && ok "disk-leak bead dispatched to the dog pool ($B_R4JNU) — the P1 that starved for days now flows" || bad "disk-leak bead routed unexpectedly (got: '${B_R4JNU:-none}')"
+echo "$B_R4JNU" | grep -E '^gastown\.dog' >/dev/null && ok "disk-leak bead dispatched to the dog pool ($B_R4JNU) — the P1 that starved for days now flows" || bad "disk-leak bead routed unexpectedly (got: '${B_R4JNU:-none}')"
 
 echo "Scenario ga-r4jnu-c: framework-dog-exempt reason (d) — area:infra label exempts even when bead_domain misses it AND the keyword isn't 'disparo'"
 # Decoupled from fix 1: this bead trips bead_content_rig via 'painel' (a DIFFERENT,
@@ -8102,13 +8102,13 @@ PAINEL_INFRA_BEAD='{"id":"ga-r4painel","title":"expose disk-floor-guard reap cou
 [ "$(_dom "$PAINEL_INFRA_BEAD")" != infra ] && ok "precondition: bead_domain does NOT classify this infra bead as infra (its allowlist misses disk-floor-guard/reap vocabulary)" || bad "precondition changed: bead_domain='$(_dom "$PAINEL_INFRA_BEAD")' — exemption (a) would already cover this"
 LOG_R4PAINEL="$(run_capacity 10 "[]" 1 "[$PAINEL_INFRA_BEAD]")"
 B_R4PAINEL="$(dispatched_builder "$LOG_R4PAINEL")"
-echo "$B_R4PAINEL" | grep -qE '^gastown\.dog' && ok "area:infra-labeled bead dispatched to the dog pool (exemption (d) fired)" || bad "REGRESSION: area:infra bead not dispatched (got: '${B_R4PAINEL:-none}')"
-echo "$LOG_R4PAINEL" | grep -q "framework-dog-exempt: ga-r4painel is gascity-framework work (area-infra-label)" && ok "exemption reason 'area-infra-label' logged" || bad "area-infra-label exemption not logged"
+echo "$B_R4PAINEL" | grep -E '^gastown\.dog' >/dev/null && ok "area:infra-labeled bead dispatched to the dog pool (exemption (d) fired)" || bad "REGRESSION: area:infra bead not dispatched (got: '${B_R4PAINEL:-none}')"
+echo "$LOG_R4PAINEL" | grep "framework-dog-exempt: ga-r4painel is gascity-framework work (area-infra-label)" >/dev/null && ok "exemption reason 'area-infra-label' logged" || bad "area-infra-label exemption not logged"
 
 echo "Scenario ga-r4jnu-d (control): SAME painel bead WITHOUT area:infra → still refused+held (proves the label, not something else, is what saves it)"
 PAINEL_NOLABEL='{"id":"ga-r4painelctl","title":"expose disk-floor-guard reap counters on the internal ops painel","priority":2,"issue_type":"task","description":"surface bytes-freed and files-removed counters on the internal status painel so the mayor can see reap velocity over time.","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-07-26T00:00:03Z","metadata":{}}'
 LOG_R4CTL="$(run_capacity 10 "[]" 1 "[$PAINEL_NOLABEL]")"
-echo "$LOG_R4CTL" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-r4painelctl" \
+echo "$LOG_R4CTL" | grep "REFUSING to dispatch whatsapp_automation domain build ga-r4painelctl" >/dev/null \
   && ok "control: without area:infra the same bead IS refused+held (proves exemption (d) — not some other accident — is what flips scenario ga-r4jnu-c)" \
   || bad "control failed: bead without area:infra was NOT refused (got builder='$(dispatched_builder "$LOG_R4CTL")') — cannot attribute ga-r4jnu-c's pass to the label"
 
@@ -8127,12 +8127,12 @@ has "$DISPATCHER" 'area-infra-label'      "area-infra-label exemption reason is 
 # (~140s) doesn't grow a second, slower way to test the same function.
 echo "Scenario ga-2n7xw-a: ga-lfvs6 domain-build hold #1 (busy crew, fresh bead) → held, NOT escalated"
 LOG_2N7XW_A="$(run_capacity 10 "$INFLIGHT18E" 1 "$PS_DOMAIN_SMALL" "$SESSIONS18E" "$SLINGMAP18E")"
-if echo "$LOG_2N7XW_A" | grep -qF "WOULD stamp pilot:held-count:ga-lfvs6:1 on ga-wgtest (hold 1/3)"; then
+if echo "$LOG_2N7XW_A" | grep -F "WOULD stamp pilot:held-count:ga-lfvs6:1 on ga-wgtest (hold 1/3)" >/dev/null; then
   ok "ga-lfvs6 1st hold stamps the counter at 1/3"
 else
   bad "ga-lfvs6 1st hold did not stamp the counter as expected"
 fi
-if echo "$LOG_2N7XW_A" | grep -qF "WOULD ESCALATE"; then
+if echo "$LOG_2N7XW_A" | grep -F "WOULD ESCALATE" >/dev/null; then
   bad "REGRESSION: ga-lfvs6 escalated on the very first hold (cap=3)"
 else
   ok "ga-lfvs6 1st hold correctly did NOT escalate"
@@ -8141,12 +8141,12 @@ fi
 echo "Scenario ga-2n7xw-b: ga-lfvs6 domain-build hold #3 (prior count=2 already on the bead) → ESCALATES, not another hold"
 PS_DOMAIN_SMALL_HELD2='[{"id":"ga-wgtest","title":"Mapeamento automatico de falecimento de proprietarios idosos (scraper RFB semanal)","priority":3,"issue_type":"feature","description":"fixture body — context for veto test","status":"open","labels":["lane:small","story:approved","pilot:held-count:ga-lfvs6:2"],"assignee":null,"created_at":"2026-06-12T00:00:01Z","metadata":{"story.o_que_e":"scraper semanal que verifica na Receita Federal o CPF dos proprietarios dos imoveis de interesse"}}]'
 LOG_2N7XW_B="$(run_capacity 10 "$INFLIGHT18E" 1 "$PS_DOMAIN_SMALL_HELD2" "$SESSIONS18E" "$SLINGMAP18E")"
-if echo "$LOG_2N7XW_B" | grep -qF "WOULD ESCALATE ga-wgtest (ga-lfvs6, hold 3/3) to Mayor"; then
+if echo "$LOG_2N7XW_B" | grep -F "WOULD ESCALATE ga-wgtest (ga-lfvs6, hold 3/3) to Mayor" >/dev/null; then
   ok "ga-lfvs6 3rd consecutive hold ESCALATES (by the ga-lfvs6-slug counter, not a generic side effect)"
 else
   bad "ga-lfvs6 3rd hold did not escalate as expected (log: $LOG_2N7XW_B)"
 fi
-if echo "$LOG_2N7XW_B" | grep -qF "WOULD stamp pilot:held-count:ga-lfvs6:3"; then
+if echo "$LOG_2N7XW_B" | grep -F "WOULD stamp pilot:held-count:ga-lfvs6:3" >/dev/null; then
   bad "REGRESSION: ga-lfvs6 3rd hold stamped ANOTHER hold instead of escalating"
 else
   ok "ga-lfvs6 3rd hold did not fall back to a plain hold"
@@ -8155,12 +8155,12 @@ fi
 echo "Scenario ga-2n7xw-c: ga-jazy9 lane:big hold #1 (generic, no domain match, no live owner) → held, leaves a trace (was: NONE at all pre-fix)"
 GENERIC_BIG_NOOWNER='[{"id":"ga-jazytest","title":"generic subsystem refactor","priority":2,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":["lane:big"],"assignee":null,"created_at":"2026-07-01T00:00:01Z","metadata":{}}]'
 LOG_2N7XW_C="$(run_capacity 10 "[]" 1 "$GENERIC_BIG_NOOWNER")"
-if echo "$LOG_2N7XW_C" | grep -qF "ga-jazy9: REFUSING to dispatch lane:big ga-jazytest"; then
+if echo "$LOG_2N7XW_C" | grep -F "ga-jazy9: REFUSING to dispatch lane:big ga-jazytest" >/dev/null; then
   ok "precondition: generic lane:big bead with no live owner hits the ga-jazy9 refusal (unchanged by this fix)"
 else
   bad "precondition failed: ga-jazy9 refusal did not fire for the generic lane:big fixture (got builder: $(dispatched_builder "$LOG_2N7XW_C"))"
 fi
-if echo "$LOG_2N7XW_C" | grep -qF "WOULD stamp pilot:held-count:ga-jazy9:1 on ga-jazytest (hold 1/3)"; then
+if echo "$LOG_2N7XW_C" | grep -F "WOULD stamp pilot:held-count:ga-jazy9:1 on ga-jazytest (hold 1/3)" >/dev/null; then
   ok "AC3: ga-jazy9 (the worst-of-3 site) now leaves a trace on the FIRST hold — previously left none at all"
 else
   bad "AC3 regression: ga-jazy9 did not stamp a counter on its first hold"
@@ -8169,7 +8169,7 @@ fi
 echo "Scenario ga-2n7xw-d: ga-jazy9 lane:big hold #3 (prior count=2) → ESCALATES"
 GENERIC_BIG_HELD2='[{"id":"ga-jazytest","title":"generic subsystem refactor","priority":2,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":["lane:big","pilot:held-count:ga-jazy9:2"],"assignee":null,"created_at":"2026-07-01T00:00:01Z","metadata":{}}]'
 LOG_2N7XW_D="$(run_capacity 10 "[]" 1 "$GENERIC_BIG_HELD2")"
-if echo "$LOG_2N7XW_D" | grep -qF "WOULD ESCALATE ga-jazytest (ga-jazy9, hold 3/3) to Mayor"; then
+if echo "$LOG_2N7XW_D" | grep -F "WOULD ESCALATE ga-jazytest (ga-jazy9, hold 3/3) to Mayor" >/dev/null; then
   ok "ga-jazy9 3rd consecutive hold ESCALATES via the ga-jazy9-slug counter"
 else
   bad "ga-jazy9 3rd hold did not escalate as expected (log: $LOG_2N7XW_D)"
@@ -8184,12 +8184,12 @@ fi
 # no capability) from scenario ga-2n7xw-d above — same fixture, new assertion
 # on the escalation TEXT rather than just the fact that it escalated.
 echo "Scenario ga-r7h3lf-a: ga-jazy9 escalation for a no-crew-capability rig (gascity) states the real fact and does NOT prescribe impossible advice"
-if echo "$LOG_2N7XW_D" | grep -qF "to Mayor: lane:big story in rig gascity, which has NO persistent-crew build path at all"; then
+if echo "$LOG_2N7XW_D" | grep -F "to Mayor: lane:big story in rig gascity, which has NO persistent-crew build path at all" >/dev/null; then
   ok "AC: escalation reason states plainly that gascity has no persistent-crew build path"
 else
   bad "AC regression: escalation reason did not state the no-crew-capability fact for gascity (log: $LOG_2N7XW_D) — this is the RED state pre-fix (rig_has_persistent_crew_capability not yet implemented/wired)"
 fi
-if echo "$LOG_2N7XW_D" | grep -qF "to Mayor: lane:big story with no live persistent-crew owner — dogs"; then
+if echo "$LOG_2N7XW_D" | grep -F "to Mayor: lane:big story with no live persistent-crew owner — dogs" >/dev/null; then
   bad "REGRESSION: escalation reason reverted to the old generic (impossible-advice-adjacent) text for a no-capability rig"
 else
   ok "old generic reason text no longer appears for a no-capability rig"
@@ -8226,13 +8226,13 @@ DIGEST_BEAD='{"id":"ga-digesttest","title":"Digest: 2026-07-27","priority":2,"is
 echo "Scenario ga-mhbyc-b: framework-dog-exempt reason (e) — digest label exempts, dispatches to dog pool"
 LOG_DIGEST="$(run_capacity 10 "[]" 1 "[$DIGEST_BEAD]")"
 B_DIGEST="$(dispatched_builder "$LOG_DIGEST")"
-echo "$B_DIGEST" | grep -qE '^gastown\.dog' && ok "digest-labeled bead dispatched to the dog pool (exemption (e) fired)" || bad "REGRESSION (ga-mhbyc): digest bead not dispatched (got: '${B_DIGEST:-none}')"
-echo "$LOG_DIGEST" | grep -q "framework-dog-exempt: ga-digesttest is gascity-framework work (digest-label)" && ok "exemption reason 'digest-label' logged" || bad "digest-label exemption not logged"
+echo "$B_DIGEST" | grep -E '^gastown\.dog' >/dev/null && ok "digest-labeled bead dispatched to the dog pool (exemption (e) fired)" || bad "REGRESSION (ga-mhbyc): digest bead not dispatched (got: '${B_DIGEST:-none}')"
+echo "$LOG_DIGEST" | grep "framework-dog-exempt: ga-digesttest is gascity-framework work (digest-label)" >/dev/null && ok "exemption reason 'digest-label' logged" || bad "digest-label exemption not logged"
 
 echo "Scenario ga-mhbyc-c (control): SAME digest body WITHOUT the digest label → still refused+held (proves the label, not something else, is what saves it)"
 DIGEST_NOLABEL='{"id":"ga-digestctl","title":"Digest: 2026-07-27","priority":2,"issue_type":"task","description":"# Gas Town Daily Digest: 2026-07-27\n\n## By Rig\n| Rig | Filed | Closed | Merges | Notes |\n|-----|-------|--------|--------|-------|\n| gascity (HQ) | 163 | 5172 | 2 | HQ + core |\n| property_scrapers | 0 | 0 | 0 | independent repo, quiet day |\n| whatsapp_automation | 4 | 22 | 0 | independent repo |\n","status":"open","labels":["daily"],"assignee":null,"created_at":"2026-07-28T14:59:05Z","metadata":{}}'
 LOG_DIGESTCTL="$(run_capacity 10 "[]" 1 "[$DIGEST_NOLABEL]")"
-echo "$LOG_DIGESTCTL" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-digestctl" \
+echo "$LOG_DIGESTCTL" | grep "REFUSING to dispatch whatsapp_automation domain build ga-digestctl" >/dev/null \
   && ok "control: without the digest label the same bead IS refused+held (proves exemption (e) — not some other accident — is what flips scenario ga-mhbyc-b)" \
   || bad "control failed: bead without digest label was NOT refused (got builder='$(dispatched_builder "$LOG_DIGESTCTL")') — cannot attribute ga-mhbyc-b's pass to the label"
 
@@ -8312,27 +8312,27 @@ Y1M40_RIG_BUG='[{"id":"wa-y1m40rig","title":"rig bug fixture, buildable","priori
 
 echo "Scenario ga-y1m40-a (AC1): HQ candidate vetoed (dispatched=0) + rig has buildable work + free slots -> rig candidate IS dispatched"
 LOG_Y1M40A="$(run_y1m40 "$Y1M40_HQ_VETOED" "tt-y1m40-hq" "$Y1M40_RIG_BUG")"
-if echo "$LOG_Y1M40A" | grep -q "Task title:.*wa-y1m40rig"; then
+if echo "$LOG_Y1M40A" | grep "Task title:.*wa-y1m40rig" >/dev/null; then
   ok "ga-y1m40 AC1: rig candidate (wa-y1m40rig) IS picked/dispatched after the sole HQ candidate was vetoed"
 else
   bad "ga-y1m40 AC1 REGRESSION: rig candidate NOT dispatched even though HQ's only candidate was vetoed and slots were free — the exact 4h-stall bug"
 fi
-if echo "$LOG_Y1M40A" | grep -q "ga-y1m40: HQ pool had candidate(s) but dispatched=0"; then
+if echo "$LOG_Y1M40A" | grep "ga-y1m40: HQ pool had candidate(s) but dispatched=0" >/dev/null; then
   ok "ga-y1m40 AC1: the new post-lane fallback log line fired"
 else
   bad "ga-y1m40 AC1: post-lane fallback did not announce itself in the log"
 fi
-if echo "$LOG_Y1M40A" | grep -qE "dispatched=1 "; then
+if echo "$LOG_Y1M40A" | grep -E "dispatched=1 " >/dev/null; then
   ok "ga-y1m40 AC1: sweep summary reports dispatched=1 (rescued by the rig fallback, not stuck at 0)"
 else
   bad "ga-y1m40 AC1: sweep summary did not report a successful dispatch"
 fi
-if echo "$LOG_Y1M40A" | grep -q "ga-htjni: REFUSING dispatch of tt-y1m40-hq"; then
+if echo "$LOG_Y1M40A" | grep "ga-htjni: REFUSING dispatch of tt-y1m40-hq" >/dev/null; then
   ok "ga-y1m40 AC1: precondition confirmed — the HQ candidate was actually refused by the ownership guard (not some other reason)"
 else
   bad "ga-y1m40 AC1: precondition failed — ownership guard did not refuse tt-y1m40-hq as expected"
 fi
-if echo "$LOG_Y1M40A" | grep -q "Task title:.*tt-y1m40-hq"; then
+if echo "$LOG_Y1M40A" | grep "Task title:.*tt-y1m40-hq" >/dev/null; then
   bad "ga-y1m40 AC1: the permanently-vetoed HQ bead (tt-y1m40-hq) was dispatched — ownership guard was bypassed, not respected"
 else
   ok "ga-y1m40 AC1: the permanently-vetoed HQ bead (tt-y1m40-hq) correctly never dispatches"
@@ -8340,17 +8340,17 @@ fi
 
 echo "Scenario ga-y1m40-b (AC2 non-regression): HQ candidate IS dispatchable -> HQ wins, rig fallback NEVER triggers (no inverted priority, no wasted scan)"
 LOG_Y1M40B="$(run_y1m40 "$Y1M40_HQ_FREE" "" "$Y1M40_RIG_BUG")"
-if echo "$LOG_Y1M40B" | grep -q "Task title:.*tt-y1m40-hqfree"; then
+if echo "$LOG_Y1M40B" | grep "Task title:.*tt-y1m40-hqfree" >/dev/null; then
   ok "ga-y1m40 AC2: a genuinely dispatchable HQ candidate still dispatches (HQ precedence intact)"
 else
   bad "ga-y1m40 AC2 REGRESSION: dispatchable HQ candidate did NOT dispatch"
 fi
-if echo "$LOG_Y1M40B" | grep -q "Task title:.*wa-y1m40rig"; then
+if echo "$LOG_Y1M40B" | grep "Task title:.*wa-y1m40rig" >/dev/null; then
   bad "ga-y1m40 AC2 REGRESSION: rig candidate dispatched even though the HQ candidate was itself dispatchable — HQ->rig priority inverted"
 else
   ok "ga-y1m40 AC2: rig candidate never considered when HQ already had a dispatchable candidate"
 fi
-if echo "$LOG_Y1M40B" | grep -q "ga-y1m40: HQ pool had candidate(s) but dispatched=0"; then
+if echo "$LOG_Y1M40B" | grep "ga-y1m40: HQ pool had candidate(s) but dispatched=0" >/dev/null; then
   bad "ga-y1m40 AC2 REGRESSION: post-lane rig fallback fired even though HQ successfully dispatched (dispatched!=0) — wasted scan"
 else
   ok "ga-y1m40 AC2: post-lane rig fallback correctly did NOT fire when HQ already dispatched"
@@ -8358,17 +8358,17 @@ fi
 
 echo "Scenario ga-y1m40-c (AC3 non-regression): HQ pool genuinely EMPTY -> old Step 2c path still fires exactly as before, and the NEW fallback does not double-scan"
 LOG_Y1M40C="$(run_y1m40 "[]" "" "$Y1M40_RIG_BUG")"
-if echo "$LOG_Y1M40C" | grep -q "HQ returned no candidates (bugs/debt + stories) — scanning rig DBs as fallback"; then
+if echo "$LOG_Y1M40C" | grep "HQ returned no candidates (bugs/debt + stories) — scanning rig DBs as fallback" >/dev/null; then
   ok "ga-y1m40 AC3: original Step 2c empty-pool log line still fires unchanged"
 else
   bad "ga-y1m40 AC3 REGRESSION: Step 2c empty-pool fallback log line missing"
 fi
-if echo "$LOG_Y1M40C" | grep -q "Task title:.*wa-y1m40rig"; then
+if echo "$LOG_Y1M40C" | grep "Task title:.*wa-y1m40rig" >/dev/null; then
   ok "ga-y1m40 AC3: rig candidate still dispatches via the original empty-pool path"
 else
   bad "ga-y1m40 AC3 REGRESSION: rig candidate not dispatched when HQ pool is genuinely empty"
 fi
-if echo "$LOG_Y1M40C" | grep -q "ga-y1m40: HQ pool had candidate(s) but dispatched=0"; then
+if echo "$LOG_Y1M40C" | grep "ga-y1m40: HQ pool had candidate(s) but dispatched=0" >/dev/null; then
   bad "ga-y1m40 AC3: the NEW post-lane fallback fired on top of the OLD Step 2c path (STEP2C_RAN guard not respected — double-scan)"
 else
   ok "ga-y1m40 AC3: STEP2C_RAN guard correctly suppresses the new post-lane fallback when Step 2c itself already ran"
@@ -8376,12 +8376,12 @@ fi
 
 echo "Scenario ga-y1m40-d (control): HQ vetoed AND rig fallback finds nothing -> dispatched=0, no crash, clean log"
 LOG_Y1M40D="$(run_y1m40 "$Y1M40_HQ_VETOED" "tt-y1m40-hq" "[]")"
-if echo "$LOG_Y1M40D" | grep -qE "dispatched=0 "; then
+if echo "$LOG_Y1M40D" | grep -E "dispatched=0 " >/dev/null; then
   ok "ga-y1m40 control: dispatched=0 when neither HQ nor rig has anything dispatchable (no false dispatch, no crash)"
 else
   bad "ga-y1m40 control: unexpected dispatch outcome when nothing should be dispatchable"
 fi
-if echo "$LOG_Y1M40D" | grep -q "ga-y1m40: rig DB fallback scan found no additional candidates"; then
+if echo "$LOG_Y1M40D" | grep "ga-y1m40: rig DB fallback scan found no additional candidates" >/dev/null; then
   ok "ga-y1m40 control: empty rig fallback scan is logged explicitly (not silent)"
 else
   bad "ga-y1m40 control: empty rig fallback scan outcome not logged"
@@ -8406,9 +8406,9 @@ rm -f "$FIXCITY/.gc/pilot-dispatcher-stall.count"
 Y1M40_STALL_LOG1="$(run_y1m40_stall "$Y1M40_HQ_VETOED" "tt-y1m40-hq" "[]")"
 Y1M40_STALL_LOG2="$(run_y1m40_stall "$Y1M40_HQ_VETOED" "tt-y1m40-hq" "[]")"
 Y1M40_STALL_LOG3="$(run_y1m40_stall "$Y1M40_HQ_VETOED" "tt-y1m40-hq" "[]")"
-if echo "$Y1M40_STALL_LOG1" | grep -q "1 consecutive sweep(s)" \
-   && echo "$Y1M40_STALL_LOG2" | grep -q "2 consecutive sweep(s)" \
-   && echo "$Y1M40_STALL_LOG3" | grep -q "3 consecutive sweep(s)"; then
+if echo "$Y1M40_STALL_LOG1" | grep "1 consecutive sweep(s)" >/dev/null \
+   && echo "$Y1M40_STALL_LOG2" | grep "2 consecutive sweep(s)" >/dev/null \
+   && echo "$Y1M40_STALL_LOG3" | grep "3 consecutive sweep(s)" >/dev/null; then
   ok "ga-y1m40 observability: stall streak persists cross-process and increments 1->2->3 (pilot-dispatcher.sh is not long-lived — file-backed, not in-memory)"
 else
   bad "ga-y1m40 observability REGRESSION: stall streak did not increment correctly across invocations"
@@ -8416,13 +8416,13 @@ fi
 
 echo "Scenario ga-y1m40-g (observability control): a dispatching sweep resets the stall streak"
 Y1M40_STALL_LOG4="$(run_y1m40_stall "$Y1M40_HQ_FREE" "" "[]")"
-if echo "$Y1M40_STALL_LOG4" | grep -q "consecutive sweep(s)"; then
+if echo "$Y1M40_STALL_LOG4" | grep "consecutive sweep(s)" >/dev/null; then
   bad "ga-y1m40 observability REGRESSION: stall WARN fired even though this sweep dispatched successfully"
 else
   ok "ga-y1m40 observability: no stall WARN on a sweep that actually dispatched"
 fi
 Y1M40_STALL_LOG5="$(run_y1m40_stall "$Y1M40_HQ_VETOED" "tt-y1m40-hq" "[]")"
-if echo "$Y1M40_STALL_LOG5" | grep -q "1 consecutive sweep(s)"; then
+if echo "$Y1M40_STALL_LOG5" | grep "1 consecutive sweep(s)" >/dev/null; then
   ok "ga-y1m40 observability: streak correctly restarts at 1 after a prior success reset the counter"
 else
   bad "ga-y1m40 observability REGRESSION: streak did not reset after a successful dispatch broke it"
@@ -8570,7 +8570,7 @@ if [ -f "$STATE/tt-flight.lane" ] && [ -s "$STATE/tt-flight.lane" ]; then
 else
   bad "lane:* label was never set/confirmed on the happy path"
 fi
-if echo "$LOG_LANE_A" | grep -q "LANE WRITE UNCONFIRMED"; then
+if echo "$LOG_LANE_A" | grep "LANE WRITE UNCONFIRMED" >/dev/null; then
   bad "happy path wrongly reported LANE WRITE UNCONFIRMED"
 else
   ok "no false lane-write failure on the happy path"
@@ -8584,7 +8584,7 @@ fi
 echo "Scenario ga-05604.2-b: lane-write exhaustion WARNs but does NOT abort the dispatch (unlike in-flight exhaustion)"
 
 LOG_LANE_B="$(run_real_dispatch 0 1)"
-if echo "$LOG_LANE_B" | grep -q "LANE WRITE UNCONFIRMED on tt-flight"; then
+if echo "$LOG_LANE_B" | grep "LANE WRITE UNCONFIRMED on tt-flight" >/dev/null; then
   ok "unconfirmed lane write → loud WARN naming the bead"
 else
   bad "did not detect/announce the unconfirmed lane write"
@@ -8604,7 +8604,7 @@ if grep -q "released tt-flight" "$STATE/releases.log" 2>/dev/null; then
 else
   bad "REGRESSION: claim was not released — an unconfirmed lane write incorrectly blocked claim release"
 fi
-if echo "$LOG_LANE_B" | grep -q "DURABLE-INFLIGHT FAILED"; then
+if echo "$LOG_LANE_B" | grep "DURABLE-INFLIGHT FAILED" >/dev/null; then
   bad "REGRESSION: lane-write failure alone triggered the (unrelated) DURABLE-INFLIGHT FAILED abort path"
 else
   ok "lane-write failure did not cross-trigger the in-flight abort path"
@@ -8671,12 +8671,12 @@ LOG_PP00F_A="$(run_capacity 10 "[]" 1 "$HEX_BUG")"
 HEX_BUILDER_A="$(builder_for_domain "$LOG_PP00F_A" hex)"
 if [ "$HEX_BUILDER_A" = "batista-wa" ]; then
   ok "hex-native bug dispatched DIRECTLY to batista-wa (structural owner, ga-pp00f fix)"
-elif echo "$HEX_BUILDER_A" | grep -qE '^wa-worker-[0-9]+$'; then
+elif echo "$HEX_BUILDER_A" | grep -E '^wa-worker-[0-9]+$' >/dev/null; then
   bad "REGRESSION (ga-pp00f): hex-native bug went to the generic wa-worker pool ($HEX_BUILDER_A) — reproduces the reclaim-loop this fix exists to close"
 else
   bad "hex-native bug routed unexpectedly (got: '${HEX_BUILDER_A:-none}')"
 fi
-if echo "$LOG_PP00F_A" | grep -q "gc.routed_to=wa-worker"; then
+if echo "$LOG_PP00F_A" | grep "gc.routed_to=wa-worker" >/dev/null; then
   bad "REGRESSION (ga-pp00f): hex-native bug still stamped gc.routed_to=wa-worker despite direct batista-wa dispatch"
 else
   ok "hex-native bug did NOT receive gc.routed_to=wa-worker stamp (named-crew path used instead)"
@@ -8685,13 +8685,13 @@ fi
 echo "Scenario ga-pp00f-b (control): benign 'hex' color mention does NOT misclassify as the hex domain (regex not over-broad)"
 HEX_COLOR_BUG='[{"id":"tt-wahexcolor","title":"muda a cor do botao pra #FF5733 (hex) no painel","priority":0,"issue_type":"bug","description":"fixture body — context for veto test; a cosmetic color-code tweak, no other signal intended","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:05Z","metadata":{"story.rig":"whatsapp_automation"}}]'
 LOG_PP00F_B="$(run_capacity 10 "[]" 1 "$HEX_COLOR_BUG")"
-if echo "$LOG_PP00F_B" | grep -q "Builder target:.*domain=hex"; then
+if echo "$LOG_PP00F_B" | grep "Builder target:.*domain=hex" >/dev/null; then
   bad "REGRESSION (ga-pp00f): a bare 'hex' color-code mention misclassified as the hex domain (regex too broad)"
 else
   ok "bare 'hex' color-code mention did NOT trigger the hex domain (compound-phrase regex holds)"
 fi
 HEXCOLOR_BUILDER="$(builders_of "$LOG_PP00F_B")"
-if echo "$HEXCOLOR_BUILDER" | grep -qE '^wa-worker-[0-9]+$'; then
+if echo "$HEXCOLOR_BUILDER" | grep -E '^wa-worker-[0-9]+$' >/dev/null; then
   ok "hex-color bug still dispatched to a normal wa-worker slot ($HEXCOLOR_BUILDER) — unaffected by the hex domain fix"
 else
   bad "hex-color bug did not dispatch to a wa-worker slot as expected (got: '${HEXCOLOR_BUILDER:-none}')"
@@ -8709,20 +8709,20 @@ INFLIGHT_PP00F_C="[{\"id\":\"if-batista\",\"labels\":[\"story:in-flight\",\"lane
 SESSIONS_PP00F_C='{"sessions":[{"session_name":"batista-wa","closed":false}]}'
 SLINGMAP_PP00F_C='{"tt-sling-batista":"batista-wa"}'
 LOG_PP00F_C="$(run_capacity 10 "$INFLIGHT_PP00F_C" 1 "$HEX_BUG" "$SESSIONS_PP00F_C" "$SLINGMAP_PP00F_C")"
-if echo "$LOG_PP00F_C" | grep -q "Busy builders (live in-flight): batista-wa"; then
+if echo "$LOG_PP00F_C" | grep "Busy builders (live in-flight): batista-wa" >/dev/null; then
   ok "busy-builder set computed with batista-wa busy (fixture wired correctly)"
 else
   bad "did not compute batista-wa as busy — fixture not wired as intended, the result below is not trustworthy"
 fi
 HEXBUILDER_C="$(builders_of "$LOG_PP00F_C")"
-if echo "$HEXBUILDER_C" | grep -qE '^wa-worker-[0-9]+$'; then
+if echo "$HEXBUILDER_C" | grep -E '^wa-worker-[0-9]+$' >/dev/null; then
   bad "REGRESSION (ga-pp00f): hex-native bug leaked into the wa-worker pool ($HEXBUILDER_C) when batista-wa was busy — reproduces the reclaim loop on a timing window"
 elif [ -z "$HEXBUILDER_C" ]; then
   ok "hex-native bug correctly DEFERRED (no dispatch) while batista-wa is busy — never touches the wa-worker pool"
 else
   bad "hex-native bug went to an unexpected target while batista-wa was busy: '$HEXBUILDER_C'"
 fi
-if echo "$LOG_PP00F_C" | grep -q "deferring tt-wahex to next sweep"; then
+if echo "$LOG_PP00F_C" | grep "deferring tt-wahex to next sweep" >/dev/null; then
   ok "defer is logged explicitly (domain-excluded from the fallback pool, not a silent drop)"
 else
   bad "no explicit defer log line found for tt-wahex — investigate before trusting the outcome above"
@@ -8732,7 +8732,7 @@ echo "Scenario ga-pp00f-d (control): a non-hex WA bug in the SAME sweep as a bus
 TWO_BUGS_PP00F="[$(echo "$HEX_BUG" | jq -c '.[0]'),$(echo "$WA_ONE_BUG" | jq -c '.[0]')]"
 LOG_PP00F_D="$(run_capacity 10 "$INFLIGHT_PP00F_C" 1 "$TWO_BUGS_PP00F" "$SESSIONS_PP00F_C" "$SLINGMAP_PP00F_C")"
 NONHEX_BUILDER_D="$(echo "$LOG_PP00F_D" | grep 'Builder target:' | grep -v 'domain=hex' | sed -E 's/.*Builder target: ([^ ]+).*/\1/' | head -1)"
-if echo "$NONHEX_BUILDER_D" | grep -qE '^wa-worker-[0-9]+$'; then
+if echo "$NONHEX_BUILDER_D" | grep -E '^wa-worker-[0-9]+$' >/dev/null; then
   ok "non-hex WA bug still dispatched to a wa-worker slot ($NONHEX_BUILDER_D) in the same sweep — hex exclusion is domain-scoped, not sweep-wide"
 else
   bad "non-hex WA bug did not dispatch as expected (got: '${NONHEX_BUILDER_D:-none}') — hex fix may be over-broad"
@@ -8777,19 +8777,19 @@ fi
 echo "Scenario ga-wnojmm-hex-a: hex-native WA bug with SUSPENDED batista-wa → still never dispatched, but now VISIBLY held (1/3)"
 LOG_WNOJMM_HEX_A="$(PILOT_SUSPENDED_CREWS_OVERRIDE="batista-wa" run_capacity 10 "[]" 1 "$HEX_BUG")"
 HEXBUILDER_WNOJMM_A="$(builders_of "$LOG_WNOJMM_HEX_A")"
-if echo "$HEXBUILDER_WNOJMM_A" | grep -qE '^wa-worker-[0-9]+$'; then
+if echo "$HEXBUILDER_WNOJMM_A" | grep -E '^wa-worker-[0-9]+$' >/dev/null; then
   bad "REGRESSION (ga-pp00f): hex-native bug leaked into the wa-worker pool ($HEXBUILDER_WNOJMM_A) once batista-wa was suspended"
 elif [ -n "$HEXBUILDER_WNOJMM_A" ]; then
   bad "hex-native bug with suspended owner routed unexpectedly (got: '$HEXBUILDER_WNOJMM_A')"
 else
   ok "hex-native bug with suspended batista-wa correctly never dispatched (structural pool-exclusion still holds)"
 fi
-if echo "$LOG_WNOJMM_HEX_A" | grep -qF "WOULD stamp pilot:held-count:ga-wnojmm-hex:1 on tt-wahex (hold 1/3)"; then
+if echo "$LOG_WNOJMM_HEX_A" | grep -F "WOULD stamp pilot:held-count:ga-wnojmm-hex:1 on tt-wahex (hold 1/3)" >/dev/null; then
   ok "ga-wnojmm: suspended-owner hex bead now stamps a VISIBLE hold counter (was: silent 'deferring' log only, no bead-visible trace)"
 else
   bad "ga-wnojmm REGRESSION: suspended-owner hex bead did not stamp a hold counter — still silent/invisible (log: $LOG_WNOJMM_HEX_A)"
 fi
-if echo "$LOG_WNOJMM_HEX_A" | grep -qi "SUSPENDED"; then
+if echo "$LOG_WNOJMM_HEX_A" | grep -i "SUSPENDED" >/dev/null; then
   ok "the hold reason names the real cause (owner suspended, not a generic unmapped-domain hold)"
 else
   bad "hold reason does not mention SUSPENDED — can't distinguish this from an unrelated hold"
@@ -8798,7 +8798,7 @@ fi
 echo "Scenario ga-wnojmm-hex-b: SAME suspended-owner hex bug, prior hold count=2 → ESCALATES on the 3rd sweep, never loops silently forever"
 HEX_BUG_HELD2='[{"id":"tt-wahex","title":"celula Hex dedup: normaliza data sem format=mixed","priority":1,"issue_type":"bug","description":"a celula de notebook Hex que decide qual proprietario fica usa pd.to_datetime(errors=coerce) sem format=mixed","status":"open","labels":["pilot:held-count:ga-wnojmm-hex:2"],"assignee":null,"created_at":"2026-06-01T00:00:04Z","metadata":{"story.rig":"whatsapp_automation"}}]'
 LOG_WNOJMM_HEX_B="$(PILOT_SUSPENDED_CREWS_OVERRIDE="batista-wa" run_capacity 10 "[]" 1 "$HEX_BUG_HELD2")"
-if echo "$LOG_WNOJMM_HEX_B" | grep -qF "WOULD ESCALATE tt-wahex (ga-wnojmm-hex, hold 3/3) to Mayor"; then
+if echo "$LOG_WNOJMM_HEX_B" | grep -F "WOULD ESCALATE tt-wahex (ga-wnojmm-hex, hold 3/3) to Mayor" >/dev/null; then
   ok "ga-wnojmm: 3rd consecutive hold on a suspended hex owner ESCALATES to the Mayor instead of holding a 4th time — the 'adiam pra sempre' bug is closed"
 else
   bad "ga-wnojmm REGRESSION: 3rd hold on suspended hex owner did not escalate (log: $LOG_WNOJMM_HEX_B)"
@@ -8807,14 +8807,14 @@ fi
 echo "Scenario ga-wnojmm-hex-c (control, Regra No 4): warming with its owner SUSPENDED is UNCHANGED — no new hold-count stamp, no escalation, no pool leak"
 LOG_WNOJMM_WARM_CTL="$(PILOT_SUSPENDED_CREWS_OVERRIDE="oracle-wa" run_capacity 10 "[]" 1 "$WARM_BUG")"
 WARMBUILDER_CTL="$(builders_of "$LOG_WNOJMM_WARM_CTL")"
-if echo "$WARMBUILDER_CTL" | grep -qE '^wa-worker-[0-9]+$'; then
+if echo "$WARMBUILDER_CTL" | grep -E '^wa-worker-[0-9]+$' >/dev/null; then
   bad "REGRESSION: warming leaked into the wa-worker pool once oracle-wa was suspended — Regra No 4 requires NO behaviour change here without an explicit Athos decision"
 elif [ -n "$WARMBUILDER_CTL" ]; then
   bad "warming with suspended owner routed unexpectedly (got: '$WARMBUILDER_CTL')"
 else
   ok "warming with suspended oracle-wa still never dispatched (unchanged)"
 fi
-if echo "$LOG_WNOJMM_WARM_CTL" | grep -qF "pilot:held-count:ga-wnojmm-hex"; then
+if echo "$LOG_WNOJMM_WARM_CTL" | grep -F "pilot:held-count:ga-wnojmm-hex" >/dev/null; then
   bad "REGRESSION (Regra No 4 violation): warming picked up the NEW hex-only visible-hold treatment — this story deliberately scopes it to domain=hex only"
 else
   ok "warming correctly did NOT receive the new visible-hold treatment (scoped to hex only, per Regra No 4 — warming stays exactly as it was)"
@@ -8920,17 +8920,17 @@ run_ram() { # $1=PILOT_RAM_PRESSURE_OVERRIDE
 
 echo "Scenario 26b: RAM WARN → PAUSE sweep, dispatch nothing"
 LOG26B="$(run_ram WARN)"
-if echo "$LOG26B" | grep -q "PAUSING all dispatch"; then
+if echo "$LOG26B" | grep "PAUSING all dispatch" >/dev/null; then
   ok "RAM-WARN sweep logs the pause"
 else
   bad "RAM-WARN sweep did NOT pause (expected 'PAUSING all dispatch')"
 fi
-if echo "$LOG26B" | grep -q "dispatched=0 (paused: pressão de RAM WARN)"; then
+if echo "$LOG26B" | grep "dispatched=0 (paused: pressão de RAM WARN)" >/dev/null; then
   ok "sweep-complete line reports dispatched=0 (paused, level=WARN)"
 else
   bad "sweep-complete did not report the RAM-paused state — got: $LOG26B"
 fi
-if echo "$LOG26B" | grep -qE "pegou uma história|gc sling|story:in-flight"; then
+if echo "$LOG26B" | grep -E "pegou uma história|gc sling|story:in-flight" >/dev/null; then
   bad "REGRESSION: dispatched/slung a builder despite RAM WARN pressure"
 else
   ok "no builder dispatched under RAM WARN (AC: nenhum agente novo começa)"
@@ -8938,7 +8938,7 @@ fi
 
 echo "Scenario 26c: RAM EMERGENCY → PAUSE sweep too (AC: 'aviso ou emergência' — same response, not a differentiated throttle)"
 LOG26C="$(run_ram EMERGENCY)"
-if echo "$LOG26C" | grep -q "dispatched=0 (paused: pressão de RAM EMERGENCY)"; then
+if echo "$LOG26C" | grep "dispatched=0 (paused: pressão de RAM EMERGENCY)" >/dev/null; then
   ok "RAM-EMERGENCY sweep also pauses identically to WARN"
 else
   bad "RAM-EMERGENCY sweep did not pause — got: $LOG26C"
@@ -8946,7 +8946,7 @@ fi
 
 echo "Scenario 26d: RAM confirmed OK → no pause, sweep proceeds normally"
 LOG26D="$(run_ram OK)"
-if echo "$LOG26D" | grep -q "PAUSING all dispatch"; then
+if echo "$LOG26D" | grep "PAUSING all dispatch" >/dev/null; then
   bad "REGRESSION: paused the sweep when RAM pressure was clear"
 else
   ok "RAM-clear sweep does not pause on the RAM gate (proceeds to dispatch logic)"
@@ -9111,22 +9111,22 @@ TIER2_ALL_VETOED='[
 
 echo "Scenario ga-3hhnyn-a: both lanes full + ALL waiting approved beads vetoed -> log says 0 eligible, does not blame lane capacity"
 LOGLFA="$(run_lanefull "$TIER2_ALL_VETOED")"
-if echo "$LOGLFA" | grep -q "Dispatch queue: 3 story:approved waiting (HQ), 0 eligible"; then
+if echo "$LOGLFA" | grep "Dispatch queue: 3 story:approved waiting (HQ), 0 eligible" >/dev/null; then
   ok "ga-3hhnyn: log reports 3 waiting / 0 eligible when every waiting bead carries a veto label"
 else
   bad "ga-3hhnyn: log did NOT report the waiting/eligible split (expected 'Dispatch queue: 3 story:approved waiting (HQ), 0 eligible')"
 fi
-if echo "$LOGLFA" | grep -q "none can dispatch this sweep"; then
+if echo "$LOGLFA" | grep "none can dispatch this sweep" >/dev/null; then
   bad "ga-3hhnyn: REGRESSION — log still blames lane capacity ('none can dispatch this sweep') when 0 beads were actually eligible"
 else
   ok "ga-3hhnyn: log does NOT blame lane capacity when nothing was eligible anyway"
 fi
-if echo "$LOGLFA" | grep -q "not lane capacity"; then
+if echo "$LOGLFA" | grep "not lane capacity" >/dev/null; then
   ok "ga-3hhnyn: log honestly states lane occupancy is not the blocker"
 else
   bad "ga-3hhnyn: log missing the 'not lane capacity' honesty clause"
 fi
-if echo "$LOGLFA" | grep -q "Both lanes full (small=0/0 unclassified_lane=0, big=0/0). Pilot backing off."; then
+if echo "$LOGLFA" | grep "Both lanes full (small=0/0 unclassified_lane=0, big=0/0). Pilot backing off." >/dev/null; then
   ok "ga-3hhnyn: factual slot-occupancy line still prints (informational, not framed as the cause)"
 else
   bad "ga-3hhnyn: factual slot-occupancy line missing when all waiting beads were vetoed"
@@ -9141,12 +9141,12 @@ TIER2_ONE_ELIGIBLE='[
 
 echo "Scenario ga-3hhnyn-b: both lanes full + at least one ELIGIBLE waiting bead -> log still attributes non-dispatch to lane capacity"
 LOGLFB="$(run_lanefull "$TIER2_ONE_ELIGIBLE")"
-if echo "$LOGLFB" | grep -q "Dispatch queue: 2 story:approved waiting, 1 eligible (HQ; both lanes full — none can dispatch this sweep)"; then
+if echo "$LOGLFB" | grep "Dispatch queue: 2 story:approved waiting, 1 eligible (HQ; both lanes full — none can dispatch this sweep)" >/dev/null; then
   ok "ga-3hhnyn: log reports 2 waiting / 1 eligible AND still attributes non-dispatch to full lanes (true positive preserved)"
 else
   bad "ga-3hhnyn: log did not preserve the lane-capacity attribution when a bead WAS actually eligible"
 fi
-if echo "$LOGLFB" | grep -q "Both lanes full (small=0/0 unclassified_lane=0, big=0/0). Pilot backing off."; then
+if echo "$LOGLFB" | grep "Both lanes full (small=0/0 unclassified_lane=0, big=0/0). Pilot backing off." >/dev/null; then
   ok "ga-3hhnyn: slot-occupancy line still prints when lane capacity IS the real blocker"
 else
   bad "ga-3hhnyn: slot-occupancy line missing/changed when lane capacity IS the real blocker"
@@ -9158,12 +9158,12 @@ fi
 # eligible count derived from an empty fallback.
 echo "Scenario ga-3hhnyn-c: story:approved query FAILS -> log says counts are unknown, never '0 eligible' or a lane-capacity verdict"
 LOGLFC="$(run_lanefull "[]" "1")"
-if echo "$LOGLFC" | grep -q "UNKNOWN this sweep"; then
+if echo "$LOGLFC" | grep "UNKNOWN this sweep" >/dev/null; then
   ok "ga-3hhnyn: a failed story:approved query is reported as unknown, not silently zero"
 else
   bad "ga-3hhnyn: REGRESSION — a failed story:approved query did not produce the 'UNKNOWN this sweep' line"
 fi
-if echo "$LOGLFC" | grep -qE "0 eligible|eligible \(HQ; both lanes full"; then
+if echo "$LOGLFC" | grep -E "0 eligible|eligible \(HQ; both lanes full" >/dev/null; then
   bad "ga-3hhnyn: REGRESSION — a failed query was reported as a concrete eligible count (error collapsed into empty)"
 else
   ok "ga-3hhnyn: a failed query is NOT reported as any concrete eligible count"
@@ -9211,12 +9211,12 @@ run_lanefull_topup() {
 
 echo "Scenario ga-swnsg3-a: both lanes full + wa-worker below cap + a pending routed-unassigned bead -> top-up STILL spawns (the exact incident: top-up used to be unreachable once lanes filled)"
 LOG_SW_A="$(run_lanefull_topup "1" "wa-pending-sw-a" "0" "100" "2")"
-if echo "$LOG_SW_A" | grep -q "Both lanes full (small=0/0 unclassified_lane=0, big=0/0). Pilot backing off."; then
+if echo "$LOG_SW_A" | grep "Both lanes full (small=0/0 unclassified_lane=0, big=0/0). Pilot backing off." >/dev/null; then
   ok "ga-swnsg3: fixture genuinely forces the lanes-full backoff branch (precondition confirmed, not assumed)"
 else
   bad "ga-swnsg3: fixture did NOT reach the lanes-full backoff branch — scenario proves nothing"
 fi
-if echo "$LOG_SW_A" | grep -q "ga-93yxc: pool top-up — wa-worker has free capacity (live=1 < 2) and wa-pending-sw-a is routed+unassigned with no worker from a prior sweep — spawning."; then
+if echo "$LOG_SW_A" | grep "ga-93yxc: pool top-up — wa-worker has free capacity (live=1 < 2) and wa-pending-sw-a is routed+unassigned with no worker from a prior sweep — spawning." >/dev/null; then
   ok "ga-swnsg3: pool top-up spawns for a routed-unassigned bead EVEN WHEN both lanes are full (fix present)"
 else
   bad "ga-swnsg3: REGRESSION — pool top-up did not spawn when lanes were full (the exact incident: a freed builder slot would idle until the ~45min never-started recovery)"
@@ -9224,7 +9224,7 @@ fi
 
 echo "Scenario ga-swnsg3-b: both lanes full + wa-worker AT cap -> top-up still does NOT spawn (cap respected even on the lanes-full path)"
 LOG_SW_B="$(run_lanefull_topup "2" "wa-pending-sw-b" "0" "100" "2")"
-if echo "$LOG_SW_B" | grep -q "wa-pending-sw-b"; then
+if echo "$LOG_SW_B" | grep "wa-pending-sw-b" >/dev/null; then
   bad "ga-swnsg3: REGRESSION — top-up spawned (or queried) despite live=2 >= max=2 while lanes were full — cap not respected"
 else
   ok "ga-swnsg3: top-up correctly skips when the pool is already at cap, even on the lanes-full path"
@@ -9232,12 +9232,12 @@ fi
 
 echo "Scenario ga-swnsg3-c: both lanes full + DRY_RUN=1 -> top-up logs the WOULD-decision only, no real-spawn claim"
 LOG_SW_C="$(run_lanefull_topup "1" "wa-pending-sw-c" "1" "100" "2")"
-if echo "$LOG_SW_C" | grep -q "DRY_RUN=1 — WOULD: pool top-up spawn wa-worker for wa-pending-sw-c"; then
+if echo "$LOG_SW_C" | grep "DRY_RUN=1 — WOULD: pool top-up spawn wa-worker for wa-pending-sw-c" >/dev/null; then
   ok "ga-swnsg3: DRY_RUN=1 still emits the WOULD-log on the lanes-full path"
 else
   bad "ga-swnsg3: DRY_RUN=1 did NOT log the top-up decision on the lanes-full path"
 fi
-if echo "$LOG_SW_C" | grep -q "pool top-up — wa-worker session spawned for wa-pending-sw-c"; then
+if echo "$LOG_SW_C" | grep "pool top-up — wa-worker session spawned for wa-pending-sw-c" >/dev/null; then
   bad "ga-swnsg3: REGRESSION — DRY_RUN=1 claims a real spawn happened on the lanes-full path"
 else
   ok "ga-swnsg3: DRY_RUN=1 makes no real-spawn claim on the lanes-full path"
@@ -9245,17 +9245,17 @@ fi
 
 echo "Scenario ga-swnsg3-d: both lanes full + Dolt SATURATED at sweep start -> top-up backs off too (the ACEITE ressalva: top-up must not add load to a hot Dolt)"
 LOG_SW_D="$(run_lanefull_topup "1" "wa-pending-sw-d" "0" "3000" "2")"
-if echo "$LOG_SW_D" | grep -q "Both lanes full (small=0/0 unclassified_lane=0, big=0/0). Pilot backing off."; then
+if echo "$LOG_SW_D" | grep "Both lanes full (small=0/0 unclassified_lane=0, big=0/0). Pilot backing off." >/dev/null; then
   ok "ga-swnsg3: fixture still reaches the lanes-full backoff branch with Dolt saturated"
 else
   bad "ga-swnsg3: fixture did NOT reach the lanes-full backoff branch — scenario proves nothing"
 fi
-if echo "$LOG_SW_D" | grep -q "ga-swnsg3: pool top-up — Dolt saturated at sweep start, skipping wa-worker top-up"; then
+if echo "$LOG_SW_D" | grep "ga-swnsg3: pool top-up — Dolt saturated at sweep start, skipping wa-worker top-up" >/dev/null; then
   ok "ga-swnsg3: top-up correctly backs off when Dolt is saturated, even on the lanes-full path"
 else
   bad "ga-swnsg3: REGRESSION — top-up did not report backing off for a saturated Dolt"
 fi
-if echo "$LOG_SW_D" | grep -q "wa-pending-sw-d"; then
+if echo "$LOG_SW_D" | grep "wa-pending-sw-d" >/dev/null; then
   bad "ga-swnsg3: REGRESSION — top-up considered/spawned a pending bead despite Dolt being saturated"
 else
   ok "ga-swnsg3: top-up never even queries the pending bead while Dolt is saturated"
@@ -9263,7 +9263,7 @@ fi
 
 echo "Scenario ga-swnsg3-e: structural — top-up call sites appear BEFORE the 'Both lanes full' backoff exit (TOPUP-6 already proved 'before the zero-candidates exit'; this proves the OTHER early-exit that ga-swnsg3 is actually about)"
 _swnsg3_topup_vs_lanefull="$(awk '/^_pilot_pool_topup "wa-worker"/{f=1} f{print} /Pilot backing off\./{if(f)exit}' "$DISPATCHER")"
-if printf '%s' "$_swnsg3_topup_vs_lanefull" | grep -q "Pilot backing off"; then
+if printf '%s' "$_swnsg3_topup_vs_lanefull" | grep "Pilot backing off" >/dev/null; then
   ok "ga-swnsg3: top-up call sites appear BEFORE the both-lanes-full backoff exit — a freed pool slot fills even while lanes stay saturated"
 else
   bad "ga-swnsg3: REGRESSION — top-up call sites do NOT precede the both-lanes-full backoff exit (a freed slot would idle until the ~45min never-started recovery again)"

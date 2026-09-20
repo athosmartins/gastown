@@ -72,7 +72,7 @@ echo "── Scenario: active-sess (idle <2h) must NOT appear as a cut opportuni
 # scope the check to the top3 array specifically — active-sess legitimately
 # appears elsewhere in the JSON (growth/medians cover every owner), so a
 # whole-blob grep would false-positive on those unrelated sections.
-jget "['top3_opportunities']" | grep -q "active-sess" && bad "active-sess leaked into top3 despite being active <2h" || ok "active-sess correctly excluded from top3 (not idle long enough)"
+jget "['top3_opportunities']" | grep "active-sess" >/dev/null && bad "active-sess leaked into top3 despite being active <2h" || ok "active-sess correctly excluded from top3 (not idle long enough)"
 
 echo ""
 echo "── Scenario: --top N live mode, ps read fails -> explicit failure message, not a happy-path-shaped line ──"
@@ -89,7 +89,7 @@ TOP_FAIL_OUT=$(RAM_OWNER_NOW_EPOCH="$NOW" \
   RAM_OWNER_PS_FIXTURE="$TMP/empty_ps.txt" \
   RAM_OWNER_SESSIONS_FIXTURE="$TMP/sessions.json" \
   python3 "$REPORT" --top 3 2>&1)
-echo "$TOP_FAIL_OUT" | grep -qi "falha na leitura" && ok "--top on a failed ps read prints the explicit failure message" || bad "--top did not degrade explicitly on empty ps: $TOP_FAIL_OUT"
+echo "$TOP_FAIL_OUT" | grep -i "falha na leitura" >/dev/null && ok "--top on a failed ps read prints the explicit failure message" || bad "--top did not degrade explicitly on empty ps: $TOP_FAIL_OUT"
 
 echo ""
 echo "── Scenario: --top N live mode, real ps data -> resolves owners, never touches the JSONL ──"
@@ -107,15 +107,15 @@ TOP_OK_OUT=$(RAM_OWNER_NOW_EPOCH="$NOW" \
   RAM_OWNER_PS_FIXTURE="$TMP/top_ps.txt" \
   RAM_OWNER_SESSIONS_FIXTURE="$TMP/top_sessions.json" \
   python3 "$REPORT" --top 3 2>&1)
-echo "$TOP_OK_OUT" | grep -q "gastown.dog-2=354MB" && ok "--top resolves a real claude PID to its session name via --session-id join" || bad "--top did not resolve real owners: $TOP_OK_OUT"
-echo "$TOP_OK_OUT" | grep -qi "AVISO" && bad "--top wrongly showed the session-lookup-failed AVISO despite a successful lookup: $TOP_OK_OUT" || ok "--top shows no AVISO when the session lookup actually succeeded"
+echo "$TOP_OK_OUT" | grep "gastown.dog-2=354MB" >/dev/null && ok "--top resolves a real claude PID to its session name via --session-id join" || bad "--top did not resolve real owners: $TOP_OK_OUT"
+echo "$TOP_OK_OUT" | grep -i "AVISO" >/dev/null && bad "--top wrongly showed the session-lookup-failed AVISO despite a successful lookup: $TOP_OK_OUT" || ok "--top shows no AVISO when the session lookup actually succeeded"
 
 echo ""
 echo "── Scenario: no history file yet -> graceful message, not a crash ──"
 NO_DATA=$(run_report --in "$TMP/does-not-exist.jsonl" 2>&1)
 rc=$?
 [ "$rc" -eq 0 ] && ok "missing JSONL exits 0 with an explanatory message" || bad "missing JSONL should not be a hard failure, got rc=$rc"
-echo "$NO_DATA" | grep -qi "sem" && ok "message says explicitly there's no data yet (not silently empty output)" || bad "no-data message missing/unclear: $NO_DATA"
+echo "$NO_DATA" | grep -i "sem" >/dev/null && ok "message says explicitly there's no data yet (not silently empty output)" || bad "no-data message missing/unclear: $NO_DATA"
 
 echo ""
 echo "ram-owner-report selftest: PASS=$PASS FAIL=$FAIL"

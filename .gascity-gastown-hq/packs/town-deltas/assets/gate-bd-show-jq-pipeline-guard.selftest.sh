@@ -78,8 +78,8 @@ fi
 # extraction point gate-verdict-status-unreadable.selftest.sh Part 6 already
 # uses to behaviorally test it) instead of a call-prefix text anchor.
 BD_MERGE_BLOCK="$(sed -n '/# SELFTEST-EXTRACT already-merged-source-bead-cleanup-fn: BEGIN/,/# SELFTEST-EXTRACT already-merged-source-bead-cleanup-fn: END/p' "$GATE" 2>/dev/null || true)"
-if printf '%s' "$BD_MERGE_BLOCK" | grep -q 'if BD_JSON=\$(bd .* show .*--json' \
-   && printf '%s' "$BD_MERGE_BLOCK" | grep -q 'BD_STATUS="__UNKNOWN__"'; then
+if printf '%s' "$BD_MERGE_BLOCK" | grep 'if BD_JSON=\$(bd .* show .*--json' >/dev/null \
+   && printf '%s' "$BD_MERGE_BLOCK" | grep 'BD_STATUS="__UNKNOWN__"' >/dev/null; then
   ok "BD_STATUS pipeline: bd-show exit status captured via if/else, not piped raw into jq (ga-8fx5e/ga-i5s5)"
 else
   bad "BD_STATUS pipeline is NOT guarded against bd-show failure (silent-crash or error/empty-conflation risk — ga-8fx5e/ga-i5s5)"
@@ -95,7 +95,7 @@ fi
 # nothing and this guard was vacuously failing. The pipeline itself now lives
 # inside the helper's body, so the guard inspects that instead.
 RA_BLOCK="$(sed -n '/^read_rebase_attempt() {/,/^}/p' "$GATE" 2>/dev/null || true)"
-if printf '%s' "$RA_BLOCK" | grep -q 'head -1 || true)'; then
+if printf '%s' "$RA_BLOCK" | grep 'head -1 || true)' >/dev/null; then
   ok "REBASE_ATTEMPT pipeline (read_rebase_attempt helper) is guarded with '|| true'"
 else
   bad "REBASE_ATTEMPT pipeline is NOT guarded with '|| true' (silent-crash risk — ga-8fx5e)"

@@ -610,20 +610,20 @@ echo "Drift guards: live wiring matches the design contract"
 #    and a comment. NO dispatch / sling write in code. (Match an actual INVOCATION
 #    — `gc ... sling` or `pilot-dispatcher` — not the `pilot:dispatched` LABEL the
 #    lifecycle-skip classifier legitimately matches against.)
-if grep -v '^[[:space:]]*#' "$DISPATCHER" | grep -qE 'gc .*sling|pilot-dispatcher|pilot dispatch'; then
+if grep -v '^[[:space:]]*#' "$DISPATCHER" | grep -E 'gc .*sling|pilot-dispatcher|pilot dispatch' >/dev/null; then
   bad "REGRESSION: dispatcher contains a dispatch/sling call — must be LABEL-ONLY"
 else
   ok "no dispatch/sling invocation in code (LABEL-ONLY)"
 fi
 # It must never CLOSE a candidate bead. (It may close its OWN ephemeral verdict
 # bead — guard that the close target is the verdict bead variable, never a candidate.)
-if grep -v '^[[:space:]]*#' "$DISPATCHER" | grep -E 'bd_ close' | grep -qv '_verdict_bead'; then
+if grep -v '^[[:space:]]*#' "$DISPATCHER" | grep -E 'bd_ close' | grep -v '_verdict_bead' >/dev/null; then
   bad "REGRESSION: a bd_ close targets something other than the verdict bead — must not close candidates"
 else
   ok "bd_ close only ever targets the daemon's own verdict bead (never a candidate)"
 fi
 # It must never write a lifecycle/dispatch label onto a candidate.
-if grep -v '^[[:space:]]*#' "$DISPATCHER" | grep -qE 'label add "\$c_id" "(story:|pilot:|gate:)'; then
+if grep -v '^[[:space:]]*#' "$DISPATCHER" | grep -E 'label add "\$c_id" "(story:|pilot:|gate:)' >/dev/null; then
   bad "REGRESSION: dispatcher writes a lifecycle/dispatch label onto a candidate"
 else
   ok "candidate writes are ONLY ctx:* + a comment (no lifecycle/dispatch label)"
@@ -705,7 +705,7 @@ CONTEXT_CHECK_CITY_OVERRIDE="$_drycity" DRY_RUN=1 \
   bash "$DISPATCHER" >/dev/null 2>&1
 _dryrc=$?
 _drylog=$(cat "$_drycity/.gc/logs/context-check-dispatcher.log" 2>/dev/null || echo "")
-if [ "$_dryrc" -eq 0 ] && echo "$_drylog" | grep -qiE 'Context-check sweep start.*dry_run=1'; then
+if [ "$_dryrc" -eq 0 ] && echo "$_drylog" | grep -iE 'Context-check sweep start.*dry_run=1' >/dev/null; then
   ok "DRY_RUN executes the sweep harness cleanly (exit 0, proof mode, no spawn)"
 else
   bad "DRY_RUN did not run cleanly in proof mode (rc=$_dryrc)"
@@ -719,7 +719,7 @@ CONTEXT_CHECK_CITY_OVERRIDE="$_kcity" CONTEXT_CHECK_ENABLED=0 \
   bash "$DISPATCHER" >/dev/null 2>&1
 _krc=$?
 _klog=$(cat "$_kcity/.gc/logs/context-check-dispatcher.log" 2>/dev/null || echo "")
-if [ "$_krc" -eq 0 ] && echo "$_klog" | grep -qi 'DISABLED'; then
+if [ "$_krc" -eq 0 ] && echo "$_klog" | grep -i 'DISABLED' >/dev/null; then
   ok "kill-switch e2e: CONTEXT_CHECK_ENABLED=0 → exit 0 + DISABLED log line (no work)"
 else
   bad "kill-switch e2e did not no-op cleanly (rc=$_krc)"
@@ -758,7 +758,7 @@ else
 fi
 #  e) exec-class is a PURE function (no bd_/gc/jq side-effects in its body).
 _ecbody=$(awk '/^context_check_exec_class\(\)/{f=1} f{print} /^}/{if(f)exit}' "$DISPATCHER")
-if echo "$_ecbody" | grep -qE 'bd_ |gc |session |sling|--apply'; then
+if echo "$_ecbody" | grep -E 'bd_ |gc |session |sling|--apply' >/dev/null; then
   bad "REGRESSION: context_check_exec_class has a side-effect (must be pure)"
 else
   ok "context_check_exec_class is pure (no bd_/gc/sling side-effect — selftest-safe)"
@@ -847,29 +847,29 @@ CONTEXT_CHECK_CITY_OVERRIDE="$_ecity" \
   timeout 30 bash "$DISPATCHER" >/dev/null 2>&1 || true
 _eled=$(cat "$LEDGER" 2>/dev/null || echo "")
 # ga-manual1: ctx:ready + exec:manual.
-if echo "$_eled" | grep -qE 'label add ga-manual1 ctx:ready' \
-   && echo "$_eled" | grep -qE 'label add ga-manual1 exec:manual'; then
+if echo "$_eled" | grep -E 'label add ga-manual1 ctx:ready' >/dev/null \
+   && echo "$_eled" | grep -E 'label add ga-manual1 exec:manual' >/dev/null; then
   ok "e2e: manual-signal ready bead → ctx:ready + exec:manual (written to its own store)"
 else
   bad "e2e: manual bead did not get ctx:ready + exec:manual (ledger: $(echo "$_eled" | tr '\n' ';'))"
 fi
 # ga-auto1: ctx:ready + exec:auto.
-if echo "$_eled" | grep -qE 'label add ga-auto1 ctx:ready' \
-   && echo "$_eled" | grep -qE 'label add ga-auto1 exec:auto'; then
+if echo "$_eled" | grep -E 'label add ga-auto1 ctx:ready' >/dev/null \
+   && echo "$_eled" | grep -E 'label add ga-auto1 exec:auto' >/dev/null; then
   ok "e2e: auto ready bead → ctx:ready + exec:auto"
 else
   bad "e2e: auto bead did not get ctx:ready + exec:auto (ledger: $(echo "$_eled" | tr '\n' ';'))"
 fi
 # ga-thin1: ctx:thin and NO exec label (pill only on ready/Aprovadas).
-if echo "$_eled" | grep -qE 'label add ga-thin1 ctx:thin' \
-   && ! echo "$_eled" | grep -qE 'label add ga-thin1 exec:'; then
+if echo "$_eled" | grep -E 'label add ga-thin1 ctx:thin' >/dev/null \
+   && ! echo "$_eled" | grep -E 'label add ga-thin1 exec:' >/dev/null; then
   ok "e2e: thin bead → ctx:thin, NO exec label (no pill on non-ready)"
 else
   bad "e2e: thin bead wrongly got an exec label or no ctx:thin (ledger: $(echo "$_eled" | tr '\n' ';'))"
 fi
 # ga-ctxrescue1 (ga-o9uvc): empty description, but a real comment carries the
 # full report (ga-pgzes/ga-r7uec live shape) → must clear ctx:ready, not thin.
-if echo "$_eled" | grep -qE 'label add ga-ctxrescue1 ctx:ready'; then
+if echo "$_eled" | grep -E 'label add ga-ctxrescue1 ctx:ready' >/dev/null; then
   ok "e2e: comment-carried context rescues an empty-description bead → ctx:ready (not falsely ctx:thin)"
 else
   bad "e2e REGRESSION: comment-carried context did not rescue ga-ctxrescue1 (ledger: $(echo "$_eled" | tr '\n' ';'))"
@@ -877,7 +877,7 @@ fi
 # ga-stillthin2 (ga-o9uvc): empty description, only comment is the daemon's
 # OWN prior gap-notice (ga-u8fly/gh-b2d live shape) → must stay ctx:thin, no
 # circular self-rescue from reading its own past verdict as context.
-if echo "$_eled" | grep -qE 'label add ga-stillthin2 ctx:thin'; then
+if echo "$_eled" | grep -E 'label add ga-stillthin2 ctx:thin' >/dev/null; then
   ok "e2e: only-the-daemon's-own-gap-comment present → stays ctx:thin (no circular self-rescue)"
 else
   bad "e2e REGRESSION: daemon's own gap-comment was read back as rescuing context for ga-stillthin2 (ledger: $(echo "$_eled" | tr '\n' ';'))"
@@ -888,7 +888,7 @@ fi
 # This is the exact gap that survived fix-attempt 2 (a blanket `|| true`
 # collapsed "fetch failed" into "0 comments", producing an identical thin
 # verdict as a genuinely-empty bead — gate-FAILED on this precise point).
-if echo "$_eled" | grep -qE 'label add ga-commentsfail1 ctx:(ready|thin)'; then
+if echo "$_eled" | grep -E 'label add ga-commentsfail1 ctx:(ready|thin)' >/dev/null; then
   bad "e2e REGRESSION: ga-commentsfail1 got a verdict despite its comments fetch failing (should be skipped, not judged on incomplete context) (ledger: $(echo "$_eled" | tr '\n' ';'))"
 else
   ok "e2e: comments-fetch failure → candidate skipped this sweep, no verdict on incomplete context"
@@ -916,8 +916,8 @@ CONTEXT_CHECK_CITY_OVERRIDE="$_ecity" \
   PATH="$_ecity:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
   timeout 30 bash "$DISPATCHER" >/dev/null 2>&1 || true
 _eled2=$(cat "$LEDGER" 2>/dev/null || echo "")
-if echo "$_eled2" | grep -qE 'label add ga-manual1 ctx:ready' \
-   && ! echo "$_eled2" | grep -qE 'label add ga-manual1 exec:'; then
+if echo "$_eled2" | grep -E 'label add ga-manual1 ctx:ready' >/dev/null \
+   && ! echo "$_eled2" | grep -E 'label add ga-manual1 exec:' >/dev/null; then
   ok "feature-gate OFF: ctx:ready verdict intact, NO exec label (exec-class skipped)"
 else
   bad "feature-gate OFF did not preserve verdict-without-exec (ledger: $(echo "$_eled2" | tr '\n' ';'))"
@@ -963,7 +963,7 @@ _ga_l5ud0_hold_ok=0
   [ "$EXEC" = "exec:auto" ] || exit 2
   # Simulate the guard: if exec:auto AND existing exec:manual → hold (no-op).
   _would_downgrade=1
-  if echo ",$c_labels," | grep -qF ",exec:manual," && [ "$EXEC" = "exec:auto" ]; then
+  if echo ",$c_labels," | grep -F ",exec:manual," >/dev/null && [ "$EXEC" = "exec:auto" ]; then
     _would_downgrade=0  # AUTHORITATIVE-HOLD fires
   fi
   [ "$_would_downgrade" = "0" ] || exit 3
@@ -988,7 +988,7 @@ _ga_l5ud0_upgrade_ok=0
   [ "$EXEC" = "exec:manual" ] || exit 2
   # Simulate: existing=exec:auto, computed=exec:manual → upgrade is NOT blocked.
   _would_upgrade=0
-  if echo ",$c_labels," | grep -qF ",exec:auto," && [ "$EXEC" = "exec:manual" ]; then
+  if echo ",$c_labels," | grep -F ",exec:auto," >/dev/null && [ "$EXEC" = "exec:manual" ]; then
     _would_upgrade=1  # upgrade path fires (no AUTHORITATIVE-HOLD — guard only blocks auto)
   fi
   [ "$_would_upgrade" = "1" ] || exit 3
@@ -1034,7 +1034,7 @@ echo "Scenario 13: comment-aware context — comments count, but not the daemon'
 #       (identified by its literal head string) is filtered out.
 _join_in='[{"text":"Context-check: marcado ctx:thin — falta contexto para um agente genérico construir sem um humano."},{"text":"Reported by mayor: root cause is X, fix is Y, verify via scripts/z.sh"}]'
 _joined=$(context_check_join_comments "$_join_in")
-if echo "$_joined" | grep -q "Reported by mayor" && ! echo "$_joined" | grep -q "marcado ctx:thin"; then
+if echo "$_joined" | grep "Reported by mayor" >/dev/null && ! echo "$_joined" | grep "marcado ctx:thin" >/dev/null; then
   ok "join_comments: keeps real comment text, excludes the daemon's own gap-comment"
 else
   bad "join_comments: did not filter correctly (got: $_joined)"

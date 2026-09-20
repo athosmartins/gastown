@@ -191,10 +191,10 @@ rm -f "$OUT"
 # ── (F) source drift-guard ───────────────────────────────────────────────────
 # The fixed block must check the CAPTURED bd-show exit code, not fold a
 # failure straight into the status comparison the way the buggy version did.
-printf '%s' "$DRAIN_SRC" | grep -q 'SLING_JSON_RC' \
+printf '%s' "$DRAIN_SRC" | grep 'SLING_JSON_RC' >/dev/null \
   && ok "(F1) deployed block captures bd show's exit code separately from the status value" \
   || bad "(F1) deployed block no longer captures bd show's exit code -- may have regressed to the collapse bug"
-printf '%s' "$DRAIN_SRC" | grep -q -- '-z "\$SLING_STATUS"' \
+printf '%s' "$DRAIN_SRC" | grep -- '-z "\$SLING_STATUS"' >/dev/null \
   && ok "(F2) deployed block has an explicit unknown-status branch" \
   || bad "(F2) deployed block no longer branches on an unknown/unreadable status"
 

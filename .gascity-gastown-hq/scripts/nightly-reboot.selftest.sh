@@ -419,7 +419,7 @@ else
   mkdir -p "$RDIR"; mk live "$LIVE_PID" running "$AFTER_BOOT"
   check
   [ "$SCRAPER_DAILY_STATE" = "running" ] && ok "6b: running marker + live pid started this boot -> running (THE fix)" || bad "6b: expected running, got $SCRAPER_DAILY_STATE ($SCRAPER_DAILY_REASON)"
-  printf '%s' "$SCRAPER_DAILY_REASON" | grep -q "live" && ok "6b: reason names the rodada" || bad "6b: reason missing rodada id: $SCRAPER_DAILY_REASON"
+  printf '%s' "$SCRAPER_DAILY_REASON" | grep "live" >/dev/null && ok "6b: reason names the rodada" || bad "6b: reason missing rodada id: $SCRAPER_DAILY_REASON"
 
   rm -f "$RDIR"/*.json; mk dead "$DEAD_PID" running "$AFTER_BOOT"
   check

@@ -140,8 +140,8 @@ fi
 # check in between), not on the immediately next line — window wide enough to
 # span that, matching the actual distance in the source (verified: 11 lines).
 FALLBACK_BLOCK=$(grep -A15 'gate auto-merge fallback — rebase-replay failed despite zero merge-tree conflict, ga-qukyp' "$GATE" 2>/dev/null)
-if printf '%s\n' "$FALLBACK_BLOCK" | grep -q 'push origin "HEAD:refs/heads/\$BRANCH" 2>/dev/null; then' \
-   && ! printf '%s\n' "$FALLBACK_BLOCK" | grep -q -- '--force-with-lease'; then
+if printf '%s\n' "$FALLBACK_BLOCK" | grep 'push origin "HEAD:refs/heads/\$BRANCH" 2>/dev/null; then' >/dev/null \
+   && ! printf '%s\n' "$FALLBACK_BLOCK" | grep -- '--force-with-lease' >/dev/null; then
   ok "merge fallback pushes the branch ref with a PLAIN push, no --force-with-lease anywhere in that block — correct, since merge never rewrites existing commits"
 else
   bad "merge fallback's push does not match the expected plain (non-forced) form"

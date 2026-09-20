@@ -154,7 +154,7 @@ retry_dead_decision
 # is the reliable signal instead.
 if [ "${REBASE_EVENT:-}" = "dispatcher_circuit_break_retry_dead" ] \
    && [ "$STATUS_LOG" = "|$MARKER_ID:error" ] \
-   && echo "$BD_LOG" | grep -q "assign $BEAD_ID" \
+   && echo "$BD_LOG" | grep "assign $BEAD_ID" >/dev/null \
    && [ "${_NH_STATUS:-}" = "armed" ]; then
   ok "unproven-clean + exhausted + dead author still hard-circuit-breaks exactly as before (status=$STATUS_LOG event=$REBASE_EVENT, needs-human=$_NH_STATUS) — no regression"
 else
@@ -169,7 +169,7 @@ retry_dead_decision
 if [ "${REBASE_EVENT:-}" = "dispatcher_autorebase_retry_clean_exhausted" ] \
    && [ "$STATUS_LOG" = "|$MARKER_ID:queued" ] \
    && [ -z "$GC_LOG" ] \
-   && ! echo "$BD_LOG" | grep -q "$BEAD_ID"; then
+   && ! echo "$BD_LOG" | grep "$BEAD_ID" >/dev/null; then
   ok "wa-llq1a/wa-4zmm1 shape (clean, exhausted, dead author) now stays gate-status:queued, posts no mail, and never touches the source bead (status=$STATUS_LOG event=$REBASE_EVENT)"
 else
   bad "expected quiet queued retry with the bead left alone, got event='${REBASE_EVENT:-}' status='$STATUS_LOG' gc='$GC_LOG' bd='$BD_LOG'"
@@ -182,7 +182,7 @@ unset REBASE_EVENT REBASE_VERDICT 2>/dev/null || true
 GATE_AUTO_CIRCUIT_BREAK=0 retry_dead_decision
 if [ "${REBASE_EVENT:-}" = "dispatcher_needs_rebase_escalated" ] \
    && [ "$STATUS_LOG" = "|$MARKER_ID:needs-rebase" ] \
-   && echo "$GC_LOG" | grep -q "mayor"; then
+   && echo "$GC_LOG" | grep "mayor" >/dev/null; then
   ok "GATE_AUTO_CIRCUIT_BREAK=0 fail-open still takes the original legacy needs-rebase escalation when cleanliness was never proven (status=$STATUS_LOG event=$REBASE_EVENT) — the new bypass is gated on PROVEN clean, not a blanket skip of escalation"
 else
   bad "expected unchanged legacy fail-open escalation, got event='${REBASE_EVENT:-}' status='$STATUS_LOG' gc='$GC_LOG'"

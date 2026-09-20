@@ -368,14 +368,14 @@ has '_pilot_selfheal_expired_slings "\$GC_CITY"'              "sweep-start self-
 # Sweep-start wiring: the self-heal call must appear shortly AFTER the
 # "=== Pilot sweep start ===" log line (runs every sweep, before any
 # quota/RAM/quiet-hours pause can short-circuit the rest).
-if grep -A10 '=== Pilot sweep start' "$DISPATCHER" | grep -q '_pilot_selfheal_expired_slings "\$GC_CITY"'; then
+if grep -A10 '=== Pilot sweep start' "$DISPATCHER" | grep '_pilot_selfheal_expired_slings "\$GC_CITY"' >/dev/null; then
   ok "self-heal call sits right after the sweep-start log line (runs even if the sweep pauses afterward)"
 else
   bad "self-heal call does not appear shortly after '=== Pilot sweep start' — ordering may have drifted"
 fi
 
 # REUSE (submit) branch: the failure handler must call the unsuppress helper.
-if grep -A2 'Could not submit to \$_DISPATCH_SESS_REF' "$DISPATCHER" | grep -q '_pilot_unsuppress_sling "\$GC_CITY" "\$SLING_BEAD_ID"'; then
+if grep -A2 'Could not submit to \$_DISPATCH_SESS_REF' "$DISPATCHER" | grep '_pilot_unsuppress_sling "\$GC_CITY" "\$SLING_BEAD_ID"' >/dev/null; then
   ok "REUSE branch (gc session submit failure) calls _pilot_unsuppress_sling"
 else
   bad "REUSE branch's submit-failure handler does not call _pilot_unsuppress_sling — the ga-i58em REUSE sibling gap is still open"
@@ -384,7 +384,7 @@ fi
 # Pool (nudge) branch: the failure handler must call the unsuppress helper —
 # this is the actual bug ga-h6trx3 reproduces (nudge to a POOL TEMPLATE
 # always fails).
-if grep -A2 'Could not nudge \$_SLING_TARGET — un-suppressing' "$DISPATCHER" | grep -q '_pilot_unsuppress_sling "\$GC_CITY" "\$SLING_BEAD_ID"'; then
+if grep -A2 'Could not nudge \$_SLING_TARGET — un-suppressing' "$DISPATCHER" | grep '_pilot_unsuppress_sling "\$GC_CITY" "\$SLING_BEAD_ID"' >/dev/null; then
   ok "pool branch (gc session nudge failure) calls _pilot_unsuppress_sling — closes ga-h6trx3's actual failure mode"
 else
   bad "REGRESSION / UNFIXED: pool branch's nudge-failure handler does not call _pilot_unsuppress_sling — ga-h6trx3 is not closed"
@@ -552,7 +552,7 @@ fi
 #    against pipefail, structurally (belt-and-suspenders to Scenario R, the
 #    same relationship Scenario N already has to L/M) ─────────────────────
 echo "Scenario S: drift-guard — _pse_sling_for extraction keeps its || continue pipefail guard"
-if grep -F '_pse_sling_for=$(printf' "$DISPATCHER" | grep -qF -- '|| continue'; then
+if grep -F '_pse_sling_for=$(printf' "$DISPATCHER" | grep -F -- '|| continue' >/dev/null; then
   ok "_pse_sling_for extraction keeps its || continue pipefail guard"
 else
   bad "REGRESSION: _pse_sling_for extraction lost its || continue guard (the exact ga-0u5xml crash could be back)"

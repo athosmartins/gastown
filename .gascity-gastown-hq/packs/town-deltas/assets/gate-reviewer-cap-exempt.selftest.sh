@@ -55,9 +55,9 @@ fi
 # The command is exactly 5 lines (session new, --no-attach, --title, --json,
 # `2>... || echo "{}"`); -A4 captures it and stops before the cleanup line.
 SPAWN_CMD="$(grep -A4 'session new[[:space:]]\+gate-reviewer' "$GATE" 2>/dev/null || true)"
-if printf '%s' "$SPAWN_CMD" | grep -q '2>/dev/null'; then
+if printf '%s' "$SPAWN_CMD" | grep '2>/dev/null' >/dev/null; then
   bad "reviewer 'session new' command still swallows stderr with 2>/dev/null"
-elif printf '%s' "$SPAWN_CMD" | grep -Eq '2>[[:space:]]*"?\$?[A-Za-z_/]'; then
+elif printf '%s' "$SPAWN_CMD" | grep -E '2>[[:space:]]*"?\$?[A-Za-z_/]' >/dev/null; then
   ok "reviewer 'session new' redirects stderr to a capture file (fails loud)"
 else
   bad "reviewer 'session new' has no explicit stderr capture (cannot log failures)"

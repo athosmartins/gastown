@@ -181,7 +181,7 @@ GOT_SHA="$(field GOT_BEAD_MERGE_SHA "$REFRESH_ECHO")"
 run_block B
 [ "$RUN_RC" -eq 0 ] && ok "T3 block completes clean on Path B (no-op pull)" \
   || nok "T3 rc" "rc=$RUN_RC log=[$LOG_OUT]"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=" >/dev/null \
   && ok "T3 pre-existing Path-B probe (ga-6zkhci) still runs unaffected" \
   || nok "T3 Path-B probe" "$LOG_OUT"
 GOT_PRE="$(field GOT_BEAD_MERGE_PRE_SHA "$REFRESH_ECHO")"

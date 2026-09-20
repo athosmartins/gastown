@@ -260,28 +260,28 @@ STUB_NARROW_AFFECTED="com.test.new-daemon"
 STUB_WIDE_GUARDED="com.test.old-daemon"
 run_block unattributed
 [ "$RUN_RC" -eq 0 ] && ok "T1 block runs clean (rc=0)" || nok "T1 rc" "rc=$RUN_RC log=[$LOG_OUT]"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=0" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=0" >/dev/null \
   && ok "T1 own-merge probe classified NOT inert (new-daemon is a real hit)" \
   || nok "T1 inert classification" "$LOG_OUT"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && nok "T1 delivery WAS held (delivery:failed set) — the bug this fix closes" "$BD_CALLS" \
   || ok "T1 delivery is NOT held (no delivery:failed) — the fix"
-echo "$BD_CALLS" | grep -q "Delivery HALTED" \
+echo "$BD_CALLS" | grep "Delivery HALTED" >/dev/null \
   && nok "T1 a HALT comment was wrongly posted for an unattributed daemon" "$BD_CALLS" \
   || ok "T1 no HALT comment posted (nothing to blame this bead for)"
-echo "$GC_CALLS" | grep -q "session nudge mayor" \
+echo "$GC_CALLS" | grep "session nudge mayor" >/dev/null \
   && ok "T1 mayor is still nudged — invariant (b): the gap stays visible/charged" \
   || nok "T1 missing mayor nudge (invariant b violated — the unattributed gap went silent)" "$GC_CALLS"
-echo "$GC_CALLS" | grep -q "com.test.old-daemon" \
+echo "$GC_CALLS" | grep "com.test.old-daemon" >/dev/null \
   && ok "T1 mayor nudge names the actually-stuck daemon (old-daemon)" \
   || nok "T1 mayor nudge does not name old-daemon" "$GC_CALLS"
 [ "$BASELINE_AFTER" = "$EXPECT_C2" ] \
   && ok "T1 rig-wide baseline marker ADVANCED to POST_DEPLOY_SHA — invariant (c), closes the self-feeding window-growth loop" \
   || nok "T1 baseline marker did not advance" "want=$EXPECT_C2 got=$BASELINE_AFTER"
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.old-daemon $EXPECT_C0 stuck" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.old-daemon $EXPECT_C0 stuck" >/dev/null \
   && ok "T1 the still-stuck old-daemon, dropped out of the next window by that advance, stays ON RECORD: frozen at its pre-advance baseline (C0), flagged stuck (ga-7polxu)" \
   || nok "T1 the marker advance erased the stuck daemon's record (ga-7polxu: 41 guarded, 0 recorded)" "perdaemon=[$PERDAEMON_AFTER]"
-echo "$LOG_OUT" | grep -q "drops the still-stuck daemon(s) \[com.test.old-daemon\]" \
+echo "$LOG_OUT" | grep "drops the still-stuck daemon(s) \[com.test.old-daemon\]" >/dev/null \
   && ok "T1 the sweep log says the advance drops old-daemon out of the next wide window — the erasure is no longer silent" \
   || nok "T1 no log line naming the daemon the marker advance drops" "$LOG_OUT"
 
@@ -292,23 +292,23 @@ STUB_WIDE_GUARDED="com.test.old-daemon com.test.new-daemon"
 run_block attributed
 [ "$RUN_RC" -eq 0 ] && ok "T2 block runs clean (rc=0; continue-based halt, BD state is the signal)" \
   || nok "T2 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=0" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=0" >/dev/null \
   && ok "T2 own-merge probe classified NOT inert" \
   || nok "T2 inert classification" "$LOG_OUT"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && ok "T2 delivery IS held (delivery:failed set) — still-attributed daemon correctly blocks" \
   || nok "T2 delivery was wrongly NOT held" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "Delivery HALTED" \
+echo "$BD_CALLS" | grep "Delivery HALTED" >/dev/null \
   && ok "T2 HALT comment posted" \
   || nok "T2 missing HALT comment" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "restart THESE for this merge" \
+echo "$BD_CALLS" | grep "restart THESE for this merge" >/dev/null \
   && ok "T2 halt still leads with the per-bead attribution phrase (ga-9lug2k, untouched by this fix)" \
   || nok "T2 missing lead-with phrase" "$BD_CALLS"
 [ "$BASELINE_AFTER" = "$EXPECT_C0" ] \
   && ok "T2 rig-wide baseline marker did NOT advance (stayed at pre-existing value) — new branch correctly did not fire" \
   || nok "T2 baseline marker unexpectedly changed" "want(unchanged)=$EXPECT_C0 got=$BASELINE_AFTER"
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.old-daemon $EXPECT_C0 stuck" \
-  && echo "$PERDAEMON_AFTER" | grep -qx "com.test.new-daemon $EXPECT_C0 stuck" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.old-daemon $EXPECT_C0 stuck" >/dev/null \
+  && echo "$PERDAEMON_AFTER" | grep -x "com.test.new-daemon $EXPECT_C0 stuck" >/dev/null \
   && ok "T2 the hold path records BOTH still-stuck daemons frozen at C0 too — the per-daemon bookkeeping does not depend on which branch decides the delivery" \
   || nok "T2 stuck daemons not recorded on the hold path" "perdaemon=[$PERDAEMON_AFTER]"
 
@@ -318,13 +318,13 @@ STUB_NARROW_AFFECTED="com.test.new-daemon"
 STUB_WIDE_GUARDED="com.test.old-daemon com.test.new-daemon"
 run_block path_a_attributed
 [ "$RUN_RC" -eq 0 ] && ok "T3 block runs clean (rc=0)" || nok "T3 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=0" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=0" >/dev/null \
   && ok "T3 own-merge probe classified NOT inert (via the probe, on Path A too)" \
   || nok "T3 inert classification" "$LOG_OUT"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && ok "T3 delivery IS held (delivery:failed set) — still-attributed daemon correctly blocks" \
   || nok "T3 delivery was wrongly NOT held" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "restart THESE for this merge" \
+echo "$BD_CALLS" | grep "restart THESE for this merge" >/dev/null \
   && ok "T3 halt now leads with the per-bead attribution phrase on Path A too (ga-ndu4ic — this used to be unavailable here)" \
   || nok "T3 missing lead-with phrase — Path A attribution regressed" "$BD_CALLS"
 [ "$BASELINE_AFTER" = "$EXPECT_C0" ] \
@@ -338,22 +338,22 @@ STUB_NARROW_AFFECTED="com.test.new-daemon"
 STUB_WIDE_GUARDED="com.test.old-daemon"
 run_block path_a_unattributed
 [ "$RUN_RC" -eq 0 ] && ok "T4 block runs clean (rc=0)" || nok "T4 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=0" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=0" >/dev/null \
   && ok "T4 own-merge probe classified NOT inert (new-daemon is a real hit)" \
   || nok "T4 inert classification" "$LOG_OUT"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && nok "T4 delivery WAS held (delivery:failed set) — Path A did not get the same exoneration as Path B (T1)" "$BD_CALLS" \
   || ok "T4 delivery is NOT held (no delivery:failed) — Path A now exonerates exactly like Path B (T1)"
-echo "$BD_CALLS" | grep -q "Delivery HALTED" \
+echo "$BD_CALLS" | grep "Delivery HALTED" >/dev/null \
   && nok "T4 a HALT comment was wrongly posted for an unattributed daemon" "$BD_CALLS" \
   || ok "T4 no HALT comment posted (nothing to blame this bead for)"
-echo "$GC_CALLS" | grep -q "session nudge mayor" \
+echo "$GC_CALLS" | grep "session nudge mayor" >/dev/null \
   && ok "T4 mayor is still nudged — invariant (b): the gap stays visible/charged" \
   || nok "T4 missing mayor nudge (invariant b violated)" "$GC_CALLS"
 [ "$BASELINE_AFTER" = "$EXPECT_C2" ] \
   && ok "T4 rig-wide baseline marker ADVANCED to POST_DEPLOY_SHA on Path A too (ga-ndu4ic, closes the Aceite-3 loop)" \
   || nok "T4 baseline marker did not advance" "want=$EXPECT_C2 got=$BASELINE_AFTER"
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.old-daemon $EXPECT_C0 stuck" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.old-daemon $EXPECT_C0 stuck" >/dev/null \
   && ok "T4 on Path A too, the still-stuck old-daemon stays on record (frozen at C0, stuck) after the marker advance (ga-7polxu)" \
   || nok "T4 the marker advance erased the stuck daemon's record on Path A" "perdaemon=[$PERDAEMON_AFTER]"
 

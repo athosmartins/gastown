@@ -306,17 +306,17 @@ phantom_block="$(awk '
   /^_beadid_live_crew_owner\(\) \{/ { p=1 }
   p { print; if ($0 == "}") exit }
 ' "$DISPATCHER")"
-if printf '%s' "$phantom_block" | grep -qE '_ownership_guard_repos >/dev/null 2>&1; *_og_rig_list_ok=\$\?'; then
+if printf '%s' "$phantom_block" | grep -E '_ownership_guard_repos >/dev/null 2>&1; *_og_rig_list_ok=\$\?' >/dev/null; then
   ok "_beadid_live_crew_owner calls _ownership_guard_repos unwrapped and captures its exit code (ga-130et shape)"
 else
   bad "REGRESSION: _beadid_live_crew_owner no longer calls _ownership_guard_repos unwrapped + captures its exit code the way ga-130et requires"
 fi
-if printf '%s' "$phantom_block" | grep -qE '_og_repos="\$\{_OWNERSHIP_GUARD_REPOS:-\}"'; then
+if printf '%s' "$phantom_block" | grep -E '_og_repos="\$\{_OWNERSHIP_GUARD_REPOS:-\}"' >/dev/null; then
   ok "_beadid_live_crew_owner reads the memoized repos list directly from the global (ga-130et shape)"
 else
   bad "REGRESSION: _beadid_live_crew_owner no longer reads \$_OWNERSHIP_GUARD_REPOS directly — may have reverted to a \$(...)-wrapped call"
 fi
-if printf '%s' "$phantom_block" | grep -qE '&& \[ "\$_og_rig_list_ok" -eq 0 \]'; then
+if printf '%s' "$phantom_block" | grep -E '&& \[ "\$_og_rig_list_ok" -eq 0 \]' >/dev/null; then
   ok "the exit-code check is wired as a required (&&) condition of the release path"
 else
   bad "REGRESSION: \$_og_rig_list_ok is not wired as a required && condition — a gc failure could silently look like 'confirmed no branch' again"
@@ -533,7 +533,7 @@ GCEOF
   # -- Negative control: fix-attempt-2's exact shipped shape (bare call) —
   #    must abort before the post marker prints. --
   _p3_neg_out="$(PATH="$SANDBOX_BIN7:$PATH" bash "$_p3_neg_script" 2>&1)"; _p3_neg_rc=$?
-  if [ "$_p3_neg_rc" -ne 0 ] && ! printf '%s' "$_p3_neg_out" | grep -q POST_PRIME_MARKER; then
+  if [ "$_p3_neg_rc" -ne 0 ] && ! printf '%s' "$_p3_neg_out" | grep POST_PRIME_MARKER >/dev/null; then
     ok "negative control: fix-attempt-2's bare invocation shape aborts the whole script on a gc failure (rc=$_p3_neg_rc, post-marker absent) — confirms this test can detect the bug"
   else
     bad "negative control did not reproduce the crash (rc=$_p3_neg_rc, output: $_p3_neg_out) — the positive result below would not be meaningful; investigate before trusting it"
@@ -542,7 +542,7 @@ GCEOF
   # -- Positive proof: the ACTUAL shipped top-level invocation line — must
   #    survive a gc failure and keep running. --
   _p3_pos_out="$(PATH="$SANDBOX_BIN7:$PATH" bash "$_p3_pos_script" 2>&1)"; _p3_pos_rc=$?
-  if [ "$_p3_pos_rc" -eq 0 ] && printf '%s' "$_p3_pos_out" | grep -q POST_PRIME_MARKER; then
+  if [ "$_p3_pos_rc" -eq 0 ] && printf '%s' "$_p3_pos_out" | grep POST_PRIME_MARKER >/dev/null; then
     ok "ga-130et fix-attempt-3 FIXED: the shipped top-level invocation ('$_p3_invoke_line') survives a gc rig list failure and the script keeps running"
   else
     bad "ga-130et fix-attempt-3 REGRESSION: the shipped top-level invocation ('$_p3_invoke_line') still aborts the whole script on a gc failure (rc=$_p3_pos_rc, output: $_p3_pos_out)"

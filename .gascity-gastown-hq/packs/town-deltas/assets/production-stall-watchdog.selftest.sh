@@ -59,7 +59,7 @@ run_test() {
   local name="$1"; local code="$2"; local expected="$3"
   local result
   result=$(WD_SCRIPT="$WD_SCRIPT" python3 -c "$code" 2>&1) || true
-  if echo "$result" | grep -qF "$expected"; then
+  if echo "$result" | grep -F "$expected" >/dev/null; then
     echo "PASS: $name"; PASS=$((PASS + 1))
   else
     echo "FAIL: $name"; echo "  expected substring: $expected"; echo "  got: $result"

@@ -104,25 +104,25 @@ run_block() {
 
 # ── S1 (CONTROLE): ANCESTOR → proceeds, no delivery:failed ────────────────────
 run_block ANCESTOR
-! echo "$LAST_BD" | grep -q "delivery:failed" && ok "S1 ANCESTOR: no delivery:failed label (proceeds to Step 4)" || nok "S1 failed-label" "$LAST_BD"
-! echo "$LAST_BD" | grep -q "label add ga-test story:done" && ok "S1 ANCESTOR: story:done not set HERE (Step 4/8's job, not 3.6's)" || nok "S1 story-done" "$LAST_BD"
-echo "$LAST_GIT" | grep -q "story_merge_verdict" && ok "S1 ANCESTOR: verdict function was actually consulted" || nok "S1 verdict-called" "$LAST_GIT"
+! echo "$LAST_BD" | grep "delivery:failed" >/dev/null && ok "S1 ANCESTOR: no delivery:failed label (proceeds to Step 4)" || nok "S1 failed-label" "$LAST_BD"
+! echo "$LAST_BD" | grep "label add ga-test story:done" >/dev/null && ok "S1 ANCESTOR: story:done not set HERE (Step 4/8's job, not 3.6's)" || nok "S1 story-done" "$LAST_BD"
+echo "$LAST_GIT" | grep "story_merge_verdict" >/dev/null && ok "S1 ANCESTOR: verdict function was actually consulted" || nok "S1 verdict-called" "$LAST_GIT"
 
 # ── S2 (FIXTURE): NOT_ANCESTOR → HALT, delivery:failed naming sha+rig ────────
 run_block NOT_ANCESTOR
-echo "$LAST_BD" | grep -q "label add ga-test delivery:failed" && ok "S2 NOT_ANCESTOR: delivery:failed added" || nok "S2 failed-label" "$LAST_BD"
-echo "$LAST_BD" | grep -q "label remove ga-test delivery:running" && ok "S2 NOT_ANCESTOR: delivery:running removed" || nok "S2 running-removed" "$LAST_BD"
-! echo "$LAST_BD" | grep -q "label add ga-test story:done" && ok "S2 NOT_ANCESTOR: story:done NOT set" || nok "S2 story-done" "$LAST_BD"
-echo "$LAST_BD" | grep -q "comment ga-test" && echo "$LAST_BD" | grep -qi "gascity" && ok "S2 NOT_ANCESTOR: comment names the rig" || nok "S2 comment-rig" "$LAST_BD"
-echo "$LAST_BD" | grep -q "abc1234deadbeefabc1234deadbeefabc1234de" && ok "S2 NOT_ANCESTOR: comment names the sha (bug's literal ask: 'nomeando o sha e o rig')" || nok "S2 comment-sha" "$LAST_BD"
-echo "$LAST_GC" | grep -q "session nudge mayor" && ok "S2 NOT_ANCESTOR: mayor nudged" || nok "S2 mayor-nudge" "$LAST_GC"
-echo "$LAST_GC" | grep -q "session nudge crew/tester" && ok "S2 NOT_ANCESTOR: author nudged" || nok "S2 author-nudge" "$LAST_GC"
+echo "$LAST_BD" | grep "label add ga-test delivery:failed" >/dev/null && ok "S2 NOT_ANCESTOR: delivery:failed added" || nok "S2 failed-label" "$LAST_BD"
+echo "$LAST_BD" | grep "label remove ga-test delivery:running" >/dev/null && ok "S2 NOT_ANCESTOR: delivery:running removed" || nok "S2 running-removed" "$LAST_BD"
+! echo "$LAST_BD" | grep "label add ga-test story:done" >/dev/null && ok "S2 NOT_ANCESTOR: story:done NOT set" || nok "S2 story-done" "$LAST_BD"
+echo "$LAST_BD" | grep "comment ga-test" >/dev/null && echo "$LAST_BD" | grep -i "gascity" >/dev/null && ok "S2 NOT_ANCESTOR: comment names the rig" || nok "S2 comment-rig" "$LAST_BD"
+echo "$LAST_BD" | grep "abc1234deadbeefabc1234deadbeefabc1234de" >/dev/null && ok "S2 NOT_ANCESTOR: comment names the sha (bug's literal ask: 'nomeando o sha e o rig')" || nok "S2 comment-sha" "$LAST_BD"
+echo "$LAST_GC" | grep "session nudge mayor" >/dev/null && ok "S2 NOT_ANCESTOR: mayor nudged" || nok "S2 mayor-nudge" "$LAST_GC"
+echo "$LAST_GC" | grep "session nudge crew/tester" >/dev/null && ok "S2 NOT_ANCESTOR: author nudged" || nok "S2 author-nudge" "$LAST_GC"
 
 # ── S3 (CONTROLE 2): NO_COMMENT → HALT the same way, fail-closed ─────────────
 run_block NO_COMMENT
-echo "$LAST_BD" | grep -q "label add ga-test delivery:failed" && ok "S3 NO_COMMENT: delivery:failed added (unverified blocks same as not-ancestor)" || nok "S3 failed-label" "$LAST_BD"
-! echo "$LAST_BD" | grep -q "label add ga-test story:done" && ok "S3 NO_COMMENT: story:done NOT set (no default-permissive)" || nok "S3 story-done" "$LAST_BD"
-! echo "$LAST_GIT" | grep -q "story_merge_verdict" && ok "S3 NO_COMMENT: story_merge_verdict never called (no sha to check)" || nok "S3 verdict-not-called" "$LAST_GIT"
+echo "$LAST_BD" | grep "label add ga-test delivery:failed" >/dev/null && ok "S3 NO_COMMENT: delivery:failed added (unverified blocks same as not-ancestor)" || nok "S3 failed-label" "$LAST_BD"
+! echo "$LAST_BD" | grep "label add ga-test story:done" >/dev/null && ok "S3 NO_COMMENT: story:done NOT set (no default-permissive)" || nok "S3 story-done" "$LAST_BD"
+! echo "$LAST_GIT" | grep "story_merge_verdict" >/dev/null && ok "S3 NO_COMMENT: story_merge_verdict never called (no sha to check)" || nok "S3 verdict-not-called" "$LAST_GIT"
 
 echo ""
 echo "story-delivery merge-verify tests: $PASS passed, $FAIL failed"

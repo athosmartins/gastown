@@ -192,13 +192,13 @@ run_block ga-test1
 [ "$RUN_RC" -eq 0 ] && ok "T1 block runs clean (rc=0; continue-based halt, BD state is the signal)" \
   || nok "T1 rc" "rc=$RUN_RC"
 [ "$REACHED" -eq 0 ] && ok "T1 block halts via continue" || nok "T1 halted" "REACHED=$REACHED"
-echo "$BD_CALLS" | grep -q "label add ga-test1 delivery:failed" \
+echo "$BD_CALLS" | grep "label add ga-test1 delivery:failed" >/dev/null \
   && ok "T1 delivery:failed added" || nok "T1 failed-label" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "comment ga-test1" \
+echo "$BD_CALLS" | grep "comment ga-test1" >/dev/null \
   && ok "T1 first HALT: comment posted" || nok "T1 comment" "$BD_CALLS"
-echo "$GC_CALLS" | grep -q "session nudge crew/tester" \
+echo "$GC_CALLS" | grep "session nudge crew/tester" >/dev/null \
   && ok "T1 first HALT: author nudged" || nok "T1 author nudge" "$GC_CALLS"
-echo "$GC_CALLS" | grep -q "session nudge mayor" \
+echo "$GC_CALLS" | grep "session nudge mayor" >/dev/null \
   && ok "T1 first HALT: Mayor nudged" || nok "T1 mayor nudge" "$GC_CALLS"
 
 # ── T2: second HALT for ga-test1, IDENTICAL verdict/guarded (a plain retry,
@@ -207,20 +207,20 @@ run_block ga-test1
 [ "$RUN_RC" -eq 0 ] && ok "T2 block runs clean (rc=0)" || nok "T2 rc" "rc=$RUN_RC"
 [ "$REACHED" -eq 0 ] && ok "T2 block still halts via continue — retry mechanics unaffected" \
   || nok "T2 halted" "REACHED=$REACHED"
-echo "$BD_CALLS" | grep -q "label add ga-test1 delivery:failed" \
+echo "$BD_CALLS" | grep "label add ga-test1 delivery:failed" >/dev/null \
   && ok "T2 delivery:failed still (re)applied every cycle" || nok "T2 failed-label" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "label add ga-test1 delivery:deploy-pending" \
+echo "$BD_CALLS" | grep "label add ga-test1 delivery:deploy-pending" >/dev/null \
   && ok "T2 delivery:deploy-pending still (re)applied every cycle" || nok "T2 deploy-pending" "$BD_CALLS"
-! echo "$BD_CALLS" | grep -q "comment ga-test1" \
+! echo "$BD_CALLS" | grep "comment ga-test1" >/dev/null \
   && ok "T2 identical repeat HALT: comment suppressed (THE FIX)" \
   || nok "T2 comment should be suppressed" "$BD_CALLS"
-! echo "$GC_CALLS" | grep -q "session nudge crew/tester" \
+! echo "$GC_CALLS" | grep "session nudge crew/tester" >/dev/null \
   && ok "T2 identical repeat HALT: author nudge suppressed" \
   || nok "T2 author nudge should be suppressed" "$GC_CALLS"
-! echo "$GC_CALLS" | grep -q "session nudge mayor" \
+! echo "$GC_CALLS" | grep "session nudge mayor" >/dev/null \
   && ok "T2 identical repeat HALT: Mayor nudge suppressed" \
   || nok "T2 mayor nudge should be suppressed" "$GC_CALLS"
-echo "$LOG_OUT" | grep -q "suppressing duplicate comment/nudge" \
+echo "$LOG_OUT" | grep "suppressing duplicate comment/nudge" >/dev/null \
   && ok "T2 log records the suppression (visible to whoever reads story-delivery.log)" \
   || nok "T2 suppression log line" "$LOG_OUT"
 
@@ -229,20 +229,20 @@ echo "$LOG_OUT" | grep -q "suppressing duplicate comment/nudge" \
 write_stub "com.test.central-sender com.test.other-daemon"
 run_block ga-test1
 [ "$RUN_RC" -eq 0 ] && ok "T3 block runs clean (rc=0)" || nok "T3 rc" "rc=$RUN_RC"
-echo "$BD_CALLS" | grep -q "comment ga-test1" \
+echo "$BD_CALLS" | grep "comment ga-test1" >/dev/null \
   && ok "T3 real transition (GUARDED set changed): comment posted again" \
   || nok "T3 comment" "$BD_CALLS"
-echo "$GC_CALLS" | grep -q "session nudge mayor" \
+echo "$GC_CALLS" | grep "session nudge mayor" >/dev/null \
   && ok "T3 real transition: Mayor nudged again" || nok "T3 mayor nudge" "$GC_CALLS"
 
 # ── T4: a DIFFERENT story's first HALT in the SAME city → not suppressed by
 #        ga-test1's fingerprint (per-bead dedup key, not global) ───────────
 run_block ga-test2
 [ "$RUN_RC" -eq 0 ] && ok "T4 block runs clean (rc=0)" || nok "T4 rc" "rc=$RUN_RC"
-echo "$BD_CALLS" | grep -q "comment ga-test2" \
+echo "$BD_CALLS" | grep "comment ga-test2" >/dev/null \
   && ok "T4 different story's first HALT: comment posted (per-bead dedup, not global)" \
   || nok "T4 comment" "$BD_CALLS"
-echo "$GC_CALLS" | grep -q "session nudge mayor" \
+echo "$GC_CALLS" | grep "session nudge mayor" >/dev/null \
   && ok "T4 different story's first HALT: Mayor nudged" || nok "T4 mayor nudge" "$GC_CALLS"
 
 # ── T5: ga-vv5ngy spaced reminder — same story (fresh id), first HALT
@@ -252,7 +252,7 @@ write_stub "com.test.central-sender"
 run_block ga-test3
 [ "$RUN_RC" -eq 0 ] && ok "T5 setup: first HALT for ga-test3 runs clean" \
   || nok "T5 setup rc" "rc=$RUN_RC"
-echo "$BD_CALLS" | grep -q "comment ga-test3" \
+echo "$BD_CALLS" | grep "comment ga-test3" >/dev/null \
   && ok "T5 setup: first HALT announced" || nok "T5 setup comment" "$BD_CALLS"
 # ga-q29hsf: the "last report is older than the interval" precondition is SET,
 # not waited for — a sleep here raced a loaded machine and slowed every gate run.
@@ -260,28 +260,28 @@ backdate_halt_fp ga-test3 \
   && ok "T5 setup: ga-test3's last report backdated past the reminder interval"
 run_block ga-test3
 [ "$RUN_RC" -eq 0 ] && ok "T5 block runs clean (rc=0)" || nok "T5 rc" "rc=$RUN_RC"
-echo "$BD_CALLS" | grep -q "comment ga-test3" \
+echo "$BD_CALLS" | grep "comment ga-test3" >/dev/null \
   && ok "T5 same fingerprint, reminder interval elapsed: comment fires" \
   || nok "T5 comment" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "STILL unresolved" \
+echo "$BD_CALLS" | grep "STILL unresolved" >/dev/null \
   && ok "T5 reminder comment is marked as a reminder, not a fresh HALT" \
   || nok "T5 reminder wording" "$BD_CALLS"
-! echo "$BD_CALLS" | grep -q "Refresh detail:" \
+! echo "$BD_CALLS" | grep "Refresh detail:" >/dev/null \
   && ok "T5 invariant (c): reminder does NOT repeat the full daemon list" \
   || nok "T5 should not include Refresh detail:" "$BD_CALLS"
-echo "$GC_CALLS" | grep -q "session nudge crew/tester" \
+echo "$GC_CALLS" | grep "session nudge crew/tester" >/dev/null \
   && ok "T5 reminder: author nudged again" || nok "T5 author nudge" "$GC_CALLS"
-echo "$GC_CALLS" | grep -q "session nudge mayor" \
+echo "$GC_CALLS" | grep "session nudge mayor" >/dev/null \
   && ok "T5 reminder: Mayor nudged again" || nok "T5 mayor nudge" "$GC_CALLS"
 
 # ── T6: immediately after T5 (timestamp just refreshed), same fingerprint
 #        again → back to silent — the reminder is SPACED, not sticky ──────
 run_block ga-test3
 [ "$RUN_RC" -eq 0 ] && ok "T6 block runs clean (rc=0)" || nok "T6 rc" "rc=$RUN_RC"
-! echo "$BD_CALLS" | grep -q "comment ga-test3" \
+! echo "$BD_CALLS" | grep "comment ga-test3" >/dev/null \
   && ok "T6 right after a reminder, unchanged: comment suppressed again" \
   || nok "T6 comment should be suppressed" "$BD_CALLS"
-! echo "$GC_CALLS" | grep -q "session nudge mayor" \
+! echo "$GC_CALLS" | grep "session nudge mayor" >/dev/null \
   && ok "T6 right after a reminder, unchanged: Mayor nudge suppressed again" \
   || nok "T6 mayor nudge should be suppressed" "$GC_CALLS"
 

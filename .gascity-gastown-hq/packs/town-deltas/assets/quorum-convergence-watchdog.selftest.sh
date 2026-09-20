@@ -22,7 +22,7 @@ FAIL=0
 
 check() {
     local name="$1" result="$2" expected="$3"
-    if printf '%s' "$result" | grep -q "$expected"; then
+    if printf '%s' "$result" | grep "$expected" >/dev/null; then
         PASS=$((PASS + 1))
         echo "  PASS: $name"
     else
@@ -47,7 +47,7 @@ check_empty() {
 
 check_absent() {
     local name="$1" result="$2" absent="$3"
-    if ! printf '%s' "$result" | grep -q "$absent"; then
+    if ! printf '%s' "$result" | grep "$absent" >/dev/null; then
         PASS=$((PASS + 1))
         echo "  PASS: $name"
     else

@@ -270,10 +270,10 @@ else
 $FORCE_HITS"
 fi
 
-printf '%s' "$FN_RELEASE" | grep -q -- '--force' \
+printf '%s' "$FN_RELEASE" | grep -- '--force' >/dev/null \
   && ok "gate_release_stale_assignee contains the merge-verified --force escalation (ga-2emo8)" \
   || bad "gate_release_stale_assignee is missing the --force escalation — ga-2emo8 fix not present"
-printf '%s' "$FN_CLOSE_TERM" | grep -q -- '--force' \
+printf '%s' "$FN_CLOSE_TERM" | grep -- '--force' >/dev/null \
   && ok "gate_close_source_terminal contains the merge-verified --force escalation (ga-2emo8)" \
   || bad "gate_close_source_terminal is missing the --force escalation — ga-2emo8 fix not present"
 

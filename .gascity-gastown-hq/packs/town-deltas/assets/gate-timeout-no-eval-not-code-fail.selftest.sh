@@ -95,12 +95,12 @@ OUT1="$(bash -c '
   '"$FN_SIGNAL"'
   printf "OVERALL_VERDICT=%s|GATE_FAIL_NO_EVAL=%s|FAIL_REASONS=%s\n" "$OVERALL_VERDICT" "$GATE_FAIL_NO_EVAL" "$FAIL_REASONS"
 ' 2>&1)"
-if printf '%s' "$OUT1" | grep -q '^OVERALL_VERDICT=FAIL|GATE_FAIL_NO_EVAL=1|'; then
+if printf '%s' "$OUT1" | grep '^OVERALL_VERDICT=FAIL|GATE_FAIL_NO_EVAL=1|' >/dev/null; then
   ok "genuine timeout block raises GATE_FAIL_NO_EVAL=1 without disturbing OVERALL_VERDICT=FAIL — got: $OUT1"
 else
   bad "genuine timeout branch did not raise the no-eval signal correctly — got: $OUT1"
 fi
-if printf '%s' "$OUT1" | grep -q 'FAIL_REASONS=TIMEOUT:'; then
+if printf '%s' "$OUT1" | grep 'FAIL_REASONS=TIMEOUT:' >/dev/null; then
   ok "FAIL_REASONS still records the TIMEOUT reason (block does not disturb it)"
 else
   bad "FAIL_REASONS lost its TIMEOUT reason — got: $OUT1"
@@ -142,14 +142,14 @@ run_reset() {
 }
 
 OUT2A="$(run_reset 1)"
-if printf '%s' "$OUT2A" | grep -q '^CLASS=hold|NO_EVAL_AFTER=0$'; then
+if printf '%s' "$OUT2A" | grep '^CLASS=hold|NO_EVAL_AFTER=0$' >/dev/null; then
   ok "GATE_FAIL_NO_EVAL=1 classifies this run's stamp as hold, and clears the signal after consuming it — got: $OUT2A"
 else
   bad "signaled no-eval FAIL did not classify as hold (or failed to clear) — got: $OUT2A"
 fi
 
 OUT2B="$(run_reset 0)"
-if printf '%s' "$OUT2B" | grep -q '^CLASS=code|NO_EVAL_AFTER=0$'; then
+if printf '%s' "$OUT2B" | grep '^CLASS=code|NO_EVAL_AFTER=0$' >/dev/null; then
   ok "no signal (ordinary real-content FAIL) still classifies as code — ga-nooaw non-regression — got: $OUT2B"
 else
   bad "unsignaled FAIL regressed away from the code default — got: $OUT2B"
@@ -171,7 +171,7 @@ OUT2C="$(bash -c '
   SECOND="$GATE_SHA_FAIL_CLASS"
   printf "FIRST=%s|SECOND=%s\n" "$FIRST" "$SECOND"
 ' 2>&1)"
-if printf '%s' "$OUT2C" | grep -q '^FIRST=hold|SECOND=code$'; then
+if printf '%s' "$OUT2C" | grep '^FIRST=hold|SECOND=code$' >/dev/null; then
   ok "a hold classified for bead #1 does not leak into bead #2's finalize call this same sweep — got: $OUT2C"
 else
   bad "anti-leak broken: a prior bead's no-eval hold leaked into the next bead's classification — got: $OUT2C"
@@ -191,7 +191,7 @@ OUT2M="$(bash -c '
   run_reset_inner
   printf "CLASS=%s\n" "$GATE_SHA_FAIL_CLASS"
 ' 2>&1)"
-if printf '%s' "$OUT2M" | grep -q '^CLASS=code$'; then
+if printf '%s' "$OUT2M" | grep '^CLASS=code$' >/dev/null; then
   ok "mutant (guard removed) DOES stamp code on a signaled no-eval timeout — reproduces the pre-fix ga-mcapdq bug, proving Part 2 is not vacuous"
 else
   bad "mutant should have reproduced the pre-fix always-code bug but didn't — mutation harness itself is broken: $OUT2M"
@@ -224,7 +224,7 @@ run_bump() {
 
 BD_LOG3A="$(mktemp)"
 OUT3A="$(run_bump 1 2 "$BD_LOG3A")"
-if printf '%s' "$OUT3A" | grep -q '^NEW_ATTEMPT=2$'; then
+if printf '%s' "$OUT3A" | grep '^NEW_ATTEMPT=2$' >/dev/null; then
   ok "no-eval timeout: NEW_ATTEMPT stays at PREV_ATTEMPT (2) — counter not advanced"
 else
   bad "no-eval timeout: NEW_ATTEMPT should stay 2 — got: $OUT3A"
@@ -237,7 +237,7 @@ fi
 
 BD_LOG3B="$(mktemp)"
 OUT3B="$(run_bump 0 2 "$BD_LOG3B")"
-if printf '%s' "$OUT3B" | grep -q '^NEW_ATTEMPT=3$'; then
+if printf '%s' "$OUT3B" | grep '^NEW_ATTEMPT=3$' >/dev/null; then
   ok "real FAIL: NEW_ATTEMPT bumps from 2 to 3 (unaffected by this fix)"
 else
   bad "real FAIL: NEW_ATTEMPT should bump to 3 — got: $OUT3B"
@@ -264,7 +264,7 @@ OUT3M="$(bash -c '
   '"$FN_BUMP_MUTANT"'
   printf "NEW_ATTEMPT=%s\n" "$NEW_ATTEMPT"
 ' _ "$BD_LOG3M" 2>&1)"
-if printf '%s' "$OUT3M" | grep -q '^NEW_ATTEMPT=3$' && grep -q 'gate:fix-attempt:3' "$BD_LOG3M"; then
+if printf '%s' "$OUT3M" | grep '^NEW_ATTEMPT=3$' >/dev/null && grep -q 'gate:fix-attempt:3' "$BD_LOG3M"; then
   ok "mutant (guard removed) DOES bump to 3 on a no-eval timeout — reproduces the pre-fix ga-mcapdq bug, proving Part 3 is not vacuous"
 else
   bad "mutant should have reproduced the pre-fix unconditional-bump bug but didn't — mutation harness itself is broken: $OUT3M"

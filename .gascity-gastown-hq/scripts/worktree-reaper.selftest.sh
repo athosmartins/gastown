@@ -61,7 +61,7 @@ WORKTREE_REAPER_ENABLED=1 \
 
 # match by path SUFFIX — macOS mktemp gives /var/... but git reports the realpath
 # /private/var/..., so an exact full-line compare false-negatives every worktree.
-wt_exists()     { git -C "$RIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/crew/$1\$"; }
+wt_exists()     { git -C "$RIG" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/crew/$1\$" >/dev/null; }
 branch_exists() { git -C "$RIG" rev-parse --verify -q "refs/heads/$1" >/dev/null 2>&1; }
 
 echo "── ga-pdrij pool-worktree reaping ──"
@@ -74,7 +74,7 @@ branch_exists crew/x/dirty    && ok "dirty worktree's local branch kept"        
 git -C "$REMOTE" rev-parse -q --verify refs/heads/crew/x/dirty >/dev/null 2>&1 \
   && ok "ga-xv78c: dirty WIP preserved to origin before reap (own branch name)" \
   || bad "ga-xv78c: dirty WIP LOST — not preserved to origin before reap!"
-git -C "$REMOTE" show refs/heads/crew/x/dirty:dirty.txt 2>/dev/null | grep -qx dirty \
+git -C "$REMOTE" show refs/heads/crew/x/dirty:dirty.txt 2>/dev/null | grep -x dirty >/dev/null \
   && ok "ga-xv78c: preserved commit contains the actual WIP content" \
   || bad "ga-xv78c: preserved ref exists but WIP content is wrong/missing"
 wt_exists worker-fresh    && ok "fresh worktree KEPT (age gate)"                 || bad "fresh worktree wrongly reaped"
@@ -102,7 +102,7 @@ URIG="$UTOWN/urig"; git init -q -b main "$URIG"
 ) >/dev/null 2>&1
 touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$URIG/crew/worker-unreachable" 2>/dev/null || true
 
-uwt() { git -C "$URIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/crew/worker-unreachable\$"; }
+uwt() { git -C "$URIG" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/crew/worker-unreachable\$" >/dev/null; }
 BEFORE_STATUS="$(git -C "$URIG/crew/worker-unreachable" status --porcelain 2>/dev/null)"
 
 WORKTREE_REAPER_GT="$UTOWN" WORKTREE_REAPER_LOG="$TMP/reaperU1.jsonl" \
@@ -239,7 +239,7 @@ WORKTREE_REAPER_ZOMBIE_HOURS=48 WORKTREE_REAPER_ZOMBIE_MAX_CPU=5 \
 WORKTREE_REAPER_FAKE_PS="$FAKEPS" \
   bash "$REAPER" >/dev/null 2>&1
 
-zwt() { git -C "$ZRIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/$1\$"; }
+zwt() { git -C "$ZRIG" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/$1\$" >/dev/null; }
 zbr() { git -C "$ZRIG" rev-parse --verify -q "refs/heads/$1" >/dev/null 2>&1; }
 
 zwt ".claude/worktrees/agent-dead"     && bad "DEAD-locked worktree NOT reaped"                 || ok "DEAD-locked worktree reaped"
@@ -261,7 +261,7 @@ zwt ".claude/worktrees/agent-dirty"    && bad "ga-xv78c: dirty .claude/worktrees
 git -C "$ZREMOTE" rev-parse -q --verify refs/heads/wa-agent-dirty-wip >/dev/null 2>&1 \
   && ok "ga-xv78c: dirty WIP preserved to origin (own branch name free → used directly)" \
   || bad "ga-xv78c: dirty WIP LOST — own-name preserve path broken"
-git -C "$ZREMOTE" show refs/heads/wa-agent-dirty-wip:wip.txt 2>/dev/null | grep -qx agentwip \
+git -C "$ZREMOTE" show refs/heads/wa-agent-dirty-wip:wip.txt 2>/dev/null | grep -x agentwip >/dev/null \
   && ok "ga-xv78c: preserved own-name commit has the real WIP content" \
   || bad "ga-xv78c: preserved own-name ref exists but content is wrong/missing"
 grep -q '"event":"reaped_dirty_preserved"' "$TMP/reaperZ.jsonl" 2>/dev/null && ok "reaped_dirty_preserved logged" || bad "reaped_dirty_preserved NOT logged"
@@ -273,7 +273,7 @@ zwt ".claude/worktrees/agent-collide"  && bad "ga-xv78c: colliding-name dirty tr
 [ "$(git -C "$ZREMOTE" rev-parse -q --verify refs/heads/wa-collide-wip 2>/dev/null)" = "$(cat "$TMP/collide_sha.txt" 2>/dev/null)" ] \
   && ok "ga-xv78c: pre-existing unrelated origin ref NOT clobbered (no force-push)" \
   || bad "ga-xv78c: collision ref was overwritten — unrelated history destroyed!"
-git -C "$ZREMOTE" for-each-ref "refs/reclaimed/agent-collide/" --format='%(objectname)' 2>/dev/null | grep -q . \
+git -C "$ZREMOTE" for-each-ref "refs/reclaimed/agent-collide/" --format='%(objectname)' 2>/dev/null | grep . >/dev/null \
   && ok "ga-xv78c: collision WIP preserved under refs/reclaimed/ fallback" \
   || bad "ga-xv78c: collision WIP LOST — refs/reclaimed/ fallback path broken"
 grep -q '"event":"reaped_zombie_lock"' "$TMP/reaperZ.jsonl" 2>/dev/null && ok "reaped_zombie_lock logged" || bad "reaped_zombie_lock NOT logged"
@@ -321,7 +321,7 @@ WORKTREE_REAPER_FAKE_PS="$DFAKEPS" WORKTREE_REAPER_FAKE_CMDLINE="$DCMD" \
 WORKTREE_REAPER_KILL_SINK="$DSINK" \
   bash "$REAPER" >/dev/null 2>&1
 [ -s "$DSINK" ] && bad "KILL default-OFF but a pid was signaled" || ok "KILL default-OFF: process NOT signaled"
-git -C "$DRIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/.claude/worktrees/agent-d\$" \
+git -C "$DRIG" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/.claude/worktrees/agent-d\$" >/dev/null \
   && bad "kill-off: zombie worktree NOT reaped" || ok "kill-off: zombie worktree still reaped (kill is orthogonal)"
 
 # ── feature kill-switch: ZOMBIE_LOCK_ENABLED=0 → ALL locked trees skipped (old behavior) ─
@@ -336,7 +336,7 @@ WORKTREE_REAPER_GT="$OTOWN" WORKTREE_REAPER_LOG="$TMP/reaperO.jsonl" \
 WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
 WORKTREE_REAPER_ZOMBIE_LOCK_ENABLED=0 WORKTREE_REAPER_FAKE_PS="$OFAKEPS" \
   bash "$REAPER" >/dev/null 2>&1
-git -C "$ORIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/.claude/worktrees/agent-o\$" \
+git -C "$ORIG" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/.claude/worktrees/agent-o\$" >/dev/null \
   && ok "ZOMBIE_LOCK_ENABLED=0: dead-locked tree KEPT (old behavior preserved)" || bad "ZOMBIE_LOCK_ENABLED=0 still reaped a locked tree"
 
 # ── dry-run: ENABLED=0 logs would_reap_zombie_lock, removes nothing ───────────────
@@ -351,7 +351,7 @@ WORKTREE_REAPER_GT="$YTOWN" WORKTREE_REAPER_LOG="$TMP/reaperY.jsonl" \
 WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=0 \
 WORKTREE_REAPER_FAKE_PS="$YFAKEPS" \
   bash "$REAPER" >/dev/null 2>&1
-git -C "$YRIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/.claude/worktrees/agent-y\$" \
+git -C "$YRIG" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/.claude/worktrees/agent-y\$" >/dev/null \
   && ok "ENABLED=0: zombie-locked tree NOT removed (dry-run)" || bad "ENABLED=0 removed a zombie-locked tree"
 grep -q '"event":"would_reap_zombie_lock"' "$TMP/reaperY.jsonl" 2>/dev/null && ok "ENABLED=0: logged would_reap_zombie_lock intent" || bad "ENABLED=0: no zombie dry intent logged"
 
@@ -407,7 +407,7 @@ WORKTREE_REAPER_GT="$CTOWN" WORKTREE_REAPER_LOG="$TMP/reaperC.jsonl" \
 WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
   bash "$REAPER" >/dev/null 2>&1
 
-git -C "$CRIG/crew/oracle" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/crew/oracle/\.claude/worktrees/agent-stale\$" \
+git -C "$CRIG/crew/oracle" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/crew/oracle/\.claude/worktrees/agent-stale\$" >/dev/null \
   && bad "independent crew-clone's stale worktree NOT reaped (scope gap NOT fixed)" \
   || ok "independent crew-clone's stale worktree reaped (wa-bptki scope gap fixed)"
 branch_exists_in() { git -C "$1" rev-parse --verify -q "refs/heads/$2" >/dev/null 2>&1; }
@@ -460,22 +460,22 @@ WORKTREE_REAPER_GT="$GTOWN" WORKTREE_REAPER_LOG="$TMP/reaperG.jsonl" \
 WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
   bash "$REAPER" >/dev/null 2>&1
 
-gwt() { git -C "$GRIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/crew/worker-ga0j2zc\$"; }
+gwt() { git -C "$GRIG" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/crew/worker-ga0j2zc\$" >/dev/null; }
 gwt && bad "ga-0j2zc: dirty worktree with ignored-tracked drift NOT reaped" || ok "ga-0j2zc: dirty worktree with ignored-tracked drift preserved+reaped"
 
 git -C "$GREMOTE" rev-parse -q --verify refs/heads/crew/g/ga0j2zc >/dev/null 2>&1 \
   && ok "ga-0j2zc: preserve commit landed on origin" \
   || bad "ga-0j2zc: preserve commit never reached origin — cannot check its contents"
 
-git -C "$GREMOTE" show refs/heads/crew/g/ga0j2zc:.gc/keep.txt 2>/dev/null | grep -qx orig-keep \
+git -C "$GREMOTE" show refs/heads/crew/g/ga0j2zc:.gc/keep.txt 2>/dev/null | grep -x orig-keep >/dev/null \
   && ok "ga-0j2zc: tracked+ignored file's on-disk DRIFT excluded (preserve kept pre-drift committed content)" \
   || bad "ga-0j2zc: tracked+ignored file's drift LEAKED into the preserve commit (the reported bug)"
 
-git -C "$GREMOTE" show refs/heads/crew/g/ga0j2zc:.gc/will-delete.txt 2>/dev/null | grep -qx orig-del \
+git -C "$GREMOTE" show refs/heads/crew/g/ga0j2zc:.gc/will-delete.txt 2>/dev/null | grep -x orig-del >/dev/null \
   && ok "ga-0j2zc: tracked+ignored file's on-disk DELETION not swept into the preserve commit" \
   || bad "ga-0j2zc: tracked+ignored file's deletion leaked into the preserve commit"
 
-git -C "$GREMOTE" show refs/heads/crew/g/ga0j2zc:crew_wip.txt 2>/dev/null | grep -qx "genuine crew wip" \
+git -C "$GREMOTE" show refs/heads/crew/g/ga0j2zc:crew_wip.txt 2>/dev/null | grep -x "genuine crew wip" >/dev/null \
   && ok "ga-0j2zc: genuine (non-ignored) crew WIP still captured (no ga-xv78c regression)" \
   || bad "ga-0j2zc: genuine crew WIP LOST — regression on the ga-xv78c preserve feature"
 
@@ -526,7 +526,7 @@ WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
 WORKTREE_REAPER_FAKE_LSOF="$MFAKELSOF" \
   bash "$REAPER" >/dev/null 2>&1
 
-mwt() { git -C "$MRIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/crew/$1\$"; }
+mwt() { git -C "$MRIG" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/crew/$1\$" >/dev/null; }
 
 mwt worker-merged-idle && bad "ga-t14of: merged+idle worktree, past grace period, NOT reaped (age-gate bypass broken)" \
   || ok "ga-t14of: merged+idle worktree reaped despite being under STALE_HOURS (age-gate bypass works)"
@@ -551,7 +551,7 @@ FRIG="$FTOWN/frig"; git init -q -b main "$FRIG"
 WORKTREE_REAPER_GT="$FTOWN" WORKTREE_REAPER_LOG="$TMP/reaperF.jsonl" \
 WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
   bash "$REAPER" >/dev/null 2>&1
-git -C "$FRIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/crew/worker-merged-fresh\$" \
+git -C "$FRIG" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/crew/worker-merged-fresh\$" >/dev/null \
   && ok "ga-t14of: freshly-branched (trivially merged) worktree KEPT (grace period protects not-yet-started work)" \
   || bad "ga-t14of: freshly-branched worktree wrongly reaped the instant it was created — destroys work before it starts!"
 
@@ -601,9 +601,9 @@ WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
 WORKTREE_REAPER_FAKE_LSOF="$WFAKELSOF" \
   bash "$REAPER" >/dev/null 2>&1
 
-wflat()       { git -C "$WTOWN" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/\.gc-worktrees/flat-unmerged\$"; }
-wnested()     { git -C "$WTOWN" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/\.gascity-gastown-hq/\.gc-worktrees/nested-merged\$"; }
-wnestedbusy() { git -C "$WTOWN" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/\.gascity-gastown-hq/\.gc-worktrees/nested-merged-busy\$"; }
+wflat()       { git -C "$WTOWN" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/\.gc-worktrees/flat-unmerged\$" >/dev/null; }
+wnested()     { git -C "$WTOWN" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/\.gascity-gastown-hq/\.gc-worktrees/nested-merged\$" >/dev/null; }
+wnestedbusy() { git -C "$WTOWN" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/\.gascity-gastown-hq/\.gc-worktrees/nested-merged-busy\$" >/dev/null; }
 
 wflat && bad "ga-t14of: flat-root stale worktree NOT reaped (loop-1 baseline broken)" \
   || ok "ga-t14of: flat-root (\$GT/.gc-worktrees) stale worktree reaped (loop-1 baseline holds)"
@@ -654,7 +654,7 @@ PATH="$FAKEBIN:$PATH" \
 WORKTREE_REAPER_GT="$R1TOWN" WORKTREE_REAPER_LOG="$TMP/reaperR1.jsonl" \
 WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
   bash "$REAPER" >/dev/null 2>&1
-r1wt() { git -C "$R1RIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/crew/worker-real-busy\$"; }
+r1wt() { git -C "$R1RIG" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/crew/worker-real-busy\$" >/dev/null; }
 r1wt && ok "gate-feedback: real lsof exit!=0-but-matched → still read as in-use (pipefail-inversion fixed)" \
        || bad "gate-feedback: real lsof's own nonzero exit inverted a genuine match into 'not in use' — the exact reported bug"
 
@@ -679,7 +679,7 @@ PATH="$FAKEBIN:$PATH" \
 WORKTREE_REAPER_GT="$R2TOWN" WORKTREE_REAPER_LOG="$TMP/reaperR2.jsonl" \
 WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
   bash "$REAPER" >/dev/null 2>&1
-r2wt() { git -C "$R2RIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/crew/worker-real-empty\$"; }
+r2wt() { git -C "$R2RIG" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/crew/worker-real-empty\$" >/dev/null; }
 r2wt && ok "gate-feedback: real lsof with ZERO output fails SAFE (kept, not silently reaped)" \
        || bad "gate-feedback: real lsof's empty output was read as 'confirmed free' — the exact reported bug"
 
@@ -706,7 +706,7 @@ PATH="$FAKEBIN:$PATH" \
 WORKTREE_REAPER_GT="$R3TOWN" WORKTREE_REAPER_LOG="$TMP/reaperR3.jsonl" \
 WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
   bash "$REAPER" >/dev/null 2>&1
-r3wt() { git -C "$R3RIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/crew/worker-real-clean\$"; }
+r3wt() { git -C "$R3RIG" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/crew/worker-real-clean\$" >/dev/null; }
 r3wt && bad "gate-feedback: real lsof clean-exit + genuine non-match NOT reaped (over-conservative regression)" \
        || ok "gate-feedback: real lsof clean-exit + genuine non-match correctly reaped (no over-conservative regression)"
 

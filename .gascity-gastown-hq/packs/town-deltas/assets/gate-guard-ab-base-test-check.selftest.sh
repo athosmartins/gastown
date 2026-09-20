@@ -347,23 +347,23 @@ eq "guard.sh: Step 5b-pre2 (ga-rstae) block present exactly once" "$STEP_COUNT" 
 
 ABT_BLOCK=$(awk '/Step 5b-pre2 \(ga-rstae\)/,/^fi$/' "$GUARD")
 
-echo "$ABT_BLOCK" | grep -q '_ABT_ARM=\$(gate_ab_arm_for_bead "\$BEAD_ID")' \
+echo "$ABT_BLOCK" | grep '_ABT_ARM=\$(gate_ab_arm_for_bead "\$BEAD_ID")' >/dev/null \
   && ok "guard.sh: block calls gate_ab_arm_for_bead on BEAD_ID" \
   || bad "guard.sh: block does not call gate_ab_arm_for_bead correctly"
 
-echo "$ABT_BLOCK" | grep -q '_ABT_VERDICT=\$(gate_base_test_verdict' \
+echo "$ABT_BLOCK" | grep '_ABT_VERDICT=\$(gate_base_test_verdict' >/dev/null \
   && ok "guard.sh: block calls gate_base_test_verdict" \
   || bad "guard.sh: block does not call gate_base_test_verdict"
 
-echo "$ABT_BLOCK" | grep -q 'set_gate_status "\$MARKER_ID" "error"' \
+echo "$ABT_BLOCK" | grep 'set_gate_status "\$MARKER_ID" "error"' >/dev/null \
   && ok "guard.sh: refusal sets gate-status:error (re-submittable, matches Step 5b-pre's own convention)" \
   || bad "guard.sh: refusal does not set gate-status:error"
 
-echo "$ABT_BLOCK" | grep -q 'exit 1' \
+echo "$ABT_BLOCK" | grep 'exit 1' >/dev/null \
   && ok "guard.sh: refusal actually exits 1 (does not fall through to Step 7)" \
   || bad "guard.sh: refusal does not exit — sweep would continue to Step 7 anyway"
 
-echo "$ABT_BLOCK" | grep -q '"\$_ABT_VERDICT" = "passou-na-base"' \
+echo "$ABT_BLOCK" | grep '"\$_ABT_VERDICT" = "passou-na-base"' >/dev/null \
   && ok "guard.sh: refusal is gated EXACTLY on verdict = passou-na-base (not a broader condition that would also refuse sem-teste-novo/nao-consegui-medir/reprovou-na-base)" \
   || bad "guard.sh: refusal condition missing or wrong — could over-refuse the non-blocking states"
 
@@ -390,11 +390,11 @@ fi
 # 3d. Every arm-B path (including nao-consegui-medir / sem-teste-novo /
 # reprovou-na-base, not just the block case) reaches the label+log lines —
 # required so the A/B apuracao counts all four states, not just refusals.
-echo "$ABT_BLOCK" | grep -q 'label add "\$MARKER_ID" "gate-ab:arm-b"' \
+echo "$ABT_BLOCK" | grep 'label add "\$MARKER_ID" "gate-ab:arm-b"' >/dev/null \
   && ok "guard.sh: arm-b label is written unconditionally within the arm-B branch (before the passou-na-base check, not inside it)" \
   || bad "guard.sh: gate-ab:arm-b label missing or misplaced"
 
-echo "$ABT_BLOCK" | grep -q 'AB-BASE-TEST bead=\$BEAD_ID arm=B verdict=\$_ABT_VERDICT' \
+echo "$ABT_BLOCK" | grep 'AB-BASE-TEST bead=\$BEAD_ID arm=B verdict=\$_ABT_VERDICT' >/dev/null \
   && ok "guard.sh: structured AB-BASE-TEST log line present with bead/arm/verdict fields (apuracao-parseable)" \
   || bad "guard.sh: AB-BASE-TEST structured log line missing or malformed"
 

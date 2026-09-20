@@ -146,9 +146,9 @@ echo "Scenario ga-huw02s: verdict:PASS + verdict:FAIL on the same verdict bead"
 # above).
 _predates_fix_verdict_check() {
   local vb_labels="$1"
-  if echo "$vb_labels" | grep -q "verdict:PASS"; then
+  if echo "$vb_labels" | grep "verdict:PASS" >/dev/null; then
     echo "PASS"
-  elif echo "$vb_labels" | grep -q "verdict:FAIL"; then
+  elif echo "$vb_labels" | grep "verdict:FAIL" >/dev/null; then
     echo "FAIL"
   fi
 }
@@ -251,7 +251,7 @@ fi
 #     ...) — this is exactly how the Athos-deferred story ga-sb11i.4 became
 #     dispatchable. Every lifecycle transition must be additive label add/remove.
 #     (Comment lines that merely document the old/wrong pattern are excluded.)
-if grep -v '^[[:space:]]*#' "$DISPATCHER" | grep -q -- '--set-labels'; then
+if grep -v '^[[:space:]]*#' "$DISPATCHER" | grep -- '--set-labels' >/dev/null; then
   bad "REGRESSION (ga-xvxvf): --set-labels present in code — it clobbers guard/qualifier labels; use additive label add/remove"
 else
   ok "no --set-labels in code (additive label add/remove only — no label clobber, ga-xvxvf)"
@@ -369,7 +369,7 @@ REFINO_CITY_OVERRIDE="$_drycity" REFINO_GATE_STORES="$_drycity" DRY_RUN=1 \
   bash "$DISPATCHER" >/dev/null 2>&1
 _dryrc=$?
 _drylog=$(cat "$_drycity/.gc/logs/refino-gate-dispatcher.log" 2>/dev/null || echo "")
-if [ "$_dryrc" -eq 0 ] && echo "$_drylog" | grep -qiE 'Refino gate sweep start.*dry_run=1'; then
+if [ "$_dryrc" -eq 0 ] && echo "$_drylog" | grep -iE 'Refino gate sweep start.*dry_run=1' >/dev/null; then
   ok "DRY_RUN executes the sweep harness cleanly (exit 0, proof mode, no spawn)"
 else
   bad "DRY_RUN did not run cleanly in proof mode (rc=$_dryrc)"
@@ -775,9 +775,9 @@ echo "AFTER"
 PROBE
 OLD_PROBE_OUTPUT=$("$BASH" "$_probe_dir/old.sh" 2>/dev/null || true)
 
-if printf '%s' "$OLD_PROBE_OUTPUT" | grep -q "AFTER"; then
+if printf '%s' "$OLD_PROBE_OUTPUT" | grep "AFTER" >/dev/null; then
   bad "characterization: expected the pre-fix shape to die under set -euo pipefail before printing AFTER — it didn't (fixture not faithful to gate-run ga-indr6o); output=[$OLD_PROBE_OUTPUT]"
-elif printf '%s' "$OLD_PROBE_OUTPUT" | grep -q "BEFORE"; then
+elif printf '%s' "$OLD_PROBE_OUTPUT" | grep "BEFORE" >/dev/null; then
   ok "characterization: pre-fix shape (no fallback) dies under set -euo pipefail when bd_ query fails, stopping before AFTER (gate-run ga-indr6o, reproduced)"
 else
   bad "characterization: probe didn't even reach BEFORE — harness is broken, not the fixture; output=[$OLD_PROBE_OUTPUT]"
@@ -794,7 +794,7 @@ PROBE
 NEW_PROBE_OUTPUT=$(PROBE_DISPATCHER="$DISPATCHER" "$BASH" "$_probe_dir/new.sh" 2>/dev/null || true)
 rm -rf "$_probe_dir"
 
-if printf '%s' "$NEW_PROBE_OUTPUT" | grep -q "AFTER"; then
+if printf '%s' "$NEW_PROBE_OUTPUT" | grep "AFTER" >/dev/null; then
   ok "fix: the REAL _refino_gate_find_pending_verdict survives a failing bd_ query — falls through to the documented fail-safe instead of killing the sweep (gate-run ga-indr6o)"
 else
   bad "REGRESSION (gate-run ga-indr6o): _refino_gate_find_pending_verdict still dies under set -euo pipefail when bd_ query fails — the || echo fallback is missing or was reverted; output=[$NEW_PROBE_OUTPUT]"
@@ -984,15 +984,15 @@ if [ "$OW_RC" -eq 0 ]; then
 else
   bad "REGRESSION (ga-owlmfj): a single handled spawn failure exits $OW_RC (watchdog reads that as a code failure). log: $(printf '%s' "$OW_LOG" | tail -n 2 | tr '\n' '|' | cut -c1-260)"
 fi
-printf '%s\n' "$OW_CALLS_TXT" | grep -q 'label remove zz-fx1 refino-gate:reviewing' && ok "fail-closed: the review claim is released" || bad "claim was NOT released on spawn failure"
-printf '%s\n' "$OW_CALLS_TXT" | grep -q 'close zz-wisp-fx' && ok "fail-closed: the just-created verdict bead is closed (no orphan wisp)" || bad "verdict bead not closed on spawn failure"
-printf '%s\n' "$OW_CALLS_TXT" | grep -qE 'label add zz-fx1 story:needs-approval|--add-label story:needs-approval' && bad "spawn failure must NEVER promote the story to Athos's queue" || ok "fail-closed: nothing promoted / no verdict fabricated"
-printf '%s\n' "$OW_LOG" | grep -q 'ERROR: Failed to spawn refino reviewer for zz-fx1' && ok "still LOGGED as ERROR (handled ≠ silent)" || bad "the spawn failure is no longer logged as ERROR"
-printf '%s\n' "$OW_LOG" | grep 'Failed to spawn' | grep -q 'session bead create timed out' \
+printf '%s\n' "$OW_CALLS_TXT" | grep 'label remove zz-fx1 refino-gate:reviewing' >/dev/null && ok "fail-closed: the review claim is released" || bad "claim was NOT released on spawn failure"
+printf '%s\n' "$OW_CALLS_TXT" | grep 'close zz-wisp-fx' >/dev/null && ok "fail-closed: the just-created verdict bead is closed (no orphan wisp)" || bad "verdict bead not closed on spawn failure"
+printf '%s\n' "$OW_CALLS_TXT" | grep -E 'label add zz-fx1 story:needs-approval|--add-label story:needs-approval' >/dev/null && bad "spawn failure must NEVER promote the story to Athos's queue" || ok "fail-closed: nothing promoted / no verdict fabricated"
+printf '%s\n' "$OW_LOG" | grep 'ERROR: Failed to spawn refino reviewer for zz-fx1' >/dev/null && ok "still LOGGED as ERROR (handled ≠ silent)" || bad "the spawn failure is no longer logged as ERROR"
+printf '%s\n' "$OW_LOG" | grep 'Failed to spawn' | grep 'session bead create timed out' >/dev/null \
   && ok "the log carries the REAL cause (banner skipped), not just the 300-char engine warning" \
   || bad "the log still hides the real spawn error behind the engine banner: $(printf '%s' "$OW_LOG" | grep 'Failed to spawn' | head -c 200)"
-printf '%s\n' "$OW_AUDIT" | grep '"event":"spawn_fail"' | grep -q '"story":"zz-fx1"' && ok "audit line spawn_fail still written (existing consumers keep working)" || bad "audit spawn_fail line missing"
-printf '%s\n' "$OW_AUDIT" | grep '"event":"spawn_fail"' | grep -q '"streak":1' && ok "audit line records streak=1" || bad "audit line has no streak=1"
+printf '%s\n' "$OW_AUDIT" | grep '"event":"spawn_fail"' | grep '"story":"zz-fx1"' >/dev/null && ok "audit line spawn_fail still written (existing consumers keep working)" || bad "audit spawn_fail line missing"
+printf '%s\n' "$OW_AUDIT" | grep '"event":"spawn_fail"' | grep '"streak":1' >/dev/null && ok "audit line records streak=1" || bad "audit line has no streak=1"
 case "$OW_STREAK_TXT" in "1 "*) ok "streak file now says 1 consecutive failure" ;; *) bad "streak file should start with '1 ', got [$OW_STREAK_TXT]" ;; esac
 _ow_done
 
@@ -1003,7 +1003,7 @@ if [ "$OW_RC" -eq 1 ]; then
 else
   bad "REGRESSION (ga-owlmfj): the 6th consecutive failure exited $OW_RC — persistent breakage would now be SILENT"
 fi
-printf '%s\n' "$OW_LOG" | grep -q 'PERSISTENT' && ok "log says PERSISTENT with the streak, so the watchdog alert is explainable" || bad "no PERSISTENT marker in the log"
+printf '%s\n' "$OW_LOG" | grep 'PERSISTENT' >/dev/null && ok "log says PERSISTENT with the streak, so the watchdog alert is explainable" || bad "no PERSISTENT marker in the log"
 _ow_done
 
 echo "Regression ga-owlmfj (B5): a STALE streak (old failures long ago) does not count as consecutive"
@@ -1015,30 +1015,30 @@ _ow_done
 echo "Regression ga-owlmfj (B5b): a CORRUPT streak file restarts the count VISIBLY, not silently"
 _ow_run fail ok "not-a-number garbage"
 [ "$OW_RC" -eq 0 ] && ok "unparseable streak file → count restarts at 1 → exit 0" || bad "corrupt streak file wrongly escalated (rc=$OW_RC)"
-printf '%s\n' "$OW_LOG" | grep -q 'streak file .* is unparseable' && ok "…and the restart is LOGGED (silent restart would let corruption quietly defer escalation)" || bad "corrupt streak file restarted the count without saying so"
+printf '%s\n' "$OW_LOG" | grep 'streak file .* is unparseable' >/dev/null && ok "…and the restart is LOGGED (silent restart would let corruption quietly defer escalation)" || bad "corrupt streak file restarted the count without saying so"
 case "$OW_STREAK_TXT" in "1 "*) ok "streak file rewritten cleanly ('1 <epoch>')" ;; *) bad "corrupt streak file was not repaired, got [$OW_STREAK_TXT]" ;; esac
 _ow_done
 
 echo "Regression ga-owlmfj (B6): a successful spawn resets the streak"
 _ow_run ok ok "3 $(date +%s)"
 [ "$OW_RC" -eq 0 ] && ok "sweep with a working spawn completes (exit 0)" || bad "success path exited $OW_RC; log: $(printf '%s' "$OW_LOG" | tail -n 2 | tr '\n' '|' | cut -c1-200)"
-printf '%s\n' "$OW_LOG" | grep -q 'Refino gate sweep done for zz-fx1' && ok "success path ran through to 'sweep done' (fixture is faithful)" || bad "success path did not complete — fixture broken"
+printf '%s\n' "$OW_LOG" | grep 'Refino gate sweep done for zz-fx1' >/dev/null && ok "success path ran through to 'sweep done' (fixture is faithful)" || bad "success path did not complete — fixture broken"
 [ ! -e "$OW_STREAK_PATH" ] && ok "streak file removed after a successful spawn" || bad "streak file survived a successful spawn: [$OW_STREAK_TXT]"
 _ow_done
 
 echo "Regression ga-owlmfj (B7): the verdict-bead create failure path is handled the same way"
 _ow_run ok fail -
 [ "$OW_RC" -eq 0 ] && ok "verdict-bead create failure (1st) → exit 0" || bad "REGRESSION (ga-owlmfj): a handled verdict-create failure exits $OW_RC"
-printf '%s\n' "$OW_LOG" | grep -q 'ERROR: Failed to create verdict bead for zz-fx1' && ok "still logged as ERROR" || bad "verdict-create failure no longer logged"
-printf '%s\n' "$OW_CALLS_TXT" | grep -q 'label remove zz-fx1 refino-gate:reviewing' && ok "claim released" || bad "claim not released on verdict-create failure"
-printf '%s\n' "$OW_CALLS_TXT" | grep -q 'session new' && bad "must not spawn a reviewer when there is no verdict bead" || ok "no reviewer spawned without a verdict bead"
-printf '%s\n' "$OW_AUDIT" | grep -q '"event":"verdict_create_fail"' && ok "audit line verdict_create_fail written" || bad "audit verdict_create_fail line missing"
+printf '%s\n' "$OW_LOG" | grep 'ERROR: Failed to create verdict bead for zz-fx1' >/dev/null && ok "still logged as ERROR" || bad "verdict-create failure no longer logged"
+printf '%s\n' "$OW_CALLS_TXT" | grep 'label remove zz-fx1 refino-gate:reviewing' >/dev/null && ok "claim released" || bad "claim not released on verdict-create failure"
+printf '%s\n' "$OW_CALLS_TXT" | grep 'session new' >/dev/null && bad "must not spawn a reviewer when there is no verdict bead" || ok "no reviewer spawned without a verdict bead"
+printf '%s\n' "$OW_AUDIT" | grep '"event":"verdict_create_fail"' >/dev/null && ok "audit line verdict_create_fail written" || bad "audit verdict_create_fail line missing"
 _ow_done
 
 echo "Regression ga-owlmfj (B8): if the streak cannot be recorded, stay as loud as before (exit 1) — never quieter"
 _ow_run fail ok - "/nonexistent-dir-ga-owlmfj/streak"
 [ "$OW_RC" -eq 1 ] && ok "unwritable streak file → exit 1 (cannot prove the failure is transient)" || bad "unwritable streak must fail loud (exit 1), got rc=$OW_RC"
-printf '%s\n' "$OW_LOG" | grep -qi 'cannot prove\|unwritable' && ok "log explains why it stayed loud" || bad "no explanation logged for the loud fallback"
+printf '%s\n' "$OW_LOG" | grep -i 'cannot prove\|unwritable' >/dev/null && ok "log explains why it stayed loud" || bad "no explanation logged for the loud fallback"
 _ow_done
 unset -f _ow_run _ow_done 2>/dev/null || true
 

@@ -65,7 +65,7 @@ bead_json() {
 }
 
 echo "── 1. drift-guard: memory-slug literal present in the live function ──"
-if printf '%s' "$FN_BLOCK" | grep -q 'bd-binary-separate-from-gascity-engine'; then
+if printf '%s' "$FN_BLOCK" | grep 'bd-binary-separate-from-gascity-engine' >/dev/null; then
   ok "bd-binary-separate-from-gascity-engine literal present"
 else
   bad "bd-binary-separate-from-gascity-engine literal MISSING (ga-yn5w8 regressed)"

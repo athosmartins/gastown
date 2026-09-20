@@ -173,9 +173,9 @@ else
   BOOT_OUTPUT=$(GC_CITY_PATH="$GC_CITY_PATH" GC_PACK_DIR="$GC_CITY_PATH/packs/town-deltas" bash "$BOOT_SNIPPET" 2>&1)
   BOOT_RC=$?
   rm -f "$BOOT_SNIPPET"
-  if [ "$BOOT_RC" -eq 0 ] && printf '%s' "$BOOT_OUTPUT" | grep -q '^BOOTSTRAP_OK GC_DOLT_PORT='; then
+  if [ "$BOOT_RC" -eq 0 ] && printf '%s' "$BOOT_OUTPUT" | grep '^BOOTSTRAP_OK GC_DOLT_PORT=' >/dev/null; then
     ok "real bootstrap survives engine GC_PACK_DIR=.../packs/town-deltas (resolved a live port)"
-  elif printf '%s' "$BOOT_OUTPUT" | grep -q 'port_resolve.sh: No such file'; then
+  elif printf '%s' "$BOOT_OUTPUT" | grep 'port_resolve.sh: No such file' >/dev/null; then
     bad "THE ORIGINAL BUG IS BACK: port_resolve.sh not found when GC_PACK_DIR=town-deltas (ga-v75ka) — output: $BOOT_OUTPUT"
   else
     bad "real-bootstrap check inconclusive (rc=$BOOT_RC, not the ga-v75ka 'No such file' signature — verify live Dolt is reachable and rerun): $BOOT_OUTPUT"

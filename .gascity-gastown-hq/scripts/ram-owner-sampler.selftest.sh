@@ -83,7 +83,7 @@ with open('$TMP/rotate.jsonl', 'a') as f:
 run_sampler "$TMP/rotate.jsonl" 1787700000 >/dev/null 2>"$TMP/stderr2"
 grep -q "\"ts\": $OLD_TS" "$TMP/rotate.jsonl" && bad "40-day-old record survived rotation" || ok "40-day-old record dropped by rotation"
 grep -q "\"ts\": $RECENT_TS" "$TMP/rotate.jsonl" && ok "1-day-old record survived rotation" || bad "recent record wrongly dropped by rotation"
-tail -1 "$TMP/rotate.jsonl" | grep -q '"gastown.dog-2"' && ok "new sample still appended after rotation" || bad "new sample missing after rotation"
+tail -1 "$TMP/rotate.jsonl" | grep '"gastown.dog-2"' >/dev/null && ok "new sample still appended after rotation" || bad "new sample missing after rotation"
 
 echo ""
 echo "── Scenario: OUT path unwritable -> uncaught exception must notify (mirrors machine-utilization-sampler's own contract) ──"

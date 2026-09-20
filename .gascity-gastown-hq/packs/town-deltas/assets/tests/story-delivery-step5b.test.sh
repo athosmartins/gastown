@@ -82,17 +82,17 @@ EOF
 # C1: VERDICT=OK → proceed, no delivery:failed, exit 0
 run_block OK
 [ "$RUN_RC" -eq 0 ] && ok "C1 OK verdict → block exits 0 (proceeds)" || nok "C1 exit" "rc=$RUN_RC"
-! echo "$LAST_BD" | grep -q "delivery:failed" && ok "C1 no delivery:failed label" || nok "C1 failed-label" "$LAST_BD"
+! echo "$LAST_BD" | grep "delivery:failed" >/dev/null && ok "C1 no delivery:failed label" || nok "C1 failed-label" "$LAST_BD"
 
 # C2: NEEDS_GUARDED_RESTART → halt
 run_block NEEDS_GUARDED_RESTART
 # Block halts via `continue` (loop-based); for-loop exits 0. BD state is the halt signal.
 [ "$RUN_RC" -eq 0 ] && ok "C2 guarded verdict → block exits 0 (continue-based halt; BD state is primary signal)" || nok "C2 exit" "rc=$RUN_RC"
-echo "$LAST_BD" | grep -q "label add ga-test delivery:failed" && ok "C2 delivery:failed added" || nok "C2 failed-label" "$LAST_BD"
-echo "$LAST_BD" | grep -q "label remove ga-test delivery:running" && ok "C2 delivery:running removed" || nok "C2 running-removed" "$LAST_BD"
-! echo "$LAST_BD" | grep -q "label add ga-test story:done" && ok "C2 story:done label NOT set" || nok "C2 story-done" "$LAST_BD"
-echo "$LAST_GC" | grep -q "session nudge mayor" && ok "C2 mayor nudged" || nok "C2 mayor-nudge" "$LAST_GC"
-echo "$LAST_GC" | grep -q "session nudge crew/tester" && ok "C2 author nudged" || nok "C2 author-nudge" "$LAST_GC"
+echo "$LAST_BD" | grep "label add ga-test delivery:failed" >/dev/null && ok "C2 delivery:failed added" || nok "C2 failed-label" "$LAST_BD"
+echo "$LAST_BD" | grep "label remove ga-test delivery:running" >/dev/null && ok "C2 delivery:running removed" || nok "C2 running-removed" "$LAST_BD"
+! echo "$LAST_BD" | grep "label add ga-test story:done" >/dev/null && ok "C2 story:done label NOT set" || nok "C2 story-done" "$LAST_BD"
+echo "$LAST_GC" | grep "session nudge mayor" >/dev/null && ok "C2 mayor nudged" || nok "C2 mayor-nudge" "$LAST_GC"
+echo "$LAST_GC" | grep "session nudge crew/tester" >/dev/null && ok "C2 author nudged" || nok "C2 author-nudge" "$LAST_GC"
 
 echo ""
 echo "story-delivery step5b wiring tests: $PASS passed, $FAIL failed"

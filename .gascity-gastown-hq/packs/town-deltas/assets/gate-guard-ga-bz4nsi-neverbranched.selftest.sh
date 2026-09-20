@@ -189,7 +189,7 @@ _gap1_ensure_lifecycle_backstop /tmp/fake-city fake-bead-already-approved
 
 _MOCK_TYPE="feature"; _MOCK_LABELS=""; _MOCK_LABEL_ADD_LOG=""
 _gap1_ensure_lifecycle_backstop /tmp/fake-city fake-bead-orphaned
-printf '%s\n' $_MOCK_LABEL_ADD_LOG | grep -qx "story:approved" \
+printf '%s\n' $_MOCK_LABEL_ADD_LOG | grep -x "story:approved" >/dev/null \
   && ok "feature with NO lifecycle label: backstop stamps story:approved (ga-bz4nsi requirement 3)" \
   || bad "REGRESSION: backstop did not stamp story:approved on an otherwise permanently-invisible feature bead: got [$_MOCK_LABEL_ADD_LOG]"
 unset -f bd

@@ -168,7 +168,7 @@ echo "$J2" | jq -e '.open_markers_count == 2' >/dev/null 2>&1 && ok "open_marker
 echo ""
 echo "-- static content sanity: playbook + schema --"
 PB="$(_haiku_playbook)"
-[ -n "$PB" ] && echo "$PB" | grep -q 'dolt_responds=false' && ok "playbook is non-empty and covers the dolt-down rule" || bad "playbook missing or doesn't mention dolt_responds=false"
+[ -n "$PB" ] && echo "$PB" | grep 'dolt_responds=false' >/dev/null && ok "playbook is non-empty and covers the dolt-down rule" || bad "playbook missing or doesn't mention dolt_responds=false"
 printf '%s' "$HAIKU_JSON_SCHEMA" | jq -e '.required == ["assessment","action","mayor_message"]' >/dev/null 2>&1 \
   && ok "HAIKU_JSON_SCHEMA is valid JSON with the 3 required fields" || bad "HAIKU_JSON_SCHEMA malformed or missing required fields"
 
@@ -184,7 +184,7 @@ echo ""
 echo "-- static content sanity: _do_nudge no longer calls 'session nudge' (ga-eldeu gap 1) --"
 # Excludes comment-only lines: _do_nudge's own doc-comment quotes the old broken
 # invocation verbatim for explanatory purposes, which isn't a reintroduction.
-if grep -v '^[[:space:]]*#' "$SCRIPT" | grep -q -- 'session nudge mayor'; then
+if grep -v '^[[:space:]]*#' "$SCRIPT" | grep -- 'session nudge mayor' >/dev/null; then
   bad "found a LIVE 'session nudge mayor' invocation (outside comments) in $SCRIPT — the hang-on-attached-Mayor bug (ga-eldeu) risks reintroduction; the Mayor alert path must mail, not session-nudge"
 else
   ok "no LIVE 'session nudge mayor' invocation anywhere in $SCRIPT — the Mayor alert path mails (durable), never session-nudges (hangs when the Mayor's tmux session is attached)"

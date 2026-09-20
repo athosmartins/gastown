@@ -100,9 +100,9 @@ run_block() {
 # (a) the LIVE (post-fix) block must not crash, and must thread an empty
 # BEAD_MERGE_PRE_SHA through (not lost, not a stale value).
 OUT_FIXED=$(run_block "$BLOCK") && RC_FIXED=0 || RC_FIXED=$?
-if printf '%s' "$OUT_FIXED" | grep -q "unbound variable"; then
+if printf '%s' "$OUT_FIXED" | grep "unbound variable" >/dev/null; then
   bad "(a) live block still crashes on unset MERGE_PRE_MAIN_SHA under DRY_RUN: $OUT_FIXED"
-elif printf '%s' "$OUT_FIXED" | grep -q "BLOCK_OK" && printf '%s' "$OUT_FIXED" | grep -q "SEEN_PRE_SHA=\[<unset>\]"; then
+elif printf '%s' "$OUT_FIXED" | grep "BLOCK_OK" >/dev/null && printf '%s' "$OUT_FIXED" | grep "SEEN_PRE_SHA=\[<unset>\]" >/dev/null; then
   ok "(a) live block survives DRY_RUN with MERGE_PRE_MAIN_SHA unset, threads empty BEAD_MERGE_PRE_SHA through (rc=$RC_FIXED)"
 else
   bad "(a) unexpected output from live block (rc=$RC_FIXED): $OUT_FIXED"
@@ -118,7 +118,7 @@ if [ "$MUTATED" = "$BLOCK" ]; then
   exit 1
 fi
 OUT_BUG=$(run_block "$MUTATED") && RC_BUG=0 || RC_BUG=$?
-if printf '%s' "$OUT_BUG" | grep -q "unbound variable"; then
+if printf '%s' "$OUT_BUG" | grep "unbound variable" >/dev/null; then
   ok "(b) pre-fix bare-reference mutation reproduces the nounset crash (proves the test detects the real defect)"
 else
   bad "(b) expected the mutated (pre-fix) block to crash with 'unbound variable' (rc=$RC_BUG): $OUT_BUG"

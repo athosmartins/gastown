@@ -858,12 +858,12 @@ _POOL_BLOCK=$(sed -n '/ga-tz0op: REBASE_AUTHOR resolved to a pool\/ephemeral ide
 if [ -z "$_POOL_BLOCK" ]; then
   bad "could not extract the ga-tz0op pool-intercept block — start/end anchor comments missing/renamed?"
 else
-  if printf '%s\n' "$_POOL_BLOCK" | grep -qF 'default_pool_route_for_rig "${RIG:-}"'; then
+  if printf '%s\n' "$_POOL_BLOCK" | grep -F 'default_pool_route_for_rig "${RIG:-}"' >/dev/null; then
     ok "AC2: pool branch routes the source bead via default_pool_route_for_rig (same mechanism as the FAIL-path pool-return, ga-f54ui)"
   else
     bad "AC2: pool branch does not call default_pool_route_for_rig — bead may not become self-serve-visible"
   fi
-  if printf '%s\n' "$_POOL_BLOCK" | grep -qF 'bd -C "$BEAD_CITY" assign       "$BEAD_ID" ""'; then
+  if printf '%s\n' "$_POOL_BLOCK" | grep -F 'bd -C "$BEAD_CITY" assign       "$BEAD_ID" ""' >/dev/null; then
     ok "AC2: pool branch clears the source bead's assignee so a fresh worker can claim it"
   else
     bad "AC2: pool branch does not clear the source bead assignee"
@@ -945,7 +945,7 @@ else
 fi
 if [ -n "$_DEAD_TRANSIENT_LN" ]; then
   _FALLTHROUGH_EXCERPT=$(sed -n "${_DEAD_TRANSIENT_LN},$((_DEAD_TRANSIENT_LN + 40))p" "$DISPATCHER")
-  if printf '%s\n' "$_FALLTHROUGH_EXCERPT" | grep -qF 'set_gate_status "$MARKER_ID" "queued"'; then
+  if printf '%s\n' "$_FALLTHROUGH_EXCERPT" | grep -F 'set_gate_status "$MARKER_ID" "queued"' >/dev/null; then
     ok "ga-pgxs78: the fallthrough destination retries via gate-status:queued (the dispatcher's OWN fast Step 0b selection), not a slower cross-daemon path"
   else
     bad "ga-pgxs78: expected gate-status:queued retry wiring not found within 40 lines of the fallthrough destination — the payoff (faster retry) may have moved or disappeared"
@@ -1029,12 +1029,12 @@ _BOUNCE_OWNER_BLOCK=$(sed -n '/elif \[ "\$_BEHIND_ACTION" = "bounce_owner" \]; t
 if [ -z "$_BOUNCE_OWNER_BLOCK" ]; then
   bad "could not extract the bounce_owner block — anchor text missing/renamed?"
 else
-  if printf '%s\n' "$_BOUNCE_OWNER_BLOCK" | grep -qF 'gc --city "$GC_CITY" session nudge "$OWNER"'; then
+  if printf '%s\n' "$_BOUNCE_OWNER_BLOCK" | grep -F 'gc --city "$GC_CITY" session nudge "$OWNER"' >/dev/null; then
     ok "bounce_owner nudges \$OWNER — the identity actually verified alive for this decision"
   else
     bad "bounce_owner does not nudge \$OWNER — repeats the exact gate-fix-2 signal/target divergence bug"
   fi
-  if printf '%s\n' "$_BOUNCE_OWNER_BLOCK" | grep -qF 'session nudge "$REBASE_AUTHOR"'; then
+  if printf '%s\n' "$_BOUNCE_OWNER_BLOCK" | grep -F 'session nudge "$REBASE_AUTHOR"' >/dev/null; then
     bad "bounce_owner nudges \$REBASE_AUTHOR — that identity is confirmed DEAD in this branch by construction"
   else
     ok "bounce_owner never nudges the confirmed-dead \$REBASE_AUTHOR"
@@ -1044,7 +1044,7 @@ else
   # prose legitimately mentions the phrase "gate:needs-human" to say what did
   # NOT happen ("nudged instead of parking this on gate:needs-human"), which
   # a plain -F substring match would misfire on.
-  if printf '%s\n' "$_BOUNCE_OWNER_BLOCK" | grep -qE 'label +add.*"gate:needs-human'; then
+  if printf '%s\n' "$_BOUNCE_OWNER_BLOCK" | grep -E 'label +add.*"gate:needs-human' >/dev/null; then
     bad "bounce_owner applies gate:needs-human — defeats AC1 (must NOT circuit-break when owner is live)"
   else
     ok "bounce_owner never applies gate:needs-human (AC1: does not park on the human path when owner is live)"

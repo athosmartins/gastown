@@ -130,7 +130,7 @@ check_removed "$ANCIENT"
 [ "$(cat "$TRACE_ROOT/quarantine/bad-segment.jsonl.123" 2>/dev/null)" = "$QUARANTINE_BEFORE" ] && ok "quarantine/ contents untouched" || bad "quarantine/ contents were modified/removed"
 
 # ── summary line reports something when there was work to do ──────────────
-echo "$OUT1" | grep -q "removed_dirs=" && ok "run 1 prints a removed_dirs summary line" || bad "run 1 printed no summary line despite deletions"
+echo "$OUT1" | grep "removed_dirs=" >/dev/null && ok "run 1 prints a removed_dirs summary line" || bad "run 1 printed no summary line despite deletions"
 
 # ── idempotency: second run over the already-pruned tree must not error ───
 OUT2=$(GC_CITY_PATH="$CITY" GC_CITY_RUNTIME_DIR="" GC_CITY="" \

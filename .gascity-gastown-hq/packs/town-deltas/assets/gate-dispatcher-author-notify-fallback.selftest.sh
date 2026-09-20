@@ -123,7 +123,7 @@ reset_stubs
 FAIL_RECIPIENTS="oracle oracle-wa some-author"
 notify_author_with_fallback "wa-166gf" "oracle" "some-author" "subj" "body" "sibling-branch race on wa-166gf (ga-lxz5w)"
 _rc=$?
-if [ "$_rc" -eq 1 ] && echo "$MAIL_LOG" | grep -q "mayor" && echo "$BD_COMMENT_LOG" | grep -q "ga-fe5at" && echo "$WARN_LOG" | grep -q "ga-lxz5w"; then
+if [ "$_rc" -eq 1 ] && echo "$MAIL_LOG" | grep "mayor" >/dev/null && echo "$BD_COMMENT_LOG" | grep "ga-fe5at" >/dev/null && echo "$WARN_LOG" | grep "ga-lxz5w" >/dev/null; then
   ok "total failure escalates to mayor, leaves durable bd comment, warns with the specific fail_context — 'could not notify' never looks identical to 'notified'"
 else
   bad "total-failure escalation incomplete — rc=$_rc mail_log='$MAIL_LOG' bd_log='$BD_COMMENT_LOG' warn_log='$WARN_LOG'"
@@ -144,7 +144,7 @@ reset_stubs
 FAIL_RECIPIENTS="oracle"
 notify_author_with_fallback "ga-fe5at" "oracle" "oracle" "subj" "body" "ctx"
 _rc=$?
-if [ "$_rc" -eq 1 ] && ! echo "$MAIL_LOG" | grep -q "oracle-ga" && echo "$MAIL_LOG" | grep -q "mayor"; then
+if [ "$_rc" -eq 1 ] && ! echo "$MAIL_LOG" | grep "oracle-ga" >/dev/null && echo "$MAIL_LOG" | grep "mayor" >/dev/null; then
   ok "ga-prefixed bead: no invented 'oracle-ga' guess (only bare 'oracle' tried, then escalated to mayor since AUTHOR==NOTIFY_AUTHOR gave no 3rd candidate): mail_log='$MAIL_LOG'"
 else
   bad "ga-prefix bead should skip rig-qualification entirely — got rc=$_rc mail_log='$MAIL_LOG'"
@@ -187,7 +187,7 @@ echo "S10 (mutation): a rig-prefix typo (single-char off) must NOT accidentally 
 reset_stubs
 FAIL_RECIPIENTS="oracle-w"   # force the bare candidate to fail so the cascade actually reaches the qualified one
 notify_author_with_fallback "wa-166gf" "oracle-w" "oracle-w" "subj" "body" "ctx" >/dev/null
-if echo "$MAIL_LOG" | grep -q "oracle-w-wa"; then
+if echo "$MAIL_LOG" | grep "oracle-w-wa" >/dev/null; then
   ok "near-miss suffix 'oracle-w' (not 'oracle-wa') correctly generates its own qualified candidate 'oracle-w-wa', not silently treated as already-qualified"
 else
   bad "near-miss suffix handling broke — got '$MAIL_LOG'"

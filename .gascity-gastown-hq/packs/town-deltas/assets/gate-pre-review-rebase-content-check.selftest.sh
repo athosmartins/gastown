@@ -99,12 +99,12 @@ LOST_PATH_CALLS=$(grep -c 'rebase_content_lost_paths "\$TMP_REBASE_WT"' "$DISPAT
 SYN_GUARDED='              if [ "$PR_COMMIT_VERDICT" = "yes" ] && [ "$PR_CONTENT_VERDICT" = "yes" ] && git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>"$_PUSH_ERR_FILE"; then'
 SYN_UNGUARDED_PREFIX='        elif git -C "$TMP_REBASE_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" rebase "origin/$DEFAULT_BRANCH" 2>"$_REBASE_ERR_FILE"; then'
 SYN_UNGUARDED_PUSH='              if git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>"$_PUSH_ERR_FILE"; then'
-if printf '%s\n' "$SYN_GUARDED" | grep -q "$GUARD_PAT"; then
+if printf '%s\n' "$SYN_GUARDED" | grep "$GUARD_PAT" >/dev/null; then
   ok "MUTACAO: o padrao do Teste 2 CASA uma linha realmente guardada (positivo correto)"
 else
   bad "MUTACAO: o padrao do Teste 2 NAO casa uma linha guardada de verdade — Teste 2 e falso-negativo (nao prova nada)"
 fi
-if printf '%s\n%s\n' "$SYN_UNGUARDED_PREFIX" "$SYN_UNGUARDED_PUSH" | grep -q "$GUARD_PAT"; then
+if printf '%s\n%s\n' "$SYN_UNGUARDED_PREFIX" "$SYN_UNGUARDED_PUSH" | grep "$GUARD_PAT" >/dev/null; then
   bad "MUTACAO: o padrao do Teste 2 casou o shape PRE-FIX (push sem veredicts, wa-hcefm/wa-i8kyc) — Teste 2 e falso-positivo (nao prova nada)"
 else
   ok "MUTACAO: o padrao do Teste 2 corretamente NAO casa o shape pre-fix (push sem veredicts) — confirma que Teste 2 pegaria a regressao original"

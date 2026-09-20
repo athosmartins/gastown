@@ -61,13 +61,13 @@ if [ -z "$STEP6_BLOCK" ]; then
   bad "could not isolate guard Step 6's bd-create block — awk anchor drifted, fix the selftest"
 else
   ok "isolated guard Step 6's bd-create block (${#STEP6_BLOCK} chars)"
-  echo "$STEP6_BLOCK" | grep -qE -- '-l gate-status:claimed' \
+  echo "$STEP6_BLOCK" | grep -E -- '-l gate-status:claimed' >/dev/null \
     && ok "Step 6 create call carries -l gate-status:claimed" \
     || bad "Step 6 create call missing -l gate-status:claimed"
-  echo "$STEP6_BLOCK" | grep -qE -- '-l gate-status:running' \
+  echo "$STEP6_BLOCK" | grep -E -- '-l gate-status:running' >/dev/null \
     && bad "REGRESSION: Step 6 create call carries -l gate-status:running (the ga-f1ngu bug is back)" \
     || ok "Step 6 create call does NOT carry -l gate-status:running"
-  echo "$STEP6_BLOCK" | grep -qE 'type:quality-gate-run' \
+  echo "$STEP6_BLOCK" | grep -E 'type:quality-gate-run' >/dev/null \
     && ok "Step 6 create call still carries type:quality-gate-run (unchanged type)" \
     || bad "Step 6 create call lost type:quality-gate-run"
 fi

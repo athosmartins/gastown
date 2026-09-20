@@ -257,16 +257,16 @@ grep -q '_CBC_VERDICT=\$(branch_bead_commit_verdict' "$GUARD" \
   || bad "guard.sh: new block does not call branch_bead_commit_verdict"
 
 CBC_BLOCK=$(awk '/Step 5b-pre \(ga-pj5va\)/,/^fi$/' "$GUARD")
-echo "$CBC_BLOCK" | grep -q '"\$_CBC_VERDICT" = "no"' \
+echo "$CBC_BLOCK" | grep '"\$_CBC_VERDICT" = "no"' >/dev/null \
   && ok "guard.sh: refusal is gated on verdict = no (not != yes — skip must NOT refuse)" \
   || bad "guard.sh: refusal condition missing or too broad (would refuse on skip too)"
-echo "$CBC_BLOCK" | grep -q 'set_gate_status "\$MARKER_ID" "error"' \
+echo "$CBC_BLOCK" | grep 'set_gate_status "\$MARKER_ID" "error"' >/dev/null \
   && ok "guard.sh: refusal sets gate-status:error (re-submittable, matches Step 4's convention)" \
   || bad "guard.sh: refusal does not set gate-status:error"
-echo "$CBC_BLOCK" | grep -q 'exit 1' \
+echo "$CBC_BLOCK" | grep 'exit 1' >/dev/null \
   && ok "guard.sh: refusal actually exits 1 (does not fall through to Step 7)" \
   || bad "guard.sh: refusal does not exit — sweep would continue to Step 7 anyway"
-echo "$CBC_BLOCK" | grep -q 'git commit --allow-empty' \
+echo "$CBC_BLOCK" | grep 'git commit --allow-empty' >/dev/null \
   && ok "guard.sh: refusal comment gives the author an actionable 30-second fix" \
   || bad "guard.sh: refusal comment is not actionable"
 

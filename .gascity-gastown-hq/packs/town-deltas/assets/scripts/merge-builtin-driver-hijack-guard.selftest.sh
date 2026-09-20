@@ -64,9 +64,9 @@ git -C "$R1" config merge.union.driver true
 git -C "$R1" config merge.deploydeps.driver 'python3 scripts/merge_deploy_deps.py %O %A %B'
 git -C "$R1" config merge.ours.driver true
 FOUND1="$(mbdhg_scan_git_dir "$R1/.git")"
-if printf '%s\n' "$FOUND1" | grep -q '^union	true$'; then ok "scan flags merge.union.driver=true"; else bad "scan missed merge.union.driver=true (got: $FOUND1)"; fi
-if printf '%s\n' "$FOUND1" | grep -q '^deploydeps'; then bad "scan false-positived on legitimate custom driver 'deploydeps'"; else ok "scan does not flag legitimate custom driver 'deploydeps'"; fi
-if printf '%s\n' "$FOUND1" | grep -q '^ours'; then bad "scan false-positived on legitimate 'ours' idiom"; else ok "scan does not flag legitimate merge.ours.driver"; fi
+if printf '%s\n' "$FOUND1" | grep '^union	true$' >/dev/null; then ok "scan flags merge.union.driver=true"; else bad "scan missed merge.union.driver=true (got: $FOUND1)"; fi
+if printf '%s\n' "$FOUND1" | grep '^deploydeps' >/dev/null; then bad "scan false-positived on legitimate custom driver 'deploydeps'"; else ok "scan does not flag legitimate custom driver 'deploydeps'"; fi
+if printf '%s\n' "$FOUND1" | grep '^ours' >/dev/null; then bad "scan false-positived on legitimate 'ours' idiom"; else ok "scan does not flag legitimate merge.ours.driver"; fi
 
 # ── 3. binary + text builtins also caught (the bead's "vale checar" item,
 #    resolved affirmatively for binary, and text included for completeness
@@ -76,7 +76,7 @@ git -C "$R2" config merge.binary.driver true
 git -C "$R2" config merge.text.driver true
 FOUND2="$(mbdhg_scan_git_dir "$R2/.git")"
 for b in binary text; do
-  if printf '%s\n' "$FOUND2" | grep -q "^${b}	true$"; then ok "scan flags merge.${b}.driver=true"; else bad "scan missed merge.${b}.driver=true (got: $FOUND2)"; fi
+  if printf '%s\n' "$FOUND2" | grep "^${b}	true$" >/dev/null; then ok "scan flags merge.${b}.driver=true"; else bad "scan missed merge.${b}.driver=true (got: $FOUND2)"; fi
 done
 
 # ── 4. clean repo, zero findings.
@@ -174,7 +174,7 @@ else
   bad "expected the bogus driver to silently no-op the merge (rc=0, content=OURS only); got rc=$MERGE_RC content=[$MERGED_CONTENT] -- repro no longer matches the incident this bead documents"
 fi
 E2E_FOUND="$(mbdhg_scan_git_dir "$R7/.git")"
-if printf '%s\n' "$E2E_FOUND" | grep -q '^union	true$'; then
+if printf '%s\n' "$E2E_FOUND" | grep '^union	true$' >/dev/null; then
   ok "guard scan flags the exact spurious key that just silently ate real content above"
 else
   bad "guard scan MISSED the union hijack that was just proven to silently destroy content (got: $E2E_FOUND)"

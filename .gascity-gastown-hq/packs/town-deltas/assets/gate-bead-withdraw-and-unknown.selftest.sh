@@ -232,7 +232,7 @@ RETRY_BLOCK_START=$(grep -n 'Only retry on push-race or stale-after-rebase' "$DI
 RETRY_BLOCK_END=$(grep -n 'Non-retryable failure' "$DISPATCHER" | head -1 | cut -d: -f1)
 if [ -n "$RETRY_BLOCK_START" ] && [ -n "$RETRY_BLOCK_END" ]; then
   RETRY_BLOCK_TEXT=$(sed -n "${RETRY_BLOCK_START},${RETRY_BLOCK_END}p" "$DISPATCHER")
-  if printf '%s' "$RETRY_BLOCK_TEXT" | grep -qF 'failed_bead_blocked_late'; then
+  if printf '%s' "$RETRY_BLOCK_TEXT" | grep -F 'failed_bead_blocked_late' >/dev/null; then
     ok "failed_bead_blocked_late is in the non-retryable break-list"
   else
     bad "failed_bead_blocked_late NOT found in the non-retryable break-list — a withdrawn/closed bead would be retried pointlessly"
@@ -242,7 +242,7 @@ if [ -n "$RETRY_BLOCK_START" ] && [ -n "$RETRY_BLOCK_END" ]; then
   # right next to this block (to say why it's excluded), and a bare-substring
   # check can't tell that apart from a real `[ "$MERGE_RESULT" = "..." ]`
   # condition. Caught live while writing this test.
-  if printf '%s' "$RETRY_BLOCK_TEXT" | grep -qF '"$MERGE_RESULT" = "failed_bead_unknown"'; then
+  if printf '%s' "$RETRY_BLOCK_TEXT" | grep -F '"$MERGE_RESULT" = "failed_bead_unknown"' >/dev/null; then
     bad "failed_bead_unknown UNEXPECTEDLY found as a real condition in the non-retryable break-list — this must stay retryable (a transient read failure should get the existing ga-3b8 retries, not an immediate hold)"
   else
     ok "failed_bead_unknown correctly absent as a condition from the non-retryable break-list (stays retryable; prose mentions of the name are fine)"

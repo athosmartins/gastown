@@ -176,7 +176,7 @@ if [ -n "$NEWDIR" ] && [ -d "$NEWDIR" ]; then
   [ "$BEFORE2" = "$AFTER2" ] \
     && ok "(D) guard no-op inside an already-isolated worktree (branch unchanged: $AFTER2)" \
     || bad "(D) guard changed branch inside an isolated worktree: $BEFORE2 -> $AFTER2"
-  printf '%s\n' "$OUT2" | grep -q "ISOLATION GUARD:" \
+  printf '%s\n' "$OUT2" | grep "ISOLATION GUARD:" >/dev/null \
     && bad "(D2) guard printed the isolation banner even though already isolated" \
     || ok "(D2) guard stayed silent (no isolation banner) when already isolated"
 fi
@@ -209,7 +209,7 @@ rm -rf "$NEWDIR4"
 OUT5=$(run_guard "$TMP/shared-root" "tt-bead4" "tester4" 2>&1)
 NEWDIR5=$(printf '%s\n' "$OUT5" | grep '^PWD_AFTER=' | tail -1 | cut -d= -f2-)
 
-printf '%s\n' "$OUT5" | grep -q '^PWD_AFTER=' \
+printf '%s\n' "$OUT5" | grep '^PWD_AFTER=' >/dev/null \
   && ok "(I0) guard completed without a FATAL abort when the worktree dir was gone" \
   || bad "(I0) guard fatally aborted recovering an orphaned branch ref. Output:
 $OUT5"
@@ -281,7 +281,7 @@ ROOT_BRANCH_L="$(git -C "$TMP/shared-root" branch --show-current)"
 # ── (H): guard is a safe no-op when CWD is not inside a git repo at all ──────
 mkdir -p "$TMP/not-a-repo"
 OUTH=$(run_guard "$TMP/not-a-repo" "tt-bead3" "tester3" 2>&1)
-printf '%s\n' "$OUTH" | grep -q "ISOLATION GUARD:" \
+printf '%s\n' "$OUTH" | grep "ISOLATION GUARD:" >/dev/null \
   && bad "(H) guard fired outside any git repo (should be a silent no-op)" \
   || ok "(H) guard silent/no-op outside any git repo"
 
@@ -342,25 +342,25 @@ README_CONTENT="$(cat "$NEWDIR/README.md" 2>/dev/null)"
 
 # ── (F): source drift-guards ──────────────────────────────────────────────────
 src=$(cat "$FORMULA")
-printf '%s' "$src" | grep -q 'git-common-dir' \
+printf '%s' "$src" | grep 'git-common-dir' >/dev/null \
   && ok "(F1) formula compares --git-dir against --git-common-dir (topology-based detection)" \
   || bad "(F1) formula missing git-common-dir topology check"
-printf '%s' "$src" | grep -q '\.gc-worktrees/' \
+printf '%s' "$src" | grep '\.gc-worktrees/' >/dev/null \
   && ok "(F2) formula isolates into the established .gc-worktrees/ convention" \
   || bad "(F2) formula does not target .gc-worktrees/"
-printf '%s' "$src" | grep -q 'pwd -P' \
+printf '%s' "$src" | grep 'pwd -P' >/dev/null \
   && ok "(F3) formula resolves paths with pwd -P (survives symlinked temp/mount paths)" \
   || bad "(F3) formula missing pwd -P canonicalization"
-printf '%s' "$src" | grep -q 'worktree prune' \
+printf '%s' "$src" | grep 'worktree prune' >/dev/null \
   && ok "(F4) formula prunes stale worktree admin state before reusing an orphaned branch" \
   || bad "(F4) formula missing worktree prune — orphaned-branch recovery (I) may regress"
-printf '%s' "$src" | grep -q 'checkout -B "$BRANCH" origin/main' \
+printf '%s' "$src" | grep 'checkout -B "$BRANCH" origin/main' >/dev/null \
   && ok "(F5) formula resets the branch to origin/main inside the isolated worktree (freshness fix)" \
   || bad "(F5) formula missing the post-isolation origin/main resync — staleness (J) may regress"
-printf '%s' "$src" | grep -q 'NESTED-REPO GUARD' \
+printf '%s' "$src" | grep 'NESTED-REPO GUARD' >/dev/null \
   && ok "(F6) formula contains the ga-ir033 nested-repo guard (double-prefixed ghost path prevention)" \
   || bad "(F6) formula missing the ga-ir033 nested-repo guard — (L) may regress"
-printf '%s' "$src" | grep -q 'SHARED_ROOT_TOPLEVEL' \
+printf '%s' "$src" | grep 'SHARED_ROOT_TOPLEVEL' >/dev/null \
   && ok "(F7) formula computes the nested-repo guard via --show-toplevel, not a hardcoded dirname" \
   || bad "(F7) formula missing --show-toplevel-based nesting detection"
 

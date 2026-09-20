@@ -53,7 +53,7 @@ run_test() {
   local expected="$3"   # exact substring expected in output
   local result
   result=$(HB_SCRIPT="$HB_SCRIPT" python3 -c "$code" 2>&1) || true
-  if echo "$result" | grep -qF "$expected"; then
+  if echo "$result" | grep -F "$expected" >/dev/null; then
     echo "PASS: $name"
     PASS=$((PASS + 1))
   else

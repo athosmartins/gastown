@@ -131,7 +131,7 @@ reset_stubs
 FAIL_RECIPIENTS="batista batista-lx some-author"
 nudge_author_with_fallback "lx-dnw" "batista" "some-author" "msg" "gate FAIL feedback for lx-dnw (ga-o2caab)"
 _rc=$?
-if [ "$_rc" -eq 1 ] && echo "$MAIL_LOG" | grep -q "mayor" && echo "$BD_COMMENT_LOG" | grep -q "ga-o2caab" && echo "$WARN_LOG" | grep -q "ga-o2caab"; then
+if [ "$_rc" -eq 1 ] && echo "$MAIL_LOG" | grep "mayor" >/dev/null && echo "$BD_COMMENT_LOG" | grep "ga-o2caab" >/dev/null && echo "$WARN_LOG" | grep "ga-o2caab" >/dev/null; then
   ok "total failure escalates to mayor, leaves durable bd comment, warns with the specific fail_context — 'could not notify' never looks identical to 'notified'"
 else
   bad "total-failure escalation incomplete — rc=$_rc nudge_log='$NUDGE_LOG' mail_log='$MAIL_LOG' bd_log='$BD_COMMENT_LOG' warn_log='$WARN_LOG'"
@@ -152,7 +152,7 @@ reset_stubs
 FAIL_RECIPIENTS="batista"
 nudge_author_with_fallback "ga-o2caab" "batista" "batista" "msg" "ctx"
 _rc=$?
-if [ "$_rc" -eq 1 ] && ! echo "$NUDGE_LOG" | grep -q "batista-ga" && echo "$MAIL_LOG" | grep -q "mayor"; then
+if [ "$_rc" -eq 1 ] && ! echo "$NUDGE_LOG" | grep "batista-ga" >/dev/null && echo "$MAIL_LOG" | grep "mayor" >/dev/null; then
   ok "ga-prefixed bead: no invented 'batista-ga' guess (only bare 'batista' tried, then escalated to mayor since AUTHOR==NOTIFY_AUTHOR gave no 3rd candidate): nudge_log='$NUDGE_LOG'"
 else
   bad "ga-prefix bead should skip rig-qualification entirely — got rc=$_rc nudge_log='$NUDGE_LOG'"
@@ -195,7 +195,7 @@ echo "S10 (mutation): a rig-prefix typo (single-char off) must NOT accidentally 
 reset_stubs
 FAIL_RECIPIENTS="batista-l"   # force the bare candidate to fail so the cascade actually reaches the qualified one
 nudge_author_with_fallback "lx-dnw" "batista-l" "batista-l" "msg" "ctx" >/dev/null
-if echo "$NUDGE_LOG" | grep -q "batista-l-lx"; then
+if echo "$NUDGE_LOG" | grep "batista-l-lx" >/dev/null; then
   ok "near-miss suffix 'batista-l' (not 'batista-lx') correctly generates its own qualified candidate 'batista-l-lx', not silently treated as already-qualified"
 else
   bad "near-miss suffix handling broke — got '$NUDGE_LOG'"
@@ -241,7 +241,7 @@ errexit_survives() {
     'echo MARKER_REACHED' \
     | bash -euo pipefail 2>&1)"
   rc=$?
-  [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -q "MARKER_REACHED"
+  [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep "MARKER_REACHED" >/dev/null
 }
 
 echo "S11: call-site-1 (general author notify) survives total nudge failure under set -e"

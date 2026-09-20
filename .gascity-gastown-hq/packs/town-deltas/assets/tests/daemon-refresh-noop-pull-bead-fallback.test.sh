@@ -192,7 +192,7 @@ V=$(field VERDICT "$OUT")
   || nok "T1 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -ne 0 ] && ok "T1 non-zero exit — delivery halts, bead does not close" \
   || nok "T1 exit" "rc=$RC (must be non-zero to hold the bead open)"
-echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" \
+echo "$(field GUARDED "$OUT")" | grep "com.test.central-sender" >/dev/null \
   && ok "T1 GUARDED names the stale sensitive daemon" \
   || nok "T1 guarded" "$(field GUARDED "$OUT")"
 

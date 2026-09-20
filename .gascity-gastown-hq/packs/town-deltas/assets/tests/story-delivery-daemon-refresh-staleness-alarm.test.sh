@@ -104,10 +104,10 @@ run_block 0 "" 0
 
 # ── T2: stale baseline (age 5 days ≥ default threshold 2), no prior marker ───
 run_block 5 "" 0
-echo "$GC_CALLS" | grep -q "session nudge mayor" \
+echo "$GC_CALLS" | grep "session nudge mayor" >/dev/null \
   && ok "T2 stale baseline (5d): Mayor nudged" \
   || nok "T2 stale baseline nudge" "GC_CALLS=[$GC_CALLS]"
-echo "$GC_CALLS" | grep -q "$SHA_VALUE" \
+echo "$GC_CALLS" | grep "$SHA_VALUE" >/dev/null \
   && ok "T2 nudge names the stuck sha" \
   || nok "T2 nudge content" "GC_CALLS=[$GC_CALLS]"
 [ "$MARKER_AFTER" = "$SHA_VALUE" ] \
@@ -143,7 +143,7 @@ rm -rf "$T"
 
 # ── T4: stale baseline, previously alarmed for a DIFFERENT sha → re-alarms ───
 run_block 5 "some-older-already-resolved-sha-0000000" 0
-echo "$GC_CALLS" | grep -q "session nudge mayor" \
+echo "$GC_CALLS" | grep "session nudge mayor" >/dev/null \
   && ok "T4 new stuck sha (different from the old marker): alarms again" \
   || nok "T4 new episode" "GC_CALLS=[$GC_CALLS]"
 [ "$MARKER_AFTER" = "$SHA_VALUE" ] \
@@ -158,7 +158,7 @@ run_block 5 "" 1
 [ -z "$MARKER_AFTER" ] \
   && ok "T5 DRY_RUN=1: no alarm marker written" \
   || nok "T5 dry-run marker" "MARKER_AFTER=[$MARKER_AFTER]"
-echo "$LOG_CONTENT" | grep -qi "has not advanced" \
+echo "$LOG_CONTENT" | grep -i "has not advanced" >/dev/null \
   && ok "T5 DRY_RUN=1 still WARNs (visible, just no side effect)" \
   || nok "T5 dry-run warn" "LOG_CONTENT=[$LOG_CONTENT]"
 

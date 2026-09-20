@@ -74,13 +74,13 @@ else
 fi
 
 DESC_HIT_COUNT=$(git -C "$SRC" ls-remote origin "refs/heads/crew/*/$FAKE_ID-*" 2>/dev/null | wc -l | tr -d ' ')
-if git -C "$SRC" ls-remote origin "refs/heads/crew/*/$FAKE_ID-*" 2>/dev/null | grep -q "refs/heads/crew/digo/$FAKE_ID-desc"; then
+if git -C "$SRC" ls-remote origin "refs/heads/crew/*/$FAKE_ID-*" 2>/dev/null | grep "refs/heads/crew/digo/$FAKE_ID-desc" >/dev/null; then
   ok "ls-remote 'refs/heads/crew/*/\$ID-*' resolves the description-suffixed crew branch ($DESC_HIT_COUNT ref(s) matched)"
 else
   bad "ls-remote 'refs/heads/crew/*/\$ID-*' did not resolve the description-suffixed crew branch"
 fi
 
-if git -C "$SRC" ls-remote origin "refs/heads/crew/*/$FAKE_ID" 2>/dev/null | grep -q "mila"; then
+if git -C "$SRC" ls-remote origin "refs/heads/crew/*/$FAKE_ID" 2>/dev/null | grep "mila" >/dev/null; then
   bad "REGRESSION: bare '\$ID' pattern over-matched an unrelated bead's crew branch (crew/mila/$OTHER_ID)"
 else
   ok "bare 'refs/heads/crew/*/\$ID' correctly does NOT match a different bead's crew branch"

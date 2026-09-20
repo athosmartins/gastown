@@ -492,8 +492,8 @@ OUT=$(run_helper daemons/ban_risk_dashboard.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "OK" ] && ok "T2 verdict OK" || nok "T2 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -eq 0 ] && ok "T2 exit 0" || nok "T2 exit" "rc=$RC"
-echo "$(field AFFECTED "$OUT")" | grep -q "com.test.ban-risk-dashboard" && ok "T2 dashboard affected" || nok "T2 affected" "$(field AFFECTED "$OUT")"
-echo "$(field RESTARTED "$OUT")" | grep -q "com.test.ban-risk-dashboard" && ok "T2 dashboard restarted" || nok "T2 restarted" "$(field RESTARTED "$OUT")"
+echo "$(field AFFECTED "$OUT")" | grep "com.test.ban-risk-dashboard" >/dev/null && ok "T2 dashboard affected" || nok "T2 affected" "$(field AFFECTED "$OUT")"
+echo "$(field RESTARTED "$OUT")" | grep "com.test.ban-risk-dashboard" >/dev/null && ok "T2 dashboard restarted" || nok "T2 restarted" "$(field RESTARTED "$OUT")"
 grep -q "com.test.ban-risk-dashboard" "$MOCK/kicks.log" 2>/dev/null && ok "T2 kickstart invoked" || nok "T2 kickstart" "log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 # ga-vmq1i: a live daemon was actually restarted AND confirmed fresh — the one
 # case that earns the word "verified".
@@ -511,7 +511,7 @@ OUT=$(run_helper daemons/ban_risk_dashboard.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "VERIFY_FAILED" ] && ok "T3 verdict VERIFY_FAILED" || nok "T3 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -ne 0 ] && ok "T3 non-zero exit (halts delivery)" || nok "T3 exit" "rc=$RC (must be non-zero)"
-echo "$(field FRESH_FAIL "$OUT")" | grep -q "com.test.ban-risk-dashboard" && ok "T3 dashboard in FRESH_FAIL" || nok "T3 fresh_fail" "$(field FRESH_FAIL "$OUT")"
+echo "$(field FRESH_FAIL "$OUT")" | grep "com.test.ban-risk-dashboard" >/dev/null && ok "T3 dashboard in FRESH_FAIL" || nok "T3 fresh_fail" "$(field FRESH_FAIL "$OUT")"
 [ "$(field PROOF "$OUT")" = "not_verified" ] && ok "T3 PROOF=not_verified" || nok "T3 proof" "got '$(field PROOF "$OUT")'"
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -530,7 +530,7 @@ OUT=$(run_helper daemons/central_sender.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T4 verdict NEEDS_GUARDED_RESTART" || nok "T4 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -ne 0 ] && ok "T4 non-zero exit (halts delivery)" || nok "T4 exit" "rc=$RC (must be non-zero)"
-echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" && ok "T4 sensitive daemon flagged GUARDED" || nok "T4 guarded" "$(field GUARDED "$OUT")"
+echo "$(field GUARDED "$OUT")" | grep "com.test.central-sender" >/dev/null && ok "T4 sensitive daemon flagged GUARDED" || nok "T4 guarded" "$(field GUARDED "$OUT")"
 ! grep -q "com.test.central-sender" "$MOCK/kicks.log" 2>/dev/null && ok "T4 sensitive daemon NOT auto-bounced" || nok "T4 no-bounce" "kickstart was called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 [ "$(field PROOF "$OUT")" = "not_verified" ] && ok "T4 PROOF=not_verified" || nok "T4 proof" "got '$(field PROOF "$OUT")'"
 
@@ -549,13 +549,13 @@ seed_restart com.test.ban-risk-dashboard 5099 "$FRESH_LSTART"
 # deploy changed ONLY the route file, not the dashboard entrypoint
 OUT=$(run_helper routes/channel_admin_api.py); RC=$?
 V=$(field VERDICT "$OUT")
-echo "$(field AFFECTED "$OUT")" | grep -q "com.test.ban-risk-dashboard" && ok "T5 importing dashboard marked affected" || nok "T5 affected" "$(field AFFECTED "$OUT")"
+echo "$(field AFFECTED "$OUT")" | grep "com.test.ban-risk-dashboard" >/dev/null && ok "T5 importing dashboard marked affected" || nok "T5 affected" "$(field AFFECTED "$OUT")"
 [ "$V" = "OK" ] && ok "T5 verdict OK after fresh restart" || nok "T5 verdict" "got '$V' out=[$OUT]"
 [ "$(field PROOF "$OUT")" = "verified" ] && ok "T5 PROOF=verified" || nok "T5 proof" "got '$(field PROOF "$OUT")'"
 # wa-xokje: a LIVE, successfully-restarted daemon must never show up in
 # AFFECTED_NOT_RUNNING — that field is exclusively for the no-PID branch T6
 # exercises below, not a general "not a problem" bucket.
-echo "$(field AFFECTED_NOT_RUNNING "$OUT")" | grep -q "com.test.ban-risk-dashboard" \
+echo "$(field AFFECTED_NOT_RUNNING "$OUT")" | grep "com.test.ban-risk-dashboard" >/dev/null \
   && nok "T5 AFFECTED_NOT_RUNNING must not contain a live daemon" "$(field AFFECTED_NOT_RUNNING "$OUT")" \
   || ok "T5 AFFECTED_NOT_RUNNING correctly excludes the live daemon"
 
@@ -572,11 +572,11 @@ V=$(field VERDICT "$OUT")
 [ "$V" = "OK" ] && ok "T6 verdict OK (not-running affected daemon is skipped)" || nok "T6 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -eq 0 ] && ok "T6 exit 0" || nok "T6 exit" "rc=$RC"
 [ ! -f "$MOCK/kicks.log" ] && ok "T6 scheduled/down job NOT kickstarted" || nok "T6 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
-echo "$(field RESTARTED "$OUT")" | grep -q "daily-scraper" && nok "T6 should not restart" "restarted=$(field RESTARTED "$OUT")" || ok "T6 not in RESTARTED"
+echo "$(field RESTARTED "$OUT")" | grep "daily-scraper" >/dev/null && nok "T6 should not restart" "restarted=$(field RESTARTED "$OUT")" || ok "T6 not in RESTARTED"
 # wa-xokje: this is the field a caller needs to tell "reaches only a
 # self-healing scheduled job" apart from "reaches a live daemon" — without
 # it, AFFECTED alone can't distinguish this case from T5's.
-echo "$(field AFFECTED_NOT_RUNNING "$OUT")" | grep -q "com.test.daily-scraper" \
+echo "$(field AFFECTED_NOT_RUNNING "$OUT")" | grep "com.test.daily-scraper" >/dev/null \
   && ok "T6 AFFECTED_NOT_RUNNING names the not-running scheduled job" \
   || nok "T6 AFFECTED_NOT_RUNNING" "$(field AFFECTED_NOT_RUNNING "$OUT")"
 # ga-vmq1i (THE BUG THIS FIX IS ABOUT): AFFECTED is non-empty here but RESTARTED
@@ -608,7 +608,7 @@ seed_restart com.test.map-viewer 6099 "$FRESH_LSTART"
 # deploy changed ONLY the template, not the .py entrypoint
 OUT=$(run_helper templates/map_viewer.html); RC=$?
 V=$(field VERDICT "$OUT")
-echo "$(field AFFECTED "$OUT")" | grep -q "com.test.map-viewer" && ok "T7 template-rendering dashboard marked affected" || nok "T7 affected" "$(field AFFECTED "$OUT")"
+echo "$(field AFFECTED "$OUT")" | grep "com.test.map-viewer" >/dev/null && ok "T7 template-rendering dashboard marked affected" || nok "T7 affected" "$(field AFFECTED "$OUT")"
 [ "$V" = "OK" ] && ok "T7 verdict OK after fresh restart" || nok "T7 verdict" "got '$V' out=[$OUT]"
 grep -q "com.test.map-viewer" "$MOCK/kicks.log" 2>/dev/null && ok "T7 kickstart invoked" || nok "T7 kickstart" "log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 [ "$(field PROOF "$OUT")" = "verified" ] && ok "T7 PROOF=verified" || nok "T7 proof" "got '$(field PROOF "$OUT")'"
@@ -634,7 +634,7 @@ seed_running com.test.map-viewer 7001 "$STALE_LSTART"
 OUT=$(run_helper templates/unrelated.html); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "OK" ] && ok "T8 verdict OK on unrelated template change" || nok "T8 verdict" "got '$V' out=[$OUT]"
-echo "$(field AFFECTED "$OUT")" | grep -q "com.test.map-viewer" && nok "T8 should not be affected" "$(field AFFECTED "$OUT")" || ok "T8 map-viewer not marked affected"
+echo "$(field AFFECTED "$OUT")" | grep "com.test.map-viewer" >/dev/null && nok "T8 should not be affected" "$(field AFFECTED "$OUT")" || ok "T8 map-viewer not marked affected"
 [ ! -f "$MOCK/kicks.log" ] && ok "T8 no kickstart called (no cascade)" || nok "T8 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 # ga-vmq1i: a template DID change (CHANGED_TEMPLATES non-empty) but detection
 # tied it to no live daemon. Unlike T1 (structurally certain nothing relevant
@@ -671,7 +671,7 @@ OUT=$(run_helper daemons/frota_dashboard.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T9 verdict NEEDS_GUARDED_RESTART (policy-sensitive, no SENSITIVE_DAEMONS match)" || nok "T9 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -ne 0 ] && ok "T9 non-zero exit (halts delivery)" || nok "T9 exit" "rc=$RC"
-echo "$(field GUARDED "$OUT")" | grep -q "com.test.frota-dashboard" && ok "T9 flagged GUARDED by restart_policy.yaml alone" || nok "T9 guarded" "$(field GUARDED "$OUT")"
+echo "$(field GUARDED "$OUT")" | grep "com.test.frota-dashboard" >/dev/null && ok "T9 flagged GUARDED by restart_policy.yaml alone" || nok "T9 guarded" "$(field GUARDED "$OUT")"
 ! grep -q "com.test.frota-dashboard" "$MOCK/kicks.log" 2>/dev/null && ok "T9 NOT auto-bounced" || nok "T9 no-bounce" "kickstart was called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -728,7 +728,7 @@ OUT=$(run_helper daemons/classification_dashboard.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T11 verdict NEEDS_GUARDED_RESTART (guard refused)" || nok "T11 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -ne 0 ] && ok "T11 non-zero exit (halts delivery)" || nok "T11 exit" "rc=$RC"
-echo "$(field GUARDED "$OUT")" | grep -q "com.test.classification-dashboard" && ok "T11 flagged GUARDED by guard script refusal" || nok "T11 guarded" "$(field GUARDED "$OUT")"
+echo "$(field GUARDED "$OUT")" | grep "com.test.classification-dashboard" >/dev/null && ok "T11 flagged GUARDED by guard script refusal" || nok "T11 guarded" "$(field GUARDED "$OUT")"
 ! grep -q "com.test.classification-dashboard" "$MOCK/kicks.log" 2>/dev/null && ok "T11 NOT auto-bounced (guard blocked kickstart)" || nok "T11 no-bounce" "kickstart was called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -789,7 +789,7 @@ OUT=$(run_helper daemons/unremarkable_dashboard.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T13 verdict NEEDS_GUARDED_RESTART (unparseable policy fails closed)" || nok "T13 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -ne 0 ] && ok "T13 non-zero exit (halts delivery)" || nok "T13 exit" "rc=$RC"
-echo "$(field GUARDED "$OUT")" | grep -q "com.test.unremarkable" && ok "T13 flagged GUARDED despite being in the (unreadable) 'auto' list" || nok "T13 guarded" "$(field GUARDED "$OUT")"
+echo "$(field GUARDED "$OUT")" | grep "com.test.unremarkable" >/dev/null && ok "T13 flagged GUARDED despite being in the (unreadable) 'auto' list" || nok "T13 guarded" "$(field GUARDED "$OUT")"
 ! grep -q "com.test.unremarkable" "$MOCK/kicks.log" 2>/dev/null && ok "T13 NOT auto-bounced" || nok "T13 no-bounce" "kickstart was called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -815,7 +815,7 @@ unset DRAIN_CMD_com_test_central_sender
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T14 verdict NEEDS_GUARDED_RESTART (unparseable policy blocks even the DRAIN_CMD path)" || nok "T14 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -ne 0 ] && ok "T14 non-zero exit (halts delivery)" || nok "T14 exit" "rc=$RC"
-echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" && ok "T14 flagged GUARDED" || nok "T14 guarded" "$(field GUARDED "$OUT")"
+echo "$(field GUARDED "$OUT")" | grep "com.test.central-sender" >/dev/null && ok "T14 flagged GUARDED" || nok "T14 guarded" "$(field GUARDED "$OUT")"
 ! grep -q "com.test.central-sender" "$MOCK/kicks.log" 2>/dev/null && ok "T14 NOT drained/bounced" || nok "T14 no-bounce" "kickstart was called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -843,8 +843,8 @@ OUT=$(run_helper daemons/central_sender.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "OK" ] && ok "T15 verdict OK (already-fresh sensitive daemon not flagged)" || nok "T15 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -eq 0 ] && ok "T15 exit 0" || nok "T15 exit" "rc=$RC"
-echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" && nok "T15 should NOT be GUARDED" "$(field GUARDED "$OUT")" || ok "T15 not flagged GUARDED"
-echo "$(field ALREADY_FRESH "$OUT")" | grep -q "com.test.central-sender" && ok "T15 recorded in ALREADY_FRESH" || nok "T15 already_fresh" "$(field ALREADY_FRESH "$OUT")"
+echo "$(field GUARDED "$OUT")" | grep "com.test.central-sender" >/dev/null && nok "T15 should NOT be GUARDED" "$(field GUARDED "$OUT")" || ok "T15 not flagged GUARDED"
+echo "$(field ALREADY_FRESH "$OUT")" | grep "com.test.central-sender" >/dev/null && ok "T15 recorded in ALREADY_FRESH" || nok "T15 already_fresh" "$(field ALREADY_FRESH "$OUT")"
 ! grep -q "com.test.central-sender" "$MOCK/kicks.log" 2>/dev/null && ok "T15 NOT kickstarted (already fresh — no restart needed at all)" || nok "T15 no-kickstart" "kickstart was called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 [ "$(field PROOF "$OUT")" = "verified" ] && ok "T15 PROOF=verified (freshness positively confirmed, just via a different restart path)" || nok "T15 proof" "got '$(field PROOF "$OUT")'"
 
@@ -867,9 +867,9 @@ OUT=$(run_helper daemons/central_sender.py daemons/slot_scheduler.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T16 verdict NEEDS_GUARDED_RESTART (one stale daemon still wins over an already-fresh sibling)" || nok "T16 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -ne 0 ] && ok "T16 non-zero exit (halts delivery)" || nok "T16 exit" "rc=$RC"
-echo "$(field GUARDED "$OUT")" | grep -q "com.test.slot-scheduler" && ok "T16 stale daemon flagged GUARDED" || nok "T16 guarded (stale)" "$(field GUARDED "$OUT")"
-echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" && nok "T16 fresh daemon should NOT be in GUARDED" "$(field GUARDED "$OUT")" || ok "T16 fresh daemon not in GUARDED"
-echo "$(field ALREADY_FRESH "$OUT")" | grep -q "com.test.central-sender" && ok "T16 fresh daemon recorded in ALREADY_FRESH" || nok "T16 already_fresh" "$(field ALREADY_FRESH "$OUT")"
+echo "$(field GUARDED "$OUT")" | grep "com.test.slot-scheduler" >/dev/null && ok "T16 stale daemon flagged GUARDED" || nok "T16 guarded (stale)" "$(field GUARDED "$OUT")"
+echo "$(field GUARDED "$OUT")" | grep "com.test.central-sender" >/dev/null && nok "T16 fresh daemon should NOT be in GUARDED" "$(field GUARDED "$OUT")" || ok "T16 fresh daemon not in GUARDED"
+echo "$(field ALREADY_FRESH "$OUT")" | grep "com.test.central-sender" >/dev/null && ok "T16 fresh daemon recorded in ALREADY_FRESH" || nok "T16 already_fresh" "$(field ALREADY_FRESH "$OUT")"
 ! grep -q "com.test.central-sender" "$MOCK/kicks.log" 2>/dev/null && ok "T16 fresh daemon NOT kickstarted" || nok "T16 no-kickstart" "kickstart log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -902,8 +902,8 @@ unset EXTRA_RUNTIME_ROOTS
 V=$(field VERDICT "$OUT")
 [ "$V" = "OK" ] && ok "T17 verdict OK" || nok "T17 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -eq 0 ] && ok "T17 exit 0" || nok "T17 exit" "rc=$RC"
-echo "$(field AFFECTED "$OUT")" | grep -q "com.test.painel-visibilidade" && ok "T17 daemon under second clone discovered + affected" || nok "T17 affected" "$(field AFFECTED "$OUT")"
-echo "$(field RESTARTED "$OUT")" | grep -q "com.test.painel-visibilidade" && ok "T17 daemon restarted" || nok "T17 restarted" "$(field RESTARTED "$OUT")"
+echo "$(field AFFECTED "$OUT")" | grep "com.test.painel-visibilidade" >/dev/null && ok "T17 daemon under second clone discovered + affected" || nok "T17 affected" "$(field AFFECTED "$OUT")"
+echo "$(field RESTARTED "$OUT")" | grep "com.test.painel-visibilidade" >/dev/null && ok "T17 daemon restarted" || nok "T17 restarted" "$(field RESTARTED "$OUT")"
 [ "$(field PROOF "$OUT")" = "verified" ] && ok "T17 PROOF=verified (no longer a false 'touches no live daemon')" || nok "T17 proof" "got '$(field PROOF "$OUT")'"
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -923,8 +923,8 @@ unset DRY_RUN
 V=$(field VERDICT "$OUT")
 [ "$V" = "OK" ] && ok "T18 verdict OK" || nok "T18 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -eq 0 ] && ok "T18 exit 0" || nok "T18 exit" "rc=$RC"
-echo "$(field RESTARTED "$OUT")" | grep -q "com.test.ban-risk-dashboard" && nok "T18 RESTARTED must stay empty under DRY_RUN=1" "$(field RESTARTED "$OUT")" || ok "T18 RESTARTED empty (pre-fix bug: populated even under DRY_RUN=1)"
-echo "$(field WOULD_RESTART "$OUT")" | grep -q "com.test.ban-risk-dashboard" && ok "T18 WOULD_RESTART reports the preview" || nok "T18 would_restart" "$(field WOULD_RESTART "$OUT")"
+echo "$(field RESTARTED "$OUT")" | grep "com.test.ban-risk-dashboard" >/dev/null && nok "T18 RESTARTED must stay empty under DRY_RUN=1" "$(field RESTARTED "$OUT")" || ok "T18 RESTARTED empty (pre-fix bug: populated even under DRY_RUN=1)"
+echo "$(field WOULD_RESTART "$OUT")" | grep "com.test.ban-risk-dashboard" >/dev/null && ok "T18 WOULD_RESTART reports the preview" || nok "T18 would_restart" "$(field WOULD_RESTART "$OUT")"
 [ "$(field PROOF "$OUT")" = "not_applicable" ] && ok "T18 PROOF=not_applicable (never 'verified' when nothing ran)" || nok "T18 proof" "got '$(field PROOF "$OUT")' (pre-fix bug: this was 'verified')"
 [ ! -f "$MOCK/kicks.log" ] && ok "T18 no kickstart called under DRY_RUN=1" || nok "T18 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 
@@ -963,8 +963,8 @@ OUT=$(run_helper_stderr daemons/ban_risk_dashboard.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "OK" ] && ok "T19 verdict OK (healthy daemon still processed normally)" || nok "T19 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -eq 0 ] && ok "T19 exit 0" || nok "T19 exit" "rc=$RC"
-echo "$(field RESTARTED "$OUT")" | grep -q "com.test.ban-risk-dashboard" && ok "T19 healthy sibling still restarted+verified" || nok "T19 restarted" "$(field RESTARTED "$OUT")"
-echo "$OUT" | grep -q "com.test.broken-comment.plist could not be parsed" && ok "T19 WARN names the broken plist (pre-fix: no warning existed anywhere)" || nok "T19 warn" "no distinguishing WARN in output: [$OUT]"
+echo "$(field RESTARTED "$OUT")" | grep "com.test.ban-risk-dashboard" >/dev/null && ok "T19 healthy sibling still restarted+verified" || nok "T19 restarted" "$(field RESTARTED "$OUT")"
+echo "$OUT" | grep "com.test.broken-comment.plist could not be parsed" >/dev/null && ok "T19 WARN names the broken plist (pre-fix: no warning existed anywhere)" || nok "T19 warn" "no distinguishing WARN in output: [$OUT]"
 [ "$(field PROOF "$OUT")" = "verified" ] && ok "T19 PROOF=verified (the healthy daemon's own verification is unaffected by its broken sibling)" || nok "T19 proof" "got '$(field PROOF "$OUT")'"
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -996,7 +996,7 @@ OUT=$(run_helper_stderr daemons/some_other_thing.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "OK" ] && ok "T20 verdict OK" || nok "T20 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -eq 0 ] && ok "T20 exit 0" || nok "T20 exit" "rc=$RC"
-echo "$OUT" | grep -q "com.test.broken-only.plist could not be parsed" && ok "T20 WARN names the broken plist" || nok "T20 warn" "no distinguishing WARN in output: [$OUT]"
+echo "$OUT" | grep "com.test.broken-only.plist could not be parsed" >/dev/null && ok "T20 WARN names the broken plist" || nok "T20 warn" "no distinguishing WARN in output: [$OUT]"
 [ "$(field PROOF "$OUT")" = "not_verified" ] && ok "T20 PROOF=not_verified (discovery incomplete, not confirmed-empty — pre-fix bug: this was not_applicable, indistinguishable from a genuinely empty dir)" || nok "T20 proof" "got '$(field PROOF "$OUT")'"
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1078,7 +1078,7 @@ OUT=$(run_helper daemons/static/some_asset.js daemons/frota_dashboard.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T23 verdict NEEDS_GUARDED_RESTART (mixed diff, entrypoint change NOT covered by no_restart_paths)" || nok "T23 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -ne 0 ] && ok "T23 non-zero exit" || nok "T23 exit" "rc=$RC"
-echo "$(field GUARDED "$OUT")" | grep -q "com.test.frota-dashboard" && ok "T23 flagged GUARDED despite one covered file in the same diff" || nok "T23 guarded" "$(field GUARDED "$OUT")"
+echo "$(field GUARDED "$OUT")" | grep "com.test.frota-dashboard" >/dev/null && ok "T23 flagged GUARDED despite one covered file in the same diff" || nok "T23 guarded" "$(field GUARDED "$OUT")"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T24 (ga-y108i): a declared no_restart_paths glob must be PRECISE — it must
@@ -1181,8 +1181,8 @@ OUT=$(run_helper daemons/demand_dashboard.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "OK" ] && ok "T26 verdict OK (daemon already fresher than the commit under review, despite predating DEPLOY_EPOCH)" || nok "T26 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -eq 0 ] && ok "T26 exit 0" || nok "T26 exit" "rc=$RC"
-echo "$(field GUARDED "$OUT")" | grep -q "com.test.demand-dashboard" && nok "T26 should NOT be GUARDED" "$(field GUARDED "$OUT")" || ok "T26 not flagged GUARDED"
-echo "$(field ALREADY_FRESH "$OUT")" | grep -q "com.test.demand-dashboard" && ok "T26 recorded in ALREADY_FRESH" || nok "T26 already_fresh" "$(field ALREADY_FRESH "$OUT")"
+echo "$(field GUARDED "$OUT")" | grep "com.test.demand-dashboard" >/dev/null && nok "T26 should NOT be GUARDED" "$(field GUARDED "$OUT")" || ok "T26 not flagged GUARDED"
+echo "$(field ALREADY_FRESH "$OUT")" | grep "com.test.demand-dashboard" >/dev/null && ok "T26 recorded in ALREADY_FRESH" || nok "T26 already_fresh" "$(field ALREADY_FRESH "$OUT")"
 ! grep -q "com.test.demand-dashboard" "$MOCK/kicks.log" 2>/dev/null && ok "T26 NOT kickstarted" || nok "T26 no-kickstart" "kickstart was called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 [ "$(field PROOF "$OUT")" = "not_verified" ] && ok "T26 PROOF=not_verified (pid-start-vs-commit is a plausibility check, not proof — gate-fix-2)" || nok "T26 proof" "got '$(field PROOF "$OUT")', want not_verified"
 
@@ -1205,7 +1205,7 @@ OUT=$(run_helper daemons/demand_dashboard.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T27 verdict NEEDS_GUARDED_RESTART (process predates the commit itself — genuinely stale)" || nok "T27 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -ne 0 ] && ok "T27 non-zero exit" || nok "T27 exit" "rc=$RC"
-echo "$(field GUARDED "$OUT")" | grep -q "com.test.demand-dashboard" && ok "T27 flagged GUARDED" || nok "T27 guarded" "$(field GUARDED "$OUT")"
+echo "$(field GUARDED "$OUT")" | grep "com.test.demand-dashboard" >/dev/null && ok "T27 flagged GUARDED" || nok "T27 guarded" "$(field GUARDED "$OUT")"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T28 (ga-dk7fw, header point 9): an ISOLATED tests/*.py change — a single
@@ -1247,7 +1247,7 @@ V=$(field VERDICT "$OUT")
 [ -z "$(field AFFECTED "$OUT")" ] && ok "T28 no daemon marked AFFECTED" || nok "T28 affected" "$(field AFFECTED "$OUT")"
 [ ! -f "$MOCK/kicks.log" ] && ok "T28 no kickstart called" || nok "T28 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 [ "$(field PROOF "$OUT")" = "not_applicable" ] && ok "T28 PROOF=not_applicable (structurally certain, not merely undetected — the delta from pre-fix not_verified that clears story-delivery.sh's delivery:daemon-unverified case)" || nok "T28 proof" "got '$(field PROOF "$OUT")', want not_applicable"
-echo "$(field REASON "$OUT")" | grep -qi "structurally inert" && ok "T28 REASON names the structurally-inert path class" || nok "T28 reason" "$(field REASON "$OUT")"
+echo "$(field REASON "$OUT")" | grep -i "structurally inert" >/dev/null && ok "T28 REASON names the structurally-inert path class" || nok "T28 reason" "$(field REASON "$OUT")"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T29 (ga-dk7fw): docs/**, *.md-only changes — the other two path classes
@@ -1290,7 +1290,7 @@ OUT=$(run_helper lib/dedup_check.py tests/test_dedup_check_wa_zmmyd.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T30 verdict NEEDS_GUARDED_RESTART (mixed lib/+tests/ deploy still flags the real lib/ change)" || nok "T30 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -ne 0 ] && ok "T30 non-zero exit" || nok "T30 exit" "rc=$RC"
-echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" && ok "T30 sensitive daemon flagged GUARDED despite co-changed tests/ file" || nok "T30 guarded" "$(field GUARDED "$OUT")"
+echo "$(field GUARDED "$OUT")" | grep "com.test.central-sender" >/dev/null && ok "T30 sensitive daemon flagged GUARDED despite co-changed tests/ file" || nok "T30 guarded" "$(field GUARDED "$OUT")"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T31 (ga-tdzsh): a plist that fails to parse, but launchd DOES have that
@@ -1327,8 +1327,8 @@ seed_running com.test.broken-loaded 9911 "$STALE_LSTART"   # loaded + live PID; 
 OUT=$(run_helper_stderr daemons/ban_risk_dashboard.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "OK" ] && ok "T31 verdict OK (healthy sibling daemon still processed normally)" || nok "T31 verdict" "got '$V' out=[$OUT]"
-echo "$OUT" | grep -q "ERROR:.*com.test.broken-loaded.plist could not be parsed" && ok "T31 ERROR-level line names the LOADED broken daemon (pre-fix: this line did not exist — only an unescalated WARN)" || nok "T31 error-line" "no escalated ERROR line in output: [$OUT]"
-echo "$(field PARSE_ERROR_LOADED "$OUT")" | grep -qx "com.test.broken-loaded" && ok "T31 PARSE_ERROR_LOADED carries the loaded label (pre-fix: field did not exist at all)" || nok "T31 parse_error_loaded" "got '$(field PARSE_ERROR_LOADED "$OUT")'"
+echo "$OUT" | grep "ERROR:.*com.test.broken-loaded.plist could not be parsed" >/dev/null && ok "T31 ERROR-level line names the LOADED broken daemon (pre-fix: this line did not exist — only an unescalated WARN)" || nok "T31 error-line" "no escalated ERROR line in output: [$OUT]"
+echo "$(field PARSE_ERROR_LOADED "$OUT")" | grep -x "com.test.broken-loaded" >/dev/null && ok "T31 PARSE_ERROR_LOADED carries the loaded label (pre-fix: field did not exist at all)" || nok "T31 parse_error_loaded" "got '$(field PARSE_ERROR_LOADED "$OUT")'"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T32 (ga-tdzsh): a plist that fails to parse, and launchd has NO record of
@@ -1363,9 +1363,9 @@ EOF
 OUT=$(run_helper_stderr daemons/ban_risk_dashboard.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "OK" ] && ok "T32 verdict OK" || nok "T32 verdict" "got '$V' out=[$OUT]"
-! echo "$OUT" | grep -q "ERROR:.*com.test.broken-unloaded" && ok "T32 no ERROR-level line for an unloaded broken plist (THE ACEITE bar)" || nok "T32 no-error" "escalated when it should not have: [$OUT]"
+! echo "$OUT" | grep "ERROR:.*com.test.broken-unloaded" >/dev/null && ok "T32 no ERROR-level line for an unloaded broken plist (THE ACEITE bar)" || nok "T32 no-error" "escalated when it should not have: [$OUT]"
 [ -z "$(field PARSE_ERROR_LOADED "$OUT")" ] && ok "T32 PARSE_ERROR_LOADED stays empty" || nok "T32 parse_error_loaded" "got '$(field PARSE_ERROR_LOADED "$OUT")'"
-echo "$(field PARSE_ERROR_UNLOADED "$OUT")" | grep -qx "com.test.broken-unloaded" && ok "T32 PARSE_ERROR_UNLOADED still records it (visible, just not escalated)" || nok "T32 parse_error_unloaded" "got '$(field PARSE_ERROR_UNLOADED "$OUT")'"
+echo "$(field PARSE_ERROR_UNLOADED "$OUT")" | grep -x "com.test.broken-unloaded" >/dev/null && ok "T32 PARSE_ERROR_UNLOADED still records it (visible, just not escalated)" || nok "T32 parse_error_unloaded" "got '$(field PARSE_ERROR_UNLOADED "$OUT")'"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T33 (ga-tdzsh): the escalation check is launchd LOAD status, not live-PID
@@ -1395,8 +1395,8 @@ cat > "$AGENTS/com.test.broken-idle.plist" <<'EOF'
 EOF
 seed_loaded com.test.broken-idle   # loaded, but NO live PID
 OUT=$(run_helper_stderr daemons/ban_risk_dashboard.py); RC=$?
-echo "$OUT" | grep -q "ERROR:.*com.test.broken-idle.plist could not be parsed" && ok "T33 ERROR line fires for a loaded-but-idle daemon (load status, not PID presence)" || nok "T33 error-line" "no escalated ERROR line: [$OUT]"
-echo "$(field PARSE_ERROR_LOADED "$OUT")" | grep -qx "com.test.broken-idle" && ok "T33 PARSE_ERROR_LOADED carries the idle-but-loaded label" || nok "T33 parse_error_loaded" "got '$(field PARSE_ERROR_LOADED "$OUT")'"
+echo "$OUT" | grep "ERROR:.*com.test.broken-idle.plist could not be parsed" >/dev/null && ok "T33 ERROR line fires for a loaded-but-idle daemon (load status, not PID presence)" || nok "T33 error-line" "no escalated ERROR line: [$OUT]"
+echo "$(field PARSE_ERROR_LOADED "$OUT")" | grep -x "com.test.broken-idle" >/dev/null && ok "T33 PARSE_ERROR_LOADED carries the idle-but-loaded label" || nok "T33 parse_error_loaded" "got '$(field PARSE_ERROR_LOADED "$OUT")'"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T34 (ga-q617u): route-blueprint hop — a changed lib/*.py module whose ONLY
@@ -1436,7 +1436,7 @@ seed_restart com.test.classification-dashboard 9599 "$FRESH_LSTART"
 # deploy changes ONLY the shared lib module — not the routes file, not the entrypoint
 OUT=$(run_helper lib/assertiva_cache.py); RC=$?
 V=$(field VERDICT "$OUT")
-echo "$(field AFFECTED "$OUT")" | grep -q "com.test.classification-dashboard" && ok "T34 route-mounted dashboard marked affected via routes/*.py hop" || nok "T34 affected" "$(field AFFECTED "$OUT")"
+echo "$(field AFFECTED "$OUT")" | grep "com.test.classification-dashboard" >/dev/null && ok "T34 route-mounted dashboard marked affected via routes/*.py hop" || nok "T34 affected" "$(field AFFECTED "$OUT")"
 [ "$V" = "OK" ] && ok "T34 verdict OK after fresh restart" || nok "T34 verdict" "got '$V' out=[$OUT]"
 grep -q "com.test.classification-dashboard" "$MOCK/kicks.log" 2>/dev/null && ok "T34 kickstart invoked" || nok "T34 kickstart" "log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 [ "$(field PROOF "$OUT")" = "verified" ] && ok "T34 PROOF=verified" || nok "T34 proof" "got '$(field PROOF "$OUT")'"
@@ -1470,7 +1470,7 @@ make_plist "$AGENTS" com.test.demand-dashboard "$RUNTIME/venv/bin/python3" "$RUN
 seed_running com.test.demand-dashboard 9601 "$STALE_LSTART"
 OUT=$(run_helper lib/assertiva_cache.py); RC=$?
 V=$(field VERDICT "$OUT")
-echo "$(field AFFECTED "$OUT")" | grep -q "com.test.demand-dashboard" && nok "T35 should not be affected (never mounts pregao)" "$(field AFFECTED "$OUT")" || ok "T35 demand-dashboard not marked affected (no cross-dashboard cascade)"
+echo "$(field AFFECTED "$OUT")" | grep "com.test.demand-dashboard" >/dev/null && nok "T35 should not be affected (never mounts pregao)" "$(field AFFECTED "$OUT")" || ok "T35 demand-dashboard not marked affected (no cross-dashboard cascade)"
 [ "$V" = "OK" ] && ok "T35 verdict OK" || nok "T35 verdict" "got '$V' out=[$OUT]"
 [ ! -f "$MOCK/kicks.log" ] && ok "T35 no kickstart called" || nok "T35 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 
@@ -1492,8 +1492,8 @@ OUT=$(run_helper daemons/central_sender.py); RC=$?
 V=$(field VERDICT "$OUT")
 REASON="$(field REASON "$OUT")"
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T36 verdict NEEDS_GUARDED_RESTART" || nok "T36 verdict" "got '$V' out=[$OUT]"
-echo "$REASON" | grep -qi "false positive" && ok "T36 REASON still warns a listed daemon may be a false positive" || nok "T36 false-positive wording" "$REASON"
-echo "$REASON" | grep -qiE "incomplete|missing|false negative" && ok "T36 REASON now warns the list itself may be INCOMPLETE (false negative)" || nok "T36 incompleteness wording" "$REASON"
+echo "$REASON" | grep -i "false positive" >/dev/null && ok "T36 REASON still warns a listed daemon may be a false positive" || nok "T36 false-positive wording" "$REASON"
+echo "$REASON" | grep -iE "incomplete|missing|false negative" >/dev/null && ok "T36 REASON now warns the list itself may be INCOMPLETE (false negative)" || nok "T36 incompleteness wording" "$REASON"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T37 (wa-jts45): a brand-new scheduled-job *.plist committed by this deploy,
@@ -1529,7 +1529,7 @@ OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" PRE_DEPLOY_SHA="$PRE" POST_DEPLOY_
 V=$(field VERDICT "$OUT")
 [ "$V" = "JOB_NOT_INSTALLED" ] && ok "T37 verdict JOB_NOT_INSTALLED (plist committed, never installed)" || nok "T37 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -ne 0 ] && ok "T37 non-zero exit" || nok "T37 exit" "rc=$RC"
-echo "$(field REASON "$OUT")" | grep -q "com.test.newjob" && ok "T37 REASON names the missing label" || nok "T37 reason" "$(field REASON "$OUT")"
+echo "$(field REASON "$OUT")" | grep "com.test.newjob" >/dev/null && ok "T37 REASON names the missing label" || nok "T37 reason" "$(field REASON "$OUT")"
 [ "$(field PROOF "$OUT")" = "not_verified" ] && ok "T37 PROOF=not_verified" || nok "T37 proof" "got '$(field PROOF "$OUT")'"
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1558,7 +1558,7 @@ OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" PRE_DEPLOY_SHA="$PRE" POST_DEPLOY_
 V=$(field VERDICT "$OUT")
 [ "$V" = "JOB_NOT_INSTALLED" ] && ok "T38 verdict JOB_NOT_INSTALLED (plist present, not loaded)" || nok "T38 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -ne 0 ] && ok "T38 non-zero exit" || nok "T38 exit" "rc=$RC"
-echo "$(field REASON "$OUT")" | grep -q "com.test.copiedonly" && ok "T38 REASON names the unloaded label" || nok "T38 reason" "$(field REASON "$OUT")"
+echo "$(field REASON "$OUT")" | grep "com.test.copiedonly" >/dev/null && ok "T38 REASON names the unloaded label" || nok "T38 reason" "$(field REASON "$OUT")"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T39 (wa-jts45): the plist IS installed AND loaded — Step 1b must NOT flag it,
@@ -1662,10 +1662,10 @@ V=$(field VERDICT "$OUT")
 [ "$V" = "JOB_NOT_INSTALLED" ] && ok "T41 verdict JOB_NOT_INSTALLED (job nao instalado continua sendo o veredito)" || nok "T41 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -ne 0 ] && ok "T41 non-zero exit" || nok "T41 exit" "rc=$RC"
 # O CORACAO DESTE TESTE: o Step 2 rodou, e o daemon obsoleto aparece.
-echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" && ok "T41 daemon SENSITIVE obsoleto aparece em GUARDED (Step 2 rodou)" || nok "T41 guarded VAZIO — Step 2 nao rodou" "GUARDED='$(field GUARDED "$OUT")' out=[$OUT]"
+echo "$(field GUARDED "$OUT")" | grep "com.test.central-sender" >/dev/null && ok "T41 daemon SENSITIVE obsoleto aparece em GUARDED (Step 2 rodou)" || nok "T41 guarded VAZIO — Step 2 nao rodou" "GUARDED='$(field GUARDED "$OUT")' out=[$OUT]"
 R41="$(field REASON "$OUT")"
-echo "$R41" | grep -q "com.test.newjob" && ok "T41 REASON nomeia o job nao instalado" || nok "T41 reason job" "$R41"
-echo "$R41" | grep -qi "NEEDS_GUARDED_RESTART" && ok "T41 REASON tambem nomeia o achado do Step 2" || nok "T41 reason step2" "$R41"
+echo "$R41" | grep "com.test.newjob" >/dev/null && ok "T41 REASON nomeia o job nao instalado" || nok "T41 reason job" "$R41"
+echo "$R41" | grep -i "NEEDS_GUARDED_RESTART" >/dev/null && ok "T41 REASON tambem nomeia o achado do Step 2" || nok "T41 reason step2" "$R41"
 ! grep -q "com.test.central-sender" "$MOCK/kicks.log" 2>/dev/null && ok "T41 daemon sensivel NAO foi bouncado" || nok "T41 no-bounce" "kickstart: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 [ "$(field PROOF "$OUT")" = "not_verified" ] && ok "T41 PROOF=not_verified (nada foi verificado)" || nok "T41 proof" "got '$(field PROOF "$OUT")'"
 
@@ -1723,12 +1723,12 @@ V=$(field VERDICT "$OUT")
 # O CORACAO DESTE TESTE: o daemon fino (zero mudanca de codigo, zero problema
 # de instalacao) nunca foi kickstartado.
 ! grep -q "com.test.safeexisting" "$MOCK/kicks.log" 2>/dev/null && ok "T42 daemon SAFE ja-fino NAO foi kickstartado" || nok "T42 kickstart indevido" "kickstart: $(cat "$MOCK/kicks.log" 2>/dev/null)"
-! echo "$(field AFFECTED "$OUT")" | grep -q "com.test.safeexisting" && ok "T42 AFFECTED exclui o daemon fino" || nok "T42 AFFECTED nao deveria conter o daemon fino" "AFFECTED=$(field AFFECTED "$OUT")"
+! echo "$(field AFFECTED "$OUT")" | grep "com.test.safeexisting" >/dev/null && ok "T42 AFFECTED exclui o daemon fino" || nok "T42 AFFECTED nao deveria conter o daemon fino" "AFFECTED=$(field AFFECTED "$OUT")"
 R42="$(field REASON "$OUT")"
-echo "$R42" | grep -q "com.test.newjob" && ok "T42 REASON nomeia o job nao instalado" || nok "T42 reason job" "$R42"
+echo "$R42" | grep "com.test.newjob" >/dev/null && ok "T42 REASON nomeia o job nao instalado" || nok "T42 reason job" "$R42"
 # O log nao pode se autocontradizer: newjob (MISSING) nao pode aparecer na
 # linha "installed+loaded".
-! grep "installed+loaded" "$MOCK/stderr.log" 2>/dev/null | grep -q "com.test.newjob" && ok "T42 log nao se autocontradiz sobre newjob" || nok "T42 log autocontraditorio: newjob aparece como installed+loaded" "$(grep 'installed+loaded' "$MOCK/stderr.log" 2>/dev/null)"
+! grep "installed+loaded" "$MOCK/stderr.log" 2>/dev/null | grep "com.test.newjob" >/dev/null && ok "T42 log nao se autocontradiz sobre newjob" || nok "T42 log autocontraditorio: newjob aparece como installed+loaded" "$(grep 'installed+loaded' "$MOCK/stderr.log" 2>/dev/null)"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T43 (ga-pntex): daemon_imports_stem()'s python3 call count must not scale
@@ -1885,7 +1885,7 @@ V=$(field VERDICT "$OUT")
 [ -z "$(field GUARDED "$OUT")" ] && ok "T45 no daemon GUARDED" || nok "T45 guarded" "$(field GUARDED "$OUT")"
 [ ! -f "$MOCK/kicks.log" ] && ok "T45 no kickstart called" || nok "T45 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 [ "$(field PROOF "$OUT")" = "not_applicable" ] && ok "T45 PROOF=not_applicable (the actual fix — was not_verified pre-fix, which trips delivery:daemon-unverified downstream)" || nok "T45 proof" "got '$(field PROOF "$OUT")', want not_applicable"
-echo "$(field REASON "$OUT")" | grep -qi "excluding tests/docs/md" && ok "T45 REASON names the excluded structurally-inert python" || nok "T45 reason" "$(field REASON "$OUT")"
+echo "$(field REASON "$OUT")" | grep -i "excluding tests/docs/md" >/dev/null && ok "T45 REASON names the excluded structurally-inert python" || nok "T45 reason" "$(field REASON "$OUT")"
 # ════════════════════════════════════════════════════════════════════════════
 # T46 (ga-9lsuq0, header point 14): a bare-name stem COLLISION between two
 # UNRELATED real modules that share a basename in different directories must
@@ -1921,7 +1921,7 @@ make_plist "$AGENTS" com.test.dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/da
 seed_running com.test.dashboard 10001 "$STALE_LSTART"
 OUT=$(run_helper daemons/routes/helpers.py); RC=$?
 V=$(field VERDICT "$OUT")
-echo "$(field AFFECTED "$OUT")" | grep -q "com.test.dashboard" && nok "T46 bare-name collision must not flag when deploy_deps.json's real closure clears it" "AFFECTED=[$(field AFFECTED "$OUT")] — dashboard.py's closure names lib/helpers.py only, never daemons/routes/helpers.py" || ok "T46 deploy_deps.json closure correctly rejects the unrelated same-named file"
+echo "$(field AFFECTED "$OUT")" | grep "com.test.dashboard" >/dev/null && nok "T46 bare-name collision must not flag when deploy_deps.json's real closure clears it" "AFFECTED=[$(field AFFECTED "$OUT")] — dashboard.py's closure names lib/helpers.py only, never daemons/routes/helpers.py" || ok "T46 deploy_deps.json closure correctly rejects the unrelated same-named file"
 [ "$V" = "OK" ] && ok "T46 verdict OK (no false-positive restart)" || nok "T46 verdict" "got '$V' out=[$OUT]"
 [ ! -f "$MOCK/kicks.log" ] && ok "T46 no kickstart called" || nok "T46 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 
@@ -1966,7 +1966,7 @@ seed_restart com.test.dashboard2 10199 "$FRESH_LSTART"
 # lib/*.py chain (not a routes/*.py hop) — invisible without deploy_deps.json
 OUT=$(run_helper lib/b.py); RC=$?
 V=$(field VERDICT "$OUT")
-echo "$(field AFFECTED "$OUT")" | grep -q "com.test.dashboard2" && ok "T47 deep lib-to-lib dependency caught via deploy_deps.json's real recursive closure" || nok "T47 affected" "$(field AFFECTED "$OUT")"
+echo "$(field AFFECTED "$OUT")" | grep "com.test.dashboard2" >/dev/null && ok "T47 deep lib-to-lib dependency caught via deploy_deps.json's real recursive closure" || nok "T47 affected" "$(field AFFECTED "$OUT")"
 [ "$V" = "OK" ] && ok "T47 verdict OK after fresh restart" || nok "T47 verdict" "got '$V' out=[$OUT]"
 grep -q "com.test.dashboard2" "$MOCK/kicks.log" 2>/dev/null && ok "T47 kickstart invoked" || nok "T47 kickstart" "log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 [ "$(field PROOF "$OUT")" = "verified" ] && ok "T47 PROOF=verified" || nok "T47 proof" "got '$(field PROOF "$OUT")'"
@@ -1992,8 +1992,8 @@ echo '{not valid json' > "$RUNTIME/daemons/deploy_deps.json"
 make_plist "$AGENTS" com.test.dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/dashboard.py"
 seed_running com.test.dashboard 10201 "$STALE_LSTART"
 OUT=$(run_helper_stderr daemons/routes/helpers.py); RC=$?
-echo "$OUT" | grep -qi "could not be read" && ok "T48 WARN logged for unparseable deploy_deps.json" || nok "T48 warn" "$OUT"
-echo "$(field AFFECTED "$OUT")" | grep -q "com.test.dashboard" && ok "T48 falls back to the ad-hoc scan (same collision as T46, now unprotected — proves fail-SOFT, not a silent no-op)" || nok "T48 affected" "$(field AFFECTED "$OUT")"
+echo "$OUT" | grep -i "could not be read" >/dev/null && ok "T48 WARN logged for unparseable deploy_deps.json" || nok "T48 warn" "$OUT"
+echo "$(field AFFECTED "$OUT")" | grep "com.test.dashboard" >/dev/null && ok "T48 falls back to the ad-hoc scan (same collision as T46, now unprotected — proves fail-SOFT, not a silent no-op)" || nok "T48 affected" "$(field AFFECTED "$OUT")"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T49 (ga-9lsuq0, header point 14): a daemon whose entrypoint deploy_deps.json
@@ -2025,7 +2025,7 @@ seed_running com.test.ban-risk-dashboard 10301 "$STALE_LSTART"
 seed_restart com.test.ban-risk-dashboard 10399 "$FRESH_LSTART"
 OUT=$(run_helper routes/channel_admin_api.py); RC=$?
 V=$(field VERDICT "$OUT")
-echo "$(field AFFECTED "$OUT")" | grep -q "com.test.ban-risk-dashboard" && ok "T49 uncovered daemon still caught by the existing ad-hoc scan (deploy_deps.json presence never starves an entrypoint it doesn't mention)" || nok "T49 affected" "$(field AFFECTED "$OUT")"
+echo "$(field AFFECTED "$OUT")" | grep "com.test.ban-risk-dashboard" >/dev/null && ok "T49 uncovered daemon still caught by the existing ad-hoc scan (deploy_deps.json presence never starves an entrypoint it doesn't mention)" || nok "T49 affected" "$(field AFFECTED "$OUT")"
 [ "$V" = "OK" ] && ok "T49 verdict OK after fresh restart" || nok "T49 verdict" "got '$V' out=[$OUT]"
 [ "$(field PROOF "$OUT")" = "verified" ] && ok "T49 PROOF=verified" || nok "T49 proof" "got '$(field PROOF "$OUT")'"
 
@@ -2077,8 +2077,8 @@ FORCE_RESTART_LABELS=""
 V=$(field VERDICT "$OUT")
 [ "$V" = "OK" ] && ok "T50 verdict OK" || nok "T50 verdict" "got '$V' out=[$OUT]"
 [ "$RC" -eq 0 ] && ok "T50 exit 0" || nok "T50 exit" "rc=$RC"
-echo "$(field AFFECTED "$OUT")" | grep -q "com.test.lexbh-dashboard" && ok "T50 python-m daemon forced into AFFECTED via daemon_restarts override" || nok "T50 affected" "$(field AFFECTED "$OUT")"
-echo "$(field RESTARTED "$OUT")" | grep -q "com.test.lexbh-dashboard" && ok "T50 python-m daemon restarted" || nok "T50 restarted" "$(field RESTARTED "$OUT")"
+echo "$(field AFFECTED "$OUT")" | grep "com.test.lexbh-dashboard" >/dev/null && ok "T50 python-m daemon forced into AFFECTED via daemon_restarts override" || nok "T50 affected" "$(field AFFECTED "$OUT")"
+echo "$(field RESTARTED "$OUT")" | grep "com.test.lexbh-dashboard" >/dev/null && ok "T50 python-m daemon restarted" || nok "T50 restarted" "$(field RESTARTED "$OUT")"
 grep -q "com.test.lexbh-dashboard" "$MOCK/kicks.log" 2>/dev/null && ok "T50 kickstart invoked" || nok "T50 kickstart" "log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 [ "$(field PROOF "$OUT")" = "verified" ] && ok "T50 PROOF=verified (real restart+fresh confirmed, not a blind fire-and-forget kick)" || nok "T50 proof" "got '$(field PROOF "$OUT")'"
 
@@ -2110,10 +2110,10 @@ OUT=$(run_helper daemons/central_sender.py); RC=$?
 V=$(field VERDICT "$OUT")
 REASON="$(field REASON "$OUT")"
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T51 verdict NEEDS_GUARDED_RESTART" || nok "T51 verdict" "got '$V' out=[$OUT]"
-echo "$REASON" | grep -qi "real recursive closure" && ok "T51 REASON asserts full-closure coverage (deploy_deps.json 1/1)" || nok "T51 full-closure wording" "$REASON"
-echo "$REASON" | grep -qi "does NOT apply here" && ok "T51 REASON retires the false-negative caveat for this run" || nok "T51 retired caveat" "$REASON"
-echo "$REASON" | grep -qi "template" && ok "T51 REASON still names template/asset reachability as a residual risk" || nok "T51 template caveat kept" "$REASON"
-echo "$REASON" | grep -qi "stale" && ok "T51 REASON still names JSON staleness as a residual risk" || nok "T51 staleness caveat kept" "$REASON"
+echo "$REASON" | grep -i "real recursive closure" >/dev/null && ok "T51 REASON asserts full-closure coverage (deploy_deps.json 1/1)" || nok "T51 full-closure wording" "$REASON"
+echo "$REASON" | grep -i "does NOT apply here" >/dev/null && ok "T51 REASON retires the false-negative caveat for this run" || nok "T51 retired caveat" "$REASON"
+echo "$REASON" | grep -i "template" >/dev/null && ok "T51 REASON still names template/asset reachability as a residual risk" || nok "T51 template caveat kept" "$REASON"
+echo "$REASON" | grep -i "stale" >/dev/null && ok "T51 REASON still names JSON staleness as a residual risk" || nok "T51 staleness caveat kept" "$REASON"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T52 (ga-9lug2k): control — deploy_deps.json exists but does NOT cover every
@@ -2145,8 +2145,8 @@ OUT=$(run_helper daemons/central_sender.py); RC=$?
 V=$(field VERDICT "$OUT")
 REASON="$(field REASON "$OUT")"
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T52 verdict NEEDS_GUARDED_RESTART" || nok "T52 verdict" "got '$V' out=[$OUT]"
-echo "$REASON" | grep -qi "verify by hand" && ok "T52 REASON keeps the conservative wording (coverage is partial: 1/2 entrypoints)" || nok "T52 conservative wording kept" "$REASON"
-! echo "$REASON" | grep -qi "does NOT apply here" && ok "T52 REASON does NOT claim full-closure coverage" || nok "T52 wrongly claimed full closure" "$REASON"
+echo "$REASON" | grep -i "verify by hand" >/dev/null && ok "T52 REASON keeps the conservative wording (coverage is partial: 1/2 entrypoints)" || nok "T52 conservative wording kept" "$REASON"
+! echo "$REASON" | grep -i "does NOT apply here" >/dev/null && ok "T52 REASON does NOT claim full-closure coverage" || nok "T52 wrongly claimed full closure" "$REASON"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T53 (ga-0fawwr): per-daemon baseline narrowing. Simulates the reported
@@ -2214,10 +2214,10 @@ OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" \
   LAUNCH_AGENTS_DIR="$AGENTS" LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" \
   VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 DRY_RUN=0 \
   bash "$HELPER" 2>/dev/null); RC=$?
-echo "$(field AFFECTED "$OUT")" | grep -q "com.test.bigclosure" \
+echo "$(field AFFECTED "$OUT")" | grep "com.test.bigclosure" >/dev/null \
   && nok "T53 bigclosure must be downgraded out of AFFECTED (its own closure is clean since its override point C1)" "AFFECTED=[$(field AFFECTED "$OUT")]" \
   || ok "T53 bigclosure downgraded out of AFFECTED via its per-daemon override"
-echo "$(field AFFECTED "$OUT")" | grep -q "com.test.otherdaemon" \
+echo "$(field AFFECTED "$OUT")" | grep "com.test.otherdaemon" >/dev/null \
   && ok "T53 otherdaemon (no override yet) still correctly AFFECTED via the wide window — real staleness never hidden" \
   || nok "T53 otherdaemon affected" "$(field AFFECTED "$OUT")"
 grep -q "com.test.bigclosure" "$MOCK/kicks.log" 2>/dev/null \
@@ -2277,7 +2277,7 @@ OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" \
   LAUNCH_AGENTS_DIR="$AGENTS" LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" \
   VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 DRY_RUN=0 \
   bash "$HELPER" 2>/dev/null); RC=$?
-echo "$(field AFFECTED "$OUT")" | grep -q "com.test.bigclosure" \
+echo "$(field AFFECTED "$OUT")" | grep "com.test.bigclosure" >/dev/null \
   && ok "T54 non-ancestor override safely ignored — falls back to the wide-window verdict (still AFFECTED)" \
   || nok "T54 affected" "AFFECTED=[$(field AFFECTED "$OUT")]"
 
@@ -2366,12 +2366,12 @@ seed_running com.test.central-sender 57001 "$STALE_LSTART"
 OUT=$(run_helper daemons/central_sender.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T57 verdict NEEDS_GUARDED_RESTART" || nok "T57 verdict" "got '$V' out=[$OUT]"
-echo "$(field GUARDED_OWN "$OUT")" | grep -q "com.test.central-sender" && ok "T57 own-file-changed daemon lands in GUARDED_OWN" || nok "T57 guarded_own" "$(field GUARDED_OWN "$OUT")"
-echo "$(field GUARDED_CLOSURE_ONLY "$OUT")" | grep -q "com.test.central-sender" && nok "T57 must NOT be in GUARDED_CLOSURE_ONLY" "$(field GUARDED_CLOSURE_ONLY "$OUT")" || ok "T57 not in GUARDED_CLOSURE_ONLY"
+echo "$(field GUARDED_OWN "$OUT")" | grep "com.test.central-sender" >/dev/null && ok "T57 own-file-changed daemon lands in GUARDED_OWN" || nok "T57 guarded_own" "$(field GUARDED_OWN "$OUT")"
+echo "$(field GUARDED_CLOSURE_ONLY "$OUT")" | grep "com.test.central-sender" >/dev/null && nok "T57 must NOT be in GUARDED_CLOSURE_ONLY" "$(field GUARDED_CLOSURE_ONLY "$OUT")" || ok "T57 not in GUARDED_CLOSURE_ONLY"
 [ -z "$(field GUARDED_CLOSURE_ONLY "$OUT")" ] && ok "T57 GUARDED_CLOSURE_ONLY empty (nothing closure-only this run)" || nok "T57 guarded_closure_only empty" "$(field GUARDED_CLOSURE_ONLY "$OUT")"
 R57="$(field REASON "$OUT")"
-echo "$R57" | grep -q "OWN-FILE-CHANGED" && ok "T57 REASON renders an OWN-FILE-CHANGED section" || nok "T57 reason own-section" "$R57"
-echo "$R57" | grep -q "CLOSURE-ONLY" && nok "T57 REASON must NOT render a CLOSURE-ONLY section (nothing to show)" "$R57" || ok "T57 no CLOSURE-ONLY section"
+echo "$R57" | grep "OWN-FILE-CHANGED" >/dev/null && ok "T57 REASON renders an OWN-FILE-CHANGED section" || nok "T57 reason own-section" "$R57"
+echo "$R57" | grep "CLOSURE-ONLY" >/dev/null && nok "T57 REASON must NOT render a CLOSURE-ONLY section (nothing to show)" "$R57" || ok "T57 no CLOSURE-ONLY section"
 # same partition must reach the trailing JSON, not just the KEY=value lines.
 echo "$OUT" | grep '^JSON=' | sed 's/^JSON=//' | python3 -c '
 import json, sys
@@ -2403,18 +2403,18 @@ seed_running com.test.central-sender 58001 "$STALE_LSTART"
 OUT=$(run_helper routes/channel_admin_api.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T58 verdict NEEDS_GUARDED_RESTART" || nok "T58 verdict" "got '$V' out=[$OUT]"
-echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" && ok "T58 still in flat GUARDED (backward compat)" || nok "T58 guarded" "$(field GUARDED "$OUT")"
-echo "$(field GUARDED_CLOSURE_ONLY "$OUT")" | grep -q "com.test.central-sender" && ok "T58 import-only daemon lands in GUARDED_CLOSURE_ONLY" || nok "T58 guarded_closure_only" "$(field GUARDED_CLOSURE_ONLY "$OUT")"
-echo "$(field GUARDED_OWN "$OUT")" | grep -q "com.test.central-sender" && nok "T58 must NOT be in GUARDED_OWN" "$(field GUARDED_OWN "$OUT")" || ok "T58 not in GUARDED_OWN"
+echo "$(field GUARDED "$OUT")" | grep "com.test.central-sender" >/dev/null && ok "T58 still in flat GUARDED (backward compat)" || nok "T58 guarded" "$(field GUARDED "$OUT")"
+echo "$(field GUARDED_CLOSURE_ONLY "$OUT")" | grep "com.test.central-sender" >/dev/null && ok "T58 import-only daemon lands in GUARDED_CLOSURE_ONLY" || nok "T58 guarded_closure_only" "$(field GUARDED_CLOSURE_ONLY "$OUT")"
+echo "$(field GUARDED_OWN "$OUT")" | grep "com.test.central-sender" >/dev/null && nok "T58 must NOT be in GUARDED_OWN" "$(field GUARDED_OWN "$OUT")" || ok "T58 not in GUARDED_OWN"
 [ -z "$(field GUARDED_OWN "$OUT")" ] && ok "T58 GUARDED_OWN empty (nothing own-file-changed this run)" || nok "T58 guarded_own empty" "$(field GUARDED_OWN "$OUT")"
 R58="$(field REASON "$OUT")"
-echo "$R58" | grep -q "CLOSURE-ONLY" && ok "T58 REASON renders a CLOSURE-ONLY section" || nok "T58 reason closure-section" "$R58"
+echo "$R58" | grep "CLOSURE-ONLY" >/dev/null && ok "T58 REASON renders a CLOSURE-ONLY section" || nok "T58 reason closure-section" "$R58"
 # the exact historical bug class this guards against (mirrors WA's own
 # daemon-refresh-step5-ranking.selftest.sh "GUARDED but zero symbol-confirmed
 # must still show its section" case): a 100%-closure-only GUARDED list must
 # not silently omit the OWN-FILE-CHANGED header's absence — it must render
 # ZERO own-file-changed daemons, not skip discussing the split at all.
-echo "$R58" | grep -q "OWN-FILE-CHANGED" && nok "T58 REASON must NOT render an OWN-FILE-CHANGED section (nothing to show)" "$R58" || ok "T58 no OWN-FILE-CHANGED section"
+echo "$R58" | grep "OWN-FILE-CHANGED" >/dev/null && nok "T58 REASON must NOT render an OWN-FILE-CHANGED section (nothing to show)" "$R58" || ok "T58 no OWN-FILE-CHANGED section"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T59 (wa-flysp, header point 16): a MIXED deploy — one SENSITIVE daemon
@@ -2441,10 +2441,10 @@ seed_running com.test.slot-scheduler 59101 "$STALE_LSTART"
 OUT=$(run_helper daemons/central_sender.py routes/channel_admin_api.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T59 verdict NEEDS_GUARDED_RESTART" || nok "T59 verdict" "got '$V' out=[$OUT]"
-echo "$(field GUARDED_OWN "$OUT")" | grep -q "com.test.central-sender" && ok "T59 central-sender in GUARDED_OWN" || nok "T59 guarded_own central" "$(field GUARDED_OWN "$OUT")"
-echo "$(field GUARDED_CLOSURE_ONLY "$OUT")" | grep -q "com.test.slot-scheduler" && ok "T59 slot-scheduler in GUARDED_CLOSURE_ONLY" || nok "T59 guarded_closure_only slot" "$(field GUARDED_CLOSURE_ONLY "$OUT")"
-echo "$(field GUARDED_OWN "$OUT")" | grep -q "com.test.slot-scheduler" && nok "T59 slot-scheduler must NOT be in GUARDED_OWN" "$(field GUARDED_OWN "$OUT")" || ok "T59 slot-scheduler correctly excluded from GUARDED_OWN"
-echo "$(field GUARDED_CLOSURE_ONLY "$OUT")" | grep -q "com.test.central-sender" && nok "T59 central-sender must NOT be in GUARDED_CLOSURE_ONLY" "$(field GUARDED_CLOSURE_ONLY "$OUT")" || ok "T59 central-sender correctly excluded from GUARDED_CLOSURE_ONLY"
+echo "$(field GUARDED_OWN "$OUT")" | grep "com.test.central-sender" >/dev/null && ok "T59 central-sender in GUARDED_OWN" || nok "T59 guarded_own central" "$(field GUARDED_OWN "$OUT")"
+echo "$(field GUARDED_CLOSURE_ONLY "$OUT")" | grep "com.test.slot-scheduler" >/dev/null && ok "T59 slot-scheduler in GUARDED_CLOSURE_ONLY" || nok "T59 guarded_closure_only slot" "$(field GUARDED_CLOSURE_ONLY "$OUT")"
+echo "$(field GUARDED_OWN "$OUT")" | grep "com.test.slot-scheduler" >/dev/null && nok "T59 slot-scheduler must NOT be in GUARDED_OWN" "$(field GUARDED_OWN "$OUT")" || ok "T59 slot-scheduler correctly excluded from GUARDED_OWN"
+echo "$(field GUARDED_CLOSURE_ONLY "$OUT")" | grep "com.test.central-sender" >/dev/null && nok "T59 central-sender must NOT be in GUARDED_CLOSURE_ONLY" "$(field GUARDED_CLOSURE_ONLY "$OUT")" || ok "T59 central-sender correctly excluded from GUARDED_CLOSURE_ONLY"
 R59="$(field REASON "$OUT")"
 OWN_POS="${R59%%OWN-FILE-CHANGED*}"
 CLOSURE_POS="${R59%%CLOSURE-ONLY*}"
@@ -2464,8 +2464,8 @@ seed_restart com.test.ban-risk-dashboard 60099 "$FRESH_LSTART"
 OUT=$(run_helper daemons/ban_risk_dashboard.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "OK" ] && ok "T60 verdict OK" || nok "T60 verdict" "got '$V' out=[$OUT]"
-echo "$OUT" | grep -q '^GUARDED_OWN=' && ok "T60 GUARDED_OWN field present (even empty) on a non-GUARDED verdict" || nok "T60 guarded_own present" "out=[$OUT]"
-echo "$OUT" | grep -q '^GUARDED_CLOSURE_ONLY=' && ok "T60 GUARDED_CLOSURE_ONLY field present (even empty) on a non-GUARDED verdict" || nok "T60 guarded_closure_only present" "out=[$OUT]"
+echo "$OUT" | grep '^GUARDED_OWN=' >/dev/null && ok "T60 GUARDED_OWN field present (even empty) on a non-GUARDED verdict" || nok "T60 guarded_own present" "out=[$OUT]"
+echo "$OUT" | grep '^GUARDED_CLOSURE_ONLY=' >/dev/null && ok "T60 GUARDED_CLOSURE_ONLY field present (even empty) on a non-GUARDED verdict" || nok "T60 guarded_closure_only present" "out=[$OUT]"
 [ -z "$(field GUARDED_OWN "$OUT")" ] && ok "T60 GUARDED_OWN empty" || nok "T60 guarded_own empty" "$(field GUARDED_OWN "$OUT")"
 [ -z "$(field GUARDED_CLOSURE_ONLY "$OUT")" ] && ok "T60 GUARDED_CLOSURE_ONLY empty" || nok "T60 guarded_closure_only empty" "$(field GUARDED_CLOSURE_ONLY "$OUT")"
 
@@ -2508,9 +2508,9 @@ OUT=$(run_helper dashboard/app.py); RC=$?
 FORCE_RESTART_LABELS=""
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T61 verdict NEEDS_GUARDED_RESTART" || nok "T61 verdict" "got '$V' out=[$OUT]"
-echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender-forced" && ok "T61 forced-in daemon still in flat GUARDED" || nok "T61 guarded" "$(field GUARDED "$OUT")"
-echo "$(field GUARDED_OWN "$OUT")" | grep -q "com.test.central-sender-forced" && ok "T61 FORCE_RESTART_LABELS entry classified GUARDED_OWN, not closure-only noise" || nok "T61 guarded_own" "$(field GUARDED_OWN "$OUT")"
-echo "$(field GUARDED_CLOSURE_ONLY "$OUT")" | grep -q "com.test.central-sender-forced" && nok "T61 must NOT be in GUARDED_CLOSURE_ONLY" "$(field GUARDED_CLOSURE_ONLY "$OUT")" || ok "T61 correctly excluded from GUARDED_CLOSURE_ONLY"
+echo "$(field GUARDED "$OUT")" | grep "com.test.central-sender-forced" >/dev/null && ok "T61 forced-in daemon still in flat GUARDED" || nok "T61 guarded" "$(field GUARDED "$OUT")"
+echo "$(field GUARDED_OWN "$OUT")" | grep "com.test.central-sender-forced" >/dev/null && ok "T61 FORCE_RESTART_LABELS entry classified GUARDED_OWN, not closure-only noise" || nok "T61 guarded_own" "$(field GUARDED_OWN "$OUT")"
+echo "$(field GUARDED_CLOSURE_ONLY "$OUT")" | grep "com.test.central-sender-forced" >/dev/null && nok "T61 must NOT be in GUARDED_CLOSURE_ONLY" "$(field GUARDED_CLOSURE_ONLY "$OUT")" || ok "T61 correctly excluded from GUARDED_CLOSURE_ONLY"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T62 (ga-8q1ulq, header point 17): rig HAS compute_symbol_reachability.py,
@@ -2526,10 +2526,10 @@ seed_symbol_result daemons/central_sender.py confirmed
 OUT=$(run_helper daemons/central_sender.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T62 verdict NEEDS_GUARDED_RESTART" || nok "T62 verdict" "got '$V' out=[$OUT]"
-echo "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")" | grep -q "com.test.central-sender" && ok "T62 lands in GUARDED_SYMBOL_CONFIRMED" || nok "T62 guarded_symbol_confirmed" "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")"
+echo "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")" | grep "com.test.central-sender" >/dev/null && ok "T62 lands in GUARDED_SYMBOL_CONFIRMED" || nok "T62 guarded_symbol_confirmed" "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")"
 [ -z "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" ] && ok "T62 GUARDED_SYMBOL_NO_EVIDENCE empty" || nok "T62 guarded_symbol_no_evidence" "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")"
 [ -z "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" ] && ok "T62 GUARDED_SYMBOL_NOT_COMPUTED empty" || nok "T62 guarded_symbol_not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
-echo "$(field REASON "$OUT")" | grep -q "SYMBOL-CONFIRMED" && ok "T62 REASON renders a SYMBOL-CONFIRMED section" || nok "T62 reason" "$(field REASON "$OUT")"
+echo "$(field REASON "$OUT")" | grep "SYMBOL-CONFIRMED" >/dev/null && ok "T62 REASON renders a SYMBOL-CONFIRMED section" || nok "T62 reason" "$(field REASON "$OUT")"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T63 (ga-8q1ulq, header point 17): same shape as T62, but the calculator
@@ -2545,10 +2545,10 @@ seed_symbol_result daemons/central_sender.py no_evidence
 OUT=$(run_helper daemons/central_sender.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T63 verdict NEEDS_GUARDED_RESTART" || nok "T63 verdict" "got '$V' out=[$OUT]"
-echo "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" | grep -q "com.test.central-sender" && ok "T63 lands in GUARDED_SYMBOL_NO_EVIDENCE" || nok "T63 guarded_symbol_no_evidence" "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")"
+echo "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" | grep "com.test.central-sender" >/dev/null && ok "T63 lands in GUARDED_SYMBOL_NO_EVIDENCE" || nok "T63 guarded_symbol_no_evidence" "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")"
 [ -z "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")" ] && ok "T63 GUARDED_SYMBOL_CONFIRMED empty" || nok "T63 guarded_symbol_confirmed" "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")"
 [ -z "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" ] && ok "T63 GUARDED_SYMBOL_NOT_COMPUTED empty" || nok "T63 guarded_symbol_not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
-echo "$(field REASON "$OUT")" | grep -q "SEM EVIDÊNCIA DE SÍMBOLO" && ok "T63 REASON renders a SEM EVIDÊNCIA DE SÍMBOLO section" || nok "T63 reason" "$(field REASON "$OUT")"
+echo "$(field REASON "$OUT")" | grep "SEM EVIDÊNCIA DE SÍMBOLO" >/dev/null && ok "T63 REASON renders a SEM EVIDÊNCIA DE SÍMBOLO section" || nok "T63 reason" "$(field REASON "$OUT")"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T64 (ga-8q1ulq, header point 17 / ACEITE item 2): the calculator subprocess
@@ -2566,11 +2566,11 @@ seed_symbol_result daemons/central_sender.py crash
 OUT=$(run_helper daemons/central_sender.py); RC=$?
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T64 verdict still NEEDS_GUARDED_RESTART (unaffected by the crash)" || nok "T64 verdict" "got '$V' out=[$OUT]"
-echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" && ok "T64 label still in flat GUARDED (membership unaffected)" || nok "T64 guarded" "$(field GUARDED "$OUT")"
-echo "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" | grep -q "com.test.central-sender" && ok "T64 lands in GUARDED_SYMBOL_NOT_COMPUTED" || nok "T64 guarded_symbol_not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
+echo "$(field GUARDED "$OUT")" | grep "com.test.central-sender" >/dev/null && ok "T64 label still in flat GUARDED (membership unaffected)" || nok "T64 guarded" "$(field GUARDED "$OUT")"
+echo "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" | grep "com.test.central-sender" >/dev/null && ok "T64 lands in GUARDED_SYMBOL_NOT_COMPUTED" || nok "T64 guarded_symbol_not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
 [ -z "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" ] && ok "T64 NOT folded into GUARDED_SYMBOL_NO_EVIDENCE" || nok "T64 guarded_symbol_no_evidence must be empty" "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")"
 [ -z "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")" ] && ok "T64 GUARDED_SYMBOL_CONFIRMED empty" || nok "T64 guarded_symbol_confirmed" "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")"
-echo "$(field REASON "$OUT")" | grep -q "NÃO CALCULADO" && ok "T64 REASON renders a NÃO CALCULADO section" || nok "T64 reason" "$(field REASON "$OUT")"
+echo "$(field REASON "$OUT")" | grep "NÃO CALCULADO" >/dev/null && ok "T64 REASON renders a NÃO CALCULADO section" || nok "T64 reason" "$(field REASON "$OUT")"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T65 (ga-8q1ulq, header point 17 / ACEITE item 3): a rig WITHOUT
@@ -2589,7 +2589,7 @@ V=$(field VERDICT "$OUT")
 [ -z "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" ] && ok "T65 GUARDED_SYMBOL_NO_EVIDENCE empty" || nok "T65 guarded_symbol_no_evidence" "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")"
 [ -z "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" ] && ok "T65 GUARDED_SYMBOL_NOT_COMPUTED empty" || nok "T65 guarded_symbol_not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
 R65="$(field REASON "$OUT")"
-echo "$R65" | grep -qE "SYMBOL-CONFIRMED|SEM EVIDÊNCIA DE SÍMBOLO|NÃO CALCULADO" && nok "T65 REASON must NOT mention any symbol-ranking section" "$R65" || ok "T65 no symbol-ranking section in REASON"
+echo "$R65" | grep -E "SYMBOL-CONFIRMED|SEM EVIDÊNCIA DE SÍMBOLO|NÃO CALCULADO" >/dev/null && nok "T65 REASON must NOT mention any symbol-ranking section" "$R65" || ok "T65 no symbol-ranking section in REASON"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T66 (ga-8q1ulq, header point 17; updated ga-4oh2r6 for batch mode): a MIXED
@@ -2630,11 +2630,11 @@ SENSITIVE_DAEMONS="central-sender"
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T66 verdict NEEDS_GUARDED_RESTART" || nok "T66 verdict" "got '$V' out=[$OUT]"
 for l in com.test.central-sender com.test.slot-scheduler com.test.conversation-monitor; do
-  echo "$(field GUARDED "$OUT")" | grep -q "$l" && ok "T66 $l still in flat GUARDED" || nok "T66 guarded $l" "$(field GUARDED "$OUT")"
+  echo "$(field GUARDED "$OUT")" | grep "$l" >/dev/null && ok "T66 $l still in flat GUARDED" || nok "T66 guarded $l" "$(field GUARDED "$OUT")"
 done
-echo "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")" | grep -q "com.test.central-sender" && ok "T66 central-sender in GUARDED_SYMBOL_CONFIRMED" || nok "T66 confirmed" "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")"
-echo "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" | grep -q "com.test.slot-scheduler" && ok "T66 slot-scheduler in GUARDED_SYMBOL_NO_EVIDENCE" || nok "T66 no_evidence" "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")"
-echo "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" | grep -q "com.test.conversation-monitor" && ok "T66 conversation-monitor in GUARDED_SYMBOL_NOT_COMPUTED" || nok "T66 not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
+echo "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")" | grep "com.test.central-sender" >/dev/null && ok "T66 central-sender in GUARDED_SYMBOL_CONFIRMED" || nok "T66 confirmed" "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")"
+echo "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" | grep "com.test.slot-scheduler" >/dev/null && ok "T66 slot-scheduler in GUARDED_SYMBOL_NO_EVIDENCE" || nok "T66 no_evidence" "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")"
+echo "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" | grep "com.test.conversation-monitor" >/dev/null && ok "T66 conversation-monitor in GUARDED_SYMBOL_NOT_COMPUTED" || nok "T66 not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
 R66="$(field REASON "$OUT")"
 CONF_POS="${R66%%SYMBOL-CONFIRMED*}"
 NOEV_POS="${R66%%SEM EVIDÊNCIA DE SÍMBOLO*}"
@@ -2671,7 +2671,7 @@ OUT=$(run_helper daemons/central_sender.py); RC=$?
 SYMBOL_REACHABILITY_TOTAL_TIMEOUT=10
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T67 verdict NEEDS_GUARDED_RESTART" || nok "T67 verdict" "got '$V' out=[$OUT]"
-echo "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" | grep -q "com.test.central-sender" && ok "T67 hung batch invocation degrades to GUARDED_SYMBOL_NOT_COMPUTED" || nok "T67 guarded_symbol_not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
+echo "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" | grep "com.test.central-sender" >/dev/null && ok "T67 hung batch invocation degrades to GUARDED_SYMBOL_NOT_COMPUTED" || nok "T67 guarded_symbol_not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T68 (ga-8q1ulq, header point 17 / ACEITE item 4; updated ga-4oh2r6):
@@ -2703,7 +2703,7 @@ SENSITIVE_DAEMONS="central-sender"
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T68 verdict NEEDS_GUARDED_RESTART" || nok "T68 verdict" "got '$V' out=[$OUT]"
 NC68="$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
-echo "$NC68" | grep -q "com.test.central-sender" && echo "$NC68" | grep -q "com.test.slot-scheduler" \
+echo "$NC68" | grep "com.test.central-sender" >/dev/null && echo "$NC68" | grep "com.test.slot-scheduler" >/dev/null \
   && ok "T68 exhausted total budget degrades BOTH daemons to GUARDED_SYMBOL_NOT_COMPUTED" \
   || nok "T68 guarded_symbol_not_computed" "$NC68"
 [ ! -e "$MOCK/symbol_batch_argv.json" ] \
@@ -2799,7 +2799,7 @@ SENSITIVE_DAEMONS="central-sender"
 V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T70 verdict NEEDS_GUARDED_RESTART" || nok "T70 verdict" "got '$V' out=[$OUT]"
 for n in $T70_LABELS; do
-  echo "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")" | grep -q "com.test.$n" \
+  echo "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")" | grep "com.test.$n" >/dev/null \
     && ok "T70 com.test.$n correctly SYMBOL-CONFIRMED" \
     || nok "T70 com.test.$n missing from GUARDED_SYMBOL_CONFIRMED" "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")"
 done
@@ -2877,7 +2877,7 @@ OUT=$(run_helper daemons/demand_dashboard.py); RC=$?
 [ "$(field GUARDED "$OUT")" = "$DD" ] && ok "T71 flat GUARDED unchanged (the daemon is still stale)" || nok "T71 guarded" "$(field GUARDED "$OUT")"
 [ "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" = "$DD" ] && ok "T71 lands in GUARDED_SYMBOL_NO_EVIDENCE" || nok "T71 no_evidence" "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")"
 [ "$(field GUARDED_LOCKED_COSMETIC "$OUT")" = "$DD" ] && ok "T71 GUARDED_LOCKED_COSMETIC names the locked + no-evidence daemon" || nok "T71 locked_cosmetic" "got '$(field GUARDED_LOCKED_COSMETIC "$OUT")' — the field is missing or wrong"
-echo "$(field REASON "$OUT")" | grep -q "TRAVA HUMANA SEM EVIDÊNCIA" && ok "T71 REASON renders a TRAVA HUMANA SEM EVIDÊNCIA section" || nok "T71 reason" "$(field REASON "$OUT")"
+echo "$(field REASON "$OUT")" | grep "TRAVA HUMANA SEM EVIDÊNCIA" >/dev/null && ok "T71 REASON renders a TRAVA HUMANA SEM EVIDÊNCIA section" || nok "T71 reason" "$(field REASON "$OUT")"
 [ "$(json_list guarded_locked_cosmetic "$OUT")" = "$DD" ] && ok "T71 trailing JSON guarded_locked_cosmetic matches the KEY=value line" || nok "T71 json" "got '$(json_list guarded_locked_cosmetic "$OUT")'"
 ! grep -q "$DD" "$MOCK/kicks.log" 2>/dev/null && ok "T71 the locked daemon was NOT bounced" || nok "T71 no-bounce" "kickstart was called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 
@@ -2885,15 +2885,15 @@ echo "$(field REASON "$OUT")" | grep -q "TRAVA HUMANA SEM EVIDÊNCIA" && ok "T71
 locked_dd_case t72 72001
 seed_symbol_result daemons/demand_dashboard.py confirmed
 OUT=$(run_helper daemons/demand_dashboard.py)
-echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T72 GUARDED_LOCKED_COSMETIC is present and empty (present-even-empty contract)" || nok "T72 line" "missing or non-empty: '$(field GUARDED_LOCKED_COSMETIC "$OUT")' present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=')"
+echo "$OUT" | grep '^GUARDED_LOCKED_COSMETIC=$' >/dev/null && ok "T72 GUARDED_LOCKED_COSMETIC is present and empty (present-even-empty contract)" || nok "T72 line" "missing or non-empty: '$(field GUARDED_LOCKED_COSMETIC "$OUT")' present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=')"
 [ "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")" = "$DD" ] && ok "T72 stays SYMBOL-CONFIRMED — a real stale is never demoted" || nok "T72 confirmed" "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")"
-echo "$(field REASON "$OUT")" | grep -q "TRAVA HUMANA SEM EVIDÊNCIA" && nok "T72 REASON wrongly renders the cosmetic section" "$(field REASON "$OUT")" || ok "T72 REASON has no cosmetic section"
+echo "$(field REASON "$OUT")" | grep "TRAVA HUMANA SEM EVIDÊNCIA" >/dev/null && nok "T72 REASON wrongly renders the cosmetic section" "$(field REASON "$OUT")" || ok "T72 REASON has no cosmetic section"
 
 # T73 — CONTROL (acceptance 3): the calculator never answered for it -> NOT COMPUTED, never cosmetic.
 locked_dd_case t73 73001
 seed_symbol_result daemons/demand_dashboard.py missing
 OUT=$(run_helper daemons/demand_dashboard.py)
-echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T73 GUARDED_LOCKED_COSMETIC present and empty" || nok "T73 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
+echo "$OUT" | grep '^GUARDED_LOCKED_COSMETIC=$' >/dev/null && ok "T73 GUARDED_LOCKED_COSMETIC present and empty" || nok "T73 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
 [ "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" = "$DD" ] && ok "T73 lands in GUARDED_SYMBOL_NOT_COMPUTED" || nok "T73 not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
 
 # T74 — CONTROL: cleanly no-evidence but NOT locked (a restartable daemon) -> unchanged, never cosmetic.
@@ -2909,7 +2909,7 @@ notify_only_locked:
 EOF
 seed_symbol_result daemons/central_sender.py no_evidence
 OUT=$(run_helper daemons/central_sender.py)
-echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T74 GUARDED_LOCKED_COSMETIC present and empty" || nok "T74 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
+echo "$OUT" | grep '^GUARDED_LOCKED_COSMETIC=$' >/dev/null && ok "T74 GUARDED_LOCKED_COSMETIC present and empty" || nok "T74 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
 [ "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" = "com.test.central-sender" ] && ok "T74 still classified NO_EVIDENCE (only the cosmetic subset needs the lock)" || nok "T74 no_evidence" "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")"
 
 # T75 — the entrypoint failed to PARSE: "reaches=False por padrão seguro" is a
@@ -2917,7 +2917,7 @@ echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T74 GUARDED_LOCKED_COS
 locked_dd_case t75 75001
 seed_symbol_result daemons/demand_dashboard.py no_evidence_syntax_error
 OUT=$(run_helper daemons/demand_dashboard.py)
-echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T75 GUARDED_LOCKED_COSMETIC present and empty" || nok "T75 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
+echo "$OUT" | grep '^GUARDED_LOCKED_COSMETIC=$' >/dev/null && ok "T75 GUARDED_LOCKED_COSMETIC present and empty" || nok "T75 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
 [ -z "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" ] && ok "T75 an unparseable entrypoint is NOT reported as 'no evidence'" || nok "T75 no_evidence" "unevaluable label collapsed into no-evidence: '$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")'"
 [ "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" = "$DD" ] && ok "T75 an unparseable entrypoint lands in NOT_COMPUTED" || nok "T75 not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
 
@@ -2936,7 +2936,7 @@ OUT=$(run_helper daemons/demand_dashboard.py)
 locked_dd_case t77 77001
 seed_symbol_result daemons/demand_dashboard.py no_evidence_unevaluable
 OUT=$(run_helper daemons/demand_dashboard.py)
-echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T77 GUARDED_LOCKED_COSMETIC present and empty" || nok "T77 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
+echo "$OUT" | grep '^GUARDED_LOCKED_COSMETIC=$' >/dev/null && ok "T77 GUARDED_LOCKED_COSMETIC present and empty" || nok "T77 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
 [ "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" = "$DD" ] && ok "T77 'não dá pra avaliar' lands in NOT_COMPUTED even alongside a benign warning" || nok "T77 not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
 
 # T78 — a CLOSURE file failed the structural diff (its changed symbols were
@@ -2944,7 +2944,7 @@ echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T77 GUARDED_LOCKED_COS
 locked_dd_case t78 78001
 seed_symbol_result daemons/demand_dashboard.py no_evidence_closure_syntax_error
 OUT=$(run_helper daemons/demand_dashboard.py)
-echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T78 GUARDED_LOCKED_COSMETIC present and empty" || nok "T78 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
+echo "$OUT" | grep '^GUARDED_LOCKED_COSMETIC=$' >/dev/null && ok "T78 GUARDED_LOCKED_COSMETIC present and empty" || nok "T78 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
 [ "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" = "$DD" ] && ok "T78 a dropped closure diff lands in NOT_COMPUTED" || nok "T78 not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
 
 # T79 — a calculator that predates the "warnings" field: cleanliness cannot be
@@ -2952,7 +2952,7 @@ echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T78 GUARDED_LOCKED_COS
 locked_dd_case t79 79001
 seed_symbol_result daemons/demand_dashboard.py no_evidence_nowarnkey
 OUT=$(run_helper daemons/demand_dashboard.py)
-echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T79 GUARDED_LOCKED_COSMETIC present and empty" || nok "T79 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
+echo "$OUT" | grep '^GUARDED_LOCKED_COSMETIC=$' >/dev/null && ok "T79 GUARDED_LOCKED_COSMETIC present and empty" || nok "T79 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
 [ "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" = "$DD" ] && ok "T79 a result with no 'warnings' key lands in NOT_COMPUTED" || nok "T79 not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
 
 # T80 — restart_policy.yaml EXISTS but is unreadable: we cannot know the daemon is
@@ -2961,7 +2961,7 @@ locked_dd_case t80 80001
 printf '\xff\xfenotify_only_locked:\n  - demand_dashboard.py\n' > "$RUNTIME/daemons/restart_policy.yaml"
 seed_symbol_result daemons/demand_dashboard.py no_evidence
 OUT=$(run_helper daemons/demand_dashboard.py)
-echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T80 unreadable policy: GUARDED_LOCKED_COSMETIC present and empty (cannot prove locked)" || nok "T80 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
+echo "$OUT" | grep '^GUARDED_LOCKED_COSMETIC=$' >/dev/null && ok "T80 unreadable policy: GUARDED_LOCKED_COSMETIC present and empty (cannot prove locked)" || nok "T80 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
 [ "$(field GUARDED "$OUT")" = "$DD" ] && ok "T80 still GUARDED (fails closed to sensitive)" || nok "T80 guarded" "$(field GUARDED "$OUT")"
 
 # T81 — a MIXED batch: only the locked + cleanly-no-evidence one is cosmetic.
@@ -2990,7 +2990,7 @@ SENSITIVE_DAEMONS="central-sender"
 [ "$(field GUARDED_LOCKED_COSMETIC "$OUT")" = "com.test.demand-dashboard" ] && ok "T81 cosmetic = ONLY the locked + no-evidence daemon (not the locked+confirmed, not the unlocked+no-evidence)" || nok "T81 locked_cosmetic" "got '$(field GUARDED_LOCKED_COSMETIC "$OUT")' guarded='$(field GUARDED "$OUT")'"
 [ "$(json_list guarded_locked_cosmetic "$OUT")" = "com.test.demand-dashboard" ] && ok "T81 JSON agrees" || nok "T81 json" "got '$(json_list guarded_locked_cosmetic "$OUT")'"
 for l in com.test.demand-dashboard com.test.campaign-dashboard com.test.central-sender; do
-  echo "$(field GUARDED "$OUT")" | grep -q "$l" && ok "T81 $l still in flat GUARDED" || nok "T81 guarded $l" "$(field GUARDED "$OUT")"
+  echo "$(field GUARDED "$OUT")" | grep "$l" >/dev/null && ok "T81 $l still in flat GUARDED" || nok "T81 guarded $l" "$(field GUARDED "$OUT")"
 done
 
 # T82 — an entrypoint explicitly allow-listed for automatic restart (deploy_restart)
@@ -3008,7 +3008,7 @@ seed_symbol_result daemons/demand_dashboard.py no_evidence
 SENSITIVE_DAEMONS="demand-dashboard"
 OUT=$(run_helper daemons/demand_dashboard.py)
 SENSITIVE_DAEMONS="central-sender"
-echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T82 an allow-listed entrypoint is not cosmetic-locked (explicitly-safe precedence)" || nok "T82 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")' guarded='$(field GUARDED "$OUT")'"
+echo "$OUT" | grep '^GUARDED_LOCKED_COSMETIC=$' >/dev/null && ok "T82 an allow-listed entrypoint is not cosmetic-locked (explicitly-safe precedence)" || nok "T82 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")' guarded='$(field GUARDED "$OUT")'"
 
 # T83 — present-even-empty on a verdict that has no guarded daemon at all (every
 # other emit path): a consumer can read the field unconditionally.
@@ -3017,7 +3017,7 @@ cat > "$RUNTIME/daemons/foo_dashboard.py" <<<'print("foo")'
 make_plist "$AGENTS" com.test.foo-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/foo_dashboard.py"
 seed_running com.test.foo-dashboard 83001 "$STALE_LSTART"
 OUT=$(run_helper README.md)
-echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T83 GUARDED_LOCKED_COSMETIC is present even when empty, on an OK verdict" || nok "T83 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=')"
+echo "$OUT" | grep '^GUARDED_LOCKED_COSMETIC=$' >/dev/null && ok "T83 GUARDED_LOCKED_COSMETIC is present even when empty, on an OK verdict" || nok "T83 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=')"
 [ "$(echo "$OUT" | grep '^JSON=' | sed 's/^JSON=//' | python3 -c 'import json,sys; print(json.load(sys.stdin).get("guarded_locked_cosmetic"))' 2>/dev/null)" = "[]" ] && ok "T83 trailing JSON carries guarded_locked_cosmetic: []" || nok "T83 json" "key missing or wrong"
 
 # ── summary ───────────────────────────────────────────────────────────────────

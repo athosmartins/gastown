@@ -146,11 +146,11 @@ run_guard() {
 echo "── 2. functional: first run classifies all five daemons correctly ──"
 OUT1=$(run_guard)
 
-if printf '%s' "$OUT1" | grep -q "com.test.daemon-a"; then ok "daemon-a (stale, KeepAlive) reported"; else bad "daemon-a NOT reported (should be stale)"; fi
-if printf '%s' "$OUT1" | grep -q "com.test.daemon-b"; then bad "daemon-b (fresh) incorrectly reported"; else ok "daemon-b (fresh, commit older than process) correctly silent"; fi
-if printf '%s' "$OUT1" | grep -q "com.test.daemon-c"; then bad "daemon-c (no KeepAlive) incorrectly reported -- fresh-exec class must never alarm"; else ok "daemon-c (StartInterval-only, no KeepAlive, present+stale-shaped in ps fixture) correctly skipped by the KeepAlive gate itself"; fi
-if printf '%s' "$OUT1" | grep -q "com.test.daemon-d"; then bad "daemon-d (not running) incorrectly reported"; else ok "daemon-d (KeepAlive but not currently running) correctly skipped, no crash"; fi
-if printf '%s' "$OUT1" | grep -q "com.test.daemon-e"; then ok "daemon-e (stale, unresolvable bead) reported"; else bad "daemon-e NOT reported (should be stale)"; fi
+if printf '%s' "$OUT1" | grep "com.test.daemon-a" >/dev/null; then ok "daemon-a (stale, KeepAlive) reported"; else bad "daemon-a NOT reported (should be stale)"; fi
+if printf '%s' "$OUT1" | grep "com.test.daemon-b" >/dev/null; then bad "daemon-b (fresh) incorrectly reported"; else ok "daemon-b (fresh, commit older than process) correctly silent"; fi
+if printf '%s' "$OUT1" | grep "com.test.daemon-c" >/dev/null; then bad "daemon-c (no KeepAlive) incorrectly reported -- fresh-exec class must never alarm"; else ok "daemon-c (StartInterval-only, no KeepAlive, present+stale-shaped in ps fixture) correctly skipped by the KeepAlive gate itself"; fi
+if printf '%s' "$OUT1" | grep "com.test.daemon-d" >/dev/null; then bad "daemon-d (not running) incorrectly reported"; else ok "daemon-d (KeepAlive but not currently running) correctly skipped, no crash"; fi
+if printf '%s' "$OUT1" | grep "com.test.daemon-e" >/dev/null; then ok "daemon-e (stale, unresolvable bead) reported"; else bad "daemon-e NOT reported (should be stale)"; fi
 
 echo "── 3. functional: notify fires for both stale daemons, exactly once each ──"
 NOTIFY_COUNT=$(wc -l < "$NOTIFY_LOG" | tr -d ' ')

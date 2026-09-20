@@ -164,7 +164,7 @@ echo ""
 echo "Scenario 1: gate:needs-human bead (tt-needs-human) must NOT be dispatched"
 LOG="$(run_dispatch)"
 
-if echo "$LOG" | grep -q "tt-needs-human"; then
+if echo "$LOG" | grep "tt-needs-human" >/dev/null; then
   bad "REGRESSION: tt-needs-human appeared in dispatch picks (gate:needs-human not excluded)"
 else
   ok "tt-needs-human NOT in dispatch picks (excluded by --exclude-label gate:needs-human)"
@@ -174,7 +174,7 @@ fi
 echo ""
 echo "Scenario 2: pilot:dispatched bead (tt-dispatched) must NOT be dispatched"
 
-if echo "$LOG" | grep -q "tt-dispatched"; then
+if echo "$LOG" | grep "tt-dispatched" >/dev/null; then
   bad "REGRESSION: tt-dispatched appeared in dispatch picks (pilot:dispatched not excluded)"
 else
   ok "tt-dispatched NOT in dispatch picks (excluded by --exclude-label pilot:dispatched)"
@@ -184,7 +184,7 @@ fi
 echo ""
 echo "Scenario 3: eligible bead (tt-normal) MUST be dispatched"
 
-if echo "$LOG" | grep -q "Lane picks — small: tt-normal"; then
+if echo "$LOG" | grep "Lane picks — small: tt-normal" >/dev/null; then
   ok "tt-normal selected as small-lane dispatch (eligible bead dispatched correctly)"
 else
   bad "tt-normal NOT selected as small-lane dispatch (eligible bead was not dispatched)"
@@ -258,7 +258,7 @@ fi
 # set -e/pipefail safety: new pipelines must not be unguarded
 # Check that all VERIFY_* assignments end with || echo ""
 if grep -A2 'VERIFY_STATUS=\|VERIFY_SOURCEBEAD=\|SOURCE_BEAD_STATUS=' "$DISPATCHER" \
-    | grep -q '|| echo ""'; then
+    | grep '|| echo ""' >/dev/null; then
   ok "new pipeline assignments guarded with || echo \"\" (set-e/pipefail safe)"
 else
   bad "new pipeline assignments may be unguarded — check set-e/pipefail safety"

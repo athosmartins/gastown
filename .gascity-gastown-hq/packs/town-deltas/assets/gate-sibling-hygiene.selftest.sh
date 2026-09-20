@@ -138,20 +138,20 @@ MOCK_SHOW_JSON='[{"id":"wa-4hzpd","status":"open","labels":["gate-sha-failed:9c6
 MOCK_LIST_JSON='[{"id":"m-wa-worker","status":"open","labels":["gate-status:failed","source-bead:wa-4hzpd","branch:crew/wa-worker/wa-4hzpd"],"description":""}]'
 gate_finalize_pass_label_hygiene "bead-city" "wa-4hzpd" "crew/batista/wa-4hzpd"
 
-if printf '%s' "$CALL_LOG" | grep -q 'label remove wa-4hzpd gate:fix-attempt:1'; then
+if printf '%s' "$CALL_LOG" | grep 'label remove wa-4hzpd gate:fix-attempt:1' >/dev/null; then
   ok "clears gate:fix-attempt:1 residue on PASS"
 else
   bad "did NOT clear gate:fix-attempt:1 — CALL_LOG:
 $CALL_LOG"
 fi
 
-if printf '%s' "$CALL_LOG" | grep -q 'label remove wa-4hzpd gate-sha-failed:9c63d1f78d21ef90a7bbf4bed189e3d616579728:code'; then
+if printf '%s' "$CALL_LOG" | grep 'label remove wa-4hzpd gate-sha-failed:9c63d1f78d21ef90a7bbf4bed189e3d616579728:code' >/dev/null; then
   bad "must NOT touch gate-sha-failed:*:code — that stamp is ga-nooaw's permanent-rejection invariant for the FAILED branch's own SHA, unrelated to this bead-level cleanup"
 else
   ok "leaves gate-sha-failed:*:code untouched (ga-nooaw invariant preserved)"
 fi
 
-if printf '%s' "$CALL_LOG" | grep -q 'comment wa-4hzpd'; then
+if printf '%s' "$CALL_LOG" | grep 'comment wa-4hzpd' >/dev/null; then
   ok "posts a comment when a terminal-failed sibling branch is found"
 else
   bad "did NOT comment on the terminal-failed-sibling case — CALL_LOG:
@@ -164,13 +164,13 @@ CALL_LOG=""
 MOCK_SHOW_JSON='[{"id":"wa-clean","status":"open","labels":["gate:passed","gate:queued"]}]'
 MOCK_LIST_JSON='[]'
 gate_finalize_pass_label_hygiene "bead-city" "wa-clean" "crew/solo/wa-clean"
-if printf '%s' "$CALL_LOG" | grep -q 'label remove'; then
+if printf '%s' "$CALL_LOG" | grep 'label remove' >/dev/null; then
   bad "clean bead (no fix-attempt label, no sibling) triggered an unexpected label remove — CALL_LOG:
 $CALL_LOG"
 else
   ok "clean bead (no residue, no sibling) → no label remove calls (true no-op)"
 fi
-if printf '%s' "$CALL_LOG" | grep -q 'comment'; then
+if printf '%s' "$CALL_LOG" | grep 'comment' >/dev/null; then
   bad "clean bead triggered an unexpected comment — CALL_LOG:
 $CALL_LOG"
 else

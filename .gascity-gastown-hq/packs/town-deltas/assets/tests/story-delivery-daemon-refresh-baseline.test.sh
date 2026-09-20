@@ -151,7 +151,7 @@ EOF
 # ── T1: no marker yet → fall back to this iteration's own PRE_DEPLOY_SHA ──────
 run_block ""
 [ "$RUN_RC" -eq 0 ] && ok "T1 block runs clean (rc=0) with no marker file" || nok "T1 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "pre=$EXPECT_C2 post=$EXPECT_C2" \
+echo "$LOG_OUT" | grep "pre=$EXPECT_C2 post=$EXPECT_C2" >/dev/null \
   && ok "T1 no marker → helper fed this-iteration pre==post (today's behavior, unchanged)" \
   || nok "T1 fallback pre" "$LOG_OUT"
 [ "$MARKER_AFTER" = "$EXPECT_C2" ] \
@@ -161,7 +161,7 @@ echo "$LOG_OUT" | grep -q "pre=$EXPECT_C2 post=$EXPECT_C2" \
 # ── T2: THE REGRESSION — marker at C0, this-iteration pre==post==C2 ───────────
 run_block "C0"
 [ "$RUN_RC" -eq 0 ] && ok "T2 block runs clean (rc=0) with marker seeded at C0" || nok "T2 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "pre=$EXPECT_C0 post=$EXPECT_C2" \
+echo "$LOG_OUT" | grep "pre=$EXPECT_C0 post=$EXPECT_C2" >/dev/null \
   && ok "T2 helper fed the MARKER (C0) as pre, not the collapsed this-iteration pre==post (C2) — the actual fix" \
   || nok "T2 baseline override" "$LOG_OUT"
 [ "$MARKER_AFTER" = "$EXPECT_C2" ] \
@@ -171,14 +171,14 @@ echo "$LOG_OUT" | grep -q "pre=$EXPECT_C0 post=$EXPECT_C2" \
 # ── T3: marker file has unparseable garbage → safe fallback, no crash ────────
 run_block "GARBAGE"
 [ "$RUN_RC" -eq 0 ] && ok "T3 block runs clean (rc=0) with a garbage marker file" || nok "T3 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "pre=$EXPECT_C2 post=$EXPECT_C2" \
+echo "$LOG_OUT" | grep "pre=$EXPECT_C2 post=$EXPECT_C2" >/dev/null \
   && ok "T3 unparseable marker → safe fallback to this-iteration PRE_DEPLOY_SHA" \
   || nok "T3 fallback" "$LOG_OUT"
 
 # ── T4: marker resolves but is NOT an ancestor of POST_DEPLOY_SHA ────────────
 run_block "DIVERGED"
 [ "$RUN_RC" -eq 0 ] && ok "T4 block runs clean (rc=0) with a diverged marker" || nok "T4 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "pre=$EXPECT_C2 post=$EXPECT_C2" \
+echo "$LOG_OUT" | grep "pre=$EXPECT_C2 post=$EXPECT_C2" >/dev/null \
   && ok "T4 non-ancestor marker → safe fallback to this-iteration PRE_DEPLOY_SHA" \
   || nok "T4 fallback" "$LOG_OUT"
 

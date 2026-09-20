@@ -151,7 +151,7 @@ if [ -n "$GFR_STALE_BRANCH_LINE" ] && [ -n "$GFR_CAP_BRANCH_LINE" ]; then
   GFR_STALE_ABS=$((GFR_START + GFR_STALE_BRANCH_LINE - 1))
   GFR_CAP_ABS=$((GFR_START + GFR_CAP_BRANCH_LINE - 1))
   STALE_BODY=$(sed -n "${GFR_STALE_ABS},$((GFR_CAP_ABS - 1))p" "$DISPATCHER")
-  if printf '%s' "$STALE_BODY" | grep -q 'gate:fix-attempt:'; then
+  if printf '%s' "$STALE_BODY" | grep 'gate:fix-attempt:' >/dev/null; then
     bad "stale branch unexpectedly writes a gate:fix-attempt: label — should be a no-op on the counter"
   else
     ok "stale branch never writes gate:fix-attempt: (counter genuinely untouched)"

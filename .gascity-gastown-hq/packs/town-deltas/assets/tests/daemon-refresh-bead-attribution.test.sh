@@ -181,10 +181,10 @@ AFF="$(field AFFECTED "$RUN_OUT")"
 [ "$V" != "JOB_NOT_INSTALLED" ] && ok "T1 verdict NOT blocked by an earlier bead's uninstalled job (got '$V')" \
   || nok "T1 verdict wrongly blocked" "got '$V' out=[$RUN_OUT]"
 [ "$RUN_RC" -eq 0 ] && ok "T1 exit 0 (not held)" || nok "T1 exit" "rc=$RUN_RC out=[$RUN_OUT]"
-echo "$UJG" | grep -q "com.test.strayjob" \
+echo "$UJG" | grep "com.test.strayjob" >/dev/null \
   && ok "T1 UNATTRIBUTED_JOB_GAP names the label — alert not silenced" \
   || nok "T1 unattributed gap wording" "UJG=[$UJG] out=[$RUN_OUT]"
-echo "$AFF" | grep -q "com.test.strayjob" \
+echo "$AFF" | grep "com.test.strayjob" >/dev/null \
   && ok "T1 AFFECTED still names the label (visibility preserved)" \
   || nok "T1 affected" "AFF=[$AFF] out=[$RUN_OUT]"
 

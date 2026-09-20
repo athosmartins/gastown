@@ -203,12 +203,12 @@ fi
 # 'keep' arm's body (from its `if` to the matching `else`) and assert both
 # new lines appear inside THAT slice.
 KEEP_ARM=$(awk '/GATE_FAIL_ASSIGNEE_ACTION" = "keep"/{flag=1} flag{print} /^      else$/{if(flag) exit}' "$DISPATCHER")
-if printf '%s' "$KEEP_ARM" | grep -qF 'unset-metadata gc.routed_to'; then
+if printf '%s' "$KEEP_ARM" | grep -F 'unset-metadata gc.routed_to' >/dev/null; then
   ok "'keep' arm itself strips gc.routed_to (not just present elsewhere in the file)"
 else
   bad "'keep' arm does NOT strip gc.routed_to — fix not wired into the FAIL-keep branch"
 fi
-if printf '%s' "$KEEP_ARM" | grep -qF 'label remove "$BEAD_ID" "gate:queued"'; then
+if printf '%s' "$KEEP_ARM" | grep -F 'label remove "$BEAD_ID" "gate:queued"' >/dev/null; then
   ok "'keep' arm removes the stale gate:queued label"
 else
   bad "'keep' arm does NOT remove gate:queued — marker was already closed terminal-FAILED above, label would stay stale"
@@ -265,17 +265,17 @@ CLEAR_ARM=$(awk '
 if [ -z "$CLEAR_ARM" ]; then
   bad "CLEAR_ARM extraction produced nothing — anchor/indentation drifted, cannot verify wiring"
 else
-  if printf '%s' "$CLEAR_ARM" | grep -qF '_GFAIL_ROUTE=$(default_pool_route_for_rig "$RIG")'; then
+  if printf '%s' "$CLEAR_ARM" | grep -F '_GFAIL_ROUTE=$(default_pool_route_for_rig "$RIG")' >/dev/null; then
     ok "'clear' arm computes the restore route via default_pool_route_for_rig"
   else
     bad "'clear' arm does NOT call default_pool_route_for_rig — wiring missing/renamed"
   fi
-  if printf '%s' "$CLEAR_ARM" | grep -qF -- '--set-metadata "gc.routed_to=$_GFAIL_ROUTE"'; then
+  if printf '%s' "$CLEAR_ARM" | grep -F -- '--set-metadata "gc.routed_to=$_GFAIL_ROUTE"' >/dev/null; then
     ok "'clear' arm writes gc.routed_to via --set-metadata (key-scoped, not a whole-object replace)"
   else
     bad "'clear' arm does NOT restore gc.routed_to — ga-f54ui fix missing from this arm"
   fi
-  if printf '%s' "$CLEAR_ARM" | grep -qF 'bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null'; then
+  if printf '%s' "$CLEAR_ARM" | grep -F 'bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null' >/dev/null; then
     ok "'clear' arm verifies the restore with a post-write read (not just assumed)"
   else
     bad "'clear' arm does NOT verify its own write — error-vs-empty risk (ga-p5q3)"
@@ -283,8 +283,8 @@ else
   # The verify step's own third-state discipline: a read failure must produce
   # a THIRD, distinguishable observation string — never silently reuse the
   # same text a confirmed mismatch would produce.
-  if printf '%s' "$CLEAR_ARM" | grep -qF 'UNVERIFIED (post-write read failed' \
-     && printf '%s' "$CLEAR_ARM" | grep -qF 'NOT $_GFAIL_ROUTE — restore did not stick'; then
+  if printf '%s' "$CLEAR_ARM" | grep -F 'UNVERIFIED (post-write read failed' >/dev/null \
+     && printf '%s' "$CLEAR_ARM" | grep -F 'NOT $_GFAIL_ROUTE — restore did not stick' >/dev/null; then
     ok "'clear' arm's verify step distinguishes UNVERIFIED (read failed) from a confirmed mismatch"
   else
     bad "'clear' arm's verify step collapses read-failure and confirmed-mismatch into the same observation"
@@ -298,12 +298,12 @@ else
   # worker — confirmed live on wa-dnzu0 (status=in_progress + stale
   # gate:queued, zero open markers, invisible to `bd ready` until a human
   # manually reopened it).
-  if printf '%s' "$CLEAR_ARM" | grep -qF -- '--status open'; then
+  if printf '%s' "$CLEAR_ARM" | grep -F -- '--status open' >/dev/null; then
     ok "'clear' arm reopens the bead's status once the assignee-clear is confirmed (ga-39l9z2)"
   else
     bad "'clear' arm does NOT reopen status — bead stays in_progress and invisible to \`bd ready\` (ga-39l9z2/wa-dnzu0 regression)"
   fi
-  if printf '%s' "$CLEAR_ARM" | grep -qF 'label remove "$BEAD_ID" "gate:queued"'; then
+  if printf '%s' "$CLEAR_ARM" | grep -F 'label remove "$BEAD_ID" "gate:queued"' >/dev/null; then
     ok "'clear' arm removes the stale gate:queued label once the assignee-clear is confirmed (ga-39l9z2)"
   else
     bad "'clear' arm does NOT remove gate:queued — worker probe's --exclude-label gate:queued hides the bead forever (ga-39l9z2/wa-dnzu0 regression)"
@@ -335,7 +335,7 @@ fi
 NEEDS_HUMAN_ARM=$(awk '/PREV_ATTEMPT" -ge "\$GATE_FIX_CAP"/{flag=1} flag{print} /^    else$/{if(flag) exit}' "$DISPATCHER")
 if [ -z "$NEEDS_HUMAN_ARM" ]; then
   bad "NEEDS_HUMAN_ARM extraction produced nothing — anchor/indentation drifted, cannot verify scope boundary (would otherwise pass vacuously)"
-elif printf '%s' "$NEEDS_HUMAN_ARM" | grep -qF 'default_pool_route_for_rig'; then
+elif printf '%s' "$NEEDS_HUMAN_ARM" | grep -F 'default_pool_route_for_rig' >/dev/null; then
   bad "needs-human (cap-exhausted) branch unexpectedly calls default_pool_route_for_rig — scope crept beyond ga-f54ui's needs-fix-only ACEITE"
 else
   ok "needs-human (cap-exhausted) branch untouched — gc.routed_to restore correctly scoped to the re-dispatchable needs-fix arm only"

@@ -142,10 +142,10 @@ dd if=/dev/zero of="$SCRATCH/offenders/file-big.bin" bs=1m count=3 2>/dev/null
 dd if=/dev/zero of="$SCRATCH/offenders/Library/CloudStorage/fake-drive/huge-but-excluded.bin" bs=1m count=5 2>/dev/null
 
 out="$(_top_offenders "$SCRATCH/offenders" 5 10)"
-echo "$out" | grep -q "file-big.bin" && ok "_top_offenders: includes recently-created file" || bad "_top_offenders: missing expected file in output (got: $out)"
+echo "$out" | grep "file-big.bin" >/dev/null && ok "_top_offenders: includes recently-created file" || bad "_top_offenders: missing expected file in output (got: $out)"
 first_line="$(echo "$out" | head -1)"
-echo "$first_line" | grep -q "file-big.bin" && ok "_top_offenders: largest (non-excluded) file sorted first" || bad "_top_offenders: sort order wrong (first line: $first_line)"
-echo "$out" | grep -q "huge-but-excluded" && bad "_top_offenders: CloudStorage-path file LEAKED into output (TCC/hang-safety violation)" || ok "_top_offenders: CloudStorage-like path correctly pruned"
+echo "$first_line" | grep "file-big.bin" >/dev/null && ok "_top_offenders: largest (non-excluded) file sorted first" || bad "_top_offenders: sort order wrong (first line: $first_line)"
+echo "$out" | grep "huge-but-excluded" >/dev/null && bad "_top_offenders: CloudStorage-path file LEAKED into output (TCC/hang-safety violation)" || ok "_top_offenders: CloudStorage-like path correctly pruned"
 
 out2="$(_top_offenders "$SCRATCH/does-not-exist-$$" 5 10)"
 [ -z "$out2" ] && ok "_top_offenders: nonexistent root → empty (best-effort, never errors)" || bad "_top_offenders: nonexistent root gave: $out2"
@@ -160,7 +160,7 @@ mkdir -p "$SCRATCH/multiA" "$SCRATCH/multiB"
 dd if=/dev/zero of="$SCRATCH/multiA/a.bin" bs=1m count=2 2>/dev/null
 dd if=/dev/zero of="$SCRATCH/multiB/b.bin" bs=1m count=4 2>/dev/null
 out3="$(_top_offenders "$SCRATCH/multiA $SCRATCH/multiB" 5 10)"
-echo "$out3" | grep -q "a\.bin" && echo "$out3" | grep -q "b\.bin" && ok "_top_offenders: multi-root (space-separated) searches ALL roots" || bad "_top_offenders: multi-root did not find both roots' files (got: $out3)"
+echo "$out3" | grep "a\.bin" >/dev/null && echo "$out3" | grep "b\.bin" >/dev/null && ok "_top_offenders: multi-root (space-separated) searches ALL roots" || bad "_top_offenders: multi-root did not find both roots' files (got: $out3)"
 rm -rf "$SCRATCH/multiA" "$SCRATCH/multiB"
 
 # ── main(): full orchestration, acceptance criteria 1 and 2. Thresholds are set

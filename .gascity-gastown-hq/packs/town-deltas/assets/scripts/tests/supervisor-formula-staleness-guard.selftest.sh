@@ -122,10 +122,10 @@ SUP_PS_OUTPUT="555   02:00:00 /opt/homebrew/bin/gc supervisor run"
 echo "── 2. functional: classifies all four orders correctly ──"
 OUT1=$(run_guard "$SUP_PS_OUTPUT")
 
-if printf '%s' "$OUT1" | grep -q "order=order-a "; then ok "order-a (stale, formula edited after supervisor start) reported"; else bad "order-a NOT reported (should be stale)"; fi
-if printf '%s' "$OUT1" | grep -q "order=order-b "; then bad "order-b (fresh, formula edited before supervisor start) incorrectly reported"; else ok "order-b correctly silent"; fi
-if printf '%s' "$OUT1" | grep -q "order=order-c "; then bad "order-c (type=exec, not formula) was reported STALE -- type filter let it through despite having a resolvable, stale-shaped formula (formula-c)"; else ok "order-c (type=exec, formula=formula-c resolvable+stale if ever reached) correctly excluded by the type=formula filter"; fi
-if printf '%s' "$OUT1" | grep -q "order=order-d "; then bad "order-d (untracked formula file, no git evidence) incorrectly reported as stale"; else ok "order-d (no git history for its formula file) correctly skipped, no crash, no guessed verdict"; fi
+if printf '%s' "$OUT1" | grep "order=order-a " >/dev/null; then ok "order-a (stale, formula edited after supervisor start) reported"; else bad "order-a NOT reported (should be stale)"; fi
+if printf '%s' "$OUT1" | grep "order=order-b " >/dev/null; then bad "order-b (fresh, formula edited before supervisor start) incorrectly reported"; else ok "order-b correctly silent"; fi
+if printf '%s' "$OUT1" | grep "order=order-c " >/dev/null; then bad "order-c (type=exec, not formula) was reported STALE -- type filter let it through despite having a resolvable, stale-shaped formula (formula-c)"; else ok "order-c (type=exec, formula=formula-c resolvable+stale if ever reached) correctly excluded by the type=formula filter"; fi
+if printf '%s' "$OUT1" | grep "order=order-d " >/dev/null; then bad "order-d (untracked formula file, no git evidence) incorrectly reported as stale"; else ok "order-d (no git history for its formula file) correctly skipped, no crash, no guessed verdict"; fi
 
 echo "── 3. functional: notify fires exactly once (only order-a is stale) ──"
 NOTIFY_COUNT=$(wc -l < "$NOTIFY_LOG" | tr -d ' ')
@@ -135,7 +135,7 @@ echo "── 4. functional: supervisor not running -> clean skip, no crash, no n
 : > "$NOTIFY_LOG"
 rm -f "$WORK/seen.json"
 OUT2=$(run_guard "")
-if printf '%s' "$OUT2" | grep -qi "not found running"; then ok "supervisor-not-running case reported cleanly"; else bad "supervisor-not-running case did not report the expected skip message"; fi
+if printf '%s' "$OUT2" | grep -i "not found running" >/dev/null; then ok "supervisor-not-running case reported cleanly"; else bad "supervisor-not-running case did not report the expected skip message"; fi
 NOTIFY_COUNT_NONE=$(wc -l < "$NOTIFY_LOG" | tr -d ' ')
 if [ "$NOTIFY_COUNT_NONE" = "0" ]; then ok "no notify fired when supervisor isn't running"; else bad "notify fired ($NOTIFY_COUNT_NONE) when supervisor isn't running"; fi
 
@@ -180,7 +180,7 @@ OUT3=$(env -i \
     FAKE_FORMULA_SOURCES="" \
     NOTIFY_LOG="$NOTIFY_LOG" \
     bash "$SCRIPT")
-if printf '%s' "$OUT3" | grep -qi "could not be checked at all\|UNKNOWN"; then ok "all-unresolved cycle prints an explicit degraded-state message"; else bad "all-unresolved cycle produced no distinguishing message -- silent, indistinguishable from a healthy cycle (the exact defect this section exists to catch)"; fi
+if printf '%s' "$OUT3" | grep -i "could not be checked at all\|UNKNOWN" >/dev/null; then ok "all-unresolved cycle prints an explicit degraded-state message"; else bad "all-unresolved cycle produced no distinguishing message -- silent, indistinguishable from a healthy cycle (the exact defect this section exists to catch)"; fi
 NOTIFY_COUNT_DEGRADED=$(wc -l < "$NOTIFY_LOG" | tr -d ' ')
 if [ "$NOTIFY_COUNT_DEGRADED" -ge "1" ]; then ok "all-unresolved cycle fires a notify ($NOTIFY_COUNT_DEGRADED call(s))"; else bad "all-unresolved cycle fired NO notify -- would go dark with nothing to page on"; fi
 if grep -qi "conseguiu checar nada" "$NOTIFY_LOG"; then ok "degraded notify carries a distinct message from the per-order stale alert"; else bad "degraded notify text does not distinguish itself from a normal stale alert"; fi

@@ -64,7 +64,7 @@ fi
 # this bug asks for — if a future edit drops them without changing the
 # anchors above, fail loudly instead of silently exercising stale code.
 for marker in 'SESSIONS_RC=$?' 'SESSION_BEADS_RC=$?' 'OVERLAY UNKNOWN' '! -s "$SESSIONS_FILE"' '! -s "$SESSION_BEADS_FILE"'; do
-  if ! printf '%s\n' "$LIVENESS_CODE" | grep -qF "$marker"; then
+  if ! printf '%s\n' "$LIVENESS_CODE" | grep -F "$marker" >/dev/null; then
     bad "extracted block missing expected marker: $marker"
   fi
 done
@@ -127,12 +127,12 @@ echo ""
 echo "Scenario 1: both reads healthy"
 run_scenario 0 "$TWO_LIVE_SESSIONS" 0 "$ONE_OVERLAY_ROW"
 if [ "$SCENARIO_RC" -eq 0 ]; then ok "extracted block exits 0"; else bad "extracted block exited $SCENARIO_RC: $SCENARIO_OUT"; fi
-if ! printf '%s' "$SCENARIO_OUT" | grep -q "FAIL-SAFE\|OVERLAY UNKNOWN"; then
+if ! printf '%s' "$SCENARIO_OUT" | grep "FAIL-SAFE\|OVERLAY UNKNOWN" >/dev/null; then
   ok "no fail-safe / overlay-unknown noise on the healthy path"
 else
   bad "unexpected fail-safe/overlay-unknown output on healthy path: $SCENARIO_OUT"
 fi
-if printf '%s' "$SCENARIO_OUT" | grep -q "RESULT MAP_COUNT=[1-9]"; then
+if printf '%s' "$SCENARIO_OUT" | grep "RESULT MAP_COUNT=[1-9]" >/dev/null; then
   ok "map is non-empty on the healthy path"
 else
   bad "map came back empty on the healthy path: $SCENARIO_OUT"
@@ -146,17 +146,17 @@ fi
 echo ""
 echo "Scenario 2 (THE BUG): session-beads read fails rc=1, 0 bytes"
 run_scenario 0 "$TWO_LIVE_SESSIONS" 1 ""
-if printf '%s' "$SCENARIO_OUT" | grep -q "OVERLAY UNKNOWN"; then
+if printf '%s' "$SCENARIO_OUT" | grep "OVERLAY UNKNOWN" >/dev/null; then
   ok "declares OVERLAY UNKNOWN instead of silently proceeding"
 else
   bad "REGRESSION (this is the bug): overlay read failure went undeclared. Output: $SCENARIO_OUT"
 fi
-if ! printf '%s' "$SCENARIO_OUT" | grep -q "FAIL-SAFE: empty liveness map"; then
+if ! printf '%s' "$SCENARIO_OUT" | grep "FAIL-SAFE: empty liveness map" >/dev/null; then
   ok "does NOT spuriously trip the empty-map fail-safe (live list alone is non-empty)"
 else
   bad "wrongly tripped the empty-map fail-safe when only the overlay failed"
 fi
-if printf '%s' "$SCENARIO_OUT" | grep -q "RESULT MAP_COUNT=[1-9] SESSION_COUNT=2"; then
+if printf '%s' "$SCENARIO_OUT" | grep "RESULT MAP_COUNT=[1-9] SESSION_COUNT=2" >/dev/null; then
   ok "still resolves assignees from the live session list (map non-empty, 2 sessions counted)"
 else
   bad "live-session-derived map was lost: $SCENARIO_OUT"
@@ -166,7 +166,7 @@ fi
 echo ""
 echo "Scenario 3: gc session list itself fails rc=1, 0 bytes"
 run_scenario 1 "" 0 "$ONE_OVERLAY_ROW"
-if printf '%s' "$SCENARIO_OUT" | grep -q "FAIL-SAFE: gc session list read failed"; then
+if printf '%s' "$SCENARIO_OUT" | grep "FAIL-SAFE: gc session list read failed" >/dev/null; then
   ok "aborts recovery this cycle on a broken live-session-list read"
 else
   bad "REGRESSION: broken session-list read was not caught. Output: $SCENARIO_OUT"
@@ -185,12 +185,12 @@ if [ "$SCENARIO_RC" -eq 0 ]; then
 else
   bad "REGRESSION: block did not exit cleanly (rc=$SCENARIO_RC): $SCENARIO_OUT"
 fi
-if ! printf '%s' "$SCENARIO_OUT" | grep -q "OVERLAY UNKNOWN"; then
+if ! printf '%s' "$SCENARIO_OUT" | grep "OVERLAY UNKNOWN" >/dev/null; then
   ok "does not fall through into the overlay guard (which would misreport a successful read as failed)"
 else
   bad "REGRESSION: fell through into OVERLAY UNKNOWN after the sessions-list guard already fired: $SCENARIO_OUT"
 fi
-if ! printf '%s' "$SCENARIO_OUT" | grep -q "RESULT MAP_COUNT="; then
+if ! printf '%s' "$SCENARIO_OUT" | grep "RESULT MAP_COUNT=" >/dev/null; then
   ok "never reaches the code after the block (proves the halt, not a coincidental zero)"
 else
   bad "REGRESSION: execution reached past the guard into LIVENESS_MAP/SESSION_COUNT: $SCENARIO_OUT"
@@ -202,7 +202,7 @@ fi
 echo ""
 echo "Scenario 4: gc session list returns invalid JSON with rc=0"
 run_scenario 0 "not valid json {{{" 0 "$ONE_OVERLAY_ROW"
-if printf '%s' "$SCENARIO_OUT" | grep -q "FAIL-SAFE: gc session list read failed"; then
+if printf '%s' "$SCENARIO_OUT" | grep "FAIL-SAFE: gc session list read failed" >/dev/null; then
   ok "aborts recovery this cycle on invalid JSON even when rc=0"
 else
   bad "REGRESSION: invalid-JSON session-list output was not caught. Output: $SCENARIO_OUT"
@@ -212,12 +212,12 @@ if [ "$SCENARIO_RC" -eq 0 ]; then
 else
   bad "REGRESSION: block did not exit cleanly (rc=$SCENARIO_RC): $SCENARIO_OUT"
 fi
-if ! printf '%s' "$SCENARIO_OUT" | grep -q "OVERLAY UNKNOWN"; then
+if ! printf '%s' "$SCENARIO_OUT" | grep "OVERLAY UNKNOWN" >/dev/null; then
   ok "does not fall through into the overlay guard (which would misreport a successful read as failed)"
 else
   bad "REGRESSION: fell through into OVERLAY UNKNOWN after the sessions-list guard already fired: $SCENARIO_OUT"
 fi
-if ! printf '%s' "$SCENARIO_OUT" | grep -q "RESULT MAP_COUNT="; then
+if ! printf '%s' "$SCENARIO_OUT" | grep "RESULT MAP_COUNT=" >/dev/null; then
   ok "never reaches the code after the block (proves the halt, not a coincidental zero)"
 else
   bad "REGRESSION: execution reached past the guard into LIVENESS_MAP/SESSION_COUNT: $SCENARIO_OUT"
@@ -231,7 +231,7 @@ fi
 echo ""
 echo "Scenario 5: pre-existing empty-map fail-safe (schema drift) still fires"
 run_scenario 0 '{"sessions":[{"unexpected_field":"x"},{"unexpected_field":"y"}]}' 0 "[]"
-if printf '%s' "$SCENARIO_OUT" | grep -q "FAIL-SAFE: empty liveness map"; then
+if printf '%s' "$SCENARIO_OUT" | grep "FAIL-SAFE: empty liveness map" >/dev/null; then
   ok "schema-drift fail-safe still fires unchanged"
 else
   bad "REGRESSION: schema-drift fail-safe no longer fires. Output: $SCENARIO_OUT"

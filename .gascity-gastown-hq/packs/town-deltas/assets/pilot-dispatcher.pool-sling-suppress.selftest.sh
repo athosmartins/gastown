@@ -219,7 +219,7 @@ fi
 # nested inside it — an idle pool (no live instance) must still fall
 # through and leave the sling untouched, independent of _DISPATCH_REUSE's
 # value (which is always 0 for pool targets to begin with).
-if grep -A2 '_pilot_pool_target_has_live_session "\$_SLING_TARGET"; then' "$DISPATCHER" | grep -q '_pilot_suppress_reused_sling "\$GC_CITY" "\$SLING_BEAD_ID"'; then
+if grep -A2 '_pilot_pool_target_has_live_session "\$_SLING_TARGET"; then' "$DISPATCHER" | grep '_pilot_suppress_reused_sling "\$GC_CITY" "\$SLING_BEAD_ID"' >/dev/null; then
   ok "call site guards its OWN _pilot_suppress_reused_sling call (not reusing/nesting inside the REUSE branch's fi)"
 else
   bad "call site does not visibly guard its own suppression call — wiring may have drifted"
@@ -227,13 +227,13 @@ fi
 # The original REUSE-only block must remain textually intact (sibling
 # selftest re-verifies this independently; this is a belt-and-suspenders
 # check that THIS edit did not disturb it).
-if grep -B1 '_pilot_suppress_reused_sling "\$GC_CITY" "\$SLING_BEAD_ID"' "$DISPATCHER" | grep -q 'if \[ "\$_DISPATCH_REUSE" = "1" \]; then'; then
+if grep -B1 '_pilot_suppress_reused_sling "\$GC_CITY" "\$SLING_BEAD_ID"' "$DISPATCHER" | grep 'if \[ "\$_DISPATCH_REUSE" = "1" \]; then' >/dev/null; then
   ok "original _DISPATCH_REUSE=1 REUSE branch is still intact and still calls _pilot_suppress_reused_sling"
 else
   bad "REGRESSION: the original REUSE branch's call site no longer matches the expected shape"
 fi
 # Ordering: after the pilot.sling_for stamp (bead must exist+be tagged first).
-if grep -A25 'set-metadata "pilot.sling_for=\$STORY_ID"' "$DISPATCHER" | grep -q '_pilot_pool_target_has_live_session'; then
+if grep -A25 'set-metadata "pilot.sling_for=\$STORY_ID"' "$DISPATCHER" | grep '_pilot_pool_target_has_live_session' >/dev/null; then
   ok "call site comes after the pilot.sling_for stamp (bead confirmed to exist first)"
 else
   bad "call site does not appear within a reasonable window after the pilot.sling_for stamp — ordering may have drifted"

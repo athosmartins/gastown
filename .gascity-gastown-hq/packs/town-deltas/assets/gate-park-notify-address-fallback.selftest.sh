@@ -149,7 +149,7 @@ echo "── (3) total failure: every candidate unresolvable → mayor escalatio
 MAIL3="$(mktemp)"; BD3="$(mktemp)"
 OUT3="$(run_park_notify "$GUARD" "ghost" "ghost-wa" "wa-999" "ga-wisp-ghost" "crew/ghost/wa-999" "ghost ghost-wa" "$MAIL3" "$BD3" 2>&1)"
 echo "$OUT3" | sed 's/^/    [test3] /'
-if printf '%s\n' "$OUT3" | grep -qx 'PARK_NOTIFIED='; then
+if printf '%s\n' "$OUT3" | grep -x 'PARK_NOTIFIED=' >/dev/null; then
   ok "PARK_NOTIFIED stayed empty (every candidate genuinely failed)"
 else
   bad "expected empty PARK_NOTIFIED, got: $OUT3"

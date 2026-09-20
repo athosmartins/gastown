@@ -159,12 +159,12 @@ fi
 echo "── db_last_commit_epoch() timezone correctness (ga-gh8mb) ──"
 
 DB_COMMIT_FN_TEXT=$(sed -n '/^db_last_commit_epoch()/,/^}/p' "$SCRIPT")
-if printf '%s' "$DB_COMMIT_FN_TEXT" | grep -qF "TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', date)"; then
+if printf '%s' "$DB_COMMIT_FN_TEXT" | grep -F "TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', date)" >/dev/null; then
   ok "db_last_commit_epoch() uses TIMESTAMPDIFF (timezone-agnostic), not session-tz-sensitive UNIX_TIMESTAMP"
 else
   bad "db_last_commit_epoch() does not use TIMESTAMPDIFF — the ga-gh8mb timezone double-conversion bug may have regressed"
 fi
-if printf '%s' "$DB_COMMIT_FN_TEXT" | grep -qF 'UNIX_TIMESTAMP(date)'; then
+if printf '%s' "$DB_COMMIT_FN_TEXT" | grep -F 'UNIX_TIMESTAMP(date)' >/dev/null; then
   bad "db_last_commit_epoch() still contains a bare UNIX_TIMESTAMP(date) call — the ga-gh8mb bug has regressed"
 else
   ok "db_last_commit_epoch() no longer calls bare UNIX_TIMESTAMP(date)"
@@ -495,9 +495,9 @@ else
   BOOT_OUTPUT=$(GC_CITY_PATH="$GC_CITY_PATH" GC_PACK_DIR="$GC_CITY_PATH/packs/town-deltas" bash "$BOOT_SNIPPET" 2>&1)
   BOOT_RC=$?
   rm -f "$BOOT_SNIPPET"
-  if [ "$BOOT_RC" -eq 0 ] && printf '%s' "$BOOT_OUTPUT" | grep -q '^BOOTSTRAP_OK GC_DOLT_PORT='; then
+  if [ "$BOOT_RC" -eq 0 ] && printf '%s' "$BOOT_OUTPUT" | grep '^BOOTSTRAP_OK GC_DOLT_PORT=' >/dev/null; then
     ok "real bootstrap survives engine GC_PACK_DIR=.../packs/town-deltas (resolved a live port)"
-  elif printf '%s' "$BOOT_OUTPUT" | grep -q 'port_resolve.sh: No such file'; then
+  elif printf '%s' "$BOOT_OUTPUT" | grep 'port_resolve.sh: No such file' >/dev/null; then
     bad "THE ORIGINAL BUG IS BACK: port_resolve.sh not found when GC_PACK_DIR=town-deltas (ga-v75ka) — output: $BOOT_OUTPUT"
   else
     bad "real-bootstrap check inconclusive (rc=$BOOT_RC, not the ga-v75ka 'No such file' signature — verify live Dolt is reachable and rerun): $BOOT_OUTPUT"
@@ -742,8 +742,8 @@ fi
 # ── probe and its own exit 0, and confirm advisory_should_alert never ─────────
 # ── appears in that span.
 UNREACHABLE_SPAN=$(awk '/if ! dolt_sql -q "SELECT active_branch\(\)"/{f=1} f{print} f&&/^[[:space:]]*exit 0[[:space:]]*$/{exit}' "$SCRIPT")
-if printf '%s' "$UNREACHABLE_SPAN" | grep -q 'ESCALATION: Dolt server unreachable' \
-    && ! printf '%s' "$UNREACHABLE_SPAN" | grep -q 'advisory_should_alert'; then
+if printf '%s' "$UNREACHABLE_SPAN" | grep 'ESCALATION: Dolt server unreachable' >/dev/null \
+    && ! printf '%s' "$UNREACHABLE_SPAN" | grep 'advisory_should_alert' >/dev/null; then
   ok "CRITICAL/unreachable escalation is NOT gated by the new cooldown — always fires, per AC3"
 else
   bad "could not confirm the CRITICAL/unreachable escalation is ungated — verify by hand it still always fires"

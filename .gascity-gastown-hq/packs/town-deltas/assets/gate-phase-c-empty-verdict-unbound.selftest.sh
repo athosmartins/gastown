@@ -242,7 +242,7 @@ else
   echo "$OUT_MUT" | sed 's/^/    [mutant] /'
   case "$BASH_VERSION_STR" in
     3.2.*)
-      if [ "$RC_MUT" -ne 0 ] && printf '%s' "$OUT_MUT" | grep -qi "unbound variable"; then
+      if [ "$RC_MUT" -ne 0 ] && printf '%s' "$OUT_MUT" | grep -i "unbound variable" >/dev/null; then
         ok "mutant (guard-after-loop, the pre-fix ordering) aborts with 'unbound variable' on the SAME empty input (rc=$RC_MUT) — proves this suite is not vacuous"
       else
         bad "mutant did NOT abort with 'unbound variable' on empty input (rc=$RC_MUT) — output: $OUT_MUT — this test may not actually be exercising the fix"

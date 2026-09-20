@@ -81,32 +81,32 @@ RC=$?
 CLOSED="$(cat "$CLOSED_LOG")"
 
 echo "-- past-day digest --"
-echo "$CLOSED" | grep -qx "test-past" \
+echo "$CLOSED" | grep -x "test-past" >/dev/null \
   && ok "past-day digest closed" \
   || bad "past-day digest NOT closed (expected close)"
 
 echo "-- today's digest must stay open (não esconder o de hoje) --"
-echo "$CLOSED" | grep -qx "test-today" \
+echo "$CLOSED" | grep -x "test-today" >/dev/null \
   && bad "today's digest was closed (must stay open)" \
   || ok "today's digest left open"
 
 echo "-- future-dated digest must stay open --"
-echo "$CLOSED" | grep -qx "test-future" \
+echo "$CLOSED" | grep -x "test-future" >/dev/null \
   && bad "future-dated digest was closed (date-parse safety violated)" \
   || ok "future-dated digest left open"
 
 echo "-- no-date title must stay open --"
-echo "$CLOSED" | grep -qx "test-nodate" \
+echo "$CLOSED" | grep -x "test-nodate" >/dev/null \
   && bad "no-date-titled bead was closed (date-parse safety violated)" \
   || ok "no-date-titled bead left open"
 
 echo "-- malformed-date title must stay open --"
-echo "$CLOSED" | grep -qx "test-malformed" \
+echo "$CLOSED" | grep -x "test-malformed" >/dev/null \
   && bad "malformed-date bead was closed (date-parse safety violated)" \
   || ok "malformed-date bead left open"
 
 echo "-- unrelated title must stay open --"
-echo "$CLOSED" | grep -qx "test-unrelated" \
+echo "$CLOSED" | grep -x "test-unrelated" >/dev/null \
   && bad "unrelated bead was closed (title match too loose)" \
   || ok "unrelated bead left open"
 
@@ -116,7 +116,7 @@ N=$(printf '%s\n' "$CLOSED" | grep -c . || true)
 
 echo "-- bd list was called with --include-infra (ga-4tt37) --"
 LIST_ARGS="$(cat "$LIST_ARGS_LOG")"
-echo "$LIST_ARGS" | grep -q -- "--include-infra" \
+echo "$LIST_ARGS" | grep -- "--include-infra" >/dev/null \
   && ok "bd list requested --include-infra (message-typed digests are visible)" \
   || bad "bd list did NOT request --include-infra — message-typed digests (the ga-8f40w archive type) would be silently invisible to this sweep: $LIST_ARGS"
 

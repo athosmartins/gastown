@@ -28,7 +28,7 @@ run_test() {
   local expected="$3"  # substring expected in output
 
   result=$(python3 -c "$code" 2>&1)
-  if echo "$result" | grep -qF "$expected"; then
+  if echo "$result" | grep -F "$expected" >/dev/null; then
     echo "PASS: $name"
     ((PASS++)) || true
   else

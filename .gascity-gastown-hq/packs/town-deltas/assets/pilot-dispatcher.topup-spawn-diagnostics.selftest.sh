@@ -195,7 +195,7 @@ fi
 # "pool top-up: " title-hint text specifically (the dispatch-path spawns at
 # ~L9829/9884 use a DIFFERENT title-hint — "build $STORY_ID: ..." — and are
 # explicitly out of scope for this bead; this check must not flag those).
-if grep -B1 -- '--title-hint "pool top-up: \$_pending"' "$DISPATCHER" | grep -q '>/dev/null 2>&1'; then
+if grep -B1 -- '--title-hint "pool top-up: \$_pending"' "$DISPATCHER" | grep '>/dev/null 2>&1' >/dev/null; then
   bad "REGRESSION: the pool-top-up title-hint call site still discards stderr via >/dev/null 2>&1 — ga-kmm6rb's ACEITE #1 is not satisfied"
 else
   ok "the pool-top-up title-hint call site no longer blindly discards stderr"
@@ -226,7 +226,7 @@ fi
 #    the time of a SEPARATELY-typed second command) ─────────────────────────
 echo "Scenario G: drift-guard — a configurable pause separates attempt 1 from the retry"
 _SPAWN_FN_BODY_LINES=$(printf '%s\n' "$SPAWN_FN")
-if printf '%s\n' "$_SPAWN_FN_BODY_LINES" | grep -q 'sleep "\${PILOT_TOPUP_RETRY_DELAY_SECS:-'; then
+if printf '%s\n' "$_SPAWN_FN_BODY_LINES" | grep 'sleep "\${PILOT_TOPUP_RETRY_DELAY_SECS:-' >/dev/null; then
   ok "a configurable sleep (PILOT_TOPUP_RETRY_DELAY_SECS) sits before the retry attempt"
 else
   bad "REGRESSION: no configurable pause found before the retry — an instant back-to-back retry may not out-run the same transient Dolt saturation the original attempt hit"

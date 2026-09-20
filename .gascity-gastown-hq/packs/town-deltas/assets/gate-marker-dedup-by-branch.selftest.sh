@@ -242,10 +242,10 @@ has "$GUARD" 'dup_marker_ids_for_branch "\$DUP_MARKERS_JSON" "\$BRANCH" "\$MARKE
 #    dispatching/running (a legitimate live run) are never touched by Step 4b.
 echo "── 5. drift guard: AC1 scope — dispatching/running excluded from the query ──"
 STEP4B_BLOCK=$(sed -n "${STEP4B_LN},${STEP5_LN}p" "$GUARD")
-echo "$STEP4B_BLOCK" | grep -q -- '--label-any gate-status:ready'        && ok "queries gate-status:ready"        || bad "missing gate-status:ready in query"
-echo "$STEP4B_BLOCK" | grep -q -- '--label-any gate-status:queued'       && ok "queries gate-status:queued"       || bad "missing gate-status:queued in query"
-echo "$STEP4B_BLOCK" | grep -q -- '--label-any gate-status:needs-rebase' && ok "queries gate-status:needs-rebase" || bad "missing gate-status:needs-rebase in query"
-if echo "$STEP4B_BLOCK" | grep -q 'gate-status:dispatching\|gate-status:running'; then
+echo "$STEP4B_BLOCK" | grep -- '--label-any gate-status:ready' >/dev/null        && ok "queries gate-status:ready"        || bad "missing gate-status:ready in query"
+echo "$STEP4B_BLOCK" | grep -- '--label-any gate-status:queued' >/dev/null       && ok "queries gate-status:queued"       || bad "missing gate-status:queued in query"
+echo "$STEP4B_BLOCK" | grep -- '--label-any gate-status:needs-rebase' >/dev/null && ok "queries gate-status:needs-rebase" || bad "missing gate-status:needs-rebase in query"
+if echo "$STEP4B_BLOCK" | grep 'gate-status:dispatching\|gate-status:running' >/dev/null; then
   bad "AC1 violation: Step 4b's block references dispatching/running — a legitimate live run must never be touched here"
 else
   ok "AC1: Step 4b never references gate-status:dispatching or gate-status:running"

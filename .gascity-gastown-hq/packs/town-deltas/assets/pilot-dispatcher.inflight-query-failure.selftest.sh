@@ -242,8 +242,8 @@ EOF
   _out_a="$(run_block 'exit 1')"
   _rc_a=$?
   if [ "$_rc_a" -eq 0 ] \
-     && printf '%s' "$_out_a" | grep -q 'IN_FLIGHT_QUERY_OK=0' \
-     && printf '%s' "$_out_a" | grep -q 'IN_FLIGHT_RAW_JSON=\[\]' \
+     && printf '%s' "$_out_a" | grep 'IN_FLIGHT_QUERY_OK=0' >/dev/null \
+     && printf '%s' "$_out_a" | grep 'IN_FLIGHT_RAW_JSON=\[\]' >/dev/null \
      && grep -q 'story:in-flight query failed for HQ' "$WARN_LOG"; then
     ok "consulta falhou: real failing bd -> IN_FLIGHT_QUERY_OK=0, IN_FLIGHT_RAW_JSON=[], warn logged, block did not abort the script"
   else
@@ -256,8 +256,8 @@ EOF
   _out_b="$(run_block 'echo "[]"; exit 0')"
   _rc_b=$?
   if [ "$_rc_b" -eq 0 ] \
-     && printf '%s' "$_out_b" | grep -q 'IN_FLIGHT_QUERY_OK=1' \
-     && printf '%s' "$_out_b" | grep -q 'IN_FLIGHT_RAW_JSON=\[\]' \
+     && printf '%s' "$_out_b" | grep 'IN_FLIGHT_QUERY_OK=1' >/dev/null \
+     && printf '%s' "$_out_b" | grep 'IN_FLIGHT_RAW_JSON=\[\]' >/dev/null \
      && [ ! -s "$WARN_LOG" ]; then
     ok "nao ha: real succeeding bd with genuinely empty result -> IN_FLIGHT_QUERY_OK=1, IN_FLIGHT_RAW_JSON=[] (SAME json as scenario A — proves QUERY_OK, not the JSON shape, is what callers must trust), no warn"
   else
@@ -270,8 +270,8 @@ EOF
   _out_c="$(run_block 'echo '"'"'[{"id":"ga-e2e1","status":"in_progress"}]'"'"'; exit 0')"
   _rc_c=$?
   if [ "$_rc_c" -eq 0 ] \
-     && printf '%s' "$_out_c" | grep -q 'IN_FLIGHT_QUERY_OK=1' \
-     && printf '%s' "$_out_c" | grep -q 'ga-e2e1' \
+     && printf '%s' "$_out_c" | grep 'IN_FLIGHT_QUERY_OK=1' >/dev/null \
+     && printf '%s' "$_out_c" | grep 'ga-e2e1' >/dev/null \
      && [ ! -s "$WARN_LOG" ]; then
     ok "ha beads em voo: real succeeding bd with one in-flight bead -> IN_FLIGHT_QUERY_OK=1, bead present in IN_FLIGHT_RAW_JSON, no warn"
   else
@@ -290,7 +290,7 @@ echo "[]"; exit 0
 ' 'echo "{\"schema_version\":\"1\",\"ok\":true,\"rigs\":[{\"name\":\"fakerig\",\"path\":\"'"$FAKE_RIG"'\",\"hq\":false}]}"; exit 0')"
   _rc_d=$?
   if [ "$_rc_d" -eq 0 ] \
-     && printf '%s' "$_out_d" | grep -q 'IN_FLIGHT_QUERY_OK=0' \
+     && printf '%s' "$_out_d" | grep 'IN_FLIGHT_QUERY_OK=0' >/dev/null \
      && grep -q "story:in-flight query failed for rig db $FAKE_RIG" "$WARN_LOG"; then
     ok "per-rig consulta falhou: HQ succeeds but the rig-scoped fetch fails -> IN_FLIGHT_QUERY_OK still lands at 0 (rig failure taints the aggregate), warn names the rig db"
   else

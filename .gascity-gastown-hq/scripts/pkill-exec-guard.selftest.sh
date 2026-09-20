@@ -74,7 +74,7 @@ echo "-- guard: agent-context env vars refuse, never reach the real binary --"
 : > "$LOG_FILE"
 OUT="$(GC_AGENT=selftest-agent GC_ALIAS= GC_DIR= "$BIN_DIR/pkill" -f "$NONCE" 2>&1)"
 RC=$?
-if [ "$RC" -eq 77 ] && echo "$OUT" | grep -q "BLOCKED"; then
+if [ "$RC" -eq 77 ] && echo "$OUT" | grep "BLOCKED" >/dev/null; then
   ok "pkill refuses with GC_AGENT set (exit 77, BLOCKED message)"
 else
   bad "pkill with GC_AGENT: expected exit 77 + BLOCKED, got rc=$RC out=$OUT"
@@ -84,7 +84,7 @@ grep -q "REFUSED" "$LOG_FILE" 2>/dev/null && ok "refusal logged" || bad "refusal
 : > "$LOG_FILE"
 OUT="$(GC_AGENT= GC_ALIAS=selftest-alias GC_DIR= "$BIN_DIR/killall" "$NONCE" 2>&1)"
 RC=$?
-if [ "$RC" -eq 77 ] && echo "$OUT" | grep -q "BLOCKED" && echo "$OUT" | grep -q "killall"; then
+if [ "$RC" -eq 77 ] && echo "$OUT" | grep "BLOCKED" >/dev/null && echo "$OUT" | grep "killall" >/dev/null; then
   ok "killall refuses with GC_ALIAS set (exit 77, BLOCKED message names killall)"
 else
   bad "killall with GC_ALIAS: expected exit 77 + BLOCKED + 'killall', got rc=$RC out=$OUT"
@@ -105,7 +105,7 @@ echo "-- guard: no agent env vars -> transparent passthrough to real binary --"
 : > "$LOG_FILE"
 OUT="$(env -u GC_AGENT -u GC_ALIAS -u GC_DIR "$BIN_DIR/pkill" -f "$NONCE" 2>&1)"
 RC=$?
-if [ "$RC" -ne 77 ] && ! echo "$OUT" | grep -q "BLOCKED"; then
+if [ "$RC" -ne 77 ] && ! echo "$OUT" | grep "BLOCKED" >/dev/null; then
   ok "pkill passes through without agent env (rc=$RC, no BLOCKED -- real pkill's own no-match exit)"
 else
   bad "pkill without agent env: expected passthrough (rc!=77, no BLOCKED), got rc=$RC out=$OUT"
@@ -114,7 +114,7 @@ grep -q "ALLOWED" "$LOG_FILE" 2>/dev/null && ok "passthrough logged as ALLOWED" 
 
 OUT="$(env -u GC_AGENT -u GC_ALIAS -u GC_DIR "$BIN_DIR/killall" "$NONCE" 2>&1)"
 RC=$?
-if [ "$RC" -ne 77 ] && ! echo "$OUT" | grep -q "BLOCKED"; then
+if [ "$RC" -ne 77 ] && ! echo "$OUT" | grep "BLOCKED" >/dev/null; then
   ok "killall passes through without agent env"
 else
   bad "killall without agent env: expected passthrough, got rc=$RC out=$OUT"
@@ -192,7 +192,7 @@ EOF
 )"
 RC3=$?
 COMMIT_MSG="$(git -C "$GIT_SCRATCH" log -1 --format=%B 2>/dev/null)"
-if [ "$RC3" -eq 0 ] && echo "$COMMIT_MSG" | grep -q "pkill" && [ "$(log_lines)" = "0" ]; then
+if [ "$RC3" -eq 0 ] && echo "$COMMIT_MSG" | grep "pkill" >/dev/null && [ "$(log_lines)" = "0" ]; then
   ok "AC3: git commit with 'pkill' in a heredoc-built message paragraph -- succeeds, guard never invoked"
 else
   bad "AC3: expected rc=0 + commit message containing pkill + zero log lines, got rc=$RC3 log_lines=$(log_lines)"
@@ -232,7 +232,7 @@ pkill -f '$NONCE'
 OUTER_EOF
 AC5_OUT="$(PATH="$BIN_DIR:$PATH" GC_AGENT=selftest-agent bash "$AC5_SCRIPT" 2>&1)"
 RC5=$?
-if [ "$RC5" -eq 77 ] && echo "$AC5_OUT" | grep -q "BLOCKED"; then
+if [ "$RC5" -eq 77 ] && echo "$AC5_OUT" | grep "BLOCKED" >/dev/null; then
   ok "AC5: real 'pkill -f <pattern>' invocation in a fresh subprocess is refused"
 else
   bad "AC5: expected exit 77 + BLOCKED, got rc=$RC5 out=$AC5_OUT"

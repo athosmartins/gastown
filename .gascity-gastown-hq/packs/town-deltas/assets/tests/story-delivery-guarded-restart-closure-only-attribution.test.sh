@@ -196,13 +196,13 @@ EOF
 #    reaches new-daemon, which is guarded but ONLY as closure-only ────────
 run_block closure_only
 [ "$RUN_RC" -eq 0 ] && ok "T4 block runs clean (rc=0)" || nok "T4 rc" "rc=$RUN_RC log=[$LOG_OUT]"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && nok "T4 delivery WAS held for a closure-only-only overlap — the bug this fix closes" "$BD_CALLS" \
   || ok "T4 delivery is NOT held (closure-only overlap correctly exonerated)"
-echo "$BD_CALLS" | grep -q "Delivery HALTED" \
+echo "$BD_CALLS" | grep "Delivery HALTED" >/dev/null \
   && nok "T4 a HALT comment was wrongly posted" "$BD_CALLS" \
   || ok "T4 no HALT comment posted"
-echo "$GC_CALLS" | grep -q "session nudge mayor" \
+echo "$GC_CALLS" | grep "session nudge mayor" >/dev/null \
   && ok "T4 mayor is still nudged — invariant (b): the gap stays visible/charged" \
   || nok "T4 missing mayor nudge" "$GC_CALLS"
 [ "$BASELINE_AFTER" = "$EXPECT_C2" ] \
@@ -214,10 +214,10 @@ echo "$GC_CALLS" | grep -q "session nudge mayor" \
 run_block own
 [ "$RUN_RC" -eq 0 ] && ok "T5 block runs clean (rc=0; continue-based halt, BD state is the signal)" \
   || nok "T5 rc" "rc=$RUN_RC"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && ok "T5 delivery IS held (delivery:failed set) — genuine own-file overlap correctly blocks" \
   || nok "T5 delivery was wrongly NOT held" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "Delivery HALTED" \
+echo "$BD_CALLS" | grep "Delivery HALTED" >/dev/null \
   && ok "T5 HALT comment posted" \
   || nok "T5 missing HALT comment" "$BD_CALLS"
 [ "$BASELINE_AFTER" = "$EXPECT_C0" ] \
@@ -228,7 +228,7 @@ echo "$BD_CALLS" | grep -q "Delivery HALTED" \
 #    fall back to the full combined list, unchanged conservative behavior ─
 run_block no_split
 [ "$RUN_RC" -eq 0 ] && ok "T6 block runs clean (rc=0)" || nok "T6 rc" "rc=$RUN_RC"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && ok "T6 delivery IS held (no split available — safe fallback to full GUARDED)" \
   || nok "T6 delivery was wrongly NOT held when the split field is absent" "$BD_CALLS"
 [ "$BASELINE_AFTER" = "$EXPECT_C0" ] \
@@ -241,7 +241,7 @@ echo "$BD_CALLS" | grep -q "delivery:failed" \
 #    "present-but-empty" is trusted and NOT confused with "absent" (T6) ────
 run_block all_closure_only
 [ "$RUN_RC" -eq 0 ] && ok "T7 block runs clean (rc=0)" || nok "T7 rc" "rc=$RUN_RC"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && nok "T7 delivery WAS held even though GUARDED_OWN was positively empty" "$BD_CALLS" \
   || ok "T7 delivery is NOT held (GUARDED_OWN empty-but-present correctly trusted)"
 [ "$BASELINE_AFTER" = "$EXPECT_C2" ] \

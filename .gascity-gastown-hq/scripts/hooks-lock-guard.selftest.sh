@@ -38,7 +38,7 @@ ok()  { PASS=$((PASS+1)); echo "  ok: $*"; }
 bad() { FAIL=$((FAIL+1)); echo "  BAD: $*"; }
 
 is_empty() { [ "$(find "$HOOKS_DIR" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')" -eq 0 ]; }
-is_uchg()  { stat -f '%Sf' "$HOOKS_DIR" 2>/dev/null | grep -q uchg; }
+is_uchg()  { stat -f '%Sf' "$HOOKS_DIR" 2>/dev/null | grep uchg >/dev/null; }
 
 # Reset HOOKS_DIR to a clean (empty + uchg) state.
 reset_clean() {

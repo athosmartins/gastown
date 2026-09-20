@@ -235,7 +235,7 @@ has '_pilot_hold_or_escalate "\$STORY_BEAD_CITY" "\$STORY_ID" "ga-jazy9"'    "ga
 has '_pilot_hold_or_escalate "\$_db" "\$_bid" "ga-4zqwm"'                    "ga-4zqwm (Mayor-deferred) call site is wired"
 # ga-4zqwm must pass an explicit cap of 1 (AC4) — the call spans 5 lines
 # (continued with trailing backslashes), ending in a bare "1" argument.
-if grep -A6 '_pilot_hold_or_escalate "\$_db" "\$_bid" "ga-4zqwm"' "$DISPATCHER" | grep -qE '^\s*1\s*$'; then
+if grep -A6 '_pilot_hold_or_escalate "\$_db" "\$_bid" "ga-4zqwm"' "$DISPATCHER" | grep -E '^\s*1\s*$' >/dev/null; then
   ok "ga-4zqwm passes an explicit cap of 1 (AC4: escalate on the first hold, not the 3rd)"
 else
   bad "ga-4zqwm call site no longer passes an explicit cap=1 — AC4 regression risk"
@@ -366,7 +366,7 @@ else
 fi
 
 echo "Scenario I5: drift-guard — the AC3 skip is wired into _pilot_hold_or_escalate"
-echo "$HOLD_FN" | grep -q 'pilot:no-auto-dispatch' && ok "_pilot_hold_or_escalate carries the pilot:no-auto-dispatch skip clause" || bad "pilot:no-auto-dispatch skip clause missing from _pilot_hold_or_escalate"
+echo "$HOLD_FN" | grep 'pilot:no-auto-dispatch' >/dev/null && ok "_pilot_hold_or_escalate carries the pilot:no-auto-dispatch skip clause" || bad "pilot:no-auto-dispatch skip clause missing from _pilot_hold_or_escalate"
 
 # ── Scenario I6 (ga-rfpm9): bare "no-auto-dispatch" (no pilot: prefix) is a
 # DIFFERENT string this function's AC3 skip never recognized pre-fix — same
@@ -387,7 +387,7 @@ else
 fi
 
 echo "Scenario I7: drift-guard — the bare no-auto-dispatch alias is wired into _pilot_hold_or_escalate (ga-rfpm9)"
-echo "$HOLD_FN" | grep -q '"no-auto-dispatch"' && ok "_pilot_hold_or_escalate carries the bare no-auto-dispatch skip clause" || bad "bare no-auto-dispatch skip clause missing from _pilot_hold_or_escalate"
+echo "$HOLD_FN" | grep '"no-auto-dispatch"' >/dev/null && ok "_pilot_hold_or_escalate carries the bare no-auto-dispatch skip clause" || bad "bare no-auto-dispatch skip clause missing from _pilot_hold_or_escalate"
 
 # ── Scenario J/K/L (ga-230cyn AC1/AC2): live re-check before hold/escalation ──
 # Bug ga-230cyn: the $_phe_labels a caller passes in is a snapshot from
@@ -574,8 +574,8 @@ else
 fi
 
 echo "Scenario M: drift-guard — the ga-230cyn live re-check is wired into _pilot_hold_or_escalate"
-echo "$HOLD_FN" | grep -q '_session_is_live_builder' && ok "_pilot_hold_or_escalate consults live builder-liveness before escalating (ga-230cyn)" || bad "live builder-liveness check missing from _pilot_hold_or_escalate (ga-230cyn regression)"
-echo "$HOLD_FN" | grep -qF 'gate:(queued|reviewing)' && ok "_pilot_hold_or_escalate checks for already-built (gate:queued/reviewing) state (ga-230cyn)" || bad "already-built (gate:queued/reviewing) check missing from _pilot_hold_or_escalate (ga-230cyn regression)"
+echo "$HOLD_FN" | grep '_session_is_live_builder' >/dev/null && ok "_pilot_hold_or_escalate consults live builder-liveness before escalating (ga-230cyn)" || bad "live builder-liveness check missing from _pilot_hold_or_escalate (ga-230cyn regression)"
+echo "$HOLD_FN" | grep -F 'gate:(queued|reviewing)' >/dev/null && ok "_pilot_hold_or_escalate checks for already-built (gate:queued/reviewing) state (ga-230cyn)" || bad "already-built (gate:queued/reviewing) check missing from _pilot_hold_or_escalate (ga-230cyn regression)"
 
 # ── _pilot_defer_extend (ga-sfj3i.1) ───────────────────────────────────────────
 # A Pilot timed hold (the pilot:held-until label stamped by ga-lfvs6/ga-4zqwm)
@@ -713,7 +713,7 @@ D9_SCRIPT="$WORK/errexit-check.sh"
 } > "$D9_SCRIPT"
 D9_OUT="$(bash "$D9_SCRIPT" 2>&1)"
 D9_RC=$?
-if [ "$D9_RC" -eq 0 ] && printf '%s' "$D9_OUT" | grep -q "SURVIVED"; then
+if [ "$D9_RC" -eq 0 ] && printf '%s' "$D9_OUT" | grep "SURVIVED" >/dev/null; then
   ok "survives set -e with a failing bd show (does not abort the dispatcher mid-sweep)"
 else
   bad "REGRESSION (ga-061ua): crashes under set -e when bd show fails (rc=$D9_RC, out: $D9_OUT)"

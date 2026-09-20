@@ -201,14 +201,14 @@ grep -q 'elif \[ "\$CONFLICT_KIND" = "merge" \]; then' "$DISPATCHER" \
 # writes the retry-counter/exile labels — the structural reason a
 # content-mismatch marker can no longer enter the resonance loop at all.
 LIVE_MERGE_SPAN=$(awk '/if \[ "\$REBASE_AUTHOR_ALIVE" = "1" \] && \[ "\$CONFLICT_KIND" = "merge" \]; then/{flag=1} flag{print} /^    elif \[ "\$REBASE_AUTHOR_ALIVE" = "1" \] && \[ "\$CONFLICT_KIND" = "transient" \]; then/{if(flag && NR>1) exit}' "$DISPATCHER")
-if printf '%s' "$LIVE_MERGE_SPAN" | grep -q 'gate:rebase-fail-count\|gate:exiled-tier5'; then
+if printf '%s' "$LIVE_MERGE_SPAN" | grep 'gate:rebase-fail-count\|gate:exiled-tier5' >/dev/null; then
   bad "live-author merge disposition now touches rebase-fail-count/exiled-tier5 labels — invariant (c)/(b) at risk, this fix's premise (content-mismatch never enters the counter) no longer holds"
 else
   ok "live-author merge disposition still never writes gate:rebase-fail-count/gate:exiled-tier5 — content-mismatch structurally cannot enter the exile-recovery resonance loop"
 fi
 
 DEAD_MERGE_SPAN=$(awk '/^    elif \[ "\$CONFLICT_KIND" = "merge" \]; then/{flag=1} flag{print} /^    else$/{if(flag && NR>1) exit}' "$DISPATCHER")
-if printf '%s' "$DEAD_MERGE_SPAN" | grep -q 'gate:rebase-fail-count\|gate:exiled-tier5'; then
+if printf '%s' "$DEAD_MERGE_SPAN" | grep 'gate:rebase-fail-count\|gate:exiled-tier5' >/dev/null; then
   bad "dead-author merge disposition now touches rebase-fail-count/exiled-tier5 labels — invariant (c)/(b) at risk"
 else
   ok "dead-author merge disposition still never writes gate:rebase-fail-count/gate:exiled-tier5"

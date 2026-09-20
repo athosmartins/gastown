@@ -121,11 +121,11 @@ for n in 1 2 3 4; do
     && ok "(P$n.count) exactly $n bd call(s) made before abort (got: $CALLS)" \
     || bad "(P$n.count) expected exactly $n bd call(s) before abort, got $CALLS. Calls:
 $(cat "$LOG")"
-  printf '%s\n' "$OUT" | grep -qi "FATAL" \
+  printf '%s\n' "$OUT" | grep -i "FATAL" >/dev/null \
     && ok "(P$n.msg) failure is reported (FATAL) rather than swallowed" \
     || bad "(P$n.msg) no FATAL diagnostic printed on ${STEP_NAMES[$n]} failure. Output:
 $OUT"
-  printf '%s\n' "$OUT" | grep -q "PARK_COMPLETED" \
+  printf '%s\n' "$OUT" | grep "PARK_COMPLETED" >/dev/null \
     && bad "(P$n.noskip) block reported PARK_COMPLETED despite ${STEP_NAMES[$n]} failing" \
     || ok "(P$n.noskip) block did not claim completion after ${STEP_NAMES[$n]} failed"
   rm -f "$LOG"
@@ -145,11 +145,11 @@ CALLS5=$(count_calls "$LOG5")
   && ok "(P5.count) all 5 calls were attempted (steps 1-4 succeeded, step 5 failed) (got: $CALLS5)" \
   || bad "(P5.count) expected 5 bd calls, got $CALLS5. Calls:
 $(cat "$LOG5")"
-printf '%s\n' "$OUT5" | grep -qi "FATAL" \
+printf '%s\n' "$OUT5" | grep -i "FATAL" >/dev/null \
   && ok "(P5.msg) sling-close failure is reported (FATAL) rather than swallowed" \
   || bad "(P5.msg) no FATAL diagnostic printed on sling-close failure. Output:
 $OUT5"
-printf '%s\n' "$OUT5" | grep -q "PARK_COMPLETED" \
+printf '%s\n' "$OUT5" | grep "PARK_COMPLETED" >/dev/null \
   && bad "(P5.noskip) block reported PARK_COMPLETED despite the sling-close call failing" \
   || ok "(P5.noskip) block did not claim completion after the sling-close call failed"
 rm -f "$LOG5"
@@ -182,7 +182,7 @@ ACTUAL_ORDER=$(printf '%s\n' "$ORDER" | sed -n '1p;2p;3p;4p;5p' | awk '{print $1
   && ok "(N.order) calls happened in the documented order: dep, label(x2), comment, update" \
   || bad "(N.order) call order does not match dep,label,label,comment,update. Calls:
 $(cat "$LOGN")"
-printf '%s\n' "$OUTN" | grep -q "PARK_COMPLETED" \
+printf '%s\n' "$OUTN" | grep "PARK_COMPLETED" >/dev/null \
   && ok "(N.done) block reports completion on the happy path" \
   || bad "(N.done) block did not report completion on the happy path. Output:
 $OUTN"
@@ -198,7 +198,7 @@ CALLSS=$(count_calls "$LOGS")
   && ok "(S) step 5 correctly skipped when GC_BEAD_ID is unset (4 calls, not 5)" \
   || bad "(S) expected 4 calls with GC_BEAD_ID unset, got $CALLSS. Calls:
 $(cat "$LOGS")"
-printf '%s\n' "$OUTS" | grep -q "PARK_COMPLETED" \
+printf '%s\n' "$OUTS" | grep "PARK_COMPLETED" >/dev/null \
   && ok "(S.done) block still completes normally when step 5 is skipped" \
   || bad "(S.done) block did not report completion when step 5 is skipped. Output:
 $OUTS"
@@ -218,10 +218,10 @@ GUARD_COUNT=$(printf '%s' "$RAW_PARK_SRC" | grep -c 'FATAL:.*exit 1')
 [ "$GUARD_COUNT" -eq 5 ] \
   && ok "(F1) all 5 mutating calls in the deployed block are guarded with a FATAL/exit-1 handler (got: $GUARD_COUNT)" \
   || bad "(F1) expected 5 guarded calls in the deployed block, found $GUARD_COUNT"
-printf '%s' "$RAW_PARK_SRC" | grep -q 'bd dep .*--blocks {{issue}} \\' \
+printf '%s' "$RAW_PARK_SRC" | grep 'bd dep .*--blocks {{issue}} \\' >/dev/null \
   && ok "(F2) step 1 (dep --blocks) still uses the line-continuation guard style" \
   || bad "(F2) step 1 no longer matches the expected 'bd dep ... --blocks {{issue}} \\' guard shape"
-printf '%s' "$RAW_PARK_SRC" | grep -q 'gc.outcome=parked --status=closed' \
+printf '%s' "$RAW_PARK_SRC" | grep 'gc.outcome=parked --status=closed' >/dev/null \
   && ok "(F3) step 5 still records gc.outcome=parked on the sling (unchanged by this edit)" \
   || bad "(F3) step 5's gc.outcome=parked write is missing or reworded"
 

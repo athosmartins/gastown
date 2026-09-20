@@ -123,7 +123,7 @@ reset_stubs
 ELAPSED=$((THRESH + 5000))
 MARKERS=$(printf '[%s]' "$(mk m3 "gate-status:queued,gate:exiled-tier5:2,gate:exiled-since:$((NOW-ELAPSED))")")
 gate_exile_watchdog_sweep "$MARKERS" "$THRESH" "$NOW"
-if echo "$MAIL_LOG" | grep -q "mayor" \
+if echo "$MAIL_LOG" | grep "mayor" >/dev/null \
    && [ "$COMMENT_LOG" = "|m3" ] \
    && [ "$LABEL_ADD_LOG" = "|m3:gate:exile-escalated" ] \
    && [ "$STATUS_LOG" = "|m3:needs-rebase" ]; then
@@ -180,10 +180,10 @@ MARKERS=$(printf '[%s,%s,%s]' \
   "$(mk under_thresh "gate-status:queued,gate:exiled-tier5:2,gate:exiled-since:$((NOW-500))")" \
   "$(mk over_thresh  "gate-status:queued,gate:exiled-tier5:2,gate:exiled-since:$((NOW-ELAPSED))")")
 gate_exile_watchdog_sweep "$MARKERS" "$THRESH" "$NOW"
-if echo "$LABEL_ADD_LOG" | grep -q "fresh_exile:gate:exiled-since:$NOW" \
-   && ! echo "$LABEL_ADD_LOG" | grep -q "under_thresh:gate:exile-escalated" \
-   && echo "$LABEL_ADD_LOG" | grep -q "over_thresh:gate:exile-escalated" \
-   && echo "$MAIL_LOG" | grep -qv "under_thresh" ; then
+if echo "$LABEL_ADD_LOG" | grep "fresh_exile:gate:exiled-since:$NOW" >/dev/null \
+   && ! echo "$LABEL_ADD_LOG" | grep "under_thresh:gate:exile-escalated" >/dev/null \
+   && echo "$LABEL_ADD_LOG" | grep "over_thresh:gate:exile-escalated" >/dev/null \
+   && echo "$MAIL_LOG" | grep -v "under_thresh" >/dev/null ; then
   ok "3 markers in one sweep each get the correct independent treatment (first-seen stamp / no-op / escalate) — log='$LABEL_ADD_LOG'"
 else
   bad "multi-marker sweep mishandled one or more markers — labels='$LABEL_ADD_LOG' mail='$MAIL_LOG'"
@@ -204,7 +204,7 @@ echo "── (10) default threshold: unset/malformed \$2 falls back to 86400s (2
 reset_stubs
 MARKERS=$(printf '[%s]' "$(mk m10 "gate-status:queued,gate:exiled-tier5:2,gate:exiled-since:$((NOW-90000))")")
 gate_exile_watchdog_sweep "$MARKERS" "" "$NOW"
-if echo "$STATUS_LOG" | grep -q "m10:needs-rebase"; then
+if echo "$STATUS_LOG" | grep "m10:needs-rebase" >/dev/null; then
   ok "empty threshold arg defaults to 86400s — 90000s elapsed correctly escalates"
 else
   bad "default threshold not applied correctly, status='$STATUS_LOG'"
@@ -276,11 +276,11 @@ gate_exile_watchdog_sweep "$MARKERS" "$THRESH" "$NOW"
 # every failed sweep too, writing a false completed-action claim to the
 # bead's audit trail. This exact gap is why round-2's case (13) passed
 # against the still-buggy code: it never looked at COMMENT_LOG either.
-if echo "$MAIL_LOG" | grep -q "mayor" \
+if echo "$MAIL_LOG" | grep "mayor" >/dev/null \
    && [ -z "$LABEL_ADD_LOG" ] \
    && [ -z "$STATUS_LOG" ] \
    && [ -z "$COMMENT_LOG" ] \
-   && echo "$WARN_LOG" | grep -qi "could not mail"; then
+   && echo "$WARN_LOG" | grep -i "could not mail" >/dev/null; then
   ok "mail attempted and failed -> gate:exile-escalated NOT stamped, gate-status left untouched, NO bead comment posted (marker stays gate-status:queued and selectable), failure warned (mail='$MAIL_LOG' labels='$LABEL_ADD_LOG' status='$STATUS_LOG' comment='$COMMENT_LOG')"
 else
   bad "expected an attempted-but-failed mail with no dedup label, no status change, and no comment, got mail='$MAIL_LOG' labels='$LABEL_ADD_LOG' status='$STATUS_LOG' comment='$COMMENT_LOG' warn='$WARN_LOG'"
@@ -293,7 +293,7 @@ fi
 MAIL_SHOULD_FAIL=0
 LABEL_ADD_LOG=""; MAIL_LOG=""; WARN_LOG=""; STATUS_LOG=""; COMMENT_LOG=""
 gate_exile_watchdog_sweep "$MARKERS" "$THRESH" "$((NOW+200))"
-if echo "$MAIL_LOG" | grep -q "mayor" \
+if echo "$MAIL_LOG" | grep "mayor" >/dev/null \
    && [ "$LABEL_ADD_LOG" = "|m13:gate:exile-escalated" ] \
    && [ "$STATUS_LOG" = "|m13:needs-rebase" ] \
    && [ "$COMMENT_LOG" = "|m13" ]; then

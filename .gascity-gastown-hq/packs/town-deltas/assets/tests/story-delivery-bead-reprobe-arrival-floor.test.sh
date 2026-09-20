@@ -223,12 +223,12 @@ run_block 4000 landed 5000
 [ "$PROOF_AFTER" = "verified" ] \
   && ok "T1 REFRESH_PROOF=verified — the bead-scoped probe's answer replaced the window's not_verified (no delivery:daemon-unverified at Step 8)" \
   || nok "T1 REFRESH_PROOF" "want=verified got=$PROOF_AFTER"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && nok "T1 story was wrongly held" "$BD_CALLS" || ok "T1 story is released (not held)"
-echo "$LOG_OUT" | grep -q "proof is bead-scoped" \
+echo "$LOG_OUT" | grep "proof is bead-scoped" >/dev/null \
   && ok "T1 the override is logged, naming the window proof it replaced" \
   || nok "T1 override not logged" "$LOG_OUT"
-echo "$LOG_OUT" | grep -q "freshness floor 3500: merge arrived in the runtime at 3500, this deploy started 5000" \
+echo "$LOG_OUT" | grep "freshness floor 3500: merge arrived in the runtime at 3500, this deploy started 5000" >/dev/null \
   && ok "T1 the re-probe log line records floor / arrival / deploy epoch" \
   || nok "T1 re-probe log line" "$LOG_OUT"
 [ "$BASELINE_AFTER" = "$EXPECT_C2" ] \
@@ -242,7 +242,7 @@ run_block 3200 landed 5000
 [ "$PROOF_AFTER" = "not_verified" ] \
   && ok "T2 a daemon that started after the COMMIT but BEFORE the code arrived stays not_verified — the floor never reaches back before the code was in the checkout" \
   || nok "T2 false verified" "want=not_verified got=$PROOF_AFTER"
-echo "$LOG_OUT" | grep -q "proof is bead-scoped" \
+echo "$LOG_OUT" | grep "proof is bead-scoped" >/dev/null \
   && nok "T2 override wrongly fired" "$LOG_OUT" || ok "T2 no override logged"
 
 # ── T3: arrival cannot be proven (the runtime never received the merge) ─────────
@@ -253,7 +253,7 @@ run_block 4000 never 5000
 [ "$PROOF_AFTER" = "not_verified" ] \
   && ok "T3 no override: the window's fail-closed not_verified stands" \
   || nok "T3 REFRESH_PROOF" "want=not_verified got=$PROOF_AFTER"
-echo "$LOG_OUT" | grep -q "merge arrived in the runtime at unknown" \
+echo "$LOG_OUT" | grep "merge arrived in the runtime at unknown" >/dev/null \
   && ok "T3 the log says the arrival is unknown" || nok "T3 log" "$LOG_OUT"
 
 # ── T4: arrival LATER than this iteration's DEPLOY_EPOCH -> never raised ───────
@@ -264,7 +264,7 @@ run_block 5500 late 5000
 
 # ── T5: control — the daemon is older than the merge's commit: still stale ─────
 run_block 2500 landed 5000
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && ok "T5 a confirmed-stale daemon still holds the delivery" \
   || nok "T5 stale daemon was not held" "$BD_CALLS"
 [ "$PROOF_AFTER" = "not_verified" ] \

@@ -249,8 +249,8 @@ setup ga-r5loop '["gate:needs-human"]' 'origin/fix/ga-r5loop' '+ dead5678' '1700
 OUT1="$(run)"
 OUT2="$(run)"
 R5_COMMENTS="$(grep -c 'AUTO-DESTRAVE R5' "$TMP/fx.ga-r5loop/comments.log" 2>/dev/null || echo 0)"
-if printf '%s' "$OUT1" | grep -q "R5 ga-r5loop.*escalado" \
-   && printf '%s' "$OUT2" | grep -qi "R5 ga-r5loop.*suprimid" \
+if printf '%s' "$OUT1" | grep "R5 ga-r5loop.*escalado" >/dev/null \
+   && printf '%s' "$OUT2" | grep -i "R5 ga-r5loop.*suprimid" >/dev/null \
    && [ "$R5_COMMENTS" -eq 1 ]; then
   ok "ga-9e0j8: R5 escala na 1ª varredura, SUPRIME a 2ª (cooldown) — nunca mais de 1 comentário idêntico por janela"
 else
@@ -309,9 +309,9 @@ OUT1="$(run)"
 rm -f "$TMP/fx.ga-r5notefail/comment_fail"
 OUT2="$(run)"
 R5_COMMENTS3="$(grep -c 'AUTO-DESTRAVE R5' "$TMP/fx.ga-r5notefail/comments.log" 2>/dev/null || echo 0)"
-if printf '%s' "$OUT1" | grep -q "FALHA R5 ga-r5notefail" \
-   && printf '%s' "$OUT2" | grep -q "R5 ga-r5notefail.*escalado" \
-   && printf '%s' "$OUT2" | grep -q 'tentativa #1' \
+if printf '%s' "$OUT1" | grep "FALHA R5 ga-r5notefail" >/dev/null \
+   && printf '%s' "$OUT2" | grep "R5 ga-r5notefail.*escalado" >/dev/null \
+   && printf '%s' "$OUT2" | grep 'tentativa #1' >/dev/null \
    && [ "$R5_COMMENTS3" -eq 1 ]; then
   ok "blocking issue 1 (ga-woesw): note() falhando NÃO consome o cooldown — retenta e escala na próxima varredura, ainda na tentativa #1"
 else
@@ -474,7 +474,7 @@ case "$OUT" in *"R5 ga-xt8zrf-gnu"*"nenhum veredito FAIL"*)
 for v in gate:needs-human:product gate:needs-human:on-device gate:needs-human:refused; do
   setup ga-var "[\"$v\"]" '' '' ''
   OUT="$(run)"
-  if printf '%s' "$OUT" | grep -q "SKIP ga-var"; then
+  if printf '%s' "$OUT" | grep "SKIP ga-var" >/dev/null; then
     ok "variante $v NÃO é tocada (tem dono fora deste script)"
   else
     bad "variante $v foi tocada — :product é decisão do Athos, :on-device precisa do aparelho" "$OUT"
@@ -490,7 +490,7 @@ done
 # branch (forçaria R1 se a variante protegida não travasse o bead antes).
 setup ga-mixed '["gate:needs-human","gate:needs-human:refused"]' '' '' ''
 OUT="$(run)"
-if printf '%s' "$OUT" | grep -q "SKIP ga-mixed" && [ ! -s "$TMP/fx.ga-mixed/removed.log" ]; then
+if printf '%s' "$OUT" | grep "SKIP ga-mixed" >/dev/null && [ ! -s "$TMP/fx.ga-mixed/removed.log" ]; then
   ok "armadilha E: variante protegida co-presente com unblockable → SKIP, nenhuma label tocada (ga-5l5v76)"
 else
   bad "armadilha E: deveria pular o bead inteiro sem remover nenhuma label" \
@@ -526,8 +526,8 @@ fi
 setup ga-labelfail '["gate:needs-human"]' '' '' ''
 touch "$TMP/fx.ga-labelfail/label_remove_fail"
 OUT="$(run)"
-if printf '%s' "$OUT" | grep -q "FALHA R1 ga-labelfail" \
-   && printf '%s' "$OUT" | grep -q "0 destravadas sem humano"; then
+if printf '%s' "$OUT" | grep "FALHA R1 ga-labelfail" >/dev/null \
+   && printf '%s' "$OUT" | grep "0 destravadas sem humano" >/dev/null; then
   ok "blocking issue 1: bd label remove falhando → reportado como FALHA, não contado como destravada"
 else
   bad "blocking issue 1: label remove falhando deveria reportar FALHA e não incrementar 'destravadas'" "$OUT"
@@ -538,9 +538,9 @@ fi
 setup ga-notefail '["gate:needs-human"]' '' '' ''
 touch "$TMP/fx.ga-notefail/comment_fail"
 OUT="$(run)"
-if printf '%s' "$OUT" | grep -q "FALHA R1 ga-notefail" \
+if printf '%s' "$OUT" | grep "FALHA R1 ga-notefail" >/dev/null \
    && [ -s "$TMP/fx.ga-notefail/removed.log" ] \
-   && printf '%s' "$OUT" | grep -q "0 destravadas sem humano"; then
+   && printf '%s' "$OUT" | grep "0 destravadas sem humano" >/dev/null; then
   ok "blocking issue 1 (pior sub-caso): label REALMENTE removida + comentário falho → ainda reportado como FALHA, não como sucesso silencioso"
 else
   bad "blocking issue 1: quando note falha após strip_lock ter sucesso, o script não pode alegar sucesso (mutação real sem rastro de auditoria)" \
@@ -585,7 +585,7 @@ fi
 setup ga-showfail '["gate:needs-human","gate:needs-human:refused"]' '' '' ''
 touch "$TMP/fx.ga-showfail/show_fail.ga-showfail"
 OUT="$(run)"
-if printf '%s' "$OUT" | grep -q "SKIP ga-showfail.*bd show falhou" \
+if printf '%s' "$OUT" | grep "SKIP ga-showfail.*bd show falhou" >/dev/null \
    && [ ! -s "$TMP/fx.ga-showfail/removed.log" ]; then
   ok "achados A/B: bd show falhando → bead inteiro pulado, label protegida NUNCA removida (elimina a corrida de rebusca separada)"
 else
@@ -606,8 +606,8 @@ fi
 setup ga-showjsonfail '["gate:needs-human"]' 'origin/fix/ga-showjsonfail' '+ abc999' '1700000000'
 touch "$TMP/fx.ga-showjsonfail/show_fail_with_comments.ga-showjsonfail"
 OUT="$(run)"
-if printf '%s' "$OUT" | grep -q "R5 ga-showjsonfail" \
-   && printf '%s' "$OUT" | grep -q "não consegui checar\|checagem não RODOU\|não RODOU"; then
+if printf '%s' "$OUT" | grep "R5 ga-showjsonfail" >/dev/null \
+   && printf '%s' "$OUT" | grep "não consegui checar\|checagem não RODOU\|não RODOU" >/dev/null; then
   ok "self-audit final: decide()'s show_json falhando → R5 diz 'não consegui checar', não finge que checou e não achou nada"
 else
   bad "self-audit final: quando a própria busca de comments falha, a mensagem de R5 não pode alegar que checou e não achou veredito FAIL" "$OUT"
@@ -634,7 +634,7 @@ try:
     print('VALID')
 except UnicodeDecodeError:
     print('INVALID')
-" | grep -q VALID; then
+" | grep VALID >/dev/null; then
   ok "achado C: verdict_line truncado permanece UTF-8 válido mesmo cortando no meio de um caractere multi-byte"
 else
   bad "achado C: cut -c1-200 sob LC_ALL=C corrompeu UTF-8 (corte no meio de ç/ã) — precisa de iconv -c" "$OUT"
@@ -665,7 +665,7 @@ for _i in $(seq 1 50); do [ -f "$READYFILE" ] && break; sleep 0.05; done
 OUT="$(GC_CITY_PATH="$TMP" WA_RIG="$TMP" PS_RIG="$TMP" GATE_AUTO_UNBLOCK_LOG="$TMP/log" \
   GATE_AUTO_UNBLOCK_LOCK="$LOCKTEST" BD=bd GIT=git bash "$SCRIPT" 2>&1)"
 wait "$HOLDER_PID" 2>/dev/null
-if printf '%s' "$OUT" | grep -q "outra instância já rodando" \
+if printf '%s' "$OUT" | grep "outra instância já rodando" >/dev/null \
    && [ ! -s "$TMP/fx.ga-lockheld/removed.log" ] && [ ! -s "$TMP/fx.ga-lockheld/comments.log" ]; then
   ok "flock: trava de instância única funciona de verdade — 2ª execução sai sem tocar nenhum bead (precedente ga-y0g5x)"
 else
@@ -684,8 +684,8 @@ fi
 # olhar, Pilot reabriu o ciclo às 07:36.
 setup wa-v6k32 '["gate:needs-human","pilot:reclaim-count:escalated-at-3"]' '' '' ''
 OUT="$(run)"
-if printf '%s' "$OUT" | grep -q "R5 wa-v6k32" \
-   && ! printf '%s' "$OUT" | grep -qE "R[1-4] wa-v6k32" \
+if printf '%s' "$OUT" | grep "R5 wa-v6k32" >/dev/null \
+   && ! printf '%s' "$OUT" | grep -E "R[1-4] wa-v6k32" >/dev/null \
    && [ ! -s "$TMP/fx.wa-v6k32/removed.log" ]; then
   ok "ga-18uhg0: reclaim-cap esgotado + sem branch/commit → força R5 (chamar humano), não R1 (trava órfã) — wa-v6k32 ao vivo"
 else
@@ -704,8 +704,8 @@ setup wa-reclaimr3 '["gate:needs-human","pilot:reclaim-count:escalated-at-2","ga
   'origin/crew/mila/wa-reclaimr3-r3' '+ eaf78abb' '1700000000' \
   '[{"created_at":"2026-08-15T10:00:00Z","text":"VERDICT: FAIL tests/test_pregao.py precisa da chave nova"}]'
 OUT="$(run)"
-if printf '%s' "$OUT" | grep -q "R5 wa-reclaimr3" \
-   && ! printf '%s' "$OUT" | grep -qE "R[1-4] wa-reclaimr3" \
+if printf '%s' "$OUT" | grep "R5 wa-reclaimr3" >/dev/null \
+   && ! printf '%s' "$OUT" | grep -E "R[1-4] wa-reclaimr3" >/dev/null \
    && [ ! -s "$TMP/fx.wa-reclaimr3/removed.log" ]; then
   ok "ga-18uhg0: reclaim-cap escalado vence mesmo quando branch+veredito dariam R3 — nenhuma de R1-R4 decide por este bead"
 else
@@ -728,8 +728,8 @@ fi
 # (ga-ih4ma) acima, mas com gate:fix-attempt:3 (cap) também presente.
 setup ga-3pkhtc '["gate:needs-human","gate:needs-human:technical","gate:fix-attempt:3"]' '' '' ''
 OUT="$(run)"
-if printf '%s' "$OUT" | grep -q "R5 ga-3pkhtc" \
-   && ! printf '%s' "$OUT" | grep -qE "R[1-4] ga-3pkhtc" \
+if printf '%s' "$OUT" | grep "R5 ga-3pkhtc" >/dev/null \
+   && ! printf '%s' "$OUT" | grep -E "R[1-4] ga-3pkhtc" >/dev/null \
    && [ ! -s "$TMP/fx.ga-3pkhtc/removed.log" ]; then
   ok "ga-3pkhtc: gate:fix-attempt:3 (cap) + sem branch/commit → força R5 (chamar humano), não R1 (trava órfã) — o mesmo bug do ga-18uhg0, cap irmão"
 else
@@ -747,8 +747,8 @@ setup wa-fixattemptr4 '["gate:needs-human","gate:needs-human:technical","gate:fi
   'origin/crew/mila/wa-fixattemptr4' '+ b40be47f' '1700000000' \
   '[{"created_at":"2026-08-15T10:00:00Z","text":"VERDICT: FAIL em lib/x.py"}]'
 OUT="$(run)"
-if printf '%s' "$OUT" | grep -q "R5 wa-fixattemptr4" \
-   && ! printf '%s' "$OUT" | grep -qE "R[1-4] wa-fixattemptr4" \
+if printf '%s' "$OUT" | grep "R5 wa-fixattemptr4" >/dev/null \
+   && ! printf '%s' "$OUT" | grep -E "R[1-4] wa-fixattemptr4" >/dev/null \
    && [ ! -s "$TMP/fx.wa-fixattemptr4/removed.log" ]; then
   ok "ga-3pkhtc: gate:fix-attempt:3 vence mesmo quando 3+ gate-sha-failed:* dariam R4 — nenhuma de R1-R4 decide por este bead"
 else
@@ -764,7 +764,7 @@ fi
 # a R1-R4 PRA SEMPRE, nunca mais destravável automaticamente.
 setup ga-3pkhtc-reset '["gate:needs-human","gate:fix-attempt:0","gate:fix-attempt:3"]' '' '' ''
 OUT="$(run)"
-if printf '%s' "$OUT" | grep -q "R1 ga-3pkhtc-reset"; then
+if printf '%s' "$OUT" | grep "R1 ga-3pkhtc-reset" >/dev/null; then
   ok "ga-3pkhtc: gate:fix-attempt:0 (reset humano) vence um :3 remanescente — R1-R4 voltam a decidir normalmente (ga-26df, mesma semântica que quality-gate-dispatcher.sh já usa pro próprio contador)"
 else
   bad "ga-3pkhtc: gate:fix-attempt:0 deveria sinalizar reset humano e liberar R1-R4 de novo, mesmo com um :3 remanescente coexistindo" "$OUT"

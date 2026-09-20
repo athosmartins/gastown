@@ -223,7 +223,7 @@ else
 
   OUT4_BASE="$(run_classify ok 2>&1)"; RC4_BASE=$?
   RES4_BASE="$(printf '%s\n' "$OUT4_BASE" | grep '^RESULT|' || true)"
-  if [ "$RC4_BASE" -eq 0 ] && printf '%s' "$RES4_BASE" | grep -q "PC_ALL_PENDING_DEAD=1"; then
+  if [ "$RC4_BASE" -eq 0 ] && printf '%s' "$RES4_BASE" | grep "PC_ALL_PENDING_DEAD=1" >/dev/null; then
     ok "baseline (both VBs readable, both sessions absent): PC_ALL_PENDING_DEAD=1 — happy path unaffected by this fix"
   else
     bad "baseline classification broken (rc=$RC4_BASE): $OUT4_BASE"
@@ -231,7 +231,7 @@ else
 
   OUT4_FAIL="$(run_classify fail 2>&1)"; RC4_FAIL=$?
   RES4_FAIL="$(printf '%s\n' "$OUT4_FAIL" | grep '^RESULT|' || true)"
-  if [ "$RC4_FAIL" -eq 0 ] && printf '%s' "$RES4_FAIL" | grep -q "PC_ALL_PENDING_DEAD=0"; then
+  if [ "$RC4_FAIL" -eq 0 ] && printf '%s' "$RES4_FAIL" | grep "PC_ALL_PENDING_DEAD=0" >/dev/null; then
     ok "pc-vb-1 unreadable: PC_ALL_PENDING_DEAD=0 (falls through to the safe TIMEOUT path instead of guessing) — got: $RES4_FAIL"
   else
     bad "pc-vb-1 unreadable did NOT force PC_ALL_PENDING_DEAD=0 (rc=$RC4_FAIL): $OUT4_FAIL"
@@ -519,7 +519,7 @@ else
 
   OUT7_BASE="$(run_rehydrate_classify all_readable 2>&1)"; RC7_BASE=$?
   RES7_BASE="$(printf '%s\n' "$OUT7_BASE" | grep '^RESULT|' || true)"
-  if [ "$RC7_BASE" -eq 0 ] && printf '%s' "$RES7_BASE" | grep -q "PC_ALL_PENDING_DEAD=1"; then
+  if [ "$RC7_BASE" -eq 0 ] && printf '%s' "$RES7_BASE" | grep "PC_ALL_PENDING_DEAD=1" >/dev/null; then
     ok "baseline (both assignee reads succeed, no live sessions present): PC_ALL_PENDING_DEAD=1 — happy path unaffected by this fix"
   else
     bad "baseline rehydrate+classify broken (rc=$RC7_BASE): $OUT7_BASE"
@@ -527,7 +527,7 @@ else
 
   OUT7_FAIL="$(run_rehydrate_classify assignee_unreadable 2>&1)"; RC7_FAIL=$?
   RES7_FAIL="$(printf '%s\n' "$OUT7_FAIL" | grep '^RESULT|' || true)"
-  if [ "$RC7_FAIL" -eq 0 ] && printf '%s' "$RES7_FAIL" | grep -q "PC_ALL_PENDING_DEAD=0"; then
+  if [ "$RC7_FAIL" -eq 0 ] && printf '%s' "$RES7_FAIL" | grep "PC_ALL_PENDING_DEAD=0" >/dev/null; then
     ok "pc-vb-1 assignee capture unreadable (status read succeeds): PC_ALL_PENDING_DEAD=0 (falls through to TIMEOUT path instead of a false dead-reviewer verdict) — got: $RES7_FAIL"
   else
     bad "assignee-unreadable case did NOT force PC_ALL_PENDING_DEAD=0 — a transient hiccup on the assignee read alone could manufacture a false dead-reviewer verdict (rc=$RC7_FAIL): $OUT7_FAIL"

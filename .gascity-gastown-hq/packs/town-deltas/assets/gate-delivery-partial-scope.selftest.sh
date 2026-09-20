@@ -492,12 +492,12 @@ PARTIAL_BRANCH=$(sed -n '/elif \[ "\$IS_PARTIAL" = "1" \]; then/,/# BUG\/TASK/p'
 if [ -z "$PARTIAL_BRANCH" ]; then
   bad "dispatcher.sh's IS_PARTIAL branch extraction found nothing — sed anchors stale? (ga-6dpoa test itself would silently pass its negative check on this empty input)"
 fi
-if printf '%s' "$PARTIAL_BRANCH" | grep -q '"scope:needs-review"'; then
+if printf '%s' "$PARTIAL_BRANCH" | grep '"scope:needs-review"' >/dev/null; then
   ok "dispatcher.sh's IS_PARTIAL branch labels scope:needs-review (ga-6dpoa)"
 else
   bad "dispatcher.sh's IS_PARTIAL branch does not label scope:needs-review (ga-6dpoa)"
 fi
-if printf '%s' "$PARTIAL_BRANCH" | grep -qF 'label add "$BEAD_ID" "gate:needs-human"'; then
+if printf '%s' "$PARTIAL_BRANCH" | grep -F 'label add "$BEAD_ID" "gate:needs-human"' >/dev/null; then
   bad "dispatcher.sh's IS_PARTIAL branch still adds bare gate:needs-human (ga-6dpoa regression — collides with janitor R7)"
 else
   ok "dispatcher.sh's IS_PARTIAL branch does not add gate:needs-human (ga-6dpoa)"
@@ -539,12 +539,12 @@ TASK_PARTIAL_ARM=$(sed -n '/keep:partial-delivery)/,/keep:contradicted-by-gate-f
 if [ -z "$TASK_PARTIAL_ARM" ]; then
   bad "story-delivery.sh's keep:partial-delivery arm extraction found nothing — sed anchors stale? (ga-6dpoa test itself would silently pass its negative check on this empty input)"
 fi
-if printf '%s' "$TASK_PARTIAL_ARM" | grep -q '"scope:needs-review"'; then
+if printf '%s' "$TASK_PARTIAL_ARM" | grep '"scope:needs-review"' >/dev/null; then
   ok "story-delivery.sh's keep:partial-delivery arm labels scope:needs-review (ga-6dpoa)"
 else
   bad "story-delivery.sh's keep:partial-delivery arm does not label scope:needs-review (ga-6dpoa)"
 fi
-if printf '%s' "$TASK_PARTIAL_ARM" | grep -qF 'label add "$TASK_BEAD_ID" "gate:needs-human"'; then
+if printf '%s' "$TASK_PARTIAL_ARM" | grep -F 'label add "$TASK_BEAD_ID" "gate:needs-human"' >/dev/null; then
   bad "story-delivery.sh's keep:partial-delivery arm still adds bare gate:needs-human (ga-6dpoa regression — collides with janitor R7)"
 else
   ok "story-delivery.sh's keep:partial-delivery arm does not add gate:needs-human (ga-6dpoa)"

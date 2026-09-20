@@ -183,7 +183,7 @@ has '_pilot_suppress_reused_sling "\$GC_CITY" "\$SLING_BEAD_ID"'       "dispatch
 # The call must be scoped to the REUSE branch only — the non-reuse (fresh
 # spawn) path still needs gc.routed_to+unassigned as the new session's REAL
 # discovery hook, so an unconditional call here would be a regression.
-if grep -B2 '_pilot_suppress_reused_sling "\$GC_CITY" "\$SLING_BEAD_ID"' "$DISPATCHER" | grep -qE 'if \[ "\$_DISPATCH_REUSE" = "1" \]; then'; then
+if grep -B2 '_pilot_suppress_reused_sling "\$GC_CITY" "\$SLING_BEAD_ID"' "$DISPATCHER" | grep -E 'if \[ "\$_DISPATCH_REUSE" = "1" \]; then' >/dev/null; then
   ok "call site is scoped to _DISPATCH_REUSE=1 only (non-reuse spawn path untouched)"
 else
   bad "REGRESSION: call site is not visibly guarded by _DISPATCH_REUSE=1 — may now suppress fresh-spawn slings too"
@@ -191,7 +191,7 @@ fi
 # The call must come AFTER pilot.sling_for is stamped (the bead must exist
 # and be tagged before we touch it) — same "confirmed live in Dolt first"
 # ordering the ga-nimyz comment right above it already establishes.
-if grep -A6 'set-metadata "pilot.sling_for=\$STORY_ID"' "$DISPATCHER" | grep -q '_pilot_suppress_reused_sling'; then
+if grep -A6 'set-metadata "pilot.sling_for=\$STORY_ID"' "$DISPATCHER" | grep '_pilot_suppress_reused_sling' >/dev/null; then
   ok "call site comes after the pilot.sling_for stamp (bead confirmed to exist first)"
 else
   bad "call site does not appear shortly after the pilot.sling_for stamp — ordering may have drifted"

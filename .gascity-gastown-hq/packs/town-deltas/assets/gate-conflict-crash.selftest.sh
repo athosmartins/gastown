@@ -50,7 +50,7 @@ fi
 # 3. Drift-guard the real line: the CONFLICT_FILES merge-tree pipeline must end
 #    with `|| true` (the assignment spans two lines; join continuations first).
 CF_BLOCK="$(awk '/CONFLICT_FILES=\$\(git/{c=1} c{printf "%s ", $0} /cut -c1-300/{if(c){print ""; c=0}}' "$GATE" 2>/dev/null || true)"
-if printf '%s' "$CF_BLOCK" | grep -q 'cut -c1-300 || true'; then
+if printf '%s' "$CF_BLOCK" | grep 'cut -c1-300 || true' >/dev/null; then
   ok "CONFLICT_FILES pipeline is guarded with '|| true'"
 else
   bad "CONFLICT_FILES pipeline is NOT guarded with '|| true' (silent-crash regression)"

@@ -82,14 +82,14 @@ for PFX in $NEW_PREFIXES; do
     bad "ls-remote 'refs/heads/$PFX/\$ID' did not resolve the expected branch (got: [$BARE_HIT])"
   fi
 
-  if git -C "$SRC" ls-remote origin "refs/heads/$PFX/$FAKE_ID-*" 2>/dev/null | grep -q "refs/heads/$PFX/$FAKE_ID-desc"; then
+  if git -C "$SRC" ls-remote origin "refs/heads/$PFX/$FAKE_ID-*" 2>/dev/null | grep "refs/heads/$PFX/$FAKE_ID-desc" >/dev/null; then
     ok "ls-remote 'refs/heads/$PFX/\$ID-*' resolves the description-suffixed $PFX branch"
   else
     bad "ls-remote 'refs/heads/$PFX/\$ID-*' did not resolve the description-suffixed $PFX branch"
   fi
 done
 
-if git -C "$SRC" ls-remote origin "refs/heads/feat/$FAKE_ID" 2>/dev/null | grep -q "$OTHER_ID"; then
+if git -C "$SRC" ls-remote origin "refs/heads/feat/$FAKE_ID" 2>/dev/null | grep "$OTHER_ID" >/dev/null; then
   bad "REGRESSION: bare 'feat/\$ID' pattern over-matched an unrelated bead's branch (feat/$OTHER_ID)"
 else
   ok "bare 'refs/heads/feat/\$ID' correctly does NOT match a different bead's feat branch"

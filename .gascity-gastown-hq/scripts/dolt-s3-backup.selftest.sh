@@ -341,7 +341,7 @@ callsites="$(grep -cF '_dolt_reachable' "$SCRIPT")"
 # in prose (a fallback-port comment, and the RESTORE section's own
 # description), neither of which is an invocation; a plain grep over the
 # whole file would false-positive on those two pre-existing comments.
-if sed -E 's/#.*$//' "$SCRIPT" | grep -qiE '\bdolt (start|restart)\b|\bsql-server\b'; then
+if sed -E 's/#.*$//' "$SCRIPT" | grep -iE '\bdolt (start|restart)\b|\bsql-server\b' >/dev/null; then
   bad "found a Dolt start/restart/sql-server invocation (outside comments) — this script must remain READ + export only, retry must never escalate to a restart"
 else
   ok "no Dolt start/restart/sql-server invocation anywhere in the script (mentions in comments don't count) — retry only re-probes, never restarts"
@@ -354,7 +354,7 @@ if grep -qE 'FATAL: Dolt server unreachable on \$HOST:\$PORT after retries' "$SC
 else
   bad "final give-up message no longer identifiable as FATAL+unreachable — downstream _backup_today_ok parsing would degrade"
 fi
-if grep -qF 'notify_fail "backup off-box: Dolt inacessível' "$SCRIPT" && grep -cF 'exit 0' "$SCRIPT" | grep -qE '^[1-9][0-9]*$'; then
+if grep -qF 'notify_fail "backup off-box: Dolt inacessível' "$SCRIPT" && grep -cF 'exit 0' "$SCRIPT" | grep -E '^[1-9][0-9]*$' >/dev/null; then
   ok "give-up path still notifies and exits 0 (never restarts, never a nonzero exit that could trip an external supervisor into restarting Dolt)"
 else
   bad "give-up path's notify/exit-0 wiring looks different than expected"
@@ -715,12 +715,12 @@ else
   bad "jsonl offsite step position relative to the per-db loop looks wrong (or missing)"
 fi
 JSONL_WIRING_REGION="$(sed -n '/JSONL archive offsite mirror (ga-7gfd34)/,/publish a run fingerprint/p' "$SCRIPT")"
-if printf '%s' "$JSONL_WIRING_REGION" | grep -qF 'jsonl_offsite_sync'; then
+if printf '%s' "$JSONL_WIRING_REGION" | grep -F 'jsonl_offsite_sync' >/dev/null; then
   ok "jsonl_offsite_sync is actually called in the live flow, not just defined"
 else
   bad "jsonl_offsite_sync is defined but never called — dead code"
 fi
-if printf '%s' "$JSONL_WIRING_REGION" | grep -qF 'if [ "$failed" -eq 0 ]'; then
+if printf '%s' "$JSONL_WIRING_REGION" | grep -F 'if [ "$failed" -eq 0 ]' >/dev/null; then
   bad "jsonl offsite step is gated on the per-db loop's success — must run even when a db backup FAILED"
 else
   ok "jsonl offsite step is unconditional — runs even when a db backup above FAILED"

@@ -223,7 +223,7 @@ fi
 [ "$(key_of claude-headless path_check)" = 'path_check = "claude"' ] \
   && ok "path_check = \"claude\": the engine still verifies the REAL binary, not the wrapper" \
   || bad "claude-headless lacks path_check = \"claude\" (got: '$(key_of claude-headless path_check)')"
-block claude-headless | grep -q '^base = "builtin:claude"$' \
+block claude-headless | grep '^base = "builtin:claude"$' >/dev/null \
   && ok "claude-headless is still built on builtin:claude (process names, resume, hooks inherited)" || bad "claude-headless lost base = builtin:claude"
 
 for p in claude claude-rc; do

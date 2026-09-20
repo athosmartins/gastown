@@ -109,7 +109,7 @@ check_survives() {
     bad "$label: jq program failed on $bead_id: $out"
     return
   fi
-  if printf '%s' "$out" | grep -q "\"$bead_id\""; then
+  if printf '%s' "$out" | grep "\"$bead_id\"" >/dev/null; then
     ok "$label: survivor $bead_id correctly present"
   else
     bad "$label: survivor $bead_id was over-matched / dropped (output: $out)"

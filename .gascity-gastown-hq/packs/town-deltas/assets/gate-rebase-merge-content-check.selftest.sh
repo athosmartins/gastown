@@ -136,7 +136,7 @@ if [ -f "$GATE" ]; then
   # descriptive bead-comment text (which names the technique for human audit)
   # instead of the real code path.
   STEP4B_DETECT="$(awk '/Step 4b: Already-merged detection/{c=1} c{print} /^if \[ "\$ALREADY_MERGED" = "1" \]; then/{exit}' "$GATE" 2>/dev/null || true)"
-  if printf '%s' "$STEP4B_DETECT" | grep -q 'elif rig_content_merged "origin/\$DEFAULT_BRANCH" "origin/\$BRANCH"; then'; then
+  if printf '%s' "$STEP4B_DETECT" | grep 'elif rig_content_merged "origin/\$DEFAULT_BRANCH" "origin/\$BRANCH"; then' >/dev/null; then
     ok "Step 4b's detection calls rig_content_merged as a fallback when is-ancestor fails"
   else
     bad "Step 4b's detection does NOT call rig_content_merged — the naive is-ancestor check alone still governs ALREADY_MERGED (ga-01yq regression)"

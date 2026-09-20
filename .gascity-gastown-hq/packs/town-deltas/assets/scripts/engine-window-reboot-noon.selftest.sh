@@ -74,12 +74,12 @@ echo "=== engine-window-reboot-noon.selftest.sh ==="
 # ── half of ga-8v5t2. ───────────────────────────────────────────────────────
 CAP1=$(run_case 3 99 t1)
 MSG1=$(cat "$CAP1/gc-mail.args" 2>/dev/null)
-if echo "$MSG1" | grep -qE '\(3 patch pendente\)'; then
+if echo "$MSG1" | grep -E '\(3 patch pendente\)' >/dev/null; then
   ok "T1 reports canonical count (3), ignoring the 99-file decoy directory"
 else
   bad "T1 expected '(3 patch pendente)' in mail body" "$MSG1"
 fi
-if echo "$MSG1" | grep -qE '\(99 patch pendente\)'; then
+if echo "$MSG1" | grep -E '\(99 patch pendente\)' >/dev/null; then
   bad "T1 leaked the decoy top-level directory's count (99) into the message" "$MSG1"
 else
   ok "T1 does not leak the decoy directory's count"
@@ -90,7 +90,7 @@ fi
 # ── Doubling half of ga-8v5t2. ──────────────────────────────────────────────
 CAP2=$(run_case 0 5 t2)
 MSG2=$(cat "$CAP2/gc-mail.args" 2>/dev/null)
-if echo "$MSG2" | grep -qE '\(0 patch pendente\)'; then
+if echo "$MSG2" | grep -E '\(0 patch pendente\)' >/dev/null; then
   ok "T2 reports a clean single '0' when the canonical queue is empty"
 else
   bad "T2 expected '(0 patch pendente)', got a possibly-doubled/corrupted value" "$MSG2"
@@ -102,7 +102,7 @@ fi
 # ── producing the literal "0\n0" this bug is named for. ─────────────────────
 CAP3=$(run_case 0 0 t3)
 MSG3=$(cat "$CAP3/gc-mail.args" 2>/dev/null)
-if echo "$MSG3" | grep -qE '\(0 patch pendente\)'; then
+if echo "$MSG3" | grep -E '\(0 patch pendente\)' >/dev/null; then
   ok "T3 reports a clean single '0' when both directories are empty"
 else
   bad "T3 expected '(0 patch pendente)' with both dirs empty" "$MSG3"

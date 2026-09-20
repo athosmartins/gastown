@@ -286,10 +286,10 @@ grep -q 'escalate_surge "\${#CONFIRMED_DIVERGENT\[@\]}"' "$SWEEP" && ok "over-th
 # destructive actions invariant (d) suspends) — extract its body and assert.
 SURGE_BODY="$(sed -n '/^escalate_surge() {/,/^}/p' "$SWEEP")"
 [ -n "$SURGE_BODY" ] && ok "escalate_surge body extracted" || bad "could not extract escalate_surge body"
-printf '%s' "$SURGE_BODY" | grep -q 'bd -C' \
+printf '%s' "$SURGE_BODY" | grep 'bd -C' >/dev/null \
   && bad "escalate_surge touches bd (reopen/label) — invariant (d) requires it never does" \
   || ok "escalate_surge never calls bd — no reopen/label during a surge"
-printf '%s' "$SURGE_BODY" | grep -q 'mail send mayor' && ok "escalate_surge still mails Mayor (aggregated, once)" || bad "escalate_surge missing Mayor mail"
+printf '%s' "$SURGE_BODY" | grep 'mail send mayor' >/dev/null && ok "escalate_surge still mails Mayor (aggregated, once)" || bad "escalate_surge missing Mayor mail"
 
 # ── 11. full-sweep integration (DRY_RUN): invariant (d) surge threshold ────
 # Acceptance criterion 2: "10 divergentes numa rodada -> acoes destrutivas
@@ -325,7 +325,7 @@ done
 OUTB=$(GC_CITY_PATH="$TB/city" SURVIVAL_LEDGER_FILE="$LEDGERB" SURVIVAL_ALERT_DIR="$TB/alerted" \
   SURVIVAL_DIVERGENT_SURGE_THRESHOLD=5 SURVIVAL_DRY_RUN=1 SURVIVAL_LOG_STDOUT=1 bash "$SWEEP" 2>&1)
 
-printf '%s\n' "$OUTB" | grep -q 'WOULD-ESCALATE(divergent)' \
+printf '%s\n' "$OUTB" | grep 'WOULD-ESCALATE(divergent)' >/dev/null \
   && bad "surge: an individual per-sha escalation fired during a 10-divergent surge — output:
 $OUTB" \
   || ok "surge: no individual per-sha escalation fired during a 10-divergent surge"
@@ -334,7 +334,7 @@ SURGE_LINES_B=$(printf '%s\n' "$OUTB" | grep -c 'WOULD-ESCALATE(surge)')
   && ok "surge: exactly ONE aggregated surge alarm for 10 confirmed-divergent" \
   || bad "surge: expected exactly 1 aggregated alarm, got $SURGE_LINES_B — output:
 $OUTB"
-printf '%s\n' "$OUTB" | grep -q '10 confirmed-divergent' \
+printf '%s\n' "$OUTB" | grep '10 confirmed-divergent' >/dev/null \
   && ok "surge alarm reports the true confirmed count (10)" \
   || bad "surge alarm does not report the count 10 — output:
 $OUTB"
@@ -376,7 +376,7 @@ INDIV_LINES_C=$(printf '%s\n' "$OUTC" | grep -c 'WOULD-ESCALATE(divergent)')
   && ok "under threshold: both genuinely-divergent entries escalate individually" \
   || bad "under threshold: expected 2 individual escalations, got $INDIV_LINES_C — output:
 $OUTC"
-printf '%s\n' "$OUTC" | grep -q 'WOULD-ESCALATE(surge)' \
+printf '%s\n' "$OUTC" | grep 'WOULD-ESCALATE(surge)' >/dev/null \
   && bad "under threshold: surge path fired for only 2 confirmed-divergent (should not)" \
   || ok "under threshold: surge path did not fire for only 2 confirmed-divergent"
 

@@ -86,7 +86,7 @@ export CLAUDE_RELOG_POOL="alpha beta gamma"
 
 # Register the active blob as 'alpha' so current_label resolves it.
 run bash "$SUT" register alpha
-if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep -q "registered current account as 'alpha'"; then
+if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep "registered current account as 'alpha'" >/dev/null; then
   ok "register tags current keychain blob → alpha"
 else bad "register alpha" "rc=$RC out=$OUT"; fi
 
@@ -103,7 +103,7 @@ else bad "current → alpha" "out=$OUT"; fi
 # ---------------------------------------------------------------------------
 stage_quota false none null ""
 run bash "$SUT" auto --dry-run
-if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep -q "not at apex"; then
+if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep "not at apex" >/dev/null; then
   ok "not limited → auto no-op"
 else bad "not limited → auto no-op" "rc=$RC out=$OUT"; fi
 
@@ -112,7 +112,7 @@ else bad "not limited → auto no-op" "rc=$RC out=$OUT"; fi
 # ---------------------------------------------------------------------------
 stage_quota true session 120 "4:50pm"
 run bash "$SUT" auto --dry-run
-if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep -q "would relog to 'beta'"; then
+if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep "would relog to 'beta'" >/dev/null; then
   ok "apex + headroom → dry-run plans relog to beta"
 else bad "apex dry-run plans beta" "rc=$RC out=$OUT"; fi
 
@@ -120,7 +120,7 @@ else bad "apex dry-run plans beta" "rc=$RC out=$OUT"; fi
 # CASE 4: gated swap refused without enable
 # ---------------------------------------------------------------------------
 run bash "$SUT" swap beta
-if [ "$RC" = 1 ] && printf '%s' "$OUT" | grep -q "refusing live swap"; then
+if [ "$RC" = 1 ] && printf '%s' "$OUT" | grep "refusing live swap" >/dev/null; then
   ok "swap without CLAUDE_RELOG_ENABLED → refused"
 else bad "swap gating" "rc=$RC out=$OUT"; fi
 
@@ -129,7 +129,7 @@ else bad "swap gating" "rc=$RC out=$OUT"; fi
 # ---------------------------------------------------------------------------
 run env CLAUDE_RELOG_ENABLED=1 bash "$SUT" swap beta
 NEWFP=$(jq -r '.claudeAiOauth.accessToken' "$KC" 2>/dev/null)
-if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep -q "swapped active Claude account → 'beta'" \
+if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep "swapped active Claude account → 'beta'" >/dev/null \
    && [ "$NEWFP" = "sk-ant-oat01-beta" ]; then
   ok "enabled swap beta → keychain rewritten to beta"
 else bad "live swap beta" "rc=$RC fp=$NEWFP out=$OUT"; fi
@@ -147,7 +147,7 @@ else bad "current after swap" "out=$OUT"; fi
 stage_quota true session 90 "5:20pm"
 run env CLAUDE_RELOG_ENABLED=1 bash "$SUT" auto
 ACTIVE=$(jq -r '.claudeAiOauth.accessToken' "$KC")
-if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep -q "relogged to" \
+if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep "relogged to" >/dev/null \
    && [ "$ACTIVE" = "sk-ant-oat01-gamma" ]; then
   ok "auto at apex from beta → relogged to gamma"
 else bad "auto relog gamma" "rc=$RC active=$ACTIVE out=$OUT"; fi
@@ -178,7 +178,7 @@ blob_for gamma > "$KC"   # make gamma active
 run bash "$SUT" register gamma   # ensure fingerprint maps to gamma
 stage_quota true session 60 "6:00pm"
 run env CLAUDE_RELOG_ENABLED=1 bash "$SUT" auto
-if [ "$RC" = 2 ] && printf '%s' "$OUT" | grep -q "NO pool account with headroom"; then
+if [ "$RC" = 2 ] && printf '%s' "$OUT" | grep "NO pool account with headroom" >/dev/null; then
   ok "apex + all others in cooldown → PAUSE (exit 2)"
 else bad "no-headroom pause" "rc=$RC out=$OUT"; fi
 
@@ -199,7 +199,7 @@ else bad "select headroom" "out=$OUT"; fi
 # CASE 9: swap to a label whose secret is MISSING → exit 3
 # ---------------------------------------------------------------------------
 run env CLAUDE_RELOG_ENABLED=1 bash "$SUT" swap delta
-if [ "$RC" = 3 ] && printf '%s' "$OUT" | grep -q "no credential for label 'delta'"; then
+if [ "$RC" = 3 ] && printf '%s' "$OUT" | grep "no credential for label 'delta'" >/dev/null; then
   ok "swap missing-secret label → exit 3"
 else bad "swap missing secret" "rc=$RC out=$OUT"; fi
 
@@ -210,7 +210,7 @@ stage_quota true session 60 "6:00pm"
 PRE=$(cat "$KC")
 run bash "$SUT" auto    # CLAUDE_RELOG_ENABLED unset → disabled
 POST=$(cat "$KC")
-if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep -q "disabled" && [ "$PRE" = "$POST" ]; then
+if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep "disabled" >/dev/null && [ "$PRE" = "$POST" ]; then
   ok "auto disabled (fail-closed) → no keychain mutation"
 else bad "fail-closed auto" "rc=$RC mutated=$([ "$PRE" = "$POST" ] && echo no || echo YES) out=$OUT"; fi
 
@@ -220,7 +220,7 @@ else bad "fail-closed auto" "rc=$RC mutated=$([ "$PRE" = "$POST" ] && echo no ||
 # ---------------------------------------------------------------------------
 blob_for alpha > "$KC"; run bash "$SUT" register alpha
 run env CLAUDE_RELOG_ENABLED=1 bash "$SUT" swap beta
-if printf '%s' "$OUT" | grep -q 'sk-ant-'; then
+if printf '%s' "$OUT" | grep 'sk-ant-' >/dev/null; then
   bad "no token in swap output" "LEAKED: $OUT"
 else
   ok "swap output contains no credential token (AC4)"
@@ -231,8 +231,8 @@ fi
 # ---------------------------------------------------------------------------
 stage_quota false none null ""
 run bash "$SUT" status
-if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep -q "relog enabled: no" \
-   && ! printf '%s' "$OUT" | grep -q 'sk-ant-'; then
+if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep "relog enabled: no" >/dev/null \
+   && ! printf '%s' "$OUT" | grep 'sk-ant-' >/dev/null; then
   ok "status renders, fail-closed, no leak"
 else bad "status render" "rc=$RC out=$OUT"; fi
 
@@ -248,7 +248,7 @@ cat > "$STATE_DIR/state.json" <<EOF
 EOF
 stage_quota true session 60 "sk-ant-oat01-LEAKMARKER"
 run env CLAUDE_RELOG_ENABLED=1 bash "$SUT" auto
-if [ "$RC" != 0 ] && ! printf '%s' "$OUT" | grep -q 'sk-ant-oat01-LEAKMARKER'; then
+if [ "$RC" != 0 ] && ! printf '%s' "$OUT" | grep 'sk-ant-oat01-LEAKMARKER' >/dev/null; then
   ok "redaction guard aborts on a token in a logged field (AC4)"
 else bad "redaction guard fires" "rc=$RC out=$OUT"; fi
 

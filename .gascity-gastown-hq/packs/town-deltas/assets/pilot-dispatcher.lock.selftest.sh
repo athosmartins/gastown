@@ -102,7 +102,7 @@ echo "pilot-dispatcher.lock.selftest — single-instance lock (ga-7s0or)"
 # `flock -n 9` idiom on purpose; only ACTIVE code matters for the fd-leak.
 echo "Scenario A: no inheritable-fd flock remains (AC1 — lsof can never show a leak)"
 CODE_ONLY="$(grep -v '^[[:space:]]*#' "$DISPATCHER")"
-if printf '%s' "$CODE_ONLY" | grep -Eq 'exec[[:space:]]+9>|flock[[:space:]]+-n[[:space:]]+9'; then
+if printf '%s' "$CODE_ONLY" | grep -E 'exec[[:space:]]+9>|flock[[:space:]]+-n[[:space:]]+9' >/dev/null; then
   bad "REGRESSION: dispatcher still opens fd 9 / calls flock -n 9 (fd leaks into children)"
 else
   ok "no active 'exec 9>' / 'flock -n 9' — no fd is held that a child could inherit"
@@ -119,12 +119,12 @@ clear_lock
 mkdir -p "$LOCK_DIR"
 date +%s > "$LOCK_HB"            # fresh heartbeat → looks like a live sweep
 LOGB="$(run_dispatch)"
-if echo "$LOGB" | grep -q "backing off"; then
+if echo "$LOGB" | grep "backing off" >/dev/null; then
   ok "backed off while a live sweep holds the lock"
 else
   bad "did NOT back off (expected 'backing off' with a fresh lock held)"
 fi
-if echo "$LOGB" | grep -q "Pilot sweep start"; then
+if echo "$LOGB" | grep "Pilot sweep start" >/dev/null; then
   bad "REGRESSION: proceeded into the sweep despite a live lock holder"
 else
   ok "did not enter the sweep (no double-run)"
@@ -139,12 +139,12 @@ echo "zombie-holder-token" > "$LOCK_HB"
 # Backdate the heartbeat mtime well past the max-age we pass in (2s).
 touch -t 200001010000 "$LOCK_HB" 2>/dev/null || true
 LOGC="$(run_dispatch 2)"         # PILOT_LOCK_MAX_AGE=2s → the 2000 mtime is stale
-if echo "$LOGC" | grep -q "Recovered STALE"; then
+if echo "$LOGC" | grep "Recovered STALE" >/dev/null; then
   ok "recovered the stale lock automatically"
 else
   bad "did NOT recover the stale lock (expected 'Recovered STALE')"
 fi
-if echo "$LOGC" | grep -q "Pilot sweep start"; then
+if echo "$LOGC" | grep "Pilot sweep start" >/dev/null; then
   ok "proceeded into the sweep after recovery"
 else
   bad "did not proceed into the sweep after recovering the stale lock"
@@ -232,9 +232,9 @@ LOGE1="$(run_dispatch)"     # no override — exercises the PRODUCTION default
 # (the exact "couldn't know" collapsing into "verdict" shape the pre-gate
 # self-audit exists to catch). Require the POSITIVE backoff signal too, same
 # as Scenario B, so a broken script fails loudly instead of reading as green.
-if echo "$LOGE1" | grep -q "Recovered STALE"; then
+if echo "$LOGE1" | grep "Recovered STALE" >/dev/null; then
   bad "REGRESSION: a 900s-old heartbeat was reclaimed under the production default — a routine slow sweep would get its lock stolen mid-work"
-elif echo "$LOGE1" | grep -q "backing off"; then
+elif echo "$LOGE1" | grep "backing off" >/dev/null; then
   ok "a 900s-old heartbeat (slow-but-alive range) backs off, not reclaimed, under the production default"
 else
   bad "neither 'Recovered STALE' nor 'backing off' logged — dispatcher did not run as expected (cannot confirm correct behavior, not just absence of the regression)"
@@ -247,7 +247,7 @@ mkdir -p "$LOCK_DIR"
 echo "zombie-holder-token" > "$LOCK_HB"
 touch -t "$(date -v-1300S +%Y%m%d%H%M.%S)" "$LOCK_HB" 2>/dev/null || true
 LOGE2="$(run_dispatch)"     # no override — exercises the PRODUCTION default
-if echo "$LOGE2" | grep -q "Recovered STALE"; then
+if echo "$LOGE2" | grep "Recovered STALE" >/dev/null; then
   ok "a 1300s-old heartbeat (past the new default) is still recovered under the production default"
 else
   bad "a 1300s-old heartbeat was NOT recovered — a genuinely dead holder would wedge the dispatcher indefinitely"

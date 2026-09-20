@@ -121,7 +121,7 @@ run() {  # run <city> [extra CITY_AUTOPRUNE_* env assignments...]
 }
 
 wt_exists() {  # wt_exists <repo> <wt-path>
-  git -C "$1" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}' | grep -qxF "$2"
+  git -C "$1" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}' | grep -xF "$2" >/dev/null
 }
 
 last_event_for() {  # last_event_for <wt-path> -> last jsonl line mentioning it

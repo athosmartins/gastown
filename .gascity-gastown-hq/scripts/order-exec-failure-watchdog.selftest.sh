@@ -164,8 +164,8 @@ append "2026/08/01 09:10:00 gc: order exec dolt-health failed: exit status 1"
 run_sweep
 GC_AFTER=$(gc_call_count)
 eq "one new batched alert covering both orders" "$((GC_AFTER - GC_BEFORE))" "1"
-last_call "$GC_CALLS_LOG" | grep -q 'mol-dog-compactor' && ok "batched alert names mol-dog-compactor" || bad "batched alert missing mol-dog-compactor"
-last_call "$GC_CALLS_LOG" | grep -q 'dolt-health'        && ok "batched alert names dolt-health"        || bad "batched alert missing dolt-health"
+last_call "$GC_CALLS_LOG" | grep 'mol-dog-compactor' >/dev/null && ok "batched alert names mol-dog-compactor" || bad "batched alert missing mol-dog-compactor"
+last_call "$GC_CALLS_LOG" | grep 'dolt-health' >/dev/null        && ok "batched alert names dolt-health"        || bad "batched alert missing dolt-health"
 
 # ── 9. log rotation/truncation: cursor resets to 0, no crash ────────────────
 echo "── 9. a shrunk log file (rotation) is handled without crashing ──"
@@ -197,10 +197,10 @@ GC_BEFORE10=$(gc_call_count)
 run_sweep
 GC_AFTER10=$(gc_call_count)
 eq "second sweep crosses threshold, one alert (not two from the duplicate)" "$((GC_AFTER10 - GC_BEFORE10))" "1"
-last_call "$GC_CALLS_LOG" | grep -q '2026/08/01 14:21:50' \
+last_call "$GC_CALLS_LOG" | grep '2026/08/01 14:21:50' >/dev/null \
   && ok "alert shows the REAL last-seen timestamp" \
   || bad "alert timestamp corrupted — likely picked up the untimestamped duplicate's bogus 'gc: order' field"
-last_call "$GC_CALLS_LOG" | grep -qF 'gc: order' \
+last_call "$GC_CALLS_LOG" | grep -F 'gc: order' >/dev/null \
   && bad "alert leaked the untimestamped duplicate's garbage timestamp ('gc: order')" \
   || ok "no 'gc: order' garbage leaked into the alert"
 

@@ -177,26 +177,26 @@ EOF
 #    daemons, this story's own delta reaches only demand-dashboard ────────
 run_block three_daemon
 [ "$RUN_RC" -eq 0 ] && ok "T1 block runs clean (rc=0)" || nok "T1 rc" "rc=$RUN_RC"
-echo "$LOG_OUT" | grep -q "this-pull-structurally-inert=0" \
+echo "$LOG_OUT" | grep "this-pull-structurally-inert=0" >/dev/null \
   && ok "T1 own-merge probe classified NOT inert (demand-dashboard is a real hit)" \
   || nok "T1 inert classification" "$LOG_OUT"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && ok "T1 delivery IS held — demand-dashboard genuinely still needs a guarded restart" \
   || nok "T1 delivery was wrongly NOT held" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "restart THESE for this merge" \
+echo "$BD_CALLS" | grep "restart THESE for this merge" >/dev/null \
   && ok "T1 halt leads with the per-bead attribution phrase (Aceite: OWN computed from this story's own commits)" \
   || nok "T1 missing lead-with phrase — Path A attribution did not engage" "$BD_CALLS"
 LEAD_PART="$(echo "$BD_CALLS" | awk '/Context only/{exit} {print}')"
-echo "$LEAD_PART" | grep -q "com.whatsapp.demand-dashboard" \
+echo "$LEAD_PART" | grep "com.whatsapp.demand-dashboard" >/dev/null \
   && ok "T1 leading action names demand-dashboard (this story's real, own daemon)" \
   || nok "T1 lead missing demand-dashboard" "$LEAD_PART"
-echo "$LEAD_PART" | grep -q "com.whatsapp.ficha360" \
+echo "$LEAD_PART" | grep "com.whatsapp.ficha360" >/dev/null \
   && nok "T1 Aceite VIOLATED: leading action wrongly names ficha360 (not this story's fault)" "$LEAD_PART" \
   || ok "T1 Aceite: leading action does NOT name ficha360"
-echo "$LEAD_PART" | grep -q "com.whatsapp.map-viewer" \
+echo "$LEAD_PART" | grep "com.whatsapp.map-viewer" >/dev/null \
   && nok "T1 Aceite VIOLATED: leading action wrongly names map-viewer (not this story's fault)" "$LEAD_PART" \
   || ok "T1 Aceite: leading action does NOT name map-viewer"
-echo "$BD_CALLS" | grep -q "Context only — NOT attributed to this merge" \
+echo "$BD_CALLS" | grep "Context only — NOT attributed to this merge" >/dev/null \
   && ok "T1 wide list demoted to an explicitly-marked context line" \
   || nok "T1 missing context-demotion marker" "$BD_CALLS"
 CONTEXT_LINE="$(echo "$BD_CALLS" | grep "Context only — NOT attributed to this merge")"
@@ -205,13 +205,13 @@ CONTEXT_LINE="$(echo "$BD_CALLS" | grep "Context only — NOT attributed to this
 # lists only ITS OWN daemons (ga-8i2nds Aceite 1) — the two other deliveries'
 # daemons are acknowledged as a COUNT on the context line, and "nothing hidden"
 # is kept by the full wide list staying in the log.
-echo "$CONTEXT_LINE" | grep -q "2 other sensitive daemon" \
+echo "$CONTEXT_LINE" | grep "2 other sensitive daemon" >/dev/null \
   && ok "T1 the other deliveries' daemons (ficha360, map-viewer) are acknowledged on the context line as a count, not blamed on this story" \
   || nok "T1 context line does not count the 2 other flagged daemons" "$CONTEXT_LINE"
-echo "$CONTEXT_LINE" | grep -qE "com.whatsapp.(ficha360|map-viewer)" \
+echo "$CONTEXT_LINE" | grep -E "com.whatsapp.(ficha360|map-viewer)" >/dev/null \
   && nok "T1 context line still names another delivery's daemon" "$CONTEXT_LINE" \
   || ok "T1 context line names none of them (they belong to other deliveries)"
-echo "$LOG_OUT" | grep -q "guarded=\[.*com.whatsapp.ficha360.*com.whatsapp.map-viewer" \
+echo "$LOG_OUT" | grep "guarded=\[.*com.whatsapp.ficha360.*com.whatsapp.map-viewer" >/dev/null \
   && ok "T1 nothing hidden — ficha360 and map-viewer stay in the log's wide list" \
   || nok "T1 the wide list is missing from the log" "$LOG_OUT"
 [ "$BASELINE_AFTER" = "$EXPECT_C0" ] \
@@ -223,13 +223,13 @@ echo "$LOG_OUT" | grep -q "guarded=\[.*com.whatsapp.ficha360.*com.whatsapp.map-v
 #    story → still correctly held for it ──────────────────────────────────
 run_block own_only
 [ "$RUN_RC" -eq 0 ] && ok "T2 block runs clean (rc=0)" || nok "T2 rc" "rc=$RUN_RC"
-echo "$BD_CALLS" | grep -q "delivery:failed" \
+echo "$BD_CALLS" | grep "delivery:failed" >/dev/null \
   && ok "T2 delivery IS held (own-file-changed daemon still running old code)" \
   || nok "T2 delivery was wrongly NOT held" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "restart THESE for this merge" \
+echo "$BD_CALLS" | grep "restart THESE for this merge" >/dev/null \
   && ok "T2 halt leads with the per-bead attribution phrase" \
   || nok "T2 missing lead-with phrase" "$BD_CALLS"
-echo "$BD_CALLS" | grep -q "com.whatsapp.demand-dashboard" \
+echo "$BD_CALLS" | grep "com.whatsapp.demand-dashboard" >/dev/null \
   && ok "T2 halt names demand-dashboard" \
   || nok "T2 halt missing demand-dashboard" "$BD_CALLS"
 [ "$BASELINE_AFTER" = "$EXPECT_C1" ] \

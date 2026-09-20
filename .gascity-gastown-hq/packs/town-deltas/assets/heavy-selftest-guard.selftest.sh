@@ -363,7 +363,7 @@ gl="$(grep -n 'heavy_selftest_guard pilot-dispatcher' "$PILOT_SELFTEST" | head -
 wl="$(grep -n '^WORK="\$(mktemp' "$PILOT_SELFTEST" | head -1 | cut -d: -f1)"
 if [ -n "$gl" ] && [ -n "$wl" ] && [ "$gl" -lt "$wl" ]; then ok "pilot-dispatcher.selftest.sh takes the guard (line $gl) before it creates any fixture (line $wl)"; else bad "guard call missing or after the fixture setup (guard line='${gl:-none}', mktemp line='${wl:-none}')"; fi
 grep -q 'heavy-selftest-guard.sh' "$PILOT_SELFTEST" && ok "…by sourcing heavy-selftest-guard.sh" || bad "pilot selftest does not source the guard"
-awk '/^cleanup\(\)/{print; exit}' "$PILOT_SELFTEST" | grep -q 'heavy_selftest_release' \
+awk '/^cleanup\(\)/{print; exit}' "$PILOT_SELFTEST" | grep 'heavy_selftest_release' >/dev/null \
   && ok "its cleanup() (EXIT trap) releases the lock" || bad "cleanup() does not call heavy_selftest_release — the lock would only clear via stale-owner reclaim"
 hdr="$(sed -n '1,30p' "$PILOT_SELFTEST")"
 case "$hdr" in *"machine-wide"*) ok "the header documents the lock and the real runtime" ;; *) bad "header still describes the old ~140s run and says nothing about the lock" ;; esac

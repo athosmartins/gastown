@@ -206,35 +206,35 @@ CONTRADICTED_SHA_SCOPED_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS
 
 # ── T1: Task bead with gate:passed → close called ─────────────────────────────
 run_block "$TASK_BEAD_JSON" 0 ""
-echo "$LAST_BD" | grep -q "close ga-test-task" && ok "T1 TASK_WITH_GATE_PASSED → bd close called" || nok "T1 bd-close missing" "$LAST_BD"
-echo "$LAST_BD" | grep -q "comment ga-test-task" && ok "T1 comment added to task bead" || nok "T1 comment missing" "$LAST_BD"
+echo "$LAST_BD" | grep "close ga-test-task" >/dev/null && ok "T1 TASK_WITH_GATE_PASSED → bd close called" || nok "T1 bd-close missing" "$LAST_BD"
+echo "$LAST_BD" | grep "comment ga-test-task" >/dev/null && ok "T1 comment added to task bead" || nok "T1 comment missing" "$LAST_BD"
 # TASK_COUNT should be 1 (reconciler ran)
 [ "${RUN_TASK_COUNT:-0}" = "1" ] && ok "T1 TASK_COUNT=1" || nok "T1 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
 
 # ── T2: Story bead excluded (has story:approved) ──────────────────────────────
 run_block "$STORY_WITH_GATE_JSON" 0 ""
-! echo "$LAST_BD" | grep -q "close ga-test-story" && ok "T2 STORY_EXCLUDED → bd close NOT called" || nok "T2 story-closed" "$LAST_BD"
+! echo "$LAST_BD" | grep "close ga-test-story" >/dev/null && ok "T2 STORY_EXCLUDED → bd close NOT called" || nok "T2 story-closed" "$LAST_BD"
 [ "${RUN_TASK_COUNT:-0}" = "0" ] && ok "T2 TASK_COUNT=0 (story filtered out)" || nok "T2 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
 
 # ── T3: Bead with story:done excluded ─────────────────────────────────────────
 run_block "$DONE_WITH_GATE_JSON" 0 ""
-! echo "$LAST_BD" | grep -q "close ga-test-done" && ok "T3 DONE_EXCLUDED → bd close NOT called" || nok "T3 done-closed" "$LAST_BD"
+! echo "$LAST_BD" | grep "close ga-test-done" >/dev/null && ok "T3 DONE_EXCLUDED → bd close NOT called" || nok "T3 done-closed" "$LAST_BD"
 [ "${RUN_TASK_COUNT:-0}" = "0" ] && ok "T3 TASK_COUNT=0 (story:done filtered out)" || nok "T3 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
 
 # ── T4: No gate:passed task beads ─────────────────────────────────────────────
 run_block "$EMPTY_JSON" 0 ""
-! echo "$LAST_BD" | grep -q "close" && ok "T4 NO_TASK_BEADS → no bd close" || nok "T4 spurious-close" "$LAST_BD"
+! echo "$LAST_BD" | grep "close" >/dev/null && ok "T4 NO_TASK_BEADS → no bd close" || nok "T4 spurious-close" "$LAST_BD"
 [ "${RUN_TASK_COUNT:-0}" = "0" ] && ok "T4 TASK_COUNT=0 (empty list)" || nok "T4 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
 
 # ── T5: DRY_RUN=1 → bd close NOT called ──────────────────────────────────────
 run_block "$TASK_BEAD_JSON" 1 ""
-! echo "$LAST_BD" | grep -q "close ga-test-task" && ok "T5 DRY_RUN_SKIPS_CLOSE → bd close NOT called" || nok "T5 dry-run-closed" "$LAST_BD"
+! echo "$LAST_BD" | grep "close ga-test-task" >/dev/null && ok "T5 DRY_RUN_SKIPS_CLOSE → bd close NOT called" || nok "T5 dry-run-closed" "$LAST_BD"
 # TASK_COUNT should still be 1 (reconciler ran, found bead, but skipped close)
 [ "${RUN_TASK_COUNT:-0}" = "1" ] && ok "T5 TASK_COUNT=1 (found bead in dry-run)" || nok "T5 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
 
 # ── T6: FORCE_STORY_ID set → reconciler skipped entirely ─────────────────────
 run_block "$TASK_BEAD_JSON" 0 "ga-some-story"
-! echo "$LAST_BD" | grep -q "close" && ok "T6 FORCE_ID_SKIPS_BLOCK → no bd close (reconciler skipped)" || nok "T6 force-id-closed" "$LAST_BD"
+! echo "$LAST_BD" | grep "close" >/dev/null && ok "T6 FORCE_ID_SKIPS_BLOCK → no bd close (reconciler skipped)" || nok "T6 force-id-closed" "$LAST_BD"
 [ "${RUN_TASK_COUNT:-0}" = "0" ] && ok "T6 TASK_COUNT=0 (FORCE_STORY_ID skips block)" || nok "T6 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
 
 # ── T7: contradicted but independently VERIFIED → residue cleared + closed ──
@@ -242,11 +242,11 @@ run_block "$TASK_BEAD_JSON" 0 "ga-some-story"
 # + gate:failed + gate:needs-fix, in_progress) with an independently-verifiable
 # merged commit resolves: stale labels cleared, bd close called."
 run_block "$CONTRADICTED_VERIFIED_JSON" 0 ""
-echo "$LAST_BD" | grep -q 'label remove ga-test-task "\?gate:failed"\?' \
+echo "$LAST_BD" | grep 'label remove ga-test-task "\?gate:failed"\?' >/dev/null \
   && ok "T7 CONTRADICTED_VERIFIED → gate:failed cleared" || nok "T7 gate:failed not cleared" "$LAST_BD"
-echo "$LAST_BD" | grep -q 'label remove ga-test-task "\?gate:needs-fix"\?' \
+echo "$LAST_BD" | grep 'label remove ga-test-task "\?gate:needs-fix"\?' >/dev/null \
   && ok "T7 CONTRADICTED_VERIFIED → gate:needs-fix cleared" || nok "T7 gate:needs-fix not cleared" "$LAST_BD"
-echo "$LAST_BD" | grep -q "close ga-test-task" \
+echo "$LAST_BD" | grep "close ga-test-task" >/dev/null \
   && ok "T7 CONTRADICTED_VERIFIED → bd close called (contradiction proven stale)" || nok "T7 bd-close missing" "$LAST_BD"
 [ "${RUN_TASK_COUNT:-0}" = "1" ] && ok "T7 TASK_COUNT=1" || nok "T7 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
 
@@ -255,9 +255,9 @@ echo "$LAST_BD" | grep -q "close ga-test-task" \
 # commit stays stuck, unchanged — proves this isn't 'trust the label pair
 # alone' in different clothes."
 run_block "$CONTRADICTED_UNVERIFIED_JSON" 0 ""
-! echo "$LAST_BD" | grep -q "close ga-test-task-nocommit" \
+! echo "$LAST_BD" | grep "close ga-test-task-nocommit" >/dev/null \
   && ok "T8 CONTRADICTED_UNVERIFIED → bd close NOT called (never guess)" || nok "T8 spurious-close" "$LAST_BD"
-! echo "$LAST_BD" | grep -q "label remove ga-test-task-nocommit" \
+! echo "$LAST_BD" | grep "label remove ga-test-task-nocommit" >/dev/null \
   && ok "T8 CONTRADICTED_UNVERIFIED → labels left untouched" || nok "T8 spurious-label-remove" "$LAST_BD"
 # TASK_COUNT is `jq 'length'` on the raw candidate list (set once, before the
 # loop runs — see story-delivery.sh ~line 504) — it reflects how many
@@ -278,11 +278,11 @@ run_block "$CONTRADICTED_UNVERIFIED_JSON" 0 ""
 # slice df90c973's live, correct rejection). The sha-scoped check must win:
 # labels survive, bd close is never called.
 run_block "$CONTRADICTED_SHA_SCOPED_JSON" 0 ""
-! echo "$LAST_BD" | grep -q 'label remove ga-test-task "\?gate:failed"\?' \
+! echo "$LAST_BD" | grep 'label remove ga-test-task "\?gate:failed"\?' >/dev/null \
   && ok "T9 SHA_SCOPED_OVERRIDES → gate:failed NOT cleared (named sha unresolved)" || nok "T9 gate:failed wrongly cleared" "$LAST_BD"
-! echo "$LAST_BD" | grep -q 'label remove ga-test-task "\?gate:needs-fix"\?' \
+! echo "$LAST_BD" | grep 'label remove ga-test-task "\?gate:needs-fix"\?' >/dev/null \
   && ok "T9 SHA_SCOPED_OVERRIDES → gate:needs-fix NOT cleared" || nok "T9 gate:needs-fix wrongly cleared" "$LAST_BD"
-! echo "$LAST_BD" | grep -q "close ga-test-task" \
+! echo "$LAST_BD" | grep "close ga-test-task" >/dev/null \
   && ok "T9 SHA_SCOPED_OVERRIDES → bd close NOT called (bead-scoped hit overridden)" || nok "T9 spurious-close" "$LAST_BD"
 [ "${RUN_TASK_COUNT:-0}" = "1" ] && ok "T9 TASK_COUNT=1 (candidate found, but kept)" || nok "T9 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
 
@@ -312,35 +312,35 @@ CLOSE_EXHAUSTED_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconci
 # ── T10: first close failure → no false-success comment, retry-count bumped,
 #         no escalation yet (1 of 3) ──────────────────────────────────────────
 run_block "$CLOSE_FIRST_ATTEMPT_JSON" 0 "" "$CLOSE_FAIL_STDERR"
-echo "$LAST_BD" | grep -q "close ga-test-task" \
+echo "$LAST_BD" | grep "close ga-test-task" >/dev/null \
   && ok "T10 close IS attempted" || nok "T10 close not attempted" "$LAST_BD"
-! echo "$LAST_BD" | grep -q "Closed by delivery sweep" \
+! echo "$LAST_BD" | grep "Closed by delivery sweep" >/dev/null \
   && ok "T10 CLOSE_FAILS → no false-success 'Closed by delivery sweep' comment" || nok "T10 false-success comment posted despite failed close" "$LAST_BD"
-echo "$LAST_BD" | grep -q 'label add ga-test-task "\?delivery:close-retry:1"\?' \
+echo "$LAST_BD" | grep 'label add ga-test-task "\?delivery:close-retry:1"\?' >/dev/null \
   && ok "T10 retry-count bumped to delivery:close-retry:1" || nok "T10 retry-count not bumped" "$LAST_BD"
-! echo "$LAST_BD" | grep -q "close-retry-exhausted" \
+! echo "$LAST_BD" | grep "close-retry-exhausted" >/dev/null \
   && ok "T10 NOT yet exhausted (1st of 3 allowed attempts)" || nok "T10 wrongly marked exhausted on 1st failure" "$LAST_BD"
-! echo "$LAST_BD" | grep -q "gc.*mail send mayor" \
+! echo "$LAST_BD" | grep "gc.*mail send mayor" >/dev/null \
   && ok "T10 no Mayor escalation yet (cap not reached)" || nok "T10 escalated too early" "$LAST_BD"
 
 # ── T11: 3rd consecutive failure (cap=3) → escalate, stop retrying ──────────
 run_block "$CLOSE_LAST_ATTEMPT_JSON" 0 "" "$CLOSE_FAIL_STDERR"
-echo "$LAST_BD" | grep -q "close ga-test-task" \
+echo "$LAST_BD" | grep "close ga-test-task" >/dev/null \
   && ok "T11 close IS attempted (3rd time)" || nok "T11 close not attempted" "$LAST_BD"
-! echo "$LAST_BD" | grep -q "Closed by delivery sweep" \
+! echo "$LAST_BD" | grep "Closed by delivery sweep" >/dev/null \
   && ok "T11 CLOSE_FAILS 3x → still no false-success comment" || nok "T11 false-success comment posted" "$LAST_BD"
-echo "$LAST_BD" | grep -q 'label remove ga-test-task "\?delivery:close-retry:2"\?' \
+echo "$LAST_BD" | grep 'label remove ga-test-task "\?delivery:close-retry:2"\?' >/dev/null \
   && ok "T11 stale delivery:close-retry:2 removed" || nok "T11 stale retry-count label not removed" "$LAST_BD"
-echo "$LAST_BD" | grep -q 'label add ga-test-task "\?delivery:close-retry-exhausted"\?' \
+echo "$LAST_BD" | grep 'label add ga-test-task "\?delivery:close-retry-exhausted"\?' >/dev/null \
   && ok "T11 CAP REACHED → delivery:close-retry-exhausted added" || nok "T11 exhausted label not added" "$LAST_BD"
-echo "$LAST_BD" | grep -q "comment ga-test-task" \
+echo "$LAST_BD" | grep "comment ga-test-task" >/dev/null \
   && ok "T11 escalation comment posted (honest — describes failure, not success)" || nok "T11 no escalation comment" "$LAST_BD"
-echo "$LAST_BD" | grep -q "gc.*mail send mayor" \
+echo "$LAST_BD" | grep "gc.*mail send mayor" >/dev/null \
   && ok "T11 Mayor notified (ga-s1qb2 escalation, same convention as keep:partial-delivery)" || nok "T11 no Mayor mail on cap" "$LAST_BD"
 
 # ── T12: already exhausted (prior sweep escalated) → skip entirely, no retry ─
 run_block "$CLOSE_EXHAUSTED_JSON" 0 ""
-! echo "$LAST_BD" | grep -q "close ga-test-task" \
+! echo "$LAST_BD" | grep "close ga-test-task" >/dev/null \
   && ok "T12 ALREADY_EXHAUSTED → bd close NOT attempted at all (early skip)" || nok "T12 spurious close attempt on exhausted bead" "$LAST_BD"
 [ "${RUN_TASK_COUNT:-0}" = "1" ] && ok "T12 TASK_COUNT=1 (candidate found, but skipped — not the same as acted)" || nok "T12 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
 
@@ -361,11 +361,11 @@ run_block "$CLOSE_EXHAUSTED_JSON" 0 ""
 # exactly what let this reconciler's own content check wave them through.
 PENDING_RESTART_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","status":"in_progress","issue_type":"task","labels":["gate:passed","delivery:pending-restart","lane:small"]}]'
 run_block "$PENDING_RESTART_JSON" 0 ""
-! echo "$LAST_BD" | grep -q "close ga-test-task" \
+! echo "$LAST_BD" | grep "close ga-test-task" >/dev/null \
   && ok "T13 PENDING_RESTART_VETO → bd close NOT called (daemon-verification hold wins over merge proof)" || nok "T13 spurious-close despite delivery:pending-restart" "$LAST_BD"
-! echo "$LAST_BD" | grep -q 'label remove ga-test-task.*delivery:pending-restart' \
+! echo "$LAST_BD" | grep 'label remove ga-test-task.*delivery:pending-restart' >/dev/null \
   && ok "T13 delivery:pending-restart label left untouched (resolution is manual/daemon-refresh, not this reconciler)" || nok "T13 label wrongly removed" "$LAST_BD"
-! echo "$LAST_BD" | grep -q "comment ga-test-task" \
+! echo "$LAST_BD" | grep "comment ga-test-task" >/dev/null \
   && ok "T13 no comment posted (already announced in full by the dispatcher when it set the label — avoids the ga-s1qb2 per-sweep comment-spam anti-pattern)" || nok "T13 spurious comment" "$LAST_BD"
 [ "${RUN_TASK_COUNT:-0}" = "1" ] && ok "T13 TASK_COUNT=1 (candidate found, but kept — not the same as acted)" || nok "T13 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
 

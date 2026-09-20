@@ -121,8 +121,8 @@ echo "── Fixture: attempt1=missing attempt2=ok → retry saves it ──"
 run_admin_case "missing
 ok"
 [ "$LAST_RC" -eq 0 ] && ok "exit 0 (retry worked)" || bad "expected exit 0, got $LAST_RC: $LAST_OUT"
-echo "$LAST_OUT" | grep -qi "retry" && ok "log mentions it needed a retry" || bad "log does not mention retry: $LAST_OUT"
-echo "$LAST_OUT" | grep -q "ALL PASS" && ok "suite reaches ALL PASS" || bad "suite did not reach ALL PASS: $LAST_OUT"
+echo "$LAST_OUT" | grep -i "retry" >/dev/null && ok "log mentions it needed a retry" || bad "log does not mention retry: $LAST_OUT"
+echo "$LAST_OUT" | grep "ALL PASS" >/dev/null && ok "suite reaches ALL PASS" || bad "suite did not reach ALL PASS: $LAST_OUT"
 
 # ═════════════════════════════════════════════════════════════════════════
 # 2. CONTROL: missing on ALL attempts -> still fails (not permissive)
@@ -130,8 +130,8 @@ echo "$LAST_OUT" | grep -q "ALL PASS" && ok "suite reaches ALL PASS" || bad "sui
 echo "── Control: missing on ALL attempts → still fails ──"
 run_admin_case "missing"
 [ "$LAST_RC" -ne 0 ] && ok "nonzero exit (retry did not become permissive)" || bad "expected nonzero exit, got 0: $LAST_OUT"
-echo "$LAST_OUT" | grep -q "FAIL" && ok "FAIL is reported" || bad "no FAIL in output: $LAST_OUT"
-echo "$LAST_OUT" | grep -q "3 attempt" && ok "ran the full retry budget (3 attempts) before giving up" || bad "message doesn't confirm 3 attempts: $LAST_OUT"
+echo "$LAST_OUT" | grep "FAIL" >/dev/null && ok "FAIL is reported" || bad "no FAIL in output: $LAST_OUT"
+echo "$LAST_OUT" | grep "3 attempt" >/dev/null && ok "ran the full retry budget (3 attempts) before giving up" || bad "message doesn't confirm 3 attempts: $LAST_OUT"
 
 # ═════════════════════════════════════════════════════════════════════════
 # 3. CONTROL 2: three distinct failure states -> three distinct messages
@@ -147,9 +147,9 @@ else
   bad "two or more states produced the SAME message (still conflated)"
 fi
 
-echo "$MSG_CURLFAIL" | grep -qi "connect" && ok "curl-failed message names a connection failure" || bad "curl-failed message doesn't name a connection failure: $MSG_CURLFAIL"
-echo "$MSG_EMPTY" | grep -qi "empty" && ok "empty-body message names an empty body" || bad "empty-body message doesn't say empty: $MSG_EMPTY"
-echo "$MSG_MISSING" | grep -qi "does not contain" && ok "string-missing message names the missing string" || bad "string-missing message unclear: $MSG_MISSING"
+echo "$MSG_CURLFAIL" | grep -i "connect" >/dev/null && ok "curl-failed message names a connection failure" || bad "curl-failed message doesn't name a connection failure: $MSG_CURLFAIL"
+echo "$MSG_EMPTY" | grep -i "empty" >/dev/null && ok "empty-body message names an empty body" || bad "empty-body message doesn't say empty: $MSG_EMPTY"
+echo "$MSG_MISSING" | grep -i "does not contain" >/dev/null && ok "string-missing message names the missing string" || bad "string-missing message unclear: $MSG_MISSING"
 
 # ═════════════════════════════════════════════════════════════════════════
 # 4. registration/restart appears ONLY as an explicitly-labeled possible
@@ -158,8 +158,8 @@ echo "$MSG_MISSING" | grep -qi "does not contain" && ok "string-missing message 
 echo "── Criterion 4: registration/restart never asserted as measured fact ──"
 for msg_name in MSG_CURLFAIL MSG_EMPTY MSG_MISSING; do
   msg="${!msg_name}"
-  if echo "$msg" | grep -qi "registration\|restart"; then
-    echo "$msg" | grep -q "Possible causes (not verified by this check)" \
+  if echo "$msg" | grep -i "registration\|restart" >/dev/null; then
+    echo "$msg" | grep "Possible causes (not verified by this check)" >/dev/null \
       && ok "$msg_name: registration/restart mention is explicitly labeled as an unverified possible cause" \
       || bad "$msg_name: registration/restart asserted WITHOUT the unverified-possible-cause label: $msg"
   else
@@ -173,8 +173,8 @@ done
 echo "── Smoke: admin ok on first attempt → ALL PASS, no retry noise ──"
 run_admin_case "ok"
 [ "$LAST_RC" -eq 0 ] && ok "exit 0" || bad "expected exit 0, got $LAST_RC: $LAST_OUT"
-echo "$LAST_OUT" | grep -q "ALL PASS" && ok "reaches ALL PASS" || bad "did not reach ALL PASS: $LAST_OUT"
-echo "$LAST_OUT" | grep -qi "retry" && bad "spurious retry-mention on a first-attempt success: $LAST_OUT" || ok "no spurious retry-mention when the first attempt already succeeds"
+echo "$LAST_OUT" | grep "ALL PASS" >/dev/null && ok "reaches ALL PASS" || bad "did not reach ALL PASS: $LAST_OUT"
+echo "$LAST_OUT" | grep -i "retry" >/dev/null && bad "spurious retry-mention on a first-attempt success: $LAST_OUT" || ok "no spurious retry-mention when the first attempt already succeeds"
 
 # ═════════════════════════════════════════════════════════════════════════
 # 6. REGRESSION ga-cjj3u: SIGPIPE + pipefail false negative — static proof

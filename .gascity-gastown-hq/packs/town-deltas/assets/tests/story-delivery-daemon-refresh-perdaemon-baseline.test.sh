@@ -210,28 +210,28 @@ EOF
 
 # ── T1: two labels, one guarded one clean, no pre-existing file ──────────────
 run_block "NEEDS_GUARDED_RESTART" "com.test.a com.test.b" "com.test.a" "" ""
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.b $EXPECT_C1" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.b $EXPECT_C1" >/dev/null \
   && ok "T1 clean label (com.test.b) gets its own baseline advanced to POST_DEPLOY_SHA" \
   || nok "T1 clean label advanced" "perdaemon=[$PERDAEMON_AFTER]"
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.a $EXPECT_C0 stuck" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.a $EXPECT_C0 stuck" >/dev/null \
   && ok "T1 guarded label (com.test.a) is RECORDED, frozen at the effective PRE (C0) and flagged stuck" \
   || nok "T1 guarded label must be recorded frozen at C0 with the stuck flag (ga-7polxu: it used to be dropped)" "perdaemon=[$PERDAEMON_AFTER]"
-echo "$PERDAEMON_AFTER" | grep -q "^com.test.a $EXPECT_C1" \
+echo "$PERDAEMON_AFTER" | grep "^com.test.a $EXPECT_C1" >/dev/null \
   && nok "T1 guarded label must NOT have its baseline advanced to POST_DEPLOY_SHA" "perdaemon=[$PERDAEMON_AFTER]" \
   || ok "T1 guarded label was not advanced past its frozen baseline"
 
 # ── T2: a pre-existing entry for a label NOT examined this cycle is kept ─────
 run_block "NEEDS_GUARDED_RESTART" "com.test.b" "" "" "com.test.c deadbeef0000000000000000000000000000000"
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.c deadbeef0000000000000000000000000000000" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.c deadbeef0000000000000000000000000000000" >/dev/null \
   && ok "T2 pre-existing entry for a label outside this cycle's ALL_LABELS is carried forward untouched" \
   || nok "T2 carry-forward" "perdaemon=[$PERDAEMON_AFTER]"
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.b $EXPECT_C1" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.b $EXPECT_C1" >/dev/null \
   && ok "T2 this cycle's clean label is still advanced alongside the carried-forward entry" \
   || nok "T2 clean label advanced" "perdaemon=[$PERDAEMON_AFTER]"
 
 # ── T2b: a stuck-flagged entry for a label NOT examined this cycle keeps its flag
 run_block "NEEDS_GUARDED_RESTART" "com.test.b" "" "" "com.test.c @C0@ stuck"
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.c $EXPECT_C0 stuck" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.c $EXPECT_C0 stuck" >/dev/null \
   && ok "T2b a stuck-flagged entry for an unexamined label is carried forward verbatim, flag included" \
   || nok "T2b flagged carry-forward" "perdaemon=[$PERDAEMON_AFTER]"
 
@@ -240,40 +240,40 @@ run_block "NEEDS_GUARDED_RESTART" "com.test.b" "" "" ""
 [ -z "$RIGMARKER_AFTER" ] \
   && ok "T3 rig-wide marker NOT advanced on a non-OK verdict (ga-gokm6 behavior, unchanged)" \
   || nok "T3 rig marker" "got '$RIGMARKER_AFTER', want empty"
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.b $EXPECT_C1" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.b $EXPECT_C1" >/dev/null \
   && ok "T3 per-daemon marker STILL advances for the clean label despite the non-OK rig-wide verdict — the actual fix" \
   || nok "T3 perdaemon advanced despite non-OK verdict" "perdaemon=[$PERDAEMON_AFTER]"
 
 # ── T4: a guarded label keeps a real pre-existing entry between PRE and POST ─
 WANT_MID=1 run_block "NEEDS_GUARDED_RESTART" "com.test.a com.test.b" "com.test.a" "" "com.test.a @MID@"
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.a $EXPECT_MID stuck" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.a $EXPECT_MID stuck" >/dev/null \
   && ok "T4 guarded label keeps its own last-known-clean point (MID), frozen and flagged" \
   || nok "T4 existing entry must be carried, not reset" "perdaemon=[$PERDAEMON_AFTER] want 'com.test.a $EXPECT_MID stuck'"
 
 # ── T5: an unusable pre-existing entry is re-frozen at the effective PRE ─────
 run_block "NEEDS_GUARDED_RESTART" "com.test.a" "com.test.a" "" "com.test.a deadbeef0000000000000000000000000000000"
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.a $EXPECT_C0 stuck" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.a $EXPECT_C0 stuck" >/dev/null \
   && ok "T5 an entry that is not a commit is replaced by the effective PRE (C0), never trusted" \
   || nok "T5 garbage entry must be replaced" "perdaemon=[$PERDAEMON_AFTER]"
 
 # ── T5b: an older-than-PRE real commit is the truthful 'unresolved since' ────
 WANT_MID=1 run_block "NEEDS_GUARDED_RESTART" "com.test.a" "com.test.a" "" "com.test.a @C0@" "@MID@"
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.a $EXPECT_C0 stuck" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.a $EXPECT_C0 stuck" >/dev/null \
   && ok "T5b a real commit older than the effective PRE is preserved for a still-stuck label" \
   || nok "T5b older-than-PRE real entry must be preserved" "perdaemon=[$PERDAEMON_AFTER]"
 
 # ── T6: FRESH_FAIL is frozen exactly like GUARDED ────────────────────────────
 run_block "NEEDS_GUARDED_RESTART" "com.test.a com.test.c" "" "com.test.c" ""
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.c $EXPECT_C0 stuck" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.c $EXPECT_C0 stuck" >/dev/null \
   && ok "T6 a FRESH_FAIL label is frozen at the effective PRE and flagged" \
   || nok "T6 FRESH_FAIL must be frozen" "perdaemon=[$PERDAEMON_AFTER]"
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.a $EXPECT_C1" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.a $EXPECT_C1" >/dev/null \
   && ok "T6 the clean label beside it still advances" \
   || nok "T6 clean neighbour" "perdaemon=[$PERDAEMON_AFTER]"
 
 # ── T6b: a stuck label absent from ALL_LABELS is frozen too, one line each ───
 run_block "NEEDS_GUARDED_RESTART" "com.test.a" "com.test.a com.test.z" "" ""
-[ "$(echo "$PERDAEMON_AFTER" | grep -c '^com.test.z ')" = "1" ] && echo "$PERDAEMON_AFTER" | grep -qx "com.test.z $EXPECT_C0 stuck" \
+[ "$(echo "$PERDAEMON_AFTER" | grep -c '^com.test.z ')" = "1" ] && echo "$PERDAEMON_AFTER" | grep -x "com.test.z $EXPECT_C0 stuck" >/dev/null \
   && ok "T6b a guarded label the helper did not list in ALL_LABELS is still frozen (exactly one line)" \
   || nok "T6b guarded-but-unlisted label" "perdaemon=[$PERDAEMON_AFTER]"
 [ "$(echo "$PERDAEMON_AFTER" | grep -c '^com.test.a ')" = "1" ] \
@@ -283,23 +283,23 @@ run_block "NEEDS_GUARDED_RESTART" "com.test.a" "com.test.a com.test.z" "" ""
 # ── T7: a stuck-flagged entry survives a cycle where the window no longer
 #    covers it (the marker already advanced past it) ──────────────────────────
 WANT_MID=1 run_block "OK" "com.test.a com.test.b" "" "" "com.test.a @C0@ stuck" "@MID@"
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.a $EXPECT_C0 stuck" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.a $EXPECT_C0 stuck" >/dev/null \
   && ok "T7 the frozen entry survives a cycle where the label is no longer flagged but the window (MID..C1) does not cover C0" \
   || nok "T7 unknown must not become clean (ga-7polxu)" "perdaemon=[$PERDAEMON_AFTER]"
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.b $EXPECT_C1" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.b $EXPECT_C1" >/dev/null \
   && ok "T7 the never-stuck neighbour still advances to POST_DEPLOY_SHA" \
   || nok "T7 clean neighbour" "perdaemon=[$PERDAEMON_AFTER]"
 
 # ── T7b: a flagged entry whose sha is not a real commit carries no information;
 #    it must not read as "not covered" and outlive the label forever ───────────
 WANT_MID=1 run_block "OK" "com.test.a" "" "" "com.test.a deadbeef0000000000000000000000000000000 stuck" "@MID@"
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.a $EXPECT_C1" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.a $EXPECT_C1" >/dev/null \
   && ok "T7b a stuck-flagged entry whose sha is not a commit is replaced (advanced), not kept forever" \
   || nok "T7b a garbage flagged entry must not outlive the label" "perdaemon=[$PERDAEMON_AFTER]"
 
 # ── T8: once the window covers the flagged entry, not-flagged is really clean ─
 run_block "OK" "com.test.a" "" "" "com.test.a @C0@ stuck" "@C0@"
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.a $EXPECT_C1" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.a $EXPECT_C1" >/dev/null \
   && ok "T8 a flagged label the covering window finds clean is advanced to POST_DEPLOY_SHA with the flag cleared" \
   || nok "T8 verified-clean label must be released" "perdaemon=[$PERDAEMON_AFTER]"
 
@@ -331,11 +331,11 @@ PD_SEED_MODE=200 run_block "NEEDS_GUARDED_RESTART" "com.test.a com.test.b" "" ""
 #    must survive: neither replaced by PRE (stuck branch) nor advanced as clean
 #    (unknown branch) on a guess.
 WANT_MID=1 BREAK_GIT=1 run_block "NEEDS_GUARDED_RESTART" "com.test.a com.test.b" "com.test.a" "" "com.test.a @MID@"
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.a $EXPECT_MID stuck" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.a $EXPECT_MID stuck" >/dev/null \
   && ok "T13a a still-stuck label keeps its existing entry when git cannot say whether it is valid" \
   || nok "T13a a git error must not replace the recorded baseline" "perdaemon=[$PERDAEMON_AFTER] want 'com.test.a $EXPECT_MID stuck'"
 WANT_MID=1 BREAK_GIT=1 run_block "OK" "com.test.a" "" "" "com.test.a @C0@ stuck" "@MID@"
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.a $EXPECT_C0 stuck" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.a $EXPECT_C0 stuck" >/dev/null \
   && ok "T13b a flagged entry is kept, not advanced as clean, when git cannot say whether the window covers it" \
   || nok "T13b a git error must not turn a stuck record into a clean one" "perdaemon=[$PERDAEMON_AFTER] want 'com.test.a $EXPECT_C0 stuck'"
 
@@ -344,8 +344,8 @@ ERREXIT=1 run_block "NEEDS_GUARDED_RESTART" "com.test.a com.test.b" "com.test.a"
 [ "$RUN_RC" -eq 0 ] \
   && ok "T10 the block runs clean under set -e" \
   || nok "T10 set -e" "rc=$RUN_RC"
-echo "$PERDAEMON_AFTER" | grep -qx "com.test.a $EXPECT_C0 stuck" \
-  && echo "$PERDAEMON_AFTER" | grep -qx "com.test.b $EXPECT_C1" \
+echo "$PERDAEMON_AFTER" | grep -x "com.test.a $EXPECT_C0 stuck" >/dev/null \
+  && echo "$PERDAEMON_AFTER" | grep -x "com.test.b $EXPECT_C1" >/dev/null \
   && ok "T10 both entries are written under set -e" \
   || nok "T10 entries under set -e" "perdaemon=[$PERDAEMON_AFTER]"
 
@@ -379,9 +379,9 @@ stuck_n="$(printf '%s\n' "$PERDAEMON_AFTER" | grep -c ' stuck$')"
   && ok "T14b all $PD_BIG_STUCK stuck labels are on record, flagged stuck" \
   || nok "T14b stuck records" "stuck lines=$stuck_n want $PD_BIG_STUCK"
 total_n="$(printf '%s\n' "$PERDAEMON_AFTER" | grep -c .)"
-if echo "$PERDAEMON_AFTER" | grep -qx "com.test.d0001 $EXPECT_C0 stuck" \
-   && echo "$PERDAEMON_AFTER" | grep -qx "com.test.d0100 $EXPECT_C1" \
-   && echo "$PERDAEMON_AFTER" | grep -qx "com.test.d$PD_BIG_N $EXPECT_C0" \
+if echo "$PERDAEMON_AFTER" | grep -x "com.test.d0001 $EXPECT_C0 stuck" >/dev/null \
+   && echo "$PERDAEMON_AFTER" | grep -x "com.test.d0100 $EXPECT_C1" >/dev/null \
+   && echo "$PERDAEMON_AFTER" | grep -x "com.test.d$PD_BIG_N $EXPECT_C0" >/dev/null \
    && [ "$total_n" -eq "$PD_BIG_N" ]; then
   ok "T14c no entry lost or duplicated ($total_n lines): stuck frozen at its old sha, examined-clean advanced to POST, unexamined carried forward"
 else

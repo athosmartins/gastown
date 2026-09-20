@@ -48,21 +48,21 @@ claude_block=$(awk '/^\[providers\.claude\]$/{f=1; print; next} /^\[/{f=0} f' "$
 headless_block=$(awk '/^\[providers\.claude-headless\]$/{f=1; print; next} /^\[/{f=0} f' "$CITY_TOML" | grep '^args_append' || true)
 
 echo "── 1. claude-headless carries --strict-mcp-config ──"
-if [ -n "$headless_block" ] && echo "$headless_block" | grep -q -- '--strict-mcp-config'; then
+if [ -n "$headless_block" ] && echo "$headless_block" | grep -- '--strict-mcp-config' >/dev/null; then
   ok "providers.claude-headless.args_append contains --strict-mcp-config"
 else
   bad "providers.claude-headless.args_append is missing --strict-mcp-config"
 fi
 
 echo "── 2. plain claude provider is untouched (Mayor/crews keep full MCP) ──"
-if [ -n "$claude_block" ] && echo "$claude_block" | grep -q -- '--strict-mcp-config'; then
+if [ -n "$claude_block" ] && echo "$claude_block" | grep -- '--strict-mcp-config' >/dev/null; then
   bad "providers.claude unexpectedly carries --strict-mcp-config — this would strip MCP from Mayor/crews"
 else
   ok "providers.claude has no --strict-mcp-config (Mayor/crews unaffected)"
 fi
 
 echo "── 3. no stray --mcp-config (zero servers is the intended outcome today) ──"
-if [ -n "$headless_block" ] && echo "$headless_block" | grep -q -- '--mcp-config'; then
+if [ -n "$headless_block" ] && echo "$headless_block" | grep -- '--mcp-config' >/dev/null; then
   bad "providers.claude-headless carries --mcp-config with no catalog configured for pool roles — verify this is intentional, not stray"
 else
   ok "providers.claude-headless has no --mcp-config (matches: no MCP catalog configured for pool roles today)"

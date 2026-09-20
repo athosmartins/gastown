@@ -125,7 +125,7 @@ find_direct_commit() {
       --grep="^fix bug ${id}:" \
       --format=%H 2>/dev/null); do
     subj=$(git -C "$SRC" log --format=%s -n 1 "$sha" 2>/dev/null)
-    if printf '%s\n' "$subj" | grep -Eq "^[a-z]+\(${id}\):|^fix bug ${id}:"; then
+    if printf '%s\n' "$subj" | grep -E "^[a-z]+\(${id}\):|^fix bug ${id}:" >/dev/null; then
       printf '%s\n' "$sha"
       return 0
     fi

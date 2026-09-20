@@ -84,7 +84,7 @@ V_CLEAN=$(rig_merge_has_conflict "main" "featclean")
 # conflict as clean (0 matches). This is the regression we are guarding against.
 LEG_BASE=$(git_rig merge-base featconf main 2>/dev/null)
 LEG_OUT=$(git_rig merge-tree "$LEG_BASE" main featconf 2>/dev/null || echo "")
-if echo "$LEG_OUT" | grep -q "^<<<<<<<"; then
+if echo "$LEG_OUT" | grep "^<<<<<<<" >/dev/null; then
   bad "legacy grep unexpectedly matched (env differs from prod git 2.54)"
 else
   ok "legacy grep '^<<<<<<<' misses the real conflict on this git (confirms the bug we fixed)"

@@ -153,7 +153,7 @@ _B_STATE_OK=0
 [ "$LABEL_ADD_CALLS" -eq 1 ] && [ "$LAST_LABEL_ADD_ID" = "mk-5" ] && _B_STATE_OK=1
 LAST_OUTPUT=$(marker_readback_selfheal "mk-5")
 _B_CONTENT_OK=0
-printf '%s' "$LAST_OUTPUT" | grep -q "Self-healed" && _B_CONTENT_OK=1
+printf '%s' "$LAST_OUTPUT" | grep "Self-healed" >/dev/null && _B_CONTENT_OK=1
 [ "$_B_STATE_OK" -eq 1 ] && [ "$_B_CONTENT_OK" -eq 1 ] \
   && ok "(B) label absent with siblings present -> self-heal called exactly once on mk-5 (state), confirmed via 'Self-healed' message (content)" \
   || bad "(B) expected 1 self-heal call on mk-5 + 'Self-healed' confirmation, got state_ok=$_B_STATE_OK(calls=$LABEL_ADD_CALLS id='$LAST_LABEL_ADD_ID') content_ok=$_B_CONTENT_OK output='$LAST_OUTPUT'"
@@ -166,7 +166,7 @@ _C_STATE_OK=0
 [ "$LABEL_ADD_CALLS" -eq 1 ] && _C_STATE_OK=1
 LAST_OUTPUT=$(marker_readback_selfheal "mk-6")
 _C_CONTENT_OK=0
-printf '%s' "$LAST_OUTPUT" | grep -q "unreadable" && _C_CONTENT_OK=1
+printf '%s' "$LAST_OUTPUT" | grep "unreadable" >/dev/null && _C_CONTENT_OK=1
 [ "$_C_STATE_OK" -eq 1 ] && [ "$_C_CONTENT_OK" -eq 1 ] \
   && ok "(C) unreadable readback (bd/jq failure) -> self-heal triggered anyway (state), labeled <unreadable> in the warning (content) -- third-state: act on don't-know" \
   || bad "(C) expected 1 self-heal call + <unreadable> mention, got state_ok=$_C_STATE_OK(calls=$LABEL_ADD_CALLS) content_ok=$_C_CONTENT_OK output='$LAST_OUTPUT'"
@@ -192,7 +192,7 @@ LABEL_ADD_CALLS=0; LABEL_ADD_RESULT=1
 MOCK_MARKER_LABELS=""
 LAST_OUTPUT=$(marker_readback_selfheal "mk-9")
 RC=$?
-[ "$RC" -eq 0 ] && printf '%s' "$LAST_OUTPUT" | grep -q "Self-heal FAILED" \
+[ "$RC" -eq 0 ] && printf '%s' "$LAST_OUTPUT" | grep "Self-heal FAILED" >/dev/null \
   && ok "(F) self-heal call failing -> warned via 'Self-heal FAILED', function still returns success (fail-open)" \
   || bad "(F) expected a graceful 'Self-heal FAILED' warning and rc=0, got rc=$RC output='$LAST_OUTPUT'"
 LABEL_ADD_RESULT=0
@@ -212,19 +212,19 @@ if [ -f "$GATE_DONE" ]; then
   src=$(cat "$GATE_DONE")
   step3_src=$(printf '%s\n' "$src" | awk '/^## Step 3:/{flag=1} flag; /^## Step 4:/{flag=0}')
 
-  printf '%s' "$step3_src" | grep -qF '_MARKER_LABELS=$(bd -C "$GC_CITY_PATH" show "$MARKER_ID"' \
+  printf '%s' "$step3_src" | grep -F '_MARKER_LABELS=$(bd -C "$GC_CITY_PATH" show "$MARKER_ID"' >/dev/null \
     && ok "(H1) gate-done.md Step 3 re-reads the marker's labels after creation" \
     || bad "(H1) gate-done.md Step 3 missing the marker readback (ga-ehbw5 regression)"
 
-  printf '%s' "$step3_src" | grep -qF 'case ",$_MARKER_LABELS," in' \
+  printf '%s' "$step3_src" | grep -F 'case ",$_MARKER_LABELS," in' >/dev/null \
     && ok "(H2) gate-done.md uses comma-boundary matching, not a bare substring grep" \
     || bad "(H2) gate-done.md missing the comma-boundary case match -- could false-positive on look-alike labels"
 
-  printf '%s' "$step3_src" | grep -qF 'bd -C "$GC_CITY_PATH" label add "$MARKER_ID" "gate-status:ready"' \
+  printf '%s' "$step3_src" | grep -F 'bd -C "$GC_CITY_PATH" label add "$MARKER_ID" "gate-status:ready"' >/dev/null \
     && ok "(H3) gate-done.md self-heals via bd label add on the marker in GC_CITY_PATH" \
     || bad "(H3) gate-done.md missing (or mis-scoped) the actual self-heal bd label add call"
 
-  printf '%s' "$step3_src" | grep -qF 'Self-heal FAILED' \
+  printf '%s' "$step3_src" | grep -F 'Self-heal FAILED' >/dev/null \
     && ok "(H4) gate-done.md surfaces a visible warning when the self-heal attempt itself fails (fail-open, not silent)" \
     || bad "(H4) gate-done.md missing a visible failure path for the self-heal attempt"
 

@@ -224,7 +224,7 @@ if [ -n "$HALF_TTL_DEFAULT" ]; then
   else
     bad "HALF_TTL_MINUTES default (${HALF_TTL_DEFAULT}min) is outside the sane 60-1440min band for half of a ~24h TTL"
   fi
-  if echo "$HALF_TTL_LINE" | grep -qF 'WISP_REAPER_HALF_TTL_MINUTES'; then
+  if echo "$HALF_TTL_LINE" | grep -F 'WISP_REAPER_HALF_TTL_MINUTES' >/dev/null; then
     ok "HALF_TTL_MINUTES is configurable via WISP_REAPER_HALF_TTL_MINUTES env var (matches the file's WISP_REAPER_* convention)"
   else
     bad "HALF_TTL_MINUTES is not wired to a WISP_REAPER_* env var override"

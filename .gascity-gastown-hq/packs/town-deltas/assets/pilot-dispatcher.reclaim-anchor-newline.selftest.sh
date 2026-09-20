@@ -172,7 +172,7 @@ IN3='[{"id":"ga-bad1","assignee":null,"labels":["pilot:reclaim-count:3\n"],"issu
       {"id":"ga-healthy1","assignee":null,"labels":[],"issue_type":"bug","metadata":{},'"$BASE_DESC"'}]'
 OUT3="$(run_filter "$IN3")"
 K3="$(kept_ids "$OUT3")"
-if echo "$K3" | grep -qx "ga-healthy1"; then
+if echo "$K3" | grep -x "ga-healthy1" >/dev/null; then
   ok "AC2: trailing-newline label does not crash the batch — sibling ga-healthy1 survives (kept: $(echo "$K3" | tr '\n' ' '))"
 else
   bad "AC2: sibling ga-healthy1 was collaterally wiped out — batch crashed (kept: '$K3', stderr: $(cat "$WORK/run.stderr"))"
@@ -186,7 +186,7 @@ IN4='[{"id":"ga-badheld1","assignee":null,"labels":["pilot:held","pilot:held-unt
       {"id":"ga-healthy2","assignee":null,"labels":[],"issue_type":"bug","metadata":{},'"$BASE_DESC"'}]'
 OUT4="$(run_filter "$IN4")"
 K4="$(kept_ids "$OUT4")"
-if echo "$K4" | grep -qx "ga-healthy2"; then
+if echo "$K4" | grep -x "ga-healthy2" >/dev/null; then
   ok "AC4: held-until trailing-newline label does not crash the batch — sibling ga-healthy2 survives (kept: $(echo "$K4" | tr '\n' ' '))"
 else
   bad "AC4: sibling ga-healthy2 was collaterally wiped out via held-until crash (kept: '$K4', stderr: $(cat "$WORK/run.stderr"))"
@@ -198,7 +198,7 @@ echo "Scenario 5 (AC5): _pilot_hold_or_escalate's own pilot:held-count:<slug>: s
 echo "  extraction (~L2145) does not crash on a numeric+trailing-newline suffix"
 LBL5='["pilot:held-count:test-slug:2\n"]'
 PHE_OUT5="$(run_hold_or_escalate "$LBL5")"
-echo "$PHE_OUT5" | grep -qE 'WOULD (stamp|ESCALATE)' \
+echo "$PHE_OUT5" | grep -E 'WOULD (stamp|ESCALATE)' >/dev/null \
   && ok "AC5: malformed held-count label does not abort the function — it still logs a WOULD-stamp/escalate decision ($PHE_OUT5)" \
   || bad "AC5: expected a WOULD-stamp/escalate log line, got: $PHE_OUT5"
 

@@ -363,7 +363,7 @@ fi
 #    auto-refino:escalated skip marker (bug 1). Every transition must be additive
 #    label add / label remove. (Comment lines that mention the token are ignored —
 #    grep only the non-comment lines.)
-if grep -v '^[[:space:]]*#' "$DISPATCHER" | grep -q -- '--set-labels'; then
+if grep -v '^[[:space:]]*#' "$DISPATCHER" | grep -- '--set-labels' >/dev/null; then
   bad "REGRESSION (bug 2): --set-labels present in code — it clobbers unrelated labels; use additive label add/remove"
 else
   ok "no --set-labels in code (additive label add/remove only — no label clobber)"
@@ -390,7 +390,7 @@ _heredoc_start=$(grep -n "IFS= read -r -d '' REFINE_TASK <<TASK" "$DISPATCHER" |
 _heredoc_end=$(grep -n '^TASK$' "$DISPATCHER" | head -1 | cut -d: -f1)
 if [ -n "$_heredoc_start" ] && [ -n "$_heredoc_end" ]; then
   _heredoc_body=$(sed -n "${_heredoc_start},${_heredoc_end}p" "$DISPATCHER")
-  if printf '%s' "$_heredoc_body" | grep -qE '"\$(AR_BEAD_STORE)" label (add|remove)'; then
+  if printf '%s' "$_heredoc_body" | grep -E '"\$(AR_BEAD_STORE)" label (add|remove)' >/dev/null; then
     bad "REGRESSION (ga-78tut): REFINE_TASK heredoc still contains independent 'label add'/'label remove' subcommand invocations — consolidate each transition into one 'bd update --add-label/--remove-label' call (same class as ga-xvxvf, caught by the gate)"
   else
     ok "ga-78tut: REFINE_TASK heredoc has no independent label add/remove invocations — every transition is one atomic bd update call"
@@ -451,7 +451,7 @@ fi
 # with an empty exclude set (defense for bug 3 at the deployment layer).
 PLIST="$SELF_DIR/auto-refino-dispatcher.plist"
 if grep -q 'AUTO_REFINO_EXCLUDE_LABELS' "$PLIST" 2>/dev/null \
-   && grep -A1 'AUTO_REFINO_EXCLUDE_LABELS' "$PLIST" 2>/dev/null | grep -q 'scraper'; then
+   && grep -A1 'AUTO_REFINO_EXCLUDE_LABELS' "$PLIST" 2>/dev/null | grep 'scraper' >/dev/null; then
   ok "plist pins AUTO_REFINO_EXCLUDE_LABELS incl. scraper (deployment-layer defense)"
 else
   bad "plist does not pin AUTO_REFINO_EXCLUDE_LABELS"
@@ -514,7 +514,7 @@ fi
 # story:refino-escalado must NOT be in AUTO_REFINO_LIFECYCLE_LABELS, otherwise
 # _clear_lifecycle would strip the label we just added to surface the escalation.
 if grep -q '^AUTO_REFINO_LIFECYCLE_LABELS=' "$DISPATCHER" \
-   && grep '^AUTO_REFINO_LIFECYCLE_LABELS=' "$DISPATCHER" | grep -q 'story:refino-escalado'; then
+   && grep '^AUTO_REFINO_LIFECYCLE_LABELS=' "$DISPATCHER" | grep 'story:refino-escalado' >/dev/null; then
   bad "story:refino-escalado is in AUTO_REFINO_LIFECYCLE_LABELS — _clear_lifecycle would strip the escalation label"
 else
   ok "story:refino-escalado is NOT in AUTO_REFINO_LIFECYCLE_LABELS (survives _clear_lifecycle)"
@@ -551,7 +551,7 @@ fi
 # _clear_lifecycle (called earlier in the same escalate case) would strip it
 # right back off before it ever reached Dolt.
 if grep -q '^AUTO_REFINO_LIFECYCLE_LABELS=' "$DISPATCHER" \
-   && grep '^AUTO_REFINO_LIFECYCLE_LABELS=' "$DISPATCHER" | grep -q 'story:needs-human'; then
+   && grep '^AUTO_REFINO_LIFECYCLE_LABELS=' "$DISPATCHER" | grep 'story:needs-human' >/dev/null; then
   bad "story:needs-human is in AUTO_REFINO_LIFECYCLE_LABELS — _clear_lifecycle would strip the label this fix just added"
 else
   ok "story:needs-human is NOT in AUTO_REFINO_LIFECYCLE_LABELS (survives _clear_lifecycle)"
@@ -611,7 +611,7 @@ AUTO_REFINO_CITY_OVERRIDE="$_drycity" AUTO_REFINO_STORES="$_drycity" DRY_RUN=1 \
   bash "$DISPATCHER" >/dev/null 2>&1
 _dryrc=$?
 _drylog=$(cat "$_drycity/.gc/logs/auto-refino-dispatcher.log" 2>/dev/null || echo "")
-if [ "$_dryrc" -eq 0 ] && echo "$_drylog" | grep -qiE 'Auto-refino sweep start.*dry_run=1'; then
+if [ "$_dryrc" -eq 0 ] && echo "$_drylog" | grep -iE 'Auto-refino sweep start.*dry_run=1' >/dev/null; then
   ok "DRY_RUN executes the sweep harness cleanly (exit 0, proof mode, no spawn)"
 else
   bad "DRY_RUN did not run cleanly in proof mode (rc=$_dryrc)"
@@ -634,7 +634,7 @@ if grep -q '🚨' "$DISPATCHER"; then
 else
   bad "ga-fnnyy: REFINE_TASK heredoc has no mention of the 🚨 marker — nothing tells the refiner to preserve it"
 fi
-if printf '%s' "$_flat_task" | grep -qiF 'must not let --description silently drop it'; then
+if printf '%s' "$_flat_task" | grep -iF 'must not let --description silently drop it' >/dev/null; then
   ok "ga-fnnyy: REFINE_TASK heredoc has an explicit preserve-verbatim instruction for 🚨 blocks"
 else
   bad "ga-fnnyy: REFINE_TASK heredoc does not explicitly instruct verbatim preservation of 🚨 blocks"
@@ -648,7 +648,7 @@ else
   bad "ga-fnnyy: REFINE_TASK heredoc does not show needs-human + pilot:no-auto-dispatch as commands to run"
 fi
 _rules_block=$(awk '/^RULES:/{f=1} f{print}' "$DISPATCHER")
-if printf '%s' "$_rules_block" | grep -q '🚨'; then
+if printf '%s' "$_rules_block" | grep '🚨' >/dev/null; then
   ok "ga-fnnyy: RULES section (final checklist read by the refiner) restates the 🚨 rule"
 else
   bad "ga-fnnyy: RULES section does not restate the 🚨 rule — easy to miss on a long prompt"
@@ -737,7 +737,7 @@ _dup_no_block=""
 ) > "$_dc9city/s9a.out" 2>/dev/null
 
 _s9a=$(cat "$_dc9city/s9a.out" 2>/dev/null || echo "")
-if echo "$_s9a" | grep -q "^BLOCKED:ga-twin-closed"; then
+if echo "$_s9a" | grep "^BLOCKED:ga-twin-closed" >/dev/null; then
   ok "9a: refined story with closed twin → handoff BLOCKED (twin=ga-twin-closed detected)"
 else
   bad "9a: refined story with closed twin → expected BLOCKED, got: $_s9a"
@@ -851,7 +851,7 @@ fi
 ) > "$_dc9city/s9c.out" 2>/dev/null
 
 _s9c=$(cat "$_dc9city/s9c.out" 2>/dev/null || echo "")
-if echo "$_s9c" | grep -q "^BLOCKED:ga-twin-gatepassed"; then
+if echo "$_s9c" | grep "^BLOCKED:ga-twin-gatepassed" >/dev/null; then
   ok "9c: twin with gate:passed label (even if status=open) → BLOCKED"
 else
   bad "9c: gate:passed twin should block — got: $_s9c"
@@ -936,12 +936,12 @@ fi
 # auto-refino:escalated check (line ~429, English-only) never recognized —
 # defeating DUP-BLOCKED's own re-ingestion-loop protection.
 _dupblock=$(awk '/if \[ -n "\$_dup_twin" \]/{f=1} f{print} /No delivered twin/{exit}' "$DISPATCHER")
-if printf '%s' "$_dupblock" | grep -q 'refino:info-gap' && printf '%s' "$_dupblock" | grep -q 'auto-refino:escalated'; then
+if printf '%s' "$_dupblock" | grep 'refino:info-gap' >/dev/null && printf '%s' "$_dupblock" | grep 'auto-refino:escalated' >/dev/null; then
   ok "dup-block sets refino:info-gap + auto-refino:escalated labels (ga-64u1b: fixed from the 'escalado' typo)"
 else
   bad "dup-block does not set the expected revert labels (refino:info-gap + auto-refino:escalated)"
 fi
-if printf '%s' "$_dupblock" | grep -q 'auto-refino:escalado\b'; then
+if printf '%s' "$_dupblock" | grep 'auto-refino:escalado\b' >/dev/null; then
   bad "ga-64u1b: dup-block still carries the auto-refino:escalado (Portuguese) typo — defeats the escalated-marker classifier check, re-ingestion loop reproduces"
 else
   ok "ga-64u1b: dup-block does not carry the auto-refino:escalado typo"
@@ -1152,7 +1152,7 @@ _patha_block=$(awk '/^\[PATH A/{f=1} /^\[PATH B/{f=0} f{print}' "$DISPATCHER")
 # ga-78tut: PATH A's label writes now ship as one atomic
 # `bd update --add-label ... --remove-label ...` call rather than independent
 # `label add`/`label remove` invocations — match either shape.
-if printf '%s' "$_patha_block" | grep -qE 'label add "\$STORY_ID" "auto-refino:escalated"|--add-label "auto-refino:escalated"'; then
+if printf '%s' "$_patha_block" | grep -E 'label add "\$STORY_ID" "auto-refino:escalated"|--add-label "auto-refino:escalated"' >/dev/null; then
   ok "ga-64u1b: PATH A (INFO-GAP) heredoc adds auto-refino:escalated (re-ingestion loop killed)"
 else
   bad "ga-64u1b: PATH A (INFO-GAP) heredoc does NOT add auto-refino:escalated — re-ingestion loop reproduces"
@@ -1234,8 +1234,8 @@ AUTO_REFINO_CITY_OVERRIDE="$_ms_a" AUTO_REFINO_STORES="$_ms_a $_ms_b" DRY_RUN=1 
 _msrc=$?
 _mslog=$(cat "$_ms_a/.gc/logs/auto-refino-dispatcher.log" 2>/dev/null || echo "")
 if [ "$_msrc" -eq 0 ] \
-   && echo "$_mslog" | grep -q "candidate store: $_ms_a" \
-   && echo "$_mslog" | grep -q "candidate store: $_ms_b"; then
+   && echo "$_mslog" | grep "candidate store: $_ms_a" >/dev/null \
+   && echo "$_mslog" | grep "candidate store: $_ms_b" >/dev/null; then
   ok "DRY_RUN sweep iterates every store (both temp stores visited)"
 else
   bad "DRY_RUN sweep did not visit all stores (rc=$_msrc; multi-store loop broken)"
@@ -1287,8 +1287,8 @@ TMPDIR="$_lktmp" AUTO_REFINO_CITY_OVERRIDE="$_lkcity" AUTO_REFINO_STORES="$_lkci
 _lkrc=$?
 _lklog=$(cat "$_lkcity/.gc/logs/auto-refino-dispatcher.log" 2>/dev/null || echo "")
 if [ "$_lkrc" -eq 0 ] \
-   && echo "$_lklog" | grep -qiF 'backing off (single-instance guard' \
-   && ! echo "$_lklog" | grep -qiE 'Auto-refino sweep start'; then
+   && echo "$_lklog" | grep -iF 'backing off (single-instance guard' >/dev/null \
+   && ! echo "$_lklog" | grep -iE 'Auto-refino sweep start' >/dev/null; then
   ok "(C) second concurrent sweep BACKS OFF on a fresh lock (no second refiner; cap protected)"
 else
   bad "(C) second sweep did not back off on a held lock (rc=$_lkrc) — 5-vs-3 stacking not prevented"
@@ -1314,8 +1314,8 @@ TMPDIR="$_sktmp" AUTO_REFINO_CITY_OVERRIDE="$_skcity" AUTO_REFINO_STORES="$_skci
 _skrc=$?
 _sklog=$(cat "$_skcity/.gc/logs/auto-refino-dispatcher.log" 2>/dev/null || echo "")
 if [ "$_skrc" -eq 0 ] \
-   && echo "$_sklog" | grep -qiF 'Recovered STALE auto-refino lock' \
-   && echo "$_sklog" | grep -qiE 'Auto-refino sweep start'; then
+   && echo "$_sklog" | grep -iF 'Recovered STALE auto-refino lock' >/dev/null \
+   && echo "$_sklog" | grep -iE 'Auto-refino sweep start' >/dev/null; then
   ok "(C) STALE lock RECLAIMED — sweep takes over and proceeds (crashed sweep can't wedge refino)"
 else
   bad "(C) stale lock not reclaimed (rc=$_skrc) — a dead holder would wedge the funnel"
@@ -1333,8 +1333,8 @@ TMPDIR="$_kstmp" AUTO_REFINO_CITY_OVERRIDE="$_kscity" AUTO_REFINO_STORES="$_ksci
   PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
   bash "$DISPATCHER" >/dev/null 2>&1
 _kslog=$(cat "$_kscity/.gc/logs/auto-refino-dispatcher.log" 2>/dev/null || echo "")
-if echo "$_kslog" | grep -qiE 'Auto-refino sweep start' \
-   && ! echo "$_kslog" | grep -qiF 'backing off (single-instance guard'; then
+if echo "$_kslog" | grep -iE 'Auto-refino sweep start' >/dev/null \
+   && ! echo "$_kslog" | grep -iF 'backing off (single-instance guard' >/dev/null; then
   ok "(C) AUTO_REFINO_LOCK=0 bypasses the guard (sweep runs despite a held lock — prior behaviour)"
 else
   bad "(C) kill-switch did not bypass the lock"
@@ -1432,8 +1432,8 @@ AUTO_REFINO_CITY_OVERRIDE="$_ydcity" AUTO_REFINO_STORES="$_ydcity" DRY_RUN=1 \
 _ydrc=$?
 _ydlog=$(cat "$_ydcity/.gc/logs/auto-refino-dispatcher.log" 2>/dev/null || echo "")
 if [ "$_ydrc" -eq 0 ] \
-   && echo "$_ydlog" | grep -qiF 'sweep deferred (cross-stage yield' \
-   && ! echo "$_ydlog" | grep -qiF 'candidate store:'; then
+   && echo "$_ydlog" | grep -iF 'sweep deferred (cross-stage yield' >/dev/null \
+   && ! echo "$_ydlog" | grep -iF 'candidate store:' >/dev/null; then
   ok "(B) DEFERS when gate-congested + quota-limited (no candidate gather, mutated nothing)"
 else
   bad "(B) did not defer under gate-congested + quota-limited (rc=$_ydrc)"
@@ -1449,7 +1449,7 @@ AUTO_REFINO_CITY_OVERRIDE="$_ypcity" AUTO_REFINO_STORES="$_ypcity" DRY_RUN=1 \
   PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
   bash "$DISPATCHER" >/dev/null 2>&1
 _yplog=$(cat "$_ypcity/.gc/logs/auto-refino-dispatcher.log" 2>/dev/null || echo "")
-if echo "$_yplog" | grep -qiF 'sweep deferred (cross-stage yield'; then
+if echo "$_yplog" | grep -iF 'sweep deferred (cross-stage yield' >/dev/null; then
   ok "(B) DEFERS when Pilot has approved work + Dolt hot (pilot disjunct works)"
 else
   bad "(B) did not defer under pilot-has-work + Dolt hot"
@@ -1468,8 +1468,8 @@ AUTO_REFINO_CITY_OVERRIDE="$_yfcity" AUTO_REFINO_STORES="$_yfcity" DRY_RUN=1 \
 _yfrc=$?
 _yflog=$(cat "$_yfcity/.gc/logs/auto-refino-dispatcher.log" 2>/dev/null || echo "")
 if [ "$_yfrc" -eq 0 ] \
-   && ! echo "$_yflog" | grep -qiF 'sweep deferred (cross-stage yield' \
-   && echo "$_yflog" | grep -qiF 'candidate store:'; then
+   && ! echo "$_yflog" | grep -iF 'sweep deferred (cross-stage yield' >/dev/null \
+   && echo "$_yflog" | grep -iF 'candidate store:' >/dev/null; then
   ok "(B) ANTI-STARVATION: resources FREE (quota OK + Dolt calm) → does NOT defer, refines (even w/ busy gate)"
 else
   bad "(B) deferred when resources were free — anti-starvation violated (rc=$_yfrc)"
@@ -1487,7 +1487,7 @@ AUTO_REFINO_CITY_OVERRIDE="$_fecity" AUTO_REFINO_STORES="$_fecity" DRY_RUN=1 \
   bash "$DISPATCHER" >/dev/null 2>&1
 _ferc=$?
 _felog=$(cat "$_fecity/.gc/logs/auto-refino-dispatcher.log" 2>/dev/null || echo "")
-if [ "$_ferc" -eq 0 ] && ! echo "$_felog" | grep -qiF 'sweep deferred (cross-stage yield'; then
+if [ "$_ferc" -eq 0 ] && ! echo "$_felog" | grep -iF 'sweep deferred (cross-stage yield' >/dev/null; then
   ok "(B) FAIL-OPEN: blind Dolt probe → not-hot; quota OK ⇒ no defer (funnel never wedged)"
 else
   bad "(B) blind probe wedged the sweep / deferred without contention (rc=$_ferc)"
@@ -1502,7 +1502,7 @@ AUTO_REFINO_CITY_OVERRIDE="$_ykcity" AUTO_REFINO_STORES="$_ykcity" DRY_RUN=1 \
   PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
   bash "$DISPATCHER" >/dev/null 2>&1
 _yklog=$(cat "$_ykcity/.gc/logs/auto-refino-dispatcher.log" 2>/dev/null || echo "")
-if ! echo "$_yklog" | grep -qiF 'sweep deferred (cross-stage yield'; then
+if ! echo "$_yklog" | grep -iF 'sweep deferred (cross-stage yield' >/dev/null; then
   ok "(B) AUTO_REFINO_YIELD=0 bypasses the yield gate (prior behaviour)"
 else
   bad "(B) kill-switch did not bypass the yield gate"
@@ -1778,7 +1778,7 @@ fi
 #      deliberately DOES both, so a whole-file grep would false-pass by
 #      matching the WRONG branch.
 _split_branch=$(awk '/^  split\)$/{flag=1} flag{print} /^  requeue\|\*\)$/{if(flag)exit}' "$DISPATCHER")
-if [ -n "$_split_branch" ] && printf '%s' "$_split_branch" | grep -qF 'outcome SPLIT registrado'; then
+if [ -n "$_split_branch" ] && printf '%s' "$_split_branch" | grep -F 'outcome SPLIT registrado' >/dev/null; then
   ok "19c. Step 7 split branch is present"
 else
   bad "19c. Step 7 split branch missing or unrecognizable"
@@ -1787,12 +1787,12 @@ fi
 # bare substring — the branch's own explanatory comments and audit-comment
 # string legitimately discuss "--type" in prose (documenting that it does
 # NOT touch it), and a naive substring match on those is a false positive.
-if printf '%s' "$_split_branch" | grep -qF 'update "$STORY_ID" --type'; then
+if printf '%s' "$_split_branch" | grep -F 'update "$STORY_ID" --type' >/dev/null; then
   bad "19c. split branch touches --type — would revert the refiner's own epic conversion (ga-9mfnw)"
 else
   ok "19c. split branch does NOT touch --type (epic conversion preserved)"
 fi
-if printf '%s' "$_split_branch" | grep -qF 'mail send mayor'; then
+if printf '%s' "$_split_branch" | grep -F 'mail send mayor' >/dev/null; then
   bad "19c. split branch mails Mayor — re-pages a decision already made and executed (ga-9mfnw)"
 else
   ok "19c. split branch does NOT mail Mayor (decision already made and executed)"

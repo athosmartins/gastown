@@ -388,27 +388,27 @@ rm -f "$GA8A9N_ERR"
 # ── (G) source drift-guards against deployed gate-done.md ─────────────────────
 if [ -f "$GATE_DONE" ]; then
   src=$(cat "$GATE_DONE")
-  printf '%s' "$src" | grep -qF '.path as $p' \
+  printf '%s' "$src" | grep -F '.path as $p' >/dev/null \
     && ok "(G1) gate-done.md binds .path to a local var before the pipe (ga-8a9n jq-context fix)" \
     || bad "(G1) gate-done.md missing '.path as \$p' binding — ga-8a9n jq-context-corruption regression"
-  printf '%s' "$src" | grep -qF 'startswith($p + "/")' \
+  printf '%s' "$src" | grep -F 'startswith($p + "/")' >/dev/null \
     && ok "(G1b) gate-done.md uses ANCESTOR-path rig matching via the bound var" \
     || bad "(G1b) gate-done.md missing ancestor-path rig matching (startswith(\$p + \"/\"))"
-  printf '%s' "$src" | grep -qE 'crew/\*/\*\)' \
+  printf '%s' "$src" | grep -E 'crew/\*/\*\)' >/dev/null \
     && ok "(G2) gate-done.md handles crew/<name>/<bead> branches" \
     || bad "(G2) gate-done.md missing crew/*/* branch handling"
-  printf '%s' "$src" | grep -q 'bead_rig:' \
+  printf '%s' "$src" | grep 'bead_rig:' >/dev/null \
     && ok "(G3) gate-done.md records bead_rig (owning store) in the marker" \
     || bad "(G3) gate-done.md missing bead_rig recording"
   # The raw-agent-name leak MUST be gone from LIVE code: `RIG="${GC_AGENT%%/*}"`
   # wrote rig=<agent>. Strip comment lines first — the fix QUOTES the old form in an
   # explanatory comment, which is documentation, not a live code path.
-  if printf '%s' "$src" | grep -vE '^[[:space:]]*#' | grep -qE 'RIG="\$\{GC_AGENT%%/\*\}"'; then
+  if printf '%s' "$src" | grep -vE '^[[:space:]]*#' | grep -E 'RIG="\$\{GC_AGENT%%/\*\}"' >/dev/null; then
     bad "(G4) gate-done.md STILL has a live \${GC_AGENT%%/*} → RIG assignment (the bug)"
   else
     ok "(G4) gate-done.md no longer leaks the raw agent name into RIG (live code)"
   fi
-  printf '%s' "$src" | grep -q '_BEAD_ID_RESOLVED' \
+  printf '%s' "$src" | grep '_BEAD_ID_RESOLVED' >/dev/null \
     && ok "(G5) gate-done.md validates bead_id existence before trusting the regex match (ga-u4yi)" \
     || bad "(G5) gate-done.md missing ga-u4yi bead_id existence validation"
 else
@@ -671,10 +671,10 @@ B=$(extract_bead_from_branch "crew/thies/demand-mobile-phase2")
 #    dotted suffix and performs the identity check, not just existence.
 if [ -f "$GATE_DONE" ]; then
   src=$(cat "$GATE_DONE")
-  printf '%s' "$src" | grep -qF '(\.[0-9]+)?' \
+  printf '%s' "$src" | grep -F '(\.[0-9]+)?' >/dev/null \
     && ok "(L1) gate-done.md crew regex captures the optional dotted sub-bead suffix" \
     || bad "(L1) gate-done.md missing the dotted sub-bead suffix capture group (ga-pkvfc regression)"
-  printf '%s' "$src" | grep -qF '"$BEAD_ID"|"$BEAD_ID"-*' \
+  printf '%s' "$src" | grep -F '"$BEAD_ID"|"$BEAD_ID"-*' >/dev/null \
     && ok "(L2) gate-done.md performs the identity/boundary check (segment == BEAD_ID or BEAD_ID-desc)" \
     || bad "(L2) gate-done.md missing the ga-pkvfc identity check (existence-check-only regression)"
 else
@@ -774,10 +774,10 @@ if [ -f "$GATE_DONE" ]; then
   # Isolate Step 3's block so this cannot be satisfied by Step 2's UNRELATED
   # BEAD_ID fail-closed guard earlier in the same file.
   step3_src=$(printf '%s\n' "$src" | awk '/^## Step 3:/{flag=1} flag; /^## Step 4:/{flag=0}')
-  printf '%s' "$step3_src" | grep -qE '\[ -z "\$BRANCH" \]' \
+  printf '%s' "$step3_src" | grep -E '\[ -z "\$BRANCH" \]' >/dev/null \
     && ok "(N1) gate-done.md Step 3 checks for blank BRANCH before creating the marker" \
     || bad "(N1) gate-done.md Step 3 missing a blank-BRANCH check (ga-kkwsa regression)"
-  printf '%s' "$step3_src" | grep -qE '\[ -z "\$BEAD_ID" \]' \
+  printf '%s' "$step3_src" | grep -E '\[ -z "\$BEAD_ID" \]' >/dev/null \
     && ok "(N2) gate-done.md Step 3 checks for blank BEAD_ID before creating the marker" \
     || bad "(N2) gate-done.md Step 3 missing a blank-BEAD_ID check (ga-kkwsa regression)"
   # The guard must appear BEFORE the `bd ... create` call within Step 3, not
@@ -807,10 +807,10 @@ fi
 # before submitting — so it never reached the WRITE side at all.
 if [ -f "$GATE_DONE" ]; then
   src=$(cat "$GATE_DONE")
-  printf '%s' "$src" | grep -qF 'Pre-flight Self-Audit: THE THIRD STATE' \
+  printf '%s' "$src" | grep -F 'Pre-flight Self-Audit: THE THIRD STATE' >/dev/null \
     && ok "(O1) gate-done.md has a mandatory Pre-flight Self-Audit section" \
     || bad "(O1) gate-done.md missing the Pre-flight Self-Audit section (ga-ogvyk regression)"
-  printf '%s' "$src" | grep -qF 'root-class:error-vs-empty' \
+  printf '%s' "$src" | grep -F 'root-class:error-vs-empty' >/dev/null \
     && ok "(O2) gate-done.md's self-audit cites the same taxonomy reviewers use (root-class:error-vs-empty)" \
     || bad "(O2) gate-done.md self-audit missing the root-class:error-vs-empty cross-reference"
 
@@ -829,7 +829,7 @@ if [ -f "$GATE_DONE" ]; then
   # prose — a check that leaves no trace can't be measured later, which is
   # exactly the failure mode ga-ogvyk's acceptance criteria warns about.
   step3_src=$(printf '%s\n' "$src" | awk '/^## Step 3:/{flag=1} flag; /^## Step 4:/{flag=0}')
-  printf '%s' "$step3_src" | grep -qF 'self_audit: $SELF_AUDIT_SUMMARY' \
+  printf '%s' "$step3_src" | grep -F 'self_audit: $SELF_AUDIT_SUMMARY' >/dev/null \
     && ok "(O4) gate-done.md Step 3 records self_audit in the marker description" \
     || bad "(O4) gate-done.md Step 3 missing the self_audit: field (ga-ogvyk regression)"
 
@@ -843,10 +843,10 @@ if [ -f "$GATE_DONE" ]; then
   # ("presence is the BAD outcome") is exactly the kind of collapsed-boolean
   # shape this whole section exists to catch, so the check for it should not
   # itself read ambiguously.
-  printf '%s' "$step3_src" | grep -qF 'SELF_AUDIT_SUMMARY:-' \
+  printf '%s' "$step3_src" | grep -F 'SELF_AUDIT_SUMMARY:-' >/dev/null \
     && ok "(O5a) gate-done.md Step 3 defaults SELF_AUDIT_SUMMARY when unset (fail-open)" \
     || bad "(O5a) gate-done.md Step 3 missing the SELF_AUDIT_SUMMARY fallback default"
-  if printf '%s' "$step3_src" | grep -qE '\[ -z "\$SELF_AUDIT_SUMMARY" \]'; then
+  if printf '%s' "$step3_src" | grep -E '\[ -z "\$SELF_AUDIT_SUMMARY" \]' >/dev/null; then
     bad "(O5b) gate-done.md Step 3 hard-blocks on blank SELF_AUDIT_SUMMARY — must stay fail-open (ga-ogvyk: judgment sweep, not a lint)"
   else
     ok "(O5b) gate-done.md Step 3 does not hard-block on SELF_AUDIT_SUMMARY (correctly fail-open)"
@@ -953,13 +953,13 @@ R=$(apply_ljbx_pin "fix/ga-c1yqp-panel-canonical-state" "/Users/athos/gt/whatsap
 #    alone.
 if [ -f "$GATE_DONE" ]; then
   src=$(cat "$GATE_DONE")
-  printf '%s' "$src" | grep -qF 'CWD_PHYSICAL=$(pwd -P' \
+  printf '%s' "$src" | grep -F 'CWD_PHYSICAL=$(pwd -P' >/dev/null \
     && ok "(Q1) gate-done.md computes CWD_PHYSICAL via pwd -P for the ga-ljbx pin" \
     || bad "(Q1) gate-done.md missing CWD_PHYSICAL computation (ga-3dhdg regression)"
-  printf '%s' "$src" | grep -qF '"$GC_CITY_PATH"|"$GC_CITY_PATH"/*)' \
+  printf '%s' "$src" | grep -F '"$GC_CITY_PATH"|"$GC_CITY_PATH"/*)' >/dev/null \
     && ok "(Q2) gate-done.md's ga-ljbx pin gates on CWD_PHYSICAL being inside \$GC_CITY_PATH, not branch text alone" \
     || bad "(Q2) gate-done.md's ga-ljbx pin missing the GC_CITY_PATH containment gate (ga-3dhdg regression)"
-  printf '%s' "$src" | grep -qF -- '-n "$GC_CITY_PATH"' \
+  printf '%s' "$src" | grep -F -- '-n "$GC_CITY_PATH"' >/dev/null \
     && ok "(Q3) gate-done.md guards the ga-ljbx pin against an empty \$GC_CITY_PATH (no glob-collapse false-positive)" \
     || bad "(Q3) gate-done.md's ga-ljbx pin missing the empty-GC_CITY_PATH guard (P6 regression)"
 else
@@ -1073,10 +1073,10 @@ R=$(derive_rig_prebug "/Users/athos/gt" "wa-sowus" "mayor")
 #    around it after the fact).
 if [ -f "$GATE_DONE" ]; then
   src=$(cat "$GATE_DONE")
-  printf '%s' "$src" | grep -qF 'ga-6mir5 PRIMARY-continued' \
+  printf '%s' "$src" | grep -F 'ga-6mir5 PRIMARY-continued' >/dev/null \
     && ok "(S1) gate-done.md has the ga-6mir5 PRIMARY-continued reverse-containment check" \
     || bad "(S1) gate-done.md missing the ga-6mir5 fix (regression)"
-  printf '%s' "$src" | grep -qF '"$GC_CITY_PATH" in' \
+  printf '%s' "$src" | grep -F '"$GC_CITY_PATH" in' >/dev/null \
     && ok "(S2) gate-done.md's new check tests containment against \$GC_CITY_PATH" \
     || bad "(S2) gate-done.md's ga-6mir5 check missing the \$GC_CITY_PATH case pattern"
   new_check_line=$(printf '%s\n' "$src" | grep -nF 'ga-6mir5 PRIMARY-continued' | head -1 | cut -d: -f1)
@@ -1250,13 +1250,13 @@ B=$(resolve_bead_id_from_branch "crew/ps-worker/ps-8iuu.4")
 #    ga-u4yi existence check (not replacing it).
 if [ -f "$GATE_DONE" ]; then
   src=$(cat "$GATE_DONE")
-  printf '%s' "$src" | grep -qF 'ga-3xuanq' \
+  printf '%s' "$src" | grep -F 'ga-3xuanq' >/dev/null \
     && ok "(U1) gate-done.md references the ga-3xuanq fix" \
     || bad "(U1) gate-done.md missing the ga-3xuanq fix marker (regression)"
-  printf '%s' "$src" | grep -qF '_BRANCH_SEG=""' \
+  printf '%s' "$src" | grep -F '_BRANCH_SEG=""' >/dev/null \
     && ok "(U2) gate-done.md initializes _BRANCH_SEG before the branch-convention case" \
     || bad "(U2) gate-done.md missing _BRANCH_SEG initialization (ga-3xuanq regression)"
-  printf '%s' "$src" | grep -qF '_RESOLVED_FULL_ID=' \
+  printf '%s' "$src" | grep -F '_RESOLVED_FULL_ID=' >/dev/null \
     && ok "(U3) gate-done.md queries the resolving store for the bead's own full id" \
     || bad "(U3) gate-done.md missing the _RESOLVED_FULL_ID exact-identity lookup (ga-3xuanq regression)"
   # The upgrade must run AFTER the ga-u4yi existence check succeeds, not
@@ -1417,10 +1417,10 @@ B=$(resolve_identity_probe_prebug fail_garbled "wa-campanha" "wa-campanha-diaria
 #    THIS fix are checked.
 if [ -f "$GATE_DONE" ]; then
   src=$(cat "$GATE_DONE")
-  printf '%s' "$src" | grep -qF '_BEAD_ID_JSON_RC' \
+  printf '%s' "$src" | grep -F '_BEAD_ID_JSON_RC' >/dev/null \
     && ok "(W1) gate-done.md captures bd's own exit status separately from jq's parse" \
     || bad "(W1) gate-done.md missing _BEAD_ID_JSON_RC (gate-feedback ga-3xuanq attempt 1 regression)"
-  printf '%s' "$src" | grep -qF '_RESOLVED_FULL_ID_KNOWN' \
+  printf '%s' "$src" | grep -F '_RESOLVED_FULL_ID_KNOWN' >/dev/null \
     && ok "(W2) gate-done.md tracks whether the identity probe positively resolved" \
     || bad "(W2) gate-done.md missing _RESOLVED_FULL_ID_KNOWN (gate-feedback ga-3xuanq attempt 1 regression)"
   known_line=$(printf '%s\n' "$src" | grep -nF '_RESOLVED_FULL_ID_KNOWN=1' | head -1 | cut -d: -f1)
@@ -1486,14 +1486,14 @@ B=$(resolve_bead_id_from_branch "fix/wa-27jn")
 # carries the '(-|$)' alternation, not just a literal trailing '-'.
 if [ -f "$GATE_DONE" ]; then
   src=$(cat "$GATE_DONE")
-  printf '%s' "$src" | grep -qF 'ga-ghnff9' \
+  printf '%s' "$src" | grep -F 'ga-ghnff9' >/dev/null \
     && ok "(X6a) gate-done.md references the ga-ghnff9 fix" \
     || bad "(X6a) gate-done.md missing the ga-ghnff9 fix marker (regression)"
   # ga-stmh8 legitimately inserted '(\.[0-9]+)?' between the char class and
   # this alternation (see (Z7b) below), so this no longer requires exact
   # adjacency to the char class — just that the alternation itself survives
   # somewhere in the generic-case pattern.
-  printf '%s' "$src" | grep -qF '(-|$)' \
+  printf '%s' "$src" | grep -F '(-|$)' >/dev/null \
     && ok "(X6b) gate-done.md's generic-case regex accepts end-of-string as an alternative to a trailing '-'" \
     || bad "(X6b) gate-done.md's generic-case regex missing the '(-|\$)' alternation (ga-ghnff9 regression)"
 else
@@ -1628,13 +1628,13 @@ R=$(apply_ljbx_pin "fix/wa-xd0zg-rebase" \
 # the worktree's own git origin before pinning to gascity.
 if [ -f "$GATE_DONE" ]; then
   src=$(cat "$GATE_DONE")
-  printf '%s' "$src" | grep -qF 'ga-5nshv' \
+  printf '%s' "$src" | grep -F 'ga-5nshv' >/dev/null \
     && ok "(Y6a) gate-done.md references the ga-5nshv fix" \
     || bad "(Y6a) gate-done.md missing the ga-5nshv fix marker (regression)"
-  printf '%s' "$src" | grep -qF 'git -C "$CWD_TOP" remote get-url origin' \
+  printf '%s' "$src" | grep -F 'git -C "$CWD_TOP" remote get-url origin' >/dev/null \
     && ok "(Y6b) gate-done.md's ga-ljbx pin checks the worktree's own git origin before pinning" \
     || bad "(Y6b) gate-done.md missing the origin-URL check (ga-5nshv regression)"
-  printf '%s' "$src" | grep -qF '_ORIGIN_MATCH_COUNT" -eq 1' \
+  printf '%s' "$src" | grep -F '_ORIGIN_MATCH_COUNT" -eq 1' >/dev/null \
     && ok "(Y6c) gate-done.md only trusts an UNAMBIGUOUS (single) origin match, never a guess among several" \
     || bad "(Y6c) gate-done.md missing the single-match-only guard (would misresolve the gascity/gastown/deacon collision)"
   # The origin check must run BEFORE the unconditional pin, not after — an
@@ -1714,10 +1714,10 @@ B=$(extract_bead_from_branch "crew/ps-worker/ps-8iuu.4")
 # carries the dotted sub-bead capture group, not just the crew arm.
 if [ -f "$GATE_DONE" ]; then
   src=$(cat "$GATE_DONE")
-  printf '%s' "$src" | grep -qF 'ga-stmh8' \
+  printf '%s' "$src" | grep -F 'ga-stmh8' >/dev/null \
     && ok "(Z7a) gate-done.md references the ga-stmh8 fix" \
     || bad "(Z7a) gate-done.md missing the ga-stmh8 fix marker (regression)"
-  printf '%s' "$src" | grep -qF '[a-z]{2,8}-[a-z0-9]{2,8}(\.[0-9]+)?(-|$)' \
+  printf '%s' "$src" | grep -F '[a-z]{2,8}-[a-z0-9]{2,8}(\.[0-9]+)?(-|$)' >/dev/null \
     && ok "(Z7b) gate-done.md's generic-case regex captures the optional dotted sub-bead suffix" \
     || bad "(Z7b) gate-done.md's generic-case regex missing the dotted sub-bead capture group (ga-stmh8 regression)"
 else
@@ -1773,10 +1773,10 @@ R=$(derive_rig "/tmp/detached-checkout" "wa-27jn" "" "$GC_CITY_PATH_STUB" "whats
 # prefers _BEAD_HOME_RIG over the blind prefix match.
 if [ -f "$GATE_DONE" ]; then
   src=$(cat "$GATE_DONE")
-  printf '%s' "$src" | grep -qF 'ga-x7asi' \
+  printf '%s' "$src" | grep -F 'ga-x7asi' >/dev/null \
     && ok "(AA5a) gate-done.md references the ga-x7asi fix" \
     || bad "(AA5a) gate-done.md missing the ga-x7asi fix marker (regression)"
-  printf '%s' "$src" | grep -qF 'RIG="$_BEAD_HOME_RIG"' \
+  printf '%s' "$src" | grep -F 'RIG="$_BEAD_HOME_RIG"' >/dev/null \
     && ok "(AA5b) gate-done.md's FALLBACK 1 assigns RIG from _BEAD_HOME_RIG" \
     || bad "(AA5b) gate-done.md's FALLBACK 1 no longer assigns RIG from _BEAD_HOME_RIG (ga-x7asi regression)"
 else

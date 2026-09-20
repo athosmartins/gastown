@@ -150,19 +150,19 @@ OUT="$(run_pipeline "$FIXTURES" "_filter_exec_manual | _filter_candidates")"
 KEPT="$(ids_of "$OUT")"
 echo "  kept: $KEPT"
 
-echo "$KEPT" | grep -q '"tt-bug-normal"' \
+echo "$KEPT" | grep '"tt-bug-normal"' >/dev/null \
   && ok "tt-bug-normal survives (control)" \
   || bad "tt-bug-normal was dropped — fix over-blocks ordinary Tier-1 bugs (kept=$KEPT)"
 
-echo "$KEPT" | grep -q '"tt-bug-execmanual"' \
+echo "$KEPT" | grep '"tt-bug-execmanual"' >/dev/null \
   && bad "REGRESSION: tt-bug-execmanual survived (Gap A: exec:manual not respected) (kept=$KEPT)" \
   || ok "tt-bug-execmanual dropped (Gap A closed)"
 
-echo "$KEPT" | grep -q '"tt-bug-deferred"' \
+echo "$KEPT" | grep '"tt-bug-deferred"' >/dev/null \
   && bad "REGRESSION: tt-bug-deferred survived (Gap B: future defer_until not respected) (kept=$KEPT)" \
   || ok "tt-bug-deferred dropped (Gap B closed)"
 
-echo "$KEPT" | grep -q '"tt-bug-deferred-past"' \
+echo "$KEPT" | grep '"tt-bug-deferred-past"' >/dev/null \
   && ok "tt-bug-deferred-past survives (a lapsed hold does not permanently strand the bead)" \
   || bad "tt-bug-deferred-past was dropped — defer_until check over-blocks a PAST hold (kept=$KEPT)"
 
@@ -171,7 +171,7 @@ echo "Scenario 5: negative control — _filter_candidates ALONE (the OLD BUGS_JS
 echo "  before _filter_exec_manual was added to the chain) does NOT catch exec:manual"
 OUT5="$(run_pipeline "$FIXTURES" "_filter_candidates")"
 KEPT5="$(ids_of "$OUT5")"
-echo "$KEPT5" | grep -q '"tt-bug-execmanual"' \
+echo "$KEPT5" | grep '"tt-bug-execmanual"' >/dev/null \
   && ok "confirms _filter_candidates alone never vetoed exec:manual — Gap A could only be closed by adding _filter_exec_manual to the chain, not by editing _filter_candidates" \
   || bad "unexpected: _filter_candidates alone already drops exec:manual (kept5=$KEPT5) — is exec:manual handled twice now?"
 
