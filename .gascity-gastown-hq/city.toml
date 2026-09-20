@@ -151,17 +151,6 @@ agent = "refinery"
 [rigs.patches.env]
 test_command = "/Users/athos/gt/whatsapp_automation/venv/bin/python3 -m pytest tests/ -q"
 
-[[rigs]]
-name = "deacon"
-prefix = "dc"
-suspended = true
-[rigs.imports]
-
-# gt-kfr7m: same fix, same rationale as marketing/lexbh above — last of the
-# 3 suspended rigs, closes out the bead's remaining scope.
-[rigs.imports.gastown]
-source = ".gc/system/packs/gastown"
-
 [patches]
 
 [[patches.agent]]
