@@ -64,3 +64,8 @@ fx_fake_notify() {   # <path-do-script> <arquivo-de-log>
     printf '#!/bin/sh\necho "NOTIFY $*" >> "%s"\n' "$2" > "$1"
     chmod +x "$1"
 }
+# notify que REGISTRA a tentativa e FALHA (exit 1): simula ntfy fora do ar.
+fx_fake_notify_failing() {   # <path-do-script> <arquivo-de-log>
+    printf '#!/bin/sh\necho "NOTIFY-TENTATIVA $*" >> "%s"\nexit 1\n' "$2" > "$1"
+    chmod +x "$1"
+}

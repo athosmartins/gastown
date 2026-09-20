@@ -102,7 +102,7 @@ ensure_backed_up() {
     return 0
   fi
   ensure_worktree
-  local tip head dirty
+  local tip head dirty st
   tip=$(git -C "$WORKTREE" rev-parse --verify --quiet "refs/heads/${BRANCH}^{commit}" 2>/dev/null) \
     || { log "  backup ....... FALHOU: a branch $BRANCH nao existe"; return 1; }
   head=$(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null) \
@@ -118,6 +118,19 @@ ensure_backed_up() {
     printf '%s\n' "$dirty" | sed -n '1,5p' | sed 's/^/                   /' | tee -a "$LOG"
     return 1
   fi
+  # Ja esta num remoto? Entao nao ha o que empurrar. Isso torna o passo idempotente
+  # E tira a rede do caminho do pos-boot quando o 'arm' (com humano por perto) ja
+  # empurrou: um boot sem rede nao desperdica o reboot -- a evidencia positiva de
+  # um fetch anterior vale (marcada "velhas" se ESTE fetch falhou). O que nunca
+  # passa e commit sem evidencia nenhuma: esse cai no push abaixo, ou falha.
+  eb_fetch_all "$WORKTREE"
+  st=$(eb_backup_state "$WORKTREE" "$tip")
+  case "$st" in
+    OK\|*)
+      log "  backup ....... OK -- $BRANCH @ $(printf '%.9s' "$tip") ja esta em ${st#*|}; nada a empurrar."
+      return 0
+      ;;
+  esac
   log "  backup ....... empurrando $BRANCH ($(printf '%.9s' "$tip")) para $PUSH_REMOTE..."
   eb_push_branch "$WORKTREE" "$BRANCH" "$PUSH_REMOTE" \
     || { log "  backup ....... FALHOU (ver o push acima) -- nada sera buildado."; return 1; }

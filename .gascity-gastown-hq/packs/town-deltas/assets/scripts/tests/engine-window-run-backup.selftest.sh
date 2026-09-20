@@ -19,7 +19,7 @@ set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ENGINE_WINDOW_RUN_SCRIPT_UNDER_TEST: so pro teste de MUTACAO (copia com o gate neutralizado).
 RUN="${ENGINE_WINDOW_RUN_SCRIPT_UNDER_TEST:-$SELF_DIR/../../../../../scripts/engine-window-run.sh}"
-SWAP="$SELF_DIR/../engine-window-swap.sh"
+SWAP="${ENGINE_WINDOW_SWAP_UNDER_TEST:-$SELF_DIR/../engine-window-swap.sh}"
 # ENGINE_BACKUP_LIB_UNDER_TEST: idem, pra mutar a lib e rodar por aqui.
 LIBPATH="${ENGINE_BACKUP_LIB_UNDER_TEST:-$SELF_DIR/../lib/engine-backup-lib.sh}"
 # shellcheck source=engine-backup-fixture.sh
@@ -181,13 +181,28 @@ assert_eq "  symlink trocado (era deliberado)" "$LIBEXEC/gc-fixture" "$(readlink
 run_win -- rollback
 assert_eq "  e o rollback do bypass tambem funciona" "$WORK/old-gc" "$(readlink "$GCLINK")"
 
-echo "── 12. build SEM rede: nada e compilado (sem backup nada nasce) ──"
+echo "── 12. build SEM rede e com commit SEM evidencia de backup: nada e compilado ──"
 rm -f "$LIBEXEC/gc-fixture"
+T1_TIP2=$(fx_commit "$WT" "janela-T1-b")          # commit novo: nenhum ref remoto o conhece
 git -C "$E" remote set-url origin "$WORK/nao-existe.git"
 run_win -- build --force
-assert_eq "remoto inalcancavel -> build rc=1" "1" "$RC"
+assert_eq "remoto inalcancavel + commit sem evidencia -> build rc=1" "1" "$RC"
 assert_has "  diz BUILD NAO INICIADO" "$OUT" "BUILD NAO INICIADO"
 assert_eq "  e NENHUM binario foi produzido" "no" "$([ -e "$LIBEXEC/gc-fixture" ] && echo yes || echo no)"
+git -C "$E" remote set-url origin "$FX_REMOTE"
+
+echo "── 12b. push idempotente; e rede fora com o commit JA no remoto (o arm empurrou) NAO desperdica o reboot ──"
+run_win -- push
+assert_eq "push com rede -> rc=0" "0" "$RC"
+assert_eq "  o remoto tem o commit novo" "$T1_TIP2" "$(remote_tip)"
+run_win -- push
+assert_eq "push de novo -> rc=0" "0" "$RC"
+assert_has "  e diz 'nada a empurrar' (idempotente)" "$OUT" "nada a empurrar"
+git -C "$E" remote set-url origin "$WORK/nao-existe.git"
+run_win -- build --force
+assert_eq "sem rede, com evidencia positiva de um fetch anterior -> build rc=0" "0" "$RC"
+assert_has "  o log marca a evidencia como possivelmente velha (nao finge frescor)" "$OUT" "possivelmente velhas"
+assert_eq "  e o binario foi produzido" "yes" "$([ -x "$LIBEXEC/gc-fixture" ] && echo yes || echo no)"
 git -C "$E" remote set-url origin "$FX_REMOTE"
 
 echo "── 13. swap SEM rede e sem prova -> recusa (fail-closed), com o bypass no aviso ──"
@@ -211,6 +226,29 @@ echo "── 15. subcomando desconhecido lista o novo 'push' no uso ──"
 run_win -- nao-existe
 assert_eq "rc=2" "2" "$RC"
 assert_has "  o uso lista push" "$OUT" "push"
+
+echo "── 15b. engine-window-swap.sh (o OUTRO caminho de swap): recusa ANTES de instalar qualquer coisa ──"
+mkdir -p "$WORK/libexec2"
+fx_fake_gc "$WORK/unbacked-bin" "$(short "$C_LOCAL")"
+OUTSW=$(env PATH="$WORK/fakebin:$PATH" HOME="$WORK/home" GC_LIBEXEC_DIR="$WORK/libexec2" GC_BIN_LINK="$WORK/gc-link2" \
+    GC_SUPERVISOR_LABEL=com.example.nao-existe GC_SRC_ROOT="$E" ENGINE_BACKUP_LIB="$LIBPATH" EB_RETRY_SLEEP_S=0 \
+    /bin/bash "$SWAP" "$WORK/unbacked-bin" gc-swap-test 2>&1); RCSW=$?
+assert_eq "binario de commit so-local -> rc=1 (sob bash 3.2, com set -euo pipefail do proprio script)" "1" "$RCSW"
+assert_has "  diz swap RECUSADO" "$OUTSW" "swap RECUSADO"
+assert_eq "  NADA foi instalado no libexec" "no" "$([ -e "$WORK/libexec2/gc-swap-test" ] && echo yes || echo no)"
+assert_eq "  nenhum symlink foi criado" "no" "$( ([ -e "$WORK/gc-link2" ] || [ -L "$WORK/gc-link2" ]) && echo yes || echo no)"
+# Caminho de SUCESSO do gate sob o `set -euo pipefail` do proprio script: um binario de
+# fonte empurrada tem que PASSAR do gate (se o set -e matasse o script aqui, o primeiro
+# swap legitimo falharia). Depois do gate o script tenta install/codesign/kickstart --
+# tudo confinado ao sandbox e a um label de launchd que nao existe; o que importa e
+# que o log chegou em "symlink atual", a linha logo APOS o gate.
+fx_fake_gc "$WORK/backed-bin" "$(short "$T1_TIP2")"
+OUTSW2=$(env PATH="$WORK/fakebin:$PATH" HOME="$WORK/home" GC_LIBEXEC_DIR="$WORK/libexec2" GC_BIN_LINK="$WORK/gc-link2" \
+    GC_SUPERVISOR_LABEL=com.example.nao-existe GC_SRC_ROOT="$E" ENGINE_BACKUP_LIB="$LIBPATH" EB_RETRY_SLEEP_S=0 \
+    /bin/bash "$SWAP" "$WORK/backed-bin" gc-swap-ok 2>&1); RCSW2=$?
+assert_has "binario de fonte EMPURRADA -> o gate libera ('backup ....... OK')" "$OUTSW2" "backup ....... OK"
+assert_lacks "  e o script NAO recusa" "$OUTSW2" "swap RECUSADO"
+assert_has "  e segue ate a etapa depois do gate (o set -e nao matou o script no gate)" "$OUTSW2" "symlink atual"
 
 echo "── 16. ORDEM no codigo: o gate vem ANTES de qualquer mutacao (em ambos os swaps) ──"
 first_line() { grep -nE "$2" "$1" | grep -vE '^[0-9]+:[[:space:]]*#' | head -1 | cut -d: -f1; }

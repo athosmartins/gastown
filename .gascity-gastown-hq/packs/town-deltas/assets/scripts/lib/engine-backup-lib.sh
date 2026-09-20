@@ -36,8 +36,12 @@
 #
 # Regras que a lib nunca quebra: NUNCA force-push (um remoto com historia
 # divergente e problema pra um humano decidir); o push so vale quando o EFEITO e
-# verificado (o commit aparece num remoto depois), nao pelo codigo de saida; todo
-# comando de rede tem limite de tempo; git nunca pergunta credencial.
+# verificado (o commit aparece num remoto depois), nao pelo codigo de saida; git
+# nunca pergunta credencial; todo comando de rede tem limite de tempo -- `timeout`
+# quando existe E, independente dele, http.lowSpeedLimit/Time (uma transferencia
+# parada aborta sozinha). Isso importa mais do que parece: um fetch pendurado
+# seguraria o lock do guard horario pra sempre, e todas as execucoes seguintes
+# sairiam "outra instancia rodando" -- um guard que existe e entrega zero.
 #
 # Sem `set -e/-u` proprios (e sourced: quem inclui decide). Compativel com bash
 # 3.2 (o /bin/bash do macOS): sem arrays associativos, sem ${x,,}, sem mapfile.
@@ -119,6 +123,7 @@ eb_fetch_all() {
             try=$((try + 1))
             if eb_bounded "$EB_FETCH_TIMEOUT_S" env GIT_TERMINAL_PROMPT=0 \
                 git -C "$repo" -c gc.auto=0 -c maintenance.auto=false \
+                -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 \
                 fetch --prune --no-tags --quiet "$remote" >/dev/null 2>&1; then
                 rc=0
                 break
@@ -194,7 +199,8 @@ eb_push_branch() {
     while [ "$try" -lt "$EB_PUSH_TRIES" ]; do
         try=$((try + 1))
         out=$(eb_bounded "$EB_PUSH_TIMEOUT_S" env GIT_TERMINAL_PROMPT=0 \
-            git -C "$wt" push "$remote" "refs/heads/${branch}:refs/heads/${branch}" 2>&1) && rc=0 || rc=$?
+            git -C "$wt" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 \
+            push "$remote" "refs/heads/${branch}:refs/heads/${branch}" 2>&1) && rc=0 || rc=$?
         [ "$rc" = "0" ] && break
         case "$out" in
             *"non-fast-forward"* | *"[rejected]"* | *"fetch first"*)

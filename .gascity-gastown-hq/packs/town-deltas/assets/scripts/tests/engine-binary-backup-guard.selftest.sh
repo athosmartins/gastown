@@ -46,7 +46,9 @@ chmod +x "$WORK/gitshim/git"
 GRACE=3600
 GUARD_BASH=bash
 SPEC=""
-# run_guard [args...] -> OUT (stdout+stderr) e RC
+NOTIFY_UNDER_TEST="$WORK/fake-notify"
+# run_guard [args...] -> OUT (stdout), ERR (stderr), RC. Separados: o JSON do stdout
+# nao pode ser contaminado pelos AVISOs do stderr.
 run_guard() {
     OUT=$(PATH="$WORK/gitshim:$PATH" GC_CITY_PATH="$CITY" \
         ENGINE_BACKUP_GUARD_ARTIFACTS="$SPEC" \
@@ -55,9 +57,10 @@ run_guard() {
         ENGINE_BACKUP_GUARD_LOCK="$WORK/guard.lock" \
         ENGINE_BACKUP_GUARD_BRANCH_GRACE_S="$GRACE" \
         ENGINE_BACKUP_GUARD_UNKNOWN_STREAK=3 \
-        NOTIFY_BIN="$WORK/fake-notify" EB_RETRY_SLEEP_S=0 \
-        "$GUARD_BASH" "$GUARD" "$@" 2>&1)
+        NOTIFY_BIN="$NOTIFY_UNDER_TEST" EB_RETRY_SLEEP_S=0 \
+        "$GUARD_BASH" "$GUARD" "$@" 2>"$WORK/stderr.log")
     RC=$?
+    ERR=$(cat "$WORK/stderr.log" 2>/dev/null)
 }
 # jq sobre a saida --json:  jf <filtro>
 jf() { printf '%s' "$OUT" | jq -r "$1" 2>/dev/null; }
@@ -206,7 +209,7 @@ echo "── 12. recusa SEM flock (nao pode virar no-op calado como o idioma do 
 mkdir -p "$WORK/pathnoflock"
 ln -sf "$(command -v jq)" "$WORK/pathnoflock/jq"
 ln -sf "$(command -v dirname)" "$WORK/pathnoflock/dirname"
-OUTNF=$(PATH="$WORK/pathnoflock" GC_CITY_PATH="$CITY" "$(command -v bash)" "$GUARD" 2>&1); RCNF=$?
+OUTNF=$(PATH="$WORK/pathnoflock" EB_GUARD_EXTRA_PATH="" GC_CITY_PATH="$CITY" "$(command -v bash)" "$GUARD" 2>&1); RCNF=$?
 assert_eq "sem flock no PATH -> exit 2 (alto), nao exit 0 calado" "2" "$RCNF"
 assert_has "  a mensagem nomeia o flock" "$OUTNF" "flock"
 
@@ -234,7 +237,45 @@ run_guard --json
 assert_eq "seen.json corrompido -> recomeca do zero, exit 0" "0" "$RC"
 assert_eq "  e ainda produz JSON valido" "true" "$(printf '%s' "$OUT" | jq -e '.rows|length>0' >/dev/null 2>&1 && echo true || echo false)"
 
-echo "── 16. invariante COMPORTAMENTAL: todo git que o guard executou, em TODOS os cenarios acima ──"
+echo "── 16. notify que FALHA nao carimba o cooldown: o alarme nao se perde por 24h ──"
+fx_fake_notify_failing "$WORK/fake-notify-failing" "$WORK/attempts.log"
+: > "$WORK/attempts.log"; rm -f "$WORK/seen.json"; : > "$NOTIFY_LOG"
+fx_fake_gc "$WORK/bin/gc-live" "deadbeef1"        # ORPHAN: alarma na hora
+NOTIFY_UNDER_TEST="$WORK/fake-notify-failing"
+run_guard --json
+assert_eq "alarme ativo" "1" "$(jf '.alarms')"
+assert_eq "  o notify foi TENTADO 1x" "1" "$(grep -c NOTIFY-TENTATIVA "$WORK/attempts.log")"
+assert_eq "  o JSON conta 1 alerta NAO entregue" "1" "$(jf '.notify_failed')"
+assert_has "  e o stderr avisa que a entrega nao foi confirmada" "$ERR" "NAO CONFIRMADO"
+run_guard --json
+assert_eq "2a execucao: TENTA DE NOVO (nada foi carimbado -- tentativa nao e entrega)" "2" "$(grep -c NOTIFY-TENTATIVA "$WORK/attempts.log")"
+NOTIFY_UNDER_TEST="$WORK/fake-notify"
+run_guard --json
+assert_eq "notify volta a funcionar: a entrega acontece" "1" "$(notify_count)"
+assert_eq "  e o JSON zera notify_failed" "0" "$(jf '.notify_failed')"
+run_guard --json
+assert_eq "  so agora carimbado: a proxima nao re-notifica" "1" "$(notify_count)"
+
+echo "── 17. notify AUSENTE: alarme segue ativo, aviso alto, nada carimbado ──"
+rm -f "$WORK/seen.json"; : > "$NOTIFY_LOG"
+NOTIFY_UNDER_TEST="$WORK/nao-existe-notify"
+run_guard
+assert_has "o veredito conta o alerta nao entregue" "$OUT" "1 alerta(s) NAO entregue(s)"
+assert_has "  e o stderr diz ALARME NAO ENTREGUE" "$ERR" "ALARME NAO ENTREGUE"
+assert_has "  o alarme segue ATIVO no relatorio" "$OUT" "ORPHAN"
+NOTIFY_UNDER_TEST="$WORK/fake-notify"
+run_guard --json
+assert_eq "  quando o notify aparece, a entrega acontece (nao ficou carimbado)" "1" "$(notify_count)"
+
+echo "── 18. PATH magro do launchd (/usr/bin:/bin): o guard acha flock/jq/timeout sozinho ──"
+OUTTHIN=$(env PATH=/usr/bin:/bin GC_CITY_PATH="$CITY" ENGINE_BACKUP_GUARD_ARTIFACTS="$SPEC" \
+    ENGINE_WINDOW_GUARD_SRC_TREE="$E" ENGINE_BACKUP_GUARD_SEEN_FILE="$WORK/seen-thin.json" \
+    ENGINE_BACKUP_GUARD_LOCK="$WORK/thin.lock" NOTIFY_BIN="$WORK/fake-notify" \
+    "$(command -v bash)" "$GUARD" --json 2>/dev/null); RCTHIN=$?
+assert_eq "exit 0 com PATH=/usr/bin:/bin" "0" "$RCTHIN"
+assert_eq "  e produz JSON valido (nao morreu em 'flock/jq nao encontrado')" "true" "$(printf '%s' "$OUTTHIN" | jq -e '.rows|length>0' >/dev/null 2>&1 && echo true || echo false)"
+
+echo "── 19. invariante COMPORTAMENTAL: todo git que o guard executou, em TODOS os cenarios acima ──"
 # Verbo = primeiro argumento que nao e opcao (pulando '-C <dir>' e '-c <k=v>'); para
 # 'worktree' o subcomando tambem conta (so 'list' e leitura).
 USED=$(awk '{ i=1; while (i<=NF) { if ($i=="-C" || $i=="-c") { i+=2; continue } if ($i ~ /^-/) { i++; continue } v=$i; if (v=="worktree") v=v " " $(i+1); print v; break } }' "$WORK/git-shim.log" | sort -u)

@@ -171,8 +171,13 @@ assert_eq "bypass deliberado -> libera (rc=0)" "0" "$rc"
 assert_has "  mas BARULHENTO no log" "$out" "IGNORADO"
 assert_has "  e dispara notify de prioridade alta" "$(cat "$WORK/notify.log")" "-p 4"
 
-echo "── 10. invariante estatico: a lib nunca faz force-push ──"
+echo "── 10. invariantes estaticos da lib ──"
 FORCE=$(grep -nE 'push[^#]*(--force|-f |\+refs|--mirror|--delete)' "$LIB" | grep -vE '^[0-9]+:[[:space:]]*#' || true)
 if [ -z "$FORCE" ]; then ok "nenhuma linha de codigo da lib faz force/mirror/delete no push"; else bad "achei push perigoso: $FORCE"; fi
+# Um fetch/push pendurado segura o lock do guard horario pra sempre (todas as execucoes
+# seguintes saem "outra instancia rodando"). `timeout` pode nao existir no PATH do
+# order; o limite de baixa velocidade do proprio git nao depende dele.
+LOWSPEED=$(grep -vE '^[[:space:]]*#' "$LIB" | grep -c 'http.lowSpeedLimit' || true)
+assert_eq "fetch E push carregam http.lowSpeedLimit (transferencia parada aborta sem depender de timeout)" "2" "$LOWSPEED"
 
 fx_finish

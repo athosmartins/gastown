@@ -53,6 +53,16 @@
 # Uso: bash engine-binary-backup-guard.sh [--json]
 set -uo pipefail
 
+# O `gc order` pode entregar um PATH magro (launchd: /usr/bin:/bin). O guard precisa
+# de flock/jq/timeout/go (Homebrew) e do notify (~/.local/bin): sem eles ele
+# recusaria (flock) ou perderia o alarme (notify). Estes diretorios entram como
+# FALLBACK, no FIM do PATH: nunca mandam mais que o PATH de quem chamou (um PATH que
+# ja tem o Homebrew na frente segue igual; um shim de teste continua ganhando).
+# EB_GUARD_EXTRA_PATH sobrescreve (vazio desliga) so pro selftest poder simular a
+# AUSENCIA de uma ferramenta.
+_EB_EXTRA_PATH="${EB_GUARD_EXTRA_PATH-/opt/homebrew/bin:$HOME/.local/bin:/usr/local/bin}"
+[ -n "$_EB_EXTRA_PATH" ] && PATH="$PATH:$_EB_EXTRA_PATH"
+
 JSON_OUT=0
 [ "${1:-}" = "--json" ] && JSON_OUT=1
 
@@ -104,14 +114,29 @@ SEEN_JSON=$(cat "$SEEN_FILE" 2>/dev/null || echo '{}')
 printf '%s' "$SEEN_JSON" | jq -e . >/dev/null 2>&1 || SEEN_JSON='{}'
 
 # Cooldown de alerta -- so governa o NOTIFY; a medicao e o relatorio nunca sao suprimidos.
+# O cooldown so e CARIMBADO depois que o notify confirma a entrega (exit 0). Sem isso,
+# um notify ausente ou com falha de rede carimbaria "avisado" e calaria o alarme por
+# 24h -- tentativa nao e entrega. Falha -> aviso no stderr, contador NOTIFY_FAILED
+# (sai no veredito e no JSON) e nova tentativa na proxima execucao.
+NOTIFY_FAILED=0
 notify_once() {
-    local key="$1" title="$2" body="$3" prio="${4:-3}" last
+    local key="$1" title="$2" body="$3" prio="${4:-3}" last nb
     last=$(printf '%s' "$SEEN_JSON" | jq -r --arg k "notify:$key" '.[$k] // 0' 2>/dev/null) || last=0
     case "$last" in '' | *[!0-9]*) last=0 ;; esac
     if [ "$last" != "0" ] && [ $((NOW - last)) -lt "$ESCALATE_AFTER_S" ]; then
         return 1
     fi
-    "$NOTIFY_BIN" -t "$title" -p "$prio" "$body" >/dev/null 2>&1 || true
+    nb=$(command -v "$NOTIFY_BIN" 2>/dev/null) || nb=""
+    if [ -z "$nb" ]; then
+        echo "AVISO: notify ('$NOTIFY_BIN') nao encontrado -- ALARME NAO ENTREGUE: $title" >&2
+        NOTIFY_FAILED=$((NOTIFY_FAILED + 1))
+        return 1
+    fi
+    if ! "$nb" -t "$title" -p "$prio" "$body" >/dev/null 2>&1; then
+        echo "AVISO: notify falhou (exit != 0) -- ALARME NAO CONFIRMADO, tento de novo na proxima execucao: $title" >&2
+        NOTIFY_FAILED=$((NOTIFY_FAILED + 1))
+        return 1
+    fi
     SEEN_JSON=$(printf '%s' "$SEEN_JSON" | jq --arg k "notify:$key" --argjson n "$NOW" '.[$k] = $n' 2>/dev/null) || true
     [ -n "$SEEN_JSON" ] || SEEN_JSON='{}'
     return 0
@@ -257,8 +282,8 @@ EOF
 DUR=$(($(date +%s) - NOW))
 
 if [ "$JSON_OUT" = "1" ]; then
-    printf '%s' "$ROWS" | jq -R -s --argjson alarms "$ALARMS" --argjson unknowns "$UNKNOWNS" --argjson dur "$DUR" --arg us "$US" '
-        { alarms: $alarms, unknowns: $unknowns, duration_s: $dur,
+    printf '%s' "$ROWS" | jq -R -s --argjson alarms "$ALARMS" --argjson unknowns "$UNKNOWNS" --argjson nf "$NOTIFY_FAILED" --argjson dur "$DUR" --arg us "$US" '
+        { alarms: $alarms, unknowns: $unknowns, notify_failed: $nf, duration_s: $dur,
           rows: ( split("\n") | map(select(length > 0) | split($us)
                   | { kind: .[0], name: .[1], commit: .[2], state: .[3], detail: .[4], alarm: (.[5] == "1"), scope: .[6], binary: .[7] }) ) }'
 else
@@ -279,7 +304,7 @@ else
         [ "$state" != "OK" ] && printf '        -> %s\n' "$detail"
     done
     printf '%s' "$FETCH_NOTES"
-    echo "  VEREDITO: $ALARMS alarme(s) ativo(s), $UNKNOWNS desconhecido(s) nesta execucao  (medido: ${DUR}s)"
+    echo "  VEREDITO: $ALARMS alarme(s) ativo(s), $UNKNOWNS desconhecido(s) nesta execucao, $NOTIFY_FAILED alerta(s) NAO entregue(s)  (medido: ${DUR}s)"
 fi
 
 echo "$SEEN_JSON" > "$SEEN_FILE" 2>/dev/null || true
