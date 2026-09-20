@@ -36,6 +36,14 @@ export MAX_REMEDIATIONS=3
 export ESCALATION_NTFY_WINDOW=7200
 export FLOW_HEALER_UID=501
 
+# ga-nixb58: the flow-authority marker path defaults to $CITY/.gc/runtime/flow-authority.json and
+# honours an ambient FFF_FLOW_AUTHORITY_FILE. Pin it (and the defer knobs) inside $WORK BEFORE
+# sourcing so section (h)/(i) can never write a fixture into the LIVE marker, whatever the caller
+# exported.
+export FFF_FLOW_AUTHORITY_FILE="$WORK/flow-authority.json"
+export FFF_FLOW_AUTHORITY_DEFER=1
+export FFF_TSW_SUPPRESS_SIGS="gate pilot"
+
 # Source the script's functions WITHOUT running run().
 export FLOW_HEALER_SOURCE_ONLY=1
 export FLOW_HEALER_NOW=1000000          # fixed clock (script copies into $NOW at source)
@@ -151,6 +159,124 @@ else
   bad "expected only stub calls recorded, got: calls=$(cat "$CALLS" 2>/dev/null || echo '(empty)')"
 fi
 unset FLOW_HEALER_FAKE_LAUNCHCTL FLOW_HEALER_FAKE_MAIL FLOW_HEALER_FAKE_NOTIFY FLOW_HEALER_FAKE_MTIME_AUTO_REFINO_DISPATCHER_LOG
+
+echo "== (h) flow-authority marker parsing (imp14): a Python-float expires_at must not abort (ga-nixb58) =="
+# The marker path comes from env and a selftest must never touch the LIVE marker: it is pinned
+# inside $WORK above - refuse to write a single marker if that ever stops being true.
+case "$FLOW_AUTHORITY_FILE" in
+  "$WORK"/*) ok "marker path is isolated inside \$WORK" ;;
+  *) bad "marker path escapes \$WORK ($FLOW_AUTHORITY_FILE) - refusing to write markers"
+     rm -rf "$WORK"; exit 1 ;;
+esac
+
+# probe_authority: run _tsw_flow_authority_active in a SUBSHELL and report how it ended.
+#   "rc=<n>" -> it returned normally with status n
+#   ""       -> the shell was ABORTED inside it (the ga-nixb58 failure: a failed $(( )) expansion
+#               abandons the command, so the echo below never runs). Without this sentinel an
+#               abort exits 1 and is indistinguishable from a legitimate "not active".
+probe_authority() { ( _tsw_flow_authority_active; echo "rc=$?" ) 2>"$WORK/probe.err"; }
+write_marker()    { printf '%s\n' "$1" > "$FLOW_AUTHORITY_FILE"; }
+marker_at()       { printf '{"authority":"throughput-stall-watchdog","expires_at":%s}' "$1"; }
+ev_count()        { touch "$JSONL"; grep -c '"event":"tsw-authority-unreadable"' "$JSONL" || true; }
+real_now=$(date +%s)
+FUT=$((real_now + 3600)); PAST=$((real_now - 3600))    # the function reads the real clock, not $NOW
+
+ev0=$(ev_count)
+write_marker "$(marker_at "$FUT")"
+eq "integer expires_at in the future = active" "$(probe_authority)" "rc=0"
+write_marker "$(marker_at "$FUT.938316")"
+eq "FLOAT expires_at in the future = active (the shape the Python writers emit)" "$(probe_authority)" "rc=0"
+write_marker "$(marker_at "$PAST.938316")"
+eq "FLOAT expires_at in the past = expired (returns, does not abort)" "$(probe_authority)" "rc=1"
+write_marker "$(marker_at "$PAST")"
+eq "integer expires_at in the past = expired" "$(probe_authority)" "rc=1"
+write_marker '{"escalated_at": 1750000000.0, "dimension": "x", "authority": "approved-state-reconciler", "expires_at": 1750003600.0}'
+eq "the fixture shape found in the live marker (float, long expired) = expired" "$(probe_authority)" "rc=1"
+write_marker "$(marker_at "\"$FUT.5\"")"
+eq "float carried as a JSON string, in the future = active (Python float() accepts it too)" "$(probe_authority)" "rc=0"
+rm -f "$FLOW_AUTHORITY_FILE"
+eq "no marker file = not active" "$(probe_authority)" "rc=1"
+write_marker "$(marker_at "$FUT.5")"
+FFF_FLOW_AUTHORITY_DEFER=0
+eq "defer switched off = not active even with a live marker" "$(probe_authority)" "rc=1"
+FFF_FLOW_AUTHORITY_DEFER=1
+eq "readable / absent markers raise no unreadable event" "$(ev_count)" "$ev0"
+
+# An UNREADABLE marker is NOT active (FFF acts on its own, like PTH/PSW) - but never an abort and never silent.
+unreadable_case() {  # unreadable_case <label> <raw marker text>
+  local label="$1" before after
+  before=$(ev_count); write_marker "$2"
+  eq "$label: returns not-active, no abort" "$(probe_authority)" "rc=1"
+  after=$(ev_count)
+  eq "$label: the doubt is logged as an event" "$after" "$((before + 1))"
+  if grep -q 'flow-authority marker unreadable' "$WORK/probe.err"; then ok "$label: and on stderr"; else bad "$label: nothing on stderr"; fi
+}
+unreadable_case "garbage, not JSON"    'this is not json'
+unreadable_case "empty marker"         ''
+unreadable_case "expires_at is text"   '{"expires_at": "soon"}'
+unreadable_case "expires_at missing"   '{"authority": "throughput-stall-watchdog"}'
+unreadable_case "expires_at null"      '{"expires_at": null}'
+unreadable_case "expires_at is a list" '{"expires_at": [1789000000, 2]}'
+unreadable_case "expires_at negative"  '{"expires_at": -5}'
+unreadable_case "expires_at boolean"   '{"expires_at": true}'
+
+# The awk fallback (jq missing): a PATH that has awk/tr/head/date but no jq. `hash -r` because the
+# parent shell may have jq cached in its command hash table, which the subshell inherits.
+NOJQ_BIN="$WORK/nojq-bin"; mkdir -p "$NOJQ_BIN"
+for t in awk tr head date; do ln -sf "$(command -v "$t")" "$NOJQ_BIN/$t"; done
+probe_authority_nojq() { ( hash -r; PATH="$NOJQ_BIN"; _tsw_flow_authority_active; echo "rc=$?" ) 2>"$WORK/probe.err"; }
+if ( hash -r; PATH="$NOJQ_BIN"; command -v jq >/dev/null 2>&1 ); then
+  bad "jq is still visible on the restricted PATH - the awk fallback is not being exercised"
+else
+  write_marker "$(marker_at "$FUT")"
+  eq "no jq: integer expires_at in the future = active" "$(probe_authority_nojq)" "rc=0"
+  write_marker "$(marker_at "$FUT.938316")"
+  eq "no jq: FLOAT expires_at in the future = active" "$(probe_authority_nojq)" "rc=0"
+  write_marker "$(marker_at "$PAST.938316")"
+  eq "no jq: FLOAT expires_at in the past = expired" "$(probe_authority_nojq)" "rc=1"
+  before=$(ev_count); write_marker '{"expires_at": "soon"}'
+  eq "no jq: text expires_at = not active, no abort" "$(probe_authority_nojq)" "rc=1"
+  eq "no jq: and the doubt is logged" "$(ev_count)" "$((before + 1))"
+fi
+
+echo "== (i) end-to-end: a float marker must not abandon run() (ga-nixb58) =="
+export FLOW_HEALER_FAKE_LAUNCHCTL=stub_launchctl FLOW_HEALER_FAKE_MAIL=stub_mail FLOW_HEALER_FAKE_NOTIFY=stub_notify
+export FLOW_HEALER_FAKE_MTIME_GATE_LOG=0 FLOW_HEALER_FAKE_MTIME_PILOT_LOG=0    # epoch 0 => ancient => frozen
+# run_two mimics run(): the gate signature, then the pilot one, then a sentinel. Both signatures
+# are in FFF_TSW_SUPPRESS_SIGS, so both consult the marker once they decide to act.
+run_two() {
+  handle_signature "gate"  "com.gascity.quality-gate-dispatcher" "/x/gate.log"  10 1 "census-blob"
+  handle_signature "pilot" "com.gascity.pilot"                    "/x/pilot.log" 15 1 "census-blob"
+  echo "reached-end"
+}
+seed_confirmed_gate() {   # gate already has 5 strikes, so its next decision is KICKSTART (ESCALATE at the bound)
+  reset_state; : > "$CALLS"; : > "$JSONL"
+  echo 5 > "$FLOW_HEALER_STATE_DIR/gate.strikes"
+}
+
+# i-1: TSW is active (float marker in the future): the kickstart is deferred AND logged, and the
+# run carries on to the pilot signature instead of being abandoned at the gate one.
+seed_confirmed_gate; write_marker "$(marker_at "$FUT.938316")"
+out=$(run_two 2>/dev/null)
+eq "TSW active, float marker: run reaches its end" "$out" "reached-end"
+eq "TSW active, float marker: the pilot signature was still evaluated" "$([ -f "$FLOW_HEALER_STATE_DIR/pilot.strikes" ] && echo yes || echo no)" "yes"
+eq "TSW active, float marker: kickstart deferred (no launchctl call)" "$(grep -c '^launchctl' "$CALLS" || true)" "0"
+eq "TSW active, float marker: the deferral is logged (tsw-defer)" "$(grep -c '"event":"tsw-defer"' "$JSONL" || true)" "1"
+
+# i-2: the float marker is EXPIRED: nothing to defer to, so the kickstart must really happen.
+seed_confirmed_gate; write_marker "$(marker_at "$PAST.938316")"
+out=$(run_two 2>/dev/null)
+eq "expired float marker: run reaches its end" "$out" "reached-end"
+eq "expired float marker: the gate kickstart is really performed" "$(grep -c 'launchctl kickstart -k gui/501/com.gascity.quality-gate-dispatcher' "$CALLS" || true)" "1"
+
+# i-3: same, at the MAX_REMEDIATIONS bound: the Mayor escalation must really go out (it used to be
+# recorded as escalated - which later let the last-resort NTFY claim "after Mayor escalation" - without being sent).
+seed_confirmed_gate; echo 3 > "$FLOW_HEALER_STATE_DIR/gate.remediations"      # == MAX_REMEDIATIONS
+write_marker "$(marker_at "$PAST.938316")"
+out=$(run_two 2>/dev/null)
+eq "expired float marker at the bound: run reaches its end" "$out" "reached-end"
+eq "expired float marker at the bound: the Mayor escalation mail is really sent" "$(grep -c '^mail subj=' "$CALLS" || true)" "1"
+unset FLOW_HEALER_FAKE_LAUNCHCTL FLOW_HEALER_FAKE_MAIL FLOW_HEALER_FAKE_NOTIFY FLOW_HEALER_FAKE_MTIME_GATE_LOG FLOW_HEALER_FAKE_MTIME_PILOT_LOG
 
 echo
 echo "==== selftest: PASS=$PASS FAIL=$FAIL ===="

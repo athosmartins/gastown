@@ -145,20 +145,50 @@ sf() { echo "$STATE_DIR/$1"; }                       # state-file path for key
 get() { cat "$(sf "$1")" 2>/dev/null || echo "$2"; } # get <key> <default>
 put() { echo "$2" > "$(sf "$1")" 2>/dev/null || true; }
 
+# ga-nixb58: a marker we cannot read is DOUBT, not silence. FFF treats it as "not active"
+# (see _tsw_flow_authority_active) but says so: a JSONL event plus stderr (launchd -> the .err log).
+_tsw_authority_unreadable() {  # _tsw_authority_unreadable <reason> <raw-value>
+  local safe="${2//[^[:alnum:]._-]/_}"   # whatever the marker held, keep the emitted JSON valid
+  safe="${safe:0:40}"
+  emit "tsw-authority-unreadable" ",\"reason\":\"$1\",\"raw\":\"$safe\""
+  echo "funnel-flow-healer: WARN: flow-authority marker unreadable ($1; raw='$safe') - treated as NOT active, FFF acts on its own" >&2
+}
+
 # imp14: return 0 (true) if TSW has written a flow-authority marker that has not yet expired.
+#
+# ga-nixb58: the writers (throughput-stall-watchdog.py, approved-state-reconciler.py) store
+# expires_at as a Python float (now + TTL, now = time.time()), e.g. 1788933768.938316. Bash
+# arithmetic rejects the '.', and a failed $(( )) expansion does not just fail this test - it
+# ABANDONS THE WHOLE TOP-LEVEL COMMAND (run): every later signature is skipped, the remediation
+# slot decide_action already spent is never used, and the script still exits 0. So nothing read
+# from the marker reaches $(( )): it is validated with a case pattern and cut to whole seconds.
+#   return 0  marker readable, expires_at still in the future     -> defer to TSW
+#   return 1  no marker / defer off / marker readable but expired -> FFF acts on its own
+#   return 1  marker present but UNREADABLE (bad JSON, missing or non-numeric expires_at)
+#             -> FFF acts on its own, like PTH/PSW (their except-branch returns False): a
+#             garbage marker must never silence a real stall. The doubt is logged, not swallowed.
 _tsw_flow_authority_active() {
   [ "$FFF_FLOW_AUTHORITY_DEFER" = "1" ] || return 1
   [ -f "$FLOW_AUTHORITY_FILE" ] || return 1
-  local expires_at now
+  local raw secs now
   now=$(date +%s)
-  # Parse expires_at from JSON without a Python dependency (portable jq / awk fallback)
+  # Parse expires_at from JSON without a Python dependency (portable jq / awk fallback).
+  # jq cuts a numeric value to whole seconds itself; a string value passes through to the check below.
   if command -v jq >/dev/null 2>&1; then
-    expires_at=$(jq -r '.expires_at // 0' "$FLOW_AUTHORITY_FILE" 2>/dev/null) || return 1
+    raw=$(jq -r '(.expires_at // empty) | if type == "number" then floor else . end' \
+            "$FLOW_AUTHORITY_FILE" 2>/dev/null) \
+      || { _tsw_authority_unreadable "marker not parseable by jq" ""; return 1; }
   else
-    expires_at=$(awk -F'"expires_at":' '{print $2}' "$FLOW_AUTHORITY_FILE" 2>/dev/null \
-                 | tr -d ' },' | head -1) || return 1
+    raw=$(awk -F'"expires_at":' '{print $2}' "$FLOW_AUTHORITY_FILE" 2>/dev/null \
+          | tr -d ' },"\r' | head -1) || raw=""
   fi
-  [ -n "$expires_at" ] && [ "$(( expires_at + 0 ))" -gt "$now" ] 2>/dev/null
+  # Digits with at most one '.'; anything else (empty, sign, exponent, quotes, text) is unreadable.
+  case "$raw" in
+    ''|*[!0-9.]*|.*|*.*.*) _tsw_authority_unreadable "expires_at missing or not a number" "$raw"; return 1 ;;
+  esac
+  secs="${raw%%.*}"                      # 1788933768.938316 -> 1788933768
+  [ "${#secs}" -le 15 ] || { _tsw_authority_unreadable "expires_at out of range" "$raw"; return 1; }
+  [ "$secs" -gt "$now" ]
 }
 
 # imp14: return 0 (true) if this signature's actions should be suppressed because TSW is active.

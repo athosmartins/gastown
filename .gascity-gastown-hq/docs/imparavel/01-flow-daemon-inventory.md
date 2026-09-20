@@ -150,6 +150,7 @@ Also emits observability events to `funnel-flow-healer.jsonl` (census + decision
 - bd count returns `"?"` (non-numeric) → treated as **no demand** (fail-safe toward no-action)
 - Log file missing → log_age_min returns `999999` (treated as frozen, but demand must also be positive)
 - `FLOW_HEALER_ENABLED=0` → census runs, all action verbs suppressed
+- `flow-authority.json` (imp14, `gate`/`pilot` sigs only): `expires_at` still in the future → kickstart + Mayor mail deferred to TSW, logged as `tsw-defer`. The Python writers store `expires_at` as a float (`1788933768.938316`), so it is cut to whole seconds and validated **before** any bash arithmetic — a failed `$(( ))` expansion would abandon the whole run (ga-nixb58). No marker / expired → FFF acts on its own. **Unreadable** marker (bad JSON, `expires_at` missing or non-numeric) → treated as not active (fail-open toward acting, same as PTH/PSW) and logged as a `tsw-authority-unreadable` event plus a stderr `WARN`
 
 ---
 
