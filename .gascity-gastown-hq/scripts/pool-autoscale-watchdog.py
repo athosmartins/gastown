@@ -18,11 +18,19 @@ Poll loop (~60s). Silence = healthy (only emits on actions).
                                      count stands uncross-checked
   [POOL-AUTOSCALE] [PROBE-WINDOW-FULL] the probe's 20-bead window holds nothing claimable;
                                      work behind it is invisible to it (and to this count)
+  [POOL-AUTOSCALE] [CAP-FALLBACK]    `gc config show` gave no max_active_sessions for a pool;
+                                     the last good number (else a hardcoded one) stands in
+  [POOL-AUTOSCALE] [CAP-RECOVERED]   `gc config show` answers again after a CAP-FALLBACK
+  [POOL-AUTOSCALE] [CAP-CHANGED]     the configured max_active_sessions changed
 
 Demand (ga-uv4on5) is the beads a pool worker's own probe would hand out, not
 every ready bead routed to the pool: held, vetoed, parked, epic and in-flight
 beads are not demand, because a dog woken for them finds nothing and exits.
 See "Demand predicate" below.
+
+The ceiling (ga-d1q1kn) is re-read from `gc config show` before every cycle, and
+a read that gives no number is never turned into one in silence. See
+load_pool_max_active().
 
 Safety invariants:
   - ONLY manages templates listed in MANAGED_POOLS.
@@ -145,39 +153,136 @@ def emit(msg):
 # Config: pool max_active_sessions
 # ---------------------------------------------------------------------------
 
-def load_pool_max_active(pool_templates):
-    """Parse gc config show to find max_active_sessions for each pool template.
+# The ceiling a pool is held to until `gc config show` has answered for it once
+# (ga-d1q1kn): a guess, and never a silent one. See load_pool_max_active().
+FALLBACK_CAPS = {"gastown.dog": 3}
 
-    Pool templates like "gastown.dog" map to config agent name "dog"
-    (the last component). Returns {template: max_active}; falls back to
-    hardcoded values on parse failure.
+# The last number `gc config show` itself gave for each pool: what a failed read
+# keeps acting on. Never holds a FALLBACK_CAPS value.
+_last_good_caps = {}
+
+# pool -> (cap, source) that load_pool_max_active() settled on last time, source
+# being "config", "last-good" (a failed read kept the last good number) or
+# "fallback" (the config has never answered). It lets a transition be reported
+# once instead of on every read.
+_cap_in_use = {}
+
+_CAP_SOURCE_WORDS = {"last-good": "the last value it gave",
+                     "fallback": "the hardcoded fallback"}
+
+
+def _read_config_caps(pool_templates):
+    """One read of `gc config show` -> (caps, reasons). Never raises.
+
+    `caps` has an entry only for a pool the config gave a number for; `reasons`
+    says, for every other pool, why it did not. Pool templates like
+    "gastown.dog" map to config agent name "dog" (the last component).
     """
-    FALLBACK = {"gastown.dog": 3}
     try:
         result = subprocess.run(
             ["gc", "config", "show"],
             capture_output=True, text=True, timeout=20)
-        text = result.stdout
-    except Exception:
-        return FALLBACK
+    except Exception as exc:
+        why = f"gc config show failed: {type(exc).__name__}: {exc}"[:200]
+        return {}, {pt: why for pt in pool_templates}
+    if result.returncode != 0:
+        # A failed command's stdout is not an answer, even when it parses.
+        error_lines = [l.strip() for l in (result.stderr or "").splitlines()
+                       if l.strip() and not l.startswith("warning:")]
+        why = (f"gc config show exit {result.returncode}, "
+               + (error_lines[-1][:160] if error_lines else "no error text"))
+        return {}, {pt: why for pt in pool_templates}
 
-    caps = {}
+    text = result.stdout or ""
+    caps, agents_seen, blocks = {}, set(), 0
     # Split on [[agent]] blocks to avoid cross-block contamination.
     # gc config show emits [[agent]] sections for each resolved agent.
     agent_block_re = re.compile(r'\[\[agent\]\](.*?)(?=\[\[agent\]\]|\Z)', re.DOTALL)
     for block in agent_block_re.findall(text):
+        blocks += 1
         name_m = re.search(r'^name\s*=\s*"([^"]+)"', block, re.MULTILINE)
         cap_m = re.search(r'^max_active_sessions\s*=\s*(\d+)', block, re.MULTILINE)
-        if not name_m or not cap_m:
+        if not name_m:
             continue
         short_name = name_m.group(1)
+        agents_seen.add(short_name)
+        if not cap_m:
+            continue
         cap = int(cap_m.group(1))
         for pt in pool_templates:
             # Match "gastown.dog" -> "dog" (last component)
             if pt.split(".")[-1] == short_name:
                 caps[pt] = cap
 
-    return {pt: caps.get(pt, FALLBACK.get(pt, 1)) for pt in pool_templates}
+    reasons = {}
+    for pt in pool_templates:
+        if pt in caps:
+            continue
+        short_name = pt.split(".")[-1]
+        reasons[pt] = (
+            f"agent {short_name!r} has no max_active_sessions"
+            if short_name in agents_seen else
+            f"no agent named {short_name!r} in the output "
+            f"({blocks} agent blocks, {len(text)} bytes)")
+    return caps, reasons
+
+
+def _report_cap_transition(pool, cap, source, why):
+    """Say so when the ceiling a pool is acted on changes, or stops coming from
+    the config -- once per episode, not once per read."""
+    before = _cap_in_use.get(pool)
+    if before == (cap, source):
+        return
+    if source != "config":
+        print(f"[POOL-AUTOSCALE] [CAP-FALLBACK] pool={pool} cannot read "
+              f"max_active_sessions ({why}); acting on "
+              f"{_CAP_SOURCE_WORDS[source]} max={cap} until it can", flush=True)
+    elif before is not None and before[1] != "config":
+        print(f"[POOL-AUTOSCALE] [CAP-RECOVERED] pool={pool} the config answers "
+              f"again: max_active_sessions={cap} (was {before[0]}, "
+              f"{_CAP_SOURCE_WORDS[before[1]]})", flush=True)
+    elif before is not None:
+        print(f"[POOL-AUTOSCALE] [CAP-CHANGED] pool={pool} max_active_sessions "
+              f"{before[0]}->{cap} (the config changed)", flush=True)
+
+
+def load_pool_max_active(pool_templates):
+    """Return {template: max_active}, read from `gc config show` on every call.
+
+    Per pool there are three answers, never conflated (ga-d1q1kn): the config
+    says N; the config says nothing about this pool (its output has no such agent,
+    or the agent has no max_active_sessions); the config could not be read at all.
+    Only the first is a number. For the other two the pool keeps the last N the
+    config gave, and falls back to FALLBACK_CAPS (1 for a pool not listed there)
+    only when it never gave one -- and says so, once per episode:
+
+      [CAP-FALLBACK]   no number: what stands in for it, and why there is none
+      [CAP-RECOVERED]  the config answers again: what was in use until now
+      [CAP-CHANGED]    the config now says a different number
+
+    Remembers across calls (_last_good_caps, _cap_in_use), like _report_once().
+    Never raises: main() calls it outside the per-cycle try, so a bug in the read
+    would end the daemon and launchd would restart it into the same failure.
+    """
+    try:
+        caps, reasons = _read_config_caps(pool_templates)
+    except Exception as exc:
+        caps = {}
+        reasons = {pt: f"cap read raised {type(exc).__name__}: {exc}"[:200]
+                   for pt in pool_templates}
+    resolved = {}
+    for pt in pool_templates:
+        if pt in caps:
+            cap, source = caps[pt], "config"
+            _last_good_caps[pt] = cap
+        elif pt in _last_good_caps:
+            cap, source = _last_good_caps[pt], "last-good"
+        else:
+            cap, source = FALLBACK_CAPS.get(pt, 1), "fallback"
+        _report_cap_transition(pt, cap, source, reasons.get(pt, ""))
+        _cap_in_use[pt] = (cap, source)
+        resolved[pt] = cap
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -650,9 +755,12 @@ def run_cycle(pool_caps, state, stuck_alerted):
 
 def main():
     pool_caps = load_pool_max_active(MANAGED_POOLS)
+    # `caps=` alone reads the same whether the config said 3 or nothing could be
+    # read; cap_source says which (config | last-good | fallback).
+    cap_source = {pt: _cap_in_use[pt][1] for pt in pool_caps}
     print(
         f"[POOL-AUTOSCALE] [STARTUP] managed_pools={MANAGED_POOLS} "
-        f"caps={pool_caps} scale_up_after={SCALE_UP_AFTER}s "
+        f"caps={pool_caps} cap_source={cap_source} scale_up_after={SCALE_UP_AFTER}s "
         f"scale_down_after={SCALE_DOWN_AFTER}s poll={POLL_SEC}s",
         flush=True
     )
@@ -681,6 +789,11 @@ def main():
         except Exception as exc:
             print(f"[POOL-AUTOSCALE] cycle exception: {exc}", flush=True)
         time.sleep(POLL_SEC)
+        # Read the ceilings again for the next cycle (ga-d1q1kn): the config can
+        # change, and the start-up read can miss -- right after a boot the first
+        # cycle's own gc/bd calls fail too. A read that fails keeps the last good
+        # value, and load_pool_max_active() says so.
+        pool_caps = load_pool_max_active(MANAGED_POOLS)
 
 
 if __name__ == "__main__":

@@ -574,10 +574,10 @@ def test_cycle_with_claimable_work_still_wakes_and_pins_an_asleep_dog(wd, fake):
 # ---------------------------------------------------------------------------
 # THE BUG. load_pool_max_active() turned every failure to read `gc config show`
 # into the hardcoded 3, with no log line, and main() called it once, at start-up.
-# A read that failed in the first minutes after a boot (gc/bd not ready) left the
-# daemon acting on 3 for ~2h while the config said 6 (`active=6/3`, `max=3` in
-# [STUCK]). The same 3 came out of "the config says 3" and out of "I could not
-# read the config".
+# The daemon that started right after a reboot acted on 3 for ~2h while the
+# config said 6 (`active=6/3`, `max=3` in [STUCK]). Why the read missed was never
+# proved -- nothing was logged, which is the bug: the same 3 came out of "the
+# config says 3" and out of "I could not read the config".
 
 FALLBACK_CAP = 3       # what the dog pool is held to until the config has answered once
 
@@ -687,8 +687,24 @@ def test_a_pool_without_an_answer_does_not_change_the_answer_for_another_pool(wd
     assert other in lines[0] and POOL not in lines[0]
 
 
-class _StopLoop(Exception):
-    """Raised from the patched time.sleep to end main()'s endless loop."""
+def test_a_bug_in_the_read_cannot_end_the_daemon(wd, fake, monkeypatch, capsys):
+    """Break caught: load_pool_max_active() runs outside main()'s per-cycle try, so an
+    exception escaping it ends the daemon and launchd restarts it into the same
+    failure. An unexpected error is one more way of not being able to read."""
+    assert wd.load_pool_max_active([POOL]) == {POOL: 6}
+
+    def broken(_pools):
+        raise RuntimeError("parser broke")
+    monkeypatch.setattr(wd, "_read_config_caps", broken)
+    assert wd.load_pool_max_active([POOL]) == {POOL: 6}            # the last good one is kept
+    lines = _cap_lines(capsys)
+    assert len(lines) == 1, lines
+    assert "RuntimeError" in lines[0] and "last value it gave" in lines[0]
+
+
+class _StopLoop(BaseException):
+    """Raised from the patched time.sleep to end main()'s endless loop. A
+    BaseException so main()'s `except Exception` around a cycle cannot swallow it."""
 
 
 def _active_dog(n):
@@ -697,12 +713,18 @@ def _active_dog(n):
 
 
 def _run_main_for(wd, monkeypatch, cycles):
-    """Run main() until the `cycles`-th sleep, i.e. for exactly that many cycles."""
-    sleeps = []
+    """Run main() for exactly `cycles` cycles: stop at the loop's `cycles`-th sleep.
+
+    Only the loop's own sleep (POLL_SEC) counts. do_wake_and_pin() also sleeps, one
+    second, to let a wake settle; counting that one ends the run inside a cycle.
+    """
+    loop_sleeps = []
 
     def sleep(seconds):
-        sleeps.append(seconds)
-        if len(sleeps) == cycles:
+        if seconds != wd.POLL_SEC:
+            return
+        loop_sleeps.append(seconds)
+        if len(loop_sleeps) >= cycles:
             raise _StopLoop
     monkeypatch.setattr(wd.time, "sleep", sleep)
     with pytest.raises(_StopLoop):
@@ -711,11 +733,11 @@ def _run_main_for(wd, monkeypatch, cycles):
 
 def test_main_rereads_the_ceiling_every_cycle_so_a_boot_time_miss_heals(
         wd, fake, monkeypatch, tmp_path, capsys):
-    """Break caught (the bead's symptom, through main()): the start-up read failed
-    (gc/bd are not ready in the first minutes after a boot), the daemon kept the
-    hardcoded 3 for ~2h while the config said 6, read 4 active dogs as a full pool
-    and woke nobody for real demand with a real vacancy. Re-read each cycle, the
-    second cycle sees 6 and wakes the dog."""
+    """Break caught (the bead's symptom, through main()): a start-up read that
+    fails (right after a boot the first cycle's own gc/bd calls fail too) left the
+    daemon on the hardcoded 3 for ~2h while the config said 6; it read 4 active dogs
+    as a full pool and woke nobody for real demand with a real vacancy. Re-read
+    each cycle, the second cycle sees 6 and wakes the dog."""
     monkeypatch.chdir(tmp_path)                            # save_state() writes a relative path
     monkeypatch.setattr(wd, "SCALE_UP_AFTER", 0)           # decide on the first sight of demand
     fake.beads = [bead("ga-open", labels=["ctx:ready"])]
