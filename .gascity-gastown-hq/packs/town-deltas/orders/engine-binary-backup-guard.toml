@@ -12,9 +12,11 @@
 # covers the newest consolidated/engine-window-* branch before it is even built.
 #
 # Detection-only (never pushes/builds/swaps/checks out/deletes; the selftest
-# enforces this on the source). The only side effect on the source repo is
-# `fetch --prune`, which touches refs/remotes/* only. Pushing is the window
-# procedure's job (scripts/engine-window-run.sh push, also run by `build`).
+# proves this by recording every git subcommand the guard actually runs). The
+# only side effect on the source repo is `fetch --prune` (updates/removes
+# refs/remotes/*, adds objects, rewrites FETCH_HEAD; never a branch, tag,
+# worktree or the index). Pushing is the window procedure's job
+# (scripts/engine-window-run.sh push, also run by `build`).
 #
 # gc order (fresh exec each tick), never a raw plist, plus the script's own
 # flock -- so this guard can never join the ga-y0g5x class of bug it exists to

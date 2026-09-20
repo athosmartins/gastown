@@ -22,8 +22,9 @@
 # roda foi compilado do topo dela. A janela consolidava, compilava e trocava sem
 # nenhum passo que empurrasse a fonte: etapa ausente, nao esquecimento. Agora:
 #   * push/build/arm: o worktree tem que estar LIMPO e exatamente no commit da
-#     branch (senao o main.commit do binario nao descreve o que foi compilado) e
-#     a branch e empurrada (sem force) com o efeito VERIFICADO antes de compilar;
+#     branch (senao o main.commit do binario nao descreve o que foi compilado);
+#     se o commit ainda nao esta em nenhum remoto a branch e empurrada (sem
+#     force) e o efeito e VERIFICADO antes de compilar (se ja esta, nada a fazer);
 #   * swap: recusa se o commit que o binario declara nao esta em nenhum remoto.
 # Bypass deliberado e barulhento (notify): ENGINE_WINDOW_SKIP_BACKUP_CHECK=1
 # (ex.: GitHub fora do ar num P0). Rollback NUNCA e barrado: voltar pro binario
@@ -213,7 +214,7 @@ phase_check() {
     _bk=$(eb_backup_state "$SRC" "$BRANCH")
     case "$_bk" in
       OK\|*) log "  backup ....... OK (so refs locais, sem fetch) — ${_bk#*|}" ;;
-      *)     log "  backup ....... PENDENTE — $BRANCH nao consta em nenhum remoto (${_bk#*|}). 'push' ou 'build' empurram." ;;
+      *)     log "  backup ....... PENDENTE — nenhum ref remoto LOCAL contem $BRANCH (${_bk#*|}). O check nao faz fetch e por isso nao afirma mais que isso; 'push'/'build' verificam de verdade e empurram." ;;
     esac
   fi
 

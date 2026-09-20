@@ -37,9 +37,18 @@
 #             a cada tremida de rede vira ruido que ninguem le.
 # MISSING/ORPHAN so saem depois de um fetch que DEU CERTO (ver a lib).
 #
+# O guard tambem nao cala quando fica CEGO: fetch falhando (contado; alarma apos
+# UNKNOWN_STREAK execucoes seguidas -- as evidencias positivas viram "velhas"),
+# falha ao enumerar branches/worktrees (linha UNKNOWN visivel, mesma regra de
+# sequencia) e falha ao gravar o estado (aviso alto no stderr) aparecem no
+# veredito, contados -- nunca um "nada a reportar" quieto.
+#
 # DETECTION-ONLY, por desenho: nunca empurra, builda, troca binario, faz checkout
-# nem apaga nada (o selftest garante isso na FONTE, nao so no comportamento). O
-# unico efeito no repo-fonte e `fetch --prune`, que so mexe em refs/remotes/*.
+# nem apaga nada. O selftest prova isso pelo que o guard EXECUTA (um git de mentira
+# registra cada subcomando, em todos os cenarios); grep no codigo confundiria o
+# texto do alerta ("git push origin ...") com um comando. O unico efeito no
+# repo-fonte e `fetch --prune`: atualiza/remove refs/remotes/*, traz objetos e
+# reescreve .git/FETCH_HEAD -- nunca toca branch, tag, worktree ou index.
 # Empurrar e o passo da janela (scripts/engine-window-run.sh push) -- este guard
 # so avisa quando esse passo nao aconteceu.
 #
@@ -167,6 +176,39 @@ FETCHED_REPO=""   # repo cujo fetch ja rodou nesta execucao (um fetch por repo p
 add_row() { ROWS="${ROWS}${1}${US}${2}${US}${3}${US}${4}${US}${5}${US}${6}${US}${7}${US}${8}
 "; }
 
+FETCH_FAILS=0
+# Fetch que falha nao e "sem novidade": e o guard ficando CEGO para pushes e
+# apagamentos novos (as evidencias positivas passam a ser 'velhas'). Visivel no
+# relatorio, contado no veredito, e alarma apos UNKNOWN_STREAK execucoes seguidas.
+note_fetch() {   # <rotulo> <repo>   (le EB_FETCH_STATE/EB_FETCH_NOTE do ultimo eb_fetch_all)
+    FETCH_NOTES="${FETCH_NOTES}  [$1] $EB_FETCH_NOTE
+"
+    if [ "$EB_FETCH_STATE" = "failed" ]; then
+        FETCH_FAILS=$((FETCH_FAILS + 1))
+        streak_bump "fetch:$2"
+        if [ "$STREAK_N" -ge "$UNKNOWN_STREAK" ]; then
+            ALARMS=$((ALARMS + 1))
+            notify_once "fetch:$2" "Guard de backup CEGO: fetch falhando em $1 ha $STREAK_N execucoes" \
+                "$EB_FETCH_NOTE (repo $2). Sem fetch o guard so ve refs velhas: pushes e apagamentos novos passam despercebidos." 3 >/dev/null || true
+        fi
+    else
+        streak_reset "fetch:$2"
+    fi
+}
+# Falha ao ENUMERAR (worktrees/branches) tambem e terceiro estado: vira uma linha
+# UNKNOWN visivel, com a mesma regra de sequencia -- nunca "nao ha branches".
+list_failed() {   # <chave> <detalhe>
+    local balarm=0
+    UNKNOWNS=$((UNKNOWNS + 1))
+    streak_bump "$1"
+    if [ "$STREAK_N" -ge "$UNKNOWN_STREAK" ]; then
+        balarm=1
+        ALARMS=$((ALARMS + 1))
+        notify_once "$1" "Guard de backup: nao consigo enumerar as branches da janela ha $STREAK_N execucoes" "$2" 3 >/dev/null || true
+    fi
+    add_row branch "($1)" "" UNKNOWN "$2" "$balarm" "listagem" ""
+}
+
 # ---------------- A) binarios vivos ----------------
 while IFS='|' read -r name kind bin repo <&3; do
     [ -n "$name" ] || continue
@@ -183,8 +225,7 @@ while IFS='|' read -r name kind bin repo <&3; do
     else
         eb_fetch_all "$repo"
         FETCHED_REPO="$repo"
-        FETCH_NOTES="${FETCH_NOTES}  [$name] $EB_FETCH_NOTE
-"
+        note_fetch "$name" "$repo"
         r=$(eb_backup_state "$repo" "$commit")
         state="${r%%|*}"
         detail="${r#*|}"
@@ -229,13 +270,23 @@ while IFS='|' read -r name kind bin repo <&3; do
         if [ "$FETCHED_REPO" != "$repo" ]; then
             eb_fetch_all "$repo"
             FETCHED_REPO="$repo"
-            FETCH_NOTES="${FETCH_NOTES}  [$name/branches] $EB_FETCH_NOTE
-"
+            note_fetch "$name/branches" "$repo"
         fi
-        wt_branches=$(git -C "$repo" worktree list --porcelain 2>/dev/null \
-            | awk '/^worktree /{p=$2} /^branch /{b=$2; sub("^refs/heads/","",b); if (p ~ /\/engine-window-/) print b}') || wt_branches=""
-        blines=$(git -C "$repo" for-each-ref --sort=-committerdate \
-            --format="%(refname:short)${US}%(objectname)${US}%(committerdate:unix)" "refs/heads/$BRANCH_GLOB" 2>/dev/null) || blines=""
+        if wt_out=$(git -C "$repo" worktree list --porcelain 2>/dev/null); then
+            wt_branches=$(printf '%s\n' "$wt_out" \
+                | awk '/^worktree /{p=$2} /^branch /{b=$2; sub("^refs/heads/","",b); if (p ~ /\/engine-window-/) print b}') || wt_branches=""
+            streak_reset "br:worktrees"
+        else
+            wt_branches=""
+            list_failed "br:worktrees" "git worktree list falhou em $repo: o escopo 'worktree-da-janela' esta indisponivel (so a branch mais nova e checada)"
+        fi
+        if blines=$(git -C "$repo" for-each-ref --sort=-committerdate \
+            --format="%(refname:short)${US}%(objectname)${US}%(committerdate:unix)" "refs/heads/$BRANCH_GLOB" 2>/dev/null); then
+            streak_reset "br:list"
+        else
+            blines=""
+            list_failed "br:list" "git for-each-ref falhou em $repo: nao consegui enumerar as branches $BRANCH_GLOB"
+        fi
         newest=""
         while IFS="$US" read -r b tip ct <&4; do
             [ -n "$b" ] || continue
@@ -280,10 +331,24 @@ $ARTIFACTS
 EOF
 
 DUR=$(($(date +%s) - NOW))
+# Evidencia positiva marcada "velha" = o fetch falhou: contada, pra nao ficar so no texto.
+STALE=$(printf '%s' "$ROWS" | grep -c 'possivelmente velhas') || STALE=0
+
+# Falha ao gravar o estado (disco cheio, permissao) tambem e terceiro estado: sem
+# gravar, o cooldown e as sequencias de UNKNOWN nao persistem -- o guard segue
+# avisando, mas sem dedupe e sem nunca completar uma sequencia. Aviso ALTO, nunca
+# quieto. Gravado ANTES de imprimir, pra o relatorio poder dizer que falhou.
+STATE_WRITE_FAILED=0
+if ! printf '%s\n' "$SEEN_JSON" > "$SEEN_FILE" 2>/dev/null; then
+    STATE_WRITE_FAILED=1
+    echo "AVISO: nao consegui gravar o estado em $SEEN_FILE -- cooldown e sequencias de UNKNOWN NAO persistem (disco cheio? permissao?)." >&2
+fi
 
 if [ "$JSON_OUT" = "1" ]; then
-    printf '%s' "$ROWS" | jq -R -s --argjson alarms "$ALARMS" --argjson unknowns "$UNKNOWNS" --argjson nf "$NOTIFY_FAILED" --argjson dur "$DUR" --arg us "$US" '
-        { alarms: $alarms, unknowns: $unknowns, notify_failed: $nf, duration_s: $dur,
+    printf '%s' "$ROWS" | jq -R -s --argjson alarms "$ALARMS" --argjson unknowns "$UNKNOWNS" --argjson nf "$NOTIFY_FAILED" \
+        --argjson ff "$FETCH_FAILS" --argjson stale "$STALE" --argjson swf "$STATE_WRITE_FAILED" --argjson dur "$DUR" --arg us "$US" '
+        { alarms: $alarms, unknowns: $unknowns, notify_failed: $nf, fetch_failed: $ff, stale: $stale,
+          state_write_failed: ($swf == 1), duration_s: $dur,
           rows: ( split("\n") | map(select(length > 0) | split($us)
                   | { kind: .[0], name: .[1], commit: .[2], state: .[3], detail: .[4], alarm: (.[5] == "1"), scope: .[6], binary: .[7] }) ) }'
 else
@@ -304,8 +369,9 @@ else
         [ "$state" != "OK" ] && printf '        -> %s\n' "$detail"
     done
     printf '%s' "$FETCH_NOTES"
-    echo "  VEREDITO: $ALARMS alarme(s) ativo(s), $UNKNOWNS desconhecido(s) nesta execucao, $NOTIFY_FAILED alerta(s) NAO entregue(s)  (medido: ${DUR}s)"
+    SW=""
+    [ "$STATE_WRITE_FAILED" = "1" ] && SW=", ESTADO NAO GRAVADO"
+    echo "  VEREDITO: $ALARMS alarme(s) ativo(s), $UNKNOWNS desconhecido(s), $FETCH_FAILS fetch(es) FALHARAM, $STALE evidencia(s) possivelmente velha(s), $NOTIFY_FAILED alerta(s) NAO entregue(s)${SW}  (medido: ${DUR}s)"
 fi
 
-echo "$SEEN_JSON" > "$SEEN_FILE" 2>/dev/null || true
 exit 0

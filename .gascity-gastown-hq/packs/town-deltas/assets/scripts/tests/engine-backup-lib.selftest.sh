@@ -171,6 +171,25 @@ assert_eq "bypass deliberado -> libera (rc=0)" "0" "$rc"
 assert_has "  mas BARULHENTO no log" "$out" "IGNORADO"
 assert_has "  e dispara notify de prioridade alta" "$(cat "$WORK/notify.log")" "-p 4"
 
+echo "── 9b. terceiro estado na LEITURA: um git que FALHA nao vira 'repo sem remotos' nem MISSING ──"
+# git de mentira que falha (rc=1) quando algum argumento e igual a $FAIL_ARG e
+# delega ao git real nos demais casos.
+mkdir -p "$WORK/failshim"
+cat > "$WORK/failshim/git" <<EOF
+#!/bin/sh
+for a in "\$@"; do [ "\$a" = "\$FAIL_ARG" ] && exit 1; done
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$WORK/failshim/git"
+out=$(PATH="$WORK/failshim:$PATH" FAIL_ARG=remote bash -c '. "$1"; eb_fetch_all "$2"; echo "$EB_FETCH_STATE|$EB_FETCH_NOTE"' _ "$LIB" "$E")
+assert_eq "git remote FALHOU -> fetch 'failed' (NAO 'ok' de um 'repo sem remotos')" "failed" "${out%%|*}"
+assert_has "  a nota diz que nao conseguiu listar os remotos" "$out" "nao consegui listar"
+st=$(PATH="$WORK/failshim:$PATH" FAIL_ARG=remote bash -c '. "$1"; eb_fetch_all "$2"; eb_backup_state "$2" "$3"' _ "$LIB" "$E" "$C_BAD")
+assert_eq "  e um commit so-local com essa leitura quebrada fica UNKNOWN, NAO MISSING" "UNKNOWN" "${st%%|*}"
+st=$(PATH="$WORK/failshim:$PATH" FAIL_ARG=for-each-ref bash -c '. "$1"; eb_fetch_all "$2"; eb_backup_state "$2" "$3"' _ "$LIB" "$E" "$C_BAD")
+assert_eq "git for-each-ref FALHOU (fetch ok) -> UNKNOWN, NAO MISSING (erro nao vira lista vazia)" "UNKNOWN" "${st%%|*}"
+assert_has "  e o detalhe nomeia o for-each-ref" "$st" "for-each-ref"
+
 echo "── 10. invariantes estaticos da lib ──"
 FORCE=$(grep -nE 'push[^#]*(--force|-f |\+refs|--mirror|--delete)' "$LIB" | grep -vE '^[0-9]+:[[:space:]]*#' || true)
 if [ -z "$FORCE" ]; then ok "nenhuma linha de codigo da lib faz force/mirror/delete no push"; else bad "achei push perigoso: $FORCE"; fi

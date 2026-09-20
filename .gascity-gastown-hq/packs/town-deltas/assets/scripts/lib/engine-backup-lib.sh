@@ -30,7 +30,9 @@
 #   OK       algum ref remoto CONTEM o commit (positivo; marcado "velhas" se o fetch falhou)
 #   MISSING  o commit existe so neste disco: nenhum remoto o contem
 #   ORPHAN   o commit nem existe no repo-fonte (a fonte do binario pode nao existir em lugar nenhum)
-#   UNKNOWN  nao da pra saber (fetch falhou sem evidencia positiva, repo ilegivel, ...)
+#   UNKNOWN  nao da pra saber (fetch falhou sem evidencia positiva, uma leitura do git
+#            falhou -- remotos, for-each-ref --, repo ilegivel, ...). Erro de leitura
+#            nunca vira lista vazia, e lista vazia nunca vira acusacao.
 # MISSING e ORPHAN so sao afirmados depois de um fetch que DEU CERTO: sem visao
 # fresca do remoto, "nao achei" nao prova "nao existe" e o estado honesto e UNKNOWN.
 #
@@ -115,7 +117,15 @@ eb_fetch_all() {
         EB_FETCH_NOTE="sem fetch (EB_NO_FETCH=1)"
         return 0
     fi
-    remotes="${EB_REMOTES:-$(git -C "$repo" remote 2>/dev/null || true)}"
+    if [ -n "${EB_REMOTES:-}" ]; then
+        remotes="$EB_REMOTES"
+    elif ! remotes=$(git -C "$repo" remote 2>/dev/null); then
+        # NAO conseguir listar os remotos nao e "repo sem remotos" (uma visao
+        # completa e fresca): e "nao sei". Terceiro estado, nunca colapsado em ok.
+        EB_FETCH_STATE="failed"
+        EB_FETCH_NOTE="nao consegui listar os remotos de $repo"
+        return 0
+    fi
     for remote in $remotes; do
         try=0
         rc=1
@@ -145,7 +155,7 @@ eb_fetch_all() {
 # eb_backup_state <repo> <commit> -- imprime "ESTADO|detalhe" (ver CONTRATO). Le
 # EB_FETCH_STATE: chame eb_fetch_all <repo> antes (uma vez por repo, nao por commit).
 eb_backup_state() {
-    local repo="$1" commit="$2" full refs
+    local repo="$1" commit="$2" full refs refs_raw
     if [ -z "$repo" ] || [ -z "$commit" ]; then
         echo "UNKNOWN|argumento vazio (repo/commit)"
         return 0
@@ -163,7 +173,13 @@ eb_backup_state() {
         fi
         return 0
     fi
-    refs=$(git -C "$repo" for-each-ref --contains "$full" --format='%(refname:short)' refs/remotes 2>/dev/null | sed -n '1,3p' | tr '\n' ' ') || refs=""
+    # O rc do for-each-ref e lido SEPARADO do pipe de formatacao: um for-each-ref que
+    # FALHOU nao pode virar "lista vazia" e depois MISSING (uma acusacao) -- e UNKNOWN.
+    if ! refs_raw=$(git -C "$repo" for-each-ref --contains "$full" --format='%(refname:short)' refs/remotes 2>/dev/null); then
+        echo "UNKNOWN|git for-each-ref --contains falhou em $repo: nao da pra saber se algum remoto contem $commit"
+        return 0
+    fi
+    refs=$(printf '%s\n' "$refs_raw" | sed -n '1,3p' | tr '\n' ' ') || refs=""
     refs="${refs% }"
     if [ -n "$refs" ]; then
         if [ "$EB_FETCH_STATE" = "ok" ]; then

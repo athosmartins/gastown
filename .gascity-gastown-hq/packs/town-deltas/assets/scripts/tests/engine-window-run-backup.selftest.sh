@@ -95,6 +95,24 @@ for f in "$RUN" "$SWAP"; do
     done
 done
 
+echo "── 1b. CANARIO DE SEGURANCA: o script sob teste HONRA o sandbox, senao NENHUMA fase roda ──"
+# Este teste dirige a fase que troca o gc da cidade inteira. Um script que ignore
+# ENGINE_WINDOW_SYMLINK (uma versao ANTERIOR do run.sh, ou um mutante) trocaria o
+# symlink REAL /opt/homebrew/bin/gc por um binario de fixture que some junto com o
+# mktemp -- e o gc da cidade ficaria pendurado. `check` e somente-leitura e imprime o
+# alvo do symlink que o script LEU: se nao for o do sandbox, o script nao honra o
+# seam e abortamos AQUI, antes de qualquer fase que escreva.
+run_win -- check
+case "$OUT" in
+    *"binario vivo agora: $WORK/old-gc"*)
+        ok "o script leu o symlink do SANDBOX (ENGINE_WINDOW_SYMLINK honrado)" ;;
+    *)
+        bad "o script sob teste IGNOROU ENGINE_WINDOW_SYMLINK (leu outro symlink) -- ABORTANDO antes de qualquer fase que troque o symlink"
+        echo "  (o que o check leu: $(printf '%s' "$OUT" | grep 'binario vivo agora' | head -1))"
+        echo "── $PASS ok, $FAIL falha(s) -- ABORTADO POR SEGURANCA (nenhuma fase de escrita rodou) ──"
+        exit 2 ;;
+esac
+
 echo "── 2. 'check' e SOMENTE-LEITURA e ja mostra o estado do backup ──"
 run_win -- check
 assert_has "check (branch ainda so local) diz PENDENTE" "$OUT" "backup ....... PENDENTE"

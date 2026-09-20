@@ -42,18 +42,32 @@ exec "$REAL_GIT" "\$@"
 EOF
 chmod +x "$WORK/gitshim/git"
 : > "$WORK/git-shim.log"
+# git de mentira que FALHA (rc=1) quando algum argumento == $FAIL_ARG (injecao de falha
+# de leitura: enumerar branches, listar worktrees...). So entra no PATH se GUARD_FAIL_ARG.
+mkdir -p "$WORK/failshim"
+cat > "$WORK/failshim/git" <<EOF
+#!/bin/sh
+for a in "\$@"; do [ "\$a" = "\$FAIL_ARG" ] && exit 1; done
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$WORK/failshim/git"
 
 GRACE=3600
 GUARD_BASH=bash
 SPEC=""
 NOTIFY_UNDER_TEST="$WORK/fake-notify"
+SEEN_UNDER_TEST="$WORK/seen.json"
+GUARD_FAIL_ARG=""
 # run_guard [args...] -> OUT (stdout), ERR (stderr), RC. Separados: o JSON do stdout
-# nao pode ser contaminado pelos AVISOs do stderr.
+# nao pode ser contaminado pelos AVISOs do stderr. GUARD_FAIL_ARG=<arg> faz todo git
+# chamado com esse argumento falhar (injecao de falha de leitura).
 run_guard() {
-    OUT=$(PATH="$WORK/gitshim:$PATH" GC_CITY_PATH="$CITY" \
+    local _p="$WORK/gitshim:$PATH"
+    [ -n "$GUARD_FAIL_ARG" ] && _p="$WORK/failshim:$_p"
+    OUT=$(PATH="$_p" FAIL_ARG="$GUARD_FAIL_ARG" GC_CITY_PATH="$CITY" \
         ENGINE_BACKUP_GUARD_ARTIFACTS="$SPEC" \
         ENGINE_WINDOW_GUARD_SRC_TREE="$E" \
-        ENGINE_BACKUP_GUARD_SEEN_FILE="$WORK/seen.json" \
+        ENGINE_BACKUP_GUARD_SEEN_FILE="$SEEN_UNDER_TEST" \
         ENGINE_BACKUP_GUARD_LOCK="$WORK/guard.lock" \
         ENGINE_BACKUP_GUARD_BRANCH_GRACE_S="$GRACE" \
         ENGINE_BACKUP_GUARD_UNKNOWN_STREAK=3 \
@@ -153,10 +167,15 @@ assert_eq "  sem alarme ainda" "0:0" "$(jf '.alarms'):$(notify_count)"
 run_guard --json
 assert_eq "2a execucao: ainda sem alarme" "0:0" "$(jf '.alarms'):$(notify_count)"
 run_guard --json
-assert_eq "3a execucao seguida: alarme" "1" "$(jf '.alarms')"
-assert_eq "  1 notify" "1" "$(notify_count)"
+# Dois sintomas da MESMA causa (rede fora), dois alarmes distintos, ambos p3: o do
+# artefato ("nao consigo verificar o backup de gc") e o do proprio guard cego
+# ("fetch falhando" -- ver a secao 19). Cada um carrega uma informacao diferente.
+assert_eq "3a execucao seguida: 2 alarmes (artefato UNKNOWN + guard CEGO pelo fetch)" "2" "$(jf '.alarms')"
+assert_eq "  2 notify" "2" "$(notify_count)"
 assert_has "  prioridade 3 (nao 4: e incerteza, nao prova)" "$(cat "$NOTIFY_LOG")" "-p 3"
-assert_has "  titulo diz que nao consegue VERIFICAR" "$(cat "$NOTIFY_LOG")" "Nao consigo verificar"
+assert_has "  um titulo diz que nao consegue VERIFICAR o backup" "$(cat "$NOTIFY_LOG")" "Nao consigo verificar"
+assert_has "  e outro diz que o guard ficou CEGO" "$(cat "$NOTIFY_LOG")" "CEGO"
+assert_lacks "  nenhum dos dois e p4 (incerteza nao e prova)" "$(cat "$NOTIFY_LOG")" "-p 4"
 git -C "$E" remote set-url origin "$FX_REMOTE"
 run_guard --json
 assert_eq "rede volta: o commit e so-local -> vira MISSING de verdade" "MISSING" "$(jf '.rows[]|select(.kind=="artifact")|.state')"
@@ -275,7 +294,55 @@ OUTTHIN=$(env PATH=/usr/bin:/bin GC_CITY_PATH="$CITY" ENGINE_BACKUP_GUARD_ARTIFA
 assert_eq "exit 0 com PATH=/usr/bin:/bin" "0" "$RCTHIN"
 assert_eq "  e produz JSON valido (nao morreu em 'flock/jq nao encontrado')" "true" "$(printf '%s' "$OUTTHIN" | jq -e '.rows|length>0' >/dev/null 2>&1 && echo true || echo false)"
 
-echo "── 19. invariante COMPORTAMENTAL: todo git que o guard executou, em TODOS os cenarios acima ──"
+echo "── 19. fetch falhando: o guard fica CEGO e DIZ (evidencia velha contada; alarma na sequencia) ──"
+rm -f "$WORK/seen.json"; : > "$NOTIFY_LOG"
+fx_fake_gc "$WORK/bin/gc-live" "$(short "$MAIN_TIP")"     # commit ja empurrado: OK, mas so por evidencia velha
+git -C "$E" remote set-url origin "$WORK/nao-existe.git"
+run_guard --json
+assert_eq "1a: a evidencia positiva ainda vale -> gc OK" "OK" "$(jf '.rows[]|select(.kind=="artifact")|.state')"
+assert_eq "  fetch_failed contado" "1" "$(jf '.fetch_failed')"
+assert_eq "  evidencia velha CONTADA (nao so no texto)" "yes" "$([ "$(jf '.stale')" -ge 1 ] && echo yes || echo no)"
+assert_eq "  sem alarme na 1a" "0:0" "$(jf '.alarms'):$(notify_count)"
+run_guard --json
+assert_eq "2a: ainda sem alarme" "0:0" "$(jf '.alarms'):$(notify_count)"
+run_guard --json
+assert_eq "3a seguida: alarme (o guard esta CEGO)" "1" "$(jf '.alarms')"
+assert_has "  titulo diz que o guard esta CEGO" "$(cat "$NOTIFY_LOG")" "CEGO"
+git -C "$E" remote set-url origin "$FX_REMOTE"
+run_guard --json
+assert_eq "rede volta: fetch_failed zera" "0" "$(jf '.fetch_failed')"
+assert_eq "  e o alarme de cegueira some" "0" "$(jf '.alarms')"
+
+echo "── 20. falha ao ENUMERAR branches/worktrees: linha UNKNOWN visivel (nunca 'nao ha branches') ──"
+rm -f "$WORK/seen.json"; : > "$NOTIFY_LOG"
+GUARD_FAIL_ARG='--sort=-committerdate'
+run_guard --json
+assert_eq "for-each-ref das branches FALHOU -> linha UNKNOWN visivel" "UNKNOWN" "$(jf '.rows[]|select(.name=="(br:list)")|.state')"
+assert_eq "  contada em unknowns" "yes" "$([ "$(jf '.unknowns')" -ge 1 ] && echo yes || echo no)"
+assert_eq "  sem alarme na 1a" "0" "$(jf '.alarms')"
+run_guard --json; run_guard --json
+assert_eq "  3a seguida: alarme" "1" "$(jf '.alarms')"
+assert_has "  e o notify diz que nao consegue enumerar" "$(cat "$NOTIFY_LOG")" "nao consigo enumerar"
+rm -f "$WORK/seen.json"; : > "$NOTIFY_LOG"
+GUARD_FAIL_ARG=worktree
+run_guard --json
+assert_eq "git worktree list FALHOU -> linha UNKNOWN (br:worktrees)" "UNKNOWN" "$(jf '.rows[]|select(.name=="(br:worktrees)")|.state')"
+assert_eq "  e o resto do scan segue (a branch T1 continua listada)" "OK" "$(jf '.rows[]|select(.name=="consolidated/engine-window-T1")|.state')"
+GUARD_FAIL_ARG=""
+
+echo "── 21. estado que NAO grava: aviso ALTO e contado (nunca quieto) ──"
+mkdir -p "$WORK/ro"
+chmod 555 "$WORK/ro"
+SEEN_UNDER_TEST="$WORK/ro/seen.json"
+run_guard --json
+assert_eq "state_write_failed=true no JSON" "true" "$(jf '.state_write_failed')"
+assert_has "  e o stderr avisa que o estado nao foi gravado" "$ERR" "nao consegui gravar o estado"
+run_guard
+assert_has "  o veredito humano tambem diz ESTADO NAO GRAVADO" "$OUT" "ESTADO NAO GRAVADO"
+chmod 755 "$WORK/ro"
+SEEN_UNDER_TEST="$WORK/seen.json"
+
+echo "── 22. invariante COMPORTAMENTAL: todo git que o guard executou, em TODOS os cenarios acima ──"
 # Verbo = primeiro argumento que nao e opcao (pulando '-C <dir>' e '-c <k=v>'); para
 # 'worktree' o subcomando tambem conta (so 'list' e leitura).
 USED=$(awk '{ i=1; while (i<=NF) { if ($i=="-C" || $i=="-c") { i+=2; continue } if ($i ~ /^-/) { i++; continue } v=$i; if (v=="worktree") v=v " " $(i+1); print v; break } }' "$WORK/git-shim.log" | sort -u)
