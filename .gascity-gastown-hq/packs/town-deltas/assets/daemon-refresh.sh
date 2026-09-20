@@ -346,7 +346,10 @@
 #                                   batch's output (killed mid-run — the
 #                                   calculator flushes each entry as it
 #                                   completes, so this only affects whichever
-#                                   entries hadn't finished yet). NEVER folded
+#                                   entries hadn't finished yet), or its answer
+#                                   was reaches=false but the calculator's own
+#                                   warnings flag the analysis as partial or
+#                                   unrunnable (point 19). NEVER folded
 #                                   into SEM EVIDÊNCIA — an unanswered
 #                                   question is not a negative answer (the
 #                                   same distinction PROOF's not_verified
@@ -409,6 +412,52 @@
 #      SÍMBOLO/NÃO CALCULADO, never promoted into VERDICT, never removing a
 #      label from GUARDED) are UNCHANGED from point 17 — this point only
 #      changes HOW the answer is computed, never what it means.
+#  19. (ga-j3lh6p) A guarded daemon that restart_policy.yaml lists as
+#      notify_only_locked ("Trava humana: NUNCA auto" — e.g. demand_dashboard
+#      hosts the outreach_worker in-process, a restart halts outreach) can never
+#      be made fresh by ANY automation. A consumer that holds a delivery for "a
+#      still-stale guarded daemon" therefore holds it FOREVER once that is the
+#      only one left (wa-z66jb 20/09: delivery:deploy-pending permanent, closed
+#      by hand after ~20min of investigation, then wa-ho1ol the same day) —
+#      even when point 17's split already says that daemon's entrypoint has NO
+#      call-graph path to any symbol this window changed: staleness that is
+#      cosmetic and never going to clear. Nothing consumed that answer.
+#      GUARDED_LOCKED_COSMETIC names, in ONE place that owns both facts (the
+#      policy file and the split), the GUARDED subset that is (a) locked — at
+#      least one entrypoint in notify_only_locked and NOT explicitly
+#      allow-listed in auto/deploy_restart (the same "explicitly safe first"
+#      precedence policy_says_sensitive() applies), and only when the policy
+#      PARSED (an unreadable file proves nothing is locked) — AND (b) in
+#      GUARDED_SYMBOL_NO_EVIDENCE. It only ANNOTATES: VERDICT and GUARDED never
+#      change; the consumers (story-delivery.sh Step 5b, quality-gate-
+#      dispatcher.sh) decide, and release only on POSITIVE membership — every
+#      still-stale label named here — never on an emptiness inferred from a
+#      missing field. A locked daemon whose symbol IS reached (SYMBOL-CONFIRMED)
+#      or was never computed stays a real hold: this is NOT "ignore
+#      notify_only_locked".
+#      What makes (b) trustworthy: compute_symbol_reachability.py returns
+#      reaches=false not only for "analysed cleanly, found no path" but ALSO for
+#      an unparseable or absent ENTRYPOINT ("reaches=False por padrão seguro",
+#      "não dá pra avaliar") and after DROPPING a closure file whose structural
+#      diff failed (a possible false negative). Those used to land in SEM
+#      EVIDÊNCIA DE SÍMBOLO — harmless while that section was only presentation,
+#      unsound the moment a release depends on it. They are NÃO CALCULADO now:
+#      the same erro != vazio distinction point 17 already draws for a crash or a
+#      missing line, applied to the calculator's own warnings. The ONE warning
+#      that leaves the answer trustworthy is "<closure file>: ausente em --after
+#      (<sha>) — ignorado" (a file added by a commit later than the range
+#      examined, or deleted): nothing else about the analysis is affected, and
+#      demanding zero warnings would only ever release a story merged at the tip
+#      of the runtime (the closure JSON is the runtime's CURRENT one). A result
+#      with no "warnings" list at all (a calculator that predates the field)
+#      cannot be verified clean and is NÃO CALCULADO too.
+#      The bound this puts on the claim: "no call-graph path" is not proof — a
+#      changed module-level constant read by an unchanged function, or a call
+#      chain the AST walk does not follow, is invisible to it (see point 17's
+#      "not a full transitive closure"). For a daemon that automation may
+#      restart that residual risk is what the guarded-restart hold exists for;
+#      for one that automation may NEVER restart, the alternative is a hold that
+#      can never clear, which is why only the locked class is released on it.
 #
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
@@ -463,6 +512,12 @@
 #     GUARDED_CLOSURE_ONLY above — not a subdivision of either bucket. Always
 #     present, even empty. All three stay empty when $RUNTIME_DIR/scripts/
 #     compute_symbol_reachability.py does not exist.)
+#   GUARDED_LOCKED_COSMETIC=<labels>   (ga-j3lh6p, header point 19: always
+#     present, even empty. The subset of GUARDED that is BOTH notify_only_locked
+#     in restart_policy.yaml (no automation may ever restart it) AND cleanly
+#     classified GUARDED_SYMBOL_NO_EVIDENCE. Annotation only — VERDICT and
+#     GUARDED never change. A consumer may stop holding a delivery for such a
+#     daemon ONLY on positive membership: every still-stale label named here.)
 #   WOULD_RESTART=<labels>   (ga-omfwe: DRY_RUN=1 only — labels that would be
 #     restarted for real; RESTARTED is always empty under DRY_RUN=1, so the
 #     two never collapse into the same string)
@@ -739,6 +794,11 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   echo "GUARDED_SYMBOL_CONFIRMED=${GUARDED_SYMBOL_CONFIRMED:-}"
   echo "GUARDED_SYMBOL_NO_EVIDENCE=${GUARDED_SYMBOL_NO_EVIDENCE:-}"
   echo "GUARDED_SYMBOL_NOT_COMPUTED=${GUARDED_SYMBOL_NOT_COMPUTED:-}"
+  # ga-j3lh6p (header point 19): always present, even empty — a subset of
+  # GUARDED (locked against automation AND cleanly no-evidence). A consumer
+  # reads it unconditionally; an absent line means an older helper and is never
+  # the same as an empty one.
+  echo "GUARDED_LOCKED_COSMETIC=${GUARDED_LOCKED_COSMETIC:-}"
   echo "ALREADY_FRESH=${ALREADY_FRESH:-}"
   echo "WOULD_RESTART=${WOULD_RESTART:-}"
   # ga-tdzsh: always present (even on the early-precondition emits above,
@@ -756,9 +816,9 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   # same convention as PARSE_ERROR_LOADED/UNLOADED above.
   echo "UNATTRIBUTED_JOB_GAP=${SJ_UNATTRIBUTED_REASON:-}"
   # Trailing JSON for the caller's bead comment / jsonl log.
-  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" "${AFFECTED_NOT_RUNNING:-}" "${GUARDED_OWN:-}" "${GUARDED_CLOSURE_ONLY:-}" "${GUARDED_SYMBOL_CONFIRMED:-}" "${GUARDED_SYMBOL_NO_EVIDENCE:-}" "${GUARDED_SYMBOL_NOT_COMPUTED:-}" <<'PY' 2>/dev/null || true
+  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" "${AFFECTED_NOT_RUNNING:-}" "${GUARDED_OWN:-}" "${GUARDED_CLOSURE_ONLY:-}" "${GUARDED_SYMBOL_CONFIRMED:-}" "${GUARDED_SYMBOL_NO_EVIDENCE:-}" "${GUARDED_SYMBOL_NOT_COMPUTED:-}" "${GUARDED_LOCKED_COSMETIC:-}" <<'PY' 2>/dev/null || true
 import json, sys
-v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg, anr, gd_own, gd_co, gd_sc, gd_sne, gd_snc = sys.argv[1:19]
+v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg, anr, gd_own, gd_co, gd_sc, gd_sne, gd_snc, gd_lc = sys.argv[1:20]
 sp = lambda s: [x for x in s.split() if x]
 print("JSON=" + json.dumps({
     "verdict": v, "reason": reason,
@@ -767,6 +827,7 @@ print("JSON=" + json.dumps({
     "guarded_own": sp(gd_own), "guarded_closure_only": sp(gd_co),
     "guarded_symbol_confirmed": sp(gd_sc), "guarded_symbol_no_evidence": sp(gd_sne),
     "guarded_symbol_not_computed": sp(gd_snc),
+    "guarded_locked_cosmetic": sp(gd_lc),
     "already_fresh": sp(afr), "would_restart": sp(wr),
     "parse_error_loaded": sp(pel), "parse_error_unloaded": sp(peu),
     "unattributed_job_gap": ujg,
@@ -785,6 +846,10 @@ AFFECTED_OWN=""; GUARDED_OWN=""; GUARDED_CLOSURE_ONLY=""
 # lazily in Step 5 (not here at Step 3/4, unlike GUARDED_OWN/
 # GUARDED_CLOSURE_ONLY) — see symbol_reachability_for()'s call site.
 GUARDED_SYMBOL_CONFIRMED=""; GUARDED_SYMBOL_NO_EVIDENCE=""; GUARDED_SYMBOL_NOT_COMPUTED=""
+# ga-j3lh6p (header point 19): the subset of GUARDED that is locked against
+# automation AND cleanly classified no-evidence. Built in Step 5, right after
+# the three lists above are final; empty on every path that never reaches it.
+GUARDED_LOCKED_COSMETIC=""
 # wa-xokje: subset of AFFECTED that Step 4 below finds has no live PID at all
 # (a scheduled/one-shot job or an already-down daemon) — never kickstarted,
 # never a restart candidate, and — unlike a live daemon — cannot be made
@@ -1510,6 +1575,35 @@ policy_says_sensitive() {
     return 0   # at least one entrypoint is NOT explicitly safe -> sensitive
   done
   return 1   # every entrypoint explicitly allow-listed safe
+}
+
+# label_notify_only_locked <label> (ga-j3lh6p, header point 19) -> 0 iff at
+# least one of this daemon's entrypoints is listed notify_only_locked in
+# restart_policy.yaml AND is NOT explicitly allow-listed for automatic restart
+# (auto/deploy_restart) — the SAME "explicitly safe first" precedence
+# policy_says_sensitive() applies just above, so a daemon that automation CAN
+# restart is never called locked (it is not stuck forever).
+# Three-state honesty, and the uncertain direction is ALWAYS 1: no policy file,
+# a policy that EXISTS but did not parse (POLICY_PARSE_OK unset — the sibling
+# treats that as "sensitive", which is the fail-closed answer THERE; here the
+# fail-closed answer is the opposite, "cannot prove locked"), or a label with no
+# resolved entrypoint all return 1. This only feeds GUARDED_LOCKED_COSMETIC,
+# where a wrong 0 would let a delivery through, so "don't know" must not read as
+# "locked". Reads $DISCO_DIR/$label, populated for every label by Step 2.
+label_notify_only_locked() {
+  local label="$1" entries entry base
+  [ -f "$RESTART_POLICY_YAML" ] || return 1
+  [ -n "$POLICY_PARSE_OK" ] || return 1
+  entries="$(cat "$DISCO_DIR/$label" 2>/dev/null || true)"
+  [ -n "${entries// /}" ] || return 1
+  for entry in $entries; do
+    base="$(basename "$entry")"
+    case " $POLICY_AUTO $POLICY_DEPLOY_RESTART " in
+      *" $base "*) continue ;;   # explicitly allow-listed safe: not locked (precedes locked)
+    esac
+    case " $POLICY_NOTIFY_ONLY_LOCKED " in *" $base "*) return 0 ;; esac
+  done
+  return 1
 }
 
 # guard_allows_restart <label> (ga-ylr2m) -> 0 if no configured guard objects.
@@ -2527,7 +2621,18 @@ elif [ -n "${GUARDED// /}" ]; then
       # tri-state honesty as the old per-label timeout: an unanswered
       # question, never a negative answer.
       SR_CLASSIFY="$(printf '%s\n' "$SR_OUT" | python3 -c '
-import json, sys
+import json, re, sys
+# ga-j3lh6p (header point 19): reaches=false is NOT always "analysed cleanly,
+# found no path". The calculator also returns it for an unparseable or absent
+# ENTRYPOINT (reaches=False por padrao seguro / nao da pra avaliar) and after
+# DROPPING a closure file whose structural diff failed (a possible false
+# negative). This is the ONE warning that leaves the answer trustworthy: a
+# CLOSURE file absent at --after (added by a commit later than the range, or
+# deleted) - nothing else about the analysis is affected. The separator before
+# "ignorado" is an em dash in the calculator wording; it is matched as any single
+# character so this Python stays pure ASCII (it runs under launchd with a
+# minimal locale) and needs no escape.
+BENIGN = re.compile(r"^.+: ausente em --after \([^)]*\) . ignorado$")
 confirmed, no_evidence = [], []
 for line in sys.stdin:
     line = line.strip()
@@ -2544,7 +2649,13 @@ for line in sys.stdin:
     if r is True:
         confirmed.append(label)
     elif r is False:
-        no_evidence.append(label)
+        w = d.get("warnings")
+        if isinstance(w, list) and all(isinstance(x, str) and BENIGN.match(x) for x in w):
+            no_evidence.append(label)
+        # else: reaches=false but the analysis was partial or could not run, or
+        # this calculator predates the warnings field. NOT a negative answer:
+        # appended to neither list, so the shell loop below files it under
+        # NOT_COMPUTED (an unevaluated label is never no-evidence).
     # r is anything else (missing/null) -> not appended to either list;
     # the shell loop below defaults an unmatched label to NOT_COMPUTED.
 print(" ".join(confirmed))
@@ -2577,6 +2688,18 @@ print(" ".join(no_evidence))
     GUARDED_SYMBOL_CONFIRMED="$(echo "$GUARDED_SYMBOL_CONFIRMED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
     GUARDED_SYMBOL_NO_EVIDENCE="$(echo "$GUARDED_SYMBOL_NO_EVIDENCE" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
     GUARDED_SYMBOL_NOT_COMPUTED="$(echo "$GUARDED_SYMBOL_NOT_COMPUTED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+    # ga-j3lh6p (header point 19): the GUARDED subset that is BOTH locked against
+    # automation (restart_policy.yaml notify_only_locked) AND cleanly classified
+    # no-evidence. Only ever drawn FROM GUARDED_SYMBOL_NO_EVIDENCE, which is
+    # itself a subset of GUARDED — so a label can never be named here that the
+    # consumer was not already holding. Annotation only: VERDICT and GUARDED are
+    # untouched.
+    for label in $GUARDED_SYMBOL_NO_EVIDENCE; do
+      if label_notify_only_locked "$label"; then
+        GUARDED_LOCKED_COSMETIC="$GUARDED_LOCKED_COSMETIC $label"
+      fi
+    done
+    GUARDED_LOCKED_COSMETIC="$(echo "$GUARDED_LOCKED_COSMETIC" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
     if [ -n "${GUARDED_SYMBOL_CONFIRMED// /}" ]; then
       NGR_RANKED="${NGR_RANKED} || SYMBOL-CONFIRMED ($(echo "$GUARDED_SYMBOL_CONFIRMED" | wc -w | tr -d ' ')) -- entrypoint's call graph reaches a symbol that changed in this window (wa-th4b1), restart THESE first:${GUARDED_SYMBOL_CONFIRMED}"
     fi
@@ -2584,7 +2707,10 @@ print(" ".join(no_evidence))
       NGR_RANKED="${NGR_RANKED} || SEM EVIDÊNCIA DE SÍMBOLO ($(echo "$GUARDED_SYMBOL_NO_EVIDENCE" | wc -w | tr -d ' ')) -- imports what changed, no call-graph path found to a changed symbol (not a full transitive closure -- verify by hand):${GUARDED_SYMBOL_NO_EVIDENCE}"
     fi
     if [ -n "${GUARDED_SYMBOL_NOT_COMPUTED// /}" ]; then
-      NGR_RANKED="${NGR_RANKED} || NÃO CALCULADO ($(echo "$GUARDED_SYMBOL_NOT_COMPUTED" | wc -w | tr -d ' ')) -- compute_symbol_reachability.py gave no usable answer for these (error/timeout/unparseable output) -- absence of evidence is not evidence of absence, verify by hand:${GUARDED_SYMBOL_NOT_COMPUTED}"
+      NGR_RANKED="${NGR_RANKED} || NÃO CALCULADO ($(echo "$GUARDED_SYMBOL_NOT_COMPUTED" | wc -w | tr -d ' ')) -- compute_symbol_reachability.py gave no usable answer for these (error/timeout/unparseable output, or a partial analysis its own warnings flag) -- absence of evidence is not evidence of absence, verify by hand:${GUARDED_SYMBOL_NOT_COMPUTED}"
+    fi
+    if [ -n "${GUARDED_LOCKED_COSMETIC// /}" ]; then
+      NGR_RANKED="${NGR_RANKED} || TRAVA HUMANA SEM EVIDÊNCIA ($(echo "$GUARDED_LOCKED_COSMETIC" | wc -w | tr -d ' ')) -- notify_only_locked em restart_policy.yaml (nenhuma automação reinicia; só um humano, e reiniciar derruba o que o daemon hospeda) E nenhum caminho de chamada até símbolo alterado nesta janela: staleness cosmética que não se cura sozinha, então NÃO segura a entrega (ga-j3lh6p). É evidência, não prova -- mesma ressalva do split por símbolo acima (não é fechamento transitivo completo):${GUARDED_LOCKED_COSMETIC}"
     fi
   fi
   if [ -f "$DEPLOY_DEPS_JSON" ] && [ "$TOTAL_ENTRY_COUNT" -gt 0 ] && [ "$JSON_COVERED_ENTRY_COUNT" -eq "$TOTAL_ENTRY_COUNT" ]; then

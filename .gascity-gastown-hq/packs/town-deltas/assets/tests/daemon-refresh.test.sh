@@ -293,6 +293,33 @@ def result_for(entrypoint):
         return {"reaches": True, "via": "graph", "path": ["entry", "mid", "handler"], "changed_symbols": ["handler"], "warnings": []}
     if mode == "no_evidence":
         return {"reaches": False, "via": None, "path": [], "changed_symbols": ["other"], "warnings": []}
+    # ga-j3lh6p: the REAL calculator returns reaches=False in several cases that
+    # are NOT "analysed cleanly, no call-graph path" (compute_symbol_reachability
+    # .py lines ~501-550). These modes reproduce its exact warning wording so the
+    # producer's clean/unevaluable split is tested against the real contract.
+    #   benign      — a CLOSURE file absent at --after (added by a later commit,
+    #                 or deleted): the analysis of everything else is complete.
+    #   syntax      — the ENTRYPOINT failed to parse: "reaches=False por padrão
+    #                 seguro" is a could-not-evaluate, not a negative answer.
+    #   unevaluable — the ENTRYPOINT is absent at --after: "não dá pra avaliar".
+    #   closure_syn — a closure file failed the structural diff: its changed
+    #                 symbols were dropped, so a false negative is possible.
+    #   nowarnkey   — a calculator that predates the "warnings" field entirely.
+    if mode == "no_evidence_benign_warning":
+        return {"reaches": False, "via": None, "path": [], "changed_symbols": ["other"],
+                "warnings": ["lib/added_later.py: ausente em --after (abc1234) — ignorado"]}
+    if mode == "no_evidence_syntax_error":
+        return {"reaches": False, "via": None, "path": [], "changed_symbols": [],
+                "warnings": ["daemons/x.py: SyntaxError (invalid syntax (<unknown>, line 1)) — reaches=False por padrão seguro"]}
+    if mode == "no_evidence_unevaluable":
+        return {"reaches": False, "via": None, "path": [], "changed_symbols": [],
+                "warnings": ["lib/added_later.py: ausente em --after (abc1234) — ignorado",
+                             "daemons/x.py: ausente em --after, não dá pra avaliar"]}
+    if mode == "no_evidence_closure_syntax_error":
+        return {"reaches": False, "via": None, "path": [], "changed_symbols": ["other"],
+                "warnings": ["lib/broken.py: SyntaxError no diff estrutural (invalid syntax) — ignorado"]}
+    if mode == "no_evidence_nowarnkey":
+        return {"reaches": False, "via": None, "path": [], "changed_symbols": ["other"]}
     return mode  # "crash" | "hang" | "badjson" | "missing" — handled by caller
 
 
@@ -2787,6 +2814,211 @@ assert d["n_entries"] == 5, d["n_entries"]
 ' "$MOCK/symbol_batch_argv.json" 2>/tmp/t70_err \
   && ok "T70 the one invocation carried all 5 entries in its manifest" \
   || nok "T70 manifest entry count" "$(cat /tmp/t70_err 2>/dev/null)"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T71-T83 (ga-j3lh6p, header point 19): GUARDED_LOCKED_COSMETIC.
+#
+# THE BUG (wa-z66jb 20/09, wa-ho1ol same day): a story's merge touched a shared
+# lib that com.whatsapp.demand-dashboard imports. That daemon is
+# notify_only_locked in restart_policy.yaml ("Trava humana: NUNCA auto" — it
+# hosts the outreach_worker in-process, a restart halts outreach), so NO
+# automation ever restarts it, so the delivery consumer that holds a story for a
+# still-stale guarded daemon holds it FOREVER (delivery:deploy-pending), and the
+# Mayor closed each by hand after ~20min of investigation. The report already
+# contained the answer — the symbol split said "no call-graph path from this
+# entrypoint to a changed symbol" — but nothing consumed it.
+#
+# This layer names, in ONE place that owns both facts (the policy file and the
+# symbol split), the GUARDED subset that is BOTH (a) locked against automation
+# AND (b) CLEANLY evaluated to "no path". It only ANNOTATES: VERDICT and GUARDED
+# never change. Consumers decide what to do with it.
+#
+# The load-bearing rule (erro != vazio): reaches=false is NOT always "analysed,
+# found nothing". The calculator also returns it for an unparseable/absent
+# ENTRYPOINT ("reaches=False por padrão seguro", "não dá pra avaliar") and after
+# dropping a closure file whose structural diff failed. Those must be NOT
+# COMPUTED — never no-evidence — or a broken analysis would release a delivery.
+# Only the one benign warning (a closure file absent at --after: added by a later
+# commit, or deleted) leaves the answer trustworthy.
+# ════════════════════════════════════════════════════════════════════════════
+# json_list <key> <helper-output> -> the trailing JSON's list field, space-joined
+json_list() {
+  echo "$2" | grep '^JSON=' | sed 's/^JSON=//' | python3 -c '
+import json, sys
+print(" ".join(json.load(sys.stdin)[sys.argv[1]]))' "$1" 2>/dev/null
+}
+# a running, STALE, notify_only_locked demand-dashboard — fixture shared by T71-T80
+locked_dd_case() {  # locked_dd_case <case-name> <pid>
+  new_case "$1"
+  make_symbol_script "$RUNTIME"
+  cat > "$RUNTIME/daemons/demand_dashboard.py" <<<'print("dd")'
+  make_plist "$AGENTS" com.test.demand-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/demand_dashboard.py"
+  seed_running com.test.demand-dashboard "$2" "$STALE_LSTART"
+  # The inline comment mirrors the REAL restart_policy.yaml, whose entries carry
+  # trailing prose (`- demand_dashboard.py    # hospeda o outreach_worker ... —
+  # restart = halt de outreach`). If the subset YAML loader kept that prose, the
+  # basename would never match and the daemon would silently NOT read as locked —
+  # so the fixture must exercise the real syntax, not a tidied-up copy of it.
+  cat > "$RUNTIME/daemons/restart_policy.yaml" <<'EOF'
+auto:
+  - chip_kpi_dashboard.py   # KPI dashboard, safe to bounce
+notify_only_locked:
+  - demand_dashboard.py    # hospeda o outreach_worker in-process — restart = halt de outreach
+EOF
+}
+DD=com.test.demand-dashboard
+
+# T71 — THE REPRO: locked + cleanly no-evidence -> named cosmetic.
+SENSITIVE_DAEMONS="central-sender"
+locked_dd_case t71 71001
+seed_symbol_result daemons/demand_dashboard.py no_evidence
+OUT=$(run_helper daemons/demand_dashboard.py); RC=$?
+[ "$(field VERDICT "$OUT")" = "NEEDS_GUARDED_RESTART" ] && ok "T71 verdict stays NEEDS_GUARDED_RESTART (this layer annotates, never changes it)" || nok "T71 verdict" "got '$(field VERDICT "$OUT")' out=[$OUT]"
+[ "$(field GUARDED "$OUT")" = "$DD" ] && ok "T71 flat GUARDED unchanged (the daemon is still stale)" || nok "T71 guarded" "$(field GUARDED "$OUT")"
+[ "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" = "$DD" ] && ok "T71 lands in GUARDED_SYMBOL_NO_EVIDENCE" || nok "T71 no_evidence" "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")"
+[ "$(field GUARDED_LOCKED_COSMETIC "$OUT")" = "$DD" ] && ok "T71 GUARDED_LOCKED_COSMETIC names the locked + no-evidence daemon" || nok "T71 locked_cosmetic" "got '$(field GUARDED_LOCKED_COSMETIC "$OUT")' — the field is missing or wrong"
+echo "$(field REASON "$OUT")" | grep -q "TRAVA HUMANA SEM EVIDÊNCIA" && ok "T71 REASON renders a TRAVA HUMANA SEM EVIDÊNCIA section" || nok "T71 reason" "$(field REASON "$OUT")"
+[ "$(json_list guarded_locked_cosmetic "$OUT")" = "$DD" ] && ok "T71 trailing JSON guarded_locked_cosmetic matches the KEY=value line" || nok "T71 json" "got '$(json_list guarded_locked_cosmetic "$OUT")'"
+! grep -q "$DD" "$MOCK/kicks.log" 2>/dev/null && ok "T71 the locked daemon was NOT bounced" || nok "T71 no-bounce" "kickstart was called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+
+# T72 — CONTROL (acceptance 2): locked but the symbol IS reached -> must NOT be cosmetic.
+locked_dd_case t72 72001
+seed_symbol_result daemons/demand_dashboard.py confirmed
+OUT=$(run_helper daemons/demand_dashboard.py)
+echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T72 GUARDED_LOCKED_COSMETIC is present and empty (present-even-empty contract)" || nok "T72 line" "missing or non-empty: '$(field GUARDED_LOCKED_COSMETIC "$OUT")' present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=')"
+[ "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")" = "$DD" ] && ok "T72 stays SYMBOL-CONFIRMED — a real stale is never demoted" || nok "T72 confirmed" "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")"
+echo "$(field REASON "$OUT")" | grep -q "TRAVA HUMANA SEM EVIDÊNCIA" && nok "T72 REASON wrongly renders the cosmetic section" "$(field REASON "$OUT")" || ok "T72 REASON has no cosmetic section"
+
+# T73 — CONTROL (acceptance 3): the calculator never answered for it -> NOT COMPUTED, never cosmetic.
+locked_dd_case t73 73001
+seed_symbol_result daemons/demand_dashboard.py missing
+OUT=$(run_helper daemons/demand_dashboard.py)
+echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T73 GUARDED_LOCKED_COSMETIC present and empty" || nok "T73 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
+[ "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" = "$DD" ] && ok "T73 lands in GUARDED_SYMBOL_NOT_COMPUTED" || nok "T73 not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
+
+# T74 — CONTROL: cleanly no-evidence but NOT locked (a restartable daemon) -> unchanged, never cosmetic.
+SENSITIVE_DAEMONS="central-sender"
+new_case t74
+make_symbol_script "$RUNTIME"
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+seed_running com.test.central-sender 74001 "$STALE_LSTART"
+cat > "$RUNTIME/daemons/restart_policy.yaml" <<'EOF'
+notify_only_locked:
+  - demand_dashboard.py
+EOF
+seed_symbol_result daemons/central_sender.py no_evidence
+OUT=$(run_helper daemons/central_sender.py)
+echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T74 GUARDED_LOCKED_COSMETIC present and empty" || nok "T74 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
+[ "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" = "com.test.central-sender" ] && ok "T74 still classified NO_EVIDENCE (only the cosmetic subset needs the lock)" || nok "T74 no_evidence" "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")"
+
+# T75 — the entrypoint failed to PARSE: "reaches=False por padrão seguro" is a
+# could-not-evaluate. It must be NOT COMPUTED, not no-evidence (RED before this bead).
+locked_dd_case t75 75001
+seed_symbol_result daemons/demand_dashboard.py no_evidence_syntax_error
+OUT=$(run_helper daemons/demand_dashboard.py)
+echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T75 GUARDED_LOCKED_COSMETIC present and empty" || nok "T75 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
+[ -z "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" ] && ok "T75 an unparseable entrypoint is NOT reported as 'no evidence'" || nok "T75 no_evidence" "unevaluable label collapsed into no-evidence: '$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")'"
+[ "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" = "$DD" ] && ok "T75 an unparseable entrypoint lands in NOT_COMPUTED" || nok "T75 not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
+
+# T76 — the ONE benign warning (a closure file absent at --after: added later, or
+# deleted) leaves the answer trustworthy. Without this the feature would only
+# ever release the story at the tip of the runtime, and never a bead merged
+# before a later commit added a file to the closure JSON.
+locked_dd_case t76 76001
+seed_symbol_result daemons/demand_dashboard.py no_evidence_benign_warning
+OUT=$(run_helper daemons/demand_dashboard.py)
+[ "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" = "$DD" ] && ok "T76 benign 'ausente em --after — ignorado' still counts as no-evidence" || nok "T76 no_evidence" "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")"
+[ "$(field GUARDED_LOCKED_COSMETIC "$OUT")" = "$DD" ] && ok "T76 ...and is cosmetic (a later-added closure file must not defeat the release)" || nok "T76 locked_cosmetic" "got '$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
+
+# T77 — the ENTRYPOINT itself is absent at --after ("não dá pra avaliar") even
+# though a benign warning is ALSO present: any non-benign warning disqualifies.
+locked_dd_case t77 77001
+seed_symbol_result daemons/demand_dashboard.py no_evidence_unevaluable
+OUT=$(run_helper daemons/demand_dashboard.py)
+echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T77 GUARDED_LOCKED_COSMETIC present and empty" || nok "T77 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
+[ "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" = "$DD" ] && ok "T77 'não dá pra avaliar' lands in NOT_COMPUTED even alongside a benign warning" || nok "T77 not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
+
+# T78 — a CLOSURE file failed the structural diff (its changed symbols were
+# dropped): a false negative is possible, so it cannot be trusted as no-evidence.
+locked_dd_case t78 78001
+seed_symbol_result daemons/demand_dashboard.py no_evidence_closure_syntax_error
+OUT=$(run_helper daemons/demand_dashboard.py)
+echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T78 GUARDED_LOCKED_COSMETIC present and empty" || nok "T78 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
+[ "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" = "$DD" ] && ok "T78 a dropped closure diff lands in NOT_COMPUTED" || nok "T78 not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
+
+# T79 — a calculator that predates the "warnings" field: cleanliness cannot be
+# verified, so it is never trusted (absent != empty).
+locked_dd_case t79 79001
+seed_symbol_result daemons/demand_dashboard.py no_evidence_nowarnkey
+OUT=$(run_helper daemons/demand_dashboard.py)
+echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T79 GUARDED_LOCKED_COSMETIC present and empty" || nok "T79 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
+[ "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" = "$DD" ] && ok "T79 a result with no 'warnings' key lands in NOT_COMPUTED" || nok "T79 not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
+
+# T80 — restart_policy.yaml EXISTS but is unreadable: we cannot know the daemon is
+# locked, so nothing may be called cosmetic (same fail-closed rule as T13).
+locked_dd_case t80 80001
+printf '\xff\xfenotify_only_locked:\n  - demand_dashboard.py\n' > "$RUNTIME/daemons/restart_policy.yaml"
+seed_symbol_result daemons/demand_dashboard.py no_evidence
+OUT=$(run_helper daemons/demand_dashboard.py)
+echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T80 unreadable policy: GUARDED_LOCKED_COSMETIC present and empty (cannot prove locked)" || nok "T80 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")'"
+[ "$(field GUARDED "$OUT")" = "$DD" ] && ok "T80 still GUARDED (fails closed to sensitive)" || nok "T80 guarded" "$(field GUARDED "$OUT")"
+
+# T81 — a MIXED batch: only the locked + cleanly-no-evidence one is cosmetic.
+new_case t81
+make_symbol_script "$RUNTIME"
+cat > "$RUNTIME/daemons/demand_dashboard.py" <<<'print("dd")'
+cat > "$RUNTIME/daemons/campaign_dashboard.py" <<<'print("cd")'
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+make_plist "$AGENTS" com.test.demand-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/demand_dashboard.py"
+make_plist "$AGENTS" com.test.campaign-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/campaign_dashboard.py"
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+seed_running com.test.demand-dashboard 81001 "$STALE_LSTART"
+seed_running com.test.campaign-dashboard 81101 "$STALE_LSTART"
+seed_running com.test.central-sender 81201 "$STALE_LSTART"
+cat > "$RUNTIME/daemons/restart_policy.yaml" <<'EOF'
+notify_only_locked:
+  - demand_dashboard.py
+  - campaign_dashboard.py
+EOF
+seed_symbol_result daemons/demand_dashboard.py no_evidence
+seed_symbol_result daemons/campaign_dashboard.py confirmed
+seed_symbol_result daemons/central_sender.py no_evidence
+SENSITIVE_DAEMONS="central-sender"
+OUT=$(run_helper daemons/demand_dashboard.py daemons/campaign_dashboard.py daemons/central_sender.py)
+SENSITIVE_DAEMONS="central-sender"
+[ "$(field GUARDED_LOCKED_COSMETIC "$OUT")" = "com.test.demand-dashboard" ] && ok "T81 cosmetic = ONLY the locked + no-evidence daemon (not the locked+confirmed, not the unlocked+no-evidence)" || nok "T81 locked_cosmetic" "got '$(field GUARDED_LOCKED_COSMETIC "$OUT")' guarded='$(field GUARDED "$OUT")'"
+[ "$(json_list guarded_locked_cosmetic "$OUT")" = "com.test.demand-dashboard" ] && ok "T81 JSON agrees" || nok "T81 json" "got '$(json_list guarded_locked_cosmetic "$OUT")'"
+for l in com.test.demand-dashboard com.test.campaign-dashboard com.test.central-sender; do
+  echo "$(field GUARDED "$OUT")" | grep -q "$l" && ok "T81 $l still in flat GUARDED" || nok "T81 guarded $l" "$(field GUARDED "$OUT")"
+done
+
+# T82 — an entrypoint explicitly allow-listed for automatic restart (deploy_restart)
+# is NOT locked even if it is ALSO (contradictorily) listed notify_only_locked: the
+# same "explicitly safe first" precedence policy_says_sensitive() applies. A daemon
+# automation CAN restart is not stuck forever, so it is never cosmetic-locked.
+locked_dd_case t82 82001
+cat > "$RUNTIME/daemons/restart_policy.yaml" <<'EOF'
+deploy_restart:
+  - demand_dashboard.py
+notify_only_locked:
+  - demand_dashboard.py
+EOF
+seed_symbol_result daemons/demand_dashboard.py no_evidence
+SENSITIVE_DAEMONS="demand-dashboard"
+OUT=$(run_helper daemons/demand_dashboard.py)
+SENSITIVE_DAEMONS="central-sender"
+echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T82 an allow-listed entrypoint is not cosmetic-locked (explicitly-safe precedence)" || nok "T82 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=') value='$(field GUARDED_LOCKED_COSMETIC "$OUT")' guarded='$(field GUARDED "$OUT")'"
+
+# T83 — present-even-empty on a verdict that has no guarded daemon at all (every
+# other emit path): a consumer can read the field unconditionally.
+new_case t83
+cat > "$RUNTIME/daemons/foo_dashboard.py" <<<'print("foo")'
+make_plist "$AGENTS" com.test.foo-dashboard "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/foo_dashboard.py"
+seed_running com.test.foo-dashboard 83001 "$STALE_LSTART"
+OUT=$(run_helper README.md)
+echo "$OUT" | grep -q '^GUARDED_LOCKED_COSMETIC=$' && ok "T83 GUARDED_LOCKED_COSMETIC is present even when empty, on an OK verdict" || nok "T83 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=')"
+[ "$(echo "$OUT" | grep '^JSON=' | sed 's/^JSON=//' | python3 -c 'import json,sys; print(json.load(sys.stdin).get("guarded_locked_cosmetic"))' 2>/dev/null)" = "[]" ] && ok "T83 trailing JSON carries guarded_locked_cosmetic: []" || nok "T83 json" "key missing or wrong"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
