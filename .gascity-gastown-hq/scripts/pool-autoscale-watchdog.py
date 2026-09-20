@@ -12,6 +12,13 @@ Poll loop (~60s). Silence = healthy (only emits on actions).
   [POOL-AUTOSCALE] [SCALED-DOWN]     unpinned a watchdog-pinned member (demand gone)
   [POOL-AUTOSCALE] [STUCK]           demand queued but no capacity to wake
   [POOL-AUTOSCALE] [STARTUP]         initial state report
+  [POOL-AUTOSCALE] [PROBE-DISAGREE]  watchdog counted claimable beads but the pool's own
+                                     probe says the queue is empty (probe wins)
+
+Demand (ga-uv4on5) is the beads a pool worker's own probe would hand out, not
+every ready bead routed to the pool: held, vetoed, parked, epic and in-flight
+beads are not demand, because a dog woken for them finds nothing and exits.
+See "Demand predicate" below.
 
 Safety invariants:
   - ONLY manages templates listed in MANAGED_POOLS.
@@ -49,6 +56,69 @@ STUCK_REALERT_SEC = 900  # re-emit STUCK alert every 15min (avoid ntfy spam)
 ACTIVE_STATES = {"active", "awake"}
 # Session states considered cleanly asleep (available to wake)
 ASLEEP_STATES = {"asleep", "idle"}
+
+
+# ---------------------------------------------------------------------------
+# Demand predicate: what counts as work a pool worker can claim (ga-uv4on5)
+# ---------------------------------------------------------------------------
+# A bead is pool DEMAND only if a pool worker's own Step-1c probe would hand it
+# out. That probe is the agent's work_query, rendered by the engine (the
+# bd-ready flags plus its poolDemandLabelFilterJQ filter; see ga-avvu2), so it
+# cannot be imported here; the constants and probe_would_serve() below mirror
+# it. Two guards keep the mirror honest:
+#   - test_pool_autoscale_watchdog.py (`-k engine_probe`) renders the engine's
+#     probe with `gc prime gastown.dog` and checks the vocabulary and the
+#     predicate against it;
+#   - get_pool_demand() puts a non-empty count to the pool's own probe
+#     (`gc hook`) before it can wake anyone, and logs [PROBE-DISAGREE] when the
+#     probe says the queue is empty.
+
+# Exact labels the probe excludes. Passed to `bd ready` as --exclude-label, which
+# bd applies BEFORE --limit, so held beads do not use up the candidate window.
+PROBE_EXCLUDE_LABELS = (
+    "story:needs-human", "needs-human", "ctx:thin", "story:needs-approval",
+    "story:epic", "needs:engine-window", "pilot:no-auto-dispatch",
+    "story:blocked", "delivery:partial", "scope:needs-review", "exec:manual",
+    "needs-human-decision", "auto-refino:refining", "auto-refino:escalated",
+    "refino:info-gap", "refino:policy-gap", "story:unrefined",
+    "story:refinement-in-progress", "story:refino-review",
+    "story:refino-escalado", "story:needs-device", "on-device", "phone-proxy",
+    "gate:queued", "gate:reviewing",
+)
+
+# Labels the probe's jq stage drops when they START with one of these.
+PROBE_EXCLUDE_LABEL_PREFIXES = (
+    "pool:refused", "blocked:", "blocked-reason:", "gate:needs-human",
+    "pilot:refused-reason:", "pilot:text-veto",
+)
+
+# Pilot holds. A bare `pilot:held` blocks until it is removed. A
+# `pilot:held-until:<epoch>` blocks until that time passes; once every expiry
+# has passed the bead is released even if a bare `pilot:held` is still on it.
+PROBE_HELD_LABEL = "pilot:held"
+PROBE_HELD_UNTIL_PREFIX = "pilot:held-until:"
+
+# Epic beads are containers, not buildable work.
+PROBE_EPIC_TITLE_RE = re.compile(r"^(EPIC|ÉPICO)[:\s]", re.IGNORECASE)
+
+# The probe asks bd for the 20 oldest candidates; the watchdog looks at the same window.
+PROBE_CANDIDATE_LIMIT = 20
+
+# In the watchdog but NOT in the probe (ga-ms1jm / ga-lx7om): a source bead that
+# is already slung or being built is not unmet demand. Counting it would spawn a
+# surplus dog that re-claims the in-flight bead (double dispatch).
+WATCHDOG_EXCLUDE_LABELS = ("story:in-flight", "pilot:dispatched")
+
+# A hold expiry is epoch seconds; anything else is unreadable, and unreadable reads as held.
+_HOLD_EXPIRY_RE = re.compile(r"\d+(?:\.\d+)?")
+
+# `gc hook` also answers for the session identity in its environment (work assigned
+# to the caller). A pool-wide question must not inherit one.
+_SESSION_IDENTITY_ENV = ("GC_SESSION_ID", "GC_SESSION_NAME", "GC_ALIAS",
+                         "GC_SESSION_ORIGIN", "GC_AGENT", "GC_TEMPLATE")
+
+# Pools whose last demand check disagreed with their own probe (log once per episode).
+_probe_disagreement_logged = set()
 
 
 # ---------------------------------------------------------------------------
@@ -132,34 +202,112 @@ def save_state(state):
 # Live data queries
 # ---------------------------------------------------------------------------
 
-def get_pool_demand(pool_template):
-    """Count unassigned tasks routed to this pool. Returns -1 on any error.
+def probe_would_serve(bead, now_ts):
+    """True iff the pool probe would hand this bead out and the watchdog does not
+    exclude it itself. See "Demand predicate" above.
 
-    Excludes story:in-flight / pilot:dispatched labels: a source bead that is
-    already being worked (or already slung) is NOT unmet demand, even if it
-    still carries gc.routed_to. Counting it would inflate demand, spawn a
-    surplus dog, and let that dog re-claim the in-flight bead (double-dispatch,
-    ga-ms1jm / ga-lx7om). bd ready already drops in_progress/hooked *statuses*;
-    these are *labels* on still-open source beads, so they need explicit
-    exclusion. Mirrors the Pilot's own --exclude-label pilot:dispatched guard.
+    Applies every exclusion in full: exact labels (which `bd ready` also drops
+    server-side, so a bd that stops honouring the flag cannot bring the bug
+    back), the jq-stage prefixes, epic titles and Pilot holds, plus
+    WATCHDOG_EXCLUDE_LABELS.
+
+    Unreadable data (labels that are not a list of strings, a hold expiry that
+    is not an epoch) reads as held: under doubt the answer is "no demand",
+    never "wake a dog".
     """
+    if not isinstance(bead, dict):
+        return False
+    labels = bead.get("labels") or []
+    if not isinstance(labels, list) or not all(isinstance(l, str) for l in labels):
+        return False
+    if any(l in PROBE_EXCLUDE_LABELS or l in WATCHDOG_EXCLUDE_LABELS
+           or l.startswith(PROBE_EXCLUDE_LABEL_PREFIXES) for l in labels):
+        return False
+    title = bead.get("title")
+    if isinstance(title, str) and PROBE_EPIC_TITLE_RE.match(title):
+        return False
+    if any(l == PROBE_HELD_LABEL or l.startswith(PROBE_HELD_UNTIL_PREFIX) for l in labels):
+        expiries = [l[len(PROBE_HELD_UNTIL_PREFIX):] for l in labels
+                    if l.startswith(PROBE_HELD_UNTIL_PREFIX)]
+        if not expiries or not all(_HOLD_EXPIRY_RE.fullmatch(e) for e in expiries):
+            return False
+        if max(float(e) for e in expiries) >= now_ts:
+            return False
+    return True
+
+
+def _ready_candidates(pool_template):
+    """Ready, unassigned beads routed to the pool: the probe's own bd query
+    (same exclusions, ordering and 20-bead window) plus WATCHDOG_EXCLUDE_LABELS.
+
+    Returns a list, or None when bd could not be read: "could not tell" must
+    never look like "nothing there".
+    """
+    argv = ["bd", "ready",
+            "--metadata-field", f"gc.routed_to={pool_template}",
+            "--unassigned", "--exclude-type=epic"]
+    for label in PROBE_EXCLUDE_LABELS + WATCHDOG_EXCLUDE_LABELS:
+        argv += ["--exclude-label", label]
+    argv += ["--json", "--sort", "oldest", f"--limit={PROBE_CANDIDATE_LIMIT}"]
     try:
-        result = subprocess.run(
-            ["bd", "ready",
-             "--metadata-field", f"gc.routed_to={pool_template}",
-             "--unassigned", "--exclude-type=epic",
-             "--exclude-label", "story:in-flight",
-             "--exclude-label", "pilot:dispatched",
-             "--json"],
-            capture_output=True, text=True, timeout=20)
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=20)
         if result.returncode != 0 or not result.stdout.strip():
-            return -1
+            return None
         data = json.loads(result.stdout)
-        if not isinstance(data, list):
-            return -1
-        return len(data)
     except Exception:
+        return None
+    return data if isinstance(data, list) else None
+
+
+def _pool_probe_reports_empty(pool_template):
+    """True only when the pool's own work query (`gc hook <pool>`) POSITIVELY
+    says the queue is empty: exit 1 and a bare "[]" on stdout.
+
+    `gc hook` exits 1 for errors too (unknown or suspended agent), with an empty
+    stdout, so the exit code alone cannot tell "empty" from "broken". Anything
+    short of the positive signature -- a failure, a timeout, a missing body --
+    returns False: no veto, the caller keeps its own count.
+    """
+    env = {k: v for k, v in os.environ.items() if k not in _SESSION_IDENTITY_ENV}
+    try:
+        result = subprocess.run(["gc", "hook", pool_template], capture_output=True,
+                                text=True, timeout=30, env=env)
+    except Exception:
+        return False
+    return result.returncode == 1 and result.stdout.strip() == "[]"
+
+
+def get_pool_demand(pool_template):
+    """Count the beads a pool worker could claim right now. Returns -1 on any error.
+
+    Three answers, never conflated: N >= 1 claimable beads, 0 nothing to claim,
+    -1 could not tell (the caller skips the cycle).
+
+    Demand is what the pool worker's own probe would hand out, not every ready
+    bead routed to the pool (ga-uv4on5): held, vetoed, parked, epic and
+    in-flight beads are not demand, because a dog woken for them finds an empty
+    queue and exits. The count is bounded by the probe's candidate window and
+    is a presence signal -- scale_decision() only asks whether it is > 0.
+
+    A non-empty count is put to the pool's own probe before it can wake anyone:
+    if the probe says the queue is empty, the probe wins (see PROBE-DISAGREE).
+    """
+    candidates = _ready_candidates(pool_template)
+    if candidates is None:
         return -1
+    now_ts = time.time()
+    claimable = [b for b in candidates if probe_would_serve(b, now_ts)]
+    if claimable and _pool_probe_reports_empty(pool_template):
+        if pool_template not in _probe_disagreement_logged:
+            _probe_disagreement_logged.add(pool_template)
+            print(f"[POOL-AUTOSCALE] [PROBE-DISAGREE] pool={pool_template} "
+                  f"watchdog_claimable={len(claimable)} but the pool's own work "
+                  f"query (gc hook) reports an empty queue; trusting the probe, no "
+                  f"dog woken. The watchdog's copy of the probe is out of date: "
+                  f"run test_pool_autoscale_watchdog.py -k engine_probe", flush=True)
+        return 0
+    _probe_disagreement_logged.discard(pool_template)
+    return len(claimable)
 
 
 def get_pool_sessions(pool_template):
