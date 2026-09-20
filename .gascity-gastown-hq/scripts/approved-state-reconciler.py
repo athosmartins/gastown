@@ -47,6 +47,7 @@ DPW: add com.gascity.approved-state-reconciler to DPW_CRITICAL after Mayor deplo
 import datetime
 import json
 import os
+import plistlib
 import re
 import subprocess
 import sys
@@ -140,8 +141,9 @@ STARVE_MIN_PRI2 = int(os.environ.get("STARVE_MIN_PRI2", str(STARVE_MIN * 2)))
 STARVE_MIN_PRI3 = int(os.environ.get("STARVE_MIN_PRI3", str(STARVE_MIN * 6)))
 # RECLAIM_CAP: mirrors MAX_RECLAIMS in inflight-reclaim-guard.py (scripts/
 # inflight-reclaim-guard.py:106) and _FILTER_RECLAIM_CAP in pilot-dispatcher.sh:1111.
-# No single source of truth yet (same duplication pattern as POOL_BY_RIG_BASENAME
-# below) — keep in sync by hand.
+# No single source of truth yet — keep in sync by hand. (POOL_BY_RIG_BASENAME below had
+# this same hand-copied-number problem and it drifted in both pools — ga-zowwdz; it now
+# derives its number at runtime. This one has not been given that treatment.)
 RECLAIM_CAP = int(os.environ.get("ARC_RECLAIM_CAP", "3"))
 # BRANCH_STRANDED_STALE_HOURS (ga-32u6s): a crew/fix branch's last commit older than
 # this, still unmerged into origin/main, with the bead itself unassigned (guaranteed
@@ -318,14 +320,33 @@ def _prune_state(state, now):
     NOTE: "alarmed" entries are either a bare epoch float (legacy, pre-AC3) or a
     {"last": epoch, "count": N, "fp": ...} dict (AC3 escalating backoff) — pull
     the timestamp out of either shape rather than assuming a bare number.
+
+    A malformed record must not take the cycle down (ga-zowwdz): this runs first in
+    every run_cycle(), and main() only calls _save_state() AFTER run_cycle() returns —
+    so an exception here leaves the bad record on disk and the job fails identically
+    on every launchd tick, forever. Unreadable records are dropped WITH a warning,
+    never silently; dropping one costs at most one early re-fire of that bead's
+    cooldown, which is the same trade-off this function already documents above.
     """
     cutoff = now - 7 * 24 * 3600
     for key in ("routed", "alarmed", "first_seen_approved", "flagged", "reclaim_exhausted",
                 "branch_stranded"):
         bucket = state.get(key, {})
+        if not isinstance(bucket, dict):
+            _log("WARN: state[%r] is a %s, not a mapping — reset to empty" % (
+                 key, type(bucket).__name__))
+            state[key] = {}
+            continue
         stale = []
         for bid, v in bucket.items():
             ts = v.get("last", 0.0) if isinstance(v, dict) else v
+            if not isinstance(ts, (int, float)):
+                # str/None/list would raise TypeError on the comparison below. Treat it
+                # like a record with no timestamp at all — the .get() default above
+                # already reads that as 0.0, i.e. expired.
+                _log("WARN: state[%r][%r] has a non-numeric timestamp %.60r — dropped" % (
+                     key, bid, ts))
+                ts = 0.0
             if ts < cutoff:
                 stale.append(bid)
         for bid in stale:
@@ -1032,14 +1053,165 @@ def _write_flow_authority(now, dimension):
 
 
 # ── pool capacity check ───────────────────────────────────────────────────────
-# rig_root basename -> (session template, max concurrent active/creating sessions).
-# Mirrors PILOT_WA_WORKER_MAX / PILOT_PS_WORKER_MAX in pilot-dispatcher.sh (packs/
-# town-deltas/assets/pilot-dispatcher.sh:104,109) and agents/{wa,ps}-worker/agent.toml
-# max_active_sessions. No single source of truth yet, so keep these in sync by hand.
+# rig_root basename -> (session template, name of the Pilot env var that holds that pool's
+# max concurrent active/creating sessions). The NUMBER is deliberately not stored here
+# (ga-zowwdz): it is an operator lever — PILOT_WA_WORKER_MAX / PILOT_PS_WORKER_MAX in the
+# Pilot's launchd plist, flipped 4→2 on 2026-09-19 alone (commit 03860b70c) — and the
+# hand-copied numbers this table used to hold had already drifted in BOTH pools (WA 4 vs a
+# live 2, PS 2 vs a live 1). _pool_cap() reads the live value instead.
+#
+# Why that drift mattered, and why it was asymmetric: a number too HIGH reads a capped pool
+# as "has capacity" → a false "dispatch failing" alarm (wa-ho1ol, 1774min); a number too
+# LOW reads a pool with room as "saturated" and _process_store() skips the alarm — a real
+# dispatch failure hidden, with no trace in any log saying which number it trusted.
 POOL_BY_RIG_BASENAME = {
-    "whatsapp_automation": ("wa-worker", 4),
-    "property_scrapers": ("ps-worker", 2),
+    "whatsapp_automation": ("wa-worker", "PILOT_WA_WORKER_MAX"),
+    "property_scrapers": ("ps-worker", "PILOT_PS_WORKER_MAX"),
 }
+# The Pilot's INSTALLED launchd job definition — the file launchd loads, whose
+# EnvironmentVariables carry the two variables above (scripts/com.gascity.pilot.plist is
+# only the repo template of it). ARC_PILOT_PLIST overrides it (tests, a relocated install).
+PILOT_PLIST = os.environ.get(
+    "ARC_PILOT_PLIST",
+    os.path.expanduser("~/Library/LaunchAgents/com.gascity.pilot.plist"))
+# How long a Pilot log line "<pool> pool at session cap (N active/creating >= M max)" stays
+# evidence of the cap the running Pilot enforces. Same 1800s margin, same reason, as
+# PILOT_SWEEP_PAUSE_TTL_SEC below (real sweep-to-sweep gaps run 673-1394s): the Pilot
+# re-logs the line every sweep while a pool stays capped, so this spans at least one
+# sweep; past it the line says nothing about the CURRENT job and is ignored.
+POOL_CAP_LOG_TTL_SEC = int(os.environ.get("ARC_POOL_CAP_LOG_TTL_SEC", "1800"))
+# A cap line dated slightly AHEAD of `now` is clock skew (the log stamps local wall time,
+# this process reads its own clock). Beyond that it is dropped: a future-dated line cannot
+# be shown to be fresh.
+_POOL_CAP_LOG_FUTURE_SKEW_SEC = 300
+
+
+def _read_pilot_plist_cap(cap_env):
+    """Read `cap_env` from the installed Pilot plist's EnvironmentVariables.
+
+    Returns (cap, mtime, why). `cap` is a non-negative int when the plist carries a usable
+    value; otherwise None and `why` names WHICH failure it was — file missing, file
+    unparseable, variable absent/empty, or value not an integer. Those stay distinct on
+    purpose (root-class:error-vs-empty): none of them may ever be read as "the cap is N".
+    `mtime` is the plist's last-write time (None if the file was not read); it dates the
+    value, so a Pilot log line written BEFORE the last edit is never used against it.
+
+    A cap of 0 is a real setting, not an error: the Pilot's own `[ live -ge 0 ]` is then
+    always true, i.e. the pool is deliberately closed and every bead waits.
+
+    When the variable is absent the Pilot silently falls back to a default baked into
+    pilot-dispatcher.sh (`${PILOT_WA_WORKER_MAX:-4}`). That default is NOT copied here —
+    copying it is exactly the drift this replaced — so absence is reported, not guessed.
+    """
+    try:
+        with open(PILOT_PLIST, "rb") as f:
+            mtime = os.fstat(f.fileno()).st_mtime
+            plist = plistlib.load(f)
+    except FileNotFoundError:
+        return None, None, "Pilot plist %s not found" % PILOT_PLIST
+    except Exception as e:   # unparseable / permission / not a dict — all "could not read"
+        return None, None, "Pilot plist %s unreadable (%s)" % (PILOT_PLIST, type(e).__name__)
+    env = plist.get("EnvironmentVariables") if isinstance(plist, dict) else None
+    raw = env.get(cap_env) if isinstance(env, dict) else None
+    if raw is None or str(raw).strip() == "":
+        return None, mtime, ("%s is not set in the Pilot plist's EnvironmentVariables (the "
+                             "Pilot then uses its own script default, which is not read here)"
+                             % cap_env)
+    try:
+        cap = int(str(raw).strip())
+    except ValueError:
+        cap = -1
+    if cap < 0:
+        return None, mtime, ("%s=%r in the Pilot plist is not a non-negative integer"
+                             % (cap_env, raw))
+    return cap, mtime, ""
+
+
+def _logged_pool_cap(template, now):
+    """(max, epoch) from the NEWEST fresh Pilot log line in which the Pilot itself said
+    `template` was at its session cap — "... pool at session cap (N active/creating >= M
+    max)" — or (None, None) if there is none.
+
+    The Pilot writes that line only while the pool is AT its cap (ga-in9ebr), and only for a
+    candidate it actually walks — its lane loop stops once the lane's slots are used up
+    (pilot-dispatcher.sh ~10746, the `_exhausted` flag). So its ABSENCE proves nothing either
+    way: a pool with room writes none, and neither does a capped pool for the beads the loop
+    never reached. This function therefore only ever answers "the Pilot enforced M" or "no
+    evidence" — never "the pool is not capped". Two emission shapes exist
+    (pilot-dispatcher.sh ~10164/10231 for dispatch_one,
+    and the pick preflight that says "QUEUED — routed to <pool>, pool at session cap");
+    both were matched against the REAL log, not a paraphrase of it. A line whose timestamp
+    cannot be parsed, is older than POOL_CAP_LOG_TTL_SEC, or is dated in the future beyond
+    a clock-skew allowance is skipped — an undatable line cannot be shown to be fresh.
+    """
+    if _read_pilot_log_lines is not None:
+        lines = _read_pilot_log_lines()   # test seam (shared with _is_pilot_alive)
+    else:
+        lines = _tail(PILOT_LOG, LOG_TAIL)
+    pat = re.compile(r"(?:routed to|ga-in9ebr:) %s,? pool at session cap "
+                     r"\(\d+ active/creating >= (\d+) max\)" % re.escape(template))
+    best_cap, best_epoch = None, None
+    for line in lines or []:
+        m = pat.search(line)
+        if not m:
+            continue
+        epoch = _ts_epoch(line)
+        if epoch is None:
+            continue
+        age = now - epoch
+        if age > POOL_CAP_LOG_TTL_SEC or age < -_POOL_CAP_LOG_FUTURE_SKEW_SEC:
+            continue
+        if best_epoch is None or epoch >= best_epoch:
+            best_cap, best_epoch = int(m.group(1)), epoch
+    return best_cap, best_epoch
+
+
+def _pool_cap(template, cap_env, now):
+    """Derive a pool's live session cap at runtime. Returns (cap, origin, note).
+
+    Three outcomes, never collapsed into one another:
+      (int,  "plist",     "")   read from the installed Pilot plist, not contradicted.
+      (int,  "pilot-log", why)  the Pilot's OWN log line is what was used — either the plist
+                                could not give a value (why says which failure), or the two
+                                DIVERGED (why says both numbers).
+      (None, "unread",    why)  neither source could say. The caller must not invent a number.
+
+    DIVERGED = the plist says X, yet a fresh Pilot log line written AFTER that file was last
+    written says the Pilot enforced M != X — the plist was edited without reloading the
+    Pilot job. The log line is what the running Pilot actually did, so it wins; and it is the
+    safe side in BOTH directions (M > X: trusting the plist would call a pool with room
+    "saturated" and silently skip a real dispatch failure; M < X: trusting it would call a
+    capped pool "has capacity" and raise a false alarm). A log line older than the plist's
+    last write describes the PREVIOUS setting and is not used against it.
+
+    Two known limits, stated so they are not mistaken for guarantees. (1) With no fresh log
+    line (the pool is not at its cap) there is nothing to cross-check the plist against, so an
+    edited-but-not-reloaded plist is trusted as written. (2) The reverse window: a line logged
+    by a sweep that was already running when the plist was edited (and the job then reloaded)
+    still carries the OLD cap but is dated after the edit, so it reads as DIVERGED and wins —
+    for at most POOL_CAP_LOG_TTL_SEC, until a newer line or its expiry replaces it. In both
+    cases the note at every skip names the cap and where it came from, so the number stays
+    auditable even when it is not authoritative.
+    """
+    plist_cap, plist_mtime, plist_why = _read_pilot_plist_cap(cap_env)
+    log_cap, log_epoch = _logged_pool_cap(template, now)
+
+    def _hms(epoch):
+        return time.strftime("%H:%M:%S", time.localtime(epoch))
+
+    if plist_cap is not None:
+        if log_cap is not None and log_cap != plist_cap and log_epoch >= plist_mtime:
+            return log_cap, "pilot-log", (
+                "DIVERGED: %s=%d in the Pilot plist, but the Pilot itself logged max=%d at %s "
+                "— after that file was last written; plist edited without reloading the "
+                "Pilot job? using what the Pilot enforced" % (
+                    cap_env, plist_cap, log_cap, _hms(log_epoch)))
+        return plist_cap, "plist", ""
+    if log_cap is not None:
+        return log_cap, "pilot-log", "%s; using the max the Pilot itself logged at %s" % (
+            plist_why, _hms(log_epoch))
+    return None, "unread", "%s, and the Pilot log holds no fresh cap line for %s" % (
+        plist_why, template)
 
 
 def _pool_has_capacity(rig_root, now):
@@ -1051,15 +1223,28 @@ def _pool_has_capacity(rig_root, now):
 
     Per spec §4: unknown capacity → alarm conservatively (True return), logging the gap.
     Silently swallowing a starve alarm is worse than a checkable false-positive alarm.
+    That includes an UNREADABLE cap (ga-zowwdz): there is no fallback number to fall back to,
+    on purpose — see _pool_cap().
 
     Mirrors Pilot's own saturation check (pilot-dispatcher.sh ~4163-4171): count sessions
     whose template matches the rig's builder pool and whose state is active or creating,
-    compare against that pool's configured max.
+    compare against that pool's max — read live by _pool_cap(), not copied.
+
+    Every note that returns a decision names the cap it used AND where it came from
+    ("cap 2 from plist"), because _process_store() logs this note at the moment it skips a
+    starve alarm as "pool saturated" — a skip that names neither number nor origin cannot be
+    audited. A note for an undetermined capacity always contains the word "unknown" (the
+    caller keys off it); no other note may.
     """
     pool = POOL_BY_RIG_BASENAME.get(os.path.basename(rig_root.rstrip("/")))
     if pool is None:
         return True, "capacity unknown — no pool mapping for %s (conservative alarm)" % rig_root
-    template, max_active = pool
+    template, cap_env = pool
+
+    max_active, origin, cap_note = _pool_cap(template, cap_env, now)
+    if max_active is None:
+        return True, "capacity unknown — %s pool cap unreadable: %s (conservative alarm)" % (
+            template, cap_note)
 
     proc = _sh([GC_BIN, "session", "list", "--json"], timeout=15)
     if proc is None or proc.returncode != 0 or not (proc.stdout or "").strip():
@@ -1073,9 +1258,14 @@ def _pool_has_capacity(rig_root, now):
         1 for s in sessions
         if s.get("template") == template and s.get("state") in ("active", "creating")
     )
+    basis = "cap %d from %s" % (max_active, origin)
+    if cap_note:
+        basis += " — " + cap_note
     if active >= max_active:
-        return False, "%s pool saturated (%d/%d active/creating)" % (template, active, max_active)
-    return True, "%s pool has capacity (%d/%d active/creating)" % (template, active, max_active)
+        return False, "%s pool saturated (%d/%d active/creating; %s)" % (
+            template, active, max_active, basis)
+    return True, "%s pool has capacity (%d/%d active/creating; %s)" % (
+        template, active, max_active, basis)
 
 
 # ── lane capacity check (ga-2yyez case 3 "lane x pool") ───────────────────────
@@ -3093,6 +3283,15 @@ def _selftest():
     globals()["FLOW_GRACE_MIN"] = 10
     globals()["ROUTE_COOLDOWN_SEC"] = 1800
     globals()["ALARM_COOLDOWN_SEC"] = 1800
+    # Hermetic default for the pool-cap read (ga-zowwdz): _pool_cap() does its own file I/O
+    # on the INSTALLED Pilot plist, so unstubbed it would read this machine's real
+    # ~/Library/LaunchAgents/com.gascity.pilot.plist in every scenario that reaches
+    # _pool_has_capacity — making the suite's outcome depend on whichever cap the operator
+    # last set. A path that cannot exist → "cap unreadable" → the same conservative
+    # alarm-preserving outcome those scenarios always got. Scenarios that DO test the derived
+    # cap point PILOT_PLIST at a throwaway plist and restore this afterwards.
+    _NO_PILOT_PLIST = "/nonexistent/approved-state-reconciler-selftest/com.gascity.pilot.plist"
+    globals()["PILOT_PLIST"] = _NO_PILOT_PLIST
 
     # ── capture lists ─────────────────────────────────────────────────────────
     label_adds = []
@@ -3463,6 +3662,263 @@ def _selftest():
         _ok("(h): pilot dead → no alarm (can't blame dispatch path when pilot is down)")
     else:
         _bad("(h)", "mail_calls=%d notify_calls=%d" % (len(mail_calls), len(notify_calls)))
+
+    # ── (ga-zowwdz-a/b) the pool cap is DERIVED from the Pilot plist, not copied ──
+    # POOL_BY_RIG_BASENAME used to hold hand-copied caps (WA 4, PS 2) that had drifted from
+    # the live ones (WA 2, PS 1). A number too HIGH raises a false "dispatch failing" alarm on
+    # a capped pool; a number too LOW silently swallows a real one. Both directions are pinned
+    # here through the real run_cycle → _process_store → _pool_has_capacity path, against a
+    # throwaway Pilot plist — and each one FAILS on the pre-fix code, which never reads it.
+    import contextlib
+    import io
+    import plistlib   # local on purpose: the scenario builds its own throwaway plist
+    import tempfile
+
+    def _wa_store_only(bead):
+        """Serve `bead` from the WhatsApp store only (the other stores stay empty), so the
+        pool mapping in play is unambiguous."""
+        return lambda root: [bead] if os.path.basename(root.rstrip("/")) == "whatsapp_automation" else []
+
+    def _fake_session_list(template, n):
+        """A `gc session list --json` reporting `n` active `template` sessions; every other
+        _sh call falls through to the suite's blanket stub."""
+        payload = json.dumps({"sessions": [{"template": template, "state": "active"}] * n})
+
+        def _fake(args, timeout=20):
+            if list(args[:3]) == [GC_BIN, "session", "list"]:
+                return subprocess.CompletedProcess(args=args, returncode=0, stdout=payload,
+                                                   stderr="")
+            return _stub_sh_fast(args, timeout)
+        return _fake
+
+    def _run_wa_cap_cycle(bead_id, live_cap, active):
+        """One run_cycle over a starving WA bead with a throwaway Pilot plist setting
+        PILOT_WA_WORKER_MAX=live_cap and `active` wa-worker sessions running. Returns
+        (alarmed, captured_stdout); the suite's globals are restored afterwards."""
+        global _sh
+        fd, plist_path = tempfile.mkstemp(prefix="arc-selftest-pilot-", suffix=".plist")
+        with os.fdopen(fd, "wb") as f:
+            plistlib.dump({"EnvironmentVariables": {"PILOT_WA_WORKER_MAX": str(live_cap)}}, f)
+        globals()["PILOT_PLIST"] = plist_path
+        _sh = _fake_session_list("wa-worker", active)
+        try:
+            globals()["_bd_approved"] = _wa_store_only(
+                _make_bead(bead_id, age_min=_STARVE + 5.0))
+            globals()["_read_pilot_log_lines"] = lambda: _pilot_recent()
+            st = _reset()
+            st["first_seen_approved"][bead_id] = NOW - (_STARVE + 5) * 60
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                run_cycle(NOW, st)
+            sys.stdout.write(buf.getvalue())   # keep the suite's own output complete
+            alarmed = (any(bead_id in subj for subj, _ in mail_calls)
+                       or any(bead_id in msg for msg, _ in notify_calls))
+            return alarmed, buf.getvalue()
+        finally:
+            _sh = _stub_sh_fast
+            globals()["PILOT_PLIST"] = _NO_PILOT_PLIST
+            os.unlink(plist_path)
+
+    print("\nScenario (ga-zowwdz-a): operator LOWERED the cap (plist WA=2, old table said 4), "
+          "pool full at 2/2 → NO alarm, skip line names cap + origin")
+    alarmed_a, out_a = _run_wa_cap_cycle("wa-capa", live_cap=2, active=2)
+    if not alarmed_a and "cap 2 from plist" in out_a:
+        _ok("(ga-zowwdz-a): capped pool (2/2 live cap) → no false 'dispatch failing' alarm; "
+            "the skip is logged with 'cap 2 from plist'")
+    else:
+        _bad("(ga-zowwdz-a)", "alarmed=%s cap-named-in-log=%s" % (
+             alarmed_a, "cap 2 from plist" in out_a))
+
+    print("\nScenario (ga-zowwdz-b): operator RAISED the cap (plist WA=6, old table said 4), "
+          "4 running → room left → ALARM (the old table swallowed it silently)")
+    alarmed_b, out_b = _run_wa_cap_cycle("wa-capb", live_cap=6, active=4)
+    if alarmed_b and "SATURATED" not in out_b:
+        _ok("(ga-zowwdz-b): pool has room under the live cap (4/6) → starving bead still "
+            "alarms; not skipped as 'saturated'")
+    else:
+        _bad("(ga-zowwdz-b)", "alarmed=%s saturated-skip-logged=%s" % (
+             alarmed_b, "SATURATED" in out_b))
+    _reset()   # the two scenarios above leave capture lists populated
+
+    # ── (ga-zowwdz-c) _pool_cap(): read / not-read / diverged stay three different answers ──
+    # Deriving the cap is only an improvement if NO failure of the derivation can ever read as
+    # "the cap is N" (root-class:error-vs-empty) — a hand-copied constant was exactly a number
+    # that looked right and was not. Each case builds a throwaway Pilot plist whose mtime is
+    # set relative to NOW (its real mtime is wall-clock, this suite's NOW is fixed in the past:
+    # every log line would predate the "edit" and DIVERGED could never fire), and feeds the
+    # Pilot log through the seam _is_pilot_alive() uses. The two log shapes are the Pilot's
+    # REAL emissions (pilot-dispatcher.sh ~10776 pick preflight, ~10164 dispatch_one).
+    print("\nScenario (ga-zowwdz-c): _pool_cap() keeps read / not-read / diverged apart")
+    _NO_PLIST_FILE = "/nonexistent/approved-state-reconciler-selftest/com.gascity.pilot.plist"
+    _tmp_plists = []
+
+    def _cap_line(template, cap, age_sec, shape):
+        ts = time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(NOW - age_sec))
+        if shape == "pick":
+            return ("%s [pilot-dispatcher] ga-in9ebr: wa-c0001 QUEUED — routed to %s, pool at "
+                    "session cap (%d active/creating >= %d max); not claimed, no writes this "
+                    "sweep (the ga-93yxc pool top-up opens a session once a slot frees)."
+                    % (ts, template, cap, cap))
+        return ("%s [pilot-dispatcher]   ga-in9ebr: %s pool at session cap (%d active/creating "
+                ">= %d max) — QUEUED wa-c0002: claim released, story:approved + gc.routed_to=%s "
+                "kept, NOT marked in-flight/dispatched (ga-93yxc pool top-up opens a session "
+                "once a slot frees)." % (ts, template, cap, cap, template))
+
+    def _pilot_plist(env=None, edited_ago=3600, raw=None):
+        """A throwaway stand-in for the installed Pilot plist, last written `edited_ago`
+        seconds before NOW. Returns its path; the scenario unlinks every one it made."""
+        fd, path = tempfile.mkstemp(prefix="arc-selftest-pilot-", suffix=".plist")
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw if raw is not None
+                    else plistlib.dumps({"EnvironmentVariables": env or {}}))
+        os.utime(path, (NOW - edited_ago, NOW - edited_ago))
+        _tmp_plists.append(path)
+        return path
+
+    def _cap_case(label, want_cap, want_origin, note_has=(), env=None, edited_ago=3600,
+                  raw=None, missing=False, log=(), tpl="wa-worker",
+                  cap_env="PILOT_WA_WORKER_MAX"):
+        global _read_pilot_log_lines
+        globals()["PILOT_PLIST"] = (_NO_PLIST_FILE if missing
+                                    else _pilot_plist(env, edited_ago, raw))
+        _read_pilot_log_lines = lambda: list(log)
+        try:
+            got = _pool_cap(tpl, cap_env, NOW)
+        except Exception as e:   # noqa: BLE001 — pre-fix code has no _pool_cap at all
+            got = e
+        finally:
+            globals()["PILOT_PLIST"] = _NO_PILOT_PLIST
+            _read_pilot_log_lines = lambda: _pilot_recent()
+        if isinstance(got, Exception):
+            _bad("(ga-zowwdz-c) %s" % label, "raised %s: %s" % (type(got).__name__, got))
+            return
+        cap, origin, note = got
+        missing_words = [w for w in note_has if w not in note]
+        good = (cap == want_cap and origin == want_origin and not missing_words
+                and (note == "" if want_origin == "plist" else True))
+        if good:
+            _ok("(ga-zowwdz-c) %s → cap=%r origin=%s" % (label, cap, origin))
+        else:
+            _bad("(ga-zowwdz-c) %s" % label, "got (%r, %r, %r); want cap=%r origin=%s, note "
+                 "containing %r" % (cap, origin, note, want_cap, want_origin, list(note_has)))
+
+    _cap_case("plist read, no Pilot log line to cross-check", 3, "plist",
+              env={"PILOT_WA_WORKER_MAX": "3"})
+    _cap_case("plist and the Pilot's own log agree (pick shape) — not a divergence", 2, "plist",
+              env={"PILOT_WA_WORKER_MAX": "2"}, log=[_cap_line("wa-worker", 2, 60, "pick")])
+    _cap_case("DIVERGED (pick shape): plist edited 1h ago says 4, Pilot logged 2 a minute ago",
+              2, "pilot-log", note_has=("DIVERGED", "PILOT_WA_WORKER_MAX=4", "max=2"),
+              env={"PILOT_WA_WORKER_MAX": "4"}, log=[_cap_line("wa-worker", 2, 60, "pick")])
+    _cap_case("DIVERGED (dispatch shape): same, other emission", 2, "pilot-log",
+              note_has=("DIVERGED",), env={"PILOT_WA_WORKER_MAX": "4"},
+              log=[_cap_line("wa-worker", 2, 60, "dispatch")])
+    _cap_case("a cap line written BEFORE the plist edit describes the old setting, not "
+              "evidence against the plist", 4, "plist", env={"PILOT_WA_WORKER_MAX": "4"},
+              edited_ago=60, log=[_cap_line("wa-worker", 2, 600, "pick")])
+    _cap_case("plist missing + fresh Pilot log line → visible fallback to what the Pilot "
+              "enforced", 2, "pilot-log",
+              note_has=("not found", "the max the Pilot itself logged"), missing=True,
+              log=[_cap_line("wa-worker", 2, 60, "dispatch")])
+    _cap_case("plist missing + no log line → UNREAD, never a number", None, "unread",
+              note_has=("not found", "no fresh cap line"), missing=True)
+    _cap_case("variable absent from the plist's EnvironmentVariables → UNREAD", None, "unread",
+              note_has=("PILOT_WA_WORKER_MAX is not set",), env={"SOMETHING_ELSE": "1"})
+    _cap_case("non-integer value → UNREAD", None, "unread",
+              note_has=("not a non-negative integer",), env={"PILOT_WA_WORKER_MAX": "two"})
+    _cap_case("negative value → UNREAD", None, "unread",
+              note_has=("not a non-negative integer",), env={"PILOT_WA_WORKER_MAX": "-1"})
+    _cap_case("unparseable plist → UNREAD", None, "unread", note_has=("unreadable",),
+              raw=b"this is not a plist")
+    _cap_case("cap 0 is a real setting (pool deliberately closed), not an error", 0, "plist",
+              env={"PILOT_WA_WORKER_MAX": "0"})
+    _cap_case("a cap line older than POOL_CAP_LOG_TTL_SEC is no evidence", None, "unread",
+              missing=True, log=[_cap_line("wa-worker", 2, POOL_CAP_LOG_TTL_SEC + 200, "pick")])
+    _cap_case("a cap line dated beyond the clock-skew allowance ahead of now is no evidence",
+              None, "unread", missing=True, log=[_cap_line("wa-worker", 2, -600, "pick")])
+    _cap_case("another pool's cap line is not this pool's evidence", None, "unread",
+              missing=True, log=[_cap_line("ps-worker", 5, 60, "pick")])
+    _cap_case("two pools share one plist without cross-talk (ps-worker ignores wa-worker's "
+              "log line)", 1, "plist", tpl="ps-worker", cap_env="PILOT_PS_WORKER_MAX",
+              env={"PILOT_WA_WORKER_MAX": "2", "PILOT_PS_WORKER_MAX": "1"},
+              log=[_cap_line("wa-worker", 2, 60, "pick")])
+
+    # The two ends of the decision that reads it: an UNREAD cap must keep the alarm alive and
+    # say why, and cap 0 must read as saturated (0 >= 0, exactly the Pilot's own `[ live -ge 0 ]`).
+    globals()["PILOT_PLIST"] = _NO_PLIST_FILE
+    _read_pilot_log_lines = lambda: []
+    try:
+        has_cap_u, note_u = _pool_has_capacity("/x/whatsapp_automation", NOW)
+    except Exception as e:   # noqa: BLE001
+        has_cap_u, note_u = None, "raised %s: %s" % (type(e).__name__, e)
+    if has_cap_u is True and "unknown" in note_u and "not found" in note_u:
+        _ok("(ga-zowwdz-c) unreadable cap → conservative alarm, and the note says why")
+    else:
+        _bad("(ga-zowwdz-c) unreadable cap", "has_cap=%r note=%r" % (has_cap_u, note_u))
+    globals()["PILOT_PLIST"] = _pilot_plist({"PILOT_WA_WORKER_MAX": "0"})
+    _sh = _fake_session_list("wa-worker", 0)
+    try:
+        has_cap_z, note_z = _pool_has_capacity("/x/whatsapp_automation", NOW)
+    except Exception as e:   # noqa: BLE001
+        has_cap_z, note_z = None, "raised %s: %s" % (type(e).__name__, e)
+    if has_cap_z is False and "0/0" in note_z and "cap 0 from plist" in note_z:
+        _ok("(ga-zowwdz-c) cap 0 → pool reads saturated, and the note names cap + origin")
+    else:
+        _bad("(ga-zowwdz-c) cap 0", "has_cap=%r note=%r" % (has_cap_z, note_z))
+    _sh = _stub_sh_fast
+    globals()["PILOT_PLIST"] = _NO_PILOT_PLIST
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    for _p in _tmp_plists:
+        os.unlink(_p)
+
+    # ── (ga-zowwdz-d) one malformed state record must not take the whole cycle down ──
+    # _prune_state() runs FIRST in every run_cycle(), and main() only saves state AFTER
+    # run_cycle() returns — so a record it chokes on stays on disk and the job fails the same
+    # way on every launchd tick, forever. Malformed records are dropped WITH a warning.
+    print("\nScenario (ga-zowwdz-d): malformed state records are dropped WITH a warning, "
+          "not fatal to run_cycle()")
+    st = {"routed": {"fresh": NOW - 60, "stale": NOW - 8 * 24 * 3600, "junk-str": "yesterday",
+                     "junk-none": None, "junk-dict": {"last": "x", "count": 1}},
+          "alarmed": {"a-fresh": {"last": NOW - 5, "count": 1}},
+          "flagged": ["not", "a", "mapping"],
+          "first_seen_approved": None}
+    buf = io.StringIO()
+    err_d = None
+    try:
+        with contextlib.redirect_stdout(buf):
+            _prune_state(st, NOW)
+    except Exception as e:   # noqa: BLE001 — on the pre-fix code: TypeError / AttributeError
+        err_d = e
+    out_d = buf.getvalue()
+    sys.stdout.write(out_d)   # keep the suite's own output complete
+    if (err_d is None and st["routed"] == {"fresh": NOW - 60}
+            and list(st["alarmed"]) == ["a-fresh"] and st["flagged"] == {}
+            and st["first_seen_approved"] == {}
+            and all(w in out_d for w in ("junk-str", "junk-none", "junk-dict", "non-numeric",
+                                         "not a mapping"))):
+        _ok("(ga-zowwdz-d): junk records dropped and named in the log; fresh ones kept; "
+            "a stale one still expires; non-mapping buckets reset")
+    else:
+        _bad("(ga-zowwdz-d)", "raised=%r routed=%r alarmed=%r flagged=%r first_seen=%r "
+             "warned=%s" % (err_d, st.get("routed"), st.get("alarmed"), st.get("flagged"),
+                            st.get("first_seen_approved"), "non-numeric" in out_d))
+    st = _reset()
+    st["alarmed"]["wa-junk"] = {"last": "not-a-number", "count": 1}
+    _bd_approved = lambda root: []
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    buf = io.StringIO()
+    err_d = None
+    try:
+        with contextlib.redirect_stdout(buf):
+            run_cycle(NOW, st)
+    except Exception as e:   # noqa: BLE001
+        err_d = e
+    sys.stdout.write(buf.getvalue())
+    if err_d is None and "wa-junk" not in st["alarmed"]:
+        _ok("(ga-zowwdz-d): run_cycle() survives a state record with a non-numeric timestamp")
+    else:
+        _bad("(ga-zowwdz-d) run_cycle", "raised=%r record-still-in-state=%s" % (
+             err_d, "wa-junk" in st["alarmed"]))
+    _reset()
 
     # ── (i) mayor-assigned + starving → ledger note only, no alarm ───────────
     print("\nScenario (i): mayor-assigned approved + starving → ledger note, NO alarm")
