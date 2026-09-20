@@ -118,6 +118,69 @@ eq "wa beats geo"             "$(escalation_classify_topic "painel arcgis layer"
 # wa beats property (painel mentions ITBI)
 eq "wa beats property"        "$(escalation_classify_topic "painel ITBI filter")"    "wa"
 
+# ── 1b. locale independence (ga-671p6g) ──────────────────────────────────────
+# Section 1 runs under whatever locale the caller happens to have, which is how
+# this bug hid: the geo/property patterns spelled accented words as bracket
+# classes ([óo]), grep matches those per CHARACTER, and under LC_ALL=C / POSIX —
+# the locale of a launchd job whose plist sets no LANG/LC_* (agent-stuck-escalation
+# sets none) — "ó" is two loose bytes, so the class never matched it and the
+# escalation fell through to the mayor fallback ("ÍNDICE CADASTRAL" was even
+# misrouted to property). A dog session has LC_ALL=C and a dev shell has UTF-8, so
+# the same selftest passed or failed depending on who ran it. Every case below
+# therefore runs under BOTH locales, set per call — grep, spawned inside the
+# function, inherits LC_ALL from the call's environment.
+echo ""
+echo "── 1b. escalation_classify_topic — same answer under C and UTF-8 (ga-671p6g) ──"
+# Without the UTF-8 locale installed the second leg would silently degrade to C
+# and prove nothing, so its absence is a failure, not a skip. `locale -a` is
+# captured first and matched from a here-string: `locale -a | grep -q` under this
+# script's `set -o pipefail` reports FAILURE when grep -q exits on its first hit
+# and locale takes SIGPIPE (141) — it flagged an installed locale as missing.
+_locales="$(locale -a 2>/dev/null)"; _loc_rc=$?
+if [ "$_loc_rc" -ne 0 ] || [ -z "$_locales" ]; then
+  bad "locale -a gave no usable list (exit $_loc_rc) — cannot tell whether the UTF-8 leg below is real"
+elif grep -qx 'en_US.UTF-8' <<< "$_locales"; then ok "en_US.UTF-8 locale installed (UTF-8 leg is real)"
+else bad "en_US.UTF-8 locale missing — the UTF-8 leg below would silently run as C"; fi
+loc_eq() {   # loc_eq <label> <text> <want>
+  local label="$1" text="$2" want="$3" got_c got_u
+  got_c=$(LC_ALL=C escalation_classify_topic "$text")
+  got_u=$(LC_ALL=en_US.UTF-8 escalation_classify_topic "$text")
+  eq "$label [C | UTF-8]" "$got_c | $got_u" "$want | $want"
+}
+# geo — lower case, UPPER case (grep -i folds non-ASCII only under UTF-8), ASCII-folded
+loc_eq "incorporação"         "incorporação"         "geo"
+loc_eq "INCORPORAÇÃO"         "INCORPORAÇÃO"         "geo"
+loc_eq "incorporacao"         "incorporacao"         "geo"
+loc_eq "quarteirão"           "quarteirão"           "geo"
+loc_eq "QUARTEIRÃO"           "QUARTEIRÃO"           "geo"
+loc_eq "quarteirao"           "quarteirao"           "geo"
+loc_eq "índice cadastral"     "índice cadastral"     "geo"
+loc_eq "ÍNDICE CADASTRAL"     "ÍNDICE CADASTRAL"     "geo"   # base @C: property — a WRONG topic, not just the fallback
+loc_eq "indice cadastral"     "indice cadastral"     "geo"
+# property
+loc_eq "proprietário"         "proprietário"         "property"
+loc_eq "proprietária"         "proprietária"         "property"
+loc_eq "PROPRIETÁRIO"         "PROPRIETÁRIO"         "property"
+loc_eq "proprietario"         "proprietario"         "property"
+loc_eq "imóvel"               "imóvel"               "property"
+loc_eq "imóveis"              "imóveis"              "property"
+loc_eq "IMÓVEL"               "IMÓVEL"               "property"
+loc_eq "IMÓVEIS"              "IMÓVEIS"              "property"
+loc_eq "imovel"               "imovel"               "property"
+loc_eq "cartório"             "cartório"             "property"
+loc_eq "CARTÓRIO"             "CARTÓRIO"             "property"
+loc_eq "cartorio"             "cartorio"             "property"
+loc_eq "matrícula"            "matrícula"            "property"
+loc_eq "MATRÍCULA"            "MATRÍCULA"            "property"
+loc_eq "matricula"            "matricula"            "property"
+# inside a realistic sentence, and precedence still holds when the winner is accented
+loc_eq "accent in a sentence"       "escalação: o proprietário do imóvel não foi encontrado" "property"
+loc_eq "geo beats property (accent)" "incorporação ITBI"                                     "geo"
+loc_eq "wa beats property (accent)"  "painel do imóvel"                                      "wa"
+# no over-matching: accented words that are NOT in the vocabulary stay unrouted
+loc_eq "unrelated accents → none"    "ação de manutenção"     ""
+loc_eq "unrelated accents → none (2)" "relatório diário"      ""
+
 # ── 2. escalation_topic_to_crew — routing map ────────────────────────────────
 echo ""
 echo "── 2. escalation_topic_to_crew (default map) ──"
@@ -305,6 +368,32 @@ grep -q 'digo-wa'                    "$ROUTER" && ok "phone crew wired"         
 grep -q 'peter-wa'                   "$ROUTER" && ok "geo crew wired"              || bad "geo crew missing"
 grep -q 'escalation_classify_rig_origin' "$ROUTER" && ok "rig-origin fn defined"   || bad "rig-origin fn missing"
 grep -q '\-\-rig\|\-r)'              "$ROUTER" && ok "--rig CLI flag present"       || bad "--rig CLI flag missing"
+
+# ga-671p6g: no non-ASCII character inside a bracket expression in the classifier.
+# [óo] is matched per BYTE under LC_ALL=C, so it never matches "ó". Section 1b only
+# covers the words listed there; this catches the NEXT accented word added in the
+# old style. Comment lines are dropped (they legitimately quote accented words) and
+# the scan runs under LC_ALL=C so a UTF-8 character shows up as high bytes. It must
+# not be able to pass without having looked — three ways that could happen, each its
+# own failure: the body is not extractable (a renamed function would pass vacuously);
+# grep itself errored (exit >1 leaves stdout empty, which reads as "none found"); or
+# the detector cannot flag a known-bad line (positive control — a regex some grep
+# build rejects or misreads would go quiet instead of loud).
+_MB_BRACKET_RE='\[[^]]*[^[:print:]][^]]*\]'
+_classifier_src="$(sed -n '/^escalation_classify_topic()/,/^}/p' "$ROUTER" | grep -v '^[[:space:]]*#')"
+printf '%s\n' 'x[óo]y' | LC_ALL=C grep -qE "$_MB_BRACKET_RE"; _mb_ctl_rc=$?
+_mb_brackets="$(printf '%s\n' "$_classifier_src" | LC_ALL=C grep -nE "$_MB_BRACKET_RE")"; _mb_rc=$?
+if [ -z "$_classifier_src" ]; then
+  bad "classifier body not extractable from $ROUTER — the multibyte-bracket guard would pass vacuously"
+elif [ "$_mb_ctl_rc" -ne 0 ]; then
+  bad "multibyte-bracket detector cannot flag a known-bad line (grep exit $_mb_ctl_rc) — the guard would pass without looking"
+elif [ "$_mb_rc" -gt 1 ]; then
+  bad "multibyte-bracket scan errored (grep exit $_mb_rc) — an empty result would have read as 'none found'"
+elif [ "$_mb_rc" -eq 0 ]; then
+  bad "classifier has a non-ASCII char inside a bracket expression (per-byte under LC_ALL=C; write (ó|Ó|o) instead): $(printf '%s' "$_mb_brackets" | head -2 | cut -c1-110 | tr '\n' ' ')"
+else
+  ok "classifier: no non-ASCII char inside a bracket expression"
+fi
 
 # ── 6. hermetic: no city log was touched but the sandbox's own (ga-d8zeli) ───
 echo ""

@@ -120,6 +120,18 @@ escalation_classify_rig_origin() {
 # Classify escalation text into a topic string, or "" if no match.
 # Order: most-specific first. Mirrors the logic in pilot-dispatcher.sh:bead_domain().
 # Prints one of: warming, phone-proxy, wa, geo, property, infra, ""
+#
+# ACCENTED LETTERS ARE WRITTEN AS ALTERNATIONS, never bracket classes (ga-671p6g):
+# (ó|Ó|o), not [óo]. grep matches a bracket expression per CHARACTER, and under
+# LC_ALL=C / POSIX — the locale of any launchd job whose plist sets no LANG/LC_*,
+# e.g. agent-stuck-escalation — a UTF-8 letter is TWO bytes: [óo] sees 0xC3, 0xB3
+# and 'o' as three loose members and never matches the 2-byte "ó", so "imóvel"
+# fell through to the mayor fallback (and "ÍNDICE CADASTRAL" was misrouted to
+# property). An alternation is a plain byte sequence under C and one character
+# under UTF-8, so it answers the same in both, and no particular locale has to
+# exist on the host. The UPPER-case letter is spelled out too: -i folds non-ASCII
+# only under a UTF-8 locale. escalation-router.selftest.sh §1b (both locales) and
+# §5 (no multibyte char inside a bracket) pin this.
 escalation_classify_topic() {
   local text="$1"
   [ -z "$text" ] && { echo ""; return 0; }
@@ -148,13 +160,13 @@ escalation_classify_topic() {
 
   # geo / ArcGIS / zoneamento / incorporação / quarteirão
   if printf '%s' "$text" | grep -iqE \
-      'arcgis|zoneamento|geometria|geo-?match|quarteir[aã]o|incorpora[çc][aã]o|geocod|georreferenc|lat[ -/]?lon|point-in-polygon|[íi]ndice cadastral|indice cadastral|centroid'; then
+      'arcgis|zoneamento|geometria|geo-?match|quarteir(ã|Ã|a)o|incorpora(ç|Ç|c)(ã|Ã|a)o|geocod|georreferenc|lat[ -/]?lon|point-in-polygon|(í|Í|i)ndice cadastral|indice cadastral|centroid'; then
     echo "geo"; return 0
   fi
 
   # property-scrapers: cadastro/ITBI/CNPJ/RFB/PBH/motherduck/scraper/terreno/lote
   if printf '%s' "$text" | grep -iqE \
-      'scraper|scrape|\bcadastro\b|cadastr[ao]|\bITBI\b|\bRFB\b|receita federal|\bCNAE\b|\bCNPJ\b|\bPBH\b|motherduck|\bHex notebook\b|pesquisa_mercado|propriet[áa]ri|\bim[óo]vel\b|\bim[óo]veis\b|\blote\b|\blotes\b|\bterreno\b|cart[óo]rio|matr[íi]cula|mega.?data.?set|batista-?ps|property.?scrap'; then
+      'scraper|scrape|\bcadastro\b|cadastr[ao]|\bITBI\b|\bRFB\b|receita federal|\bCNAE\b|\bCNPJ\b|\bPBH\b|motherduck|\bHex notebook\b|pesquisa_mercado|propriet(á|Á|a)ri|\bim(ó|Ó|o)vel\b|\bim(ó|Ó|o)veis\b|\blote\b|\blotes\b|\bterreno\b|cart(ó|Ó|o)rio|matr(í|Í|i)cula|mega.?data.?set|batista-?ps|property.?scrap'; then
     echo "property"; return 0
   fi
 
