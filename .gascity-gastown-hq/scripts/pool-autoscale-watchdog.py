@@ -14,6 +14,10 @@ Poll loop (~60s). Silence = healthy (only emits on actions).
   [POOL-AUTOSCALE] [STARTUP]         initial state report
   [POOL-AUTOSCALE] [PROBE-DISAGREE]  watchdog counted claimable beads but the pool's own
                                      probe says the queue is empty (probe wins)
+  [POOL-AUTOSCALE] [PROBE-UNAVAILABLE] the pool's own probe could not be asked, so the
+                                     count stands uncross-checked
+  [POOL-AUTOSCALE] [PROBE-WINDOW-FULL] the probe's 20-bead window holds nothing claimable;
+                                     work behind it is invisible to it (and to this count)
 
 Demand (ga-uv4on5) is the beads a pool worker's own probe would hand out, not
 every ready bead routed to the pool: held, vetoed, parked, epic and in-flight
@@ -71,7 +75,8 @@ ASLEEP_STATES = {"asleep", "idle"}
 #     predicate against it;
 #   - get_pool_demand() puts a non-empty count to the pool's own probe
 #     (`gc hook`) before it can wake anyone, and logs [PROBE-DISAGREE] when the
-#     probe says the queue is empty.
+#     probe says the queue is empty, or [PROBE-UNAVAILABLE] when it cannot be
+#     asked (the count then stands, uncross-checked).
 
 # Exact labels the probe excludes. Passed to `bd ready` as --exclude-label, which
 # bd applies BEFORE --limit, so held beads do not use up the candidate window.
@@ -117,8 +122,8 @@ _HOLD_EXPIRY_RE = re.compile(r"\d+(?:\.\d+)?")
 _SESSION_IDENTITY_ENV = ("GC_SESSION_ID", "GC_SESSION_NAME", "GC_ALIAS",
                          "GC_SESSION_ORIGIN", "GC_AGENT", "GC_TEMPLATE")
 
-# Pools whose last demand check disagreed with their own probe (log once per episode).
-_probe_disagreement_logged = set()
+# (kind, pool) conditions already reported; see _report_once().
+_reported = set()
 
 
 # ---------------------------------------------------------------------------
@@ -211,9 +216,11 @@ def probe_would_serve(bead, now_ts):
     back), the jq-stage prefixes, epic titles and Pilot holds, plus
     WATCHDOG_EXCLUDE_LABELS.
 
-    Unreadable data (labels that are not a list of strings, a hold expiry that
-    is not an epoch) reads as held: under doubt the answer is "no demand",
-    never "wake a dog".
+    A missing or null `labels` key means no labels: bd omits the key for a bead
+    nobody has labelled, and the probe's jq reads it the same way. Unreadable
+    data (labels that are not a list of strings, a hold expiry that is not an
+    epoch) reads as held: under doubt the answer is "no demand", never "wake a
+    dog".
     """
     if not isinstance(bead, dict):
         return False
@@ -259,22 +266,50 @@ def _ready_candidates(pool_template):
     return data if isinstance(data, list) else None
 
 
-def _pool_probe_reports_empty(pool_template):
-    """True only when the pool's own work query (`gc hook <pool>`) POSITIVELY
-    says the queue is empty: exit 1 and a bare "[]" on stdout.
+def _pool_probe_verdict(pool_template):
+    """Ask the pool's own work query (`gc hook <pool>`) whether a dog could claim
+    anything. Returns (verdict, why):
+
+      ("empty", "")     exit 1 and a bare "[]" on stdout: positively nothing to claim
+      ("work", "")      exit 0 and a JSON list with at least one entry
+      ("unknown", why)  anything else: a failure, a timeout, an answer that is no list
 
     `gc hook` exits 1 for errors too (unknown or suspended agent), with an empty
-    stdout, so the exit code alone cannot tell "empty" from "broken". Anything
-    short of the positive signature -- a failure, a timeout, a missing body --
-    returns False: no veto, the caller keeps its own count.
+    stdout, so the exit code alone cannot tell "empty" from "broken"; only the
+    positive signatures count. It runs without the caller's session identity,
+    which `gc hook` would otherwise also answer for.
     """
     env = {k: v for k, v in os.environ.items() if k not in _SESSION_IDENTITY_ENV}
     try:
         result = subprocess.run(["gc", "hook", pool_template], capture_output=True,
                                 text=True, timeout=30, env=env)
-    except Exception:
-        return False
-    return result.returncode == 1 and result.stdout.strip() == "[]"
+    except Exception as exc:
+        return "unknown", f"{type(exc).__name__}: {exc}"
+    out = result.stdout.strip()
+    if result.returncode == 1 and out == "[]":
+        return "empty", ""
+    if result.returncode == 0:
+        try:
+            body = json.loads(out)
+        except ValueError:
+            body = None
+        if isinstance(body, list) and body:
+            return "work", ""
+    error_lines = [l.strip() for l in (result.stderr or "").splitlines()
+                   if l.strip() and not l.startswith("warning:")]
+    return "unknown", (f"exit {result.returncode}, "
+                       + (error_lines[-1][:160] if error_lines else "no error text"))
+
+
+def _report_once(kind, pool_template, message):
+    """Print `message` the first time a condition holds for a pool, and again only
+    after it has stopped holding. A falsy message means "does not hold now"."""
+    key = (kind, pool_template)
+    if not message:
+        _reported.discard(key)
+    elif key not in _reported:
+        _reported.add(key)
+        print(message, flush=True)
 
 
 def get_pool_demand(pool_template):
@@ -290,24 +325,45 @@ def get_pool_demand(pool_template):
     is a presence signal -- scale_decision() only asks whether it is > 0.
 
     A non-empty count is put to the pool's own probe before it can wake anyone:
-    if the probe says the queue is empty, the probe wins (see PROBE-DISAGREE).
+    if the probe says the queue is empty, the probe wins. Where the watchdog
+    cannot know it says so instead of guessing quietly, once per episode:
+      PROBE-UNAVAILABLE  the probe could not be asked; the count stands
+      PROBE-DISAGREE     the probe overruled the count
+      PROBE-WINDOW-FULL  the probe's window holds nothing claimable, so work
+                         behind it is invisible to every dog; still 0, because
+                         no dog can claim what its probe cannot see
     """
     candidates = _ready_candidates(pool_template)
     if candidates is None:
         return -1
+    if candidates and not any(isinstance(b, dict) for b in candidates):
+        return -1   # a list came back but no beads are in it: the format changed
     now_ts = time.time()
     claimable = [b for b in candidates if probe_would_serve(b, now_ts)]
-    if claimable and _pool_probe_reports_empty(pool_template):
-        if pool_template not in _probe_disagreement_logged:
-            _probe_disagreement_logged.add(pool_template)
-            print(f"[POOL-AUTOSCALE] [PROBE-DISAGREE] pool={pool_template} "
-                  f"watchdog_claimable={len(claimable)} but the pool's own work "
-                  f"query (gc hook) reports an empty queue; trusting the probe, no "
-                  f"dog woken. The watchdog's copy of the probe is out of date: "
-                  f"run test_pool_autoscale_watchdog.py -k engine_probe", flush=True)
-        return 0
-    _probe_disagreement_logged.discard(pool_template)
-    return len(claimable)
+
+    # `condition and "message"`: a falsy value means the condition does not hold.
+    _report_once("window-full", pool_template,
+                 not claimable and len(candidates) >= PROBE_CANDIDATE_LIMIT and
+                 f"[POOL-AUTOSCALE] [PROBE-WINDOW-FULL] pool={pool_template} the "
+                 f"probe's {PROBE_CANDIDATE_LIMIT}-bead candidate window holds "
+                 f"nothing claimable; work behind it is invisible to the pool's own "
+                 f"probe, so no dog is woken for it")
+
+    verdict, why = _pool_probe_verdict(pool_template) if claimable else ("none", "")
+    _report_once("probe-unavailable", pool_template,
+                 verdict == "unknown" and
+                 f"[POOL-AUTOSCALE] [PROBE-UNAVAILABLE] pool={pool_template} cannot "
+                 f"cross-check the count against the pool's own probe ({why}); the "
+                 f"watchdog's own count stands ({len(claimable)} claimable)")
+    _report_once("probe-disagree", pool_template,
+                 verdict == "empty" and
+                 f"[POOL-AUTOSCALE] [PROBE-DISAGREE] pool={pool_template} "
+                 f"watchdog_claimable={len(claimable)} but the pool's own work query "
+                 f"(gc hook) reports an empty queue; trusting the probe, no dog woken. "
+                 f"Either the watchdog's copy of the probe is out of date (run "
+                 f"test_pool_autoscale_watchdog.py -k engine_probe) or the probe's own "
+                 f"bd read failed (it reports errors as empty)")
+    return 0 if verdict == "empty" else len(claimable)
 
 
 def get_pool_sessions(pool_template):

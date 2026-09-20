@@ -231,8 +231,9 @@ def test_only_claimable_beads_are_counted(wd, fake):
 
 
 def test_bead_with_no_labels_at_all_is_demand(wd, fake):
-    """Break caught: reading a label-less row as unreadable. bd may omit the
-    labels key or send null for a bead nobody has labelled; that is plain work."""
+    """Break caught: reading a label-less row as unreadable. bd omits the labels
+    key for a bead nobody has labelled (checked live: 9 of 400 beads sampled),
+    and the probe's own jq reads a missing or null key as no labels."""
     omitted = bead("ga-omitted")
     del omitted["labels"]
     null = bead("ga-null")
@@ -276,6 +277,34 @@ def test_hold_labelled_beads_do_not_crowd_claimable_work_out_of_the_window(wd, f
                  created_at="2026-09-01T00:%02d:00Z" % i) for i in range(25)]
     fake.beads = held + [bead("ga-ok", created_at="2026-09-20T00:00:00Z")]
     assert wd.get_pool_demand(POOL) == 1
+
+
+def _twenty_refused_then_one_claimable():
+    """20 beads that only the probe's jq stage drops (pool:refused:* is a prefix
+    rule, so bd does not exclude them), all older than one claimable bead."""
+    refused = [bead("ga-r%02d" % i, labels=["pool:refused:engine-rebuild-required"],
+                    created_at="2026-09-01T00:%02d:00Z" % i) for i in range(20)]
+    return refused + [bead("ga-hidden", created_at="2026-09-20T00:00:00Z")]
+
+
+def test_full_candidate_window_with_nothing_claimable_is_reported_once(wd, fake, capsys):
+    """Break caught: the probe only looks at its 20 oldest candidates, so 20
+    jq-held beads hide any later work from every dog. "Nothing visible" must not
+    pass silently for "nothing there": still 0 (no dog can claim it), but said."""
+    fake.beads = _twenty_refused_then_one_claimable()
+    assert wd.get_pool_demand(POOL) == 0
+    assert wd.get_pool_demand(POOL) == 0
+    assert capsys.readouterr().out.count("PROBE-WINDOW-FULL") == 1
+
+
+def test_window_that_is_not_full_or_holds_claimable_work_is_not_reported(wd, fake, capsys):
+    fake.beads = _twenty_refused_then_one_claimable()[1:]         # 19 refused + 1 claimable: room left
+    wd.get_pool_demand(POOL)
+    fake.beads = _twenty_refused_then_one_claimable()[:19]        # 19 refused, nothing else: room left
+    wd.get_pool_demand(POOL)
+    fake.beads = _twenty_refused_then_one_claimable()[:19] + [bead("ga-ok", created_at="2026-09-02T00:00:00Z")]
+    wd.get_pool_demand(POOL)                                      # 20 candidates, one claimable
+    assert "PROBE-WINDOW-FULL" not in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +385,58 @@ def test_probe_confirming_work_keeps_the_count(wd, fake):
     assert wd.get_pool_demand(POOL) == 3
 
 
+def test_a_healthy_probe_raises_no_probe_alerts(wd, fake, capsys):
+    """Break caught: alert noise on the normal path drowns the one that matters."""
+    fake.beads = [bead("ga-a")]
+    fake.hook = (0, json.dumps([bead("ga-a")]), "")
+    wd.get_pool_demand(POOL)
+    fake.hook = (1, "[]", "")
+    wd.get_pool_demand(POOL)
+    assert "PROBE-UNAVAILABLE" not in capsys.readouterr().out
+
+
+def test_probe_that_cannot_answer_is_reported_once_per_episode(wd, fake, capsys):
+    """Break caught: with the cross-check silently off, a stale mirror wakes
+    dogs again and nobody can tell the safety net is down. The count still
+    stands (fail-open beats stalling the pool) but the outage is said aloud."""
+    fake.beads = [bead("ga-a")]
+    fake.hook = (1, "", 'gc hook: agent "gastown.dog" not found in config')
+    assert wd.get_pool_demand(POOL) == 1
+    assert wd.get_pool_demand(POOL) == 1
+    out = capsys.readouterr().out
+    assert out.count("PROBE-UNAVAILABLE") == 1
+    assert "not found in config" in out, "the alert must say why"
+    fake.hook = (0, json.dumps([bead("ga-a")]), "")               # the probe answers again
+    wd.get_pool_demand(POOL)
+    fake.hook = (1, "", "boom")                                   # a later outage is a new episode
+    wd.get_pool_demand(POOL)
+    assert capsys.readouterr().out.count("PROBE-UNAVAILABLE") == 1
+
+
+@pytest.mark.parametrize("rc,out,err", [
+    (0, "", ""),
+    (0, "not a work list", ""),
+    (2, "", "usage: gc hook [agent]"),
+    (1, "", 'gc hook: agent "gastown.dog" is suspended'),
+], ids=["ok-without-body", "ok-with-garbage", "usage-error", "suspended-agent"])
+def test_an_answer_that_is_not_an_answer_is_reported_as_unavailable(wd, fake, capsys, rc, out, err):
+    """Break caught: only the two positive signatures (exit 1 + "[]", exit 0 +
+    a work list) count as an answer; everything else is "could not ask"."""
+    fake.beads = [bead("ga-a")]
+    fake.hook = (rc, out, err)
+    assert wd.get_pool_demand(POOL) == 1
+    assert capsys.readouterr().out.count("PROBE-UNAVAILABLE") == 1
+
+
+def test_probe_timeout_is_reported_as_unavailable(wd, fake, capsys):
+    fake.beads = [bead("ga-a")]
+    fake.hook_raises = subprocess.TimeoutExpired(["gc", "hook", POOL], 30)
+    assert wd.get_pool_demand(POOL) == 1
+    out = capsys.readouterr().out
+    assert out.count("PROBE-UNAVAILABLE") == 1
+    assert "timed out" in out
+
+
 def test_probe_is_asked_about_the_pool_not_about_the_caller(wd, fake, monkeypatch):
     """Break caught: with a session identity in the environment `gc hook` also
     returns work assigned to that caller, so the probe would never say empty."""
@@ -411,10 +492,18 @@ def test_bd_timeout_is_an_error(wd, fake):
     assert wd.get_pool_demand(POOL) == -1
 
 
-@pytest.mark.parametrize("stdout", ["", "not json at all", '{"error": "boom"}', "null"],
-                         ids=["empty", "garbage", "object", "null"])
+@pytest.mark.parametrize("stdout", ["", "not json at all", '{"error": "boom"}', "{}", "null", "7", '"oops"'],
+                         ids=["empty", "garbage", "object", "empty-object", "null", "number", "string"])
 def test_unparseable_bd_output_is_an_error(wd, fake, stdout):
     fake.bd_stdout = stdout
+    assert wd.get_pool_demand(POOL) == -1
+
+
+def test_a_list_with_no_beads_in_it_is_an_error_not_zero_demand(wd, fake):
+    """Break caught: if bd's row format ever changed, every row would read as
+    unreadable = held, and the pool would never scale up again, in silence.
+    (A few bad rows among good ones are ignored, see the malformed-rows test.)"""
+    fake.bd_stdout = json.dumps([None, "ga-1", 7])
     assert wd.get_pool_demand(POOL) == -1
 
 
