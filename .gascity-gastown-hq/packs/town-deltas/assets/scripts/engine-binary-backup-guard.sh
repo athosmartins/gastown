@@ -119,7 +119,9 @@ mkdir -p "$STATE_DIR" 2>/dev/null || true
 [ -f "$SEEN_FILE" ] || echo '{}' > "$SEEN_FILE" 2>/dev/null || true
 SEEN_JSON=$(cat "$SEEN_FILE" 2>/dev/null || echo '{}')
 [ -n "$SEEN_JSON" ] || SEEN_JSON='{}'
-# Estado ilegivel: recomeca do zero. Pior caso e UM re-alerta a mais, nunca um alerta a menos.
+# Estado ilegivel: recomeca do zero. Pior caso REAL: um re-alerta a mais E as sequencias
+# de UNKNOWN recomecam (o alarme por incerteza atrasa ate UNKNOWN_STREAK execucoes).
+# MISSING/ORPHAN/UNSTAMPED nao dependem de estado: esses alarmes nunca se perdem por aqui.
 printf '%s' "$SEEN_JSON" | jq -e . >/dev/null 2>&1 || SEEN_JSON='{}'
 
 # Cooldown de alerta -- so governa o NOTIFY; a medicao e o relatorio nunca sao suprimidos.
