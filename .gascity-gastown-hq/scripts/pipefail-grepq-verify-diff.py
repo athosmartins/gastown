@@ -26,18 +26,44 @@ def git(*a):
     return subprocess.run(["git", "-C", wt, *a], capture_output=True, text=True, errors="surrogateescape").stdout
 
 
+def _flag_removal_candidates(s):
+    """one-step reductions of s matching a single codemod edit: drop one 'q' from
+    inside a flag cluster, or drop a whole -q/--quiet/--silent word (one adjacent space)."""
+    out = []
+    for i, c in enumerate(s):
+        if c == "q" and re.search(r"(?:^|[\s\"'])-[A-Za-z]*$", s[:i]):
+            out.append(s[:i] + s[i + 1:])
+    for pat in (" -q", "-q ", " --quiet", "--quiet ", " --silent", "--silent "):
+        idx = s.find(pat)
+        while idx != -1:
+            out.append(s[:idx] + s[idx + len(pat):])
+            idx = s.find(pat, idx + 1)
+    return out
+
+
+def is_q_only_edit(o, n, depth=0):
+    """True iff n is reachable from o via zero or more single-flag q-removals.
+
+    Checked by direct reconstruction (try every legal single-step removal and
+    recurse) rather than by pattern-matching a difflib opcode: with a repeated
+    '-' right after the removed flag (e.g. "-q --pat"), SequenceMatcher can
+    represent the very same net edit as deleting 'q -' instead of ' -q' —
+    an alignment artifact, not a different edit — which a fixed-shape check
+    on its opcodes would misreport as unrecognized."""
+    if o == n:
+        return True
+    if depth > 4:                      # a real line never needs more than a couple of removals
+        return False
+    return any(is_q_only_edit(cand, n, depth + 1) for cand in _flag_removal_candidates(o))
+
+
 def only_q_edits(o, n):
+    if is_q_only_edit(o, n):
+        return None
     sm = difflib.SequenceMatcher(None, o, n, autojunk=False)
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == "equal":
-            continue
-        if tag == "delete":
-            seg = o[i1:i2]
-            if seg == "q" and re.search(r"(?:^|[\s\"'])-[A-Za-z]*$", o[:i1]):
-                continue
-            if seg in (" -q", "-q ", " --quiet", "--quiet ", " --silent", "--silent "):
-                continue
-        return f"{tag} {o[i1:i2]!r} -> {n[j1:j2]!r}"
+        if tag != "equal":
+            return f"{tag} {o[i1:i2]!r} -> {n[j1:j2]!r}"
     return None
 
 

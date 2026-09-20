@@ -176,6 +176,26 @@ PYTAMPER2
 vout="$(python3 "$VERIFY" "$R" HEAD 2>&1)"; vrc=$?
 [ "$vrc" = 1 ] && [[ "$vout" == *"LOST"* ]] && ok "verifier: REJECTS a rewrite that loses an existing >/dev/null" || bad "verifier accepted a lost redirect (rc=$vrc): $vout"
 
+echo "── verifier: the '-q --' alignment ambiguity does not false-positive ──"
+# ga-d37l4y: a bare "-q" word immediately followed by another "-"-led token (a
+# literal "--" end-of-options marker is the common case) removes cleanly, but
+# difflib's SequenceMatcher can represent that same net edit as deleting "q -"
+# instead of " -q" -- an alignment artifact, not a different edit. A checker
+# that pattern-matches one opcode's shape misreports it as unrecognized. Real,
+# not hypothetical: 20 sites across the *.selftest.sh sweep hit exactly this.
+AMBIG="$T/ambig"; mkdir -p "$AMBIG"
+git -C "$AMBIG" init -q 2>/dev/null
+cat > "$AMBIG/f.sh" <<'FIXTURE_AMBIG'
+#!/bin/bash
+set -uo pipefail
+if [ -n "$x" ] && echo "$x" | grep -q -- '--strict-mcp-config'; then :; fi
+FIXTURE_AMBIG
+git -C "$AMBIG" add f.sh
+git -C "$AMBIG" -c user.name=selftest -c user.email=selftest@example.invalid commit -q -m base 2>/dev/null
+python3 "$CODEMOD" --apply "$AMBIG" f.sh >/dev/null 2>&1
+vout="$(python3 "$VERIFY" "$AMBIG" HEAD 2>&1)"; vrc=$?
+[ "$vrc" = 0 ] && [[ "$vout" == *"failures=0"* ]] && ok "verifier: accepts a -q immediately followed by -- (the alignment-ambiguity case)" || bad "verifier false-positived on '-q --' (rc=$vrc): $vout"
+
 echo ""
 echo "Results: $P passed, $F failed"
 [ "$F" -eq 0 ] && { echo "SELFTEST PASS"; exit 0; } || { echo "SELFTEST FAIL"; exit 1; }
