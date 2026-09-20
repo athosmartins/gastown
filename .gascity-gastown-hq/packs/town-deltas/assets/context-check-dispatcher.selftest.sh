@@ -944,7 +944,7 @@ else
 fi
 # 12b — The guard specifically checks: if computed=exec:auto AND existing has exec:manual, skip.
 #        Verify the exact branch condition exists in the code.
-if grep -qF '"exec:auto" ] && echo ",$c_labels," | grep -qF ",exec:manual,"' "$DISPATCHER"; then
+if grep -qF '"exec:auto" ] && echo ",$c_labels," | grep -F ",exec:manual," >/dev/null' "$DISPATCHER"; then
   ok "ga-l5ud0: hold-condition wiring correct (exec:auto + existing exec:manual → skip)"
 else
   bad "ga-l5ud0: hold-condition wiring malformed or missing"
