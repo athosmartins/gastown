@@ -10289,15 +10289,26 @@ if [ -z "$AUTHOR" ] && [ -n "$BEAD_ID" ]; then
   fi
 fi
 
+# SELFTEST-EXTRACT adhoc-author-normalize-dispatcher: BEGIN
 # 3. Session-id normalization: if assignee looks like an adhoc session-id
 #    (e.g. "digo-adhoc-e2510107f6"), strip the adhoc suffix to get the crew role.
 #    We keep the FULL id as the exclusion target AND the normalized role — a
 #    reviewer session matches if its alias contains either form.
-if [ -n "$AUTHOR" ] && echo "$AUTHOR" | grep -E "-adhoc-[0-9a-f]+" 2>/dev/null >/dev/null; then
-  AUTHOR_BASE=$(echo "$AUTHOR" | sed 's/-adhoc-[0-9a-f]*$//')
-  log "  Author '$AUTHOR' looks like a session-id; normalized to base role '$AUTHOR_BASE'."
-  AUTHOR="$AUTHOR_BASE"
-fi
+# ga-po5x43: was `echo "$AUTHOR" | grep -E "-adhoc-[0-9a-f]+"` — a pattern that
+# STARTS WITH A DASH, which grep parses as an option bundle instead of a
+# pattern (BSD grep: exit 2, "unknown --directories option"). The 2>/dev/null
+# hid the error and the `if` read rc=2 the same as "no match", so this branch
+# never ran, for any author. `case` needs no pattern-as-argv, so it sidesteps
+# the whole class of leading-dash flag misparsing (and never pipes into a
+# command that could early-exit, so it isn't a `set -o pipefail` risk either).
+case "$AUTHOR" in
+  *-adhoc-*)
+    AUTHOR_BASE=$(echo "$AUTHOR" | sed 's/-adhoc-[0-9a-f]*$//')
+    log "  Author '$AUTHOR' looks like a session-id; normalized to base role '$AUTHOR_BASE'."
+    AUTHOR="$AUTHOR_BASE"
+    ;;
+esac
+# SELFTEST-EXTRACT adhoc-author-normalize-dispatcher: END
 # wa-worker FAIL normalizer (pilot-rewire): a wa-worker build uses an ephemeral session
 # (wa-worker or wa-worker-<sid>) that has already drained by FAIL time.
 # Route FAIL to the Mayor so the human always gets a signal, never a dead-session nudge.

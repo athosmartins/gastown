@@ -4697,13 +4697,24 @@ if [ -n "$BEAD_ID" ]; then
   fi
 fi
 
+# SELFTEST-EXTRACT adhoc-author-normalize-guard: BEGIN
 # Session-id normalization: strip adhoc suffix from session IDs to get the crew role.
 # e.g. "digo-wa-adhoc-e2510107f6" → "digo-wa", "batista-lx-adhoc-abc123" → "batista-lx"
-if [ -n "$AUTHOR" ] && echo "$AUTHOR" | grep -E "-adhoc-[0-9a-f]+" 2>/dev/null >/dev/null; then
-  AUTHOR_NORMALIZED=$(echo "$AUTHOR" | sed 's/-adhoc-[0-9a-f]*$//')
-  log "  Author '$AUTHOR' looks like a session-id; normalizing to crew role '$AUTHOR_NORMALIZED'."
-  AUTHOR="$AUTHOR_NORMALIZED"
-fi
+# ga-po5x43: was `echo "$AUTHOR" | grep -E "-adhoc-[0-9a-f]+"` — a pattern that
+# STARTS WITH A DASH, which grep parses as an option bundle instead of a
+# pattern (BSD grep: exit 2, "unknown --directories option"). The 2>/dev/null
+# hid the error and the `if` read rc=2 the same as "no match", so this branch
+# never ran, for any author. `case` needs no pattern-as-argv, so it sidesteps
+# the whole class of leading-dash flag misparsing (and never pipes into a
+# command that could early-exit, so it isn't a `set -o pipefail` risk either).
+case "$AUTHOR" in
+  *-adhoc-*)
+    AUTHOR_NORMALIZED=$(echo "$AUTHOR" | sed 's/-adhoc-[0-9a-f]*$//')
+    log "  Author '$AUTHOR' looks like a session-id; normalizing to crew role '$AUTHOR_NORMALIZED'."
+    AUTHOR="$AUTHOR_NORMALIZED"
+    ;;
+esac
+# SELFTEST-EXTRACT adhoc-author-normalize-guard: END
 
 # ga-pyzo: best-effort resolve the DURABLE agent alias behind AUTHOR (see
 # resolve_author_agent_alias in the pure-decision-functions section above for
