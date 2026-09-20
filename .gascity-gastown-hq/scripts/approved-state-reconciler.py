@@ -4417,6 +4417,15 @@ def _selftest():
     _cap_case("DIVERGED (dispatch shape): same, other emission", 2, "pilot-log",
               note_has=("DIVERGED",), env={"PILOT_WA_WORKER_MAX": "4"},
               log=[_cap_line("wa-worker", 2, 60, "dispatch")])
+    # ga-zowwdz scope item 3 asked for divergence in BOTH directions; every case above only
+    # exercises the plist reading HIGHER than the Pilot enforced. This is the other one, and
+    # it is the dangerous side per _pool_cap's own docstring: if the plist under-reports the
+    # live cap, a pool that still has room reads as saturated, so a real dispatch failure is
+    # skipped in silence instead of alarmed. Same shape as the case above, inverted.
+    _cap_case("DIVERGED upward: plist says 2, Pilot logged max=4 — a pool WITH room would "
+              "otherwise read saturated and hide a real dispatch failure",
+              4, "pilot-log", note_has=("DIVERGED", "PILOT_WA_WORKER_MAX=2", "max=4"),
+              env={"PILOT_WA_WORKER_MAX": "2"}, log=[_cap_line("wa-worker", 4, 60, "pick")])
     _cap_case("a cap line written BEFORE the plist edit describes the old setting, not "
               "evidence against the plist", 4, "plist", env={"PILOT_WA_WORKER_MAX": "4"},
               edited_ago=60, log=[_cap_line("wa-worker", 2, 600, "pick")])
