@@ -1,0 +1,29 @@
+# ga-ta2w6r: recurring detector for "o que RODA nao tem backup". On 2026-09-20 the
+# Mayor found consolidated/engine-window-20260919 -- 12 commits, ~20 engine patches
+# across three windows -- on NO remote, while the binary the whole city runs was
+# built from its tip. The window procedure had no push step and nothing watched
+# for it (the 0906 window sat unbacked for two weeks unnoticed).
+#
+# The strong test is the binary's, not a branch name's: does the commit the
+# CURRENT gc/bd binary derives from exist on any remote? It reads the binary's
+# own stamp (main.commit / main.Build) -- NOT vcs.revision, which for binaries
+# built in a `git worktree` describes the enclosing ~/gt repo instead (see the
+# header of assets/scripts/lib/engine-backup-lib.sh). A second, earlier signal
+# covers the newest consolidated/engine-window-* branch before it is even built.
+#
+# Detection-only (never pushes/builds/swaps/checks out/deletes; the selftest
+# enforces this on the source). The only side effect on the source repo is
+# `fetch --prune`, which touches refs/remotes/* only. Pushing is the window
+# procedure's job (scripts/engine-window-run.sh push, also run by `build`).
+#
+# gc order (fresh exec each tick), never a raw plist, plus the script's own
+# flock -- so this guard can never join the ga-y0g5x class of bug it exists to
+# avoid. Measured runtime: ~1s with no network; ~15s including a real fetch of
+# origin+upstream into a COLD clone (a warm repo fetches in a few seconds) -- a
+# 1h interval leaves a >200x margin, and the 24h default notify cooldown only
+# needs to be sampled a couple dozen times between possible re-fires.
+[order]
+description = "Alarm when the in-use gc/bd binary derives from a commit no remote contains, or when the newest engine-window branch exists only on this disk"
+trigger = "cooldown"
+interval = "1h"
+exec = "$PACK_DIR/assets/scripts/engine-binary-backup-guard.sh"

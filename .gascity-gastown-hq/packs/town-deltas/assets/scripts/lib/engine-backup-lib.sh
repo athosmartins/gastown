@@ -186,7 +186,7 @@ eb_branch_hint() {
 # mostrar o commit num remoto. rc=0 do `git push` nao prova isso.
 eb_push_branch() {
     local wt="$1" branch="$2" remote="${3:-origin}" tip try=0 out rc=1 st
-    tip=$(git -C "$wt" rev-parse --verify --quiet "refs/heads/$branch^{commit}" 2>/dev/null) || tip=""
+    tip=$(git -C "$wt" rev-parse --verify --quiet "refs/heads/${branch}^{commit}" 2>/dev/null) || tip=""
     if [ -z "$tip" ]; then
         eb_log "  push: branch '$branch' nao existe em $wt"
         return 1
@@ -194,7 +194,7 @@ eb_push_branch() {
     while [ "$try" -lt "$EB_PUSH_TRIES" ]; do
         try=$((try + 1))
         out=$(eb_bounded "$EB_PUSH_TIMEOUT_S" env GIT_TERMINAL_PROMPT=0 \
-            git -C "$wt" push "$remote" "refs/heads/$branch:refs/heads/$branch" 2>&1) && rc=0 || rc=$?
+            git -C "$wt" push "$remote" "refs/heads/${branch}:refs/heads/${branch}" 2>&1) && rc=0 || rc=$?
         [ "$rc" = "0" ] && break
         case "$out" in
             *"non-fast-forward"* | *"[rejected]"* | *"fetch first"*)
