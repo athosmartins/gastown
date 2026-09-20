@@ -26,8 +26,16 @@ Re-act cadence:
   - Track alerted-ambig keys to avoid spam (re-alert every REALERT_SEC if
     still ambiguous with a new set of session ids).
   - If a NEW duplicate appears for a previously-clean agent, act on it.
+
+Singleton templates (max_active_sessions == 1) are read fresh from `gc config
+show` every cycle (ga-878qeq): parsed one [[agent]] block at a time, so a
+block with no cap of its own (e.g. gemini-worker) can never shift a later
+block's name onto an earlier block's cap. A read that gives nothing usable
+keeps the last good set rather than guessing a fixed one in silence -- see
+load_singleton_templates().
 """
 import json
+import re
 import subprocess
 import time
 
@@ -52,46 +60,136 @@ BAD_STATE_SIGNALS = [
 
 # ---------------------------------------------------------------------------
 # Config: singleton templates (max_active_sessions=1).
-# Read once at startup from `gc config show`; falls back to known-good set.
+# Read fresh from `gc config show` every cycle; a read that gives nothing
+# usable keeps the last good set, falling back to a hardcoded one only if
+# the config has never answered.
 # ---------------------------------------------------------------------------
 
 KNOWN_NON_SINGLETONS = {"dog", "gate-reviewer"}  # empirically confirmed >1
 
-def load_singleton_templates():
-    """Parse `gc config show` output to build the set of singleton templates."""
+# What to act on until `gc config show` has ever answered (empirical run on
+# 2026-06-06). Never re-entered once a real read has succeeded even once --
+# see load_singleton_templates().
+FALLBACK_SINGLETONS = frozenset({
+    "boot", "deacon", "mayor",
+    "batista-lx", "batista-ps", "batista-wa",
+    "digo-wa", "mila-wa", "oracle-wa", "peter-wa", "thies-wa",
+    "claude", "control-dispatcher",
+})
+
+# The last known-good singleton set `gc config show` gave us. Never holds
+# FALLBACK_SINGLETONS -- only ever a set an actual parse produced.
+_last_good_singletons = None
+
+# (frozenset, source) load_singleton_templates() last acted on, source being
+# "config", "last-good" (a failed read kept the last good set) or "fallback"
+# (the config has never answered). Lets a transition be reported once instead
+# of on every read.
+_singleton_state = None
+
+_SINGLETON_SOURCE_WORDS = {"last-good": "the last value it gave",
+                           "fallback": "the hardcoded fallback"}
+
+
+def _read_config_singletons():
+    """One read of `gc config show` -> (singletons, why).
+
+    `singletons` is a frozenset of agent names whose max_active_sessions == 1,
+    parsed one [[agent]] block at a time (never None on a good read -- an
+    output with zero singleton blocks is a legitimate, if unlikely, answer).
+    `why` is empty on a good read, else the reason no set could be produced at
+    all: the command failed, timed out, or its output had no [[agent]] blocks.
+
+    Blocks, not position: the previous version paired every `name = "..."`
+    line with every `max_active_sessions = N` line by list position (zip). An
+    agent block with no cap of its own (gemini-worker, codex-test, ... have
+    none) shifted every following block's name onto an earlier block's cap --
+    ga-878qeq measured 12 agents misclassified this way, mayor among them.
+    """
     try:
         result = subprocess.run(
             ["gc", "config", "show"],
             capture_output=True, text=True, timeout=20)
-        text = result.stdout + result.stderr
-    except Exception:
-        text = ""
+    except Exception as exc:
+        return None, f"gc config show failed: {type(exc).__name__}: {exc}"[:200]
+    if result.returncode != 0:
+        error_lines = [l.strip() for l in (result.stderr or "").splitlines()
+                       if l.strip() and not l.startswith("warning:")]
+        why = (f"gc config show exit {result.returncode}, "
+               + (error_lines[-1][:160] if error_lines else "no error text"))
+        return None, why
 
-    import re
-    # Match [[agent]] blocks: name = "X" ... max_active_sessions = N
-    # The config output is TOML-like; grab pairs in order.
-    names = re.findall(r'^name\s*=\s*"([^"]+)"', text, re.MULTILINE)
-    caps  = re.findall(r'^max_active_sessions\s*=\s*(\d+)', text, re.MULTILINE)
+    text = result.stdout or ""
+    singletons, blocks = set(), 0
+    agent_block_re = re.compile(r'\[\[agent\]\](.*?)(?=\[\[agent\]\]|\Z)', re.DOTALL)
+    for block in agent_block_re.findall(text):
+        blocks += 1
+        name_m = re.search(r'^name\s*=\s*"([^"]+)"', block, re.MULTILINE)
+        cap_m = re.search(r'^max_active_sessions\s*=\s*(\d+)', block, re.MULTILINE)
+        if not name_m or not cap_m:
+            continue
+        if cap_m.group(1) == "1":
+            singletons.add(name_m.group(1))
 
-    singletons = set()
-    for name, cap in zip(names, caps):
-        if cap == "1":
-            # Strip rig-prefix if present (e.g. "property_scrapers/claude" -> just track full name)
-            singletons.add(name)
+    if blocks == 0:
+        return None, f"no [[agent]] blocks in output ({len(text)} bytes)"
 
-    # Belt-and-suspenders: always exclude known pools
-    singletons -= KNOWN_NON_SINGLETONS
+    # Belt-and-suspenders: always exclude known pools, even if misconfigured
+    # with max_active_sessions=1.
+    return frozenset(singletons - KNOWN_NON_SINGLETONS), ""
 
-    if not singletons:
-        # Fallback: hard-coded from empirical run on 2026-06-06
-        singletons = {
-            "boot", "deacon", "mayor",
-            "batista-lx", "batista-ps", "batista-wa",
-            "digo-wa", "mila-wa", "oracle-wa", "peter-wa", "thies-wa",
-            "claude", "control-dispatcher",
-        }
 
-    return singletons
+def _report_singleton_transition(singletons, source, why):
+    """Say so when the singleton set acted on changes, or stops coming from
+    the config -- once per episode, not once per read."""
+    global _singleton_state
+    if _singleton_state == (singletons, source):
+        return
+    before = _singleton_state
+    if source != "config":
+        print(f"[DEDUP-CAP-FALLBACK] cannot read singleton templates from "
+              f"`gc config show` ({why}); acting on "
+              f"{_SINGLETON_SOURCE_WORDS[source]} ({len(singletons)} templates) "
+              f"until it can", flush=True)
+    elif before is not None and before[1] != "config":
+        print(f"[DEDUP-CAP-RECOVERED] the config answers again: "
+              f"{len(singletons)} singleton templates (was {len(before[0])}, "
+              f"{_SINGLETON_SOURCE_WORDS[before[1]]})", flush=True)
+    elif before is not None and before[0] != singletons:
+        added, removed = sorted(singletons - before[0]), sorted(before[0] - singletons)
+        print(f"[DEDUP-CAP-CHANGED] singleton templates changed: "
+              f"+{added} -{removed}", flush=True)
+    _singleton_state = (singletons, source)
+
+
+def load_singleton_templates():
+    """Return the set of singleton templates (max_active_sessions == 1),
+    read fresh from `gc config show` on every call.
+
+    Three answers, never conflated (same class as ga-d1q1kn): the config
+    gives a set (possibly empty); the config could not be read at all (bad
+    exit, timeout, exception, or no parseable [[agent]] blocks). Only the
+    first is a reading. For the second, the set in use stays whatever the
+    config last actually gave, and only falls back to the 2026-06-06
+    hardcoded set if the config has NEVER answered -- and says so, once per
+    episode, via _report_singleton_transition().
+    """
+    global _last_good_singletons
+    try:
+        singletons, why = _read_config_singletons()
+    except Exception as exc:
+        singletons, why = None, f"parse raised {type(exc).__name__}: {exc}"[:200]
+
+    if singletons is not None:
+        result, source = singletons, "config"
+        _last_good_singletons = singletons
+    elif _last_good_singletons is not None:
+        result, source = _last_good_singletons, "last-good"
+    else:
+        result, source = FALLBACK_SINGLETONS, "fallback"
+
+    _report_singleton_transition(result, source, why)
+    return set(result)
 
 
 # ---------------------------------------------------------------------------
@@ -291,12 +389,13 @@ def run_cycle(singleton_templates, drained_ids, ambig_alerted):
 
 
 def main():
-    singleton_templates = load_singleton_templates()
-
     drained_ids   = set()   # session IDs we have already drained (avoid re-drain)
     ambig_alerted = {}      # (rig, template) -> (last_alert_time, frozenset(ids))
 
     while True:
+        # Read fresh every cycle (ga-878qeq): a boot-time miss or a config
+        # change must heal on the next cycle, not wait for a daemon restart.
+        singleton_templates = load_singleton_templates()
         try:
             run_cycle(singleton_templates, drained_ids, ambig_alerted)
         except Exception as exc:
