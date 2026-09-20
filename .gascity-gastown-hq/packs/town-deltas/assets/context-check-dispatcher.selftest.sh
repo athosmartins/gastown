@@ -744,7 +744,7 @@ else
   bad "exec label not written via bd_ or opposite not stripped"
 fi
 #  c) idempotent: only writes if absent/changed (no thrash on re-mark).
-if grep -qF 'echo ",$c_labels," | grep -qF ",$EXEC,"' "$DISPATCHER"; then
+if grep -qF 'echo ",$c_labels," | grep -F ",$EXEC," >/dev/null' "$DISPATCHER"; then
   ok "exec label idempotent (skips write when already present — no thrash)"
 else
   bad "exec label idempotence guard missing"

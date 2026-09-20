@@ -927,7 +927,10 @@ else
   # that made classify_gap2_bugtask_verdict reachable ONLY on the else
   # (non-story) side — must be gone. story:approved may still be READ (to
   # pick the terminal action), just never used to SKIP verification.
-  if echo "$GAP1UN0N_ARM_TEXT" | grep -q 'if echo "\$SC_LABELS" | grep -q "story:approved"; then'; then
+  # ga-5bxuam: match the construct in ANY grep flag form ("grep -q ..." or "grep ... >/dev/null"),
+  # so this negative lock cannot go vacuous now that production dropped -q. Here-string, not a
+  # pipe into an early-exit reader (the very SIGPIPE flake ga-5bxuam fixes).
+  if grep -q 'if echo "\$SC_LABELS" | grep[^;]*"story:approved"[^;]*; then' <<<"$GAP1UN0N_ARM_TEXT"; then
     bad "REGRESSION ga-1un0n: the free:pass-stranded arm still branches on story:approved BEFORE verification — the exact bypass this bead reports"
   else
     ok "the free:pass-stranded arm no longer gates verification behind an if/else on story:approved"

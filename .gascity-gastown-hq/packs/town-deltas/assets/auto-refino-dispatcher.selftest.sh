@@ -1762,7 +1762,7 @@ D=$(auto_refino_handoff_decision "SPLIT" 9 3)
 # 19b. Drift-guard: the Step 6 poll loop actually recognizes outcome:SPLIT —
 #      else it falls through to TIMEOUT/requeue, the exact silent-mitigation
 #      shape the bug reported.
-if grep -qF 'grep -q "outcome:SPLIT"' "$DISPATCHER" \
+if grep -qF 'grep "outcome:SPLIT" >/dev/null' "$DISPATCHER" \
    && grep -qF 'OUTCOME="SPLIT"; break' "$DISPATCHER"; then
   ok "19b. Step 6 poll loop recognizes outcome:SPLIT (breaks immediately, not just at TIMEOUT)"
 else

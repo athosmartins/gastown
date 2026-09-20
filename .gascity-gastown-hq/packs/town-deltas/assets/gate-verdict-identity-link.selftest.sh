@@ -298,7 +298,7 @@ grep -q 'gate_check_verdict_identity_link "\$VB"' "$DISPATCHER" \
 # so it runs for every counted verdict, not a subset.
 INCR_LINE=$(grep -n 'VERDICTS_RECEIVED=\$((VERDICTS_RECEIVED + 1))' "$DISPATCHER" | head -1 | cut -d: -f1)
 CALL_LINE=$(grep -n 'gate_check_verdict_identity_link "\$VB"' "$DISPATCHER" | head -1 | cut -d: -f1)
-PASSCHK_LINE=$(grep -n 'grep -q "verdict:PASS"' "$DISPATCHER" | head -1 | cut -d: -f1)
+PASSCHK_LINE=$(grep -n 'grep "verdict:PASS" >/dev/null' "$DISPATCHER" | head -1 | cut -d: -f1)
 if [ -n "$INCR_LINE" ] && [ -n "$CALL_LINE" ] && [ -n "$PASSCHK_LINE" ] \
    && [ "$INCR_LINE" -lt "$CALL_LINE" ] && [ "$CALL_LINE" -lt "$PASSCHK_LINE" ]; then
   ok "call site sits between the VERDICTS_RECEIVED increment and the PASS/FAIL branch"

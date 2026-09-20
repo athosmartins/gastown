@@ -230,7 +230,7 @@ import sys
 path = sys.argv[1]
 with open(path) as f:
     c = f.read()
-anchor = '    if [ "$VB_STATUS" != "closed" ] && echo "$VB_LABELS" | grep -qE "verdict:(PASS|FAIL)"; then'
+anchor = '    if [ "$VB_STATUS" != "closed" ] && echo "$VB_LABELS" | grep -E "verdict:(PASS|FAIL)" >/dev/null; then'
 n = c.count(anchor)
 if n != 1:
     print("ANCHOR_NOT_UNIQUE count=%d" % n, file=sys.stderr)
