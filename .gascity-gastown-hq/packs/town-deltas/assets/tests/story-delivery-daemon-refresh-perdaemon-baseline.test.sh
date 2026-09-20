@@ -75,7 +75,13 @@
 # T9: format compatibility — the consumer (daemon-refresh.sh) reads an entry
 #     with `awk '$1==l{print $2; exit}'`; the extra column must not leak in.
 # T10: the block also holds under `set -e`, which is how story-delivery.sh
-#     runs it in production (the harness above runs without it).
+#     runs it in production (the harness above runs without it). T10 seeds no
+#     file, so it never reaches the per-label lookup of an OLD entry — T14 does.
+# T14: the OLD-entry lookup does not abort the sweep under `set -e` + pipefail at
+#     real scale (a ~100 KB file, stuck labels each with an earlier entry):
+#     an early-exit reader in that pipeline took SIGPIPE and errexit killed the
+#     whole sweep (found by a late gate review, 11 sweeps in 12; the tests above
+#     were 26/26 green on that code).
 
 # No `pipefail` at file level (ga-7polxu): every assertion below is
 # `echo "$X" | grep -q ...`, and under pipefail grep -q's early exit hands the
@@ -342,6 +348,45 @@ echo "$PERDAEMON_AFTER" | grep -qx "com.test.a $EXPECT_C0 stuck" \
   && echo "$PERDAEMON_AFTER" | grep -qx "com.test.b $EXPECT_C1" \
   && ok "T10 both entries are written under set -e" \
   || nok "T10 entries under set -e" "perdaemon=[$PERDAEMON_AFTER]"
+
+# ── T14: the OLD-entry lookup must not kill the sweep under `set -e` at real scale ─
+#    Gate review of ga-7polxu (late verdict on 0ca057421): the per-label lookup of a
+#    label's previous entry was `printf '%s\n' "$PERDAEMON_OLD" | awk … {print $2; exit}`.
+#    An early-exit reader in a pipeline under errexit + pipefail hands the writer a
+#    SIGPIPE (rc 141) whenever awk quits before printf has finished writing, and
+#    errexit then kills the WHOLE sweep — once per stuck label. Every seeded test
+#    above runs without errexit on a 1-line file, and T10 (errexit) seeds nothing,
+#    so the suite stayed 26/26 green on code that aborted 11 sweeps in 12 at
+#    incident scale (41 stuck daemons).
+#    This makes the race DETERMINISTIC instead of load-dependent: the file is bigger
+#    than any pipe buffer (64 KB at most), so printf cannot finish before awk has
+#    read its first chunk, and the stuck labels sit at the TOP of the file, so an
+#    early-exit awk is certain to quit with the writer still mid-write. The stuck
+#    labels each carry an earlier entry, as in the 20/09 incident (41 of them).
+#    Any number of stuck labels >= 1 is enough for that determinism; 8 keeps the
+#    per-label git calls cheap (the gate runs this under load 40).
+PD_BIG_N=1800; PD_BIG_STUCK=8; PD_BIG_EXAMINED=200
+# one awk per list — a subshell per label would cost minutes under gate load
+big_seed="$(awk -v n="$PD_BIG_N" 'BEGIN{for(i=1;i<=n;i++) printf "com.test.d%04d @C0@\n", i}')"
+big_all="$(awk -v n="$PD_BIG_EXAMINED" 'BEGIN{for(i=1;i<=n;i++) printf "com.test.d%04d ", i}')"
+big_guarded="$(awk -v n="$PD_BIG_STUCK" 'BEGIN{for(i=1;i<=n;i++) printf "com.test.d%04d ", i}')"
+ERREXIT=1 run_block "NEEDS_GUARDED_RESTART" "$big_all" "$big_guarded" "" "$big_seed"
+[ "$RUN_RC" -eq 0 ] \
+  && ok "T14a $PD_BIG_STUCK stuck labels over a $PD_BIG_N-line (~100 KB) per-daemon file: the sweep survives set -e (rc=0)" \
+  || nok "T14a the old-entry lookup killed the sweep under set -e" "rc=$RUN_RC (141 = SIGPIPE on the lookup pipe)"
+stuck_n="$(printf '%s\n' "$PERDAEMON_AFTER" | grep -c ' stuck$')"
+[ "$stuck_n" -eq "$PD_BIG_STUCK" ] \
+  && ok "T14b all $PD_BIG_STUCK stuck labels are on record, flagged stuck" \
+  || nok "T14b stuck records" "stuck lines=$stuck_n want $PD_BIG_STUCK"
+total_n="$(printf '%s\n' "$PERDAEMON_AFTER" | grep -c .)"
+if echo "$PERDAEMON_AFTER" | grep -qx "com.test.d0001 $EXPECT_C0 stuck" \
+   && echo "$PERDAEMON_AFTER" | grep -qx "com.test.d0100 $EXPECT_C1" \
+   && echo "$PERDAEMON_AFTER" | grep -qx "com.test.d$PD_BIG_N $EXPECT_C0" \
+   && [ "$total_n" -eq "$PD_BIG_N" ]; then
+  ok "T14c no entry lost or duplicated ($total_n lines): stuck frozen at its old sha, examined-clean advanced to POST, unexamined carried forward"
+else
+  nok "T14c file content after the sweep" "lines=$total_n want $PD_BIG_N; stuck=$stuck_n"
+fi
 
 echo ""
 echo "story-delivery per-daemon baseline tests: $PASS passed, $FAIL failed"

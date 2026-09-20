@@ -2426,12 +2426,16 @@ else
   # examined (empty on every early short-circuit — nothing ran, nothing to
   # record). Each label ends in exactly one of three states, and only the
   # first may move its baseline forward:
-  #   clean   — examined, not left in GUARDED or FRESH_FAIL, and this cycle's
-  #             wide window really covers everything since the label's last
-  #             recorded baseline: resolved as of POST_DEPLOY_SHA (never
-  #             affected at all, or affected-and-restarted-and-verified), so
-  #             its OWN baseline is advanced regardless of what any OTHER
-  #             daemon on the same rig is still stuck on.
+  #   clean   — examined and not left in GUARDED or FRESH_FAIL: resolved as of
+  #             POST_DEPLOY_SHA (never affected at all, or affected-and-
+  #             restarted-and-verified), so its OWN baseline is advanced
+  #             regardless of what any OTHER daemon on the same rig is still
+  #             stuck on. One extra condition applies ONLY to a label whose
+  #             recorded entry is flagged stuck: it is clean only if this
+  #             cycle's wide window starts at or before that entry (else it is
+  #             "unknown", below). An older UNFLAGGED entry advances
+  #             unconditionally — the pre-ga-7polxu behaviour; nothing here
+  #             checks that the window covers it.
   #   stuck   — left in GUARDED or FRESH_FAIL: FROZEN, never advanced and never
   #             dropped (ga-7polxu). It keeps its existing entry when that is
   #             a real commit reachable from POST_DEPLOY_SHA (its last
@@ -2457,6 +2461,11 @@ else
   # unresolved, and since when, instead of an erasure — not a live status: once
   # the marker is past an entry nothing re-examines that label, so a daemon
   # restarted afterwards is not cleared from it (ga-n2jnsa).
+  # PD_RECORDED / PD_WROTE: what this cycle REALLY wrote, for the release log
+  # below — initialised here, ahead of every branch that can skip the write
+  # (DRY_RUN, an untouched file), because that log reads them under set -u.
+  PD_RECORDED=" "
+  PD_WROTE=0
   PD_STUCK=" "
   for pd_label in $REFRESH_GUARDED $REFRESH_FRESHFAIL; do
     case "$PD_STUCK" in *" $pd_label "*) ;; *) PD_STUCK="${PD_STUCK}${pd_label} " ;; esac
@@ -2464,10 +2473,16 @@ else
   # Two "the input never said" states that must NOT read as "nothing is stuck" or
   # "nothing is recorded" — either would let a stuck label advance as clean, or a
   # flagged record be rewritten from an empty read. In both the file is left
-  # exactly as it was (the inert answer) and the cycle says so:
+  # exactly as it was (the inert answer) and this cycle warns just below:
   #  - no GUARDED= LINE in the helper's output (crash, kill mid-print): a missing
   #    line is not an empty one. Tested on the text, not by piping into grep -q:
   #    under pipefail the writer takes SIGPIPE when grep -q exits early.
+  #    (Under this script's own set -e the REFRESH_GUARDED= parse further up has
+  #    no `|| true` — deliberately: a missing line must not become an EMPTY
+  #    guarded list, which the release below would read as "nothing guarded". So
+  #    a missing line normally aborts the sweep before it reaches here: loud, and
+  #    nothing is written. This test keeps the file inert on any path where that
+  #    parse survives.)
   #  - the per-daemon file exists but cannot be read.
   PD_SKIP_WHY=""
   case $'\n'"$REFRESH_OUT" in *$'\n'GUARDED=*) ;; *) PD_SKIP_WHY="the helper printed no GUARDED= line" ;; esac
@@ -2517,8 +2532,16 @@ else
       case "$PD_SEEN" in *" $pd_label "*) continue ;; esac
       PD_SEEN="${PD_SEEN}${pd_label} "
       pd_old_sha=""
+      # The lookup reads the WHOLE file — no awk `exit`. This is an assignment
+      # under set -e + pipefail: an early-exit reader closes the pipe while printf
+      # is still writing the ~15 KB variable, the writer takes SIGPIPE (rc 141),
+      # the pipeline reports 141 and errexit kills the whole sweep — once per stuck
+      # label, so 41 stuck daemons make it likely (ga-7polxu gate review: 11 of 12
+      # sweeps at incident scale aborted, 0 of 12 on base). The value captured is
+      # right either way; it is the STATUS that kills. Duplicate labels: the first
+      # line wins, as before.
       case "$PD_STUCK$PD_FLAGGED" in
-        *" $pd_label "*) pd_old_sha="$(printf '%s\n' "$PERDAEMON_OLD" | awk -v l="$pd_label" '$1==l{print $2; exit}')" ;;
+        *" $pd_label "*) pd_old_sha="$(printf '%s\n' "$PERDAEMON_OLD" | awk -v l="$pd_label" '$1==l && !d{print $2; d=1}')" ;;
       esac
       case "$PD_STUCK" in
         *" $pd_label "*)
@@ -2535,7 +2558,10 @@ else
             # recorded baseline on a guess.
             case "$(pd_commit_state "$pd_old_sha")" in ok|unknown) pd_frozen="$pd_old_sha" ;; esac
           fi
-          [ -z "$pd_frozen" ] || PERDAEMON_NEW="${PERDAEMON_NEW}${pd_label} ${pd_frozen} stuck"$'\n'
+          if [ -n "$pd_frozen" ]; then
+            PERDAEMON_NEW="${PERDAEMON_NEW}${pd_label} ${pd_frozen} stuck"$'\n'
+            PD_RECORDED="${PD_RECORDED}${pd_label} "
+          fi
           continue
           ;;
       esac
@@ -2572,8 +2598,11 @@ else
       esac
       PERDAEMON_NEW="${PERDAEMON_NEW}${pd_label} ${POST_DEPLOY_SHA}"$'\n'
     done
-    printf '%s' "$PERDAEMON_NEW" > "$DAEMON_REFRESH_PERDAEMON_FILE" 2>/dev/null \
-      || warn "could not persist per-daemon baseline for rig $RIG at $DAEMON_REFRESH_PERDAEMON_FILE (non-fatal; next sweep falls back to the rig-wide marker for every label)"
+    if printf '%s' "$PERDAEMON_NEW" > "$DAEMON_REFRESH_PERDAEMON_FILE" 2>/dev/null; then
+      PD_WROTE=1
+    else
+      warn "could not persist per-daemon baseline for rig $RIG at $DAEMON_REFRESH_PERDAEMON_FILE (non-fatal; next sweep falls back to the rig-wide marker for every label)"
+    fi
   fi
   case "$REFRESH_VERDICT" in
     OK|SKIPPED)
@@ -2900,7 +2929,23 @@ else
           if [ "$UNATTRIBUTED_ADVANCES_MARKER" = "1" ] && [ -n "$POST_DEPLOY_SHA" ]; then
             if [ -n "${PD_STUCK// /}" ]; then
               pd_dropped="${PD_STUCK# }"; pd_dropped="${pd_dropped% }"
-              log "Daemon refresh: advancing the rig-wide baseline marker to $POST_DEPLOY_SHA drops the still-stuck daemon(s) [$pd_dropped] out of the next wide window. Each keeps a frozen 'stuck' baseline in $DAEMON_REFRESH_PERDAEMON_FILE — a record of what is unresolved and since when, not a re-flag: daemon-refresh.sh only narrows per-daemon baselines (ga-7polxu; making the list itself stick is ga-n2jnsa)."
+              # Claim a record only for the labels this cycle REALLY wrote one for.
+              # The file may have been left untouched (PD_SKIP_WHY), the write may
+              # have failed (PD_WROTE), or a label may have had nothing to freeze
+              # (effective PRE unknown, no earlier entry): "each keeps ..." in any
+              # of those cases is the promise-without-delivery this bead removes.
+              pd_unrecorded=""
+              for pd_ul in $PD_STUCK; do
+                case " $PD_RECORDED " in
+                  *" $pd_ul "*) [ "$PD_WROTE" = "1" ] || pd_unrecorded="${pd_unrecorded} ${pd_ul}" ;;
+                  *) pd_unrecorded="${pd_unrecorded} ${pd_ul}" ;;
+                esac
+              done
+              if [ -z "$pd_unrecorded" ]; then
+                log "Daemon refresh: advancing the rig-wide baseline marker to $POST_DEPLOY_SHA drops the still-stuck daemon(s) [$pd_dropped] out of the next wide window. Each keeps a frozen 'stuck' baseline in $DAEMON_REFRESH_PERDAEMON_FILE — a record of what is unresolved and since when, not a re-flag: daemon-refresh.sh only narrows per-daemon baselines (ga-7polxu; making the list itself stick is ga-n2jnsa)."
+              else
+                log "Daemon refresh: advancing the rig-wide baseline marker to $POST_DEPLOY_SHA drops the still-stuck daemon(s) [$pd_dropped] out of the next wide window. NO frozen 'stuck' baseline was recorded for [${pd_unrecorded# }] this cycle (${PD_SKIP_WHY:-the per-daemon file was not rewritten, or the label had no baseline to freeze}): they leave no per-daemon record (ga-7polxu; making the list itself stick is ga-n2jnsa)."
+              fi
             fi
             printf '%s\n' "$POST_DEPLOY_SHA" > "$DAEMON_REFRESH_BASELINE_FILE" 2>/dev/null \
               || warn "could not persist daemon-refresh baseline for rig $RIG at $DAEMON_REFRESH_BASELINE_FILE (non-fatal; next sweep falls back to its own pre-pull HEAD)"
