@@ -2418,35 +2418,158 @@ else
   REFRESH_PROOF=$(echo "$REFRESH_OUT" | grep '^PROOF=' | head -1 | sed 's/^PROOF=//' || true)
   [ -n "$REFRESH_PROOF" ] || REFRESH_PROOF="not_verified"
   log "Daemon refresh verdict=$REFRESH_VERDICT restarted=[$REFRESH_RESTARTED] guarded=[$REFRESH_GUARDED] freshfail=[$REFRESH_FRESHFAIL] proof=$REFRESH_PROOF reason=$REFRESH_REASON"
-  # ga-0fawwr: per-daemon baseline advance — independent of the rig-wide
+  # ga-0fawwr: per-daemon baseline bookkeeping — independent of the rig-wide
   # OK|SKIPPED gate below, which starves for days whenever even ONE daemon
   # stays guarded (see daemon-refresh.sh's own comment on
   # DAEMON_BASELINE_OVERRIDES, at its point of use, for the full incident).
   # REFRESH_ALL_LABELS is every daemon this cycle's discovery actually
   # examined (empty on every early short-circuit — nothing ran, nothing to
-  # record); of those, any NOT left in GUARDED or FRESH_FAIL this cycle is —
-  # by definition — resolved as of POST_DEPLOY_SHA (never affected at all, or
-  # affected-and-restarted-and-verified), and gets its OWN baseline advanced
-  # regardless of what any OTHER daemon on the same rig is still stuck on. A
-  # still-stuck label is simply left untouched (or absent, the first time) —
-  # its window keeps growing until IT specifically resolves, exactly like the
-  # rig-wide marker did before this fix, just scoped to the one daemon
-  # actually responsible instead of every daemon sharing its rig.
-  if [ "$DRY_RUN" != "1" ] && [ -n "$POST_DEPLOY_SHA" ] && [ -n "${REFRESH_ALL_LABELS// /}" ]; then
+  # record). Each label ends in exactly one of three states, and only the
+  # first may move its baseline forward:
+  #   clean   — examined, not left in GUARDED or FRESH_FAIL, and this cycle's
+  #             wide window really covers everything since the label's last
+  #             recorded baseline: resolved as of POST_DEPLOY_SHA (never
+  #             affected at all, or affected-and-restarted-and-verified), so
+  #             its OWN baseline is advanced regardless of what any OTHER
+  #             daemon on the same rig is still stuck on.
+  #   stuck   — left in GUARDED or FRESH_FAIL: FROZEN, never advanced and never
+  #             dropped (ga-7polxu). It keeps its existing entry when that is
+  #             a real commit reachable from POST_DEPLOY_SHA (its last
+  #             known-clean point), otherwise it gets the effective PRE this
+  #             cycle's helper run was measured against. Written as
+  #             "<label> <sha> stuck". Until ga-7polxu this branch wrote
+  #             nothing AND the carry-forward below skipped every examined
+  #             label, so a stuck label's previous entry was thrown away and a
+  #             first-time one never got one — while this comment said the
+  #             label was "simply left untouched".
+  #   unknown — flagged stuck earlier, not flagged now, but this cycle's wide
+  #             window starts AFTER its entry (the rig-wide marker moved past
+  #             it — e.g. the unattributed release below): nothing looked at
+  #             that stretch, so "not flagged" means "not looked at", never
+  #             "clean". The entry is kept as it was.
+  # What these entries are FOR is easy to over-read: they keep each label's own
+  # last-known-clean point, and daemon-refresh.sh only ever NARROWS the wide
+  # window with them (an entry strictly between the rig-wide PRE and POST can
+  # drop a label out of AFFECTED; it never adds one and ignores an entry older
+  # than PRE). A frozen entry therefore does NOT keep its label in the wide
+  # list once the rig-wide marker has moved past it — see the note at the
+  # unattributed release below. It is a record of what was LAST SEEN
+  # unresolved, and since when, instead of an erasure — not a live status: once
+  # the marker is past an entry nothing re-examines that label, so a daemon
+  # restarted afterwards is not cleared from it (ga-n2jnsa).
+  PD_STUCK=" "
+  for pd_label in $REFRESH_GUARDED $REFRESH_FRESHFAIL; do
+    case "$PD_STUCK" in *" $pd_label "*) ;; *) PD_STUCK="${PD_STUCK}${pd_label} " ;; esac
+  done
+  # Two "the input never said" states that must NOT read as "nothing is stuck" or
+  # "nothing is recorded" — either would let a stuck label advance as clean, or a
+  # flagged record be rewritten from an empty read. In both the file is left
+  # exactly as it was (the inert answer) and the cycle says so:
+  #  - no GUARDED= LINE in the helper's output (crash, kill mid-print): a missing
+  #    line is not an empty one. Tested on the text, not by piping into grep -q:
+  #    under pipefail the writer takes SIGPIPE when grep -q exits early.
+  #  - the per-daemon file exists but cannot be read.
+  PD_SKIP_WHY=""
+  case $'\n'"$REFRESH_OUT" in *$'\n'GUARDED=*) ;; *) PD_SKIP_WHY="the helper printed no GUARDED= line" ;; esac
+  PERDAEMON_OLD=""
+  if [ -e "$DAEMON_REFRESH_PERDAEMON_FILE" ]; then
+    PERDAEMON_OLD="$(cat "$DAEMON_REFRESH_PERDAEMON_FILE" 2>/dev/null)" || PD_SKIP_WHY="the per-daemon file exists but could not be read"
+  fi
+  # pd_commit_state <sha>: "ok" = a real commit reachable from POST_DEPLOY_SHA;
+  # "bad" = positively not one (not a full 40-hex id, no such commit, not an
+  # ancestor); "unknown" = git could not say (a broken checkout, a signal — any
+  # exit but a plain yes/no). Only "bad" may replace a recorded baseline.
+  # rev-parse --verify -q exits 1 for an absent commit and 128 for a broken
+  # repository; cat-file -e exits 128 for both, so it cannot tell them apart.
+  pd_commit_state() {
+    local pd_rc=0
+    [[ "$1" =~ ^[0-9a-f]{40}$ ]] || { echo bad; return 0; }
+    git -C "$RUNTIME_DIR" rev-parse --verify -q "${1}^{commit}" >/dev/null 2>&1 || pd_rc=$?
+    case "$pd_rc" in 0) ;; 1) echo bad; return 0 ;; *) echo unknown; return 0 ;; esac
+    pd_rc=0
+    git -C "$RUNTIME_DIR" merge-base --is-ancestor "$1" "$POST_DEPLOY_SHA" >/dev/null 2>&1 || pd_rc=$?
+    case "$pd_rc" in 0) echo ok ;; 1) echo bad ;; *) echo unknown ;; esac
+  }
+  if [ "$DRY_RUN" != "1" ] && [ -n "$POST_DEPLOY_SHA" ] && [ -n "${REFRESH_ALL_LABELS// /}" ] && [ -n "$PD_SKIP_WHY" ]; then
+    warn "per-daemon baseline for rig $RIG left untouched this cycle: $PD_SKIP_WHY (unknown is not clean; ga-7polxu)"
+  fi
+  if [ "$DRY_RUN" != "1" ] && [ -n "$POST_DEPLOY_SHA" ] && [ -n "${REFRESH_ALL_LABELS// /}" ] && [ -z "$PD_SKIP_WHY" ]; then
     PERDAEMON_NEW=""
-    # carry forward every existing entry NOT examined this cycle untouched —
-    # a rig can have daemons this run's discovery didn't see (e.g. a plist
-    # parse error) whose own last-known baseline must not be silently dropped.
-    if [ -f "$DAEMON_REFRESH_PERDAEMON_FILE" ]; then
-      while IFS=' ' read -r pd_label pd_sha; do
+    # labels whose recorded entry already carries the stuck flag — the file is
+    # ~200 lines and almost no label is ever flagged, so a per-label lookup
+    # happens only for a label that can be in this set or in PD_STUCK.
+    PD_FLAGGED=" $(printf '%s\n' "$PERDAEMON_OLD" | awk '$3=="stuck"{printf "%s ", $1}')"
+    # carry forward every existing entry NOT examined this cycle untouched
+    # (flag included) — a rig can have daemons this run's discovery didn't see
+    # (e.g. a plist parse error) whose own last-known baseline must not be
+    # silently dropped. A stuck label is written by the loop below whether or
+    # not discovery listed it, so it is skipped here to stay one line per label.
+    if [ -n "$PERDAEMON_OLD" ]; then
+      while IFS=' ' read -r pd_label pd_rest; do
         [ -n "$pd_label" ] || continue
         case " $REFRESH_ALL_LABELS " in *" $pd_label "*) continue ;; esac
-        PERDAEMON_NEW="${PERDAEMON_NEW}${pd_label} ${pd_sha}"$'\n'
-      done < "$DAEMON_REFRESH_PERDAEMON_FILE"
+        case "$PD_STUCK" in *" $pd_label "*) continue ;; esac
+        PERDAEMON_NEW="${PERDAEMON_NEW}${pd_label} ${pd_rest}"$'\n'
+      done <<< "$PERDAEMON_OLD"
     fi
-    for pd_label in $REFRESH_ALL_LABELS; do
-      case " $REFRESH_GUARDED " in *" $pd_label "*) continue ;; esac
-      case " $REFRESH_FRESHFAIL " in *" $pd_label "*) continue ;; esac
+    PD_SEEN=" "
+    for pd_label in $REFRESH_ALL_LABELS $PD_STUCK; do
+      case "$PD_SEEN" in *" $pd_label "*) continue ;; esac
+      PD_SEEN="${PD_SEEN}${pd_label} "
+      pd_old_sha=""
+      case "$PD_STUCK$PD_FLAGGED" in
+        *" $pd_label "*) pd_old_sha="$(printf '%s\n' "$PERDAEMON_OLD" | awk -v l="$pd_label" '$1==l{print $2; exit}')" ;;
+      esac
+      case "$PD_STUCK" in
+        *" $pd_label "*)
+          # stuck: frozen — the existing entry if it is a real commit reachable
+          # from POST_DEPLOY_SHA, or if git cannot say (an entry older than PRE
+          # is kept too: it is the truthful "unresolved since", and the
+          # consumer ignores it), else the effective PRE. Nothing usable at all
+          # (PRE unknown): write no entry rather than invent one — the label
+          # then has none, as before.
+          pd_frozen="$DAEMON_REFRESH_PRE_SHA"
+          if [ -n "$pd_old_sha" ]; then
+            # "unknown" keeps the recorded entry too: git failing to answer is
+            # not evidence the entry is wrong, and replacing it would move a
+            # recorded baseline on a guess.
+            case "$(pd_commit_state "$pd_old_sha")" in ok|unknown) pd_frozen="$pd_old_sha" ;; esac
+          fi
+          [ -z "$pd_frozen" ] || PERDAEMON_NEW="${PERDAEMON_NEW}${pd_label} ${pd_frozen} stuck"$'\n'
+          continue
+          ;;
+      esac
+      case "$PD_FLAGGED" in
+        *" $pd_label "*)
+          # flagged earlier, not flagged now: clean only when this cycle's wide
+          # window starts at or before the entry (PRE is an ancestor-or-equal
+          # of it). Not covered, or git unable to say (PRE unknown, any exit but
+          # a plain yes/no), means the window did not look at that stretch: the
+          # entry stays exactly as it was. Only an entry that is POSITIVELY not
+          # a commit reachable from POST_DEPLOY_SHA carries no information and
+          # is replaced like any other — "git could not say" must not be read as
+          # "invalid", or a transient failure would turn a stuck record into a
+          # clean one.
+          if [ -n "$pd_old_sha" ]; then
+            pd_keep=0
+            case "$(pd_commit_state "$pd_old_sha")" in
+              unknown) pd_keep=1 ;;
+              ok)
+                pd_rc=2
+                if [ -n "$DAEMON_REFRESH_PRE_SHA" ]; then
+                  pd_rc=0
+                  git -C "$RUNTIME_DIR" merge-base --is-ancestor "$DAEMON_REFRESH_PRE_SHA" "$pd_old_sha" >/dev/null 2>&1 || pd_rc=$?
+                fi
+                [ "$pd_rc" = "0" ] || pd_keep=1
+                ;;
+            esac
+            if [ "$pd_keep" = "1" ]; then
+              PERDAEMON_NEW="${PERDAEMON_NEW}${pd_label} ${pd_old_sha} stuck"$'\n'
+              continue
+            fi
+          fi
+          ;;
+      esac
       PERDAEMON_NEW="${PERDAEMON_NEW}${pd_label} ${POST_DEPLOY_SHA}"$'\n'
     done
     printf '%s' "$PERDAEMON_NEW" > "$DAEMON_REFRESH_PERDAEMON_FILE" 2>/dev/null \
@@ -2744,20 +2867,41 @@ else
           # DOES advance the rig-wide marker: this bead's own portion of the
           # wide window is fully examined (MERGE_OWN_AFFECTED is non-empty and
           # every daemon it reaches is confirmed NOT in the current guarded
-          # set), and any daemon still genuinely stuck keeps its OWN
-          # per-daemon override baseline frozen regardless — the unconditional
-          # per-daemon advance above already excludes anything still in
-          # $REFRESH_GUARDED/$REFRESH_FRESHFAIL (ga-0fawwr), so nothing is
-          # hidden from a future sweep. Only the self-feeding wide-window
-          # growth this bug's own root-cause section describes (verdict never
-          # OK -> marker never advances -> window widens -> more daemons
-          # match -> verdict never OK) stops.
+          # set). Only the self-feeding wide-window growth this bug's own
+          # root-cause section describes (verdict never OK -> marker never
+          # advances -> window widens -> more daemons match -> verdict never
+          # OK) stops.
+          #
+          # ga-7polxu — what this advance does NOT protect, said plainly
+          # because this comment used to claim the opposite ("any daemon still
+          # genuinely stuck keeps its OWN per-daemon override baseline frozen
+          # regardless ... so nothing is hidden from a future sweep"). It did
+          # not: the per-daemon block above discarded a stuck label's entry
+          # (measured 2026-09-20 on whatsapp_automation: 41 guarded, 0 of them
+          # recorded, marker advanced, wide list 41 -> 5, nobody restarted
+          # anything). It now RECORDS each one ("<label> <sha> stuck") — but the
+          # only reader of that file, daemon-refresh.sh, merely narrows a
+          # label's window between the rig-wide PRE and POST: it never adds a
+          # label and ignores an entry older than PRE. So a still-stuck daemon
+          # DOES drop out of the next wide window when the line below moves the
+          # marker past it; what survives is the frozen entry, the record of
+          # what was last seen unresolved and since when (it is not cleared by a
+          # later restart either — nothing re-examines the label). Making the wide list itself
+          # stick to those labels needs a per-daemon freshness reference first:
+          # already_fresh() measures a daemon's start against the window TIP,
+          # so one restarted by hand reads stale as soon as any later commit
+          # lands, and a held window could stay lit indefinitely — that is
+          # ga-n2jnsa, deliberately not done here.
           #
           # ga-8i2nds: only when the exoneration was the no-overlap kind. A
           # release that rests on the bead-scoped re-probe DESPITE a wide
           # overlap (UNATTRIBUTED_ADVANCES_MARKER=0) proves nothing about the
           # rest of the window, so it leaves the marker alone.
           if [ "$UNATTRIBUTED_ADVANCES_MARKER" = "1" ] && [ -n "$POST_DEPLOY_SHA" ]; then
+            if [ -n "${PD_STUCK// /}" ]; then
+              pd_dropped="${PD_STUCK# }"; pd_dropped="${pd_dropped% }"
+              log "Daemon refresh: advancing the rig-wide baseline marker to $POST_DEPLOY_SHA drops the still-stuck daemon(s) [$pd_dropped] out of the next wide window. Each keeps a frozen 'stuck' baseline in $DAEMON_REFRESH_PERDAEMON_FILE — a record of what is unresolved and since when, not a re-flag: daemon-refresh.sh only narrows per-daemon baselines (ga-7polxu; making the list itself stick is ga-n2jnsa)."
+            fi
             printf '%s\n' "$POST_DEPLOY_SHA" > "$DAEMON_REFRESH_BASELINE_FILE" 2>/dev/null \
               || warn "could not persist daemon-refresh baseline for rig $RIG at $DAEMON_REFRESH_BASELINE_FILE (non-fatal; next sweep falls back to its own pre-pull HEAD)"
           fi

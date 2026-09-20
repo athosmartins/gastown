@@ -22,19 +22,31 @@
 # ga-9lug2k added) — an empty intersection means none of the currently-stuck
 # daemons belong to this bead, so the delivery is NOT held. This also
 # advances the rig-wide daemon-refresh baseline marker in that case (unlike
-# the pre-existing ga-3bdttu inert branch, which deliberately does not) —
-# safe because any daemon still genuinely stuck keeps its own per-daemon
-# override baseline frozen regardless (ga-0fawwr, unconditional, unaffected
-# by this branch) — closing the self-feeding "verdict never OK -> marker
-# never advances -> window widens -> more daemons match -> verdict never OK"
-# loop this bug's own root-cause section describes.
+# the pre-existing ga-3bdttu inert branch, which deliberately does not),
+# closing the self-feeding "verdict never OK -> marker never advances ->
+# window widens -> more daemons match -> verdict never OK" loop this bug's
+# own root-cause section describes.
+#
+# ga-7polxu CORRECTION to the rationale this header used to give ("safe
+# because any daemon still genuinely stuck keeps its own per-daemon override
+# baseline frozen regardless"). That was not true: the per-daemon block threw a
+# still-stuck label's entry away, and even a recorded entry cannot keep the
+# label in the wide list, because daemon-refresh.sh only NARROWS per-daemon
+# baselines (never adds a label, ignores an entry older than PRE). What this
+# branch's marker advance really does is drop a still-stuck daemon out of the
+# NEXT wide window (making the list itself stick is ga-n2jnsa). What ga-7polxu
+# guarantees, and T1/T2/T4 below pin, is that the daemon stays ON RECORD: a
+# frozen "<label> <sha> stuck" entry in the per-daemon file, at its pre-advance
+# baseline, however the sweep ends.
 #
 # T1 (the repro + fix proof): this bead's own merge reaches ONE live daemon
 #     (new-daemon), which is NOT in the current wide GUARDED set (only an
 #     unrelated old-daemon is stuck). Delivery must NOT be held (no
 #     delivery:failed, no "Delivery HALTED" comment), the mayor must still be
 #     nudged (invariant b: the gap stays visible/charged), and the rig-wide
-#     baseline marker must advance to POST_DEPLOY_SHA (invariant c).
+#     baseline marker must advance to POST_DEPLOY_SHA (invariant c) — while
+#     the old-daemon the advance drops out of the next window stays recorded,
+#     frozen at its pre-advance baseline (ga-7polxu), and the log says so.
 # T2 (control — still attributed, unchanged behavior): this bead's own merge
 #     reaches a live daemon (new-daemon) that IS in the current wide GUARDED
 #     set alongside an unrelated old-daemon. Delivery MUST still be held
@@ -65,7 +77,13 @@
 #     an unrelated old-daemon is stuck). Delivery must NOT be held, mayor
 #     still nudged, baseline marker must advance.
 
-set -uo pipefail
+# No `pipefail` at file level (ga-7polxu): the assertions below are
+# `echo "$X" | grep -q ...`, and under pipefail grep -q's early exit hands the
+# writer a SIGPIPE — the pipeline then reports 141 and a PASSING assertion prints
+# FAIL (measured at load ~45: 29 false FAILs in 1500 such pipelines with pipefail
+# on, 0 with it off; this file failed 6 runs in 8 at load 66, on the base too).
+# The block under test still runs WITH pipefail (see run_block), as in production.
+set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DELIVERY="$SCRIPT_DIR/../story-delivery.sh"
@@ -224,12 +242,15 @@ EOF
   esac
   get_runbook_field() { echo ""; }
 
-  ( for _t in _once; do eval "$BLOCK"; done ) >/dev/null 2>&1
+  ( set -o pipefail; for _t in _once; do eval "$BLOCK"; done ) >/dev/null 2>&1
   RUN_RC=$?
   LOG_OUT="$(cat "$LOG_FILE" 2>/dev/null || true)"
   BD_CALLS="$(cat "$BD_LOG" 2>/dev/null || true)"
   GC_CALLS="$(cat "$GC_LOG" 2>/dev/null || true)"
   BASELINE_AFTER="$(cat "$BASELINE_FILE_ABS" 2>/dev/null || echo "<missing>")"
+  # ga-7polxu: the per-daemon file, to prove a still-stuck daemon stays on
+  # record whichever way the sweep ends (release + marker advance, or hold).
+  PERDAEMON_AFTER="$(cat "$GC_CITY/.gc/runtime/daemon-refresh-baseline/whatsapp_automation.perdaemon" 2>/dev/null || true)"
   rm -rf "$T"
 }
 
@@ -257,6 +278,12 @@ echo "$GC_CALLS" | grep -q "com.test.old-daemon" \
 [ "$BASELINE_AFTER" = "$EXPECT_C2" ] \
   && ok "T1 rig-wide baseline marker ADVANCED to POST_DEPLOY_SHA — invariant (c), closes the self-feeding window-growth loop" \
   || nok "T1 baseline marker did not advance" "want=$EXPECT_C2 got=$BASELINE_AFTER"
+echo "$PERDAEMON_AFTER" | grep -qx "com.test.old-daemon $EXPECT_C0 stuck" \
+  && ok "T1 the still-stuck old-daemon, dropped out of the next window by that advance, stays ON RECORD: frozen at its pre-advance baseline (C0), flagged stuck (ga-7polxu)" \
+  || nok "T1 the marker advance erased the stuck daemon's record (ga-7polxu: 41 guarded, 0 recorded)" "perdaemon=[$PERDAEMON_AFTER]"
+echo "$LOG_OUT" | grep -q "drops the still-stuck daemon(s) \[com.test.old-daemon\]" \
+  && ok "T1 the sweep log says the advance drops old-daemon out of the next wide window — the erasure is no longer silent" \
+  || nok "T1 no log line naming the daemon the marker advance drops" "$LOG_OUT"
 
 # ── T2 (mode=attributed): control — new-daemon IS still in the current
 #    guarded set → must still hold, exactly as before this fix ────────────
@@ -280,6 +307,10 @@ echo "$BD_CALLS" | grep -q "restart THESE for this merge" \
 [ "$BASELINE_AFTER" = "$EXPECT_C0" ] \
   && ok "T2 rig-wide baseline marker did NOT advance (stayed at pre-existing value) — new branch correctly did not fire" \
   || nok "T2 baseline marker unexpectedly changed" "want(unchanged)=$EXPECT_C0 got=$BASELINE_AFTER"
+echo "$PERDAEMON_AFTER" | grep -qx "com.test.old-daemon $EXPECT_C0 stuck" \
+  && echo "$PERDAEMON_AFTER" | grep -qx "com.test.new-daemon $EXPECT_C0 stuck" \
+  && ok "T2 the hold path records BOTH still-stuck daemons frozen at C0 too — the per-daemon bookkeeping does not depend on which branch decides the delivery" \
+  || nok "T2 stuck daemons not recorded on the hold path" "perdaemon=[$PERDAEMON_AFTER]"
 
 # ── T3 (mode=path_a_attributed, ga-ndu4ic) — mirrors T2 via Path A: new-
 #    daemon IS still in the current guarded set → must still hold ────────
@@ -322,6 +353,9 @@ echo "$GC_CALLS" | grep -q "session nudge mayor" \
 [ "$BASELINE_AFTER" = "$EXPECT_C2" ] \
   && ok "T4 rig-wide baseline marker ADVANCED to POST_DEPLOY_SHA on Path A too (ga-ndu4ic, closes the Aceite-3 loop)" \
   || nok "T4 baseline marker did not advance" "want=$EXPECT_C2 got=$BASELINE_AFTER"
+echo "$PERDAEMON_AFTER" | grep -qx "com.test.old-daemon $EXPECT_C0 stuck" \
+  && ok "T4 on Path A too, the still-stuck old-daemon stays on record (frozen at C0, stuck) after the marker advance (ga-7polxu)" \
+  || nok "T4 the marker advance erased the stuck daemon's record on Path A" "perdaemon=[$PERDAEMON_AFTER]"
 
 echo ""
 echo "story-delivery guarded-restart attribution tests: $PASS passed, $FAIL failed"
