@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Tests for pool-autoscale-watchdog.py's demand count (ga-uv4on5).
+"""Tests for pool-autoscale-watchdog.py's demand count (ga-uv4on5) and for the
+pool ceiling it reads from `gc config show` (ga-d1q1kn, last section).
 
 THE BUG. get_pool_demand() counted every ready, unassigned bead routed to the
 pool. A pool worker's own probe (the engine-rendered Step-1c work query)
@@ -70,6 +71,22 @@ def _done(argv, rc, out="", err=""):
     return subprocess.CompletedProcess(args=argv, returncode=rc, stdout=out, stderr=err)
 
 
+def config_show(**agents):
+    """Text shaped like `gc config show`: one [[agent]] block per agent, with a
+    max_active_sessions line only where the agent has one (some real agents, such
+    as gemini-worker, have none) and the min_active_sessions line the real blocks
+    carry right after it, which the cap parse must not mistake for the cap."""
+    blocks = []
+    for name, cap in agents.items():
+        lines = ["[[agent]]", 'name = "%s"' % name, 'scope = "city"',
+                 'provider = "claude-headless"']
+        if cap is not None:
+            lines.append("max_active_sessions = %d" % cap)
+        lines.append("min_active_sessions = 0")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks) + "\n"
+
+
 class FakeCLI:
     """Stands in for subprocess.run. Records every call; refuses unknown ones."""
 
@@ -84,10 +101,20 @@ class FakeCLI:
         self.hook_raises = None
         self.hook_calls = []                  # [(argv, effective_env)]
         self.sessions = []
+        # What `gc config show` answers: a (rc, stdout, stderr) tuple, or an exception to
+        # raise. `config` is the standing answer (default: the live shape, dog cap 6);
+        # `config_script` holds one-off answers consumed in order, one per call.
+        self.config = (0, config_show(mayor=1, dog=6, witness=1), "")
+        self.config_script = []
         self.calls = []
 
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
+        if argv[:3] == ["gc", "config", "show"]:
+            answer = self.config_script.pop(0) if self.config_script else self.config
+            if isinstance(answer, BaseException):
+                raise answer
+            return _done(argv, *answer)
         if argv[:2] == ["bd", "ready"]:
             return self._bd_ready(argv)
         if argv[:2] == ["gc", "hook"]:
@@ -540,6 +567,183 @@ def test_cycle_with_claimable_work_still_wakes_and_pins_an_asleep_dog(wd, fake):
     wd.run_cycle({POOL: 3}, state, {})
     assert ["gc", "session", "wake", "ga-s1"] in fake.calls
     assert ["gc", "session", "pin", "ga-s1"] in fake.calls
+
+
+# ---------------------------------------------------------------------------
+# The pool ceiling: a failed read is not a number (ga-d1q1kn)
+# ---------------------------------------------------------------------------
+# THE BUG. load_pool_max_active() turned every failure to read `gc config show`
+# into the hardcoded 3, with no log line, and main() called it once, at start-up.
+# A read that failed in the first minutes after a boot (gc/bd not ready) left the
+# daemon acting on 3 for ~2h while the config said 6 (`active=6/3`, `max=3` in
+# [STUCK]). The same 3 came out of "the config says 3" and out of "I could not
+# read the config".
+
+FALLBACK_CAP = 3       # what the dog pool is held to until the config has answered once
+
+# (id, what `gc config show` does, the reason the log line must give). Every way
+# the read can end without a number for the dog pool.
+NO_ANSWER = [
+    ("timeout", subprocess.TimeoutExpired(["gc", "config", "show"], 20), "TimeoutExpired"),
+    ("gc-missing", FileNotFoundError("gc"), "FileNotFoundError"),
+    ("exit-1-with-an-error", (1, "", "Error: city not ready"), "exit 1, Error: city not ready"),
+    # a failed command's stdout is not an answer, even when it looks like one
+    ("exit-1-with-a-config-on-stdout", (1, config_show(dog=6), ""), "exit 1"),
+    # exit 0 but nothing usable. The dog agent comes from the maintenance system
+    # pack, so a boot where that pack is not materialised yet reads like this.
+    ("exit-0-empty", (0, "", ""), "no agent named 'dog'"),
+    ("exit-0-not-a-config", (0, "not toml at all\n", ""), "no agent named 'dog'"),
+    ("exit-0-config-without-the-dog-agent", (0, config_show(mayor=1, witness=1), ""),
+     "no agent named 'dog'"),
+    ("exit-0-dog-agent-without-a-cap", (0, config_show(dog=None), ""),
+     "'dog' has no max_active_sessions"),
+]
+NO_ANSWER_PARAMS = [pytest.param(answer, reason, id=name) for name, answer, reason in NO_ANSWER]
+
+
+def _cap_lines(capsys):
+    """The [CAP-*] lines printed since the last call."""
+    return [l for l in capsys.readouterr().out.splitlines() if "[CAP-" in l]
+
+
+def test_a_healthy_read_gives_the_configured_cap_and_says_nothing(wd, fake, capsys):
+    """Break caught: the fix must not make a healthy daemon noisy (silence = healthy).
+    The cap parse must also take max_active_sessions, not the min_ line after it."""
+    assert wd.load_pool_max_active([POOL]) == {POOL: 6}
+    assert wd.load_pool_max_active([POOL]) == {POOL: 6}
+    assert _cap_lines(capsys) == []
+
+
+@pytest.mark.parametrize("answer,reason", NO_ANSWER_PARAMS)
+def test_a_read_that_gives_no_number_is_said_not_swallowed(wd, fake, capsys, answer, reason):
+    """Break caught: the daemon that ran ~2h on a ceiling of 3 while the config said
+    6 printed nothing when the read failed. The value is still a stand-in -- but it
+    is now labelled as one, with the reason."""
+    fake.config = answer
+    assert wd.load_pool_max_active([POOL]) == {POOL: FALLBACK_CAP}
+    lines = _cap_lines(capsys)
+    assert len(lines) == 1, lines
+    assert "[CAP-FALLBACK]" in lines[0] and POOL in lines[0]
+    assert "hardcoded fallback" in lines[0] and reason in lines[0]
+
+
+@pytest.mark.parametrize("answer,reason", NO_ANSWER_PARAMS)
+def test_a_failed_read_keeps_the_last_good_cap_not_the_hardcoded_one(wd, fake, capsys, answer, reason):
+    """Break caught: 6 was read, then one read fails and the ceiling drops to 3 --
+    4 active dogs now look like a full pool and nobody is woken for real demand."""
+    assert wd.load_pool_max_active([POOL]) == {POOL: 6}
+    fake.config = answer
+    assert wd.load_pool_max_active([POOL]) == {POOL: 6}
+    lines = _cap_lines(capsys)
+    assert len(lines) == 1, lines
+    assert "[CAP-FALLBACK]" in lines[0] and "last value it gave" in lines[0]
+    assert reason in lines[0]
+
+
+def test_the_fallback_is_said_once_per_episode_and_so_is_the_recovery(wd, fake, capsys):
+    """Break caught: logging every failed read puts a line in the log every two
+    minutes for as long as the config stays unreadable."""
+    down, up = (1, "", "Error: city not ready"), (0, config_show(dog=6), "")
+    fake.config_script = [down, down, down, up, down, up]
+    assert [wd.load_pool_max_active([POOL])[POOL] for _ in range(6)] == [3, 3, 3, 6, 6, 6]
+    out = capsys.readouterr().out
+    assert out.count("[CAP-FALLBACK]") == 2      # never read; then the last good kept
+    assert out.count("[CAP-RECOVERED]") == 2
+
+
+def test_recovery_says_what_the_daemon_acted_on_and_what_it_acts_on_now(wd, fake, capsys):
+    """Break caught: the cap changed from 3 to 6 by itself and nothing in the log said so."""
+    fake.config_script = [(1, "", "Error: city not ready")]
+    assert wd.load_pool_max_active([POOL]) == {POOL: 3}
+    assert wd.load_pool_max_active([POOL]) == {POOL: 6}
+    lines = _cap_lines(capsys)
+    assert len(lines) == 2, lines
+    assert "[CAP-FALLBACK]" in lines[0]
+    assert "[CAP-RECOVERED]" in lines[1]
+    assert "max_active_sessions=6" in lines[1] and "was 3" in lines[1]
+    assert "hardcoded fallback" in lines[1]
+
+
+def test_a_changed_config_is_used_at_once_and_reported(wd, fake, capsys):
+    """Break caught: the ceiling was read once, so raising it in the config took
+    effect only when the daemon next restarted."""
+    fake.config = (0, config_show(dog=3), "")
+    assert wd.load_pool_max_active([POOL]) == {POOL: 3}
+    fake.config = (0, config_show(dog=6), "")
+    assert wd.load_pool_max_active([POOL]) == {POOL: 6}
+    assert wd.load_pool_max_active([POOL]) == {POOL: 6}
+    lines = _cap_lines(capsys)
+    assert len(lines) == 1, lines
+    assert "[CAP-CHANGED]" in lines[0] and "3->6" in lines[0]
+
+
+def test_a_pool_without_an_answer_does_not_change_the_answer_for_another_pool(wd, fake, capsys):
+    """Break caught: one pool the config knows nothing about must not drag the
+    others down to a guess."""
+    other = "gastown.other"
+    assert wd.load_pool_max_active([POOL, other]) == {POOL: 6, other: 1}
+    lines = _cap_lines(capsys)
+    assert len(lines) == 1, lines
+    assert other in lines[0] and POOL not in lines[0]
+
+
+class _StopLoop(Exception):
+    """Raised from the patched time.sleep to end main()'s endless loop."""
+
+
+def _active_dog(n):
+    return {"id": "ga-a%d" % n, "name": "gastown.dog-%d" % n, "template": POOL,
+            "state": "active", "closed": False}
+
+
+def _run_main_for(wd, monkeypatch, cycles):
+    """Run main() until the `cycles`-th sleep, i.e. for exactly that many cycles."""
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == cycles:
+            raise _StopLoop
+    monkeypatch.setattr(wd.time, "sleep", sleep)
+    with pytest.raises(_StopLoop):
+        wd.main()
+
+
+def test_main_rereads_the_ceiling_every_cycle_so_a_boot_time_miss_heals(
+        wd, fake, monkeypatch, tmp_path, capsys):
+    """Break caught (the bead's symptom, through main()): the start-up read failed
+    (gc/bd are not ready in the first minutes after a boot), the daemon kept the
+    hardcoded 3 for ~2h while the config said 6, read 4 active dogs as a full pool
+    and woke nobody for real demand with a real vacancy. Re-read each cycle, the
+    second cycle sees 6 and wakes the dog."""
+    monkeypatch.chdir(tmp_path)                            # save_state() writes a relative path
+    monkeypatch.setattr(wd, "SCALE_UP_AFTER", 0)           # decide on the first sight of demand
+    fake.beads = [bead("ga-open", labels=["ctx:ready"])]
+    fake.sessions = [_active_dog(n) for n in range(4)] + [_asleep_dog()]
+    fake.config_script = [(1, "", "Error: city not ready")]   # the start-up read; later reads see dog=6
+    _run_main_for(wd, monkeypatch, cycles=2)
+    out = capsys.readouterr().out
+    assert ["gc", "session", "wake", "ga-s1"] in fake.calls, out       # cycle 2: 4 active < 6
+    assert ["gc", "session", "pin", "ga-s1"] in fake.calls, out
+    assert sum(1 for c in fake.calls if c[:3] == ["gc", "config", "show"]) == 2
+    # cycle 1 on the stand-in (4 active >= 3), then the heal, then the wake
+    assert -1 != out.find("[STUCK]") < out.find("[CAP-RECOVERED]") < out.find("[SCALED-UP]"), out
+
+
+@pytest.mark.parametrize("answer,source", [
+    pytest.param((0, config_show(dog=6), ""), "config", id="read"),
+    pytest.param((1, "", "Error: city not ready"), "fallback", id="not-read"),
+])
+def test_startup_line_says_where_the_cap_came_from(wd, fake, monkeypatch, tmp_path, capsys,
+                                                    answer, source):
+    """Break caught: `caps={'gastown.dog': 3}` read the same whether the config said 3
+    or nothing could be read -- and the restart chore proves the new code by that line."""
+    monkeypatch.chdir(tmp_path)
+    fake.config = answer
+    _run_main_for(wd, monkeypatch, cycles=1)
+    startup = [l for l in capsys.readouterr().out.splitlines() if "[STARTUP] managed_pools=" in l]
+    assert len(startup) == 1, startup
+    assert "cap_source={%r: %r}" % (POOL, source) in startup[0]
 
 
 # ---------------------------------------------------------------------------
