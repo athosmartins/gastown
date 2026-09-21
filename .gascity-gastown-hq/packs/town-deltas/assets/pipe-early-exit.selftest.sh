@@ -156,11 +156,18 @@ fi
 
 echo "── C. the 3 --count=1 hardenings (pilot-dispatcher.sh) are present ──"
 PD="$SELF_DIR/pilot-dispatcher.sh"
-count_hits=$(grep -c 'for-each-ref --count=1' "$PD" 2>/dev/null)
-if [ "$count_hits" -ge 3 ]; then
-  ok "pilot-dispatcher.sh has $count_hits 'for-each-ref --count=1' site(s) (expected >= 3)"
+if [ ! -f "$PD" ]; then
+  # Third state: `grep -c` on a missing file prints NOTHING (not "0") and
+  # exits 2 — feeding that straight into `-ge 3` below would crash with
+  # "integer expression expected" instead of reporting a clean failure.
+  bad "pilot-dispatcher.sh not found at $PD — cannot check the --count=1 hardenings"
 else
-  bad "pilot-dispatcher.sh has only $count_hits 'for-each-ref --count=1' site(s), expected >= 3 — a hardening may have been reverted"
+  count_hits=$(grep -c 'for-each-ref --count=1' "$PD" 2>/dev/null)
+  if [ "$count_hits" -ge 3 ]; then
+    ok "pilot-dispatcher.sh has $count_hits 'for-each-ref --count=1' site(s) (expected >= 3)"
+  else
+    bad "pilot-dispatcher.sh has only $count_hits 'for-each-ref --count=1' site(s), expected >= 3 — a hardening may have been reverted"
+  fi
 fi
 
 echo "── D. the C11 detector exists, is wired in, and production findings stay at/under baseline ──"
@@ -195,12 +202,23 @@ else
     # triaging exactly what grew and confirming it is ALSO safe — never bump it
     # to silence a failure without reading the new finding first.
     BASELINE=33
-    # shellcheck disable=SC2046
-    PROD_FINDINGS="$(cd "$CITY_DIR" && scan_pipe_early_exit_files $(printf '%s ' $PROD_LIST) | grep -c ':C11:')"
-    if [ "$PROD_FINDINGS" -le "$BASELINE" ]; then
-      ok "$PROD_FINDINGS C11 finding(s) in production (baseline $BASELINE) — no growth"
+    # Third state, explicit: a `cd` failure here must never fall through to
+    # comparing an empty string with `-le` (bash would throw "integer
+    # expression expected" — a confusing crash, not a reported failure). Keep
+    # the failure-to-cd and the counted-findings paths fully separate so
+    # "could not run the ratchet" and "ran it, 0 findings" can never collapse
+    # into the same outcome.
+    if ! cd "$CITY_DIR" 2>/dev/null; then
+      bad "could not cd to CITY_DIR ($CITY_DIR) to run the C11 ratchet — treating as UNKNOWN, not as a passing 0-findings result"
     else
-      bad "$PROD_FINDINGS C11 finding(s) in production, up from the $BASELINE baseline — a NEW unguarded head/awk-exit/grep-m/sed-q site landed; triage it before bumping the baseline"
+      # shellcheck disable=SC2046
+      PROD_FINDINGS="$(scan_pipe_early_exit_files $(printf '%s ' $PROD_LIST) | grep -c ':C11:')"
+      cd "$SELF_DIR" 2>/dev/null || true
+      if [ "$PROD_FINDINGS" -le "$BASELINE" ]; then
+        ok "$PROD_FINDINGS C11 finding(s) in production (baseline $BASELINE) — no growth"
+      else
+        bad "$PROD_FINDINGS C11 finding(s) in production, up from the $BASELINE baseline — a NEW unguarded head/awk-exit/grep-m/sed-q site landed; triage it before bumping the baseline"
+      fi
     fi
   fi
 fi
