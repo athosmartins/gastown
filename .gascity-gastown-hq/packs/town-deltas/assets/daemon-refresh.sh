@@ -2087,58 +2087,67 @@ AFFECTED="$(echo "$AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' 
 # closure-diff evidence) and BEFORE Step 4, so a downgraded label never
 # reaches the restart/verify machinery at all this cycle — same as if it had
 # never been flagged.
-if [ -n "${DAEMON_BASELINE_OVERRIDES// /}" ] && [ -n "${AFFECTED// /}" ]; then
-  # git diff --name-only <sha>..POST_DEPLOY_SHA, memoized per distinct <sha> —
-  # several labels sharing the same last-resolved cycle (the common case) pay
-  # for exactly one git invocation, not one per label.
-  ga0fawwr_narrow_changed() {  # ga0fawwr_narrow_changed <sha> -> prints multiline changed
-    # set on stdout, returns 1 if the diff itself could not be computed at
-    # all. Third-state: a FAILED `git diff` and a SUCCESSFUL diff that just
-    # happens to be empty must never collapse into the same "" — the first
-    # means "unknown, could not check" (caller must keep the label as
-    # originally affected), the second means "confirmed, genuinely nothing
-    # changed" (a real, safe signal to downgrade on). Returning 1 only on the
-    # former, distinct from printing empty output on the latter, is what lets
-    # the caller tell them apart.
-    local sha="$1" cache
-    cache="$DISCO_DIR/.ga0fawwr-changed.$(echo "$sha" | tr -c 'A-Za-z0-9' '_')"
-    if [ ! -f "$cache" ]; then
-      if ! git -C "$RUNTIME_DIR" diff --name-only "$sha" "$POST_DEPLOY_SHA" > "$cache" 2>/dev/null; then
-        rm -f "$cache" 2>/dev/null
-        return 1
-      fi
+# ga0fawwr (per-daemon baseline narrowing) + ga-n2jnsa (per-daemon freshness
+# floor + AFFECTED widening) share these two helpers. Defined
+# UNCONDITIONALLY (not gated on DAEMON_BASELINE_OVERRIDES/AFFECTED as they
+# used to be) because already_fresh() below needs ga0fawwr_label_hits on
+# EVERY invocation, including the common case where DAEMON_BASELINE_OVERRIDES
+# is empty (first cycle for a rig, or a rig that has never had a stuck
+# daemon) — calling into a conditionally-defined function is silently
+# "command not found" in bash, and that must never depend on which cycle
+# happens to be running.
+#
+# git diff --name-only <sha>..POST_DEPLOY_SHA, memoized per distinct <sha> —
+# several labels sharing the same last-resolved cycle (the common case) pay
+# for exactly one git invocation, not one per label.
+ga0fawwr_narrow_changed() {  # ga0fawwr_narrow_changed <sha> -> prints multiline changed
+  # set on stdout, returns 1 if the diff itself could not be computed at
+  # all. Third-state: a FAILED `git diff` and a SUCCESSFUL diff that just
+  # happens to be empty must never collapse into the same "" — the first
+  # means "unknown, could not check" (caller must keep the label as
+  # originally affected), the second means "confirmed, genuinely nothing
+  # changed" (a real, safe signal to downgrade on). Returning 1 only on the
+  # former, distinct from printing empty output on the latter, is what lets
+  # the caller tell them apart.
+  local sha="$1" cache
+  cache="$DISCO_DIR/.ga0fawwr-changed.$(echo "$sha" | tr -c 'A-Za-z0-9' '_')"
+  if [ ! -f "$cache" ]; then
+    if ! git -C "$RUNTIME_DIR" diff --name-only "$sha" "$POST_DEPLOY_SHA" > "$cache" 2>/dev/null; then
+      rm -f "$cache" 2>/dev/null
+      return 1
     fi
-    cat "$cache" 2>/dev/null || true
-  }
+  fi
+  cat "$cache" 2>/dev/null || true
+}
 
-  # is <label> still affected once measured against its OWN narrower <changed>
-  # set? Same signals Step 3 above already trusts (deploy_deps.json closure
-  # when it covers an entry, else direct/basename + import-stem + routes-hop +
-  # template), replicated here rather than shared with Step 3's loop — that
-  # loop is optimized to run once for the WHOLE rig against the wide $CHANGED;
-  # this one runs rarely (only for a label already flagged AFFECTED that also
-  # has a usable override) against a label-specific narrow set, so a second,
-  # smaller implementation is the lower-risk choice over threading a second
-  # changed-set through the shared one.
-  ga0fawwr_label_hits() {  # ga0fawwr_label_hits <label> <changed-multiline> -> 0 if still affected
-    local label="$1" changed="$2" e eb stem tmpl tb pat covered=0
-    local entries json_entries="" adhoc_entries=""
-    entries="$(cat "$DISCO_DIR/$label" 2>/dev/null || true)"
-    # third-state: an entries file we can't read/find here is "don't know",
-    # not "no entries" — Step 3 already proved this label real (it's only
-    # ever called for a label already in $AFFECTED, and FORCE_RESTART_LABELS
-    # members are excluded before this is ever reached), so an unreadable
-    # file now is a filesystem hiccup, not evidence of a clean closure. Fail
-    # toward the SAFE side of a downgrade decision: still hit (0), i.e. never
-    # downgrade on a read we couldn't actually perform.
-    [ -n "${entries// /}" ] || return 0
-    for e in $entries; do
-      if json_covers_entry "$e"; then json_entries="$json_entries $e"; else adhoc_entries="$adhoc_entries $e"; fi
-    done
+# is <label> still affected once measured against its OWN narrower <changed>
+# set? Same signals Step 3 above already trusts (deploy_deps.json closure
+# when it covers an entry, else direct/basename + import-stem + routes-hop +
+# template), replicated here rather than shared with Step 3's loop — that
+# loop is optimized to run once for the WHOLE rig against the wide $CHANGED;
+# this one runs rarely (only for a label already flagged AFFECTED that also
+# has a usable override) against a label-specific narrow set, so a second,
+# smaller implementation is the lower-risk choice over threading a second
+# changed-set through the shared one.
+ga0fawwr_label_hits() {  # ga0fawwr_label_hits <label> <changed-multiline> -> 0 if still affected
+  local label="$1" changed="$2" e eb stem tmpl tb pat covered=0
+  local entries json_entries="" adhoc_entries=""
+  entries="$(cat "$DISCO_DIR/$label" 2>/dev/null || true)"
+  # third-state: an entries file we can't read/find here is "don't know",
+  # not "no entries" — Step 3 already proved this label real (it's only
+  # ever called for a label already in $AFFECTED, and FORCE_RESTART_LABELS
+  # members are excluded before this is ever reached), so an unreadable
+  # file now is a filesystem hiccup, not evidence of a clean closure. Fail
+  # toward the SAFE side of a downgrade decision: still hit (0), i.e. never
+  # downgrade on a read we couldn't actually perform.
+  [ -n "${entries// /}" ] || return 0
+  for e in $entries; do
+    if json_covers_entry "$e"; then json_entries="$json_entries $e"; else adhoc_entries="$adhoc_entries $e"; fi
+  done
 
-    if [ -n "${json_entries// /}" ] && [ -f "$DEPLOY_DEPS_JSON" ]; then
-      local hit hit_rc
-      hit="$(CHANGED_FOR_DDJ="$changed" ENTRIES_FOR_DDJ="$json_entries" python3 - "$DEPLOY_DEPS_JSON" <<'PY' 2>/dev/null
+  if [ -n "${json_entries// /}" ] && [ -f "$DEPLOY_DEPS_JSON" ]; then
+    local hit hit_rc
+    hit="$(CHANGED_FOR_DDJ="$changed" ENTRIES_FOR_DDJ="$json_entries" python3 - "$DEPLOY_DEPS_JSON" <<'PY' 2>/dev/null
 import json, os, sys
 try:
     daemons = json.load(open(sys.argv[1], encoding="utf-8"))["daemons"]
@@ -2155,66 +2164,128 @@ for path, info in daemons.items():
         break
 PY
 )"
-      hit_rc=$?
-      if [ "$hit" = "HIT" ]; then
-        return 0
-      elif [ "$hit_rc" -ne 0 ]; then
-        # third-state: python/deploy_deps.json failed to answer at all for
-        # these exclusively-trusted entries (header point 14) — unknown, not
-        # "confirmed clean". A crashed check must never look like a clean
-        # one; fail toward keeping the label affected.
-        return 0
-      fi
-      # hit_rc==0 and hit != HIT: python ran fine and positively confirmed no
-      # intersection for every json-covered entry — trust that exclusively
-      # (header point 14) and do NOT fall through to ad-hoc for THESE
-      # entries; only adhoc_entries (below, entries json doesn't cover at
-      # all) can still keep the label affected.
+    hit_rc=$?
+    if [ "$hit" = "HIT" ]; then
+      return 0
+    elif [ "$hit_rc" -ne 0 ]; then
+      # third-state: python/deploy_deps.json failed to answer at all for
+      # these exclusively-trusted entries (header point 14) — unknown, not
+      # "confirmed clean". A crashed check must never look like a clean
+      # one; fail toward keeping the label affected.
+      return 0
     fi
-    [ -n "${adhoc_entries// /}" ] || return 1
+    # hit_rc==0 and hit != HIT: python ran fine and positively confirmed no
+    # intersection for every json-covered entry — trust that exclusively
+    # (header point 14) and do NOT fall through to ad-hoc for THESE
+    # entries; only adhoc_entries (below, entries json doesn't cover at
+    # all) can still keep the label affected.
+  fi
+  [ -n "${adhoc_entries// /}" ] || return 1
 
-    local c_py c_stems="" c_tpl_basenames py_basenames
-    c_py="$(echo "$changed" | grep -E '\.py$' || true)"
-    c_tpl_basenames="$(echo "$changed" | grep -E '\.(html|htm|jinja2?|j2)$' | while read -r f; do [ -n "$f" ] && basename "$f"; done)"
-    py_basenames="$(echo "$c_py" | while read -r f; do [ -n "$f" ] && basename "$f"; done)"
-    # tests/**, docs/**, *.md never contribute a stem — same universal claim
-    # DEFAULT_NO_RESTART_PATTERNS already establishes for the wide computation.
-    set -f
-    while IFS= read -r pyf; do
-      [ -n "$pyf" ] || continue
-      covered=0
-      for pat in $DEFAULT_NO_RESTART_PATTERNS; do
-        # shellcheck disable=SC2254  # deliberate glob match, not literal
-        case "$pyf" in $pat) covered=1; break ;; esac
-      done
-      [ "$covered" -eq 1 ] || c_stems="$c_stems $(basename "$pyf" .py)"
-    done <<< "$c_py"
-    set +f
+  local c_py c_stems="" c_tpl_basenames py_basenames
+  c_py="$(echo "$changed" | grep -E '\.py$' || true)"
+  c_tpl_basenames="$(echo "$changed" | grep -E '\.(html|htm|jinja2?|j2)$' | while read -r f; do [ -n "$f" ] && basename "$f"; done)"
+  py_basenames="$(echo "$c_py" | while read -r f; do [ -n "$f" ] && basename "$f"; done)"
+  # tests/**, docs/**, *.md never contribute a stem — same universal claim
+  # DEFAULT_NO_RESTART_PATTERNS already establishes for the wide computation.
+  set -f
+  while IFS= read -r pyf; do
+    [ -n "$pyf" ] || continue
+    covered=0
+    for pat in $DEFAULT_NO_RESTART_PATTERNS; do
+      # shellcheck disable=SC2254  # deliberate glob match, not literal
+      case "$pyf" in $pat) covered=1; break ;; esac
+    done
+    [ "$covered" -eq 1 ] || c_stems="$c_stems $(basename "$pyf" .py)"
+  done <<< "$c_py"
+  set +f
 
+  for e in $adhoc_entries; do
+    echo "$c_py" | grep -xF "$e" >/dev/null && return 0
+    eb="$(basename "$e")"
+    echo "$py_basenames" | grep -xF "$eb" >/dev/null && return 0
+  done
+  for stem in $c_stems; do
     for e in $adhoc_entries; do
-      echo "$c_py" | grep -xF "$e" >/dev/null && return 0
-      eb="$(basename "$e")"
-      echo "$py_basenames" | grep -xF "$eb" >/dev/null && return 0
+      daemon_imports_stem "$RUNTIME_DIR/$e" "$stem" && return 0
+      daemon_imports_stem_via_routes "$e" "$stem" && return 0
     done
-    for stem in $c_stems; do
-      for e in $adhoc_entries; do
-        daemon_imports_stem "$RUNTIME_DIR/$e" "$stem" && return 0
-        daemon_imports_stem_via_routes "$e" "$stem" && return 0
-      done
+  done
+  if [ -n "${c_tpl_basenames// /}" ]; then
+    for e in $adhoc_entries; do
+      [ -f "$RUNTIME_DIR/$e" ] || continue
+      while IFS= read -r tmpl; do
+        [ -n "$tmpl" ] || continue
+        tb="$(basename "$tmpl")"
+        echo "$c_tpl_basenames" | grep -xF "$tb" >/dev/null && return 0
+      done < <(daemon_template_names "$RUNTIME_DIR/$e")
     done
-    if [ -n "${c_tpl_basenames// /}" ]; then
-      for e in $adhoc_entries; do
-        [ -f "$RUNTIME_DIR/$e" ] || continue
-        while IFS= read -r tmpl; do
-          [ -n "$tmpl" ] || continue
-          tb="$(basename "$tmpl")"
-          echo "$c_tpl_basenames" | grep -xF "$tb" >/dev/null && return 0
-        done < <(daemon_template_names "$RUNTIME_DIR/$e")
-      done
-    fi
-    return 1
-  }
+  fi
+  return 1
+}
 
+# ga-n2jnsa: resolve the best AVAILABLE per-daemon starting point to walk
+# from when looking for the most recent commit that touches <label>'s own
+# closure — deliberately a LOOSER contract than the narrowing block's own
+# override-validity check below (which requires the override to sit
+# STRICTLY inside (PRE_DEPLOY_SHA, POST_DEPLOY_SHA], because narrowing only
+# ever wants a NARROWER window). Here an override OLDER than PRE_DEPLOY_SHA
+# is exactly the case worth walking from: it is the "stuck" signature this
+# story exists to fix (rig-wide marker advanced past the label's own last-
+# clean point, ga-49fwiw's unattributed-release path). Only two bars: the
+# value must be a real commit, and it must be an ancestor of POST_DEPLOY_SHA
+# (so base..POST is a well-formed range for `git rev-list` below). Falls
+# back to PRE_DEPLOY_SHA — today's implicit walk-from point — whenever no
+# override exists or it fails either bar, so a label with nothing recorded
+# yet behaves exactly as before this fix.
+ga0fawwr_freshness_base_sha() {  # ga0fawwr_freshness_base_sha <label> -> prints a sha
+  local label="$1" override_sha
+  override_sha="$(printf '%s\n' "$DAEMON_BASELINE_OVERRIDES" | awk -v l="$label" '$1==l{print $2; exit}')"
+  if [ -n "$override_sha" ] \
+     && git -C "$RUNTIME_DIR" cat-file -e "${override_sha}^{commit}" 2>/dev/null \
+     && git -C "$RUNTIME_DIR" merge-base --is-ancestor "$override_sha" "$POST_DEPLOY_SHA" 2>/dev/null; then
+    printf '%s' "$override_sha"
+  else
+    printf '%s' "$PRE_DEPLOY_SHA"
+  fi
+}
+
+# ga-n2jnsa: the epoch of the MOST RECENT commit in (<base_sha>,
+# POST_DEPLOY_SHA] whose changes actually hit <label>'s closure (reusing
+# ga0fawwr_label_hits's exact hit-test, single-commit at a time, newest
+# first via `git rev-list`) — the per-daemon replacement for "the tip of
+# whatever window happens to be under examination this cycle" that
+# already_fresh() used exclusively before this fix. Returns 1 (nothing
+# printed) when the range is empty or no single commit in it hits the
+# closure — the caller falls back to COMMIT_EPOCH, unchanged from today,
+# rather than ever guessing. The epoch found here is always <= COMMIT_EPOCH
+# (it names a commit at or before POST_DEPLOY_SHA), so swapping it in below
+# can only ever ADD true-fresh detections relative to the old COMMIT_EPOCH-
+# only comparison — the identical safety argument the COMMIT_EPOCH-vs-
+# DEPLOY_EPOCH comment above already established.
+ga0fawwr_daemon_closure_epoch() {  # ga0fawwr_daemon_closure_epoch <label> <base_sha> -> prints epoch, or nothing (return 1)
+  local label="$1" base_sha="$2" sha single_changed
+  [ "$base_sha" != "$POST_DEPLOY_SHA" ] || return 1
+  while IFS= read -r sha; do
+    [ -n "$sha" ] || continue
+    single_changed="$(git -C "$RUNTIME_DIR" diff --name-only "${sha}^" "$sha" 2>/dev/null || true)"
+    if ga0fawwr_label_hits "$label" "$single_changed"; then
+      git -C "$RUNTIME_DIR" show -s --format=%ct "$sha" 2>/dev/null
+      return 0
+    fi
+  done < <(git -C "$RUNTIME_DIR" rev-list "${base_sha}..${POST_DEPLOY_SHA}" 2>/dev/null)
+  return 1
+}
+
+# ga-n2jnsa: already_fresh()'s per-daemon floor, or nothing when it cannot
+# be determined (caller falls back to COMMIT_EPOCH — zero regression).
+ga0fawwr_daemon_floor_epoch() {  # ga0fawwr_daemon_floor_epoch <label> -> prints epoch, or nothing (return 1)
+  local label="$1" base_sha
+  base_sha="$(ga0fawwr_freshness_base_sha "$label")"
+  ga0fawwr_daemon_closure_epoch "$label" "$base_sha"
+}
+
+if [ -n "${DAEMON_BASELINE_OVERRIDES// /}" ] && [ -n "${AFFECTED// /}" ]; then
   NARROWED_AFFECTED=""
   for label in $AFFECTED; do
     # never reconsider a static always-restart override — see comment above.
@@ -2251,6 +2322,42 @@ PY
   done
   AFFECTED="$(echo "$NARROWED_AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
 fi
+
+# ── ga-n2jnsa: widen AFFECTED back to include still-"stuck" per-daemon
+# entries the wide window above no longer covers ──────────────────────────
+# The narrowing block above (ga-0fawwr) can only ever REMOVE a label from
+# AFFECTED; nothing until now could ever put one back. Once the rig-wide
+# marker (PRE_DEPLOY_SHA) advances past the commit that originally caused a
+# label's guarded/fresh-fail state (ga-49fwiw's unattributed-release path),
+# the wide Step 3 computation above stops seeing that trigger commit at
+# all, so the label never even reaches the narrowing block above — it just
+# silently disappears from AFFECTED, from the wide list, and from
+# consideration, with only its frozen .perdaemon record left behind
+# ("<label> <sha> stuck", ga-7polxu) as evidence anything is still wrong.
+#
+# Re-adding it here means the per-label loop below examines it again this
+# cycle exactly like any other AFFECTED label: already_fresh() (fixed below
+# to use a per-daemon commit floor instead of the wide window's tip) then
+# decides the actual outcome — still genuinely stale -> re-confirmed
+# GUARDED/FRESH_FAIL (stays visible, ACEITE 1), already restarted since the
+# real last-touching commit -> ALREADY_FRESH (clears on THIS sweep, ACEITE
+# 1's "dentro de 1 varredura"). Nothing here decides that itself; it only
+# ensures the label is examined at all. A widened-back label is not present
+# in AFFECTED_OWN (Step 3's own-file check never ran for it this cycle), so
+# classify_guarded() below files it under GUARDED_CLOSURE_ONLY by default —
+# a minor severity-display nuance, not a correctness gap this bead is
+# scoped to fix.
+for ga_n2jnsa_stuck_label in $(printf '%s\n' "$DAEMON_BASELINE_OVERRIDES" | awk '$3=="stuck"{print $1}'); do
+  case " $AFFECTED " in
+    *" $ga_n2jnsa_stuck_label "*) continue ;;  # already covered this cycle
+  esac
+  case " $FORCE_RESTART_LABELS " in
+    *" $ga_n2jnsa_stuck_label "*) continue ;;  # unrelated static-override path already handles this one
+  esac
+  AFFECTED="$AFFECTED $ga_n2jnsa_stuck_label"
+  log "ga-n2jnsa: $ga_n2jnsa_stuck_label widened back into AFFECTED — .perdaemon records it 'stuck' but the wide window ($PRE_DEPLOY_SHA..$POST_DEPLOY_SHA) no longer reaches its trigger commit; re-examining this cycle instead of letting it silently drop out."
+done
+AFFECTED="$(echo "$AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
 
 # wa-flysp (header point 16): keep AFFECTED_OWN in lockstep with any
 # per-daemon narrowing just above — a label downgraded OUT of AFFECTED (its
@@ -2320,11 +2427,19 @@ verify_fresh() {  # verify_fresh <label> -> 0 if a process started after DEPLOY_
 # assume verified outright. See header point 7 for why a file-mtime
 # comparison would be a different (and misleading) alternative.
 already_fresh() {  # already_fresh <label> -> 0/1; sets AFR_TIER on a 0 return
-  local label="$1" pid se
+  local label="$1" pid se floor_epoch
   pid="$(daemon_pid "$label")"
   [ -n "$pid" ] || return 1
   se="$(pid_start_epoch "$pid" || echo 0)"
-  [ -n "$se" ] && [ "$se" -gt "$COMMIT_EPOCH" ] 2>/dev/null || return 1
+  # ga-n2jnsa: prefer the per-daemon closure-touching commit's epoch over
+  # COMMIT_EPOCH (the tip of whatever window this cycle happens to examine)
+  # — see ga0fawwr_daemon_closure_epoch above for why this can only ever
+  # ADD true-fresh detections, never mask a real one. Falls back to
+  # COMMIT_EPOCH, unchanged from before this fix, whenever the per-daemon
+  # epoch cannot be determined (no AFFECTED context, no resolvable range).
+  floor_epoch="$(ga0fawwr_daemon_floor_epoch "$label" 2>/dev/null)"
+  case "$floor_epoch" in ''|*[!0-9]*) floor_epoch="$COMMIT_EPOCH" ;; esac
+  [ -n "$se" ] && [ "$se" -gt "$floor_epoch" ] 2>/dev/null || return 1
   if [ "$se" -gt "$DEPLOY_EPOCH" ] 2>/dev/null; then
     AFR_TIER="verified"
   else

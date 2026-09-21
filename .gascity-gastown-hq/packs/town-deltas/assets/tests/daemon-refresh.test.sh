@@ -3026,6 +3026,156 @@ OUT=$(run_helper README.md)
 echo "$OUT" | grep '^GUARDED_LOCKED_COSMETIC=$' >/dev/null && ok "T83 GUARDED_LOCKED_COSMETIC is present even when empty, on an OK verdict" || nok "T83 line" "present=$(echo "$OUT" | grep -c '^GUARDED_LOCKED_COSMETIC=')"
 [ "$(echo "$OUT" | grep '^JSON=' | sed 's/^JSON=//' | python3 -c 'import json,sys; print(json.load(sys.stdin).get("guarded_locked_cosmetic"))' 2>/dev/null)" = "[]" ] && ok "T83 trailing JSON carries guarded_locked_cosmetic: []" || nok "T83 json" "key missing or wrong"
 
+# ════════════════════════════════════════════════════════════════════════════
+# T84 (ga-n2jnsa): the actual regression this bead fixes -- a SENSITIVE
+# daemon's guarded/stuck state must not silently vanish from AFFECTED/GUARDED
+# just because the rig-wide marker (PRE_DEPLOY_SHA) advanced past the commit
+# that caused it (ga-49fwiw's unattributed-release path). Reproduces the
+# incident directly: C0 (base) -> C1 changes lib/shared.py (the real trigger
+# for com.test.stuck-sensitive, closure-covered via deploy_deps.json) -> C2
+# changes an unrelated lib/otherlib.py (com.test.other-sensitive's own
+# trigger, genuinely affected THIS cycle). The caller's rig-wide marker has
+# already advanced to C1 (PRE_DEPLOY_SHA=C1), so the wide diff(C1,C2) never
+# even sees lib/shared.py -- pre-fix, com.test.stuck-sensitive silently
+# drops out of AFFECTED and is never examined again. The caller recorded it
+# "stuck" at C0 (its last-clean point) in DAEMON_BASELINE_OVERRIDES, per
+# ga-7polxu's format. com.test.stuck-sensitive is seeded STILL genuinely
+# stale (never restarted) -- proves ACEITE 1's "permanece visível ... até
+# restart+prova" half. com.test.other-sensitive proves the fix does not
+# mask a real, freshly-affected sibling (same pairing T53 already
+# established for the narrowing half of this same mechanism).
+# ════════════════════════════════════════════════════════════════════════════
+new_case t84
+mkdir -p "$RUNTIME/lib"
+cat > "$RUNTIME/lib/shared.py" <<<'def v(): return 1'
+cat > "$RUNTIME/lib/otherlib.py" <<<'def v(): return 1'
+cat > "$RUNTIME/daemons/stuck_sensitive.py" <<'PYEOF'
+from lib import shared
+def index():
+    return shared.v()
+PYEOF
+cat > "$RUNTIME/daemons/other_sensitive.py" <<'PYEOF'
+from lib import otherlib
+def run():
+    return otherlib.v()
+PYEOF
+cat > "$RUNTIME/daemons/deploy_deps.json" <<'JSONEOF'
+{
+  "_generated_by": "scripts/gen_daemon_deps.py",
+  "daemons": {
+    "daemons/stuck_sensitive.py": {
+      "label": "com.test.stuck-sensitive",
+      "closure": ["daemons/stuck_sensitive.py", "lib/shared.py"]
+    },
+    "daemons/other_sensitive.py": {
+      "label": "com.test.other-sensitive",
+      "closure": ["daemons/other_sensitive.py", "lib/otherlib.py"]
+    }
+  }
+}
+JSONEOF
+make_plist "$AGENTS" com.test.stuck-sensitive "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/stuck_sensitive.py"
+make_plist "$AGENTS" com.test.other-sensitive "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/other_sensitive.py"
+STUCK_TRIGGER_EPOCH=$(( DEPLOY_EPOCH - 3600 ))
+NEVER_RESTARTED_LSTART="$(lstart_of $(( STUCK_TRIGGER_EPOCH - 3600 )) )"   # long before the trigger commit -- never restarted
+seed_running com.test.stuck-sensitive 84001 "$NEVER_RESTARTED_LSTART"
+seed_running com.test.other-sensitive 84002 "$STALE_LSTART"
+
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && git commit -q -m t84-base --allow-empty )
+SHA_C0=$(git -C "$RUNTIME" rev-parse HEAD)
+echo "def v(): return 2" > "$RUNTIME/lib/shared.py"
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && GIT_AUTHOR_DATE="@$STUCK_TRIGGER_EPOCH" GIT_COMMITTER_DATE="@$STUCK_TRIGGER_EPOCH" git commit -q -m t84-c1-trigger --allow-empty )
+SHA_C1=$(git -C "$RUNTIME" rev-parse HEAD)
+echo "def v(): return 2" > "$RUNTIME/lib/otherlib.py"
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && GIT_AUTHOR_DATE="@$POST_COMMIT_EPOCH" GIT_COMMITTER_DATE="@$POST_COMMIT_EPOCH" git commit -q -m t84-c2 --allow-empty )
+SHA_C2=$(git -C "$RUNTIME" rev-parse HEAD)
+
+SENSITIVE_DAEMONS="stuck-sensitive other-sensitive"
+OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" \
+  PRE_DEPLOY_SHA="$SHA_C1" POST_DEPLOY_SHA="$SHA_C2" \
+  DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" EXTRA_RUNTIME_ROOTS="" \
+  FORCE_RESTART_LABELS="" \
+  DAEMON_BASELINE_OVERRIDES="com.test.stuck-sensitive $SHA_C0 stuck" \
+  LAUNCH_AGENTS_DIR="$AGENTS" LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" \
+  VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 DRY_RUN=0 \
+  bash "$HELPER" 2>/dev/null); RC=$?
+SENSITIVE_DAEMONS=""
+echo "$(field GUARDED "$OUT")" | grep "com.test.stuck-sensitive" >/dev/null \
+  && ok "T84 stuck-sensitive widened back into GUARDED -- the wide window (C1..C2) no longer covers its trigger commit, but its .perdaemon 'stuck' record keeps it visible (ACEITE 1)" \
+  || nok "T84 stuck-sensitive should still be GUARDED" "GUARDED=[$(field GUARDED "$OUT")] AFFECTED=[$(field AFFECTED "$OUT")]"
+echo "$(field GUARDED "$OUT")" | grep "com.test.other-sensitive" >/dev/null \
+  && ok "T84 other-sensitive (no override, genuinely affected this cycle) still correctly GUARDED -- real staleness never masked" \
+  || nok "T84 other-sensitive should be GUARDED" "GUARDED=[$(field GUARDED "$OUT")]"
+[ "$(field VERDICT "$OUT")" = "NEEDS_GUARDED_RESTART" ] && ok "T84 verdict NEEDS_GUARDED_RESTART" || nok "T84 verdict" "$(field VERDICT "$OUT")"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T85 (ga-n2jnsa): a widened-back stuck daemon that WAS restarted after the
+# real commit that touches its closure (C1) -- but before this cycle's own
+# POST_DEPLOY_SHA (C2, an unrelated later commit) -- must clear within this
+# ONE sweep (ACEITE 1's "SAI dela dentro de 1 varredura depois de um
+# restart feito à mão após o último commit que toca o closure dele"). Same
+# C0/C1/C2 shape as T84, but the process start now sits strictly between
+# C1's commit epoch and C2's (== COMMIT_EPOCH): the OLD already_fresh()
+# (pid-start vs. COMMIT_EPOCH alone) would read this as still-stale --
+# unresolvable except by yet another commit landing to move COMMIT_EPOCH
+# forward, which is exactly the "label lit indefinitely" failure mode this
+# bead's own description warns about. The per-daemon floor (C1's epoch, not
+# C2's) is what lets a genuinely-resolved restart actually clear.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t85
+mkdir -p "$RUNTIME/lib"
+cat > "$RUNTIME/lib/shared.py" <<<'def v(): return 1'
+cat > "$RUNTIME/daemons/stuck_sensitive.py" <<'PYEOF'
+from lib import shared
+def index():
+    return shared.v()
+PYEOF
+cat > "$RUNTIME/daemons/deploy_deps.json" <<'JSONEOF'
+{
+  "_generated_by": "scripts/gen_daemon_deps.py",
+  "daemons": {
+    "daemons/stuck_sensitive.py": {
+      "label": "com.test.stuck-sensitive",
+      "closure": ["daemons/stuck_sensitive.py", "lib/shared.py"]
+    }
+  }
+}
+JSONEOF
+make_plist "$AGENTS" com.test.stuck-sensitive "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/stuck_sensitive.py"
+STUCK_TRIGGER_EPOCH=$(( DEPLOY_EPOCH - 3600 ))
+RESTARTED_AFTER_TRIGGER_LSTART="$(lstart_of $(( STUCK_TRIGGER_EPOCH + 60 )) )"   # after C1, before C2/DEPLOY_EPOCH
+seed_running com.test.stuck-sensitive 85001 "$RESTARTED_AFTER_TRIGGER_LSTART"
+
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && git commit -q -m t85-base --allow-empty )
+SHA_C0=$(git -C "$RUNTIME" rev-parse HEAD)
+echo "def v(): return 2" > "$RUNTIME/lib/shared.py"
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && GIT_AUTHOR_DATE="@$STUCK_TRIGGER_EPOCH" GIT_COMMITTER_DATE="@$STUCK_TRIGGER_EPOCH" git commit -q -m t85-c1-trigger --allow-empty )
+SHA_C1=$(git -C "$RUNTIME" rev-parse HEAD)
+# a genuine .py change (so Step 1's "no python source changed" early-exit
+# does not fire before this test's own machinery ever runs) that no
+# daemon's deploy_deps.json closure covers -- stays a real no-op for
+# com.test.stuck-sensitive's wide AFFECTED status, unlike T84's sibling.
+cat > "$RUNTIME/daemons/unrelated_standalone.py" <<<'def noop(): return None'
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && GIT_AUTHOR_DATE="@$POST_COMMIT_EPOCH" GIT_COMMITTER_DATE="@$POST_COMMIT_EPOCH" git commit -q -m t85-c2-unrelated --allow-empty )
+SHA_C2=$(git -C "$RUNTIME" rev-parse HEAD)
+
+SENSITIVE_DAEMONS="stuck-sensitive"
+OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" \
+  PRE_DEPLOY_SHA="$SHA_C1" POST_DEPLOY_SHA="$SHA_C2" \
+  DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" EXTRA_RUNTIME_ROOTS="" \
+  FORCE_RESTART_LABELS="" \
+  DAEMON_BASELINE_OVERRIDES="com.test.stuck-sensitive $SHA_C0 stuck" \
+  LAUNCH_AGENTS_DIR="$AGENTS" LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" \
+  VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 DRY_RUN=0 \
+  bash "$HELPER" 2>/dev/null); RC=$?
+SENSITIVE_DAEMONS=""
+echo "$(field GUARDED "$OUT")" | grep "com.test.stuck-sensitive" >/dev/null \
+  && nok "T85 stuck-sensitive must clear -- it was restarted after C1 (the real trigger), only an UNRELATED commit (C2) landed after" "GUARDED=[$(field GUARDED "$OUT")]" \
+  || ok "T85 stuck-sensitive correctly clears within one sweep after a restart following its own real last-touch commit"
+echo "$(field ALREADY_FRESH "$OUT")" | grep "com.test.stuck-sensitive" >/dev/null \
+  && ok "T85 stuck-sensitive reported via ALREADY_FRESH" \
+  || nok "T85 ALREADY_FRESH should include stuck-sensitive" "$(field ALREADY_FRESH "$OUT")"
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"
