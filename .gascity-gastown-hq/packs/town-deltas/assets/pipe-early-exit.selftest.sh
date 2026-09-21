@@ -20,10 +20,13 @@
 #      on every run — a second copy would not make it more deterministic).
 #   B. rebase_content_lost_paths (quality-gate-dispatcher.sh, THIS bead's own new
 #      finding) — the exact `git diff --name-only ... | head -20` idiom reliably
-#      SIGPIPEs (141, every time) against a real >150 KB diff; the `|| true` this
-#      bead added removes that abort while the truncated output stays identical;
-#      the full function, called end-to-end against the same fixture, returns the
-#      correct first-20-paths list.
+#      SIGPIPEs (141, every time) against a real >150 KB diff; the function's
+#      guard treats that specific code as success (truncated output stays
+#      identical) while any OTHER git-diff failure now surfaces this function's
+#      own `<could not compute: diff-failed rc=N>` sentinel instead of an empty
+#      string indistinguishable from "0 paths differ" (GATE-FEEDBACK on this
+#      bead's first submission flagged a bare `|| true` for reopening exactly
+#      that could-not-compute-vs-empty conflation — see ga-pgxs78).
 #   C. the 3 `--count=1` hardenings this bead added to pilot-dispatcher.sh
 #      (for-each-ref call sites) are present in the shipped source.
 #   D. the C11 detector (error-empty-conflation-scan.sh) exists, is wired into
@@ -134,10 +137,10 @@ FN3="$(extract_fn "$GD" rebase_content_lost_paths)"
 if [ -z "$FN1" ] || [ -z "$FN2" ] || [ -z "$FN3" ]; then
   bad "rebase_wt_git_dir / rebase_git_attributes_file / rebase_content_lost_paths: one or more not found in $GD"
 else
-  if ! printf '%s\n' "$FN3" | grep -qF '| head -20 || true'; then
-    bad "rebase_content_lost_paths no longer contains the expected '| head -20 || true' — did the fix get reverted or reworded?"
+  if ! printf '%s\n' "$FN3" | grep -qF '<could not compute: diff-failed rc='; then
+    bad "rebase_content_lost_paths no longer contains the diff-failed sentinel — did the rc-discriminating fix get reverted or reworded?"
   else
-    ok "rebase_content_lost_paths carries the shipped '|| true' guard"
+    ok "rebase_content_lost_paths carries the shipped diff-failed sentinel"
   fi
   full_out="$(
     ( set -euo pipefail
@@ -151,6 +154,31 @@ else
     ok "rebase_content_lost_paths end-to-end on the same >150 KB diff: rc=0, 20 paths returned"
   else
     bad "rebase_content_lost_paths end-to-end: expected rc=0 and 20 paths, got rc=$full_rc paths=$full_words stderr=$(head -c 300 "$TMPD/b2-stderr" 2>/dev/null)"
+  fi
+
+  # B3: the GATE-FEEDBACK case — a genuine (non-SIGPIPE) git-diff failure
+  # must surface the function's own sentinel, never an empty string that
+  # reads as "0 paths differ". Shadow `git` so ONLY the `diff` call inside
+  # rebase_content_lost_paths fails (rc=17, an arbitrary non-141 marker);
+  # every other git subcommand the function chain needs (rev-parse,
+  # merge-tree, show) has no "diff" argument and passes through untouched
+  # (verified above: rebase_wt_git_dir uses rev-parse, rebase_git_attributes_file
+  # uses show, and this function's own earlier calls use merge-tree/rev-parse).
+  sentinel_out="$(
+    ( set -euo pipefail
+      eval "$FN1"; eval "$FN2"; eval "$FN3"
+      git() {
+        for _a in "$@"; do [ "$_a" = "diff" ] && return 17; done
+        command git "$@"
+      }
+      rebase_content_lost_paths "$FIXTURE_REPO" "$MAIN_SHA" "$ORIG_TIP" "$NEW_TIP"
+    ) 2>"$TMPD/b3-stderr"
+  )"
+  sentinel_rc=$?
+  if [ "$sentinel_rc" -eq 0 ] && [ "$sentinel_out" = "<could not compute: diff-failed rc=17>" ]; then
+    ok "genuine (non-SIGPIPE) git-diff failure returns the diff-failed sentinel, not an empty/successful-looking result"
+  else
+    bad "expected rc=0 and '<could not compute: diff-failed rc=17>', got rc=$sentinel_rc out='$sentinel_out' stderr=$(head -c 300 "$TMPD/b3-stderr" 2>/dev/null)"
   fi
 fi
 
@@ -201,7 +229,23 @@ else
     # assertion; C11 findings are expected to persist. Bump this only after
     # triaging exactly what grew and confirming it is ALSO safe — never bump it
     # to silence a failure without reading the new finding first.
-    BASELINE=33
+    #
+    # Bumped to 34 (GATE-FEEDBACK fix-attempt, gate_run ga-fk9g4k): the C11
+    # scanner's own guard is purely textual — it skips any buffered statement
+    # containing a literal `||` (error-empty-conflation-scan.sh, C11AWK:
+    # `buf !~ /\|\|/`), which is why the OLD `| head -20 || true` line in
+    # rebase_content_lost_paths (quality-gate-dispatcher.sh) was never
+    # flagged. The gate's fix replaced that bare `|| true` (which masked
+    # genuine git-diff failures, not just SIGPIPE) with
+    # `if _diff_out=$(... | head -20); then` — a strictly SAFER shape (still
+    # immune to `set -e` because it is an if-condition, but now also branches
+    # on the real exit code instead of discarding it) that just happens to
+    # carry no literal `||` on its own line, so the scanner's heuristic now
+    # sees it as a new, unguarded-looking site. Triaged manually: it is safe
+    # by construction (see the function's own comment above the fix). Not
+    # fixing the scanner's `||`-only suppression heuristic here — that is a
+    # separate, shared-file change out of scope for this fix-attempt.
+    BASELINE=34
     # Third state, explicit: a `cd` failure here must never fall through to
     # comparing an empty string with `-le` (bash would throw "integer
     # expression expected" — a confusing crash, not a reported failure). Keep

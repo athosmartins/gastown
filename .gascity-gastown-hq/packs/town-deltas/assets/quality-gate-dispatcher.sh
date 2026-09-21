@@ -4538,10 +4538,36 @@ rebase_content_lost_paths() {
   # via a bare `_LOST_PATHS=$(rebase_content_lost_paths ... | tr ...)` —
   # a single-statement substitution, so that SIGPIPE's pipefail-elevated
   # exit code would otherwise abort the caller under set -e. The captured
-  # TEXT is unaffected either way (head's own output is always complete);
-  # only the exit code needs neutralizing, so `|| true` is correct here
-  # (this family carries no decision in the exit code — see ga-5lrhjm).
-  git --git-dir="$gd" diff --name-only "$actual" "$expected" 2>/dev/null | head -20 || true
+  # TEXT is unaffected either way (head's own output is always complete
+  # regardless of what happens to the writer once head has its 20 lines).
+  #
+  # GATE-FEEDBACK (gate_run ga-fk9g4k, this bead's first submission): a bare
+  # `|| true` here neutralizes EVERY git-diff failure, not just SIGPIPE/141
+  # — a genuine failure (pruned/missing object, worktree git-dir race, repo
+  # corruption) would silently become an empty result, indistinguishable
+  # from "diff succeeded, 0 paths differ". That is the exact could-not-
+  # compute-vs-empty conflation ga-pgxs78 (L4476-4483 above) measured as a
+  # real incident and hardened every OTHER early-return in this function
+  # against (no-gitdir / merge-tree-conflict / merge-tree-error / bad-sha,
+  # all above). Only 141 gets treated as success-equivalent; any other
+  # non-zero code gets this function's own sentinel instead, matching that
+  # established convention.
+  #
+  # The assignment is the condition of an `if` (not a bare statement) so
+  # `set -e` does not abort on the non-zero cases — that guard is still the
+  # point, just narrowed to the one code it was ever meant to cover.
+  local _diff_out _diff_rc
+  if _diff_out=$(git --git-dir="$gd" diff --name-only "$actual" "$expected" 2>/dev/null | head -20); then
+    _diff_rc=0
+  else
+    _diff_rc=$?
+  fi
+  if [ "$_diff_rc" -eq 0 ] || [ "$_diff_rc" -eq 141 ]; then
+    [ -n "$_diff_out" ] && printf '%s\n' "$_diff_out"
+    return 0
+  fi
+  echo "<could not compute: diff-failed rc=$_diff_rc>"
+  return 0
 }
 # SELFTEST-EXTRACT gate-rebase-content-verdict: END
 
