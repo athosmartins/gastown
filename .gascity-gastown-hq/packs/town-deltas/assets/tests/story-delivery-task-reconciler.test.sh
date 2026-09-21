@@ -42,7 +42,12 @@
 # bead) in origin/main and <shaB> outside it, keeps gate:failed/gate:needs-fix —
 # today they are erased."
 
-set -uo pipefail
+# No `pipefail` at file level (ga-uel7sb): assertions below are `X | grep ...`
+# -style pipes, and under pipefail an early-exiting reader can SIGPIPE the
+# writer mid-write, turning a PASSING assertion into a false FAIL under load
+# (measured: 1.9% per assertion at load 45; see ga-uel7sb). The block under
+# test still runs WITH pipefail (see run_block), as in production.
+set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DELIVERY="$SCRIPT_DIR/../story-delivery.sh"
@@ -136,7 +141,7 @@ run_block() {
 
   # Run block; capture TASK_COUNT (set inside block)
   local TASK_COUNT=0
-  ( eval "$BLOCK"; echo "TASK_COUNT=$TASK_COUNT" ) > "$T/out.txt" 2>&1
+  ( set -o pipefail; eval "$BLOCK"; echo "TASK_COUNT=$TASK_COUNT" ) > "$T/out.txt" 2>&1
   RUN_TASK_COUNT=$(grep '^TASK_COUNT=' "$T/out.txt" 2>/dev/null | tail -1 | sed 's/TASK_COUNT=//' || echo "0")
   LAST_BD="$(cat "$BD_LOG" 2>/dev/null || echo "")"
 

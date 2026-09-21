@@ -118,7 +118,13 @@
 # and a mock state dir, so the test touches NO real daemons. The plist scan and
 # the lstart→epoch date parse run for real.
 
-set -uo pipefail
+# No `pipefail` at file level (ga-uel7sb): assertions below are `X | grep ...`
+# -style pipes, and under pipefail an early-exiting reader can SIGPIPE the
+# writer mid-write, turning a PASSING assertion into a false FAIL under load
+# (measured: 1.9% per assertion at load 45; see ga-uel7sb). daemon-refresh.sh
+# under test runs as its own subprocess (bash "$HELPER"), with its own `set`
+# options — unaffected by this file's.
+set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPER="$SCRIPT_DIR/../daemon-refresh.sh"

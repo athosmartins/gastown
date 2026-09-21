@@ -54,7 +54,12 @@
 #     reached via Path A instead of Path B — proving the two paths behave
 #     identically now that both run the same probe.
 
-set -uo pipefail
+# No `pipefail` at file level (ga-uel7sb): assertions below are `X | grep ...`
+# -style pipes, and under pipefail an early-exiting reader can SIGPIPE the
+# writer mid-write, turning a PASSING assertion into a false FAIL under load
+# (measured: 1.9% per assertion at load 45; see ga-uel7sb). The block under
+# test still runs WITH pipefail (see run_block), as in production.
+set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DELIVERY="$SCRIPT_DIR/../story-delivery.sh"
@@ -167,7 +172,7 @@ EOF
   esac
   get_runbook_field() { echo "old-daemon new-daemon"; }
 
-  ( for _t in _once; do eval "$BLOCK"; done ) >/dev/null 2>&1
+  ( set -o pipefail; for _t in _once; do eval "$BLOCK"; done ) >/dev/null 2>&1
   RUN_RC=$?
   LOG_OUT="$(cat "$LOG_FILE" 2>/dev/null || true)"
   BD_CALLS="$(cat "$BD_LOG" 2>/dev/null || true)"

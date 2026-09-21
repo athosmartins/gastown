@@ -32,7 +32,13 @@
 # specific shape can no longer happen, and S1 proves the escalated story goes
 # quiet afterward instead of continuing to accumulate noise.
 
-set -euo pipefail
+# No `pipefail` at file level (ga-uel7sb): assertions below are `X | grep ...`
+# -style pipes, and under pipefail an early-exiting reader can SIGPIPE the
+# writer mid-write, turning a PASSING assertion into a false FAIL under load
+# (measured: 1.9% per assertion at load 45; see ga-uel7sb). `-e` is unrelated
+# to that race and stays. Both blocks under test (Step 3 and the skip guard)
+# still run WITH pipefail, as in production.
+set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DELIVERY="$SCRIPT_DIR/../story-delivery.sh"
@@ -88,7 +94,7 @@ run_step3() {
   fi
 
   # Wrap in a for-loop so the block's `continue` (loop-based halt) is valid.
-  ( for _t in _once; do eval "$STEP3_BLOCK"; done ) >/dev/null 2>&1
+  ( set -o pipefail; for _t in _once; do eval "$STEP3_BLOCK"; done ) >/dev/null 2>&1
   LAST_BD="$(cat "$BD_LOG" 2>/dev/null || true)"
   LAST_GC="$(cat "$GC_LOG" 2>/dev/null || true)"
   unset -f get_runbook_field bd gc log warn err
@@ -158,7 +164,7 @@ run_skip_guard() {
   log() { :; }
   local STORY_ID="ga-test"
   local STORY_LABELS="$LABELS"
-  ( for _t in _once; do eval "$SKIP_BLOCK"; touch "$REACHED_MARKER"; done ) >/dev/null 2>&1
+  ( set -o pipefail; for _t in _once; do eval "$SKIP_BLOCK"; touch "$REACHED_MARKER"; done ) >/dev/null 2>&1
   LAST_BD="$(cat "$BD_LOG" 2>/dev/null || true)"
   REACHED_AFTER=0
   [ -f "$REACHED_MARKER" ] && REACHED_AFTER=1

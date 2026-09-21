@@ -27,7 +27,14 @@
 # assignment (story_merge_verdict returns rc1 on 2 of its 3 outcomes). Keeping
 # -e here is what makes S2/S3 below an honest proof instead of a false green.
 
-set -euo pipefail
+# No `pipefail` at file level (ga-uel7sb, on top of gate-fix-attempt-2 above):
+# assertions below are `X | grep ...`-style pipes, and under pipefail an
+# early-exiting reader can SIGPIPE the writer mid-write, turning a PASSING
+# assertion into a false FAIL under load (measured: 1.9% per assertion at
+# load 45; see ga-uel7sb). `-e` stays (see above — it is load-bearing here).
+# The block under test still runs WITH pipefail (see run_block), as in
+# production.
+set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DELIVERY="$SCRIPT_DIR/../story-delivery.sh"
@@ -93,7 +100,7 @@ run_block() {
   local STORY='{"assignee":"crew/tester","created_by":"tester"}'
 
   # Wrap in a for-loop so the block's `continue` (loop-based halt) is valid.
-  ( for _t in _once; do eval "$BLOCK"; done ) >/dev/null 2>&1
+  ( set -o pipefail; for _t in _once; do eval "$BLOCK"; done ) >/dev/null 2>&1
   RUN_RC=$?
   LAST_BD="$(cat "$BD_LOG"  2>/dev/null || true)"
   LAST_GC="$(cat "$GC_LOG"  2>/dev/null || true)"

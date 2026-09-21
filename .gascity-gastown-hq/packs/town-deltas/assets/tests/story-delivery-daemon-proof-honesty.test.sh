@@ -37,7 +37,11 @@
 #      wording that says a locked daemon is still on old code — never "may still
 #      be dormant", never "verified in prod".
 
-set -uo pipefail
+# No `pipefail` at file level (ga-uel7sb, on top of ga-j3lh6p's here-string
+# fix below): removing it here closes any OTHER pipe site the here-string
+# swap didn't touch, not just the grep -q ones. The block under test still
+# runs WITH pipefail (see run_block), as in production.
+set -u
 
 # ga-j3lh6p (flake fix): every assertion below used to be `echo "$LAST_BD" | grep
 # -q pat`. Under `set -o pipefail` that is a SIGPIPE race: macOS BUFSIZ is 1024,
@@ -93,7 +97,7 @@ run_block() {
   local PROD_TEST_SCRIPT="/tmp/fake-prod-test.sh"
   local REFRESH_PROOF="$proof"
 
-  ( for _t in _once; do eval "$BLOCK"; done ) >/dev/null 2>&1
+  ( set -o pipefail; for _t in _once; do eval "$BLOCK"; done ) >/dev/null 2>&1
   RUN_RC=$?
   LAST_BD="$(cat "$BD_LOG" 2>/dev/null || true)"
   rm -rf "$T"

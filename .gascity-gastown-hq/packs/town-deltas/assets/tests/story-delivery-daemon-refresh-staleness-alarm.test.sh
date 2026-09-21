@@ -33,7 +33,13 @@
 #     a clean no-op (no crash under this script's set -euo pipefail, no false
 #     alarm) — the realistic day-to-day shape the [ -f ] guard exists for.
 
-set -uo pipefail
+# No `pipefail` at file level (ga-uel7sb): assertions below are `X | grep ...`
+# -style pipes, and under pipefail an early-exiting reader can SIGPIPE the
+# writer mid-write, turning a PASSING assertion into a false FAIL under load
+# (measured: 1.9% per assertion at load 45; see ga-uel7sb). Both places below
+# that run the block (run_block, and T3's inline re-run) still run it WITH
+# pipefail, as in production.
+set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DELIVERY="$SCRIPT_DIR/../story-delivery.sh"
@@ -85,7 +91,7 @@ run_block() {
 
   local DRY_RUN="$dry_run"
 
-  ( for _t in _once; do eval "$BLOCK"; done ) >/dev/null 2>&1
+  ( set -o pipefail; for _t in _once; do eval "$BLOCK"; done ) >/dev/null 2>&1
 
   GC_CALLS="$(cat "$GC_CALLS_FILE" 2>/dev/null || true)"
   LOG_CONTENT="$(cat "$LOG_FILE" 2>/dev/null || true)"
@@ -134,7 +140,7 @@ warn() { echo "WARN: $*" >> "$LOG_FILE"; }
 err()  { echo "ERR: $*" >> "$LOG_FILE"; }
 export -f gc log warn err 2>/dev/null || true
 DRY_RUN=0
-( for _t in _once; do eval "$BLOCK"; done ) >/dev/null 2>&1
+( set -o pipefail; for _t in _once; do eval "$BLOCK"; done ) >/dev/null 2>&1
 GC_CALLS="$(cat "$GC_CALLS_FILE" 2>/dev/null || true)"
 rm -rf "$T"
 [ -z "$GC_CALLS" ] \

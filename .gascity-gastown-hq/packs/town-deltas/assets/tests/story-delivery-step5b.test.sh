@@ -10,7 +10,12 @@
 # This covers the bead-mutation / escalation wiring that the daemon-refresh unit
 # tests deliberately do not touch.
 
-set -uo pipefail
+# No `pipefail` at file level (ga-uel7sb): assertions below are `X | grep ...`
+# -style pipes, and under pipefail an early-exiting reader can SIGPIPE the
+# writer mid-write, turning a PASSING assertion into a false FAIL under load
+# (measured: 1.9% per assertion at load 45; see ga-uel7sb). The block under
+# test still runs WITH pipefail (see run_block), as in production.
+set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DELIVERY="$SCRIPT_DIR/../story-delivery.sh"
@@ -72,7 +77,7 @@ EOF
   # for-loop (matches story-delivery-staleness.test.sh) so the block's
   # `continue` — a real loop-continue in production's per-story sweep
   # (story-delivery.sh:473 `while IFS= read -r STORY`) — is valid here too.
-  ( for _t in _once; do eval "$BLOCK"; done ) >/dev/null 2>&1
+  ( set -o pipefail; for _t in _once; do eval "$BLOCK"; done ) >/dev/null 2>&1
   RUN_RC=$?
   LAST_BD="$(cat "$BD_LOG" 2>/dev/null || true)"
   LAST_GC="$(cat "$GC_LOG" 2>/dev/null || true)"

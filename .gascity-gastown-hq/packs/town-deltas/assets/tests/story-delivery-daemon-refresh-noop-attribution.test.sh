@@ -86,7 +86,13 @@
 #     C3's harmless file, and wrongly exempt a story whose own earlier commit
 #     really did cause the staleness. Runs strict.
 
-set -uo pipefail
+# No `pipefail` at file level (ga-uel7sb): assertions below are `X | grep ...`
+# -style pipes, and under pipefail an early-exiting reader can SIGPIPE the
+# writer mid-write, turning a PASSING assertion into a false FAIL under load
+# (measured: 1.9% per assertion at load 45; see ga-uel7sb). The block under
+# test still runs WITH pipefail (both the `strict` and default branches
+# below), as in production.
+set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DELIVERY="$SCRIPT_DIR/../story-delivery.sh"
@@ -329,7 +335,7 @@ EOF
     # for any test that exercises the new fallback's guard chain.
     ( set -euo pipefail; for _t in _once; do eval "$BLOCK"; touch "$T/reached.marker"; done ) >/dev/null 2>&1
   else
-    ( for _t in _once; do eval "$BLOCK"; touch "$T/reached.marker"; done ) >/dev/null 2>&1
+    ( set -o pipefail; for _t in _once; do eval "$BLOCK"; touch "$T/reached.marker"; done ) >/dev/null 2>&1
   fi
   RUN_RC=$?
   LOG_OUT="$(cat "$LOG_FILE" 2>/dev/null || true)"

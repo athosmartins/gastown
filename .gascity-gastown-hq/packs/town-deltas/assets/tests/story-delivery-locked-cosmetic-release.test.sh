@@ -43,7 +43,12 @@
 # T7  (control): the cosmetic line names a label that is NOT the stale one ->
 #     still held (every stale label must be covered, by name).
 
-set -uo pipefail
+# No `pipefail` at file level (ga-uel7sb): assertions below are `X | grep ...`
+# -style pipes, and under pipefail an early-exiting reader can SIGPIPE the
+# writer mid-write, turning a PASSING assertion into a false FAIL under load
+# (measured: 1.9% per assertion at load 45; see ga-uel7sb). The block under
+# test still runs WITH pipefail (see run_block), as in production.
+set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DELIVERY="$SCRIPT_DIR/../story-delivery.sh"
@@ -297,7 +302,7 @@ EOF
 
   # Read the block's own conclusions out of the subshell — the state the story
   # leaves this block in is what Step 6/8 then act on.
-  ( for _t in _once; do eval "$BLOCK"; done
+  ( set -o pipefail; for _t in _once; do eval "$BLOCK"; done
     echo "STATE=${BEAD_REPROBE_STATE:-<unset>} PROOF=${REFRESH_PROOF:-<unset>}" > "$VARS_FILE" ) >/dev/null 2>&1
   RUN_RC=$?
   LOG_OUT="$(cat "$LOG_FILE" 2>/dev/null || true)"
