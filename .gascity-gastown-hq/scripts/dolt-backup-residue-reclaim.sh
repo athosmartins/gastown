@@ -206,6 +206,17 @@ _should_release_residue() {
 # nested inside "$(...)" mis-parses under bash 3.2 when it contains an
 # apostrophe — this script's heredoc has none, but the file-redirect shape
 # sidesteps the question entirely rather than relying on that).
+#
+# ga-6xo4r0: a PER-DB run_utc (databases.<db>.run_utc — written by an ad hoc
+# single-db fingerprint refresh, see dolt-backup-reseed.sh's own
+# _publish_db_fingerprint) takes priority over the shared top-level run_utc
+# (written once a day, for every db at once, by dolt-s3-backup.sh). An ad
+# hoc reseed only ever touches ONE db, so it can only ever prove freshness
+# for that db's own entry — bumping the shared top-level field instead would
+# falsely vouch for every OTHER db too. Falls back to the top-level field
+# whenever the per-db one is absent (every fingerprint published before this
+# change, and every sibling db an ad hoc reseed didn't touch), so untouched
+# entries parse EXACTLY as before — fully backward compatible.
 _parse_fingerprint_to_file() {
   local json_file="$1" db="$2" out_file="$3"
   "$PY" - "$json_file" "$db" > "$out_file" 2>/dev/null <<'PY'
@@ -219,7 +230,13 @@ try:
 except Exception:
     sys.exit(0)
 
-run_utc = data.get("run_utc")
+entry = (data.get("databases") or {}).get(db)
+if not isinstance(entry, dict):
+    sys.exit(0)
+
+run_utc = entry.get("run_utc")
+if not isinstance(run_utc, str):
+    run_utc = data.get("run_utc")
 if not isinstance(run_utc, str):
     sys.exit(0)
 try:
@@ -228,9 +245,6 @@ except Exception:
     sys.exit(0)
 run_epoch = int(dt.timestamp())
 
-entry = (data.get("databases") or {}).get(db)
-if not isinstance(entry, dict):
-    sys.exit(0)
 size_str = entry.get("backup_size")
 if not isinstance(size_str, str):
     sys.exit(0)

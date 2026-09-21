@@ -80,6 +80,34 @@
 # liberação nem bastaria (livre + antigo ainda < 120% do vivo), o script
 # recusa exatamente como antes -- apagar o antigo sem conseguir reconstruir
 # o novo não ajudaria em nada.
+#
+# ═══ PUBLICAÇÃO DO FINGERPRINT APÓS TROCA (ga-6xo4r0) ═══
+#
+# dolt-backup-residue-reclaim.sh só libera um .old residue depois que o
+# fingerprint publicado em S3 (_meta/latest.json) prova, via generation
+# check, que o backup ATUAL (o que substituiu esse .old) foi sincronizado ao
+# S3 DEPOIS da troca. Até esta bead, o ÚNICO publicador desse fingerprint
+# era dolt-s3-backup.sh, uma vez por dia (04:00) — o que é ótimo para uma
+# troca feita DENTRO desse mesmo run diário, mas deixa um buraco de até 24h
+# para uma troca feita por um chamador AD HOC fora desse horário
+# (dolt-disk-floor-guard.sh, ao detectar disco CRITICAL): o .old fica
+# perfeitamente saudável e verificado localmente, mas invisível ao
+# residue-reclaim até o próximo 04:00 — medido ao vivo 2026-09-21,
+# whatsapp_automation.old foi reaproveitado 4x num único dia, cada vez
+# empurrando sua elegibilidade mais um dia adiante (ver ga-6xo4r0).
+#
+# Todo swap bem-sucedido abaixo (modo normal OU modo de baixo disco) agora
+# chama _publish_after_swap -> _publish_db_fingerprint: sincroniza o backup
+# recém-promovido para S3 e MESCLA uma entrada com timestamp PRÓPRIO deste
+# db em _meta/latest.json, sem tocar nas entradas dos outros dbs (nunca
+# sobrescreve o arquivo inteiro — ver o comentário de _publish_db_fingerprint
+# para o porquê). dolt-backup-residue-reclaim.sh's _parse_fingerprint_to_file
+# prefere esse timestamp por-db ao timestamp compartilhado do topo do
+# arquivo quando presente, com fallback total para o comportamento antigo
+# quando ausente (100% retrocompatível). Best-effort e nunca fatal: uma
+# falha aqui não desfaz a troca local já verificada, só atrasa a prova
+# off-box (mesma janela de até 24h de antes, não uma regressão). Escape
+# hatch: RESEED_PUBLISH_FINGERPRINT=0.
 set -uo pipefail
 
 # shellcheck disable=SC1091
@@ -90,6 +118,25 @@ set -uo pipefail
 # e _size_coherent). LIB mode só define funções/variáveis, não varre nem apaga nada.
 # shellcheck disable=SC1091
 DOLT_BACKUP_RESIDUE_RECLAIM_LIB=1 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dolt-backup-residue-reclaim.sh"
+
+# ga-6xo4r0 / ga-tyaozh: aws-cli/botocore defaults to wrapping every S3
+# PutObject/UploadPart body in botocore.httpchecksum.AwsChunkedWrapper (a
+# chunked-transfer trailing checksum). On a dropped connection, botocore's
+# retry tries to rewind that wrapper; when the rewind raises, botocore
+# surfaces UnseekableStreamError ("stream is not seekable") and ABANDONS the
+# retry instead of completing it — this hit hq's daily backup for real on
+# 2026-09-21 and cascaded into a city-wide disk-pressure outage (see
+# dolt-s3-backup.sh's own identical export for the full incident writeup).
+# dolt-s3-backup.sh already exports this for its OWN uploads, and a child
+# process (this script, invoked via its RESEED_SCRIPT call) inherits it —
+# but this script's OTHER caller, dolt-disk-floor-guard.sh's ad hoc CRITICAL
+# trigger, does NOT set it. Since ga-6xo4r0 gives THIS script its own S3
+# upload call sites (_publish_db_fingerprint's sync + fingerprint cp, below)
+# that did not exist when ga-tyaozh's fix was written, this script must
+# export it independently rather than rely on inheriting it from one caller
+# only — exported unconditionally (harmless no-op re-export when already
+# inherited from dolt-s3-backup.sh) so every caller is covered.
+export AWS_REQUEST_CHECKSUM_CALCULATION=when_required
 
 DB="${1:-}"
 CITY="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
@@ -121,6 +168,22 @@ LOW_DISK_MARGIN_PCT="${RESEED_LOW_DISK_MARGIN_PCT:-120}"
 # Escape hatch: 0 desliga o modo de baixo disco inteiro e volta ao
 # comportamento antigo (recusa quando a margem normal não cabe, ponto final).
 RESEED_ALLOW_LOW_DISK="${RESEED_ALLOW_LOW_DISK:-1}"
+# ga-6xo4r0: bound on the post-swap "aws s3 sync" _publish_db_fingerprint
+# runs so residue-reclaim can see THIS swap's proof without waiting for
+# dolt-s3-backup.sh's next once-a-day run — up to 24h away for a db an ad
+# hoc, disk-pressure-triggered reseed touched outside that schedule (see
+# this file's own header link for the full gap this closes). Matches
+# dolt-s3-backup.sh's own S3_TIMEOUT (1200s) for the same per-db off-box
+# mirror step.
+RESEED_S3_SYNC_TIMEOUT_SECS="${RESEED_S3_SYNC_TIMEOUT_SECS:-1200}"
+# Escape hatch: 0 skips the post-swap S3 sync + fingerprint refresh
+# entirely, reverting to the pre-ga-6xo4r0 behavior (swap only; residue-
+# reclaim only sees this db's proof at the next dolt-s3-backup.sh run) —
+# same shape as RESEED_ALLOW_LOW_DISK above, for an operator to disable
+# without a code change if this step ever misbehaves in prod. Never affects
+# the swap itself, which has already succeeded and been verified by the
+# time this step runs either way.
+RESEED_PUBLISH_FINGERPRINT="${RESEED_PUBLISH_FINGERPRINT:-1}"
 DOLT_BIN="${DOLT_BIN:-dolt}"
 GC_BIN="${GC_BIN:-gc}"
 # ga-o3nqy2: wiring for the shared server-free sync (dolt-offline-backup-sync.sh).
@@ -185,6 +248,129 @@ _s3_current_backup_verified() {
 
   log "prova S3 (modo de baixo disco) para '$db': manifest_ok=$manifest_ok size_ok=$size_ok (fingerprint=${size_bytes:-?}B local=${local_bytes:-?}B run_epoch=${run_epoch:-?} head=${head:-?})"
   [ "$manifest_ok" = "1" ] && [ "$size_ok" = "1" ]
+}
+
+# _publish_db_fingerprint <db> <local_dir> <issues> — ga-6xo4r0: syncs
+# <local_dir> (the JUST-PROMOTED, already restore-verified backup for <db>)
+# to S3, then MERGES a fresh, per-db-timestamped entry for <db> into
+# s3://$BUCKET/_meta/latest.json — leaving every OTHER db's entry (including
+# its own run_utc) untouched. This is what lets an ad hoc reseed (triggered
+# by dolt-disk-floor-guard.sh at CRITICAL, outside dolt-s3-backup.sh's once-
+# a-day 04:00 schedule) prove S3 freshness for JUST the db it touched,
+# instead of leaving a perfectly healthy .old residue stuck until the next
+# scheduled run (up to 24h) — see this file's own header link for the full
+# mechanism this closes.
+#
+# ═══ WHY MERGE, NEVER OVERWRITE ═══
+# The published file's databases.<db> entries are the ONLY proof residue-
+# reclaim has for EVERY db in the city, not just this one. Overwriting the
+# whole file with a doc that only describes <db> would ERASE every other
+# db's proof and stall their reclaim until the next daily run — a real (if
+# self-healing) availability regression this function must never cause. So:
+# fetch the CURRENT doc first, and if that fetch fails for ANY reason
+# (network, auth, doesn't parse as a JSON object) — ABORT, publish nothing,
+# return 1. Leaving THIS db's own gap open one more cycle (self-healing:
+# retried on the next successful reseed, ad hoc or daily) is always safer
+# than clobbering everyone else's proof to close it sooner.
+#
+# <issues> is informational only (never read back by
+# _parse_fingerprint_to_file's run_epoch/size_bytes extraction, same as the
+# existing "head" field) — best-effort, never blocks the publish.
+#
+# Returns 0 (synced + published) or 1 (sync, fetch, parse, or upload
+# failed) — ALWAYS non-fatal to the caller (_publish_after_swap below): the
+# local swap/promotion this runs after has ALREADY succeeded and been
+# verified (restored + row-count-checked). A failure here only means the
+# OFF-BOX proof is delayed, never that the LOCAL backup itself is in doubt.
+_publish_db_fingerprint() {
+  local db="$1" local_dir="$2" issues="$3"
+
+  if ! timeout "$RESEED_S3_SYNC_TIMEOUT_SECS" "$AWS" s3 sync "$local_dir/" "s3://$BUCKET/$db/" --delete --only-show-errors; then
+    log "publish-fingerprint: ${db} — aws s3 sync FAILED; not publishing a fingerprint that would claim S3 content it doesn't have"
+    return 1
+  fi
+
+  local fp_file merged_file
+  fp_file="$(mktemp "${TMPDIR:-/tmp}/dolt-publish-fp.XXXXXX" 2>/dev/null)" || { log "publish-fingerprint: ${db} — could not create temp file for fetch"; return 1; }
+  merged_file="$(mktemp "${TMPDIR:-/tmp}/dolt-publish-merged.XXXXXX" 2>/dev/null)" || { rm -f "$fp_file"; log "publish-fingerprint: ${db} — could not create temp file for merge"; return 1; }
+
+  if ! timeout "$AWS_TIMEOUT_SECS" "$AWS" s3 cp "s3://$BUCKET/_meta/latest.json" "$fp_file" >/dev/null 2>&1; then
+    log "publish-fingerprint: ${db} — could not fetch current _meta/latest.json; ABORTING publish (never clobber other dbs' proof with a partial doc)"
+    rm -f "$fp_file" "$merged_file"
+    return 1
+  fi
+
+  local backup_size_human
+  backup_size_human="$(du -sh "$local_dir" 2>/dev/null | awk '{print $1}')"
+  [ -n "$backup_size_human" ] || backup_size_human="0B"
+  local run_utc; run_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  if ! "$PY" - "$fp_file" "$db" "$run_utc" "$backup_size_human" "$issues" > "$merged_file" 2>/dev/null <<'PY'
+import sys, json
+
+fp_path, db, run_utc, backup_size, issues = sys.argv[1:6]
+try:
+    with open(fp_path) as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("top-level JSON is not an object")
+except Exception:
+    sys.exit(1)
+
+if not isinstance(data.get("databases"), dict):
+    data["databases"] = {}
+
+try:
+    issues_n = int(issues)
+except Exception:
+    issues_n = -1
+
+# Merge: replace ONLY this db's entry. Every sibling key in "databases",
+# and every other top-level key (including the shared "run_utc"), passes
+# through untouched.
+data["databases"][db] = {"issues": issues_n, "backup_size": backup_size, "run_utc": run_utc}
+json.dump(data, sys.stdout, indent=2)
+PY
+  then
+    log "publish-fingerprint: ${db} — fetched _meta/latest.json did not parse as a JSON object; ABORTING publish (never clobber)"
+    rm -f "$fp_file" "$merged_file"
+    return 1
+  fi
+  rm -f "$fp_file"
+
+  if ! timeout "$AWS_TIMEOUT_SECS" "$AWS" s3 cp "$merged_file" "s3://$BUCKET/_meta/latest.json" --only-show-errors >/dev/null 2>&1; then
+    log "publish-fingerprint: ${db} — upload of merged _meta/latest.json FAILED"
+    rm -f "$merged_file"
+    return 1
+  fi
+  rm -f "$merged_file"
+  log "publish-fingerprint: ${db} — OK (run_utc=${run_utc} size=${backup_size_human}), merged into _meta/latest.json without touching other dbs' entries"
+  return 0
+}
+
+# _publish_after_swap <db> <backup_dir> <issues> — ga-6xo4r0: thin wrapper
+# _run_reseed calls from EVERY successful swap/promotion branch below
+# (normal mode AND low-disk mode alike — reseed itself has no way to know
+# whether dolt-s3-backup.sh's daily cron or dolt-disk-floor-guard.sh's ad
+# hoc CRITICAL trigger called it, and running this unconditionally is
+# correct/safe either way). See _publish_db_fingerprint above for the
+# actual mechanism and its own safety reasoning.
+#
+# Escape hatch: RESEED_PUBLISH_FINGERPRINT=0 skips this step entirely.
+#
+# Best-effort and NEVER fatal: logs the outcome either way, never touches
+# the caller's exit code — the swap this runs after already succeeded.
+_publish_after_swap() {
+  local db="$1" backup_dir="$2" issues="$3"
+  if [ "$RESEED_PUBLISH_FINGERPRINT" != "1" ]; then
+    log "S3 fingerprint refresh SKIPPED for '$db' (RESEED_PUBLISH_FINGERPRINT=0)"
+    return 0
+  fi
+  if _publish_db_fingerprint "$db" "$backup_dir" "$issues"; then
+    log "S3 fingerprint refresh OK for '$db' — residue-reclaim can see this swap once its settle window clears"
+  else
+    log "S3 fingerprint refresh FAILED for '$db' (non-fatal — local backup already verified and promoted; this db's .old stays spared until a future reseed or daily run succeeds at publishing)"
+  fi
 }
 
 # _run_reseed <db> — todo o mecanismo (preflights, construção, verificação,
@@ -387,6 +573,7 @@ _run_reseed() {
     fi
     local NEW_SIZE; NEW_SIZE=$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
     log "trocado (modo de baixo disco — sem período de .old, antigo já liberado com prova do S3). novo=$NEW_SIZE ($NEW_FILES arquivos)"
+    _publish_after_swap "$DB" "$BACKUP_DIR" "$RESTORED_COUNT"
     log "=== re-seed de '$DB' concluído com sucesso (modo de baixo disco) ==="
     exit 0
   fi
@@ -417,6 +604,7 @@ _run_reseed() {
   # automatismo errar em silêncio. O ganho já está garantido: o novo está no
   # lugar e verificado.
   log "antigo preservado em $OLD_DIR — remova à mão quando estiver confortável, ou deixe o residue-reclaim liberar quando o S3 confirmar."
+  _publish_after_swap "$DB" "$BACKUP_DIR" "$RESTORED_COUNT"
   log "=== re-seed de '$DB' concluído com sucesso ==="
   exit 0
 }

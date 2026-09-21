@@ -129,6 +129,39 @@ JSON
 rm -f "$FIX_JSON" "$FIX_OUT"
 
 echo ""
+echo "── _parse_fingerprint_to_file() — per-db run_utc precedence (ga-6xo4r0) ──"
+FIX_JSON="$(mktemp)"; FIX_OUT="$(mktemp)"
+cat > "$FIX_JSON" <<'JSON'
+{
+  "run_utc": "2020-01-01T00:00:00Z",
+  "databases": {
+    "adhoc": {"issues": 5, "backup_size": "10M", "run_utc": "2026-09-21T15:30:00Z"},
+    "untouched": {"issues": 9, "backup_size": "20M"},
+    "corrupt": {"issues": 1, "backup_size": "1M", "run_utc": "not-a-timestamp"}
+  }
+}
+JSON
+
+: > "$FIX_OUT"; _parse_fingerprint_to_file "$FIX_JSON" "adhoc" "$FIX_OUT"
+if [ "$(cat "$FIX_OUT")" = "$(printf '1790004600\t10485760\t')" ]; then
+  ok "entry WITH its own run_utc → uses the PER-DB timestamp, not the stale shared top-level one"
+else
+  bad "per-db run_utc should have taken precedence: got '$(cat "$FIX_OUT")'"
+fi
+
+: > "$FIX_OUT"; _parse_fingerprint_to_file "$FIX_JSON" "untouched" "$FIX_OUT"
+if [ "$(cat "$FIX_OUT")" = "$(printf '1577836800\t20971520\t')" ]; then
+  ok "entry WITHOUT its own run_utc → falls back to the shared top-level one (backward compatible, sibling of an ad hoc-touched db unaffected)"
+else
+  bad "fallback to top-level run_utc broken: got '$(cat "$FIX_OUT")'"
+fi
+
+: > "$FIX_OUT"; _parse_fingerprint_to_file "$FIX_JSON" "corrupt" "$FIX_OUT"
+[ -s "$FIX_OUT" ] && bad "a PRESENT but malformed per-db run_utc must fail closed, not silently substitute the top-level value, got '$(cat "$FIX_OUT")'" || ok "malformed per-db run_utc → empty output (fails closed, never silently guesses)"
+
+rm -f "$FIX_JSON" "$FIX_OUT"
+
+echo ""
 echo "── _reclaim_one_residue() — stubbed aws/notify, real rm against a throwaway fixture ──"
 echo "   (dolt-s3-backup.sh's own _reseed_staging_if_enabled test uses this exact shape:"
 echo "    fake binaries + a real function call, never the real AWS/notify.)"

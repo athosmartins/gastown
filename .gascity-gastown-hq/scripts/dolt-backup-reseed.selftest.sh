@@ -67,6 +67,19 @@ else
   exit 1
 fi
 
+# ga-6xo4r0 / ga-tyaozh: this script now has its OWN S3 upload call sites
+# (_publish_db_fingerprint's sync + fingerprint cp), so it must export the
+# same AwsChunkedWrapper/UnseekableStreamError workaround dolt-s3-backup.sh
+# exports for ITS uploads — independently, since dolt-disk-floor-guard.sh's
+# ad hoc CRITICAL trigger (this bead's whole reason for existing) invokes
+# this script directly, without going through dolt-s3-backup.sh at all. See
+# dolt-s3-backup.selftest.sh's own identical check for the full incident.
+if [ "${AWS_REQUEST_CHECKSUM_CALCULATION:-}" = "when_required" ]; then
+  ok "AWS_REQUEST_CHECKSUM_CALCULATION=when_required after lib-mode source"
+else
+  bad "AWS_REQUEST_CHECKSUM_CALCULATION not 'when_required' after lib-mode source (got '${AWS_REQUEST_CHECKSUM_CALCULATION:-<unset>}') — this script's NEW S3 upload call sites are UNPROTECTED against the ga-tyaozh AwsChunkedWrapper defect when invoked ad hoc (i.e. NOT as a dolt-s3-backup.sh child)"
+fi
+
 LOCALDIR="$LIB_SCRATCH/local-backup-hq"
 mkdir -p "$LOCALDIR"
 dd if=/dev/zero of="$LOCALDIR/data.bin" bs=1M count=10 >/dev/null 2>&1
@@ -179,19 +192,50 @@ esac
 DOLTEOF
   chmod +x "$root/bin/dolt"
 
-  # fake aws: same contract as Part 1's stub above.
+  # fake aws: same contract as Part 1's stub above, PLUS (ga-6xo4r0):
+  #  - "s3 sync" (the new post-swap off-box mirror in _publish_db_fingerprint)
+  #    records its invocation to ./s3-sync.log (relative to $root, since
+  #    run_scenario always `cd`s there first) and succeeds by default, or
+  #    fails when FAKE_S3_SYNC_FAIL=1.
+  #  - "s3 cp ... _meta/latest.json" DOWNLOAD (arg $3 is the s3:// URI):
+  #    unchanged canned single-db-doc behavior UNLESS FAKE_S3_META_SEED_FILE
+  #    points at a file, in which case THAT file's content is served instead
+  #    — lets a scenario seed a multi-db doc to prove the merge-publish
+  #    preserves sibling entries.
+  #  - "s3 cp ... _meta/latest.json" UPLOAD (arg $4 is the s3:// URI — the
+  #    NEW direction _publish_db_fingerprint needs, to write the merged doc
+  #    back): captures the uploaded content to ./s3-meta-uploaded.json.
   cat > "$root/bin/aws" <<'AWSEOF'
 #!/bin/bash
 case "$*" in
   *"s3api head-object"*)
     [ "${FAKE_AWS_MANIFEST_OK:-1}" = "1" ] && exit 0 || exit 254
     ;;
+  *"s3 sync"*)
+    echo "$*" >> ./s3-sync.log
+    printf '%s\n' "${AWS_REQUEST_CHECKSUM_CALCULATION:-<unset>}" >> ./s3-sync-checksum-env.log
+    [ "${FAKE_S3_SYNC_FAIL:-0}" = "1" ] && exit 1 || exit 0
+    ;;
   *"s3 cp"*"_meta/latest.json"*)
-    [ "${FAKE_AWS_FINGERPRINT_OK:-1}" = "1" ] || exit 1
-    dest="${@: -1}"
-    printf '{"run_utc": "%s", "databases": {"%s": {"backup_size": "%s", "head": "abc123"}}}' \
-      "${FAKE_FP_RUN_UTC:-2026-09-17T04:00:00Z}" "${FAKE_FP_DB:-hq}" "${FAKE_FP_SIZE:-20M}" > "$dest"
-    exit 0
+    case "$3" in
+      s3://*)
+        # DOWNLOAD: aws s3 cp s3://.../_meta/latest.json <local-dest>
+        dest="$4"
+        if [ -n "${FAKE_S3_META_SEED_FILE:-}" ] && [ -f "${FAKE_S3_META_SEED_FILE:-}" ]; then
+          cp "$FAKE_S3_META_SEED_FILE" "$dest"
+          exit 0
+        fi
+        [ "${FAKE_AWS_FINGERPRINT_OK:-1}" = "1" ] || exit 1
+        printf '{"run_utc": "%s", "databases": {"%s": {"backup_size": "%s", "head": "abc123"}}}' \
+          "${FAKE_FP_RUN_UTC:-2026-09-17T04:00:00Z}" "${FAKE_FP_DB:-hq}" "${FAKE_FP_SIZE:-20M}" > "$dest"
+        exit 0
+        ;;
+      *)
+        # UPLOAD: aws s3 cp <local-src> s3://.../_meta/latest.json [flags]
+        cp "$3" ./s3-meta-uploaded.json
+        exit 0
+        ;;
+    esac
     ;;
   *) exit 0 ;;
 esac
@@ -371,6 +415,171 @@ if [ "$RC" -ne 0 ]; then ok "scenario 5 (low-disk disabled via RESEED_ALLOW_LOW_
 if grep -q "modo de baixo disco desabilitado" "$ROOT5/out.log" 2>/dev/null; then ok "scenario 5: escape hatch correctly disables the new path"; else bad "scenario 5: escape hatch message missing"; fi
 if [ -e "$ROOT5/city/.dolt-backup/hq.new" ] || [ -e "$ROOT5/city/.dolt-backup/hq.old" ]; then bad "scenario 5: nothing should have been touched with the escape hatch on"; else ok "scenario 5: nothing touched with the escape hatch on"; fi
 rm -rf "$ROOT5" 2>/dev/null
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Part 3 (ga-6xo4r0): post-swap S3 sync + per-db fingerprint publish — the
+# fix for "S3 backup fingerprint (once/day) can be outpaced by ad hoc
+# disk-pressure reseeds, silently freezing residue-reclaim for healthy dbs".
+# ═══════════════════════════════════════════════════════════════════════════
+echo "── post-swap fingerprint publish (ga-6xo4r0) — stubbed aws, real subprocess ──"
+
+# ── Scenario 9 (THE regression test for this bead): ad hoc reseed for 'hq'
+#    with an EXISTING multi-db _meta/latest.json already on "S3" (seeded via
+#    FAKE_S3_META_SEED_FILE) whose hq entry is STALE (yesterday) and whose
+#    sibling 'otherdb' entry is untouched. Proves three things: (1) the swap
+#    triggers a real S3 sync of the promoted backup, (2) the merge refreshes
+#    ONLY hq's own entry, byte-for-byte preserving otherdb's, and (3) feeding
+#    what actually got published into residue-reclaim's OWN gate
+#    (_should_release_residue) now says RELEASE for hq — not just that the
+#    settle window cleared, the actual eligibility clock this bead is about.
+ROOT9="/tmp/reseed-selftest-s9.$$"
+setup_scenario "$ROOT9" 5 5 200
+cat > "$ROOT9/seed-meta.json" <<'JSON'
+{
+  "run_utc": "2026-09-20T04:00:00Z",
+  "databases": {
+    "hq": {"issues": 999, "backup_size": "999M", "run_utc": "2026-09-20T04:00:00Z"},
+    "otherdb": {"issues": 42, "backup_size": "7M", "run_utc": "2026-09-20T04:00:00Z"}
+  }
+}
+JSON
+run_scenario "$ROOT9" FAKE_LIVE_COUNT=50 FAKE_RESTORED_COUNT=50 FAKE_S3_META_SEED_FILE="$ROOT9/seed-meta.json"
+if [ "$RC" -eq 0 ]; then ok "scenario 9 (ad hoc reseed + fingerprint publish): exits 0"; else bad "scenario 9: expected exit 0, got $RC — $(tail -5 "$ROOT9/out.log")"; fi
+if [ -d "$ROOT9/city/.dolt-backup/hq.old" ]; then ok "scenario 9: normal swap still produces .old (unchanged)"; else bad "scenario 9: expected .old to exist"; fi
+if grep -qF "s3://urblink-dolt-backups/hq/" "$ROOT9/s3-sync.log" 2>/dev/null; then ok "scenario 9: the promoted backup was actually synced to S3 (the off-box mirror this bead's fix adds)"; else bad "scenario 9: missing the expected 'aws s3 sync' call to hq's S3 prefix"; fi
+if [ "$(cat "$ROOT9/s3-sync-checksum-env.log" 2>/dev/null)" = "when_required" ]; then ok "scenario 9: the real child 'aws s3 sync' subprocess (this bead's NEW upload call site) inherits AWS_REQUEST_CHECKSUM_CALCULATION=when_required (ga-tyaozh protection)"; else bad "scenario 9: child aws subprocess did not see AWS_REQUEST_CHECKSUM_CALCULATION=when_required (saw '$(cat "$ROOT9/s3-sync-checksum-env.log" 2>/dev/null)') — this NEW upload call site is unprotected against the ga-tyaozh defect"; fi
+if grep -q "S3 fingerprint refresh OK" "$ROOT9/out.log" 2>/dev/null; then ok "scenario 9: publish logged as OK"; else bad "scenario 9: missing the fingerprint-refresh-OK log line"; fi
+if [ -f "$ROOT9/s3-meta-uploaded.json" ]; then ok "scenario 9: a merged _meta/latest.json was actually uploaded"; else bad "scenario 9: no fingerprint was uploaded at all"; fi
+
+python3 - "$ROOT9/seed-meta.json" "$ROOT9/s3-meta-uploaded.json" > "$ROOT9/merge-check.log" 2>&1 <<'PYCHECK'
+import json, sys
+seed_path, uploaded_path = sys.argv[1], sys.argv[2]
+with open(seed_path) as f:
+    seed = json.load(f)
+with open(uploaded_path) as f:
+    uploaded = json.load(f)
+
+ok = True
+if uploaded.get("databases", {}).get("otherdb") != seed["databases"]["otherdb"]:
+    print("FAIL: otherdb entry was NOT preserved byte-for-byte by the merge — got", uploaded.get("databases", {}).get("otherdb"))
+    ok = False
+else:
+    print("PASS: otherdb entry preserved untouched by the merge (never clobbered by an ad hoc reseed of a DIFFERENT db)")
+
+hq = uploaded.get("databases", {}).get("hq")
+if not isinstance(hq, dict) or not hq.get("run_utc"):
+    print("FAIL: hq entry missing or has no run_utc in the uploaded doc:", hq)
+    ok = False
+elif hq.get("run_utc") == seed["databases"]["hq"]["run_utc"]:
+    print("FAIL: hq's run_utc was not refreshed — still the stale seeded value", hq.get("run_utc"))
+    ok = False
+else:
+    print("PASS: hq's run_utc was refreshed to a fresh value (" + hq.get("run_utc") + "), distinct from the stale seeded one")
+
+sys.exit(0 if ok else 1)
+PYCHECK
+cat "$ROOT9/merge-check.log"
+while read -r line; do
+  case "$line" in "PASS:"*) PASS=$((PASS+1)) ;; "FAIL:"*) FAIL=$((FAIL+1)) ;; esac
+done < "$ROOT9/merge-check.log"
+
+# The actual bug this bead is about: feed what got published into
+# residue-reclaim's OWN gate and confirm it now says release. Fabricates an
+# .old mtime STRICTLY before the published run_epoch and a "now" comfortably
+# past the settle window — proving the GATE logic accepts this fix's own
+# output deterministically, without depending on real wall-clock timing
+# inside a fast hermetic test (where old_mtime and run_epoch could otherwise
+# legitimately land in the same wall-clock second).
+( DOLT_BACKUP_RESIDUE_RECLAIM_LIB=1 . "$HERE/dolt-backup-residue-reclaim.sh"
+  FP_OUT="$(mktemp)"
+  _parse_fingerprint_to_file "$ROOT9/s3-meta-uploaded.json" "hq" "$FP_OUT"
+  IFS="$(printf '\t')" read -r run_epoch size_bytes head < "$FP_OUT"
+  rm -f "$FP_OUT"
+  if [ -z "$run_epoch" ]; then
+    echo "  FAIL: scenario 9: published fingerprint for hq did not parse (empty run_epoch)"
+  else
+    fabricated_old_mtime=$(( run_epoch - 1 ))
+    fabricated_now=$(( run_epoch + 7200 + 10 ))
+    if _should_release_residue "$fabricated_old_mtime" "$fabricated_now" 7200 "$run_epoch" 1 1; then
+      echo "  PASS: scenario 9: residue-reclaim's OWN gate (_should_release_residue), fed this fix's published fingerprint, now says RELEASE for hq's .old — the actual bug this bead is about is closed"
+    else
+      echo "  FAIL: scenario 9: _should_release_residue still says spare even with this fix's own fresh fingerprint — gap not closed"
+    fi
+  fi
+) > "$ROOT9/gate-check.log" 2>&1
+cat "$ROOT9/gate-check.log"
+grep -q "^  PASS:" "$ROOT9/gate-check.log" && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+rm -rf "$ROOT9" 2>/dev/null
+
+# ── Scenario 10 (ga-6xo4r0): the NEW post-swap S3 sync fails — must NEVER
+#    unwind or fail the already-verified LOCAL swap (this bead's own
+#    framing: "should a post-swap S3 failure unwind an already-verified
+#    local promotion? almost certainly not"). Only the OFF-BOX proof is
+#    delayed; the local backup itself is never in doubt.
+ROOT10="/tmp/reseed-selftest-s10.$$"
+setup_scenario "$ROOT10" 5 5 200
+run_scenario "$ROOT10" FAKE_LIVE_COUNT=50 FAKE_RESTORED_COUNT=50 FAKE_S3_SYNC_FAIL=1
+if [ "$RC" -eq 0 ]; then ok "scenario 10 (post-swap S3 sync fails): LOCAL swap still exits 0"; else bad "scenario 10: expected exit 0 (local swap succeeded regardless), got $RC — $(tail -5 "$ROOT10/out.log")"; fi
+if [ -d "$ROOT10/city/.dolt-backup/hq.old" ]; then ok "scenario 10: .old still produced normally — the swap is unaffected by the S3 failure"; else bad "scenario 10: swap should be unaffected by an S3 sync failure"; fi
+if grep -q "aws s3 sync FAILED" "$ROOT10/out.log" 2>/dev/null; then ok "scenario 10: sync failure logged distinctly"; else bad "scenario 10: missing the sync-failed log line"; fi
+if grep -q "S3 fingerprint refresh FAILED" "$ROOT10/out.log" 2>/dev/null; then ok "scenario 10: non-fatal outcome logged (self-healing, retried on a future reseed)"; else bad "scenario 10: missing the non-fatal outcome log line"; fi
+if [ -e "$ROOT10/s3-meta-uploaded.json" ]; then bad "scenario 10: fingerprint should never have been fetched/uploaded once the sync itself failed"; else ok "scenario 10: correctly never attempted the fingerprint fetch/merge after the sync failed"; fi
+rm -rf "$ROOT10" 2>/dev/null
+
+# ── Scenario 11 (ga-6xo4r0): the S3 sync succeeds but FETCHING the current
+#    _meta/latest.json (to merge into) fails — must ABORT the publish
+#    entirely rather than upload a partial doc that would erase every other
+#    db's proof. Local swap still succeeds regardless (same non-fatal
+#    contract as scenario 10).
+ROOT11="/tmp/reseed-selftest-s11.$$"
+setup_scenario "$ROOT11" 5 5 200
+run_scenario "$ROOT11" FAKE_LIVE_COUNT=50 FAKE_RESTORED_COUNT=50 FAKE_AWS_FINGERPRINT_OK=0
+if [ "$RC" -eq 0 ]; then ok "scenario 11 (fingerprint fetch fails): LOCAL swap still exits 0"; else bad "scenario 11: expected exit 0, got $RC — $(tail -5 "$ROOT11/out.log")"; fi
+if grep -q "could not fetch current _meta/latest.json" "$ROOT11/out.log" 2>/dev/null; then ok "scenario 11: fetch failure logged distinctly"; else bad "scenario 11: missing the fetch-failed log line"; fi
+if [ -e "$ROOT11/s3-meta-uploaded.json" ]; then bad "scenario 11: NEVER upload a partial doc when the current one couldn't be fetched — this would clobber every other db's proof"; else ok "scenario 11: correctly aborted BEFORE any upload — no sibling db's proof was put at risk"; fi
+rm -rf "$ROOT11" 2>/dev/null
+
+# ── Scenario 12 (ga-6xo4r0): RESEED_PUBLISH_FINGERPRINT=0 → the whole new
+#    step is skipped, reverting to the pre-fix behavior (swap only) — same
+#    escape-hatch shape as RESEED_ALLOW_LOW_DISK.
+ROOT12="/tmp/reseed-selftest-s12.$$"
+setup_scenario "$ROOT12" 5 5 200
+run_scenario "$ROOT12" FAKE_LIVE_COUNT=50 FAKE_RESTORED_COUNT=50 RESEED_PUBLISH_FINGERPRINT=0
+if [ "$RC" -eq 0 ]; then ok "scenario 12 (kill switch on): exits 0"; else bad "scenario 12: expected exit 0, got $RC"; fi
+if [ -d "$ROOT12/city/.dolt-backup/hq.old" ]; then ok "scenario 12: swap still happens normally"; else bad "scenario 12: swap should be unaffected by the kill switch"; fi
+if grep -q "S3 fingerprint refresh SKIPPED" "$ROOT12/out.log" 2>/dev/null; then ok "scenario 12: escape hatch correctly logs SKIPPED"; else bad "scenario 12: missing the SKIPPED log line"; fi
+if [ -e "$ROOT12/s3-sync.log" ] || [ -e "$ROOT12/s3-meta-uploaded.json" ]; then bad "scenario 12: kill switch should prevent ANY sync/publish call"; else ok "scenario 12: correctly made zero sync/publish calls with the kill switch on"; fi
+rm -rf "$ROOT12" 2>/dev/null
+
+echo ""
+echo "── drift-guard: dolt-backup-reseed.sh wires _publish_after_swap into BOTH swap branches (ga-6xo4r0) ──"
+if [ "$(grep -c '_publish_after_swap "\$DB" "\$BACKUP_DIR" "\$RESTORED_COUNT"' "$SCRIPT")" = "2" ]; then
+  ok "_publish_after_swap is called from exactly the two successful-swap branches (normal + low-disk) — wiring is live, not dead code"
+else
+  bad "_publish_after_swap call count in the live script is not 2 — wiring changed or regressed"
+fi
+
+echo ""
+echo "── drift-guard: AWS_REQUEST_CHECKSUM_CALCULATION export precedes both new upload call sites (ga-6xo4r0 / ga-tyaozh) ──"
+EXPORT_LINE=$(grep -nF 'export AWS_REQUEST_CHECKSUM_CALCULATION=when_required' "$SCRIPT" | head -1 | cut -d: -f1)
+if [ -z "$EXPORT_LINE" ]; then
+  bad "export AWS_REQUEST_CHECKSUM_CALCULATION=when_required line not found in live script at all"
+else
+  ok "export line present in live script (line $EXPORT_LINE)"
+  for marker in \
+    '"$AWS" s3 sync "$local_dir/" "s3://$BUCKET/$db/"' \
+    '"$AWS" s3 cp "$merged_file" "s3://$BUCKET/_meta/latest.json"' \
+  ; do
+    CALL_LINE=$(grep -nF "$marker" "$SCRIPT" | head -1 | cut -d: -f1)
+    if [ -z "$CALL_LINE" ]; then
+      bad "drift-guard: upload call site not found (script changed shape?): $marker"
+    elif [ "$CALL_LINE" -gt "$EXPORT_LINE" ]; then
+      ok "drift-guard: upload call at line $CALL_LINE comes after the export (line $EXPORT_LINE): $marker"
+    else
+      bad "drift-guard: upload call at line $CALL_LINE comes BEFORE the export (line $EXPORT_LINE) — unprotected: $marker"
+    fi
+  done
+fi
 
 # ── drift-guard: dolt-s3-backup.sh actually wires the new classifiers/counter ──
 echo "── drift-guard: dolt-s3-backup.sh wiring (ga-i99qsp) ──"
