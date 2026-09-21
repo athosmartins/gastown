@@ -19,7 +19,7 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
 
 echo "=== dolt-backup-status.selftest.sh ==="
 
-for fn in _status_age_human _status_one_copy _status_kb_human _status_report_db; do
+for fn in _status_age_human _status_one_copy _status_kb_human _status_report_db _status_mtime_date _status_mtime_age; do
   type "$fn" >/dev/null 2>&1 && ok "$fn defined by lib-mode source" \
     || { bad "$fn NOT defined — lib mode broken"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="; exit 1; }
 done
@@ -31,6 +31,21 @@ echo "── _status_age_human() ──"
 [ "$(_status_age_human 90000)" = "1d1h" ] && ok "90000s -> 1d1h" || bad "90000s -> $(_status_age_human 90000), expected 1d1h"
 [ "$(_status_age_human "")" = "?" ] && ok "empty seconds -> ? (fail-closed formatting, never a fake 0m)" || bad "empty seconds did not format as ?"
 [ "$(_status_age_human "x")" = "?" ] && ok "non-numeric seconds -> ?" || bad "non-numeric seconds did not format as ?"
+
+# ── _status_mtime_date() / _status_mtime_age() — fail-closed on empty mtime ──
+# (the actual bug this audit sweep found and fixed: an empty mtime used to
+# default to epoch 0 / "now", producing a confident-looking WRONG date/age
+# instead of "?". These two guard that regression directly.)
+echo "── _status_mtime_date() / _status_mtime_age() (fail-closed on empty mtime) ──"
+REAL_EPOCH=1758000000  # an arbitrary real-looking epoch, NOT 0 and NOT "now"
+[ "$(_status_mtime_date "$REAL_EPOCH")" != "?" ] && ok "real epoch formats to a real date, not ?" \
+  || bad "real epoch incorrectly formatted as ?"
+[ "$(_status_mtime_date "")" = "?" ] && ok "empty mtime -> ? (NOT epoch-0's 1970 date — the actual bug this sweep fixed)" \
+  || bad "empty mtime -> '$(_status_mtime_date "")', expected ? (would silently show a fake 1970 date)"
+[ "$(_status_mtime_age "$REAL_EPOCH" $((REAL_EPOCH + 3661)))" = "1h1m" ] \
+  && ok "real epoch + now=+3661s -> 1h1m" || bad "real epoch age computed wrong: $(_status_mtime_age "$REAL_EPOCH" $((REAL_EPOCH + 3661)))"
+[ "$(_status_mtime_age "" 1758003661)" = "?" ] && ok "empty mtime -> ? (NOT 'now'=0m — the actual bug this sweep fixed)" \
+  || bad "empty mtime age -> '$(_status_mtime_age "" 1758003661)', expected ? (would silently show a fake 0m-ago)"
 
 # ── _status_kb_human() — pure formatting ─────────────────────────────────────
 echo "── _status_kb_human() ──"

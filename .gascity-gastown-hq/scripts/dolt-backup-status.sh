@@ -73,6 +73,23 @@ _status_one_copy() {
   printf '%s\t%s\t%s\n' "${size_kb:-}" "${mtime:-}" "$manifest"
 }
 
+# _status_mtime_date <epoch|""> — formatted date, or "?" if epoch is empty
+# or unparseable. Deliberately does NOT default an empty epoch to 0 before
+# formatting: date -r 0 succeeds and prints a real-looking 1970 date, which
+# would silently pass off "mtime unreadable" as "mtime is the Unix epoch" —
+# a confident wrong answer standing in for "don't know".
+_status_mtime_date() {
+  [ -n "$1" ] && date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '?'
+}
+
+# _status_mtime_age <epoch|""> <now_epoch> — "?" if epoch is empty (same
+# reasoning as above: defaulting to "$now" would silently report an unknown
+# mtime as "0m ago", a confident wrong answer, not an unknown one).
+_status_mtime_age() {
+  [ -n "$1" ] || { printf '?'; return; }
+  _status_age_human "$(( $2 - $1 ))"
+}
+
 _status_kb_human() {
   local kb="$1"
   case "$kb" in ''|*[!0-9]*) printf '?'; return ;; esac
@@ -110,30 +127,28 @@ _status_report_db() {
     rc=1
   elif [ "$p_manifest" = "AUSENTE" ]; then
     printf '%s: PRIMARY %s mtime=%s MANIFEST=AUSENTE — NAO E UM BACKUP VALIDO (sync interrompido; nao restaura), mesmo sendo o de nome/mtime mais \xe2\x80\x9cobvio\xe2\x80\x9d\n' \
-      "$db" "$(_status_kb_human "$p_size")" "$(date -r "${p_mtime:-0}" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '?')"
+      "$db" "$(_status_kb_human "$p_size")" "$(_status_mtime_date "$p_mtime")"
     rc=1
   else
     printf '%s: PRIMARY %s mtime=%s MANIFEST=OK\n' \
-      "$db" "$(_status_kb_human "$p_size")" "$(date -r "${p_mtime:-0}" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '?')"
+      "$db" "$(_status_kb_human "$p_size")" "$(_status_mtime_date "$p_mtime")"
   fi
 
   local n_size n_mtime n_manifest
   IFS="$(printf '\t')" read -r n_size n_mtime n_manifest <<< "$new_line"
   if [ -n "$n_manifest" ]; then
-    local age; age="$(_status_age_human "$(( now - ${n_mtime:-$now} ))")"
     printf '    .new RESIDUO %s mtime=%s (%s atras) MANIFEST=%s%s\n' \
-      "$(_status_kb_human "$n_size")" "$(date -r "${n_mtime:-0}" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '?')" \
-      "$age" "$n_manifest" \
+      "$(_status_kb_human "$n_size")" "$(_status_mtime_date "$n_mtime")" \
+      "$(_status_mtime_age "$n_mtime" "$now")" "$n_manifest" \
       "$([ "$n_manifest" = "OK" ] && [ "$p_manifest" = "AUSENTE" ] && printf ' <- ESTE presta, o PRIMARY acima nao' || true)"
   fi
 
   local o_size o_mtime o_manifest
   IFS="$(printf '\t')" read -r o_size o_mtime o_manifest <<< "$old_line"
   if [ -n "$o_manifest" ]; then
-    local age; age="$(_status_age_human "$(( now - ${o_mtime:-$now} ))")"
     printf '    .old residuo (normal — reseed nunca apaga sozinho; aguarda residue-reclaim com prova do S3) %s mtime=%s (%s atras) MANIFEST=%s\n' \
-      "$(_status_kb_human "$o_size")" "$(date -r "${o_mtime:-0}" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '?')" \
-      "$age" "$o_manifest"
+      "$(_status_kb_human "$o_size")" "$(_status_mtime_date "$o_mtime")" \
+      "$(_status_mtime_age "$o_mtime" "$now")" "$o_manifest"
   fi
 
   # .new residue is the genuinely anomalous case worth the strong warning —
