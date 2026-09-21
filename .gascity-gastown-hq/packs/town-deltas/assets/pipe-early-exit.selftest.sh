@@ -10,14 +10,20 @@
 # the full triage note.
 #
 # This file proves, against the REAL production script (not fixtures):
-#   A. the historical ga-8w22n regression suite (pilot-dispatcher-branch-detection-
-#      race.selftest.sh) still exists and still passes — NOT re-implemented here.
-#      That file already extracts and load-tests the exact 3 functions this bead's
-#      --count=1 hardening touches (_beadid_has_branch, _beadid_has_crew_branch,
-#      _beadid_matched_crew_branch_ref) against a synthetic multi-thousand-ref repo;
-#      duplicating its fixture here would be the same maintenance burden for zero
-#      new coverage (its own header notes the race is probabilistic, not guaranteed
-#      on every run — a second copy would not make it more deterministic).
+#   A. the 3 REAL functions this bead's --count=1 hardening touches
+#      (_filter_built ~L4279, _crew_progressed_since ~L5538,
+#      _beadid_needs_remerge_branch ~L5867) survive a genuine SIGPIPE race
+#      against tens of thousands of matching refs, dynamically. This is NOT
+#      the historical ga-8w22n regression suite's 3 functions
+#      (_beadid_has_branch, _beadid_has_crew_branch,
+#      _beadid_matched_crew_branch_ref) — a DIFFERENT, older trio in the same
+#      file. An earlier draft of this section cited that suite as already
+#      covering this bead's 3 functions; it does not (GATE-FEEDBACK on
+#      fix-attempt 2 caught the false citation — verified by grep: that
+#      suite never mentions _filter_built, _crew_progressed_since, or
+#      _beadid_needs_remerge_branch). That suite is still run below, but
+#      honestly, as an unrelated regression guard for its own 3 functions —
+#      not as coverage for this bead's diff.
 #   B. rebase_content_lost_paths (quality-gate-dispatcher.sh, THIS bead's own new
 #      finding) — the exact `git diff --name-only ... | head -20` idiom reliably
 #      SIGPIPEs (141, every time) against a real >150 KB diff; the function's
@@ -48,14 +54,123 @@ extract_fn() { awk -v n="$2" '$0 ~ "^"n"\\(\\) *\\{" {f=1} f {print} f && /^}/ {
 TMPD="$(mktemp -d)"
 trap 'rm -rf "$TMPD"' EXIT
 
-echo "── A. ga-8w22n regression suite (pilot-dispatcher-branch-detection-race.selftest.sh) ──"
+echo "── A0. ga-8w22n regression suite (pilot-dispatcher-branch-detection-race.selftest.sh) — unrelated, older 3 functions, run here only as a standing regression guard ──"
 RACE_SUITE="$SELF_DIR/pilot-dispatcher-branch-detection-race.selftest.sh"
 if [ ! -f "$RACE_SUITE" ]; then
-  bad "pilot-dispatcher-branch-detection-race.selftest.sh is missing — the ga-8w22n regression guard for the 3 for-each-ref functions this bead also hardened is gone"
+  bad "pilot-dispatcher-branch-detection-race.selftest.sh is missing — the ga-8w22n regression guard (a different, older 3-function trio in this file) is gone"
 elif bash "$RACE_SUITE" >"$TMPD/race-suite.log" 2>&1; then
-  ok "pilot-dispatcher-branch-detection-race.selftest.sh still passes ($(tail -1 "$TMPD/race-suite.log"))"
+  ok "pilot-dispatcher-branch-detection-race.selftest.sh (ga-8w22n, unrelated functions) still passes ($(tail -1 "$TMPD/race-suite.log"))"
 else
   bad "pilot-dispatcher-branch-detection-race.selftest.sh FAILED — see $TMPD/race-suite.log: $(tail -5 "$TMPD/race-suite.log" | tr '\n' ' ')"
+fi
+
+PD="$SELF_DIR/pilot-dispatcher.sh"
+RUNS_A=15
+
+# Shared synthetic repo for the 3 REAL for-each-ref --count=1 sites this bead
+# added. Two ref families, one per matched glob shape, all pointing at the
+# same fresh commit (so any match trivially satisfies "exists" / "progressed
+# since epoch 1"). 15000 refs per family: the shortest format used below
+# (%(committerdate:unix), ~11 bytes/line) needs tens of thousands of lines to
+# clear the ~140 KB macOS pipe-buffer threshold ga-5lrhjm measured as the
+# point an unguarded early-exit reader SIGPIPEs the writer 100% of the time;
+# 15000 clears that for every format exercised here (%(refname),
+# %(refname:short), %(committerdate:unix) alike), matching the order of
+# magnitude the ga-8w22n suite above already calibrated for this same OS/pipe
+# mechanism (it needed 3000 full-path lines; ours are shorter per-line, so it
+# takes more of them).
+A_ID="ga-a11racetarget"
+A_CREW="racecrew-a11"
+A_REPO="$TMPD/repo-a"
+git init -q "$A_REPO"
+git -C "$A_REPO" config user.email t@t.invalid
+git -C "$A_REPO" config user.name selftest
+git -C "$A_REPO" commit -q --allow-empty -m init
+A_SHA=$(git -C "$A_REPO" rev-parse HEAD)
+{
+  for i in $(seq 1 15000); do
+    printf 'create refs/heads/fix/%s-%05d %s\n' "$A_ID" "$i" "$A_SHA"
+  done
+  for i in $(seq 1 15000); do
+    printf 'create refs/heads/crew/%s/%05d %s\n' "$A_CREW" "$i" "$A_SHA"
+  done
+} | git -C "$A_REPO" update-ref --stdin
+
+echo ""
+echo "── A1. _filter_built's exact for-each-ref idiom (~L4279): --count=1 removes the SIGPIPE race the old head-1-only shape had ──"
+OLD_RC=0
+( set -euo pipefail
+  git -C "$A_REPO" for-each-ref --format='%(refname)' \
+    "refs/remotes/origin/crew/*/$A_ID" "refs/heads/crew/*/$A_ID" \
+    "refs/remotes/origin/fix/$A_ID-*" "refs/heads/fix/$A_ID-*" 2>/dev/null | head -1 >/dev/null
+) || OLD_RC=$?
+if [ "$OLD_RC" -eq 141 ]; then
+  ok "A1: pre-fix shape (for-each-ref ... | head -1, no --count=1) SIGPIPEs (rc=141) against 15000 matching refs — confirms this is a real race, not a tautology"
+else
+  bad "A1: pre-fix shape did not SIGPIPE (rc=$OLD_RC) — fixture too small to exercise the failure mode; strengthen before trusting this section"
+fi
+NEW_OK=0
+for _ in $(seq 1 "$RUNS_A"); do
+  _m=$(
+    ( set -euo pipefail
+      git -C "$A_REPO" for-each-ref --count=1 --format='%(refname)' \
+        "refs/remotes/origin/crew/*/$A_ID" "refs/heads/crew/*/$A_ID" \
+        "refs/remotes/origin/fix/$A_ID-*" "refs/heads/fix/$A_ID-*" 2>/dev/null | head -1
+    ) 2>/dev/null
+  ) && [ -n "$_m" ] && NEW_OK=$((NEW_OK+1))
+done
+if [ "$NEW_OK" -eq "$RUNS_A" ]; then
+  ok "A1: shipped shape (--count=1) survives and matches on $NEW_OK/$RUNS_A runs against the same 15000-ref fixture"
+else
+  bad "A1: shipped shape only survived/matched $NEW_OK/$RUNS_A runs — race still present"
+fi
+
+echo ""
+echo "── A2. _crew_progressed_since, the REAL function (~L5515): finds real committer-date progress on every run, no SIGPIPE false-negative ──"
+FN_CPS="$(extract_fn "$PD" _crew_progressed_since)"
+if [ -z "$FN_CPS" ]; then
+  bad "A2: _crew_progressed_since not found in $PD"
+else
+  CPS_OK=0
+  for _ in $(seq 1 "$RUNS_A"); do
+    if ( set -euo pipefail
+         eval "$FN_CPS"
+         _NS_RIG_LIST_OK=1
+         _NS_BRANCH_REPOS="$A_REPO"
+         _crew_progressed_since "$A_CREW" 1
+       ) >/dev/null 2>&1; then
+      CPS_OK=$((CPS_OK+1))
+    fi
+  done
+  if [ "$CPS_OK" -eq "$RUNS_A" ]; then
+    ok "A2: _crew_progressed_since found progress on $CPS_OK/$RUNS_A runs against 15000 crew/* refs"
+  else
+    bad "A2: _crew_progressed_since only succeeded $CPS_OK/$RUNS_A runs — race still present"
+  fi
+fi
+
+echo ""
+echo "── A3. _beadid_needs_remerge_branch, the REAL function (~L5848): finds the real fix/* branch on every run, no SIGPIPE false-negative ──"
+FN_NRB="$(extract_fn "$PD" _beadid_needs_remerge_branch)"
+if [ -z "$FN_NRB" ]; then
+  bad "A3: _beadid_needs_remerge_branch not found in $PD"
+else
+  NRB_OK=0
+  for _ in $(seq 1 "$RUNS_A"); do
+    if ( set -euo pipefail
+         _ownership_guard_repos() { :; }
+         eval "$FN_NRB"
+         _OWNERSHIP_GUARD_REPOS="$A_REPO"
+         _beadid_needs_remerge_branch "$A_ID" >/dev/null
+       ) >/dev/null 2>&1; then
+      NRB_OK=$((NRB_OK+1))
+    fi
+  done
+  if [ "$NRB_OK" -eq "$RUNS_A" ]; then
+    ok "A3: _beadid_needs_remerge_branch matched on $NRB_OK/$RUNS_A runs against 15000 fix/* refs"
+  else
+    bad "A3: _beadid_needs_remerge_branch only matched $NRB_OK/$RUNS_A runs — race still present"
+  fi
 fi
 
 echo "── B. rebase_content_lost_paths (quality-gate-dispatcher.sh) on a >150 KB diff ──"
@@ -107,15 +222,31 @@ else
   bad "OLD idiom did not SIGPIPE (rc=$old_rc) — fixture stopped exercising the failure mode; strengthen it before trusting this section"
 fi
 
+# NOTE: this used to reproduce a bare `|| true` here — that was fix-
+# attempt 1's PRE-image, not what ships now. GATE-FEEDBACK on this bead's
+# first submission flagged that bare `|| true` for masking non-SIGPIPE
+# git-diff failures as empty output; fix-attempt 1 replaced it, in
+# production, with the if-guarded rc-discriminating capture below (only
+# rc=0/141 pass output through; anything else would fall to the sentinel
+# B3 tests). Reproduced here literally so B1 keeps testing what's actually
+# shipped instead of a stale idiom nobody runs anymore.
 new_out="$(
   ( set -euo pipefail
-    git -C "$FIXTURE_REPO" diff --name-only "$ACTUAL_TREE" "$EXPECTED_TREE" 2>/dev/null | head -20 || true
+    _b1_out="" _b1_rc=0
+    if _b1_out=$(git -C "$FIXTURE_REPO" diff --name-only "$ACTUAL_TREE" "$EXPECTED_TREE" 2>/dev/null | head -20); then
+      _b1_rc=0
+    else
+      _b1_rc=$?
+    fi
+    if [ "$_b1_rc" -eq 0 ] || [ "$_b1_rc" -eq 141 ]; then
+      printf '%s' "$_b1_out"
+    fi
   )
 )"
 new_rc=$?
 new_lines=$(printf '%s\n' "$new_out" | grep -c .)
 if [ "$new_rc" -eq 0 ] && [ "$new_lines" -eq 20 ]; then
-  ok "NEW idiom (with \`|| true\`, as shipped) survives (rc=0) and still returns all 20 truncated paths"
+  ok "NEW idiom (if-guarded rc-discriminating capture, as shipped) survives (rc=0) and still returns all 20 truncated paths"
 else
   bad "NEW idiom: expected rc=0 and 20 lines, got rc=$new_rc lines=$new_lines"
 fi
