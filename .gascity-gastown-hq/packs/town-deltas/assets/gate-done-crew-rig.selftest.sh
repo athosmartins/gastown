@@ -1783,6 +1783,160 @@ else
   bad "(AA5) gate-done.md not found at $GATE_DONE"
 fi
 
+# ── (AB) ga-mxwg89: a SEPARATE worktree of the outer repo parked as a
+#    SIBLING of .gascity-gastown-hq (not an ancestor or descendant of it)
+#    now resolves rig=gascity when its origin matches HQ's own AND every
+#    file it changed falls under HQ's own subtree — closing the gap neither
+#    ga-owfll PRIMARY nor ga-6mir5's reverse-containment covers.
+#
+# Root bug (ga-mxwg89, filed by gastown.dog-1 from a live incident, 21/09):
+# this city's own documented worktree recipe (packs/town-deltas CLAUDE.md's
+# "Idioma WORKTREE", `git worktree add .gc-worktrees/<name> -b fix/<bead>-
+# <desc> HEAD` run from ~/gt) lands the worktree at ~/gt/.gc-worktrees/<name>
+# — a SIBLING of .gascity-gastown-hq, not nested under it. CWD_TOP for that
+# worktree is neither equal to, nor an ancestor or descendant of,
+# $GC_CITY_PATH as a raw path, so PRIMARY and ga-6mir5 both miss — and since
+# the worktree is not physically under $GC_CITY_PATH either, the ga-ljbx pin
+# misses too. RIG fell through to "unknown" even though the only changed
+# file (.gascity-gastown-hq/packs/town-deltas/assets/daemon-refresh.sh) was
+# unambiguously gascity's own code.
+
+# apply_sibling_worktree_check <cwd_top> <gc_city_path> <gc_city_origin>
+# <cwd_origin> <changed_files_newline_separated> — pure-logic replica of the
+# fix. Origins are passed in directly (exactly like apply_ljbx_pin_with_
+# origin above passes cwd_top/rig in directly) rather than re-derived via
+# real git calls here, so this section's (AB1)-(AB5) exercise the
+# disambiguation LOGIC deterministically regardless of which real
+# directories happen to exist on whatever machine runs this suite. The real
+# premise this logic depends on — that two worktrees of the SAME repo
+# really do report the same `git remote get-url origin` — is confirmed
+# separately below via real git, against the same TOWN_ROOT/$GC_CITY_PATH
+# pair (R2) already uses, so it can't collide with any registered rig's own
+# exact path.
+apply_sibling_worktree_check() {
+  local cwd_top="$1" gc_city_path="$2" gc_city_origin="$3" cwd_origin="$4" changed_files="$5" rig="" basename_gc outside sf old_ifs
+  if [ -z "$gc_city_path" ] || [ -z "$cwd_top" ]; then
+    printf '%s' "$rig"; return
+  fi
+  if [ -n "$gc_city_origin" ] && [ "$gc_city_origin" = "$cwd_origin" ]; then
+    basename_gc=$(basename "$gc_city_path")
+    outside=0
+    if [ -n "$changed_files" ]; then
+      old_ifs="$IFS"; IFS='
+'
+      for sf in $changed_files; do
+        case "$sf" in
+          "$basename_gc"/*) : ;;
+          *) outside=1 ;;
+        esac
+      done
+      IFS="$old_ifs"
+    else
+      outside=1
+    fi
+    [ "$outside" -eq 0 ] && rig="gascity"
+  fi
+  printf '%s' "$rig"
+}
+
+_AB_ORIGIN="https://github.com/athosmartins/gastown.git"
+_AB_OTHER_ORIGIN="https://github.com/athosmartins/whatsapp-automation.git"
+
+# (AB1) primary repro: origins match, the only changed file is under HQ's
+# own subtree → gascity.
+R=$(apply_sibling_worktree_check "/Users/athos/gt/.gc-worktrees/fix-ga-mxwg89-demo" "$GC_CITY_PATH_STUB" \
+  "$_AB_ORIGIN" "$_AB_ORIGIN" ".gascity-gastown-hq/packs/town-deltas/assets/daemon-refresh.sh")
+[ "$R" = "gascity" ] \
+  && ok "(AB1) sibling worktree, single change under the gascity subtree → gascity (got: $R)" \
+  || bad "(AB1) sibling-worktree repro → expected gascity, got: '$R' (ga-mxwg89 regression)"
+
+# (AB2) control: a changed file OUTSIDE the gascity subtree (e.g. this
+# worktree's real work is gastown's, which shares the same origin) must NOT
+# force gascity — stay silent, no guess.
+R=$(apply_sibling_worktree_check "/Users/athos/gt/.gc-worktrees/fix-ga-mxwg89-demo" "$GC_CITY_PATH_STUB" \
+  "$_AB_ORIGIN" "$_AB_ORIGIN" "gastown/some-file.md")
+[ -z "$R" ] \
+  && ok "(AB2) control: changed file outside the gascity subtree → check stays silent, no guess (got: '$R')" \
+  || bad "(AB2) control: expected the check to abstain (empty), got: '$R' (would misresolve a gastown worktree to gascity)"
+
+# (AB3) control: a MIX of in-subtree and out-of-subtree changed files must
+# also abstain — one matching file does not excuse the ambiguity of another.
+R=$(apply_sibling_worktree_check "/Users/athos/gt/.gc-worktrees/fix-ga-mxwg89-demo" "$GC_CITY_PATH_STUB" \
+  "$_AB_ORIGIN" "$_AB_ORIGIN" ".gascity-gastown-hq/packs/town-deltas/assets/daemon-refresh.sh
+gastown/some-file.md")
+[ -z "$R" ] \
+  && ok "(AB3) control: mixed in/out-of-subtree changes → check stays silent (got: '$R')" \
+  || bad "(AB3) control: mixed changes should abstain, got: '$R'"
+
+# (AB4) control: no changed files (should never happen live — Step 1's
+# empty-diff fail-closed check runs first — but must not misfire if it did)
+# → abstain.
+R=$(apply_sibling_worktree_check "/Users/athos/gt/.gc-worktrees/fix-ga-mxwg89-demo" "$GC_CITY_PATH_STUB" \
+  "$_AB_ORIGIN" "$_AB_ORIGIN" "")
+[ -z "$R" ] \
+  && ok "(AB4) control: no changed files → check stays silent (got: '$R')" \
+  || bad "(AB4) control: empty changed-files list should abstain, got: '$R'"
+
+# (AB5) control: cwd_top with a DIFFERENT origin than HQ's (a genuinely
+# separate repo) never matches, even with an in-subtree-looking file path —
+# origin must agree first.
+R=$(apply_sibling_worktree_check "/Users/athos/gt/whatsapp_automation" "$GC_CITY_PATH_STUB" \
+  "$_AB_ORIGIN" "$_AB_OTHER_ORIGIN" ".gascity-gastown-hq/packs/town-deltas/assets/daemon-refresh.sh")
+[ -z "$R" ] \
+  && ok "(AB5) control: distinct-origin cwd never matches regardless of changed-file text (got: '$R')" \
+  || bad "(AB5) control: distinct-origin cwd should abstain, got: '$R'"
+
+# (AB6) mutation guard: derive_rig() ALONE (PRIMARY + ga-6mir5 + the two
+# fallbacks, unmodified — no sibling-worktree awareness) given a cwd that is
+# neither a registered rig path nor an ancestor/descendant of gc_city_path,
+# with a bead/agent that match no rig prefix or suffix, resolves "unknown".
+# Proves the gap ga-mxwg89 closes is real in the CURRENT shipped chain, not
+# already covered some other way.
+R=$(derive_rig "/Users/athos/gt/.gc-worktrees/fix-ga-mxwg89-demo" "zz-nomatch" "no-agent-match" "$GC_CITY_PATH_STUB" "")
+[ "$R" = "unknown" ] \
+  && ok "(AB6) mutation check: the base chain alone leaves a sibling-worktree cwd unresolved, reproducing ga-mxwg89" \
+  || bad "(AB6) mutation check: base chain unexpectedly resolved to '$R' — (AB1)'s class would not catch a reversion"
+
+# (AB_premise) real-git confirmation: the fact this fix's origin-match
+# depends on — that a worktree of the SAME repo reports the SAME origin URL
+# as $GC_CITY_PATH, regardless of which subdirectory of that repo you ask
+# from — actually holds for the real repo. Uses the same safe TOWN_ROOT /
+# $GC_CITY_PATH pair (R2) already uses (not tied to any specific worktree's
+# location, and not a registered rig's own exact path, so it can't collide).
+AB_ORIGIN_ROOT=$(git -C "$TOWN_ROOT" remote get-url origin 2>/dev/null || echo "")
+AB_ORIGIN_HQ=$(git -C "$GC_CITY_PATH_STUB" remote get-url origin 2>/dev/null || echo "")
+if [ -n "$AB_ORIGIN_ROOT" ] && [ "$AB_ORIGIN_ROOT" = "$AB_ORIGIN_HQ" ]; then
+  ok "(AB_premise) real git: repo root and \$GC_CITY_PATH report the same origin ($AB_ORIGIN_ROOT) — confirming the fact ga-mxwg89's origin-match depends on"
+else
+  bad "(AB_premise) real git: origin mismatch — root='$AB_ORIGIN_ROOT' hq='$AB_ORIGIN_HQ' (if these differ, ga-mxwg89's origin-match premise no longer holds)"
+fi
+
+# (AB7) source drift-guard: deployed gate-done.md contains the sibling-
+# worktree check, comparing HQ's own origin and verifying changed files
+# against BASE_COMMIT, positioned before FALLBACK 1 (same priority as
+# ga-6mir5, so it takes precedence over the bead-prefix heuristic).
+if [ -f "$GATE_DONE" ]; then
+  src=$(cat "$GATE_DONE")
+  printf '%s' "$src" | grep -F 'ga-mxwg89' >/dev/null \
+    && ok "(AB7a) gate-done.md references the ga-mxwg89 fix" \
+    || bad "(AB7a) gate-done.md missing the ga-mxwg89 fix marker (regression)"
+  printf '%s' "$src" | grep -F 'git -C "$GC_CITY_PATH" remote get-url origin' >/dev/null \
+    && ok "(AB7b) gate-done.md's sibling-worktree check compares HQ's own origin" \
+    || bad "(AB7b) gate-done.md missing the HQ-origin comparison (ga-mxwg89 regression)"
+  printf '%s' "$src" | grep -F 'diff --name-only "$BASE_COMMIT"...HEAD' >/dev/null \
+    && ok "(AB7c) gate-done.md's sibling-worktree check verifies changed files against BASE_COMMIT" \
+    || bad "(AB7c) gate-done.md missing the changed-files check (ga-mxwg89 regression)"
+  mxwg89_line=$(printf '%s\n' "$src" | grep -nF 'ga-mxwg89' | head -1 | cut -d: -f1)
+  fallback1_line=$(printf '%s\n' "$src" | grep -nF 'ga-owfll FALLBACK 1' | head -1 | cut -d: -f1)
+  if [ -n "$mxwg89_line" ] && [ -n "$fallback1_line" ] && [ "$mxwg89_line" -lt "$fallback1_line" ]; then
+    ok "(AB7d) gate-done.md's ga-mxwg89 check runs BEFORE FALLBACK 1 (line $mxwg89_line < $fallback1_line)"
+  else
+    bad "(AB7d) gate-done.md's ga-mxwg89 check does not precede FALLBACK 1 (mxwg89_line='$mxwg89_line' fallback1_line='$fallback1_line')"
+  fi
+else
+  bad "(AB7) gate-done.md not found at $GATE_DONE"
+fi
+
 echo
 echo "  PASS=$PASS  FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

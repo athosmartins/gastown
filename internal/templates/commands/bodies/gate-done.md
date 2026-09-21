@@ -474,6 +474,62 @@ if { [ -z "$RIG" ] || [ "$RIG" = "null" ]; } && [ -n "$GC_CITY_PATH" ] && [ -n "
   esac
 fi
 
+# ga-mxwg89: ga-6mir5 above catches "cwd is AT or ABOVE GC_CITY_PATH" (running
+# gate-done from ~/gt itself, or from inside .gascity-gastown-hq). It does
+# NOT catch a SEPARATE worktree of the outer repo parked as a SIBLING of
+# .gascity-gastown-hq — e.g. ~/gt/.gc-worktrees/<name>, exactly what this
+# city's own documented worktree-parking convention (packs/town-deltas
+# CLAUDE.md's "Idioma WORKTREE" recipe) creates when run from ~/gt as
+# instructed. That worktree's CWD_TOP is neither equal to, nor an ancestor
+# or descendant of, GC_CITY_PATH as a raw path — even though it IS the same
+# repository and genuinely contains gascity's own tracked subtree nested
+# inside it (a worktree checks out the WHOLE tree, .gascity-gastown-hq
+# included). Confirmed live 2026-09-21 (ga-mxwg89): a fix/* worktree at
+# ~/gt/.gc-worktrees/<name> whose only changed file was under
+# .gascity-gastown-hq/packs/town-deltas/assets/ resolved rig=unknown through
+# every check above.
+#
+# Matching origin ALONE is not enough to resolve this: gascity and gastown
+# are both tracked subdirs of this SAME outer monorepo (no .git of their
+# own — see ga-6mir5/ga-5nshv above) and therefore share ONE origin URL, so
+# an origin match by itself can't tell "this worktree's work is gascity's"
+# from "this worktree's work is gastown's" — it would misfire on the gastown
+# case exactly like ga-ljbx's original branch-prefix pin misfired before
+# ga-3dhdg gated it on physical location. Require EVERY file this branch has
+# actually changed since BASE_COMMIT to fall under GC_CITY_PATH's own
+# subtree — the same unambiguous signal the live incident used by hand ("the
+# edited file is unambiguously gascity's own code"), made mechanical. If any
+# changed file falls outside that subtree (or the diff can't be read, or
+# origin doesn't match at all — a genuinely unrelated repo), this block
+# stays silent and RIG falls through to the fallbacks below unchanged — no
+# guess when the diff spans more than one rig's code.
+if { [ -z "$RIG" ] || [ "$RIG" = "null" ]; } && [ -n "$GC_CITY_PATH" ] && [ -n "$CWD_TOP" ]; then
+  _GC_CITY_ORIGIN=$(git -C "$GC_CITY_PATH" remote get-url origin 2>/dev/null || echo "")
+  _CWD_ORIGIN_SIB=$(git -C "$CWD_TOP" remote get-url origin 2>/dev/null || echo "")
+  if [ -n "$_GC_CITY_ORIGIN" ] && [ "$_GC_CITY_ORIGIN" = "$_CWD_ORIGIN_SIB" ]; then
+    _GC_CITY_BASENAME=$(basename "$GC_CITY_PATH")
+    _SIB_CHANGED=$(git -C "$CWD_TOP" diff --name-only "$BASE_COMMIT"...HEAD 2>/dev/null || echo "")
+    _SIB_OUTSIDE=0
+    if [ -n "$_SIB_CHANGED" ]; then
+      _OLD_IFS="$IFS"; IFS='
+'
+      for _SIB_FILE in $_SIB_CHANGED; do
+        case "$_SIB_FILE" in
+          "$_GC_CITY_BASENAME"/*) : ;;
+          *) _SIB_OUTSIDE=1 ;;
+        esac
+      done
+      IFS="$_OLD_IFS"
+    else
+      _SIB_OUTSIDE=1
+    fi
+    if [ "$_SIB_OUTSIDE" -eq 0 ]; then
+      echo "Note: cwd ($CWD_TOP) is a separate worktree sharing HQ's origin ($_GC_CITY_ORIGIN), and every changed file since origin/main falls under $_GC_CITY_BASENAME/ — resolving rig=gascity (ga-mxwg89)."
+      RIG="gascity"
+    fi
+  fi
+fi
+
 # ga-owfll FALLBACK 1: map the source bead's PREFIX to a rig (wa-27jn → wa →
 # whatsapp_automation). The bead id already encodes its owning rig.
 #
