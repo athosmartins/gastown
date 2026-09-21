@@ -50,6 +50,26 @@ S3="s3://$BUCKET"
 LOG="$CITY/.gc/logs/dolt-s3-backup.log"
 NOTIFY="/Users/athos/.local/bin/notify"
 AWS="$(command -v aws || echo /opt/homebrew/bin/aws)"
+# ga-tyaozh: aws-cli/botocore (>= ~2.33; confirmed empirically here on 2.34.48)
+# defaults request_checksum_calculation to "when_supported", which wraps every
+# S3 PutObject/UploadPart body in botocore.httpchecksum.AwsChunkedWrapper (a
+# chunked-transfer trailing-checksum encoding). On a dropped connection,
+# botocore's retry path tries to rewind that wrapper; when the rewind raises
+# for any reason, botocore converts it into UnseekableStreamError ("Need to
+# rewind the stream <AwsChunkedWrapper ...>, but stream is not seekable"),
+# aborting the whole upload instead of completing the retry — this is exactly
+# what hit hq's backup at 2026-09-21 04:06 and, by starving hq's local staging
+# reseed, cascaded into the day's disk-pressure outage. PutObject/UploadPart
+# both have requestChecksumRequired=false (verified against this install's
+# own botocore S3 service model), so "when_required" skips the wrapper
+# entirely for every plain upload this script does — verified empirically via
+# `aws --debug s3 cp` against the real bucket: with this var set, the request
+# body is a plain (genuinely seekable) s3transfer.utils.ReadFileChunk, with no
+# AwsChunkedWrapper and no Content-Encoding/Transfer-Encoding/X-Amz-Trailer
+# headers at all. Exported once here so it covers every "$AWS" s3 upload below
+# (JSONL mirror, per-db sync, fingerprint publish) without touching each call
+# site individually.
+export AWS_REQUEST_CHECKSUM_CALCULATION=when_required
 DOLT="$(command -v dolt || echo /opt/homebrew/bin/dolt)"
 HOST="127.0.0.1"
 LOCKDIR="$CITY/.gc/logs/.dolt-s3-backup.lock.d"

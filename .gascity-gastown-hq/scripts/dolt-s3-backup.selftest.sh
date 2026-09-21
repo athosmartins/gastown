@@ -954,5 +954,91 @@ else
   bad "live script's jsonl sync does not exclude .git"
 fi
 
+echo ""
+echo "── AWS_REQUEST_CHECKSUM_CALCULATION=when_required (ga-tyaozh) ──"
+# Root cause: aws-cli/botocore defaults to wrapping every S3 upload body in
+# botocore.httpchecksum.AwsChunkedWrapper (checksum trailer). On a dropped
+# connection, botocore's retry tries to rewind that wrapper; when the rewind
+# raises, botocore reports UnseekableStreamError ("stream is not seekable")
+# and aborts instead of completing the retry — this hit hq's backup for real
+# on 2026-09-21 and cascaded into a city-wide disk-pressure outage. Setting
+# this var to "when_required" skips the wrapper entirely for PutObject/
+# UploadPart (requestChecksumRequired=false for both), verified empirically
+# against the real bucket via `aws --debug s3 cp` (body becomes a plain,
+# genuinely seekable s3transfer.utils.ReadFileChunk; zero AwsChunkedWrapper,
+# zero Content-Encoding/Transfer-Encoding/X-Amz-Trailer headers).
+
+if [ "${AWS_REQUEST_CHECKSUM_CALCULATION:-}" = "when_required" ]; then
+  ok "AWS_REQUEST_CHECKSUM_CALCULATION=when_required after lib-mode source"
+else
+  bad "AWS_REQUEST_CHECKSUM_CALCULATION not 'when_required' after lib-mode source (got '${AWS_REQUEST_CHECKSUM_CALCULATION:-<unset>}') — the AwsChunkedWrapper 'stream is not seekable' upload defect (ga-tyaozh) is UNPROTECTED"
+fi
+
+# Real subprocess proof: a stubbed aws binary records what IT sees in ITS OWN
+# environment when invoked by the actual (unmodified) jsonl_offsite_sync's
+# real "$AWS" s3 sync call — proves the var is genuinely exported/inherited
+# by a child process, not just set in this shell, without reimplementing the
+# call site.
+CHECKSUM_STUB_DIR="$(mktemp -d)"
+CHECKSUM_STUB_ENV="$(mktemp)"
+cat > "$CHECKSUM_STUB_DIR/aws" <<'STUB'
+#!/bin/bash
+case "$1 $2" in
+  "s3 sync")
+    printf '%s\n' "${AWS_REQUEST_CHECKSUM_CALCULATION:-<unset>}" >> "$CHECKSUM_STUB_ENV"
+    exit 0
+    ;;
+  "s3api head-object")
+    printf '100\n'
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+STUB
+chmod +x "$CHECKSUM_STUB_DIR/aws"
+
+CHECKSUM_TEST_DIR="$(mktemp -d)"
+printf 'x%.0s' $(seq 1 100) > "$CHECKSUM_TEST_DIR/hq.jsonl"
+CHECKSUM_TEST_LOG="$(mktemp)"
+: > "$CHECKSUM_STUB_ENV"
+AWS="$CHECKSUM_STUB_DIR/aws" CHECKSUM_STUB_ENV="$CHECKSUM_STUB_ENV" JSONL_ARCHIVE_DIR="$CHECKSUM_TEST_DIR" \
+  JSONL_ARCHIVE_VERIFY_FILE="hq.jsonl" BUCKET=testbucket S3=s3://testbucket \
+  LOG="$CHECKSUM_TEST_LOG" S3_TIMEOUT=5 jsonl_offsite_sync >/dev/null 2>&1
+
+SEEN="$(cat "$CHECKSUM_STUB_ENV" 2>/dev/null)"
+if [ "$SEEN" = "when_required" ]; then
+  ok "a real child 'aws s3 sync' subprocess (via the live jsonl_offsite_sync call site) actually inherits AWS_REQUEST_CHECKSUM_CALCULATION=when_required"
+else
+  bad "child aws subprocess did not see AWS_REQUEST_CHECKSUM_CALCULATION=when_required (saw '${SEEN:-<nothing captured>}') — the export is not reaching the upload call"
+fi
+
+rm -rf "$CHECKSUM_STUB_DIR" "$CHECKSUM_TEST_DIR" 2>/dev/null || true
+rm -f "$CHECKSUM_STUB_ENV" "$CHECKSUM_TEST_LOG" 2>/dev/null || true
+
+echo "── drift-guard: export precedes every upload call site in the live script ──"
+EXPORT_LINE=$(grep -nF 'export AWS_REQUEST_CHECKSUM_CALCULATION=when_required' "$SCRIPT" | head -1 | cut -d: -f1)
+if [ -z "$EXPORT_LINE" ]; then
+  bad "export AWS_REQUEST_CHECKSUM_CALCULATION=when_required line not found in live script at all"
+else
+  ok "export line present in live script (line $EXPORT_LINE)"
+  for marker in \
+    '"$AWS" s3 sync "$JSONL_ARCHIVE_DIR/"' \
+    '"$AWS" s3 sync "$dest/" "$S3/$db/"' \
+    '"$AWS" s3 cp "$META" "$S3/_meta/latest.json"' \
+    '"$AWS" s3 cp "$META" "$S3/_meta/$(date' \
+  ; do
+    CALL_LINE=$(grep -nF "$marker" "$SCRIPT" | head -1 | cut -d: -f1)
+    if [ -z "$CALL_LINE" ]; then
+      bad "drift-guard: upload call site not found (script changed shape?): $marker"
+    elif [ "$CALL_LINE" -gt "$EXPORT_LINE" ]; then
+      ok "drift-guard: upload call at line $CALL_LINE comes after the export (line $EXPORT_LINE): $marker"
+    else
+      bad "drift-guard: upload call at line $CALL_LINE comes BEFORE the export (line $EXPORT_LINE) — unprotected: $marker"
+    fi
+  done
+fi
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
