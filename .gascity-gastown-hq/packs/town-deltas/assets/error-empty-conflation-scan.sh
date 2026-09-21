@@ -24,6 +24,25 @@
 #   C10 (ga-5bxuam) `<writer> | grep -q ...` in a script that sets pipefail: the
 #       early-exiting reader lets the writer catch SIGPIPE and a MATCH is
 #       reported as "no match" (7-22% at load 40). Details at scan_pipefail_grep_q.
+#   C11 (ga-ebuj6c, sister of C10) `<writer> | head|awk-exit|grep -m|sed q ...`
+#       in a script that sets pipefail: the reader closes the pipe on its own,
+#       once it has what it needs, while the writer may still be mid-write.
+#       Unlike C10, the CAPTURED VALUE survives correctly either way — only
+#       the pipeline's exit code is corrupted (pipefail elevates the writer's
+#       SIGPIPE/141 over the reader's own 0). That matters only if something
+#       downstream actually LOOKS at that exit code: a bare `set -e` script
+#       with no `inherit_errexit` does NOT propagate an internal failure out
+#       of a `$(...)` command substitution unless the failing pipeline is the
+#       LAST statement executed inside it (verified empirically, ga-ebuj6c) —
+#       so a finding buried in a helper function that is only ever called as
+#       `x=$(helper ...)` from elsewhere, with more code after the pipeline
+#       inside that helper, is very likely INERT. Triage a C11 hit by asking:
+#       (1) is the immediately-preceding stage's un-truncated output plausibly
+#       >64-100KB (the measured pipe-buffer failure threshold)? (2) is this
+#       pipeline the LAST thing executed before a bare `var=$(...)` capture or
+#       a bare top-level statement, with no intervening `$(...)` boundary that
+#       would swallow the failure? Both "yes" is a real bug; either "no" is
+#       usually noise. Details at scan_pipe_early_exit.
 #
 # Calibrated against real precedent already in this codebase:
 #   verdict_count_from_query()  — quality-gate-guard.sh, ga-jfo7
@@ -892,6 +911,151 @@ scan_pipefail_grep_q() {
   scan_pipefail_grep_q_files "$1"
 }
 
+# ── C11 (ga-ebuj6c): `<writer> | head|awk-exit|grep -m|sed q ...` under ──────
+# pipefail — the sister family to C10, measured in ga-5lrhjm. See the file
+# header above for the full triage note (this family corrupts only the exit
+# code, never the captured value, and often turns out inert once you check
+# whether the failure can actually reach a live `set -e` context).
+#
+# Four sub-idioms, one pipe:
+#   head   any invocation right after a live `|` closes early once it has
+#          its quota (byte or line), same risk regardless of -n/-c/bare.
+#   grep-m -m<N>/--max-count on grep/egrep/fgrep/ugrep (grep -q is C10, not
+#          this — that family's risk is a flipped DECISION, not an abort).
+#   sed-q  a bare `q` command with an address (`1q`, `$q`, `/pat/q`) — NOT
+#          `p` (prints but keeps draining) and NOT `s///` (no address+q
+#          shape at all). `sed -n '1p'` is the catalogued false positive
+#          this excludes (ga-5lrhjm: drains to EOF, never closes early).
+#   awk-exit a literal `exit` in the program — UNLESS it is the textually
+#          last "exit" and comes after the last "END" marker, i.e. it is
+#          almost certainly scoped inside `END { ... exit ... }`, which
+#          only ever runs at natural EOF and never truncates the reader's
+#          own input (pilot-dispatcher.sh's rig-membership check is the
+#          real false positive this excludes — string-position heuristic,
+#          not a real awk parse; see file header "not a parser" disclaimer).
+#
+# Suppressions beyond the two above (both catalogued in ga-ebuj6c, not
+# speculative — both are real, measured shapes in THIS codebase):
+#   - `<<<` (here-string): no live writer process, nothing to SIGPIPE.
+#   - `for-each-ref`/`ls-remote` with NO `*` in the statement: a fully-
+#     qualified single ref can return at most one match — measured 0 bytes
+#     in production (quality-gate-guard.sh's 6 SHA-lookup sites). A
+#     wildcarded pattern (pilot-dispatcher.sh's crew/bead-scoped globs)
+#     still matches; those are genuinely bounded-but-fragile, not exempt.
+#   - any `||` already on the statement: matches this bead's OWN Step-1
+#     audit-list command (`grep -vF '||'`) — a line already guarded (this
+#     family's correct, deliberate fix per the bead is `|| true`, the
+#     OPPOSITE of C10's family, where `|| true` hides a wrong decision and
+#     is explicitly never the fix) is not a finding, it is a closed one.
+#
+# Same allowlist convention as C10: `# erro-vs-vazio: ok <razao>`.
+_C11_AWK_PROGRAM=""
+IFS= read -r -d '' _C11_AWK_PROGRAM <<'C11AWK' || true
+# lastmatch(s, re) — start position of the LAST match of ERE `re` in `s`,
+# or 0 if none. awk's match() only ever finds the FIRST match, so this
+# walks forward re-matching against the remaining tail each time.
+function lastmatch(s, re,    pos, off) {
+  pos = 0; off = 0
+  while (match(substr(s, off + 1), re) > 0) {
+    pos = off + RSTART
+    off = pos + RLENGTH - 1
+  }
+  return pos
+}
+BEGIN {
+  SETPF = "(^|[^A-Za-z0-9_])(set|shopt)[[:space:]]+([^;#|&]*[[:space:]])?-[A-Za-z]*o[[:space:]]+pipefail"
+  # Unlike C10 (a flipped DECISION, live even without errexit — testable
+  # directly via $? or an if-condition), C11's whole risk model is "the
+  # script silently ABORTS", which requires errexit to be active, not just
+  # pipefail. Measured in ga-ebuj6c: of the files a first pipefail-only pass
+  # touched, 42/49 use `set -uo pipefail` (no -e) — pipefail with no -e can
+  # only ever change what a captured EXIT CODE says, and nothing in this
+  # sub-family branches on that (the whole point of the family, per the file
+  # header: only the exit code is at risk, never the captured value) — so
+  # those findings are structurally inert. `-o errexit` is the long form;
+  # `-e` is almost always combined into a cluster (`-eu`, `-euo`, ...).
+  SETEE = "(^|[^A-Za-z0-9_])set[[:space:]]+-[A-Za-z]*e[A-Za-z]*([[:space:]]|;|$)|(^|[^A-Za-z0-9_])set[[:space:]]+-o[[:space:]]+errexit"
+  PREFIX = "((command|builtin)[[:space:]]+|/usr/bin/|/bin/)*"
+  IDIOM = "(^|[^|])[|][[:space:]]*" PREFIX "(head|sed|awk|grep|egrep|fgrep|ugrep)([[:space:]]|$)"
+  HEAD = "[|][[:space:]]*" PREFIX "head([[:space:]]|$)"
+  GREPM = "[|][[:space:]]*" PREFIX "(grep|egrep|fgrep|ugrep)[[:space:]]+([^|;&]*[[:space:]])?(-[A-Za-z0-9]*m[0-9]|--max-count)"
+  SED = "[|][[:space:]]*" PREFIX "sed[[:space:]]"
+  # sed's script arg is almost always quoted ('1q', "1q") — the boundary
+  # classes on both sides of the address+q must accept the quote char
+  # itself, or the overwhelmingly common real-world shape never matches
+  # (caught by the fixture test in ga-ebuj6c, not theoretical).
+  SEDQ = "(^|[;{[:space:]'\"])([0-9]+|[$]|/[^/]*/)[[:space:]]*q([[:space:];}'\"]|$)"
+  AWKP = "[|][[:space:]]*" PREFIX "awk[[:space:]]"
+  # Word-bounded, NOT a bare /exit/ or /END/ substring search — a bare
+  # substring match false-fires on any identifier merely CONTAINING the
+  # word, e.g. a function named `_last_exit` (caught live in ga-ebuj6c's
+  # own first pass against daemon-presence-watchdog.sh:193, which has no
+  # `exit` keyword in its awk program at all). No \b/\s (this file avoids
+  # both, see header) — explicit negated-class boundaries instead.
+  EXITWORD = "(^|[^A-Za-z0-9_])exit([^A-Za-z0-9_]|$)"
+  ENDWORD = "(^|[^A-Za-z0-9_])END([^A-Za-z0-9_]|$)"
+}
+FNR == 1 { pf = 0; pf_local = 0; ee = 0; ee_local = 0; cont = 0; buf = "" }
+{
+  line = $0
+  if (line ~ /^[})]/) { pf_local = 0; ee_local = 0 }
+  if (cont) { buf = buf " " line } else { buf = line; start = FNR }
+  if (line ~ /\\$/) { buf = substr(buf, 1, length(buf) - 1); cont = 1; next }
+  cont = 0
+  t = buf
+  sub(/^[[:space:]]+/, "", t)
+  if (t ~ /^#/) next
+  oneshot = 0
+  if (buf ~ SETPF) {
+    if (buf ~ /^(set|shopt)[[:space:]]/) pf = 1
+    else {
+      pf_local = 1
+      if (buf ~ /[(][^)]*(set|shopt)[^)]*pipefail[^)]*[)]/) oneshot = 1
+    }
+  }
+  if (buf ~ SETEE) {
+    if (buf ~ /^set[[:space:]]/) ee = 1
+    else {
+      ee_local = 1
+      if (buf ~ /[(][^)]*set[^)]*-[A-Za-z]*e[A-Za-z]*[^)]*[)]/) oneshot = 1
+    }
+  }
+  if ((pf || pf_local) && (ee || ee_local) && buf ~ IDIOM && buf !~ /<<</ && buf !~ /\|\|/) {
+    hit = ""
+    if (buf ~ HEAD) hit = "head"
+    else if (buf ~ GREPM) hit = "grep-m"
+    else if (buf ~ SED && buf ~ SEDQ) hit = "sed-q"
+    else if (buf ~ AWKP && buf ~ EXITWORD) {
+      last_end = lastmatch(buf, ENDWORD)
+      last_exit = lastmatch(buf, EXITWORD)
+      if (!(last_end > 0 && last_exit > last_end)) hit = "awk-exit"
+    }
+    if (hit != "" && buf ~ /(for-each-ref|ls-remote)/ && buf !~ /\*/) hit = ""
+    if (hit != "" && tolower(buf) !~ /erro-vs-vazio:[[:space:]]*ok/) {
+      s = buf
+      gsub(/[[:space:]]+/, " ", s)
+      sub(/^ /, "", s)
+      if (length(s) > 200) s = substr(s, 1, 200)
+      printf "%s:%d:C11:%s: %s\n", FILENAME, start, hit, s
+    }
+  }
+  if (oneshot) { pf_local = 0; ee_local = 0 }
+}
+C11AWK
+
+# scan_pipe_early_exit_files <file>... — the multi-file core (one awk
+# process, same rationale as scan_pipefail_grep_q_files above).
+# Prints "file:line:C11:kind: snippet". Unreadable files are skipped by awk.
+scan_pipe_early_exit_files() {
+  [ "$#" -gt 0 ] || return 0
+  awk "$_C11_AWK_PROGRAM" "$@" 2>/dev/null
+}
+
+# scan_pipe_early_exit <file> — same calling convention as every other scan_*.
+scan_pipe_early_exit() {
+  scan_pipe_early_exit_files "$1"
+}
+
 # ── driver ───────────────────────────────────────────────────────────────────
 # run_scan <findings_file> <root>... — appends "file:line:CATEGORY:snippet"
 # lines to findings_file (truncated first). Count is the caller's job (just
@@ -1009,8 +1173,12 @@ run_scan() {
     # ga-5bxuam (C10): early-exit `grep -q` reader under pipefail. File-level
     # pre-filter (one cheap grep, no pipe): a file that never mentions
     # pipefail cannot be in scope, so most files skip the awk pass entirely.
+    # ga-ebuj6c (C11): sister family (head/awk-exit/grep-m/sed-q), same
+    # pipefail-only scope, so it shares this exact pre-filter and file loop
+    # instead of paying a second full-tree find+read pass for it.
     if grep -q 'pipefail' "$f" 2>/dev/null; then
       scan_pipefail_grep_q "$f" >>"$findings_file"
+      scan_pipe_early_exit "$f" >>"$findings_file"
     fi
   done < <(find "${roots[@]}" -type f -name '*.sh' "${EXCL[@]}" -print0 2>/dev/null)
 

@@ -4532,7 +4532,16 @@ rebase_content_lost_paths() {
   expected=$(printf '%s\n' "$out" | head -1)
   actual=$(git --git-dir="$gd" rev-parse "${new_tip}^{tree}" 2>/dev/null || echo "")
   { [ -z "$expected" ] || [ -z "$actual" ]; } && { echo "<could not compute: bad-sha>"; return 0; }
-  git --git-dir="$gd" diff --name-only "$actual" "$expected" 2>/dev/null | head -20
+  # ga-ebuj6c: a bad rebase can diverge on hundreds of paths, comfortably
+  # past the ~80-100KB pipe-buffer threshold where `| head -20` closing
+  # early SIGPIPEs this `git diff`. Every call site captures this function
+  # via a bare `_LOST_PATHS=$(rebase_content_lost_paths ... | tr ...)` —
+  # a single-statement substitution, so that SIGPIPE's pipefail-elevated
+  # exit code would otherwise abort the caller under set -e. The captured
+  # TEXT is unaffected either way (head's own output is always complete);
+  # only the exit code needs neutralizing, so `|| true` is correct here
+  # (this family carries no decision in the exit code — see ga-5lrhjm).
+  git --git-dir="$gd" diff --name-only "$actual" "$expected" 2>/dev/null | head -20 || true
 }
 # SELFTEST-EXTRACT gate-rebase-content-verdict: END
 
