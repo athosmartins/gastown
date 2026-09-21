@@ -63,6 +63,162 @@ else
   bad "sync step does NOT call _sync_with_stale_manifest_recovery — detection is dead code"
 fi
 
+# ── _sync_disk_preflight() (ga-odtd3f) — the disk-space gate itself ─────────
+# Hermetic: shadows `du` and `df` as plain shell functions. Unlike
+# dolt-backup-reseed.sh's _run_reseed (which needs a PATH-based fake `df`
+# because it runs as a real subprocess), _sync_disk_preflight is called
+# in-process here like every other function in this file, so shadowing
+# works directly — no subprocess, no PATH tricks, real disk never touched
+# or queried.
+echo "── _sync_disk_preflight() (ga-odtd3f) ──"
+
+type _sync_disk_preflight >/dev/null 2>&1 \
+  && ok "_sync_disk_preflight defined by lib-mode source" \
+  || { bad "_sync_disk_preflight NOT defined — lib mode broken"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="; exit 1; }
+
+SDP_CITY="$(mktemp -d)"
+SDP_LOG="$(mktemp)"
+mkdir -p "$SDP_CITY/.beads/dolt/testdb"
+
+# Fake du: only answers for the exact live-db path this function queries
+# (keeps the fake honest about what it's asked — real du's output shape is
+# "<kb><TAB><path>", matched by the live code's `awk '{print $1}'`).
+du() {
+  if [ "$2" = "$SDP_CITY/.beads/dolt/testdb" ]; then
+    printf '%s\t%s\n' "${SDP_LIVE_KB-0}" "$2"
+  else
+    command du "$@"
+  fi
+}
+# Fake df: only answers for /System/Volumes/Data (live code calls
+# `df -k /System/Volumes/Data`, so $2 is the path), real df's output shape
+# (header line + one data line, $4 = available KB — matched by the live
+# code's `awk 'NR==2{print $4}'`).
+df() {
+  if [ "$2" = "/System/Volumes/Data" ]; then
+    printf 'Filesystem 512-blocks Used Available Capacity iused ifree %%iused Mounted\n'
+    printf '/dev/x 1 1 %s 1%% 1 1 1%% /System/Volumes/Data\n' "${SDP_FREE_KB-0}"
+  else
+    command df "$@"
+  fi
+}
+
+_run_sdp() {
+  # <live_kb|""> <free_kb|""> <margin_pct> <floor_gb>
+  : > "$SDP_LOG"
+  SDP_LIVE_KB="$1" SDP_FREE_KB="$2" \
+    CITY="$SDP_CITY" LOG="$SDP_LOG" \
+    SYNC_DISK_MARGIN_PCT="$3" SYNC_DISK_FLOOR_GB="$4" \
+    _sync_disk_preflight "testdb"
+}
+
+# Comfortably sufficient: 1GB live, 150% margin needs 1.5GB, 10GB free.
+if _run_sdp 1048576 10485760 150 3; then
+  ok "sufficient disk (10GB free, needs ~1.5GB): proceeds"
+else
+  bad "sufficient disk (10GB free, needs ~1.5GB): should have proceeded"
+fi
+grep -qF "sync preflight OK" "$SDP_LOG" && ok "sufficient disk: logged OK" || bad "sufficient disk: missing OK log line"
+
+# Insufficient: 1GB live, 150% margin needs 1.5GB, only 1GB free.
+if _run_sdp 1048576 1048576 150 3; then
+  bad "insufficient disk (1GB free, needs ~1.5GB): should have refused"
+else
+  ok "insufficient disk (1GB free, needs ~1.5GB): refuses"
+fi
+grep -qF "sync preflight REFUSED" "$SDP_LOG" && grep -qF "disco insuficiente" "$SDP_LOG" \
+  && ok "insufficient disk: logged REFUSED with the expected reason text" \
+  || bad "insufficient disk: missing REFUSED/disco insuficiente log line"
+
+# Floor protects a tiny db: live=10MB (150% => need ~15MB, would pass on
+# percentage alone) but free is only 1GB, well under the 3GB floor — must
+# still refuse. Proves the floor is a REAL backstop, not dead code.
+if _run_sdp 10240 1048576 150 3; then
+  bad "tiny db under the 3GB floor (1GB free): should have refused via the floor"
+else
+  ok "tiny db under the 3GB floor (1GB free): refuses via the floor"
+fi
+grep -qF "piso=3GB" "$SDP_LOG" && ok "tiny-db case: log line cites the floor" || bad "tiny-db case: log line does not cite the floor"
+
+# Boundary: free exactly equals need → must proceed (>=, not strict >).
+# live=4GB, margin=100% => need=4GB exactly (kept above the 3GB floor on
+# purpose, so the floor can never be the thing deciding this case); free=4GB
+# exactly.
+if _run_sdp 4194304 4194304 100 3; then
+  ok "boundary (free == need exactly): proceeds"
+else
+  bad "boundary (free == need exactly): should have proceeded (>= is inclusive)"
+fi
+
+# Fail-closed: du can't read the live db size (simulated as an empty
+# answer, e.g. path doesn't exist) → refuse, never guess.
+if _run_sdp "" 10485760 150 3; then
+  bad "unreadable live size: should refuse (fail-closed), not proceed on a guess"
+else
+  ok "unreadable live size: refuses (fail-closed)"
+fi
+grep -qF "could not measure live db size" "$SDP_LOG" \
+  && ok "unreadable live size: logged the fail-closed reason" || bad "unreadable live size: missing fail-closed log line"
+
+# Fail-closed: df can't read free space → refuse, never guess.
+if _run_sdp 1048576 "" 150 3; then
+  bad "unreadable free space: should refuse (fail-closed), not proceed on a guess"
+else
+  ok "unreadable free space: refuses (fail-closed)"
+fi
+grep -qF "could not measure free disk space" "$SDP_LOG" \
+  && ok "unreadable free space: logged the fail-closed reason" || bad "unreadable free space: missing fail-closed log line"
+
+# Env overrides actually take effect: a case that passes at 150% margin
+# must refuse once SYNC_DISK_MARGIN_PCT is cranked way up — same numbers,
+# only the env var changes. live=4GB kept above the 3GB floor on purpose
+# (see the boundary case above) so this is genuinely testing the margin
+# knob, not accidentally testing the floor again.
+if _run_sdp 4194304 8388608 150 3; then
+  ok "margin override sanity: 8GB free / 4GB live passes at 150% (need 6GB)"
+else
+  bad "margin override sanity: 8GB free / 4GB live should pass at 150% (need 6GB)"
+fi
+if _run_sdp 4194304 8388608 1000 3; then
+  bad "margin override: same numbers must refuse once margin is 1000% (need 40GB)"
+else
+  ok "margin override: same numbers correctly refuse once margin is 1000% (need 40GB)"
+fi
+
+# Real incident anchor (ga-odtd3f, 2026-09-21 09:xx): hq live ~7.3G,
+# free at the worst measured point ~596Mi. At this file's own default
+# margin (150%), the preflight MUST have refused — this is the exact
+# scenario the fix exists to catch, encoded as a regression anchor the
+# same way REAL_ERR/REAL_TIMEOUT_ERR anchor the two detectors above.
+HQ_LIVE_KB=$((7654400))   # ~7.3G
+HQ_FREE_KB_AT_CRASH=$((596*1024))  # 596Mi
+if _run_sdp "$HQ_LIVE_KB" "$HQ_FREE_KB_AT_CRASH" 150 3; then
+  bad "ga-odtd3f incident numbers (hq ~7.3G live, 596Mi free): should have refused"
+else
+  ok "ga-odtd3f incident numbers (hq ~7.3G live, 596Mi free): refuses at default margin — this is the fix"
+fi
+
+unset -f du df
+rm -rf "$SDP_CITY" 2>/dev/null || true
+rm -f "$SDP_LOG" 2>/dev/null || true
+
+# ── drift-guard: disk preflight actually wired into every write attempt ─────
+echo "── drift-guard: disk preflight wiring present in live script (ga-odtd3f) ──"
+if grep -qF 'if ! _sync_disk_preflight "$db"; then' "$SCRIPT"; then
+  ok "at least one guarded call site uses the exact expected shape"
+else
+  bad "no call site matches the expected '_sync_disk_preflight' guard shape"
+fi
+callsites="$(grep -cF '_sync_disk_preflight "$db"' "$SCRIPT")"
+[ "$callsites" -eq 5 ] \
+  && ok "exactly 5 occurrences of _sync_disk_preflight \"\$db\" (1 in the main loop's initial attempt, 1 in the main loop's offline-fallback-after-timeout branch, 1 in the connection-timeout retry loop, 2 in stale-manifest recovery — retry + its own offline fallback)" \
+  || bad "expected exactly 5 occurrences of _sync_disk_preflight \"\$db\" (def excluded — this counts call sites only), got $callsites — a guard was added, removed, or a call site's db var name drifted"
+if grep -qF 'FAILED_DBS="$FAILED_DBS ${db}(disco)"' "$SCRIPT"; then
+  ok "main-loop disk refusals are counted with a distinct (disco) marker, same pattern as (sync)/(s3)"
+else
+  bad "main-loop disk refusals are not counted with the expected (disco) marker — 'CONTADA' (Mayor's ga-odtd3f requirement) would silently regress"
+fi
+
 # ── _sync_with_stale_manifest_recovery() (ga-yct7r1) — exercised live with a
 # simulated-failure stub (not just a drift-guard grep): the OLD code physically
 # could not pass scenario B below (it had no offline fallback at all, and
@@ -106,16 +262,23 @@ _offline_backup_sync() {
   printf '%s %s\n' "$1" "$2" >> "$SMR_OFFLINE_CALLS"
   [ "${SMR_STUB_OFFLINE_OK:-0}" = "1" ]
 }
+# Shadow the new disk preflight (ga-odtd3f) too — these scenarios exercise
+# the stale-manifest retry/fallback CONTROL FLOW, not disk math (which gets
+# its own dedicated hermetic tests below). Defaults to "disk OK" so
+# scenarios A-C keep testing exactly what they tested before this gate
+# existed; scenario D below flips it to prove the gate itself stops this
+# function cold instead of writing into a disk already proven insufficient.
+_sync_disk_preflight() { [ "${SMR_STUB_DISK_OK:-1}" = "1" ]; }
 
 _run_smr_scenario() {
-  # <retry_ok> <offline_ok> <label>
-  local retry_ok="$1" offline_ok="$2" label="$3"
+  # <retry_ok> <offline_ok> <label> [<disk_ok>]
+  local retry_ok="$1" offline_ok="$2" label="$3" disk_ok="${4:-1}"
   echo "  -- scenario: $label --"
   rm -rf "$SMR_DEST"; mkdir -p "$SMR_DEST"; touch "$SMR_DEST/marker"
   echo 0 > "$SMR_DOLT_COUNT_FILE"
   : > "$SMR_LOG"; : > "$SMR_OFFLINE_CALLS"
   DOLT="$SMR_STUB_DIR/dolt" HOST=127.0.0.1 PORT=0 LOG="$SMR_LOG" BACKUP_ROOT="$SMR_DEST_PARENT" \
-    SMR_STUB_RETRY_OK="$retry_ok" SMR_STUB_OFFLINE_OK="$offline_ok" \
+    SMR_STUB_RETRY_OK="$retry_ok" SMR_STUB_OFFLINE_OK="$offline_ok" SMR_STUB_DISK_OK="$disk_ok" \
     _sync_with_stale_manifest_recovery "testdb" "$SMR_DEST"
 }
 
@@ -166,7 +329,26 @@ grep -qF "offline-sync fallback OK" "$SMR_LOG" \
   && bad "scenario C: must NOT log a false offline-sync fallback OK line" \
   || ok "scenario C: no false success line when the offline fallback also failed"
 
-unset -f _offline_backup_sync
+# Scenario D (ga-odtd3f): disk preflight refuses right after the rm -rf
+# reinit — must fail immediately, must NOT attempt the retry OR the offline
+# fallback (both would write into a disk already proven insufficient). Both
+# retry_ok and offline_ok are set to 1 (would succeed if attempted) so a
+# pass here can only mean the disk gate stopped things BEFORE either ran.
+if _run_smr_scenario 1 1 "disk preflight refuses after reinit" 0; then
+  bad "scenario D (disk refuses): should have returned failure"
+else
+  ok "scenario D (disk refuses): returns failure"
+fi
+grep -qF "DOLT_BACKUP sync FAILED (disk preflight refused after stale-manifest reinit)" "$SMR_LOG" \
+  && ok "scenario D: logged the disk-preflight-refused tripwire" || bad "scenario D: missing the disk-preflight-refused tripwire line"
+[ "$(cat "$SMR_DOLT_COUNT_FILE")" = "0" ] \
+  && ok "scenario D: the reinit retry (_sync_once) was never attempted" \
+  || bad "scenario D: _sync_once was called despite the disk preflight refusing first"
+[ -s "$SMR_OFFLINE_CALLS" ] \
+  && bad "scenario D: offline fallback should NOT be invoked when disk preflight already refused" \
+  || ok "scenario D: offline fallback correctly not invoked"
+
+unset -f _offline_backup_sync _sync_disk_preflight
 rm -rf "$SMR_STUB_DIR" "$SMR_DEST_PARENT" 2>/dev/null || true
 rm -f "$SMR_DOLT_COUNT_FILE" "$SMR_LOG" "$SMR_OFFLINE_CALLS" 2>/dev/null || true
 
@@ -245,16 +427,22 @@ STUB
 chmod +x "$DOLT_STUB_DIR/dolt"
 sleep() { printf '%s\n' "$1" >> "$SLEEP_CALLS"; }
 export DOLT_STUB_COUNT_FILE
+# Shadow the new disk preflight (ga-odtd3f) — these scenarios exercise the
+# escalating-retry CONTROL FLOW, not disk math (dedicated hermetic tests
+# below). Defaults to "disk OK" so scenarios A-C keep testing exactly what
+# they tested before this gate existed; scenario D below flips it to prove
+# the gate stops the retry loop cold instead of sleeping into a full disk.
+_sync_disk_preflight() { [ "${RETRY_STUB_DISK_OK:-1}" = "1" ]; }
 
 _run_retry_scenario() {
-  # <fail_until_call> <label>
-  local fail_until="$1" label="$2"
+  # <fail_until_call> <label> [<disk_ok>]
+  local fail_until="$1" label="$2" disk_ok="${3:-1}"
   echo "  -- scenario: $label --"
   echo 0 > "$DOLT_STUB_COUNT_FILE"
   : > "$SLEEP_CALLS"
   : > "$TEST_LOG"
   DOLT="$DOLT_STUB_DIR/dolt" HOST=127.0.0.1 PORT=0 LOG="$TEST_LOG" \
-    DOLT_STUB_FAIL_UNTIL_CALL="$fail_until" \
+    DOLT_STUB_FAIL_UNTIL_CALL="$fail_until" RETRY_STUB_DISK_OK="$disk_ok" \
     _sync_with_connection_timeout_retry "testdb"
 }
 
@@ -301,7 +489,27 @@ grep -qF "DOLT_BACKUP sync FAILED (after connection-timeout retries)" "$TEST_LOG
   && ok "scenario C: no false 'sync OK' line when every attempt failed" \
   || bad "scenario C: logged a success line despite every attempt failing"
 
-unset -f sleep
+# Scenario D (ga-odtd3f): disk preflight refuses before the FIRST retry
+# attempt (fail_until=0 means the fake dolt would SUCCEED immediately if
+# ever called) — must fail right after the first sleep, never call dolt,
+# never sleep again for wait #2/#3. A pass here can only mean the disk gate
+# stopped the loop, since the stub would otherwise succeed trivially.
+if _run_retry_scenario 0 "disk preflight refuses before first retry" 0; then
+  bad "scenario D (disk refuses): should have returned failure"
+else
+  ok "scenario D (disk refuses): returns failure"
+fi
+[ "$(cat "$SLEEP_CALLS" | tr '\n' ',')" = "20," ] \
+  && ok "scenario D: slept once (20s) then stopped — did not proceed to wait #2/#3" \
+  || bad "scenario D: expected exactly one sleep (20) — got: $(cat "$SLEEP_CALLS" | tr '\n' ',')"
+[ "$(cat "$DOLT_STUB_COUNT_FILE")" = "0" ] \
+  && ok "scenario D: the retry's dolt call was never attempted — disk preflight blocked it" \
+  || bad "scenario D: dolt was invoked despite the disk preflight refusing first"
+grep -qF "DOLT_BACKUP sync FAILED (disk preflight refused before connection-timeout retry)" "$TEST_LOG" \
+  && ok "scenario D: logged the disk-preflight-refused tripwire" \
+  || bad "scenario D: missing the disk-preflight-refused tripwire line"
+
+unset -f sleep _sync_disk_preflight
 rm -rf "$DOLT_STUB_DIR" 2>/dev/null || true
 rm -f "$DOLT_STUB_COUNT_FILE" "$TEST_LOG" "$SLEEP_CALLS" 2>/dev/null || true
 

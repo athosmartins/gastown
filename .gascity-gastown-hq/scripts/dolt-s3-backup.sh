@@ -209,6 +209,63 @@ _margin_refusal_reset() {
   rm -f "$MARGIN_REFUSAL_STATE_DIR/$1" 2>/dev/null || true
 }
 
+# ga-odtd3f: neither the initial CALL DOLT_BACKUP('sync', ...) attempt below
+# nor its retry/fallback paths (_sync_with_connection_timeout_retry,
+# _sync_with_stale_manifest_recovery, the offline-sync fallback) had ANY
+# disk-space check of their own — unlike dolt-backup-reseed.sh's Preflight 2,
+# which only guards the LATER shrink step this script triggers via
+# _reseed_staging_if_enabled below. Measured 2026-09-21: with
+# .dolt-backup/hq already bloated (append-only, never shrinks itself — see
+# the file header), this let the sync write into .dolt-backup/hq/ until the
+# LIVE Dolt server's own noms journal (same physical disk) hit "no space
+# left on device" and crashed — three times in one morning (~04:20, ~09:07,
+# ~09:33), ~5h20 outage. Each crash freed nothing, and nothing stopped the
+# next attempt (server auto-restart, or the next retry wait) from writing
+# into the same still-full disk again.
+#
+# Same disk-query convention as dolt-backup-reseed.sh (/System/Volumes/Data,
+# NOT `df /` — "df / MENTE no macOS", already burned this city once) but a
+# separate, independently-tunable margin/env-var namespace: this codebase's
+# established rule is that one script's safety margin must never silently
+# change another's (dolt-restore-verify.sh's own header states the same
+# rule for its margin).
+SYNC_DISK_MARGIN_PCT="${SYNC_DISK_MARGIN_PCT:-150}"  # % of live db size required free
+SYNC_DISK_FLOOR_GB="${SYNC_DISK_FLOOR_GB:-3}"         # absolute backstop for small dbs
+
+# _sync_disk_preflight <db> — 0 (proceed) if free space on
+# /System/Volumes/Data covers SYNC_DISK_MARGIN_PCT% of <db>'s current live
+# on-disk size (floored at SYNC_DISK_FLOOR_GB), 1 (refuse) otherwise. Logs
+# its own reason either way. Fail-closed: an unreadable live size or
+# free-space number refuses rather than proceeding on a guess — same
+# posture as every other preflight in this city's Dolt backup scripts.
+_sync_disk_preflight() {
+  local db="$1"
+  local live_kb free_kb need_kb floor_kb
+  live_kb="$(du -sk "$CITY/.beads/dolt/$db" 2>/dev/null | awk '{print $1}')"
+  case "${live_kb:-}" in
+    ''|*[!0-9]*)
+      log "$db: sync preflight: could not measure live db size at $CITY/.beads/dolt/$db — refusing (fail-closed)"
+      return 1
+      ;;
+  esac
+  free_kb="$(df -k /System/Volumes/Data 2>/dev/null | awk 'NR==2{print $4}')"
+  case "${free_kb:-}" in
+    ''|*[!0-9]*)
+      log "$db: sync preflight: could not measure free disk space — refusing (fail-closed)"
+      return 1
+      ;;
+  esac
+  need_kb=$(( live_kb * SYNC_DISK_MARGIN_PCT / 100 ))
+  floor_kb=$(( SYNC_DISK_FLOOR_GB * 1024 * 1024 ))
+  [ "$need_kb" -lt "$floor_kb" ] && need_kb="$floor_kb"
+  if [ "$free_kb" -lt "$need_kb" ]; then
+    log "$db: sync preflight REFUSED — disco insuficiente (livre=$((free_kb/1024))MB precisa=$((need_kb/1024))MB, vivo=$((live_kb/1024))MB, margem=${SYNC_DISK_MARGIN_PCT}%, piso=${SYNC_DISK_FLOOR_GB}GB) — não vou escrever até o Dolt morrer (precedente: ga-odtd3f, 2026-09-21, outage de ~5h20)"
+    return 1
+  fi
+  log "$db: sync preflight OK (livre=$((free_kb/1024))MB >= precisa=$((need_kb/1024))MB, vivo=$((live_kb/1024))MB)"
+  return 0
+}
+
 # _sync_once <db> — one CALL DOLT_BACKUP('sync', ...) attempt for <db>; raw
 # dolt output goes wherever the caller redirects, dolt's own exit code is
 # returned. Factored out so the retry loop below and the selftest's
@@ -233,6 +290,10 @@ _sync_with_connection_timeout_retry() {
   for wait_sec in $RETRY_WAITS_SEC; do
     log "$db: connection-timeout on sync — retrying after ${wait_sec}s"
     sleep "$wait_sec"
+    if ! _sync_disk_preflight "$db"; then
+      log "$db: DOLT_BACKUP sync FAILED (disk preflight refused before connection-timeout retry)"
+      return 1
+    fi
     if _sync_once "$db" >> "$LOG" 2>&1; then
       log "$db: sync OK after connection-timeout retry"
       return 0
@@ -265,11 +326,19 @@ _sync_with_stale_manifest_recovery() {
     "$BACKUP_ROOT"/*) rm -rf "${dest:?}" ;;
     *) log "$db: REFUSING auto-reinit — dest '$dest' outside BACKUP_ROOT (safety guard)" ;;
   esac
+  if ! _sync_disk_preflight "$db"; then
+    log "$db: DOLT_BACKUP sync FAILED (disk preflight refused after stale-manifest reinit)"
+    return 1
+  fi
   if _sync_once "$db" >> "$LOG" 2>&1; then
     log "$db: auto-recover OK after staging reinit"
     return 0
   fi
   log "$db: stale-manifest retry FAILED — falling back to offline sync (no server involved)"
+  if ! _sync_disk_preflight "$db"; then
+    log "$db: DOLT_BACKUP sync FAILED (disk preflight refused before offline fallback)"
+    return 1
+  fi
   if _offline_backup_sync "$db" "$dest"; then
     log "$db: offline-sync fallback OK"
     return 0
@@ -497,6 +566,9 @@ for db in $DBS; do
   # the backup actually contains.
   head="$(dsql -q "SELECT commit_hash FROM \`$db\`.dolt_log ORDER BY date DESC LIMIT 1" --result-format csv 2>/dev/null | tail -1)"
   # 1) native consistent backup -> local staging (incremental)
+  if ! _sync_disk_preflight "$db"; then
+    failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(disco)"; continue
+  fi
   if ! DOLT_CLI_PASSWORD='' timeout "$SYNC_TIMEOUT" "$DOLT" --host "$HOST" --port "$PORT" \
         --user root --no-tls sql -q "USE \`$db\`; CALL DOLT_BACKUP('sync', '${db}-backup');" > "$SYNC_OUT" 2>&1; then
     cat "$SYNC_OUT" >> "$LOG"
@@ -521,6 +593,9 @@ for db in $DBS; do
         # is why hq has failed every night since 2026-09-11). Fall back to
         # the server-free path before giving up on this db.
         log "$db: connection-timeout retries exhausted — falling back to offline sync (no server involved)"
+        if ! _sync_disk_preflight "$db"; then
+          failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(disco)"; continue
+        fi
         if ! _offline_backup_sync "$db" "$dest"; then
           failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"; continue
         fi
