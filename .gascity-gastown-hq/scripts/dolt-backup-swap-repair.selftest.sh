@@ -78,6 +78,41 @@ _rr "restore+contagem" INVALID VALID 0 0 "nao-verificada explica que manifest !=
   && ok "recusa por ilegivel != recusa por saudavel" \
   || bad "as duas recusas produzem o mesmo texto"
 
+# ── _dry_run_state: o defeito que o gate ga-p3ynfr pegou ───────────────────
+# A versao anterior era `[ "$DRY_RUN" = "1" ]`: segura so com a variavel
+# NAO-DEFINIDA. Definida como "true" — a convencao mais natural para um flag
+# booleano — ela caia no else e EXECUTAVA O MV DE VERDADE. Estes testes existem
+# para que essa forma nunca volte.
+_dr() { # <esperado> <raw> <titulo>
+  local got; got="$(_dry_run_state "$2")"
+  [ "$got" = "$1" ] && ok "$3 ($got)" || bad "$3: esperado $1, veio $got"
+}
+_dr DRY  ""      "nao-definida = seco"
+_dr DRY  "1"     "1 = seco"
+_dr DRY  "true"  "REGRESSAO ga-p3ynfr: 'true' e SECO, nao acao"
+_dr DRY  "TRUE"  "'TRUE' e seco"
+_dr DRY  "yes"   "'yes' e seco"
+_dr DRY  "on"    "'on' e seco"
+_dr ACT  "0"     "0 = agir (opt-out explicito)"
+_dr ACT  "false" "'false' = agir"
+_dr ACT  "no"    "'no' = agir"
+_dr ACT  "off"   "'off' = agir"
+_dr UNRECOGNIZED "sim"   "valor nao reconhecido tem nome proprio, nao vira DRY calado"
+_dr UNRECOGNIZED "2"     "numero fora do vocabulario = UNRECOGNIZED"
+_dr UNRECOGNIZED "  1 "  "espacos em volta nao sao 1 — melhor recusar que adivinhar"
+
+# O contrato que importa: SO 'ACT' age. Tudo que nao for ACT nao toca disco.
+for v in "" 1 true TRUE yes on sim 2 "x" "  1 " "1;rm" "TrUe"; do
+  st="$(_dry_run_state "$v")"
+  [ "$st" = "ACT" ] && { bad "VALOR PERIGOSO: '$v' resolveu para ACT"; break; }
+done
+ok "nenhum valor ambiguo resolve para ACT"
+
+# E 'nao entendi' nao pode ler igual a 'voce pediu seco'.
+[ "$(_dry_run_state sim)" != "$(_dry_run_state 1)" ] \
+  && ok "UNRECOGNIZED != DRY (o chamador fica sabendo que foi ignorado)" \
+  || bad "UNRECOGNIZED e DRY colapsaram"
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" = "0" ] || exit 1
 exit 0

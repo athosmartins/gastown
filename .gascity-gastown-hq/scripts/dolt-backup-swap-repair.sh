@@ -61,7 +61,7 @@ CITY="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
 BACKUP_ROOT="${DOLT_BACKUP_SWAP_REPAIR_BACKUP_ROOT:-$CITY/.dolt-backup}"
 LOG="${DOLT_BACKUP_SWAP_REPAIR_LOG:-$CITY/.gc/logs/dolt-backup-swap-repair.log}"
 NOTIFY="${DOLT_BACKUP_SWAP_REPAIR_NOTIFY:-/Users/athos/.local/bin/notify}"
-DRY_RUN="${DOLT_BACKUP_SWAP_REPAIR_DRY_RUN:-1}"   # default DRY: acting is opt-in
+DRY_RUN_RAW="${DOLT_BACKUP_SWAP_REPAIR_DRY_RUN-}"   # unset, "", or anything unrecognized => DRY
 
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] swap-repair: $*" >> "$LOG" 2>/dev/null || true; }
@@ -72,6 +72,24 @@ notify_fail() { "$NOTIFY" -t "Dolt backup swap repair" -p 4 "🚨 $*" 2>/dev/nul
 # Every input is caller-supplied so the selftest can exercise them with no
 # filesystem, no Dolt and no real backup anywhere.
 # ════════════════════════════════════════════════════════════════════════════
+
+# _dry_run_state <raw>  ->  prints DRY | ACT | UNRECOGNIZED
+# Gate ga-p3ynfr (reviewer 1, e o revisor estava certo): a versao anterior era
+# `[ "$DRY_RUN" = "1" ]`, que so e segura enquanto a variavel esta NAO-DEFINIDA.
+# Definida com qualquer outro valor — inclusive o "true" que todo mundo escreve
+# para um flag booleano em shell — ela caia no else e executava o mv de verdade.
+# Fail-OPEN no unico ponto do arquivo que toca disco, num script cuja tese e o
+# contrario. Agora o padrao se inverte: AGIR e que exige uma palavra explicita e
+# reconhecida; todo o resto fica seco. E "nao entendi o que voce quis dizer" e um
+# terceiro estado com nome proprio (UNRECOGNIZED), nao um sinonimo silencioso de
+# DRY — o chamador precisa saber que o valor dele foi ignorado.
+_dry_run_state() {
+  case "${1-}" in
+    0|no|NO|No|false|FALSE|False|off|OFF|Off) printf 'ACT' ;;
+    ''|1|yes|YES|Yes|true|TRUE|True|on|ON|On)  printf 'DRY' ;;
+    *) printf 'UNRECOGNIZED' ;;
+  esac
+}
 
 # _classify_copy <has_dir> <has_manifest>  ->  prints one of:
 #   MISSING   — the directory is not there at all
@@ -152,8 +170,8 @@ if [ "${DOLT_BACKUP_SWAP_REPAIR_LIB:-0}" = "1" ]; then
   return 0 2>/dev/null || exit 0
 fi
 
-echo "dolt-backup-swap-repair.sh — inspecionando $BACKUP_ROOT (DRY_RUN=$DRY_RUN)"
-log "inicio (BACKUP_ROOT=$BACKUP_ROOT DRY_RUN=$DRY_RUN)"
+echo "dolt-backup-swap-repair.sh — inspecionando $BACKUP_ROOT (modo: $(_dry_run_state "$DRY_RUN_RAW"))"
+log "inicio (BACKUP_ROOT=$BACKUP_ROOT DRY_RUN_RAW='$DRY_RUN_RAW' -> $(_dry_run_state "$DRY_RUN_RAW"))"
 [ -d "$BACKUP_ROOT" ] || { echo "ERRO: $BACKUP_ROOT nao existe"; log "ERRO: BACKUP_ROOT ausente"; exit 1; }
 
 found=0
@@ -181,9 +199,15 @@ for new_dir in "$BACKUP_ROOT"/*.new; do
   verified="${DOLT_BACKUP_SWAP_REPAIR_VERIFIED:-0}"
 
   if _should_complete_swap "$pclass" "$nclass" "$oe" "$verified"; then
-    if [ "$DRY_RUN" = "1" ]; then
-      echo "  $db: TROCA INTERROMPIDA — completaria (DRY_RUN=1, nada feito)"
-      log "$db: DRY_RUN, troca interrompida detectada e nao aplicada"
+    _DRY="$(_dry_run_state "$DRY_RUN_RAW")"
+    if [ "$_DRY" != "ACT" ]; then
+      if [ "$_DRY" = "UNRECOGNIZED" ]; then
+        echo "  $db: TROCA INTERROMPIDA — NAO aplicada: DRY_RUN='$DRY_RUN_RAW' nao e um valor reconhecido, tratando como seco"
+        log "$db: DRY_RUN='$DRY_RUN_RAW' nao reconhecido -> seco (nao e o mesmo que voce ter pedido seco)"
+      else
+        echo "  $db: TROCA INTERROMPIDA — completaria (modo seco, nada feito)"
+        log "$db: seco, troca interrompida detectada e nao aplicada"
+      fi
     else
       mv "$primary_dir" "$BACKUP_ROOT/$db.old" \
         && mv "$new_dir" "$primary_dir" \
