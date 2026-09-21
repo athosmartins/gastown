@@ -4271,7 +4271,12 @@ _filter_built() {
         [ -z "$id" ] && continue
         while IFS= read -r r; do
           [ -n "$r" ] && [ -d "$r" ] || continue
-          _matched_ref=$(git -C "$r" for-each-ref --format='%(refname)' \
+          # ga-ebuj6c: --count=1 limits at the SOURCE instead of relying on
+          # `| head -1` to close the pipe early — under set -e this family can
+          # SIGPIPE the writer and abort the script (sister bug to ga-8w22n's
+          # unscoped for-each-ref). Scoped-by-id already keeps output tiny in
+          # practice; --count=1 removes the live pipe entirely, for free.
+          _matched_ref=$(git -C "$r" for-each-ref --count=1 --format='%(refname)' \
                "refs/remotes/origin/crew/*/$id" "refs/heads/crew/*/$id" \
                "refs/remotes/origin/fix/$id-*" "refs/heads/fix/$id-*" 2>/dev/null | head -1)
           if [ -n "$_matched_ref" ]; then
@@ -5527,7 +5532,10 @@ _crew_progressed_since() {
   while IFS= read -r _repo; do
     [ -n "$_repo" ] && [ -d "$_repo" ] || continue
     for _pat in "crew/$_crew/" "crew/$_short/"; do
-      _latest=$(git -C "$_repo" for-each-ref --sort=-committerdate \
+      # ga-ebuj6c: --count=1 applies AFTER --sort, so this still returns the
+      # single most-recent matching ref — same result as `| head -1`, minus
+      # the live pipe a set -e script could SIGPIPE-abort on.
+      _latest=$(git -C "$_repo" for-each-ref --count=1 --sort=-committerdate \
         --format='%(committerdate:unix)' \
         "refs/remotes/origin/${_pat}*" "refs/heads/${_pat}*" 2>/dev/null | head -1)
       [ -n "$_latest" ] && [ "$_latest" -gt "$_since" ] 2>/dev/null && return 0
@@ -5853,7 +5861,10 @@ _beadid_needs_remerge_branch() {
   [ -n "$_repos" ] || return 1
   while IFS= read -r _repo; do
     [ -n "$_repo" ] && [ -d "$_repo" ] || continue
-    _match=$(git -C "$_repo" for-each-ref --format='%(refname:short)' \
+    # ga-ebuj6c: --count=1 limits at the source instead of relying on the
+    # trailing `| head -1` to close the pipe early under set -e (same
+    # rationale as the _filter_built fix above, ~L4276).
+    _match=$(git -C "$_repo" for-each-ref --count=1 --format='%(refname:short)' \
       "refs/heads/fix/${_bid}" "refs/heads/fix/${_bid}-*" \
       "refs/remotes/origin/fix/${_bid}" "refs/remotes/origin/fix/${_bid}-*" \
       2>/dev/null | head -1)
