@@ -397,6 +397,66 @@ seed_symbol_result() {
   echo "$2" > "$MOCK/symbol_mode.$sanitized"
 }
 
+# ga-abofl6 (header point 20): a stub scripts/detect_stale_daemons.py, CLI-
+# compatible with the real one's --mode/--no-fetch/--json contract but driven
+# by a control file instead of real git/launchd inspection — the real
+# script's own "own mode" algorithm is whatsapp_automation's own pytest
+# suite's concern (test_detect_stale_daemons_*.py), not this HQ integration's.
+# Same shape as make_symbol_script above: reads $MOCK_DIR the same way the
+# launchctl/ps/symbol-script mocks do (inherited from run_helper's exported
+# MOCK_DIR, no extra wiring).
+make_stale_detector_script() {  # make_stale_detector_script <runtime-dir>
+  mkdir -p "$1/scripts"
+  cat > "$1/scripts/detect_stale_daemons.py" <<'PYEOF'
+#!/usr/bin/env python3
+import argparse, json, os, sys, time
+ap = argparse.ArgumentParser()
+ap.add_argument("--notify", action="store_true")
+ap.add_argument("--seen", default="")
+ap.add_argument("--no-fetch", action="store_true")
+ap.add_argument("--mode", default="closure")
+ap.add_argument("--json", action="store_true")
+args = ap.parse_args()
+mock = os.environ.get("MOCK_DIR", "")
+if not args.json:
+    print("0 daemons stale -- tudo live.")
+    sys.exit(0)
+mode_path = os.path.join(mock, "stale_detector_mode") if mock else ""
+ctrl_mode = open(mode_path).read().strip() if mode_path and os.path.exists(mode_path) else ""
+if ctrl_mode == "crash":
+    sys.exit(1)
+if ctrl_mode == "hang":
+    time.sleep(20)
+if ctrl_mode == "badjson":
+    print("not valid json")
+    sys.exit(0)
+payload_path = os.path.join(mock, "stale_detector.json") if mock else ""
+payload = json.load(open(payload_path)) if payload_path and os.path.exists(payload_path) else {}
+print(json.dumps({"mode": args.mode, "known": payload.get("known", []),
+                   "affected": payload.get("affected", [])}))
+sys.exit(0)
+PYEOF
+  chmod +x "$1/scripts/detect_stale_daemons.py"
+}
+# seed_stale_detector <known-relpaths-str> <affected-relpaths-str> — writes
+# the control file the stub above reads. Both args are space-separated
+# relpath lists (bash word-splitting, same convention as every other
+# space-separated set in this test file); affected should be a subset of
+# known (mirrors the real --json contract) but the stub does not enforce it.
+seed_stale_detector() {  # seed_stale_detector <known> <affected>
+  python3 - "$MOCK/stale_detector.json" "$1" "$2" <<'PY'
+import json, sys
+path, known_str, affected_str = sys.argv[1], sys.argv[2], sys.argv[3]
+json.dump({"known": known_str.split(), "affected": affected_str.split()}, open(path, "w"))
+PY
+}
+# seed_stale_detector_mode <crash|hang|badjson> — makes the stub fail in a
+# specific way instead of returning a seeded payload (default when unseeded:
+# returns whatever seed_stale_detector wrote, or {"known":[],"affected":[]}).
+seed_stale_detector_mode() {  # seed_stale_detector_mode <mode>
+  echo "$1" > "$MOCK/stale_detector_mode"
+}
+
 run_helper() {  # run_helper <changed-relpaths...>  (commits a deploy diff first)
   # PRE = current HEAD; mutate the listed files; POST = new HEAD.
   ( cd "$RUNTIME"
@@ -428,6 +488,7 @@ run_helper() {  # run_helper <changed-relpaths...>  (commits a deploy diff first
   LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" \
   VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
   SYMBOL_REACHABILITY_TOTAL_TIMEOUT="${SYMBOL_REACHABILITY_TOTAL_TIMEOUT:-10}" \
+  RIG_STALE_DETECTOR_TIMEOUT="${RIG_STALE_DETECTOR_TIMEOUT:-3}" \
   DRY_RUN="${DRY_RUN:-0}" \
   bash "$HELPER" 2>/dev/null
 }
@@ -464,6 +525,7 @@ run_helper_stderr() {  # run_helper_stderr <changed-relpaths...>
   LAUNCH_AGENTS_DIR="$AGENTS" \
   LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" \
   VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 \
+  RIG_STALE_DETECTOR_TIMEOUT="${RIG_STALE_DETECTOR_TIMEOUT:-3}" \
   DRY_RUN="${DRY_RUN:-0}" \
   bash "$HELPER" 2>&1
 }
@@ -3175,6 +3237,134 @@ echo "$(field GUARDED "$OUT")" | grep "com.test.stuck-sensitive" >/dev/null \
 echo "$(field ALREADY_FRESH "$OUT")" | grep "com.test.stuck-sensitive" >/dev/null \
   && ok "T85 stuck-sensitive reported via ALREADY_FRESH" \
   || nok "T85 ALREADY_FRESH should include stuck-sensitive" "$(field ALREADY_FRESH "$OUT")"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T86 (ga-abofl6, header point 20 -- BASELINE): no scripts/detect_stale_
+# daemons.py on this rig. A shared lib change fans out via deploy_deps.json's
+# closure exactly like today, pre-fix -- documents the behavior T87 changes,
+# and proves the new consultation is a pure no-op when the rig lacks it.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t86
+mkdir -p "$RUNTIME/lib"
+cat > "$RUNTIME/lib/shared.py" <<<'def v(): return 1'
+cat > "$RUNTIME/daemons/dashboard_a.py" <<'PYEOF'
+from lib import shared
+def index():
+    return shared.v()
+PYEOF
+cat > "$RUNTIME/daemons/deploy_deps.json" <<'JSONEOF'
+{"daemons": {"daemons/dashboard_a.py": {"label": "com.test.dashboard-a",
+  "closure": ["daemons/dashboard_a.py", "lib/shared.py"]}}}
+JSONEOF
+make_plist "$AGENTS" com.test.dashboard-a "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/dashboard_a.py"
+seed_running com.test.dashboard-a 86001 "$STALE_LSTART"
+seed_restart com.test.dashboard-a 86002 "$FRESH_LSTART"
+OUT=$(run_helper lib/shared.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T86 baseline verdict OK (restarted+verified fresh)" || nok "T86 verdict" "got '$V' out=[$OUT]"
+echo "$(field AFFECTED "$OUT")" | grep "com.test.dashboard-a" >/dev/null \
+  && ok "T86 baseline: shared-lib change fans out to dashboard-a via closure (today's exact pre-fix behavior)" \
+  || nok "T86 baseline should flag dashboard-a via closure" "AFFECTED=[$(field AFFECTED "$OUT")]"
+[ "$(field RIG_DETECTOR_USED "$OUT")" = "0" ] && ok "T86 RIG_DETECTOR_USED=0 (no rig script on this rig)" || nok "T86 rig_detector_used" "$(field RIG_DETECTOR_USED "$OUT")"
+[ -z "$(field AFFECTED_RIG_DETECTOR "$OUT")" ] && ok "T86 AFFECTED_RIG_DETECTOR empty" || nok "T86 affected_rig_detector" "$(field AFFECTED_RIG_DETECTOR "$OUT")"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T87 (ga-abofl6, header point 20 -- THE FIX): same shared-lib fixture as T86,
+# but the rig NOW has scripts/detect_stale_daemons.py, and its --mode own
+# verdict for daemons/dashboard_a.py is FRESH (not in "affected") even though
+# deploy_deps.json's closure still intersects the changed file. dashboard-a
+# must NOT land in AFFECTED -- this is the exact 16-vs-2 false-positive this
+# bead measured, reduced to one daemon: the rig detector's precise answer now
+# REPLACES, not just annotates, the closure-only signal.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t87
+make_stale_detector_script "$RUNTIME"
+mkdir -p "$RUNTIME/lib"
+cat > "$RUNTIME/lib/shared.py" <<<'def v(): return 1'
+cat > "$RUNTIME/daemons/dashboard_a.py" <<'PYEOF'
+from lib import shared
+def index():
+    return shared.v()
+PYEOF
+cat > "$RUNTIME/daemons/deploy_deps.json" <<'JSONEOF'
+{"daemons": {"daemons/dashboard_a.py": {"label": "com.test.dashboard-a",
+  "closure": ["daemons/dashboard_a.py", "lib/shared.py"]}}}
+JSONEOF
+make_plist "$AGENTS" com.test.dashboard-a "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/dashboard_a.py"
+seed_running com.test.dashboard-a 87001 "$STALE_LSTART"
+seed_stale_detector "daemons/dashboard_a.py" ""
+OUT=$(run_helper lib/shared.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T87 verdict OK -- nothing restarted, rig detector confirmed fresh" || nok "T87 verdict" "got '$V' out=[$OUT]"
+echo "$(field AFFECTED "$OUT")" | grep "com.test.dashboard-a" >/dev/null \
+  && nok "T87 dashboard-a must NOT be AFFECTED -- rig detector positively said fresh" "AFFECTED=[$(field AFFECTED "$OUT")]" \
+  || ok "T87 dashboard-a correctly excluded from AFFECTED despite closure intersecting the changed file (the false positive this bead measured, suppressed)"
+[ "$(field RIG_DETECTOR_USED "$OUT")" = "1" ] && ok "T87 RIG_DETECTOR_USED=1" || nok "T87 rig_detector_used" "$(field RIG_DETECTOR_USED "$OUT")"
+[ -z "$(field AFFECTED_RIG_DETECTOR "$OUT")" ] && ok "T87 AFFECTED_RIG_DETECTOR empty (consulted, confirmed nothing stale)" || nok "T87 affected_rig_detector" "$(field AFFECTED_RIG_DETECTOR "$OUT")"
+[ -z "$(cat "$MOCK/kicks.log" 2>/dev/null)" ] && ok "T87 dashboard-a was never kickstarted" || nok "T87 unexpected kickstart" "$(cat "$MOCK/kicks.log")"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T88 (ga-abofl6, header point 20): dashboard-b has NO deploy_deps.json entry
+# at all (the "processo FORA da tabela ainda é checado" promise, one level up
+# the stack: daemon-refresh.sh's OWN consumption of the rig detector must not
+# require JSON coverage either) and the changed file is neither its own
+# entrypoint nor anything it imports -- so every ad-hoc check (direct/import/
+# route/template) would say NOT affected. Only the rig detector's own_file
+# claim makes it AFFECTED here, isolating that this layer, not the pre-
+# existing ad-hoc matching, is what fired. SENSITIVE + no drain path ->
+# NEEDS_GUARDED_RESTART, proving GUARDED_RIG_DETECTOR attribution too.
+# ════════════════════════════════════════════════════════════════════════════
+SENSITIVE_DAEMONS="dashboard-b"
+new_case t88
+make_stale_detector_script "$RUNTIME"
+cat > "$RUNTIME/daemons/dashboard_b.py" <<<'def index(): return "b"'
+make_plist "$AGENTS" com.test.dashboard-b "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/dashboard_b.py"
+seed_running com.test.dashboard-b 88001 "$STALE_LSTART"
+seed_stale_detector "daemons/dashboard_b.py" "daemons/dashboard_b.py"
+OUT=$(run_helper lib/totally_unrelated.py); RC=$?
+SENSITIVE_DAEMONS=""
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T88 verdict NEEDS_GUARDED_RESTART" || nok "T88 verdict" "got '$V' out=[$OUT]"
+echo "$(field AFFECTED_RIG_DETECTOR "$OUT")" | grep "com.test.dashboard-b" >/dev/null \
+  && ok "T88 dashboard-b's AFFECTED status was decided by the rig detector alone (no JSON entry, no ad-hoc hit possible)" \
+  || nok "T88 affected_rig_detector should include dashboard-b" "$(field AFFECTED_RIG_DETECTOR "$OUT")"
+echo "$(field GUARDED_RIG_DETECTOR "$OUT")" | grep "com.test.dashboard-b" >/dev/null \
+  && ok "T88 lands in GUARDED_RIG_DETECTOR" || nok "T88 guarded_rig_detector" "$(field GUARDED_RIG_DETECTOR "$OUT")"
+echo "$(field GUARDED "$OUT")" | grep "com.test.dashboard-b" >/dev/null \
+  && ok "T88 flat GUARDED membership unaffected by which mechanism decided it" || nok "T88 guarded" "$(field GUARDED "$OUT")"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T89 (ga-abofl6, header point 20): the rig HAS detect_stale_daemons.py, but
+# it crashes (nonzero exit) this run. Must degrade to EXACTLY T86's baseline
+# (closure still flags dashboard-a) -- a failing rig detector must never be
+# worse than an absent one -- and RIG_DETECTOR_USED must stay 0: a crash is
+# not a positive confirmation of freshness.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t89
+make_stale_detector_script "$RUNTIME"
+seed_stale_detector_mode crash
+mkdir -p "$RUNTIME/lib"
+cat > "$RUNTIME/lib/shared.py" <<<'def v(): return 1'
+cat > "$RUNTIME/daemons/dashboard_a.py" <<'PYEOF'
+from lib import shared
+def index():
+    return shared.v()
+PYEOF
+cat > "$RUNTIME/daemons/deploy_deps.json" <<'JSONEOF'
+{"daemons": {"daemons/dashboard_a.py": {"label": "com.test.dashboard-a",
+  "closure": ["daemons/dashboard_a.py", "lib/shared.py"]}}}
+JSONEOF
+make_plist "$AGENTS" com.test.dashboard-a "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/dashboard_a.py"
+seed_running com.test.dashboard-a 89001 "$STALE_LSTART"
+seed_restart com.test.dashboard-a 89002 "$FRESH_LSTART"
+OUT=$(run_helper_stderr lib/shared.py); RC=$?
+echo "$(field AFFECTED "$OUT")" | grep "com.test.dashboard-a" >/dev/null \
+  && ok "T89 fail-soft: a crashing rig detector falls back to closure, dashboard-a still correctly flagged" \
+  || nok "T89 should still flag dashboard-a via closure fallback" "AFFECTED=[$(field AFFECTED "$OUT")]"
+[ "$(field RIG_DETECTOR_USED "$OUT")" = "0" ] && ok "T89 RIG_DETECTOR_USED=0 (a crash is not a confirmation)" || nok "T89 rig_detector_used" "$(field RIG_DETECTOR_USED "$OUT")"
+echo "$OUT" | grep -q "WARN:.*detect_stale_daemons.py" \
+  && ok "T89 a WARN log names the failing rig detector (not silent)" \
+  || nok "T89 expected a WARN mentioning detect_stale_daemons.py" "$OUT"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""

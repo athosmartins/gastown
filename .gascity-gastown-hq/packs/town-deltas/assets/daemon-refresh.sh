@@ -458,6 +458,50 @@
 #      restart that residual risk is what the guarded-restart hold exists for;
 #      for one that automation may NEVER restart, the alternative is a hold that
 #      can never clear, which is why only the locked class is released on it.
+#  20. (ga-abofl6) Points 1-19 all answer "does this entrypoint's CLOSURE/import-
+#      graph reach a changed file?" — a family of increasingly careful
+#      REIMPLEMENTATIONS of that question, never a consultation of the rig's
+#      OWN answer. MEDIDO 21/09: at the same instant, closure (what this script
+#      used) said 16 daemons needed a restart; whatsapp_automation's own
+#      scripts/detect_stale_daemons.py --mode own (already tested, already
+#      scheduled daily via com.whatsapp.stale-daemons-daily, already the tool
+#      that ESCALATES real staleness to a bead) said 2 — and of those 2, one
+#      (campaign_scheduler) was itself cosmetic for a reason neither detector
+#      alone could see (an added parameter whose else-branch is byte-identical
+#      to the old code). Cost: four same-shaped alerts in one day demanding a
+#      guarded restart of up to 14 production daemons — including
+#      demand_dashboard, which hosts outreach and carries a human lock — each
+#      requiring a human to read a diff by hand to learn it wasn't needed.
+#      FIX (per CLAUDE.md's own "Deploy / Restart Hygiene": restart only who
+#      actually USES the new symbol): when the rig exposes a verdict tool,
+#      CONSUME it, don't reimplement it — two implementations of the same
+#      question diverge by construction, which is exactly what happened here.
+#      DESIGN CONSTRAINT this fix cannot violate: not every rig has this
+#      detector, and "the rig said no" must never look identical to "the rig
+#      has no way to say" — today those two collapse into the same silence.
+#      So: $RUNTIME_DIR/scripts/detect_stale_daemons.py, when present, is
+#      invoked ONCE (--mode own --no-fetch --json, bounded by
+#      RIG_STALE_DETECTOR_TIMEOUT) for a {"known":[...],"affected":[...]}
+#      answer keyed by entrypoint relpath — mirroring deploy_deps.json's own
+#      K:/A: shape (header point 14) precisely so Step 3 below reuses the
+#      identical "trust exclusively when covered, fall through only when it
+#      isn't" pattern, with the rig detector taking precedence OVER deploy_
+#      deps.json's broader closure (own mode already folds in registered
+#      template/static assets AND one-hop imports — see detect_stale_
+#      daemons.py's own docstring — so a covered entry's verdict already
+#      accounts for what the ad-hoc/JSON-closure checks would otherwise ask).
+#      RIG_DETECTOR_USED (rig-level: was it consulted successfully this run —
+#      0 for both "absent" and "present but crashed/timed out/bad JSON", the
+#      same fail-soft default every other point-14-shaped consultation in
+#      this file already uses) plus AFFECTED_RIG_DETECTOR/GUARDED_RIG_
+#      DETECTOR (label-level: which of THIS run's AFFECTED/GUARDED members
+#      came from it) are the new always-present fields that let a consumer
+#      tell "the rig detector ran and confirmed nothing needed restarting"
+#      apart from "it was never asked" — the exact distinction this bead's
+#      own description demanded, and the one thing an annotation-only layer
+#      (points 16-19) could never provide, because none of those change
+#      membership. This one does, deliberately: suppressing the false
+#      positive IS the fix, not a side effect of one.
 #
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
@@ -518,6 +562,18 @@
 #     classified GUARDED_SYMBOL_NO_EVIDENCE. Annotation only — VERDICT and
 #     GUARDED never change. A consumer may stop holding a delivery for such a
 #     daemon ONLY on positive membership: every still-stale label named here.)
+#   RIG_DETECTOR_USED=0|1   AFFECTED_RIG_DETECTOR=<labels>
+#     GUARDED_RIG_DETECTOR=<labels>   (ga-abofl6, header point 20: always
+#     present. RIG_DETECTOR_USED is rig-level — 1 only when $RUNTIME_DIR/
+#     scripts/detect_stale_daemons.py exists AND this run's --mode own --json
+#     call succeeded; 0 covers both "absent" and "present but failed", so a
+#     consumer must check it before treating an empty AFFECTED_RIG_DETECTOR as
+#     "the rig confirmed everything fresh" rather than "never asked". The
+#     other two are label-level: unlike GUARDED_OWN/CLOSURE_ONLY (a partition
+#     of GUARDED) or GUARDED_SYMBOL_* (an annotation that never changes
+#     membership), these mark labels whose AFFECTED/GUARDED membership itself
+#     was DECIDED by the rig detector — this layer suppresses false positives,
+#     it does not just describe them.)
 #   WOULD_RESTART=<labels>   (ga-omfwe: DRY_RUN=1 only — labels that would be
 #     restarted for real; RESTARTED is always empty under DRY_RUN=1, so the
 #     two never collapse into the same string)
@@ -570,6 +626,12 @@
 #                     bound too, removed with the per-label subprocess loop
 #                     it governed) — tripping it degrades whichever labels
 #                     hadn't finished yet to NÃO CALCULADO.
+#   RIG_STALE_DETECTOR_TIMEOUT   seconds for the ONE $RUNTIME_DIR/scripts/
+#                     detect_stale_daemons.py --mode own --json call (default
+#                     30; ga-abofl6, header point 20) — tripping it, or the
+#                     script failing/being absent, leaves RIG_DETECTOR_USED=0
+#                     and every entrypoint falls through to today's exact
+#                     deploy_deps.json/ad-hoc behavior (fail-soft).
 
 set -uo pipefail
 
@@ -617,6 +679,10 @@ PS_BIN="${PS_BIN:-ps}"
 # per-label subprocess loop point 18 replaced, and has no meaning against a
 # single batched call, so it's gone — only the total budget remains.
 SYMBOL_REACHABILITY_TOTAL_TIMEOUT="${SYMBOL_REACHABILITY_TOTAL_TIMEOUT:-30}"
+# ga-abofl6 (header point 20): bounds the ONE detect_stale_daemons.py --json
+# call below. Same "trip it, degrade to today's exact fallback" shape as
+# SYMBOL_REACHABILITY_TOTAL_TIMEOUT above, never blocks the halt past it.
+RIG_STALE_DETECTOR_TIMEOUT="${RIG_STALE_DETECTOR_TIMEOUT:-30}"
 VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-20}"
 VERIFY_INTERVAL="${VERIFY_INTERVAL:-1}"
 
@@ -799,6 +865,15 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   # reads it unconditionally; an absent line means an older helper and is never
   # the same as an empty one.
   echo "GUARDED_LOCKED_COSMETIC=${GUARDED_LOCKED_COSMETIC:-}"
+  # ga-abofl6 (header point 20): always present, even empty — same convention
+  # as every other field above. RIG_DETECTOR_USED distinguishes "consulted,
+  # confirmed nothing" (AFFECTED_RIG_DETECTOR/GUARDED_RIG_DETECTOR empty, USED=1)
+  # from "never asked" (empty, USED=0) — the one thing this run's fallback to
+  # today's closure/ad-hoc behavior must never let look the same as a positive
+  # rig confirmation.
+  echo "RIG_DETECTOR_USED=${RIG_DETECTOR_USED:-0}"
+  echo "AFFECTED_RIG_DETECTOR=${AFFECTED_RIG_DETECTOR:-}"
+  echo "GUARDED_RIG_DETECTOR=${GUARDED_RIG_DETECTOR:-}"
   echo "ALREADY_FRESH=${ALREADY_FRESH:-}"
   echo "WOULD_RESTART=${WOULD_RESTART:-}"
   # ga-tdzsh: always present (even on the early-precondition emits above,
@@ -816,9 +891,9 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   # same convention as PARSE_ERROR_LOADED/UNLOADED above.
   echo "UNATTRIBUTED_JOB_GAP=${SJ_UNATTRIBUTED_REASON:-}"
   # Trailing JSON for the caller's bead comment / jsonl log.
-  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" "${AFFECTED_NOT_RUNNING:-}" "${GUARDED_OWN:-}" "${GUARDED_CLOSURE_ONLY:-}" "${GUARDED_SYMBOL_CONFIRMED:-}" "${GUARDED_SYMBOL_NO_EVIDENCE:-}" "${GUARDED_SYMBOL_NOT_COMPUTED:-}" "${GUARDED_LOCKED_COSMETIC:-}" <<'PY' 2>/dev/null || true
+  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" "${AFFECTED_NOT_RUNNING:-}" "${GUARDED_OWN:-}" "${GUARDED_CLOSURE_ONLY:-}" "${GUARDED_SYMBOL_CONFIRMED:-}" "${GUARDED_SYMBOL_NO_EVIDENCE:-}" "${GUARDED_SYMBOL_NOT_COMPUTED:-}" "${GUARDED_LOCKED_COSMETIC:-}" "${AFFECTED_RIG_DETECTOR:-}" "${GUARDED_RIG_DETECTOR:-}" "${RIG_DETECTOR_USED:-0}" <<'PY' 2>/dev/null || true
 import json, sys
-v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg, anr, gd_own, gd_co, gd_sc, gd_sne, gd_snc, gd_lc = sys.argv[1:20]
+v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg, anr, gd_own, gd_co, gd_sc, gd_sne, gd_snc, gd_lc, afr_rig, gd_rig, rdu = sys.argv[1:23]
 sp = lambda s: [x for x in s.split() if x]
 print("JSON=" + json.dumps({
     "verdict": v, "reason": reason,
@@ -828,6 +903,8 @@ print("JSON=" + json.dumps({
     "guarded_symbol_confirmed": sp(gd_sc), "guarded_symbol_no_evidence": sp(gd_sne),
     "guarded_symbol_not_computed": sp(gd_snc),
     "guarded_locked_cosmetic": sp(gd_lc),
+    "affected_rig_detector": sp(afr_rig), "guarded_rig_detector": sp(gd_rig),
+    "rig_detector_used": rdu == "1",
     "already_fresh": sp(afr), "would_restart": sp(wr),
     "parse_error_loaded": sp(pel), "parse_error_unloaded": sp(peu),
     "unattributed_job_gap": ujg,
@@ -850,6 +927,11 @@ GUARDED_SYMBOL_CONFIRMED=""; GUARDED_SYMBOL_NO_EVIDENCE=""; GUARDED_SYMBOL_NOT_C
 # automation AND cleanly classified no-evidence. Built in Step 5, right after
 # the three lists above are final; empty on every path that never reaches it.
 GUARDED_LOCKED_COSMETIC=""
+# ga-abofl6 (header point 20): AFFECTED_RIG_DETECTOR is a subset of AFFECTED
+# (built at Step 3, same boundary as AFFECTED_OWN above); GUARDED_RIG_DETECTOR
+# is built from it at Step 4 via classify_guarded(), same shape as GUARDED_OWN/
+# GUARDED_CLOSURE_ONLY. RIG_DETECTOR_USED is rig-level, set once at Step 3.
+AFFECTED_RIG_DETECTOR=""; GUARDED_RIG_DETECTOR=""; RIG_DETECTOR_USED=0
 # wa-xokje: subset of AFFECTED that Step 4 below finds has no live PID at all
 # (a scheduled/one-shot job or an already-down daemon) — never kickstarted,
 # never a restart candidate, and — unlike a live daemon — cannot be made
@@ -1880,6 +1962,65 @@ for p in entry.get("closure") or []:
 PY
 }
 
+# ── rig-owned own-mode stale detector consultation (ga-abofl6, header point 20) ─
+# See header point 20 for the full rationale. Computed ONCE here, same "one
+# python3 spawn total for the whole run" shape as the deploy_deps.json block
+# above — RIG_STALE_SCRIPT's --json output already IS the two K:/A|"known"/
+# "affected" sets, no per-daemon re-derivation needed. Bounded by `timeout`:
+# an external rig script is not this file's to trust with an unbounded wait
+# (same reasoning SYMBOL_REACHABILITY_TOTAL_TIMEOUT already applies to
+# compute_symbol_reachability.py above).
+RIG_STALE_SCRIPT="$RUNTIME_DIR/scripts/detect_stale_daemons.py"
+RIG_KNOWN_ENTRYPOINTS=""
+RIG_AFFECTED_ENTRYPOINTS=""
+if [ -f "$RIG_STALE_SCRIPT" ]; then
+  RSD_JSON="$(timeout "$RIG_STALE_DETECTOR_TIMEOUT" python3 "$RIG_STALE_SCRIPT" --mode own --no-fetch --json 2>/dev/null)"
+  RSD_RC=$?
+  if [ "$RSD_RC" -eq 0 ] && [ -n "$RSD_JSON" ]; then
+    # ga-abofl6: argv, not a piped stdin -- `python3 -` already consumes the
+    # heredoc below AS its own program source, so stdin is spent before the
+    # program body ever runs; a second redirect/pipe into the same fd0 cannot
+    # also deliver data (the deploy_deps.json/json_closure_for_entry blocks
+    # above never hit this because they pass a FILE PATH via argv and let the
+    # script open it itself -- same shape, applied to a string instead).
+    RSD_LINES="$(python3 - "$RSD_JSON" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+    known = d.get("known") or []
+    affected = d.get("affected") or []
+    if not isinstance(known, list) or not isinstance(affected, list):
+        raise ValueError("known/affected not lists")
+except Exception:
+    sys.exit(1)
+for p in known:
+    if isinstance(p, str):
+        print("K:" + p)
+for p in affected:
+    if isinstance(p, str):
+        print("A:" + p)
+PY
+)"
+    if [ $? -eq 0 ]; then
+      RIG_KNOWN_ENTRYPOINTS="$(echo "$RSD_LINES" | sed -n 's/^K://p' | tr '\n' ' ')"
+      RIG_AFFECTED_ENTRYPOINTS="$(echo "$RSD_LINES" | sed -n 's/^A://p' | tr '\n' ' ')"
+      RIG_DETECTOR_USED=1
+    else
+      log "WARN: $RIG_STALE_SCRIPT --json produced output that wasn't the expected {\"known\":[...],\"affected\":[...]} shape — every entrypoint falls back to deploy_deps.json/ad-hoc matching for this run (fail-soft, same as an unparseable deploy_deps.json above)."
+    fi
+  else
+    log "WARN: $RIG_STALE_SCRIPT --mode own --no-fetch --json failed or timed out (rc=$RSD_RC, timeout=${RIG_STALE_DETECTOR_TIMEOUT}s) — every entrypoint falls back to deploy_deps.json/ad-hoc matching for this run. RIG_DETECTOR_USED stays 0: 'the rig detector failed to answer' must never look like 'it positively confirmed nothing is stale'."
+  fi
+fi
+# does the rig's own detector's own-mode examine <entrypoint-relpath> at all?
+rig_detector_covers_entry() {  # rig_detector_covers_entry <entrypoint-relpath>
+  case " $RIG_KNOWN_ENTRYPOINTS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+# did the rig's own detector's own-mode find <entrypoint-relpath> stale?
+rig_detector_entry_affected() {  # rig_detector_entry_affected <entrypoint-relpath>
+  case " $RIG_AFFECTED_ENTRYPOINTS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+
 # ── Step 3: resolve affected daemons ──────────────────────────────────────────
 for label in $DAEMON_LABELS; do
   entries="$(cat "$DISCO_DIR/$label")"
@@ -1897,9 +2038,18 @@ for label in $DAEMON_LABELS; do
   # "direct" self-changed case below for a covered entry — no separate check
   # needed for it.
   ad_hoc_entries=""
+  rig_hit=0
   for e in $entries; do
     TOTAL_ENTRY_COUNT=$((TOTAL_ENTRY_COUNT + 1))
-    if json_covers_entry "$e"; then
+    # (ga-abofl6, header point 20) rig detector takes precedence OVER
+    # deploy_deps.json's closure — trust it EXCLUSIVELY when it covers this
+    # entry, same "supplementing would let a false positive leak through"
+    # reasoning as the JSON split below, one tier up: own mode already folds
+    # in registered assets + one-hop imports, so a covered entry's verdict
+    # already subsumes what the JSON/ad-hoc checks would otherwise ask.
+    if rig_detector_covers_entry "$e"; then
+      if rig_detector_entry_affected "$e"; then affected=1; rig_hit=1; fi
+    elif json_covers_entry "$e"; then
       JSON_COVERED_ENTRY_COUNT=$((JSON_COVERED_ENTRY_COUNT + 1))
       json_entry_affected "$e" && affected=1
     else
@@ -1976,6 +2126,12 @@ for label in $DAEMON_LABELS; do
   [ "$affected" -eq 1 ] || continue
   AFFECTED="$AFFECTED $label"
   log "AFFECTED: $label (entrypoints:$entries)"
+  # (ga-abofl6, header point 20) did the rig's own detector decide THIS
+  # label's affected=1, for at least one of its entries? Independent of
+  # own_hit below (own_hit asks "is the entrypoint's OWN file in the diff",
+  # this asks "which mechanism made the call") — a rig-detector hit can be
+  # own_hit=1 (its own .py changed) or 0 (a one-hop import changed instead).
+  [ "$rig_hit" -eq 1 ] && AFFECTED_RIG_DETECTOR="$AFFECTED_RIG_DETECTOR $label"
 
   # wa-flysp (header point 16): independently of WHICH check above set
   # affected=1 (direct, import-level, route-hop, JSON-closure, or template),
@@ -2012,6 +2168,7 @@ done
 
 AFFECTED="$(echo "$AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
 AFFECTED_OWN="$(echo "$AFFECTED_OWN" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+AFFECTED_RIG_DETECTOR="$(echo "$AFFECTED_RIG_DETECTOR" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
 
 # ga-fzfqsu: FORCE_RESTART_LABELS (delivery-runbooks.toml's daemon_restarts,
 # threaded through by the caller) forces its labels into AFFECTED
@@ -2459,6 +2616,12 @@ classify_guarded() {  # classify_guarded <label>
     *" $1 "*) GUARDED_OWN="$GUARDED_OWN $1" ;;
     *) GUARDED_CLOSURE_ONLY="$GUARDED_CLOSURE_ONLY $1" ;;
   esac
+  # (ga-abofl6, header point 20) a FOURTH, independent split — orthogonal to
+  # the OWN/CLOSURE_ONLY partition above, same convention as GUARDED_SYMBOL_*
+  # below: never a subdivision of either bucket, just an additional fact.
+  case " $AFFECTED_RIG_DETECTOR " in
+    *" $1 "*) GUARDED_RIG_DETECTOR="$GUARDED_RIG_DETECTOR $1" ;;
+  esac
 }
 
 # ga-4oh2r6, replacing the ga-8q1ulq per-label symbol_reachability_for(): does
@@ -2603,6 +2766,7 @@ FRESH_FAIL="$(echo "$FRESH_FAIL" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | se
 GUARDED="$(echo "$GUARDED" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
 GUARDED_OWN="$(echo "$GUARDED_OWN" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
 GUARDED_CLOSURE_ONLY="$(echo "$GUARDED_CLOSURE_ONLY" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+GUARDED_RIG_DETECTOR="$(echo "$GUARDED_RIG_DETECTOR" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
 ALREADY_FRESH="$(echo "$ALREADY_FRESH" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
 WOULD_RESTART="$(echo "$WOULD_RESTART" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
 
