@@ -30,15 +30,21 @@ WHAT THIS FILE DOES NOT DO: it does not decide anything on its own. It answers o
 question a caller poses, and logs the answer. The caller (e.g. the watchdog bash script)
 is still the one deciding whether an alert exists at all.
 
-CREDENTIALS: reads CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN from the environment.
-Neither is set as of 2026-09-22 (checked via `secret` against Bitwarden — nothing found;
-see wa-dln9g) — until they are, call_jev() always returns ok=False, error=no_credentials,
-which the suppression logic (by design, not by accident) treats as "escalate anyway".
-The HTTP client itself is written against Cloudflare's documented request/response shape
-(developers.cloudflare.com/ai/models/typesafe/jev/) but has never been exercised against
-the live API — it defends against BOTH a bare model response and Cloudflare's usual
-{"result": ..., "success": ...} v4 envelope, and fails closed (ok=False) on anything it
-can't parse, rather than guessing.
+CREDENTIALS: reads CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN from the environment,
+stored in Bitwarden as the "cloudflare-workers-ai" item (username=account id,
+password=token; `secret cloudflare-workers-ai --field username|password`). Live and
+verified end-to-end against the real API 2026-09-22 (Athos enabled AI Gateway Unified
+Billing) — the response shape is ONE LEVEL DEEPER than either the model docs' bare
+example or Cloudflare's usual {"result": ...} v4 envelope: {"result": {"state":
+"Completed", "result": {"answers": ..., "usage": ...}, "gatewayMetadata": ...}}. The
+first version of call_jev() only unwrapped once and silently returned ok=False on every
+real call — safe (fail-closed), but the experiment would have run forever in
+never-suppress mode while looking live. Fixed to walk candidate unwrap levels and use
+the first one that actually has an "answers" dict, still never guessing past that (see
+_selftest, which locks in both the real double-wrapped shape and the flatter one as a
+regression guard). If a credential is ever missing, call_jev() returns ok=False,
+error=no_credentials, and the suppression logic (by design) treats that as "escalate
+anyway" — same fail-closed direction as every parse failure below.
 
 CLI:
   python3 jev_experiment.py evaluate --entity-id <id> --experiment <name> \\
@@ -118,12 +124,25 @@ def call_jev(state: str, question_key: str, instructions: str, true_desc: str, f
     except json.JSONDecodeError as e:
         return {"ok": False, "error": f"bad_json: {e}"}
 
-    # Cloudflare's v4 API normally wraps model output in {"result": ..., "success": ...};
-    # the model docs' own example shows the inner shape directly. Accept either — but
-    # never guess past a KeyError/TypeError, that's exactly the third-state bug this
-    # whole file exists to avoid on the CALLER's side.
-    payload = raw.get("result", raw) if isinstance(raw, dict) else None
-    if not isinstance(payload, dict):
+    # wa-dln9g, verified against the LIVE API 2026-09-22 (not just the docs example) once
+    # billing was enabled: the real response is {"result": {"state": "Completed", "result":
+    # {"model":..., "answers":..., "usage":...}, "gatewayMetadata":...}, "success": true} —
+    # ONE MORE wrapping level than either the model docs' bare example or Cloudflare's usual
+    # {"result": <payload>} v4 shape. The first version of this function only unwrapped once
+    # and failed closed (ok=False) on every real call — safe, but useless: it would have run
+    # forever in fail-open/never-suppress mode while LOOKING live. Walk candidate unwrap
+    # levels (deepest real observation first) and use the first one that actually has an
+    # "answers" dict — never guess past that, same fail-closed discipline as before.
+    candidates = [raw]
+    if isinstance(raw, dict):
+        r1 = raw.get("result")
+        if isinstance(r1, dict):
+            candidates.append(r1)
+            r2 = r1.get("result")
+            if isinstance(r2, dict):
+                candidates.append(r2)
+    payload = next((c for c in candidates if isinstance(c.get("answers"), dict)), None)
+    if payload is None:
         return {"ok": False, "error": "unparseable_response_shape"}
     try:
         answer = payload["answers"][question_key]
@@ -195,9 +214,109 @@ def _log(entry: dict) -> None:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def _selftest() -> int:
+    """No live credential needed — mocks urllib. Run: python3 jev_experiment.py selftest"""
+    import io
+    from unittest import mock
+
+    passed = 0
+    failed = 0
+
+    def ok(label: str, cond: bool) -> None:
+        nonlocal passed, failed
+        if cond:
+            passed += 1
+            print(f"  ok  {label}")
+        else:
+            failed += 1
+            print(f"  FAIL {label}")
+
+    def _fake_response(body: bytes):
+        cm = mock.MagicMock()
+        cm.read.return_value = body
+        cm.__enter__.return_value = cm
+        cm.__exit__.return_value = False
+        return cm
+
+    global CF_ACCOUNT_ID, CF_API_TOKEN
+    CF_ACCOUNT_ID, CF_API_TOKEN = "acct", "token"
+
+    # wa-dln9g: the ACTUAL shape returned by the live API (2026-09-22, billing enabled) —
+    # one level deeper than either the model docs' bare example or a plain v4 {"result": ...}
+    # wrapper. This is the regression the first version of call_jev() failed silently on
+    # (ok=False/unparseable_answer on every real call, never caught until tested live).
+    live_shape = json.dumps(
+        {
+            "result": {
+                "state": "Completed",
+                "result": {
+                    "model": "jev-1.13.0",
+                    "answers": {"q": {"type": "noul", "noul": 0.83}},
+                    "usage": {"input_tokens": 328, "output_tokens": 21},
+                },
+                "gatewayMetadata": {"keySource": "Unified"},
+            },
+            "success": True,
+            "errors": [],
+            "messages": [],
+        }
+    ).encode()
+    with mock.patch("urllib.request.urlopen", return_value=_fake_response(live_shape)):
+        r = call_jev("state", "q", "instr", "t", "f")
+    ok("double-wrapped live response shape parses", r == {"ok": True, "noul": 0.83, "tokens_in": 328, "tokens_out": 21})
+
+    # A flatter shape (docs' bare example / plain v4 wrapper) must still work — additive,
+    # not a replacement for the one-level case.
+    flat_shape = json.dumps(
+        {"result": {"answers": {"q": {"type": "noul", "noul": 0.2}}, "usage": {"input_tokens": 10, "output_tokens": 0}}}
+    ).encode()
+    with mock.patch("urllib.request.urlopen", return_value=_fake_response(flat_shape)):
+        r = call_jev("state", "q", "instr", "t", "f")
+    ok("single-wrapped (docs-example) shape still parses", r == {"ok": True, "noul": 0.2, "tokens_in": 10, "tokens_out": 0})
+
+    # Garbage at every level must fail CLOSED, never guess.
+    garbage = json.dumps({"result": {"nope": True}}).encode()
+    with mock.patch("urllib.request.urlopen", return_value=_fake_response(garbage)):
+        r = call_jev("state", "q", "instr", "t", "f")
+    ok("no 'answers' at any wrap level -> ok=False, not a guess", r["ok"] is False and r["error"] == "unparseable_response_shape")
+
+    # No credentials at all -> ok=False, no network call attempted.
+    CF_ACCOUNT_ID, CF_API_TOKEN = "", ""
+    r = call_jev("state", "q", "instr", "t", "f")
+    ok("no credentials -> ok=False, no_credentials", r == {"ok": False, "error": "no_credentials"})
+    CF_ACCOUNT_ID, CF_API_TOKEN = "acct", "token"
+
+    # evaluate(): control arm never calls Jev at all.
+    with mock.patch("urllib.request.urlopen", side_effect=AssertionError("control arm must not call Jev")):
+        # a bunch of ids to reliably land at least one in each arm
+        control_id = next(i for i in (f"id{n}" for n in range(50)) if assign_arm(i, "selftest") == "control")
+        r = evaluate(control_id, "selftest", "state text", "q", "instr", "t", "f", 0.85)
+    ok("control arm result has arm=control and never touches Jev", r["arm"] == "control" and r["jev_error"] == "control_arm_skips_jev")
+
+    # evaluate(): experiment arm, confident-false -> suppress=True.
+    exp_id = next(i for i in (f"id{n}" for n in range(50)) if assign_arm(i, "selftest") == "experiment")
+    with mock.patch("urllib.request.urlopen", return_value=_fake_response(json.dumps(
+        {"result": {"result": {"answers": {"q": {"type": "noul", "noul": 0.05}}, "usage": {"input_tokens": 1, "output_tokens": 0}}}}
+    ).encode())):
+        r = evaluate(exp_id, "selftest", "state text", "q", "instr", "t", "f", 0.85)
+    ok("experiment arm, noul=0.05 (95% confident NOT needed) -> suppress=True", r["suppress"] is True)
+
+    # evaluate(): experiment arm, uncertain -> suppress=False (fail toward escalating).
+    with mock.patch("urllib.request.urlopen", return_value=_fake_response(json.dumps(
+        {"result": {"result": {"answers": {"q": {"type": "noul", "noul": 0.5}}, "usage": {"input_tokens": 1, "output_tokens": 0}}}}
+    ).encode())):
+        r = evaluate(exp_id, "selftest", "state text", "q", "instr", "t", "f", 0.85)
+    ok("experiment arm, noul=0.5 (uncertain) -> suppress=False", r["suppress"] is False)
+
+    print(f"\njev_experiment selftest: PASS={passed} FAIL={failed}")
+    return 1 if failed else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("selftest", help="mocked, no live credential needed")
 
     ev = sub.add_parser("evaluate")
     ev.add_argument("--entity-id", required=True)
@@ -216,6 +335,9 @@ def main() -> int:
     )
 
     args = ap.parse_args()
+
+    if args.cmd == "selftest":
+        return _selftest()
 
     if args.cmd == "evaluate":
         state_text = Path(args.state_file).read_text(encoding="utf-8", errors="replace")
