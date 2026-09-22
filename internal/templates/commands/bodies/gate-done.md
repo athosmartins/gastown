@@ -503,32 +503,51 @@ fi
 # origin doesn't match at all — a genuinely unrelated repo), this block
 # stays silent and RIG falls through to the fallbacks below unchanged — no
 # guess when the diff spans more than one rig's code.
+#
+# This runs in every agent's shell, which in this city is zsh, not bash: the
+# changed-file loop below is written to behave identically in both. The block
+# between the SELFTEST-EXTRACT sentinels is executed VERBATIM under bash AND zsh
+# by gate-done-sibling-worktree-rig.selftest.sh — keep the sentinels in place.
+# SELFTEST-EXTRACT sibling-worktree-rig: BEGIN
 if { [ -z "$RIG" ] || [ "$RIG" = "null" ]; } && [ -n "$GC_CITY_PATH" ] && [ -n "$CWD_TOP" ]; then
   _GC_CITY_ORIGIN=$(git -C "$GC_CITY_PATH" remote get-url origin 2>/dev/null || echo "")
   _CWD_ORIGIN_SIB=$(git -C "$CWD_TOP" remote get-url origin 2>/dev/null || echo "")
   if [ -n "$_GC_CITY_ORIGIN" ] && [ "$_GC_CITY_ORIGIN" = "$_CWD_ORIGIN_SIB" ]; then
     _GC_CITY_BASENAME=$(basename "$GC_CITY_PATH")
-    _SIB_CHANGED=$(git -C "$CWD_TOP" diff --name-only "$BASE_COMMIT"...HEAD 2>/dev/null || echo "")
-    _SIB_OUTSIDE=0
-    if [ -n "$_SIB_CHANGED" ]; then
-      _OLD_IFS="$IFS"; IFS='
-'
-      for _SIB_FILE in $_SIB_CHANGED; do
-        case "$_SIB_FILE" in
-          "$_GC_CITY_BASENAME"/*) : ;;
-          *) _SIB_OUTSIDE=1 ;;
-        esac
-      done
-      IFS="$_OLD_IFS"
-    else
-      _SIB_OUTSIDE=1
-    fi
+    # --no-renames: with rename detection on (git's default) --name-only lists
+    # only a renamed file's NEW path, so a move OUT of another rig's tree INTO
+    # this subtree would look wholly inside it. Both paths must be seen.
+    _SIB_CHANGED=$(git -C "$CWD_TOP" diff --name-only --no-renames "$BASE_COMMIT"...HEAD 2>/dev/null || echo "")
+    # One path per line via a heredoc-fed `while read` — NOT `for f in $list`.
+    # zsh (SH_WORD_SPLIT off) does not split an unquoted parameter, so that loop
+    # runs ONCE over the whole multi-line string and the trailing * of
+    # "$_GC_CITY_BASENAME"/* swallows every newline after the first path:
+    # "EVERY changed file is under the subtree" silently degrades to "the
+    # alphabetically-first one is" (.gascity-gastown-hq/ sorts ahead of docs/,
+    # gastown/, internal/, packs/). The heredoc keeps the loop in the CURRENT
+    # shell (a pipe into `while` would run it in a subshell under bash and lose
+    # _SIB_OUTSIDE) and reads the same in bash and zsh.
+    _SIB_OUTSIDE=0; _SIB_SEEN=0
+    while IFS= read -r _SIB_FILE; do
+      [ -z "$_SIB_FILE" ] && continue
+      _SIB_SEEN=1
+      case "$_SIB_FILE" in
+        "$_GC_CITY_BASENAME"/*) : ;;
+        *) _SIB_OUTSIDE=1 ;;
+      esac
+    done <<EOF_SIB
+$_SIB_CHANGED
+EOF_SIB
+    # An empty or unreadable diff saw no path at all: abstain, never let "no
+    # file was outside the subtree" pass vacuously.
+    [ "$_SIB_SEEN" -eq 1 ] || _SIB_OUTSIDE=1
     if [ "$_SIB_OUTSIDE" -eq 0 ]; then
       echo "Note: cwd ($CWD_TOP) is a separate worktree sharing HQ's origin ($_GC_CITY_ORIGIN), and every changed file since origin/main falls under $_GC_CITY_BASENAME/ — resolving rig=gascity (ga-mxwg89)."
       RIG="gascity"
     fi
   fi
 fi
+# SELFTEST-EXTRACT sibling-worktree-rig: END
 
 # ga-owfll FALLBACK 1: map the source bead's PREFIX to a rig (wa-27jn → wa →
 # whatsapp_automation). The bead id already encodes its owning rig.
