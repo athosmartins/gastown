@@ -10118,6 +10118,28 @@ TASK
           DISPATCH_RESULT="rig_assign_failed"
           return 1
         fi
+        # wa-vtvcc: `--assignee`+`--status` above sets the fields but grants NO
+        # lease (lease_expires_at stays null forever — confirmed live: a
+        # non-ephemeral bead claimed this way keeps lease_expires_at=null
+        # indefinitely). `bd reclaim` only reaps EXPIRED leases, so a null
+        # lease is never reclaimable by it or by the pilot-manual-reclaim.sh
+        # wrapper, no matter how long the assignee's session has been dead —
+        # exactly the wa-5zt7b/wa-rrkfm/wa-tvmky incident (oracle-wa assigned,
+        # no live session, `bd reclaim`/pilot-manual-reclaim.sh both no-op).
+        # `--claim` is bd's own lease-granting path, but it unconditionally
+        # REFUSES to reassign over a *different* live/foreign holder — even
+        # with --force (confirmed live) — so it cannot replace the assign
+        # above without breaking the ga-jzye0 stale-owner-override case this
+        # same case block already depends on (gate-f, ~L10009). `bd heartbeat`
+        # instead INITIALIZES a lease from null on a bead this actor already
+        # holds (confirmed live: assignee=X, lease=null, then
+        # `bd heartbeat --actor X` → lease set), matching how the DOG dispatch
+        # path already self-heals its own lease via mol-do-work.toml's
+        # heartbeat step (ga-z93p0) after its own lease-less `bd assign`. Kept
+        # best-effort (never fails the dispatch): the assign above already
+        # succeeded and is the load-bearing half; a missing lease only
+        # reverts to today's (buggy but non-fatal) behavior.
+        timeout 15 bd -C "$STORY_BEAD_CITY" heartbeat "$STORY_ID" --actor "$_SLING_TARGET" -q 2>/dev/null || true
         ;;
     esac
     # Record the rig bead itself as the "sling bead" for TTL compatibility.

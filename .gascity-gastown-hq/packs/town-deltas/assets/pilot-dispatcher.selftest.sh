@@ -6001,6 +6001,36 @@ else
   bad "gate (f): dedup re-check missing from the rig-native dispatch path"
 fi
 
+# ── Scenario 22g (wa-vtvcc): rig-native crew assign grants a lease via heartbeat ─
+# `--assignee ... --status in_progress` alone (the rig-native assign just above)
+# sets the fields but grants NO lease — lease_expires_at stays null forever
+# (confirmed live against a real non-ephemeral bead). A null lease is never
+# reclaimable by `bd reclaim` / pilot-manual-reclaim.sh (both only reap EXPIRED
+# leases), so a crew-dispatched bead whose owner session dies is stuck exactly
+# like wa-5zt7b/wa-rrkfm/wa-tvmky (oracle-wa assigned, no live session, manual
+# reclaim silently no-op'd — the wa-vtvcc incident). `--claim` can't replace the
+# assign above: it unconditionally refuses to reassign over a *different* live
+# holder, even with --force (confirmed live), which would break gate (f)'s own
+# stale-owner override immediately above. Fix: a best-effort
+# `bd heartbeat --actor "$_SLING_TARGET"` right after the assign succeeds — `bd
+# heartbeat` INITIALIZES a lease from null on a bead the actor already holds
+# (confirmed live), matching how the dog dispatch path already self-heals its
+# own lease via mol-do-work.toml (ga-z93p0) after its own lease-less `bd assign`.
+echo "Scenario 22g: rig-native crew assign is followed by a lease-granting heartbeat (wa-vtvcc)"
+if printf '%s' "$_dedup_block" | grep -E 'bd -C "\$STORY_BEAD_CITY" heartbeat "\$STORY_ID" --actor "\$_SLING_TARGET"' >/dev/null; then
+  ok "wa-vtvcc: heartbeat --actor \"\$_SLING_TARGET\" wired after the rig-native assign (grants the lease bd reclaim needs)"
+else
+  bad "wa-vtvcc REGRESSION: no heartbeat call after the rig-native assign — a crew-dispatched bead's lease_expires_at stays null forever, and bd reclaim/pilot-manual-reclaim.sh can never recover it from a dead owner"
+fi
+# The heartbeat must be a NON-FATAL follow-up (never gate the dispatch outcome
+# on it) — the assign above already succeeded and is the load-bearing half; a
+# missing lease should only revert to today's behavior, not fail the dispatch.
+if printf '%s' "$_dedup_block" | grep -E 'heartbeat "\$STORY_ID" --actor "\$_SLING_TARGET" -q 2>/dev/null \|\| true' >/dev/null; then
+  ok "wa-vtvcc: the heartbeat follow-up is best-effort (|| true) — cannot fail the dispatch"
+else
+  bad "wa-vtvcc REGRESSION: the heartbeat follow-up is not best-effort — a transient heartbeat failure could now abort an otherwise-successful crew dispatch"
+fi
+
 # ── Scenario 23 (Bug A fix: WA rig story:approved features in primary pool) ───
 # Before this fix, the WA-rig story:approved FEATURE scan lived ONLY in Step 2c
 # (fallback — only reached when HQ returned ZERO candidates). Since HQ almost always
