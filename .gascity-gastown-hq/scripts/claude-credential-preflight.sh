@@ -117,7 +117,15 @@ _alert() {
   sent_f="$_STATE_DIR/$key.last_sent"
   count_f="$_STATE_DIR/$key.count"
   now="$(date +%s)"
-  mkdir -p "$_STATE_DIR" 2>/dev/null || true
+  # VISIBLE fail-open, not silent: an unwritable state dir makes every
+  # subsequent read below come back empty too, so the cooldown degrades to
+  # "always send" -- correct (never let a state-layer problem silence a
+  # real alert), but doing that with NO signal would reintroduce this
+  # bead's own root cause invisibly, one _log line short of the same "170
+  # in one night" symptom. Log once per call so the degradation is
+  # observable in the script's own output, not just inferred later from a
+  # mailbox that never stopped flooding.
+  mkdir -p "$_STATE_DIR" 2>/dev/null || _log "WARN: could not create state dir $_STATE_DIR -- rate limiting inactive this call (fail-open: alert still sends)"
 
   # Fail-open on any read/parse trouble (missing or corrupt state, unwritable
   # dir): treat as "never sent" so a state-layer problem can never
