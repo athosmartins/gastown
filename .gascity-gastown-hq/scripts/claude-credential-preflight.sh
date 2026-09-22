@@ -31,12 +31,19 @@
 # "erro e vazio nao podem produzir o mesmo valor" doctrine):
 #   GOOD    loggedIn=true, email is a known pool account. Silent, exit 0.
 #   BAD     loggedIn=false (no usable credential at all) — the literal
-#           reported symptom. Loud alert ALWAYS (shadow or enforce). Blocks
-#           the spawn only when CLAUDE_CRED_PREFLIGHT_ENFORCE=1.
-#   WARN    loggedIn=true but email is NOT a recognized pool account. Loud
-#           alert always (a human should confirm/allowlist it) but NEVER
-#           blocks, even when enforced — the known-account list can go
-#           stale, and a false block here is worse than a missed alert.
+#           reported symptom. Alert (shadow or enforce), rate-limited like
+#           WARN below. Blocks the spawn only when
+#           CLAUDE_CRED_PREFLIGHT_ENFORCE=1.
+#   WARN    loggedIn=true but email is NOT a recognized pool account. Alert
+#           (a human should confirm/allowlist it) but NEVER blocks, even when
+#           enforced — the known-account list can go stale, and a false block
+#           here is worse than a missed alert. Rate-limited per account to at
+#           most one message per CLAUDE_CRED_PREFLIGHT_ALERT_COOLDOWN_SEC
+#           (default 1h): every spawn re-triggers the check, so an account
+#           left off the list for a while must not flood the mailbox with
+#           one identical message per session (ga-2g6w4s: 170 in one night).
+#           A message sent after suppressed repeats reports how many
+#           occurrences it collapsed.
 #   UNKNOWN the check itself could not complete (claude/jq missing, timeout,
 #           unparseable output). Never blocks, never mails (too noisy for a
 #           possibly-transient boot-time blip) — log only, same posture as
@@ -55,6 +62,9 @@
 #   CLAUDE_CRED_PREFLIGHT_AUTH_STATUS_CMD  default: "claude auth status --json"
 #   CLAUDE_CRED_PREFLIGHT_NOTIFY_CMD       default: "notify"
 #   CLAUDE_CRED_PREFLIGHT_MAIL_CMD         default: "gc mail send mayor"
+#   CLAUDE_CRED_PREFLIGHT_ALERT_COOLDOWN_SEC  default: 3600 (1h) — per-key
+#                                              alert rate limit, see _alert()
+#   CLAUDE_CRED_PREFLIGHT_STATE_DIR        default: ~/.claude/cred-preflight-alerts
 
 set -uo pipefail
 
@@ -63,35 +73,87 @@ _ENFORCE="${CLAUDE_CRED_PREFLIGHT_ENFORCE:-0}"
 _AUTH_STATUS_CMD="${CLAUDE_CRED_PREFLIGHT_AUTH_STATUS_CMD:-claude auth status --json}"
 _NOTIFY_CMD="${CLAUDE_CRED_PREFLIGHT_NOTIFY_CMD:-notify}"
 _MAIL_CMD="${CLAUDE_CRED_PREFLIGHT_MAIL_CMD:-gc mail send mayor}"
+_ALERT_COOLDOWN_SEC="${CLAUDE_CRED_PREFLIGHT_ALERT_COOLDOWN_SEC:-3600}"
+_STATE_DIR="${CLAUDE_CRED_PREFLIGHT_STATE_DIR:-$HOME/.claude/cred-preflight-alerts}"
 
 # Canonical source: /Users/athos/gt/whatsapp_automation/lib/claude_usage_collector.py
-# L92-100 (as of 2026-08-15, cited by gastown.mayor in ga-tkd2ll). Override
-# without editing this file via CLAUDE_CRED_PREFLIGHT_KNOWN_EMAILS
-# (space-separated) if that list changes and this file hasn't caught up.
-_DEFAULT_KNOWN_EMAILS="athosmartins@gmail.com terrenos.incorporacoes@gmail.com throw.away.amb@gmail.com athoscrypto@gmail.com"
+# ACCOUNTS (as of 2026-09-22, athosb85@gmail.com added by wa-b741h; cited by
+# gastown.mayor in ga-tkd2ll and ga-2g6w4s). Override without editing this
+# file via CLAUDE_CRED_PREFLIGHT_KNOWN_EMAILS (space-separated) if that list
+# changes and this file hasn't caught up.
+_DEFAULT_KNOWN_EMAILS="athosmartins@gmail.com terrenos.incorporacoes@gmail.com throw.away.amb@gmail.com athoscrypto@gmail.com athosb85@gmail.com"
 _KNOWN_EMAILS="${CLAUDE_CRED_PREFLIGHT_KNOWN_EMAILS:-$_DEFAULT_KNOWN_EMAILS}"
 
 _WHO="${GC_AGENT:-${GC_SESSION_NAME:-unknown}}"
 
 _log() { printf '[CRED-PREFLIGHT] %s\n' "$*"; }
 
+# _alert_state_key <subject> <discriminator> -> sanitized filename stem
+# (same tr-based idiom as daemon-presence-watchdog.sh's _alert_cd_file / the
+# _cooldown_elapsed+_mark_now pair in city-health-sentinel.sh -- reused here
+# rather than reinvented). <discriminator> is normally the account email;
+# never shell-interpreted, only ever used as a path component.
+_alert_state_key() {
+  printf '%s' "${1}__${2}" | tr -c 'A-Za-z0-9._-' '_'
+}
+
+# ga-2g6w4s: an unrecognized/missing credential is re-checked on EVERY spawn,
+# so a sustained misalignment (an account left off the known-pool list, or a
+# real outage) used to mail/notify once per spawn -- 170 identical messages
+# in one night, burying real signal in the Mayor's inbox. Collapse repeats:
+# at most one message per (subject, discriminator) per _ALERT_COOLDOWN_SEC.
+# The first occurrence in a window sends immediately (unchanged latency for
+# a fresh problem); further occurrences in the same window are suppressed
+# but counted; the next occurrence after the window elapses sends again and
+# reports how many occurrences (including itself) it collapsed, so the
+# signal ("this is still happening, N times since the last alert") survives
+# the suppression instead of going silent.
 _alert() {
-  local subject="$1" msg="$2"
+  local subject="$1" msg="$2" discriminator="${3:-}"
   _log "ALERT $subject -- $msg"
-  # SECURITY: $subject/$msg can carry data this script does not fully
-  # control (claude auth status's own `email` field; $_WHO from
-  # GC_AGENT/GC_SESSION_NAME). Earlier drafts built one string via bash -c
-  # "$_NOTIFY_CMD -t '...' -p 4 '$msg'" -- that hands the ALREADY-expanded
-  # string to a SECOND shell parse, so any shell metacharacter inside
-  # $subject/$msg's own content (not just a literal quote) could break out
-  # of the intended argument and be re-interpreted as shell syntax. Fixed
-  # by invoking directly instead of through bash -c: $_NOTIFY_CMD/$_MAIL_CMD
-  # are intentionally left unquoted (word-split into a command+args prefix,
-  # e.g. "gc mail send mayor" -- operator/config-controlled, not data), but
-  # $subject/$msg are double-quoted and passed as direct argv entries with
-  # NO re-parse step, so their content is always inert data, never syntax.
-  $_NOTIFY_CMD -t "Claude cred preflight: $subject" -p 4 "$msg" >/dev/null 2>&1 || true
-  $_MAIL_CMD -s "Claude cred preflight: $subject" -m "$msg" >/dev/null 2>&1 || true
+
+  local key sent_f count_f now last count sent_msg
+  key="$(_alert_state_key "$subject" "$discriminator")"
+  sent_f="$_STATE_DIR/$key.last_sent"
+  count_f="$_STATE_DIR/$key.count"
+  now="$(date +%s)"
+  mkdir -p "$_STATE_DIR" 2>/dev/null || true
+
+  # Fail-open on any read/parse trouble (missing or corrupt state, unwritable
+  # dir): treat as "never sent" so a state-layer problem can never
+  # permanently silence a real alert -- same posture _cooldown_elapsed()
+  # documents in city-health-sentinel.sh, for the identical reason.
+  last="$(cat "$sent_f" 2>/dev/null)"
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  count="$(cat "$count_f" 2>/dev/null)"
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+  count=$((count + 1))
+  printf '%s' "$count" > "$count_f" 2>/dev/null || true
+
+  if [ "$last" -eq 0 ] || [ $(( now - last )) -ge "$_ALERT_COOLDOWN_SEC" ]; then
+    sent_msg="$msg"
+    [ "$count" -gt 1 ] && sent_msg="$msg (x$count in the last ~$((_ALERT_COOLDOWN_SEC / 60))min; repeats were suppressed in this window)"
+    # SECURITY: $subject/$msg (and now $discriminator, folded into
+    # $sent_msg) can carry data this script does not fully control (claude
+    # auth status's own `email` field; $_WHO from GC_AGENT/GC_SESSION_NAME).
+    # Earlier drafts built one string via bash -c "$_NOTIFY_CMD -t '...' -p 4
+    # '$msg'" -- that hands the ALREADY-expanded string to a SECOND shell
+    # parse, so any shell metacharacter inside that content (not just a
+    # literal quote) could break out of the intended argument and be
+    # re-interpreted as shell syntax. Fixed by invoking directly instead of
+    # through bash -c: $_NOTIFY_CMD/$_MAIL_CMD are intentionally left
+    # unquoted (word-split into a command+args prefix, e.g. "gc mail send
+    # mayor" -- operator/config-controlled, not data), but
+    # $subject/$sent_msg are double-quoted and passed as direct argv entries
+    # with NO re-parse step, so their content is always inert data, never
+    # syntax.
+    $_NOTIFY_CMD -t "Claude cred preflight: $subject" -p 4 "$sent_msg" >/dev/null 2>&1 || true
+    $_MAIL_CMD -s "Claude cred preflight: $subject" -m "$sent_msg" >/dev/null 2>&1 || true
+    printf '%s' "$now" > "$sent_f" 2>/dev/null || true
+    printf '0' > "$count_f" 2>/dev/null || true
+  else
+    _log "SUPPRESSED $subject -- rate-limited ($count occurrence(s) since last alert $(( now - last ))s ago, cooldown=${_ALERT_COOLDOWN_SEC}s)"
+  fi
 }
 
 main() {
@@ -154,7 +216,7 @@ main() {
 
   if [ "$known" -eq 0 ]; then
     local msg="claude auth status reports loggedIn=true but email=$email is not in the known pool ($_KNOWN_EMAILS). Session about to spawn: $_WHO. Never auto-blocked -- confirm and add to the known list if legitimate, or investigate if not."
-    _alert "unrecognized account" "$msg"
+    _alert "unrecognized account" "$msg" "$email"
     return 0
   fi
 

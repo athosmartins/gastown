@@ -68,11 +68,19 @@ ln -sf "$(command -v bash)" "$JQLESS_BIN/bash"
 
 run() { # extra env assignments as NAME=value args, then nothing else
   rm -f "$NOTIFY_LOG" "$MAIL_LOG"
+  # ALERT_COOLDOWN_SEC=0 + a sandboxed STATE_DIR are defaults here, not
+  # baked into the SUT: cooldown=0 means "the window always elapsed", so
+  # every pre-existing test below keeps firing an alert on every run() call
+  # regardless of the new dedup state shared across calls in this same
+  # $SBX (env-assignment last-wins lets the rate-limit-specific tests
+  # override both to exercise the real behavior).
   OUT=$(env \
     CLAUDE_CRED_PREFLIGHT_AUTH_STATUS_CMD="$AUTH_STUB" \
     CLAUDE_CRED_PREFLIGHT_NOTIFY_CMD="$NOTIFY_STUB" \
     CLAUDE_CRED_PREFLIGHT_MAIL_CMD="$MAIL_STUB" \
     CLAUDE_CRED_PREFLIGHT_BUDGET_SEC=3 \
+    CLAUDE_CRED_PREFLIGHT_ALERT_COOLDOWN_SEC=0 \
+    CLAUDE_CRED_PREFLIGHT_STATE_DIR="$SBX/state" \
     "$@" bash "$SUT" 2>&1)
   RC=$?
 }
@@ -250,6 +258,63 @@ else
   bad "command injection regression" "canary_exists=$([ -e "$CANARY" ] && echo YES-VULNERABLE || echo no) rc=$RC out=$OUT notify_log=$(cat "$NOTIFY_LOG" 2>/dev/null) mail_log=$(cat "$MAIL_LOG" 2>/dev/null)"
 fi
 rm -f "$CANARY"
+
+# ---------------------------------------------------------------------------
+# 12. ga-2g6w4s AC1: athosb85@gmail.com (added to claude_usage_collector.py's
+#     ACCOUNTS by wa-b741h) must be in the default known-pool list -- 3
+#     consecutive sessions logged in as it produce zero "unrecognized
+#     account" alerts, not the WARN this bead reports.
+# ---------------------------------------------------------------------------
+for i in 1 2 3; do
+  stage_auth 0 '{"loggedIn":true,"email":"athosb85@gmail.com","authMethod":"claude.ai"}'
+  run
+  if [ "$RC" = 0 ] && silent; then
+    ok "ga-2g6w4s AC1: athosb85@gmail.com known account, exit 0, no alert (run $i/3)"
+  else
+    bad "ga-2g6w4s AC1: athosb85@gmail.com (run $i/3)" "rc=$RC out=$OUT notify_log=$(cat "$NOTIFY_LOG" 2>/dev/null) mail_log=$(cat "$MAIL_LOG" 2>/dev/null)"
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# 13. ga-2g6w4s AC2: repeated "unrecognized account" triggers for the SAME
+#     account within the cooldown window collapse into a single alert
+#     instead of firing once per spawn (the reported symptom: 170 identical
+#     messages in one night). Isolated state dir + a distinct fake email so
+#     this doesn't cross-talk with test 4's WARN case (which shares $SBX/state
+#     but runs with cooldown=0, so it never writes a state that could leak
+#     in here -- this is belt-and-suspenders isolation, not a dependency).
+# ---------------------------------------------------------------------------
+RL_STATE="$SBX/ratelimit-state"
+rm -rf "$RL_STATE"
+stage_auth 0 '{"loggedIn":true,"email":"ratelimit-test@example.com"}'
+run CLAUDE_CRED_PREFLIGHT_STATE_DIR="$RL_STATE" CLAUDE_CRED_PREFLIGHT_ALERT_COOLDOWN_SEC=3600
+FIRST_ALERTED=no; alerted && FIRST_ALERTED=yes
+run CLAUDE_CRED_PREFLIGHT_STATE_DIR="$RL_STATE" CLAUDE_CRED_PREFLIGHT_ALERT_COOLDOWN_SEC=3600
+SECOND_ALERTED=no; alerted && SECOND_ALERTED=yes
+run CLAUDE_CRED_PREFLIGHT_STATE_DIR="$RL_STATE" CLAUDE_CRED_PREFLIGHT_ALERT_COOLDOWN_SEC=3600
+THIRD_ALERTED=no; alerted && THIRD_ALERTED=yes
+if [ "$FIRST_ALERTED" = yes ] && [ "$SECOND_ALERTED" = no ] && [ "$THIRD_ALERTED" = no ]; then
+  ok "ga-2g6w4s AC2: repeated unrecognized-account alerts within cooldown collapse to 1 message (not 3)"
+else
+  bad "ga-2g6w4s AC2: repeat collapse" "first=$FIRST_ALERTED(want yes) second=$SECOND_ALERTED(want no) third=$THIRD_ALERTED(want no)"
+fi
+
+# ---------------------------------------------------------------------------
+# 14. ga-2g6w4s AC2, "com contagem": once the cooldown window has elapsed,
+#     the NEXT trigger sends again AND the message reports how many
+#     occurrences (incl. itself) it collapsed -- 2 suppressed in test 13
+#     plus this one = 3. Backdate the state file instead of sleeping 1h.
+# ---------------------------------------------------------------------------
+SENT_STATE_FILE=$(find "$RL_STATE" -name '*.last_sent' 2>/dev/null | head -1)
+if [ -n "$SENT_STATE_FILE" ]; then
+  echo $(( $(date +%s) - 3700 )) > "$SENT_STATE_FILE"
+fi
+run CLAUDE_CRED_PREFLIGHT_STATE_DIR="$RL_STATE" CLAUDE_CRED_PREFLIGHT_ALERT_COOLDOWN_SEC=3600
+if [ -n "$SENT_STATE_FILE" ] && alerted && grep -q 'x3 in the last' "$MAIL_LOG" 2>/dev/null; then
+  ok "ga-2g6w4s AC2: after cooldown elapses, next trigger sends WITH a count of suppressed repeats"
+else
+  bad "ga-2g6w4s AC2: post-cooldown resend with count" "state_file=$SENT_STATE_FILE rc=$RC mail_log=$(cat "$MAIL_LOG" 2>/dev/null)"
+fi
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
