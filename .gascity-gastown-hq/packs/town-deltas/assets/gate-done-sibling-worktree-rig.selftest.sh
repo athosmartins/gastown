@@ -105,10 +105,15 @@ extract_sentinel_block() {
   local file="$1" name="$2" nb ne
   nb=$(grep -cF "# SELFTEST-EXTRACT ${name}: BEGIN" "$file")
   ne=$(grep -cF "# SELFTEST-EXTRACT ${name}: END" "$file")
-  if [ "$nb" -ne 1 ] || [ "$ne" -ne 1 ]; then
-    echo "expected exactly one BEGIN and one END sentinel for '${name}', found BEGIN=$nb END=$ne" >&2
-    return 1
-  fi
+  # String compare, not arithmetic: an empty count (grep itself failed) must read
+  # as "cannot tell", never crash the comparison or slip through as a match.
+  case "$nb:$ne" in
+    1:1) : ;;
+    *)
+      echo "expected exactly one BEGIN and one END sentinel for '${name}', found BEGIN='$nb' END='$ne'" >&2
+      return 1
+      ;;
+  esac
   awk -v b="# SELFTEST-EXTRACT ${name}: BEGIN" -v e="# SELFTEST-EXTRACT ${name}: END" '
     index($0, b) { inblk = 1; next }
     index($0, e) { if (inblk) closed = 1; exit }
@@ -157,9 +162,16 @@ mk_wt() {
   git -C "$OUTER" worktree add -q -b "fx-$1" "$OUTER/.gc-worktrees/$1" main 2>/dev/null \
     && git -C "$OUTER/.gc-worktrees/$1" rev-parse --show-toplevel
 }
-# diff_shape <dir> — "<changed paths>/<of which outside the subtree>", as the block sees them.
+# diff_shape <dir> — "<changed paths>/<of which outside the subtree>", as the block
+# sees them; "diff-failed" if git itself failed. A failed diff must NOT read as
+# "0/0": that is exactly the shape the `empty` scenario is expected to have, so a
+# broken diff there would validate itself.
 diff_shape() {
-  git -C "$1" diff --name-only --no-renames "$BASE"...HEAD 2>/dev/null \
+  local names
+  names=$(git -C "$1" diff --name-only --no-renames "$BASE"...HEAD 2>/dev/null) \
+    || { printf 'diff-failed'; return; }
+  [ -z "$names" ] && { printf '0/0'; return; }
+  printf '%s\n' "$names" \
     | awk -v p="$SUBTREE/" '{ if (index($0, p) != 1) out++ } END { printf "%d/%d", NR, out + 0 }'
 }
 
@@ -234,7 +246,14 @@ build_fixture() {
 
 if [ "$RUN_MATRIX" -eq 1 ]; then
   if build_fixture; then
-    ok "(SW1) fixture built: bare origin, outer clone, 10 sibling worktrees, 1 distinct-origin clone"
+    # Count what was actually built — the message must not claim more than exists.
+    nwt=$(git -C "$OUTER" worktree list --porcelain 2>/dev/null | grep -c '^worktree .*/\.gc-worktrees/')
+    if [ "$nwt" = "9" ]; then
+      ok "(SW1) fixture built: bare origin, outer clone, $nwt sibling worktrees, 1 distinct-origin clone"
+    else
+      bad "(SW1) fixture built, but the outer clone has '$nwt' sibling worktrees, expected 9 — a scenario is missing its worktree"
+      RUN_MATRIX=0
+    fi
   else
     bad "(SW1) fixture build failed — the matrix below would pass or fail for the wrong reason, so it is NOT run"
     RUN_MATRIX=0
@@ -278,8 +297,8 @@ if [ "$RUN_MATRIX" -eq 1 ]; then
 fi
 
 # run_file <shell> <file> — run a script file in a clean, rc-less shell of that kind
-# (bash: no profile/rc; zsh -f: default options, so SH_WORD_SPLIT is off — exactly
-# what the agents' live Bash tool runs).
+# (bash: no profile/rc; zsh -f: default options, SH_WORD_SPLIT off — the setting
+# the agents' live Bash tool, which is zsh, runs under).
 run_file() {
   case "$1" in
     bash) env -u BASH_ENV -u ENV bash --noprofile --norc "$2" ;;

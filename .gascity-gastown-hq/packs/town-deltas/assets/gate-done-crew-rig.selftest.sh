@@ -1868,11 +1868,20 @@ if [ -f "$GATE_DONE" ]; then
   # word-split it, so `for f in $list` runs ONCE over the whole string (the
   # ga-mxwg89 gate-attempt-1 defect). Loops over "$(...)" (which zsh does split)
   # or a quoted word list are fine and are not matched.
-  bare_loops=$(printf '%s\n' "$src" | grep -nE '^[[:space:]]*for [A-Za-z_][A-Za-z0-9_]* in \$\{?[A-Za-z_][A-Za-z0-9_]*\}?[[:space:];]' || true)
-  if [ -z "$bare_loops" ]; then
-    ok "(AB7e) gate-done.md has no for-loop over a bare unquoted parameter (zsh would not word-split it)"
+  # Three outcomes, kept apart: grep rc 1 = scanned, none found (ok); rc 0 = found
+  # (bad); rc >= 2 = grep itself failed, so "none found" would be a guess (bad).
+  # A positive control runs first: the detector must flag the very shape it exists
+  # for (the ga-mxwg89 first cut), else "none found" below would mean nothing.
+  bare_loop_re='^[[:space:]]*for [A-Za-z_][A-Za-z0-9_]* in \$\{?[A-Za-z_][A-Za-z0-9_]*\}?[[:space:];]'
+  if grep -qE "$bare_loop_re" <<< '      for _SIB_FILE in $_SIB_CHANGED; do'; then
+    bare_loops=$(grep -nE "$bare_loop_re" <<< "$src"); bare_rc=$?
+    case "$bare_rc" in
+      1) ok "(AB7e) gate-done.md has no for-loop over a bare unquoted parameter (zsh would not word-split it)" ;;
+      0) bad "(AB7e) gate-done.md has a for-loop over a bare unquoted parameter — under zsh it runs ONCE over the whole string: $(printf '%s' "$bare_loops" | head -3 | tr '\n' ' ')" ;;
+      *) bad "(AB7e) grep failed (rc=$bare_rc) scanning gate-done.md — cannot tell whether a bare-parameter for-loop exists" ;;
+    esac
   else
-    bad "(AB7e) gate-done.md has a for-loop over a bare unquoted parameter — under zsh it runs ONCE over the whole string: $(printf '%s' "$bare_loops" | head -3 | tr '\n' ' ')"
+    bad "(AB7e) the detector regex no longer matches the shape it exists to catch — 'none found' would be meaningless"
   fi
 else
   bad "(AB7) gate-done.md not found at $GATE_DONE"
