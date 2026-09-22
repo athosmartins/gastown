@@ -305,6 +305,15 @@ NOTIFY_BIN="${GOLW_NOTIFY_BIN:-/Users/athos/.local/bin/notify}"
 GC_BIN="${GOLW_GC_BIN:-gc}"
 BD_BIN="${GOLW_BD_BIN:-bd}"
 
+# wa-dln9g: Jev A/B pre-triage experiment. Fail-open by construction (see
+# jev_experiment.py's own docstring) — with no Cloudflare credential configured this
+# is a no-op that only logs which arm each candidate landed in, changing zero
+# production behavior. GOLW_JEV_EXPERIMENT_ENABLED lets a caller (selftest, or a
+# future decision to pull the plug) turn it off entirely without touching the rest
+# of this file.
+GOLW_JEV_EXPERIMENT_ENABLED="${GOLW_JEV_EXPERIMENT_ENABLED:-1}"
+JEV_BIN="${GOLW_JEV_BIN:-python3 $HQ/scripts/jev_experiment.py}"
+
 GOLW_STATE_DIR="${GOLW_STATE_DIR:-$HOME/.gastown/state}"
 STATE_FILE="${GOLW_STATE_FILE:-$GOLW_STATE_DIR/gate-orphaned-label-watchdog.state.json}"
 
@@ -925,7 +934,9 @@ run_sweep() {
   # already loaded up-front (see above the empty-sweep branch). ──
   local flagged_ids="[]"
   local to_alert_tsv=""
+  local to_mail_tsv=""
   local bid store2 age_min labels lstatus lcount last_alert
+  local _jev_state_file _jev_result _jev_suppress
   while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount; do
     [ -z "${bid:-}" ] && continue
     flagged_ids="$(printf '%s' "$flagged_ids" | jq -c --arg id "$bid" '. + [$id]' 2>/dev/null)" || flagged_ids="$flagged_ids"
@@ -933,6 +944,40 @@ run_sweep() {
     case "$last_alert" in ''|*[!0-9]*) last_alert=0 ;; esac
     if [ "$last_alert" -eq 0 ] || [ $(( now - last_alert )) -ge "$GOLW_ALERT_COOLDOWN_S" ]; then
       to_alert_tsv="${to_alert_tsv}${bid}\t${store2}\t${age_min}\t${labels}\t${lstatus}\t${lcount}\n"
+
+      # wa-dln9g: Jev A/B pre-triage. This bead already cleared the heuristic above
+      # (that decision is untouched) — the only question left is whether the MAIL
+      # needs to carry it THIS cycle. The per-bead `bd comment` loop further below
+      # still runs over the full to_alert_tsv regardless of this block's outcome,
+      # so a suppressed bead is never actually silent — only "wake Mayor" is
+      # skipped, and only when Jev is confidently on the "not needed" side (see
+      # jev_experiment.py: absence of a credential, a network error, or any
+      # unparseable response all fail OPEN — i.e. behave exactly like control).
+      _jev_suppress=0
+      if [ "${GOLW_JEV_EXPERIMENT_ENABLED:-1}" = "1" ] && command -v python3 >/dev/null 2>&1; then
+        _jev_state_file="$(mktemp 2>/dev/null || echo "")"
+        if [ -n "$_jev_state_file" ]; then
+          {
+            echo "Bead ${bid} (store: ${store2}) carries gate:* label(s) [${labels}] with no active quality-gate marker for >=${GOLW_STALE_MINUTES}min (age: ${age_min}min)."
+            echo "Last known gate artifact: ${lstatus} (${lcount} open artifact(s) referencing this bead)."
+            echo "Common causes seen historically: a stale label left after a manual fix, a branch conflicting with main needing re-anchor, or work already merged but the bead never closed."
+          } > "$_jev_state_file" 2>/dev/null
+          _jev_result="$($JEV_BIN evaluate \
+            --entity-id "$bid" --experiment "gate-orphaned-label" \
+            --state-file "$_jev_state_file" \
+            --instructions "Does this specific bead genuinely need a human or Mayor session to look at it right now, as opposed to being safe to leave for the automatic 6-hour recheck (routine label lag, a case the boilerplate already explains, or something that plausibly self-resolves on its own)?" \
+            --true-desc "Needs investigation now -- looks like a real gate/merge problem, not just a stale label" \
+            --false-desc "Safe to leave for the next check -- routine label lag or already explained by the common-causes text" \
+            --heuristic-would-escalate 2>/dev/null)"
+          rm -f "$_jev_state_file" 2>/dev/null
+          _jev_suppress="$(printf '%s' "$_jev_result" | jq -r 'if .suppress == true then "1" else "0" end' 2>/dev/null)"
+          case "$_jev_suppress" in 1) : ;; *) _jev_suppress=0 ;; esac
+        fi
+      fi
+      if [ "$_jev_suppress" != "1" ]; then
+        to_mail_tsv="${to_mail_tsv}${bid}\t${store2}\t${age_min}\t${labels}\t${lstatus}\t${lcount}\n"
+      fi
+
       # ga-tqe4j: record the REAL store2 path, not the old self-referential
       # `.[$id].store // ""` (which only ever read back what a prior write put
       # there — and no write ever put anything but "" — so this field was
@@ -958,7 +1003,11 @@ run_sweep() {
   # FULL flagged_tsv every time ANY bead was due — one new bead re-spammed
   # every already-alerted bead still in cooldown. Compute the delta up front
   # so both the "nothing changed" gate and the mail body key off it.
-  local new_count; new_count="$(printf '%b' "$to_alert_tsv" | grep -c . || true)"
+  # wa-dln9g: new_count (and the NEW/DUE mail section below) is keyed off
+  # to_mail_tsv, NOT to_alert_tsv — a Jev-suppressed bead still got its
+  # cooldown/state updated and its per-bead bd comment above, it just isn't
+  # counted as "new" from the MAIL's point of view this cycle.
+  local new_count; new_count="$(printf '%b' "$to_mail_tsv" | grep -c . || true)"
   local resolved_count; resolved_count="$(printf '%s\n' "${resolved_ids:-}" | grep -c . || true)"
 
   local total_flagged; total_flagged="$(printf '%b' "$flagged_tsv" | grep -c . || true)"
@@ -1022,7 +1071,7 @@ ${summary}
 "
 
   if [ "${new_count:-0}" -gt 0 ]; then
-    local new_lines; new_lines="$(printf '%b' "$to_alert_tsv" | while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount; do
+    local new_lines; new_lines="$(printf '%b' "$to_mail_tsv" | while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount; do
       [ -z "${bid:-}" ] && continue
       echo "  ${bid}  (${store2})  age=${age_min}min  labels=[${labels}]  last_artifact=${lstatus} (${lcount} open)"
     done)"
@@ -1091,6 +1140,11 @@ if [ "${1:-}" = "--selftest" ] || [ "${GOLW_SELFTEST:-0}" = "1" ]; then
   NOTIFY_BIN="$TMP/notify"
   GC_BIN="$TMP/gc"
   BD_BIN="$TMP/bd"
+  # wa-dln9g: these selftests exercise the watchdog's OWN detection logic, not the
+  # Jev A/B experiment — leave the experiment off here so a run never shells out to
+  # a real python3/jev_experiment.py or (if a credential ever exists) touches the
+  # real Jev API or the real experiment log with synthetic test bead ids.
+  GOLW_JEV_EXPERIMENT_ENABLED=0
   GOLW_ENABLED=1
   GOLW_DRY_RUN=0
   GOLW_STALE_MINUTES=180
