@@ -30,21 +30,15 @@ WHAT THIS FILE DOES NOT DO: it does not decide anything on its own. It answers o
 question a caller poses, and logs the answer. The caller (e.g. the watchdog bash script)
 is still the one deciding whether an alert exists at all.
 
-CREDENTIALS: reads CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN from the environment,
-stored in Bitwarden as the "cloudflare-workers-ai" item (username=account id,
-password=token; `secret cloudflare-workers-ai --field username|password`). Live and
-verified end-to-end against the real API 2026-09-22 (Athos enabled AI Gateway Unified
-Billing) — the response shape is ONE LEVEL DEEPER than either the model docs' bare
-example or Cloudflare's usual {"result": ...} v4 envelope: {"result": {"state":
-"Completed", "result": {"answers": ..., "usage": ...}, "gatewayMetadata": ...}}. The
-first version of call_jev() only unwrapped once and silently returned ok=False on every
-real call — safe (fail-closed), but the experiment would have run forever in
-never-suppress mode while looking live. Fixed to walk candidate unwrap levels and use
-the first one that actually has an "answers" dict, still never guessing past that (see
-_selftest, which locks in both the real double-wrapped shape and the flatter one as a
-regression guard). If a credential is ever missing, call_jev() returns ok=False,
-error=no_credentials, and the suppression logic (by design) treats that as "escalate
-anyway" — same fail-closed direction as every parse failure below.
+CREDENTIALS: reads CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN from the environment.
+Neither is set as of 2026-09-22 (checked via `secret` against Bitwarden — nothing found;
+see wa-dln9g) — until they are, call_jev() always returns ok=False, error=no_credentials,
+which the suppression logic (by design, not by accident) treats as "escalate anyway".
+The HTTP client itself is written against Cloudflare's documented request/response shape
+(developers.cloudflare.com/ai/models/typesafe/jev/) but has never been exercised against
+the live API — it defends against BOTH a bare model response and Cloudflare's usual
+{"result": ..., "success": ...} v4 envelope, and fails closed (ok=False) on anything it
+can't parse, rather than guessing.
 
 CLI:
   python3 jev_experiment.py evaluate --entity-id <id> --experiment <name> \\
@@ -141,7 +135,13 @@ def call_jev(state: str, question_key: str, instructions: str, true_desc: str, f
             r2 = r1.get("result")
             if isinstance(r2, dict):
                 candidates.append(r2)
-    payload = next((c for c in candidates if isinstance(c.get("answers"), dict)), None)
+    # gate-feedback (wa-dln9g attempt 1): candidates[0] is `raw` itself, which is only
+    # GUARANTEED to be a dict when the `isinstance(raw, dict)` check above already ran —
+    # for r1/r2 that's true (appended only inside that branch), but raw can legitimately be
+    # any JSON value (a bare list, string, number, null). Calling c.get(...) on a non-dict
+    # candidate raises AttributeError, uncaught here — a crash, not the fail-closed
+    # ok=False this function promises everywhere else. Guard isinstance(c, dict) first.
+    payload = next((c for c in candidates if isinstance(c, dict) and isinstance(c.get("answers"), dict)), None)
     if payload is None:
         return {"ok": False, "error": "unparseable_response_shape"}
     try:

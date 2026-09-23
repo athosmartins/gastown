@@ -1007,6 +1007,18 @@ run_sweep() {
   # to_mail_tsv, NOT to_alert_tsv — a Jev-suppressed bead still got its
   # cooldown/state updated and its per-bead bd comment above, it just isn't
   # counted as "new" from the MAIL's point of view this cycle.
+  #
+  # GATE-FEEDBACK (gate_run=ga-35uv0o, attempt 1 FAIL): alert_count is the
+  # SEPARATE count this file's one "is there truly nothing to do" early-return
+  # (below) must key off, NOT new_count. Before this fix that gate checked
+  # new_count==0 directly — which, on a cycle where every newly-due bead was
+  # Jev-suppressed (to_mail_tsv empty) but to_alert_tsv was NOT, returned
+  # BEFORE the per-bead `bd comment` loop even ran. That directly contradicted
+  # this file's own design promise (a suppressed bead is never actually
+  # silent, only the aggregate mail is skipped) — the bead got no comment at
+  # all, yet its cooldown state was still persisted as if it had been. Verified
+  # against the reviewed SHA via `git show`, not just the diff hunks.
+  local alert_count; alert_count="$(printf '%b' "$to_alert_tsv" | grep -c . || true)"
   local new_count; new_count="$(printf '%b' "$to_mail_tsv" | grep -c . || true)"
   local resolved_count; resolved_count="$(printf '%s\n' "${resolved_ids:-}" | grep -c . || true)"
 
@@ -1017,7 +1029,7 @@ run_sweep() {
     log "  - $bid ($(_store_name "$store2")) age=${age_min}min labels=[${labels}] last_artifact=${lstatus} (${lcount} open)"
   done
 
-  if [ "${new_count:-0}" -eq 0 ] && [ "${resolved_count:-0}" -eq 0 ]; then
+  if [ "${new_count:-0}" -eq 0 ] && [ "${resolved_count:-0}" -eq 0 ] && [ "${alert_count:-0}" -eq 0 ]; then
     local park_suffix2=""
     [ "$park_count" -gt 0 ] && park_suffix2="${park_suffix2} (+${park_count} parked, excluded)"
     [ "$active_count" -gt 0 ] && park_suffix2="${park_suffix2} (+${active_count} active-live, excluded)"
@@ -1045,6 +1057,24 @@ run_sweep() {
       printf '%s' "$msg" | "$BD_BIN" -C "$store2" comment "$bid" --stdin 2>/dev/null || log "WARN: bd comment failed for $bid"
     fi
   done < <(printf '%b' "$to_alert_tsv")
+
+  # gate-feedback (ga-35uv0o, wa-dln9g attempt 1): the comment loop above just ran over
+  # the FULL to_alert_tsv (unaffected by Jev), so every due bead already got its durable
+  # comment regardless of suppression — "a suppressed bead is never actually silent" is
+  # now actually true, not just a comment claiming it. What's left below is ONLY the
+  # aggregate mail/notify, which stays gated on new_count/resolved_count exactly as
+  # before: a cycle where every due bead was Jev-suppressed (new_count==0) and nothing
+  # resolved has nothing worth paging Mayor about, but state must still persist (the
+  # cooldown timestamps the loop above just set into $state would otherwise be lost,
+  # and the very next sweep would treat these same beads as newly-due again).
+  if [ "${new_count:-0}" -eq 0 ] && [ "${resolved_count:-0}" -eq 0 ]; then
+    log "OK: ${alert_count} due bead(s) commented (Jev-suppressed from mail), 0 resolved — no mail this cycle"
+    if [ "${GOLW_DRY_RUN:-0}" != "1" ]; then
+      mkdir -p "$GOLW_STATE_DIR" 2>/dev/null || true
+      printf '%s' "$state" > "$STATE_FILE" 2>/dev/null || true
+    fi
+    return 1
+  fi
 
   # ── aggregate notify + mail — DELTA report (ga-lnpa7): new/due + resolved +
   # a count of what's unchanged, not the full flagged set every cycle. ───────
@@ -1221,6 +1251,21 @@ esac
 exit 0
 GCSTUB
   chmod +x "$NOTIFY_BIN" "$GC_BIN"
+
+  # wa-dln9g (gate_run=ga-35uv0o): fake Jev binary for the 2 A/B-suppression
+  # scenarios near the end of this file. Inactive by default -- every other
+  # scenario in this file sets GOLW_JEV_EXPERIMENT_ENABLED=0 above; a scenario
+  # opts in by setting GOLW_JEV_EXPERIMENT_ENABLED=1 + GOLW_JEV_BIN="$JEV_BIN_STUB"
+  # and writing $TMP/fixtures/jev-suppress.json. Missing fixture defaults to
+  # {"suppress":false} -- same fail-closed-to-escalate direction as the real
+  # jev_experiment.py (a missing/broken signal must never silently suppress).
+  JEV_BIN_STUB="$TMP/jev"
+  cat > "$JEV_BIN_STUB" <<'JEVSTUB'
+#!/usr/bin/env bash
+f="$GOLW_TEST_FIXTURES_DIR/jev-suppress.json"
+[ -f "$f" ] && cat "$f" || echo '{"suppress":false}'
+JEVSTUB
+  chmod +x "$JEV_BIN_STUB"
 
   export GOLW_TEST_FIXTURES_DIR="$TMP/fixtures"
 
@@ -2331,6 +2376,54 @@ GCSTUB
   grep -q "cand-held-expired" "$COMM44" 2>/dev/null && ok "scenario 44: comment posted on the expired-hold orphan" || bad "scenario 44 (ga-sgp6j regression): no comment on cand-held-expired — the fix over-widened is_park and silenced a real alert"
   [ -s "$NOTIF44" ] && ok "scenario 44: notify still fires for an expired-hold orphan" || bad "scenario 44: notify did not fire for an expired-hold orphan"
   [ -s "$MAIL44" ] && ok "scenario 44: mail still fires for an expired-hold orphan" || bad "scenario 44: mail did not fire for an expired-hold orphan"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 45 (gate_run=ga-35uv0o, wa-dln9g attempt 2 fix): a bead the
+  # heuristic flags, but Jev confidently says "not needed now" -- comment must
+  # still post (never actually silent), but mail/notify must NOT fire this
+  # cycle (nothing new for the aggregate report). This is the exact gap the
+  # reviewer caught on gate_run ga-35uv0o: new_count (mail-only) was being
+  # used for the early-return/gate that should also have accounted for
+  # to_alert_tsv (comment-only). ──────────────────────────────────────────
+  echo "Scenario 45 (ga-35uv0o): Jev suppresses -- comment still posts, mail/notify do not fire"
+  printf '[%s]' "$(mk_candidate cand-jevsup "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-jevsup.json"
+  echo '{"suppress":true}' > "$TMP/fixtures/jev-suppress.json"
+  NOTIF45="$TMP/notif45"; MAIL45="$TMP/mail45"; COMM45="$TMP/comm45"
+  : > "$NOTIF45"; : > "$MAIL45"; : > "$COMM45"; : > "$LOG"
+  # JEV_BIN (unlike GOLW_JEV_BIN) is the actual variable run_sweep reads --
+  # it's bound once at top-level script parse time from GOLW_JEV_BIN (line
+  # ~315), long before this selftest block runs, so setting GOLW_JEV_BIN as an
+  # env-prefix here would be too late to have any effect. Reassign the
+  # already-bound global directly.
+  GOLW_JEV_EXPERIMENT_ENABLED=1 JEV_BIN="$JEV_BIN_STUB" \
+    GOLW_TEST_NOTIFIED="$NOTIF45" GOLW_TEST_MAILED="$MAIL45" GOLW_TEST_COMMENTS_LOG="$COMM45" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 45: Jev-suppressed cycle still returns 1 (work happened)" || bad "scenario 45: expected return 1, got $rc"
+  grep -q "cand-jevsup" "$COMM45" 2>/dev/null && ok "scenario 45: comment still posted despite Jev suppression (never actually silent)" || bad "scenario 45 (ga-35uv0o regression): NO comment posted on a Jev-suppressed bead -- the exact bug this fix targets"
+  [ ! -s "$MAIL45" ] && ok "scenario 45: mail did NOT fire (Jev-suppressed, nothing new for the aggregate report)" || bad "scenario 45: mail fired even though Jev suppressed the only due bead"
+  [ ! -s "$NOTIF45" ] && ok "scenario 45: notify did NOT fire (Jev-suppressed)" || bad "scenario 45: notify fired even though Jev suppressed the only due bead"
+  grep -q "Jev-suppressed from mail" "$LOG" 2>/dev/null && ok "scenario 45: log records the comment-only-no-mail path explicitly" || bad "scenario 45: log does not show the expected comment-only-no-mail acknowledgment"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 46 (ga-35uv0o CONTROL): same setup, but Jev does NOT suppress --
+  # mail and notify must still fire normally. Guards against an over-wide fix
+  # that skips mail unconditionally regardless of suppression state. ────────
+  echo "Scenario 46 (ga-35uv0o control): Jev does not suppress -- comment, mail, and notify all fire normally"
+  printf '[%s]' "$(mk_candidate cand-jevesc "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-jevesc.json"
+  echo '{"suppress":false}' > "$TMP/fixtures/jev-suppress.json"
+  NOTIF46="$TMP/notif46"; MAIL46="$TMP/mail46"; COMM46="$TMP/comm46"
+  : > "$NOTIF46"; : > "$MAIL46"; : > "$COMM46"; : > "$LOG"
+  GOLW_JEV_EXPERIMENT_ENABLED=1 JEV_BIN="$JEV_BIN_STUB" \
+    GOLW_TEST_NOTIFIED="$NOTIF46" GOLW_TEST_MAILED="$MAIL46" GOLW_TEST_COMMENTS_LOG="$COMM46" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 46: normal (non-suppressed) cycle returns 1" || bad "scenario 46: expected return 1, got $rc"
+  grep -q "cand-jevesc" "$COMM46" 2>/dev/null && ok "scenario 46: comment posted" || bad "scenario 46: no comment posted"
+  [ -s "$MAIL46" ] && ok "scenario 46: mail fired normally (Jev did not suppress)" || bad "scenario 46 (regression): mail did NOT fire even though Jev did not suppress -- fix over-widened the new gate"
+  [ -s "$NOTIF46" ] && ok "scenario 46: notify fired normally" || bad "scenario 46: notify did NOT fire even though Jev did not suppress"
   rm -f "$STATE_FILE" 2>/dev/null
 
   echo ""
