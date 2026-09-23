@@ -16,7 +16,10 @@
 # needs untracked local state such as .gc/site.toml that a clean checkout does not have):
 #   1. [providers.claude-rc] exists, is built on builtin:claude and adds --remote-control;
 #   2. it adds NOTHING else that changes behaviour (no MCP/model/settings flags);
-#   3. peter-wa uses it, and is still suspended=true (steady state) with its session caps;
+#   3. peter-wa uses it, and its on-demand steady state (ga-3g2rjo, 2026-09-22: no
+#      committed suspended=true -- the never-gets-a-bead dispatch-safety guarantee
+#      now lives independently in pilot-dispatcher.sh's _crew_is_suspended, see its
+#      own selftest Scenario 22e) leaves its session caps unchanged;
 #   4. RC did not leak: plain `claude` and `claude-headless` do not carry --remote-control,
 #      and no other agent uses claude-rc.
 set -euo pipefail
@@ -57,13 +60,14 @@ else
   ok "claude-rc.args_append is only the RC flag (Mayor/crew MCP surface, model and permissions untouched)"
 fi
 
-echo "── 3. peter-wa uses it and stays in its steady state ──"
+echo "── 3. peter-wa uses it and stays in its on-demand steady state (ga-3g2rjo) ──"
 grep -q '^provider = "claude-rc"$' "$PETER_TOML" \
   && ok "peter-wa provider = claude-rc" || bad "peter-wa does not use provider claude-rc"
-last_line="$(grep -v '^[[:space:]]*$' "$PETER_TOML" | tail -1)"
-[ "$last_line" = "suspended = true" ] \
-  && ok "peter-wa is still suspended = true, as the LAST line (gc agent suspend/resume edit exactly that line)" \
-  || bad "peter-wa lost its steady-state 'suspended = true' as last line (got: '$last_line')"
+if grep -q '^suspended[[:space:]]*=[[:space:]]*true$' "$PETER_TOML"; then
+  bad "peter-wa still commits 'suspended = true' -- ga-3g2rjo made on-demand access (no committed suspension) the steady state; the never-gets-a-bead guarantee now lives independently in pilot-dispatcher.sh's _crew_is_suspended (see its own selftest, Scenario 22e), so this line is expected to stay removed"
+else
+  ok "peter-wa does not commit 'suspended = true' (ga-3g2rjo: on-demand access is the steady state; dispatch-safety is enforced independently in pilot-dispatcher.sh)"
+fi
 grep -q '^min_active_sessions = 0$' "$PETER_TOML" && grep -q '^max_active_sessions = 1$' "$PETER_TOML" \
   && ok "peter-wa session caps unchanged (min 0 / max 1)" || bad "peter-wa min/max_active_sessions changed"
 

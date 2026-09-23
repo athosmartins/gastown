@@ -113,17 +113,22 @@ KILL_SWITCH = os.path.join(CITY, ".gc/state/quorum-convergence-watchdog.disabled
 # Mayor and dogs are never included; adhoc/polecat sessions are excluded at runtime.
 #
 # wa-14p4c (Athos 2026-09-19, "Manter só nos horários"): peter-wa is
-# deliberately NOT in this roster, even though it can briefly have a live
-# session during its 07:00/19:00 touchpoint window (agent.toml stays
-# suspended=true as the STEADY STATE — the WA-repo wrapper/closer toggle it
-# to false only for the duration of that window, per gate-feedback ga-lltq86:
-# pilot-dispatcher.sh's _crew_is_suspended is a domain-independent safety net
-# that strips any stray assignee=peter-wa before dispatch, so leaving
-# suspended=true whenever there is no active touchpoint is load-bearing).
+# deliberately NOT in this roster, even though it can have a live session
+# (originally only briefly, during a 07:00/19:00 touchpoint window; ga-3g2rjo,
+# 2026-09-22, replaced that with on-demand access via Remote Control). That
+# original rationale rested on agent.toml's suspended=true as the committed
+# STEADY STATE, per gate-feedback ga-lltq86: pilot-dispatcher.sh's
+# _crew_is_suspended is a domain-independent safety net that strips any stray
+# assignee=peter-wa before dispatch, so leaving suspended=true whenever there
+# is no active touchpoint was load-bearing. ga-3g2rjo removed that committed
+# suspended=true line entirely (do NOT assume it is still there) and made the
+# guarantee independent of it instead: _crew_is_suspended now hardcodes
+# peter-wa as always-excluded regardless of the suspended set (see its own
+# selftest, Scenario 22e) — that is what actually backstops dispatch safety now.
 # This watchdog's own selection gate (_get_active_named_crews) only checks
-# whether a session is currently active, never `suspended` — so during that
-# brief window peter-wa would otherwise be selectable as a VOTER. Removing it
-# from the roster stops that. It does NOT, by itself, stop a DIFFERENT
+# whether a session is currently active, never `suspended` — so whenever
+# peter-wa's session is live it would otherwise be selectable as a VOTER.
+# Removing it from the roster stops that. It does NOT, by itself, stop a DIFFERENT
 # legitimately-selected crew from voting "reassign:peter-wa" as a TARGET —
 # that hole is closed separately, in VALID_ACTION_RE and _execute_action
 # below (both explicitly refuse "peter-wa" as a reassignment target,
