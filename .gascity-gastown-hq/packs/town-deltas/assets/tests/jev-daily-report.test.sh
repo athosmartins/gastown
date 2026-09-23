@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# jev-daily-report.test.sh — wa-dln9g: the end-of-day Jev ntfy.
+#
+# Runs the REAL scripts/jev-daily-report.sh against the REAL
+# scripts/jev_experiment_report.py, with a synthetic experiment log and a fake
+# `notify` first on PATH (records its args, never touches ntfy). Covers:
+#   T1 a day with data -> full report file + ONE ntfy carrying the Portuguese
+#      summary, with the exact MEASURED/ESTIMATED numbers and the Jev-unavailable
+#      warning (a day the filter never ran must not read as "saved 0%").
+#   T2 a day with no events -> still exactly one ntfy, saying there is no data
+#      (silence would look the same as "the job never ran").
+#   T3 the report script failing -> an ntfy saying so, and exit != 0.
+#   T4 no date argument -> reports the UTC day that just closed (yesterday, UTC).
+#   T5 the plist fires daily at 21:07 (= 00:07 UTC) and runs this script.
+set -u
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+HQ="$(cd "$HERE/../../../.." && pwd)"
+SCRIPT="$HQ/scripts/jev-daily-report.sh"
+REPORT="$HQ/scripts/jev_experiment_report.py"
+PLIST="$HQ/packs/town-deltas/assets/jev-daily-report.plist"
+
+PASS=0; FAIL=0
+ok()  { PASS=$((PASS+1)); echo "  ok   - $1"; }
+nok() { FAIL=$((FAIL+1)); echo "  FAIL - $1: $2"; }
+
+T="$(mktemp -d)"
+trap 'rm -rf "$T"' EXIT
+mkdir -p "$T/bin" "$T/out"
+cat >"$T/bin/notify" <<'EOF'
+#!/bin/bash
+{ printf 'CALL'; for a in "$@"; do printf '\n%s' "$a"; done; printf '\n--END--\n'; } >>"$NOTIFY_LOG"
+EOF
+chmod +x "$T/bin/notify"
+
+# 2 control + 2 experiment on 2026-09-20: one suppressed by a working Jev
+# (300 in / 20 out tokens), one fired because Jev had no credentials.
+cat >"$T/log.jsonl" <<'EOF'
+{"ts": "2026-09-20T01:00:00Z", "experiment": "gate-orphaned-label", "entity_id": "a", "arm": "control", "jev_ok": false, "jev_error": "control_arm_skips_jev", "jev_tokens_in": 0, "jev_tokens_out": 0, "suppress": false}
+{"ts": "2026-09-20T02:00:00Z", "experiment": "gate-orphaned-label", "entity_id": "b", "arm": "control", "jev_ok": false, "jev_error": "control_arm_skips_jev", "jev_tokens_in": 0, "jev_tokens_out": 0, "suppress": false}
+{"ts": "2026-09-20T03:00:00Z", "experiment": "gate-orphaned-label", "entity_id": "c", "arm": "experiment", "jev_ok": true, "jev_noul": 0.05, "jev_error": null, "jev_tokens_in": 300, "jev_tokens_out": 20, "suppress": true}
+{"ts": "2026-09-20T04:00:00Z", "experiment": "gate-orphaned-label", "entity_id": "d", "arm": "experiment", "jev_ok": false, "jev_error": "no_credentials", "jev_tokens_in": 0, "jev_tokens_out": 0, "suppress": false}
+{"ts": "2026-09-21T04:00:00Z", "experiment": "gate-orphaned-label", "entity_id": "e", "arm": "control", "jev_ok": false, "jev_error": "control_arm_skips_jev", "jev_tokens_in": 0, "jev_tokens_out": 0, "suppress": false}
+EOF
+
+run() {  # run [date-arg...] with the sandboxed env; sets RC
+  : >"$T/notify.log"
+  env PATH="$T/bin:$PATH" NOTIFY_LOG="$T/notify.log" JEV_EXPERIMENT_LOG="$T/log.jsonl" \
+      JEV_DAILY_OUT_DIR="$T/out" JEV_REPORT="${RUN_REPORT:-$REPORT}" \
+      bash "$SCRIPT" "$@" >"$T/stdout" 2>&1
+  RC=$?
+}
+calls() { grep -c '^CALL$' "$T/notify.log"; }
+
+echo "jev-daily-report tests"
+
+# T1
+run 2026-09-20
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T1 exit 0, exactly one ntfy"; else nok "T1 rc/calls" "rc=$RC calls=$(calls) out=$(cat "$T/stdout")"; fi
+grep -q 'Jev experiment report — 2026-09-20' "$T/out/2026-09-20.txt" 2>/dev/null \
+  && ok "T1 full report written to <out>/2026-09-20.txt" || nok "T1 report file" "$(cat "$T/out/2026-09-20.txt" 2>&1)"
+case "$N" in *"Jev — fim do dia 2026-09-20 (UTC)"*) ok "T1 ntfy title names the UTC day" ;; *) nok "T1 title" "$N" ;; esac
+case "$N" in *"controle 2 alerta(s); experimento 2, dos quais 1 silenciado(s) pelo Jev."*) ok "T1 arm counts" ;; *) nok "T1 arm counts" "$N" ;; esac
+case "$N" in *"Redução de alertas (medida): 50,0%."*) ok "T1 measured reduction 50,0%" ;; *) nok "T1 reduction" "$N" ;; esac
+case "$N" in *"~3680 = 46,0%."*) ok "T1 estimated tokens ~3680 = 46,0% (1x4000 - 320 Jev tokens, vs 2x4000)" ;; *) nok "T1 estimate" "$N" ;; esac
+case "$N" in *"Custo do Jev (medido): 300 + 20 tokens."*) ok "T1 measured Jev cost" ;; *) nok "T1 cost" "$N" ;; esac
+case "$N" in *"Jev indisponível em 1 de 2 alerta(s)"*) ok "T1 warns the day's number is understated (Jev unavailable 1/2)" ;; *) nok "T1 unavailable warning" "$N" ;; esac
+case "$N" in *"2026-09-21"*) nok "T1 day filter" "another day's event leaked: $N" ;; *) ok "T1 only the requested UTC day is counted" ;; esac
+
+# T2
+run 2026-09-25
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T2 day without events still sends exactly one ntfy"; else nok "T2 rc/calls" "rc=$RC calls=$(calls)"; fi
+case "$N" in *"nenhum alerta candidato registrado"*) ok "T2 ntfy says there is no data" ;; *) nok "T2 text" "$N" ;; esac
+
+# T3
+RUN_REPORT="$T/does-not-exist.py" run 2026-09-20
+N="$(cat "$T/notify.log")"
+if [ "$RC" -ne 0 ] && [ "$(calls)" -eq 1 ]; then ok "T3 failing report -> exit != 0 and one ntfy"; else nok "T3 rc/calls" "rc=$RC calls=$(calls)"; fi
+case "$N" in *"falhou"*) ok "T3 ntfy says the report failed" ;; *) nok "T3 text" "$N" ;; esac
+
+# T4
+run
+N="$(cat "$T/notify.log")"
+Y="$(date -u -v-1d +%Y-%m-%d)"
+case "$N" in *"fim do dia $Y (UTC)"*) ok "T4 default day = yesterday UTC ($Y)" ;; *) nok "T4 default day" "want $Y, got: $N" ;; esac
+
+# T5
+H="$(plutil -extract StartCalendarInterval.Hour raw "$PLIST" 2>/dev/null)"
+M="$(plutil -extract StartCalendarInterval.Minute raw "$PLIST" 2>/dev/null)"
+P="$(plutil -extract ProgramArguments.1 raw "$PLIST" 2>/dev/null)"
+L="$(plutil -extract Label raw "$PLIST" 2>/dev/null)"
+if [ "$H" = "21" ] && [ "$M" = "7" ] && [ "$P" = "/Users/athos/gt/.gascity-gastown-hq/scripts/jev-daily-report.sh" ] && [ "$L" = "com.gascity.jev-daily-report" ]; then
+  ok "T5 plist: com.gascity.jev-daily-report, daily 21:07, runs the live script path"
+else
+  nok "T5 plist" "hour=$H minute=$M prog=$P label=$L"
+fi
+
+echo ""
+echo "jev-daily-report tests: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]

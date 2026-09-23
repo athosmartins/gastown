@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key><string>/Users/athos</string>
+		<key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+	</dict>
+	<key>Label</key><string>com.gascity.jev-daily-report</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/athos/gt/.gascity-gastown-hq/scripts/jev-daily-report.sh</string>
+	</array>
+	<!-- wa-dln9g: 21:07 BRT = 00:07 UTC, just after the UTC day the experiment log is
+	     stamped in has closed (see jev-daily-report.sh). StartCalendarInterval, not
+	     StartInterval=86400: a long StartInterval resets its countdown on every
+	     sleep/reboot of the mini and may never fire (see beads-upstream-pr-watchdog.plist);
+	     this fires at the next real wall-clock occurrence, or shortly after wake. -->
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key><integer>21</integer>
+		<key>Minute</key><integer>7</integer>
+	</dict>
+	<!-- false: loading/reloading the plist must not send an extra report. -->
+	<key>RunAtLoad</key><false/>
+	<key>LowPriorityIO</key><true/>
+	<key>Nice</key><integer>10</integer>
+	<key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/jev-daily-report-launchd.err</string>
+	<key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/jev-daily-report-launchd.out</string>
+	<key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+</dict>
+</plist>

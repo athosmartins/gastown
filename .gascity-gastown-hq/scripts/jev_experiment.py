@@ -30,15 +30,21 @@ WHAT THIS FILE DOES NOT DO: it does not decide anything on its own. It answers o
 question a caller poses, and logs the answer. The caller (e.g. the watchdog bash script)
 is still the one deciding whether an alert exists at all.
 
-CREDENTIALS: reads CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN from the environment.
-Neither is set as of 2026-09-22 (checked via `secret` against Bitwarden — nothing found;
-see wa-dln9g) — until they are, call_jev() always returns ok=False, error=no_credentials,
-which the suppression logic (by design, not by accident) treats as "escalate anyway".
-The HTTP client itself is written against Cloudflare's documented request/response shape
-(developers.cloudflare.com/ai/models/typesafe/jev/) but has never been exercised against
-the live API — it defends against BOTH a bare model response and Cloudflare's usual
-{"result": ..., "success": ...} v4 envelope, and fails closed (ok=False) on anything it
-can't parse, rather than guessing.
+CREDENTIALS: CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN from the environment win; any
+one that is missing is read from the Bitwarden item `cloudflare-workers-ai` via the
+`secret` CLI (username = account id, password = API token). The vault fallback is what
+the LIVE caller actually depends on: gate-orphaned-label-watchdog's launchd plist passes
+only BD_ACTOR/HOME/PATH, so with the env-only lookup this file shipped with, every
+experiment-arm evaluation from 22/09 to 23/09 logged jev_error=no_credentials (9 of 9 in
+.gc/logs/jev-experiment.jsonl) while the credential sat in the vault — the experiment
+LOOKED live and measured nothing (wa-dln9g). If neither source yields a well-formed
+account id + token, call_jev() returns ok=False — no_credentials (checked, nothing there),
+vault_unavailable (the vault could not be read) or bad_account_id — which the suppression
+logic (by design, not by accident) treats as "escalate anyway".
+The HTTP client defends against BOTH a bare model response and Cloudflare's usual
+{"result": ..., "success": ...} v4 envelope, plus the extra wrapping level the live API
+really returns (see call_jev), and fails closed (ok=False) on anything it can't parse,
+rather than guessing.
 
 CLI:
   python3 jev_experiment.py evaluate --entity-id <id> --experiment <name> \\
@@ -56,6 +62,8 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -65,9 +73,49 @@ from pathlib import Path
 JEV_LOG = Path(os.environ.get("JEV_EXPERIMENT_LOG", "/Users/athos/gt/.gascity-gastown-hq/.gc/logs/jev-experiment.jsonl"))
 CF_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
 CF_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
+SECRET_BIN = os.environ.get("JEV_SECRET_BIN", str(Path.home() / ".local/bin/secret"))
+SECRET_ITEM = os.environ.get("JEV_CF_SECRET_ITEM", "cloudflare-workers-ai")
+SECRET_TIMEOUT_S = 20
 JEV_MODEL = "typesafe/jev"
 DEFAULT_CONFIDENCE_THRESHOLD = 0.85
 HTTP_TIMEOUT_S = 8
+
+
+def _secret_field(field: str) -> str | None:
+    """One field of SECRET_ITEM from the vault. Three outcomes, kept apart on purpose: the
+    value; "" when the vault answered but the field is empty; None when the vault could
+    NOT be read at all (CLI missing, vault locked, bw serve restarting, timeout, non-zero
+    exit). Never raises — both failure shapes end in "no Jev call" (= escalate)."""
+    try:
+        out = subprocess.run(
+            [SECRET_BIN, SECRET_ITEM, "--field", field],
+            capture_output=True,
+            text=True,
+            timeout=SECRET_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip()
+
+
+def _credentials() -> tuple[str, str, bool]:
+    """(account_id, token, vault_failed): env first, vault for whichever one env lacks.
+    vault_failed says a needed vault read could not be done, so the log can tell "could
+    not check" (vault_unavailable) apart from "checked, nothing there" (no_credentials)."""
+    vault_failed = False
+    account_id = CF_ACCOUNT_ID
+    if not account_id:
+        v = _secret_field("username")
+        vault_failed = vault_failed or v is None
+        account_id = v or ""
+    token = CF_API_TOKEN
+    if not token:
+        v = _secret_field("password")
+        vault_failed = vault_failed or v is None
+        token = v or ""
+    return account_id, token, vault_failed
 
 
 def assign_arm(entity_id: str, experiment_name: str) -> str:
@@ -80,10 +128,17 @@ def call_jev(state: str, question_key: str, instructions: str, true_desc: str, f
     """Never raises. Returns a dict with ok=True/False; ok=False always means 'treat as
     unknown, do not suppress' to the caller — this function does not make that call
     itself, evaluate() below does, so the fail-open policy lives in exactly one place."""
-    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
-        return {"ok": False, "error": "no_credentials"}
+    account_id, token, vault_failed = _credentials()
+    if not account_id or not token:
+        return {"ok": False, "error": "vault_unavailable" if vault_failed else "no_credentials"}
+    # A Cloudflare account id is 32 lowercase hex chars. Anything else (a mis-filled vault
+    # field, stray whitespace/notes text) would be spliced into the URL below, and a URL
+    # with spaces raises InvalidURL — a ValueError the handlers below don't catch — so
+    # refuse it here instead of breaking this function's never-raises promise.
+    if not re.fullmatch(r"[0-9a-f]{32}", account_id):
+        return {"ok": False, "error": "bad_account_id"}
 
-    endpoint = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run"
+    endpoint = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run"
     body = json.dumps(
         {
             "model": JEV_MODEL,
@@ -104,7 +159,7 @@ def call_jev(state: str, question_key: str, instructions: str, true_desc: str, f
         data=body,
         method="POST",
         headers={
-            "Authorization": f"Bearer {CF_API_TOKEN}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         },
     )
@@ -215,9 +270,19 @@ def _log(entry: dict) -> None:
 
 
 def _selftest() -> int:
-    """No live credential needed — mocks urllib. Run: python3 jev_experiment.py selftest"""
+    """No live credential needed — mocks urllib AND the vault lookup (the real `secret`
+    CLI is never called). Run: python3 jev_experiment.py selftest"""
     import io
+    import tempfile
     from unittest import mock
+
+    this = sys.modules[__name__]
+    # Every call_jev() below that doesn't explicitly exercise the vault path must never
+    # reach the real `secret` CLI: env-style globals are set, and this stub fails loudly
+    # if the env-wins short-circuit ever regresses. Tests that DO exercise the fallback
+    # patch _secret_field themselves, on top of this.
+    vault_guard = mock.patch.object(this, "_secret_field", side_effect=AssertionError("vault read while env creds were set"))
+    vault_guard.start()
 
     passed = 0
     failed = 0
@@ -238,8 +303,9 @@ def _selftest() -> int:
         cm.__exit__.return_value = False
         return cm
 
-    global CF_ACCOUNT_ID, CF_API_TOKEN
-    CF_ACCOUNT_ID, CF_API_TOKEN = "acct", "token"
+    global CF_ACCOUNT_ID, CF_API_TOKEN, SECRET_BIN, SECRET_TIMEOUT_S
+    FAKE_ACCT = "0123456789abcdef0123456789abcdef"  # well-formed: 32 lowercase hex
+    CF_ACCOUNT_ID, CF_API_TOKEN = FAKE_ACCT, "token"
 
     # wa-dln9g: the ACTUAL shape returned by the live API (2026-09-22, billing enabled) —
     # one level deeper than either the model docs' bare example or a plain v4 {"result": ...}
@@ -280,11 +346,88 @@ def _selftest() -> int:
         r = call_jev("state", "q", "instr", "t", "f")
     ok("no 'answers' at any wrap level -> ok=False, not a guess", r["ok"] is False and r["error"] == "unparseable_response_shape")
 
-    # No credentials at all -> ok=False, no network call attempted.
+    # No credentials anywhere (env empty AND vault empty/unavailable) -> ok=False, and no
+    # network call is attempted.
     CF_ACCOUNT_ID, CF_API_TOKEN = "", ""
-    r = call_jev("state", "q", "instr", "t", "f")
-    ok("no credentials -> ok=False, no_credentials", r == {"ok": False, "error": "no_credentials"})
-    CF_ACCOUNT_ID, CF_API_TOKEN = "acct", "token"
+    with mock.patch.object(this, "_secret_field", return_value=""), \
+         mock.patch("urllib.request.urlopen", side_effect=AssertionError("network call without credentials")):
+        r = call_jev("state", "q", "instr", "t", "f")
+    ok("no env creds + vault empty -> ok=False, no_credentials, no network call", r == {"ok": False, "error": "no_credentials"})
+
+    # Vault could not be read at all -> a DIFFERENT error than "nothing configured", so the
+    # log never claims "no credential" when the truth is "couldn't check" (third state).
+    with mock.patch.object(this, "_secret_field", return_value=None), \
+         mock.patch("urllib.request.urlopen", side_effect=AssertionError("network call without credentials")):
+        r = call_jev("state", "q", "instr", "t", "f")
+    ok("no env creds + vault unreadable -> ok=False, vault_unavailable, no network call", r == {"ok": False, "error": "vault_unavailable"})
+
+    # wa-dln9g regression — the live watchdog's real situation on 22-23/09: env empty, the
+    # credential only in the vault. The request must go out with the vault's account id in
+    # the URL and the vault's token as Bearer. Before the fallback existed this exact case
+    # logged no_credentials on 9 of 9 production evaluations.
+    vault = {"username": FAKE_ACCT, "password": "tok-from-vault"}
+    seen = {}
+
+    def _capture(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["auth"] = req.get_header("Authorization")
+        return _fake_response(live_shape)
+
+    with mock.patch.object(this, "_secret_field", side_effect=lambda f: vault[f]), \
+         mock.patch("urllib.request.urlopen", side_effect=_capture):
+        r = call_jev("state", "q", "instr", "t", "f")
+    ok(
+        "env empty -> vault supplies account id + token, the real request uses both",
+        r.get("ok") is True
+        and seen.get("url") == f"https://api.cloudflare.com/client/v4/accounts/{FAKE_ACCT}/ai/run"
+        and seen.get("auth") == "Bearer tok-from-vault",
+    )
+
+    # Partial env: only the token is missing -> the vault is asked for the token alone.
+    CF_ACCOUNT_ID = FAKE_ACCT
+    asked = []
+    with mock.patch.object(this, "_secret_field", side_effect=lambda f: asked.append(f) or vault[f]), \
+         mock.patch("urllib.request.urlopen", return_value=_fake_response(live_shape)):
+        r = call_jev("state", "q", "instr", "t", "f")
+    ok("env has the account id only -> vault asked for the token only", r.get("ok") is True and asked == ["password"])
+
+    # A malformed account id (e.g. notes text in the wrong vault field) must fail CLOSED with
+    # its own error and never be spliced into the URL (spaces -> InvalidURL, uncaught).
+    CF_ACCOUNT_ID, CF_API_TOKEN = "", ""
+    with mock.patch.object(this, "_secret_field", side_effect=lambda f: {"username": "Workers AI token for", "password": "tok"}[f]), \
+         mock.patch("urllib.request.urlopen", side_effect=AssertionError("malformed account id reached the network")):
+        r = call_jev("state", "q", "instr", "t", "f")
+    ok("malformed account id -> ok=False, bad_account_id, no network call", r == {"ok": False, "error": "bad_account_id"})
+    CF_ACCOUNT_ID, CF_API_TOKEN = FAKE_ACCT, "token"
+
+    # _secret_field() itself: every failure mode of the CLI is None (never raises, never
+    # ""), and a vault that answers with an empty field is "" (never None).
+    vault_guard.stop()
+    saved_bin, saved_timeout = SECRET_BIN, SECRET_TIMEOUT_S
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            SECRET_BIN = str(Path(td) / "no-such-secret-cli")
+            ok("secret CLI missing -> None", _secret_field("password") is None)
+            SECRET_BIN = "/usr/bin/false"
+            ok("secret CLI exits non-zero -> None", _secret_field("password") is None)
+            slow = Path(td) / "slow-secret"
+            slow.write_text("#!/bin/sh\nsleep 5\necho late\n")
+            slow.chmod(0o755)
+            SECRET_BIN, SECRET_TIMEOUT_S = str(slow), 0.3
+            ok("secret CLI hangs past the timeout -> None", _secret_field("password") is None)
+            empty = Path(td) / "empty-secret"
+            empty.write_text("#!/bin/sh\nexit 0\n")
+            empty.chmod(0o755)
+            SECRET_BIN, SECRET_TIMEOUT_S = str(empty), 5
+            ok("secret CLI answers with an empty field -> '' (not None)", _secret_field("password") == "")
+            good = Path(td) / "good-secret"
+            good.write_text('#!/bin/sh\n[ "$1" = "cloudflare-workers-ai" ] && [ "$2" = "--field" ] && echo "  value-for-$3  "\n')
+            good.chmod(0o755)
+            SECRET_BIN, SECRET_TIMEOUT_S = str(good), 5
+            ok("secret CLI success -> stripped stdout, item + --field passed", _secret_field("username") == "value-for-username")
+    finally:
+        SECRET_BIN, SECRET_TIMEOUT_S = saved_bin, saved_timeout
+        vault_guard.start()
 
     # evaluate(): control arm never calls Jev at all.
     with mock.patch("urllib.request.urlopen", side_effect=AssertionError("control arm must not call Jev")):
@@ -308,6 +451,7 @@ def _selftest() -> int:
         r = evaluate(exp_id, "selftest", "state text", "q", "instr", "t", "f", 0.85)
     ok("experiment arm, noul=0.5 (uncertain) -> suppress=False", r["suppress"] is False)
 
+    vault_guard.stop()
     print(f"\njev_experiment selftest: PASS={passed} FAIL={failed}")
     return 1 if failed else 0
 
