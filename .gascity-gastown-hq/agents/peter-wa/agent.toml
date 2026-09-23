@@ -6,4 +6,3 @@ provider = "claude-rc"
 
 option_defaults = { effort = "high" }
 
-suspended = true

@@ -1321,8 +1321,26 @@ _pilot_suspended_crews() {
   printf '%s' "$_PILOT_SUSPENDED_CREWS"
 }
 # _crew_is_suspended <crew> — return 0 (true) iff the crew is in the suspended set.
+#
+# ga-3g2rjo: peter-wa is hardcoded as ALWAYS suspended-for-dispatch-purposes here,
+# independent of the suspended set above. Before this, agent.toml's suspended=true
+# was the ONLY thing keeping every call site of this function (the explicit-assignee
+# strip and the domain-default clear, both below) from ever honoring a stray
+# assignee=peter-wa. Athos's original decision (wa-14p4c) was explicit and
+# unconditional: "Garanto que ele não pega bead nenhuma" — not "unless someone
+# un-suspends him for a chat". Once peter-wa's agent.toml suspended=true was
+# removed (ga-3g2rjo, to allow on-demand interactive access via Remote Control),
+# every OTHER consumer of this function silently regained the ability to dispatch
+# to him. Hardcoding the exclusion HERE — the single choke point every existing
+# (and future) call site already trusts — closes that gap for all of them at once,
+# the same "fix the shared primitive, not each call site" choice
+# quorum-convergence-watchdog.py's VALID_ACTION_RE already made for the
+# vote-injection path. This does NOT affect _own/rig_domain_owner's "real-estate
+# prefers peter-wa" preference query (a different, unrelated question) — only
+# whether a dispatch actually honors that preference.
 _crew_is_suspended() {
   local crew="$1" susp
+  case "$crew" in peter-wa) return 0 ;; esac
   susp=$(_pilot_suspended_crews)
   [ -z "$susp" ] && return 1
   case " $susp " in *" $crew "*) return 0 ;; *) return 1 ;; esac

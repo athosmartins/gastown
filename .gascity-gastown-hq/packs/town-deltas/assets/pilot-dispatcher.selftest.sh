@@ -5963,6 +5963,25 @@ fi
 has "$DISPATCHER" '_crew_is_suspended()'                 "_crew_is_suspended gate (e) helper defined"
 has "$DISPATCHER" '_crew_is_suspended "\$crew" && continue' "suspended-crew skip wired into pick_pool_builder"
 
+# ga-3g2rjo: peter-wa must NEVER be dispatchable, independent of the suspended
+# list -- Athos's explicit "Garanto que ele não pega bead nenhuma" guarantee,
+# which used to ride entirely on agent.toml's suspended=true (removed by this
+# same bead to allow on-demand interactive access). Prove _crew_is_suspended
+# treats peter-wa as excluded even when the override list does NOT mention him
+# at all -- this is the actual regression this bead exists to prevent, and it
+# fails against the pre-fix function (peter-wa was dispatchable whenever he
+# wasn't separately suspended).
+PETER_RESULT="$(
+  eval "$_SUSP_FNS"
+  export PILOT_SUSPENDED_CREWS_OVERRIDE="digo-wa gastown.boot"
+  if _crew_is_suspended peter-wa; then printf 'peter=excluded'; else printf 'peter=DISPATCHABLE'; fi
+)"
+if [ "$PETER_RESULT" = "peter=excluded" ]; then
+  ok "ga-3g2rjo: peter-wa is ALWAYS excluded from dispatch, even absent from the suspended override list"
+else
+  bad "ga-3g2rjo (REGRESSION): peter-wa is dispatchable when not explicitly suspended -- the never-gets-a-bead guarantee is broken (got: '$PETER_RESULT')"
+fi
+
 # ── Scenario 22e2: per-crew in-flight CAP — an overloaded crew is skipped (load-balance)
 echo "Scenario 22e2: per-crew in-flight cap — crew at/over the cap is capped, light crew is not"
 _CAP_FNS="$(awk '/^PILOT_MAX_INFLIGHT_PER_CREW=/{p=1} p{print} /_crew_at_inflight_cap\(\)/{c=1} c&&/^}$/{exit}' "$DISPATCHER")"
