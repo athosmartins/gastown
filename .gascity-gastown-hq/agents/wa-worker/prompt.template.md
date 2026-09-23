@@ -23,388 +23,117 @@ You are disposable. You do not carry state between runs. When your bead is done,
 {{ .AssignedReadyQuery }}
 
 # Step 1b2 (ga-dbibq, ga-x80j1, ga-0pg2o — CRITICAL, do NOT skip, run FIRST):
-# the un-gated, priority-aware routed-pool probe below. Renumbered from
-# "Step 1b3" by ga-0pg2o (Mayor decision, 2026-09-10), which swapped this
-# probe to run BEFORE the Go-rendered query (moved to Step 1b3 below) for
-# EVERY session regardless of origin. Why: that Go-rendered query is GATED
-# on GC_SESSION_ORIGIN=ephemeral (ga-dbibq) — a Pilot-spawned worker
-# (`gc session new`) gets a NON-ephemeral origin, so it silently renders to
-# a no-op for such a worker, and this probe was already the only one such a
-# worker ever got real results from. The gap ga-0pg2o closed: a genuinely
-# ephemeral-origin session still hit that Go-rendered query FIRST, and it is
-# LRU-only with no priority awareness (routedReadyTierCommand,
-# internal/config/config.go) — so ga-x80j1's priority-sort fix below never
-# reached an ephemeral-origin session, which could still claim an older,
-# lower-priority routed bead ahead of a freshly-dispatched P0/P1.
-# {{ .RoutedPoolQuery }} appears in no template but this one and ps-worker's
-# (verified: grep across agents/ and packs/), so the fix belongs here, not
-# in the engine. You ARE a dedicated wa-worker — ALWAYS run this UN-GATED
-# routed-pool probe directly, first:
-# ga-y8qh: excludes pool:refused:*/story:needs-human/ctx:thin — nothing clears
-# gc.routed_to after a refusal, so without this filter every fresh worker
-# re-fetches and re-confirms the SAME already-parked bead, burning a full
-# startup per session. --exclude-label is exact-match only, so
-# pool:refused:<reason-slug> needs the jq startswith() pass; limit=20 (not 1)
-# so a filtered-out top candidate can't hide a valid one behind it.
-# ga-nf4x5: also excludes story:needs-approval — the Athos MERIT/legal sign-off
-# gate (refino-gate-dispatcher.sh applies it once code-gate passed but a human
-# decision on merit/risk is still pending). Distinct from story:needs-human (an
-# INFO-GAP) but the same "never auto-dispatch" invariant applies: near-miss
-# wa-6xn82 (a real LAI legal filing) was dispatched to this exact pool with "No
-# human review required" before a worker happened to read the comment and
-# refuse by hand — this probe must not rely on that again. Mirrors
-# _filter_candidates in pilot-dispatcher.sh (same fix, same story).
-# ga-en2s: also excludes beads under Pilot's dispatch-hold (see pilot-dispatcher.sh
-# _filter_candidates). This probe bypasses Pilot's dispatch path entirely, so it had
-# no awareness of the hold. Replicate the CANONICAL rule EXACTLY (imp19/ga-4aree):
-#   a bead passes iff  (NOT pilot:held)  OR  (a pilot:held-until:<epoch> exists AND
-#   its LATEST/MAX stamp is already in the past).
-# ga-uvfs6: also excludes pilot:refused-reason:* — inflight-reclaim-guard.py's
-# _promote_refusal_labels() CONSUMES the ephemeral pool:refused[:reason] label
-# above and promotes it to a permanent pilot:refused-reason:<slug> for audit,
-# so a once-refused bead that survived past its first reclaim cycle no longer
-# carries any pool:refused* label at all and this probe re-fetched/re-confirmed
-# it exactly like a fresh bead (wa-ys0cy: pilot:refused-reason:oracle-named-executor
-# with no pool:refused: reappeared and burned another startup). Same prefix-startswith
-# treatment as pool:refused, just a different label namespace.
-# Two subtleties the first cut got wrong (gate FAIL ga-wisp-2hcah2):
-#   • pilot:held with NO held-until yet is the "trap" state (imp19/imp20 hold-stamping
-#     is non-atomic; janitor R6 stamps a default expiry only on its NEXT sweep). The
-#     canonical filter treats it as skip-forever → the empty-held-until case must be
-#     `false` (still held), NOT `true`. A bare `pilot:held` alone must exclude.
-#   • ga-en2s-2: do NOT gate the left branch on a BARE `index("pilot:held")`. In the
-#     wild, beads carry `pilot:held-until:<epoch>` WITHOUT the bare `pilot:held`
-#     (stamping is non-atomic — held-until lands first). With `index("pilot:held")|not`
-#     the left branch is TRUE for those beads and the OR short-circuits, so an ACTIVE
-#     hold is never checked: live repro wa-qgdw1 (held-until ~4.7h in the future) came
-#     back as the probe's top-1 candidate. The left branch must mean "no hold label AT
-#     ALL" — but NOT via a bare `startswith("pilot:held")` either (see ga-jfz9t1 below).
-#   • held-until labels ACCUMULATE (never pruned here), so use MAX not .[0] (ga-4aree)
-#     — the bead is still held iff its LATEST stamp is in the future.
-#   • ga-jfz9t1: `startswith("pilot:held")` (no colon) is ALSO wrong, the other
-#     direction — it matches the unrelated sticky `pilot:held-count:<slug>:<n>`
-#     label (pilot-dispatcher.sh's _pilot_hold_or_escalate — an escalation-cap
-#     counter documented there as surviving hold expiry, i.e. NEVER cleared once
-#     stamped). A bead carrying only pilot:held-count:* has zero pilot:held-until:
-#     labels to compute an expiry from, so the old broad match fell into the
-#     "else false" branch with no escape hatch and was excluded FOREVER. Confirmed
-#     live: ga-281ri4/ga-fkc1vx were re-approved (ctx:ready/exec:auto/
-#     story:approved) after an earlier unrelated lane:big refusal, but the leftover
-#     held-count label kept them invisible to this exact probe until removed by
-#     hand. The correct left branch is exactly the two label forms that ever
-#     represent an actual hold — `. == "pilot:held" or startswith("pilot:held-until:")`
-#     — covering both the ga-en2s-2 non-atomic-stamping case above AND excluding
-#     pilot:held-count:*, simultaneously. Do not simplify either direction.
-# ga-3lsy1: bugs/tech-debt/tasks never carry the story:* refino convention, so their
-# human-gate signal is the BARE needs-human label instead of story:needs-human — this
-# probe bypasses Pilot's _filter_candidates entirely (same class as ga-nf4x5's
-# wa-6xn82 near-miss), so the bare-label exclusion must live here too, independently.
-# ga-7ha7g: --exclude-type=epic checks issue_type only. Bead authors routinely
-# title/label a bead as an epic (Portuguese "ÉPICO:", English "EPIC:", or the
-# story:epic label) without setting issue_type=epic — confirmed live: ga-9pyg2
-# (issue_type=task, label story:epic, title "ÉPICO: migração v55 do engine...",
-# labels ctx:ready+exec:auto — required a Mayor-coordinated engine rebuild,
-# exactly the class of work a pool worker must never execute off its own hook
-# per ga-vhyd) and gh-ai2 (issue_type=task, title "EPIC: migrar crew GT...", no
-# story:epic label — the title-only half of the same gap). Both the exact
-# --exclude-label "story:epic" below and the jq title-regex select are needed —
-# neither alone would have caught both live instances. The regex is anchored
-# to the start with a :/whitespace delimiter so a title merely containing
-# "epic" mid-sentence is never over-matched.
-# ga-znlvl: also excludes the REFINO-STAGE + MANUAL-EXECUTION label families —
-# a bead still mid-refino (or requiring a human/device to execute) was surfacing
-# as candidate #1 and burning a claim-detect-drain cycle every time, exactly
-# the same "probe never learned this label" shape as every fix above. Two
-# distinct sources, cited exactly, not invented:
-#   • refino-stage: the canonical allowlist lives in lifecycle-coherence-janitor.sh's
-#     R7 check (reasoned in ga-rccry) — enumerated here because --exclude-label is
-#     exact-match only (the janitor's own ^story:refino- PREFIX cannot be expressed
-#     as a flag). Deliberately an ALLOWLIST of what blocks, not a denylist of what
-#     doesn't: ga-rccry measured that a broad ^refino:/^auto-refino: prefix also
-#     catches refino:creator-swept (36 of ~50 refino-labeled beads at measurement
-#     time) and refino:done (refino FINISHED — implementable by definition), and
-#     excluding either would silently block legitimate work.
-#   • manual-execution: park_labels.py's MANUAL_EXEC_LABELS (the canonical "the
-#     headless pool cannot build this by design" set) — found by the Mayor
-#     (ga-znlvl investigation) already honored by FOUR other consumers
-#     (throughput-stall-watchdog.py, approved-state-reconciler.py, park_labels
-#     itself, inflight-reclaim-guard.py) but not this probe, the one that
-#     actually starts work. Live near-miss: wa-ielq6.1/.2 (exec:manual, child of
-#     an epic touching central_sender.py, the rig's highest-blast-radius file)
-#     claimed and only stopped by a worker manually reading the label.
-# NOTE (residual, not fixed here — flagging rather than silently expanding
-# scope or silently dropping it): park_labels.py also defines
-# BLOCKED_FAMILY_LABELS and FLOWING_OR_DONE_LABELS as further "don't offer
-# this bead fresh" signals. Not included in this pass — no LIVE incident
-# confirmed them reaching this probe specifically, and bd ready's own
-# status/assignee filtering already excludes most of that territory in the
-# normal reclaim/gate flow (a reclaim clears story:in-flight together with
-# status/assignee). If one of those labels is ever caught live on an offered
-# candidate, that is real evidence this note's reasoning was wrong for that
-# label — add it then, don't pre-emptively enumerate the whole canonical set
-# against zero incidents. (GATE_PARK_LABELS is no longer in this residual
-# set — see ga-6bghe below, which is exactly the live incident this note
-# said to wait for.)
-# ga-s1d5o: also excludes needs:engine-window, pilot:no-auto-dispatch, and
-# story:blocked (exact-match) plus blocked:<reason> and gate:needs-human(:<reason>)
-# (prefix, via jq below). This probe had drifted OUT of sync with
-# bdReadyPoolDemandExcludeLabelArgs()/poolDemandLabelFilterJQ() — the Go
-# functions that render Step 1b3/.RoutedPoolQuery below — which already
-# carried these three park labels (ga-5huvs) that this hardcoded Step 1b2
-# copy never picked up. Found while fixing the INVERSE gap: Step 1b3 was
-# missing exec:manual/refino-stage, i.e. THIS file's own ga-znlvl fix, which
-# was applied only here and never backported to the Go side (see ga-s1d5o).
-# Bringing both lists to the same superset in one pass so neither direction
-# of drift is left standing.
-# ga-6bghe: also excludes gate:queued and gate:reviewing (exact-match) — the
-# ABOVE note assumed "a gate:queued bead stays assigned, not open+unassigned,
-# in the flow this session observed," so GATE_PARK_LABELS was left out
-# pending a live counter-example. Two independent live incidents (ga-nxgxz
-# 2026-08-06, ga-ovw94t 2026-08-17) are exactly that counter-example: a
-# builder's fix was submitted to gate (gate:queued/gate:reviewing set) while
-# the SOURCE bead stayed open+unassigned+gc.routed_to (the builder's own
-# "stays open until the gate merges" convention), and this probe — bypassing
-# Pilot's own gate-aware dispatch entirely, same as every other gap above —
-# claimed it as fresh work mid-review, burning ~10-15 tool calls
-# reconstructing "already in flight" from scratch each time.
-# gate:needs-fix is deliberately NOT added: it means the gate REJECTED and a
-# builder IS needed again, so it must stay poolable. The two do not
-# steady-state coexist — quality-gate-dispatcher.sh's FAIL path clears
-# gate:queued (and unsets gc.routed_to) in the same edit that sets
-# gate:needs-fix. A third label named in ga-6bghe's own bug report,
-# "gate:dispatching", is deliberately omitted: verified against every gate:*
-# label actually applied to a bead across packs/town-deltas/assets/*.sh and
-# internal/ — it does not exist. The real marker-side field is
-# gate-status:dispatching, which lives on the separate quality-gate-marker
-# bead, never on the story bead this probe evaluates.
-# ga-3ife8: also excludes pilot:text-veto:<slug> by FAMILY PREFIX (not an
-# enumerated slug list). This is the label _reconcile_text_veto_labels
-# (pilot-dispatcher.sh) stamps on a bead the Pilot vetoed by TEXT content
-# (engine-rebuild mention, a DECISAO title, an "only Athos decides" phrase, a
-# compliance marker, a diagnostic-only body). ga-42mlf's close reason claims
-# the Go-rendered Step 1b3 below already excludes this family
-# (poolDemandLabelFilterJQ) — NOT independently confirmed here: that symbol
-# and the commit SHA the close reason cites are both absent from the current
-# origin/main tree (see ga-c2w3k, filed alongside this fix, for the
-# verification trail). This file's Step 1b2 fix does not depend on Step 1b3's
-# real state either way — it is plain text, not Go-rendered, so it inherits
-# nothing automatically regardless. Live incident: this copy offered wa-es2v1
-# (pilot:text-veto:compliance-marker-text-pattern) as candidate #1 on
-# 2026-09-04. Matching by prefix rather than the 5 known slugs means a future
-# 6th slug needs NO prompt edit here — this is the 10th time this exact copy
-# has drifted behind pilot-dispatcher.sh (ga-y8qh, ga-nf4x5, ga-en2s,
-# ga-uvfs6, ga-3lsy1, ga-7ha7g, ga-znlvl, ga-s1d5o, ga-6bghe, now this).
-# Regression coverage: pool-probe-text-veto-family.selftest.sh.
+# un-gated, priority-aware routed-pool probe. Runs BEFORE the Go-rendered
+# Step 1b3 query because that one is GATED on GC_SESSION_ORIGIN=ephemeral
+# and is LRU-only (no priority awareness) — a Pilot-spawned session
+# (non-ephemeral origin) gets a no-op from Step 1b3, so THIS probe is the
+# only one that ever returns real results for it. You ARE a dedicated
+# wa-worker — ALWAYS run this probe directly, first.
 #
-# ga-x80j1: --sort oldest (below) starved higher-priority routed beads. Step
-# 1b3 (.RoutedPoolQuery) is Go-rendered and GATED on GC_SESSION_ORIGIN=ephemeral
-# (ga-dbibq) — a Pilot-spawned worker (`gc session new`) gets a NON-ephemeral
-# origin, so Step 1b3 renders to a no-op for it (ga-0pg2o: consulted below as
-# a fallback, but never returns anything for such a worker) and this Step 1b2
-# copy is the ONLY query such a worker ever gets real results from.
-# `bd ready --help` documents --sort's
-# values as "priority (default), hybrid, oldest" — this line explicitly
-# overrode the sane default to raw creation-time FIFO, so any older
-# lower-priority routed bead beat a fresh P0 to the front of the line.
-# Verified live 2026-09-10 against the real WA routed-pool backlog:
-# --sort oldest put a priority=2 bead (wa-j4bzx, created 17:35) ahead of
-# five priority=1 beads created later. Matches the exact pattern reported
-# for wa-q947y (P0): dispatched twice, both times the spawned session
-# claimed a different, older, lower-priority routed bead instead
-# (wa-p2ozw, wa-nb4ie, wa-sq97b — see memory
-# wa-worker-title-stub-transcript-not-work-session for the transcript
-# trail). pilot-dispatcher.sh's own header already states the doctrine
-# this now matches: "PRIORITY DIRECTIVE (wa-tm2a): PRIORITY DOMINATES;
-# type is only a tiebreak."
+# Each --exclude-label / jq select below encodes one confirmed live
+# regression (bead id = full incident writeup, don't re-derive from
+# scratch if this list ever needs to change):
+#   ga-y8qh      pool:refused:*/pilot:refused-reason:* by PREFIX (not exact) — a bare
+#                exact-match re-offers the same already-refused bead every session.
+#   ga-nf4x5     story:needs-approval (Athos merit/legal sign-off gate, distinct
+#                from story:needs-human) — a live LAI filing was nearly auto-built.
+#   ga-en2s      pilot:held UNLESS its MAX pilot:held-until:<epoch> is already past.
+#                Bare pilot:held w/ no held-until = still held (non-atomic stamping).
+#                Do NOT match via startswith("pilot:held") — also matches the
+#                unrelated sticky pilot:held-count:<n> label (ga-jfz9t1).
+#   ga-3lsy1     bare `needs-human` too — bugs/tasks don't use the story:* convention.
+#   ga-7ha7g     --exclude-type=epic misses title/label-only epics (no issue_type set)
+#                — also match title regex ^(EPIC|ÉPICO)[:\s] and label story:epic.
+#   ga-znlvl     refino-stage allowlist (lifecycle-coherence-janitor.sh R7) + manual-
+#                execution labels (park_labels.py MANUAL_EXEC_LABELS) — exec:manual
+#                work claimed by the headless pool by design must never happen.
+#                (residual, not fixed: BLOCKED_FAMILY_LABELS/FLOWING_OR_DONE_LABELS —
+#                no live incident yet, add only if one occurs.)
+#   ga-s1d5o     needs:engine-window, pilot:no-auto-dispatch, story:blocked (exact) +
+#                blocked:<reason>, gate:needs-human(:<reason>) (prefix) — brought this
+#                hardcoded copy back in sync with the Go-rendered query's own list.
+#   ga-6bghe     gate:queued, gate:reviewing (exact) — a bead mid-gate-review must not
+#                be re-claimed as fresh work. gate:needs-fix is deliberately NOT
+#                excluded (gate rejected -> needs a builder again).
+#   ga-3ife8     pilot:text-veto:<slug> by FAMILY PREFIX, not an enumerated slug list
+#                (10th time this hand-copy has drifted behind pilot-dispatcher.sh —
+#                see pool-probe-text-veto-family.selftest.sh).
 #
-# NOT a plain `--sort priority` swap: the engine's OWN routedReadyTierCommand
-# (internal/config/config.go, renders the gated Step 1b3 this file mirrors)
-# deliberately uses --sort oldest + a trailing `sort_by(.updated_at //
-# .created_at)` instead of priority — ga-w4k2z's comment there explains why:
-# a repeatedly-reclaimed bead's created_at never changes, so a pure static
-# sort (whether by age OR by priority) lets that ONE poisoned bead re-occupy
-# position 0 forever and starve every sibling behind it; sorting survivors by
-# updated_at (which every reclaim bumps) instead sends a just-reclaimed bead
-# to the BACK of the line each time. That fix is deliberate and evidence-based
-# (13 candidates over ~36h, only the head ever served) — copying it here
-# verbatim would just reinstate the ga-x80j1 bug (no priority-awareness at
-# all). So this line does BOTH: --sort priority bounds the fetched 20-candidate
-# window by priority (so a large low-priority backlog can never push a fresh
-# P0 out of the window before the jq filters even see it), and the jq tail's
-# `sort_by([.priority, (.updated_at // .created_at // "")])` re-sorts the
-# survivors with priority as the dominant key and ga-w4k2z's own LRU-by-
-# updated_at as the tiebreak WITHIN each priority tier — so a poisoned bead
-# still cedes its slot to same-priority siblings on repeat reclaims, and a
-# fresh high-priority bead is never buried behind an older low-priority one.
-# residual (still not fixed here — flagging, not expanding scope): the
-# engine's routedReadyTierCommand itself still has no priority-awareness at
-# all. ga-0pg2o (2026-09-10) closed the main consequence of this: a
-# genuinely-ephemeral-origin session now hits this priority-aware probe
-# FIRST, same as every other origin, because the Go-rendered query was
-# demoted to a Step 1b3 fallback consulted only if this one found nothing.
-# The remaining gap is narrower — within that fallback-only path, an
-# ephemeral-origin session whose Step 1b2 comes back empty still gets pure
-# LRU ordering with no priority signal from Step 1b3. Bringing the engine
-# itself in line with this same compound approach is still an engine-side
-# change (out of pack-level reach, and a real design tradeoff — see
-# ga-w4k2z — that deserves human/Mayor review rather than a dog unilaterally
-# patching it) — flagged in the ga-x80j1 bead, not fixed here or in
-# ga-0pg2o. Regression coverage: pool-probe-priority-sort.selftest.sh.
+# ga-x80j1 (sort): --sort oldest starved P0s behind older low-priority routed beads
+# (bd ready --sort supports priority/hybrid/oldest; pilot-dispatcher.sh's own
+# doctrine: "PRIORITY DOMINATES; type is only a tiebreak"). NOT a plain --sort
+# priority swap either: the engine's own routedReadyTierCommand deliberately
+# sorts oldest+updated_at instead of priority (ga-w4k2z) so a repeatedly-reclaimed
+# bead's static created_at can't let it camp position 0 forever. This line does
+# both: --sort priority bounds the fetched window by priority, then the jq tail's
+# sort_by([priority, updated_at-or-created_at]) re-sorts survivors with priority
+# dominant and LRU as the same-priority tiebreak — so a poisoned bead still cedes
+# to siblings, and a fresh P0 is never buried behind an old P2.
+# (residual, not fixed: the engine's own routedReadyTierCommand still has no
+# priority-awareness at all — an engine-side change, out of pack-level reach,
+# flagged in ga-x80j1, deliberately left to the Step 1b3 fallback below.)
+# Regression coverage: pool-probe-priority-sort.selftest.sh.
 #
-# ga-0pg2o: also excludes a bead at Pilot's reclaim-count cap. Mirrors
-# pilot-dispatcher.sh's own OPERATIVE exclusion exactly (_FILTER_RECLAIM_CAP=3
-# at ~line 1988; applied ~lines 2964-2967): a bead's labels are scanned for
-# pilot:reclaim-count:<n>, and if the MAX such n is >= 3 the bead is
-# excluded. Without this, putting priority sort first (above) lets a single
-# always-failing P0/P1 bead with no same-priority sibling monopolize
-# position 0 for every new session forever — the compound sort's updated_at
-# tiebreak (ga-w4k2z, above) only protects a bead from a same-priority
-# sibling, not from being the sole occupant of its own priority tier. The
-# threshold (3) is a hardcoded literal, not read from a shared variable —
-# pilot-dispatcher.sh and this template are separate processes with no
-# shared runtime state; if _FILTER_RECLAIM_CAP ever changes, this literal
-# must be updated too. Regression coverage: pool-probe-priority-sort
-# .selftest.sh's reclaim-cap-exclusion case (not caught automatically).
-# ga-q65d8: also excludes delivery:pending-restart (exact-match). That label
-# is the canonical, deliberate hold stamped by the daemon-verification
-# mechanism (ga-l7n3v/ga-puq8z) once a bead's fix has already passed the
-# quality gate and merged, but a long-lived hot-path daemon may still be
-# running the old code — "done as far as any builder is concerned," the only
-# remaining step being an operational guarded restart (sometimes gated on a
-# domain-specialist's production-timing judgment call), never a code change.
-# This probe bypasses Pilot's dispatch path entirely, same as every gap
-# above, so it had no awareness of the hold. Live incident: wa-k2j6n
-# (labels ctx:ready, delivery:pending-restart, exec:auto, gate:passed,
-# lane:small, pilot:reclaim-count:1, scope:advisory; unassigned) cost 3
-# separate worker sessions a full from-scratch re-investigation each — the
-# gate has already passed, so no branch-progress liveness signal is ever
-# possible again, and the bead had already been explicitly routed by the
-# Mayor to a named domain owner (oracle-wa) for a timing decision a generic
-# ephemeral worker has no basis to make safely. Without this exclusion it
-# will keep re-surfacing roughly every reclaim-guard TTL window until that
-# owner acts, regardless of how many times it is re-parked by hand.
-# Regression coverage: pool-probe-delivery-pending-restart.selftest.sh.
+# ga-0pg2o: also excludes a bead at Pilot's reclaim-count cap (MAX pilot:reclaim-
+# count:<n> >= 3, mirrors pilot-dispatcher.sh's _FILTER_RECLAIM_CAP verbatim,
+# hardcoded literal — no shared runtime state between the two processes) — else
+# priority-sort alone lets one always-failing P0 monopolize position 0 forever.
 #
-# ga-oc6knj: the tiebreak's fallback-to-updated_at (ga-w4k2z, kept below for
-# GENUINELY-reclaimed beads) also fired on a bead's OWN FIRST dispatch —
-# Pilot's dispatch write itself (story:in-flight + pilot:dispatched labels +
-# a comment) bumps updated_at, so a bead JUST routed always sorted to the
-# BACK of its priority tier, behind every sibling it hadn't yet raced. Each
-# missed pick + reclaim + redispatch re-bumped updated_at again, so the bead
-# could never win a same-priority tiebreak as long as ANY untouched sibling
-# existed — proven live 17/09 (transcript 0bc29f56): probe order
-# [wa-aaekc(updated 23:38, re-routed earlier), wa-yzx9g(updated 01:40:43,
-# =dispatch instant), wa-ylh0x(updated 01:40:55, =dispatch instant)] handed
-# the session to wa-aaekc; wa-yzx9g/wa-ylh0x each burned reclaim attempts
-# without ever being tried once. Compounded by inflight-reclaim-guard.py's
-# do_reclaim() (ga-oc6knj fix there too) charging a NEVER-claimed bead's
-# reclaim the same MAX_RECLAIMS cap as a real dead-worker reclaim, so pure
-# queue starvation alone reached gate:needs-human in 3 cycles with zero
-# attempts (wa-ylh0x, wa-yzx9g, wa-c1hgd).
-# Fix is NOT a plain switch to created_at (that would just reinstate
-# ga-w4k2z's poisoned-bead-camps-position-0-forever bug for a bead that DOES
-# fail repeatedly, since created_at never moves). Instead: branch on whether
-# this bead carries ANY pilot:reclaim-count:<n> label (i.e. has it EVER
-# actually been reclaimed after a real attempt) — reusing the exact same
-# label-parsing sub-expression as the cap-exclusion clause immediately to
-# the left. Zero such labels (never reclaimed, incl. every first-ever
-# dispatch) -> sort by created_at (stable, immune to the dispatcher's own
-# routing writes). One or more (proven poisoned at least once) -> sort by
-# updated_at exactly as before, preserving ga-w4k2z's anti-poison property
-# for the beads it actually protects against. Regression coverage:
-# pool-probe-priority-sort.selftest.sh's ga-oc6knj cases.
+# ga-oc6knj (tiebreak): the updated_at tiebreak above also fired on a bead's OWN
+# first dispatch (Pilot's dispatch write bumps updated_at), so a just-routed bead
+# always sorted to the back of its tier behind every untried sibling — pure queue
+# starvation reached gate:needs-human in 3 cycles with zero real attempts
+# (wa-ylh0x/wa-yzx9g/wa-c1hgd, transcript 0bc29f56). Fix: branch on whether the
+# bead carries ANY pilot:reclaim-count:<n> label at all — zero (incl. every
+# first-ever dispatch) -> sort by created_at (immune to the dispatcher's own
+# routing writes); one+ (proven poisoned) -> sort by updated_at as before,
+# preserving ga-w4k2z's anti-poison property for the beads it actually protects.
 #
-# ga-onrnd6 (2026-09-17): also excludes next-action:* (vetoing UNLESS it ends
-# in a build-verb suffix) — same drift shape as every gap above (this probe
-# bypasses Pilot's own _filter_label_vetoes entirely, so it had no awareness
-# of this label at all). Live incident: wa-k1sr7 (mockup DONE, parked
-# next-action:athos-decide awaiting Athos's A/B/C pick, zero code left to
-# write) was still offered as a fresh candidate and dispatched 6 times before
-# a human noticed.
-# next-action: is OVERLOADED with two opposite meanings (pilot-dispatcher.sh's
-# _filter_label_vetoes gate (d) comment is the source of truth this mirrors,
-# character-for-character): the original convention (bare next-action:mayor,
-# next-action:athos+oracle, next-action:athos-decide) means "blocked on
-# Athos/a dependency" and must veto; refino's newer next-action:<crew>-
-# constroi/-reconstroi/-corrige-gate/-corrige convention means the OPPOSITE —
-# "ready, <crew> is who builds it" (ga-f7bek) — and must survive. Omitting
-# that carve-out would reinstate the exact 24h starvation bug ga-f7bek fixed.
-# Sibling fix, same day, same predicate fragment verbatim: ga-473mkh patched
-# poolDemandLabelFilterJQ() (internal/config/config.go — the dog pool's own
-# Step 1c probe) for this identical gap, confirmed live via ga-boftko
-# (bare next-action:mayor, 2026-09-16). That patch's own "Known adjacent gap"
-# note flagged this file (wa-worker/ps-worker's independently-hardcoded
-# copy) as unconfirmed and untouched — this is that follow-up.
-# Known adjacent gap, NOT fixed here (scope stays matched to what both live
-# incidents actually reported): waiting-on:/blocked-on:/depends-on: are
-# ALSO part of _filter_label_vetoes's full predicate and are STILL not
-# excluded by this probe. Deliberately not addressed in this pass — no live
-# incident named them here (unlike next-action:, corroborated 4 times across
-# two independent probes), and the reviewed ga-473mkh sibling fix scoped
-# itself the same way. _pilot_pool_topup gets the FULL family for free below
-# (it now calls _filter_label_vetoes directly, the actual canonical function,
-# rather than a hand-typed subset) — worth a follow-up bead if
-# waiting-on:/blocked-on:/depends-on: is ever caught live on THIS probe.
-# Same fix applied to ps-worker's identical copy and to the Step 1b3 fallback
-# below (both templates).
-# Regression coverage: pool-probe-next-action-family.selftest.sh.
+# ga-q65d8: also excludes delivery:pending-restart (exact) — the canonical hold
+# for "gate passed, code done, but a long-lived daemon may still run old code
+# and a domain-specialist owns the restart timing call." Bypassing this cost
+# wa-k2j6n 3 separate from-scratch re-investigations before a human noticed.
+#
+# ga-onrnd6 (2026-09-17): also excludes next-action:* UNLESS it ends in a build-
+# verb suffix (constroi/corrige-gate/corrige). next-action: is OVERLOADED: the
+# original convention (next-action:mayor, next-action:athos-decide, ...) means
+# "blocked on a human" and must veto; refino's newer <crew>-constroi/-corrige
+# convention means the OPPOSITE ("ready, this crew builds it") and must survive.
+# Confirmed live 4x across two independent probes (wa-k1sr7 dispatched 6 times
+# after being parked next-action:athos-decide with zero code left to write).
+# (known adjacent gap, not fixed: waiting-on:/blocked-on:/depends-on: are also
+# part of pilot-dispatcher.sh's full veto predicate and still NOT excluded here
+# — no live incident named them on this probe yet.)
+# Regression coverage: pool-probe-next-action-family.selftest.sh (+ delivery-
+# pending-restart.selftest.sh, text-veto-family.selftest.sh — one file per rule
+# family above unless noted otherwise).
 bd ready --metadata-field "gc.routed_to=wa-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --exclude-label "delivery:pending-restart" --json --sort priority --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select((.labels // []) | map(select(startswith("blocked:"))) | length == 0) | select(((.labels // []) | map(select(test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not))) | length) == 0) | select((.labels // []) | map(select(startswith("gate:needs-human"))) | length == 0) | select((.labels // []) | map(select(startswith("pilot:text-veto"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | if length > 0 then (max < 3) else true end)] | sort_by([.priority, (if (((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | length) > 0 then (.updated_at // "") else (.created_at // .updated_at // "") end)]) | .[:1]'
 # If it returns a bead (output is NOT []), THAT BEAD IS YOURS. Claim it FIRST:
 #     gc bd update <id> --claim
 # verify the claim set assignee to your session, then go to the Build Protocol and build it.
 # Do NOT drain while this probe returns a bead.
 
-# Step 1b3 (fallback ONLY — ga-0pg2o, 2026-09-10): Step 1b2 above already
-# covers every session origin, so only consult this if it returned []. This
-# is the original Go-rendered query, GATED on GC_SESSION_ORIGIN=ephemeral
-# (ga-dbibq) and LRU-only by design (routedReadyTierCommand,
-# internal/config/config.go — no priority awareness, deliberately: see
-# ga-w4k2z above; the Mayor's ga-0pg2o decision was to leave the engine
-# as-is). For a Pilot-spawned (non-ephemeral) session this still renders to
-# a no-op, same as always. For a genuinely ephemeral-origin session it is
-# now a second look after Step 1b2, kept as a safety net rather than
-# deleted outright — parity between this Go path's poolDemandLabelFilterJQ()
-# and Step 1b2's hardcoded exclude list was never fully audited (ga-42mlf's
-# parity claim was left unconfirmed by ga-c2w3k), so removing this outright
-# could silently drop a protection Step 1b2 hasn't mirrored yet.
+# Step 1b3 (fallback ONLY — ga-0pg2o, 2026-09-10): Step 1b2 above already covers
+# every session origin; only consult this if it returned []. Original Go-rendered
+# query, GATED on GC_SESSION_ORIGIN=ephemeral, LRU-only by design (no priority
+# awareness — deliberate, ga-w4k2z; Mayor decision ga-0pg2o: leave the engine as
+# is). For a Pilot-spawned session this is always a no-op; for a genuine
+# ephemeral-origin session it's a safety-net 2nd look, kept rather than deleted
+# because full parity between this Go path's filter list and Step 1b2's hardcoded
+# one was never fully audited (ga-42mlf's parity claim, unconfirmed by ga-c2w3k).
 #
-# ga-0pg2o gate-fix round 2 (2026-09-11): round 1 added the reclaim-count-cap
-# exclusion (Step 1b2 above) but only there. GATE-FEEDBACK on that round
-# named the exact gap this reopens: when a capped P0/P1 bead is the SOLE
-# occupant of its priority tier, Step 1b2 correctly excludes it and returns
-# [], and this fallback then re-surfaces that SAME bead — verified against
-# origin/main's poolDemandLabelFilterJQ() (internal/config/config.go): zero
-# references to pilot:reclaim-count anywhere in that file, so the
-# Go-rendered query has no reclaim-cap awareness at all and the template's
-# own "THAT BEAD IS YOURS" instruction below sends the agent to claim/build
-# the excluded bead anyway. The Go-rendered query stays off-limits per the
-# Mayor's ga-0pg2o decision above, so this is a post-filter on the OUTPUT
-# instead: {{ .RoutedPoolQuery }} always resolves to one `sh -c ... --
-# <target>` invocation whose stdout is a single JSON array of 0 or 1 items
-# (routedReadyTierCommand's own trailing `jq -c '... | .[0:1]'`), so
-# wrapping that output in one more array-preserving `select` keeps the same
-# [] / [bead] contract every caller below already expects. Clause copied
-# verbatim from Step 1b2 above — same pilot:reclaim-count:<n> scan, same
-# >=3 threshold, same hardcoded-literal caveat (this template and
-# pilot-dispatcher.sh share no runtime state). Regression coverage:
-# pool-probe-priority-sort.selftest.sh's fallback-inherits-reclaim-cap case.
-#
-# ga-q65d8: the delivery:pending-restart exclusion added to Step 1b2 above is
-# mirrored into this fallback's post-filter too, same "post-filter on the
-# OUTPUT" technique as the reclaim-cap clause immediately above (the
-# Go-rendered query itself stays off-limits per the same Mayor decision).
-# This file's own documented drift history (ga-s1d5o, ga-42mlf/ga-c2w3k)
-# means an exclusion landing on Step 1b2 is never assumed to reach this
-# fallback automatically — it does not, until added here explicitly.
-# Regression coverage: pool-probe-delivery-pending-restart.selftest.sh.
-#
-# ga-onrnd6: the next-action: exclusion added to Step 1b2 above is mirrored
-# into this fallback's post-filter too, same technique and same reasoning as
-# the delivery:pending-restart clause immediately above (the Go-rendered
-# poolDemandLabelFilterJQ() itself stays off-limits per the same Mayor
-# decision — this file's own drift history means a Step 1b2 fix is never
-# assumed to reach here automatically).
-# Regression coverage: pool-probe-next-action-family.selftest.sh.
+# The engine-rendered query itself is off-limits (Mayor decision), so every fix
+# below is a post-filter on its OUTPUT instead (always a single `[]`/`[bead]`
+# array) — mirrored from Step 1b2, same rule, same reasoning, not re-derived:
+#   ga-0pg2o (round 2)  reclaim-count cap (>=3) — round 1 only fixed Step 1b2,
+#                        so a capped P0 that's the SOLE occupant of its tier got
+#                        excluded there and re-surfaced here instead.
+#   ga-q65d8            delivery:pending-restart — this file's drift history means
+#                        a Step 1b2 fix is never assumed to reach here automatically.
+#   ga-onrnd6           next-action:* (same build-verb-suffix carve-out as Step 1b2).
+# Regression coverage: pool-probe-priority-sort.selftest.sh (fallback-inherits-
+# reclaim-cap case), pool-probe-delivery-pending-restart.selftest.sh,
+# pool-probe-next-action-family.selftest.sh.
 {{ .RoutedPoolQuery }} | jq -c '[.[] | select((.labels // []) | map(select(. == "delivery:pending-restart")) | length == 0) | select(((.labels // []) | map(select(test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not))) | length) == 0) | select(((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | if length > 0 then (max < 3) else true end)]'
 
 # Step 1c: ONLY if Steps 1a / 1b / 1b2 / 1b3 are ALL empty — no work — drain and exit.
@@ -481,18 +210,9 @@ rediscover why from scratch.
 
 ---
 
-## Mockups para Athos — S3 presigned URL (OBRIGATÓRIO)
+## Mockups para Athos
 
-⚠️ `mockups/` NÃO é mais anônimo-legível, e o `presign` é hoje o que TE DÁ acesso — a redação anterior aqui dizia o oposto ("presign é decorativo, não protege nem expira"), verdadeira em 25/07 e FALSA desde 31/07. A policy do bucket tem o Sid `DenyAnonymousReadOnBackupsDraftsAndMockups`, um Deny de `s3:GetObject` para `Principal:*` em `mockups/*` (idem `backups/*`, `estudos/*`, `discador-mockups/*`, `pending_drafts.json`), cuja Condition exclui `aws:PrincipalAccount: 549710416969`. Como a URL presigned assina COM a conta, o Deny não se aplica a ela — medido: sem assinatura 403, presigned 200 (wa-hvh10 + wa-ge8bs; verificação de thies-wa em 08/08, conferida contra a policy viva). ⚠️ O resto do bucket segue público por `PublicReadAccess`, e a distro CloudFront não passa pela assinatura — então isto vale para os prefixos negados acima, não para o bucket inteiro. Continue usando chave de alta entropia: ela não é mais a única barreira, mas ainda é uma.
-NUNCA entregue mockup como PNG, localhost ou tunnel (cloudflared já deu 404).
-
-```bash
-python3 -c "import secrets; print(secrets.token_hex(8))"  # chave de alta entropia
-aws s3 cp <arquivo.html> s3://whatsapp-viewer-549710416969/mockups/<nome>-<hex>.html --content-type "text/html; charset=utf-8"
-aws s3 presign s3://whatsapp-viewer-549710416969/mockups/<nome>-<hex>.html --expires-in 604800
-```
-
-🚨 NUNCA suba CPF, telefone, endereço, situação sucessória/óbito ou qualquer dado que identifique uma pessoa específica nesse bucket — o link é público pra sempre.
+Invoke the `wa-worker-session-protocol` skill (`whatsapp_automation/.claude/skills/wa-worker-session-protocol`) when delivering an HTML mockup to Athos — S3 presigned URL, never PNG/localhost/tunnel.
 
 ---
 

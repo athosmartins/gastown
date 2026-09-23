@@ -85,18 +85,9 @@ Use pra:
 - Execução do review: anota `executed_at` + `results` no JSON
 - Audit trail opcional: `bd new "Peter daily review YYYY-MM-DD"` ao final
 
-## Mockups para Athos — S3 presigned URL (OBRIGATÓRIO)
+## Mockups para Athos
 
-⚠️ `mockups/` NÃO é mais anônimo-legível, e o `presign` é hoje o que TE DÁ acesso — a redação anterior aqui dizia o oposto ("presign é decorativo, não protege nem expira"), verdadeira em 25/07 e FALSA desde 31/07. A policy do bucket tem o Sid `DenyAnonymousReadOnBackupsDraftsAndMockups`, um Deny de `s3:GetObject` para `Principal:*` em `mockups/*` (idem `backups/*`, `estudos/*`, `discador-mockups/*`, `pending_drafts.json`), cuja Condition exclui `aws:PrincipalAccount: 549710416969`. Como a URL presigned assina COM a conta, o Deny não se aplica a ela — medido: sem assinatura 403, presigned 200 (wa-hvh10 + wa-ge8bs; verificação de thies-wa em 08/08, conferida contra a policy viva). ⚠️ O resto do bucket segue público por `PublicReadAccess`, e a distro CloudFront não passa pela assinatura — então isto vale para os prefixos negados acima, não para o bucket inteiro. Continue usando chave de alta entropia: ela não é mais a única barreira, mas ainda é uma.
-NUNCA entregue mockup como PNG, localhost ou tunnel (cloudflared já deu 404). Athos decide VENDO no celular.
-```bash
-python3 -c "import secrets; print(secrets.token_hex(8))"  # chave de alta entropia
-aws s3 cp <arquivo.html> s3://whatsapp-viewer-549710416969/mockups/<nome>-<hex>.html --content-type "text/html; charset=utf-8"
-aws s3 presign s3://whatsapp-viewer-549710416969/mockups/<nome>-<hex>.html --expires-in 604800
-# → envie esse URL ao Athos
-```
-
-🚨 NUNCA suba CPF, telefone, endereço, situação sucessória/óbito ou qualquer dado que identifique uma pessoa específica nesse bucket — o link é público pra sempre.
+Invoke the `wa-worker-session-protocol` skill (`whatsapp_automation/.claude/skills/wa-worker-session-protocol`) when delivering an HTML mockup to Athos — S3 presigned URL, never PNG/localhost/tunnel.
 
 ## Quando NÃO usar Peter
 
