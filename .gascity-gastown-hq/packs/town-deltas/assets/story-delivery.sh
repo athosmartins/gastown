@@ -1446,11 +1446,12 @@ fi
 # re-evaluates whether it's actually still alive, and the story is wedged
 # permanently.
 #
-# Fail-closed direction: only clear when the recorded timestamp is PRESENT
-# and UNAMBIGUOUSLY past the ceiling. A missing/unparseable timestamp (e.g.
-# a delivery:running set before this fix shipped, with no metadata) is never
-# treated as stale -- that could clobber a genuinely slow-but-live delivery
-# just because we can't prove it isn't done. $STORY is the same Step-1
+# Fail-closed direction: only treat as stale (and renew) when the recorded
+# timestamp is PRESENT and UNAMBIGUOUSLY past the ceiling. A missing/
+# unparseable timestamp (e.g. a delivery:running set before this fix shipped,
+# with no metadata) is never treated as stale -- that could clobber a
+# genuinely slow-but-live delivery just because we can't prove it isn't
+# done. $STORY is the same Step-1
 # snapshot STORY_LABELS itself came from, so reading its embedded metadata
 # here is internally consistent with the label check right above it.
 if echo "$STORY_LABELS" | grep "delivery:running" >/dev/null; then
@@ -1465,13 +1466,35 @@ if echo "$STORY_LABELS" | grep "delivery:running" >/dev/null; then
     fi
   fi
   if [ "$_DELIVERY_RUNNING_STALE" = "1" ]; then
-    warn "Story $STORY_ID has delivery:running since $_DELIVERY_RUNNING_SINCE (>= ${DELIVERY_RUNNING_STALE_CEILING_S:-1800}s ago) -- treating as abandoned (ga-015qqe), clearing and re-processing this sweep instead of skipping."
+    warn "Story $STORY_ID has delivery:running since $_DELIVERY_RUNNING_SINCE (>= ${DELIVERY_RUNNING_STALE_CEILING_S:-1800}s ago) -- treating as abandoned (ga-015qqe), renewing the lock and re-processing this sweep instead of skipping."
     if [ "$DRY_RUN" != "1" ]; then
-      bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
-      bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery reconciler (ga-015qqe): delivery:running was set at $_DELIVERY_RUNNING_SINCE and never cleared -- the run that set it most likely crashed or was killed before finishing (no staleness check existed before this fix; wa-r4ehy.2 hit exactly this for ~3.5h). Clearing the stale lock so this sweep retries cleanly." 2>/dev/null || true
+      bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery reconciler (ga-015qqe): delivery:running was set at $_DELIVERY_RUNNING_SINCE and never cleared -- the run that set it most likely crashed or was killed before finishing (no staleness check existed before this fix; wa-r4ehy.2 hit exactly this for ~3.5h). Renewing the lock with a fresh timestamp so this sweep retries cleanly." 2>/dev/null || true
+      # ga-015qqe gate-fix (attempt 2): renew delivery.running_since IN PLACE
+      # instead of removing the label here and relying on the CLAIM block
+      # below to re-set it later. Between here and CLAIM (lines ~1549+) sit
+      # two more checks that can `continue` this same iteration --
+      # delivery:no-deploy-cmd-exhausted right below, and the OPEN_SIBLINGS
+      # hold further down, which this file's own comments confirm is a real,
+      # anticipated case for a cross-rig/resubmitted story (i.e. it CAN be
+      # true for a story whose delivery is genuinely still mid-flight, not
+      # actually abandoned -- the staleness heuristic above is a guess, not
+      # proof of death). A bare `label remove` here, followed by either of
+      # those `continue`s, left the story with NO lock at all until some
+      # later, unrelated sweep happened to re-claim it -- opening a window
+      # for a second, genuinely concurrent delivery run against a first one
+      # that was merely slow. The label is already present (this whole branch
+      # only runs when the CHECK above matched it) -- only the timestamp
+      # needs to move, so the lock is never actually absent, whatever this
+      # iteration does next. Gate-caught (gate_run=ga-epuc97): reviewer 1
+      # traced the exact fall-through-into-OPEN_SIBLINGS window this closes.
+      bd -C "$STORY_STORE" update "$STORY_ID" --set-metadata "delivery.running_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -q 2>/dev/null || true
     fi
     # Deliberately NOT `continue` -- fall through so THIS iteration re-processes
-    # the story fresh instead of waiting a full extra sweep interval.
+    # the story fresh instead of waiting a full extra sweep interval. The lock
+    # itself was just renewed above (not removed), so any later `continue`
+    # this same iteration takes (no-deploy-cmd-exhausted, OPEN_SIBLINGS)
+    # leaves a freshly-timestamped lock behind -- identical in shape to what
+    # the CLAIM block itself persists -- instead of no lock at all.
   else
     log "Story $STORY_ID already has delivery:running — skipping (already in flight)."
     continue
