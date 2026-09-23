@@ -1435,10 +1435,47 @@ if echo "$STORY_LABELS" | grep "story:done" >/dev/null; then
   continue
 fi
 
-# Skip if already in delivery (prevents parallel runs)
+# Skip if already in delivery (prevents parallel runs) -- UNLESS the lock is
+# STALE (ga-015qqe): wa-r4ehy.2 sat wedged ~3.5h because this check was
+# unconditional -- every OTHER lock in this file is staleness-aware (search
+# "staleness" above: the post-deploy town-root gate ga-rhtu, the daemon-
+# refresh baseline alarm ga-gjum0y, the gate:failed/gate:needs-fix
+# contradiction check ga-tuk26/ga-as3p1) but this one just checked "does the
+# label exist" -- if the run that set it crashed/was killed (e.g. resource
+# pressure) before reaching any of its 6 cleanup call sites, nothing ever
+# re-evaluates whether it's actually still alive, and the story is wedged
+# permanently.
+#
+# Fail-closed direction: only clear when the recorded timestamp is PRESENT
+# and UNAMBIGUOUSLY past the ceiling. A missing/unparseable timestamp (e.g.
+# a delivery:running set before this fix shipped, with no metadata) is never
+# treated as stale -- that could clobber a genuinely slow-but-live delivery
+# just because we can't prove it isn't done. $STORY is the same Step-1
+# snapshot STORY_LABELS itself came from, so reading its embedded metadata
+# here is internally consistent with the label check right above it.
 if echo "$STORY_LABELS" | grep "delivery:running" >/dev/null; then
-  log "Story $STORY_ID already has delivery:running — skipping (already in flight)."
-  continue
+  _DELIVERY_RUNNING_SINCE=$(echo "$STORY" | jq -r '.metadata["delivery.running_since"] // empty' 2>/dev/null || echo "")
+  _DELIVERY_RUNNING_STALE=0
+  if [ -n "$_DELIVERY_RUNNING_SINCE" ]; then
+    _DRS_EPOCH=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$_DELIVERY_RUNNING_SINCE" +%s 2>/dev/null \
+      || date -u -d "$_DELIVERY_RUNNING_SINCE" +%s 2>/dev/null || echo "")
+    if [ -n "$_DRS_EPOCH" ]; then
+      _DRS_AGE=$(( $(date -u +%s) - _DRS_EPOCH ))
+      [ "$_DRS_AGE" -ge "${DELIVERY_RUNNING_STALE_CEILING_S:-1800}" ] && _DELIVERY_RUNNING_STALE=1
+    fi
+  fi
+  if [ "$_DELIVERY_RUNNING_STALE" = "1" ]; then
+    warn "Story $STORY_ID has delivery:running since $_DELIVERY_RUNNING_SINCE (>= ${DELIVERY_RUNNING_STALE_CEILING_S:-1800}s ago) -- treating as abandoned (ga-015qqe), clearing and re-processing this sweep instead of skipping."
+    if [ "$DRY_RUN" != "1" ]; then
+      bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
+      bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery reconciler (ga-015qqe): delivery:running was set at $_DELIVERY_RUNNING_SINCE and never cleared -- the run that set it most likely crashed or was killed before finishing (no staleness check existed before this fix; wa-r4ehy.2 hit exactly this for ~3.5h). Clearing the stale lock so this sweep retries cleanly." 2>/dev/null || true
+    fi
+    # Deliberately NOT `continue` -- fall through so THIS iteration re-processes
+    # the story fresh instead of waiting a full extra sweep interval.
+  else
+    log "Story $STORY_ID already has delivery:running — skipping (already in flight)."
+    continue
+  fi
 fi
 
 # ga-aqqj0: skip if the no-deploy-cmd retry cap already escalated this story
@@ -1515,6 +1552,13 @@ if [ "$DRY_RUN" != "1" ]; then
     warn "Could not add delivery:running to $STORY_ID (race condition?). Skipping."
     continue
   }
+  # ga-015qqe: persist WHEN this claim was made so a later sweep (possibly a
+  # different process, if this one dies) can tell a fresh claim apart from an
+  # abandoned one -- see the staleness check above this loop's top. Best-effort
+  # (|| true): if this write fails, the check above simply never finds a
+  # timestamp for this story and fails closed (never treats it as stale),
+  # same as any other missing-metadata case.
+  bd -C "$STORY_STORE" update "$STORY_ID" --set-metadata "delivery.running_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -q 2>/dev/null || true
 fi
 
 DELIVERY_START=$(date +%s)
