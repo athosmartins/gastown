@@ -18,6 +18,16 @@ REPORT="${JEV_REPORT:-$HQ/scripts/jev_experiment_report.py}"
 OUT_DIR="${JEV_DAILY_OUT_DIR:-$HQ/.gc/logs/jev-daily}"
 DAY="${1:-$(date -u -v-1d +%Y-%m-%d)}"
 
+# An empty/garbled day must not reach the report: --date "" means "no filter", so the
+# whole log would go out labeled as one day.
+case "$DAY" in
+  [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) : ;;
+  *)
+    notify -t "Jev: relatório do dia falhou" "Dia inválido: '$DAY' (esperado YYYY-MM-DD, UTC)"
+    exit 1
+    ;;
+esac
+
 mkdir -p "$OUT_DIR"
 
 if ! python3 "$REPORT" --date "$DAY" >"$OUT_DIR/$DAY.txt" 2>&1; then

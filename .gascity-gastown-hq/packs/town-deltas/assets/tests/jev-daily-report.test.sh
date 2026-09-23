@@ -12,6 +12,10 @@
 #   T3 the report script failing -> an ntfy saying so, and exit != 0.
 #   T4 no date argument -> reports the UTC day that just closed (yesterday, UTC).
 #   T5 the plist fires daily at 21:07 (= 00:07 UTC) and runs this script.
+#   T6 the experiment log missing -> "report failed" ntfy + exit != 0, never
+#      the "no alerts today" line (can't-know must not read as nothing-happened).
+#   T7 a garbled day argument -> refused (--date "" would report the whole log
+#      under one day's name).
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -45,7 +49,7 @@ EOF
 
 run() {  # run [date-arg...] with the sandboxed env; sets RC
   : >"$T/notify.log"
-  env PATH="$T/bin:$PATH" NOTIFY_LOG="$T/notify.log" JEV_EXPERIMENT_LOG="$T/log.jsonl" \
+  env PATH="$T/bin:$PATH" NOTIFY_LOG="$T/notify.log" JEV_EXPERIMENT_LOG="${RUN_LOG:-$T/log.jsonl}" \
       JEV_DAILY_OUT_DIR="$T/out" JEV_REPORT="${RUN_REPORT:-$REPORT}" \
       bash "$SCRIPT" "$@" >"$T/stdout" 2>&1
   RC=$?
@@ -96,6 +100,20 @@ if [ "$H" = "21" ] && [ "$M" = "7" ] && [ "$P" = "/Users/athos/gt/.gascity-gasto
 else
   nok "T5 plist" "hour=$H minute=$M prog=$P label=$L"
 fi
+
+# T6
+RUN_LOG="$T/no-such-log.jsonl" run 2026-09-20
+N="$(cat "$T/notify.log")"
+if [ "$RC" -ne 0 ] && [ "$(calls)" -eq 1 ]; then ok "T6 missing log -> exit != 0 and one ntfy"; else nok "T6 rc/calls" "rc=$RC calls=$(calls) n=$N"; fi
+case "$N" in *"falhou"*) ok "T6 ntfy says the report failed" ;; *) nok "T6 text" "$N" ;; esac
+case "$N" in *"nenhum alerta"*) nok "T6 can't-know" "missing log reported as 'no alerts': $N" ;; *) ok "T6 missing log is NOT reported as 'no alerts today'" ;; esac
+
+# T7
+run "garbage"
+N="$(cat "$T/notify.log")"
+if [ "$RC" -ne 0 ] && [ "$(calls)" -eq 1 ]; then ok "T7 garbled day -> exit != 0 and one ntfy"; else nok "T7 rc/calls" "rc=$RC calls=$(calls)"; fi
+case "$N" in *"Dia inválido"*) ok "T7 ntfy names the invalid day" ;; *) nok "T7 text" "$N" ;; esac
+ls "$T/out" | grep -q garbage && nok "T7 no report file" "a report was written for the garbled day" || ok "T7 no report written for the garbled day"
 
 echo ""
 echo "jev-daily-report tests: $PASS passed, $FAIL failed"

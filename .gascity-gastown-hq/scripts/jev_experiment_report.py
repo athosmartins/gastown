@@ -203,6 +203,13 @@ def main() -> int:
     ap.add_argument("--resumo-pt", action="store_true", help="short Portuguese summary (the daily ntfy, see jev-daily-report.sh)")
     args = ap.parse_args()
 
+    # A missing log means "can't know", not "nothing happened": load_events() returns []
+    # for both, and every output format would then print its "no data" line — which the
+    # daily ntfy would deliver to the Athos as a fact. Fail loudly instead.
+    if not JEV_LOG.exists():
+        print(f"jev-experiment log not found: {JEV_LOG} — cannot tell whether anything was logged", file=sys.stderr)
+        return 2
+
     events = load_events(args.date, args.experiment)
     summary = summarize(events)
 
