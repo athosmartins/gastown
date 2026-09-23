@@ -5,7 +5,8 @@
 # Sources the sweep in lib-only mode for the REAL functions (one source of
 # truth, no copy-drift), then:
 #   • unit-tests the pure classifier survival_classify across EVERY verdict
-#     (survived / ff_heal / divergent / unresolved) on a real local git repo;
+#     (survived / ff_heal / content_equivalent / divergent / unresolved) on a
+#     real local git repo;
 #   • unit-tests the retention/age helpers (iso_to_epoch, entry_within_retention)
 #     including the fail-open-on-unparseable guard;
 #   • unit-tests the rig container/self git-dir resolution + git_in dispatch;
@@ -67,6 +68,48 @@ eq "neither ancestor → divergent"          "$(survival_classify "$R" 0 "$C3" o
 eq "bogus merge sha → unresolved"          "$(survival_classify "$R" 0 "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" origin/main)" "unresolved"
 git -C "$R" update-ref -d refs/remotes/origin/main 2>/dev/null || true
 eq "missing origin ref → unresolved"       "$(survival_classify "$R" 0 "$C2" origin/main)" "unresolved"
+
+# ── 1b. content_equivalent — wa-k8l0m (2026-09-22, 3 recurrences): a merge sha
+# that is divergent by raw ancestry, but whose touched file(s) already match
+# byte-for-byte on the other side (same fix, landed under a different sha —
+# e.g. a rebase/re-commit) must classify content_equivalent, NOT divergent, so
+# the sweep stops re-escalating an already-resolved case every single run.
+echo "── 1b. content_equivalent (same fix, different sha) ──"
+git -C "$R" checkout -q -b ce-branch "$C1"
+echo "REBASED-B" > "$R/b"; git -C "$R" add .; git -C "$R" commit -q -m "same fix as CE2, different sha/branch"
+CE1=$(git -C "$R" rev-parse HEAD)
+git -C "$R" checkout -q -b ce-other "$C1"
+echo "REBASED-B" > "$R/b"; git -C "$R" add .; git -C "$R" commit -q -m "same fix as CE1, re-landed independently"
+CE2=$(git -C "$R" rev-parse HEAD)
+git -C "$R" checkout -q -b ce-diff "$C1"
+echo "ACTUALLY-DIFFERENT-CONTENT" > "$R/b"; git -C "$R" add .; git -C "$R" commit -q -m "genuinely different change to the same file"
+CE3=$(git -C "$R" rev-parse HEAD)
+git -C "$R" checkout -q main
+
+eq "neither ancestor, byte-identical touched files → content_equivalent" \
+  "$(survival_classify "$R" 0 "$CE1" "$CE2")" "content_equivalent"
+eq "content_equivalent is symmetric (CE2 vs CE1)" \
+  "$(survival_classify "$R" 0 "$CE2" "$CE1")" "content_equivalent"
+eq "CONTROL: neither ancestor, touched file content DIFFERS → still plain divergent" \
+  "$(survival_classify "$R" 0 "$CE1" "$CE3")" "divergent"
+rc0 "_survival_content_equivalent true for the CE1/CE2 pair directly" \
+  _survival_content_equivalent "$R" 0 "$CE1" "$CE2"
+rc1 "_survival_content_equivalent false for the CE1/CE3 pair directly" \
+  _survival_content_equivalent "$R" 0 "$CE1" "$CE3"
+# Merge-commit guard: a 2-parent commit must never take the equivalence
+# shortcut, even if its content happens to match -- which "the" touched-file
+# set a merge represents is ambiguous across parents, so this stays
+# conservative (falls through to ordinary ancestry-based divergent).
+# Built directly via commit-tree (deterministic, no conflict-resolution
+# heuristics to go wrong): a real 2-parent commit whose tree is BYTE-IDENTICAL
+# to CE2's, so the only variable under test is the parent count.
+CE_MERGE=$(git -C "$R" commit-tree "${CE2}^{tree}" -p "$CE3" -p "$CE2" -m "merge (2 parents), tree matches CE2 exactly" 2>/dev/null || echo "")
+if [ -n "$CE_MERGE" ] && [ "$(git -C "$R" rev-parse "${CE_MERGE}^@" 2>/dev/null | grep -c .)" = "2" ]; then
+  rc1 "_survival_content_equivalent false for a 2-parent (merge) commit, even with matching content" \
+    _survival_content_equivalent "$R" 0 "$CE_MERGE" "$CE2"
+else
+  bad "merge-commit fixture did not actually produce 2 parents -- skipped guard assertion"
+fi
 
 # Provably-lossless direction check: ff_heal ⟹ origin IS ancestor of merge.
 git -C "$R" update-ref refs/remotes/origin/main "$C2"

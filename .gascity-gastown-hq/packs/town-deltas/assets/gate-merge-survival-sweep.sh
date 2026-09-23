@@ -26,13 +26,31 @@
 #                   ahead; re-landing it loses NOTHING, incl. anything the town
 #                   push added that is already in origin/main) → FF-only re-push
 #                   + re-advance the bare local main → self-healed.
-#       divergent — neither is an ancestor of the other: a genuine shared-remote
-#                   clobber with new conflicting work on origin/main. Auto-FF is
-#                   UNSAFE (would either be rejected or, if forced, drop the
-#                   town push) → ESCALATE: reopen + label gate:merge-orphan +
-#                   comment the source bead, mail the Mayor, ntfy P4. Re-anchor
-#                   is a human/Mayor decision (matches the dead-author/conflict
-#                   re-anchor doctrine), NOT an autonomous force-push.
+#       content_equivalent — neither is an ancestor of the other by RAW commit
+#                   history, but every file merge_sha touched already has
+#                   byte-identical content on origin/<default_branch> (same fix,
+#                   re-landed under a different sha — e.g. a rebase/re-commit,
+#                   or an independent re-application of the same change) → no-op,
+#                   same as survived. wa-k8l0m (2026-09-22) hit this 3 sweeps
+#                   running: the real fix for that bead landed via a DIFFERENT
+#                   commit (5c30b3a62) than the one the ledger recorded
+#                   (5963c0c23), byte-identical diff — a genuine ancestry check
+#                   can never see that as anything but permanently divergent, so
+#                   it re-escalated to the Mayor every single sweep forever,
+#                   even though a human had already manually confirmed zero
+#                   data loss on EACH prior occurrence. See
+#                   _survival_content_equivalent for the exact (conservative,
+#                   fails closed to plain divergent on any ambiguity) check.
+#       divergent — neither is an ancestor of the other AND the touched-file
+#                   content differs (or content_equivalent could not be proven,
+#                   e.g. a merge commit or a deleted/moved path): a genuine
+#                   shared-remote clobber with new conflicting work on
+#                   origin/main. Auto-FF is UNSAFE (would either be rejected or,
+#                   if forced, drop the town push) → ESCALATE: reopen + label
+#                   gate:merge-orphan + comment the source bead, mail the
+#                   Mayor, ntfy P4. Re-anchor is a human/Mayor decision
+#                   (matches the dead-author/conflict re-anchor doctrine), NOT
+#                   an autonomous force-push.
 #       unresolved— merge_sha or origin/main not resolvable (sha gc'd, ref gone)
 #                   → soft-escalate (ntfy P3 + comment), rate-limited.
 #
@@ -144,7 +162,60 @@ survival_classify() {
   if git_in "$gdir" "$container" merge-base --is-ancestor "$mref" "$sha" 2>/dev/null; then
     echo "ff_heal"; return 0
   fi
+  if _survival_content_equivalent "$gdir" "$container" "$sha" "$mref"; then
+    echo "content_equivalent"; return 0
+  fi
   echo "divergent"
+}
+
+# _survival_content_equivalent <git_dir> <container> <sha> <mref> — wa-k8l0m
+# (2026-09-22, 3 recurrences): true (rc0) iff EVERY file <sha> touched (vs its
+# own parent) has byte-identical content on <mref> already — i.e. <sha>'s
+# actual change is already fully present, just landed under a DIFFERENT sha
+# (a rebase/re-commit, or an independent re-application of the same fix).
+# Compares git blob shas, not file bytes directly — git's own content
+# addressing makes an exact blob-sha match exact-content-match, cheaply, with
+# no need to check out either tree.
+#
+# Deliberately conservative — every ambiguous case falls through to "not
+# equivalent" (rc1), which just means plain "divergent" classification and the
+# EXISTING escalate-to-Mayor behavor, never a new failure mode:
+#   • sha has other than exactly 1 parent (a merge commit) → not equivalent.
+#     Which "the" touched-file set a merge commit represents is itself
+#     ambiguous across parents; don't guess.
+#   • sha touched zero files (empty commit, or diff-tree unreadable) → not
+#     equivalent. No positive evidence either way.
+#   • ANY touched path is unreadable at sha or missing/unreadable at mref
+#     (deleted, renamed, moved-and-content-changed) → not equivalent. A
+#     rename that also changed bytes, or a path the real fix removed, is
+#     exactly the kind of divergence a human should still see.
+_survival_content_equivalent() {
+  local gdir="$1" container="$2" sha="$3" mref="$4"
+  # ga-lzj2e selftest (caught by the merge-commit guard fixture itself, not
+  # inspection): `rev-list --count sha^@` counts WALKED HISTORY reachable
+  # from the parent(s), not the number of direct parents -- for any commit
+  # whose parent has real history depth it is never "1" even for an ordinary
+  # single-parent commit, so this guard would silently never pass in a real
+  # (non-toy) repo. `rev-parse sha^@` is the correct tool: it expands to the
+  # direct parent SHAs, one per line, with no history walk.
+  local parent_count
+  parent_count=$(git_in "$gdir" "$container" rev-parse "${sha}^@" 2>/dev/null | grep -c . || echo "")
+  [ "${parent_count:-}" = "1" ] || return 1
+
+  local files
+  files=$(git_in "$gdir" "$container" diff-tree --no-commit-id --name-only -r "$sha" -- 2>/dev/null || echo "")
+  [ -z "$files" ] && return 1
+
+  local f sha_blob mref_blob
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    sha_blob=$(git_in "$gdir" "$container" rev-parse -q --verify "${sha}:${f}" 2>/dev/null || echo "")
+    mref_blob=$(git_in "$gdir" "$container" rev-parse -q --verify "${mref}:${f}" 2>/dev/null || echo "")
+    [ -n "$sha_blob" ] && [ -n "$mref_blob" ] && [ "$sha_blob" = "$mref_blob" ] || return 1
+  done <<EOF_CE_FILES
+$files
+EOF_CE_FILES
+  return 0
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -285,7 +356,7 @@ DEDUP_STREAM=$(printf '%s\n' "$LEDGER_DEDUP" \
   | jq -rc '.' 2>/dev/null \
   | awk 'match($0,/"merge_sha":"[0-9a-f]+"/){ k=substr($0,RSTART,RLENGTH); if(!s[k]++) print }' 2>/dev/null || true)
 
-SURVIVED=0; HEALED=0; DIVERGED=0; UNRESOLVED=0; CHECKED=0; PRUNED=0; DOWNGRADED=0
+SURVIVED=0; HEALED=0; DIVERGED=0; UNRESOLVED=0; CHECKED=0; PRUNED=0; DOWNGRADED=0; CONTENT_EQUIV=0
 # NOTE: macOS /bin/bash is 3.2 — NO associative arrays. Dedup fetches with an
 # indexed array + linear membership check (same pattern as merged-bead-janitor).
 declare -a KEEP_LINES=()
@@ -452,6 +523,14 @@ while IFS= read -r entry; do
       [ -f "$ALERT_DIR/$SHA" ] && rm -f "$ALERT_DIR/$SHA" 2>/dev/null || true
       ;;
 
+    content_equivalent)
+      CONTENT_EQUIV=$((CONTENT_EQUIV+1))
+      log "content-equivalent $SHA ($RIG) — not an ancestor of origin/$RDEFAULT ($ORIGIN_NOW) by raw history, but every touched file already matches byte-for-byte (same fix landed under a different sha) — no-op, not escalating"
+      # Same as survived: a prior false orphan alarm on THIS exact sha (e.g.
+      # wa-k8l0m re-escalating every sweep before this fix existed) is over.
+      [ -f "$ALERT_DIR/$SHA" ] && rm -f "$ALERT_DIR/$SHA" 2>/dev/null || true
+      ;;
+
     ff_heal)
       if [ "$DRY_RUN" = "1" ]; then
         HEALED=$((HEALED+1))
@@ -535,6 +614,9 @@ if [ "${#PENDING_DIVERGENT[@]}" -gt 0 ]; then
       if [ "$RECHECK_VERDICT" = "survived" ]; then
         SURVIVED=$((SURVIVED+1))
         [ -f "$ALERT_DIR/$SHA" ] && rm -f "$ALERT_DIR/$SHA" 2>/dev/null || true
+      elif [ "$RECHECK_VERDICT" = "content_equivalent" ]; then
+        CONTENT_EQUIV=$((CONTENT_EQUIV+1))
+        [ -f "$ALERT_DIR/$SHA" ] && rm -f "$ALERT_DIR/$SHA" 2>/dev/null || true
       else
         # ff_heal or unresolved on recheck: this run took no action for the
         # entry (heal isn't re-attempted here — see parse_entry_fields's
@@ -576,7 +658,7 @@ if [ "$PRUNED" -gt 0 ] && [ "$DRY_RUN" = "0" ]; then
   fi
 fi
 
-log "=== survival-sweep complete — checked=$CHECKED survived=$SURVIVED healed=$HEALED divergent=$DIVERGED unresolved=$UNRESOLVED downgraded=$DOWNGRADED pruned=$PRUNED dry_run=$DRY_RUN ==="
+log "=== survival-sweep complete — checked=$CHECKED survived=$SURVIVED content_equivalent=$CONTENT_EQUIV healed=$HEALED divergent=$DIVERGED unresolved=$UNRESOLVED downgraded=$DOWNGRADED pruned=$PRUNED dry_run=$DRY_RUN ==="
 # Per-event notifies (heal / orphan / unresolved) already fired above — loud and
 # per-sha rate-limited; no duplicate roll-up here.
 exit 0
