@@ -423,6 +423,93 @@ printf '%s\n' "$OUTC" | grep 'WOULD-ESCALATE(surge)' >/dev/null \
   && bad "under threshold: surge path fired for only 2 confirmed-divergent (should not)" \
   || ok "under threshold: surge path did not fire for only 2 confirmed-divergent"
 
+
+# ── 13. _bead_already_closed (ga-f7czjc) — unit + full-sweep integration ────
+# wa-k8l0m re-escalated 4 times: content_equivalent (already tested above)
+# correctly handles a FRESH rebase, but is structurally unable to prove
+# equivalence once the repo keeps evolving for unrelated reasons after the
+# duplicate fix lands. _bead_already_closed is the independent second net:
+# a CLOSED bead means a human already resolved this exact concern, so the
+# sweep must not reopen it just because a point-in-time file diff no longer
+# matches. Real-world check (done live, not here): sourced this file in
+# lib-only mode in the real whatsapp_automation repo and called
+# _bead_already_closed against wa-k8l0m (real, closed) and wa-dln9g (real,
+# open) directly -- true and false respectively, as expected.
+echo "── 13. _bead_already_closed (closed-bead escalation skip) ──"
+
+# 13a. Unit tests via a fake `bd` on PATH (this file hardcodes the `bd`
+# command name throughout, no BD_BIN-style override exists to inject
+# through, so PATH-prepending a fake executable is the standard way to test
+# it without touching a real Dolt store -- matches this file's own stated
+# "NO live Dolt" testing philosophy).
+FAKE_BD_DIR="$T/fakebd"; mkdir -p "$FAKE_BD_DIR"
+cat > "$FAKE_BD_DIR/bd" <<'FAKEBD'
+#!/usr/bin/env bash
+# invoked as: bd -C <city> show <bead> --json
+bead="$4"
+case "$bead" in
+  closed-story) echo '{"id":"closed-story","status":"closed"}' ;;
+  closed-story-array) echo '[{"id":"closed-story-array","status":"closed"}]' ;;
+  open-story) echo '{"id":"open-story","status":"open"}' ;;
+  *) echo "" ;;  # not found / empty response
+esac
+FAKEBD
+chmod +x "$FAKE_BD_DIR/bd"
+OLDPATH="$PATH"; PATH="$FAKE_BD_DIR:$PATH"
+
+rc0 "closed bead -> true"                       _bead_already_closed anycity closed-story
+rc0 "closed bead, array-shaped bd output -> true" _bead_already_closed anycity closed-story-array
+rc1 "open bead -> false"                        _bead_already_closed anycity open-story
+rc1 "unknown/empty bd response -> false (fail closed)" _bead_already_closed anycity nonexistent-story
+rc1 "empty bead id -> false (fail closed, no bd call needed)" _bead_already_closed anycity ""
+rc1 "empty beadcity -> false (fail closed, no bd call needed)" _bead_already_closed "" closed-story
+
+PATH="$OLDPATH"
+
+# 13b. Full-sweep integration (DRY_RUN): a closed-bead sha must show
+# WOULD-SKIP(closed-bead) and must NOT show WOULD-ESCALATE(divergent); an
+# open-bead sha with equally-divergent content must still escalate normally
+# (control -- guards against this fix silently swallowing real escalations).
+TD="$T/ga_f7czjc"; mkdir -p "$TD"
+ROD="$TD/origin.git"; git init -q --bare -b main "$ROD" >/dev/null 2>&1
+RRD="$TD/rig"; git clone -q "$ROD" "$RRD" >/dev/null 2>&1
+git -C "$RRD" config user.email t@example.com
+git -C "$RRD" config user.name  tester
+echo base > "$RRD/base"; git -C "$RRD" add .; git -C "$RRD" commit -q -m base
+git -C "$RRD" push -q origin main
+BASED=$(git -C "$RRD" rev-parse HEAD)
+LEDGERD="$TD/ledger.jsonl"; : > "$LEDGERD"
+# side1/closed-story: will end up divergent from origin/main, ledger points
+# at bead=closed-story (fake bd says closed).
+# side2/open-story: identical shape, ledger points at bead=open-story (fake
+# bd says open) -- the control.
+declare -A STORY_FOR=( [1]="closed-story" [2]="open-story" )
+for i in 1 2; do
+  git -C "$RRD" checkout -q -b "side$i" "$BASED" >/dev/null 2>&1
+  echo "s$i" > "$RRD/s$i"; git -C "$RRD" add .; git -C "$RRD" commit -q -m "S$i"
+  SHAD=$(git -C "$RRD" rev-parse HEAD)
+  git -C "$RRD" checkout -q main >/dev/null 2>&1
+  printf '{"ts":"%s","rig":"rigD","rig_path":"%s","default_branch":"main","branch":"side%s","bead":"%s","bead_city":"anycity","gate_run":"","merge_sha":"%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RRD" "$i" "${STORY_FOR[$i]}" "$SHAD" >> "$LEDGERD"
+  echo "m$i" > "$RRD/m$i"; git -C "$RRD" add .; git -C "$RRD" commit -q -m "M$i"
+  git -C "$RRD" push -q origin main
+done
+
+OUTD=$(PATH="$FAKE_BD_DIR:$PATH" GC_CITY_PATH="$TD/city" SURVIVAL_LEDGER_FILE="$LEDGERD" SURVIVAL_ALERT_DIR="$TD/alerted" \
+  SURVIVAL_DIVERGENT_SURGE_THRESHOLD=5 SURVIVAL_DRY_RUN=1 SURVIVAL_LOG_STDOUT=1 bash "$SWEEP" 2>&1)
+
+printf '%s\n' "$OUTD" | grep -q 'WOULD-SKIP(closed-bead) .*bead=closed-story' \
+  && ok "closed-bead sha logs WOULD-SKIP(closed-bead), not escalated" \
+  || bad "closed-bead sha did not log the expected WOULD-SKIP(closed-bead) line — output:
+$OUTD"
+printf '%s\n' "$OUTD" | grep 'WOULD-ESCALATE(divergent)' | grep -q 'closed-story' \
+  && bad "closed-bead sha WAS escalated via WOULD-ESCALATE(divergent) — the exact regression ga-f7czjc fixes"
+INDIV_LINES_D=$(printf '%s\n' "$OUTD" | grep -c 'WOULD-ESCALATE(divergent)')
+[ "$INDIV_LINES_D" = "1" ] \
+  && ok "CONTROL: the open-bead sha still escalates normally (exactly 1 WOULD-ESCALATE)" \
+  || bad "CONTROL: expected exactly 1 WOULD-ESCALATE(divergent) (the open-bead sha only), got $INDIV_LINES_D — output:
+$OUTD"
+
 echo ""
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"

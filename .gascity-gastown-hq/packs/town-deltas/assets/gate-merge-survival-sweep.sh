@@ -218,6 +218,33 @@ EOF_CE_FILES
   return 0
 }
 
+# _bead_already_closed <beadcity> <bead> — ga-f7czjc: true (rc0) iff the bead
+# is CURRENTLY status=closed. Independent of, and complementary to,
+# _survival_content_equivalent: that check proves equivalence by diffing
+# file content against origin/main RIGHT NOW, which is structurally fragile
+# once the repo keeps evolving after a duplicate fix lands (unrelated later
+# commits touching the same files make a once-fully-matching sha look
+# "divergent" again, even though the substantive fix never moved). A CLOSED
+# bead is a different, more durable signal: a human already looked at this
+# exact concern and resolved it -- possibly this exact sha, possibly more
+# than once (wa-k8l0m: 3 separate manual closures, each re-confirming zero
+# data loss, before this function existed). Re-opening a bead a human
+# already closed, to tell them the same thing again, is the actual waste.
+#
+# Fails closed on missing information: an empty beadcity/bead, or a status
+# read that errors/returns nothing, is NOT treated as closed -- only an
+# explicit "status":"closed" suppresses escalation. A genuinely open bead
+# with a genuinely divergent sha must keep escalating exactly as before.
+_bead_already_closed() {
+  local beadcity="$1" bead="$2" bead_status
+  { [ -z "$beadcity" ] || [ -z "$bead" ]; } && return 1
+  # 'status' collides with a read-only variable in some invoking shells
+  # (observed live) -- use an unambiguous local name instead.
+  bead_status=$(bd -C "$beadcity" show "$bead" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | .status // empty' 2>/dev/null)
+  [ "$bead_status" = "closed" ]
+}
+
 # ═════════════════════════════════════════════════════════════════════════════
 # GIT HELPERS — match the dispatcher's container/self-repo handling exactly.
 # ═════════════════════════════════════════════════════════════════════════════
@@ -356,7 +383,7 @@ DEDUP_STREAM=$(printf '%s\n' "$LEDGER_DEDUP" \
   | jq -rc '.' 2>/dev/null \
   | awk 'match($0,/"merge_sha":"[0-9a-f]+"/){ k=substr($0,RSTART,RLENGTH); if(!s[k]++) print }' 2>/dev/null || true)
 
-SURVIVED=0; HEALED=0; DIVERGED=0; UNRESOLVED=0; CHECKED=0; PRUNED=0; DOWNGRADED=0; CONTENT_EQUIV=0
+SURVIVED=0; HEALED=0; DIVERGED=0; UNRESOLVED=0; CHECKED=0; PRUNED=0; DOWNGRADED=0; CONTENT_EQUIV=0; CLOSED_BEAD_SKIP=0
 # NOTE: macOS /bin/bash is 3.2 — NO associative arrays. Dedup fetches with an
 # indexed array + linear membership check (same pattern as merged-bead-janitor).
 declare -a KEEP_LINES=()
@@ -639,6 +666,22 @@ else
   for rec in "${CONFIRMED_DIVERGENT[@]:-}"; do
     [ -z "$rec" ] && continue
     IFS='|' read -r SHA RIG BRANCH BEAD BEADCITY GATERUN RDEFAULT RECHECK_ORIGIN <<< "$rec"
+    # ga-f7czjc: an already-closed bead means a human already verified this
+    # exact concern -- do not reopen/re-escalate just because content_equivalent
+    # (a point-in-time file diff) can no longer prove equivalence once the repo
+    # has moved on for unrelated reasons. See _bead_already_closed's own comment.
+    if [ -n "$BEAD" ] && [ -n "$BEADCITY" ] && _bead_already_closed "$BEADCITY" "$BEAD"; then
+      CLOSED_BEAD_SKIP=$((CLOSED_BEAD_SKIP+1))
+      log "$SHA ($RIG) is content-divergent from origin/$RDEFAULT but bead $BEAD is ALREADY status=closed — treating as prior human confirmation, NOT reopening/escalating (ga-f7czjc)."
+      if [ "$DRY_RUN" = "1" ]; then
+        log "WOULD-SKIP(closed-bead) $SHA ($RIG) bead=$BEAD — no reopen, no comment, no Mayor mail"
+      else
+        bd -C "$BEADCITY" comment "$BEAD" \
+          "gate-merge-survival-sweep (ga-lzj2e / ga-f7czjc): sha $SHA is still tracked in the survival ledger and is content-divergent from origin/$RDEFAULT, but this bead is already closed — treating that as prior human confirmation this specific case is resolved and no work is lost, so NOT reopening or paging Mayor again. If this closure was not actually about this sha, reopen the bead by hand to re-trigger escalation next sweep." 2>/dev/null || true
+        [ -f "$ALERT_DIR/$SHA" ] && rm -f "$ALERT_DIR/$SHA" 2>/dev/null || true
+      fi
+      continue
+    fi
     escalate_divergent "$SHA" "$RIG" "$BRANCH" "$BEAD" "$BEADCITY" "$GATERUN" "$RDEFAULT" "$RECHECK_ORIGIN"
   done
 fi
@@ -658,7 +701,7 @@ if [ "$PRUNED" -gt 0 ] && [ "$DRY_RUN" = "0" ]; then
   fi
 fi
 
-log "=== survival-sweep complete — checked=$CHECKED survived=$SURVIVED content_equivalent=$CONTENT_EQUIV healed=$HEALED divergent=$DIVERGED unresolved=$UNRESOLVED downgraded=$DOWNGRADED pruned=$PRUNED dry_run=$DRY_RUN ==="
+log "=== survival-sweep complete — checked=$CHECKED survived=$SURVIVED content_equivalent=$CONTENT_EQUIV closed_bead_skip=$CLOSED_BEAD_SKIP healed=$HEALED divergent=$DIVERGED unresolved=$UNRESOLVED downgraded=$DOWNGRADED pruned=$PRUNED dry_run=$DRY_RUN ==="
 # Per-event notifies (heal / orphan / unresolved) already fired above — loud and
 # per-sha rate-limited; no duplicate roll-up here.
 exit 0
