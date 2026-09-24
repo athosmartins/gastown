@@ -13,6 +13,12 @@
 # report also sends an ntfy — staying silent would look exactly like "no data today".
 set -u
 
+# ga-9wimr7: `notify` routes by an allowlist and its DEFAULT is the hourly digest, not the
+# phone (wa-f53j6). No rule knows "Jev — fim do dia", so the first run (23/09 21:07) exited 0
+# with "Logged for digest" — the report the Athos asked to SEE never reached him. This is a
+# once-a-day report he explicitly requested, sent outside quiet hours: force the push.
+export NOTIFY_FORCE_PUSH=1
+
 HQ="${JEV_HQ:-/Users/athos/gt/.gascity-gastown-hq}"
 REPORT="${JEV_REPORT:-$HQ/scripts/jev_experiment_report.py}"
 OUT_DIR="${JEV_DAILY_OUT_DIR:-$HQ/.gc/logs/jev-daily}"

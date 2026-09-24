@@ -16,6 +16,9 @@
 #      the "no alerts today" line (can't-know must not read as nothing-happened).
 #   T7 a garbled day argument -> refused (--date "" would report the whole log
 #      under one day's name).
+#   T8 every ntfy goes out with NOTIFY_FORCE_PUSH=1 (ga-9wimr7): notify's default
+#      route is the digest, and on 23/09 the real report landed there, never on
+#      the phone. Checked on the success path AND on a failure path.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -33,7 +36,7 @@ trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/bin" "$T/out"
 cat >"$T/bin/notify" <<'EOF'
 #!/bin/bash
-{ printf 'CALL'; for a in "$@"; do printf '\n%s' "$a"; done; printf '\n--END--\n'; } >>"$NOTIFY_LOG"
+{ printf 'CALL'; printf '\nFORCE=%s' "${NOTIFY_FORCE_PUSH:-}"; for a in "$@"; do printf '\n%s' "$a"; done; printf '\n--END--\n'; } >>"$NOTIFY_LOG"
 EOF
 chmod +x "$T/bin/notify"
 
@@ -49,7 +52,7 @@ EOF
 
 run() {  # run [date-arg...] with the sandboxed env; sets RC
   : >"$T/notify.log"
-  env PATH="$T/bin:$PATH" NOTIFY_LOG="$T/notify.log" JEV_EXPERIMENT_LOG="${RUN_LOG:-$T/log.jsonl}" \
+  env -u NOTIFY_FORCE_PUSH PATH="$T/bin:$PATH" NOTIFY_LOG="$T/notify.log" JEV_EXPERIMENT_LOG="${RUN_LOG:-$T/log.jsonl}" \
       JEV_DAILY_OUT_DIR="$T/out" JEV_REPORT="${RUN_REPORT:-$REPORT}" \
       bash "$SCRIPT" "$@" >"$T/stdout" 2>&1
   RC=$?
@@ -71,6 +74,7 @@ case "$N" in *"~3680 = 46,0%."*) ok "T1 estimated tokens ~3680 = 46,0% (1x4000 -
 case "$N" in *"Custo do Jev (medido): 300 + 20 tokens."*) ok "T1 measured Jev cost" ;; *) nok "T1 cost" "$N" ;; esac
 case "$N" in *"Jev indisponível em 1 de 2 alerta(s)"*) ok "T1 warns the day's number is understated (Jev unavailable 1/2)" ;; *) nok "T1 unavailable warning" "$N" ;; esac
 case "$N" in *"2026-09-21"*) nok "T1 day filter" "another day's event leaked: $N" ;; *) ok "T1 only the requested UTC day is counted" ;; esac
+case "$N" in *"FORCE=1"*) ok "T8 the daily result is sent with NOTIFY_FORCE_PUSH=1 (phone, not digest)" ;; *) nok "T8 force push (result)" "$N" ;; esac
 
 # T2
 run 2026-09-25
@@ -83,6 +87,7 @@ RUN_REPORT="$T/does-not-exist.py" run 2026-09-20
 N="$(cat "$T/notify.log")"
 if [ "$RC" -ne 0 ] && [ "$(calls)" -eq 1 ]; then ok "T3 failing report -> exit != 0 and one ntfy"; else nok "T3 rc/calls" "rc=$RC calls=$(calls)"; fi
 case "$N" in *"falhou"*) ok "T3 ntfy says the report failed" ;; *) nok "T3 text" "$N" ;; esac
+case "$N" in *"FORCE=1"*) ok "T8 the failure ntfy is also forced to the phone" ;; *) nok "T8 force push (failure)" "$N" ;; esac
 
 # T4
 run
