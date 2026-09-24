@@ -12109,7 +12109,9 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       # narrated-intent-vs-executed-action gap this whole fix exists to close.
       # Pure computation (no bd calls), safe to run even when BEAD_ID is empty.
       _TZ0OP_ROUTE=$(gate_fail_restore_route "$BEAD_CITY" "$RIG_LIST_JSON")
+      _TZ0OP_ROUTE_UNKNOWN=0
       if [ "$_TZ0OP_ROUTE" = "UNKNOWN" ]; then
+        _TZ0OP_ROUTE_UNKNOWN=1
         _TZ0OP_ROUTE="gastown.dog"
         log "  ga-u679x2: could not reverse-resolve bead_city='$BEAD_CITY' to any registered rig — falling back to gastown.dog (safe default), NOT guessing from code rig '${RIG:-}'."
       fi
@@ -12139,7 +12141,9 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
             _TZ0OP_ROUTE_OBS="gc.routed_to='${_TZ0OP_ROUTE_OBSERVED}' NOT $_TZ0OP_ROUTE — restore did not stick, needs investigation"
           fi
         fi
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate (ga-tz0op): branch $BRANCH needs a rebase, but its resolved rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity — no fixed session to wait for. Returned to the $_TZ0OP_ROUTE pool (assignee cleared) for a fresh worker to rebase and resubmit via /gate-done — verified post-write, not assumed: $_TZ0OP_ROUTE_OBS." 2>/dev/null || true
+        _TZ0OP_ROUTE_UNKNOWN_NOTE=""
+        [ "$_TZ0OP_ROUTE_UNKNOWN" = "1" ] && _TZ0OP_ROUTE_UNKNOWN_NOTE=" NOTE: bead_city='$BEAD_CITY' did not reverse-resolve to any registered rig — route defaulted to gastown.dog rather than guessed (ga-u679x2)."
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate (ga-tz0op): branch $BRANCH needs a rebase, but its resolved rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity — no fixed session to wait for. Returned to the $_TZ0OP_ROUTE pool (assignee cleared) for a fresh worker to rebase and resubmit via /gate-done — verified post-write, not assumed: $_TZ0OP_ROUTE_OBS.$_TZ0OP_ROUTE_UNKNOWN_NOTE" 2>/dev/null || true
       fi
       REBASE_EVENT="dispatcher_needs_rebase_pool_author"
       REBASE_VERDICT="NEEDS_REBASE (pool/ephemeral author '$REBASE_AUTHOR' — returned to pool, ga-tz0op)"
