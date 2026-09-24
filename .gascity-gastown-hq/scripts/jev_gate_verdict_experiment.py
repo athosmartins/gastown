@@ -260,18 +260,42 @@ def _git_text(repo_root: str, args: list[str]) -> str | None:
     return r.stdout
 
 
+def _text_or_marker(raw: str | None, empty_label: str, failed_label: str) -> str:
+    """A git command failing outright (None) and one that succeeded with a genuinely
+    empty result ("") are different facts -- collapsing them into the same fallback
+    text would be exactly the third-state bug this gate hunts for. Both cases are
+    already rare here in practice (ensure_commits_available() has just verified both
+    SHAs resolve before build_state_text() is ever called), but the distinction costs
+    nothing to keep, and the label makes it visible to whoever reads a shadow log
+    entry later instead of quietly reading like "empty diff" either way."""
+    if raw is None:
+        return failed_label
+    return raw.strip() or empty_label
+
+
 def build_state_text(repo_root: str, base_sha: str, head_sha: str, self_audit: str | None,
                       diff_line_budget: int = DIFF_LINE_BUDGET) -> str:
-    log_out = (_git_text(repo_root, ["log", "--format=%H %s", f"{base_sha}..{head_sha}"]) or "(no commits found)").strip()
-    stat_out = (_git_text(repo_root, ["diff", "--stat", f"{base_sha}...{head_sha}"]) or "(empty)").strip()
-    diff_out = _git_text(repo_root, ["diff", f"{base_sha}...{head_sha}"]) or ""
+    log_out = _text_or_marker(
+        _git_text(repo_root, ["log", "--format=%H %s", f"{base_sha}..{head_sha}"]),
+        "(no commits in range)", "(git log failed)",
+    )
+    stat_out = _text_or_marker(
+        _git_text(repo_root, ["diff", "--stat", f"{base_sha}...{head_sha}"]),
+        "(no changes)", "(git diff --stat failed)",
+    )
+    diff_raw = _git_text(repo_root, ["diff", f"{base_sha}...{head_sha}"])
+    diff_out = "" if diff_raw is None else diff_raw
     diff_lines = diff_out.splitlines()
+    if diff_raw is None:
+        diff_lines = ["(git diff failed)"]
     truncated = len(diff_lines) > diff_line_budget
     shown = "\n".join(diff_lines[:diff_line_budget])
-    header = (
-        f"DIFF (first {diff_line_budget} of {len(diff_lines)} lines, truncated):"
-        if truncated else "DIFF (complete):"
-    )
+    if diff_raw is None:
+        header = "DIFF (git diff failed):"
+    elif truncated:
+        header = f"DIFF (first {diff_line_budget} of {len(diff_lines)} lines, truncated):"
+    else:
+        header = "DIFF (complete):"
     parts = ["COMMIT LOG:", log_out, "", "DIFF STAT:", stat_out, "", header, shown]
     if self_audit:
         parts += ["", "SUBMITTER'S SELF-AUDIT NOTE:", self_audit]
@@ -462,6 +486,35 @@ def _selftest() -> int:
         ok("build_state_text: omits self-audit section when none given", "SELF-AUDIT" not in state)
         ok("build_state_text: includes self-audit note when given",
            "checked X and Y" in build_state_text("/repo", "aaa", "bbb", "checked X and Y"))
+
+    ok("_text_or_marker: git command failure -> the FAILED label, not the empty one",
+       _text_or_marker(None, "empty", "failed") == "failed")
+    ok("_text_or_marker: genuinely empty success -> the EMPTY label, never the failed one",
+       _text_or_marker("", "empty", "failed") == "empty")
+    ok("_text_or_marker: whitespace-only success is still 'empty', not a raw blank string",
+       _text_or_marker("   \n", "empty", "failed") == "empty")
+    ok("_text_or_marker: real content passes through stripped, untouched by either label",
+       _text_or_marker("  real text  ", "empty", "failed") == "real text")
+
+    def fake_run_diff_fails(cmd, timeout=None):
+        if cmd[:2] == ["git", "-C"] and cmd[3] == "cat-file":
+            return cp(0)
+        if cmd[:3] == ["git", "-C", "/repo"] and cmd[3:5] == ["log", "--format=%H %s"]:
+            return cp(0, "")  # succeeds, genuinely no commits in range
+        if cmd[:3] == ["git", "-C", "/repo"] and cmd[3:5] == ["diff", "--stat"]:
+            return cp(1, "", "fatal: bad revision")  # command itself fails
+        if cmd[:3] == ["git", "-C", "/repo"] and cmd[3] == "diff":
+            return cp(1, "", "fatal: bad revision")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    with mock.patch.object(this, "_run", side_effect=fake_run_diff_fails):
+        state_fail = build_state_text("/repo", "aaa", "bbb", None)
+    ok(
+        "build_state_text: a genuinely empty commit log and a FAILED diff command read as distinct facts, never the same fallback text",
+        "(no commits in range)" in state_fail
+        and "(git diff --stat failed)" in state_fail
+        and "(git diff failed)" in state_fail,
+    )
 
     ok("resolve_rig_root: unknown rig name -> None, no git call attempted",
        resolve_rig_root("nope", {"gascity": "/whatever"}) is None)
