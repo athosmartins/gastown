@@ -1,0 +1,13 @@
+# ga-aijm2v.2 (Jev F1): pre-triage gastown.mayor's automated-watchdog mail.
+# For each new eligible message (see mayor-inbox-jev-triage.sh's own header
+# for the full eligibility/safety design -- subject-pattern allowlist, not
+# the unreliable `from` field), ask Jev "does this need Mayor action now?"
+# (A/B experiment "mayor-inbox"). Experiment arm + >=85% confident no ->
+# archive + log. Control arm / uncertain / Jev error -> never archive.
+# 15m cadence matches this city's other mail/mayor-shaped orders
+# (next-action-coordinator-alert.toml).
+[order]
+description = "Jev pre-triage of gastown.mayor's automated watchdog mail (ga-aijm2v.2): archive high-confidence no-action alerts in the A/B experiment arm"
+trigger = "cooldown"
+interval = "15m"
+exec = "$PACK_DIR/assets/scripts/mayor-inbox-jev-triage.sh"

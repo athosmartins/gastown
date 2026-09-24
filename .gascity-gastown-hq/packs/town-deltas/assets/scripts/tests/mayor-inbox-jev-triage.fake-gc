@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Fake `gc` for mayor-inbox-jev-triage.selftest.sh. Handles only the two
+# subcommands the real script calls: `mail inbox <addr> --json` (prints the
+# fixture inbox file) and `mail archive <id>` (records the id to a log,
+# honors FAKE_GC_ARCHIVE_FAIL_ID to simulate one failing archive call).
+set -euo pipefail
+
+if [ "${1:-}" = "mail" ] && [ "${2:-}" = "inbox" ]; then
+    # Simulate archived messages actually disappearing from later listings:
+    # filter out any id already recorded in FAKE_GC_ARCHIVE_LOG.
+    if [ -s "${FAKE_GC_ARCHIVE_LOG:-/dev/null}" ]; then
+        archived_json=$(jq -R . "$FAKE_GC_ARCHIVE_LOG" | jq -s .)
+        jq --argjson archived "$archived_json" \
+            '.messages |= map(select(.id as $i | $archived | index($i) | not))' \
+            "$FAKE_GC_INBOX_FILE"
+    else
+        cat "$FAKE_GC_INBOX_FILE"
+    fi
+    exit 0
+fi
+
+if [ "${1:-}" = "mail" ] && [ "${2:-}" = "archive" ]; then
+    id="${3:-}"
+    if [ -n "${FAKE_GC_ARCHIVE_FAIL_ID:-}" ] && [ "$id" = "$FAKE_GC_ARCHIVE_FAIL_ID" ]; then
+        echo "fake-gc: simulated archive failure for $id" >&2
+        exit 1
+    fi
+    echo "$id" >> "$FAKE_GC_ARCHIVE_LOG"
+    exit 0
+fi
+
+echo "fake-gc: unhandled invocation: $*" >&2
+exit 1

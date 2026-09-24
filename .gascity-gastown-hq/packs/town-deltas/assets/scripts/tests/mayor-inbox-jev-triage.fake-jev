@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Fake jev_experiment.py for mayor-inbox-jev-triage.selftest.sh. Parses just
+# enough of the real CLI (evaluate --entity-id X ...) to record the call and
+# print a scripted response looked up by entity-id from
+# FAKE_JEV_FIXTURES (a JSON object: {entity_id: {arm, suppress, jev_error}}).
+# An entity-id with no fixture entry gets a "control" response, matching the
+# real harness's own shape for an id that happened to hash into control.
+set -euo pipefail
+
+entity_id=""
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+    if [ "${args[$i]}" = "--entity-id" ]; then
+        entity_id="${args[$((i + 1))]}"
+    fi
+done
+
+echo "$entity_id" >> "$FAKE_JEV_CALL_LOG"
+
+fixture=$(jq -c --arg id "$entity_id" '.[$id] // {arm:"control", suppress:false, jev_error:"control_arm_skips_jev"}' "$FAKE_JEV_FIXTURES")
+
+if [ "$(printf '%s' "$fixture" | jq -r 'has("no_output")')" = "true" ]; then
+    # Simulates a hard failure of the harness itself (crash/timeout): no
+    # stdout at all, matching what `jev_result=$($JEV_BIN ... ) || jev_result=""`
+    # sees from a nonzero-exit or empty-output subprocess.
+    exit 1
+fi
+
+arm=$(printf '%s' "$fixture" | jq -r '.arm')
+suppress=$(printf '%s' "$fixture" | jq -r '.suppress')
+jev_error=$(printf '%s' "$fixture" | jq -r '.jev_error // null')
+
+jq -n --arg id "$entity_id" --arg arm "$arm" --argjson suppress "$suppress" --argjson jev_error "$jev_error" \
+    '{ts: "2026-09-24T00:00:00Z", experiment: "mayor-inbox", entity_id: $id, arm: $arm, jev_ok: ($arm == "experiment"), jev_noul: null, jev_error: $jev_error, jev_tokens_in: 0, jev_tokens_out: 0, suppress: $suppress}'
