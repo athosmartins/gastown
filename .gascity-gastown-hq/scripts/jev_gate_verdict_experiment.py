@@ -234,7 +234,7 @@ def resolve_rig_root(rig_name: str, rig_paths: dict[str, str]) -> str | None:
     path = rig_paths.get(rig_name)
     if not path:
         return None
-    r = _run(["git", "-C", path, "rev-parse", "--show-toplevel"])
+    r = _run(["git", "-C", path, "rev-parse", "--show-toplevel"], timeout=10)
     if r is None or r.returncode != 0:
         return None
     top = r.stdout.strip()
@@ -242,7 +242,7 @@ def resolve_rig_root(rig_name: str, rig_paths: dict[str, str]) -> str | None:
 
 
 def _commit_exists(repo_root: str, sha: str) -> bool:
-    r = _run(["git", "-C", repo_root, "cat-file", "-e", f"{sha}^{{commit}}"])
+    r = _run(["git", "-C", repo_root, "cat-file", "-e", f"{sha}^{{commit}}"], timeout=10)
     return r is not None and r.returncode == 0
 
 
@@ -253,8 +253,8 @@ def ensure_commits_available(repo_root: str, *shas: str) -> bool:
     return all(_commit_exists(repo_root, s) for s in shas)
 
 
-def _git_text(repo_root: str, args: list[str]) -> str | None:
-    r = _run(["git", "-C", repo_root] + args)
+def _git_text(repo_root: str, args: list[str], timeout: float = 30) -> str | None:
+    r = _run(["git", "-C", repo_root] + args, timeout=timeout)
     if r is None or r.returncode != 0:
         return None
     return r.stdout
@@ -461,7 +461,10 @@ def _selftest() -> int:
     ok("_field: missing field -> None", _field(desc, "branch_sha") is None)
     ok("_field: None description -> None, never raises", _field(None, "base_commit") is None)
 
+    happy_calls: list[tuple[list[str], float | None]] = []
+
     def fake_run_happy(cmd, timeout=None):
+        happy_calls.append((cmd, timeout))
         if cmd[:2] == ["git", "-C"] and cmd[3:5] == ["rev-parse", "--show-toplevel"]:
             return cp(0, "/repo\n")
         if cmd[:3] == ["git", "-C", "/repo"]:
@@ -486,6 +489,16 @@ def _selftest() -> int:
         ok("build_state_text: omits self-audit section when none given", "SELF-AUDIT" not in state)
         ok("build_state_text: includes self-audit note when given",
            "checked X and Y" in build_state_text("/repo", "aaa", "bbb", "checked X and Y"))
+
+    # ga-hu89on gate finding: resolve_rig_root/_commit_exists/_git_text ran with no bound
+    # at all, so a stuck git process (concurrent activity in this shared multi-agent ~/gt
+    # tree, or just a slow diff) could hang this daily batch job forever. Every git call
+    # recorded above must carry an explicit, positive timeout -- `timeout=None` on any of
+    # them is exactly the regression that finding described.
+    ok(
+        "resolve_rig_root/_commit_exists/_git_text: every git call site passes an explicit, positive timeout",
+        len(happy_calls) == 9 and all(isinstance(t, (int, float)) and t > 0 for _cmd, t in happy_calls),
+    )
 
     ok("_text_or_marker: git command failure -> the FAILED label, not the empty one",
        _text_or_marker(None, "empty", "failed") == "failed")

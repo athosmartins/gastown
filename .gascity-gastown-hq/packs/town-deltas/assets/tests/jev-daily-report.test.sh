@@ -21,7 +21,10 @@
 #      the phone. Checked on the success path AND on a failure path.
 #   T9 (ga-aijm2v.3/F5) the gate-verdict join step runs before the report AND is
 #      fail-open: a join failure is logged to gate-verdict-join.log but never
-#      blocks or changes the report/ntfy outcome (same rc/calls as T1).
+#      blocks or changes the report/ntfy outcome (same rc/calls as T1). T9c covers
+#      a HUNG join step specifically -- gate_run=ga-hu89on found that a fast
+#      sys.exit(1) stub (T9b) gives zero coverage for an actual stall, since the
+#      outer `timeout` and the stub exiting on its own are different code paths.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -58,6 +61,14 @@ import sys
 print("jev_gate_verdict_experiment: simulated failure (ga-aijm2v.3 T9)", file=sys.stderr)
 sys.exit(1)
 EOF
+# T9c: a real stall, not a fast exit. Paired with RUN_JOIN_TIMEOUT=1 in the test below
+# so proving the kill costs ~1s, never the full 5s sleep.
+cat >"$T/join-hang.py" <<'EOF'
+#!/usr/bin/env python3
+import time
+time.sleep(5)
+print("jev_gate_verdict_experiment: should never get here (ga-aijm2v.3 T9c)")
+EOF
 
 # 2 control + 2 experiment on 2026-09-20: one suppressed by a working Jev
 # (300 in / 20 out tokens), one fired because Jev had no credentials.
@@ -74,6 +85,7 @@ run() {  # run [date-arg...] with the sandboxed env; sets RC
   rm -f "$T/out/gate-verdict-join.log"
   env -u NOTIFY_FORCE_PUSH PATH="$T/bin:$PATH" NOTIFY_LOG="$T/notify.log" JEV_EXPERIMENT_LOG="${RUN_LOG:-$T/log.jsonl}" \
       JEV_DAILY_OUT_DIR="$T/out" JEV_REPORT="${RUN_REPORT:-$REPORT}" JEV_GATE_VERDICT_JOIN="${RUN_JOIN:-$T/join-ok.py}" \
+      JEV_GATE_VERDICT_JOIN_TIMEOUT="${RUN_JOIN_TIMEOUT:-600}" \
       bash "$SCRIPT" "$@" >"$T/stdout" 2>&1
   RC=$?
 }
@@ -155,6 +167,20 @@ grep -q 'simulated failure' "$T/out/gate-verdict-join.log" 2>/dev/null \
   && ok "T9b join failure captured in gate-verdict-join.log" || nok "T9b join failure logged" "$(cat "$T/out/gate-verdict-join.log" 2>&1)"
 grep -q 'exited non-zero' "$T/out/gate-verdict-join.log" 2>/dev/null \
   && ok "T9b jev-daily-report.sh itself notes the non-zero exit" || nok "T9b non-zero note" "$(cat "$T/out/gate-verdict-join.log" 2>&1)"
+
+# T9c: a HUNG join step (join-hang.py sleeps 5s) must be killed by the outer bound
+# well before it ever returns on its own -- RUN_JOIN_TIMEOUT=1 keeps this test itself
+# fast (~1s) while still proving a real process gets terminated, not just a fast exit.
+RUN_JOIN="$T/join-hang.py" RUN_JOIN_TIMEOUT=1 run 2026-09-20
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T9c hung join step still yields exit 0, exactly one ntfy (fail-open)"; else nok "T9c rc/calls" "rc=$RC calls=$(calls)"; fi
+grep -q 'Jev experiment report — 2026-09-20' "$T/out/2026-09-20.txt" 2>/dev/null \
+  && ok "T9c report still generated despite the join hanging" || nok "T9c report file" "$(cat "$T/out/2026-09-20.txt" 2>&1)"
+grep -q 'TIMED OUT' "$T/out/gate-verdict-join.log" 2>/dev/null \
+  && ok "T9c the hang is captured as TIMED OUT, distinct from an ordinary non-zero exit" || nok "T9c timeout logged" "$(cat "$T/out/gate-verdict-join.log" 2>&1)"
+grep -q 'should never get here' "$T/out/gate-verdict-join.log" 2>/dev/null \
+  && nok "T9c process actually killed" "join-hang.py's post-sleep line ran -- the process was not terminated" \
+  || ok "T9c the hung process was killed before finishing its sleep"
 
 echo ""
 echo "jev-daily-report tests: $PASS passed, $FAIL failed"

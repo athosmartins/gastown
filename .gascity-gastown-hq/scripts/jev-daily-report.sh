@@ -41,8 +41,17 @@ mkdir -p "$OUT_DIR"
 # a join failure (Dolt hiccup, unresolvable rig, git object pruned) just leaves that one
 # gate run unmeasured, it says nothing about whether the report itself can run.
 JOIN_SCRIPT="${JEV_GATE_VERDICT_JOIN:-$HQ/scripts/jev_gate_verdict_experiment.py}"
-if ! python3 "$JOIN_SCRIPT" run >>"$OUT_DIR/gate-verdict-join.log" 2>&1; then
-  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) jev_gate_verdict_experiment.py run exited non-zero, see $OUT_DIR/gate-verdict-join.log" >>"$OUT_DIR/gate-verdict-join.log"
+# Every individual git/bd call inside the join script now carries its own timeout, but
+# this outer bound is the last line of defense: it guarantees the report below still
+# runs today even if some future call site regresses that discipline. Overridable so
+# the test suite can exercise a real hang without waiting 600s.
+JOIN_TIMEOUT="${JEV_GATE_VERDICT_JOIN_TIMEOUT:-600}"
+JOIN_RC=0
+timeout "$JOIN_TIMEOUT" python3 "$JOIN_SCRIPT" run >>"$OUT_DIR/gate-verdict-join.log" 2>&1 || JOIN_RC=$?
+if [ "$JOIN_RC" -eq 124 ]; then
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) jev_gate_verdict_experiment.py run TIMED OUT after ${JOIN_TIMEOUT}s, see $OUT_DIR/gate-verdict-join.log" >>"$OUT_DIR/gate-verdict-join.log"
+elif [ "$JOIN_RC" -ne 0 ]; then
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) jev_gate_verdict_experiment.py run exited non-zero ($JOIN_RC), see $OUT_DIR/gate-verdict-join.log" >>"$OUT_DIR/gate-verdict-join.log"
 fi
 
 if ! python3 "$REPORT" --date "$DAY" >"$OUT_DIR/$DAY.txt" 2>&1; then
