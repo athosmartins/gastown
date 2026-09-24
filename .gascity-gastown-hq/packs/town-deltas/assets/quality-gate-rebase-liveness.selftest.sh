@@ -858,10 +858,15 @@ _POOL_BLOCK=$(sed -n '/ga-tz0op: REBASE_AUTHOR resolved to a pool\/ephemeral ide
 if [ -z "$_POOL_BLOCK" ]; then
   bad "could not extract the ga-tz0op pool-intercept block — start/end anchor comments missing/renamed?"
 else
-  if printf '%s\n' "$_POOL_BLOCK" | grep -F 'default_pool_route_for_rig "${RIG:-}"' >/dev/null; then
-    ok "AC2: pool branch routes the source bead via default_pool_route_for_rig (same mechanism as the FAIL-path pool-return, ga-f54ui)"
+  if printf '%s\n' "$_POOL_BLOCK" | grep -F 'gate_fail_restore_route "$BEAD_CITY" "$RIG_LIST_JSON"' >/dev/null; then
+    ok "AC2: pool branch routes the source bead via gate_fail_restore_route, from the bead's own home store (same mechanism as the FAIL-path pool-return, ga-f54ui/ga-u679x2)"
   else
-    bad "AC2: pool branch does not call default_pool_route_for_rig — bead may not become self-serve-visible"
+    bad "AC2: pool branch does not call gate_fail_restore_route with \$BEAD_CITY — bead may not become self-serve-visible, or regressed back to \$RIG (ga-u679x2)"
+  fi
+  if printf '%s\n' "$_POOL_BLOCK" | grep -F 'default_pool_route_for_rig "${RIG:-}"' >/dev/null; then
+    bad "AC2: pool branch still computes the restore route from \$RIG (the CODE rig) directly — ga-u679x2 regression"
+  else
+    ok "AC2: pool branch no longer derives the restore route from \$RIG directly (ga-u679x2)"
   fi
   if printf '%s\n' "$_POOL_BLOCK" | grep -F 'bd -C "$BEAD_CITY" assign       "$BEAD_ID" ""' >/dev/null; then
     ok "AC2: pool branch clears the source bead's assignee so a fresh worker can claim it"

@@ -181,10 +181,15 @@ if [ -n "$NR_BODY" ]; then
       bad "needs-rebase 'clear' sub-arm does NOT correctly scope status-open/gate:queued-remove (cleared=$NR_CLEARED_LN status=$NR_STATUS_LN queued=$NR_QUEUED_LN elif=$NR_ELIF_LN)"
     fi
   fi
-  if printf '%s' "$NR_BODY" | grep -F '_NR_ROUTE=$(default_pool_route_for_rig "$RIG")' >/dev/null; then
-    ok "needs-rebase 'clear' sub-arm restores gc.routed_to via default_pool_route_for_rig (same convention as ga-f54ui)"
+  if printf '%s' "$NR_BODY" | grep -F '_NR_ROUTE=$(gate_fail_restore_route "$BEAD_CITY" "$RIG_LIST_JSON")' >/dev/null; then
+    ok "needs-rebase 'clear' sub-arm restores gc.routed_to via gate_fail_restore_route, from the bead's own home store (ga-f54ui/ga-u679x2)"
   else
-    bad "needs-rebase 'clear' sub-arm does not restore gc.routed_to"
+    bad "needs-rebase 'clear' sub-arm does not restore gc.routed_to from \$BEAD_CITY — missing, or regressed back to \$RIG (ga-u679x2)"
+  fi
+  if printf '%s' "$NR_BODY" | grep -F '_NR_ROUTE=$(default_pool_route_for_rig "$RIG")' >/dev/null; then
+    bad "needs-rebase 'clear' sub-arm still computes the restore route from \$RIG (the CODE rig) directly — ga-u679x2 regression"
+  else
+    ok "needs-rebase 'clear' sub-arm no longer derives the restore route from \$RIG directly (ga-u679x2)"
   fi
   # ga-39l9z2 self-audit (mandatory /gate-done third-state sweep): the 'keep'
   # sub-arm originally claimed "assignee + story:in-flight were kept" with no

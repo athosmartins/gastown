@@ -163,7 +163,7 @@ if grep -qF 'bd -C "$BEAD_CITY" assign "$BEAD_ID" "$AUTHOR" 2>/dev/null || true'
 else
   bad "needs-fix 'keep' arm missing the re-assign-to-\$AUTHOR call"
 fi
-if grep -qF 'story:in-flight + gate:reviewing (wa-qq33j) cleared. gc.routed_to restored to $_GFAIL_ROUTE so pool workers can self-serve this bead (ga-f54ui) — verified post-write, not assumed: $_GFAIL_ROUTE_OBS; $_GFAIL_ASSIGNEE_OBS; $_GFAIL_STATUS_OBS; $_GFAIL_QUEUED_OBS (ga-39l9z2).' "$DISPATCHER"; then
+if grep -qF 'story:in-flight + gate:reviewing (wa-qq33j) cleared. gc.routed_to restored to $_GFAIL_ROUTE (from the bead'"'"'s own home store, ga-u679x2) so pool workers can self-serve this bead (ga-f54ui) — verified post-write, not assumed: $_GFAIL_ROUTE_OBS; $_GFAIL_ASSIGNEE_OBS; $_GFAIL_STATUS_OBS; $_GFAIL_QUEUED_OBS (ga-39l9z2).' "$DISPATCHER"; then
   ok "needs-fix 'clear' arm reports the OBSERVED assignee-clear state (ga-yd8t6) instead of an unconditional 'assignee cleared' assertion"
 else
   bad "needs-fix 'clear' arm no longer reports the observed post-write assignee state — ga-yd8t6 regression"
@@ -265,10 +265,20 @@ CLEAR_ARM=$(awk '
 if [ -z "$CLEAR_ARM" ]; then
   bad "CLEAR_ARM extraction produced nothing — anchor/indentation drifted, cannot verify wiring"
 else
-  if printf '%s' "$CLEAR_ARM" | grep -F '_GFAIL_ROUTE=$(default_pool_route_for_rig "$RIG")' >/dev/null; then
-    ok "'clear' arm computes the restore route via default_pool_route_for_rig"
+  if printf '%s' "$CLEAR_ARM" | grep -F '_GFAIL_ROUTE=$(gate_fail_restore_route "$BEAD_CITY" "$RIG_LIST_JSON")' >/dev/null; then
+    ok "'clear' arm computes the restore route via gate_fail_restore_route, from the bead's own home store (ga-u679x2)"
   else
-    bad "'clear' arm does NOT call default_pool_route_for_rig — wiring missing/renamed"
+    bad "'clear' arm does NOT call gate_fail_restore_route with \$BEAD_CITY — wiring missing/renamed, or regressed back to \$RIG (ga-u679x2)"
+  fi
+  if printf '%s' "$CLEAR_ARM" | grep -F '_GFAIL_ROUTE=$(default_pool_route_for_rig "$RIG")' >/dev/null; then
+    bad "'clear' arm still computes the restore route from \$RIG (the CODE rig) directly — ga-u679x2 regression (wrong for a bead whose store differs from the branch's rig)"
+  else
+    ok "'clear' arm no longer derives the restore route from \$RIG directly (ga-u679x2)"
+  fi
+  if printf '%s' "$CLEAR_ARM" | grep -F 'if [ "$_GFAIL_ROUTE" = "UNKNOWN" ]; then' >/dev/null; then
+    ok "'clear' arm handles gate_fail_restore_route's UNKNOWN sentinel instead of trusting it blindly (ga-u679x2)"
+  else
+    bad "'clear' arm does NOT handle the UNKNOWN sentinel — an unresolvable bead_city would write gc.routed_to=UNKNOWN literally (ga-u679x2)"
   fi
   if printf '%s' "$CLEAR_ARM" | grep -F -- '--set-metadata "gc.routed_to=$_GFAIL_ROUTE"' >/dev/null; then
     ok "'clear' arm writes gc.routed_to via --set-metadata (key-scoped, not a whole-object replace)"
@@ -335,10 +345,99 @@ fi
 NEEDS_HUMAN_ARM=$(awk '/PREV_ATTEMPT" -ge "\$GATE_FIX_CAP"/{flag=1} flag{print} /^    else$/{if(flag) exit}' "$DISPATCHER")
 if [ -z "$NEEDS_HUMAN_ARM" ]; then
   bad "NEEDS_HUMAN_ARM extraction produced nothing — anchor/indentation drifted, cannot verify scope boundary (would otherwise pass vacuously)"
-elif printf '%s' "$NEEDS_HUMAN_ARM" | grep -F 'default_pool_route_for_rig' >/dev/null; then
-  bad "needs-human (cap-exhausted) branch unexpectedly calls default_pool_route_for_rig — scope crept beyond ga-f54ui's needs-fix-only ACEITE"
+elif printf '%s' "$NEEDS_HUMAN_ARM" | grep -F 'default_pool_route_for_rig' >/dev/null || printf '%s' "$NEEDS_HUMAN_ARM" | grep -F 'gate_fail_restore_route' >/dev/null; then
+  bad "needs-human (cap-exhausted) branch unexpectedly calls a route-restore helper — scope crept beyond ga-f54ui/ga-u679x2's needs-fix-only ACEITE"
 else
   ok "needs-human (cap-exhausted) branch untouched — gc.routed_to restore correctly scoped to the re-dispatchable needs-fix arm only"
+fi
+
+# ── 12. ga-u679x2: gate_fail_restore_route — pure function, bead's home store ─
+# The actual bug: a gate FAIL used to restore gc.routed_to from $RIG (the CODE
+# rig — where the failing branch lives) instead of the BEAD's own home store.
+# For an HQ bead (ga-*) fixed by code delivered on a whatsapp_automation
+# branch, that wrote gc.routed_to=wa-worker — no wa-worker ever polls an HQ
+# bead (wrong Dolt DB) and no dog polls wa-worker's route either, so the bead
+# went ctx:ready + unassigned + invisible to every pool worker. This function
+# reverse-looks-up bead_city's OWN rig name and routes from THAT.
+echo "── 12. ga-u679x2: gate_fail_restore_route (pure function) ──"
+type gate_fail_restore_route >/dev/null 2>&1 \
+  || { echo "FATAL: gate_fail_restore_route not defined by dispatcher (ga-u679x2 missing?)"; exit 1; }
+
+RLJ='{"rigs":[
+  {"name":"gascity","prefix":"ga","path":"/city/hq"},
+  {"name":"whatsapp_automation","prefix":"wa","path":"/city/wa"},
+  {"name":"property_scrapers","prefix":"ps","path":"/city/ps"}
+]}'
+
+# AC1 (the reported bug, literally): HQ bead (bead_city=/city/hq), branch
+# delivered in the whatsapp_automation rig — must route to gastown.dog, NEVER
+# wa-worker (today's bug: caller passed $RIG=whatsapp_automation here instead).
+eq "AC1: HQ bead_city + wa-rig branch -> gastown.dog (NOT wa-worker — the reported bug)" \
+  "$(gate_fail_restore_route "/city/hq" "$RLJ")" \
+  "gastown.dog"
+
+# Mirror case: a wa-* bead fixed by code delivered from the HQ/gascity repo
+# (gate_resolve_rig_context's own wa-2ddr0 scenario) — must route to
+# wa-worker, the BEAD's home, not gastown.dog.
+eq "mirror: wa bead_city + gascity-rig branch -> wa-worker (NOT gastown.dog)" \
+  "$(gate_fail_restore_route "/city/wa" "$RLJ")" \
+  "wa-worker"
+
+eq "ps bead_city -> ps-worker" \
+  "$(gate_fail_restore_route "/city/ps" "$RLJ")" \
+  "ps-worker"
+
+# AC2: ordinary same-store case (bead_city IS the code rig's own path) —
+# unchanged from today's behavior for every rig.
+eq "AC2: same-store wa bead_city -> wa-worker (normal case unchanged)" \
+  "$(gate_fail_restore_route "/city/wa" "$RLJ")" \
+  "wa-worker"
+eq "AC2: same-store gascity bead_city -> gastown.dog (normal case unchanged)" \
+  "$(gate_fail_restore_route "/city/hq" "$RLJ")" \
+  "gastown.dog"
+
+# AC4: bead_city doesn't reverse-resolve to any registered rig -> UNKNOWN
+# sentinel, never a guess (structurally unreachable via the real call site
+# today, but the pure function itself must still refuse to guess).
+eq "AC4: unregistered bead_city -> UNKNOWN sentinel (not a guess)" \
+  "$(gate_fail_restore_route "/city/nonexistent" "$RLJ")" \
+  "UNKNOWN"
+eq "AC4: empty bead_city -> UNKNOWN sentinel" \
+  "$(gate_fail_restore_route "" "$RLJ")" \
+  "UNKNOWN"
+eq "AC4: empty rig_list_json -> UNKNOWN sentinel (fail-safe, never crashes)" \
+  "$(gate_fail_restore_route "/city/hq" "")" \
+  "UNKNOWN"
+
+# ── 13. ga-u679x2: needs-rebase (NR) arm has the identical sibling defect,
+#    fixed with the same helper — same function (gate_finalize_run), same
+#    "bead returns to pool" scenario, same $BEAD_CITY/$RIG/$RIG_LIST_JSON
+#    already in scope. Conserta a classe, não só a instância citada no bug.
+echo "── 13. ga-u679x2: needs-rebase (NR) arm — sibling defect, same fix ──"
+NR_CLEAR_ARM=$(awk '
+  /GATE_NR_ASSIGNEE_ACTION" = "keep"/ { flag=1 }
+  flag==1 && /^      else$/           { flag=2 }
+  flag==2                             { print }
+  flag==2 && /^      fi$/             { exit }
+' "$DISPATCHER")
+if [ -z "$NR_CLEAR_ARM" ]; then
+  bad "NR_CLEAR_ARM extraction produced nothing — anchor/indentation drifted, cannot verify wiring"
+else
+  if printf '%s' "$NR_CLEAR_ARM" | grep -F '_NR_ROUTE=$(gate_fail_restore_route "$BEAD_CITY" "$RIG_LIST_JSON")' >/dev/null; then
+    ok "needs-rebase arm computes the restore route via gate_fail_restore_route, from the bead's own home store (ga-u679x2)"
+  else
+    bad "needs-rebase arm does NOT call gate_fail_restore_route with \$BEAD_CITY — sibling fix missing/renamed (ga-u679x2)"
+  fi
+  if printf '%s' "$NR_CLEAR_ARM" | grep -F '_NR_ROUTE=$(default_pool_route_for_rig "$RIG")' >/dev/null; then
+    bad "needs-rebase arm still computes the restore route from \$RIG directly — ga-u679x2 sibling regression"
+  else
+    ok "needs-rebase arm no longer derives the restore route from \$RIG directly (ga-u679x2)"
+  fi
+  if printf '%s' "$NR_CLEAR_ARM" | grep -F 'if [ "$_NR_ROUTE" = "UNKNOWN" ]; then' >/dev/null; then
+    ok "needs-rebase arm handles gate_fail_restore_route's UNKNOWN sentinel (ga-u679x2)"
+  else
+    bad "needs-rebase arm does NOT handle the UNKNOWN sentinel (ga-u679x2)"
+  fi
 fi
 
 # ── Result ────────────────────────────────────────────────────────────────────

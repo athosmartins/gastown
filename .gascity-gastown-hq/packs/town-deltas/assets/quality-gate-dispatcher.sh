@@ -2570,6 +2570,50 @@ default_pool_route_for_rig() {
   esac
 }
 
+# gate_fail_restore_route <bead_city> <rig_list_json> — pure; selftest-sourceable.
+# ga-u679x2: what gc.routed_to should be RESTORED to when a bead returns to the
+# generic pool after a gate FAIL, derived from the BEAD's OWN home store
+# (bead_city — see resolve_bead_city/gate_resolve_rig_context), never from the
+# CODE rig ($RIG) the failing branch happened to deliver on. The prior code
+# passed $RIG straight to default_pool_route_for_rig above — correct for the
+# ordinary same-store fix, but WRONG whenever a bead is fixed by code living in
+# a DIFFERENT repo (e.g. an HQ ga-* bead delivered on a whatsapp_automation
+# branch): the restore then wrote gc.routed_to=wa-worker, which no wa-worker
+# ever polls for (its self-serve probe only sees its own rig's Dolt DB, and the
+# bead lives in HQ's) and no dog polls for either (dogs probe gc.routed_to=
+# gastown.dog) — the bead went ctx:ready + unassigned + invisible to every pool
+# worker (measured live, ga-u679x2; mirror-image of gate_resolve_rig_context's
+# own wa-2ddr0 case, a wa-* bead fixed from the HQ repo).
+#
+# Reverse-looks-up bead_city's OWN rig name in rig_list_json — the exact same
+# path->name query gate_resolve_rig_context already uses for RIG_PATH ->
+# _RIG_CANON — then feeds that name to default_pool_route_for_rig. For the
+# ordinary same-store case (bead_city == rig_path) this is bit-for-bit
+# identical to the old $RIG-based call (same path, same lookup, same name), so
+# that case is unchanged. Only the cross-store case differs.
+#
+# Echoes "UNKNOWN" (never a guessed route) if bead_city cannot be reverse-
+# mapped to any registered rig. Structurally unreachable in production today —
+# resolve_bead_city only ever returns BEAD_RIG_PATH, RIG_PATH, or GC_CITY, all
+# pre-validated registry paths (gate_resolve_rig_context refuses to proceed on
+# an unresolvable RIG_PATH; "gascity" is itself a registered self-repo rig for
+# GC_CITY) — but the caller must still treat "UNKNOWN" as its own visible
+# third state (ga-u679x2 ACEITE: "se a rota original não puder ser
+# determinada, terceiro estado visível, não um chute") instead of silently
+# substituting the code rig back in, which would just reintroduce this same
+# bug for the one case it can't confidently resolve.
+gate_fail_restore_route() {
+  local bead_city="${1:-}" rig_list_json="${2:-}" name
+  if [ -n "$bead_city" ] && [ -n "$rig_list_json" ]; then
+    name=$(printf '%s' "$rig_list_json" | jq -r --arg p "$bead_city" '.rigs[] | select(.path == $p) | .name' 2>/dev/null | head -1)
+    if [ -n "$name" ]; then
+      default_pool_route_for_rig "$name"
+      return 0
+    fi
+  fi
+  printf 'UNKNOWN'
+}
+
 # gate_clear_assignee_if_holder <bead_id> <city>
 # ga-yd8t6: holder-aware assignee clear. Since bd-98s5c, a plain
 # `bd assign <id> ""` is REFUSED whenever the bead is still a DIFFERENT
@@ -7266,7 +7310,16 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
         _NR_CLEAR_RC=0
         gate_clear_assignee_if_holder "$BEAD_ID" "$BEAD_CITY" || _NR_CLEAR_RC=$?
-        _NR_ROUTE=$(default_pool_route_for_rig "$RIG")
+        # ga-u679x2: route from the BEAD's own home store ($BEAD_CITY), never
+        # from $RIG (the CODE rig) — same sibling defect as the needs-fix arm
+        # below; see gate_fail_restore_route's header for why those diverge.
+        _NR_ROUTE=$(gate_fail_restore_route "$BEAD_CITY" "$RIG_LIST_JSON")
+        _NR_ROUTE_UNKNOWN=0
+        if [ "$_NR_ROUTE" = "UNKNOWN" ]; then
+          _NR_ROUTE_UNKNOWN=1
+          _NR_ROUTE="gastown.dog"
+          log "  ga-u679x2: could not reverse-resolve bead_city='$BEAD_CITY' to any registered rig — falling back to gastown.dog (safe default), NOT guessing from code rig '$RIG'."
+        fi
         bd -C "$BEAD_CITY" update "$BEAD_ID" --set-metadata "gc.routed_to=$_NR_ROUTE" -q 2>/dev/null || true
         # ga-39l9z2: same "verify, don't assume" discipline as the needs-fix
         # pool-return arm below (ga-p5q3/ga-f54ui) — a post-write read
@@ -7312,7 +7365,9 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
             _NR_QUEUED_OBS="gate:queued=left untouched (clear unverified)"
           fi
         fi
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (merge-mechanical, ga-39l9z2) — labeled gate:needs-rebase; NOT counted as a gate:fix-attempt, since the reviewers already approved this content (GATE_SHA_FAIL_CLASS=$GATE_SHA_FAIL_CLASS). story:in-flight + gate:reviewing cleared. gc.routed_to restored to $_NR_ROUTE so pool workers can self-serve this bead — verified post-write, not assumed: $_NR_ROUTE_OBS; $_NR_ASSIGNEE_OBS; $_NR_STATUS_OBS; $_NR_QUEUED_OBS. Rebase onto current main and re-run /gate-done (no code changes needed)." 2>/dev/null || true
+        _NR_ROUTE_UNKNOWN_NOTE=""
+        [ "$_NR_ROUTE_UNKNOWN" = "1" ] && _NR_ROUTE_UNKNOWN_NOTE=" NOTE: bead_city='$BEAD_CITY' did not reverse-resolve to any registered rig — route defaulted to gastown.dog rather than guessed (ga-u679x2)."
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (merge-mechanical, ga-39l9z2) — labeled gate:needs-rebase; NOT counted as a gate:fix-attempt, since the reviewers already approved this content (GATE_SHA_FAIL_CLASS=$GATE_SHA_FAIL_CLASS). story:in-flight + gate:reviewing cleared. gc.routed_to restored to $_NR_ROUTE (from the bead's own home store, ga-u679x2) so pool workers can self-serve this bead — verified post-write, not assumed: $_NR_ROUTE_OBS; $_NR_ASSIGNEE_OBS; $_NR_STATUS_OBS; $_NR_QUEUED_OBS.$_NR_ROUTE_UNKNOWN_NOTE Rebase onto current main and re-run /gate-done (no code changes needed)." 2>/dev/null || true
       fi
     elif [ "$GATE_SHA_STALE_ACTION" = "stale" ]; then
       # (d) STALE REVIEW (ga-l7mvtw) — the branch has moved past the commit
@@ -7537,7 +7592,16 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         # hand (rig -> default pool template) — see default_pool_route_for_rig
         # above for the mapping and why it is duplicated, not shared, with
         # pilot-dispatcher.sh's rig_to_builder()+wa_worker_template().
-        _GFAIL_ROUTE=$(default_pool_route_for_rig "$RIG")
+        # ga-u679x2: route from the BEAD's own home store ($BEAD_CITY), never
+        # from $RIG (the CODE rig) — see gate_fail_restore_route's header for
+        # why those two diverge and what happened when this used $RIG.
+        _GFAIL_ROUTE=$(gate_fail_restore_route "$BEAD_CITY" "$RIG_LIST_JSON")
+        _GFAIL_ROUTE_UNKNOWN=0
+        if [ "$_GFAIL_ROUTE" = "UNKNOWN" ]; then
+          _GFAIL_ROUTE_UNKNOWN=1
+          _GFAIL_ROUTE="gastown.dog"
+          log "  ga-u679x2: could not reverse-resolve bead_city='$BEAD_CITY' to any registered rig — falling back to gastown.dog (safe default), NOT guessing from code rig '$RIG'."
+        fi
         bd -C "$BEAD_CITY" update "$BEAD_ID" --set-metadata "gc.routed_to=$_GFAIL_ROUTE" -q 2>/dev/null || true
         # Verify the write actually stuck (ga-p5q3 error-vs-empty discipline) — a
         # post-write READ failure must never be reported as "restore failed"; it is
@@ -7589,7 +7653,9 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
             _GFAIL_QUEUED_OBS="gate:queued=left untouched (clear unverified)"
           fi
         fi
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) cleared. gc.routed_to restored to $_GFAIL_ROUTE so pool workers can self-serve this bead (ga-f54ui) — verified post-write, not assumed: $_GFAIL_ROUTE_OBS; $_GFAIL_ASSIGNEE_OBS; $_GFAIL_STATUS_OBS; $_GFAIL_QUEUED_OBS (ga-39l9z2). The Pilot will also re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
+        _GFAIL_ROUTE_UNKNOWN_NOTE=""
+        [ "$_GFAIL_ROUTE_UNKNOWN" = "1" ] && _GFAIL_ROUTE_UNKNOWN_NOTE=" NOTE: bead_city='$BEAD_CITY' did not reverse-resolve to any registered rig — route defaulted to gastown.dog rather than guessed (ga-u679x2)."
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) cleared. gc.routed_to restored to $_GFAIL_ROUTE (from the bead's own home store, ga-u679x2) so pool workers can self-serve this bead (ga-f54ui) — verified post-write, not assumed: $_GFAIL_ROUTE_OBS; $_GFAIL_ASSIGNEE_OBS; $_GFAIL_STATUS_OBS; $_GFAIL_QUEUED_OBS (ga-39l9z2).$_GFAIL_ROUTE_UNKNOWN_NOTE The Pilot will also re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
       fi
     fi
   fi
@@ -12035,11 +12101,22 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     # pool for a fresh worker" design is correct there; only the transient
     # case was ever misrouted.
     if [ "$REBASE_AUTHOR_IS_POOL" = "1" ] && [ "$CONFLICT_KIND" != "transient" ]; then
-      warn "Branch $BRANCH: rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity (ga-tz0op) — no fixed instance to wait for or nudge. Returning source bead to the ${RIG:-unknown} pool for a fresh worker instead of circuit-breaking or bouncing to a dead identity."
+      # ga-u679x2: resolved BEFORE the warn/marker-comment below (not just at
+      # the point of the actual write further down) so those two diagnostics
+      # name the pool the bead is ACTUALLY being routed to, not $RIG (the CODE
+      # rig) — narrating $RIG there would silently diverge from the real
+      # gc.routed_to write whenever bead_city != rig_path, the exact
+      # narrated-intent-vs-executed-action gap this whole fix exists to close.
+      # Pure computation (no bd calls), safe to run even when BEAD_ID is empty.
+      _TZ0OP_ROUTE=$(gate_fail_restore_route "$BEAD_CITY" "$RIG_LIST_JSON")
+      if [ "$_TZ0OP_ROUTE" = "UNKNOWN" ]; then
+        _TZ0OP_ROUTE="gastown.dog"
+        log "  ga-u679x2: could not reverse-resolve bead_city='$BEAD_CITY' to any registered rig — falling back to gastown.dog (safe default), NOT guessing from code rig '${RIG:-}'."
+      fi
+      warn "Branch $BRANCH: rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity (ga-tz0op) — no fixed instance to wait for or nudge. Returning source bead to the $_TZ0OP_ROUTE pool for a fresh worker instead of circuit-breaking or bouncing to a dead identity."
       set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
-      bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED (ga-tz0op): branch $BRANCH needs a rebase, but its resolved rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity (virtual slot label, bare template, or a recycled pool instance) — structurally never a fixed session to wait for or notify (NOT the same as a dead named author; NOT the same as a live one to bounce to). Source bead $BEAD_ID returned to the ${RIG:-unknown} pool for a fresh worker to rebase and resubmit." 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED (ga-tz0op): branch $BRANCH needs a rebase, but its resolved rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity (virtual slot label, bare template, or a recycled pool instance) — structurally never a fixed session to wait for or notify (NOT the same as a dead named author; NOT the same as a live one to bounce to). Source bead $BEAD_ID returned to the $_TZ0OP_ROUTE pool for a fresh worker to rebase and resubmit." 2>/dev/null || true
       if [ -n "$BEAD_ID" ]; then
-        _TZ0OP_ROUTE=$(default_pool_route_for_rig "${RIG:-}")
         bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-rebase"  -q 2>/dev/null || true
         bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"    -q 2>/dev/null || true
         bd -C "$BEAD_CITY" assign       "$BEAD_ID" ""                   -q 2>/dev/null || true
