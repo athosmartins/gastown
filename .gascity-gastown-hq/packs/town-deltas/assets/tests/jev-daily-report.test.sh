@@ -19,6 +19,9 @@
 #   T8 every ntfy goes out with NOTIFY_FORCE_PUSH=1 (ga-9wimr7): notify's default
 #      route is the digest, and on 23/09 the real report landed there, never on
 #      the phone. Checked on the success path AND on a failure path.
+#   T9 (ga-aijm2v.3/F5) the gate-verdict join step runs before the report AND is
+#      fail-open: a join failure is logged to gate-verdict-join.log but never
+#      blocks or changes the report/ntfy outcome (same rc/calls as T1).
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -40,6 +43,22 @@ cat >"$T/bin/notify" <<'EOF'
 EOF
 chmod +x "$T/bin/notify"
 
+# ga-aijm2v.3 (F5): every test below MUST override the gate-verdict join script --
+# without this, jev-daily-report.sh's new default ($HQ/scripts/jev_gate_verdict_experiment.py)
+# would run for real here: live `gc rig list`, live `bd show`, live git, live production
+# quality-gate.jsonl. This stub keeps the whole suite hermetic. RUN_JOIN lets T9 swap in a
+# failing stub without touching this default.
+cat >"$T/join-ok.py" <<'EOF'
+#!/usr/bin/env python3
+print("jev_gate_verdict_experiment: considered=0 logged=0 skipped_dup=0 other_skips=0")
+EOF
+cat >"$T/join-fail.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+print("jev_gate_verdict_experiment: simulated failure (ga-aijm2v.3 T9)", file=sys.stderr)
+sys.exit(1)
+EOF
+
 # 2 control + 2 experiment on 2026-09-20: one suppressed by a working Jev
 # (300 in / 20 out tokens), one fired because Jev had no credentials.
 cat >"$T/log.jsonl" <<'EOF'
@@ -52,8 +71,9 @@ EOF
 
 run() {  # run [date-arg...] with the sandboxed env; sets RC
   : >"$T/notify.log"
+  rm -f "$T/out/gate-verdict-join.log"
   env -u NOTIFY_FORCE_PUSH PATH="$T/bin:$PATH" NOTIFY_LOG="$T/notify.log" JEV_EXPERIMENT_LOG="${RUN_LOG:-$T/log.jsonl}" \
-      JEV_DAILY_OUT_DIR="$T/out" JEV_REPORT="${RUN_REPORT:-$REPORT}" \
+      JEV_DAILY_OUT_DIR="$T/out" JEV_REPORT="${RUN_REPORT:-$REPORT}" JEV_GATE_VERDICT_JOIN="${RUN_JOIN:-$T/join-ok.py}" \
       bash "$SCRIPT" "$@" >"$T/stdout" 2>&1
   RC=$?
 }
@@ -75,6 +95,9 @@ case "$N" in *"Custo do Jev (medido): 300 + 20 tokens."*) ok "T1 measured Jev co
 case "$N" in *"Jev indisponível em 1 de 2 alerta(s)"*) ok "T1 warns the day's number is understated (Jev unavailable 1/2)" ;; *) nok "T1 unavailable warning" "$N" ;; esac
 case "$N" in *"2026-09-21"*) nok "T1 day filter" "another day's event leaked: $N" ;; *) ok "T1 only the requested UTC day is counted" ;; esac
 case "$N" in *"FORCE=1"*) ok "T8 the daily result is sent with NOTIFY_FORCE_PUSH=1 (phone, not digest)" ;; *) nok "T8 force push (result)" "$N" ;; esac
+grep -q 'considered=0' "$T/out/gate-verdict-join.log" 2>/dev/null \
+  && ok "T9 gate-verdict join step ran before the report (join-ok stub's own output captured)" \
+  || nok "T9 join ran" "$(cat "$T/out/gate-verdict-join.log" 2>&1)"
 
 # T2
 run 2026-09-25
@@ -119,6 +142,19 @@ N="$(cat "$T/notify.log")"
 if [ "$RC" -ne 0 ] && [ "$(calls)" -eq 1 ]; then ok "T7 garbled day -> exit != 0 and one ntfy"; else nok "T7 rc/calls" "rc=$RC calls=$(calls)"; fi
 case "$N" in *"Dia inválido"*) ok "T7 ntfy names the invalid day" ;; *) nok "T7 text" "$N" ;; esac
 ls "$T/out" | grep -q garbage && nok "T7 no report file" "a report was written for the garbled day" || ok "T7 no report written for the garbled day"
+
+# T9b: a FAILING join script must never block or change the report/ntfy outcome --
+# same rc/calls as T1, and the failure is captured in gate-verdict-join.log for a human
+# to notice later, never surfaced as a report/ntfy failure.
+RUN_JOIN="$T/join-fail.py" run 2026-09-20
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T9b failing join step still yields exit 0, exactly one ntfy (fail-open)"; else nok "T9b rc/calls" "rc=$RC calls=$(calls)"; fi
+grep -q 'Jev experiment report — 2026-09-20' "$T/out/2026-09-20.txt" 2>/dev/null \
+  && ok "T9b report still generated despite the join failure" || nok "T9b report file" "$(cat "$T/out/2026-09-20.txt" 2>&1)"
+grep -q 'simulated failure' "$T/out/gate-verdict-join.log" 2>/dev/null \
+  && ok "T9b join failure captured in gate-verdict-join.log" || nok "T9b join failure logged" "$(cat "$T/out/gate-verdict-join.log" 2>&1)"
+grep -q 'exited non-zero' "$T/out/gate-verdict-join.log" 2>/dev/null \
+  && ok "T9b jev-daily-report.sh itself notes the non-zero exit" || nok "T9b non-zero note" "$(cat "$T/out/gate-verdict-join.log" 2>&1)"
 
 echo ""
 echo "jev-daily-report tests: $PASS passed, $FAIL failed"

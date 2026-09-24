@@ -36,6 +36,15 @@ esac
 
 mkdir -p "$OUT_DIR"
 
+# ga-aijm2v.3 (F5): best-effort join of new gate-verdict shadow predictions before the
+# report runs, so today's numbers include them. NEVER allowed to block the report --
+# a join failure (Dolt hiccup, unresolvable rig, git object pruned) just leaves that one
+# gate run unmeasured, it says nothing about whether the report itself can run.
+JOIN_SCRIPT="${JEV_GATE_VERDICT_JOIN:-$HQ/scripts/jev_gate_verdict_experiment.py}"
+if ! python3 "$JOIN_SCRIPT" run >>"$OUT_DIR/gate-verdict-join.log" 2>&1; then
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) jev_gate_verdict_experiment.py run exited non-zero, see $OUT_DIR/gate-verdict-join.log" >>"$OUT_DIR/gate-verdict-join.log"
+fi
+
 if ! python3 "$REPORT" --date "$DAY" >"$OUT_DIR/$DAY.txt" 2>&1; then
   notify -t "Jev: relatório de $DAY falhou" "Detalhe em $OUT_DIR/$DAY.txt"
   exit 1
