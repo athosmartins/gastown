@@ -125,7 +125,21 @@
 #                             city-wide outage must survive a session restart, so
 #                             this is mail, not a nudge (see mail-lifecycle
 #                             doctrine: "if the recipient dies and restarts, do
-#                             they need this message? yes -> mail").
+#                             they need this message? yes -> mail"). Once
+#                             sustain-confirmed, this durable mail does NOT
+#                             then repeat on every subsequent CRITICAL cycle
+#                             (ga-4f4opx — the sustain gate alone stayed true
+#                             forever once confirmed, producing one Mayor mail
+#                             per 5min cycle: measured 32 of 65 Mayor mails in
+#                             one night, same disk event). Re-mail requires a
+#                             new relevant minimum (avail drops by
+#                             >= CRITICAL_MAIL_MIN_DROP_GB, default 1GB) or
+#                             CRITICAL_MAIL_COOLDOWN_SECS (default 2h) since
+#                             the last mail — see _should_mail_critical. The
+#                             FIRST recovery cycle after an episode that
+#                             actually mailed the Mayor also sends exactly one
+#                             RECOVERED mail (_maybe_mail_recovery) and resets
+#                             the debounce state for the next episode.
 #
 # Absolute-GB floors (not percent, unlike disk-pressure-monitor's WARN/EMERGENCY/
 # HALT_IMMINENT_PCT): a %-based floor can look "fine" on a large disk while the
@@ -320,6 +334,33 @@ STATE_AVAIL_FILE="$STATE_DIR/.dolt-disk-floor-guard.last-notify-avail-gb"
 # confirmation window — mirrors ram-pressure-monitor.sh's RPM_EMERGENCY_SUSTAIN.
 CRITICAL_MAIL_SUSTAIN="${DOLT_DISK_FLOOR_CRITICAL_MAIL_SUSTAIN:-2}"
 STATE_CRITICAL_SUSTAIN_FILE="$STATE_DIR/.dolt-disk-floor-guard.critical-sustain-count"
+
+# ga-4f4opx: once CRITICAL_MAIL_SUSTAIN first confirms and mails the Mayor,
+# this guard used to mail AGAIN on every single subsequent CRITICAL cycle —
+# `pending` (above) only grows and _sustain_confirmed stays true forever once
+# the streak crosses the threshold, so a CRITICAL condition that persisted
+# overnight (5min StartInterval) produced one Mayor mail EVERY cycle: measured
+# 32 of 65 Mayor mails in one night, all re-reporting the SAME disk event
+# (ga-6gp0a6) with the "for N consecutive cycles" count as the only thing that
+# changed. Re-mail (after the first sustain-confirmed one) is now gated the
+# same shape as the WARN-tier notify below (_should_notify: cooldown OR
+# worsening) but on its OWN, longer cooldown, its OWN drop threshold, and its
+# OWN state track (STATE_LAST_MAIL_*) — this channel wakes the Mayor, the
+# WARN-tier NOTIFY-cooldown state above does not, and the two must never
+# share a debounce clock. Defaults (2h / 1GB) are this bead's own stated
+# policy ("passar 2h desde o último aviso" / "cair mais 1GB"), not yet tuned
+# against production history. NOTIFY itself is UNCHANGED by this — still
+# unconditional on every CRITICAL cycle (imp07), only the DURABLE mail is
+# further debounced here, on top of (not instead of) the sustain gate above.
+CRITICAL_MAIL_COOLDOWN_SECS="${DOLT_DISK_FLOOR_CRITICAL_MAIL_COOLDOWN_SECS:-7200}"
+CRITICAL_MAIL_MIN_DROP_GB="${DOLT_DISK_FLOOR_CRITICAL_MAIL_MIN_DROP_GB:-1}"
+STATE_LAST_MAIL_EPOCH_FILE="$STATE_DIR/.dolt-disk-floor-guard.last-mail-epoch"
+STATE_LAST_MAIL_AVAIL_FILE="$STATE_DIR/.dolt-disk-floor-guard.last-mail-avail-gb"
+# Tracks whether THIS CRITICAL episode ever actually mailed the Mayor, so a
+# recovery mail only fires when there's something to close out — never for a
+# WARN/CRITICAL dip the Mayor was never told about (ga-4f4opx: "manter ... o
+# [aviso] de recuperação").
+STATE_CRITICAL_EPISODE_MAILED_FILE="$STATE_DIR/.dolt-disk-floor-guard.critical-episode-mailed"
 
 # ga-f4l2z: bound on `gc dolt start` when resurrecting a CONFIRMED-down Dolt
 # (see _resurrect_dolt). Not yet measured for a cold start specifically after
@@ -557,6 +598,33 @@ _should_notify() {
   local last_epoch="$1" now="$2" cooldown="$3" current="$4" last_avail="$5"
   _cooldown_elapsed "$last_epoch" "$now" "$cooldown" && return 0
   _worsening "$current" "$last_avail"
+}
+
+# _should_mail_critical <last_mail_epoch> <now> <cooldown_secs> <current_avail>
+#   <last_mail_avail> <min_drop_gb> → 0 (true, mail again) when there is no
+# valid prior-mail record for this episode (fail-open via _cooldown_elapsed's
+# own no-prior-timestamp case — the first sustain-confirmed mail of an episode
+# must never be blocked by this gate) OR the mail-specific cooldown elapsed OR
+# avail has dropped by at least min_drop_gb since the last mail (a "new
+# relevant minimum" — ga-4f4opx acceptance criteria (a)/(b): re-mail only on a
+# new minimum, or after 2h, while CRITICAL persists). Deliberately a SEPARATE
+# function/state track from _should_notify above, never reusing its cooldown
+# or its worsening direction — this gates the Mayor-mail channel specifically,
+# on its own (longer) cooldown and its own drop threshold; conflating the two
+# would make the WARN-tier push cadence and the CRITICAL-tier mail cadence
+# move together, which they must not (see this file's own CRITICAL_MAIL_
+# COOLDOWN_SECS comment). A non-numeric/empty current can't actually reach
+# this call (main() returns before this point when class=UNKNOWN — see
+# _floor_class's own UNKNOWN handling), but is still checked here (fails
+# closed on the drop check only, not the cooldown check) so this function
+# stays safe to unit-test and to call in isolation, same discipline
+# _sustain_confirmed's own comment documents for this file.
+_should_mail_critical() {
+  local last_mail_epoch="$1" now="$2" cooldown="$3" current="$4" last_mail_avail="$5" min_drop="$6"
+  _cooldown_elapsed "$last_mail_epoch" "$now" "$cooldown" && return 0
+  case "$last_mail_avail" in ''|*[!0-9]*) return 1 ;; esac
+  case "$current" in ''|*[!0-9]*) return 1 ;; esac
+  [ $(( last_mail_avail - current )) -ge "$min_drop" ]
 }
 
 # _sustain_confirmed <pending_count> <threshold> → 0 (true) once pending_count
@@ -976,6 +1044,69 @@ _read_critical_sustain() {
 _write_critical_sustain() {
   mkdir -p "$STATE_DIR" 2>/dev/null || true
   echo "$1" > "$STATE_CRITICAL_SUSTAIN_FILE" 2>/dev/null || true
+}
+
+# _read_last_mail_state / _write_last_mail_state / _clear_last_mail_state
+# (ga-4f4opx) — persist when the Mayor was last actually MAILED for a
+# CRITICAL episode and at what avail, mirroring _read_state/_write_state's
+# own global-side-effect shape above but on a SEPARATE state track (see
+# CRITICAL_MAIL_COOLDOWN_SECS's own comment for why this must never share
+# the WARN-tier notify cooldown files). Missing state reads as empty (never
+# mailed yet this episode), which _should_mail_critical's own
+# _cooldown_elapsed call already treats as fail-open (mail).
+_read_last_mail_state() {
+  _LAST_MAIL_EPOCH=""; _LAST_MAIL_AVAIL=""
+  [ -f "$STATE_LAST_MAIL_EPOCH_FILE" ] && _LAST_MAIL_EPOCH="$(cat "$STATE_LAST_MAIL_EPOCH_FILE" 2>/dev/null)"
+  [ -f "$STATE_LAST_MAIL_AVAIL_FILE" ] && _LAST_MAIL_AVAIL="$(cat "$STATE_LAST_MAIL_AVAIL_FILE" 2>/dev/null)"
+}
+
+_write_last_mail_state() {
+  local epoch="$1" avail="$2"
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  echo "$epoch" > "$STATE_LAST_MAIL_EPOCH_FILE" 2>/dev/null || true
+  echo "$avail" > "$STATE_LAST_MAIL_AVAIL_FILE" 2>/dev/null || true
+}
+
+_clear_last_mail_state() {
+  rm -f "$STATE_LAST_MAIL_EPOCH_FILE" "$STATE_LAST_MAIL_AVAIL_FILE" 2>/dev/null || true
+}
+
+# _read_critical_episode_mailed / _write_critical_episode_mailed (ga-4f4opx) —
+# same shape/fail-direction as _read_critical_sustain/_write_critical_sustain
+# above (missing/corrupt state reads as "0" — no episode mail sent — never as
+# "1", since a corrupt flag must not fabricate a recovery mail for an episode
+# the Mayor was never actually told about).
+_read_critical_episode_mailed() {
+  local f="$STATE_CRITICAL_EPISODE_MAILED_FILE" v
+  v="$([ -f "$f" ] && cat "$f" 2>/dev/null)"
+  case "$v" in 1) echo 1 ;; *) echo 0 ;; esac
+}
+
+_write_critical_episode_mailed() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  echo "$1" > "$STATE_CRITICAL_EPISODE_MAILED_FILE" 2>/dev/null || true
+}
+
+# _maybe_mail_recovery <avail> <now> (ga-4f4opx) — sends ONE recovery mail to
+# the Mayor the first non-CRITICAL cycle observed after this guard already
+# mailed at least one CRITICAL alert this episode. No-op when no CRITICAL
+# mail went out this episode — nothing for the Mayor to be told is over,
+# same "don't alert on what nobody was told about" principle
+# _sustain_confirmed's own gate already applies to the FIRST mail. Clears the
+# mail-debounce state too, so the NEXT CRITICAL episode's first mail is
+# unconditional again (fail-open via _should_mail_critical's own
+# no-prior-record case), exactly like a brand-new episode — never carries a
+# stale "last mailed at Xgb" comparison across a recovery gap. Never gated by
+# ENABLED (same "notification is never gated by the reclaim kill switch"
+# invariant this file's header already documents for NOTIFY/mail above).
+_maybe_mail_recovery() {
+  local avail="$1" now="$2"
+  [ "$(_read_critical_episode_mailed)" = "1" ] || return 0
+  local mail_body="dolt-disk-floor-guard: Dolt data-dir RECOVERED — avail is now ${avail}GB, back above the CRITICAL floor (${FLOOR_CRITICAL_GB}GB). This closes the CRITICAL episode reported by the earlier mail(s) above."
+  "$GC" mail send mayor -s "Dolt disk-floor RECOVERED: avail=${avail}GB" -m "$mail_body" 2>/dev/null || log "WARN: gc mail send mayor (recovery) failed"
+  _write_critical_episode_mailed 0
+  _clear_last_mail_state
+  log "CRITICAL episode recovered (avail=${avail}GB) — mailed Mayor recovery notice, cleared mail-debounce state"
 }
 
 # _safe_reclaim <before_avail_gb> → best-effort `gc dolt-cleanup --force` (orphan
@@ -2066,6 +2197,7 @@ main() {
   if [ "$class" = "NONE" ]; then
     log "avail=${avail}GB > floor(warn=${FLOOR_WARN_GB}GB) — OK"
     _write_critical_sustain 0
+    _maybe_mail_recovery "$avail" "$now"
     return 0
   fi
 
@@ -2131,8 +2263,13 @@ main() {
   # ram-pressure-monitor.sh resetting its own EMERGENCY sustain count on
   # every OK *and* every WARN-but-not-EMERGENCY sample. Placed once here
   # (rather than in each of the three exits) so it can't be missed if a
-  # future edit adds a fourth.
-  [ "$was_critical" = "0" ] && _write_critical_sustain 0
+  # future edit adds a fourth. ga-4f4opx: the same single spot is where a
+  # CRITICAL episode's recovery is detected, so the recovery-mail check
+  # (no-op unless this episode actually mailed) lives right alongside it.
+  if [ "$was_critical" = "0" ]; then
+    _write_critical_sustain 0
+    _maybe_mail_recovery "$avail" "$now"
+  fi
 
   if [ "$class" = "NONE" ] && [ "$was_critical" = "0" ]; then
     log "avail=${avail}GB back above floor after reclaim — no notify needed"
@@ -2224,7 +2361,18 @@ main() {
       local pending; pending=$(( $(_read_critical_sustain) + 1 ))
       _write_critical_sustain "$pending"
       if _sustain_confirmed "$pending" "$CRITICAL_MAIL_SUSTAIN"; then
-        log "CRITICAL sustain confirmed (${pending}/${CRITICAL_MAIL_SUSTAIN} consecutive cycles) — mailing Mayor"
+        # ga-4f4opx: sustain-confirmed no longer mails unconditionally on
+        # EVERY subsequent CRITICAL cycle — that was the actual bug (32 of 65
+        # Mayor mails in one night, one per 5min cycle, same disk event).
+        # Gate the repeat mail on its own cooldown/new-minimum track; the
+        # FIRST sustain-confirmed mail of an episode always goes out
+        # regardless (no prior record → _should_mail_critical's own
+        # _cooldown_elapsed fail-open).
+        _read_last_mail_state
+        if ! _should_mail_critical "$_LAST_MAIL_EPOCH" "$now" "$CRITICAL_MAIL_COOLDOWN_SECS" "$avail" "$_LAST_MAIL_AVAIL" "$CRITICAL_MAIL_MIN_DROP_GB"; then
+          log "CRITICAL sustain confirmed (${pending}/${CRITICAL_MAIL_SUSTAIN}) but re-mail SUPPRESSED (ga-4f4opx): avail=${avail}GB vs last-mailed=${_LAST_MAIL_AVAIL:-none}GB (need -${CRITICAL_MAIL_MIN_DROP_GB}GB new minimum), last mail <${CRITICAL_MAIL_COOLDOWN_SECS}s ago. notify above already fired unconditionally."
+        else
+        log "CRITICAL sustain confirmed (${pending}/${CRITICAL_MAIL_SUSTAIN} consecutive cycles) — mailing Mayor (avail=${avail}GB last-mailed=${_LAST_MAIL_AVAIL:-none}GB)"
         # ga-sfj3i.3: same exhaustive four-way split as the short `diagnosis`
         # above, expanded to a full paragraph for the durable mail channel.
         # Opposite remedies (file cleanup vs reduce RAM pressure) must never
@@ -2281,6 +2429,9 @@ ga-ofi307 — catches a new large consumer, the way bash-edit-diff's 3.5GB cache
 bead, before a human has to find it by hand):
 ${top_disk:-  (unmeasured — no known roots present or du failed)}"
         "$GC" mail send mayor -s "Dolt disk-floor CRITICAL: avail=${avail}GB" -m "$mail_body" 2>/dev/null || log "WARN: gc mail send mayor failed"
+        _write_last_mail_state "$now" "$avail"
+        _write_critical_episode_mailed 1
+        fi
       else
         log "CRITICAL sample ${pending}/${CRITICAL_MAIL_SUSTAIN} — PENDING, not yet mailing Mayor (single-cycle dip may self-recover; notify above already fired unconditionally)"
       fi

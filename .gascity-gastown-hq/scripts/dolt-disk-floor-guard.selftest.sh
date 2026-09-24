@@ -100,6 +100,21 @@ _sustain_confirmed "" 2  && bad "sustain_confirmed: empty pending should fail CL
 _sustain_confirmed abc 2 && bad "sustain_confirmed: non-numeric pending should fail CLOSED"              || ok "sustain_confirmed: non-numeric pending → fails closed"
 _sustain_confirmed 1 1   && ok "sustain_confirmed: threshold=1 (sustain disabled/immediate) → confirmed on 1st sample" || bad "sustain_confirmed: 1>=1 should confirm"
 
+# ── _should_mail_critical (ga-4f4opx): the CRITICAL-mail REPEAT-debounce gate
+#    — cooldown-elapsed OR a new relevant minimum (avail dropped by
+#    >= min_drop since the last mail). A SEPARATE track from _should_notify
+#    (different state, different cooldown) even though the shape rhymes. ────
+_should_mail_critical 1000 1100 7200 2 2 1   && bad "should_mail_critical: within cooldown, unchanged avail, no new minimum → should suppress" || ok "should_mail_critical: within cooldown + stable avail → suppressed (the actual ga-4f4opx bug, now fixed)"
+_should_mail_critical 1000 8201 7200 2 2 1   && ok "should_mail_critical: cooldown elapsed (7201s >= 7200s) → mail again even at unchanged avail" || bad "should_mail_critical: elapsed cooldown should re-mail regardless of trend"
+_should_mail_critical 1000 8200 7200 2 2 1   && ok "should_mail_critical: exactly 7200s elapsed → elapsed (boundary >=, matches _cooldown_elapsed)" || bad "should_mail_critical: boundary should be inclusive"
+_should_mail_critical 1000 1100 7200 1 2 1   && ok "should_mail_critical: within cooldown BUT avail dropped by >=1GB (2→1) → new minimum, mail again" || bad "should_mail_critical: a 1GB drop should be a new relevant minimum"
+_should_mail_critical 1000 1100 7200 2 3 1   && ok "should_mail_critical: within cooldown, avail dropped 3→2 (>=1GB) → new minimum, mail again" || bad "should_mail_critical: a 1GB drop (3->2) should count"
+_should_mail_critical 1000 1100 7200 2 3 2   && bad "should_mail_critical: drop of 1GB (3->2) below a 2GB min_drop threshold should NOT count" || ok "should_mail_critical: drop below configured min_drop_gb → not a new minimum"
+_should_mail_critical 1000 1100 7200 3 2 1   && bad "should_mail_critical: avail IMPROVED (2→3) within cooldown should NOT re-mail" || ok "should_mail_critical: improved avail (not worse) within cooldown → suppressed"
+_should_mail_critical "" 1100 7200 2 "" 1    && ok "should_mail_critical: no prior mail record → mail (fail-open; the FIRST sustain-confirmed mail of an episode must never be blocked)" || bad "should_mail_critical: first-ever mail should never be suppressed"
+_should_mail_critical 1000 1100 7200 2 "" 1  && bad "should_mail_critical: within cooldown + corrupt/empty last_mail_avail should fail CLOSED on the drop check (not fabricate a drop)" || ok "should_mail_critical: empty last_mail_avail (within cooldown) → drop check fails closed, suppressed"
+_should_mail_critical 1000 1100 7200 "" 2 1  && bad "should_mail_critical: within cooldown + non-numeric current avail should fail CLOSED on the drop check" || ok "should_mail_critical: non-numeric current avail (within cooldown) → drop check fails closed, suppressed"
+
 # ── _should_resurrect (ga-f4l2z): gate on CONFIRMED-down (probe_rc=1, the
 #    gc_dolt_probe_robust "unreachable, confirmed" code) AND disk headroom
 #    safe (class NONE/WARN only — NEVER CRITICAL: the crash-loop risk this
@@ -1744,6 +1759,18 @@ STATE_AVAIL_FILE="$STATE_TMP/.last-notify-avail-gb"
 # $CITY/.gc/logs before this redirect was added).
 STATE_CRITICAL_SUSTAIN_FILE="$STATE_TMP/.critical-sustain-count"
 
+# ga-4f4opx: same MUST-redirect trap as STATE_CRITICAL_SUSTAIN_FILE's own
+# comment immediately above documents, and this suite repeated it live once
+# already (first draft of THIS bead's tests leaked
+# `.dolt-disk-floor-guard.critical-episode-mailed` into the real
+# $CITY/.gc/logs before this redirect was added — caught via mtime on the
+# real file, matching the exact failure mode the comment above already
+# warns about). All three new state vars are evaluated at SOURCE time
+# against the real $STATE_DIR default, so they MUST be reassigned here too.
+STATE_LAST_MAIL_EPOCH_FILE="$STATE_TMP/.last-mail-epoch"
+STATE_LAST_MAIL_AVAIL_FILE="$STATE_TMP/.last-mail-avail-gb"
+STATE_CRITICAL_EPISODE_MAILED_FILE="$STATE_TMP/.critical-episode-mailed"
+
 # Canned avail-GB readings: main() calls _avail_gb exactly twice per cycle
 # (pre-reclaim, then post-reclaim), both via `$(...)` command substitution —
 # which forks a SUBSHELL, so a shell-variable/array queue popped inside
@@ -1969,7 +1996,16 @@ record_gc() {
 # shellcheck disable=SC2034  # read by main() in the sourced script
 GC=record_gc
 
-reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; REAP_GO_BUILD_CALLS=0; REAP_CODE_SIGN_CLONE_CALLS=0; REAP_BASH_EDIT_DIFF_CALLS=0; REAP_ORPHAN_TEST_DOLT_CALLS=0; REAP_BACKUP_RESIDUE_CALLS=0; REAP_BACKUP_STAGING_CALLS=0; REAP_BACKUP_STAGING_LAST_ARG=""; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; }
+reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; REAP_GO_BUILD_CALLS=0; REAP_CODE_SIGN_CLONE_CALLS=0; REAP_BASH_EDIT_DIFF_CALLS=0; REAP_ORPHAN_TEST_DOLT_CALLS=0; REAP_BACKUP_RESIDUE_CALLS=0; REAP_BACKUP_STAGING_CALLS=0; REAP_BACKUP_STAGING_LAST_ARG=""; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0;
+  # ga-4f4opx: clear the mail-debounce/recovery state too, so every scenario
+  # starts with a clean slate by default (no leftover "already mailed this
+  # avail" or "episode already mailed" from whichever scenario ran before
+  # it) unless it explicitly opts in via seed_last_mail/
+  # seed_critical_episode_mailed below — mirrors seed_state/
+  # seed_critical_sustain's own explicit-seed convention, just defaulted to
+  # empty here since reset_capture already runs at the top of every scenario.
+  rm -f "$STATE_LAST_MAIL_EPOCH_FILE" "$STATE_LAST_MAIL_AVAIL_FILE" "$STATE_CRITICAL_EPISODE_MAILED_FILE";
+}
 seed_state() {
   if [ -n "$1" ]; then echo "$1" > "$STATE_EPOCH_FILE"; else rm -f "$STATE_EPOCH_FILE"; fi
   if [ -n "$2" ]; then echo "$2" > "$STATE_AVAIL_FILE"; else rm -f "$STATE_AVAIL_FILE"; fi
@@ -1981,6 +2017,19 @@ seed_critical_sustain() {
   if [ -n "$1" ]; then echo "$1" > "$STATE_CRITICAL_SUSTAIN_FILE"; else rm -f "$STATE_CRITICAL_SUSTAIN_FILE"; fi
 }
 read_critical_sustain_state() { [ -f "$STATE_CRITICAL_SUSTAIN_FILE" ] && cat "$STATE_CRITICAL_SUSTAIN_FILE" || echo ""; }
+
+# ga-4f4opx: seed/read the new mail-debounce + recovery-episode state, same
+# explicit-seed shape as seed_state/seed_critical_sustain above.
+seed_last_mail() {
+  if [ -n "$1" ]; then echo "$1" > "$STATE_LAST_MAIL_EPOCH_FILE"; else rm -f "$STATE_LAST_MAIL_EPOCH_FILE"; fi
+  if [ -n "$2" ]; then echo "$2" > "$STATE_LAST_MAIL_AVAIL_FILE"; else rm -f "$STATE_LAST_MAIL_AVAIL_FILE"; fi
+}
+seed_critical_episode_mailed() {
+  if [ -n "$1" ]; then echo "$1" > "$STATE_CRITICAL_EPISODE_MAILED_FILE"; else rm -f "$STATE_CRITICAL_EPISODE_MAILED_FILE"; fi
+}
+read_last_mail_epoch_state() { [ -f "$STATE_LAST_MAIL_EPOCH_FILE" ] && cat "$STATE_LAST_MAIL_EPOCH_FILE" || echo ""; }
+read_last_mail_avail_state() { [ -f "$STATE_LAST_MAIL_AVAIL_FILE" ] && cat "$STATE_LAST_MAIL_AVAIL_FILE" || echo ""; }
+read_critical_episode_mailed_state() { [ -f "$STATE_CRITICAL_EPISODE_MAILED_FILE" ] && cat "$STATE_CRITICAL_EPISODE_MAILED_FILE" || echo ""; }
 
 # Scenario A — repro path (a) from the GATE-FEEDBACK: CRITICAL (2GB) fully
 # recovers to NONE (20GB) after reclaim. Pre-fix, main() hit the early return
@@ -2036,6 +2085,95 @@ else
   else
     bad "main(): streak reset didn't take — next CRITICAL cycle should start at 1/2 (mail_calls=$GC_MAIL_CALLS pending=$(read_critical_sustain_state))"
   fi
+fi
+
+# Scenario A4 — ga-4f4opx repro: a THIRD consecutive CRITICAL cycle (no reset
+# in between, sustain already confirmed+mailed once at avail=2GB, recently)
+# must NOT mail the Mayor again — same avail, well within the 2h cooldown, no
+# new minimum. This is the actual measured bug (32 of 65 Mayor mails in one
+# night, one per 5min cycle): pre-fix, _sustain_confirmed alone gated the
+# mail and stayed true forever once the streak crossed 2, so THIS cycle would
+# have mailed again. NOTIFY must still fire unconditionally (imp07,
+# unaffected by this bead).
+reset_capture; seed_state "" ""; seed_critical_sustain 2
+seed_last_mail "$(( $(date +%s) - 60 ))" 2
+queue_avail 2 2
+main
+if [ "$NOTIFY_CALLS" = "1" ] && [ "$NOTIFY_LAST_PRIO" = "5" ] && [ "$GC_MAIL_CALLS" = "0" ] && [ "$(read_critical_sustain_state)" = "3" ]; then
+  ok "main(): 3rd consecutive CRITICAL cycle (unchanged avail, within cooldown) suppresses the repeat Mayor mail — ga-4f4opx fixed; notify still unconditional"
+else
+  bad "main(): 3rd consecutive CRITICAL cycle should suppress repeat mail (notify_calls=$NOTIFY_CALLS prio=$NOTIFY_LAST_PRIO mail_calls=$GC_MAIL_CALLS pending=$(read_critical_sustain_state))"
+fi
+
+# Scenario A5 — ga-4f4opx: a new relevant minimum (avail dropped by
+# >= CRITICAL_MAIL_MIN_DROP_GB since the last mail) DOES re-mail, even well
+# within the 2h cooldown — acceptance criteria (a). Last mail was at 2GB;
+# this cycle reads 1GB both before and after reclaim (no recovery).
+reset_capture; seed_state "" ""; seed_critical_sustain 2
+seed_last_mail "$(( $(date +%s) - 60 ))" 2
+queue_avail 1 1
+main
+if [ "$GC_MAIL_CALLS" = "1" ] && [ "$(read_last_mail_avail_state)" = "1" ]; then
+  ok "main(): a new relevant minimum (2GB -> 1GB) re-mails the Mayor even within cooldown (ga-4f4opx acceptance (a)), and records the new last-mailed avail"
+else
+  bad "main(): a new minimum should have re-mailed (mail_calls=$GC_MAIL_CALLS last_mailed_avail=$(read_last_mail_avail_state))"
+fi
+
+# Scenario A6 — ga-4f4opx: the mail cooldown elapsing (>= 2h since the last
+# mail) DOES re-mail even at an unchanged avail — acceptance criteria (b).
+reset_capture; seed_state "" ""; seed_critical_sustain 2
+seed_last_mail "$(( $(date +%s) - 7201 ))" 2
+queue_avail 2 2
+main
+if [ "$GC_MAIL_CALLS" = "1" ]; then
+  ok "main(): mail cooldown elapsed (>2h) re-mails the Mayor even at unchanged avail (ga-4f4opx acceptance (b))"
+else
+  bad "main(): elapsed mail cooldown should have re-mailed, GC_MAIL_CALLS=$GC_MAIL_CALLS"
+fi
+
+# Scenario A7 — ga-4f4opx recovery mail: after this guard already mailed the
+# Mayor at least once this CRITICAL episode, the FIRST fully-recovered cycle
+# (avail comfortably above the WARN floor, pre-reclaim NONE — the early-return
+# path) must send exactly one recovery mail and clear the episode-mailed +
+# mail-debounce state, so a FUTURE new CRITICAL episode's first mail is
+# unconditional again. "Manter... o [aviso] de recuperação" — the acceptance
+# criteria's explicit third requirement.
+reset_capture; seed_state "" ""; seed_critical_sustain 2
+seed_last_mail "$(( $(date +%s) - 60 ))" 2
+seed_critical_episode_mailed 1
+queue_avail 20
+main
+if [ "$GC_MAIL_CALLS" = "1" ] && [ "$(read_critical_episode_mailed_state)" = "0" ] && [ "$(read_last_mail_epoch_state)" = "" ] && [ "$(read_last_mail_avail_state)" = "" ]; then
+  ok "main(): first fully-recovered cycle after a mailed CRITICAL episode sends ONE recovery mail and clears mail-debounce state"
+else
+  bad "main(): recovery mail wrong (mail_calls=$GC_MAIL_CALLS episode_mailed=$(read_critical_episode_mailed_state) last_epoch='$(read_last_mail_epoch_state)' last_avail='$(read_last_mail_avail_state)')"
+fi
+
+# Scenario A7b — the SAME recovery must never repeat on a SECOND consecutive
+# recovered cycle — episode-mailed was already cleared by A7, so this is a
+# genuine non-regression (not just "cooldown" — the flag itself is gone).
+reset_capture
+queue_avail 20
+main
+if [ "$GC_MAIL_CALLS" = "0" ]; then
+  ok "main(): a second consecutive recovered cycle does NOT repeat the recovery mail (episode-mailed flag already cleared)"
+else
+  bad "main(): recovery mail repeated on a cycle that already recovered, GC_MAIL_CALLS=$GC_MAIL_CALLS"
+fi
+
+# Scenario A8 — non-regression: a cycle that recovers WITHOUT this guard ever
+# having mailed the Mayor this episode (ordinary WARN dip that self-resolved,
+# or a CRITICAL streak that never reached CRITICAL_MAIL_SUSTAIN) must NOT
+# send a recovery mail — nothing to close out, same "don't alert on what
+# nobody was told about" principle the sustain gate already applies to the
+# first mail.
+reset_capture; seed_state "" ""; seed_critical_sustain ""
+queue_avail 20
+main
+if [ "$GC_MAIL_CALLS" = "0" ]; then
+  ok "main(): recovery from a dip that never mailed the Mayor stays silent on the mail channel (no phantom recovery mail)"
+else
+  bad "main(): should never mail a recovery for an episode that was never mailed, GC_MAIL_CALLS=$GC_MAIL_CALLS"
 fi
 
 # Scenario B — repro path (b), reviewer's exact numbers (WARN=8 CRIT=3
