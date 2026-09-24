@@ -55,6 +55,28 @@ CLI:
        failure is data, not a script failure — the caller's fallback is "escalate").
     Only writes a log line when --heuristic-would-escalate is passed (no-op evaluations
     where the underlying watchdog wasn't going to alert anyway aren't experiment data).
+
+  python3 jev_experiment.py evaluate-shadow --entity-id <id> --experiment <name> \\
+      --state-file <path> --question-key <key> --instructions <text> \\
+      --true-desc <text> --false-desc <text> --decisao-atual {true,false} \\
+      [--confidence 0.85] [--decisao-atual-tokens <int>]
+    SHADOW MODE (ga-aijm2v.1/F0), for a caller that already has its OWN real decisor
+    (Claude reviewer, Groq extraction, a human) and just wants to measure Jev against
+    it — never to act on Jev's answer. `--decisao-atual` is the decision the real
+    decisor ALREADY made (using the same true/false semantics as --true-desc/
+    --false-desc); it passes straight through to the log UNCHANGED — this function
+    never derives or overrides it. Always calls Jev (no control/experiment split:
+    every call is comparison data, unlike `evaluate` above, which only calls Jev on
+    the experiment arm) and ALWAYS logs, unconditionally. Prints one JSON line:
+    {mode: "shadow", jev_ok, jev_noul, jev_error, jev_tokens_in, jev_tokens_out,
+     decisao_atual, decisao_atual_tokens, jev_would_flag, agree, would_dispense}.
+    `agree` is None (never True/False) when jev_ok=False — third state, never
+    coerced into "concordou"/"discordou". `would_dispense` says Jev was confident
+    enough (either direction) that a live deployment could have skipped the real
+    decisor for this one case — see jev_experiment_report.py for how that turns into
+    an estimated token count. Always exit 0, same fail-open-as-data philosophy as
+    `evaluate` above — a caller in shadow mode ignores this return value entirely for
+    its own control flow by construction.
 """
 from __future__ import annotations
 
@@ -263,6 +285,65 @@ def evaluate(
     return result
 
 
+def evaluate_shadow(
+    entity_id: str,
+    experiment: str,
+    state: str,
+    question_key: str,
+    instructions: str,
+    true_desc: str,
+    false_desc: str,
+    decisao_atual: bool,
+    confidence_threshold: float,
+    decisao_atual_tokens: int | None = None,
+) -> dict:
+    """SHADOW MODE (ga-aijm2v.1/F0): Jev answers, `decisao_atual` (what the real decisor
+    already did) is what happened, and this function's job is ONLY to say whether the
+    two agree — it never feeds back into `decisao_atual` and a caller MUST NOT use this
+    return value to change behavior. Pure (no I/O — logging is the caller's job in
+    main(), same split as evaluate()/_log() above), so it's testable without a log file.
+
+    Unlike evaluate()'s control/experiment split, there is no arm here: every call is
+    comparison data because decisao_atual already happened for real, so Jev is always
+    asked.
+    """
+    jr = call_jev(state, question_key, instructions, true_desc, false_desc)
+    result = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "mode": "shadow",
+        "experiment": experiment,
+        "entity_id": entity_id,
+        "jev_ok": jr["ok"],
+        "jev_noul": None,
+        "jev_error": None,
+        "jev_tokens_in": 0,
+        "jev_tokens_out": 0,
+        "decisao_atual": bool(decisao_atual),
+        "decisao_atual_tokens": decisao_atual_tokens,
+        "jev_would_flag": None,
+        "agree": None,
+        "would_dispense": False,
+    }
+
+    if jr["ok"]:
+        noul = jr["noul"]
+        result["jev_noul"] = noul
+        result["jev_tokens_in"] = jr["tokens_in"]
+        result["jev_tokens_out"] = jr["tokens_out"]
+        jev_would_flag = noul >= 0.5
+        result["jev_would_flag"] = jev_would_flag
+        result["agree"] = jev_would_flag == bool(decisao_atual)
+        confidence = noul if jev_would_flag else (1.0 - noul)
+        result["would_dispense"] = confidence >= confidence_threshold
+    else:
+        result["jev_error"] = jr["error"]
+        # TERCEIRO ESTADO: ok=False leaves jev_would_flag/agree at None and
+        # would_dispense at False — an unavailable Jev is never counted as having
+        # agreed, disagreed, or earned enough confidence to dispense with anything.
+
+    return result
+
+
 def _log(entry: dict) -> None:
     JEV_LOG.parent.mkdir(parents=True, exist_ok=True)
     with JEV_LOG.open("a", encoding="utf-8") as f:
@@ -451,6 +532,63 @@ def _selftest() -> int:
         r = evaluate(exp_id, "selftest", "state text", "q", "instr", "t", "f", 0.85)
     ok("experiment arm, noul=0.5 (uncertain) -> suppress=False", r["suppress"] is False)
 
+    # evaluate_shadow() (ga-aijm2v.1/F0): never alters the decision -- decisao_atual
+    # passed in must come back byte-for-byte identical regardless of what Jev said.
+    def _shadow(noul: float, decisao_atual: bool, tokens=(7, 3)):
+        body = json.dumps(
+            {"result": {"result": {"answers": {"q": {"type": "noul", "noul": noul}},
+                                    "usage": {"input_tokens": tokens[0], "output_tokens": tokens[1]}}}}
+        ).encode()
+        with mock.patch("urllib.request.urlopen", return_value=_fake_response(body)):
+            return evaluate_shadow("e1", "F-selftest", "state", "q", "instr", "t", "f", decisao_atual, 0.85)
+
+    r_true = _shadow(0.9, True)
+    r_false = _shadow(0.9, False)
+    ok(
+        "shadow mode never alters the decision: decisao_atual echoes back unchanged either way",
+        r_true["decisao_atual"] is True and r_false["decisao_atual"] is False,
+    )
+    ok("shadow mode: mode=shadow on every result", r_true.get("mode") == "shadow" and r_false.get("mode") == "shadow")
+
+    # Jev leans true (noul=0.9) and the real decisor also said true -> agree.
+    ok("shadow: jev_would_flag=True (noul=0.9), decisao_atual=True -> agree=True", r_true["agree"] is True)
+    # Same Jev answer, but the real decisor said false this time -> disagree, and the
+    # disagreement must NOT feed back into decisao_atual (already checked above) or
+    # otherwise change what would_dispense reports for an equally-confident case.
+    ok("shadow: same Jev answer, decisao_atual=False -> agree=False (disagreement never overrides decisao_atual)", r_false["agree"] is False)
+    ok("shadow: noul=0.9 >= 0.85 confidence -> would_dispense=True regardless of agreement", r_true["would_dispense"] is True and r_false["would_dispense"] is True)
+
+    # Uncertain Jev (noul=0.5) -> below the confidence threshold either direction ->
+    # would_dispense=False, even though it still has an opinion (agree is still True/False).
+    r_uncertain = _shadow(0.5, True)
+    ok("shadow: noul=0.5 (uncertain) -> would_dispense=False", r_uncertain["would_dispense"] is False)
+    ok("shadow: noul=0.5 still yields a binary jev_would_flag/agree (0.5 rounds to True side)", r_uncertain["agree"] is True)
+
+    # Jev leans FALSE (noul=0.05) and agrees with a decisao_atual=False real decision.
+    r_false_lean = _shadow(0.05, False)
+    ok("shadow: noul=0.05 (Jev leans false), decisao_atual=False -> agree=True, would_dispense=True", r_false_lean["agree"] is True and r_false_lean["would_dispense"] is True)
+
+    # TERCEIRO ESTADO: Jev unavailable (no credentials) -> agree=None (never coerced to
+    # True/False) and would_dispense=False -- never counted as "concordou"/"discordou".
+    saved_acct, saved_tok = CF_ACCOUNT_ID, CF_API_TOKEN
+    CF_ACCOUNT_ID, CF_API_TOKEN = "", ""
+    with mock.patch.object(this, "_secret_field", return_value=""), \
+         mock.patch("urllib.request.urlopen", side_effect=AssertionError("network call without credentials")):
+        r_unavail = evaluate_shadow("e1", "F-selftest", "state", "q", "instr", "t", "f", True, 0.85)
+    CF_ACCOUNT_ID, CF_API_TOKEN = saved_acct, saved_tok
+    ok(
+        "shadow: Jev unavailable -> jev_ok=False, agree=None (third state, not False), would_dispense=False, decisao_atual still echoed",
+        r_unavail["jev_ok"] is False and r_unavail["agree"] is None and r_unavail["would_dispense"] is False and r_unavail["decisao_atual"] is True,
+    )
+
+    # decisao_atual_tokens passes through untouched when supplied, stays None when not.
+    r_with_tokens = _shadow(0.9, True)
+    ok("shadow: decisao_atual_tokens defaults to None when the caller doesn't supply it", r_with_tokens["decisao_atual_tokens"] is None)
+    body = json.dumps({"result": {"result": {"answers": {"q": {"type": "noul", "noul": 0.9}}, "usage": {"input_tokens": 1, "output_tokens": 0}}}}).encode()
+    with mock.patch("urllib.request.urlopen", return_value=_fake_response(body)):
+        r_with_tokens2 = evaluate_shadow("e1", "F-selftest", "state", "q", "instr", "t", "f", True, 0.85, decisao_atual_tokens=1234)
+    ok("shadow: decisao_atual_tokens passes through unchanged when the caller supplies it", r_with_tokens2["decisao_atual_tokens"] == 1234)
+
     vault_guard.stop()
     print(f"\njev_experiment selftest: PASS={passed} FAIL={failed}")
     return 1 if failed else 0
@@ -478,6 +616,36 @@ def main() -> int:
         "suppresses log-writing for the (uninteresting) case where nothing was going to fire anyway",
     )
 
+    sh = sub.add_parser(
+        "evaluate-shadow",
+        help="shadow mode: Jev answers, decisao-atual (already decided) is what happens; "
+        "logs both for concordance measurement, NEVER alters behavior",
+    )
+    sh.add_argument("--entity-id", required=True)
+    sh.add_argument("--experiment", required=True)
+    sh.add_argument("--state-file", required=True, help="path to a text file with the case's own text")
+    sh.add_argument("--question-key", default="needs_review")
+    sh.add_argument("--instructions", required=True)
+    sh.add_argument("--true-desc", required=True)
+    sh.add_argument("--false-desc", required=True)
+    sh.add_argument("--confidence", type=float, default=DEFAULT_CONFIDENCE_THRESHOLD)
+    sh.add_argument(
+        "--decisao-atual",
+        required=True,
+        choices=["true", "false"],
+        help="the REAL decision the current decisor already made, using the same "
+        "true/false semantics as --true-desc/--false-desc — passed through to the "
+        "log unchanged, never derived from Jev",
+    )
+    sh.add_argument(
+        "--decisao-atual-tokens",
+        type=int,
+        default=None,
+        help="optional: the current decisor's REAL token cost for this call, if known "
+        "(e.g. from the Claude/Groq API response's own usage field); when omitted, the "
+        "report falls back to a labeled PROVISIONAL estimate for this case",
+    )
+
     args = ap.parse_args()
 
     if args.cmd == "selftest":
@@ -499,6 +667,27 @@ def main() -> int:
             _log(result)
         else:
             result["suppress"] = False  # nothing to suppress if it wasn't going to fire
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+
+    if args.cmd == "evaluate-shadow":
+        state_text = Path(args.state_file).read_text(encoding="utf-8", errors="replace")
+        result = evaluate_shadow(
+            entity_id=args.entity_id,
+            experiment=args.experiment,
+            state=state_text,
+            question_key=args.question_key,
+            instructions=args.instructions,
+            true_desc=args.true_desc,
+            false_desc=args.false_desc,
+            decisao_atual=(args.decisao_atual == "true"),
+            confidence_threshold=args.confidence,
+            decisao_atual_tokens=args.decisao_atual_tokens,
+        )
+        # Shadow mode always logs -- unlike evaluate()'s --heuristic-would-escalate
+        # gate, there is no uninteresting no-op case: decisao_atual already happened
+        # for real, so every call is comparison data.
+        _log(result)
         print(json.dumps(result, ensure_ascii=False))
         return 0
 
