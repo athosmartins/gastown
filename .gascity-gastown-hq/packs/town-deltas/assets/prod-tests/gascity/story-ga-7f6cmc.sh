@@ -46,11 +46,17 @@ log "  run_bounded() + RACE_STEP_TIMEOUT_SEC present ✓"
 log "Checking every race loop actually calls run_bounded (not just defines it)..."
 # D/D1, G1's own racers, and G2/H's raw interloper fetch call run_bounded
 # directly; D2/G2/H's wrapper-script racers get it for free via run_script()
-# itself. Count sites, not just presence, so a partial revert (helper added
-# but not wired into a loop) is caught.
+# itself. Count MATCHING LINES (grep -c), not just presence — so a partial
+# revert (helper added but not wired into a loop) is caught. NOTE: this counts
+# lines, not raw occurrences — G1's `fetch && merge` racer calls run_bounded
+# twice on one line, which grep -c counts once. Exactly 7 lines exist today
+# (run_script, D1's pull, D1's fetch, G1's combined fetch&&merge, G1's
+# interloper fetch, G2's interloper fetch, H's interloper fetch) — pinned
+# exactly, not >=, so dropping any one of them (including the easy-to-miss
+# double-call G1 line) is caught, not just a wholesale revert.
 CALL_SITES=$(grep -c 'run_bounded "\$RACE_STEP_TIMEOUT_SEC"' "$SELFTEST" || true)
-[[ "$CALL_SITES" -ge 6 ]] \
-  || fail "expected run_bounded to be called at >=6 sites (run_script + D1's two racers + G1's two racers + G2/H's interloper), found $CALL_SITES — looks like a partial revert"
+[[ "$CALL_SITES" -eq 7 ]] \
+  || fail "expected run_bounded to be called on exactly 7 lines (run_script + D1's 2 racers + G1's combined racer line + G1's interloper + G2's interloper + H's interloper), found $CALL_SITES — looks like a partial revert"
 log "  $CALL_SITES call sites ✓"
 
 log "Falsifying check: the REAL deployed run_bounded must kill a hung command within its bound (not just look right)..."
@@ -85,8 +91,14 @@ log "  hung command killed in ${FALSIFY_ELAPSED}s (rc=124), not left to run its 
 log "Running the feature's own selftest (regression guard, itself time-boxed)..."
 SELFTEST_LOG="/tmp/.story-ga-7f6cmc-selftest.$$.log"
 if command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout"; else TIMEOUT_BIN="timeout"; fi
-if ! "$TIMEOUT_BIN" --kill-after=5 240 bash "$SELFTEST" >"$SELFTEST_LOG" 2>&1; then
-  RC=$?
+# NOTE: deliberately not `if ! cmd; then RC=$?; ...` — `$?` inside that
+# `then` block reflects the `!` negation's own synthesized status (always 0
+# there, since entering `then` means the negated condition was true), never
+# the wrapped command's real exit code. Run it as a plain statement instead
+# so `$?` right after is genuinely the timeout/gtimeout exit status.
+"$TIMEOUT_BIN" --kill-after=5 240 bash "$SELFTEST" >"$SELFTEST_LOG" 2>&1
+RC=$?
+if [[ "$RC" -ne 0 ]]; then
   tail -30 "$SELFTEST_LOG" >&2
   rm -f "$SELFTEST_LOG"
   if [[ "$RC" -eq 124 ]]; then
