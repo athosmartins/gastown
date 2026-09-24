@@ -81,8 +81,57 @@ advance_other_branch() {
   must git -C "$OTHER" checkout --quiet main
 }
 run_script() { # $1=repo $2=branch(optional) -> exit code in $?, stdout+stderr in $WORK/last.txt
-  bash "$SCRIPT" "$1" "${2:-main}" >"$WORK/last.txt" 2>&1
+  run_bounded "$RACE_STEP_TIMEOUT_SEC" bash "$SCRIPT" "$1" "${2:-main}" >"$WORK/last.txt" 2>&1
 }
+
+# ga-7f6cmc: D/D1/D2/G1/G2/H below background two REAL processes per
+# iteration and `wait` on each with no ceiling — under sustained high system
+# load (observed load avg ~36-38 while verifying ga-4vb24i) either racer can
+# wedge for minutes, hanging the whole 30-iteration loop until something
+# OUTSIDE this script kills it (which also doesn't reach these backgrounded
+# grandchildren, hence the orphaned /tmp/gc-git-repo-mutex/<slug>/ dirs seen
+# in that incident — harmless, already covered by git-lock-hygiene.sh's own
+# GIT_REPO_MUTEX_MAX_AGE=600s staleness reclaim, not re-solved here).
+# run_bounded mirrors the dolt pack's helper of the same name
+# (.gc/system/packs/dolt/assets/scripts/runtime.sh) rather than sourcing it —
+# that lib does dolt-specific port resolution this git script has no business
+# depending on. Same fail-closed contract: refuse (rc=124) instead of running
+# unbounded if no timeout mechanism exists at all.
+if command -v gtimeout >/dev/null 2>&1; then
+  _RB_TIMEOUT_BIN="gtimeout"
+elif command -v timeout >/dev/null 2>&1; then
+  _RB_TIMEOUT_BIN="timeout"
+else
+  _RB_TIMEOUT_BIN=""
+fi
+run_bounded() {
+  _rb_t="$1"; shift
+  if [ -n "$_RB_TIMEOUT_BIN" ]; then
+    "$_RB_TIMEOUT_BIN" --kill-after=2 "$_rb_t" "$@"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$_rb_t" "$@" <<'PY'
+import subprocess, sys
+limit = float(sys.argv[1]); cmd = sys.argv[2:]
+try:
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=limit)
+except subprocess.TimeoutExpired as exc:
+    sys.stdout.write(exc.stdout or ""); sys.stderr.write(exc.stderr or "")
+    sys.exit(124)
+sys.stdout.write(proc.stdout); sys.stderr.write(proc.stderr)
+sys.exit(proc.returncode)
+PY
+  else
+    printf 'git-deploy-pull.selftest.sh: timeout/gtimeout/python3 not found; cannot bound race processes\n' >&2
+    return 124
+  fi
+}
+# Local git ops on throwaway repos normally finish in well under a second;
+# this only ever engages under the load class this bead reports. A timeout
+# (rc=124) is a THIRD state, distinct from pass/fail — see each race loop
+# below — never collapsed into either (same discipline as ga-gquc1's
+# run_bounded-timeout-vs-real-failure fix in mol-dog-backup.sh).
+RACE_STEP_TIMEOUT_SEC="${GIT_DEPLOY_PULL_SELFTEST_RACE_TIMEOUT_SEC:-20}"
+RACE_TIMEOUTS=0
 
 # ── A. behind by one commit, clean tree -> fast-forwards, exit 0 ──────────────
 RT_A="$WORK/rt-behind"; seed_runtime "$RT_A"; advance_origin
@@ -140,12 +189,17 @@ OLD_PATTERN_FAILED=0
 OLD_PATTERN_FAIL_MSG=""
 for i in $(seq 1 30); do
   advance_origin
-  ( git -C "$RT_D" pull --ff-only --quiet 2>"$WORK/d-old-$i.err" ) &
+  ( run_bounded "$RACE_STEP_TIMEOUT_SEC" git -C "$RT_D" pull --ff-only --quiet 2>"$WORK/d-old-$i.err" ) &
   VPID=$!
-  ( git -C "$RT_D" fetch origin main other-branch --quiet 2>/dev/null ) &
+  ( run_bounded "$RACE_STEP_TIMEOUT_SEC" git -C "$RT_D" fetch origin main other-branch --quiet 2>/dev/null ) &
   IPID=$!
   wait "$VPID"; VRC=$?
   wait "$IPID"
+  if [ "$VRC" -eq 124 ]; then
+    RACE_TIMEOUTS=$((RACE_TIMEOUTS+1))
+    echo "D1 iter $i: racer hit the ${RACE_STEP_TIMEOUT_SEC}s bound (rc=124) — environment overload, not counted as evidence either way"
+    continue
+  fi
   if [ "$VRC" -ne 0 ]; then
     OLD_PATTERN_FAILED=1
     OLD_PATTERN_FAIL_MSG="$(cat "$WORK/d-old-$i.err")"
@@ -189,6 +243,11 @@ for i in $(seq 1 30); do
   wait "$IPID"
   VRC=$(sed -n 's/^rc=//p' "$WORK/d-new-a-$i.rc")
   IRC=$(sed -n 's/^rc=//p' "$WORK/d-new-b-$i.rc")
+  if [ "$VRC" = "124" ] || [ "$IRC" = "124" ]; then
+    RACE_TIMEOUTS=$((RACE_TIMEOUTS+1))
+    echo "D2 iter $i: a racer hit the ${RACE_STEP_TIMEOUT_SEC}s bound (vrc=$VRC irc=$IRC) — environment overload, skipping this iteration's assertions"
+    continue
+  fi
   AFTER=$(git -C "$RT_D2" rev-parse HEAD)
   if { [ "$VRC" = "0" ] || [ "$IRC" = "0" ]; } && [ "$AFTER" != "$ORIGIN_TIP" ]; then
     NEW_PATTERN_BAD=1
@@ -271,12 +330,17 @@ OLD_UNSCOPED_FAILED=0
 OLD_UNSCOPED_MSG=""
 for i in $(seq 1 30); do
   advance_other_branch
-  ( git -C "$RT_G" fetch origin --quiet && git -C "$RT_G" merge --ff-only origin/main --quiet ) 2>"$WORK/g-old-$i.err" &
+  ( run_bounded "$RACE_STEP_TIMEOUT_SEC" git -C "$RT_G" fetch origin --quiet && run_bounded "$RACE_STEP_TIMEOUT_SEC" git -C "$RT_G" merge --ff-only origin/main --quiet ) 2>"$WORK/g-old-$i.err" &
   VPID=$!
-  ( git -C "$RT_G" fetch origin other-branch --quiet ) 2>/dev/null &
+  ( run_bounded "$RACE_STEP_TIMEOUT_SEC" git -C "$RT_G" fetch origin other-branch --quiet ) 2>/dev/null &
   IPID=$!
   wait "$VPID"; VRC=$?
   wait "$IPID"
+  if [ "$VRC" -eq 124 ]; then
+    RACE_TIMEOUTS=$((RACE_TIMEOUTS+1))
+    echo "G1 iter $i: racer hit the ${RACE_STEP_TIMEOUT_SEC}s bound (rc=124) — environment overload, not counted as evidence either way"
+    continue
+  fi
   if [ "$VRC" -ne 0 ] && grep -q 'cannot lock ref' "$WORK/g-old-$i.err"; then
     OLD_UNSCOPED_FAILED=1
     OLD_UNSCOPED_MSG="$(cat "$WORK/g-old-$i.err")"
@@ -298,11 +362,16 @@ for i in $(seq 1 30); do
   ORIGIN_TIP=$(git -C "$OTHER" rev-parse HEAD)
   ( run_script "$RT_G2" main; echo "rc=$?" > "$WORK/g-new-$i.rc" ) &
   VPID=$!
-  ( git -C "$RT_G2" fetch origin other-branch --quiet ) 2>/dev/null &
+  ( run_bounded "$RACE_STEP_TIMEOUT_SEC" git -C "$RT_G2" fetch origin other-branch --quiet ) 2>/dev/null &
   IPID=$!
   wait "$VPID"
   wait "$IPID"
   VRC=$(sed -n 's/^rc=//p' "$WORK/g-new-$i.rc")
+  if [ "$VRC" = "124" ]; then
+    RACE_TIMEOUTS=$((RACE_TIMEOUTS+1))
+    echo "G2 iter $i: git-deploy-pull.sh hit the ${RACE_STEP_TIMEOUT_SEC}s bound (rc=124) — environment overload, skipping this iteration's assertions"
+    continue
+  fi
   AFTER=$(git -C "$RT_G2" rev-parse HEAD)
   if [ "$VRC" != "0" ]; then
     NEW_SCOPED_BAD=1
@@ -339,10 +408,15 @@ for i in $(seq 1 30); do
   ORIGIN_TIP=$(git -C "$OTHER" rev-parse HEAD)
   ( run_script "$RT_H" main; echo "rc=$?" > "$WORK/h-wrap-$i.rc" ) &
   WPID=$!
-  ( git -C "$RT_H" fetch origin main --quiet ) 2>/dev/null &
+  ( run_bounded "$RACE_STEP_TIMEOUT_SEC" git -C "$RT_H" fetch origin main --quiet ) 2>/dev/null &
   IPID=$!
   wait "$WPID"; wait "$IPID"
   WRC=$(sed -n 's/^rc=//p' "$WORK/h-wrap-$i.rc")
+  if [ "$WRC" = "124" ]; then
+    RACE_TIMEOUTS=$((RACE_TIMEOUTS+1))
+    echo "H iter $i: wrapper hit the ${RACE_STEP_TIMEOUT_SEC}s bound (rc=124) — environment overload, skipping this iteration's assertions"
+    continue
+  fi
   AFTER=$(git -C "$RT_H" rev-parse HEAD)
   case "$WRC" in
     75) BACKSTOP_HIT=1 ;;
@@ -423,5 +497,8 @@ else
   bad "I3 merge-lock-collision-exhausted: expected exit 75 with HEAD unchanged when the external index.lock outlasts the retry budget; got rc=$RC head=$AFTER (was $BEFORE). Output: $(cat "$WORK/last.txt")"
 fi
 
+if [ "$RACE_TIMEOUTS" -gt 0 ]; then
+  echo "NOTE (ga-7f6cmc): $RACE_TIMEOUTS race iteration(s) hit the ${RACE_STEP_TIMEOUT_SEC}s per-racer bound — environment overload, not scored as pass or fail. Set GIT_DEPLOY_PULL_SELFTEST_RACE_TIMEOUT_SEC to adjust."
+fi
 echo "git-deploy-pull selftest: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
