@@ -53,12 +53,15 @@
 # Exit 0  = fast-forwarded (or already up to date).
 # Exit 75 = a TRANSIENT, not-our-fault non-completion — either (a) could not
 #           acquire the per-repo deploy mutex within the wait budget (another
-#           deploy is genuinely in flight), or (b) the branch-scoped fetch hit
+#           deploy is genuinely in flight), (b) the branch-scoped fetch hit
 #           "cannot lock ref" on $BRANCH's own remote-tracking ref because some
 #           OTHER process raced that identical ref outside our mutex
-#           (ga-zhwi4l). Callers should treat this exactly like "try again
-#           next cycle," never as a real deploy failure (75 = EX_TEMPFAIL in
-#           sysexits.h — chosen for that reason).
+#           (ga-zhwi4l), or (c) the merge step hit a .git/index.lock collision
+#           from a non-cooperating concurrent process (e.g. another daemon's
+#           `git status` opportunistically refreshing the index) that outlasted
+#           the merge retry budget (ga-4vb24i). Callers should treat this
+#           exactly like "try again next cycle," never as a real deploy
+#           failure (75 = EX_TEMPFAIL in sysexits.h — chosen for that reason).
 # Other nonzero = a real git failure (diverged history, network, missing
 #           branch, ...) — a normal, actionable deploy failure.
 set -uo pipefail
@@ -69,6 +72,38 @@ CITY="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
 GLH="${CITY}/scripts/git-lock-hygiene.sh"
 MUTEX_WAIT_SEC="${GIT_DEPLOY_PULL_MUTEX_WAIT_SEC:-5}"
 MUTEX_POLL_SEC="${GIT_DEPLOY_PULL_MUTEX_POLL_SEC:-0.2}"
+# Merge-side index.lock collision (ga-4vb24i): a non-cooperating concurrent
+# process (e.g. another daemon's `git status`/`git diff` opportunistically
+# refreshing the index) can hold .git/index.lock across our merge attempt
+# even though our OWN callers are already serialized by the mutex above.
+# Measured transient: clears within a few seconds. Retry short, then degrade
+# to exit 75 (same contract as the fetch-side "cannot lock ref" case) instead
+# of surfacing a hard failure.
+MERGE_RETRY_WAIT_SEC="${GIT_DEPLOY_PULL_MERGE_RETRY_SEC:-3}"
+MERGE_RETRY_POLL_SEC="${GIT_DEPLOY_PULL_MERGE_POLL_SEC:-0.2}"
+
+# Runs `git merge --ff-only` against $BRANCH, retrying with backoff while the
+# failure is an index.lock collision (mirrors the mutex-acquire wait loop
+# below). Sets global RC to 0 / a real failure's code / 75. Prints the real
+# (non-transient) failure's stderr; the transient case logs its own message.
+_merge_ff_only_with_retry() {
+  local _merge_err _deadline
+  _deadline=$(( $(date +%s) + MERGE_RETRY_WAIT_SEC ))
+  while :; do
+    _merge_err="$(git -C "$REPO" merge --ff-only "origin/$BRANCH" --quiet 2>&1)"
+    RC=$?
+    [ "$RC" -eq 0 ] && return 0
+    if ! printf '%s' "$_merge_err" | grep -q "Unable to create '.*index\.lock': File exists"; then
+      printf '%s\n' "$_merge_err" >&2
+      return 0
+    fi
+    [ "$(date +%s)" -ge "$_deadline" ] && break
+    sleep "$MERGE_RETRY_POLL_SEC"
+  done
+  echo "git-deploy-pull.sh: transient index.lock collision on merge (non-cooperating concurrent process) persisted past ${MERGE_RETRY_WAIT_SEC}s — try again next cycle" >&2
+  RC=75
+  return 0
+}
 
 # git-lock-hygiene.sh missing/unreadable: degrade to unlocked fetch+merge
 # rather than hard-failing the deploy. Still strictly safer than the old
@@ -86,8 +121,8 @@ if [ ! -r "$GLH" ]; then
     printf '%s\n' "$_fetch_err" >&2
     exit "$RC"
   fi
-  git -C "$REPO" merge --ff-only "origin/$BRANCH" --quiet
-  exit $?
+  _merge_ff_only_with_retry
+  exit "$RC"
 fi
 
 GIT_LOCK_HYGIENE_LIB=1
@@ -122,8 +157,7 @@ if [ "$RC" -ne 0 ]; then
   printf '%s\n' "$_fetch_err" >&2
 fi
 if [ "$RC" -eq 0 ]; then
-  git -C "$REPO" merge --ff-only "origin/$BRANCH" --quiet
-  RC=$?
+  _merge_ff_only_with_retry
 fi
 git_mutex_release "$REPO"
 exit "$RC"

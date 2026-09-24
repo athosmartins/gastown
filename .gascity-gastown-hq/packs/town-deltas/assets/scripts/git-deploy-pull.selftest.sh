@@ -364,5 +364,64 @@ else
   bad "H (base-fires check): never observed rc=75 from a concurrent same-ref race across 30 iterations — this selftest is not exercising the backstop path; strengthen it before trusting the H own-ref-unchanged check above."
 fi
 
+# ── I. merge-side .git/index.lock collision degrades correctly (ga-4vb24i) ────
+# Confirmed live 2026-09-24: a non-cooperating concurrent process (e.g. another
+# daemon's `git status`/`git diff` opportunistically refreshing the index) can
+# hold .git/index.lock across our merge step even though the mutex above only
+# serializes OUR OWN callers. Unlike D/G/H's races (real concurrent git
+# processes contending for a REF), here we simulate the external holder by
+# creating .git/index.lock directly and holding it for a controlled duration —
+# this is exactly the lock git itself takes before writing the index (same
+# technique as E's direct git_mutex_acquire hold above), so a merge attempted
+# while it exists fails with the identical "Unable to create '.../index.lock':
+# File exists" message the bead reports, without depending on racy real-process
+# timing to reproduce.
+# I1 proves the failure mode is real (base-fails check, same convention as
+# D1/G1/H). I2 proves the fixed script retries past a SHORT-lived collision and
+# still completes the fast-forward. I3 proves a collision that outlives the
+# retry budget degrades to transient (75), never a hard failure, with HEAD
+# left untouched.
+RT_I1="$WORK/rt-mergelock-base"; seed_runtime "$RT_I1"; advance_origin
+must git -C "$RT_I1" fetch origin "+refs/heads/main:refs/remotes/origin/main" --quiet
+: > "$RT_I1/.git/index.lock"
+MERGE_ERR="$(git -C "$RT_I1" merge --ff-only origin/main --quiet 2>&1)"
+MERGE_RC=$?
+rm -f "$RT_I1/.git/index.lock"
+if [ "$MERGE_RC" -ne 0 ] && printf '%s' "$MERGE_ERR" | grep -q "Unable to create '.*index\.lock': File exists"; then
+  ok
+else
+  bad "I1 (base-fails check): a single-shot 'git merge --ff-only' while .git/index.lock is externally held did NOT fail with the expected index.lock message (rc=$MERGE_RC, err=$MERGE_ERR) — this selftest is not exercising the real ga-4vb24i failure mode; strengthen it before trusting I2/I3 below."
+fi
+
+RT_I2="$WORK/rt-mergelock-fast"; seed_runtime "$RT_I2"; advance_origin
+ORIGIN_TIP=$(git -C "$OTHER" rev-parse HEAD)
+: > "$RT_I2/.git/index.lock"
+( sleep 1; rm -f "$RT_I2/.git/index.lock" ) &
+HOLDER_PID=$!
+GIT_DEPLOY_PULL_MERGE_RETRY_SEC=4 GIT_DEPLOY_PULL_MERGE_POLL_SEC=0.1 run_script "$RT_I2"; RC=$?
+wait "$HOLDER_PID" 2>/dev/null
+AFTER=$(git -C "$RT_I2" rev-parse HEAD)
+if [ "$RC" -eq 0 ] && [ "$AFTER" = "$ORIGIN_TIP" ]; then
+  ok
+else
+  bad "I2 merge-lock-collision-clears: expected exit 0 with HEAD==origin tip once the external index.lock clears within the retry budget; got rc=$RC head=$AFTER (origin $ORIGIN_TIP). Output: $(cat "$WORK/last.txt")"
+fi
+
+RT_I3="$WORK/rt-mergelock-exhaust"; seed_runtime "$RT_I3"
+BEFORE=$(git -C "$RT_I3" rev-parse HEAD)
+advance_origin
+: > "$RT_I3/.git/index.lock"
+( sleep 2; rm -f "$RT_I3/.git/index.lock" ) &
+HOLDER_PID=$!
+GIT_DEPLOY_PULL_MERGE_RETRY_SEC=1 GIT_DEPLOY_PULL_MERGE_POLL_SEC=0.1 run_script "$RT_I3"; RC=$?
+AFTER=$(git -C "$RT_I3" rev-parse HEAD)
+wait "$HOLDER_PID" 2>/dev/null
+rm -f "$RT_I3/.git/index.lock" 2>/dev/null
+if [ "$RC" -eq 75 ] && [ "$AFTER" = "$BEFORE" ]; then
+  ok
+else
+  bad "I3 merge-lock-collision-exhausted: expected exit 75 with HEAD unchanged when the external index.lock outlasts the retry budget; got rc=$RC head=$AFTER (was $BEFORE). Output: $(cat "$WORK/last.txt")"
+fi
+
 echo "git-deploy-pull selftest: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
