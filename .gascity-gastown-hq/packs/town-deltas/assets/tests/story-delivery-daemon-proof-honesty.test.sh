@@ -127,7 +127,7 @@ grep -qi "NOT VERIFIED" <<<"$LAST_BD" && ok "H3 close_reason says daemon livenes
 grep -q "label add ga-test story:done" <<<"$LAST_BD" && ok "H3 story:done still set (labeling honesty, not a new halt)" || nok "H3 story-done" "$LAST_BD"
 
 # H4: the literal false claim can never resurface, in any scenario this file drives.
-for p in verified not_applicable not_verified asset_served_per_request symbol_unreachable_locked; do
+for p in verified not_applicable not_verified asset_served_per_request symbol_unreachable_locked symbol_unreachable_nodrain; do
   run_block "$p"
   ! grep -q "verified in prod" <<<"$LAST_BD" && ok "H4 [$p] 'verified in prod' never appears" || nok "H4 [$p]" "$LAST_BD"
 done
@@ -157,6 +157,25 @@ run_block symbol_unreachable_locked
 [[ "$LAST_BD" == *"notify_only_locked"* ]] && ok "H6 close_reason names the locked daemon caveat (does not overclaim)" || nok "H6 locked caveat missing from the close reason" "$LAST_BD"
 [[ "$LAST_BD" != *"NOT VERIFIED"* && "$LAST_BD" != *"may still be dormant"* ]] && ok "H6 close_reason does NOT say liveness was unverified / may be dormant" || nok "H6 alarming wording for a proven-cosmetic case" "$LAST_BD"
 [[ "$LAST_BD" == *"label add ga-test story:done"* ]] && ok "H6 story:done set" || nok "H6 story-done" "$LAST_BD"
+
+# H7 (ga-xrn8ni, extends ga-j3lh6p): REFRESH_PROOF=symbol_unreachable_nodrain —
+# Step 5b released this story because every still-stale daemon is SENSITIVE
+# with no $DRAIN_CMD_<label> configured (never notify_only_locked) AND has no
+# call-graph path to a symbol the merge changed. Same THIRD-answer shape as H6,
+# with its OWN label (delivery:daemon-stale-nodrain, not -stale-locked — a
+# reader must be able to tell "a human locked this" from "nobody wired a drain
+# command yet" apart) and wording that never claims notify_only_locked for a
+# daemon that isn't in restart_policy.yaml at all.
+run_block symbol_unreachable_nodrain
+[[ "$LAST_BD" == *"label add ga-test delivery:tested"* ]] && ok "H7 delivery:tested added (the rig harness passed)" || nok "H7 tested-label" "$LAST_BD"
+[[ "$LAST_BD" != *"delivery:daemon-unverified"* ]] && ok "H7 NO delivery:daemon-unverified (that label means 'could not check', which is not what happened)" || nok "H7 daemon-unverified wrongly added" "$LAST_BD"
+[[ "$LAST_BD" == *"label add ga-test delivery:daemon-stale-nodrain"* ]] && ok "H7 delivery:daemon-stale-nodrain IS added (queryable, and distinct from -stale-locked)" || nok "H7 stale-nodrain label" "$LAST_BD"
+[[ "$LAST_BD" != *"delivery:daemon-stale-locked"* ]] && ok "H7 does NOT also add delivery:daemon-stale-locked (never claim a policy lock that isn't there)" || nok "H7 wrongly added the locked label too" "$LAST_BD"
+[[ "$LAST_BD" == *"close ga-test -r"*"tested in prod"* ]] && ok "H7 close_reason says tested in prod" || nok "H7 close-reason" "$LAST_BD"
+[[ "$LAST_BD" == *"drain"* ]] && ok "H7 close_reason names the no-drain-configured caveat" || nok "H7 no-drain caveat missing from the close reason" "$LAST_BD"
+[[ "$LAST_BD" != *"notify_only_locked"* ]] && ok "H7 close_reason does NOT claim notify_only_locked (that file doesn't even list this daemon)" || nok "H7 wrongly claims notify_only_locked" "$LAST_BD"
+[[ "$LAST_BD" != *"NOT VERIFIED"* && "$LAST_BD" != *"may still be dormant"* ]] && ok "H7 close_reason does NOT say liveness was unverified / may be dormant" || nok "H7 alarming wording for a proven-cosmetic case" "$LAST_BD"
+[[ "$LAST_BD" == *"label add ga-test story:done"* ]] && ok "H7 story:done set" || nok "H7 story-done" "$LAST_BD"
 
 echo ""
 echo "story-delivery daemon-proof-honesty tests: $PASS passed, $FAIL failed"

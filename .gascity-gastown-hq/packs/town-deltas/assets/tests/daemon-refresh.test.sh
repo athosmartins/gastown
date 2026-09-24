@@ -3366,6 +3366,95 @@ echo "$OUT" | grep -q "WARN:.*detect_stale_daemons.py" \
   && ok "T89 a WARN log names the failing rig detector (not silent)" \
   || nok "T89 expected a WARN mentioning detect_stale_daemons.py" "$OUT"
 
+# ════════════════════════════════════════════════════════════════════════════
+# T90-T92 (ga-xrn8ni, header point 21, extends ga-j3lh6p's header point 19):
+# GUARDED_NODRAIN_COSMETIC.
+#
+# THE GAP: T71's GUARDED_LOCKED_COSMETIC only fires for a daemon a human
+# explicitly marked notify_only_locked in restart_policy.yaml. A SENSITIVE
+# daemon with NO restart_policy.yaml entry at all, simply missing a configured
+# $DRAIN_CMD_<label> (this script's own "NO drain path configured -- NOT
+# auto-bounced" log line), is EQUALLY unable to be auto-restarted — but until
+# now had no equivalent exoneration path, so a merge that provably does not
+# reach it still held delivery forever (ga-xrn8ni: wa-8yfoi, 16 daemons, 3
+# independent manual clears in 90min that never stuck because the sweep
+# re-derived the same verdict from scratch every cycle).
+#
+# This is a SIBLING split, not a merge into GUARDED_LOCKED_COSMETIC: the two
+# reasons are not interchangeable in the human-facing text a consumer builds
+# from them ("notify_only_locked in restart_policy.yaml" would be a FALSE
+# claim about a daemon that isn't in that file at all).
+# ════════════════════════════════════════════════════════════════════════════
+
+# T90 — THE REPRO: SENSITIVE (via SENSITIVE_DAEMONS, no restart_policy.yaml at
+# all — same fixture shape as T4) + no $DRAIN_CMD_<label> configured + cleanly
+# no-evidence -> named GUARDED_NODRAIN_COSMETIC, never GUARDED_LOCKED_COSMETIC.
+SENSITIVE_DAEMONS="central-sender"
+new_case t90
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+seed_running com.test.central-sender 90001 "$STALE_LSTART"
+make_symbol_script "$RUNTIME"
+seed_symbol_result daemons/central_sender.py no_evidence
+OUT=$(run_helper daemons/central_sender.py); RC=$?
+[ "$(field VERDICT "$OUT")" = "NEEDS_GUARDED_RESTART" ] && ok "T90 verdict stays NEEDS_GUARDED_RESTART (this layer annotates, never changes it)" || nok "T90 verdict" "got '$(field VERDICT "$OUT")' out=[$OUT]"
+[ "$(field GUARDED "$OUT")" = "com.test.central-sender" ] && ok "T90 flat GUARDED unchanged (the daemon is still stale)" || nok "T90 guarded" "$(field GUARDED "$OUT")"
+[ "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" = "com.test.central-sender" ] && ok "T90 lands in GUARDED_SYMBOL_NO_EVIDENCE" || nok "T90 no_evidence" "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")"
+[ "$(field GUARDED_NODRAIN_COSMETIC "$OUT")" = "com.test.central-sender" ] && ok "T90 GUARDED_NODRAIN_COSMETIC names the no-drain + no-evidence daemon" || nok "T90 nodrain_cosmetic" "got '$(field GUARDED_NODRAIN_COSMETIC "$OUT")' — the field is missing or wrong"
+echo "$OUT" | grep '^GUARDED_LOCKED_COSMETIC=$' >/dev/null && ok "T90 GUARDED_LOCKED_COSMETIC stays present and EMPTY (this is not a policy lock)" || nok "T90 locked_cosmetic should stay empty" "$(field GUARDED_LOCKED_COSMETIC "$OUT")"
+echo "$(field REASON "$OUT")" | grep "SEM DRAIN CONFIGURADO" >/dev/null && ok "T90 REASON renders a no-drain cosmetic section" || nok "T90 reason" "$(field REASON "$OUT")"
+[ "$(json_list guarded_nodrain_cosmetic "$OUT")" = "com.test.central-sender" ] && ok "T90 trailing JSON guarded_nodrain_cosmetic matches the KEY=value line" || nok "T90 json" "got '$(json_list guarded_nodrain_cosmetic "$OUT")'"
+! grep -q "com.test.central-sender" "$MOCK/kicks.log" 2>/dev/null && ok "T90 the no-drain daemon was NOT bounced" || nok "T90 no-bounce" "kickstart was called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+
+# T91 — CONTROL (mirrors T72's acceptance-2 shape): same no-drain SENSITIVE
+# daemon, but the symbol IS reached (CONFIRMED) -> must NOT be nodrain-cosmetic.
+# This bead must never become "ignore missing drain config".
+SENSITIVE_DAEMONS="central-sender"
+new_case t91
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+seed_running com.test.central-sender 91001 "$STALE_LSTART"
+make_symbol_script "$RUNTIME"
+seed_symbol_result daemons/central_sender.py confirmed
+OUT=$(run_helper daemons/central_sender.py)
+echo "$OUT" | grep '^GUARDED_NODRAIN_COSMETIC=$' >/dev/null && ok "T91 GUARDED_NODRAIN_COSMETIC is present and empty (present-even-empty contract)" || nok "T91 line" "missing or non-empty: '$(field GUARDED_NODRAIN_COSMETIC "$OUT")' present=$(echo "$OUT" | grep -c '^GUARDED_NODRAIN_COSMETIC=')"
+[ "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")" = "com.test.central-sender" ] && ok "T91 stays SYMBOL-CONFIRMED — a real stale is never demoted" || nok "T91 confirmed" "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")"
+echo "$(field REASON "$OUT")" | grep "SEM DRAIN CONFIGURADO" >/dev/null && nok "T91 REASON wrongly renders the no-drain cosmetic section" "$(field REASON "$OUT")" || ok "T91 REASON has no no-drain cosmetic section"
+
+# T92 — CONTROL: a SENSITIVE daemon that DOES have $DRAIN_CMD_<label>
+# configured, but is GUARDED because its restart_guard_scripts entry refuses
+# (dynamic in-flight state, not a static configuration gap) -- with a cleanly
+# no-evidence symbol split. label_no_drain_configured() must check the actual
+# $DRAIN_CMD_<label> fact, not "was this GUARDED via the SENSITIVE branch" --
+# a drain command existing means this can restart the moment the guard clears,
+# unlike T90's daemon, so it must NOT be exonerated the same way.
+SENSITIVE_DAEMONS="central-sender"
+new_case t92
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+seed_running com.test.central-sender 92001 "$STALE_LSTART"
+mkdir -p "$RUNTIME/scripts"
+cat > "$RUNTIME/scripts/cs_guard.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+print("1 send in flight", file=sys.stderr)
+sys.exit(1)
+EOF
+chmod +x "$RUNTIME/scripts/cs_guard.py"
+cat > "$RUNTIME/daemons/restart_policy.yaml" <<'EOF'
+restart_guard_scripts:
+  central_sender.py: scripts/cs_guard.py
+EOF
+make_symbol_script "$RUNTIME"
+seed_symbol_result daemons/central_sender.py no_evidence
+export DRAIN_CMD_com_test_central_sender="true"
+OUT=$(run_helper daemons/central_sender.py); RC=$?
+unset DRAIN_CMD_com_test_central_sender
+[ "$(field GUARDED "$OUT")" = "com.test.central-sender" ] && ok "T92 flagged GUARDED (guard refused)" || nok "T92 guarded" "$(field GUARDED "$OUT")"
+[ "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")" = "com.test.central-sender" ] && ok "T92 lands in GUARDED_SYMBOL_NO_EVIDENCE" || nok "T92 no_evidence" "$(field GUARDED_SYMBOL_NO_EVIDENCE "$OUT")"
+echo "$OUT" | grep '^GUARDED_NODRAIN_COSMETIC=$' >/dev/null && ok "T92 GUARDED_NODRAIN_COSMETIC present and EMPTY (a configured drain command means this is NOT a config gap, just a guard refusal that can clear on its own)" || nok "T92 line" "present=$(echo "$OUT" | grep -c '^GUARDED_NODRAIN_COSMETIC=') value='$(field GUARDED_NODRAIN_COSMETIC "$OUT")'"
+! grep -q "com.test.central-sender" "$MOCK/kicks.log" 2>/dev/null && ok "T92 NOT auto-bounced (guard blocked kickstart)" || nok "T92 no-bounce" "kickstart was called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"

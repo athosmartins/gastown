@@ -865,6 +865,11 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   # reads it unconditionally; an absent line means an older helper and is never
   # the same as an empty one.
   echo "GUARDED_LOCKED_COSMETIC=${GUARDED_LOCKED_COSMETIC:-}"
+  # ga-xrn8ni (header point 21): always present, even empty — same convention
+  # as GUARDED_LOCKED_COSMETIC just above, of which this is a sibling (excused
+  # via a missing $DRAIN_CMD_<label>, not via restart_policy.yaml). A consumer
+  # reads it unconditionally; an absent line means a helper that predates it.
+  echo "GUARDED_NODRAIN_COSMETIC=${GUARDED_NODRAIN_COSMETIC:-}"
   # ga-abofl6 (header point 20): always present, even empty — same convention
   # as every other field above. RIG_DETECTOR_USED distinguishes "consulted,
   # confirmed nothing" (AFFECTED_RIG_DETECTOR/GUARDED_RIG_DETECTOR empty, USED=1)
@@ -891,9 +896,9 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   # same convention as PARSE_ERROR_LOADED/UNLOADED above.
   echo "UNATTRIBUTED_JOB_GAP=${SJ_UNATTRIBUTED_REASON:-}"
   # Trailing JSON for the caller's bead comment / jsonl log.
-  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" "${AFFECTED_NOT_RUNNING:-}" "${GUARDED_OWN:-}" "${GUARDED_CLOSURE_ONLY:-}" "${GUARDED_SYMBOL_CONFIRMED:-}" "${GUARDED_SYMBOL_NO_EVIDENCE:-}" "${GUARDED_SYMBOL_NOT_COMPUTED:-}" "${GUARDED_LOCKED_COSMETIC:-}" "${AFFECTED_RIG_DETECTOR:-}" "${GUARDED_RIG_DETECTOR:-}" "${RIG_DETECTOR_USED:-0}" <<'PY' 2>/dev/null || true
+  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" "${AFFECTED_NOT_RUNNING:-}" "${GUARDED_OWN:-}" "${GUARDED_CLOSURE_ONLY:-}" "${GUARDED_SYMBOL_CONFIRMED:-}" "${GUARDED_SYMBOL_NO_EVIDENCE:-}" "${GUARDED_SYMBOL_NOT_COMPUTED:-}" "${GUARDED_LOCKED_COSMETIC:-}" "${GUARDED_NODRAIN_COSMETIC:-}" "${AFFECTED_RIG_DETECTOR:-}" "${GUARDED_RIG_DETECTOR:-}" "${RIG_DETECTOR_USED:-0}" <<'PY' 2>/dev/null || true
 import json, sys
-v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg, anr, gd_own, gd_co, gd_sc, gd_sne, gd_snc, gd_lc, afr_rig, gd_rig, rdu = sys.argv[1:23]
+v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg, anr, gd_own, gd_co, gd_sc, gd_sne, gd_snc, gd_lc, gd_ndc, afr_rig, gd_rig, rdu = sys.argv[1:24]
 sp = lambda s: [x for x in s.split() if x]
 print("JSON=" + json.dumps({
     "verdict": v, "reason": reason,
@@ -903,6 +908,7 @@ print("JSON=" + json.dumps({
     "guarded_symbol_confirmed": sp(gd_sc), "guarded_symbol_no_evidence": sp(gd_sne),
     "guarded_symbol_not_computed": sp(gd_snc),
     "guarded_locked_cosmetic": sp(gd_lc),
+    "guarded_nodrain_cosmetic": sp(gd_ndc),
     "affected_rig_detector": sp(afr_rig), "guarded_rig_detector": sp(gd_rig),
     "rig_detector_used": rdu == "1",
     "already_fresh": sp(afr), "would_restart": sp(wr),
@@ -927,6 +933,16 @@ GUARDED_SYMBOL_CONFIRMED=""; GUARDED_SYMBOL_NO_EVIDENCE=""; GUARDED_SYMBOL_NOT_C
 # automation AND cleanly classified no-evidence. Built in Step 5, right after
 # the three lists above are final; empty on every path that never reaches it.
 GUARDED_LOCKED_COSMETIC=""
+# ga-xrn8ni (header point 21): a SIBLING split, same shape as GUARDED_LOCKED_
+# COSMETIC just above but for a daemon that cannot be auto-restarted for a
+# DIFFERENT durable reason — SENSITIVE with no $DRAIN_CMD_<label> configured
+# (this script's own "NO drain path configured -- NOT auto-bounced" log line
+# below), never notify_only_locked. Kept as its own field rather than folded
+# into GUARDED_LOCKED_COSMETIC: the two reasons are not interchangeable in the
+# human-facing text a consumer builds from them ("notify_only_locked in
+# restart_policy.yaml" would be a FALSE claim about a daemon that isn't in
+# that file at all) — see label_no_drain_configured() below.
+GUARDED_NODRAIN_COSMETIC=""
 # ga-abofl6 (header point 20): AFFECTED_RIG_DETECTOR is a subset of AFFECTED
 # (built at Step 3, same boundary as AFFECTED_OWN above); GUARDED_RIG_DETECTOR
 # is built from it at Step 4 via classify_guarded(), same shape as GUARDED_OWN/
@@ -1686,6 +1702,34 @@ label_notify_only_locked() {
     case " $POLICY_NOTIFY_ONLY_LOCKED " in *" $base "*) return 0 ;; esac
   done
   return 1
+}
+
+# label_no_drain_configured <label> (ga-xrn8ni, header point 21) -> 0 iff this
+# label is SENSITIVE (is_sensitive || policy_says_sensitive — the same "either
+# source calling it sensitive makes it sensitive" union point 6 already
+# established) AND no $DRAIN_CMD_<sanitized-label> is set for it — the exact
+# fact that sends a SENSITIVE daemon down the "NO drain path configured -- NOT
+# auto-bounced" branch in the Step-4 loop below, rather than the drain+
+# kickstart path. Checks the underlying fact directly (never "which branch did
+# Step 4 take") so it stays correct regardless of call order: a SENSITIVE
+# daemon that DOES have a drain configured but was guarded for some OTHER
+# reason (already_fresh() false, guard_allows_restart() refused) has
+# DRAIN_CMD_<label> set and is correctly NOT no-drain-configured — that is a
+# transient/dynamic reason (an in-flight guard can allow it next cycle),
+# unlike this one, which is a static configuration gap that only changes when
+# a human wires a drain command. Never true for a SAFE daemon: the SAFE branch
+# below never even looks at DRAIN_CMD_<label>, so "no drain configured" is not
+# why a SAFE daemon would ever be GUARDED.
+# Three-state honesty, same direction as label_notify_only_locked() just
+# above: a label that is not even SENSITIVE returns 1 ("don't know / not
+# applicable"), never a false 0 — this only ever feeds
+# GUARDED_NODRAIN_COSMETIC, where a wrong 0 would let a delivery through.
+label_no_drain_configured() {
+  local label="$1" sani drain_var
+  is_sensitive "$label" || policy_says_sensitive "$label" || return 1
+  sani="${label//[^A-Za-z0-9_]/_}"
+  drain_var="DRAIN_CMD_${sani}"
+  [ -z "${!drain_var:-}" ]
 }
 
 # guard_allows_restart <label> (ga-ylr2m) -> 0 if no configured guard objects.
@@ -2973,12 +3017,20 @@ print(" ".join(no_evidence))
     # itself a subset of GUARDED — so a label can never be named here that the
     # consumer was not already holding. Annotation only: VERDICT and GUARDED are
     # untouched.
+    # ga-xrn8ni (header point 21): a SIBLING subset, same shape as
+    # GUARDED_LOCKED_COSMETIC above but for a daemon that is SENSITIVE with no
+    # $DRAIN_CMD_<label> configured — a durable configuration gap, not a
+    # deliberate human lock, but equally unable to be auto-restarted, so a
+    # merge that provably does not reach it is exonerated the same way.
     for label in $GUARDED_SYMBOL_NO_EVIDENCE; do
       if label_notify_only_locked "$label"; then
         GUARDED_LOCKED_COSMETIC="$GUARDED_LOCKED_COSMETIC $label"
+      elif label_no_drain_configured "$label"; then
+        GUARDED_NODRAIN_COSMETIC="$GUARDED_NODRAIN_COSMETIC $label"
       fi
     done
     GUARDED_LOCKED_COSMETIC="$(echo "$GUARDED_LOCKED_COSMETIC" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+    GUARDED_NODRAIN_COSMETIC="$(echo "$GUARDED_NODRAIN_COSMETIC" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
     if [ -n "${GUARDED_SYMBOL_CONFIRMED// /}" ]; then
       NGR_RANKED="${NGR_RANKED} || SYMBOL-CONFIRMED ($(echo "$GUARDED_SYMBOL_CONFIRMED" | wc -w | tr -d ' ')) -- entrypoint's call graph reaches a symbol that changed in this window (wa-th4b1), restart THESE first:${GUARDED_SYMBOL_CONFIRMED}"
     fi
@@ -2990,6 +3042,9 @@ print(" ".join(no_evidence))
     fi
     if [ -n "${GUARDED_LOCKED_COSMETIC// /}" ]; then
       NGR_RANKED="${NGR_RANKED} || TRAVA HUMANA SEM EVIDÊNCIA ($(echo "$GUARDED_LOCKED_COSMETIC" | wc -w | tr -d ' ')) -- notify_only_locked em restart_policy.yaml (nenhuma automação reinicia; só um humano, e reiniciar derruba o que o daemon hospeda) E nenhum caminho de chamada até símbolo alterado nesta janela: staleness cosmética que não se cura sozinha, então NÃO segura a entrega (ga-j3lh6p). É evidência, não prova -- mesma ressalva do split por símbolo acima (não é fechamento transitivo completo):${GUARDED_LOCKED_COSMETIC}"
+    fi
+    if [ -n "${GUARDED_NODRAIN_COSMETIC// /}" ]; then
+      NGR_RANKED="${NGR_RANKED} || SEM DRAIN CONFIGURADO, SEM EVIDÊNCIA ($(echo "$GUARDED_NODRAIN_COSMETIC" | wc -w | tr -d ' ')) -- SENSITIVE sem \$DRAIN_CMD_<label> configurado (nenhuma automação sabe drenar e reiniciar; é lacuna de configuração, não trava humana deliberada -- muda assim que alguém configurar um drain) E nenhum caminho de chamada até símbolo alterado nesta janela: staleness cosmética que não se cura sozinha, então NÃO segura a entrega (ga-xrn8ni, extensão de ga-j3lh6p). É evidência, não prova -- mesma ressalva do split por símbolo acima (não é fechamento transitivo completo):${GUARDED_NODRAIN_COSMETIC}"
     fi
   fi
   if [ -f "$DEPLOY_DEPS_JSON" ] && [ "$TOTAL_ENTRY_COUNT" -gt 0 ] && [ "$JSON_COVERED_ENTRY_COUNT" -eq "$TOTAL_ENTRY_COUNT" ]; then

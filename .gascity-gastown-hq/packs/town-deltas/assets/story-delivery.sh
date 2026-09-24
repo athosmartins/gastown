@@ -2741,6 +2741,13 @@ else
       MERGE_OWN_FRESH_COSMETIC=""
       MERGE_OWN_ACTIONABLE_STALE=""
       MERGE_OWN_LOCKED_COSMETIC_STALE=""
+      # ga-xrn8ni: a SIBLING of the two vars just above, same reset reason —
+      # the daemon-refresh.sh subset excused via a missing $DRAIN_CMD_<label>
+      # rather than restart_policy.yaml's notify_only_locked (extends
+      # ga-j3lh6p to a SENSITIVE-but-not-locked daemon).
+      MERGE_OWN_FRESH_NODRAIN_LINE=""
+      MERGE_OWN_FRESH_NODRAIN=""
+      MERGE_OWN_NODRAIN_COSMETIC_STALE=""
       if [ "$REFRESH_VERDICT" = "NEEDS_GUARDED_RESTART" ] \
          && [ "$THIS_PULL_STRUCTURALLY_INERT" = "0" ] \
          && [ -n "${MERGE_OWN_AFFECTED// /}" ]; then
@@ -2857,6 +2864,12 @@ else
         # an answer in either direction — here it simply means no split is made.
         MERGE_OWN_FRESH_COSMETIC_LINE=$(echo "$MERGE_OWN_FRESH_OUT" | grep '^GUARDED_LOCKED_COSMETIC=' | head -1 || true)
         MERGE_OWN_FRESH_COSMETIC=$(echo "$MERGE_OWN_FRESH_COSMETIC_LINE" | sed 's/^GUARDED_LOCKED_COSMETIC=//')
+        # ga-xrn8ni: a SIBLING read, same reasoning as the pair just above but
+        # for daemon-refresh.sh's GUARDED_NODRAIN_COSMETIC (extends ga-j3lh6p
+        # to a SENSITIVE daemon excused via a missing $DRAIN_CMD_<label>
+        # rather than restart_policy.yaml's notify_only_locked).
+        MERGE_OWN_FRESH_NODRAIN_LINE=$(echo "$MERGE_OWN_FRESH_OUT" | grep '^GUARDED_NODRAIN_COSMETIC=' | head -1 || true)
+        MERGE_OWN_FRESH_NODRAIN=$(echo "$MERGE_OWN_FRESH_NODRAIN_LINE" | sed 's/^GUARDED_NODRAIN_COSMETIC=//')
         log "Freshness re-probe for $STORY_ID's own affected daemon(s) [$MERGE_OWN_AFFECTED] (forced through the SENSITIVE already_fresh() check): ${MERGE_OWN_FRESH_VERDICT_LINE:-<unparseable output>} still-stale=[$MERGE_OWN_LIVE_STALE] proof=${MERGE_OWN_FRESH_PROOF:-none} (freshness floor $MERGE_OWN_REPROBE_EPOCH: merge arrived in the runtime at ${MERGE_OWN_ARRIVAL_EPOCH:-unknown}, this deploy started $DEPLOY_EPOCH)."
         # Three states, and only the first one releases:
         #   clean       — the re-probe printed BOTH a VERDICT= and a GUARDED= line,
@@ -2917,23 +2930,39 @@ else
           # helper, so it can never reach this split: this is NOT "ignore
           # notify_only_locked".
           MERGE_OWN_ACTIONABLE_STALE="$MERGE_OWN_LIVE_STALE"
+          # ga-xrn8ni: the trigger now also fires when the helper printed
+          # GUARDED_NODRAIN_COSMETIC (extends ga-j3lh6p's split to a SENSITIVE
+          # daemon excused via a missing $DRAIN_CMD_<label>, not just a
+          # notify_only_locked one) — either line alone is enough to attempt
+          # the split; a stale label not named by EITHER stays actionable.
           if [ "$MERGE_OWN_FRESH_VERDICT_LINE" = "VERDICT=NEEDS_GUARDED_RESTART" ] \
-             && [ -n "$MERGE_OWN_FRESH_COSMETIC_LINE" ]; then
+             && { [ -n "$MERGE_OWN_FRESH_COSMETIC_LINE" ] || [ -n "$MERGE_OWN_FRESH_NODRAIN_LINE" ]; }; then
             MERGE_OWN_ACTIONABLE_STALE=""
             for _sl in $MERGE_OWN_LIVE_STALE; do
               case " $MERGE_OWN_FRESH_COSMETIC " in
-                *" $_sl "*) MERGE_OWN_LOCKED_COSMETIC_STALE="$MERGE_OWN_LOCKED_COSMETIC_STALE $_sl" ;;
-                *)          MERGE_OWN_ACTIONABLE_STALE="$MERGE_OWN_ACTIONABLE_STALE $_sl" ;;
+                *" $_sl "*) MERGE_OWN_LOCKED_COSMETIC_STALE="$MERGE_OWN_LOCKED_COSMETIC_STALE $_sl"; continue ;;
               esac
+              case " $MERGE_OWN_FRESH_NODRAIN " in
+                *" $_sl "*) MERGE_OWN_NODRAIN_COSMETIC_STALE="$MERGE_OWN_NODRAIN_COSMETIC_STALE $_sl"; continue ;;
+              esac
+              MERGE_OWN_ACTIONABLE_STALE="$MERGE_OWN_ACTIONABLE_STALE $_sl"
             done
             MERGE_OWN_ACTIONABLE_STALE="$(echo "$MERGE_OWN_ACTIONABLE_STALE" | tr -s ' ' | sed 's/^ //; s/ $//')"
             MERGE_OWN_LOCKED_COSMETIC_STALE="$(echo "$MERGE_OWN_LOCKED_COSMETIC_STALE" | tr -s ' ' | sed 's/^ //; s/ $//')"
+            MERGE_OWN_NODRAIN_COSMETIC_STALE="$(echo "$MERGE_OWN_NODRAIN_COSMETIC_STALE" | tr -s ' ' | sed 's/^ //; s/ $//')"
             if [ -z "${MERGE_OWN_ACTIONABLE_STALE// /}" ]; then
               BEAD_REPROBE_STATE="locked-cosmetic"
             fi
           fi
           if [ "$BEAD_REPROBE_STATE" = "locked-cosmetic" ]; then
-            log "Daemon refresh verdict=$REFRESH_VERDICT — $STORY_ID's own merge reaches [$MERGE_OWN_AFFECTED]; the freshness re-probe confirms [$MERGE_OWN_LIVE_STALE] still run code older than the merge commit ($MERGE_SHA), but EVERY one of them is notify_only_locked (no automation may restart it) AND has no call-graph path to any symbol this merge changed ($MERGE_OWN_BASE_SHA..$MERGE_SHA) — cosmetic staleness that can never self-heal; NOT holding this delivery for it (ga-j3lh6p; wide-window overlap: [${MERGE_OWN_WIDE_OVERLAP:-none}])."
+            # ga-xrn8ni: name only the reason(s) that actually apply — never
+            # assert "notify_only_locked" for a daemon exonerated purely via
+            # the no-drain-configured set (a human checking restart_policy.yaml
+            # for it would find nothing, and rightly distrust the message).
+            COSMETIC_WHY=""
+            [ -n "${MERGE_OWN_LOCKED_COSMETIC_STALE// /}" ] && COSMETIC_WHY="${COSMETIC_WHY}[$MERGE_OWN_LOCKED_COSMETIC_STALE] notify_only_locked; "
+            [ -n "${MERGE_OWN_NODRAIN_COSMETIC_STALE// /}" ] && COSMETIC_WHY="${COSMETIC_WHY}[$MERGE_OWN_NODRAIN_COSMETIC_STALE] SENSITIVE with no \$DRAIN_CMD_<label> configured; "
+            log "Daemon refresh verdict=$REFRESH_VERDICT — $STORY_ID's own merge reaches [$MERGE_OWN_AFFECTED]; the freshness re-probe confirms [$MERGE_OWN_LIVE_STALE] still run code older than the merge commit ($MERGE_SHA), but EVERY one of them is either locked against automation or lacks a drain path (${COSMETIC_WHY%; }) AND has no call-graph path to any symbol this merge changed ($MERGE_OWN_BASE_SHA..$MERGE_SHA) — cosmetic staleness that can never self-heal; NOT holding this delivery for it (ga-j3lh6p / ga-xrn8ni; wide-window overlap: [${MERGE_OWN_WIDE_OVERLAP:-none}])."
           else
             log "Daemon refresh verdict=$REFRESH_VERDICT — $STORY_ID's own merge reaches [$MERGE_OWN_AFFECTED]; the freshness re-probe confirms [$MERGE_OWN_LIVE_STALE] still run code older than the merge commit ($MERGE_SHA) — holding this delivery for exactly those (wide-window overlap: [${MERGE_OWN_WIDE_OVERLAP:-none}])."
           fi
@@ -3091,15 +3120,35 @@ else
         # this evidence is about THIS merge only, so it releases THIS story only;
         # moving the marker would drop a still-pending sibling's merge out of its
         # own next window).
-        REFRESH_PROOF="symbol_unreachable_locked"
+        # ga-xrn8ni: two exoneration reasons can each cover a DISJOINT subset of
+        # the still-stale set (a label is never in both — see the elif in the
+        # split above). Pick the proof tier from whichever subset(s) are
+        # non-empty; a mixed batch (both non-empty) tags as the newer,
+        # less-run mechanism so it stays easy to find while it accrues
+        # production mileage — the comment below still names BOTH reasons
+        # precisely either way, never claiming one for a daemon it doesn't
+        # cover.
+        if [ -n "${MERGE_OWN_NODRAIN_COSMETIC_STALE// /}" ]; then
+          REFRESH_PROOF="symbol_unreachable_nodrain"
+        else
+          REFRESH_PROOF="symbol_unreachable_locked"
+        fi
         if [ "$DRY_RUN" != "1" ]; then
-          bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery NOT held for a locked daemon (ga-j3lh6p) — released on positive evidence, recorded here so it can be audited and disproved.
-Daemon(s) still running pre-merge code: $MERGE_OWN_LOCKED_COSMETIC_STALE
-Why that is not a dormant deploy:
-  1. notify_only_locked in restart_policy.yaml — no automation may restart it (a restart halts what it hosts, e.g. the outreach worker), so a hold on it could never clear by itself.
-  2. daemon-refresh.sh's symbol reachability, on this merge's own delta $MERGE_OWN_BASE_SHA..$MERGE_SHA, found NO call-graph path from its entrypoint to any symbol this merge changed. The analysis was cleanly evaluated — an unparseable entrypoint or a partial analysis would have been NOT COMPUTED and held.
-LIMIT: 'no call-graph path' is evidence, not proof — a changed module-level constant read by an unchanged function, or a call chain the AST walk does not follow, is invisible to it. To check by hand: run compute_symbol_reachability.py --before $MERGE_OWN_BASE_SHA --after $MERGE_SHA for that daemon, or compare \`ps -o lstart= -p <pid>\` with the merge commit date. If the daemon DOES need the new code, restart it in a window where halting what it hosts is acceptable.
-This delivery is recorded as proof=symbol_unreachable_locked (label delivery:daemon-stale-locked) — not as verified." 2>/dev/null || true
+          COSMETIC_WHY_BODY=""
+          if [ -n "${MERGE_OWN_LOCKED_COSMETIC_STALE// /}" ]; then
+            COSMETIC_WHY_BODY="${COSMETIC_WHY_BODY}Daemon(s) still running pre-merge code, LOCKED against automation (ga-j3lh6p): $MERGE_OWN_LOCKED_COSMETIC_STALE
+  Reason: notify_only_locked in restart_policy.yaml — no automation may restart it (a restart halts what it hosts, e.g. the outreach worker), so a hold on it could never clear by itself.
+"
+          fi
+          if [ -n "${MERGE_OWN_NODRAIN_COSMETIC_STALE// /}" ]; then
+            COSMETIC_WHY_BODY="${COSMETIC_WHY_BODY}Daemon(s) still running pre-merge code, SENSITIVE with NO DRAIN PATH configured (ga-xrn8ni): $MERGE_OWN_NODRAIN_COSMETIC_STALE
+  Reason: no \$DRAIN_CMD_<label> is wired for it, so automation cannot drain in-flight work before restarting it — a configuration gap, not a deliberate policy lock, that changes the moment someone configures a drain command.
+"
+          fi
+          bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery NOT held for a locked/no-drain daemon (ga-j3lh6p / ga-xrn8ni) — released on positive evidence, recorded here so it can be audited and disproved.
+${COSMETIC_WHY_BODY}daemon-refresh.sh's symbol reachability, on this merge's own delta $MERGE_OWN_BASE_SHA..$MERGE_SHA, found NO call-graph path from either daemon's entrypoint to any symbol this merge changed. The analysis was cleanly evaluated — an unparseable entrypoint or a partial analysis would have been NOT COMPUTED and held.
+LIMIT: 'no call-graph path' is evidence, not proof — a changed module-level constant read by an unchanged function, or a call chain the AST walk does not follow, is invisible to it. To check by hand: run compute_symbol_reachability.py --before $MERGE_OWN_BASE_SHA --after $MERGE_SHA for that daemon, or compare \`ps -o lstart= -p <pid>\` with the merge commit date. If a daemon DOES need the new code: restart a locked one only in a window where halting what it hosts is acceptable; restart a no-drain one by hand, or wire \$DRAIN_CMD_<label> so future deploys handle it automatically.
+This delivery is recorded as proof=$REFRESH_PROOF — not as verified." 2>/dev/null || true
         fi
       else
         err "Daemon refresh did NOT pass (verdict=$REFRESH_VERDICT): $REFRESH_REASON"
@@ -3184,12 +3233,19 @@ This delivery is recorded as proof=symbol_unreachable_locked (label delivery:dae
             # re-probe re-checks everything that is left on the same evidence and
             # releases the story only if all of it still holds (a locked daemon
             # whose analysis came back NOT COMPUTED under load would hold again).
-            HALT_LOCKED_NOTE=""; HALT_LOCKED_CLAUSE=""
+            HALT_LOCKED_NOTE=""; HALT_LOCKED_CLAUSE=""; HALT_NODRAIN_NOTE=""; HALT_NODRAIN_CLAUSE=""
             if [ "$BEAD_REPROBE_STATE" = "stale" ]; then
               HALT_OWN_LIST="$(echo "$MERGE_OWN_ACTIONABLE_STALE" | tr -s ' ' | sed 's/^ //; s/ $//')"
               if [ -n "${MERGE_OWN_LOCKED_COSMETIC_STALE// /}" ]; then
                 HALT_LOCKED_NOTE=$'\n'"Not listed above: $MERGE_OWN_LOCKED_COSMETIC_STALE — notify_only_locked (no automation may restart it) and no call-graph path to any symbol this merge changed: cosmetic staleness. Do NOT restart it on this story's account — a restart halts what it hosts and buys nothing here. Once the daemon(s) above are handled, the next sweep re-checks this one on the same evidence and, only if it still holds, releases the story (ga-j3lh6p)."
                 HALT_LOCKED_CLAUSE=" (plus $(echo "$MERGE_OWN_LOCKED_COSMETIC_STALE" | wc -w | tr -d ' ') more still on old code but locked with no call-graph path to a changed symbol — cosmetic, not listed: ga-j3lh6p)"
+              fi
+              # ga-xrn8ni: a SIBLING note/clause, same shape as the locked pair
+              # just above but for a SENSITIVE daemon excused via a missing
+              # $DRAIN_CMD_<label> instead of restart_policy.yaml.
+              if [ -n "${MERGE_OWN_NODRAIN_COSMETIC_STALE// /}" ]; then
+                HALT_NODRAIN_NOTE=$'\n'"Not listed above: $MERGE_OWN_NODRAIN_COSMETIC_STALE — SENSITIVE with no \$DRAIN_CMD_<label> configured (automation cannot drain it) and no call-graph path to any symbol this merge changed: cosmetic staleness. Do NOT restart it on this story's account on that basis alone — once the daemon(s) above are handled, the next sweep re-checks this one on the same evidence and, only if it still holds, releases the story (ga-xrn8ni, extends ga-j3lh6p)."
+                HALT_NODRAIN_CLAUSE=" (plus $(echo "$MERGE_OWN_NODRAIN_COSMETIC_STALE" | wc -w | tr -d ' ') more still on old code but SENSITIVE with no drain path configured and no call-graph path to a changed symbol — cosmetic, not listed: ga-xrn8ni)"
               fi
               HALT_OWN_BASIS="the freshness re-probe found each of these started BEFORE this merge's commit $MERGE_SHA, i.e. still running pre-merge code"
             else
@@ -3201,7 +3257,7 @@ This delivery is recorded as proof=symbol_unreachable_locked (label delivery:dae
             HALT_REACH_COUNT="$(echo "$MERGE_OWN_AFFECTED_LIVE" | wc -w | tr -d ' ')"
             HALT_CONTEXT_COUNT="$(echo "$REFRESH_GUARDED_CONTEXT_ONLY" | wc -w | tr -d ' ')"
             if [ "$BEAD_REPROBE_STATE" = "stale" ]; then
-              HALT_REASON="this merge's own delta ($MERGE_OWN_BASE_SHA..$MERGE_SHA) reaches $HALT_REACH_COUNT live daemon(s); $HALT_OWN_COUNT of them still run code older than the merge: $HALT_OWN_LIST$HALT_LOCKED_CLAUSE"
+              HALT_REASON="this merge's own delta ($MERGE_OWN_BASE_SHA..$MERGE_SHA) reaches $HALT_REACH_COUNT live daemon(s); $HALT_OWN_COUNT of them still run code older than the merge: $HALT_OWN_LIST$HALT_LOCKED_CLAUSE$HALT_NODRAIN_CLAUSE"
             else
               HALT_REASON="this merge's own delta ($MERGE_OWN_BASE_SHA..$MERGE_SHA) reaches $HALT_REACH_COUNT live daemon(s), could not confirm which are stale (freshness re-probe unavailable): $HALT_OWN_LIST"
             fi
@@ -3218,7 +3274,7 @@ This delivery is recorded as proof=symbol_unreachable_locked (label delivery:dae
 $HALT_DETAIL_BODY"
             HALT_FP_LIST="$HALT_OWN_LIST"
             REFRESH_ACTION="ACTION: restart THESE for this merge — per-bead attribution ($STORY_ID's own delta $MERGE_OWN_BASE_SHA..$MERGE_SHA reaches them; $HALT_OWN_BASIS):$HALT_OWN_LIST
-Drain in-flight messages/webhooks first, then re-run delivery. (Configure a DRAIN_CMD_<label> for daemon-refresh.sh to automate this.)${HALT_LOCKED_NOTE}
+Drain in-flight messages/webhooks first, then re-run delivery. (Configure a DRAIN_CMD_<label> for daemon-refresh.sh to automate this.)${HALT_LOCKED_NOTE}${HALT_NODRAIN_NOTE}
 Context only — NOT attributed to this merge: $HALT_CONTEXT_COUNT other sensitive daemon(s) flagged by the rig-wide window ($DAEMON_REFRESH_PRE_SHA..$POST_DEPLOY_SHA), which is judged against that window's tip commit, not this merge (cosmetic unless one of them actually uses a changed symbol; do not restart these on THIS story's account). Names deliberately omitted so this halt lists only this merge's own daemons (ga-8i2nds) — the full list is in story-delivery.log, the 'Daemon refresh verdict=' lines of this sweep.
 CAVEAT (ga-puq8z): the list above is an import/template-closure match against this merge's own delta, not proof of reachability to the changed symbols — if in doubt, compare \`ps -o lstart= -p <pid>\` against this merge's commit $MERGE_SHA before restarting."
           else
@@ -3500,6 +3556,12 @@ else
     # putting this case under it would make two different facts one label, and
     # tell Athos "may still be dormant" about something the system judged safe.
     symbol_unreachable_locked) bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:daemon-stale-locked" -q 2>/dev/null || true ;;
+    # ga-xrn8ni: same THIRD-answer reasoning as symbol_unreachable_locked just
+    # above, extended to a SENSITIVE daemon excused via a missing
+    # $DRAIN_CMD_<label> rather than restart_policy.yaml's notify_only_locked.
+    # Own label so a reader can tell the two exoneration paths apart (one
+    # names a deliberate human lock, the other a configuration gap).
+    symbol_unreachable_nodrain) bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:daemon-stale-nodrain" -q 2>/dev/null || true ;;
     *) bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:daemon-unverified" -q 2>/dev/null || true ;;
   esac
 
@@ -3544,6 +3606,10 @@ NOTE: $DONE_NOTE" 2>/dev/null || true
       # still on the old code; the analysis found no call-graph path from it to
       # anything this merge changed. Evidence, not proof.
       symbol_unreachable_locked) DONE_PUSH_TAIL="deployed + tested in prod; a notify_only_locked daemon still runs the old code — no call-graph path from it to a symbol this merge changed (evidence, not proof; see delivery:daemon-stale-locked)" ;;
+      # ga-xrn8ni: same evidence-not-proof wording as symbol_unreachable_locked
+      # just above, for a SENSITIVE daemon excused via a missing
+      # $DRAIN_CMD_<label> instead of a notify_only_locked policy entry.
+      symbol_unreachable_nodrain) DONE_PUSH_TAIL="deployed + tested in prod; a SENSITIVE daemon with no drain path configured still runs the old code — no call-graph path from it to a symbol this merge changed (evidence, not proof; see delivery:daemon-stale-nodrain)" ;;
       *) DONE_PUSH_TAIL="deployed (rig harness passed); DAEMON LIVENESS NOT VERIFIED — merged code may still be dormant, see delivery:daemon-unverified" ;;
     esac
     bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery COMPLETE. story:done (delivery:tested).

@@ -42,6 +42,28 @@
 #     never ran.
 # T7  (control): the cosmetic line names a label that is NOT the stale one ->
 #     still held (every stale label must be covered, by name).
+#
+# T8-T11 (ga-xrn8ni, extends ga-j3lh6p): a SIBLING gap — a SENSITIVE daemon with
+# NO restart_policy.yaml entry at all, simply missing a configured
+# $DRAIN_CMD_<label> (daemon-refresh.sh's own "NO drain path configured -- NOT
+# auto-bounced"), is EQUALLY unable to be auto-restarted, but the T1-T7
+# mechanism above only recognized notify_only_locked. THE BUG (wa-8yfoi,
+# 24/09): 16 such daemons held delivery FOREVER on a merge whose only new
+# symbols had zero callers among them — 3 independent manual clears in 90min
+# never stuck, because delivery:deploy-pending re-arms story:approved and the
+# next sweep re-derives the identical verdict from scratch.
+# T8  (the repro): re-probe = a no-drain-configured daemon, still stale,
+#     GUARDED_NODRAIN_COSMETIC names it -> NOT held, evidence recorded
+#     (mentions the daemon + "DRAIN_CMD", NEVER "notify_only_locked" — that
+#     file doesn't even list this daemon), proof=symbol_unreachable_nodrain.
+# T9  (control): the symbol IS reached (CONFIRMED) -> still held. This bead
+#     must never become "ignore missing drain config".
+# T10 (mixed, both cosmetic): one locked daemon AND one no-drain daemon, BOTH
+#     excused, nothing left actionable -> NOT held, evidence names BOTH
+#     daemons with their OWN distinct reason each.
+# T11 (mixed, one real): one no-drain-cosmetic daemon AND one ordinary stale
+#     daemon -> still held (the ordinary one is real work), but the halt's
+#     "restart THESE" list must NOT tell a human to restart the no-drain one.
 
 # No `pipefail` at file level (ga-uel7sb): assertions below are `X | grep ...`
 # -style pipes, and under pipefail an early-exiting reader can SIGPIPE the
@@ -72,6 +94,7 @@ BLOCK="$(sed -n '/Step 5b: Daemon freshness refresh/,/# ── Step 6: Run prod 
 MARKER_REL=".gc/runtime/daemon-refresh-baseline/whatsapp_automation.sha"
 LOCKED="com.test.demand-dashboard"
 PLAIN="com.test.plain-daemon"
+NODRAIN="com.test.no-drain-daemon"
 
 # reprobe_lines <mode> -> the KEY=value lines the bead-scoped freshness re-probe prints
 reprobe_lines() {
@@ -206,6 +229,86 @@ PROOF=not_verified
 ALL_LABELS=
 EOF
       ;;
+    nodrain_cosmetic)  # T8 — SIBLING repro: no drain configured, no symbol evidence
+      cat <<EOF
+VERDICT=NEEDS_GUARDED_RESTART
+AFFECTED=$NODRAIN
+AFFECTED_NOT_RUNNING=
+RESTARTED=
+FRESH_FAIL=
+GUARDED=$NODRAIN
+GUARDED_OWN=
+GUARDED_CLOSURE_ONLY=$NODRAIN
+GUARDED_SYMBOL_CONFIRMED=
+GUARDED_SYMBOL_NO_EVIDENCE=$NODRAIN
+GUARDED_SYMBOL_NOT_COMPUTED=
+GUARDED_LOCKED_COSMETIC=
+GUARDED_NODRAIN_COSMETIC=$NODRAIN
+REASON=freshness re-probe: still stale, no drain configured, no symbol evidence
+PROOF=not_verified
+ALL_LABELS=
+EOF
+      ;;
+    nodrain_confirmed) # T9 — control: the symbol IS reached
+      cat <<EOF
+VERDICT=NEEDS_GUARDED_RESTART
+AFFECTED=$NODRAIN
+AFFECTED_NOT_RUNNING=
+RESTARTED=
+FRESH_FAIL=
+GUARDED=$NODRAIN
+GUARDED_OWN=$NODRAIN
+GUARDED_CLOSURE_ONLY=
+GUARDED_SYMBOL_CONFIRMED=$NODRAIN
+GUARDED_SYMBOL_NO_EVIDENCE=
+GUARDED_SYMBOL_NOT_COMPUTED=
+GUARDED_LOCKED_COSMETIC=
+GUARDED_NODRAIN_COSMETIC=
+REASON=freshness re-probe: still stale, symbol reached
+PROOF=not_verified
+ALL_LABELS=
+EOF
+      ;;
+    mixed_both_cosmetic) # T10 — one locked + one no-drain, BOTH cosmetic
+      cat <<EOF
+VERDICT=NEEDS_GUARDED_RESTART
+AFFECTED=$LOCKED $NODRAIN
+AFFECTED_NOT_RUNNING=
+RESTARTED=
+FRESH_FAIL=
+GUARDED=$LOCKED $NODRAIN
+GUARDED_OWN=
+GUARDED_CLOSURE_ONLY=$LOCKED $NODRAIN
+GUARDED_SYMBOL_CONFIRMED=
+GUARDED_SYMBOL_NO_EVIDENCE=$LOCKED $NODRAIN
+GUARDED_SYMBOL_NOT_COMPUTED=
+GUARDED_LOCKED_COSMETIC=$LOCKED
+GUARDED_NODRAIN_COSMETIC=$NODRAIN
+REASON=freshness re-probe: one locked-cosmetic, one nodrain-cosmetic
+PROOF=not_verified
+ALL_LABELS=
+EOF
+      ;;
+    mixed_nodrain_actionable) # T11 — one no-drain-cosmetic AND one ordinary stale
+      cat <<EOF
+VERDICT=NEEDS_GUARDED_RESTART
+AFFECTED=$NODRAIN $PLAIN
+AFFECTED_NOT_RUNNING=
+RESTARTED=
+FRESH_FAIL=
+GUARDED=$NODRAIN $PLAIN
+GUARDED_OWN=$PLAIN
+GUARDED_CLOSURE_ONLY=$NODRAIN
+GUARDED_SYMBOL_CONFIRMED=$PLAIN
+GUARDED_SYMBOL_NO_EVIDENCE=$NODRAIN
+GUARDED_SYMBOL_NOT_COMPUTED=
+GUARDED_LOCKED_COSMETIC=
+GUARDED_NODRAIN_COSMETIC=$NODRAIN
+REASON=freshness re-probe: one real stale, one nodrain-cosmetic
+PROOF=not_verified
+ALL_LABELS=
+EOF
+      ;;
     *) echo "reprobe_lines: unknown mode '$mode'" >&2; return 1 ;;
   esac
 }
@@ -235,12 +338,21 @@ run_block() {
   # The re-probe's stdout, verbatim, in a file the fake helper cats.
   reprobe_lines "$mode" > "$T/reprobe.out" || { rm -rf "$T"; return 1; }
   local narrow_affected="$LOCKED"
-  [ "$mode" = "mixed" ] && narrow_affected="$LOCKED $PLAIN"
+  case "$mode" in
+    mixed) narrow_affected="$LOCKED $PLAIN" ;;
+    # ga-xrn8ni: the SIBLING modes need the merge to reach the no-drain daemon
+    # (instead of / alongside $LOCKED) so the freshness re-probe below gets
+    # triggered for it too.
+    nodrain_cosmetic|nodrain_confirmed) narrow_affected="$NODRAIN" ;;
+    mixed_both_cosmetic) narrow_affected="$LOCKED $NODRAIN" ;;
+    mixed_nodrain_actionable) narrow_affected="$NODRAIN $PLAIN" ;;
+  esac
 
   # Fake daemon-refresh.sh — three call shapes share this one script:
-  #   1. DRY_RUN=1, SENSITIVE_DAEMONS does NOT name the locked daemon: the
-  #      per-bead reachability probe (Path B) — reports what the merge reaches.
-  #   2. DRY_RUN=1, SENSITIVE_DAEMONS DOES name it: the freshness re-probe —
+  #   1. DRY_RUN=1, SENSITIVE_DAEMONS does NOT name the locked or no-drain
+  #      daemon: the per-bead reachability probe (Path B) — reports what the
+  #      merge reaches.
+  #   2. DRY_RUN=1, SENSITIVE_DAEMONS DOES name either: the freshness re-probe —
   #      prints $T/reprobe.out (the mode under test).
   #   3. DRY_RUN!=1: the WIDE sweep — GUARDED is an unrelated old-daemon only,
   #      the story's own daemon is off its radar (the real wa-z66jb shape:
@@ -248,7 +360,7 @@ run_block() {
   cat > "$GC_CITY/packs/town-deltas/assets/daemon-refresh.sh" <<EOF
 if [ "\$DRY_RUN" = "1" ]; then
   case " \$SENSITIVE_DAEMONS " in
-    *" $LOCKED "*)
+    *" $LOCKED "*|*" $NODRAIN "*)
       cat "$T/reprobe.out"
       exit 1
       ;;
@@ -381,6 +493,71 @@ held && ok "T6 JOB_NOT_INSTALLED carrying a cosmetic line is still HELD (the spl
 run_block foreign_label
 held && ok "T7 a cosmetic line naming a DIFFERENT label does not cover the stale one — still HELD" \
      || nok "T7 story was released though the stale label is not in the cosmetic set" "$BD_CALLS"
+
+# ── T8 (ga-xrn8ni): THE SIBLING REPRO — no drain configured + no symbol
+#    evidence: must NOT be held, and must NEVER claim notify_only_locked ──────
+run_block nodrain_cosmetic
+[ "$RUN_RC" -eq 0 ] && ok "T8 block runs clean" || nok "T8 rc" "rc=$RUN_RC vars=[$VARS_OUT]"
+held && nok "T8 story WAS held for a no-drain daemon the symbol split proves cosmetic — the bug (wa-8yfoi)" "$BD_CALLS" \
+     || ok "T8 story is NOT held (no delivery:failed / delivery:deploy-pending)"
+halt_seen && nok "T8 a 'Delivery HALTED' comment was posted" "$BD_CALLS" || ok "T8 no HALT comment"
+has "$BD_CALLS" "comment ga-test" && has "$BD_CALLS" "$NODRAIN" && has "$BD_CALLS" "DRAIN_CMD" \
+  && ok "T8 the release is RECORDED on the bead: names the daemon and the reason (missing DRAIN_CMD)" \
+  || nok "T8 no evidence comment naming the daemon + DRAIN_CMD" "$BD_CALLS"
+! has "$BD_CALLS" "notify_only_locked" \
+  && ok "T8 the evidence NEVER claims notify_only_locked (that file doesn't even list this daemon)" \
+  || nok "T8 wrongly claims notify_only_locked for a no-drain daemon" "$BD_CALLS"
+has "$BD_CALLS" "$EXPECT_C1..$EXPECT_C2" \
+  && ok "T8 the evidence names the merge range that was examined ($EXPECT_C1..$EXPECT_C2)" \
+  || nok "T8 evidence does not name the examined range" "$BD_CALLS"
+[ "$BASELINE_AFTER" = "$EXPECT_C0" ] \
+  && ok "T8 rig-wide baseline marker did NOT advance" \
+  || nok "T8 baseline marker changed" "want(unchanged)=$EXPECT_C0 got=$BASELINE_AFTER"
+has "$VARS_OUT" "STATE=locked-cosmetic" && ok "T8 re-probe state is 'locked-cosmetic' (same internal state, sibling reason)" || nok "T8 state" "$VARS_OUT"
+has "$VARS_OUT" "PROOF=symbol_unreachable_nodrain" \
+  && ok "T8 proof tier is symbol_unreachable_nodrain (its own tier, not folded into symbol_unreachable_locked)" \
+  || nok "T8 proof tier" "$VARS_OUT"
+has "$(printf %s "$LOG_OUT" | tr "[:upper:]" "[:lower:]")" "not holding" && ok "T8 log says the delivery is not held" || nok "T8 log" "$LOG_OUT"
+
+# ── T9: CONTROL — the symbol IS reached: still held ────────────────────────────
+run_block nodrain_confirmed
+held && ok "T9 a no-drain daemon whose symbol IS reached is still HELD (never 'ignore missing drain config')" \
+     || nok "T9 story was released though the symbol split says CONFIRMED" "$BD_CALLS"
+halt_seen && ok "T9 HALT comment posted" || nok "T9 missing HALT comment" "$BD_CALLS"
+has "$VARS_OUT" "STATE=stale" && ok "T9 state stays 'stale'" || nok "T9 state" "$VARS_OUT"
+[ "$BASELINE_AFTER" = "$EXPECT_C0" ] && ok "T9 marker unchanged" || nok "T9 marker" "$BASELINE_AFTER"
+
+# ── T10: MIXED, both cosmetic — a locked daemon AND a no-drain daemon, nothing
+#    actionable left -> NOT held, evidence names BOTH with their own reason ───
+run_block mixed_both_cosmetic
+held && nok "T10 story WAS held though every still-stale daemon is cosmetic-excused (one locked, one no-drain)" "$BD_CALLS" \
+     || ok "T10 story is NOT held (both daemons excused, nothing actionable left)"
+has "$BD_CALLS" "$LOCKED" && has "$BD_CALLS" "notify_only_locked" \
+  && ok "T10 evidence names the locked daemon and its OWN reason" \
+  || nok "T10 missing locked daemon / notify_only_locked" "$BD_CALLS"
+has "$BD_CALLS" "$NODRAIN" && has "$BD_CALLS" "DRAIN_CMD" \
+  && ok "T10 evidence ALSO names the no-drain daemon and its OWN, different reason" \
+  || nok "T10 missing no-drain daemon / DRAIN_CMD" "$BD_CALLS"
+has "$VARS_OUT" "PROOF=symbol_unreachable_nodrain" \
+  && ok "T10 a mixed batch tags proof=symbol_unreachable_nodrain (the newer mechanism stays visible while it accrues mileage)" \
+  || nok "T10 proof tier" "$VARS_OUT"
+
+# ── T11: MIXED, one real — a no-drain-cosmetic daemon AND an ordinary stale
+#    daemon -> still held, but 'restart THESE' must not name the no-drain one ─
+run_block mixed_nodrain_actionable
+held && ok "T11 story is still HELD (the ordinary stale daemon is real work)" \
+     || nok "T11 story was released though an ordinary daemon is still stale" "$BD_CALLS"
+ACTION_LINE="$(grep 'ACTION: restart THESE' <<<"$BD_CALLS" | head -1)"
+if [ -n "$ACTION_LINE" ]; then
+  has "$ACTION_LINE" "$PLAIN" && ok "T11 the 'restart THESE' list names the ordinary stale daemon" || nok "T11 list lacks $PLAIN" "$ACTION_LINE"
+  has "$ACTION_LINE" "$NODRAIN" && nok "T11 the 'restart THESE' list tells a human to restart the NO-DRAIN daemon" "$ACTION_LINE" \
+                                || ok "T11 the no-drain cosmetic daemon is NOT in the 'restart THESE' list"
+else
+  nok "T11 no 'ACTION: restart THESE' line in the halt" "$BD_CALLS"
+fi
+has "$BD_CALLS" "$NODRAIN" && has "$BD_CALLS" "DRAIN_CMD" \
+  && ok "T11 the halt still MENTIONS the no-drain daemon it left out, and why" \
+  || nok "T11 the no-drain daemon silently vanished from the halt (say why it was left out)" "$BD_CALLS"
 
 echo ""
 echo "story-delivery locked-cosmetic release tests: $PASS passed, $FAIL failed"
