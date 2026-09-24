@@ -1,0 +1,95 @@
+diff --git a/examples/gastown/operational_awareness_test.go b/examples/gastown/operational_awareness_test.go
+index 88d43b550..eb52dcb38 100644
+--- a/examples/gastown/operational_awareness_test.go
++++ b/examples/gastown/operational_awareness_test.go
+@@ -96,3 +96,45 @@ func TestOperationalAwarenessFragmentNonFatalDiagnostic(t *testing.T) {
+ 		}
+ 	})
+ }
++
++// TestOperationalAwarenessFragmentNoHardcodedDoltPort is the regression
++// fence for the stale-port class of bug (found live 2026-09-24: this
++// fragment hardcoded "port 3307", which is wrong for the city it was
++// actually rendered into — the real port is per-city and must be derived
++// from the running process, not written down). The fragment ships into
++// every gastown agent's prompt, so a hardcoded wrong port isn't cosmetic:
++// an agent following it verbatim targets a port nothing is listening on.
++//
++// The check can't be a plain substring-absence test for "3307": the
++// corrective text legitimately needs to mention that digit string once,
++// to warn readers away from it ("not 3307 ... this exact line used to say
++// 3307, which is wrong"). So this asserts against the specific stale
++// CLAIM ("single server on port 3307") rather than the digits, and
++// separately asserts the corrective derive-from-live-process guidance is
++// present as an active claim.
++func TestOperationalAwarenessFragmentNoHardcodedDoltPort(t *testing.T) {
++	path := filepath.Join(exampleDir(), operationalAwarenessFragment)
++	data, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatalf("read %s: %v", operationalAwarenessFragment, err)
++	}
++	body := string(data)
++
++	t.Run("no_stale_port_claim", func(t *testing.T) {
++		if strings.Contains(body, "single server on port 3307") {
++			t.Errorf("%s still claims Dolt runs on a fixed port 3307. "+
++				"The port is per-city and must never be hardcoded — derive it "+
++				"from the running process instead (gc dolt status/health).",
++				operationalAwarenessFragment)
++		}
++	})
++
++	t.Run("documents_derive_from_live_process", func(t *testing.T) {
++		if !strings.Contains(body, "Derive the live port from the running process") {
++			t.Errorf("%s does not instruct deriving the Dolt port from the "+
++				"live process; without this active guidance, readers fall back "+
++				"to whatever port number they last saw written down.",
++				operationalAwarenessFragment)
++		}
++	})
++}
+diff --git a/examples/gastown/packs/gastown/template-fragments/operational-awareness.template.md b/examples/gastown/packs/gastown/template-fragments/operational-awareness.template.md
+index 12612cfcd..83ec0f389 100644
+--- a/examples/gastown/packs/gastown/template-fragments/operational-awareness.template.md
++++ b/examples/gastown/packs/gastown/template-fragments/operational-awareness.template.md
+@@ -13,7 +13,13 @@ Your role is determined by the GC_AGENT environment variable and injected by
+ ### Dolt Server
+ 
+ Dolt is the data plane for beads (issues, mail, work history). It runs as a
+-single server on port 3307 serving all databases. **It is fragile.**
++single server serving all databases. **It is fragile.**
++
++⚠️ **Never hardcode or trust a written-down port number for Dolt (not 3307,
++not any other number) — it is per-city and this exact line used to say 3307,
++which is wrong.** Derive the live port from the running process
++(`gc dolt status`/`gc dolt health`, or the process's own `--config` /
++`dolt-config.yaml`), never from memory or a doc.
+ 
+ If you detect Dolt trouble (commands hang/timeout, "connection refused",
+ "database not found", query latency > 5s, unexpected empty results):
+@@ -73,15 +79,16 @@ gc mail send mayor -s "Dolt: <describe symptom>" -m "<paste evidence>"
+ 
+ **Do NOT just `gc dolt stop && gc dolt start` without steps 1-4.**
+ 
+-**Last resort, only with explicit human consent:** SIGQUIT to the Dolt
+-PID writes a goroutine dump to `dolt.log` AND exits the server (Dolt's
+-Go runtime treats SIGQUIT as a fatal default). Use only when steps 1-4
+-above were insufficient AND the operator has approved a Dolt restart:
+-
+-```bash
+-# WARNING: this terminates the Dolt server. Restart will follow.
+-# kill -QUIT $(cat {{ .CityRoot }}/.gc/runtime/packs/dolt/dolt.pid)
+-```
++🚨 **NEVER `kill -QUIT` the Dolt PID — verified DANGEROUS, not a safe last
++resort.** This section used to offer it as a consent-gated last resort; that
++was wrong and cost a real, if brief, citywide Dolt outage: sent to a live,
++fully-reachable `dolt sql-server` (confirmed healthy via `gc dolt health`
++immediately beforehand), the process vanished on the spot rather than
++dumping-and-continuing. Go's default SIGQUIT handling is dump-then-terminate,
++and Dolt does not install its own handler, so "consent" does not make this
++safe — it only makes the outage authorized. If steps 1-4 above weren't
++enough, escalate with the evidence (step 5) and let a human/Mayor decide the
++next step; do not send any signal to the Dolt process yourself.
+ 
+ Orphan databases (testdb_*, beads_t*, beads_pt*) accumulate on the production
+ server and degrade performance. Use `gc dolt cleanup` to remove them safely.
