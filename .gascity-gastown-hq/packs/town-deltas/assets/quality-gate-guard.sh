@@ -2332,15 +2332,17 @@ gate_base_test_verdict() {
 #                   base proves nothing (same as before ga-yl1k3w).
 #     old-passes  — the base copy ran on base and exited 0. Passing in BOTH
 #                   forms proves nothing; the file stays refusable.
-#     old-fails   — the base copy ran on base and exited non-zero: old red, new
-#                   green = a repair.
+#     old-fails   — the base copy ran on base and exited with an ordinary
+#                   failure status (1-125): old red, new green = a repair.
 #     unknown     — anything else: empty args, `git ls-tree` ERROR, the base
-#                   copy could not be extracted, or it hit the timeout (exit 124
+#                   copy could not be extracted, it hit the timeout (exit 124
 #                   is ambiguous — would it have failed, or just needed more
-#                   time in a bare throwaway worktree?). An ls-tree error must
-#                   NOT read as "path absent" (that would call a repair "added"
-#                   and refuse it), so the three-way split is on ls-tree's exit
-#                   status first and its output second.
+#                   time in a bare throwaway worktree?), or it exited 126/127
+#                   (could not execute / command not found) or >=128 (killed
+#                   by a signal) — none of which says the old test was red.
+#                   An ls-tree error must NOT read as "path absent" (that would
+#                   call a repair "added" and refuse it), so the three-way split
+#                   is on ls-tree's exit status first and its output second.
 #   Side effect, deliberate: on the paths that reach the run it OVERWRITES
 #   <worktree>/<file> with the base copy — the caller has already run the new
 #   form and does not run it again. GATE_ABT_OLD_TIMEOUT (seconds, default 30 =
@@ -2351,7 +2353,14 @@ gate_base_test_old_state() {
   if [ -z "$rig" ] || [ -z "$base" ] || [ -z "$wt" ] || [ -z "$f" ]; then
     printf 'unknown'; return 0
   fi
-  if ! tree=$(git -C "$rig" ls-tree "$base" -- "$f" 2>/dev/null); then
+  # --full-tree: <f> is ROOT-relative (it comes from `git diff --name-only`), but
+  # a plain `ls-tree` resolves it against the -C directory. The gascity rig's
+  # RIG_PATH is a SUBDIRECTORY of the repo toplevel, and there a plain ls-tree
+  # exits 0 with EMPTY output for a file that exists on base — indistinguishable
+  # from "path absent", so a real repair read as `added` and was refused
+  # (gate ga-ql6pdl, attempt 1). `git show base:path` below is already
+  # root-relative; this makes the existence probe agree with it.
+  if ! tree=$(git -C "$rig" ls-tree --full-tree "$base" -- "$f" 2>/dev/null); then
     printf 'unknown'; return 0
   fi
   if [ -z "$tree" ]; then
@@ -2365,7 +2374,12 @@ gate_base_test_old_state() {
     printf 'old-passes'
   else
     rc=$?
-    if [ "$rc" = "124" ]; then
+    # old-fails is a POSITIVE claim ("the old form ran and went red" => repair),
+    # so only an exit that means "the test ran and failed" may make it. 124 =
+    # timeout; 126/127 = the shell could not execute / find a command in this
+    # bare throwaway worktree; >=128 = killed by a signal (137 SIGKILL, 143
+    # SIGTERM). None of those says the old test was red — all are unknown.
+    if [ "$rc" = "124" ] || [ "$rc" = "126" ] || [ "$rc" = "127" ] || [ "$rc" -ge 128 ]; then
       printf 'unknown'
     else
       printf 'old-fails'
@@ -5234,9 +5248,13 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
                 # old red + new green is a test REPAIR, which no builder can make
                 # fail on base (only the test was wrong). Runs only for files that
                 # already passed, so a submission with a failing file pays nothing.
+                # Only the two answers that PROVE "nothing to repair" may leave the
+                # counters untouched (and so stay refusable); an empty or
+                # unrecognised answer is "don't know" -> unclassified, never a refusal.
                 case "$(gate_base_test_old_state "$RIG_PATH" "$_ABT_BASE" "$_ABT_WT" "$_abt_f")" in
-                  old-fails) _ABT_REPAIRED=$((_ABT_REPAIRED + 1)) ;;
-                  unknown)   _ABT_UNCLASSIFIED=$((_ABT_UNCLASSIFIED + 1)) ;;
+                  old-fails)         _ABT_REPAIRED=$((_ABT_REPAIRED + 1)) ;;
+                  added|old-passes)  : ;;
+                  *)                 _ABT_UNCLASSIFIED=$((_ABT_UNCLASSIFIED + 1)) ;;
                 esac
               else
                 _abt_rc=$?
