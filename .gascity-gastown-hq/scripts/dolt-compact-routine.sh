@@ -302,7 +302,15 @@ _backup_today_ok() {
     "[$today "*) ;;
     *) echo "latest backup run is not from today ($today): $start_line"; return 1 ;;
   esac
-  if ! printf '%s' "$block" | grep -E '=== run complete: ok=[0-9]+ failed=0 total=[0-9]+ ===' >/dev/null; then
+  # ga-0r03cl: dolt-s3-backup.sh's closing line carries trailing key=value
+  # fields after total=N (jsonl_offsite=<ok|skipped|failed> since ga-7gfd34 /
+  # feb465c8b), so the pattern tolerates any number of them. It stays strict
+  # about what this gate is FOR: ok=/failed=0/total= must parse. The JSONL
+  # offsite status is deliberately NOT a precondition — that mirror runs
+  # independently of the per-db Dolt backups (unconditionally, "regardless of
+  # $failed"), is not what a history-squash needs to be recoverable, and has
+  # its own notify_fail in dolt-s3-backup.sh.
+  if ! printf '%s' "$block" | grep -E '=== run complete: ok=[0-9]+ failed=0 total=[0-9]+( [a-z_]+=[a-z0-9_.-]+)* ===' >/dev/null; then
     local complete_line
     complete_line="$(printf '%s' "$block" | grep -m1 '=== run complete')"
     if [ -z "$complete_line" ]; then
@@ -324,7 +332,17 @@ _backup_today_ok() {
       fi
       return 1
     fi
-    echo "latest backup run did not close failed=0: $complete_line"
+    # ga-0r03cl: three states, not two. A line that reads failed=0 but did not
+    # match above is "cannot tell" (format drifted), not "run failed" — saying
+    # "did not close failed=0" about a line that literally says failed=0 sent
+    # every reader chasing a backup failure that never happened. Still refuse
+    # (fail-closed): an unparseable line never opens an irreversible compaction.
+    case "$complete_line" in
+      *" failed=0 "*)
+        echo "latest backup run's closing line reads failed=0 but its shape is unrecognised — refusing (fail-closed); update _backup_today_ok if dolt-s3-backup.sh's line changed: $complete_line" ;;
+      *)
+        echo "latest backup run did not close failed=0: $complete_line" ;;
+    esac
     return 1
   fi
   while IFS= read -r db; do

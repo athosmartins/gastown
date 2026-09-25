@@ -205,7 +205,7 @@ cat > "$BL" <<EOF
 [$TODAY 04:00:00] === run start (port=52756 bucket=x) ===
 [$TODAY 04:00:03] beads: OK (issues=0 head=abc size=1K)
 [$TODAY 04:00:06] whatsapp_automation: OK (issues=100 head=def size=1G)
-[$TODAY 04:01:20] === run complete: ok=2 failed=0 total=2 ===
+[$TODAY 04:01:20] === run complete: ok=2 failed=0 total=2 jsonl_offsite=ok ===
 EOF
 r="$(_backup_today_ok "$BL" "$TODAY" "$(printf 'beads\nwhatsapp_automation\n')")" && ok "healthy today's run, all eligible dbs OK, failed=0 → pass" || bad "should have passed: $r"
 
@@ -214,7 +214,7 @@ r="$(_backup_today_ok "$BL" "$TODAY" "$(printf 'beads\ngastown\n')")" && bad "sh
 cat > "$BL" <<EOF
 [$YDAY 04:00:00] === run start (port=52756 bucket=x) ===
 [$YDAY 04:00:03] beads: OK (issues=0 head=abc size=1K)
-[$YDAY 04:01:20] === run complete: ok=1 failed=0 total=1 ===
+[$YDAY 04:01:20] === run complete: ok=1 failed=0 total=1 jsonl_offsite=ok ===
 EOF
 r="$(_backup_today_ok "$BL" "$TODAY" "$(printf 'beads\n')")" && bad "yesterday's run should not satisfy 'today'" || ok "latest run is from yesterday → refuse ($r)"
 
@@ -222,11 +222,72 @@ cat > "$BL" <<EOF
 [$TODAY 04:00:00] === run start (port=52756 bucket=x) ===
 [$TODAY 04:00:03] beads: OK (issues=0 head=abc size=1K)
 [$TODAY 04:00:06] whatsapp_automation: DOLT_BACKUP sync FAILED
-[$TODAY 04:01:20] === run complete: ok=1 failed=1 total=2 ===
+[$TODAY 04:01:20] === run complete: ok=1 failed=1 total=2 jsonl_offsite=ok ===
 EOF
 r="$(_backup_today_ok "$BL" "$TODAY" "$(printf 'beads\n')")" && bad "failed=1 in the run should refuse even if MY eligible db was OK" || ok "run closed with failed=1 (a DIFFERENT db failed) → refuse anyway ($r)"
 
 r="$(_backup_today_ok "$SCRATCH/does-not-exist.log" "$TODAY" "$(printf 'beads\n')")" && bad "missing log should refuse" || ok "no backup log at all → refuse, fail-closed ($r)"
+
+# ga-0r03cl: the closing line the LIVE dolt-s3-backup.sh writes carries an
+# extra trailing field (jsonl_offsite=<ok|skipped|failed>, added by ga-7gfd34 /
+# feb465c8b). The gate's regex was written against the older
+# "... total=N ===" shape and never matched the live line — not even on a
+# 100%-clean night — while every fixture in this file kept using the OLD shape,
+# so the suite stayed green. The JSONL offsite mirror is independent of the
+# per-db Dolt backups (dolt-s3-backup.sh runs it "regardless of $failed") and
+# has its own notify_fail, so its status must NEVER decide the compaction gate.
+for js in ok skipped failed; do
+  cat > "$BL" <<EOF
+[$TODAY 04:00:00] === run start (port=52756 bucket=x) ===
+[$TODAY 04:00:03] beads: OK (issues=0 head=abc size=1K)
+[$TODAY 04:01:20] === run complete: ok=1 failed=0 total=1 jsonl_offsite=$js ===
+EOF
+  r="$(_backup_today_ok "$BL" "$TODAY" "$(printf 'beads\n')")" && ok "live closing line with jsonl_offsite=$js and failed=0 → pass" || bad "REGRESSION (ga-0r03cl): live closing line 'failed=0 ... jsonl_offsite=$js' must pass the gate — got: '$r'"
+done
+
+# failed>0 still refuses whatever the extra field says (the per-db result is
+# what this gate is about), and the message says WHY.
+cat > "$BL" <<EOF
+[$TODAY 04:00:00] === run start (port=52756 bucket=x) ===
+[$TODAY 04:00:03] beads: OK (issues=0 head=abc size=1K)
+[$TODAY 04:01:20] === run complete: ok=1 failed=1 total=2 jsonl_offsite=ok ===
+EOF
+r="$(_backup_today_ok "$BL" "$TODAY" "$(printf 'beads\n')")" && bad "failed=1 with jsonl_offsite=ok must still refuse" || ok "live line with failed=1 → refuse ($r)"
+case "$r" in *"did not close failed=0"*"failed=1"*) ok "failed>0 message quotes the closing line" ;; *) bad "failed>0 message should say the run did not close failed=0 and quote the line — got: '$r'" ;; esac
+
+# A closing line that says failed=0 but that the gate cannot parse must refuse
+# (fail-closed) WITHOUT claiming the run "did not close failed=0" — that
+# sentence about a line that literally reads failed=0 is the misleading message
+# this bead's own report called out. Three states: closed clean / closed with
+# failures / cannot tell.
+cat > "$BL" <<EOF
+[$TODAY 04:00:00] === run start (port=52756 bucket=x) ===
+[$TODAY 04:00:03] beads: OK (issues=0 head=abc size=1K)
+[$TODAY 04:01:20] === run complete: ok=1 failed=0 total=one jsonl_offsite=ok ===
+EOF
+r="$(_backup_today_ok "$BL" "$TODAY" "$(printf 'beads\n')")" && bad "unparseable closing line must refuse (fail-closed)" || ok "failed=0 line the gate cannot parse → refuse ($r)"
+case "$r" in
+  *"did not close failed=0"*) bad "REGRESSION (ga-0r03cl): a line reading failed=0 must not be reported as 'did not close failed=0' — got: '$r'" ;;
+  *"unrecognised"*) ok "message says the line shape is unrecognised, not that the run failed" ;;
+  *) bad "message should say the closing line is unrecognised — got: '$r'" ;;
+esac
+
+# Contract test: build the closing line from the LIVE emitter's own format
+# string instead of a hand-typed fixture, so a future change to that line
+# breaks HERE (the consumer) instead of silently re-closing the gate forever.
+tmpl="$(grep -m1 'log "=== run complete:' "$HERE/dolt-s3-backup.sh" | sed -E 's/^.*log "(=== run complete:[^"]*)".*$/\1/')"
+if [ -z "$tmpl" ]; then
+  bad "cannot locate the run-complete emitter in dolt-s3-backup.sh — contract test has nothing to check"
+else
+  live="${tmpl//\$ok/2}"; live="${live//\$failed/0}"; live="${live//\$total/2}"
+  live="$(printf '%s' "$live" | sed -E 's/\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/ok/g')"
+  cat > "$BL" <<EOF
+[$TODAY 04:00:00] === run start (port=52756 bucket=x) ===
+[$TODAY 04:00:03] beads: OK (issues=0 head=abc size=1K)
+[$TODAY 04:01:20] $live
+EOF
+  r="$(_backup_today_ok "$BL" "$TODAY" "$(printf 'beads\n')")" && ok "line built from the live emitter's format string ('$live') → pass" || bad "REGRESSION (ga-0r03cl): the gate rejects the line dolt-s3-backup.sh actually writes ('$live') — got: '$r'"
+fi
 
 # ga-abrbt: today's run started but ABORTED before ever reaching "run
 # complete" (dolt-s3-backup.sh's own FATAL early-exit when Dolt is
