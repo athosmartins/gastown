@@ -422,8 +422,26 @@ nudge_author_with_fallback() {
         ;;
     esac
   fi
+  # ga-aijm2v.5 (rule 3): GATE_FAIL_DEFER_MAYOR=1 (set ONLY around the first gate-FAIL
+  # nudge, and only for an ephemeral pool author — see gate_fail_author_is_ephemeral)
+  # takes the Mayor out of the cascade and out of the total-failure page. For such an
+  # author the Mayor is a routing SENTINEL ("mayor" replaces an unreachable
+  # wa-worker/dog session), and the source bead returns to its pool on its own — a wake
+  # there asked the Mayor for nothing. Unset (the default, and every other call site) =
+  # today's behaviour exactly. The page is not dropped, it is DEFERRED: the FAIL path
+  # settles it once the re-dispatch has been read back (gate_fail_settle_deferred_mayor_wake).
+  local _defer="${GATE_FAIL_DEFER_MAYOR:-0}"
   if [ -n "$_author" ] && [ "$_author" != "$_notify_author" ]; then
     _candidates="$_candidates $_author"
+  fi
+  if [ "$_defer" = "1" ]; then
+    # Filter the WHOLE list, not just $_author: when the branch is not crew/<name>/*, the caller
+    # sets NOTIFY_AUTHOR="$AUTHOR", so the rewritten "mayor" sentinel is then the FIRST candidate.
+    local _kept="" _c
+    for _c in $_candidates; do
+      case "$_c" in mayor|gastown.mayor|gastown__mayor) ;; *) _kept="$_kept $_c" ;; esac
+    done
+    _candidates="${_kept# }"
   fi
   local _notified="" _candidate
   for _candidate in $_candidates; do
@@ -431,6 +449,18 @@ nudge_author_with_fallback() {
       && { _notified="$_candidate"; break; }
   done
   [ -n "$_notified" ] && return 0
+  if [ "$_defer" = "1" ]; then
+    warn "Could not nudge any author candidate ($_candidates) for $_fail_context — Mayor page DEFERRED until the re-dispatch is verified (ga-aijm2v.5)"
+    GATE_FAIL_MAYOR_DEFERRED=1
+    GATE_FAIL_MAYOR_DEFER_CTX="$_fail_context"
+    GATE_FAIL_MAYOR_DEFER_CANDIDATES="$_candidates"
+    # Still leave the durable trace (ga-fe5at: "not notified" must never read as "notified") —
+    # worded for what actually happened: the Mayor was NOT paged (yet).
+    bd -C "$GC_CITY" comment "$_bead_id" \
+      "Author-nudge FAILED for every candidate ($_candidates) for: $_fail_context — the author is an ephemeral pool session, so this is expected; the Mayor was NOT paged. The FAIL path pages it only if the source bead's return to the pool cannot be verified (ga-aijm2v.5)." \
+      2>/dev/null || true
+    return 1
+  fi
   warn "Could not nudge any author candidate ($_candidates) for $_fail_context — escalating to mayor"
   gc --city "$GC_CITY" mail send mayor \
     -s "Gate: author unreachable for $_bead_id" \
@@ -2617,6 +2647,72 @@ gate_fail_assignee_action() {
   else
     printf 'clear'
   fi
+}
+
+# gate_fail_author_is_ephemeral <author> — pure; selftest-sourceable.
+# ga-aijm2v.5 (rule 3): true (rc 0) when <author> is a disposable pool slot — wa-worker,
+# ps-worker, gastown.dog, dog-* — or the "mayor" routing sentinel the author normalizer
+# substitutes for an unreachable one. Deliberately NOT a second pattern list: it asks
+# gate_fail_assignee_action with alive=1, whose deny-list (ga-nkkku / ga-mgrma) already IS
+# this codebase's definition of "never a named crew, regardless of liveness", so the two
+# cannot drift. An empty author is not ephemeral (there is nobody to classify).
+gate_fail_author_is_ephemeral() {
+  local author="${1:-}"
+  [ -n "$author" ] || return 1
+  [ "$(gate_fail_assignee_action "$author" 1)" = "clear" ]
+}
+
+# gate_fail_redispatch_verified <route_obs> <route> <assignee_obs> <route_unknown> — pure;
+# echoes 1 or 0. ga-aijm2v.5 (rule 3): 1 ONLY when the FAIL path's own post-write READ-BACK
+# (not its intent) shows both facts that make "the source bead returns to the pool by itself"
+# true: gc.routed_to is the restored pool AND the assignee is cleared. Every other state —
+# read failed (UNVERIFIED), restore did not stick, assignee still held, or the route was a
+# GUESS because the home store did not resolve to a rig — is 0. An unknown must never read as
+# "fine" (ga-p5q3): a 1 here is what keeps the Mayor asleep. The strings compared are exactly
+# the ones the return-to-pool arm sets on success.
+gate_fail_redispatch_verified() {
+  local route_obs="${1:-}" route="${2:-}" assignee_obs="${3:-}" route_unknown="${4:-1}"
+  if [ -n "$route" ] && [ "$route_unknown" = "0" ] \
+     && [ "$route_obs" = "gc.routed_to=${route} (restored)" ] \
+     && [ "$assignee_obs" = "assignee=cleared" ]; then
+    printf '1'
+  else
+    printf '0'
+  fi
+}
+
+# gate_fail_settle_deferred_mayor_wake — ga-aijm2v.5 (rule 3). Runs ONCE, at the end of the
+# gate-FAIL path, and decides the Mayor page that nudge_author_with_fallback deferred for an
+# ephemeral pool author. It cannot be decided at nudge time: gc.routed_to is restored — and read
+# back — only AFTER that nudge, so "the bead is routed" is unknowable there.
+#   - fix-attempt cap escalation already paged the Mayor  -> do not page twice;
+#   - re-dispatch VERIFIED (route restored + assignee cleared, read back) -> the bead comes back
+#     to the pool by itself (gate:needs-fix, up to GATE_FIX_CAP attempts): no page;
+#   - anything else (stale-SHA arm, dry run, no bead, failed/UNVERIFIED read-back, route guessed)
+#     -> page exactly as before, same subject, plus a bead comment saying so.
+# One-shot: clears the deferral, so a second call never pages twice. No-op when nothing deferred.
+gate_fail_settle_deferred_mayor_wake() {
+  [ "${GATE_FAIL_MAYOR_DEFERRED:-0}" = "1" ] || return 0
+  local _ctx="${GATE_FAIL_MAYOR_DEFER_CTX:-gate FAIL nudge}" _cands="${GATE_FAIL_MAYOR_DEFER_CANDIDATES:-}"
+  local _bid="${BEAD_ID:-unknown}"
+  GATE_FAIL_MAYOR_DEFERRED=0
+  if [ "${GATE_FAIL_CAP_ESCALATED:-0}" = "1" ]; then
+    log "  ga-aijm2v.5: Mayor NOT paged separately for $_bid — the fix-attempt cap escalation already paged it."
+    return 0
+  fi
+  if [ "${GATE_FAIL_REDISPATCH_VERIFIED:-0}" = "1" ]; then
+    log "  ga-aijm2v.5: Mayor NOT paged for $_bid — an unreachable ephemeral author is expected; the source bead's return to the pool was verified post-write (route restored, assignee cleared)."
+    return 0
+  fi
+  warn "Ephemeral-author FAIL for $_bid: the return to the pool could not be verified — paging the Mayor after all (ga-aijm2v.5)"
+  gc --city "$GC_CITY" mail send mayor \
+    -s "Gate: author unreachable for $_bid" \
+    -m "$_ctx — could not nudge ANY author candidate (${_cands:-none}); the author was never notified, AND the source bead's return to the pool could not be verified after the FAIL (route not restored or not read back, assignee not cleared, or no fix-attempt path ran). Please look at $_bid." \
+    2>/dev/null || warn "Could not mail Mayor for $_bid (deferred ephemeral-author FAIL)"
+  bd -C "$GC_CITY" comment "$_bid" \
+    "Mayor PAGED (ga-aijm2v.5): the author nudge failed (ephemeral session) and the source bead's return to the pool could not be verified after this FAIL." \
+    2>/dev/null || true
+  return 0
 }
 
 # default_pool_route_for_rig <rig> — pure; selftest-sourceable.
@@ -7999,6 +8095,17 @@ else
   # long comment at the newly-inserted `fi` above this if for the full story.
   log "Gate FAILED: $FAIL_REASONS"
 
+  # ga-aijm2v.5 wiring[reset]: per-run state for the deferred-Mayor-page logic (rule 3).
+  # gate_finalize_run is invoked once per marker from Phase C's loop in the SAME process, so
+  # these are globals that would otherwise LEAK from one run into the next — a stale
+  # REDISPATCH_VERIFIED=1 would silence the Mayor for a run that never verified anything.
+  GATE_FAIL_DEFER_MAYOR=0
+  GATE_FAIL_MAYOR_DEFERRED=0
+  GATE_FAIL_REDISPATCH_VERIFIED=0
+  GATE_FAIL_CAP_ESCALATED=0
+  GATE_FAIL_MAYOR_DEFER_CTX=""
+  GATE_FAIL_MAYOR_DEFER_CANDIDATES=""
+
   set_gate_status "$MARKER_ID" "failed"
   # ga-jhyu: CLOSE the marker at terminal (failed) so it is reaped. A FAIL is
   # terminal for THIS gate attempt — re-running /gate-done mints a fresh marker.
@@ -8036,6 +8143,17 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
   # mayor + durable bd comment, per its own doc comment) — `|| true` here only
   # neutralizes the return code for script control flow, it changes no
   # notification behavior. See SELFTEST-EXTRACT nudge-call-site-1 below.
+  # ga-aijm2v.5 wiring[defer-on] (rule 3): an EPHEMERAL pool author (wa-worker / ps-worker /
+  # dog session, or the "mayor" sentinel that replaced one) is unreachable by design — its
+  # session drained after submitting — and the source bead returns to the pool on its own
+  # below. Waking the Mayor for that asked it for nothing (~8 wakes on 2026-09-25, none needing
+  # action; each costs a turn re-reading ~440k tokens). So for those authors the Mayor page is
+  # DEFERRED (nudge_author_with_fallback with GATE_FAIL_DEFER_MAYOR=1) and settled at the end of
+  # this FAIL path (gate_fail_settle_deferred_mayor_wake), once the re-dispatch has been READ
+  # BACK. Named crews keep today's immediate escalation. Set outside the SELFTEST-EXTRACT block
+  # so the existing extract-based selftests see the block unchanged.
+  GATE_FAIL_DEFER_MAYOR=0
+  if gate_fail_author_is_ephemeral "$AUTHOR"; then GATE_FAIL_DEFER_MAYOR=1; fi
   # SELFTEST-EXTRACT nudge-call-site-1: BEGIN
   if [ -n "$NOTIFY_AUTHOR" ]; then
     nudge_author_with_fallback "$BEAD_ID" "$NOTIFY_AUTHOR" "$AUTHOR" \
@@ -8043,6 +8161,9 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       "Gate FAIL nudge for $BEAD_ID (branch $BRANCH, gate_run $GATE_RUN_ID)" || true
   fi
   # SELFTEST-EXTRACT nudge-call-site-1: END
+  # ga-aijm2v.5 wiring[defer-off]: the switch is for THIS nudge only — the live-crew nudge and
+  # every other nudge_author_with_fallback call site keep today's behaviour.
+  GATE_FAIL_DEFER_MAYOR=0
 
   # ── ga-jb4l: SELF-HEALING FAIL LOOP ────────────────────────────────────────
   # A gate FAIL must not strand the source story forever. The legacy FAIL path
@@ -8286,6 +8407,10 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       # imp13: emit human-touch ledger entry (technical kind) for 99% metric.
       { source "$GC_CITY/scripts/gc-ledger.sh" 2>/dev/null && \
         gc_ledger_append "human-touch" "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"source_daemon\":\"quality-gate-dispatcher\",\"stage\":\"executa\",\"kind\":\"technical\",\"bead_id\":\"${BEAD_ID}\",\"reason\":\"Gate fix-cap exhausted (${GATE_FIX_CAP} attempts) — circuit-breaker park (armed=$_NH_STATUS)\"}"; } 2>/dev/null || true
+      # ga-aijm2v.5 wiring[cap-covered]: at exhaustion THIS branch owns the Mayor page — its own
+      # once-only mail below, or the gate:needs-human label proving it was already paged on an
+      # earlier cycle. Tell the deferred-page settle (rule 3) not to add a second wake.
+      GATE_FAIL_CAP_ESCALATED=1
       # Escalate EXACTLY once: only mail if gate:needs-human was not already set.
       if ! printf '%s' "$SRC_LABELS" | grep "gate:needs-human" >/dev/null; then
         _NH_MAIL_SUBJ="Gate needs-human: $BEAD_ID exhausted $GATE_FIX_CAP fix attempts"
@@ -8545,10 +8670,21 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         fi
         _GFAIL_ROUTE_UNKNOWN_NOTE=""
         [ "$_GFAIL_ROUTE_UNKNOWN" = "1" ] && _GFAIL_ROUTE_UNKNOWN_NOTE=" NOTE: bead_city='$BEAD_CITY' did not reverse-resolve to any registered rig — route defaulted to gastown.dog rather than guessed (ga-u679x2)."
+        # ga-aijm2v.5 wiring[verified] (rule 3): the READ-BACK above (not the write) is what tells
+        # us the source bead really returns to the pool by itself — route restored AND assignee
+        # cleared, on a route that was resolved rather than guessed. Only then may the settle step
+        # keep the Mayor asleep for an ephemeral author; UNVERIFIED / did-not-stick / guessed => 0.
+        GATE_FAIL_REDISPATCH_VERIFIED=$(gate_fail_redispatch_verified "${_GFAIL_ROUTE_OBS:-}" "$_GFAIL_ROUTE" "${_GFAIL_ASSIGNEE_OBS:-}" "$_GFAIL_ROUTE_UNKNOWN")
         bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) cleared. gc.routed_to restored to $_GFAIL_ROUTE (from the bead's own home store, ga-u679x2) so pool workers can self-serve this bead (ga-f54ui) — verified post-write, not assumed: $_GFAIL_ROUTE_OBS; $_GFAIL_ASSIGNEE_OBS; $_GFAIL_STATUS_OBS; $_GFAIL_QUEUED_OBS (ga-39l9z2).$_GFAIL_ROUTE_UNKNOWN_NOTE The Pilot will also re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
       fi
     fi
   fi
+
+  # ga-aijm2v.5 wiring[settle] (rule 3): decide the Mayor page deferred by the first author nudge
+  # (ephemeral pool author). Runs here — after the fix-attempt/cap/re-dispatch logic has run and
+  # read the source bead back — and also when that logic was skipped (no bead id, dry run, stale
+  # SHA arm), in which case nothing is verified and the Mayor is paged exactly as before.
+  gate_fail_settle_deferred_mayor_wake || true
 
   # wa-uthi: TERMINAL FAIL (review rejected, definitive) — this push is KEPT.
   notify -t "Quality Gate FAILED" -p 3 "Branch $BRANCH failed review — $TIER, ${ELAPSED_S}s" 2>/dev/null || true
