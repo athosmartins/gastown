@@ -1515,5 +1515,180 @@ printf '%s' "$FBODY" | grep -qF '_s3proof_repair_then_prove' \
   || bad "the refusal mirror bypasses the shared proof lib"
 grep -qF 'dolt-backup-s3-proof.sh' "$SCRIPT" && ok "the proof lib is sourced by the script" || bad "proof lib not sourced"
 
+echo "── _build_run_fingerprint() — a db that FAILED stays in _meta/latest.json (ga-gjfe78) ──"
+# The nightly fingerprint used to be rebuilt from scratch from the dbs that
+# SUCCEEDED, so a failing db (hq, every night since 2026-09-21) simply vanished:
+# no entry, no failed mark, no last good date — indistinguishable from a db that
+# never existed. Rules under test: every discovered db keeps an entry; a failed
+# one is marked failed and keeps the date/values of its last good backup when
+# they can be found; and a failed entry carries NO key an old reader would take
+# as proof. last_ok null means NOT KNOWN — never "there was none": a db absent
+# from the previous file may simply have been dropped by the old writer.
+type _build_run_fingerprint >/dev/null 2>&1 \
+  && ok "_build_run_fingerprint defined by lib-mode source" \
+  || bad "_build_run_fingerprint NOT defined — the fingerprint is still built inline and drops failed dbs"
+
+FPD="$(mktemp -d)"
+TAB="$(printf '\t')"
+_raw() { : > "$FPD/raw"; for row in "$@"; do printf '%s\n' "$row" | tr '|' "$TAB" >> "$FPD/raw"; done; }
+# _build <discovered> <failed_text> <prev_file> [ok failed total]
+_build() {
+  _build_run_fingerprint "$FPD/raw" "2026-09-25T07:04:02Z" 52756 "${4:-1}" "${5:-0}" "${6:-1}" "$1" "$2" "$3" > "$FPD/out.json" 2> "$FPD/err"
+}
+# _jt <python expr over d = the built document> — exit 0 iff truthy.
+# eval() is deliberate and safe here: every expression passed in is a string
+# literal written in THIS test file, and the only data it ever sees is the JSON
+# this test just produced in its own mktemp dir. No external or untrusted input
+# reaches it, and it is never used outside this hermetic selftest.
+_jt() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if eval(sys.argv[2]) else 1)' "$FPD/out.json" "$1" 2>/dev/null; }
+
+# the writer exactly as it was before ga-gjfe78, kept here as the compatibility oracle
+cat > "$FPD/legacy.py" <<'PY'
+import json, sys
+raw, run_utc, port, ok, failed, total = sys.argv[1:7]
+dbs = {}
+try:
+    with open(raw) as f:
+        for line in f:
+            p = line.rstrip("\n").split("\t")
+            if len(p) >= 4:
+                dbs[p[0]] = {"issues": int(p[1]), "head": p[2], "backup_size": p[3]}
+except FileNotFoundError:
+    pass
+json.dump({"run_utc": run_utc, "port": int(port), "bucket": "urblink-dolt-backups",
+           "ok": int(ok), "failed": int(failed), "total": int(total),
+           "databases": dbs}, sys.stdout, indent=2)
+PY
+
+# 1) nothing failed → byte-identical to what the old writer produced
+_raw "beads|10|bh1|1M" "gastown|20|gh1|2M"
+_build "beads gastown" "" "" 2 0 2
+python3 "$FPD/legacy.py" "$FPD/raw" "2026-09-25T07:04:02Z" 52756 2 0 2 > "$FPD/legacy.json"
+cmp -s "$FPD/out.json" "$FPD/legacy.json" \
+  && ok "no failures → output is BYTE-IDENTICAL to the pre-ga-gjfe78 writer (existing readers see nothing new on a good night)" \
+  || bad "no failures → output differs from the old writer: $(diff "$FPD/legacy.json" "$FPD/out.json" | head -5 | tr '\n' ' ')"
+
+# 2) hq failed; previous fingerprint is a legacy one (no per-db run_utc) where hq was ok
+cat > "$FPD/prev-legacy.json" <<'JSON'
+{"run_utc": "2026-09-20T07:00:00Z", "port": 52756, "bucket": "urblink-dolt-backups", "ok": 2, "failed": 0, "total": 2,
+ "databases": {"beads": {"issues": 1, "head": "old-b", "backup_size": "1M"}, "hq": {"issues": 7242, "head": "hq-old", "backup_size": "13G"}}}
+JSON
+_raw "beads|10|bh1|1M"
+_build "beads hq" " hq(sync)" "$FPD/prev-legacy.json" 1 1 2
+_jt 'sorted(d["databases"]) == ["beads", "hq"]' && ok "failed db stays LISTED in databases (the bug: it vanished)" || bad "failed db is not listed in databases"
+_jt 'd["databases"]["hq"]["status"] == "failed"' && ok "failed db is marked status=failed" || bad "failed db not marked failed"
+_jt 'd["databases"]["hq"]["reason"] == "sync"' && ok "reason taken from the run's own failure token (sync)" || bad "reason not carried"
+_jt 'd["databases"]["hq"]["last_ok_run_utc"] == "2026-09-20T07:00:00Z"' && ok "last_ok_run_utc = the shared run time of the previous fingerprint where hq was last ok" || bad "last_ok_run_utc wrong"
+_jt 'd["databases"]["hq"]["last_ok"] == {"issues": 7242, "head": "hq-old", "backup_size": "13G"}' && ok "last good issues/head/backup_size preserved under last_ok" || bad "last_ok values not preserved"
+_jt 'not ({"run_utc", "issues", "head", "backup_size"} & set(d["databases"]["hq"]))' && ok "failed entry carries NO run_utc/issues/head/backup_size at its top level (nothing an old reader takes as proof)" || bad "failed entry still carries a proof-looking key"
+_jt 'set(d["databases"]["hq"]) == {"status", "reason", "last_ok_run_utc", "last_ok"}' && ok "failed entry has exactly status/reason/last_ok_run_utc/last_ok (no extra claim such as a known/none flag)" || bad "failed entry key set drifted: $(python3 -c 'import json,sys; print(sorted(json.load(open(sys.argv[1]))["databases"]["hq"]))' "$FPD/out.json" 2>&1)"
+_jt 'd["databases"]["beads"] == {"issues": 10, "head": "bh1", "backup_size": "1M"}' && ok "the ok sibling is untouched (no status key, same shape as before)" || bad "ok sibling changed shape"
+_jt 'd["ok"] == 1 and d["failed"] == 1 and d["total"] == 2 and d["run_utc"] == "2026-09-25T07:04:02Z" and d["port"] == 52756' && ok "top-level run_utc/port/ok/failed/total pass through unchanged" || bad "top-level fields changed"
+
+# 3) previous entry had its OWN run_utc (an ad hoc reseed refreshed it) → that wins over the shared one
+cat > "$FPD/prev-perdb.json" <<'JSON'
+{"run_utc": "2026-09-20T07:00:00Z", "databases": {"hq": {"issues": 5, "backup_size": "9G", "run_utc": "2026-09-22T15:30:00Z"}}}
+JSON
+_raw "beads|10|bh1|1M"
+_build "beads hq" " hq(s3)" "$FPD/prev-perdb.json"
+_jt 'd["databases"]["hq"]["last_ok_run_utc"] == "2026-09-22T15:30:00Z"' && ok "previous per-db run_utc (ad hoc reseed) wins over the shared top-level time" || bad "per-db run_utc precedence lost"
+_jt 'd["databases"]["hq"]["last_ok"]["backup_size"] == "9G" and d["databases"]["hq"]["reason"] == "s3"' && ok "last_ok backup_size + reason=s3 carried" || bad "last_ok/reason wrong for the per-db case"
+
+# 4) SECOND consecutive failed night — the last-ok date must be carried forward, not reset to last night
+python3 - "$FPD" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1] + "/out.json"))
+json.dump(d, open(sys.argv[1] + "/prev-failed.json", "w"))
+PY
+_raw "beads|11|bh2|1M"
+_build "beads hq" " hq(sync)" "$FPD/prev-failed.json"
+_jt 'd["databases"]["hq"]["last_ok_run_utc"] == "2026-09-22T15:30:00Z" and d["databases"]["hq"]["last_ok"]["backup_size"] == "9G"' && ok "night 2 of failing: the ORIGINAL last-ok date/values are carried forward (not reset to the previous failed night)" || bad "second failed night lost the real last-ok date"
+
+# 5) previous fingerprint UNREADABLE → last ok is NOT KNOWN (null), never a made-up value
+_raw "beads|10|bh1|1M"
+: > "$FPD/prev-empty.json"
+echo '{ not json' > "$FPD/prev-garbage.json"
+echo '["a list"]' > "$FPD/prev-list.json"
+echo '{"run_utc": "2026-09-20T07:00:00Z", "databases": "x"}' > "$FPD/prev-baddbs.json"
+for variant in "" "$FPD/does-not-exist.json" "$FPD/prev-empty.json" "$FPD/prev-garbage.json" "$FPD/prev-list.json" "$FPD/prev-baddbs.json"; do
+  _build "beads hq" " hq(sync)" "$variant"
+  _jt 'd["databases"]["hq"]["last_ok_run_utc"] is None and d["databases"]["hq"]["last_ok"] is None' \
+    && ok "previous fingerprint unusable (${variant:+${variant##*/}}${variant:-<no file given>}) → last_ok null (not known), never a fabricated value" \
+    || bad "unusable previous fingerprint (${variant:-<none>}) must give last_ok null"
+done
+
+# 6) previous fingerprint readable but has no entry for this db. This is EXACTLY
+#    what the old writer left behind for hq, so absence proves nothing about
+#    whether hq ever had a good backup — the honest answer is null (not known).
+#    A "none"/"never" claim here would be false on the first night after deploy.
+cat > "$FPD/prev-nohq.json" <<'JSON'
+{"run_utc": "2026-09-20T07:00:00Z", "databases": {"beads": {"issues": 1, "head": "x", "backup_size": "1M"}}}
+JSON
+_build "beads hq" " hq(sync)" "$FPD/prev-nohq.json"
+_jt 'd["databases"]["hq"]["last_ok_run_utc"] is None and d["databases"]["hq"]["last_ok"] is None and d["databases"]["hq"]["status"] == "failed"' \
+  && ok "previous readable but WITHOUT the db (what the old writer left for hq) → failed entry with last_ok null = not known, no claim that none ever existed" \
+  || bad "db absent from a readable previous file must give last_ok null"
+
+# 7) previous entry present but malformed / unrecognized status → cannot know
+cat > "$FPD/prev-odd.json" <<'JSON'
+{"run_utc": "2026-09-20T07:00:00Z", "databases": {"hq": "oops", "dc": {"status": "partial", "backup_size": "1M"}}}
+JSON
+_build "beads hq dc" " hq(sync) dc(sync)" "$FPD/prev-odd.json"
+_jt 'd["databases"]["hq"]["last_ok"] is None and d["databases"]["dc"]["last_ok"] is None and d["databases"]["dc"]["last_ok_run_utc"] is None' \
+  && ok "previous entry not an object / unrecognized status → last_ok null (does not guess)" \
+  || bad "odd previous entries must give last_ok null"
+
+# 8) the discovered list is the source of truth for WHO failed; the text only supplies the reason
+_raw "beads|10|bh1|1M"
+_build "beads hq" "" "$FPD/prev-legacy.json"
+_jt 'd["databases"]["hq"]["status"] == "failed" and d["databases"]["hq"]["reason"] == "unknown"' \
+  && ok "db discovered but neither succeeded nor named in the failure text → still listed as failed, reason=unknown" \
+  || bad "a db missing from both the success rows and the failure text must not vanish"
+_build "beads hq" " hq(sync" "$FPD/prev-legacy.json"
+_jt 'd["databases"]["hq"]["status"] == "failed" and d["databases"]["hq"]["reason"] == "unknown"' \
+  && ok "malformed failure token → reason=unknown, no crash" || bad "malformed failure token broke the writer"
+_build "beads" " hq(disco)" "$FPD/prev-legacy.json"
+_jt 'd["databases"]["hq"]["status"] == "failed" and d["databases"]["hq"]["reason"] == "disco"' \
+  && ok "db named only in the failure text (discovered list empty of it) → still listed, reason=disco" \
+  || bad "a db named in the failure text must be listed even if the discovered list lacks it"
+# disco+s3 is the token the main loop writes when the disk refused today's sync AND
+# the S3 mirror is not proven — the one failure where S3 itself is in doubt. The
+# alert distinguishes it from a plain disco; the published reason must too, not
+# collapse it to "unknown" because of the '+'.
+_build "beads hq" " hq(disco+s3)" "$FPD/prev-legacy.json"
+_jt 'd["databases"]["hq"]["status"] == "failed" and d["databases"]["hq"]["reason"] == "disco+s3"' \
+  && ok "hq(disco+s3) → reason=disco+s3 (S3 NOT proven stays distinguishable from plain disco)" \
+  || bad "the disco+s3 failure token was degraded (expected reason=disco+s3; the '+' must be accepted in a reason token)"
+
+# 9) writer → consumer contract, through the REAL parser (subshell: both scripts define AWS/LOG/…)
+RECLAIM_LIB="$HERE/dolt-backup-residue-reclaim.sh"
+_consumer_sees() {
+  ( export DOLT_BACKUP_RESIDUE_RECLAIM_LIB=1; . "$RECLAIM_LIB"; : > "$FPD/parsed"
+    _parse_fingerprint_to_file "$FPD/out.json" "$1" "$FPD/parsed"; cat "$FPD/parsed" )
+}
+_raw "beads|10|bh1|1M"
+_build "beads hq" " hq(sync)" "$FPD/prev-legacy.json" 1 1 2
+[ -n "$(_consumer_sees beads)" ] && ok "contract: the real residue-reclaim parser still reads the ok entry as proof" || bad "contract: ok entry no longer parses"
+[ -z "$(_consumer_sees hq)" ] && ok "contract: the real residue-reclaim parser reads the failed entry as NO proof" || bad "contract: failed entry parsed as proof: '$(_consumer_sees hq)'"
+rm -rf "${FPD:?}" 2>/dev/null || true
+
+echo ""
+echo "── drift-guard: the live flow builds the fingerprint through the tested function (ga-gjfe78) ──"
+if grep -qF '_build_run_fingerprint "$RAW" "$RUN_UTC" "$PORT" "$ok" "$failed" "$total" "$DBS" "$FAILED_DBS"' "$SCRIPT"; then
+  ok "live flow calls _build_run_fingerprint with the discovered list and the failure text"
+else
+  bad "live flow does not pass \$DBS and \$FAILED_DBS to _build_run_fingerprint — failed dbs would vanish again"
+fi
+if grep -B1 -F 'PREV_META="$(mktemp)"' "$SCRIPT" | grep -qF 'if [ "$failed" -gt 0 ]; then'; then
+  ok "previous fingerprint is fetched ONLY when something failed (a clean night never reads it) so last_ok can be preserved"
+else
+  bad "previous-fingerprint fetch is missing or no longer gated on failed>0"
+fi
+if grep -qF 'NOT publishing' "$SCRIPT"; then
+  ok "a fingerprint that could not be built/validated is NOT published over the last good one"
+else
+  bad "no guard against publishing an empty/invalid fingerprint over the last good one"
+fi
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
