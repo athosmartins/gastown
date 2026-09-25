@@ -22,9 +22,11 @@
 # noise dressed up as one.
 #
 # FIX: a new plain script-global, GATE_FAIL_NO_EVAL (same relay idiom this
-# file already uses for QUOTA_REQUEUE/REQUEUE_REASON), is set to 1 ONLY by
+# file already uses for QUOTA_REQUEUE/REQUEUE_REASON), is set to 1 by
 # the genuine-timeout branch (never by the sibling dead-reviewer branch,
-# which requeues instead of failing) immediately before calling
+# which requeues instead of failing; ga-w7pm55 later added a second producer,
+# gate_collect_verdicts, for a verdict bead closed with no verdict — covered
+# by gate-no-verdict-infra-not-code-fail.selftest.sh) immediately before calling
 # gate_finalize_run(). That function reads it once at the top (into a
 # function-local so a stale value can never leak into a LATER bead
 # finalized later in the same sweep), classing the stamp "hold" instead of
@@ -118,7 +120,7 @@ if [ -n "$DR_START" ] && [ -n "$DR_END" ]; then
   if [[ "$DR_WINDOW" == *"GATE_FAIL_NO_EVAL=1"* ]]; then
     bad "dead-reviewer branch (lines $DR_START-$DR_ABS_END) unexpectedly sets GATE_FAIL_NO_EVAL=1 — would misclassify infra deaths too, harmless-but-wrong, or worse mask a real conflation"
   else
-    ok "dead-reviewer branch (lines $DR_START-$DR_ABS_END) does not set GATE_FAIL_NO_EVAL — signal is exclusive to the genuine-timeout branch"
+    ok "dead-reviewer branch (lines $DR_START-$DR_ABS_END) does not set GATE_FAIL_NO_EVAL — the requeue path never raises the no-eval FAIL signal"
   fi
 else
   bad "could not bound the dead-reviewer branch to check for signal leakage (DR_START=$DR_START DR_END=$DR_END)"
