@@ -27,18 +27,30 @@
 #      redirected nothing" (a blind detector says the same thing as a clean run).
 #   B. the real selftest, under the shim: still passes, and leaves NO .git at the
 #      (fake) temp root.
-#   C. the fail-closed tripwire the selftest now carries
-#      (_refuse_if_townroot_is_os_tmp): refuses an OS-temp-root / empty /
+#   C. the fail-closed tripwire (_refuse_if_townroot_is_os_tmp, defined in
+#      selftest-tmproot-tripwire.lib.sh): refuses an OS-temp-root / empty /
 #      unresolvable TOWNROOT, accepts a private directory.
+#   D. the selftest REFUSES TO START when the tripwire lib is missing (copied alone
+#      next to pilot-dispatcher.sh, no lib): non-zero exit, the reason is the missing
+#      lib, and NOT ONE fixture dir is built. This is also exactly what the gate's
+#      base-commit check (quality-gate-guard.sh, ga-rstae) sees: it overlays only the
+#      `*.selftest.sh` files a branch changes onto the pre-fix base, the lib is not
+#      one of them, so on the base the fix is absent and this harness fails for that
+#      real reason (ga-bdebb0) instead of passing because the fix rode along.
 #
 # Exit 0 iff every assertion holds.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET="$HERE/pilot-dispatcher.ns-rig-list-gc-failure.selftest.sh"
+LIB="$HERE/selftest-tmproot-tripwire.lib.sh"
 
 if [ ! -f "$TARGET" ]; then
   echo "FATAL: target selftest not found at $TARGET" >&2
+  exit 2
+fi
+if [ ! -f "$LIB" ]; then
+  echo "FATAL: tripwire lib not found at $LIB — the fix under test is not present" >&2
   exit 2
 fi
 
@@ -127,9 +139,9 @@ fi
 
 # ── C. the fail-closed tripwire ─────────────────────────────────────────────
 echo "-- C. tripwire _refuse_if_townroot_is_os_tmp: refuses a temp-root TOWNROOT, accepts a private dir --"
-TW_SRC="$(extract_fn _refuse_if_townroot_is_os_tmp "$TARGET")"
+TW_SRC="$(extract_fn _refuse_if_townroot_is_os_tmp "$LIB")"
 if [ -z "$TW_SRC" ]; then
-  bad "_refuse_if_townroot_is_os_tmp() not found in the target selftest — no tripwire guards the fixture"
+  bad "_refuse_if_townroot_is_os_tmp() not found in the tripwire lib — no tripwire guards the fixture"
 else
   mkdir -p "$WORK/ostmp/private"
   ( eval "$TW_SRC"; TMPDIR="$WORK/ostmp" _refuse_if_townroot_is_os_tmp "$WORK/ostmp" ) >/dev/null 2>&1
@@ -155,6 +167,29 @@ else
   ( eval "$TW_SRC"; TMPDIR="$WORK/ostmp" _refuse_if_townroot_is_os_tmp "$WORK/no-such-dir" ) >/dev/null 2>&1
   rc=$?
   if [ "$rc" -ne 0 ]; then ok "refuses an UNRESOLVABLE TOWNROOT (rc=$rc) — can't-tell is not 'safe'"; else bad "accepted an unresolvable TOWNROOT"; fi
+fi
+
+# ── D. no tripwire lib -> the selftest must refuse to start ─────────────────
+echo "-- D. the selftest refuses to start without the tripwire lib (what the gate's base overlay sees) --"
+mkdir -p "$WORK/no-lib/dir" "$WORK/no-lib-tmproot"
+cp "$TARGET" "$WORK/no-lib/dir/"
+# The target loads pilot-dispatcher.sh from its own directory BEFORE it reaches the
+# lib check; copy it too, or the target would abort on that first and this case would
+# "pass" for the wrong reason (a missing dispatcher, not a missing lib).
+cp "$HERE/pilot-dispatcher.sh" "$WORK/no-lib/dir/"
+run_under_shim "$WORK/no-lib-tmproot" bash "$WORK/no-lib/dir/$(basename "$TARGET")" > "$WORK/no-lib.out" 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then ok "target selftest exits non-zero without the lib (rc=$rc)"; else bad "target selftest ran to completion with NO tripwire lib — the fix is optional, not load-bearing"; fi
+if grep -q "tripwire lib not found" "$WORK/no-lib.out"; then
+  ok "and it says why: the tripwire lib is missing (not some earlier, unrelated failure)"
+else
+  bad "no 'tripwire lib not found' in the output — it stopped for some other reason, this case proves nothing"
+  tail -8 "$WORK/no-lib.out" | sed 's/^/      | /'
+fi
+if [ -z "$(ls -A "$WORK/no-lib-tmproot" 2>/dev/null)" ]; then
+  ok "no fixture dir was built at the (scratch) temp root before it stopped"
+else
+  bad "the selftest built something under the temp root before refusing: $(ls -A "$WORK/no-lib-tmproot" | tr '\n' ' ')"
 fi
 
 echo

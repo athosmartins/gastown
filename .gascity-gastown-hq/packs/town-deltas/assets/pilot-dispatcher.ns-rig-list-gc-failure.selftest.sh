@@ -97,32 +97,23 @@ log()  { :; }
 # pilot-dispatcher.ns-rig-list-gc-failure.tmpdir-pollution.selftest.sh.
 
 # _refuse_if_townroot_is_os_tmp <path> — fail-closed tripwire, called BEFORE any git
-# op on TOWNROOT. Returns non-zero if <path> is empty, cannot be resolved (can't-tell
-# is not "safe"), or resolves to an OS temp root ($TMPDIR, /tmp, /var/tmp, or the
-# per-user Darwin temp dir); compared by physical path so a trailing slash or a
-# /tmp -> /private/tmp symlink can't defeat it.
-_refuse_if_townroot_is_os_tmp() {
-  local root="${1:-}" root_p cand cand_p
-  if [ -z "$root" ]; then
-    echo "FATAL: TOWNROOT is empty — refusing to run git against it" >&2
-    return 2
-  fi
-  root_p="$(cd "$root" 2>/dev/null && pwd -P)"
-  if [ -z "$root_p" ]; then
-    echo "FATAL: cannot resolve TOWNROOT '$root' — refusing to run git against it" >&2
-    return 2
-  fi
-  for cand in "${TMPDIR:-}" /tmp /var/tmp "$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null)"; do
-    [ -n "$cand" ] || continue
-    cand_p="$(cd "$cand" 2>/dev/null && pwd -P)" || continue
-    [ -n "$cand_p" ] || continue
-    if [ "$root_p" = "$cand_p" ]; then
-      echo "FATAL: TOWNROOT '$root' IS the OS temp root ('$cand_p') — a git init here would poison every process that uses it (wa-x02jx)" >&2
-      return 2
-    fi
-  done
-  return 0
-}
+# op on TOWNROOT (refuses an empty / unresolvable / OS-temp-root path). It lives in
+# selftest-tmproot-tripwire.lib.sh, NOT inline here, on purpose: see that file's
+# header (the gate's base-commit check overlays this whole file onto the pre-fix
+# base, so a fix written inline would travel with its own test and prove nothing).
+# Loaded BEFORE the first mktemp/git call, and a missing or unloadable lib aborts
+# the run: `set -e` is off in this file, so a bare `.` that fails would otherwise
+# fall through into the git init below with no tripwire defined.
+_TRIPWIRE_LIB="$HERE/selftest-tmproot-tripwire.lib.sh"
+if [ ! -f "$_TRIPWIRE_LIB" ]; then
+  echo "FATAL: tripwire lib not found at $_TRIPWIRE_LIB — refusing to build the git fixture without it (wa-x02jx)" >&2
+  exit 2
+fi
+. "$_TRIPWIRE_LIB" || { echo "FATAL: could not load $_TRIPWIRE_LIB" >&2; exit 2; }
+if ! type _refuse_if_townroot_is_os_tmp >/dev/null 2>&1; then
+  echo "FATAL: $_TRIPWIRE_LIB loaded but did not define _refuse_if_townroot_is_os_tmp" >&2
+  exit 2
+fi
 
 TOWN_SANDBOX="$(mktemp -d)"
 if [ -z "$TOWN_SANDBOX" ] || [ ! -d "$TOWN_SANDBOX" ]; then
