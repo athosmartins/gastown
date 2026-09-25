@@ -1040,5 +1040,63 @@ else
   done
 fi
 
+# ── ga-btnq6h: a disk refusal must still mirror the EXISTING staging to S3 ────────
+# Measured 2026-09-25: hq's S3 copy was unrestorable for four days because the nightly
+# refused hq for disk (22-25/09) and `continue` also skipped the zero-disk mirror step.
+echo "── _mirror_staging_after_disk_refusal (ga-btnq6h) ──"
+type _mirror_staging_after_disk_refusal >/dev/null 2>&1 \
+  && ok "_mirror_staging_after_disk_refusal defined by lib-mode source" \
+  || bad "_mirror_staging_after_disk_refusal NOT defined"
+
+MR_DIR="$(mktemp -d)"; MR_LOG="$(mktemp)"; MR_CALLS="$(mktemp)"
+_s3proof_repair_then_prove() { echo "prove $1 $2" >> "$MR_CALLS"; return "${MR_STUB_RC:-0}"; }
+
+: > "$MR_CALLS"
+LOG="$MR_LOG" _mirror_staging_after_disk_refusal hq "$MR_DIR/does-not-exist"; rc=$?
+[ "$rc" -eq 0 ] && ok "no staging dir → returns 0 (nothing to mirror)" || bad "no staging dir returned $rc"
+[ ! -s "$MR_CALLS" ] && ok "…and the proof/mirror is NOT attempted for a missing dir" || bad "proof attempted for a missing dir"
+
+mkdir -p "$MR_DIR/hq"; : > "$MR_CALLS"
+MR_STUB_RC=0 LOG="$MR_LOG" _mirror_staging_after_disk_refusal hq "$MR_DIR/hq"; rc=$?
+[ "$rc" -eq 0 ] && ok "proof passes → returns 0" || bad "proof passing returned $rc"
+[ "$(cat "$MR_CALLS")" = "prove $MR_DIR/hq hq" ] && ok "…by asking the shared lib to repair-then-prove exactly this staging dir and db" || bad "unexpected lib call: '$(cat "$MR_CALLS")'"
+
+: > "$MR_LOG"
+MR_STUB_RC=1 LOG="$MR_LOG" _mirror_staging_after_disk_refusal hq "$MR_DIR/hq"; rc=$?
+[ "$rc" -eq 1 ] && ok "proof fails → returns 1 (the alert can say S3 is NOT sound)" || bad "proof failing returned $rc"
+grep -q 'NOT proven' "$MR_LOG" && ok "…and the log says S3 is NOT proven" || bad "failure not logged: $(cat "$MR_LOG")"
+unset -f _s3proof_repair_then_prove
+rm -rf "$MR_DIR" "$MR_LOG" "$MR_CALLS"
+
+echo "── drift-guard: the refusal branch is wired to the mirror (ga-btnq6h) ──"
+# the FIRST (pre-write) preflight in the per-db loop — the block between the step-1 marker
+# and the native sync call.
+BLOCK="$(awk '/# 1\) native consistent backup/{f=1} f{print} /SYNC_OUT" 2>&1; then/{if(f) exit}' "$SCRIPT")"
+printf '%s' "$BLOCK" | grep -qF '_mirror_staging_after_disk_refusal "$db" "$dest"' \
+  && ok "step-1 refusal branch calls _mirror_staging_after_disk_refusal \"\$db\" \"\$dest\"" \
+  || bad "step-1 refusal branch does NOT call the mirror — S3 repair is skipped on a disk refusal again"
+printf '%s' "$BLOCK" | grep -qF 'failed=$((failed+1))' \
+  && ok "…and still counts the db as failed (its own backup did not run today)" \
+  || bad "refusal branch no longer counts the db as failed"
+printf '%s' "$BLOCK" | grep -qF '(disco+s3)' && printf '%s' "$BLOCK" | grep -qF '(disco)' \
+  && ok "…and the alert distinguishes disco (S3 sound) from disco+s3 (S3 NOT proven)" \
+  || bad "alert text no longer distinguishes S3 state"
+M_LN="$(printf '%s\n' "$BLOCK" | grep -nF '_mirror_staging_after_disk_refusal "$db" "$dest"' | head -1 | cut -d: -f1)"
+C_LN="$(printf '%s\n' "$BLOCK" | grep -nE '^ +continue$' | head -1 | cut -d: -f1)"
+[ -n "$M_LN" ] && [ -n "$C_LN" ] && [ "$M_LN" -lt "$C_LN" ] \
+  && ok "…and the mirror runs BEFORE the branch's continue" || bad "mirror not before continue (mirror@${M_LN:-?} continue@${C_LN:-?})"
+N_CALLS="$(grep -cF '_mirror_staging_after_disk_refusal "$db" "$dest"' "$SCRIPT")"
+[ "$N_CALLS" -eq 1 ] \
+  && ok "the mirror has exactly ONE call site — not wired into the post-sync-attempt preflights (a half-written staging must never be mirrored)" \
+  || bad "expected exactly 1 call site of the mirror, found $N_CALLS"
+FBODY="$(awk '/^_mirror_staging_after_disk_refusal\(\)/{f=1} f{print} f&&/^}/{exit}' "$SCRIPT")"
+printf '%s' "$FBODY" | grep -qF -- '--delete' \
+  && bad "the refusal mirror uses --delete (must be additive on a night with no fresh sync)" \
+  || ok "the refusal mirror body never uses --delete"
+printf '%s' "$FBODY" | grep -qF '_s3proof_repair_then_prove' \
+  && ok "the refusal mirror goes through the shared proof lib (closure-guarded, manifest-last)" \
+  || bad "the refusal mirror bypasses the shared proof lib"
+grep -qF 'dolt-backup-s3-proof.sh' "$SCRIPT" && ok "the proof lib is sourced by the script" || bad "proof lib not sourced"
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
