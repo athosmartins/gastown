@@ -362,7 +362,12 @@ fi
 
 # ── 4. source drift-guards ─────────────────────────────────────────────────────
 echo "── 4. source drift-guards ──"
-N_WRAP=$(grep -c 'gate_requeue_respecting_external "\$MARKER_ID" "queued" "dispatching"' "$DISPATCHER")
+# The 3 rebase-retry sites (live-author, dead-author, proven-clean) carry the
+# ga-7fwt1 tag on the call line; ga-dl3x9s later added 2 finalize sites (reviewer
+# death, quota-stop) and 1 TTL site ($D_ID) that use the same call WITHOUT it —
+# count the rebase-retry ones by that tag so this guard keeps meaning "these 3".
+# (gate-dl3x9s-requeue-external.selftest.sh locks the other 3 and the whole class.)
+N_WRAP=$(grep -c 'gate_requeue_respecting_external "\$MARKER_ID" "queued" "dispatching"  # ga-7fwt1' "$DISPATCHER")
 [ "$N_WRAP" = "3" ] \
   && ok "all 3 rebase-retry sites (live-author, dead-author, proven-clean) close through gate_requeue_respecting_external" \
   || bad "expected 3 guarded requeue sites, found $N_WRAP"

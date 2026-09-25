@@ -4965,9 +4965,12 @@ gate_full_suite_verdict() {
 #     it was not replayed from Dolt history. gate_requeue_respecting_external
 #     below is the compare-before-write fix for the THREE rebase-retry sites in
 #     this file. The dispatcher's other requeue writers (reviewer-death,
-#     quota-stop, dispatching-TTL recovery) share the same blind overwrite and
-#     are NOT covered here — each needs its own expected_status; tracked as a
-#     follow-up on ga-a6etc2.
+#     quota-stop, dispatching-TTL recovery) shared the same blind overwrite;
+#     ga-dl3x9s routes them through it too, each with the expected_status that
+#     site really holds (all three: `dispatching` — the marker is claimed
+#     queued->dispatching and stays there until a terminal status, Phase B/C
+#     included). gate-dl3x9s-requeue-external.selftest.sh locks the class: no
+#     raw `set_gate_status ... "queued"` may come back without a waiver.
 GATE_RETRY_COOLDOWN_SECONDS="${GATE_RETRY_COOLDOWN_SECONDS:-900}"
 case "$GATE_RETRY_COOLDOWN_SECONDS" in ''|*[!0-9]*) GATE_RETRY_COOLDOWN_SECONDS=900 ;; esac
 GATE_CLEAN_RETRY_HARD_CAP="${GATE_CLEAN_RETRY_HARD_CAP:-7}"
@@ -5017,14 +5020,25 @@ gate_retry_cooldown_stamp() {
 # TTL, a worse default than the rare lost transition) — but it is never SILENT:
 # every unreadable read is logged, so "could not verify" is countable in the log
 # and never indistinguishable from "verified, nothing external happened".
+#
+# ga-dl3x9s: what happened is left in the global GATE_REQUEUE_OUTCOME — "written"
+# (read clean, wrote <new_status>), "unverified" (unreadable, legacy write) or
+# "respected" (external transition won, nothing written). The return code stays 0
+# in every case ON PURPOSE: every caller runs under this file's `set -e`, so a
+# non-zero "respected" would abort the sweep at the call. A caller that posts a
+# message about the requeue (a comment, a push) reads the global so it does not
+# claim a requeue that did not happen. Empty until the first call and reset on
+# entry, so a stale value from an earlier marker can never leak into a later one.
 gate_requeue_respecting_external() {
   local _id="$1" _new="$2" _expect="${3:-dispatching}" _json _mid _mstatus _foreign
+  GATE_REQUEUE_OUTCOME=""
   [ -z "$_id" ] && return 0
   _json=$(bd -C "$GC_CITY" show "$_id" --json 2>/dev/null || true)
   _mid=""
   [ -n "$_json" ] && _mid=$(printf '%s' "$_json" | jq -r 'if type=="array" then .[0] else . end | .id // empty' 2>/dev/null || true)
   if [ -z "$_mid" ]; then
     warn "Marker $_id: could not read it back to check for an external transition (bd show returned nothing, non-JSON, or an error envelope) — UNVERIFIED, falling back to the legacy overwrite to gate-status:$_new (ga-a6etc2)."
+    GATE_REQUEUE_OUTCOME="unverified"
   else
     _mstatus=$(printf '%s' "$_json" | jq -r 'if type=="array" then .[0] else . end | .status // ""' 2>/dev/null || true)
     _foreign=$(printf '%s' "$_json" | jq -r --arg e "gate-status:$_expect" --arg n "gate-status:$_new" \
@@ -5032,8 +5046,10 @@ gate_requeue_respecting_external() {
     if [ "$_mstatus" = "closed" ] || [ -n "$_foreign" ]; then
       warn "Marker $_id: an external transition landed while this sweep held it (status='${_mstatus:-?}', foreign gate-status: ${_foreign:-none}) — respecting it, NOT overwriting with gate-status:$_new (ga-a6etc2)."
       bd -C "$GC_CITY" label remove "$_id" "gate-status:$_expect" -q 2>/dev/null || true
+      GATE_REQUEUE_OUTCOME="respected"
       return 0
     fi
+    GATE_REQUEUE_OUTCOME="written"
   fi
   set_gate_status "$_id" "$_new"
 }
@@ -5298,6 +5314,7 @@ ELAPSED_S=$((GATE_END_EPOCH - GATE_START_EPOCH))
 # Park any still-pending verdict beads as REQUEUED (not TIMEOUT) so they neither
 # orphan nor read as a FAIL, and the re-run mints fresh ones. Clear notify + ETA
 # (AC4). This branch is mutually exclusive with the PASS/FAIL paths below.
+# SELFTEST-EXTRACT infra-requeue-block: BEGIN
 if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
   if [ "${REQUEUE_REASON:-quota}" = "dead-reviewer" ]; then
     # ga-eqjo (code-review fix): the old blocking Step 8 poll loop silently
@@ -5344,7 +5361,23 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
     # (queried live, not assumed to be "dispatching") — same invariant
     # ga-i0n83 already proved for the shared helper itself: an interrupted
     # transition leaves at most two gate-status labels, never zero.
-    set_gate_status "$MARKER_ID" "queued"
+    # ga-dl3x9s: and it closes through gate_requeue_respecting_external, not a
+    # bare set_gate_status: this write lands ~seconds to ~50 min (Phase B) after
+    # the claim, and set_gate_status strips EVERY gate-status:*, so a transition
+    # another actor made in between (the Mayor's needs-rebase, the 25/09 incident
+    # class) would be erased. expected_status is `dispatching` — what this sweep
+    # holds: the claim moved the marker queued->dispatching and nothing between
+    # the claim and here re-labels it (gate-run beads carry `running`, not the
+    # marker). A WRONG expected_status would read this sweep's own label as
+    # "foreign", skip the write and strand the marker — hence the drift-guard on
+    # the literal in gate-dl3x9s-requeue-external.selftest.sh.
+    gate_requeue_respecting_external "$MARKER_ID" "queued" "dispatching"
+    _RQ_NOTE="re-queued for a fresh attempt"
+    _RQ_RESPECTED=0
+    if [ "${GATE_REQUEUE_OUTCOME:-}" = "respected" ]; then
+      _RQ_RESPECTED=1
+      _RQ_NOTE="NOT re-queued (another actor moved it while this sweep held it; that transition was respected, ga-dl3x9s)"
+    fi
     # ga-n2cpe: every OTHER terminal path in this function clears gate:reviewing
     # on the source bead (wa-qq33j) — this one didn't. A reviewer that died
     # before ever ACKing (stale_async_start drain during startup, ga-flfo/
@@ -5355,9 +5388,13 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
     # wa-c3qsr, 2026-07-25, three times in one day). Clear it here too, on the
     # same sweep this dead-reviewer condition is confirmed.
     bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (infra re-queue, ga-n2cpe)
-    bd -C "$GC_CITY" comment "$MARKER_ID" "INFRA re-queue (ga-eqjo): reviewer session(s) died mid-review — an infra failure (Dolt hiccup/crash class, ga-4u16h/ga-h9o17), NOT a code FAIL. Marker re-queued; the ga-cw4pm headroom gate will admit a fresh attempt with new reviewers." 2>/dev/null || true
+    if [ "$_RQ_RESPECTED" = "1" ]; then
+      bd -C "$GC_CITY" comment "$MARKER_ID" "INFRA re-queue (ga-eqjo) NOT applied: reviewer session(s) died mid-review (an infra failure, NOT a code FAIL), but another actor changed this marker's gate-status while the sweep held it, so that transition was respected and the marker was left where they put it (ga-dl3x9s)." 2>/dev/null || true
+    else
+      bd -C "$GC_CITY" comment "$MARKER_ID" "INFRA re-queue (ga-eqjo): reviewer session(s) died mid-review — an infra failure (Dolt hiccup/crash class, ga-4u16h/ga-h9o17), NOT a code FAIL. Marker re-queued; the ga-cw4pm headroom gate will admit a fresh attempt with new reviewers." 2>/dev/null || true
+    fi
     if [ "$GATE_RUN_ID" != "unknown" ]; then
-      bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate run paused (infra re-queue, ga-eqjo): reviewer session(s) died mid-review; marker $MARKER_ID re-queued for a fresh attempt. No verdict recorded; this is NOT a FAIL." 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate run paused (infra re-queue, ga-eqjo): reviewer session(s) died mid-review; marker $MARKER_ID ${_RQ_NOTE}. No verdict recorded; this is NOT a FAIL." 2>/dev/null || true
       # ga-fi1dh: retire THIS gate-run bead (superseded, NOT left at gate-status:
       # running) — mirrors set_gate_status's other supersede call sites
       # (quality-gate-guard.sh Vector B, supersede_sibling_runs above). Without
@@ -5367,9 +5404,14 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
       # terminally FAILs the marker that was just re-queued for a fresh attempt
       # — before that attempt ever runs.
       set_gate_status "$GATE_RUN_ID" "superseded"
-      bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run superseded (terminal) — infra re-queue (ga-eqjo), marker $MARKER_ID re-queued for a fresh attempt. Closed by dispatcher (ga-fi1dh)." 2>/dev/null || true
+      bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run superseded (terminal) — infra re-queue (ga-eqjo), marker $MARKER_ID ${_RQ_NOTE}. Closed by dispatcher (ga-fi1dh)." 2>/dev/null || true
     fi
-    notify -t "⚠️ Gate re-enfileirado: reviewer morreu" -p 3 "Gate $BRANCH re-enfileirado — sessão de reviewer morreu em pleno review (falha de infra, não é FAIL) (ga-eqjo)." 2>/dev/null || true
+    # ga-dl3x9s: "re-enfileirado" is a claim about the marker; when an external
+    # transition won there is nothing to announce (the actor who made it knows,
+    # and the dispatcher log has the "respecting it" line).
+    if [ "$_RQ_RESPECTED" != "1" ]; then
+      notify -t "⚠️ Gate re-enfileirado: reviewer morreu" -p 3 "Gate $BRANCH re-enfileirado — sessão de reviewer morreu em pleno review (falha de infra, não é FAIL) (ga-eqjo)." 2>/dev/null || true
+    fi
     return 0
   fi
   _eta=$(quota_reset_eta)
@@ -5398,24 +5440,44 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
   # Re-queue the marker (reverse of the atomic claim): dispatching → queued.
   # ga-7fwt1: set_gate_status() (see the earlier dead-reviewer branch's
   # matching comment) — add-before-remove, queried live, not a fixed guess.
-  set_gate_status "$MARKER_ID" "queued"
+  # ga-dl3x9s: through gate_requeue_respecting_external with expected_status
+  # `dispatching` — same reasoning as the dead-reviewer branch above (this is the
+  # same claim->finalize window, entered via QUOTA_REQUEUE instead of
+  # REQUEUE_REASON=dead-reviewer, holding the same label).
+  gate_requeue_respecting_external "$MARKER_ID" "queued" "dispatching"
+  _RQ_NOTE="re-queued for re-run post-reset"
+  _RQ_ETA="${_eta:+ ($_eta)}"
+  _RQ_RESPECTED=0
+  if [ "${GATE_REQUEUE_OUTCOME:-}" = "respected" ]; then
+    _RQ_RESPECTED=1
+    _RQ_NOTE="NOT re-queued (another actor moved it while this sweep held it; that transition was respected, ga-dl3x9s)"
+    _RQ_ETA=""
+  fi
   # ga-n2cpe: same gap as the dead-reviewer branch above (sibling requeue
   # path, identical shape, identical missing clear) — a quota-stop can strand
   # gate:reviewing on the source bead just as permanently as a dead reviewer
   # can, with the same head-of-line fallout. See the dead-reviewer branch's
   # comment for the full incident context.
   bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (quota-stop re-queue, ga-n2cpe)
-  bd -C "$GC_CITY" comment "$MARKER_ID" "QUOTA-STOP re-queue (ga-x3nmz): reviewer(s) stalled because Claude's 5h session quota is exhausted — a quota-stop, NOT a code FAIL. Marker re-queued; the ga-cw4pm headroom gate holds it deferred until the window resets${_eta:+ ($_eta)}, then the gate re-runs with fresh reviewers." 2>/dev/null || true
+  if [ "$_RQ_RESPECTED" = "1" ]; then
+    bd -C "$GC_CITY" comment "$MARKER_ID" "QUOTA-STOP re-queue (ga-x3nmz) NOT applied: reviewer(s) stalled on an exhausted Claude 5h quota (a quota-stop, NOT a code FAIL), but another actor changed this marker's gate-status while the sweep held it, so that transition was respected and the marker was left where they put it (ga-dl3x9s)." 2>/dev/null || true
+  else
+    bd -C "$GC_CITY" comment "$MARKER_ID" "QUOTA-STOP re-queue (ga-x3nmz): reviewer(s) stalled because Claude's 5h session quota is exhausted — a quota-stop, NOT a code FAIL. Marker re-queued; the ga-cw4pm headroom gate holds it deferred until the window resets${_eta:+ ($_eta)}, then the gate re-runs with fresh reviewers." 2>/dev/null || true
+  fi
   if [ "$GATE_RUN_ID" != "unknown" ]; then
-    bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate run paused (quota-stop, ga-x3nmz): Claude 5h quota exhausted mid-review; marker $MARKER_ID re-queued for re-run post-reset${_eta:+ ($_eta)}. No verdict recorded; this is NOT a FAIL." 2>/dev/null || true
+    bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate run paused (quota-stop, ga-x3nmz): Claude 5h quota exhausted mid-review; marker $MARKER_ID ${_RQ_NOTE}${_RQ_ETA}. No verdict recorded; this is NOT a FAIL." 2>/dev/null || true
     # ga-fi1dh: retire THIS gate-run bead (superseded, NOT left at gate-status:
     # running) — see the identical comment in the dead-reviewer branch above for
     # why (Phase C would otherwise re-select it next sweep and mis-finalize on
     # the REQUEUED verdict bead as a FAIL).
     set_gate_status "$GATE_RUN_ID" "superseded"
-    bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run superseded (terminal) — quota-stop re-queue (ga-x3nmz), marker $MARKER_ID re-queued for re-run post-reset. Closed by dispatcher (ga-fi1dh)." 2>/dev/null || true
+    bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run superseded (terminal) — quota-stop re-queue (ga-x3nmz), marker $MARKER_ID ${_RQ_NOTE}. Closed by dispatcher (ga-fi1dh)." 2>/dev/null || true
   fi
-  notify -t "⏸️ Gate pausado: cota 5h" -p 3 "Gate $BRANCH re-enfileirado — cota 5h do Claude esgotada (quota-stop, não é FAIL); retoma quando resetar${_eta:+ ($_eta)} (ga-x3nmz)." 2>/dev/null || true
+  # ga-dl3x9s: same as the dead-reviewer notify — no "re-enfileirado" when the
+  # marker was NOT re-queued.
+  if [ "$_RQ_RESPECTED" != "1" ]; then
+    notify -t "⏸️ Gate pausado: cota 5h" -p 3 "Gate $BRANCH re-enfileirado — cota 5h do Claude esgotada (quota-stop, não é FAIL); retoma quando resetar${_eta:+ ($_eta)} (ga-x3nmz)." 2>/dev/null || true
+  fi
   # ga-eqjo: return (not exit) — this now runs inside gate_finalize_run(), which
   # Phase C calls once per in-flight run bead in a loop; exiting the whole
   # process here would abandon any OTHER run bead still waiting to be checked
@@ -5424,6 +5486,7 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
   # via Step 11, which is an ordinary return in function context.
   return 0
 fi
+# SELFTEST-EXTRACT infra-requeue-block: END
 
 # ga-4cy2t: reset the per-run fail-class tracker used by the SHA stamp below.
 # Defaults to "code" — if OVERALL_VERDICT is already FAIL here, it came from
@@ -9260,6 +9323,7 @@ DISPATCHING_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list 
   2>/dev/null || echo "[]")
 DISPATCHING_COUNT=$(printf '%s\n' "$DISPATCHING_JSON" | jq 'length' 2>/dev/null || echo "0")
 
+# SELFTEST-EXTRACT dispatching-ttl-recovery: BEGIN
 if [ "$DISPATCHING_COUNT" -gt 0 ]; then
   NOW_EPOCH_D=$(date +%s)
   for di in $(seq 0 $((DISPATCHING_COUNT - 1))); do
@@ -9285,11 +9349,27 @@ if [ "$DISPATCHING_COUNT" -gt 0 ]; then
       fi
       warn "Re-queuing zombie dispatching marker $D_ID (age=${D_AGE_MINUTES}m > TTL=${DISPATCHING_TTL_MINUTES}m — dispatcher died mid-run, no live gate-run found)"
       # ga-7fwt1: set_gate_status() — add-before-remove, queried live.
-      set_gate_status "$D_ID" "queued"
-      bd -C "$GC_CITY" comment "$D_ID" "Dispatcher TTL recovery: marker was stuck in gate-status:dispatching for ${D_AGE_MINUTES}m (> ${DISPATCHING_TTL_MINUTES}m TTL) with no live gate-run bead found. Dispatcher process died mid-run. Re-queuing for re-processing." 2>/dev/null || true
+      # ga-dl3x9s: through gate_requeue_respecting_external, expected_status
+      # `dispatching` — this pass only ever selects markers that CARRY
+      # gate-status:dispatching (the -l filter above), so that is by
+      # construction the label it holds. The list above is up to ~5s stale (the
+      # read-cache shim) and the live-run lookups run between the read and this
+      # write, so an actor that moved the marker in that window (the Mayor's
+      # needs-rebase) must win: the helper re-reads the marker LIVE, not from the
+      # cache. Side effect worth knowing: a marker an interrupted transition left
+      # with BOTH dispatching and another status (e.g. needs-rebase) now keeps the
+      # other status instead of being re-queued — the dispatcher's own earlier
+      # decision, previously undone by this recovery.
+      gate_requeue_respecting_external "$D_ID" "queued" "dispatching"
+      if [ "${GATE_REQUEUE_OUTCOME:-}" = "respected" ]; then
+        bd -C "$GC_CITY" comment "$D_ID" "Dispatcher TTL recovery: marker was in gate-status:dispatching for ${D_AGE_MINUTES}m (> ${DISPATCHING_TTL_MINUTES}m TTL) with no live gate-run bead found, but another actor changed its gate-status before the recovery write, so that transition was respected and the marker was NOT re-queued (ga-dl3x9s)." 2>/dev/null || true
+      else
+        bd -C "$GC_CITY" comment "$D_ID" "Dispatcher TTL recovery: marker was stuck in gate-status:dispatching for ${D_AGE_MINUTES}m (> ${DISPATCHING_TTL_MINUTES}m TTL) with no live gate-run bead found. Dispatcher process died mid-run. Re-queuing for re-processing." 2>/dev/null || true
+      fi
     fi
   done
 fi
+# SELFTEST-EXTRACT dispatching-ttl-recovery: END
 
 # ── Step 0a-2 (ga-zl277): reap orphaned gate-reviewer sessions ────────────────
 # Backstop for the EXIT trap below: a dispatcher killed by SIGKILL/OOM/launchd
