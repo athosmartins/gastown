@@ -13154,32 +13154,18 @@ Review this diff adversarially using ONLY your assigned lens above.
 You must NOT know or consider what the other reviewers think (you are independent).
 This author ($AUTHOR) cannot be a reviewer of their own work.
 
-REFUTATION PASS — FACT-CHECK, NOT A SEVERITY FILTER:
-For EVERY issue you are about to raise, RE-READ the exact changed lines in the
-diff and verify the defect is actually there: is it really present in THIS
+REFUTATION PASS — MANDATORY BEFORE ANY FAIL:
+For EVERY blocking issue you are about to raise, RE-READ the exact changed lines
+in the diff and actively try to REFUTE it: is the defect really present in THIS
 diff, at the lines you cite, given the surrounding context — or are you
 pattern-matching on superficially-similar code, or assuming context you did not
-actually verify in the diff? This refutation pass asks only one question —
-does the defect exist in the code? — and is never a filter on how severe or
-how certain the issue feels.
-
-WHAT BLOCKS (verdict FAIL): any defect you can ground in specific changed
-lines that could cause incorrect behavior, a failing test, data loss, or a
-misleading result/log/comment.
-WHAT DOES NOT BLOCK: pure style or naming preferences with no behavioral
-effect — report these too, just don't fail the verdict on them alone.
-LOW CONFIDENCE: if you're not sure whether something is really a defect,
-RE-READ the surrounding code until you can decide either way — never silence
-or drop a finding just because you're unsure.
-Every issue that survives the fact-check gets reported at its real severity,
-blocking or not — nothing you found gets dropped silently. Your verdict is
-FAIL only if at least one blocking issue survives the fact-check; otherwise
-it is PASS, with any non-blocking findings still listed below.
+actually verify in the diff? If you cannot ground a blocking issue in specific
+changed lines, DROP it. Only issues you can prove against the actual diff count
+as blocking. If nothing survives refutation, your verdict is PASS.
 WHY THIS MATTERS: this gate fails on ANY single reviewer FAIL, so a
 false-positive FAIL is expensive — it forces a full re-dispatch + re-work cycle
-on correct code. Be adversarial about whether the CODE actually has the
-defect, never about whether a real finding is "worth" reporting: verify each
-issue is real, then report everything real you find, at its true severity.
+on correct code. Be adversarial about the CODE, and equally adversarial about
+your own findings before you commit to FAIL.
 
 After completing your review, record your verdict with EXACTLY these bash commands:
 
@@ -13187,16 +13173,14 @@ bd -C "$GC_CITY" label remove "$VERDICT_BEAD_ID" "verdict:pending"
 # If PASS:
 bd -C "$GC_CITY" label add "$VERDICT_BEAD_ID" "verdict:PASS"
 bd -C "$GC_CITY" comment "$VERDICT_BEAD_ID" "VERDICT: PASS
-Summary: <2-3 sentence summary of what you checked and why it passes your lens>
-Non-blocking findings: <one per line as 'severity: description', or 'none'>"
+Summary: <2-3 sentence summary of what you checked and why it passes your lens>"
 bd -C "$GC_CITY" close "$VERDICT_BEAD_ID"
 
 # If FAIL:
 # bd -C "$GC_CITY" label add "$VERDICT_BEAD_ID" "verdict:FAIL"
 # bd -C "$GC_CITY" comment "$VERDICT_BEAD_ID" "VERDICT: FAIL
 # Blocking issue 1: <description>
-# Blocking issue 2: <description> (if any)
-# Non-blocking findings: <one per line as 'severity: description', or 'none'>"
+# Blocking issue 2: <description> (if any)"
 # bd -C "$GC_CITY" close "$VERDICT_BEAD_ID"
 
 Run those commands and then exit your session. Do not start other work.
