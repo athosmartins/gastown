@@ -2204,17 +2204,34 @@ gate_ab_arm_for_bead() {
   fi
 }
 
-# gate_base_test_verdict <detected> <copy_ok> <ran> <failed>
+# gate_base_test_verdict <detected> <copy_ok> <ran> <failed> [<repaired> [<unclassified>]]
 #   ga-rstae: collapses the base-commit test check's raw counts (computed by
 #   the impure Step 5b-pre2 block below: how many *.selftest.sh files were
 #   added/changed on the branch, how many of those were successfully
 #   materialized onto a throwaway base-commit worktree, how many actually
 #   completed execution within their timeout budget, and how many of THOSE
-#   exited non-zero) into exactly ONE of four named states. All four are
-#   REQUIRED reporting buckets per the bead — "sem-teste-novo" and
-#   "nao-consegui-medir" are not swallowed into a generic pass, they are
-#   counted separately so the A/B apuracao measures "who wrote a test that
-#   proves something", not "who wrote any test" or "who got measured".
+#   exited non-zero) into exactly ONE of five named states (four from ga-rstae,
+#   the fifth from ga-yl1k3w). All are REQUIRED reporting buckets per the
+#   bead — "sem-teste-novo" and "nao-consegui-medir" are not swallowed into a
+#   generic pass, they are counted separately so the A/B apuracao measures
+#   "who wrote a test that proves something", not "who wrote any test" or
+#   "who got measured".
+#   ga-yl1k3w — the two optional counts, both about files whose NEW form
+#   PASSED on base (a file that failed on base already makes the verdict
+#   reprovou-na-base and never needs them):
+#     repaired      — MODIFIED selftests whose OLD form (base's own copy of the
+#                     same path) ALSO ran on base and FAILED there. Old red +
+#                     new green is a test REPAIR: the code under test was
+#                     already correct, only the test was wrong, so the new
+#                     form passing on base is expected and is not evidence
+#                     that the test "proves nothing".
+#     unclassified  — passing-new files whose old form could not be measured
+#                     (base copy unreadable, timed out, git error). Unknown is
+#                     not "the old form passed".
+#   Both default to 0 when the argument is ABSENT (a legacy 4-arg call keeps
+#   today's answer exactly). A PRESENT-but-empty or non-numeric value is NOT
+#   defaulted to 0: 0 here reads "no repair" and REFUSES the builder, so a
+#   garbled count is nao-consegui-medir instead (erro != vazio).
 #     sem-teste-novo      — detected=0, and detected was a CONFIRMED, cleanly
 #                            parsed zero (the call site actually counted the
 #                            diff and got nothing). Never blocks; this
@@ -2236,13 +2253,27 @@ gate_ab_arm_for_bead() {
 #                            killed by its timeout — see the call site's 124
 #                            handling). Never blocks.
 #     passou-na-base       — detected>0 (confirmed), every file measured, ALL
-#                            exit 0 against the pre-fix base. The test
-#                            doesn't distinguish base from fix -> proves
-#                            nothing. BLOCKS (arm B only).
+#                            exit 0 against the pre-fix base, and NONE of them
+#                            is a repair (an ADDED file has no old form; a
+#                            MODIFIED file's old form also passed on base).
+#                            The test doesn't distinguish base from fix ->
+#                            proves nothing. BLOCKS (arm B only).
 #     reprovou-na-base     — detected>0 (confirmed), every file measured, AT
 #                            LEAST ONE exits non-zero against base ->
 #                            something in the new/changed test genuinely
 #                            depends on the fix. Never blocks — the GOOD case.
+#     consertou-teste-vermelho — (ga-yl1k3w) detected>0, every file measured,
+#                            none failed on base in its NEW form, and AT LEAST
+#                            ONE is a repair (repaired>0: the base's own copy
+#                            failed on base, the branch's copy passes).
+#                            Never blocks; counted apart from the other four
+#                            so the tally shows how often a builder's
+#                            deliverable is fixing a wrongly-red test.
+#                            Precedence: reprovou-na-base wins when a file also
+#                            failed in its new form (existing meaning kept).
+#                            A passing file whose old form is unclassifiable,
+#                            with no repair alongside it, is nao-consegui-medir
+#                            — never passou-na-base.
 #   "measured" above means copy_ok==detected AND ran==detected: a PARTIAL
 #   measurement (some files ok, some not) is treated the same as a total
 #   failure to measure, never as partial proof — fail-open on ANY
@@ -2252,6 +2283,7 @@ gate_ab_arm_for_bead() {
 #   passes in only these four counts.
 gate_base_test_verdict() {
   local detected="$1" copy_ok="$2" ran="$3" failed="$4"
+  local repaired="${5-0}" unclassified="${6-0}"   # absent -> 0; present-but-garbled handled below
   case "$detected" in
     ''|*[!0-9]*) printf 'nao-consegui-medir'; return 0 ;;
   esac
@@ -2268,9 +2300,78 @@ gate_base_test_verdict() {
   fi
   if [ "$failed" -gt 0 ]; then
     printf 'reprovou-na-base'
+    return 0
+  fi
+  # No file failed on base in its new form. The only thing left to decide is
+  # whether "all passed" means "proves nothing" (refuse) or "repaired a red
+  # test" (ga-yl1k3w) — so these two counts must be trustworthy before the
+  # refusing answer below is allowed.
+  case "$repaired" in ''|*[!0-9]*) printf 'nao-consegui-medir'; return 0 ;; esac
+  case "$unclassified" in ''|*[!0-9]*) printf 'nao-consegui-medir'; return 0 ;; esac
+  if [ $(( repaired + unclassified )) -gt "$detected" ]; then
+    printf 'nao-consegui-medir'   # more classified files than files: inconsistent input, not evidence
+    return 0
+  fi
+  if [ "$repaired" -gt 0 ]; then
+    printf 'consertou-teste-vermelho'
+  elif [ "$unclassified" -gt 0 ]; then
+    printf 'nao-consegui-medir'
   else
     printf 'passou-na-base'
   fi
+}
+
+# gate_base_test_old_state <rig_path> <base> <worktree> <file>
+#   ga-yl1k3w: what does BASE'S OWN COPY of a changed selftest do on base? Called
+#   by the Step 5b-pre2 measurement loop (and by the selftest, which runs this
+#   very function rather than a copy) only for a file whose NEW form already
+#   passed on base. Prints exactly one word and ALWAYS returns 0 (the guard runs
+#   under set -e; "unknown" is an answer, not a failure):
+#     added       — the path does not exist in the base tree. There is no old
+#                   form, so there is nothing to repair: the new file passing on
+#                   base proves nothing (same as before ga-yl1k3w).
+#     old-passes  — the base copy ran on base and exited 0. Passing in BOTH
+#                   forms proves nothing; the file stays refusable.
+#     old-fails   — the base copy ran on base and exited non-zero: old red, new
+#                   green = a repair.
+#     unknown     — anything else: empty args, `git ls-tree` ERROR, the base
+#                   copy could not be extracted, or it hit the timeout (exit 124
+#                   is ambiguous — would it have failed, or just needed more
+#                   time in a bare throwaway worktree?). An ls-tree error must
+#                   NOT read as "path absent" (that would call a repair "added"
+#                   and refuse it), so the three-way split is on ls-tree's exit
+#                   status first and its output second.
+#   Side effect, deliberate: on the paths that reach the run it OVERWRITES
+#   <worktree>/<file> with the base copy — the caller has already run the new
+#   form and does not run it again. GATE_ABT_OLD_TIMEOUT (seconds, default 30 =
+#   the new-form budget) exists so the selftest can prove the timeout branch
+#   without sleeping 30s; the guard itself never sets it.
+gate_base_test_old_state() {
+  local rig="$1" base="$2" wt="$3" f="$4" tree="" rc=0
+  if [ -z "$rig" ] || [ -z "$base" ] || [ -z "$wt" ] || [ -z "$f" ]; then
+    printf 'unknown'; return 0
+  fi
+  if ! tree=$(git -C "$rig" ls-tree "$base" -- "$f" 2>/dev/null); then
+    printf 'unknown'; return 0
+  fi
+  if [ -z "$tree" ]; then
+    printf 'added'; return 0
+  fi
+  mkdir -p "$(dirname "$wt/$f")" 2>/dev/null || true
+  if ! git -C "$rig" show "${base}:${f}" > "$wt/$f" 2>/dev/null; then
+    printf 'unknown'; return 0
+  fi
+  if timeout "${GATE_ABT_OLD_TIMEOUT:-30}" bash "$wt/$f" >/dev/null 2>&1; then
+    printf 'old-passes'
+  else
+    rc=$?
+    if [ "$rc" = "124" ]; then
+      printf 'unknown'
+    else
+      printf 'old-fails'
+    fi
+  fi
+  return 0
 }
 
 # gate_bead_sibling_status_lines <gc_city> <bead_id> — bd-backed. Builds the
@@ -5070,6 +5171,18 @@ fi
 # "couldn't tell" into "proves nothing, refuse" would be worse than not
 # building this check at all.
 #
+# Test REPAIRS (ga-yl1k3w, Mayor decision 2026-09-25): a bead whose deliverable
+# is fixing a selftest that is wrongly RED on base cannot satisfy "the test must
+# fail on base" — the code under test is already right, only the test was wrong,
+# so the repaired test passes on base by definition. For each MODIFIED (not
+# added) selftest whose new form passed on base, gate_base_test_old_state also
+# runs base's OWN copy of that path on base. Old red + new green -> counted as
+# repaired -> verdict consertou-teste-vermelho (never blocks, tallied apart).
+# Everything else keeps its old answer: an ADDED file has no old form, and a
+# MODIFIED file that passed on base in BOTH forms is still passou-na-base. An
+# old form that cannot be measured is unclassified -> nao-consegui-medir.
+# All of it lives inside the arm-B branch below; arm A never reaches it.
+#
 # Every submission that reaches this point with arm=B gets a verdict label
 # + a structured "AB-BASE-TEST" log line, REGARDLESS of whether it blocks —
 # "sem-teste-novo" and "nao-consegui-medir" must be counted, not just
@@ -5083,6 +5196,7 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
     _ABT_VERDICT="nao-consegui-medir"   # pessimistic default; only upgraded
                                          # below once a stage actually succeeds
     _ABT_DETECTED=0; _ABT_COPY_OK=0; _ABT_RAN=0; _ABT_FAILED=0
+    _ABT_REPAIRED=0; _ABT_UNCLASSIFIED=0   # ga-yl1k3w: see gate_base_test_old_state
     _ABT_BASE=""; _ABT_TEST_FILES=""
 
     git -C "$RIG_PATH" fetch origin main "$BRANCH" --quiet 2>/dev/null || true
@@ -5115,6 +5229,15 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
               _ABT_COPY_OK=$((_ABT_COPY_OK + 1))
               if timeout 30 bash "$_ABT_WT/$_abt_f" >/dev/null 2>&1; then
                 _ABT_RAN=$((_ABT_RAN + 1))
+                # ga-yl1k3w: the new form passed on base. Before ruling "proves
+                # nothing", ask what base's OWN copy of this path does on base —
+                # old red + new green is a test REPAIR, which no builder can make
+                # fail on base (only the test was wrong). Runs only for files that
+                # already passed, so a submission with a failing file pays nothing.
+                case "$(gate_base_test_old_state "$RIG_PATH" "$_ABT_BASE" "$_ABT_WT" "$_abt_f")" in
+                  old-fails) _ABT_REPAIRED=$((_ABT_REPAIRED + 1)) ;;
+                  unknown)   _ABT_UNCLASSIFIED=$((_ABT_UNCLASSIFIED + 1)) ;;
+                esac
               else
                 _abt_rc=$?
                 # 124 = killed by timeout (coreutils convention): ambiguous by
@@ -5136,13 +5259,13 @@ ABT_TEST_FILES_EOF
         else
           [ -n "$_ABT_WT" ] && rm -rf "$_ABT_WT" 2>/dev/null   # mktemp ok but worktree add itself failed
         fi
-        _ABT_VERDICT=$(gate_base_test_verdict "$_ABT_DETECTED" "$_ABT_COPY_OK" "$_ABT_RAN" "$_ABT_FAILED")
+        _ABT_VERDICT=$(gate_base_test_verdict "$_ABT_DETECTED" "$_ABT_COPY_OK" "$_ABT_RAN" "$_ABT_FAILED" "$_ABT_REPAIRED" "$_ABT_UNCLASSIFIED")
       fi
     fi
 
     bd -C "$GC_CITY" label add "$MARKER_ID" "gate-ab:arm-b" -q 2>/dev/null || true
     bd -C "$GC_CITY" label add "$MARKER_ID" "gate-ab-basetest:$_ABT_VERDICT" -q 2>/dev/null || true
-    log "AB-BASE-TEST bead=$BEAD_ID arm=B verdict=$_ABT_VERDICT branch=$BRANCH base=$_ABT_BASE detected=$_ABT_DETECTED copy_ok=$_ABT_COPY_OK ran=$_ABT_RAN failed=$_ABT_FAILED"
+    log "AB-BASE-TEST bead=$BEAD_ID arm=B verdict=$_ABT_VERDICT branch=$BRANCH base=$_ABT_BASE detected=$_ABT_DETECTED copy_ok=$_ABT_COPY_OK ran=$_ABT_RAN failed=$_ABT_FAILED repaired=$_ABT_REPAIRED unclassified=$_ABT_UNCLASSIFIED"
 
     if [ "$_ABT_VERDICT" = "passou-na-base" ]; then
       err "  base-commit-test-check (ga-rstae, arm B): $_ABT_DETECTED new/changed selftest(s) on $BRANCH ALL pass unmodified against pre-fix base $_ABT_BASE — proves nothing about this branch's own diff. Refusing at submission."
@@ -5150,6 +5273,7 @@ ABT_TEST_FILES_EOF
       bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: base-commit test check (ga-rstae, A/B experiment arm B).
 $_ABT_DETECTED new/changed selftest file(s) on $BRANCH pass UNCHANGED when run against the pre-fix base commit ($_ABT_BASE) — meaning they don't actually exercise the bug/regression this branch claims to fix (test-driven-development's own Iron Law: a test that passes before your fix exists proves nothing).
 Files: $(printf '%s' "$_ABT_TEST_FILES" | tr '\n' ' ')
+(For a selftest you MODIFIED, this also means base's own copy of that file PASSED on base — a repair of a test that was red on base is accepted, not refused: ga-yl1k3w.)
 Fix (this is the point of the check, not busywork): strengthen the test so it FAILS against base — i.e. it actually depends on your fix — then push again:
   git push origin $BRANCH
 Then re-run /gate-done. Marker set to gate-status:error (fixable + re-submittable, not lost).

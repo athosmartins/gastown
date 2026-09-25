@@ -20,6 +20,7 @@ set -uo pipefail
 HQ="${GC_CITY:-/Users/athos/gt/.gascity-gastown-hq}"
 GUARD="$HQ/packs/town-deltas/assets/quality-gate-guard.sh"
 LOG="$HQ/.gc/logs/quality-gate-dispatcher.log"
+GUARD_LOG="$HQ/.gc/logs/quality-gate-guard.log"   # onde o GUARD escreve as linhas AB-BASE-TEST (ga-yl1k3w)
 SINCE="${1:-}"   # opcional: YYYY-MM-DD — corta o log a partir dessa data (inicio do experimento)
 
 for f in "$GUARD" "$LOG"; do
@@ -104,6 +105,17 @@ if [ "$MIN" -lt 286 ]; then
 fi
 echo
 echo "  ── verdicts do check por braco (do log estruturado do guard) ──"
-grep -oE 'AB-BASE-TEST bead=\S+ arm=[AB] verdict=\S+' "$LOG" 2>/dev/null \
-  | sed -E 's/.*arm=([AB]) verdict=(\S+)/  \1 \2/' | sort | uniq -c | sort -rn | head -10
-echo "  (vazio = o guard novo ainda nao mergeou ou nao rodou; nao e erro)"
+# ga-yl1k3w: esta secao estava MUDA por duas falhas independentes, ambas com a MESMA saida
+# vazia que a nota do fim manda ler como "nao e erro":
+#   1. lia $LOG (log do DISPATCHER), que nunca recebe estas linhas — o guard escreve em
+#      quality-gate-guard.log (medido 25/09: 186 linhas AB-BASE-TEST la, 0 no do dispatcher);
+#   2. o sed usava \S, que o BSD sed do macOS nao entende: o padrao nao casava, a linha passava
+#      INTEIRA e o `uniq -c` contava cada uma como unica (o grep -E do macOS entende \S; o sed nao).
+# Sem isto, nenhum veredito — nem o consertou-teste-vermelho — era "contado a parte".
+if [ -r "$GUARD_LOG" ]; then
+  grep -oE 'AB-BASE-TEST bead=[^ ]+ arm=[AB] verdict=[^ ]+' "$GUARD_LOG" 2>/dev/null \
+    | sed -E 's/.*arm=([AB]) verdict=([^ ]+)/  \1 \2/' | sort | uniq -c | sort -rn | head -10
+  echo "  (vazio = nenhuma submissao em braco B apurada ainda; nao e erro)"
+else
+  echo "  FALHA: nao consigo ler $GUARD_LOG — esta secao NAO foi apurada (isto nao e 'vazio')"
+fi
