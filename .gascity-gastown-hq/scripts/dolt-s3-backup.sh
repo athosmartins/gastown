@@ -261,21 +261,27 @@ BACKUP_FAIL_ALARM_THRESHOLD="${BACKUP_FAIL_ALARM_THRESHOLD:-2}"
 #   rc=0 + the NEW count on stdout — incremented AND read back from disk, so
 #     the value the caller escalates on is the value the next run will see;
 #   rc=1, nothing on stdout — the streak is UNKNOWN: state dir not creatable,
-#     an existing counter exists but is unreadable, the write failed, or the
-#     read-back doesn't match. Callers must NOT treat this as "1" (that would
-#     reset the streak forever under sustained disk pressure) nor as a
-#     confirmed threshold hit (that would claim a streak nobody counted).
+#     an existing counter exists but is unreadable or holds unparseable
+#     content, the write failed, or the read-back doesn't match. Callers must
+#     NOT treat this as "1" (that would reset the streak forever under
+#     sustained disk pressure) nor as a confirmed threshold hit (that would
+#     claim a streak nobody counted). An unparseable counter is the one
+#     unknown that self-heals: it is rewritten to 1 (this run's failure) before
+#     rc=1 is returned, so the NEXT night counts 2 and confirms normally rather
+#     than alarming as "unknown" forever.
 # The write goes to a temp file + rename so a failed write (ENOSPC truncates
 # a plain `> file` BEFORE writing) can't destroy the previous night's count.
 _backup_fail_streak_note_failure() {
-  local db="$1" f tmp n back
+  local db="$1" f tmp n back corrupt=0
   mkdir -p "$BACKUP_FAIL_STREAK_DIR" 2>/dev/null || return 1
   f="$BACKUP_FAIL_STREAK_DIR/$db"
   n=""
   if [ -e "$f" ]; then
     n="$(cat "$f" 2>/dev/null)" || return 1
+    # exists but is not a number (empty/garbage): the previous streak is not
+    # knowable — do not silently read it as "no history".
+    case "$n" in ''|*[!0-9]*) corrupt=1; n=0 ;; esac
   fi
-  case "$n" in ''|*[!0-9]*) n=0 ;; esac
   n=$((n+1))
   tmp="$f.tmp.$$"
   # brace group: a failed `> "$tmp"` open reports BEFORE a trailing 2>/dev/null
@@ -286,14 +292,22 @@ _backup_fail_streak_note_failure() {
   fi
   back="$(cat "$f" 2>/dev/null)" || return 1
   [ "$back" = "$n" ] || return 1
+  [ "$corrupt" -eq 0 ] || return 1
   echo "$n"
 }
 
 # _backup_fail_streak_note_success <db> — resets the streak: called whenever
 # this db's off-box backup completes OK this run, so a LATER failure starts
-# counting from a fresh night, not an old one.
+# counting from a fresh night, not an old one. Verifies the counter is really
+# gone: if the reset didn't take (read-only/full state dir), a stale streak
+# would survive a SUCCESSFUL backup and the next failure would claim
+# consecutive nights that a success in between broke — so that is logged, not
+# swallowed. (Never aborts the backup; the log line is the trail.)
 _backup_fail_streak_note_success() {
   rm -f "$BACKUP_FAIL_STREAK_DIR/$1" 2>/dev/null || true
+  if [ -e "$BACKUP_FAIL_STREAK_DIR/$1" ]; then
+    log "$1: backup OK but its failure-streak counter could NOT be reset in $BACKUP_FAIL_STREAK_DIR — the next failure may over-count consecutive nights"
+  fi
 }
 
 # _backup_fail_note <db> — call exactly once per db that failed its off-box
@@ -342,8 +356,15 @@ do_mail_mayor() {
 # (NOTIFY_FORCE_PUSH=1) instead of letting the title fall through to the
 # default digest route — for the 2+-consecutive-night escalation only, never
 # for an isolated failure (see memory notify-default-digest-new-alert-silent).
+# Returns the real status (never aborts the backup — no set -e here); a failed
+# push is logged, since this is an alarm of last resort and a silent failure
+# is exactly the incident it exists to prevent.
 notify_escalate() {
-  NOTIFY_FORCE_PUSH=1 "$NOTIFY" -t "Dolt S3 backup" -p 5 "🚨 $*" 2>/dev/null || true
+  if NOTIFY_FORCE_PUSH=1 "$NOTIFY" -t "Dolt S3 backup" -p 5 "🚨 $*" 2>/dev/null; then
+    return 0
+  fi
+  log "escalation: forced push via $NOTIFY FAILED"
+  return 1
 }
 
 # _backup_escalate_if_needed — called once after the per-db loop. No-op
@@ -354,7 +375,7 @@ notify_escalate() {
 # text says "mail enviado" only when do_mail_mayor actually reported success —
 # a failed send is stated as such, not papered over.
 _backup_escalate_if_needed() {
-  local unknown="${UNKNOWN_STREAK_DBS:-}" subj="" body="" push="" mailnote
+  local unknown="${UNKNOWN_STREAK_DBS:-}" subj="" body="" push="" mailnote mail_ok=0
   [ -n "$ESCALATE_DBS" ] || [ -n "$unknown" ] || return 0
   if [ -n "$ESCALATE_DBS" ]; then
     subj="Dolt S3 backup: sem backup off-box há ${BACKUP_FAIL_ALARM_THRESHOLD}+ noites seguidas"
@@ -367,12 +388,19 @@ _backup_escalate_if_needed() {
     push="${push:+$push; }falha off-box em:${unknown} com contador ilegível (sequência desconhecida)"
   fi
   if do_mail_mayor "$subj" "$body Ação: libere disco / rode o reseed manual (dolt-backup-reseed.sh) / veja $LOG."; then
+    mail_ok=1
     mailnote="mail enviado ao Mayor"
   else
     mailnote="⚠️ mail ao Mayor FALHOU — aja por aqui"
     log "escalation: do_mail_mayor FAILED — the push notification is the only channel that carried this alarm"
   fi
-  notify_escalate "backup off-box: ${push} — ${mailnote}. Ver $LOG."
+  if ! notify_escalate "backup off-box: ${push} — ${mailnote}. Ver $LOG."; then
+    if [ "$mail_ok" -eq 1 ]; then
+      log "escalation: push FAILED but the mail to the Mayor was sent — one channel delivered"
+    else
+      log "escalation: NOT DELIVERED on ANY channel (mail AND forced push both failed) — backup off-box alarm for:${ESCALATE_DBS}${unknown} exists only in this log"
+    fi
+  fi
 }
 
 # ga-odtd3f: neither the initial CALL DOLT_BACKUP('sync', ...) attempt below

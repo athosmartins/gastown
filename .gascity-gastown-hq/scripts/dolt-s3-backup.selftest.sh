@@ -1151,6 +1151,35 @@ _bfp_run "$BFP_F" hq; _bfp_run "$BFP_F" hq
   && ok "healthy path: count 2 after 2 failures, exactly one file, no temp litter" \
   || bad "healthy path: out='$BFP_OUT' entries=$(_bfp_count "$BFP_F")"
 
+# (g) an existing counter holding garbage/empty content: the previous streak
+# is NOT knowable, so this night is UNKNOWN (rc=1) — not silently "no history"
+# (=1). It self-heals: the counter is rewritten to 1, so the next night counts
+# 2 and confirms normally instead of alarming as "unknown" forever.
+for _bfp_junk in "abc" ""; do
+  BFP_G="$BFP_ROOT/g"; mkdir -p "$BFP_G"; printf '%s' "$_bfp_junk" > "$BFP_G/hq"
+  _bfp_run "$BFP_G" hq
+  { [ "$BFP_RC" -eq 1 ] && [ -z "$BFP_OUT" ]; } \
+    && ok "counter holding '${_bfp_junk:-<empty>}' → this night UNKNOWN (rc=1), not silently read as 'no history'" \
+    || bad "counter holding '${_bfp_junk:-<empty>}': expected rc=1 + empty stdout, got rc=$BFP_RC out='$BFP_OUT'"
+  [ "$(cat "$BFP_G/hq" 2>/dev/null)" = "1" ] && ok "  …and was repaired to 1 (this run's failure)" || bad "  …not repaired: '$(cat "$BFP_G/hq" 2>/dev/null)'"
+  _bfp_run "$BFP_G" hq
+  { [ "$BFP_RC" -eq 0 ] && [ "$BFP_OUT" = "2" ]; } && ok "  …next night counts 2 and confirms normally (self-healed)" || bad "  …next night: expected rc=0 out=2, got rc=$BFP_RC out='$BFP_OUT'"
+done
+unset _bfp_junk
+
+# (h) a streak reset that did not take must be VISIBLE (a stale streak would
+# survive a successful backup and the next failure would over-claim
+# consecutive nights). `rm` is shadowed as a no-op so the file stays.
+BFP_H="$BFP_ROOT/h"; mkdir -p "$BFP_H"; printf '1\n' > "$BFP_H/hq"
+: > "$LOG"
+BACKUP_FAIL_STREAK_DIR="$BFP_H" _backup_fail_streak_note_success hq
+[ ! -s "$LOG" ] && [ ! -e "$BFP_H/hq" ] && ok "reset that works: counter gone, nothing logged" || bad "healthy reset: file present or log noisy — log: $(cat "$LOG")"
+printf '1\n' > "$BFP_H/hq"; : > "$LOG"
+rm() { return 0; }
+BACKUP_FAIL_STREAK_DIR="$BFP_H" _backup_fail_streak_note_success hq
+unset -f rm
+grep -qF "could NOT be reset" "$LOG" && ok "reset that did NOT take is logged (was: swallowed by || true)" || bad "failed reset not logged — log: $(cat "$LOG")"
+
 # _backup_fail_note routes an UNKNOWN streak to its own list — never into
 # ESCALATE_DBS (that would claim a confirmed streak nobody counted).
 BACKUP_FAIL_STREAK_DIR="$BFP_ROOT/afile/sub"; BACKUP_FAIL_ALARM_THRESHOLD=2
@@ -1330,6 +1359,27 @@ BACKUP_FAIL_FAKE_MAIL="$ESC_STUB_DIR/fake_mail"
 FAILED_DBS_STREAK=""; ESCALATE_DBS=" hq(2n)"; UNKNOWN_STREAK_DBS=""
 _backup_escalate_if_needed
 grep -qF "mail enviado ao Mayor" "$ESC_NOTIFY_CALLS" && ok "mail OK: push says 'mail enviado ao Mayor' (claim matches reality)" || bad "mail OK: push lacks the sent-confirmation — got: $(cat "$ESC_NOTIFY_CALLS")"
+
+# A failed forced push must leave a trail, and "mail AND push both failed" must
+# be stated as such in the log — the alarm of last resort can't vanish silently.
+echo "── e2e: push FALHA → registrado; mail+push falham → 'NOT DELIVERED on ANY channel' ──"
+cat > "$ESC_STUB_DIR/notify_fail" <<'STUB'
+#!/bin/bash
+exit 1
+STUB
+chmod +x "$ESC_STUB_DIR/notify_fail"
+NOTIFY="$ESC_STUB_DIR/notify_fail"
+: > "$ESC_LOG"; FAILED_DBS_STREAK=""; ESCALATE_DBS=" hq(2n)"; UNKNOWN_STREAK_DBS=""
+_backup_escalate_if_needed          # mail stub (fake_mail) succeeds, push fails
+grep -qF "push FAILED but the mail to the Mayor was sent" "$ESC_LOG" && ok "push failed, mail sent: logged as one-channel-delivered" || bad "push-failed/mail-sent not logged — log: $(cat "$ESC_LOG")"
+grep -qF "NOT DELIVERED" "$ESC_LOG" && bad "push failed but mail sent: must NOT claim 'NOT DELIVERED' — log: $(cat "$ESC_LOG")" || ok "push failed, mail sent: does not claim total failure"
+: > "$ESC_LOG"
+BACKUP_FAIL_FAKE_MAIL="$ESC_STUB_DIR/fake_mail_fail"
+_backup_escalate_if_needed          # mail fails AND push fails
+grep -qF "NOT DELIVERED on ANY channel" "$ESC_LOG" && ok "mail AND push failed: logged as NOT DELIVERED on ANY channel" || bad "double failure not logged — log: $(cat "$ESC_LOG")"
+NOTIFY="$ESC_STUB_DIR/notify"
+# shellcheck disable=SC2034  # read by the sourced lib's do_mail_mayor
+BACKUP_FAIL_FAKE_MAIL="$ESC_STUB_DIR/fake_mail"
 unset UNKNOWN_STREAK_DBS
 
 NOTIFY="$_ESC_SAVE_NOTIFY"; LOG="$_ESC_SAVE_LOG"
