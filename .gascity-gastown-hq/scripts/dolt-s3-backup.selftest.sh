@@ -1496,6 +1496,12 @@ M_LN="$(printf '%s\n' "$BLOCK" | grep -nF '_mirror_staging_after_disk_refusal "$
 C_LN="$(printf '%s\n' "$BLOCK" | grep -nE '^ +continue$' | head -1 | cut -d: -f1)"
 [ -n "$M_LN" ] && [ -n "$C_LN" ] && [ "$M_LN" -lt "$C_LN" ] \
   && ok "…and the mirror runs BEFORE the branch's continue" || bad "mirror not before continue (mirror@${M_LN:-?} continue@${C_LN:-?})"
+# ga-rt7ljo x ga-btnq6h: the refusal branch must ALSO record tonight's failure streak, and BEFORE the
+# slow network mirror — so a mirror that stalls or is killed can never lose the night's failure count.
+N_LN="$(printf '%s\n' "$BLOCK" | grep -nF '_backup_fail_note "$db"' | head -1 | cut -d: -f1)"
+[ -n "$N_LN" ] && [ -n "$M_LN" ] && [ "$N_LN" -lt "$M_LN" ] \
+  && ok "…and the failure streak is noted (ga-rt7ljo) BEFORE the mirror runs" \
+  || bad "refusal branch: streak note missing or after the mirror (note@${N_LN:-?} mirror@${M_LN:-?})"
 N_CALLS="$(grep -cF '_mirror_staging_after_disk_refusal "$db" "$dest"' "$SCRIPT")"
 [ "$N_CALLS" -eq 1 ] \
   && ok "the mirror has exactly ONE call site — not wired into the post-sync-attempt preflights (a half-written staging must never be mirrored)" \
