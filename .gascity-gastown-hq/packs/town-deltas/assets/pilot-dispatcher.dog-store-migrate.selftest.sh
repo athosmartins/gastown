@@ -282,7 +282,11 @@ fi
 
 # Scenario 5: create succeeds but the new bead does not read back -> treated
 # as failed, aborts, does NOT close the original (the copy may or may not
-# really exist — never close the original on an unconfirmed copy).
+# really exist — never close the original on an unconfirmed copy). But the
+# create call may have actually landed with only the readback lagging, so
+# the copy must be retracted too (label pilot:no-auto-dispatch THEN close),
+# same as the close_fails race in Scenario 6 — otherwise an unconfirmed
+# copy that DID land stays live and fully dispatchable forever.
 OUT=$(run_migrate "readback_fails"); RC=$?; CALLLOG="$(calllog_for readback_fails)"
 if [ "$RC" = "1" ] && [ -z "$OUT" ]; then
   ok "created id does not read back -> treated as failed, aborts (ga-ehbw5 discipline: a write succeeding is not the write being readable)"
@@ -293,6 +297,13 @@ if grep -qE '^close\|.*\|ORIG-1\|' "$CALLLOG"; then
   bad "readback failure -> REGRESSION: closed the original despite an unconfirmed copy"
 else
   ok "readback failure -> original is NOT closed (copy unconfirmed, original stays authoritative)"
+fi
+READBACK_LABEL_LINE=$(grep -nE '^label\|.*add NEW-1 pilot:no-auto-dispatch' "$CALLLOG" | head -1 | cut -d: -f1)
+READBACK_RETRACT_CLOSE_LINE=$(grep -nE '^close\|.*\|NEW-1\|' "$CALLLOG" | head -1 | cut -d: -f1)
+if [ -n "$READBACK_LABEL_LINE" ] && [ -n "$READBACK_RETRACT_CLOSE_LINE" ] && [ "$READBACK_LABEL_LINE" -lt "$READBACK_RETRACT_CLOSE_LINE" ]; then
+  ok "readback failure -> retracts the possibly-orphaned copy too: pilot:no-auto-dispatch labeled BEFORE it is closed (matches the close_fails race's retraction, gate-review ga-7tjx1r)"
+else
+  bad "readback failure -> expected label-then-close retraction on NEW-1 (an unconfirmed copy that actually landed must not stay live), got: $(cat "$CALLLOG" | tr '\n' '|')"
 fi
 
 # Scenario 6 (the race, post-copy): create+readback succeed, but close of

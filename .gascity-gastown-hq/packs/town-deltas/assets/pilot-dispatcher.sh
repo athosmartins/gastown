@@ -6708,9 +6708,21 @@ $_desc"
   fi
 
   # Verify readback before trusting the id (ga-ehbw5 discipline: a write
-  # succeeding is not the same fact as the write being READABLE).
+  # succeeding is not the same fact as the write being READABLE). We fall
+  # back to parking the ORIGINAL either way, but the create call may have
+  # actually landed and only the readback lagged — same ambiguity the
+  # close_fails race below resolves by retracting the copy rather than
+  # trusting it's safely gone. Apply the identical best-effort retraction
+  # here: label pilot:no-auto-dispatch (stop it being dispatched) then close
+  # it as unconfirmed, so a create that DID land is never left live with
+  # ctx:ready/exec:auto/story:approved and no blocking label (bead-
+  # migration-copy-races: never leave two live copies of the same story).
   if ! bd -C "$_dest_city" show "$_new_id" >/dev/null 2>&1; then
-    warn "ga-6u64fm: created $_new_id for migrated $_story_id but it did not read back — treating as failed, falling back to park (orphan may need manual cleanup: bd -C $_dest_city show $_new_id)." >&2
+    warn "ga-6u64fm: created $_new_id for migrated $_story_id but it did not read back — treating as failed, falling back to park. Attempting best-effort retraction in case the create actually landed." >&2
+    bd -C "$_dest_city" label add "$_new_id" "pilot:no-auto-dispatch" -q 2>/dev/null || true
+    bd -C "$_dest_city" close "$_new_id" --reason \
+      "Retracted: create for $_story_id did not read back immediately after — treating as failed and parking the original; closing in case the write actually landed (ga-ehbw5 discipline)." \
+      -q 2>/dev/null || warn "ga-6u64fm: best-effort retraction of possibly-orphaned $_new_id also failed (label/close) — needs manual cleanup: bd -C $_dest_city show $_new_id" >&2
     return 1
   fi
 
