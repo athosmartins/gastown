@@ -35,6 +35,9 @@ set -uo pipefail
 
 # shellcheck disable=SC1091
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dolt-offline-backup-sync.sh"
+# ga-btnq6h: manifest-closure proof + additive mirror, shared with dolt-gc-maintenance.sh.
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dolt-backup-s3-proof.sh"
 
 CITY="/Users/athos/gt/.gascity-gastown-hq"
 DOLT_CFG="$CITY/.gc/runtime/packs/dolt/dolt-config.yaml"
@@ -78,6 +81,8 @@ SYNC_TIMEOUT=600                          # per-db native DOLT_BACKUP sync
 S3_TIMEOUT=1200                           # per-db aws s3 sync
 PREFLIGHT_TIMEOUT=30                       # server reachability probe
 RETRY_WAITS_SEC="20 60 120"               # ga-gdsq5: escalating pauses, one connection-timeout retry per wait
+S3PROOF_LOG="$LOG"                        # ga-btnq6h: where the proof lib's upload output goes
+S3PROOF_UP_TIMEOUT="$S3_TIMEOUT"          # ga-btnq6h: same per-db upload budget as step 2 below
 # ga-8f1uh0: reuse the already-verified reseed mechanism (fresh backup -> restore
 # -> row-count verify -> swap) to keep per-db local staging from growing without
 # bound. Same timeout budget dolt-compact-routine.sh's own reseed call already
@@ -460,6 +465,43 @@ _sync_disk_preflight() {
   return 0
 }
 
+# _mirror_staging_after_disk_refusal <db> <dest> — ga-btnq6h. The disk preflight above
+# guards the WRITE to local staging (step 1). Step 2 — mirroring the staging that
+# ALREADY EXISTS to S3 — writes nothing locally, yet `continue` after a refusal used to
+# skip it too. MEASURED 2026-09-25: hq's `aws s3 sync` failed halfway on 09-21 (ga-tyaozh),
+# then the nightly refused hq on 09-22, 23, 24 and 25 (free 3–10 GB < 150% of a 7.6 GB
+# store) and never repaired S3, so its copy stayed UNRESTORABLE for four days: the S3
+# manifest named a table the bucket did not have, and 31 files never uploaded. (A
+# separate 6-hourly job, mol-dog-backup, keeps that same staging incrementally fresh
+# without any disk gate — so the staging was complete the whole time; only S3 lagged.)
+#
+# Reuses the shared proof lib: ADDITIVE upload (never --delete — nothing in S3 is pruned
+# on a night we could not sync), tables first and the manifest last (S3 never names a
+# table it lacks), and only from a staging dir whose own manifest closes (never mirror a
+# broken copy over S3). It ends by re-proving the S3 copy is restorable and matches the
+# staging, so the caller learns the true S3 state rather than assuming it.
+#
+# Deliberately NOT applied to the OTHER _sync_disk_preflight failure sites below: those
+# fire after a sync attempt may have half-written the staging, and a half-written
+# staging must never be mirrored.
+#
+# Returns 0 iff S3 is proven restorable and identical to the staging (or there is no
+# staging to mirror); 1 otherwise. Never changes the ok/failed counters — the db's
+# backup for today still failed; this only reports what state S3 is left in.
+_mirror_staging_after_disk_refusal() {
+  local db="$1" dest="$2"
+  if [ ! -d "$dest" ]; then
+    log "$db: disk refusal — no local staging at $dest, nothing to mirror to S3"
+    return 0
+  fi
+  if _s3proof_repair_then_prove "$dest" "$db"; then
+    log "$db: disk refusal — existing staging mirrored to S3 anyway (zero local disk); S3 copy is proven restorable and matches the staging"
+    return 0
+  fi
+  log "$db: disk refusal — S3 copy of $db is NOT proven restorable/identical to the staging after the mirror attempt (see lines above)"
+  return 1
+}
+
 # _sync_once <db> — one CALL DOLT_BACKUP('sync', ...) attempt for <db>; raw
 # dolt output goes wherever the caller redirects, dolt's own exit code is
 # returned. Factored out so the retry loop below and the selftest's
@@ -761,8 +803,18 @@ for db in $DBS; do
   head="$(dsql -q "SELECT commit_hash FROM \`$db\`.dolt_log ORDER BY date DESC LIMIT 1" --result-format csv 2>/dev/null | tail -1)"
   # 1) native consistent backup -> local staging (incremental)
   if ! _sync_disk_preflight "$db"; then
-    failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(disco)"
-    _backup_fail_note "$db"; continue
+    failed=$((failed+1))
+    # ga-rt7ljo: the streak note is a cheap bookkeeping write — take it BEFORE the (slow, network)
+    # mirror below, so a mirror that stalls or is killed can never lose tonight's failure count.
+    _backup_fail_note "$db"
+    # ga-btnq6h: today's local sync is refused, but mirroring the staging that already
+    # exists needs no local disk — do it, and say in the alert whether S3 is sound.
+    if _mirror_staging_after_disk_refusal "$db" "$dest"; then
+      FAILED_DBS="$FAILED_DBS ${db}(disco)"
+    else
+      FAILED_DBS="$FAILED_DBS ${db}(disco+s3)"
+    fi
+    continue
   fi
   if ! DOLT_CLI_PASSWORD='' timeout "$SYNC_TIMEOUT" "$DOLT" --host "$HOST" --port "$PORT" \
         --user root --no-tls sql -q "USE \`$db\`; CALL DOLT_BACKUP('sync', '${db}-backup');" > "$SYNC_OUT" 2>&1; then
