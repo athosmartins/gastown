@@ -100,6 +100,12 @@ s=s.replace("**"+needle+".**","**Segredos.**",1).replace("{{ end -}}\n{{ if not 
 open(p,"w",encoding="utf-8").write(s)
 EOF
 expect_fail "sentinela de segredos migra para seção guardada (existe no arquivo, mas não é núcleo)" "NÚCLEO: sentinela 'segredos'"
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-roles.json" <<'EOF'
+import json, sys
+p = sys.argv[1]; m = json.load(open(p)); m["doctrine"]["guarded"]["claudemd-carryover"]["roles"].remove("wa-worker")
+json.dump(m, open(p, "w"), indent=1, ensure_ascii=False)
+EOF
+expect_fail "wa-worker tem o CLAUDE.md excluído mas deixa de receber o carry-over (as regras só-do-CLAUDE.md sumiriam em silêncio)" "não recebe 'claudemd-carryover'"
 reset_tree; python3 - "$T/packs/town-deltas/template-fragments/town-deltas.template.md" <<'EOF'
 import sys
 p=sys.argv[1]; s=open(p,encoding="utf-8").read()
@@ -224,7 +230,7 @@ for name, role in cases:
         if needle not in out: errs.append(f"{name}: NÚCLEO '{key}' ausente do prompt renderizado")
     for b in blocks:
         if b["cond"] is None: continue
-        should = role is None or role in m["doctrine"]["guarded"][b["id"]]["roles"]
+        should = ppb.receives(m["doctrine"]["guarded"][b["id"]], role)
         if should != (b["lines"][0] in out): errs.append(f"{name}: seção '{b['id']}' {'deveria estar' if should else 'VAZOU (deveria estar escondida)'}")
     print(f"      {name:14s} {len(out):>7,} chars  == referência do motor")
 for e in errs: print("      ✗", e)

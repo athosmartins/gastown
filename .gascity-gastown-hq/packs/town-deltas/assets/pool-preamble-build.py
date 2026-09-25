@@ -100,11 +100,23 @@ def cmd_build(m):
 
 
 # ----------------------------------------------------------------------------- fragment
-def guard_cond(roles):
-    """Condição Go-template: agente sem TD_ROLE (fail-open) OU papel na lista. Lista vazia = só quem não tem TD_ROLE."""
-    if not roles:
-        return "not .TD_ROLE"
-    return "or (not .TD_ROLE) " + " ".join(f'(eq .TD_ROLE "{r}")' for r in sorted(roles))
+def guard_cond(roles, show_unset=True):
+    """Condição Go-template. show_unset=True (padrão): agente SEM TD_ROLE recebe a seção (fail-open, byte-idêntico ao de antes) OU o papel
+    está na lista. show_unset=False: SÓ os papéis listados — para texto que substitui o que o papel perdeu ao excluir o CLAUDE.md (um agente
+    sem TD_ROLE ainda carrega o CLAUDE.md, então receberia a regra em duplicata)."""
+    eqs = [f'(eq .TD_ROLE "{r}")' for r in sorted(roles)]
+    if show_unset:
+        return "not .TD_ROLE" if not eqs else "or (not .TD_ROLE) " + " ".join(eqs)
+    if not eqs:
+        raise ValueError("seção com show_unset=false precisa de ao menos um papel")
+    return eqs[0][1:-1] if len(eqs) == 1 else "or " + " ".join(eqs)
+
+
+def receives(guarded_entry, role):
+    """O papel `role` (None = agente sem TD_ROLE) recebe esta seção guardada?"""
+    if role is None:
+        return guarded_entry.get("show_unset", True)
+    return role in guarded_entry["roles"]
 
 
 def parse_fragment(text):
@@ -143,7 +155,7 @@ def role_text(blocks, m, role):
     guarded = m["doctrine"]["guarded"]
     out = []
     for b in blocks:
-        if b["cond"] is not None and role is not None and role not in guarded[b["id"]]["roles"]:
+        if b["cond"] is not None and not receives(guarded[b["id"]], role):
             continue
         out.append("\n".join(b["lines"]) + "\n")
     return '{{ define "town-deltas" }}\n' + "".join(out) + "{{ end }}\n"
@@ -169,7 +181,7 @@ def check_fragment(m):
             if b["id"] not in guarded:
                 errs.append(f"fragment: seção guardada '{b['id']}' (L{b['line']}) não está em doctrine.guarded do manifesto")
             else:
-                want = guard_cond(guarded[b["id"]]["roles"])
+                want = guard_cond(guarded[b["id"]]["roles"], guarded[b["id"]].get("show_unset", True))
                 if b["cond"] != want:
                     errs.append(f"fragment: guarda de '{b['id']}' (L{b['line']}) diverge do manifesto.\n    no fragment: {b['cond']}\n    esperado   : {want}")
     for i in sorted(core):
@@ -181,6 +193,12 @@ def check_fragment(m):
     for r in {r for g in guarded.values() for r in g["roles"]}:
         if r not in {x["td_role"] for x in m["roles"].values()}:
             errs.append(f"manifesto: papel '{r}' citado em doctrine.guarded não é td_role de nenhum papel")
+    # todo papel cujo overlay EXCLUI o CLAUDE.md perdeu as regras que só viviam lá: ou recebe o carry-over ou está isento com motivo
+    carry = set(guarded.get("claudemd-carryover", {}).get("roles", []))
+    exempt = set(m["doctrine"].get("carryover_exempt_roles", {}))
+    for role_key, r in m["roles"].items():
+        if m["common"]["claude_md_excludes"] and r["td_role"] not in carry and r["td_role"] not in exempt:
+            errs.append(f"papel '{r['td_role']}' tem o CLAUDE.md excluído mas não recebe 'claudemd-carryover' nem está em doctrine.carryover_exempt_roles")
     # núcleo obrigatório: cada sentinela tem que estar em bloco NÃO guardado
     core_text = "\n".join("\n".join(b["lines"]) for b in blocks if b["cond"] is None)
     for name, needle in m["doctrine"]["core_sentinels"].items():
@@ -257,7 +275,7 @@ def cmd_sections(m):
     print(f"fragment town-deltas: {total_all:,} chars em {len(blocks)} seções\n")
     for rl in roles:
         role = None if rl.startswith("(sem") else rl
-        got = [b for b in blocks if b["cond"] is None or role is None or role in m["doctrine"]["guarded"][b["id"]]["roles"]]
+        got = [b for b in blocks if b["cond"] is None or receives(m["doctrine"]["guarded"][b["id"]], role)]
         hid = [b for b in blocks if b not in got]
         chars = sum(size[b["id"]] for b in got)
         print(f"== {rl}: recebe {len(got)}/{len(blocks)} seções, {chars:,} chars ({chars * 100 // total_all}%)")

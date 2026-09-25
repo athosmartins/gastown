@@ -890,6 +890,25 @@ sem dono = disponível pra despacho. Sem ela, esta regra vira decorativa e
 ninguém aplica.
 
 {{ end -}}
+{{ if or (eq .TD_ROLE "dog") (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:claudemd-carryover */ -}}
+**Regras que só viviam no CLAUDE.md do Athos/do gt — a sessão de pool não carrega mais esses arquivos (ga-aijm2v.6); continuam valendo:**
+
+- **Deploy / restart:** edição ADITIVA numa lib importada por muitos daemons (constante, coluna, função ou migração que nenhum caminho existente lê — ex.: `credits_collector.py`, `classification_database.py`) acende o detector de "daemon velho" em vários de uma vez, mas a defasagem é COSMÉTICA: eles rodam idênticos. Reinicie SÓ os processos que USAM o símbolo novo; o resto limpa no próximo deploy natural. Não faça restart em cascata — nem entre em pânico — por causa de detector aceso. Pergunte por processo: "ele lê a coisa nova?" Não → deixe.
+- **Dados pessoais do Athos** (CPF, RG, nascimento, CNPJ, sócios, e-mails, telefone, endereço): ANTES de pedir a ele, consulte `secret "Athos Martins Bernardes - Dados Pessoais"`. Documentos completos (RG, CNH, passaporte, comprovante de residência...) estão no Google Drive de `athosmartins@gmail.com`, pasta `My Drive/02 Documentos/` — leia pela API (`lib/gdrive_reader.py` do repo whatsapp_automation: `get_local_path` / `list_folder`), NÃO pelo mount local do Drive: o mount do File Provider está quebrado (bead gt-xu3c5) e abrir o caminho pendura a sessão em syscall não-cancelável. Só pergunte ao Athos se faltar nos dois — e depois ACRESCENTE o dado ao item do Bitwarden.
+- **2FA do Google — NÃO peça código ao Athos:** `gmail-totp <email>` devolve o código de 6 dígitos das 4 contas dele (`athoscrypto@gmail.com`, `athosmartins@gmail.com`, `throw.away.amb@gmail.com`, `terrenos.incorporacoes@gmail.com`). Não use `secret "<nome>" --field totp` (os nomes colidem). Detalhe em `~/gt/SECRETS.md`.
+- **Reclaim manual de bead: nunca `bd reclaim` cru.** Ele limpa assignee/status mas deixa os marcadores do Pilot (`pilot:dispatched`/`pilot:dispatching`, `pilot.dispatched_at`), e todo scan do Pilot exclui `pilot:dispatched` — o bead volta a `open` e fica INVISÍVEL pro re-despacho. Use `packs/town-deltas/assets/pilot-manual-reclaim.sh <bead-id> [rig-path]` (só limpa os marcadores se o reclaim de fato reabriu o bead).
+- **Antes de consertar algo no Gas Town, procure a solução canônica:** `gc doctor` (diagnostica), `gc doctor --fix`, `gc <cmd> --help`. Não crie script novo para problema que o Gas Town já resolve.
+
+{{ end -}}
+{{ if eq .TD_ROLE "dog" -}}{{/* td:dolt-cleanup-hazards */ -}}
+**Dolt — o que só o CLAUDE.md do gt dizia (ga-aijm2v.6):**
+
+- **Órfãos: `gc dolt-cleanup` (HÍFEN), nunca `gc dolt cleanup` (ESPAÇO).** O de hífen é o caminho Go seguro: só apaga prefixos de teste (`testdb_*`, `beads_t*`...), é dry-run por padrão e não derruba banco de produção nem com `--force`. O de espaço é OUTRO comando, em shell, que dá `DROP DATABASE` no que julgar órfão — tem guardas, mas nenhuma proteção por nome de produção. A tabela de comandos deste prompt lista `gc dolt cleanup --force`: NÃO use essa forma; se achar que precisa, escale pro Mayor.
+- **A contagem de órfãos do `gc dolt health` MENTE quando o `gc rig list` estoura os 5s** (leva 8-17s sob carga): todo banco de produção exceto `hq` (`whatsapp_automation`, `gastown`, `dc`, `lexbh`, `marketing`, `property_scrapers`) aparece como "órfão". Banco de produção nessa lista É o sintoma de sonda degradada, não de orfandade. Nunca aja só pela contagem: confira com `gc rig list --json | jq -r '.rigs[].path'` (sem limite de tempo).
+- **Porta e PID do Dolt: derive do processo vivo, nunca de arquivo ou doc** (o `~/gt/dolt-server.port` está velho): `source /Users/athos/gt/.gascity-gastown-hq/scripts/dolt-pid-lib.sh; dolt_server_pid` — verifica o executável `dolt` E um socket LISTEN; um `pgrep | head -1` pode devolver um processo-isca. O `data_dir` real está no `--config` do processo (`ps -o command= -p "$DOLT_PID"`).
+- **Nunca** apague nem edite nada dentro de um diretório `.dolt/` — inclusive `noms/LOCK` — nem faça `rm -rf` em diretório de dados do Dolt: corrompe o banco sem volta.
+
+{{ end -}}
 {{ if not .TD_ROLE -}}{{/* td:witness-startup */ -}}
 **WITNESS: o Startup Protocol Step 1/3 e o bloco "CRITICAL: No Idle State" do
 prompt nativo estão QUEBRADOS — substitua pelos comandos abaixo (ga-3v2n4).**

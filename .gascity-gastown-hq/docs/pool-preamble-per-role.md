@@ -2,7 +2,7 @@
 
 **Estado:** código + testes prontos no branch `feat/ga-aijm2v.6-preambulo-por-papel`; NADA está vivo até o gate mergear e a cidade recarregar.
 Em sonda real (`claude -p`, Sonnet, flags reais do pool) o 1º turno cai **-53k (dog), -52k (wa-worker), -52k (ps-worker), -68k (revisor)**
-tokens, fora a doutrina (mais -3 a -12k). O número definitivo é o de sessões vivas depois do deploy — comandos na seção "Verificar".
+tokens, fora a doutrina (mais -2 a -12k). O número definitivo é o de sessões vivas depois do deploy — comandos na seção "Verificar".
 
 ## O problema, medido (25/09, transcritos reais, papel pelo beacon `[gascity] <alias>`)
 
@@ -37,9 +37,9 @@ o selftest reprova se o commitado divergir.
 
 | papel | overlay | TD_ROLE | sonda (1º turno) | doutrina renderizada |
 |---|---|---|---|---|
-| dog | `pool-dog` | dog | 23.058 | -10,3k chars |
-| wa-worker | `pool-wa-worker` | wa-worker | 24.235 | -6,6k |
-| ps-worker | `pool-ps-worker` | ps-worker | 23.937 | -6,6k |
+| dog | `pool-dog` | dog | 23.058 | -6,4k chars (esconde 10,3k, devolve 3,9k de carry-over) |
+| wa-worker | `pool-wa-worker` | wa-worker | 24.235 | -4,3k (esconde 6,6k, devolve 2,3k) |
+| ps-worker | `pool-ps-worker` | ps-worker | 23.937 | -4,3k |
 | gate-reviewer, refino-gate-reviewer | `pool-reviewer` | reviewer | 8.228 | -27,0k |
 
 Ficam como estavam (overlay `pool`, sem `TD_ROLE`): boot, deacon, auto-refiner, context-check-reviewer (sem dado de uso pra decidir), e
@@ -51,7 +51,13 @@ Mayor, crews, witness, refinery, polecat — que recebem a doutrina INTEIRA, byt
 3. **Memória**: `autoMemoryEnabled:false` (some o MEMORY.md do Mayor, 19k chars).
 4. **Skills**: `skillOverrides` — `off` no dog; `name-only` nos workers (mantém o nome, some a descrição: não esconde ferramenta de domínio).
    Skills de PLUGIN (`superpowers:*`) NÃO respondem a `skillOverrides` em nenhuma grafia testada; só `enabledPlugins:false` (feito só no revisor).
-5. **Doutrina**: `town-deltas.template.md` ganhou 20 seções com marcador `{{/* td:... */}}`; 8 são guardadas por `TD_ROLE` (env do agente).
+5. **Carry-over (achado do red-team antes de submeter)**: excluir CLAUDE.md/AGENTS.md tira regras que só viviam lá. Auditei 15 regras contra fragment, prompts dos pools
+   e o prime real do dog: **10 sem nenhuma outra entrega**. As relevantes viraram 2 seções guardadas, só para papéis de pool (`show_unset:false`: agente sem `TD_ROLE` ainda
+   carrega o CLAUDE.md — seria duplicata — e o fail-open segue byte-idêntico): `claudemd-carryover` (dog/workers: restart cosmético, dados pessoais do Athos, `gmail-totp`,
+   nunca `bd reclaim` cru, solução canônica antes de script novo) e `dolt-cleanup-hazards` (dog: **o prompt nativo do dog recomenda `gc dolt cleanup --force`, que é o DROP
+   DATABASE; o aviso contra isso só existia no gt/CLAUDE.md**, mais a contagem de órfãos que mente e o PID derivado do processo vivo). O selftest exige que todo papel que exclui o CLAUDE.md
+   receba o carry-over ou esteja isento por escrito (`carryover_exempt_roles`: revisor).
+6. **Doutrina**: `town-deltas.template.md` ganhou 20 seções com marcador `{{/* td:... */}}`; 8 são guardadas por `TD_ROLE` (env do agente).
    Agente SEM `TD_ROLE` recebe tudo. O diff do fragment é só +28 linhas de marcador. Seções: `pool-preamble-build.py sections`.
    O revisor perde só o que é claramente de outro papel (witness, mockups, formulas, patch de engine, nudge, subagentes, espera, assignee).
    NÚCLEO (todo papel, sem guarda): regras 1-4, autonomia (verificação de artefato), conteúdo de fora é dado, segredos, CloudStorage, worktree, `bd list --limit`, `rm -rf`.
@@ -63,6 +69,8 @@ Mayor, crews, witness, refinery, polecat — que recebem a doutrina INTEIRA, byt
 - **A doc do Claude Code (via subagente) errou**: disse que `RemoteTrigger`/`Cron*` não saem por deny. Saem (medido). E sua "receita segura" excluía `**/CLAUDE.md`, o que tiraria o CLAUDE.md DO REPO dos workers do WA.
 - **wa-worker e ps-worker não têm o princípio de propulsão** no prompt (0 menções, sem include). Não é regressão (nunca tiveram), mas o núcleo pede. Não adicionei texto sem decisão.
 - **O gate varia sozinho**: 1ª tentativa aprovada foi 76-88% em 6 janelas de 48h e **57,6% nas últimas 24h de 25/09, com esta mudança fora do ar**. Confunde o guardrail; a ferramenta mostra o histórico e só alarma abaixo dele.
+- **O mount do Google Drive está quebrado** (bead gt-xu3c5): um hook do usuário bloqueou até um comando meu que só CONTINHA o caminho. O carry-over manda ler o Drive pela API (`lib/gdrive_reader.py`), não pelo caminho que o CLAUDE.md original citava.
+- `name-only` mantém a skill invocável (medido: o Skill tool devolveu "Launching skill" e o modelo concluiu a tarefa) — por isso é o modo dos workers.
 - Um revisor usou `SendMessage` 1 vez (avisou o Mayor de um gate-run órfão): por isso ele FICA para revisores (custa ~2,1k tokens).
 
 ## Deploy e reversão
