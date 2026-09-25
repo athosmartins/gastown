@@ -5349,7 +5349,9 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
         requeue)
           bd -C "$GC_CITY" label remove "$VB" "verdict:pending" -q 2>/dev/null || true
           bd -C "$GC_CITY" label add    "$VB" "verdict:REQUEUED" -q 2>/dev/null || true
-          bd -C "$GC_CITY" comment "$VB" "VERDICT: REQUEUED (ga-eqjo) — reviewer session died mid-review (infra failure, NOT a code FAIL). Marker re-queued for a fresh attempt." 2>/dev/null || true
+          # ga-dl3x9s: written BEFORE the marker requeue below, so it cannot state the
+          # marker's fate (an external transition may still win) — say what is true now.
+          bd -C "$GC_CITY" comment "$VB" "VERDICT: REQUEUED (ga-eqjo) — reviewer session died mid-review (infra failure, NOT a code FAIL). Marker is re-queued for a fresh attempt unless another actor moved it first — the marker's own comment records which." 2>/dev/null || true
           bd -C "$GC_CITY" close "$VB" 2>/dev/null || true
           ;;
       esac
@@ -5432,7 +5434,9 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
       requeue)
         bd -C "$GC_CITY" label remove "$VB" "verdict:pending" -q 2>/dev/null || true
         bd -C "$GC_CITY" label add    "$VB" "verdict:REQUEUED" -q 2>/dev/null || true
-        bd -C "$GC_CITY" comment "$VB" "VERDICT: REQUEUED (ga-x3nmz) — reviewer session ended on an exhausted Claude 5h quota (quota-stop, NOT a code FAIL). Marker re-queued for re-run post-reset${_eta:+ ($_eta)}." 2>/dev/null || true
+        # ga-dl3x9s: written BEFORE the marker requeue below — see the dead-reviewer
+        # branch's matching comment; it must not state the marker's fate.
+        bd -C "$GC_CITY" comment "$VB" "VERDICT: REQUEUED (ga-x3nmz) — reviewer session ended on an exhausted Claude 5h quota (quota-stop, NOT a code FAIL). Marker is re-queued for re-run post-reset${_eta:+ ($_eta)} unless another actor moved it first — the marker's own comment records which." 2>/dev/null || true
         bd -C "$GC_CITY" close "$VB" 2>/dev/null || true
         ;;
     esac
