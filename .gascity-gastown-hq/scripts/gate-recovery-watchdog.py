@@ -34,6 +34,17 @@ DETECTS (head-of-line stale-branch block — the ga-hl0gq signature, 2026-06-10)
   exactly why the 2026-06-10 stall ran 49min before a human asked for status.
   Detected here in ~2 sweeps (~6min). The permanent dispatcher-level auto-skip is
   ga-q3ig2; this wake is the detection+recovery bridge until it lands.
+  Only THIS ending ('QUEUED (retry N/M, dead author)') gets a repair dog: the runbook
+  re-anchors/supersedes a branch that conflicts with main.
+
+OBSERVES (the other QUEUED endings — ga-mlzqg4, 25/09 incident):
+  - the dispatcher has more than one 'verdict=QUEUED (...)' ending. The proven-clean
+    one ('merge-tree proven clean, transient failures repeat, staying in bounded retry
+    — ga-y5c29l') ran 28-30 sweeps on ONE branch (82min) and was invisible to the check
+    above, whose pattern only knows '(retry'. It is now recognised (>=
+    HEADOFLINE_NONREPAIR_MIN_SWEEPS same-branch sweeps) and LOGGED, rate-limited per
+    branch — with NO repair dog: for a branch merge-tree already proved clean the
+    'auto-rebase conflicts' premise of the runbook above is false.
 
 DETECTS (orphaned queued marker — the gt-mqkwj signature, 2026-06-12):
   - a gate-status:queued marker created during a dispatcher OUTAGE (a gap with no
@@ -94,6 +105,12 @@ PILOT_STALL_SEC = 2400         # pilot log silent >40min = Pilot dead/not sweepi
 GRW_WAKE_GRACE = os.environ.get("GRW_WAKE_GRACE", "1") != "0"  # ga-m1o5: suppress a stall verdict a machine sleep can fully explain (mirrors daemon-presence-watchdog.sh's DPW_WAKE_GRACE)
 HEADOFLINE_MIN_SWEEPS = 2      # >=2 consecutive QUEUED-retry sweeps on the SAME branch = head-of-line block
 HEADOFLINE_LOG_FRESH_SEC = 600 # ignore if dispatcher log is staler than this (that's ENGINE-STALL's job)
+# ga-mlzqg4: the OTHER `verdict=QUEUED (...)` outcomes (merge-tree-proven-clean retry, live-author
+# transient race). Log-only — see headofline_nonrepair(). 5 sweeps ~ 15min at the dispatcher's
+# ~3min cadence (the 25/09 incident ran 28-30 sweeps / 82min), long enough that a couple of
+# ordinary transient retries on one branch do not trip it.
+HEADOFLINE_NONREPAIR_MIN_SWEEPS = int(os.environ.get("GRW_HOL_NONREPAIR_MIN_SWEEPS", "5"))
+HEADOFLINE_NONREPAIR_LOG_EVERY_SEC = int(os.environ.get("GRW_HOL_NONREPAIR_LOG_EVERY_SEC", "1800"))
 ORPHAN_LOG_FRESH_SEC = 600     # dispatcher log must be live (process still writing) — else ENGINE-STALL's job
 ORPHAN_DRAIN_FRESH_SEC = 1200  # newest COMPLETED sweep within 20min = dispatcher actively draining (not wedged on one run)
 ORPHAN_MIN_AGE_SEC = 1800      # a queued marker must sit >=30min unmentioned before we call it skipped (rules out a just-created marker)
@@ -319,7 +336,14 @@ DOLT_INSTABILITY_MIN_HITS = int(os.environ.get("GRW_DOLT_INSTABILITY_MIN_HITS", 
 SUP_TS_RE = re.compile(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})")
 TS_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
 # "=== Dispatcher sweep complete: branch=<X> verdict=QUEUED (retry N/M, dead author) ==="
+# This is ONE of the dispatcher's QUEUED endings — the conflict + dead-author one, which is the
+# one the stale-branch repair runbook is written for. quality-gate-dispatcher.sh also ends a sweep with
+#   QUEUED (merge-tree proven clean, transient failures repeat, staying in bounded retry — ga-y5c29l)
+#   QUEUED (transient rebase race, author <X> live, retry N/M)
+# which this pattern does not (and must not) match — see SWEEP_QUEUED_ANY_RE.
 SWEEP_QUEUED_RETRY_RE = re.compile(r"Dispatcher sweep complete: branch=(\S+) verdict=QUEUED \(retry")
+# Any QUEUED ending. Checked AFTER SWEEP_QUEUED_RETRY_RE, so a line that matches both is the retry kind.
+SWEEP_QUEUED_ANY_RE = re.compile(r"Dispatcher sweep complete: branch=(\S+) verdict=QUEUED\b")
 SWEEP_COMPLETE_RE = re.compile(r"Dispatcher sweep complete: branch=(\S+) verdict=")
 MARKER_BRANCH_RE = re.compile(r"^branch:(.+)$")  # marker label form: branch:crew/<rig>-<name>/<bead>  (gt-mqkwj)
 # supervisor init-failure loop (ga-h3w2y): a rig with no `path` in site.toml makes
@@ -575,8 +599,92 @@ def gate_infra_throttled():
     return False
 
 
+HOL_KIND_CONFLICT_RETRY = "conflict-retry"  # 'QUEUED (retry N/M, dead author)' — the repair runbook fits
+HOL_KIND_QUEUED_OTHER = "queued-other"      # any other 'verdict=QUEUED' — deliberately NOT repaired
+# Third state (ga-mlzqg4 self-audit): "could not read a fresh dispatcher log" is NOT "no head-of-line".
+# A None kind means we READ the log and the newest sweep is not a QUEUED; HOL_KIND_UNKNOWN means we
+# did not get to read it. Callers must not treat the second as the end of an episode.
+HOL_KIND_UNKNOWN = "unknown"
+
+
+def _scan_headofline(lines):
+    """PURE (no I/O) trailing-run scan of dispatcher-log lines → (kind, branch, count).
+
+    Walks the 'Dispatcher sweep complete' lines newest → oldest and counts the
+    consecutive run that names the SAME branch with the SAME kind of QUEUED ending
+    as the newest one (HOL_KIND_CONFLICT_RETRY or HOL_KIND_QUEUED_OTHER). The run
+    ends at the first sweep that is anything else — a real PASS/FAIL/merge, another
+    branch, or the other kind — so the two kinds never inflate each other's count.
+    Returns (None, None, 0) when the newest completion is not a QUEUED at all."""
+    kind = None
+    branch = None
+    count = 0
+    for l in reversed(lines):
+        if "Dispatcher sweep complete:" not in l:
+            continue
+        mq = SWEEP_QUEUED_RETRY_RE.search(l)
+        if mq:
+            k, b = HOL_KIND_CONFLICT_RETRY, mq.group(1)
+        else:
+            ma = SWEEP_QUEUED_ANY_RE.search(l)
+            if not ma:
+                # most-recent completion is NOT a QUEUED (a real PASS/FAIL/merge
+                # happened, or a different terminal verdict) → not stalled right now.
+                break
+            k, b = HOL_KIND_QUEUED_OTHER, ma.group(1)
+        if kind is None:
+            kind, branch = k, b
+        if k != kind or b != branch:
+            break  # head-of-line moved to a different branch/kind → not a single-branch wedge
+        count += 1
+    return (kind, branch, count)
+
+
+# How much of the dispatcher log tail headofline_scan() reads. The old window was the last 400 LINES,
+# but the dispatcher writes ~50-95 lines between two sweeps (measured 25/09: 94, 91, 54), so 400 lines
+# held only ~4-5 sweeps. 2MB is ~16k lines (~200 sweeps at that spacing) and reads in milliseconds.
+HEADOFLINE_TAIL_BYTES = 2 * 1024 * 1024
+
+
+def _read_log_tail_lines(path, max_bytes):
+    """Lines of the last ~max_bytes of `path`, decoded TOLERANTLY (errors='replace').
+
+    Two things the old `open(path).readlines()[-400:]` got wrong on the live log (ga-mlzqg4):
+    it decoded strictly, and it read the WHOLE 25MB file before slicing — so ONE byte that is
+    not valid UTF-8 anywhere in the file (the dispatcher's own 'FAIL forensics reviewer' lines
+    carry reviewer output cut mid-multibyte-character; 11 such lines since 15/09) raised
+    UnicodeDecodeError, which the caller's `except Exception` turned into 'no signal'. Reading
+    bytes and decoding with errors='replace' makes an odd byte a replacement character instead
+    of an outage. A read that seeks into the middle of a line drops that partial first line."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        if size > max_bytes:
+            f.seek(size - max_bytes)
+        data = f.read()
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if size > max_bytes and lines:
+        lines = lines[1:]
+    return lines
+
+
+def headofline_scan():
+    """Read the dispatcher log and return _scan_headofline()'s (kind, branch, count).
+
+    Requires a fresh log (dispatcher actively sweeping) — a stale log is dead-
+    engine territory, covered by the health-monitor's ENGINE-STALL. An unreadable
+    or stale log yields (HOL_KIND_UNKNOWN, None, 0): no verdict either way, and
+    distinct from (None, None, 0), which means the log WAS read and shows no run."""
+    try:
+        if time.time() - os.path.getmtime(DISPATCH_LOG) > HEADOFLINE_LOG_FRESH_SEC:
+            return (HOL_KIND_UNKNOWN, None, 0)
+        lines = _read_log_tail_lines(DISPATCH_LOG, HEADOFLINE_TAIL_BYTES)
+    except Exception:
+        return (HOL_KIND_UNKNOWN, None, 0)
+    return _scan_headofline(lines)
+
+
 def headofline_stall():
-    """Detect the stale-branch FIFO head-of-line block (ga-hl0gq).
+    """Detect the stale-branch FIFO head-of-line block (ga-hl0gq) — the REPAIR signal.
 
     The dispatcher picks the oldest queued marker every sweep; if that branch is
     stale vs origin/main and its auto-rebase conflicts with a dead/empty author,
@@ -585,35 +693,41 @@ def headofline_stall():
     keeps logging (no ENGINE-STALL) and no run reaches verdicts (no TIMEOUT, no
     'Verdicts 0/N' poll line), so recent_timeouts()/stuck_dispatching() are blind.
 
-    Signature: walking the dispatcher log's 'sweep complete' lines from newest to
-    oldest, the trailing run names the SAME branch with 'verdict=QUEUED (retry'.
-    Returns (branch, count) when count >= HEADOFLINE_MIN_SWEEPS, else (None, 0).
-    Requires a fresh log (dispatcher actively sweeping) — a stale log is dead-
-    engine territory, covered by the health-monitor's ENGINE-STALL."""
-    try:
-        if time.time() - os.path.getmtime(DISPATCH_LOG) > HEADOFLINE_LOG_FRESH_SEC:
-            return (None, 0)
-        with open(DISPATCH_LOG) as f:
-            lines = f.readlines()[-400:]
-    except Exception:
-        return (None, 0)
-    branch = None
-    count = 0
-    for l in reversed(lines):
-        if "Dispatcher sweep complete:" not in l:
-            continue
-        mq = SWEEP_QUEUED_RETRY_RE.search(l)
-        if not mq:
-            # most-recent completion is NOT a QUEUED-retry (a real PASS/FAIL/merge
-            # happened, or a different terminal verdict) → not stalled right now.
-            break
-        b = mq.group(1)
-        if branch is None:
-            branch = b
-        if b != branch:
-            break  # head-of-line moved to a different branch → not a single-branch wedge
-        count += 1
-    if branch and count >= HEADOFLINE_MIN_SWEEPS:
+    Signature: the trailing run of 'sweep complete' lines names the SAME branch with
+    'verdict=QUEUED (retry'. Returns (branch, count) when count >= HEADOFLINE_MIN_SWEEPS,
+    else (None, 0). Only this kind gets a repair dog: its runbook (re-anchor / supersede
+    a conflicting stale branch) is about a branch that does NOT merge cleanly."""
+    kind, branch, count = headofline_scan()
+    if kind == HOL_KIND_CONFLICT_RETRY and count >= HEADOFLINE_MIN_SWEEPS:
+        return (branch, count)
+    return (None, 0)
+
+
+def headofline_nonrepair():
+    """The OTHER QUEUED endings (ga-mlzqg4) — an OBSERVATION signal, never a repair trigger.
+
+    Until this existed, headofline_stall() returned (None, 0) for these on the very first
+    line, by construction: measured 25/09, 09:44-11:06, 28-30 sweeps on ONE branch, every
+    one ending 'verdict=QUEUED (merge-tree proven clean, transient failures repeat, staying
+    in bounded retry — ga-y5c29l)', which SWEEP_QUEUED_RETRY_RE cannot match.
+
+    Not repaired on purpose. For the proven-clean ending the stale-branch runbook's premise
+    ('auto-rebase conflicts') is false — merge-tree already proved the branch merges with
+    zero conflicts, so the failure is operational (disk / worktree / push race) and a dog
+    re-anchoring or force-pushing that branch would be acting on the wrong diagnosis.
+    The live-author ending is bounded by the dispatcher's own attempt cap and the author
+    is around to act. This watchdog therefore only LOGS the episode (see main()); paging
+    the Mayor about a repeating head-of-line belongs to gate-throughput-stall-watchdog.sh
+    (ga-a6etc2) — two watchdogs alarming on one episode would be a duplicate.
+
+    Returns (branch, count) when count >= HEADOFLINE_NONREPAIR_MIN_SWEEPS, else (None, 0)."""
+    return _nonrepair_signal(*headofline_scan())
+
+
+def _nonrepair_signal(kind, branch, count):
+    """PURE threshold decision behind headofline_nonrepair(); main() feeds it one scan so it
+    can also tell 'no run' (kind None) from 'could not read' (HOL_KIND_UNKNOWN)."""
+    if kind == HOL_KIND_QUEUED_OTHER and count >= HEADOFLINE_NONREPAIR_MIN_SWEEPS:
         return (branch, count)
     return (None, 0)
 
@@ -4125,6 +4239,7 @@ def main():
   last_pilot_spawn = 0
   last_loop_spawn = 0
   last_orphan_spawn = 0
+  hol_nonrepair_logged = {}  # ga-mlzqg4: branch -> epoch of the last log-only HOL line (rate limit)
 
   print("[watchdog] gate+pilot watchdog started — governed repair-agent spawner "
         "(dedup + cap=%d + per-condition back-off + self-limit=%d; enabled=%s dry_run=%s) "
@@ -4258,6 +4373,24 @@ def main():
                                   "Gate preso em branch stale (head-of-line)", branch=hb)
             if lhow is not None:
                 last_loop_spawn = now; saw_loop = True
+
+        # --- HEAD-OF-LINE, non-conflict QUEUED endings (ga-mlzqg4): LOG ONLY. No
+        #     snapshot(), no governed_spawn() — headofline_nonrepair() says why a repair
+        #     dog would be the wrong response. Rate-limited per branch; the dict is
+        #     cleared once a READ of the log shows the run has ended, so the NEXT episode
+        #     logs immediately. A log we could not read (HOL_KIND_UNKNOWN) proves nothing
+        #     about the episode and clears nothing. ---
+        hk, hbr, hcnt = headofline_scan()
+        nb, ncount = _nonrepair_signal(hk, hbr, hcnt)
+        if nb:
+            if now - hol_nonrepair_logged.get(nb, 0) >= HEADOFLINE_NONREPAIR_LOG_EVERY_SEC:
+                print("[watchdog] head-of-line (log-only, NO repair dog spawned): %d consecutive sweeps on %s "
+                      "ended verdict=QUEUED but not '(retry ..., dead author)' — proven-clean / live-author "
+                      "retry, not a stale-branch conflict; the re-anchor runbook does not apply (ga-mlzqg4)"
+                      % (ncount, nb), flush=True)
+                hol_nonrepair_logged[nb] = now
+        elif hk != HOL_KIND_UNKNOWN:
+            hol_nonrepair_logged.clear()
 
         # --- SUPERVISOR init-failure loop (closes the ga-h3w2y blind spot:
         #     a rig with no path in site.toml → spawn-outage town-wide, ~1h to
