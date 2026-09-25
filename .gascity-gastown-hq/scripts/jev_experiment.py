@@ -146,10 +146,15 @@ def assign_arm(entity_id: str, experiment_name: str) -> str:
     return "experiment" if int(digest[:8], 16) % 2 == 0 else "control"
 
 
-def call_jev(state: str, question_key: str, instructions: str, true_desc: str, false_desc: str) -> dict:
-    """Never raises. Returns a dict with ok=True/False; ok=False always means 'treat as
-    unknown, do not suppress' to the caller — this function does not make that call
-    itself, evaluate() below does, so the fail-open policy lives in exactly one place."""
+def _noul_question(instructions: str, true_desc: str, false_desc: str) -> dict:
+    return {"type": "noul", "instructions": instructions, "criteria": {"true": true_desc, "false": false_desc}}
+
+
+def _jev_post(state: str, questions: dict) -> dict:
+    """The HTTP round-trip shared by call_jev (one question) and call_jev_multi (several in
+    ONE call — ga-aijm2v.4: the model bills the state once, so extra questions cost ~nothing).
+    Never raises. {"ok": False, "error": ...} or {"ok": True, "payload": <the dict that holds
+    "answers">}; parsing the individual answers is the caller's job."""
     account_id, token, vault_failed = _credentials()
     if not account_id or not token:
         return {"ok": False, "error": "vault_unavailable" if vault_failed else "no_credentials"}
@@ -166,13 +171,7 @@ def call_jev(state: str, question_key: str, instructions: str, true_desc: str, f
             "model": JEV_MODEL,
             "input": {
                 "state": state,
-                "questions": {
-                    question_key: {
-                        "type": "noul",
-                        "instructions": instructions,
-                        "criteria": {"true": true_desc, "false": false_desc},
-                    }
-                },
+                "questions": questions,
             },
         }
     ).encode("utf-8")
@@ -221,6 +220,17 @@ def call_jev(state: str, question_key: str, instructions: str, true_desc: str, f
     payload = next((c for c in candidates if isinstance(c, dict) and isinstance(c.get("answers"), dict)), None)
     if payload is None:
         return {"ok": False, "error": "unparseable_response_shape"}
+    return {"ok": True, "payload": payload}
+
+
+def call_jev(state: str, question_key: str, instructions: str, true_desc: str, false_desc: str) -> dict:
+    """Never raises. Returns a dict with ok=True/False; ok=False always means 'treat as
+    unknown, do not suppress' to the caller — this function does not make that call
+    itself, evaluate() below does, so the fail-open policy lives in exactly one place."""
+    posted = _jev_post(state, {question_key: _noul_question(instructions, true_desc, false_desc)})
+    if not posted["ok"]:
+        return posted
+    payload = posted["payload"]
     try:
         answer = payload["answers"][question_key]
         noul = float(answer["noul"])
@@ -234,6 +244,40 @@ def call_jev(state: str, question_key: str, instructions: str, true_desc: str, f
         return {"ok": False, "error": f"noul_out_of_range: {noul}"}
 
     return {"ok": True, "noul": noul, "tokens_in": tokens_in, "tokens_out": tokens_out}
+
+
+def call_jev_multi(state: str, questions: dict) -> dict:
+    """Several yes/no questions about ONE state in a single call (ga-aijm2v.4, the Portaria).
+    `questions` maps key -> (instructions, true_desc, false_desc). Never raises.
+
+    ok=False (whole call failed: no credential, network, unparseable shape): treat every
+    question as unknown. ok=True: `answers` holds ONLY the questions that parsed to a valid
+    noul in [0,1] — a question the model skipped or garbled lands in `bad` (key -> reason),
+    never in `answers`, so a caller can never read a missing answer as a low probability.
+    Token usage is per CALL (the API reports one usage for the whole request)."""
+    posted = _jev_post(state, {k: _noul_question(*v) for k, v in questions.items()})
+    if not posted["ok"]:
+        return posted
+    payload = posted["payload"]
+    answers: dict = {}
+    bad: dict = {}
+    for key in questions:
+        try:
+            noul = float(payload["answers"][key]["noul"])
+        except (KeyError, TypeError, ValueError) as e:
+            bad[key] = f"unparseable_answer: {e}"
+            continue
+        if not (0.0 <= noul <= 1.0):
+            bad[key] = f"noul_out_of_range: {noul}"
+            continue
+        answers[key] = noul
+    usage = payload.get("usage", {}) or {}
+    try:
+        tokens_in = int(usage.get("input_tokens", 0) or 0)
+        tokens_out = int(usage.get("output_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        tokens_in = tokens_out = 0
+    return {"ok": True, "answers": answers, "bad": bad, "tokens_in": tokens_in, "tokens_out": tokens_out}
 
 
 def evaluate(
@@ -588,6 +632,37 @@ def _selftest() -> int:
     with mock.patch("urllib.request.urlopen", return_value=_fake_response(body)):
         r_with_tokens2 = evaluate_shadow("e1", "F-selftest", "state", "q", "instr", "t", "f", True, 0.85, decisao_atual_tokens=1234)
     ok("shadow: decisao_atual_tokens passes through unchanged when the caller supplies it", r_with_tokens2["decisao_atual_tokens"] == 1234)
+
+    # call_jev_multi() (ga-aijm2v.4): several questions, ONE request. The wire body must carry
+    # every question; the answers must come back keyed; and a question the model skipped or
+    # garbled must land in `bad`, NEVER in `answers` (a missing answer read as a low
+    # probability would be read as "safe to skip").
+    sent = {}
+
+    def _capture_body(req, timeout=None):
+        sent["body"] = json.loads(req.data)
+        return _fake_response(json.dumps({"result": {"result": {
+            "answers": {"a": {"type": "noul", "noul": 0.1}, "b": {"type": "noul", "noul": 1.7}},  # c missing, b out of range
+            "usage": {"input_tokens": 400, "output_tokens": 9}}}}).encode())
+
+    with mock.patch("urllib.request.urlopen", side_effect=_capture_body):
+        rm = call_jev_multi("st", {"a": ("ia", "ta", "fa"), "b": ("ib", "tb", "fb"), "c": ("ic", "tc", "fc")})
+    ok("multi: ONE request carries all three questions", sorted(sent["body"]["input"]["questions"]) == ["a", "b", "c"])
+    ok("multi: question body keeps the noul shape (instructions + true/false criteria)",
+       sent["body"]["input"]["questions"]["a"] == {"type": "noul", "instructions": "ia", "criteria": {"true": "ta", "false": "fa"}})
+    ok("multi: only the valid answer is in `answers`", rm["ok"] is True and rm["answers"] == {"a": 0.1})
+    ok("multi: a skipped question and an out-of-range one land in `bad`, not in `answers`",
+       set(rm["bad"]) == {"b", "c"} and "noul_out_of_range" in rm["bad"]["b"] and "unparseable_answer" in rm["bad"]["c"])
+    ok("multi: usage is the call's usage", rm["tokens_in"] == 400 and rm["tokens_out"] == 9)
+    with mock.patch("urllib.request.urlopen", return_value=_fake_response(garbage)):
+        rm2 = call_jev_multi("st", {"a": ("ia", "ta", "fa")})
+    ok("multi: an unparseable response fails the WHOLE call closed", rm2 == {"ok": False, "error": "unparseable_response_shape"})
+    CF_ACCOUNT_ID, CF_API_TOKEN = "", ""
+    with mock.patch.object(this, "_secret_field", return_value=""), \
+         mock.patch("urllib.request.urlopen", side_effect=AssertionError("network call without credentials")):
+        rm3 = call_jev_multi("st", {"a": ("ia", "ta", "fa")})
+    CF_ACCOUNT_ID, CF_API_TOKEN = FAKE_ACCT, "token"
+    ok("multi: no credentials -> ok=False, no network call", rm3 == {"ok": False, "error": "no_credentials"})
 
     vault_guard.stop()
     print(f"\njev_experiment selftest: PASS={passed} FAIL={failed}")

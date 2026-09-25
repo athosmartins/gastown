@@ -112,10 +112,11 @@ def summarize(events: list[dict]) -> dict:
         }
     )
     for ev in events:
-        if ev.get("mode") == "shadow":
+        if ev.get("mode") in ("shadow", "portaria"):
             # ga-aijm2v.1/F0: shadow events have no arm/suppress fields -- without this
             # skip they'd fall through to the "experiment arm" branch below and silently
             # count as suppression-experiment data. summarize_shadow() owns these instead.
+            # ga-aijm2v.4: same for the Portaria (mode=="portaria") -> summarize_portaria().
             continue
         s = by_exp[ev.get("experiment", "unknown")]
         if ev.get("arm") == "control":
@@ -218,8 +219,202 @@ def _shadow_metrics(s: dict) -> dict:
     }
 
 
-def format_report(summary: dict, shadow_summary: dict, date_label: str) -> str:
-    if not summary and not shadow_summary:
+# ── Portaria (ga-aijm2v.4) ─────────────────────────────────────────────────────────────────
+def summarize_portaria(events: list[dict]) -> dict:
+    """Per message class: what each layer of the cascade WOULD have skipped, and what the recipient
+    then actually did (see portaria_shadow.py for the three outcomes). Only mode=="portaria"."""
+    by_cls: dict[str, dict] = defaultdict(
+        lambda: {
+            "volume": 0, "regra_pularia": 0, "jev_pularia": 0, "cascata_pularia": 0,
+            "pularia_seguro": 0,      # cascade would skip AND the recipient certainly did not act (nao_agiu)
+            "erro_grave": 0,          # cascade would skip BUT the recipient acted (agiu) -- a real alarm silenced
+            "erro_grave_regra": 0, "erro_grave_jev": 0,
+            "pularia_incerto": 0,     # cascade would skip, outcome nao_sei -- never folded into safe or grave
+            "jev_indisponivel": 0,    # Jev answered nothing usable -- the third state, never a skip
+            "desfecho_conclusivo": 0, # deliveries whose outcome is agiu/nao_agiu (the rest is nao_sei: not measurable)
+            "jev_tokens_in": 0, "jev_tokens_out": 0,
+            "seguro_por_destinatario": defaultdict(int),
+        }
+    )
+    for ev in events:
+        if ev.get("mode") != "portaria":
+            continue
+        s = by_cls[ev.get("classe") or str(ev.get("experiment", "portaria-?")).removeprefix("portaria-")]
+        s["volume"] += 1
+        s["jev_tokens_in"] += int(ev.get("jev_tokens_in") or 0)
+        s["jev_tokens_out"] += int(ev.get("jev_tokens_out") or 0)
+        c1, c2, casc, desf = ev.get("camada1"), ev.get("camada2"), ev.get("cascata"), ev.get("desfecho")
+        if desf in ("agiu", "nao_agiu"):
+            s["desfecho_conclusivo"] += 1
+        if c2 == "nao_sei":
+            s["jev_indisponivel"] += 1
+        if c1 == "pular":
+            s["regra_pularia"] += 1
+            if desf == "agiu":
+                s["erro_grave_regra"] += 1
+        if c2 == "pular":
+            s["jev_pularia"] += 1
+            if desf == "agiu":
+                s["erro_grave_jev"] += 1
+        if casc == "pular":
+            s["cascata_pularia"] += 1
+            if desf == "agiu":
+                s["erro_grave"] += 1
+            elif desf == "nao_agiu":
+                s["pularia_seguro"] += 1
+                s["seguro_por_destinatario"][ev.get("destinatario") or "?"] += 1
+            else:
+                s["pularia_incerto"] += 1
+    out = {}
+    for k, v in by_cls.items():
+        v["seguro_por_destinatario"] = dict(v["seguro_por_destinatario"])
+        out[k] = v
+    return out
+
+
+def _portaria_metrics(s: dict, cache_read_by_recipient: dict | None) -> dict:
+    """ESTIMATED tokens saved = safe skips x the recipient's MEASURED mean cache-read per API call
+    (one wake counted as ONE call re-reading the context: a floor, a real wake makes several) minus
+    Jev's own cost. None -- never a made-up number -- when a recipient with safe skips has no measurement."""
+    cache = cache_read_by_recipient or {}
+    saved = 0
+    for rcpt, n in s["seguro_por_destinatario"].items():
+        per = cache.get(rcpt)
+        if per is None:
+            saved = None
+            break
+        saved += n * per
+    tokens = None if saved is None else saved - s["jev_tokens_in"] - s["jev_tokens_out"]
+    vol = s["volume"]
+    return {
+        "regra_pct": (100 * s["regra_pularia"] / vol) if vol else None,
+        "jev_pct": (100 * s["jev_pularia"] / vol) if vol else None,
+        "cascata_pct": (100 * s["cascata_pularia"] / vol) if vol else None,
+        "erro_grave_pct": (100 * s["erro_grave"] / s["cascata_pularia"]) if s["cascata_pularia"] else None,
+        "tokens_economizados": tokens,
+    }
+
+
+def measure_cache_read(recipients, since_hours: int = 24, projects_dir: Path | None = None) -> dict:
+    """recipient -> MEAN cache_read_input_tokens per API call over the last `since_hours` of that
+    agent's own Claude transcripts (read-only), or None when the transcripts cannot be found/read.
+    One API request = one usage record (several transcript lines can share a requestId)."""
+    import time as _time
+    projects = projects_dir or (Path.home() / ".claude" / "projects")
+    base = "-Users-athos-gt--gascity-gastown-hq--gc-agents-"
+    out: dict = {}
+    cutoff = _time.time() - since_hours * 3600
+    for rcpt in recipients:
+        if rcpt == "gastown.mayor":
+            dirs = [projects / (base + "mayor")]
+        elif rcpt.startswith("gastown.dog-"):
+            dirs = [projects / (base + "dogs-" + rcpt.replace(".", "-"))]
+        else:
+            dirs = []
+        seen: set = set()
+        total = n = 0
+        for d in dirs:
+            try:
+                files = [f for f in d.glob("*.jsonl") if f.stat().st_mtime >= cutoff]
+            except OSError:
+                continue
+            for f in files:
+                try:
+                    with f.open(encoding="utf-8", errors="replace") as fh:
+                        for line in fh:
+                            if '"cache_read_input_tokens"' not in line:
+                                continue
+                            try:
+                                rec = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            usage = (rec.get("message") or {}).get("usage") or {}
+                            rid = rec.get("requestId") or rec.get("uuid")
+                            ts = rec.get("timestamp") or ""
+                            if rid in seen or "cache_read_input_tokens" not in usage:
+                                continue
+                            try:
+                                from datetime import datetime as _dt
+                                if _dt.fromisoformat(ts.replace("Z", "+00:00")).timestamp() < cutoff:
+                                    continue
+                            except ValueError:
+                                continue
+                            seen.add(rid)
+                            total += int(usage["cache_read_input_tokens"] or 0)
+                            n += 1
+                except OSError:
+                    continue
+        out[rcpt] = (total / n) if n else None
+    return out
+
+
+def _format_portaria_block(name: str, s: dict, m: dict) -> list[str]:
+    def pct(x):
+        return "n/a" if x is None else f"{x:.1f}%"
+    vol = s["volume"]
+    lines = [f"## portaria-{name} (shadow, Portaria v1)"]
+    lines.append(f"  Deliveries observed: {vol}")
+    lines.append(
+        f"  Would skip (MEASURED counts): fixed rule {s['regra_pularia']} ({pct(m['regra_pct'])}), "
+        f"Jev >=85% sure {s['jev_pularia']} ({pct(m['jev_pct'])}), cascade {s['cascata_pularia']} ({pct(m['cascata_pct'])})"
+    )
+    lines.append(
+        f"  What the recipient then did, over the {s['cascata_pularia']} the cascade would skip: "
+        f"safe (did NOT act) {s['pularia_seguro']}, GRAVE — erro grave (a real alarm silenced: the recipient ACTED) {s['erro_grave']}, "
+        f"uncertain (outcome nao_sei) {s['pularia_incerto']}"
+    )
+    lines.append(
+        f"  Grave errors by layer: fixed rule {s['erro_grave_regra']}, Jev {s['erro_grave_jev']} "
+        f"(a LOWER BOUND: only attributable evidence counts as 'acted' — see portaria_shadow.py)"
+    )
+    lines.append(f"  Outcome measurable (agiu/nao_agiu, the rest nao_sei): {s['desfecho_conclusivo']} of {vol}"
+                 + (" — ⚠️ LOW: numbers above rest on few deliveries" if vol and s["desfecho_conclusivo"] / vol < 0.3 else ""))
+    lines.append(f"  Jev unavailable / unusable (third state, never a skip): {s['jev_indisponivel']}")
+    lines.append(f"  Jev cost (MEASURED, from real API usage): {s['jev_tokens_in']} input + {s['jev_tokens_out']} output tokens")
+    if s["pularia_seguro"] == 0:
+        lines.append(f"  Tokens saved (ESTIMATED): none yet — 0 safe skips; Jev has cost {s['jev_tokens_in'] + s['jev_tokens_out']} tokens so far")
+    elif m["tokens_economizados"] is None:
+        lines.append("  Tokens saved (ESTIMATED): n/d — no measured cache-read per turn for a recipient with safe skips")
+    else:
+        lines.append(
+            f"  Tokens saved (ESTIMATED: safe skips x recipient's MEASURED cache-read per API call, one wake counted as one call "
+            f"= a floor, minus Jev cost): ~{int(m['tokens_economizados'])}"
+        )
+    lines.append("")
+    return lines
+
+
+def _portaria_resumo_pt(portaria_summary: dict, cache_read_by_recipient: dict | None) -> str:
+    def pct(x):
+        return "n/d" if x is None else _pct_pt(x)
+    tot = defaultdict(int)
+    for s in portaria_summary.values():
+        for k in ("volume", "regra_pularia", "jev_pularia", "cascata_pularia", "pularia_seguro", "erro_grave", "pularia_incerto", "jev_indisponivel", "desfecho_conclusivo"):
+            tot[k] += s[k]
+    linhas = [
+        f"Portaria (sombra, nada muda na entrega): {tot['volume']} mensagem(ns) em {len(portaria_summary)} classe(s). "
+        f"Pularia: regra fixa {tot['regra_pularia']}, Jev (>=85%) {tot['jev_pularia']}, cascata {tot['cascata_pularia']}.",
+        f"Dos {tot['cascata_pularia']} que a cascata pularia: {tot['pularia_seguro']} seguros (destinatario nao agiu), "
+        f"{tot['erro_grave']} ERRO GRAVE (alarme real calado: ele agiu), {tot['pularia_incerto']} incertos (sem como atribuir). "
+        f"Erro grave e piso: so conta acao atribuivel. Desfecho mensuravel em {tot['desfecho_conclusivo']} de {tot['volume']}.",
+    ]
+    if tot["jev_indisponivel"]:
+        linhas.append(f"Jev indisponivel em {tot['jev_indisponivel']} — contam como 'nao sei', nunca como pular.")
+    for name, s in sorted(portaria_summary.items(), key=lambda kv: -kv[1]["volume"])[:8]:
+        m = _portaria_metrics(s, cache_read_by_recipient)
+        tok = (f"nenhum pulo seguro ainda (Jev custou {s['jev_tokens_in'] + s['jev_tokens_out']})" if s["pularia_seguro"] == 0
+               else "n/d" if m["tokens_economizados"] is None else f"~{int(m['tokens_economizados'])}")
+        linhas.append(
+            f"- {name}: {s['volume']} msg; pularia {s['cascata_pularia']} ({pct(m['cascata_pct'])}), "
+            f"seguros {s['pularia_seguro']}, erro grave {s['erro_grave']}, incertos {s['pularia_incerto']}; tokens (estimativa) {tok}."
+        )
+    return "\n".join(linhas)
+
+
+def format_report(summary: dict, shadow_summary: dict, date_label: str, portaria_summary: dict | None = None,
+                  cache_read_by_recipient: dict | None = None) -> str:
+    portaria_summary = portaria_summary or {}
+    if not summary and not shadow_summary and not portaria_summary:
         return f"Jev experiment report ({date_label}): no candidate escalations logged for this window."
 
     lines = [f"Jev experiment report — {date_label}", ""]
@@ -266,6 +461,8 @@ def format_report(summary: dict, shadow_summary: dict, date_label: str) -> str:
             f"{s['would_dispense_missing_real_tokens']} that didn't): ~{m['estimated_tokens_saved']} tokens"
         )
         lines.append("")
+    for name, s in sorted(portaria_summary.items()):
+        lines.extend(_format_portaria_block(name, s, _portaria_metrics(s, cache_read_by_recipient)))
     return "\n".join(lines)
 
 
@@ -273,7 +470,8 @@ def _pct_pt(x: float) -> str:
     return f"{x:.1f}".replace(".", ",") + "%"
 
 
-def format_resumo_pt(summary: dict, shadow_summary: dict, date_label: str) -> str:
+def format_resumo_pt(summary: dict, shadow_summary: dict, date_label: str, portaria_summary: dict | None = None,
+                    cache_read_by_recipient: dict | None = None) -> str:
     """wa-dln9g — the end-of-day phone notification the Athos asked for ("a % of saved
     tokens for each end of day"). Same numbers as format_report() (both read _metrics()/
     _shadow_metrics()), in Portuguese and short. Keeps the MEDIDO / ESTIMATIVA split, and
@@ -283,7 +481,8 @@ def format_resumo_pt(summary: dict, shadow_summary: dict, date_label: str) -> st
     ga-aijm2v.1/F0: includes shadow-mode fronts (F2-F5) alongside the suppression
     experiment whenever either has data — the daily ntfy must not silently drop shadow
     results just because it was written for the suppression shape first."""
-    if not summary and not shadow_summary:
+    portaria_summary = portaria_summary or {}
+    if not summary and not shadow_summary and not portaria_summary:
         return f"Dia {date_label}: nenhum alerta candidato registrado — nada a medir."
     blocos = []
     for name, s in sorted(summary.items()):
@@ -330,6 +529,8 @@ def format_resumo_pt(summary: dict, shadow_summary: dict, date_label: str) -> st
         )
         linhas.append(f"Custo do Jev (medido): {s['jev_tokens_in']} + {s['jev_tokens_out']} tokens.")
         blocos.append("\n".join(linhas))
+    if portaria_summary:
+        blocos.append(_portaria_resumo_pt(portaria_summary, cache_read_by_recipient))
     return "\n\n".join(blocos)
 
 
@@ -434,13 +635,17 @@ def main() -> int:
     events = load_events(args.date, args.experiment)
     summary = summarize(events)
     shadow_summary = summarize_shadow(events)
+    portaria_summary = summarize_portaria(events)
+    # transcripts are read (read-only) only for recipients that actually have safe skips to price
+    cache_read = measure_cache_read({r for s in portaria_summary.values() for r in s["seguro_por_destinatario"]}) if portaria_summary else {}
 
     if args.json:
-        print(json.dumps({"suppression": summary, "shadow": shadow_summary}, ensure_ascii=False, indent=2))
+        print(json.dumps({"suppression": summary, "shadow": shadow_summary, "portaria": portaria_summary,
+                          "cache_read_per_call": cache_read}, ensure_ascii=False, indent=2))
     elif args.resumo_pt:
-        print(format_resumo_pt(summary, shadow_summary, args.date or "todo o período"))
+        print(format_resumo_pt(summary, shadow_summary, args.date or "todo o período", portaria_summary, cache_read))
     else:
-        print(format_report(summary, shadow_summary, args.date or "all-time"))
+        print(format_report(summary, shadow_summary, args.date or "all-time", portaria_summary, cache_read))
     return 0
 
 

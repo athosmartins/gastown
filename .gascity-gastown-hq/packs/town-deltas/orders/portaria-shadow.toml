@@ -1,0 +1,16 @@
+# ga-aijm2v.4 (Jev): the Portaria in SHADOW mode. For every message delivered to an agent (mail
+# from events.jsonl, new items in the nudge queue) it records what a fixed rule and Jev would
+# say to "does this need to wake the recipient?" and, 60 min later, what the recipient actually
+# did -- so the Athos sees, with numbers, how many tokens skipping would save and how many real
+# alarms it would silence, BEFORE anything is suppressed. It NEVER changes a delivery.
+# Replaces the F1 order (mayor-inbox-jev-triage, ga-aijm2v.2), which triaged only a fixed list of
+# subjects AFTER delivery and archived mail; that order file is removed.
+# 5m cadence: outcomes resolve 60 min after delivery, so latency is irrelevant; the nudge queue is
+# sampled per run, so a shorter interval sees more short-lived nudges. A run costs ~2-5 s per new
+# delivery (one Jev call, measured live 25/09: 14 deliveries = 30-67 s), bounded by MAX_PER_RUN and
+# the wrapper's timeout, and is single-instance (lock), so the cadence cannot stack.
+[order]
+description = "Portaria do Jev v1 (sombra): records what a fixed rule and Jev would skip for every mail/nudge delivery, and what the recipient did within 60 min; never changes a delivery (ga-aijm2v.4)"
+trigger = "cooldown"
+interval = "5m"
+exec = "$PACK_DIR/assets/scripts/portaria-shadow.sh"

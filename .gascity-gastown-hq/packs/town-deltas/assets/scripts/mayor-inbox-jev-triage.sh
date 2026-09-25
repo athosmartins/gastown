@@ -63,6 +63,15 @@
 # incident class in this city: wa-bq3ng, a plist fix mergeed but dormant for
 # 1h until someone copied it by hand). See
 # packs/town-deltas/orders/mayor-inbox-jev-triage.toml.
+# ⚠️ SUBSTITUÍDA por scripts/portaria_shadow.py (ga-aijm2v.4, 25/09): a order `mayor-inbox-jev-triage`
+# (packs/town-deltas/orders/mayor-inbox-jev-triage.toml) foi REMOVIDA -- este script não roda mais
+# sozinho. Motivos medidos: só triava uma lista fixa de assuntos e só DEPOIS da entrega (o Mayor já
+# tinha sido acordado), o braço controle nem consultava o Jev (0 supressões em 2 dias), e falhava
+# desde 15:26Z ("gc mail inbox failed -- skipping"). A Portaria observa TODA entrega (e-mail e
+# nudge) em modo sombra e mede o desfecho real; nada é arquivado nem suprimido. Este arquivo e o
+# selftest ficam no repo só como histórico e referência de padrões de assunto; para religar a F1
+# seria preciso recriar a order -- e isso conflita com a Portaria (dois consumidores da mesma caixa).
+#
 set -euo pipefail
 
 CITY="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
