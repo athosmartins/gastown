@@ -25,6 +25,8 @@
 # next sweep refuses it again too; nothing is ever removed on an unconfirmed guess. Age
 # gate protects anything touched recently. Pressure mode lowers the age gate when disk is
 # genuinely low. Branch deletion is merged-only. Kill switch: WORKTREE_REAPER_ENABLED=0.
+# The one exception to "WITHOUT --force" is a LOCKED worktree (`remove -f -f`); it is reaped only
+# under the LOCK CONTRACT stated at ZOMBIE-LOCK DETECTION below, never because of its age alone.
 set -uo pipefail
 GT="${WORKTREE_REAPER_GT:-/Users/athos/gt}"   # overridable for the selftest (temp repo)
 # ga-t14of: .gc-worktrees accumulates under MULTIPLE physical roots in practice — the
@@ -69,6 +71,12 @@ KILL_ZOMBIE="${WORKTREE_REAPER_KILL_ZOMBIE:-0}"                  # SIGTERM the c
 SESSION_LIST_TIMEOUT="${WORKTREE_REAPER_SESSION_LIST_TIMEOUT:-60}"
 case "$SESSION_LIST_TIMEOUT" in ''|*[!0-9]*) SESSION_LIST_TIMEOUT=60 ;; esac
 [ "$SESSION_LIST_TIMEOUT" -ge 1 ] || SESSION_LIST_TIMEOUT=60      # timeout(1) treats 0 as "no bound at all"
+# ... plus a KILL grace (seconds). `timeout N gc` only sends TERM, so a gc that ignores TERM would hold the
+# whole sweep past N for as long as it likes; `timeout -k G N gc` follows with KILL after G more seconds, so the
+# real bound is N+G and the call reports 124 (TERM was enough) or 137 (it had to be KILLed).
+SESSION_LIST_KILL_GRACE="${WORKTREE_REAPER_SESSION_LIST_KILL_GRACE:-5}"
+case "$SESSION_LIST_KILL_GRACE" in ''|*[!0-9]*) SESSION_LIST_KILL_GRACE=5 ;; esac
+[ "$SESSION_LIST_KILL_GRACE" -ge 1 ] || SESSION_LIST_KILL_GRACE=5  # `-k 0` means "never KILL" in timeout(1)
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # _json_esc <text> — make free text safe to interpolate into a hand-built JSON log line
@@ -289,13 +297,38 @@ preserve_and_reap_dirty() {
 
 # ── ZOMBIE-LOCK DETECTION (the fix for wa-8y45) ──────────────────────────────────
 # A crew/agent worktree is `git worktree lock`ed while its agent session is alive, so the
-# reaper rightly SKIPS locked trees (a live agent may be mid-build). But a STUCK agent —
+# reaper does not take a lock lightly (a live agent may be mid-build). But a STUCK agent —
 # dead, or alive-but-ancient-and-idle — holds that lock forever, pinning a stale conflicted
 # worktree that blocks re-dispatch (wa-8y45: pid 42047 alive 4d7h @ 0.3% CPU pinned a P1 for
 # 4 days). These helpers decide whether a lock holder is a ZOMBIE so its worktree can be
-# unlock+reaped. CONSERVATIVE by construction: any doubt (can't parse pid, can't probe the
-# process, holder is young, or shows recent CPU) → NOT a zombie → the worktree is KEPT.
+# unlock+reaped. The PID path is CONSERVATIVE by construction: any doubt in it (can't probe the
+# process, holder is young, or shows recent CPU) → NOT a zombie, and it never reaps on that doubt.
+# A reason with no pid at all skips that path and is looked up by SESSION name instead. What becomes
+# of a lock that is not a pid-confirmed zombie is decided in ONE place: the LOCK CONTRACT below.
 # Process probes are seam-injectable (WORKTREE_REAPER_FAKE_*) so the selftest is hermetic.
+#
+# LOCK CONTRACT (ga-vs6shu) — the one statement of it; the comments at each decision point refer here.
+# A lock is never a reason to REAP, and it is not, on its own, the protection either:
+#   1. a "pid N" in the reason: pid-confirmed ZOMBIE (dead, or alive > ZOMBIE_HOURS and idle) → unlock + reap;
+#      pid-confirmed LIVE (young, or busy) → KEPT (kept_locked_live).
+#   2. no pid: the holder is looked up by session name (ONE `gc session list` per sweep):
+#        list unavailable → KEPT (kept_locked_session_list_unavailable / kept_locked_unknown);
+#        a named session is alive AND its work_dir is this tree → KEPT (kept_locked_live);
+#        otherwise ("unparseable") → not reaped on the lock's say-so, but reaped when the TREE proves itself safe
+#        without the lock's help: HEAD already in origin/<default> + git status clean (rc 0 AND empty) + no live
+#        process has it as cwd + older than the age gate (reaped_locked_unparseable_safe). Any proof missing →
+#        KEPT (kept_locked_unparseable). Ignored files are not part of "clean" and go with the tree.
+#   3. any other verdict, or none (empty): KEPT (kept_locked_unrecognized_verdict). Only the exact verdict
+#      "unparseable" reaches the independent-proof path.
+# So a pid-confirmed live holder is always kept; every other lock is reapable only when the session lookup does
+# not confirm the holder AND the tree proves itself safe.
+# CAVEAT (measured 25/09 on `gc session list --json --state all`, 26 sessions): every real session's work_dir is an
+# agent home, a crew dir or the HQ root — none is a per-bead worktree (.gc-worktrees, worker-*, .claude/worktrees).
+# So "a named session is alive in THIS tree" cannot fire for a real pool worker (it does for a session whose work_dir
+# IS the tree), and for those the live-holder guard is the independent proofs — above all _worktree_in_use (a live
+# process's cwd inside the tree) — not the lock and not the session list. The ga-wpdmj6 fix ("an alive session's
+# tree was reaped") is closed for the OUTAGE route (list unavailable → KEPT), not for a live pool session whose tree
+# is merged + clean + aged + not any process's cwd.
 
 _etime_to_secs() {           # macOS `ps -o etime` "[[DD-]HH:]MM:SS" → seconds
   local e="$1" days=0 hms h m s
@@ -383,8 +416,9 @@ _session_list_ensure() {
   elif ! command -v timeout >/dev/null 2>&1; then
     rc=127; why="timeout_missing"
   else
-    # Bounded: a wedged gc/Dolt must never hang the whole sweep over one lookup.
-    raw="$(timeout "$SESSION_LIST_TIMEOUT" gc --city "${WORKTREE_REAPER_GC_CITY:-$GT/.gascity-gastown-hq}" session list --json --state all 2>/dev/null)"; rc=$?
+    # Bounded: a wedged gc/Dolt must never hang the whole sweep over one lookup — TERM after
+    # SESSION_LIST_TIMEOUT, KILL SESSION_LIST_KILL_GRACE seconds later if gc ignores TERM.
+    raw="$(timeout -k "$SESSION_LIST_KILL_GRACE" "$SESSION_LIST_TIMEOUT" gc --city "${WORKTREE_REAPER_GC_CITY:-$GT/.gascity-gastown-hq}" session list --json --state all 2>/dev/null)"; rc=$?
   fi
   if [ "$rc" -eq 0 ] && ! command -v jq >/dev/null 2>&1; then rc=127; why="jq_missing"; fi
   if [ "$rc" -eq 0 ]; then
@@ -396,7 +430,9 @@ _session_list_ensure() {
     fi
     why="invalid_output"
   fi
-  [ -n "$why" ] || { [ "$rc" -eq 124 ] && why="timeout" || why="gc_failed"; }
+  if [ -z "$why" ]; then
+    case "$rc" in 124|137) why="timeout" ;; *) why="gc_failed" ;; esac   # 137 = timeout(1) had to KILL it after the grace
+  fi
   _WT_REAPER_SESSION_STATE="unavailable"; _WT_REAPER_SESSION_LIST_JSON=""
   printf '{"ts":"%s","event":"session_list_unavailable","rc":%s,"why":"%s","timeout_s":%s}\n' \
     "$(ts)" "$rc" "$why" "$SESSION_LIST_TIMEOUT" >> "$LOG" 2>/dev/null
@@ -413,6 +449,9 @@ _session_list_ensure() {
 # permanently block the safety net below for a worktree that is actually free. Mirrors
 # _worktree_in_use's path-containment check, applied to a session's work_dir instead of a
 # live process's cwd. jq's own failure (exit >= 2) is "cannot know" too, never "not alive".
+# LIMIT (see the LOCK CONTRACT caveat): real sessions report an agent-home work_dir, never a per-bead
+# worktree, so for them this returns 1 ("not alive here") and the reap decision rests on the independent
+# proofs, `_worktree_in_use` (lsof cwd) being the live-holder guard.
 _session_is_alive_for_worktree() {
   local name="$1" wt="$2" rc
   [ -n "$name" ] || return 1
@@ -515,7 +554,10 @@ _maybe_kill_zombie() {
 }
 
 # reap_zombie_locked <repo> <wt> <br> <reason> <age_h> <label>
-#   → 0 reaped | 1 dry-run logged | 2 NOT-a-zombie (caller KEEPS) | 3 remove failed
+#   → 0 reaped | 1 dry-run logged | 3 remove failed |
+#     2 not a pid-confirmed zombie (verdict left in $_ZL_VERDICT): the caller hands the lock to
+#       _reap_or_log_unparseable_lock, which KEEPS it unless the tree independently proves safe
+#       (LOCK CONTRACT above) — "2" does not mean "keep".
 # unlock + DOUBLE-force remove (single --force is refused on a locked tree) + merged-only
 # branch cleanup (never deletes unmerged local work) + optional guarded process kill.
 reap_zombie_locked() {
@@ -569,6 +611,10 @@ reap_zombie_locked() {
 #       knowable. The safe default on a destructive path is "assume alive":
 #       KEEP, log kept_locked_session_list_unavailable, and count it — never
 #       fall through to the safety net below on a value we do not have.
+#   1 = kept, UNRECOGNISED verdict (empty — classify_lock died inside its `$(...)` —, a stray
+#       "zombie ...", or any token no arm here names): "cannot tell", never "unparseable". On a
+#       destructive path the default is KEEP, with its own event (kept_locked_unrecognized_verdict).
+#       ONLY the exact verdict "unparseable" reaches the independent-proof path below.
 #   1 = kept, genuinely unparseable: the list was fetched, could not confirm
 #       live, and the worktree did not independently qualify as safe
 #       (unmerged, dirty, in-use, or too young) — the correct, conservative
@@ -597,6 +643,13 @@ _reap_or_log_unparseable_lock() {
       ;;
     unknown\ *)
       _log_lock_event kept_locked_unknown "$repo" "$wt" "$br" "$age" "$label" "$verdict" "$reason"
+      return 1
+      ;;
+    unparseable) : ;;   # the ONLY verdict that may fall through to the independent-proof path below
+    *)
+      # An empty string (classify_lock killed inside its `$(...)`), a "zombie ..." the caller should have
+      # handled, or any token no arm names is "cannot tell" — never "unparseable". KEEP, distinctly logged.
+      _log_lock_event kept_locked_unrecognized_verdict "$repo" "$wt" "$br" "$age" "$label" "${verdict:-<empty>}" "$reason"
       return 1
       ;;
   esac
@@ -689,8 +742,10 @@ reap_pool_worktrees() {
           printf '{"ts":"%s","event":"kept_merged_in_use","repo":"%s","wt":"%s","branch":"%s","age_h":%s}\n' "$(ts)" "$(basename "$repo")" "$(basename "$wt")" "$br" "$age" >> "$LOG" 2>/dev/null
           wt=""; br=""; lock=""; continue
         fi
-        # ── LOCKED worktree: reap ONLY if the lock holder is a ZOMBIE (dead / ancient+idle).
-        # A live agent's lock (young, or recent CPU) is ALWAYS kept — never reap active work.
+        # ── LOCKED worktree — the LOCK CONTRACT (see ZOMBIE-LOCK DETECTION): a pid-confirmed zombie is
+        # reaped; a pid-confirmed live holder is always kept; any other lock goes to
+        # _reap_or_log_unparseable_lock, which reaps it only when the session lookup does not confirm the
+        # holder AND the tree proves itself merged + clean + not in use + aged, and keeps it otherwise.
         if [ -n "$lock" ]; then
           if [ "$ZOMBIE_LOCK_ENABLED" = "1" ]; then
             local zrc
@@ -789,7 +844,9 @@ for WT_DIR in $WT_DIRS; do
       # silently skipped it (skipped_dirty, no event) while the pool loop maps the same
       # shape to "(no reason)" and reaps it. Same word here, so both loops agree; an empty
       # lock_reason now means only "not locked" (or git itself failed → stays kept).
-      # plain remove was refused by a LOCK — reap ONLY if the holder is a zombie, else keep.
+      # plain remove was refused by a LOCK — same LOCK CONTRACT as the pool loop above: a pid-confirmed
+      # zombie is reaped; any other lock goes to _reap_or_log_unparseable_lock (kept unless the tree
+      # independently proves safe).
       reap_zombie_locked "$GT" "$d" "" "$lock_reason" "$age" "town"; zrc1=$?
       case "$zrc1" in
         0) reaped=$((reaped+1)); zombie_reaped=$((zombie_reaped+1)) ;;

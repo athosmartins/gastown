@@ -10,7 +10,9 @@
 # ZOMBIE-LOCK (wa-8y45): a worktree LOCKED by a stuck/ancient agent. Asserts a DEAD-pid lock
 # and an ANCIENT+IDLE-pid lock are unlock+reaped; a YOUNG/ACTIVE-pid lock and an ANCIENT-but-
 # BUSY lock are KEPT (never reap a live agent); .claude/worktrees + .gc-worktrees paths are
-# covered; an UNPARSEABLE lock is KEPT (fail-safe); the SIGTERM guard kills a crew claude proc
+# covered; an UNPARSEABLE lock (no pid, no confirmed live session) is KEPT unless the tree itself proves
+# safe (merged + clean + unused + aged → reaped, ga-vs6shu; see the LOCK CONTRACT in the reaper), and any
+# verdict other than exactly 'unparseable' is KEPT; the SIGTERM guard kills a crew claude proc
 # but never a supervisor/pilot; kill is default-OFF; the feature has a kill-switch + dry-run.
 # Process probes are faked so it's hermetic. Exit 0 iff all hold.
 set -uo pipefail
@@ -194,7 +196,8 @@ grep -q '"event":"pool_cap_hit"' "$TMP/reaper3.jsonl" 2>/dev/null && ok "cap-hit
 # ══ ZOMBIE-LOCK reaping (wa-8y45): a worktree LOCKED by a stuck/ancient agent ══════
 # Proves: (i) DEAD-pid lock → reap; (ii) ANCIENT+IDLE-pid lock → reap; (iii) YOUNG/ACTIVE
 # -pid lock → KEEP (critical: never reap a live agent); (iii-b) ANCIENT-but-BUSY → KEEP;
-# (iv) .claude/worktrees + .gc-worktrees path coverage; (v) UNPARSEABLE lock → KEEP.
+# (iv) .claude/worktrees + .gc-worktrees path coverage; (v) UNPARSEABLE lock on UNMERGED work → KEEP
+# (a merged+clean+aged+unused one is reaped instead — the ga-vs6shu scenarios below).
 # Process probes are faked (WORKTREE_REAPER_FAKE_PS) so the suite is hermetic.
 echo "── zombie-lock detection (wa-8y45) ──"
 TOWNZ="$TMP/townz"; mkdir -p "$TOWNZ"
@@ -513,6 +516,7 @@ case "${FAKE_GC_MODE:-ok}" in
   notok) printf '{"ok":false,"sessions":[]}' ;;
   fail)  exit 1 ;;
   hang)  exec sleep 30 ;;   # exec: the shell must BE the sleep, or `timeout` kills the shell and the orphan holds the pipe
+  stubborn) trap '' TERM; i=0; while [ "$i" -lt 12 ]; do sleep 1; i=$((i+1)); done ;;   # ignores TERM (finite: 12s)
   empty) exit 0 ;;
   brace) printf '{}' ;;
 esac
@@ -581,7 +585,7 @@ run_fakegc memo ok
 # to the ones reaped above — merged, clean, aged, no process — so the ONLY thing that differs
 # is whether we could find out about live sessions. Pre-fix: `{}` == "nobody alive" → REAPED.
 echo "── ga-vs6shu gate-feedback: session list UNAVAILABLE ≠ 'no session alive' (KEEP + distinct event) ──"
-for spec in fail:gc_failed hang:timeout empty:invalid_output brace:invalid_output notok:invalid_output; do
+for spec in fail:gc_failed hang:timeout stubborn:timeout empty:invalid_output brace:invalid_output notok:invalid_output; do
   mode="${spec%%:*}"; why="${spec##*:}"
   mk_locked_rig "un_$mode" 2 'wa-x build (wa-worker-adhoc-held@N@)'
   run_fakegc "un_$mode" "$mode" WORKTREE_REAPER_SESSION_LIST_TIMEOUT=1
@@ -672,6 +676,121 @@ if sed -n '/^_reap_or_log_unparseable_lock() {/,/^}/p' "$REAPER" | grep -v '^[[:
 else
   ok "_reap_or_log_unparseable_lock removes with -f -f and never unlocks first (a failed remove leaves the lock as found)"
 fi
+
+# ══ ga-vs6shu GATE FEEDBACK 2 (ga-x7lbcr): the default arm, the kill grace, and a stale-contract guard ══
+# The reviewer's blocking issue was comment-only (four comments still stated the OLD lock contract), but its
+# non-blocking findings were real, and the same class — an unrecognised outcome read as a known one — is asked
+# of the code too: only the EXACT verdict "unparseable" may reach the destructive independent-proof path.
+echo ""
+echo "── ga-vs6shu gate-feedback 2: only the exact 'unparseable' verdict may reach the safety net ──"
+# Unit level, against the REAL functions (awk-extracted from the reaper — it runs on source, so it cannot be sourced):
+# _reap_or_log_unparseable_lock is called directly with verdicts the classifier is not supposed to produce, or does
+# not produce because it was killed inside its `$(...)` (empty). The worktree is the exact shape the safety net DOES
+# reap (locked, merged, clean, aged 3h, no process cwd) — so a keep can only come from the verdict handling itself.
+extract_reaper_fn() { awk -v n="$1" '$0 ~ "^" n "\\(\\)" {f=1} f{print} f&&/^}$/{exit}' "$REAPER"; }
+UV_FNS=""
+for _f in _json_esc _log_lock_event _worktree_head_merged _worktree_in_use delete_merged_local_branch _reap_or_log_unparseable_lock; do
+  _body="$(extract_reaper_fn "$_f")"
+  [ -n "$_body" ] || { echo "FATAL: $_f() not found in $REAPER (extraction pattern drifted)" >&2; exit 2; }
+  UV_FNS="$UV_FNS
+$_body"
+done
+UV_SCRIPT="$TMP/uv_sandbox.sh"
+{
+  echo 'set -uo pipefail'
+  cat <<'EOS_HEAD'
+LOG="$UV_LOG"; ENABLED=1; gate_hours=1; kept_session_list_unavailable=0; branches_deleted=0
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+EOS_HEAD
+  echo "$UV_FNS"
+  cat <<'EOS_BODY'
+if [ "$UV_VERDICT" = "@CLASSIFY_EMPTY@" ]; then
+  # A classifier killed inside its `$(...)` prints nothing: the caller has no verdict to pass, so the function
+  # classifies for itself and gets an EMPTY string back.
+  classify_lock() { :; }
+  _session_list_ensure() { :; }
+  _reap_or_log_unparseable_lock "$UV_REPO" "$UV_WT" crew/uv/b1 'wa-x build' 3 pool
+else
+  _reap_or_log_unparseable_lock "$UV_REPO" "$UV_WT" crew/uv/b1 'wa-x build' 3 pool "$UV_VERDICT"
+fi
+echo "rc=$?"
+EOS_BODY
+} > "$UV_SCRIPT"
+: > "$TMP/uv_no_lsof.txt"
+uv_events() { local n; n="$(grep -c "\"event\":\"$2\"" "$TMP/$1.jsonl" 2>/dev/null)"; echo "${n:-0}"; }
+run_uv() { # run_uv <town-name> <verdict> -> the function's exit code ("rc=N"); log -> $TMP/<town-name>.jsonl
+  local name="$1" verdict="$2" rig wt
+  rig="$(cd "$TMP/$name/rig" && pwd -P)"; wt="$(cd "$TMP/$name/rig/crew/worker-1" && pwd -P)"
+  : > "$TMP/$name.jsonl"
+  UV_LOG="$TMP/$name.jsonl" UV_REPO="$rig" UV_WT="$wt" UV_VERDICT="$verdict" \
+    WORKTREE_REAPER_FAKE_LSOF="$TMP/uv_no_lsof.txt" /bin/bash "$UV_SCRIPT" 2>/dev/null | tail -1
+}
+# positive control FIRST: the very same fixture IS reaped for the one verdict the safety net accepts, so the keeps
+# below cannot be the fixture failing some other proof (merged/clean/aged/in-use).
+mk_locked_rig uv_ctl 1 'wa-x build (wa-worker-adhoc-held@N@)'
+[ "$(run_uv uv_ctl unparseable)" = "rc=0" ] && [ "$(count_wt uv_ctl)" = "0" ] \
+  && ok "control: verdict 'unparseable' + a merged+clean+aged+unused tree → the safety net reaps it (the fixture is reapable)" \
+  || bad "control: the fixture was NOT reaped for verdict 'unparseable' — the keep assertions below would prove nothing"
+for spec in "garbage:garbage" "zombie:zombie 42 dead" "empty:@CLASSIFY_EMPTY@"; do
+  tag="${spec%%:*}"; verdict="${spec#*:}"
+  mk_locked_rig "uv_$tag" 1 'wa-x build (wa-worker-adhoc-held@N@)'
+  rc="$(run_uv "uv_$tag" "$verdict")"
+  [ "$rc" = "rc=1" ] && [ "$(count_wt "uv_$tag")" = "1" ] \
+    && ok "verdict '$verdict' (not exactly 'unparseable') → the worktree is KEPT even though it is merged+clean+aged+unused" \
+    || bad "verdict '$verdict' reached the destructive path: $rc, worktrees left: $(count_wt "uv_$tag") (expected rc=1, 1 kept)"
+  [ "$(uv_events "uv_$tag" reaped_locked_unparseable_safe)" = "0" ] \
+    || bad "verdict '$verdict': a reaped_locked_unparseable_safe event was logged for a verdict the safety net must not accept"
+  [ "$(uv_events "uv_$tag" kept_locked_unrecognized_verdict)" = "1" ] \
+    && ok "verdict '$verdict' → one distinct kept_locked_unrecognized_verdict event (not folded into kept_locked_unparseable)" \
+    || bad "verdict '$verdict' → expected 1 kept_locked_unrecognized_verdict event, saw $(uv_events "uv_$tag" kept_locked_unrecognized_verdict)"
+  jq -e . "$TMP/uv_$tag.jsonl" >/dev/null 2>&1 \
+    && ok "verdict '$verdict' → the event line is valid JSON" \
+    || bad "verdict '$verdict' → the log line is not valid JSON: $(head -c 200 "$TMP/uv_$tag.jsonl")"
+done
+
+# ... an "unknown <cause>" verdict is NOT this arm: it already has its own KEEP + event, and must keep it.
+mk_locked_rig uv_unk 1 'wa-x build (wa-worker-adhoc-held@N@)'
+rc="$(run_uv uv_unk "unknown some_other_cause")"
+[ "$rc" = "rc=1" ] && [ "$(count_wt uv_unk)" = "1" ] && [ "$(uv_events uv_unk kept_locked_unknown)" = "1" ] \
+  && ok "verdict 'unknown <cause>' → KEPT with its own kept_locked_unknown event (the new default arm did not swallow it)" \
+  || bad "verdict 'unknown <cause>' → expected rc=1, 1 kept, 1 kept_locked_unknown; got $rc, kept $(count_wt uv_unk), events $(uv_events uv_unk kept_locked_unknown)"
+
+# ── the timeout kill grace: `timeout N gc ...` alone leaves a gc that ignores TERM holding the sweep past its bound.
+echo "── ga-vs6shu gate-feedback 2: the session-list fetch is killed after a grace (timeout -k) ──"
+REAL_TIMEOUT="$(command -v timeout)"
+if [ -z "$REAL_TIMEOUT" ]; then
+  ok "no timeout(1) on this machine — the kill-grace check does not apply (the reaper keeps every lock without it)"
+else
+  FAKETO="$TMP/faketo"; mkdir -p "$FAKETO"
+  cat > "$FAKETO/timeout" <<EOTO
+#!/bin/sh
+echo "\$*" >> "$TMP/timeout.args"
+exec "$REAL_TIMEOUT" "\$@"
+EOTO
+  chmod +x "$FAKETO/timeout"
+  mk_locked_rig kg 1 'wa-x build (wa-worker-adhoc-gone@N@)'
+  : > "$TMP/timeout.args"
+  run_fakegc kg ok PATH="$FAKETO:$FAKEBIN:$PATH"
+  grep -E '^(-k|--kill-after)[ =][0-9]+ [0-9]+ gc ' "$TMP/timeout.args" >/dev/null 2>&1 \
+    && ok "the gc fetch runs as 'timeout -k <grace> <bound> gc ...' (a gc that ignores TERM is KILLed, not waited for)" \
+    || bad "the gc fetch has no kill grace — got: $(head -c 200 "$TMP/timeout.args")"
+fi
+
+# ── the comments must not still state the OLD contract (gate ga-x7lbcr, blocking issue 1). The code lets a lock
+# whose holder is not a pid-confirmed zombie be reaped when the tree independently proves safe, so a comment that
+# says "reap ONLY if zombie" / "ALWAYS kept" / "caller KEEPS" is a false absolute the next maintainer builds on.
+echo "── ga-vs6shu gate-feedback 2: no comment states the pre-ga-vs6shu lock contract ──"
+for _stale in 'reap ONLY if the lock holder is a ZOMBIE' \
+              'is ALWAYS kept' \
+              'reap ONLY if the holder is a zombie, else keep' \
+              'NOT-a-zombie (caller KEEPS)' \
+              "NOT a zombie → the worktree is KEPT"; do
+  if grep -qF -- "$_stale" "$REAPER"; then
+    bad "stale contract text is still in worktree-reaper.sh: '$_stale' (a lock is no longer 'only reaped if a zombie' / 'always kept')"
+  else
+    ok "no comment says '$_stale'"
+  fi
+done
 
 # ── zombie SIGTERM guard: kill a crew claude agent, NEVER a supervisor/pilot ──────
 echo "── zombie kill guard (guarded when ON) ──"

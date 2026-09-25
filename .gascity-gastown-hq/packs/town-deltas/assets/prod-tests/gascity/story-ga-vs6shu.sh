@@ -66,6 +66,13 @@ grep -qF '"session_list_unavailable"' "$REAPER" \
   || fail "session_list_unavailable (the fetch-failure event carrying rc/why) missing"
 grep -qF 'kept_session_list_unavailable' "$REAPER" \
   || fail "kept_session_list_unavailable counter missing from the sweep summary"
+# gate ga-x7lbcr: only the exact verdict "unparseable" may reach the independent-proof (destructive) path —
+# an empty / stray / unnamed verdict is KEPT with its own event; and the gc fetch has a KILL grace, so a gc
+# that ignores TERM cannot hold the sweep past its bound.
+grep -qF 'kept_locked_unrecognized_verdict' "$REAPER" \
+  || fail "kept_locked_unrecognized_verdict (the default-arm KEEP) missing from the deployed reaper"
+grep -qE 'timeout -k "\$SESSION_LIST_KILL_GRACE" "\$SESSION_LIST_TIMEOUT" gc ' "$REAPER" \
+  || fail "the gc session-list fetch no longer runs as 'timeout -k <grace> <bound> gc' (a gc that ignores TERM would hang the sweep)"
 log "  present ✓"
 
 # ── 3. classify_lock's call sites pass the worktree path through ───────────────
