@@ -2388,6 +2388,55 @@ gate_base_test_old_state() {
   return 0
 }
 
+# gate_base_test_outside_subtree <rig> <base> <tip>  (ga-x4mkk2)
+#   How many *.selftest.sh files changed between <base> and <tip> OUTSIDE the <rig>
+#   directory. Same added-or-modified filter as the Step 5b-pre2 detection, so the two
+#   numbers are comparable. Why it exists: that detection runs
+#   `git -C <rig> diff -- '*.selftest.sh'`, and a pathspec resolves against the -C
+#   directory. The gascity rig (RIG_PATH) is a SUBDIRECTORY of the repo toplevel, so a
+#   changed selftest anywhere else in the repo is silently absent from the detection
+#   (4 of 304 selftests, measured 2026-09-25) and a submission made only of such files
+#   reads sem-teste-novo — identical to "no test at all". This only COUNTS them, so the
+#   blind spot becomes a number in the AB-BASE-TEST log line instead of a silence. It is
+#   not an input to any verdict and it refuses nobody: what arm B should cover is the
+#   experiment owner's call, made once this number is real.
+#   Prints exactly one word and ALWAYS returns 0 (the guard runs under set -e):
+#     <N>      — a non-negative integer: git answered, and N changed selftests are outside
+#                the rig directory. 0 is a MEASURED zero (it includes "the rig IS the repo
+#                toplevel", where nothing can be outside).
+#     unknown  — anything else: an empty argument, `rev-parse --show-prefix` ERROR (not a
+#                repo), or the root-relative diff ERROR (unresolvable sha). An error must
+#                not read as 0 — that would hide the blind spot exactly when the check
+#                could not look.
+#   Inside/outside is decided by the prefix git reports for <rig> (`--show-prefix`: "sub/"
+#   for a subdirectory rig, empty at the toplevel), trailing slash included, so "sub-other/x"
+#   — whose name starts with "sub" — is correctly outside "sub/".
+gate_base_test_outside_subtree() {
+  local rig="$1" base="$2" tip="$3" prefix="" all="" f="" n=0
+  if [ -z "$rig" ] || [ -z "$base" ] || [ -z "$tip" ]; then
+    printf 'unknown'; return 0
+  fi
+  if ! prefix=$(git -C "$rig" rev-parse --show-prefix 2>/dev/null); then
+    printf 'unknown'; return 0
+  fi
+  # :(top) makes the pathspec ROOT-relative, so the diff sees the whole repo whatever
+  # directory -C names (the output of `diff --name-only` is root-relative either way).
+  if ! all=$(git -C "$rig" diff --name-only --diff-filter=AM "${base}..${tip}" -- ':(top)*.selftest.sh' 2>/dev/null); then
+    printf 'unknown'; return 0
+  fi
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    case "$f" in
+      "$prefix"*) ;;                # inside the rig directory (an empty prefix matches all)
+      *) n=$((n + 1)) ;;
+    esac
+  done <<OUTSIDE_SUBTREE_EOF
+$all
+OUTSIDE_SUBTREE_EOF
+  printf '%s' "$n"
+  return 0
+}
+
 # gate_bead_sibling_status_lines <gc_city> <bead_id> — bd-backed. Builds the
 # "<branch><TAB><gate-status-value><TAB><rig>" lines for every marker/gate-run
 # tied to $bead_id (source-bead:$bead_id label), skipping closed markers
@@ -5197,6 +5246,15 @@ fi
 # old form that cannot be measured is unclassified -> nao-consegui-medir.
 # All of it lives inside the arm-B branch below; arm A never reaches it.
 #
+# Known blind spot, counted not closed (ga-x4mkk2, Mayor decision 2026-09-25): the
+# detection below only sees selftests inside the RIG_PATH directory, which for the
+# gascity rig is a subdirectory of the repo. A changed selftest elsewhere in the repo is
+# invisible to it, so a submission made only of such files is scored sem-teste-novo. The
+# AB-BASE-TEST line therefore ends with outside-subtree=N (gate_base_test_outside_subtree:
+# N changed selftests outside RIG_PATH; "unknown" when git could not be asked). It changes
+# NO verdict and NO refusal — widening what arm B covers is the experiment owner's call
+# (Athos, 2026-08-12), to be made once that number is real.
+#
 # Every submission that reaches this point with arm=B gets a verdict label
 # + a structured "AB-BASE-TEST" log line, REGARDLESS of whether it blocks —
 # "sem-teste-novo" and "nao-consegui-medir" must be counted, not just
@@ -5211,6 +5269,7 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
                                          # below once a stage actually succeeds
     _ABT_DETECTED=0; _ABT_COPY_OK=0; _ABT_RAN=0; _ABT_FAILED=0
     _ABT_REPAIRED=0; _ABT_UNCLASSIFIED=0   # ga-yl1k3w: see gate_base_test_old_state
+    _ABT_OUTSIDE="unknown"                 # ga-x4mkk2: "never measured" must not read as 0
     _ABT_BASE=""; _ABT_TEST_FILES=""
 
     git -C "$RIG_PATH" fetch origin main "$BRANCH" --quiet 2>/dev/null || true
@@ -5221,6 +5280,9 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
     fi
 
     if [ -n "$_ABT_BASE" ]; then
+      # ga-x4mkk2: the detection just below is scoped to the RIG_PATH directory; count what
+      # changed outside it. Logged only — never read again by the verdict or the refusal.
+      _ABT_OUTSIDE=$(gate_base_test_outside_subtree "$RIG_PATH" "$_ABT_BASE" "$_ABT_BRANCH_SHA")
       _ABT_TEST_FILES=$(git -C "$RIG_PATH" diff --name-only --diff-filter=AM "${_ABT_BASE}..${_ABT_BRANCH_SHA}" -- '*.selftest.sh' 2>/dev/null || echo "")
       [ -n "$_ABT_TEST_FILES" ] && _ABT_DETECTED=$(printf '%s\n' "$_ABT_TEST_FILES" | grep -c .)
 
@@ -5283,7 +5345,7 @@ ABT_TEST_FILES_EOF
 
     bd -C "$GC_CITY" label add "$MARKER_ID" "gate-ab:arm-b" -q 2>/dev/null || true
     bd -C "$GC_CITY" label add "$MARKER_ID" "gate-ab-basetest:$_ABT_VERDICT" -q 2>/dev/null || true
-    log "AB-BASE-TEST bead=$BEAD_ID arm=B verdict=$_ABT_VERDICT branch=$BRANCH base=$_ABT_BASE detected=$_ABT_DETECTED copy_ok=$_ABT_COPY_OK ran=$_ABT_RAN failed=$_ABT_FAILED repaired=$_ABT_REPAIRED unclassified=$_ABT_UNCLASSIFIED"
+    log "AB-BASE-TEST bead=$BEAD_ID arm=B verdict=$_ABT_VERDICT branch=$BRANCH base=$_ABT_BASE detected=$_ABT_DETECTED copy_ok=$_ABT_COPY_OK ran=$_ABT_RAN failed=$_ABT_FAILED repaired=$_ABT_REPAIRED unclassified=$_ABT_UNCLASSIFIED outside-subtree=$_ABT_OUTSIDE"
 
     if [ "$_ABT_VERDICT" = "passou-na-base" ]; then
       err "  base-commit-test-check (ga-rstae, arm B): $_ABT_DETECTED new/changed selftest(s) on $BRANCH ALL pass unmodified against pre-fix base $_ABT_BASE — proves nothing about this branch's own diff. Refusing at submission."
