@@ -365,9 +365,15 @@ policy viva, não só no relato: GET sem assinatura dá 403, GET presigned dá
 200, porque a assinatura carrega `aws:PrincipalAccount` e o Deny só bate
 quando essa conta DIFERE da dona (549710416969). Ou seja, hoje `presign`
 PROTEGE de verdade — a redação anterior aqui ("presign é decorativo") ficou
-stale e está corrigida. A distro CloudFront segue sem gate (não passa pela
-assinatura) — nunca linke por ela pra esses prefixos, só a URL presigned do
-S3. Continue gerando chave de alta entropia por arquivo: é defesa em
+stale e está corrigida. A distro CloudFront (`dnroc49bwlbis.cloudfront.net`)
+TAMBÉM ficou stale na direção oposta: a redação anterior dizia que ela
+"serve sem gate" — testado ao vivo (2026-09-25, objeto novo E um objeto
+antigo de junho, pelos dois caminhos) e CloudFront hoje dá 403 sem
+assinatura, igual ao S3 direto. Ou seja, CloudFront não é mais um vazamento
+conhecido pra esses prefixos, mas também não serve como link de entrega —
+use SEMPRE a URL presigned do S3, nunca a de CloudFront (ela não vai
+funcionar sem assinatura, e presign não se aplica a domínio de CDN).
+Continue gerando chave de alta entropia por arquivo: é defesa em
 profundidade, não a única barreira.
 
 NUNCA entregue mockup como PNG, localhost URL ou servidor local/tunnel. O
