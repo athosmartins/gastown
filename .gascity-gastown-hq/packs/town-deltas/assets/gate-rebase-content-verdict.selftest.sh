@@ -100,6 +100,13 @@ run_verdict() { # <new_tip>
   ( . "$TMP/block.sh"; rebase_content_verdict "$R" "$MAIN" "$FEAT" "$1" )
 }
 
+# run_verdict_at <wt> <main_ref> <orig_tip> <new_tip> — generic form used by
+# Teste 8 (ga-r5dsgp) below, which needs a DIFFERENT worktree per case
+# (unlike run_verdict()'s single fixed "$R").
+run_verdict_at() {
+  ( . "$TMP/block.sh"; rebase_content_verdict "$1" "$2" "$3" "$4" )
+}
+
 # Teste 1 — rebase honesto: arvore bate com o merge 3-way => "yes"
 git -C "$R" checkout -q --detach feat
 git -C "$R" rebase main -q >/dev/null 2>&1
@@ -353,6 +360,118 @@ if [ -n "$ATTRS_OUT" ] && [ -f "$ATTRS_OUT" ]; then
 else
   bad "rebase_git_attributes_file nao materializou arquivo nenhum (esperava um so com a linha union)"
 fi
+
+# Teste 8 (ga-r5dsgp) — daemons/deploy_deps.json auto-verify special case.
+#
+# INCIDENTE: daemons/deploy_deps.json is registered with a CUSTOM merge
+# driver (merge=deploydeps) precisely so two branches that each regenerate
+# it independently never hard-conflict — but rebase_git_attributes_file()
+# (ga-stisew, Teste 7d above) deliberately excludes custom drivers from THIS
+# function's own ground-truth merge-tree computation, so that computation
+# conflicts on this file EVERY time the driver resolves it, forever, on every
+# rebase — turning a perfectly healthy push into a permanent
+# "unknown:merge-tree-conflict" that never becomes "yes". Root cause of
+# ga-r5dsgp's 2.5h/59-sweep head-of-line block. The fix: when the ONLY path
+# this function's ground truth conflicts on is daemons/deploy_deps.json,
+# verify the CONTENT ACTUALLY ABOUT TO BE PUSHED (on disk at $wt, i.e.
+# $new_tip) via the rig's own generator --check instead of the 3-way-tree
+# comparison, which is the wrong question for a driver-covered path.
+#
+# $wt must be a REAL, non-bare checkout for this (unlike Teste 6's bare
+# .repo.git) — the fix reads $wt/scripts/gen_daemon_deps.py and runs it
+# against $wt's ON-DISK daemons/deploy_deps.json, exactly as the live
+# dispatcher's $TMP_REBASE_WT already is post-commit, pre-push.
+mkrepo_ddj() {  # <dir> [with_other_conflict:0|1]
+  local R="$1" with_other="${2:-0}"
+  mkdir -p "$R/daemons" "$R/scripts"
+  git -C "$R" init -q
+  git -C "$R" config user.email t@t; git -C "$R" config user.name T
+  # Fixture generator: --check passes iff the committed file's content is
+  # exactly the one "canonical" string — a minimal stand-in for the real
+  # rig's scripts/gen_daemon_deps.py (wa-9lxa7's "compara o build fresco
+  # contra o commitado"); this test only needs pass/fail, not real closures.
+  cat > "$R/scripts/gen_daemon_deps.py" <<'PYEOF'
+#!/usr/bin/env python3
+import sys
+CANON = '{"n": 2}\n'
+if "--check" in sys.argv[1:]:
+    with open("daemons/deploy_deps.json") as f:
+        sys.exit(0 if f.read() == CANON else 1)
+sys.exit(0)
+PYEOF
+  printf '{"n": 0}\n' > "$R/daemons/deploy_deps.json"
+  [ "$with_other" = "1" ] && printf 'base\n' > "$R/other.txt"
+  git -C "$R" add -A; git -C "$R" commit -qm base
+  git -C "$R" branch -M ddjmain
+  git -C "$R" checkout -q -b ddjbranch
+  printf '{"n": 1}\n' > "$R/daemons/deploy_deps.json"
+  [ "$with_other" = "1" ] && printf 'branch-version\n' > "$R/other.txt"
+  git -C "$R" add -A; git -C "$R" commit -qm "branch regenerates deploy_deps.json"
+  git -C "$R" checkout -q ddjmain
+  printf '{"n": 5}\n' > "$R/daemons/deploy_deps.json"
+  [ "$with_other" = "1" ] && printf 'main-version\n' > "$R/other.txt"
+  git -C "$R" add -A; git -C "$R" commit -qm "main regenerates deploy_deps.json differently"
+}
+RD="$TMP/repo-deploydeps"; mkrepo_ddj "$RD"
+DDJ_MAIN=$(git -C "$RD" rev-parse ddjmain); DDJ_BRANCH=$(git -C "$RD" rev-parse ddjbranch)
+
+# Teste 8-premise — the two sides genuinely conflict under a plain merge-tree
+# (same single-line file, both sides changed it away from base) — without
+# this, Testes 8a/8b below could pass by accident because there was never a
+# real conflict to special-case around.
+git -C "$RD" merge-tree --write-tree "$DDJ_MAIN" "$DDJ_BRANCH" >/dev/null 2>&1
+[ "$?" -ne 0 ] && ok "premissa: main e branch regeneram deploy_deps.json de forma conflitante sob merge-tree puro" \
+               || bad "premissa quebrada: o fixture deveria conflitar sem o driver, ground-truth deu rc=0"
+
+# Teste 8a — THE FIX: $wt on-disk (at new_tip) passes --check => "yes",
+# even though the ground-truth 3-way merge genuinely conflicts on this path.
+git -C "$RD" checkout -q --detach ddjbranch
+printf '{"n": 2}\n' > "$RD/daemons/deploy_deps.json"
+git -C "$RD" commit -qam "gate auto-resolve: regenerated deploy_deps.json"
+DDJ_GOOD_TIP=$(git -C "$RD" rev-parse HEAD)
+V8A=$(run_verdict_at "$RD" "$DDJ_MAIN" "$DDJ_BRANCH" "$DDJ_GOOD_TIP")
+[ "$V8A" = "yes" ] && ok "sole conflict is daemons/deploy_deps.json AND \$wt's on-disk content passes --check => yes (the ga-r5dsgp fix)" \
+                   || bad "expected yes (driver-resolved, --check green), got '$V8A'"
+
+# Teste 8b — SAFETY: --check FAILS (drift — the committed content does NOT
+# match what regeneration would produce) => stays unknown, never upgraded.
+printf '{"n": 999}\n' > "$RD/daemons/deploy_deps.json"
+git -C "$RD" commit -qam "corrupted: does not match the generator"
+DDJ_BAD_TIP=$(git -C "$RD" rev-parse HEAD)
+V8B=$(run_verdict_at "$RD" "$DDJ_MAIN" "$DDJ_BRANCH" "$DDJ_BAD_TIP")
+[ "$V8B" = "unknown:merge-tree-conflict" ] && ok "--check FAILS on drifted content => stays unknown:merge-tree-conflict (never silently upgraded to yes)" \
+                   || bad "expected unknown:merge-tree-conflict for drifted content, got '$V8B' (would silently push bad content)"
+
+# Teste 8c — SAFETY: no generator present in \$wt => falls through unchanged,
+# no crash, never mistaken for a resolvable case.
+RD2="$TMP/repo-deploydeps-nogen"; mkrepo_ddj "$RD2"; rm -f "$RD2/scripts/gen_daemon_deps.py"
+DDJ2_MAIN=$(git -C "$RD2" rev-parse ddjmain); DDJ2_BRANCH=$(git -C "$RD2" rev-parse ddjbranch)
+git -C "$RD2" checkout -q --detach ddjbranch
+printf '{"n": 2}\n' > "$RD2/daemons/deploy_deps.json"
+git -C "$RD2" commit -qam "no generator in this rig"
+DDJ2_TIP=$(git -C "$RD2" rev-parse HEAD)
+V8C=$(run_verdict_at "$RD2" "$DDJ2_MAIN" "$DDJ2_BRANCH" "$DDJ2_TIP")
+[ "$V8C" = "unknown:merge-tree-conflict" ] && ok "rig with no scripts/gen_daemon_deps.py: falls through to the existing unknown, no crash" \
+                   || bad "expected unknown:merge-tree-conflict when no generator exists, got '$V8C'"
+
+# Teste 8d — SAFETY: a SECOND, unrelated conflicting path alongside
+# deploy_deps.json => not a SOLE conflict anymore, falls through unchanged
+# (this fix must never mask a real conflict in a DIFFERENT file).
+RD3="$TMP/repo-deploydeps-multi"; mkrepo_ddj "$RD3" 1
+DDJ3_MAIN=$(git -C "$RD3" rev-parse ddjmain); DDJ3_BRANCH=$(git -C "$RD3" rev-parse ddjbranch)
+git -C "$RD3" checkout -q --detach "$DDJ3_BRANCH"
+printf '{"n": 2}\n' > "$RD3/daemons/deploy_deps.json"
+git -C "$RD3" commit -qam "gate auto-resolve attempt: only regenerated deploy_deps.json, other.txt still conflicts"
+DDJ3_TIP=$(git -C "$RD3" rev-parse HEAD)
+V8D=$(run_verdict_at "$RD3" "$DDJ3_MAIN" "$DDJ3_BRANCH" "$DDJ3_TIP")
+[ "$V8D" = "unknown:merge-tree-conflict" ] && ok "a SECOND conflicting file (other.txt) alongside deploy_deps.json => NOT treated as sole/resolvable, stays unknown (never masks a real conflict elsewhere)" \
+                   || bad "expected unknown:merge-tree-conflict when more than one path conflicts, got '$V8D'"
+
+echo "── Teste 8e — drift-guard: shipped code still has the special-case wired ──"
+grep -q 'daemons/deploy_deps.json' "$DISPATCHER" \
+  && ok "dispatcher still names daemons/deploy_deps.json in rebase_content_verdict's special case" || bad "the ga-r5dsgp special case is gone from the dispatcher"
+grep -q 'gen_daemon_deps.py --check' "$DISPATCHER" \
+  && ok "dispatcher still invokes the generator's --check as the verification step" || bad "the --check invocation is gone from the dispatcher"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

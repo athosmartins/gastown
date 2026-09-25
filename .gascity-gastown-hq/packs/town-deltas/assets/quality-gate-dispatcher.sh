@@ -4491,7 +4491,55 @@ rebase_content_verdict() {
   # both shapes before shipping this split — see rebase_content_lost_paths()
   # below for where the stderr this discards is instead captured.
   if [ "$rc" -ne 0 ]; then
-    if [ -n "$out" ]; then echo "unknown:merge-tree-conflict"; else echo "unknown:merge-tree-error"; fi
+    if [ -n "$out" ]; then
+      # ga-r5dsgp: before giving up as "unknown", check whether the ONLY
+      # path this ground-truth 3-way merge-tree conflicts on is a generated
+      # file this rig can independently verify — daemons/deploy_deps.json,
+      # via its own generator's --check (wa-9lxa7/wa-95ida). That file is
+      # registered with a CUSTOM merge driver (daemons/deploy_deps.json
+      # merge=deploydeps) precisely so two branches that regenerate it
+      # differently never hard-conflict — but rebase_git_attributes_file()
+      # (ga-stisew, above) deliberately EXCLUDES custom drivers from this
+      # function's own ground-truth merge-tree computation (executing an
+      # arbitrary driver script against a bare git-dir with no working tree
+      # was itself a prior incident). So this function's ground-truth
+      # comparison disagrees with the driver on this file BY DESIGN, on
+      # every single rebase that resolves it via the driver — not evidence
+      # content was lost, just evidence a 3-way-tree match is the wrong
+      # question to ask for a driver-covered path. Root cause of ga-r5dsgp
+      # (59 consecutive dispatcher sweeps re-selecting the same exiled
+      # marker on this exact conflict, 2.5h head-of-line block on 10+ other
+      # markers incl. a P0): the actual git-level rebase/merge succeeded via
+      # the driver every sweep, and this function refused to bless it every
+      # single time, so the marker never left the bounded-retry loop despite
+      # genuinely being fine each time.
+      #
+      # $wt is a REAL worktree (unlike the bare-git-dir-only comparison
+      # above) already checked out at $new_tip — its on-disk
+      # daemons/deploy_deps.json IS exactly the content about to be pushed.
+      # Verifying it via the SAME --check the generator's own pre-push lint
+      # uses (wa-9lxa7: "compara o build FRESCO contra o commitado ... falha
+      # se divergirem") is a STRONGER, more direct guarantee for this one
+      # path than a 3-way-tree match would ever be — it confirms the pushed
+      # content is byte-identical to what regenerating from source produces,
+      # not merely "agrees with a merge strategy nobody asked for". Fully
+      # conservative: any failure below (no generator, more than one
+      # conflicting path, --check itself fails) falls straight through to
+      # the existing "unknown" — this can only ever upgrade a verified-good
+      # result, never invent one.
+      local _rcv_conflict_paths
+      _rcv_conflict_paths=$(git --git-dir="$gd" merge-tree --write-tree --name-only "$main_ref" "$orig_tip" 2>/dev/null \
+        | tail -n +2 | sed '/^$/q' | sed '/^$/d' || true)
+      if [ "$_rcv_conflict_paths" = "daemons/deploy_deps.json" ] \
+         && [ -f "$wt/scripts/gen_daemon_deps.py" ] \
+         && ( cd "$wt" && python3 scripts/gen_daemon_deps.py --check ) >/dev/null 2>&1; then
+        echo "yes"
+        return 0
+      fi
+      echo "unknown:merge-tree-conflict"
+    else
+      echo "unknown:merge-tree-error"
+    fi
     return 0
   fi
   expected=$(printf '%s\n' "$out" | head -1)
@@ -10197,8 +10245,43 @@ case "$GATE_MARKER_HARD_AGE_SECONDS" in ''|*[!0-9]*) GATE_MARKER_HARD_AGE_SECOND
 # to the same value as GATE_MARKER_HARD_AGE_SECONDS (one ceiling, healthy or
 # not) but is independently configurable. 0 disables the feature (same "0
 # turns it off" convention as GATE_FRESH_SLOT_WINDOW_SWEEPS above).
+#
+# ga-r5dsgp: the "MAX_REBASE_ATTEMPTS still caps how many times it can be
+# re-attempted" claim two paragraphs up does NOT hold in every case — Step
+# 4c's own ga-y5c29l exemption (REBASE_MERGE_TREE_PROVEN_CLEAN) keeps a
+# marker in gate-status:queued INDEFINITELY once its attempt count blows
+# past MAX_REBASE_ATTEMPTS, specifically to protect a branch that is
+# genuinely clean but hitting repeated operational/plumbing failures (the
+# wa-llq1a/wa-4zmm1 incident that exemption exists for). Combined with THIS
+# tier's admission rule (exile_overdue, below), a marker whose retry is
+# permanently, deterministically un-resolvable (not transient — the same
+# failure every sweep) never leaves tier 1 once past the exile-age ceiling:
+# every sweep re-admits it, and because tier 1 sorts oldest-created_at-first
+# an old marker wins EVERY sweep, starving the entire queue behind it.
+# Measured live (ga-r6bore, 2026-09-25): 59 consecutive dispatcher sweeps
+# re-selected the SAME exiled marker (gate:rebase-fail-count climbing past
+# 60), 2.5h head-of-line block on a queue carrying 10+ other markers
+# including a P0 (wa-egtf0). See GATE_EXILE_RETRY_CEILING immediately below —
+# it closes this gap without touching the wa-ycyf8 invariant this comment
+# describes (a marker still UNDER the ceiling keeps getting exactly the
+# behavior this paragraph promises).
 GATE_EXILE_OVERDUE_SECONDS="${GATE_EXILE_OVERDUE_SECONDS:-$GATE_MARKER_HARD_AGE_SECONDS}"
 case "$GATE_EXILE_OVERDUE_SECONDS" in ''|*[!0-9]*) GATE_EXILE_OVERDUE_SECONDS="$GATE_MARKER_HARD_AGE_SECONDS" ;; esac
+# ga-r5dsgp: retry-count ceiling for exile_overdue's tier-1 admission (below).
+# A marker whose own retry count has already reached/passed this ceiling has
+# exhausted the bounded-retry contract the wa-ycyf8 fix promises — letting
+# it keep re-entering tier 1 forever achieves nothing but head-of-line
+# blocking (see the comment above). Mirrors MAX_REBASE_ATTEMPTS (Step 4c,
+# below — hardcoded there, not yet defined at this point in the sweep, hence
+# an independent tunable here) so the two stay in lockstep by default while
+# remaining separately overridable. Once past this ceiling the marker simply
+# stops being admitted to tier 1 — it falls to tier 7 (has_rebase_fail, the
+# back of the queue, unchanged), where gate_exile_watchdog_sweep (ga-faw5o,
+# already running every sweep, GATE_EXILE_ESCALATE_AFTER_SECONDS default 24h)
+# remains the existing backstop that eventually parks it at needs-rebase —
+# this fix's job is only to stop it DOMINATING every sweep in the meantime.
+GATE_EXILE_RETRY_CEILING="${GATE_EXILE_RETRY_CEILING:-3}"
+case "$GATE_EXILE_RETRY_CEILING" in ''|*[!0-9]*) GATE_EXILE_RETRY_CEILING=3 ;; esac
 # ga-r8u92 (ga-faw5o defeito 1): SIZE-AWARE SELECTION, healthy-not-aged tiers only.
 # Step 0b-0 (above, OUTSIDE this sentinel — mirrors how MARKERS_JSON itself is
 # built outside and merely CONSUMED here) annotates each candidate with
@@ -10222,6 +10305,7 @@ MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   --argjson age_threshold "$GATE_MARKER_AGE_PROMOTE_SECONDS" \
   --argjson hard_threshold "$GATE_MARKER_HARD_AGE_SECONDS" \
   --argjson exile_ceiling "$GATE_EXILE_OVERDUE_SECONDS" \
+  --argjson retry_ceiling "$GATE_EXILE_RETRY_CEILING" \
   --argjson reserve_fresh "$GATE_FRESH_SLOT_DUE" \
   --argjson diff_unknown "$GATE_DIFF_SIZE_UNKNOWN_SENTINEL" \
   --arg priority_authors "$GATE_PRIORITY_AUTHORS" '
@@ -10245,7 +10329,15 @@ MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   # behind healthy markers exactly as before — this tier only admits a
   # marker whose OWN exile has sat unconsidered long enough on its own terms.
   def exiled_since_epoch: ([(.labels // [])[] | select(test("^gate:exiled-since:[0-9]+$")) | (sub("^gate:exiled-since:";"") | tonumber)] | max) // null;
-  def exile_overdue: ($exile_ceiling > 0) and (exiled_since_epoch != null) and (($now - exiled_since_epoch) > $exile_ceiling);
+  # ga-r5dsgp: mirrors read_rebase_attempt() (shell, above) exactly — same
+  # three label prefixes, same "highest value wins" rule — so a marker
+  # exiled under the legacy gate:rebase-attempt:N name is capped correctly
+  # too. See the GATE_EXILE_RETRY_CEILING shell comment above for why this
+  # exists: without it, exile_overdue keeps admitting a marker to tier 1
+  # forever once past the exile-age ceiling, even after it has blown far
+  # past its own bounded-retry budget (measured: gate:rebase-fail-count:61).
+  def rebase_attempt_count: ([(.labels // [])[] | select(test("^gate:(rebase-attempt|exiled-tier5|rebase-fail-count):[0-9]+$")) | (sub("^gate:(rebase-attempt|exiled-tier5|rebase-fail-count):";"") | tonumber)] | max) // 0;
+  def exile_overdue: ($exile_ceiling > 0) and (exiled_since_epoch != null) and (($now - exiled_since_epoch) > $exile_ceiling) and (rebase_attempt_count < $retry_ceiling);
   # crew_of parses the <crew> segment of `branch: crew/<crew>/<bead>` from the
   # marker DESCRIPTION. MUST always yield exactly one value ("" when absent) —
   # `capture`/`scan` yield an EMPTY STREAM on no-match under jq, and `crew_of as

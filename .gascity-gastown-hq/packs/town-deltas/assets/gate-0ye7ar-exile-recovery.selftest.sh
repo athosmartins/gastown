@@ -406,5 +406,87 @@ else
 fi
 
 echo ""
+echo "── SECTION E: marker-select tier-selection — ga-r5dsgp, retry-ceiling caps exile_overdue admission ──"
+echo "── (the ga-r5dsgp incident: exile_overdue (Section B) admits a marker to tier 1 purely on TIME, with"
+echo "──  no regard for how many times it has already been retried — a marker whose auto-rebase keeps"
+echo "──  failing IDENTICALLY (gate:rebase-fail-count climbing past 60) stays admitted forever once past"
+echo "──  the exile-age ceiling, and because tier 1 sorts oldest-created_at-first it wins EVERY sweep,"
+echo "──  starving the whole queue behind it — measured live: 59 consecutive sweeps, 2.5h, marker ga-r6bore) ──"
+
+# select_marker3 <block> <markers_json> <now> <age> <hard> <exile_ceiling> [<retry_ceiling>]
+# retry_ceiling omitted leaves GATE_EXILE_RETRY_CEILING UNSET, so the block's
+# own default (3) governs — mirrors select_marker2's own exile_ceiling
+# omission convention above, for the same reason (test E4 below needs it).
+select_marker3() {
+  local block="$1" markers_json="$2" now_epoch="$3" age_threshold="$4" hard_threshold="$5" exile_ceiling="$6"
+  if [ "$#" -ge 7 ]; then
+    MARKERS_JSON="$markers_json" GATE_MARKER_NOW_OVERRIDE_EPOCH="$now_epoch" \
+    GATE_MARKER_AGE_PROMOTE_SECONDS="$age_threshold" GATE_MARKER_HARD_AGE_SECONDS="$hard_threshold" \
+    GATE_EXILE_OVERDUE_SECONDS="$exile_ceiling" GATE_EXILE_RETRY_CEILING="$7" GATE_PRIORITY_AUTHORS="oracle" \
+    bash -c "$block"$'\necho "$MARKER_ID"' 2>/dev/null
+  else
+    MARKERS_JSON="$markers_json" GATE_MARKER_NOW_OVERRIDE_EPOCH="$now_epoch" \
+    GATE_MARKER_AGE_PROMOTE_SECONDS="$age_threshold" GATE_MARKER_HARD_AGE_SECONDS="$hard_threshold" \
+    GATE_EXILE_OVERDUE_SECONDS="$exile_ceiling" GATE_PRIORITY_AUTHORS="oracle" \
+    bash -c "$block"$'\necho "$MARKER_ID"' 2>/dev/null
+  fi
+}
+
+echo "── (E1) THE FIX: exile_overdue by TIME but retry count >= ceiling — no longer dominates tier 1 ──"
+FIX=$(printf '[%s,%s]' \
+  "$(mkb fresh_e1  "$(ago 60)"  "gate-status:queued")" \
+  "$(mkb runaway_e1 "$(ago 300)" "gate-status:queued,gate:exiled-tier5:61,gate:exiled-since:$((NOW_EPOCH-999999))")")
+SEL=$(select_marker3 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$THRESH" "$HARD" "$HARD" 3)
+[ "$SEL" = "fresh_e1" ] && ok "runaway marker (attempt=61, exiled 999999s ago) no longer wins tier 1 over a fresh healthy marker — the ga-r5dsgp head-of-line block this fix exists to stop" \
+  || bad "expected fresh_e1, got '$SEL' — a marker past its own retry ceiling is still dominating tier 1 (ga-r5dsgp regression)"
+
+echo "── (E2) NOT reversed: a marker UNDER the ceiling still gets its exile_overdue admission (Section B1's shape, ceiling explicit) ──"
+FIX=$(printf '[%s,%s,%s]' \
+  "$(mkb fresh_e2   "$(ago 60)"   "gate-status:queued")" \
+  "$(mkb aged_e2    "$(ago 2000)" "gate-status:queued")" \
+  "$(mkb exiled_e2  "$(ago 300)"  "gate-status:queued,gate:exiled-tier5:2,gate:exiled-since:$((NOW_EPOCH-5500))")")
+SEL=$(select_marker3 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$THRESH" "$HARD" "$HARD" 3)
+[ "$SEL" = "exiled_e2" ] && ok "attempt=2 < ceiling=3 — still admitted to tier 1 by its overdue exile clock, exactly as Section B already proves (no regression)" \
+  || bad "expected exiled_e2, got '$SEL' — the ceiling over-applied and blocked a marker still inside its retry budget"
+
+echo "── (E3) boundary: attempt count EXACTLY AT the ceiling is excluded (strict <, matches house convention) ──"
+FIX=$(printf '[%s,%s]' \
+  "$(mkb fresh_e3    "$(ago 60)"  "gate-status:queued")" \
+  "$(mkb atceiling_e3 "$(ago 300)" "gate-status:queued,gate:exiled-tier5:3,gate:exiled-since:$((NOW_EPOCH-999999))")")
+SEL=$(select_marker3 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$THRESH" "$HARD" "$HARD" 3)
+[ "$SEL" = "fresh_e3" ] && ok "attempt count exactly AT the ceiling (3) is excluded, not just strictly-above — off-by-one matches MAX_REBASE_ATTEMPTS's own semantics (Step 4c: attempt>=MAX circuit-breaks)" \
+  || bad "expected fresh_e3, got '$SEL' — attempt==ceiling should already be excluded"
+
+echo "── (E4) default: leaving GATE_EXILE_RETRY_CEILING unset resolves to 3 ──"
+FIX=$(printf '[%s,%s]' \
+  "$(mkb fresh_e4    "$(ago 60)"  "gate-status:queued")" \
+  "$(mkb runaway_e4  "$(ago 300)" "gate-status:queued,gate:rebase-fail-count:9,gate:exiled-since:$((NOW_EPOCH-999999))")")
+SEL=$(select_marker3 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$THRESH" "$HARD" "$HARD")
+[ "$SEL" = "fresh_e4" ] && ok "leaving GATE_EXILE_RETRY_CEILING unset defaults to 3 — attempt=9 (via legacy gate:rebase-fail-count label) is excluded without an explicit override" \
+  || bad "expected fresh_e4, got '$SEL' — default retry ceiling not wired (or legacy rebase-fail-count label not recognized)"
+
+echo "── (E5) gate-feedback-style regression: malformed GATE_EXILE_RETRY_CEILING must not crash the sweep ──"
+FIX5=$(printf '[%s,%s]' "$(mkb e5a "$(ago 600)" "gate-status:queued")" "$(mkb e5b "$(ago 60)" "gate-status:queued")")
+SEL=$(MARKERS_JSON="$FIX5" GATE_MARKER_NOW_OVERRIDE_EPOCH="$NOW_EPOCH" \
+  GATE_MARKER_AGE_PROMOTE_SECONDS="$THRESH" GATE_MARKER_HARD_AGE_SECONDS="$HARD" \
+  GATE_EXILE_OVERDUE_SECONDS="$HARD" GATE_EXILE_RETRY_CEILING="not-a-number" GATE_PRIORITY_AUTHORS="oracle" \
+  bash -c "set -euo pipefail; $SELECT_BLOCK"$'\necho "$MARKER_ID"' 2>/dev/null)
+STATUS=$?
+if [ "$STATUS" = "0" ] && [ "$SEL" = "e5b" ]; then
+  ok "malformed GATE_EXILE_RETRY_CEILING falls back to the default (3) instead of crashing the sweep (exit=$STATUS, selected=$SEL)"
+else
+  bad "malformed GATE_EXILE_RETRY_CEILING broke selection (exit=$STATUS, selected='$SEL')"
+fi
+
+echo "── (E6) drift-guard: exile_overdue now composes a retry-count cap ──"
+grep -q 'def rebase_attempt_count' "$DISPATCHER" \
+  && ok "rebase_attempt_count predicate present in the shipped dispatcher" || bad "rebase_attempt_count predicate missing"
+grep -q 'GATE_EXILE_RETRY_CEILING' "$DISPATCHER" \
+  && ok "exile retry ceiling is a configurable GATE_* tunable" || bad "exile retry ceiling not configurable"
+grep -q 'exile_overdue: (\$exile_ceiling > 0) and (exiled_since_epoch != null) and ((\$now - exiled_since_epoch) > \$exile_ceiling) and (rebase_attempt_count < \$retry_ceiling)' "$DISPATCHER" \
+  && ok "exile_overdue's own definition composes the retry-count cap (not a separate select-line clause — keeps tier 1's outer shape, and Section C's drift-guard, untouched)" \
+  || bad "exile_overdue no longer wires in the retry-count cap the way this fix shipped it"
+
+echo ""
 echo "== gate-0ye7ar-exile-recovery.selftest: PASS=$PASS FAIL=$FAIL =="
 [ "$FAIL" -eq 0 ]
