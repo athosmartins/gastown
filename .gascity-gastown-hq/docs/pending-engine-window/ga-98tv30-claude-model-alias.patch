@@ -1,0 +1,80 @@
+diff --git a/cmd/gc/template_resolve_phase2_test.go b/cmd/gc/template_resolve_phase2_test.go
+index 5cd711676..dd32a01ec 100644
+--- a/cmd/gc/template_resolve_phase2_test.go
++++ b/cmd/gc/template_resolve_phase2_test.go
+@@ -65,7 +65,7 @@ func selectedPhase2ProviderCases(t *testing.T) []phase2ProviderCase {
+ 			wantProcessNames:      []string{"node", "claude"},
+ 			wantEmitsPermission:   true,
+ 			wantModelOverride:     "sonnet",
+-			wantModelOverrideArgs: []string{"--model", "claude-sonnet-4-6"},
++			wantModelOverrideArgs: []string{"--model", "sonnet"},
+ 		},
+ 		{
+ 			profileID:             "codex/tmux-cli",
+diff --git a/internal/config/provider_test.go b/internal/config/provider_test.go
+index 66c14edca..18b16c534 100644
+--- a/internal/config/provider_test.go
++++ b/internal/config/provider_test.go
+@@ -72,8 +72,7 @@ func TestBuiltinProvidersClaude(t *testing.T) {
+
+ func TestBuiltinProvidersClaudeModelChoices(t *testing.T) {
+ 	p := BuiltinProviders()["claude"]
+-	var model OptionChoice
+-	var oldOpus OptionChoice
++	var opusChoice, oldOpus, sonnetChoice OptionChoice
+ 	for _, opt := range p.OptionsSchema {
+ 		if opt.Key != "model" {
+ 			continue
+@@ -81,14 +80,24 @@ func TestBuiltinProvidersClaudeModelChoices(t *testing.T) {
+ 		for _, choice := range opt.Choices {
+ 			switch choice.Value {
+ 			case "opus":
+-				model = choice
++				opusChoice = choice
+ 			case "opus-4-7":
+ 				oldOpus = choice
++			case "sonnet":
++				sonnetChoice = choice
+ 			}
+ 		}
+ 	}
+-	if !reflect.DeepEqual(model.FlagArgs, []string{"--model", "claude-opus-4-8"}) {
+-		t.Fatalf("opus FlagArgs = %v, want Opus 4.8", model.FlagArgs)
++	// "opus" and "sonnet" track the claude CLI's own alias resolution
++	// (--model opus / --model sonnet resolve to that tier's newest model),
++	// so this table cannot go stale the way it did (ga-98tv30: pinned to
++	// claude-opus-4-8 / claude-sonnet-4-6 long after both tiers moved on).
++	// "opus-4-7" is a deliberate pinned snapshot and must NOT track latest.
++	if !reflect.DeepEqual(opusChoice.FlagArgs, []string{"--model", "opus"}) {
++		t.Fatalf("opus FlagArgs = %v, want CLI alias --model opus", opusChoice.FlagArgs)
++	}
++	if !reflect.DeepEqual(sonnetChoice.FlagArgs, []string{"--model", "sonnet"}) {
++		t.Fatalf("sonnet FlagArgs = %v, want CLI alias --model sonnet", sonnetChoice.FlagArgs)
+ 	}
+ 	if !reflect.DeepEqual(oldOpus.FlagArgs, []string{"--model", "claude-opus-4-7"}) {
+ 		t.Fatalf("opus-4-7 FlagArgs = %v, want Opus 4.7 preserved", oldOpus.FlagArgs)
+diff --git a/internal/worker/builtin/profiles.go b/internal/worker/builtin/profiles.go
+index 7e30c256f..76807bc05 100644
+--- a/internal/worker/builtin/profiles.go
++++ b/internal/worker/builtin/profiles.go
+@@ -152,9 +152,18 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
+ 				Type:  "select",
+ 				Choices: []BuiltinOptionChoice{
+ 					{Value: "", Label: "Default"},
+-					{Value: "opus", Label: "Opus", FlagArgs: []string{"--model", "claude-opus-4-8"}, FlagAliases: [][]string{{"-m", "claude-opus-4-8"}}},
++					// "opus" and "sonnet" track the claude CLI's own alias
++					// resolution (--model opus / --model sonnet resolve to
++					// that tier's newest model — confirmed live 2026-09-24:
++					// pool sessions launched via claude-headless's
++					// args_append already pass "--model sonnet" and get
++					// claude-sonnet-5) instead of a pinned dated ID, so this
++					// table cannot go stale again the way it did (ga-98tv30:
++					// pinned to claude-opus-4-8 / claude-sonnet-4-6 long
++					// after both tiers moved on to Opus 5.5 / Sonnet 5).
++					{Value: "opus", Label: "Opus", FlagArgs: []string{"--model", "opus"}, FlagAliases: [][]string{{"-m", "opus"}}},
+ 					{Value: "opus-4-7", Label: "Opus 4.7", FlagArgs: []string{"--model", "claude-opus-4-7"}, FlagAliases: [][]string{{"-m", "claude-opus-4-7"}}},
+-					{Value: "sonnet", Label: "Sonnet", FlagArgs: []string{"--model", "claude-sonnet-4-6"}, FlagAliases: [][]string{{"-m", "claude-sonnet-4-6"}}},
++					{Value: "sonnet", Label: "Sonnet", FlagArgs: []string{"--model", "sonnet"}, FlagAliases: [][]string{{"-m", "sonnet"}}},
+ 					{Value: "haiku", Label: "Haiku", FlagArgs: []string{"--model", "claude-haiku-4-5-20251001"}, FlagAliases: [][]string{{"-m", "claude-haiku-4-5-20251001"}}},
+ 				},
+ 			},
