@@ -12,7 +12,10 @@ provider = "claude-headless"
 # arbitrary --settings flag racing another one on the same command line.
 # overlay_dir writes it into THIS session's own project-level
 # .claude/settings.json at spawn time — the documented, guaranteed-to-win path.
-overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"
+# ga-aijm2v.6: overlay próprio do revisor (só Bash/Read/Edit/Write; sem skills/plugins/CLAUDE.md do Mayor) + TD_ROLE.
+# Reverter: volte para .../pool e apague a linha env. Fonte: assets/claude-overlays/pool-roles.json.
+overlay_dir = "packs/town-deltas/assets/claude-overlays/pool-reviewer"
+env = { TD_ROLE = "reviewer" }
 scope = "city"
 wake_mode = "fresh"
 

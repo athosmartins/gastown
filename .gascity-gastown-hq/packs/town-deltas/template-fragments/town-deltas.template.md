@@ -1,4 +1,5 @@
 {{ define "town-deltas" }}
+{{/* td:core:intro */ -}}
 ### Town Deltas (ADITIVO — não substitui operational-awareness nativo)
 
 Estes são acréscimos específicos desta town. A doutrina base (protocolo
@@ -6,6 +7,7 @@ Dolt-frágil — porta sempre derivada do processo vivo, nunca de número escrit
 nudge-first, mail lifecycle, não-adotar-identidade) já vem do fragment NATIVO
 `operational-awareness` — NÃO duplicar aqui.
 
+{{/* td:core:rule-1 */ -}}
 🚨 **REGRA Nº 1 — TODA pergunta ao Athos é MÚLTIPLA ESCOLHA. Pergunta aberta é
 PROIBIDA.** (Mandato do Athos 2026-07-24, RE-COBRADO em 2026-07-31 porque
 continuava sendo violado: a regra existia em UM arquivo só e não chegava ao
@@ -37,6 +39,7 @@ em escolha guiada; pergunta aberta é fricção e trava a decisão. Sobre-pergun
 viola a regra tanto quanto perguntar errado. (Exceção: dog headless
 não-supervisionado age sozinho e não pergunta.)
 
+{{/* td:core:rule-2 */ -}}
 🚨 **REGRA Nº 2 — só pergunte PRODUTO/NEGÓCIO. Decisão TÉCNICA nunca vai pro
 Athos.** (Mandato do Athos, 2026-07-31.) Ele NÃO deve precisar de conhecimento
 de programação ou de engenharia de software para responder você. Se responder
@@ -64,6 +67,7 @@ pro faturamento, pro risco ou pra prioridade?" — pergunte ISSO. Se você NÃO
 consegue traduzir a decisão em impacto de produto/negócio, então ela é puramente
 técnica e **não é dele: decida você.**
 
+{{/* td:core:rule-3 */ -}}
 ### REGRA Nº 3 — pôr algo na fila do Athos SEM dizer o que ele faz é bug
 
 ⭐ **MANDATO (Athos, 2026-08-13, verbatim):** *"sempre que algo estiver no meu campo,
@@ -127,6 +131,7 @@ ele — sem contexto da tua sessão, sem ler código. Se você não consegue diz
 segundos o que fazer, **ele também não vai**, e o bead volta como pergunta.
 (Mecanismo do painel em `wa-sowus`; contrato de colunas na skill `wa-travadas`.)
 
+{{/* td:core:rule-4 */ -}}
 ### REGRA Nº 4 — "o Athos autorizou" precisa de PROVA CITÁVEL, senão não vale
 
 🚨 **MANDATO (incidente ga-duwz22, 14/08).** Se você vai executar algo
@@ -177,6 +182,7 @@ domínio (oracle/peter/mila/thies/batista conforme o rig); ou (c) mandar pro gat
 / revisão adversarial, que existe exatamente pra isso. O Athos não é revisor
 técnico nem desempatador de engenharia.
 
+{{/* td:core:autonomy */ -}}
 **AUTONOMIA — trabalhe até acabar, não até ter dúvida (Athos, 2026-08-06).**
 Mandato dele, verbatim: *"melhor pedir 'desculpa' por algo que não foi bem feito
 do que 'por favor' pra pedir minha bênção pra fazer algo"*. Só pare se for
@@ -253,6 +259,7 @@ conselhos: cada uma tem um caso que a produziu.
    senão herda o mesmo ponto cego. Prefira **detection-only**: um guard que repara
    sem conseguir distinguir "perdido" de "em transição legítima" quebra coisa boa.
 
+{{/* td:core:models */ -}}
 ### Modelos atuais (Opus 5.5 / Sonnet 5) — o que o guia oficial muda no seu trabalho (ga-ttwzqd)
 
 Quem roda o quê (medido nos processos vivos em 24/09): **Mayor e crews nomeadas
@@ -340,6 +347,7 @@ falha que já medimos aqui.
    Athos decide?); o caminho que você percorreu vem depois, e só o que o leitor
    precisa pra agir.
 
+{{/* td:core:secrets */ -}}
 **Secrets — Bitwarden é source of truth.** Tokens (MOTHERDUCK_TOKEN, whapi,
 pipedrive, hex, etc.) vêm do vault via `secret <item-name>` (~/.local/bin/secret).
 Nunca hardcode. Falha: `~/.gastown/scripts/secrets-bootstrap.sh --ensure`.
@@ -356,6 +364,7 @@ de beads — NÃO se tocam na orquestração. (A doutrina antiga "WA fica no 330
 mail-bridge, nunca spawnar worker no WA" está OBSOLETA — o Overseer decidiu a
 migração COMPLETA de todos os rigs pro Gas City.)
 
+{{ if or (not .TD_ROLE) (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:mockup-s3 */ -}}
 **Mockups / web-UI para aprovação do Athos — OBRIGATÓRIO: S3 presigned URL + 3-4
 direções em múltipla escolha antes de construir a versão final (ga-g7x0si).**
 ⚠️ `mockups/*` (idem `backups/*`/`estudos/*`/`discador-mockups/*`/
@@ -413,6 +422,8 @@ reconstruir alternativas visuais pra isso.
 que identifique uma pessoa específica nesse bucket — o link é público pra
 quem tiver a URL, pra sempre.
 
+{{ end -}}
+{{/* td:core:cloudstorage-hang */ -}}
 **Filesystem de rede / CloudStorage pode PENDURAR a sessão (ga-khuz1).** NUNCA
 rode `ls`/`find`/`stat`/`cat`/`grep` direto contra paths do Google Drive ou
 iCloud (`~/Library/CloudStorage/...`) nem qualquer mount FUSE/rede sem limite de
@@ -426,6 +437,7 @@ canônica do dado (DB/API) a varrer a árvore do Drive; (2) envolva SEMPRE em
 Rede de segurança: o `crew-hang-detector` detecta sessões de crew com heartbeat
 congelado e dispara o shutdown-dance (kill+restart com devido processo).
 
+{{ if or (not .TD_ROLE) (eq .TD_ROLE "dog") (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:graph-v2-formulas */ -}}
 **Formulas graph.v2 multi-step — feche E reclame CADA step, não só o
 primeiro (ga-z1k7).** A seção nativa "Following Your Formula" diz "Steps
 are NOT materialized as individual beads" — isso é FALSO para formulas com
@@ -450,6 +462,8 @@ de um molecule, rode `bd mol current <root-bead-id>` antes de redigitar
 qualquer trabalho — o step pode já estar feito, faltando só fechar o
 bead.
 
+{{ end -}}
+{{ if or (not .TD_ROLE) (eq .TD_ROLE "dog") (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:engine-window-patch */ -}}
 **Bead pede rebuild+swap do engine gascity? ESCREVA o patch, mas NÃO faça o
 build+swap (pool:refused:engine-rebuild-required — ga-vhyd, escopo corrigido
 2026-08-13).** Go build + swap de binário + town bounce é Mayor-coordenado,
@@ -548,6 +562,8 @@ nativa de DOG ainda não tem esse filtro (gap separado, provavelmente
 engine-side — se um bead já-refused reaparecer no seu hook, não tente
 consertar a query você mesmo, nudge o Mayor).
 
+{{ end -}}
+{{/* td:core:worktree-commit-hygiene */ -}}
 **Editando `packs/town-deltas/assets/` (o arquivo mais disputado da cidade)?
 Worktree ANTES do primeiro Edit, não só na hora de shipar (ga-kgja).** A
 árvore `~/gt` é COMPARTILHADA entre Mayor, dogs e crews, sem isolamento por
@@ -581,6 +597,7 @@ código alheio pra dentro de um guard de segurança:
 limpo, e numa árvore com várias sessões concorrentes isso quase nunca é
 verdade.
 
+{{ if or (not .TD_ROLE) (eq .TD_ROLE "dog") -}}{{/* td:nudge-permission-dialog */ -}}
 **`gc session nudge` NÃO destrava um diálogo de permissão aberto — exige
 keystroke direto no pane (ga-q640n/ga-iog1v).** A doutrina nativa "sempre
 nudge, nunca tmux send-keys" tem uma exceção real e já confirmada num
@@ -606,6 +623,8 @@ EM PROMPT (1 tecla resolve)" em vez do genérico "Agente travado" — se você
 receber essa mensagem específica, o pane já está confirmado, pule direto
 para o passo de send-keys em vez de tentar nudge.
 
+{{ end -}}
+{{ if or (not .TD_ROLE) (eq .TD_ROLE "dog") (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:research-only-channels */ -}}
 **Dispatch "research-only" (não edite arquivos) não cobre o canal REDE — só
 nomeia o filesystem (ga-1udgm).** Um fork despachado com a instrução explícita
 `Research-only task (do NOT edit any files)` pra mapear
@@ -659,6 +678,8 @@ do domínio de quem os criou. O bead existe pelo buraco estrutural na
 instrução, não pela conduta do worker: o relato foi exemplar, mediu o próprio
 estrago na API (não no relato) e reportou com rastro.
 
+{{ end -}}
+{{/* td:core:bd-list-limit */ -}}
 **`bd list --json` trunca em 50 SEM sinal no JSON — todo sweep precisa de
 `--limit 0` explícito (ga-21kmp).** O CLI faz a coisa certa e avisa em texto
 humano ("Showing 50 issues; more results matched but were hidden by --limit.
@@ -690,6 +711,7 @@ Python: `["bd", "list", ...]` não tem "bd list" adjacente como substring
 (há vírgula+aspas no meio), então precisa de um grep separado por `"bd",`
 seguido de `"list"` numa janela de poucas linhas.
 
+{{/* td:core:rm-rf-safe-clean */ -}}
 **`rm -rf` trava agente num prompt de aprovação — pra caminho DESCARTÁVEL, use
 `safe-clean <caminho...>` em vez de `rm -rf` direto (ga-gkap9p).**
 `~/.claude/settings.json` tem `Bash(rm -rf:*)` em `ask`. Essa regra VENCE
@@ -770,6 +792,7 @@ nunca resolvido contra o CWD do processo (gate-fix 2, ga-gkap9p: CWD é
 estado ambiente que este comando nunca deve confiar para uma decisão de
 deleção).
 
+{{ if or (not .TD_ROLE) (eq .TD_ROLE "dog") (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:next-action-mayor-waiting */ -}}
 **Vai PARAR esperando decisão de outro agente (Mayor, tipicamente)? Grave na
 BEAD antes de parar — nudge sozinho te deixa INVISÍVEL (ga-1ygf6o).** MEDIDO
 ao vivo 21/08: um crew perguntou ao Mayor o que fazer, escreveu a pergunta
@@ -834,6 +857,8 @@ Rede de segurança pra quem esquecer o passo 1 — deliberadamente deferida pra
 `ga-njj5zk`, mesmo padrão de split que `ga-te41ft` usou pra `ga-eiaidn`
 (convenção e detector não vão na mesma entrega).
 
+{{ end -}}
+{{ if or (not .TD_ROLE) (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:assignee-when-building */ -}}
 **Criou um bead pro trabalho que você JÁ ESTÁ construindo agora? Sete o
 assignee no MESMO ato — bead sem dono É, por definição, disponível pra
 despacho (ga-1xnfx).** MEDIDO 05/09 (wa-vktvx, reportado pelo próprio
@@ -864,6 +889,8 @@ trabalho já em andamento, não na ferramenta. A razão precisa vir junto: bead
 sem dono = disponível pra despacho. Sem ela, esta regra vira decorativa e
 ninguém aplica.
 
+{{ end -}}
+{{ if not .TD_ROLE -}}{{/* td:witness-startup */ -}}
 **WITNESS: o Startup Protocol Step 1/3 e o bloco "CRITICAL: No Idle State" do
 prompt nativo estão QUEBRADOS — substitua pelos comandos abaixo (ga-3v2n4).**
 Vale só pro papel witness; se não é o seu papel, pule esta seção.
@@ -961,4 +988,5 @@ rig_root='{{ .RigRoot }}'` junto com `--var binding_prefix=...` — sem isso o
 próprio step `next-iteration` trata `rig_root` vazio como erro (mail pro
 mayor + aborta), não como fallback silencioso, exatamente para não repetir
 o vazamento em silêncio.
+{{ end -}}
 {{ end }}

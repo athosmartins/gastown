@@ -8,6 +8,9 @@ provider = "claude-headless"
 # flags) — see agents/gate-reviewer/agent.toml for the full rationale. overlay_dir
 # writes the override into this session's own .claude/settings.json instead,
 # which Claude Code's docs explicitly guarantee wins.
-overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"
+# ga-aijm2v.6: overlay próprio do revisor (só Bash/Read/Edit/Write; sem skills/plugins/CLAUDE.md do Mayor) + TD_ROLE.
+# Reverter: volte para .../pool e apague a linha env. Fonte: assets/claude-overlays/pool-roles.json.
+overlay_dir = "packs/town-deltas/assets/claude-overlays/pool-reviewer"
+env = { TD_ROLE = "reviewer" }
 scope = "city"
 wake_mode = "fresh"

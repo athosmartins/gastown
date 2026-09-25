@@ -264,20 +264,31 @@ min_active_sessions = 1
 # .claude/settings.local.json wins even over a managed/global true) — every
 # agent using this overlay_dir now gets remoteControlAtStartup:false via the
 # guaranteed path, not just the permission-deny rules.
+# ga-aijm2v.6 (etapa 1 do "preâmbulo por papel"): dog / wa-worker / ps-worker deixam o overlay `pool`
+# genérico e ganham um overlay PRÓPRIO + TD_ROLE (escolhe as seções da doutrina town-deltas). Cada overlay
+# corta o que aquele papel não usa do contexto FIXO da sessão: schemas de tools (medido -24k tokens só isso),
+# CLAUDE.md/AGENTS.md/MEMORY do Mayor (-11k) e a listagem de skills (-4 a -7k).
+# FONTE ÚNICA: assets/claude-overlays/pool-roles.json -> `pool-preamble-build.py build` (o selftest falha se divergir).
+# REVERTER UM PAPEL: volte overlay_dir para .../pool e apague a linha env — agente sem TD_ROLE recebe a doutrina
+# inteira, byte-idêntico ao de antes (provado pelo selftest contra o `gc prime` real). Racional/medição:
+# docs/pool-preamble-per-role.md. boot/deacon/auto-refiner/context-check-reviewer seguem no `pool` (sem dados de uso).
 [[patches.agent]]
 dir = ""
 name = "gastown.dog"
-overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"
+overlay_dir = "packs/town-deltas/assets/claude-overlays/pool-dog"
+env = { TD_ROLE = "dog" }
 
 [[patches.agent]]
 dir = ""
 name = "wa-worker"
-overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"
+overlay_dir = "packs/town-deltas/assets/claude-overlays/pool-wa-worker"
+env = { TD_ROLE = "wa-worker" }
 
 [[patches.agent]]
 dir = ""
 name = "ps-worker"
-overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"
+overlay_dir = "packs/town-deltas/assets/claude-overlays/pool-ps-worker"
+env = { TD_ROLE = "ps-worker" }
 
 # ga-ymrx1 (31/08): valor REVERTIDO para 900000 -- o mesmo que o global do
 # Athos (~/.claude/settings.json). NAO baixe de volta para 300000 lendo o
