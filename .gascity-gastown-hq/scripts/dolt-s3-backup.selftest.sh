@@ -1040,5 +1040,180 @@ else
   done
 fi
 
+echo ""
+echo "── consecutive-failure-night escalation (ga-rt7ljo) ──"
+
+for fn in _backup_fail_streak_note_failure _backup_fail_streak_note_success \
+          _backup_fail_note do_mail_mayor notify_escalate _backup_escalate_if_needed; do
+  type "$fn" >/dev/null 2>&1 \
+    && ok "$fn defined by lib-mode source" \
+    || bad "$fn NOT defined — lib mode broken"
+done
+
+# ── _backup_fail_streak_note_failure / _success — per-db independent streak,
+# separate state/counter from the reseed margin-refusal streak above (this
+# one tracks whether the off-box backup ITSELF succeeded on a given run).
+echo "── _backup_fail_streak_note_failure / _success (per-db streak) ──"
+BFS_STATE_DIR="$(mktemp -d)"
+
+n1="$(BACKUP_FAIL_STREAK_DIR="$BFS_STATE_DIR" _backup_fail_streak_note_failure "hq")"
+[ "$n1" = "1" ] && ok "1st failure for hq: streak=1" || bad "1st failure for hq: expected streak=1, got '$n1'"
+n2="$(BACKUP_FAIL_STREAK_DIR="$BFS_STATE_DIR" _backup_fail_streak_note_failure "hq")"
+[ "$n2" = "2" ] && ok "2nd consecutive failure for hq: streak=2" || bad "2nd consecutive failure for hq: expected streak=2, got '$n2'"
+
+n_other="$(BACKUP_FAIL_STREAK_DIR="$BFS_STATE_DIR" _backup_fail_streak_note_failure "whatsapp_automation")"
+[ "$n_other" = "1" ] && ok "a DIFFERENT db's first failure does not inherit hq's streak" || bad "cross-db streak leak: expected 1, got '$n_other'"
+
+BACKUP_FAIL_STREAK_DIR="$BFS_STATE_DIR" _backup_fail_streak_note_success "hq"
+n3="$(BACKUP_FAIL_STREAK_DIR="$BFS_STATE_DIR" _backup_fail_streak_note_failure "hq")"
+[ "$n3" = "1" ] && ok "success resets hq's streak — next failure starts at 1 again" || bad "success did not reset streak: expected 1, got '$n3'"
+
+rm -rf "$BFS_STATE_DIR" 2>/dev/null || true
+
+# ── _backup_fail_note() — pure accumulation into FAILED_DBS_STREAK (the
+# per-store "quantos dias sem backup OK" the final summary line names) and
+# ESCALATE_DBS (only once a streak crosses BACKUP_FAIL_ALARM_THRESHOLD).
+echo "── _backup_fail_note() accumulation ──"
+BFN_STATE_DIR="$(mktemp -d)"
+BACKUP_FAIL_STREAK_DIR="$BFN_STATE_DIR"
+BACKUP_FAIL_ALARM_THRESHOLD=2
+FAILED_DBS_STREAK=""
+ESCALATE_DBS=""
+_backup_fail_note "hq"
+[ "$FAILED_DBS_STREAK" = " hq(1n)" ] && ok "1st failure recorded as hq(1n) in FAILED_DBS_STREAK" || bad "unexpected FAILED_DBS_STREAK after 1st failure: '$FAILED_DBS_STREAK'"
+[ -z "$ESCALATE_DBS" ] && ok "1st failure (streak=1 < threshold=2): ESCALATE_DBS stays empty" || bad "1st failure should NOT escalate — ESCALATE_DBS='$ESCALATE_DBS'"
+
+_backup_fail_note "hq"
+[ "$FAILED_DBS_STREAK" = " hq(1n) hq(2n)" ] && ok "2nd consecutive failure appended as hq(2n)" || bad "unexpected FAILED_DBS_STREAK after 2nd failure: '$FAILED_DBS_STREAK'"
+[ "$ESCALATE_DBS" = " hq(2n)" ] && ok "2nd consecutive failure (streak=2 >= threshold=2): ESCALATE_DBS names hq" || bad "2nd consecutive failure should escalate — ESCALATE_DBS='$ESCALATE_DBS'"
+
+unset BACKUP_FAIL_STREAK_DIR BACKUP_FAIL_ALARM_THRESHOLD FAILED_DBS_STREAK ESCALATE_DBS
+rm -rf "$BFN_STATE_DIR" 2>/dev/null || true
+
+# ── end-to-end routing proof (the bead's own acceptance criterion): 1
+# isolated failure must NOT escalate (stays on notify_fail's default digest
+# route, untouched by this fix); the SAME store failing 2 CONSECUTIVE runs
+# MUST mail the Mayor and force a real push. Real subprocess stubs for both
+# `notify` and the mail sender — the notify stub records what IT sees in ITS
+# OWN environment (same technique as the AWS_REQUEST_CHECKSUM_CALCULATION
+# proof above), proving NOTIFY_FORCE_PUSH is genuinely exported to the
+# child, not just asserted in-process.
+echo "── end-to-end: 1 falha isolada → sem escalação; 2 seguidas → mail+push forçado (ga-rt7ljo) ──"
+ESC_STUB_DIR="$(mktemp -d)"
+ESC_NOTIFY_CALLS="$(mktemp)"
+ESC_MAIL_CALLS="$(mktemp)"
+ESC_STATE_DIR="$(mktemp -d)"
+ESC_LOG="$(mktemp)"
+
+cat > "$ESC_STUB_DIR/notify" <<'STUB'
+#!/bin/bash
+printf 'FORCE=%s ARGS=%s\n' "${NOTIFY_FORCE_PUSH:-<unset>}" "$*" >> "$ESC_NOTIFY_CALLS"
+exit 0
+STUB
+chmod +x "$ESC_STUB_DIR/notify"
+cat > "$ESC_STUB_DIR/fake_mail" <<'STUB'
+#!/bin/bash
+printf 'SUBJECT=%s BODY=%s\n' "$1" "$2" >> "$ESC_MAIL_CALLS"
+exit 0
+STUB
+chmod +x "$ESC_STUB_DIR/fake_mail"
+export ESC_NOTIFY_CALLS ESC_MAIL_CALLS
+
+# Plain (non-prefixed) assignments: _backup_fail_note and
+# _backup_escalate_if_needed must share FAILED_DBS_STREAK/ESCALATE_DBS
+# across the two calls within the same simulated "run" — a `VAR=val cmd`
+# prefix does NOT persist a function's mutation past that one command
+# (verified: prefixed vars revert once the command returns), so this needs
+# real (if temporary, scoped to this block) global assignment, restored
+# below.
+_ESC_SAVE_NOTIFY="$NOTIFY"; _ESC_SAVE_LOG="$LOG"
+NOTIFY="$ESC_STUB_DIR/notify"
+BACKUP_FAIL_FAKE_MAIL="$ESC_STUB_DIR/fake_mail"
+BACKUP_FAIL_STREAK_DIR="$ESC_STATE_DIR"
+BACKUP_FAIL_ALARM_THRESHOLD=2
+LOG="$ESC_LOG"
+
+# Night 1: hq fails ONCE (streak becomes 1, below threshold=2).
+: > "$ESC_NOTIFY_CALLS"; : > "$ESC_MAIL_CALLS"
+FAILED_DBS_STREAK=""; ESCALATE_DBS=""
+_backup_fail_note "hq"
+_backup_escalate_if_needed
+[ ! -s "$ESC_MAIL_CALLS" ] && ok "night 1 (isolated failure): do_mail_mayor NOT called" || bad "night 1: mail should NOT have fired on an isolated failure — got: $(cat "$ESC_MAIL_CALLS")"
+[ ! -s "$ESC_NOTIFY_CALLS" ] && ok "night 1 (isolated failure): notify_escalate (forced push) NOT called" || bad "night 1: forced push should NOT have fired on an isolated failure — got: $(cat "$ESC_NOTIFY_CALLS")"
+
+# Night 2: hq fails AGAIN — SAME BACKUP_FAIL_STREAK_DIR, i.e. the same
+# on-disk state a second real nightly run would see. Streak reaches 2 →
+# MUST escalate: mail naming hq's streak, and notify with a genuinely
+# forced push.
+: > "$ESC_NOTIFY_CALLS"; : > "$ESC_MAIL_CALLS"
+FAILED_DBS_STREAK=""; ESCALATE_DBS=""
+_backup_fail_note "hq"
+_backup_escalate_if_needed
+[ -s "$ESC_MAIL_CALLS" ] && ok "night 2 (2nd consecutive failure): do_mail_mayor WAS called" || bad "night 2: mail should have fired on the 2nd consecutive failure"
+grep -qF "hq(2n)" "$ESC_MAIL_CALLS" && ok "night 2: mail content names hq with its streak length (2n)" || bad "night 2: mail content should name hq(2n) — got: $(cat "$ESC_MAIL_CALLS")"
+[ -s "$ESC_NOTIFY_CALLS" ] && ok "night 2 (2nd consecutive failure): notify was invoked" || bad "night 2: notify should have fired"
+grep -qF "FORCE=1" "$ESC_NOTIFY_CALLS" && ok "night 2: the notify SUBPROCESS actually saw NOTIFY_FORCE_PUSH=1 in its own environment — a genuine forced push, not just an in-process assertion" || bad "night 2: notify subprocess did not see NOTIFY_FORCE_PUSH=1 — got: $(cat "$ESC_NOTIFY_CALLS")"
+
+# Night 3: a SUCCESS resets the streak — a later isolated failure must NOT
+# re-escalate immediately (proves the reset actually wires into the
+# end-to-end path, not just the unit-level streak counter tested above).
+_backup_fail_streak_note_success "hq"
+: > "$ESC_NOTIFY_CALLS"; : > "$ESC_MAIL_CALLS"
+FAILED_DBS_STREAK=""; ESCALATE_DBS=""
+_backup_fail_note "hq"
+_backup_escalate_if_needed
+[ ! -s "$ESC_MAIL_CALLS" ] && ok "night 3 (after a success reset the streak): a lone new failure does NOT re-escalate" || bad "night 3: streak reset did not take effect — mail fired again on a single post-reset failure"
+
+NOTIFY="$_ESC_SAVE_NOTIFY"; LOG="$_ESC_SAVE_LOG"
+rm -rf "$ESC_STUB_DIR" "$ESC_STATE_DIR" 2>/dev/null || true
+rm -f "$ESC_NOTIFY_CALLS" "$ESC_MAIL_CALLS" "$ESC_LOG" 2>/dev/null || true
+unset BACKUP_FAIL_STREAK_DIR BACKUP_FAIL_ALARM_THRESHOLD BACKUP_FAIL_FAKE_MAIL FAILED_DBS_STREAK ESCALATE_DBS ESC_NOTIFY_CALLS ESC_MAIL_CALLS
+
+# ── drift-guard: live script actually wires the escalation into every
+# failure exit + the success path + the final summary, not just declares it ──
+echo "── drift-guard: escalation wiring present in live script (ga-rt7ljo) ──"
+callsites="$(grep -cF '_backup_fail_note "$db"' "$SCRIPT")"
+[ "$callsites" -eq 6 ] \
+  && ok "exactly 6 occurrences of _backup_fail_note \"\$db\" (1 per failure exit: disco x2, sync x3, s3 x1 — every FAILED_DBS append site has a matching streak-note call)" \
+  || bad "expected exactly 6 occurrences of _backup_fail_note \"\$db\", got $callsites — a failure exit was added/removed without updating the streak wiring"
+if grep -qF '_backup_fail_streak_note_success "$db"' "$SCRIPT"; then
+  ok "success path resets the per-db streak (_backup_fail_streak_note_success called)"
+else
+  bad "success path does not call _backup_fail_streak_note_success — a resolved db would keep an old streak forever"
+fi
+SUCCESS_RESET_LINE=$(grep -nF '_backup_fail_streak_note_success "$db"' "$SCRIPT" | head -1 | cut -d: -f1)
+OK_INCR_LINE2=$(grep -nF 'ok=$((ok+1))' "$SCRIPT" | head -1 | cut -d: -f1)
+if [ -n "$SUCCESS_RESET_LINE" ] && [ -n "$OK_INCR_LINE2" ] && [ "$SUCCESS_RESET_LINE" -gt "$OK_INCR_LINE2" ]; then
+  ok "streak reset happens AFTER ok=\$((ok+1)) — matches the established convention of counting the core outcome before any side-effect helper runs"
+else
+  bad "streak reset is not positioned after the ok counter increment"
+fi
+if grep -qF 'notify_fail "backup off-box: $failed/$total store(s) FALHARAM:${FAILED_DBS} — noites seguidas sem backup OK:${FAILED_DBS_STREAK}"' "$SCRIPT"; then
+  ok "final summary line names FAILED_DBS_STREAK (the bead's own requirement: which store, how many nights)"
+else
+  bad "final summary line does not include the per-store nights-without-OK-backup detail"
+fi
+if grep -qF '_backup_escalate_if_needed' "$SCRIPT"; then
+  ESCALATE_CALL_LINE=$(grep -nF '_backup_escalate_if_needed' "$SCRIPT" | tail -1 | cut -d: -f1)
+  FAILED_GT0_LINE=$(grep -nF 'if [ "$failed" -gt 0 ]; then' "$SCRIPT" | head -1 | cut -d: -f1)
+  if [ -n "$ESCALATE_CALL_LINE" ] && [ -n "$FAILED_GT0_LINE" ] && [ "$ESCALATE_CALL_LINE" -gt "$FAILED_GT0_LINE" ]; then
+    ok "_backup_escalate_if_needed is called inside the failed>0 summary block — wiring is live, not dead code"
+  else
+    bad "_backup_escalate_if_needed call is not positioned inside the failed>0 block as expected"
+  fi
+else
+  bad "_backup_escalate_if_needed is defined but never called in the live flow"
+fi
+if grep -qF 'total=0; ok=0; failed=0; FAILED_DBS=""; FAILED_DBS_STREAK=""; ESCALATE_DBS=""' "$SCRIPT"; then
+  ok "FAILED_DBS_STREAK/ESCALATE_DBS are initialized once per run, alongside FAILED_DBS (set -u safe)"
+else
+  bad "FAILED_DBS_STREAK/ESCALATE_DBS initialization missing or changed shape — set -u would abort the run on first reference"
+fi
+if grep -qF 'gc mail send mayor' "$SCRIPT"; then
+  ok "do_mail_mayor's real (non-stubbed) path actually calls gc mail send mayor"
+else
+  bad "do_mail_mayor does not wire to gc mail send mayor — escalation would never reach a real Mayor mailbox"
+fi
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

@@ -229,6 +229,97 @@ _margin_refusal_reset() {
   rm -f "$MARGIN_REFUSAL_STATE_DIR/$1" 2>/dev/null || true
 }
 
+# ga-rt7ljo: consecutive-failure-NIGHT escalation — distinct from the reseed
+# margin-refusal streak above (that one tracks the best-effort LOCAL staging
+# shrink that only runs AFTER a backup already succeeded; this one tracks
+# whether the off-box S3 backup ITSELF succeeded on a given run). Measured
+# 2026-09-25 (Mayor): hq and whatsapp_automation both failed their off-box
+# backup for 3 consecutive nights and nobody knew — every notify_fail call
+# for "Dolt S3 backup" routes to the DIGEST by default (its title isn't on
+# the push allowlist; see notify's own classify_route_detail), so neither
+# the Mayor nor Athos saw it until someone read the log by hand. A single
+# bad night is expected/self-healing (server blip, transient load under a
+# hot store) and should stay quiet on the digest; the SAME store failing
+# across >= 2 consecutive RUNS is the signal that something needs a human,
+# and escalates to a channel that can't be missed: gc mail send mayor
+# (durable, actionable — he can free disk / trigger a reseed) AND a forced
+# ntfy push (NOTIFY_FORCE_PUSH=1 — the routing allowlist wouldn't otherwise
+# match this title). Per-db, same fail-soft posture as
+# _margin_refusal_count_after_increment: a bookkeeping failure here must
+# never block the backup flow itself, only ever downgrade this escalation.
+BACKUP_FAIL_STREAK_DIR="${BACKUP_FAIL_STREAK_DIR:-$CITY/.gc/logs/.dolt-s3-backup-fail-streak}"
+BACKUP_FAIL_ALARM_THRESHOLD="${BACKUP_FAIL_ALARM_THRESHOLD:-2}"
+
+# _backup_fail_streak_note_failure <db> — increments (creating if absent) the
+# per-db consecutive-run-failure counter and echoes the NEW count.
+_backup_fail_streak_note_failure() {
+  local db="$1" f n
+  if ! mkdir -p "$BACKUP_FAIL_STREAK_DIR" 2>/dev/null; then
+    echo "$BACKUP_FAIL_ALARM_THRESHOLD"
+    return
+  fi
+  f="$BACKUP_FAIL_STREAK_DIR/$db"
+  n="$(cat "$f" 2>/dev/null)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  n=$((n+1))
+  echo "$n" > "$f" 2>/dev/null
+  echo "$n"
+}
+
+# _backup_fail_streak_note_success <db> — resets the streak: called whenever
+# this db's off-box backup completes OK this run, so a LATER failure starts
+# counting from a fresh night, not an old one.
+_backup_fail_streak_note_success() {
+  rm -f "$BACKUP_FAIL_STREAK_DIR/$1" 2>/dev/null || true
+}
+
+# _backup_fail_note <db> — call exactly once per db that failed its off-box
+# backup this run (any reason — disco/sync/s3), from whichever of the loop's
+# several failure exits hit. Records "<db>(<n>n)" into FAILED_DBS_STREAK —
+# the "quantos dias sem backup OK" the final summary line names per store —
+# and, once the streak reaches BACKUP_FAIL_ALARM_THRESHOLD, appends db to
+# ESCALATE_DBS so _backup_escalate_if_needed (below) fires afterward.
+# Requires FAILED_DBS_STREAK/ESCALATE_DBS already initialized by the caller
+# (set -u is active; the live flow inits both alongside FAILED_DBS below).
+_backup_fail_note() {
+  local db="$1" n
+  n="$(_backup_fail_streak_note_failure "$db")"
+  FAILED_DBS_STREAK="$FAILED_DBS_STREAK ${db}(${n}n)"
+  if [ "$n" -ge "$BACKUP_FAIL_ALARM_THRESHOLD" ]; then
+    ESCALATE_DBS="$ESCALATE_DBS ${db}(${n}n)"
+  fi
+}
+
+# do_mail_mayor <subject> <body> — stubbable in selftest via
+# BACKUP_FAIL_FAKE_MAIL (same idiom as funnel-flow-healer.sh's own
+# do_mail_mayor). Fail-soft: a mail-send error must never abort the backup.
+do_mail_mayor() {
+  local subj="$1" body="$2"
+  if [ -n "${BACKUP_FAIL_FAKE_MAIL:-}" ]; then
+    "$BACKUP_FAIL_FAKE_MAIL" "$subj" "$body"; return $?
+  fi
+  ( cd "$CITY" && GC_CITY="$CITY" gc mail send mayor -s "$subj" -m "$body" >/dev/null 2>&1 ) || true
+}
+
+# notify_escalate <message> — like notify_fail, but forces a PUSH
+# (NOTIFY_FORCE_PUSH=1) instead of letting the title fall through to the
+# default digest route — for the 2+-consecutive-night escalation only, never
+# for an isolated failure (see memory notify-default-digest-new-alert-silent).
+notify_escalate() {
+  NOTIFY_FORCE_PUSH=1 "$NOTIFY" -t "Dolt S3 backup" -p 5 "🚨 $*" 2>/dev/null || true
+}
+
+# _backup_escalate_if_needed — called once after the per-db loop. No-op
+# unless ESCALATE_DBS is non-empty (i.e. at least one db's streak crossed
+# BACKUP_FAIL_ALARM_THRESHOLD this run) — an isolated single-night failure
+# must never reach this.
+_backup_escalate_if_needed() {
+  [ -n "$ESCALATE_DBS" ] || return 0
+  do_mail_mayor "Dolt S3 backup: sem backup off-box há 2+ noites seguidas" \
+    "backup off-box FALHOU por 2+ noites seguidas em:${ESCALATE_DBS}. Ação: libere disco / rode o reseed manual (dolt-backup-reseed.sh) / veja $LOG."
+  notify_escalate "backup off-box: 2+ noites seguidas sem backup OK em:${ESCALATE_DBS} — mail enviado ao Mayor. Ver $LOG."
+}
+
 # ga-odtd3f: neither the initial CALL DOLT_BACKUP('sync', ...) attempt below
 # nor its retry/fallback paths (_sync_with_connection_timeout_retry,
 # _sync_with_stale_manifest_recovery, the offline-sync fallback) had ANY
@@ -572,7 +663,7 @@ DBS="$(dsql -q "SHOW DATABASES" --result-format csv 2>/dev/null | tail -n +2 \
         | grep -vxE 'information_schema|mysql|dolt')"
 if [ -z "$DBS" ]; then log "FATAL: no databases discovered"; notify_fail "backup off-box: nenhum banco descoberto"; exit 0; fi
 
-total=0; ok=0; failed=0; FAILED_DBS=""
+total=0; ok=0; failed=0; FAILED_DBS=""; FAILED_DBS_STREAK=""; ESCALATE_DBS=""
 for db in $DBS; do
   total=$((total+1))
   dest="$BACKUP_ROOT/$db"
@@ -587,7 +678,8 @@ for db in $DBS; do
   head="$(dsql -q "SELECT commit_hash FROM \`$db\`.dolt_log ORDER BY date DESC LIMIT 1" --result-format csv 2>/dev/null | tail -1)"
   # 1) native consistent backup -> local staging (incremental)
   if ! _sync_disk_preflight "$db"; then
-    failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(disco)"; continue
+    failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(disco)"
+    _backup_fail_note "$db"; continue
   fi
   if ! DOLT_CLI_PASSWORD='' timeout "$SYNC_TIMEOUT" "$DOLT" --host "$HOST" --port "$PORT" \
         --user root --no-tls sql -q "USE \`$db\`; CALL DOLT_BACKUP('sync', '${db}-backup');" > "$SYNC_OUT" 2>&1; then
@@ -599,7 +691,8 @@ for db in $DBS; do
       # server-free _offline_backup_sync the connection-timeout branch below
       # already uses, before counting this db as failed.
       if ! _sync_with_stale_manifest_recovery "$db" "$dest"; then
-        failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"; continue
+        failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"
+        _backup_fail_note "$db"; continue
       fi
     elif is_connection_timeout_error "$(cat "$SYNC_OUT")"; then
       # Transient/load-dependent (ga-gdsq5) — staging itself is fine, only the
@@ -614,20 +707,24 @@ for db in $DBS; do
         # the server-free path before giving up on this db.
         log "$db: connection-timeout retries exhausted — falling back to offline sync (no server involved)"
         if ! _sync_disk_preflight "$db"; then
-          failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(disco)"; continue
+          failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(disco)"
+          _backup_fail_note "$db"; continue
         fi
         if ! _offline_backup_sync "$db" "$dest"; then
-          failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"; continue
+          failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"
+          _backup_fail_note "$db"; continue
         fi
         log "$db: offline-sync fallback OK"
       fi
     else
-      log "$db: DOLT_BACKUP sync FAILED"; failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"; continue
+      log "$db: DOLT_BACKUP sync FAILED"; failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"
+      _backup_fail_note "$db"; continue
     fi
   fi
   # 2) off-box mirror -> S3 (incremental; prune orphans; versioning retains history)
   if ! timeout "$S3_TIMEOUT" "$AWS" s3 sync "$dest/" "$S3/$db/" --delete --only-show-errors >> "$LOG" 2>&1; then
-    log "$db: aws s3 sync FAILED"; failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(s3)"; continue
+    log "$db: aws s3 sync FAILED"; failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(s3)"
+    _backup_fail_note "$db"; continue
   fi
   # fingerprint: issue count AS OF the exact captured commit (self-consistent + present
   # in the backup), so a restorer can verify: restore, then COUNT(*) issues AS OF <head>.
@@ -641,6 +738,7 @@ for db in $DBS; do
   printf '%s\t%s\t%s\t%s\n' "$db" "$cnt" "${head:-}" "${sz:-}" >> "$RAW"
   log "$db: OK (issues=$cnt head=${head:-?} size=${sz:-?})"
   ok=$((ok+1))
+  _backup_fail_streak_note_success "$db"
   # ga-8f1uh0: best-effort space reclaim, AFTER the counters above already
   # reflect this run's real backup outcome — its own success/failure is
   # logged and (when non-disk) notified inside the helper, but never changes
@@ -688,7 +786,8 @@ fi
 
 log "=== run complete: ok=$ok failed=$failed total=$total jsonl_offsite=$JSONL_OFFSITE_STATUS ==="
 if [ "$failed" -gt 0 ]; then
-  notify_fail "backup off-box: $failed/$total store(s) FALHARAM:${FAILED_DBS}"
+  notify_fail "backup off-box: $failed/$total store(s) FALHARAM:${FAILED_DBS} — noites seguidas sem backup OK:${FAILED_DBS_STREAK}"
+  _backup_escalate_if_needed
 fi
 if [ "$JSONL_OFFSITE_STATUS" = "failed" ]; then
   notify_fail "backup off-box: cópia offsite do JSONL não subiu (ver $LOG)"
