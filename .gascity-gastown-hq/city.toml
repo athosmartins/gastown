@@ -365,6 +365,67 @@ dir = ""
 name = "peter-wa"
 overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived"
 
+# ga-ttwzqd: explicit --effort per role. Without an option_defaults.effort the
+# builtin:claude provider launches with `--effort max` — measured on the live
+# processes 2026-09-24: the Mayor (Opus 5.5) and EVERY headless pool session
+# (dog, gate/refino/context-check reviewers, auto-refiner, wa-worker,
+# ps-worker — all Sonnet 5 via claude-headless's --model sonnet) ran at max;
+# only the named crews, which set effort="high" in their own agent.toml, did
+# not. Anthropic's guidance for these models: Sonnet 5 defaults to high, uses
+# xhigh for the hardest coding and treats max as unconstrained spend; Opus 5.5
+# defaults to medium, thinks more per turn than Opus 5 at the same level, and
+# xhigh/max are for measured gains. Nothing here measured max beating xhigh, so:
+#   xhigh — roles doing the city's hardest reasoning or code (Mayor
+#           coordination, dog infra work, wa/ps builders, gate reviewers,
+#           whose recall is the gate's whole value);
+#   high  — triage/refinement roles (refino and context-check reviewers,
+#           auto-refiner): Sonnet 5's own default, recommended for most work.
+# Crews keep their agent.toml "high". Suspended roles (boot, deacon) and the
+# unused per-rig witness/refinery/polecat are left alone on purpose.
+# Takes effect on each session's NEXT launch; the post-merge soft reload
+# (ga-hawi) keeps running sessions from being drained over the new hash.
+# Revert per role by deleting its block; judge by gate verdict quality and
+# rework rate, not by feel.
+[[patches.agent]]
+dir = ""
+name = "gastown.mayor"
+option_defaults = { effort = "xhigh" }
+
+[[patches.agent]]
+dir = ""
+name = "gastown.dog"
+option_defaults = { effort = "xhigh" }
+
+[[patches.agent]]
+dir = ""
+name = "wa-worker"
+option_defaults = { effort = "xhigh" }
+
+[[patches.agent]]
+dir = ""
+name = "ps-worker"
+option_defaults = { effort = "xhigh" }
+
+[[patches.agent]]
+dir = ""
+name = "gate-reviewer"
+option_defaults = { effort = "xhigh" }
+
+[[patches.agent]]
+dir = ""
+name = "refino-gate-reviewer"
+option_defaults = { effort = "high" }
+
+[[patches.agent]]
+dir = ""
+name = "context-check-reviewer"
+option_defaults = { effort = "high" }
+
+[[patches.agent]]
+dir = ""
+name = "auto-refiner"
+option_defaults = { effort = "high" }
+
 [daemon]
 # nudge_dispatcher: EXPLICITAMENTE "legacy" — nao remova sem MEDIR (ga-yxuab).
 # O modo runtime (socket wake) e melhor no papel: o poll `gc nudge poll` por sessao
