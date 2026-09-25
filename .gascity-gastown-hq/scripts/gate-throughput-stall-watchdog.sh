@@ -193,6 +193,165 @@ _gtsw_measure_sweep_cadence_sec() {
   return 0
 }
 
+# ── ga-a6etc2: HEAD-OF-LINE REPEAT detector ──────────────────────────────────
+# WHY (2026-09-25): one marker won 28+ consecutive dispatcher sweeps from 09:44 to
+# 11:06 while 23 others waited, and NOTHING alarmed for 82 minutes — the Athos saw
+# it before any detector did. The stall check below could never have fired: it
+# needs GTSW_STALL_MINUTES (165) without a "Gate PASSED", and 82 < 165. Worse, the
+# selection logic that caused the jam is blind to its own repetition by
+# construction (it re-derives "who is first" from scratch every sweep), so a
+# detector has to read what the sweeps DID, not what the queue looks like.
+#
+# SIGNATURE (deliberately the inverse of the consumer's blind spot): the trailing
+# run of dispatcher outcomes is >= GTSW_HOL_MIN_SWEEPS "Dispatcher sweep complete:
+# branch=<same>" lines, with no reviewer spawned in between, and at least one OTHER
+# marker is queued. A `sweep complete` line is only ever logged for a sweep that
+# did NOT spawn reviewers (spawning sweeps log "Spawning N independent reviewer
+# session(s)" and exit) — so N of them on one branch is a retry loop with no
+# legitimate reading. A spawn line BREAKS the run (it proves the gate did real
+# work in between); sweeps that ended early (quiet hours, headroom defer, nothing
+# eligible) log neither and neither extend nor break it.
+#
+# DETECTION-ONLY: no kickstart, no auto-park. A kickstart cannot fix a
+# deterministic selection, and repairing a marker the detector cannot prove is
+# lost (vs. legitimately mid-retry) is exactly how a guard breaks good work.
+# It mails the Mayor once per branch per GATE_HOL_COOLDOWN_S with the marker id
+# and the unblock command, and logs every decision (alert, suppression, and the
+# reason for each) so a silent detector is distinguishable from a dead one.
+# Fail-safe: any unreadable signal (timestamp, marker JSON) is UNKNOWN -> no
+# verdict, logged; never "no HOL" by default and never an alert by default.
+GTSW_HOL_MIN_SWEEPS="${GTSW_HOL_MIN_SWEEPS:-5}"
+case "$GTSW_HOL_MIN_SWEEPS" in ''|*[!0-9]*|0) GTSW_HOL_MIN_SWEEPS=5 ;; esac
+GTSW_HOL_RECENT_SECS="${GTSW_HOL_RECENT_SECS:-2400}"    # ignore an episode that ended >40min ago
+case "$GTSW_HOL_RECENT_SECS" in ''|*[!0-9]*|0) GTSW_HOL_RECENT_SECS=2400 ;; esac
+GATE_HOL_COOLDOWN_S="${GATE_HOL_COOLDOWN_S:-3600}"      # one mail per branch per hour
+case "$GATE_HOL_COOLDOWN_S" in ''|*[!0-9]*) GATE_HOL_COOLDOWN_S=3600 ;; esac
+
+# Prints "<branch>\t<count>\t<last-timestamp>" for the trailing run of identical-
+# branch `sweep complete` outcomes in the log text, or nothing when there is no
+# such run (empty text, no sweep-complete lines, or the newest outcome is a
+# reviewer spawn). Pure: no I/O beyond stdin/stdout.
+_gtsw_hol_trailing_run() {
+  printf '%s\n' "$1" | awk '
+    /Dispatcher sweep complete: branch=/ {
+      b = $0; sub(/.*Dispatcher sweep complete: branch=/, "", b); sub(/ .*/, "", b)
+      n++; br[n] = b; tt[n] = substr($0, 2, 19); next
+    }
+    /Spawning [0-9]+ independent reviewer/ { n++; br[n] = "@SPAWN@"; tt[n] = substr($0, 2, 19); next }
+    END {
+      if (n == 0) exit
+      last = br[n]
+      if (last == "@SPAWN@") exit
+      c = 0
+      for (i = n; i >= 1; i--) { if (br[i] == last) c++; else break }
+      printf "%s\t%d\t%s\n", last, c, tt[n]
+    }'
+}
+
+# _gtsw_hol_repeat_check <log_lines> <active_markers_json> <now_epoch>
+# Always returns 0: an HOL alert is a side effect, never a change to run_sweep's
+# own stall verdict/exit code.
+_gtsw_hol_repeat_check() {
+  local log_lines="$1" markers_json="$2" now="$3"
+  local run branch cnt last_ts last_ep age others hol_ids
+  run="$(_gtsw_hol_trailing_run "$log_lines")"
+  [ -n "$run" ] || return 0
+  IFS=$'\t' read -r branch cnt last_ts <<< "$run"
+  case "$cnt" in ''|*[!0-9]*) return 0 ;; esac
+  [ -n "$branch" ] || return 0
+  [ "$cnt" -ge "$GTSW_HOL_MIN_SWEEPS" ] || return 0
+
+  last_ep="$(date -j -f "%Y-%m-%d %H:%M:%S" "$last_ts" +%s 2>/dev/null)" || last_ep=""
+  case "$last_ep" in ''|*[!0-9]*)
+    log "WARN: HOL check: $cnt consecutive sweeps on $branch but cannot parse the newest timestamp '$last_ts' — UNKNOWN, no verdict (fail-open)"
+    return 0 ;;
+  esac
+  age=$(( now - last_ep ))
+  if [ "$age" -gt "$GTSW_HOL_RECENT_SECS" ]; then
+    log "HOL check: trailing run of $cnt sweeps on $branch ended ${age}s ago (> ${GTSW_HOL_RECENT_SECS}s) — a finished episode, not alerting"
+    return 0
+  fi
+
+  # Is anyone actually WAITING behind it? A lone marker being retried is not head-
+  # of-line blocking — nothing is being starved.
+  others="$(printf '%s' "$markers_json" | jq --arg b "branch:$branch" \
+    '[.[] | select((.labels // []) | index("gate-status:queued")) | select(((.labels // []) | index($b)) == null)] | length' 2>/dev/null)"
+  case "$others" in ''|*[!0-9]*)
+    log "WARN: HOL check: $cnt consecutive sweeps on $branch but the active-marker JSON is unreadable — UNKNOWN, no verdict (fail-open)"
+    return 0 ;;
+  esac
+  if [ "$others" -lt 1 ]; then
+    log "HOL check: $cnt consecutive sweeps on $branch but no OTHER marker is queued — a lone retry starves nobody, not alerting"
+    return 0
+  fi
+
+  hol_ids="$(printf '%s' "$markers_json" | jq -r --arg b "branch:$branch" \
+    '[.[] | select((.labels // []) | index($b)) | .id] | join(",")' 2>/dev/null)"
+  [ -n "$hol_ids" ] || hol_ids="unknown (branch label not found on any active marker)"
+
+  local safe state
+  safe="$(printf '%s' "$branch" | tr -c 'A-Za-z0-9._-' '_')"
+  state="${GTSW_STATE_DIR}/gate-hol-alert-${safe}"
+  if [ -f "$state" ]; then
+    local last_alert; last_alert="$(cat "$state" 2>/dev/null)"
+    case "$last_alert" in ''|*[!0-9]*) last_alert=0 ;; esac
+    if [ "$last_alert" -gt 0 ] && [ "$(( now - last_alert ))" -lt "$GATE_HOL_COOLDOWN_S" ]; then
+      log "HOL PERSISTS: $cnt consecutive sweeps on $branch (marker $hol_ids), $others waiting — Mayor already mailed $(( now - last_alert ))s ago (cooldown ${GATE_HOL_COOLDOWN_S}s), suppressing dup"
+      return 0
+    fi
+  fi
+
+  log "HOL DETECTED: $cnt consecutive sweeps on $branch (marker $hol_ids) with no reviewer spawned, $others other marker(s) queued behind it"
+  if [ "${GTSW_DRY_RUN:-0}" = "1" ]; then
+    log "DRY_RUN: would mail Mayor about the head-of-line repeat on $branch"
+    return 0
+  fi
+
+  local subject="Watchdog: GATE HEAD-OF-LINE — $branch ganhou $cnt varreduras seguidas com $others marker(s) esperando"
+  local body
+  body="$(cat <<BODY
+GATE HEAD-OF-LINE detectado pelo gate-throughput-stall-watchdog (ga-a6etc2).
+
+O dispatcher processou a MESMA branch em $cnt varreduras seguidas, sem spawnar nenhum
+revisor, enquanto $others outro(s) marker(s) esperavam na fila.
+
+  branch:  $branch
+  marker:  $hol_ids
+  última varredura: $last_ts (${age}s atrás)
+
+POR QUE O STALL-WATCHDOG NORMAL NÃO PEGA: ele só dispara após ${GTSW_STALL_MINUTES}min sem
+"Gate PASSED". Um HOL de 82min (25/09) fica abaixo disso. Este detector olha o que as
+varreduras FIZERAM (mesma branch repetida), não o tamanho da fila.
+
+CAUSA MAIS PROVÁVEL: o marker está em retry (gate:rebase-fail-count / gate:exiled-tier5) e
+não está saindo da frente. Desde o ga-a6etc2 isso não deveria mais acontecer (o marker ganha
+gate:retry-cooldown-until entre tentativas e estaciona em needs-rebase no teto) — se você
+está lendo isto COM o fix no ar, é uma REGRESSÃO ou um caminho de retry que o fix não cobre.
+
+CONFIRA:
+  bd -C $HQ show <marker> --json | jq '.[0].labels'
+  grep 'Dispatcher sweep complete' $DISPATCH_LOG | tail -8
+
+PARA DESTRAVAR AGORA (a branch precisa de rebuild sobre a main atual):
+  bd -C $HQ label add <marker> gate-status:needs-rebase
+  bd -C $HQ label remove <marker> gate-status:queued
+
+Nenhum kickstart foi feito: reiniciar o dispatcher não muda a seleção. Próximo aviso para
+esta branch só depois de $(( GATE_HOL_COOLDOWN_S / 60 ))min.
+BODY
+)"
+
+  if [ -n "${GTSW_TEST_MAILED+x}" ]; then
+    echo "mail:gate-hol:$subject" >> "${GTSW_TEST_MAILED}" 2>/dev/null || true
+  else
+    command -v "$GC_BIN" >/dev/null 2>&1 && \
+      "$GC_BIN" mail send mayor -s "$subject" -m "$body" 2>/dev/null || true
+  fi
+  mkdir -p "${GTSW_STATE_DIR}" 2>/dev/null || true
+  echo "$now" > "$state" 2>/dev/null || true
+  return 0
+}
+
 # ── main sweep function (pure-ish; all I/O goes through overrideable vars) ───
 # Test seams: override these vars to inject fake data without touching disk/net.
 #   GTSW_TEST_ACTIVE_MARKERS_JSON — fake `bd list` JSON (replaces the live query)
@@ -287,6 +446,15 @@ run_sweep() {
     log "OK: 0 active gate markers (queued/dispatching/ready/claimed/running) — gate idle (not a stall)"
     return 0
   fi
+
+  # ── ga-a6etc2: head-of-line repeat detector ───────────────────────────────
+  # Runs BEFORE the quota/progress guards and independently of the 165-min stall
+  # clock below: a jam of one marker winning every sweep is not a "no Gate PASSED
+  # for 165min" stall (82min was enough to hurt) and the guards that suppress the
+  # stall verdict — quota, recent PASS, live reviewer — are irrelevant to it (a
+  # quota-deferred sweep never logs a `sweep complete` line at all). Detection
+  # only, always returns 0: it can never change the stall verdict below.
+  _gtsw_hol_repeat_check "$log_lines" "$markers_json" "$now" || true
 
   # ── FALSE-POSITIVE GUARD B: quota-limited ────────────────────────────────
   # Three sub-checks:
@@ -1408,6 +1576,135 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   run_sweep && bad "scenario 23: composition real=1 should still return 1" || ok "scenario 23: composition-confirmed real work still alerts (return 1)"
   grep -q "mail:" "$MAIL23" 2>/dev/null && ok "scenario 23: Mayor mailed (confirmed real backlog, guard G is not a blanket mute)" || bad "scenario 23: Mayor NOT mailed despite composition-confirmed real work"
   rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true
+
+  # ══ ga-a6etc2: HEAD-OF-LINE REPEAT detector (scenarios HOL-*) ═════════════════
+  # The 25/09 incident: one marker won 28+ consecutive sweeps (09:44-11:06) with 23
+  # others queued and NOTHING alarmed, because the stall clock needs 165min. These
+  # scenarios pin what the new detector must alert on AND what it must leave alone
+  # (a detector that cries wolf gets muted, which is the same as not having one).
+  hol_ts()    { date -r "$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d "@$1" '+%Y-%m-%d %H:%M:%S'; }
+  hol_sweep() { printf '[%s] [quality-gate-dispatcher] === Dispatcher sweep complete: branch=%s verdict=QUEUED (merge-tree proven clean, transient failures repeat, staying in bounded retry — ga-y5c29l) ===\n' "$(hol_ts "$1")" "$2"; }
+  hol_spawn() { printf '[%s] [quality-gate-dispatcher] Spawning 1 independent reviewer session(s) ...\n' "$(hol_ts "$1")"; }
+  hol_noise() { printf '[%s] [quality-gate-dispatcher] Quiet hours — PAUSING new-run admission this sweep, leaving 24 marker(s) queued\n' "$(hol_ts "$1")"; }
+  hol_markers() { # <hol-branch> <n-others-queued>
+    # Counting loop, NOT `seq 1 $2`: BSD seq counts DOWN when first > last, so
+    # `seq 1 0` prints "1 0" and silently fabricates two "other" markers (this
+    # very fixture did, and made the lone-marker scenario alert).
+    local out i=1
+    out="[{\"id\":\"hol-m\",\"status\":\"open\",\"labels\":[\"type:quality-gate-marker\",\"gate-status:queued\",\"branch:$1\"]}"
+    while [ "$i" -le "$2" ]; do
+      out="${out},{\"id\":\"other-$i\",\"status\":\"open\",\"labels\":[\"type:quality-gate-marker\",\"gate-status:queued\",\"branch:crew/x/other-$i\"]}"
+      i=$((i + 1))
+    done
+    printf '%s]' "$out"
+  }
+  # hol_run <log-text> <markers-json> [now]  → runs the detector; resets the mail sink first.
+  HOLB="crew/wa-worker/wa-wqn2v"; HOL_NOW="$(date +%s)"
+  HOL_MAIL="$TMP/hol-mail"; HOL_NOTIF="$TMP/hol-notif"; HOL_KICK="$TMP/hol-kick"
+  hol_reset() { : > "$HOL_MAIL"; : > "$HOL_NOTIF"; : > "$HOL_KICK"; rm -f "$TMP"/gate-hol-alert-* 2>/dev/null || true; }
+  hol_run() {
+    GTSW_TEST_MAILED="$HOL_MAIL"; GTSW_TEST_NOTIFIED="$HOL_NOTIF"; GTSW_TEST_KICKSTARTS="$HOL_KICK"
+    _gtsw_hol_repeat_check "$1" "$2" "${3:-$HOL_NOW}"
+  }
+  hol_mails() { grep -c 'gate-hol:' "$HOL_MAIL" 2>/dev/null || true; }
+  six_same() { # 6 sweeps ~3min apart ending 60s before HOL_NOW, all on $1
+    local t=$((HOL_NOW - 960)) k
+    for k in 1 2 3 4 5 6; do hol_sweep "$t" "$1"; t=$((t + 180)); done
+  }
+
+  echo "Scenario HOL-1: 6 consecutive sweeps on ONE branch, 3 others queued → Mayor mailed, nobody paged, nothing kickstarted"
+  hol_reset; hol_run "$(six_same "$HOLB")" "$(hol_markers "$HOLB" 3)"
+  [ "$(hol_mails)" = "1" ] && ok "HOL-1: exactly one Mayor mail" || bad "HOL-1: expected 1 mail, got $(hol_mails)"
+  grep -q "$HOLB" "$HOL_MAIL" 2>/dev/null && grep -q '6 varreduras' "$HOL_MAIL" 2>/dev/null \
+    && ok "HOL-1: the mail names the branch and the sweep count" || bad "HOL-1: mail lacks branch/count: $(cat "$HOL_MAIL")"
+  [ ! -s "$HOL_NOTIF" ] && ok "HOL-1: Athos's phone NOT paged (Mayor first — the machine handles it)" || bad "HOL-1: Athos was paged"
+  [ ! -s "$HOL_KICK" ] && ok "HOL-1: nothing kickstarted (a restart cannot change a deterministic selection)" || bad "HOL-1: a kickstart was issued"
+  [ -f "$TMP/gate-hol-alert-crew_wa-worker_wa-wqn2v" ] && ok "HOL-1: dedup state written under a filesystem-safe name for a branch with slashes" || bad "HOL-1: no dedup state file"
+
+  echo "Scenario HOL-2: same episode re-checked inside the cooldown → NO duplicate mail; after the cooldown → mailed again"
+  hol_run "$(six_same "$HOLB")" "$(hol_markers "$HOLB" 3)" "$((HOL_NOW + 300))"
+  [ "$(hol_mails)" = "1" ] && ok "HOL-2: no second mail within GATE_HOL_COOLDOWN_S (one page per branch per hour)" || bad "HOL-2: duplicate mail inside cooldown ($(hol_mails))"
+  grep -q 'HOL PERSISTS' "$LOG" 2>/dev/null && ok "HOL-2: the suppression is logged (a quiet detector is distinguishable from a dead one)" || bad "HOL-2: suppression not logged"
+  HOL_LATER=$((HOL_NOW + GATE_HOL_COOLDOWN_S + 60))
+  hol_run "$( { t=$((HOL_LATER - 960)); for k in 1 2 3 4 5 6; do hol_sweep "$t" "$HOLB"; t=$((t + 180)); done; } )" "$(hol_markers "$HOLB" 3)" "$HOL_LATER"
+  [ "$(hol_mails)" = "2" ] && ok "HOL-2: a jam that outlives the cooldown is mailed again" || bad "HOL-2: no re-alert after the cooldown ($(hol_mails))"
+
+  echo "Scenario HOL-3: only 4 consecutive sweeps (< GTSW_HOL_MIN_SWEEPS=5) → no alert"
+  hol_reset
+  hol_run "$( t=$((HOL_NOW - 600)); for k in 1 2 3 4; do hol_sweep "$t" "$HOLB"; t=$((t + 150)); done )" "$(hol_markers "$HOLB" 3)"
+  [ "$(hol_mails)" = "0" ] && ok "HOL-3: 4 sweeps is a retry, not a jam" || bad "HOL-3: alerted on 4 sweeps"
+  hol_reset
+  hol_run "$( t=$((HOL_NOW - 700)); for k in 1 2 3 4 5; do hol_sweep "$t" "$HOLB"; t=$((t + 140)); done )" "$(hol_markers "$HOLB" 3)"
+  [ "$(hol_mails)" = "1" ] && ok "HOL-3: exactly 5 sweeps (the threshold) DOES alert (>=)" || bad "HOL-3: no alert at the threshold"
+
+  echo "Scenario HOL-4: a reviewer spawn in the middle BREAKS the run (the gate did real work)"
+  hol_reset
+  hol_run "$( t=$((HOL_NOW - 900)); for k in 1 2 3; do hol_sweep "$t" "$HOLB"; t=$((t + 120)); done; hol_spawn "$((HOL_NOW - 500))"; hol_sweep "$((HOL_NOW - 300))" "$HOLB"; hol_sweep "$((HOL_NOW - 120))" "$HOLB" )" "$(hol_markers "$HOLB" 3)"
+  [ "$(hol_mails)" = "0" ] && ok "HOL-4: X X X SPAWN X X → trailing run is 2, no alert" || bad "HOL-4: a spawn did not break the run"
+  hol_reset
+  hol_run "$( six_same "$HOLB"; hol_spawn "$((HOL_NOW - 30))" )" "$(hol_markers "$HOLB" 3)"
+  [ "$(hol_mails)" = "0" ] && ok "HOL-4: the NEWEST outcome is a spawn → the jam is already over, no alert" || bad "HOL-4: alerted although the newest outcome is a spawn"
+
+  echo "Scenario HOL-5: nobody waiting behind it (lone marker) → no alert"
+  hol_reset; hol_run "$(six_same "$HOLB")" "$(hol_markers "$HOLB" 0)"
+  [ "$(hol_mails)" = "0" ] && ok "HOL-5: 6 retries with an otherwise-empty queue starve nobody — not head-of-line blocking" || bad "HOL-5: alerted on a lone marker"
+  grep -q 'no OTHER marker is queued' "$LOG" 2>/dev/null && ok "HOL-5: the reason is logged" || bad "HOL-5: reason not logged"
+
+  echo "Scenario HOL-6: healthy churn — alternating branches → no alert"
+  hol_reset
+  hol_run "$( t=$((HOL_NOW - 900)); for k in 1 2 3; do hol_sweep "$t" "crew/a/x"; hol_sweep "$((t + 60))" "crew/b/y"; t=$((t + 120)); done; hol_sweep "$((HOL_NOW - 30))" "crew/a/x" )" "$(hol_markers "crew/a/x" 3)"
+  [ "$(hol_mails)" = "0" ] && ok "HOL-6: X Y X Y X Y X → trailing run 1, no alert" || bad "HOL-6: false positive on healthy alternation"
+
+  echo "Scenario HOL-7: a FINISHED episode (newest sweep 3h old) → no alert"
+  hol_reset
+  hol_run "$( t=$((HOL_NOW - 11400)); for k in 1 2 3 4 5 6; do hol_sweep "$t" "$HOLB"; t=$((t + 180)); done )" "$(hol_markers "$HOLB" 3)"
+  [ "$(hol_mails)" = "0" ] && ok "HOL-7: a jam that ended hours ago is history, not an alarm" || bad "HOL-7: alerted on a stale episode"
+
+  echo "Scenario HOL-8: unreadable signals are UNKNOWN, never a verdict"
+  hol_reset
+  hol_run "$( for k in 1 2 3 4 5 6; do printf '[2026-99-99 99:99:99] [quality-gate-dispatcher] === Dispatcher sweep complete: branch=%s verdict=QUEUED ===\n' "$HOLB"; done )" "$(hol_markers "$HOLB" 3)"
+  [ "$(hol_mails)" = "0" ] && grep -q 'cannot parse the newest timestamp' "$LOG" 2>/dev/null \
+    && ok "HOL-8: unparseable timestamp → logged UNKNOWN, no alert (fail-open, not fail-loud-on-garbage)" || bad "HOL-8: unparseable timestamp mishandled"
+  hol_reset; hol_run "$(six_same "$HOLB")" "this is not json"
+  [ "$(hol_mails)" = "0" ] && grep -q 'active-marker JSON is unreadable' "$LOG" 2>/dev/null \
+    && ok "HOL-8: unreadable marker JSON → logged UNKNOWN, no alert (error is not the same value as 'nobody waiting')" || bad "HOL-8: unreadable marker JSON mishandled"
+
+  echo "Scenario HOL-9: sweeps that ended early (quiet hours etc.) neither extend nor break the run"
+  hol_reset
+  hol_run "$( t=$((HOL_NOW - 900)); for k in 1 2 3 4 5 6; do hol_sweep "$t" "$HOLB"; hol_noise "$((t + 60))"; t=$((t + 150)); done )" "$(hol_markers "$HOLB" 3)"
+  [ "$(hol_mails)" = "1" ] && ok "HOL-9: 6 X-sweeps interleaved with early-exit noise still alert" || bad "HOL-9: early-exit lines broke the run"
+
+  echo "Scenario HOL-10: dry-run logs the decision but sends nothing and stamps nothing"
+  hol_reset; GTSW_DRY_RUN=1 hol_run "$(six_same "$HOLB")" "$(hol_markers "$HOLB" 3)"
+  [ "$(hol_mails)" = "0" ] && ! ls "$TMP"/gate-hol-alert-* >/dev/null 2>&1 \
+    && ok "HOL-10: GTSW_DRY_RUN=1 → no mail, no dedup state" || bad "HOL-10: dry-run had side effects"
+
+  echo "Scenario HOL-11: REPLAY of the real 25/09 incident (sweep times from quality-gate-dispatcher.log)"
+  # 09:44 09:48 09:55 09:59 10:02 10:05 — six of the 28 consecutive sweeps ga-g5s956 won.
+  hol_reset
+  HOL_REAL=""
+  for hm in 09:44:40 09:48:12 09:55:03 09:59:31 10:02:47 10:05:20; do
+    HOL_REAL="${HOL_REAL}[2026-09-25 ${hm}] [quality-gate-dispatcher] === Dispatcher sweep complete: branch=crew/wa-worker/wa-wqn2v verdict=QUEUED (merge-tree proven clean, transient failures repeat, staying in bounded retry — ga-y5c29l) ===
+"
+  done
+  HOL_REAL_NOW="$(date -j -f '%Y-%m-%d %H:%M:%S' '2026-09-25 10:07:00' +%s)"
+  hol_run "$HOL_REAL" "$(hol_markers "$HOLB" 23)" "$HOL_REAL_NOW"
+  [ "$(hol_mails)" = "1" ] && ok "HOL-11: 6 sweeps into the real incident (10:07, 23 markers waiting) the Mayor is told — ~23 min in, not 82" || bad "HOL-11: the real incident would NOT have alarmed"
+
+  echo "Scenario HOL-12 (end-to-end): run_sweep wires the detector in and does not disturb the stall verdict"
+  hol_reset
+  rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true
+  GTSW_TEST_NOW="$HOL_NOW"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(hol_markers "$HOLB" 3)"
+  GTSW_TEST_LOG_LINES="$( printf '[%s] [quality-gate-dispatcher] Gate PASSED (origin=Pilot): branch=fix/ga-test tier=CODE merge_sha=abc123 elapsed=300s\n' "$(hol_ts $((HOL_NOW - 300)))"; six_same "$HOLB" )"
+  GTSW_TEST_QUOTA_RC=0; GTSW_TEST_SESSIONS=""
+  GTSW_TEST_KICKSTARTS="$HOL_KICK"; GTSW_TEST_NOTIFIED="$HOL_NOTIF"; GTSW_TEST_MAILED="$HOL_MAIL"
+  run_sweep && ok "HOL-12: a Gate PASSED 5min ago still reads as progress (run_sweep returns 0 — the stall verdict is untouched)" \
+            || bad "HOL-12: the HOL check changed run_sweep's stall verdict"
+  [ "$(hol_mails)" = "1" ] && ok "HOL-12: …and the HOL mail still goes out from inside run_sweep (the jam is invisible to the PASS clock)" \
+                           || bad "HOL-12: run_sweep did not invoke the detector (mails=$(hol_mails))"
+  unset GTSW_TEST_NOW
+  hol_reset
 
   # ── CLEANUP / SUMMARY ─────────────────────────────────────────────────────
   # Unset test seams so no state leaks

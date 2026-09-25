@@ -5145,6 +5145,118 @@ gate_full_suite_verdict() {
   fi
 }
 
+# ── ga-a6etc2: bounded clean-retry — per-marker cooldown, hard cap, and a ─────
+#    requeue write that respects a transition someone else made mid-sweep ───────
+#
+# INCIDENT (2026-09-25 09:44-11:06 local, 82 min): one marker (ga-g5s956, branch
+# crew/wa-worker/wa-wqn2v) won 28+ consecutive sweeps while 23 others waited, and
+# nothing alarmed. Three separate defects stacked, all three fixed here/below:
+#
+#  1. SELECTION: tier 1 of the marker-select block admits a has_rebase_fail
+#     marker once its OWN exile passed GATE_EXILE_OVERDUE_SECONDS (ga-0ye7ar) —
+#     a deliberate "an exiled marker must eventually get an attempt even in a
+#     queue that never empties" guarantee. But nothing re-armed that clock after
+#     the attempt FAILED, so the marker stayed in tier 1 (oldest-first, above
+#     every healthy marker) on every following sweep. Measured: gate:exiled-since
+#     07:40, overdue at 09:10, first HOL sweep 09:44, then every sweep to 11:06.
+#     Fix: gate:retry-cooldown-until:<epoch> (below), stamped on each failed
+#     attempt of the unbounded path; the selection block skips a marker until it
+#     expires. gate:exiled-since is deliberately NOT touched — gate_exile_
+#     watchdog_sweep (ga-faw5o) measures the exile's total age with it.
+#  2. THE BOUND: ga-y5c29l made a proven-clean marker whose retries are exhausted
+#     stay `queued` instead of circuit-breaking (correct for a transient
+#     environment fault: wa-llq1a/wa-4zmm1) — but it removed the ONLY bound, so
+#     gate:rebase-fail-count reached 32 with no exit. GATE_CLEAN_RETRY_HARD_CAP
+#     restores one: at that many total failed attempts the marker parks at
+#     gate-status:needs-rebase (the legacy escalation: mail Mayor + source-bead
+#     label). Default 7 = the 3 ordinary attempts + 4 more spaced by the cooldown
+#     (>= ~1h of coverage for an environment fault, but no longer unbounded).
+#     A value <= MAX_REBASE_ATTEMPTS disables the extension (pre-y5c29l behaviour).
+#  3. THE REVERT: the Mayor's manual queued->needs-rebase (11:03) was undone by
+#     THIS dispatcher: set_gate_status strips EVERY gate-status:* label and writes
+#     the target, so a transition made while the marker was `dispatching` (the
+#     ~25s each sweep holds it) was erased by the sweep's own closing
+#     set_gate_status(queued). Ruled out as the reverter: gate-recovery-watchdog
+#     ("NEVER requeue"s a needs-rebase marker) and the guard's Vector A (it only
+#     touches dispatching/claimed, and its only entry for this marker was logged
+#     two minutes BEFORE the Mayor's flip). The mechanism is confirmed from the
+#     code and the timing (Mayor comment 11:03, claim 11:03:37, sweep end ~11:04);
+#     it was not replayed from Dolt history. gate_requeue_respecting_external
+#     below is the compare-before-write fix for the THREE rebase-retry sites in
+#     this file. The dispatcher's other requeue writers (reviewer-death,
+#     quota-stop, dispatching-TTL recovery) share the same blind overwrite and
+#     are NOT covered here — each needs its own expected_status; tracked as a
+#     follow-up on ga-a6etc2.
+GATE_RETRY_COOLDOWN_SECONDS="${GATE_RETRY_COOLDOWN_SECONDS:-900}"
+case "$GATE_RETRY_COOLDOWN_SECONDS" in ''|*[!0-9]*) GATE_RETRY_COOLDOWN_SECONDS=900 ;; esac
+GATE_CLEAN_RETRY_HARD_CAP="${GATE_CLEAN_RETRY_HARD_CAP:-7}"
+case "$GATE_CLEAN_RETRY_HARD_CAP" in ''|*[!0-9]*) GATE_CLEAN_RETRY_HARD_CAP=7 ;; esac
+
+# gate_retry_cooldown_stamp <marker_id> [now_epoch]
+# Writes gate:retry-cooldown-until:<now+GATE_RETRY_COOLDOWN_SECONDS> and removes
+# any older cooldown label it can SEE. ADD before REMOVE (same interrupted-
+# transition invariant as set_gate_status/ga-i0n83). GATE_RETRY_COOLDOWN_SECONDS=0
+# disables the stamp. The selection block reads the labels with `max`, so an
+# older label that could not be listed or removed can never SHORTEN a cooldown,
+# and — deadlines only grow — never extend one either.
+# A failed label write is logged, not swallowed: the marker then stays eligible
+# for the next sweep, which is SAFE (the attempt count still advances toward
+# GATE_CLEAN_RETRY_HARD_CAP, so the retry stays bounded) but is exactly the
+# head-of-line exposure this function exists to prevent, so it must be visible.
+gate_retry_cooldown_stamp() {
+  local _id="$1" _now="${2:-}" _until _cur _lbl
+  [ -z "$_id" ] && return 0
+  [ "${GATE_RETRY_COOLDOWN_SECONDS:-0}" -gt 0 ] 2>/dev/null || return 0
+  [ -n "$_now" ] || _now=$(date +%s)
+  _until=$(( _now + GATE_RETRY_COOLDOWN_SECONDS ))
+  _cur=$(bd -C "$GC_CITY" show "$_id" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]? | select(test("^gate:retry-cooldown-until:[0-9]+$"))' 2>/dev/null || true)
+  if ! bd -C "$GC_CITY" label add "$_id" "gate:retry-cooldown-until:$_until" -q 2>/dev/null; then
+    warn "Marker $_id: FAILED to write gate:retry-cooldown-until:$_until — it stays eligible next sweep (retry remains capped at GATE_CLEAN_RETRY_HARD_CAP, but head-of-line protection is off for this attempt) (ga-a6etc2)."
+    return 0
+  fi
+  for _lbl in $_cur; do
+    [ "$_lbl" = "gate:retry-cooldown-until:$_until" ] && continue
+    bd -C "$GC_CITY" label remove "$_id" "$_lbl" -q 2>/dev/null || true
+  done
+}
+
+# gate_requeue_respecting_external <marker_id> <new_status> [expected_status]
+# The closing write of a sweep that holds a marker at <expected_status>
+# (default dispatching) and puts it back at <new_status>. Unlike a bare
+# set_gate_status it first READS the marker: if the marker is closed, or carries
+# a gate-status:* other than the two this sweep owns, someone else (Mayor, a
+# watchdog) moved it while the sweep ran — that transition wins; this sweep only
+# drops its own transient label and does not write <new_status>.
+# Three-state read (error != empty, ga-p5q3 class): the marker is either READ
+# (decide from what it says), or UNREADABLE — bd failed, printed nothing, printed
+# non-JSON, or printed an error envelope with no .id. UNREADABLE takes the legacy
+# overwrite, so behaviour under a Dolt hiccup is exactly what it was before this
+# function existed (a stranded `dispatching` marker would wait out the 30m Vector A
+# TTL, a worse default than the rare lost transition) — but it is never SILENT:
+# every unreadable read is logged, so "could not verify" is countable in the log
+# and never indistinguishable from "verified, nothing external happened".
+gate_requeue_respecting_external() {
+  local _id="$1" _new="$2" _expect="${3:-dispatching}" _json _mid _mstatus _foreign
+  [ -z "$_id" ] && return 0
+  _json=$(bd -C "$GC_CITY" show "$_id" --json 2>/dev/null || true)
+  _mid=""
+  [ -n "$_json" ] && _mid=$(printf '%s' "$_json" | jq -r 'if type=="array" then .[0] else . end | .id // empty' 2>/dev/null || true)
+  if [ -z "$_mid" ]; then
+    warn "Marker $_id: could not read it back to check for an external transition (bd show returned nothing, non-JSON, or an error envelope) — UNVERIFIED, falling back to the legacy overwrite to gate-status:$_new (ga-a6etc2)."
+  else
+    _mstatus=$(printf '%s' "$_json" | jq -r 'if type=="array" then .[0] else . end | .status // ""' 2>/dev/null || true)
+    _foreign=$(printf '%s' "$_json" | jq -r --arg e "gate-status:$_expect" --arg n "gate-status:$_new" \
+      'if type=="array" then .[0] else . end | (.labels // [])[]? | select(startswith("gate-status:")) | select(. != $e and . != $n)' 2>/dev/null || true)
+    if [ "$_mstatus" = "closed" ] || [ -n "$_foreign" ]; then
+      warn "Marker $_id: an external transition landed while this sweep held it (status='${_mstatus:-?}', foreign gate-status: ${_foreign:-none}) — respecting it, NOT overwriting with gate-status:$_new (ga-a6etc2)."
+      bd -C "$GC_CITY" label remove "$_id" "gate-status:$_expect" -q 2>/dev/null || true
+      return 0
+    fi
+  fi
+  set_gate_status "$_id" "$_new"
+}
+
 # Lib-only entrypoint for quality-gate-reconvene.selftest.sh: expose the helpers
 # above WITHOUT running the live dispatcher (mirrors quality-gate-guard.sh's
 # GATE_GUARD_LIB_ONLY). Must precede the log-redirect + live work below. Never
@@ -10752,6 +10864,18 @@ MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   # past its own bounded-retry budget (measured: gate:rebase-fail-count:61).
   def rebase_attempt_count: ([(.labels // [])[] | select(test("^gate:(rebase-attempt|exiled-tier5|rebase-fail-count):[0-9]+$")) | (sub("^gate:(rebase-attempt|exiled-tier5|rebase-fail-count):";"") | tonumber)] | max) // 0;
   def exile_overdue: ($exile_ceiling > 0) and (exiled_since_epoch != null) and (($now - exiled_since_epoch) > $exile_ceiling) and (rebase_attempt_count < $retry_ceiling);
+  # ga-a6etc2: per-marker retry cooldown. gate_retry_cooldown_stamp writes
+  # gate:retry-cooldown-until:<epoch> on every failed attempt of the
+  # proven-clean retry path (see the helper for the incident). A marker inside
+  # its cooldown is EXCLUDED FROM EVERY TIER below, including tier 1 and the
+  # rebase-fail back-of-queue tier: tier 1 (exile_overdue) used to re-admit the
+  # same failing marker on every sweep because nothing re-armed the exile
+  # clock after a failed attempt (82 min of head-of-line blocking). max, not
+  # first: if a stale label ever survives, the newest deadline decides. Absent
+  # or already-expired reads as "no cooldown" so a marker is never held out
+  # indefinitely by a label that stopped mattering.
+  def retry_cooldown_until: ([(.labels // [])[] | select(test("^gate:retry-cooldown-until:[0-9]+$")) | (sub("^gate:retry-cooldown-until:";"") | tonumber)] | max) // null;
+  def in_retry_cooldown: (retry_cooldown_until != null) and ($now < retry_cooldown_until);
   # crew_of parses the <crew> segment of `branch: crew/<crew>/<bead>` from the
   # marker DESCRIPTION. MUST always yield exactly one value ("" when absent) —
   # `capture`/`scan` yield an EMPTY STREAM on no-match under jq, and `crew_of as
@@ -10787,6 +10911,10 @@ MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   # OTHER tier (2-6 all keep excluding has_rebase_fail unchanged below), and
   # gate-priority-starvation-ceiling.selftest.sh case (4) still passes
   # because that fixture carries no gate:exiled-since label at all.
+  # ga-a6etc2: the leading map(select(in_retry_cooldown | not)) | drops every
+  # marker still inside its retry cooldown before ANY tier sees it (jq: the pipe
+  # binds looser than +, so it feeds the whole tier sum, not just the first term).
+  map(select(in_retry_cooldown | not)) |
   (map(select((is_overdue and (has_rebase_fail | not)) or (has_rebase_fail and exile_overdue))) | sort_by(.created_at))
   + (if $reserve_fresh then (map(select(has_rebase_fail | not)) | sort_by(.created_at) | reverse | .[0:1]) else [] end)
   + (map(select(is_priority and (has_rebase_fail | not) and is_aged))                 | sort_by(.created_at))
@@ -10795,7 +10923,26 @@ MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   + (map(select((is_priority | not) and (has_rebase_fail | not) and (is_aged | not))) | sort_by([diff_size, -created_epoch]))
   + (map(select(has_rebase_fail))                                                   | sort_by(.created_at) | reverse)
   | .[0]')
-MARKER_ID=$(printf '%s\n' "$MARKER" | jq -r '.id')
+# ga-a6etc2: `.id // empty`, not `.id` — jq -r prints the literal string "null"
+# for a null selection, and the cooldown pre-filter above can now legitimately
+# leave NOTHING eligible (every queued marker inside its retry cooldown). That
+# must end the sweep cleanly here, never fall through to "claim marker null".
+MARKER_ID=$(printf '%s\n' "$MARKER" | jq -r '.id // empty')
+if [ -z "$MARKER_ID" ]; then
+  # Do not ASSERT the cause, confirm it: count the markers that really carry an
+  # unexpired cooldown, independently of the selection program above. If that
+  # count is not the whole queue, the selection came back empty for a reason
+  # this branch does not understand — say so, claim nothing (the inert choice),
+  # and let a human see the mismatch in the log instead of a comforting story.
+  _CD_N=$(printf '%s\n' "$MARKERS_JSON" | jq --argjson now "$GATE_MARKER_NOW_EPOCH" \
+    '[.[] | select(([(.labels // [])[] | select(test("^gate:retry-cooldown-until:[0-9]+$")) | (sub("^gate:retry-cooldown-until:";"") | tonumber)] | (max // 0)) > $now)] | length' 2>/dev/null || echo "?")
+  if [ "$_CD_N" = "$COUNT" ]; then
+    log "All $COUNT queued marker(s) are inside their retry cooldown (gate:retry-cooldown-until, ga-a6etc2) — nothing eligible to claim this sweep; the earliest cooldown expiry re-admits it."
+  else
+    warn "Marker selection came back EMPTY with $COUNT queued marker(s), but only ${_CD_N:-?} of them carry an unexpired retry cooldown — cause UNKNOWN; claiming nothing this sweep (ga-a6etc2)."
+  fi
+  exit 0
+fi
 # SELFTEST-EXTRACT marker-select: END
 DESC=$(printf '%s\n' "$MARKER" | jq -r '.description // ""')
 
@@ -13134,7 +13281,8 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
           warn "Branch $BRANCH: transient auto-rebase-fail (author $REBASE_AUTHOR live; attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS, still in the healthy queue) — gate-status:queued for server-side retry."
           _TIER5_NOTE=""
         fi
-        set_gate_status "$MARKER_ID" "queued"  # ga-7fwt1
+        # ga-a6etc2: compare-before-write — see gate_requeue_respecting_external.
+        gate_requeue_respecting_external "$MARKER_ID" "queued" "dispatching"  # ga-7fwt1
         bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS (gt-4tk5m): branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) — $_PUSH_DIAG. Re-queued for next sweep; no /gate-done re-run needed.${_TIER5_NOTE}" 2>/dev/null || true
         # ga-6dp9 (gate-fix-2): same notify-identity fix as the bounce branches
         # above — REBASE_AUTHOR is this branch's own verified-alive identity.
@@ -13249,7 +13397,8 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
           warn "Branch $BRANCH: transient auto-rebase-fail, author dead/empty (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS, still in the healthy queue) — gate-status:queued for server-side retry."
           _TIER5_NOTE=""
         fi
-        set_gate_status "$MARKER_ID" "queued"  # ga-7fwt1
+        # ga-a6etc2: compare-before-write — see gate_requeue_respecting_external.
+        gate_requeue_respecting_external "$MARKER_ID" "queued" "dispatching"  # ga-7fwt1
         bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS: branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) and the author session is gone. Queued for server-side retry on next sweep (NOT stranded on a dead author).${_TIER5_NOTE}" 2>/dev/null || true
         REBASE_EVENT="dispatcher_autorebase_retry"
         REBASE_VERDICT="QUEUED (retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS, dead author)"
@@ -13300,7 +13449,12 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
           fi
           REBASE_EVENT="dispatcher_circuit_break_retry_dead"
           REBASE_VERDICT="CIRCUIT-BREAK (retry_dead: ${MAX_REBASE_ATTEMPTS} attempts exhausted, dead author, needs-human armed=$_NH_STATUS)"
-        elif [ "$REBASE_MERGE_TREE_PROVEN_CLEAN" = "1" ]; then
+        elif [ "$REBASE_MERGE_TREE_PROVEN_CLEAN" = "1" ] && [ "$NEXT_ATTEMPT" -lt "$GATE_CLEAN_RETRY_HARD_CAP" ]; then
+          # ga-a6etc2: the `&& NEXT_ATTEMPT < GATE_CLEAN_RETRY_HARD_CAP` half is
+          # the bound ga-y5c29l removed — without it this branch kept the marker
+          # queued forever (fail-count 32, 82 min of head-of-line blocking). At
+          # the cap control falls to the else below: the legacy needs-rebase
+          # escalation, which parks the marker durably.
           # ga-y5c29l: merge-tree already proved this branch merges into main
           # with ZERO conflicts this sweep — gate_circuit_break_check()'s own
           # ga-agtqm exemption is why _ACB_RETRY="ok" above. Retries being
@@ -13312,29 +13466,45 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
           # human manually clearing 3 labels (rebase-fail-count, exiled-
           # tier5, exiled-since) to undo. Stay in the retry queue (already
           # exiled to tier5 above, so this does not block healthy markers)
-          # instead of escalating — gate_exile_watchdog_sweep (ga-faw5o) is
-          # the appropriate backstop if this genuinely never recovers, on a
-          # timescale (default 24h) that fits an environment issue instead of
-          # the $MAX_REBASE_ATTEMPTS-sweep window that forced the manual fix.
-          warn "Branch $BRANCH: transient auto-rebase failure persists after $MAX_REBASE_ATTEMPTS attempts, dead author, but merge-tree already proved $BRANCH merges clean (ga-y5c29l) — staying in the retry queue instead of circuit-breaking."
-          set_gate_status "$MARKER_ID" "queued"  # ga-7fwt1
-          bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry (ga-y5c29l): branch $BRANCH hit $NEXT_ATTEMPT transient auto-rebase failures (${CONFLICT_FILES:-plumbing}) and the author session is gone, but merge-tree already proved this branch merges into $DEFAULT_BRANCH with zero conflicts — not evidence of an unmergeable branch, so NOT circuit-broken. Remains queued (exiled behind the healthy tier). If this persists for hours, gate_exile_watchdog_sweep (ga-faw5o) will escalate to Mayor on its own." 2>/dev/null || true
+          # instead of escalating. ga-a6etc2: "stay in the retry queue" is now
+          # BOUNDED — at GATE_CLEAN_RETRY_HARD_CAP total failed attempts control
+          # takes the else below and parks the marker at needs-rebase; between
+          # attempts a gate:retry-cooldown-until label (stamped below) keeps the
+          # marker out of every selection tier, so one failing marker can no
+          # longer win every sweep while healthy markers wait.
+          warn "Branch $BRANCH: transient auto-rebase failure persists after $NEXT_ATTEMPT attempts (proven-clean retry cap $GATE_CLEAN_RETRY_HARD_CAP), dead author, but merge-tree already proved $BRANCH merges clean (ga-y5c29l) — staying in the bounded retry queue instead of circuit-breaking; next attempt not before ${GATE_RETRY_COOLDOWN_SECONDS}s from now (ga-a6etc2)."
+          # Cooldown FIRST, requeue second: the marker is never `queued` without
+          # its cooldown label, so no sweep can pick it up in the gap.
+          gate_retry_cooldown_stamp "$MARKER_ID"
+          gate_requeue_respecting_external "$MARKER_ID" "queued" "dispatching"  # ga-7fwt1 + ga-a6etc2
+          bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry (ga-y5c29l): branch $BRANCH hit $NEXT_ATTEMPT transient auto-rebase failures (${CONFLICT_FILES:-plumbing}) and the author session is gone, but merge-tree already proved this branch merges into $DEFAULT_BRANCH with zero conflicts — not evidence of an unmergeable branch, so NOT circuit-broken. Remains queued behind a ${GATE_RETRY_COOLDOWN_SECONDS}s cooldown (ga-a6etc2) so it cannot monopolize the sweeps, and the retry is bounded: at $GATE_CLEAN_RETRY_HARD_CAP failed attempts the marker parks at gate-status:needs-rebase and the Mayor is mailed." 2>/dev/null || true
           REBASE_EVENT="dispatcher_autorebase_retry_clean_exhausted"
           REBASE_VERDICT="QUEUED (merge-tree proven clean, transient failures repeat, staying in bounded retry — ga-y5c29l)"
         else
-          # GATE_AUTO_CIRCUIT_BREAK=0: fall through to legacy needs-rebase escalation.
-          err "Branch $BRANCH: transient auto-rebase failure persists after $MAX_REBASE_ATTEMPTS server-side attempts, author dead/empty — escalating to Mayor."
+          # Reached by (a) GATE_AUTO_CIRCUIT_BREAK=0 with a branch never proven
+          # clean — the original legacy needs-rebase escalation — or, since
+          # ga-a6etc2, (b) a proven-clean marker that used up
+          # GATE_CLEAN_RETRY_HARD_CAP. Attempt counts below use $NEXT_ATTEMPT (the
+          # real number of failures), not $MAX_REBASE_ATTEMPTS: with (b) they differ.
+          _CAP_NOTE=""
+          REBASE_EVENT="dispatcher_needs_rebase_escalated"
+          _ESC_SUBJ="Gate escalation: $BRANCH stranded conflict (no live author)"
+          if [ "$REBASE_MERGE_TREE_PROVEN_CLEAN" = "1" ]; then
+            _CAP_NOTE=" (ga-a6etc2: merge-tree proved this branch clean, but $NEXT_ATTEMPT failed attempts reached GATE_CLEAN_RETRY_HARD_CAP=$GATE_CLEAN_RETRY_HARD_CAP — the bounded retry is spent, so this is a repeated push/rebase failure, not a merge conflict)"
+            REBASE_EVENT="dispatcher_needs_rebase_clean_retry_cap"
+            _ESC_SUBJ="Gate escalation: $BRANCH bounded retry spent (merge-tree clean, no live author)"
+          fi
+          err "Branch $BRANCH: transient auto-rebase failure persists after $NEXT_ATTEMPT server-side attempts, author dead/empty — escalating to Mayor.${_CAP_NOTE}"
           set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
-          bd -C "$GC_CITY" comment "$MARKER_ID" "Gate ESCALATED: branch $BRANCH could not auto-rebase (${CONFLICT_FILES:-unknown}) vs main ($MAIN_HEAD_SHA) after $MAX_REBASE_ATTEMPTS attempts, and no live author session exists. Escalated to Mayor for resolution." 2>/dev/null || true
+          bd -C "$GC_CITY" comment "$MARKER_ID" "Gate ESCALATED: branch $BRANCH could not auto-rebase (${CONFLICT_FILES:-unknown}) vs main ($MAIN_HEAD_SHA) after $NEXT_ATTEMPT attempts, and no live author session exists.${_CAP_NOTE} Parked at gate-status:needs-rebase; escalated to Mayor for resolution (rebuild on current main, or close)." 2>/dev/null || true
           if [ -n "$BEAD_ID" ]; then
             bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
           fi
           gc --city "$GC_CITY" mail send mayor \
-            -s "Gate escalation: $BRANCH stranded conflict (no live author)" \
-            -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) could not auto-rebase vs origin/$DEFAULT_BRANCH ($MAIN_HEAD_SHA). ${CONFLICT_FILES:-unknown}. Auto-rebase failed $MAX_REBASE_ATTEMPTS times and the author session is gone — gate cannot self-heal. Needs a manual rebase or a decision." 2>/dev/null \
+            -s "$_ESC_SUBJ" \
+            -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) could not auto-rebase vs origin/$DEFAULT_BRANCH ($MAIN_HEAD_SHA). ${CONFLICT_FILES:-unknown}. Auto-rebase failed $NEXT_ATTEMPT times and the author session is gone — gate cannot self-heal.${_CAP_NOTE} Needs a manual rebase, a rebuild on current main, or a decision." 2>/dev/null \
             || warn "Could not mail Mayor for gate escalation on $BRANCH"
-          REBASE_EVENT="dispatcher_needs_rebase_escalated"
-          REBASE_VERDICT="NEEDS_REBASE (escalated to Mayor after $MAX_REBASE_ATTEMPTS attempts)"
+          REBASE_VERDICT="NEEDS_REBASE (escalated to Mayor after $NEXT_ATTEMPT attempts)"
         fi
         # SELFTEST-EXTRACT ga-y5c29l-retry-dead-decision: END
       fi

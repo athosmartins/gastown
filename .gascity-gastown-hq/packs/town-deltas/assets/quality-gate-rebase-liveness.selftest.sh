@@ -950,7 +950,12 @@ else
 fi
 if [ -n "$_DEAD_TRANSIENT_LN" ]; then
   _FALLTHROUGH_EXCERPT=$(sed -n "${_DEAD_TRANSIENT_LN},$((_DEAD_TRANSIENT_LN + 40))p" "$DISPATCHER")
-  if printf '%s\n' "$_FALLTHROUGH_EXCERPT" | grep -F 'set_gate_status "$MARKER_ID" "queued"' >/dev/null; then
+  # ga-a6etc2: the requeue is now written as gate_requeue_respecting_external
+  # (compare-before-write; it calls set_gate_status ... queued itself unless an
+  # external transition landed mid-sweep). Same wiring, same payoff — accept the
+  # raw call OR the wrapper, but ONLY with "queued" as the target: a wrapper call
+  # to any other status would still be a different (slower) retry path.
+  if printf '%s\n' "$_FALLTHROUGH_EXCERPT" | grep -E 'set_gate_status "\$MARKER_ID" "queued"|gate_requeue_respecting_external "\$MARKER_ID" "queued"' >/dev/null; then
     ok "ga-pgxs78: the fallthrough destination retries via gate-status:queued (the dispatcher's OWN fast Step 0b selection), not a slower cross-daemon path"
   else
     bad "ga-pgxs78: expected gate-status:queued retry wiring not found within 40 lines of the fallthrough destination — the payoff (faster retry) may have moved or disappeared"
