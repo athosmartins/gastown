@@ -53,14 +53,20 @@
 #     lookups in one sweep the rest are kept WITHOUT a call (a consistently wedged Dolt
 #     costs 2 timeouts per sweep, not one per candidate).
 #   * PARKED-BEAD EXCEPTION to the lock above (ga-v4l16y): if EVERY non-closed bead the
-#     lock finds, in EVERY store, is parked on an Athos decision (next-action:athos*,
-#     story:needs-approval, or metadata athos.acao set) — never just the first one found
+#     lock finds, in EVERY store, is parked on an Athos decision (a park LABEL:
+#     next-action:athos* or story:needs-approval) — never just the first one found
 #     — the session is not babysitting a task, it is idling on a decision only Athos can
 #     make, which can take days. Each such bead is released (assignee cleared, reopened;
-#     every other field, including the park label/metadata itself, is left untouched —
-#     the decision is still pending, only the pool slot is freed) and the session is
+#     every other field, including the park label itself, is left untouched — the
+#     decision is still pending, only the pool slot is freed) and the session is
 #     reaped instead of held forever. A MIX (some beads parked, some not) still KEEPS,
 #     unchanged from the behavior above.
+#     Metadata athos.acao is NOT a park signal, alone or otherwise: it is the painel
+#     card's render-only "O QUE VOCE FAZ" text and nothing ever clears it, so it outlives
+#     the decision (measured 25/09: 4 of 7 open WA beads carrying it had no park label —
+#     an approved story, a bead whose text reads "Nada a fazer agora"). Reading a stale
+#     leftover as "parked NOW" would release + kill a session that is legitimately
+#     mid-work. A bead with only athos.acao therefore keeps the session (has_assigned_bead).
 #   * Kill switch ADHOC_REAPER_ENABLED=0 → census/log only, no closes, no bead releases.
 # The two mutations are `gc session close` on eligible adhoc sessions, and — ONLY for the
 # parked-bead exception above — `bd update` to release a bead parked on an Athos decision.
@@ -315,9 +321,10 @@ for s in d["sessions"]:
 #   held_parked <n>
 #   <store_abs_path>\t<bead_id>\t<bead_assignee>   (repeated n times)
 #                              (ga-v4l16y) EVERY non-closed bead held by this session, in
-#                              EVERY store, is parked on an Athos decision — next-action:athos
-#                              (exact, or a next-action:athos-/next-action:athos: variant),
-#                              story:needs-approval, or metadata athos.acao set (non-empty).
+#                              EVERY store, is parked on an Athos decision — a park LABEL:
+#                              next-action:athos (exact, or a next-action:athos-/
+#                              next-action:athos: variant) or story:needs-approval. Metadata
+#                              athos.acao alone does NOT count (see is_human_parked).
 #                              The caller may release each listed bead (clear assignee,
 #                              reopen) and then reap the session. Full, untruncated list —
 #                              the caller needs exact ids here, unlike "held" above which is
@@ -349,21 +356,25 @@ def out(line):
     sys.exit(0)
 
 def is_human_parked(b):
-    # ga-v4l16y: a bead deliberately parked on a decision only Athos can make.
-    # Deliberately narrower than bead_state.is_athos_page (no blocked-reason:decision,
-    # no refino:policy-gap) to match the acceptance criteria for this fix exactly:
-    # next-action:athos*, story:needs-approval, or metadata athos.acao set.
+    # ga-v4l16y: a bead deliberately parked on a decision only Athos can make, judged
+    # by a park LABEL only. This is a DESTRUCTIVE verdict (the caller unassigns the bead
+    # and closes the worker session), so anything short of a live label reads as "not
+    # parked" and the session is kept.
+    # Relation to bead_state.is_athos_page: NARROWER on blocked-reason:decision and
+    # refino:policy-gap (not recognized here), BROADER on the next-action:athos-* and
+    # next-action:athos:* prefix variants (is_athos_page matches only the exact
+    # next-action:athos). Both differences are deliberate: they follow the spec of bead ga-v4l16y.
+    # Metadata athos.acao is deliberately NOT read: it is render-only text for the painel
+    # card, nothing clears it after the decision, and a stale leftover is not proof the
+    # bead is parked now (see the header note on the parked-bead exception).
+    # NOTE: this whole block sits inside a single-quoted python3 -c string, so it must
+    # never contain a single quote (apostrophe) - one closes the shell quote.
     for l in (b.get("labels") or []):
         if not isinstance(l, str):
             continue
         if l == "next-action:athos" or l.startswith("next-action:athos-") or l.startswith("next-action:athos:"):
             return True
         if l == "story:needs-approval":
-            return True
-    meta = b.get("metadata")
-    if isinstance(meta, dict):
-        v = meta.get("athos.acao")
-        if isinstance(v, str) and v.strip():
             return True
     return False
 
@@ -459,17 +470,29 @@ out("clear %d/%d" % (checked, len(stores)))
 # on a partial release). Every other field — labels (next-action:/story:needs-approval),
 # metadata (athos.acao), history — is left exactly as it was: only assignee/status move, so
 # the parked decision stays fully visible to whoever looks at the bead next.
+#
+# On failure RELEASE_FAIL_DETAIL (a global — this runs in the caller's shell, not a
+# subshell) lists every bead that did not release as "<store>:<bead> rc=<n>", comma-
+# separated, so the caller's log line can tell a stale-guard race (rc 13: the bead changed
+# hands) from a real bd error (rc 1). It is reset on every call, so it is only meaningful
+# right after a nonzero return.
+RELEASE_FAIL_DETAIL=""
 release_parked_beads() {
-  local payload="$1" store bead_id bead_assignee overall_rc=0 body
+  local payload="$1" store bead_id bead_assignee overall_rc=0 body rc
+  RELEASE_FAIL_DETAIL=""
   body="$(printf '%s\n' "$payload" | tail -n +2)"
   while IFS=$'\t' read -r store bead_id bead_assignee; do
     [ -z "$store" ] && continue
     if [ -z "$bead_id" ] || [ -z "$bead_assignee" ]; then
       overall_rc=1
+      RELEASE_FAIL_DETAIL="${RELEASE_FAIL_DETAIL:+$RELEASE_FAIL_DETAIL,}$(basename "$store"):malformed_row"
       continue
     fi
-    if ! "$BD_BIN" -C "$store" update "$bead_id" -a "" -s open --if-assignee "$bead_assignee" -q; then
+    "$BD_BIN" -C "$store" update "$bead_id" -a "" -s open --if-assignee "$bead_assignee" -q
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
       overall_rc=1
+      RELEASE_FAIL_DETAIL="${RELEASE_FAIL_DETAIL:+$RELEASE_FAIL_DETAIL,}$(basename "$store"):$bead_id rc=$rc"
     fi
   done <<< "$body"
   return "$overall_rc"
@@ -706,7 +729,8 @@ while IFS=$'\t' read -r id name state closed created last_active attached alias 
       released_parked_beads=$((released_parked_beads + $(printf '%s\n' "$pending_bead_release" | head -1 | awk '{print $2}')))
     else
       kept_parked_release_failed=$((kept_parked_release_failed+1))
-      log "$(printf '{"ts":"%s","event":"keep","reason":"parked_release_failed","id":"%s","name":"%s","state":"%s"}' "$(ts)" "$id" "$name" "$state")"
+      release_detail="$(printf '%s' "${RELEASE_FAIL_DETAIL:-unknown}" | tr -c 'A-Za-z0-9._:,/=()+ -' '_')"
+      log "$(printf '{"ts":"%s","event":"keep","reason":"parked_release_failed","id":"%s","name":"%s","state":"%s","detail":"%s"}' "$(ts)" "$id" "$name" "$state" "$release_detail")"
       continue
     fi
   fi
