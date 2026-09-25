@@ -6657,13 +6657,15 @@ _pilot_dog_store_blind_migrate_dest() {
   if [ -z "$PILOT_RIG_PATHS_JSON" ]; then
     rig_root_path "gascity" >/dev/null 2>&1 || true   # force memoization; failure is handled just below
   fi
-  if [ -z "$PILOT_RIG_PATHS_JSON" ]; then
-    # Not silent: "could not list rigs" must not read, in the log, as "no other
-    # rig was named" — both end at HQ, for different reasons.
-    warn "ga-6u64fm: could not list rigs (gc rig list failed or was empty) — migration destination defaults to HQ (gascity); it was NOT chosen from the bead's text." >&2
-  fi
   local _names
   _names=$(printf '%s' "$PILOT_RIG_PATHS_JSON" | jq -r '.rigs[]?.name' 2>/dev/null || echo "")
+  if [ -z "$_names" ]; then
+    # Not silent: "could not read the rig list" (gc failed / empty / unparseable / lists
+    # no rigs) must not read, in the log, as "no other rig was named" — both end at HQ,
+    # for different reasons. Judged on the parsed NAMES, not on the raw JSON being
+    # non-empty: an HTML error page is non-empty and yields no names at all.
+    warn "ga-6u64fm: could not read any rig name from the rig list (gc rig list failed, was empty or unparseable) — migration destination defaults to HQ (gascity); it was NOT chosen from the bead's text." >&2
+  fi
   local _match="" _match_count=0 _n
   # Heredoc-fed `while read`, not `for n in $_names` — keeps one rig name per
   # iteration regardless of shell word-splitting settings (same idiom as the

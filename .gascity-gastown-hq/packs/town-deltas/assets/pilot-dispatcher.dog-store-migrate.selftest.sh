@@ -214,9 +214,25 @@ GC_CITY=/nonexistent
 $FN_PRELUDE"'
 _pilot_dog_store_blind_migrate_dest "{\"title\":\"x\",\"description\":\"whatsapp_automation/scripts/x.py\"}" gastown' 2>&1)
 case "$RIGFAIL_OUT" in
-  *"could not list rigs"*gascity) ok "gc rig list failure -> destination defaults to gascity AND says why (not silent)" ;;
-  *) bad "gc rig list failure -> expected a 'could not list rigs' WARN then 'gascity', got: $RIGFAIL_OUT" ;;
+  *"could not read any rig name"*gascity) ok "gc rig list failure (empty) -> destination defaults to gascity AND says why (not silent)" ;;
+  *) bad "gc rig list failure (empty) -> expected a 'could not read any rig name' WARN then 'gascity', got: $RIGFAIL_OUT" ;;
 esac
+# A NON-empty but unusable list must be announced too (was silent: only an empty memo warned).
+for _bad_list in '<html>502 bad gateway</html>' '{"rigs":[]}' '{"error":"x"}'; do
+  _o=$(PILOT_RIG_PATHS_JSON="$_bad_list" bash -c "$DISPATCHER_OPTS
+warn() { echo \"WARN: \$*\" >&2; }
+GC_CITY=/nonexistent
+$FN_PRELUDE"'
+_pilot_dog_store_blind_migrate_dest "{\"title\":\"x\",\"description\":\"whatsapp_automation/scripts/x.py\"}" gastown' 2>&1)
+  case "$_o" in
+    *"could not read any rig name"*gascity) ok "unusable rig list '$_bad_list' -> defaults to gascity AND says why (not silent)" ;;
+    *) bad "unusable rig list '$_bad_list' -> expected a WARN then 'gascity', got: $_o" ;;
+  esac
+done
+# ... and a usable list stays QUIET (the warning must not become noise on the normal path).
+_o=$(run_dest '{"title":"x","description":"whatsapp_automation/scripts/x.py"}' gastown 2>&1)
+[ "$_o" = "whatsapp_automation" ] && ok "a usable rig list -> no warning, destination chosen from the text" \
+                                  || bad "a usable rig list should be silent, got: $_o"
 
 echo ""
 echo "=== Part B: _pilot_migrate_dog_store_blind_bead (needs a fake bd) ==="
