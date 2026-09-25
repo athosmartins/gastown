@@ -110,11 +110,21 @@ SNAP_PS_LINE_MAX=240
 SNAP_PS_MAX_LINES=120
 SNAP_LOG_MAX_LINES=1000
 SNAP_LOG_TIMEOUT="${DOLT_WATCHDOG_SNAP_LOG_TIMEOUT:-30}"
+SNAP_BURST_TIMEOUT="${DOLT_WATCHDOG_SNAP_BURST_TIMEOUT:-20}"
+SNAP_END_MARK="=== end of snapshot ==="
+# Every `log show` section below must tell the reader when its output is NOT a valid window:
+# exit 124 = timeout (partial output), any other nonzero = the command itself failed (what it
+# printed is an error message, not log events). A section that handles only one of the two --
+# or none -- prints a failure in the same shape as "nothing happened", and this file exists
+# to be believed about exactly that.
 capture_death_snapshot() {
-  local _old="$1" _new="$2" _ts _out _lg _lg_rc _lg_n
+  local _old="$1" _new="$2" _ts _out _lg _lg_rc _lg_n _ps _ps_n _bs _bs_rc _wrc
   _ts="$(date '+%Y%m%d-%H%M%S')"
   mkdir -p "$DEATH_LOG_DIR" 2>/dev/null || true
-  _out="$DEATH_LOG_DIR/dolt-death-${_ts}.txt"
+  # ${_ts} has 1-second resolution and `>` truncates: two captures in the same second
+  # (overlapping runs, or a flapping Dolt) would overwrite each other and leave ONE file
+  # for TWO events, with nothing saying so. The run's PID makes the name unique per run.
+  _out="$DEATH_LOG_DIR/dolt-death-${_ts}-$$.txt"
   {
     echo "=== dolt-hang-watchdog PID-change forensic snapshot ==="
     echo "captured_at:  $(ts)"
@@ -137,6 +147,7 @@ capture_death_snapshot() {
     _lg_rc=$?
     _lg_n="$(printf '%s\n' "$_lg" | grep -c . || true)"
     [ "$_lg_rc" -eq 124 ] && echo "(!! log show TIMED OUT after ${SNAP_LOG_TIMEOUT}s -- the lines below are PARTIAL, the window is NOT fully covered)"
+    [ "$_lg_rc" -ne 0 ] && [ "$_lg_rc" -ne 124 ] && echo "(!! log show FAILED rc=${_lg_rc} -- the lines below are its ERROR OUTPUT, not log events; the window is NOT covered)"
     [ "$_lg_n" -gt "$SNAP_LOG_MAX_LINES" ] && echo "(!! TRUNCATED: showing the newest ${SNAP_LOG_MAX_LINES} of ${_lg_n} matching lines -- the oldest $((_lg_n - SNAP_LOG_MAX_LINES)) were dropped)"
     printf '%s\n' "$_lg" | tail -"$SNAP_LOG_MAX_LINES" | cut -c1-"$SNAP_LINE_MAX"
     echo
@@ -146,22 +157,51 @@ capture_death_snapshot() {
     # swallowed -- measured 40/40 runs losing the dolt sql-server row against a fast writer,
     # so whether the rows survived depended on how `ps` happened to chunk its output.
     # `d[o]lt` keeps awk's own argv from matching itself in the process table.
-    ps -ef 2>/dev/null | awk 'NR == 1 || tolower($0) ~ /d[o]lt/' \
-      | cut -c1-"$SNAP_PS_LINE_MAX" | head -"$SNAP_PS_MAX_LINES"
+    # Captured, not streamed, so the cap and an empty result can be STATED like the log
+    # section's: 0 rows = `ps` itself failed (the header row alone is 1), which is UNKNOWN,
+    # not "no dolt process".
+    _ps="$(ps -ef 2>/dev/null | awk 'NR == 1 || tolower($0) ~ /d[o]lt/' | cut -c1-"$SNAP_PS_LINE_MAX")"
+    _ps_n="$(printf '%s\n' "$_ps" | grep -c . || true)"
+    [ "$_ps_n" -eq 0 ] && echo "(!! ps returned NO rows -- the process tree is UNKNOWN, not empty)"
+    [ "$_ps_n" -gt "$SNAP_PS_MAX_LINES" ] && echo "(!! TRUNCATED: showing the first ${SNAP_PS_MAX_LINES} of ${_ps_n} ps rows -- $((_ps_n - SNAP_PS_MAX_LINES)) were dropped)"
+    printf '%s\n' "$_ps" | head -"$SNAP_PS_MAX_LINES"
     echo
     echo "--- last 50 lines of dolt.log ---"
     { tail -50 "$CITY/.gc/runtime/packs/dolt/dolt.log" 2>/dev/null || echo "(not found)"; } \
       | cut -c1-"$SNAP_LINE_MAX"
     echo
     echo "--- short-lived 'dolt' CLI process count in the last 60s (ga-oyw1tw burst lead) ---"
-    timeout 20 log show --last 1m --predicate \
+    # This number is the evidence for the burst hypothesis, so it must never be a number
+    # when the query did not actually answer. A bare `| grep -c .` counted the column-header
+    # line ("1" for a window with zero events) and the error line of a failed query ("1"),
+    # and a timed-out query printed "0" -- all three read as "no burst", the one conclusion
+    # a query that could not run must not support, under the same memory pressure that made
+    # it time out. So: count only real event lines (they start with a timestamp), and say
+    # UNAVAILABLE when `log show` timed out (124) or failed (any other nonzero).
+    _bs="$(timeout "$SNAP_BURST_TIMEOUT" log show --last 1m --predicate \
       'eventMessage contains "Retrieve User by ID" AND processImagePath contains "dolt"' \
-      2>&1 | grep -c . || true
+      2>&1)"
+    _bs_rc=$?
+    if [ "$_bs_rc" -eq 124 ]; then
+      echo "count: UNAVAILABLE (log show TIMED OUT after ${SNAP_BURST_TIMEOUT}s -- this is NOT 0 events, the burst question is UNANSWERED)"
+    elif [ "$_bs_rc" -ne 0 ]; then
+      echo "count: UNAVAILABLE (log show FAILED rc=${_bs_rc}: $(printf '%s\n' "$_bs" | head -1 | cut -c1-200) -- this is NOT 0 events, the burst question is UNANSWERED)"
+    else
+      echo "count: $(printf '%s\n' "$_bs" | grep -cE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' || true)"
+    fi
     echo
     echo "--- exit status/signal of the previous PID, if the supervisor recorded one ---"
     echo "(no such record is currently exposed by the supervisor; dolt-state.json above only has the CURRENT pid/started_at)"
+    echo "$SNAP_END_MARK"
   } > "$_out" 2>&1
+  _wrc=$?
   printf '%s' "$_out"
+  # "captured" must mean the file is whole. The disk this runs on has already filled once
+  # (no space left on device); a redirect that could not open the file, or a write that
+  # died midway, used to fall through to printf of the path and the caller logged
+  # "snapshot captured" for a file that was absent, empty, or cut short. The end-mark is
+  # the last line written, so its absence means the write did not finish.
+  [ "$_wrc" -eq 0 ] && [ "$(tail -1 "$_out" 2>/dev/null)" = "$SNAP_END_MARK" ]
 }
 
 # Compares the PID this run observes against the PID the LAST run recorded.
@@ -172,6 +212,19 @@ check_pid_change() {
   local _cur _prev _changed=0
   _cur="${DOLT_WATCHDOG_PID_OVERRIDE-$(dolt_server_pid || true)}"
   _prev="$(cat "$LASTPID_FILE" 2>/dev/null || true)"
+
+  # dolt_server_pid's own contract (dolt-pid-lib.sh): empty = UNKNOWN, not "no server".
+  # Its lsof/ps verification can miss a live server under exactly the saturation this
+  # snapshot exists for. If the PID recorded last run still answers `kill -0` (signal 0
+  # never delivers anything), the server did not go anywhere: keep the baseline and say the
+  # lookup was unknown, instead of logging a "disappearance", writing a snapshot and
+  # deleting the baseline -- which would also hide a real death+respawn that lands before
+  # the next run (the next run would find no baseline to diff against).
+  if [ -z "$_cur" ] && [ -n "$_prev" ] && kill -0 "$_prev" 2>/dev/null; then
+    log "Dolt PID lookup came back EMPTY but the previous PID ${_prev} is still alive -- treating as UNKNOWN (resolver miss), baseline kept at ${_prev}, no snapshot"
+    return 0
+  fi
+
   [ -n "$_prev" ] && [ "$_prev" != "$_cur" ] && _changed=1
 
   if is_dry_run; then
@@ -180,11 +233,18 @@ check_pid_change() {
     fi
   else
     if [ "$_changed" -eq 1 ]; then
-      local _snap
-      _snap="$(capture_death_snapshot "$_prev" "$_cur")"
-      log "Dolt PID CHANGED (${_prev} -> ${_cur:-<none>}) -- forensic snapshot captured: ${_snap}"
+      local _snap _snap_rc
+      _snap="$(capture_death_snapshot "$_prev" "$_cur")"; _snap_rc=$?
+      if [ "$_snap_rc" -eq 0 ]; then
+        log "Dolt PID CHANGED (${_prev} -> ${_cur:-<none>}) -- forensic snapshot captured: ${_snap}"
+      else
+        log "Dolt PID CHANGED (${_prev} -> ${_cur:-<none>}) -- forensic snapshot capture FAILED or INCOMPLETE (rc=${_snap_rc}; disk full or DEATH_LOG_DIR unwritable?): ${_snap:-<no path>}"
+      fi
     fi
-    if [ -n "$_cur" ]; then printf '%s' "$_cur" > "$LASTPID_FILE"; else rm -f "$LASTPID_FILE" 2>/dev/null || true; fi
+    if [ -n "$_cur" ]; then
+      printf '%s' "$_cur" > "$LASTPID_FILE" 2>/dev/null \
+        || log "WARN: could not write the Dolt PID baseline ${LASTPID_FILE} -- the next run will diff against a stale or missing baseline"
+    else rm -f "$LASTPID_FILE" 2>/dev/null || true; fi
   fi
 }
 

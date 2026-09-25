@@ -283,9 +283,23 @@ fi
 #
 # Tested with DOLT_WATCHDOG_PID_OVERRIDE (same seam as DOLT_WATCHDOG_CPU_PID
 # above) so a PID change can be simulated across invocations without a real
-# Dolt process, entirely isolated (scratch LASTPID_FILE + DEATH_LOG_DIR), and
-# a fake `gc` on PATH so probe_ok() resolves deterministically and the run
-# exits via the ordinary healthy path right after check_pid_change(). ──
+# Dolt process, entirely isolated, and a fake `gc` on PATH so probe_ok()
+# resolves deterministically and the run exits via the ordinary healthy path
+# right after check_pid_change().
+#
+# HERMETIC BY CONSTRUCTION (gate ga-u9utfa, blocking issue 2 -- the same class as
+# ga-153cq gate attempts 2 and 3 in this very file): the healthy branch of the script
+# runs `rm -f` on $STRIKES and $CPU_VETO_FILE. Invoked without overriding both, every
+# run here deleted the REAL watchdog's live counters at /tmp/dolt-hang-watchdog.*,
+# resetting the consecutive-strike progress of a genuinely failing Dolt. Listing the
+# two overrides at each call site is how six call sites forgot them, so there is now
+# exactly ONE way to run the script in this block -- _wd() -- and it always sets every
+# scratch path (LOG, STRIKES, CPU_VETO, LASTPID, DEATH_LOG_DIR). Extra env goes in as
+# arguments. Nothing in this block may call `bash "$SRC"` any other way.
+#
+# The fake `log` is installed FROM THE START, not only where a case needs to control
+# it: the real `log show` takes ~10-20s per call under load (this file took 2 minutes
+# and every case depended on what the host's unified log happened to contain). ──
 echo
 echo "ga-xyhl9d: PID-change forensic snapshot (check_pid_change / capture_death_snapshot)"
 if [ -f "$SRC" ]; then
@@ -300,62 +314,141 @@ fi
 exit 1
 FAKE
   chmod +x "$_tmpd4/bin/gc"
+
+  # Fake `log`: answers the two windows the snapshot asks for. FAKE_LOG_MODE drives the
+  # forensic window (--last 3m), FAKE_BURST_MODE the burst-count window (--last 1m).
+  # Default (both unset) is a quiet host: no events, exit 0. The `_hdr` line is the
+  # column header the REAL `log show` prints even for a zero-event window (measured).
+  cat > "$_tmpd4/bin/log" <<'FAKE'
+#!/usr/bin/env bash
+_ev()  { echo "2026-09-25 00:26:43.000000-0300 0x1 Default 0x0 1 0 kernel: $1;"; }
+_hdr() { echo "Timestamp                       Thread     Type        Activity             PID    TTL  "; }
+case "$*" in
+  *"--last 3m"*)
+    case "${FAKE_LOG_MODE:-}" in
+      many)  i=0; while [ "$i" -lt 1500 ]; do _ev "seq=$i"; i=$((i+1)); done ;;
+      slow)  echo "partial-line-before-timeout"; exec sleep 5 ;;
+      few)   _ev "seq=0" ;;
+      fail3) echo "log: Bad predicate (Unable to parse the format string \"x\"): x" >&2; exit 64 ;;
+    esac ;;
+  *"--last 1m"*)
+    case "${FAKE_BURST_MODE:-}" in
+      burst) _hdr; i=0; while [ "$i" -lt 7 ]; do _ev "Retrieve User by ID $i"; i=$((i+1)); done ;;
+      zero)  _hdr ;;
+      slow)  _hdr; exec sleep 5 ;;
+      fail)  echo "log: Bad predicate (Unable to parse the format string \"x\"): x" >&2; exit 64 ;;
+    esac ;;
+esac
+exit 0
+FAKE
+  chmod +x "$_tmpd4/bin/log"
+
   _lastpid="$_tmpd4/lastpid"
   _deaths="$_tmpd4/deathlogs"
   _count_deaths() { find "$_deaths" -maxdepth 1 -name 'dolt-death-*.txt' 2>/dev/null | wc -l | tr -d ' '; }
+  _newest_snap()  { find "$_deaths" -maxdepth 1 -name 'dolt-death-*.txt' 2>/dev/null | head -1; }
+  # THE one way to run the script in this block. See the HERMETIC note above.
+  _wd() {
+    env PATH="$_tmpd4/bin:$PATH" DOLT_WATCHDOG_LOG="$_tmpd4/l" \
+        DOLT_WATCHDOG_STRIKES_FILE="$_tmpd4/s" DOLT_WATCHDOG_CPU_VETO_FILE="$_tmpd4/v" \
+        DOLT_WATCHDOG_LASTPID_FILE="$_lastpid" DOLT_WATCHDOG_DEATH_LOG_DIR="$_deaths" \
+        "$@" bash "$SRC" >/dev/null 2>&1
+  }
 
   # (1) First-ever observation: no baseline on disk -> no snapshot, baseline established.
-  env PATH="$_tmpd4/bin:$PATH" DOLT_WATCHDOG_LOG="$_tmpd4/l" \
-      DOLT_WATCHDOG_LASTPID_FILE="$_lastpid" DOLT_WATCHDOG_DEATH_LOG_DIR="$_deaths" \
-      DOLT_WATCHDOG_PID_OVERRIDE=1111 bash "$SRC" >/dev/null 2>&1
+  #     Also the POSITIVE CONTROL for hermeticity: seed scratch strikes/veto, and require
+  #     that the healthy branch consumed THESE. If _wd stopped pointing the script at the
+  #     scratch paths, it would consume (or miss) the real /tmp files instead and these
+  #     scratch files would survive.
+  echo 2 > "$_tmpd4/s"; echo 3 > "$_tmpd4/v"
+  _wd DOLT_WATCHDOG_PID_OVERRIDE=1111
   [ "$(_count_deaths)" = "0" ] && ok "first observation (no baseline) -> no snapshot fired" \
                                || bad "first observation should not fire a snapshot -- $(_count_deaths) file(s) found"
   [ "$(cat "$_lastpid" 2>/dev/null)" = "1111" ] && ok "first observation establishes baseline (lastpid=1111)" \
                                || bad "baseline not established after first observation: $(cat "$_lastpid" 2>/dev/null)"
+  if [ ! -e "$_tmpd4/s" ] && [ ! -e "$_tmpd4/v" ] && grep -q 'Dolt healthy again .* clearing 2 strike' "$_tmpd4/l" 2>/dev/null; then
+    ok "hermetic: the healthy branch consumed the SCRATCH strikes/veto (seeded 2/3), never the real /tmp counters"
+  else
+    bad "ga-u9utfa regressao: scratch strikes/veto were not the ones the script touched -- _wd no longer isolates the live watchdog counters"
+  fi
 
   # (2) Same PID observed again -> still no snapshot, baseline unchanged.
-  env PATH="$_tmpd4/bin:$PATH" DOLT_WATCHDOG_LOG="$_tmpd4/l" \
-      DOLT_WATCHDOG_LASTPID_FILE="$_lastpid" DOLT_WATCHDOG_DEATH_LOG_DIR="$_deaths" \
-      DOLT_WATCHDOG_PID_OVERRIDE=1111 bash "$SRC" >/dev/null 2>&1
+  _wd DOLT_WATCHDOG_PID_OVERRIDE=1111
   [ "$(_count_deaths)" = "0" ] && ok "unchanged PID (1111 -> 1111) -> no snapshot fired" \
                                || bad "unchanged PID should not fire a snapshot -- $(_count_deaths) file(s) found"
 
   # (3) PID CHANGES (1111 -> 2222) -> exactly one snapshot, baseline advances.
-  env PATH="$_tmpd4/bin:$PATH" DOLT_WATCHDOG_LOG="$_tmpd4/l" \
-      DOLT_WATCHDOG_LASTPID_FILE="$_lastpid" DOLT_WATCHDOG_DEATH_LOG_DIR="$_deaths" \
-      DOLT_WATCHDOG_PID_OVERRIDE=2222 bash "$SRC" >/dev/null 2>&1
+  _wd DOLT_WATCHDOG_PID_OVERRIDE=2222
   [ "$(_count_deaths)" = "1" ] && ok "PID changed (1111 -> 2222) -> exactly one snapshot fired" \
                                || bad "PID change should fire exactly one snapshot -- found $(_count_deaths)"
   [ "$(cat "$_lastpid" 2>/dev/null)" = "2222" ] && ok "baseline advanced to new PID (2222)" \
                                || bad "baseline did not advance: $(cat "$_lastpid" 2>/dev/null)"
-  _snap1="$(find "$_deaths" -maxdepth 1 -name 'dolt-death-*.txt' 2>/dev/null | head -1)"
+  _snap1="$(_newest_snap)"
   if [ -n "$_snap1" ] && grep -q 'previous_pid: 1111' "$_snap1" && grep -q 'current_pid:  2222' "$_snap1"; then
     ok "snapshot file records old and new PID correctly"
   else
     bad "snapshot file missing or does not record previous/current PID as expected: ${_snap1:-<none>}"
   fi
+  [ -n "$_snap1" ] && [ "$(tail -1 "$_snap1")" = "=== end of snapshot ===" ] \
+    && ok "snapshot ends with its end-mark (the file is whole)" \
+    || bad "ga-u9utfa: snapshot has no end-mark as its last line -- completeness cannot be checked"
   grep -q 'Dolt PID CHANGED (1111 -> 2222)' "$_tmpd4/l" 2>/dev/null \
     && ok "watchdog log records the PID-change event" \
     || bad "watchdog log missing the PID-change event line"
+  grep -q 'forensic snapshot captured:' "$_tmpd4/l" 2>/dev/null \
+    && ok "a whole snapshot is logged as captured" \
+    || bad "a successful capture was not logged as captured"
 
-  # (4) PID DISAPPEARS (2222 -> <none>) -> a second snapshot, baseline cleared.
-  env PATH="$_tmpd4/bin:$PATH" DOLT_WATCHDOG_LOG="$_tmpd4/l" \
-      DOLT_WATCHDOG_LASTPID_FILE="$_lastpid" DOLT_WATCHDOG_DEATH_LOG_DIR="$_deaths" \
-      DOLT_WATCHDOG_PID_OVERRIDE= bash "$SRC" >/dev/null 2>&1
-  [ "$(_count_deaths)" = "2" ] && ok "PID disappeared (2222 -> none) -> a second snapshot fired" \
-                               || bad "PID disappearance should fire a snapshot -- found $(_count_deaths), expected 2"
-  [ -f "$_lastpid" ] && bad "lastpid file should be removed once the PID disappears, but it still exists" \
-                     || ok "lastpid file removed once the PID disappears"
+  # (4) PID DISAPPEARS -> a second snapshot, baseline cleared. The previous PID must be
+  #     really DEAD now (a child we started and reaped): an empty lookup with a still-alive
+  #     previous PID is a different case, (4b). Fake PIDs like 2222 would make this depend
+  #     on whether the host happens to have a process with that number.
+  sleep 0 & _deadpid=$!; wait "$_deadpid" 2>/dev/null
+  if kill -0 "$_deadpid" 2>/dev/null; then
+    bad "test precondition: reaped PID ${_deadpid} still answers kill -0 -- disappearance case not exercised"
+  else
+    echo "$_deadpid" > "$_lastpid"
+    _wd DOLT_WATCHDOG_PID_OVERRIDE=
+    [ "$(_count_deaths)" = "2" ] && ok "PID disappeared (dead ${_deadpid} -> none) -> a second snapshot fired" \
+                                 || bad "PID disappearance should fire a snapshot -- found $(_count_deaths), expected 2"
+    [ -f "$_lastpid" ] && bad "lastpid file should be removed once the PID disappears, but it still exists" \
+                       || ok "lastpid file removed once the PID disappears"
+  fi
+
+  # (4b) Resolver returns EMPTY but the previous PID is still ALIVE. dolt_server_pid's own
+  #      contract says empty = UNKNOWN (its lsof/ps verification can miss a live server under
+  #      saturation), so this must NOT be logged as a death: no snapshot, baseline kept -- and
+  #      the payoff, a real death+respawn on the NEXT run is still caught because the
+  #      baseline survived (before: baseline deleted -> that change was invisible).
+  sleep 60 & _livepid=$!
+  echo "$_livepid" > "$_lastpid"
+  _before="$(_count_deaths)"
+  : > "$_tmpd4/l"
+  _wd DOLT_WATCHDOG_PID_OVERRIDE=
+  [ "$(_count_deaths)" = "$_before" ] && ok "empty lookup + previous PID alive -> UNKNOWN, no snapshot fired" \
+                                      || bad "ga-xyhl9d: an EMPTY (unknown) lookup with a live previous PID fired a snapshot as if Dolt had died"
+  [ "$(cat "$_lastpid" 2>/dev/null)" = "$_livepid" ] && ok "baseline KEPT through the unknown lookup (still ${_livepid})" \
+                                                     || bad "ga-xyhl9d: unknown lookup deleted/changed the baseline ($(cat "$_lastpid" 2>/dev/null))"
+  grep -q 'treating as UNKNOWN' "$_tmpd4/l" 2>/dev/null \
+    && ok "the unknown lookup is SAID in the log (not silent)" \
+    || bad "ga-xyhl9d: unknown lookup left no line in the log"
+  _wd DOLT_WATCHDOG_PID_OVERRIDE=8888
+  _snap4b="$(grep -l 'current_pid:  8888' "$_deaths"/dolt-death-*.txt 2>/dev/null | head -1)"
+  if [ "$(_count_deaths)" = "$((_before + 1))" ] && [ -n "$_snap4b" ] && grep -q "previous_pid: ${_livepid}" "$_snap4b"; then
+    ok "a real change right after the unknown run (${_livepid} -> 8888) is still caught"
+  else
+    bad "ga-xyhl9d: the change after an unknown lookup was lost (deaths=$(_count_deaths), expected $((_before + 1)))"
+  fi
+  kill "$_livepid" 2>/dev/null; wait "$_livepid" 2>/dev/null
 
   # (5) DRY_RUN must not create a snapshot file or advance the real baseline,
   #     but must still report what it WOULD have done (same promise as every
   #     other mutation site in this file).
+  _before="$(_count_deaths)"
   echo 3333 > "$_lastpid"
-  env PATH="$_tmpd4/bin:$PATH" DOLT_WATCHDOG_LOG="$_tmpd4/l" \
-      DOLT_WATCHDOG_LASTPID_FILE="$_lastpid" DOLT_WATCHDOG_DEATH_LOG_DIR="$_deaths" \
-      DOLT_WATCHDOG_PID_OVERRIDE=4444 DOLT_WATCHDOG_DRY_RUN=1 bash "$SRC" >/dev/null 2>&1
-  [ "$(_count_deaths)" = "2" ] && ok "DRY-RUN PID change -> no new snapshot written (still 2)" \
-                               || bad "DRY-RUN should not write a snapshot -- found $(_count_deaths), expected 2"
+  _wd DOLT_WATCHDOG_PID_OVERRIDE=4444 DOLT_WATCHDOG_DRY_RUN=1
+  [ "$(_count_deaths)" = "$_before" ] && ok "DRY-RUN PID change -> no new snapshot written (still ${_before})" \
+                                      || bad "DRY-RUN should not write a snapshot -- found $(_count_deaths), expected ${_before}"
   [ "$(cat "$_lastpid" 2>/dev/null)" = "3333" ] && ok "DRY-RUN does not advance the real lastpid baseline (still 3333)" \
                                || bad "ga-xyhl9d regressao: DRY-RUN mutated the real lastpid file ($(cat "$_lastpid" 2>/dev/null))"
   grep -q 'DRY-RUN: Dolt PID changed (3333 -> 4444)' "$_tmpd4/l" 2>/dev/null \
@@ -367,10 +460,18 @@ FAKE
   #     "dolt", sits in argv: ~100 KB per line) and one snapshot came out 1.1 MB,
   #     90% of it that section, burying the dolt/supervisor rows. A fake `ps -ef`
   #     reproduces that shape; any other `ps` call falls through to the real one so
-  #     the rest of the script is unaffected.
+  #     the rest of the script is unaffected. FAKE_PS_MODE: `empty` = ps produced
+  #     nothing, `rows` = 130 dolt-matching rows (over the 120-row cap).
   cat > "$_tmpd4/bin/ps" <<'FAKE'
 #!/usr/bin/env bash
 if [ "${1:-}" = "-ef" ]; then
+  case "${FAKE_PS_MODE:-}" in
+    empty) exit 1 ;;
+    rows)
+      echo "  UID   PID  PPID   C STIME   TTY           TIME CMD"
+      i=0; while [ "$i" -lt 130 ]; do echo "  501 5${i} 1 0 8:00AM ?? 0:00.00 dolt worker $i"; i=$((i+1)); done
+      exit 0 ;;
+  esac
   echo "  UID   PID  PPID   C STIME   TTY           TIME CMD"
   echo "  501 63228     1   0  8:00AM ??         1:00.00 /opt/homebrew/bin/dolt sql-server --config /x/dolt-config.yaml"
   for _i in 1 2 3; do
@@ -385,10 +486,8 @@ FAKE
   chmod +x "$_tmpd4/bin/ps"
   rm -f "$_deaths"/dolt-death-*.txt
   echo 5555 > "$_lastpid"
-  env PATH="$_tmpd4/bin:$PATH" DOLT_WATCHDOG_LOG="$_tmpd4/l" \
-      DOLT_WATCHDOG_LASTPID_FILE="$_lastpid" DOLT_WATCHDOG_DEATH_LOG_DIR="$_deaths" \
-      DOLT_WATCHDOG_PID_OVERRIDE=6666 bash "$SRC" >/dev/null 2>&1
-  _snap6="$(find "$_deaths" -maxdepth 1 -name 'dolt-death-*.txt' 2>/dev/null | head -1)"
+  _wd DOLT_WATCHDOG_PID_OVERRIDE=6666
+  _snap6="$(_newest_snap)"
   if [ -n "$_snap6" ]; then
     _ps6="$(awk '/^--- ps:/{f=1;next} /^--- /{f=0} f' "$_snap6")"
     printf '%s' "$_ps6" | grep -q 'dolt sql-server --config /x/dolt-config.yaml' \
@@ -401,30 +500,39 @@ FAKE
     [ "$_allmax" -le 1000 ] && ok "no line anywhere in the snapshot exceeds 1000 chars (longest ${_allmax})" \
                             || bad "ga-xyhl9d regressao: snapshot has a ${_allmax}-char line -- some section embeds unbounded external text"
   else
-    bad "ga-xyhl9d: bounded-snapshot case produced no snapshot file at all"
+    bad "ga-xyhl9d: bounded-snapshot case produced no snapshot file"
   fi
+
+  # (6b) The ps section states its own cap and its own failure -- the log section already
+  #      does; a `head -120` with no note (or an empty section when `ps` itself failed) reads
+  #      as "these are all the rows" / "no dolt process".
+  _runps() {  # $1 = FAKE_PS_MODE; leaves the newest snapshot path in $_snapps
+    rm -f "$_deaths"/dolt-death-*.txt; echo 6000 > "$_lastpid"
+    _wd FAKE_PS_MODE="$1" DOLT_WATCHDOG_PID_OVERRIDE=6001
+    _snapps="$(_newest_snap)"
+  }
+  _runps rows
+  if [ -n "$_snapps" ]; then
+    grep -q 'TRUNCATED: showing the first 120 of 131 ps rows -- 11 were dropped' "$_snapps" \
+      && ok "ps rows over the cap -> snapshot states the truncation (first 120 of 131)" \
+      || bad "ga-xyhl9d: ps rows truncated 131 -> 120 with NO note in the snapshot"
+  else bad "ga-xyhl9d: ps-cap case produced no snapshot file"; fi
+  _runps empty
+  if [ -n "$_snapps" ]; then
+    grep -q 'ps returned NO rows -- the process tree is UNKNOWN' "$_snapps" \
+      && ok "ps produced nothing -> snapshot says the tree is UNKNOWN (not an empty section)" \
+      || bad "ga-xyhl9d: ps failure left an empty section indistinguishable from 'no dolt process'"
+  else bad "ga-xyhl9d: ps-failure case produced no snapshot file"; fi
 
   # (7) Truncation and timeout of the `log show` window must be STATED in the file,
   #     not silent. Measured 2026-09-25: under memory pressure jetsam/memorystatus lines
   #     alone filled the 1000-line cap and `tail` dropped the oldest ~47s of the 3-minute
   #     window -- the part that would hold the moment of death -- with nothing in the file
-  #     saying so. A fake `log` answers only the forensic (--last 3m) window.
-  cat > "$_tmpd4/bin/log" <<'FAKE'
-#!/usr/bin/env bash
-case "$*" in *"--last 3m"*) ;; *) exit 0 ;; esac
-case "${FAKE_LOG_MODE:-}" in
-  many) i=0; while [ "$i" -lt 1500 ]; do echo "2026-09-25 00:26:43.000000-0300 0x1 Default 0x0 1 0 kernel: seq=$i;"; i=$((i+1)); done ;;
-  slow) echo "partial-line-before-timeout"; sleep 5 ;;
-  few)  echo "2026-09-25 00:26:43.000000-0300 0x1 Default 0x0 1 0 kernel: seq=0;" ;;
-esac
-FAKE
-  chmod +x "$_tmpd4/bin/log"
-  _run7() {  # $1 = FAKE_LOG_MODE, $2 = extra env (or empty); leaves the newest snapshot path in $_snap7
+  #     saying so.
+  _run7() {  # $1 = FAKE_LOG_MODE, $2 = extra env words (or empty); leaves the newest snapshot path in $_snap7
     rm -f "$_deaths"/dolt-death-*.txt; echo 7000 > "$_lastpid"
-    env PATH="$_tmpd4/bin:$PATH" DOLT_WATCHDOG_LOG="$_tmpd4/l" FAKE_LOG_MODE="$1" $2 \
-        DOLT_WATCHDOG_LASTPID_FILE="$_lastpid" DOLT_WATCHDOG_DEATH_LOG_DIR="$_deaths" \
-        DOLT_WATCHDOG_PID_OVERRIDE=7001 bash "$SRC" >/dev/null 2>&1
-    _snap7="$(find "$_deaths" -maxdepth 1 -name 'dolt-death-*.txt' 2>/dev/null | head -1)"
+    _wd FAKE_LOG_MODE="$1" $2 DOLT_WATCHDOG_PID_OVERRIDE=7001
+    _snap7="$(_newest_snap)"
   }
 
   _run7 many ""
@@ -439,9 +547,9 @@ FAKE
 
   _run7 few ""
   if [ -n "$_snap7" ]; then
-    { ! grep -q 'TRUNCATED' "$_snap7" && ! grep -q 'TIMED OUT' "$_snap7"; } \
-      && ok "small window -> no truncation / timeout note (markers are not unconditional)" \
-      || bad "ga-xyhl9d: a 1-line window carried a TRUNCATED/TIMED OUT note -- the markers fire unconditionally"
+    { ! grep -q 'TRUNCATED' "$_snap7" && ! grep -q 'TIMED OUT' "$_snap7" && ! grep -q 'FAILED rc=' "$_snap7" && ! grep -q 'UNAVAILABLE' "$_snap7"; } \
+      && ok "small window -> no truncation / timeout / failure / unavailable note (markers are not unconditional)" \
+      || bad "ga-xyhl9d: a healthy 1-line window carried a TRUNCATED/TIMED OUT/FAILED/UNAVAILABLE note -- the markers fire unconditionally"
   else bad "ga-xyhl9d: control case produced no snapshot file"; fi
 
   _run7 slow "DOLT_WATCHDOG_SNAP_LOG_TIMEOUT=1"
@@ -450,6 +558,64 @@ FAKE
       && ok "log show timeout -> snapshot says the window is PARTIAL (not silent)" \
       || bad "ga-xyhl9d: log show timed out with NO note in the snapshot (silent partial window)"
   else bad "ga-xyhl9d: timeout case produced no snapshot file"; fi
+
+  # (7b) A `log show` that FAILS (not times out) prints an error message; without a note it
+  #      sat in the window section looking like log events (gate ga-u9utfa: instance fixed
+  #      for the timeout, class not swept). Real `log show` exits 64 on a bad predicate.
+  _run7 fail3 ""
+  if [ -n "$_snap7" ]; then
+    grep -q 'log show FAILED rc=64' "$_snap7" \
+      && ok "log show failure (rc=64) -> the forensic window says its lines are an ERROR, not events" \
+      || bad "ga-u9utfa: a failed log show (rc=64) left its error text in the window with no note"
+  else bad "ga-u9utfa: log-failure case produced no snapshot file"; fi
+
+  # (8) The burst count (ga-oyw1tw hypothesis evidence) must never be a NUMBER when the
+  #     query did not answer. Measured against the real `log show`: a zero-event window
+  #     prints the column header (a bare `grep -c .` said 1), a bad predicate prints one
+  #     error line and exits 64 (said 1), a timeout-killed query printed 0, and N real
+  #     events said N+1 -- so "no burst" and "could not look" were the same number.
+  _run7 few "FAKE_BURST_MODE=burst"
+  if [ -n "$_snap7" ]; then
+    grep -qx 'count: 7' "$_snap7" \
+      && ok "burst: 7 events (+ column header) -> count: 7 (header not counted)" \
+      || bad "ga-u9utfa: 7 real events + header did not yield 'count: 7' -- got: $(grep -m1 '^count:' "$_snap7")"
+  else bad "ga-u9utfa: burst case produced no snapshot file"; fi
+
+  _run7 few "FAKE_BURST_MODE=zero"
+  if [ -n "$_snap7" ]; then
+    grep -qx 'count: 0' "$_snap7" \
+      && ok "zero-event window (header only) -> count: 0 (was 1: the header counted as an event)" \
+      || bad "ga-u9utfa: a zero-event window did not yield 'count: 0' -- got: $(grep -m1 '^count:' "$_snap7")"
+  else bad "ga-u9utfa: zero-window case produced no snapshot file"; fi
+
+  _run7 few "FAKE_BURST_MODE=slow DOLT_WATCHDOG_SNAP_BURST_TIMEOUT=1"
+  if [ -n "$_snap7" ]; then
+    { grep -q 'count: UNAVAILABLE (log show TIMED OUT after 1s' "$_snap7" && ! grep -qE '^count: [0-9]' "$_snap7"; } \
+      && ok "burst query timed out -> count: UNAVAILABLE (never a number that reads as 'no burst')" \
+      || bad "ga-u9utfa: a timed-out burst query did not say UNAVAILABLE -- got: $(grep -m1 '^count:' "$_snap7")"
+  else bad "ga-u9utfa: burst-timeout case produced no snapshot file"; fi
+
+  _run7 few "FAKE_BURST_MODE=fail"
+  if [ -n "$_snap7" ]; then
+    { grep -q 'count: UNAVAILABLE (log show FAILED rc=64' "$_snap7" && ! grep -qE '^count: [0-9]' "$_snap7"; } \
+      && ok "burst query failed (rc=64) -> count: UNAVAILABLE (the error line is not counted as an event)" \
+      || bad "ga-u9utfa: a failed burst query did not say UNAVAILABLE -- got: $(grep -m1 '^count:' "$_snap7")"
+  else bad "ga-u9utfa: burst-failure case produced no snapshot file"; fi
+
+  # (9) "captured" must mean WHOLE. The disk has already run out of space once; a snapshot
+  #     that cannot be written used to be logged as "forensic snapshot captured: <path>" for a
+  #     file that did not exist. DEATH_LOG_DIR under a regular FILE makes mkdir and the
+  #     redirect fail deterministically without needing a full disk.
+  : > "$_tmpd4/afile"
+  echo 9000 > "$_lastpid"
+  : > "$_tmpd4/l"
+  _wd DOLT_WATCHDOG_PID_OVERRIDE=9001 DOLT_WATCHDOG_DEATH_LOG_DIR="$_tmpd4/afile/sub"
+  { grep -q 'forensic snapshot capture FAILED or INCOMPLETE' "$_tmpd4/l" && ! grep -q 'forensic snapshot captured:' "$_tmpd4/l"; } \
+    && ok "snapshot that could not be written -> logged as FAILED, never as captured" \
+    || bad "ga-u9utfa: an unwritable snapshot dir was still logged as 'captured' (log: $(tr '\n' '|' < "$_tmpd4/l" | cut -c1-200))"
+  [ "$(cat "$_lastpid" 2>/dev/null)" = "9001" ] \
+    && ok "baseline still advances when the snapshot fails (no re-fire every run)" \
+    || bad "ga-u9utfa: baseline did not advance after a failed snapshot ($(cat "$_lastpid" 2>/dev/null))"
 
   rm -rf "$_tmpd4"
 else
