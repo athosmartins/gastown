@@ -182,11 +182,13 @@ is_stale_residue_refusal() {
 
 # ga-i99qsp: dolt-backup-reseed.sh's low-disk fallback refuses (exit 1,
 # NOTHING touched — no rename, no delete) when the S3 proof it needs before
-# freeing the old copy early doesn't hold (manifest missing or size
-# incoherent with the fingerprint). Unlike is_disk_margin_refusal this is NOT
-# the expected/self-healing case — the db stays bloated until whatever broke
-# the S3 proof is fixed (a failed upload, a stale fingerprint), so it must
-# notify_fail with its own specific message rather than the generic one.
+# freeing the old copy early doesn't hold (ga-gsnee8: the S3 copy does not
+# restore — a table its manifest names is missing from the bucket — or S3 lacks
+# a file the local copy has, and the proof's own repair upload could not fix
+# that). Unlike is_disk_margin_refusal this is NOT the expected/self-healing
+# case — the db stays bloated until whatever broke the S3 copy is fixed (a
+# failed or timed-out upload), so it must notify_fail with its own specific
+# message rather than the generic one.
 is_low_disk_proof_failed_refusal() {
   case "$1" in
     *"prova do S3 FALHOU"*) return 0 ;;

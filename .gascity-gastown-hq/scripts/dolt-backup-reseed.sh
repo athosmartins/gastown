@@ -52,9 +52,10 @@
 # constrói o backup novo com o antigo ainda no lugar (igual ao fluxo normal);
 # só quando o disco livre APÓS construir o novo não bastar para a verificação
 # (a segunda cópia), libera o antigo MAIS CEDO que o normal -- mas nunca sem
-# antes provar, via S3 (a MESMA prova que dolt-backup-residue-reclaim.sh usa
-# para liberar resíduo .old: manifest presente + tamanho coerente com o
-# fingerprint), que a cópia local prestes a ser apagada já está espelhada lá.
+# antes provar, via S3, que a cópia local prestes a ser apagada já está
+# espelhada lá E que a cópia do S3 RESTAURA (ga-gsnee8: a prova anterior era só
+# "o OBJETO manifest existe" + razão de tamanho, que não diz nada sobre
+# restaurar -- ver "PROVA DE S3 DO MODO DE BAIXO DISCO" abaixo).
 # Se a prova falhar: NADA é apagado (fail-closed). Se passar e algo DEPOIS
 # falhar (restore, contagem, promoção): o banco fica temporariamente SEM
 # backup local -- log e saída marcam isso explicitamente ("SEM BACKUP LOCAL")
@@ -72,14 +73,41 @@
 # Mesmo catch-22 de ga-i99qsp, com o limiar menor.
 #
 # Quando nem uma cópia nova cabe com o antigo no lugar (Preflight 2), mas
-# LIBERAR o antigo abriria espaço suficiente (livre + tamanho do antigo >=
-# 120% do vivo), a ordem se inverte por completo: prova via S3 -> libera o
-# antigo -> só ENTÃO constrói a cópia nova -> verifica -> promove. A MESMA
-# prova de duas partes do modo de baixo disco normal (nunca uma prova mais
+# LIBERAR o antigo abriria espaço suficiente, a ordem se inverte por completo:
+# prova via S3 -> libera o antigo -> só ENTÃO constrói a cópia nova -> verifica
+# -> promove. A MESMA prova do modo de baixo disco normal (nunca uma prova mais
 # fraca só porque a situação é mais urgente); se falhar, nada é apagado. Se a
-# liberação nem bastaria (livre + antigo ainda < 120% do vivo), o script
-# recusa exatamente como antes -- apagar o antigo sem conseguir reconstruir
-# o novo não ajudaria em nada.
+# liberação nem bastaria, o script recusa -- apagar o antigo sem conseguir
+# reconstruir o novo não ajudaria em nada.
+#
+# ⚠️ "BASTARIA" É UMA CONTA DE DUAS CÓPIAS, NÃO DE UMA (ga-gsnee8). Este bloco
+# dizia "livre + antigo >= 120% do vivo" -- o espaço de UMA cópia nova. Mas o
+# mecanismo constrói NEW_DIR (~1x vivo) e, ANTES de promover, restaura NEW_DIR
+# em VERIFY_DIR (~1x vivo, sob /tmp, no MESMO volume): as duas coexistem. Com
+# livre ~3GB o hq passava no limiar de 120% e o disco estourava no meio da
+# restauração -- com o antigo JÁ apagado (mesma classe do outage de ga-odtd3f).
+# A conta correta é cópia nova (120%) + cópia da restauração
+# (RESEED_RESTORE_COPY_PCT, default 100%) = 220% do vivo.
+#
+# ═══ PROVA DE S3 DO MODO DE BAIXO DISCO (ga-gsnee8) ═══
+#
+# Os dois pontos que apagam o antigo mais cedo (Passo 0.5 e Passo 1.5) só
+# apagam com a prova de dolt-backup-s3-proof.sh (_s3proof_repair_then_prove):
+#   1. o backup LOCAL a apagar é um backup fechado (toda tabela que o seu
+#      manifest nomeia existe);
+#   2. o backup do S3 é fechado (toda tabela que o manifest DO S3 nomeia existe
+#      no bucket) -- ou seja, RESTAURA;
+#   3. o S3 já tem cada arquivo do local (mesmo tamanho, não mais antigo).
+# Se não provar, a lib tenta REPARAR (espelha o local para o S3, tabelas antes
+# do manifest, aditivo) e prova de novo; se ainda não provar, NADA é apagado.
+#
+# A prova anterior era "head-object do manifest" + razão de tamanho contra o
+# fingerprint (_meta/latest.json). Nenhuma das duas diz que a cópia restaura.
+# MEDIDO 2026-09-25 no hq: o manifest existia (4089 B) e nomeava uma tabela
+# que NÃO estava no bucket, com 31 arquivos (2,69GB) nunca enviados -- cópia
+# irrestaurável que a prova fraca chamaria de boa. Só NÃO autorizou apagar o
+# único staging completo porque o hq tinha sumido do fingerprint naquela
+# semana (size_ok=0): um acidente, não uma guarda.
 #
 # ═══ PUBLICAÇÃO DO FINGERPRINT APÓS TROCA (ga-6xo4r0) ═══
 #
@@ -112,12 +140,16 @@ set -uo pipefail
 
 # shellcheck disable=SC1091
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dolt-offline-backup-sync.sh"
-# ga-i99qsp: reusa a prova S3 (manifest head-object + coerência de tamanho via
-# _meta/latest.json) que dolt-backup-residue-reclaim.sh já tem testada, em vez
-# de reimplementar o parsing de fingerprint uma segunda vez (_parse_fingerprint_to_file
-# e _size_coherent). LIB mode só define funções/variáveis, não varre nem apaga nada.
+# Do residue-reclaim vêm AWS/BUCKET/AWS_TIMEOUT_SECS/PY (usados pela publicação
+# do fingerprint abaixo e pela lib de prova S3). LIB mode só define
+# funções/variáveis, não varre nem apaga nada.
 # shellcheck disable=SC1091
 DOLT_BACKUP_RESIDUE_RECLAIM_LIB=1 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dolt-backup-residue-reclaim.sh"
+# ga-gsnee8: a prova de que o S3 RESTAURA (fecho do manifest local + S3 + espelho
+# idêntico) mora numa lib só, compartilhada com dolt-s3-backup.sh e
+# dolt-gc-maintenance.sh (ga-btnq6h). Executa-se a lib; não se reimplementa.
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dolt-backup-s3-proof.sh"
 
 # ga-6xo4r0 / ga-tyaozh: aws-cli/botocore defaults to wrapping every S3
 # PutObject/UploadPart body in botocore.httpchecksum.AwsChunkedWrapper (a
@@ -184,6 +216,26 @@ RESEED_S3_SYNC_TIMEOUT_SECS="${RESEED_S3_SYNC_TIMEOUT_SECS:-1200}"
 # the swap itself, which has already succeeded and been verified by the
 # time this step runs either way.
 RESEED_PUBLISH_FINGERPRINT="${RESEED_PUBLISH_FINGERPRINT:-1}"
+# ga-gsnee8: tamanho da cópia da RESTAURAÇÃO DE VERIFICAÇÃO (VERIFY_DIR), em %
+# do vivo. É a segunda cópia que coexiste com NEW_DIR antes da troca (ver o
+# cabeçalho, "BASTARIA É UMA CONTA DE DUAS CÓPIAS"). 100 = a restauração ocupa
+# ~1x o vivo. Só entra na conta do modo ULTRA (Preflight 2).
+RESTORE_COPY_PCT="${RESEED_RESTORE_COPY_PCT:-100}"
+# ga-gsnee8: a prova de S3 do modo de baixo disco pode REPARAR o S3 (espelhar o
+# local para lá) antes de passar. Isso roda dentro do orçamento (~1800s) dos
+# chamadores (dolt-s3-backup.sh, dolt-compact-routine.sh, disk-floor-guard) --
+# e no Passo 1.5 roda com NEW_DIR já construído, então um timeout no meio
+# humano limpar). Por isso: UMA rodada de reparo, upload limitado a 600s e
+# chamadas só-leitura (manifest, listagem, dry-run) a 120s -- os defaults da lib
+# são 2 rodadas x 1500s e 300s. Com o S3 fora do ar o pior caso da prova vira
+# ~120s + ~600s, não ~300s + ~900s. Uma prova que não fecha nesse orçamento
+# recusa e NADA é apagado; e o upload é aditivo (`s3 sync` pula o que já
+# chegou), então cada execução avança de onde a anterior parou -- um orçamento
+# curto só custa mais uma rodada, nunca correção.
+S3PROOF_UP_TIMEOUT="${RESEED_S3PROOF_UP_TIMEOUT_SECS:-600}"
+S3PROOF_TIMEOUT="${RESEED_S3PROOF_TIMEOUT_SECS:-120}"
+S3PROOF_REPAIR_ROUNDS="${RESEED_S3PROOF_REPAIR_ROUNDS:-1}"
+S3PROOF_LOG="${S3PROOF_LOG:-$LOG}"
 DOLT_BIN="${DOLT_BIN:-dolt}"
 GC_BIN="${GC_BIN:-gc}"
 # ga-o3nqy2: wiring for the shared server-free sync (dolt-offline-backup-sync.sh).
@@ -202,52 +254,32 @@ mkdir -p "$(dirname "$LOG")" 2>/dev/null
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [reseed] $*" | tee -a "$LOG"; }
 die() { log "ABORTADO: $*"; exit 1; }
 
-# _s3_current_backup_verified <db> <local_dir> — ga-i99qsp: prova de que o S3
-# já tem uma cópia restaurável e dimensionalmente coerente de <local_dir>
-# ANTES de apagá-lo no modo de baixo disco. É a MESMA prova de duas partes que
-# dolt-backup-residue-reclaim.sh's _reclaim_one_residue usa para liberar
-# resíduo .old (manifest presente via head-object real + tamanho coerente com
-# o fingerprint de _meta/latest.json) — reusa _parse_fingerprint_to_file e
-# _size_coherent da lib sourced acima em vez de reimplementar o parsing.
-# Deliberadamente NÃO reusa o check de "geração mais nova que a residual" de
-# _should_release_residue: aqui não existe uma residual antiga sendo
-# substituída por uma nova geração já sincronizada — o que se prova é que o
-# conteúdo ATUAL (ainda não tocado) já está espelhado. Fail-closed por
-# construção: qualquer falha de AWS/parse/medição retorna falso, nunca
-# verdadeiro (ga-p5q3) — quem chama nunca apaga sem um "true" explícito daqui.
+# _s3_current_backup_verified <db> <local_dir> — ga-i99qsp / ga-gsnee8: prova de
+# que o S3 tem uma cópia que RESTAURA e que já contém tudo o que há em
+# <local_dir>, ANTES de apagá-lo no modo de baixo disco. Quem chama nunca apaga
+# sem um "true" explícito daqui.
+#
+# ga-gsnee8: delega à lib dolt-backup-s3-proof.sh (_s3proof_repair_then_prove:
+# fecho do manifest local + fecho do manifest do S3 + espelho idêntico; se não
+# provar, repara espelhando o local e prova de novo). A prova anterior daqui era
+# `head-object` do manifest + razão de tamanho contra _meta/latest.json --
+# "o OBJETO manifest existe" e "o tamanho é parecido", nenhuma das duas
+# dizendo que a cópia restaura. O fingerprint deixou de ser consultado: a
+# identidade agora é provada por arquivo (nome + tamanho), não por uma razão.
+#
+# Fail-closed por construção: a lib devolve 0 SÓ quando a propriedade foi
+# positivamente estabelecida, e 1 tanto para "é falso" quanto para "não consegui
+# saber" (aws fora do ar, listagem vazia, arquivo ilegível) -- nunca 0 na dúvida
+# (ga-p5q3). As linhas "closure"/"mirror check" que a lib loga (via log() acima)
+# dizem QUAL parte falhou.
 _s3_current_backup_verified() {
   local db="$1" local_dir="$2"
-  local fp_file parsed_file
-  fp_file="$(mktemp "${TMPDIR:-/tmp}/dolt-reseed-fp.XXXXXX" 2>/dev/null)" || { log "prova S3: não consegui criar temp file para fingerprint"; return 1; }
-  parsed_file="$(mktemp "${TMPDIR:-/tmp}/dolt-reseed-parsed.XXXXXX" 2>/dev/null)" || { rm -f "$fp_file"; log "prova S3: não consegui criar temp file para parse"; return 1; }
-
-  local manifest_ok=0
-  if timeout "$AWS_TIMEOUT_SECS" "$AWS" s3api head-object --bucket "$BUCKET" --key "$db/manifest" >/dev/null 2>&1; then
-    manifest_ok=1
+  if _s3proof_repair_then_prove "$local_dir" "$db"; then
+    log "prova do S3 OK (modo de baixo disco) para '$db': o backup local é fechado, o S3 restaura (fecho do manifest) e já tem cada arquivo local"
+    return 0
   fi
-
-  local run_epoch="" size_bytes="" head=""
-  if timeout "$AWS_TIMEOUT_SECS" "$AWS" s3 cp "s3://$BUCKET/_meta/latest.json" "$fp_file" >/dev/null 2>&1; then
-    _parse_fingerprint_to_file "$fp_file" "$db" "$parsed_file"
-    if [ -s "$parsed_file" ]; then
-      IFS="$(printf '\t')" read -r run_epoch size_bytes head < "$parsed_file"
-    fi
-  fi
-  rm -f "$fp_file" "$parsed_file" 2>/dev/null
-
-  local local_bytes=""
-  if [ -d "$local_dir" ]; then
-    local local_kb; local_kb="$(du -sk "$local_dir" 2>/dev/null | awk '{print $1}')"
-    case "$local_kb" in ''|*[!0-9]*) : ;; *) local_bytes=$(( local_kb * 1024 )) ;; esac
-  fi
-
-  local size_ok=0
-  if _size_coherent "${size_bytes:-}" "${local_bytes:-}" "$MIN_SIZE_RATIO_PCT"; then
-    size_ok=1
-  fi
-
-  log "prova S3 (modo de baixo disco) para '$db': manifest_ok=$manifest_ok size_ok=$size_ok (fingerprint=${size_bytes:-?}B local=${local_bytes:-?}B run_epoch=${run_epoch:-?} head=${head:-?})"
-  [ "$manifest_ok" = "1" ] && [ "$size_ok" = "1" ]
+  log "prova S3 (modo de baixo disco) para '$db' NÃO estabelecida: fecho do manifest ou espelho idêntico não provado, mesmo após o reparo (ver as linhas 'closure'/'mirror' acima) — nada será apagado com base nisto"
+  return 1
 }
 
 # _publish_db_fingerprint <db> <local_dir> <issues> — ga-6xo4r0: syncs
@@ -434,11 +466,19 @@ _run_reseed() {
         case "$OLD_DIR_KB" in ''|*[!0-9]*) OLD_DIR_KB=0 ;; esac
       fi
       local PROJECTED_KB=$(( FREE_KB + OLD_DIR_KB ))
-      if [ "$PROJECTED_KB" -lt "$LOW_NEED_KB" ]; then
-        die "disco insuficiente até liberando o backup antigo (livre $((FREE_KB/1024))MB + antigo $((OLD_DIR_KB/1024))MB = $((PROJECTED_KB/1024))MB, preciso ~$((LOW_NEED_KB/1024))MB para UMA cópia nova). NÃO iniciando: um sync que enche o disco no meio é exatamente como se corrompe o Dolt (precedente: ga-vs55, 14/07)."
+      # ga-gsnee8: depois de liberar o antigo o disco tem de comportar DUAS
+      # cópias ao mesmo tempo -- NEW_DIR (a cópia nova, com a folga de
+      # LOW_DISK_MARGIN_PCT) e VERIFY_DIR (a restauração de verificação, que
+      # coexiste com NEW_DIR até o dado ser lido) --, não só a primeira. Contar
+      # só a nova deixava o modo apagar o antigo e depois estourar o disco no
+      # meio da restauração.
+      local RESTORE_NEED_KB=$(( LIVE_KB * RESTORE_COPY_PCT / 100 ))
+      local ULTRA_NEED_KB=$(( LOW_NEED_KB + RESTORE_NEED_KB ))
+      if [ "$PROJECTED_KB" -lt "$ULTRA_NEED_KB" ]; then
+        die "disco insuficiente até liberando o backup antigo (livre $((FREE_KB/1024))MB + antigo $((OLD_DIR_KB/1024))MB = $((PROJECTED_KB/1024))MB, preciso ~$((ULTRA_NEED_KB/1024))MB = cópia nova ~$((LOW_NEED_KB/1024))MB + cópia da restauração de verificação ~$((RESTORE_NEED_KB/1024))MB, que coexistem antes da troca). NÃO iniciando: um sync que enche o disco no meio é exatamente como se corrompe o Dolt (precedente: ga-vs55, 14/07)."
       fi
       FREE_OLD_FIRST=1
-      log "livre $((FREE_KB/1024))MB não cobre nem uma cópia nova (~$((LOW_NEED_KB/1024))MB) com o antigo ainda no lugar -- mas liberando o antigo (~$((OLD_DIR_KB/1024))MB, com prova do S3) chegaria a ~$((PROJECTED_KB/1024))MB, o suficiente. Vou provar e liberar ANTES de escrever qualquer coisa nova (ordem invertida do modo de baixo disco normal abaixo)."
+      log "livre $((FREE_KB/1024))MB não cobre nem uma cópia nova (~$((LOW_NEED_KB/1024))MB) com o antigo ainda no lugar -- mas liberando o antigo (~$((OLD_DIR_KB/1024))MB, com prova do S3) chegaria a ~$((PROJECTED_KB/1024))MB, o suficiente para a cópia nova MAIS a restauração de verificação (~$((ULTRA_NEED_KB/1024))MB). Vou provar e liberar ANTES de escrever qualquer coisa nova (ordem invertida do modo de baixo disco normal abaixo)."
     else
       log "modo de baixo disco ativado para '$DB': livre $((FREE_KB/1024))MB cobre uma cópia nova (~$((LOW_NEED_KB/1024))MB) mas não as duas do fluxo normal (~$((NEED_KB/1024))MB) -- vou liberar o backup antigo, com prova do S3, SE precisar do espaço dele para a verificação."
     fi
@@ -460,7 +500,7 @@ _run_reseed() {
   # é apagado.
   if [ "$FREE_OLD_FIRST" = "1" ]; then
     if ! _s3_current_backup_verified "$DB" "$BACKUP_DIR"; then
-      die "modo ULTRA de baixo disco: prova do S3 FALHOU para '$DB' (manifest ausente ou tamanho incoerente) -- NADA foi apagado. O backup antigo segue intacto em $BACKUP_DIR."
+      die "modo ULTRA de baixo disco: prova do S3 FALHOU para '$DB' (o S3 não restaura -- fecho do manifest --, ou não tem cada arquivo local, mesmo após o reparo) -- NADA foi apagado. O backup antigo segue intacto em $BACKUP_DIR."
     fi
     local OLD_FREED_SIZE; OLD_FREED_SIZE="$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')"
     log "modo ULTRA de baixo disco: prova do S3 OK para '$DB' -- liberando o antigo ($BACKUP_DIR, ~${OLD_FREED_SIZE:-?}) ANTES de construir, porque não há espaço para os dois coexistirem."
@@ -501,9 +541,23 @@ _run_reseed() {
     VERIFY_NEED_KB=$(( LIVE_KB * LOW_DISK_MARGIN_PCT / 100 ))
     if [ -z "$FREE_KB_NOW" ] || [ "$FREE_KB_NOW" -lt "$VERIFY_NEED_KB" ]; then
       log "modo de baixo disco: livre agora $((${FREE_KB_NOW:-0}/1024))MB não cobre a verificação (~$((VERIFY_NEED_KB/1024))MB) -- avaliando liberar o backup antigo ($BACKUP_DIR) antes de continuar."
+      # ga-gsnee8: só vale apagar o antigo se apagá-lo REALMENTE abre o espaço
+      # que a restauração precisa (mesma classe do modo ULTRA: uma exclusão
+      # autorizada sem provar que ela cumpre o propósito). Se livre + antigo
+      # ainda não cobre a verificação, apagar deixaria o banco sem backup local
+      # E o restore estouraria o disco do mesmo jeito. `df` ilegível conta como
+      # 0 livre: é o lado pessimista de uma conta cujo "passou" AUTORIZA uma
+      # exclusão -- na dúvida não se apaga.
+      local OLD_KB_NOW
+      OLD_KB_NOW=$(du -sk "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
+      case "$OLD_KB_NOW" in ''|*[!0-9]*) OLD_KB_NOW=0 ;; esac
+      if [ $(( ${FREE_KB_NOW:-0} + OLD_KB_NOW )) -lt "$VERIFY_NEED_KB" ]; then
+        rm -rf "$NEW_DIR"
+        die "disco insuficiente para a verificação mesmo liberando o backup antigo (livre agora $((${FREE_KB_NOW:-0}/1024))MB + antigo $((OLD_KB_NOW/1024))MB = $(( (${FREE_KB_NOW:-0} + OLD_KB_NOW)/1024 ))MB, preciso ~$((VERIFY_NEED_KB/1024))MB para a restauração de verificação). NADA foi apagado: o backup antigo segue intacto em $BACKUP_DIR; o novo (não verificado) foi descartado."
+      fi
       if ! _s3_current_backup_verified "$DB" "$BACKUP_DIR"; then
         rm -rf "$NEW_DIR"
-        die "modo de baixo disco: prova do S3 FALHOU para '$DB' (manifest ausente ou tamanho incoerente) -- NADA foi apagado. O backup antigo segue intacto em $BACKUP_DIR; o novo (não verificado) foi descartado."
+        die "modo de baixo disco: prova do S3 FALHOU para '$DB' (o S3 não restaura -- fecho do manifest --, ou não tem cada arquivo local, mesmo após o reparo) -- NADA foi apagado. O backup antigo segue intacto em $BACKUP_DIR; o novo (não verificado) foi descartado."
       fi
       local OLD_FREED_SIZE; OLD_FREED_SIZE="$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')"
       log "modo de baixo disco: prova do S3 OK para '$DB' -- liberando o antigo ($BACKUP_DIR, ~${OLD_FREED_SIZE:-?}) ANTES da verificação, para caber o restore."
