@@ -51,7 +51,11 @@
 # Usage:
 #   git-lock-hygiene.sh              — run one janitor sweep
 #   git-lock-hygiene.sh --selftest   — run regression tests (exit 0 = pass)
-#   GIT_LOCK_HYGIENE_LIB=1 source git-lock-hygiene.sh — load lib, skip sweep
+#   GIT_LOCK_HYGIENE_LIB=1 source git-lock-hygiene.sh — load lib, skip sweep. Lib mode is PURE
+#     (ga-kimlod): it calls no gc, no notify, writes nothing to stdout or the hygiene log. That
+#     also means it does NOT resolve GIT_LOCK_RIG_ROOTS from `gc rig list`: it stays the static
+#     default (or the caller's value). Only the sweep reads it, so a sourcer that wants the live
+#     rig list must resolve it itself (scripts/lib/rig-stores.sh), not rely on this file.
 #
 # Env knobs:
 #   GIT_LOCK_RIG_ROOTS         colon-separated repo roots to scan (see default below)
@@ -105,7 +109,17 @@ _log_json() {
 # Skipped under --selftest for the same reason as ga-3xfndz: this script's own
 # --selftest exercises _scan_repo()/_is_stale() in-process and must not shell
 # out to a real `gc rig list` on every hermetic run.
-if [ "$_GIT_LOCK_ROOTS_CALLER_SET" != "1" ] && [ "${1:-}" != "--selftest" ]; then
+# ga-kimlod: ALSO skipped in lib mode (GIT_LOCK_HYGIENE_LIB=1). This block used to run BEFORE the
+# lib-mode `return` below, so every `source` of this file — quality-gate-dispatcher.sh does it on
+# each cycle, StartInterval=60 — paid a `gc rig list` of up to 20 s when Dolt is busiest, and on
+# failure called notify, whose STDOUT ("Logged for digest ...") leaked into the sourcer (measured
+# 25/09: 50 of 120 runs at load ~50; it turned gate-verdict-timeout-scale.selftest.sh flaky,
+# ga-5hw36b). Skipping, not deferring, is safe because nothing outside the sweep reads
+# GIT_LOCK_RIG_ROOTS: the only reader is the sweep loop at the bottom of this file, after the lib
+# return, and the external sourcers (git-deploy-pull.sh) only PRE-SET it. Verified by grep
+# across .sh/.py/.toml/.plist in the repo. The 20 s bound and the notify stay exactly as they were
+# for the sweep — this changes who pays for them, not what they do.
+if [ "$_GIT_LOCK_ROOTS_CALLER_SET" != "1" ] && [ "${1:-}" != "--selftest" ] && [ "${GIT_LOCK_HYGIENE_LIB:-0}" != "1" ]; then
   _git_lock_rig_stores_lib="${CITY}/scripts/lib/rig-stores.sh"
   if [ -r "$_git_lock_rig_stores_lib" ]; then
     . "$_git_lock_rig_stores_lib"
