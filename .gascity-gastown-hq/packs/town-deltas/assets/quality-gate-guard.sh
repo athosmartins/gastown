@@ -212,6 +212,97 @@ reconcile_marker_action() {
   esac
 }
 
+# ── ga-jmmcjn: how long has the marker been in its CURRENT transient state? ────
+# bd 1.1.0 bumps a bead's updated_at ONLY on `bd update`. `label add`,
+# `label remove` and `comment` leave it untouched (measured 2026-09-25: probe
+# bead, show and list agree) — and those are the ONLY writes that move a marker
+# into gate-status:dispatching (dispatcher claim) or gate-status:claimed (guard
+# claim). So age_minutes_of(updated_at) is "time since the last `bd update`",
+# not "time in the current state": a marker that waited 30m+ in `queued` and is
+# then claimed, or one bouncing queued→dispatching→needs-rebase→queued every
+# ~3m (ga-g5s956: 30+ cycles, updated_at frozen at 32m), reads as a 30m+ zombie
+# while a live dispatcher is working it. Vector A / the dispatcher TTL then
+# re-queue it, burning one of MAX_RECLAIMS (at MAX → terminal
+# gate-status:error, human required) with nothing wrong with the branch.
+#
+# Fix: the claim sites stamp the moment of entry into the transient state via
+# `bd update --set-metadata` — the one write type that persists — as
+# "<status>@<epoch>" under GATE_STATE_SINCE_KEY, BEFORE the label add so the
+# stamp already exists when the label makes the marker visible to Vector A.
+# The age of the current state is then the SMALLER of the two ages
+# (= the more recent signal). Three states, all resolved toward today's
+# behaviour rather than toward "fresh":
+#   stamp present, status matches, epoch sane -> min(updated_at age, stamp age)
+#   stamp absent / other status / unreadable  -> updated_at age (legacy marker,
+#                                                or a stamp write that failed)
+#   stamp epoch in the future (corrupt)       -> updated_at age
+# A stale stamp from an EARLIER episode is harmless: it is older than the
+# current updated_at or than the fresh stamp, and min() never picks it.
+# A real zombie (dispatcher died right after the claim) still ages out: its
+# stamp is as old as the claim, so it is requeued TTL minutes after the claim
+# instead of TTL minutes after the last unrelated `bd update`.
+GATE_STATE_SINCE_KEY="gate.state_since"
+
+# marker_state_age_minutes <status> <marker_json> [now_epoch]
+# <marker_json> is one element of `bd list --json` (an object) OR the raw
+# `bd show --json` output (an ARRAY of one) — both shapes are read in this
+# file, and `.updated_at` on an array is a jq error that 2>/dev/null would
+# turn into "" → age 0 (inert, but it would silently disable the fix).
+marker_state_age_minutes() {
+  local status="$1" marker_json="$2" now_epoch="${3:-$(date +%s)}"
+  local obj updated since_meta since_epoch age since_age
+  obj=$(printf '%s\n' "$marker_json" \
+    | jq -c 'if type=="array" then (.[0] // {}) else . end' 2>/dev/null || true)
+  updated=$(printf '%s\n' "$obj" | jq -r '.updated_at // .created_at // ""' 2>/dev/null || true)
+  age=$(age_minutes_of "$updated" "$now_epoch")
+  # Unknown/ambiguous status (marker_status_from_labels gives "" for 0 or 2+
+  # gate-status labels): nothing to match a stamp against — and an empty
+  # pattern would match a corrupt "@123" stamp — so use the legacy age.
+  [ -z "$status" ] && { echo "$age"; return; }
+  since_meta=$(printf '%s\n' "$obj" \
+    | jq -r --arg k "$GATE_STATE_SINCE_KEY" '(.metadata // {})[$k] // ""' 2>/dev/null || true)
+  case "$since_meta" in
+    "$status"@*)
+      since_epoch="${since_meta#*@}"
+      # A stamp for THIS status that we cannot use is a corrupt/unknown read,
+      # not "no stamp": fall back to the updated_at age (never toward "fresh")
+      # but say so on stderr — which is the sweep log in both callers, and NOT
+      # captured by their $(...) — instead of failing open silently.
+      case "$since_epoch" in
+        ''|*[!0-9]*)
+          echo "marker_state_age_minutes: ignoring unreadable ${GATE_STATE_SINCE_KEY}='${since_meta}' (status=${status}) — using the updated_at age (ga-jmmcjn)" >&2
+          ;;
+        *)
+          # <=12 digits keeps the arithmetic far from overflow; 10# stops a
+          # leading zero being read as octal ("08" is an arithmetic error).
+          if [ "${#since_epoch}" -le 12 ] && [ "$since_epoch" -le "$now_epoch" ]; then
+            since_age=$(( (now_epoch - 10#$since_epoch) / 60 ))
+            if [ "$since_age" -lt "$age" ]; then age="$since_age"; fi
+          else
+            echo "marker_state_age_minutes: ignoring future-dated/overlong ${GATE_STATE_SINCE_KEY}='${since_meta}' (status=${status}) — using the updated_at age (ga-jmmcjn)" >&2
+          fi
+          ;;
+      esac
+      ;;
+  esac
+  echo "$age"
+}
+
+# stamp_marker_state_since <marker_id> <status>
+# Records entry into a transient gate-status (see above). Best-effort by
+# design: returns non-zero on a failed write so the caller can log it, but the
+# fallback is exactly the pre-fix behaviour (updated_at age), so callers must
+# NOT let a failed stamp abort or block a claim.
+stamp_marker_state_since() {
+  local _id="$1" _st="$2"
+  [ -z "$_id" ] && return 0
+  bd -C "$GC_CITY" update "$_id" --set-metadata "${GATE_STATE_SINCE_KEY}=${_st}@$(date +%s)" -q >/dev/null 2>&1 || {
+    warn "stamp_marker_state_since: could not record ${GATE_STATE_SINCE_KEY} on ${_id} (${_st}) — its age falls back to updated_at (ga-jmmcjn)"
+    return 1
+  }
+  return 0
+}
+
 # reconcile_gaterun_action <age_min> <ttl_min> <marker_active: 0|1> \
 #                          [verdict_timeout_min] [reviewers_alive: 0|1]
 # Pure decision: what to do with a gate-run bead stuck in gate-status:running.
@@ -2674,7 +2765,14 @@ if [ "$TRANSIENT_COUNT" -gt 0 ]; then
     echo "$T_LABELS" | grep "gate-status:claimed" >/dev/null     && T_STATUS="claimed"
     [ -z "$T_STATUS" ] && continue
 
-    T_AGE=$(age_minutes_of "$T_UPDATED" "$NOW_EPOCH")
+    # ga-jmmcjn: age of the CURRENT state, not of the last `bd update` — the
+    # claim that put this marker in $T_STATUS was label-only and never moved
+    # updated_at. See marker_state_age_minutes for the full story.
+    T_AGE_UPDATED=$(age_minutes_of "$T_UPDATED" "$NOW_EPOCH")
+    T_AGE=$(marker_state_age_minutes "$T_STATUS" "$T" "$NOW_EPOCH")
+    if [ "$T_AGE_UPDATED" -gt "$CLAIM_TTL_MINUTES" ] && [ "$T_AGE" -le "$CLAIM_TTL_MINUTES" ]; then
+      log "  Marker $T_ID: updated_at says ${T_AGE_UPDATED}m but it entered $T_STATUS only ${T_AGE}m ago (${GATE_STATE_SINCE_KEY}) — NOT a zombie (ga-jmmcjn)."
+    fi
     T_COUNT=$(echo "$T_LABELS" | tr ' ' '\n' \
       | sed -n 's/^gate-reclaim-count:\([0-9]*\)$/\1/p' | sort -n | tail -1)
     [ -z "$T_COUNT" ] && T_COUNT=0
@@ -3059,10 +3157,22 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
         # ~961, dispatching by the dispatcher) — the same T_AGE signal Vector A
         # already uses for these exact states (Step 0 above) — so it measures time
         # in the CURRENT state instead of time-since-queued.
+        #
+        # ga-jmmcjn CORRECTION of the paragraph above: that premise is false. The
+        # claims into claimed/dispatching are label-only and bd bumps updated_at
+        # ONLY on `bd update` (measured 2026-09-25), so a raw updated_at age here
+        # is really time-since-last-bd-update — for a marker that queued a while
+        # it is ≥ the queue wait, blows past GATE_ZERO_VERDICT_GRACE_MINUTES the
+        # instant the dispatcher claims it, and reconcile_zero_verdict_run_action
+        # answers supersede:requeue-marker: it closes the gate-run and re-queues a
+        # marker that is mid-dispatch. marker_state_age_minutes ages the marker
+        # from the entry stamp the two claim sites write (Vector A above and the
+        # dispatcher's Step 0a use the same helper). `bd show` returns an array;
+        # the helper handles both shapes.
         MARKER_UPDATED=$(printf '%s\n' "$MARKER_JSON" \
           | jq -r 'if type=="array" then .[0] else . end | .updated_at // .created_at // ""' \
           2>/dev/null || echo "")
-        [ -n "$MARKER_UPDATED" ] && MARKER_AGE=$(age_minutes_of "$MARKER_UPDATED" "$NOW_EPOCH")
+        [ -n "$MARKER_UPDATED" ] && MARKER_AGE=$(marker_state_age_minutes "$(marker_status_from_labels "$MARKER_LABELS")" "$MARKER_JSON" "$NOW_EPOCH")
         MARKER_ACTIVE=$(marker_active_from_labels "$MARKER_LABELS")
       fi
     fi
@@ -4469,6 +4579,14 @@ if ! echo "$CURRENT_LABELS" | grep "gate-status:ready" >/dev/null; then
   log "Marker $MARKER_ID no longer ready (raced away before claim). Skipping."
   exit 0
 fi
+
+# ga-jmmcjn: stamp the entry into `claimed` FIRST. This claim is label-only, and
+# bd bumps updated_at only on `bd update`, so without the stamp Vector A would
+# age this marker from whenever it was last `bd update`d (e.g. 3h ago, while it
+# sat in `ready`) and could re-ready it as a "zombie" seconds after this claim.
+# Best-effort: a failed stamp falls back to the old age, it must never block
+# the claim.
+stamp_marker_state_since "$MARKER_ID" claimed || true
 
 # We believe we can claim it — add claimed before removing ready.
 bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:claimed" -q 2>/dev/null || {

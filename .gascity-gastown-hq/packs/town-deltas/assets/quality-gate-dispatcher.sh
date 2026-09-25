@@ -9669,6 +9669,27 @@ if [ "$DISPATCHING_COUNT" -gt 0 ]; then
     D_EPOCH=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "${D_UPDATED%%Z*}" "+%s" 2>/dev/null \
       || date -d "$D_UPDATED" +%s 2>/dev/null || echo "0")
     D_AGE_MINUTES=$(( (NOW_EPOCH_D - D_EPOCH) / 60 ))
+    # ga-jmmcjn: the claim that put this marker in dispatching is label-only
+    # (see the claim below), and bd bumps updated_at only on `bd update` — so
+    # D_AGE_MINUTES above is "time since the last bd update", which for a marker
+    # that queued a while, or that bounces queued→dispatching→needs-rebase→queued
+    # every few minutes, is far older than its time in dispatching. Prefer the
+    # entry stamp (min of the two ages; see marker_state_age_minutes in the guard
+    # lib). `type` guard: a guard sibling without the helper (partial deploy)
+    # must degrade to the legacy age, not kill the sweep with "command not found"
+    # under set -e. A non-numeric result is likewise ignored.
+    if type marker_state_age_minutes >/dev/null 2>&1; then
+      D_AGE_STATE=$(marker_state_age_minutes dispatching "$D_MARKER" "$NOW_EPOCH_D") || D_AGE_STATE=""
+      case "$D_AGE_STATE" in
+        ''|*[!0-9-]*) ;;
+        *)
+          if [ "$D_AGE_STATE" -lt "$D_AGE_MINUTES" ] && [ "$D_AGE_MINUTES" -gt "$DISPATCHING_TTL_MINUTES" ] && [ "$D_AGE_STATE" -le "$DISPATCHING_TTL_MINUTES" ]; then
+            log "Marker $D_ID: updated_at says ${D_AGE_MINUTES}m but it entered dispatching only ${D_AGE_STATE}m ago (${GATE_STATE_SINCE_KEY:-gate.state_since}) — NOT a zombie (ga-jmmcjn)."
+          fi
+          D_AGE_MINUTES="$D_AGE_STATE"
+          ;;
+      esac
+    fi
     if [ "$D_AGE_MINUTES" -gt "$DISPATCHING_TTL_MINUTES" ]; then
       D_HAS_LIVE_RUN=$(printf '%s' "$LIVE_RUN_MARKER_IDS_JSON" | jq -r --arg mid "$D_ID" \
         '[ .[] | select(((.description // "") | test("(^|\n)marker_id: *" + $mid + "( |\n|$)")) ) ] | length' 2>/dev/null || echo "0")
@@ -10761,6 +10782,17 @@ if ! echo "$VERIFY_LABELS" | grep "gate-status:queued" >/dev/null; then
   log "Marker $MARKER_ID no longer queued (raced away before claim). Skipping."
   exit 0
 fi
+
+# ga-jmmcjn: stamp the entry into `dispatching` FIRST. This claim is label-only,
+# and bd bumps updated_at only on `bd update`, so without the stamp the guard's
+# Vector A (and Step 0a above) age this marker from whenever it was last
+# `bd update`d — e.g. 30m+ ago while it sat in `queued`, or the frozen 32m of
+# ga-g5s956's 30-cycle retry loop — and re-queue it as a "zombie" while this
+# dispatcher is actively working it, burning one of MAX_RECLAIMS. Best-effort:
+# a failed stamp falls back to the old age and must never block the claim
+# (`|| true`: an undefined helper, i.e. a guard sibling from before this fix,
+# is command-not-found = 127, also swallowed here).
+stamp_marker_state_since "$MARKER_ID" dispatching || true
 
 # We believe we can claim it — add dispatching before removing queued.
 bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || {
