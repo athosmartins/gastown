@@ -82,11 +82,14 @@ if [ -z "$FN_SIGNAL" ] || [ -z "$FN_RESET" ] || [ -z "$FN_BUMP" ]; then
 fi
 
 # ── Part 1: phase-c-genuine-timeout-no-eval — the branch sets the signal ────
-# NOTE: the marked block itself is deliberately narrow (just the signal
-# assignment) — OVERALL_VERDICT/FAIL_REASONS are set by the two UNMARKED
-# lines immediately above it in production (unchanged by this fix), so the
-# harness pre-seeds them here to reproduce that already-established context,
-# then checks only what the marked block is actually responsible for.
+# NOTE: the marked block is deliberately narrow — it decides the signal (and,
+# since ga-h8vc8y, whether the collected reviewer reasons are kept). It raises
+# GATE_FAIL_NO_EVAL only when NO reviewer judged the code; this harness leaves
+# GATE_COLLECT_JUDGED_FAILS unset (reads as 0 = nobody judged), so it exercises
+# exactly that no-evaluation branch. The judged-FAIL branch is covered by
+# gate-timeout-keeps-judged-fail.selftest.sh. OVERALL_VERDICT/FAIL_REASONS are
+# set by lines outside this block in production, so the harness pre-seeds them
+# to reproduce that established context, then checks only what this block owns.
 echo "── 1. phase-c-genuine-timeout-no-eval: genuine timeout raises GATE_FAIL_NO_EVAL ──"
 OUT1="$(bash -c '
   set -euo pipefail

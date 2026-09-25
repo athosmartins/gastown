@@ -9402,6 +9402,14 @@ gate_collect_verdicts() {
   # (same leak concern as QUOTA_REQUEUE/REQUEUE_REASON at the call sites).
   GATE_FAIL_NO_EVAL=0
   local _judged_fails=0 _noverdict_fails=0
+  # ga-h8vc8y: the judged-FAIL count is ALSO handed to the caller (the local
+  # above dies with this function), because Phase C's timeout branch runs right
+  # after this collect and must know whether a reviewer that DID deliver
+  # rejected the code before it decides the run is a no-evaluation timeout.
+  # Zeroed up front so no path out of this function can hand back a stale
+  # count (same staleness concern as GATE_FAIL_NO_EVAL); assigned its real
+  # value once, after the loop.
+  GATE_COLLECT_JUDGED_FAILS=0
   for j in "${!VERDICT_BEAD_IDS[@]}"; do
     VB="${VERDICT_BEAD_IDS[$j]}"
     # ga-art5: `|| echo "[]"` used to mask a failed `bd show` as an empty
@@ -9578,6 +9586,7 @@ gate_collect_verdicts() {
   if [ "$ANY_FAIL" = "1" ] && [ "$_judged_fails" -eq 0 ] && [ "$_noverdict_fails" -gt 0 ]; then
     GATE_FAIL_NO_EVAL=1
   fi
+  GATE_COLLECT_JUDGED_FAILS="$_judged_fails"  # ga-h8vc8y: read by Phase C's timeout branch
 }
 # SELFTEST-EXTRACT gate-collect-verdicts-fn: END
 
@@ -10106,24 +10115,47 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
           gate_finalize_run
         else
           warn "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) TIMED OUT after ${PC_ELAPSED}s (limit=${PC_TIMEOUT_SECS}s) with $VERDICTS_RECEIVED/$REQUIRED_REVIEWERS verdicts. Treating as FAIL."
+          # SELFTEST-EXTRACT phase-c-timeout-classify: BEGIN
           OVERALL_VERDICT="FAIL"
+          # ga-h8vc8y: gate_collect_verdicts() ran at the top of this Phase C
+          # block, so FAIL_REASONS still holds the text of every reviewer that
+          # DID deliver (a judged FAIL's own words). Save it before the
+          # TIMEOUT line below replaces it — the builder must see what the
+          # reviewer that answered rejected, not just that another one was slow.
+          PC_COLLECTED_REASONS="${FAIL_REASONS:-}"
           FAIL_REASONS="TIMEOUT: reviewers did not submit verdicts within ${PC_TIMEOUT_MIN} minutes."
           # SELFTEST-EXTRACT phase-c-genuine-timeout-no-eval: BEGIN
           # ga-mcapdq: at least one pending reviewer is confirmed LIVE (not
           # dead — see the dead-reviewer branch above) but slow/wedged, so
-          # this run genuinely timed out with NO verdict from anyone. That
-          # is a FAIL (unlike dead-reviewer, this doesn't self-heal via
-          # requeue — see this bead's own "invariantes" for why: an
-          # always-alive-but-wedged reviewer would requeue forever), but it
-          # is NOT a code rejection — nobody evaluated the content. Signal
-          # this to gate_finalize_run() so its fail-class reset (top of
-          # function) classes it "hold", and its fix-attempt bump (Step 10
-          # FAIL path) leaves the counter untouched — same script-global
-          # relay idiom as QUOTA_REQUEUE/REQUEUE_REASON just above, read
-          # once and zeroed at each consumption site so it can never leak
-          # into a later, unrelated bead finalized later in this sweep.
-          GATE_FAIL_NO_EVAL=1
+          # this run genuinely timed out. That is a FAIL (unlike dead-reviewer,
+          # this doesn't self-heal via requeue — see this bead's own
+          # "invariantes" for why: an always-alive-but-wedged reviewer would
+          # requeue forever).
+          #
+          # When NO reviewer judged the code, it is NOT a code rejection —
+          # nobody evaluated the content. Signal this to gate_finalize_run()
+          # so its fail-class reset (top of function) classes it "hold", and
+          # its fix-attempt bump (Step 10 FAIL path) leaves the counter
+          # untouched — same script-global relay idiom as QUOTA_REQUEUE/
+          # REQUEUE_REASON just above, read once and zeroed at each
+          # consumption site so it can never leak into a later, unrelated
+          # bead finalized later in this sweep.
+          #
+          # ga-h8vc8y: "no reviewer judged" is only true when the collect found
+          # no verdict:FAIL. If one reviewer already delivered a real rejection
+          # and another merely timed out, the rejection stands: class stays
+          # "code" (the SHA must not re-earn a PASS on a re-review — ga-nooaw),
+          # the fix-attempt counts, and the rejecting reviewer's text is kept
+          # ahead of the timeout note. An UNSET count (the collect did not run)
+          # reads as 0 and keeps the pre-existing no-evaluation behavior.
+          if [ "${GATE_COLLECT_JUDGED_FAILS:-0}" -gt 0 ]; then
+            FAIL_REASONS="${PC_COLLECTED_REASONS}${FAIL_REASONS}"
+            GATE_FAIL_NO_EVAL=0
+          else
+            GATE_FAIL_NO_EVAL=1
+          fi
           # SELFTEST-EXTRACT phase-c-genuine-timeout-no-eval: END
+          # SELFTEST-EXTRACT phase-c-timeout-classify: END
           # SELFTEST-EXTRACT phase-c-timeout-close-fn: BEGIN
           for PC_VB in "${VERDICT_BEAD_IDS[@]}"; do
             # ga-art5: same conflation this whole bead exists to close, now
