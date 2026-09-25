@@ -25,7 +25,6 @@
       "ReportFindings",
       "ScheduleWakeup",
       "SendFeedback",
-      "SendMessage",
       "Skill",
       "TaskStop",
       "WebFetch",

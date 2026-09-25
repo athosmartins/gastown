@@ -240,14 +240,13 @@
     "gate-reviewer",
     "refino-gate-reviewer"
    ],
-   "_why": "776+35 sessões/7d usando SÓ Bash/Read (Edit 5, Write 3): 0 skill, 0 Agent, 0 Monitor. Sem tool Skill não há listagem de skills; superpowers off remove o hook que manda 'invoque skill'.",
+   "_why": "776+35 sessões/7d usando SÓ Bash/Read (Edit 5, Write 3): 0 skill, 0 Agent, 0 Monitor. Sem tool Skill não há listagem de skills; superpowers off remove o hook que manda 'invoque skill'. SendMessage FICA: 1 uso real em 24/09 (um revisor achou um gate-run órfão correlacionado com o branch errado e avisou o Mayor) — canal de escalonamento raro mas valioso; custa ~2.6k tokens.",
    "deny_tools_extra": [
     "Agent",
     "AskUserQuestion",
     "ListAgents",
     "Monitor",
     "ScheduleWakeup",
-    "SendMessage",
     "Skill",
     "TaskStop",
     "WebFetch",
