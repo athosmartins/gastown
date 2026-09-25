@@ -5152,6 +5152,55 @@ supersede_sibling_runs() {
   done
 }
 
+# ── ga-rhzbii: is the PASS-path close of a bug/task source bead HELD? ────────
+# gate_sibling_hold_check <gc_city> <bead_id>
+#
+# Wraps gate_bead_sibling_status_lines (quality-gate-guard.sh) so the caller
+# can tell THREE outcomes apart. The helper has two very different reasons to
+# return a non-empty result, and reporting them as one fact ("a sibling is
+# open") is the failure/positive collapse this bead's gate review caught:
+#   ""            no marker/gate-run for this bead is still open  → close
+#   "open"        a real, still-open marker/gate-run on this bead → hold
+#   "unverified"  the bd query FAILED — the helper emits the synthetic row
+#                 unknown<TAB>query-failed<TAB>unknown; siblings are UNKNOWN,
+#                 not confirmed open                              → hold
+# Both non-empty outcomes hold (a delay costs less than orphaning a sibling
+# branch's merge), but the operator-facing wording differs, so callers branch
+# on SIBLING_HOLD_KIND, never on "is the row list non-empty".
+#
+# Sets two globals — no subshell, so the helper's stderr ALERT reaches $LOG
+# (the dispatcher runs under `exec >> "$LOG" 2>&1`). Do NOT add 2>/dev/null to
+# the helper call: its documented contract is to write that ALERT to stderr on
+# query failure, and story-delivery.sh's own caller removed the same redirect
+# for exactly this reason (ga-0m6tgc gate-fix attempt 2).
+#   OPEN_SIBLINGS_FOR_CLOSE  the raw "<branch>\t<status>\t<rig>" rows
+#   SIBLING_HOLD_KIND        "" | "open" | "unverified"
+# The helper itself always returns 0 (its bd failure is the synthetic row
+# above). A NON-zero exit — helper undefined, or killed — is a fourth way of not
+# knowing; it must not read as "no siblings" (which would close the bead), so it
+# is "unverified" too. The shell's own error text is left on stderr for $LOG.
+# Always returns 0.
+# SELFTEST-EXTRACT sibling-hold-check-fn: BEGIN
+gate_sibling_hold_check() {
+  local gc_city="$1" bead_id="$2" _rc=0
+  SIBLING_HOLD_KIND=""
+  OPEN_SIBLINGS_FOR_CLOSE=$(gate_bead_sibling_status_lines "$gc_city" "$bead_id") || _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    SIBLING_HOLD_KIND="unverified"
+    return 0
+  fi
+  if [ -z "$OPEN_SIBLINGS_FOR_CLOSE" ]; then
+    return 0
+  fi
+  if printf '%s\n' "$OPEN_SIBLINGS_FOR_CLOSE" | grep -q "$(printf '\tquery-failed\t')"; then
+    SIBLING_HOLD_KIND="unverified"
+  else
+    SIBLING_HOLD_KIND="open"
+  fi
+  return 0
+}
+# SELFTEST-EXTRACT sibling-hold-check-fn: END
+
 # ── ga-eqjo: Steps 9-11 wrapped as a callable function ───────────────────────
 # No logic below changed from its historical inline form — pure relocation +
 # function-wrap so it is callable from TWO places: (a) the same-sweep fast
@@ -6966,18 +7015,45 @@ $DAEMON_HOLD_DETAIL" 2>/dev/null || true
           # source bead). Mirrors story-delivery.sh's OPEN_SIBLINGS hold
           # (ga-0m6tgc) for story:approved beads; bug/task closes had no
           # equivalent guard. By this point in the sweep THIS run's own
-          # marker (Step 6/gate-status:passed transition, earlier) and
-          # gate-run bead (closed above at the PASS terminal transition) are
-          # already closed, so a non-empty result here can only be a
-          # genuinely different, still-open sibling.
-          OPEN_SIBLINGS_FOR_CLOSE=$(gate_bead_sibling_status_lines "$GC_CITY" "$BEAD_ID" 2>/dev/null || echo "")
-          if [ -n "$OPEN_SIBLINGS_FOR_CLOSE" ]; then
+          # marker (closed at the gate-status:passed transition above) and
+          # gate-run bead (closed at the PASS terminal transition above) are
+          # normally closed, so a row here is normally a DIFFERENT sibling.
+          # Two other ways to get a row — both hold, both stay visible:
+          #   - the bd query FAILED (SIBLING_HOLD_KIND=unverified): the helper
+          #     emits a synthetic query-failed row and an ALERT on stderr. That
+          #     is "siblings UNKNOWN", not "a sibling is open" — the wording
+          #     below says so, and the ALERT reaches $LOG because
+          #     gate_sibling_hold_check carries no 2>/dev/null.
+          #   - this run's own marker/gate-run close above failed (both are
+          #     `|| true`): the helper takes no this-branch exclusion, so it
+          #     would list this run's own still-open marker as the "sibling".
+          #     Hold is the safe direction; the row's branch shows it.
+          # NOT re-checked by a later sweep: nothing in this dispatcher revisits
+          # a PASSED bead once its marker and gate-run are closed
+          # (IS_SIBLING_HOLD is read once, by the POST-MERGE exemption below).
+          # The bead is released only when (a) the OTHER marker's own PASS runs
+          # this same check and finds nothing else open, or (b) by hand.
+          # merged-bead-janitor keeps a held bead while a sibling is open but
+          # only sweeps beads still in_progress / story:in-flight /
+          # story:approved, so it does not close this one. The bead comments
+          # below say exactly that, including the manual action — they must
+          # not promise a retry that does not exist.
+          # SELFTEST-EXTRACT sibling-hold-block: BEGIN
+          gate_sibling_hold_check "$GC_CITY" "$BEAD_ID"
+          if [ -n "$SIBLING_HOLD_KIND" ]; then
             IS_SIBLING_HOLD=1
-            log "Source bug/task $BEAD_ID PASSED+merged but another gate marker/run for this source-bead is still open (ga-rhzbii) — holding, NOT closing:
-$OPEN_SIBLINGS_FOR_CLOSE"
             bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
-            bd -C "$BEAD_CITY" comment "$BEAD_ID" "$(printf 'Quality gate PASSED and branch %s merged to %s/%s (sha=%s) — but NOT closing yet (ga-rhzbii): at least one OTHER gate marker/run citing this bead via source-bead: is still open (not yet terminal):\n\n%s\n\nA bead delivered as branches in more than one repo/rig can have more than one marker; closing on the first PASS would silently orphan the rest while it waits to merge. Re-checked every dispatcher sweep — this closes automatically once every marker/run for this bead reaches a terminal state.' "$BRANCH" "$RIG" "$DEFAULT_BRANCH" "$MERGE_SHA" "$OPEN_SIBLINGS_FOR_CLOSE")" 2>/dev/null || true
-          else
+            if [ "$SIBLING_HOLD_KIND" = "unverified" ]; then
+              log "Source bug/task $BEAD_ID PASSED+merged but the open-sibling check could NOT run (bd query failed — see the ALERT just above) — holding, NOT closing (ga-rhzbii). Siblings are UNKNOWN, not confirmed open."
+              bd -C "$BEAD_CITY" comment "$BEAD_ID" "$(printf 'Quality gate PASSED and branch %s merged to %s/%s (sha=%s) — but NOT closing (ga-rhzbii): the check for OTHER still-open gate markers/runs on this bead COULD NOT RUN (a bd query failed; the ALERT is in the dispatcher log). Whether a sibling exists is UNKNOWN — none is confirmed. Held instead of closed because closing on a false "no siblings" would orphan another repo/rig branch that is still waiting to merge.\n\nNo automatic retry: this dispatcher does not revisit the bead, and if no sibling exists no later PASS will re-run the check. ACTION: run `bd -C %s list --label source-bead:%s --all` (keep the -C: a bare bd from another directory reads a different store, and an empty list there is NOT "every marker is closed"); if every marker/run listed is closed, close this bead by hand; if one is still open, leave the bead for that sibling'"'"'s own PASS to close.' "$BRANCH" "$RIG" "$DEFAULT_BRANCH" "$MERGE_SHA" "$GC_CITY" "$BEAD_ID")" 2>/dev/null || true
+            else
+              log "Source bug/task $BEAD_ID PASSED+merged but another gate marker/run for this source-bead is still open (ga-rhzbii) — holding, NOT closing:
+$OPEN_SIBLINGS_FOR_CLOSE"
+              bd -C "$BEAD_CITY" comment "$BEAD_ID" "$(printf 'Quality gate PASSED and branch %s merged to %s/%s (sha=%s) — but NOT closing yet (ga-rhzbii): at least one OTHER gate marker/run citing this bead via source-bead: is still open (not yet terminal):\n\n%s\n\nA bead delivered as branches in more than one repo/rig can have more than one marker; closing on the first PASS would silently orphan the rest while it waits to merge. The bead stays open (gate:passed keeps the Pilot from re-dispatching it). It is NOT re-checked by a later sweep: it closes when the OTHER marker'"'"'s own PASS runs this same check and finds nothing else open. If that sibling instead ends FAIL / discarded / superseded, nothing closes this bead automatically — close it by hand once no marker/run for it is still open (`bd -C %s list --label source-bead:%s --all` — keep the -C: a bare bd from another directory reads a different store, and an empty list there is NOT "every marker is closed").' "$BRANCH" "$RIG" "$DEFAULT_BRANCH" "$MERGE_SHA" "$OPEN_SIBLINGS_FOR_CLOSE" "$GC_CITY" "$BEAD_ID")" 2>/dev/null || true
+            fi
+          fi
+          # SELFTEST-EXTRACT sibling-hold-block: END
+          if [ "$IS_SIBLING_HOLD" != "1" ]; then
           # BUG/TASK, daemon-verified (or check skipped/not applicable/degraded)
           # → close it as before. bd list defaults to OPEN-only, so closing
           # removes the bead from EVERY open-work selector (Pilot Tier-1 bug &
