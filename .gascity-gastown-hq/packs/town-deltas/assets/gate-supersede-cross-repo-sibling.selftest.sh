@@ -360,6 +360,105 @@ eq "no sibling → IS_SIBLING_HOLD stays 0 (bead closes on the ordinary path)" "
 [ ! -s "$COMMENT_F" ] && [ ! -s "$LABEL_F" ] \
   && ok "no comment / no label change when there is nothing to hold" || bad "block wrote to the bead although nothing is held"
 
+# ── 6b. ga-wlhd07: the DAEMON-HOLD branch must not hide an open sibling ───────
+# Section 6 covers the else-branch (no daemon hold). When a daemon hold applies
+# it used to win the if/else and the sibling check never ran, so the bead's
+# comment / Mayor mail / author nudge all said "close this bead manually once
+# confirmed live" with no hint that another repo's marker was still open — the
+# manual close then orphaned that branch (a CLOSED source bead matches no
+# re-spawn selector). Here the REAL daemon-hold block runs against a mocked bd,
+# gc and notify, and the three operator-facing surfaces are read directly.
+echo "── 6b. daemon-hold block: open / unverified / none sibling → what the operator is told (real block) ──"
+DH_BLOCK="$(awk '/SELFTEST-EXTRACT daemon-hold-block: BEGIN/{f=1;next} /SELFTEST-EXTRACT daemon-hold-block: END/{f=0} f' "$DISPATCHER")"
+[ -n "$DH_BLOCK" ] || { echo "FATAL: could not extract the daemon-hold block — SELFTEST-EXTRACT markers moved?" >&2; exit 2; }
+ok "extracted the daemon-hold block ($(printf '%s\n' "$DH_BLOCK" | wc -l | tr -d ' ') lines)"
+
+MAIL_F="$WORK_DIR/mail"; NOTIFY_F="$WORK_DIR/notify"
+gc() { if [ "${3:-}" = "mail" ]; then printf '%s\n----\n' "$*" >> "$MAIL_F"; fi; return 0; }
+warn() { printf '%s\n' "$*" >> "$LOG_F"; }
+notify_author_with_fallback() { printf '%s\n----\n' "$*" >> "$NOTIFY_F"; return 0; }
+
+run_dh() {  # $1 = MOCK_BD_MODE, $2 = DAEMON_HOLD_VERDICT, $3 = block to eval (default: the real one)
+  MOCK_BD_MODE="$1"; : > "$ERR_F"; : > "$LOG_F"; : > "$COMMENT_F"; : > "$LABEL_F"; : > "$MAIL_F"; : > "$NOTIFY_F"
+  GC_CITY=city; BEAD_CITY=beadcity; BEAD_ID=ga-g7x0si; BRANCH=fix/ga-g7x0si-mockup-directions
+  RIG=gascity; DEFAULT_BRANCH=main; MERGE_SHA=abc1234; MERGE_PRE_MAIN_SHA=""; GATE_RUN_ID=run1
+  NOTIFY_AUTHOR=digo; AUTHOR=digo; IS_DAEMON_HOLD=0; IS_SIBLING_HOLD=0
+  DAEMON_HOLD_VERDICT="$2"; DAEMON_HOLD_REASON="daemon d1 is stale"; DAEMON_HOLD_DETAIL="detail-line"
+  eval "${3:-$DH_BLOCK}" 2>"$ERR_F"
+}
+PINNED='bd -C city list --label source-bead:ga-g7x0si --all'
+surfaces_have() {  # $1 = fixed string; true iff the comment AND the Mayor mail AND the author nudge all carry it
+  grep -qF -- "$1" "$COMMENT_F" && grep -qF -- "$1" "$MAIL_F" && grep -qF -- "$1" "$NOTIFY_F"
+}
+
+# THE ga-wlhd07 scenario: branch A passed+merged, its daemon verification says
+# NEEDS_GUARDED_RESTART, branch B's marker (another repo) is still open.
+run_dh open NEEDS_GUARDED_RESTART
+eq "daemon hold + open sibling → the bead is still held (IS_DAEMON_HOLD=1)" "$IS_DAEMON_HOLD" "1"
+grep -q 'perform a guarded/graceful restart' "$COMMENT_F" \
+  && ok "the original daemon-hold ACTION is still in the comment" || bad "daemon-hold ACTION lost: [$(cat "$COMMENT_F")]"
+surfaces_have 'fix/ga-g7x0si-mockup-directions-wa' \
+  && ok "comment, Mayor mail AND author nudge all name the still-open sibling branch" \
+  || bad "a surface omits the open sibling branch (comment/mail/nudge must ALL carry it): comment=[$(cat "$COMMENT_F")]"
+surfaces_have "$PINNED" \
+  && ok "all three surfaces give the manual check pinned to the store (bd -C <city> list ...)" \
+  || bad "a surface lacks the pinned manual check (a bare bd from another cwd reads a different store)"
+grep -q 'would orphan' "$COMMENT_F" \
+  && ok "comment says WHY: closing now would orphan the sibling branch" || bad "comment does not explain the orphaning risk"
+! grep -qE 'Re-checked every|closes automatically|will close (it|this bead) (for you|automatically)' "$COMMENT_F" "$MAIL_F" "$NOTIFY_F" "$LOG_F" \
+  && ok "no promise of an automatic retry/close (none exists — a held bead is not revisited)" \
+  || bad "a surface promises an automatic retry/close that nothing implements"
+grep -q 'delivery:pending-restart' "$LABEL_F" \
+  && ok "delivery:pending-restart is still applied" || bad "delivery:pending-restart label no longer applied"
+
+# The note must ride every daemon-hold verdict, not just the one in the bead.
+run_dh open DEPLOY_FAILED
+surfaces_have 'fix/ga-g7x0si-mockup-directions-wa' && grep -q 'rig deploy_cmd itself failed' "$COMMENT_F" \
+  && ok "DEPLOY_FAILED verdict: its own ACTION AND the sibling note are both present" \
+  || bad "DEPLOY_FAILED verdict lost its ACTION or the sibling note"
+run_dh open JOB_NOT_INSTALLED
+surfaces_have 'fix/ga-g7x0si-mockup-directions-wa' && grep -q 'install the missing scheduled job' "$COMMENT_F" \
+  && ok "JOB_NOT_INSTALLED verdict: its own ACTION AND the sibling note are both present" \
+  || bad "JOB_NOT_INSTALLED verdict lost its ACTION or the sibling note"
+
+# A FAILED query is UNKNOWN, not "a sibling is open" — never a positive claim.
+run_dh fail NEEDS_GUARDED_RESTART
+eq "daemon hold + failed sibling query → still held" "$IS_DAEMON_HOLD" "1"
+surfaces_have 'COULD NOT RUN' && surfaces_have 'UNKNOWN' \
+  && ok "all three surfaces say the check could not run and siblings are UNKNOWN" \
+  || bad "a surface does not say the sibling check failed: comment=[$(cat "$COMMENT_F")]"
+surfaces_have "$PINNED" \
+  && ok "unverified: all three surfaces still give the pinned manual check" || bad "unverified: a surface lacks the pinned manual check"
+! grep -q 'is still open (not yet terminal)' "$COMMENT_F" "$MAIL_F" "$NOTIFY_F" \
+  && ok "unverified: no surface asserts an open sibling that was never confirmed" \
+  || bad "unverified: a surface presents the FAILED query as 'a sibling is open' (failure presented as a positive)"
+grep -q 'ALERT: gate_bead_sibling_status_lines query FAILED' "$ERR_F" \
+  && ok "through the daemon-hold block, the bd-failure ALERT still reaches stderr (\$LOG)" \
+  || bad "ALERT swallowed on the daemon-hold path — stderr was: [$(cat "$ERR_F")]"
+
+# No sibling: the operator text must be exactly what it was before this bead.
+run_dh none NEEDS_GUARDED_RESTART
+eq "daemon hold + no sibling → held" "$IS_DAEMON_HOLD" "1"
+! grep -qE 'source-bead:|sibling|COULD NOT RUN' "$COMMENT_F" "$MAIL_F" "$NOTIFY_F" \
+  && ok "no sibling → comment/mail/nudge carry no sibling text (unchanged behaviour)" \
+  || bad "no sibling, but a surface carries sibling text: comment=[$(cat "$COMMENT_F")]"
+
+# MUTATION: delete the sibling check from the extracted block. The 'open' scenario
+# must then go red — proving these assertions catch the pre-fix behaviour rather
+# than passing vacuously.
+_pat='gate_sibling_hold_check "$GC_CITY" "$BEAD_ID"'
+DH_BLOCK_MUT="${DH_BLOCK//"$_pat"/:}"
+if [ "$DH_BLOCK_MUT" = "$DH_BLOCK" ]; then
+  bad "mutation did not apply (daemon-hold block no longer calls gate_sibling_hold_check?) — the open-sibling assertions are unproven"
+else
+  run_dh open NEEDS_GUARDED_RESTART "$DH_BLOCK_MUT"
+  if surfaces_have 'fix/ga-g7x0si-mockup-directions-wa'; then
+    bad "mutation (sibling check deleted) still names the sibling — the open-sibling assertions cannot catch the pre-fix behaviour"
+  else
+    ok "mutation: deleting the sibling check from the daemon-hold block loses the sibling note → the assertions go red on the old code"
+  fi
+fi
+
 rm -rf "$WORK_DIR"
 trap - EXIT
 
