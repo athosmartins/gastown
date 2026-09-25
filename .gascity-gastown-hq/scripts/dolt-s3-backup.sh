@@ -485,14 +485,21 @@ _sync_disk_preflight() {
 # fire after a sync attempt may have half-written the staging, and a half-written
 # staging must never be mirrored.
 #
-# Returns 0 iff S3 is proven restorable and identical to the staging (or there is no
-# staging to mirror); 1 otherwise. Never changes the ok/failed counters — the db's
-# backup for today still failed; this only reports what state S3 is left in.
+# Returns 0 iff S3 is PROVEN restorable (and, when a staging exists, identical to it);
+# 1 otherwise — including when it could not be found out. "No staging to mirror" does NOT
+# mean "S3 is fine": with no staging (e.g. dolt-gc-maintenance released it for the GC
+# window, ga-btnq6h) the only honest report is S3's own closure, read without writing
+# anything. Never changes the ok/failed counters — the db's backup for today still
+# failed; this only reports what state S3 is left in.
 _mirror_staging_after_disk_refusal() {
   local db="$1" dest="$2"
   if [ ! -d "$dest" ]; then
-    log "$db: disk refusal — no local staging at $dest, nothing to mirror to S3"
-    return 0
+    if _s3proof_s3_closure_ok "$db"; then
+      log "$db: disk refusal — no local staging at $dest to mirror; the S3 copy of $db is proven restorable (manifest closure)"
+      return 0
+    fi
+    log "$db: disk refusal — no local staging at $dest to mirror AND the S3 copy of $db is NOT proven restorable (see line above)"
+    return 1
   fi
   if _s3proof_repair_then_prove "$dest" "$db"; then
     log "$db: disk refusal — existing staging mirrored to S3 anyway (zero local disk); S3 copy is proven restorable and matches the staging"
