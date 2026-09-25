@@ -141,6 +141,35 @@
 #                             RECOVERED mail (_maybe_mail_recovery) and resets
 #                             the debounce state for the next episode.
 #
+#   DISK-GROWTH PHOTO (ga-ond0fa) — READ-ONLY diagnostic, not a reclaim lever.
+#                             2026-09-25 free space fell ~10GB -> 3GB in ~25min
+#                             (CRITICAL for 3 cycles) and recovered by 02:16 with
+#                             no author: the guard logged only "avail=", the reclaim
+#                             levers found nothing, ~7GB stayed anonymous. Now, on
+#                             the FIRST WARN cycle and again on the first CRITICAL
+#                             cycle of an episode — before any reclaim lever runs,
+#                             since they delete the very things that grew — it
+#                             photographs one-level `du -sk` under a fixed set of
+#                             roots (the dolt data-dir per database, .dolt-backup,
+#                             ~/shared/data, /private/tmp, DARWIN_USER_TEMP_DIR,
+#                             ~/.claude/projects, every .gc-worktrees, ~/Library/
+#                             Caches) plus vm.swapusage and /System/Volumes/VM plus
+#                             the biggest files currently held open for WRITE, and
+#                             diffs it against a "last OK" baseline photo refreshed
+#                             (rate-limited, nice'd) on class=NONE cycles. Output:
+#                             .gc/logs/disk-growth-<ts>.txt, the top growers in this
+#                             log, and a WHAT GREW paragraph in the Mayor CRITICAL
+#                             mail. A root that timed out says PARTIAL, one the scan
+#                             budget never reached says SKIPPED — and the diff never
+#                             calls anything "new" or "grown" from a root that was
+#                             not completely measured on both sides. macOS has no
+#                             per-process write counter without root, so "who wrote"
+#                             is approximated by "which held-open file grew and which
+#                             pid holds it" (labelled as a proxy everywhere it is
+#                             shown). Own switch: DOLT_DISK_FLOOR_GROWTH_PHOTO_ENABLED
+#                             (NOT DOLT_DISK_FLOOR_GUARD_ENABLED — nothing here
+#                             deletes or stops anything).
+#
 # Absolute-GB floors (not percent, unlike disk-pressure-monitor's WARN/EMERGENCY/
 # HALT_IMMINENT_PCT): a %-based floor can look "fine" on a large disk while the
 # absolute room left is thin, and vice versa on a small one. This guard is a
@@ -408,6 +437,46 @@ RESEED_TRIGGER_TIMEOUT_SECS="${DOLT_DISK_FLOOR_RESEED_TRIGGER_TIMEOUT_SECS:-240}
 # wait for that.
 RESEED_TRIGGER_COOLDOWN_SECS="${DOLT_DISK_FLOOR_RESEED_TRIGGER_COOLDOWN_SECS:-1800}"
 STATE_RESEED_TRIGGER_DIR="$STATE_DIR/.dolt-disk-floor-guard.reseed-attempt"
+
+# ga-ond0fa: DISK-GROWTH PHOTO — see the header's DISK-GROWTH PHOTO paragraph for
+# the incident and the design. Read-only diagnostic (never a reclaim lever), so
+# NOT gated by DOLT_DISK_FLOOR_GUARD_ENABLED — it has its own switch. The state
+# files are resolved at CALL time from $STATE_DIR (_growth_baseline_file /
+# _growth_episode_file below), not frozen here at source time: this suite has
+# twice leaked a stray state file into the real $CITY/.gc/logs because a
+# source-time path was evaluated before the selftest's STATE_DIR redirect (see
+# STATE_CRITICAL_SUSTAIN_FILE's redirect comment in the selftest), and a helper
+# that reads $STATE_DIR when it runs cannot repeat that.
+GROWTH_PHOTO_ENABLED="${DOLT_DISK_FLOOR_GROWTH_PHOTO_ENABLED:-1}"
+# Seconds between refreshes of the "last OK" baseline photo (taken only on
+# class=NONE cycles). Each scan is I/O — MEASURED 2026-09-25 at load ~47 (this
+# city's normal): ~/Library/Caches alone took 91s serially — so it is
+# rate-limited and nice'd rather than run every 5min cycle (a detector's poll
+# cost is part of the load it observes; ga-y0g5x). 30min keeps the baseline
+# fresh enough to bracket a ~25min fill like the 2026-09-25 01:0x->01:30 dive.
+GROWTH_BASELINE_INTERVAL_SECS="${DOLT_DISK_FLOOR_GROWTH_BASELINE_INTERVAL_SECS:-1800}"
+# Per-root bound, and a whole-scan budget. A root that hits its bound keeps the
+# rows that finished (PARTIAL); once the budget is spent the remaining roots are
+# recorded SKIPPED — an explicit "not measured", never a silent zero (ga-p5q3).
+# The episode photo runs BEFORE the reclaim levers (they delete the very things
+# that grew), so the budget is also the most this photo can delay them.
+GROWTH_ROOT_TIMEOUT_SECS="${DOLT_DISK_FLOOR_GROWTH_ROOT_TIMEOUT_SECS:-60}"
+GROWTH_TOTAL_BUDGET_SECS="${DOLT_DISK_FLOOR_GROWTH_TOTAL_BUDGET_SECS:-150}"
+# Tighter budget for the photo taken on a CRITICAL cycle: it runs before the
+# reclaim levers, and MEASURED 2026-09-25 (load ~47) an unbounded-in-practice
+# photo took 90s of scanning — 90s the last-resort reclaim would otherwise not
+# have waited. A partial CRITICAL photo (later roots SKIPPED, said so) beats a
+# delayed reclaim; the WARN photo and the baseline get the full budget above.
+GROWTH_CRITICAL_BUDGET_SECS="${DOLT_DISK_FLOOR_GROWTH_CRITICAL_BUDGET_SECS:-60}"
+# Smallest growth (MB) worth listing, how many growers to list, and how many
+# disk-growth-<ts>.txt files to keep (each is a few KB; the cap only stops an
+# oscillating disk from accumulating them forever).
+GROWTH_MIN_DELTA_MB="${DOLT_DISK_FLOOR_GROWTH_MIN_DELTA_MB:-50}"
+GROWTH_TOP_N="${DOLT_DISK_FLOOR_GROWTH_TOP_N:-8}"
+GROWTH_KEEP_PHOTOS="${DOLT_DISK_FLOOR_GROWTH_KEEP_PHOTOS:-20}"
+# Smallest regular file (MB) that _top_open_write_files reports as "held open
+# for write".
+GROWTH_WRITER_MIN_MB="${DOLT_DISK_FLOOR_GROWTH_WRITER_MIN_MB:-100}"
 
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
@@ -1013,6 +1082,337 @@ _top_disk_consumers() {
   printf '%s' "$out" | sort -rn | head -n "$n"
 }
 
+# ── ga-ond0fa: DISK-GROWTH PHOTO ────────────────────────────────────────────────
+# WHY: 2026-09-25 free space fell ~10GB -> 5GB (01:30) -> 3GB (01:51-02:09,
+# CRITICAL for 3 cycles, Dolt at the ENOSPC floor that killed it 24/09 13:02) and
+# came back to 10GB at 02:16 with no author: this guard logged only "avail=" and
+# the reclaim levers found nothing, so ~7GB of writes in 45min stayed anonymous.
+# _top_disk_consumers above answers "what is BIG" across a few scratch roots; it
+# cannot answer "what GREW", which is the question an unexplained dive poses.
+#
+# HOW: a photo is one-level `du -sk` under a fixed set of roots (_growth_roots).
+# A BASELINE photo is refreshed (rate-limited) on class=NONE cycles — the "last
+# OK" one; the first WARN cycle and the first CRITICAL cycle of an episode each
+# take a fresh photo BEFORE the reclaim levers run and diff it against that
+# baseline. The result lands in $STATE_DIR/disk-growth-<ts>.txt, its top growers
+# in the log and in the Mayor CRITICAL mail. Read-only throughout: nothing is
+# deleted or stopped, and only this guard's own state dir is written.
+#
+# PHOTO FILE FORMAT (tab-separated; '#' lines are commentary and ignored by the
+# parser, which is what lets the human report be appended to the same file):
+#   TS <epoch>   AVAIL_GB <n>   VM_SWAP <sysctl text>   VM_DIR_KB <n|unknown>
+#   ROOT <STATUS> <root>        — STATUS: OK | PARTIAL | MISSING | SYMLINK | SKIPPED
+#   ENT <kb> <path>             — immediate child of the ROOT line above it
+#   WRITERS <ok|unmeasured>     WRITER <mb> <pid> <command> <path>
+# "Unmeasured" is always a STATUS or an absent line, never a 0: a root that timed
+# out keeps the rows that finished and says PARTIAL; one the budget never reached
+# says SKIPPED; the diff refuses to call an entry "new" or "grown" on the strength
+# of a root that was not completely measured on both sides (ga-p5q3: "could not
+# measure" must never read as "did not grow").
+
+# _growth_baseline_file / _growth_episode_file → state paths, resolved from
+# $STATE_DIR at call time (see the config block for why).
+_growth_baseline_file() { echo "$STATE_DIR/.dolt-disk-floor-guard.growth-baseline"; }
+_growth_episode_file()  { echo "$STATE_DIR/.dolt-disk-floor-guard.growth-episode"; }
+
+# _growth_roots → the roots to photograph, one per line, cheap ones first so a
+# spent budget skips the slowest (Library/Caches) rather than the dolt data-dir.
+# Every root is a directory this guard's own reapers or the bead's list already
+# name — never a walk from / or ~ (TCC-protected Desktop/Documents/iCloud/
+# CloudStorage stay untouched, same rule as _top_disk_consumers above). Deduped
+# so a root shared with another lever is measured once.
+_growth_roots() {
+  local town t d
+  town="$(dirname "$CITY")"
+  t="$(_go_build_tmp_root)"
+  {
+    echo "$DOLTDIR"                                # one entry per Dolt database
+    echo "$CITY/.dolt-backup"
+    echo "$HOME/shared/data"
+    echo "/private/tmp/claude-$(id -u 2>/dev/null)"
+    echo "/private/tmp"
+    if [ -n "$t" ]; then
+      echo "$t"                                    # DARWIN_USER_TEMP_DIR: go-build orphans
+      echo "$(dirname "$t")/X"                     # code_sign_clone parent
+    fi
+    echo "$HOME/.claude/projects"
+    echo "$CITY/.gc-worktrees"
+    echo "$town/.gc-worktrees"
+    echo "$town/.claude/worktrees"
+    for d in "$town"/*/.gc-worktrees; do [ -e "$d" ] && echo "$d"; done
+    echo "$HOME/Library/Caches"                    # slowest (~91s at load 47); GOCACHE lives here
+  } | awk 'NF && !seen[$0]++'
+}
+
+# _growth_scan_root <root> <timeout_secs> → "ROOT<TAB>STATUS<TAB>root" then one
+# "ENT<TAB>kb<TAB>path" per immediate child. Chunked + parallel (`xargs -n 4 -P 3`),
+# NOT one big `du -sk`: du block-buffers its stdout to a pipe, so a timeout-killed
+# single du yields ZERO rows (measured 2026-09-25: ~/Library/Caches hit a 90s
+# bound and returned nothing), whereas chunks that already finished have already
+# flushed and survive the kill. Chunks of 4 keep each du's output under PIPE_BUF
+# (512B on macOS) so two parallel dus cannot interleave mid-line. Symlinked roots
+# are never descended (a symlink into CloudStorage/FUSE could hang the scan).
+_growth_scan_root() {
+  local root="$1" tmo="$2" tmpf xrc status
+  if [ -L "$root" ]; then printf 'ROOT\tSYMLINK\t%s\n' "$root"; return 0; fi
+  if [ ! -d "$root" ]; then printf 'ROOT\tMISSING\t%s\n' "$root"; return 0; fi
+  tmpf="$(mktemp "${TMPDIR:-/tmp}/dolt-disk-floor-guard-growth.XXXXXX" 2>/dev/null)" \
+    || { printf 'ROOT\tPARTIAL\t%s\n' "$root"; return 0; }
+  find "$root" -maxdepth 1 -mindepth 1 -print0 2>/dev/null \
+    | timeout "$tmo" nice -n 10 xargs -0 -n 4 -P 3 du -sk > "$tmpf" 2>/dev/null
+  xrc="${PIPESTATUS[1]}"
+  # A du chunk that hit a permission error or a vanished child exits nonzero — the
+  # routine case here (TCC-protected subdirs under ~/Library/Caches, entries
+  # deleted mid-scan under /private/tmp) — and the rows it printed are still
+  # valid. What xargs reports for that depends on WHICH xargs: macOS's BSD xargs
+  # exits 1 (MEASURED 2026-09-25: 1 for T, /private/tmp and ~/shared/data; a first
+  # draft treated only GNU's 123 as routine and marked nearly every root PARTIAL,
+  # which would have suppressed every "new" claim in the diff), GNU xargs 123. 124
+  # is timeout's own "bound hit"; anything else (126/127 cannot exec, 137/143
+  # killed) means rows may be missing. Those are PARTIAL — never OK.
+  case "$xrc" in 0|1|123) status="OK" ;; *) status="PARTIAL" ;; esac
+  printf 'ROOT\t%s\t%s\n' "$status" "$root"
+  # Only well-formed "<kb><TAB>/abs/path" rows survive; anything else (a
+  # truncated line, a path with a newline) is dropped rather than guessed at.
+  awk -F'\t' '$1 ~ /^[0-9]+$/ && substr($2,1,1) == "/" { printf "ENT\t%s\t%s\n", $1, $2 }' "$tmpf"
+  rm -f "$tmpf" 2>/dev/null
+  return 0
+}
+
+# _lsof_writers_parse <min_mb> → stdin: `lsof -F pcaftsn` output. Prints
+# "mb<TAB>pid<TAB>command<TAB>path" for every REGULAR file held open for WRITE
+# ('w' or 'u') that is >= min_mb, largest first, one row per (pid, path) — a
+# process holding the same file on 6 fds (measured live: Google Drive's
+# metadata_sqlite_db) is one row, not six. A record ends at the next `f`/`p`
+# line or EOF, never at `n`: lsof's field order within a record is not something
+# to lean on.
+_lsof_writers_parse() {
+  local min_mb="${1:-100}"
+  awk -v min="$min_mb" '
+    function flush() {
+      if (have && (a == "w" || a == "u") && t == "REG" && s + 0 >= min * 1048576) {
+        key = pid SUBSEP n
+        if (!(key in seen)) { seen[key] = 1; printf "%d\t%s\t%s\t%s\n", s / 1048576, pid, cmd, n }
+      }
+      have = 0
+    }
+    /^p/ { flush(); pid = substr($0, 2); next }
+    /^c/ { cmd = substr($0, 2); next }
+    /^f/ { flush(); have = 1; a = ""; t = ""; s = ""; n = ""; next }
+    /^a/ { a = substr($0, 2); next }
+    /^t/ { t = substr($0, 2); next }
+    /^s/ { s = substr($0, 2); next }
+    /^n/ { n = substr($0, 2); next }
+    END { flush() }
+  ' | sort -t"$(printf '\t')" -k1,1nr
+}
+
+# _top_open_write_files [n] [min_mb] → tri-state, like _go_build_dir_in_use:
+# rc 0 = lsof ran; stdout = up to n rows (possibly none — a real "nothing that
+# big is open for write"); rc 2 = could not measure (no lsof, timed out, or it
+# reported an error and printed nothing) — which must never be read as rc 0's
+# empty. This is a PROXY for "top writers": macOS exposes no per-process
+# bytes-written counter without root (powermetrics/fs_usage need it), so this
+# shows who is HOLDING the biggest files open for write right now — it caught a
+# 2.1GB fileproviderd database no scan root covers — not who wrote the most
+# recently. Label it as such wherever it is shown. ~3s measured at load 47.
+_top_open_write_files() {
+  local n="${1:-10}" min_mb="${2:-$GROWTH_WRITER_MIN_MB}" raw rc
+  command -v lsof >/dev/null 2>&1 || return 2
+  raw="$(mktemp "${TMPDIR:-/tmp}/dolt-disk-floor-guard-lsofw.XXXXXX" 2>/dev/null)" || return 2
+  timeout 30 nice -n 10 lsof -nP -w -F pcaftsn > "$raw" 2>/dev/null
+  rc=$?
+  # A live machine always has open files, so an EMPTY capture means lsof failed
+  # (or was killed at the 30s bound, rc 124) — never "nothing is open". A
+  # non-empty capture from an lsof that exited nonzero is still valid rows (it
+  # skips what it cannot stat).
+  if [ "$rc" -eq 124 ] || [ ! -s "$raw" ]; then
+    rm -f "$raw" 2>/dev/null
+    return 2
+  fi
+  _lsof_writers_parse "$min_mb" < "$raw" | head -n "$n"
+  rm -f "$raw" 2>/dev/null
+  return 0
+}
+
+# _disk_growth_photo <outfile> [writers] [budget_secs] → reads the roots (one per
+# line) from STDIN and writes the photo (format above) to <outfile>, atomically
+# (tmp + mv, so a reader never sees half a photo). Pass "writers" to also record
+# the open-for-write proxy (~3s; both the baseline and the episode photo do, so
+# the diff can show which held-open file GREW and which pid holds it). rc 0 =
+# <outfile> written; rc 1 = it could not be written. The root scan is bounded by
+# budget_secs (default GROWTH_TOTAL_BUDGET_SECS): each root's own timeout is
+# clamped to what is left, and once nothing is left every remaining root is
+# recorded SKIPPED — so the scan, not just its start, stays inside the budget.
+# The VM du (<=20s) and the writers lsof (<=30s) sit outside it. Read-only apart
+# from <outfile>.
+_disk_growth_photo() {
+  local out="$1" want_writers="${2:-}" budget="${3:-$GROWTH_TOTAL_BUDGET_SECS}" roots root start="$SECONDS" tmp vm_kb rows wrc left tmo
+  roots="$(cat)"
+  tmp="${out}.tmp.$$"
+  vm_kb="$(timeout 20 du -sk /System/Volumes/VM 2>/dev/null | awk '{print $1}')"
+  case "$vm_kb" in ''|*[!0-9]*) vm_kb="unknown" ;; esac
+  {
+    printf '# dolt-disk-floor-guard disk-growth photo (ga-ond0fa) — read-only; sizes in KB (du -sk), one level under each ROOT\n'
+    printf 'TS\t%s\n' "$(date +%s)"
+    printf 'AVAIL_GB\t%s\n' "$(_avail_gb "$DOLTDIR")"
+    printf 'VM_SWAP\t%s\n' "$(sysctl -n vm.swapusage 2>/dev/null | tr '\t\n' '  ')"
+    printf 'VM_DIR_KB\t%s\n' "$vm_kb"
+    while IFS= read -r root; do
+      [ -z "$root" ] && continue
+      left=$(( budget - (SECONDS - start) ))
+      if [ "$left" -le 0 ]; then
+        printf 'ROOT\tSKIPPED\t%s\n' "$root"
+        continue
+      fi
+      tmo="$GROWTH_ROOT_TIMEOUT_SECS"
+      [ "$left" -lt "$tmo" ] && tmo="$left"
+      _growth_scan_root "$root" "$tmo"
+    done <<< "$roots"
+    if [ "$want_writers" = "writers" ]; then
+      rows="$(_top_open_write_files 10 "$GROWTH_WRITER_MIN_MB")"; wrc=$?
+      if [ "$wrc" -eq 0 ]; then
+        printf 'WRITERS\tok\n'
+        [ -n "$rows" ] && printf '%s\n' "$rows" | awk -F'\t' '{ printf "WRITER\t%s\t%s\t%s\t%s\n", $1, $2, $3, $4 }'
+      else
+        printf 'WRITERS\tunmeasured\n'
+      fi
+    fi
+  } 2>/dev/null > "$tmp" || { rm -f "$tmp" 2>/dev/null; return 1; }
+  mv "$tmp" "$out" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  return 0
+}
+
+# _growth_delta <baseline> <now> [n] [min_mb] → what GREW between two photos.
+# Output, tab-separated, one record per line:
+#   G <delta_mb> <now_mb> <was_mb|new> <path>   — grew by >= min_mb, largest first, top n
+#   W <delta_mb> <now_mb> <was_mb|absent> <pid> <command> <path>
+#                                               — a file held open for WRITE that grew by >= min_mb
+#                                                 (or was not in the baseline's list), top n; only
+#                                                 when BOTH photos measured writers. This is the
+#                                                 nearest thing macOS gives to "which process wrote
+#                                                 it": the growing file plus who holds it open.
+#   V <delta_mb> <now_mb> <was_mb>              — /System/Volumes/VM residency, when both known
+#   U <root> <reason>                           — a root that could NOT be fully compared
+# Only entries present in BOTH photos are compared, plus "new" entries — and
+# "new" is claimed only when the baseline scan of that root was OK (complete): an
+# entry absent from a PARTIAL/SKIPPED baseline root is "not measured then", not
+# "did not exist". A root that is not OK on either side is reported as U (with
+# the reason) so a dive hiding in it reads as "unmeasured", never as "nothing
+# grew". Empty output means no growth >= min_mb AND nothing uncomparable.
+# Reads two files, writes nothing.
+_growth_delta() {
+  local base="$1" now="$2" n="${3:-8}" min_mb="${4:-$GROWTH_MIN_DELTA_MB}" rows
+  [ -s "$base" ] && [ -s "$now" ] || return 0
+  rows="$(awk -F'\t' -v min_kb="$(( min_mb * 1024 ))" -v min_mb="$min_mb" '
+    FNR == 1 { fileno++ }
+    $1 == "ROOT" { root = $3; st[fileno SUBSEP root] = $2; if (!(root in roots)) { roots[root] = 1; order[++nr] = root }; next }
+    $1 == "ENT"  { kb[fileno SUBSEP root SUBSEP $3] = $2; if (fileno == 2) { nowkeys[++nn] = root SUBSEP $3 }; next }
+    $1 == "VM_DIR_KB" { vm[fileno] = $2; next }
+    $1 == "WRITERS" { wst[fileno] = $2; next }
+    $1 == "WRITER" {
+      if (fileno == 1) { if (!($5 in wbase) || $2 + 0 > wbase[$5] + 0) wbase[$5] = $2 }
+      else { wn++; wmb[wn] = $2; wpid[wn] = $3; wcmd[wn] = $4; wpath[wn] = $5 }
+      next
+    }
+    END {
+      for (i = 1; i <= nn; i++) {
+        key = nowkeys[i]; split(key, kp, SUBSEP); r = kp[1]; p = kp[2]
+        if (st[1 SUBSEP r] == "" || st[2 SUBSEP r] == "") continue        # root not in both photos
+        cur = kb[2 SUBSEP key]
+        if ((1 SUBSEP key) in kb) { was = kb[1 SUBSEP key]; wtxt = int(was / 1024) }
+        else if (st[1 SUBSEP r] == "OK") { was = 0; wtxt = "new" }
+        else continue                                                      # absent from an incomplete baseline
+        d = cur - was
+        if (d > 0 && d >= min_kb) printf "G\t%d\t%d\t%s\t%s\n", int(d / 1024), int(cur / 1024), wtxt, p
+      }
+      for (i = 1; i <= nr; i++) {
+        r = order[i]; b = st[1 SUBSEP r]; c = st[2 SUBSEP r]
+        if (b == "" && c == "") continue
+        if (b != "OK" || c != "OK") printf "U\t%s\tbaseline=%s now=%s\n", r, (b == "" ? "absent" : b), (c == "" ? "absent" : c)
+      }
+      if (wst[1] == "ok" && wst[2] == "ok") {
+        for (i = 1; i <= wn; i++) {
+          p = wpath[i]
+          if (p in wdone) continue
+          wdone[p] = 1
+          if (p in wbase) { was = wbase[p] + 0; wtxt = wbase[p] } else { was = 0; wtxt = "absent" }
+          d = wmb[i] - was
+          if (d > 0 && d >= min_mb) printf "W\t%d\t%d\t%s\t%s\t%s\t%s\n", d, wmb[i], wtxt, wpid[i], wcmd[i], p
+        }
+      }
+      if (vm[1] ~ /^[0-9]+$/ && vm[2] ~ /^[0-9]+$/) printf "V\t%d\t%d\t%d\n", int((vm[2] - vm[1]) / 1024), int(vm[2] / 1024), int(vm[1] / 1024)
+    }
+  ' "$base" "$now")"
+  [ -z "$rows" ] && return 0
+  printf '%s\n' "$rows" | awk -F'\t' '$1 == "G"' | sort -t"$(printf '\t')" -k2,2nr | head -n "$n"
+  printf '%s\n' "$rows" | awk -F'\t' '$1 == "W"' | sort -t"$(printf '\t')" -k2,2nr | head -n "$n"
+  printf '%s\n' "$rows" | awk -F'\t' '$1 == "V" || $1 == "U"'
+}
+
+# _growth_report <baseline> <now> → the human text for a finished photo. With a
+# baseline: the growers (or an explicit "nothing >= N MB grew in the comparable
+# roots"), the VM delta, and every root that could not be compared. Without one
+# (the guard has not yet seen an OK cycle): says so and falls back to the biggest
+# entries by absolute size, which is still more than "avail=" ever gave.
+_growth_report() {
+  local base="$1" now="$2" delta bts nts age g w v u
+  nts="$(awk -F'\t' '$1 == "TS" { print $2; exit }' "$now" 2>/dev/null)"
+  if [ ! -s "$base" ]; then
+    echo "No baseline photo yet (this guard has not completed an OK cycle since the baseline was introduced) — cannot compute growth."
+    echo "Largest entries by absolute size in this photo (MB path):"
+    awk -F'\t' '$1 == "ENT" { printf "%d\t%s\n", $2 / 1024, $3 }' "$now" | sort -t"$(printf '\t')" -k1,1nr | head -n "$GROWTH_TOP_N" | awk -F'\t' '{ printf "  %s %s\n", $1, $2 }'
+    return 0
+  fi
+  bts="$(awk -F'\t' '$1 == "TS" { print $2; exit }' "$base" 2>/dev/null)"
+  age="unknown age"
+  case "$bts" in ''|*[!0-9]*) ;; *)
+    case "$nts" in ''|*[!0-9]*) ;; *) age="$(( (nts - bts) / 60 )) min old" ;; esac
+  esac
+  echo "Growth since the last OK photo (${age}; entries that grew >= ${GROWTH_MIN_DELTA_MB}MB, MB path):"
+  delta="$(_growth_delta "$base" "$now" "$GROWTH_TOP_N" "$GROWTH_MIN_DELTA_MB")"
+  g="$(printf '%s\n' "$delta" | awk -F'\t' '$1 == "G" { printf "  +%sMB  %s  (now %sMB, was %s%s)\n", $2, $5, $3, $4, ($4 == "new" ? "" : "MB") }')"
+  if [ -n "$g" ]; then printf '%s\n' "$g"; else echo "  (none in the roots that could be compared — the growth is outside them, in VM, or in an unmeasured root below)"; fi
+  w="$(printf '%s\n' "$delta" | awk -F'\t' '$1 == "W" { printf "  +%sMB  pid=%s %s  %s  (now %sMB, was %s)\n", $2, $5, $6, $7, $3, ($4 == "absent" ? "not in the baseline open-for-write list" : $4 "MB") }')"
+  if [ -n "$w" ]; then
+    echo "Files held open for WRITE that grew (or appeared) since the baseline — the process holding one is the prime suspect:"
+    printf '%s\n' "$w"
+  fi
+  v="$(printf '%s\n' "$delta" | awk -F'\t' '$1 == "V" { printf "  /System/Volumes/VM: %sMB now, %+dMB vs baseline (%sMB)\n", $3, $2, $4 }')"
+  [ -n "$v" ] && printf '%s\n' "$v"
+  u="$(printf '%s\n' "$delta" | awk -F'\t' '$1 == "U" { printf "  NOT FULLY COMPARED: %s (%s)\n", $2, $3 }')"
+  [ -n "$u" ] && printf '%s\n' "$u"
+  return 0
+}
+
+# _growth_baseline_due <baseline_file> <now> <interval_secs> → 0 when a baseline
+# refresh is due: no baseline, an unreadable/garbled TS, a TS in the FUTURE (clock
+# step — a baseline that looks younger than zero must not freeze refreshing), or
+# the interval elapsed. Fail-open on purpose: the cost of a wrongly-taken photo is
+# one rate-limited scan, the cost of a wrongly-suppressed one is a diff against
+# nothing at the exact moment it is needed.
+_growth_baseline_due() {
+  local f="$1" now="$2" interval="$3" ts_
+  ts_="$([ -s "$f" ] && awk -F'\t' '$1 == "TS" { print $2; exit }' "$f" 2>/dev/null)"
+  case "$ts_" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$ts_" -gt "$now" ] && return 0
+  [ $(( now - ts_ )) -ge "$interval" ]
+}
+
+# _growth_should_photo <episode_level> <class> → 0 when this cycle earns an
+# episode photo: episode_level is the HIGHEST class already photographed this
+# episode ('' none | WARN | CRITICAL), class is this cycle's pre-reclaim class.
+# So: the first WARN cycle photographs; the first CRITICAL cycle photographs
+# again (a fill that started at WARN is usually worse by the time it is
+# CRITICAL); every later cycle of the same or lower level does not. Any other
+# class (NONE/UNKNOWN never reach here, but stay safe in isolation) never does.
+_growth_should_photo() {
+  local level="$1" class="$2" have want
+  case "$level" in CRITICAL) have=2 ;; WARN) have=1 ;; *) have=0 ;; esac
+  case "$class" in CRITICAL) want=2 ;; WARN) want=1 ;; *) return 1 ;; esac
+  [ "$want" -gt "$have" ]
+}
+
 # ════════════════════════════════════════════════════════════════════════════════
 # EXECUTION (side-effecting; NOT exercised by the selftest)
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1107,6 +1507,128 @@ _maybe_mail_recovery() {
   _write_critical_episode_mailed 0
   _clear_last_mail_state
   log "CRITICAL episode recovered (avail=${avail}GB) — mailed Mayor recovery notice, cleared mail-debounce state"
+}
+
+# ── ga-ond0fa: disk-growth photo — execution side (design: see the DISK-GROWTH
+# PHOTO block above _growth_roots). The episode file holds two lines: the highest
+# class already photographed this episode (WARN|CRITICAL), then the path of the
+# most recent photo — the second line is what lets a LATER cycle's Mayor mail cite
+# the photo an EARLIER cycle took (each cycle is a separate process). Missing or
+# garbled reads as "no photo yet", which errs toward one extra scan, never toward
+# a suppressed one.
+_growth_read_episode() {
+  local f v; f="$(_growth_episode_file)"
+  v="$([ -f "$f" ] && sed -n '1p' "$f" 2>/dev/null)"
+  case "$v" in WARN|CRITICAL) echo "$v" ;; *) echo "" ;; esac
+}
+
+_growth_read_episode_photo() {
+  local f; f="$(_growth_episode_file)"
+  [ -f "$f" ] && sed -n '2p' "$f" 2>/dev/null
+  return 0
+}
+
+_growth_write_episode() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  printf '%s\n%s\n' "$1" "$2" > "$(_growth_episode_file)" 2>/dev/null || true
+}
+
+_growth_clear_episode() { rm -f "$(_growth_episode_file)" 2>/dev/null || true; }
+
+# _growth_prune_photos → keep only the newest GROWTH_KEEP_PHOTOS photo files. Only
+# this guard's own disk-growth-<stamp>.txt files are ever removed.
+_growth_prune_photos() {
+  ls -1 "$STATE_DIR"/disk-growth-[0-9]*.txt 2>/dev/null | sort -r | tail -n +"$(( GROWTH_KEEP_PHOTOS + 1 ))" \
+    | while IFS= read -r _old_photo; do rm -f "$_old_photo" 2>/dev/null; done
+  return 0
+}
+
+# _growth_writers_text <photo> → the WRITERS section of a photo as report lines.
+# Says outright that this is a proxy (see _top_open_write_files) and keeps the
+# three cases apart: measured-with-rows, measured-and-empty, unmeasured.
+_growth_writers_text() {
+  local f="$1" st
+  st="$(awk -F'\t' '$1 == "WRITERS" { print $2; exit }' "$f" 2>/dev/null)"
+  echo "Largest files held open for WRITE right now (proxy — macOS gives no per-process write counter without root; this is who HOLDS big files open, not who wrote most recently):"
+  case "$st" in
+    ok)
+      if awk -F'\t' '$1 == "WRITER" { found = 1 } END { exit !found }' "$f" 2>/dev/null; then
+        awk -F'\t' '$1 == "WRITER" { printf "  %sMB  pid=%s %s  %s\n", $2, $3, $4, $5 }' "$f"
+      else
+        echo "  (none >= ${GROWTH_WRITER_MIN_MB}MB)"
+      fi ;;
+    *) echo "  (unmeasured — lsof failed or timed out)" ;;
+  esac
+}
+
+# _growth_baseline_refresh <now> → on a class=NONE cycle, refresh the "last OK"
+# baseline photo if GROWTH_BASELINE_INTERVAL_SECS has passed. Never affects the
+# guard's decisions: a failed scan only logs, and the previous baseline (the
+# refresh is an atomic tmp+mv) stays in place.
+_growth_baseline_refresh() {
+  local now="$1" f t0 notok
+  [ "$GROWTH_PHOTO_ENABLED" = "1" ] || return 0
+  f="$(_growth_baseline_file)"
+  _growth_baseline_due "$f" "$now" "$GROWTH_BASELINE_INTERVAL_SECS" || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  t0=$SECONDS
+  if _growth_roots | _disk_growth_photo "$f" writers; then
+    notok="$(awk -F'\t' '$1 == "ROOT" && $2 != "OK" && $2 != "MISSING" { printf "%s(%s) ", $3, $2 }' "$f" 2>/dev/null)"
+    log "growth baseline photo refreshed ($(( SECONDS - t0 ))s; roots not fully measured: ${notok:-none}) (ga-ond0fa)"
+  else
+    log "WARN: growth baseline photo could not be written to ${f} — keeping the previous baseline (ga-ond0fa)"
+  fi
+  return 0
+}
+
+# _growth_episode_photo <class> <avail> → on the first WARN cycle and again
+# on the first CRITICAL cycle of an episode (_growth_should_photo), photograph the
+# growth roots and write $STATE_DIR/disk-growth-<stamp>.txt with the diff against
+# the baseline. MUST be called BEFORE the reclaim levers: they delete scratch,
+# caches and orphans, which are exactly the things a growth photo should still be
+# able to see. The top growers are also logged. The episode is only marked as
+# photographed once the file actually landed, so a failed write is retried.
+_growth_episode_photo() {
+  local class="$1" avail="$2" level stamp file base report t0 l budget
+  [ "$GROWTH_PHOTO_ENABLED" = "1" ] || return 0
+  level="$(_growth_read_episode)"
+  _growth_should_photo "$level" "$class" || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  stamp="$(date '+%Y%m%d-%H%M%S')"
+  file="$STATE_DIR/disk-growth-${stamp}.txt"
+  base="$(_growth_baseline_file)"
+  budget="$GROWTH_TOTAL_BUDGET_SECS"
+  [ "$class" = "CRITICAL" ] && budget="$GROWTH_CRITICAL_BUDGET_SECS"
+  log "disk-growth photo (ga-ond0fa): class=${class} avail=${avail}GB — photographing the growth roots BEFORE the reclaim levers run (scan budget ${budget}s)"
+  t0=$SECONDS
+  if ! _growth_roots | _disk_growth_photo "$file" writers "$budget"; then
+    log "WARN: disk-growth photo could not be written to ${file} — will retry next cycle (ga-ond0fa)"
+    return 0
+  fi
+  report="$(_growth_report "$base" "$file")"
+  {
+    echo "# ==== disk-growth report (ga-ond0fa) — class=${class} avail=${avail}GB at $(ts) ===="
+    printf '%s\n' "$report" | sed 's/^/# /'
+    _growth_writers_text "$file" | sed 's/^/# /'
+  } >> "$file" 2>/dev/null
+  log "disk-growth photo written: ${file} ($(( SECONDS - t0 ))s)"
+  printf '%s\n' "$report" | while IFS= read -r l; do log "  $l"; done
+  _growth_write_episode "$class" "$file"
+  _growth_prune_photos
+  return 0
+}
+
+# _growth_mail_text → the disk-growth paragraph for the Mayor CRITICAL mail: the
+# photo THIS EPISODE took (which may be from an earlier cycle than the mail), or
+# an explicit statement that there is none — never silence.
+_growth_mail_text() {
+  local pf; pf="$(_growth_read_episode_photo)"
+  if [ -z "$pf" ] || [ ! -s "$pf" ]; then
+    echo "  (no disk-growth photo recorded for this episode — DOLT_DISK_FLOOR_GROWTH_PHOTO_ENABLED=0, or the scan could not write its file; see ga-ond0fa)"
+    return 0
+  fi
+  echo "  Photo file: ${pf}"
+  awk '/^# ==== disk-growth report/ { on = 1; next } on && /^# / { sub(/^# /, "  "); print }' "$pf"
 }
 
 # _safe_reclaim <before_avail_gb> → best-effort `gc dolt-cleanup --force` (orphan
@@ -2198,6 +2720,13 @@ main() {
     log "avail=${avail}GB > floor(warn=${FLOOR_WARN_GB}GB) — OK"
     _write_critical_sustain 0
     _maybe_mail_recovery "$avail" "$now"
+    # ga-ond0fa: the disk is healthy — end any growth-photo episode (the next
+    # WARN/CRITICAL earns a fresh photo) and, if the interval has passed, refresh
+    # the "last OK" baseline that episode photos are diffed against. Last on
+    # purpose: it is the only part of this branch that can take real time, and
+    # the alerts/recovery above must not wait behind it.
+    _growth_clear_episode
+    _growth_baseline_refresh "$now"
     return 0
   fi
 
@@ -2218,6 +2747,11 @@ main() {
   # so their combined effect can be measured (reclaimed_gb below) instead of
   # only inferred from the reclassified `class`.
   local avail_before="$avail"
+
+  # ga-ond0fa: photograph WHAT GREW before any lever below runs — they delete
+  # scratch, caches and orphans, the very things a growth photo must still see.
+  # Once per episode level (first WARN, first CRITICAL); no-op otherwise.
+  _growth_episode_photo "$class" "$avail"
 
   _read_state
   _safe_reclaim "$avail"
@@ -2407,6 +2941,7 @@ and .gc/logs)."
         # command substitution when the body contains an apostrophe (confirmed by
         # direct repro on this machine). A plain multi-line double-quoted assignment
         # has no such bug and is otherwise equivalent.
+        local growth_txt; growth_txt="$(_growth_mail_text)"
         local mail_body="dolt-disk-floor-guard: Dolt data-dir hit CRITICAL floor (<= ${FLOOR_CRITICAL_GB}GB) for ${pending} consecutive cycles.
 Safe reclaim (gc dolt-cleanup --force), dead-session scratchpad cleanup, and dead-session
 transcript cleanup were already attempted this cycle. This is the same class of event that
@@ -2427,7 +2962,11 @@ broader causal claim against 40 days of this guard's history — see that bead f
 Top disk consumers measured this cycle across this guard's known scratch/cache roots (MB path;
 ga-ofi307 — catches a new large consumer, the way bash-edit-diff's 3.5GB cache was before this
 bead, before a human has to find it by hand):
-${top_disk:-  (unmeasured — no known roots present or du failed)}"
+${top_disk:-  (unmeasured — no known roots present or du failed)}
+
+WHAT GREW (ga-ond0fa) — this episode's disk-growth photo, taken before any reclaim lever ran and
+diffed against the last OK photo:
+${growth_txt}"
         "$GC" mail send mayor -s "Dolt disk-floor CRITICAL: avail=${avail}GB" -m "$mail_body" 2>/dev/null || log "WARN: gc mail send mayor failed"
         _write_last_mail_state "$now" "$avail"
         _write_critical_episode_mailed 1

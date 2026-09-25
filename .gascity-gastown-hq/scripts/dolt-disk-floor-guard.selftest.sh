@@ -1155,6 +1155,431 @@ _gocache_dir() {
 CITY="/Users/athos/gt/.gascity-gastown-hq"
 
 echo ""
+echo "=== disk-growth photo (ga-ond0fa): scan, photo, delta, report, gating, writers proxy ==="
+# WHY: 2026-09-25 free space dived ~7GB in 45min and the guard could only log
+# "avail=" — nothing said WHAT grew. These prove the pieces that answer it, on
+# hermetic fixtures: the REAL find/xargs/du/lsof binaries run, but only against
+# mktemp directories (and lsof only for one file this shell holds open itself);
+# the state dir is redirected to a throwaway (helpers resolve $STATE_DIR at call
+# time, so nothing can leak into the real $CITY/.gc/logs — see the config block).
+GROW_TMP="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-growth.XXXXXX)"
+STATE_DIR_BEFORE_GROWTH="$STATE_DIR"
+STATE_DIR="$GROW_TMP/state"; mkdir -p "$STATE_DIR"
+TAB="$(printf '\t')"
+GROWTH_MIN_DELTA_MB_ORIG="$GROWTH_MIN_DELTA_MB"
+
+# ── _growth_scan_root: real du on a fixture ────────────────────────────────────
+GR="$GROW_TMP/root1"; mkdir -p "$GR/big" "$GR/small1" "$GR/small2"
+head -c 5242880 /dev/zero > "$GR/big/payload"; echo x > "$GR/small1/f"; echo x > "$GR/small2/f"
+scan_out="$(_growth_scan_root "$GR" 30)"
+[ "$(printf '%s\n' "$scan_out" | head -1)" = "ROOT${TAB}OK${TAB}$GR" ] \
+  && ok "_growth_scan_root: a fully scanned root is STATUS OK" \
+  || bad "_growth_scan_root: expected 'ROOT OK $GR' first, got: $(printf '%s' "$scan_out" | head -1)"
+big_kb="$(printf '%s\n' "$scan_out" | awk -F'\t' -v p="$GR/big" '$1 == "ENT" && $3 == p { print $2 }')"
+case "$big_kb" in
+  ''|*[!0-9]*) bad "_growth_scan_root: no ENT row for the 5MB child (got '$big_kb')" ;;
+  *) [ "$big_kb" -ge 5120 ] && ok "_growth_scan_root: the 5MB child is measured (${big_kb}KB) as an ENT row" || bad "_growth_scan_root: 5MB child measured too small: ${big_kb}KB" ;;
+esac
+[ "$(printf '%s\n' "$scan_out" | grep -c '^ENT')" = "3" ] \
+  && ok "_growth_scan_root: exactly the 3 immediate children, one ENT each" \
+  || bad "_growth_scan_root: expected 3 ENT rows, got $(printf '%s\n' "$scan_out" | grep -c '^ENT')"
+
+# ── _growth_scan_root: BSD xargs exits 1 when ANY du chunk errors (measured
+#    live) — that routine case must stay OK, not PARTIAL. A fake du that fails
+#    on one argument reproduces it without needing an unreadable directory. ─────
+STUBBIN="$GROW_TMP/stubbin"; mkdir -p "$STUBBIN"
+cat > "$STUBBIN/du" <<'STUBEOF'
+#!/bin/bash
+# fake du: prints a row per argument, but exits 1 as if one path was unreadable
+for a in "$@"; do [ "$a" = "-sk" ] && continue; printf '100\t%s\n' "$a"; done
+exit 1
+STUBEOF
+chmod +x "$STUBBIN/du"
+routine_out="$(PATH="$STUBBIN:$PATH" _growth_scan_root "$GR" 30)"
+[ "$(printf '%s\n' "$routine_out" | head -1)" = "ROOT${TAB}OK${TAB}$GR" ] \
+  && ok "_growth_scan_root: du chunks exiting nonzero (permission errors — routine) still yield STATUS OK, rows kept" \
+  || bad "_growth_scan_root: a nonzero du exit must not demote the root — got: $(printf '%s' "$routine_out" | head -1)"
+
+# ── _growth_scan_root: missing root and symlinked root ─────────────────────────
+[ "$(_growth_scan_root "$GROW_TMP/nope" 5)" = "ROOT${TAB}MISSING${TAB}$GROW_TMP/nope" ] \
+  && ok "_growth_scan_root: a missing root is reported MISSING (not an error, not an empty OK)" \
+  || bad "_growth_scan_root: missing root should read 'ROOT MISSING'"
+ln -s "$GR" "$GROW_TMP/linkroot"
+link_out="$(_growth_scan_root "$GROW_TMP/linkroot" 5)"
+[ "$link_out" = "ROOT${TAB}SYMLINK${TAB}$GROW_TMP/linkroot" ] \
+  && ok "_growth_scan_root: a symlinked root is never descended (SYMLINK, zero ENT rows — CloudStorage/FUSE hazard)" \
+  || bad "_growth_scan_root: symlinked root must not be scanned, got: $link_out"
+
+# ── _growth_scan_root: a timeout keeps the chunks that FINISHED (PARTIAL), it
+#    does not lose the whole root. This is the reason for chunked+parallel du:
+#    a single killed du returns zero rows (measured: ~/Library/Caches). The fake
+#    du hangs on any chunk containing 'slow'. ───────────────────────────────────
+cat > "$STUBBIN/du" <<'STUBEOF'
+#!/bin/bash
+for a in "$@"; do case "$a" in *slow*) sleep 30 ;; esac; done
+for a in "$@"; do [ "$a" = "-sk" ] && continue; printf '100\t%s\n' "$a"; done
+STUBEOF
+GP="$GROW_TMP/rootpart"; mkdir -p "$GP/slow1"      # NOT named *slow*: the fake du hangs on any path matching it
+for i in 1 2 3 4 5 6 7 8 9 10 11 12; do mkdir -p "$GP/fast$i"; done
+part_out="$(PATH="$STUBBIN:$PATH" _growth_scan_root "$GP" 3)"
+[ "$(printf '%s\n' "$part_out" | head -1)" = "ROOT${TAB}PARTIAL${TAB}$GP" ] \
+  && ok "_growth_scan_root: a root that hits its timeout is PARTIAL, never OK" \
+  || bad "_growth_scan_root: timed-out root should be PARTIAL, got: $(printf '%s' "$part_out" | head -1)"
+part_rows="$(printf '%s\n' "$part_out" | grep -c '^ENT')"
+{ [ "$part_rows" -ge 8 ] && [ "$part_rows" -le 12 ]; } \
+  && ok "_growth_scan_root: chunks that finished before the timeout survive ($part_rows of 13 rows kept)" \
+  || bad "_growth_scan_root: expected 8-12 surviving rows after the timeout, got $part_rows"
+case "$part_out" in
+  *slow1*) bad "_growth_scan_root: the hung entry must not appear as a measured row" ;;
+  *) ok "_growth_scan_root: the hung entry is absent — unmeasured, not fabricated as a zero" ;;
+esac
+rm -f "$STUBBIN/du"
+
+# ── _disk_growth_photo: format, atomicity, budget, unwritable ──────────────────
+PH="$GROW_TMP/photo1.txt"
+printf '%s\n%s\n' "$GR" "$GROW_TMP/nope" | _disk_growth_photo "$PH"; ph_rc=$?
+if [ "$ph_rc" = "0" ] && [ -s "$PH" ] && grep -q "^TS${TAB}[0-9]" "$PH" \
+   && grep -q "^ROOT${TAB}OK${TAB}$GR" "$PH" && grep -q "^ROOT${TAB}MISSING${TAB}$GROW_TMP/nope" "$PH"; then
+  ok "_disk_growth_photo: writes TS + one ROOT line per root (OK and MISSING both recorded) and returns 0"
+else
+  bad "_disk_growth_photo: photo malformed (rc=$ph_rc): $(head -8 "$PH" 2>/dev/null | tr '\n' '|')"
+fi
+[ -z "$(ls "$GROW_TMP"/photo1.txt.tmp.* 2>/dev/null)" ] \
+  && ok "_disk_growth_photo: no .tmp file left behind (atomic tmp+mv)" \
+  || bad "_disk_growth_photo: leftover tmp file(s): $(ls "$GROW_TMP"/photo1.txt.tmp.*)"
+grep -q "^VM_DIR_KB${TAB}" "$PH" && grep -q "^VM_SWAP${TAB}" "$PH" \
+  && ok "_disk_growth_photo: records VM_SWAP and VM_DIR_KB (the vm.swapusage + /System/Volumes/VM half of the bead)" \
+  || bad "_disk_growth_photo: VM lines missing"
+
+printf '%s\n' "$GR" | _disk_growth_photo "$GROW_TMP/photo-budget.txt" "" 0
+if grep -q "^ROOT${TAB}SKIPPED${TAB}$GR" "$GROW_TMP/photo-budget.txt" && [ "$(grep -c '^ENT' "$GROW_TMP/photo-budget.txt")" = "0" ]; then
+  ok "_disk_growth_photo: a spent budget records every remaining root SKIPPED — explicit 'not measured', no ENT rows, never a silent zero"
+else
+  bad "_disk_growth_photo: budget=0 should mark the root SKIPPED with no ENT rows: $(cat "$GROW_TMP/photo-budget.txt" | tr '\n' '|')"
+fi
+
+printf '%s\n' "$GR" | _disk_growth_photo "$GROW_TMP/no-such-dir/photo.txt" 2>/dev/null; bad_rc=$?
+[ "$bad_rc" = "1" ] && [ ! -e "$GROW_TMP/no-such-dir" ] \
+  && ok "_disk_growth_photo: an unwritable output returns 1 (the caller can retry) and creates nothing" \
+  || bad "_disk_growth_photo: unwritable output should return 1, got $bad_rc"
+
+# ── _lsof_writers_parse: canned `lsof -F pcaftsn` output ───────────────────────
+# journal (pid 100) is held on TWO fds (one 'w', one 'u') = ONE row; readonly is
+# mode r; a directory (DIR) and a 10-byte file are below/outside the filter; 'rev'
+# lists n BEFORE s (field order within a record must not matter).
+LSOF_CANNED="$(printf '%s\n' \
+  p100 cdolt f4 aw tREG s3145728 n/x/journal \
+  f5 ar tREG s9999999999 n/x/readonly \
+  f6 au tREG s3145728 n/x/journal \
+  p200 cpython f3 aw tDIR s4096 n/x/somedir \
+  f7 aw tREG s10 n/x/small \
+  f8 aw tREG s5242880 n/y/big \
+  f9 aw tREG n/z/rev s2097152)"
+wp_out="$(printf '%s\n' "$LSOF_CANNED" | _lsof_writers_parse 1)"
+if [ "$(printf '%s\n' "$wp_out" | grep -c .)" = "3" ] \
+   && [ "$(printf '%s\n' "$wp_out" | head -1 | awk -F'\t' '{ print $4 }')" = "/y/big" ] \
+   && printf '%s\n' "$wp_out" | grep -q "^3${TAB}100${TAB}dolt${TAB}/x/journal\$" \
+   && printf '%s\n' "$wp_out" | grep -q "${TAB}/z/rev\$" \
+   && ! printf '%s\n' "$wp_out" | grep -q -e readonly -e somedir -e small; then
+  ok "_lsof_writers_parse: only REG files held open for w/u >= min, largest first, one row per (pid,path), field order irrelevant"
+else
+  bad "_lsof_writers_parse: wrong rows: $(printf '%s' "$wp_out" | tr '\n' ';')"
+fi
+
+# ── _top_open_write_files: REAL lsof against a file THIS shell holds open ──────
+HOLD="$GROW_TMP/held-open.bin"; head -c 3145728 /dev/zero > "$HOLD"
+exec 9>>"$HOLD"
+tw_out="$(_top_open_write_files 100000 1)"; tw_rc=$?    # every row: this host holds many >1MB files open, a top-10 cut could drop the fixture
+exec 9>&-
+if [ "$tw_rc" = "0" ] && printf '%s\n' "$tw_out" | grep -q "held-open.bin"; then
+  ok "_top_open_write_files: real lsof surfaces a 3MB file held open for write (rc 0)"
+else
+  bad "_top_open_write_files: expected held-open.bin with rc 0, got rc=$tw_rc out=$(printf '%s' "$tw_out" | head -c 200)"
+fi
+
+# unmeasured (rc 2) must differ from measured-empty (rc 0, no rows): a fake lsof
+# that prints nothing (as a failing/unavailable one does) is UNMEASURED.
+STUB2="$GROW_TMP/stublsof"; mkdir -p "$STUB2"
+printf '#!/bin/bash\nexit 1\n' > "$STUB2/lsof"; chmod +x "$STUB2/lsof"
+PATH="$STUB2:$PATH" _top_open_write_files 10 1 >/dev/null; tw2_rc=$?
+[ "$tw2_rc" = "2" ] && ok "_top_open_write_files: an lsof that yields nothing is UNMEASURED (rc 2), never 'no big writers'" || bad "_top_open_write_files: empty lsof capture should be rc 2, got $tw2_rc"
+# a nonzero lsof exit WITH valid output is still valid rows (it skips what it cannot stat)
+printf '#!/bin/bash\nprintf "p1\\ncx\\nf1\\naw\\ntREG\\ns5242880\\nn/q/kept\\n"\nexit 1\n' > "$STUB2/lsof"
+tw3_out="$(PATH="$STUB2:$PATH" _top_open_write_files 10 1)"; tw3_rc=$?
+{ [ "$tw3_rc" = "0" ] && printf '%s\n' "$tw3_out" | grep -q "/q/kept"; } \
+  && ok "_top_open_write_files: a nonzero lsof exit with valid output still returns its rows" \
+  || bad "_top_open_write_files: valid rows from a nonzero-exit lsof were dropped (rc=$tw3_rc out=$tw3_out)"
+
+# ── _growth_delta: handcrafted photos covering every comparison rule ───────────
+GB_BASE="$GROW_TMP/delta-base.txt"; GB_NOW="$GROW_TMP/delta-now.txt"
+printf '%s\n' \
+  "TS${TAB}1000" "VM_DIR_KB${TAB}1048576" \
+  "ROOT${TAB}OK${TAB}/r1" \
+  "ENT${TAB}1048576${TAB}/r1/grown" "ENT${TAB}2048${TAB}/r1/same" "ENT${TAB}8192${TAB}/r1/shrunk" "ENT${TAB}1024${TAB}/r1/small-growth" \
+  "ROOT${TAB}OK${TAB}/r2" "ENT${TAB}4096${TAB}/r2/a" \
+  "ROOT${TAB}PARTIAL${TAB}/r3" "ENT${TAB}100${TAB}/r3/x" \
+  "ROOT${TAB}OK${TAB}/r4" "ENT${TAB}100${TAB}/r4/x" \
+  "WRITERS${TAB}ok" "WRITER${TAB}400${TAB}77${TAB}dolt${TAB}/w/journal" "WRITER${TAB}150${TAB}88${TAB}py${TAB}/w/steady.db" > "$GB_BASE"
+printf '%s\n' \
+  "TS${TAB}2200" "VM_DIR_KB${TAB}3145728" \
+  "ROOT${TAB}OK${TAB}/r1" \
+  "ENT${TAB}6291456${TAB}/r1/grown" "ENT${TAB}2048${TAB}/r1/same" "ENT${TAB}1024${TAB}/r1/shrunk" "ENT${TAB}21504${TAB}/r1/small-growth" "ENT${TAB}307200${TAB}/r1/brandnew" \
+  "ROOT${TAB}OK${TAB}/r2" "ENT${TAB}4096${TAB}/r2/a" \
+  "ROOT${TAB}OK${TAB}/r3" "ENT${TAB}100${TAB}/r3/x" "ENT${TAB}900000${TAB}/r3/y" \
+  "ROOT${TAB}SKIPPED${TAB}/r4" \
+  "ROOT${TAB}OK${TAB}/r5" "ENT${TAB}500000${TAB}/r5/z" \
+  "WRITERS${TAB}ok" "WRITER${TAB}2500${TAB}77${TAB}dolt${TAB}/w/journal" "WRITER${TAB}3000${TAB}99${TAB}build${TAB}/w/newtemp.bin" "WRITER${TAB}150${TAB}88${TAB}py${TAB}/w/steady.db" > "$GB_NOW"
+gd="$(_growth_delta "$GB_BASE" "$GB_NOW" 8 50)"
+gd_g() { printf '%s\n' "$gd" | awk -F'\t' '$1 == "G"'; }
+[ "$(gd_g | head -1 | cut -f2,3,4,5 | tr '\t' ' ')" = "5120 6144 1024 /r1/grown" ] \
+  && ok "_growth_delta: a grown entry is reported with delta/now/was in MB (5120MB: 1GB -> 6GB), largest first" \
+  || bad "_growth_delta: first grower wrong: $(gd_g | head -1)"
+gd_g | grep -q "${TAB}/r1/brandnew\$" && gd_g | grep "/r1/brandnew" | cut -f4 | grep -qx new \
+  && ok "_growth_delta: an entry absent from an OK baseline root is 'new'" \
+  || bad "_growth_delta: brandnew should be reported as 'new': $(gd_g | tr '\n' ';')"
+if printf '%s\n' "$gd" | grep -q -e "/r1/same" -e "/r1/shrunk" -e "/r1/small-growth"; then
+  bad "_growth_delta: unchanged / shrunk / under-threshold (+20MB < 50) entries must not be listed: $(gd_g | tr '\n' ';')"
+else
+  ok "_growth_delta: unchanged, shrunk and below-threshold entries are not listed"
+fi
+if gd_g | grep -q -e "/r3/y" -e "/r5/z"; then
+  bad "_growth_delta: an entry in a root whose BASELINE was PARTIAL/absent must NOT be called new/grown (not measured then): $(gd_g | tr '\n' ';')"
+else
+  ok "_growth_delta: no 'new' claim about a root the baseline never fully measured (r3 PARTIAL, r5 absent)"
+fi
+printf '%s\n' "$gd" | grep -q "^U${TAB}/r3${TAB}baseline=PARTIAL now=OK\$" \
+  && printf '%s\n' "$gd" | grep -q "^U${TAB}/r4${TAB}baseline=OK now=SKIPPED\$" \
+  && printf '%s\n' "$gd" | grep -q "^U${TAB}/r5${TAB}baseline=absent now=OK\$" \
+  && ok "_growth_delta: every root that could not be fully compared is reported U with its reason (PARTIAL / SKIPPED / absent)" \
+  || bad "_growth_delta: missing U lines: $(printf '%s\n' "$gd" | grep '^U' | tr '\n' ';')"
+printf '%s\n' "$gd" | grep -q "^V${TAB}2048${TAB}3072${TAB}1024\$" \
+  && ok "_growth_delta: VM residency delta reported (V +2048MB: 1GB -> 3GB)" \
+  || bad "_growth_delta: VM line wrong: $(printf '%s\n' "$gd" | grep '^V')"
+gw="$(printf '%s\n' "$gd" | awk -F'\t' '$1 == "W"')"
+gw_j="$(printf '%s\n' "$gw" | awk -F'\t' '$7 == "/w/journal"' | cut -f2,3,4,5,6,7 | tr '\t' ' ')"
+if [ "$gw_j" = "2100 2500 400 77 dolt /w/journal" ]; then
+  ok "_growth_delta: a held-open file that GREW is attributed to its holder (dolt pid 77: +2100MB) — the 'who wrote it' signal"
+else
+  bad "_growth_delta: writer growth wrong: $(printf '%s' "$gw" | tr '\n' ';')"
+fi
+printf '%s\n' "$gw" | grep -q "/w/newtemp.bin" && printf '%s\n' "$gw" | grep "/w/newtemp.bin" | cut -f4 | grep -qx absent \
+  && ok "_growth_delta: a big held-open file NOT in the baseline's list is reported (marked 'absent'), the classic temp-file culprit" \
+  || bad "_growth_delta: newtemp.bin should be reported as absent-from-baseline: $(printf '%s' "$gw" | tr '\n' ';')"
+[ "$(printf '%s\n' "$gw" | head -1 | cut -f7)" = "/w/newtemp.bin" ] \
+  && ok "_growth_delta: writer rows sort by growth, largest first (the 3000MB new temp file ahead of the +2100MB journal)" \
+  || bad "_growth_delta: writer rows not sorted largest-first: $(printf '%s' "$gw" | tr '\n' ';')"
+printf '%s\n' "$gw" | grep -q "steady.db" && bad "_growth_delta: an unchanged held-open file must not be listed" || ok "_growth_delta: an unchanged held-open file is not listed"
+
+n1="$(_growth_delta "$GB_BASE" "$GB_NOW" 1 50 | awk -F'\t' '$1 == "G"' | grep -c .)"
+[ "$n1" = "1" ] && ok "_growth_delta: honours the top-n cap (n=1 -> 1 grower)" || bad "_growth_delta: n=1 returned $n1 growers"
+
+# writers not measured on EITHER side -> no W claims at all (same 'unmeasured is not zero' rule)
+sed "s/^WRITERS${TAB}ok\$/WRITERS${TAB}unmeasured/" "$GB_NOW" > "$GROW_TMP/delta-now-unm.txt"
+_growth_delta "$GB_BASE" "$GROW_TMP/delta-now-unm.txt" 8 50 | awk -F'\t' '$1 == "W"' | grep -q . \
+  && bad "_growth_delta: no writer claims when the writers were unmeasured in one photo" \
+  || ok "_growth_delta: writers unmeasured on one side -> no writer growth claimed"
+
+[ -z "$(_growth_delta "$GROW_TMP/does-not-exist" "$GB_NOW" 8 50)" ] && [ -z "$(_growth_delta "$GB_BASE" "$GROW_TMP/does-not-exist" 8 50)" ] \
+  && ok "_growth_delta: a missing baseline or photo yields empty output, rc 0 (the report says so; nothing is invented)" \
+  || bad "_growth_delta: missing input should produce empty output"
+
+# ── _growth_delta on REAL du output from synthetic directories (the bead's
+#    acceptance test: 'selftest com diretórios sintéticos mostrando o delta') ────
+RA="$GROW_TMP/synA"; RB="$GROW_TMP/synB"; mkdir -p "$RA/db1" "$RA/db2" "$RB/keep"
+head -c 1048576 /dev/zero > "$RA/db1/f"; head -c 1048576 /dev/zero > "$RA/db2/f"; head -c 1048576 /dev/zero > "$RB/keep/f"
+printf '%s\n%s\n' "$RA" "$RB" | _disk_growth_photo "$GROW_TMP/syn-base.txt"
+head -c 6291456 /dev/zero > "$RA/db2/growth.bin"                      # db2 grows by 6MB
+mkdir -p "$RB/newdir"; head -c 3145728 /dev/zero > "$RB/newdir/f"      # a brand-new 3MB directory
+printf '%s\n%s\n' "$RA" "$RB" | _disk_growth_photo "$GROW_TMP/syn-now.txt"
+syn="$(_growth_delta "$GROW_TMP/syn-base.txt" "$GROW_TMP/syn-now.txt" 8 1)"
+db2_delta="$(printf '%s\n' "$syn" | awk -F'\t' -v p="$RA/db2" '$1 == "G" && $5 == p { print $2 }')"
+case "$db2_delta" in
+  ''|*[!0-9]*) bad "synthetic delta: db2 (+6MB) not reported as a grower: $(printf '%s' "$syn" | tr '\n' ';')" ;;
+  *) [ "$db2_delta" -ge 5 ] && [ "$db2_delta" -le 7 ] && ok "synthetic delta: db2 growing 1MB -> 7MB is reported as +${db2_delta}MB from real du output" || bad "synthetic delta: db2 delta out of range: $db2_delta" ;;
+esac
+printf '%s\n' "$syn" | awk -F'\t' -v p="$RB/newdir" '$1 == "G" && $5 == p && $4 == "new" { f = 1 } END { exit !f }' \
+  && ok "synthetic delta: a directory that did not exist at baseline is reported 'new'" \
+  || bad "synthetic delta: newdir should be 'new': $(printf '%s' "$syn" | tr '\n' ';')"
+if printf '%s\n' "$syn" | grep -q -e "$RA/db1" -e "$RB/keep"; then
+  bad "synthetic delta: untouched db1 / keep must not be listed: $(printf '%s' "$syn" | tr '\n' ';')"
+else
+  ok "synthetic delta: untouched directories (db1, keep) are not listed"
+fi
+[ -z "$(printf '%s\n' "$syn" | grep '^U')" ] && ok "synthetic delta: two complete scans leave no NOT-FULLY-COMPARED roots" || bad "synthetic delta: unexpected U lines: $(printf '%s\n' "$syn" | grep '^U' | tr '\n' ';')"
+
+# ── _growth_report ─────────────────────────────────────────────────────────────
+rep_nb="$(_growth_report "$GROW_TMP/does-not-exist" "$GROW_TMP/syn-now.txt")"
+case "$rep_nb" in
+  *"No baseline photo yet"*"$RA"*) ok "_growth_report: with no baseline it says so and falls back to absolute sizes (still more than 'avail=')" ;;
+  *) bad "_growth_report: no-baseline text wrong: $(printf '%s' "$rep_nb" | head -c 300)" ;;
+esac
+GROWTH_MIN_DELTA_MB=1
+rep_syn="$(_growth_report "$GROW_TMP/syn-base.txt" "$GROW_TMP/syn-now.txt")"
+GROWTH_MIN_DELTA_MB="$GROWTH_MIN_DELTA_MB_ORIG"
+case "$rep_syn" in
+  *"Growth since the last OK photo"*"+"*"MB  $RA/db2"*"$RB/newdir"*"was new"*) ok "_growth_report: lists the growers with +MB, path, now/was, and 'was new' for a new dir" ;;
+  *) bad "_growth_report: grower lines wrong: $(printf '%s' "$rep_syn" | head -c 400)" ;;
+esac
+rep_none="$(_growth_report "$GROW_TMP/syn-now.txt" "$GROW_TMP/syn-now.txt")"
+case "$rep_none" in
+  *"none in the roots that could be compared"*) ok "_growth_report: no growth is stated outright, and points at VM / unmeasured roots as the remaining suspects" ;;
+  *) bad "_growth_report: empty-growth text wrong: $(printf '%s' "$rep_none" | head -c 300)" ;;
+esac
+rep_hand="$(_growth_report "$GB_BASE" "$GB_NOW")"
+case "$rep_hand" in
+  *"20 min old"*"NOT FULLY COMPARED: /r3 (baseline=PARTIAL now=OK)"*) ok "_growth_report: shows the baseline's age (20 min) and every root that was NOT FULLY COMPARED" ;;
+  *) bad "_growth_report: age / not-compared lines missing: $(printf '%s' "$rep_hand" | head -c 500)" ;;
+esac
+case "$rep_hand" in
+  *"/System/Volumes/VM: 3072MB now, +2048MB"*) ok "_growth_report: includes the VM delta line" ;;
+  *) bad "_growth_report: VM line missing" ;;
+esac
+case "$rep_hand" in
+  *"prime suspect"*"pid=77 dolt  /w/journal"*) ok "_growth_report: held-open files that grew are listed with their holder as the prime suspect" ;;
+  *) bad "_growth_report: writer-growth section missing: $(printf '%s' "$rep_hand" | head -c 700)" ;;
+esac
+
+# ── _growth_baseline_due ───────────────────────────────────────────────────────
+BD_F="$GROW_TMP/bd-baseline.txt"; BD_NOW=100000
+rm -f "$BD_F"; _growth_baseline_due "$BD_F" "$BD_NOW" 1800 && ok "_growth_baseline_due: no baseline file -> due" || bad "_growth_baseline_due: missing file should be due"
+printf 'TS\t%s\n' "$(( BD_NOW - 10 ))" > "$BD_F"; _growth_baseline_due "$BD_F" "$BD_NOW" 1800 && bad "_growth_baseline_due: a 10s-old baseline must not be due" || ok "_growth_baseline_due: fresh baseline -> not due (rate limit holds)"
+printf 'TS\t%s\n' "$(( BD_NOW - 1800 ))" > "$BD_F"; _growth_baseline_due "$BD_F" "$BD_NOW" 1800 && ok "_growth_baseline_due: exactly at the interval -> due (inclusive boundary)" || bad "_growth_baseline_due: boundary should be due"
+printf 'TS\t%s\n' "$(( BD_NOW + 500 ))" > "$BD_F"; _growth_baseline_due "$BD_F" "$BD_NOW" 1800 && ok "_growth_baseline_due: a TS in the FUTURE (clock step) -> due, never frozen" || bad "_growth_baseline_due: future TS must not suppress refresh"
+printf 'TS\tgarbage\n' > "$BD_F"; _growth_baseline_due "$BD_F" "$BD_NOW" 1800 && ok "_growth_baseline_due: garbled TS -> due (fail-open)" || bad "_growth_baseline_due: garbled TS should be due"
+printf 'ROOT\tOK\t/x\n' > "$BD_F"; _growth_baseline_due "$BD_F" "$BD_NOW" 1800 && ok "_growth_baseline_due: a file without a TS line -> due" || bad "_growth_baseline_due: TS-less file should be due"
+
+# ── _growth_should_photo: episode gating table ─────────────────────────────────
+sp_check() { # level class expect(0=photo,1=no)
+  _growth_should_photo "$1" "$2"; local rc=$?
+  [ "$rc" = "$3" ] && ok "_growth_should_photo: level='$1' class=$2 -> $( [ "$3" = 0 ] && echo photo || echo skip )" || bad "_growth_should_photo: level='$1' class=$2 expected rc=$3, got $rc"
+}
+sp_check "" WARN 0; sp_check "" CRITICAL 0
+sp_check WARN WARN 1; sp_check WARN CRITICAL 0
+sp_check CRITICAL CRITICAL 1; sp_check CRITICAL WARN 1
+sp_check "" NONE 1; sp_check CRITICAL UNKNOWN 1; sp_check garbage WARN 0
+
+# ── episode lifecycle: real _disk_growth_photo/_growth_delta on fixtures, with
+#    the writers lsof and the root list swapped for hermetic stand-ins ───────────
+eval "$(declare -f _top_open_write_files | sed '1s/^_top_open_write_files/_real_top_open_write_files/')"
+eval "$(declare -f _growth_roots | sed '1s/^_growth_roots/_real_growth_roots/')"
+eval "$(declare -f _disk_growth_photo | sed '1s/^_disk_growth_photo/_real_disk_growth_photo/')"
+WRITERS_STUB_RC=0
+_top_open_write_files() { [ "$WRITERS_STUB_RC" = "0" ] && printf '2158\t417\tfileproviderd\t/x/db\n'; return "$WRITERS_STUB_RC"; }
+_growth_roots() { printf '%s\n%s\n' "$RA" "$RB"; }
+GROWTH_MIN_DELTA_MB=1
+EP_NOW="$(date +%s)"
+: > "$LOG"
+
+# baseline: taken when due, then rate-limited, then refreshed when old, and off when disabled
+BASEF="$(_growth_baseline_file)"; rm -f "$BASEF"
+_growth_baseline_refresh "$EP_NOW"
+if [ -s "$BASEF" ] && grep -q "^TS${TAB}[0-9]" "$BASEF" && grep -q "growth baseline photo refreshed" "$LOG"; then
+  ok "_growth_baseline_refresh: takes the first baseline when none exists and logs it"
+else
+  bad "_growth_baseline_refresh: no baseline written / logged: $(tail -3 "$LOG" | tr '\n' '|')"
+fi
+grep -q "^WRITERS${TAB}ok" "$BASEF" && ok "_growth_baseline_refresh: the baseline records writers too (so the diff can attribute growth to a holder)" || bad "_growth_baseline_refresh: baseline missing WRITERS section"
+echo "# marker" >> "$BASEF"
+_growth_baseline_refresh "$EP_NOW"
+grep -q '^# marker' "$BASEF" && ok "_growth_baseline_refresh: a fresh baseline is left alone inside the interval (rate limit: no scan)" || bad "_growth_baseline_refresh: rescanned inside the interval"
+sed "s/^TS${TAB}.*/TS${TAB}$(( EP_NOW - 3600 ))/" "$BASEF" > "$BASEF.x" && mv "$BASEF.x" "$BASEF"
+_growth_baseline_refresh "$EP_NOW"
+if grep -q '^# marker' "$BASEF"; then bad "_growth_baseline_refresh: an hour-old baseline should have been refreshed"; else ok "_growth_baseline_refresh: an old baseline is refreshed (atomically replaced)"; fi
+GROWTH_PHOTO_ENABLED=0
+echo "# marker2" >> "$BASEF"; sed "s/^TS${TAB}.*/TS${TAB}$(( EP_NOW - 7200 ))/" "$BASEF" > "$BASEF.x" && mv "$BASEF.x" "$BASEF"
+_growth_baseline_refresh "$EP_NOW"; _growth_episode_photo WARN 6
+if grep -q '^# marker2' "$BASEF" && [ -z "$(ls "$STATE_DIR"/disk-growth-*.txt 2>/dev/null)" ]; then
+  ok "GROWTH_PHOTO_ENABLED=0: neither the baseline refresh nor the episode photo runs"
+else
+  bad "GROWTH_PHOTO_ENABLED=0 did not disable the photo feature"
+fi
+GROWTH_PHOTO_ENABLED=1
+_growth_baseline_refresh "$EP_NOW"     # old TS again -> fresh baseline, taken BEFORE the growth below
+BASE_SUM_BEFORE="$(cksum < "$BASEF")"
+
+# growth happens; first WARN cycle photographs, later WARN cycles of the episode do not
+head -c 8388608 /dev/zero > "$RA/db1/g.bin"
+: > "$LOG"
+_growth_episode_photo WARN 6
+EPF="$(_growth_episode_file)"
+PHOTOS="$(ls -1 "$STATE_DIR"/disk-growth-*.txt 2>/dev/null)"
+if [ "$(printf '%s\n' "$PHOTOS" | grep -c .)" = "1" ] && [ "$(sed -n 1p "$EPF")" = "WARN" ] && [ "$(sed -n 2p "$EPF")" = "$PHOTOS" ]; then
+  ok "_growth_episode_photo: first WARN cycle writes disk-growth-<ts>.txt and records level+path in the episode file"
+else
+  bad "_growth_episode_photo: first WARN photo/episode state wrong (photos=$PHOTOS episode=$(tr '\n' '|' < "$EPF" 2>/dev/null))"
+fi
+if grep -q "BEFORE the reclaim levers run" "$LOG" && grep -q "disk-growth photo written" "$LOG" && grep -q "db1" "$LOG"; then
+  ok "_growth_episode_photo: logs that it ran before the reclaim levers, where the file is, and the top growers (db1)"
+else
+  bad "_growth_episode_photo: log missing lines: $(tr '\n' '|' < "$LOG" | head -c 400)"
+fi
+grep -q "^# ==== disk-growth report" "$PHOTOS" && grep -q "db1" "$PHOTOS" && grep -q "fileproviderd" "$PHOTOS" \
+  && ok "_growth_episode_photo: the file carries the raw photo AND the human report (growers + writers section)" \
+  || bad "_growth_episode_photo: report section missing from $PHOTOS"
+[ "$(cksum < "$BASEF")" = "$BASE_SUM_BEFORE" ] && ok "_growth_episode_photo: leaves the baseline untouched (the baseline stays the LAST OK photo)" || bad "_growth_episode_photo: modified the baseline"
+_growth_episode_photo WARN 6
+[ "$(ls -1 "$STATE_DIR"/disk-growth-*.txt | grep -c .)" = "1" ] && ok "_growth_episode_photo: a second WARN cycle in the same episode is a no-op (rate-limited to one photo per level)" || bad "_growth_episode_photo: re-photographed within the same WARN level"
+sleep 1                                  # distinct <ts> stamp for the CRITICAL photo
+_growth_episode_photo CRITICAL 2
+if [ "$(ls -1 "$STATE_DIR"/disk-growth-*.txt | grep -c .)" = "2" ] && [ "$(sed -n 1p "$EPF")" = "CRITICAL" ] && grep -q "class=CRITICAL" "$(sed -n 2p "$EPF")"; then
+  ok "_growth_episode_photo: the first CRITICAL cycle photographs AGAIN (a fill that began at WARN is worse by then)"
+else
+  bad "_growth_episode_photo: WARN->CRITICAL should add a second photo (episode=$(tr '\n' '|' < "$EPF"))"
+fi
+_growth_episode_photo CRITICAL 2
+[ "$(ls -1 "$STATE_DIR"/disk-growth-*.txt | grep -c .)" = "2" ] && ok "_growth_episode_photo: later CRITICAL cycles of the episode do not photograph again" || bad "_growth_episode_photo: re-photographed at the same CRITICAL level"
+
+# the Mayor-mail paragraph cites THIS episode's latest photo, even from a later cycle
+mt="$(_growth_mail_text)"
+case "$mt" in
+  *"Photo file: $(sed -n 2p "$EPF")"*"db1"*) ok "_growth_mail_text: cites the episode's photo path and its growers" ;;
+  *) bad "_growth_mail_text: wrong: $(printf '%s' "$mt" | head -c 300)" ;;
+esac
+
+# an episode ends when the disk recovers: fresh photo next time, and the mail text says there is none
+_growth_clear_episode
+case "$(_growth_mail_text)" in
+  *"no disk-growth photo recorded for this episode"*) ok "_growth_mail_text: with no photo this episode it says so explicitly (never silence, never a stale photo)" ;;
+  *) bad "_growth_mail_text: expected the explicit no-photo statement" ;;
+esac
+sleep 1
+_growth_episode_photo WARN 6
+[ "$(ls -1 "$STATE_DIR"/disk-growth-*.txt | grep -c .)" = "3" ] && ok "_growth_clear_episode: after recovery the next WARN earns a fresh photo" || bad "_growth_clear_episode: next episode should re-photograph"
+
+# a failed photo is NOT recorded as taken, so the next cycle retries
+_growth_clear_episode
+_disk_growth_photo() { return 1; }
+: > "$LOG"
+_growth_episode_photo WARN 6
+if [ ! -e "$EPF" ] && grep -q "could not be written" "$LOG"; then
+  ok "_growth_episode_photo: a photo that could not be written logs a WARN and does NOT mark the episode photographed (retried next cycle)"
+else
+  bad "_growth_episode_photo: failed photo must not be recorded (episode file exists=$([ -e "$EPF" ] && echo yes || echo no))"
+fi
+eval "$(declare -f _real_disk_growth_photo | sed '1s/^_real_disk_growth_photo/_disk_growth_photo/')"
+
+# retention: only the newest N of OUR files go; foreign files are never touched
+GROWTH_KEEP_PHOTOS_ORIG="$GROWTH_KEEP_PHOTOS"; GROWTH_KEEP_PHOTOS=2
+rm -f "$STATE_DIR"/disk-growth-*.txt
+for i in 1 2 3 4; do : > "$STATE_DIR/disk-growth-2020010$i-000000.txt"; done
+: > "$STATE_DIR/unrelated.txt"; : > "$STATE_DIR/.dolt-disk-floor-guard.last-notify"
+_growth_prune_photos
+left="$(ls -1 "$STATE_DIR"/disk-growth-*.txt | sed 's|.*/||' | tr '\n' ' ')"
+if [ "$left" = "disk-growth-20200103-000000.txt disk-growth-20200104-000000.txt " ] && [ -e "$STATE_DIR/unrelated.txt" ] && [ -e "$STATE_DIR/.dolt-disk-floor-guard.last-notify" ]; then
+  ok "_growth_prune_photos: keeps only the newest N photos; unrelated state files are never touched"
+else
+  bad "_growth_prune_photos: wrong survivors: $left"
+fi
+GROWTH_KEEP_PHOTOS="$GROWTH_KEEP_PHOTOS_ORIG"
+
+# restore everything this section swapped, so later sections see the real functions
+eval "$(declare -f _real_top_open_write_files | sed '1s/^_real_top_open_write_files/_top_open_write_files/')"
+eval "$(declare -f _real_growth_roots | sed '1s/^_real_growth_roots/_growth_roots/')"
+GROWTH_MIN_DELTA_MB="$GROWTH_MIN_DELTA_MB_ORIG"
+STATE_DIR="$STATE_DIR_BEFORE_GROWTH"
+rm -rf "$GROW_TMP"
+
+echo ""
 echo "=== _reap_dead_scratch: production sentinel wiring (ga-h565g) ==="
 # _reap_dead_scratch is the REAL caller scratchpad-reaper.sh's own header
 # names as the one allowed to set SCRATCHPAD_REAPER_PROD=1 (ga-h565g) — this
@@ -1912,6 +2337,23 @@ _top_mem_processes() { printf '%s\n' "51664 1 1870M 302M com.gastown.dolt-server
 # stub.
 _top_disk_consumers() { printf '%s\n' "3583 /private/tmp/claude-501/bash-edit-diff" "812 /var/folders/gj/T/pytest-of-athos"; }
 
+# _growth_episode_photo / _growth_baseline_refresh are new (ga-ond0fa), same
+# reasoning as _top_disk_consumers above: real and hermetic in isolation (proven
+# with fixture directories in the disk-growth section earlier in this file) but
+# STUBBED here so no main() scenario pays a real scan of this host's directories.
+# The stub for the photo snapshots the reclaim-lever call counters AT CALL TIME
+# ("0/0/0/0/0" proves it ran BEFORE every lever — the ordering the feature exists
+# for: the levers delete the scratch/caches a growth photo must still see). The
+# counters are read by name at call time, so defining this before they exist is
+# fine. GROWTH_* capture vars are reset by reset_capture.
+GROWTH_PHOTO_CALLS=0; GROWTH_PHOTO_LAST_CLASS=""; GROWTH_PHOTO_LAST_AVAIL=""; GROWTH_PHOTO_REAP_AT_CALL=""
+_growth_episode_photo() {
+  GROWTH_PHOTO_CALLS=$((GROWTH_PHOTO_CALLS+1)); GROWTH_PHOTO_LAST_CLASS="$1"; GROWTH_PHOTO_LAST_AVAIL="$2"
+  GROWTH_PHOTO_REAP_AT_CALL="$REAP_CALLS/$REAP_TRANSCRIPT_CALLS/$REAP_HF_CALLS/$REAP_GOCACHE_CALLS/$REAP_BACKUP_STAGING_CALLS"
+}
+GROWTH_BASELINE_CALLS=0
+_growth_baseline_refresh() { GROWTH_BASELINE_CALLS=$((GROWTH_BASELINE_CALLS+1)); }
+
 # _safe_reclaim's own mechanics (gc dolt-cleanup --force, health probe) are
 # EXECUTION code out of scope for this file (see section banner above) —
 # stubbed as a no-op here too, same as every other main()-only side effect.
@@ -2095,7 +2537,7 @@ record_gc() {
 # shellcheck disable=SC2034  # read by main() in the sourced script
 GC=record_gc
 
-reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; REAP_GO_BUILD_CALLS=0; REAP_CODE_SIGN_CLONE_CALLS=0; REAP_BASH_EDIT_DIFF_CALLS=0; REAP_ORPHAN_TEST_DOLT_CALLS=0; REAP_BACKUP_RESIDUE_CALLS=0; REAP_BACKUP_STAGING_CALLS=0; REAP_BACKUP_STAGING_LAST_ARG=""; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0;
+reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; REAP_GO_BUILD_CALLS=0; REAP_CODE_SIGN_CLONE_CALLS=0; REAP_BASH_EDIT_DIFF_CALLS=0; REAP_ORPHAN_TEST_DOLT_CALLS=0; REAP_BACKUP_RESIDUE_CALLS=0; REAP_BACKUP_STAGING_CALLS=0; REAP_BACKUP_STAGING_LAST_ARG=""; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; GROWTH_PHOTO_CALLS=0; GROWTH_PHOTO_LAST_CLASS=""; GROWTH_PHOTO_LAST_AVAIL=""; GROWTH_PHOTO_REAP_AT_CALL=""; GROWTH_BASELINE_CALLS=0; rm -f "$(_growth_episode_file)";
   # ga-4f4opx: clear the mail-debounce/recovery state too, so every scenario
   # starts with a clean slate by default (no leftover "already mailed this
   # avail" or "episode already mailed" from whichever scenario ran before
@@ -2652,6 +3094,92 @@ else
   bad "main(): UNKNOWN disk class should never trigger resurrection, got RESURRECT_CALLS=$RESURRECT_CALLS"
 fi
 RESURRECT_PROBE_RC=0   # restore safe default for any scenario added after this point
+
+echo ""
+echo "=== main(): disk-growth photo wiring (ga-ond0fa) ==="
+# The photo/baseline functions are stubbed in this section (see their stubs above:
+# no real scans in main() scenarios), so these prove main()'s WIRING — WHEN it
+# calls them and with WHAT — not the scan itself (proven by the unit section).
+
+# Scenario R — a CRITICAL cycle takes the episode photo exactly once, with the
+# PRE-reclaim class/avail, BEFORE any reclaim lever has run. The counter snapshot
+# taken inside the stub at call time is 0/0/0/0/0; REAP_CALLS == 1 afterwards
+# proves the levers did run later in the same cycle (so 0 means "before", not
+# "never ran"). The baseline is NOT refreshed on a CRITICAL cycle, even though
+# reclaim recovers avail to 20GB (only the pre-reclaim-NONE path may refresh it).
+reset_capture; seed_state "" ""; seed_critical_sustain ""
+queue_avail 2 20
+main
+if [ "$GROWTH_PHOTO_CALLS" = "1" ] && [ "$GROWTH_PHOTO_LAST_CLASS" = "CRITICAL" ] && [ "$GROWTH_PHOTO_LAST_AVAIL" = "2" ] \
+   && [ "$GROWTH_PHOTO_REAP_AT_CALL" = "0/0/0/0/0" ] && [ "$REAP_CALLS" = "1" ] && [ "$GROWTH_BASELINE_CALLS" = "0" ]; then
+  ok "main(): a CRITICAL cycle photographs growth ONCE, with the pre-reclaim class/avail, BEFORE any reclaim lever; no baseline refresh"
+else
+  bad "main(): CRITICAL photo wiring wrong (calls=$GROWTH_PHOTO_CALLS class=$GROWTH_PHOTO_LAST_CLASS avail=$GROWTH_PHOTO_LAST_AVAIL reaped_at_call=$GROWTH_PHOTO_REAP_AT_CALL reap_calls_after=$REAP_CALLS baseline_calls=$GROWTH_BASELINE_CALLS)"
+fi
+
+# Scenario S — a WARN cycle photographs too (the first WARN of an episode), also
+# before the levers.
+reset_capture; seed_state "" ""; seed_critical_sustain ""
+queue_avail 6 6
+main
+if [ "$GROWTH_PHOTO_CALLS" = "1" ] && [ "$GROWTH_PHOTO_LAST_CLASS" = "WARN" ] && [ "$GROWTH_PHOTO_REAP_AT_CALL" = "0/0/0/0/0" ]; then
+  ok "main(): a WARN cycle photographs growth before the reclaim levers (class=WARN)"
+else
+  bad "main(): WARN photo wiring wrong (calls=$GROWTH_PHOTO_CALLS class=$GROWTH_PHOTO_LAST_CLASS reaped_at_call=$GROWTH_PHOTO_REAP_AT_CALL)"
+fi
+
+# Scenario T — a healthy (pre-reclaim NONE) cycle refreshes the baseline, takes no
+# episode photo, and ENDS the episode (a leftover episode file is removed, so the
+# next WARN/CRITICAL earns a fresh photo).
+reset_capture; seed_state "" ""; seed_critical_sustain ""
+printf 'CRITICAL\n/some/old/photo.txt\n' > "$(_growth_episode_file)"
+queue_avail 20
+main
+if [ "$GROWTH_BASELINE_CALLS" = "1" ] && [ "$GROWTH_PHOTO_CALLS" = "0" ] && [ ! -e "$(_growth_episode_file)" ]; then
+  ok "main(): a healthy cycle refreshes the baseline, takes no photo, and ends the growth episode (episode file cleared)"
+else
+  bad "main(): healthy-cycle wiring wrong (baseline_calls=$GROWTH_BASELINE_CALLS photo_calls=$GROWTH_PHOTO_CALLS episode_file_exists=$([ -e "$(_growth_episode_file)" ] && echo yes || echo no))"
+fi
+
+# Scenario U — df unreadable (UNKNOWN): neither the photo nor the baseline runs
+# (main returns before either; an unmeasurable floor is not an episode).
+reset_capture; seed_state "" ""; seed_critical_sustain ""
+queue_avail ""
+main
+if [ "$GROWTH_PHOTO_CALLS" = "0" ] && [ "$GROWTH_BASELINE_CALLS" = "0" ]; then
+  ok "main(): class=UNKNOWN takes neither a photo nor a baseline"
+else
+  bad "main(): UNKNOWN cycle must not scan (photo_calls=$GROWTH_PHOTO_CALLS baseline_calls=$GROWTH_BASELINE_CALLS)"
+fi
+
+# Scenario V — the Mayor CRITICAL mail carries THIS episode's photo (taken by an
+# EARLIER cycle: each cycle is its own process, so the mail cannot rely on
+# in-memory state). Seed the episode file + a canned photo, then run the 2nd
+# consecutive CRITICAL cycle (sustain 1 -> 2, mails).
+CANNED_PHOTO="$STATE_TMP/disk-growth-canned.txt"
+printf '%s\n' "# dolt-disk-floor-guard disk-growth photo (ga-ond0fa)" "TS	1" \
+  "# ==== disk-growth report (ga-ond0fa) — class=CRITICAL avail=2GB at 2026-09-25 01:51:00 ====" \
+  "# Growth since the last OK photo (17 min old; entries that grew >= 50MB, MB path):" \
+  "#   +7000MB  /private/tmp/claude-501/CANNED-CULPRIT  (now 7100MB, was 100MB)" > "$CANNED_PHOTO"
+reset_capture; seed_state "" ""; seed_critical_sustain 1
+printf 'CRITICAL\n%s\n' "$CANNED_PHOTO" > "$(_growth_episode_file)"
+queue_avail 2 20
+main
+case "$GC_MAIL_LAST_BODY" in
+  *"WHAT GREW (ga-ond0fa)"*"Photo file: $CANNED_PHOTO"*"+7000MB  /private/tmp/claude-501/CANNED-CULPRIT"*)
+    ok "main(): the Mayor CRITICAL mail names the episode's growth photo and its top grower (WHAT GREW section)" ;;
+  *) bad "main(): mail body missing the growth section/photo path/culprit: $(printf '%s' "$GC_MAIL_LAST_BODY" | tail -c 500)" ;;
+esac
+
+# Scenario W — same mail with NO photo this episode: says so, never silent, never
+# a stale photo.
+reset_capture; seed_state "" ""; seed_critical_sustain 1
+queue_avail 2 20
+main
+case "$GC_MAIL_LAST_BODY" in
+  *"WHAT GREW (ga-ond0fa)"*"no disk-growth photo recorded for this episode"*) ok "main(): with no photo this episode the mail says so explicitly instead of omitting the section" ;;
+  *) bad "main(): mail body should state that no growth photo exists: $(printf '%s' "$GC_MAIL_LAST_BODY" | tail -c 400)" ;;
+esac
 
 rm -rf "$STATE_TMP"
 
